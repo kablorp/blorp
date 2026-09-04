@@ -180,6 +180,15 @@ indices for visible names, qualification, and source-function UFCS. Prepared
 overload channel is deleted. The Phase 01-06 self-check retired 27.7% fewer
 instructions than the Issue 39 baseline with no latency regression.
 
+Issue 41 is implemented. Accepted source traits and implementations now live
+once in an immutable semantic table; prepared module views retain compact
+visibility and relevant-trait candidate indices. Imported trait and
+implementation reconstruction is removed from module preparation, and
+prepared `Env` values retain only compiler-builtin trait facts. Coherence
+relationships are computed once in the table rather than once per module
+view. Three isolated Phase 01-06 self-check samples retired a median 8.3%
+fewer instructions than the Issue 40 parent with 7.7% lower median wall time.
+
 ### Later declaration families
 
 Issues 38-42 should be integrated serially. Their semantic inventories and

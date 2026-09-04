@@ -1,6 +1,6 @@
 # Cut Over Traits And Implementations To The Declaration Catalog
 
-**Status:** Ready
+**Status:** Implemented
 
 **Dependencies:** Issue 40
 
@@ -93,3 +93,26 @@ Run trait, inheritance, implementation, privacy, generic-bound, method, and
 coherence fixtures plus the dense frontend benchmark. Inspect exact conflict
 diagnostics and method-slot identities. Build once before merge and run the
 affected Stage 06 tests.
+
+## Implementation Result
+
+Accepted source traits and implementations now have one graph-owned semantic
+table. Each prepared module view retains only deterministic table indices for
+its local declarations and public direct imports, plus a relevant-trait
+candidate index. Trait inheritance, method ownership, implementation
+selection, generic bounds, and private implementation isolation read that
+authority. Prepared `Env` values retain compiler builtins and session-local
+facts, but no accepted source trait, implementation, or method publication.
+
+The cutover also removes imported trait/implementation reconstruction from
+module preparation. A logical-counter regression requires one semantic table
+entry and conversion per accepted header, compact module-view indices, zero
+legacy graph installs or full-record view copies, and zero exact-query graph
+scans. Coherence overlap relationships are computed once in the table; module
+views only test precomputed conflicting indices that are actually visible.
+
+In three isolated compiler self-check samples through Stage 06, the final
+implementation retired a median 290,397,281,209 instructions versus
+316,649,911,090 for its Issue 40 parent, an 8.3% reduction. Median wall time was
+16.55 seconds versus 17.94 seconds, a 7.7% reduction; retired instructions are
+the primary evidence because unrelated host activity makes wall time noisier.

@@ -76,6 +76,7 @@ import:
 		resolved_module_identity_from_resolver,
 	../../../src/compiler/stage_04_modules/module_surface: module_surface_for_program
 	../../../src/compiler/stage_06_typecheck/decl:
+		AcceptedTypecheckGraph,
 		TypecheckProgramResult,
 		TypedDecl(
 			TypedFunctionDecl,
@@ -95,6 +96,7 @@ import:
 		TypedRecordFieldInfo,
 		TypedRecordInfo,
 		TypedUnionInfo,
+		accepted_typecheck_graph_implementation_headers,
 		typecheck_bind_program_module_view,
 		typecheck_check_function_body,
 		typecheck_check_standalone_program_bodies,
@@ -121,6 +123,19 @@ import:
 		prepared_module_program,
 		prepared_module_scope_canonical_path,
 		prepared_module_scope_module,
+	../../../src/compiler/stage_06_typecheck/headers/callable_headers:
+		callable_header_graph_trait_topology,
+	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
+		DeclarationVisibility(PublicDeclaration),
+		builtin_trait_id,
+		trait_id_definition_id,
+		trait_id_module_identity,
+		trait_id_name,
+	../../../src/compiler/stage_06_typecheck/headers/implementation_headers:
+		implementation_header_graph_callable_headers,
+	../../../src/compiler/stage_06_typecheck/headers/trait_headers:
+		trait_topology_graph_headers,
+		trait_topology_header_id,
 	../../../src/compiler/stage_06_typecheck/infer:
 		ExprTypeOrigin(InferredOrigin),
 		TypedExpr(TypedForExpr, TypedIntLiteralExpr),
@@ -169,6 +184,7 @@ import:
 		module_view_accepted_callable_authority,
 		module_view_accepted_global_authority,
 		module_view_accepted_record_authority,
+		module_view_accepted_trait_implementation_authority,
 		module_view_accepted_union_authority,
 		module_view_find_local_name,
 		module_view_has_selective_binding,
@@ -206,6 +222,15 @@ import:
 		accepted_global_find,
 	../../../src/compiler/stage_06_typecheck/type_system/accepted_record_authority:
 		accepted_record_find,
+	../../../src/compiler/stage_06_typecheck/type_system/accepted_trait_implementation_authority:
+		AcceptedTraitTableRecord,
+		accepted_has_direct_trait_evidence,
+		accepted_implementation_candidate_count,
+		accepted_resolve_trait_obligation,
+		accepted_trait_find_exact,
+		accepted_trait_implementation_authority,
+		accepted_trait_implementation_table,
+		accepted_trait_module_path,
 	../../../src/compiler/stage_06_typecheck/type_system/accepted_union_authority:
 		AcceptedUnionVariantEntry,
 		accepted_union_find,
@@ -217,6 +242,7 @@ import:
 		FuncOrigin(ForeignFunc, UserDefinedFunc),
 		Purity(Impure, Pure),
 		SymbolKind(FuncSymbolKind),
+		TraitObligationResolution(TraitObligationUnsatisfied),
 		TypeKind(TypeResource),
 		env_add_impl,
 		env_add_trait,
@@ -236,6 +262,7 @@ import:
 		env_type_contains_resource_if_valid,
 		impl_instance,
 		trait_def_with_details,
+		trait_obligation,
 	../../../src/compiler/stage_06_typecheck/type_system/refinement: UNREFINED_BINDING
 	../../../src/compiler/stage_06_typecheck/type_system/semantic_type:
 		SemanticType(
@@ -262,6 +289,7 @@ import:
 		source_span,
 	../typecheck_test_support:
 		finalized_typecheck_program_fixture,
+		typecheck_test_accepted_graph,
 		typecheck_test_install_validated_type_headers,
 		typecheck_test_program,
 		typecheck_test_program_with_import_modules,
@@ -1757,14 +1785,188 @@ func test_ambient_tuple_module_registers_impls_without_source_import() -> Bool:
 		program([]),
 		importable_modules_with_origin("tuple", ambient_decls, StdlibModule),
 	)
+	accepted_impl_count = module_view_accepted_trait_implementation_authority(
+		result.state.module_view,
+	)
+		.map(
+			func(
+				authority,
+			): accepted_implementation_candidate_count(authority, "AmbientTupleTrait"),
+		)
+		.get_or(0)
 
 	(
 		result.state.errors.length() == 0
-		and result.state.env.impls.length() == base_state.env.impls.length() + 1
-		and result.state.env.impls.any(func(instance): instance.trait_name == "AmbientTupleTrait")
+		and result.state.env.impls.length() == base_state.env.impls.length()
+		and accepted_impl_count == 1
 		and not typecheck_state_has_imported_module(result.state, "tuple")
 		and typecheck_state_find_module_alias(result.state, "tuple").is_none()
 	)
+
+
+private pure func compiler_trait_bridge_has_expected_direct_evidence(
+	trait_module_path: String,
+	trait_origin: ModuleOrigin,
+	include_unrelated_module: Bool,
+	expected_evidence: Bool,
+) -> Bool:
+	trait_modules = importable_modules_with_origin(
+		trait_module_path,
+		[trait_decl("Equatable")],
+		trait_origin,
+	)
+	model_module_path = "bridge_model"
+	model_decls = [
+		import_block_decl(
+			[import_decl(trait_module_path, None, Some([import_symbol("Equatable", None, [])]))],
+		),
+		record_with_fields_decl("BridgeValue", [int_type()]),
+		impl_decl_with_methods("Equatable", named_type("BridgeValue"), []),
+	]
+	model_modules = importable_modules(model_module_path, model_decls)
+	var modules = trait_modules.concat(model_modules)
+
+	if include_unrelated_module:
+		modules = modules.concat(importable_modules("unrelated", [trait_decl("Equatable")]))
+
+	target = program(
+		[
+			import_block_decl(
+				[
+					import_decl(
+						model_module_path,
+						None,
+						Some([import_symbol("BridgeValue", None, [])]),
+					),
+				],
+			),
+		],
+	)
+	result = typecheck_test_program_with_import_modules(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		target,
+		modules,
+	)
+	authority = module_view_accepted_trait_implementation_authority(result.state.module_view)
+
+	evidence = authority
+		.map(func(value): accepted_has_direct_trait_evidence(
+				value,
+				result.state.env,
+				trait_obligation(
+					SemanticNamedType(
+						canonical_module_type_name(model_module_path, "BridgeValue"),
+						[],
+					),
+					"Equatable",
+				),
+			))
+		.get_or(False)
+
+	result.state.errors.is_empty() and evidence == expected_evidence
+
+
+func test_std_prelude_trait_links_compiler_trait_for_transitive_implementation() -> Bool:
+	compiler_trait_bridge_has_expected_direct_evidence("traits", StdlibModule, False, True)
+
+
+func test_same_name_user_trait_does_not_link_compiler_trait() -> Bool:
+	compiler_trait_bridge_has_expected_direct_evidence(
+		"user_traits",
+		SourcePackageModule("test"),
+		False,
+		False,
+	)
+
+
+func test_unrelated_same_name_trait_does_not_change_compiler_trait_link() -> Bool:
+	compiler_trait_bridge_has_expected_direct_evidence("traits", StdlibModule, True, True)
+
+
+func test_qualified_only_namesake_does_not_replace_selective_trait_binding() -> Bool:
+	modules = importable_modules(
+		"selected_traits",
+		[trait_decl("Show")],
+	).concat(importable_modules("qualified_traits", [trait_decl("Show")]))
+	target = program([import_block_decl([
+			import_decl("selected_traits", None, Some([import_symbol("Show", None, [])])),
+			import_decl("qualified_traits", Some("Qualified"), None),
+		])])
+	result = typecheck_test_program_with_import_modules(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		target,
+		modules,
+	)
+	selected_path = module_view_accepted_trait_implementation_authority(
+		result.state.module_view,
+	).and_then(
+		func(authority): accepted_trait_module_path(authority, "Show"),
+	)
+
+	result.state.errors.is_empty() and selected_path == Some("selected_traits")
+
+
+private pure func accepted_trait_table_exact_identity_is_owner_safe() -> Option[Bool]:
+	base_state = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
+	graph: AcceptedTypecheckGraph ?= typecheck_test_accepted_graph(
+		base_state,
+		program([trait_decl("Equatable")]),
+		[],
+	).to_option()
+	topology = callable_header_graph_trait_topology(
+		implementation_header_graph_callable_headers(
+			accepted_typecheck_graph_implementation_headers(graph),
+		),
+	)
+	header ?= trait_topology_graph_headers(topology).get(0)
+	id = trait_topology_header_id(header)
+	owner_path = module_identity_display_name(trait_id_module_identity(id))
+	definition = trait_def_with_details(
+		trait_id_definition_id(id),
+		trait_id_name(id),
+		[],
+		[],
+		[],
+		Some(owner_path),
+	)
+	item: AcceptedTraitTableRecord = {
+		id = id,
+		compiler_builtin_id = None,
+		owner_module_path = owner_path,
+		visibility = PublicDeclaration,
+		supertraits = [],
+		method_ids = [],
+		definition = definition
+	}
+	table ?= accepted_trait_implementation_table({
+		traits = [item],
+		implementations = [],
+	})
+	authority = accepted_trait_implementation_authority(table, trait_id_module_identity(id), [], [])
+	builtin_id ?= builtin_trait_id("Equatable")
+	wrong_owner_path = "not/the/trait/owner"
+	wrong_owner_item = { item |
+		owner_module_path = wrong_owner_path,
+		definition = { definition | module_path = Some(wrong_owner_path) }
+	}
+
+	Some((
+		accepted_trait_find_exact(authority, id).is_some()
+		and accepted_trait_find_exact(authority, builtin_id).is_none()
+		and accepted_resolve_trait_obligation(
+			authority,
+			base_state.env,
+			trait_obligation(TYPE_INT, "Equatable"),
+		) == TraitObligationUnsatisfied
+		and accepted_trait_implementation_table({
+			traits = [wrong_owner_item],
+			implementations = [],
+		}).is_none()
+	))
+
+
+func test_accepted_trait_table_exact_identity_is_owner_safe() -> Bool:
+	accepted_trait_table_exact_identity_is_owner_safe().get_or(False)
 
 
 func test_import_modules_register_canonical_type_payloads() -> Bool:
@@ -4251,9 +4453,16 @@ func test_typecheck_program_runs_full_decl_pipeline() -> Bool:
 		_:
 			False
 
+	accepted_impl_count = module_view_accepted_trait_implementation_authority(
+		result.state.module_view,
+	)
+		.map(func(authority): accepted_implementation_candidate_count(authority, "Display"))
+		.get_or(0)
+
 	(
 		result.state.errors.length() == 0
-		and result.state.env.impls.length() == base_state.env.impls.length() + 1
+		and result.state.env.impls.length() == base_state.env.impls.length()
+		and accepted_impl_count == 1
 		and result.program.source.module_name == "decl"
 		and result.program.diagnostics.length() == 0
 		and result.program.decls.length() == 5
@@ -4262,6 +4471,66 @@ func test_typecheck_program_runs_full_decl_pipeline() -> Bool:
 		and impl_ok
 		and function_ok
 		and global_ok
+	)
+
+
+func test_conflicting_accepted_implementation_is_not_indexed() -> Bool:
+	result = typecheck_test_program(typecheck_state_for_origin(TYPECHECK_USER_ORIGIN), program([
+			record_with_fields_decl("ConflictValue", [int_type()]),
+			trait_decl_with_methods(
+				"ConflictTrait",
+				[],
+				[],
+				[
+					trait_method_decl(
+						"conflict_value",
+						[named_param("value", named_type("ConflictValue"))],
+						Some(int_type()),
+						False,
+						False,
+					),
+				],
+			),
+			impl_decl_with_methods_at(
+				"ConflictTrait",
+				named_type("ConflictValue"),
+				[
+					method_body_decl_at(
+						"conflict_value",
+						[named_param("value", named_type("ConflictValue"))],
+						Some(int_type()),
+						Some(int_expr()),
+						2,
+					),
+				],
+				3,
+			),
+			impl_decl_with_methods_at(
+				"ConflictTrait",
+				named_type("ConflictValue"),
+				[
+					method_body_decl_at(
+						"conflict_value",
+						[named_param("value", named_type("ConflictValue"))],
+						Some(int_type()),
+						Some(int_expr()),
+						4,
+					),
+				],
+				5,
+			),
+		]))
+	accepted_impl_count = module_view_accepted_trait_implementation_authority(
+		result.state.module_view,
+	)
+		.map(func(authority): accepted_implementation_candidate_count(authority, "ConflictTrait"))
+		.get_or(0)
+
+	(
+		result.state.errors.any(
+			func(message): message.contains("conflicting implementation of trait 'ConflictTrait'"),
+		)
+		and accepted_impl_count == 1
 	)
 
 
@@ -5801,6 +6070,10 @@ tests: TestSuite = {
 			test_typecheck_program_runs_full_decl_pipeline,
 		),
 		(
+			"conflicting accepted implementation is not indexed",
+			test_conflicting_accepted_implementation_is_not_indexed,
+		),
+		(
 			"validate typed program rejects unfinalized meta",
 			test_validate_typed_program_rejects_unfinalized_meta,
 		),
@@ -5952,6 +6225,26 @@ tests: TestSuite = {
 		(
 			"combined import selection preserves visible and direct order",
 			test_combined_import_selection_preserves_visible_and_direct_order,
+		),
+		(
+			"std prelude trait links compiler trait for transitive implementation",
+			test_std_prelude_trait_links_compiler_trait_for_transitive_implementation,
+		),
+		(
+			"same-name user trait does not link compiler trait",
+			test_same_name_user_trait_does_not_link_compiler_trait,
+		),
+		(
+			"unrelated same-name trait does not change compiler trait link",
+			test_unrelated_same_name_trait_does_not_change_compiler_trait_link,
+		),
+		(
+			"qualified-only namesake does not replace selective trait binding",
+			test_qualified_only_namesake_does_not_replace_selective_trait_binding,
+		),
+		(
+			"accepted trait table exact identity is owner safe",
+			test_accepted_trait_table_exact_identity_is_owner_safe,
 		),
 	]
 }

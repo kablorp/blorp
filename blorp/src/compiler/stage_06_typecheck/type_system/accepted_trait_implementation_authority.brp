@@ -1,0 +1,2207 @@
+-- Accepted traits and implementations are converted to semantic form once.
+-- A module authority retains only table indices for facts visible to that
+-- module; exact nominal IDs remain the source of every relationship.
+import:
+	../../../lib/source: source_spans_equal
+	../../stage_04_modules/loaded_module:
+		ModuleIdentity,
+		module_identities_equal,
+		module_identity_matches_module_path,
+		module_identity_storage_key,
+	../headers/declaration_skeleton:
+		CallableId,
+		DeclarationVisibility(PrivateDeclaration, PublicDeclaration),
+		ImplId,
+		TraitId,
+		TraitMethodId,
+		builtin_trait_id,
+		callable_id_definition_id,
+		callable_id_module_identity,
+		callable_id_name,
+		impl_id_definition_id,
+		impl_id_module_identity,
+		impl_id_name,
+		impl_ids_equal,
+		trait_id_definition_id,
+		trait_id_is_compiler_builtin,
+		trait_id_module_identity,
+		trait_id_name,
+		trait_id_source_span,
+		trait_ids_equal,
+		trait_method_id_index,
+		trait_method_id_name,
+		trait_method_id_owner,
+		trait_method_ids_equal,
+	env:
+		Env,
+		ImplInstance,
+		ImplMethodInfo,
+		TraitDef,
+		TraitMethodSig,
+		TraitObligation,
+		TraitObligationResolution(
+			TraitObligationDeferred,
+			TraitObligationSatisfied,
+			TraitObligationUnsatisfied,
+		),
+		env_get_type_param_bound_identities,
+		env_get_type_param_bounds,
+		env_resolve_trait_obligation,
+		impl_instances_may_overlap,
+		implementation_pattern_matches_with,
+		trait_obligation,
+	generic_params: BoundTraitIdentity, BoundTypeParam, bound_trait_identities_equal
+	semantic_type:
+		SemanticType(SemanticArrayType, SemanticMetaType, SemanticNamedType, SemanticTypeVar),
+		localize_module_types,
+		types_equal,
+
+
+record AcceptedTraitTableRecord {
+	id: TraitId,
+	compiler_builtin_id: Option[TraitId],
+	owner_module_path: String,
+	visibility: DeclarationVisibility,
+	supertraits: List[TraitId],
+	method_ids: List[TraitMethodId],
+	definition: TraitDef
+}
+
+
+record AcceptedImplementationTableRecord {
+	id: ImplId,
+	trait_id: TraitId,
+	owner_module_path: String,
+	visibility: DeclarationVisibility,
+	method_ids: List[CallableId],
+	instance: ImplInstance
+}
+
+
+record AcceptedTraitImplementationTableInput {
+	traits: List[AcceptedTraitTableRecord],
+	implementations: List[AcceptedImplementationTableRecord]
+}
+
+
+record AcceptedImplementationDefinitionIds {
+	id: ImplId,
+	method_ids: List[CallableId]
+}
+
+
+record AcceptedVisibleTraitBinding {
+	source_name: String,
+	owner_module_path: String,
+	original_name: String
+}
+
+
+private record AcceptedTraitImplementationTableRep {
+	traits: List[AcceptedTraitTableRecord],
+	implementations: List[AcceptedImplementationTableRecord],
+	implementation_trait_method_ids: List[List[Option[TraitMethodId]]],
+	satisfied_trait_indices_by_implementation: List[List[Int]],
+	conflicting_implementation_indices_by_implementation: List[List[Int]],
+	trait_indices_by_module_and_definition_id: Dict[String, Dict[Int, Int]],
+	trait_index_by_compiler_identity: Dict[String, Int],
+	implementation_indices_by_module_and_definition_id: Dict[String, Dict[Int, Int]],
+	trait_indices_by_module_identity: Dict[String, List[Int]],
+	implementation_indices_by_module_identity: Dict[String, List[Int]]
+}
+
+
+opaque type AcceptedTraitImplementationTable = AcceptedTraitImplementationTableRep
+
+
+private record AcceptedCompilerImplementationBucket {
+	trait_id: TraitId,
+	implementation_indices: List[Int]
+}
+
+
+private record AcceptedTraitImplementationAuthorityRep {
+	table: AcceptedTraitImplementationTable,
+	owner: ModuleIdentity,
+	visible_trait_indices: List[Int],
+	trait_indices_by_semantic_name: Dict[String, Int],
+	visible_trait_indices_by_name: Dict[String, Int],
+	visible_implementation_indices: List[Int],
+	implementation_indices_by_satisfied_trait_index: Dict[Int, List[Int]],
+	implementation_indices_by_trait_name: Dict[String, List[Int]],
+	compiler_implementations_by_trait_identity: Dict[String, AcceptedCompilerImplementationBucket],
+	qualified_implementation_indices_by_module_and_method: Dict[String, Dict[String, List[Int]]],
+	trait_name_by_method_name: Dict[String, String],
+	preparation_errors: List[String]
+}
+
+
+opaque type AcceptedTraitImplementationAuthority = AcceptedTraitImplementationAuthorityRep
+
+
+struct AcceptedTraitImplementationAuthorityMetrics {
+	accepted_trait_table_entries: Int,
+	accepted_implementation_table_entries: Int,
+	accepted_trait_semantic_conversions: Int,
+	accepted_implementation_semantic_conversions: Int,
+	module_view_trait_indices: Int,
+	module_view_implementation_indices: Int,
+	module_view_coherence_overlap_checks: Int,
+	legacy_graph_trait_env_installs: Int,
+	legacy_graph_implementation_env_installs: Int,
+	module_view_full_record_copies: Int,
+	exact_query_graph_scans: Int
+}
+
+
+private pure func table_rep(
+	table: AcceptedTraitImplementationTable,
+) -> AcceptedTraitImplementationTableRep:
+	from_opaque AcceptedTraitImplementationTable(table)
+
+
+private pure func authority_rep(
+	authority: AcceptedTraitImplementationAuthority,
+) -> AcceptedTraitImplementationAuthorityRep:
+	from_opaque AcceptedTraitImplementationAuthority(authority)
+
+
+private pure func trait_identity_key(id: TraitId) -> String:
+	module_identity_storage_key(
+		trait_id_module_identity(
+			id,
+		),
+	) + "#" + trait_id_definition_id(id).to_string() + "#" + trait_id_name(id)
+
+
+private pure func bound_trait_identity_key(identity: BoundTraitIdentity) -> String:
+	module_identity_storage_key(
+		identity.module_identity,
+	) + "#" + identity.definition_id.to_string() + "#" + identity.name
+
+
+private pure func bound_trait_identity_matches_id(
+	identity: BoundTraitIdentity,
+	id: TraitId,
+) -> Bool:
+	(
+		module_identities_equal(trait_id_module_identity(id), identity.module_identity)
+		and trait_id_definition_id(id) == identity.definition_id
+		and trait_id_name(id) == identity.name
+		and source_spans_equal(trait_id_source_span(id), identity.span)
+		and trait_id_is_compiler_builtin(id) == identity.compiler_builtin
+	)
+
+
+private pure func trait_method_ids_are_valid(item: AcceptedTraitTableRecord) -> Bool:
+	if item.method_ids.length() != item.definition.methods.length():
+		False
+	else:
+		var valid: Bool = True
+
+		for indexed in item.method_ids.enumerate():
+			method = item.definition.methods.get(indexed[0])
+
+			if (
+				method.is_none()
+				or not trait_ids_equal(trait_method_id_owner(indexed[1]), item.id)
+				or trait_method_id_index(indexed[1]) != indexed[0]
+				or trait_method_id_name(indexed[1]) != method
+					.map(func(value): value.name)
+					.get_or("")
+			):
+				valid = False
+				break
+
+		valid
+
+
+private pure func implementation_method_ids_are_valid(
+	item: AcceptedImplementationTableRecord,
+) -> Bool:
+	if item.method_ids.length() != item.instance.methods.length():
+		False
+	else:
+		var valid: Bool = True
+		var seen_method_definition_ids: Dict[Int, Bool] = {}
+
+		for pair in item.method_ids.zip(item.instance.methods):
+			definition_id = callable_id_definition_id(pair[0])
+
+			if (
+				seen_method_definition_ids.contains(definition_id)
+				or not module_identities_equal(
+					callable_id_module_identity(pair[0]),
+					impl_id_module_identity(item.id),
+				)
+				or callable_id_name(pair[0]) != pair[1].name
+				or match pair[1].target:
+					Some(target):
+						(
+							target.callable_id != callable_id_definition_id(pair[0])
+							or target.module_path != item.owner_module_path
+						)
+					None:
+						True
+			):
+				valid = False
+				break
+			else:
+				seen_method_definition_ids = seen_method_definition_ids.set(definition_id, True)
+
+		valid
+
+
+private pure func trait_record_is_valid(item: AcceptedTraitTableRecord) -> Bool:
+	(
+		item.definition.def_id == trait_id_definition_id(item.id)
+		and item.definition.name == trait_id_name(item.id)
+		and item.definition.module_path == Some(item.owner_module_path)
+		and module_identity_matches_module_path(
+			trait_id_module_identity(item.id),
+			item.owner_module_path,
+		)
+		and match item.compiler_builtin_id:
+			Some(id):
+				trait_id_is_compiler_builtin(id) and trait_id_name(id) == trait_id_name(item.id)
+			None:
+				True
+		and trait_method_ids_are_valid(item)
+	)
+
+
+private pure func implementation_record_is_valid(item: AcceptedImplementationTableRecord) -> Bool:
+	(
+		item.instance.def_id == impl_id_definition_id(item.id)
+		and impl_id_name(item.id) == trait_id_name(item.trait_id)
+		and item.instance.trait_name == trait_id_name(item.trait_id)
+		and module_identity_matches_module_path(
+			impl_id_module_identity(item.id),
+			item.owner_module_path,
+		)
+		and implementation_method_ids_are_valid(item)
+	)
+
+
+private pure func implementation_method_ids_conflict_with_index(
+	indices: Dict[String, Dict[Int, Bool]],
+	item: AcceptedImplementationTableRecord,
+) -> Bool:
+	var conflict: Bool = False
+
+	for id in item.method_ids:
+		module_ids = indices.get_or(
+			module_identity_storage_key(callable_id_module_identity(id)),
+			{},
+		)
+
+		if module_ids.contains(callable_id_definition_id(id)):
+			conflict = True
+			break
+
+	conflict
+
+
+private pure func index_implementation_method_ids(
+	indices: Dict[String, Dict[Int, Bool]],
+	item: AcceptedImplementationTableRecord,
+) -> Dict[String, Dict[Int, Bool]]:
+	var result = indices
+
+	for id in item.method_ids:
+		module_key = module_identity_storage_key(callable_id_module_identity(id))
+		result = result.set(
+			module_key,
+			result.get_or(module_key, {}).set(
+				callable_id_definition_id(id),
+				True,
+			),
+		)
+
+	result
+
+
+private pure func trait_index_from_indices(
+	traits: List[AcceptedTraitTableRecord],
+	indices: Dict[String, Dict[Int, Int]],
+	id: TraitId,
+) -> Option[Int]:
+	definitions ?= indices.get(module_identity_storage_key(trait_id_module_identity(id)))
+	index ?= definitions.get(trait_id_definition_id(id))
+	item ?= traits.get(index)
+
+	if trait_ids_equal(item.id, id):
+		Some(index)
+	else:
+		None
+
+
+private pure func append_unique_index(indices: List[Int], index: Int) -> List[Int]:
+	if indices.contains(index):
+		indices
+	else:
+		indices.append(index)
+
+
+private pure func compiler_trait_index_from_indices(
+	traits: List[AcceptedTraitTableRecord],
+	indices: Dict[String, Int],
+	id: TraitId,
+) -> Option[Int]:
+	index ?= indices.get(trait_identity_key(id))
+	item ?= traits.get(index)
+	linked ?= item.compiler_builtin_id
+
+	if trait_ids_equal(linked, id):
+		Some(index)
+	else:
+		None
+
+
+private pure func trait_compiler_link_from_indices(
+	traits: List[AcceptedTraitTableRecord],
+	trait_indices: Dict[String, Dict[Int, Int]],
+	id: TraitId,
+) -> Option[TraitId]:
+	if trait_id_is_compiler_builtin(id):
+		Some(id)
+	else:
+		trait_index_from_indices(traits, trait_indices, id)
+			.and_then(func(index): traits.get(index))
+			.and_then(func(item): item.compiler_builtin_id)
+
+
+private pure func trait_semantic_identity_key_from_indices(
+	traits: List[AcceptedTraitTableRecord],
+	trait_indices: Dict[String, Dict[Int, Int]],
+	id: TraitId,
+) -> String:
+	trait_identity_key(trait_compiler_link_from_indices(traits, trait_indices, id).get_or(id))
+
+
+private pure func append_conflicting_implementation_index(
+	conflicts: List[List[Int]],
+	implementation_index: Int,
+	conflicting_index: Int,
+) -> List[List[Int]]:
+	match conflicts.get(implementation_index):
+		Some(indices):
+			conflicts.set(
+				implementation_index,
+				indices.append(conflicting_index),
+			)
+		None:
+			conflicts
+
+
+private pure func satisfied_trait_indices_seen(
+	traits: List[AcceptedTraitTableRecord],
+	trait_indices: Dict[String, Dict[Int, Int]],
+	trait_indices_by_compiler_identity: Dict[String, Int],
+	seen: List[Int],
+	trait_id: TraitId,
+) -> List[Int]:
+	trait_index = match trait_index_from_indices(traits, trait_indices, trait_id):
+		Some(index):
+			Some(index)
+		None:
+			if trait_id_is_compiler_builtin(trait_id):
+				compiler_trait_index_from_indices(
+					traits,
+					trait_indices_by_compiler_identity,
+					trait_id,
+				)
+			else:
+				None
+
+	match trait_index:
+		Some(index):
+			if seen.contains(index):
+				[]
+			else:
+				var result: List[Int] = [index]
+
+				match traits.get(index):
+					Some(item):
+						for supertrait in item.supertraits:
+							for satisfied_index in satisfied_trait_indices_seen(
+								traits,
+								trait_indices,
+								trait_indices_by_compiler_identity,
+								seen.append(index),
+								supertrait,
+							):
+								result = append_unique_index(result, satisfied_index)
+					None:
+						void
+
+				result
+		None:
+			[]
+
+
+private pure func trait_method_id_for_name_seen(
+	traits: List[AcceptedTraitTableRecord],
+	indices: Dict[String, Dict[Int, Int]],
+	indices_by_compiler_identity: Dict[String, Int],
+	seen: List[Int],
+	trait_id: TraitId,
+	method_name: String,
+) -> Option[TraitMethodId]:
+	trait_index ?= match trait_index_from_indices(traits, indices, trait_id):
+		Some(index):
+			Some(index)
+		None:
+			if trait_id_is_compiler_builtin(trait_id):
+				compiler_trait_index_from_indices(traits, indices_by_compiler_identity, trait_id)
+			else:
+				None
+
+	if seen.contains(trait_index):
+		None
+	else:
+		item ?= traits.get(trait_index)
+		var result: Option[TraitMethodId] = None
+
+		for method_id in item.method_ids:
+			if trait_method_id_name(method_id) == method_name:
+				result = Some(method_id)
+				break
+
+		if result.is_none():
+			for supertrait in item.supertraits:
+				match trait_method_id_for_name_seen(
+					traits,
+					indices,
+					indices_by_compiler_identity,
+					seen.append(trait_index),
+					supertrait,
+					method_name,
+				):
+					Some(method_id):
+						result = Some(method_id)
+					None:
+						void
+
+				if result.is_some():
+					break
+
+		result
+
+
+pure func accepted_trait_implementation_table_validation_errors(
+	input: AcceptedTraitImplementationTableInput,
+) -> List[String]:
+	var errors: List[String] = []
+	var trait_indices: Dict[String, Dict[Int, Int]] = {}
+
+	for indexed in input.traits.enumerate():
+		item = indexed[1]
+		module_key = module_identity_storage_key(trait_id_module_identity(item.id))
+		definitions = trait_indices.get_or(module_key, {})
+		definition_id = trait_id_definition_id(item.id)
+
+		if definitions.contains(definition_id):
+			errors = errors.append(
+				"duplicate accepted trait ID for '" + trait_id_name(item.id) + "'",
+			)
+		else if not trait_record_is_valid(item):
+			errors = errors.append(
+				"invalid accepted trait record for '" + trait_id_name(item.id) + "'",
+			)
+		else:
+			trait_indices = trait_indices.set(
+				module_key,
+				definitions.set(definition_id, indexed[0]),
+			)
+
+	var implementation_ids: Dict[String, Dict[Int, Bool]] = {}
+	var implementation_method_ids: Dict[String, Dict[Int, Bool]] = {}
+
+	for item in input.implementations:
+		module_key = module_identity_storage_key(impl_id_module_identity(item.id))
+		definitions = implementation_ids.get_or(module_key, {})
+		definition_id = impl_id_definition_id(item.id)
+
+		if definitions.contains(definition_id):
+			errors = errors.append(
+				"duplicate accepted implementation ID for trait '" + trait_id_name(
+					item.trait_id,
+				) + "'",
+			)
+		else if not implementation_record_is_valid(item):
+			errors = errors.append(
+				"invalid accepted implementation record for trait '" + trait_id_name(
+					item.trait_id,
+				) + "'",
+			)
+		else if (
+			not trait_id_is_compiler_builtin(item.trait_id)
+			and trait_index_from_indices(input.traits, trait_indices, item.trait_id).is_none()
+		):
+			errors = errors.append(
+				"accepted implementation trait ID is absent for '" + trait_id_name(
+					item.trait_id,
+				) + "' owner=" + module_identity_storage_key(
+					trait_id_module_identity(
+						item.trait_id,
+					),
+				) + " definition=" + trait_id_definition_id(item.trait_id).to_string(),
+			)
+		else if implementation_method_ids_conflict_with_index(implementation_method_ids, item):
+			errors = errors.append(
+				"duplicate accepted implementation method ID for trait '" + trait_id_name(
+					item.trait_id,
+				) + "'",
+			)
+		else:
+			implementation_ids = implementation_ids.set(
+				module_key,
+				definitions.set(definition_id, True),
+			)
+			implementation_method_ids = index_implementation_method_ids(
+				implementation_method_ids,
+				item,
+			)
+
+	errors
+
+
+pure func accepted_trait_implementation_table(
+	input: AcceptedTraitImplementationTableInput,
+) -> Option[AcceptedTraitImplementationTable]:
+	var trait_indices: Dict[String, Dict[Int, Int]] = {}
+	var implementation_indices: Dict[String, Dict[Int, Int]] = {}
+	var implementation_method_ids: Dict[String, Dict[Int, Bool]] = {}
+	var trait_indices_by_module_identity: Dict[String, List[Int]] = {}
+	var implementation_indices_by_module_identity: Dict[String, List[Int]] = {}
+	var implementation_trait_method_ids: List[List[Option[TraitMethodId]]] = []
+	var satisfied_trait_indices_by_implementation: List[List[Int]] = []
+	var conflicting_implementation_indices_by_implementation: List[List[Int]] = []
+	var trait_index_by_compiler_identity: Dict[String, Int] = {}
+	var valid: Bool = True
+	var trait_index: Int = 0
+
+	for item in input.traits:
+		module_key = module_identity_storage_key(trait_id_module_identity(item.id))
+		definitions = trait_indices.get_or(module_key, {})
+		definition_id = trait_id_definition_id(item.id)
+
+		if definitions.contains(definition_id) or not trait_record_is_valid(item):
+			valid = False
+		else:
+			trait_indices = trait_indices.set(
+				module_key,
+				definitions.set(definition_id, trait_index),
+			)
+			owner_key = module_identity_storage_key(trait_id_module_identity(item.id))
+			trait_indices_by_module_identity = trait_indices_by_module_identity.set(
+				owner_key,
+				trait_indices_by_module_identity
+					.get_or(owner_key, [])
+					.append(trait_index),
+			)
+
+			match item.compiler_builtin_id:
+				Some(id):
+					identity_key = trait_identity_key(id)
+
+					if trait_index_by_compiler_identity.contains(identity_key):
+						valid = False
+					else:
+						trait_index_by_compiler_identity = trait_index_by_compiler_identity.set(
+							identity_key,
+							trait_index,
+						)
+				None:
+					void
+
+		trait_index += 1
+
+	var implementation_index: Int = 0
+
+	for item in input.implementations:
+		module_key = module_identity_storage_key(impl_id_module_identity(item.id))
+		definitions = implementation_indices.get_or(module_key, {})
+		definition_id = impl_id_definition_id(item.id)
+
+		if (
+			definitions.contains(definition_id)
+			or not implementation_record_is_valid(item)
+			or implementation_method_ids_conflict_with_index(implementation_method_ids, item)
+			or (
+				not trait_id_is_compiler_builtin(item.trait_id)
+				and trait_index_from_indices(input.traits, trait_indices, item.trait_id).is_none()
+			)
+		):
+			valid = False
+		else:
+			implementation_indices = implementation_indices.set(
+				module_key,
+				definitions.set(definition_id, implementation_index),
+			)
+			owner_key = module_identity_storage_key(impl_id_module_identity(item.id))
+			implementation_indices_by_module_identity = implementation_indices_by_module_identity.set(
+				owner_key,
+				implementation_indices_by_module_identity
+					.get_or(owner_key, [])
+					.append(implementation_index),
+			)
+			implementation_method_ids = index_implementation_method_ids(
+				implementation_method_ids,
+				item,
+			)
+
+		implementation_index += 1
+
+	for item in input.implementations:
+		conflicting_implementation_indices_by_implementation = conflicting_implementation_indices_by_implementation.append(
+			[],
+		)
+		satisfied_trait_indices_by_implementation = satisfied_trait_indices_by_implementation.append(
+			satisfied_trait_indices_seen(
+				input.traits,
+				trait_indices,
+				trait_index_by_compiler_identity,
+				[],
+				item.trait_id,
+			),
+		)
+		var method_traits: List[Option[TraitMethodId]] = []
+
+		for method_id in item.method_ids:
+			trait_method_id = trait_method_id_for_name_seen(
+				input.traits,
+				trait_indices,
+				trait_index_by_compiler_identity,
+				[],
+				item.trait_id,
+				callable_id_name(method_id),
+			)
+			method_traits = method_traits.append(trait_method_id)
+
+		implementation_trait_method_ids = implementation_trait_method_ids.append(method_traits)
+
+	-- Coherence relationships depend only on canonical table entries. Compute
+	-- them once within exact/compiler-linked trait buckets so unrelated traits
+	-- are never overlap candidates and module projections only test indices.
+	var coherence_buckets: Dict[String, List[Int]] = {}
+
+	for indexed in input.implementations.enumerate():
+		current_index = indexed[0]
+		current = indexed[1]
+		bucket_key = trait_semantic_identity_key_from_indices(
+			input.traits,
+			trait_indices,
+			current.trait_id,
+		)
+		prior_indices = coherence_buckets.get_or(bucket_key, [])
+
+		for prior_index in prior_indices:
+			match input.implementations.get(prior_index):
+				Some(prior):
+					match (prior.visibility, current.visibility):
+						(PublicDeclaration, PublicDeclaration):
+							if impl_instances_may_overlap(prior.instance, current.instance):
+								conflicting_implementation_indices_by_implementation = append_conflicting_implementation_index(
+									conflicting_implementation_indices_by_implementation,
+									prior_index,
+									current_index,
+								)
+								conflicting_implementation_indices_by_implementation = append_conflicting_implementation_index(
+									conflicting_implementation_indices_by_implementation,
+									current_index,
+									prior_index,
+								)
+						(PublicDeclaration, PrivateDeclaration):
+							if impl_instances_may_overlap(prior.instance, current.instance):
+								conflicting_implementation_indices_by_implementation = append_conflicting_implementation_index(
+									conflicting_implementation_indices_by_implementation,
+									current_index,
+									prior_index,
+								)
+						(PrivateDeclaration, PublicDeclaration):
+							if impl_instances_may_overlap(prior.instance, current.instance):
+								conflicting_implementation_indices_by_implementation = append_conflicting_implementation_index(
+									conflicting_implementation_indices_by_implementation,
+									prior_index,
+									current_index,
+								)
+						(PrivateDeclaration, PrivateDeclaration):
+							if types_equal(prior.instance.for_type, current.instance.for_type):
+								conflicting_implementation_indices_by_implementation = append_conflicting_implementation_index(
+									conflicting_implementation_indices_by_implementation,
+									prior_index,
+									current_index,
+								)
+								conflicting_implementation_indices_by_implementation = append_conflicting_implementation_index(
+									conflicting_implementation_indices_by_implementation,
+									current_index,
+									prior_index,
+								)
+				None:
+					void
+
+		coherence_buckets = coherence_buckets.set(
+			bucket_key,
+			prior_indices.append(current_index),
+		)
+
+	if valid:
+		Some(into_opaque AcceptedTraitImplementationTable({
+					traits = input.traits,
+					implementations = input.implementations,
+					implementation_trait_method_ids = implementation_trait_method_ids,
+					satisfied_trait_indices_by_implementation = satisfied_trait_indices_by_implementation,
+					conflicting_implementation_indices_by_implementation = conflicting_implementation_indices_by_implementation,
+					trait_indices_by_module_and_definition_id = trait_indices,
+					trait_index_by_compiler_identity = trait_index_by_compiler_identity,
+					implementation_indices_by_module_and_definition_id = implementation_indices,
+					trait_indices_by_module_identity = trait_indices_by_module_identity,
+					implementation_indices_by_module_identity = implementation_indices_by_module_identity
+				}))
+	else:
+		None
+
+
+pure func accepted_trait_ids_for_owner(
+	table: AcceptedTraitImplementationTable,
+	owner: ModuleIdentity,
+) -> List[TraitId]:
+	representation = table_rep(table)
+	var result: List[TraitId] = []
+
+	for index in representation.trait_indices_by_module_identity.get_or(
+		module_identity_storage_key(owner),
+		[],
+	):
+		match representation.traits.get(index):
+			Some(item):
+				result = result.append(item.id)
+			None:
+				void
+
+	result
+
+
+pure func accepted_implementation_definition_ids_for_owner(
+	table: AcceptedTraitImplementationTable,
+	owner: ModuleIdentity,
+) -> List[AcceptedImplementationDefinitionIds]:
+	representation = table_rep(table)
+	var result: List[AcceptedImplementationDefinitionIds] = []
+
+	for index in representation.implementation_indices_by_module_identity.get_or(
+		module_identity_storage_key(owner),
+		[],
+	):
+		match representation.implementations.get(index):
+			Some(item):
+				result = result.append({
+					id = item.id,
+					method_ids = item.method_ids,
+				})
+			None:
+				void
+
+	result
+
+
+private pure func table_find_trait_index(
+	table: AcceptedTraitImplementationTableRep,
+	id: TraitId,
+) -> Option[Int]:
+	definitions ?= table.trait_indices_by_module_and_definition_id.get(
+		module_identity_storage_key(trait_id_module_identity(id)),
+	)
+	index ?= definitions.get(trait_id_definition_id(id))
+	item ?= table.traits.get(index)
+
+	if trait_ids_equal(item.id, id):
+		Some(index)
+	else:
+		None
+
+
+private pure func table_find_bound_trait_index(
+	table: AcceptedTraitImplementationTableRep,
+	identity: BoundTraitIdentity,
+) -> Option[Int]:
+	if identity.compiler_builtin:
+		index ?= table.trait_index_by_compiler_identity.get(bound_trait_identity_key(identity))
+		item ?= table.traits.get(index)
+		linked ?= item.compiler_builtin_id
+
+		if bound_trait_identity_matches_id(identity, linked):
+			Some(index)
+		else:
+			None
+	else:
+		definitions ?= table.trait_indices_by_module_and_definition_id.get(
+			module_identity_storage_key(identity.module_identity),
+		)
+		index ?= definitions.get(identity.definition_id)
+		item ?= table.traits.get(index)
+
+		if bound_trait_identity_matches_id(identity, item.id):
+			Some(index)
+		else:
+			None
+
+
+private pure func table_find_implementation_index(
+	table: AcceptedTraitImplementationTableRep,
+	id: ImplId,
+) -> Option[Int]:
+	definitions ?= table.implementation_indices_by_module_and_definition_id.get(
+		module_identity_storage_key(impl_id_module_identity(id)),
+	)
+	index ?= definitions.get(impl_id_definition_id(id))
+	item ?= table.implementations.get(index)
+
+	if impl_ids_equal(item.id, id):
+		Some(index)
+	else:
+		None
+
+
+private pure func table_trait_has_supertrait_seen(
+	table: AcceptedTraitImplementationTableRep,
+	seen: List[Int],
+	trait_index: Int,
+	target: TraitId,
+) -> Bool:
+	if seen.contains(trait_index):
+		False
+	else:
+		match table.traits.get(trait_index):
+			None:
+				False
+			Some(item):
+				var found: Bool = False
+
+				for supertrait in item.supertraits:
+					if trait_ids_equal(supertrait, target):
+						found = True
+					else:
+						match table_find_trait_index(table, supertrait):
+							Some(supertrait_index):
+								if table_trait_has_supertrait_seen(
+									table,
+									seen.append(trait_index),
+									supertrait_index,
+									target,
+								):
+									found = True
+							None:
+								void
+
+					if found:
+						break
+
+				found
+
+
+private pure func table_trait_compiler_link(
+	table: AcceptedTraitImplementationTableRep,
+	id: TraitId,
+) -> Option[TraitId]:
+	if trait_id_is_compiler_builtin(id):
+		Some(id)
+	else:
+		table_find_trait_index(table, id)
+			.and_then(func(index): table.traits.get(index))
+			.and_then(func(item): item.compiler_builtin_id)
+
+
+private pure func table_trait_ids_semantically_equivalent(
+	table: AcceptedTraitImplementationTableRep,
+	left: TraitId,
+	right: TraitId,
+) -> Bool:
+	(
+		trait_ids_equal(left, right)
+		or match (table_trait_compiler_link(table, left), table_trait_compiler_link(table, right)):
+			(Some(left_compiler), Some(right_compiler)):
+				trait_ids_equal(left_compiler, right_compiler)
+			_:
+				False
+	)
+
+
+private pure func implementation_type_label(
+	owner: ModuleIdentity,
+	item: AcceptedImplementationTableRecord,
+) -> String:
+	for_type = if module_identities_equal(impl_id_module_identity(item.id), owner):
+		localize_module_types(item.owner_module_path, item.instance.for_type)
+	else:
+		item.instance.for_type
+
+	match for_type:
+		SemanticNamedType(name, _):
+			name
+		_:
+			"<non-named type>"
+
+
+pure func accepted_trait_implementation_authority(
+	table: AcceptedTraitImplementationTable,
+	owner: ModuleIdentity,
+	bindings: List[AcceptedVisibleTraitBinding],
+	direct_module_identities: List[ModuleIdentity],
+) -> AcceptedTraitImplementationAuthority:
+	representation = table_rep(table)
+	var visible_traits: Dict[String, Int] = {}
+	var visible_trait_indices: List[Int] = []
+	var visible_implementations: List[Int] = []
+	var implementation_indices_by_satisfied_trait_index: Dict[Int, List[Int]] = {}
+	var implementation_indices_by_trait_name: Dict[String, List[Int]] = {}
+	var compiler_implementations_by_trait_identity: Dict[String, AcceptedCompilerImplementationBucket] = {
+
+	}
+	var qualified_implementation_indices_by_module_and_method: Dict[String, Dict[String, List[Int]]] = {
+
+	}
+	var trait_name_by_method_name: Dict[String, String] = {}
+	var preparation_errors: List[String] = []
+
+	for module_identity in direct_module_identities:
+		module_key = module_identity_storage_key(module_identity)
+
+		for index in representation.trait_indices_by_module_identity.get_or(module_key, []):
+			match representation.traits.get(index):
+				Some(item):
+					if item.visibility == PublicDeclaration:
+						visible_trait_indices = append_unique_index(visible_trait_indices, index)
+				None:
+					void
+
+	owner_key = module_identity_storage_key(owner)
+
+	for index in representation.trait_indices_by_module_identity.get_or(owner_key, []):
+		visible_trait_indices = append_unique_index(visible_trait_indices, index)
+
+	var visible_trait_index_set: Dict[Int, Bool] = {}
+
+	for index in visible_trait_indices:
+		visible_trait_index_set = visible_trait_index_set.set(index, True)
+
+	for index in representation.trait_indices_by_module_identity.get_or(owner_key, []):
+		match representation.traits.get(index):
+			Some(item):
+				visible_traits = visible_traits.set(item.definition.name, index)
+			None:
+				void
+
+	for binding in bindings:
+		for index in visible_trait_indices:
+			match representation.traits.get(index):
+				Some(item):
+					if (
+						item.visibility == PublicDeclaration
+						and item.owner_module_path == binding.owner_module_path
+						and item.definition.name == binding.original_name
+					):
+						visible_traits = visible_traits.set(binding.source_name, index)
+						break
+				None:
+					void
+
+	-- Compiler-linked prelude traits are intentionally available without an
+	-- explicit source binding. User-defined traits, including qualified-only
+	-- namesakes, never enter the bare-name map through this path.
+	for index in visible_trait_indices:
+		match representation.traits.get(index):
+			Some(item):
+				if (
+					item.compiler_builtin_id.is_some()
+					and not visible_traits.contains(item.definition.name)
+				):
+					visible_traits = visible_traits.set(item.definition.name, index)
+			None:
+				void
+
+	-- Semantic trait-method and obligation resolution also sees ambient direct
+	-- implementation modules. Resolved source bindings win, so adding a
+	-- qualified-only namesake cannot replace a selective or local trait.
+	var semantic_traits = visible_traits
+
+	for index in visible_trait_indices:
+		match representation.traits.get(index):
+			Some(item):
+				if not semantic_traits.contains(item.definition.name):
+					semantic_traits = semantic_traits.set(item.definition.name, index)
+			None:
+				void
+
+	for index in visible_trait_indices:
+		match representation.traits.get(index):
+			Some(_):
+				for pair in table_trait_methods_seen(representation, [], index):
+					match trait_name_by_method_name.get(pair[0]):
+						Some(existing_trait):
+							if existing_trait != pair[1]:
+								preparation_errors = preparation_errors.append(
+									"method '" + pair[0] + "' is already registered under trait '" + existing_trait + "'; cannot also register under '" + pair[1] + "'",
+								)
+						None:
+							trait_name_by_method_name = trait_name_by_method_name.set(
+								pair[0],
+								pair[1],
+							)
+			None:
+				void
+
+	for module_identity in direct_module_identities:
+		module_key = module_identity_storage_key(module_identity)
+
+		for index in representation.implementation_indices_by_module_identity.get_or(
+			module_key,
+			[],
+		):
+			match representation.implementations.get(index):
+				Some(item):
+					if item.visibility == PublicDeclaration:
+						visible_implementations = append_unique_index(
+							visible_implementations,
+							index,
+						)
+				None:
+					void
+
+	for index in representation.implementation_indices_by_module_identity.get_or(owner_key, []):
+		visible_implementations = append_unique_index(visible_implementations, index)
+
+	var prior_visible_implementation_indices: Dict[Int, Bool] = {}
+	var accepted_visible_implementation_indices: List[Int] = []
+
+	for index in visible_implementations:
+		match representation.implementations.get(index):
+			Some(item):
+				var conflict: Bool = False
+
+				for conflicting_index in representation.conflicting_implementation_indices_by_implementation.get_or(
+					index,
+					[],
+				):
+					if prior_visible_implementation_indices.contains(conflicting_index):
+						conflict = True
+						break
+
+				if conflict:
+					preparation_errors = preparation_errors.append(
+						"conflicting implementation of trait '" + item.instance.trait_name + "' for type '" + implementation_type_label(
+							owner,
+							item,
+						) + "'",
+					)
+				else:
+					prior_visible_implementation_indices = prior_visible_implementation_indices.set(
+						index,
+						True,
+					)
+					accepted_visible_implementation_indices = accepted_visible_implementation_indices.append(
+						index,
+					)
+			None:
+				void
+
+	visible_implementations = accepted_visible_implementation_indices
+
+	for index in visible_implementations:
+		match representation.implementations.get(index):
+			Some(item):
+				implementation_indices_by_trait_name = implementation_indices_by_trait_name.set(
+					item.instance.trait_name,
+					implementation_indices_by_trait_name
+						.get_or(item.instance.trait_name, [])
+						.append(index),
+				)
+				method_trait_ids = representation.implementation_trait_method_ids.get_or(index, [])
+
+				for method_trait_id in method_trait_ids:
+					match method_trait_id:
+						Some(id):
+							method_name = trait_method_id_name(id)
+							var owner_paths: List[String] = [item.owner_module_path]
+
+							match table_find_trait_index(representation, trait_method_id_owner(id)):
+								Some(trait_index):
+									match representation.traits.get(trait_index):
+										Some(trait_item):
+											if not owner_paths.contains(
+												trait_item.owner_module_path,
+											):
+												owner_paths = owner_paths.append(
+													trait_item.owner_module_path,
+												)
+										None:
+											void
+								None:
+									void
+
+							for module_path in owner_paths:
+								methods = qualified_implementation_indices_by_module_and_method.get_or(
+									module_path,
+									{},
+								)
+								indices = methods.get_or(method_name, [])
+								qualified_implementation_indices_by_module_and_method = qualified_implementation_indices_by_module_and_method.set(
+									module_path,
+									methods.set(
+										method_name,
+										append_unique_index(indices, index),
+									),
+								)
+						None:
+							void
+
+				for trait_index in representation.satisfied_trait_indices_by_implementation.get_or(
+					index,
+					[],
+				):
+					if visible_trait_index_set.contains(trait_index):
+						implementation_indices_by_satisfied_trait_index = implementation_indices_by_satisfied_trait_index.set(
+							trait_index,
+							implementation_indices_by_satisfied_trait_index
+								.get_or(trait_index, [])
+								.append(index),
+						)
+
+				match table_trait_compiler_link(representation, item.trait_id):
+					Some(id):
+						identity_key = trait_identity_key(id)
+						bucket = compiler_implementations_by_trait_identity.get_or(
+							identity_key,
+							{
+								trait_id = id,
+								implementation_indices = []
+							},
+						)
+						compiler_implementations_by_trait_identity = compiler_implementations_by_trait_identity.set(
+							identity_key,
+							{ bucket |
+								implementation_indices = bucket.implementation_indices.append(index)
+							},
+						)
+					None:
+						void
+			None:
+				void
+
+	into_opaque AcceptedTraitImplementationAuthority({
+			table = table,
+			owner = owner,
+			visible_trait_indices = visible_trait_indices,
+			trait_indices_by_semantic_name = semantic_traits,
+			visible_trait_indices_by_name = visible_traits,
+			visible_implementation_indices = visible_implementations,
+			implementation_indices_by_satisfied_trait_index = implementation_indices_by_satisfied_trait_index,
+			implementation_indices_by_trait_name = implementation_indices_by_trait_name,
+			compiler_implementations_by_trait_identity = compiler_implementations_by_trait_identity,
+			qualified_implementation_indices_by_module_and_method = qualified_implementation_indices_by_module_and_method,
+			trait_name_by_method_name = trait_name_by_method_name,
+			preparation_errors = preparation_errors
+		})
+
+
+pure func accepted_trait_implementation_authority_without_visible_names(
+	authority: AcceptedTraitImplementationAuthority,
+) -> AcceptedTraitImplementationAuthority:
+	representation = authority_rep(authority)
+	into_opaque AcceptedTraitImplementationAuthority({ representation |
+			visible_trait_indices = [],
+			visible_trait_indices_by_name = {},
+			trait_name_by_method_name = {},
+			preparation_errors = []
+		})
+
+
+pure func accepted_trait_implementation_authority_preparation_errors(
+	authority: AcceptedTraitImplementationAuthority,
+) -> List[String]:
+	authority_rep(authority).preparation_errors
+
+
+private pure func localized_trait_method(
+	module_path: String,
+	method: TraitMethodSig,
+) -> TraitMethodSig:
+	{ method |
+		params = method.params.map(func(parameter): localize_module_types(module_path, parameter)),
+		return_type = localize_module_types(module_path, method.return_type)
+	}
+
+
+private pure func trait_for_authority(
+	authority: AcceptedTraitImplementationAuthorityRep,
+	item: AcceptedTraitTableRecord,
+) -> TraitDef:
+	if module_identities_equal(trait_id_module_identity(item.id), authority.owner):
+		{ item.definition |
+			methods = item.definition.methods.map(
+				func(method): localized_trait_method(item.owner_module_path, method),
+			)
+		}
+	else:
+		item.definition
+
+
+pure func accepted_trait_find(
+	authority: AcceptedTraitImplementationAuthority,
+	name: String,
+) -> Option[TraitDef]:
+	representation = authority_rep(authority)
+	index ?= representation.visible_trait_indices_by_name.get(name)
+	table_rep(representation.table).traits
+		.get(index)
+		.map(func(item): trait_for_authority(representation, item))
+
+
+pure func accepted_trait_contains(
+	authority: AcceptedTraitImplementationAuthority,
+	name: String,
+) -> Bool:
+	authority_rep(authority).visible_trait_indices_by_name.contains(name)
+
+
+pure func accepted_trait_allows_compiler_fallback(
+	authority: AcceptedTraitImplementationAuthority,
+	name: String,
+) -> Bool:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+
+	match representation.visible_trait_indices_by_name.get(name):
+		Some(index):
+			table.traits
+				.get(index)
+				.and_then(func(item): item.compiler_builtin_id)
+				.is_some()
+		None:
+			builtin_trait_id(name).is_some()
+
+
+pure func accepted_trait_module_path(
+	authority: AcceptedTraitImplementationAuthority,
+	name: String,
+) -> Option[String]:
+	representation = authority_rep(authority)
+	index ?= representation.visible_trait_indices_by_name.get(name)
+	table_rep(representation.table).traits
+		.get(index)
+		.map(func(item): item.owner_module_path)
+
+
+pure func accepted_trait_find_exact(
+	authority: AcceptedTraitImplementationAuthority,
+	id: TraitId,
+) -> Option[TraitDef]:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+	index ?= table_find_trait_index(table, id)
+	item ?= table.traits.get(index)
+
+	if trait_ids_equal(item.id, id):
+		Some(trait_for_authority(representation, item))
+	else:
+		None
+
+
+pure func accepted_trait_has_supertrait(
+	authority: AcceptedTraitImplementationAuthority,
+	trait_name: String,
+	target_name: String,
+) -> Bool:
+	if trait_name == target_name:
+		False
+	else:
+		representation = authority_rep(authority)
+		table = table_rep(representation.table)
+
+		match (
+			representation.trait_indices_by_semantic_name.get(trait_name),
+			representation.trait_indices_by_semantic_name.get(target_name),
+		):
+			(Some(trait_index), Some(target_index)):
+				match table.traits.get(target_index):
+					Some(target):
+						table_trait_has_supertrait_seen(table, [], trait_index, target.id)
+					None:
+						False
+			_:
+				False
+
+
+record AcceptedQualifiedTraitMethodInfo {
+	trait_name: String,
+	trait_identity: Option[BoundTraitIdentity],
+	method: TraitMethodSig,
+	implementation_method: ImplMethodInfo
+}
+
+
+private pure func bound_trait_identity_from_id(id: TraitId) -> BoundTraitIdentity:
+	{
+		module_identity = trait_id_module_identity(id),
+		definition_id = trait_id_definition_id(id),
+		name = trait_id_name(id),
+		span = trait_id_source_span(id),
+		compiler_builtin = trait_id_is_compiler_builtin(id)
+	}
+
+
+private record AcceptedTraitMethodMatch {
+	id: TraitMethodId,
+	signature: TraitMethodSig,
+	declaring_trait_name: String
+}
+
+
+private pure func table_find_trait_method_seen(
+	authority: AcceptedTraitImplementationAuthorityRep,
+	seen: List[Int],
+	trait_index: Int,
+	method_name: String,
+) -> Option[AcceptedTraitMethodMatch]:
+	if seen.contains(trait_index):
+		None
+	else:
+		table = table_rep(authority.table)
+		item ?= table.traits.get(trait_index)
+		var result: Option[AcceptedTraitMethodMatch] = None
+
+		for indexed in item.definition.methods.enumerate():
+			match item.method_ids.get(indexed[0]):
+				Some(method_id):
+					if trait_method_id_name(method_id) == method_name:
+						signature = if module_identities_equal(
+							trait_id_module_identity(item.id),
+							authority.owner,
+						):
+							localized_trait_method(item.owner_module_path, indexed[1])
+						else:
+							indexed[1]
+
+						result = Some({
+							id = method_id,
+							signature = signature,
+							declaring_trait_name = item.definition.name,
+						})
+						break
+				None:
+					void
+
+		if result.is_none():
+			for supertrait in item.supertraits:
+				match table_find_trait_index(table, supertrait):
+					Some(supertrait_index):
+						match table_find_trait_method_seen(
+							authority,
+							seen.append(trait_index),
+							supertrait_index,
+							method_name,
+						):
+							Some(found):
+								result = Some(found)
+							None:
+								void
+					None:
+						void
+
+				if result.is_some():
+					break
+
+		result
+
+
+pure func accepted_trait_find_method(
+	authority: AcceptedTraitImplementationAuthority,
+	trait_name: String,
+	method_name: String,
+) -> Option[(TraitMethodSig, String)]:
+	representation = authority_rep(authority)
+	trait_index ?= representation.trait_indices_by_semantic_name.get(trait_name)
+	table_find_trait_method_seen(
+		representation,
+		[],
+		trait_index,
+		method_name,
+	).map(
+		func(found): (found.signature, found.declaring_trait_name),
+	)
+
+
+private pure func append_unique_method_pair(
+	values: List[(String, String)],
+	value: (String, String),
+) -> List[(String, String)]:
+	if values.contains(value):
+		values
+	else:
+		values.append(value)
+
+
+private pure func table_trait_methods_seen(
+	table: AcceptedTraitImplementationTableRep,
+	seen: List[Int],
+	trait_index: Int,
+) -> List[(String, String)]:
+	if seen.contains(trait_index):
+		[]
+	else:
+		match table.traits.get(trait_index):
+			None:
+				[]
+			Some(item):
+				var methods: List[(String, String)] = []
+
+				for method in item.definition.methods:
+					methods = append_unique_method_pair(
+						methods,
+						(method.name, item.definition.name),
+					)
+
+				for supertrait in item.supertraits:
+					match table_find_trait_index(table, supertrait):
+						Some(supertrait_index):
+							for pair in table_trait_methods_seen(
+								table,
+								seen.append(trait_index),
+								supertrait_index,
+							):
+								methods = append_unique_method_pair(methods, pair)
+						None:
+							void
+
+				methods
+
+
+pure func accepted_trait_methods_with_declaring_trait(
+	authority: AcceptedTraitImplementationAuthority,
+	trait_name: String,
+) -> List[(String, String)]:
+	representation = authority_rep(authority)
+
+	match representation.visible_trait_indices_by_name.get(trait_name):
+		Some(index):
+			table_trait_methods_seen(table_rep(representation.table), [], index)
+		None:
+			[]
+
+
+pure func accepted_trait_function_trait(
+	authority: AcceptedTraitImplementationAuthority,
+	method_name: String,
+) -> Option[String]:
+	representation = authority_rep(authority)
+
+	match representation.trait_name_by_method_name.get(method_name):
+		Some(name):
+			Some(name)
+		None:
+			None
+
+
+private pure func localized_implementation_method(
+	module_path: String,
+	method: ImplMethodInfo,
+) -> ImplMethodInfo:
+	{ method |
+		func_type = localize_module_types(module_path, method.func_type),
+		dim_constraints = method.dim_constraints.map(
+			func(
+				constraint,
+			): (
+				localize_module_types(module_path, constraint[0]),
+				localize_module_types(module_path, constraint[1]),
+			),
+		)
+	}
+
+
+private pure func implementation_for_authority(
+	authority: AcceptedTraitImplementationAuthorityRep,
+	item: AcceptedImplementationTableRecord,
+) -> ImplInstance:
+	if module_identities_equal(impl_id_module_identity(item.id), authority.owner):
+		{ item.instance |
+			for_type = localize_module_types(item.owner_module_path, item.instance.for_type),
+			methods = item.instance.methods.map(
+				func(method): localized_implementation_method(item.owner_module_path, method),
+			)
+		}
+	else:
+		item.instance
+
+
+pure func accepted_implementation_find_exact(
+	authority: AcceptedTraitImplementationAuthority,
+	id: ImplId,
+) -> Option[ImplInstance]:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+	index ?= table_find_implementation_index(table, id)
+	item ?= table.implementations.get(index)
+
+	if impl_ids_equal(item.id, id):
+		Some(implementation_for_authority(representation, item))
+	else:
+		None
+
+
+private pure func implementation_candidate_indices_for_trait(
+	authority: AcceptedTraitImplementationAuthorityRep,
+	trait_name: String,
+) -> List[Int]:
+	match authority.trait_indices_by_semantic_name.get(trait_name):
+		Some(trait_index):
+			authority.implementation_indices_by_satisfied_trait_index.get_or(trait_index, [])
+		None:
+			match builtin_trait_id(trait_name):
+				Some(id):
+					match authority.compiler_implementations_by_trait_identity.get(
+						trait_identity_key(id),
+					):
+						Some(bucket):
+							if trait_ids_equal(bucket.trait_id, id):
+								bucket.implementation_indices
+							else:
+								[]
+						None:
+							[]
+				None:
+					authority.implementation_indices_by_trait_name.get_or(trait_name, [])
+
+
+private pure func table_trait_represents_compiler_trait(
+	table: AcceptedTraitImplementationTableRep,
+	trait_id: TraitId,
+	compiler_trait_id: TraitId,
+) -> Bool:
+	if trait_ids_equal(trait_id, compiler_trait_id):
+		True
+	else:
+		match table_find_trait_index(table, trait_id):
+			Some(index):
+				match (
+					table.traits
+						.get(index)
+						.and_then(func(item): item.compiler_builtin_id)
+				):
+					Some(linked):
+						trait_ids_equal(linked, compiler_trait_id)
+					None:
+						False
+			None:
+				False
+
+
+pure func accepted_implementation_candidate_count(
+	authority: AcceptedTraitImplementationAuthority,
+	trait_name: String,
+) -> Int:
+	representation = authority_rep(authority)
+	implementation_candidate_indices_for_trait(representation, trait_name).length()
+
+
+private pure func accepted_type_param_has_trait_bound(
+	authority: AcceptedTraitImplementationAuthority,
+	env: Env,
+	param_name: String,
+	trait_name: String,
+) -> Bool:
+	var found: Bool = False
+
+	for bound in env_get_type_param_bounds(env, param_name):
+		if bound == trait_name or accepted_trait_has_supertrait(authority, bound, trait_name):
+			found = True
+			break
+
+	found
+
+
+private pure func accepted_type_param_has_exact_trait_bound(
+	authority: AcceptedTraitImplementationAuthority,
+	env: Env,
+	param_name: String,
+	requested: BoundTraitIdentity,
+) -> Bool:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+	requested_index = table_find_bound_trait_index(table, requested)
+	var found: Bool = False
+
+	for bound in env_get_type_param_bound_identities(env, param_name):
+		if bound_trait_identities_equal(bound, requested):
+			found = True
+		else:
+			match (table_find_bound_trait_index(table, bound), requested_index):
+				(Some(bound_index), Some(target_index)):
+					match table.traits.get(target_index):
+						Some(target):
+							if table_trait_has_supertrait_seen(table, [], bound_index, target.id):
+								found = True
+						None:
+							void
+				_:
+					void
+
+		if found:
+			break
+
+	found
+
+
+private pure func accepted_bound_obligation_is_satisfied(
+	authority: AcceptedTraitImplementationAuthority,
+	env: Env,
+	obligation: TraitObligation,
+	bound_identity: Option[BoundTraitIdentity],
+) -> Bool:
+	match bound_identity:
+		Some(identity):
+			accepted_resolve_exact_trait_obligation(
+				authority,
+				env,
+				obligation.obligation_type,
+				identity,
+			) == TraitObligationSatisfied
+		None:
+			accepted_resolve_trait_obligation(
+				authority,
+				env,
+				obligation,
+			) == TraitObligationSatisfied
+
+
+private pure func accepted_implementation_matches_type(
+	authority: AcceptedTraitImplementationAuthority,
+	env: Env,
+	item: AcceptedImplementationTableRecord,
+	typ: SemanticType,
+) -> Bool:
+	representation = authority_rep(authority)
+
+	for_type = if module_identities_equal(impl_id_module_identity(item.id), representation.owner):
+		localize_module_types(item.owner_module_path, item.instance.for_type)
+	else:
+		item.instance.for_type
+
+	implementation_pattern_matches_with(
+		for_type,
+		item.instance.bounds,
+		typ,
+		pure func(
+			obligation,
+			bound_identity,
+		): accepted_bound_obligation_is_satisfied(authority, env, obligation, bound_identity),
+	)
+
+
+private pure func accepted_has_matching_implementation(
+	authority: AcceptedTraitImplementationAuthority,
+	env: Env,
+	trait_name: String,
+	typ: SemanticType,
+) -> Bool:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+	var found: Bool = False
+
+	for index in implementation_candidate_indices_for_trait(representation, trait_name):
+		match table.implementations.get(index):
+			Some(item):
+				if accepted_implementation_matches_type(authority, env, item, typ):
+					found = True
+			None:
+				void
+
+		if found:
+			break
+
+	found
+
+
+private pure func accepted_has_matching_exact_implementation(
+	authority: AcceptedTraitImplementationAuthority,
+	env: Env,
+	trait_index: Int,
+	typ: SemanticType,
+) -> Bool:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+	var found: Bool = False
+
+	candidate_indices: List[Int] = match (
+		table.traits
+			.get(trait_index)
+			.and_then(func(item): item.compiler_builtin_id)
+	):
+		Some(compiler_id):
+			match representation.compiler_implementations_by_trait_identity.get(
+				trait_identity_key(compiler_id),
+			):
+				Some(bucket):
+					if trait_ids_equal(compiler_id, bucket.trait_id):
+						bucket.implementation_indices
+					else:
+						empty: List[Int] = []
+						empty
+				None:
+					empty: List[Int] = []
+					empty
+		None:
+			representation.implementation_indices_by_satisfied_trait_index.get_or(trait_index, [])
+
+	for index in candidate_indices:
+		match table.implementations.get(index):
+			Some(item):
+				if accepted_implementation_matches_type(authority, env, item, typ):
+					found = True
+			None:
+				void
+
+		if found:
+			break
+
+	found
+
+
+pure func accepted_resolve_exact_trait_obligation(
+	authority: AcceptedTraitImplementationAuthority,
+	env: Env,
+	typ: SemanticType,
+	identity: BoundTraitIdentity,
+) -> TraitObligationResolution:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+
+	match table_find_bound_trait_index(table, identity):
+		Some(trait_index):
+			match typ:
+				SemanticMetaType(_):
+					TraitObligationDeferred
+				SemanticTypeVar(name):
+					if accepted_type_param_has_exact_trait_bound(authority, env, name, identity):
+						TraitObligationSatisfied
+					else:
+						match (
+							table.traits
+								.get(trait_index)
+								.and_then(func(item): item.compiler_builtin_id)
+						):
+							Some(_):
+								env_resolve_trait_obligation(
+									env,
+									trait_obligation(typ, identity.name),
+								)
+							None:
+								TraitObligationUnsatisfied
+				_:
+					if accepted_has_matching_exact_implementation(authority, env, trait_index, typ):
+						TraitObligationSatisfied
+					else:
+						match (
+							table.traits
+								.get(trait_index)
+								.and_then(func(item): item.compiler_builtin_id)
+						):
+							Some(_):
+								env_resolve_trait_obligation(
+									env,
+									trait_obligation(typ, identity.name),
+								)
+							None:
+								TraitObligationUnsatisfied
+		None:
+			if identity.compiler_builtin:
+				env_resolve_trait_obligation(
+					env,
+					trait_obligation(typ, identity.name),
+				)
+			else:
+				TraitObligationUnsatisfied
+
+
+pure func accepted_find_unsatisfied_bound_type_param(
+	authority: AcceptedTraitImplementationAuthority,
+	env: Env,
+	param: BoundTypeParam,
+	concrete_type: SemanticType,
+) -> Option[TraitObligation]:
+	var unsatisfied: Option[TraitObligation] = None
+
+	for indexed_name in param.bounds.enumerate():
+		name = indexed_name[1]
+
+		resolution = match param.bound_identities.get(indexed_name[0]):
+			Some(identity):
+				accepted_resolve_exact_trait_obligation(authority, env, concrete_type, identity)
+			None:
+				accepted_resolve_trait_obligation(
+					authority,
+					env,
+					trait_obligation(concrete_type, name),
+				)
+
+		if resolution == TraitObligationUnsatisfied:
+			unsatisfied = Some(trait_obligation(concrete_type, name))
+			break
+
+	unsatisfied
+
+
+private pure func accepted_or_compiler_trait_obligation_resolution(
+	authority: AcceptedTraitImplementationAuthority,
+	env: Env,
+	obligation: TraitObligation,
+) -> TraitObligationResolution:
+	if accepted_trait_allows_compiler_fallback(authority, obligation.trait_name):
+		env_resolve_trait_obligation(env, obligation)
+	else:
+		TraitObligationUnsatisfied
+
+
+pure func accepted_resolve_trait_obligation(
+	authority: AcceptedTraitImplementationAuthority,
+	env: Env,
+	obligation: TraitObligation,
+) -> TraitObligationResolution:
+	match obligation.obligation_type:
+		SemanticMetaType(_):
+			TraitObligationDeferred
+		SemanticTypeVar(name):
+			if accepted_type_param_has_trait_bound(authority, env, name, obligation.trait_name):
+				TraitObligationSatisfied
+			else:
+				accepted_or_compiler_trait_obligation_resolution(authority, env, obligation)
+		SemanticNamedType(name, args):
+			if (
+				args.length() == 0
+				and accepted_type_param_has_trait_bound(authority, env, name, obligation.trait_name)
+			):
+				TraitObligationSatisfied
+			else if accepted_has_matching_implementation(
+				authority,
+				env,
+				obligation.trait_name,
+				obligation.obligation_type,
+			):
+				TraitObligationSatisfied
+			else:
+				accepted_or_compiler_trait_obligation_resolution(authority, env, obligation)
+		SemanticArrayType(_, _):
+			if (
+				obligation.trait_name == "HasLength"
+				or obligation.trait_name == "Stringable"
+				or accepted_has_matching_implementation(
+					authority,
+					env,
+					obligation.trait_name,
+					obligation.obligation_type,
+				)
+			):
+				TraitObligationSatisfied
+			else:
+				accepted_or_compiler_trait_obligation_resolution(authority, env, obligation)
+		_:
+			if accepted_has_matching_implementation(
+				authority,
+				env,
+				obligation.trait_name,
+				obligation.obligation_type,
+			):
+				TraitObligationSatisfied
+			else:
+				accepted_or_compiler_trait_obligation_resolution(authority, env, obligation)
+
+
+pure func accepted_find_unsatisfied_trait_obligation(
+	authority: AcceptedTraitImplementationAuthority,
+	env: Env,
+	obligations: List[TraitObligation],
+) -> Option[TraitObligation]:
+	var result: Option[TraitObligation] = None
+
+	for obligation in obligations:
+		if accepted_resolve_trait_obligation(
+			authority,
+			env,
+			obligation,
+		) == TraitObligationUnsatisfied:
+			result = Some(obligation)
+			break
+
+	result
+
+
+pure func accepted_find_impl_method_info(
+	authority: AcceptedTraitImplementationAuthority,
+	env: Env,
+	trait_name: String,
+	method_name: String,
+	receiver_type: SemanticType,
+) -> Option[ImplMethodInfo]:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+	trait_method = representation.trait_indices_by_semantic_name
+		.get(trait_name)
+		.and_then(
+			func(
+				trait_index,
+			): table_find_trait_method_seen(representation, [], trait_index, method_name),
+		)
+	compiler_trait_id = builtin_trait_id(trait_name)
+	var result: Option[ImplMethodInfo] = None
+
+	for implementation_index in implementation_candidate_indices_for_trait(
+		representation,
+		trait_name,
+	):
+		match table.implementations.get(implementation_index):
+			Some(item):
+				if accepted_implementation_matches_type(authority, env, item, receiver_type):
+					method_trait_ids = table.implementation_trait_method_ids.get_or(
+						implementation_index,
+						[],
+					)
+
+					for indexed in item.instance.methods.enumerate():
+						implements_requested_slot = match trait_method:
+							Some(requested):
+								match method_trait_ids.get(indexed[0]):
+									Some(Some(id)):
+										trait_method_ids_equal(id, requested.id)
+									_:
+										False
+							None:
+								match compiler_trait_id:
+									Some(id):
+										(
+											table_trait_represents_compiler_trait(
+												table,
+												item.trait_id,
+												id,
+											)
+											and item.method_ids
+												.get(indexed[0])
+												.map(
+													func(
+														method_id,
+													): callable_id_name(method_id) == method_name,
+												)
+												.get_or(False)
+										)
+									None:
+										False
+
+						if implements_requested_slot:
+							method = if module_identities_equal(
+								impl_id_module_identity(item.id),
+								representation.owner,
+							):
+								localized_implementation_method(item.owner_module_path, indexed[1])
+							else:
+								indexed[1]
+
+							result = Some(method)
+							break
+			None:
+				void
+
+		if result.is_some():
+			break
+
+	result
+
+
+pure func accepted_find_qualified_trait_method_info(
+	authority: AcceptedTraitImplementationAuthority,
+	env: Env,
+	module_path: String,
+	method_name: String,
+	receiver_type: SemanticType,
+) -> Option[AcceptedQualifiedTraitMethodInfo]:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+	var result: Option[AcceptedQualifiedTraitMethodInfo] = None
+	implementation_indices = representation.qualified_implementation_indices_by_module_and_method
+		.get_or(module_path, {})
+		.get_or(method_name, [])
+
+	for implementation_index in implementation_indices:
+		match table.implementations.get(implementation_index):
+			Some(item):
+				match table_find_trait_index(table, item.trait_id):
+					Some(trait_index):
+						match table_find_trait_method_seen(
+							representation,
+							[],
+							trait_index,
+							method_name,
+						):
+							Some(requested):
+								qualified_owner = (
+									module_identity_matches_module_path(
+										impl_id_module_identity(item.id),
+										module_path,
+									)
+									or module_identity_matches_module_path(
+										trait_id_module_identity(
+											trait_method_id_owner(requested.id),
+										),
+										module_path,
+									)
+								)
+
+								if (
+									qualified_owner
+									and accepted_implementation_matches_type(
+										authority,
+										env,
+										item,
+										receiver_type,
+									)
+								):
+									method_trait_ids = table.implementation_trait_method_ids.get_or(
+										implementation_index,
+										[],
+									)
+
+									for indexed in item.instance.methods.enumerate():
+										implements_requested_slot = match method_trait_ids.get(
+											indexed[0],
+										):
+											Some(Some(id)):
+												trait_method_ids_equal(id, requested.id)
+											_:
+												False
+
+										if implements_requested_slot:
+											implementation_method = if module_identities_equal(
+												impl_id_module_identity(item.id),
+												representation.owner,
+											):
+												localized_implementation_method(
+													item.owner_module_path,
+													indexed[1],
+												)
+											else:
+												indexed[1]
+
+											result = Some({
+												trait_name = requested.declaring_trait_name,
+												trait_identity = Some(
+													bound_trait_identity_from_id(
+														trait_method_id_owner(requested.id),
+													),
+												),
+												method = requested.signature,
+												implementation_method = implementation_method,
+											})
+											break
+							None:
+								void
+					None:
+						void
+			None:
+				void
+
+		if result.is_some():
+			break
+
+	result
+
+
+pure func accepted_has_direct_trait_evidence(
+	authority: AcceptedTraitImplementationAuthority,
+	env: Env,
+	obligation: TraitObligation,
+) -> Bool:
+	-- Direct evidence deliberately excludes implementations of subtraits. The
+	-- canonical source-prelude declaration and its compiler builtin are the only
+	-- distinct IDs that can represent the same trait.
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+
+	requested_trait_id = match representation.trait_indices_by_semantic_name.get(
+		obligation.trait_name,
+	):
+		Some(index):
+			table.traits
+				.get(index)
+				.map(func(item): item.id)
+		None:
+			builtin_trait_id(obligation.trait_name)
+
+	var found: Bool = False
+
+	match requested_trait_id:
+		Some(requested):
+			for index in implementation_candidate_indices_for_trait(
+				representation,
+				obligation.trait_name,
+			):
+				match table.implementations.get(index):
+					Some(item):
+						if (
+							table_trait_ids_semantically_equivalent(table, item.trait_id, requested)
+							and accepted_implementation_matches_type(
+								authority,
+								env,
+								item,
+								obligation.obligation_type,
+							)
+						):
+							found = True
+					None:
+						void
+
+				if found:
+					break
+		None:
+			void
+
+	if found:
+		True
+	else:
+		match obligation.obligation_type:
+			SemanticTypeVar(name):
+				accepted_type_param_has_trait_bound(authority, env, name, obligation.trait_name)
+			_:
+				(
+					accepted_trait_allows_compiler_fallback(authority, obligation.trait_name)
+					and env_resolve_trait_obligation(env, obligation) == TraitObligationSatisfied
+				)
+
+
+pure func accepted_trait_implementation_authority_metrics(
+	table: AcceptedTraitImplementationTable,
+	authorities: List[AcceptedTraitImplementationAuthority],
+) -> AcceptedTraitImplementationAuthorityMetrics:
+	representation = table_rep(table)
+	var trait_indices: Int = 0
+	var implementation_indices: Int = 0
+
+	for authority in authorities:
+		view = authority_rep(authority)
+		trait_indices += view.visible_trait_indices_by_name
+			.keys()
+			.length()
+		implementation_indices += view.visible_implementation_indices.length()
+
+	{
+		accepted_trait_table_entries = representation.traits.length(),
+		accepted_implementation_table_entries = representation.implementations.length(),
+		accepted_trait_semantic_conversions = representation.traits.length(),
+		accepted_implementation_semantic_conversions = representation.implementations.length(),
+		module_view_trait_indices = trait_indices,
+		module_view_implementation_indices = implementation_indices,
+		module_view_coherence_overlap_checks = 0,
+		legacy_graph_trait_env_installs = 0,
+		legacy_graph_implementation_env_installs = 0,
+		module_view_full_record_copies = 0,
+		exact_query_graph_scans = 0
+	}

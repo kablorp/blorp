@@ -136,7 +136,8 @@ Stage 06 owns:
 - tail-recursion annotation validation; and
 - construction of typed modules consumed by CTFE and Core lowering.
 
-Accepted aliases, records, unions, globals, and source/foreign callables use
+Accepted aliases, records, unions, globals, source/foreign callables, traits,
+and implementations use
 separate graph-owned, category-specific
 authorities. Their canonical payloads are built from accepted type headers
 or completed global headers once; each selected module retains only established
@@ -167,10 +168,16 @@ source or foreign callable. Prepared module views retain ordered table indices
 for owner-local names, selective imports, qualified access, and ordinary
 source-function UFCS. They do not retain copies of signatures or constraints;
 owner-local queries localize canonical nominal type spellings at the read
-boundary. `Env`
-remains authoritative for provisional header construction, compiler builtins,
-body-local type parameters, refinements, variables, nested lexical scopes, and
-trait/implementation method candidates pending their vertical cutovers. A
+boundary. The accepted trait/implementation table owns one semantic trait or
+implementation payload per accepted header. Module views retain compact,
+ordered indices for owner-local and public direct-import visibility, inherited
+method lookup, and candidates grouped by satisfied trait. Owner-local method
+and receiver types are localized only when read; accepted source traits,
+implementations, and methods are not republished into prepared `Env` values.
+
+`Env` remains authoritative for provisional header construction, compiler
+builtins, body-local type parameters and their bounds, refinements, variables,
+and nested lexical scopes. A
 resolved call retains the selected candidate's bound type parameters and
 debug-only status; accepted body checking neither republishes graph callables
 into `Env` nor scans graph functions by name or definition ID.

@@ -135,6 +135,7 @@ import:
 		prepared_module_scope_definition_index,
 		prepared_module_scope_identity,
 		prepared_module_scope_module,
+		prepared_module_scope_origin,
 		prepared_module_scopes_are_compatible,
 	graph/typed_expr_children: typed_expr_children
 	headers/accepted_alias_graph:
@@ -193,9 +194,13 @@ import:
 		CallableId,
 		DeclarationVisibility(PrivateDeclaration, PublicDeclaration),
 		GlobalId,
+		ImplId,
+		TraitId,
+		builtin_trait_id,
 		callable_id_definition_id,
 		callable_id_module_identity,
 		callable_id_name,
+		callable_id_source_span,
 		callable_ids_equal,
 		global_id_module_identity,
 		global_id_name,
@@ -203,7 +208,10 @@ import:
 		global_ids_equal,
 		impl_id_definition_id,
 		impl_id_module_identity,
+		impl_id_name,
+		impl_id_source_span,
 		trait_id_definition_id,
+		trait_id_is_compiler_builtin,
 		trait_id_module_identity,
 		trait_id_name,
 		trait_id_source_span,
@@ -231,7 +239,6 @@ import:
 		explicit_implementation_method_signature,
 		explicit_implementation_method_source,
 		implementation_header_graph_callable_headers,
-		implementation_header_graph_find_definition_id,
 		implementation_header_graph_headers,
 		implementation_header_id,
 		implementation_header_methods,
@@ -248,16 +255,17 @@ import:
 	headers/trait_headers:
 		TraitTopologyGraph,
 		TraitTopologyHeader,
+		trait_method_slot_id,
 		trait_method_slot_name,
 		trait_method_slot_signature,
 		trait_method_slot_source,
-		trait_topology_graph_find_definition_id,
 		trait_topology_graph_headers,
 		trait_topology_graph_type_headers,
 		trait_topology_header_id,
 		trait_topology_header_methods,
 		trait_topology_header_parameters,
 		trait_topology_header_supertraits,
+		trait_topology_header_visibility,
 		trait_type_parameter_name,
 	headers/type_decl_analysis:
 		resource_type_scan_contains,
@@ -392,6 +400,7 @@ import:
 		module_view_accepted_callable_authority,
 		module_view_accepted_global_authority,
 		module_view_accepted_record_authority,
+		module_view_accepted_trait_implementation_authority,
 		module_view_accepted_union_authority,
 		module_view_import_bindings,
 		module_view_imported_modules,
@@ -401,6 +410,7 @@ import:
 		module_view_with_accepted_callable_authority,
 		module_view_with_accepted_global_authority,
 		module_view_with_accepted_record_authority,
+		module_view_with_accepted_trait_implementation_authority,
 		module_view_with_accepted_union_authority,
 	modules/module_visibility: importable_module_surfaces
 	state:
@@ -490,6 +500,27 @@ import:
 		accepted_global_table,
 		accepted_global_table_complete,
 	type_system/accepted_record_authority: AcceptedRecordAuthority, accepted_record_contains
+	type_system/accepted_trait_implementation_authority:
+		AcceptedImplementationDefinitionIds,
+		AcceptedImplementationTableRecord,
+		AcceptedTraitImplementationAuthority,
+		AcceptedTraitImplementationAuthorityMetrics,
+		AcceptedTraitImplementationTable,
+		AcceptedTraitImplementationTableInput,
+		AcceptedTraitTableRecord,
+		AcceptedVisibleTraitBinding,
+		accepted_has_direct_trait_evidence,
+		accepted_implementation_definition_ids_for_owner,
+		accepted_resolve_trait_obligation,
+		accepted_trait_contains,
+		accepted_trait_find,
+		accepted_trait_ids_for_owner,
+		accepted_trait_implementation_authority,
+		accepted_trait_implementation_authority_metrics,
+		accepted_trait_implementation_authority_preparation_errors,
+		accepted_trait_implementation_table,
+		accepted_trait_implementation_table_validation_errors,
+		accepted_trait_methods_with_declaring_trait,
 	type_system/accepted_union_authority:
 		AcceptedUnionAuthority,
 		accepted_union_contains,
@@ -530,7 +561,9 @@ import:
 			ResourceResultOrdinary,
 		),
 		SymbolKind(FuncSymbolKind),
+		TraitDef,
 		TraitMethodSig,
+		TraitObligation,
 		TraitObligationResolution(
 			TraitObligationDeferred,
 			TraitObligationSatisfied,
@@ -574,7 +607,11 @@ import:
 		trait_method_sig_with_details,
 		trait_obligation,
 		var_mutability,
-	type_system/generic_params: BoundTypeParam, make_bound_type_param
+	type_system/generic_params:
+		BoundTraitIdentity,
+		BoundTypeParam,
+		make_bound_type_param,
+		make_resolved_bound_type_param,
 	type_system/refinement: UNREFINED_BINDING
 	type_system/semantic_type:
 		SemanticType(
@@ -2471,6 +2508,16 @@ private pure func callable_header_parameter_name(binder: CallableParameterBinder
 			None
 
 
+private pure func bound_trait_identity(id: TraitId) -> BoundTraitIdentity:
+	{
+		module_identity = trait_id_module_identity(id),
+		definition_id = trait_id_definition_id(id),
+		name = trait_id_name(id),
+		span = trait_id_source_span(id),
+		compiler_builtin = trait_id_is_compiler_builtin(id)
+	}
+
+
 private pure func callable_header_bound_type_params(
 	header: CallableHeader,
 	declared: List[ParsedTypeParamDecl],
@@ -2513,9 +2560,9 @@ private pure func callable_header_bound_type_params(
 
 		if generic_names.contains(name):
 			result = result.append(
-				make_bound_type_param(
+				make_resolved_bound_type_param(
 					name,
-					callable_type_parameter_bounds(parameter).map(trait_id_name),
+					callable_type_parameter_bounds(parameter).map(bound_trait_identity),
 				),
 			)
 
@@ -2921,15 +2968,24 @@ private pure func register_trait_with_id(
 	with_trait
 
 
-private pure func register_trait_header(
+private union AcceptedTraitRecordClaim:
+	AcceptedTraitRecordClaimed(TypecheckState, AcceptedTraitTableRecord)
+	AcceptedTraitRecordMissing(TypecheckState)
+
+
+-- Convert and claim an accepted trait without publishing it through Env. The
+-- returned record is already canonicalized for the graph-owned table.
+private pure func prepare_accepted_trait_header(
 	state: TypecheckState,
 	type_headers: TypeHeaderGraph,
 	header: TraitTopologyHeader,
-	registration: CallableHeaderRegistration,
 	module_path: String,
-) -> TypecheckState:
+	local_type_names: List[String],
+	compiler_builtin_id: Option[TraitId],
+) -> AcceptedTraitRecordClaim:
 	id = trait_topology_header_id(header)
 	owner_identity = trait_id_module_identity(id)
+	registration = LocalCallableHeaderRegistration(module_path)
 	var methods: List[TraitMethodSig] = []
 	var conversion_failed: Bool = False
 
@@ -2948,29 +3004,37 @@ private pure func register_trait_header(
 						parameter.typ,
 					):
 						Some(typ):
-							param_types = param_types.append(typ)
+							param_types = param_types.append(
+								qualify_module_local_types(
+									module_path,
+									local_type_names,
+									typ,
+								),
+							)
 							param_names = param_names.append(
 								callable_header_parameter_name(parameter.binder),
 							)
 						None:
 							conversion_failed = True
 
-			return_type = callable_header_semantic_type(
+			match callable_header_semantic_type(
 				type_headers,
 				owner_identity,
 				registration,
 				callable_signature_return_type(signature),
-			)
-
-			match return_type:
-				Some(resolved_return_type):
+			):
+				Some(return_type):
 					if not conversion_failed:
 						source = trait_method_slot_source(slot)
 						methods = methods.append(
 							trait_method_sig_with_details(
 								trait_method_slot_name(slot),
 								param_types,
-								resolved_return_type,
+								qualify_module_local_types(
+									module_path,
+									local_type_names,
+									return_type,
+								),
 								callable_signature_is_pure(signature),
 								source.body.is_some(),
 								param_names,
@@ -2980,9 +3044,11 @@ private pure func register_trait_header(
 					conversion_failed = True
 
 	if conversion_failed:
-		typecheck_state_add_error(
-			state,
-			"internal typecheck error: accepted trait header could not be installed",
+		AcceptedTraitRecordMissing(
+			typecheck_state_add_error(
+				state,
+				"internal typecheck error: accepted trait header could not be converted",
+			),
 		)
 	else:
 		definition_key = source_definition_key(
@@ -2995,105 +3061,42 @@ private pure func register_trait_header(
 
 		match typecheck_state_claim_source_definition_id(state, definition_key):
 			DefinitionIdMissing(with_error):
-				with_error
+				AcceptedTraitRecordMissing(with_error)
 			DefinitionIdClaimed(with_id, definition_id):
 				if definition_id != trait_id_definition_id(id):
-					typecheck_state_add_error(
-						with_id,
-						(
-							"internal typecheck error: trait header definition ID does not match its "
-							+ "reserved module ID"
+					AcceptedTraitRecordMissing(
+						typecheck_state_add_error(
+							with_id,
+							(
+								"internal typecheck error: trait header definition ID does not match its "
+								+ "reserved module ID"
+							),
 						),
 					)
 				else:
-					trait_name = trait_id_name(id)
-					trait_def = trait_def_with_details(
-						definition_id,
-						trait_name,
-						trait_topology_header_parameters(header).map(trait_type_parameter_name),
-						trait_topology_header_supertraits(header).map(trait_id_name),
-						methods,
-						Some(module_path),
+					AcceptedTraitRecordClaimed(
+						with_id,
+						{
+							id = id,
+							compiler_builtin_id = compiler_builtin_id,
+							owner_module_path = module_path,
+							visibility = trait_topology_header_visibility(header),
+							supertraits = trait_topology_header_supertraits(header),
+							method_ids = trait_topology_header_methods(
+								header,
+							).map(trait_method_slot_id),
+							definition = trait_def_with_details(
+								definition_id,
+								trait_id_name(id),
+								trait_topology_header_parameters(
+									header,
+								).map(trait_type_parameter_name),
+								trait_topology_header_supertraits(header).map(trait_id_name),
+								methods,
+								Some(module_path),
+							)
+						},
 					)
-					env_with_trait = env_add_trait(with_id.env, trait_def)
-					var with_trait = { with_id | env = env_with_trait }
-
-					for slot in trait_topology_header_methods(header):
-						with_trait = add_trait_function_checked(
-							with_trait,
-							trait_method_slot_name(slot),
-							trait_name,
-						)
-
-					for pair in env_trait_methods_with_declaring_trait(with_trait.env, trait_name):
-						if pair[1] != trait_name:
-							with_trait = add_trait_function_checked(with_trait, pair[0], pair[1])
-
-					with_trait
-
-
-private pure func register_trait_header_for_source(
-	state: TypecheckState,
-	type_headers: TypeHeaderGraph,
-	topology: TraitTopologyGraph,
-	trait_decl: ParsedTraitDecl,
-	module_path: String,
-) -> TypecheckState:
-	definition_key = source_definition_key(
-		typecheck_state_module_identity(state),
-		TraitDefinition,
-		trait_decl.name.text,
-		None,
-		trait_decl.span,
-	)
-
-	match typecheck_state_find_source_definition_id(state, definition_key):
-		None:
-			typecheck_state_add_error(
-				state,
-				"internal typecheck error: accepted trait header has no reserved definition ID",
-			)
-		Some(definition_id):
-			match trait_topology_graph_find_definition_id(topology, definition_id):
-				None:
-					typecheck_state_add_error(
-						state,
-						"internal typecheck error: reserved trait definition has no accepted header",
-					)
-				Some(header):
-					register_trait_header(
-						state,
-						type_headers,
-						header,
-						ImportedCallableHeaderRegistration(module_path),
-						module_path,
-					)
-
-
-private pure func register_local_trait_headers(
-	state: TypecheckState,
-	type_headers: TypeHeaderGraph,
-	topology: TraitTopologyGraph,
-	module_identity: ModuleIdentity,
-	source_module_name: String,
-	canonical_module_path: String,
-) -> TypecheckState:
-	var next = state
-
-	for header in trait_topology_graph_headers(topology):
-		if module_identities_equal(
-			trait_id_module_identity(trait_topology_header_id(header)),
-			module_identity,
-		):
-			next = register_trait_header(
-				next,
-				type_headers,
-				header,
-				LocalCallableHeaderRegistration(canonical_module_path),
-				source_module_name,
-			)
-
-	next
 
 
 private pure func impl_type_head_name(for_type: SemanticType) -> Option[String]:
@@ -3108,13 +3111,61 @@ private pure func impl_target_label(for_type: SemanticType) -> String:
 	impl_type_head_name(for_type).get_or("<non-named type>")
 
 
+private pure func typecheck_find_trait(state: TypecheckState, name: String) -> Option[TraitDef]:
+	match module_view_accepted_trait_implementation_authority(state.module_view):
+		Some(authority):
+			match accepted_trait_find(authority, name):
+				Some(found):
+					Some(found)
+				None:
+					env_get_trait(state.env, name)
+		None:
+			env_get_trait(state.env, name)
+
+
+private pure func typecheck_trait_methods_with_declaring_trait(
+	state: TypecheckState,
+	trait_name: String,
+) -> List[(String, String)]:
+	match module_view_accepted_trait_implementation_authority(state.module_view):
+		Some(authority):
+			if accepted_trait_contains(authority, trait_name):
+				accepted_trait_methods_with_declaring_trait(authority, trait_name)
+			else:
+				env_trait_methods_with_declaring_trait(state.env, trait_name)
+		None:
+			env_trait_methods_with_declaring_trait(state.env, trait_name)
+
+
+private pure func typecheck_has_direct_trait_evidence(
+	state: TypecheckState,
+	obligation: TraitObligation,
+) -> Bool:
+	match module_view_accepted_trait_implementation_authority(state.module_view):
+		Some(authority):
+			accepted_has_direct_trait_evidence(authority, state.env, obligation)
+		None:
+			env_has_direct_trait_evidence(state.env, obligation)
+
+
+private pure func typecheck_resolve_trait_obligation(
+	state: TypecheckState,
+	obligation: TraitObligation,
+) -> TraitObligationResolution:
+	match module_view_accepted_trait_implementation_authority(state.module_view):
+		Some(authority):
+			accepted_resolve_trait_obligation(authority, state.env, obligation)
+		None:
+			env_resolve_trait_obligation(state.env, obligation)
+
+
 private pure func impl_orphan_error_message(
 	state: TypecheckState,
 	module_path: String,
 	impl_decl: ParsedImplDecl,
 	for_type: SemanticType,
 ) -> Option[String]:
-	trait_home: Option[String] = match env_get_trait(state.env, impl_decl.trait_name.text):
+	trait_home: Option[String] = match typecheck_find_trait(state, impl_decl.trait_name.text):
 		Some(trait_def):
 			trait_def.module_path
 		None:
@@ -3423,23 +3474,29 @@ private pure func impl_method_infos_from_decl(
 private pure func implementation_bound_type_params(
 	header: ImplementationHeader,
 ) -> List[BoundTypeParam]:
-	implementation_header_parameters(header).map(func(parameter): make_bound_type_param(
+	implementation_header_parameters(header).map(func(parameter): make_resolved_bound_type_param(
 			implementation_type_parameter_id_name(
 				resolved_implementation_type_parameter_id(parameter),
 			),
-			resolved_implementation_type_parameter_bounds(parameter).map(trait_id_name),
+			resolved_implementation_type_parameter_bounds(parameter).map(bound_trait_identity),
 		))
 
 
 private pure func implementation_method_bound_type_params(
 	header: ImplementationMethodHeader,
 ) -> List[BoundTypeParam]:
-	explicit_implementation_method_parameters(header).map(func(parameter): make_bound_type_param(
+	explicit_implementation_method_parameters(
+		header,
+	).map(
+		func(parameter): make_resolved_bound_type_param(
 			callable_type_parameter_id_name(
 				resolved_implementation_method_type_parameter_id(parameter),
 			),
-			resolved_implementation_method_type_parameter_bounds(parameter).map(trait_id_name),
-		))
+			resolved_implementation_method_type_parameter_bounds(
+				parameter,
+			).map(bound_trait_identity),
+		),
+	)
 
 
 private pure func implementation_method_info_from_header(
@@ -3626,28 +3683,38 @@ private pure func implementation_method_infos_from_header(
 	result
 
 
-private pure func register_implementation_header(
+private union AcceptedImplementationRecordClaim:
+	AcceptedImplementationRecordClaimed(TypecheckState, AcceptedImplementationTableRecord)
+	AcceptedImplementationRecordMissing(TypecheckState)
+
+
+-- Convert and claim an accepted implementation without installing it in Env.
+-- Coherence is checked after the graph table can project the exact visible IDs.
+private pure func prepare_accepted_implementation_header(
 	state: TypecheckState,
 	type_headers: TypeHeaderGraph,
 	header: ImplementationHeader,
-	registration: CallableHeaderRegistration,
 	module_path: String,
-) -> TypecheckState:
+	local_type_names: List[String],
+) -> AcceptedImplementationRecordClaim:
 	id = implementation_header_id(header)
-	receiver = callable_header_semantic_type(
+	trait_id = implementation_header_trait_id(header)
+	registration = LocalCallableHeaderRegistration(module_path)
+
+	match callable_header_semantic_type(
 		type_headers,
 		impl_id_module_identity(id),
 		registration,
 		implementation_header_receiver(header),
-	)
-
-	match receiver:
+	):
 		None:
-			typecheck_state_add_error(
-				state,
-				(
-					"internal typecheck error: accepted implementation receiver could not be "
-					+ "installed"
+			AcceptedImplementationRecordMissing(
+				typecheck_state_add_error(
+					state,
+					(
+						"internal typecheck error: accepted implementation receiver could not be "
+						+ "converted"
+					),
 				),
 			)
 		Some(for_type):
@@ -3659,7 +3726,7 @@ private pure func register_implementation_header(
 				module_path,
 			):
 				ImplMethodInfosMissing(with_error):
-					with_error
+					AcceptedImplementationRecordMissing(with_error)
 				ImplMethodInfosClaimed(with_methods, method_infos):
 					source = implementation_header_source(header)
 
@@ -3684,104 +3751,67 @@ private pure func register_implementation_header(
 
 					match typecheck_state_claim_source_definition_id(with_orphan, definition_key):
 						DefinitionIdMissing(with_error):
-							with_error
+							AcceptedImplementationRecordMissing(with_error)
 						DefinitionIdClaimed(with_id, definition_id):
 							if definition_id != impl_id_definition_id(id):
-								typecheck_state_add_error(
-									with_id,
-									(
-										"internal typecheck error: implementation header definition ID does not match "
-										+ "its reserved module ID"
+								AcceptedImplementationRecordMissing(
+									typecheck_state_add_error(
+										with_id,
+										(
+											"internal typecheck error: implementation header definition ID does not match "
+											+ "its reserved module ID"
+										),
 									),
 								)
 							else:
-								instance = impl_instance_with_methods(
-									definition_id,
-									trait_id_name(implementation_header_trait_id(header)),
+								canonical_for_type = qualify_module_local_types(
+									module_path,
+									local_type_names,
 									for_type,
-									implementation_bound_type_params(header),
-									method_infos,
-									False,
 								)
-
-								match implementation_header_visibility(header):
-									PrivateDeclaration:
-										add_private_impl_checked(with_id, instance)
-									PublicDeclaration:
-										add_source_impl_checked(with_id, instance)
-
-
-private pure func register_implementation_header_for_source(
-	state: TypecheckState,
-	type_headers: TypeHeaderGraph,
-	implementation_headers: ImplementationHeaderGraph,
-	impl_decl: ParsedImplDecl,
-	module_path: String,
-) -> TypecheckState:
-	definition_key = source_definition_key(
-		typecheck_state_module_identity(state),
-		ImplDefinition,
-		impl_decl.trait_name.text,
-		None,
-		impl_decl.span,
-	)
-
-	match typecheck_state_find_source_definition_id(state, definition_key):
-		None:
-			typecheck_state_add_error(
-				state,
-				(
-					"internal typecheck error: accepted implementation header has no reserved "
-					+ "definition ID"
-				),
-			)
-		Some(definition_id):
-			match implementation_header_graph_find_definition_id(
-				implementation_headers,
-				definition_id,
-			):
-				None:
-					typecheck_state_add_error(
-						state,
-						(
-							"internal typecheck error: reserved implementation definition has no accepted "
-							+ "header"
-						),
-					)
-				Some(header):
-					register_implementation_header(
-						state,
-						type_headers,
-						header,
-						ImportedCallableHeaderRegistration(module_path),
-						module_path,
-					)
-
-
-private pure func register_local_implementation_headers(
-	state: TypecheckState,
-	type_headers: TypeHeaderGraph,
-	implementation_headers: ImplementationHeaderGraph,
-	module_identity: ModuleIdentity,
-	source_module_name: String,
-	canonical_module_path: String,
-) -> TypecheckState:
-	var next = state
-
-	for header in implementation_header_graph_headers(implementation_headers):
-		if module_identities_equal(
-			impl_id_module_identity(implementation_header_id(header)),
-			module_identity,
-		):
-			next = register_implementation_header(
-				next,
-				type_headers,
-				header,
-				LocalCallableHeaderRegistration(canonical_module_path),
-				source_module_name,
-			)
-
-	next
+								canonical_methods = method_infos.map(func(method): { method |
+										func_type = qualify_module_local_types(
+											module_path,
+											local_type_names,
+											method.func_type,
+										),
+										dim_constraints = method.dim_constraints.map(
+											func(
+												constraint,
+											): (
+												qualify_module_local_types(
+													module_path,
+													local_type_names,
+													constraint[0],
+												),
+												qualify_module_local_types(
+													module_path,
+													local_type_names,
+													constraint[1],
+												),
+											),
+										)
+									})
+								AcceptedImplementationRecordClaimed(
+									with_id,
+									{
+										id = id,
+										trait_id = trait_id,
+										owner_module_path = module_path,
+										visibility = implementation_header_visibility(header),
+										method_ids = implementation_header_methods(header)
+											.filter(implementation_method_header_is_explicit)
+											.map(implementation_method_header_id),
+										instance = impl_instance_with_methods(
+											definition_id,
+											trait_id_name(trait_id),
+											canonical_for_type,
+											implementation_bound_type_params(header),
+											canonical_methods,
+											False,
+										)
+									},
+								)
 
 
 private pure func register_impl_decl_with_info(
@@ -3953,72 +3983,6 @@ pure func typecheck_register_program_impl_decls(
 	)
 
 
-private pure func typecheck_register_imported_signature_decl(
-	state: TypecheckState,
-	module_path: String,
-	type_headers: TypeHeaderGraph,
-	callable_headers: CallableHeaderGraph,
-	decl: ImportableSignatureDecl,
-) -> TypecheckState:
-	match decl:
-		ImportableFunctionDecl(_):
-			state
-		ImportableVarDecl(_):
-			state
-		ImportableForeignFunctionDecl(_):
-			state
-		ImportableTraitDecl(trait_decl):
-			register_trait_header_for_source(
-				state,
-				type_headers,
-				callable_header_graph_trait_topology(callable_headers),
-				trait_decl,
-				module_path,
-			)
-
-
-private pure func typecheck_register_imported_signature_decls(
-	state: TypecheckState,
-	module_path: String,
-	type_headers: TypeHeaderGraph,
-	callable_headers: CallableHeaderGraph,
-	decls: List[ImportableSignatureDecl],
-) -> TypecheckState:
-	var next = state
-
-	for decl in decls:
-		next = typecheck_register_imported_signature_decl(
-			next,
-			module_path,
-			type_headers,
-			callable_headers,
-			decl,
-		)
-
-	next
-
-
-private pure func typecheck_register_imported_impl_decls(
-	state: TypecheckState,
-	module_path: String,
-	type_headers: TypeHeaderGraph,
-	implementation_headers: ImplementationHeaderGraph,
-	decls: List[ParsedImplDecl],
-) -> TypecheckState:
-	var next = state
-
-	for decl in decls:
-		next = register_implementation_header_for_source(
-			next,
-			type_headers,
-			implementation_headers,
-			decl,
-			module_path,
-		)
-
-	next
-
-
 private pure func typecheck_register_import_module_types(
 	state: TypecheckState,
 	module: ImportableModule,
@@ -4061,46 +4025,10 @@ private pure func typecheck_register_import_module_types(
 		typecheck_state_restore_definition_scope(with_types, target_scope)
 
 
-private pure func typecheck_register_direct_import_module_decls(
-	state: TypecheckState,
-	module: ImportableModule,
-	type_headers: TypeHeaderGraph,
-	callable_headers: CallableHeaderGraph,
-	implementation_headers: ImplementationHeaderGraph,
-) -> TypecheckState:
-	target_scope = state
-	module_state = typecheck_state_scope_to_imported_module(
-		state,
-		importable_module_prepared_scope(module),
-	)
-
-	if module_state.errors.length() > state.errors.length():
-		module_state
-	else:
-		with_signatures = typecheck_register_imported_signature_decls(
-			module_state,
-			importable_module_path(module),
-			type_headers,
-			callable_headers,
-			importable_module_signature_decls(module),
-		)
-		with_impls = typecheck_register_imported_impl_decls(
-			with_signatures,
-			importable_module_path(module),
-			type_headers,
-			implementation_headers,
-			importable_module_impl_decls(module),
-		)
-		typecheck_state_restore_definition_scope(with_impls, target_scope)
-
-
 private pure func typecheck_register_import_modules_from(
 	state: TypecheckState,
 	all_modules: List[ImportableModule],
-	direct_modules: List[ImportableModule],
 	type_headers: TypeHeaderGraph,
-	callable_headers: CallableHeaderGraph,
-	implementation_headers: ImplementationHeaderGraph,
 ) -> TypecheckState:
 	var next = state
 	var compatible_modules: List[ImportableModule] = []
@@ -4120,19 +4048,6 @@ private pure func typecheck_register_import_modules_from(
 	-- record/union from one of its dependencies without leaking unrelated values.
 	for module in compatible_modules:
 		next = typecheck_register_import_module_types(next, module, type_headers)
-
-	for module in direct_modules:
-		if typecheck_state_accepts_imported_module_scope(
-			state,
-			importable_module_prepared_scope(module),
-		):
-			next = typecheck_register_direct_import_module_decls(
-				next,
-				module,
-				type_headers,
-				callable_headers,
-				implementation_headers,
-			)
 
 	next
 
@@ -4419,8 +4334,8 @@ private pure func check_main_signature_for_program(
 				):
 					True
 				else:
-					return_resolution = env_resolve_trait_obligation(
-						state.env,
+					return_resolution = typecheck_resolve_trait_obligation(
+						state,
 						trait_obligation(return_type, "ExitStatusAble"),
 					)
 
@@ -5007,8 +4922,8 @@ private pure func impl_validate_supertraits(
 	var next = state
 
 	for supertrait in supertraits:
-		if not env_has_direct_trait_evidence(
-			next.env,
+		if not typecheck_has_direct_trait_evidence(
+			next,
 			trait_obligation(for_type, supertrait),
 		):
 			next = typecheck_state_add_error(
@@ -5422,7 +5337,7 @@ private pure func add_impl_body_trait_functions(
 ) -> TypecheckState:
 	var next = state
 
-	for pair in env_trait_methods_with_declaring_trait(state.env, trait_name):
+	for pair in typecheck_trait_methods_with_declaring_trait(state, trait_name):
 		next = { next | env = env_add_trait_function(next.env, pair[0], pair[1]) }
 		next = typecheck_state_add_scoped_trait_function(next, pair[0], pair[1])
 
@@ -5456,7 +5371,7 @@ private pure func trait_visible_for_impl(state: TypecheckState, trait_name: Stri
 				Some(_):
 					True
 				None:
-					match env_get_trait(state.env, trait_name):
+					match typecheck_find_trait(state, trait_name):
 						Some(trait_def):
 							match trait_def.module_path:
 								Some(module_path):
@@ -5472,7 +5387,7 @@ private pure func typecheck_validate_visible_impl_decl(
 	impl_decl: ParsedImplDecl,
 	for_type: SemanticType,
 ) -> TypecheckState:
-	match env_get_trait(state.env, impl_decl.trait_name.text):
+	match typecheck_find_trait(state, impl_decl.trait_name.text):
 		Some(trait_def):
 			with_required = impl_validate_required_methods(
 				state,
@@ -6130,12 +6045,95 @@ private func typecheck_materialize_standalone_program_bodies_with_import_modules
 	})
 
 
-private pure func typecheck_state_after_accepted_header_registration(
+private pure func replay_accepted_trait_definition_id(
+	state: TypecheckState,
+	id: TraitId,
+) -> TypecheckState:
+	definition_key = source_definition_key(
+		typecheck_state_module_identity(state),
+		TraitDefinition,
+		trait_id_name(id),
+		None,
+		trait_id_source_span(id),
+	)
+
+	match typecheck_state_claim_source_definition_id(state, definition_key):
+		DefinitionIdMissing(with_error):
+			with_error
+		DefinitionIdClaimed(with_id, definition_id):
+			if definition_id == trait_id_definition_id(id):
+				with_id
+			else:
+				typecheck_state_add_error(
+					with_id,
+					(
+						"internal typecheck error: trait header definition ID does not match its "
+						+ "reserved module ID"
+					),
+				)
+
+
+private pure func replay_accepted_implementation_method_definition_id(
+	state: TypecheckState,
+	id: CallableId,
+) -> TypecheckState:
+	callable_key = callable_key_from_span(state, callable_id_name(id), callable_id_source_span(id))
+
+	match typecheck_state_claim_func_callable_id(state, callable_key):
+		DefinitionIdMissing(with_error):
+			with_error
+		DefinitionIdClaimed(with_id, definition_id):
+			if definition_id == callable_id_definition_id(id):
+				with_id
+			else:
+				typecheck_state_add_error(
+					with_id,
+					(
+						"internal typecheck error: implementation method header definition ID does not "
+						+ "match its reserved module ID"
+					),
+				)
+
+
+private pure func replay_accepted_implementation_definition_ids(
+	state: TypecheckState,
+	definition_ids: AcceptedImplementationDefinitionIds,
+) -> TypecheckState:
+	var next = state
+
+	for method_id in definition_ids.method_ids:
+		next = replay_accepted_implementation_method_definition_id(next, method_id)
+
+	id = definition_ids.id
+	definition_key = source_definition_key(
+		typecheck_state_module_identity(next),
+		ImplDefinition,
+		impl_id_name(id),
+		None,
+		impl_id_source_span(id),
+	)
+
+	match typecheck_state_claim_source_definition_id(next, definition_key):
+		DefinitionIdMissing(with_error):
+			with_error
+		DefinitionIdClaimed(with_id, definition_id):
+			if definition_id == impl_id_definition_id(id):
+				with_id
+			else:
+				typecheck_state_add_error(
+					with_id,
+					(
+						"internal typecheck error: implementation header definition ID does not match "
+						+ "its reserved module ID"
+					),
+				)
+
+
+private pure func typecheck_state_after_accepted_definition_id_replay(
 	state: TypecheckState,
 	bound_module: BoundModule,
 	type_headers: TypeHeaderGraph,
-	callable_headers: CallableHeaderGraph,
-	implementation_headers: ImplementationHeaderGraph,
+	trait_implementation_table: AcceptedTraitImplementationTable,
 	module_identity: ModuleIdentity,
 	module_path: String,
 ) -> TypecheckState:
@@ -6164,23 +6162,24 @@ private pure func typecheck_state_after_accepted_header_registration(
 		bound_module_scope(bound_module),
 		module_path,
 	)
-	with_traits = register_local_trait_headers(
-		with_types,
-		type_headers,
-		callable_header_graph_trait_topology(callable_headers),
+	-- CTFE creates a fresh body-inference session, so it must replay the IDs reserved
+	-- by header preparation. Accepted trait and implementation semantics remain owned
+	-- by the graph table attached to ModuleView; replay must not republish them in Env.
+	var with_definition_ids = with_types
+
+	for id in accepted_trait_ids_for_owner(trait_implementation_table, module_identity):
+		with_definition_ids = replay_accepted_trait_definition_id(with_definition_ids, id)
+
+	for definition_ids in accepted_implementation_definition_ids_for_owner(
+		trait_implementation_table,
 		module_identity,
-		program.source.module_name,
-		module_path,
-	)
-	with_impls = register_local_implementation_headers(
-		with_traits,
-		type_headers,
-		implementation_headers,
-		module_identity,
-		program.source.module_name,
-		module_path,
-	)
-	with_impls
+	):
+		with_definition_ids = replay_accepted_implementation_definition_ids(
+			with_definition_ids,
+			definition_ids,
+		)
+
+	with_definition_ids
 
 
 pure func typecheck_bind_program_module_view(
@@ -6464,6 +6463,34 @@ private pure func accepted_callable_authority_for_module(
 			Err("accepted callable module view rejected conflicting source bindings")
 
 
+private pure func accepted_trait_implementation_authority_for_module(
+	table: AcceptedTraitImplementationTable,
+	bound_module: BoundModule,
+) -> AcceptedTraitImplementationAuthority:
+	view = bound_module_view(bound_module)
+	var bindings: List[AcceptedVisibleTraitBinding] = []
+
+	for imported in module_view_imported_names(view):
+		bindings = bindings.append({
+			source_name = imported.local_name,
+			owner_module_path = imported.module_path,
+			original_name = imported.original_name,
+		})
+
+	accepted_trait_implementation_authority(
+		table,
+		bound_module_identity(bound_module),
+		bindings,
+		bound_module_direct_import_modules(
+			bound_module,
+		).map(
+			func(
+				module,
+			): prepared_module_scope_identity(importable_module_prepared_scope(module)),
+		),
+	)
+
+
 -- Immutable accepted module facts shared by initializer and ordinary body
 -- sessions. Session-owned diagnostics, inference bindings, lexical scopes,
 -- containment snapshots, and memo answers cannot be represented here.
@@ -6488,7 +6515,8 @@ private record PreparedModuleIssues {
 private record PreparedModuleEnvironmentCollection {
 	environments: List[PreparedCanonicalModuleEnvironment],
 	issues: List[PreparedModuleIssues],
-	accepted_callable_table: Option[AcceptedCallableTable]
+	accepted_callable_table: Option[AcceptedCallableTable],
+	accepted_trait_implementation_table: Option[AcceptedTraitImplementationTable]
 }
 
 
@@ -6503,8 +6531,6 @@ private record InitializerCheckContext {
 private pure func prepared_module_environment_base_state(
 	bound_module: BoundModule,
 	type_headers: TypeHeaderGraph,
-	callable_headers: CallableHeaderGraph,
-	implementation_headers: ImplementationHeaderGraph,
 	accepted_global_table: AcceptedGlobalTable,
 	accepted_alias_graph: AcceptedAliasGraph,
 	accepted_record_graph: AcceptedRecordGraph,
@@ -6514,7 +6540,6 @@ private pure func prepared_module_environment_base_state(
 	program = bound_module_program(bound_module)
 	view = bound_module_view(bound_module)
 	visible_import_modules = bound_module_visible_import_modules(bound_module)
-	direct_import_modules = bound_module_direct_import_modules(bound_module)
 	import_surfaces = importable_module_surfaces(visible_import_modules)
 	base = typecheck_state_for_prepared_module_scope(
 		bound_module_scope(bound_module),
@@ -6571,12 +6596,8 @@ private pure func prepared_module_environment_base_state(
 	with_import_decls = typecheck_register_import_modules_from(
 		with_import_type_facts,
 		visible_import_modules,
-		direct_import_modules,
 		type_headers,
-		callable_headers,
-		implementation_headers,
 	)
-	module_identity = bound_module_identity(bound_module)
 	canonical_path = bound_module_canonical_path(bound_module)
 	with_builtin_headers = typecheck_install_local_builtin_headers(
 		with_import_decls,
@@ -6602,15 +6623,7 @@ private pure func prepared_module_environment_base_state(
 		bound_module_scope(bound_module),
 		canonical_path,
 	)
-	with_traits = register_local_trait_headers(
-		with_types,
-		type_headers,
-		callable_header_graph_trait_topology(callable_headers),
-		module_identity,
-		program.source.module_name,
-		canonical_path,
-	)
-	with_traits
+	with_types
 
 
 private pure func prepared_canonical_module_environment(
@@ -6624,6 +6637,16 @@ private pure func prepared_canonical_module_environment(
 		declaration_env = declaration_env,
 		module_facts = infer_module_facts_from_typecheck_state(base_state),
 	})
+
+
+private pure func implementation_method_header_is_explicit(
+	header: ImplementationMethodHeader,
+) -> Bool:
+	match header:
+		DefaultImplementationMethodHeaderValue(_):
+			False
+		ExplicitImplementationMethodHeaderValue(_):
+			True
 
 
 private pure func prepared_module_environments(
@@ -6648,13 +6671,14 @@ private pure func prepared_module_environments(
 	var base_indices_by_module: Dict[String, Int] = {}
 	var callable_records: List[AcceptedCallableTableRecord] = []
 	var callable_owner_missing: Bool = False
+	var trait_records: List[AcceptedTraitTableRecord] = []
+	var implementation_records: List[AcceptedImplementationTableRecord] = []
+	var trait_implementation_owner_missing: Bool = False
 
 	for bound_module in modules:
 		base_state = prepared_module_environment_base_state(
 			bound_module,
 			type_headers,
-			callable_headers,
-			implementation_headers,
 			accepted_global_table,
 			accepted_alias_graph,
 			accepted_record_graph,
@@ -6676,6 +6700,96 @@ private pure func prepared_module_environments(
 			callables = [],
 			callable_errors = [],
 		})
+
+	for header in trait_topology_graph_headers(
+		callable_header_graph_trait_topology(callable_headers),
+	):
+		module_key = module_identity_storage_key(
+			trait_id_module_identity(trait_topology_header_id(header)),
+		)
+
+		match base_indices_by_module.get(module_key):
+			Some(index):
+				match bases.get(index):
+					Some(base):
+						program = bound_module_program(base.bound_module)
+						is_prelude_traits = prelude_traits_module_matches(
+							prepared_module_scope_origin(bound_module_scope(base.bound_module)),
+							base.module_path,
+							program.source.module_name,
+						)
+
+						compiler_builtin_id = if is_prelude_traits:
+							builtin_trait_id(trait_id_name(trait_topology_header_id(header)))
+						else:
+							None
+
+						match prepare_accepted_trait_header(
+							base.state,
+							type_headers,
+							header,
+							base.module_path,
+							base.local_type_names,
+							compiler_builtin_id,
+						):
+							AcceptedTraitRecordClaimed(with_trait, item):
+								bases = bases.set(index, { base | state = with_trait })
+								trait_records = trait_records.append(item)
+							AcceptedTraitRecordMissing(with_error):
+								bases = bases.set(index, { base | state = with_error })
+								trait_implementation_owner_missing = True
+					None:
+						trait_implementation_owner_missing = True
+			None:
+				trait_implementation_owner_missing = True
+
+	-- Callable and implementation annotation conversion can consult local and
+	-- imported traits through a trait-only projection. Accepted traits never
+	-- need a provisional Env publication.
+	preliminary_trait_table = if trait_implementation_owner_missing:
+		None
+	else:
+		accepted_trait_implementation_table({
+			traits = trait_records,
+			implementations = [],
+		})
+
+	var preliminary_base_index: Int = 0
+
+	while preliminary_base_index < bases.length():
+		match bases.get(preliminary_base_index):
+			Some(base):
+				var with_authority = base.state
+
+				match preliminary_trait_table:
+					Some(table):
+						authority = accepted_trait_implementation_authority_for_module(
+							table,
+							base.bound_module,
+						)
+						with_authority = { with_authority |
+							module_view = module_view_with_accepted_trait_implementation_authority(
+								with_authority.module_view,
+								authority,
+							)
+						}
+					None:
+						with_authority = typecheck_state_add_error(
+							with_authority,
+							"internal typecheck error: accepted trait table rejected prepared entries",
+						)
+
+				bases = bases.set(
+					preliminary_base_index,
+					{ base |
+						state = with_authority,
+						callable_error_start = with_authority.errors.length()
+					},
+				)
+			None:
+				trait_implementation_owner_missing = True
+
+		preliminary_base_index += 1
 
 	for header in callable_header_graph_callables(callable_headers):
 		module_key = module_identity_storage_key(
@@ -6703,14 +6817,6 @@ private pure func prepared_module_environments(
 				base = { with_callables |
 					callable_errors = with_callables.state.errors.drop(
 						with_callables.callable_error_start,
-					),
-					state = register_local_implementation_headers(
-						with_callables.state,
-						type_headers,
-						implementation_headers,
-						bound_module_identity(with_callables.bound_module),
-						bound_module_program(with_callables.bound_module).source.module_name,
-						with_callables.module_path,
 					)
 				}
 				bases = bases.set(base_index, base)
@@ -6724,6 +6830,43 @@ private pure func prepared_module_environments(
 		None
 	else:
 		accepted_callable_table({callables = callable_records})
+
+	for header in implementation_header_graph_headers(implementation_headers):
+		module_key = module_identity_storage_key(
+			impl_id_module_identity(implementation_header_id(header)),
+		)
+
+		match base_indices_by_module.get(module_key):
+			Some(index):
+				match bases.get(index):
+					Some(base):
+						match prepare_accepted_implementation_header(
+							base.state,
+							type_headers,
+							header,
+							base.module_path,
+							base.local_type_names,
+						):
+							AcceptedImplementationRecordClaimed(with_impl, item):
+								bases = bases.set(index, { base | state = with_impl })
+								implementation_records = implementation_records.append(item)
+							AcceptedImplementationRecordMissing(with_error):
+								bases = bases.set(index, { base | state = with_error })
+								trait_implementation_owner_missing = True
+					None:
+						trait_implementation_owner_missing = True
+			None:
+				trait_implementation_owner_missing = True
+
+	trait_implementation_input: AcceptedTraitImplementationTableInput = {
+		traits = trait_records,
+		implementations = implementation_records
+	}
+
+	trait_implementation_table = if trait_implementation_owner_missing:
+		None
+	else:
+		accepted_trait_implementation_table(trait_implementation_input)
 
 	for base in bases:
 		var prepared_state = base.state
@@ -6749,6 +6892,45 @@ private pure func prepared_module_environments(
 					"internal typecheck error: accepted callable table rejected prepared entries",
 				)
 
+		match trait_implementation_table:
+			Some(table):
+				authority = accepted_trait_implementation_authority_for_module(
+					table,
+					base.bound_module,
+				)
+
+				for message in accepted_trait_implementation_authority_preparation_errors(
+					authority,
+				):
+					prepared_state = typecheck_state_add_error(prepared_state, message)
+
+				prepared_state = { prepared_state |
+					module_view = module_view_with_accepted_trait_implementation_authority(
+						prepared_state.module_view,
+						authority,
+					),
+					private_impls = []
+				}
+			None:
+				validation_errors = accepted_trait_implementation_table_validation_errors(
+					trait_implementation_input,
+				)
+
+				if validation_errors.is_empty():
+					prepared_state = typecheck_state_add_error(
+						prepared_state,
+						(
+							"internal typecheck error: accepted trait/implementation table rejected prepared "
+							+ "entries"
+						),
+					)
+				else:
+					for message in validation_errors:
+						prepared_state = typecheck_state_add_error(
+							prepared_state,
+							"internal typecheck error: " + message,
+						)
+
 		match prepared_canonical_module_environment(base.bound_module, prepared_state):
 			Some(environment):
 				prepared = prepared.append(environment)
@@ -6766,7 +6948,8 @@ private pure func prepared_module_environments(
 	{
 		environments = prepared,
 		issues = issues,
-		accepted_callable_table = callable_table
+		accepted_callable_table = callable_table,
+		accepted_trait_implementation_table = trait_implementation_table
 	}
 
 
@@ -6978,6 +7161,7 @@ private record GlobalHeaderCompletionOutcome {
 	completed: CompletedGlobalHeaderGraph,
 	accepted_global_table: Option[AcceptedGlobalTable],
 	accepted_callable_table: Option[AcceptedCallableTable],
+	accepted_trait_implementation_table: Option[AcceptedTraitImplementationTable],
 	failures: List[GlobalHeaderCompletionFailure],
 	prepared_environments: List[PreparedCanonicalModuleEnvironment],
 	module_preparation_issues: List[PreparedModuleIssues]
@@ -7147,6 +7331,7 @@ private pure func complete_planned_global_headers(
 			}),
 		accepted_global_table = completed_table,
 		accepted_callable_table = prepared_modules.accepted_callable_table,
+		accepted_trait_implementation_table = prepared_modules.accepted_trait_implementation_table,
 		failures = failures,
 		prepared_environments = prepared_environments,
 		module_preparation_issues = prepared_modules.issues
@@ -7213,6 +7398,7 @@ private record TypecheckGraphFacts {
 	completed_globals: CompletedGlobalHeaderGraph,
 	accepted_global_table: AcceptedGlobalTable,
 	accepted_callable_table: AcceptedCallableTable,
+	accepted_trait_implementation_table: AcceptedTraitImplementationTable,
 	prepared_environments: List[PreparedCanonicalModuleEnvironment],
 	module_preparation_issues: List[PreparedModuleIssues],
 	accepted_alias_graph: AcceptedAliasGraph,
@@ -7262,8 +7448,12 @@ private pure func finish_typecheck_graph_completion(
 			],
 		)
 	else:
-		match (completion.accepted_global_table, completion.accepted_callable_table):
-			(None, _):
+		match (
+			completion.accepted_global_table,
+			completion.accepted_callable_table,
+			completion.accepted_trait_implementation_table,
+		):
+			(None, _, _):
 				TypecheckGraphCompletionRejected(
 					[
 						(
@@ -7272,19 +7462,35 @@ private pure func finish_typecheck_graph_completion(
 						),
 					],
 				)
-			(_, None):
+			(_, None, _):
 				TypecheckGraphCompletionRejected(
 					[
 						"internal typecheck error: accepted callable table construction was incomplete",
 					],
 				)
-			(Some(accepted_global_table), Some(accepted_callable_table)):
+			(_, _, None):
+				preparation_errors = completion.module_preparation_issues.flat_map(
+					func(issue): issue.errors,
+				)
+				var failure_errors = preparation_errors
+
+				if failure_errors.is_empty():
+					failure_errors = [
+						(
+							"internal typecheck error: accepted trait/implementation table construction was "
+							+ "incomplete"
+						),
+					]
+
+				TypecheckGraphCompletionRejected(failure_errors)
+			(Some(accepted_global_table), Some(accepted_callable_table), Some(accepted_trait_implementation_table)):
 				facts: TypecheckGraphFacts = {
 					implementation_headers = implementation_headers,
 					importable_graph = importable_graph,
 					completed_globals = completion.completed,
 					accepted_global_table = accepted_global_table,
 					accepted_callable_table = accepted_callable_table,
+					accepted_trait_implementation_table = accepted_trait_implementation_table,
 					prepared_environments = completion.prepared_environments,
 					module_preparation_issues = completion.module_preparation_issues,
 					accepted_alias_graph = accepted_alias_graph,
@@ -7552,6 +7758,27 @@ pure func accepted_typecheck_graph_callable_authority_metrics(
 				void
 
 	accepted_callable_authority_metrics(facts.accepted_callable_table, authorities)
+
+
+pure func accepted_typecheck_graph_trait_implementation_authority_metrics(
+	graph: AcceptedTypecheckGraph,
+) -> AcceptedTraitImplementationAuthorityMetrics:
+	facts = accepted_typecheck_graph_rep(graph).facts
+	var authorities: List[AcceptedTraitImplementationAuthority] = []
+
+	for environment in facts.prepared_environments:
+		match module_view_accepted_trait_implementation_authority(
+			environment.module_facts.module_view,
+		):
+			Some(authority):
+				authorities = authorities.append(authority)
+			None:
+				void
+
+	accepted_trait_implementation_authority_metrics(
+		facts.accepted_trait_implementation_table,
+		authorities,
+	)
 
 
 pure func accepted_typecheck_graph_alias_metrics(
@@ -8474,7 +8701,6 @@ private pure func prepare_ctfe_artifact_body_module(
 	program = bound_module_program(bound_module)
 	view = bound_module_view(bound_module)
 	visible_import_modules = bound_module_visible_import_modules(bound_module)
-	direct_import_modules = bound_module_direct_import_modules(bound_module)
 	import_surfaces = importable_module_surfaces(visible_import_modules)
 	with_known_types = typecheck_prescan_known_type_names(state, program)
 	var with_view = typecheck_state_with_accepted_type_authority(
@@ -8521,21 +8747,27 @@ private pure func prepare_ctfe_artifact_body_module(
 	with_import_decls = typecheck_register_import_modules_from(
 		with_import_type_facts,
 		visible_import_modules,
-		direct_import_modules,
 		type_headers,
-		callable_headers,
-		graph.implementation_headers,
 	)
 
-	base_state = typecheck_state_after_accepted_header_registration(
+	var base_state = typecheck_state_after_accepted_definition_id_replay(
 		with_import_decls,
 		bound_module,
 		type_headers,
-		callable_headers,
-		graph.implementation_headers,
+		graph.accepted_trait_implementation_table,
 		bound_module_identity(bound_module),
 		prepared_module_scope_canonical_path(bound_module_scope(bound_module)),
 	)
+	base_state = { base_state |
+		module_view = module_view_with_accepted_trait_implementation_authority(
+			base_state.module_view,
+			accepted_trait_implementation_authority_for_module(
+				graph.accepted_trait_implementation_table,
+				bound_module,
+			),
+		),
+		private_impls = []
+	}
 	session_seed ?= body_infer_session_seed(base_state)
 
 	Some({
