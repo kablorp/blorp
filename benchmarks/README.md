@@ -1065,17 +1065,20 @@ responses stay file-backed until the worker has exited.
 ### Perceus Global Scanning
 
 `compiler_perceus_memory` generates a bounded Core program with managed globals
-and moderately sized function bodies, sends it through the production
-`run_perceus` bridge action, validates the resulting Core, and reports request
-and artifact hashes, elapsed time, and peak memory. Each function reads 32
-globals by default so the fixture measures both reference discovery and the
-width of the global table:
+and moderately sized function bodies, validates the resulting Core, and reports
+request and artifact hashes, elapsed time, peak memory, a static ownership-node
+census, and deterministic work counters. The default inner window is named
+`ownership-preparation plus Perceus` because it includes consume specialization,
+record-update lowering, dictionary ownership preparation, and Perceus. Select
+`--measurement-window perceus-direct` to perform those prerequisites before the
+window and measure only `insert_drops_program`:
 
 ```bash
 benchmarks/compiler_perceus_memory
 benchmarks/compiler_perceus_memory --globals 24
 benchmarks/compiler_perceus_memory --globals 384
 benchmarks/compiler_perceus_memory --global-reads-per-function 0
+benchmarks/compiler_perceus_memory --measurement-window perceus-direct
 ```
 
 The function count, body shape, and referenced-global count stay fixed when
@@ -1084,6 +1087,9 @@ referenced set. Set `--global-reads-per-function 0` to measure bodies with no
 global references. The runner uses `BLORP_BACKEND_BENCHMARK_WORKER` when it
 names a prepared worker; otherwise it builds the benchmark-owned worker before
 starting measurement. Worker construction is excluded from the reported time.
+The independently instrumented worker uses
+`BLORP_BACKEND_COUNTER_BENCHMARK_WORKER`; the timing-worker override is never
+silently reused for counters.
 
 On macOS, all compiler memory diagnostics accept `--vmmap` to sample physical
 footprint, `MALLOC_SMALL`, and allocation count when `vmmap` exposes those
@@ -1095,11 +1101,39 @@ benchmarks/compiler_backend_memory captured-request.json --vmmap
 benchmarks/compiler_perceus_memory --vmmap
 ```
 
-The default action hashes the Core artifact produced by the isolated worker
-route through Perceus. This excludes reuse and C emission, but includes worker
-startup, Core JSON decoding/encoding, and the ownership-preparation stages
-immediately before Perceus. Use `--end-to-end` to retain the older integration
-measurement through generated C.
+The result contains both process elapsed time and `window_elapsed_microseconds`.
+Only the latter isolates the named compiler window; process elapsed time still
+includes worker startup and Core JSON decoding/encoding. Window allocation and
+release counts are captured by the ordinary timing worker. Static `DupExpr` and
+`DropExpr` counts are grouped by policy in `ownership_census`.
+An untimed inspection request also reports expression and ownership-event
+censuses, plus artifact hashes, for ownership-ready, post-Perceus, post-reuse,
+and prepared Core.
+
+Logical counters come from a separately compiled `--debug --profile` worker.
+Normal builds erase all marker calls through `debug:` blocks. The runner executes
+the counter worker twice, requires identical counter maps, and rejects any Core
+artifact mismatch between counter and timing workers. Use `--no-work-counters`
+for a timing-only run, or `--counter-bridge` when comparing an explicitly built
+instrumented worker. Never use the debug/profile worker's elapsed time for a
+speed claim.
+
+The initial body catalog is deliberately limited to the contract-inference
+workloads consumed by the next optimization tranche:
+
+```bash
+benchmarks/compiler_perceus_memory --body-shape linear
+benchmarks/compiler_perceus_memory --body-shape nested_user_call --user-call-edges 8
+benchmarks/compiler_perceus_memory --body-shape mutually_recursive_calls --user-call-edges 8
+```
+
+Branch, match, aggregate, borrowed-return, and cancellation fixtures will be
+added with the tranches that consume them; constructing unvalidated Core JSON
+for all later mechanisms here would add test-only surface without improving the
+current contract baseline. Use `--end-to-end` to run ownership preparation,
+Perceus, and the complete post-Perceus tail before measuring backend emission.
+That result includes separate retain, release, ARC-only release, cleanup-push,
+and cleanup-pop counts from the generated program C artifact.
 
 For the standard four-point global/reference matrix, build one worker and run
 seven warmed samples per point:
@@ -1123,6 +1157,16 @@ normalization. Primitive and managed samples alternate at each count and the
 result reports paired ratios. Use paired candidate/baseline workers for
 compiler-change claims rather than treating absolute times as Perceus-only
 subphase timings.
+
+The contract matrix varies borrowed owners, exact function-body node count,
+and user-call edges one axis at a time. Padding literals keep the other two
+structural axes fixed, including the owner-count points. The edge axis uses 33
+mutually recursive functions so each function can call 1, 8, or 32 distinct
+callees; repeated sites to the same callee do not masquerade as graph edges:
+
+```bash
+benchmarks/compiler_perceus_memory --contract-matrix --samples 7 --json
+```
 
 For performance decisions, compare explicit workers in alternating order:
 

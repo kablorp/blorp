@@ -79,7 +79,7 @@ import:
 			WhileExpr,
 		),
 		CoreForeignArgPassing(ForeignBorrowArgs),
-		CoreFunctionKind(UserFunction),
+		CoreFunctionKind(ClosureBodyFunction, UserFunction),
 		CoreListAccessBounds(ProvenListAccess),
 		CoreListStorageLayout(PointerListStorage),
 		CoreLiteral(BoolLiteral, IntLiteral, StringLiteral),
@@ -4464,6 +4464,118 @@ pure func test_recursive_read_only_user_calls_borrow_argument() -> Bool:
 			False
 
 
+pure func test_mutually_recursive_contract_propagates_consuming_seed() -> Bool:
+	value_type: CoreType = list_int_type()
+	first: CoreDecl = function_decl(
+		"consuming_cycle_first",
+		1102,
+		[core_param("value", value_type)],
+		value_type,
+		user_call_expr(
+			"consuming_cycle_second",
+			Some(1103),
+			[],
+			[var_expr("value", value_type)],
+			value_type,
+		),
+	)
+	second: CoreDecl = function_decl(
+		"consuming_cycle_second",
+		1103,
+		[core_param("value", value_type)],
+		value_type,
+		SeqExpr(
+			intrinsic_expr(
+				"list_ensure_unique",
+				[var_expr("value", value_type)],
+				value_type,
+			),
+			user_call_expr(
+				"consuming_cycle_first",
+				Some(1102),
+				[],
+				[var_expr("value", value_type)],
+				value_type,
+			),
+		),
+	)
+	rewritten: CoreProgram = insert_drops_program({
+		decls = [first, second],
+		foreign_includes = [],
+	})
+
+	first_consumes: Bool = match function_body(rewritten, "consuming_cycle_first"):
+		Some(CallExpr(UserCall(name, def_id, consumed_args), callee, args, typ, loc)):
+			int_lists_equal(consumed_args, [0])
+		Some(_):
+			False
+		None:
+			False
+	first_consumes
+
+
+pure func test_transitive_user_call_consumption_is_cancelled_by_incoming_dup() -> Bool:
+	consume: CoreDecl = function_decl(
+		"consume_after_dup",
+		256,
+		[core_param("items", list_int_type())],
+		list_int_type(),
+		intrinsic_expr(
+			"list_ensure_unique",
+			[var_expr("items", list_int_type())],
+			list_int_type(),
+		),
+	)
+	duplicate_then_consume: CoreDecl = function_decl(
+		"duplicate_then_consume",
+		257,
+		[core_param("items", list_int_type())],
+		list_int_type(),
+		SeqExpr(
+			DupExpr(
+				named_var("items"),
+				list_int_type(),
+				ArcRetainPolicy,
+				user_call_expr(
+					"consume_after_dup",
+					Some(256),
+					[],
+					[var_expr("items", list_int_type())],
+					list_int_type(),
+				),
+				list_int_type(),
+				SyntheticSourceLoc,
+			),
+			var_expr("items", list_int_type()),
+		),
+	)
+	caller: CoreDecl = function_decl(
+		"call_duplicate_then_consume",
+		258,
+		[core_param("items", list_int_type())],
+		list_int_type(),
+		user_call_expr(
+			"duplicate_then_consume",
+			Some(257),
+			[],
+			[var_expr("items", list_int_type())],
+			list_int_type(),
+		),
+	)
+	program: CoreProgram = insert_drops_program({
+		decls = [consume, duplicate_then_consume, caller],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "call_duplicate_then_consume"):
+		Some(CallExpr(UserCall(name, def_id, consumed_args), callee, args, typ, loc)):
+			consumed_args.length() == 0
+		Some(body):
+			False
+		None:
+			False
+
+
 pure func test_recursive_managed_result_borrows_context_and_retains_alias() -> Bool:
 	value_type: CoreType = list_int_type()
 	tag_type: CoreType = UnionType("Tag")
@@ -4696,6 +4808,421 @@ pure func test_specialized_functions_with_shared_def_id_keep_distinct_contracts(
 			False
 
 	read_borrows and consume_transfers
+
+
+pure func test_inferred_contract_preserves_direct_then_transitive_order() -> Bool:
+	value_type: CoreType = list_int_type()
+	consume: CoreDecl = function_decl(
+		"consume_for_contract_order",
+		1310,
+		[core_param("value", value_type)],
+		value_type,
+		intrinsic_expr(
+			"list_ensure_unique",
+			[var_expr("value", value_type)],
+			value_type,
+		),
+	)
+	target: CoreDecl = function_decl(
+		"ordered_contract_target",
+		1311,
+		[core_param("transitive", value_type), core_param("direct", value_type)],
+		value_type,
+		SeqExpr(
+			intrinsic_expr(
+				"list_ensure_unique",
+				[var_expr("direct", value_type)],
+				value_type,
+			),
+			user_call_expr(
+				"consume_for_contract_order",
+				Some(1310),
+				[],
+				[var_expr("transitive", value_type)],
+				value_type,
+			),
+		),
+	)
+	caller: CoreDecl = function_decl(
+		"ordered_contract_caller",
+		1312,
+		[],
+		value_type,
+		user_call_expr(
+			"ordered_contract_target",
+			Some(1311),
+			[],
+			[var_expr("left", value_type), var_expr("right", value_type)],
+			value_type,
+		),
+	)
+	rewritten: CoreProgram = insert_drops_program({
+		decls = [consume, target, caller],
+		foreign_includes = [],
+	})
+
+	match function_body(rewritten, "ordered_contract_caller"):
+		Some(CallExpr(UserCall(name, def_id, consumed_args), callee, args, typ, loc)):
+			int_lists_equal(consumed_args, [1, 0])
+		Some(_):
+			False
+		None:
+			False
+
+
+pure func test_same_named_functions_require_exact_contract_identity() -> Bool:
+	read: CoreDecl = function_decl(
+		"same_name",
+		1303,
+		[core_param("value", list_int_type())],
+		int_type(),
+		intrinsic_expr("list_len", [var_expr("value", list_int_type())], int_type()),
+	)
+	consume: CoreDecl = function_decl(
+		"same_name",
+		1304,
+		[core_param("value", list_int_type())],
+		list_int_type(),
+		intrinsic_expr("list_ensure_unique", [var_expr("value", list_int_type())], list_int_type()),
+	)
+	read_caller: CoreDecl = function_decl(
+		"same_name_read_caller",
+		1305,
+		[core_param("value", list_int_type())],
+		int_type(),
+		user_call_expr(
+			"same_name",
+			Some(1303),
+			[],
+			[var_expr("value", list_int_type())],
+			int_type(),
+		),
+	)
+	consume_caller: CoreDecl = function_decl(
+		"same_name_consume_caller",
+		1306,
+		[core_param("value", list_int_type())],
+		list_int_type(),
+		user_call_expr(
+			"same_name",
+			Some(1304),
+			[],
+			[var_expr("value", list_int_type())],
+			list_int_type(),
+		),
+	)
+	rewritten: CoreProgram = insert_drops_program({
+		decls = [read, consume, read_caller, consume_caller],
+		foreign_includes = [],
+	})
+
+	read_borrows: Bool = match function_body(rewritten, "same_name_read_caller"):
+		Some(CallExpr(UserCall(name, def_id, consumed_args), callee, args, typ, loc)):
+			consumed_args.length() == 0
+		Some(_):
+			False
+		None:
+			False
+
+	consume_transfers: Bool = match function_body(rewritten, "same_name_consume_caller"):
+		Some(CallExpr(UserCall(name, def_id, consumed_args), callee, args, typ, loc)):
+			int_lists_equal(consumed_args, [0])
+		Some(_):
+			False
+		None:
+			False
+
+	read_borrows and consume_transfers
+
+
+pure func test_missing_user_call_identity_does_not_guess_contract() -> Bool:
+	consume: CoreDecl = function_decl(
+		"identity_required",
+		1307,
+		[core_param("value", list_int_type())],
+		list_int_type(),
+		intrinsic_expr("list_ensure_unique", [var_expr("value", list_int_type())], list_int_type()),
+	)
+	caller: CoreDecl = function_decl(
+		"missing_identity_caller",
+		1308,
+		[core_param("value", list_int_type())],
+		list_int_type(),
+		user_call_expr(
+			"identity_required",
+			None,
+			[],
+			[var_expr("value", list_int_type())],
+			list_int_type(),
+		),
+	)
+	rewritten: CoreProgram = insert_drops_program({
+		decls = [consume, caller],
+		foreign_includes = [],
+	})
+
+	match function_body(rewritten, "missing_identity_caller"):
+		Some(CallExpr(UserCall(name, def_id, consumed_args), callee, args, typ, loc)):
+			consumed_args.length() == 0
+		Some(_):
+			False
+		None:
+			False
+
+
+pure func test_match_binding_shadow_does_not_consume_same_named_parameter() -> Bool:
+	value_type: CoreType = list_int_type()
+	target: CoreDecl = function_decl(
+		"shadowed_contract_target",
+		1313,
+		[core_param("callee", value_type)],
+		value_type,
+		constructor_match_expr(
+			[constructor_case(
+					"Some",
+					[match_binding("callee", value_type)],
+					intrinsic_expr(
+						"list_ensure_unique",
+						[var_expr("callee", value_type)],
+						value_type,
+					),
+				)],
+			intrinsic_expr("list_alloc", [int_expr(0)], value_type),
+			value_type,
+		),
+	)
+	caller: CoreDecl = function_decl(
+		"shadowed_contract_caller",
+		1314,
+		[core_param("value", value_type)],
+		value_type,
+		user_call_expr(
+			"shadowed_contract_target",
+			Some(1313),
+			[],
+			[var_expr("value", value_type)],
+			value_type,
+		),
+	)
+	rewritten: CoreProgram = insert_drops_program({
+		decls = [target, caller],
+		foreign_includes = [],
+	})
+
+	match function_body(rewritten, "shadowed_contract_caller"):
+		Some(CallExpr(UserCall(name, def_id, consumed_args), callee, args, typ, loc)):
+			consumed_args.length() == 0
+		Some(_):
+			False
+		None:
+			False
+
+
+pure func test_inferred_contract_ignores_stale_call_site_consumption() -> Bool:
+	value_type: CoreType = list_int_type()
+	read: CoreDecl = function_decl(
+		"stale_contract_read",
+		1315,
+		[core_param("value", value_type)],
+		int_type(),
+		intrinsic_expr("list_len", [var_expr("value", value_type)], int_type()),
+	)
+	forward: CoreDecl = function_decl(
+		"stale_contract_forward",
+		1316,
+		[core_param("value", value_type)],
+		int_type(),
+		user_call_expr(
+			"stale_contract_read",
+			Some(1315),
+			[0],
+			[var_expr("value", value_type)],
+			int_type(),
+		),
+	)
+	caller: CoreDecl = function_decl(
+		"stale_contract_caller",
+		1317,
+		[core_param("value", value_type)],
+		int_type(),
+		user_call_expr(
+			"stale_contract_forward",
+			Some(1316),
+			[],
+			[var_expr("value", value_type)],
+			int_type(),
+		),
+	)
+	rewritten: CoreProgram = insert_drops_program({
+		decls = [read, forward, caller],
+		foreign_includes = [],
+	})
+
+	match function_body(rewritten, "stale_contract_caller"):
+		Some(CallExpr(UserCall(name, def_id, consumed_args), callee, args, typ, loc)):
+			consumed_args.length() == 0
+		Some(_):
+			False
+		None:
+			False
+
+
+pure func test_closure_body_contract_remains_fixed_borrowing() -> Bool:
+	value_type: CoreType = list_int_type()
+	closure_body: CoreDecl = FunctionDecl({
+		name = "fixed_borrowing_closure_body",
+		source_module = None,
+		type_params = [],
+		params = [core_param("value", value_type)],
+		return_type = int_type(),
+		body = Some(SeqExpr(
+			intrinsic_expr(
+				"list_ensure_unique",
+				[var_expr("value", value_type)],
+				value_type,
+			),
+			int_expr(0),
+		)),
+		is_pure = True,
+		function_kind = ClosureBodyFunction({
+			c_name = "fixed_borrowing_closure_body_c",
+			params = [],
+			captures = [],
+			moved_captures = [],
+			task_abi = False,
+		}),
+		def_id = 1318,
+		loc = SyntheticSourceLoc,
+	})
+	caller: CoreDecl = function_decl(
+		"fixed_borrowing_closure_caller",
+		1319,
+		[core_param("value", value_type)],
+		int_type(),
+		user_call_expr(
+			"fixed_borrowing_closure_body",
+			Some(1318),
+			[],
+			[var_expr("value", value_type)],
+			int_type(),
+		),
+	)
+	rewritten: CoreProgram = insert_drops_program({
+		decls = [closure_body, caller],
+		foreign_includes = [],
+	})
+
+	match function_body(rewritten, "fixed_borrowing_closure_caller"):
+		Some(CallExpr(UserCall(name, def_id, consumed_args), callee, args, typ, loc)):
+			consumed_args.length() == 0
+		Some(_):
+			False
+		None:
+			False
+
+
+pure func test_closure_body_direct_wrapper_preserves_consuming_contract() -> Bool:
+	value_type: CoreType = string_type()
+	closure_body: CoreDecl = FunctionDecl({
+		name = "consuming_wrapper_closure_body",
+		source_module = None,
+		type_params = [],
+		params = [core_param("left", value_type), core_param("right", value_type)],
+		return_type = value_type,
+		body = Some(call_expr(
+			"blorp_string_concat_consume",
+			[var_expr("left", value_type), var_expr("right", value_type)],
+			value_type,
+		)),
+		is_pure = True,
+		function_kind = ClosureBodyFunction({
+			c_name = "consuming_wrapper_closure_body_c",
+			params = [],
+			captures = [],
+			moved_captures = [],
+			task_abi = False,
+		}),
+		def_id = 1323,
+		loc = SyntheticSourceLoc,
+	})
+	env: PerceusEnv = build_env({
+		decls = [closure_body],
+		foreign_includes = [],
+	})
+
+	contract_is(
+		contract_for_call(
+			env,
+			UserCall("consuming_wrapper_closure_body", Some(1323), []),
+			2,
+			value_type,
+		),
+		[TransferArg, TransferArg],
+		ReturnOwned,
+	)
+
+
+pure func test_nested_lambda_contract_region_does_not_escape() -> Bool:
+	value_type: CoreType = list_int_type()
+	consume: CoreDecl = function_decl(
+		"consume_nested_lambda_value",
+		1320,
+		[core_param("value", value_type)],
+		value_type,
+		intrinsic_expr(
+			"list_ensure_unique",
+			[var_expr("value", value_type)],
+			value_type,
+		),
+	)
+	target: CoreDecl = function_decl(
+		"nested_lambda_contract_target",
+		1321,
+		[core_param("value", value_type)],
+		int_type(),
+		SeqExpr(
+			LambdaExpr(
+				[core_param("value", value_type)],
+				value_type,
+				user_call_expr(
+					"consume_nested_lambda_value",
+					Some(1320),
+					[],
+					[var_expr("value", value_type)],
+					value_type,
+				),
+				True,
+				NamedType("Function", []),
+				SyntheticSourceLoc,
+			),
+			int_expr(0),
+		),
+	)
+	caller: CoreDecl = function_decl(
+		"nested_lambda_contract_caller",
+		1322,
+		[core_param("value", value_type)],
+		int_type(),
+		user_call_expr(
+			"nested_lambda_contract_target",
+			Some(1321),
+			[],
+			[var_expr("value", value_type)],
+			int_type(),
+		),
+	)
+	rewritten: CoreProgram = insert_drops_program({
+		decls = [consume, target, caller],
+		foreign_includes = [],
+	})
+
+	match function_body(rewritten, "nested_lambda_contract_caller"):
+		Some(CallExpr(UserCall(name, def_id, consumed_args), callee, args, typ, loc)):
+			consumed_args.length() == 0
+		Some(_):
+			False
+		None:
+			False
 
 
 pure func test_consumed_managed_parameter_return_transfers_without_retain() -> Bool:
@@ -13117,6 +13644,92 @@ pure func test_inferred_user_call_contract_is_written_to_calls() -> Bool:
 			False
 
 
+pure func test_inferred_user_call_contract_borrows_list_get_owner() -> Bool:
+	read_head: CoreDecl = function_decl(
+		"read_head",
+		252,
+		[core_param("items", NamedType("List", [list_int_type()]))],
+		list_int_type(),
+		ListGetExpr(
+			{
+				layout = PointerListStorage,
+				list = var_expr("items", NamedType("List", [list_int_type()])),
+				index = int_expr(0),
+				bounds = ProvenListAccess
+			},
+			list_int_type(),
+			SyntheticSourceLoc,
+		),
+	)
+	caller: CoreDecl = function_decl(
+		"call_read_head",
+		253,
+		[core_param("items", NamedType("List", [list_int_type()]))],
+		list_int_type(),
+		user_call_expr(
+			"read_head",
+			Some(252),
+			[],
+			[var_expr("items", NamedType("List", [list_int_type()]))],
+			list_int_type(),
+		),
+	)
+	program: CoreProgram = insert_drops_program({
+		decls = [read_head, caller],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "call_read_head"):
+		Some(CallExpr(UserCall(name, def_id, consumed_args), callee, args, typ, loc)):
+			name == "read_head" and consumed_args.length() == 0
+		Some(body):
+			False
+		None:
+			False
+
+
+pure func test_bodyless_user_call_preserves_explicit_consumption() -> Bool:
+	external: CoreDecl = FunctionDecl({
+		name = "external_consume",
+		source_module = None,
+		type_params = [],
+		params = [core_param("items", list_int_type())],
+		return_type = list_int_type(),
+		body = None,
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 254,
+		loc = SyntheticSourceLoc,
+	})
+	caller: CoreDecl = function_decl(
+		"call_external_consume",
+		255,
+		[core_param("items", list_int_type())],
+		list_int_type(),
+		user_call_expr(
+			"external_consume",
+			Some(254),
+			[0],
+			[var_expr("items", list_int_type())],
+			list_int_type(),
+		),
+	)
+	program: CoreProgram = insert_drops_program({
+		decls = [external, caller],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "call_external_consume"):
+		Some(body):
+			match body:
+				CallExpr(UserCall(name, def_id, consumed_args), callee, args, typ, loc):
+					int_lists_equal(consumed_args, [0]) and drop_count_for("items", body) == 0
+				_:
+					False
+		None:
+			False
+
+
 pure func test_inferred_user_call_contract_is_used_for_union_return() -> Bool:
 	consume: CoreDecl = function_decl(
 		"consume_with_union_result",
@@ -14425,6 +15038,14 @@ tests: TestSuite = {
 			test_recursive_read_only_user_calls_borrow_argument,
 		),
 		(
+			"mutually recursive contract propagates consuming seed",
+			test_mutually_recursive_contract_propagates_consuming_seed,
+		),
+		(
+			"transitive user-call consumption is cancelled by incoming dup",
+			test_transitive_user_call_consumption_is_cancelled_by_incoming_dup,
+		),
+		(
 			"recursive managed result borrows context and retains alias",
 			test_recursive_managed_result_borrows_context_and_retains_alias,
 		),
@@ -14443,6 +15064,38 @@ tests: TestSuite = {
 		(
 			"specialized functions with shared def id keep distinct contracts",
 			test_specialized_functions_with_shared_def_id_keep_distinct_contracts,
+		),
+		(
+			"inferred contract preserves direct then transitive order",
+			test_inferred_contract_preserves_direct_then_transitive_order,
+		),
+		(
+			"same named functions require exact contract identity",
+			test_same_named_functions_require_exact_contract_identity,
+		),
+		(
+			"missing user call identity does not guess contract",
+			test_missing_user_call_identity_does_not_guess_contract,
+		),
+		(
+			"match binding shadow does not consume same-named parameter",
+			test_match_binding_shadow_does_not_consume_same_named_parameter,
+		),
+		(
+			"inferred contract ignores stale call-site consumption",
+			test_inferred_contract_ignores_stale_call_site_consumption,
+		),
+		(
+			"closure body contract remains fixed borrowing",
+			test_closure_body_contract_remains_fixed_borrowing,
+		),
+		(
+			"closure body direct wrapper preserves consuming contract",
+			test_closure_body_direct_wrapper_preserves_consuming_contract,
+		),
+		(
+			"nested lambda contract region does not escape",
+			test_nested_lambda_contract_region_does_not_escape,
 		),
 		(
 			"consumed managed parameter return transfers without retain",
@@ -15318,6 +15971,14 @@ tests: TestSuite = {
 		(
 			"inferred user-call contract is written to calls",
 			test_inferred_user_call_contract_is_written_to_calls,
+		),
+		(
+			"inferred user-call contract borrows list-get owner",
+			test_inferred_user_call_contract_borrows_list_get_owner,
+		),
+		(
+			"bodyless user call preserves explicit consumption",
+			test_bodyless_user_call_preserves_explicit_consumption,
 		),
 		(
 			"inferred user-call contract is used for union return",

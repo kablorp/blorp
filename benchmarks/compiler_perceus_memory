@@ -21,13 +21,58 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from compiler_backend_worker import BACKEND_WORKER_ENV, prepare_backend_worker
+from compiler_backend_worker import (
+    BACKEND_COUNTER_WORKER_ENV,
+    BACKEND_WORKER_ENV,
+    prepare_backend_worker,
+)
 
 
-FIXTURE_VERSION = 3
+FIXTURE_VERSION = 5
 DEFAULT_TIMEOUT_SECONDS = 60.0
 PERCEUS_ACTION = "run_perceus"
-END_TO_END_ACTION = "emit_core_c"
+MEASURE_OWNERSHIP_PREPARATION_PERCEUS_ACTION = (
+    "measure_ownership_preparation_perceus"
+)
+MEASURE_PERCEUS_DIRECT_ACTION = "measure_perceus_direct"
+INSPECT_OWNERSHIP_STAGES_ACTION = "inspect_ownership_stages"
+END_TO_END_ACTION = "measure_backend_emission"
+DEFAULT_MEASUREMENT_WINDOW = "ownership-preparation-plus-perceus"
+BODY_SHAPES = (
+    "linear",
+    "nested_user_call",
+    "mutually_recursive_calls",
+)
+PERCEUS_WORK_COUNTER_NAMES = (
+    "contract_function_analyses",
+    "contract_managed_parameter_summaries",
+    "contract_solver_wave_iterations",
+    "contract_solver_frontier_callable_visits",
+    "contract_collection_expression_visits",
+    "contract_flow_edges",
+    "contract_solver_flow_visits",
+    "contract_scalar_fallback_analyses",
+    "contract_managed_parameter_slots",
+    "contract_reverse_parameter_slots",
+    "contract_flow_dedup_entries",
+    "contract_direct_parameter_inserts",
+    "contract_collection_task_pushes",
+    "contract_solver_parameter_marks",
+    "contract_dup_fallback_analyses",
+    "contract_shadow_fallback_analyses",
+    "linear_summary_requests",
+    "linear_summary_node_visits",
+    "legacy_count_node_visits",
+    "borrowed_call_node_visits",
+    "borrowed_aggregate_node_visits",
+    "borrowed_result_node_visits",
+    "resolved_value_queries",
+    "insert_node_visits",
+    "insert_rebuild_actions",
+    "declarations_rewritten",
+    "functions_rewritten",
+    "globals_rewritten",
+)
 DEFAULT_GLOBALS = 384
 DEFAULT_FUNCTIONS = 64
 DEFAULT_BODY_LEAVES = 64
@@ -35,6 +80,10 @@ DEFAULT_GLOBAL_READS_PER_FUNCTION = 32
 DEFAULT_PARAMS_PER_FUNCTION = 0
 PARAMETER_MATRIX_FUNCTIONS = 2
 PARAMETER_MATRIX_BODY_LEAVES = 128
+CONTRACT_MATRIX_FUNCTIONS = 8
+CONTRACT_EDGE_MATRIX_FUNCTIONS = 33
+CONTRACT_MATRIX_OWNER_BODY_LEAVES = 644
+CONTRACT_FIXTURE_LET_NODES = 2
 PRIMITIVE_PARAMETER_TYPE = "Int"
 MANAGED_PARAMETER_TYPE = "String"
 WORKER_FLAG = "--measurement-worker"
@@ -44,6 +93,185 @@ SUPERVISOR_GRACE_SECONDS = 3.0
 VMMAP_COMMAND_TIMEOUT_SECONDS = 1.0
 
 JsonObject = dict[str, Any]
+
+# Every serialized CoreExpr tag in stage_09_core/ir.brp. Restricting the census
+# to this closed vocabulary avoids mistaking CoreType and CoreCallKind objects,
+# which also have a `kind` field, for expression nodes.
+CORE_EXPR_KINDS = frozenset({
+    "literal", "var", "void", "debug_block", "cooperative_checkpoint",
+    "call", "seq", "if", "binary", "unary", "logical", "assign", "cast",
+    "box", "unbox", "field", "tuple_field", "tuple", "tuple_construct",
+    "vector", "lambda", "closure_create", "list_construct", "list_alloc",
+    "list_get", "list_handoff", "list_handoff_set_owned",
+    "list_handoff_set_source_slot", "string_byte_read", "string_byte_write",
+    "string_byte_copy", "string_set_len", "tensor_raw_read",
+    "tensor_raw_write", "tensor_raw_view_let", "dict", "borrow_let",
+    "tensor_literal", "tensor_boxed_literal", "tensor_packed_literal",
+    "tensor_raw_fill", "dict_construct", "set_alloc", "list_retain",
+    "list_set", "list_swap", "record", "record_update", "record_reuse",
+    "record_cow_update", "record_construct", "union_construct",
+    "union_reuse_construct", "detach", "drop", "dup", "let", "while",
+    "break", "continue", "resource_scope", "resource_cleanup_exit",
+    "tailrec_loop", "tailrec_recur", "tailrec_list_spread_loop",
+    "tailrec_list_spread_recur", "for_range", "for_channel", "for_list",
+    "for_string", "for_dict", "for_set", "for_stream",
+    "for_resource_source", "for_tensor", "concurrently_loop",
+    "pre_closure_concurrently_loop", "concurrent", "pre_closure_concurrent",
+    "pre_closure_detach", "select", "range", "raw_match", "semantic_match",
+    "literal_match", "accessor_literal_match", "length_match",
+    "constructor_match", "expr",
+})
+
+
+def measurement_action(window: str) -> str:
+    if window == "ownership-preparation-plus-perceus":
+        return MEASURE_OWNERSHIP_PREPARATION_PERCEUS_ACTION
+    if window == "perceus-direct":
+        return MEASURE_PERCEUS_DIRECT_ACTION
+    raise ValueError(f"unsupported Perceus measurement window: {window}")
+
+
+def measurement_window_label(action: str) -> str:
+    if action == MEASURE_OWNERSHIP_PREPARATION_PERCEUS_ACTION:
+        return "ownership-preparation plus Perceus"
+    if action == MEASURE_PERCEUS_DIRECT_ACTION:
+        return "direct Perceus"
+    if action == END_TO_END_ACTION:
+        return "backend emission"
+    if action == PERCEUS_ACTION:
+        return "legacy ownership-preparation plus Perceus"
+    raise ValueError(f"unsupported Perceus benchmark action: {action}")
+
+
+def parse_perceus_work_counters(stderr: str) -> dict[str, int]:
+    counters: dict[str, int] = {}
+    for line in stderr.splitlines():
+        for name in PERCEUS_WORK_COUNTER_NAMES:
+            if f"perceus_work_{name}" not in line:
+                continue
+            match = re.search(r"\s([0-9]+)\s+[0-9.]+\s*$", line)
+            if match is not None:
+                registered_count = int(match.group(1))
+                if registered_count < 1:
+                    raise RuntimeError(f"invalid Perceus work counter: {name}")
+                counters[name] = registered_count - 1
+    missing = [name for name in PERCEUS_WORK_COUNTER_NAMES if name not in counters]
+    if missing:
+        raise RuntimeError("missing Perceus work counters: " + ", ".join(missing))
+    return counters
+
+
+def core_ownership_census(core_program: JsonObject) -> JsonObject:
+    dup_by_policy: dict[str, int] = {}
+    drop_by_policy: dict[str, int] = {}
+    expression_nodes = 0
+
+    def visit(value: Any) -> None:
+        nonlocal expression_nodes
+        if isinstance(value, dict):
+            kind = value.get("kind")
+            if kind in CORE_EXPR_KINDS:
+                expression_nodes += 1
+            if kind == "dup":
+                policy = str(value.get("retain_policy", "unknown"))
+                dup_by_policy[policy] = dup_by_policy.get(policy, 0) + 1
+            elif kind == "drop":
+                policy = str(value.get("release_policy", "unknown"))
+                drop_by_policy[policy] = drop_by_policy.get(policy, 0) + 1
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(core_program)
+    return {
+        "expression_nodes": expression_nodes,
+        "dup_by_policy": dict(sorted(dup_by_policy.items())),
+        "drop_by_policy": dict(sorted(drop_by_policy.items())),
+    }
+
+
+def c_without_literals_and_comments(c_code: str) -> str:
+    """Blank C literals/comments while preserving token and line boundaries."""
+    output: list[str] = []
+    index = 0
+    state = "code"
+    while index < len(c_code):
+        current = c_code[index]
+        following = c_code[index + 1] if index + 1 < len(c_code) else ""
+        if state == "code":
+            if current == '"':
+                state = "string"
+                output.append(" ")
+            elif current == "'":
+                state = "char"
+                output.append(" ")
+            elif current == "/" and following == "/":
+                state = "line_comment"
+                output.extend((" ", " "))
+                index += 1
+            elif current == "/" and following == "*":
+                state = "block_comment"
+                output.extend((" ", " "))
+                index += 1
+            else:
+                output.append(current)
+        elif state in ("string", "char"):
+            if current == "\\":
+                output.append(" ")
+                if following:
+                    output.append("\n" if following == "\n" else " ")
+                    index += 1
+            elif (state == "string" and current == '"') or (
+                state == "char" and current == "'"
+            ):
+                state = "code"
+                output.append(" ")
+            else:
+                output.append("\n" if current == "\n" else " ")
+        elif state == "line_comment":
+            output.append("\n" if current == "\n" else " ")
+            if current == "\n":
+                state = "code"
+        else:
+            output.append("\n" if current == "\n" else " ")
+            if current == "*" and following == "/":
+                output.append(" ")
+                index += 1
+                state = "code"
+        index += 1
+    return "".join(output)
+
+
+def generated_c_ownership_census(c_code: str) -> JsonObject:
+    """Count emitted ownership statements, excluding C literals and comments."""
+    emitted_code = c_without_literals_and_comments(c_code)
+    return {
+        "retain_calls": len(re.findall(r"\bblorp_retain\s*\(", emitted_code)),
+        "release_calls": len(re.findall(r"\bblorp_release\s*\(", emitted_code)),
+        "release_arc_only_calls": len(
+            re.findall(r"\bblorp_release_arc_only\s*\(", emitted_code)
+        ),
+        "cleanup_push_calls": len(
+            re.findall(r"\bblorp_task_cleanup_push\s*\(", emitted_code)
+        ),
+        "cleanup_pop_calls": len(
+            re.findall(r"\bblorp_task_cleanup_pop_slot\s*\(", emitted_code)
+        ),
+        "cleanup_duplicate_calls": len(
+            re.findall(r"\bblorp_task_cleanup_duplicate_slot\s*\(", emitted_code)
+        ),
+        "stack_result_retain_calls": len(
+            re.findall(r"\bblorp_stack_result_retain\s*\(", emitted_code)
+        ),
+        "stack_result_retain_value_calls": len(
+            re.findall(r"\bblorp_stack_result_retain_value\s*\(", emitted_code)
+        ),
+        "stack_result_release_calls": len(
+            re.findall(r"\bblorp_stack_result_release\s*\(", emitted_code)
+        ),
+    }
 
 
 def synthetic_loc() -> JsonObject:
@@ -74,6 +302,40 @@ def seq_expr(expressions: list[JsonObject]) -> JsonObject:
     result = expressions[-1]
     for expression in reversed(expressions[:-1]):
         result = {"kind": "seq", "first": expression, "second": result}
+    return result
+
+
+def expression_node_count(value: Any) -> int:
+    if isinstance(value, dict):
+        own = int(value.get("kind") in CORE_EXPR_KINDS)
+        return own + sum(expression_node_count(child) for child in value.values())
+    if isinstance(value, list):
+        return sum(expression_node_count(child) for child in value)
+    return 0
+
+
+def padded_sequence(expressions: list[JsonObject], target_nodes: int) -> JsonObject:
+    if not expressions:
+        expressions = [literal_expr("int", 0, "Int")]
+    result = seq_expr(expressions)
+    current_nodes = expression_node_count(result)
+    if current_nodes > target_nodes:
+        raise ValueError(
+            f"body workload needs {current_nodes} nodes but target is {target_nodes}"
+        )
+    while current_nodes + 2 <= target_nodes:
+        expressions.append(literal_expr("int", current_nodes, "Int"))
+        current_nodes += 2
+    result = seq_expr(expressions)
+    if current_nodes < target_nodes:
+        result = {
+            "kind": "cast",
+            "expr": result,
+            "type": named_type("Int"),
+            "loc": synthetic_loc(),
+        }
+    if expression_node_count(result) != target_nodes:
+        raise RuntimeError("failed to construct exact Perceus body node target")
     return result
 
 
@@ -159,6 +421,31 @@ def parameter_argument_expr(param_index: int, parameter_type: str) -> JsonObject
     return literal_expr("int", param_index, parameter_type)
 
 
+def consuming_parameter_expr(
+    function_index: int,
+    param_index: int,
+    parameter_type: str,
+) -> JsonObject:
+    if parameter_type != MANAGED_PARAMETER_TYPE:
+        return borrowed_param_ref_expr(function_index, param_index, parameter_type)
+    return {
+        "kind": "call",
+        "call_kind": {"kind": "builtin", "name": "blorp_string_concat_consume"},
+        "callee": {
+            "kind": "var",
+            "var": core_var("blorp_string_concat_consume", None),
+            "type": named_type("Function"),
+            "loc": synthetic_loc(),
+        },
+        "args": [
+            borrowed_param_ref_expr(function_index, param_index, parameter_type),
+            literal_expr("string", "", MANAGED_PARAMETER_TYPE),
+        ],
+        "type": named_type(MANAGED_PARAMETER_TYPE),
+        "loc": synthetic_loc(),
+    }
+
+
 def worker_decl(
     index: int,
     def_id: int,
@@ -166,23 +453,73 @@ def worker_decl(
     global_reads_per_function: int,
     params_per_function: int,
     parameter_type: str,
+    body_shape: str,
+    function_count: int,
+    first_function_id: int,
+    user_call_edges: int,
 ) -> JsonObject:
-    literal_count = (
-        body_leaves
-        - global_reads_per_function
-        - params_per_function
+    direct_parameter_reads = (
+        body_shape == "linear"
+        or (body_shape == "nested_user_call" and index == function_count - 1)
+        or (body_shape == "mutually_recursive_calls" and index == 0)
     )
     expressions = [
         global_ref_expr(global_index)
         for global_index in range(global_reads_per_function)
     ]
-    expressions.extend(
-        borrowed_param_ref_expr(index, param_index, parameter_type)
-        for param_index in range(params_per_function)
-    )
-    expressions.extend(
-        literal_expr("int", leaf, "Int") for leaf in range(literal_count)
-    )
+    if direct_parameter_reads:
+        expressions.extend(
+            (
+                borrowed_param_ref_expr(index, param_index, parameter_type)
+                if body_shape == "linear"
+                else consuming_parameter_expr(index, param_index, parameter_type)
+            )
+            for param_index in range(params_per_function)
+        )
+    if body_shape == "nested_user_call":
+        if index < function_count - 1:
+            calls = [
+                call_worker_with_borrowed_params_expr(
+                    index,
+                    target_index,
+                    first_function_id + target_index,
+                    params_per_function,
+                    parameter_type,
+                )
+                for target_index in range(
+                    index + 1,
+                    min(function_count, index + 1 + user_call_edges),
+                )
+            ]
+            expressions = [*calls, *expressions]
+    elif body_shape == "mutually_recursive_calls" and function_count > 1:
+        calls = []
+        for edge_index in range(user_call_edges):
+            target_index = (index + edge_index + 1) % function_count
+            calls.append(
+                call_worker_with_borrowed_params_expr(
+                    index,
+                    target_index,
+                    first_function_id + target_index,
+                    params_per_function,
+                    parameter_type,
+                )
+            )
+        expressions = [*calls, *expressions]
+    elif body_shape != "linear":
+        raise ValueError(f"unsupported Perceus body shape: {body_shape}")
+    if body_shape == "linear":
+        literal_count = body_leaves - global_reads_per_function - params_per_function
+        expressions.extend(
+            literal_expr("int", leaf, "Int") for leaf in range(literal_count)
+        )
+        body_tail = seq_expr(expressions)
+    else:
+        expressions.append(literal_expr("int", 0, "Int"))
+        body_tail = padded_sequence(
+            expressions,
+            body_leaves - CONTRACT_FIXTURE_LET_NODES,
+        )
     managed_local_name = f"BENCH_MANAGED_LOCAL_{index:04d}"
     body = {
         "kind": "let",
@@ -190,7 +527,7 @@ def worker_decl(
         "mutable": False,
         "type": named_type("String"),
         "rhs": literal_expr("string", f"managed-{index:04d}", "String"),
-        "body": seq_expr(expressions),
+        "body": body_tail,
     }
     params = [
         core_param(borrowed_param_name(index, param_index), parameter_type)
@@ -225,6 +562,32 @@ def call_worker_expr(
     }
 
 
+def call_worker_with_borrowed_params_expr(
+    caller_index: int,
+    target_index: int,
+    target_def_id: int,
+    params_per_function: int,
+    parameter_type: str,
+) -> JsonObject:
+    call = call_worker_expr(
+        target_index,
+        target_def_id,
+        params_per_function,
+        parameter_type,
+    )
+    call["call_kind"] = {
+        "kind": "user",
+        "name": f"bench_worker_{target_index:04d}",
+        "def_id": target_def_id,
+        "consumed_args": [],
+    }
+    call["args"] = [
+        borrowed_param_ref_expr(caller_index, param_index, parameter_type)
+        for param_index in range(params_per_function)
+    ]
+    return call
+
+
 def fixture_request(
     global_count: int,
     function_count: int,
@@ -234,7 +597,13 @@ def fixture_request(
     params_per_function: int = DEFAULT_PARAMS_PER_FUNCTION,
     parameter_type: str = MANAGED_PARAMETER_TYPE,
     invoke_workers: bool = True,
+    body_shape: str = "linear",
+    branch_arms: int = 2,
+    user_call_edges: int = 1,
 ) -> tuple[JsonObject, JsonObject]:
+    del branch_arms
+    if body_shape not in BODY_SHAPES:
+        raise ValueError(f"unsupported Perceus body shape: {body_shape}")
     globals_json = [global_decl(index) for index in range(global_count)]
     first_function_id = global_count + 1
     functions_json = [
@@ -245,6 +614,10 @@ def fixture_request(
             global_reads_per_function,
             params_per_function,
             parameter_type,
+            body_shape,
+            function_count,
+            first_function_id,
+            user_call_edges,
         )
         for index in range(function_count)
     ]
@@ -518,6 +891,8 @@ def validate_perceus_parameter_shape(
     function_count: int,
     params_per_function: int,
     parameter_type: str,
+    body_shape: str = "linear",
+    user_call_edges: int = 1,
 ) -> None:
     declarations = core_program.get("decls")
     if not isinstance(declarations, list):
@@ -550,7 +925,16 @@ def validate_perceus_parameter_shape(
                 or value_type.get("name") != parameter_type
             ):
                 raise RuntimeError(f"Perceus Core parameter shape changed for {function_name}")
-            if count_parameter_reads(function.get("body"), expected_name) != 1:
+            expected_reads = 1
+            if body_shape == "nested_user_call":
+                expected_reads = (
+                    1
+                    if function_index == function_count - 1
+                    else min(user_call_edges, function_count - function_index - 1)
+                )
+            elif body_shape == "mutually_recursive_calls":
+                expected_reads = user_call_edges + (1 if function_index == 0 else 0)
+            if count_parameter_reads(function.get("body"), expected_name) != expected_reads:
                 raise RuntimeError(f"Perceus Core parameter reads changed for {function_name}")
 
 
@@ -580,6 +964,8 @@ def validate_response(
     action: str,
     params_per_function: int,
     parameter_type: str,
+    body_shape: str = "linear",
+    user_call_edges: int = 1,
 ) -> tuple[int, str]:
     try:
         response = json.loads(response_path.read_text(encoding="utf-8"))
@@ -605,26 +991,42 @@ def validate_response(
             function_count,
             params_per_function,
             parameter_type,
+            body_shape,
+            user_call_edges,
         )
         encoded_output = json.dumps(output, separators=(",", ":")).encode("utf-8")
 
-    expected_names = ["BENCH_UNUSED_GLOBAL_0000", "bench_worker_0000", "main"]
-    if global_count > 1:
-        expected_names.append(f"BENCH_UNUSED_GLOBAL_{global_count - 1:04d}")
-    if function_count > 1:
-        expected_names.append(f"bench_worker_{function_count - 1:04d}")
-    rendered_output = encoded_output.decode("utf-8")
-    missing_names = [name for name in expected_names if name not in rendered_output]
-    if missing_names:
-        raise RuntimeError(
-            "benchmark artifact is missing fixture declarations: " + ", ".join(missing_names)
-        )
-    if action == PERCEUS_ACTION:
+    if action != END_TO_END_ACTION:
+        expected_names = ["BENCH_UNUSED_GLOBAL_0000", "bench_worker_0000", "main"]
+        if global_count > 1:
+            expected_names.append(f"BENCH_UNUSED_GLOBAL_{global_count - 1:04d}")
+        if function_count > 1:
+            expected_names.append(f"bench_worker_{function_count - 1:04d}")
+        rendered_output = encoded_output.decode("utf-8")
+        missing_names = [name for name in expected_names if name not in rendered_output]
+        if missing_names:
+            raise RuntimeError(
+                "benchmark artifact is missing fixture declarations: "
+                + ", ".join(missing_names)
+            )
+    if action in (
+        PERCEUS_ACTION,
+        MEASURE_OWNERSHIP_PREPARATION_PERCEUS_ACTION,
+        MEASURE_PERCEUS_DIRECT_ACTION,
+    ):
         if not has_expected_managed_local_drop(output):
             raise RuntimeError(
                 "Perceus Core is missing the expected managed-local ownership event"
             )
     return len(encoded_output), hashlib.sha256(encoded_output).hexdigest()
+
+
+def response_artifact(response_path: Path) -> JsonObject:
+    response = json.loads(response_path.read_text(encoding="utf-8"))
+    artifact = response.get("artifact")
+    if not isinstance(artifact, dict):
+        raise RuntimeError("backend benchmark worker response is missing an artifact")
+    return artifact
 
 
 def file_sha256(path: Path) -> str:
@@ -651,6 +1053,9 @@ def print_metrics(metrics: JsonObject, as_json: bool) -> None:
     ordered_names = (
         "fixture_version",
         "action",
+        "measurement_window",
+        "body_shape",
+        "user_call_edges",
         "globals",
         "functions",
         "body_leaves",
@@ -678,6 +1083,9 @@ def print_metrics(metrics: JsonObject, as_json: bool) -> None:
         "generated_c_sha256",
         "elapsed_seconds",
         "elapsed_mad_seconds",
+        "window_elapsed_microseconds",
+        "window_allocations",
+        "window_releases",
         "peak_rss_bytes",
         "physical_footprint_bytes",
         "malloc_small_bytes",
@@ -696,7 +1104,7 @@ def run_measurement(
     sample_index: str | int,
     sample_vmmap: bool,
     timeout_seconds: float,
-) -> tuple[JsonObject, Path]:
+) -> tuple[JsonObject, Path, Path]:
     response_path = temp_dir / f"response-{sample_index}.json"
     stderr_path = temp_dir / f"bridge-{sample_index}.stderr"
     metrics_path = temp_dir / f"metrics-{sample_index}.json"
@@ -740,7 +1148,7 @@ def run_measurement(
         )
     del metrics["exit_code"]
     del metrics["timed_out"]
-    return metrics, response_path
+    return metrics, response_path, stderr_path
 
 
 def paired_sample_order(sample_index: int) -> tuple[str, str]:
@@ -779,6 +1187,51 @@ def summarize_paired_elapsed(
     }
 
 
+def summarize_paired_window_metric(
+    metric_name: str,
+    baseline_samples: list[JsonObject],
+    candidate_samples: list[JsonObject],
+) -> JsonObject:
+    baseline_values = [
+        int(sample[metric_name])
+        for sample in baseline_samples
+        if metric_name in sample
+    ]
+    candidate_values = [
+        int(sample[metric_name])
+        for sample in candidate_samples
+        if metric_name in sample
+    ]
+    if (
+        len(baseline_values) != len(baseline_samples)
+        or len(candidate_values) != len(candidate_samples)
+        or len(baseline_values) != len(candidate_values)
+        or not baseline_values
+    ):
+        return {}
+
+    baseline_median, _ = median_and_mad([float(value) for value in baseline_values])
+    candidate_median, _ = median_and_mad([float(value) for value in candidate_values])
+    ratios = [
+        candidate / baseline
+        for baseline, candidate in zip(baseline_values, candidate_values, strict=True)
+        if baseline > 0
+    ]
+    result: JsonObject = {
+        f"baseline_{metric_name}": int(baseline_median),
+        f"baseline_{metric_name}_samples": baseline_values,
+        f"candidate_baseline_{metric_name}_ratio": (
+            candidate_median / baseline_median if baseline_median > 0 else None
+        ),
+    }
+    if len(ratios) == len(baseline_values):
+        ratio_median, ratio_mad = median_and_mad(ratios)
+        result[f"paired_{metric_name}_ratio_median"] = ratio_median
+        result[f"paired_{metric_name}_ratio_mad"] = ratio_mad
+        result[f"paired_{metric_name}_ratios"] = ratios
+    return result
+
+
 def run_benchmark(args: argparse.Namespace) -> int:
     root = project_root()
     with tempfile.TemporaryDirectory(prefix="blorp-perceus-memory-") as temp_name:
@@ -787,9 +1240,24 @@ def run_benchmark(args: argparse.Namespace) -> int:
         bridge_dir.mkdir()
         bridge = prepare_backend_worker(root, bridge_dir, args.bridge)
         candidate_worker_sha256 = file_sha256(bridge)
+        counters_enabled = bool(getattr(args, "work_counters", False)) and not args.end_to_end
+        counter_bridge: Path | None = None
+        counter_worker_sha256: str | None = None
+        if counters_enabled:
+            counter_dir = temp_dir / "counter-bridge"
+            counter_dir.mkdir()
+            counter_bridge = prepare_backend_worker(
+                root,
+                counter_dir,
+                getattr(args, "counter_bridge", None),
+                debug_profile=True,
+            )
+            counter_worker_sha256 = file_sha256(counter_bridge)
         control_parameter_type = getattr(args, "control_parameter_type", None)
         baseline_bridge: Path | None = None
         baseline_worker_sha256: str | None = None
+        baseline_counter_bridge: Path | None = None
+        baseline_counter_worker_sha256: str | None = None
         if control_parameter_type is not None:
             baseline_bridge = bridge
             baseline_worker_sha256 = candidate_worker_sha256
@@ -803,7 +1271,15 @@ def run_benchmark(args: argparse.Namespace) -> int:
             )
             baseline_worker_sha256 = file_sha256(baseline_bridge)
 
-        action = END_TO_END_ACTION if args.end_to_end else PERCEUS_ACTION
+        selected_window = getattr(args, "measurement_window", DEFAULT_MEASUREMENT_WINDOW)
+        action = (
+            END_TO_END_ACTION
+            if args.end_to_end
+            else measurement_action(selected_window)
+        )
+        body_shape = getattr(args, "body_shape", "linear")
+        user_call_edges = getattr(args, "user_call_edges", 1)
+        branch_arms = getattr(args, "branch_arms", 2)
         request, core_program = fixture_request(
             args.globals,
             args.functions,
@@ -813,6 +1289,9 @@ def run_benchmark(args: argparse.Namespace) -> int:
             args.params_per_function,
             args.parameter_type,
             args.invoke_workers,
+            body_shape,
+            branch_arms,
+            user_call_edges,
         )
         request_path = temp_dir / "request.json"
         request_path.write_text(
@@ -832,6 +1311,9 @@ def run_benchmark(args: argparse.Namespace) -> int:
                 args.params_per_function,
                 control_parameter_type,
                 args.invoke_workers,
+                body_shape,
+                branch_arms,
+                user_call_edges,
             )
             baseline_request_path = temp_dir / "control-request.json"
             baseline_request_path.write_text(
@@ -841,8 +1323,25 @@ def run_benchmark(args: argparse.Namespace) -> int:
             baseline_parameter_type = control_parameter_type
             artifacts_must_match = False
 
+        if counters_enabled and baseline_bridge is not None:
+            if control_parameter_type is not None:
+                baseline_counter_bridge = counter_bridge
+                baseline_counter_worker_sha256 = counter_worker_sha256
+            else:
+                baseline_counter_dir = temp_dir / "baseline-counter-bridge"
+                baseline_counter_dir.mkdir()
+                baseline_counter_bridge = prepare_backend_worker(
+                    root,
+                    baseline_counter_dir,
+                    getattr(args, "baseline_counter_bridge", None),
+                    debug_profile=True,
+                )
+                baseline_counter_worker_sha256 = file_sha256(
+                    baseline_counter_bridge
+                )
+
         if args.warmup:
-            _, warmup_response = run_measurement(
+            _, warmup_response, _ = run_measurement(
                 root, bridge, request_path, temp_dir, "candidate-warmup", False, args.timeout
             )
             validate_response(
@@ -852,9 +1351,11 @@ def run_benchmark(args: argparse.Namespace) -> int:
                 action,
                 args.params_per_function,
                 args.parameter_type,
+                body_shape,
+                user_call_edges,
             )
             if baseline_bridge is not None:
-                _, baseline_warmup_response = run_measurement(
+                _, baseline_warmup_response, _ = run_measurement(
                     root,
                     baseline_bridge,
                     baseline_request_path,
@@ -870,6 +1371,8 @@ def run_benchmark(args: argparse.Namespace) -> int:
                     action,
                     args.params_per_function,
                     baseline_parameter_type,
+                    body_shape,
+                    user_call_edges,
                 )
 
         samples_by_worker: dict[str, list[JsonObject]] = {
@@ -879,6 +1382,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
         artifact_bytes = 0
         artifact_sha256 = ""
         response_bytes = 0
+        candidate_response_path: Path | None = None
         artifact_by_worker: dict[str, tuple[int, str]] = {}
         for sample_index in range(args.samples):
             workers: dict[str, tuple[Path, Path, str]] = {
@@ -894,7 +1398,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
                 order = paired_sample_order(sample_index)
             for worker_name in order:
                 worker_bridge, worker_request, worker_parameter_type = workers[worker_name]
-                sample, response_path = run_measurement(
+                sample, response_path, _ = run_measurement(
                     root,
                     worker_bridge,
                     worker_request,
@@ -910,7 +1414,18 @@ def run_benchmark(args: argparse.Namespace) -> int:
                     action,
                     args.params_per_function,
                     worker_parameter_type,
+                    body_shape,
+                    user_call_edges,
                 )
+                artifact = response_artifact(response_path)
+                for metric_name in (
+                    "window_elapsed_microseconds",
+                    "window_allocations",
+                    "window_releases",
+                ):
+                    value = artifact.get(metric_name)
+                    if isinstance(value, (int, float)):
+                        sample[metric_name] = int(value)
                 previous_artifact = artifact_by_worker.get(worker_name)
                 if previous_artifact is not None and current_sha256 != previous_artifact[1]:
                     raise RuntimeError(
@@ -927,6 +1442,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
                     artifact_bytes = current_bytes
                     artifact_sha256 = current_sha256
                     response_bytes = response_path.stat().st_size
+                    candidate_response_path = response_path
                 samples_by_worker[worker_name].append(sample)
 
         candidate_samples = samples_by_worker["candidate"]
@@ -946,6 +1462,118 @@ def run_benchmark(args: argparse.Namespace) -> int:
             "samples": args.samples,
             "warmup": args.warmup,
         }
+        for metric_name in (
+            "window_elapsed_microseconds",
+            "window_allocations",
+            "window_releases",
+        ):
+            values = [
+                int(sample[metric_name])
+                for sample in candidate_samples
+                if metric_name in sample
+            ]
+            if values:
+                metrics[metric_name] = int(statistics.median(values))
+                metrics[f"{metric_name}_samples"] = values
+
+        if candidate_response_path is None:
+            raise RuntimeError("Perceus benchmark produced no candidate response")
+        candidate_core = response_artifact(candidate_response_path).get("core")
+        if isinstance(candidate_core, dict):
+            metrics["ownership_census"] = core_ownership_census(candidate_core)
+
+        if counter_bridge is not None:
+            counter_observations: list[dict[str, int]] = []
+            counter_artifact_hash = ""
+            for repeat in range(2):
+                _, counter_response, counter_stderr = run_measurement(
+                    root,
+                    counter_bridge,
+                    request_path,
+                    temp_dir,
+                    f"counter-{repeat}",
+                    False,
+                    args.timeout,
+                )
+                _, current_counter_artifact_hash = validate_response(
+                    counter_response,
+                    args.globals,
+                    args.functions,
+                    action,
+                    args.params_per_function,
+                    args.parameter_type,
+                    body_shape,
+                    user_call_edges,
+                )
+                if current_counter_artifact_hash != artifact_sha256:
+                    raise RuntimeError(
+                        "counter-enabled Perceus output differs from timing output"
+                    )
+                counter_artifact_hash = current_counter_artifact_hash
+                counter_observations.append(
+                    parse_perceus_work_counters(
+                        counter_stderr.read_text(encoding="utf-8", errors="replace")
+                    )
+                )
+            if counter_observations[0] != counter_observations[1]:
+                raise RuntimeError("Perceus work counters differ between repeated runs")
+            metrics["work_counters"] = counter_observations[0]
+            metrics["counter_artifact_sha256"] = counter_artifact_hash
+            metrics["counter_worker_sha256"] = counter_worker_sha256
+            if baseline_counter_bridge is not None:
+                baseline_counter_observations: list[dict[str, int]] = []
+                for repeat in range(2):
+                    _, baseline_counter_response, baseline_counter_stderr = run_measurement(
+                        root,
+                        baseline_counter_bridge,
+                        baseline_request_path,
+                        temp_dir,
+                        f"baseline-counter-{repeat}",
+                        False,
+                        args.timeout,
+                    )
+                    _, baseline_counter_artifact_hash = validate_response(
+                        baseline_counter_response,
+                        args.globals,
+                        args.functions,
+                        action,
+                        args.params_per_function,
+                        baseline_parameter_type,
+                        body_shape,
+                        user_call_edges,
+                    )
+                    if (
+                        baseline_counter_artifact_hash
+                        != artifact_by_worker["baseline"][1]
+                    ):
+                        raise RuntimeError(
+                            "baseline counter-enabled Perceus output differs "
+                            "from timing output"
+                        )
+                    baseline_counter_observations.append(
+                        parse_perceus_work_counters(
+                            baseline_counter_stderr.read_text(
+                                encoding="utf-8",
+                                errors="replace",
+                            )
+                        )
+                    )
+                if baseline_counter_observations[0] != baseline_counter_observations[1]:
+                    raise RuntimeError(
+                        "baseline Perceus work counters differ between repeated runs"
+                    )
+                baseline_work_counters = baseline_counter_observations[0]
+                metrics["baseline_work_counters"] = baseline_work_counters
+                metrics["baseline_counter_artifact_sha256"] = (
+                    baseline_counter_artifact_hash
+                )
+                metrics["baseline_counter_worker_sha256"] = (
+                    baseline_counter_worker_sha256
+                )
+                metrics["work_counter_deltas"] = {
+                    name: counter_observations[0][name] - baseline_work_counters[name]
+                    for name in PERCEUS_WORK_COUNTER_NAMES
+                }
         for metric_name in (
             "physical_footprint_bytes",
             "malloc_small_bytes",
@@ -970,6 +1598,18 @@ def run_benchmark(args: argparse.Namespace) -> int:
                 )
             )
             baseline_samples = samples_by_worker["baseline"]
+            for metric_name in (
+                "window_elapsed_microseconds",
+                "window_allocations",
+                "window_releases",
+            ):
+                metrics.update(
+                    summarize_paired_window_metric(
+                        metric_name,
+                        baseline_samples,
+                        candidate_samples,
+                    )
+                )
             for metric_name in (
                 "peak_rss_bytes",
                 "physical_footprint_bytes",
@@ -1008,6 +1648,11 @@ def run_benchmark(args: argparse.Namespace) -> int:
             {
                 "fixture_version": FIXTURE_VERSION,
                 "action": action,
+                "measurement_window": measurement_window_label(action),
+                "body_shape": body_shape,
+                "user_call_edges": user_call_edges,
+                "branch_arms": branch_arms,
+                "primary_axis": getattr(args, "primary_axis", "single_fixture"),
                 "globals": args.globals,
                 "functions": args.functions,
                 "body_leaves": args.body_leaves,
@@ -1016,13 +1661,9 @@ def run_benchmark(args: argparse.Namespace) -> int:
                 "parameter_type": args.parameter_type,
                 "invoke_workers": args.invoke_workers,
                 "declarations": len(core_program["decls"]),
-                "input_expression_nodes": input_expression_count(
-                    args.globals,
-                    args.functions,
-                    args.body_leaves,
-                    args.params_per_function,
-                    args.invoke_workers,
-                ),
+                "input_expression_nodes": core_ownership_census(core_program)[
+                    "expression_nodes"
+                ],
                 "request_bytes": request_path.stat().st_size,
                 "request_sha256": file_sha256(request_path),
                 "worker_sha256": candidate_worker_sha256,
@@ -1040,13 +1681,79 @@ def run_benchmark(args: argparse.Namespace) -> int:
                 "verified": True,
             }
         )
+
+        inspection_request, _ = fixture_request(
+            args.globals,
+            args.functions,
+            args.body_leaves,
+            args.global_reads_per_function,
+            INSPECT_OWNERSHIP_STAGES_ACTION,
+            args.params_per_function,
+            args.parameter_type,
+            args.invoke_workers,
+            body_shape,
+            branch_arms,
+            user_call_edges,
+        )
+        inspection_request_path = temp_dir / "inspect-ownership-stages-request.json"
+        inspection_request_path.write_text(
+            json.dumps(inspection_request, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        _, inspection_response_path, _ = run_measurement(
+            root,
+            bridge,
+            inspection_request_path,
+            temp_dir,
+            "inspect-ownership-stages",
+            False,
+            args.timeout,
+        )
+        inspection_artifact = response_artifact(inspection_response_path)
+        stage_censuses: JsonObject = {}
+        stage_hashes: JsonObject = {}
+        for stage_name in (
+            "ownership_ready",
+            "post_perceus",
+            "post_reuse",
+            "prepared",
+        ):
+            stage_core = inspection_artifact.get(stage_name)
+            if not isinstance(stage_core, dict):
+                raise RuntimeError(
+                    f"ownership stage inspection is missing `{stage_name}` Core"
+                )
+            stage_censuses[stage_name] = core_ownership_census(stage_core)
+            encoded_stage = json.dumps(stage_core, separators=(",", ":")).encode("utf-8")
+            stage_hashes[stage_name] = hashlib.sha256(encoded_stage).hexdigest()
+        metrics["stage_ownership_censuses"] = stage_censuses
+        metrics["stage_core_sha256"] = stage_hashes
         if file_sha256(bridge) != candidate_worker_sha256:
             raise RuntimeError("candidate benchmark worker changed during measurement")
         if baseline_bridge is not None and file_sha256(baseline_bridge) != baseline_worker_sha256:
             raise RuntimeError("baseline benchmark worker changed during measurement")
+        if (
+            counter_bridge is not None
+            and file_sha256(counter_bridge) != counter_worker_sha256
+        ):
+            raise RuntimeError("counter benchmark worker changed during measurement")
+        if (
+            baseline_counter_bridge is not None
+            and file_sha256(baseline_counter_bridge)
+            != baseline_counter_worker_sha256
+        ):
+            raise RuntimeError(
+                "baseline counter benchmark worker changed during measurement"
+            )
         if action == END_TO_END_ACTION:
             metrics["generated_c_bytes"] = artifact_bytes
             metrics["generated_c_sha256"] = artifact_sha256
+            generated_c = response_artifact(candidate_response_path).get("c_code")
+            if not isinstance(generated_c, str):
+                raise RuntimeError("backend emission response is missing generated C")
+            metrics["generated_c_ownership_census"] = generated_c_ownership_census(
+                generated_c
+            )
         print_metrics(metrics, args.json)
     return 0
 
@@ -1054,12 +1761,21 @@ def run_benchmark(args: argparse.Namespace) -> int:
 def run_global_matrix(args: argparse.Namespace) -> int:
     root = project_root()
     with tempfile.TemporaryDirectory(prefix="blorp-perceus-matrix-worker-") as temp_name:
-        worker_dir = Path(temp_name)
+        worker_dir = Path(temp_name) / "timing"
         bridge = prepare_backend_worker(root, worker_dir, args.bridge)
+        counter_bridge = None
+        if getattr(args, "work_counters", False):
+            counter_bridge = prepare_backend_worker(
+                root,
+                Path(temp_name) / "counters",
+                args.counter_bridge,
+                debug_profile=True,
+            )
 
         for global_count, global_reads in ((32, 0), (32, 32), (384, 0), (384, 32)):
             point = argparse.Namespace(**vars(args))
             point.bridge = str(bridge)
+            point.counter_bridge = str(counter_bridge) if counter_bridge is not None else None
             point.globals = global_count
             point.global_reads_per_function = global_reads
             point.params_per_function = 0
@@ -1075,12 +1791,21 @@ def run_global_matrix(args: argparse.Namespace) -> int:
 def run_parameter_matrix(args: argparse.Namespace) -> int:
     root = project_root()
     with tempfile.TemporaryDirectory(prefix="blorp-perceus-param-matrix-worker-") as temp_name:
-        worker_dir = Path(temp_name)
+        worker_dir = Path(temp_name) / "timing"
         bridge = prepare_backend_worker(root, worker_dir, args.bridge)
+        counter_bridge = None
+        if getattr(args, "work_counters", False):
+            counter_bridge = prepare_backend_worker(
+                root,
+                Path(temp_name) / "counters",
+                args.counter_bridge,
+                debug_profile=True,
+            )
 
         for param_count in (1, 8, 32):
             point = argparse.Namespace(**vars(args))
             point.bridge = str(bridge)
+            point.counter_bridge = str(counter_bridge) if counter_bridge is not None else None
             point.globals = 1
             point.functions = PARAMETER_MATRIX_FUNCTIONS
             point.body_leaves = PARAMETER_MATRIX_BODY_LEAVES
@@ -1100,14 +1825,66 @@ def run_parameter_matrix(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_contract_matrix(args: argparse.Namespace) -> int:
+    root = project_root()
+    with tempfile.TemporaryDirectory(prefix="blorp-perceus-contract-matrix-") as temp_name:
+        worker_dir = Path(temp_name) / "timing"
+        bridge = prepare_backend_worker(root, worker_dir, args.bridge)
+        counter_bridge = None
+        if getattr(args, "work_counters", False):
+            counter_bridge = prepare_backend_worker(
+                root,
+                Path(temp_name) / "counters",
+                args.counter_bridge,
+                debug_profile=True,
+            )
+
+        points = []
+        for owner_count in (1, 8, 32, 128):
+            points.append(("borrowed_owners", owner_count, CONTRACT_MATRIX_OWNER_BODY_LEAVES, 1))
+        for body_nodes in (32, 128, 512):
+            points.append(("body_nodes", 1, body_nodes, 1))
+        for call_edges in (1, 8, 32):
+            points.append(("user_call_edges", 8, 512, call_edges))
+
+        for axis, owner_count, body_nodes, call_edges in points:
+            point = argparse.Namespace(**vars(args))
+            point.bridge = str(bridge)
+            point.counter_bridge = str(counter_bridge) if counter_bridge is not None else None
+            point.globals = 1
+            point.functions = (
+                CONTRACT_EDGE_MATRIX_FUNCTIONS
+                if axis == "user_call_edges"
+                else CONTRACT_MATRIX_FUNCTIONS
+            )
+            point.body_leaves = body_nodes
+            point.global_reads_per_function = 0
+            point.params_per_function = owner_count
+            point.parameter_type = MANAGED_PARAMETER_TYPE
+            point.body_shape = (
+                "mutually_recursive_calls"
+                if axis == "user_call_edges"
+                else "nested_user_call"
+            )
+            point.user_call_edges = call_edges
+            point.invoke_workers = False
+            point.primary_axis = axis
+            point.global_matrix = False
+            point.parameter_matrix = False
+            point.contract_matrix = False
+            run_benchmark(point)
+
+    return 0
+
+
 def main(argv: list[str]) -> int:
     if argv and argv[0] == WORKER_FLAG:
         return measurement_worker(argv[1:])
 
     parser = argparse.ArgumentParser(
         description=(
-            "Measure the isolated production Perceus stage with many managed globals "
-            "and moderately sized function bodies containing resolved global reads."
+            "Measure an explicitly named ownership-preparation/Perceus window with "
+            "deterministic synthetic Core fixtures."
         )
     )
     parser.add_argument("--globals", type=positive_int, default=DEFAULT_GLOBALS)
@@ -1130,6 +1907,30 @@ def main(argv: list[str]) -> int:
         help="parameter type for a single fixture; the parameter matrix runs both",
     )
     parser.add_argument(
+        "--body-shape",
+        choices=BODY_SHAPES,
+        default="linear",
+        help="independently selectable function-body workload",
+    )
+    parser.add_argument(
+        "--user-call-edges",
+        type=positive_int,
+        default=1,
+        help="user-call edges per function for call-graph body shapes",
+    )
+    parser.add_argument(
+        "--branch-arms",
+        type=positive_int,
+        default=2,
+        help="reserved branch-width axis for later branch/match fixtures",
+    )
+    parser.add_argument(
+        "--measurement-window",
+        choices=("ownership-preparation-plus-perceus", "perceus-direct"),
+        default=DEFAULT_MEASUREMENT_WINDOW,
+        help="inner compiler window measured by the benchmark worker",
+    )
+    parser.add_argument(
         "--bridge",
         help=f"backend benchmark worker; defaults to ${BACKEND_WORKER_ENV} or builds one",
     )
@@ -1138,9 +1939,30 @@ def main(argv: list[str]) -> int:
         help="explicit baseline worker for paired, alternating comparison",
     )
     parser.add_argument(
+        "--counter-bridge",
+        help=(
+            "debug/profile worker used only for exact logical work counters; "
+            f"defaults to ${BACKEND_COUNTER_WORKER_ENV} or builds one"
+        ),
+    )
+    parser.add_argument(
+        "--baseline-counter-bridge",
+        help="debug/profile baseline worker for paired logical-counter comparison",
+    )
+    parser.add_argument(
+        "--no-work-counters",
+        action="store_false",
+        dest="work_counters",
+        help="skip the separate debug/profile counter worker",
+    )
+    parser.set_defaults(work_counters=True)
+    parser.add_argument(
         "--end-to-end",
         action="store_true",
-        help="continue through C emission instead of stopping after Perceus",
+        help=(
+            "run ownership preparation, Perceus, and the post-Perceus tail, "
+            "then measure backend C emission"
+        ),
     )
     parser.add_argument(
         "--samples",
@@ -1168,6 +1990,11 @@ def main(argv: list[str]) -> int:
         ),
     )
     parser.add_argument(
+        "--contract-matrix",
+        action="store_true",
+        help="vary borrowed owners, body nodes, and user-call edges one axis at a time",
+    )
+    parser.add_argument(
         "--no-warmup",
         action="store_false",
         dest="warmup",
@@ -1191,7 +2018,7 @@ def main(argv: list[str]) -> int:
     if args.global_matrix:
         if 32 >= args.body_leaves:
             parser.error("--global-matrix requires --body-leaves greater than 32")
-    elif not args.parameter_matrix:
+    elif not (args.parameter_matrix or args.contract_matrix):
         if args.global_reads_per_function >= args.body_leaves:
             parser.error("--global-reads-per-function must be less than --body-leaves")
         if args.global_reads_per_function + args.params_per_function >= args.body_leaves:
@@ -1202,12 +2029,30 @@ def main(argv: list[str]) -> int:
             parser.error("--global-reads-per-function cannot exceed --globals")
     if args.timeout <= 0:
         parser.error("--timeout must be greater than zero")
+    if args.body_shape != "linear" and args.user_call_edges >= args.functions:
+        parser.error("--user-call-edges must be less than --functions")
     if args.baseline_bridge is not None and args.samples < 7:
         parser.error("paired comparison requires at least 7 samples")
-    if args.global_matrix and args.parameter_matrix:
-        parser.error("--global-matrix and --parameter-matrix are mutually exclusive")
+    if (
+        args.baseline_bridge is not None
+        and args.work_counters
+        and not args.end_to_end
+        and args.baseline_counter_bridge is None
+    ):
+        parser.error(
+            "paired work counters require --baseline-counter-bridge "
+            "(or use --no-work-counters)"
+        )
+    selected_matrices = sum(
+        int(enabled)
+        for enabled in (args.global_matrix, args.parameter_matrix, args.contract_matrix)
+    )
+    if selected_matrices > 1:
+        parser.error("matrix modes are mutually exclusive")
     if args.parameter_matrix and args.end_to_end:
         parser.error("--parameter-matrix cannot be combined with --end-to-end")
+    if args.contract_matrix and args.end_to_end:
+        parser.error("--contract-matrix cannot be combined with --end-to-end")
 
     if args.vmmap and (platform.system() != "Darwin" or shutil.which("vmmap") is None):
         parser.error("--vmmap requires macOS vmmap")
@@ -1217,6 +2062,8 @@ def main(argv: list[str]) -> int:
             return run_global_matrix(args)
         if args.parameter_matrix:
             return run_parameter_matrix(args)
+        if args.contract_matrix:
+            return run_contract_matrix(args)
         return run_benchmark(args)
     except (OSError, RuntimeError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)

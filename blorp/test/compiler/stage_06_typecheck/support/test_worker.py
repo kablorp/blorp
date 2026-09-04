@@ -124,6 +124,27 @@ class CompilerTypecheckWorkerTests(unittest.TestCase):
             main_symbol=self.backend.WORKER_MAIN_SYMBOL,
         )
 
+    def test_backend_adapter_requests_debug_profile_worker_explicitly(self) -> None:
+        expected = Path("/tmp/backend-counter-worker")
+        with mock.patch.object(
+            self.backend,
+            "prepare_benchmark_worker",
+            return_value=expected,
+        ) as prepare:
+            actual = self.backend.prepare_backend_worker(
+                ROOT,
+                Path("/tmp/output"),
+                None,
+                debug_profile=True,
+            )
+
+        self.assertEqual(actual, expected)
+        self.assertTrue(prepare.call_args.kwargs["debug_profile"])
+        self.assertEqual(
+            prepare.call_args.kwargs["env_name"],
+            self.backend.BACKEND_COUNTER_WORKER_ENV,
+        )
+
     def test_builder_links_and_runs_worker_with_system_c_compiler(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
             root = Path(temp_name)

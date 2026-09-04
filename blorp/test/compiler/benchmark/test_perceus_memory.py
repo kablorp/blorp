@@ -70,6 +70,201 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
 
         self.assertEqual(request["action"], self.benchmark.PERCEUS_ACTION)
 
+    def test_measurement_windows_have_explicit_actions_and_labels(self) -> None:
+        self.assertEqual(
+            self.benchmark.measurement_action("ownership-preparation-plus-perceus"),
+            self.benchmark.MEASURE_OWNERSHIP_PREPARATION_PERCEUS_ACTION,
+        )
+        self.assertEqual(
+            self.benchmark.measurement_action("perceus-direct"),
+            self.benchmark.MEASURE_PERCEUS_DIRECT_ACTION,
+        )
+        self.assertEqual(
+            self.benchmark.measurement_window_label(
+                self.benchmark.MEASURE_OWNERSHIP_PREPARATION_PERCEUS_ACTION,
+            ),
+            "ownership-preparation plus Perceus",
+        )
+        self.assertEqual(
+            self.benchmark.measurement_window_label(
+                self.benchmark.MEASURE_PERCEUS_DIRECT_ACTION,
+            ),
+            "direct Perceus",
+        )
+        self.assertEqual(
+            self.benchmark.measurement_window_label(self.benchmark.END_TO_END_ACTION),
+            "backend emission",
+        )
+
+    def test_generated_c_ownership_census_separates_operation_kinds(self) -> None:
+        census = self.benchmark.generated_c_ownership_census(
+            "blorp_retain(x); blorp_release(x); blorp_release_arc_only(y); "
+            "blorp_task_cleanup_push(a); blorp_task_cleanup_pop_slot(b); "
+            "blorp_task_cleanup_duplicate_slot(c); "
+            "blorp_stack_result_retain(d); blorp_stack_result_retain_value(e); "
+            "blorp_stack_result_release(f); "
+            'const char *s = "blorp_retain(fake)"; '
+            "// blorp_release(fake)\n/* blorp_task_cleanup_push(fake) */"
+        )
+
+        self.assertEqual(census, {
+            "retain_calls": 1,
+            "release_calls": 1,
+            "release_arc_only_calls": 1,
+            "cleanup_push_calls": 1,
+            "cleanup_pop_calls": 1,
+            "cleanup_duplicate_calls": 1,
+            "stack_result_retain_calls": 1,
+            "stack_result_retain_value_calls": 1,
+            "stack_result_release_calls": 1,
+        })
+
+    def test_profile_counter_parser_requires_complete_exact_schema(self) -> None:
+        rows = []
+        expected = {}
+        for index, name in enumerate(self.benchmark.PERCEUS_WORK_COUNTER_NAMES, start=1):
+            expected[name] = index - 1
+            rows.append(
+                f"compiler_perceus_work_{name} 0.001 0.1% {index} 0.100"
+            )
+
+        actual = self.benchmark.parse_perceus_work_counters("\n".join(rows))
+
+        self.assertEqual(actual, expected)
+        with self.assertRaisesRegex(RuntimeError, "missing Perceus work counters"):
+            self.benchmark.parse_perceus_work_counters("\n".join(rows[:-1]))
+
+    def test_contract_inference_uses_collected_equations_without_body_rescans(self) -> None:
+        perceus_source = (
+            ROOT / "blorp" / "src" / "compiler" / "stage_09_core" / "perceus.brp"
+        ).read_text(encoding="utf-8")
+
+        for required in (
+            "record ParameterFlow",
+            "record FunctionContractEquation",
+            "record OwnershipContractGraph",
+            "collect_function_contract_equation",
+            "solve_user_call_contracts",
+        ):
+            self.assertIn(required, perceus_source)
+
+        for obsolete in (
+            "private pure func infer_user_contract(",
+            "private pure func analyze_user_contract_wave(",
+        ):
+            self.assertNotIn(obsolete, perceus_source)
+
+    def test_core_ownership_census_counts_policies(self) -> None:
+        response = self.perceus_response()
+        body = response["artifact"]["core"]["decls"][4]["body"]
+        response["artifact"]["core"]["decls"][4]["body"] = {
+            "kind": "dup",
+            "var": self.benchmark.core_var("BENCH_MANAGED_LOCAL_0000", None),
+            "value_type": self.benchmark.named_type("String"),
+            "retain_policy": "arc",
+            "body": body,
+            "type": self.benchmark.named_type("Int"),
+            "loc": self.benchmark.synthetic_loc(),
+        }
+
+        census = self.benchmark.core_ownership_census(response["artifact"]["core"])
+
+        self.assertEqual(census["dup_by_policy"], {"arc": 1})
+        self.assertEqual(census["drop_by_policy"], {"arc": 1})
+
+    def test_core_expression_census_vocabulary_matches_serialized_ir(self) -> None:
+        ir_source = (
+            ROOT / "blorp" / "src" / "compiler" / "stage_09_core" / "ir.brp"
+        ).read_text(encoding="utf-8")
+        serialized_tags = set(
+            self.benchmark.re.findall(
+                r'^private [A-Z0-9_]+_EXPR_TAG: String = "([^"]+)"',
+                ir_source,
+                self.benchmark.re.MULTILINE,
+            )
+        )
+
+        self.assertEqual(self.benchmark.CORE_EXPR_KINDS, serialized_tags)
+
+    def test_supported_body_shapes_are_structurally_distinct(self) -> None:
+        fingerprints = set()
+        for body_shape in self.benchmark.BODY_SHAPES:
+            _, program = self.benchmark.fixture_request(
+                4,
+                3,
+                64,
+                2,
+                params_per_function=2,
+                body_shape=body_shape,
+                branch_arms=2,
+                user_call_edges=2,
+            )
+            fingerprints.add(
+                json.dumps(program["decls"][4]["body"], sort_keys=True),
+            )
+
+        self.assertEqual(len(fingerprints), len(self.benchmark.BODY_SHAPES))
+
+    def test_call_graph_shapes_pass_borrowed_parameters_across_edges(self) -> None:
+        _, program = self.benchmark.fixture_request(
+            1,
+            3,
+            14,
+            0,
+            params_per_function=2,
+            body_shape="nested_user_call",
+            user_call_edges=1,
+        )
+        worker_body = program["decls"][1]["body"]
+        rendered = json.dumps(worker_body, sort_keys=True)
+
+        self.assertIn("BENCH_BORROWED_PARAM_0000_0000", rendered)
+        self.assertIn("BENCH_BORROWED_PARAM_0000_0001", rendered)
+        self.assertIn("bench_worker_0001", rendered)
+
+    def test_mutual_call_edge_count_uses_distinct_callees(self) -> None:
+        _, program = self.benchmark.fixture_request(
+            1,
+            4,
+            64,
+            0,
+            params_per_function=1,
+            body_shape="mutually_recursive_calls",
+            user_call_edges=3,
+        )
+        rendered = json.dumps(program["decls"][1]["body"], sort_keys=True)
+
+        self.assertIn("bench_worker_0001", rendered)
+        self.assertIn("bench_worker_0002", rendered)
+        self.assertIn("bench_worker_0003", rendered)
+        self.assertEqual(rendered.count('"kind": "user"'), 3)
+
+    def test_contract_fixture_holds_body_nodes_constant_when_varying_owners(self) -> None:
+        body_counts = []
+        for owner_count in (1, 8, 32, 128):
+            _, program = self.benchmark.fixture_request(
+                1,
+                self.benchmark.CONTRACT_MATRIX_FUNCTIONS,
+                self.benchmark.CONTRACT_MATRIX_OWNER_BODY_LEAVES,
+                0,
+                params_per_function=owner_count,
+                body_shape="nested_user_call",
+                user_call_edges=1,
+                invoke_workers=False,
+            )
+            body_counts.append([
+                self.benchmark.expression_node_count(decl["body"])
+                for decl in program["decls"]
+                if decl["kind"] == "function" and decl["name"] != "main"
+            ])
+
+        self.assertTrue(all(counts == body_counts[0] for counts in body_counts))
+        self.assertEqual(
+            body_counts[0],
+            [self.benchmark.CONTRACT_MATRIX_OWNER_BODY_LEAVES]
+            * self.benchmark.CONTRACT_MATRIX_FUNCTIONS,
+        )
+
     def test_validator_accepts_perceus_core_artifact(self) -> None:
         response = self.perceus_response()
 
@@ -346,6 +541,83 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, 2)
 
+    def test_paired_end_to_end_mode_does_not_require_counter_worker(self) -> None:
+        with mock.patch.object(
+            self.benchmark,
+            "run_benchmark",
+            return_value=0,
+        ) as run:
+            exit_code = self.benchmark.main([
+                "--end-to-end",
+                "--baseline-bridge",
+                "/tmp/baseline-worker",
+                "--samples",
+                "7",
+                "--globals",
+                "1",
+                "--global-reads-per-function",
+                "0",
+            ])
+
+        self.assertEqual(exit_code, 0)
+        run.assert_called_once()
+
+    def test_contract_matrix_varies_one_primary_axis_at_a_time(self) -> None:
+        args = argparse.Namespace(
+            bridge=None,
+            counter_bridge=None,
+            baseline_bridge=None,
+            globals=1,
+            functions=2,
+            body_leaves=64,
+            global_reads_per_function=0,
+            params_per_function=1,
+            parameter_type="String",
+            body_shape="linear",
+            user_call_edges=1,
+            end_to_end=False,
+            work_counters=False,
+        )
+
+        with mock.patch.object(
+            self.benchmark,
+            "prepare_backend_worker",
+            return_value=Path("/tmp/perceus-worker"),
+        ) as prepare, mock.patch.object(
+            self.benchmark,
+            "run_benchmark",
+            return_value=0,
+        ) as run:
+            self.benchmark.run_contract_matrix(args)
+
+        prepare.assert_called_once()
+        points = [
+            (
+                call.args[0].primary_axis,
+                call.args[0].params_per_function,
+                call.args[0].body_leaves,
+                call.args[0].user_call_edges,
+                call.args[0].functions,
+                call.args[0].body_shape,
+            )
+            for call in run.call_args_list
+        ]
+        self.assertEqual(
+            points,
+            [
+                ("borrowed_owners", 1, 644, 1, 8, "nested_user_call"),
+                ("borrowed_owners", 8, 644, 1, 8, "nested_user_call"),
+                ("borrowed_owners", 32, 644, 1, 8, "nested_user_call"),
+                ("borrowed_owners", 128, 644, 1, 8, "nested_user_call"),
+                ("body_nodes", 1, 32, 1, 8, "nested_user_call"),
+                ("body_nodes", 1, 128, 1, 8, "nested_user_call"),
+                ("body_nodes", 1, 512, 1, 8, "nested_user_call"),
+                ("user_call_edges", 8, 512, 1, 33, "mutually_recursive_calls"),
+                ("user_call_edges", 8, 512, 8, 33, "mutually_recursive_calls"),
+                ("user_call_edges", 8, 512, 32, 33, "mutually_recursive_calls"),
+            ],
+        )
+
     def test_paired_sample_order_alternates_baseline_and_candidate(self) -> None:
         self.assertEqual(
             self.benchmark.paired_sample_order(0),
@@ -366,6 +638,28 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
         self.assertEqual(summary["candidate_elapsed_seconds"], 3.0)
         self.assertEqual(summary["candidate_baseline_ratio"], 0.75)
         self.assertEqual(summary["paired_ratios"], [0.5, 0.75, 0.5])
+
+    def test_paired_window_summary_retains_per_pair_ratios(self) -> None:
+        summary = self.benchmark.summarize_paired_window_metric(
+            "window_allocations",
+            [
+                {"window_allocations": 100},
+                {"window_allocations": 200},
+                {"window_allocations": 400},
+            ],
+            [
+                {"window_allocations": 50},
+                {"window_allocations": 150},
+                {"window_allocations": 200},
+            ],
+        )
+
+        self.assertEqual(summary["baseline_window_allocations"], 200)
+        self.assertEqual(
+            summary["paired_window_allocations_ratios"],
+            [0.5, 0.75, 0.5],
+        )
+        self.assertEqual(summary["paired_window_allocations_ratio_median"], 0.5)
 
     def test_measurement_worker_times_out_renderer(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:

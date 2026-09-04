@@ -97,6 +97,7 @@ def prepare_benchmark_worker(
     worker_name: str,
     main_symbol: str,
     include_dirs: tuple[Path, ...] = (),
+    debug_profile: bool = False,
 ) -> Path:
     """Resolve an override or build one disposable benchmark worker."""
     selected = _explicit_worker(env_name, explicit)
@@ -116,8 +117,12 @@ def prepare_benchmark_worker(
     wrapper_path = out_dir / f"{worker_name}_main.c"
     worker_path = out_dir / worker_name
 
+    compiler_arguments = [str(compiler), "compile", "--no-format"]
+    if debug_profile:
+        compiler_arguments.extend(("--debug", "--profile"))
+    compiler_arguments.extend(("-o", str(c_path), str(source)))
     _run(
-        [str(compiler), "compile", "--no-format", "-o", str(c_path), str(source)],
+        compiler_arguments,
         root,
         f"compiling the {worker_name} source",
     )

@@ -1,15 +1,5 @@
 -- Benchmark-only JSON adapter for replaying backend emission in isolation.
 import:
-	../../../blorp/src/compiler/stage_09_core/ir:
-		CoreProgram,
-		core_json_error_to_string,
-		core_program_to_json,
-		decode_core_program_json,
-	../../../blorp/src/compiler/stage_09_core/pipeline: run_perceus_stage
-	../../../blorp/src/lib/build_artifact: CArtifact
-	../../../blorp/src/compiler/stage_10_backend/emit:
-		core_emit_error_message,
-		try_emit_core_program_c_artifact_with_profile,
 	../../../blorp/src/compiler/bridge_protocol:
 		BridgeProtocolError,
 		bridge_error_json,
@@ -17,7 +7,28 @@ import:
 		bridge_success_json,
 		decode_bridge_envelope_header,
 		decode_bridge_payload,
+	../../../blorp/src/compiler/stage_09_core/ir:
+		CoreProgram,
+		core_json_error_to_string,
+		core_program_to_json,
+		decode_core_program_json,
+	../../../blorp/src/compiler/stage_09_core/perceus as CorePerceus
+	../../../blorp/src/compiler/stage_09_core/pipeline:
+		PreparedCoreProgram,
+		prepare_perceus_input,
+		run_perceus_stage,
+		run_post_perceus_tail,
+		run_pre_dce_tail,
+		run_reuse_stage,
+	../../../blorp/src/compiler/stage_10_backend/emit:
+		core_emit_error_message,
+		try_emit_core_program_c_artifact_with_profile,
+		try_emit_prepared_core_program_c_artifact_with_profile,
+	../../../blorp/src/lib/build_artifact: CArtifact
+	instrumentation: begin_function_profile_window, end_function_profile_window
 	json: JsonValue(JsonBool, JsonNull, JsonNumber, JsonObject, JsonString, JsonVector), get_field
+	memory: get_mem_stats, reset_mem_stats
+	system: now_microseconds
 
 
 union BackendBridgeError:
@@ -35,6 +46,20 @@ private C_ARTIFACT_LINK_FLAGS_FIELD: String = "link_flags"
 private C_ARTIFACT_INCLUDE_DIRS_FIELD: String = "include_dirs"
 
 private CORE_ARTIFACT_FIELD: String = "core"
+
+private WINDOW_FIELD: String = "window"
+
+private WINDOW_ELAPSED_MICROSECONDS_FIELD: String = "window_elapsed_microseconds"
+
+private WINDOW_ALLOCATIONS_FIELD: String = "window_allocations"
+
+private WINDOW_RELEASES_FIELD: String = "window_releases"
+
+private OWNERSHIP_PREPARATION_PERCEUS_WINDOW: String = "ownership-preparation plus Perceus"
+
+private DIRECT_PERCEUS_WINDOW: String = "direct Perceus"
+
+private BACKEND_EMISSION_WINDOW: String = "backend emission"
 
 
 private pure func string_list_to_json(items: List[String]) -> JsonValue:
@@ -141,6 +166,18 @@ private pure func emit_core_c_artifact(
 	)
 
 
+private pure func emit_prepared_core_c_artifact(
+	program: PreparedCoreProgram,
+	profile: Bool,
+) -> Result[CArtifact, BackendBridgeError]:
+	try_emit_prepared_core_program_c_artifact_with_profile(
+		program,
+		profile,
+	).map_err(
+		func(error): EmitFailure(core_emit_error_message(error)),
+	)
+
+
 private pure func handle_emit_core_c(body: JsonValue) -> Result[JsonValue, BackendBridgeError]:
 	core_json ?= json_field(body, "core", "Core program JSON")
 	profile ?= optional_bool_field(body, "profile", False)
@@ -160,7 +197,104 @@ private pure func handle_run_perceus(body: JsonValue) -> Result[JsonValue, Backe
 	)
 
 
-private pure func dispatch_request(root: JsonValue) -> Result[JsonValue, BackendBridgeError]:
+private func measured_core_artifact(
+	window_name: String,
+	program: CoreProgram,
+	direct_perceus: Bool,
+) -> Result[JsonValue, BackendBridgeError]:
+	reset_mem_stats()
+	begin_function_profile_window()
+
+	debug:
+		CorePerceus.register_perceus_work_counters()
+
+	started: Int = now_microseconds()
+
+	output: CoreProgram = if direct_perceus:
+		CorePerceus.insert_drops_program(program)
+	else:
+		run_perceus_stage(program)
+
+	elapsed_microseconds: Int = now_microseconds() - started
+	end_function_profile_window()
+	memory = get_mem_stats()
+
+	Ok(bridge_success_json(JsonObject([
+		(CORE_ARTIFACT_FIELD, core_program_to_json(output)),
+		(WINDOW_FIELD, JsonString(window_name)),
+		(WINDOW_ELAPSED_MICROSECONDS_FIELD, JsonNumber(to_float(elapsed_microseconds))),
+		(WINDOW_ALLOCATIONS_FIELD, JsonNumber(to_float(memory.total_allocations))),
+		(WINDOW_RELEASES_FIELD, JsonNumber(to_float(memory.total_releases))),
+	])))
+
+
+private func handle_measure_ownership_preparation_perceus(
+	body: JsonValue,
+) -> Result[JsonValue, BackendBridgeError]:
+	core_json ?= json_field(body, "core", "Core program JSON")
+	program ?= decode_core_program(core_json)
+	measured_core_artifact(OWNERSHIP_PREPARATION_PERCEUS_WINDOW, program, False)
+
+
+private func handle_measure_perceus_direct(
+	body: JsonValue,
+) -> Result[JsonValue, BackendBridgeError]:
+	core_json ?= json_field(body, "core", "Core program JSON")
+	program ?= decode_core_program(core_json)
+	ownership_ready_program: CoreProgram = prepare_perceus_input(program)
+	measured_core_artifact(DIRECT_PERCEUS_WINDOW, ownership_ready_program, True)
+
+
+private pure func handle_inspect_ownership_stages(
+	body: JsonValue,
+) -> Result[JsonValue, BackendBridgeError]:
+	core_json ?= json_field(body, "core", "Core program JSON")
+	program ?= decode_core_program(core_json)
+	ownership_ready: CoreProgram = prepare_perceus_input(program)
+	post_perceus: CoreProgram = CorePerceus.insert_drops_program(ownership_ready)
+	post_reuse: CoreProgram = run_reuse_stage(post_perceus)
+	prepared: CoreProgram = run_post_perceus_tail(post_perceus)
+
+	Ok(bridge_success_json(JsonObject([
+		("ownership_ready", core_program_to_json(ownership_ready)),
+		("post_perceus", core_program_to_json(post_perceus)),
+		("post_reuse", core_program_to_json(post_reuse)),
+		("prepared", core_program_to_json(prepared)),
+	])))
+
+
+private func handle_measure_backend_emission(
+	body: JsonValue,
+) -> Result[JsonValue, BackendBridgeError]:
+	core_json ?= json_field(body, "core", "Core program JSON")
+	profile ?= optional_bool_field(body, "profile", False)
+	program ?= decode_core_program(core_json)
+	prepared: PreparedCoreProgram = run_pre_dce_tail(program)
+
+	reset_mem_stats()
+	begin_function_profile_window()
+	started: Int = now_microseconds()
+	artifact_result: Result[CArtifact, BackendBridgeError] = emit_prepared_core_c_artifact(
+		prepared,
+		profile,
+	)
+	elapsed_microseconds: Int = now_microseconds() - started
+	end_function_profile_window()
+	memory = get_mem_stats()
+	artifact ?= artifact_result
+
+	Ok(bridge_success_json(JsonObject([
+		(C_ARTIFACT_C_CODE_FIELD, JsonString(artifact.c_code)),
+		(C_ARTIFACT_LINK_FLAGS_FIELD, string_list_to_json(artifact.link_flags)),
+		(C_ARTIFACT_INCLUDE_DIRS_FIELD, string_list_to_json(artifact.include_dirs)),
+		(WINDOW_FIELD, JsonString(BACKEND_EMISSION_WINDOW)),
+		(WINDOW_ELAPSED_MICROSECONDS_FIELD, JsonNumber(to_float(elapsed_microseconds))),
+		(WINDOW_ALLOCATIONS_FIELD, JsonNumber(to_float(memory.total_allocations))),
+		(WINDOW_RELEASES_FIELD, JsonNumber(to_float(memory.total_releases))),
+	])))
+
+
+private func dispatch_request(root: JsonValue) -> Result[JsonValue, BackendBridgeError]:
 	header ?= decode_bridge_envelope_header(root).map_err(func(error): ProtocolError(error))
 
 	body ?= decode_bridge_payload(root).map_err(func(error): ProtocolError(error))
@@ -169,9 +303,17 @@ private pure func dispatch_request(root: JsonValue) -> Result[JsonValue, Backend
 		handle_emit_core_c(body)
 	else if header.action_name == "run_perceus":
 		handle_run_perceus(body)
+	else if header.action_name == "measure_ownership_preparation_perceus":
+		handle_measure_ownership_preparation_perceus(body)
+	else if header.action_name == "measure_perceus_direct":
+		handle_measure_perceus_direct(body)
+	else if header.action_name == "inspect_ownership_stages":
+		handle_inspect_ownership_stages(body)
+	else if header.action_name == "measure_backend_emission":
+		handle_measure_backend_emission(body)
 	else:
 		Err(UnsupportedAction(header.action_name))
 
 
-pure func handle_request_value(root: JsonValue) -> JsonValue:
+func handle_request_value(root: JsonValue) -> JsonValue:
 	dispatch_request(root).get_or_else(error_json)
