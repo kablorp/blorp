@@ -1,4 +1,5 @@
 import:
+	../../../src/compiler/stage_02_lex/parse_diagnostic: parse_error
 	../../../src/compiler/stage_03_parse/parsed_ast:
 		ParsedBinaryOp(ParsedAddOp),
 		ParsedDecl(
@@ -194,6 +195,7 @@ import:
 			ImportIdentityFound,
 			ImportIdentityMissing,
 		),
+		importable_module_dependency_closure,
 		resolve_import_identity,
 	../../../src/compiler/stage_06_typecheck/state:
 		TYPECHECK_STDLIB_ORIGIN,
@@ -1215,6 +1217,26 @@ pure func importable_modules(
 	importable_modules_with_origin(module_path, decls, SourcePackageModule("test"))
 
 
+private pure func recovery_importable_modules(
+	module_path: String,
+	decls: List[ParsedDecl],
+) -> List[ImportableModule]:
+	module_program = program_for_module(module_path, decls)
+	recovery_program = { module_program |
+		diagnostics = [parse_error(fixture_source_span(), "fixture parse failure")]
+	}
+	candidate = module_load_candidate(
+		resolved_module_identity_from_resolver(module_path, SourcePackageModule("test")),
+		finalized_typecheck_program(recovery_program),
+	)
+
+	match indexed_graph_build(candidate, []):
+		Err(_):
+			[]
+		Ok(graph):
+			[importable_module(indexed_graph_target_scope(graph))]
+
+
 private pure func importable_module_index(
 	modules: List[ImportableModule],
 ) -> Option[ImportableModuleIndex]:
@@ -1559,6 +1581,137 @@ func test_reachable_import_modules_follow_private_source_name_alias() -> Bool:
 		.get_or([])
 
 	reachable.map(importable_module_path) == ["dep", "pkg/nested"]
+
+
+private pure func dependency_closure_paths(
+	indexed_modules: List[ImportableModule],
+	roots: List[ImportableModule],
+	current_module_path: Option[String],
+) -> List[String]:
+	match importable_module_index(indexed_modules):
+		None:
+			[]
+		Some(index):
+			importable_module_dependency_closure(
+				index,
+				roots,
+				current_module_path,
+			).map(importable_module_path)
+
+
+func test_import_dependency_closure_preserves_shapes_and_index_order() -> Bool:
+	a = importable_modules(
+		"a",
+		[import_block_decl([import_decl("b", None, None), import_decl("c", None, None)])],
+	)
+	b = importable_modules("b", [import_block_decl([import_decl("d", None, None)])])
+	c = importable_modules("c", [import_block_decl([import_decl("d", None, None)])])
+	d = importable_modules("d", [])
+	diamond_modules = d
+		.concat(c)
+		.concat(a)
+		.concat(b)
+	diamond = dependency_closure_paths(diamond_modules, a, None)
+	chain_modules = importable_modules(
+		"chain_a",
+		[import_block_decl([import_decl("chain_b", None, None)])],
+	)
+		.concat(
+			importable_modules(
+				"chain_b",
+				[import_block_decl([import_decl("chain_c", None, None)])],
+			),
+		)
+		.concat(importable_modules("chain_c", []))
+	chain = dependency_closure_paths(
+		chain_modules,
+		chain_modules.filter(func(module): importable_module_path(module) == "chain_a"),
+		None,
+	)
+	star_modules = importable_modules("star", [import_block_decl([
+				import_decl("left", None, None),
+				import_decl("right", None, None),
+				import_decl("leaf", None, None),
+			])])
+		.concat(importable_modules("left", []))
+		.concat(importable_modules("right", []))
+		.concat(importable_modules("leaf", []))
+	star = dependency_closure_paths(
+		star_modules,
+		star_modules.filter(func(module): importable_module_path(module) == "star"),
+		None,
+	)
+
+	(
+		dependency_closure_paths([], [], None).length() == 0
+		and dependency_closure_paths(d, d, None) == ["d"]
+		and chain == ["chain_a", "chain_b", "chain_c"]
+		and star == ["star", "left", "right", "leaf"]
+		and diamond == ["d", "c", "a", "b"]
+	)
+
+
+func test_import_dependency_closure_preserves_boundary_semantics() -> Bool:
+	indexed = importable_modules("root", [import_block_decl([
+				import_decl("leaf", None, None),
+				import_decl("leaf", None, None),
+			])]).concat(
+		importable_modules(
+			"leaf",
+			[import_block_decl([import_decl("root", None, None)])],
+		),
+	)
+	external_same_path = importable_modules("root", [])
+	nonmember = importable_modules(
+		"nonmember",
+		[import_block_decl([import_decl("leaf", None, None)])],
+	)
+	broken = recovery_importable_modules(
+		"broken",
+		[
+			import_block_decl([import_decl("hidden", None, None)]),
+			ParsedErrorDecl(fixture_source_span()),
+		],
+	)
+	recovery_index = broken.concat(importable_modules("hidden", []))
+	private_root = importable_modules(
+		"private_root",
+		[
+			PrivateParsedDecl(
+				import_block_decl([import_decl("private_leaf", None, None)]),
+				fixture_source_span(),
+			),
+		],
+	)
+	private_index = private_root.concat(importable_modules("private_leaf", []))
+	exclusion_root = importable_modules(
+		"exclusion_root",
+		[import_block_decl([import_decl("excluded_current", None, None)])],
+	)
+	excluded_current = importable_modules(
+		"excluded_current",
+		[import_block_decl([import_decl("excluded_leaf", None, None)])],
+	)
+	exclusion_index = exclusion_root
+		.concat(excluded_current)
+		.concat(importable_modules("excluded_leaf", []))
+
+	(
+		dependency_closure_paths(indexed, external_same_path, None) == ["root", "leaf"]
+		and dependency_closure_paths(indexed, nonmember, None).length() == 0
+		and dependency_closure_paths(indexed, external_same_path, Some("root")) == ["root", "leaf"]
+		and dependency_closure_paths(recovery_index, broken, None) == ["broken"]
+		and dependency_closure_paths(
+			private_index,
+			private_root,
+			None,
+		) == ["private_root", "private_leaf"]
+		and dependency_closure_paths(
+			exclusion_index,
+			exclusion_root,
+			Some("excluded_current"),
+		) == ["exclusion_root"]
+	)
 
 
 func test_combined_import_selection_preserves_visible_and_direct_order() -> Bool:
@@ -5814,6 +5967,14 @@ tests: TestSuite = {
 		(
 			"reachable imports follow private source-name aliases",
 			test_reachable_import_modules_follow_private_source_name_alias,
+		),
+		(
+			"import dependency closure preserves shapes and index order",
+			test_import_dependency_closure_preserves_shapes_and_index_order,
+		),
+		(
+			"import dependency closure preserves boundary semantics",
+			test_import_dependency_closure_preserves_boundary_semantics,
 		),
 		(
 			"import identity resolution reports missing module",

@@ -693,6 +693,34 @@ so one cache key describes one effective compiler graph.
 `BLORP_TYPECHECK_PROFILE_SKIP_BUILD=1` after building that executable separately
 when repeated source-level measurements should avoid the workspace build check.
 
+### Module Visibility Profile
+
+`compiler_module_visibility_profile` isolates resolved dependency-closure
+traversal through the production `ImportableModuleIndex`. Setup parses and
+indexes a deterministic module graph; the measured loop starts from the
+requested roots and validates the exact visible-module order against an
+independent integer-graph traversal:
+
+```bash
+benchmarks/compiler_module_visibility_profile
+benchmarks/compiler_module_visibility_profile 1000 128 1 1 chain user
+benchmarks/compiler_module_visibility_profile 1000 128 all 1 dense mixed
+```
+
+The positional controls are iterations, module count, imports per module
+(`all` or an integer), root count, graph shape (`empty`, `chain`, `star`,
+`layered`, or `dense`), and origin mode (`user` or `mixed`). Output keeps the
+requested and effective import limits separate and reports fixture-modeled
+resolved edges and queue/adjacency reads, visible modules, checksum, errors,
+elapsed time, and allocator counters. Modeled counts are deterministic workload
+facts; they are not observations of private index contents or production
+function-call instrumentation.
+
+Use `BLORP_COMPILER_BENCHMARK_WORKSPACE_ROOT` to compare implementations in
+separate source trees. Both trees must contain the same fixture and runner.
+Pair and alternate runs, and require identical semantic fields before
+comparing cost.
+
 ### Typecheck Name Lookup Profile
 
 `compiler_typecheck_name_lookup_profile` isolates the typecheck state's

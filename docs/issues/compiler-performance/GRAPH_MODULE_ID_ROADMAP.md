@@ -1,6 +1,8 @@
 # Graph-Local Module ID Roadmap
 
-**Status:** Issue 46 retained a measured TypeHeader-only vertical slice
+**Status:** Issues 46 and 47 retained a measured TypeHeader-only vertical
+slice; Issues 48 and 49 were rejected; Issue 50 retained ordinal import
+adjacency; Issue 51 is deferred pending a production catalog consumer
 
 Issue 45's standalone candidate reduced allocations in a narrow indexed-scope
 lookup but increased whole-compiler retired instructions by 0.319%, so its
@@ -151,16 +153,28 @@ type-variable allocation. Numeric ID stability is not a semantic requirement:
 assignment follows the accepted graph's existing validated target/dependency
 order, while all observable compiler work preserves its current order.
 
-## Historical Proposed Order
+## Measured And Proposed Order
 
 ```text
-45 establish graph-local module IDs and cut over prepared-module addressing
+45 broad graph-local module IDs (rejected)
  |
  v
-46 index graph-owned declaration products by module ID
+46 private prepared-scope slot plus TypeHeader integer index (retained)
  |
  v
-47 replace remaining proven dense products, clean boundaries, and reprofile
+47 dense TypeHeader module inventory (retained)
+ |
+ v
+48 accepted reusable-environment lookup by compatible scope
+ |
+ v
+49 compatible-scope BoundModule lookup and one measured consumer
+ |
+ v
+50 resolved import adjacency by index-local module ordinal
+ |
+ v
+51 declaration catalog module buckets, only if its cost-share scout passes
 ```
 
 The original Issue 45 arrow was broken by its rejected experiment. Issue 46's
@@ -212,6 +226,61 @@ allocations and releases with identical response bytes. Other Issue 46
 categories and Issue 45's rejected representation do not exist, and every
 additional product still needs its own gate.
 
+### Issue 48: Index reusable module environments by scope
+
+Use the existing target-first `PreparedCanonicalModuleEnvironment` list and
+the compatible prepared-scope slot to replace retained-graph linear identity
+scans. The existing completion boundary proves exact environment count and
+alignment before constructing either accepted or recoverable graph facts;
+recoverable global-failure admission remains separate. The issue must add no
+second table or dormant module ID.
+
+The measured candidate was rejected. It reduced synthetic lookup work but did
+not clear the predeclared production allocation or retired-instruction gate;
+the compatible-scope environment index was not retained.
+
+### Issue 49: Address bound modules by prepared scope
+
+Add one narrow compatible-scope selector over the existing bound target and
+dependency list, then migrate only callers that already own exact scope
+provenance. Identity-only and canonical-path callers remain descriptive. The
+pre-edit audit must show that the bounded cutover removes at least 25% of
+production `bound_module_graph_find` calls; otherwise no API is retained.
+
+The measured candidate was rejected. It retired the targeted identity scans
+and improved synthetic allocation counts, but its production allocation share
+was below the issue gate; no compatible-scope bound-module selector remains.
+
+### Issue 50: Index resolved import adjacency by module ordinal
+
+Keep source path and alias dictionaries for import resolution, but conditionally
+replace the already-resolved path adjacency with one ordinal list per module.
+Dependency-only and all-module indexes own separate ordinal universes. This is
+a lower-ceiling candidate and must stop early if the 128-module sentinel does
+not improve allocations or retired instructions by Issue 50's predeclared 20%
+threshold.
+
+The ordinal adjacency was retained. It removed 34,894 exact production
+dependency-path lookups, reduced the 128-module focused sentinel allocations
+by 96.59%, and reduced the production graph-preparation interval allocations
+by 0.130% with byte-identical output. Whole-compiler retired instructions
+improved by 0.0137%, so the result is a bounded visibility win rather than a
+compiler-wide speedup claim.
+
+### Issue 51: Consolidate declaration catalog module indexes if measured
+
+Measure the cost share of the catalog's eight outer module dictionaries before
+editing production. Compare the current shape with one descriptive module
+bucket and one dense graph-owned bucket. The issue is rejected without code if
+real production catalog work is below its predeclared share or neither strategy
+wins representative sparse and mixed workloads. The current catalog is used
+only by benchmarks/tests, so Issue 51 remains deferred until Issue 43 or another
+accepted milestone retains and queries it in production.
+
+Each issue starts from its immediate accepted parent. Rejection does not create
+an API or representation dependency for the next issue: the next agent must
+rebase its audit and implementation on the actual retained tree.
+
 ## Performance Ratchet
 
 Every issue begins from its immediate parent. Use isolated control and
@@ -220,21 +289,25 @@ candidate worktrees built by the same bootstrap compiler. The candidate must:
 - produce byte-identical responses and semantic checksums;
 - reduce the issue's deterministic logical work counters;
 - reduce focused allocations or retired instructions;
-- reduce median whole-compiler retired instructions, with at least 1% preferred
-  for an independently merged production slice; and
-- avoid a clear wall-time or peak-RSS regression.
+- reduce either median whole-compiler retired instructions or the issue's
+  predeclared exact production allocation/release metric; an instruction
+  reduction of at least 1% remains preferred for an independently merged
+  production slice;
+- when acceptance is allocation-based, keep whole-compiler median retired
+  instructions within 0.05% of the immediate baseline; and
+- keep median elapsed within 1.0% and median peak RSS within 0.5% of the
+  immediate baseline.
 
 If a slice adds the new representation without removing enough old work, do
 not merge it. Redesign it or combine it with the next deletion so every merged
 checkpoint has a defensible return.
 
-Issue 47's TypeHeader-only conversion is the documented exception to the
-whole-compiler instruction requirement: its isolated effect was below that
-measurement's resolution, but it removed an exact 2,216 allocations and
-releases from production replay, improved every focused allocation pair, and
-preserved byte-identical output without a material RSS regression. This
-exception is limited to that measured slice and does not relax the ratchet for
-another dense product.
+Issue 47's TypeHeader-only conversion is the measured precedent for the
+allocation branch: its isolated instruction effect was below resolution, but
+it removed an exact 2,216 allocations and releases from production replay,
+improved every focused allocation pair, and preserved byte-identical output
+within the RSS bound. That result does not authorize another dense product;
+each follow-up must satisfy its own predeclared production threshold.
 
 Wall time is supporting evidence. Retired instructions, exact logical counts,
 allocator statistics, generated C, and response identity are the primary

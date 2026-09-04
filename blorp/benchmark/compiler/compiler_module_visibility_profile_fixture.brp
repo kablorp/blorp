@@ -1,0 +1,327 @@
+-- Deterministic production-path workload for resolved import closure.
+-- Graph construction and import resolution are setup. The measured loop calls
+-- the same opaque-index closure boundary used by Stage 06 module visibility.
+import:
+	../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
+	../../src/compiler/stage_03_parse/source_ast_finalize: finalized_typecheck_program
+	../../src/compiler/stage_04_modules/loaded_module:
+		ModuleLoadCandidate,
+		ModuleOrigin(NativePackageModule, SourcePackageModule, StdlibModule, UserModule),
+		module_load_candidate,
+		resolved_module_identity_from_resolver,
+	../../src/compiler/stage_06_typecheck/graph/indexed_graph: indexed_graph_build
+	../../src/compiler/stage_06_typecheck/modules/module_binding:
+		ImportableModule,
+		ImportableModuleIndex,
+		importable_module_graph,
+		importable_module_graph_dependencies,
+		importable_module_graph_dependency_index,
+		importable_module_path,
+	../../src/compiler/stage_06_typecheck/modules/module_visibility:
+		importable_module_dependency_closure,
+	../../src/lib/source: source_file
+	set as Sets
+
+
+enum CompilerModuleVisibilityGraphShape:
+	ModuleVisibilityEmptyGraph
+	ModuleVisibilityChainGraph
+	ModuleVisibilityStarGraph
+	ModuleVisibilityLayeredGraph
+	ModuleVisibilityDenseGraph
+
+
+struct CompilerModuleVisibilityBenchmarkConfig {
+	iterations: Int,
+	module_count: Int,
+	requested_imports_per_module: Int,
+	root_count: Int,
+	graph_shape: CompilerModuleVisibilityGraphShape,
+	mixed_origins: Bool
+}
+
+
+record CompilerModuleVisibilityBenchmarkResult {
+	module_count: Int,
+	requested_imports_per_module: Int,
+	effective_import_limit: Int,
+	root_count: Int,
+	resolved_edge_count: Int,
+	modeled_queue_visits: Int,
+	modeled_adjacency_reads: Int,
+	visible_module_count: Int,
+	checksum: Int,
+	error_count: Int,
+	workload_valid: Bool
+}
+
+
+private record CompilerModuleVisibilityBenchmarkInputRep {
+	config: CompilerModuleVisibilityBenchmarkConfig,
+	index: ImportableModuleIndex,
+	roots: List[ImportableModule],
+	expected_paths: List[String],
+	resolved_edge_count: Int,
+	effective_import_limit: Int
+}
+
+
+opaque type CompilerModuleVisibilityBenchmarkInput = CompilerModuleVisibilityBenchmarkInputRep
+
+
+private pure func benchmark_module_path(module_index: Int) -> String:
+	"bench/module_visibility_" + module_index.to_string()
+
+
+private pure func benchmark_module_origin(module_index: Int, mixed: Bool) -> ModuleOrigin:
+	if not mixed:
+		UserModule
+	else:
+		match module_index % 4:
+			0:
+				UserModule
+			1:
+				StdlibModule
+			2:
+				SourcePackageModule("visibility-benchmark")
+			_:
+				NativePackageModule("visibility-benchmark")
+
+
+private pure func effective_import_limit(module_count: Int, requested: Int) -> Int:
+	available = if module_count > 0:
+		module_count - 1
+	else:
+		0
+
+	if requested < 0 or requested > available:
+		available
+	else:
+		requested
+
+
+private pure func benchmark_forward_dependencies(
+	module_index: Int,
+	module_count: Int,
+	limit: Int,
+) -> List[Int]:
+	var dependencies: List[Int] = []
+	var candidate: Int = module_index + 1
+
+	while candidate < module_count and dependencies.length() < limit:
+		dependencies = dependencies.append(candidate)
+		candidate += 1
+
+	dependencies
+
+
+private pure func benchmark_dense_dependencies(
+	module_index: Int,
+	module_count: Int,
+	limit: Int,
+) -> List[Int]:
+	var dependencies: List[Int] = []
+	var offset: Int = 1
+
+	while offset < module_count and dependencies.length() < limit:
+		dependencies = dependencies.append((module_index + offset) % module_count)
+		offset += 1
+
+	dependencies
+
+
+private pure func benchmark_dependencies(
+	shape: CompilerModuleVisibilityGraphShape,
+	module_index: Int,
+	module_count: Int,
+	limit: Int,
+) -> List[Int]:
+	match shape:
+		ModuleVisibilityEmptyGraph:
+			[]
+		ModuleVisibilityChainGraph:
+			if limit > 0 and module_index + 1 < module_count:
+				[module_index + 1]
+			else:
+				[]
+		ModuleVisibilityStarGraph:
+			if module_index == 0:
+				benchmark_forward_dependencies(module_index, module_count, limit)
+			else:
+				[]
+		ModuleVisibilityLayeredGraph:
+			benchmark_forward_dependencies(module_index, module_count, limit)
+		ModuleVisibilityDenseGraph:
+			benchmark_dense_dependencies(module_index, module_count, limit)
+
+
+private pure func benchmark_module_source(dependencies: List[Int]) -> String:
+	if dependencies.is_empty():
+		""
+	else:
+		lines = dependencies.map(func(index): "\t" + benchmark_module_path(index))
+		"import:\n" + lines.join("\n") + "\n"
+
+
+private pure func benchmark_candidate(
+	module_index: Int,
+	config: CompilerModuleVisibilityBenchmarkConfig,
+	limit: Int,
+) -> ModuleLoadCandidate:
+	module_path = benchmark_module_path(module_index)
+	program = parse_compiler_source(
+		source_file(
+			"/" + module_path + ".brp",
+			module_path,
+			benchmark_module_source(
+				benchmark_dependencies(
+					config.graph_shape,
+					module_index,
+					config.module_count,
+					limit,
+				),
+			),
+		),
+	)
+	module_load_candidate(
+		resolved_module_identity_from_resolver(
+			module_path,
+			benchmark_module_origin(module_index, config.mixed_origins),
+		),
+		finalized_typecheck_program(program),
+	)
+
+
+private pure func benchmark_target_candidate() -> ModuleLoadCandidate:
+	path: String = "bench/module_visibility_target"
+	module_load_candidate(
+		resolved_module_identity_from_resolver(path, UserModule),
+		finalized_typecheck_program(parse_compiler_source(source_file("/target.brp", path, ""))),
+	)
+
+
+private pure func benchmark_expected_ordinals(
+	config: CompilerModuleVisibilityBenchmarkConfig,
+	limit: Int,
+) -> List[Int]:
+	var queue: List[Int] = []
+	var seen: Set[Int] = Sets.set()
+	var root_index: Int = 0
+
+	while root_index < config.root_count and root_index < config.module_count:
+		queue = queue.append(root_index)
+		seen = Sets.add(seen, root_index)
+		root_index += 1
+
+	var visit_index: Int = 0
+
+	while visit_index < queue.length():
+		module_index = queue.get_or(visit_index, 0)
+
+		for dependency in benchmark_dependencies(
+			config.graph_shape,
+			module_index,
+			config.module_count,
+			limit,
+		):
+			if not Sets.contains(seen, dependency):
+				queue = queue.append(dependency)
+				seen = Sets.add(seen, dependency)
+
+		visit_index += 1
+
+	queue.sort()
+
+
+private pure func benchmark_checksum(paths: List[String]) -> Int:
+	var checksum: Int = 216613626
+
+	for path in paths:
+		checksum = checksum * 16777619 + path.length()
+
+		for codepoint in path.codepoints():
+			checksum = checksum * 16777619 + codepoint
+
+	checksum
+
+
+pure func compiler_module_visibility_benchmark_input(
+	config: CompilerModuleVisibilityBenchmarkConfig,
+) -> Option[CompilerModuleVisibilityBenchmarkInput]:
+	if (
+		config.module_count <= 0
+		or config.root_count < 0
+		or config.root_count > config.module_count
+	):
+		None
+	else:
+		limit = effective_import_limit(config.module_count, config.requested_imports_per_module)
+		var candidates: List[ModuleLoadCandidate] = []
+		var resolved_edge_count: Int = 0
+
+		for module_index in 0..config.module_count:
+			dependencies = benchmark_dependencies(
+				config.graph_shape,
+				module_index,
+				config.module_count,
+				limit,
+			)
+			resolved_edge_count += dependencies.length()
+			candidates = candidates.append(benchmark_candidate(module_index, config, limit))
+
+		match indexed_graph_build(benchmark_target_candidate(), candidates):
+			Err(_):
+				None
+			Ok(graph):
+				importable_graph = importable_module_graph(graph)
+				modules = importable_module_graph_dependencies(importable_graph)
+				expected_ordinals = benchmark_expected_ordinals(config, limit)
+				expected_paths = expected_ordinals.map(benchmark_module_path)
+				roots = modules.take(config.root_count)
+				representation: CompilerModuleVisibilityBenchmarkInputRep = {
+					config = config,
+					index = importable_module_graph_dependency_index(importable_graph),
+					roots = roots,
+					expected_paths = expected_paths,
+					resolved_edge_count = resolved_edge_count,
+					effective_import_limit = limit
+				}
+				Some(into_opaque CompilerModuleVisibilityBenchmarkInput(representation))
+
+
+pure func compiler_module_visibility_benchmark(
+	input: CompilerModuleVisibilityBenchmarkInput,
+) -> CompilerModuleVisibilityBenchmarkResult:
+	representation: CompilerModuleVisibilityBenchmarkInputRep = from_opaque CompilerModuleVisibilityBenchmarkInput(
+		input
+	)
+	config = representation.config
+	var final_paths: List[String] = []
+	var workload_valid: Bool = config.iterations > 0
+	var error_count: Int = 0
+
+	for _ in 0..config.iterations:
+		paths = importable_module_dependency_closure(
+			representation.index,
+			representation.roots,
+			None,
+		).map(importable_module_path)
+		final_paths = paths
+
+		if paths != representation.expected_paths:
+			workload_valid = False
+			error_count += 1
+
+	{
+		module_count = config.module_count,
+		requested_imports_per_module = config.requested_imports_per_module,
+		effective_import_limit = representation.effective_import_limit,
+		root_count = config.root_count,
+		resolved_edge_count = representation.resolved_edge_count,
+		modeled_queue_visits = representation.expected_paths.length() * config.iterations,
+		modeled_adjacency_reads = representation.expected_paths.length() * config.iterations,
+		visible_module_count = final_paths.length(),
+		checksum = benchmark_checksum(final_paths),
+		error_count = error_count,
+		workload_valid = workload_valid
+	}

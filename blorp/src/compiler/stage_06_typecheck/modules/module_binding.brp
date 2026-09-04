@@ -41,7 +41,6 @@ import:
 		ModuleSurfaceSymbolKind(RecordSurfaceSymbol, TypeAliasSurfaceSymbol, TypeSurfaceSymbol),
 		module_surface_for_program,
 	../../stage_04_modules/module_type_identity: local_type_names_from_decls
-	../type_system/context: module_origin_is_package, module_origin_is_std
 	../graph/indexed_graph:
 		IndexedGraph,
 		PreparedModuleScope,
@@ -66,7 +65,9 @@ import:
 		typecheck_state_register_imported_constructor,
 		typecheck_state_register_imported_name,
 		typecheck_state_register_module_alias,
+	../type_system/context: module_origin_is_package, module_origin_is_std
 	module_view: ImportedNameBinding, ModuleView, module_view_imported_names
+	set as Sets
 
 
 record ImportableModuleSurface {
@@ -114,12 +115,14 @@ private record ImportableModuleIndexRep {
 	modules_by_path: Dict[String, ImportableModule],
 	module_ordinals_by_path: Dict[String, Int],
 	candidate_paths_by_request: Dict[String, List[String]],
-	dependency_paths_by_path: Dict[String, List[String]],
+	dependency_ordinals_by_module: List[List[Int]],
 	prelude_path: Option[String]
 }
 
 
 opaque type ImportableModuleIndex = ImportableModuleIndexRep
+
+private EMPTY_IMPORTABLE_MODULE_ADJACENCY: List[List[Int]] = []
 
 
 private record ImportableModuleGraphRep {
@@ -555,11 +558,83 @@ pure func importable_module_index_matching_paths(
 				candidates
 
 
-pure func importable_module_index_dependency_paths(
+private pure func importable_module_ordinal_is_current(
+	module_ordinal: Int,
+	current_module_ordinal: Option[Int],
+) -> Bool:
+	match current_module_ordinal:
+		Some(current):
+			module_ordinal == current
+		None:
+			False
+
+
+pure func importable_module_index_dependency_closure(
 	index: ImportableModuleIndex,
-	canonical_path: String,
-) -> List[String]:
-	importable_module_index_rep(index).dependency_paths_by_path.get_or(canonical_path, [])
+	roots: List[ImportableModule],
+	current_module_path: Option[String],
+) -> List[ImportableModule]:
+	representation = importable_module_index_rep(index)
+
+	if representation.dependency_ordinals_by_module.length() != representation.modules.length():
+		[]
+	else:
+		current_module_ordinal = match current_module_path:
+			Some(path):
+				representation.module_ordinals_by_path.get(path)
+			None:
+				None
+
+		var module_ordinals: List[Int] = []
+		var seen: Set[Int] = Sets.set()
+		var visit_index: Int = 0
+		var traversal_valid: Bool = True
+
+		for root in roots:
+			match representation.module_ordinals_by_path.get(importable_module_path(root)):
+				Some(root_ordinal):
+					if not Sets.contains(seen, root_ordinal):
+						module_ordinals = module_ordinals.append(root_ordinal)
+						seen = Sets.add(seen, root_ordinal)
+				None:
+					void
+
+		while visit_index < module_ordinals.length() and traversal_valid:
+			match module_ordinals.get(visit_index):
+				Some(module_ordinal):
+					match representation.dependency_ordinals_by_module.get(module_ordinal):
+						Some(dependencies):
+							for dependency in dependencies:
+								if (
+									not Sets.contains(seen, dependency)
+									and not importable_module_ordinal_is_current(
+										dependency,
+										current_module_ordinal,
+									)
+								):
+									module_ordinals = module_ordinals.append(dependency)
+									seen = Sets.add(seen, dependency)
+						None:
+							traversal_valid = False
+				None:
+					traversal_valid = False
+
+			visit_index += 1
+
+		var modules: List[ImportableModule] = []
+		var projection_valid: Bool = True
+
+		for module_ordinal in module_ordinals.sort():
+			match representation.modules.get(module_ordinal):
+				Some(module):
+					modules = modules.append(module)
+				None:
+					projection_valid = False
+
+		if traversal_valid and projection_valid:
+			modules
+		else:
+			[]
 
 
 private pure func importable_module_index(modules: List[ImportableModule]) -> ImportableModuleIndex:
@@ -623,27 +698,37 @@ private pure func importable_module_index(modules: List[ImportableModule]) -> Im
 		modules_by_path = modules_by_path,
 		module_ordinals_by_path = module_ordinals_by_path,
 		candidate_paths_by_request = candidate_paths_by_request,
-		dependency_paths_by_path = {},
+		dependency_ordinals_by_module = [],
 		prelude_path = prelude_path
 	}
 	base = into_opaque ImportableModuleIndex(base_representation)
-	var dependency_paths_by_path: Dict[String, List[String]] = {}
+	var dependency_ordinals_by_module: List[List[Int]] = []
+	var adjacency_valid: Bool = True
 
 	for module in modules:
-		var dependencies: List[String] = []
+		var dependencies: List[Int] = []
 
 		for import_decl in importable_module_declared_imports(module):
-			for dependency in importable_module_index_matching_paths(base, import_decl.module_path):
-				if not dependencies.contains(dependency):
-					dependencies = dependencies.append(dependency)
+			for dependency_path in importable_module_index_matching_paths(
+				base,
+				import_decl.module_path,
+			):
+				match module_ordinals_by_path.get(dependency_path):
+					Some(dependency_ordinal):
+						if not dependencies.contains(dependency_ordinal):
+							dependencies = dependencies.append(dependency_ordinal)
+					None:
+						adjacency_valid = False
 
-		dependency_paths_by_path = dependency_paths_by_path.set(
-			importable_module_path(module),
-			dependencies,
-		)
+		dependency_ordinals_by_module = dependency_ordinals_by_module.append(dependencies)
+
+	final_dependency_ordinals = if adjacency_valid:
+		dependency_ordinals_by_module
+	else:
+		EMPTY_IMPORTABLE_MODULE_ADJACENCY
 
 	indexed_representation = { base_representation |
-		dependency_paths_by_path = dependency_paths_by_path
+		dependency_ordinals_by_module = final_dependency_ordinals
 	}
 	into_opaque ImportableModuleIndex(indexed_representation)
 
