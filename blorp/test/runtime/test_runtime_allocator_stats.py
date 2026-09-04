@@ -102,7 +102,9 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
                 if (before.total_allocations != 0) return 2;
                 if (before.total_releases != 0) return 3;
                 if (before.current_objects != 0) return 4;
-                if (before.bytes_allocated <= 0) return 5;
+                // A zero baseline is valid now that the stats snapshot itself
+                // is returned by value and performs no allocation.
+                if (before.bytes_allocated < 0) return 5;
                 long before_bytes = before.bytes_allocated;
 
                 blorp_Object* object = blorp_alloc(sizeof(blorp_Object));
