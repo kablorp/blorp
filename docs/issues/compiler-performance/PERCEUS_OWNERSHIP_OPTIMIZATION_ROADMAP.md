@@ -1083,6 +1083,13 @@ Global discovery may remain one separate read-only pass initially. The landing
 property is one owner-independent reconstruction per operation family, not a
 claim that catalog discovery itself is free.
 
+Implemented on 2026-09-04. The 32-global focused fixture reduced
+referenced-global normalization visits by 96.9%, the paired direct-Perceus
+median by 41.1%, allocations by 41.2%, and releases by 42.5%, with
+byte-identical Core and rooted generated C. The one-global allocation and
+release controls remained within 0.4% of the immediate parent. See
+[`compiler_perceus_tranche4b_2026-09-04.md`](../../../benchmarks/results/compiler_perceus_tranche4b_2026-09-04.md).
+
 ### 4C: Lambda ownership regions
 
 [Issue 50](50-use-owner-catalogs-for-lambda-regions.md) applies the same

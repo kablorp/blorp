@@ -1234,6 +1234,28 @@ benchmarks/compiler_perceus_memory \
   --samples 7 --json
 ```
 
+The referenced-global matrix keeps 384 declared globals, two uncalled
+256-node functions, and 32 ownership-boundary sites per function. It cycles
+those fixed sites through 1, 8, and 32 exact managed global identities, so
+only the referenced-owner cardinality changes. The matrix requires explicit
+immediate-parent timing and counter workers, forces direct Perceus, checks
+exact post-Perceus Core identity, and enforces visit, timing, allocation,
+fallback, rewrite-count, and one-global regression gates:
+
+```bash
+benchmarks/compiler_perceus_memory \
+  --referenced-global-matrix \
+  --bridge /path/to/candidate-worker \
+  --counter-bridge /path/to/candidate-counter-worker \
+  --baseline-bridge /path/to/immediate-parent-worker \
+  --baseline-counter-bridge /path/to/immediate-parent-counter-worker \
+  --samples 7 --json
+```
+
+The direct matrix leaves workers uncalled to isolate Perceus. Validate rooted
+generated C separately with `--body-shape referenced_global_boundary`,
+`--end-to-end`, and each 1/8/32 reference count.
+
 For performance decisions, compare explicit workers in alternating order:
 
 ```bash

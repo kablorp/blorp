@@ -28,7 +28,7 @@ from compiler_backend_worker import (
 )
 
 
-FIXTURE_VERSION = 6
+FIXTURE_VERSION = 7
 DEFAULT_TIMEOUT_SECONDS = 60.0
 PERCEUS_ACTION = "run_perceus"
 MEASURE_OWNERSHIP_PREPARATION_PERCEUS_ACTION = (
@@ -43,6 +43,7 @@ BODY_SHAPES = (
     "borrowed_call_protection",
     "aggregate_escape",
     "borrowed_return",
+    "referenced_global_boundary",
     "nested_user_call",
     "mutually_recursive_calls",
 )
@@ -77,6 +78,13 @@ PERCEUS_WORK_COUNTER_NAMES = (
     "borrowed_result_owner_candidate_visits",
     "borrowed_result_alias_fallback_requests",
     "borrowed_result_rewrite_actions",
+    "referenced_global_discovery_node_visits",
+    "referenced_global_read_candidates",
+    "referenced_global_exact_matches",
+    "borrowed_global_catalog_slots",
+    "borrowed_global_normalization_visits",
+    "borrowed_global_alias_fallback_requests",
+    "borrowed_global_rewrite_actions",
     "borrowed_origin_member_visits",
     "borrowed_origin_storage_slots",
     "borrowed_aggregate_node_visits",
@@ -106,12 +114,22 @@ TRANCHE_4_WORK_COUNTER_NAMES = (
     "borrowed_result_alias_fallback_requests",
     "borrowed_result_rewrite_actions",
 )
+TRANCHE_4B_WORK_COUNTER_NAMES = (
+    "referenced_global_discovery_node_visits",
+    "referenced_global_read_candidates",
+    "referenced_global_exact_matches",
+    "borrowed_global_catalog_slots",
+    "borrowed_global_normalization_visits",
+    "borrowed_global_alias_fallback_requests",
+    "borrowed_global_rewrite_actions",
+)
 LEGACY_PERCEUS_WORK_COUNTER_NAMES = tuple(
     name for name in PERCEUS_WORK_COUNTER_NAMES
     if name not in (
         TRANCHE_2_WORK_COUNTER_NAMES
         + TRANCHE_3_WORK_COUNTER_NAMES
         + TRANCHE_4_WORK_COUNTER_NAMES
+        + TRANCHE_4B_WORK_COUNTER_NAMES
     )
 )
 DEFAULT_GLOBALS = 384
@@ -130,6 +148,17 @@ MANAGED_PARAMETER_TYPE = "String"
 BORROWED_OWNER_TYPE_NAME = "BenchBorrowOwner"
 AGGREGATE_ESCAPE_SITES_PER_FUNCTION = 12
 RESULT_ALIAS_TERMINALS_PER_FUNCTION = 32
+REFERENCED_GLOBAL_MATRIX_GLOBALS = 384
+REFERENCED_GLOBAL_MATRIX_FUNCTIONS = 2
+REFERENCED_GLOBAL_MATRIX_BODY_NODES = 256
+REFERENCED_GLOBAL_CALL_SITES_PER_FUNCTION = 12
+REFERENCED_GLOBAL_AGGREGATE_SITES_PER_FUNCTION = 12
+REFERENCED_GLOBAL_RESULT_SITES_PER_FUNCTION = 8
+REFERENCED_GLOBAL_SITES_PER_FUNCTION = (
+    REFERENCED_GLOBAL_CALL_SITES_PER_FUNCTION
+    + REFERENCED_GLOBAL_AGGREGATE_SITES_PER_FUNCTION
+    + REFERENCED_GLOBAL_RESULT_SITES_PER_FUNCTION
+)
 WORKER_FLAG = "--measurement-worker"
 VMAP_SAMPLE_SECONDS = 0.1
 TERMINATE_GRACE_SECONDS = 1.0
@@ -211,6 +240,20 @@ def parse_perceus_work_counters(
     if missing:
         raise RuntimeError("missing Perceus work counters: " + ", ".join(missing))
     return counters
+
+
+def add_referenced_global_derived_counters(counters: dict[str, int]) -> dict[str, int]:
+    """Compose directly comparable region work from operation counters."""
+    result = dict(counters)
+    result["borrowed_global_normalization_visits"] = sum(
+        result[name]
+        for name in (
+            "borrowed_call_node_visits",
+            "borrowed_aggregate_node_visits",
+            "borrowed_result_node_visits",
+        )
+    )
+    return result
 
 
 def core_ownership_census(core_program: JsonObject) -> JsonObject:
@@ -413,6 +456,25 @@ def padded_result_sequence(result: JsonObject, target_nodes: int) -> JsonObject:
     return combined
 
 
+def padded_result_sequence_with_work(
+    work: list[JsonObject],
+    result: JsonObject,
+    target_nodes: int,
+) -> JsonObject:
+    """Pad non-result work without moving it into the function result path."""
+    result_nodes = expression_node_count(result)
+    work_target_nodes = target_nodes - result_nodes - 1
+    if work_target_nodes < 1:
+        raise ValueError(
+            "referenced-global workload is larger than the requested node count"
+        )
+    padding = padded_sequence(work, work_target_nodes)
+    combined = {"kind": "seq", "first": padding, "second": result}
+    if expression_node_count(combined) != target_nodes:
+        raise RuntimeError("failed to construct exact referenced-global node target")
+    return combined
+
+
 def global_decl(index: int) -> JsonObject:
     def_id = index + 1
     name = f"BENCH_UNUSED_GLOBAL_{index:04d}"
@@ -497,6 +559,145 @@ def global_ref_expr(index: int) -> JsonObject:
         "var": core_var(f"BENCH_UNUSED_GLOBAL_{index:04d}", index + 1),
         "type": named_type("String"),
         "loc": synthetic_loc(),
+    }
+
+
+def referenced_global_call_expr(global_index: int) -> JsonObject:
+    return {
+        "kind": "call",
+        "call_kind": {"kind": "builtin", "name": "blorp_string_concat_consume"},
+        "callee": {
+            "kind": "var",
+            "var": core_var("blorp_string_concat_consume", None),
+            "type": named_type("Function"),
+            "loc": synthetic_loc(),
+        },
+        "args": [
+            global_ref_expr(global_index),
+            literal_expr("string", "", MANAGED_PARAMETER_TYPE),
+        ],
+        "type": named_type(MANAGED_PARAMETER_TYPE),
+        "loc": synthetic_loc(),
+    }
+
+
+def referenced_global_aggregate_expr(global_index: int) -> JsonObject:
+    return {
+        "kind": "record_construct",
+        "type_name": BORROWED_OWNER_TYPE_NAME,
+        "fields": [{
+            "name": "BENCH_PAYLOAD",
+            "value": global_ref_expr(global_index),
+        }],
+        "type": heap_record_type(BORROWED_OWNER_TYPE_NAME),
+        "loc": synthetic_loc(),
+    }
+
+
+def referenced_global_result_tree(referenced_globals: int) -> JsonObject:
+    results = [
+        global_ref_expr(
+            (
+                REFERENCED_GLOBAL_CALL_SITES_PER_FUNCTION
+                + REFERENCED_GLOBAL_AGGREGATE_SITES_PER_FUNCTION
+                + terminal_index
+            )
+            % referenced_globals
+        )
+        for terminal_index in range(REFERENCED_GLOBAL_RESULT_SITES_PER_FUNCTION)
+    ]
+    while len(results) > 1:
+        if len(results) % 2 != 0:
+            raise RuntimeError("referenced-global result count must form a balanced tree")
+        results = [
+            {
+                "kind": "if",
+                "cond": literal_expr("bool", True, "Bool"),
+                "then": results[index],
+                "else": results[index + 1],
+                "type": named_type(MANAGED_PARAMETER_TYPE),
+                "loc": synthetic_loc(),
+            }
+            for index in range(0, len(results), 2)
+        ]
+    return results[0]
+
+
+def referenced_global_boundary_body(
+    function_index: int,
+    referenced_globals: int,
+    body_nodes: int,
+) -> JsonObject:
+    if referenced_globals < 1 or referenced_globals > REFERENCED_GLOBAL_SITES_PER_FUNCTION:
+        raise ValueError("referenced-global boundary requires between 1 and 32 globals")
+
+    work: list[JsonObject] = []
+    for site_index in range(REFERENCED_GLOBAL_CALL_SITES_PER_FUNCTION):
+        work.append(referenced_global_call_expr(site_index % referenced_globals))
+    for site_index in range(REFERENCED_GLOBAL_AGGREGATE_SITES_PER_FUNCTION):
+        global_site = REFERENCED_GLOBAL_CALL_SITES_PER_FUNCTION + site_index
+        work.append(referenced_global_aggregate_expr(global_site % referenced_globals))
+
+    result = referenced_global_result_tree(referenced_globals)
+    body_tail = padded_result_sequence_with_work(result=result, work=work, target_nodes=body_nodes - 2)
+    return {
+        "kind": "let",
+        "name": core_var(f"BENCH_MANAGED_LOCAL_{function_index:04d}", None),
+        "mutable": False,
+        "type": named_type(MANAGED_PARAMETER_TYPE),
+        "rhs": literal_expr("string", "managed-global-boundary", MANAGED_PARAMETER_TYPE),
+        "body": body_tail,
+    }
+
+
+def referenced_global_boundary_census(value: Any) -> JsonObject:
+    consuming_calls = 0
+    aggregate_transfers = 0
+    reference_sites = 0
+    global_indices: set[int] = set()
+
+    def visit(current: Any) -> None:
+        nonlocal consuming_calls, aggregate_transfers, reference_sites
+        if isinstance(current, dict):
+            kind = current.get("kind")
+            if kind == "call":
+                call_kind = current.get("call_kind")
+                if (
+                    isinstance(call_kind, dict)
+                    and call_kind.get("kind") == "builtin"
+                    and call_kind.get("name") == "blorp_string_concat_consume"
+                ):
+                    consuming_calls += 1
+            elif (
+                kind == "record_construct"
+                and current.get("type_name") == BORROWED_OWNER_TYPE_NAME
+            ):
+                aggregate_transfers += 1
+            elif kind == "var":
+                variable = current.get("var")
+                if isinstance(variable, dict):
+                    name = variable.get("name")
+                    def_id = variable.get("def_id")
+                    if (
+                        isinstance(name, str)
+                        and name.startswith("BENCH_UNUSED_GLOBAL_")
+                        and isinstance(def_id, int)
+                    ):
+                        reference_sites += 1
+                        global_indices.add(def_id - 1)
+            for child in current.values():
+                visit(child)
+        elif isinstance(current, list):
+            for child in current:
+                visit(child)
+
+    visit(value)
+    return {
+        "consuming_calls": consuming_calls,
+        "aggregate_transfers": aggregate_transfers,
+        "result_terminals": reference_sites - consuming_calls - aggregate_transfers,
+        "reference_sites": reference_sites,
+        "distinct_global_indices": len(global_indices),
     }
 
 
@@ -657,6 +858,15 @@ def worker_decl(
     first_function_id: int,
     user_call_edges: int,
 ) -> JsonObject:
+    if body_shape == "referenced_global_boundary":
+        return user_function(
+            f"bench_worker_{index:04d}",
+            def_id,
+            referenced_global_boundary_body(index, global_reads_per_function, body_leaves),
+            [],
+            MANAGED_PARAMETER_TYPE,
+        )
+
     if body_shape == "borrowed_return":
         if params_per_function == 0:
             raise ValueError("borrowed return requires parameters")
@@ -822,7 +1032,9 @@ def call_worker_expr(
             for param_index in range(params_per_function)
         ],
         "type": named_type(
-            MANAGED_PARAMETER_TYPE if body_shape == "borrowed_return" else "Int"
+            MANAGED_PARAMETER_TYPE
+            if body_shape in ("borrowed_return", "referenced_global_boundary")
+            else "Int"
         ),
         "loc": synthetic_loc(),
     }
@@ -873,7 +1085,11 @@ def fixture_request(
     globals_json = [global_decl(index) for index in range(global_count)]
     type_decls = (
         [borrowed_owner_decl()]
-        if body_shape in ("borrowed_call_protection", "aggregate_escape")
+        if body_shape in (
+            "borrowed_call_protection",
+            "aggregate_escape",
+            "referenced_global_boundary",
+        )
         else []
     )
     first_function_id = global_count + 1
@@ -892,6 +1108,20 @@ def fixture_request(
         )
         for index in range(function_count)
     ]
+    if body_shape == "referenced_global_boundary":
+        for function in functions_json:
+            body = function.get("body")
+            if expression_node_count(body) != body_leaves:
+                raise RuntimeError("referenced-global worker body node count changed")
+            expected_census = {
+                "consuming_calls": REFERENCED_GLOBAL_CALL_SITES_PER_FUNCTION,
+                "aggregate_transfers": REFERENCED_GLOBAL_AGGREGATE_SITES_PER_FUNCTION,
+                "result_terminals": REFERENCED_GLOBAL_RESULT_SITES_PER_FUNCTION,
+                "reference_sites": REFERENCED_GLOBAL_SITES_PER_FUNCTION,
+                "distinct_global_indices": global_reads_per_function,
+            }
+            if referenced_global_boundary_census(body) != expected_census:
+                raise RuntimeError("referenced-global boundary site census changed")
     main_expressions = []
     if invoke_workers:
         main_expressions = [
@@ -1803,11 +2033,14 @@ def run_benchmark(
                         "counter-enabled Perceus output differs from timing output"
                     )
                 counter_artifact_hash = current_counter_artifact_hash
-                counter_observations.append(
-                    parse_perceus_work_counters(
-                        counter_stderr.read_text(encoding="utf-8", errors="replace")
-                    )
+                parsed_counters = parse_perceus_work_counters(
+                    counter_stderr.read_text(encoding="utf-8", errors="replace")
                 )
+                if body_shape == "referenced_global_boundary":
+                    parsed_counters = add_referenced_global_derived_counters(
+                        parsed_counters
+                    )
+                counter_observations.append(parsed_counters)
             if counter_observations[0] != counter_observations[1]:
                 raise RuntimeError("Perceus work counters differ between repeated runs")
             metrics["work_counters"] = counter_observations[0]
@@ -1843,15 +2076,18 @@ def run_benchmark(
                             "baseline counter-enabled Perceus output differs "
                             "from timing output"
                         )
-                    baseline_counter_observations.append(
-                        parse_perceus_work_counters(
-                            baseline_counter_stderr.read_text(
-                                encoding="utf-8",
-                                errors="replace",
-                            ),
-                            require_candidate_schema=False,
-                        )
+                    parsed_baseline_counters = parse_perceus_work_counters(
+                        baseline_counter_stderr.read_text(
+                            encoding="utf-8",
+                            errors="replace",
+                        ),
+                        require_candidate_schema=False,
                     )
+                    if body_shape == "referenced_global_boundary":
+                        parsed_baseline_counters = add_referenced_global_derived_counters(
+                            parsed_baseline_counters
+                        )
+                    baseline_counter_observations.append(parsed_baseline_counters)
                 if baseline_counter_observations[0] != baseline_counter_observations[1]:
                     raise RuntimeError(
                         "baseline Perceus work counters differ between repeated runs"
@@ -2303,6 +2539,125 @@ def validate_borrowed_result_matrix(points: list[JsonObject]) -> None:
                 )
 
 
+def validate_referenced_global_matrix(points: list[JsonObject]) -> None:
+    if len(points) != 3:
+        raise RuntimeError("referenced-global matrix requires 1, 8, and 32-global points")
+    referenced_counts = [int(point["global_reads_per_function"]) for point in points]
+    if referenced_counts != [1, 8, 32]:
+        raise RuntimeError(
+            "referenced-global matrix requires 1, 8, and 32-global points: "
+            f"{referenced_counts}"
+        )
+    if any(int(point["globals"]) != REFERENCED_GLOBAL_MATRIX_GLOBALS for point in points):
+        raise RuntimeError("referenced-global matrix declared-global count changed")
+
+    counters = [point.get("work_counters") for point in points]
+    if not all(isinstance(value, dict) for value in counters):
+        raise RuntimeError("referenced-global matrix requires work counters")
+
+    for name in (
+        "referenced_global_discovery_node_visits",
+        "borrowed_global_normalization_visits",
+        "borrowed_global_alias_fallback_requests",
+        "borrowed_global_rewrite_actions",
+    ):
+        values = [int(counter[name]) for counter in counters]
+        if len(set(values)) != 1:
+            raise RuntimeError(
+                f"referenced-global matrix {name} scales with referenced globals: {values}"
+            )
+
+    fallback_requests = [
+        int(counter["borrowed_global_alias_fallback_requests"])
+        for counter in counters
+    ]
+    if any(fallback_requests):
+        raise RuntimeError(
+            "referenced-global matrix unexpectedly entered scalar alias fallback: "
+            f"{fallback_requests}"
+        )
+
+    expected_candidates = [
+        int(point["functions"]) * int(point["global_reads_per_function"])
+        for point in points
+    ]
+    for name in (
+        "referenced_global_read_candidates",
+        "referenced_global_exact_matches",
+        "borrowed_global_catalog_slots",
+    ):
+        actual = [int(counter[name]) for counter in counters]
+        if actual != expected_candidates:
+            raise RuntimeError(
+                f"referenced-global matrix {name} does not match exact global owners: "
+                f"{actual} != {expected_candidates}"
+            )
+
+    expected_rewrites = [
+        int(point["functions"]) * REFERENCED_GLOBAL_SITES_PER_FUNCTION
+        for point in points
+    ]
+    actual_rewrites = [
+        int(counter["borrowed_global_rewrite_actions"])
+        for counter in counters
+    ]
+    if actual_rewrites != expected_rewrites:
+        raise RuntimeError(
+            "referenced-global rewrites do not match fixed boundary sites: "
+            f"{actual_rewrites} != {expected_rewrites}"
+        )
+
+    if all(point.get("comparison_kind") == "compiler-worker" for point in points):
+        baseline_counters = [point.get("baseline_work_counters") for point in points]
+        if not all(isinstance(value, dict) for value in baseline_counters):
+            raise RuntimeError("referenced-global matrix requires baseline work counters")
+        candidate_visits = int(counters[-1]["borrowed_global_normalization_visits"])
+        baseline_visits = int(
+            baseline_counters[-1]["borrowed_global_normalization_visits"]
+        )
+        if candidate_visits * 4 > baseline_visits:
+            raise RuntimeError(
+                "referenced-global matrix must reduce 32-global reconstruction visits "
+                f"by at least 75%: baseline {baseline_visits}, candidate {candidate_visits}"
+            )
+
+        high_owner = points[-1]
+        speed_ratio = high_owner.get(
+            "paired_window_elapsed_microseconds_ratio_median"
+        )
+        allocation_ratio = high_owner.get("paired_window_allocations_ratio_median")
+        if not isinstance(speed_ratio, (int, float)):
+            raise RuntimeError("referenced-global matrix is missing paired direct timing")
+        if float(speed_ratio) > 0.85:
+            raise RuntimeError(
+                "referenced-global matrix must make the 32-global direct window at "
+                f"least 15% faster: ratio {speed_ratio}"
+            )
+        if not isinstance(allocation_ratio, (int, float)):
+            raise RuntimeError(
+                "referenced-global matrix is missing paired allocation data"
+            )
+        if float(allocation_ratio) > 0.80:
+            raise RuntimeError(
+                "referenced-global matrix must reduce 32-global direct-window "
+                f"allocations by at least 20%: ratio {allocation_ratio}"
+            )
+
+        one_owner = points[0]
+        for metric_name in ("window_allocations", "window_releases"):
+            ratio = one_owner.get(f"paired_{metric_name}_ratio_median")
+            if not isinstance(ratio, (int, float)):
+                raise RuntimeError(
+                    "referenced-global matrix is missing one-global paired "
+                    f"{metric_name}"
+                )
+            if float(ratio) > 1.02:
+                raise RuntimeError(
+                    "referenced-global matrix one-global "
+                    f"{metric_name} regressed by more than 2%: ratio {ratio}"
+                )
+
+
 def run_global_matrix(args: argparse.Namespace) -> int:
     root = project_root()
     with tempfile.TemporaryDirectory(prefix="blorp-perceus-matrix-worker-") as temp_name:
@@ -2452,6 +2807,48 @@ def run_result_matrix(args: argparse.Namespace) -> int:
 
         if getattr(args, "work_counters", False):
             validate_borrowed_result_matrix(matrix_points)
+
+    return 0
+
+
+def run_referenced_global_matrix(args: argparse.Namespace) -> int:
+    root = project_root()
+    with tempfile.TemporaryDirectory(prefix="blorp-perceus-global-owner-matrix-") as temp_name:
+        bridge = prepare_backend_worker(root, Path(temp_name) / "timing", args.bridge)
+        counter_bridge = None
+        if getattr(args, "work_counters", False):
+            counter_bridge = prepare_backend_worker(
+                root,
+                Path(temp_name) / "counters",
+                args.counter_bridge,
+                debug_profile=True,
+            )
+
+        matrix_points: list[JsonObject] = []
+        for referenced_globals in (1, 8, 32):
+            point = argparse.Namespace(**vars(args))
+            point.bridge = str(bridge)
+            point.counter_bridge = str(counter_bridge) if counter_bridge is not None else None
+            point.globals = REFERENCED_GLOBAL_MATRIX_GLOBALS
+            point.functions = REFERENCED_GLOBAL_MATRIX_FUNCTIONS
+            point.body_leaves = REFERENCED_GLOBAL_MATRIX_BODY_NODES
+            point.global_reads_per_function = referenced_globals
+            point.params_per_function = 0
+            point.parameter_type = MANAGED_PARAMETER_TYPE
+            point.body_shape = "referenced_global_boundary"
+            point.measurement_window = "perceus-direct"
+            point.control_parameter_type = None
+            point.invoke_workers = False
+            point.global_matrix = False
+            point.parameter_matrix = False
+            point.aggregate_matrix = False
+            point.result_matrix = False
+            point.referenced_global_matrix = False
+            point.contract_matrix = False
+            run_benchmark(point, matrix_points)
+
+        if getattr(args, "work_counters", False):
+            validate_referenced_global_matrix(matrix_points)
 
     return 0
 
@@ -2637,6 +3034,14 @@ def main(argv: list[str]) -> int:
         ),
     )
     parser.add_argument(
+        "--referenced-global-matrix",
+        action="store_true",
+        help=(
+            "run the 1/8/32 referenced-global boundary matrix with fixed "
+            "384 globals and two 256-node functions"
+        ),
+    )
+    parser.add_argument(
         "--contract-matrix",
         action="store_true",
         help="vary borrowed owners, body nodes, and user-call edges one axis at a time",
@@ -2669,6 +3074,7 @@ def main(argv: list[str]) -> int:
         args.parameter_matrix
         or args.aggregate_matrix
         or args.result_matrix
+        or args.referenced_global_matrix
         or args.contract_matrix
     ):
         if args.global_reads_per_function >= args.body_leaves:
@@ -2705,6 +3111,7 @@ def main(argv: list[str]) -> int:
             args.parameter_matrix,
             args.aggregate_matrix,
             args.result_matrix,
+            args.referenced_global_matrix,
             args.contract_matrix,
         )
     )
@@ -2716,6 +3123,8 @@ def main(argv: list[str]) -> int:
         parser.error("--aggregate-matrix cannot be combined with --end-to-end")
     if args.result_matrix and args.end_to_end:
         parser.error("--result-matrix cannot be combined with --end-to-end")
+    if args.referenced_global_matrix and args.end_to_end:
+        parser.error("--referenced-global-matrix cannot be combined with --end-to-end")
     if args.result_matrix and args.baseline_bridge is None:
         parser.error("--result-matrix requires --baseline-bridge")
     if (
@@ -2724,6 +3133,14 @@ def main(argv: list[str]) -> int:
         and args.baseline_counter_bridge is None
     ):
         parser.error("--result-matrix requires --baseline-counter-bridge")
+    if args.referenced_global_matrix and args.baseline_bridge is None:
+        parser.error("--referenced-global-matrix requires --baseline-bridge")
+    if (
+        args.referenced_global_matrix
+        and args.work_counters
+        and args.baseline_counter_bridge is None
+    ):
+        parser.error("--referenced-global-matrix requires --baseline-counter-bridge")
     if args.contract_matrix and args.end_to_end:
         parser.error("--contract-matrix cannot be combined with --end-to-end")
 
@@ -2739,6 +3156,8 @@ def main(argv: list[str]) -> int:
             return run_aggregate_matrix(args)
         if args.result_matrix:
             return run_result_matrix(args)
+        if args.referenced_global_matrix:
+            return run_referenced_global_matrix(args)
         if args.contract_matrix:
             return run_contract_matrix(args)
         return run_benchmark(args)

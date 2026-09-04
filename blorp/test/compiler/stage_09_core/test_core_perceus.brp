@@ -247,6 +247,17 @@ private pure func ownership_event_releases_definition(event: OwnershipEvent, def
 				False
 
 
+private pure func ownership_event_retains_definition(event: OwnershipEvent, def_id: Int) -> Bool:
+	if event.variable.def_id != Some(def_id):
+		False
+	else:
+		match event.operation:
+			OwnershipRetainEvent(_):
+				True
+			OwnershipReleaseEvent(_):
+				False
+
+
 func checked_ownership_events(expr: CoreExpr) -> Option[List[OwnershipEvent]]:
 	match ownership_events(expr):
 		Ok(projected_events):
@@ -597,6 +608,23 @@ pure func function_body(program: CoreProgram, name: String) -> Option[CoreExpr]:
 			FunctionDecl(func_info):
 				if func_info.name == name:
 					found = func_info.body
+					break
+				else:
+					void
+			_:
+				void
+
+	found
+
+
+pure func global_init(program: CoreProgram, name: String) -> Option[CoreExpr]:
+	var found: Option[CoreExpr] = None
+
+	for decl in program.decls:
+		match decl:
+			GlobalDecl(global):
+				if global.name.name == name:
+					found = Some(global.init)
 					break
 				else:
 					void
@@ -12766,6 +12794,338 @@ pure func test_resolved_global_is_retained_under_same_named_parameter() -> Bool:
 			False
 
 
+pure func test_unmanaged_exact_parameter_collision_excludes_global_owner() -> Bool:
+	shared_name: String = "module__GLOBAL_NAME"
+	shared_def_id: Int = 9100
+	shared_reference: CoreVar = {
+		name = shared_name,
+		uniq = 0,
+		def_id = Some(shared_def_id)
+	}
+	program: CoreProgram = insert_drops_program({
+		decls = [global_decl(
+				shared_name,
+				shared_def_id,
+				string_type(),
+				LiteralExpr(StringLiteral("shared"), string_type(), SyntheticSourceLoc),
+			), function_decl(
+				"read_exact_collision",
+				9101,
+				[core_param_with_id(shared_name, shared_def_id, int_type())],
+				string_type(),
+				VarExpr(shared_reference, string_type(), SyntheticSourceLoc),
+			)],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "read_exact_collision"):
+		Some(VarExpr(variable, typ, loc)):
+			variable.def_id == Some(shared_def_id)
+		_:
+			False
+
+
+pure func test_consumed_exact_parameter_collision_excludes_global_owner() -> Bool:
+	shared_name: String = "module__GLOBAL_ITEMS"
+	shared_def_id: Int = 9102
+	shared_reference: CoreVar = {
+		name = shared_name,
+		uniq = 0,
+		def_id = Some(shared_def_id)
+	}
+	program: CoreProgram = insert_drops_program({
+		decls = [global_decl(
+				shared_name,
+				shared_def_id,
+				list_int_type(),
+				call_expr("blorp_list_new", [int_expr(0)], list_int_type()),
+			), function_decl(
+				"consume_exact_collision",
+				9103,
+				[core_param_with_id(shared_name, shared_def_id, list_int_type())],
+				list_int_type(),
+				intrinsic_expr(
+					"list_ensure_unique",
+					[VarExpr(shared_reference, list_int_type(), SyntheticSourceLoc)],
+					list_int_type(),
+				),
+			)],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "consume_exact_collision"):
+		Some(body):
+			dup_count_for(shared_name, body) == 0
+		None:
+			False
+
+
+pure func test_repeated_global_references_retain_each_transfer_site_once() -> Bool:
+	global_name: String = "module__REPEATED_GLOBAL"
+	global_def_id: Int = 9104
+	global_reference: CoreVar = {
+		name = global_name,
+		uniq = 0,
+		def_id = Some(global_def_id)
+	}
+	result_type: CoreType = TupleType([string_type(), string_type()])
+	program: CoreProgram = insert_drops_program({
+		decls = [
+			global_decl(
+				global_name,
+				global_def_id,
+				string_type(),
+				LiteralExpr(StringLiteral("shared"), string_type(), SyntheticSourceLoc),
+			),
+			function_decl(
+				"repeat_global",
+				9105,
+				[],
+				result_type,
+				TupleExpr(
+					[
+						VarExpr(global_reference, string_type(), SyntheticSourceLoc),
+						VarExpr(global_reference, string_type(), SyntheticSourceLoc),
+					],
+					result_type,
+					SyntheticSourceLoc,
+				),
+			),
+		],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "repeat_global"):
+		Some(body):
+			dup_count_for(global_name, body) == 2
+		None:
+			False
+
+
+pure func test_global_initializer_excludes_self_and_retains_dependency() -> Bool:
+	dependency_name: String = "module__GLOBAL_DEPENDENCY"
+	dependency_def_id: Int = 9106
+	initialized_name: String = "module__GLOBAL_INITIALIZED"
+	initialized_def_id: Int = 9107
+	dependency_reference: CoreExpr = VarExpr(
+		{
+			name = dependency_name,
+			uniq = 0,
+			def_id = Some(dependency_def_id)
+		},
+		string_type(),
+		SyntheticSourceLoc,
+	)
+	self_reference: CoreExpr = VarExpr(
+		{
+			name = initialized_name,
+			uniq = 0,
+			def_id = Some(initialized_def_id)
+		},
+		string_type(),
+		SyntheticSourceLoc,
+	)
+	program: CoreProgram = insert_drops_program({
+		decls = [global_decl(
+				dependency_name,
+				dependency_def_id,
+				string_type(),
+				LiteralExpr(StringLiteral("dependency"), string_type(), SyntheticSourceLoc),
+			), global_decl(
+				initialized_name,
+				initialized_def_id,
+				string_type(),
+				IfExpr(
+					bool_expr(True),
+					dependency_reference,
+					self_reference,
+					string_type(),
+					SyntheticSourceLoc,
+				),
+			)],
+		foreign_includes = [],
+	})
+
+	match global_init(program, initialized_name):
+		Some(init):
+			dup_count_for(dependency_name, init) == 1 and dup_count_for(initialized_name, init) == 0
+		None:
+			False
+
+
+pure func test_global_initializer_retains_two_exact_dependencies() -> Bool:
+	first_name: String = "module__FIRST_DEPENDENCY"
+	first_def_id: Int = 9108
+	second_name: String = "module__SECOND_DEPENDENCY"
+	second_def_id: Int = 9109
+	initialized_name: String = "module__DEPENDENCY_PAIR"
+	result_type: CoreType = TupleType([string_type(), string_type()])
+	program: CoreProgram = insert_drops_program({
+		decls = [
+			global_decl(
+				first_name,
+				first_def_id,
+				string_type(),
+				LiteralExpr(StringLiteral("first"), string_type(), SyntheticSourceLoc),
+			),
+			global_decl(
+				second_name,
+				second_def_id,
+				string_type(),
+				LiteralExpr(StringLiteral("second"), string_type(), SyntheticSourceLoc),
+			),
+			global_decl(
+				initialized_name,
+				9110,
+				result_type,
+				TupleExpr(
+					[
+						VarExpr(
+							{
+								name = first_name,
+								uniq = 0,
+								def_id = Some(first_def_id)
+							},
+							string_type(),
+							SyntheticSourceLoc,
+						),
+						VarExpr(
+							{
+								name = second_name,
+								uniq = 0,
+								def_id = Some(second_def_id)
+							},
+							string_type(),
+							SyntheticSourceLoc,
+						),
+					],
+					result_type,
+					SyntheticSourceLoc,
+				),
+			),
+		],
+		foreign_includes = [],
+	})
+
+	match global_init(program, initialized_name):
+		Some(init):
+			dup_count_for(first_name, init) == 1 and dup_count_for(second_name, init) == 1
+		None:
+			False
+
+
+func test_parameter_phase_precedes_dense_exact_global_catalog() -> Bool:
+	shared_global_name: String = "module__COLLIDING_GLOBAL"
+	first_global_def_id: Int = 9111
+	second_global_def_id: Int = 9112
+	parameter_def_id: Int = 9113
+	parameter: CoreParam = core_param_with_id("parameter_owner", parameter_def_id, string_type())
+	program: CoreProgram = insert_drops_program({
+		decls = [
+			global_decl(
+				shared_global_name,
+				first_global_def_id,
+				string_type(),
+				LiteralExpr(StringLiteral("first"), string_type(), SyntheticSourceLoc),
+			),
+			global_decl(
+				shared_global_name,
+				second_global_def_id,
+				string_type(),
+				LiteralExpr(StringLiteral("second"), string_type(), SyntheticSourceLoc),
+			),
+			function_decl(
+				"bundle_parameter_and_globals",
+				9114,
+				[parameter],
+				string_type(),
+				IfExpr(
+					bool_expr(True),
+					VarExpr(
+						parameter.name,
+						string_type(),
+						SyntheticSourceLoc,
+					),
+					IfExpr(
+						bool_expr(False),
+						VarExpr(
+							{
+								name = shared_global_name,
+								uniq = 0,
+								def_id = Some(first_global_def_id)
+							},
+							string_type(),
+							SyntheticSourceLoc,
+						),
+						VarExpr(
+							{
+								name = shared_global_name,
+								uniq = 0,
+								def_id = Some(second_global_def_id)
+							},
+							string_type(),
+							SyntheticSourceLoc,
+						),
+						string_type(),
+						SyntheticSourceLoc,
+					),
+					string_type(),
+					SyntheticSourceLoc,
+				),
+			),
+		],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "bundle_parameter_and_globals"):
+		Some(body):
+			match checked_ownership_events(body):
+				Some(events):
+					valid: Bool = (
+						events.length() == 3
+						and events
+							.get(0)
+							.map(
+								func(
+									event,
+								): ownership_event_retains_definition(event, parameter_def_id),
+							)
+							.get_or(False)
+						and events
+							.get(1)
+							.map(
+								func(
+									event,
+								): ownership_event_retains_definition(event, first_global_def_id),
+							)
+							.get_or(False)
+						and events
+							.get(2)
+							.map(
+								func(
+									event,
+								): ownership_event_retains_definition(event, second_global_def_id),
+							)
+							.get_or(False)
+					)
+
+					if not valid:
+						for event in events:
+							event_def_id: Int = event.variable.def_id.get_or(-1)
+							operation_code: Int = ownership_operation_code(event.operation)
+							print_error(
+								"dense owner event: ${event.variable.name} ${event_def_id} ${operation_code}",
+							)
+					else:
+						void
+
+					valid
+				None:
+					False
+		None:
+			False
+
+
 pure func test_alias_contract_correlates_exact_argument_identity() -> Bool:
 	param: CoreParam = core_param_with_id("value", 1429, list_string_type())
 	same_named_other_owner: CoreVar = {
@@ -16233,6 +16593,30 @@ tests: TestSuite = {
 		(
 			"resolved global is retained under same-named parameter",
 			test_resolved_global_is_retained_under_same_named_parameter,
+		),
+		(
+			"unmanaged exact parameter collision excludes global owner",
+			test_unmanaged_exact_parameter_collision_excludes_global_owner,
+		),
+		(
+			"consumed exact parameter collision excludes global owner",
+			test_consumed_exact_parameter_collision_excludes_global_owner,
+		),
+		(
+			"repeated global references retain each transfer site once",
+			test_repeated_global_references_retain_each_transfer_site_once,
+		),
+		(
+			"global initializer excludes self and retains dependency",
+			test_global_initializer_excludes_self_and_retains_dependency,
+		),
+		(
+			"global initializer retains two exact dependencies",
+			test_global_initializer_retains_two_exact_dependencies,
+		),
+		(
+			"parameter phase precedes dense exact global catalog",
+			test_parameter_phase_precedes_dense_exact_global_catalog,
 		),
 		(
 			"alias contract correlates exact argument identity",

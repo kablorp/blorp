@@ -231,6 +231,39 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
     def test_borrowed_return_is_a_supported_body_shape(self) -> None:
         self.assertIn("borrowed_return", self.benchmark.BODY_SHAPES)
 
+    def test_referenced_global_boundary_is_a_supported_body_shape(self) -> None:
+        self.assertIn("referenced_global_boundary", self.benchmark.BODY_SHAPES)
+
+    def test_referenced_global_fixture_has_fixed_nodes_and_boundary_sites(self) -> None:
+        _, program = self.benchmark.fixture_request(
+            384,
+            2,
+            256,
+            8,
+            params_per_function=0,
+            body_shape="referenced_global_boundary",
+            invoke_workers=False,
+        )
+        worker = next(
+            declaration
+            for declaration in program["decls"]
+            if declaration.get("name") == "bench_worker_0000"
+        )
+
+        self.assertEqual(self.benchmark.expression_node_count(worker["body"]), 256)
+        self.assertEqual(worker["return_type"], self.benchmark.named_type("String"))
+        self.assertEqual(worker["params"], [])
+        self.assertEqual(
+            self.benchmark.referenced_global_boundary_census(worker["body"]),
+            {
+                "consuming_calls": 12,
+                "aggregate_transfers": 12,
+                "result_terminals": 8,
+                "reference_sites": 32,
+                "distinct_global_indices": 8,
+            },
+        )
+
     def test_borrowed_return_fixture_has_fixed_nodes_and_result_terminals(self) -> None:
         _, program = self.benchmark.fixture_request(
             1,
@@ -904,6 +937,138 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
             (1, 2, 256, "borrowed_return", False, "perceus-direct"),
             (8, 2, 256, "borrowed_return", False, "perceus-direct"),
             (32, 2, 256, "borrowed_return", False, "perceus-direct"),
+        ])
+
+    def test_referenced_global_matrix_rejects_owner_scaled_rewrite_work(self) -> None:
+        def point(
+            referenced_globals,
+            normalization_visits,
+            *,
+            fallback_requests=0,
+            rewrite_actions=64,
+            baseline_visits=None,
+        ):
+            return {
+                "globals": 384,
+                "functions": 2,
+                "global_reads_per_function": referenced_globals,
+                "comparison_kind": "compiler-worker",
+                "paired_window_elapsed_microseconds_ratio_median": 0.80,
+                "paired_window_allocations_ratio_median": 0.70,
+                "paired_window_releases_ratio_median": 1.0,
+                "work_counters": {
+                    "referenced_global_discovery_node_visits": 512,
+                    "referenced_global_read_candidates": 2 * referenced_globals,
+                    "referenced_global_exact_matches": 2 * referenced_globals,
+                    "borrowed_global_catalog_slots": 2 * referenced_globals,
+                    "borrowed_global_normalization_visits": normalization_visits,
+                    "borrowed_global_alias_fallback_requests": fallback_requests,
+                    "borrowed_global_rewrite_actions": rewrite_actions,
+                },
+                "baseline_work_counters": {
+                    "borrowed_global_normalization_visits": (
+                        baseline_visits
+                        if baseline_visits is not None
+                        else normalization_visits * referenced_globals
+                    ),
+                },
+            }
+
+        valid = [point(1, 600), point(8, 600), point(32, 600)]
+        self.benchmark.validate_referenced_global_matrix(valid)
+
+        scaled = [point(1, 600), point(8, 4800), point(32, 19200)]
+        with self.assertRaisesRegex(RuntimeError, "scales with referenced globals"):
+            self.benchmark.validate_referenced_global_matrix(scaled)
+
+        fallbacks = [
+            point(1, 600, fallback_requests=1),
+            point(8, 600, fallback_requests=1),
+            point(32, 600, fallback_requests=1),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "scalar alias fallback"):
+            self.benchmark.validate_referenced_global_matrix(fallbacks)
+
+        wrong_rewrites = [
+            point(1, 600, rewrite_actions=1),
+            point(8, 600, rewrite_actions=1),
+            point(32, 600, rewrite_actions=1),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "boundary sites"):
+            self.benchmark.validate_referenced_global_matrix(wrong_rewrites)
+
+        insufficient_reduction = [
+            point(1, 600, baseline_visits=600),
+            point(8, 600, baseline_visits=1200),
+            point(32, 600, baseline_visits=2000),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "at least 75%"):
+            self.benchmark.validate_referenced_global_matrix(insufficient_reduction)
+
+    def test_referenced_global_visit_counter_composes_operation_work(self) -> None:
+        operation_counters = {
+            "borrowed_call_node_visits": 10,
+            "borrowed_aggregate_node_visits": 20,
+            "borrowed_result_node_visits": 30,
+        }
+        baseline = self.benchmark.add_referenced_global_derived_counters({
+            **operation_counters,
+            "borrowed_global_normalization_visits": 0,
+        })
+        candidate = self.benchmark.add_referenced_global_derived_counters({
+            **operation_counters,
+            "borrowed_global_normalization_visits": 40,
+        })
+
+        self.assertEqual(baseline["borrowed_global_normalization_visits"], 60)
+        self.assertEqual(candidate["borrowed_global_normalization_visits"], 60)
+
+    def test_referenced_global_matrix_reuses_workers_and_varies_only_global_count(self) -> None:
+        args = argparse.Namespace(
+            bridge=None,
+            counter_bridge=None,
+            baseline_bridge="/tmp/perceus-baseline-worker",
+            baseline_counter_bridge="/tmp/perceus-baseline-counter-worker",
+            globals=384,
+            functions=2,
+            body_leaves=256,
+            global_reads_per_function=1,
+            params_per_function=0,
+            parameter_type="String",
+            body_shape="linear",
+            end_to_end=False,
+            work_counters=False,
+        )
+
+        with mock.patch.object(
+            self.benchmark,
+            "prepare_backend_worker",
+            return_value=Path("/tmp/perceus-worker"),
+        ) as prepare, mock.patch.object(
+            self.benchmark,
+            "run_benchmark",
+            return_value=0,
+        ) as run:
+            self.benchmark.run_referenced_global_matrix(args)
+
+        prepare.assert_called_once()
+        points = [
+            (
+                call.args[0].globals,
+                call.args[0].global_reads_per_function,
+                call.args[0].functions,
+                call.args[0].body_leaves,
+                call.args[0].params_per_function,
+                call.args[0].body_shape,
+                call.args[0].invoke_workers,
+                call.args[0].measurement_window,
+            )
+            for call in run.call_args_list
+        ]
+        self.assertEqual(points, [
+            (384, 1, 2, 256, 0, "referenced_global_boundary", False, "perceus-direct"),
+            (384, 8, 2, 256, 0, "referenced_global_boundary", False, "perceus-direct"),
+            (384, 32, 2, 256, 0, "referenced_global_boundary", False, "perceus-direct"),
         ])
 
     def test_parameter_matrix_ignores_single_fixture_shape_arguments(self) -> None:

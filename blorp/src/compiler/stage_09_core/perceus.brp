@@ -333,6 +333,34 @@ private @debug_only pure func perceus_work_borrowed_result_rewrite_actions() -> 
 	black_box_int(0)
 
 
+private @debug_only pure func perceus_work_referenced_global_discovery_node_visits() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func perceus_work_referenced_global_read_candidates() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func perceus_work_referenced_global_exact_matches() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func perceus_work_borrowed_global_catalog_slots() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func perceus_work_borrowed_global_normalization_visits() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func perceus_work_borrowed_global_alias_fallback_requests() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func perceus_work_borrowed_global_rewrite_actions() -> Int:
+	black_box_int(0)
+
+
 private @debug_only pure func perceus_work_borrowed_origin_member_visits() -> Int:
 	black_box_int(0)
 
@@ -409,6 +437,13 @@ pure func register_perceus_work_counters() -> Int:
 		perceus_work_borrowed_result_owner_candidate_visits()
 		perceus_work_borrowed_result_alias_fallback_requests()
 		perceus_work_borrowed_result_rewrite_actions()
+		perceus_work_referenced_global_discovery_node_visits()
+		perceus_work_referenced_global_read_candidates()
+		perceus_work_referenced_global_exact_matches()
+		perceus_work_borrowed_global_catalog_slots()
+		perceus_work_borrowed_global_normalization_visits()
+		perceus_work_borrowed_global_alias_fallback_requests()
+		perceus_work_borrowed_global_rewrite_actions()
 		perceus_work_borrowed_origin_member_visits()
 		perceus_work_borrowed_origin_storage_slots()
 		perceus_work_borrowed_aggregate_node_visits()
@@ -548,8 +583,25 @@ private record ContractParameterIndex {
 -- former owner-major rewrites retained, and that retain makes the result owned
 -- for every later owner. Keep stable dense IDs so this ordering is explicit
 -- without allocating an owner set at every syntax node.
+private enum BorrowedOwnerOriginKind:
+	FunctionParameterOwnerOrigin
+	ReferencedGlobalOwnerOrigin
+
+
+private struct BorrowedOwnerOrigin {
+	kind: BorrowedOwnerOriginKind,
+	index: Int
+}
+
+
+private record BorrowedOwnerEntry {
+	value: CoreParam,
+	origin: BorrowedOwnerOrigin
+}
+
+
 private record BorrowedOwnerCatalog {
-	owners: List[CoreParam],
+	entries: List[BorrowedOwnerEntry],
 	candidate_ids_by_name: Dict[String, List[Int]],
 	has_unresolved_identity: Bool
 }
@@ -19878,7 +19930,7 @@ private pure func build_borrowed_owner_catalog(
 	params: List[CoreParam],
 	consumed_params: List[Int],
 ) -> BorrowedOwnerCatalog:
-	var owners: List[CoreParam] = []
+	var entries: List[BorrowedOwnerEntry] = []
 	var candidate_ids_by_name: Dict[String, List[Int]] = {}
 	var consumed_indices: Dict[Int, Bool] = {}
 	var has_unresolved_identity: Bool = False
@@ -19889,12 +19941,18 @@ private pure func build_borrowed_owner_catalog(
 
 	for param in params:
 		if is_managed_type(env, param.typ) and not consumed_indices.get_or(parameter_index, False):
-			owner_id: Int = owners.length()
+			owner_id: Int = entries.length()
 
 			debug:
 				perceus_work_borrowed_call_owner_catalog_slots()
 
-			owners = owners.append(param)
+			entries = entries.append({
+				value = param,
+				origin = {
+					kind = FunctionParameterOwnerOrigin,
+					index = parameter_index
+				},
+			})
 
 			if param.name.def_id == None:
 				has_unresolved_identity = True
@@ -19913,10 +19971,48 @@ private pure func build_borrowed_owner_catalog(
 		parameter_index += 1
 
 	{
-		owners = owners,
+		entries = entries,
 		candidate_ids_by_name = candidate_ids_by_name,
 		has_unresolved_identity = has_unresolved_identity
 	}
+
+
+private pure func borrowed_owner_catalog_is_global(owners: BorrowedOwnerCatalog) -> Bool:
+	match owners.entries.get(0):
+		Some(entry):
+			entry.origin.kind == ReferencedGlobalOwnerOrigin
+		None:
+			False
+
+
+private pure func record_borrowed_global_normalization_visit(owners: BorrowedOwnerCatalog) -> Int:
+	debug:
+		if borrowed_owner_catalog_is_global(owners):
+			perceus_work_borrowed_global_normalization_visits()
+		else:
+			0
+
+	0
+
+
+private pure func record_borrowed_global_alias_fallback(owners: BorrowedOwnerCatalog) -> Int:
+	debug:
+		if borrowed_owner_catalog_is_global(owners):
+			perceus_work_borrowed_global_alias_fallback_requests()
+		else:
+			0
+
+	0
+
+
+private pure func record_borrowed_global_rewrite(owners: BorrowedOwnerCatalog) -> Int:
+	debug:
+		if borrowed_owner_catalog_is_global(owners):
+			perceus_work_borrowed_global_rewrite_actions()
+		else:
+			0
+
+	0
 
 
 private pure func borrowed_owner_is_active(
@@ -19931,7 +20027,11 @@ private pure func borrowed_owner_param(
 	owner_id: Int,
 ) -> Option[CoreParam]:
 	if borrowed_owner_is_active(context, owner_id):
-		context.owners.owners.get(owner_id)
+		match context.owners.entries.get(owner_id):
+			Some(entry):
+				Some(entry.value)
+			None:
+				None
 	else:
 		None
 
@@ -19943,9 +20043,9 @@ private pure func borrowed_context_shadowing_var(
 	var shadowed: Dict[Int, Bool] = context.shadowed_owner_ids
 
 	for owner_id in context.owners.candidate_ids_by_name.get_or(variable.name, []):
-		match context.owners.owners.get(owner_id):
-			Some(owner):
-				if core_var_matches_param(variable, owner):
+		match context.owners.entries.get(owner_id):
+			Some(entry):
+				if core_var_matches_param(variable, entry.value):
 					shadowed = shadowed.set(owner_id, True)
 				else:
 					void
@@ -20018,6 +20118,8 @@ private pure func first_borrowed_owner_legacy(
 	expr: CoreExpr,
 ) -> Option[Int]:
 	debug:
+		record_borrowed_global_alias_fallback(context.owners)
+
 		match context.query_kind:
 			BorrowedCallOwnerQuery:
 				perceus_work_borrowed_call_alias_fallback_requests()
@@ -20029,7 +20131,7 @@ private pure func first_borrowed_owner_legacy(
 	var found: Option[Int] = None
 	var owner_id: Int = 0
 
-	for owner in context.owners.owners:
+	for entry in context.owners.entries:
 		if borrowed_owner_is_active(context, owner_id):
 			debug:
 				match context.query_kind:
@@ -20042,7 +20144,7 @@ private pure func first_borrowed_owner_legacy(
 
 				perceus_work_borrowed_origin_member_visits()
 
-			if borrow_expr_aliases_param(context.env, owner, expr):
+			if borrow_expr_aliases_param(context.env, entry.value, expr):
 				found = Some(owner_id)
 				break
 			else:
@@ -20166,7 +20268,11 @@ private pure func borrowed_result_owner_param(
 	owner_id: Int,
 ) -> Option[CoreParam]:
 	if borrowed_result_owner_is_active(context, owner_id):
-		context.base.owners.owners.get(owner_id)
+		match context.base.owners.entries.get(owner_id):
+			Some(entry):
+				Some(entry.value)
+			None:
+				None
 	else:
 		None
 
@@ -20202,9 +20308,9 @@ private pure func borrowed_result_context_satisfying_var(
 		var satisfied: Dict[Int, Bool] = context.result_satisfied_owner_ids
 
 		for owner_id in candidate_ids:
-			match context.base.owners.owners.get(owner_id):
-				Some(owner):
-					if core_var_matches_param(variable, owner):
+			match context.base.owners.entries.get(owner_id):
+				Some(entry):
+					if core_var_matches_param(variable, entry.value):
 						satisfied = satisfied.set(owner_id, True)
 					else:
 						void
@@ -20247,17 +20353,18 @@ private pure func first_borrowed_result_owner_legacy(
 ) -> Option[Int]:
 	debug:
 		perceus_work_borrowed_result_alias_fallback_requests()
+		record_borrowed_global_alias_fallback(context.base.owners)
 
 	var found: Option[Int] = None
 	var owner_id: Int = 0
 
-	for owner in context.base.owners.owners:
+	for entry in context.base.owners.entries:
 		if borrowed_result_owner_is_active(context, owner_id):
 			debug:
 				perceus_work_borrowed_result_owner_candidate_visits()
 				perceus_work_borrowed_origin_member_visits()
 
-			if borrow_expr_aliases_param(context.base.env, owner, expr):
+			if borrow_expr_aliases_param(context.base.env, entry.value, expr):
 				found = Some(owner_id)
 				break
 			else:
@@ -20299,6 +20406,7 @@ private pure func retain_borrowed_result_terminal_for_owners(
 				Some(owner):
 					debug:
 						perceus_work_borrowed_result_rewrite_actions()
+						record_borrowed_global_rewrite(context.base.owners)
 
 					match expr:
 						VarExpr(variable, typ, loc):
@@ -20458,6 +20566,7 @@ private pure func retain_borrowed_results_for_owners(
 ) -> CoreExpr:
 	debug:
 		perceus_work_borrowed_result_node_visits()
+		record_borrowed_global_normalization_visit(context.base.owners)
 
 	match expr:
 		VarExpr(_, typ, _) | FieldExpr(_, _, typ, _) | TupleFieldExpr(_, _, typ, _) | CallExpr(_, _, _, typ, _) | CastExpr(_, typ, _) | UnboxExpr(_, _, typ, _):
@@ -20570,13 +20679,13 @@ private pure func retain_borrowed_results_for_owners(
 			expr
 
 
-private pure func retain_borrowed_function_results(
+private pure func retain_borrowed_results_for_owner_catalog(
 	env: PerceusEnv,
 	owners: BorrowedOwnerCatalog,
 	return_type: CoreType,
 	body: CoreExpr,
 ) -> CoreExpr:
-	if owners.owners.is_empty() or not is_managed_type(env, return_type):
+	if owners.entries.is_empty() or not is_managed_type(env, return_type):
 		body
 	else:
 		retain_borrowed_results_for_owners(
@@ -20615,6 +20724,7 @@ private pure func protect_borrowed_call_args_for_owners(
 										Some(owner):
 											debug:
 												perceus_work_borrowed_call_rewrite_actions()
+												record_borrowed_global_rewrite(context.owners)
 
 											temp: CoreVar = synthetic_binding_var(
 												"borrowed_result_${owner.name.name}_call_arg",
@@ -20657,6 +20767,7 @@ private pure func protect_borrowed_equality_arg_for_owners(
 				Some(owner):
 					debug:
 						perceus_work_borrowed_call_rewrite_actions()
+						record_borrowed_global_rewrite(context.owners)
 
 					temp: CoreVar = synthetic_binding_var(
 						"borrowed_result_${owner.name.name}_equality_arg",
@@ -21427,13 +21538,14 @@ private pure func protect_borrowed_calls_legacy_active(
 ) -> CoreExpr:
 	debug:
 		perceus_work_borrowed_call_alias_fallback_requests()
+		record_borrowed_global_alias_fallback(context.owners)
 
 	var result: CoreExpr = expr
 	var owner_id: Int = 0
 
-	for owner in context.owners.owners:
+	for entry in context.owners.entries:
 		if borrowed_owner_is_active(context, owner_id):
-			result = protect_borrowed_param_calls(context.env, owner, result)
+			result = protect_borrowed_param_calls(context.env, entry.value, result)
 		else:
 			void
 
@@ -21595,6 +21707,7 @@ private pure func protect_borrowed_calls(
 ) -> CoreExpr:
 	debug:
 		perceus_work_borrowed_call_node_visits()
+		record_borrowed_global_normalization_visit(context.owners)
 
 	match expr:
 		CallExpr(kind, callee, args, typ, loc):
@@ -21856,12 +21969,12 @@ private pure func protect_borrowed_calls(
 			expr
 
 
-private pure func protect_borrowed_param_calls_for_function(
+private pure func protect_borrowed_calls_for_owner_catalog(
 	env: PerceusEnv,
 	owners: BorrowedOwnerCatalog,
 	body: CoreExpr,
 ) -> CoreExpr:
-	if owners.owners.is_empty():
+	if owners.entries.is_empty():
 		body
 	else:
 		protect_borrowed_calls(
@@ -21888,6 +22001,7 @@ private pure func retain_borrowed_aggregate_transfer_value_for_owners(
 					Some(_):
 						debug:
 							perceus_work_borrowed_aggregate_rewrite_actions()
+							record_borrowed_global_rewrite(context.owners)
 
 						DupExpr(
 							variable,
@@ -21911,6 +22025,7 @@ private pure func retain_borrowed_aggregate_transfer_value_for_owners(
 							Some(owner):
 								debug:
 									perceus_work_borrowed_aggregate_rewrite_actions()
+									record_borrowed_global_rewrite(context.owners)
 
 								retain_borrowed_alias_result(owner, nested_safe_value)
 							None:
@@ -22163,6 +22278,7 @@ private pure func retain_borrowed_aggregate_transfers(
 ) -> CoreExpr:
 	debug:
 		perceus_work_borrowed_aggregate_node_visits()
+		record_borrowed_global_normalization_visit(context.owners)
 
 	match expr:
 		CallExpr(kind, callee, args, typ, loc):
@@ -22828,12 +22944,12 @@ private pure func retain_borrowed_param_aggregate_members(
 			expr
 
 
-private pure func retain_borrowed_param_aggregates(
+private pure func retain_borrowed_aggregates_for_owner_catalog(
 	env: PerceusEnv,
 	owners: BorrowedOwnerCatalog,
 	body: CoreExpr,
 ) -> CoreExpr:
-	if owners.owners.is_empty():
+	if owners.entries.is_empty():
 		body
 	else:
 		retain_borrowed_aggregate_transfers(
@@ -22847,26 +22963,36 @@ private pure func retain_borrowed_param_aggregates(
 		)
 
 
-private pure func retain_borrowed_values(
+private pure func retain_borrowed_scalar_value(
+	env: PerceusEnv,
+	value: CoreParam,
+	return_type: CoreType,
+	body: CoreExpr,
+) -> CoreExpr:
+	if is_managed_type(env, value.typ):
+		call_body: CoreExpr = protect_borrowed_param_calls(env, value, body)
+		aggregate_body: CoreExpr = retain_borrowed_param_aggregate_members(env, value, call_body)
+
+		if is_managed_type(env, return_type):
+			retain_borrowed_param_result(env, value, aggregate_body)
+		else:
+			aggregate_body
+	else:
+		body
+
+
+-- Nested lambdas retain the scalar path until Issue 50 gives each lambda
+-- region its own explicit owner catalog and discovery boundary.
+private pure func retain_borrowed_lambda_values(
 	env: PerceusEnv,
 	borrowed_values: List[CoreParam],
 	return_type: CoreType,
 	body: CoreExpr,
 ) -> CoreExpr:
-	managed_result: Bool = is_managed_type(env, return_type)
 	var result: CoreExpr = body
 
 	for value in borrowed_values:
-		if is_managed_type(env, value.typ):
-			result = protect_borrowed_param_calls(env, value, result)
-			result = retain_borrowed_param_aggregate_members(env, value, result)
-
-			if managed_result:
-				result = retain_borrowed_param_result(env, value, result)
-			else:
-				void
-		else:
-			void
+		result = retain_borrowed_scalar_value(env, value, return_type, result)
 
 	result
 
@@ -22890,6 +23016,19 @@ private pure func exact_global_value(env: PerceusEnv, variable: CoreVar) -> Opti
 	env.global_values.get(global_index)
 
 
+-- Debug workers count the discovery authority's complete expression walk
+-- without adding work to production timing builds.
+private @debug_only pure func record_referenced_global_discovery_nodes(expr: CoreExpr) -> Int:
+	debug:
+		perceus_work_referenced_global_discovery_node_visits()
+
+	for child in CoreTraverse.immediate_core_expr_children(expr):
+		debug:
+			record_referenced_global_discovery_nodes(child)
+
+	0
+
+
 private pure func global_candidate_indices(
 	env: PerceusEnv,
 	value_reads: List[CoreVar],
@@ -22897,8 +23036,14 @@ private pure func global_candidate_indices(
 	var result: List[Int] = []
 
 	for value_read in value_reads:
+		debug:
+			perceus_work_referenced_global_read_candidates()
+
 		match exact_global_index(env, value_read):
 			Some(global_index):
+				debug:
+					perceus_work_referenced_global_exact_matches()
+
 				if not result.contains(global_index):
 					result = result.append(global_index)
 				else:
@@ -22914,6 +23059,9 @@ private pure func unshadowed_global_values(
 	shadowing_values: List[CoreParam],
 	body: CoreExpr,
 ) -> List[CoreParam]:
+	debug:
+		record_referenced_global_discovery_nodes(body)
+
 	value_reads: List[CoreVar] = CoreDce.value_references(body).resolved_reads
 	var result: List[CoreParam] = []
 
@@ -22930,6 +23078,97 @@ private pure func unshadowed_global_values(
 				void
 
 	result
+
+
+-- Preserve the established DCE read authority and ascending global-index
+-- order. Return the empty list directly for the overwhelmingly common case of
+-- a global initializer with no referenced managed global; callers construct a
+-- catalog only when there is actual normalization work.
+private pure func referenced_global_owner_entries(
+	env: PerceusEnv,
+	shadowing_values: List[CoreParam],
+	body: CoreExpr,
+) -> List[BorrowedOwnerEntry]:
+	debug:
+		record_referenced_global_discovery_nodes(body)
+
+	value_reads: List[CoreVar] = CoreDce.value_references(body).resolved_reads
+	var entries: List[BorrowedOwnerEntry] = []
+
+	for global_index in global_candidate_indices(env, value_reads):
+		match env.global_values.get(global_index):
+			Some(global):
+				is_shadowed: Bool = shadowing_values.any(
+					func(param): core_vars_have_same_definition(param.name, global.value.name),
+				)
+
+				if not is_shadowed and is_managed_type(env, global.value.typ):
+					debug:
+						perceus_work_borrowed_global_catalog_slots()
+
+					entries = entries.append({
+						value = global.value,
+						origin = {
+							kind = ReferencedGlobalOwnerOrigin,
+							index = global_index
+						},
+					})
+				else:
+					void
+			None:
+				void
+
+	entries
+
+
+private pure func build_referenced_global_owner_catalog(
+	entries: List[BorrowedOwnerEntry],
+) -> BorrowedOwnerCatalog:
+	var candidate_ids_by_name: Dict[String, List[Int]] = {}
+	var owner_id: Int = 0
+
+	for entry in entries:
+		candidate_ids_by_name = candidate_ids_by_name.set(
+			entry.value.name.name,
+			candidate_ids_by_name
+				.get_or(entry.value.name.name, [])
+				.append(owner_id),
+		)
+		owner_id += 1
+
+	{
+		entries = entries,
+		candidate_ids_by_name = candidate_ids_by_name,
+		has_unresolved_identity = False
+	}
+
+
+private pure func normalize_borrowed_owner_catalog(
+	env: PerceusEnv,
+	owners: BorrowedOwnerCatalog,
+	return_type: CoreType,
+	body: CoreExpr,
+) -> CoreExpr:
+	call_body: CoreExpr = protect_borrowed_calls_for_owner_catalog(env, owners, body)
+	aggregate_body: CoreExpr = retain_borrowed_aggregates_for_owner_catalog(env, owners, call_body)
+	retain_borrowed_results_for_owner_catalog(env, owners, return_type, aggregate_body)
+
+
+private pure func normalize_referenced_global_entries(
+	env: PerceusEnv,
+	entries: List[BorrowedOwnerEntry],
+	return_type: CoreType,
+	body: CoreExpr,
+) -> CoreExpr:
+	if entries.is_empty():
+		body
+	else:
+		normalize_borrowed_owner_catalog(
+			env,
+			build_referenced_global_owner_catalog(entries),
+			return_type,
+			body,
+		)
 
 
 private pure func mutable_managed_global_for_target(
@@ -22956,7 +23195,12 @@ private pure func normalize_lambda_body_ownership(
 	managed_result: Bool = is_managed_type(lambda_env, return_type)
 	global_values: List[CoreParam] = unshadowed_global_values(lambda_env, borrowed_values, body)
 	all_borrowed_values: List[CoreParam] = borrowed_values.concat(global_values)
-	result: CoreExpr = retain_borrowed_values(lambda_env, all_borrowed_values, return_type, body)
+	result: CoreExpr = retain_borrowed_lambda_values(
+		lambda_env,
+		all_borrowed_values,
+		return_type,
+		body,
+	)
 
 	if managed_result:
 		normalize_owned_result_aliases(lambda_env, result)
@@ -23423,26 +23667,20 @@ private pure func rewrite_function(env: PerceusEnv, func_info: CoreFunction) -> 
 				params,
 				consumed_params,
 			)
-			call_body: CoreExpr = protect_borrowed_param_calls_for_function(
-				env,
-				borrowed_owners,
-				contract_body,
-			)
-			aggregate_body: CoreExpr = retain_borrowed_param_aggregates(
-				env,
-				borrowed_owners,
-				call_body,
-			)
-			retained_body: CoreExpr = retain_borrowed_function_results(
+			retained_body: CoreExpr = normalize_borrowed_owner_catalog(
 				env,
 				borrowed_owners,
 				return_type,
-				aggregate_body,
+				contract_body,
 			)
-			global_values: List[CoreParam] = unshadowed_global_values(env, params, retained_body)
-			global_safe_body: CoreExpr = retain_borrowed_values(
+			global_entries: List[BorrowedOwnerEntry] = referenced_global_owner_entries(
 				env,
-				global_values,
+				params,
+				retained_body,
+			)
+			global_safe_body: CoreExpr = normalize_referenced_global_entries(
+				env,
+				global_entries,
 				return_type,
 				retained_body,
 			)
@@ -23505,8 +23743,17 @@ private pure func rewrite_global(env: PerceusEnv, global: CoreGlobal) -> CoreGlo
 		typ = typ,
 		loc = loc
 	}
-	global_values: List[CoreParam] = unshadowed_global_values(env, [global_value], contract_init)
-	owned_init: CoreExpr = retain_borrowed_values(env, global_values, typ, contract_init)
+	global_entries: List[BorrowedOwnerEntry] = referenced_global_owner_entries(
+		env,
+		[global_value],
+		contract_init,
+	)
+	owned_init: CoreExpr = normalize_referenced_global_entries(
+		env,
+		global_entries,
+		typ,
+		contract_init,
+	)
 	rewritten_init: CoreExpr = insert_drops_expr(env, owned_init)
 
 	{
