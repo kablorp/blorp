@@ -116,6 +116,7 @@ import:
 		ImportedNameBinding,
 		ModuleView,
 		module_view_accepted_alias_authority,
+		module_view_accepted_callable_authority,
 		module_view_accepted_global_authority,
 		module_view_accepted_record_authority,
 		module_view_accepted_union_authority,
@@ -143,6 +144,11 @@ import:
 		accepted_alias_find_transparent,
 		accepted_alias_resolve,
 		accepted_alias_resolve_head,
+	type_system/accepted_callable_authority:
+		accepted_callable_find,
+		accepted_callable_find_qualified,
+		accepted_callable_lookup_qualified_ufcs,
+		accepted_callable_lookup_ufcs,
 	type_system/accepted_global_authority:
 		AcceptedGlobalBinding,
 		accepted_global_find,
@@ -246,9 +252,7 @@ import:
 		env_get_constructors,
 		env_get_func_info,
 		env_get_function_trait,
-		env_get_module_func_symbol,
 		env_get_opaque_alias,
-		env_get_overloads,
 		env_get_record,
 		env_get_trait,
 		env_get_type_decl,
@@ -262,14 +266,13 @@ import:
 		env_lookup,
 		env_lookup_in_current_scope,
 		env_lookup_is_outermost_scope,
+		env_lookup_module_ufcs_methods,
 		env_lookup_ufcs_methods,
 		env_lookup_with_scope_depth,
 		env_pop_scope,
 		env_push_scope,
 		env_resolve_alias,
 		env_resolve_alias_head,
-		env_resolve_module_ufcs_method,
-		env_resolve_overload,
 		env_resolve_trait_obligation,
 		env_scoped_resource_unavailable_owner,
 		env_select_overload_for_args,
@@ -417,8 +420,6 @@ record ResolvedCallInfo {
 	source_name: String,
 	purity: Purity,
 	target: ResolvedCallTarget,
-	-- These belong to the selected candidate. Retaining them here prevents
-	-- later call checks from rediscovering that candidate through Env scans.
 	bound_type_params: List[BoundTypeParam],
 	debug_only: Bool,
 	instantiated_params: List[SemanticType],
@@ -1172,8 +1173,12 @@ private pure func resolved_call_from_trait_method_callee(
 			callee.trait_name,
 			impl_method.and_then(func(method): method.target),
 		),
-		bound_type_params = impl_method.map(func(method): method.type_params).get_or([]),
-		debug_only = impl_method.map(func(method): method.debug_only).get_or(False),
+		bound_type_params = impl_method
+			.map(func(method): method.type_params)
+			.get_or([]),
+		debug_only = impl_method
+			.map(func(method): method.debug_only)
+			.get_or(False),
 		instantiated_params = callee.method.params,
 		instantiated_return = callee.method.return_type,
 		resource_args = RejectResourceArgs,
@@ -6543,31 +6548,19 @@ private pure func symbol_from_imported_binding(
 	module_path = binding.module_path
 	original_name = binding.original_name
 
-	match env_get_module_func_symbol(context.state.env, module_path, original_name):
-		Some(func_symbol):
-			Some({
-				name = local_name,
-				kind = FuncSymbolKind(func_symbol),
-			})
+	match module_view_accepted_union_authority(context.state.facts.module_view):
+		Some(_):
+			None
 		None:
-			match module_view_accepted_union_authority(context.state.facts.module_view):
-				Some(_):
-					None
+			match find_module_constructor(context, context.state.env, module_path, original_name):
+				Some(ctor):
+					legacy_symbol: Symbol = {
+						name = local_name,
+						kind = ConstructorSymbolKind(ctor)
+					}
+					Some(legacy_symbol)
 				None:
-					match find_module_constructor(
-						context,
-						context.state.env,
-						module_path,
-						original_name,
-					):
-						Some(ctor):
-							legacy_symbol: Symbol = {
-								name = local_name,
-								kind = ConstructorSymbolKind(ctor)
-							}
-							Some(legacy_symbol)
-						None:
-							None
+					None
 
 
 private pure func trait_method_callee_from_trait(
@@ -6666,6 +6659,7 @@ private pure func imported_receiver_trait_method_callee(
 
 private union BareValueLookup:
 	BareEnvSymbol(Symbol)
+	BareAcceptedCallable(OverloadEntry)
 	BareAcceptedGlobal(AcceptedGlobalBinding)
 
 
@@ -6676,6 +6670,17 @@ private pure func infer_session_accepted_global(
 	match module_view_accepted_global_authority(session.facts.module_view):
 		Some(authority):
 			accepted_global_find(authority, name)
+		None:
+			None
+
+
+private pure func infer_session_accepted_callable(
+	session: InferSession,
+	name: String,
+) -> Option[OverloadEntry]:
+	match module_view_accepted_callable_authority(session.facts.module_view):
+		Some(authority):
+			accepted_callable_find(authority, name)
 		None:
 			None
 
@@ -6733,34 +6738,41 @@ private pure func lookup_bare_value(
 		Some(symbol):
 			Some(BareEnvSymbol(symbol))
 		None:
-			match explicit_import:
-				Some(symbol):
-					Some(BareEnvSymbol(symbol))
+			match infer_session_accepted_callable(context.state, name.text):
+				Some(entry):
+					Some(BareAcceptedCallable(entry))
 				None:
-					global_fallback = infer_session_accepted_global(context.state, name.text)
-
-					match global_fallback:
-						Some(binding):
-							Some(BareAcceptedGlobal(binding))
+					match explicit_import:
+						Some(symbol):
+							Some(BareEnvSymbol(symbol))
 						None:
-							constructor_fallback = find_accepted_bare_constructor_symbol(
-								context,
+							global_fallback = infer_session_accepted_global(
+								context.state,
 								name.text,
 							)
 
-							match constructor_fallback:
-								Some(symbol):
-									Some(BareEnvSymbol(symbol))
+							match global_fallback:
+								Some(binding):
+									Some(BareAcceptedGlobal(binding))
 								None:
-									match visible_fallback:
+									constructor_fallback = find_accepted_bare_constructor_symbol(
+										context,
+										name.text,
+									)
+
+									match constructor_fallback:
 										Some(symbol):
 											Some(BareEnvSymbol(symbol))
 										None:
-											match builtin_fallback:
+											match visible_fallback:
 												Some(symbol):
 													Some(BareEnvSymbol(symbol))
 												None:
-													None
+													match builtin_fallback:
+														Some(symbol):
+															Some(BareEnvSymbol(symbol))
+														None:
+															None
 
 
 private pure func source_name_for_imported_module_path(
@@ -6852,8 +6864,27 @@ private pure func builtin_ufcs_prefers_trait_dispatch(
 
 private pure func infer_name_expr(context: InferContext, name: ParsedIdentifier) -> InferResult:
 	match lookup_bare_value(context, name):
+		Some(BareAcceptedCallable(entry)):
+			next_context = check_debug_only_reference(context, name.text, entry.debug_only)
+			source_name = source_name_for_imported_module_path(
+				context,
+				name.text,
+				entry.module_path,
+			)
+			expr = TypedNameExpr(
+				name,
+				typed_expr_info_from_slot(
+					None,
+					InferredOrigin,
+					UNREFINED_BINDING,
+					Some(resolved_call_from_overload_entry(name.text, source_name, entry)),
+					infer_expected_slot(next_context, entry.func_type),
+				),
+			)
+			infer_result(next_context, expr)
 		Some(BareAcceptedGlobal(binding)):
 			binding_type = resolve_type_metas(context.state.context, binding.binding_type)
+
 			value_slot = match binding_type:
 				SemanticRangeType(_):
 					match infer_context_expected_type(context):
@@ -6864,13 +6895,18 @@ private pure func infer_name_expr(context: InferContext, name: ParsedIdentifier)
 				_:
 					infer_expected_slot(context, binding_type)
 
-			expr = TypedNameExpr(name, { typed_expr_info_from_slot(
+			expr = TypedNameExpr(
+				name,
+				{ typed_expr_info_from_slot(
 					binding.source_type,
 					InferredOrigin,
 					UNREFINED_BINDING,
 					None,
 					value_slot,
-				) | resolved_definition_id = binding.definition_id })
+				) |
+					resolved_definition_id = binding.definition_id
+				},
+			)
 			infer_result(context, expr)
 		Some(BareEnvSymbol(symbol)):
 			match symbol.kind:
@@ -8378,6 +8414,18 @@ private pure func typed_qualified_module_constructor_expr(
 	)
 
 
+private pure func find_accepted_qualified_callable(
+	context: InferContext,
+	module_path: String,
+	name: String,
+) -> Option[OverloadEntry]:
+	match module_view_accepted_callable_authority(context.state.facts.module_view):
+		Some(authority):
+			accepted_callable_find_qualified(authority, module_path, name)
+		None:
+			None
+
+
 private pure func infer_qualified_module_callee(
 	context: InferContext,
 	callee: ParsedExpr,
@@ -8391,22 +8439,22 @@ private pure func infer_qualified_module_callee(
 						module_ident.text,
 					):
 						Some(module_path):
-							match env_get_module_func_symbol(
-								context.state.env,
+							match find_accepted_qualified_callable(
+								context,
 								module_path,
 								field.text,
 							):
-								Some(func_symbol):
+								Some(entry):
 									typed = typed_qualified_module_field_expr(
 										module_ident,
 										field,
 										span,
-										func_symbol.func_type,
+										entry.func_type,
 										Some(
-											resolved_call_from_func_symbol_with_source(
+											resolved_call_from_overload_entry(
 												field.text,
 												field.text,
-												func_symbol,
+												entry,
 											),
 										),
 									)
@@ -8448,23 +8496,23 @@ private pure func infer_qualified_module_field_expr(
 		ParsedNameExpr(module_ident):
 			match module_view_find_module_alias(context.state.facts.module_view, module_ident.text):
 				Some(module_path):
-					match env_get_module_func_symbol(context.state.env, module_path, field.text):
-						Some(func_symbol):
+					match find_accepted_qualified_callable(context, module_path, field.text):
+						Some(entry):
 							next_context = check_debug_only_reference(
 								context,
 								field.text,
-								func_symbol.debug_only,
+								entry.debug_only,
 							)
 							typed = typed_qualified_module_field_expr(
 								module_ident,
 								field,
 								span,
-								func_symbol.func_type,
+								entry.func_type,
 								Some(
-									resolved_call_from_func_symbol_with_source(
+									resolved_call_from_overload_entry(
 										field.text,
 										field.text,
-										func_symbol,
+										entry,
 									),
 								),
 							)
@@ -8542,8 +8590,8 @@ private pure func missing_qualified_module_call_result(
 					):
 						Some(module_path):
 							if (
-								env_get_module_func_symbol(
-									context.state.env,
+								find_accepted_qualified_callable(
+									context,
 									module_path,
 									field.text,
 								).is_some()
@@ -8579,22 +8627,6 @@ private pure func missing_qualified_module_call_result(
 				_:
 					None
 		_:
-			None
-
-
-private pure func bare_overload_first_arg_type(
-	context: InferContext,
-	args: List[ParsedExpr],
-) -> Option[SemanticType]:
-	match args.get(0):
-		Some(first_arg):
-			first_arg_result = infer_expr(infer_without_expected(context), first_arg)
-
-			if first_arg_result.context.state.errors.length() == context.state.errors.length():
-				Some(typed_expr_value_type(first_arg_result.expr))
-			else:
-				None
-		None:
 			None
 
 
@@ -8639,119 +8671,6 @@ private pure func overload_argument_type(parsed: ParsedExpr, typed: TypedExpr) -
 			value_type
 
 
-private pure func bare_overload_callee_result(
-	context: InferContext,
-	name: ParsedIdentifier,
-	entry: OverloadEntry,
-) -> InferResult:
-	source_name = source_name_for_imported_module_path(context, name.text, entry.module_path)
-	typed = TypedNameExpr(
-		name,
-		typed_expr_info_from_slot(
-			None,
-			InferredOrigin,
-			UNREFINED_BINDING,
-			Some(resolved_call_from_overload_entry(name.text, source_name, entry)),
-			KeptValueSlot(entry.func_type),
-		),
-	)
-	infer_result(context, typed)
-
-
-private pure func infer_bare_overload_callee(
-	context: InferContext,
-	callee: ParsedExpr,
-	args: List[ParsedExpr],
-) -> Option[InferResult]:
-	match callee:
-		ParsedNameExpr(name):
-			match lookup_bare_value(context, name):
-				Some(_):
-					None
-				None:
-					overloads = env_get_overloads(context.state.env, name.text)
-
-					if overloads.length() == 0:
-						None
-					else:
-						match bare_overload_arg_types(context, args):
-							Some(arg_types):
-								match env_select_overload_for_args(overloads, arg_types):
-									Some(entry):
-										Some(bare_overload_callee_result(context, name, entry))
-									None:
-										match arg_types.get(0):
-											Some(first_arg_type):
-												match env_resolve_overload(
-													context.state.env,
-													name.text,
-													first_arg_type,
-												):
-													Some(entry):
-														Some(
-															bare_overload_callee_result(
-																context,
-																name,
-																entry,
-															),
-														)
-													None:
-														None
-											None:
-												None
-							None:
-								None
-		_:
-			None
-
-
-private pure func missing_bare_overload_call_result(
-	context: InferContext,
-	callee: ParsedExpr,
-	args: List[ParsedExpr],
-	span: SourceSpan,
-) -> Option[InferResult]:
-	match callee:
-		ParsedNameExpr(name):
-			match lookup_bare_value(context, name):
-				Some(_):
-					None
-				None:
-					if env_get_overloads(context.state.env, name.text).length() == 0:
-						None
-					else:
-						match bare_overload_first_arg_type(context, args):
-							Some(first_arg_type):
-								if env_resolve_overload(
-									context.state.env,
-									name.text,
-									first_arg_type,
-								).is_some():
-									None
-								else:
-									next = infer_error(
-										context,
-										"No overload `" + name.text + "` matches first argument type " + type_to_string(
-											first_arg_type,
-										),
-									)
-									typed_callee = TypedNameExpr(
-										name,
-										inferred_info(next, TYPE_VOID),
-									)
-									typed = TypedCallExpr(
-										typed_callee,
-										[],
-										span,
-										inferred_call_info(next, TYPE_VOID, None),
-									)
-									Some(infer_result(next, typed))
-							None:
-								None
-		_:
-			None
-
-
 private pure func bare_callee_is_constructor(context: InferContext, name: ParsedIdentifier) -> Bool:
 	match lookup_bare_value(context, name):
 		Some(BareEnvSymbol(symbol)):
@@ -8760,7 +8679,7 @@ private pure func bare_callee_is_constructor(context: InferContext, name: Parsed
 					True
 				_:
 					False
-		Some(BareAcceptedGlobal(_)) | None:
+		Some(BareAcceptedCallable(_)) | Some(BareAcceptedGlobal(_)) | None:
 			False
 
 
@@ -8828,26 +8747,7 @@ private pure func declared_callee_bound_type_params(
 				None:
 					[]
 		TypedFieldAccessExpr(receiver, field, _, _):
-			match receiver:
-				TypedNameExpr(module_ident, _):
-					match module_view_find_module_alias(
-						context.state.facts.module_view,
-						module_ident.text,
-					):
-						Some(module_path):
-							match env_get_module_func_symbol(
-								context.state.env,
-								module_path,
-								field.text,
-							):
-								Some(func_symbol):
-									func_symbol.type_params
-								None:
-									[]
-						None:
-							[]
-				_:
-					[]
+			[]
 		_:
 			[]
 
@@ -9930,13 +9830,19 @@ private pure func retry_ufcs_call_candidates(
 	span: SourceSpan,
 ) -> Option[InferResult]:
 	receiver_type = typed_expr_value_type(receiver_result.expr)
-	candidates = env_lookup_ufcs_methods(
-		context.state.env,
-		method.text,
-		receiver_type,
-	).filter(
-		func(entry): entry.module_path == selected.module_path,
-	)
+
+	graph_candidates = match module_view_accepted_callable_authority(
+		context.state.facts.module_view,
+	):
+		Some(authority):
+			accepted_callable_lookup_ufcs(authority, method.text, receiver_type)
+		None:
+			empty: List[OverloadEntry] = []
+			empty
+
+	candidates = env_lookup_ufcs_methods(context.state.env, method.text, receiver_type)
+		.concat(graph_candidates)
+		.filter(func(entry): entry.module_path == selected.module_path)
 	var successful: List[OverloadEntry] = []
 
 	-- An unannotated lambda is purity-flexible: its body must be checked with
@@ -10024,9 +9930,9 @@ private pure func infer_trait_method_ufcs_call_expr(
 							receiver_type,
 						)
 
-						resource_args = impl_method.map(
-							func(method): method.resource_args,
-						).get_or(RejectResourceArgs)
+						resource_args = impl_method
+							.map(func(method): method.resource_args)
+							.get_or(RejectResourceArgs)
 						resolved_call = { resolved_call_from_trait_method_callee(
 							method_callee,
 							impl_method,
@@ -10085,12 +9991,31 @@ private pure func infer_qualified_module_ufcs_call_expr(
 									else:
 										receiver_type = typed_expr_value_type(receiver_result.expr)
 
-										match env_resolve_module_ufcs_method(
-											context.state.env,
-											module_path,
-											method.text,
-											receiver_type,
+										graph_matches = match module_view_accepted_callable_authority(
+											context.state.facts.module_view,
 										):
+											Some(authority):
+												accepted_callable_lookup_qualified_ufcs(
+													authority,
+													module_path,
+													method.text,
+													receiver_type,
+												)
+											None:
+												empty: List[OverloadEntry] = []
+												empty
+
+										selected = env_select_ufcs_method(
+											env_lookup_module_ufcs_methods(
+												context.state.env,
+												module_path,
+												method.text,
+												receiver_type,
+											).concat(graph_matches),
+											receiver_type,
+										)
+
+										match selected:
 											Some(entry):
 												infer_ufcs_call_with_receiver_result(
 													context,
@@ -10240,7 +10165,14 @@ private pure func resolve_visible_ufcs_method(
 	receiver_type: SemanticType,
 	argument_types: Option[List[SemanticType]],
 ) -> Option[OverloadEntry]:
-	matches = env_lookup_ufcs_methods(context.state.env, name, receiver_type)
+	graph_matches = match module_view_accepted_callable_authority(context.state.facts.module_view):
+		Some(authority):
+			accepted_callable_lookup_ufcs(authority, name, receiver_type)
+		None:
+			empty: List[OverloadEntry] = []
+			empty
+
+	matches = env_lookup_ufcs_methods(context.state.env, name, receiver_type).concat(graph_matches)
 	local_matches = matches.filter(func(entry):
 		entry.module_path.is_none() and entry.origin != BuiltinFunc
 	)
@@ -10473,21 +10405,12 @@ private pure func infer_call_expr(
 								Some(result):
 									result
 								None:
-									match infer_bare_overload_callee(
-										infer_without_expected(context),
-										callee,
-										args,
-									):
-										Some(callee_result):
-											infer_call_with_callee_result(
-												context,
-												callee_result,
-												args,
-												span,
-											)
+									match infer_ufcs_call_expr(context, callee, args, span):
+										Some(result):
+											result
 										None:
-											match missing_bare_overload_call_result(
-												infer_without_expected(context),
+											match infer_trait_method_ufcs_call_expr(
+												context,
 												callee,
 												args,
 												span,
@@ -10495,49 +10418,28 @@ private pure func infer_call_expr(
 												Some(result):
 													result
 												None:
-													match infer_ufcs_call_expr(
+													callee_context = { call_callee_context(
 														context,
 														callee,
-														args,
-														span,
+													) |
+														suppress_debug_only_reference = True
+													}
+
+													callee_result = match infer_qualified_module_callee(
+														callee_context,
+														callee,
 													):
 														Some(result):
 															result
 														None:
-															match infer_trait_method_ufcs_call_expr(
-																context,
-																callee,
-																args,
-																span,
-															):
-																Some(result):
-																	result
-																None:
-																	callee_context = { call_callee_context(
-																		context,
-																		callee,
-																	) |
-																		suppress_debug_only_reference = True
-																	}
+															infer_expr(callee_context, callee)
 
-																	callee_result = match infer_qualified_module_callee(
-																		callee_context,
-																		callee,
-																	):
-																		Some(result):
-																			result
-																		None:
-																			infer_expr(
-																				callee_context,
-																				callee,
-																			)
-
-																	infer_call_with_callee_result(
-																		context,
-																		callee_result,
-																		args,
-																		span,
-																	)
+													infer_call_with_callee_result(
+														context,
+														callee_result,
+														args,
+														span,
+													)
 
 
 private pure func expected_function_type(
@@ -11192,13 +11094,22 @@ private pure func resource_type_contains_resource_if_valid(
 			match module_view_accepted_record_authority(session.facts.module_view):
 				Some(authority):
 					match accepted_record_contains_resource(authority, name):
-						Some(value): Some(value)
+						Some(value):
+							Some(value)
 						None:
-							module_view_accepted_union_authority(session.facts.module_view)
-								.and_then(func(union_authority): accepted_union_contains_resource(union_authority, name))
+							module_view_accepted_union_authority(
+								session.facts.module_view,
+							).and_then(
+								func(
+									union_authority,
+								): accepted_union_contains_resource(union_authority, name),
+							)
 				None:
-					module_view_accepted_union_authority(session.facts.module_view)
-						.and_then(func(authority): accepted_union_contains_resource(authority, name))
+					module_view_accepted_union_authority(
+						session.facts.module_view,
+					).and_then(
+						func(authority): accepted_union_contains_resource(authority, name),
+					)
 
 
 private pure func resource_type_scan_is_proven_unnecessary(
@@ -11213,18 +11124,27 @@ private pure func resource_type_scan_is_proven_unnecessary(
 		None:
 			match module_view_accepted_record_authority(session.facts.module_view):
 				Some(authority):
-					match accepted_record_resource_scan_is_proven_unnecessary(
-						authority,
-						name,
-					):
-						Some(value): value
+					match accepted_record_resource_scan_is_proven_unnecessary(authority, name):
+						Some(value):
+							value
 						None:
 							module_view_accepted_union_authority(session.facts.module_view)
-								.and_then(func(union_authority): accepted_union_resource_scan_is_proven_unnecessary(union_authority, name))
+								.and_then(
+									func(
+										union_authority,
+									): accepted_union_resource_scan_is_proven_unnecessary(
+										union_authority,
+										name,
+									),
+								)
 								.get_or(False)
 				None:
 					module_view_accepted_union_authority(session.facts.module_view)
-						.and_then(func(authority): accepted_union_resource_scan_is_proven_unnecessary(authority, name))
+						.and_then(
+							func(
+								authority,
+							): accepted_union_resource_scan_is_proven_unnecessary(authority, name),
+						)
 						.get_or(False)
 
 
@@ -11241,13 +11161,22 @@ private pure func resource_type_may_contain_function(
 			match module_view_accepted_record_authority(session.facts.module_view):
 				Some(authority):
 					match accepted_record_may_contain_function(authority, name):
-						Some(value): Some(value)
+						Some(value):
+							Some(value)
 						None:
-							module_view_accepted_union_authority(session.facts.module_view)
-								.and_then(func(union_authority): accepted_union_may_contain_function(union_authority, name))
+							module_view_accepted_union_authority(
+								session.facts.module_view,
+							).and_then(
+								func(
+									union_authority,
+								): accepted_union_may_contain_function(union_authority, name),
+							)
 				None:
-					module_view_accepted_union_authority(session.facts.module_view)
-						.and_then(func(authority): accepted_union_may_contain_function(authority, name))
+					module_view_accepted_union_authority(
+						session.facts.module_view,
+					).and_then(
+						func(authority): accepted_union_may_contain_function(authority, name),
+					)
 
 
 private pure func resource_type_may_contain_one_shot_stream(
@@ -11263,13 +11192,27 @@ private pure func resource_type_may_contain_one_shot_stream(
 			match module_view_accepted_record_authority(session.facts.module_view):
 				Some(authority):
 					match accepted_record_may_contain_one_shot_stream(authority, name):
-						Some(value): Some(value)
+						Some(value):
+							Some(value)
 						None:
-							module_view_accepted_union_authority(session.facts.module_view)
-								.and_then(func(union_authority): accepted_union_may_contain_one_shot_stream(union_authority, name))
+							module_view_accepted_union_authority(
+								session.facts.module_view,
+							).and_then(
+								func(
+									union_authority,
+								): accepted_union_may_contain_one_shot_stream(
+									union_authority,
+									name,
+								),
+							)
 				None:
-					module_view_accepted_union_authority(session.facts.module_view)
-						.and_then(func(authority): accepted_union_may_contain_one_shot_stream(authority, name))
+					module_view_accepted_union_authority(
+						session.facts.module_view,
+					).and_then(
+						func(
+							authority,
+						): accepted_union_may_contain_one_shot_stream(authority, name),
+					)
 
 
 private pure func resource_type_may_contain_resource_source(
@@ -11285,13 +11228,27 @@ private pure func resource_type_may_contain_resource_source(
 			match module_view_accepted_record_authority(session.facts.module_view):
 				Some(authority):
 					match accepted_record_may_contain_resource_source(authority, name):
-						Some(value): Some(value)
+						Some(value):
+							Some(value)
 						None:
-							module_view_accepted_union_authority(session.facts.module_view)
-								.and_then(func(union_authority): accepted_union_may_contain_resource_source(union_authority, name))
+							module_view_accepted_union_authority(
+								session.facts.module_view,
+							).and_then(
+								func(
+									union_authority,
+								): accepted_union_may_contain_resource_source(
+									union_authority,
+									name,
+								),
+							)
 				None:
-					module_view_accepted_union_authority(session.facts.module_view)
-						.and_then(func(authority): accepted_union_may_contain_resource_source(authority, name))
+					module_view_accepted_union_authority(
+						session.facts.module_view,
+					).and_then(
+						func(
+							authority,
+						): accepted_union_may_contain_resource_source(authority, name),
+					)
 
 
 private pure func resource_type_facts_resolve_alias_head(
@@ -11336,7 +11293,12 @@ private pure func named_type_component_types_without_scan_proof(
 
 	record_info = match module_view_accepted_record_authority(session.facts.module_view):
 		Some(authority):
-			accepted_record_find(authority, name).map(func(entry): (entry.type_params, entry.fields))
+			accepted_record_find(
+				authority,
+				name,
+			).map(
+				func(entry): (entry.type_params, entry.fields),
+			)
 		None:
 			env_get_record(session.env, name)
 
@@ -15810,7 +15772,7 @@ private pure func infer_special_builtin_call_expr(
 							func_symbol.origin == BuiltinFunc
 						_:
 							False
-				Some(BareAcceptedGlobal(_)) | None:
+				Some(BareAcceptedCallable(_)) | Some(BareAcceptedGlobal(_)) | None:
 					False
 
 			if not is_builtin:

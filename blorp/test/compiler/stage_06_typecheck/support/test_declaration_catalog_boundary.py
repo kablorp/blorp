@@ -15,6 +15,10 @@ GLOBAL_AUTHORITY = (
     ROOT
     / "blorp/src/compiler/stage_06_typecheck/type_system/accepted_global_authority.brp"
 )
+CALLABLE_AUTHORITY = (
+    ROOT
+    / "blorp/src/compiler/stage_06_typecheck/type_system/accepted_callable_authority.brp"
+)
 DECL_IMPORT = re.compile(r"(?m)^\s*\.\./decl(?:\s|:|$)")
 
 
@@ -89,9 +93,10 @@ class DeclarationCatalogBoundaryTests(unittest.TestCase):
             ").get_or(initial_global_table)", decl_source
         )
         self.assertIn(
-            '"internal typecheck error: completed globals did not match "',
+            '"internal typecheck error: completed globals did not match the accepted global "',
             decl_source,
         )
+        self.assertIn('+ "table"', decl_source)
 
     def test_resolved_calls_do_not_require_an_exact_env_function_index(self) -> None:
         infer_source = INFER.read_text(encoding="utf-8")
@@ -107,6 +112,69 @@ class DeclarationCatalogBoundaryTests(unittest.TestCase):
         ):
             with self.subTest(removed_name=removed_name):
                 self.assertNotIn(removed_name, env_source)
+
+    def test_accepted_graph_callables_do_not_use_legacy_env_publication(self) -> None:
+        self.assertTrue(CALLABLE_AUTHORITY.is_file())
+
+        decl_source = DECL.read_text(encoding="utf-8")
+        infer_source = INFER.read_text(encoding="utf-8")
+        env_source = ENV.read_text(encoding="utf-8")
+
+        for removed_name in (
+            "env_get_module_func_symbol",
+            "env_find_func_named_by_def_id",
+            "env_add_overload",
+            "env_get_overloads",
+            "env_resolve_overload",
+        ):
+            with self.subTest(removed_name=removed_name):
+                self.assertNotIn(removed_name, env_source)
+                self.assertNotIn(removed_name, infer_source)
+
+        self.assertNotIn("overloads: List[OverloadSet]", env_source)
+        self.assertNotIn("infer_bare_overload_callee", infer_source)
+        self.assertNotIn("missing_bare_overload_call_result", infer_source)
+        self.assertIn("accepted_callable_table", decl_source)
+        self.assertIn("module_view_with_accepted_callable_authority", decl_source)
+
+        preparation = re.search(
+            r"private pure func prepare_accepted_callable_header\(.*?"
+            r"(?=\n\nprivate pure func)",
+            decl_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(preparation)
+        self.assertNotIn("env_add_func_with_info", preparation.group(0))
+        self.assertNotIn("env_extract_graph_callables", decl_source)
+
+        body_signature = re.search(
+            r"private pure func body_signature_from_accepted_header\(.*?"
+            r"(?=\n\nprivate pure func)",
+            decl_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(body_signature)
+        self.assertIn("accepted_callable_find_exact", body_signature.group(0))
+        self.assertNotIn("callable_header_semantic_type", body_signature.group(0))
+
+        authority_source = CALLABLE_AUTHORITY.read_text(encoding="utf-8")
+        self.assertNotIn("owner_entry:", authority_source)
+        self.assertNotIn("canonical_entry:", authority_source)
+
+        graph_preparation = re.search(
+            r"private pure func prepared_module_environments\(.*?"
+            r"(?=\n\nprivate pure func)",
+            decl_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(graph_preparation)
+        self.assertEqual(
+            graph_preparation.group(0).count(
+                "for header in callable_header_graph_callables(callable_headers):"
+            ),
+            1,
+        )
+        self.assertIn("base_indices_by_module", graph_preparation.group(0))
 
 
 if __name__ == "__main__":

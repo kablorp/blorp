@@ -166,6 +166,7 @@ import:
 			TopLevelVariable,
 		),
 		module_view_accepted_alias_authority,
+		module_view_accepted_callable_authority,
 		module_view_accepted_global_authority,
 		module_view_accepted_record_authority,
 		module_view_accepted_union_authority,
@@ -199,6 +200,8 @@ import:
 	../../../src/compiler/stage_06_typecheck/type_system/accepted_alias_authority:
 		accepted_alias_find_opaque,
 		accepted_alias_find_transparent,
+	../../../src/compiler/stage_06_typecheck/type_system/accepted_callable_authority:
+		accepted_callable_find,
 	../../../src/compiler/stage_06_typecheck/type_system/accepted_global_authority:
 		accepted_global_find,
 	../../../src/compiler/stage_06_typecheck/type_system/accepted_record_authority:
@@ -223,7 +226,6 @@ import:
 		env_get_func_callable_id,
 		env_get_func_info,
 		env_get_function_trait,
-		env_get_module_func_symbol,
 		env_get_opaque_alias,
 		env_get_record,
 		env_get_trait,
@@ -233,7 +235,6 @@ import:
 		env_lookup,
 		env_type_contains_resource_if_valid,
 		impl_instance,
-		loop_producer_is_windows,
 		trait_def_with_details,
 	../../../src/compiler/stage_06_typecheck/type_system/refinement: UNREFINED_BINDING
 	../../../src/compiler/stage_06_typecheck/type_system/semantic_type:
@@ -301,6 +302,14 @@ pure func accepted_opaque_alias_target(state: TypecheckState, name: String) -> O
 	match module_view_accepted_alias_authority(state.module_view):
 		Some(authority):
 			accepted_alias_find_opaque(authority, name).map(func(alias_entry): alias_entry.target)
+		None:
+			None
+
+
+pure func accepted_callable_type(state: TypecheckState, name: String) -> Option[SemanticType]:
+	match module_view_accepted_callable_authority(state.module_view):
+		Some(authority):
+			accepted_callable_find(authority, name).map(func(entry): entry.func_type)
 		None:
 			None
 
@@ -2011,11 +2020,11 @@ func test_import_modules_register_canonical_signature_types() -> Bool:
 			None
 
 	match (
-		env_get_func_info(result.state.env, "make_token"),
-		env_get_func_info(result.state.env, "use_token"),
+		accepted_callable_type(result.state, "make_token"),
+		accepted_callable_type(result.state, "use_token"),
 		global_type,
 	):
-		(Some((make_type, _, _)), Some((use_type, _, _)), Some(var_type)):
+		(Some(make_type), Some(use_type), Some(var_type)):
 			result.state.errors.length() == 0 and types_equal(
 				make_type,
 				SemanticFunctionType(True, [], expected_token),
@@ -2030,9 +2039,7 @@ func test_import_modules_register_canonical_signature_types() -> Bool:
 func test_accepted_globals_support_direct_selective_qualified_and_shadowed_reads() -> Bool:
 	module_decls = [var_body_decl("shared", Some(int_type()), int_expr())]
 	direct_program = program([
-		import_block_decl(
-			[import_decl("values", None, Some([import_symbol("shared", None, [])]))],
-		),
+		import_block_decl([import_decl("values", None, Some([import_symbol("shared", None, [])]))]),
 		function_body_decl_with_purity(
 			"read_direct",
 			[],
@@ -2160,13 +2167,13 @@ func test_concurrent_binding_rhs_can_read_same_named_accepted_global() -> Bool:
 				"run",
 				[],
 				Some(named_type("Void")),
-				Some(ParsedConcurrentBlockExpr(
-					[],
-					decl_block_expr([
-						decl_assign_expr("shared", decl_name_expr("shared")),
-					]),
-					fixture_source_span(),
-				)),
+				Some(
+					ParsedConcurrentBlockExpr(
+						[],
+						decl_block_expr([decl_assign_expr("shared", decl_name_expr("shared"))]),
+						fixture_source_span(),
+					),
+				),
 				False,
 			),
 		]),
@@ -2202,8 +2209,8 @@ func test_imported_explicit_type_param_shadows_module_alias() -> Bool:
 	)
 	type_param = SemanticTypeVar("Callback")
 
-	match env_get_func_info(result.state.env, "identity"):
-		Some((func_type, _, _)):
+	match accepted_callable_type(result.state, "identity"):
+		Some(func_type):
 			result.state.errors.length() == 0 and types_equal(
 				func_type,
 				SemanticFunctionType(True, [type_param], type_param),
@@ -2236,56 +2243,12 @@ func test_current_module_signatures_canonicalize_qualified_import_types() -> Boo
 		[],
 	)
 
-	match env_get_func_info(result.state.env, "keep_error"):
-		Some((func_type, _, _)):
+	match accepted_callable_type(result.state, "keep_error"):
+		Some(func_type):
 			result.state.errors.length() == 0 and types_equal(
 				func_type,
 				SemanticFunctionType(True, [canonical_error], canonical_error),
 			)
-		None:
-			False
-
-
-func test_import_modules_preserve_tensor_loop_producer() -> Bool:
-	vector_type = ParsedArrayType(
-		int_type(),
-		[ParsedDimLiteralType("4", fixture_source_span())],
-		fixture_source_span(),
-	)
-	module_decls = [
-		function_body_decl_with_purity(
-			"windows",
-			[named_param("values", vector_type), named_param("size", int_type())],
-			Some(ParsedNamedType(ident("List"), [int_type()], fixture_source_span())),
-			Some(
-				ParsedBlockExpr(
-					[ParsedBuiltinExpr(Some("tensor.windows"), fixture_source_span())],
-					fixture_source_span(),
-				),
-			),
-			True,
-		),
-	]
-	source_program = program(
-		[
-			import_block_decl(
-				[import_decl("tensor", None, Some([import_symbol("windows", None, [])]))],
-			),
-		],
-	)
-	result = typecheck_test_program_with_import_modules(
-		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
-		source_program,
-		importable_modules_with_origin("tensor", module_decls, StdlibModule),
-	)
-
-	match env_get_module_func_symbol(result.state.env, "tensor", "windows"):
-		Some(symbol):
-			match symbol.loop_producer:
-				Some(producer):
-					result.state.errors.length() == 0 and loop_producer_is_windows(producer)
-				None:
-					False
 		None:
 			False
 
@@ -5532,7 +5495,11 @@ pure func test_graph_owned_headers_keep_import_scope_compatible() -> Bool:
 		),
 	)
 
-	result.state.errors.is_empty() and env_lookup(result.state.env, "second").is_some()
+	(
+		result.state.errors.is_empty()
+		and env_lookup(result.state.env, "second").is_none()
+		and accepted_callable_type(result.state, "second").is_some()
+	)
 
 
 tests: TestSuite = {
@@ -5694,10 +5661,6 @@ tests: TestSuite = {
 		(
 			"qualified record type uses accepted authority",
 			test_qualified_record_type_uses_accepted_authority,
-		),
-		(
-			"import modules preserve tensor loop producer",
-			test_import_modules_preserve_tensor_loop_producer,
 		),
 		(
 			"imported tensor loop producer reaches typed for",

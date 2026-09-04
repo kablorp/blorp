@@ -1,6 +1,6 @@
 # Cut Over Traits And Implementations To The Declaration Catalog
 
-**Status:** Blocked on Issue 40
+**Status:** Ready
 
 **Dependencies:** Issue 40
 

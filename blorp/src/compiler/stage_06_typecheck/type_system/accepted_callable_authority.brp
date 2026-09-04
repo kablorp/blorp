@@ -1,0 +1,437 @@
+-- Accepted source and foreign callables have one graph-owned payload each.
+-- Per-module authorities retain only ordered table indices for callable names
+-- visible to that module. Lexical functions and compiler builtins remain in
+-- Env; trait and implementation methods remain there until their own cutover.
+import:
+	../../stage_04_modules/loaded_module:
+		ModuleIdentity,
+		module_identities_equal,
+		module_identity_matches_module_path,
+		module_identity_storage_key,
+	../headers/declaration_skeleton:
+		CallableId,
+		DeclarationVisibility(PublicDeclaration),
+		callable_id_definition_id,
+		callable_id_module_identity,
+		callable_id_name,
+		callable_ids_equal,
+	env: OverloadEntry, overload_entry_first_param_matches
+	semantic_type: SemanticType, localize_module_types
+
+
+record AcceptedCallableTableRecord {
+	id: CallableId,
+	owner_module_path: String,
+	source_name: String,
+	visibility: DeclarationVisibility,
+	entry: OverloadEntry
+}
+
+
+record AcceptedCallableTableInput {
+	callables: List[AcceptedCallableTableRecord]
+}
+
+
+private record AcceptedCallableSlot {
+	id: CallableId,
+	owner_module_path: String,
+	source_name: String,
+	visibility: DeclarationVisibility,
+	entry: OverloadEntry
+}
+
+
+private record AcceptedCallableTableRep {
+	slots: List[AcceptedCallableSlot],
+	indices_by_module_and_definition_id: Dict[String, Dict[Int, Int]],
+	indices_by_module_and_name: Dict[String, Dict[String, List[Int]]],
+	indices_by_module_path_and_name: Dict[String, Dict[String, List[Int]]]
+}
+
+
+opaque type AcceptedCallableTable = AcceptedCallableTableRep
+
+
+record AcceptedVisibleCallableBinding {
+	source_name: String,
+	owner_module_path: String,
+	original_name: String
+}
+
+
+private record AcceptedCallableAuthorityRep {
+	table: AcceptedCallableTable,
+	owner: ModuleIdentity,
+	visible_indices_by_source_name: Dict[String, List[Int]],
+	ufcs_indices_by_source_name: Dict[String, List[Int]]
+}
+
+
+opaque type AcceptedCallableAuthority = AcceptedCallableAuthorityRep
+
+
+struct AcceptedCallableAuthorityMetrics {
+	accepted_callable_table_entries: Int,
+	accepted_callable_semantic_conversions: Int,
+	module_view_callable_candidate_entries: Int,
+	legacy_graph_callable_env_installs: Int,
+	legacy_graph_overload_installs: Int,
+	module_view_callable_full_record_copies: Int,
+	exact_callable_query_graph_scans: Int
+}
+
+
+private pure func table_rep(table: AcceptedCallableTable) -> AcceptedCallableTableRep:
+	from_opaque AcceptedCallableTable(table)
+
+
+private pure func authority_rep(
+	authority: AcceptedCallableAuthority,
+) -> AcceptedCallableAuthorityRep:
+	from_opaque AcceptedCallableAuthority(authority)
+
+
+private pure func entries_match_id(item: AcceptedCallableTableRecord) -> Bool:
+	definition_id = callable_id_definition_id(item.id)
+
+	(
+		item.entry.def_id == definition_id
+		and item.entry.module_path == Some(item.owner_module_path)
+		and item.source_name == callable_id_name(item.id)
+		and module_identity_matches_module_path(
+			callable_id_module_identity(item.id),
+			item.owner_module_path,
+		)
+	)
+
+
+pure func accepted_callable_table(
+	input: AcceptedCallableTableInput,
+) -> Option[AcceptedCallableTable]:
+	var slots: List[AcceptedCallableSlot] = []
+	var indices_by_module_and_definition_id: Dict[String, Dict[Int, Int]] = {}
+	var indices_by_module_and_name: Dict[String, Dict[String, List[Int]]] = {}
+	var indices_by_module_path_and_name: Dict[String, Dict[String, List[Int]]] = {}
+	var valid: Bool = True
+
+	for item in input.callables:
+		module_key = module_identity_storage_key(callable_id_module_identity(item.id))
+		definition_id = callable_id_definition_id(item.id)
+		definition_indices = indices_by_module_and_definition_id.get_or(module_key, {})
+		module_names = indices_by_module_and_name.get_or(module_key, {})
+		path_names = indices_by_module_path_and_name.get_or(item.owner_module_path, {})
+
+		if definition_indices.contains(definition_id) or not entries_match_id(item):
+			valid = False
+		else:
+			index = slots.length()
+			slots = slots.append({
+				id = item.id,
+				owner_module_path = item.owner_module_path,
+				source_name = item.source_name,
+				visibility = item.visibility,
+				entry = item.entry,
+			})
+			indices_by_module_and_definition_id = indices_by_module_and_definition_id.set(
+				module_key,
+				definition_indices.set(definition_id, index),
+			)
+			indices_by_module_and_name = indices_by_module_and_name.set(
+				module_key,
+				module_names.set(
+					item.source_name,
+					module_names
+						.get_or(item.source_name, [])
+						.append(index),
+				),
+			)
+			indices_by_module_path_and_name = indices_by_module_path_and_name.set(
+				item.owner_module_path,
+				path_names.set(
+					item.source_name,
+					path_names
+						.get_or(item.source_name, [])
+						.append(index),
+				),
+			)
+
+	if valid:
+		Some(into_opaque AcceptedCallableTable({
+					slots = slots,
+					indices_by_module_and_definition_id = indices_by_module_and_definition_id,
+					indices_by_module_and_name = indices_by_module_and_name,
+					indices_by_module_path_and_name = indices_by_module_path_and_name
+				}))
+	else:
+		None
+
+
+pure func accepted_callable_table_entry_count(table: AcceptedCallableTable) -> Int:
+	table_rep(table).slots.length()
+
+
+private pure func public_indices(
+	representation: AcceptedCallableTableRep,
+	indices: List[Int],
+) -> List[Int]:
+	var result: List[Int] = []
+
+	for index in indices.reverse():
+		match representation.slots.get(index):
+			Some(slot):
+				if slot.visibility == PublicDeclaration:
+					result = result.append(index)
+			None:
+				void
+
+	result
+
+
+pure func accepted_callable_authority(
+	table: AcceptedCallableTable,
+	owner: ModuleIdentity,
+	bindings: List[AcceptedVisibleCallableBinding],
+	direct_module_paths: List[String],
+) -> Option[AcceptedCallableAuthority]:
+	representation = table_rep(table)
+	owner_key = module_identity_storage_key(owner)
+	local_names = representation.indices_by_module_and_name.get_or(owner_key, {})
+	var visible_indices_by_source_name: Dict[String, List[Int]] = {}
+	var ufcs_indices_by_source_name: Dict[String, List[Int]] = {}
+	var valid: Bool = True
+
+	for name in local_names.keys():
+		indices = local_names
+			.get_or(name, [])
+			.reverse()
+		visible_indices_by_source_name = visible_indices_by_source_name.set(name, indices)
+		ufcs_indices_by_source_name = ufcs_indices_by_source_name.set(name, indices)
+
+	for binding in bindings:
+		path_names = representation.indices_by_module_path_and_name.get_or(
+			binding.owner_module_path,
+			{},
+		)
+		indices = public_indices(
+			representation,
+			path_names.get_or(binding.original_name, []),
+		)
+
+		if not indices.is_empty():
+			if visible_indices_by_source_name.contains(binding.source_name):
+				valid = False
+			else:
+				visible_indices_by_source_name = visible_indices_by_source_name.set(
+					binding.source_name,
+					indices,
+				)
+
+	-- Source-function UFCS sees owner-local callables first, then direct
+	-- imports in the reverse installation order formerly produced by Env.
+	for module_path in direct_module_paths.reverse():
+		path_names = representation.indices_by_module_path_and_name.get_or(module_path, {})
+
+		for name in path_names.keys():
+			indices = public_indices(
+				representation,
+				path_names.get_or(name, []),
+			)
+
+			if not indices.is_empty():
+				ufcs_indices_by_source_name = ufcs_indices_by_source_name.set(
+					name,
+					ufcs_indices_by_source_name
+						.get_or(name, [])
+						.concat(indices),
+				)
+
+	if valid:
+		Some(into_opaque AcceptedCallableAuthority({
+					table = table,
+					owner = owner,
+					visible_indices_by_source_name = visible_indices_by_source_name,
+					ufcs_indices_by_source_name = ufcs_indices_by_source_name
+				}))
+	else:
+		None
+
+
+pure func accepted_callable_authority_without_visible_names(
+	authority: AcceptedCallableAuthority,
+) -> AcceptedCallableAuthority:
+	representation = authority_rep(authority)
+	into_opaque AcceptedCallableAuthority({ representation |
+			visible_indices_by_source_name = {},
+			ufcs_indices_by_source_name = {}
+		})
+
+
+private pure func owner_entry(slot: AcceptedCallableSlot) -> OverloadEntry:
+	{ slot.entry |
+		func_type = localize_module_types(slot.owner_module_path, slot.entry.func_type),
+		module_path = None,
+		dim_constraints = slot.entry.dim_constraints.map(
+			func(
+				constraint,
+			): (
+				localize_module_types(slot.owner_module_path, constraint[0]),
+				localize_module_types(slot.owner_module_path, constraint[1]),
+			),
+		)
+	}
+
+
+private pure func entry_at(
+	authority: AcceptedCallableAuthorityRep,
+	index: Int,
+) -> Option[OverloadEntry]:
+	slot ?= table_rep(authority.table).slots.get(index)
+
+	if module_identities_equal(callable_id_module_identity(slot.id), authority.owner):
+		Some(owner_entry(slot))
+	else:
+		Some(slot.entry)
+
+
+pure func accepted_callable_find(
+	authority: AcceptedCallableAuthority,
+	source_name: String,
+) -> Option[OverloadEntry]:
+	representation = authority_rep(authority)
+	index ?= representation.visible_indices_by_source_name
+		.get_or(source_name, [])
+		.get(0)
+	entry_at(representation, index)
+
+
+pure func accepted_callable_find_exact(
+	authority: AcceptedCallableAuthority,
+	id: CallableId,
+) -> Option[OverloadEntry]:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+	module_indices ?= table.indices_by_module_and_definition_id.get(
+		module_identity_storage_key(callable_id_module_identity(id)),
+	)
+	index ?= module_indices.get(callable_id_definition_id(id))
+	slot ?= table.slots.get(index)
+
+	if callable_ids_equal(slot.id, id):
+		entry_at(representation, index)
+	else:
+		None
+
+
+pure func accepted_callable_find_owner_definition_id(
+	authority: AcceptedCallableAuthority,
+	definition_id: Int,
+) -> Option[OverloadEntry]:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+	module_indices ?= table.indices_by_module_and_definition_id.get(
+		module_identity_storage_key(representation.owner),
+	)
+	index ?= module_indices.get(definition_id)
+	slot ?= table.slots.get(index)
+
+	if (
+		module_identities_equal(callable_id_module_identity(slot.id), representation.owner)
+		and callable_id_definition_id(slot.id) == definition_id
+	):
+		Some(owner_entry(slot))
+	else:
+		None
+
+
+pure func accepted_callable_find_qualified(
+	authority: AcceptedCallableAuthority,
+	module_path: String,
+	name: String,
+) -> Option[OverloadEntry]:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+	path_names ?= table.indices_by_module_path_and_name.get(module_path)
+	indices = public_indices(
+		table,
+		path_names.get_or(name, []),
+	)
+	index ?= indices.get(0)
+	table.slots
+		.get(index)
+		.map(func(slot): slot.entry)
+
+
+pure func accepted_callable_lookup_ufcs(
+	authority: AcceptedCallableAuthority,
+	name: String,
+	first_arg_type: SemanticType,
+) -> List[OverloadEntry]:
+	representation = authority_rep(authority)
+	var result: List[OverloadEntry] = []
+
+	for index in representation.ufcs_indices_by_source_name.get_or(name, []):
+		match entry_at(representation, index):
+			Some(entry):
+				if overload_entry_first_param_matches(entry, first_arg_type):
+					result = result.append(entry)
+			None:
+				void
+
+	result
+
+
+pure func accepted_callable_lookup_qualified_ufcs(
+	authority: AcceptedCallableAuthority,
+	module_path: String,
+	name: String,
+	first_arg_type: SemanticType,
+) -> List[OverloadEntry]:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+	path_names = table.indices_by_module_path_and_name.get_or(module_path, {})
+	indices = public_indices(
+		table,
+		path_names.get_or(name, []),
+	)
+	var result: List[OverloadEntry] = []
+
+	for index in indices:
+		match table.slots.get(index):
+			Some(slot):
+				if overload_entry_first_param_matches(slot.entry, first_arg_type):
+					result = result.append(slot.entry)
+			None:
+				void
+
+	result
+
+
+pure func accepted_callable_authority_metrics(
+	table: AcceptedCallableTable,
+	authorities: List[AcceptedCallableAuthority],
+) -> AcceptedCallableAuthorityMetrics:
+	var view_entries: Int = 0
+
+	for authority in authorities:
+		representation = authority_rep(authority)
+
+		for name in representation.visible_indices_by_source_name.keys():
+			view_entries += representation.visible_indices_by_source_name
+				.get_or(name, [])
+				.length()
+
+		for name in representation.ufcs_indices_by_source_name.keys():
+			view_entries += representation.ufcs_indices_by_source_name
+				.get_or(name, [])
+				.length()
+
+	{
+		accepted_callable_table_entries = accepted_callable_table_entry_count(table),
+		accepted_callable_semantic_conversions = accepted_callable_table_entry_count(table),
+		module_view_callable_candidate_entries = view_entries,
+		legacy_graph_callable_env_installs = 0,
+		legacy_graph_overload_installs = 0,
+		module_view_callable_full_record_copies = 0,
+		exact_callable_query_graph_scans = 0
+	}

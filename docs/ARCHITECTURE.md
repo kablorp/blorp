@@ -136,7 +136,8 @@ Stage 06 owns:
 - tail-recursion annotation validation; and
 - construction of typed modules consumed by CTFE and Core lowering.
 
-Accepted aliases, records, unions, and globals use separate graph-owned, category-specific
+Accepted aliases, records, unions, globals, and source/foreign callables use
+separate graph-owned, category-specific
 authorities. Their canonical payloads are built from accepted type headers
 or completed global headers once; each selected module retains only established
 declaration identities and scalar source-name/visibility or constructor locators. Exact lookup validates the complete nominal
@@ -161,12 +162,18 @@ Owner-local record and variant field spellings are localized from their one
 canonical payload only when a payload reader needs them; scalar category and
 containment queries do not materialize fields. Recursive capability scans
 honor accepted negative containment proofs before opening component payloads.
-`Env` remains authoritative for provisional header construction, body-local
-type parameters, refinements, variables, nested lexical scopes, and callable
-source-name candidates. A resolved call retains the selected candidate's bound
-type parameters and debug-only status; `Env` has no post-resolution exact
-callable-ID index. Traits, implementations, and source-name callable discovery
-remain on their explicit `Env` paths pending their vertical cutovers.
+The accepted-callable table owns one complete semantic entry per accepted
+source or foreign callable. Prepared module views retain ordered table indices
+for owner-local names, selective imports, qualified access, and ordinary
+source-function UFCS. They do not retain copies of signatures or constraints;
+owner-local queries localize canonical nominal type spellings at the read
+boundary. `Env`
+remains authoritative for provisional header construction, compiler builtins,
+body-local type parameters, refinements, variables, nested lexical scopes, and
+trait/implementation method candidates pending their vertical cutovers. A
+resolved call retains the selected candidate's bound type parameters and
+debug-only status; accepted body checking neither republishes graph callables
+into `Env` nor scans graph functions by name or definition ID.
 
 Exact identities established by the graph must survive later phases. A pass
 must not reconstruct semantic identity from declaration names, module strings,

@@ -173,6 +173,13 @@ production exact-metadata reader. Resolved calls retain the chosen candidate's
 bound parameters and debug-only status, and `Env` no longer builds an exact
 callable-ID index. Source-name candidate storage remains for Issue 40.
 
+Issue 40 is implemented. Accepted source and foreign callables now live once
+in an immutable category table, while module views retain compact ordered
+indices for visible names, qualification, and source-function UFCS. Prepared
+`Env` values no longer contain graph callables, and the unused standalone
+overload channel is deleted. The Phase 01-06 self-check retired 27.7% fewer
+instructions than the Issue 39 baseline with no latency regression.
+
 ### Later declaration families
 
 Issues 38-42 should be integrated serially. Their semantic inventories and

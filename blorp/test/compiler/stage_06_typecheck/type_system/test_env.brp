@@ -30,7 +30,6 @@ import:
 		env_add_func,
 		env_add_func_with_info,
 		env_add_impl,
-		env_add_overload,
 		env_add_record,
 		env_add_trait,
 		env_add_trait_function,
@@ -43,7 +42,6 @@ import:
 		env_disambiguate_nominal_dim_application,
 		env_extend_type_param_bounds,
 		env_find_conflicting_impl,
-		env_find_func_named_by_def_id,
 		env_find_records_with_fields,
 		env_from_prepared_module_declarations,
 		env_get_alias,
@@ -51,8 +49,6 @@ import:
 		env_get_constructors,
 		env_get_func_info,
 		env_get_function_trait,
-		env_get_module_func_symbol,
-		env_get_overloads,
 		env_get_record,
 		env_get_type_decl,
 		env_get_type_kind,
@@ -75,7 +71,6 @@ import:
 		env_pop_scope,
 		env_push_scope,
 		env_resolve_alias,
-		env_resolve_overload,
 		env_resolve_trait_obligation,
 		env_resolve_ufcs_method,
 		env_scoped_resource_unavailable_owner,
@@ -1387,8 +1382,6 @@ func test_traits_impls_overloads_and_ufcs() -> Bool:
 	string_entry = overload_entry(11, TYPE_STRING, TYPE_STRING)
 	int_string_entry = two_arg_overload_entry(13, TYPE_INT, TYPE_STRING, TYPE_STRING)
 	int_bool_entry = two_arg_overload_entry(14, TYPE_INT, TYPE_BOOL, TYPE_BOOL)
-	env = env_add_overload(env, "show", int_entry)
-	env = env_add_overload(env, "show", string_entry)
 	selected_two_arg = env_select_overload_for_args(
 		[int_string_entry, int_bool_entry],
 		[TYPE_INT, TYPE_BOOL],
@@ -1424,9 +1417,14 @@ func test_traits_impls_overloads_and_ufcs() -> Bool:
 	)
 
 	match (
-		conflict,
-		env_resolve_overload(env, "show", TYPE_STRING),
-		env_lookup_ufcs_methods(env, "windowed", TYPE_STRING).get(0),
+		(
+			conflict,
+			env_select_overload_for_args(
+				[int_entry, string_entry],
+				[TYPE_STRING],
+			),
+			env_lookup_ufcs_methods(env, "windowed", TYPE_STRING).get(0),
+		)
 	):
 		(Some(existing), Some(resolved_overload), Some(ufcs_entry)):
 			match env_get_func_info(env, "local_helper"):
@@ -1455,7 +1453,6 @@ func test_traits_impls_overloads_and_ufcs() -> Bool:
 								False
 						and ufcs_entry.def_id == 12
 						and env_has_ufcs_method(env, "windowed")
-						and env_get_overloads(env, "show").length() == 2
 						and env_trait_has_supertrait(env, "Display", "Stringable")
 						and env_trait_method_names_transitive(env, "Display") == ["show"]
 						and declaring_methods.length() == 1
@@ -1576,19 +1573,16 @@ func test_generic_impl_satisfies_concrete_trait_obligation() -> Bool:
 func test_overload_ranking_prefers_concrete_over_generic() -> Bool:
 	generic_entry = generic_overload_entry(60, SemanticTypeVar("T"), TYPE_STRING, "T")
 	int_entry = overload_entry(61, TYPE_INT, TYPE_INT)
-	env = env_add_overload(
-		env_add_overload(ENV_EMPTY, "rank", generic_entry),
-		"rank",
-		int_entry,
-	)
 
-	match (env_select_overload_for_args(
-			env_get_overloads(env, "rank"),
+	match (
+		env_select_overload_for_args(
+			[generic_entry, int_entry],
 			[TYPE_INT],
-		), env_resolve_overload(env, "rank", TYPE_INT)):
-		(Some(selected), Some(resolved)):
-			selected.def_id == 61 and resolved.def_id == 61
-		_:
+		)
+	):
+		Some(selected):
+			selected.def_id == 61
+		None:
 			False
 
 
@@ -1734,98 +1728,6 @@ func test_generic_impl_conflicts_with_specific_impl() -> Bool:
 			False
 
 
-func test_module_function_lookup_uses_module_path() -> Bool:
-	local_func = func_symbol(
-		1,
-		SemanticFunctionType(True, [TYPE_INT], TYPE_INT),
-		[],
-		[Some("value")],
-		Pure,
-		UserDefinedFunc,
-		RejectResourceArgs,
-		None,
-		[],
-		None,
-		False,
-	)
-	imported_func = func_symbol(
-		2,
-		SemanticFunctionType(True, [TYPE_STRING], TYPE_STRING),
-		[],
-		[Some("value")],
-		Pure,
-		UserDefinedFunc,
-		RejectResourceArgs,
-		Some("text"),
-		[],
-		None,
-		False,
-	)
-	env = env_add_func_with_info(
-		env_add_func_with_info(ENV_EMPTY, "trim", local_func),
-		"trim",
-		imported_func,
-	)
-
-	match env_get_module_func_symbol(env, "text", "trim"):
-		Some(function_symbol):
-			(
-				function_symbol.callable_id == 2
-				and env_get_module_func_symbol(env, "other", "trim").is_none()
-				and env_get_module_func_symbol(env, "text", "missing").is_none()
-			)
-		None:
-			False
-
-
-func test_function_lookup_uses_name_index_and_callable_id() -> Bool:
-	int_func = func_symbol(
-		10,
-		SemanticFunctionType(True, [TYPE_INT], TYPE_INT),
-		[],
-		[Some("value")],
-		Pure,
-		UserDefinedFunc,
-		RejectResourceArgs,
-		None,
-		[],
-		None,
-		False,
-	)
-	string_func = func_symbol(
-		11,
-		SemanticFunctionType(True, [TYPE_STRING], TYPE_STRING),
-		[],
-		[Some("value")],
-		Pure,
-		UserDefinedFunc,
-		RejectResourceArgs,
-		None,
-		[],
-		None,
-		False,
-	)
-	env = env_add_func_with_info(
-		env_add_func_with_info(ENV_EMPTY, "convert", int_func),
-		"convert",
-		string_func,
-	)
-
-	match (
-		env_find_func_named_by_def_id(env, "convert", 10),
-		env_find_func_named_by_def_id(env, "convert", 11),
-	):
-		(Some(first), Some(second)):
-			(
-				types_equal(first.func_type, int_func.func_type)
-				and types_equal(second.func_type, string_func.func_type)
-				and env_find_func_named_by_def_id(env, "convert", 12).is_none()
-				and env_find_func_named_by_def_id(env, "missing", 10).is_none()
-			)
-		_:
-			False
-
-
 func test_prepared_module_declarations_create_isolated_root_environments() -> Bool:
 	function = func_symbol(
 		40,
@@ -1863,12 +1765,12 @@ func test_prepared_module_declarations_create_isolated_root_environments() -> Bo
 			match (
 				env_get_var_type(first_nested, "body_local"),
 				env_get_var_type(third, "body_local"),
-				env_find_func_named_by_def_id(third, "root_function", 40),
+				env_get_func_info(third, "root_function"),
 			):
-				(Some(local_type), None, Some(root_function)):
+				(Some(local_type), None, Some((root_function_type, _, _))):
 					(
 						types_equal(local_type, TYPE_STRING)
-						and types_equal(root_function.func_type, function.func_type)
+						and types_equal(root_function_type, function.func_type)
 						and env_get_type_params(first_nested) == ["T"]
 						and env_get_type_params(third).is_empty()
 						and prepare_module_declaration_env(first_nested).is_none()
@@ -2069,11 +1971,6 @@ tests: TestSuite = {
 		(
 			"generic impl conflicts with specific impl",
 			test_generic_impl_conflicts_with_specific_impl,
-		),
-		("module function lookup uses module path", test_module_function_lookup_uses_module_path),
-		(
-			"function lookup uses name index and callable id",
-			test_function_lookup_uses_name_index_and_callable_id,
 		),
 		(
 			"prepared module declarations create isolated root environments",

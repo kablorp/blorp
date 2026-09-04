@@ -121,12 +121,12 @@ import:
 	../stage_04_modules/module_type_identity: local_type_names_from_decls
 	diagnostic: TypecheckDiagnostic, typecheck_diagnostic
 	foreign_validation: validate_foreign_function
-	graph/definition_index: definition_index_find_source_definition_id
 	graph/definition_identity:
 		FuncCallableKey,
 		SourceDefinitionKind(FieldDefinition, GlobalDefinition, ImplDefinition, TraitDefinition),
 		func_callable_key,
 		source_definition_key,
+	graph/definition_index: definition_index_find_source_definition_id
 	graph/indexed_graph:
 		PreparedModuleScope,
 		indexed_graph_target_scope,
@@ -177,6 +177,7 @@ import:
 		callable_header_parameters,
 		callable_header_signature,
 		callable_header_source,
+		callable_header_visibility,
 		callable_type_parameter_bounds,
 		callable_type_parameter_id,
 		global_header_id,
@@ -388,6 +389,7 @@ import:
 			TopLevelVariable,
 		),
 		module_view_accepted_alias_authority,
+		module_view_accepted_callable_authority,
 		module_view_accepted_global_authority,
 		module_view_accepted_record_authority,
 		module_view_accepted_union_authority,
@@ -396,6 +398,7 @@ import:
 		module_view_imported_names,
 		module_view_module_aliases,
 		module_view_with_accepted_alias_authority,
+		module_view_with_accepted_callable_authority,
 		module_view_with_accepted_global_authority,
 		module_view_with_accepted_record_authority,
 		module_view_with_accepted_union_authority,
@@ -460,6 +463,17 @@ import:
 		typed_type_definitions,
 		typed_type_references,
 	type_system/accepted_alias_authority: AcceptedAliasAuthority, accepted_alias_contains
+	type_system/accepted_callable_authority:
+		AcceptedCallableAuthority,
+		AcceptedCallableAuthorityMetrics,
+		AcceptedCallableTable,
+		AcceptedCallableTableRecord,
+		AcceptedVisibleCallableBinding,
+		accepted_callable_authority,
+		accepted_callable_authority_metrics,
+		accepted_callable_find_exact,
+		accepted_callable_find_owner_definition_id,
+		accepted_callable_table,
 	type_system/accepted_global_authority:
 		AcceptedGlobalAuthority,
 		AcceptedGlobalAuthorityMetrics,
@@ -495,6 +509,7 @@ import:
 		Env,
 		FieldDecl,
 		FuncOrigin(ForeignFunc, UserDefinedFunc),
+		FuncSymbol,
 		ImplInstance,
 		ImplMethodInfo,
 		ImplMethodTarget,
@@ -504,6 +519,7 @@ import:
 			LoopProducerIndices,
 			LoopProducerWindows,
 		),
+		OverloadEntry,
 		PreparedInferSessionEnv,
 		PreparedModuleDeclarationEnv,
 		Purity(Impure, Pure),
@@ -513,6 +529,7 @@ import:
 			ResourceResultIndependent,
 			ResourceResultOrdinary,
 		),
+		SymbolKind(FuncSymbolKind),
 		TraitMethodSig,
 		TraitObligationResolution(
 			TraitObligationDeferred,
@@ -530,7 +547,6 @@ import:
 		env_add_var_with_module_details,
 		env_extend_type_param_bounds,
 		env_find_conflicting_impl,
-		env_find_func_named_by_def_id,
 		env_from_prepared_infer_session,
 		env_from_prepared_module_declarations,
 		env_get_alias,
@@ -544,11 +560,13 @@ import:
 		env_has_direct_trait_evidence,
 		env_push_scope,
 		env_resolve_trait_obligation,
+		env_symbols_named,
 		env_trait_function_collision,
 		env_trait_methods_with_declaring_trait,
 		func_symbol,
 		impl_instance_with_methods,
 		impl_method_info,
+		overload_entry_from_func_symbol,
 		prepare_infer_session_env,
 		prepare_module_declaration_env,
 		resolve_self,
@@ -2185,13 +2203,32 @@ private pure func function_body_signature(
 
 	match callable_id:
 		Some(def_id):
-			match env_find_func_named_by_def_id(state.env, function_decl.name.text, def_id):
-				Some(symbol):
-					match symbol.func_type:
+			entry = match module_view_accepted_callable_authority(state.module_view):
+				Some(authority):
+					accepted_callable_find_owner_definition_id(authority, def_id)
+				None:
+					var found: Option[OverloadEntry] = None
+
+					-- Standalone tools construct provisional declarations without an
+					-- accepted graph. Keep that path Env-backed, but do not expose an
+					-- exact graph lookup API to ordinary accepted body checking.
+					for symbol in env_symbols_named(state.env, function_decl.name.text):
+						match symbol.kind:
+							FuncSymbolKind(info):
+								if info.callable_id == def_id and found.is_none():
+									found = Some(overload_entry_from_func_symbol(info))
+							_:
+								void
+
+					found
+
+			match entry:
+				Some(found):
+					match found.func_type:
 						SemanticFunctionType(_, param_types, return_type):
 							{
 								callable_id = callable_id,
-								effective_type_params = symbol.type_params,
+								effective_type_params = found.type_params,
 								param_types = param_types,
 								semantic_return_type = return_type
 							}
@@ -2365,6 +2402,12 @@ private union CallableHeaderRegistration:
 	ImportedCallableHeaderRegistration(String)
 
 
+private record PreparedCallableHeader {
+	state: TypecheckState,
+	entry: Option[OverloadEntry]
+}
+
+
 -- These event values are mirrored by the profile-only runtime counter schema
 -- in blorp/src/lib/runtime/native/runtime.c. They are intentionally local to callable header
 -- registration so ordinary typechecking never receives a new state field.
@@ -2384,8 +2427,6 @@ private CALLABLE_HEADER_PROFILE_RESOURCE_VALIDATIONS: Int = 7
 
 private CALLABLE_HEADER_PROFILE_ID_CLAIMS: Int = 8
 
-private CALLABLE_HEADER_PROFILE_ENVIRONMENT_INSERTIONS: Int = 9
-
 
 -- The existing black-box builtin is a profile-window marker here: the runtime
 -- recognizes only these two private wrapper names while profiling is active.
@@ -2397,16 +2438,6 @@ private pure func profile_callable_header_event(event: Int) -> Int:
 
 private pure func profile_callable_header_enter(definition_id: Int) -> Int:
 	builtin("blorp_black_box_int")
-
-
-private pure func callable_header_registration_module_path(
-	registration: CallableHeaderRegistration,
-) -> Option[String]:
-	match registration:
-		LocalCallableHeaderRegistration(_):
-			None
-		ImportedCallableHeaderRegistration(module_path):
-			Some(module_path)
 
 
 private pure func callable_header_semantic_type(
@@ -2491,12 +2522,12 @@ private pure func callable_header_bound_type_params(
 	result
 
 
-private pure func register_callable_header(
+private pure func prepare_accepted_callable_header(
 	state: TypecheckState,
 	type_headers: TypeHeaderGraph,
 	header: CallableHeader,
 	registration: CallableHeaderRegistration,
-) -> TypecheckState:
+) -> PreparedCallableHeader:
 	id = callable_header_id(header)
 	owner_identity = callable_id_module_identity(id)
 	signature = callable_header_signature(header)
@@ -2568,16 +2599,22 @@ private pure func register_callable_header(
 
 	match return_type:
 		None:
-			typecheck_state_add_error(
-				state,
-				"internal typecheck error: accepted callable header could not be installed",
-			)
+			{
+				state = typecheck_state_add_error(
+					state,
+					"internal typecheck error: accepted callable header could not be prepared",
+				),
+				entry = None
+			}
 		Some(resolved_return_type):
 			if conversion_failed:
-				typecheck_state_add_error(
-					state,
-					"internal typecheck error: accepted callable header could not be installed",
-				)
+				{
+					state = typecheck_state_add_error(
+						state,
+						"internal typecheck error: accepted callable header could not be prepared",
+					),
+					entry = None
+				}
 			else:
 				match callable_header_source(header):
 					FunctionCallableHeaderSource(decl):
@@ -2618,49 +2655,52 @@ private pure func register_callable_header(
 							callable_key,
 						):
 							DefinitionIdMissing(with_error):
-								with_error
+								{
+									state = with_error,
+									entry = None
+								}
 							DefinitionIdClaimed(with_id, definition_id):
 								if definition_id != callable_id_definition_id(id):
-									typecheck_state_add_error(
-										with_id,
-										(
-											"internal typecheck error: callable header definition ID does not match its "
-											+ "reserved module ID"
+									{
+										state = typecheck_state_add_error(
+											with_id,
+											(
+												"internal typecheck error: callable header definition ID does not match its "
+												+ "reserved module ID"
+											),
 										),
-									)
+										entry = None
+									}
 								else:
 									func_type = SemanticFunctionType(
 										callable_signature_is_pure(signature),
 										param_types,
 										resolved_return_type,
 									)
-									profile_callable_header_event(
-										CALLABLE_HEADER_PROFILE_ENVIRONMENT_INSERTIONS,
-									)
-									env = env_add_func_with_info(
-										with_id.env,
-										decl.name.text,
-										func_symbol(
-											definition_id,
-											func_type,
-											callable_header_bound_type_params(
+									{
+										state = with_id,
+										entry = Some({
+											def_id = definition_id,
+											func_type = func_type,
+											type_params = callable_header_bound_type_params(
 												header,
 												decl.type_params,
 												func_type,
 												dim_constraints,
 												True,
 											),
-											param_names,
-											purity_from_parsed(decl.is_pure),
-											UserDefinedFunc,
-											resource_arg_policy,
-											callable_header_registration_module_path(registration),
-											dim_constraints,
-											loop_producer_from_body(decl.body),
-											decl.annotations.any(annotation_is_debug_only),
-										),
-									)
-									{ with_id | env = env }
+											param_names = param_names,
+											purity = purity_from_parsed(decl.is_pure),
+											origin = UserDefinedFunc,
+											resource_args = resource_arg_policy,
+											module_path = None,
+											dim_constraints = dim_constraints,
+											loop_producer = loop_producer_from_body(decl.body),
+											debug_only = decl.annotations.any(
+												annotation_is_debug_only,
+											),
+										})
+									}
 					ForeignCallableHeaderSource(decl):
 						next = if typecheck_state_allows_foreign(state):
 							state
@@ -2703,94 +2743,46 @@ private pure func register_callable_header(
 							callable_key,
 						):
 							DefinitionIdMissing(with_error):
-								with_error
+								{
+									state = with_error,
+									entry = None
+								}
 							DefinitionIdClaimed(with_id, definition_id):
 								if definition_id != callable_id_definition_id(id):
-									typecheck_state_add_error(
-										with_id,
-										(
-											"internal typecheck error: foreign callable header definition ID does not match "
-											+ "its reserved module ID"
+									{
+										state = typecheck_state_add_error(
+											with_id,
+											(
+												"internal typecheck error: foreign callable header definition ID does not match "
+												+ "its reserved module ID"
+											),
 										),
-									)
+										entry = None
+									}
 								else:
 									func_type = SemanticFunctionType(
 										callable_signature_is_pure(signature),
 										param_types,
 										resolved_return_type,
 									)
-									profile_callable_header_event(
-										CALLABLE_HEADER_PROFILE_ENVIRONMENT_INSERTIONS,
-									)
-									env = env_add_func_with_info(
-										with_id.env,
-										decl.name.text,
-										func_symbol(
-											definition_id,
-											func_type,
-											[],
-											param_names,
-											purity_from_parsed(decl.is_pure),
-											ForeignFunc,
-											RejectResourceArgs,
-											callable_header_registration_module_path(registration),
-											dim_constraints,
-											None,
-											decl.annotations.any(annotation_is_debug_only),
-										),
-									)
-									{ with_id | env = env }
-
-
-private pure func register_callable_header_for_source(
-	state: TypecheckState,
-	type_headers: TypeHeaderGraph,
-	callable_headers: CallableHeaderGraph,
-	name: String,
-	span: SourceSpan,
-	registration: CallableHeaderRegistration,
-) -> TypecheckState:
-	callable_key = callable_key_from_span(state, name, span)
-
-	match typecheck_state_find_func_callable_id(state, callable_key):
-		None:
-			typecheck_state_add_error(
-				state,
-				"internal typecheck error: accepted callable header has no reserved definition ID",
-			)
-		Some(definition_id):
-			match callable_header_graph_find_definition_id(callable_headers, definition_id):
-				None:
-					typecheck_state_add_error(
-						state,
-						"internal typecheck error: reserved callable definition has no accepted header",
-					)
-				Some(header):
-					register_callable_header(state, type_headers, header, registration)
-
-
-private pure func register_local_callable_headers(
-	state: TypecheckState,
-	type_headers: TypeHeaderGraph,
-	callable_headers: CallableHeaderGraph,
-	module_identity: ModuleIdentity,
-	module_path: String,
-) -> TypecheckState:
-	var next = state
-
-	for header in callable_header_graph_callables(callable_headers):
-		if module_identities_equal(
-			callable_id_module_identity(callable_header_id(header)),
-			module_identity,
-		):
-			next = register_callable_header(
-				next,
-				type_headers,
-				header,
-				LocalCallableHeaderRegistration(module_path),
-			)
-
-	next
+									{
+										state = with_id,
+										entry = Some({
+											def_id = definition_id,
+											func_type = func_type,
+											type_params = [],
+											param_names = param_names,
+											purity = purity_from_parsed(decl.is_pure),
+											origin = ForeignFunc,
+											resource_args = RejectResourceArgs,
+											module_path = None,
+											dim_constraints = dim_constraints,
+											loop_producer = None,
+											debug_only = decl.annotations.any(
+												annotation_is_debug_only,
+											),
+										})
+									}
 
 
 private pure func register_function_decl(
@@ -3969,26 +3961,12 @@ private pure func typecheck_register_imported_signature_decl(
 	decl: ImportableSignatureDecl,
 ) -> TypecheckState:
 	match decl:
-		ImportableFunctionDecl(function_decl):
-			register_callable_header_for_source(
-				state,
-				type_headers,
-				callable_headers,
-				function_decl.name.text,
-				function_decl.span,
-				ImportedCallableHeaderRegistration(module_path),
-			)
+		ImportableFunctionDecl(_):
+			state
 		ImportableVarDecl(_):
 			state
-		ImportableForeignFunctionDecl(function_decl):
-			register_callable_header_for_source(
-				state,
-				type_headers,
-				callable_headers,
-				function_decl.name.text,
-				function_decl.span,
-				ImportedCallableHeaderRegistration(module_path),
-			)
+		ImportableForeignFunctionDecl(_):
+			state
 		ImportableTraitDecl(trait_decl):
 			register_trait_header_for_source(
 				state,
@@ -5942,11 +5920,14 @@ private pure func typecheck_materialize_decl_body(
 					}
 				ReuseAcceptedGlobalBodies(completed_globals):
 					accepted = module_view_accepted_global_authority(state.module_view)
-						.and_then(func(authority): accepted_global_find(authority, var_decl.name.text))
-						.and_then(func(binding): completed_global_header_graph_find(
-							completed_globals,
-							binding.id,
-						))
+						.and_then(
+							func(authority): accepted_global_find(authority, var_decl.name.text),
+						)
+						.and_then(
+							func(
+								binding,
+							): completed_global_header_graph_find(completed_globals, binding.id),
+						)
 
 					match accepted:
 						Some(completed):
@@ -6149,7 +6130,7 @@ private func typecheck_materialize_standalone_program_bodies_with_import_modules
 	})
 
 
-private pure func typecheck_state_after_header_registration(
+private pure func typecheck_state_after_accepted_header_registration(
 	state: TypecheckState,
 	bound_module: BoundModule,
 	type_headers: TypeHeaderGraph,
@@ -6191,15 +6172,8 @@ private pure func typecheck_state_after_header_registration(
 		program.source.module_name,
 		module_path,
 	)
-	with_signatures = register_local_callable_headers(
-		with_traits,
-		type_headers,
-		callable_headers,
-		module_identity,
-		module_path,
-	)
 	with_impls = register_local_implementation_headers(
-		with_signatures,
+		with_traits,
 		type_headers,
 		implementation_headers,
 		module_identity,
@@ -6393,6 +6367,103 @@ private pure func accepted_global_authority_for_module(
 			Err("accepted global module view rejected conflicting source bindings")
 
 
+private pure func canonical_callable_entry(
+	owner_entry: OverloadEntry,
+	owner_module_path: String,
+	local_type_names: List[String],
+) -> OverloadEntry:
+	{ owner_entry |
+		func_type = qualify_module_local_types(
+			owner_module_path,
+			local_type_names,
+			owner_entry.func_type,
+		),
+		module_path = Some(owner_module_path),
+		dim_constraints = owner_entry.dim_constraints.map(
+			func(
+				constraint,
+			): (
+				qualify_module_local_types(owner_module_path, local_type_names, constraint[0]),
+				qualify_module_local_types(owner_module_path, local_type_names, constraint[1]),
+			),
+		)
+	}
+
+
+private record PreparedModuleCallableBase {
+	bound_module: BoundModule,
+	module_path: String,
+	local_type_names: List[String],
+	callable_error_start: Int,
+	state: TypecheckState,
+	callables: List[AcceptedCallableTableRecord],
+	callable_errors: List[String]
+}
+
+
+private pure func prepare_accepted_module_callable(
+	base: PreparedModuleCallableBase,
+	type_headers: TypeHeaderGraph,
+	header: CallableHeader,
+) -> PreparedModuleCallableBase:
+	id = callable_header_id(header)
+	prepared = prepare_accepted_callable_header(
+		base.state,
+		type_headers,
+		header,
+		LocalCallableHeaderRegistration(base.module_path),
+	)
+
+	match prepared.entry:
+		Some(entry):
+			{ base |
+				state = prepared.state,
+				callables = base.callables.append({
+					id = id,
+					owner_module_path = base.module_path,
+					source_name = callable_id_name(id),
+					visibility = callable_header_visibility(header),
+					entry = canonical_callable_entry(
+						entry,
+						base.module_path,
+						base.local_type_names,
+					),
+				})
+			}
+		None:
+			{ base | state = prepared.state }
+
+
+private pure func accepted_callable_authority_for_module(
+	table: AcceptedCallableTable,
+	bound_module: BoundModule,
+) -> Result[AcceptedCallableAuthority, String]:
+	view = bound_module_view(bound_module)
+	var bindings: List[AcceptedVisibleCallableBinding] = []
+
+	for imported in module_view_imported_names(view):
+		bindings = bindings.append({
+			source_name = imported.local_name,
+			owner_module_path = imported.module_path,
+			original_name = imported.original_name,
+		})
+
+	direct_module_paths = bound_module_direct_import_modules(
+		bound_module,
+	).map(importable_module_path)
+
+	match accepted_callable_authority(
+		table,
+		bound_module_identity(bound_module),
+		bindings,
+		direct_module_paths,
+	):
+		Some(authority):
+			Ok(authority)
+		None:
+			Err("accepted callable module view rejected conflicting source bindings")
+
+
 -- Immutable accepted module facts shared by initializer and ordinary body
 -- sessions. Session-owned diagnostics, inference bindings, lexical scopes,
 -- containment snapshots, and memo answers cannot be represented here.
@@ -6409,13 +6480,15 @@ private record PreparedCanonicalModuleEnvironment {
 private record PreparedModuleIssues {
 	module_identity: ModuleIdentity,
 	errors: List[String],
-	diagnostics: List[TypecheckDiagnostic]
+	diagnostics: List[TypecheckDiagnostic],
+	callable_errors: List[String]
 }
 
 
 private record PreparedModuleEnvironmentCollection {
 	environments: List[PreparedCanonicalModuleEnvironment],
-	issues: List[PreparedModuleIssues]
+	issues: List[PreparedModuleIssues],
+	accepted_callable_table: Option[AcceptedCallableTable]
 }
 
 
@@ -6537,23 +6610,7 @@ private pure func prepared_module_environment_base_state(
 		program.source.module_name,
 		canonical_path,
 	)
-	with_signatures = register_local_callable_headers(
-		with_traits,
-		type_headers,
-		callable_headers,
-		module_identity,
-		canonical_path,
-	)
-	with_impls = register_local_implementation_headers(
-		with_signatures,
-		type_headers,
-		implementation_headers,
-		module_identity,
-		program.source.module_name,
-		canonical_path,
-	)
-
-	with_impls
+	with_traits
 
 
 private pure func prepared_canonical_module_environment(
@@ -6587,6 +6644,10 @@ private pure func prepared_module_environments(
 	].concat(bound_module_graph_modules(bound_graph))
 	var prepared: List[PreparedCanonicalModuleEnvironment] = []
 	var issues: List[PreparedModuleIssues] = []
+	var bases: List[PreparedModuleCallableBase] = []
+	var base_indices_by_module: Dict[String, Int] = {}
+	var callable_records: List[AcceptedCallableTableRecord] = []
+	var callable_owner_missing: Bool = False
 
 	for bound_module in modules:
 		base_state = prepared_module_environment_base_state(
@@ -6600,23 +6661,112 @@ private pure func prepared_module_environments(
 			accepted_union_graph,
 			allow_debug_only_calls,
 		)
+		base_indices_by_module = base_indices_by_module.set(
+			module_identity_storage_key(bound_module_identity(bound_module)),
+			bases.length(),
+		)
+		bases = bases.append({
+			bound_module = bound_module,
+			module_path = bound_module_canonical_path(bound_module),
+			local_type_names = local_type_names_from_decls(
+				bound_module_program(bound_module).decls,
+			),
+			callable_error_start = base_state.errors.length(),
+			state = base_state,
+			callables = [],
+			callable_errors = [],
+		})
 
-		match prepared_canonical_module_environment(bound_module, base_state):
+	for header in callable_header_graph_callables(callable_headers):
+		module_key = module_identity_storage_key(
+			callable_id_module_identity(callable_header_id(header)),
+		)
+
+		match base_indices_by_module.get(module_key):
+			Some(index):
+				match bases.get(index):
+					Some(base):
+						bases = bases.set(
+							index,
+							prepare_accepted_module_callable(base, type_headers, header),
+						)
+					None:
+						callable_owner_missing = True
+			None:
+				callable_owner_missing = True
+
+	var base_index: Int = 0
+
+	while base_index < bases.length():
+		match bases.get(base_index):
+			Some(with_callables):
+				base = { with_callables |
+					callable_errors = with_callables.state.errors.drop(
+						with_callables.callable_error_start,
+					),
+					state = register_local_implementation_headers(
+						with_callables.state,
+						type_headers,
+						implementation_headers,
+						bound_module_identity(with_callables.bound_module),
+						bound_module_program(with_callables.bound_module).source.module_name,
+						with_callables.module_path,
+					)
+				}
+				bases = bases.set(base_index, base)
+				callable_records = callable_records.concat(base.callables)
+			None:
+				callable_owner_missing = True
+
+		base_index += 1
+
+	callable_table = if callable_owner_missing:
+		None
+	else:
+		accepted_callable_table({callables = callable_records})
+
+	for base in bases:
+		var prepared_state = base.state
+
+		match callable_table:
+			Some(table):
+				match accepted_callable_authority_for_module(table, base.bound_module):
+					Ok(authority):
+						prepared_state = { prepared_state |
+							module_view = module_view_with_accepted_callable_authority(
+								prepared_state.module_view,
+								authority,
+							)
+						}
+					Err(message):
+						prepared_state = typecheck_state_add_error(
+							prepared_state,
+							"internal typecheck error: " + message,
+						)
+			None:
+				prepared_state = typecheck_state_add_error(
+					prepared_state,
+					"internal typecheck error: accepted callable table rejected prepared entries",
+				)
+
+		match prepared_canonical_module_environment(base.bound_module, prepared_state):
 			Some(environment):
 				prepared = prepared.append(environment)
 			None:
 				void
 
-		if not base_state.errors.is_empty() or not base_state.diagnostics.is_empty():
+		if not prepared_state.errors.is_empty() or not prepared_state.diagnostics.is_empty():
 			issues = issues.append({
-				module_identity = bound_module_identity(bound_module),
-				errors = base_state.errors,
-				diagnostics = base_state.diagnostics,
+				module_identity = bound_module_identity(base.bound_module),
+				errors = prepared_state.errors,
+				diagnostics = prepared_state.diagnostics,
+				callable_errors = base.callable_errors,
 			})
 
 	{
 		environments = prepared,
-		issues = issues
+		issues = issues,
+		accepted_callable_table = callable_table
 	}
 
 
@@ -6827,6 +6977,7 @@ private record GlobalHeaderCompletionFailure {
 private record GlobalHeaderCompletionOutcome {
 	completed: CompletedGlobalHeaderGraph,
 	accepted_global_table: Option[AcceptedGlobalTable],
+	accepted_callable_table: Option[AcceptedCallableTable],
 	failures: List[GlobalHeaderCompletionFailure],
 	prepared_environments: List[PreparedCanonicalModuleEnvironment],
 	module_preparation_issues: List[PreparedModuleIssues]
@@ -6995,6 +7146,7 @@ private pure func complete_planned_global_headers(
 				}
 			}),
 		accepted_global_table = completed_table,
+		accepted_callable_table = prepared_modules.accepted_callable_table,
 		failures = failures,
 		prepared_environments = prepared_environments,
 		module_preparation_issues = prepared_modules.issues
@@ -7060,6 +7212,7 @@ private record TypecheckGraphFacts {
 	importable_graph: ImportableModuleGraph,
 	completed_globals: CompletedGlobalHeaderGraph,
 	accepted_global_table: AcceptedGlobalTable,
+	accepted_callable_table: AcceptedCallableTable,
 	prepared_environments: List[PreparedCanonicalModuleEnvironment],
 	module_preparation_issues: List[PreparedModuleIssues],
 	accepted_alias_graph: AcceptedAliasGraph,
@@ -7109,22 +7262,29 @@ private pure func finish_typecheck_graph_completion(
 			],
 		)
 	else:
-		match completion.accepted_global_table:
-			None:
+		match (completion.accepted_global_table, completion.accepted_callable_table):
+			(None, _):
 				TypecheckGraphCompletionRejected(
 					[
 						(
-							"internal typecheck error: completed globals did not match "
-							+ "the accepted global table"
+							"internal typecheck error: completed globals did not match the accepted global "
+							+ "table"
 						),
 					],
 				)
-			Some(accepted_global_table):
+			(_, None):
+				TypecheckGraphCompletionRejected(
+					[
+						"internal typecheck error: accepted callable table construction was incomplete",
+					],
+				)
+			(Some(accepted_global_table), Some(accepted_callable_table)):
 				facts: TypecheckGraphFacts = {
 					implementation_headers = implementation_headers,
 					importable_graph = importable_graph,
 					completed_globals = completion.completed,
 					accepted_global_table = accepted_global_table,
+					accepted_callable_table = accepted_callable_table,
 					prepared_environments = completion.prepared_environments,
 					module_preparation_issues = completion.module_preparation_issues,
 					accepted_alias_graph = accepted_alias_graph,
@@ -7376,6 +7536,22 @@ pure func accepted_typecheck_graph_global_authority_metrics(
 		facts.accepted_global_table,
 		facts.prepared_environments.length(),
 	)
+
+
+pure func accepted_typecheck_graph_callable_authority_metrics(
+	graph: AcceptedTypecheckGraph,
+) -> AcceptedCallableAuthorityMetrics:
+	facts = accepted_typecheck_graph_rep(graph).facts
+	var authorities: List[AcceptedCallableAuthority] = []
+
+	for environment in facts.prepared_environments:
+		match module_view_accepted_callable_authority(environment.module_facts.module_view):
+			Some(authority):
+				authorities = authorities.append(authority)
+			None:
+				void
+
+	accepted_callable_authority_metrics(facts.accepted_callable_table, authorities)
 
 
 pure func accepted_typecheck_graph_alias_metrics(
@@ -7663,31 +7839,26 @@ private pure func frontend_preparation_type_header_observation(
 private pure func frontend_preparation_signature_observation(
 	decls: List[ImportableSignatureDecl],
 ) -> FrontendDeclarationPreparationObservation:
-	var callable_count: Int = 0
 	var trait_count: Int = 0
 
 	for decl in decls:
 		match decl:
-			ImportableFunctionDecl(_):
-				callable_count += 1
-			ImportableForeignFunctionDecl(_):
-				callable_count += 1
+			ImportableFunctionDecl(_) | ImportableForeignFunctionDecl(_):
+				void
 			ImportableVarDecl(_):
 				void
 			ImportableTraitDecl(_):
 				trait_count += 1
 
 	frontend_preparation_observation_finish({ frontend_preparation_observation_empty(0) |
-			imported_callable_header_installations = callable_count,
 			imported_trait_header_installations = trait_count,
-			scope_symbol_insertions = callable_count + trait_count,
-			environment_publications = callable_count + trait_count
+			scope_symbol_insertions = trait_count,
+			environment_publications = trait_count
 		})
 
 
 private pure func frontend_preparation_local_header_observation(
 	type_headers: TypeHeaderGraph,
-	callable_headers: CallableHeaderGraph,
 	topology: TraitTopologyGraph,
 	implementation_headers: ImplementationHeaderGraph,
 	module_identity: ModuleIdentity,
@@ -7697,16 +7868,8 @@ private pure func frontend_preparation_local_header_observation(
 		module_identity,
 		False,
 	)
-	var callable_count: Int = 0
 	var trait_count: Int = 0
 	var impl_count: Int = 0
-
-	for header in callable_header_graph_callables(callable_headers):
-		if module_identities_equal(
-			callable_id_module_identity(callable_header_id(header)),
-			module_identity,
-		):
-			callable_count += 1
 
 	for header in trait_topology_graph_headers(topology):
 		if module_identities_equal(
@@ -7725,9 +7888,9 @@ private pure func frontend_preparation_local_header_observation(
 	frontend_preparation_observation_add(
 		type_observation,
 		frontend_preparation_observation_finish({ frontend_preparation_observation_empty(0) |
-				local_header_installations = callable_count + trait_count + impl_count,
-				scope_symbol_insertions = callable_count + trait_count,
-				environment_publications = callable_count + trait_count + impl_count
+				local_header_installations = trait_count + impl_count,
+				scope_symbol_insertions = trait_count,
+				environment_publications = trait_count + impl_count
 			}),
 	)
 
@@ -7914,18 +8077,27 @@ private pure func prepare_canonical_body_module(
 ) -> Option[PreparedAcceptedBodyModule]:
 	base_state = typecheck_session_for_prepared_module(environment)
 	module_identity = bound_module_identity(environment.bound_module)
-	module_issues = graph.module_preparation_issues.find(func(issues):
-		module_identities_equal(issues.module_identity, module_identity)
+	direct_module_identities = bound_module_direct_import_modules(
+		environment.bound_module,
+	).map(
+		func(module): prepared_module_scope_identity(importable_module_prepared_scope(module)),
 	)
+	var errors: List[String] = []
+	var diagnostics: List[TypecheckDiagnostic] = []
 
-	state_with_issues = match module_issues:
-		None:
-			base_state
-		Some(issues):
-			{ base_state |
-				errors = issues.errors,
-				diagnostics = issues.diagnostics
-			}
+	for issues in graph.module_preparation_issues:
+		if module_identities_equal(issues.module_identity, module_identity):
+			errors = errors.concat(issues.errors)
+			diagnostics = diagnostics.concat(issues.diagnostics)
+		else if direct_module_identities.any(
+			func(identity): module_identities_equal(issues.module_identity, identity),
+		):
+			errors = errors.concat(issues.callable_errors)
+
+	state_with_issues = { base_state |
+		errors = errors,
+		diagnostics = diagnostics
+	}
 
 	with_completed_globals = match module_view_accepted_global_authority(
 		state_with_issues.module_view,
@@ -8328,6 +8500,20 @@ private pure func prepare_ctfe_artifact_body_module(
 		Err(message):
 			typecheck_state_add_error(with_view, "internal typecheck error: " + message)
 
+	with_view = match accepted_callable_authority_for_module(
+		graph.accepted_callable_table,
+		bound_module,
+	):
+		Ok(authority):
+			{ with_view |
+				module_view = module_view_with_accepted_callable_authority(
+					with_view.module_view,
+					authority,
+				)
+			}
+		Err(message):
+			typecheck_state_add_error(with_view, "internal typecheck error: " + message)
+
 	for diagnostic in bound_module_binding_diagnostics(bound_module):
 		with_view = typecheck_state_add_diagnostic(with_view, diagnostic)
 
@@ -8341,7 +8527,7 @@ private pure func prepare_ctfe_artifact_body_module(
 		graph.implementation_headers,
 	)
 
-	base_state = typecheck_state_after_header_registration(
+	base_state = typecheck_state_after_accepted_header_registration(
 		with_import_decls,
 		bound_module,
 		type_headers,
@@ -8393,7 +8579,6 @@ private pure func accepted_body_module_preparation_semantic_observation(
 	)
 	local_observation = frontend_preparation_local_header_observation(
 		type_headers,
-		callable_headers,
 		trait_topology,
 		graph.implementation_headers,
 		module_identity,
@@ -8790,82 +8975,20 @@ pure func accepted_typecheck_module_body_plan(input: AcceptedTypecheckModule) ->
 private pure func body_signature_from_accepted_header(
 	base: AcceptedBodyModuleBase,
 	header: CallableHeader,
-	source: ParsedFunctionDecl,
 ) -> Option[FunctionBodySignature]:
 	id = callable_header_id(header)
-	type_headers = trait_topology_graph_type_headers(
-		accepted_typecheck_graph_trait_topology(base.representation.graph_facts),
-	)
-	registration = LocalCallableHeaderRegistration(
-		prepared_module_scope_canonical_path(bound_module_scope(base.representation.bound_module)),
-	)
-	signature = callable_header_signature(header)
-	var param_types: List[SemanticType] = []
-	var dimension_constraints: List[(SemanticType, SemanticType)] = []
-	var conversion_failed: Bool = False
+	authority ?= module_view_accepted_callable_authority(base.state.module_view)
+	entry ?= accepted_callable_find_exact(authority, id)
 
-	for parameter in callable_signature_parameters(signature):
-		match callable_header_semantic_type(
-			type_headers,
-			callable_id_module_identity(id),
-			registration,
-			parameter.typ,
-		):
-			Some(resolved):
-				param_types = param_types.append(resolved)
-			None:
-				conversion_failed = True
-
-	for constraint in callable_header_dimension_constraints(header):
-		left = callable_header_semantic_type(
-			type_headers,
-			callable_id_module_identity(id),
-			registration,
-			constraint[0],
-		)
-		right = callable_header_semantic_type(
-			type_headers,
-			callable_id_module_identity(id),
-			registration,
-			constraint[1],
-		)
-
-		match (left, right):
-			(Some(left_type), Some(right_type)):
-				dimension_constraints = dimension_constraints.append((left_type, right_type))
-			_:
-				conversion_failed = True
-
-	return_type = callable_header_semantic_type(
-		type_headers,
-		callable_id_module_identity(id),
-		registration,
-		callable_signature_return_type(signature),
-	)
-
-	match return_type:
-		Some(resolved_return_type):
-			if conversion_failed:
-				None
-			else:
-				func_type = SemanticFunctionType(
-					callable_signature_is_pure(signature),
-					param_types,
-					resolved_return_type,
-				)
-				Some({
-					callable_id = Some(callable_id_definition_id(id)),
-					effective_type_params = callable_header_bound_type_params(
-						header,
-						source.type_params,
-						func_type,
-						dimension_constraints,
-						False,
-					),
-					param_types = param_types,
-					semantic_return_type = resolved_return_type,
-				})
-		None:
+	match entry.func_type:
+		SemanticFunctionType(_, param_types, return_type):
+			Some({
+				callable_id = Some(callable_id_definition_id(id)),
+				effective_type_params = entry.type_params,
+				param_types = param_types,
+				semantic_return_type = return_type,
+			})
+		_:
 			None
 
 
@@ -9121,7 +9244,7 @@ private pure func body_check_context_build_from_base(
 						ForeignCallableHeaderSource(_):
 							BodyContextRejected(BodyContextUnsupportedSource)
 						FunctionCallableHeaderSource(source):
-							match body_signature_from_accepted_header(base, header, source):
+							match body_signature_from_accepted_header(base, header):
 								None:
 									BodyContextRejected(BodyContextMissingAcceptedSignature)
 								Some(signature):
