@@ -28,7 +28,7 @@ from compiler_backend_worker import (
 )
 
 
-FIXTURE_VERSION = 7
+FIXTURE_VERSION = 8
 DEFAULT_TIMEOUT_SECONDS = 60.0
 PERCEUS_ACTION = "run_perceus"
 MEASURE_OWNERSHIP_PREPARATION_PERCEUS_ACTION = (
@@ -44,6 +44,7 @@ BODY_SHAPES = (
     "aggregate_escape",
     "borrowed_return",
     "referenced_global_boundary",
+    "lambda_borrowed_boundary",
     "nested_user_call",
     "mutually_recursive_calls",
 )
@@ -85,6 +86,14 @@ PERCEUS_WORK_COUNTER_NAMES = (
     "borrowed_global_normalization_visits",
     "borrowed_global_alias_fallback_requests",
     "borrowed_global_rewrite_actions",
+    "lambda_regions_normalized",
+    "lambda_parameter_owner_slots",
+    "lambda_capture_owner_slots",
+    "lambda_referenced_global_owner_slots",
+    "lambda_scalar_owner_normalizations",
+    "lambda_borrowed_normalization_visits",
+    "lambda_alias_fallback_requests",
+    "lambda_rewrite_actions",
     "borrowed_origin_member_visits",
     "borrowed_origin_storage_slots",
     "borrowed_aggregate_node_visits",
@@ -123,6 +132,18 @@ TRANCHE_4B_WORK_COUNTER_NAMES = (
     "borrowed_global_alias_fallback_requests",
     "borrowed_global_rewrite_actions",
 )
+LAMBDA_PREPARATION_WORK_COUNTER_NAMES = (
+    "lambda_regions_normalized",
+    "lambda_parameter_owner_slots",
+    "lambda_capture_owner_slots",
+    "lambda_referenced_global_owner_slots",
+    "lambda_scalar_owner_normalizations",
+)
+LAMBDA_CUTOVER_WORK_COUNTER_NAMES = (
+    "lambda_borrowed_normalization_visits",
+    "lambda_alias_fallback_requests",
+    "lambda_rewrite_actions",
+)
 LEGACY_PERCEUS_WORK_COUNTER_NAMES = tuple(
     name for name in PERCEUS_WORK_COUNTER_NAMES
     if name not in (
@@ -130,6 +151,8 @@ LEGACY_PERCEUS_WORK_COUNTER_NAMES = tuple(
         + TRANCHE_3_WORK_COUNTER_NAMES
         + TRANCHE_4_WORK_COUNTER_NAMES
         + TRANCHE_4B_WORK_COUNTER_NAMES
+        + LAMBDA_PREPARATION_WORK_COUNTER_NAMES
+        + LAMBDA_CUTOVER_WORK_COUNTER_NAMES
     )
 )
 DEFAULT_GLOBALS = 384
@@ -159,6 +182,13 @@ REFERENCED_GLOBAL_SITES_PER_FUNCTION = (
     + REFERENCED_GLOBAL_AGGREGATE_SITES_PER_FUNCTION
     + REFERENCED_GLOBAL_RESULT_SITES_PER_FUNCTION
 )
+LAMBDA_OWNER_MATRIX_FUNCTIONS = 2
+LAMBDA_OWNER_MATRIX_BODY_NODES = 256
+LAMBDA_CALL_SITES_PER_FUNCTION = 12
+LAMBDA_AGGREGATE_SITES_PER_FUNCTION = 12
+LAMBDA_RESULT_SITES_PER_FUNCTION = 12
+LAMBDA_NESTED_RESULT_SITES_PER_FUNCTION = 1
+LAMBDA_OWNER_MATRIX_NORMALIZATION_VISITS = 1072
 WORKER_FLAG = "--measurement-worker"
 VMAP_SAMPLE_SECONDS = 0.1
 TERMINATE_GRACE_SECONDS = 1.0
@@ -251,6 +281,23 @@ def add_referenced_global_derived_counters(counters: dict[str, int]) -> dict[str
             "borrowed_call_node_visits",
             "borrowed_aggregate_node_visits",
             "borrowed_result_node_visits",
+        )
+    )
+    return result
+
+
+def add_lambda_derived_counters(counters: dict[str, int]) -> dict[str, int]:
+    """Backfill the pre-cutover lambda-region traversal measurement."""
+    result = dict(counters)
+    result.setdefault(
+        "lambda_borrowed_normalization_visits",
+        sum(
+            result[name]
+            for name in (
+                "borrowed_call_node_visits",
+                "borrowed_aggregate_node_visits",
+                "borrowed_result_node_visits",
+            )
         )
     )
     return result
@@ -468,7 +515,21 @@ def padded_result_sequence_with_work(
         raise ValueError(
             "referenced-global workload is larger than the requested node count"
         )
-    padding = padded_sequence(work, work_target_nodes)
+    padded_work = list(work)
+    work_nodes = expression_node_count(seq_expr(padded_work))
+    remaining_nodes = work_target_nodes - work_nodes
+    if remaining_nodes % 2 == 1:
+        if remaining_nodes < 3:
+            raise ValueError(
+                "non-result workload needs a dedicated three-node odd padding value"
+            )
+        padded_work.append({
+            "kind": "cast",
+            "expr": literal_expr("int", 0, "Int"),
+            "type": named_type("Int"),
+            "loc": synthetic_loc(),
+        })
+    padding = padded_sequence(padded_work, work_target_nodes)
     combined = {"kind": "seq", "first": padding, "second": result}
     if expression_node_count(combined) != target_nodes:
         raise RuntimeError("failed to construct exact referenced-global node target")
@@ -701,6 +762,180 @@ def referenced_global_boundary_census(value: Any) -> JsonObject:
     }
 
 
+def lambda_owner_name(function_index: int, owner_index: int) -> str:
+    return f"BENCH_LAMBDA_OWNER_{function_index:04d}_{owner_index:04d}"
+
+
+def lambda_owner_ref_expr(function_index: int, owner_index: int) -> JsonObject:
+    return {
+        "kind": "var",
+        "var": core_var(lambda_owner_name(function_index, owner_index), None),
+        "type": named_type(MANAGED_PARAMETER_TYPE),
+        "loc": synthetic_loc(),
+    }
+
+
+def lambda_expr(
+    params: list[JsonObject],
+    return_type: JsonObject,
+    body: JsonObject,
+) -> JsonObject:
+    return {
+        "kind": "lambda",
+        "params": params,
+        "return_type": return_type,
+        "body": body,
+        "pure": True,
+        "type": named_type("Function"),
+        "loc": synthetic_loc(),
+    }
+
+
+def lambda_boundary_result_tree(
+    function_index: int,
+    owner_count: int,
+) -> JsonObject:
+    results = [
+        lambda_owner_ref_expr(
+            function_index,
+            (LAMBDA_CALL_SITES_PER_FUNCTION + LAMBDA_AGGREGATE_SITES_PER_FUNCTION + site)
+            % owner_count,
+        )
+        for site in range(LAMBDA_RESULT_SITES_PER_FUNCTION)
+    ]
+    while len(results) > 1:
+        next_level: list[JsonObject] = []
+        index = 0
+        while index + 1 < len(results):
+            next_level.append({
+                "kind": "if",
+                "cond": literal_expr("bool", True, "Bool"),
+                "then": results[index],
+                "else": results[index + 1],
+                "type": named_type(MANAGED_PARAMETER_TYPE),
+                "loc": synthetic_loc(),
+            })
+            index += 2
+        if index < len(results):
+            next_level.append(results[index])
+        results = next_level
+    return results[0]
+
+
+def lambda_borrowed_boundary_expr(
+    function_index: int,
+    owner_count: int,
+    body_nodes: int,
+) -> JsonObject:
+    if owner_count < 1 or owner_count > 32:
+        raise ValueError("lambda borrowed boundary requires between 1 and 32 owners")
+
+    work: list[JsonObject] = []
+    for site in range(LAMBDA_CALL_SITES_PER_FUNCTION):
+        work.append({
+            "kind": "call",
+            "call_kind": {"kind": "builtin", "name": "blorp_string_concat_consume"},
+            "callee": {
+                "kind": "var",
+                "var": core_var("blorp_string_concat_consume", None),
+                "type": named_type("Function"),
+                "loc": synthetic_loc(),
+            },
+            "args": [
+                lambda_owner_ref_expr(function_index, site % owner_count),
+                literal_expr("string", "", MANAGED_PARAMETER_TYPE),
+            ],
+            "type": named_type(MANAGED_PARAMETER_TYPE),
+            "loc": synthetic_loc(),
+        })
+    for site in range(LAMBDA_AGGREGATE_SITES_PER_FUNCTION):
+        owner_index = (LAMBDA_CALL_SITES_PER_FUNCTION + site) % owner_count
+        work.append({
+            "kind": "record_construct",
+            "type_name": BORROWED_OWNER_TYPE_NAME,
+            "fields": [{
+                "name": "BENCH_PAYLOAD",
+                "value": lambda_owner_ref_expr(function_index, owner_index),
+            }],
+            "type": heap_record_type(BORROWED_OWNER_TYPE_NAME),
+            "loc": synthetic_loc(),
+        })
+
+    nested_name = f"BENCH_NESTED_LAMBDA_OWNER_{function_index:04d}"
+    work.append(lambda_expr(
+        [core_param(nested_name, MANAGED_PARAMETER_TYPE)],
+        named_type(MANAGED_PARAMETER_TYPE),
+        {
+            "kind": "var",
+            "var": core_var(nested_name, None),
+            "type": named_type(MANAGED_PARAMETER_TYPE),
+            "loc": synthetic_loc(),
+        },
+    ))
+
+    body = padded_result_sequence_with_work(
+        work=work,
+        result=lambda_boundary_result_tree(function_index, owner_count),
+        target_nodes=body_nodes,
+    )
+    params = [
+        core_param(lambda_owner_name(function_index, owner_index), MANAGED_PARAMETER_TYPE)
+        for owner_index in range(owner_count)
+    ]
+    return lambda_expr(params, named_type(MANAGED_PARAMETER_TYPE), body)
+
+
+def lambda_boundary_census(value: Any) -> JsonObject:
+    consuming_calls = 0
+    aggregate_transfers = 0
+    owner_reads = 0
+    owner_names: set[str] = set()
+    nested_lambdas = 0
+
+    def visit(current: Any) -> None:
+        nonlocal consuming_calls, aggregate_transfers, owner_reads, nested_lambdas
+        if isinstance(current, dict):
+            kind = current.get("kind")
+            if kind == "lambda":
+                nested_lambdas += 1
+                return
+            if kind == "call":
+                call_kind = current.get("call_kind")
+                if (
+                    isinstance(call_kind, dict)
+                    and call_kind.get("kind") == "builtin"
+                    and call_kind.get("name") == "blorp_string_concat_consume"
+                ):
+                    consuming_calls += 1
+            elif (
+                kind == "record_construct"
+                and current.get("type_name") == BORROWED_OWNER_TYPE_NAME
+            ):
+                aggregate_transfers += 1
+            elif kind == "var":
+                variable = current.get("var")
+                if isinstance(variable, dict):
+                    name = variable.get("name")
+                    if isinstance(name, str) and name.startswith("BENCH_LAMBDA_OWNER_"):
+                        owner_reads += 1
+                        owner_names.add(name)
+            for child in current.values():
+                visit(child)
+        elif isinstance(current, list):
+            for child in current:
+                visit(child)
+
+    visit(value)
+    return {
+        "consuming_calls": consuming_calls,
+        "aggregate_transfers": aggregate_transfers,
+        "result_terminals": owner_reads - consuming_calls - aggregate_transfers,
+        "owner_reads": owner_reads,
+        "distinct_owners": len(owner_names),
+        "nested_lambdas": nested_lambdas,
+    }
+
+
 def borrowed_param_name(function_index: int, param_index: int) -> str:
     return f"BENCH_BORROWED_PARAM_{function_index:04d}_{param_index:04d}"
 
@@ -867,6 +1102,32 @@ def worker_decl(
             MANAGED_PARAMETER_TYPE,
         )
 
+    if body_shape == "lambda_borrowed_boundary":
+        managed_local_name = f"BENCH_MANAGED_LOCAL_{index:04d}"
+        body = {
+            "kind": "let",
+            "name": core_var(managed_local_name, None),
+            "mutable": False,
+            "type": named_type(MANAGED_PARAMETER_TYPE),
+            "rhs": literal_expr(
+                "string",
+                f"managed-lambda-{index:04d}",
+                MANAGED_PARAMETER_TYPE,
+            ),
+            "body": lambda_borrowed_boundary_expr(
+                index,
+                params_per_function,
+                body_leaves,
+            ),
+        }
+        return user_function(
+            f"bench_worker_{index:04d}",
+            def_id,
+            body,
+            [],
+            "Function",
+        )
+
     if body_shape == "borrowed_return":
         if params_per_function == 0:
             raise ValueError("borrowed return requires parameters")
@@ -1023,7 +1284,7 @@ def call_worker_expr(
             "type": function_type,
             "loc": synthetic_loc(),
         },
-        "args": [
+        "args": [] if body_shape == "lambda_borrowed_boundary" else [
             (
                 borrowed_owner_argument_expr(param_index)
                 if body_shape in ("borrowed_call_protection", "aggregate_escape")
@@ -1032,9 +1293,13 @@ def call_worker_expr(
             for param_index in range(params_per_function)
         ],
         "type": named_type(
-            MANAGED_PARAMETER_TYPE
-            if body_shape in ("borrowed_return", "referenced_global_boundary")
-            else "Int"
+            "Function"
+            if body_shape == "lambda_borrowed_boundary"
+            else (
+                MANAGED_PARAMETER_TYPE
+                if body_shape in ("borrowed_return", "referenced_global_boundary")
+                else "Int"
+            )
         ),
         "loc": synthetic_loc(),
     }
@@ -1089,6 +1354,7 @@ def fixture_request(
             "borrowed_call_protection",
             "aggregate_escape",
             "referenced_global_boundary",
+            "lambda_borrowed_boundary",
         )
         else []
     )
@@ -1122,6 +1388,28 @@ def fixture_request(
             }
             if referenced_global_boundary_census(body) != expected_census:
                 raise RuntimeError("referenced-global boundary site census changed")
+    elif body_shape == "lambda_borrowed_boundary":
+        for function in functions_json:
+            outer = function.get("body", {}).get("body")
+            if not isinstance(outer, dict) or outer.get("kind") != "lambda":
+                raise RuntimeError("lambda-boundary worker is missing its outer lambda")
+            lambda_body = outer.get("body")
+            if expression_node_count(lambda_body) != body_leaves:
+                raise RuntimeError("lambda-boundary body node count changed")
+            expected_census = {
+                "consuming_calls": LAMBDA_CALL_SITES_PER_FUNCTION,
+                "aggregate_transfers": LAMBDA_AGGREGATE_SITES_PER_FUNCTION,
+                "result_terminals": LAMBDA_RESULT_SITES_PER_FUNCTION,
+                "owner_reads": (
+                    LAMBDA_CALL_SITES_PER_FUNCTION
+                    + LAMBDA_AGGREGATE_SITES_PER_FUNCTION
+                    + LAMBDA_RESULT_SITES_PER_FUNCTION
+                ),
+                "distinct_owners": params_per_function,
+                "nested_lambdas": 1,
+            }
+            if lambda_boundary_census(lambda_body) != expected_census:
+                raise RuntimeError("lambda borrowed-boundary site census changed")
     main_expressions = []
     if invoke_workers:
         main_expressions = [
@@ -1388,6 +1676,22 @@ def has_expected_managed_local_drop(value: Any) -> bool:
     return False
 
 
+def first_expression_of_kind(value: Any, expected_kind: str) -> JsonObject | None:
+    if isinstance(value, dict):
+        if value.get("kind") == expected_kind:
+            return value
+        for child in value.values():
+            found = first_expression_of_kind(child, expected_kind)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = first_expression_of_kind(child, expected_kind)
+            if found is not None:
+                return found
+    return None
+
+
 def validate_perceus_parameter_shape(
     core_program: JsonObject,
     function_count: int,
@@ -1411,8 +1715,40 @@ def validate_perceus_parameter_shape(
         if not isinstance(function, dict):
             raise RuntimeError(f"Perceus Core parameter shape is missing {function_name}")
         params = function.get("params")
-        if not isinstance(params, list) or len(params) != params_per_function:
+        expected_function_params = (
+            0 if body_shape == "lambda_borrowed_boundary" else params_per_function
+        )
+        if not isinstance(params, list) or len(params) != expected_function_params:
             raise RuntimeError(f"Perceus Core parameter shape changed for {function_name}")
+        if body_shape == "lambda_borrowed_boundary":
+            outer_lambda = first_expression_of_kind(function.get("body"), "lambda")
+            if not isinstance(outer_lambda, dict):
+                raise RuntimeError(f"Perceus Core is missing lambda for {function_name}")
+            lambda_params = outer_lambda.get("params")
+            if not isinstance(lambda_params, list) or len(lambda_params) != params_per_function:
+                raise RuntimeError(f"Perceus Core lambda owner shape changed for {function_name}")
+            for param_index, param in enumerate(lambda_params):
+                expected_name = lambda_owner_name(function_index, param_index)
+                if (
+                    not isinstance(param, dict)
+                    or param.get("name") != core_var(expected_name, None)
+                ):
+                    raise RuntimeError(
+                        f"Perceus Core lambda owner shape changed for {function_name}"
+                    )
+                expected_reads = sum(
+                    1 for site in range(
+                        LAMBDA_CALL_SITES_PER_FUNCTION
+                        + LAMBDA_AGGREGATE_SITES_PER_FUNCTION
+                        + LAMBDA_RESULT_SITES_PER_FUNCTION
+                    )
+                    if site % params_per_function == param_index
+                )
+                if count_parameter_reads(outer_lambda.get("body"), expected_name) != expected_reads:
+                    raise RuntimeError(
+                        f"Perceus Core lambda owner reads changed for {function_name}"
+                    )
+            continue
         for param_index, param in enumerate(params):
             expected_name = borrowed_param_name(function_index, param_index)
             if not isinstance(param, dict):
@@ -2040,6 +2376,8 @@ def run_benchmark(
                     parsed_counters = add_referenced_global_derived_counters(
                         parsed_counters
                     )
+                elif body_shape == "lambda_borrowed_boundary":
+                    parsed_counters = add_lambda_derived_counters(parsed_counters)
                 counter_observations.append(parsed_counters)
             if counter_observations[0] != counter_observations[1]:
                 raise RuntimeError("Perceus work counters differ between repeated runs")
@@ -2085,6 +2423,10 @@ def run_benchmark(
                     )
                     if body_shape == "referenced_global_boundary":
                         parsed_baseline_counters = add_referenced_global_derived_counters(
+                            parsed_baseline_counters
+                        )
+                    elif body_shape == "lambda_borrowed_boundary":
+                        parsed_baseline_counters = add_lambda_derived_counters(
                             parsed_baseline_counters
                         )
                     baseline_counter_observations.append(parsed_baseline_counters)
@@ -2658,6 +3000,182 @@ def validate_referenced_global_matrix(points: list[JsonObject]) -> None:
                 )
 
 
+def validate_lambda_owner_baseline_matrix(points: list[JsonObject]) -> None:
+    if len(points) != 3:
+        raise RuntimeError("lambda-owner matrix requires 1, 8, and 32-owner points")
+    owner_counts = [int(point["params_per_function"]) for point in points]
+    if owner_counts != [1, 8, 32]:
+        raise RuntimeError(
+            f"lambda-owner matrix requires 1, 8, and 32-owner points: {owner_counts}"
+        )
+
+    counters = [point.get("work_counters") for point in points]
+    if not all(isinstance(value, dict) for value in counters):
+        raise RuntimeError("lambda-owner matrix requires work counters")
+
+    for owner_count, counter in zip(owner_counts, counters):
+        expected_slots = LAMBDA_OWNER_MATRIX_FUNCTIONS * owner_count + LAMBDA_OWNER_MATRIX_FUNCTIONS
+        expected = {
+            "lambda_regions_normalized": LAMBDA_OWNER_MATRIX_FUNCTIONS * 2,
+            "lambda_parameter_owner_slots": expected_slots,
+            "lambda_capture_owner_slots": 0,
+            "lambda_referenced_global_owner_slots": 0,
+            "lambda_scalar_owner_normalizations": expected_slots,
+        }
+        for name, expected_value in expected.items():
+            if int(counter[name]) != expected_value:
+                raise RuntimeError(
+                    f"lambda-owner matrix {name} changed: "
+                    f"{counter[name]} != {expected_value}"
+                )
+
+    visits = [int(counter["lambda_borrowed_normalization_visits"]) for counter in counters]
+    if not (visits[0] < visits[1] < visits[2]):
+        raise RuntimeError(
+            f"lambda-owner scalar baseline must scale with owner count: {visits}"
+        )
+
+
+def validate_lambda_owner_catalog_matrix(points: list[JsonObject]) -> None:
+    if len(points) != 3:
+        raise RuntimeError("lambda-owner matrix requires 1, 8, and 32-owner points")
+    owner_counts = [int(point["params_per_function"]) for point in points]
+    if owner_counts != [1, 8, 32]:
+        raise RuntimeError(
+            f"lambda-owner matrix requires 1, 8, and 32-owner points: {owner_counts}"
+        )
+
+    counters = [point.get("work_counters") for point in points]
+    if not all(isinstance(value, dict) for value in counters):
+        raise RuntimeError("lambda-owner matrix requires work counters")
+
+    for owner_count, counter in zip(owner_counts, counters):
+        expected_slots = (
+            LAMBDA_OWNER_MATRIX_FUNCTIONS * owner_count
+            + LAMBDA_OWNER_MATRIX_FUNCTIONS
+        )
+        expected = {
+            "lambda_regions_normalized": LAMBDA_OWNER_MATRIX_FUNCTIONS * 2,
+            "lambda_parameter_owner_slots": expected_slots,
+            "lambda_capture_owner_slots": 0,
+            "lambda_referenced_global_owner_slots": 0,
+        }
+        for name, expected_value in expected.items():
+            if int(counter[name]) != expected_value:
+                raise RuntimeError(
+                    f"lambda-owner matrix {name} changed: "
+                    f"{counter[name]} != {expected_value}"
+                )
+
+        if int(counter["lambda_scalar_owner_normalizations"]) != 0:
+            raise RuntimeError(
+                "lambda-owner matrix retained scalar owner normalization: "
+                f"{counter['lambda_scalar_owner_normalizations']}"
+            )
+
+    visits = [int(counter["lambda_borrowed_normalization_visits"]) for counter in counters]
+    expected_visits = [LAMBDA_OWNER_MATRIX_NORMALIZATION_VISITS] * len(points)
+    if visits != expected_visits:
+        raise RuntimeError(
+            "lambda-owner catalog visits changed or scale with owner count: "
+            f"{visits} != {expected_visits}"
+        )
+
+    fallback_requests = [
+        int(counter["lambda_alias_fallback_requests"]) for counter in counters
+    ]
+    if any(fallback_requests):
+        raise RuntimeError(
+            "lambda-owner matrix unexpectedly entered scalar alias fallback: "
+            f"{fallback_requests}"
+        )
+
+    expected_actions = {
+        "borrowed_call_rewrite_actions": (
+            LAMBDA_OWNER_MATRIX_FUNCTIONS * LAMBDA_CALL_SITES_PER_FUNCTION
+        ),
+        "borrowed_aggregate_rewrite_actions": (
+            LAMBDA_OWNER_MATRIX_FUNCTIONS * LAMBDA_AGGREGATE_SITES_PER_FUNCTION
+        ),
+        "borrowed_result_rewrite_actions": (
+            LAMBDA_OWNER_MATRIX_FUNCTIONS
+            * (
+                LAMBDA_RESULT_SITES_PER_FUNCTION
+                + LAMBDA_NESTED_RESULT_SITES_PER_FUNCTION
+            )
+        ),
+    }
+    expected_actions["lambda_rewrite_actions"] = sum(expected_actions.values())
+    for counter_name, expected_action_count in expected_actions.items():
+        actual_actions = [int(counter[counter_name]) for counter in counters]
+        expected_action_counts = [expected_action_count] * len(points)
+        if actual_actions != expected_action_counts:
+            raise RuntimeError(
+                f"lambda-owner matrix {counter_name} changed: "
+                f"{actual_actions} != {expected_action_counts}"
+            )
+
+    if all(point.get("comparison_kind") == "compiler-worker" for point in points):
+        baseline_counters = [point.get("baseline_work_counters") for point in points]
+        if not all(isinstance(value, dict) for value in baseline_counters):
+            raise RuntimeError("lambda-owner matrix requires baseline work counters")
+
+        candidate_visits = visits[-1]
+        baseline_visits = int(
+            baseline_counters[-1]["lambda_borrowed_normalization_visits"]
+        )
+        if candidate_visits * 4 > baseline_visits:
+            raise RuntimeError(
+                "lambda-owner matrix must reduce 32-owner reconstruction visits "
+                f"by at least 75%: baseline {baseline_visits}, candidate {candidate_visits}"
+            )
+
+        high_owner = points[-1]
+        speed_ratio = high_owner.get(
+            "paired_window_elapsed_microseconds_ratio_median"
+        )
+        allocation_ratio = high_owner.get(
+            "paired_window_allocations_ratio_median"
+        )
+        if not isinstance(speed_ratio, (int, float)):
+            raise RuntimeError("lambda-owner matrix is missing paired direct timing")
+        if float(speed_ratio) > 0.85:
+            raise RuntimeError(
+                "lambda-owner matrix must make the 32-owner direct window at least "
+                f"15% faster: ratio {speed_ratio}"
+            )
+        if not isinstance(allocation_ratio, (int, float)):
+            raise RuntimeError("lambda-owner matrix is missing paired allocation data")
+        if float(allocation_ratio) > 0.80:
+            raise RuntimeError(
+                "lambda-owner matrix must reduce 32-owner direct-window allocations "
+                f"by at least 20%: ratio {allocation_ratio}"
+            )
+
+        one_owner = points[0]
+        one_owner_speed_ratio = one_owner.get(
+            "paired_window_elapsed_microseconds_ratio_median"
+        )
+        if not isinstance(one_owner_speed_ratio, (int, float)):
+            raise RuntimeError("lambda-owner matrix is missing one-owner paired timing")
+        if float(one_owner_speed_ratio) > 1.05:
+            raise RuntimeError(
+                "lambda-owner matrix one-owner direct timing regressed by more "
+                f"than 5%: ratio {one_owner_speed_ratio}"
+            )
+        for metric_name in ("window_allocations", "window_releases"):
+            ratio = one_owner.get(f"paired_{metric_name}_ratio_median")
+            if not isinstance(ratio, (int, float)):
+                raise RuntimeError(
+                    f"lambda-owner matrix is missing one-owner paired {metric_name}"
+                )
+            if float(ratio) > 1.02:
+                raise RuntimeError(
+                    "lambda-owner matrix one-owner "
+                    f"{metric_name} regressed by more than 2%: ratio {ratio}"
+                )
+
+
 def run_global_matrix(args: argparse.Namespace) -> int:
     root = project_root()
     with tempfile.TemporaryDirectory(prefix="blorp-perceus-matrix-worker-") as temp_name:
@@ -2853,6 +3371,56 @@ def run_referenced_global_matrix(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_lambda_owner_matrix(args: argparse.Namespace) -> int:
+    root = project_root()
+    with tempfile.TemporaryDirectory(prefix="blorp-perceus-lambda-owner-matrix-") as temp_name:
+        bridge = prepare_backend_worker(root, Path(temp_name) / "timing", args.bridge)
+        counter_bridge = None
+        if getattr(args, "work_counters", False):
+            counter_bridge = prepare_backend_worker(
+                root,
+                Path(temp_name) / "counters",
+                args.counter_bridge,
+                debug_profile=True,
+            )
+
+        matrix_points: list[JsonObject] = []
+        for owner_count in (1, 8, 32):
+            point = argparse.Namespace(**vars(args))
+            point.bridge = str(bridge)
+            point.counter_bridge = str(counter_bridge) if counter_bridge is not None else None
+            point.globals = 1
+            point.functions = LAMBDA_OWNER_MATRIX_FUNCTIONS
+            point.body_leaves = LAMBDA_OWNER_MATRIX_BODY_NODES
+            point.global_reads_per_function = 0
+            point.params_per_function = owner_count
+            point.parameter_type = MANAGED_PARAMETER_TYPE
+            point.body_shape = "lambda_borrowed_boundary"
+            point.measurement_window = "perceus-direct"
+            point.control_parameter_type = None
+            point.invoke_workers = False
+            point.global_matrix = False
+            point.parameter_matrix = False
+            point.aggregate_matrix = False
+            point.result_matrix = False
+            point.referenced_global_matrix = False
+            point.lambda_owner_matrix = False
+            point.contract_matrix = False
+            run_benchmark(point, matrix_points)
+
+        if getattr(args, "work_counters", False):
+            first_counters = matrix_points[0].get("work_counters")
+            if (
+                isinstance(first_counters, dict)
+                and int(first_counters["lambda_scalar_owner_normalizations"]) == 0
+            ):
+                validate_lambda_owner_catalog_matrix(matrix_points)
+            else:
+                validate_lambda_owner_baseline_matrix(matrix_points)
+
+    return 0
+
+
 def run_contract_matrix(args: argparse.Namespace) -> int:
     root = project_root()
     with tempfile.TemporaryDirectory(prefix="blorp-perceus-contract-matrix-") as temp_name:
@@ -3042,6 +3610,14 @@ def main(argv: list[str]) -> int:
         ),
     )
     parser.add_argument(
+        "--lambda-owner-matrix",
+        action="store_true",
+        help=(
+            "run the scalar 1/8/32 lambda-parameter owner baseline with fixed "
+            "two-function, 256-node lambda bodies"
+        ),
+    )
+    parser.add_argument(
         "--contract-matrix",
         action="store_true",
         help="vary borrowed owners, body nodes, and user-call edges one axis at a time",
@@ -3075,6 +3651,7 @@ def main(argv: list[str]) -> int:
         or args.aggregate_matrix
         or args.result_matrix
         or args.referenced_global_matrix
+        or args.lambda_owner_matrix
         or args.contract_matrix
     ):
         if args.global_reads_per_function >= args.body_leaves:
@@ -3112,6 +3689,7 @@ def main(argv: list[str]) -> int:
             args.aggregate_matrix,
             args.result_matrix,
             args.referenced_global_matrix,
+            args.lambda_owner_matrix,
             args.contract_matrix,
         )
     )
@@ -3125,6 +3703,8 @@ def main(argv: list[str]) -> int:
         parser.error("--result-matrix cannot be combined with --end-to-end")
     if args.referenced_global_matrix and args.end_to_end:
         parser.error("--referenced-global-matrix cannot be combined with --end-to-end")
+    if args.lambda_owner_matrix and args.end_to_end:
+        parser.error("--lambda-owner-matrix cannot be combined with --end-to-end")
     if args.result_matrix and args.baseline_bridge is None:
         parser.error("--result-matrix requires --baseline-bridge")
     if (
@@ -3158,6 +3738,8 @@ def main(argv: list[str]) -> int:
             return run_result_matrix(args)
         if args.referenced_global_matrix:
             return run_referenced_global_matrix(args)
+        if args.lambda_owner_matrix:
+            return run_lambda_owner_matrix(args)
         if args.contract_matrix:
             return run_contract_matrix(args)
         return run_benchmark(args)

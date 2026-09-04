@@ -1256,6 +1256,22 @@ The direct matrix leaves workers uncalled to isolate Perceus. Validate rooted
 generated C separately with `--body-shape referenced_global_boundary`,
 `--end-to-end`, and each 1/8/32 reference count.
 
+The lambda-owner baseline matrix keeps two uncalled outer functions and two
+256-node outer lambda bodies fixed while varying 1, 8, and 32 managed lambda
+parameters. Each outer lambda contains twelve consuming calls, twelve
+transferring record fields, twelve result terminals, and one fixed nested
+lambda region. This preparation matrix deliberately excludes captures and
+globals: their current name-mode overlap would make source-kind timing
+comparisons ambiguous. It records the scalar owner-scaled parent behavior for
+the later lambda-catalog cutover:
+
+```bash
+benchmarks/compiler_perceus_memory \
+  --lambda-owner-matrix \
+  --measurement-window perceus-direct \
+  --samples 7 --json
+```
+
 For performance decisions, compare explicit workers in alternating order:
 
 ```bash

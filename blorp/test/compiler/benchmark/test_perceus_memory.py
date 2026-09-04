@@ -1005,6 +1005,206 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "at least 75%"):
             self.benchmark.validate_referenced_global_matrix(insufficient_reduction)
 
+    def test_lambda_boundary_fixture_has_fixed_outer_region_geometry(self) -> None:
+        for owner_count in (1, 8, 32):
+            _, program = self.benchmark.fixture_request(
+                1,
+                2,
+                256,
+                0,
+                params_per_function=owner_count,
+                body_shape="lambda_borrowed_boundary",
+                invoke_workers=False,
+            )
+            workers = [
+                declaration
+                for declaration in program["decls"]
+                if declaration.get("kind") == "function"
+                and declaration.get("name", "").startswith("bench_worker_")
+            ]
+            self.assertEqual(len(workers), 2)
+            for worker in workers:
+                outer_lambda = worker["body"]["body"]
+                self.assertEqual(len(outer_lambda["params"]), owner_count)
+                self.assertEqual(
+                    self.benchmark.expression_node_count(outer_lambda["body"]),
+                    256,
+                )
+                self.assertEqual(
+                    self.benchmark.lambda_boundary_census(outer_lambda["body"]),
+                    {
+                        "consuming_calls": 12,
+                        "aggregate_transfers": 12,
+                        "result_terminals": 12,
+                        "owner_reads": 36,
+                        "distinct_owners": owner_count,
+                        "nested_lambdas": 1,
+                    },
+                )
+
+    def test_lambda_baseline_matrix_requires_exact_regions_and_owner_slots(self) -> None:
+        def point(owner_count, visits, *, regions=4):
+            slots = 2 * owner_count + 2
+            return {
+                "params_per_function": owner_count,
+                "work_counters": {
+                    "lambda_regions_normalized": regions,
+                    "lambda_parameter_owner_slots": slots,
+                    "lambda_capture_owner_slots": 0,
+                    "lambda_referenced_global_owner_slots": 0,
+                    "lambda_scalar_owner_normalizations": slots,
+                    "lambda_borrowed_normalization_visits": visits,
+                },
+            }
+
+        self.benchmark.validate_lambda_owner_baseline_matrix([
+            point(1, 100),
+            point(8, 800),
+            point(32, 3200),
+        ])
+
+        with self.assertRaisesRegex(RuntimeError, "lambda_regions_normalized"):
+            self.benchmark.validate_lambda_owner_baseline_matrix([
+                point(1, 100, regions=3),
+                point(8, 800),
+                point(32, 3200),
+            ])
+
+        with self.assertRaisesRegex(RuntimeError, "must scale with owner count"):
+            self.benchmark.validate_lambda_owner_baseline_matrix([
+                point(1, 100),
+                point(8, 100),
+                point(32, 100),
+            ])
+
+    def test_lambda_catalog_matrix_rejects_owner_scaled_or_scalar_work(self) -> None:
+        def point(
+            owner_count,
+            visits,
+            *,
+            scalar_normalizations=0,
+            fallback_requests=0,
+            baseline_visits=None,
+        ):
+            slots = 2 * owner_count + 2
+            return {
+                "params_per_function": owner_count,
+                "comparison_kind": "compiler-worker",
+                "paired_window_elapsed_microseconds_ratio_median": 0.80,
+                "paired_window_allocations_ratio_median": 0.70,
+                "paired_window_releases_ratio_median": 1.0,
+                "work_counters": {
+                    "lambda_regions_normalized": 4,
+                    "lambda_parameter_owner_slots": slots,
+                    "lambda_capture_owner_slots": 0,
+                    "lambda_referenced_global_owner_slots": 0,
+                    "lambda_scalar_owner_normalizations": scalar_normalizations,
+                    "lambda_borrowed_normalization_visits": visits,
+                    "lambda_alias_fallback_requests": fallback_requests,
+                    "lambda_rewrite_actions": 74,
+                    "borrowed_call_rewrite_actions": 24,
+                    "borrowed_aggregate_rewrite_actions": 24,
+                    "borrowed_result_rewrite_actions": 26,
+                },
+                "baseline_work_counters": {
+                    "lambda_borrowed_normalization_visits": (
+                        baseline_visits
+                        if baseline_visits is not None
+                        else visits * owner_count
+                    ),
+                },
+            }
+
+        valid = [point(1, 1072), point(8, 1072), point(32, 1072)]
+        self.benchmark.validate_lambda_owner_catalog_matrix(valid)
+
+        scaled = [point(1, 1072), point(8, 8576), point(32, 34304)]
+        with self.assertRaisesRegex(RuntimeError, "visits changed or scale"):
+            self.benchmark.validate_lambda_owner_catalog_matrix(scaled)
+
+        scalar = [
+            point(1, 1072, scalar_normalizations=4),
+            point(8, 1072, scalar_normalizations=18),
+            point(32, 1072, scalar_normalizations=66),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "scalar owner normalization"):
+            self.benchmark.validate_lambda_owner_catalog_matrix(scalar)
+
+        fallback = [
+            point(1, 1072, fallback_requests=1),
+            point(8, 1072, fallback_requests=1),
+            point(32, 1072, fallback_requests=1),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "scalar alias fallback"):
+            self.benchmark.validate_lambda_owner_catalog_matrix(fallback)
+
+        insufficient_reduction = [
+            point(1, 1072, baseline_visits=1072),
+            point(8, 1072, baseline_visits=2144),
+            point(32, 1072, baseline_visits=4000),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "at least 75%"):
+            self.benchmark.validate_lambda_owner_catalog_matrix(insufficient_reduction)
+
+        missing_aggregate_actions = [point(1, 1072), point(8, 1072), point(32, 1072)]
+        for matrix_point in missing_aggregate_actions:
+            matrix_point["work_counters"]["borrowed_aggregate_rewrite_actions"] = 0
+            matrix_point["work_counters"]["lambda_rewrite_actions"] = 50
+        with self.assertRaisesRegex(RuntimeError, "borrowed_aggregate_rewrite_actions"):
+            self.benchmark.validate_lambda_owner_catalog_matrix(
+                missing_aggregate_actions
+            )
+
+        slow_one_owner = [point(1, 1072), point(8, 1072), point(32, 1072)]
+        slow_one_owner[0]["paired_window_elapsed_microseconds_ratio_median"] = 1.06
+        with self.assertRaisesRegex(RuntimeError, "one-owner direct timing"):
+            self.benchmark.validate_lambda_owner_catalog_matrix(slow_one_owner)
+
+    def test_lambda_owner_matrix_reuses_workers_and_isolates_lambda_parameters(self) -> None:
+        args = argparse.Namespace(
+            bridge=None,
+            counter_bridge=None,
+            baseline_bridge=None,
+            globals=1,
+            functions=2,
+            body_leaves=256,
+            global_reads_per_function=0,
+            params_per_function=1,
+            parameter_type="String",
+            body_shape="linear",
+            end_to_end=False,
+            work_counters=False,
+        )
+
+        with mock.patch.object(
+            self.benchmark,
+            "prepare_backend_worker",
+            return_value=Path("/tmp/perceus-worker"),
+        ) as prepare, mock.patch.object(
+            self.benchmark,
+            "run_benchmark",
+            return_value=0,
+        ) as run:
+            self.benchmark.run_lambda_owner_matrix(args)
+
+        prepare.assert_called_once()
+        points = [
+            (
+                call.args[0].params_per_function,
+                call.args[0].functions,
+                call.args[0].body_leaves,
+                call.args[0].body_shape,
+                call.args[0].invoke_workers,
+                call.args[0].measurement_window,
+            )
+            for call in run.call_args_list
+        ]
+        self.assertEqual(points, [
+            (1, 2, 256, "lambda_borrowed_boundary", False, "perceus-direct"),
+            (8, 2, 256, "lambda_borrowed_boundary", False, "perceus-direct"),
+            (32, 2, 256, "lambda_borrowed_boundary", False, "perceus-direct"),
+        ])
+
     def test_referenced_global_visit_counter_composes_operation_work(self) -> None:
         operation_counters = {
             "borrowed_call_node_visits": 10,

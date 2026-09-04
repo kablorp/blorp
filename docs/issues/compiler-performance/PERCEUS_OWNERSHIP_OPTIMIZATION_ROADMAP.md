@@ -1097,6 +1097,12 @@ all-owner mechanisms to lambda parameters, runtime captures, and exact
 referenced globals. A nested lambda is opaque to its outer region and is
 normalized exactly once as its own ownership region.
 
+This tranche is implemented. On the fixed 32-owner lambda fixture,
+reconstruction visits fell 97.0%, the paired direct-Perceus median improved
+63.1%, allocations fell 68.7%, and releases fell 69.7%, with byte-identical
+post-Perceus Core and generated C. See
+[`compiler_perceus_tranche4c_2026-09-04.md`](../../../benchmarks/results/compiler_perceus_tranche4c_2026-09-04.md).
+
 Match, loop, resource, mutable-slot, and concurrency bindings introduced inside
 a region remain on their existing lexical-balancing path. Their all-value
 migration belongs to Tranches 5–6 rather than being hidden inside borrowed

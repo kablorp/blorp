@@ -1,4 +1,5 @@
 import:
+	../../../src/compiler/stage_09_core/closure as CoreClosure
 	../../../src/compiler/stage_09_core/consume_specialize as CoreConsumeSpecialize
 	../../../src/compiler/stage_09_core/ir:
 		CoreAccessor(
@@ -93,6 +94,7 @@ import:
 		CoreLoopRangeDirection(RangeForwardOnly),
 		CoreMatchBinding,
 		CoreMatchBindingMode(MatchBorrowBindingMode, MatchOwnBindingMode),
+		CoreClosureCapture,
 		CoreParam,
 		CoreProgram,
 		CoreRecordFieldValue,
@@ -7020,6 +7022,148 @@ pure func test_lambda_managed_capture_union_payload_is_retained() -> Bool:
 	dup_count_for("captured", rewritten) == 1
 
 
+pure func test_lambda_catalog_retains_parameter_capture_and_exact_global() -> Bool:
+	global_def_id: Int = 1501
+	global_value: CoreVar = {
+		name = "GLOBAL_TEXT",
+		uniq = 0,
+		def_id = Some(global_def_id)
+	}
+	result_type: CoreType = TupleType([string_type(), string_type(), string_type()])
+	program: CoreProgram = {
+		decls = [global_decl(
+				"GLOBAL_TEXT",
+				global_def_id,
+				string_type(),
+				LiteralExpr(StringLiteral("global"), string_type(), SyntheticSourceLoc),
+			)],
+		foreign_includes = [],
+	}
+	lambda: CoreExpr = LambdaExpr(
+		[core_param("parameter", string_type())],
+		result_type,
+		TupleExpr(
+			[
+				var_expr("parameter", string_type()),
+				var_expr("captured", string_type()),
+				VarExpr(global_value, string_type(), SyntheticSourceLoc),
+			],
+			result_type,
+			SyntheticSourceLoc,
+		),
+		True,
+		closure_type(),
+		SyntheticSourceLoc,
+	)
+
+	rewritten: CoreExpr = insert_drops_expr(build_env(program), lambda)
+
+	(
+		dup_count_for("parameter", rewritten) == 1
+		and dup_count_for("captured", rewritten) == 1
+		and dup_count_for("GLOBAL_TEXT", rewritten) == 1
+	)
+
+
+pure func test_lambda_parameter_spelling_excludes_runtime_capture() -> Bool:
+	parameter: CoreParam = core_param("shared", string_type())
+	body: CoreExpr = var_expr("shared", string_type())
+	captures: List[CoreClosureCapture] = CoreClosure.lambda_runtime_captures(
+		[],
+		[],
+		[parameter],
+		body,
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		LambdaExpr(
+			[parameter],
+			string_type(),
+			body,
+			True,
+			closure_type(),
+			SyntheticSourceLoc,
+		),
+	)
+
+	captures.is_empty() and dup_count_for("shared", rewritten) == 1
+
+
+pure func test_lambda_name_mode_capture_and_exact_global_retain_each_site_once() -> Bool:
+	global_def_id: Int = 1503
+	exact_global: CoreVar = {
+		name = "shared",
+		uniq = 0,
+		def_id = Some(global_def_id)
+	}
+	result_type: CoreType = TupleType([string_type(), string_type()])
+	body: CoreExpr = TupleExpr(
+		[
+			var_expr("shared", string_type()),
+			VarExpr(exact_global, string_type(), SyntheticSourceLoc),
+		],
+		result_type,
+		SyntheticSourceLoc,
+	)
+	program: CoreProgram = {
+		decls = [global_decl(
+				"shared",
+				global_def_id,
+				string_type(),
+				LiteralExpr(StringLiteral("global"), string_type(), SyntheticSourceLoc),
+			)],
+		foreign_includes = [],
+	}
+	rewritten: CoreExpr = insert_drops_expr(
+		build_env(program),
+		LambdaExpr(
+			[],
+			result_type,
+			body,
+			True,
+			closure_type(),
+			SyntheticSourceLoc,
+		),
+	)
+
+	match rewritten:
+		LambdaExpr(_, _, TupleExpr(items, _, _), _, _, _):
+			match items:
+				[DupExpr(first, _, ArcRetainPolicy, _, _, _), DupExpr(second, _, ArcRetainPolicy, _, _, _)]:
+					first.def_id == None and second.def_id == Some(global_def_id)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_nested_lambda_shared_owner_stays_in_inner_region() -> Bool:
+	inner: CoreExpr = LambdaExpr(
+		[core_param("shared", string_type())],
+		string_type(),
+		var_expr("shared", string_type()),
+		True,
+		closure_type(),
+		SyntheticSourceLoc,
+	)
+	outer: CoreExpr = LambdaExpr(
+		[core_param("shared", string_type())],
+		closure_type(),
+		inner,
+		True,
+		closure_type(),
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		outer,
+	)
+
+	match rewritten:
+		LambdaExpr(_, _, LambdaExpr(_, _, inner_body, _, _, _), _, _, _):
+			dup_count_for("shared", inner_body) == 1
+		_:
+			False
 pure func test_unmanaged_let_gets_no_drop() -> Bool:
 	expr: CoreExpr = LetExpr(named_var("n"), False, int_type(), int_expr(1), int_expr(2))
 	rewritten: CoreExpr = insert_drops_expr(
@@ -16048,6 +16192,22 @@ tests: TestSuite = {
 		(
 			"lambda managed capture union payload is retained",
 			test_lambda_managed_capture_union_payload_is_retained,
+		),
+		(
+			"lambda catalog retains parameter capture and exact global",
+			test_lambda_catalog_retains_parameter_capture_and_exact_global,
+		),
+		(
+			"lambda parameter spelling excludes runtime capture",
+			test_lambda_parameter_spelling_excludes_runtime_capture,
+		),
+		(
+			"lambda name mode capture and exact global retain each site once",
+			test_lambda_name_mode_capture_and_exact_global_retain_each_site_once,
+		),
+		(
+			"nested lambda shared owner stays in inner region",
+			test_nested_lambda_shared_owner_stays_in_inner_region,
 		),
 		("unmanaged let gets no drop", test_unmanaged_let_gets_no_drop),
 		(
