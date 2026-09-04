@@ -1,6 +1,6 @@
 # Stage 06 Environment Reuse Roadmap
 
-**Status:** Proposed execution outline
+**Status:** Complete through Issue 43; Issue 44 remains conditional
 
 ## Objective
 
@@ -196,6 +196,16 @@ lexical, provisional, and builtin functions in the session scope path. The
 existing accepted-callable candidate-list path remains until a simpler design
 can demonstrate an instruction reduction.
 
+Issue 43 is implemented. The final audit removed constant-zero migration
+telemetry, a synthetic graph-to-`Env` installation model, and unreachable
+adapters. Accepted aliases now check their retained authority before
+provisional target/containment conversion, removing exactly 24,177 resolved
+shape conversions in the measured compiler self-check. Median Phase 01-06
+retired instructions fell 1.298% and median peak footprint fell 0.788% versus
+the Issue 42 parent. Remaining sampled cost is broad ARC/list/dictionary work;
+Issue 44 remains conditional on identifying a specific lexical-environment
+hotspot rather than treating those runtime families as sufficient evidence.
+
 ### Later declaration families
 
 Issues 38-42 should be integrated serially. Their semantic inventories and
@@ -252,7 +262,7 @@ The point of the sequence is to preserve clean rollback and measurement points.
 
 ## Completion Criteria
 
-The roadmap is complete when:
+The roadmap completed with:
 
 - one accepted declaration catalog is built per accepted graph;
 - each module has one canonical view and at most one distinct CTFE dependency
@@ -261,7 +271,8 @@ The roadmap is complete when:
 - accepted declaration storage no longer grows with the sum of module
   visibility closures;
 - every check receives fresh session-local state;
-- `Env` has a documented lexical-only responsibility;
+- `Env` has a documented builtin, provisional, lexical, and session-only
+  responsibility;
 - no legacy graph publication or fallback lookup remains;
 - accepted and recoverable graph paths share the same reusable products,
   failed modules remain excluded, and unaffected modules still typecheck from

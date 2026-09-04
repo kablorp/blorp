@@ -1,9 +1,9 @@
--- Installation boundary from immutable type headers to the transitional Env.
---
--- Definition-owned builtin, alias, record, and union facts come from accepted
--- category-specific headers and authorities.
--- The installation target carries importer-local naming
--- separately, so parsed declarations are not replayed at this boundary.
+-- Projection boundary from immutable type headers into a typecheck session.
+-- Accepted aliases, records, and unions already live in category authorities;
+-- their authority-present paths record only known names and nominal homes.
+-- Builtins and provisional pre-acceptance checks still install real Env payloads.
+-- The installation target carries importer-local naming separately, so parsed
+-- declarations are not replayed at this boundary.
 import:
 	../../stage_04_modules/loaded_module: ModuleIdentity, module_identities_equal
 	../graph/indexed_graph: PreparedModuleScope, prepared_module_scope_identity
@@ -19,6 +19,7 @@ import:
 		typecheck_state_add_known_type_name,
 		typecheck_state_allows_builtin,
 		typecheck_state_record_type_home,
+	../type_system/accepted_alias_authority: accepted_alias_contains
 	../type_system/accepted_record_authority: accepted_record_contains
 	../type_system/context: register_resource_cleanup
 	../type_system/env:
@@ -528,9 +529,9 @@ private pure func semantic_type_from_resolved_shape(
 	semantic_type_from_resolved_shape_with_substitutions(graph, shape, installation, [])
 
 
--- Callable and implementation adapters use these category-specific entry
--- points so importer-local naming cannot be confused with owner-local naming.
--- The resolved shape remains definition-owned; only its legacy Env spelling
+-- Declaration-authority builders use these category-specific entry points so
+-- importer-local naming cannot be confused with owner-local naming. The
+-- resolved shape remains definition-owned; only its projected semantic spelling
 -- depends on the installation site.
 pure func local_semantic_type_from_resolved_shape(
 	graph: TypeHeaderGraph,
@@ -705,19 +706,6 @@ private pure func record_header_fields(
 		None
 
 
-pure func local_record_header_fields(
-	graph: TypeHeaderGraph,
-	module_identity: ModuleIdentity,
-	module_path: String,
-	header: AcceptedRecordHeader,
-) -> Option[List[FieldDecl]]:
-	record_header_fields(
-		graph,
-		header,
-		LocalTypeHeaderInstallation(module_identity, module_path),
-	)
-
-
 pure func imported_record_header_fields(
 	graph: TypeHeaderGraph,
 	module_identity: ModuleIdentity,
@@ -848,19 +836,6 @@ private pure func union_header_variant_definitions(
 	)
 
 
-pure func local_union_header_variants(
-	graph: TypeHeaderGraph,
-	module_identity: ModuleIdentity,
-	module_path: String,
-	header: AcceptedUnionHeader,
-) -> Option[List[VariantDef]]:
-	union_header_variant_definitions(
-		graph,
-		header,
-		LocalTypeHeaderInstallation(module_identity, module_path),
-	)
-
-
 pure func imported_union_header_variants(
 	graph: TypeHeaderGraph,
 	module_identity: ModuleIdentity,
@@ -930,7 +905,7 @@ private pure func install_union_header(
 					)
 
 
-private pure func finalize_installed_alias(
+private pure func finalize_provisional_alias(
 	state: TypecheckState,
 	source_name: String,
 	type_name: String,
@@ -950,21 +925,32 @@ private pure func finalize_installed_alias(
 				ImportedTypeHeaderInstallation(_, _):
 					typecheck_state_record_type_home(state, type_name, module_path, True)
 
-	match module_view_accepted_alias_authority(state.module_view):
-		Some(_):
+	match installation:
+		LocalTypeHeaderInstallation(_, _):
 			with_home
-		None:
-			match installation:
-				LocalTypeHeaderInstallation(_, _):
-					with_home
-				ImportedTypeHeaderInstallation(_, _):
-					add_imported_accepted_type_aliases(
-						with_home,
-						module_path,
-						source_name,
-						type_name,
-						type_parameters,
-					)
+		ImportedTypeHeaderInstallation(_, _):
+			add_imported_accepted_type_aliases(
+				with_home,
+				module_path,
+				source_name,
+				type_name,
+				type_parameters,
+			)
+
+
+private pure func project_accepted_alias_session_facts(
+	state: TypecheckState,
+	type_name: String,
+	layout: AliasLayout,
+	installation: TypeHeaderInstallation,
+) -> TypecheckState:
+	with_known_type = typecheck_state_add_known_type_name(state, type_name)
+
+	match layout:
+		TransparentAlias:
+			with_known_type
+		OpaqueAlias:
+			record_installed_type_home(with_known_type, type_name, installation)
 
 
 private pure func install_alias_header(
@@ -975,28 +961,38 @@ private pure func install_alias_header(
 ) -> TypecheckState:
 	source_name = type_id_name(alias_type_header_id(header))
 	type_name = installed_type_name(source_name, installation)
-	type_parameters = alias_type_header_parameters(
-		header,
-	).map(
-		func(parameter): type_parameter_id_name(parameter.id),
-	)
 	layout = alias_type_header_layout(header)
 
-	match semantic_type_from_resolved_shape(graph, alias_type_header_target(header), installation):
+	match module_view_accepted_alias_authority(state.module_view):
+		Some(authority):
+			if accepted_alias_contains(authority, type_name):
+				project_accepted_alias_session_facts(state, type_name, layout, installation)
+			else:
+				typecheck_state_add_error(
+					state,
+					"internal typecheck error: accepted alias authority is missing '" + type_name + "'",
+				)
 		None:
-			typecheck_state_add_error(
-				state,
-				"internal typecheck error: accepted alias header '" + type_name + "' refers to a module absent from its type-header graph",
+			type_parameters = alias_type_header_parameters(
+				header,
+			).map(
+				func(parameter): type_parameter_id_name(parameter.id),
 			)
-		Some(target):
-			containment = alias_type_header_containment_facts(header)
-			env_summary = env_containment_summary(containment)
 
-			env = match module_view_accepted_alias_authority(state.module_view):
-				Some(_):
-					state.env
+			match semantic_type_from_resolved_shape(
+				graph,
+				alias_type_header_target(header),
+				installation,
+			):
 				None:
-					match layout:
+					typecheck_state_add_error(
+						state,
+						"internal typecheck error: accepted alias header '" + type_name + "' refers to a module absent from its type-header graph",
+					)
+				Some(target):
+					containment = alias_type_header_containment_facts(header)
+					env_summary = env_containment_summary(containment)
+					env = match layout:
 						TransparentAlias:
 							env_add_accepted_alias_with_containment(
 								state.env,
@@ -1017,15 +1013,14 @@ private pure func install_alias_header(
 								env_summary,
 							)
 
-			with_env = { typecheck_state_add_known_type_name(state, type_name) | env = env }
-			finalize_installed_alias(
-				with_env,
-				source_name,
-				type_name,
-				type_parameters,
-				layout,
-				installation,
-			)
+					finalize_provisional_alias(
+						{ typecheck_state_add_known_type_name(state, type_name) | env = env },
+						source_name,
+						type_name,
+						type_parameters,
+						layout,
+						installation,
+					)
 
 
 pure func typecheck_install_local_builtin_headers(

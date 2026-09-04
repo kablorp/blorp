@@ -11,6 +11,24 @@ CATALOG = ROOT / "blorp/src/compiler/stage_06_typecheck/headers/declaration_cata
 DECL = ROOT / "blorp/src/compiler/stage_06_typecheck/decl.brp"
 INFER = ROOT / "blorp/src/compiler/stage_06_typecheck/infer.brp"
 ENV = ROOT / "blorp/src/compiler/stage_06_typecheck/type_system/env.brp"
+FRONTEND_PROFILE_FIXTURE = (
+    ROOT / "blorp/benchmark/compiler/compiler_frontend_declaration_catalog_profile_fixture.brp"
+)
+ALIAS_GRAPH = (
+    ROOT / "blorp/src/compiler/stage_06_typecheck/headers/accepted_alias_graph.brp"
+)
+ALIAS_AUTHORITY = (
+    ROOT / "blorp/src/compiler/stage_06_typecheck/type_system/accepted_alias_authority.brp"
+)
+RECORD_GRAPH = (
+    ROOT / "blorp/src/compiler/stage_06_typecheck/headers/accepted_record_graph.brp"
+)
+UNION_GRAPH = (
+    ROOT / "blorp/src/compiler/stage_06_typecheck/headers/accepted_union_graph.brp"
+)
+TYPE_HEADER_INSTALL = (
+    ROOT / "blorp/src/compiler/stage_06_typecheck/headers/type_header_install.brp"
+)
 GLOBAL_AUTHORITY = (
     ROOT
     / "blorp/src/compiler/stage_06_typecheck/type_system/accepted_global_authority.brp"
@@ -18,6 +36,10 @@ GLOBAL_AUTHORITY = (
 CALLABLE_AUTHORITY = (
     ROOT
     / "blorp/src/compiler/stage_06_typecheck/type_system/accepted_callable_authority.brp"
+)
+TRAIT_IMPLEMENTATION_AUTHORITY = (
+    ROOT
+    / "blorp/src/compiler/stage_06_typecheck/type_system/accepted_trait_implementation_authority.brp"
 )
 DECL_IMPORT = re.compile(r"(?m)^\s*\.\./decl(?:\s|:|$)")
 
@@ -49,6 +71,120 @@ class DeclarationCatalogBoundaryTests(unittest.TestCase):
         ):
             with self.subTest(forbidden_name=forbidden_name):
                 self.assertNotIn(forbidden_name, source)
+
+    def test_migration_only_zero_metrics_are_not_production_fields(self) -> None:
+        production_sources = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (
+                ALIAS_GRAPH,
+                RECORD_GRAPH,
+                UNION_GRAPH,
+                GLOBAL_AUTHORITY,
+                CALLABLE_AUTHORITY,
+                TRAIT_IMPLEMENTATION_AUTHORITY,
+            )
+        )
+
+        for obsolete_metric in (
+            "legacy_alias_graph_symbol_installs",
+            "legacy_record_graph_symbol_installs",
+            "legacy_union_graph_symbol_installs",
+            "legacy_graph_global_installs",
+            "global_exact_query_graph_scans",
+            "legacy_graph_callable_env_installs",
+            "legacy_graph_overload_installs",
+            "module_view_callable_full_record_copies",
+            "exact_callable_query_graph_scans",
+            "module_view_coherence_overlap_checks",
+            "legacy_graph_trait_env_installs",
+            "legacy_graph_implementation_env_installs",
+            "module_view_full_record_copies",
+            "exact_query_graph_scans",
+        ):
+            with self.subTest(obsolete_metric=obsolete_metric):
+                self.assertNotIn(obsolete_metric, production_sources)
+
+    def test_frontend_profile_does_not_model_legacy_env_publication(self) -> None:
+        decl_source = DECL.read_text(encoding="utf-8")
+        fixture_source = FRONTEND_PROFILE_FIXTURE.read_text(encoding="utf-8")
+
+        for obsolete_observation in (
+            "imported_type_header_installations",
+            "imported_constructor_installations",
+            "imported_callable_header_installations",
+            "imported_global_header_installations",
+            "imported_trait_header_installations",
+            "imported_implementation_header_installations",
+            "local_header_installations",
+            "scope_symbol_insertions",
+            "scope_batch_insertions",
+            "environment_publications",
+            "total_graph_declaration_installations",
+            "duplicate_installation_factor_millis",
+            "ordinary_body_environment_rebuilds",
+            "body_checks_started",
+        ):
+            with self.subTest(obsolete_observation=obsolete_observation):
+                self.assertNotIn(obsolete_observation, decl_source)
+                self.assertNotIn(obsolete_observation, fixture_source)
+
+        self.assertNotIn(
+            "CompilerFrontendDeclarationRepresentationModel", fixture_source
+        )
+        self.assertNotIn(
+            "compiler_frontend_declaration_catalog_profile_representation_model",
+            fixture_source,
+        )
+
+    def test_unreachable_declaration_adapters_are_absent(self) -> None:
+        sources_by_obsolete_helper = {
+            "accepted_record_graph_table": RECORD_GRAPH,
+            "local_record_header_fields": TYPE_HEADER_INSTALL,
+            "local_union_header_variants": TYPE_HEADER_INSTALL,
+            "accepted_implementation_find_exact": TRAIT_IMPLEMENTATION_AUTHORITY,
+        }
+
+        for obsolete_helper, source_path in sources_by_obsolete_helper.items():
+            with self.subTest(obsolete_helper=obsolete_helper):
+                self.assertNotIn(
+                    f"func {obsolete_helper}(",
+                    source_path.read_text(encoding="utf-8"),
+                )
+
+    def test_accepted_alias_projection_skips_provisional_payload_conversion(self) -> None:
+        source = TYPE_HEADER_INSTALL.read_text(encoding="utf-8")
+        function = re.search(
+            r"private pure func install_alias_header\(.*?"
+            r"(?=\n\npure func typecheck_install_local_builtin_headers)",
+            source,
+            re.DOTALL,
+        )
+
+        self.assertIsNotNone(function)
+        body = function.group(0)
+        authority_branch = body.index(
+            "match module_view_accepted_alias_authority(state.module_view)"
+        )
+        provisional_conversion = body.index("semantic_type_from_resolved_shape(")
+        self.assertLess(authority_branch, provisional_conversion)
+        self.assertIn("accepted_alias_contains(authority, type_name)", body)
+
+    def test_accepted_alias_membership_does_not_materialize_payload(self) -> None:
+        source = ALIAS_AUTHORITY.read_text(encoding="utf-8")
+        function = re.search(
+            r"pure func accepted_alias_contains\(.*?(?=\n\nprivate pure func)",
+            source,
+            re.DOTALL,
+        )
+
+        self.assertIsNotNone(function)
+        body = function.group(0)
+        self.assertNotIn("accepted_alias_find_transparent", body)
+        self.assertNotIn("accepted_alias_find_opaque", body)
+        self.assertNotIn("local_transparent_alias_value", body)
+        self.assertNotIn("local_opaque_alias_value", body)
+        self.assertNotIn(".get(binding.payload_index)", body)
+        self.assertNotIn(".get(binding.canonical_redirect_index)", body)
 
     def test_accepted_graph_globals_do_not_use_legacy_env_publication(self) -> None:
         self.assertTrue(GLOBAL_AUTHORITY.is_file())

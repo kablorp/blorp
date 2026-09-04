@@ -183,6 +183,23 @@ resolved call retains the selected candidate's bound type parameters and
 debug-only status; accepted body checking neither republishes graph callables
 into `Env` nor scans graph functions by name or definition ID.
 
+Type-header projection into an accepted module session is deliberately narrower
+than provisional installation. Authority-present alias, record, and union paths
+record known type names and nominal homes only; they do not rebuild targets,
+fields, variants, constructors, or containment payloads in `Env`. The alias path
+checks authority before converting its resolved target, so that conversion and
+containment work is reserved for provisional checking. Compiler builtins remain
+the intentional exception because their runtime/type-system primitives are
+session inputs rather than graph-owned source declarations.
+
+`PreparedCanonicalModuleEnvironment` is built once per accepted module and
+contains reusable declaration and inference-module facts. Every initializer and
+ordinary body derives a fresh `PreparedInferSessionEnv`, preserving independent
+metas, diagnostics, refinements, and lexical scopes without reconstructing the
+module base. CTFE does not retain another graph-owned environment: it constructs
+a dependency-only module view on demand, replays reserved definition IDs into a
+fresh session, and releases that preparation with the CTFE check.
+
 Exact identities established by the graph must survive later phases. A pass
 must not reconstruct semantic identity from declaration names, module strings,
 source order, or generated C spelling.
