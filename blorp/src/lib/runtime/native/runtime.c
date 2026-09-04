@@ -371,23 +371,19 @@ typedef struct blorp_Object_s {
 } blorp_Object;
 
 #define BLORP_ALLOC_CLASS_DIRECT UINT32_MAX
-#define BLORP_ALLOC_CLASS_UNTRACKED (UINT32_MAX - 1)
 typedef void (*blorp_destructor_fn)(void*);
 
-// User-facing struct for blorp_get_mem_stats return value
-// Uses blorp_Object header so it participates in ARC (codegen emits retain/release)
+// User-facing value snapshot for blorp_get_mem_stats.
 typedef struct {
-    blorp_Object header;
     long total_allocations;
     long total_releases;
     long current_objects;
     long bytes_allocated;
 } blorp_MemStats;
 
-// User-facing struct for scheduler instrumentation snapshots.
-// Field order must match standard_library/src/instrumentation.brp's SchedulerStats record.
+// User-facing value snapshot for scheduler instrumentation.
+// Field order must match standard_library/src/instrumentation.brp's SchedulerStats struct.
 typedef struct {
-    blorp_Object header;
     long tasks_spawned;
     long tasks_cancelled;
     long task_timeouts;
@@ -1992,35 +1988,6 @@ void* blorp_alloc(size_t size) {
     }
     if (__blorp_stats_enabled && __blorp_trace_allocs) {
         __blorp_trace_record(actual_size, alloc_site);
-    }
-    return obj;
-}
-
-static void blorp_untrack_allocated_object(void* obj) {
-    if (!obj) return;
-    blorp_Object* header = (blorp_Object*)obj;
-    blorp_AllocMeta* meta = __alloc_meta_take(header);
-    if (!meta) return;
-    bool counted_in_current_epoch =
-        meta->stats_tracked && meta->stats_epoch == atomic_load(&global_mem_stats.epoch);
-    if (__blorp_stats_enabled && counted_in_current_epoch) {
-        global_mem_stats.total_allocations--;
-        global_mem_stats.current_objects--;
-        global_mem_stats.bytes_allocated -= (long)meta->alloc_size;
-    }
-    free(meta);
-}
-
-static void* blorp_alloc_untracked(size_t size) {
-    void* obj = blorp_alloc(size);
-    if (__blorp_stats_enabled) {
-        blorp_untrack_allocated_object(obj);
-    } else if (__blorp_lightweight_stats_enabled) {
-        atomic_fetch_sub_explicit(
-            &global_mem_stats.total_allocations, 1, memory_order_relaxed);
-        atomic_fetch_sub_explicit(
-            &global_mem_stats.current_objects, 1, memory_order_relaxed);
-        ((blorp_Object*)obj)->alloc_class = BLORP_ALLOC_CLASS_UNTRACKED;
     }
     return obj;
 }
@@ -3982,8 +3949,6 @@ static int blorp_io_reactor_take_ready(
 __attribute__((noinline))
 static void blorp_release_slow_finish(blorp_Object* header, void* obj,
                                       blorp_destructor_fn destructor) {
-    bool lightweight_tracked =
-        header->alloc_class != BLORP_ALLOC_CLASS_UNTRACKED;
     blorp_AllocMeta* meta = __alloc_meta_take(header);
     bool stats_tracked = meta && meta->stats_tracked;
     bool counted_in_current_epoch =
@@ -4015,9 +3980,7 @@ static void blorp_release_slow_finish(blorp_Object* header, void* obj,
         global_mem_stats.total_releases++;
         global_mem_stats.current_objects--;
         global_mem_stats.bytes_allocated -= (long)freed_size;
-    } else if (!__blorp_stats_enabled &&
-               __blorp_lightweight_stats_enabled &&
-               lightweight_tracked) {
+    } else if (!__blorp_stats_enabled && __blorp_lightweight_stats_enabled) {
         atomic_fetch_add_explicit(
             &global_mem_stats.total_releases, 1, memory_order_relaxed);
         atomic_fetch_sub_explicit(
@@ -36671,26 +36634,25 @@ bool blorp_setenv(const blorp_String* name, const blorp_String* value) {
 // Memory Stats (wired into blorp_alloc/blorp_release above)
 // ============================================================================
 
-blorp_MemStats* blorp_get_mem_stats(void) {
+blorp_MemStats blorp_get_mem_stats(void) {
     bool allocator_stats = __blorp_allocator_stats_active();
     if (!allocator_stats) {
         __blorp_stats_enabled = true;
     }
-    blorp_MemStats* stats = (blorp_MemStats*)blorp_alloc_untracked(sizeof(blorp_MemStats));
-    // MemStats is an observation object, not part of the measured program heap.
+    blorp_MemStats stats = {0};
     if (allocator_stats) {
-        stats->total_allocations = atomic_load_explicit(
+        stats.total_allocations = atomic_load_explicit(
             &global_mem_stats.total_allocations, memory_order_relaxed);
-        stats->total_releases = atomic_load_explicit(
+        stats.total_releases = atomic_load_explicit(
             &global_mem_stats.total_releases, memory_order_relaxed);
-        stats->current_objects = atomic_load_explicit(
+        stats.current_objects = atomic_load_explicit(
             &global_mem_stats.current_objects, memory_order_relaxed);
-        stats->bytes_allocated = __blorp_allocator_bytes_in_use();
+        stats.bytes_allocated = __blorp_allocator_bytes_in_use();
     } else {
-        stats->total_allocations = atomic_load(&global_mem_stats.total_allocations);
-        stats->total_releases = atomic_load(&global_mem_stats.total_releases);
-        stats->current_objects = atomic_load(&global_mem_stats.current_objects);
-        stats->bytes_allocated = atomic_load(&global_mem_stats.bytes_allocated);
+        stats.total_allocations = atomic_load(&global_mem_stats.total_allocations);
+        stats.total_releases = atomic_load(&global_mem_stats.total_releases);
+        stats.current_objects = atomic_load(&global_mem_stats.current_objects);
+        stats.bytes_allocated = atomic_load(&global_mem_stats.bytes_allocated);
     }
     return stats;
 }
@@ -36723,105 +36685,103 @@ void blorp_print_live_object_summary(void) {
     fflush(stdout);
 }
 
-blorp_SchedulerStats* blorp_get_scheduler_stats(void) {
+blorp_SchedulerStats blorp_get_scheduler_stats(void) {
     atomic_store_explicit(
         &__blorp_scheduler_stats_enabled, 1, memory_order_relaxed);
-    blorp_SchedulerStats* stats =
-        (blorp_SchedulerStats*)blorp_alloc_untracked(
-            sizeof(blorp_SchedulerStats));
-    stats->tasks_spawned =
+    blorp_SchedulerStats stats = {0};
+    stats.tasks_spawned =
         atomic_load_explicit(&global_scheduler_stats.tasks_spawned,
             memory_order_relaxed);
-    stats->tasks_cancelled =
+    stats.tasks_cancelled =
         atomic_load_explicit(&global_scheduler_stats.tasks_cancelled,
             memory_order_relaxed);
-    stats->task_timeouts =
+    stats.task_timeouts =
         atomic_load_explicit(&global_scheduler_stats.task_timeouts,
             memory_order_relaxed);
-    stats->fibers_created =
+    stats.fibers_created =
         atomic_load_explicit(&global_scheduler_stats.fibers_created,
             memory_order_relaxed);
-    stats->fibers_reused =
+    stats.fibers_reused =
         atomic_load_explicit(&global_scheduler_stats.fibers_reused,
             memory_order_relaxed);
-    stats->fibers_completed =
+    stats.fibers_completed =
         atomic_load_explicit(&global_scheduler_stats.fibers_completed,
             memory_order_relaxed);
-    stats->fiber_resumes =
+    stats.fiber_resumes =
         atomic_load_explicit(&global_scheduler_stats.fiber_resumes,
             memory_order_relaxed);
-    stats->fiber_parks =
+    stats.fiber_parks =
         atomic_load_explicit(&global_scheduler_stats.fiber_parks,
             memory_order_relaxed);
-    stats->fiber_schedule_transitions =
+    stats.fiber_schedule_transitions =
         atomic_load_explicit(
             &global_scheduler_stats.fiber_schedule_transitions,
             memory_order_relaxed);
-    stats->cooperative_yields =
+    stats.cooperative_yields =
         atomic_load_explicit(&global_scheduler_stats.cooperative_yields,
             memory_order_relaxed);
-    stats->channel_send_parks =
+    stats.channel_send_parks =
         atomic_load_explicit(&global_scheduler_stats.channel_send_parks,
             memory_order_relaxed);
-    stats->channel_recv_parks =
+    stats.channel_recv_parks =
         atomic_load_explicit(&global_scheduler_stats.channel_recv_parks,
             memory_order_relaxed);
-    stats->runnable_enqueues =
+    stats.runnable_enqueues =
         atomic_load_explicit(&global_scheduler_stats.runnable_enqueues,
             memory_order_relaxed);
-    stats->run_queue_pops =
+    stats.run_queue_pops =
         atomic_load_explicit(&global_scheduler_stats.run_queue_pops,
             memory_order_relaxed);
-    stats->timer_inserts =
+    stats.timer_inserts =
         atomic_load_explicit(&global_scheduler_stats.timer_inserts,
             memory_order_relaxed);
-    stats->timer_expirations =
+    stats.timer_expirations =
         atomic_load_explicit(&global_scheduler_stats.timer_expirations,
             memory_order_relaxed);
-    stats->reactor_control_wakes =
+    stats.reactor_control_wakes =
         atomic_load_explicit(&global_scheduler_stats.reactor_control_wakes,
             memory_order_relaxed);
-    stats->reactor_poll_wakes =
+    stats.reactor_poll_wakes =
         atomic_load_explicit(&global_scheduler_stats.reactor_poll_wakes,
             memory_order_relaxed);
-    stats->reactor_ready_events =
+    stats.reactor_ready_events =
         atomic_load_explicit(&global_scheduler_stats.reactor_ready_events,
             memory_order_relaxed);
-    stats->reactor_waiter_wakes =
+    stats.reactor_waiter_wakes =
         atomic_load_explicit(&global_scheduler_stats.reactor_waiter_wakes,
             memory_order_relaxed);
-    stats->stack_allocations =
+    stats.stack_allocations =
         atomic_load_explicit(&global_scheduler_stats.stack_allocations,
             memory_order_relaxed);
-    stats->stack_reuses =
+    stats.stack_reuses =
         atomic_load_explicit(&global_scheduler_stats.stack_reuses,
             memory_order_relaxed);
-    stats->work_steals =
+    stats.work_steals =
         atomic_load_explicit(&global_scheduler_stats.work_steals,
             memory_order_relaxed);
-    stats->run_queue_lock_contentions =
+    stats.run_queue_lock_contentions =
         atomic_load_explicit(
             &global_scheduler_stats.run_queue_lock_contentions,
             memory_order_relaxed);
-    stats->timer_lock_contentions =
+    stats.timer_lock_contentions =
         atomic_load_explicit(&global_scheduler_stats.timer_lock_contentions,
             memory_order_relaxed);
-    stats->tracked_active_tasks =
+    stats.tracked_active_tasks =
         atomic_load_explicit(&global_scheduler_stats.tracked_active_tasks,
             memory_order_relaxed);
-    stats->tracked_parked_fibers =
+    stats.tracked_parked_fibers =
         atomic_load_explicit(&global_scheduler_stats.tracked_parked_fibers,
             memory_order_relaxed);
-    stats->worker_count =
+    stats.worker_count =
         __blorp_pool ? __blorp_pool->num_threads : 0;
-    stats->runnable_count =
+    stats.runnable_count =
         atomic_load_explicit(&__fiber_runnable_count, memory_order_relaxed);
     if (__fibers_initialized) {
         pthread_mutex_lock(&__fiber_timer_queue.lock);
-        stats->timers_pending = (long)__fiber_timer_queue.len;
+        stats.timers_pending = (long)__fiber_timer_queue.len;
         pthread_mutex_unlock(&__fiber_timer_queue.lock);
     } else {
-        stats->timers_pending = 0;
+        stats.timers_pending = 0;
     }
     return stats;
 }

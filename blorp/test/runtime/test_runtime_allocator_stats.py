@@ -98,27 +98,24 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
             #include "runtime.c"
 
             int main(void) {
-                blorp_MemStats* before = blorp_get_mem_stats();
-                if (before->total_allocations != 0) return 2;
-                if (before->total_releases != 0) return 3;
-                if (before->current_objects != 0) return 4;
-                if (before->bytes_allocated <= 0) return 5;
-                long before_bytes = before->bytes_allocated;
-                blorp_release(before);
+                blorp_MemStats before = blorp_get_mem_stats();
+                if (before.total_allocations != 0) return 2;
+                if (before.total_releases != 0) return 3;
+                if (before.current_objects != 0) return 4;
+                if (before.bytes_allocated <= 0) return 5;
+                long before_bytes = before.bytes_allocated;
 
                 blorp_Object* object = blorp_alloc(sizeof(blorp_Object));
-                blorp_MemStats* after_object_alloc = blorp_get_mem_stats();
-                if (after_object_alloc->total_allocations != 1) return 6;
-                if (after_object_alloc->total_releases != 0) return 7;
-                if (after_object_alloc->current_objects != 1) return 8;
-                blorp_release(after_object_alloc);
+                blorp_MemStats after_object_alloc = blorp_get_mem_stats();
+                if (after_object_alloc.total_allocations != 1) return 6;
+                if (after_object_alloc.total_releases != 0) return 7;
+                if (after_object_alloc.current_objects != 1) return 8;
                 blorp_release(object);
 
-                blorp_MemStats* after_object_release = blorp_get_mem_stats();
-                if (after_object_release->total_allocations != 1) return 9;
-                if (after_object_release->total_releases != 1) return 10;
-                if (after_object_release->current_objects != 0) return 11;
-                blorp_release(after_object_release);
+                blorp_MemStats after_object_release = blorp_get_mem_stats();
+                if (after_object_release.total_allocations != 1) return 9;
+                if (after_object_release.total_releases != 1) return 10;
+                if (after_object_release.current_objects != 0) return 11;
 
                 for (size_t slot = 0; slot < BLORP_ALLOC_META_SLOTS; slot++) {
                     if (__alloc_meta_table[slot] != NULL) return 12;
@@ -129,15 +126,13 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
                 if (!allocation) return 13;
                 memset(allocation, 0x5a, allocation_size);
 
-                blorp_MemStats* during = blorp_get_mem_stats();
-                long during_bytes = during->bytes_allocated;
-                blorp_release(during);
+                blorp_MemStats during = blorp_get_mem_stats();
+                long during_bytes = during.bytes_allocated;
                 if (during_bytes - before_bytes < (long)(allocation_size / 2)) return 14;
 
                 free(allocation);
-                blorp_MemStats* after = blorp_get_mem_stats();
-                long after_bytes = after->bytes_allocated;
-                blorp_release(after);
+                blorp_MemStats after = blorp_get_mem_stats();
+                long after_bytes = after.bytes_allocated;
                 if (during_bytes - after_bytes < (long)(allocation_size / 2)) return 15;
                 return 0;
             }
@@ -205,25 +200,22 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
                 blorp_Object* measured = blorp_alloc(sizeof(blorp_Object));
                 if (!has_allocation_metadata(measured)) return 3;
 
-                blorp_MemStats* live = blorp_get_mem_stats();
-                if (live->total_allocations != 1) return 4;
-                if (live->total_releases != 0) return 5;
-                if (live->current_objects != 1) return 6;
-                blorp_release(live);
+                blorp_MemStats live = blorp_get_mem_stats();
+                if (live.total_allocations != 1) return 4;
+                if (live.total_releases != 0) return 5;
+                if (live.current_objects != 1) return 6;
 
                 blorp_release(before_epoch);
-                blorp_MemStats* after_old_release = blorp_get_mem_stats();
-                if (after_old_release->total_allocations != 1) return 7;
-                if (after_old_release->total_releases != 0) return 8;
-                if (after_old_release->current_objects != 1) return 9;
-                blorp_release(after_old_release);
+                blorp_MemStats after_old_release = blorp_get_mem_stats();
+                if (after_old_release.total_allocations != 1) return 7;
+                if (after_old_release.total_releases != 0) return 8;
+                if (after_old_release.current_objects != 1) return 9;
 
                 blorp_release(measured);
-                blorp_MemStats* complete = blorp_get_mem_stats();
-                if (complete->total_allocations != 1) return 10;
-                if (complete->total_releases != 1) return 11;
-                if (complete->current_objects != 0) return 12;
-                blorp_release(complete);
+                blorp_MemStats complete = blorp_get_mem_stats();
+                if (complete.total_allocations != 1) return 10;
+                if (complete.total_releases != 1) return 11;
+                if (complete.current_objects != 0) return 12;
                 return 0;
             }
             """

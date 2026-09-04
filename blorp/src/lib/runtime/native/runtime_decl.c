@@ -190,11 +190,9 @@ typedef struct blorp_Object_s {
 } blorp_Object;
 
 #define BLORP_ALLOC_CLASS_DIRECT UINT32_MAX
-#define BLORP_ALLOC_CLASS_UNTRACKED (UINT32_MAX - 1)
 typedef void (*blorp_destructor_fn)(void*);
 
 typedef struct {
-    blorp_Object header;
     long total_allocations;
     long total_releases;
     long current_objects;
@@ -202,7 +200,6 @@ typedef struct {
 } blorp_MemStats;
 
 typedef struct {
-    blorp_Object header;
     long tasks_spawned;
     long tasks_cancelled;
     long task_timeouts;
@@ -2328,11 +2325,11 @@ blorp_String* blorp_getenv_nullable(const blorp_String* name);
 bool blorp_setenv(const blorp_String* name, const blorp_String* value);
 
 // Memory Stats / Profiling
-blorp_MemStats* blorp_get_mem_stats(void);
+blorp_MemStats blorp_get_mem_stats(void);
 void blorp_reset_mem_stats(void);
 void blorp_compiler_memory_checkpoint_c(const char* phase);
 void blorp_print_live_object_summary(void);
-blorp_SchedulerStats* blorp_get_scheduler_stats(void);
+blorp_SchedulerStats blorp_get_scheduler_stats(void);
 void blorp_reset_scheduler_stats(void);
 void blorp_profile_enable(void);
 void blorp_profile_start(const char* func_name);
