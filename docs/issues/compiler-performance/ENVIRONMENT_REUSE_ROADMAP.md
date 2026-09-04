@@ -189,6 +189,13 @@ relationships are computed once in the table rather than once per module
 view. Three isolated Phase 01-06 self-check samples retired a median 8.3%
 fewer instructions than the Issue 40 parent with 7.7% lower median wall time.
 
+Issue 42's fail-fast prototypes did not reduce Phase 01-06 retired
+instructions, so the accepted change stops short of the candidate-selection
+cutover. It deletes the dormant standalone `Env` UFCS channel and keeps real
+lexical, provisional, and builtin functions in the session scope path. The
+existing accepted-callable candidate-list path remains until a simpler design
+can demonstrate an instruction reduction.
+
 ### Later declaration families
 
 Issues 38-42 should be integrated serially. Their semantic inventories and

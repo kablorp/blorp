@@ -35,7 +35,6 @@ import:
 		env_add_trait_function,
 		env_add_type,
 		env_add_type_with_constructor_ids,
-		env_add_ufcs_method,
 		env_add_var,
 		env_add_var_with_details,
 		env_add_var_with_module_details,
@@ -55,7 +54,6 @@ import:
 		env_get_type_params,
 		env_get_var_type,
 		env_has_trait_bound_transitive,
-		env_has_ufcs_method,
 		env_is_func_param,
 		env_is_local_func,
 		env_is_scoped_resource_derived_var,
@@ -64,17 +62,16 @@ import:
 		env_lookup,
 		env_lookup_in_current_scope,
 		env_lookup_is_outermost_scope,
-		env_lookup_module_ufcs_methods,
-		env_lookup_ufcs_methods,
+		env_lookup_session_ufcs_functions,
 		env_lookup_with_scope_depth,
 		env_mint_def_id,
 		env_pop_scope,
 		env_push_scope,
 		env_resolve_alias,
 		env_resolve_trait_obligation,
-		env_resolve_ufcs_method,
 		env_scoped_resource_unavailable_owner,
 		env_select_overload_for_args,
+		env_select_ufcs_method,
 		env_set_type_param_bounds,
 		env_symbols_named,
 		env_trait_function_collision,
@@ -134,6 +131,26 @@ pure func overload_entry(
 		loop_producer = None,
 		debug_only = False
 	}
+
+
+pure func env_add_test_ufcs_function(env: Env, name: String, entry: OverloadEntry) -> Env:
+	env_add_func_with_info(
+		env,
+		name,
+		func_symbol(
+			entry.def_id,
+			entry.func_type,
+			entry.type_params,
+			entry.param_names,
+			entry.purity,
+			entry.origin,
+			entry.resource_args,
+			entry.module_path,
+			entry.dim_constraints,
+			entry.loop_producer,
+			entry.debug_only,
+		),
+	)
 
 
 pure func two_arg_overload_entry(
@@ -1399,7 +1416,7 @@ func test_traits_impls_overloads_and_ufcs() -> Bool:
 		loop_producer = Some(LoopProducerWindows),
 		debug_only = string_entry.debug_only
 	}
-	env = env_add_ufcs_method(env, "windowed", windowed_entry)
+	env = env_add_test_ufcs_function(env, "windowed", windowed_entry)
 	env = env_add_func(
 		env,
 		"local_helper",
@@ -1423,7 +1440,7 @@ func test_traits_impls_overloads_and_ufcs() -> Bool:
 				[int_entry, string_entry],
 				[TYPE_STRING],
 			),
-			env_lookup_ufcs_methods(env, "windowed", TYPE_STRING).get(0),
+			env_lookup_session_ufcs_functions(env, "windowed", TYPE_STRING).get(0),
 		)
 	):
 		(Some(existing), Some(resolved_overload), Some(ufcs_entry)):
@@ -1452,7 +1469,11 @@ func test_traits_impls_overloads_and_ufcs() -> Bool:
 							None:
 								False
 						and ufcs_entry.def_id == 12
-						and env_has_ufcs_method(env, "windowed")
+						and not env_lookup_session_ufcs_functions(
+							env,
+							"windowed",
+							TYPE_STRING,
+						).is_empty()
 						and env_trait_has_supertrait(env, "Display", "Stringable")
 						and env_trait_method_names_transitive(env, "Display") == ["show"]
 						and declaring_methods.length() == 1
@@ -1783,37 +1804,6 @@ func test_prepared_module_declarations_create_isolated_root_environments() -> Bo
 					False
 
 
-func test_module_ufcs_lookup_filters_module_and_receiver() -> Bool:
-	string_entry = { overload_entry(20, TYPE_STRING, TYPE_INT) | module_path = Some("text") }
-	int_entry = { overload_entry(21, TYPE_INT, TYPE_FLOAT) | module_path = Some("text") }
-	other_module_entry = { overload_entry(22, TYPE_STRING, TYPE_BOOL) |
-		module_path = Some("other")
-	}
-	env = env_add_ufcs_method(
-		env_add_ufcs_method(
-			env_add_ufcs_method(ENV_EMPTY, "size", string_entry),
-			"size",
-			int_entry,
-		),
-		"size",
-		other_module_entry,
-	)
-	matches = env_lookup_module_ufcs_methods(env, "text", "size", TYPE_STRING)
-	wrong_receiver = env_lookup_module_ufcs_methods(env, "text", "size", TYPE_BOOL)
-	wrong_module = env_lookup_module_ufcs_methods(env, "missing", "size", TYPE_STRING)
-
-	match matches.get(0):
-		Some(entry):
-			(
-				matches.length() == 1
-				and entry.def_id == 20
-				and wrong_receiver.length() == 0
-				and wrong_module.length() == 0
-			)
-		None:
-			False
-
-
 func test_function_symbol_ufcs_lookup_filters_same_name_candidates() -> Bool:
 	int_func = func_symbol(
 		30,
@@ -1846,15 +1836,18 @@ func test_function_symbol_ufcs_lookup_filters_same_name_candidates() -> Bool:
 		"convert",
 		string_func,
 	)
-	matches = env_lookup_module_ufcs_methods(env, "convert", "convert", TYPE_STRING)
+	matches = env_lookup_session_ufcs_functions(env, "convert", TYPE_STRING)
 
 	match matches.get(0):
 		Some(entry):
 			(
 				matches.length() == 1
 				and entry.def_id == 31
-				and env_has_ufcs_method(env, "convert")
-				and not env_has_ufcs_method(env, "missing")
+				and env_lookup_session_ufcs_functions(
+					env,
+					"missing",
+					TYPE_STRING,
+				).is_empty()
 			)
 		None:
 			False
@@ -1863,13 +1856,16 @@ func test_function_symbol_ufcs_lookup_filters_same_name_candidates() -> Bool:
 func test_ufcs_resolution_prefers_concrete_receiver() -> Bool:
 	generic_entry = generic_overload_entry(23, SemanticTypeVar("T"), TYPE_STRING, "T")
 	concrete_entry = overload_entry(24, TYPE_STRING, TYPE_INT)
-	env = env_add_ufcs_method(
-		env_add_ufcs_method(ENV_EMPTY, "repeat", generic_entry),
+	env = env_add_test_ufcs_function(
+		env_add_test_ufcs_function(ENV_EMPTY, "repeat", generic_entry),
 		"repeat",
 		concrete_entry,
 	)
 
-	match env_resolve_ufcs_method(env, "repeat", TYPE_STRING):
+	match env_select_ufcs_method(
+		env_lookup_session_ufcs_functions(env, "repeat", TYPE_STRING),
+		TYPE_STRING,
+	):
 		Some(entry):
 			entry.def_id == 24
 		None:
@@ -1975,10 +1971,6 @@ tests: TestSuite = {
 		(
 			"prepared module declarations create isolated root environments",
 			test_prepared_module_declarations_create_isolated_root_environments,
-		),
-		(
-			"module ufcs lookup filters module and receiver",
-			test_module_ufcs_lookup_filters_module_and_receiver,
 		),
 		(
 			"function-symbol ufcs lookup filters same-name candidates",

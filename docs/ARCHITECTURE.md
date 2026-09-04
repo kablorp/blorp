@@ -177,7 +177,8 @@ implementations, and methods are not republished into prepared `Env` values.
 
 `Env` remains authoritative for provisional header construction, compiler
 builtins, body-local type parameters and their bounds, refinements, variables,
-and nested lexical scopes. A
+and nested lexical scopes. It has no standalone UFCS collection; UFCS reads
+from `Env` inspect only actual session functions in those scopes. A
 resolved call retains the selected candidate's bound type parameters and
 debug-only status; accepted body checking neither republishes graph callables
 into `Env` nor scans graph functions by name or definition ID.

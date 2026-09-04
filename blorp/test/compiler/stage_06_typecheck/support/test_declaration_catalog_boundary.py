@@ -132,6 +132,9 @@ class DeclarationCatalogBoundaryTests(unittest.TestCase):
                 self.assertNotIn(removed_name, infer_source)
 
         self.assertNotIn("overloads: List[OverloadSet]", env_source)
+        self.assertNotIn("ufcs_methods: List[OverloadSet]", env_source)
+        self.assertNotIn("env_add_ufcs_method", env_source)
+        self.assertNotIn("env_lookup_module_ufcs_methods", env_source)
         self.assertNotIn("infer_bare_overload_callee", infer_source)
         self.assertNotIn("missing_bare_overload_call_result", infer_source)
         self.assertIn("accepted_callable_table", decl_source)
@@ -175,7 +178,6 @@ class DeclarationCatalogBoundaryTests(unittest.TestCase):
             1,
         )
         self.assertIn("base_indices_by_module", graph_preparation.group(0))
-
 
 if __name__ == "__main__":
     unittest.main()
