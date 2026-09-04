@@ -293,6 +293,30 @@ private @debug_only pure func perceus_work_borrowed_call_node_visits() -> Int:
 	black_box_int(0)
 
 
+private @debug_only pure func perceus_work_borrowed_call_owner_catalog_slots() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func perceus_work_borrowed_call_owner_candidate_visits() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func perceus_work_borrowed_call_alias_fallback_requests() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func perceus_work_borrowed_call_rewrite_actions() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func perceus_work_borrowed_origin_member_visits() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func perceus_work_borrowed_origin_storage_slots() -> Int:
+	black_box_int(0)
+
+
 private @debug_only pure func perceus_work_borrowed_aggregate_node_visits() -> Int:
 	black_box_int(0)
 
@@ -351,6 +375,12 @@ pure func register_perceus_work_counters() -> Int:
 		perceus_work_linear_summary_node_visits()
 		perceus_work_legacy_count_node_visits()
 		perceus_work_borrowed_call_node_visits()
+		perceus_work_borrowed_call_owner_catalog_slots()
+		perceus_work_borrowed_call_owner_candidate_visits()
+		perceus_work_borrowed_call_alias_fallback_requests()
+		perceus_work_borrowed_call_rewrite_actions()
+		perceus_work_borrowed_origin_member_visits()
+		perceus_work_borrowed_origin_storage_slots()
 		perceus_work_borrowed_aggregate_node_visits()
 		perceus_work_borrowed_result_node_visits()
 		perceus_work_resolved_value_queries()
@@ -480,6 +510,25 @@ private record ScalarBalanceFallback {
 private record ContractParameterIndex {
 	params: List[CoreParam],
 	candidate_indices_by_name: Dict[String, List[Int]]
+}
+
+
+-- Borrowed-call protection only needs the earliest owner that can supply an
+-- evaluated result: the first owner is the one the former owner-major rewrite
+-- retained, and that retain makes the result owned for every later owner. Keep
+-- stable dense IDs so this ordering is explicit without allocating an owner
+-- set at every syntax node.
+private record BorrowedOwnerCatalog {
+	owners: List[CoreParam],
+	candidate_ids_by_name: Dict[String, List[Int]],
+	has_unresolved_identity: Bool
+}
+
+
+private record BorrowedCallRewriteContext {
+	env: PerceusEnv,
+	owners: BorrowedOwnerCatalog,
+	shadowed_owner_ids: Dict[Int, Bool]
 }
 
 
@@ -809,10 +858,7 @@ private pure func lookup_ownership_callable_id(
 			for candidate_id in index.candidate_ids_by_name.get_or(name, []):
 				match index.entries_by_id.get(candidate_id):
 					Some(entry):
-						if (
-							entry.identity.name == name
-							and entry.identity.def_id == expected_def_id
-						):
+						if entry.identity.name == name and entry.identity.def_id == expected_def_id:
 							found = Some(candidate_id)
 							break
 						else:
@@ -873,12 +919,14 @@ private pure func lookup_direct_user_call_contract(
 				Some(entry):
 					match entry.direct_consumed_args:
 						Some(consumed_args):
-							Some(user_call_contract_from_consumed_args(
-								env,
-								consumed_args,
-								arg_count,
-								return_type,
-							))
+							Some(
+								user_call_contract_from_consumed_args(
+									env,
+									consumed_args,
+									arg_count,
+									return_type,
+								),
+							)
 						None:
 							None
 				None:
@@ -1005,8 +1053,9 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 				callable_id: OwnershipCallableId = callable_entries.length()
 				identity: CoreDefinitionIdentity = {
 					name = func_info.name,
-					def_id = func_info.def_id,
+					def_id = func_info.def_id
 				}
+
 				contract_source: OwnershipCallableContractSource = match func_info.body:
 					Some(_):
 						match func_info.function_kind:
@@ -1016,6 +1065,7 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 								InferredCallableContract
 					None:
 						ExplicitCallSiteContract
+
 				callable_entries = callable_entries.append({
 					id = callable_id,
 					identity = identity,
@@ -1028,7 +1078,9 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 				})
 				callable_candidate_ids_by_name = callable_candidate_ids_by_name.set(
 					func_info.name,
-					callable_candidate_ids_by_name.get_or(func_info.name, []).append(callable_id),
+					callable_candidate_ids_by_name
+						.get_or(func_info.name, [])
+						.append(callable_id),
 				)
 				function_definitions = function_definitions.append(identity)
 			GlobalDecl(global):
@@ -1384,11 +1436,23 @@ pure func contract_for_call(
 				Some(contract):
 					Some(contract)
 				None:
-					match lookup_direct_user_call_contract(env, name, def_id, arg_count, return_type):
+					match lookup_direct_user_call_contract(
+						env,
+						name,
+						def_id,
+						arg_count,
+						return_type,
+					):
 						Some(contract):
 							Some(contract)
 						None:
-							match lookup_user_call_contract(env, name, def_id, arg_count, return_type):
+							match lookup_user_call_contract(
+								env,
+								name,
+								def_id,
+								arg_count,
+								return_type,
+							):
 								Some(contract):
 									Some(contract)
 								None:
@@ -16579,7 +16643,9 @@ private pure func build_contract_parameter_index(
 
 			candidates = candidates.set(
 				param.name.name,
-				candidates.get_or(param.name.name, []).append(parameter_index),
+				candidates
+					.get_or(param.name.name, [])
+					.append(parameter_index),
 			)
 		else:
 			void
@@ -16773,14 +16839,17 @@ private pure func contract_expr_introduces_parameter_shadow(
 		ConstructorMatchExpr(_, _, cases, fallback, _, _):
 			contract_constructor_match_shadows_parameter(index, cases, fallback)
 		LiteralMatchExpr(_, cases, fallback, typ, loc):
-			contract_literal_match_shadows_parameter(index, {
-				accessor = RootAccessor,
-				scrutinee_type = typ,
-				cases = cases,
-				fallback = fallback,
-				result_type = typ,
-				loc = loc
-			})
+			contract_literal_match_shadows_parameter(
+				index,
+				{
+					accessor = RootAccessor,
+					scrutinee_type = typ,
+					cases = cases,
+					fallback = fallback,
+					result_type = typ,
+					loc = loc
+				},
+			)
 		AccessorLiteralMatchExpr(_, _, match_expr, _, _):
 			contract_literal_match_shadows_parameter(index, match_expr)
 		LengthMatchExpr(_, _, match_expr, _, _):
@@ -16858,13 +16927,14 @@ private pure func record_contract_parameter_use(
 						caller = caller,
 						caller_parameter_index = parameter_index,
 						callee = callee,
-						callee_argument_index = callee_argument_index,
+						callee_argument_index = callee_argument_index
 					}
 					callee_arguments: Dict[Int, Dict[Int, Bool]] = state.seen_user_call_flows.get_or(
 						parameter_index,
 						{},
 					)
 					argument_indices: Dict[Int, Bool] = callee_arguments.get_or(callee, {})
+
 					if argument_indices.contains(callee_argument_index):
 						state
 					else:
@@ -16923,6 +16993,7 @@ private pure func push_contract_boxed_storage_values(
 			ConsumeContractResult
 		else:
 			BorrowContractResult
+
 		next = push_contract_task(next, demand, value.value)
 
 	next
@@ -17101,7 +17172,11 @@ private pure func schedule_contract_call(
 														args,
 													)
 										None:
-											push_contract_exprs(pending, ConsumeContractResult, args)
+											push_contract_exprs(
+												pending,
+												ConsumeContractResult,
+												args,
+											)
 								None:
 									match contract_for_call(env, kind, args.length(), return_type):
 										Some(contract):
@@ -17124,6 +17199,7 @@ private pure func schedule_contract_call(
 						contract.args,
 						args,
 					)
+
 					match kind:
 						ClosureCall:
 							push_contract_task(with_args, BorrowContractResult, callee)
@@ -17153,9 +17229,15 @@ private pure func schedule_contract_linear(
 				pending = pending
 			}
 		LiteralExpr(_, _, _) | VoidExpr(_, _) | BreakExpr(_, _):
-			{ state = state, pending = pending }
+			{
+				state = state,
+				pending = pending
+			}
 		DebugBlockExpr(body, typ, loc):
-			{ state = state, pending = push_contract_task(pending, demand, body) }
+			{
+				state = state,
+				pending = push_contract_task(pending, demand, body)
+			}
 		CallExpr(kind, callee, args, typ, loc):
 			{
 				state = state,
@@ -17170,6 +17252,7 @@ private pure func schedule_contract_linear(
 				BorrowContractResult
 			else:
 				ConsumeContractResult
+
 			{
 				state = state,
 				pending = push_contract_task(
@@ -17183,6 +17266,7 @@ private pure func schedule_contract_linear(
 				BorrowContractResult
 			else:
 				ConsumeContractResult
+
 			{
 				state = state,
 				pending = push_contract_task(pending, rhs_demand, rhs)
@@ -17203,6 +17287,7 @@ private pure func schedule_contract_linear(
 					demand
 				_:
 					BorrowContractResult
+
 			{
 				state = state,
 				pending = push_contract_task(pending, child_demand, box_op.value)
@@ -17232,7 +17317,10 @@ private pure func schedule_contract_linear(
 				pending = push_contract_task(pending, InspectNestedContractRegion, body)
 			}
 		ClosureCreateExpr(_, _, _):
-			{ state = state, pending = pending }
+			{
+				state = state,
+				pending = pending
+			}
 		LetExpr(variable, is_mutable, bind_type, rhs, body):
 			rhs_demand: ContractConsumptionDemand = if (
 				is_managed_type(env, bind_type)
@@ -17241,6 +17329,7 @@ private pure func schedule_contract_linear(
 				BorrowContractResult
 			else:
 				ConsumeContractResult
+
 			{
 				state = state,
 				pending = push_contract_task(
@@ -17269,10 +17358,12 @@ private pure func schedule_contract_linear(
 			}
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
 			parameter_dup: Bool = contract_parameter_index(index, variable) != None
+
 			next_state: ContractCollectionState = if parameter_dup:
 				{ state | contains_parameter_dup = True }
 			else:
 				state
+
 			{
 				state = next_state,
 				pending = push_contract_task(pending, demand, body)
@@ -17327,6 +17418,7 @@ private pure func schedule_contract_linear(
 				BorrowContractResult
 			else:
 				ConsumeContractResult
+
 			{
 				state = state,
 				pending = push_contract_task(
@@ -17375,6 +17467,7 @@ private pure func schedule_contract_linear(
 				ConsumeContractResult
 			else:
 				BorrowContractResult
+
 			{
 				state = state,
 				pending = push_contract_task(
@@ -17453,8 +17546,13 @@ private pure func schedule_contract_linear(
 			}
 		DictConstructExpr(construct, typ, loc):
 			var next: ContractCollectionTaskStack = pending
+
 			for entry in construct.entries:
-				next = push_contract_boxed_storage_values(next, [entry.key, entry.value])
+				next = push_contract_boxed_storage_values(
+					next,
+					[entry.key, entry.value],
+				)
+
 			{
 				state = state,
 				pending = next
@@ -17497,6 +17595,7 @@ private pure func schedule_contract_linear(
 						state
 			else:
 				state
+
 			{
 				state = next_state,
 				pending = push_contract_match_children(index, pending, demand, expr)
@@ -17515,6 +17614,7 @@ private pure func schedule_contract_linear(
 						state
 			else:
 				state
+
 			{
 				state = next_state,
 				pending = push_contract_match_children(index, pending, demand, expr)
@@ -17528,6 +17628,7 @@ private pure func schedule_contract_linear(
 						state
 			else:
 				state
+
 			{
 				state = next_state,
 				pending = push_contract_match_children(index, pending, demand, expr)
@@ -17538,17 +17639,22 @@ private pure func schedule_contract_linear(
 				demand,
 				scope.body,
 			)
+
 			with_cleanup: ContractCollectionTaskStack = match demand:
 				ReturnContractResult(_):
 					with_body
 				_:
 					push_contract_task(with_body, ConsumeContractResult, scope.cleanup)
+
 			{
 				state = state,
 				pending = with_cleanup
 			}
 		PreClosureDetachExpr(_, _, _) | DetachExpr(_, _, _):
-			{ state = state, pending = pending }
+			{
+				state = state,
+				pending = pending
+			}
 		ForRangeExpr(binder, start, end_value, body, typ, loc):
 			{
 				state = state,
@@ -17670,6 +17776,7 @@ private pure func schedule_contract_linear(
 			}
 		SelectExpr(select_expr, typ, loc):
 			var next: ContractCollectionTaskStack = pending
+
 			for arm in select_expr:
 				match arm.kind:
 					SelectRecvArm(recv):
@@ -17678,7 +17785,9 @@ private pure func schedule_contract_linear(
 						next = push_contract_task(next, BorrowContractResult, channel)
 					SelectAfterArm(timeout):
 						next = push_contract_task(next, ConsumeContractResult, timeout)
+
 				next = push_contract_task(next, ConsumeContractResult, arm.body)
+
 			{
 				state = state,
 				pending = next
@@ -17722,6 +17831,7 @@ private pure func collect_function_contract_equation(
 		match pending:
 			ContractCollectionMore(demand, expr, remaining):
 				pending = remaining
+
 				debug:
 					perceus_work_contract_collection_expression_visits()
 
@@ -17730,6 +17840,7 @@ private pure func collect_function_contract_equation(
 						False
 					_:
 						True
+
 				if (
 					checks_enclosing_parameter_identity
 					and contract_expr_introduces_parameter_shadow(parameter_index, expr)
@@ -17751,7 +17862,10 @@ private pure func collect_function_contract_equation(
 					BorrowContractResult:
 						match expr:
 							VarExpr(variable, typ, loc):
-								{ state = state, pending = pending }
+								{
+									state = state,
+									pending = pending
+								}
 							FieldExpr(owner, field, typ, loc):
 								{
 									state = state,
@@ -17916,11 +18030,15 @@ private pure func collect_function_contract_equation(
 							LetExpr(variable, is_mutable, bind_type, rhs, body):
 								rhs_demand: ContractConsumptionDemand = if (
 									is_managed_type(env, bind_type)
-									and contract_direct_alias_parameter(parameter_index, rhs) != None
+									and contract_direct_alias_parameter(
+										parameter_index,
+										rhs,
+									) != None
 								):
 									BorrowContractResult
 								else:
 									ConsumeContractResult
+
 								{
 									state = state,
 									pending = push_contract_task(
@@ -17979,7 +18097,10 @@ private pure func collect_function_contract_equation(
 								if is_managed_type(env, return_type):
 									match expr:
 										VarExpr(variable, typ, loc):
-											{ state = state, pending = pending }
+											{
+												state = state,
+												pending = pending
+											}
 										_:
 											match schedule_contract_linear(
 												env,
@@ -18030,11 +18151,13 @@ private pure func collect_function_contract_equation(
 
 	var directly_consumed: List[Int] = []
 	var parameter_index_value: Int = 0
+
 	while parameter_index_value < func_info.params.length():
 		if state.directly_consumed_parameters.contains(parameter_index_value):
 			directly_consumed = directly_consumed.append(parameter_index_value)
 		else:
 			void
+
 		parameter_index_value += 1
 
 	{
@@ -18409,6 +18532,7 @@ private pure func infer_consumed_parameters_scalar(
 								func_info.return_type,
 								body,
 							)
+
 							if uses.consumed_refs > 0:
 								consumed = consumed.append(index)
 							else:
@@ -18434,13 +18558,14 @@ private pure func build_ownership_contract_graph(
 	for entry in env.callables.entries_by_id:
 		equations = equations.append({
 			function = entry.id,
-			directly_consumed_parameters = []
+			directly_consumed_parameters = [],
 		})
 		reverse_flows = reverse_flows.append({})
 
 	inference_env: PerceusEnv = { env | infer_unresolved_user_calls_as_borrow = True }
 
 	var declaration_index: Int = 0
+
 	while declaration_index < program.decls.length():
 		match program.decls.get(declaration_index):
 			Some(FunctionDecl(func_info)):
@@ -18456,7 +18581,9 @@ private pure func build_ownership_contract_graph(
 							_:
 								match func_info.body:
 									Some(body):
-										if func_info.params.any(func(param): is_managed_type(env, param.typ)):
+										if func_info.params.any(
+											func(param): is_managed_type(env, param.typ),
+										):
 											collected: CollectedContractEquation = collect_function_contract_equation(
 												inference_env,
 												callable_id,
@@ -18471,12 +18598,13 @@ private pure func build_ownership_contract_graph(
 												collected.contains_parameter_dup
 												or collected.contains_parameter_shadow
 											)
+
 											equation: FunctionContractEquation = if uses_scalar_fallback:
 												scalar_balance_fallbacks = scalar_balance_fallbacks.append({
 													callable = callable_id,
 													declaration_index = declaration_index,
 													has_incoming_dup = collected.contains_parameter_dup,
-													has_parameter_shadow = collected.contains_parameter_shadow
+													has_parameter_shadow = collected.contains_parameter_shadow,
 												})
 												{
 													function = callable_id,
@@ -18484,6 +18612,7 @@ private pure func build_ownership_contract_graph(
 												}
 											else:
 												collected.equation
+
 											equations = equations.set(callable_id, equation)
 
 											if not uses_scalar_fallback:
@@ -18492,19 +18621,28 @@ private pure func build_ownership_contract_graph(
 														flow.callee,
 														{},
 													)
-													if not callee_flows.contains(flow.callee_argument_index):
+
+													if not callee_flows.contains(
+														flow.callee_argument_index,
+													):
 														debug:
 															perceus_work_contract_reverse_parameter_slots()
 													else:
 														void
+
 													reverse_flows = reverse_flows.set(
 														flow.callee,
 														callee_flows.set(
 															flow.callee_argument_index,
-															callee_flows.get_or(flow.callee_argument_index, []).append({
-																caller = flow.caller,
-																caller_parameter_index = flow.caller_parameter_index
-															}),
+															callee_flows
+																.get_or(
+																	flow.callee_argument_index,
+																	[],
+																)
+																.append({
+																	caller = flow.caller,
+																	caller_parameter_index = flow.caller_parameter_index,
+																}),
 														),
 													)
 											else:
@@ -18541,6 +18679,7 @@ private pure func solve_user_call_contracts(
 	for equation in graph.equations_by_callable_id:
 		var consumed_parameters: Dict[Int, Bool] = {}
 		var contract: List[Int] = []
+
 		for parameter_index in equation.directly_consumed_parameters:
 			if not consumed_parameters.contains(parameter_index):
 				debug:
@@ -18550,14 +18689,16 @@ private pure func solve_user_call_contracts(
 				contract = contract.append(parameter_index)
 			else:
 				void
+
 		consumed_parameters_by_callable = consumed_parameters_by_callable.append(
 			consumed_parameters,
 		)
 		contracts_by_callable = contracts_by_callable.append(contract)
+
 		if contract.length() > 0:
 			pending_work = pending_work.append({
 				callable = equation.function,
-				parameter_frontier = contract
+				parameter_frontier = contract,
 			})
 		else:
 			void
@@ -18569,19 +18710,20 @@ private pure func solve_user_call_contracts(
 	-- Scalar compatibility functions participate in the same fixed-point waves
 	-- as graph equations. Seed them against the empty inferred-contract table,
 	-- exactly like the former initial whole-program analysis.
-	initial_fallback_env: PerceusEnv = { env |
-		infer_unresolved_user_calls_as_borrow = True
-	}
+	initial_fallback_env: PerceusEnv = { env | infer_unresolved_user_calls_as_borrow = True }
+
 	for fallback in graph.scalar_balance_fallbacks:
 		match program.decls.get(fallback.declaration_index):
 			Some(FunctionDecl(func_info)):
 				debug:
 					perceus_work_contract_scalar_fallback_analyses()
+
 					if fallback.has_incoming_dup:
 						perceus_work_contract_dup_fallback_analyses()
 						void
 					else:
 						void
+
 					if fallback.has_parameter_shadow:
 						perceus_work_contract_shadow_fallback_analyses()
 						void
@@ -18593,17 +18735,20 @@ private pure func solve_user_call_contracts(
 					func_info,
 				)
 				var initial_set: Dict[Int, Bool] = {}
+
 				for parameter_index in initial:
 					initial_set = initial_set.set(parameter_index, True)
+
 				consumed_parameters_by_callable = consumed_parameters_by_callable.set(
 					fallback.callable,
 					initial_set,
 				)
 				contracts_by_callable = contracts_by_callable.set(fallback.callable, initial)
+
 				if initial.length() > 0:
 					pending_work = pending_work.append({
 						callable = fallback.callable,
-						parameter_frontier = initial
+						parameter_frontier = initial,
 					})
 				else:
 					void
@@ -18618,6 +18763,7 @@ private pure func solve_user_call_contracts(
 			contracts_by_callable
 		else:
 			[]
+
 		var discovered_parameters_by_caller: Dict[Int, Dict[Int, Bool]] = {}
 		var next_candidate_callables: List[OwnershipCallableId] = []
 		var seen_next_candidates: Dict[Int, Bool] = {}
@@ -18648,8 +18794,12 @@ private pure func solve_user_call_contracts(
 												)
 												discovered_parameters_by_caller = discovered_parameters_by_caller.set(
 													flow.caller,
-													discovered.set(flow.caller_parameter_index, True),
+													discovered.set(
+														flow.caller_parameter_index,
+														True,
+													),
 												)
+
 												if not seen_next_candidates.contains(flow.caller):
 													next_candidate_callables = next_candidate_callables.append(
 														flow.caller,
@@ -18681,6 +18831,7 @@ private pure func solve_user_call_contracts(
 					var next_contract: List[Int] = contract
 					var newly_consumed_parameters: List[Int] = []
 					var parameter_index: Int = 0
+
 					while parameter_index < entry.parameter_count:
 						if (
 							discovered.contains(parameter_index)
@@ -18699,6 +18850,7 @@ private pure func solve_user_call_contracts(
 							)
 						else:
 							void
+
 						parameter_index += 1
 
 					consumed_parameters_by_callable = consumed_parameters_by_callable.set(
@@ -18706,10 +18858,11 @@ private pure func solve_user_call_contracts(
 						next_consumed_parameters,
 					)
 					contracts_by_callable = contracts_by_callable.set(caller, next_contract)
+
 					if newly_consumed_parameters.length() > 0:
 						next_pending_work = next_pending_work.append({
 							callable = caller,
-							parameter_frontier = newly_consumed_parameters
+							parameter_frontier = newly_consumed_parameters,
 						})
 						scheduled_next_work = scheduled_next_work.set(caller, True)
 					else:
@@ -18724,30 +18877,32 @@ private pure func solve_user_call_contracts(
 			user_call_contracts_by_callable_id = wave_contracts,
 			infer_unresolved_user_calls_as_borrow = True
 		}
+
 		for fallback in graph.scalar_balance_fallbacks:
 			match program.decls.get(fallback.declaration_index):
 				Some(FunctionDecl(func_info)):
 					debug:
 						perceus_work_contract_scalar_fallback_analyses()
+
 						if fallback.has_incoming_dup:
 							perceus_work_contract_dup_fallback_analyses()
 							void
 						else:
 							void
+
 						if fallback.has_parameter_shadow:
 							perceus_work_contract_shadow_fallback_analyses()
 							void
 						else:
 							void
 
-					inferred: List[Int] = infer_consumed_parameters_scalar(
-						fallback_env,
-						func_info,
-					)
+					inferred: List[Int] = infer_consumed_parameters_scalar(fallback_env, func_info)
 					current: List[Int] = wave_contracts.get_or(fallback.callable, [])
 					merged: List[Int] = merge_consumed_args(current, inferred)
+
 					if merged.length() > current.length():
 						var newly_consumed_parameters: List[Int] = []
+
 						for parameter_index in inferred:
 							if not current.contains(parameter_index):
 								newly_consumed_parameters = newly_consumed_parameters.append(
@@ -18755,29 +18910,27 @@ private pure func solve_user_call_contracts(
 								)
 							else:
 								void
-						contracts_by_callable = contracts_by_callable.set(
-							fallback.callable,
-							merged,
-						)
+
+						contracts_by_callable = contracts_by_callable.set(fallback.callable, merged)
 						var merged_set: Dict[Int, Bool] = consumed_parameters_by_callable.get_or(
 							fallback.callable,
 							{},
 						)
+
 						for parameter_index in merged:
 							merged_set = merged_set.set(parameter_index, True)
+
 						consumed_parameters_by_callable = consumed_parameters_by_callable.set(
 							fallback.callable,
 							merged_set,
 						)
+
 						if not scheduled_next_work.contains(fallback.callable):
 							next_pending_work = next_pending_work.append({
 								callable = fallback.callable,
-								parameter_frontier = newly_consumed_parameters
+								parameter_frontier = newly_consumed_parameters,
 							})
-							scheduled_next_work = scheduled_next_work.set(
-								fallback.callable,
-								True,
-							)
+							scheduled_next_work = scheduled_next_work.set(fallback.callable, True)
 						else:
 							void
 					else:
@@ -18793,11 +18946,7 @@ private pure func solve_user_call_contracts(
 private pure func infer_user_call_contracts(program: CoreProgram, env: PerceusEnv) -> PerceusEnv:
 	graph: OwnershipContractGraph = build_ownership_contract_graph(program, env)
 	{ env |
-		user_call_contracts_by_callable_id = solve_user_call_contracts(
-			program,
-			env,
-			graph,
-		),
+		user_call_contracts_by_callable_id = solve_user_call_contracts(program, env, graph),
 		infer_unresolved_user_calls_as_borrow = False
 	}
 
@@ -19701,6 +19850,341 @@ private pure func retain_borrowed_aggregate_value(
 	retain_borrowed_aggregate_value_with_temp(env, param, value, None)
 
 
+private pure func build_borrowed_owner_catalog(
+	env: PerceusEnv,
+	params: List[CoreParam],
+	consumed_params: List[Int],
+) -> BorrowedOwnerCatalog:
+	var owners: List[CoreParam] = []
+	var candidate_ids_by_name: Dict[String, List[Int]] = {}
+	var consumed_indices: Dict[Int, Bool] = {}
+	var has_unresolved_identity: Bool = False
+	var parameter_index: Int = 0
+
+	for consumed_index in consumed_params:
+		consumed_indices = consumed_indices.set(consumed_index, True)
+
+	for param in params:
+		if is_managed_type(env, param.typ) and not consumed_indices.get_or(parameter_index, False):
+			owner_id: Int = owners.length()
+
+			debug:
+				perceus_work_borrowed_call_owner_catalog_slots()
+
+			owners = owners.append(param)
+
+			if param.name.def_id == None:
+				has_unresolved_identity = True
+			else:
+				void
+
+			candidate_ids_by_name = candidate_ids_by_name.set(
+				param.name.name,
+				candidate_ids_by_name
+					.get_or(param.name.name, [])
+					.append(owner_id),
+			)
+		else:
+			void
+
+		parameter_index += 1
+
+	{
+		owners = owners,
+		candidate_ids_by_name = candidate_ids_by_name,
+		has_unresolved_identity = has_unresolved_identity
+	}
+
+
+private pure func borrowed_owner_is_active(
+	context: BorrowedCallRewriteContext,
+	owner_id: Int,
+) -> Bool:
+	not context.shadowed_owner_ids.get_or(owner_id, False)
+
+
+private pure func borrowed_owner_param(
+	context: BorrowedCallRewriteContext,
+	owner_id: Int,
+) -> Option[CoreParam]:
+	if borrowed_owner_is_active(context, owner_id):
+		context.owners.owners.get(owner_id)
+	else:
+		None
+
+
+private pure func borrowed_context_shadowing_var(
+	context: BorrowedCallRewriteContext,
+	variable: CoreVar,
+) -> BorrowedCallRewriteContext:
+	var shadowed: Dict[Int, Bool] = context.shadowed_owner_ids
+
+	for owner_id in context.owners.candidate_ids_by_name.get_or(variable.name, []):
+		match context.owners.owners.get(owner_id):
+			Some(owner):
+				if core_var_matches_param(variable, owner):
+					shadowed = shadowed.set(owner_id, True)
+				else:
+					void
+			None:
+				void
+
+	{ context | shadowed_owner_ids = shadowed }
+
+
+private pure func borrowed_context_shadowing_bindings(
+	context: BorrowedCallRewriteContext,
+	bindings: List[CoreMatchBinding],
+) -> BorrowedCallRewriteContext:
+	var result: BorrowedCallRewriteContext = context
+
+	for binding in bindings:
+		result = borrowed_context_shadowing_var(result, binding.variable)
+
+	result
+
+
+private pure func earlier_borrowed_owner(left: Option[Int], right: Option[Int]) -> Option[Int]:
+	match left:
+		Some(left_id):
+			match right:
+				Some(right_id):
+					if left_id < right_id:
+						Some(left_id)
+					else:
+						Some(right_id)
+				None:
+					left
+		None:
+			right
+
+
+private pure func direct_borrowed_owner_for_var(
+	context: BorrowedCallRewriteContext,
+	variable: CoreVar,
+) -> Option[Int]:
+	var found: Option[Int] = None
+
+	for owner_id in context.owners.candidate_ids_by_name.get_or(variable.name, []):
+		debug:
+			perceus_work_borrowed_call_owner_candidate_visits()
+			perceus_work_borrowed_origin_member_visits()
+
+		match borrowed_owner_param(context, owner_id):
+			Some(owner):
+				if core_var_matches_param(variable, owner):
+					found = Some(owner_id)
+					break
+				else:
+					void
+			None:
+				void
+
+	found
+
+
+private pure func first_borrowed_owner_legacy(
+	context: BorrowedCallRewriteContext,
+	expr: CoreExpr,
+) -> Option[Int]:
+	debug:
+		perceus_work_borrowed_call_alias_fallback_requests()
+
+	var found: Option[Int] = None
+	var owner_id: Int = 0
+
+	for owner in context.owners.owners:
+		if borrowed_owner_is_active(context, owner_id):
+			debug:
+				perceus_work_borrowed_call_owner_candidate_visits()
+				perceus_work_borrowed_origin_member_visits()
+
+			if borrow_expr_aliases_param(context.env, owner, expr):
+				found = Some(owner_id)
+				break
+			else:
+				void
+		else:
+			void
+
+		owner_id += 1
+
+	found
+
+
+-- Find only the earliest borrowed owner because the current materialization
+-- rule retains the evaluated result once. Direct projections and explicit
+-- call contracts stay indexed; uncommon binding/match/ownership-node shapes
+-- use the exact scalar predicate as a compatibility fallback.
+private pure func first_resolved_borrowed_owner_aliasing_expr(
+	context: BorrowedCallRewriteContext,
+	expr: CoreExpr,
+) -> Option[Int]:
+	match expr:
+		VarExpr(variable, typ, loc):
+			direct_borrowed_owner_for_var(context, variable)
+		FieldExpr(owner, field, typ, loc):
+			first_borrowed_owner_aliasing_expr(context, owner)
+		TupleFieldExpr(owner, field_index, typ, loc):
+			first_borrowed_owner_aliasing_expr(context, owner)
+		ListGetExpr(get, typ, loc):
+			first_borrowed_owner_aliasing_expr(context, get.list)
+		CastExpr(inner, typ, loc):
+			first_borrowed_owner_aliasing_expr(context, inner)
+		UnboxExpr(kind, inner, typ, loc):
+			first_borrowed_owner_aliasing_expr(context, inner)
+		CallExpr(kind, callee, args, typ, loc):
+			match contract_for_call(context.env, kind, args.length(), typ):
+				Some(contract):
+					match contract.result:
+						ReturnAliasOfArg(index):
+							match args.get(index):
+								Some(arg):
+									first_borrowed_owner_aliasing_expr(context, arg)
+								None:
+									None
+						ReturnBorrowed:
+							var found: Option[Int] = None
+							var index: Int = 0
+
+							for arg in args:
+								match contract.args.get(index):
+									Some(mode):
+										if arg_allows_borrowed_result_alias(mode):
+											found = earlier_borrowed_owner(
+												found,
+												first_borrowed_owner_aliasing_expr(context, arg),
+											)
+										else:
+											void
+									None:
+										void
+
+								index += 1
+
+							found
+						ReturnVoid | ReturnPrimitive | ReturnOwned:
+							None
+				None:
+					None
+		SeqExpr(first, second):
+			first_borrowed_owner_aliasing_expr(context, second)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			earlier_borrowed_owner(
+				first_borrowed_owner_aliasing_expr(context, then_expr),
+				first_borrowed_owner_aliasing_expr(context, else_expr),
+			)
+		LetExpr(_, _, _, _, _) | BorrowLetExpr(_, _, _, _) | LiteralMatchExpr(_, _, _, _, _) | AccessorLiteralMatchExpr(_, _, _, _, _) | LengthMatchExpr(_, _, _, _, _) | ConstructorMatchExpr(_, _, _, _, _, _) | ResourceScopeExpr(_, _, _) | DupExpr(_, _, _, _, _, _) | DropExpr(_, _, _, _, _, _):
+			first_borrowed_owner_legacy(context, expr)
+		_:
+			None
+
+
+private pure func first_borrowed_owner_aliasing_expr(
+	context: BorrowedCallRewriteContext,
+	expr: CoreExpr,
+) -> Option[Int]:
+	if context.owners.has_unresolved_identity:
+		-- Name-mode has the same direct rules for variables and transparent
+		-- projections, but deliberately different summary semantics for
+		-- control flow and calls. Keep those complex forms on the exact
+		-- predicate while avoiding owner scans for definite leaves.
+		match expr:
+			VarExpr(variable, typ, loc):
+				direct_borrowed_owner_for_var(context, variable)
+			FieldExpr(owner, field, typ, loc):
+				first_borrowed_owner_aliasing_expr(context, owner)
+			TupleFieldExpr(owner, field_index, typ, loc):
+				first_borrowed_owner_aliasing_expr(context, owner)
+			CastExpr(inner, typ, loc):
+				first_borrowed_owner_aliasing_expr(context, inner)
+			UnboxExpr(kind, inner, typ, loc):
+				first_borrowed_owner_aliasing_expr(context, inner)
+			LiteralExpr(_, _, _) | VoidExpr(_, _):
+				None
+			_:
+				first_borrowed_owner_legacy(context, expr)
+	else:
+		first_resolved_borrowed_owner_aliasing_expr(context, expr)
+
+
+private pure func protect_borrowed_call_args_for_owners(
+	context: BorrowedCallRewriteContext,
+	kind: CoreCallKind,
+	args: List[CoreExpr],
+	return_type: CoreType,
+	call_loc: CoreSourceLoc,
+) -> List[CoreExpr]:
+	match contract_for_call(context.env, kind, args.length(), return_type):
+		Some(contract):
+			var protected: List[CoreExpr] = []
+			var index: Int = 0
+
+			for arg in args:
+				match contract.args.get(index):
+					Some(mode):
+						if arg_consumes_caller(mode):
+							match first_borrowed_owner_aliasing_expr(context, arg):
+								Some(owner_id):
+									match borrowed_owner_param(context, owner_id):
+										Some(owner):
+											debug:
+												perceus_work_borrowed_call_rewrite_actions()
+
+											temp: CoreVar = synthetic_binding_var(
+												"borrowed_result_${owner.name.name}_call_arg",
+												index,
+												call_loc,
+											)
+											protected = protected.append(
+												retain_borrowed_aggregate_value_with_temp(
+													context.env,
+													owner,
+													arg,
+													Some(temp),
+												),
+											)
+										None:
+											protected = protected.append(arg)
+								None:
+									protected = protected.append(arg)
+						else:
+							protected = protected.append(arg)
+					None:
+						protected = protected.append(arg)
+
+				index += 1
+
+			protected
+		None:
+			args
+
+
+private pure func protect_borrowed_equality_arg_for_owners(
+	context: BorrowedCallRewriteContext,
+	arg: CoreExpr,
+	index: Int,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	match first_borrowed_owner_aliasing_expr(context, arg):
+		Some(owner_id):
+			match borrowed_owner_param(context, owner_id):
+				Some(owner):
+					debug:
+						perceus_work_borrowed_call_rewrite_actions()
+
+					temp: CoreVar = synthetic_binding_var(
+						"borrowed_result_${owner.name.name}_equality_arg",
+						index,
+						loc,
+					)
+					retain_borrowed_aggregate_value_with_temp(context.env, owner, arg, Some(temp))
+				None:
+					arg
+		None:
+			arg
+
+
 private pure func protect_borrowed_param_call_args(
 	env: PerceusEnv,
 	param: CoreParam,
@@ -20452,24 +20936,480 @@ private pure func protect_borrowed_param_loop_body(
 		protect_borrowed_param_calls(env, param, body)
 
 
+private pure func protect_borrowed_calls_legacy_active(
+	context: BorrowedCallRewriteContext,
+	expr: CoreExpr,
+) -> CoreExpr:
+	debug:
+		perceus_work_borrowed_call_alias_fallback_requests()
+
+	var result: CoreExpr = expr
+	var owner_id: Int = 0
+
+	for owner in context.owners.owners:
+		if borrowed_owner_is_active(context, owner_id):
+			result = protect_borrowed_param_calls(context.env, owner, result)
+		else:
+			void
+
+		owner_id += 1
+
+	result
+
+
+private pure func protect_borrowed_list_set_for_owners(
+	context: BorrowedCallRewriteContext,
+	set: CoreListSet,
+) -> CoreListSet:
+	protected_value: CoreExpr = protect_borrowed_calls(context, set.value.value)
+	var stored_value: CoreExpr = protected_value
+
+	if set.value.transfers_ownership:
+		var owner_id: Int = 0
+
+		for owner in context.owners.owners:
+			if borrowed_owner_is_active(context, owner_id):
+				stored_value = retain_borrowed_aggregate_value(context.env, owner, stored_value)
+			else:
+				void
+
+			owner_id += 1
+	else:
+		void
+
+	{ set |
+		list = protect_borrowed_calls(context, set.list),
+		index = protect_borrowed_calls(context, set.index),
+		value = { set.value | value = stored_value }
+	}
+
+
+private pure func protect_borrowed_literal_case_for_owners(
+	context: BorrowedCallRewriteContext,
+	match_case: CoreLiteralMatchCase,
+) -> CoreLiteralMatchCase:
+	{ match_case | body = protect_borrowed_calls(
+			borrowed_context_shadowing_bindings(context, match_case.bindings),
+			match_case.body,
+		) }
+
+
+private pure func protect_borrowed_literal_fallback_for_owners(
+	context: BorrowedCallRewriteContext,
+	fallback: CoreLiteralMatchFallback,
+) -> CoreLiteralMatchFallback:
+	match fallback:
+		LiteralMatchFallbackBody(body):
+			LiteralMatchFallbackBody(protect_borrowed_calls(context, body))
+		LiteralMatchFallbackBindings(bindings, body):
+			LiteralMatchFallbackBindings(
+				bindings,
+				protect_borrowed_calls(
+					borrowed_context_shadowing_bindings(context, bindings),
+					body,
+				),
+			)
+		LiteralMatchFallbackFail:
+			LiteralMatchFallbackFail
+
+
+private pure func protect_borrowed_literal_match_for_owners(
+	context: BorrowedCallRewriteContext,
+	match_expr: CoreConstructorLiteralMatch,
+) -> CoreConstructorLiteralMatch:
+	{ match_expr |
+		cases = match_expr.cases.map(
+			func(match_case): protect_borrowed_literal_case_for_owners(context, match_case),
+		),
+		fallback = protect_borrowed_literal_fallback_for_owners(context, match_expr.fallback)
+	}
+
+
+private pure func protect_borrowed_constructor_body_for_owners(
+	context: BorrowedCallRewriteContext,
+	body: CoreConstructorMatchBody,
+) -> CoreConstructorMatchBody:
+	match body:
+		ConstructorMatchBodyExpr(expr):
+			ConstructorMatchBodyExpr(protect_borrowed_calls(context, expr))
+		ConstructorMatchBodyLiteral(match_expr):
+			ConstructorMatchBodyLiteral(
+				protect_borrowed_literal_match_for_owners(
+					context,
+					match_expr,
+				),
+			)
+		ConstructorMatchBodyLength(match_expr):
+			ConstructorMatchBodyLength(
+				protect_borrowed_length_match_for_owners(
+					context,
+					match_expr,
+				),
+			)
+
+
+private pure func protect_borrowed_length_branch_for_owners(
+	context: BorrowedCallRewriteContext,
+	branch: CoreConstructorLengthMatchBranch,
+) -> CoreConstructorLengthMatchBranch:
+	{ branch | body = protect_borrowed_constructor_body_for_owners(
+			borrowed_context_shadowing_bindings(context, branch.bindings),
+			branch.body,
+		) }
+
+
+private pure func protect_borrowed_length_match_for_owners(
+	context: BorrowedCallRewriteContext,
+	match_expr: CoreConstructorLengthMatch,
+) -> CoreConstructorLengthMatch:
+	mapped_cases: List[CoreConstructorLengthMatchCase] = match_expr.cases.map(func(match_case):
+		{ match_case |
+			branch = protect_borrowed_length_branch_for_owners(context, match_case.branch)
+		}
+	)
+
+	mapped_geq: Option[CoreConstructorLengthMatchGeq] = match match_expr.geq:
+		Some(geq):
+			Some({ geq | branch = protect_borrowed_length_branch_for_owners(context, geq.branch) })
+		None:
+			None
+
+	mapped_fallback: Option[CoreConstructorLengthMatchBranch] = match match_expr.fallback:
+		Some(branch):
+			Some(protect_borrowed_length_branch_for_owners(context, branch))
+		None:
+			None
+
+	{ match_expr |
+		cases = mapped_cases,
+		geq = mapped_geq,
+		fallback = mapped_fallback
+	}
+
+
+private pure func protect_borrowed_constructor_case_for_owners(
+	context: BorrowedCallRewriteContext,
+	match_case: CoreConstructorMatchCase,
+) -> CoreConstructorMatchCase:
+	{ match_case | body = protect_borrowed_constructor_body_for_owners(
+			borrowed_context_shadowing_bindings(context, match_case.bindings),
+			match_case.body,
+		) }
+
+
+private pure func protect_borrowed_constructor_fallback_for_owners(
+	context: BorrowedCallRewriteContext,
+	fallback: CoreConstructorMatchFallback,
+) -> CoreConstructorMatchFallback:
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			ConstructorMatchFallbackBody(protect_borrowed_calls(context, body))
+		ConstructorMatchFallbackBindings(bindings, body):
+			ConstructorMatchFallbackBindings(
+				bindings,
+				protect_borrowed_calls(
+					borrowed_context_shadowing_bindings(context, bindings),
+					body,
+				),
+			)
+		ConstructorMatchFallbackFail:
+			ConstructorMatchFallbackFail
+
+
+-- Reconstruct the call-protection region once for all borrowed function
+-- parameters. Complex match and incoming ownership-node regions retain the
+-- exact scalar implementation as explicit compatibility islands; they are
+-- absent from ownership-ready production input and remain measurable.
+private pure func protect_borrowed_calls(
+	context: BorrowedCallRewriteContext,
+	expr: CoreExpr,
+) -> CoreExpr:
+	debug:
+		perceus_work_borrowed_call_node_visits()
+
+	match expr:
+		CallExpr(kind, callee, args, typ, loc):
+			protected_callee: CoreExpr = protect_borrowed_calls(context, callee)
+			var protected_args: List[CoreExpr] = []
+
+			for arg in args:
+				protected_args = protected_args.append(protect_borrowed_calls(context, arg))
+
+			CallExpr(
+				kind,
+				protected_callee,
+				protect_borrowed_call_args_for_owners(context, kind, protected_args, typ, loc),
+				typ,
+				loc,
+			)
+		BinaryExpr(op, left, right, typ, loc):
+			protected_left: CoreExpr = protect_borrowed_calls(context, left)
+			protected_right: CoreExpr = protect_borrowed_calls(context, right)
+
+			if is_consuming_collection_equality(op, protected_left, protected_right):
+				BinaryExpr(
+					op,
+					protect_borrowed_equality_arg_for_owners(context, protected_left, 0, loc),
+					protect_borrowed_equality_arg_for_owners(context, protected_right, 1, loc),
+					typ,
+					loc,
+				)
+			else:
+				BinaryExpr(op, protected_left, protected_right, typ, loc)
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			ListHandoffSetOwnedExpr(
+				protect_borrowed_list_set_for_owners(context, set),
+				typ,
+				loc,
+			)
+		ListSetExpr(set, typ, loc):
+			ListSetExpr(
+				protect_borrowed_list_set_for_owners(context, set),
+				typ,
+				loc,
+			)
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			LetExpr(
+				variable,
+				is_mutable,
+				typ,
+				protect_borrowed_calls(context, rhs),
+				protect_borrowed_calls(
+					borrowed_context_shadowing_var(context, variable),
+					body,
+				),
+			)
+		BorrowLetExpr(variable, typ, rhs, body):
+			BorrowLetExpr(
+				variable,
+				typ,
+				protect_borrowed_calls(context, rhs),
+				protect_borrowed_calls(
+					borrowed_context_shadowing_var(context, variable),
+					body,
+				),
+			)
+		SeqExpr(first, second):
+			SeqExpr(
+				protect_borrowed_calls(context, first),
+				protect_borrowed_calls(context, second),
+			)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			IfExpr(
+				protect_borrowed_calls(context, cond),
+				protect_borrowed_calls(context, then_expr),
+				protect_borrowed_calls(context, else_expr),
+				typ,
+				loc,
+			)
+		AssignExpr(variable, rhs, typ, loc):
+			AssignExpr(
+				variable,
+				protect_borrowed_calls(context, rhs),
+				typ,
+				loc,
+			)
+		WhileExpr(cond, body, typ, loc):
+			WhileExpr(
+				protect_borrowed_calls(context, cond),
+				protect_borrowed_calls(context, body),
+				typ,
+				loc,
+			)
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			ForRangeExpr(
+				binder,
+				protect_borrowed_calls(context, start),
+				protect_borrowed_calls(context, end_value),
+				protect_borrowed_calls(
+					borrowed_context_shadowing_var(context, binder.variable),
+					body,
+				),
+				typ,
+				loc,
+			)
+		ForChannelExpr(loop, typ, loc):
+			ForChannelExpr(
+				{ loop |
+					iterable = protect_borrowed_calls(context, loop.iterable),
+					body = protect_borrowed_calls(
+						borrowed_context_shadowing_var(context, loop.binder.variable),
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		ForListExpr(loop, typ, loc):
+			ForListExpr(
+				{ loop |
+					iterable = protect_borrowed_calls(context, loop.iterable),
+					body = protect_borrowed_calls(
+						borrowed_context_shadowing_var(context, loop.binder.variable),
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		ForStringExpr(loop, typ, loc):
+			ForStringExpr(
+				{ loop |
+					iterable = protect_borrowed_calls(context, loop.iterable),
+					body = protect_borrowed_calls(
+						borrowed_context_shadowing_var(context, loop.binder.variable),
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		ForDictExpr(loop, typ, loc):
+			ForDictExpr(
+				{ loop |
+					iterable = protect_borrowed_calls(context, loop.iterable),
+					body = protect_borrowed_calls(
+						borrowed_context_shadowing_var(context, loop.binder.variable),
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		ForSetExpr(loop, typ, loc):
+			ForSetExpr(
+				{ loop |
+					iterable = protect_borrowed_calls(context, loop.iterable),
+					body = protect_borrowed_calls(
+						borrowed_context_shadowing_var(context, loop.binder.variable),
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		ForStreamExpr(loop, typ, loc):
+			ForStreamExpr(
+				{ loop |
+					iterable = protect_borrowed_calls(context, loop.iterable),
+					body = protect_borrowed_calls(
+						borrowed_context_shadowing_var(context, loop.binder.variable),
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		ForResourceSourceExpr(loop, typ, loc):
+			ForResourceSourceExpr(
+				{ loop |
+					iterable = protect_borrowed_calls(context, loop.iterable),
+					body = protect_borrowed_calls(
+						borrowed_context_shadowing_var(context, loop.binder.variable),
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		ForTensorExpr(loop, typ, loc):
+			ForTensorExpr(
+				{ loop |
+					iterable = protect_borrowed_calls(context, loop.iterable),
+					body = protect_borrowed_calls(
+						borrowed_context_shadowing_var(context, loop.binder.variable),
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		ResourceScopeExpr(scope, typ, loc):
+			shadowed_context: BorrowedCallRewriteContext = borrowed_context_shadowing_var(
+				context,
+				scope.variable,
+			)
+			ResourceScopeExpr(
+				{ scope |
+					acquire = protect_borrowed_calls(context, scope.acquire),
+					body = protect_borrowed_calls(shadowed_context, scope.body),
+					cleanup = protect_borrowed_calls(shadowed_context, scope.cleanup)
+				},
+				typ,
+				loc,
+			)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			LiteralMatchExpr(
+				protect_borrowed_calls(context, scrutinee),
+				cases.map(
+					func(
+						match_case,
+					): protect_borrowed_literal_case_for_owners(context, match_case),
+				),
+				protect_borrowed_literal_fallback_for_owners(context, fallback),
+				typ,
+				loc,
+			)
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			AccessorLiteralMatchExpr(
+				protect_borrowed_calls(context, scrutinee),
+				release_policy,
+				protect_borrowed_literal_match_for_owners(context, match_expr),
+				typ,
+				loc,
+			)
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			LengthMatchExpr(
+				protect_borrowed_calls(context, scrutinee),
+				release_policy,
+				protect_borrowed_length_match_for_owners(context, match_expr),
+				typ,
+				loc,
+			)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			ConstructorMatchExpr(
+				protect_borrowed_calls(context, scrutinee),
+				release_policy,
+				cases.map(
+					func(
+						match_case,
+					): protect_borrowed_constructor_case_for_owners(context, match_case),
+				),
+				protect_borrowed_constructor_fallback_for_owners(context, fallback),
+				typ,
+				loc,
+			)
+		DupExpr(_, _, _, _, _, _) | DropExpr(_, _, _, _, _, _):
+			protect_borrowed_calls_legacy_active(context, expr)
+		BoxExpr(_, _, _) | CastExpr(_, _, _) | DictConstructExpr(_, _, _) | FieldExpr(_, _, _, _) | ListConstructExpr(_, _, _) | LogicalExpr(_, _, _, _, _) | RecordConstructExpr(_, _, _, _) | RecordExpr(_, _, _) | RecordUpdateExpr(_, _, _, _) | RecordReuseExpr(_, _, _, _) | RecordCowUpdateExpr(_, _, _, _) | TensorBoxedLiteralExpr(_, _, _) | TupleExpr(_, _, _) | TupleFieldExpr(_, _, _, _) | UnaryExpr(_, _, _, _) | UnboxExpr(_, _, _, _) | UnionConstructExpr(_, _, _) | VectorExpr(_, _, _):
+			CoreTraverse.map_core_expr_children_with_context(expr, context, protect_borrowed_calls)
+		_:
+			expr
+
+
 private pure func protect_borrowed_param_calls_for_function(
 	env: PerceusEnv,
 	func_info: CoreFunction,
 	consumed_params: List[Int],
 	body: CoreExpr,
 ) -> CoreExpr:
-	var result: CoreExpr = body
-	var index: Int = 0
+	owners: BorrowedOwnerCatalog = build_borrowed_owner_catalog(
+		env,
+		func_info.params,
+		consumed_params,
+	)
 
-	for param in func_info.params:
-		if is_managed_type(env, param.typ) and not int_list_contains(consumed_params, index):
-			result = protect_borrowed_param_calls(env, param, result)
-		else:
-			void
-
-		index += 1
-
-	result
+	if owners.owners.is_empty():
+		body
+	else:
+		protect_borrowed_calls(
+			{
+				env = env,
+				owners = owners,
+				shadowed_owner_ids = {}
+			},
+			body,
+		)
 
 
 private pure func retain_borrowed_aggregate_boxed_value(
@@ -21418,6 +22358,7 @@ private pure func rewrite_function(env: PerceusEnv, func_info: CoreFunction) -> 
 				loc = loc
 			}
 			contract_body: CoreExpr = annotate_user_call_contracts(env, body)
+
 			consumed_params: List[Int] = match lookup_ownership_callable_id(
 				env.callables,
 				name,
@@ -21427,6 +22368,7 @@ private pure func rewrite_function(env: PerceusEnv, func_info: CoreFunction) -> 
 					env.user_call_contracts_by_callable_id.get_or(callable_id, [])
 				None:
 					[]
+
 			var transferable_result_vars: List[CoreVar] = []
 			var param_index: Int = 0
 

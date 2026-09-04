@@ -40,6 +40,7 @@ END_TO_END_ACTION = "measure_backend_emission"
 DEFAULT_MEASUREMENT_WINDOW = "ownership-preparation-plus-perceus"
 BODY_SHAPES = (
     "linear",
+    "borrowed_call_protection",
     "nested_user_call",
     "mutually_recursive_calls",
 )
@@ -64,6 +65,12 @@ PERCEUS_WORK_COUNTER_NAMES = (
     "linear_summary_node_visits",
     "legacy_count_node_visits",
     "borrowed_call_node_visits",
+    "borrowed_call_owner_catalog_slots",
+    "borrowed_call_owner_candidate_visits",
+    "borrowed_call_alias_fallback_requests",
+    "borrowed_call_rewrite_actions",
+    "borrowed_origin_member_visits",
+    "borrowed_origin_storage_slots",
     "borrowed_aggregate_node_visits",
     "borrowed_result_node_visits",
     "resolved_value_queries",
@@ -72,6 +79,18 @@ PERCEUS_WORK_COUNTER_NAMES = (
     "declarations_rewritten",
     "functions_rewritten",
     "globals_rewritten",
+)
+TRANCHE_2_WORK_COUNTER_NAMES = (
+    "borrowed_call_owner_catalog_slots",
+    "borrowed_call_owner_candidate_visits",
+    "borrowed_call_alias_fallback_requests",
+    "borrowed_call_rewrite_actions",
+    "borrowed_origin_member_visits",
+    "borrowed_origin_storage_slots",
+)
+LEGACY_PERCEUS_WORK_COUNTER_NAMES = tuple(
+    name for name in PERCEUS_WORK_COUNTER_NAMES
+    if name not in TRANCHE_2_WORK_COUNTER_NAMES
 )
 DEFAULT_GLOBALS = 384
 DEFAULT_FUNCTIONS = 64
@@ -86,6 +105,7 @@ CONTRACT_MATRIX_OWNER_BODY_LEAVES = 644
 CONTRACT_FIXTURE_LET_NODES = 2
 PRIMITIVE_PARAMETER_TYPE = "Int"
 MANAGED_PARAMETER_TYPE = "String"
+BORROWED_OWNER_TYPE_NAME = "BenchBorrowOwner"
 WORKER_FLAG = "--measurement-worker"
 VMAP_SAMPLE_SECONDS = 0.1
 TERMINATE_GRACE_SECONDS = 1.0
@@ -143,7 +163,10 @@ def measurement_window_label(action: str) -> str:
     raise ValueError(f"unsupported Perceus benchmark action: {action}")
 
 
-def parse_perceus_work_counters(stderr: str) -> dict[str, int]:
+def parse_perceus_work_counters(
+    stderr: str,
+    require_tranche_2: bool = True,
+) -> dict[str, int]:
     counters: dict[str, int] = {}
     for line in stderr.splitlines():
         for name in PERCEUS_WORK_COUNTER_NAMES:
@@ -155,7 +178,12 @@ def parse_perceus_work_counters(stderr: str) -> dict[str, int]:
                 if registered_count < 1:
                     raise RuntimeError(f"invalid Perceus work counter: {name}")
                 counters[name] = registered_count - 1
-    missing = [name for name in PERCEUS_WORK_COUNTER_NAMES if name not in counters]
+    required_names = (
+        PERCEUS_WORK_COUNTER_NAMES
+        if require_tranche_2
+        else LEGACY_PERCEUS_WORK_COUNTER_NAMES
+    )
+    missing = [name for name in required_names if name not in counters]
     if missing:
         raise RuntimeError("missing Perceus work counters: " + ", ".join(missing))
     return counters
@@ -282,6 +310,10 @@ def named_type(name: str) -> JsonObject:
     return {"kind": "named", "name": name, "args": []}
 
 
+def heap_record_type(name: str) -> JsonObject:
+    return {"kind": "heap_record", "name": name}
+
+
 def core_var(name: str, def_id: int | None) -> JsonObject:
     return {"name": name, "uniq": 0, "def_id": def_id}
 
@@ -356,10 +388,41 @@ def global_decl(index: int) -> JsonObject:
     }
 
 
-def core_param(name: str, type_name: str) -> JsonObject:
+def core_param(
+    name: str,
+    type_name: str,
+    def_id: int | None = None,
+) -> JsonObject:
     return {
-        "name": core_var(name, None),
+        "name": core_var(name, def_id),
         "type": named_type(type_name),
+        "loc": synthetic_loc(),
+    }
+
+
+def core_param_with_type(
+    name: str,
+    value_type: JsonObject,
+    def_id: int | None = None,
+) -> JsonObject:
+    return {
+        "name": core_var(name, def_id),
+        "type": value_type,
+        "loc": synthetic_loc(),
+    }
+
+
+def borrowed_owner_decl() -> JsonObject:
+    return {
+        "kind": "heap_record",
+        "abi_type": None,
+        "name": BORROWED_OWNER_TYPE_NAME,
+        "type_params": [],
+        "fields": [{
+            "name": "BENCH_PAYLOAD",
+            "type": named_type(MANAGED_PARAMETER_TYPE),
+            "release_policy": "arc",
+        }],
         "loc": synthetic_loc(),
     }
 
@@ -405,7 +468,10 @@ def borrowed_param_ref_expr(
 ) -> JsonObject:
     return {
         "kind": "var",
-        "var": core_var(borrowed_param_name(function_index, param_index), None),
+        "var": core_var(
+            borrowed_param_name(function_index, param_index),
+            None,
+        ),
         "type": named_type(type_name),
         "loc": synthetic_loc(),
     }
@@ -419,6 +485,23 @@ def parameter_argument_expr(param_index: int, parameter_type: str) -> JsonObject
             parameter_type,
         )
     return literal_expr("int", param_index, parameter_type)
+
+
+def borrowed_owner_argument_expr(param_index: int) -> JsonObject:
+    return {
+        "kind": "record_construct",
+        "type_name": BORROWED_OWNER_TYPE_NAME,
+        "fields": [{
+            "name": "BENCH_PAYLOAD",
+            "value": literal_expr(
+                "string",
+                f"argument-{param_index:04d}",
+                MANAGED_PARAMETER_TYPE,
+            ),
+        }],
+        "type": heap_record_type(BORROWED_OWNER_TYPE_NAME),
+        "loc": synthetic_loc(),
+    }
 
 
 def consuming_parameter_expr(
@@ -439,6 +522,40 @@ def consuming_parameter_expr(
         },
         "args": [
             borrowed_param_ref_expr(function_index, param_index, parameter_type),
+            literal_expr("string", "", MANAGED_PARAMETER_TYPE),
+        ],
+        "type": named_type(MANAGED_PARAMETER_TYPE),
+        "loc": synthetic_loc(),
+    }
+
+
+def consuming_borrowed_projection_expr(
+    function_index: int,
+    parameter_type: str,
+) -> JsonObject:
+    projected = {
+        "kind": "field",
+        "expr": {
+            "kind": "var",
+            "var": core_var(borrowed_param_name(function_index, 0), None),
+            "type": heap_record_type(BORROWED_OWNER_TYPE_NAME),
+            "loc": synthetic_loc(),
+        },
+        "field": "BENCH_PAYLOAD",
+        "type": named_type(MANAGED_PARAMETER_TYPE),
+        "loc": synthetic_loc(),
+    }
+    return {
+        "kind": "call",
+        "call_kind": {"kind": "builtin", "name": "blorp_string_concat_consume"},
+        "callee": {
+            "kind": "var",
+            "var": core_var("blorp_string_concat_consume", None),
+            "type": named_type("Function"),
+            "loc": synthetic_loc(),
+        },
+        "args": [
+            projected,
             literal_expr("string", "", MANAGED_PARAMETER_TYPE),
         ],
         "type": named_type(MANAGED_PARAMETER_TYPE),
@@ -476,6 +593,10 @@ def worker_decl(
             )
             for param_index in range(params_per_function)
         )
+    if body_shape == "borrowed_call_protection":
+        if params_per_function == 0:
+            raise ValueError("borrowed-call protection requires parameters")
+        expressions.append(consuming_borrowed_projection_expr(index, parameter_type))
     if body_shape == "nested_user_call":
         if index < function_count - 1:
             calls = [
@@ -506,7 +627,7 @@ def worker_decl(
                 )
             )
         expressions = [*calls, *expressions]
-    elif body_shape != "linear":
+    elif body_shape not in ("linear", "borrowed_call_protection"):
         raise ValueError(f"unsupported Perceus body shape: {body_shape}")
     if body_shape == "linear":
         literal_count = body_leaves - global_reads_per_function - params_per_function
@@ -530,7 +651,14 @@ def worker_decl(
         "body": body_tail,
     }
     params = [
-        core_param(borrowed_param_name(index, param_index), parameter_type)
+        (
+            core_param_with_type(
+                borrowed_param_name(index, param_index),
+                heap_record_type(BORROWED_OWNER_TYPE_NAME),
+            )
+            if body_shape == "borrowed_call_protection"
+            else core_param(borrowed_param_name(index, param_index), parameter_type)
+        )
         for param_index in range(params_per_function)
     ]
     return user_function(f"bench_worker_{index:04d}", def_id, body, params)
@@ -541,6 +669,7 @@ def call_worker_expr(
     def_id: int,
     params_per_function: int,
     parameter_type: str,
+    body_shape: str = "linear",
 ) -> JsonObject:
     name = f"bench_worker_{index:04d}"
     function_type = named_type("Function")
@@ -554,7 +683,11 @@ def call_worker_expr(
             "loc": synthetic_loc(),
         },
         "args": [
-            parameter_argument_expr(param_index, parameter_type)
+            (
+                borrowed_owner_argument_expr(param_index)
+                if body_shape == "borrowed_call_protection"
+                else parameter_argument_expr(param_index, parameter_type)
+            )
             for param_index in range(params_per_function)
         ],
         "type": named_type("Int"),
@@ -605,6 +738,11 @@ def fixture_request(
     if body_shape not in BODY_SHAPES:
         raise ValueError(f"unsupported Perceus body shape: {body_shape}")
     globals_json = [global_decl(index) for index in range(global_count)]
+    type_decls = (
+        [borrowed_owner_decl()]
+        if body_shape == "borrowed_call_protection"
+        else []
+    )
     first_function_id = global_count + 1
     functions_json = [
         worker_decl(
@@ -629,6 +767,7 @@ def fixture_request(
                 first_function_id + index,
                 params_per_function,
                 parameter_type,
+                body_shape,
             )
             for index in range(function_count)
         ]
@@ -640,7 +779,7 @@ def fixture_request(
     )
     core_program = {
         "kind": "program",
-        "decls": [*globals_json, *functions_json, main_json],
+        "decls": [*globals_json, *type_decls, *functions_json, main_json],
         "foreign_includes": [],
     }
     request = {
@@ -917,16 +1056,22 @@ def validate_perceus_parameter_shape(
                 raise RuntimeError(f"Perceus Core parameter shape changed for {function_name}")
             variable = param.get("name")
             value_type = param.get("type")
+            expected_type = (
+                heap_record_type(BORROWED_OWNER_TYPE_NAME)
+                if body_shape == "borrowed_call_protection"
+                else named_type(parameter_type)
+            )
             if (
                 not isinstance(variable, dict)
                 or variable.get("name") != expected_name
-                or not isinstance(value_type, dict)
-                or value_type.get("kind") != "named"
-                or value_type.get("name") != parameter_type
+                or variable.get("def_id") is not None
+                or value_type != expected_type
             ):
                 raise RuntimeError(f"Perceus Core parameter shape changed for {function_name}")
             expected_reads = 1
-            if body_shape == "nested_user_call":
+            if body_shape == "borrowed_call_protection":
+                expected_reads = 1 if param_index == 0 else 0
+            elif body_shape == "nested_user_call":
                 expected_reads = (
                     1
                     if function_index == function_count - 1
@@ -1232,7 +1377,10 @@ def summarize_paired_window_metric(
     return result
 
 
-def run_benchmark(args: argparse.Namespace) -> int:
+def run_benchmark(
+    args: argparse.Namespace,
+    metrics_collector: list[JsonObject] | None = None,
+) -> int:
     root = project_root()
     with tempfile.TemporaryDirectory(prefix="blorp-perceus-memory-") as temp_name:
         temp_dir = Path(temp_name)
@@ -1555,7 +1703,8 @@ def run_benchmark(args: argparse.Namespace) -> int:
                             baseline_counter_stderr.read_text(
                                 encoding="utf-8",
                                 errors="replace",
-                            )
+                            ),
+                            require_tranche_2=False,
                         )
                     )
                 if baseline_counter_observations[0] != baseline_counter_observations[1]:
@@ -1571,7 +1720,10 @@ def run_benchmark(args: argparse.Namespace) -> int:
                     baseline_counter_worker_sha256
                 )
                 metrics["work_counter_deltas"] = {
-                    name: counter_observations[0][name] - baseline_work_counters[name]
+                    name: (
+                        counter_observations[0][name]
+                        - baseline_work_counters.get(name, 0)
+                    )
                     for name in PERCEUS_WORK_COUNTER_NAMES
                 }
         for metric_name in (
@@ -1754,8 +1906,75 @@ def run_benchmark(args: argparse.Namespace) -> int:
             metrics["generated_c_ownership_census"] = generated_c_ownership_census(
                 generated_c
             )
+        if metrics_collector is not None:
+            metrics_collector.append(metrics)
         print_metrics(metrics, args.json)
     return 0
+
+
+def validate_borrowed_call_matrix(points: list[JsonObject]) -> None:
+    if len(points) != 3:
+        raise RuntimeError("borrowed-call matrix requires 1, 8, and 32-owner points")
+    owner_counts = [int(point["params_per_function"]) for point in points]
+    if owner_counts != [1, 8, 32]:
+        raise RuntimeError(
+            f"borrowed-call matrix requires 1, 8, and 32-owner points: {owner_counts}"
+        )
+    counters = [point.get("work_counters") for point in points]
+    if not all(isinstance(value, dict) for value in counters):
+        raise RuntimeError("borrowed-call matrix requires work counters")
+
+    constant_names = (
+        "borrowed_call_node_visits",
+        "borrowed_call_alias_fallback_requests",
+        "borrowed_call_rewrite_actions",
+        "borrowed_origin_member_visits",
+        "borrowed_origin_storage_slots",
+    )
+    for name in constant_names:
+        values = [int(counter[name]) for counter in counters]
+        if len(set(values)) != 1:
+            raise RuntimeError(
+                f"borrowed-call matrix {name} scales with owner count: {values}"
+            )
+
+    fallback_requests = [
+        int(counter["borrowed_call_alias_fallback_requests"])
+        for counter in counters
+    ]
+    if any(fallback_requests):
+        raise RuntimeError(
+            "borrowed-call matrix unexpectedly entered scalar alias fallback: "
+            f"{fallback_requests}"
+        )
+
+    expected_slots = [
+        int(point["functions"]) * int(point["params_per_function"])
+        for point in points
+    ]
+    actual_slots = [
+        int(counter["borrowed_call_owner_catalog_slots"])
+        for counter in counters
+    ]
+    if actual_slots != expected_slots:
+        raise RuntimeError(
+            "borrowed-call owner catalog slots do not match managed owners: "
+            f"{actual_slots} != {expected_slots}"
+        )
+
+    if all(point.get("comparison_kind") == "compiler-worker" for point in points):
+        baseline_counters = [point.get("baseline_work_counters") for point in points]
+        if not all(isinstance(value, dict) for value in baseline_counters):
+            raise RuntimeError("borrowed-call matrix requires baseline work counters")
+        candidate_visits = int(counters[-1]["borrowed_call_node_visits"])
+        baseline_visits = int(
+            baseline_counters[-1]["borrowed_call_node_visits"]
+        )
+        if candidate_visits * 4 > baseline_visits:
+            raise RuntimeError(
+                "borrowed-call matrix must reduce 32-owner reconstruction visits "
+                f"by at least 75%: baseline {baseline_visits}, candidate {candidate_visits}"
+            )
 
 
 def run_global_matrix(args: argparse.Namespace) -> int:
@@ -1802,6 +2021,7 @@ def run_parameter_matrix(args: argparse.Namespace) -> int:
                 debug_profile=True,
             )
 
+        matrix_points: list[JsonObject] = []
         for param_count in (1, 8, 32):
             point = argparse.Namespace(**vars(args))
             point.bridge = str(bridge)
@@ -1812,6 +2032,7 @@ def run_parameter_matrix(args: argparse.Namespace) -> int:
             point.global_reads_per_function = 0
             point.params_per_function = param_count
             point.parameter_type = MANAGED_PARAMETER_TYPE
+            point.body_shape = "borrowed_call_protection"
             point.control_parameter_type = (
                 None
                 if args.baseline_bridge is not None
@@ -1820,7 +2041,10 @@ def run_parameter_matrix(args: argparse.Namespace) -> int:
             point.invoke_workers = False
             point.global_matrix = False
             point.parameter_matrix = False
-            run_benchmark(point)
+            run_benchmark(point, matrix_points)
+
+        if getattr(args, "work_counters", False):
+            validate_borrowed_call_matrix(matrix_points)
 
     return 0
 

@@ -134,6 +134,23 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "missing Perceus work counters"):
             self.benchmark.parse_perceus_work_counters("\n".join(rows[:-1]))
 
+    def test_profile_counter_parser_accepts_pre_tranche_two_baseline_schema(self) -> None:
+        rows = []
+        for index, name in enumerate(
+            self.benchmark.LEGACY_PERCEUS_WORK_COUNTER_NAMES,
+            start=1,
+        ):
+            rows.append(
+                f"compiler_perceus_work_{name} 0.001 0.1% {index} 0.100"
+            )
+
+        actual = self.benchmark.parse_perceus_work_counters(
+            "\n".join(rows),
+            require_tranche_2=False,
+        )
+
+        self.assertEqual(set(actual), set(self.benchmark.LEGACY_PERCEUS_WORK_COUNTER_NAMES))
+
     def test_contract_inference_uses_collected_equations_without_body_rescans(self) -> None:
         perceus_source = (
             ROOT / "blorp" / "src" / "compiler" / "stage_09_core" / "perceus.brp"
@@ -199,11 +216,35 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
                 branch_arms=2,
                 user_call_edges=2,
             )
-            fingerprints.add(
-                json.dumps(program["decls"][4]["body"], sort_keys=True),
+            worker = next(
+                declaration
+                for declaration in program["decls"]
+                if declaration.get("name") == "bench_worker_0000"
             )
+            fingerprints.add(json.dumps(worker["body"], sort_keys=True))
 
         self.assertEqual(len(fingerprints), len(self.benchmark.BODY_SHAPES))
+
+    def test_borrowed_call_fixture_invokes_workers_with_heap_records(self) -> None:
+        _, program = self.benchmark.fixture_request(
+            1,
+            1,
+            16,
+            0,
+            params_per_function=2,
+            body_shape="borrowed_call_protection",
+        )
+        main = next(
+            declaration
+            for declaration in program["decls"]
+            if declaration.get("name") == "main"
+        )
+        call = main["body"]["first"]
+
+        self.assertEqual(
+            [argument["kind"] for argument in call["args"]],
+            ["record_construct", "record_construct"],
+        )
 
     def test_call_graph_shapes_pass_borrowed_parameters_across_edges(self) -> None:
         _, program = self.benchmark.fixture_request(
@@ -510,8 +551,67 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
         )
         self.assertTrue(all(not call.args[0].invoke_workers for call in run.call_args_list))
         self.assertTrue(
+            all(
+                call.args[0].body_shape == "borrowed_call_protection"
+                for call in run.call_args_list
+            )
+        )
+        self.assertTrue(
             all(call.args[0].build_mode == "benchmark-worker-O0" for call in run.call_args_list)
         )
+
+    def test_borrowed_call_matrix_rejects_owner_scaled_rewrite_work(self) -> None:
+        def point(
+            owner_count,
+            node_visits,
+            member_visits,
+            *,
+            fallback_requests=0,
+            baseline_node_visits=None,
+        ):
+            return {
+                "functions": 2,
+                "params_per_function": owner_count,
+                "comparison_kind": "compiler-worker",
+                "work_counters": {
+                    "borrowed_call_node_visits": node_visits,
+                    "borrowed_call_alias_fallback_requests": fallback_requests,
+                    "borrowed_call_rewrite_actions": 2,
+                    "borrowed_origin_member_visits": member_visits,
+                    "borrowed_origin_storage_slots": 0,
+                    "borrowed_call_owner_catalog_slots": 2 * owner_count,
+                },
+                "baseline_work_counters": {
+                    "borrowed_call_node_visits": (
+                        baseline_node_visits
+                        if baseline_node_visits is not None
+                        else node_visits * owner_count
+                    ),
+                },
+            }
+
+        valid = [point(1, 256, 2), point(8, 256, 2), point(32, 256, 2)]
+        self.benchmark.validate_borrowed_call_matrix(valid)
+
+        invalid = [point(1, 256, 2), point(8, 2048, 16), point(32, 8192, 64)]
+        with self.assertRaisesRegex(RuntimeError, "scales with owner count"):
+            self.benchmark.validate_borrowed_call_matrix(invalid)
+
+        fallbacks = [
+            point(1, 256, 2, fallback_requests=1),
+            point(8, 256, 2, fallback_requests=1),
+            point(32, 256, 2, fallback_requests=1),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "scalar alias fallback"):
+            self.benchmark.validate_borrowed_call_matrix(fallbacks)
+
+        insufficient_reduction = [
+            point(1, 256, 2, baseline_node_visits=256),
+            point(8, 256, 2, baseline_node_visits=512),
+            point(32, 256, 2, baseline_node_visits=1000),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "at least 75%"):
+            self.benchmark.validate_borrowed_call_matrix(insufficient_reduction)
 
     def test_parameter_matrix_ignores_single_fixture_shape_arguments(self) -> None:
         with mock.patch.object(

@@ -861,80 +861,104 @@ parameters and no body-node growth across recursive fixed-point waves.
 
 ## Tranche 2: Protect Borrowed Calls For All Owners At Once
 
-### Current shape
+**Implemented:** 2026-09-04. The implementation uses an ordered-min owner
+semilattice rather than retaining complete origin sets. Call protection only
+observes the earliest active owner: that owner determines the legacy synthetic
+temporary name, and retaining the evaluated result makes it owned for every
+later owner. Exact variables and projections use the name-candidate index;
+explicit call contracts and conditionals combine minima without allocating
+sets. Resolved match regions are traversed once with sparse shadow state.
+Unresolved owner identities use indexed direct-variable/projection rules and
+the exact name-summary predicate only at complex result boundaries, because
+those semantics intentionally differ from definition-origin semantics.
+Incoming ownership nodes and complex result expressions retain counted
+compatibility islands. This preserves existing Core while avoiding origin-set
+storage entirely in the measured ownership-ready path.
+
+The focused 32-owner fixture reduced borrowed-call reconstruction visits from
+8,378 to 256 (96.9%), direct-Perceus window allocations by 39.3%, and the direct
+window median by 33.2%. The post-Perceus artifact was byte-identical. See
+`benchmarks/results/compiler_perceus_tranche2_2026-09-04.md`.
+
+### Previous shape
 
 `protect_borrowed_param_calls_for_function` reconstructs the body once for each
 nonconsumed managed parameter. Argument alias checks can also rescan the same
 argument for each owner.
 
-### Target shape
+### Implemented shape
 
 ```blorp
 record BorrowedOwnerCatalog {
-	owners: List[OwnershipValue],
-	active_owner_flags: List[Bool]
+	owners: List[CoreParam],
+	candidate_ids_by_name: Dict[String, List[Int]],
+	has_unresolved_identity: Bool
 }
 
-union BorrowedResultOwnership:
-	NoBorrowedResult
-	DirectBorrowedOwner(OwnershipValueId)
-	ComputedBorrowedResult(OwnershipValueSet)
-
-record BorrowedRewriteResult {
-	expr: CoreExpr,
-	result_ownership: BorrowedResultOwnership
+record BorrowedCallRewriteContext {
+	env: PerceusEnv,
+	owners: BorrowedOwnerCatalog,
+	shadowed_owner_ids: Dict[Int, Bool]
 }
 
 private pure func protect_borrowed_calls(
-	context: PerceusFunctionContext,
-	owners: BorrowedOwnerCatalog,
-	body: CoreExpr,
+	context: BorrowedCallRewriteContext,
+	expr: CoreExpr,
 ) -> CoreExpr
+
+private pure func first_borrowed_owner_aliasing_expr(
+	context: BorrowedCallRewriteContext,
+	expr: CoreExpr,
+) -> Option[Int]
 ```
 
-The traversal is post-order. Each child reports whether its evaluated result is
-owned, a direct borrowed variable, or a computed result that may borrow one of
-several owners along different paths. Entering a binder removes only the exact
-shadowed identity.
+The traversal reconstructs each region once. Entering a binder adds only the
+exact shadowed owner identity to sparse context. A consuming boundary asks for
+the earliest active owner that the evaluated result may borrow. This is the
+only owner identity that affects output: the old owner-major traversal emitted
+the first retain for that owner, and the retain made the value owned before any
+later owner was considered.
 
-A consuming boundary must retain the value actually produced, not every owner
-that the expression could alias. Preserve the existing evaluate-once shape:
+Direct variables and transparent projections use the name-candidate index.
+Resolved calls and conditionals combine the minimum owner ID without allocating
+origin sets. Ordinary lowered parameters have name-only identities; their
+complex result forms use the exact legacy scalar predicate at an explicit,
+counted compatibility boundary because its summary semantics intentionally
+differ from resolved definition-origin semantics.
+
+A matching consuming boundary preserves the existing evaluate-once shape:
 
 ```blorp
-private pure func own_consuming_argument(
-	arg: BorrowedRewriteResult,
-	temp: CoreVar,
-) -> CoreExpr:
-	match arg.result_ownership:
-		NoBorrowedResult:
-			arg.expr
-		DirectBorrowedOwner(owner_id):
-			retain_direct_borrowed_owner(owner_id, arg.expr)
-		ComputedBorrowedResult(origins):
-			retain_borrowed_alias_result_with_temp(arg.expr, temp)
+match first_borrowed_owner_aliasing_expr(context, arg):
+	Some(owner_id):
+		retain_borrowed_aggregate_value_with_temp(
+			context.env,
+			context.owners.owners[owner_id],
+			arg,
+			Some(temp),
+		)
+	None:
+		arg
 ```
 
 For `if condition: p else: q`, the result is one
-`ComputedBorrowedResult`, not two retains. Materialization emits one synthetic
+minimum owner, not two retains. Materialization emits one synthetic
 `BorrowLetExpr(temp, argument, DupExpr(temp, ...))` so the argument is evaluated
-once and only the selected result is retained. Origin information remains
-useful for scope and escape proofs; it does not identify values to retain
-eagerly.
-
-`OwnershipValueSet` must not be materialized as a fresh list at every node. Use
-the representation selected by Tranche 0—such as dense generation stamps or
-small ordered sparse sets—and measure both syntax visits and origin-set work.
+once and only the selected result is retained. Complete origin sets are not
+materialized or retained by this pass.
 
 ### Independent value
 
 This replaces `O(B * N)` body reconstruction, where `B` is borrowed owners,
-with approximately `O(N + A)`, where `A` is the number of actual alias
-relationships.
+with one `O(N)` reconstruction plus catalog construction, indexed direct-owner
+queries, actual transfer work, and the explicitly counted scalar compatibility
+queries. The ownership-ready focused fixture has no scalar fallback requests.
 
 ### Acceptance criteria
 
 - Start with a failing node-visit assertion at 1, 8, and 32 borrowed owners.
-- The traversal count is independent of borrowed-owner count for a fixed body.
+- The reconstruction traversal count is independent of borrowed-owner count
+  for a fixed body. Scalar compatibility-query counts are reported separately.
 - Exact local shadowing, global shadowing, nested lambdas, specialized calls,
   and unknown-call conservatism are covered.
 - Conditional multi-origin results retain exactly one evaluated result.
