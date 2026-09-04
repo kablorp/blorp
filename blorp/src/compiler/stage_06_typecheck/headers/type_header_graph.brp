@@ -38,12 +38,13 @@ import:
 		ModuleOrigin(StdlibModule),
 		module_identities_equal,
 		module_identity_display_name,
-		module_identity_storage_key,
 	../graph/definition_identity: SourceDefinitionKind(FieldDefinition), source_definition_key
 	../graph/definition_index: definition_index_find_source_definition_id
 	../graph/indexed_graph:
+		PreparedModuleScope,
 		indexed_graph_definition_index,
 		prepared_module_scope_canonical_path,
+		prepared_module_scope_compatible_index,
 		prepared_module_scope_origin,
 	../graph/type_identity:
 		TypeId,
@@ -57,6 +58,7 @@ import:
 		bound_module_graph_find,
 		bound_module_graph_find_canonical_path,
 		bound_module_graph_indexed_graph,
+		bound_module_graph_target,
 		bound_module_identity,
 		bound_module_program,
 		bound_module_scope,
@@ -395,7 +397,8 @@ private record ModuleTypeHeaderIndices {
 private record TypeHeaderTable {
 	headers: List[TypeHeader],
 	header_indices_by_name: Dict[String, List[Int]],
-	header_indices_by_module: Dict[String, ModuleTypeHeaderIndices]
+	header_indices_by_module: Dict[Int, ModuleTypeHeaderIndices],
+	owner_scope: PreparedModuleScope
 }
 
 
@@ -1860,14 +1863,13 @@ private pure func type_header_is_public(
 
 
 private pure func module_type_header_indices_add(
-	inventories: Dict[String, ModuleTypeHeaderIndices],
-	module_identity: ModuleIdentity,
+	inventories: Dict[Int, ModuleTypeHeaderIndices],
+	module_index: Int,
 	header_index: Int,
 	is_public: Bool,
-) -> Dict[String, ModuleTypeHeaderIndices]:
-	key = module_identity_storage_key(module_identity)
+) -> Dict[Int, ModuleTypeHeaderIndices]:
 	inventory: ModuleTypeHeaderIndices = inventories.get_or(
-		key,
+		module_index,
 		{
 			all_indices = [],
 			public_indices = []
@@ -1880,7 +1882,7 @@ private pure func module_type_header_indices_add(
 		inventory.public_indices
 
 	inventories.set(
-		key,
+		module_index,
 		{
 			all_indices = inventory.all_indices.append(header_index),
 			public_indices = public_indices
@@ -1891,9 +1893,12 @@ private pure func module_type_header_indices_add(
 private pure func type_header_table(
 	headers: List[TypeHeader],
 	declaration_graph: DeclarationSkeletonGraph,
-) -> TypeHeaderTable:
+) -> Result[TypeHeaderTable, List[TypeHeaderError]]:
+	bound_graph = declaration_skeleton_graph_bound_graph(declaration_graph)
+	owner_scope = bound_module_scope(bound_module_graph_target(bound_graph))
 	var header_indices_by_name: Dict[String, List[Int]] = {}
-	var header_indices_by_module: Dict[String, ModuleTypeHeaderIndices] = {}
+	var header_indices_by_module: Dict[Int, ModuleTypeHeaderIndices] = {}
+	var errors: List[TypeHeaderError] = []
 	var index: Int = 0
 
 	for header in headers:
@@ -1904,35 +1909,56 @@ private pure func type_header_table(
 				.get_or(name, [])
 				.append(index),
 		)
-		header_indices_by_module = module_type_header_indices_add(
-			header_indices_by_module,
-			type_id_module_identity(header.id),
-			index,
-			type_header_is_public(declaration_graph, header),
-		)
+
+		match bound_module_graph_find(bound_graph, type_id_module_identity(header.id)):
+			None:
+				errors = errors.append(TypeHeaderOwnerModuleMissing(header.id))
+			Some(module):
+				match prepared_module_scope_compatible_index(
+					owner_scope,
+					bound_module_scope(module),
+				):
+					None:
+						errors = errors.append(TypeHeaderOwnerModuleMissing(header.id))
+					Some(module_index):
+						header_indices_by_module = module_type_header_indices_add(
+							header_indices_by_module,
+							module_index,
+							index,
+							type_header_is_public(declaration_graph, header),
+						)
+
 		index += 1
 
-	{
-		headers = headers,
-		header_indices_by_name = header_indices_by_name,
-		header_indices_by_module = header_indices_by_module
-	}
+	if errors.is_empty():
+		Ok({
+			headers = headers,
+			header_indices_by_name = header_indices_by_name,
+			header_indices_by_module = header_indices_by_module,
+			owner_scope = owner_scope,
+		})
+	else:
+		Err(errors)
 
 
-private pure func type_header_table_module_indices(
+private pure func type_header_table_module_indices_for_scope(
 	table: TypeHeaderTable,
-	module_identity: ModuleIdentity,
+	module_scope: PreparedModuleScope,
 	selection: HeaderVisibilitySelection,
 ) -> List[Int]:
-	match table.header_indices_by_module.get(module_identity_storage_key(module_identity)):
-		Some(inventory):
-			match selection:
-				AllModuleHeaders:
-					inventory.all_indices
-				PublicModuleHeaders:
-					inventory.public_indices
+	match prepared_module_scope_compatible_index(table.owner_scope, module_scope):
 		None:
 			[]
+		Some(module_index):
+			match table.header_indices_by_module.get(module_index):
+				Some(inventory):
+					match selection:
+						AllModuleHeaders:
+							inventory.all_indices
+						PublicModuleHeaders:
+							inventory.public_indices
+				None:
+					[]
 
 
 private pure func type_header_table_index(table: TypeHeaderTable, id: TypeId) -> Option[Int]:
@@ -3079,25 +3105,27 @@ pure func type_header_graph_build(
 	if not errors.is_empty():
 		Err(errors)
 	else:
-		table = type_header_table(headers, declaration_graph)
+		match type_header_table(headers, declaration_graph):
+			Err(table_errors):
+				Err(table_errors)
+			Ok(table):
+				match inline_layout_cycle(table):
+					Some(cycle):
+						Err([TypeHeaderInlineStorageCycle(cycle)])
+					None:
+						struct_field_errors = invalid_struct_field_errors(table)
+						recursive_layout_errors = recursive_value_layout_errors(table)
+						validation_errors = struct_field_errors.concat(recursive_layout_errors)
 
-		match inline_layout_cycle(table):
-			Some(cycle):
-				Err([TypeHeaderInlineStorageCycle(cycle)])
-			None:
-				struct_field_errors = invalid_struct_field_errors(table)
-				recursive_layout_errors = recursive_value_layout_errors(table)
-				validation_errors = struct_field_errors.concat(recursive_layout_errors)
-
-				if not validation_errors.is_empty():
-					Err(validation_errors)
-				else:
-					completed_table = complete_type_containment(table)
-					representation: TypeHeaderGraphRep = {
-						parameter_graph = parameter_graph,
-						table = completed_table
-					}
-					Ok(into_opaque TypeHeaderGraph(representation))
+						if not validation_errors.is_empty():
+							Err(validation_errors)
+						else:
+							completed_table = complete_type_containment(table)
+							representation: TypeHeaderGraphRep = {
+								parameter_graph = parameter_graph,
+								table = completed_table
+							}
+							Ok(into_opaque TypeHeaderGraph(representation))
 
 
 private pure func type_header_graph_rep(graph: TypeHeaderGraph) -> TypeHeaderGraphRep:
@@ -3131,6 +3159,16 @@ pure func type_header_graph_find(graph: TypeHeaderGraph, id: TypeId) -> Option[T
 	type_header_table_find(type_header_graph_rep(graph).table, id)
 
 
+private pure func type_header_graph_scope(
+	graph: TypeHeaderGraph,
+	module_identity: ModuleIdentity,
+) -> Option[PreparedModuleScope]:
+	bound_module_graph_find(
+		type_header_graph_bound_graph(graph),
+		module_identity,
+	).map(bound_module_scope)
+
+
 pure func type_header_graph_declared_type_expansion(
 	graph: TypeHeaderGraph,
 	id: TypeId,
@@ -3157,15 +3195,15 @@ private pure func builtin_type_header(header: TypeHeader) -> Option[AcceptedBuil
 			None
 
 
-private pure func type_header_graph_builtin_headers_for_module(
+private pure func type_header_graph_builtin_headers_for_scope(
 	graph: TypeHeaderGraph,
-	module_identity: ModuleIdentity,
+	module_scope: PreparedModuleScope,
 	selection: HeaderVisibilitySelection,
 ) -> List[AcceptedBuiltinHeader]:
 	table = type_header_graph_rep(graph).table
 	var result: List[AcceptedBuiltinHeader] = []
 
-	for index in type_header_table_module_indices(table, module_identity, selection):
+	for index in type_header_table_module_indices_for_scope(table, module_scope, selection):
 		match table.headers.get(index):
 			Some(header):
 				match builtin_type_header(header):
@@ -3179,18 +3217,40 @@ private pure func type_header_graph_builtin_headers_for_module(
 	result
 
 
+pure func type_header_graph_local_builtin_headers_for_scope(
+	graph: TypeHeaderGraph,
+	module_scope: PreparedModuleScope,
+) -> List[AcceptedBuiltinHeader]:
+	type_header_graph_builtin_headers_for_scope(graph, module_scope, AllModuleHeaders)
+
+
+pure func type_header_graph_public_builtin_headers_for_scope(
+	graph: TypeHeaderGraph,
+	module_scope: PreparedModuleScope,
+) -> List[AcceptedBuiltinHeader]:
+	type_header_graph_builtin_headers_for_scope(graph, module_scope, PublicModuleHeaders)
+
+
 pure func type_header_graph_local_builtin_headers(
 	graph: TypeHeaderGraph,
 	module_identity: ModuleIdentity,
 ) -> List[AcceptedBuiltinHeader]:
-	type_header_graph_builtin_headers_for_module(graph, module_identity, AllModuleHeaders)
+	match type_header_graph_scope(graph, module_identity):
+		Some(module_scope):
+			type_header_graph_local_builtin_headers_for_scope(graph, module_scope)
+		None:
+			[]
 
 
 pure func type_header_graph_public_builtin_headers(
 	graph: TypeHeaderGraph,
 	module_identity: ModuleIdentity,
 ) -> List[AcceptedBuiltinHeader]:
-	type_header_graph_builtin_headers_for_module(graph, module_identity, PublicModuleHeaders)
+	match type_header_graph_scope(graph, module_identity):
+		Some(module_scope):
+			type_header_graph_public_builtin_headers_for_scope(graph, module_scope)
+		None:
+			[]
 
 
 private pure func record_type_header(header: TypeHeader) -> Option[AcceptedRecordHeader]:
@@ -3207,15 +3267,15 @@ private pure func record_type_header(header: TypeHeader) -> Option[AcceptedRecor
 			None
 
 
-private pure func type_header_graph_record_headers_for_module(
+private pure func type_header_graph_record_headers_for_scope(
 	graph: TypeHeaderGraph,
-	module_identity: ModuleIdentity,
+	module_scope: PreparedModuleScope,
 	selection: HeaderVisibilitySelection,
 ) -> List[AcceptedRecordHeader]:
 	table = type_header_graph_rep(graph).table
 	var result: List[AcceptedRecordHeader] = []
 
-	for index in type_header_table_module_indices(table, module_identity, selection):
+	for index in type_header_table_module_indices_for_scope(table, module_scope, selection):
 		match table.headers.get(index):
 			Some(header):
 				match record_type_header(header):
@@ -3229,18 +3289,40 @@ private pure func type_header_graph_record_headers_for_module(
 	result
 
 
+pure func type_header_graph_local_record_headers_for_scope(
+	graph: TypeHeaderGraph,
+	module_scope: PreparedModuleScope,
+) -> List[AcceptedRecordHeader]:
+	type_header_graph_record_headers_for_scope(graph, module_scope, AllModuleHeaders)
+
+
+pure func type_header_graph_public_record_headers_for_scope(
+	graph: TypeHeaderGraph,
+	module_scope: PreparedModuleScope,
+) -> List[AcceptedRecordHeader]:
+	type_header_graph_record_headers_for_scope(graph, module_scope, PublicModuleHeaders)
+
+
 pure func type_header_graph_local_record_headers(
 	graph: TypeHeaderGraph,
 	module_identity: ModuleIdentity,
 ) -> List[AcceptedRecordHeader]:
-	type_header_graph_record_headers_for_module(graph, module_identity, AllModuleHeaders)
+	match type_header_graph_scope(graph, module_identity):
+		Some(module_scope):
+			type_header_graph_local_record_headers_for_scope(graph, module_scope)
+		None:
+			[]
 
 
 pure func type_header_graph_public_record_headers(
 	graph: TypeHeaderGraph,
 	module_identity: ModuleIdentity,
 ) -> List[AcceptedRecordHeader]:
-	type_header_graph_record_headers_for_module(graph, module_identity, PublicModuleHeaders)
+	match type_header_graph_scope(graph, module_identity):
+		Some(module_scope):
+			type_header_graph_public_record_headers_for_scope(graph, module_scope)
+		None:
+			[]
 
 
 private pure func union_type_header(header: TypeHeader) -> Option[AcceptedUnionHeader]:
@@ -3257,15 +3339,15 @@ private pure func union_type_header(header: TypeHeader) -> Option[AcceptedUnionH
 			None
 
 
-private pure func type_header_graph_union_headers_for_module(
+private pure func type_header_graph_union_headers_for_scope(
 	graph: TypeHeaderGraph,
-	module_identity: ModuleIdentity,
+	module_scope: PreparedModuleScope,
 	selection: HeaderVisibilitySelection,
 ) -> List[AcceptedUnionHeader]:
 	table = type_header_graph_rep(graph).table
 	var result: List[AcceptedUnionHeader] = []
 
-	for index in type_header_table_module_indices(table, module_identity, selection):
+	for index in type_header_table_module_indices_for_scope(table, module_scope, selection):
 		match table.headers.get(index):
 			Some(header):
 				match union_type_header(header):
@@ -3279,18 +3361,40 @@ private pure func type_header_graph_union_headers_for_module(
 	result
 
 
+pure func type_header_graph_local_union_headers_for_scope(
+	graph: TypeHeaderGraph,
+	module_scope: PreparedModuleScope,
+) -> List[AcceptedUnionHeader]:
+	type_header_graph_union_headers_for_scope(graph, module_scope, AllModuleHeaders)
+
+
+pure func type_header_graph_public_union_headers_for_scope(
+	graph: TypeHeaderGraph,
+	module_scope: PreparedModuleScope,
+) -> List[AcceptedUnionHeader]:
+	type_header_graph_union_headers_for_scope(graph, module_scope, PublicModuleHeaders)
+
+
 pure func type_header_graph_local_union_headers(
 	graph: TypeHeaderGraph,
 	module_identity: ModuleIdentity,
 ) -> List[AcceptedUnionHeader]:
-	type_header_graph_union_headers_for_module(graph, module_identity, AllModuleHeaders)
+	match type_header_graph_scope(graph, module_identity):
+		Some(module_scope):
+			type_header_graph_local_union_headers_for_scope(graph, module_scope)
+		None:
+			[]
 
 
 pure func type_header_graph_public_union_headers(
 	graph: TypeHeaderGraph,
 	module_identity: ModuleIdentity,
 ) -> List[AcceptedUnionHeader]:
-	type_header_graph_union_headers_for_module(graph, module_identity, PublicModuleHeaders)
+	match type_header_graph_scope(graph, module_identity):
+		Some(module_scope):
+			type_header_graph_public_union_headers_for_scope(graph, module_scope)
+		None:
+			[]
 
 
 private pure func alias_type_header(header: TypeHeader) -> Option[AcceptedAliasHeader]:
@@ -3307,15 +3411,15 @@ private pure func alias_type_header(header: TypeHeader) -> Option[AcceptedAliasH
 			None
 
 
-private pure func type_header_graph_alias_headers_for_module(
+private pure func type_header_graph_alias_headers_for_scope(
 	graph: TypeHeaderGraph,
-	module_identity: ModuleIdentity,
+	module_scope: PreparedModuleScope,
 	selection: HeaderVisibilitySelection,
 ) -> List[AcceptedAliasHeader]:
 	table = type_header_graph_rep(graph).table
 	var result: List[AcceptedAliasHeader] = []
 
-	for index in type_header_table_module_indices(table, module_identity, selection):
+	for index in type_header_table_module_indices_for_scope(table, module_scope, selection):
 		match table.headers.get(index):
 			Some(header):
 				match alias_type_header(header):
@@ -3329,18 +3433,40 @@ private pure func type_header_graph_alias_headers_for_module(
 	result
 
 
+pure func type_header_graph_local_alias_headers_for_scope(
+	graph: TypeHeaderGraph,
+	module_scope: PreparedModuleScope,
+) -> List[AcceptedAliasHeader]:
+	type_header_graph_alias_headers_for_scope(graph, module_scope, AllModuleHeaders)
+
+
+pure func type_header_graph_public_alias_headers_for_scope(
+	graph: TypeHeaderGraph,
+	module_scope: PreparedModuleScope,
+) -> List[AcceptedAliasHeader]:
+	type_header_graph_alias_headers_for_scope(graph, module_scope, PublicModuleHeaders)
+
+
 pure func type_header_graph_local_alias_headers(
 	graph: TypeHeaderGraph,
 	module_identity: ModuleIdentity,
 ) -> List[AcceptedAliasHeader]:
-	type_header_graph_alias_headers_for_module(graph, module_identity, AllModuleHeaders)
+	match type_header_graph_scope(graph, module_identity):
+		Some(module_scope):
+			type_header_graph_local_alias_headers_for_scope(graph, module_scope)
+		None:
+			[]
 
 
 pure func type_header_graph_public_alias_headers(
 	graph: TypeHeaderGraph,
 	module_identity: ModuleIdentity,
 ) -> List[AcceptedAliasHeader]:
-	type_header_graph_alias_headers_for_module(graph, module_identity, PublicModuleHeaders)
+	match type_header_graph_scope(graph, module_identity):
+		Some(module_scope):
+			type_header_graph_public_alias_headers_for_scope(graph, module_scope)
+		None:
+			[]
 
 
 pure func type_header_graph_type_module_path(graph: TypeHeaderGraph, id: TypeId) -> Option[String]:

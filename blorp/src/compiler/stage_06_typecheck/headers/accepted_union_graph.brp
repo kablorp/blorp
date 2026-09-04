@@ -5,6 +5,7 @@
 -- the source spellings visible in that module.
 import:
 	../../stage_04_modules/loaded_module: ModuleIdentity
+	../graph/indexed_graph: PreparedModuleScope
 	../graph/type_identity: type_id_name, type_id_storage_key
 	../modules/bound_module_graph:
 		BoundModule,
@@ -14,6 +15,7 @@ import:
 		bound_module_graph_modules,
 		bound_module_graph_target,
 		bound_module_identity,
+		bound_module_scope,
 		bound_module_view,
 	../modules/module_view:
 		ImportedConstructorBinding,
@@ -43,8 +45,8 @@ import:
 		TypeContainmentFacts,
 		TypeHeaderGraph,
 		UnionLayout(FieldlessEnum, TaggedUnion),
-		type_header_graph_local_union_headers,
-		type_header_graph_public_union_headers,
+		type_header_graph_local_union_headers_for_scope,
+		type_header_graph_public_union_headers_for_scope,
 		union_type_header_containment_facts,
 		union_type_header_contains_resource,
 		union_type_header_id,
@@ -98,20 +100,26 @@ private pure func union_entry(
 	header: AcceptedUnionHeader,
 ) -> AcceptedUnionEntry:
 	containment: TypeContainmentFacts = union_type_header_containment_facts(header)
+
 	is_enum = match union_type_header_layout(header):
-		FieldlessEnum: True
-		TaggedUnion: False
+		FieldlessEnum:
+			True
+		TaggedUnion:
+			False
 
 	{
-		type_params = union_type_header_parameters(header).map(
+		type_params = union_type_header_parameters(
+			header,
+		).map(
 			func(parameter): type_parameter_id_name(parameter.id),
 		),
 		variants = variants
 			.zip(union_type_header_variants(header))
-			.map(func(pair): union_variant_entry(
-				pair[0],
-				constructor_id_definition_id(pair[1].id),
-			)),
+			.map(
+				func(
+					pair,
+				): union_variant_entry(pair[0], constructor_id_definition_id(pair[1].id)),
+			),
 		is_enum = is_enum,
 		contains_resource = union_type_header_contains_resource(header),
 		may_contain_function = containment.may_contain_function,
@@ -122,11 +130,11 @@ private pure func union_entry(
 
 private pure func public_union_ids(
 	type_headers: TypeHeaderGraph,
-	module_identity: ModuleIdentity,
+	module_scope: PreparedModuleScope,
 ) -> Dict[String, Bool]:
 	var result: Dict[String, Bool] = {}
 
-	for header in type_header_graph_public_union_headers(type_headers, module_identity):
+	for header in type_header_graph_public_union_headers_for_scope(type_headers, module_scope):
 		result = result.set(type_id_storage_key(union_type_header_id(header)), True)
 
 	result
@@ -139,27 +147,23 @@ private pure func collect_module_inputs(
 ) -> UnionInputCollection:
 	module_identity = bound_module_identity(module)
 	module_path = bound_module_canonical_path(module)
-	public_ids = public_union_ids(type_headers, module_identity)
+	module_scope = bound_module_scope(module)
+	public_ids = public_union_ids(type_headers, module_scope)
 	var unions = collection.unions
 	var errors = collection.errors
 
-	for header in type_header_graph_local_union_headers(type_headers, module_identity):
+	for header in type_header_graph_local_union_headers_for_scope(type_headers, module_scope):
 		id = union_type_header_id(header)
 		canonical_name = canonical_module_type_name(module_path, type_id_name(id))
 
-		match imported_union_header_variants(
-			type_headers,
-			module_identity,
-			module_path,
-			header,
-		):
+		match imported_union_header_variants(type_headers, module_identity, module_path, header):
 			Some(variants):
 				unions = unions.append({
 					id = id,
 					owner_module_path = module_path,
 					canonical_name = canonical_name,
 					canonical_visible = public_ids.contains(type_id_storage_key(id)),
-					payload = union_entry(variants, header)
+					payload = union_entry(variants, header),
 				})
 			None:
 				errors = errors.append(
@@ -174,12 +178,12 @@ private pure func collect_module_inputs(
 
 private pure func find_public_union_header(
 	type_headers: TypeHeaderGraph,
-	module_identity: ModuleIdentity,
+	module_scope: PreparedModuleScope,
 	name: String,
 ) -> Option[AcceptedUnionHeader]:
 	var result: Option[AcceptedUnionHeader] = None
 
-	for header in type_header_graph_public_union_headers(type_headers, module_identity):
+	for header in type_header_graph_public_union_headers_for_scope(type_headers, module_scope):
 		if result.is_none() and type_id_name(union_type_header_id(header)) == name:
 			result = Some(header)
 
@@ -188,13 +192,17 @@ private pure func find_public_union_header(
 
 private pure func local_union_bindings(
 	type_headers: TypeHeaderGraph,
-	module_identity: ModuleIdentity,
+	module_scope: PreparedModuleScope,
 ) -> List[AcceptedVisibleUnionBinding]:
 	var result: List[AcceptedVisibleUnionBinding] = []
 
-	for header in type_header_graph_local_union_headers(type_headers, module_identity):
+	for header in type_header_graph_local_union_headers_for_scope(type_headers, module_scope):
 		id = union_type_header_id(header)
-		result = result.append({source_name = type_id_name(id), id = id, owner_local = True})
+		result = result.append({
+			source_name = type_id_name(id),
+			id = id,
+			owner_local = True,
+		})
 
 	result
 
@@ -207,14 +215,15 @@ private pure func imported_union_binding(
 	module ?= bound_module_graph_find_canonical_path(bound_graph, binding.module_path)
 	header ?= find_public_union_header(
 		type_headers,
-		bound_module_identity(module),
+		bound_module_scope(module),
 		binding.original_name,
 	)
 	Some({
 		source_name = binding.local_name,
 		id = union_type_header_id(header),
-		owner_local = False
+		owner_local = False,
 	})
+
 
 private pure func selected_constructor_binding(
 	type_headers: TypeHeaderGraph,
@@ -224,7 +233,7 @@ private pure func selected_constructor_binding(
 	module ?= bound_module_graph_find_canonical_path(bound_graph, binding.module_path)
 	header ?= find_public_union_header(
 		type_headers,
-		bound_module_identity(module),
+		bound_module_scope(module),
 		binding.parent_name,
 	)
 	var result: Option[AcceptedVisibleConstructorBinding] = None
@@ -236,7 +245,7 @@ private pure func selected_constructor_binding(
 				parent_source_name = binding.parent_local_name,
 				parent_id = union_type_header_id(header),
 				constructor_id = constructor_id_definition_id(variant.id),
-				owner_local = False
+				owner_local = False,
 			})
 
 	result
@@ -250,21 +259,24 @@ pure func accepted_union_graph_authority_for_module(
 ) -> Result[AcceptedUnionAuthority, String]:
 	module_identity = bound_module_identity(bound_module)
 	view = bound_module_view(bound_module)
-	var union_bindings = local_union_bindings(type_headers, module_identity)
+	var union_bindings = local_union_bindings(type_headers, bound_module_scope(bound_module))
 	var constructor_bindings: List[AcceptedVisibleConstructorBinding] = []
 
 	-- Explicit constructor selections retain precedence because their scalar
 	-- locators are appended before constructors exposed by imported unions.
 	for binding in module_view_imported_constructors(view):
 		match selected_constructor_binding(type_headers, bound_graph, binding):
-			Some(visible): constructor_bindings = constructor_bindings.append(visible)
-			None: void
+			Some(visible):
+				constructor_bindings = constructor_bindings.append(visible)
+			None:
+				void
 
 	for binding in module_view_imported_names(view):
 		match imported_union_binding(type_headers, bound_graph, binding):
 			Some(visible):
 				union_bindings = union_bindings.append(visible)
-			None: void
+			None:
+				void
 
 	match accepted_union_module_view(
 		graph_rep(graph).table,
@@ -285,9 +297,9 @@ pure func accepted_union_graph_build(
 	builtin_env: Env,
 	builtin_union_names: List[String],
 ) -> Result[AcceptedUnionGraph, List[String]]:
-	modules = [bound_module_graph_target(bound_graph)].concat(
-		bound_module_graph_modules(bound_graph),
-	)
+	modules = [
+		bound_module_graph_target(bound_graph),
+	].concat(bound_module_graph_modules(bound_graph))
 	var collection: UnionInputCollection = {
 		unions = [],
 		errors = []
@@ -299,23 +311,20 @@ pure func accepted_union_graph_build(
 	if not collection.errors.is_empty():
 		Err(collection.errors)
 	else:
-		input: AcceptedUnionTableInput = {
-			unions = collection.unions
-		}
+		input: AcceptedUnionTableInput = {unions = collection.unions}
 
 		match accepted_union_table(input, type_identities, builtin_env, builtin_union_names):
-			Ok(table): Ok(into_opaque AcceptedUnionGraph({table = table}))
-			Err(errors): Err(errors)
+			Ok(table):
+				Ok(into_opaque AcceptedUnionGraph({table = table}))
+			Err(errors):
+				Err(errors)
 
 
 pure func accepted_union_graph_canonical_authority(
 	graph: AcceptedUnionGraph,
 	owner: ModuleIdentity,
 ) -> AcceptedUnionAuthority:
-	accepted_union_authority(
-		graph_rep(graph).table,
-		accepted_union_empty_module_view(owner),
-	)
+	accepted_union_authority(graph_rep(graph).table, accepted_union_empty_module_view(owner))
 
 
 pure func accepted_union_graph_metrics(

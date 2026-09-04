@@ -28,6 +28,7 @@ import:
 		module_load_candidate_origin,
 		module_origins_equal,
 	../../stage_04_modules/module_surface: ModuleSurface
+	../../stage_04_modules/module_surface_json: module_surface_to_json
 	../type_system/env: ENV_EMPTY
 	definition_index:
 		DefinitionIndex,
@@ -73,7 +74,7 @@ union IndexedGraphError:
 private record IndexedGraphRep {
 	target: PreparedModule,
 	modules: List[PreparedModule],
-	dependencies_by_path: Dict[String, PreparedModule],
+	dependencies_by_path: Dict[String, Int],
 	definition_index: DefinitionIndex
 }
 
@@ -90,7 +91,8 @@ foreign(include: "indexed_graph_ffi.h"):
 
 private record PreparedModuleScopeRep {
 	graph: IndexedGraph,
-	module: PreparedModule
+	module: PreparedModule,
+	module_index: Int
 }
 
 
@@ -130,13 +132,15 @@ private pure func indexed_graph_from_loaded_modules(
 	modules = loaded_module_set_modules(loaded_modules).map(func(module):
 		prepared_module_from_loaded(module)
 	)
-	var dependencies_by_path: Dict[String, PreparedModule] = {}
+	var dependencies_by_path: Dict[String, Int] = {}
+	var dependency_index: Int = 0
 
 	for module in modules:
 		dependencies_by_path = dependencies_by_path.set(
 			prepared_module_canonical_path(module),
-			module,
+			dependency_index,
 		)
+		dependency_index += 1
 
 	representation: IndexedGraphRep = {
 		target = target,
@@ -212,7 +216,8 @@ pure func indexed_graph_find_dependency(
 	canonical_path: String,
 ) -> Option[PreparedModule]:
 	representation: IndexedGraphRep = from_opaque IndexedGraph(graph)
-	representation.dependencies_by_path.get(canonical_path)
+	index ?= representation.dependencies_by_path.get(canonical_path)
+	representation.modules.get(index)
 
 
 pure func indexed_graph_select_dependencies(
@@ -247,16 +252,25 @@ pure func indexed_graph_definition_index(graph: IndexedGraph) -> DefinitionIndex
 
 
 pure func indexed_graph_module_scopes(graph: IndexedGraph) -> List[PreparedModuleScope]:
-	indexed_graph_modules(graph).map(func(module): prepared_module_scope(graph, module))
+	var scopes: List[PreparedModuleScope] = []
+	var module_index: Int = 1
+
+	for module in indexed_graph_modules(graph):
+		scopes = scopes.append(prepared_module_scope(graph, module, module_index))
+		module_index += 1
+
+	scopes
 
 
 private pure func prepared_module_scope(
 	graph: IndexedGraph,
 	module: PreparedModule,
+	module_index: Int,
 ) -> PreparedModuleScope:
 	representation: PreparedModuleScopeRep = {
 		graph = graph,
-		module = module
+		module = module,
+		module_index = module_index
 	}
 	into_opaque PreparedModuleScope(representation)
 
@@ -269,25 +283,33 @@ pure func indexed_graph_select_dependency_scopes(
 		Err(errors):
 			Err(errors)
 		Ok(modules):
-			Ok(modules.map(
-				func(module): prepared_module_scope(graph, module),
-			))
+			var scopes: List[PreparedModuleScope] = []
+
+			for module in modules:
+				match indexed_graph_find_dependency_scope(
+					graph,
+					prepared_module_canonical_path(module),
+				):
+					Some(scope):
+						scopes = scopes.append(scope)
+					None:
+						void
+
+			Ok(scopes)
 
 
 pure func indexed_graph_target_scope(graph: IndexedGraph) -> PreparedModuleScope:
-	prepared_module_scope(graph, indexed_graph_target(graph))
+	prepared_module_scope(graph, indexed_graph_target(graph), 0)
 
 
 pure func indexed_graph_find_dependency_scope(
 	graph: IndexedGraph,
 	canonical_path: String,
 ) -> Option[PreparedModuleScope]:
-	indexed_graph_find_dependency(
-		graph,
-		canonical_path,
-	).map(
-		func(module): prepared_module_scope(graph, module),
-	)
+	representation: IndexedGraphRep = from_opaque IndexedGraph(graph)
+	dependency_index ?= representation.dependencies_by_path.get(canonical_path)
+	module ?= representation.modules.get(dependency_index)
+	Some(prepared_module_scope(graph, module, dependency_index + 1))
 
 
 pure func prepared_module_scope_find_module(
@@ -324,11 +346,29 @@ pure func prepared_module_scope_origin(scope: PreparedModuleScope) -> ModuleOrig
 	prepared_module_origin(prepared_module_scope_module(scope))
 
 
+private pure func module_surfaces_are_equal(left: ModuleSurface, right: ModuleSurface) -> Bool:
+	module_surface_to_json(left).to_string() == module_surface_to_json(right).to_string()
+
+
+private pure func prepared_module_surfaces_are_equal(
+	left: PreparedModule,
+	right: PreparedModule,
+) -> Bool:
+	match (prepared_module_surface(left), prepared_module_surface(right)):
+		(None, None):
+			True
+		(Some(left_surface), Some(right_surface)):
+			module_surfaces_are_equal(left_surface, right_surface)
+		_:
+			False
+
+
 private pure func prepared_modules_are_equal(left: PreparedModule, right: PreparedModule) -> Bool:
 	(
 		module_identities_equal(prepared_module_identity(left), prepared_module_identity(right))
 		and module_origins_equal(prepared_module_origin(left), prepared_module_origin(right))
 		and parsed_programs_are_equal(prepared_module_program(left), prepared_module_program(right))
+		and prepared_module_surfaces_are_equal(left, right)
 	)
 
 
@@ -378,3 +418,22 @@ pure func prepared_module_scopes_are_compatible(
 		indexed_graphs_are_same_allocation(left_representation.graph, right_representation.graph)
 		or indexed_graphs_are_equal(left_representation.graph, right_representation.graph)
 	)
+
+
+-- Return the requested module's table position only when both scopes prove
+-- the same complete graph and therefore the same target-first module order.
+pure func prepared_module_scope_compatible_index(
+	owner: PreparedModuleScope,
+	requested: PreparedModuleScope,
+) -> Option[Int]:
+	requested_representation: PreparedModuleScopeRep = from_opaque PreparedModuleScope(requested)
+	module_count = indexed_graph_modules(requested_representation.graph).length() + 1
+
+	if (
+		prepared_module_scopes_are_compatible(owner, requested)
+		and requested_representation.module_index >= 0
+		and requested_representation.module_index < module_count
+	):
+		Some(requested_representation.module_index)
+	else:
+		None

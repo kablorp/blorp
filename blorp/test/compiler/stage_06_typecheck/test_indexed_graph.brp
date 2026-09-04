@@ -2,6 +2,7 @@ import:
 	../../../src/compiler/stage_03_parse/source_ast_finalize:
 		FinalizedImportPathRewrite,
 		FinalizedTypecheckProgram,
+		finalized_typecheck_program_ast,
 		finalized_typecheck_program_rewrite_import_paths,
 	../../../src/compiler/stage_04_modules/loaded_module:
 		ModuleLoadCandidate,
@@ -9,8 +10,9 @@ import:
 		module_identity_display_name,
 		module_load_candidate,
 		module_load_candidate_canonical_path,
+		module_load_candidate_with_surface,
 		resolved_module_identity_from_resolver,
-	../../../src/compiler/stage_06_typecheck/type_system/env: ENV_EMPTY
+	../../../src/compiler/stage_04_modules/module_surface: module_surface_for_program
 	../../../src/compiler/stage_06_typecheck/graph/definition_index:
 		definition_index_func_callable_id_count,
 		definition_index_initial_seed,
@@ -31,8 +33,10 @@ import:
 		indexed_graph_target_scope,
 		prepared_module_identity,
 		prepared_module_program,
+		prepared_module_scope_compatible_index,
 		prepared_module_scope_module,
 		prepared_module_scopes_are_compatible,
+	../../../src/compiler/stage_06_typecheck/type_system/env: ENV_EMPTY
 	../typecheck_test_support as TypecheckTestSupport
 	memory: get_mem_stats, reset_mem_stats
 	test: TestSuite
@@ -87,6 +91,21 @@ private pure func module_load_candidate_with_resolved_import(
 	module_load_candidate(
 		resolved_module_identity_from_resolver(module_path, UserModule),
 		rewritten,
+	)
+
+
+private pure func module_load_candidate_with_alternate_surface(
+	path: String,
+	module_path: String,
+	source: String,
+	surface_source: String,
+) -> ModuleLoadCandidate:
+	module_load_candidate_with_surface(
+		resolved_module_identity_from_resolver(module_path, UserModule),
+		finalized_program(path, module_path, source),
+		module_surface_for_program(
+			finalized_typecheck_program_ast(finalized_program(path, module_path, surface_source)),
+		),
 	)
 
 
@@ -454,6 +473,93 @@ pure func test_prepared_module_scopes_reject_different_module_order() -> Bool:
 					)
 
 
+pure func test_prepared_module_scope_indices_require_compatible_graphs() -> Bool:
+	target = fixture_module_load_candidate("main.brp", "app", "func main(): 0")
+	first = fixture_module_load_candidate("first.brp", "pkg/first", "pure func first(): 1")
+	second = fixture_module_load_candidate("second.brp", "pkg/second", "pure func second(): 2")
+	different = fixture_module_load_candidate("second.brp", "pkg/second", "pure func second(): 3")
+
+	match (
+		indexed_graph_build(
+			target,
+			[first, second],
+		)
+	):
+		Err(_):
+			False
+		Ok(graph):
+			match (
+				indexed_graph_build(
+					target,
+					[first, second],
+				)
+			):
+				Err(_):
+					False
+				Ok(equivalent):
+					match (
+						indexed_graph_build(
+							target,
+							[first, different],
+						)
+					):
+						Err(_):
+							False
+						Ok(incompatible):
+							match (
+								indexed_graph_find_dependency_scope(equivalent, "pkg/second"),
+								indexed_graph_find_dependency_scope(incompatible, "pkg/second"),
+							):
+								(Some(equivalent_second), Some(incompatible_second)):
+									(
+										prepared_module_scope_compatible_index(
+											indexed_graph_target_scope(graph),
+											indexed_graph_target_scope(equivalent),
+										) == Some(0)
+										and prepared_module_scope_compatible_index(
+											indexed_graph_target_scope(graph),
+											equivalent_second,
+										) == Some(2)
+										and prepared_module_scope_compatible_index(
+											indexed_graph_target_scope(graph),
+											incompatible_second,
+										).is_none()
+									)
+								_:
+									False
+
+
+pure func test_prepared_module_scope_indices_reject_different_retained_surfaces() -> Bool:
+	target = fixture_module_load_candidate("main.brp", "app", "func main(): 0")
+	source = "pure func visible() -> Int: 1"
+	first = module_load_candidate_with_alternate_surface("dep.brp", "pkg/dep", source, source)
+	different_surface = module_load_candidate_with_alternate_surface(
+		"dep.brp",
+		"pkg/dep",
+		source,
+		"private pure func visible() -> Int: 1",
+	)
+
+	match (indexed_graph_build(target, [first]), indexed_graph_build(target, [different_surface])):
+		(Ok(first_graph), Ok(different_graph)):
+			match indexed_graph_find_dependency_scope(different_graph, "pkg/dep"):
+				Some(different_scope):
+					(
+						not prepared_module_scopes_are_compatible(
+							indexed_graph_target_scope(first_graph),
+							different_scope,
+						)
+						and prepared_module_scope_compatible_index(
+							indexed_graph_target_scope(first_graph),
+							different_scope,
+						).is_none()
+					)
+				None:
+					False
+		_:
+			False
+
+
 private func build_and_release_indexed_graph() -> Bool:
 	target = fixture_module_load_candidate("main.brp", "app", "func main(): 0")
 	dependency = fixture_module_load_candidate("dep.brp", "dep", "pure func value(): 1")
@@ -541,6 +647,14 @@ tests: TestSuite = {
 		(
 			"prepared module scopes reject different module order",
 			test_prepared_module_scopes_reject_different_module_order,
+		),
+		(
+			"prepared module scope indices require compatible graphs",
+			test_prepared_module_scope_indices_require_compatible_graphs,
+		),
+		(
+			"prepared module scope indices reject different retained surfaces",
+			test_prepared_module_scope_indices_reject_different_retained_surfaces,
 		),
 		("indexed graph releases owned values", test_indexed_graph_releases_owned_values),
 	]
