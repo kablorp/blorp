@@ -134,7 +134,7 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "missing Perceus work counters"):
             self.benchmark.parse_perceus_work_counters("\n".join(rows[:-1]))
 
-    def test_profile_counter_parser_accepts_pre_tranche_two_baseline_schema(self) -> None:
+    def test_profile_counter_parser_accepts_legacy_baseline_schema(self) -> None:
         rows = []
         for index, name in enumerate(
             self.benchmark.LEGACY_PERCEUS_WORK_COUNTER_NAMES,
@@ -146,7 +146,7 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
 
         actual = self.benchmark.parse_perceus_work_counters(
             "\n".join(rows),
-            require_tranche_2=False,
+            require_candidate_schema=False,
         )
 
         self.assertEqual(set(actual), set(self.benchmark.LEGACY_PERCEUS_WORK_COUNTER_NAMES))
@@ -209,7 +209,7 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
             _, program = self.benchmark.fixture_request(
                 4,
                 3,
-                64,
+                256,
                 2,
                 params_per_function=2,
                 body_shape=body_shape,
@@ -224,6 +224,77 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
             fingerprints.add(json.dumps(worker["body"], sort_keys=True))
 
         self.assertEqual(len(fingerprints), len(self.benchmark.BODY_SHAPES))
+
+    def test_aggregate_escape_is_a_supported_body_shape(self) -> None:
+        self.assertIn("aggregate_escape", self.benchmark.BODY_SHAPES)
+
+    def test_borrowed_return_is_a_supported_body_shape(self) -> None:
+        self.assertIn("borrowed_return", self.benchmark.BODY_SHAPES)
+
+    def test_borrowed_return_fixture_has_fixed_nodes_and_result_terminals(self) -> None:
+        _, program = self.benchmark.fixture_request(
+            1,
+            2,
+            256,
+            0,
+            params_per_function=8,
+            body_shape="borrowed_return",
+            invoke_workers=False,
+        )
+        worker = next(
+            declaration
+            for declaration in program["decls"]
+            if declaration.get("name") == "bench_worker_0000"
+        )
+
+        self.assertEqual(self.benchmark.expression_node_count(worker["body"]), 256)
+        self.assertEqual(worker["return_type"], self.benchmark.named_type("String"))
+        self.assertEqual(
+            self.benchmark.count_parameter_reads(
+                worker["body"],
+                "BENCH_BORROWED_PARAM_0000_0000",
+            ),
+            self.benchmark.RESULT_ALIAS_TERMINALS_PER_FUNCTION,
+        )
+        self.assertEqual(
+            self.benchmark.count_parameter_reads(
+                worker["body"],
+                "BENCH_BORROWED_PARAM_0000_0007",
+            ),
+            0,
+        )
+
+    def test_aggregate_escape_fixture_has_fixed_nodes_and_real_escape_sites(self) -> None:
+        _, program = self.benchmark.fixture_request(
+            1,
+            2,
+            128,
+            0,
+            params_per_function=8,
+            body_shape="aggregate_escape",
+            invoke_workers=False,
+        )
+        worker = next(
+            declaration
+            for declaration in program["decls"]
+            if declaration.get("name") == "bench_worker_0000"
+        )
+
+        self.assertEqual(self.benchmark.expression_node_count(worker["body"]), 128)
+        self.assertEqual(
+            self.benchmark.count_parameter_reads(
+                worker["body"],
+                "BENCH_BORROWED_PARAM_0000_0000",
+            ),
+            self.benchmark.AGGREGATE_ESCAPE_SITES_PER_FUNCTION,
+        )
+        self.assertEqual(
+            self.benchmark.count_parameter_reads(
+                worker["body"],
+                "BENCH_BORROWED_PARAM_0000_0007",
+            ),
+            0,
+        )
 
     def test_borrowed_call_fixture_invokes_workers_with_heap_records(self) -> None:
         _, program = self.benchmark.fixture_request(
@@ -613,6 +684,228 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "at least 75%"):
             self.benchmark.validate_borrowed_call_matrix(insufficient_reduction)
 
+    def test_aggregate_matrix_rejects_owner_scaled_rewrite_work(self) -> None:
+        def point(
+            owner_count,
+            node_visits,
+            member_visits,
+            *,
+            fallback_requests=0,
+            rewrite_actions=None,
+            baseline_node_visits=None,
+        ):
+            return {
+                "functions": 2,
+                "params_per_function": owner_count,
+                "comparison_kind": "compiler-worker",
+                "work_counters": {
+                    "borrowed_aggregate_node_visits": node_visits,
+                    "borrowed_aggregate_owner_candidate_visits": member_visits,
+                    "borrowed_aggregate_alias_fallback_requests": fallback_requests,
+                    "borrowed_aggregate_rewrite_actions": (
+                        rewrite_actions
+                        if rewrite_actions is not None
+                        else 2 * self.benchmark.AGGREGATE_ESCAPE_SITES_PER_FUNCTION
+                    ),
+                    "borrowed_origin_member_visits": member_visits,
+                    "borrowed_origin_storage_slots": 0,
+                },
+                "baseline_work_counters": {
+                    "borrowed_aggregate_node_visits": (
+                        baseline_node_visits
+                        if baseline_node_visits is not None
+                        else node_visits * owner_count
+                    ),
+                },
+            }
+
+        valid = [point(1, 256, 32), point(8, 256, 32), point(32, 256, 32)]
+        self.benchmark.validate_borrowed_aggregate_matrix(valid)
+
+        invalid = [point(1, 256, 32), point(8, 2048, 256), point(32, 8192, 1024)]
+        with self.assertRaisesRegex(RuntimeError, "scales with owner count"):
+            self.benchmark.validate_borrowed_aggregate_matrix(invalid)
+
+        fallbacks = [
+            point(1, 256, 32, fallback_requests=1),
+            point(8, 256, 32, fallback_requests=1),
+            point(32, 256, 32, fallback_requests=1),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "scalar alias fallback"):
+            self.benchmark.validate_borrowed_aggregate_matrix(fallbacks)
+
+        wrong_rewrites = [
+            point(1, 256, 32, rewrite_actions=1),
+            point(8, 256, 32, rewrite_actions=1),
+            point(32, 256, 32, rewrite_actions=1),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "escaping values"):
+            self.benchmark.validate_borrowed_aggregate_matrix(wrong_rewrites)
+
+        insufficient_reduction = [
+            point(1, 256, 32, baseline_node_visits=256),
+            point(8, 256, 32, baseline_node_visits=512),
+            point(32, 256, 32, baseline_node_visits=1000),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "at least 75%"):
+            self.benchmark.validate_borrowed_aggregate_matrix(insufficient_reduction)
+
+    def test_aggregate_matrix_reuses_workers_and_varies_only_owner_count(self) -> None:
+        args = argparse.Namespace(
+            bridge=None,
+            counter_bridge=None,
+            globals=1,
+            functions=2,
+            body_leaves=128,
+            global_reads_per_function=0,
+            params_per_function=1,
+            parameter_type="String",
+            body_shape="linear",
+            end_to_end=False,
+            work_counters=False,
+        )
+
+        with mock.patch.object(
+            self.benchmark,
+            "prepare_backend_worker",
+            return_value=Path("/tmp/perceus-worker"),
+        ) as prepare, mock.patch.object(
+            self.benchmark,
+            "run_benchmark",
+            return_value=0,
+        ) as run:
+            self.benchmark.run_aggregate_matrix(args)
+
+        prepare.assert_called_once()
+        points = [
+            (
+                call.args[0].params_per_function,
+                call.args[0].functions,
+                call.args[0].body_leaves,
+                call.args[0].body_shape,
+                call.args[0].invoke_workers,
+            )
+            for call in run.call_args_list
+        ]
+        self.assertEqual(points, [
+            (1, 2, 128, "aggregate_escape", False),
+            (8, 2, 128, "aggregate_escape", False),
+            (32, 2, 128, "aggregate_escape", False),
+        ])
+
+    def test_result_matrix_rejects_owner_scaled_rewrite_work(self) -> None:
+        def point(
+            owner_count,
+            node_visits,
+            candidate_visits,
+            *,
+            fallback_requests=0,
+            rewrite_actions=None,
+            baseline_node_visits=None,
+        ):
+            return {
+                "functions": 2,
+                "params_per_function": owner_count,
+                "comparison_kind": "compiler-worker",
+                "paired_window_elapsed_microseconds_ratio_median": 0.80,
+                "paired_window_allocations_ratio_median": 0.70,
+                "paired_window_releases_ratio_median": 1.0,
+                "work_counters": {
+                    "borrowed_result_node_visits": node_visits,
+                    "borrowed_result_owner_candidate_visits": candidate_visits,
+                    "borrowed_result_alias_fallback_requests": fallback_requests,
+                    "borrowed_result_rewrite_actions": (
+                        rewrite_actions
+                        if rewrite_actions is not None
+                        else 2 * self.benchmark.RESULT_ALIAS_TERMINALS_PER_FUNCTION
+                    ),
+                    "borrowed_origin_member_visits": candidate_visits,
+                    "borrowed_origin_storage_slots": 0,
+                },
+                "baseline_work_counters": {
+                    "borrowed_result_node_visits": (
+                        baseline_node_visits
+                        if baseline_node_visits is not None
+                        else node_visits * owner_count
+                    ),
+                },
+            }
+
+        valid = [point(1, 130, 64), point(8, 130, 64), point(32, 130, 64)]
+        self.benchmark.validate_borrowed_result_matrix(valid)
+
+        scaled = [point(1, 256, 64), point(8, 2048, 512), point(32, 8192, 2048)]
+        with self.assertRaisesRegex(RuntimeError, "scales with owner count"):
+            self.benchmark.validate_borrowed_result_matrix(scaled)
+
+        fallbacks = [
+            point(1, 130, 64, fallback_requests=1),
+            point(8, 130, 64, fallback_requests=1),
+            point(32, 130, 64, fallback_requests=1),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "scalar alias fallback"):
+            self.benchmark.validate_borrowed_result_matrix(fallbacks)
+
+        wrong_rewrites = [
+            point(1, 130, 64, rewrite_actions=1),
+            point(8, 130, 64, rewrite_actions=1),
+            point(32, 130, 64, rewrite_actions=1),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "result terminals"):
+            self.benchmark.validate_borrowed_result_matrix(wrong_rewrites)
+
+        insufficient_reduction = [
+            point(1, 130, 64, baseline_node_visits=130),
+            point(8, 130, 64, baseline_node_visits=260),
+            point(32, 130, 64, baseline_node_visits=500),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "at least 75%"):
+            self.benchmark.validate_borrowed_result_matrix(insufficient_reduction)
+
+    def test_result_matrix_reuses_workers_and_varies_only_owner_count(self) -> None:
+        args = argparse.Namespace(
+            bridge=None,
+            counter_bridge=None,
+            globals=1,
+            functions=2,
+            body_leaves=256,
+            global_reads_per_function=0,
+            params_per_function=1,
+            parameter_type="String",
+            body_shape="linear",
+            end_to_end=False,
+            work_counters=False,
+        )
+
+        with mock.patch.object(
+            self.benchmark,
+            "prepare_backend_worker",
+            return_value=Path("/tmp/perceus-worker"),
+        ) as prepare, mock.patch.object(
+            self.benchmark,
+            "run_benchmark",
+            return_value=0,
+        ) as run:
+            self.benchmark.run_result_matrix(args)
+
+        prepare.assert_called_once()
+        points = [
+            (
+                call.args[0].params_per_function,
+                call.args[0].functions,
+                call.args[0].body_leaves,
+                call.args[0].body_shape,
+                call.args[0].invoke_workers,
+                call.args[0].measurement_window,
+            )
+            for call in run.call_args_list
+        ]
+        self.assertEqual(points, [
+            (1, 2, 256, "borrowed_return", False, "perceus-direct"),
+            (8, 2, 256, "borrowed_return", False, "perceus-direct"),
+            (32, 2, 256, "borrowed_return", False, "perceus-direct"),
+        ])
+
     def test_parameter_matrix_ignores_single_fixture_shape_arguments(self) -> None:
         with mock.patch.object(
             self.benchmark,
@@ -640,6 +933,27 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
                 self.benchmark.main(["--parameter-matrix", "--end-to-end"])
 
         self.assertEqual(raised.exception.code, 2)
+
+    def test_aggregate_matrix_dispatches_without_single_fixture_limits(self) -> None:
+        with mock.patch.object(
+            self.benchmark,
+            "run_aggregate_matrix",
+            return_value=0,
+        ) as run:
+            exit_code = self.benchmark.main([
+                "--aggregate-matrix",
+                "--globals",
+                "1",
+                "--global-reads-per-function",
+                "100",
+                "--params-per-function",
+                "100",
+                "--body-leaves",
+                "1",
+            ])
+
+        self.assertEqual(exit_code, 0)
+        run.assert_called_once()
 
     def test_paired_end_to_end_mode_does_not_require_counter_worker(self) -> None:
         with mock.patch.object(

@@ -1118,22 +1118,30 @@ for a timing-only run, or `--counter-bridge` when comparing an explicitly built
 instrumented worker. Never use the debug/profile worker's elapsed time for a
 speed claim.
 
-The initial body catalog is deliberately limited to the contract-inference
-workloads consumed by the next optimization tranche:
+The body catalog keeps each ownership optimization on an independently
+selectable workload:
 
 ```bash
 benchmarks/compiler_perceus_memory --body-shape linear
+benchmarks/compiler_perceus_memory --body-shape borrowed_call_protection
+benchmarks/compiler_perceus_memory --body-shape aggregate_escape
+benchmarks/compiler_perceus_memory --body-shape borrowed_return
 benchmarks/compiler_perceus_memory --body-shape nested_user_call --user-call-edges 8
 benchmarks/compiler_perceus_memory --body-shape mutually_recursive_calls --user-call-edges 8
 ```
 
-Branch, match, aggregate, borrowed-return, and cancellation fixtures will be
-added with the tranches that consume them; constructing unvalidated Core JSON
-for all later mechanisms here would add test-only surface without improving the
-current contract baseline. Use `--end-to-end` to run ownership preparation,
-Perceus, and the complete post-Perceus tail before measuring backend emission.
-That result includes separate retain, release, ARC-only release, cleanup-push,
-and cleanup-pop counts from the generated program C artifact.
+The borrowed-call fixture holds one real consuming field projection constant as
+owner count grows. The aggregate fixture places twelve field projections in
+explicit record-transfer slots per function. Both use fixed 128-node bodies and
+ordinary name-only heap-record parameters. The borrowed-result fixture uses a
+fixed 256-node body with a balanced 32-terminal result tree; one traversable
+padding subtree remains outside result position. None adds real alias work as
+the owner-count axis grows. Branch and cancellation fixtures will be added with
+the tranches that consume them. Use `--end-to-end` to run
+ownership preparation, Perceus, and the complete post-Perceus tail before
+measuring backend emission. That result includes separate retain, release,
+ARC-only release, cleanup-push, and cleanup-pop counts from the generated
+program C artifact.
 
 For the standard four-point global/reference matrix, build one worker and run
 seven warmed samples per point:
@@ -1166,6 +1174,36 @@ callees; repeated sites to the same callee do not masquerade as graph edges:
 
 ```bash
 benchmarks/compiler_perceus_memory --contract-matrix --samples 7 --json
+```
+
+The aggregate matrix keeps two uncalled worker functions at exactly 128 nodes,
+varies 1, 8, and 32 borrowed owners, and holds twelve real aggregate escapes per
+function fixed. It rejects owner-scaled traversal, alias fallback, origin-set,
+or rewrite work and requires at least a 75% traversal reduction at 32 owners in
+paired compiler-worker mode:
+
+```bash
+benchmarks/compiler_perceus_memory \
+  --aggregate-matrix \
+  --measurement-window perceus-direct \
+  --samples 7 --json
+```
+
+The result matrix keeps two uncalled worker functions at exactly 256 nodes,
+varies 1, 8, and 32 borrowed owners, and holds 32 real result terminals per
+function fixed. It forces the direct-Perceus window, requires explicit
+immediate-parent timing and counter workers, checks exact Core identity, and
+enforces the result traversal, timing, allocation, and one-owner regression
+gates:
+
+```bash
+benchmarks/compiler_perceus_memory \
+  --result-matrix \
+  --bridge /path/to/candidate-worker \
+  --counter-bridge /path/to/candidate-counter-worker \
+  --baseline-bridge /path/to/immediate-parent-worker \
+  --baseline-counter-bridge /path/to/immediate-parent-counter-worker \
+  --samples 7 --json
 ```
 
 For performance decisions, compare explicit workers in alternating order:

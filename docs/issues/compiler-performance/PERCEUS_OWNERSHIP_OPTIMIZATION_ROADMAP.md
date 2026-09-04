@@ -1,6 +1,6 @@
 # Perceus Ownership Optimization Roadmap
 
-**Status:** Tranches 0–1 implemented; Tranches 2–9 proposed
+**Status:** Tranches 0–3 implemented; Tranches 4–9 proposed
 
 ## Objective
 
@@ -551,6 +551,8 @@ mutually_recursive_calls
 borrowed_return
 aggregate_escape
 referenced_global
+lambda_borrowed_boundary
+borrowed_boundary_fusion
 task_and_select
 ```
 
@@ -579,14 +581,13 @@ not noisy process or Core JSON time, are the primary fast proof.
 
 ### Forecasts versus acceptance gates
 
-The ranges below are pre-baseline hypotheses used to prioritize work. They are
-not evidence-backed current-main promises. Every row is relative to its
-immediate parent tranche; the cumulative statement following the table is
-relative to Tranche 0. Tranche 0 must replace these hypotheses with
-counter-derived forecasts before implementation of the corresponding tranche.
-A tranche succeeds by meeting its structural and correctness criteria and by
-avoiding a controlled performance regression, even when process or JSON costs
-dilute a focused wall-time result.
+Rows not yet implemented are prioritization hypotheses rather than
+production-current promises. Every row is relative to its immediate parent;
+the cumulative statement following the table is relative to Tranche 0. The
+Tranche 4 rows are stricter issue-level landing gates: their deliberately
+dominant fixed-shape fixtures must expose an observable gain before the change
+can merge. Production self-compilation percentages remain measurements, not
+promises, because earlier tranches change the remaining Perceus denominator.
 
 | Tranche | Direct work expected to disappear | Targeted benchmark forecast | Production self-compilation forecast |
 | --- | --- | ---: | ---: |
@@ -594,7 +595,8 @@ dilute a focused wall-time result.
 | 1: contract equations | Per-parameter body scans and per-wave body rescans | 30–70% faster contract-heavy Perceus fixture | 3–10% of Perceus time; whole-compiler effect likely below 2% |
 | 2: all-owner call protection | One body reconstruction per borrowed owner | 15–40% faster owner-rich fixture | 2–8% of Perceus time |
 | 3: all-owner aggregate protection | Another reconstruction per borrowed owner | 10–30% faster aggregate-heavy fixture | 1–5% of Perceus time |
-| 4: results, globals, and fusion | Per-owner terminal walks, per-global triples, then two of three all-owner walks | 15–40% faster borrowed-boundary fixture | 3–12% of Perceus time |
+| 4A–C: results, globals, and lambdas | Per-owner terminal walks and per-owner rewrite triples | At least 15% faster on each 32-owner focused fixture | Rebaseline after each issue; no percentage promised |
+| 4D: borrowed-boundary fusion | Three overlapping all-owner reconstruction passes | At least 10% faster on the overlapping fusion fixture | Reprofile after fusion; no percentage promised |
 | 5: all-value facts | Repeated scalar summaries and occurrence fallbacks | 20–50% faster branch/match/repetition fixtures | 8–25% of Perceus time |
 | 6: plan/materialize | Per-value balancing rewrites and most repeated reconstruction | 25–60% faster complex ownership fixtures | 15–35% of Perceus time |
 | 7A: cleanup-plan parity | Per-binding emitter body scans | 50–90% fewer relevant node visits | 2–8% of backend emission time |
@@ -895,19 +897,20 @@ record BorrowedOwnerCatalog {
 	has_unresolved_identity: Bool
 }
 
-record BorrowedCallRewriteContext {
+record BorrowedOwnerRewriteContext {
 	env: PerceusEnv,
 	owners: BorrowedOwnerCatalog,
-	shadowed_owner_ids: Dict[Int, Bool]
+	shadowed_owner_ids: Dict[Int, Bool],
+	query_kind: BorrowedOwnerQueryKind
 }
 
 private pure func protect_borrowed_calls(
-	context: BorrowedCallRewriteContext,
+	context: BorrowedOwnerRewriteContext,
 	expr: CoreExpr,
 ) -> CoreExpr
 
 private pure func first_borrowed_owner_aliasing_expr(
-	context: BorrowedCallRewriteContext,
+	context: BorrowedOwnerRewriteContext,
 	expr: CoreExpr,
 ) -> Option[Int]
 ```
@@ -975,21 +978,52 @@ queries. The ownership-ready focused fixture has no scalar fallback requests.
 
 ## Tranche 3: Normalize Aggregate Transfers For All Owners
 
-### Change
+**Implemented:** 2026-09-04. Function-parameter call protection and aggregate
+normalization now share one ordered owner catalog. Aggregate normalization
+reconstructs supported ownership-ready Core regions once, carries exact sparse
+shadow state through binders and compiled matches, and asks for only the
+earliest active owner at each transferring slot. The scalar aggregate pass
+remains for globals, lambda-local borrowed values, and explicit local-binding
+compatibility paths. Issues 49–50 move globals and lambda region owners onto
+catalogs; local match/loop paths remain deferred to the later all-value fact
+and planning tranches.
 
-Extend the all-owner alias mechanism to ownership-transferring aggregate slots:
+The aggregate boundary is contract-directed. Record and source-level tuple
+fields transfer their children. Prepared boxed collection and union slots use
+`needs_release`; list-set storage uses `transfers_ownership`; prepared tuple
+pointer slots use the least-significant-first `retain_mask`, while struct slots
+transfer and primitive, float, void, and stack-result slots do not. No
+constructor spelling or broad expression-shape heuristic decides ownership.
+
+The focused 32-owner fixture reduced aggregate reconstruction visits from
+9,656 to 232 (97.6%), direct-Perceus window allocations by 60.3%, releases by
+61.4%, and the paired direct-window median by 54.4%. The one-owner point was
+neutral. Post-Perceus Core and generated C were byte-identical. See
+`benchmarks/results/compiler_perceus_tranche3_2026-09-04.md`.
+
+### Previous shape
+
+`retain_borrowed_param_aggregates` reconstructed each function body once for
+every nonconsumed managed parameter. Each transferring child then recursively
+normalized nested aggregate members and ran a scalar alias query for that
+owner.
+
+### Implemented shape
+
+The all-owner alias mechanism now covers ownership-transferring aggregate slots:
 
 ```blorp
 private pure func retain_borrowed_aggregate_transfers(
-	context: PerceusFunctionContext,
-	owners: BorrowedOwnerCatalog,
-	body: CoreExpr,
+	context: BorrowedOwnerRewriteContext,
+	expr: CoreExpr,
 ) -> CoreExpr
 ```
 
-Transfer decisions must use explicit constructor contracts,
-`CoreBoxedStorageValue.transfers_ownership`, and retain masks. Do not infer
-transfer from constructor spelling or expression shape.
+Transfer decisions use explicit storage contracts:
+`CoreBoxedStorageValue.needs_release` for boxed aggregate slots,
+`CoreBoxedStorageValue.transfers_ownership` for list-set storage, and prepared
+tuple retain masks. Do not infer transfer from constructor spelling or
+expression shape.
 
 ### Independent value
 
@@ -1010,72 +1044,89 @@ the later general lifetime planner.
   noise, increase only aggregate density and use logical counters to decide
   whether the change has independent value.
 
-## Tranche 4: Normalize Results And Globals, Then Fuse Borrowed Rewrites
+## Tranche 4: Normalize Every Borrowed Boundary Once Per Ownership Region
 
-### Result-position traversal
+Tranche 4 is split into four independently mergeable issues. The split first
+removes the remaining owner-multiplied rewrites, then fuses the proven all-owner
+passes. Each issue has a fixed-shape benchmark, exact logical counters, paired
+immediate-parent workers, byte-identical Core/C requirements, and an observable
+direct-Perceus performance gate.
 
-Result ownership recurses only through result-bearing children:
+### 4A: All-owner function results
 
-```text
-IfExpr                  both arms
-MatchExpr               every arm result
-LetExpr                 body, not initializer
-SeqExpr                 right expression
-Loop or task boundary   according to its explicit Core contract
-ordinary expression     the expression itself
-```
+[Issue 48](48-normalize-borrowed-results-for-all-owners.md) replaces the
+per-parameter result-path loop with one branch-local all-owner result walk.
+Result satisfaction is distinct from lexical shadowing: an existing `DupExpr`
+may satisfy one owner's result obligation without hiding that owner from call
+or aggregate analysis.
 
-Implement:
+The exact result-carrier inventory comes from the current scalar authority.
+Conditions, scrutinees, initializers, assignment right-hand sides, and currently
+opaque loop/task forms must not become result paths during an output-preserving
+optimization.
 
-```blorp
-private pure func own_borrowed_result_paths(
-	context: PerceusFunctionContext,
-	owners: BorrowedOwnerCatalog,
-	body: CoreExpr,
-) -> CoreExpr
-```
+Implemented on 2026-09-04. The 32-owner focused fixture reduced result-path
+visits by 97.9%, the paired direct-Perceus median by 27.5%, and allocations by
+23.6%, with byte-identical Core and generated C. See
+[`compiler_perceus_tranche4a_2026-09-04.md`](../../../benchmarks/results/compiler_perceus_tranche4a_2026-09-04.md).
 
-Referenced globals enter the same owner catalog. Preserve the existing exact
-resolved-reference filtering; do not scan or normalize every program global.
+### 4B: Exact referenced globals
 
-### Fusion
+[Issue 49](49-normalize-referenced-globals-as-owner-catalog.md) replaces the
+per-global call/aggregate/result triples in function bodies and dynamic global
+initializers. Only exact resolved, referenced, managed globals enter the
+catalog. Parameter owners retain declaration order and referenced globals
+retain existing sorted global-index order; the initialized global excludes
+itself.
 
-Once call, aggregate, and result behavior independently match the baseline,
-combine them:
+Global discovery may remain one separate read-only pass initially. The landing
+property is one owner-independent reconstruction per operation family, not a
+claim that catalog discovery itself is free.
 
-```blorp
-private pure func normalize_borrowed_ownership(
-	context: PerceusFunctionContext,
-	owners: BorrowedOwnerCatalog,
-	body: CoreExpr,
-) -> CoreExpr
-```
+### 4C: Lambda ownership regions
 
-The combined traversal carries an explicit context rather than relying on
-operation order:
+[Issue 50](50-use-owner-catalogs-for-lambda-regions.md) applies the same
+all-owner mechanisms to lambda parameters, runtime captures, and exact
+referenced globals. A nested lambda is opaque to its outer region and is
+normalized exactly once as its own ownership region.
 
-```blorp
-union BorrowedUseContext:
-	OrdinaryBorrowedUse
-	ConsumingCallArgument(OwnershipCallContract, Int)
-	OwnershipTransferringStorage
-	FunctionResultPosition
-```
+Match, loop, resource, mutable-slot, and concurrency bindings introduced inside
+a region remain on their existing lexical-balancing path. Their all-value
+migration belongs to Tranches 5–6 rather than being hidden inside borrowed
+boundary fusion.
 
-### Acceptance criteria
+### 4D: Fuse the boundary passes
 
-- Result-position rules have focused tests for every child-bearing Core form.
-- Parameter/global spelling collisions preserve exact identity.
-- Direct and contracted return aliases remain owned at the boundary.
-- The all-owner result walk is independent of owner count.
-- After fusion, borrowed normalization visits the body once per function.
-- The fused implementation emits the same canonical ownership events. Byte
-  identity is required unless stable event ordering is deliberately encoded by
-  a stronger canonical oracle.
-- Fused normalization performs at least 50% fewer expression visits than the
-  three independent all-owner traversals.
-- The complete borrowed-boundary fixture must not regress and its realized
-  median is recorded against the Tranche 0 hypothesis.
+[Issue 51](51-fuse-borrowed-boundary-normalization.md) combines the independently
+validated call, aggregate, and result passes into one post-order reconstruction
+per function, lambda, or dynamic-global-initializer region. Boundary kind,
+lexical visibility, and result satisfaction are represented independently.
+
+The fused action order is explicit: normalize children, apply consuming-call
+ownership, apply contract-directed storage transfer, then apply terminal result
+ownership. The implementation must model ownership transitions directly rather
+than depending on a later pass observing wrappers inserted by an earlier pass.
+
+### Tranche-wide acceptance
+
+- Issue 48 removes parameter-scaled result reconstruction.
+- Issue 49 removes referenced-global-scaled reconstruction without considering
+  unreferenced program globals.
+- Issue 50 removes parameter/capture/global-scaled lambda reconstruction.
+- Each of Issues 48–50 reduces relevant node visits by at least 75%, improves
+  its 32-owner focused direct-Perceus median by at least 15%, and lowers focused
+  direct-window allocations by at least 20%.
+- Issue 51 visits each ownership region once, reduces overlapping traversal
+  visits by at least 50%, improves the fusion fixture's direct-Perceus median by
+  at least 10%, and lowers focused allocations by at least 15%.
+- Low-owner/low-density controls remain neutral within specified paired noise
+  and allocation bounds.
+- Every checkpoint preserves exact ownership-event order, post-Perceus Core,
+  and generated C against its immediate parent.
+- The final fusion deletes the superseded traversal/helper families rather
+  than retaining a second production compatibility path.
+- Compiler self-compilation is reprofiled after 4D. Its result guides the
+  Tranche 5 stop/go decision but is not substituted for the focused gates.
 
 ## Tranche 5: Build All-Value Ownership Facts Once
 

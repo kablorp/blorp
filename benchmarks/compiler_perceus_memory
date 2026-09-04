@@ -28,7 +28,7 @@ from compiler_backend_worker import (
 )
 
 
-FIXTURE_VERSION = 5
+FIXTURE_VERSION = 6
 DEFAULT_TIMEOUT_SECONDS = 60.0
 PERCEUS_ACTION = "run_perceus"
 MEASURE_OWNERSHIP_PREPARATION_PERCEUS_ACTION = (
@@ -41,6 +41,8 @@ DEFAULT_MEASUREMENT_WINDOW = "ownership-preparation-plus-perceus"
 BODY_SHAPES = (
     "linear",
     "borrowed_call_protection",
+    "aggregate_escape",
+    "borrowed_return",
     "nested_user_call",
     "mutually_recursive_calls",
 )
@@ -69,6 +71,12 @@ PERCEUS_WORK_COUNTER_NAMES = (
     "borrowed_call_owner_candidate_visits",
     "borrowed_call_alias_fallback_requests",
     "borrowed_call_rewrite_actions",
+    "borrowed_aggregate_owner_candidate_visits",
+    "borrowed_aggregate_alias_fallback_requests",
+    "borrowed_aggregate_rewrite_actions",
+    "borrowed_result_owner_candidate_visits",
+    "borrowed_result_alias_fallback_requests",
+    "borrowed_result_rewrite_actions",
     "borrowed_origin_member_visits",
     "borrowed_origin_storage_slots",
     "borrowed_aggregate_node_visits",
@@ -88,9 +96,23 @@ TRANCHE_2_WORK_COUNTER_NAMES = (
     "borrowed_origin_member_visits",
     "borrowed_origin_storage_slots",
 )
+TRANCHE_3_WORK_COUNTER_NAMES = (
+    "borrowed_aggregate_owner_candidate_visits",
+    "borrowed_aggregate_alias_fallback_requests",
+    "borrowed_aggregate_rewrite_actions",
+)
+TRANCHE_4_WORK_COUNTER_NAMES = (
+    "borrowed_result_owner_candidate_visits",
+    "borrowed_result_alias_fallback_requests",
+    "borrowed_result_rewrite_actions",
+)
 LEGACY_PERCEUS_WORK_COUNTER_NAMES = tuple(
     name for name in PERCEUS_WORK_COUNTER_NAMES
-    if name not in TRANCHE_2_WORK_COUNTER_NAMES
+    if name not in (
+        TRANCHE_2_WORK_COUNTER_NAMES
+        + TRANCHE_3_WORK_COUNTER_NAMES
+        + TRANCHE_4_WORK_COUNTER_NAMES
+    )
 )
 DEFAULT_GLOBALS = 384
 DEFAULT_FUNCTIONS = 64
@@ -106,6 +128,8 @@ CONTRACT_FIXTURE_LET_NODES = 2
 PRIMITIVE_PARAMETER_TYPE = "Int"
 MANAGED_PARAMETER_TYPE = "String"
 BORROWED_OWNER_TYPE_NAME = "BenchBorrowOwner"
+AGGREGATE_ESCAPE_SITES_PER_FUNCTION = 12
+RESULT_ALIAS_TERMINALS_PER_FUNCTION = 32
 WORKER_FLAG = "--measurement-worker"
 VMAP_SAMPLE_SECONDS = 0.1
 TERMINATE_GRACE_SECONDS = 1.0
@@ -165,7 +189,7 @@ def measurement_window_label(action: str) -> str:
 
 def parse_perceus_work_counters(
     stderr: str,
-    require_tranche_2: bool = True,
+    require_candidate_schema: bool = True,
 ) -> dict[str, int]:
     counters: dict[str, int] = {}
     for line in stderr.splitlines():
@@ -180,7 +204,7 @@ def parse_perceus_work_counters(
                 counters[name] = registered_count - 1
     required_names = (
         PERCEUS_WORK_COUNTER_NAMES
-        if require_tranche_2
+        if require_candidate_schema
         else LEGACY_PERCEUS_WORK_COUNTER_NAMES
     )
     missing = [name for name in required_names if name not in counters]
@@ -371,6 +395,24 @@ def padded_sequence(expressions: list[JsonObject], target_nodes: int) -> JsonObj
     return result
 
 
+def padded_result_sequence(result: JsonObject, target_nodes: int) -> JsonObject:
+    """Add traversable non-result work while preserving the result expression."""
+    result_nodes = expression_node_count(result)
+    padding_nodes = target_nodes - result_nodes - 1
+    if padding_nodes < 1:
+        raise ValueError(
+            "borrowed-result workload is larger than the requested node count"
+        )
+    padding = padded_sequence(
+        [literal_expr("int", 0, "Int")],
+        padding_nodes,
+    )
+    combined = {"kind": "seq", "first": padding, "second": result}
+    if expression_node_count(combined) != target_nodes:
+        raise RuntimeError("failed to construct exact borrowed-result node target")
+    return combined
+
+
 def global_decl(index: int) -> JsonObject:
     def_id = index + 1
     name = f"BENCH_UNUSED_GLOBAL_{index:04d}"
@@ -432,6 +474,7 @@ def user_function(
     def_id: int,
     body: JsonObject,
     params: list[JsonObject] | None = None,
+    return_type: str = "Int",
 ) -> JsonObject:
     return {
         "kind": "function",
@@ -439,7 +482,7 @@ def user_function(
         "module": None,
         "type_params": [],
         "params": params if params is not None else [],
-        "return_type": named_type("Int"),
+        "return_type": named_type(return_type),
         "body": body,
         "pure": True,
         "function_kind": {"kind": "user"},
@@ -504,6 +547,56 @@ def borrowed_owner_argument_expr(param_index: int) -> JsonObject:
     }
 
 
+def borrowed_owner_projection_expr(function_index: int) -> JsonObject:
+    return {
+        "kind": "field",
+        "expr": {
+            "kind": "var",
+            "var": core_var(borrowed_param_name(function_index, 0), None),
+            "type": heap_record_type(BORROWED_OWNER_TYPE_NAME),
+            "loc": synthetic_loc(),
+        },
+        "field": "BENCH_PAYLOAD",
+        "type": named_type(MANAGED_PARAMETER_TYPE),
+        "loc": synthetic_loc(),
+    }
+
+
+def borrowed_aggregate_escape_expr(function_index: int) -> JsonObject:
+    return {
+        "kind": "record_construct",
+        "type_name": BORROWED_OWNER_TYPE_NAME,
+        "fields": [{
+            "name": "BENCH_PAYLOAD",
+            "value": borrowed_owner_projection_expr(function_index),
+        }],
+        "type": heap_record_type(BORROWED_OWNER_TYPE_NAME),
+        "loc": synthetic_loc(),
+    }
+
+
+def borrowed_result_tree(function_index: int) -> JsonObject:
+    results = [
+        borrowed_param_ref_expr(function_index, 0, MANAGED_PARAMETER_TYPE)
+        for _ in range(RESULT_ALIAS_TERMINALS_PER_FUNCTION)
+    ]
+    while len(results) > 1:
+        if len(results) % 2 != 0:
+            raise RuntimeError("borrowed-result terminal count must form a balanced tree")
+        results = [
+            {
+                "kind": "if",
+                "cond": literal_expr("bool", True, "Bool"),
+                "then": results[index],
+                "else": results[index + 1],
+                "type": named_type(MANAGED_PARAMETER_TYPE),
+                "loc": synthetic_loc(),
+            }
+            for index in range(0, len(results), 2)
+        ]
+    return results[0]
+
+
 def consuming_parameter_expr(
     function_index: int,
     param_index: int,
@@ -533,18 +626,7 @@ def consuming_borrowed_projection_expr(
     function_index: int,
     parameter_type: str,
 ) -> JsonObject:
-    projected = {
-        "kind": "field",
-        "expr": {
-            "kind": "var",
-            "var": core_var(borrowed_param_name(function_index, 0), None),
-            "type": heap_record_type(BORROWED_OWNER_TYPE_NAME),
-            "loc": synthetic_loc(),
-        },
-        "field": "BENCH_PAYLOAD",
-        "type": named_type(MANAGED_PARAMETER_TYPE),
-        "loc": synthetic_loc(),
-    }
+    del parameter_type
     return {
         "kind": "call",
         "call_kind": {"kind": "builtin", "name": "blorp_string_concat_consume"},
@@ -555,7 +637,7 @@ def consuming_borrowed_projection_expr(
             "loc": synthetic_loc(),
         },
         "args": [
-            projected,
+            borrowed_owner_projection_expr(function_index),
             literal_expr("string", "", MANAGED_PARAMETER_TYPE),
         ],
         "type": named_type(MANAGED_PARAMETER_TYPE),
@@ -575,6 +657,37 @@ def worker_decl(
     first_function_id: int,
     user_call_edges: int,
 ) -> JsonObject:
+    if body_shape == "borrowed_return":
+        if params_per_function == 0:
+            raise ValueError("borrowed return requires parameters")
+        body_tail = padded_result_sequence(
+            borrowed_result_tree(index),
+            body_leaves - CONTRACT_FIXTURE_LET_NODES,
+        )
+        managed_local_name = f"BENCH_MANAGED_LOCAL_{index:04d}"
+        body = {
+            "kind": "let",
+            "name": core_var(managed_local_name, None),
+            "mutable": False,
+            "type": named_type("String"),
+            "rhs": literal_expr("string", f"managed-{index:04d}", "String"),
+            "body": body_tail,
+        }
+        params = [
+            core_param(
+                borrowed_param_name(index, param_index),
+                MANAGED_PARAMETER_TYPE,
+            )
+            for param_index in range(params_per_function)
+        ]
+        return user_function(
+            f"bench_worker_{index:04d}",
+            def_id,
+            body,
+            params,
+            MANAGED_PARAMETER_TYPE,
+        )
+
     direct_parameter_reads = (
         body_shape == "linear"
         or (body_shape == "nested_user_call" and index == function_count - 1)
@@ -597,6 +710,24 @@ def worker_decl(
         if params_per_function == 0:
             raise ValueError("borrowed-call protection requires parameters")
         expressions.append(consuming_borrowed_projection_expr(index, parameter_type))
+    elif body_shape == "aggregate_escape":
+        if params_per_function == 0:
+            raise ValueError("aggregate escape requires parameters")
+        expressions.extend(
+            borrowed_aggregate_escape_expr(index)
+            for _ in range(AGGREGATE_ESCAPE_SITES_PER_FUNCTION)
+        )
+        # The fixed 128-node workload has even cardinality. Include one fully
+        # traversable even-sized expression so padded_sequence does not need
+        # to wrap the whole body in an opaque CastExpr merely to fix parity.
+        expressions.append({
+            "kind": "if",
+            "cond": literal_expr("bool", True, "Bool"),
+            "then": literal_expr("int", 0, "Int"),
+            "else": literal_expr("int", 0, "Int"),
+            "type": named_type("Int"),
+            "loc": synthetic_loc(),
+        })
     if body_shape == "nested_user_call":
         if index < function_count - 1:
             calls = [
@@ -627,7 +758,7 @@ def worker_decl(
                 )
             )
         expressions = [*calls, *expressions]
-    elif body_shape not in ("linear", "borrowed_call_protection"):
+    elif body_shape not in ("linear", "borrowed_call_protection", "aggregate_escape"):
         raise ValueError(f"unsupported Perceus body shape: {body_shape}")
     if body_shape == "linear":
         literal_count = body_leaves - global_reads_per_function - params_per_function
@@ -656,7 +787,7 @@ def worker_decl(
                 borrowed_param_name(index, param_index),
                 heap_record_type(BORROWED_OWNER_TYPE_NAME),
             )
-            if body_shape == "borrowed_call_protection"
+            if body_shape in ("borrowed_call_protection", "aggregate_escape")
             else core_param(borrowed_param_name(index, param_index), parameter_type)
         )
         for param_index in range(params_per_function)
@@ -685,12 +816,14 @@ def call_worker_expr(
         "args": [
             (
                 borrowed_owner_argument_expr(param_index)
-                if body_shape == "borrowed_call_protection"
+                if body_shape in ("borrowed_call_protection", "aggregate_escape")
                 else parameter_argument_expr(param_index, parameter_type)
             )
             for param_index in range(params_per_function)
         ],
-        "type": named_type("Int"),
+        "type": named_type(
+            MANAGED_PARAMETER_TYPE if body_shape == "borrowed_return" else "Int"
+        ),
         "loc": synthetic_loc(),
     }
 
@@ -740,7 +873,7 @@ def fixture_request(
     globals_json = [global_decl(index) for index in range(global_count)]
     type_decls = (
         [borrowed_owner_decl()]
-        if body_shape == "borrowed_call_protection"
+        if body_shape in ("borrowed_call_protection", "aggregate_escape")
         else []
     )
     first_function_id = global_count + 1
@@ -1058,7 +1191,7 @@ def validate_perceus_parameter_shape(
             value_type = param.get("type")
             expected_type = (
                 heap_record_type(BORROWED_OWNER_TYPE_NAME)
-                if body_shape == "borrowed_call_protection"
+                if body_shape in ("borrowed_call_protection", "aggregate_escape")
                 else named_type(parameter_type)
             )
             if (
@@ -1071,6 +1204,18 @@ def validate_perceus_parameter_shape(
             expected_reads = 1
             if body_shape == "borrowed_call_protection":
                 expected_reads = 1 if param_index == 0 else 0
+            elif body_shape == "aggregate_escape":
+                expected_reads = (
+                    AGGREGATE_ESCAPE_SITES_PER_FUNCTION
+                    if param_index == 0
+                    else 0
+                )
+            elif body_shape == "borrowed_return":
+                expected_reads = (
+                    RESULT_ALIAS_TERMINALS_PER_FUNCTION
+                    if param_index == 0
+                    else 0
+                )
             elif body_shape == "nested_user_call":
                 expected_reads = (
                     1
@@ -1704,7 +1849,7 @@ def run_benchmark(
                                 encoding="utf-8",
                                 errors="replace",
                             ),
-                            require_tranche_2=False,
+                            require_candidate_schema=False,
                         )
                     )
                 if baseline_counter_observations[0] != baseline_counter_observations[1]:
@@ -1977,6 +2122,187 @@ def validate_borrowed_call_matrix(points: list[JsonObject]) -> None:
             )
 
 
+def validate_borrowed_aggregate_matrix(points: list[JsonObject]) -> None:
+    if len(points) != 3:
+        raise RuntimeError("borrowed-aggregate matrix requires 1, 8, and 32-owner points")
+    owner_counts = [int(point["params_per_function"]) for point in points]
+    if owner_counts != [1, 8, 32]:
+        raise RuntimeError(
+            "borrowed-aggregate matrix requires 1, 8, and 32-owner points: "
+            f"{owner_counts}"
+        )
+    counters = [point.get("work_counters") for point in points]
+    if not all(isinstance(value, dict) for value in counters):
+        raise RuntimeError("borrowed-aggregate matrix requires work counters")
+
+    constant_names = (
+        "borrowed_aggregate_node_visits",
+        "borrowed_aggregate_owner_candidate_visits",
+        "borrowed_aggregate_alias_fallback_requests",
+        "borrowed_aggregate_rewrite_actions",
+        "borrowed_origin_member_visits",
+        "borrowed_origin_storage_slots",
+    )
+    for name in constant_names:
+        values = [int(counter[name]) for counter in counters]
+        if len(set(values)) != 1:
+            raise RuntimeError(
+                f"borrowed-aggregate matrix {name} scales with owner count: {values}"
+            )
+
+    fallback_requests = [
+        int(counter["borrowed_aggregate_alias_fallback_requests"])
+        for counter in counters
+    ]
+    if any(fallback_requests):
+        raise RuntimeError(
+            "borrowed-aggregate matrix unexpectedly entered scalar alias fallback: "
+            f"{fallback_requests}"
+        )
+
+    expected_rewrites = [
+        int(point["functions"]) * AGGREGATE_ESCAPE_SITES_PER_FUNCTION
+        for point in points
+    ]
+    actual_rewrites = [
+        int(counter["borrowed_aggregate_rewrite_actions"])
+        for counter in counters
+    ]
+    if actual_rewrites != expected_rewrites:
+        raise RuntimeError(
+            "borrowed-aggregate rewrites do not match escaping values: "
+            f"{actual_rewrites} != {expected_rewrites}"
+        )
+
+    if all(point.get("comparison_kind") == "compiler-worker" for point in points):
+        baseline_counters = [point.get("baseline_work_counters") for point in points]
+        if not all(isinstance(value, dict) for value in baseline_counters):
+            raise RuntimeError("borrowed-aggregate matrix requires baseline work counters")
+        candidate_visits = int(counters[-1]["borrowed_aggregate_node_visits"])
+        baseline_visits = int(
+            baseline_counters[-1]["borrowed_aggregate_node_visits"]
+        )
+        if candidate_visits * 4 > baseline_visits:
+            raise RuntimeError(
+                "borrowed-aggregate matrix must reduce 32-owner reconstruction visits "
+                f"by at least 75%: baseline {baseline_visits}, candidate {candidate_visits}"
+            )
+
+
+def validate_borrowed_result_matrix(points: list[JsonObject]) -> None:
+    if len(points) != 3:
+        raise RuntimeError("borrowed-result matrix requires 1, 8, and 32-owner points")
+    owner_counts = [int(point["params_per_function"]) for point in points]
+    if owner_counts != [1, 8, 32]:
+        raise RuntimeError(
+            "borrowed-result matrix requires 1, 8, and 32-owner points: "
+            f"{owner_counts}"
+        )
+    counters = [point.get("work_counters") for point in points]
+    if not all(isinstance(value, dict) for value in counters):
+        raise RuntimeError("borrowed-result matrix requires work counters")
+
+    constant_names = (
+        "borrowed_result_node_visits",
+        "borrowed_result_owner_candidate_visits",
+        "borrowed_result_alias_fallback_requests",
+        "borrowed_result_rewrite_actions",
+        "borrowed_origin_member_visits",
+        "borrowed_origin_storage_slots",
+    )
+    for name in constant_names:
+        values = [int(counter[name]) for counter in counters]
+        if len(set(values)) != 1:
+            raise RuntimeError(
+                f"borrowed-result matrix {name} scales with owner count: {values}"
+            )
+
+    expected_node_visits = [
+        int(point["functions"]) * (2 * RESULT_ALIAS_TERMINALS_PER_FUNCTION + 1)
+        for point in points
+    ]
+    actual_node_visits = [
+        int(counter["borrowed_result_node_visits"])
+        for counter in counters
+    ]
+    if actual_node_visits != expected_node_visits:
+        raise RuntimeError(
+            "borrowed-result traversal left the closed result-position path: "
+            f"{actual_node_visits} != {expected_node_visits}"
+        )
+
+    fallback_requests = [
+        int(counter["borrowed_result_alias_fallback_requests"])
+        for counter in counters
+    ]
+    if any(fallback_requests):
+        raise RuntimeError(
+            "borrowed-result matrix unexpectedly entered scalar alias fallback: "
+            f"{fallback_requests}"
+        )
+
+    expected_rewrites = [
+        int(point["functions"]) * RESULT_ALIAS_TERMINALS_PER_FUNCTION
+        for point in points
+    ]
+    actual_rewrites = [
+        int(counter["borrowed_result_rewrite_actions"])
+        for counter in counters
+    ]
+    if actual_rewrites != expected_rewrites:
+        raise RuntimeError(
+            "borrowed-result rewrites do not match result terminals: "
+            f"{actual_rewrites} != {expected_rewrites}"
+        )
+
+    if all(point.get("comparison_kind") == "compiler-worker" for point in points):
+        baseline_counters = [point.get("baseline_work_counters") for point in points]
+        if not all(isinstance(value, dict) for value in baseline_counters):
+            raise RuntimeError("borrowed-result matrix requires baseline work counters")
+        candidate_visits = int(counters[-1]["borrowed_result_node_visits"])
+        baseline_visits = int(baseline_counters[-1]["borrowed_result_node_visits"])
+        if candidate_visits * 4 > baseline_visits:
+            raise RuntimeError(
+                "borrowed-result matrix must reduce 32-owner reconstruction visits "
+                f"by at least 75%: baseline {baseline_visits}, candidate {candidate_visits}"
+            )
+
+        high_owner = points[-1]
+        speed_ratio = high_owner.get(
+            "paired_window_elapsed_microseconds_ratio_median"
+        )
+        allocation_ratio = high_owner.get(
+            "paired_window_allocations_ratio_median"
+        )
+        if not isinstance(speed_ratio, (int, float)):
+            raise RuntimeError("borrowed-result matrix is missing paired direct timing")
+        if float(speed_ratio) > 0.85:
+            raise RuntimeError(
+                "borrowed-result matrix must make the 32-owner direct window at "
+                f"least 15% faster: ratio {speed_ratio}"
+            )
+        if not isinstance(allocation_ratio, (int, float)):
+            raise RuntimeError("borrowed-result matrix is missing paired allocation data")
+        if float(allocation_ratio) > 0.80:
+            raise RuntimeError(
+                "borrowed-result matrix must reduce 32-owner direct-window "
+                f"allocations by at least 20%: ratio {allocation_ratio}"
+            )
+
+        one_owner = points[0]
+        for metric_name in ("window_allocations", "window_releases"):
+            ratio = one_owner.get(f"paired_{metric_name}_ratio_median")
+            if not isinstance(ratio, (int, float)):
+                raise RuntimeError(
+                    f"borrowed-result matrix is missing one-owner paired {metric_name}"
+                )
+            if float(ratio) > 1.02:
+                raise RuntimeError(
+                    "borrowed-result matrix one-owner "
+                    f"{metric_name} regressed by more than 2%: ratio {ratio}"
+                )
+
+
 def run_global_matrix(args: argparse.Namespace) -> int:
     root = project_root()
     with tempfile.TemporaryDirectory(prefix="blorp-perceus-matrix-worker-") as temp_name:
@@ -2045,6 +2371,87 @@ def run_parameter_matrix(args: argparse.Namespace) -> int:
 
         if getattr(args, "work_counters", False):
             validate_borrowed_call_matrix(matrix_points)
+
+    return 0
+
+
+def run_aggregate_matrix(args: argparse.Namespace) -> int:
+    root = project_root()
+    with tempfile.TemporaryDirectory(prefix="blorp-perceus-aggregate-matrix-") as temp_name:
+        worker_dir = Path(temp_name) / "timing"
+        bridge = prepare_backend_worker(root, worker_dir, args.bridge)
+        counter_bridge = None
+        if getattr(args, "work_counters", False):
+            counter_bridge = prepare_backend_worker(
+                root,
+                Path(temp_name) / "counters",
+                args.counter_bridge,
+                debug_profile=True,
+            )
+
+        matrix_points: list[JsonObject] = []
+        for param_count in (1, 8, 32):
+            point = argparse.Namespace(**vars(args))
+            point.bridge = str(bridge)
+            point.counter_bridge = str(counter_bridge) if counter_bridge is not None else None
+            point.globals = 1
+            point.functions = PARAMETER_MATRIX_FUNCTIONS
+            point.body_leaves = PARAMETER_MATRIX_BODY_LEAVES
+            point.global_reads_per_function = 0
+            point.params_per_function = param_count
+            point.parameter_type = MANAGED_PARAMETER_TYPE
+            point.body_shape = "aggregate_escape"
+            point.control_parameter_type = None
+            point.invoke_workers = False
+            point.global_matrix = False
+            point.parameter_matrix = False
+            point.aggregate_matrix = False
+            point.contract_matrix = False
+            run_benchmark(point, matrix_points)
+
+        if getattr(args, "work_counters", False):
+            validate_borrowed_aggregate_matrix(matrix_points)
+
+    return 0
+
+
+def run_result_matrix(args: argparse.Namespace) -> int:
+    root = project_root()
+    with tempfile.TemporaryDirectory(prefix="blorp-perceus-result-matrix-") as temp_name:
+        bridge = prepare_backend_worker(root, Path(temp_name) / "timing", args.bridge)
+        counter_bridge = None
+        if getattr(args, "work_counters", False):
+            counter_bridge = prepare_backend_worker(
+                root,
+                Path(temp_name) / "counters",
+                args.counter_bridge,
+                debug_profile=True,
+            )
+
+        matrix_points: list[JsonObject] = []
+        for param_count in (1, 8, 32):
+            point = argparse.Namespace(**vars(args))
+            point.bridge = str(bridge)
+            point.counter_bridge = str(counter_bridge) if counter_bridge is not None else None
+            point.globals = 1
+            point.functions = PARAMETER_MATRIX_FUNCTIONS
+            point.body_leaves = 256
+            point.global_reads_per_function = 0
+            point.params_per_function = param_count
+            point.parameter_type = MANAGED_PARAMETER_TYPE
+            point.body_shape = "borrowed_return"
+            point.measurement_window = "perceus-direct"
+            point.control_parameter_type = None
+            point.invoke_workers = False
+            point.global_matrix = False
+            point.parameter_matrix = False
+            point.aggregate_matrix = False
+            point.result_matrix = False
+            point.contract_matrix = False
+            run_benchmark(point, matrix_points)
+
+        if getattr(args, "work_counters", False):
+            validate_borrowed_result_matrix(matrix_points)
 
     return 0
 
@@ -2214,6 +2621,22 @@ def main(argv: list[str]) -> int:
         ),
     )
     parser.add_argument(
+        "--aggregate-matrix",
+        action="store_true",
+        help=(
+            "run the 1/8/32 borrowed-owner aggregate-escape matrix with a "
+            "fixed two-function, 128-node fixture"
+        ),
+    )
+    parser.add_argument(
+        "--result-matrix",
+        action="store_true",
+        help=(
+            "run the 1/8/32 borrowed-owner result matrix with a fixed "
+            "two-function, 256-node fixture"
+        ),
+    )
+    parser.add_argument(
         "--contract-matrix",
         action="store_true",
         help="vary borrowed owners, body nodes, and user-call edges one axis at a time",
@@ -2242,7 +2665,12 @@ def main(argv: list[str]) -> int:
     if args.global_matrix:
         if 32 >= args.body_leaves:
             parser.error("--global-matrix requires --body-leaves greater than 32")
-    elif not (args.parameter_matrix or args.contract_matrix):
+    elif not (
+        args.parameter_matrix
+        or args.aggregate_matrix
+        or args.result_matrix
+        or args.contract_matrix
+    ):
         if args.global_reads_per_function >= args.body_leaves:
             parser.error("--global-reads-per-function must be less than --body-leaves")
         if args.global_reads_per_function + args.params_per_function >= args.body_leaves:
@@ -2253,7 +2681,10 @@ def main(argv: list[str]) -> int:
             parser.error("--global-reads-per-function cannot exceed --globals")
     if args.timeout <= 0:
         parser.error("--timeout must be greater than zero")
-    if args.body_shape != "linear" and args.user_call_edges >= args.functions:
+    if (
+        args.body_shape in ("nested_user_call", "mutually_recursive_calls")
+        and args.user_call_edges >= args.functions
+    ):
         parser.error("--user-call-edges must be less than --functions")
     if args.baseline_bridge is not None and args.samples < 7:
         parser.error("paired comparison requires at least 7 samples")
@@ -2269,12 +2700,30 @@ def main(argv: list[str]) -> int:
         )
     selected_matrices = sum(
         int(enabled)
-        for enabled in (args.global_matrix, args.parameter_matrix, args.contract_matrix)
+        for enabled in (
+            args.global_matrix,
+            args.parameter_matrix,
+            args.aggregate_matrix,
+            args.result_matrix,
+            args.contract_matrix,
+        )
     )
     if selected_matrices > 1:
         parser.error("matrix modes are mutually exclusive")
     if args.parameter_matrix and args.end_to_end:
         parser.error("--parameter-matrix cannot be combined with --end-to-end")
+    if args.aggregate_matrix and args.end_to_end:
+        parser.error("--aggregate-matrix cannot be combined with --end-to-end")
+    if args.result_matrix and args.end_to_end:
+        parser.error("--result-matrix cannot be combined with --end-to-end")
+    if args.result_matrix and args.baseline_bridge is None:
+        parser.error("--result-matrix requires --baseline-bridge")
+    if (
+        args.result_matrix
+        and args.work_counters
+        and args.baseline_counter_bridge is None
+    ):
+        parser.error("--result-matrix requires --baseline-counter-bridge")
     if args.contract_matrix and args.end_to_end:
         parser.error("--contract-matrix cannot be combined with --end-to-end")
 
@@ -2286,6 +2735,10 @@ def main(argv: list[str]) -> int:
             return run_global_matrix(args)
         if args.parameter_matrix:
             return run_parameter_matrix(args)
+        if args.aggregate_matrix:
+            return run_aggregate_matrix(args)
+        if args.result_matrix:
+            return run_result_matrix(args)
         if args.contract_matrix:
             return run_contract_matrix(args)
         return run_benchmark(args)

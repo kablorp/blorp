@@ -309,6 +309,30 @@ private @debug_only pure func perceus_work_borrowed_call_rewrite_actions() -> In
 	black_box_int(0)
 
 
+private @debug_only pure func perceus_work_borrowed_aggregate_owner_candidate_visits() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func perceus_work_borrowed_aggregate_alias_fallback_requests() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func perceus_work_borrowed_aggregate_rewrite_actions() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func perceus_work_borrowed_result_owner_candidate_visits() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func perceus_work_borrowed_result_alias_fallback_requests() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func perceus_work_borrowed_result_rewrite_actions() -> Int:
+	black_box_int(0)
+
+
 private @debug_only pure func perceus_work_borrowed_origin_member_visits() -> Int:
 	black_box_int(0)
 
@@ -379,6 +403,12 @@ pure func register_perceus_work_counters() -> Int:
 		perceus_work_borrowed_call_owner_candidate_visits()
 		perceus_work_borrowed_call_alias_fallback_requests()
 		perceus_work_borrowed_call_rewrite_actions()
+		perceus_work_borrowed_aggregate_owner_candidate_visits()
+		perceus_work_borrowed_aggregate_alias_fallback_requests()
+		perceus_work_borrowed_aggregate_rewrite_actions()
+		perceus_work_borrowed_result_owner_candidate_visits()
+		perceus_work_borrowed_result_alias_fallback_requests()
+		perceus_work_borrowed_result_rewrite_actions()
 		perceus_work_borrowed_origin_member_visits()
 		perceus_work_borrowed_origin_storage_slots()
 		perceus_work_borrowed_aggregate_node_visits()
@@ -513,11 +543,11 @@ private record ContractParameterIndex {
 }
 
 
--- Borrowed-call protection only needs the earliest owner that can supply an
--- evaluated result: the first owner is the one the former owner-major rewrite
--- retained, and that retain makes the result owned for every later owner. Keep
--- stable dense IDs so this ordering is explicit without allocating an owner
--- set at every syntax node.
+-- Borrowed call, aggregate, and result normalization only need the earliest
+-- owner that can supply an evaluated result: the first owner is the one the
+-- former owner-major rewrites retained, and that retain makes the result owned
+-- for every later owner. Keep stable dense IDs so this ordering is explicit
+-- without allocating an owner set at every syntax node.
 private record BorrowedOwnerCatalog {
 	owners: List[CoreParam],
 	candidate_ids_by_name: Dict[String, List[Int]],
@@ -525,10 +555,26 @@ private record BorrowedOwnerCatalog {
 }
 
 
-private record BorrowedCallRewriteContext {
+private union BorrowedOwnerQueryKind:
+	BorrowedCallOwnerQuery
+	BorrowedAggregateOwnerQuery
+	BorrowedResultOwnerQuery
+
+
+private record BorrowedOwnerRewriteContext {
 	env: PerceusEnv,
 	owners: BorrowedOwnerCatalog,
-	shadowed_owner_ids: Dict[Int, Bool]
+	shadowed_owner_ids: Dict[Int, Bool],
+	query_kind: BorrowedOwnerQueryKind
+}
+
+
+-- Lexical shadowing and an existing Dup satisfy different obligations. Keep
+-- them separate so a Dup for one result owner cannot hide another owner that
+-- remains visible below the same result node.
+private record BorrowedResultRewriteContext {
+	base: BorrowedOwnerRewriteContext,
+	result_satisfied_owner_ids: Dict[Int, Bool]
 }
 
 
@@ -19633,29 +19679,6 @@ private pure func retain_borrowed_param_result(
 			expr
 
 
-private pure func retain_borrowed_param_results(
-	env: PerceusEnv,
-	func_info: CoreFunction,
-	consumed_params: List[Int],
-	body: CoreExpr,
-) -> CoreExpr:
-	if not is_managed_type(env, func_info.return_type):
-		body
-	else:
-		var result: CoreExpr = body
-		var index: Int = 0
-
-		for param in func_info.params:
-			if is_managed_type(env, param.typ) and not consumed_params.contains(index):
-				result = retain_borrowed_param_result(env, param, result)
-			else:
-				void
-
-			index += 1
-
-		result
-
-
 private record MatchBindingLifetimeContext {
 	env: PerceusEnv,
 	owner: Option[CoreParam],
@@ -19897,14 +19920,14 @@ private pure func build_borrowed_owner_catalog(
 
 
 private pure func borrowed_owner_is_active(
-	context: BorrowedCallRewriteContext,
+	context: BorrowedOwnerRewriteContext,
 	owner_id: Int,
 ) -> Bool:
 	not context.shadowed_owner_ids.get_or(owner_id, False)
 
 
 private pure func borrowed_owner_param(
-	context: BorrowedCallRewriteContext,
+	context: BorrowedOwnerRewriteContext,
 	owner_id: Int,
 ) -> Option[CoreParam]:
 	if borrowed_owner_is_active(context, owner_id):
@@ -19914,9 +19937,9 @@ private pure func borrowed_owner_param(
 
 
 private pure func borrowed_context_shadowing_var(
-	context: BorrowedCallRewriteContext,
+	context: BorrowedOwnerRewriteContext,
 	variable: CoreVar,
-) -> BorrowedCallRewriteContext:
+) -> BorrowedOwnerRewriteContext:
 	var shadowed: Dict[Int, Bool] = context.shadowed_owner_ids
 
 	for owner_id in context.owners.candidate_ids_by_name.get_or(variable.name, []):
@@ -19933,10 +19956,10 @@ private pure func borrowed_context_shadowing_var(
 
 
 private pure func borrowed_context_shadowing_bindings(
-	context: BorrowedCallRewriteContext,
+	context: BorrowedOwnerRewriteContext,
 	bindings: List[CoreMatchBinding],
-) -> BorrowedCallRewriteContext:
-	var result: BorrowedCallRewriteContext = context
+) -> BorrowedOwnerRewriteContext:
+	var result: BorrowedOwnerRewriteContext = context
 
 	for binding in bindings:
 		result = borrowed_context_shadowing_var(result, binding.variable)
@@ -19960,14 +19983,21 @@ private pure func earlier_borrowed_owner(left: Option[Int], right: Option[Int]) 
 
 
 private pure func direct_borrowed_owner_for_var(
-	context: BorrowedCallRewriteContext,
+	context: BorrowedOwnerRewriteContext,
 	variable: CoreVar,
 ) -> Option[Int]:
 	var found: Option[Int] = None
 
 	for owner_id in context.owners.candidate_ids_by_name.get_or(variable.name, []):
 		debug:
-			perceus_work_borrowed_call_owner_candidate_visits()
+			match context.query_kind:
+				BorrowedCallOwnerQuery:
+					perceus_work_borrowed_call_owner_candidate_visits()
+				BorrowedAggregateOwnerQuery:
+					perceus_work_borrowed_aggregate_owner_candidate_visits()
+				BorrowedResultOwnerQuery:
+					perceus_work_borrowed_result_owner_candidate_visits()
+
 			perceus_work_borrowed_origin_member_visits()
 
 		match borrowed_owner_param(context, owner_id):
@@ -19984,11 +20014,17 @@ private pure func direct_borrowed_owner_for_var(
 
 
 private pure func first_borrowed_owner_legacy(
-	context: BorrowedCallRewriteContext,
+	context: BorrowedOwnerRewriteContext,
 	expr: CoreExpr,
 ) -> Option[Int]:
 	debug:
-		perceus_work_borrowed_call_alias_fallback_requests()
+		match context.query_kind:
+			BorrowedCallOwnerQuery:
+				perceus_work_borrowed_call_alias_fallback_requests()
+			BorrowedAggregateOwnerQuery:
+				perceus_work_borrowed_aggregate_alias_fallback_requests()
+			BorrowedResultOwnerQuery:
+				perceus_work_borrowed_result_alias_fallback_requests()
 
 	var found: Option[Int] = None
 	var owner_id: Int = 0
@@ -19996,7 +20032,14 @@ private pure func first_borrowed_owner_legacy(
 	for owner in context.owners.owners:
 		if borrowed_owner_is_active(context, owner_id):
 			debug:
-				perceus_work_borrowed_call_owner_candidate_visits()
+				match context.query_kind:
+					BorrowedCallOwnerQuery:
+						perceus_work_borrowed_call_owner_candidate_visits()
+					BorrowedAggregateOwnerQuery:
+						perceus_work_borrowed_aggregate_owner_candidate_visits()
+					BorrowedResultOwnerQuery:
+						perceus_work_borrowed_result_owner_candidate_visits()
+
 				perceus_work_borrowed_origin_member_visits()
 
 			if borrow_expr_aliases_param(context.env, owner, expr):
@@ -20017,7 +20060,7 @@ private pure func first_borrowed_owner_legacy(
 -- call contracts stay indexed; uncommon binding/match/ownership-node shapes
 -- use the exact scalar predicate as a compatibility fallback.
 private pure func first_resolved_borrowed_owner_aliasing_expr(
-	context: BorrowedCallRewriteContext,
+	context: BorrowedOwnerRewriteContext,
 	expr: CoreExpr,
 ) -> Option[Int]:
 	match expr:
@@ -20081,7 +20124,7 @@ private pure func first_resolved_borrowed_owner_aliasing_expr(
 
 
 private pure func first_borrowed_owner_aliasing_expr(
-	context: BorrowedCallRewriteContext,
+	context: BorrowedOwnerRewriteContext,
 	expr: CoreExpr,
 ) -> Option[Int]:
 	if context.owners.has_unresolved_identity:
@@ -20108,8 +20151,450 @@ private pure func first_borrowed_owner_aliasing_expr(
 		first_resolved_borrowed_owner_aliasing_expr(context, expr)
 
 
+private pure func borrowed_result_owner_is_active(
+	context: BorrowedResultRewriteContext,
+	owner_id: Int,
+) -> Bool:
+	(
+		borrowed_owner_is_active(context.base, owner_id)
+		and not context.result_satisfied_owner_ids.get_or(owner_id, False)
+	)
+
+
+private pure func borrowed_result_owner_param(
+	context: BorrowedResultRewriteContext,
+	owner_id: Int,
+) -> Option[CoreParam]:
+	if borrowed_result_owner_is_active(context, owner_id):
+		context.base.owners.owners.get(owner_id)
+	else:
+		None
+
+
+private pure func borrowed_result_context_shadowing_var(
+	context: BorrowedResultRewriteContext,
+	variable: CoreVar,
+) -> BorrowedResultRewriteContext:
+	{ context | base = borrowed_context_shadowing_var(context.base, variable) }
+
+
+private pure func borrowed_result_context_shadowing_bindings(
+	context: BorrowedResultRewriteContext,
+	bindings: List[CoreMatchBinding],
+) -> BorrowedResultRewriteContext:
+	var result: BorrowedResultRewriteContext = context
+
+	for binding in bindings:
+		result = borrowed_result_context_shadowing_var(result, binding.variable)
+
+	result
+
+
+private pure func borrowed_result_context_satisfying_var(
+	context: BorrowedResultRewriteContext,
+	variable: CoreVar,
+) -> BorrowedResultRewriteContext:
+	candidate_ids: List[Int] = context.base.owners.candidate_ids_by_name.get_or(variable.name, [])
+
+	if candidate_ids.is_empty():
+		context
+	else:
+		var satisfied: Dict[Int, Bool] = context.result_satisfied_owner_ids
+
+		for owner_id in candidate_ids:
+			match context.base.owners.owners.get(owner_id):
+				Some(owner):
+					if core_var_matches_param(variable, owner):
+						satisfied = satisfied.set(owner_id, True)
+					else:
+						void
+				None:
+					void
+
+		{ context | result_satisfied_owner_ids = satisfied }
+
+
+private pure func direct_borrowed_result_owner_for_var(
+	context: BorrowedResultRewriteContext,
+	variable: CoreVar,
+) -> Option[Int]:
+	var found: Option[Int] = None
+
+	for owner_id in context.base.owners.candidate_ids_by_name.get_or(variable.name, []):
+		debug:
+			perceus_work_borrowed_result_owner_candidate_visits()
+			perceus_work_borrowed_origin_member_visits()
+
+		match borrowed_result_owner_param(context, owner_id):
+			Some(owner):
+				if core_var_matches_param(variable, owner):
+					found = Some(owner_id)
+					break
+				else:
+					void
+			None:
+				void
+
+	found
+
+
+-- Calls and other non-projection aliases retain the scalar predicate as an
+-- explicit compatibility boundary. Ownership-ready direct results and their
+-- transparent projections stay on the indexed path.
+private pure func first_borrowed_result_owner_legacy(
+	context: BorrowedResultRewriteContext,
+	expr: CoreExpr,
+) -> Option[Int]:
+	debug:
+		perceus_work_borrowed_result_alias_fallback_requests()
+
+	var found: Option[Int] = None
+	var owner_id: Int = 0
+
+	for owner in context.base.owners.owners:
+		if borrowed_result_owner_is_active(context, owner_id):
+			debug:
+				perceus_work_borrowed_result_owner_candidate_visits()
+				perceus_work_borrowed_origin_member_visits()
+
+			if borrow_expr_aliases_param(context.base.env, owner, expr):
+				found = Some(owner_id)
+				break
+			else:
+				void
+		else:
+			void
+
+		owner_id += 1
+
+	found
+
+
+private pure func first_borrowed_result_owner_aliasing_expr(
+	context: BorrowedResultRewriteContext,
+	expr: CoreExpr,
+) -> Option[Int]:
+	match expr:
+		VarExpr(variable, typ, loc):
+			direct_borrowed_result_owner_for_var(context, variable)
+		FieldExpr(owner, field, typ, loc):
+			first_borrowed_result_owner_aliasing_expr(context, owner)
+		TupleFieldExpr(owner, field_index, typ, loc):
+			first_borrowed_result_owner_aliasing_expr(context, owner)
+		CastExpr(inner, typ, loc):
+			first_borrowed_result_owner_aliasing_expr(context, inner)
+		UnboxExpr(kind, inner, typ, loc):
+			first_borrowed_result_owner_aliasing_expr(context, inner)
+		_:
+			first_borrowed_result_owner_legacy(context, expr)
+
+
+private pure func retain_borrowed_result_terminal_for_owners(
+	context: BorrowedResultRewriteContext,
+	expr: CoreExpr,
+) -> CoreExpr:
+	match first_borrowed_result_owner_aliasing_expr(context, expr):
+		Some(owner_id):
+			match borrowed_result_owner_param(context, owner_id):
+				Some(owner):
+					debug:
+						perceus_work_borrowed_result_rewrite_actions()
+
+					match expr:
+						VarExpr(variable, typ, loc):
+							DupExpr(variable, typ, retain_policy_for_type(typ), expr, typ, loc)
+						_:
+							retain_borrowed_alias_result(owner, expr)
+				None:
+					expr
+		None:
+			expr
+
+
+private pure func retain_borrowed_result_literal_case_for_owners(
+	context: BorrowedResultRewriteContext,
+	match_case: CoreLiteralMatchCase,
+) -> CoreLiteralMatchCase:
+	{ match_case | body = retain_borrowed_results_for_owners(
+			borrowed_result_context_shadowing_bindings(context, match_case.bindings),
+			match_case.body,
+		) }
+
+
+private pure func retain_borrowed_result_literal_fallback_for_owners(
+	context: BorrowedResultRewriteContext,
+	fallback: CoreLiteralMatchFallback,
+) -> CoreLiteralMatchFallback:
+	match fallback:
+		LiteralMatchFallbackBody(body):
+			LiteralMatchFallbackBody(retain_borrowed_results_for_owners(context, body))
+		LiteralMatchFallbackBindings(bindings, body):
+			LiteralMatchFallbackBindings(
+				bindings,
+				retain_borrowed_results_for_owners(
+					borrowed_result_context_shadowing_bindings(context, bindings),
+					body,
+				),
+			)
+		LiteralMatchFallbackFail:
+			LiteralMatchFallbackFail
+
+
+private pure func retain_borrowed_result_literal_match_for_owners(
+	context: BorrowedResultRewriteContext,
+	match_expr: CoreConstructorLiteralMatch,
+) -> CoreConstructorLiteralMatch:
+	{ match_expr |
+		cases = match_expr.cases.map(
+			func(match_case): retain_borrowed_result_literal_case_for_owners(context, match_case),
+		),
+		fallback = retain_borrowed_result_literal_fallback_for_owners(context, match_expr.fallback)
+	}
+
+
+private pure func retain_borrowed_result_constructor_body_for_owners(
+	context: BorrowedResultRewriteContext,
+	body: CoreConstructorMatchBody,
+) -> CoreConstructorMatchBody:
+	match body:
+		ConstructorMatchBodyExpr(expr):
+			ConstructorMatchBodyExpr(retain_borrowed_results_for_owners(context, expr))
+		ConstructorMatchBodyLiteral(match_expr):
+			ConstructorMatchBodyLiteral(
+				retain_borrowed_result_literal_match_for_owners(
+					context,
+					match_expr,
+				),
+			)
+		ConstructorMatchBodyLength(match_expr):
+			ConstructorMatchBodyLength(
+				retain_borrowed_result_length_match_for_owners(
+					context,
+					match_expr,
+				),
+			)
+
+
+private pure func retain_borrowed_result_length_branch_for_owners(
+	context: BorrowedResultRewriteContext,
+	branch: CoreConstructorLengthMatchBranch,
+) -> CoreConstructorLengthMatchBranch:
+	{ branch | body = retain_borrowed_result_constructor_body_for_owners(
+			borrowed_result_context_shadowing_bindings(context, branch.bindings),
+			branch.body,
+		) }
+
+
+private pure func retain_borrowed_result_length_match_for_owners(
+	context: BorrowedResultRewriteContext,
+	match_expr: CoreConstructorLengthMatch,
+) -> CoreConstructorLengthMatch:
+	mapped_cases: List[CoreConstructorLengthMatchCase] = match_expr.cases.map(
+		func(
+			match_case,
+		): { match_case |
+			branch = retain_borrowed_result_length_branch_for_owners(context, match_case.branch)
+		},
+	)
+
+	mapped_geq: Option[CoreConstructorLengthMatchGeq] = match match_expr.geq:
+		Some(geq):
+			Some(
+				{ geq |
+					branch = retain_borrowed_result_length_branch_for_owners(context, geq.branch)
+				},
+			)
+		None:
+			None
+
+	mapped_fallback: Option[CoreConstructorLengthMatchBranch] = match match_expr.fallback:
+		Some(branch):
+			Some(retain_borrowed_result_length_branch_for_owners(context, branch))
+		None:
+			None
+
+	{ match_expr |
+		cases = mapped_cases,
+		geq = mapped_geq,
+		fallback = mapped_fallback
+	}
+
+
+private pure func retain_borrowed_result_constructor_case_for_owners(
+	context: BorrowedResultRewriteContext,
+	match_case: CoreConstructorMatchCase,
+) -> CoreConstructorMatchCase:
+	{ match_case | body = retain_borrowed_result_constructor_body_for_owners(
+			borrowed_result_context_shadowing_bindings(context, match_case.bindings),
+			match_case.body,
+		) }
+
+
+private pure func retain_borrowed_result_constructor_fallback_for_owners(
+	context: BorrowedResultRewriteContext,
+	fallback: CoreConstructorMatchFallback,
+) -> CoreConstructorMatchFallback:
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			ConstructorMatchFallbackBody(retain_borrowed_results_for_owners(context, body))
+		ConstructorMatchFallbackBindings(bindings, body):
+			ConstructorMatchFallbackBindings(
+				bindings,
+				retain_borrowed_results_for_owners(
+					borrowed_result_context_shadowing_bindings(context, bindings),
+					body,
+				),
+			)
+		ConstructorMatchFallbackFail:
+			ConstructorMatchFallbackFail
+
+
+-- Result position is deliberately a closed traversal. Conditions, initializers,
+-- scrutinees, assignment values, and loop/task children are not function-result
+-- positions and must remain untouched here.
+private pure func retain_borrowed_results_for_owners(
+	context: BorrowedResultRewriteContext,
+	expr: CoreExpr,
+) -> CoreExpr:
+	debug:
+		perceus_work_borrowed_result_node_visits()
+
+	match expr:
+		VarExpr(_, typ, _) | FieldExpr(_, _, typ, _) | TupleFieldExpr(_, _, typ, _) | CallExpr(_, _, _, typ, _) | CastExpr(_, typ, _) | UnboxExpr(_, _, typ, _):
+			if is_managed_type(context.base.env, typ):
+				retain_borrowed_result_terminal_for_owners(context, expr)
+			else:
+				expr
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			LetExpr(
+				variable,
+				is_mutable,
+				typ,
+				rhs,
+				retain_borrowed_results_for_owners(
+					borrowed_result_context_shadowing_var(context, variable),
+					body,
+				),
+			)
+		BorrowLetExpr(variable, typ, rhs, body):
+			BorrowLetExpr(
+				variable,
+				typ,
+				rhs,
+				retain_borrowed_results_for_owners(
+					borrowed_result_context_shadowing_var(context, variable),
+					body,
+				),
+			)
+		SeqExpr(first, second):
+			SeqExpr(
+				first,
+				retain_borrowed_results_for_owners(context, second),
+			)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			IfExpr(
+				cond,
+				retain_borrowed_results_for_owners(context, then_expr),
+				retain_borrowed_results_for_owners(context, else_expr),
+				typ,
+				loc,
+			)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			LiteralMatchExpr(
+				scrutinee,
+				cases.map(
+					func(
+						match_case,
+					): retain_borrowed_result_literal_case_for_owners(context, match_case),
+				),
+				retain_borrowed_result_literal_fallback_for_owners(context, fallback),
+				typ,
+				loc,
+			)
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			AccessorLiteralMatchExpr(
+				scrutinee,
+				release_policy,
+				retain_borrowed_result_literal_match_for_owners(context, match_expr),
+				typ,
+				loc,
+			)
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			LengthMatchExpr(
+				scrutinee,
+				release_policy,
+				retain_borrowed_result_length_match_for_owners(context, match_expr),
+				typ,
+				loc,
+			)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			ConstructorMatchExpr(
+				scrutinee,
+				release_policy,
+				cases.map(
+					func(
+						match_case,
+					): retain_borrowed_result_constructor_case_for_owners(context, match_case),
+				),
+				retain_borrowed_result_constructor_fallback_for_owners(context, fallback),
+				typ,
+				loc,
+			)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			DupExpr(
+				variable,
+				value_type,
+				retain_policy,
+				retain_borrowed_results_for_owners(
+					borrowed_result_context_satisfying_var(context, variable),
+					body,
+				),
+				typ,
+				loc,
+			)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			DropExpr(
+				variable,
+				value_type,
+				release_policy,
+				retain_borrowed_results_for_owners(context, body),
+				typ,
+				loc,
+			)
+		ResourceScopeExpr(scope, typ, loc):
+			ResourceScopeExpr({ scope | body = retain_borrowed_results_for_owners(
+						borrowed_result_context_shadowing_var(context, scope.variable),
+						scope.body,
+					) }, typ, loc)
+		_:
+			expr
+
+
+private pure func retain_borrowed_function_results(
+	env: PerceusEnv,
+	owners: BorrowedOwnerCatalog,
+	return_type: CoreType,
+	body: CoreExpr,
+) -> CoreExpr:
+	if owners.owners.is_empty() or not is_managed_type(env, return_type):
+		body
+	else:
+		retain_borrowed_results_for_owners(
+			{
+				base = {
+					env = env,
+					owners = owners,
+					shadowed_owner_ids = {},
+					query_kind = BorrowedResultOwnerQuery
+				},
+				result_satisfied_owner_ids = {}
+			},
+			body,
+		)
+
+
 private pure func protect_borrowed_call_args_for_owners(
-	context: BorrowedCallRewriteContext,
+	context: BorrowedOwnerRewriteContext,
 	kind: CoreCallKind,
 	args: List[CoreExpr],
 	return_type: CoreType,
@@ -20161,7 +20646,7 @@ private pure func protect_borrowed_call_args_for_owners(
 
 
 private pure func protect_borrowed_equality_arg_for_owners(
-	context: BorrowedCallRewriteContext,
+	context: BorrowedOwnerRewriteContext,
 	arg: CoreExpr,
 	index: Int,
 	loc: CoreSourceLoc,
@@ -20937,7 +21422,7 @@ private pure func protect_borrowed_param_loop_body(
 
 
 private pure func protect_borrowed_calls_legacy_active(
-	context: BorrowedCallRewriteContext,
+	context: BorrowedOwnerRewriteContext,
 	expr: CoreExpr,
 ) -> CoreExpr:
 	debug:
@@ -20958,34 +21443,18 @@ private pure func protect_borrowed_calls_legacy_active(
 
 
 private pure func protect_borrowed_list_set_for_owners(
-	context: BorrowedCallRewriteContext,
+	context: BorrowedOwnerRewriteContext,
 	set: CoreListSet,
 ) -> CoreListSet:
-	protected_value: CoreExpr = protect_borrowed_calls(context, set.value.value)
-	var stored_value: CoreExpr = protected_value
-
-	if set.value.transfers_ownership:
-		var owner_id: Int = 0
-
-		for owner in context.owners.owners:
-			if borrowed_owner_is_active(context, owner_id):
-				stored_value = retain_borrowed_aggregate_value(context.env, owner, stored_value)
-			else:
-				void
-
-			owner_id += 1
-	else:
-		void
-
 	{ set |
 		list = protect_borrowed_calls(context, set.list),
 		index = protect_borrowed_calls(context, set.index),
-		value = { set.value | value = stored_value }
+		value = { set.value | value = protect_borrowed_calls(context, set.value.value) }
 	}
 
 
 private pure func protect_borrowed_literal_case_for_owners(
-	context: BorrowedCallRewriteContext,
+	context: BorrowedOwnerRewriteContext,
 	match_case: CoreLiteralMatchCase,
 ) -> CoreLiteralMatchCase:
 	{ match_case | body = protect_borrowed_calls(
@@ -20995,7 +21464,7 @@ private pure func protect_borrowed_literal_case_for_owners(
 
 
 private pure func protect_borrowed_literal_fallback_for_owners(
-	context: BorrowedCallRewriteContext,
+	context: BorrowedOwnerRewriteContext,
 	fallback: CoreLiteralMatchFallback,
 ) -> CoreLiteralMatchFallback:
 	match fallback:
@@ -21014,7 +21483,7 @@ private pure func protect_borrowed_literal_fallback_for_owners(
 
 
 private pure func protect_borrowed_literal_match_for_owners(
-	context: BorrowedCallRewriteContext,
+	context: BorrowedOwnerRewriteContext,
 	match_expr: CoreConstructorLiteralMatch,
 ) -> CoreConstructorLiteralMatch:
 	{ match_expr |
@@ -21026,7 +21495,7 @@ private pure func protect_borrowed_literal_match_for_owners(
 
 
 private pure func protect_borrowed_constructor_body_for_owners(
-	context: BorrowedCallRewriteContext,
+	context: BorrowedOwnerRewriteContext,
 	body: CoreConstructorMatchBody,
 ) -> CoreConstructorMatchBody:
 	match body:
@@ -21049,7 +21518,7 @@ private pure func protect_borrowed_constructor_body_for_owners(
 
 
 private pure func protect_borrowed_length_branch_for_owners(
-	context: BorrowedCallRewriteContext,
+	context: BorrowedOwnerRewriteContext,
 	branch: CoreConstructorLengthMatchBranch,
 ) -> CoreConstructorLengthMatchBranch:
 	{ branch | body = protect_borrowed_constructor_body_for_owners(
@@ -21059,7 +21528,7 @@ private pure func protect_borrowed_length_branch_for_owners(
 
 
 private pure func protect_borrowed_length_match_for_owners(
-	context: BorrowedCallRewriteContext,
+	context: BorrowedOwnerRewriteContext,
 	match_expr: CoreConstructorLengthMatch,
 ) -> CoreConstructorLengthMatch:
 	mapped_cases: List[CoreConstructorLengthMatchCase] = match_expr.cases.map(func(match_case):
@@ -21088,7 +21557,7 @@ private pure func protect_borrowed_length_match_for_owners(
 
 
 private pure func protect_borrowed_constructor_case_for_owners(
-	context: BorrowedCallRewriteContext,
+	context: BorrowedOwnerRewriteContext,
 	match_case: CoreConstructorMatchCase,
 ) -> CoreConstructorMatchCase:
 	{ match_case | body = protect_borrowed_constructor_body_for_owners(
@@ -21098,7 +21567,7 @@ private pure func protect_borrowed_constructor_case_for_owners(
 
 
 private pure func protect_borrowed_constructor_fallback_for_owners(
-	context: BorrowedCallRewriteContext,
+	context: BorrowedOwnerRewriteContext,
 	fallback: CoreConstructorMatchFallback,
 ) -> CoreConstructorMatchFallback:
 	match fallback:
@@ -21121,7 +21590,7 @@ private pure func protect_borrowed_constructor_fallback_for_owners(
 -- exact scalar implementation as explicit compatibility islands; they are
 -- absent from ownership-ready production input and remain measurable.
 private pure func protect_borrowed_calls(
-	context: BorrowedCallRewriteContext,
+	context: BorrowedOwnerRewriteContext,
 	expr: CoreExpr,
 ) -> CoreExpr:
 	debug:
@@ -21325,7 +21794,7 @@ private pure func protect_borrowed_calls(
 				loc,
 			)
 		ResourceScopeExpr(scope, typ, loc):
-			shadowed_context: BorrowedCallRewriteContext = borrowed_context_shadowing_var(
+			shadowed_context: BorrowedOwnerRewriteContext = borrowed_context_shadowing_var(
 				context,
 				scope.variable,
 			)
@@ -21389,16 +21858,9 @@ private pure func protect_borrowed_calls(
 
 private pure func protect_borrowed_param_calls_for_function(
 	env: PerceusEnv,
-	func_info: CoreFunction,
-	consumed_params: List[Int],
+	owners: BorrowedOwnerCatalog,
 	body: CoreExpr,
 ) -> CoreExpr:
-	owners: BorrowedOwnerCatalog = build_borrowed_owner_catalog(
-		env,
-		func_info.params,
-		consumed_params,
-	)
-
 	if owners.owners.is_empty():
 		body
 	else:
@@ -21406,10 +21868,586 @@ private pure func protect_borrowed_param_calls_for_function(
 			{
 				env = env,
 				owners = owners,
-				shadowed_owner_ids = {}
+				shadowed_owner_ids = {},
+				query_kind = BorrowedCallOwnerQuery
 			},
 			body,
 		)
+
+
+private pure func retain_borrowed_aggregate_transfer_value_for_owners(
+	context: BorrowedOwnerRewriteContext,
+	value: CoreExpr,
+) -> CoreExpr:
+	nested_safe_value: CoreExpr = retain_borrowed_aggregate_transfers(context, value)
+
+	match nested_safe_value:
+		VarExpr(variable, typ, loc):
+			if is_managed_type(context.env, typ):
+				match direct_borrowed_owner_for_var(context, variable):
+					Some(_):
+						debug:
+							perceus_work_borrowed_aggregate_rewrite_actions()
+
+						DupExpr(
+							variable,
+							typ,
+							retain_policy_for_type(typ),
+							nested_safe_value,
+							typ,
+							loc,
+						)
+					None:
+						nested_safe_value
+			else:
+				nested_safe_value
+		TupleExpr(_, _, _) | VectorExpr(_, _, _) | RecordExpr(_, _, _) | RecordUpdateExpr(_, _, _, _) | RecordReuseExpr(_, _, _, _) | RecordCowUpdateExpr(_, _, _, _) | RecordConstructExpr(_, _, _, _) | ListConstructExpr(_, _, _) | TensorBoxedLiteralExpr(_, _, _) | DictConstructExpr(_, _, _) | UnionConstructExpr(_, _, _):
+			nested_safe_value
+		_:
+			if is_managed_type(context.env, core_expr_type(nested_safe_value)):
+				match first_borrowed_owner_aliasing_expr(context, nested_safe_value):
+					Some(owner_id):
+						match borrowed_owner_param(context, owner_id):
+							Some(owner):
+								debug:
+									perceus_work_borrowed_aggregate_rewrite_actions()
+
+								retain_borrowed_alias_result(owner, nested_safe_value)
+							None:
+								nested_safe_value
+					None:
+						nested_safe_value
+			else:
+				nested_safe_value
+
+
+private pure func retain_borrowed_aggregate_exprs_for_owners(
+	context: BorrowedOwnerRewriteContext,
+	items: List[CoreExpr],
+) -> List[CoreExpr]:
+	var retained: List[CoreExpr] = []
+
+	for item in items:
+		retained = retained.append(
+			retain_borrowed_aggregate_transfer_value_for_owners(
+				context,
+				item,
+			),
+		)
+
+	retained
+
+
+private pure func retain_borrowed_aggregate_record_fields_for_owners(
+	context: BorrowedOwnerRewriteContext,
+	fields: List[CoreRecordFieldValue],
+) -> List[CoreRecordFieldValue]:
+	var retained: List[CoreRecordFieldValue] = []
+
+	for field in fields:
+		retained = retained.append({
+			name = field.name,
+			value = retain_borrowed_aggregate_transfer_value_for_owners(context, field.value),
+		})
+
+	retained
+
+
+private pure func retain_borrowed_aggregate_boxed_value_for_owners(
+	context: BorrowedOwnerRewriteContext,
+	value: CoreBoxedStorageValue,
+) -> CoreBoxedStorageValue:
+	-- Prepared boxed storage explicitly says whether the enclosing aggregate
+	-- will release this slot. Only those slots acquire a transferred reference.
+	if value.needs_release:
+		{ value |
+			value = retain_borrowed_aggregate_transfer_value_for_owners(context, value.value)
+		}
+	else:
+		value
+
+
+private pure func retain_borrowed_aggregate_boxed_values_for_owners(
+	context: BorrowedOwnerRewriteContext,
+	values: List[CoreBoxedStorageValue],
+) -> List[CoreBoxedStorageValue]:
+	var retained: List[CoreBoxedStorageValue] = []
+
+	for value in values:
+		retained = retained.append(retain_borrowed_aggregate_boxed_value_for_owners(context, value))
+
+	retained
+
+
+private pure func retain_borrowed_aggregate_dict_entries_for_owners(
+	context: BorrowedOwnerRewriteContext,
+	entries: List[CoreDictEntry],
+) -> List[CoreDictEntry]:
+	var retained: List[CoreDictEntry] = []
+
+	for entry in entries:
+		retained = retained.append({
+			key = retain_borrowed_aggregate_boxed_value_for_owners(context, entry.key),
+			value = retain_borrowed_aggregate_boxed_value_for_owners(context, entry.value),
+		})
+
+	retained
+
+
+private pure func retain_borrowed_aggregate_list_set_for_owners(
+	context: BorrowedOwnerRewriteContext,
+	set: CoreListSet,
+) -> CoreListSet:
+	-- List storage has a separate transfer contract from boxed constructors.
+	-- Do not infer it from the value's type or from the expression variant.
+	if set.value.transfers_ownership:
+		{ set |
+			value = { set.value |
+				value = retain_borrowed_aggregate_transfer_value_for_owners(
+					context,
+					set.value.value,
+				)
+			}
+		}
+	else:
+		set
+
+
+private pure func retain_borrowed_aggregate_literal_case_for_owners(
+	context: BorrowedOwnerRewriteContext,
+	match_case: CoreLiteralMatchCase,
+) -> CoreLiteralMatchCase:
+	{ match_case | body = retain_borrowed_aggregate_transfers(
+			borrowed_context_shadowing_bindings(context, match_case.bindings),
+			match_case.body,
+		) }
+
+
+private pure func retain_borrowed_aggregate_literal_fallback_for_owners(
+	context: BorrowedOwnerRewriteContext,
+	fallback: CoreLiteralMatchFallback,
+) -> CoreLiteralMatchFallback:
+	match fallback:
+		LiteralMatchFallbackBody(body):
+			LiteralMatchFallbackBody(retain_borrowed_aggregate_transfers(context, body))
+		LiteralMatchFallbackBindings(bindings, body):
+			LiteralMatchFallbackBindings(
+				bindings,
+				retain_borrowed_aggregate_transfers(
+					borrowed_context_shadowing_bindings(context, bindings),
+					body,
+				),
+			)
+		LiteralMatchFallbackFail:
+			LiteralMatchFallbackFail
+
+
+private pure func retain_borrowed_aggregate_literal_match_for_owners(
+	context: BorrowedOwnerRewriteContext,
+	match_expr: CoreConstructorLiteralMatch,
+) -> CoreConstructorLiteralMatch:
+	{ match_expr |
+		cases = match_expr.cases.map(
+			func(
+				match_case,
+			): retain_borrowed_aggregate_literal_case_for_owners(context, match_case),
+		),
+		fallback = retain_borrowed_aggregate_literal_fallback_for_owners(
+			context,
+			match_expr.fallback,
+		)
+	}
+
+
+private pure func retain_borrowed_aggregate_constructor_body_for_owners(
+	context: BorrowedOwnerRewriteContext,
+	body: CoreConstructorMatchBody,
+) -> CoreConstructorMatchBody:
+	match body:
+		ConstructorMatchBodyExpr(expr):
+			ConstructorMatchBodyExpr(retain_borrowed_aggregate_transfers(context, expr))
+		ConstructorMatchBodyLiteral(match_expr):
+			ConstructorMatchBodyLiteral(
+				retain_borrowed_aggregate_literal_match_for_owners(
+					context,
+					match_expr,
+				),
+			)
+		ConstructorMatchBodyLength(match_expr):
+			ConstructorMatchBodyLength(
+				retain_borrowed_aggregate_length_match_for_owners(
+					context,
+					match_expr,
+				),
+			)
+
+
+private pure func retain_borrowed_aggregate_length_branch_for_owners(
+	context: BorrowedOwnerRewriteContext,
+	branch: CoreConstructorLengthMatchBranch,
+) -> CoreConstructorLengthMatchBranch:
+	{ branch | body = retain_borrowed_aggregate_constructor_body_for_owners(
+			borrowed_context_shadowing_bindings(context, branch.bindings),
+			branch.body,
+		) }
+
+
+private pure func retain_borrowed_aggregate_length_match_for_owners(
+	context: BorrowedOwnerRewriteContext,
+	match_expr: CoreConstructorLengthMatch,
+) -> CoreConstructorLengthMatch:
+	mapped_cases: List[CoreConstructorLengthMatchCase] = match_expr.cases.map(func(match_case):
+		{ match_case |
+			branch = retain_borrowed_aggregate_length_branch_for_owners(context, match_case.branch)
+		}
+	)
+
+	mapped_geq: Option[CoreConstructorLengthMatchGeq] = match match_expr.geq:
+		Some(geq):
+			Some(
+				{ geq |
+					branch = retain_borrowed_aggregate_length_branch_for_owners(context, geq.branch)
+				},
+			)
+		None:
+			None
+
+	mapped_fallback: Option[CoreConstructorLengthMatchBranch] = match match_expr.fallback:
+		Some(branch):
+			Some(retain_borrowed_aggregate_length_branch_for_owners(context, branch))
+		None:
+			None
+
+	{ match_expr |
+		cases = mapped_cases,
+		geq = mapped_geq,
+		fallback = mapped_fallback
+	}
+
+
+private pure func retain_borrowed_aggregate_constructor_case_for_owners(
+	context: BorrowedOwnerRewriteContext,
+	match_case: CoreConstructorMatchCase,
+) -> CoreConstructorMatchCase:
+	{ match_case | body = retain_borrowed_aggregate_constructor_body_for_owners(
+			borrowed_context_shadowing_bindings(context, match_case.bindings),
+			match_case.body,
+		) }
+
+
+private pure func retain_borrowed_aggregate_constructor_fallback_for_owners(
+	context: BorrowedOwnerRewriteContext,
+	fallback: CoreConstructorMatchFallback,
+) -> CoreConstructorMatchFallback:
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			ConstructorMatchFallbackBody(retain_borrowed_aggregate_transfers(context, body))
+		ConstructorMatchFallbackBindings(bindings, body):
+			ConstructorMatchFallbackBindings(
+				bindings,
+				retain_borrowed_aggregate_transfers(
+					borrowed_context_shadowing_bindings(context, bindings),
+					body,
+				),
+			)
+		ConstructorMatchFallbackFail:
+			ConstructorMatchFallbackFail
+
+
+-- Reconstruct the aggregate-transfer region once for all borrowed function
+-- parameters. The explicit prepared-Core storage contracts below are the
+-- authority for which child values transfer ownership.
+private pure func retain_borrowed_aggregate_transfers(
+	context: BorrowedOwnerRewriteContext,
+	expr: CoreExpr,
+) -> CoreExpr:
+	debug:
+		perceus_work_borrowed_aggregate_node_visits()
+
+	match expr:
+		CallExpr(kind, callee, args, typ, loc):
+			var retained_args: List[CoreExpr] = []
+
+			for arg in args:
+				retained_args = retained_args.append(
+					retain_borrowed_aggregate_transfers(
+						context,
+						arg,
+					),
+				)
+
+			CallExpr(kind, callee, retained_args, typ, loc)
+		TupleExpr(items, typ, loc):
+			TupleExpr(
+				retain_borrowed_aggregate_exprs_for_owners(context, items),
+				typ,
+				loc,
+			)
+		TupleConstructExpr(construct, typ, loc):
+			var elements: List[CoreTupleElement] = []
+			var retain_bits: Int = construct.retain_mask
+
+			for element in construct.elements:
+				mapped: CoreTupleElement = match element:
+					TuplePrimElement(value):
+						TuplePrimElement(value)
+					TuplePointerElement(value):
+						-- A set retain bit means tuple preparation already owns the
+						-- pointer slot; a clear bit transfers the child value here.
+						if retain_bits % 2 == 1:
+							TuplePointerElement(value)
+						else:
+							TuplePointerElement(
+								retain_borrowed_aggregate_transfer_value_for_owners(
+									context,
+									value,
+								),
+							)
+					TupleStructElement(value, c_type):
+						TupleStructElement(
+							retain_borrowed_aggregate_transfer_value_for_owners(context, value),
+							c_type,
+						)
+					TupleStackResultElement(value):
+						TupleStackResultElement(value)
+					TupleFloatElement(value):
+						TupleFloatElement(value)
+					TupleFloat32Element(value):
+						TupleFloat32Element(value)
+					TupleFloat16Element(value):
+						TupleFloat16Element(value)
+					TupleVoidElement:
+						TupleVoidElement
+
+				elements = elements.append(mapped)
+				retain_bits /= 2
+
+			TupleConstructExpr({ construct | elements = elements }, typ, loc)
+		VectorExpr(items, typ, loc):
+			VectorExpr(
+				retain_borrowed_aggregate_exprs_for_owners(context, items),
+				typ,
+				loc,
+			)
+		RecordExpr(fields, typ, loc):
+			RecordExpr(
+				retain_borrowed_aggregate_record_fields_for_owners(context, fields),
+				typ,
+				loc,
+			)
+		RecordUpdateExpr(base, fields, typ, loc):
+			RecordUpdateExpr(
+				retain_borrowed_aggregate_transfers(context, base),
+				retain_borrowed_aggregate_record_fields_for_owners(context, fields),
+				typ,
+				loc,
+			)
+		RecordReuseExpr(source, fields, typ, loc):
+			RecordReuseExpr(
+				retain_borrowed_aggregate_transfers(context, source),
+				retain_borrowed_aggregate_record_fields_for_owners(context, fields),
+				typ,
+				loc,
+			)
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			RecordCowUpdateExpr(
+				retain_borrowed_aggregate_transfers(context, source),
+				CoreTraverse.map_core_record_cow_fields(
+					fields,
+					pure func(
+						replacement,
+					): retain_borrowed_aggregate_transfer_value_for_owners(context, replacement),
+				),
+				typ,
+				loc,
+			)
+		RecordConstructExpr(type_name, fields, typ, loc):
+			RecordConstructExpr(
+				type_name,
+				retain_borrowed_aggregate_record_fields_for_owners(context, fields),
+				typ,
+				loc,
+			)
+		ListConstructExpr(construct, typ, loc):
+			ListConstructExpr(
+				{ construct |
+					elements = retain_borrowed_aggregate_boxed_values_for_owners(
+						context,
+						construct.elements,
+					)
+				},
+				typ,
+				loc,
+			)
+		TensorBoxedLiteralExpr(literal, typ, loc):
+			TensorBoxedLiteralExpr(
+				{ literal |
+					elements = retain_borrowed_aggregate_boxed_values_for_owners(
+						context,
+						literal.elements,
+					)
+				},
+				typ,
+				loc,
+			)
+		DictConstructExpr(construct, typ, loc):
+			DictConstructExpr(
+				{ construct |
+					entries = retain_borrowed_aggregate_dict_entries_for_owners(
+						context,
+						construct.entries,
+					)
+				},
+				typ,
+				loc,
+			)
+		UnionConstructExpr(construct, typ, loc):
+			UnionConstructExpr(
+				{ construct |
+					args = retain_borrowed_aggregate_boxed_values_for_owners(
+						context,
+						construct.args,
+					)
+				},
+				typ,
+				loc,
+			)
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			ListHandoffSetOwnedExpr(
+				retain_borrowed_aggregate_list_set_for_owners(context, set),
+				typ,
+				loc,
+			)
+		ListSetExpr(set, typ, loc):
+			ListSetExpr(
+				retain_borrowed_aggregate_list_set_for_owners(context, set),
+				typ,
+				loc,
+			)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			LiteralMatchExpr(
+				retain_borrowed_aggregate_transfers(context, scrutinee),
+				cases.map(
+					func(
+						match_case,
+					): retain_borrowed_aggregate_literal_case_for_owners(context, match_case),
+				),
+				retain_borrowed_aggregate_literal_fallback_for_owners(context, fallback),
+				typ,
+				loc,
+			)
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			AccessorLiteralMatchExpr(
+				retain_borrowed_aggregate_transfers(context, scrutinee),
+				release_policy,
+				retain_borrowed_aggregate_literal_match_for_owners(context, match_expr),
+				typ,
+				loc,
+			)
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			LengthMatchExpr(
+				retain_borrowed_aggregate_transfers(context, scrutinee),
+				release_policy,
+				retain_borrowed_aggregate_length_match_for_owners(context, match_expr),
+				typ,
+				loc,
+			)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			ConstructorMatchExpr(
+				retain_borrowed_aggregate_transfers(context, scrutinee),
+				release_policy,
+				cases.map(
+					func(
+						match_case,
+					): retain_borrowed_aggregate_constructor_case_for_owners(context, match_case),
+				),
+				retain_borrowed_aggregate_constructor_fallback_for_owners(context, fallback),
+				typ,
+				loc,
+			)
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			LetExpr(
+				variable,
+				is_mutable,
+				typ,
+				retain_borrowed_aggregate_transfers(context, rhs),
+				retain_borrowed_aggregate_transfers(
+					borrowed_context_shadowing_var(context, variable),
+					body,
+				),
+			)
+		BorrowLetExpr(variable, typ, rhs, body):
+			BorrowLetExpr(
+				variable,
+				typ,
+				retain_borrowed_aggregate_transfers(context, rhs),
+				retain_borrowed_aggregate_transfers(
+					borrowed_context_shadowing_var(context, variable),
+					body,
+				),
+			)
+		SeqExpr(first, second):
+			SeqExpr(
+				retain_borrowed_aggregate_transfers(context, first),
+				retain_borrowed_aggregate_transfers(context, second),
+			)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			IfExpr(
+				retain_borrowed_aggregate_transfers(context, cond),
+				retain_borrowed_aggregate_transfers(context, then_expr),
+				retain_borrowed_aggregate_transfers(context, else_expr),
+				typ,
+				loc,
+			)
+		AssignExpr(variable, rhs, typ, loc):
+			AssignExpr(
+				variable,
+				retain_borrowed_aggregate_transfers(context, rhs),
+				typ,
+				loc,
+			)
+		WhileExpr(cond, body, typ, loc):
+			WhileExpr(
+				retain_borrowed_aggregate_transfers(context, cond),
+				retain_borrowed_aggregate_transfers(context, body),
+				typ,
+				loc,
+			)
+		ResourceScopeExpr(scope, typ, loc):
+			shadowed_context: BorrowedOwnerRewriteContext = borrowed_context_shadowing_var(
+				context,
+				scope.variable,
+			)
+
+			ResourceScopeExpr(
+				{ scope |
+					acquire = retain_borrowed_aggregate_transfers(context, scope.acquire),
+					body = retain_borrowed_aggregate_transfers(shadowed_context, scope.body),
+					cleanup = retain_borrowed_aggregate_transfers(shadowed_context, scope.cleanup)
+				},
+				typ,
+				loc,
+			)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			DupExpr(
+				variable,
+				value_type,
+				retain_policy,
+				retain_borrowed_aggregate_transfers(context, body),
+				typ,
+				loc,
+			)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			DropExpr(
+				variable,
+				value_type,
+				release_policy,
+				retain_borrowed_aggregate_transfers(context, body),
+				typ,
+				loc,
+			)
+		_:
+			expr
 
 
 private pure func retain_borrowed_aggregate_boxed_value(
@@ -21792,22 +22830,21 @@ private pure func retain_borrowed_param_aggregate_members(
 
 private pure func retain_borrowed_param_aggregates(
 	env: PerceusEnv,
-	func_info: CoreFunction,
-	consumed_params: List[Int],
+	owners: BorrowedOwnerCatalog,
 	body: CoreExpr,
 ) -> CoreExpr:
-	var result: CoreExpr = body
-	var index: Int = 0
-
-	for param in func_info.params:
-		if is_managed_type(env, param.typ) and not int_list_contains(consumed_params, index):
-			result = retain_borrowed_param_aggregate_members(env, param, result)
-		else:
-			void
-
-		index += 1
-
-	result
+	if owners.owners.is_empty():
+		body
+	else:
+		retain_borrowed_aggregate_transfers(
+			{
+				env = env,
+				owners = owners,
+				shadowed_owner_ids = {},
+				query_kind = BorrowedAggregateOwnerQuery
+			},
+			body,
+		)
 
 
 private pure func retain_borrowed_values(
@@ -22381,22 +23418,25 @@ private pure func rewrite_function(env: PerceusEnv, func_info: CoreFunction) -> 
 				param_index += 1
 
 			result_env: PerceusEnv = { env | transferable_result_vars = transferable_result_vars }
+			borrowed_owners: BorrowedOwnerCatalog = build_borrowed_owner_catalog(
+				env,
+				params,
+				consumed_params,
+			)
 			call_body: CoreExpr = protect_borrowed_param_calls_for_function(
 				env,
-				analysis_function,
-				consumed_params,
+				borrowed_owners,
 				contract_body,
 			)
 			aggregate_body: CoreExpr = retain_borrowed_param_aggregates(
 				env,
-				analysis_function,
-				consumed_params,
+				borrowed_owners,
 				call_body,
 			)
-			retained_body: CoreExpr = retain_borrowed_param_results(
+			retained_body: CoreExpr = retain_borrowed_function_results(
 				env,
-				analysis_function,
-				consumed_params,
+				borrowed_owners,
+				return_type,
 				aggregate_body,
 			)
 			global_values: List[CoreParam] = unshadowed_global_values(env, params, retained_body)
