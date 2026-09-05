@@ -1680,7 +1680,8 @@ private record MutableDictEntriesRewrite {
 
 private record AssignmentAliasNormalizationContext {
 	env: PerceusEnv,
-	local_aliases: Dict[String, Bool]
+	local_aliases: Dict[String, Bool],
+	exact_owned_vars: List[CoreVar]
 }
 
 
@@ -2429,15 +2430,23 @@ private pure func summarize_linear_borrow(
 			summarize_linear_ownership_uses(env, name, expr)
 
 
-private pure func release_expr_is_owner_value(name: String, expr: CoreExpr) -> Bool:
+private pure func release_expr_owner_var(expr: CoreExpr) -> Option[CoreVar]:
 	match expr:
 		VarExpr(variable, typ, loc):
-			variable.name == name
+			Some(variable)
 		CastExpr(inner, typ, loc):
-			release_expr_is_owner_value(name, inner)
+			release_expr_owner_var(inner)
 		UnboxExpr(PointerUnbox, inner, typ, loc):
-			release_expr_is_owner_value(name, inner)
+			release_expr_owner_var(inner)
 		_:
+			None
+
+
+private pure func release_expr_is_owner_value(name: String, expr: CoreExpr) -> Bool:
+	match release_expr_owner_var(expr):
+		Some(variable):
+			variable.name == name
+		None:
 			False
 
 
@@ -8415,42 +8424,134 @@ private pure func normalize_assignment_alias_match_result(
 	result: CoreExpr,
 ) -> CoreExpr:
 	var local_aliases: Dict[String, Bool] = context.local_aliases
+	var exact_owned_vars: List[CoreVar] = context.exact_owned_vars
 
 	for binding in bindings:
 		local_aliases = local_aliases.set(
 			binding.variable.name,
 			binding.mode == MatchBorrowBindingMode,
 		)
+		exact_owned_vars = exact_owned_vars_remove(exact_owned_vars, binding.variable)
 
-	normalize_assignment_alias_result_inner(context.env, local_aliases, result)
+	normalize_assignment_alias_result_inner(context.env, local_aliases, exact_owned_vars, result)
+
+
+private pure func assignment_result_is_exact_owner(
+	exact_owned_vars: List[CoreVar],
+	expr: CoreExpr,
+) -> Bool:
+	match expr:
+		VarExpr(variable, typ, loc):
+			exact_owned_vars_contains(exact_owned_vars, variable)
+		CastExpr(inner, typ, loc):
+			assignment_result_is_exact_owner(exact_owned_vars, inner)
+		UnboxExpr(kind, inner, typ, loc):
+			assignment_result_is_exact_owner(exact_owned_vars, inner)
+		_:
+			False
+
+
+private pure func exact_owned_vars_after_effect(
+	exact_owned_vars: List[CoreVar],
+	expr: CoreExpr,
+) -> List[CoreVar]:
+	match retained_core_var_from_effect(expr):
+		Some(variable):
+			exact_owned_vars_add(exact_owned_vars, variable)
+		None:
+			match expr:
+				DebugBlockExpr(body, typ, loc):
+					exact_owned_vars_after_effect(exact_owned_vars, body)
+				SeqExpr(first, second):
+					exact_owned_vars_after_effect(
+						exact_owned_vars_after_effect(exact_owned_vars, first),
+						second,
+					)
+				DupExpr(variable, value_type, retain_policy, body, typ, loc):
+					retained_vars: List[CoreVar] = match retain_policy:
+						NoRetainPolicy:
+							exact_owned_vars
+						_:
+							exact_owned_vars_add(exact_owned_vars, variable)
+
+					exact_owned_vars_after_effect(retained_vars, body)
+				DropExpr(variable, value_type, release_policy, body, typ, loc):
+					released_vars: List[CoreVar] = match release_policy:
+						NoReleasePolicy:
+							exact_owned_vars
+						_:
+							exact_owned_vars_remove(exact_owned_vars, variable)
+
+					exact_owned_vars_after_effect(released_vars, body)
+				_:
+					exact_owned_vars
+
+
+private pure func exact_owned_vars_for_match_results(
+	exact_owned_vars: List[CoreVar],
+	scrutinee: CoreExpr,
+	release_policy: CoreReleasePolicy,
+) -> List[CoreVar]:
+	match release_policy:
+		NoReleasePolicy:
+			exact_owned_vars
+		_:
+			match release_expr_owner_var(scrutinee):
+				Some(variable):
+					exact_owned_vars_remove(exact_owned_vars, variable)
+				None:
+					exact_owned_vars
 
 
 private pure func normalize_assignment_alias_result_inner(
 	env: PerceusEnv,
 	local_aliases: Dict[String, Bool],
+	exact_owned_vars: List[CoreVar],
 	expr: CoreExpr,
 ) -> CoreExpr:
-	if not is_managed_type(env, core_expr_type(expr)):
+	result_is_exact_owner: Bool = assignment_result_is_exact_owner(exact_owned_vars, expr)
+
+	if result_is_exact_owner or not is_managed_type(env, core_expr_type(expr)):
 		expr
 	else:
 		match expr:
 			DebugBlockExpr(body, typ, loc):
 				DebugBlockExpr(
-					normalize_assignment_alias_result_inner(env, local_aliases, body),
+					normalize_assignment_alias_result_inner(
+						env,
+						local_aliases,
+						exact_owned_vars,
+						body,
+					),
 					typ,
 					loc,
 				)
 			IfExpr(cond, then_expr, else_expr, typ, loc):
 				IfExpr(
 					cond,
-					normalize_assignment_alias_result_inner(env, local_aliases, then_expr),
-					normalize_assignment_alias_result_inner(env, local_aliases, else_expr),
+					normalize_assignment_alias_result_inner(
+						env,
+						local_aliases,
+						exact_owned_vars,
+						then_expr,
+					),
+					normalize_assignment_alias_result_inner(
+						env,
+						local_aliases,
+						exact_owned_vars,
+						else_expr,
+					),
 					typ,
 					loc,
 				)
 			LetExpr(variable, is_mutable, typ, rhs, body):
 				owned_rhs: CoreExpr = if is_managed_type(env, typ):
-					normalize_assignment_alias_result_inner(env, local_aliases, rhs)
+					normalize_assignment_alias_result_inner(
+						env,
+						local_aliases,
+						exact_owned_vars,
+						rhs,
+					)
 				else:
 					rhs
 
@@ -8462,6 +8563,7 @@ private pure func normalize_assignment_alias_result_inner(
 					normalize_assignment_alias_result_inner(
 						env,
 						local_aliases.set(variable.name, False),
+						exact_owned_vars_remove(exact_owned_vars, variable),
 						body,
 					),
 				)
@@ -8476,13 +8578,19 @@ private pure func normalize_assignment_alias_result_inner(
 							variable.name,
 							is_managed_type(env, typ),
 						),
+						exact_owned_vars_remove(exact_owned_vars, variable),
 						body,
 					),
 				)
 			SeqExpr(first, second):
 				SeqExpr(
 					first,
-					normalize_assignment_alias_result_inner(env, local_aliases, second),
+					normalize_assignment_alias_result_inner(
+						env,
+						local_aliases,
+						exact_owned_vars_after_effect(exact_owned_vars, first),
+						second,
+					),
 				)
 			DupExpr(variable, value_type, retain_policy, body, typ, loc):
 				DupExpr(
@@ -8492,6 +8600,7 @@ private pure func normalize_assignment_alias_result_inner(
 					normalize_assignment_alias_result_inner(
 						env,
 						local_aliases.set(variable.name, False),
+						exact_owned_vars_add(exact_owned_vars, variable),
 						body,
 					),
 					typ,
@@ -8502,7 +8611,12 @@ private pure func normalize_assignment_alias_result_inner(
 					variable,
 					value_type,
 					release_policy,
-					normalize_assignment_alias_result_inner(env, local_aliases, body),
+					normalize_assignment_alias_result_inner(
+						env,
+						local_aliases,
+						exact_owned_vars_remove(exact_owned_vars, variable),
+						body,
+					),
 					typ,
 					loc,
 				)
@@ -8511,7 +8625,8 @@ private pure func normalize_assignment_alias_result_inner(
 					expr,
 					{
 						env = env,
-						local_aliases = local_aliases
+						local_aliases = local_aliases,
+						exact_owned_vars = exact_owned_vars
 					},
 					normalize_assignment_alias_match_result,
 				)
@@ -8520,7 +8635,12 @@ private pure func normalize_assignment_alias_result_inner(
 					expr,
 					{
 						env = env,
-						local_aliases = local_aliases
+						local_aliases = local_aliases,
+						exact_owned_vars = exact_owned_vars_for_match_results(
+							exact_owned_vars,
+							scrutinee,
+							release_policy,
+						)
 					},
 					normalize_assignment_alias_match_result,
 				)
@@ -8529,7 +8649,12 @@ private pure func normalize_assignment_alias_result_inner(
 					expr,
 					{
 						env = env,
-						local_aliases = local_aliases
+						local_aliases = local_aliases,
+						exact_owned_vars = exact_owned_vars_for_match_results(
+							exact_owned_vars,
+							scrutinee,
+							release_policy,
+						)
 					},
 					normalize_assignment_alias_match_result,
 				)
@@ -8538,26 +8663,27 @@ private pure func normalize_assignment_alias_result_inner(
 					expr,
 					{
 						env = env,
-						local_aliases = local_aliases
+						local_aliases = local_aliases,
+						exact_owned_vars = exact_owned_vars_for_match_results(
+							exact_owned_vars,
+							scrutinee,
+							release_policy,
+						)
 					},
 					normalize_assignment_alias_match_result,
 				)
 			ResourceScopeExpr(scope, typ, loc):
-				ResourceScopeExpr(
-					{ scope |
-						body = normalize_assignment_alias_result_inner(
+				ResourceScopeExpr({ scope | body = normalize_assignment_alias_result_inner(
 							env,
 							local_aliases,
+							exact_owned_vars_remove(exact_owned_vars, scope.variable),
 							scope.body,
-						)
-					},
-					typ,
-					loc,
-				)
+						) }, typ, loc)
 			ListHandoffExpr(handoff, typ, loc):
 				ListHandoffExpr({ handoff | body = normalize_assignment_alias_result_inner(
 							env,
 							local_aliases.set(handoff.result_var.name, False),
+							exact_owned_vars_remove(exact_owned_vars, handoff.result_var),
 							handoff.body,
 						) }, typ, loc)
 			TensorRawViewLetExpr(binding, body, typ, loc):
@@ -8566,6 +8692,7 @@ private pure func normalize_assignment_alias_result_inner(
 					normalize_assignment_alias_result_inner(
 						env,
 						local_aliases.set(binding.variable.name, False),
+						exact_owned_vars_remove(exact_owned_vars, binding.variable),
 						body,
 					),
 					typ,
@@ -8579,7 +8706,7 @@ private pure func normalize_assignment_alias_result_inner(
 
 
 private pure func normalize_assignment_alias_result(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
-	normalize_assignment_alias_result_inner(env, {}, expr)
+	normalize_assignment_alias_result_inner(env, {}, [], expr)
 
 
 private pure func rewrite_uniform_mutable_assignment_with_uses(
@@ -13724,13 +13851,13 @@ private pure func owned_names_remove(owned: List[String], name: String) -> List[
 	remaining
 
 
-private pure func retained_var_from_effect(expr: CoreExpr) -> Option[String]:
+private pure func retained_core_var_from_effect(expr: CoreExpr) -> Option[CoreVar]:
 	match expr:
 		ListRetainExpr(retain, typ, loc):
 			if retain.value.needs_release:
 				match retain.value.value:
 					VarExpr(value, value_type, value_loc):
-						Some(value.name)
+						Some(value)
 					_:
 						None
 			else:
@@ -13744,12 +13871,20 @@ private pure func retained_var_from_effect(expr: CoreExpr) -> Option[String]:
 						or name == "dict_retain_value_for"
 						or name == "set_retain_key_for"
 					):
-						Some(value.name)
+						Some(value)
 					else:
 						None
 				_:
 					None
 		_:
+			None
+
+
+private pure func retained_var_from_effect(expr: CoreExpr) -> Option[String]:
+	match retained_core_var_from_effect(expr):
+		Some(variable):
+			Some(variable.name)
+		None:
 			None
 
 
@@ -14619,6 +14754,30 @@ private pure func owned_result_is_alias(env: PerceusEnv, expr: CoreExpr) -> Bool
 
 private pure func same_core_var(left: CoreVar, right: CoreVar) -> Bool:
 	left.name == right.name and left.uniq == right.uniq and left.def_id == right.def_id
+
+
+private pure func exact_owned_vars_add(
+	variables: List[CoreVar],
+	variable: CoreVar,
+) -> List[CoreVar]:
+	if variables.any(func(candidate): same_core_var(candidate, variable)):
+		variables
+	else:
+		variables.append(variable)
+
+
+private pure func exact_owned_vars_remove(
+	variables: List[CoreVar],
+	variable: CoreVar,
+) -> List[CoreVar]:
+	if variables.is_empty():
+		variables
+	else:
+		variables.filter(func(candidate): not same_core_var(candidate, variable))
+
+
+private pure func exact_owned_vars_contains(variables: List[CoreVar], variable: CoreVar) -> Bool:
+	variables.any(func(candidate): same_core_var(candidate, variable))
 
 
 private pure func add_transferable_result_var(
@@ -20050,9 +20209,7 @@ private pure func build_borrowed_owner_catalog(
 	}
 
 
-private pure func record_borrowed_region_normalization_visit(
-	owners: BorrowedOwnerCatalog,
-) -> Int:
+private pure func record_borrowed_region_normalization_visit(owners: BorrowedOwnerCatalog) -> Int:
 	debug:
 		match owners.region_kind:
 			GlobalInitializerOwnerRegion:
@@ -23187,13 +23344,7 @@ private pure func normalize_global_initializer_owner_entries(
 	return_type: CoreType,
 	body: CoreExpr,
 ) -> CoreExpr:
-	normalize_borrowed_owner_entries(
-		env,
-		entries,
-		GlobalInitializerOwnerRegion,
-		return_type,
-		body,
-	)
+	normalize_borrowed_owner_entries(env, entries, GlobalInitializerOwnerRegion, return_type, body)
 
 
 private pure func mutable_managed_global_for_target(

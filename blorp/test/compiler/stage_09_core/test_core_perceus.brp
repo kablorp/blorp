@@ -14,6 +14,7 @@ import:
 		CoreBoxKind(PointerBox),
 		CoreBoxedStorageValue,
 		CoreCallKind(BuiltinCall, ClosureCall, ForeignCall, IntrinsicCall, UserCall),
+		CoreClosureCapture,
 		CoreConstructorLengthMatch,
 		CoreConstructorLengthMatchBranch,
 		CoreConstructorLengthMatchCase,
@@ -95,7 +96,6 @@ import:
 		CoreLoopRangeDirection(RangeForwardOnly),
 		CoreMatchBinding,
 		CoreMatchBindingMode(MatchBorrowBindingMode, MatchOwnBindingMode),
-		CoreClosureCapture,
 		CoreParam,
 		CoreProgram,
 		CoreRecordFieldValue,
@@ -6072,6 +6072,340 @@ pure func test_prepared_list_retain_owns_alias_binding_result() -> Bool:
 	dup_count_for("$blorp$perceus$owned_result", rewritten) == 0
 
 
+pure func test_prepared_list_retain_owns_assignment_result() -> Bool:
+	value_type: CoreType = list_int_type()
+	outer_type: CoreType = NamedType("List", [value_type])
+	elem: CoreVar = named_var("elem")
+	retained: CoreExpr = ListRetainExpr(
+		{
+			list = var_expr("outer", outer_type),
+			value = {
+				kind = PointerBox,
+				value = VarExpr(elem, value_type, SyntheticSourceLoc),
+				needs_release = True,
+				transfers_ownership = False
+			}
+		},
+		VoidType,
+		SyntheticSourceLoc,
+	)
+	rhs: CoreExpr = BorrowLetExpr(
+		elem,
+		value_type,
+		var_expr("borrowed", value_type),
+		SeqExpr(
+			retained,
+			VarExpr(elem, value_type, SyntheticSourceLoc),
+		),
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		AssignExpr(named_var("target"), rhs, void_type(), SyntheticSourceLoc),
+	)
+
+	-- ListRetainExpr already gives the projected element an independent owner.
+	dup_count_for("$blorp$perceus$owned_result", rewritten) == 0
+
+
+pure func test_prepared_list_retain_does_not_own_shadowed_assignment_result() -> Bool:
+	value_type: CoreType = list_int_type()
+	outer_type: CoreType = NamedType("List", [value_type])
+	retained_elem: CoreVar = {
+		name = "elem",
+		uniq = 1,
+		def_id = None
+	}
+	shadowed_elem: CoreVar = {
+		name = "elem",
+		uniq = 2,
+		def_id = None
+	}
+	retained: CoreExpr = ListRetainExpr(
+		{
+			list = var_expr("outer", outer_type),
+			value = {
+				kind = PointerBox,
+				value = VarExpr(retained_elem, value_type, SyntheticSourceLoc),
+				needs_release = True,
+				transfers_ownership = False
+			}
+		},
+		VoidType,
+		SyntheticSourceLoc,
+	)
+	rhs: CoreExpr = SeqExpr(
+		retained,
+		BorrowLetExpr(
+			shadowed_elem,
+			value_type,
+			var_expr("borrowed", value_type),
+			VarExpr(shadowed_elem, value_type, SyntheticSourceLoc),
+		),
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		AssignExpr(named_var("target"), rhs, void_type(), SyntheticSourceLoc),
+	)
+
+	dup_count_for("$blorp$perceus$owned_result", rewritten) == 1
+
+
+pure func assignment_owned_result_dup_count(rhs: CoreExpr) -> Int:
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		AssignExpr(named_var("target"), rhs, void_type(), SyntheticSourceLoc),
+	)
+	dup_count_for("$blorp$perceus$owned_result", rewritten)
+
+
+pure func prepared_list_retain(owner: CoreVar, value: CoreVar, value_type: CoreType) -> CoreExpr:
+	ListRetainExpr(
+		{
+			list = VarExpr(
+				owner,
+				NamedType("List", [value_type]),
+				SyntheticSourceLoc,
+			),
+			value = {
+				kind = PointerBox,
+				value = VarExpr(value, value_type, SyntheticSourceLoc),
+				needs_release = True,
+				transfers_ownership = False
+			}
+		},
+		VoidType,
+		SyntheticSourceLoc,
+	)
+
+
+pure func test_assignment_explicit_owner_is_cleared_after_release() -> Bool:
+	value_type: CoreType = list_int_type()
+	elem: CoreVar = named_var("elem")
+	rhs: CoreExpr = BorrowLetExpr(
+		elem,
+		value_type,
+		var_expr("borrowed", value_type),
+		SeqExpr(
+			prepared_list_retain(named_var("outer"), elem, value_type),
+			SeqExpr(
+				DropExpr(
+					elem,
+					value_type,
+					ArcReleasePolicy,
+					VoidExpr(void_type(), SyntheticSourceLoc),
+					void_type(),
+					SyntheticSourceLoc,
+				),
+				VarExpr(elem, value_type, SyntheticSourceLoc),
+			),
+		),
+	)
+
+	assignment_owned_result_dup_count(rhs) == 1
+
+
+pure func test_assignment_drop_body_can_restore_explicit_owner() -> Bool:
+	value_type: CoreType = list_int_type()
+	elem: CoreVar = named_var("elem")
+	rhs: CoreExpr = BorrowLetExpr(
+		elem,
+		value_type,
+		var_expr("borrowed", value_type),
+		SeqExpr(
+			DropExpr(
+				elem,
+				value_type,
+				ArcReleasePolicy,
+				prepared_list_retain(named_var("outer"), elem, value_type),
+				void_type(),
+				SyntheticSourceLoc,
+			),
+			VarExpr(elem, value_type, SyntheticSourceLoc),
+		),
+	)
+
+	assignment_owned_result_dup_count(rhs) == 0
+
+
+pure func test_assignment_dup_effect_owns_result() -> Bool:
+	value_type: CoreType = list_int_type()
+	elem: CoreVar = named_var("elem")
+	retained: CoreExpr = BorrowLetExpr(
+		elem,
+		value_type,
+		var_expr("borrowed", value_type),
+		SeqExpr(
+			DupExpr(
+				elem,
+				value_type,
+				ArcRetainPolicy,
+				VoidExpr(void_type(), SyntheticSourceLoc),
+				void_type(),
+				SyntheticSourceLoc,
+			),
+			VarExpr(elem, value_type, SyntheticSourceLoc),
+		),
+	)
+	borrowed: CoreExpr = BorrowLetExpr(
+		elem,
+		value_type,
+		var_expr("borrowed", value_type),
+		SeqExpr(
+			DupExpr(
+				elem,
+				value_type,
+				NoRetainPolicy,
+				VoidExpr(void_type(), SyntheticSourceLoc),
+				void_type(),
+				SyntheticSourceLoc,
+			),
+			VarExpr(elem, value_type, SyntheticSourceLoc),
+		),
+	)
+
+	(
+		assignment_owned_result_dup_count(retained) == 0
+		and assignment_owned_result_dup_count(borrowed) == 1
+	)
+
+
+pure func test_assignment_explicit_owner_survives_alias_wrappers() -> Bool:
+	value_type: CoreType = list_int_type()
+	elem: CoreVar = named_var("elem")
+	retained: CoreExpr = prepared_list_retain(named_var("outer"), elem, value_type)
+	cast_rhs: CoreExpr = BorrowLetExpr(
+		elem,
+		value_type,
+		var_expr("borrowed", value_type),
+		SeqExpr(
+			retained,
+			CastExpr(
+				VarExpr(elem, value_type, SyntheticSourceLoc),
+				value_type,
+				SyntheticSourceLoc,
+			),
+		),
+	)
+	unbox_rhs: CoreExpr = BorrowLetExpr(
+		elem,
+		value_type,
+		var_expr("borrowed", value_type),
+		SeqExpr(
+			retained,
+			UnboxExpr(
+				PointerUnbox,
+				VarExpr(elem, value_type, SyntheticSourceLoc),
+				value_type,
+				SyntheticSourceLoc,
+			),
+		),
+	)
+
+	(
+		assignment_owned_result_dup_count(cast_rhs) == 0
+		and assignment_owned_result_dup_count(unbox_rhs) == 0
+	)
+
+
+pure func assignment_releasing_matches(
+	scrutinee: CoreExpr,
+	result: CoreExpr,
+	value_type: CoreType,
+) -> List[CoreExpr]:
+	[
+		ConstructorMatchExpr(
+			scrutinee,
+			ArcReleasePolicy,
+			[],
+			ConstructorMatchFallbackBody(result),
+			value_type,
+			SyntheticSourceLoc,
+		),
+		AccessorLiteralMatchExpr(
+			scrutinee,
+			ArcReleasePolicy,
+			{
+				accessor = RootAccessor,
+				scrutinee_type = value_type,
+				cases = [],
+				fallback = LiteralMatchFallbackBody(result),
+				result_type = value_type,
+				loc = SyntheticSourceLoc
+			},
+			value_type,
+			SyntheticSourceLoc,
+		),
+		LengthMatchExpr(
+			scrutinee,
+			ArcReleasePolicy,
+			{
+				accessor = RootAccessor,
+				cases = [],
+				geq = None,
+				fallback = Some(constructor_length_branch([], ConstructorMatchBodyExpr(result))),
+				result_type = value_type,
+				loc = SyntheticSourceLoc
+			},
+			value_type,
+			SyntheticSourceLoc,
+		),
+	]
+
+
+pure func test_assignment_releasing_match_clears_scrutinee_owner() -> Bool:
+	value_type: CoreType = list_int_type()
+	elem: CoreVar = named_var("elem")
+	direct: CoreExpr = VarExpr(elem, value_type, SyntheticSourceLoc)
+	scrutinees: List[CoreExpr] = [
+		direct,
+		CastExpr(direct, value_type, SyntheticSourceLoc),
+		UnboxExpr(PointerUnbox, direct, value_type, SyntheticSourceLoc),
+	]
+	expected_owned_result_dups: List[Int] = [0, 1, 1]
+	var balanced: Bool = True
+	var scrutinee_index: Int = 0
+
+	for scrutinee in scrutinees:
+		result: CoreExpr = CastExpr(scrutinee, value_type, SyntheticSourceLoc)
+		expected_dups: Int = expected_owned_result_dups.get_or(scrutinee_index, -1)
+
+		for match_expr in assignment_releasing_matches(scrutinee, result, value_type):
+			rhs: CoreExpr = SeqExpr(
+				prepared_list_retain(named_var("outer"), elem, value_type),
+				match_expr,
+			)
+			balanced = balanced and assignment_owned_result_dup_count(rhs) == expected_dups
+
+		scrutinee_index += 1
+
+	balanced
+
+
+pure func test_assignment_resource_binder_clears_explicit_owner() -> Bool:
+	value_type: CoreType = list_int_type()
+	resource_var: CoreVar = named_var("resource")
+	rhs: CoreExpr = SeqExpr(
+		prepared_list_retain(
+			named_var("outer"),
+			resource_var,
+			value_type,
+		),
+		ResourceScopeExpr(
+			{
+				variable = resource_var,
+				typ = value_type,
+				acquire = var_expr("acquired", value_type),
+				body = VarExpr(resource_var, value_type, SyntheticSourceLoc),
+				cleanup = VoidExpr(void_type(), SyntheticSourceLoc)
+			},
+			value_type,
+			SyntheticSourceLoc,
+		),
+	)
+
+	assignment_owned_result_dup_count(rhs) == 1
+
+
 pure func test_list_set_owned_transfers_managed_element() -> Bool:
 	body: CoreExpr = ListSetExpr(
 		{
@@ -7043,7 +7377,7 @@ pure func test_lambda_catalog_retains_parameter_capture_and_exact_global() -> Bo
 				string_type(),
 				LiteralExpr(StringLiteral("global"), string_type(), SyntheticSourceLoc),
 			)],
-		foreign_includes = [],
+		foreign_includes = []
 	}
 	lambda: CoreExpr = LambdaExpr(
 		[core_param("parameter", string_type())],
@@ -7082,14 +7416,7 @@ pure func test_lambda_parameter_spelling_excludes_runtime_capture() -> Bool:
 	)
 	rewritten: CoreExpr = insert_drops_expr(
 		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
-		LambdaExpr(
-			[parameter],
-			string_type(),
-			body,
-			True,
-			closure_type(),
-			SyntheticSourceLoc,
-		),
+		LambdaExpr([parameter], string_type(), body, True, closure_type(), SyntheticSourceLoc),
 	)
 
 	captures.is_empty() and dup_count_for("shared", rewritten) == 1
@@ -7118,18 +7445,11 @@ pure func test_lambda_name_mode_capture_and_exact_global_retain_each_site_once()
 				string_type(),
 				LiteralExpr(StringLiteral("global"), string_type(), SyntheticSourceLoc),
 			)],
-		foreign_includes = [],
+		foreign_includes = []
 	}
 	rewritten: CoreExpr = insert_drops_expr(
 		build_env(program),
-		LambdaExpr(
-			[],
-			result_type,
-			body,
-			True,
-			closure_type(),
-			SyntheticSourceLoc,
-		),
+		LambdaExpr([], result_type, body, True, closure_type(), SyntheticSourceLoc),
 	)
 
 	match rewritten:
@@ -7170,6 +7490,8 @@ pure func test_nested_lambda_shared_owner_stays_in_inner_region() -> Bool:
 			dup_count_for("shared", inner_body) == 1
 		_:
 			False
+
+
 pure func test_unmanaged_let_gets_no_drop() -> Bool:
 	expr: CoreExpr = LetExpr(named_var("n"), False, int_type(), int_expr(1), int_expr(2))
 	rewritten: CoreExpr = insert_drops_expr(
@@ -16120,6 +16442,35 @@ tests: TestSuite = {
 		(
 			"prepared list retain owns alias binding result",
 			test_prepared_list_retain_owns_alias_binding_result,
+		),
+		(
+			"prepared list retain owns assignment result",
+			test_prepared_list_retain_owns_assignment_result,
+		),
+		(
+			"prepared list retain does not own shadowed assignment result",
+			test_prepared_list_retain_does_not_own_shadowed_assignment_result,
+		),
+		(
+			"assignment explicit owner is cleared after release",
+			test_assignment_explicit_owner_is_cleared_after_release,
+		),
+		(
+			"assignment drop body can restore explicit owner",
+			test_assignment_drop_body_can_restore_explicit_owner,
+		),
+		("assignment dup effect owns result", test_assignment_dup_effect_owns_result),
+		(
+			"assignment explicit owner survives alias wrappers",
+			test_assignment_explicit_owner_survives_alias_wrappers,
+		),
+		(
+			"assignment releasing match clears scrutinee owner",
+			test_assignment_releasing_match_clears_scrutinee_owner,
+		),
+		(
+			"assignment resource binder clears explicit owner",
+			test_assignment_resource_binder_clears_explicit_owner,
 		),
 		("list set owned transfers managed element", test_list_set_owned_transfers_managed_element),
 		(
