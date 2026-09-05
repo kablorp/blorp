@@ -13889,6 +13889,9 @@ pure func test_emit_dynamic_global_init() -> Bool:
 		and artifact.c_code.contains("void __blorp_init_globals(void)")
 		and artifact.c_code.contains("TEST_ITEMS = ({")
 		and artifact.c_code.contains("blorp_List* __lst = blorp_list_new(1);")
+		and not artifact.c_code.contains("blorp_task_cleanup_push")
+		and not artifact.c_code.contains("blorp_task_cleanup_pop_slot")
+		and not artifact.c_code.contains("blorp_task_cleanup_duplicate_slot")
 		and artifact.c_code.contains("int main(void)")
 		and artifact.c_code.contains("__blorp_init_globals();")
 	)
@@ -13985,7 +13988,7 @@ pure func test_emit_static_closure_forward_decl() -> Bool:
 	)
 
 
-pure func test_emit_task_closure_forward_decl_and_moved_capture_cleanup() -> Bool:
+pure func test_emit_noncancelling_task_closure_omits_moved_capture_cleanup() -> Bool:
 	program: CoreProgram = {
 		decls = [FunctionDecl(moved_channel_task_body_function())],
 		foreign_includes = []
@@ -14003,11 +14006,8 @@ pure func test_emit_task_closure_forward_decl_and_moved_capture_cleanup() -> Boo
 		and artifact.c_code.contains("void** __e = (void**)__env;")
 		and artifact.c_code.contains("blorp_Channel* ch = (blorp_Channel*)__e[0];")
 		and artifact.c_code.contains("__e[0] = NULL;")
-		and artifact.c_code.contains("blorp_CancelCleanupFrame __blorp_cleanup_ch;")
-		and artifact.c_code.contains((
-				"blorp_task_cleanup_push(&__blorp_cleanup_ch, &ch, (void*)ch, "
-				+ "blorp_cleanup_release_arc_value);"
-			))
+		and not artifact.c_code.contains("blorp_CancelCleanupFrame __blorp_cleanup_ch;")
+		and not artifact.c_code.contains("blorp_task_cleanup_push(&__blorp_cleanup_ch")
 		and artifact.c_code.contains("return (void*)ch;")
 	)
 
@@ -20625,7 +20625,6 @@ pure func dup_policy_function(
 		uniq = 0,
 		def_id = None
 	}
-
 	{
 		name = function_name,
 		source_module = None,
@@ -20651,6 +20650,35 @@ pure func dup_policy_function(
 		is_pure = True,
 		function_kind = UserFunction,
 		def_id = def_id,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func cancelling_dup_policy_function() -> CoreFunction:
+	value_var: CoreVar = named_var("value")
+
+	{
+		name = "cancelling_dup_arc",
+		source_module = None,
+		type_params = [],
+		params = [string_param("value")],
+		return_type = string_type(),
+		body = Some(
+			DupExpr(
+				value_var,
+				string_type(),
+				ArcRetainPolicy,
+				SeqExpr(
+					CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc),
+					VarExpr(value_var, string_type(), SyntheticSourceLoc),
+				),
+				string_type(),
+				SyntheticSourceLoc,
+			),
+		),
+		is_pure = False,
+		function_kind = UserFunction,
+		def_id = 1400,
 		loc = SyntheticSourceLoc
 	}
 
@@ -21353,7 +21381,7 @@ pure func test_emit_resource_source_concurrently_loop() -> Bool:
 		)
 		and artifact.c_code.contains("((void**)__cl_new->env)[0] = (void*)conn;")
 		and artifact.c_code.contains("BLORP_CONCURRENT_TASK_FLUSH_IMMEDIATE")
-		and artifact.c_code.contains("blorp_task_cleanup_pop_slot(&conn);")
+		and not artifact.c_code.contains("blorp_task_cleanup_pop_slot(&conn);")
 		and not artifact.c_code.contains("blorp_list_get(")
 	)
 
@@ -21541,12 +21569,11 @@ pure func test_emit_owned_list_literal_length_match_releases_scrutinee() -> Bool
 
 	(
 		artifact.c_code.contains("int owned_list_literal_length_match(void)")
-		and artifact.c_code.contains(
+		and not artifact.c_code.contains(
 			"blorp_CancelCleanupFrame __blorp_cleanup___blorp_match_scrut_owned;",
 		)
-		and artifact.c_code.contains(
-			"blorp_task_cleanup_pop_slot(&__blorp_match_scrut_owned);\n  blorp_release(__blorp_match_scrut_owned);",
-		)
+		and artifact.c_code.contains("blorp_release(__blorp_match_scrut_owned);")
+		and not artifact.c_code.contains("blorp_task_cleanup_pop_slot(&__blorp_match_scrut_owned);")
 		and not artifact.c_code.contains(
 			"blorp_release(__blorp_match_scrut_owned);\n  blorp_release(__blorp_match_scrut_owned);",
 		)
@@ -22464,6 +22491,7 @@ pure func test_emit_drop_release_policies() -> Bool:
 				),
 			),
 			FunctionDecl(dup_policy_function("dup_none", int_type(), NoRetainPolicy, 122)),
+			FunctionDecl(cancelling_dup_policy_function()),
 		],
 		foreign_includes = []
 	}
@@ -22477,10 +22505,12 @@ pure func test_emit_drop_release_policies() -> Bool:
 		and artifact.c_code.contains("long drop_none(long value)")
 		and artifact.c_code.contains("blorp_String* dup_arc(blorp_String* value)")
 		and artifact.c_code.contains("blorp_retain(value);")
-		and artifact.c_code.count("blorp_task_cleanup_duplicate_slot(&value);") == 2
+		and artifact.c_code.count("blorp_task_cleanup_duplicate_slot(&value);") == 1
 		and artifact.c_code.contains("void* dup_stack_result(void* value)")
 		and artifact.c_code.contains("blorp_stack_result_retain(value);")
 		and artifact.c_code.contains("long dup_none(long value)")
+		and artifact.c_code.contains("blorp_String* cancelling_dup_arc(blorp_String* value)")
+		and artifact.c_code.contains("blorp_cooperative_checkpoint();")
 		and not artifact.c_code.contains("blorp_release(value);")
 	)
 
@@ -22576,7 +22606,7 @@ pure func test_emit_let_direct_return_transfers_owned_bytes() -> Bool:
 	)
 
 
-pure func test_emit_let_alias_return_pops_source_cleanup() -> Bool:
+pure func test_emit_noncancelling_let_alias_return_omits_source_cleanup() -> Bool:
 	program: CoreProgram = {
 		decls = [FunctionDecl(let_bytes_alias_return_function())],
 		foreign_includes = []
@@ -22586,13 +22616,13 @@ pure func test_emit_let_alias_return_pops_source_cleanup() -> Bool:
 	(
 		artifact.c_code.contains("blorp_Bytes* payload = ({")
 		and artifact.c_code.contains("blorp_retain(input);")
-		and artifact.c_code.contains("blorp_CancelCleanupFrame __blorp_cleanup_payload;")
+		and not artifact.c_code.contains("blorp_CancelCleanupFrame __blorp_cleanup_payload;")
 		and artifact.c_code.contains("blorp_Bytes* result = ({")
 		and artifact.c_code.contains("blorp_retain(payload);")
 		and artifact.c_code.contains("blorp_Bytes* __cdrop_payload = ({")
 		and artifact.c_code.contains("blorp_release(payload);")
 		and artifact.c_code.contains("return __cdrop_payload;")
-		and artifact.c_code.count("blorp_task_cleanup_pop_slot(&payload);") == 1
+		and not artifact.c_code.contains("blorp_task_cleanup_pop_slot(&payload);")
 	)
 
 
@@ -22640,7 +22670,7 @@ pure func test_emit_let_user_call_transfer_pops_cleanup_at_call_site() -> Bool:
 	)
 
 
-pure func test_emit_let_transfer_tail_balances_alias_cleanup() -> Bool:
+pure func test_emit_noncancelling_let_transfer_tail_omits_alias_cleanup() -> Bool:
 	program: CoreProgram = {
 		decls = [FunctionDecl(let_list_append_transfer_function())],
 		foreign_includes = []
@@ -22651,9 +22681,8 @@ pure func test_emit_let_transfer_tail_balances_alias_cleanup() -> Bool:
 		artifact.c_code.contains("blorp_List* let_list_append_transfer")
 		and artifact.c_code.contains("blorp_List* source_owner = ({")
 		and artifact.c_code.contains("blorp_retain(source);")
-		and artifact.c_code.contains("blorp_CancelCleanupFrame __blorp_cleanup_source_owner;")
-		and artifact.c_code.contains("blorp_task_cleanup_pop_slot(&source_owner);")
-		and artifact.c_code.count("blorp_task_cleanup_pop_slot(&source_owner);") == 1
+		and not artifact.c_code.contains("blorp_CancelCleanupFrame __blorp_cleanup_source_owner;")
+		and not artifact.c_code.contains("blorp_task_cleanup_pop_slot(&source_owner);")
 		and artifact.c_code.contains("blorp_List* __std_inline___result =")
 		and artifact.c_code.contains("blorp_List* __cdrop___std_inline_elem =")
 		and artifact.c_code.contains("return __cdrop___std_inline_elem;")
@@ -23435,7 +23464,7 @@ pure func test_emit_constructor_match_with_union_payload_binding() -> Bool:
 	)
 
 
-pure func test_emit_constructor_match_owns_let_scrutinee_cleanup() -> Bool:
+pure func test_emit_noncancelling_constructor_match_omits_scrutinee_cleanup() -> Bool:
 	program: CoreProgram = {
 		decls = [
 			UnionDecl(choice_union_decl()),
@@ -23449,7 +23478,7 @@ pure func test_emit_constructor_match_owns_let_scrutinee_cleanup() -> Bool:
 	(
 		artifact.c_code.contains("long picked_value_from_owned_call(void)")
 		and artifact.c_code.contains("Choice* __blorp_match_scrut = make_choice(7);")
-		and artifact.c_code.contains(
+		and not artifact.c_code.contains(
 			"blorp_CancelCleanupFrame __blorp_owned_cleanup___blorp_match_scrut;",
 		)
 		and artifact.c_code.contains("blorp_release_arc_only(__blorp_match_scrut);")
@@ -23513,8 +23542,8 @@ pure func test_emit_nullable_singleton_union_from_list_get() -> Bool:
 		and artifact.c_code.contains("Paint* selected = __blorp_internal_match_scrut_")
 		and artifact.c_code.contains("Paint* __match_scrut_")
 		and artifact.c_code.contains("->tag == TAG_Paint_Red")
-		and artifact.c_code.contains("int __let_result_")
-		and artifact.c_code.contains("return __let_result_")
+		and not artifact.c_code.contains("int __let_result_")
+		and artifact.c_code.contains("return __match_result_")
 	)
 
 
@@ -24399,8 +24428,8 @@ tests: TestSuite = {
 		("emit stack Result void payload match", test_emit_stack_result_void_payload_match),
 		("emit Bool constructor match", test_emit_bool_constructor_match),
 		(
-			"emit constructor match owns let scrutinee cleanup",
-			test_emit_constructor_match_owns_let_scrutinee_cleanup,
+			"emit noncancelling constructor match without scrutinee cleanup",
+			test_emit_noncancelling_constructor_match_omits_scrutinee_cleanup,
 		),
 		(
 			"emit stack Result task closure return uses stack Result box",
@@ -24473,8 +24502,8 @@ tests: TestSuite = {
 		("emit owned const erased union global", test_emit_owned_const_erased_union_global),
 		("emit static closure forward decl", test_emit_static_closure_forward_decl),
 		(
-			"emit task closure forward decl and moved capture cleanup",
-			test_emit_task_closure_forward_decl_and_moved_capture_cleanup,
+			"emit noncancelling task closure without moved capture cleanup",
+			test_emit_noncancelling_task_closure_omits_moved_capture_cleanup,
 		),
 		("emit tuple construct and field access", test_emit_tuple_construct_and_field_access),
 		("emit struct tuple construct", test_emit_struct_tuple_construct),
@@ -24663,8 +24692,8 @@ tests: TestSuite = {
 			test_emit_let_direct_return_transfers_owned_bytes,
 		),
 		(
-			"emit let alias return pops source cleanup",
-			test_emit_let_alias_return_pops_source_cleanup,
+			"emit noncancelling let alias return without source cleanup",
+			test_emit_noncancelling_let_alias_return_omits_source_cleanup,
 		),
 		("emit let user call transfers owned bytes", test_emit_let_user_call_transfers_owned_bytes),
 		(
@@ -24672,8 +24701,8 @@ tests: TestSuite = {
 			test_emit_let_user_call_transfer_pops_cleanup_at_call_site,
 		),
 		(
-			"emit let transfer tail balances alias cleanup",
-			test_emit_let_transfer_tail_balances_alias_cleanup,
+			"emit noncancelling let transfer tail without alias cleanup",
+			test_emit_noncancelling_let_transfer_tail_omits_alias_cleanup,
 		),
 		(
 			"emit compiler-owned result temp is hygienic",

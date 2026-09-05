@@ -1,0 +1,1398 @@
+-- Semantic cleanup identities and actions at the prepared-Core/backend boundary.
+--
+-- These types deliberately contain no generated C names. The planner owns
+-- cleanup identity and protocol; the renderer owns concrete slots, frame names,
+-- and callback spellings.
+import:
+	../stage_06_typecheck/type_system/builtins: builtin_is_cancellation_point, builtin_is_registered
+	../stage_09_core/ir:
+		CoreBinaryOp(EqualOp, NotEqualOp),
+		CoreCallKind(
+			BuiltinCall,
+			ClosureCall,
+			DeferredTraitCall,
+			DictWithCapacityCall,
+			DirectRuntimeCall,
+			FallibleStreamTerminalCall,
+			ForeignCall,
+			IntrinsicCall,
+			ListToStringCall,
+			OperationResultCall,
+			SelectedDirectCall,
+			SelectedTraitCall,
+			TensorParallelCall,
+			UnknownCall,
+			UserCall,
+		),
+		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
+		CoreDefinitionIdentity,
+		CoreExpr(
+			AccessorLiteralMatchExpr,
+			AssignExpr,
+			BinaryExpr,
+			BorrowLetExpr,
+			CallExpr,
+			ConstructorMatchExpr,
+			DebugBlockExpr,
+			DictExpr,
+			DropExpr,
+			DupExpr,
+			IfExpr,
+			LetExpr,
+			LengthMatchExpr,
+			ListHandoffSetOwnedExpr,
+			ListHandoffSetSourceSlotExpr,
+			ListRetainExpr,
+			ListSetExpr,
+			ListSwapExpr,
+			LiteralExpr,
+			RawMatchExpr,
+			RangeExpr,
+			SemanticMatchExpr,
+			SeqExpr,
+			StaticStringLiteralExpr,
+			StringByteCopyExpr,
+			StringByteReadExpr,
+			StringByteWriteExpr,
+			StringSetLenExpr,
+			TensorRawFillExpr,
+			TensorRawReadExpr,
+			TensorRawWriteExpr,
+			TupleExpr,
+			UnaryExpr,
+			UnboxExpr,
+			FieldExpr,
+			TupleFieldExpr,
+			CastExpr,
+			VectorExpr,
+			VarExpr,
+			ConcurrentExpr,
+			ConcurrentlyLoopExpr,
+			CooperativeCheckpointExpr,
+			DetachExpr,
+			ForChannelExpr,
+			ForStreamExpr,
+			PreClosureConcurrentExpr,
+			PreClosureConcurrentlyLoopExpr,
+			PreClosureDetachExpr,
+			SelectExpr,
+		),
+		CoreFunction,
+		CoreGlobal,
+		CoreProgram,
+		CoreReleasePolicy(
+			ArcReleaseOnlyPolicy,
+			ArcReleasePolicy,
+			NoReleasePolicy,
+			StackResultReleasePolicy,
+		),
+		CoreType(NamedType),
+		CoreVar,
+		core_expr_type,
+	../stage_09_core/ownership:
+		OwnershipCallContract,
+		arg_consumes_caller,
+		builtin_contract,
+		intrinsic_contract,
+	../stage_09_core/traverse as CoreTraverse
+	../stage_09_core/type_policy as CoreTypePolicy
+	dict: Dict
+
+
+opaque type CancellationSiteId = Int
+
+opaque type CancellationOwnerId = Int
+
+opaque type CancellationSlotId = Int
+
+opaque type ResourceCleanupIdentity = String
+
+opaque type RuntimeCleanupIdentity = String
+
+
+pure func cancellation_site_id(value: Int) -> CancellationSiteId:
+	into_opaque CancellationSiteId(value)
+
+
+pure func cancellation_site_id_value(id: CancellationSiteId) -> Int:
+	from_opaque CancellationSiteId(id)
+
+
+pure func cancellation_owner_id(value: Int) -> CancellationOwnerId:
+	into_opaque CancellationOwnerId(value)
+
+
+pure func cancellation_owner_id_value(id: CancellationOwnerId) -> Int:
+	from_opaque CancellationOwnerId(id)
+
+
+pure func cancellation_slot_id(value: Int) -> CancellationSlotId:
+	into_opaque CancellationSlotId(value)
+
+
+pure func cancellation_slot_id_value(id: CancellationSlotId) -> Int:
+	from_opaque CancellationSlotId(id)
+
+
+pure func resource_cleanup_identity(callback: String) -> ResourceCleanupIdentity:
+	into_opaque ResourceCleanupIdentity(callback)
+
+
+pure func resource_cleanup_identity_value(identity: ResourceCleanupIdentity) -> String:
+	from_opaque ResourceCleanupIdentity(identity)
+
+
+pure func runtime_cleanup_identity(protocol: String) -> RuntimeCleanupIdentity:
+	into_opaque RuntimeCleanupIdentity(protocol)
+
+
+pure func runtime_cleanup_identity_value(identity: RuntimeCleanupIdentity) -> String:
+	from_opaque RuntimeCleanupIdentity(identity)
+
+
+union CancellationActivationIdentity:
+	FunctionCancellationActivation(CoreDefinitionIdentity)
+	GlobalInitializerCancellationActivation(CoreDefinitionIdentity)
+
+
+union BackendCleanupTemporaryRole:
+	CallArgumentTemporary(Int)
+	CallResultTemporary
+	MatchScrutineeTemporary
+	IterableTemporary
+	ChannelValueTemporary
+	SelectValueTemporary(Int)
+	ConcurrentCaptureTemporary(Int)
+	ConcurrentResultTemporary
+	ClosureMoveTemporary(Int)
+	PreparedStackResultTemporary
+
+
+union CancellationOwnerIdentity:
+	CoreVariableCancellationOwner(CoreVar)
+	BackendTemporaryCancellationOwner(CancellationSiteId, BackendCleanupTemporaryRole)
+
+
+union CancellationCleanupAction:
+	ReleaseArcCancellationOwner
+	ReleaseArcOnlyCancellationOwner
+	ReleaseStackResultCancellationOwner
+	ReleaseResourceCancellationOwner(ResourceCleanupIdentity)
+	CancelJoinTaskCancellationOwner
+	CloseTaskWindowCancellationOwner
+	RuntimeOwnedCancellationOwner(RuntimeCleanupIdentity)
+
+
+record CancellationCleanupCandidate {
+	activation: CancellationActivationIdentity,
+	id: CancellationOwnerId,
+	owner: CancellationOwnerIdentity,
+	slot: CancellationSlotId,
+	action: CancellationCleanupAction
+}
+
+
+union CancellationProtectionEvent:
+	TrackCancellationOwner(CancellationSlotId, CancellationOwnerId, CancellationCleanupAction)
+	DuplicateCancellationOwner(CancellationSlotId)
+	UntrackCancellationOwner(CancellationSlotId)
+
+
+record CancellationProtectionSite {
+	site_id: CancellationSiteId,
+	before: List[CancellationProtectionEvent],
+	after: List[CancellationProtectionEvent]
+}
+
+
+record CancellationLetProtection {
+	variable: CoreVar,
+	owner_id: CancellationOwnerId,
+	slot_id: CancellationSlotId,
+	tracks_cleanup: Bool,
+	untracks_after_body: Bool
+}
+
+
+record CancellationProtectionPlan {
+	activation: CancellationActivationIdentity,
+	effect: CoreCancellationEffect,
+	max_live_slots: Int,
+	sites: List[CancellationProtectionSite],
+	let_protections: List[CancellationLetProtection],
+	let_protections_by_uniq: Dict[Int, List[CancellationLetProtection]],
+	expression_visits: Int
+}
+
+
+pure func cancellation_cleanup_action_for_release_policy(
+	policy: CoreReleasePolicy,
+) -> Option[CancellationCleanupAction]:
+	match policy:
+		NoReleasePolicy:
+			None
+		ArcReleasePolicy:
+			Some(ReleaseArcCancellationOwner)
+		ArcReleaseOnlyPolicy:
+			Some(ReleaseArcOnlyCancellationOwner)
+		StackResultReleasePolicy:
+			Some(ReleaseStackResultCancellationOwner)
+
+
+private TENSOR_RECEIVER_CONSUMING_RUNTIME_CALLS: List[String] = [
+	"blorp_vector_set_cow",
+	"blorp_vector_set_cow_nullable",
+	"blorp_checked_set",
+	"blorp_vector_set_inplace",
+	"blorp_vector_set_cow_f32",
+	"blorp_vector_set_cow_nullable_f32",
+	"blorp_vector_set_cow_i64",
+	"blorp_vector_set_cow_nullable_i64",
+	"blorp_vector_set_inplace_packed",
+	"blorp_vector_set_inplace_f32",
+	"blorp_vector_set_inplace_f64",
+	"blorp_vector_set_inplace_i64",
+	"blorp_vector_set_inplace_f16",
+	"blorp_matrix_checked_set",
+	"blorp_matrix_set_opt",
+	"blorp_matrix_set_opt_nullable",
+	"blorp_matrix_checked_set_f64",
+	"blorp_matrix_checked_set_f32",
+	"blorp_matrix_checked_set_i64",
+	"blorp_matrix_set_opt_i64",
+	"blorp_matrix_set_opt_nullable_i64",
+	"blorp_tensor3_checked_set",
+	"blorp_tensor4_checked_set",
+	"blorp_tensor5_checked_set",
+]
+
+
+private record CancellationOwnershipFacts {
+	consumed: List[CoreVar],
+	consumed_before_suspension: List[CoreVar],
+	direct_returns: List[CoreVar],
+	non_suspending_transfer: Bool
+}
+
+
+private record CancellationPlanAnalysis {
+	facts: CancellationOwnershipFacts,
+	sites: List[CancellationProtectionSite],
+	let_protections: List[CancellationLetProtection],
+	max_live_slots: Int,
+	next_site: Int,
+	next_owner: Int
+}
+
+
+private EMPTY_OWNERSHIP_FACTS: CancellationOwnershipFacts = {
+	consumed = [],
+	consumed_before_suspension = [],
+	direct_returns = [],
+	non_suspending_transfer = False
+}
+
+
+private pure func core_vars_equal(left: CoreVar, right: CoreVar) -> Bool:
+	left.name == right.name and left.uniq == right.uniq and left.def_id == right.def_id
+
+
+private pure func vars_contain(variables: List[CoreVar], variable: CoreVar) -> Bool:
+	variables.any(func(candidate): core_vars_equal(candidate, variable))
+
+
+private pure func add_var(variables: List[CoreVar], variable: CoreVar) -> List[CoreVar]:
+	if vars_contain(variables, variable):
+		variables
+	else:
+		variables.append(variable)
+
+
+private pure func merge_vars(left: List[CoreVar], right: List[CoreVar]) -> List[CoreVar]:
+	var result: List[CoreVar] = left
+
+	for variable in right:
+		result = add_var(result, variable)
+
+	result
+
+
+private pure func remove_var(variables: List[CoreVar], removed: CoreVar) -> List[CoreVar]:
+	variables.filter(func(variable): not core_vars_equal(variable, removed))
+
+
+private pure func merge_child_vars(
+	children: List[CancellationOwnershipFacts],
+	selector: pure (CancellationOwnershipFacts) -> List[CoreVar],
+) -> List[CoreVar]:
+	var result: List[CoreVar] = []
+
+	for child in children:
+		result = merge_vars(result, selector(child))
+
+	result
+
+
+private pure func child_facts(
+	children: List[CancellationOwnershipFacts],
+	index: Int,
+) -> CancellationOwnershipFacts:
+	children.get_or(index, EMPTY_OWNERSHIP_FACTS)
+
+
+private pure func max_live_slot_count(counts: List[Int]) -> Int:
+	var result: Int = 0
+
+	for count in counts:
+		if count > result:
+			result = count
+
+	result
+
+
+private pure func call_contract(
+	kind: CoreCallKind,
+	arg_count: Int,
+) -> Option[OwnershipCallContract]:
+	match kind:
+		IntrinsicCall(name):
+			intrinsic_contract(name, arg_count)
+		BuiltinCall(name):
+			builtin_contract(name, arg_count)
+		DirectRuntimeCall(call):
+			builtin_contract(call.name, arg_count)
+		OperationResultCall(bridge):
+			builtin_contract(bridge.builtin_name, arg_count)
+		FallibleStreamTerminalCall(bridge):
+			builtin_contract(bridge.builtin_name, arg_count)
+		TensorParallelCall(name, _):
+			builtin_contract(name, arg_count)
+		DictWithCapacityCall(_):
+			builtin_contract("blorp_dict_with_capacity_custom", arg_count)
+		ListToStringCall(_):
+			builtin_contract("blorp_list_to_string_cb", arg_count)
+		_:
+			None
+
+
+private pure func contract_consumed_arg_indices(contract: OwnershipCallContract) -> List[Int]:
+	var consumed: List[Int] = []
+	var index: Int = 0
+
+	for mode in contract.args:
+		if arg_consumes_caller(mode):
+			consumed = consumed.append(index)
+
+		index += 1
+
+	consumed
+
+
+private pure func consuming_handoff_intrinsic(name: String) -> Bool:
+	[
+		"list_cow",
+		"list_ensure_unique",
+		"list_ensure_capacity",
+		"string_cow",
+		"string_ensure_capacity",
+		"bytes_cow",
+		"dict_cow",
+		"set_cow",
+	].contains(name)
+
+
+private pure func fallback_consumed_arg_indices(kind: CoreCallKind) -> List[Int]:
+	match kind:
+		IntrinsicCall(name):
+			if consuming_handoff_intrinsic(name):
+				[0]
+			else:
+				[]
+		BuiltinCall(name):
+			if TENSOR_RECEIVER_CONSUMING_RUNTIME_CALLS.contains(name):
+				[0]
+			else:
+				[]
+		DirectRuntimeCall(call):
+			if TENSOR_RECEIVER_CONSUMING_RUNTIME_CALLS.contains(call.name):
+				[0]
+			else if call.name == "blorp_stream_fold":
+				[1]
+			else:
+				[]
+		UserCall(_, _, consumed_args):
+			consumed_args
+		_:
+			[]
+
+
+pure func cancellation_call_consumed_arg_indices(kind: CoreCallKind, arg_count: Int) -> List[Int]:
+	match kind:
+		UserCall(_, _, consumed_args):
+			consumed_args
+		_:
+			match call_contract(kind, arg_count):
+				Some(contract):
+					contract_consumed_arg_indices(contract)
+				None:
+					fallback_consumed_arg_indices(kind)
+
+
+private pure func call_kind_is_non_suspending_transfer(kind: CoreCallKind) -> Bool:
+	match kind:
+		IntrinsicCall(name):
+			name == "list_retain_for" or name == "list_set" or name == "list_set_len"
+		BuiltinCall(name):
+			TENSOR_RECEIVER_CONSUMING_RUNTIME_CALLS.contains(name)
+		DirectRuntimeCall(call):
+			TENSOR_RECEIVER_CONSUMING_RUNTIME_CALLS.contains(call.name)
+		_:
+			False
+
+
+private pure func expr_is_var_reference(expr: CoreExpr) -> Option[CoreVar]:
+	match expr:
+		VarExpr(variable, _, _):
+			Some(variable)
+		_:
+			None
+
+
+private pure func optional_var_list(variable: Option[CoreVar]) -> List[CoreVar]:
+	match variable:
+		Some(value):
+			[value]
+		None:
+			[]
+
+
+private pure func collection_equality_type(typ: CoreType) -> Bool:
+	match typ:
+		NamedType(name, args):
+			(
+				name == "List" and args.length() == 1
+				or name == "Dict" and args.length() == 2
+				or name == "Set" and args.length() == 1
+			)
+		_:
+			False
+
+
+private pure func collection_equality_vars(
+	op: CoreBinaryOp,
+	left: CoreExpr,
+	right: CoreExpr,
+) -> List[CoreVar]:
+	if (
+		(op == EqualOp or op == NotEqualOp)
+		and ((
+			collection_equality_type(core_expr_type(left))
+			or collection_equality_type(core_expr_type(right))
+		))
+	):
+		[expr_is_var_reference(left), expr_is_var_reference(right)].flat_map(optional_var_list)
+	else:
+		[]
+
+
+private pure func direct_consumed_call_vars(
+	kind: CoreCallKind,
+	args: List[CoreExpr],
+) -> List[CoreVar]:
+	indices: List[Int] = cancellation_call_consumed_arg_indices(kind, args.length())
+	var variables: List[CoreVar] = []
+	var index: Int = 0
+
+	for arg in args:
+		if indices.contains(index):
+			match expr_is_var_reference(arg):
+				Some(variable):
+					variables = add_var(variables, variable)
+				None:
+					void
+
+		index += 1
+
+	variables
+
+
+private pure func consumed_call_vars_before_suspension(
+	kind: CoreCallKind,
+	args: List[CoreExpr],
+	children: List[CancellationOwnershipFacts],
+) -> List[CoreVar]:
+	indices: List[Int] = cancellation_call_consumed_arg_indices(kind, args.length())
+	var variables: List[CoreVar] = []
+	var prefix_is_non_suspending: Bool = True
+	var index: Int = 0
+
+	for arg in args:
+		if prefix_is_non_suspending and indices.contains(index):
+			match expr_is_var_reference(arg):
+				Some(variable):
+					variables = add_var(variables, variable)
+				None:
+					void
+
+		prefix_is_non_suspending = (
+			prefix_is_non_suspending
+			and child_facts(children, index + 1).non_suspending_transfer
+		)
+
+		index += 1
+
+	variables
+
+
+private pure func match_scrutinee_consumed_var(
+	scrutinee: CoreExpr,
+	release_policy: CoreReleasePolicy,
+) -> List[CoreVar]:
+	if cancellation_cleanup_action_for_release_policy(release_policy).is_some():
+		optional_var_list(expr_is_var_reference(scrutinee))
+	else:
+		[]
+
+
+private pure func analyzed_non_suspending_transfer(
+	expr: CoreExpr,
+	children: List[CancellationOwnershipFacts],
+) -> Bool:
+	match expr:
+		LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _) | VarExpr(_, _, _) | VoidExpr(_, _) | RangeExpr(_, _, _, _):
+			True
+		DebugBlockExpr(_, _, _) | DupExpr(_, _, _, _, _, _) | DropExpr(_, _, _, _, _, _):
+			child_facts(children, 0).non_suspending_transfer
+		CallExpr(kind, _, args, _, _):
+			if not call_kind_is_non_suspending_transfer(kind):
+				False
+			else:
+				var non_suspending: Bool = True
+				var index: Int = 0
+
+				for arg in args:
+					non_suspending = (
+						non_suspending
+						and child_facts(children, index + 1).non_suspending_transfer
+					)
+
+					index += 1
+
+				non_suspending
+		BinaryExpr(_, _, _, _, _) | SeqExpr(_, _):
+			(
+				child_facts(children, 0).non_suspending_transfer
+				and child_facts(children, 1).non_suspending_transfer
+			)
+		UnaryExpr(_, _, _, _) | AssignExpr(_, _, _, _) | CastExpr(_, _, _) | UnboxExpr(_, _, _, _) | FieldExpr(_, _, _, _) | TupleFieldExpr(_, _, _, _):
+			child_facts(children, 0).non_suspending_transfer
+		ListHandoffSetOwnedExpr(_, _, _) | ListHandoffSetSourceSlotExpr(_, _, _) | ListRetainExpr(_, _, _) | ListSetExpr(_, _, _) | ListSwapExpr(_, _, _) | StringByteReadExpr(_, _, _) | StringByteWriteExpr(_, _, _) | StringByteCopyExpr(_, _, _) | StringSetLenExpr(_, _, _) | TensorRawFillExpr(_, _, _) | TensorRawReadExpr(_, _, _) | TensorRawWriteExpr(_, _, _):
+			True
+		_:
+			False
+
+
+private pure func analyzed_consumed_vars(
+	expr: CoreExpr,
+	children: List[CancellationOwnershipFacts],
+) -> List[CoreVar]:
+	match expr:
+		RawMatchExpr(_, _, _, _) | SemanticMatchExpr(_, _, _, _):
+			merge_child_vars(children, func(child): child.consumed)
+		CallExpr(kind, _, args, _, _):
+			direct_consumed_call_vars(kind, args)
+		DebugBlockExpr(_, _, _) | DupExpr(_, _, _, _, _, _):
+			child_facts(children, 0).consumed
+		DropExpr(variable, _, _, _, _, _):
+			add_var(child_facts(children, 0).consumed, variable)
+		LetExpr(variable, _, _, _, _):
+			merge_vars(
+				child_facts(children, 0).consumed,
+				remove_var(child_facts(children, 1).consumed, variable),
+			)
+		BorrowLetExpr(variable, _, _, _):
+			merge_vars(
+				child_facts(children, 0).consumed,
+				remove_var(child_facts(children, 1).consumed, variable),
+			)
+		SeqExpr(_, _):
+			merge_vars(child_facts(children, 0).consumed, child_facts(children, 1).consumed)
+		AccessorLiteralMatchExpr(scrutinee, policy, _, _, _) | LengthMatchExpr(scrutinee, policy, _, _, _) | ConstructorMatchExpr(scrutinee, policy, _, _, _, _):
+			match_scrutinee_consumed_var(scrutinee, policy)
+		AssignExpr(_, rhs, _, _):
+			optional_var_list(expr_is_var_reference(rhs))
+		BinaryExpr(op, left, right, _, _):
+			collection_equality_vars(op, left, right)
+		TupleExpr(_, _, _) | VectorExpr(_, _, _) | DictExpr(_, _, _):
+			merge_child_vars(children, func(child): child.consumed)
+		_:
+			[]
+
+
+private pure func analyzed_consumed_before_suspension_vars(
+	expr: CoreExpr,
+	children: List[CancellationOwnershipFacts],
+) -> List[CoreVar]:
+	match expr:
+		RawMatchExpr(_, _, _, _) | SemanticMatchExpr(_, _, _, _):
+			merge_child_vars(children, func(child): child.consumed_before_suspension)
+		CallExpr(kind, _, args, _, _):
+			consumed_call_vars_before_suspension(kind, args, children)
+		DebugBlockExpr(_, _, _) | DupExpr(_, _, _, _, _, _):
+			child_facts(children, 0).consumed_before_suspension
+		DropExpr(variable, _, _, _, _, _):
+			add_var(child_facts(children, 0).consumed_before_suspension, variable)
+		LetExpr(_, _, _, _, _):
+			rhs: CancellationOwnershipFacts = child_facts(children, 0)
+			body: CancellationOwnershipFacts = child_facts(children, 1)
+
+			if rhs.non_suspending_transfer:
+				merge_vars(rhs.consumed_before_suspension, body.consumed_before_suspension)
+			else:
+				rhs.consumed_before_suspension
+		BorrowLetExpr(variable, _, _, _):
+			rhs: CancellationOwnershipFacts = child_facts(children, 0)
+			body: CancellationOwnershipFacts = child_facts(children, 1)
+
+			if rhs.non_suspending_transfer:
+				merge_vars(
+					rhs.consumed_before_suspension,
+					remove_var(body.consumed_before_suspension, variable),
+				)
+			else:
+				rhs.consumed_before_suspension
+		SeqExpr(_, _):
+			first: CancellationOwnershipFacts = child_facts(children, 0)
+			second: CancellationOwnershipFacts = child_facts(children, 1)
+
+			if first.non_suspending_transfer:
+				merge_vars(first.consumed_before_suspension, second.consumed_before_suspension)
+			else:
+				first.consumed_before_suspension
+		AccessorLiteralMatchExpr(scrutinee, policy, _, _, _) | LengthMatchExpr(scrutinee, policy, _, _, _) | ConstructorMatchExpr(scrutinee, policy, _, _, _, _):
+			match_scrutinee_consumed_var(scrutinee, policy)
+		AssignExpr(_, rhs, _, _):
+			optional_var_list(expr_is_var_reference(rhs))
+		BinaryExpr(op, left, right, _, _):
+			collection_equality_vars(op, left, right)
+		TupleExpr(_, _, _) | VectorExpr(_, _, _) | DictExpr(_, _, _):
+			merge_child_vars(children, func(child): child.consumed_before_suspension)
+		IfExpr(_, _, _, _, _):
+			merge_child_vars(children, func(child): child.consumed)
+		_:
+			[]
+
+
+private pure func analyzed_direct_returns(
+	expr: CoreExpr,
+	children: List[CancellationOwnershipFacts],
+) -> List[CoreVar]:
+	match expr:
+		VarExpr(variable, _, _):
+			[variable]
+		DupExpr(_, _, _, _, _, _) | DropExpr(_, _, _, _, _, _):
+			child_facts(children, 0).direct_returns
+		SeqExpr(_, _):
+			if child_facts(children, 0).non_suspending_transfer:
+				child_facts(children, 1).direct_returns
+			else:
+				[]
+		_:
+			[]
+
+
+private pure func let_cleanup_action(
+	variable: CoreVar,
+	is_mutable: Bool,
+	typ: CoreType,
+	rhs: CoreExpr,
+) -> Option[CancellationCleanupAction]:
+	if variable.name == "_" or is_mutable:
+		None
+	else:
+		match rhs:
+			StaticStringLiteralExpr(_, _, _, _):
+				None
+			_:
+				cancellation_cleanup_action_for_release_policy(
+					CoreTypePolicy.cleanup_release_policy_for_type(typ),
+				)
+
+
+private pure func analyze_current_behavior_expr(
+	expr: CoreExpr,
+	next_site: Int,
+	next_owner: Int,
+) -> CancellationPlanAnalysis:
+	current_site: CancellationSiteId = cancellation_site_id(next_site)
+
+	current_is_let: Bool = match expr:
+		LetExpr(_, _, _, _, _):
+			True
+		_:
+			False
+
+	current_owner: Int = next_owner
+	var child_site: Int = next_site + 1
+
+	var child_owner: Int = if current_is_let:
+		next_owner + 1
+	else:
+		next_owner
+
+	var children: List[CancellationOwnershipFacts] = []
+	var child_live_slots: List[Int] = []
+	var sites: List[CancellationProtectionSite] = []
+	var protections: List[CancellationLetProtection] = []
+
+	for child_expr in CoreTraverse.immediate_core_expr_children(expr):
+		child_analysis: CancellationPlanAnalysis = analyze_current_behavior_expr(
+			child_expr,
+			child_site,
+			child_owner,
+		)
+		children = children.append(child_analysis.facts)
+		child_live_slots = child_live_slots.append(child_analysis.max_live_slots)
+		sites = sites.concat(child_analysis.sites)
+		protections = protections.concat(child_analysis.let_protections)
+		child_site = child_analysis.next_site
+		child_owner = child_analysis.next_owner
+
+	var max_live_slots: Int = max_live_slot_count(child_live_slots)
+
+	match expr:
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			body_facts: CancellationOwnershipFacts = child_facts(children, 1)
+			action: Option[CancellationCleanupAction] = let_cleanup_action(
+				variable,
+				is_mutable,
+				typ,
+				rhs,
+			)
+			body_takes_ownership: Bool = (
+				vars_contain(body_facts.direct_returns, variable)
+				or vars_contain(body_facts.consumed_before_suspension, variable)
+			)
+
+			tracks_cleanup: Bool = action.is_some() and not body_takes_ownership
+			untracks_after_body: Bool = (
+				tracks_cleanup
+				and not vars_contain(body_facts.consumed, variable)
+			)
+
+			owner_id: CancellationOwnerId = cancellation_owner_id(current_owner)
+			slot_id: CancellationSlotId = cancellation_slot_id(current_owner)
+
+			before: List[CancellationProtectionEvent] = match action:
+				Some(cleanup_action):
+					if tracks_cleanup:
+						[TrackCancellationOwner(slot_id, owner_id, cleanup_action)]
+					else:
+						[]
+				None:
+					[]
+
+			after: List[CancellationProtectionEvent] = if untracks_after_body:
+				[UntrackCancellationOwner(slot_id)]
+			else:
+				[]
+
+			sites = [
+				{
+					site_id = current_site,
+					before = before,
+					after = after
+				},
+			].concat(sites)
+			protections = [
+				{
+					variable = variable,
+					owner_id = owner_id,
+					slot_id = slot_id,
+					tracks_cleanup = tracks_cleanup,
+					untracks_after_body = untracks_after_body
+				},
+			].concat(protections)
+
+			body_live_slots: Int = child_live_slots.get_or(1, 0)
+
+			if tracks_cleanup and body_live_slots + 1 > max_live_slots:
+				max_live_slots = body_live_slots + 1
+		_:
+			void
+
+	{
+		facts = {
+			consumed = analyzed_consumed_vars(expr, children),
+			consumed_before_suspension = analyzed_consumed_before_suspension_vars(expr, children),
+			direct_returns = analyzed_direct_returns(expr, children),
+			non_suspending_transfer = analyzed_non_suspending_transfer(expr, children)
+		},
+		sites = sites,
+		let_protections = protections,
+		max_live_slots = max_live_slots,
+		next_site = child_site,
+		next_owner = child_owner
+	}
+
+
+pure func build_current_behavior_cancellation_plan(
+	activation: CancellationActivationIdentity,
+	body: CoreExpr,
+) -> CancellationProtectionPlan:
+	analysis: CancellationPlanAnalysis = analyze_current_behavior_expr(body, 0, 0)
+	var protections_by_uniq: Dict[Int, List[CancellationLetProtection]] = {}
+
+	for protection in analysis.let_protections:
+		bucket: List[CancellationLetProtection] = protections_by_uniq.get_or(
+			protection.variable.uniq,
+			[],
+		)
+		protections_by_uniq = protections_by_uniq.set(
+			protection.variable.uniq,
+			bucket.append(protection),
+		)
+
+	{
+		activation = activation,
+		effect = MayCancelCurrentTask,
+		max_live_slots = analysis.max_live_slots,
+		sites = analysis.sites,
+		let_protections = analysis.let_protections,
+		let_protections_by_uniq = protections_by_uniq,
+		expression_visits = analysis.next_site
+	}
+
+
+pure func build_current_behavior_cancellation_plan_with_summary(
+	activation: CancellationActivationIdentity,
+	body: CoreExpr,
+	summary: CancellationSummary,
+) -> CancellationProtectionPlan:
+	plan: CancellationProtectionPlan = build_current_behavior_cancellation_plan(activation, body)
+	{ plan | effect = cancellation_summary_effect(summary) }
+
+
+pure func cancellation_let_protection(
+	plan: CancellationProtectionPlan,
+	variable: CoreVar,
+) -> Option[CancellationLetProtection]:
+	plan.let_protections_by_uniq
+		.get_or(variable.uniq, [])
+		.find(func(decision): core_vars_equal(decision.variable, variable))
+
+
+pure func cancellation_backend_temporary_candidate(
+	plan: CancellationProtectionPlan,
+	temporary_index: Int,
+	role: BackendCleanupTemporaryRole,
+	policy: CoreReleasePolicy,
+	boxed_temporary_needs_release: Bool,
+	transfers_ownership: Bool,
+) -> Option[CancellationCleanupCandidate]:
+	action ?= cancellation_cleanup_action_for_release_policy(policy)
+
+	if boxed_temporary_needs_release or transfers_ownership:
+		identity_index: Int = plan.let_protections.length() + temporary_index
+		Some({
+			activation = plan.activation,
+			id = cancellation_owner_id(identity_index),
+			owner = BackendTemporaryCancellationOwner(
+				cancellation_site_id(plan.expression_visits + temporary_index),
+				role,
+			),
+			slot = cancellation_slot_id(identity_index),
+			action = action,
+		})
+	else:
+		None
+
+
+enum CoreCancellationEffect:
+	CannotCancelCurrentTask
+	MayCancelCurrentTask
+
+
+enum CancellationHandoffContract:
+	CallerProtectsThroughCall
+	CalleeOwnsAtEntry
+
+
+union CancellationReason:
+	ExplicitCancellationCheckpoint
+	BuiltinCancellationPoint(String)
+	TransitiveCallBoundary
+	StructuredCancellationBoundary
+	UnknownCallBoundary
+	ForeignCallBoundary
+	ClosureCallBoundary
+	DeferredTraitCallBoundary
+	UnknownRuntimeCallBoundary(String)
+	RuntimeBridgeBoundary
+	DetachedTaskBoundary
+
+
+implements Equatable for CancellationReason:
+	pure func equals(left: CancellationReason, right: CancellationReason) -> Bool:
+		match (left, right):
+			(ExplicitCancellationCheckpoint, ExplicitCancellationCheckpoint):
+				True
+			(BuiltinCancellationPoint(left_name), BuiltinCancellationPoint(right_name)):
+				left_name == right_name
+			(TransitiveCallBoundary, TransitiveCallBoundary):
+				True
+			(StructuredCancellationBoundary, StructuredCancellationBoundary):
+				True
+			(UnknownCallBoundary, UnknownCallBoundary):
+				True
+			(ForeignCallBoundary, ForeignCallBoundary):
+				True
+			(ClosureCallBoundary, ClosureCallBoundary):
+				True
+			(DeferredTraitCallBoundary, DeferredTraitCallBoundary):
+				True
+			(UnknownRuntimeCallBoundary(left_name), UnknownRuntimeCallBoundary(right_name)):
+				left_name == right_name
+			(RuntimeBridgeBoundary, RuntimeBridgeBoundary):
+				True
+			(DetachedTaskBoundary, DetachedTaskBoundary):
+				True
+			_:
+				False
+
+
+record CancellationSummary {
+	reasons: List[CancellationReason]
+}
+
+
+record CancellationFunctionSummary {
+	identity: CoreDefinitionIdentity,
+	summary: CancellationSummary
+}
+
+
+record CancellationGlobalInitializerSummary {
+	identity: CoreDefinitionIdentity,
+	summary: CancellationSummary
+}
+
+
+record CancellationProgramSummary {
+	functions: List[CancellationFunctionSummary],
+	global_initializers: List[CancellationGlobalInitializerSummary],
+	functions_by_def_id: Dict[Int, CancellationFunctionSummary],
+	global_initializers_by_def_id: Dict[Int, CancellationGlobalInitializerSummary]
+}
+
+
+private record CancellationCallableFacts {
+	identity: CoreDefinitionIdentity,
+	local_summary: CancellationSummary,
+	callees: List[CoreDefinitionIdentity]
+}
+
+
+private record CancellationExprFacts {
+	local_summary: CancellationSummary,
+	callees: List[CoreDefinitionIdentity]
+}
+
+
+private record CancellationIdentityIndex {
+	by_def_id: Dict[Int, CoreDefinitionIdentity],
+	collisions_by_def_id: Dict[Int, Bool]
+}
+
+
+private union CancellationCallEffect:
+	NonCancellingCall
+	CancellingCall(CancellationReason)
+	CallableCall(CoreDefinitionIdentity)
+
+
+private NO_CANCELLATION: CancellationSummary = {reasons = []}
+
+
+pure func cancellation_summary_effect(summary: CancellationSummary) -> CoreCancellationEffect:
+	if summary.reasons.is_empty():
+		CannotCancelCurrentTask
+	else:
+		MayCancelCurrentTask
+
+
+pure func cancellation_effect_may_cancel(summary: CancellationSummary) -> Bool:
+	match cancellation_summary_effect(summary):
+		CannotCancelCurrentTask:
+			False
+		MayCancelCurrentTask:
+			True
+
+
+pure func cancellation_plan_requires_local_owner_protection(
+	plan: CancellationProtectionPlan,
+) -> Bool:
+	match plan.effect:
+		CannotCancelCurrentTask:
+			False
+		MayCancelCurrentTask:
+			True
+
+
+private pure func definition_identities_equal(
+	left: CoreDefinitionIdentity,
+	right: CoreDefinitionIdentity,
+) -> Bool:
+	left.name == right.name and left.def_id == right.def_id
+
+
+private pure func add_cancellation_reason(
+	summary: CancellationSummary,
+	reason: CancellationReason,
+) -> CancellationSummary:
+	if summary.reasons.contains(reason):
+		summary
+	else:
+		{reasons = summary.reasons.append(reason)}
+
+
+private pure func add_callee(
+	callees: List[CoreDefinitionIdentity],
+	callee: CoreDefinitionIdentity,
+) -> List[CoreDefinitionIdentity]:
+	if callees.any(func(existing): definition_identities_equal(existing, callee)):
+		callees
+	else:
+		callees.append(callee)
+
+
+private pure func identity_index(
+	identities: List[CoreDefinitionIdentity],
+) -> CancellationIdentityIndex:
+	var by_def_id: Dict[Int, CoreDefinitionIdentity] = {}
+	var collisions_by_def_id: Dict[Int, Bool] = {}
+
+	for identity in identities:
+		match by_def_id.get(identity.def_id):
+			None:
+				by_def_id = by_def_id.set(identity.def_id, identity)
+			Some(_):
+				-- Definition-ID collisions are invalid prepared Core. Keep the
+				-- cancellation analysis fail-closed until invariants report them.
+				collisions_by_def_id = collisions_by_def_id.set(identity.def_id, True)
+
+	{
+		by_def_id = by_def_id,
+		collisions_by_def_id = collisions_by_def_id
+	}
+
+
+private pure func unique_identity_for_def_id(
+	identities: CancellationIdentityIndex,
+	def_id: Int,
+) -> Option[CoreDefinitionIdentity]:
+	if identities.collisions_by_def_id.get_or(def_id, False):
+		None
+	else:
+		identities.by_def_id.get(def_id)
+
+
+private pure func named_identity_for_def_id(
+	identities: CancellationIdentityIndex,
+	name: String,
+	def_id: Int,
+) -> Option[CoreDefinitionIdentity]:
+	match unique_identity_for_def_id(identities, def_id):
+		Some(identity):
+			if identity.name == name:
+				Some(identity)
+			else:
+				None
+		None:
+			None
+
+
+private pure func classified_builtin_call(name: String) -> CancellationCallEffect:
+	if builtin_is_cancellation_point(name):
+		CancellingCall(BuiltinCancellationPoint(name))
+	else if builtin_is_registered(name):
+		NonCancellingCall
+	else:
+		CancellingCall(UnknownCallBoundary)
+
+
+private pure func classify_call(
+	kind: CoreCallKind,
+	identities: CancellationIdentityIndex,
+) -> CancellationCallEffect:
+	match kind:
+		BuiltinCall(name):
+			classified_builtin_call(name)
+		DirectRuntimeCall(call):
+			if builtin_is_cancellation_point(call.name):
+				CancellingCall(BuiltinCancellationPoint(call.name))
+			else if builtin_is_registered(call.name):
+				NonCancellingCall
+			else:
+				CancellingCall(UnknownRuntimeCallBoundary(call.name))
+		SelectedDirectCall(def_id) | SelectedTraitCall(_, _, _, def_id):
+			match unique_identity_for_def_id(identities, def_id):
+				Some(identity):
+					CallableCall(identity)
+				None:
+					CancellingCall(UnknownCallBoundary)
+		UserCall(name, Some(def_id), _):
+			match named_identity_for_def_id(identities, name, def_id):
+				Some(identity):
+					CallableCall(identity)
+				None:
+					CancellingCall(UnknownCallBoundary)
+		UserCall(_, None, _) | UnknownCall:
+			CancellingCall(UnknownCallBoundary)
+		ForeignCall(_, _):
+			CancellingCall(ForeignCallBoundary)
+		ClosureCall:
+			CancellingCall(ClosureCallBoundary)
+		DeferredTraitCall(_, _):
+			CancellingCall(DeferredTraitCallBoundary)
+		OperationResultCall(_) | FallibleStreamTerminalCall(_) | TensorParallelCall(_, _):
+			CancellingCall(RuntimeBridgeBoundary)
+		DictWithCapacityCall(_) | ListToStringCall(_) | IntrinsicCall(_):
+			NonCancellingCall
+
+
+private pure func expression_cancellation_facts(
+	root: CoreExpr,
+	identities: CancellationIdentityIndex,
+) -> CancellationExprFacts:
+	var summary: CancellationSummary = NO_CANCELLATION
+	var callees: List[CoreDefinitionIdentity] = []
+	var pending: List[CoreExpr] = [root]
+	var cursor: Int = 0
+
+	while cursor < pending.length():
+		expr: CoreExpr = pending.get_or(cursor, root)
+
+		match expr:
+			CooperativeCheckpointExpr(_, _):
+				summary = add_cancellation_reason(summary, ExplicitCancellationCheckpoint)
+			CallExpr(kind, _, _, _, _):
+				match classify_call(kind, identities):
+					NonCancellingCall:
+						void
+					CancellingCall(reason):
+						summary = add_cancellation_reason(summary, reason)
+					CallableCall(identity):
+						callees = add_callee(callees, identity)
+			ForChannelExpr(_, _, _) | ForStreamExpr(_, _, _) | PreClosureConcurrentlyLoopExpr(_, _, _) | ConcurrentlyLoopExpr(_, _, _) | PreClosureConcurrentExpr(_, _, _) | ConcurrentExpr(_, _, _) | SelectExpr(_, _, _):
+				summary = add_cancellation_reason(summary, StructuredCancellationBoundary)
+			PreClosureDetachExpr(_, _, _) | DetachExpr(_, _, _):
+				summary = add_cancellation_reason(summary, DetachedTaskBoundary)
+			_:
+				void
+
+		for child in CoreTraverse.immediate_core_expr_children(expr):
+			pending = pending.append(child)
+
+		cursor += 1
+
+	{
+		local_summary = summary,
+		callees = callees
+	}
+
+
+private pure func program_functions(program: CoreProgram) -> List[CoreFunction]:
+	var functions: List[CoreFunction] = []
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				functions = functions.append(function_info)
+			ImplDecl(implementation):
+				functions = functions.concat(implementation.methods)
+			_:
+				void
+
+	functions
+
+
+private pure func function_identity(function_info: CoreFunction) -> CoreDefinitionIdentity:
+	{
+		name = function_info.name,
+		def_id = function_info.def_id
+	}
+
+
+private pure func callable_facts(
+	function_info: CoreFunction,
+	identities: CancellationIdentityIndex,
+) -> CancellationCallableFacts:
+	identity: CoreDefinitionIdentity = function_identity(function_info)
+
+	match function_info.body:
+		Some(body):
+			facts: CancellationExprFacts = expression_cancellation_facts(body, identities)
+			{
+				identity = identity,
+				local_summary = facts.local_summary,
+				callees = facts.callees
+			}
+		None:
+			{
+				identity = identity,
+				local_summary = {reasons = [UnknownCallBoundary]},
+				callees = []
+			}
+
+
+private pure func summary_for_def_id(
+	summaries: Dict[Int, CancellationSummary],
+	def_id: Int,
+) -> CancellationSummary:
+	summaries
+		.get(def_id)
+		.get_or({reasons = [UnknownCallBoundary]})
+
+
+private pure func resolved_callable_summary(
+	facts: CancellationCallableFacts,
+	summaries: Dict[Int, CancellationSummary],
+) -> CancellationSummary:
+	var summary: CancellationSummary = facts.local_summary
+
+	for callee in facts.callees:
+		if cancellation_effect_may_cancel(summary_for_def_id(summaries, callee.def_id)):
+			summary = add_cancellation_reason(summary, TransitiveCallBoundary)
+			break
+
+	summary
+
+
+private pure func analyze_function_cancellation(
+	functions: List[CoreFunction],
+) -> List[CancellationFunctionSummary]:
+	identities: CancellationIdentityIndex = identity_index(functions.map(function_identity))
+	facts: List[CancellationCallableFacts] = functions.map(
+		func(function_info): callable_facts(function_info, identities),
+	)
+	var summaries: Dict[Int, CancellationSummary] = {}
+	var callers_by_def_id: Dict[Int, List[CancellationCallableFacts]] = {}
+
+	for entry in facts:
+		summaries = summaries.set(entry.identity.def_id, entry.local_summary)
+
+		for callee in entry.callees:
+			callers: List[CancellationCallableFacts] = callers_by_def_id.get_or(callee.def_id, [])
+			callers_by_def_id = callers_by_def_id.set(
+				callee.def_id,
+				callers.append(entry),
+			)
+
+	var pending: List[CancellationCallableFacts] = facts
+	var cursor: Int = 0
+
+	while cursor < pending.length():
+		match pending.get(cursor):
+			Some(entry):
+				next_summary: CancellationSummary = resolved_callable_summary(entry, summaries)
+				previous: CancellationSummary = summary_for_def_id(summaries, entry.identity.def_id)
+
+				if previous.reasons != next_summary.reasons:
+					summaries = summaries.set(entry.identity.def_id, next_summary)
+					pending = pending.concat(callers_by_def_id.get_or(entry.identity.def_id, []))
+			None:
+				break
+
+		cursor += 1
+
+	var results: List[CancellationFunctionSummary] = []
+
+	for entry in facts:
+		result: CancellationFunctionSummary = {
+			identity = entry.identity,
+			summary = summary_for_def_id(summaries, entry.identity.def_id)
+		}
+		results = results.append(result)
+
+	results
+
+
+private pure func global_initializer_summary(
+	global: CoreGlobal,
+	identities: CancellationIdentityIndex,
+	function_summaries: Dict[Int, CancellationSummary],
+) -> CancellationGlobalInitializerSummary:
+	facts: CancellationExprFacts = expression_cancellation_facts(global.init, identities)
+	var summary: CancellationSummary = facts.local_summary
+
+	for callee in facts.callees:
+		if cancellation_effect_may_cancel(summary_for_def_id(function_summaries, callee.def_id)):
+			summary = add_cancellation_reason(summary, TransitiveCallBoundary)
+			break
+
+	{
+		identity = {
+			name = global.name.name,
+			def_id = global.def_id
+		},
+		summary = summary
+	}
+
+
+pure func analyze_program_cancellation(program: CoreProgram) -> CancellationProgramSummary:
+	functions: List[CoreFunction] = program_functions(program)
+	function_results: List[CancellationFunctionSummary] = analyze_function_cancellation(functions)
+	identities: CancellationIdentityIndex = identity_index(functions.map(function_identity))
+	var summaries_by_def_id: Dict[Int, CancellationSummary] = {}
+	var function_results_by_def_id: Dict[Int, CancellationFunctionSummary] = {}
+
+	for result in function_results:
+		summaries_by_def_id = summaries_by_def_id.set(result.identity.def_id, result.summary)
+		function_results_by_def_id = function_results_by_def_id.set(result.identity.def_id, result)
+
+	var global_results: List[CancellationGlobalInitializerSummary] = []
+	var global_results_by_def_id: Dict[Int, CancellationGlobalInitializerSummary] = {}
+
+	for decl in program.decls:
+		match decl:
+			GlobalDecl(global):
+				result: CancellationGlobalInitializerSummary = global_initializer_summary(
+					global,
+					identities,
+					summaries_by_def_id,
+				)
+				global_results = global_results.append(result)
+				global_results_by_def_id = global_results_by_def_id.set(
+					result.identity.def_id,
+					result,
+				)
+			_:
+				void
+
+	{
+		functions = function_results,
+		global_initializers = global_results,
+		functions_by_def_id = function_results_by_def_id,
+		global_initializers_by_def_id = global_results_by_def_id
+	}
+
+
+pure func cancellation_function_summary(
+	program_summary: CancellationProgramSummary,
+	identity: CoreDefinitionIdentity,
+) -> Option[CancellationSummary]:
+	program_summary.functions_by_def_id
+		.get(identity.def_id)
+		.filter(func(entry): definition_identities_equal(entry.identity, identity))
+		.map(func(entry): entry.summary)
+
+
+pure func cancellation_global_initializer_summary(
+	program_summary: CancellationProgramSummary,
+	identity: CoreDefinitionIdentity,
+) -> Option[CancellationSummary]:
+	program_summary.global_initializers_by_def_id
+		.get(identity.def_id)
+		.filter(func(entry): definition_identities_equal(entry.identity, identity))
+		.map(func(entry): entry.summary)

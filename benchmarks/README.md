@@ -1138,6 +1138,13 @@ An untimed inspection request also reports expression and ownership-event
 censuses, plus artifact hashes, for ownership-ready, post-Perceus, post-reuse,
 and prepared Core.
 
+For end-to-end emission, `generated_c_ownership_census` also reports cleanup
+frame declarations, cleanup-scope guards, and cleanup push/pop/duplicate calls.
+These metrics provide the deterministic generated-C census used by the
+cancellation-cleanup optimization roadmap; compare their values together with
+`generated_c_bytes`, elapsed time, and peak memory rather than counting source
+text with ad hoc shell patterns.
+
 Logical counters come from a separately compiled `--debug --profile` worker.
 Normal builds erase all marker calls through `debug:` blocks. The runner executes
 the counter worker twice, requires identical counter maps, and rejects any Core

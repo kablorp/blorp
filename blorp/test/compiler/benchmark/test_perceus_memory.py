@@ -98,6 +98,8 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
 
     def test_generated_c_ownership_census_separates_operation_kinds(self) -> None:
         census = self.benchmark.generated_c_ownership_census(
+            "blorp_CancelCleanupFrame cleanup; "
+            "BLORP_TASK_CLEANUP_SCOPE(cleanup); "
             "blorp_retain(x); blorp_release(x); blorp_release_arc_only(y); "
             "blorp_task_cleanup_push(a); blorp_task_cleanup_pop_slot(b); "
             "blorp_task_cleanup_duplicate_slot(c); "
@@ -108,6 +110,8 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
         )
 
         self.assertEqual(census, {
+            "cleanup_frame_declarations": 1,
+            "cleanup_scope_guards": 1,
             "retain_calls": 1,
             "release_calls": 1,
             "release_arc_only_calls": 1,
