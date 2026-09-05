@@ -6,15 +6,12 @@ import:
 		FrontendGraphError,
 		FrontendImportEdge,
 		FrontendModule,
-		FrontendModuleId,
 		frontend_graph,
 		frontend_graph_error_message,
-		frontend_graph_find_module_id,
-		frontend_graph_module,
-		frontend_graph_module_ids,
-		frontend_graph_reference,
-		frontend_graph_reference_ids,
-	loaded_module: ResolvedModuleIdentity, resolved_module_canonical_path
+	loaded_module:
+		ResolvedModuleIdentity,
+		resolved_module_canonical_path,
+		resolved_module_identity_storage_key,
 
 
 union FrontendGraphServiceError:
@@ -41,8 +38,20 @@ union FrontendDiscoveryError:
 	FrontendDiscoveryGraphFailed(List[FrontendGraphServiceError])
 
 
-private pure func import_outcome_count(counts: Dict[String, Int], requested_path: String) -> Int:
-	match counts.get(requested_path):
+private record FrontendImportValidation {
+	outcome_counts: Dict[String, Int],
+	undeclared_errors: List[FrontendGraphServiceError]
+}
+
+
+private pure func import_fact_key(identity_key: String, requested_path: String) -> String:
+	identity_key
+		.length()
+		.to_string() + ":" + identity_key + requested_path
+
+
+private pure func import_outcome_count(counts: Dict[String, Int], fact_key: String) -> Int:
+	match counts.get(fact_key):
 		Some(found):
 			found
 		None:
@@ -95,79 +104,72 @@ pure func frontend_discovery_error_message(error: FrontendDiscoveryError) -> Str
 				.join("\n")
 
 
-private pure func import_outcome_errors_for_module(
-	graph: FrontendGraph,
-	module_id: FrontendModuleId,
-	module: FrontendModule,
-) -> List[FrontendGraphServiceError]:
-	var declared_counts: Dict[String, Int] = {}
-	var outcome_counts: Dict[String, Int] = {}
-	var errors: List[FrontendGraphServiceError] = []
-	var visited_counts: Dict[String, Int] = {}
-
-	for requested_path in module.surface.import_paths:
-		declared_counts = declared_counts.set(
-			requested_path,
-			import_outcome_count(declared_counts, requested_path) + 1,
-		)
-
-	for reference_id in frontend_graph_reference_ids(graph, module_id):
-		match frontend_graph_reference(graph, reference_id):
-			Some(reference):
-				outcome_counts = outcome_counts.set(
-					reference.requested_path,
-					import_outcome_count(outcome_counts, reference.requested_path) + 1,
-				)
-			None:
-				void
-
-	for requested_path in module.surface.import_paths:
-		visited_count = import_outcome_count(visited_counts, requested_path)
-		count = import_outcome_count(outcome_counts, requested_path)
-		declared_count = import_outcome_count(declared_counts, requested_path)
-
-		if visited_count >= count:
-			errors = errors.append(
-				MissingCompilerFrontendImportOutcome(
-					module.identity,
-					requested_path,
-				),
-			)
-		else if visited_count == 0 and count > declared_count:
-			errors = errors.append(
-				DuplicateCompilerFrontendImportOutcome(
-					module.identity,
-					requested_path,
-				),
-			)
-
-		visited_counts = visited_counts.set(requested_path, visited_count + 1)
-
-	errors
-
-
-private pure func undeclared_import_outcome_errors(
-	graph: FrontendGraph,
+private pure func frontend_import_validation(
+	modules: List[FrontendModule],
 	edges: List[FrontendImportEdge],
-) -> List[FrontendGraphServiceError]:
-	var errors: List[FrontendGraphServiceError] = []
+) -> FrontendImportValidation:
+	var declared_imports: Dict[String, Bool] = {}
+	var outcome_counts: Dict[String, Int] = {}
+	var undeclared_errors: List[FrontendGraphServiceError] = []
+
+	for module in modules:
+		identity_key = resolved_module_identity_storage_key(module.identity)
+
+		for requested_path in module.surface.import_paths:
+			declared_imports = declared_imports.set(
+				import_fact_key(identity_key, requested_path),
+				True,
+			)
 
 	for edge in edges:
-		match frontend_graph_find_module_id(graph, edge.importer):
-			Some(module_id):
-				match frontend_graph_module(graph, module_id):
-					Some(module):
-						if not module.surface.import_paths.contains(edge.requested_path):
-							errors = errors.append(
-								UndeclaredCompilerFrontendImportOutcome(
-									edge.importer,
-									edge.requested_path,
-								),
-							)
-					None:
-						void
-			None:
-				void
+		identity_key = resolved_module_identity_storage_key(edge.importer)
+		fact_key = import_fact_key(identity_key, edge.requested_path)
+		count = import_outcome_count(outcome_counts, fact_key)
+		outcome_counts = outcome_counts.set(fact_key, count + 1)
+
+		if not declared_imports.contains(fact_key):
+			undeclared_errors = undeclared_errors.append(
+				UndeclaredCompilerFrontendImportOutcome(
+					edge.importer,
+					edge.requested_path,
+				),
+			)
+
+	{
+		outcome_counts = outcome_counts,
+		undeclared_errors = undeclared_errors
+	}
+
+
+private pure func import_outcome_errors(
+	modules: List[FrontendModule],
+	validation: FrontendImportValidation,
+) -> List[FrontendGraphServiceError]:
+	var errors: List[FrontendGraphServiceError] = []
+
+	for module in modules:
+		identity_key = resolved_module_identity_storage_key(module.identity)
+
+		for requested_path in module.surface.import_paths:
+			count = import_outcome_count(
+				validation.outcome_counts,
+				import_fact_key(identity_key, requested_path),
+			)
+
+			if count == 0:
+				errors = errors.append(
+					MissingCompilerFrontendImportOutcome(
+						module.identity,
+						requested_path,
+					),
+				)
+			else if count > 1:
+				errors = errors.append(
+					DuplicateCompilerFrontendImportOutcome(
+						module.identity,
+						requested_path,
+					),
+				)
 
 	errors
 
@@ -181,22 +183,11 @@ pure func validated_frontend_graph_for_modules(
 		Err(errors):
 			Err([FrontendGraphValidationFailed(errors)])
 		Ok(graph):
-			var errors: List[FrontendGraphServiceError] = []
-
-			for module_id in frontend_graph_module_ids(graph):
-				match frontend_graph_module(graph, module_id):
-					Some(module):
-						errors = errors.concat(
-							import_outcome_errors_for_module(
-								graph,
-								module_id,
-								module,
-							),
-						)
-					None:
-						void
-
-			errors = errors.concat(undeclared_import_outcome_errors(graph, import_edges))
+			validation = frontend_import_validation(modules, import_edges)
+			errors = import_outcome_errors(
+				modules,
+				validation,
+			).concat(validation.undeclared_errors)
 
 			if errors.length() > 0:
 				Err(errors)
