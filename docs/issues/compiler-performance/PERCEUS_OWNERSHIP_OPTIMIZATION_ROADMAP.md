@@ -148,7 +148,8 @@ The implementation must preserve the ownership ABI in
 4. ARC operations may affect COW uniqueness and are not generally cancellable
    as an adjacent retain/release peephole;
 5. cancellation is a nonlocal exit and must be represented in lifetime facts;
-6. strings remain mortal managed allocations under the current storage model;
+6. dynamically constructed strings are mortal managed allocations, while
+   `StaticStringLiteralExpr` values are artifact-lifetime immortal data;
 7. other phases also produce `DupExpr` and `DropExpr`; and
 8. reuse may consume a `DropExpr` as its proof that a record owner is dead.
 

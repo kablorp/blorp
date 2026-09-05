@@ -343,8 +343,8 @@ BLORP_RECORD_UPDATE_SKIP_BUILD=1 \
 `compiler_record_update_nested_match_allocations` exercises the projected
 decision tree for nested constructor and literal patterns. Every nested leaf
 must transfer the same mutable owner before the compiler can reuse it. The
-record includes managed `String` fields so the probe also checks that retained
-field aliases do not force fresh record allocations.
+record includes static `String` literal fields so the probe also checks that
+field aliases do not force fresh record allocations or dynamic string storage.
 
 ```bash
 benchmarks/compiler_record_update_nested_match_allocations

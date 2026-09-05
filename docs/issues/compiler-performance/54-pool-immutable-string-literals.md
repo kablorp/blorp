@@ -1,6 +1,6 @@
 # Pool Immutable String Literals As Static Artifact Data
 
-**Status:** Proposed
+**Status:** Implemented
 
 ## Objective
 
@@ -13,6 +13,39 @@ This is a deliberate change to Blorp's current ownership/storage contract.
 Today strings are always mortal managed allocations. The implementation must
 update that contract coherently; it must not quietly restore the former lazy
 cached-literal helper.
+
+## Implementation result
+
+The implementation adds one deterministic post-`consume_specialize` Core pass,
+preserves the assigned IDs through ownership and late Core, validates the pool
+at the backend boundary, and emits static objects using the runtime's exact
+`blorp_String` type.
+Perceus and C emission omit literal-attributable ARC and cancellation cleanup;
+the runtime's existing immortal/COW behavior protects the static bytes.
+
+A controlled self-host census compiled identical current source with the
+pinned bootstrap and optimized candidate compilers using identical
+`--no-format --no-embed-runtime` flags:
+
+| Measurement | Direct parent | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Generated C lines | 1,419,845 | 1,295,688 | -8.74% |
+| Generated C bytes | 100,728,611 | 91,509,015 | -9.15% |
+| Dynamic string construction sites | 25,244 | 991 | -96.07% |
+| Distinct static literal objects | 0 | 6,964 | +6,964 |
+| Static literal references | 0 | 24,253 | +24,253 |
+| `blorp_retain(...)` sites | 50,181 | 50,176 | -0.01% |
+| `blorp_release(...)` sites | 74,331 | 63,448 | -14.64% |
+| `blorp_release_arc_only(...)` sites | 2,245 | 1,635 | -27.17% |
+| Cancellation cleanup scopes | 48,305 | 35,579 | -26.35% |
+| Self-host C emission wall time | 33.10s | 32.76s | -1.01% |
+| Native `cc -O2` wall time | 86.16s | 79.55s | -7.67% |
+| Native `cc -O2` peak RSS | 6.31 GiB | 5.68 GiB | -9.97% |
+
+The remaining 991 construction sites are dynamic compiler/runtime operations,
+not direct value-position `LiteralExpr(StringLiteral(...))` emission. Timings
+are single local macOS arm64 observations; the structural counts are the stable
+acceptance measurements.
 
 ## Current problem
 
@@ -158,12 +191,8 @@ pool does not replace dynamic-call lines with many initializer lines:
 
 ```c
 #define BLORP_STATIC_STRING(name, length, bytes) \
-    static struct { \
-        blorp_Object header; \
-        long len; \
-        long capacity; \
-        char data[(length) + 1]; \
-    } name = { \
+    _Static_assert(sizeof(bytes) == (length) + 1, "string literal byte length"); \
+    static blorp_String name = { \
         .header = { BLORP_IMMORTAL_REFCOUNT, BLORP_ALLOC_CLASS_DIRECT, 0 }, \
         .len = (length), \
         .capacity = (length), \
@@ -172,11 +201,13 @@ pool does not replace dynamic-call lines with many initializer lines:
 
 BLORP_STATIC_STRING(__blorp_string_literal_17, 3L, "a\000b");
 
-#define BLORP_STRING_LITERAL_17 \
-    ((blorp_String*)&__blorp_string_literal_17)
+#define BLORP_STRING_LITERAL_17 (&__blorp_string_literal_17)
 ```
 
-The macro is illustrative; a direct cast at use sites is also acceptable.
+The emitted definition uses the runtime's actual flexible-array type, which
+avoids a backing-struct cast and any global strict-aliasing exception. The
+supported Clang/GCC C toolchains allocate the initialized trailing bytes in
+static storage. A redundant cast at use sites is harmless.
 Required properties:
 
 - storage layout is ABI-compatible with `blorp_String` (`header`, byte length,

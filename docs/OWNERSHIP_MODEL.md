@@ -55,6 +55,7 @@ layout fact.
 | `FreshOwned` | A newly allocated owned value with runtime uniqueness |
 | `Borrowed` | A temporary read owned elsewhere; it must not be dropped |
 | `Alias(owner)` | A borrowed projection whose lifetime depends on another owner |
+| `StaticImmortal` | Artifact-lifetime immutable storage that needs no runtime ownership operation |
 | `Retained` | A new owner created by incrementing the source reference count |
 | `Consumed` | Ownership transferred into an operation; the caller cannot drop it afterward |
 | `Transferred` | Ownership moved into another owner without an extra retain |
@@ -68,7 +69,8 @@ definition numbers can collide across modules.
 
 Every managed expression result has one of these source contracts:
 
-- a literal or allocation normally produces `FreshOwned`;
+- a dynamic allocation produces `FreshOwned`;
+- an immutable string literal produces `StaticImmortal`;
 - a local or global read is borrowed from its storage place;
 - a field or collection projection is an alias of its container owner;
 - a caller-preserving operation returns ownership according to its explicit
@@ -110,7 +112,11 @@ consuming source operation.
 Direct user calls use exact callable identities and inferred or declared
 contracts. Builtins and intrinsics use the typed contract tables in
 `ownership.brp`. Foreign calls remain a trust boundary and must receive an
-explicit conservative contract rather than a name heuristic.
+explicit conservative contract rather than a name heuristic. Static string
+literals may cross ordinary borrow, retain, or consume slots because their
+runtime ARC operations are defined no-ops. A foreign API that can mutate a
+string or keep an untracked pointer beyond Blorp's ownership ABI must receive
+an explicit mortal copy; arbitrary C must never write pooled storage.
 
 ## Source Function Boundary
 
@@ -211,24 +217,29 @@ Pure immutable global initializers are evaluated before Core lowering. The
 backend selects one of three storage classes:
 
 1. Inline C data for values with no runtime ownership.
-2. Static immortal storage for recursively static, string-free object graphs.
-3. Ordinary managed startup values for strings or graphs requiring runtime
-   construction.
+2. Static immortal storage for immutable string literals and recursively static
+   object graphs supported by the backend.
+3. Ordinary managed startup values for graphs requiring runtime construction.
 
-Strings are always mortal managed allocations. String globals and aggregate
-globals containing strings are initialized once, owned by generated global
-roots, and released in reverse initialization order at shutdown. Reads are
-borrowed and are retained before escaping.
+Value-position string literals are interned by exact bytes at the
+post-specialization Core boundary. Each distinct literal has one statically
+initialized, artifact-lifetime `blorp_String` object. Literal values require no
+retain, release, cancellation cleanup, allocation accounting, or global
+shutdown cleanup. Dynamically constructed strings remain mortal managed
+allocations. Aggregate globals containing strings may still require ordinary
+managed construction and cleanup for the outer graph, while their literal
+children point to the static pool.
 
-Static immortal objects may include scalar data, compatible fixed-width lists,
-string-free records/tuples/concrete unions, fieldless constructor singletons,
-and zero-capture closure descriptors. They must never contain a pointer to a
-mortal object. Unsupported static children fail closed to ordinary managed
-initialization.
+Static immortal objects may include literal strings, scalar data, compatible
+fixed-width lists, string-free records/tuples/concrete unions, fieldless
+constructor singletons, and zero-capture closure descriptors. They must never
+contain a pointer to a mortal object. Unsupported static children fail closed
+to ordinary managed initialization.
 
 Required invariants:
 
-- every heap string remains visible to profiling and leak checking;
+- every dynamically allocated string remains visible to profiling and leak checking;
+- static string literals remain absent from allocation and leak counts;
 - static objects contain only recursively static children;
 - global reassignment releases the previous managed owner;
 - generated global cleanup runs in reverse initialization order; and

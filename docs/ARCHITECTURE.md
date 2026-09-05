@@ -265,6 +265,7 @@ lower + ffi_boundary + list_layout
   -> function-reference adaptation + tensor_specialize + specialize
   -> callable resolution + backend projection + match projection + dce
   -> consume_specialize
+  -> static_string_literals
   -> record-update ownership lowering + dictionary ownership preparation
   -> perceus
   -> reuse

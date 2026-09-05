@@ -107,6 +107,7 @@ import:
 			ResourceScopeExpr,
 			SelectExpr,
 			SeqExpr,
+			StaticStringLiteralExpr,
 			StringByteCopyExpr,
 			StringByteReadExpr,
 			StringByteWriteExpr,
@@ -3909,6 +3910,8 @@ private pure func summarize_linear_ownership_uses_non_binding(
 				NO_OWNERSHIP_USES
 		LiteralExpr(literal, typ, loc):
 			NO_OWNERSHIP_USES
+		StaticStringLiteralExpr(id, value, typ, loc):
+			NO_OWNERSHIP_USES
 		VoidExpr(typ, loc):
 			NO_OWNERSHIP_USES
 		DebugBlockExpr(body, typ, loc):
@@ -4679,6 +4682,8 @@ pure func count_uses(name: String, expr: CoreExpr) -> Int:
 			else:
 				0
 		LiteralExpr(literal, typ, loc):
+			0
+		StaticStringLiteralExpr(id, value, typ, loc):
 			0
 		VoidExpr(typ, loc):
 			0
@@ -13771,6 +13776,8 @@ private pure func is_owned_temporary_with_names(
 				False
 			LiteralExpr(StringLiteral(value), literal_type, loc):
 				True
+			StaticStringLiteralExpr(id, value, literal_type, loc):
+				False
 			CallExpr(kind, callee, args, return_type, loc):
 				call_result_is_owned(env, kind, args, return_type)
 			CastExpr(inner, cast_type, loc):
@@ -14175,8 +14182,10 @@ private pure func materialize_borrowed_match_temporary(
 		borrowed_temporary_result(env, [], rewritten)
 
 
-private pure func is_immortal_closure_expr(env: PerceusEnv, expr: CoreExpr) -> Bool:
+private pure func is_immortal_value_expr(env: PerceusEnv, expr: CoreExpr) -> Bool:
 	match expr:
+		StaticStringLiteralExpr(id, value, typ, loc):
+			True
 		LambdaExpr(params, return_type, body, is_pure, typ, loc):
 			not CoreClosure.lambda_has_runtime_captures(
 				env.function_definitions,
@@ -15151,15 +15160,17 @@ private pure func retain_direct_field_alias_record_fields(
 	retained
 
 
-private pure func aggregate_value_has_owned_projection_root(
+private pure func aggregate_value_can_transfer_without_retain(
 	env: PerceusEnv,
 	expr: CoreExpr,
 ) -> Bool:
 	match expr:
+		StaticStringLiteralExpr(id, value, typ, loc):
+			True
 		FieldExpr(owner, field, typ, loc):
-			aggregate_value_has_owned_projection_root(env, owner)
+			aggregate_value_can_transfer_without_retain(env, owner)
 		TupleFieldExpr(owner, field_index, typ, loc):
-			aggregate_value_has_owned_projection_root(env, owner)
+			aggregate_value_can_transfer_without_retain(env, owner)
 		_:
 			is_owned_temporary_expr(env, expr)
 
@@ -15172,7 +15183,7 @@ private pure func retain_direct_field_alias_boxed_value(
 	needs_release: Bool = value.needs_release
 	transfers_ownership: Bool = (
 		value.transfers_ownership
-		or needs_release and aggregate_value_has_owned_projection_root(env, value.value)
+		or needs_release and aggregate_value_can_transfer_without_retain(env, value.value)
 	)
 
 	owned_value: CoreExpr = if transfers_ownership:
@@ -15532,7 +15543,7 @@ private pure func rebuild_managed_let(
 	rewritten_rhs: CoreExpr,
 	rewritten_body: CoreExpr,
 ) -> CoreExpr:
-	managed_binding: Bool = not is_immortal_closure_expr(env, plan.owned_rhs)
+	managed_binding: Bool = plan.is_mutable or not is_immortal_value_expr(env, plan.owned_rhs)
 
 	balance_strategy: PerceusBalanceStrategy = if (
 		managed_binding
@@ -16149,7 +16160,7 @@ private pure func managed_let_is_proven_unused(
 	plan: PerceusManagedLetPlan,
 	resolved_values: PerceusResolvedValueIndex,
 ) -> Bool:
-	if plan.is_mutable or is_immortal_closure_expr(env, plan.owned_rhs):
+	if plan.is_mutable or is_immortal_value_expr(env, plan.owned_rhs):
 		False
 	else:
 		(
@@ -16178,7 +16189,7 @@ private pure func managed_let_has_single_direct_consume(
 	body: PerceusInsertedExpr,
 	resolved_values: PerceusResolvedValueIndex,
 ) -> Bool:
-	if plan.is_mutable or is_immortal_closure_expr(env, plan.owned_rhs):
+	if plan.is_mutable or is_immortal_value_expr(env, plan.owned_rhs):
 		False
 	else:
 		match body.direct_consume:
@@ -17378,7 +17389,7 @@ private pure func schedule_contract_linear(
 				state = record_contract_parameter_use(index, caller, demand, variable, state),
 				pending = pending
 			}
-		LiteralExpr(_, _, _) | VoidExpr(_, _) | BreakExpr(_, _):
+		LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _) | VoidExpr(_, _) | BreakExpr(_, _):
 			{
 				state = state,
 				pending = pending
@@ -20310,7 +20321,7 @@ private pure func first_borrowed_owner_aliasing_expr(
 				first_borrowed_owner_aliasing_expr(context, inner)
 			UnboxExpr(kind, inner, typ, loc):
 				first_borrowed_owner_aliasing_expr(context, inner)
-			LiteralExpr(_, _, _) | VoidExpr(_, _):
+			LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _) | VoidExpr(_, _):
 				None
 			_:
 				first_borrowed_owner_legacy(context, expr)
@@ -23574,7 +23585,7 @@ private pure func prove_simple_consumed_parameter_balance(
 
 				if supported:
 					match expr:
-						LiteralExpr(_, _, _) | VoidExpr(_, _):
+						LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _) | VoidExpr(_, _):
 							void
 						VarExpr(variable, _, _):
 							match catalog.consumed_indices_by_name.get(variable.name):
@@ -23597,7 +23608,7 @@ private pure func prove_simple_consumed_parameter_balance(
 							)
 						LetExpr(variable, is_mutable, bind_type, rhs, let_body):
 							rhs_is_literal: Bool = match rhs:
-								LiteralExpr(_, _, _):
+								LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _):
 									True
 								_:
 									False

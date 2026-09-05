@@ -129,6 +129,23 @@ Prefer `map`, `filter`, or `filter_map` when they express the operation more
 directly. Use an explicit builder loop when control flow or error handling makes
 that clearer.
 
+## String Literals
+
+Value-position string literals are immutable artifact data. Equal literal byte
+sequences share one statically initialized `String` object within the generated
+artifact. They do not allocate at runtime and are not included in `MemStats` or
+leak counts.
+
+The static object uses the normal `String` ABI, so equality, length, byte
+access, `refcount`, and `size_of` behave like other strings. Its refcount is the
+runtime immortal sentinel and `is_unique(literal)` is `False`. A mutating COW
+operation therefore allocates a normal mortal copy before writing; later uses
+of the literal continue to observe the original bytes.
+
+Only source literals have this storage class. Interpolation, concatenation,
+formatting, `to_string`, and foreign-returned strings remain mortal managed
+allocations and remain visible to memory instrumentation.
+
 ## Tensors And Fixed Shapes
 
 Tensor and fixed-shape vector values use managed runtime storage unless a Core

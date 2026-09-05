@@ -1,0 +1,373 @@
+-- Classify value-position string literals once before ownership lowering.
+--
+-- IDs use deterministic declaration-order, breadth-first expression order.
+-- Match keys are CoreLiteral comparison data rather than value expressions,
+-- so shared Core traversal deliberately leaves them outside this pool.
+import:
+	dict: Dict
+	ir:
+		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
+		CoreExpr(
+			LambdaExpr,
+			LetExpr,
+			LiteralExpr,
+			LogicalExpr,
+			PreClosureConcurrentExpr,
+			PreClosureConcurrentlyLoopExpr,
+			PreClosureDetachExpr,
+			SeqExpr,
+			StaticStringLiteralExpr,
+			VarExpr,
+		),
+		CoreFunction,
+		CoreLiteral(StringLiteral),
+		CoreProgram,
+		CoreVar,
+		StaticStringLiteralId,
+		core_var_equal,
+		static_string_literal_id,
+	traverse as CoreTraverse
+
+
+record StaticStringLiteralEntry {
+	id: StaticStringLiteralId,
+	value: String,
+	occurrences: Int
+}
+
+
+record StaticStringLiteralProgram {
+	program: CoreProgram,
+	entries: List[StaticStringLiteralEntry]
+}
+
+
+private record StaticStringLiteralCatalog {
+	ids_by_value: Dict[String, Int],
+	entries: List[StaticStringLiteralEntry]
+}
+
+
+private record StaticStringLiteralBinding {
+	variable: CoreVar,
+	id: StaticStringLiteralId,
+	value: String,
+	boundary_depth: Int
+}
+
+
+private record StaticStringLiteralRewriteContext {
+	ids_by_value: Dict[String, Int],
+	bindings: List[StaticStringLiteralBinding],
+	boundary_depth: Int
+}
+
+
+private EMPTY_STATIC_STRING_LITERAL_CATALOG: StaticStringLiteralCatalog = {
+	ids_by_value = {},
+	entries = []
+}
+
+
+private pure func increment_entry_occurrences(
+	entries: List[StaticStringLiteralEntry],
+	index: Int,
+) -> List[StaticStringLiteralEntry]:
+	match entries.get(index):
+		Some(entry):
+			entries.set(index, { entry | occurrences = entry.occurrences + 1 })
+		None:
+			entries
+
+
+private pure func catalog_add_literal(
+	catalog: StaticStringLiteralCatalog,
+	value: String,
+) -> StaticStringLiteralCatalog:
+	match catalog.ids_by_value.get(value):
+		Some(existing_id):
+			{ catalog | entries = increment_entry_occurrences(catalog.entries, existing_id) }
+		None:
+			id_value: Int = catalog.entries.length()
+			{
+				ids_by_value = catalog.ids_by_value.set(value, id_value),
+				entries = catalog.entries.append({
+					id = static_string_literal_id(id_value),
+					value = value,
+					occurrences = 1,
+				})
+			}
+
+
+private pure func collect_expr_literals(
+	catalog: StaticStringLiteralCatalog,
+	root: CoreExpr,
+) -> StaticStringLiteralCatalog:
+	var result: StaticStringLiteralCatalog = catalog
+	var pending: List[CoreExpr] = [root]
+	var cursor: Int = 0
+
+	while cursor < pending.length():
+		current: CoreExpr = pending.get_or(cursor, root)
+
+		match current:
+			LiteralExpr(StringLiteral(value), typ, loc):
+				result = catalog_add_literal(result, value)
+			_:
+				void
+
+		for child in CoreTraverse.immediate_core_expr_children(current):
+			pending = pending.append(child)
+
+		cursor += 1
+
+	result
+
+
+private pure func collect_function_literals(
+	catalog: StaticStringLiteralCatalog,
+	function_info: CoreFunction,
+) -> StaticStringLiteralCatalog:
+	match function_info.body:
+		Some(body):
+			collect_expr_literals(catalog, body)
+		None:
+			catalog
+
+
+private pure func collect_decl_literals(
+	catalog: StaticStringLiteralCatalog,
+	decl: CoreDecl,
+) -> StaticStringLiteralCatalog:
+	match decl:
+		FunctionDecl(function_info):
+			collect_function_literals(catalog, function_info)
+		GlobalDecl(global):
+			collect_expr_literals(catalog, global.init)
+		ImplDecl(impl):
+			var result: StaticStringLiteralCatalog = catalog
+
+			for method in impl.methods:
+				result = collect_function_literals(result, method)
+
+			result
+		_:
+			catalog
+
+
+private pure func collect_program_literals(program: CoreProgram) -> StaticStringLiteralCatalog:
+	var catalog: StaticStringLiteralCatalog = EMPTY_STATIC_STRING_LITERAL_CATALOG
+
+	for decl in program.decls:
+		catalog = collect_decl_literals(catalog, decl)
+
+	catalog
+
+
+private pure func find_static_literal_binding(
+	bindings: List[StaticStringLiteralBinding],
+	variable: CoreVar,
+) -> Option[StaticStringLiteralBinding]:
+	var found: Option[StaticStringLiteralBinding] = None
+	var index: Int = bindings.length() - 1
+
+	while index >= 0:
+		match bindings.get(index):
+			Some(binding):
+				if core_var_equal(binding.variable, variable):
+					found = Some(binding)
+					break
+				else:
+					void
+			None:
+				void
+
+		index -= 1
+
+	found
+
+
+private pure func rewrite_expr_literals(
+	context: StaticStringLiteralRewriteContext,
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		VarExpr(variable, typ, loc):
+			match find_static_literal_binding(context.bindings, variable):
+				Some(binding):
+					if binding.boundary_depth < context.boundary_depth:
+						StaticStringLiteralExpr(binding.id, binding.value, typ, loc)
+					else:
+						expr
+				None:
+					expr
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			rewritten_rhs: CoreExpr = rewrite_expr_literals(context, rhs)
+			literal_binding: Option[StaticStringLiteralBinding] = if is_mutable:
+				None
+			else:
+				match rewritten_rhs:
+					StaticStringLiteralExpr(id, value, _, _):
+						Some({
+							variable = variable,
+							id = id,
+							value = value,
+							boundary_depth = context.boundary_depth,
+						})
+					VarExpr(alias_variable, _, _):
+						find_static_literal_binding(context.bindings, alias_variable).map(
+							func(binding): { binding |
+								variable = variable,
+								boundary_depth = context.boundary_depth,
+							},
+						)
+					_:
+						None
+			body_context: StaticStringLiteralRewriteContext = match literal_binding:
+				Some(binding):
+					{ context | bindings = context.bindings.append(binding) }
+				None:
+					context
+
+			LetExpr(
+				variable,
+				is_mutable,
+				typ,
+				rewritten_rhs,
+				rewrite_expr_literals(body_context, body),
+			)
+		LambdaExpr(params, return_type, body, is_pure, typ, loc):
+			LambdaExpr(
+				params,
+				return_type,
+				rewrite_expr_literals(
+					{ context | boundary_depth = context.boundary_depth + 1 },
+					body,
+				),
+				is_pure,
+				typ,
+				loc,
+			)
+		PreClosureDetachExpr(body, typ, loc):
+			PreClosureDetachExpr(
+				rewrite_expr_literals(
+					{ context | boundary_depth = context.boundary_depth + 1 },
+					body,
+				),
+				typ,
+				loc,
+			)
+		PreClosureConcurrentExpr(block, typ, loc):
+			task_context: StaticStringLiteralRewriteContext = {
+				context | boundary_depth = context.boundary_depth + 1
+			}
+			PreClosureConcurrentExpr(
+				{ block |
+					bindings = block.bindings.map(
+						func(binding): { binding |
+							rhs = rewrite_expr_literals(task_context, binding.rhs)
+						},
+					),
+					body = rewrite_expr_literals(context, block.body),
+					timeout = block.timeout.map(
+						func(timeout): rewrite_expr_literals(context, timeout),
+					)
+				},
+				typ,
+				loc,
+			)
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			PreClosureConcurrentlyLoopExpr(
+				{ loop |
+					iterable = rewrite_expr_literals(context, loop.iterable),
+					body = rewrite_expr_literals(
+						{ context | boundary_depth = context.boundary_depth + 1 },
+						loop.body,
+					),
+					timeout = loop.timeout.map(
+						func(timeout): rewrite_expr_literals(context, timeout),
+					),
+					limit = rewrite_expr_literals(context, loop.limit)
+				},
+				typ,
+				loc,
+			)
+		LogicalExpr(_, _, _, _, _):
+			CoreTraverse.map_core_logical_tree_with_context(
+				expr,
+				context,
+				rewrite_expr_literals,
+			)
+		SeqExpr(_, _):
+			spine = CoreTraverse.split_core_sequence(expr)
+			CoreTraverse.rebuild_core_sequence({
+				preceding_items = spine.preceding_items.map(
+					func(item): rewrite_expr_literals(context, item),
+				),
+				final_item = rewrite_expr_literals(context, spine.final_item),
+			})
+		_:
+			mapped: CoreExpr = CoreTraverse.map_core_expr_children_with_context(
+				expr,
+				context,
+				rewrite_expr_literals,
+			)
+
+			match mapped:
+				LiteralExpr(StringLiteral(value), typ, loc):
+					match context.ids_by_value.get(value):
+						Some(id):
+							StaticStringLiteralExpr(static_string_literal_id(id), value, typ, loc)
+						None:
+							mapped
+				_:
+					mapped
+
+
+private pure func rewrite_function_literals(
+	context: StaticStringLiteralRewriteContext,
+	function_info: CoreFunction,
+) -> CoreFunction:
+	{ function_info |
+		body = function_info.body.map(func(body): rewrite_expr_literals(context, body))
+	}
+
+
+private pure func rewrite_decl_literals(
+	context: StaticStringLiteralRewriteContext,
+	decl: CoreDecl,
+) -> CoreDecl:
+	match decl:
+		FunctionDecl(function_info):
+			FunctionDecl(rewrite_function_literals(context, function_info))
+		GlobalDecl(global):
+			GlobalDecl({ global | init = rewrite_expr_literals(context, global.init) })
+		ImplDecl(impl):
+			ImplDecl(
+				{ impl |
+					methods = impl.methods.map(
+						func(method): rewrite_function_literals(context, method),
+					)
+				},
+			)
+		_:
+			decl
+
+
+pure func pool_static_string_literals(program: CoreProgram) -> StaticStringLiteralProgram:
+	catalog: StaticStringLiteralCatalog = collect_program_literals(program)
+	context: StaticStringLiteralRewriteContext = {
+		ids_by_value = catalog.ids_by_value,
+		bindings = [],
+		boundary_depth = 0,
+	}
+	{
+		program = { program |
+			decls = program.decls.map(func(decl): rewrite_decl_literals(context, decl))
+		},
+		entries = catalog.entries
+	}
+
+
+pure func rewrite_static_string_literals(program: CoreProgram) -> CoreProgram:
+	pool_static_string_literals(program).program

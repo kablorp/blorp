@@ -1,0 +1,301 @@
+import:
+	../../../src/compiler/stage_09_core/ir:
+		CoreDecl(FunctionDecl),
+		CoreExpr(
+			LambdaExpr,
+			LetExpr,
+			LiteralExpr,
+			LiteralMatchExpr,
+			LogicalExpr,
+			PreClosureDetachExpr,
+			StaticStringLiteralExpr,
+			TupleExpr,
+			VarExpr,
+		),
+		CoreFunctionKind(UserFunction),
+		CoreLiteral(StringLiteral),
+		CoreLiteralMatchCase,
+		CoreLiteralMatchFallback(LiteralMatchFallbackBody),
+		CoreLogicalOp(AndOp),
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(FunctionType, NamedType, TupleType, VoidType),
+		CoreVar,
+		static_string_literal_id_value,
+	../../../src/compiler/stage_09_core/static_string_literals:
+		StaticStringLiteralEntry,
+		StaticStringLiteralProgram,
+		pool_static_string_literals,
+	test: TestSuite
+
+
+pure func string_type() -> CoreType:
+	NamedType("String", [])
+
+
+pure func string_expr(value: String) -> CoreExpr:
+	LiteralExpr(StringLiteral(value), string_type(), SyntheticSourceLoc)
+
+
+pure func local_var(name: String, uniq: Int) -> CoreVar:
+	{
+		name = name,
+		uniq = uniq,
+		def_id = None,
+	}
+
+
+pure func function_decl(name: String, def_id: Int, body: CoreExpr) -> CoreDecl:
+	FunctionDecl({
+		name = name,
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = string_type(),
+		body = Some(body),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = def_id,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func program_with_body(body: CoreExpr) -> CoreProgram:
+	{
+		decls = [function_decl("fixture", 1, body)],
+		foreign_includes = []
+	}
+
+
+pure func entry_for_value(
+	entries: List[StaticStringLiteralEntry],
+	value: String,
+) -> Option[StaticStringLiteralEntry]:
+	var found: Option[StaticStringLiteralEntry] = None
+
+	for entry in entries:
+		if entry.value == value:
+			found = Some(entry)
+			break
+
+	found
+
+
+pure func entry_has_identity(
+	entries: List[StaticStringLiteralEntry],
+	value: String,
+	id: Int,
+	occurrences: Int,
+) -> Bool:
+	match entry_for_value(entries, value):
+		Some(entry):
+			static_string_literal_id_value(entry.id) == id and entry.occurrences == occurrences
+		None:
+			False
+
+
+pure func test_pool_assigns_deterministic_first_seen_ids() -> Bool:
+	body: CoreExpr = TupleExpr(
+		[
+			string_expr("same"),
+			string_expr("different"),
+			string_expr("same"),
+			string_expr("a\0b"),
+			string_expr(""),
+			string_expr("é"),
+			string_expr("\"quote\"\\slash"),
+			string_expr("same"),
+		],
+		TupleType([
+			string_type(),
+			string_type(),
+			string_type(),
+			string_type(),
+			string_type(),
+			string_type(),
+			string_type(),
+			string_type(),
+		]),
+		SyntheticSourceLoc,
+	)
+	pooled: StaticStringLiteralProgram = pool_static_string_literals(program_with_body(body))
+
+	(
+		pooled.entries.length() == 6
+		and entry_has_identity(pooled.entries, "same", 0, 3)
+		and entry_has_identity(pooled.entries, "different", 1, 1)
+		and entry_has_identity(pooled.entries, "a\0b", 2, 1)
+		and entry_has_identity(pooled.entries, "", 3, 1)
+		and entry_has_identity(pooled.entries, "é", 4, 1)
+		and entry_has_identity(pooled.entries, "\"quote\"\\slash", 5, 1)
+	)
+
+
+pure func test_pool_rewrites_equal_values_to_equal_ids() -> Bool:
+	body: CoreExpr = TupleExpr(
+		[string_expr("same"), string_expr("other"), string_expr("same")],
+		TupleType([string_type(), string_type(), string_type()]),
+		SyntheticSourceLoc,
+	)
+	pooled: StaticStringLiteralProgram = pool_static_string_literals(program_with_body(body))
+
+	match pooled.program.decls:
+		[FunctionDecl(function_info)]:
+			match function_info.body:
+				Some(TupleExpr(items, _, _)):
+					match items:
+						[StaticStringLiteralExpr(first_id, "same", _, _), StaticStringLiteralExpr(other_id, "other", _, _), StaticStringLiteralExpr(last_id, "same", _, _)]:
+							(
+								static_string_literal_id_value(first_id) == 0
+								and static_string_literal_id_value(other_id) == 1
+								and static_string_literal_id_value(last_id) == 0
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_pool_does_not_rewrite_comparison_literals() -> Bool:
+	case: CoreLiteralMatchCase = {
+		literal = StringLiteral("comparison-only"),
+		bindings = [],
+		body = string_expr("matched")
+	}
+	body: CoreExpr = LiteralMatchExpr(
+		string_expr("subject"),
+		[case],
+		LiteralMatchFallbackBody(string_expr("fallback")),
+		string_type(),
+		SyntheticSourceLoc,
+	)
+	pooled: StaticStringLiteralProgram = pool_static_string_literals(program_with_body(body))
+
+	match pooled.program.decls:
+		[FunctionDecl(function_info)]:
+			match function_info.body:
+				Some(LiteralMatchExpr(StaticStringLiteralExpr(_, subject, _, _), cases, fallback, _, _)):
+					case_preserved: Bool = match cases:
+						[match_case]:
+							match (match_case.literal, match_case.body):
+								(StringLiteral(comparison), StaticStringLiteralExpr(_, matched, _, _)):
+									comparison == "comparison-only" and matched == "matched"
+								_:
+									False
+						_:
+							False
+
+					fallback_preserved: Bool = match fallback:
+						LiteralMatchFallbackBody(StaticStringLiteralExpr(_, value, _, _)):
+							value == "fallback"
+						_:
+							False
+
+					(
+						subject == "subject"
+						and case_preserved
+						and fallback_preserved
+						and pooled.entries.length() == 3
+						and entry_for_value(pooled.entries, "comparison-only").is_none()
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_pool_rewrites_deep_logical_trees_iteratively() -> Bool:
+	var body: CoreExpr = string_expr("deep")
+	var depth: Int = 0
+
+	while depth < 1024:
+		body = LogicalExpr(AndOp, string_expr("deep"), body, string_type(), SyntheticSourceLoc)
+		depth += 1
+
+	pooled: StaticStringLiteralProgram = pool_static_string_literals(program_with_body(body))
+	entry_has_identity(pooled.entries, "deep", 0, 1025)
+
+
+pure func test_pool_propagates_immutable_literals_across_capture_boundaries() -> Bool:
+	label: CoreVar = local_var("label", 1)
+	closure_type: CoreType = FunctionType(True, [], string_type())
+	body: CoreExpr = LetExpr(
+		label,
+		False,
+		string_type(),
+		string_expr("captured"),
+		TupleExpr(
+			[
+				LambdaExpr(
+					[],
+					string_type(),
+					VarExpr(label, string_type(), SyntheticSourceLoc),
+					True,
+					closure_type,
+					SyntheticSourceLoc,
+				),
+				PreClosureDetachExpr(
+					VarExpr(label, string_type(), SyntheticSourceLoc),
+					VoidType,
+					SyntheticSourceLoc,
+				),
+			],
+			TupleType([closure_type, VoidType]),
+			SyntheticSourceLoc,
+		),
+	)
+	pooled: StaticStringLiteralProgram = pool_static_string_literals(program_with_body(body))
+
+	match pooled.program.decls:
+		[FunctionDecl(function_info)]:
+			match function_info.body:
+				Some(LetExpr(rewritten, False, _, StaticStringLiteralExpr(_, "captured", _, _), TupleExpr([LambdaExpr(_, _, closure_body, _, _, _), PreClosureDetachExpr(task_body, _, _)], _, _))):
+					match (closure_body, task_body):
+						(StaticStringLiteralExpr(_, "captured", _, _), StaticStringLiteralExpr(_, "captured", _, _)):
+							rewritten == label
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_pool_preserves_mutable_literal_bindings() -> Bool:
+	label: CoreVar = local_var("label", 2)
+	body: CoreExpr = LetExpr(
+		label,
+		True,
+		string_type(),
+		string_expr("mutable"),
+		VarExpr(label, string_type(), SyntheticSourceLoc),
+	)
+	pooled: StaticStringLiteralProgram = pool_static_string_literals(program_with_body(body))
+
+	match pooled.program.decls:
+		[FunctionDecl(function_info)]:
+			match function_info.body:
+				Some(LetExpr(rewritten, True, _, StaticStringLiteralExpr(_, "mutable", _, _), VarExpr(reference, _, _))):
+					rewritten == label and reference == label
+				_:
+					False
+		_:
+			False
+
+
+tests: TestSuite = {
+	description = "Core static string literals",
+	tests = [
+		("assigns deterministic first-seen IDs", test_pool_assigns_deterministic_first_seen_ids),
+		("equal values reuse one ID", test_pool_rewrites_equal_values_to_equal_ids),
+		("comparison literals are not pooled", test_pool_does_not_rewrite_comparison_literals),
+		("deep logical trees are iterative", test_pool_rewrites_deep_logical_trees_iteratively),
+		(
+			"immutable literal aliases cross capture boundaries",
+			test_pool_propagates_immutable_literals_across_capture_boundaries,
+		),
+		("mutable literal bindings remain local", test_pool_preserves_mutable_literal_bindings),
+	]
+}

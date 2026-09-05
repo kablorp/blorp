@@ -194,6 +194,7 @@ import:
 			SelectExpr,
 			SeqExpr,
 			SetAllocExpr,
+			StaticStringLiteralExpr,
 			StringByteCopyExpr,
 			StringByteReadExpr,
 			StringByteWriteExpr,
@@ -419,6 +420,8 @@ import:
 		CoreValueRecordDecl,
 		CoreValueRecordField,
 		CoreVar,
+		StaticStringLiteralId,
+		static_string_literal_id_value,
 	../stage_09_core/ownership:
 		OwnershipCallContract,
 		OwnershipResultMode(ReturnOwned),
@@ -723,6 +726,15 @@ import:
 		TupleConstructWithRcArgs,
 		TupleRetainElemArgs,
 		render_prepared_tuple_op,
+	static_string_literal_pool:
+		BackendStaticStringLiteral,
+		StaticStringLiteralPoolError(
+			NegativeStaticStringLiteralId,
+			StaticStringLiteralIdConflict,
+			StaticStringLiteralValueConflict,
+			UnpooledValueStringLiteral,
+		),
+		collect_backend_static_string_literals,
 	string: string as make_string
 
 
@@ -862,6 +874,7 @@ private pure func emit_foreign_includes(headers: List[String]) -> String:
 union CoreEmitError:
 	UnsupportedGlobalInitializer(String)
 	CallableSymbolProjectionFailed(CSymbolProjectionError)
+	InvalidStaticStringLiteralPool(StaticStringLiteralPoolError)
 
 
 pure func core_emit_error_message(error: CoreEmitError) -> String:
@@ -870,6 +883,16 @@ pure func core_emit_error_message(error: CoreEmitError) -> String:
 			"unsupported global initializer for `${global_name}`"
 		CallableSymbolProjectionFailed(projection_error):
 			symbol_projection_error_text(projection_error)
+		InvalidStaticStringLiteralPool(pool_error):
+			match pool_error:
+				NegativeStaticStringLiteralId(id):
+					"negative static string literal ID `${id}` reached the backend"
+				StaticStringLiteralIdConflict(id, first, second):
+					"static string literal ID `${id}` has conflicting byte values"
+				StaticStringLiteralValueConflict(value, first_id, second_id):
+					"static string literal bytes use conflicting IDs `${first_id}` and `${second_id}`"
+				UnpooledValueStringLiteral(value):
+					"unpooled value-position string literal reached the backend"
 
 
 private DEFAULT_PROFILE_ENABLED: Bool = False
@@ -1233,6 +1256,8 @@ private pure func is_void_expr(expr: CoreExpr) -> Bool:
 	match expr:
 		LiteralExpr(literal, typ, loc):
 			False
+		StaticStringLiteralExpr(id, value, typ, loc):
+			False
 		VarExpr(variable, typ, loc):
 			False
 		VoidExpr(typ, loc):
@@ -1453,6 +1478,14 @@ private pure func expr_source_transfers_ownership(expr: CoreExpr) -> Bool:
 			expr_transfers_ownership(expr)
 
 
+private pure func expr_is_static_immortal(expr: CoreExpr) -> Bool:
+	match expr:
+		StaticStringLiteralExpr(_, _, _, _):
+			True
+		_:
+			False
+
+
 private pure func expr_transfers_ownership(expr: CoreExpr) -> Bool:
 	match expr:
 		BoxExpr(box, typ, loc):
@@ -1485,6 +1518,8 @@ private pure func expr_transfers_ownership(expr: CoreExpr) -> Bool:
 					TypeLayout.boxed_value_needs_release_type(typ)
 				CharLiteral(value):
 					TypeLayout.boxed_value_needs_release_type(typ)
+		StaticStringLiteralExpr(id, value, typ, loc):
+			False
 		VoidExpr(typ, loc):
 			TypeLayout.boxed_value_needs_release_type(typ)
 		DebugBlockExpr(body, typ, loc):
@@ -2084,6 +2119,8 @@ private pure func resource_cleanup_hook(cleanup: CoreExpr) -> Option[ResourceCle
 			resource_cleanup_hook_for_args(kind, args)
 		LiteralExpr(literal, typ, loc):
 			None
+		StaticStringLiteralExpr(id, value, typ, loc):
+			None
 		VarExpr(variable, typ, loc):
 			None
 		VoidExpr(typ, loc):
@@ -2398,37 +2435,12 @@ private pure func c_string_literal(text: String) -> String:
 	result.append_char('\"')
 
 
-private pure func string_contains_nul(text: String) -> Bool:
-	var found: Bool = False
-	var index: Int = 0
-
-	while index < text.length():
-		if not found:
-			match text.get(index):
-				Some(ch):
-					if to_int(ch) == 0:
-						found = True
-						break
-					else:
-						void
-				None:
-					void
-
-		index += 1
-
-	found
+private pure func static_string_literal_symbol(id: StaticStringLiteralId) -> String:
+	"__blorp_string_literal_${static_string_literal_id_value(id)}"
 
 
-private pure func emit_string_literal_expr(value: String) -> String:
-	literal_c: String = c_string_literal(value)
-	length_c: String = value
-		.length()
-		.to_string()
-
-	if string_contains_nul(value):
-		"blorp_string_create_len(" + literal_c + ", " + length_c + "L)"
-	else:
-		"blorp_string_create(" + literal_c + ")"
+private pure func emit_static_string_literal_expr(id: StaticStringLiteralId) -> String:
+	"(blorp_String*)&${static_string_literal_symbol(id)}"
 
 
 private pure func emit_string_literal_comparison(value_c: String, literal: String) -> String:
@@ -2440,6 +2452,8 @@ private pure func emit_string_literal_comparison(value_c: String, literal: Strin
 private pure func string_literal_value(expr: CoreExpr) -> Option[String]:
 	match expr:
 		LiteralExpr(StringLiteral(value), typ, loc):
+			Some(value)
+		StaticStringLiteralExpr(id, value, typ, loc):
 			Some(value)
 		_:
 			None
@@ -2568,7 +2582,7 @@ private pure func emit_literal_expr(literal: CoreLiteral) -> Option[String]:
 		CharLiteral(value):
 			Some(value.to_string())
 		StringLiteral(value):
-			Some(emit_string_literal_expr(value))
+			None
 
 
 private pure func c_infix_expr(left_c: String, operator: String, right_c: String) -> String:
@@ -3162,6 +3176,8 @@ private pure func simple_call_arg_requires_ordering(arg: CoreExpr) -> Bool:
 		LiteralExpr(StringLiteral(_), _, _):
 			True
 		LiteralExpr(_, _, _) | VarExpr(_, _, _) | VoidExpr(_, _):
+			False
+		StaticStringLiteralExpr(_, _, _, _):
 			False
 		FieldExpr(owner, _, _, _) | TupleFieldExpr(owner, _, _, _):
 			simple_call_arg_requires_ordering(owner)
@@ -8872,13 +8888,22 @@ private pure func emit_set_constructor(constructor: CoreHashContainerConstructor
 private pure func emit_dict_insert_statement(entry: CoreDictEntry) -> Option[String]:
 	key_c ?= emit_boxed_pointer_value(entry.key)
 	value_c ?= emit_boxed_pointer_value(entry.value)
+	key_transfers_ownership: Bool = (
+		entry.key.transfers_ownership
+		and not expr_is_static_immortal(entry.key.value)
+	)
+
+	value_transfers_ownership: Bool = (
+		entry.value.transfers_ownership
+		and not expr_is_static_immortal(entry.value.value)
+	)
 
 	Some(render_prepared_backend_op(BackendDictInsert({
 		temp_seed = DICT_CONSTRUCT_TEMP_SEED,
 		key = key_c,
 		value = value_c,
-		key_transfers_ownership = entry.key.transfers_ownership,
-		value_transfers_ownership = entry.value.transfers_ownership,
+		key_transfers_ownership = key_transfers_ownership,
+		value_transfers_ownership = value_transfers_ownership,
 	})))
 
 
@@ -11380,10 +11405,13 @@ private pure func let_cleanup_policy(
 	variable: CoreVar,
 	is_mutable: Bool,
 	typ: CoreType,
+	rhs: CoreExpr,
 ) -> CoreReleasePolicy:
 	if variable.name == "_":
 		NoReleasePolicy
 	else if is_mutable:
+		NoReleasePolicy
+	else if expr_is_static_immortal(rhs):
 		NoReleasePolicy
 	else:
 		CoreTypePolicy.cleanup_release_policy_for_type(typ)
@@ -11469,6 +11497,8 @@ private pure func exprs_are_non_suspending_transfer(exprs: List[CoreExpr]) -> Bo
 private pure func transfer_prefix_is_non_suspending(expr: CoreExpr) -> Bool:
 	match expr:
 		LiteralExpr(literal, typ, loc):
+			True
+		StaticStringLiteralExpr(id, value, typ, loc):
 			True
 		VarExpr(variable, typ, loc):
 			True
@@ -11651,6 +11681,8 @@ private pure func expr_is_var_reference(expr: CoreExpr, variable: CoreVar) -> Bo
 		VarExpr(candidate, typ, loc):
 			core_vars_equal(candidate, variable)
 		LiteralExpr(literal, typ, loc):
+			False
+		StaticStringLiteralExpr(id, value, typ, loc):
 			False
 		VoidExpr(typ, loc):
 			False
@@ -11909,6 +11941,8 @@ private pure func call_arg_transfer_cleanup_pop_statement(arg: CoreExpr) -> Stri
 			else:
 				""
 		LiteralExpr(literal, typ, loc):
+			""
+		StaticStringLiteralExpr(id, value, typ, loc):
 			""
 		VoidExpr(typ, loc):
 			""
@@ -12216,6 +12250,8 @@ private pure func body_consumes_var_before_suspension(expr: CoreExpr, variable: 
 			False
 		LiteralExpr(literal, typ, loc):
 			False
+		StaticStringLiteralExpr(id, value, typ, loc):
+			False
 		VoidExpr(typ, loc):
 			False
 		DebugBlockExpr(body, typ, loc):
@@ -12486,6 +12522,8 @@ private pure func body_consumes_var(expr: CoreExpr, variable: CoreVar) -> Bool:
 			False
 		LiteralExpr(literal, typ, loc):
 			False
+		StaticStringLiteralExpr(id, value, typ, loc):
+			False
 		VoidExpr(typ, loc):
 			False
 		DebugBlockExpr(body, typ, loc):
@@ -12645,6 +12683,8 @@ private pure func directly_returns_var(expr: CoreExpr, variable: CoreVar) -> Boo
 		VarExpr(returned, typ, loc):
 			core_vars_equal(returned, variable)
 		LiteralExpr(literal, typ, loc):
+			False
+		StaticStringLiteralExpr(id, value, typ, loc):
 			False
 		VoidExpr(typ, loc):
 			False
@@ -12917,6 +12957,8 @@ private pure func emit_simple_expr(expr: CoreExpr) -> Option[String]:
 			None
 		LiteralExpr(literal, typ, loc):
 			emit_literal_expr(literal)
+		StaticStringLiteralExpr(id, value, typ, loc):
+			Some(emit_static_string_literal_expr(id))
 		VarExpr(variable, typ, loc):
 			if variable.name == "None":
 				stack_option_none_expr_for_type(typ)
@@ -13370,6 +13412,8 @@ private pure func emit_tailrec_tail(
 				),
 			)
 		LiteralExpr(literal, typ, loc):
+			emit_tailrec_return(return_type, expr, next_temp)
+		StaticStringLiteralExpr(id, value, typ, loc):
 			emit_tailrec_return(return_type, expr, next_temp)
 		VarExpr(variable, typ, loc):
 			emit_tailrec_return(return_type, expr, next_temp)
@@ -14138,6 +14182,8 @@ private pure func emit_tailrec_list_spread_tail(
 			emit_tailrec_return(loop.return_type, expr, next_temp)
 		LiteralExpr(literal, typ, loc):
 			emit_tailrec_return(loop.return_type, expr, next_temp)
+		StaticStringLiteralExpr(id, value, typ, loc):
+			emit_tailrec_return(loop.return_type, expr, next_temp)
 		VarExpr(variable, typ, loc):
 			emit_tailrec_return(loop.return_type, expr, next_temp)
 		VoidExpr(typ, loc):
@@ -14333,6 +14379,8 @@ private pure func static_int_literal(expr: CoreExpr) -> Option[Int]:
 					None
 				StringLiteral(value):
 					None
+		StaticStringLiteralExpr(id, value, typ, loc):
+			None
 		VarExpr(variable, typ, loc):
 			None
 		VoidExpr(typ, loc):
@@ -16386,6 +16434,8 @@ private pure func core_expr_type(expr: CoreExpr) -> CoreType:
 			typ
 		LiteralExpr(literal, typ, loc):
 			typ
+		StaticStringLiteralExpr(id, value, typ, loc):
+			typ
 		VarExpr(variable, typ, loc):
 			typ
 		VoidExpr(typ, loc):
@@ -18181,6 +18231,8 @@ private pure func emit_constructor_expr_match_body(
 			emit_literal_match_branch_body(result_name, expr, next_temp)
 		LiteralExpr(literal, typ, loc):
 			emit_literal_match_branch_body(result_name, expr, next_temp)
+		StaticStringLiteralExpr(id, value, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
 		VarExpr(variable, typ, loc):
 			emit_literal_match_branch_body(result_name, expr, next_temp)
 		VoidExpr(typ, loc):
@@ -19588,7 +19640,7 @@ private pure func emit_bound_let_body(
 	next_temp: Int,
 ) -> Option[FunctionBodyC]:
 	body_c ?= emit_function_body(body, next_temp)
-	cleanup_policy: CoreReleasePolicy = let_cleanup_policy(name, is_mutable, typ)
+	cleanup_policy: CoreReleasePolicy = let_cleanup_policy(name, is_mutable, typ, rhs)
 	tracks_cleanup: Bool = let_tracks_cleanup(cleanup_policy, body, name)
 
 	cleanup_push: String = if tracks_cleanup:
@@ -19844,6 +19896,8 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 		LiteralExpr(literal, typ, loc):
 			value ?= emit_simple_expr(expr)
 			Some(body_value(value, next_temp))
+		StaticStringLiteralExpr(id, value, typ, loc):
+			Some(body_value(emit_static_string_literal_expr(id), next_temp))
 		VarExpr(variable, typ, loc):
 			value ?= emit_simple_expr(expr)
 			Some(body_value(value, next_temp))
@@ -20732,6 +20786,8 @@ private pure func emit_channel_attempt_user_function(
 		CallExpr(kind, callee, args, typ, loc):
 			None
 		LiteralExpr(literal, typ, loc):
+			None
+		StaticStringLiteralExpr(id, value, typ, loc):
 			None
 		VarExpr(variable, typ, loc):
 			None
@@ -21889,6 +21945,8 @@ private pure func static_value_supported(typ: CoreType, expr: CoreExpr) -> Bool:
 	match expr:
 		LiteralExpr(literal, literal_type, loc):
 			static_literal_supported(typ, literal)
+		StaticStringLiteralExpr(id, value, literal_type, loc):
+			False
 		ListConstructExpr(construct, list_type, loc):
 			(
 				canonical_empty_list_for_construct(construct).is_some()
@@ -22114,6 +22172,8 @@ private pure func static_value_initializer(
 	match expr:
 		LiteralExpr(literal, literal_type, loc):
 			static_literal_value_initializer(path_c, typ, literal)
+		StaticStringLiteralExpr(id, value, literal_type, loc):
+			None
 		ListConstructExpr(construct, list_type, loc):
 			match canonical_empty_list_for_construct(construct):
 				Some(canonical):
@@ -22660,6 +22720,37 @@ private pure func emit_canonical_empty_list_definitions(items: List[CanonicalEmp
 	definitions.join("\n")
 
 
+private STATIC_STRING_LITERAL_DECLARATION_MACRO: String =
+	|#define BLORP_STATIC_STRING(name, length, bytes) \
+	|  _Static_assert(sizeof(bytes) == (length) + 1, "string literal byte length"); \
+	|  static blorp_String name = { \
+	|    .header = { BLORP_IMMORTAL_REFCOUNT, BLORP_ALLOC_CLASS_DIRECT, 0 }, \
+	|    .len = (length), \
+	|    .capacity = (length), \
+	|    .data = bytes \
+	|  }
+
+
+private pure func emit_static_string_literal_definition(
+	literal: BackendStaticStringLiteral,
+) -> String:
+	symbol: String = static_string_literal_symbol(literal.id)
+	length: Int = literal.value.length()
+	bytes: String = c_string_literal(literal.value)
+	"BLORP_STATIC_STRING(${symbol}, ${length}L, ${bytes});"
+
+
+private pure func emit_static_string_literal_definitions(
+	literals: List[BackendStaticStringLiteral],
+) -> String:
+	if literals.length() == 0:
+		""
+	else:
+		STATIC_STRING_LITERAL_DECLARATION_MACRO + "\n\n" + literals
+			.map(emit_static_string_literal_definition)
+			.join("\n") + "\n\n"
+
+
 private pure func global_has_static_managed_decl(global: CoreGlobal) -> Bool:
 	global.is_const and static_value_supported(global.typ, global.init)
 
@@ -22705,6 +22796,8 @@ private pure func emit_global_static_init_expr(init: CoreExpr) -> Option[String]
 					emit_simple_expr(init)
 				StringLiteral(value):
 					None
+		StaticStringLiteralExpr(id, value, typ, loc):
+			Some(emit_static_string_literal_expr(id))
 		VarExpr(variable, typ, loc):
 			None
 		VoidExpr(typ, loc):
@@ -24068,6 +24161,11 @@ private pure func emit_decls(
 ) -> Result[String, CoreEmitError]:
 	decls: List[CoreDecl] = program.decls
 	layouts: CRecordLayoutRegistry = classify_c_record_layouts(program)
+	static_string_literals ?= collect_backend_static_string_literals(
+		program,
+	).map_err(
+		func(error): InvalidStaticStringLiteralPool(error),
+	)
 	global_init ?= emit_global_init_function(decls)
 	var c_code: String = make_string(0)
 	c_code = append_emitted_c(c_code, emit_heap_record_and_union_forward_decls(decls))
@@ -24083,6 +24181,10 @@ private pure func emit_decls(
 		emit_heap_record_decls(decls, layouts),
 	)
 	c_code = append_emitted_c(c_code, emit_canonical_empty_list_definitions(canonical_empty_lists))
+	c_code = append_emitted_c(
+		c_code,
+		emit_static_string_literal_definitions(static_string_literals),
+	)
 	c_code = append_emitted_c(c_code, emit_static_closure_forward_decls(decls))
 	c_code = append_emitted_c(
 		c_code,

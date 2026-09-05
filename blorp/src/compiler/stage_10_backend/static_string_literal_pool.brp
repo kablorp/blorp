@@ -1,0 +1,193 @@
+-- Validate the Stage 09 string-literal classification at the backend boundary.
+--
+-- This module does not assign or reassign IDs. It only verifies the surviving
+-- Core nodes and presents them in ID order for deterministic C emission.
+import:
+	../stage_09_core/ir:
+		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
+		CoreExpr(LiteralExpr, StaticStringLiteralExpr),
+		CoreFunction,
+		CoreLiteral(StringLiteral),
+		CoreProgram,
+		StaticStringLiteralId,
+		static_string_literal_id,
+		static_string_literal_id_value,
+	../stage_09_core/traverse as CoreTraverse
+	dict: Dict
+
+
+record BackendStaticStringLiteral {
+	id: StaticStringLiteralId,
+	value: String
+}
+
+
+union StaticStringLiteralPoolError:
+	NegativeStaticStringLiteralId(Int)
+	StaticStringLiteralIdConflict(Int, String, String)
+	StaticStringLiteralValueConflict(String, Int, Int)
+	UnpooledValueStringLiteral(String)
+
+
+private record StaticStringLiteralPoolState {
+	values_by_id: Dict[Int, String],
+	ids_by_value: Dict[String, Int],
+	max_id: Int,
+	error: Option[StaticStringLiteralPoolError]
+}
+
+
+private EMPTY_STATIC_STRING_LITERAL_POOL_STATE: StaticStringLiteralPoolState = {
+	values_by_id = {},
+	ids_by_value = {},
+	max_id = -1,
+	error = None
+}
+
+
+private pure func add_static_string_literal(
+	state: StaticStringLiteralPoolState,
+	id: StaticStringLiteralId,
+	value: String,
+) -> StaticStringLiteralPoolState:
+	if state.error.is_some():
+		state
+	else:
+		id_value: Int = static_string_literal_id_value(id)
+
+		if id_value < 0:
+			{ state | error = Some(NegativeStaticStringLiteralId(id_value)) }
+		else:
+			match state.values_by_id.get(id_value):
+				Some(existing_value):
+					if existing_value == value:
+						state
+					else:
+						{ state |
+							error = Some(
+								StaticStringLiteralIdConflict(
+									id_value,
+									existing_value,
+									value,
+								),
+							)
+						}
+				None:
+					match state.ids_by_value.get(value):
+						Some(existing_id):
+							{ state |
+								error = Some(
+									StaticStringLiteralValueConflict(
+										value,
+										existing_id,
+										id_value,
+									),
+								)
+							}
+						None:
+							max_id: Int = if id_value > state.max_id:
+								id_value
+							else:
+								state.max_id
+
+							{
+								values_by_id = state.values_by_id.set(id_value, value),
+								ids_by_value = state.ids_by_value.set(value, id_value),
+								max_id = max_id,
+								error = None
+							}
+
+
+private pure func collect_expr_static_string_literals(
+	state: StaticStringLiteralPoolState,
+	root: CoreExpr,
+) -> StaticStringLiteralPoolState:
+	var result: StaticStringLiteralPoolState = state
+	var pending: List[CoreExpr] = [root]
+	var cursor: Int = 0
+
+	while cursor < pending.length() and result.error.is_none():
+		current: CoreExpr = pending.get_or(cursor, root)
+
+		match current:
+			StaticStringLiteralExpr(id, value, typ, loc):
+				result = add_static_string_literal(result, id, value)
+			LiteralExpr(StringLiteral(value), typ, loc):
+				result = { result | error = Some(UnpooledValueStringLiteral(value)) }
+			_:
+				void
+
+		for child in CoreTraverse.immediate_core_expr_children(current):
+			pending = pending.append(child)
+
+		cursor += 1
+
+	result
+
+
+private pure func collect_function_static_string_literals(
+	state: StaticStringLiteralPoolState,
+	function_info: CoreFunction,
+) -> StaticStringLiteralPoolState:
+	match function_info.body:
+		Some(body):
+			collect_expr_static_string_literals(state, body)
+		None:
+			state
+
+
+private pure func collect_decl_static_string_literals(
+	state: StaticStringLiteralPoolState,
+	decl: CoreDecl,
+) -> StaticStringLiteralPoolState:
+	match decl:
+		FunctionDecl(function_info):
+			collect_function_static_string_literals(state, function_info)
+		GlobalDecl(global):
+			collect_expr_static_string_literals(state, global.init)
+		ImplDecl(impl):
+			var result: StaticStringLiteralPoolState = state
+
+			for method in impl.methods:
+				result = collect_function_static_string_literals(result, method)
+
+			result
+		_:
+			state
+
+
+private pure func ordered_static_string_literals(
+	state: StaticStringLiteralPoolState,
+) -> List[BackendStaticStringLiteral]:
+	var result: List[BackendStaticStringLiteral] = []
+	var id_value: Int = 0
+
+	while id_value <= state.max_id:
+		match state.values_by_id.get(id_value):
+			Some(value):
+				result = result.append({
+					id = static_string_literal_id(id_value),
+					value = value,
+				})
+			None:
+				void
+
+		id_value += 1
+
+	result
+
+
+pure func collect_backend_static_string_literals(
+	program: CoreProgram,
+) -> Result[List[BackendStaticStringLiteral], StaticStringLiteralPoolError]:
+	var state: StaticStringLiteralPoolState = EMPTY_STATIC_STRING_LITERAL_POOL_STATE
+
+	for decl in program.decls:
+		if state.error.is_none():
+			state = collect_decl_static_string_literals(state, decl)
+
+	match state.error:
+		Some(error):
+			Err(error)
+		None:
+			Ok(ordered_static_string_literals(state))
