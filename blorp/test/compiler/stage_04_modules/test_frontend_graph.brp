@@ -14,9 +14,20 @@ import:
 		FrontendImportEdge,
 		FrontendImportResolution(FrontendResolvedImport, FrontendUnresolvedImport),
 		FrontendModule,
+		FrontendModuleReferenceResolution(
+			ResolvedFrontendModuleReference,
+			UnresolvedFrontendModuleReference,
+		),
 		frontend_graph,
 		frontend_graph_direct_dependents,
+		frontend_graph_find_module_id,
 		frontend_graph_import_edges,
+		frontend_graph_module,
+		frontend_graph_module_ids,
+		frontend_graph_reference,
+		frontend_graph_reference_ids,
+		frontend_graph_reference_resolution,
+		frontend_graph_root_ids,
 	../../../src/compiler/stage_04_modules/loaded_module:
 		ModuleOrigin(SourcePackageModule, UserModule),
 		ResolvedModuleIdentity,
@@ -209,18 +220,14 @@ pure func test_graph_preserves_mixed_validation_error_order() -> Bool:
 		},
 	]
 
-	match frontend_graph(
-		[reserved, first, second, app],
-		[missing_root],
-		edges,
+	match (
+		frontend_graph(
+			[reserved, first, second, app],
+			[missing_root],
+			edges,
+		)
 	):
-		Err([
-			ReservedCompilerFrontendModulePath(found_reserved),
-			DuplicateCompilerFrontendModulePath(found_first, found_second),
-			MissingCompilerFrontendRoot(found_root),
-			MissingCompilerFrontendEdgeImporter(found_importer),
-			MissingCompilerFrontendEdgeTarget(found_target)
-		]):
+		Err([ReservedCompilerFrontendModulePath(found_reserved), DuplicateCompilerFrontendModulePath(found_first, found_second), MissingCompilerFrontendRoot(found_root), MissingCompilerFrontendEdgeImporter(found_importer), MissingCompilerFrontendEdgeTarget(found_target)]):
 			(
 				resolved_module_identities_equal(found_reserved, reserved.identity)
 				and resolved_module_identities_equal(found_first, first.identity)
@@ -311,6 +318,91 @@ pure func test_graph_direct_dependents_deduplicate_without_reordering() -> Bool:
 					False
 
 
+pure func test_graph_retains_dense_module_and_reference_tables() -> Bool:
+	app = module("app/main", "main", UserModule)
+	dependency = module("packages/math/stats", "stats", SourcePackageModule("math"))
+	edges: List[FrontendImportEdge] = [
+		{
+			importer = app.identity,
+			requested_path = "stats",
+			resolution = FrontendResolvedImport(dependency.identity)
+		},
+		{
+			importer = app.identity,
+			requested_path = "missing",
+			resolution = FrontendUnresolvedImport
+		},
+	]
+
+	match (
+		frontend_graph(
+			[app, dependency],
+			[app.identity],
+			edges,
+		)
+	):
+		Err(_):
+			False
+		Ok(graph):
+			match (
+				frontend_graph_find_module_id(graph, app.identity),
+				frontend_graph_find_module_id(graph, dependency.identity),
+			):
+				(Some(app_id), Some(dependency_id)):
+					ids = frontend_graph_module_ids(graph)
+					references = frontend_graph_reference_ids(graph, app_id)
+
+					match (ids, frontend_graph_root_ids(graph), references):
+						([first_id, second_id], [root_id], [resolved_id, unresolved_id]):
+							resolved_ok: Bool = match (
+								frontend_graph_reference(graph, resolved_id),
+								frontend_graph_reference_resolution(graph, resolved_id),
+							):
+								(Some(reference), Some(ResolvedFrontendModuleReference(target_id))):
+									(
+										reference.importer == app_id
+										and reference.requested_path == "stats"
+										and target_id == dependency_id
+									)
+								_:
+									False
+
+							unresolved_ok: Bool = match (
+								frontend_graph_reference(graph, unresolved_id),
+								frontend_graph_reference_resolution(graph, unresolved_id),
+							):
+								(Some(reference), Some(UnresolvedFrontendModuleReference)):
+									(
+										reference.importer == app_id
+										and reference.requested_path == "missing"
+									)
+								_:
+									False
+
+							module_ok: Bool = match frontend_graph_module(graph, dependency_id):
+								Some(found):
+									resolved_module_identities_equal(
+										found.identity,
+										dependency.identity,
+									)
+								None:
+									False
+
+							(
+								first_id == app_id
+								and second_id == dependency_id
+								and root_id == app_id
+								and frontend_graph_reference_ids(graph, dependency_id).length() == 0
+								and resolved_ok
+								and unresolved_ok
+								and module_ok
+							)
+						_:
+							False
+				_:
+					False
+
+
 tests: TestSuite = {
 	description = "Compiler frontend graph model",
 	tests = [
@@ -337,6 +429,10 @@ tests: TestSuite = {
 		(
 			"direct dependents deduplicate without reordering",
 			test_graph_direct_dependents_deduplicate_without_reordering,
+		),
+		(
+			"retain dense module and reference tables",
+			test_graph_retains_dense_module_and_reference_tables,
 		),
 	]
 }
