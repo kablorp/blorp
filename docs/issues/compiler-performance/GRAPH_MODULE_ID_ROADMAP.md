@@ -2,7 +2,9 @@
 
 **Status:** Issues 46 and 47 retained a measured TypeHeader-only vertical
 slice; Issues 48 and 49 were rejected; Issue 50 retained ordinal import
-adjacency; Issue 51 is deferred pending a production catalog consumer
+adjacency; Issue 55 retained Stage 04 module/reference reuse by explicit
+maintainer decision despite missing its performance gate; Issue 51 is deferred
+pending a production catalog consumer
 
 Issue 45's standalone candidate reduced allocations in a narrow indexed-scope
 lookup but increased whole-compiler retired instructions by 0.319%, so its
@@ -10,6 +12,16 @@ production code was restored. Issue 46 was later reactivated as one combined
 replacement-substrate plus TypeHeader consumer slice. That bounded slice
 reduced whole-compiler retired instructions by 0.600% and was retained; global
 and callable extensions were measured and rejected.
+
+Issue 55 retained graph-local module/reference IDs across the Stage 04 to Stage
+06 handoff and removed the first descriptive reconstruction boundary. Exact
+direct/replay behavior was green, but a matched whole-compiler comparison
+improved retired instructions by only 0.0154%, below its predeclared 0.10%
+gate, with noisy elapsed regression. The maintainer explicitly retained the
+implementation for its architectural reuse value. Follow-up work may consume
+the retained graph tables, but must independently clear a predeclared
+instruction or allocation gate rather than treating Issue 55 as evidence of a
+compiler-wide speedup.
 
 ## Objective
 
@@ -174,7 +186,10 @@ order, while all observable compiler work preserves its current order.
 50 resolved import adjacency by index-local module ordinal
  |
  v
-51 declaration catalog module buckets, only if its cost-share scout passes
+55 preserve Stage 04 module/reference data through Stage 06
+
+51 declaration catalog module buckets remains independent and may start only
+if its production-consumer and cost-share gates pass
 ```
 
 The original Issue 45 arrow was broken by its rejected experiment. Issue 46's
@@ -266,6 +281,20 @@ by 96.59%, and reduced the production graph-preparation interval allocations
 by 0.130% with byte-identical output. Whole-compiler retired instructions
 improved by 0.0137%, so the result is a bounded visibility win rather than a
 compiler-wide speedup claim.
+
+### Issue 55: Preserve Stage 04 resolved module data
+
+The candidate made the accepted Stage 04 frontend graph own one dense module
+table and exact source-reference resolution table, then bypassed the first
+descriptive Stage 06 reconstruction boundary. Direct/replay semantics were
+exact, including repeated imports and reordered resolver outcomes.
+
+The implementation was retained by explicit maintainer decision after matched
+production measurement improved retired instructions by only 0.0154% against
+a 0.10% gate and did not provide a stable elapsed improvement. The graph-owned
+IDs and direct adapter therefore remain available, but removing the remaining
+canonical program/surface rewrites and importable indexes would require a
+broader binding and CTFE data-flow change with its own measured gate.
 
 ### Issue 51: Consolidate declaration catalog module indexes if measured
 
