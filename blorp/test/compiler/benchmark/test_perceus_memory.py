@@ -193,6 +193,16 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
         self.assertEqual(census["dup_by_policy"], {"arc": 1})
         self.assertEqual(census["drop_by_policy"], {"arc": 1})
 
+    def test_core_ownership_census_ignores_nested_non_expression_kind_objects(self) -> None:
+        census = self.benchmark.core_ownership_census({
+            "kind": "tensor_boxed_literal",
+            "literal": {
+                "elements": [{"kind": {"kind": "pointer"}}],
+            },
+        })
+
+        self.assertEqual(census["expression_nodes"], 1)
+
     def test_core_expression_census_vocabulary_matches_serialized_ir(self) -> None:
         ir_source = (
             ROOT / "blorp" / "src" / "compiler" / "stage_09_core" / "ir.brp"
@@ -210,15 +220,18 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
     def test_supported_body_shapes_are_structurally_distinct(self) -> None:
         fingerprints = set()
         for body_shape in self.benchmark.BODY_SHAPES:
-            mixed_function_catalog = body_shape == "mixed_function_owner_catalog"
+            fixed_large_shape = body_shape in (
+                "mixed_function_owner_catalog",
+                "borrowed_boundary_fusion",
+            )
             _, program = self.benchmark.fixture_request(
-                8 if mixed_function_catalog else 4,
+                8 if fixed_large_shape else 4,
                 3,
-                1536 if mixed_function_catalog else 256,
-                8 if mixed_function_catalog else 2,
-                params_per_function=32 if mixed_function_catalog else 2,
+                1536 if fixed_large_shape else 256,
+                8 if fixed_large_shape else 2,
+                params_per_function=32 if fixed_large_shape else 2,
                 body_shape=body_shape,
-                branch_arms=2,
+                branch_arms=8 if body_shape == "borrowed_boundary_fusion" else 2,
                 user_call_edges=2,
             )
             worker = next(
@@ -241,6 +254,53 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
 
     def test_mixed_function_owner_catalog_is_a_supported_body_shape(self) -> None:
         self.assertIn("mixed_function_owner_catalog", self.benchmark.BODY_SHAPES)
+
+    def test_borrowed_boundary_fusion_is_a_supported_body_shape(self) -> None:
+        self.assertIn("borrowed_boundary_fusion", self.benchmark.BODY_SHAPES)
+
+    def test_borrowed_boundary_fusion_fixture_has_fixed_geometry(self) -> None:
+        for density in (8, 32, 96):
+            with self.subTest(density=density):
+                _, program = self.benchmark.fixture_request(
+                    8,
+                    2,
+                    1536,
+                    8,
+                    params_per_function=32,
+                    body_shape="borrowed_boundary_fusion",
+                    branch_arms=density,
+                    invoke_workers=False,
+                )
+                workers = [
+                    declaration
+                    for declaration in program["decls"]
+                    if declaration.get("kind") == "function"
+                    and declaration.get("name", "").startswith("bench_worker_")
+                ]
+
+                self.assertEqual(len(workers), 2)
+                for worker in workers:
+                    self.assertEqual(len(worker["params"]), 32)
+                    self.assertEqual(
+                        self.benchmark.expression_node_count(worker["body"]),
+                        1536,
+                    )
+                    self.assertEqual(
+                        self.benchmark.borrowed_boundary_fusion_census(worker["body"]),
+                        {
+                            "call_slots": 96,
+                            "active_calls": density,
+                            "storage_slots": 96,
+                            "active_storage": density,
+                            "result_slots": 96,
+                            "active_results": density,
+                            "distinct_globals": 8,
+                            "nested_lambdas": 0,
+                            "literal_matches": 1,
+                            "resource_scopes": 1,
+                            "opaque_padding_nodes": 0,
+                        },
+                    )
 
     def test_mixed_function_owner_fixture_has_fixed_geometry(self) -> None:
         _, program = self.benchmark.fixture_request(
@@ -1299,6 +1359,103 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
             (1, 1, 1, 2, 1536, "mixed_function_owner_catalog", False, "perceus-direct"),
             (32, 8, 8, 2, 1536, "mixed_function_owner_catalog", False, "perceus-direct"),
         ])
+
+    def test_borrowed_boundary_fusion_matrix_reuses_workers(self) -> None:
+        args = argparse.Namespace(
+            bridge=None,
+            counter_bridge=None,
+            baseline_bridge="/tmp/perceus-checkpoint-a-worker",
+            baseline_counter_bridge="/tmp/perceus-checkpoint-a-counter-worker",
+            globals=1,
+            functions=2,
+            body_leaves=64,
+            global_reads_per_function=0,
+            params_per_function=0,
+            parameter_type="String",
+            body_shape="linear",
+            end_to_end=False,
+            work_counters=False,
+        )
+
+        with mock.patch.object(
+            self.benchmark,
+            "prepare_backend_worker",
+            side_effect=lambda _root, _directory, explicit, **_kwargs: Path(
+                explicit or "/tmp/perceus-worker"
+            ),
+        ) as prepare, mock.patch.object(
+            self.benchmark,
+            "run_benchmark",
+            return_value=0,
+        ) as run:
+            self.benchmark.run_borrowed_boundary_fusion_matrix(args)
+
+        self.assertEqual(prepare.call_count, 1)
+        points = [
+            (
+                call.args[0].branch_arms,
+                call.args[0].params_per_function,
+                call.args[0].global_reads_per_function,
+                call.args[0].functions,
+                call.args[0].body_leaves,
+                call.args[0].body_shape,
+                call.args[0].invoke_workers,
+                call.args[0].measurement_window,
+            )
+            for call in run.call_args_list
+        ]
+        self.assertEqual(points, [
+            (8, 32, 8, 2, 1536, "borrowed_boundary_fusion", False, "perceus-direct"),
+            (32, 32, 8, 2, 1536, "borrowed_boundary_fusion", False, "perceus-direct"),
+            (96, 32, 8, 2, 1536, "borrowed_boundary_fusion", False, "perceus-direct"),
+        ])
+
+    def test_borrowed_boundary_fusion_matrix_accepts_fused_visit_budget(self) -> None:
+        points = []
+        for density in (8, 32, 96):
+            points.append({
+                "branch_arms": density,
+                "functions": 2,
+                "params_per_function": 32,
+                "global_reads_per_function": 8,
+                "paired_window_elapsed_microseconds_ratio_median": 0.99,
+                "paired_window_allocations_ratio_median": 0.98,
+                "paired_window_releases_ratio_median": 0.98,
+                "work_counters": {
+                    "borrowed_call_node_visits": 0,
+                    "borrowed_aggregate_node_visits": 0,
+                    "borrowed_result_node_visits": 0,
+                    "borrowed_fused_node_visits": 900,
+                    "borrowed_call_alias_fallback_requests": 0,
+                    "borrowed_aggregate_alias_fallback_requests": 0,
+                    "borrowed_result_alias_fallback_requests": 0,
+                    "borrowed_call_fallback_expression_visits": 0,
+                    "borrowed_aggregate_fallback_expression_visits": 0,
+                    "borrowed_result_fallback_expression_visits": 0,
+                    "borrowed_call_rewrite_actions": 2 * density,
+                    "borrowed_aggregate_rewrite_actions": 2 * density,
+                    "borrowed_result_rewrite_actions": 2 * density,
+                    "borrowed_call_reconstructed_nodes": 0,
+                    "borrowed_aggregate_reconstructed_nodes": 0,
+                    "borrowed_result_reconstructed_nodes": 0,
+                    "borrowed_fused_reconstructed_nodes": 700,
+                    "borrowed_function_regions_normalized": 2,
+                    "borrowed_global_initializer_regions_normalized": 0,
+                    "lambda_regions_normalized": 0,
+                    "borrowed_function_parameter_owner_slots": 64,
+                    "borrowed_function_global_owner_slots": 16,
+                },
+                "baseline_work_counters": {
+                    "borrowed_call_node_visits": 1000,
+                    "borrowed_aggregate_node_visits": 800,
+                    "borrowed_result_node_visits": 200,
+                    "borrowed_call_reconstructed_nodes": 900,
+                    "borrowed_aggregate_reconstructed_nodes": 700,
+                    "borrowed_result_reconstructed_nodes": 180,
+                },
+            })
+
+        self.benchmark.validate_borrowed_boundary_fusion_matrix(points)
 
     def test_mixed_function_owner_matrix_requires_combined_catalog_gain(self) -> None:
         def point(

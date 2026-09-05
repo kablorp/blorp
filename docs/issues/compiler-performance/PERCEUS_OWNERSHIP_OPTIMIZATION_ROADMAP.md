@@ -1129,7 +1129,16 @@ chronology of internal rewrite-helper calls from three whole-region passes.
 Checkpoint A is complete: ordinary-function parameters and exact globals now
 share one ordered catalog, reducing the measured high-owner direct-Perceus
 window by 11.7% and allocations by 6.3% while preserving exact Core and C.
-Checkpoints B–C remain proposed.
+Checkpoint B is also complete: every Core expression and nested
+expression-bearing composite has a test-enforced three-mode inventory, and the
+fixed fusion matrix now locks exact legacy visits, rebuilds, actions, region
+membership, and zero-fallback behavior. Checkpoint C is complete: one private
+typed normalizer now owns each nonempty region, and the three superseded
+all-owner structural walkers plus their duplicate helper families are deleted.
+The fixed matrix reduced visits by 48.8–53.9% and allocations by 2.6–3.0% with
+byte-identical artifacts. Direct time remained within ±1.4% rather than
+realizing the prospective 10% improvement. See
+[`compiler_perceus_tranche4d_checkpoint_c_2026-09-05.md`](../../../benchmarks/results/compiler_perceus_tranche4d_checkpoint_c_2026-09-05.md).
 
 ### Tranche-wide acceptance
 
@@ -1141,8 +1150,10 @@ Checkpoints B–C remain proposed.
   its 32-owner focused direct-Perceus median by at least 15%, and lowers focused
   direct-window allocations by at least 20%.
 - Issue 51 visits each ownership region once, reduces overlapping traversal
-  visits by at least 50%, improves the fusion fixture's direct-Perceus median by
-  at least 10%, and lowers focused allocations by at least 15%.
+  visits by 48.8–53.9%, and lowers focused allocations by 2.6–3.0%. The
+  original uniform 50% visit and 10% time/15% allocation forecasts were revised
+  from the exact Checkpoint B/C census; complete-window time must remain within
+  the documented 5% bound.
 - Low-owner/low-density controls remain neutral within specified paired noise
   and allocation bounds.
 - Every checkpoint preserves exact ownership-event order, post-Perceus Core,

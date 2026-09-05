@@ -300,6 +300,7 @@ hygiene-check: build-blorp-cli
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/benchmark/test_backend_memory.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/benchmark/test_perceus_memory.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/stage_09_core/support/test_ownership_node_inventory.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/stage_09_core/support/test_borrowed_boundary_child_modes.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/stage_09_core/support/test_cleanup_coverage_ledger.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test/test_session_benchmark.py
 	@PYTHONDWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/stage_06_typecheck/support/test_worker.py

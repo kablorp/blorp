@@ -28,7 +28,7 @@ from compiler_backend_worker import (
 )
 
 
-FIXTURE_VERSION = 8
+FIXTURE_VERSION = 9
 DEFAULT_TIMEOUT_SECONDS = 60.0
 PERCEUS_ACTION = "run_perceus"
 MEASURE_OWNERSHIP_PREPARATION_PERCEUS_ACTION = (
@@ -45,6 +45,7 @@ BODY_SHAPES = (
     "borrowed_return",
     "referenced_global_boundary",
     "mixed_function_owner_catalog",
+    "borrowed_boundary_fusion",
     "lambda_borrowed_boundary",
     "nested_user_call",
     "mutually_recursive_calls",
@@ -80,6 +81,18 @@ PERCEUS_WORK_COUNTER_NAMES = (
     "borrowed_result_owner_candidate_visits",
     "borrowed_result_alias_fallback_requests",
     "borrowed_result_rewrite_actions",
+    "borrowed_call_fallback_expression_visits",
+    "borrowed_aggregate_fallback_expression_visits",
+    "borrowed_result_fallback_expression_visits",
+    "borrowed_call_reconstructed_nodes",
+    "borrowed_aggregate_reconstructed_nodes",
+    "borrowed_result_reconstructed_nodes",
+    "borrowed_fused_node_visits",
+    "borrowed_fused_reconstructed_nodes",
+    "borrowed_function_regions_normalized",
+    "borrowed_global_initializer_regions_normalized",
+    "borrowed_function_parameter_owner_slots",
+    "borrowed_function_global_owner_slots",
     "referenced_global_discovery_node_visits",
     "referenced_global_read_candidates",
     "referenced_global_exact_matches",
@@ -188,6 +201,12 @@ MIXED_FUNCTION_OWNER_MATRIX_BODY_NODES = 1536
 MIXED_FUNCTION_OWNER_BOUNDARY_SITES_PER_FAMILY = 32
 MIXED_FUNCTION_OWNER_HIGH_PARAMETERS = 32
 MIXED_FUNCTION_OWNER_HIGH_GLOBALS = 8
+BORROWED_BOUNDARY_FUSION_FUNCTIONS = 2
+BORROWED_BOUNDARY_FUSION_BODY_NODES = 1536
+BORROWED_BOUNDARY_FUSION_PARAMETERS = 32
+BORROWED_BOUNDARY_FUSION_GLOBALS = 8
+BORROWED_BOUNDARY_FUSION_SLOTS_PER_FAMILY = 96
+BORROWED_BOUNDARY_FUSION_DENSITIES = (8, 32, 96)
 LAMBDA_OWNER_MATRIX_FUNCTIONS = 2
 LAMBDA_OWNER_MATRIX_BODY_NODES = 256
 LAMBDA_CALL_SITES_PER_FUNCTION = 12
@@ -351,7 +370,7 @@ def core_ownership_census(core_program: JsonObject) -> JsonObject:
         nonlocal expression_nodes
         if isinstance(value, dict):
             kind = value.get("kind")
-            if kind in CORE_EXPR_KINDS:
+            if isinstance(kind, str) and kind in CORE_EXPR_KINDS:
                 expression_nodes += 1
             if kind == "dup":
                 policy = str(value.get("retain_policy", "unknown"))
@@ -527,7 +546,8 @@ def expression_node_count(value: Any) -> int:
     while pending:
         current = pending.pop()
         if isinstance(current, dict):
-            node_count += int(current.get("kind") in CORE_EXPR_KINDS)
+            kind = current.get("kind")
+            node_count += int(isinstance(kind, str) and kind in CORE_EXPR_KINDS)
             pending.extend(current.values())
         elif isinstance(current, list):
             pending.extend(current)
@@ -583,6 +603,40 @@ def balanced_padded_sequence(
         }
     if expression_node_count(result) != target_nodes:
         raise RuntimeError("failed to construct exact Perceus body node target")
+    return result
+
+
+def balanced_padded_sequence_without_wrapper(
+    expressions: list[JsonObject],
+    target_nodes: int,
+) -> JsonObject:
+    """Reach an exact size without an outer child-domain-changing wrapper."""
+    if not expressions:
+        expressions = [literal_expr("int", 0, "Int")]
+    current_nodes = expression_node_count(balanced_seq_expr(expressions))
+    if current_nodes > target_nodes:
+        raise ValueError(
+            f"body workload needs {current_nodes} nodes but target is {target_nodes}"
+        )
+    remaining_nodes = target_nodes - current_nodes
+    if remaining_nodes % 2 == 1:
+        if remaining_nodes < 5:
+            raise ValueError("exact traversable padding needs at least five odd nodes")
+        expressions.append({
+            "kind": "if",
+            "cond": literal_expr("bool", True, "Bool"),
+            "then": literal_expr("int", 0, "Int"),
+            "else": literal_expr("int", 0, "Int"),
+            "type": named_type("Int"),
+            "loc": synthetic_loc(),
+        })
+        current_nodes += 5
+    while current_nodes + 2 <= target_nodes:
+        expressions.append(literal_expr("int", current_nodes, "Int"))
+        current_nodes += 2
+    result = balanced_seq_expr(expressions)
+    if expression_node_count(result) != target_nodes:
+        raise RuntimeError("failed to construct exact traversable body node target")
     return result
 
 
@@ -1096,6 +1150,311 @@ def mixed_function_owner_census(value: Any) -> JsonObject:
     }
 
 
+def borrowed_boundary_fusion_owner_ref(
+    function_index: int,
+    site_index: int,
+) -> JsonObject:
+    if site_index % 2 == 0:
+        return global_ref_expr((site_index // 2) % BORROWED_BOUNDARY_FUSION_GLOBALS)
+    return {
+        "kind": "field",
+        "expr": {
+            "kind": "var",
+            "var": core_var(
+                borrowed_param_name(
+                    function_index,
+                    (site_index // 2) % BORROWED_BOUNDARY_FUSION_PARAMETERS,
+                ),
+                None,
+            ),
+            "type": heap_record_type(BORROWED_OWNER_TYPE_NAME),
+            "loc": synthetic_loc(),
+        },
+        "field": "BENCH_PAYLOAD",
+        "type": named_type(MANAGED_PARAMETER_TYPE),
+        "loc": synthetic_loc(),
+    }
+
+
+def borrowed_boundary_fusion_call_slot(
+    function_index: int,
+    site_index: int,
+    active_density: int,
+) -> JsonObject:
+    builtin = (
+        "blorp_string_concat_consume"
+        if site_index < active_density
+        else "blorp_string_concat"
+    )
+    return {
+        "kind": "call",
+        "call_kind": {"kind": "builtin", "name": builtin},
+        "callee": {
+            "kind": "var",
+            "var": core_var(builtin, None),
+            "type": named_type("Function"),
+            "loc": synthetic_loc(),
+        },
+        "args": [
+            borrowed_boundary_fusion_owner_ref(function_index, site_index),
+            literal_expr("string", "", MANAGED_PARAMETER_TYPE),
+        ],
+        "type": named_type(MANAGED_PARAMETER_TYPE),
+        "loc": synthetic_loc(),
+    }
+
+
+def borrowed_boundary_fusion_storage_slot(
+    function_index: int,
+    site_index: int,
+    active_density: int,
+) -> JsonObject:
+    active = site_index < active_density
+    return {
+        "kind": "tensor_boxed_literal",
+        "literal": {
+            "shape": {"kind": "vector", "length": 1},
+            "elements": [{
+                "kind": {"kind": "pointer"},
+                "value": borrowed_boundary_fusion_owner_ref(
+                    function_index,
+                    site_index,
+                ),
+                "needs_release": active,
+                "transfers_ownership": active,
+            }],
+            "elem_needs_release": active,
+        },
+        "type": named_type("Tensor"),
+        "loc": synthetic_loc(),
+    }
+
+
+def borrowed_boundary_fusion_result_tree(
+    function_index: int,
+    active_density: int,
+) -> JsonObject:
+    results = [
+        (
+            borrowed_boundary_fusion_owner_ref(function_index, site_index)
+            if site_index < active_density
+            else literal_expr(
+                "string",
+                f"FUSION_INACTIVE_RESULT_{site_index:04d}",
+                MANAGED_PARAMETER_TYPE,
+            )
+        )
+        for site_index in range(BORROWED_BOUNDARY_FUSION_SLOTS_PER_FAMILY)
+    ]
+    while len(results) > 1:
+        next_level: list[JsonObject] = []
+        index = 0
+        while index + 1 < len(results):
+            next_level.append({
+                "kind": "if",
+                "cond": literal_expr("bool", True, "Bool"),
+                "then": results[index],
+                "else": results[index + 1],
+                "type": named_type(MANAGED_PARAMETER_TYPE),
+                "loc": synthetic_loc(),
+            })
+            index += 2
+        if index < len(results):
+            next_level.append(results[index])
+        results = next_level
+    return results[0]
+
+
+def borrowed_boundary_fusion_body(
+    function_index: int,
+    active_density: int,
+    body_nodes: int,
+) -> JsonObject:
+    if active_density not in BORROWED_BOUNDARY_FUSION_DENSITIES:
+        raise ValueError("borrowed-boundary density must be 8, 32, or 96")
+
+    work = [
+        borrowed_boundary_fusion_call_slot(
+            function_index,
+            site_index,
+            active_density,
+        )
+        for site_index in range(BORROWED_BOUNDARY_FUSION_SLOTS_PER_FAMILY)
+    ]
+    work.extend(
+        borrowed_boundary_fusion_storage_slot(
+            function_index,
+            site_index,
+            active_density,
+        )
+        for site_index in range(BORROWED_BOUNDARY_FUSION_SLOTS_PER_FAMILY)
+    )
+
+    result = borrowed_boundary_fusion_result_tree(function_index, active_density)
+    placeholder = literal_expr("int", 0, "Int")
+
+    def assemble(case_body: JsonObject) -> JsonObject:
+        managed_local_rhs = {
+            "kind": "call",
+            "call_kind": {"kind": "builtin", "name": "blorp_string_concat"},
+            "callee": {
+                "kind": "var",
+                "var": core_var("blorp_string_concat", None),
+                "type": named_type("Function"),
+                "loc": synthetic_loc(),
+            },
+            "args": [
+                literal_expr("string", "managed-fusion-", MANAGED_PARAMETER_TYPE),
+                literal_expr(
+                    "string",
+                    f"{function_index:04d}",
+                    MANAGED_PARAMETER_TYPE,
+                ),
+            ],
+            "type": named_type(MANAGED_PARAMETER_TYPE),
+            "loc": synthetic_loc(),
+        }
+        match_work = {
+            "kind": "literal_match",
+            "scrutinee": literal_expr("int", 0, "Int"),
+            "cases": [{
+                "literal": {"kind": "int", "value": 0},
+                "bindings": [],
+                "body": case_body,
+            }],
+            "fallback": {"kind": "fail"},
+            "type": named_type("Int"),
+            "loc": synthetic_loc(),
+        }
+        return {
+            "kind": "let",
+            "name": core_var(f"BENCH_MANAGED_LOCAL_{function_index:04d}", None),
+            "mutable": False,
+            "type": named_type(MANAGED_PARAMETER_TYPE),
+            "rhs": managed_local_rhs,
+            "body": {
+                "kind": "resource_scope",
+                "scope": {
+                    "var": core_var(f"BENCH_FUSION_RESOURCE_{function_index:04d}", None),
+                    "type": named_type(MANAGED_PARAMETER_TYPE),
+                    "acquire": literal_expr(
+                        "string",
+                        f"resource-fusion-{function_index:04d}",
+                        MANAGED_PARAMETER_TYPE,
+                    ),
+                    "body": {"kind": "seq", "first": match_work, "second": result},
+                    "cleanup": literal_expr("int", 0, "Int"),
+                },
+                "type": named_type(MANAGED_PARAMETER_TYPE),
+                "loc": synthetic_loc(),
+            },
+        }
+
+    fixed_nodes = expression_node_count(assemble(placeholder)) - 1
+    work_body = balanced_padded_sequence_without_wrapper(
+        work,
+        body_nodes - fixed_nodes,
+    )
+    body = assemble(work_body)
+    if expression_node_count(body) != body_nodes:
+        raise RuntimeError("borrowed-boundary fusion body node count changed")
+    return body
+
+
+def borrowed_boundary_fusion_census(value: Any) -> JsonObject:
+    call_slots = 0
+    active_calls = 0
+    storage_slots = 0
+    active_storage = 0
+    nested_lambdas = 0
+    literal_matches = 0
+    resource_scopes = 0
+    globals_seen: set[int] = set()
+    opaque_padding_nodes = 0
+
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            kind = current.get("kind")
+            if kind == "call":
+                call_kind = current.get("call_kind")
+                args = current.get("args")
+                first_arg = args[0] if isinstance(args, list) and args else None
+                if (
+                    isinstance(call_kind, dict)
+                    and isinstance(first_arg, dict)
+                    and first_arg.get("kind") in ("var", "field")
+                ):
+                    name = call_kind.get("name")
+                    if name in (
+                        "blorp_string_concat",
+                        "blorp_string_concat_consume",
+                    ):
+                        call_slots += 1
+                        active_calls += int(name == "blorp_string_concat_consume")
+            elif kind == "tensor_boxed_literal":
+                storage_slots += 1
+                literal = current.get("literal")
+                if isinstance(literal, dict):
+                    active_storage += int(bool(literal.get("elem_needs_release")))
+            elif kind == "lambda":
+                nested_lambdas += 1
+                continue
+            elif kind == "literal_match":
+                literal_matches += 1
+            elif kind == "resource_scope":
+                resource_scopes += 1
+            elif kind == "cast":
+                opaque_padding_nodes += 1
+            elif kind == "var":
+                variable = current.get("var")
+                if isinstance(variable, dict):
+                    name = variable.get("name")
+                    def_id = variable.get("def_id")
+                    if (
+                        isinstance(name, str)
+                        and name.startswith("BENCH_UNUSED_GLOBAL_")
+                        and isinstance(def_id, int)
+                    ):
+                        globals_seen.add(def_id - 1)
+            pending.extend(current.values())
+        elif isinstance(current, list):
+            pending.extend(current)
+
+    result_tree = value["body"]["scope"]["body"]["second"]
+    result_slots = 0
+    active_results = 0
+    pending_results = [result_tree]
+    while pending_results:
+        current = pending_results.pop()
+        if current.get("kind") == "if":
+            pending_results.extend((current["then"], current["else"]))
+        else:
+            result_slots += 1
+            literal = current.get("literal")
+            inactive = (
+                isinstance(literal, dict)
+                and isinstance(literal.get("value"), str)
+                and literal["value"].startswith("FUSION_INACTIVE_RESULT_")
+            )
+            active_results += int(not inactive)
+
+    return {
+        "call_slots": call_slots,
+        "active_calls": active_calls,
+        "storage_slots": storage_slots,
+        "active_storage": active_storage,
+        "result_slots": result_slots,
+        "active_results": active_results,
+        "distinct_globals": len(globals_seen),
+        "nested_lambdas": nested_lambdas,
+        "literal_matches": literal_matches,
+        "resource_scopes": resource_scopes,
+        "opaque_padding_nodes": opaque_padding_nodes,
+    }
+
+
 def lambda_owner_name(function_index: int, owner_index: int) -> str:
     return f"BENCH_LAMBDA_OWNER_{function_index:04d}_{owner_index:04d}"
 
@@ -1426,7 +1785,23 @@ def worker_decl(
     function_count: int,
     first_function_id: int,
     user_call_edges: int,
+    branch_arms: int,
 ) -> JsonObject:
+    if body_shape == "borrowed_boundary_fusion":
+        return user_function(
+            f"bench_worker_{index:04d}",
+            def_id,
+            borrowed_boundary_fusion_body(index, branch_arms, body_leaves),
+            [
+                core_param_with_type(
+                    borrowed_param_name(index, param_index),
+                    heap_record_type(BORROWED_OWNER_TYPE_NAME),
+                )
+                for param_index in range(params_per_function)
+            ],
+            MANAGED_PARAMETER_TYPE,
+        )
+
     if body_shape == "mixed_function_owner_catalog":
         return user_function(
             f"bench_worker_{index:04d}",
@@ -1698,7 +2073,6 @@ def fixture_request(
     branch_arms: int = 2,
     user_call_edges: int = 1,
 ) -> tuple[JsonObject, JsonObject]:
-    del branch_arms
     if body_shape not in BODY_SHAPES:
         raise ValueError(f"unsupported Perceus body shape: {body_shape}")
     globals_json = [global_decl(index) for index in range(global_count)]
@@ -1709,6 +2083,7 @@ def fixture_request(
             "aggregate_escape",
             "referenced_global_boundary",
             "mixed_function_owner_catalog",
+            "borrowed_boundary_fusion",
             "lambda_borrowed_boundary",
         )
         else []
@@ -1726,10 +2101,31 @@ def fixture_request(
             function_count,
             first_function_id,
             user_call_edges,
+            branch_arms,
         )
         for index in range(function_count)
     ]
-    if body_shape == "mixed_function_owner_catalog":
+    if body_shape == "borrowed_boundary_fusion":
+        expected_census = {
+            "call_slots": BORROWED_BOUNDARY_FUSION_SLOTS_PER_FAMILY,
+            "active_calls": branch_arms,
+            "storage_slots": BORROWED_BOUNDARY_FUSION_SLOTS_PER_FAMILY,
+            "active_storage": branch_arms,
+            "result_slots": BORROWED_BOUNDARY_FUSION_SLOTS_PER_FAMILY,
+            "active_results": branch_arms,
+            "distinct_globals": BORROWED_BOUNDARY_FUSION_GLOBALS,
+            "nested_lambdas": 0,
+            "literal_matches": 1,
+            "resource_scopes": 1,
+            "opaque_padding_nodes": 0,
+        }
+        for function in functions_json:
+            body = function.get("body")
+            if expression_node_count(body) != body_leaves:
+                raise RuntimeError("borrowed-boundary fusion body node count changed")
+            if borrowed_boundary_fusion_census(body) != expected_census:
+                raise RuntimeError("borrowed-boundary fusion census changed")
+    elif body_shape == "mixed_function_owner_catalog":
         for function in functions_json:
             body = function.get("body")
             if expression_node_count(body) != body_leaves:
@@ -2076,6 +2472,7 @@ def validate_perceus_parameter_shape(
     body_shape: str = "linear",
     user_call_edges: int = 1,
     global_count: int = 0,
+    branch_arms: int = 2,
 ) -> None:
     declarations = core_program.get("decls")
     if not isinstance(declarations, list):
@@ -2138,6 +2535,7 @@ def validate_perceus_parameter_shape(
                     "borrowed_call_protection",
                     "aggregate_escape",
                     "mixed_function_owner_catalog",
+                    "borrowed_boundary_fusion",
                 )
                 else named_type(parameter_type)
             )
@@ -2171,6 +2569,23 @@ def validate_perceus_parameter_shape(
                         MIXED_FUNCTION_OWNER_BOUNDARY_SITES_PER_FAMILY,
                     )
                     if (site_index - global_count) % params_per_function == param_index
+                )
+            elif body_shape == "borrowed_boundary_fusion":
+                expected_reads = 2 * sum(
+                    1
+                    for site_index in range(BORROWED_BOUNDARY_FUSION_SLOTS_PER_FAMILY)
+                    if (
+                        site_index % 2 == 1
+                        and (site_index // 2) % params_per_function == param_index
+                    )
+                )
+                expected_reads += sum(
+                    1
+                    for site_index in range(branch_arms)
+                    if (
+                        site_index % 2 == 1
+                        and (site_index // 2) % params_per_function == param_index
+                    )
                 )
             elif body_shape == "nested_user_call":
                 expected_reads = (
@@ -2212,6 +2627,7 @@ def validate_response(
     parameter_type: str,
     body_shape: str = "linear",
     user_call_edges: int = 1,
+    branch_arms: int = 2,
 ) -> tuple[int, str]:
     try:
         response = json.loads(response_path.read_text(encoding="utf-8"))
@@ -2240,6 +2656,7 @@ def validate_response(
             body_shape,
             user_call_edges,
             global_count,
+            branch_arms,
         )
         encoded_output = json.dumps(output, separators=(",", ":")).encode("utf-8")
 
@@ -2603,6 +3020,7 @@ def run_benchmark(
                 args.parameter_type,
                 body_shape,
                 user_call_edges,
+                branch_arms,
             )
             if baseline_bridge is not None:
                 _, baseline_warmup_response, _ = run_measurement(
@@ -2623,6 +3041,7 @@ def run_benchmark(
                     baseline_parameter_type,
                     body_shape,
                     user_call_edges,
+                    branch_arms,
                 )
 
         samples_by_worker: dict[str, list[JsonObject]] = {
@@ -2666,6 +3085,7 @@ def run_benchmark(
                     worker_parameter_type,
                     body_shape,
                     user_call_edges,
+                    branch_arms,
                 )
                 artifact = response_artifact(response_path)
                 for metric_name in (
@@ -2754,6 +3174,7 @@ def run_benchmark(
                     args.parameter_type,
                     body_shape,
                     user_call_edges,
+                    branch_arms,
                 )
                 if current_counter_artifact_hash != artifact_sha256:
                     raise RuntimeError(
@@ -2800,6 +3221,7 @@ def run_benchmark(
                         baseline_parameter_type,
                         body_shape,
                         user_call_edges,
+                        branch_arms,
                     )
                     if (
                         baseline_counter_artifact_hash
@@ -3541,6 +3963,171 @@ def validate_mixed_function_owner_catalog_matrix(points: list[JsonObject]) -> No
             )
 
 
+def validate_borrowed_boundary_fusion_matrix(points: list[JsonObject]) -> None:
+    densities = [int(point["branch_arms"]) for point in points]
+    if densities != list(BORROWED_BOUNDARY_FUSION_DENSITIES):
+        raise RuntimeError(
+            "borrowed-boundary fusion matrix requires 8, 32, and 96-site points: "
+            f"{densities}"
+        )
+    counters = [point.get("work_counters") for point in points]
+    if not all(isinstance(counter, dict) for counter in counters):
+        raise RuntimeError("borrowed-boundary fusion matrix requires work counters")
+    baseline_counters = [point.get("baseline_work_counters") for point in points]
+    if not all(isinstance(counter, dict) for counter in baseline_counters):
+        raise RuntimeError(
+            "borrowed-boundary fusion matrix requires immediate-parent work counters"
+        )
+
+    for density, counter, baseline_counter in zip(
+        densities,
+        counters,
+        baseline_counters,
+        strict=True,
+    ):
+        expected_actions = BORROWED_BOUNDARY_FUSION_FUNCTIONS * density
+        for name in (
+            "borrowed_call_rewrite_actions",
+            "borrowed_aggregate_rewrite_actions",
+            "borrowed_result_rewrite_actions",
+        ):
+            if int(counter[name]) != expected_actions:
+                raise RuntimeError(
+                    f"borrowed-boundary fusion {name} changed at density {density}: "
+                    f"{counter[name]} != {expected_actions}"
+                )
+
+        expected_region_counts = {
+            "borrowed_function_regions_normalized": BORROWED_BOUNDARY_FUSION_FUNCTIONS,
+            "borrowed_global_initializer_regions_normalized": 0,
+            "lambda_regions_normalized": 0,
+            "borrowed_function_parameter_owner_slots": (
+                BORROWED_BOUNDARY_FUSION_FUNCTIONS
+                * BORROWED_BOUNDARY_FUSION_PARAMETERS
+            ),
+            "borrowed_function_global_owner_slots": (
+                BORROWED_BOUNDARY_FUSION_FUNCTIONS
+                * BORROWED_BOUNDARY_FUSION_GLOBALS
+            ),
+        }
+        for name, expected in expected_region_counts.items():
+            if int(counter[name]) != expected:
+                raise RuntimeError(
+                    f"borrowed-boundary fusion {name} changed at density {density}: "
+                    f"{counter[name]} != {expected}"
+                )
+
+        fallback_requests = sum(
+            int(counter[name])
+            for name in (
+                "borrowed_call_alias_fallback_requests",
+                "borrowed_aggregate_alias_fallback_requests",
+                "borrowed_result_alias_fallback_requests",
+            )
+        )
+        fallback_visits = sum(
+            int(counter[name])
+            for name in (
+                "borrowed_call_fallback_expression_visits",
+                "borrowed_aggregate_fallback_expression_visits",
+                "borrowed_result_fallback_expression_visits",
+            )
+        )
+        if fallback_requests != 0 or fallback_visits != 0:
+            raise RuntimeError(
+                "borrowed-boundary fusion fixture entered scalar fallback: "
+                f"requests={fallback_requests}, visits={fallback_visits}"
+            )
+
+        legacy_names = (
+            "borrowed_call_node_visits",
+            "borrowed_aggregate_node_visits",
+            "borrowed_result_node_visits",
+            "borrowed_call_reconstructed_nodes",
+            "borrowed_aggregate_reconstructed_nodes",
+            "borrowed_result_reconstructed_nodes",
+        )
+        for name in legacy_names:
+            if int(baseline_counter[name]) <= 0:
+                raise RuntimeError(
+                    f"borrowed-boundary fusion parent did not exercise {name}"
+                )
+            if int(counter[name]) != 0:
+                raise RuntimeError(
+                    f"borrowed-boundary fusion still reached legacy authority {name}: "
+                    f"{counter[name]}"
+                )
+
+    fused_visits = [int(counter["borrowed_fused_node_visits"]) for counter in counters]
+    if any(value == 0 for value in fused_visits):
+        raise RuntimeError(
+            "borrowed-boundary fusion requires one fused structural visit per "
+            "expression under the union child domain; Checkpoint C has not "
+            f"implemented that authority: {fused_visits}"
+        )
+    for density, counter, baseline_counter in zip(
+        densities,
+        counters,
+        baseline_counters,
+        strict=True,
+    ):
+        legacy_visits = sum(
+            int(baseline_counter[name])
+            for name in (
+                "borrowed_call_node_visits",
+                "borrowed_aggregate_node_visits",
+                "borrowed_result_node_visits",
+            )
+        )
+        maximum_visit_ratio = 0.52 if density == 8 else 0.50
+        if int(counter["borrowed_fused_node_visits"]) > legacy_visits * maximum_visit_ratio:
+            raise RuntimeError(
+                "borrowed-boundary fusion exceeded its structural visit budget: "
+                f"{counter['borrowed_fused_node_visits']} vs {legacy_visits} "
+                f"at ratio {maximum_visit_ratio}"
+            )
+        if int(counter["borrowed_fused_reconstructed_nodes"]) <= 0:
+            raise RuntimeError(
+                "borrowed-boundary fusion did not report reconstructed nodes"
+            )
+
+    middle_point = points[1]
+    middle_time_ratio = middle_point.get(
+        "paired_window_elapsed_microseconds_ratio_median"
+    )
+    if not isinstance(middle_time_ratio, (int, float)) or float(middle_time_ratio) > 1.05:
+        raise RuntimeError(
+            "borrowed-boundary fusion 32-site direct time regressed by more than "
+            f"5%: ratio {middle_time_ratio}"
+        )
+    middle_allocation_ratio = middle_point.get(
+        "paired_window_allocations_ratio_median"
+    )
+    if (
+        not isinstance(middle_allocation_ratio, (int, float))
+        or float(middle_allocation_ratio) > 0.985
+    ):
+        raise RuntimeError(
+            "borrowed-boundary fusion must reduce 32-site direct-window "
+            f"allocations by at least 1.5%: ratio {middle_allocation_ratio}"
+        )
+
+    low_point = points[0]
+    low_time_ratio = low_point.get("paired_window_elapsed_microseconds_ratio_median")
+    if not isinstance(low_time_ratio, (int, float)) or float(low_time_ratio) > 1.05:
+        raise RuntimeError(
+            "borrowed-boundary fusion low control regressed direct time by more "
+            f"than 5%: ratio {low_time_ratio}"
+        )
+    for metric_name in ("window_allocations", "window_releases"):
+        ratio = low_point.get(f"paired_{metric_name}_ratio_median")
+        if not isinstance(ratio, (int, float)) or float(ratio) > 1.02:
+            raise RuntimeError(
+                "borrowed-boundary fusion low control "
+                f"{metric_name} regressed by more than 2%: ratio {ratio}"
+            )
+
+
 def validate_lambda_owner_baseline_matrix(points: list[JsonObject]) -> None:
     if len(points) != 3:
         raise RuntimeError("lambda-owner matrix requires 1, 8, and 32-owner points")
@@ -4012,6 +4599,52 @@ def run_mixed_function_owner_catalog_matrix(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_borrowed_boundary_fusion_matrix(args: argparse.Namespace) -> int:
+    root = project_root()
+    with tempfile.TemporaryDirectory(prefix="blorp-perceus-boundary-fusion-matrix-") as temp_name:
+        bridge = prepare_backend_worker(root, Path(temp_name) / "timing", args.bridge)
+        counter_bridge = None
+        if getattr(args, "work_counters", False):
+            counter_bridge = prepare_backend_worker(
+                root,
+                Path(temp_name) / "counters",
+                args.counter_bridge,
+                debug_profile=True,
+            )
+
+        matrix_points: list[JsonObject] = []
+        for density in BORROWED_BOUNDARY_FUSION_DENSITIES:
+            point = argparse.Namespace(**vars(args))
+            point.bridge = str(bridge)
+            point.counter_bridge = str(counter_bridge) if counter_bridge is not None else None
+            point.globals = BORROWED_BOUNDARY_FUSION_GLOBALS
+            point.functions = BORROWED_BOUNDARY_FUSION_FUNCTIONS
+            point.body_leaves = BORROWED_BOUNDARY_FUSION_BODY_NODES
+            point.global_reads_per_function = BORROWED_BOUNDARY_FUSION_GLOBALS
+            point.params_per_function = BORROWED_BOUNDARY_FUSION_PARAMETERS
+            point.parameter_type = MANAGED_PARAMETER_TYPE
+            point.body_shape = "borrowed_boundary_fusion"
+            point.measurement_window = "perceus-direct"
+            point.control_parameter_type = None
+            point.invoke_workers = False
+            point.branch_arms = density
+            point.global_matrix = False
+            point.parameter_matrix = False
+            point.aggregate_matrix = False
+            point.result_matrix = False
+            point.referenced_global_matrix = False
+            point.lambda_owner_matrix = False
+            point.mixed_function_owner_catalog_matrix = False
+            point.borrowed_boundary_fusion_matrix = False
+            point.contract_matrix = False
+            run_benchmark(point, matrix_points)
+
+        if getattr(args, "work_counters", False):
+            validate_borrowed_boundary_fusion_matrix(matrix_points)
+
+    return 0
+
+
 def run_contract_matrix(args: argparse.Namespace) -> int:
     root = project_root()
     with tempfile.TemporaryDirectory(prefix="blorp-perceus-contract-matrix-") as temp_name:
@@ -4109,7 +4742,7 @@ def main(argv: list[str]) -> int:
         "--branch-arms",
         type=positive_int,
         default=2,
-        help="reserved branch-width axis for later branch/match fixtures",
+        help="branch width or active borrowed-boundary density for a single fixture",
     )
     parser.add_argument(
         "--measurement-window",
@@ -4217,6 +4850,14 @@ def main(argv: list[str]) -> int:
         ),
     )
     parser.add_argument(
+        "--borrowed-boundary-fusion-matrix",
+        action="store_true",
+        help=(
+            "run the fixed 8/32/96-site borrowed-boundary fusion contract; "
+            "Checkpoint B intentionally fails its fused-visit budget"
+        ),
+    )
+    parser.add_argument(
         "--contract-matrix",
         action="store_true",
         help="vary borrowed owners, body nodes, and user-call edges one axis at a time",
@@ -4252,6 +4893,7 @@ def main(argv: list[str]) -> int:
         or args.referenced_global_matrix
         or args.lambda_owner_matrix
         or args.mixed_function_owner_catalog_matrix
+        or args.borrowed_boundary_fusion_matrix
         or args.contract_matrix
     ):
         if args.global_reads_per_function >= args.body_leaves:
@@ -4291,6 +4933,7 @@ def main(argv: list[str]) -> int:
             args.referenced_global_matrix,
             args.lambda_owner_matrix,
             args.mixed_function_owner_catalog_matrix,
+            args.borrowed_boundary_fusion_matrix,
             args.contract_matrix,
         )
     )
@@ -4309,6 +4952,10 @@ def main(argv: list[str]) -> int:
     if args.mixed_function_owner_catalog_matrix and args.end_to_end:
         parser.error(
             "--mixed-function-owner-catalog-matrix cannot be combined with --end-to-end"
+        )
+    if args.borrowed_boundary_fusion_matrix and args.end_to_end:
+        parser.error(
+            "--borrowed-boundary-fusion-matrix cannot be combined with --end-to-end"
         )
     if args.result_matrix and args.baseline_bridge is None:
         parser.error("--result-matrix requires --baseline-bridge")
@@ -4339,6 +4986,16 @@ def main(argv: list[str]) -> int:
             "--mixed-function-owner-catalog-matrix requires "
             "--baseline-counter-bridge"
         )
+    if args.borrowed_boundary_fusion_matrix and args.baseline_bridge is None:
+        parser.error("--borrowed-boundary-fusion-matrix requires --baseline-bridge")
+    if (
+        args.borrowed_boundary_fusion_matrix
+        and args.work_counters
+        and args.baseline_counter_bridge is None
+    ):
+        parser.error(
+            "--borrowed-boundary-fusion-matrix requires --baseline-counter-bridge"
+        )
     if args.contract_matrix and args.end_to_end:
         parser.error("--contract-matrix cannot be combined with --end-to-end")
 
@@ -4360,6 +5017,8 @@ def main(argv: list[str]) -> int:
             return run_lambda_owner_matrix(args)
         if args.mixed_function_owner_catalog_matrix:
             return run_mixed_function_owner_catalog_matrix(args)
+        if args.borrowed_boundary_fusion_matrix:
+            return run_borrowed_boundary_fusion_matrix(args)
         if args.contract_matrix:
             return run_contract_matrix(args)
         return run_benchmark(args)

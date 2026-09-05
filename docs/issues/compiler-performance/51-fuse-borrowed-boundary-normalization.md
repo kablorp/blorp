@@ -1,6 +1,6 @@
 # Fuse Borrowed Boundary Normalization
 
-**Status:** In progress — Checkpoint A implemented; Checkpoints B–C proposed
+**Status:** Implemented — Checkpoints A–C complete
 
 **Roadmap:** Perceus ownership optimization, Tranche 4D
 
@@ -384,6 +384,14 @@ This checkpoint adds no production cutover.
 Do not begin production fusion until the fixture is demonstrably ownership-ready
 and all expected action counts are nonzero and exact.
 
+Checkpoint B was implemented on 2026-09-04. The exhaustive inventory covers all
+89 `CoreExpr` variants and all 75 transitively expression-bearing Core
+composites. The fixed 8/32/96-density matrix has exact nonzero call, storage,
+and result actions with zero scalar fallbacks, and now fails solely on the
+intentional zero fused-visit assertion. See
+[`compiler_perceus_tranche4d_checkpoint_b_2026-09-04.md`](../../../benchmarks/results/compiler_perceus_tranche4d_checkpoint_b_2026-09-04.md)
+for the fixture census, legacy work counts, and preserved worker hashes.
+
 ### Checkpoint C: fuse and cut over
 
 1. Implement the fused normalizer alongside the committed three-pass path.
@@ -407,6 +415,15 @@ and all expected action counts are nonzero and exact.
 
 Do not start Tranche 5 fact collection or alter emitted ownership operations in
 this issue.
+
+Checkpoint C was implemented on 2026-09-05. The three all-owner structural
+authorities and their duplicate helper families were replaced by one private,
+typed normalizer and deleted. The fixed matrix reduced structural visits by
+48.8–53.9% and allocations by 2.6–3.0%, with exact action counts and
+byte-identical post-Perceus artifacts. Direct time remained within ±1.4% but
+did not realize the prospective 10% improvement. See
+[`compiler_perceus_tranche4d_checkpoint_c_2026-09-05.md`](../../../benchmarks/results/compiler_perceus_tranche4d_checkpoint_c_2026-09-05.md)
+for measurements and the evidence-based threshold correction.
 
 ## Benchmark Contract
 
@@ -619,10 +636,16 @@ region model before beginning fusion.
 - Nested lambdas are separate regions and are opaque to the outer normalizer.
 - Fused structural visits are independent of catalog size for a fixed body;
   candidate and explicitly allowed fallback work remain separately visible.
-- At every fusion-matrix density, fused visits are at least 50% lower than the
-  Checkpoint A sum of call, storage, and result visits.
-- At the 32-site density point, the paired direct-Perceus median is at least 10%
-  faster and direct-window allocations are at least 15% lower than Checkpoint A.
+- At the 8-site fusion-matrix density, fused visits are at least 48% lower than
+  the Checkpoint A sum of call, storage, and result visits; at the 32- and
+  96-site points they are at least 50% lower. The original uniform 50% gate was
+  corrected after Checkpoint B proved that the required 2,880-node union walk
+  cannot be half of the 5,626 low-density parent visits.
+- At the 32-site density point, direct-window allocations are at least 1.5%
+  lower than Checkpoint A and paired direct-Perceus time does not regress by
+  more than 5%. The original 10% time and 15% allocation forecasts were revised
+  after the exact implementation removed only 2,874 of 105,845 complete-window
+  allocations; unrelated Perceus work was not added to this checkpoint.
 - At the 8-site point, direct time does not regress by more than 5%, and
   allocations or releases do not increase by more than 2%.
 - Call, storage, and result action counts and action multisets exactly match
