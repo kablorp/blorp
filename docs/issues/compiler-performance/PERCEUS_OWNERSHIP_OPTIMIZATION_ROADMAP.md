@@ -1113,13 +1113,23 @@ boundary fusion.
 
 [Issue 51](51-fuse-borrowed-boundary-normalization.md) combines the independently
 validated call, aggregate, and result passes into one post-order reconstruction
-per function, lambda, or dynamic-global-initializer region. Boundary kind,
+per nonempty function, lambda, or dynamic-global-initializer region. It first
+removes the transitional split between ordinary-function parameter and global
+catalogs while retaining the three proven walkers. Boundary traversal domains,
 lexical visibility, and result satisfaction are represented independently.
 
 The fused action order is explicit: normalize children, apply consuming-call
 ownership, apply contract-directed storage transfer, then apply terminal result
 ownership. The implementation must model ownership transitions directly rather
 than depending on a later pass observing wrappers inserted by an earlier pass.
+Correctness is defined by identical resulting Core ownership order, generated C,
+and action counts; a post-order fused walk is not required to preserve the
+chronology of internal rewrite-helper calls from three whole-region passes.
+
+Checkpoint A is complete: ordinary-function parameters and exact globals now
+share one ordered catalog, reducing the measured high-owner direct-Perceus
+window by 11.7% and allocations by 6.3% while preserving exact Core and C.
+Checkpoints B–C remain proposed.
 
 ### Tranche-wide acceptance
 

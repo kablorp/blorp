@@ -647,9 +647,9 @@ private record BorrowedOwnerEntry {
 -- catalog may eventually contain parameter, capture, and global entries, so
 -- instrumentation must not infer the region from whichever entry comes first.
 private enum BorrowedOwnerRegionKind:
-	FunctionParameterOwnerRegion
-	ReferencedGlobalOwnerRegion
+	FunctionOwnerRegion
 	LambdaOwnerRegion
+	GlobalInitializerOwnerRegion
 
 
 private record BorrowedOwnerCatalog {
@@ -20055,11 +20055,11 @@ private pure func record_borrowed_region_normalization_visit(
 ) -> Int:
 	debug:
 		match owners.region_kind:
-			ReferencedGlobalOwnerRegion:
+			GlobalInitializerOwnerRegion:
 				perceus_work_borrowed_global_normalization_visits()
 			LambdaOwnerRegion:
 				perceus_work_lambda_borrowed_normalization_visits()
-			FunctionParameterOwnerRegion:
+			FunctionOwnerRegion:
 				0
 
 	0
@@ -20068,11 +20068,11 @@ private pure func record_borrowed_region_normalization_visit(
 private pure func record_borrowed_region_alias_fallback(owners: BorrowedOwnerCatalog) -> Int:
 	debug:
 		match owners.region_kind:
-			ReferencedGlobalOwnerRegion:
+			GlobalInitializerOwnerRegion:
 				perceus_work_borrowed_global_alias_fallback_requests()
 			LambdaOwnerRegion:
 				perceus_work_lambda_alias_fallback_requests()
-			FunctionParameterOwnerRegion:
+			FunctionOwnerRegion:
 				0
 
 	0
@@ -20081,11 +20081,11 @@ private pure func record_borrowed_region_alias_fallback(owners: BorrowedOwnerCat
 private pure func record_borrowed_region_rewrite(owners: BorrowedOwnerCatalog) -> Int:
 	debug:
 		match owners.region_kind:
-			ReferencedGlobalOwnerRegion:
+			GlobalInitializerOwnerRegion:
 				perceus_work_borrowed_global_rewrite_actions()
 			LambdaOwnerRegion:
 				perceus_work_lambda_rewrite_actions()
-			FunctionParameterOwnerRegion:
+			FunctionOwnerRegion:
 				0
 
 	0
@@ -23100,17 +23100,18 @@ private pure func global_candidate_indices(
 -- order. Return the empty list directly for the overwhelmingly common case of
 -- a global initializer with no referenced managed global; callers construct a
 -- catalog only when there is actual normalization work.
-private pure func referenced_global_owner_entries(
+private pure func append_referenced_global_owner_entries(
 	env: PerceusEnv,
 	shadowing_values: List[CoreParam],
 	body: CoreExpr,
 	region_kind: BorrowedOwnerRegionKind,
+	initial_entries: List[BorrowedOwnerEntry],
 ) -> List[BorrowedOwnerEntry]:
 	debug:
 		record_referenced_global_discovery_nodes(body)
 
 	value_reads: List[CoreVar] = CoreDce.value_references(body).resolved_reads
-	var entries: List[BorrowedOwnerEntry] = []
+	var entries: List[BorrowedOwnerEntry] = initial_entries
 
 	for global_index in global_candidate_indices(env, value_reads):
 		match env.global_values.get(global_index):
@@ -23122,12 +23123,10 @@ private pure func referenced_global_owner_entries(
 				if not is_shadowed and is_managed_type(env, global.value.typ):
 					debug:
 						match region_kind:
-							ReferencedGlobalOwnerRegion:
+							FunctionOwnerRegion | GlobalInitializerOwnerRegion:
 								perceus_work_borrowed_global_catalog_slots()
 							LambdaOwnerRegion:
 								perceus_work_lambda_referenced_global_owner_slots()
-							FunctionParameterOwnerRegion:
-								0
 
 					entries = entries.append({
 						value = global.value,
@@ -23142,6 +23141,15 @@ private pure func referenced_global_owner_entries(
 				void
 
 	entries
+
+
+private pure func referenced_global_owner_entries(
+	env: PerceusEnv,
+	shadowing_values: List[CoreParam],
+	body: CoreExpr,
+	region_kind: BorrowedOwnerRegionKind,
+) -> List[BorrowedOwnerEntry]:
+	append_referenced_global_owner_entries(env, shadowing_values, body, region_kind, [])
 
 
 private pure func normalize_borrowed_owner_catalog(
@@ -23173,7 +23181,7 @@ private pure func normalize_borrowed_owner_entries(
 		)
 
 
-private pure func normalize_referenced_global_entries(
+private pure func normalize_global_initializer_owner_entries(
 	env: PerceusEnv,
 	entries: List[BorrowedOwnerEntry],
 	return_type: CoreType,
@@ -23182,7 +23190,7 @@ private pure func normalize_referenced_global_entries(
 	normalize_borrowed_owner_entries(
 		env,
 		entries,
-		ReferencedGlobalOwnerRegion,
+		GlobalInitializerOwnerRegion,
 		return_type,
 		body,
 	)
@@ -23756,24 +23764,19 @@ private pure func rewrite_function(env: PerceusEnv, func_info: CoreFunction) -> 
 				params,
 				consumed_params,
 			)
-			retained_body: CoreExpr = normalize_borrowed_owner_entries(
-				env,
-				borrowed_entries,
-				FunctionParameterOwnerRegion,
-				return_type,
-				contract_body,
-			)
-			global_entries: List[BorrowedOwnerEntry] = referenced_global_owner_entries(
+			all_owner_entries: List[BorrowedOwnerEntry] = append_referenced_global_owner_entries(
 				env,
 				params,
-				retained_body,
-				ReferencedGlobalOwnerRegion,
+				contract_body,
+				FunctionOwnerRegion,
+				borrowed_entries,
 			)
-			global_safe_body: CoreExpr = normalize_referenced_global_entries(
+			global_safe_body: CoreExpr = normalize_borrowed_owner_entries(
 				env,
-				global_entries,
+				all_owner_entries,
+				FunctionOwnerRegion,
 				return_type,
-				retained_body,
+				contract_body,
 			)
 
 			owned_result_body: CoreExpr = if is_managed_type(env, return_type):
@@ -23838,9 +23841,9 @@ private pure func rewrite_global(env: PerceusEnv, global: CoreGlobal) -> CoreGlo
 		env,
 		[global_value],
 		contract_init,
-		ReferencedGlobalOwnerRegion,
+		GlobalInitializerOwnerRegion,
 	)
-	owned_init: CoreExpr = normalize_referenced_global_entries(
+	owned_init: CoreExpr = normalize_global_initializer_owner_entries(
 		env,
 		global_entries,
 		typ,

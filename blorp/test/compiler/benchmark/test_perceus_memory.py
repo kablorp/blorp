@@ -206,12 +206,13 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
     def test_supported_body_shapes_are_structurally_distinct(self) -> None:
         fingerprints = set()
         for body_shape in self.benchmark.BODY_SHAPES:
+            mixed_function_catalog = body_shape == "mixed_function_owner_catalog"
             _, program = self.benchmark.fixture_request(
-                4,
+                8 if mixed_function_catalog else 4,
                 3,
-                256,
-                2,
-                params_per_function=2,
+                1536 if mixed_function_catalog else 256,
+                8 if mixed_function_catalog else 2,
+                params_per_function=32 if mixed_function_catalog else 2,
                 body_shape=body_shape,
                 branch_arms=2,
                 user_call_edges=2,
@@ -233,6 +234,47 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
 
     def test_referenced_global_boundary_is_a_supported_body_shape(self) -> None:
         self.assertIn("referenced_global_boundary", self.benchmark.BODY_SHAPES)
+
+    def test_mixed_function_owner_catalog_is_a_supported_body_shape(self) -> None:
+        self.assertIn("mixed_function_owner_catalog", self.benchmark.BODY_SHAPES)
+
+    def test_mixed_function_owner_fixture_has_fixed_geometry(self) -> None:
+        _, program = self.benchmark.fixture_request(
+            8,
+            2,
+            1536,
+            8,
+            params_per_function=32,
+            body_shape="mixed_function_owner_catalog",
+            invoke_workers=False,
+        )
+        workers = [
+            declaration
+            for declaration in program["decls"]
+            if declaration.get("kind") == "function"
+            and declaration.get("name", "").startswith("bench_worker_")
+        ]
+
+        self.assertEqual(len(workers), 2)
+        for worker in workers:
+            self.assertEqual(len(worker["params"]), 32)
+            self.assertEqual(
+                self.benchmark.expression_node_count(worker["body"]),
+                1536,
+            )
+            self.assertEqual(
+                self.benchmark.mixed_function_owner_census(worker["body"]),
+                {
+                    "consuming_calls": 32,
+                    "aggregate_transfers": 32,
+                    "result_terminals": 32,
+                    "parameter_reference_sites": 72,
+                    "global_reference_sites": 24,
+                    "distinct_parameters": 24,
+                    "distinct_globals": 8,
+                    "nested_lambdas": 0,
+                },
+            )
 
     def test_referenced_global_fixture_has_fixed_nodes_and_boundary_sites(self) -> None:
         _, program = self.benchmark.fixture_request(
@@ -1204,6 +1246,130 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
             (8, 2, 256, "lambda_borrowed_boundary", False, "perceus-direct"),
             (32, 2, 256, "lambda_borrowed_boundary", False, "perceus-direct"),
         ])
+
+    def test_mixed_function_owner_matrix_reuses_workers(self) -> None:
+        args = argparse.Namespace(
+            bridge=None,
+            counter_bridge=None,
+            baseline_bridge="/tmp/perceus-baseline-worker",
+            baseline_counter_bridge="/tmp/perceus-baseline-counter-worker",
+            globals=1,
+            functions=2,
+            body_leaves=64,
+            global_reads_per_function=0,
+            params_per_function=0,
+            parameter_type="String",
+            body_shape="linear",
+            end_to_end=False,
+            work_counters=False,
+        )
+
+        with mock.patch.object(
+            self.benchmark,
+            "prepare_backend_worker",
+            side_effect=lambda _root, _directory, explicit, **_kwargs: Path(
+                explicit or "/tmp/perceus-worker"
+            ),
+        ) as prepare, mock.patch.object(
+            self.benchmark,
+            "run_benchmark",
+            return_value=0,
+        ) as run:
+            self.benchmark.run_mixed_function_owner_catalog_matrix(args)
+
+        self.assertEqual(prepare.call_count, 1)
+        points = [
+            (
+                call.args[0].params_per_function,
+                call.args[0].global_reads_per_function,
+                call.args[0].globals,
+                call.args[0].functions,
+                call.args[0].body_leaves,
+                call.args[0].body_shape,
+                call.args[0].invoke_workers,
+                call.args[0].measurement_window,
+            )
+            for call in run.call_args_list
+        ]
+        self.assertEqual(points, [
+            (1, 1, 1, 2, 1536, "mixed_function_owner_catalog", False, "perceus-direct"),
+            (32, 8, 8, 2, 1536, "mixed_function_owner_catalog", False, "perceus-direct"),
+        ])
+
+    def test_mixed_function_owner_matrix_requires_combined_catalog_gain(self) -> None:
+        def point(
+            params,
+            globals_count,
+            visits,
+            baseline_visits,
+            *,
+            time_ratio,
+            allocation_ratio,
+            release_ratio,
+            fallback_requests=0,
+        ):
+            return {
+                "params_per_function": params,
+                "global_reads_per_function": globals_count,
+                "globals": globals_count,
+                "functions": 2,
+                "comparison_kind": "compiler-worker",
+                "paired_window_elapsed_microseconds_ratio_median": time_ratio,
+                "paired_window_allocations_ratio_median": allocation_ratio,
+                "paired_window_releases_ratio_median": release_ratio,
+                "work_counters": {
+                    "borrowed_call_owner_catalog_slots": 2 * params,
+                    "borrowed_global_catalog_slots": 2 * globals_count,
+                    "borrowed_call_alias_fallback_requests": fallback_requests,
+                    "borrowed_aggregate_alias_fallback_requests": 0,
+                    "borrowed_result_alias_fallback_requests": 0,
+                    "borrowed_call_rewrite_actions": 64,
+                    "borrowed_aggregate_rewrite_actions": 64,
+                    "borrowed_result_rewrite_actions": 64,
+                    "mixed_function_normalization_visits": visits,
+                },
+                "baseline_work_counters": {
+                    "mixed_function_normalization_visits": baseline_visits,
+                },
+            }
+
+        valid = [
+            point(1, 1, 1200, 2400, time_ratio=1.03, allocation_ratio=1.01, release_ratio=1.01),
+            point(32, 8, 1200, 2400, time_ratio=0.90, allocation_ratio=0.85, release_ratio=0.85),
+        ]
+        self.benchmark.validate_mixed_function_owner_catalog_matrix(valid)
+
+        insufficient_visits = [
+            {
+                **point_value,
+                "work_counters": {
+                    **point_value["work_counters"],
+                    "mixed_function_normalization_visits": 1500,
+                },
+            }
+            for point_value in valid
+        ]
+        with self.assertRaisesRegex(RuntimeError, "at least 40%"):
+            self.benchmark.validate_mixed_function_owner_catalog_matrix(insufficient_visits)
+
+        insufficient_allocations = [valid[0], {
+            **valid[1],
+            "paired_window_allocations_ratio_median": 0.96,
+        }]
+        with self.assertRaisesRegex(RuntimeError, "at least 5%"):
+            self.benchmark.validate_mixed_function_owner_catalog_matrix(
+                insufficient_allocations
+            )
+
+        fallback = [valid[0], {
+            **valid[1],
+            "work_counters": {
+                **valid[1]["work_counters"],
+                "borrowed_call_alias_fallback_requests": 1,
+            },
+        }]
+        with self.assertRaisesRegex(RuntimeError, "scalar alias fallback"):
+            self.benchmark.validate_mixed_function_owner_catalog_matrix(fallback)
 
     def test_referenced_global_visit_counter_composes_operation_work(self) -> None:
         operation_counters = {

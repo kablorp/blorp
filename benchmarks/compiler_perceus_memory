@@ -44,6 +44,7 @@ BODY_SHAPES = (
     "aggregate_escape",
     "borrowed_return",
     "referenced_global_boundary",
+    "mixed_function_owner_catalog",
     "lambda_borrowed_boundary",
     "nested_user_call",
     "mutually_recursive_calls",
@@ -182,6 +183,11 @@ REFERENCED_GLOBAL_SITES_PER_FUNCTION = (
     + REFERENCED_GLOBAL_AGGREGATE_SITES_PER_FUNCTION
     + REFERENCED_GLOBAL_RESULT_SITES_PER_FUNCTION
 )
+MIXED_FUNCTION_OWNER_MATRIX_FUNCTIONS = 2
+MIXED_FUNCTION_OWNER_MATRIX_BODY_NODES = 1536
+MIXED_FUNCTION_OWNER_BOUNDARY_SITES_PER_FAMILY = 32
+MIXED_FUNCTION_OWNER_HIGH_PARAMETERS = 32
+MIXED_FUNCTION_OWNER_HIGH_GLOBALS = 8
 LAMBDA_OWNER_MATRIX_FUNCTIONS = 2
 LAMBDA_OWNER_MATRIX_BODY_NODES = 256
 LAMBDA_CALL_SITES_PER_FUNCTION = 12
@@ -284,6 +290,22 @@ def add_referenced_global_derived_counters(counters: dict[str, int]) -> dict[str
             "borrowed_result_node_visits",
         )
     )
+    result["borrowed_global_alias_fallback_requests"] = sum(
+        result.get(name, 0)
+        for name in (
+            "borrowed_call_alias_fallback_requests",
+            "borrowed_aggregate_alias_fallback_requests",
+            "borrowed_result_alias_fallback_requests",
+        )
+    )
+    result["borrowed_global_rewrite_actions"] = sum(
+        result.get(name, 0)
+        for name in (
+            "borrowed_call_rewrite_actions",
+            "borrowed_aggregate_rewrite_actions",
+            "borrowed_result_rewrite_actions",
+        )
+    )
     return result
 
 
@@ -299,6 +321,22 @@ def add_lambda_derived_counters(counters: dict[str, int]) -> dict[str, int]:
                 "borrowed_aggregate_node_visits",
                 "borrowed_result_node_visits",
             )
+        )
+    )
+    return result
+
+
+def add_mixed_function_owner_derived_counters(
+    counters: dict[str, int],
+) -> dict[str, int]:
+    """Compose the complete ordinary-function boundary work for split/fused catalogs."""
+    result = dict(counters)
+    result["mixed_function_normalization_visits"] = sum(
+        result[name]
+        for name in (
+            "borrowed_call_node_visits",
+            "borrowed_aggregate_node_visits",
+            "borrowed_result_node_visits",
         )
     )
     return result
@@ -452,13 +490,39 @@ def seq_expr(expressions: list[JsonObject]) -> JsonObject:
     return result
 
 
+def balanced_seq_expr(expressions: list[JsonObject]) -> JsonObject:
+    """Preserve sequence order without making fixture depth proportional to size."""
+    if not expressions:
+        raise ValueError("a sequence requires at least one expression")
+
+    level = list(expressions)
+    while len(level) > 1:
+        next_level: list[JsonObject] = []
+        index = 0
+        while index + 1 < len(level):
+            next_level.append({
+                "kind": "seq",
+                "first": level[index],
+                "second": level[index + 1],
+            })
+            index += 2
+        if index < len(level):
+            next_level.append(level[index])
+        level = next_level
+    return level[0]
+
+
 def expression_node_count(value: Any) -> int:
-    if isinstance(value, dict):
-        own = int(value.get("kind") in CORE_EXPR_KINDS)
-        return own + sum(expression_node_count(child) for child in value.values())
-    if isinstance(value, list):
-        return sum(expression_node_count(child) for child in value)
-    return 0
+    node_count = 0
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            node_count += int(current.get("kind") in CORE_EXPR_KINDS)
+            pending.extend(current.values())
+        elif isinstance(current, list):
+            pending.extend(current)
+    return node_count
 
 
 def padded_sequence(expressions: list[JsonObject], target_nodes: int) -> JsonObject:
@@ -474,6 +538,33 @@ def padded_sequence(expressions: list[JsonObject], target_nodes: int) -> JsonObj
         expressions.append(literal_expr("int", current_nodes, "Int"))
         current_nodes += 2
     result = seq_expr(expressions)
+    if current_nodes < target_nodes:
+        result = {
+            "kind": "cast",
+            "expr": result,
+            "type": named_type("Int"),
+            "loc": synthetic_loc(),
+        }
+    if expression_node_count(result) != target_nodes:
+        raise RuntimeError("failed to construct exact Perceus body node target")
+    return result
+
+
+def balanced_padded_sequence(
+    expressions: list[JsonObject],
+    target_nodes: int,
+) -> JsonObject:
+    if not expressions:
+        expressions = [literal_expr("int", 0, "Int")]
+    current_nodes = expression_node_count(balanced_seq_expr(expressions))
+    if current_nodes > target_nodes:
+        raise ValueError(
+            f"body workload needs {current_nodes} nodes but target is {target_nodes}"
+        )
+    while current_nodes + 2 <= target_nodes:
+        expressions.append(literal_expr("int", current_nodes, "Int"))
+        current_nodes += 2
+    result = balanced_seq_expr(expressions)
     if current_nodes < target_nodes:
         result = {
             "kind": "cast",
@@ -508,6 +599,8 @@ def padded_result_sequence_with_work(
     work: list[JsonObject],
     result: JsonObject,
     target_nodes: int,
+    *,
+    balance_padding: bool = False,
 ) -> JsonObject:
     """Pad non-result work without moving it into the function result path."""
     result_nodes = expression_node_count(result)
@@ -530,7 +623,10 @@ def padded_result_sequence_with_work(
             "type": named_type("Int"),
             "loc": synthetic_loc(),
         })
-    padding = padded_sequence(padded_work, work_target_nodes)
+    if balance_padding:
+        padding = balanced_padded_sequence(padded_work, work_target_nodes)
+    else:
+        padding = padded_sequence(padded_work, work_target_nodes)
     combined = {"kind": "seq", "first": padding, "second": result}
     if expression_node_count(combined) != target_nodes:
         raise RuntimeError("failed to construct exact referenced-global node target")
@@ -760,6 +856,234 @@ def referenced_global_boundary_census(value: Any) -> JsonObject:
         "result_terminals": reference_sites - consuming_calls - aggregate_transfers,
         "reference_sites": reference_sites,
         "distinct_global_indices": len(global_indices),
+    }
+
+
+def mixed_function_owner_ref_expr(
+    function_index: int,
+    site_index: int,
+    parameter_count: int,
+    referenced_globals: int,
+) -> JsonObject:
+    if site_index < referenced_globals:
+        return global_ref_expr(site_index)
+    return {
+        "kind": "field",
+        "expr": {
+            "kind": "var",
+            "var": core_var(
+                borrowed_param_name(
+                    function_index,
+                    (site_index - referenced_globals) % parameter_count,
+                ),
+                None,
+            ),
+            "type": heap_record_type(BORROWED_OWNER_TYPE_NAME),
+            "loc": synthetic_loc(),
+        },
+        "field": "BENCH_PAYLOAD",
+        "type": named_type(MANAGED_PARAMETER_TYPE),
+        "loc": synthetic_loc(),
+    }
+
+
+def mixed_function_owner_call_expr(
+    function_index: int,
+    site_index: int,
+    parameter_count: int,
+    referenced_globals: int,
+) -> JsonObject:
+    return {
+        "kind": "call",
+        "call_kind": {"kind": "builtin", "name": "blorp_string_concat_consume"},
+        "callee": {
+            "kind": "var",
+            "var": core_var("blorp_string_concat_consume", None),
+            "type": named_type("Function"),
+            "loc": synthetic_loc(),
+        },
+        "args": [
+            mixed_function_owner_ref_expr(
+                function_index,
+                site_index,
+                parameter_count,
+                referenced_globals,
+            ),
+            literal_expr("string", "", MANAGED_PARAMETER_TYPE),
+        ],
+        "type": named_type(MANAGED_PARAMETER_TYPE),
+        "loc": synthetic_loc(),
+    }
+
+
+def mixed_function_owner_aggregate_expr(
+    function_index: int,
+    site_index: int,
+    parameter_count: int,
+    referenced_globals: int,
+) -> JsonObject:
+    return {
+        "kind": "record_construct",
+        "type_name": BORROWED_OWNER_TYPE_NAME,
+        "fields": [{
+            "name": "BENCH_PAYLOAD",
+            "value": mixed_function_owner_ref_expr(
+                function_index,
+                site_index,
+                parameter_count,
+                referenced_globals,
+            ),
+        }],
+        "type": heap_record_type(BORROWED_OWNER_TYPE_NAME),
+        "loc": synthetic_loc(),
+    }
+
+
+def mixed_function_owner_result_tree(
+    function_index: int,
+    parameter_count: int,
+    referenced_globals: int,
+) -> JsonObject:
+    results = [
+        mixed_function_owner_ref_expr(
+            function_index,
+            site_index,
+            parameter_count,
+            referenced_globals,
+        )
+        for site_index in range(MIXED_FUNCTION_OWNER_BOUNDARY_SITES_PER_FAMILY)
+    ]
+    while len(results) > 1:
+        if len(results) % 2 != 0:
+            raise RuntimeError("mixed function result count must form a balanced tree")
+        results = [
+            {
+                "kind": "if",
+                "cond": literal_expr("bool", True, "Bool"),
+                "then": results[index],
+                "else": results[index + 1],
+                "type": named_type(MANAGED_PARAMETER_TYPE),
+                "loc": synthetic_loc(),
+            }
+            for index in range(0, len(results), 2)
+        ]
+    return results[0]
+
+
+def mixed_function_owner_catalog_body(
+    function_index: int,
+    parameter_count: int,
+    referenced_globals: int,
+    body_nodes: int,
+) -> JsonObject:
+    if parameter_count < 1 or parameter_count > MIXED_FUNCTION_OWNER_HIGH_PARAMETERS:
+        raise ValueError("mixed function owner catalog requires between 1 and 32 parameters")
+    if referenced_globals < 1 or referenced_globals > MIXED_FUNCTION_OWNER_HIGH_GLOBALS:
+        raise ValueError("mixed function owner catalog requires between 1 and 8 globals")
+
+    work: list[JsonObject] = []
+    for site_index in range(MIXED_FUNCTION_OWNER_BOUNDARY_SITES_PER_FAMILY):
+        work.append(mixed_function_owner_call_expr(
+            function_index,
+            site_index,
+            parameter_count,
+            referenced_globals,
+        ))
+    for site_index in range(MIXED_FUNCTION_OWNER_BOUNDARY_SITES_PER_FAMILY):
+        work.append(mixed_function_owner_aggregate_expr(
+            function_index,
+            site_index,
+            parameter_count,
+            referenced_globals,
+        ))
+
+    result = mixed_function_owner_result_tree(
+        function_index,
+        parameter_count,
+        referenced_globals,
+    )
+    body_tail = padded_result_sequence_with_work(
+        work=work,
+        result=result,
+        target_nodes=body_nodes - CONTRACT_FIXTURE_LET_NODES,
+        balance_padding=True,
+    )
+    return {
+        "kind": "let",
+        "name": core_var(f"BENCH_MANAGED_LOCAL_{function_index:04d}", None),
+        "mutable": False,
+        "type": named_type(MANAGED_PARAMETER_TYPE),
+        "rhs": literal_expr(
+            "string",
+            f"managed-mixed-owner-{function_index:04d}",
+            MANAGED_PARAMETER_TYPE,
+        ),
+        "body": body_tail,
+    }
+
+
+def mixed_function_owner_census(value: Any) -> JsonObject:
+    consuming_calls = 0
+    aggregate_transfers = 0
+    parameter_reference_sites = 0
+    global_reference_sites = 0
+    parameter_names: set[str] = set()
+    global_indices: set[int] = set()
+    nested_lambdas = 0
+
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            kind = current.get("kind")
+            if kind == "lambda":
+                nested_lambdas += 1
+                continue
+            if kind == "call":
+                call_kind = current.get("call_kind")
+                if (
+                    isinstance(call_kind, dict)
+                    and call_kind.get("kind") == "builtin"
+                    and call_kind.get("name") == "blorp_string_concat_consume"
+                ):
+                    consuming_calls += 1
+            elif (
+                kind == "record_construct"
+                and current.get("type_name") == BORROWED_OWNER_TYPE_NAME
+            ):
+                aggregate_transfers += 1
+            elif kind == "var":
+                variable = current.get("var")
+                if isinstance(variable, dict):
+                    name = variable.get("name")
+                    def_id = variable.get("def_id")
+                    if isinstance(name, str) and name.startswith("BENCH_BORROWED_PARAM_"):
+                        parameter_reference_sites += 1
+                        parameter_names.add(name)
+                    elif (
+                        isinstance(name, str)
+                        and name.startswith("BENCH_UNUSED_GLOBAL_")
+                        and isinstance(def_id, int)
+                    ):
+                        global_reference_sites += 1
+                        global_indices.add(def_id - 1)
+            pending.extend(current.values())
+        elif isinstance(current, list):
+            pending.extend(current)
+    return {
+        "consuming_calls": consuming_calls,
+        "aggregate_transfers": aggregate_transfers,
+        "result_terminals": (
+            parameter_reference_sites
+            + global_reference_sites
+            - consuming_calls
+            - aggregate_transfers
+        ),
+        "parameter_reference_sites": parameter_reference_sites,
+        "global_reference_sites": global_reference_sites,
+        "distinct_parameters": len(parameter_names),
+        "distinct_globals": len(global_indices),
+        "nested_lambdas": nested_lambdas,
     }
 
 
@@ -1094,6 +1418,26 @@ def worker_decl(
     first_function_id: int,
     user_call_edges: int,
 ) -> JsonObject:
+    if body_shape == "mixed_function_owner_catalog":
+        return user_function(
+            f"bench_worker_{index:04d}",
+            def_id,
+            mixed_function_owner_catalog_body(
+                index,
+                params_per_function,
+                global_reads_per_function,
+                body_leaves,
+            ),
+            [
+                core_param_with_type(
+                    borrowed_param_name(index, param_index),
+                    heap_record_type(BORROWED_OWNER_TYPE_NAME),
+                )
+                for param_index in range(params_per_function)
+            ],
+            MANAGED_PARAMETER_TYPE,
+        )
+
     if body_shape == "referenced_global_boundary":
         return user_function(
             f"bench_worker_{index:04d}",
@@ -1355,6 +1699,7 @@ def fixture_request(
             "borrowed_call_protection",
             "aggregate_escape",
             "referenced_global_boundary",
+            "mixed_function_owner_catalog",
             "lambda_borrowed_boundary",
         )
         else []
@@ -1375,7 +1720,28 @@ def fixture_request(
         )
         for index in range(function_count)
     ]
-    if body_shape == "referenced_global_boundary":
+    if body_shape == "mixed_function_owner_catalog":
+        for function in functions_json:
+            body = function.get("body")
+            if expression_node_count(body) != body_leaves:
+                raise RuntimeError("mixed function owner body node count changed")
+            parameter_sites_per_family = (
+                MIXED_FUNCTION_OWNER_BOUNDARY_SITES_PER_FAMILY
+                - global_reads_per_function
+            )
+            expected_census = {
+                "consuming_calls": MIXED_FUNCTION_OWNER_BOUNDARY_SITES_PER_FAMILY,
+                "aggregate_transfers": MIXED_FUNCTION_OWNER_BOUNDARY_SITES_PER_FAMILY,
+                "result_terminals": MIXED_FUNCTION_OWNER_BOUNDARY_SITES_PER_FAMILY,
+                "parameter_reference_sites": 3 * parameter_sites_per_family,
+                "global_reference_sites": 3 * global_reads_per_function,
+                "distinct_parameters": min(params_per_function, parameter_sites_per_family),
+                "distinct_globals": global_reads_per_function,
+                "nested_lambdas": 0,
+            }
+            if mixed_function_owner_census(body) != expected_census:
+                raise RuntimeError("mixed function owner boundary census changed")
+    elif body_shape == "referenced_global_boundary":
         for function in functions_json:
             body = function.get("body")
             if expression_node_count(body) != body_leaves:
@@ -1700,6 +2066,7 @@ def validate_perceus_parameter_shape(
     parameter_type: str,
     body_shape: str = "linear",
     user_call_edges: int = 1,
+    global_count: int = 0,
 ) -> None:
     declarations = core_program.get("decls")
     if not isinstance(declarations, list):
@@ -1758,7 +2125,11 @@ def validate_perceus_parameter_shape(
             value_type = param.get("type")
             expected_type = (
                 heap_record_type(BORROWED_OWNER_TYPE_NAME)
-                if body_shape in ("borrowed_call_protection", "aggregate_escape")
+                if body_shape in (
+                    "borrowed_call_protection",
+                    "aggregate_escape",
+                    "mixed_function_owner_catalog",
+                )
                 else named_type(parameter_type)
             )
             if (
@@ -1782,6 +2153,15 @@ def validate_perceus_parameter_shape(
                     RESULT_ALIAS_TERMINALS_PER_FUNCTION
                     if param_index == 0
                     else 0
+                )
+            elif body_shape == "mixed_function_owner_catalog":
+                expected_reads = 3 * sum(
+                    1
+                    for site_index in range(
+                        global_count,
+                        MIXED_FUNCTION_OWNER_BOUNDARY_SITES_PER_FAMILY,
+                    )
+                    if (site_index - global_count) % params_per_function == param_index
                 )
             elif body_shape == "nested_user_call":
                 expected_reads = (
@@ -1850,6 +2230,7 @@ def validate_response(
             parameter_type,
             body_shape,
             user_call_edges,
+            global_count,
         )
         encoded_output = json.dumps(output, separators=(",", ":")).encode("utf-8")
 
@@ -2377,6 +2758,10 @@ def run_benchmark(
                     parsed_counters = add_referenced_global_derived_counters(
                         parsed_counters
                     )
+                elif body_shape == "mixed_function_owner_catalog":
+                    parsed_counters = add_mixed_function_owner_derived_counters(
+                        parsed_counters
+                    )
                 elif body_shape == "lambda_borrowed_boundary":
                     parsed_counters = add_lambda_derived_counters(parsed_counters)
                 counter_observations.append(parsed_counters)
@@ -2424,6 +2809,10 @@ def run_benchmark(
                     )
                     if body_shape == "referenced_global_boundary":
                         parsed_baseline_counters = add_referenced_global_derived_counters(
+                            parsed_baseline_counters
+                        )
+                    elif body_shape == "mixed_function_owner_catalog":
+                        parsed_baseline_counters = add_mixed_function_owner_derived_counters(
                             parsed_baseline_counters
                         )
                     elif body_shape == "lambda_borrowed_boundary":
@@ -3001,6 +3390,148 @@ def validate_referenced_global_matrix(points: list[JsonObject]) -> None:
                 )
 
 
+def validate_mixed_function_owner_catalog_matrix(points: list[JsonObject]) -> None:
+    if len(points) != 2:
+        raise RuntimeError("mixed function owner matrix requires low and high points")
+    owner_points = [
+        (
+            int(point["params_per_function"]),
+            int(point["global_reads_per_function"]),
+        )
+        for point in points
+    ]
+    expected_points = [
+        (1, 1),
+        (
+            MIXED_FUNCTION_OWNER_HIGH_PARAMETERS,
+            MIXED_FUNCTION_OWNER_HIGH_GLOBALS,
+        ),
+    ]
+    if owner_points != expected_points:
+        raise RuntimeError(
+            "mixed function owner matrix requires 1/1 and 32/8 owner points: "
+            f"{owner_points}"
+        )
+
+    counters = [point.get("work_counters") for point in points]
+    if not all(isinstance(value, dict) for value in counters):
+        raise RuntimeError("mixed function owner matrix requires work counters")
+
+    candidate_visits = [
+        int(counter["mixed_function_normalization_visits"])
+        for counter in counters
+    ]
+
+    expected_parameter_slots = [
+        int(point["functions"]) * int(point["params_per_function"])
+        for point in points
+    ]
+    actual_parameter_slots = [
+        int(counter["borrowed_call_owner_catalog_slots"])
+        for counter in counters
+    ]
+    if actual_parameter_slots != expected_parameter_slots:
+        raise RuntimeError(
+            "mixed function parameter catalog slots do not match exact owners: "
+            f"{actual_parameter_slots} != {expected_parameter_slots}"
+        )
+
+    expected_global_slots = [
+        int(point["functions"]) * int(point["global_reads_per_function"])
+        for point in points
+    ]
+    actual_global_slots = [
+        int(counter["borrowed_global_catalog_slots"])
+        for counter in counters
+    ]
+    if actual_global_slots != expected_global_slots:
+        raise RuntimeError(
+            "mixed function global catalog slots do not match exact owners: "
+            f"{actual_global_slots} != {expected_global_slots}"
+        )
+
+    for counter in counters:
+        fallback_requests = sum(
+            int(counter[name])
+            for name in (
+                "borrowed_call_alias_fallback_requests",
+                "borrowed_aggregate_alias_fallback_requests",
+                "borrowed_result_alias_fallback_requests",
+            )
+        )
+        if fallback_requests != 0:
+            raise RuntimeError(
+                "mixed function owner matrix unexpectedly entered scalar alias fallback: "
+                f"{fallback_requests}"
+            )
+
+    expected_actions = (
+        MIXED_FUNCTION_OWNER_MATRIX_FUNCTIONS
+        * MIXED_FUNCTION_OWNER_BOUNDARY_SITES_PER_FAMILY
+    )
+    for name in (
+        "borrowed_call_rewrite_actions",
+        "borrowed_aggregate_rewrite_actions",
+        "borrowed_result_rewrite_actions",
+    ):
+        actions = [int(counter[name]) for counter in counters]
+        if actions != [expected_actions, expected_actions]:
+            raise RuntimeError(
+                f"mixed function owner {name} does not match boundary sites: "
+                f"{actions} != {[expected_actions, expected_actions]}"
+            )
+
+    baseline_counters = [point.get("baseline_work_counters") for point in points]
+    if not all(isinstance(value, dict) for value in baseline_counters):
+        raise RuntimeError("mixed function owner matrix requires baseline work counters")
+    baseline_visits = [
+        int(counter["mixed_function_normalization_visits"])
+        for counter in baseline_counters
+    ]
+    if candidate_visits[-1] * 5 > baseline_visits[-1] * 3:
+        raise RuntimeError(
+            "mixed function owner matrix must reduce reconstruction visits by "
+            f"at least 40%: baseline {baseline_visits[-1]}, "
+            f"candidate {candidate_visits[-1]}"
+        )
+
+    high_point = points[-1]
+    high_time_ratio = high_point.get(
+        "paired_window_elapsed_microseconds_ratio_median"
+    )
+    if not isinstance(high_time_ratio, (int, float)) or float(high_time_ratio) > 0.92:
+        raise RuntimeError(
+            "mixed function owner matrix must make the high-owner direct window "
+            f"at least 8% faster: ratio {high_time_ratio}"
+        )
+    high_allocation_ratio = high_point.get(
+        "paired_window_allocations_ratio_median"
+    )
+    if (
+        not isinstance(high_allocation_ratio, (int, float))
+        or float(high_allocation_ratio) > 0.95
+    ):
+        raise RuntimeError(
+            "mixed function owner matrix must reduce high-owner direct-window "
+            f"allocations by at least 5%: ratio {high_allocation_ratio}"
+        )
+
+    low_point = points[0]
+    low_time_ratio = low_point.get("paired_window_elapsed_microseconds_ratio_median")
+    if not isinstance(low_time_ratio, (int, float)) or float(low_time_ratio) > 1.05:
+        raise RuntimeError(
+            "mixed function owner low control regressed direct time by more than "
+            f"5%: ratio {low_time_ratio}"
+        )
+    for metric_name in ("window_allocations", "window_releases"):
+        ratio = low_point.get(f"paired_{metric_name}_ratio_median")
+        if not isinstance(ratio, (int, float)) or float(ratio) > 1.02:
+            raise RuntimeError(
+                "mixed function owner low control "
+                f"{metric_name} regressed by more than 2%: ratio {ratio}"
+            )
+
+
 def validate_lambda_owner_baseline_matrix(points: list[JsonObject]) -> None:
     if len(points) != 3:
         raise RuntimeError("lambda-owner matrix requires 1, 8, and 32-owner points")
@@ -3422,6 +3953,56 @@ def run_lambda_owner_matrix(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_mixed_function_owner_catalog_matrix(args: argparse.Namespace) -> int:
+    root = project_root()
+    with tempfile.TemporaryDirectory(prefix="blorp-perceus-mixed-owner-matrix-") as temp_name:
+        bridge = prepare_backend_worker(root, Path(temp_name) / "timing", args.bridge)
+        counter_bridge = None
+        if getattr(args, "work_counters", False):
+            counter_bridge = prepare_backend_worker(
+                root,
+                Path(temp_name) / "counters",
+                args.counter_bridge,
+                debug_profile=True,
+            )
+
+        matrix_points: list[JsonObject] = []
+        for parameter_count, referenced_globals in (
+            (1, 1),
+            (
+                MIXED_FUNCTION_OWNER_HIGH_PARAMETERS,
+                MIXED_FUNCTION_OWNER_HIGH_GLOBALS,
+            ),
+        ):
+            point = argparse.Namespace(**vars(args))
+            point.bridge = str(bridge)
+            point.counter_bridge = str(counter_bridge) if counter_bridge is not None else None
+            point.globals = referenced_globals
+            point.functions = MIXED_FUNCTION_OWNER_MATRIX_FUNCTIONS
+            point.body_leaves = MIXED_FUNCTION_OWNER_MATRIX_BODY_NODES
+            point.global_reads_per_function = referenced_globals
+            point.params_per_function = parameter_count
+            point.parameter_type = MANAGED_PARAMETER_TYPE
+            point.body_shape = "mixed_function_owner_catalog"
+            point.measurement_window = "perceus-direct"
+            point.control_parameter_type = None
+            point.invoke_workers = False
+            point.global_matrix = False
+            point.parameter_matrix = False
+            point.aggregate_matrix = False
+            point.result_matrix = False
+            point.referenced_global_matrix = False
+            point.lambda_owner_matrix = False
+            point.mixed_function_owner_catalog_matrix = False
+            point.contract_matrix = False
+            run_benchmark(point, matrix_points)
+
+        if getattr(args, "work_counters", False):
+            validate_mixed_function_owner_catalog_matrix(matrix_points)
+
+    return 0
+
+
 def run_contract_matrix(args: argparse.Namespace) -> int:
     root = project_root()
     with tempfile.TemporaryDirectory(prefix="blorp-perceus-contract-matrix-") as temp_name:
@@ -3619,6 +4200,14 @@ def main(argv: list[str]) -> int:
         ),
     )
     parser.add_argument(
+        "--mixed-function-owner-catalog-matrix",
+        action="store_true",
+        help=(
+            "compare split and combined ordinary-function owner catalogs with "
+            "fixed two-function, 1536-node bodies"
+        ),
+    )
+    parser.add_argument(
         "--contract-matrix",
         action="store_true",
         help="vary borrowed owners, body nodes, and user-call edges one axis at a time",
@@ -3653,6 +4242,7 @@ def main(argv: list[str]) -> int:
         or args.result_matrix
         or args.referenced_global_matrix
         or args.lambda_owner_matrix
+        or args.mixed_function_owner_catalog_matrix
         or args.contract_matrix
     ):
         if args.global_reads_per_function >= args.body_leaves:
@@ -3691,6 +4281,7 @@ def main(argv: list[str]) -> int:
             args.result_matrix,
             args.referenced_global_matrix,
             args.lambda_owner_matrix,
+            args.mixed_function_owner_catalog_matrix,
             args.contract_matrix,
         )
     )
@@ -3706,6 +4297,10 @@ def main(argv: list[str]) -> int:
         parser.error("--referenced-global-matrix cannot be combined with --end-to-end")
     if args.lambda_owner_matrix and args.end_to_end:
         parser.error("--lambda-owner-matrix cannot be combined with --end-to-end")
+    if args.mixed_function_owner_catalog_matrix and args.end_to_end:
+        parser.error(
+            "--mixed-function-owner-catalog-matrix cannot be combined with --end-to-end"
+        )
     if args.result_matrix and args.baseline_bridge is None:
         parser.error("--result-matrix requires --baseline-bridge")
     if (
@@ -3722,6 +4317,19 @@ def main(argv: list[str]) -> int:
         and args.baseline_counter_bridge is None
     ):
         parser.error("--referenced-global-matrix requires --baseline-counter-bridge")
+    if args.mixed_function_owner_catalog_matrix and args.baseline_bridge is None:
+        parser.error(
+            "--mixed-function-owner-catalog-matrix requires --baseline-bridge"
+        )
+    if (
+        args.mixed_function_owner_catalog_matrix
+        and args.work_counters
+        and args.baseline_counter_bridge is None
+    ):
+        parser.error(
+            "--mixed-function-owner-catalog-matrix requires "
+            "--baseline-counter-bridge"
+        )
     if args.contract_matrix and args.end_to_end:
         parser.error("--contract-matrix cannot be combined with --end-to-end")
 
@@ -3741,6 +4349,8 @@ def main(argv: list[str]) -> int:
             return run_referenced_global_matrix(args)
         if args.lambda_owner_matrix:
             return run_lambda_owner_matrix(args)
+        if args.mixed_function_owner_catalog_matrix:
+            return run_mixed_function_owner_catalog_matrix(args)
         if args.contract_matrix:
             return run_contract_matrix(args)
         return run_benchmark(args)
