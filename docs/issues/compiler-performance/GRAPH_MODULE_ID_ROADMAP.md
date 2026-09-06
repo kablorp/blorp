@@ -7,6 +7,11 @@ maintainer decision despite missing its performance gate, and was restored
 after fixing the compiler ownership regression that had forced its temporary
 revert; Issue 51 is deferred pending a production catalog consumer
 
+**Measured successor:** [Stage 6 Dense Module-Index Migration Roadmap](STAGE6_DENSE_MODULE_INDEX_MIGRATION_ROADMAP.md)
+records the rejected cumulative migration experiment. Retain it as measurement
+and design history; further implementation requires a newly scoped proposal
+rather than continuing that rejected plan.
+
 Issue 45's standalone candidate reduced allocations in a narrow indexed-scope
 lookup but increased whole-compiler retired instructions by 0.319%, so its
 production code was restored. Issue 46 was later reactivated as one combined

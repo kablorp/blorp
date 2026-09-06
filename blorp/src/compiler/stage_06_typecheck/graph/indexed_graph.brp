@@ -69,11 +69,13 @@ union IndexedGraphError:
 	ReservedCompilerStandardLibraryPath(String)
 	DuplicateCompilerModuleTarget(String)
 	UnknownCompilerModuleTarget(String)
+	UnknownCompilerModuleTableIndex(Int)
 
 
 private record IndexedGraphRep {
 	target: PreparedModule,
-	modules: List[PreparedModule],
+	module_table: List[PreparedModule],
+	target_index: Int,
 	dependencies_by_path: Dict[String, Int],
 	definition_index: DefinitionIndex
 }
@@ -91,7 +93,6 @@ foreign(include: "indexed_graph_ffi.h"):
 
 private record PreparedModuleScopeRep {
 	graph: IndexedGraph,
-	module: PreparedModule,
 	module_index: Int
 }
 
@@ -113,6 +114,8 @@ pure func indexed_graph_error_message(error: IndexedGraphError) -> String:
 			"duplicate typecheck module target '" + identity + "'"
 		UnknownCompilerModuleTarget(identity):
 			"unknown typecheck module target '" + identity + "'"
+		UnknownCompilerModuleTableIndex(index):
+			"unknown typecheck module table index '" + index.to_string() + "'"
 
 
 private pure func indexed_graph_error_from_loaded_module_set_error(
@@ -123,28 +126,47 @@ private pure func indexed_graph_error_from_loaded_module_set_error(
 
 private pure func indexed_graph_from_loaded_modules(
 	loaded_modules: LoadedModuleSet,
+	target_index: Int,
 ) -> IndexedGraph:
 	definition_index = definition_index_for_loaded_modules(
 		definition_index_initial_seed(ENV_EMPTY),
 		loaded_modules,
 	)
 	target = prepared_module_from_loaded(loaded_module_set_target(loaded_modules))
-	modules = loaded_module_set_modules(loaded_modules).map(func(module):
-		prepared_module_from_loaded(module)
-	)
-	var dependencies_by_path: Dict[String, Int] = {}
+	loaded_dependencies = loaded_module_set_modules(loaded_modules)
+	var module_table: List[PreparedModule] = []
 	var dependency_index: Int = 0
+	var table_index: Int = 0
 
-	for module in modules:
-		dependencies_by_path = dependencies_by_path.set(
-			prepared_module_canonical_path(module),
-			dependency_index,
-		)
-		dependency_index += 1
+	while table_index < loaded_dependencies.length() + 1:
+		if table_index == target_index:
+			module_table = module_table.append(target)
+		else:
+			match loaded_dependencies.get(dependency_index):
+				Some(module):
+					module_table = module_table.append(prepared_module_from_loaded(module))
+					dependency_index += 1
+				None:
+					void
+
+		table_index += 1
+
+	var dependencies_by_path: Dict[String, Int] = {}
+	var module_index: Int = 0
+
+	for module in module_table:
+		if module_index != target_index:
+			dependencies_by_path = dependencies_by_path.set(
+				prepared_module_canonical_path(module),
+				module_index,
+			)
+
+		module_index += 1
 
 	representation: IndexedGraphRep = {
 		target = target,
-		modules = modules,
+		module_table = module_table,
+		target_index = target_index,
 		dependencies_by_path = dependencies_by_path,
 		definition_index = definition_index
 	}
@@ -198,7 +220,36 @@ pure func indexed_graph_build(
 			Err(errors):
 				Err(errors.map(indexed_graph_error_from_loaded_module_set_error))
 			Ok(loaded_modules):
-				Ok(indexed_graph_from_loaded_modules(loaded_modules))
+				Ok(indexed_graph_from_loaded_modules(loaded_modules, 0))
+
+
+pure func indexed_graph_build_for_module_table(
+	module_candidates: List[ModuleLoadCandidate],
+	target_index: Int,
+) -> Result[IndexedGraph, List[IndexedGraphError]]:
+	match module_candidates.get(target_index):
+		None:
+			Err([UnknownCompilerModuleTableIndex(target_index)])
+		Some(target_candidate):
+			var dependencies: List[ModuleLoadCandidate] = []
+			var module_index: Int = 0
+
+			for candidate in module_candidates:
+				if module_index != target_index:
+					dependencies = dependencies.append(candidate)
+
+				module_index += 1
+
+			validation_errors = module_candidate_validation_errors(target_candidate, dependencies)
+
+			if validation_errors.length() > 0:
+				Err(validation_errors)
+			else:
+				match loaded_module_set(target_candidate, dependencies):
+					Err(errors):
+						Err(errors.map(indexed_graph_error_from_loaded_module_set_error))
+					Ok(loaded_modules):
+						Ok(indexed_graph_from_loaded_modules(loaded_modules, target_index))
 
 
 pure func indexed_graph_target(graph: IndexedGraph) -> PreparedModule:
@@ -208,7 +259,16 @@ pure func indexed_graph_target(graph: IndexedGraph) -> PreparedModule:
 
 pure func indexed_graph_modules(graph: IndexedGraph) -> List[PreparedModule]:
 	representation: IndexedGraphRep = from_opaque IndexedGraph(graph)
-	representation.modules
+	var modules: List[PreparedModule] = []
+	var module_index: Int = 0
+
+	for module in representation.module_table:
+		if module_index != representation.target_index:
+			modules = modules.append(module)
+
+		module_index += 1
+
+	modules
 
 
 pure func indexed_graph_find_dependency(
@@ -216,8 +276,8 @@ pure func indexed_graph_find_dependency(
 	canonical_path: String,
 ) -> Option[PreparedModule]:
 	representation: IndexedGraphRep = from_opaque IndexedGraph(graph)
-	index ?= representation.dependencies_by_path.get(canonical_path)
-	representation.modules.get(index)
+	module_index ?= representation.dependencies_by_path.get(canonical_path)
+	representation.module_table.get(module_index)
 
 
 pure func indexed_graph_select_dependencies(
@@ -252,11 +312,14 @@ pure func indexed_graph_definition_index(graph: IndexedGraph) -> DefinitionIndex
 
 
 pure func indexed_graph_module_scopes(graph: IndexedGraph) -> List[PreparedModuleScope]:
+	representation: IndexedGraphRep = from_opaque IndexedGraph(graph)
 	var scopes: List[PreparedModuleScope] = []
-	var module_index: Int = 1
+	var module_index: Int = 0
 
-	for module in indexed_graph_modules(graph):
-		scopes = scopes.append(prepared_module_scope(graph, module, module_index))
+	for _module in representation.module_table:
+		if module_index != representation.target_index:
+			scopes = scopes.append(prepared_module_scope(graph, module_index))
+
 		module_index += 1
 
 	scopes
@@ -264,12 +327,10 @@ pure func indexed_graph_module_scopes(graph: IndexedGraph) -> List[PreparedModul
 
 private pure func prepared_module_scope(
 	graph: IndexedGraph,
-	module: PreparedModule,
 	module_index: Int,
 ) -> PreparedModuleScope:
 	representation: PreparedModuleScopeRep = {
 		graph = graph,
-		module = module,
 		module_index = module_index
 	}
 	into_opaque PreparedModuleScope(representation)
@@ -299,7 +360,8 @@ pure func indexed_graph_select_dependency_scopes(
 
 
 pure func indexed_graph_target_scope(graph: IndexedGraph) -> PreparedModuleScope:
-	prepared_module_scope(graph, indexed_graph_target(graph), 0)
+	representation: IndexedGraphRep = from_opaque IndexedGraph(graph)
+	prepared_module_scope(graph, representation.target_index)
 
 
 pure func indexed_graph_find_dependency_scope(
@@ -307,9 +369,8 @@ pure func indexed_graph_find_dependency_scope(
 	canonical_path: String,
 ) -> Option[PreparedModuleScope]:
 	representation: IndexedGraphRep = from_opaque IndexedGraph(graph)
-	dependency_index ?= representation.dependencies_by_path.get(canonical_path)
-	module ?= representation.modules.get(dependency_index)
-	Some(prepared_module_scope(graph, module, dependency_index + 1))
+	module_index ?= representation.dependencies_by_path.get(canonical_path)
+	Some(prepared_module_scope(graph, module_index))
 
 
 pure func prepared_module_scope_find_module(
@@ -326,7 +387,10 @@ pure func prepared_module_scope_find_module(
 
 pure func prepared_module_scope_module(scope: PreparedModuleScope) -> PreparedModule:
 	representation: PreparedModuleScopeRep = from_opaque PreparedModuleScope(scope)
-	representation.module
+	graph_representation: IndexedGraphRep = from_opaque IndexedGraph(representation.graph)
+	graph_representation.module_table
+		.get(representation.module_index)
+		.get_or(graph_representation.target)
 
 
 pure func prepared_module_scope_definition_index(scope: PreparedModuleScope) -> DefinitionIndex:
@@ -401,9 +465,10 @@ private pure func indexed_graphs_are_equal(left: IndexedGraph, right: IndexedGra
 	(
 		prepared_modules_are_equal(left_representation.target, right_representation.target)
 		and prepared_module_lists_are_equal(
-			left_representation.modules,
-			right_representation.modules,
+			left_representation.module_table,
+			right_representation.module_table,
 		)
+		and left_representation.target_index == right_representation.target_index
 	)
 
 
@@ -421,19 +486,21 @@ pure func prepared_module_scopes_are_compatible(
 
 
 -- Return the requested module's table position only when both scopes prove
--- the same complete graph and therefore the same target-first module order.
+-- the same complete graph and therefore the same issuing-table order.
 pure func prepared_module_scope_compatible_index(
 	owner: PreparedModuleScope,
 	requested: PreparedModuleScope,
 ) -> Option[Int]:
 	requested_representation: PreparedModuleScopeRep = from_opaque PreparedModuleScope(requested)
-	module_count = indexed_graph_modules(requested_representation.graph).length() + 1
+	graph_representation: IndexedGraphRep = from_opaque IndexedGraph(requested_representation.graph)
+	module_index = requested_representation.module_index
+	module_count = graph_representation.module_table.length()
 
 	if (
 		prepared_module_scopes_are_compatible(owner, requested)
-		and requested_representation.module_index >= 0
-		and requested_representation.module_index < module_count
+		and module_index >= 0
+		and module_index < module_count
 	):
-		Some(requested_representation.module_index)
+		Some(module_index)
 	else:
 		None

@@ -59,6 +59,21 @@ IMPORT_ENTRY = re.compile(
     r"(?:\s*:\s*(?P<selection>.*))?$"
 )
 ENVIRONMENT_READ = re.compile(r'\bgetenv\("(BLORP_[A-Z0-9_]+)"\)')
+MODULE_IDENTITY_TYPE = re.compile(
+    r"\b(?:ResolvedModuleIdentity|ModuleIdentity|FrontendModuleId)\b"
+)
+MODULE_STRING_BINDING = re.compile(
+    r"\b(?:[A-Za-z_][A-Za-z0-9_]*module_(?:path|name)|"
+    r"module_(?:path|name)|module_bucket)\s*:\s*String\b"
+)
+MODULE_STRING_FIELD_READ = re.compile(
+    r"\.(?:[A-Za-z_][A-Za-z0-9_]*module_(?:path|name)|"
+    r"module_(?:path|name)|module_bucket)\b"
+)
+MODULE_STRING_FUNCTION_NAME = re.compile(
+    r"(?:^|_)module_(?:(?:canonical|source|display|requested|resolved|owner|target)_)?"
+    r"(?:path|paths|name|names)(?:_|$)"
+)
 TEXT_REFERENCE_SUFFIXES = {
     ".brp",
     ".json",
@@ -399,6 +414,185 @@ def declaration_edges(
     return edges
 
 
+def declaration_header(body: str) -> str:
+    """Return a top-level declaration header without its expression body."""
+    nesting = 0
+    for index, character in enumerate(body):
+        if character in "([":
+            nesting += 1
+        elif character in ")]":
+            nesting -= 1
+        elif character == ":" and nesting == 0:
+            return body[: index + 1]
+    return body
+
+
+def module_fact_categories(declaration: Declaration) -> tuple[str, ...]:
+    if declaration.kind != "func":
+        return ()
+
+    header = declaration_header(declaration.body)
+    body = declaration.body[len(header) :]
+    facts: list[str] = []
+    if MODULE_IDENTITY_TYPE.search(header) is not None:
+        facts.append("module_identity_signature")
+    if MODULE_IDENTITY_TYPE.search(body) is not None:
+        facts.append("module_identity_body")
+    if MODULE_STRING_BINDING.search(header) is not None:
+        facts.append("module_string_signature")
+    if MODULE_STRING_BINDING.search(body) is not None:
+        facts.append("module_string_body")
+    if MODULE_STRING_FIELD_READ.search(body) is not None:
+        facts.append("module_string_field_read")
+    if (
+        MODULE_STRING_FUNCTION_NAME.search(declaration.node.name) is not None
+        and re.search(r"\bString\b", header) is not None
+    ):
+        facts.append("module_string_named_function")
+    return tuple(facts)
+
+
+def node_id(node: Node) -> str:
+    return f"{node.module}::{node.name}"
+
+
+def module_identity_call_graph(
+    declarations: dict[Node, Declaration],
+    variants: dict[tuple[str, str], Node],
+    imports_by_module: dict[str, list[ImportBinding]],
+) -> dict[str, object]:
+    """Build the conservative caller closure around module identity facts."""
+    functions = {
+        node: declaration
+        for node, declaration in declarations.items()
+        if declaration.kind == "func"
+    }
+    all_edges = declaration_edges(declarations, variants, imports_by_module)
+    function_edges = {
+        caller: {callee for callee in callees if callee in functions}
+        for caller, callees in all_edges.items()
+        if caller in functions
+    }
+    facts_by_node = {
+        node: module_fact_categories(declaration)
+        for node, declaration in functions.items()
+    }
+    direct_nodes = {node for node, facts in facts_by_node.items() if facts}
+
+    callers_by_callee: dict[Node, set[Node]] = defaultdict(set)
+    for caller, callees in function_edges.items():
+        for callee in callees:
+            callers_by_callee[callee].add(caller)
+
+    distance = {node: 0 for node in direct_nodes}
+    pending = deque(sorted(direct_nodes))
+    while pending:
+        callee = pending.popleft()
+        next_distance = distance[callee] + 1
+        for caller in sorted(callers_by_callee[callee]):
+            previous = distance.get(caller)
+            if previous is None or next_distance < previous:
+                distance[caller] = next_distance
+                pending.append(caller)
+
+    relevant_nodes = set(distance)
+    nodes: list[dict[str, object]] = []
+    for node in sorted(relevant_nodes):
+        declaration = functions[node]
+        try:
+            path = display_path(declaration.path)
+        except ValueError:
+            path = str(declaration.path)
+        nodes.append(
+            {
+                "id": node_id(node),
+                "module": node.module,
+                "name": node.name,
+                "path": path,
+                "line": declaration.line,
+                "private": declaration.private,
+                "direct_facts": list(facts_by_node[node]),
+                "distance_to_direct_fact": distance[node],
+            }
+        )
+
+    edges = sorted(
+        (
+            {"caller": node_id(caller), "callee": node_id(callee)}
+            for caller, callees in function_edges.items()
+            if caller in relevant_nodes
+            for callee in callees
+            if callee in relevant_nodes
+        ),
+        key=lambda edge: (edge["caller"], edge["callee"]),
+    )
+    fact_counts = Counter(
+        fact
+        for node in direct_nodes
+        for fact in facts_by_node[node]
+    )
+
+    return {
+        "schema_version": 1,
+        "resolution": "conservative Blorp source import/name dependency graph",
+        "counts": {
+            "compiler_functions": len(functions),
+            "direct_fact_functions": len(direct_nodes),
+            "caller_closure_functions": len(relevant_nodes),
+            "caller_closure_edges": len(edges),
+            "direct_facts": dict(sorted(fact_counts.items())),
+        },
+        "nodes": nodes,
+        "edges": edges,
+    }
+
+
+def collect_module_identity_call_graph() -> dict[str, object]:
+    source_files = source_files_for_audit()
+    known_paths = {path.resolve() for path in source_files}
+    declarations, variants = parse_declarations(source_files)
+    imports_by_module = {
+        module_name(path): parse_imports(path, path.read_text(encoding="utf-8"), known_paths)
+        for path in source_files
+    }
+    return module_identity_call_graph(declarations, variants, imports_by_module)
+
+
+def dot_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def print_module_identity_call_graph_dot(graph: dict[str, object]) -> None:
+    print("digraph compiler_module_identity_calls {")
+    print('  rankdir="LR";')
+    nodes = graph["nodes"]
+    assert isinstance(nodes, list)
+    for node in nodes:
+        assert isinstance(node, dict)
+        facts = node["direct_facts"]
+        assert isinstance(facts, list)
+        detail = ", ".join(str(fact) for fact in facts) if facts else f"distance {node['distance_to_direct_fact']}"
+        label = "\\n".join(
+            dot_escape(part)
+            for part in (
+                f"{node['module']}::{node['name']}",
+                f"{node['path']}:{node['line']}",
+                detail,
+            )
+        )
+        shape = "box" if facts else "ellipse"
+        print(f'  "{dot_escape(str(node["id"]))}" [label="{label}", shape="{shape}"];')
+    edges = graph["edges"]
+    assert isinstance(edges, list)
+    for edge in edges:
+        assert isinstance(edge, dict)
+        print(
+            f'  "{dot_escape(str(edge["caller"]))}" -> '
+            f'"{dot_escape(str(edge["callee"]))}";'
+        )
+    print("}")
+
+
 def external_roots(
     paths: list[Path],
     known_paths: set[Path],
@@ -704,8 +898,28 @@ def print_text(audit: dict[str, object]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    output = parser.add_mutually_exclusive_group()
+    output.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    output.add_argument(
+        "--module-identity-graph-json",
+        action="store_true",
+        help="emit the module identity/string caller closure as JSON",
+    )
+    output.add_argument(
+        "--module-identity-graph-dot",
+        action="store_true",
+        help="emit the module identity/string caller closure as Graphviz DOT",
+    )
     args = parser.parse_args()
+
+    if args.module_identity_graph_json or args.module_identity_graph_dot:
+        graph = collect_module_identity_call_graph()
+        if args.module_identity_graph_json:
+            print(json.dumps(graph, indent=2, sort_keys=True))
+        else:
+            print_module_identity_call_graph_dot(graph)
+        return 0
+
     audit = collect_audit()
     if args.json:
         print(json.dumps(audit, indent=2, sort_keys=True))

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+import io
 from pathlib import Path
 import runpy
 import tempfile
@@ -202,6 +204,155 @@ func documented() -> Bool:
             )
 
             self.assertEqual(findings, [documentation])
+
+    def test_module_identity_call_graph_classifies_direct_facts_and_callers(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_temp_dir:
+            source_root = Path(raw_temp_dir) / "src"
+            source_root.mkdir()
+            source_root = source_root.resolve()
+            source = source_root / "sample.brp"
+            source.write_text(
+                """\
+record ModuleHolder {
+\tmodule_path: String
+}
+
+pure func identity_name(identity: ModuleIdentity) -> String:
+\tmodule_identity_display_name(identity)
+
+pure func path_name(module_path: String) -> String:
+\tmodule_path
+
+pure func prepared_module_canonical_path(module: ModuleHolder) -> String:
+\tmodule.module_path
+
+pure func holder_path(holder: ModuleHolder) -> String:
+\tholder.module_path
+
+pure func identity_body(value: Int) -> Int:
+\towner: Option[ModuleIdentity] = None
+\tvalue
+
+pure func string_body(value: Int) -> String:
+\tmodule_name: String = "sample"
+\tmodule_name
+
+pure func caller(identity: ModuleIdentity) -> String:
+\tidentity_name(identity)
+
+pure func transitive_caller(value: Int) -> String:
+\tcaller(value)
+
+pure func unrelated(value: Int) -> Int:
+\tvalue
+
+pure func module_surface_symbol_kind_name(value: String) -> String:
+\tvalue
+
+pure func import_module_named_field(value: String) -> String:
+\tvalue
+
+pure func module_view_find_local_name(value: String) -> String:
+\tvalue
+""",
+                encoding="utf-8",
+            )
+
+            self.audit["parse_declarations"].__globals__["SOURCE_ROOT"] = source_root
+            declarations, variants = self.audit["parse_declarations"]([source])
+            graph = self.audit["module_identity_call_graph"](
+                declarations,
+                variants,
+                {"sample": []},
+            )
+            nodes = {node["id"]: node for node in graph["nodes"]}
+
+            self.assertEqual(
+                nodes["sample::identity_name"]["direct_facts"],
+                ["module_identity_signature"],
+            )
+            self.assertEqual(
+                nodes["sample::path_name"]["direct_facts"],
+                ["module_string_signature"],
+            )
+            self.assertEqual(
+                nodes["sample::holder_path"]["direct_facts"],
+                ["module_string_field_read"],
+            )
+            self.assertEqual(
+                nodes["sample::prepared_module_canonical_path"]["direct_facts"],
+                ["module_string_field_read", "module_string_named_function"],
+            )
+            self.assertEqual(
+                nodes["sample::identity_body"]["direct_facts"],
+                ["module_identity_body"],
+            )
+            self.assertEqual(
+                nodes["sample::string_body"]["direct_facts"],
+                ["module_string_body"],
+            )
+            self.assertEqual(nodes["sample::caller"]["distance_to_direct_fact"], 0)
+            self.assertEqual(
+                nodes["sample::transitive_caller"]["distance_to_direct_fact"],
+                1,
+            )
+            self.assertNotIn("sample::unrelated", nodes)
+            self.assertNotIn("sample::module_surface_symbol_kind_name", nodes)
+            self.assertNotIn("sample::import_module_named_field", nodes)
+            self.assertNotIn("sample::module_view_find_local_name", nodes)
+            self.assertIn(
+                {"caller": "sample::transitive_caller", "callee": "sample::caller"},
+                graph["edges"],
+            )
+
+    def test_module_identity_call_graph_is_deterministic(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_temp_dir:
+            source_root = Path(raw_temp_dir) / "src"
+            source_root.mkdir()
+            source_root = source_root.resolve()
+            source = source_root / "sample.brp"
+            source.write_text(
+                """\
+pure func second(module_name: String) -> String: module_name
+pure func first(value: Int) -> String: second(value)
+""",
+                encoding="utf-8",
+            )
+
+            self.audit["parse_declarations"].__globals__["SOURCE_ROOT"] = source_root
+            declarations, variants = self.audit["parse_declarations"]([source])
+            first = self.audit["module_identity_call_graph"](
+                declarations,
+                variants,
+                {"sample": []},
+            )
+            second = self.audit["module_identity_call_graph"](
+                dict(reversed(list(declarations.items()))),
+                variants,
+                {"sample": []},
+            )
+
+            self.assertEqual(first, second)
+            self.assertEqual(
+                [node["id"] for node in first["nodes"]],
+                ["sample::first", "sample::second"],
+            )
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.audit["print_module_identity_call_graph_dot"](first)
+
+            dot = output.getvalue()
+            self.assertTrue(dot.startswith("digraph compiler_module_identity_calls {\n"))
+            self.assertIn("sample::second\\n", dot)
+            self.assertNotIn("sample::second\\\\n", dot)
+            self.assertIn('"sample::second" [label=', dot)
+            self.assertIn('shape="box"', dot)
+            self.assertIn('shape="ellipse"', dot)
+            self.assertIn('"sample::first" -> "sample::second";', dot)
+            self.assertLess(dot.index('"sample::first" [label='), dot.index('"sample::second" [label='))
+            self.assertEqual(self.audit["dot_escape"]('a"b\\c'), 'a\\"b\\\\c')
+            self.assertTrue(dot.endswith("}\n"))
 
 
 if __name__ == "__main__":

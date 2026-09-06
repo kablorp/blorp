@@ -317,12 +317,31 @@ environment controls with no tracked reference outside compiler source.
 ```bash
 scripts/audit-compiler-blorp-dead-code
 scripts/audit-compiler-blorp-dead-code --json
+scripts/audit-compiler-blorp-dead-code --module-identity-graph-json
+scripts/audit-compiler-blorp-dead-code --module-identity-graph-dot
 ```
 
 Findings require owner review before deletion; the script intentionally does
 not fail the quality gate merely because cleanup remains queued. Track accepted
 cleanup work in GitHub issues rather than copying point-in-time counts into a
 maintained document.
+
+The module-identity graph modes isolate functions whose signatures or bodies
+directly carry `ResolvedModuleIdentity`, `ModuleIdentity`, `FrontendModuleId`,
+explicit `module_path`/`module_name` String bindings or fields, or a String-bearing
+function whose name contains an exact `_module_path`/`_module_name` token. They
+then walk callers transitively.
+JSON output is intended for mechanical migration inventories: every node has a
+deterministic module/function key, source location, direct-fact categories, and its
+shortest caller distance from a direct fact. DOT output renders the same node
+and edge set with direct handlers boxed.
+
+This is a conservative source dependency graph, not a typechecked call graph.
+An edge means the caller references a locally or explicitly imported compiler
+function according to the audit's import/name resolver; callbacks and other
+value references can therefore appear as calls, while unresolved dynamic or
+ambiguous references are absent. Use the graph to select and sequence a bounded
+migration, then prove each edit through compiler behavior and allocation tests.
 
 ## Drift Checks
 

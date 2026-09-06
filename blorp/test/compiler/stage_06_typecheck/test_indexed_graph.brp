@@ -14,6 +14,7 @@ import:
 		resolved_module_identity_from_resolver,
 	../../../src/compiler/stage_04_modules/module_surface: module_surface_for_program
 	../../../src/compiler/stage_06_typecheck/graph/definition_index:
+		definition_index_find_type_definition_id,
 		definition_index_func_callable_id_count,
 		definition_index_initial_seed,
 		definition_index_next_def_id,
@@ -22,10 +23,12 @@ import:
 		IndexedGraph,
 		IndexedGraphError,
 		indexed_graph_build,
+		indexed_graph_build_for_module_table,
 		indexed_graph_definition_index,
 		indexed_graph_error_message,
 		indexed_graph_find_dependency,
 		indexed_graph_find_dependency_scope,
+		indexed_graph_module_scopes,
 		indexed_graph_modules,
 		indexed_graph_select_dependencies,
 		indexed_graph_select_dependency_scopes,
@@ -560,6 +563,112 @@ pure func test_prepared_module_scope_indices_reject_different_retained_surfaces(
 			False
 
 
+pure func test_indexed_graph_preserves_issuing_module_table_ids() -> Bool:
+	target = fixture_module_load_candidate("main.brp", "app", "type Target = Int")
+	first = fixture_module_load_candidate("first.brp", "pkg/first", "type First = Int")
+	second = fixture_module_load_candidate("second.brp", "pkg/second", "type Second = Int")
+
+	match (
+		(
+			indexed_graph_build_for_module_table(
+				[first, target, second],
+				1,
+			),
+			indexed_graph_build(
+				target,
+				[first, second],
+			),
+		)
+	):
+		(Ok(graph), Ok(legacy)):
+			match indexed_graph_module_scopes(graph):
+				[first_scope, second_scope]:
+					first_definition_id = definition_index_seed_next_def_id(
+						definition_index_initial_seed(ENV_EMPTY),
+					)
+					graph_index = indexed_graph_definition_index(graph)
+					legacy_index = indexed_graph_definition_index(legacy)
+					graph_target = indexed_graph_target(graph)
+					legacy_target = indexed_graph_target(legacy)
+					graph_modules = indexed_graph_modules(graph)
+					legacy_modules = indexed_graph_modules(legacy)
+					graph_target_id = definition_index_find_type_definition_id(
+						graph_index,
+						prepared_module_identity(graph_target),
+						"Target",
+					)
+					legacy_target_id = definition_index_find_type_definition_id(
+						legacy_index,
+						prepared_module_identity(legacy_target),
+						"Target",
+					)
+					graph_first_id = definition_index_find_type_definition_id(
+						graph_index,
+						prepared_module_identity(graph_modules.get_or(0, graph_target)),
+						"First",
+					)
+					legacy_first_id = definition_index_find_type_definition_id(
+						legacy_index,
+						prepared_module_identity(legacy_modules.get_or(0, legacy_target)),
+						"First",
+					)
+					graph_second_id = definition_index_find_type_definition_id(
+						graph_index,
+						prepared_module_identity(graph_modules.get_or(1, graph_target)),
+						"Second",
+					)
+					legacy_second_id = definition_index_find_type_definition_id(
+						legacy_index,
+						prepared_module_identity(legacy_modules.get_or(1, legacy_target)),
+						"Second",
+					)
+
+					(
+						prepared_module_scope_compatible_index(
+							indexed_graph_target_scope(graph),
+							indexed_graph_target_scope(graph),
+						) == Some(1)
+						and prepared_module_scope_compatible_index(
+							indexed_graph_target_scope(graph),
+							first_scope,
+						) == Some(0)
+						and prepared_module_scope_compatible_index(
+							indexed_graph_target_scope(graph),
+							second_scope,
+						) == Some(2)
+						and graph_modules.map(func(module):
+							module_identity_display_name(prepared_module_identity(module))
+						) == ["pkg/first", "pkg/second"]
+						and graph_target_id == Some(first_definition_id)
+						and graph_target_id == legacy_target_id
+						and graph_first_id == Some(first_definition_id + 2)
+						and graph_first_id == legacy_first_id
+						and graph_second_id == Some(first_definition_id + 4)
+						and graph_second_id == legacy_second_id
+						and definition_index_next_def_id(graph_index) == first_definition_id + 6
+						and definition_index_next_def_id(
+							graph_index,
+						) == definition_index_next_def_id(legacy_index)
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_indexed_graph_rejects_invalid_module_table_target_indices() -> Bool:
+	target = fixture_module_load_candidate("main.brp", "app", "func main(): 0")
+
+	match (
+		indexed_graph_build_for_module_table([target], -1),
+		indexed_graph_build_for_module_table([target], 1),
+	):
+		(Err([UnknownCompilerModuleTableIndex(-1)]), Err([UnknownCompilerModuleTableIndex(1)])):
+			True
+		_:
+			False
+
+
 private func build_and_release_indexed_graph() -> Bool:
 	target = fixture_module_load_candidate("main.brp", "app", "func main(): 0")
 	dependency = fixture_module_load_candidate("dep.brp", "dep", "pure func value(): 1")
@@ -655,6 +764,14 @@ tests: TestSuite = {
 		(
 			"prepared module scope indices reject different retained surfaces",
 			test_prepared_module_scope_indices_reject_different_retained_surfaces,
+		),
+		(
+			"preserves issuing module table ids",
+			test_indexed_graph_preserves_issuing_module_table_ids,
+		),
+		(
+			"rejects invalid module table target indices",
+			test_indexed_graph_rejects_invalid_module_table_target_indices,
 		),
 		("indexed graph releases owned values", test_indexed_graph_releases_owned_values),
 	]

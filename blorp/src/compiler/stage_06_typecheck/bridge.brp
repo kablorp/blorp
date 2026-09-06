@@ -64,6 +64,7 @@ import:
 		frontend_graph_reference,
 		frontend_graph_reference_ids,
 		frontend_graph_reference_resolution,
+		frontend_module_id_table_index,
 	../stage_04_modules/loaded_module:
 		ModuleIdentity,
 		ModuleLoadCandidate,
@@ -161,6 +162,7 @@ import:
 		PreparedModule,
 		PreparedModuleScope,
 		indexed_graph_build,
+		indexed_graph_build_for_module_table,
 		indexed_graph_definition_index,
 		indexed_graph_error_message,
 		indexed_graph_module_scopes,
@@ -1243,25 +1245,49 @@ private pure func prepare_frontend_graph_module(
 
 private record FrontendTypecheckInput {
 	target: ModuleLoadCandidate,
-	modules: List[ModuleLoadCandidate],
-	module_targets: List[String]
+	module_candidates: List[ModuleLoadCandidate],
+	target_id: FrontendModuleId,
+	module_target_ids: List[FrontendModuleId]
 }
+
+
+private pure func frontend_graph_module_paths_for_ids(
+	graph: FrontendGraph,
+	module_ids: List[FrontendModuleId],
+) -> Option[List[String]]:
+	var paths: List[String] = []
+	var valid: Bool = True
+
+	for module_id in module_ids:
+		match frontend_graph_module(graph, module_id):
+			Some(module):
+				paths = paths.append(resolved_module_canonical_path(module.identity))
+			None:
+				valid = False
+
+	if valid:
+		Some(paths)
+	else:
+		None
 
 
 private pure func frontend_typecheck_input(
 	graph: FrontendGraph,
 	root_id: FrontendModuleId,
-	module_targets: List[String],
+	module_target_ids: List[FrontendModuleId],
 ) -> Option[FrontendTypecheckInput]:
 	root ?= frontend_graph_module(graph, root_id)
 	rewrites = frontend_graph_import_path_rewrites(graph)
-	var modules: List[ModuleLoadCandidate] = []
+	target = prepare_frontend_graph_module(graph, root_id, root, rewrites)
+	var module_candidates: List[ModuleLoadCandidate] = []
 
 	for module_id in frontend_graph_module_ids(graph):
-		if module_id != root_id:
+		if module_id == root_id:
+			module_candidates = module_candidates.append(target)
+		else:
 			match frontend_graph_module(graph, module_id):
 				Some(module):
-					modules = modules.append(
+					module_candidates = module_candidates.append(
 						prepare_frontend_graph_module(
 							graph,
 							module_id,
@@ -1273,9 +1299,10 @@ private pure func frontend_typecheck_input(
 					void
 
 	Some({
-		target = prepare_frontend_graph_module(graph, root_id, root, rewrites),
-		modules = modules,
-		module_targets = module_targets,
+		target = target,
+		module_candidates = module_candidates,
+		target_id = root_id,
+		module_target_ids = module_target_ids,
 	})
 
 
@@ -3816,23 +3843,23 @@ pure func typecheck_graph_with_metrics(request: TypecheckGraphRequest) -> Typech
 pure func typecheck_frontend_graph_ids(
 	graph: FrontendGraph,
 	root_id: FrontendModuleId,
-	module_targets: List[String],
+	module_target_ids: List[FrontendModuleId],
 	allow_debug_only_calls: Bool,
 ) -> Option[TypecheckedGraph]:
-	input ?= frontend_typecheck_input(graph, root_id, module_targets)
+	input ?= frontend_typecheck_input(graph, root_id, module_target_ids)
+	module_targets ?= frontend_graph_module_paths_for_ids(graph, input.module_target_ids)
 
-	prepared = match indexed_graph_build(input.target, input.modules):
+	prepared = match indexed_graph_build_for_module_table(
+		input.module_candidates,
+		frontend_module_id_table_index(input.target_id),
+	):
 		Err(errors):
 			PreparedTypecheckGraphRejected(
 				RejectedCandidateTarget(input.target),
 				typecheck_diagnostics_from_messages(indexed_graph_error_messages(errors)),
 			)
 		Ok(indexed_graph):
-			prepare_indexed_typecheck_graph(
-				indexed_graph,
-				input.module_targets,
-				allow_debug_only_calls,
-			)
+			prepare_indexed_typecheck_graph(indexed_graph, module_targets, allow_debug_only_calls)
 
 	Some(typechecked_graph_from_prepared(prepared, allow_debug_only_calls))
 
