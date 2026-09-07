@@ -5,8 +5,7 @@
 -- relying on source order, formatted types, or LSP-side name reconstruction.
 import:
 	../../../lib/source: SourceSpan
-	../../stage_04_modules/loaded_module: ModuleIdentity, module_identities_equal
-	../type_system/semantic_type: SemanticType(SemanticFunctionType)
+	../../stage_04_modules/loaded_module: ModuleIdentity
 	../bridge: TypecheckedGraph, TypecheckedModule
 	../decl:
 		TypedDecl(
@@ -47,6 +46,7 @@ import:
 		typed_expr_resolved_call,
 		typed_expr_resolved_definition_id,
 	../type_occurrence: TypedTypeDefinition, TypedTypeReference
+	../type_system/semantic_type: SemanticType(SemanticFunctionType)
 	../typed_display:
 		typed_callable_display,
 		typed_constructor_display,
@@ -84,7 +84,6 @@ record SemanticDefinitionOccurrence {
 	symbol: SemanticSymbolIdentity,
 	name: String,
 	display_contents: String,
-	module_identity: ModuleIdentity,
 	declaration_span: SourceSpan,
 	selection_span: SourceSpan
 }
@@ -92,7 +91,6 @@ record SemanticDefinitionOccurrence {
 
 record SemanticReferenceOccurrence {
 	symbol: SemanticSymbolIdentity,
-	module_identity: ModuleIdentity,
 	span: SourceSpan
 }
 
@@ -118,13 +116,19 @@ private record DefinitionProjection {
 
 
 private record GraphDefinitionProjections {
-	projections: List[DefinitionProjection],
+	target_projections: List[DefinitionProjection],
+	dependency_projections: List[DefinitionProjection],
 	dependency_projection_complete: Bool
 }
 
 
+private record DependencyDefinitionProjections {
+	projections: List[DefinitionProjection],
+	complete: Bool
+}
+
+
 private pure func function_projection_with_symbol(
-	module_identity: ModuleIdentity,
 	info: TypedFunctionInfo,
 	callable_id: Int,
 	symbol: SemanticSymbolIdentity,
@@ -140,7 +144,6 @@ private pure func function_projection_with_symbol(
 				info.param_types,
 				info.semantic_return_type,
 			),
-			module_identity = module_identity,
 			declaration_span = info.decl.span,
 			selection_span = info.decl.name.span
 		}
@@ -158,7 +161,7 @@ private pure func function_projection(
 		Some(callable_id):
 			if is_private:
 				symbol = ArtifactLocalSemanticSymbolIdentity(SemanticFunction, callable_id)
-				Ok(function_projection_with_symbol(module_identity, info, callable_id, symbol))
+				Ok(function_projection_with_symbol(info, callable_id, symbol))
 			else:
 				match exported_callable_symbol_key(
 					module_identity,
@@ -174,14 +177,7 @@ private pure func function_projection(
 				):
 					Some(key):
 						symbol = ExportedSemanticSymbolIdentity(key)
-						Ok(
-							function_projection_with_symbol(
-								module_identity,
-								info,
-								callable_id,
-								symbol,
-							),
-						)
+						Ok(function_projection_with_symbol(info, callable_id, symbol))
 					None:
 						Err(
 							SemanticDefinitionHasUnresolvedSignature(
@@ -192,7 +188,6 @@ private pure func function_projection(
 
 
 private pure func global_projection_with_symbol(
-	module_identity: ModuleIdentity,
 	info: TypedGlobalVarInfo,
 	definition_id: Int,
 	symbol: SemanticSymbolIdentity,
@@ -203,7 +198,6 @@ private pure func global_projection_with_symbol(
 			symbol = symbol,
 			name = info.decl.name.text,
 			display_contents = typed_named_value_display(info.decl.name.text, info.binding_type),
-			module_identity = module_identity,
 			declaration_span = info.decl.span,
 			selection_span = info.decl.name.span
 		}
@@ -231,7 +225,7 @@ private pure func global_projection(
 					),
 				)
 
-			Ok(global_projection_with_symbol(module_identity, info, definition_id, symbol))
+			Ok(global_projection_with_symbol(info, definition_id, symbol))
 
 
 private pure func constructor_projection(
@@ -266,7 +260,6 @@ private pure func constructor_projection(
 						variant.name,
 						variant.fields,
 					),
-					module_identity = module_identity,
 					declaration_span = variant.declaration_span,
 					selection_span = variant.selection_span
 				},
@@ -324,7 +317,6 @@ private pure func field_projection(
 					symbol = symbol,
 					name = field.name,
 					display_contents = typed_named_value_display(field.name, field.semantic_type),
-					module_identity = module_identity,
 					declaration_span = field.declaration_span,
 					selection_span = field.selection_span
 				},
@@ -380,7 +372,6 @@ private pure func type_definition_projection(
 					symbol = symbol,
 					name = definition.name,
 					display_contents = typed_type_display(definition.name),
-					module_identity = module_identity,
 					declaration_span = definition.declaration_span,
 					selection_span = definition.selection_span
 				},
@@ -438,58 +429,94 @@ private pure func decl_definition_projections(
 			Ok([])
 
 
-private pure func graph_definition_projections(
-	graph: TypecheckedGraph,
-) -> Result[GraphDefinitionProjections, SemanticOccurrenceError]:
+private pure func module_definition_projections(
+	module: TypecheckedModule,
+) -> Result[List[DefinitionProjection], SemanticOccurrenceError]:
 	var projections: List[DefinitionProjection] = []
 	var error: Option[SemanticOccurrenceError] = None
-	var dependency_projection_complete: Bool = True
 
-	for module in [graph.target] + graph.modules:
-		is_target = module_identities_equal(
-			module.module_identity,
-			graph.target.module_identity,
-		)
-		-- A graph wave can contain independent failed roots. Their incomplete
-		-- declarations cannot contribute identities, but they must not suppress
-		-- indexing for a successful target in the same compiler invocation. The
-		-- same rule applies to an unrelated dependency whose signature cannot be
-		-- projected: target-local navigation must not depend on its full index.
-		if module.errors.is_empty():
-			match type_definition_projections(
-				module.module_identity,
-				module.semantic_program.type_definitions,
-			):
+	match type_definition_projections(
+		module.module_identity,
+		module.semantic_program.type_definitions,
+	):
+		Ok(found):
+			projections += found
+		Err(found):
+			error = Some(found)
+
+	for decl in module.semantic_program.decls:
+		if error.is_none():
+			match decl_definition_projections(module.module_identity, decl, False):
 				Ok(found):
 					projections += found
 				Err(found):
-					if is_target:
-						error = Some(found)
-					else:
-						dependency_projection_complete = False
-
-			for decl in module.semantic_program.decls:
-				if error.is_none():
-					match decl_definition_projections(module.module_identity, decl, False):
-						Ok(found):
-							projections += found
-						Err(found):
-							if is_target:
-								error = Some(found)
-							else:
-								dependency_projection_complete = False
-		else:
-			if not is_target:
-				dependency_projection_complete = False
+					error = Some(found)
 
 	match error:
 		Some(found):
 			Err(found)
 		None:
-			Ok({
-				projections = projections,
-				dependency_projection_complete = dependency_projection_complete
-			})
+			Ok(projections)
+
+
+private pure func dependency_definition_projections(
+	module: TypecheckedModule,
+) -> DependencyDefinitionProjections:
+	var projections: List[DefinitionProjection] = []
+	var complete: Bool = True
+
+	match type_definition_projections(
+		module.module_identity,
+		module.semantic_program.type_definitions,
+	):
+		Ok(found):
+			projections += found
+		Err(_):
+			complete = False
+
+	for decl in module.semantic_program.decls:
+		match decl_definition_projections(module.module_identity, decl, False):
+			Ok(found):
+				projections += found
+			Err(_):
+				complete = False
+
+	{
+		projections = projections,
+		complete = complete
+	}
+
+
+private pure func graph_definition_projections(
+	graph: TypecheckedGraph,
+) -> Result[GraphDefinitionProjections, SemanticOccurrenceError]:
+	target_projections ?= if graph.target.errors.is_empty():
+		module_definition_projections(graph.target)
+	else:
+		empty: List[DefinitionProjection] = []
+		Ok(empty)
+
+	var dependency_projections: List[DefinitionProjection] = []
+	var dependency_projection_complete: Bool = True
+
+	-- A graph wave can contain independent failed roots. Their incomplete
+	-- declarations cannot contribute identities, but they must not suppress
+	-- indexing for a successful target in the same compiler invocation. The
+	-- same rule applies to an unrelated dependency whose signature cannot be
+	-- projected: target-local navigation must not depend on its full index.
+	for module in graph.modules:
+		if module.errors.is_empty():
+			projected = dependency_definition_projections(module)
+			dependency_projections += projected.projections
+			dependency_projection_complete = dependency_projection_complete and projected.complete
+		else:
+			dependency_projection_complete = False
+
+	Ok({
+		target_projections = target_projections,
+		dependency_projections = dependency_projections,
+		dependency_projection_complete = dependency_projection_complete,
+	})
 
 
 private pure func callable_symbol(
@@ -538,7 +565,6 @@ private pure func semantic_selection_span(expr: TypedExpr) -> Option[SourceSpan]
 
 
 private pure func expr_reference(
-	module_identity: ModuleIdentity,
 	bindings: Dict[Int, SemanticSymbolIdentity],
 	expr: TypedExpr,
 ) -> Option[SemanticReferenceOccurrence]:
@@ -556,13 +582,11 @@ private pure func expr_reference(
 	span ?= semantic_selection_span(expr)
 	Some({
 		symbol = resolved_symbol,
-		module_identity = module_identity,
 		span = span,
 	})
 
 
 private pure func expr_references(
-	module_identity: ModuleIdentity,
 	bindings: Dict[Int, SemanticSymbolIdentity],
 	expr: TypedExpr,
 ) -> List[SemanticReferenceOccurrence]:
@@ -574,14 +598,14 @@ private pure func expr_references(
 				empty: List[SemanticReferenceOccurrence] = []
 				empty
 			else:
-				match expr_reference(module_identity, bindings, expr):
+				match expr_reference(bindings, expr):
 					Some(reference):
 						[reference]
 					None:
 						empty: List[SemanticReferenceOccurrence] = []
 						empty
 		_:
-			match expr_reference(module_identity, bindings, expr):
+			match expr_reference(bindings, expr):
 				Some(reference):
 					[reference]
 				None:
@@ -591,7 +615,7 @@ private pure func expr_references(
 	pattern_occurrences = match expr:
 		TypedMatchExpr(_, cases, _, _):
 			cases.flat_map(func(case):
-				pattern_references(module_identity, bindings, case.pattern)
+				pattern_references(bindings, case.pattern)
 			)
 		_:
 			empty: List[SemanticReferenceOccurrence] = []
@@ -600,11 +624,11 @@ private pure func expr_references(
 	field_occurrences = match expr:
 		TypedRecordExpr(fields, _, _):
 			fields.flat_map(func(field):
-				typed_record_field_reference(module_identity, bindings, field)
+				typed_record_field_reference(bindings, field)
 			)
 		TypedRecordUpdateExpr(_, fields, _, _, _):
 			fields.flat_map(func(field):
-				typed_record_field_reference(module_identity, bindings, field)
+				typed_record_field_reference(bindings, field)
 			)
 		_:
 			empty: List[SemanticReferenceOccurrence] = []
@@ -613,12 +637,11 @@ private pure func expr_references(
 	current + pattern_occurrences + field_occurrences + typed_expr_children(
 		expr,
 	).flat_map(func(child):
-		expr_references(module_identity, bindings, child)
+		expr_references(bindings, child)
 	)
 
 
 private pure func typed_record_field_reference(
-	module_identity: ModuleIdentity,
 	bindings: Dict[Int, SemanticSymbolIdentity],
 	field: TypedRecordField,
 ) -> List[SemanticReferenceOccurrence]:
@@ -630,7 +653,6 @@ private pure func typed_record_field_reference(
 						[
 							{
 								symbol = symbol,
-								module_identity = module_identity,
 								span = field.name.span
 							},
 						]
@@ -646,7 +668,6 @@ private pure func typed_record_field_reference(
 
 
 private pure func constructor_pattern_reference(
-	module_identity: ModuleIdentity,
 	bindings: Dict[Int, SemanticSymbolIdentity],
 	span: SourceSpan,
 	definition_id: Int,
@@ -657,7 +678,6 @@ private pure func constructor_pattern_reference(
 				[
 					{
 						symbol = symbol,
-						module_identity = module_identity,
 						span = span
 					},
 				]
@@ -670,64 +690,52 @@ private pure func constructor_pattern_reference(
 
 
 private pure func pattern_references(
-	module_identity: ModuleIdentity,
 	bindings: Dict[Int, SemanticSymbolIdentity],
 	pattern: TypedPattern,
 ) -> List[SemanticReferenceOccurrence]:
 	match pattern:
 		TypedConstructorPattern(name, fields, _, definition_id):
-			current = constructor_pattern_reference(
-				module_identity,
-				bindings,
-				name.span,
-				definition_id,
-			)
+			current = constructor_pattern_reference(bindings, name.span, definition_id)
 
 			current + fields.flat_map(func(field):
-				pattern_references(module_identity, bindings, field)
+				pattern_references(bindings, field)
 			)
 		TypedQualifiedConstructorPattern(_, name, fields, _, definition_id):
-			current = constructor_pattern_reference(
-				module_identity,
-				bindings,
-				name.span,
-				definition_id,
-			)
+			current = constructor_pattern_reference(bindings, name.span, definition_id)
 
 			current + fields.flat_map(func(field):
-				pattern_references(module_identity, bindings, field)
+				pattern_references(bindings, field)
 			)
 		TypedTuplePattern(items, _):
-			items.flat_map(func(item): pattern_references(module_identity, bindings, item))
+			items.flat_map(func(item): pattern_references(bindings, item))
 		TypedListPattern(items, _, _):
-			items.flat_map(func(item): pattern_references(module_identity, bindings, item))
+			items.flat_map(func(item): pattern_references(bindings, item))
 		TypedOrPattern(items, _):
-			items.flat_map(func(item): pattern_references(module_identity, bindings, item))
+			items.flat_map(func(item): pattern_references(bindings, item))
 		_:
 			empty: List[SemanticReferenceOccurrence] = []
 			empty
 
 
 private pure func decl_references(
-	module_identity: ModuleIdentity,
 	bindings: Dict[Int, SemanticSymbolIdentity],
 	decl: TypedDecl,
 ) -> List[SemanticReferenceOccurrence]:
 	match decl:
 		TypedFunctionDecl(info):
 			info.body
-				.map(func(body): expr_references(module_identity, bindings, body))
+				.map(func(body): expr_references(bindings, body))
 				.get_or([])
 		TypedGlobalVarDecl(info):
-			expr_references(module_identity, bindings, info.value)
+			expr_references(bindings, info.value)
 		TypedImplDecl(info):
 			info.methods.flat_map(func(method):
 				method.body
-					.map(func(body): expr_references(module_identity, bindings, body))
+					.map(func(body): expr_references(bindings, body))
 					.get_or([])
 			)
 		TypedPrivateDecl(inner):
-			decl_references(module_identity, bindings, inner)
+			decl_references(bindings, inner)
 		_:
 			[]
 
@@ -737,23 +745,21 @@ private pure func module_references(
 	bindings: Dict[Int, SemanticSymbolIdentity],
 ) -> List[SemanticReferenceOccurrence]:
 	type_references = module.semantic_program.type_references.filter_map(func(reference):
-		type_reference_occurrence(module.module_identity, bindings, reference)
+		type_reference_occurrence(bindings, reference)
 	)
 
 	type_references + module.semantic_program.decls.flat_map(func(decl):
-		decl_references(module.module_identity, bindings, decl)
+		decl_references(bindings, decl)
 	)
 
 
 private pure func type_reference_occurrence(
-	module_identity: ModuleIdentity,
 	bindings: Dict[Int, SemanticSymbolIdentity],
 	reference: TypedTypeReference,
 ) -> Option[SemanticReferenceOccurrence]:
 	symbol ?= definition_symbol(bindings, reference.definition_id)
 	Some({
 		symbol = symbol,
-		module_identity = module_identity,
 		span = reference.span,
 	})
 
@@ -764,17 +770,13 @@ pure func semantic_occurrences_for_target(
 	projection_result ?= graph_definition_projections(graph)
 	var bindings: Dict[Int, SemanticSymbolIdentity] = {}
 
-	for projection in projection_result.projections:
+	for projection in projection_result.target_projections:
 		bindings = bindings.set(projection.definition_id, projection.definition.symbol)
 
-	definitions = projection_result.projections
-		.filter(func(projection):
-			module_identities_equal(
-				projection.definition.module_identity,
-				graph.target.module_identity,
-			)
-		)
-		.map(func(projection): projection.definition)
+	for projection in projection_result.dependency_projections:
+		bindings = bindings.set(projection.definition_id, projection.definition.symbol)
+
+	definitions = projection_result.target_projections.map(func(projection): projection.definition)
 
 	Ok({
 		module_identity = graph.target.module_identity,

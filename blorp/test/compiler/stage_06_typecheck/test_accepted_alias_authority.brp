@@ -1,9 +1,5 @@
 import:
-	../../../src/compiler/stage_04_modules/loaded_module:
-		ModuleIdentity,
-		ModuleOrigin(UserModule),
-		module_identity_from_resolved,
-		resolved_module_identity_from_resolver,
+	../../../src/compiler/stage_06_typecheck/graph/indexed_graph: PreparedModuleScope
 	../../../src/compiler/stage_06_typecheck/graph/type_identity: TypeId, type_id, type_ids_equal
 	../../../src/compiler/stage_06_typecheck/type_system/accepted_alias_authority:
 		AcceptedAliasExactLookup(
@@ -31,11 +27,17 @@ import:
 		TYPE_STRING,
 		types_equal,
 	../../../src/lib/source: SourceSpan, source_empty_span, source_file, source_start
+	../typecheck_test_support: prepared_module_id_fixture, prepared_module_id_fixture_find
 	test: TestSuite
 
 
-private pure func module_identity(path: String) -> ModuleIdentity:
-	module_identity_from_resolved(resolved_module_identity_from_resolver(path, UserModule))
+private MODULE_PATHS: List[String] = [
+	"app/main",
+	"app/left",
+	"pkg/left",
+	"pkg/right",
+	"pkg/unrelated",
+]
 
 
 private pure func fixture_span(path: String) -> SourceSpan:
@@ -43,14 +45,22 @@ private pure func fixture_span(path: String) -> SourceSpan:
 	source_empty_span(source, source_start(source))
 
 
-private pure func fixture_type_id(module_path: String, name: String) -> TypeId:
-	type_id(module_identity(module_path), name, fixture_span(module_path + ".brp"))
+private pure func fixture_type_id(
+	fixture: PreparedModuleScope,
+	module_path: String,
+	name: String,
+) -> Option[TypeId]:
+	module_id ?= prepared_module_id_fixture_find(fixture, module_path)
+	Some(type_id(module_id, name, fixture_span(module_path + ".brp")))
 
 
-private pure func table_input(include_unrelated: Bool) -> AcceptedAliasTableInput:
-	left_alias_id = fixture_type_id("pkg/left", "Name")
-	right_alias_id = fixture_type_id("pkg/right", "Name")
-	record_id = fixture_type_id("app/main", "Box")
+private pure func table_input(
+	fixture: PreparedModuleScope,
+	include_unrelated: Bool,
+) -> Option[AcceptedAliasTableInput]:
+	left_alias_id ?= fixture_type_id(fixture, "pkg/left", "Name")
+	right_alias_id ?= fixture_type_id(fixture, "pkg/right", "Name")
+	record_id ?= fixture_type_id(fixture, "app/main", "Box")
 	base_types: List[AcceptedTypeIdentity] = [
 		{
 			id = left_alias_id,
@@ -69,16 +79,18 @@ private pure func table_input(include_unrelated: Bool) -> AcceptedAliasTableInpu
 		},
 	]
 
-	type_identities = if include_unrelated:
-		base_types.append({
-			id = fixture_type_id("pkg/unrelated", "Other"),
-			canonical_name = "pkg__unrelated__Other",
-			type_params = [],
-		})
+	type_identities ?= if include_unrelated:
+		fixture_type_id(fixture, "pkg/unrelated", "Other").map(func(unrelated_id):
+			base_types.append({
+				id = unrelated_id,
+				canonical_name = "pkg__unrelated__Other",
+				type_params = [],
+			})
+		)
 	else:
-		base_types
+		Some(base_types)
 
-	{
+	Some({
 		type_identities = type_identities,
 		transparent_aliases = [
 			{
@@ -105,17 +117,20 @@ private pure func table_input(include_unrelated: Bool) -> AcceptedAliasTableInpu
 					home_module = "pkg/right"
 				}
 			},
-		]
-	}
+		],
+	})
 
 
 private pure func alias_authority_is_category_safe_and_identity_exact_result() -> Option[Bool]:
-	table ?= accepted_alias_table(table_input(False))
-	left_alias_id = fixture_type_id("pkg/left", "Name")
-	record_id = fixture_type_id("app/main", "Box")
+	fixture ?= prepared_module_id_fixture(MODULE_PATHS)
+	input ?= table_input(fixture, False)
+	table ?= accepted_alias_table(input)
+	left_alias_id ?= fixture_type_id(fixture, "pkg/left", "Name")
+	record_id ?= fixture_type_id(fixture, "app/main", "Box")
+	owner ?= prepared_module_id_fixture_find(fixture, "app/main")
 	view ?= accepted_alias_module_view(
 		table,
-		module_identity("app/main"),
+		owner,
 		[
 			{
 				source_name = "DisplayName",
@@ -158,16 +173,16 @@ private pure func alias_authority_is_category_safe_and_identity_exact() -> Bool:
 
 
 private pure func module_view_rejects_wrong_span_identity_result() -> Option[Bool]:
-	table ?= accepted_alias_table(table_input(False))
-	wrong_span_alias_id = type_id(
-		module_identity("pkg/left"),
-		"Name",
-		fixture_span("pkg/left/other"),
-	)
+	fixture ?= prepared_module_id_fixture(MODULE_PATHS)
+	input ?= table_input(fixture, False)
+	table ?= accepted_alias_table(input)
+	left_owner ?= prepared_module_id_fixture_find(fixture, "pkg/left")
+	main_owner ?= prepared_module_id_fixture_find(fixture, "app/main")
+	wrong_span_alias_id = type_id(left_owner, "Name", fixture_span("pkg/left/other"))
 
 	Some(accepted_alias_module_view(
 			table,
-			module_identity("app/main"),
+			main_owner,
 			[
 				{
 					source_name = "WrongSpan",
@@ -183,11 +198,14 @@ private pure func module_view_rejects_wrong_span_identity() -> Bool:
 
 
 private pure func module_view_rejects_forged_private_visibility_result() -> Option[Bool]:
-	table ?= accepted_alias_table(table_input(False))
-	private_alias_id = fixture_type_id("pkg/right", "Name")
+	fixture ?= prepared_module_id_fixture(MODULE_PATHS)
+	input ?= table_input(fixture, False)
+	table ?= accepted_alias_table(input)
+	private_alias_id ?= fixture_type_id(fixture, "pkg/right", "Name")
+	main_owner ?= prepared_module_id_fixture_find(fixture, "app/main")
 	imported_private = accepted_alias_module_view(
 		table,
-		module_identity("app/main"),
+		main_owner,
 		[
 			{
 				source_name = "PrivateName",
@@ -198,7 +216,7 @@ private pure func module_view_rejects_forged_private_visibility_result() -> Opti
 	)
 	false_local = accepted_alias_module_view(
 		table,
-		module_identity("app/main"),
+		main_owner,
 		[
 			{
 				source_name = "FalseLocal",
@@ -216,9 +234,12 @@ private pure func module_view_rejects_forged_private_visibility() -> Bool:
 
 
 private pure func exact_alias_queries_ignore_unrelated_modules_result() -> Option[Bool]:
-	base ?= accepted_alias_table(table_input(False))
-	expanded ?= accepted_alias_table(table_input(True))
-	id = fixture_type_id("pkg/left", "Name")
+	fixture ?= prepared_module_id_fixture(MODULE_PATHS)
+	base_input ?= table_input(fixture, False)
+	expanded_input ?= table_input(fixture, True)
+	base ?= accepted_alias_table(base_input)
+	expanded ?= accepted_alias_table(expanded_input)
+	id ?= fixture_type_id(fixture, "pkg/left", "Name")
 	base_probe = accepted_alias_exact_transparent(base, id)
 	expanded_probe = accepted_alias_exact_transparent(expanded, id)
 
@@ -240,12 +261,16 @@ private pure func exact_alias_queries_ignore_unrelated_modules() -> Bool:
 
 
 private pure func same_spelling_aliases_remain_owner_distinct_result() -> Option[Bool]:
-	table ?= accepted_alias_table(table_input(False))
-	left_id = fixture_type_id("pkg/left", "Name")
-	right_id = fixture_type_id("pkg/right", "Name")
+	fixture ?= prepared_module_id_fixture(MODULE_PATHS)
+	input ?= table_input(fixture, False)
+	table ?= accepted_alias_table(input)
+	left_id ?= fixture_type_id(fixture, "pkg/left", "Name")
+	right_id ?= fixture_type_id(fixture, "pkg/right", "Name")
+	left_owner ?= prepared_module_id_fixture_find(fixture, "app/left")
+	right_owner ?= prepared_module_id_fixture_find(fixture, "pkg/right")
 	left_view ?= accepted_alias_module_view(
 		table,
-		module_identity("app/left"),
+		left_owner,
 		[
 			{
 				source_name = "Name",
@@ -256,7 +281,7 @@ private pure func same_spelling_aliases_remain_owner_distinct_result() -> Option
 	)
 	right_view ?= accepted_alias_module_view(
 		table,
-		module_identity("pkg/right"),
+		right_owner,
 		[
 			{
 				source_name = "Name",

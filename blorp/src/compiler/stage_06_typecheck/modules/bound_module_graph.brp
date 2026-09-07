@@ -13,15 +13,24 @@ import:
 	../diagnostic: TypecheckDiagnostic
 	../graph/indexed_graph:
 		IndexedGraph,
-		IndexedGraphError,
+		IndexedGraphError(DuplicateCompilerModuleTarget, UnknownCompilerModuleTarget),
 		PreparedModule,
+		PreparedModuleId,
 		PreparedModuleScope,
 		indexed_graph_error_message,
+		indexed_graph_module_count,
+		indexed_graph_module_for_id,
+		indexed_graph_module_scopes,
 		indexed_graph_select_dependency_scopes,
 		indexed_graph_target_scope,
+		prepared_module_canonical_path,
+		prepared_module_id_table_index,
 		prepared_module_identity,
 		prepared_module_scope_canonical_path,
+		prepared_module_scope_id,
 		prepared_module_scope_identity,
+		prepared_module_scopes_are_compatible,
+	list: repeat
 	module_binding: ImportableModule, importable_module_path
 	module_view: ModuleView
 
@@ -75,7 +84,8 @@ private record BoundModuleGraphRep {
 	indexed_graph: IndexedGraph,
 	target: BoundModule,
 	modules: List[BoundModule],
-	modules_by_canonical_path: Dict[String, BoundModule]
+	modules_by_canonical_path: Dict[String, BoundModule],
+	positions_by_module_id: List[Int]
 }
 
 
@@ -220,6 +230,16 @@ pure func bound_module_graph_indexed_graph(graph: BoundModuleGraph) -> IndexedGr
 	bound_module_graph_rep(graph).indexed_graph
 
 
+pure func bound_module_graph_canonical_path_for_id(
+	graph: BoundModuleGraph,
+	module_id: PreparedModuleId,
+) -> Option[String]:
+	indexed_graph_module_for_id(
+		bound_module_graph_rep(graph).indexed_graph,
+		module_id,
+	).map(prepared_module_canonical_path)
+
+
 pure func bound_module_graph_target(graph: BoundModuleGraph) -> BoundModule:
 	bound_module_graph_rep(graph).target
 
@@ -256,6 +276,63 @@ pure func bound_module_graph_find_canonical_path(
 				None
 		None:
 			None
+
+
+-- Zero represents an unbound module. Positive positions encode target as one
+-- and dependency list offsets as index + two, keeping the retained index
+-- unboxed while preserving partial-graph absence.
+private pure func bound_module_positions_by_id(
+	indexed_graph: IndexedGraph,
+	target: BoundModule,
+	modules: List[BoundModule],
+) -> List[Int]:
+	var positions = 0.repeat(indexed_graph_module_count(indexed_graph))
+	target_index = prepared_module_id_table_index(
+		prepared_module_scope_id(bound_module_scope(target)),
+	)
+	positions = positions.set(target_index, 1)
+	var module_position: Int = 0
+
+	for module in modules:
+		module_index = prepared_module_id_table_index(
+			prepared_module_scope_id(bound_module_scope(module)),
+		)
+		positions = positions.set(module_index, module_position + 2)
+		module_position += 1
+
+	positions
+
+
+-- The ID must be issued by this graph's IndexedGraph. Callers that only own a
+-- scope should use bound_module_graph_find_for_scope for provenance validation.
+pure func bound_module_graph_find_for_id(
+	graph: BoundModuleGraph,
+	module_id: PreparedModuleId,
+) -> Option[BoundModule]:
+	representation = bound_module_graph_rep(graph)
+	position = representation.positions_by_module_id.get_or(
+		prepared_module_id_table_index(module_id),
+		0,
+	)
+
+	if position == 1:
+		Some(representation.target)
+	else if position > 1:
+		representation.modules.get(position - 2)
+	else:
+		None
+
+
+pure func bound_module_graph_find_for_scope(
+	graph: BoundModuleGraph,
+	scope: PreparedModuleScope,
+) -> Option[BoundModule]:
+	representation = bound_module_graph_rep(graph)
+
+	if prepared_module_scopes_are_compatible(bound_module_scope(representation.target), scope):
+		bound_module_graph_find_for_id(graph, prepared_module_scope_id(scope))
+	else:
+		None
 
 
 pure func bound_module_graph_modules_for_prepared(
@@ -317,6 +394,57 @@ pure func bound_module_build(
 	bind_module_scope(scope, bind_view)
 
 
+private pure func bound_module_graph_build_for_scopes(
+	indexed_graph: IndexedGraph,
+	module_scopes: List[PreparedModuleScope],
+	bind_view: pure (PreparedModuleScope) -> BoundModuleViewBinding,
+) -> Result[BoundModuleGraph, List[BoundModuleGraphError]]:
+	target_scope = indexed_graph_target_scope(indexed_graph)
+	target_binding = bind_module_scope(target_scope, bind_view)
+	var modules: List[BoundModule] = []
+	var modules_by_canonical_path: Dict[String, BoundModule] = {}
+	var module_errors: List[BoundModuleGraphError] = []
+
+	match target_binding:
+		Ok(bound_target):
+			modules_by_canonical_path = modules_by_canonical_path.set(
+				bound_module_canonical_path(bound_target),
+				bound_target,
+			)
+		Err(_):
+			void
+
+	for scope in module_scopes:
+		match bind_module_scope(scope, bind_view):
+			Ok(module):
+				modules = modules.append(module)
+				modules_by_canonical_path = modules_by_canonical_path.set(
+					bound_module_canonical_path(module),
+					module,
+				)
+			Err(errors):
+				module_errors = module_errors.concat(errors)
+
+	match target_binding:
+		Err(target_errors):
+			Err(target_errors.concat(module_errors))
+		Ok(bound_target):
+			if module_errors.length() > 0:
+				Err(module_errors)
+			else:
+				Ok(bound_module_graph_from_rep({
+					indexed_graph = indexed_graph,
+					target = bound_target,
+					modules = modules,
+					modules_by_canonical_path = modules_by_canonical_path,
+					positions_by_module_id = bound_module_positions_by_id(
+						indexed_graph,
+						bound_target,
+						modules,
+					),
+				}))
+
+
 pure func bound_module_graph_build(
 	indexed_graph: IndexedGraph,
 	module_paths: List[String],
@@ -328,42 +456,48 @@ pure func bound_module_graph_build(
 				func(error): BoundModuleSelectionError(error),
 			))
 		Ok(module_scopes):
-			target_scope = indexed_graph_target_scope(indexed_graph)
-			target_binding = bind_module_scope(target_scope, bind_view)
-			var modules: List[BoundModule] = []
-			var modules_by_canonical_path: Dict[String, BoundModule] = {}
-			var module_errors: List[BoundModuleGraphError] = []
+			bound_module_graph_build_for_scopes(indexed_graph, module_scopes, bind_view)
 
-			match target_binding:
-				Ok(bound_target):
-					modules_by_canonical_path = modules_by_canonical_path.set(
-						bound_module_canonical_path(bound_target),
-						bound_target,
-					)
-				Err(_):
-					void
 
-			for scope in module_scopes:
-				match bind_module_scope(scope, bind_view):
-					Ok(module):
-						modules = modules.append(module)
-						modules_by_canonical_path = modules_by_canonical_path.set(
-							bound_module_canonical_path(module),
-							module,
-						)
-					Err(errors):
-						module_errors = module_errors.concat(errors)
+pure func bound_module_graph_build_all(
+	indexed_graph: IndexedGraph,
+	selected_scopes: List[PreparedModuleScope],
+	bind_view: pure (PreparedModuleScope) -> BoundModuleViewBinding,
+) -> Result[BoundModuleGraph, List[BoundModuleGraphError]]:
+	target_scope = indexed_graph_target_scope(indexed_graph)
+	module_count = indexed_graph_module_count(indexed_graph)
+	var selected_positions = False.repeat(module_count)
+	var ordered_scopes: List[PreparedModuleScope] = []
+	var errors: List[BoundModuleGraphError] = []
 
-			match target_binding:
-				Err(target_errors):
-					Err(target_errors.concat(module_errors))
-				Ok(bound_target):
-					if module_errors.length() > 0:
-						Err(module_errors)
-					else:
-						Ok(bound_module_graph_from_rep({
-							indexed_graph = indexed_graph,
-							target = bound_target,
-							modules = modules,
-							modules_by_canonical_path = modules_by_canonical_path,
-						}))
+	for scope in selected_scopes:
+		path = prepared_module_scope_canonical_path(scope)
+		module_index = prepared_module_id_table_index(prepared_module_scope_id(scope))
+
+		if (
+			not prepared_module_scopes_are_compatible(target_scope, scope)
+			or module_index < 0
+			or module_index >= module_count
+			or module_index == prepared_module_id_table_index(
+				prepared_module_scope_id(target_scope),
+			)
+		):
+			errors = errors.append(BoundModuleSelectionError(UnknownCompilerModuleTarget(path)))
+		else if selected_positions.get_or(module_index, False):
+			errors = errors.append(BoundModuleSelectionError(DuplicateCompilerModuleTarget(path)))
+		else:
+			selected_positions = selected_positions.set(module_index, True)
+			ordered_scopes = ordered_scopes.append(scope)
+
+	if not errors.is_empty():
+		Err(errors)
+	else:
+		selected = selected_positions
+
+		for scope in indexed_graph_module_scopes(indexed_graph):
+			module_index = prepared_module_id_table_index(prepared_module_scope_id(scope))
+
+			if not selected.get_or(module_index, False):
+				ordered_scopes = ordered_scopes.append(scope)
+
+		bound_module_graph_build_for_scopes(indexed_graph, ordered_scopes, bind_view)

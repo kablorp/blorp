@@ -128,15 +128,20 @@ import:
 		source_definition_key,
 	graph/definition_index: definition_index_find_source_definition_id
 	graph/indexed_graph:
+		PreparedModuleId,
 		PreparedModuleScope,
+		indexed_graph_module_count,
 		indexed_graph_target_scope,
+		prepared_module_id_table_index,
+		prepared_module_ids_equal,
 		prepared_module_program,
 		prepared_module_scope_canonical_path,
 		prepared_module_scope_definition_index,
+		prepared_module_scope_id,
 		prepared_module_scope_identity,
 		prepared_module_scope_module,
 		prepared_module_scope_origin,
-		prepared_module_scopes_are_compatible,
+		prepared_module_scopes_select_same_module,
 	graph/typed_expr_children: typed_expr_children
 	headers/accepted_alias_graph:
 		AcceptedAliasGraph,
@@ -222,9 +227,10 @@ import:
 			GlobalHeaderCompletionPlanReady,
 		),
 		global_header_completion_plan_annotated,
+		global_header_completion_plan_annotated_dependencies,
 		global_header_completion_plan_build,
-		global_header_completion_plan_dependencies,
 		global_header_completion_plan_pending,
+		global_header_completion_plan_pending_dependencies,
 	headers/implementation_headers:
 		ImplementationHeader,
 		ImplementationHeaderGraph,
@@ -282,10 +288,10 @@ import:
 		implementation_type_parameter_id_name,
 		type_header_graph_bound_graph,
 		type_header_graph_declaration_skeleton_count,
-		type_header_graph_local_alias_headers,
-		type_header_graph_local_builtin_headers,
-		type_header_graph_local_record_headers,
-		type_header_graph_local_union_headers,
+		type_header_graph_local_alias_headers_for_scope,
+		type_header_graph_local_builtin_headers_for_scope,
+		type_header_graph_local_record_headers_for_scope,
+		type_header_graph_local_union_headers_for_scope,
 		union_type_header_variants,
 	headers/type_header_install:
 		imported_semantic_type_from_resolved_shape,
@@ -328,6 +334,7 @@ import:
 		typed_expr_type_error,
 		typed_expr_value_type,
 		typed_expr_with_slot,
+	list: repeat
 	modules/bound_module_graph:
 		BoundModule,
 		BoundModuleGraph,
@@ -345,6 +352,7 @@ import:
 		bound_module_direct_import_modules,
 		bound_module_graph_find,
 		bound_module_graph_find_canonical_path,
+		bound_module_graph_find_for_scope,
 		bound_module_graph_indexed_graph,
 		bound_module_graph_modules,
 		bound_module_graph_target,
@@ -1062,7 +1070,6 @@ union BodyCheckOutcome:
 
 
 private record BodyOutcomeIndexRep {
-	owner: ModuleIdentity,
 	by_definition_id: Dict[Int, BodyCheckOutcome]
 }
 
@@ -2475,22 +2482,17 @@ private pure func profile_callable_header_enter(definition_id: Int) -> Int:
 
 private pure func callable_header_semantic_type(
 	type_headers: TypeHeaderGraph,
-	owner_identity: ModuleIdentity,
+	owner_scope: PreparedModuleScope,
 	registration: CallableHeaderRegistration,
 	shape: ResolvedTypeShape,
 ) -> Option[SemanticType]:
 	match registration:
 		LocalCallableHeaderRegistration(module_path):
-			local_semantic_type_from_resolved_shape(
-				type_headers,
-				owner_identity,
-				module_path,
-				shape,
-			)
+			local_semantic_type_from_resolved_shape(type_headers, owner_scope, module_path, shape)
 		ImportedCallableHeaderRegistration(module_path):
 			imported_semantic_type_from_resolved_shape(
 				type_headers,
-				owner_identity,
+				owner_scope,
 				module_path,
 				shape,
 			)
@@ -2568,11 +2570,11 @@ private pure func callable_header_bound_type_params(
 private pure func prepare_accepted_callable_header(
 	state: TypecheckState,
 	type_headers: TypeHeaderGraph,
+	owner_scope: PreparedModuleScope,
 	header: CallableHeader,
 	registration: CallableHeaderRegistration,
 ) -> PreparedCallableHeader:
 	id = callable_header_id(header)
-	owner_identity = callable_id_module_identity(id)
 	signature = callable_header_signature(header)
 	profile_callable_header_enter(callable_id_definition_id(id))
 
@@ -2592,7 +2594,7 @@ private pure func prepare_accepted_callable_header(
 
 			match callable_header_semantic_type(
 				type_headers,
-				owner_identity,
+				owner_scope,
 				registration,
 				parameter.typ,
 			):
@@ -2607,7 +2609,7 @@ private pure func prepare_accepted_callable_header(
 	profile_callable_header_event(CALLABLE_HEADER_PROFILE_RETURN_CONVERSIONS)
 	return_type = callable_header_semantic_type(
 		type_headers,
-		owner_identity,
+		owner_scope,
 		registration,
 		callable_signature_return_type(signature),
 	)
@@ -2618,14 +2620,14 @@ private pure func prepare_accepted_callable_header(
 			profile_callable_header_event(CALLABLE_HEADER_PROFILE_DIMENSION_SIDE_CONVERSIONS)
 			left = callable_header_semantic_type(
 				type_headers,
-				owner_identity,
+				owner_scope,
 				registration,
 				constraint[0],
 			)
 			profile_callable_header_event(CALLABLE_HEADER_PROFILE_DIMENSION_SIDE_CONVERSIONS)
 			right = callable_header_semantic_type(
 				type_headers,
-				owner_identity,
+				owner_scope,
 				registration,
 				constraint[1],
 			)
@@ -2974,13 +2976,13 @@ private union AcceptedTraitRecordClaim:
 private pure func prepare_accepted_trait_header(
 	state: TypecheckState,
 	type_headers: TypeHeaderGraph,
+	owner_scope: PreparedModuleScope,
 	header: TraitTopologyHeader,
 	module_path: String,
 	local_type_names: List[String],
 	compiler_builtin_id: Option[TraitId],
 ) -> AcceptedTraitRecordClaim:
 	id = trait_topology_header_id(header)
-	owner_identity = trait_id_module_identity(id)
 	registration = LocalCallableHeaderRegistration(module_path)
 	var methods: List[TraitMethodSig] = []
 	var conversion_failed: Bool = False
@@ -2995,7 +2997,7 @@ private pure func prepare_accepted_trait_header(
 				if not conversion_failed:
 					match callable_header_semantic_type(
 						type_headers,
-						owner_identity,
+						owner_scope,
 						registration,
 						parameter.typ,
 					):
@@ -3015,7 +3017,7 @@ private pure func prepare_accepted_trait_header(
 
 			match callable_header_semantic_type(
 				type_headers,
-				owner_identity,
+				owner_scope,
 				registration,
 				callable_signature_return_type(signature),
 			):
@@ -3499,7 +3501,7 @@ private pure func implementation_method_info_from_header(
 	state: TypecheckState,
 	type_headers: TypeHeaderGraph,
 	method_header: ImplementationMethodHeader,
-	owner_identity: ModuleIdentity,
+	owner_scope: PreparedModuleScope,
 	registration: CallableHeaderRegistration,
 	module_path: String,
 ) -> ImplMethodInfoClaim:
@@ -3516,7 +3518,7 @@ private pure func implementation_method_info_from_header(
 				if not conversion_failed:
 					match callable_header_semantic_type(
 						type_headers,
-						owner_identity,
+						owner_scope,
 						registration,
 						parameter.typ,
 					):
@@ -3530,7 +3532,7 @@ private pure func implementation_method_info_from_header(
 
 			return_type = callable_header_semantic_type(
 				type_headers,
-				owner_identity,
+				owner_scope,
 				registration,
 				callable_signature_return_type(signature),
 			)
@@ -3540,13 +3542,13 @@ private pure func implementation_method_info_from_header(
 				if not conversion_failed:
 					left = callable_header_semantic_type(
 						type_headers,
-						owner_identity,
+						owner_scope,
 						registration,
 						constraint[0],
 					)
 					right = callable_header_semantic_type(
 						type_headers,
-						owner_identity,
+						owner_scope,
 						registration,
 						constraint[1],
 					)
@@ -3644,11 +3646,11 @@ private pure func implementation_method_info_from_header(
 private pure func implementation_method_infos_from_header(
 	state: TypecheckState,
 	type_headers: TypeHeaderGraph,
+	owner_scope: PreparedModuleScope,
 	header: ImplementationHeader,
 	registration: CallableHeaderRegistration,
 	module_path: String,
 ) -> ImplMethodInfosClaim:
-	owner_identity = impl_id_module_identity(implementation_header_id(header))
 	var result: ImplMethodInfosClaim = ImplMethodInfosClaimed(state, [])
 
 	for method_header in implementation_header_methods(header):
@@ -3664,7 +3666,7 @@ private pure func implementation_method_infos_from_header(
 							next,
 							type_headers,
 							method_header,
-							owner_identity,
+							owner_scope,
 							registration,
 							module_path,
 						):
@@ -3689,6 +3691,7 @@ private union AcceptedImplementationRecordClaim:
 private pure func prepare_accepted_implementation_header(
 	state: TypecheckState,
 	type_headers: TypeHeaderGraph,
+	owner_scope: PreparedModuleScope,
 	header: ImplementationHeader,
 	module_path: String,
 	local_type_names: List[String],
@@ -3699,7 +3702,7 @@ private pure func prepare_accepted_implementation_header(
 
 	match callable_header_semantic_type(
 		type_headers,
-		impl_id_module_identity(id),
+		owner_scope,
 		registration,
 		implementation_header_receiver(header),
 	):
@@ -3717,6 +3720,7 @@ private pure func prepare_accepted_implementation_header(
 			match implementation_method_infos_from_header(
 				state,
 				type_headers,
+				owner_scope,
 				header,
 				registration,
 				module_path,
@@ -5675,9 +5679,10 @@ private pure func body_outcome_index_find(
 	id: CallableId,
 ) -> Option[BodyCheckOutcome]:
 	representation = from_opaque BodyOutcomeIndex(index)
+	outcome ?= representation.by_definition_id.get(callable_id_definition_id(id))
 
-	if module_identities_equal(representation.owner, callable_id_module_identity(id)):
-		representation.by_definition_id.get(callable_id_definition_id(id))
+	if callable_ids_equal(body_check_outcome_callable_id(outcome), id):
+		Some(outcome)
 	else:
 		None
 
@@ -6130,7 +6135,6 @@ private pure func typecheck_state_after_accepted_definition_id_replay(
 	bound_module: BoundModule,
 	type_headers: TypeHeaderGraph,
 	trait_implementation_table: AcceptedTraitImplementationTable,
-	module_identity: ModuleIdentity,
 	module_path: String,
 ) -> TypecheckState:
 	with_builtin_headers = typecheck_install_local_builtin_headers(
@@ -6162,12 +6166,12 @@ private pure func typecheck_state_after_accepted_definition_id_replay(
 	-- by the graph table attached to ModuleView; replay must not republish them in Env.
 	var with_definition_ids = with_types
 
-	for id in accepted_trait_ids_for_owner(trait_implementation_table, module_identity):
+	for id in accepted_trait_ids_for_owner(trait_implementation_table, module_path):
 		with_definition_ids = replay_accepted_trait_definition_id(with_definition_ids, id)
 
 	for definition_ids in accepted_implementation_definition_ids_for_owner(
 		trait_implementation_table,
-		module_identity,
+		module_path,
 	):
 		with_definition_ids = replay_accepted_implementation_definition_ids(
 			with_definition_ids,
@@ -6271,7 +6275,7 @@ private pure func accepted_global_declared_binding(
 	canonical_path = bound_module_canonical_path(bound_module)
 	typ ?= imported_semantic_type_from_resolved_shape(
 		type_headers,
-		global_id_module_identity(id),
+		bound_module_scope(bound_module),
 		canonical_path,
 		shape,
 	)
@@ -6343,7 +6347,7 @@ private pure func accepted_global_authority_for_module(
 	table: AcceptedGlobalTable,
 	bound_module: BoundModule,
 ) -> Result[AcceptedGlobalAuthority, String]:
-	owner = bound_module_identity(bound_module)
+	owner_module_path = bound_module_canonical_path(bound_module)
 	view = bound_module_view(bound_module)
 	var bindings: List[AcceptedVisibleGlobalBinding] = []
 
@@ -6354,7 +6358,7 @@ private pure func accepted_global_authority_for_module(
 			original_name = imported.original_name,
 		})
 
-	match accepted_global_authority(table, owner, bindings):
+	match accepted_global_authority(table, owner_module_path, bindings):
 		Some(authority):
 			Ok(authority)
 		None:
@@ -6404,6 +6408,7 @@ private pure func prepare_accepted_module_callable(
 	prepared = prepare_accepted_callable_header(
 		base.state,
 		type_headers,
+		bound_module_scope(base.bound_module),
 		header,
 		LocalCallableHeaderRegistration(base.module_path),
 	)
@@ -6448,7 +6453,7 @@ private pure func accepted_callable_authority_for_module(
 
 	match accepted_callable_authority(
 		table,
-		bound_module_identity(bound_module),
+		Some(bound_module_canonical_path(bound_module)),
 		bindings,
 		direct_module_paths,
 	):
@@ -6474,15 +6479,9 @@ private pure func accepted_trait_implementation_authority_for_module(
 
 	accepted_trait_implementation_authority(
 		table,
-		bound_module_identity(bound_module),
+		bound_module_canonical_path(bound_module),
 		bindings,
-		bound_module_direct_import_modules(
-			bound_module,
-		).map(
-			func(
-				module,
-			): prepared_module_scope_identity(importable_module_prepared_scope(module)),
-		),
+		bound_module_direct_import_modules(bound_module).map(importable_module_path),
 	)
 
 
@@ -6500,7 +6499,7 @@ private record PreparedCanonicalModuleEnvironment {
 -- Declaration-policy findings belong to graph completion, not to the reusable
 -- module environment or any initializer/inference session.
 private record PreparedModuleIssues {
-	module_identity: ModuleIdentity,
+	module_id: PreparedModuleId,
 	errors: List[String],
 	diagnostics: List[TypecheckDiagnostic],
 	callable_errors: List[String]
@@ -6509,6 +6508,7 @@ private record PreparedModuleIssues {
 
 private record PreparedModuleEnvironmentCollection {
 	environments: List[PreparedCanonicalModuleEnvironment],
+	environment_positions_by_module_id: List[Int],
 	issues: List[PreparedModuleIssues],
 	accepted_callable_table: Option[AcceptedCallableTable],
 	accepted_trait_implementation_table: Option[AcceptedTraitImplementationTable]
@@ -6644,6 +6644,30 @@ private pure func implementation_method_header_is_explicit(
 			True
 
 
+private pure func prepared_module_base_index(
+	positions_by_module_id: List[Int],
+	module_id: PreparedModuleId,
+) -> Option[Int]:
+	position = positions_by_module_id.get_or(prepared_module_id_table_index(module_id), 0)
+
+	if position > 0:
+		Some(position - 1)
+	else:
+		None
+
+
+private pure func prepared_module_base_index_for_identity(
+	bound_graph: BoundModuleGraph,
+	positions_by_module_id: List[Int],
+	module_identity: ModuleIdentity,
+) -> Option[Int]:
+	bound_module ?= bound_module_graph_find(bound_graph, module_identity)
+	prepared_module_base_index(
+		positions_by_module_id,
+		prepared_module_scope_id(bound_module_scope(bound_module)),
+	)
+
+
 private pure func prepared_module_environments(
 	implementation_headers: ImplementationHeaderGraph,
 	accepted_global_table: AcceptedGlobalTable,
@@ -6663,7 +6687,9 @@ private pure func prepared_module_environments(
 	var prepared: List[PreparedCanonicalModuleEnvironment] = []
 	var issues: List[PreparedModuleIssues] = []
 	var bases: List[PreparedModuleCallableBase] = []
-	var base_indices_by_module: Dict[String, Int] = {}
+	var base_positions_by_module_id = 0.repeat(
+		indexed_graph_module_count(bound_module_graph_indexed_graph(bound_graph)),
+	)
 	var callable_records: List[AcceptedCallableTableRecord] = []
 	var callable_owner_missing: Bool = False
 	var trait_records: List[AcceptedTraitTableRecord] = []
@@ -6680,9 +6706,11 @@ private pure func prepared_module_environments(
 			accepted_union_graph,
 			allow_debug_only_calls,
 		)
-		base_indices_by_module = base_indices_by_module.set(
-			module_identity_storage_key(bound_module_identity(bound_module)),
-			bases.length(),
+		base_positions_by_module_id = base_positions_by_module_id.set(
+			prepared_module_id_table_index(
+				prepared_module_scope_id(bound_module_scope(bound_module)),
+			),
+			bases.length() + 1,
 		)
 		bases = bases.append({
 			bound_module = bound_module,
@@ -6699,11 +6727,11 @@ private pure func prepared_module_environments(
 	for header in trait_topology_graph_headers(
 		callable_header_graph_trait_topology(callable_headers),
 	):
-		module_key = module_identity_storage_key(
+		match prepared_module_base_index_for_identity(
+			bound_graph,
+			base_positions_by_module_id,
 			trait_id_module_identity(trait_topology_header_id(header)),
-		)
-
-		match base_indices_by_module.get(module_key):
+		):
 			Some(index):
 				match bases.get(index):
 					Some(base):
@@ -6722,6 +6750,7 @@ private pure func prepared_module_environments(
 						match prepare_accepted_trait_header(
 							base.state,
 							type_headers,
+							bound_module_scope(base.bound_module),
 							header,
 							base.module_path,
 							base.local_type_names,
@@ -6787,11 +6816,11 @@ private pure func prepared_module_environments(
 		preliminary_base_index += 1
 
 	for header in callable_header_graph_callables(callable_headers):
-		module_key = module_identity_storage_key(
+		match prepared_module_base_index_for_identity(
+			bound_graph,
+			base_positions_by_module_id,
 			callable_id_module_identity(callable_header_id(header)),
-		)
-
-		match base_indices_by_module.get(module_key):
+		):
 			Some(index):
 				match bases.get(index):
 					Some(base):
@@ -6827,17 +6856,18 @@ private pure func prepared_module_environments(
 		accepted_callable_table({callables = callable_records})
 
 	for header in implementation_header_graph_headers(implementation_headers):
-		module_key = module_identity_storage_key(
+		match prepared_module_base_index_for_identity(
+			bound_graph,
+			base_positions_by_module_id,
 			impl_id_module_identity(implementation_header_id(header)),
-		)
-
-		match base_indices_by_module.get(module_key):
+		):
 			Some(index):
 				match bases.get(index):
 					Some(base):
 						match prepare_accepted_implementation_header(
 							base.state,
 							type_headers,
+							bound_module_scope(base.bound_module),
 							header,
 							base.module_path,
 							base.local_type_names,
@@ -6934,7 +6964,7 @@ private pure func prepared_module_environments(
 
 		if not prepared_state.errors.is_empty() or not prepared_state.diagnostics.is_empty():
 			issues = issues.append({
-				module_identity = bound_module_identity(base.bound_module),
+				module_id = prepared_module_scope_id(bound_module_scope(base.bound_module)),
 				errors = prepared_state.errors,
 				diagnostics = prepared_state.diagnostics,
 				callable_errors = base.callable_errors,
@@ -6942,6 +6972,10 @@ private pure func prepared_module_environments(
 
 	{
 		environments = prepared,
+		environment_positions_by_module_id = prepared_environment_positions_by_module_id(
+			prepared,
+			indexed_graph_module_count(bound_module_graph_indexed_graph(bound_graph)),
+		).get_or([]),
 		issues = issues,
 		accepted_callable_table = callable_table,
 		accepted_trait_implementation_table = trait_implementation_table
@@ -7063,20 +7097,31 @@ private pure func initializer_callable_dependencies_from_expr(
 
 private pure func complete_one_global_header(
 	implementation_headers: ImplementationHeaderGraph,
+	bound_graph: BoundModuleGraph,
 	prepared_environments: List[PreparedCanonicalModuleEnvironment],
-	plan: GlobalHeaderCompletionPlan,
+	prepared_environment_positions_by_module_id: List[Int],
+	planned_dependencies: List[GlobalId],
 	completed: List[CompletedGlobalHeader],
 	header: GlobalHeader,
 ) -> Result[CompletedGlobalHeader, List[TypecheckDiagnostic]]:
 	id = global_header_id(header)
-	module_environment = prepared_environments.find(
-		func(
-			context,
-		): module_identities_equal(
-			bound_module_identity(context.bound_module),
-			global_id_module_identity(id),
-		),
-	)
+	owner = bound_module_graph_find(bound_graph, global_id_module_identity(id))
+
+	module_environment_position = match owner:
+		Some(bound_module):
+			prepared_environment_positions_by_module_id.get_or(
+				prepared_module_id_table_index(
+					prepared_module_scope_id(bound_module_scope(bound_module)),
+				),
+				0,
+			)
+		None:
+			0
+
+	module_environment = if module_environment_position > 0:
+		prepared_environments.get(module_environment_position - 1)
+	else:
+		None
 
 	match module_environment:
 		None:
@@ -7090,7 +7135,6 @@ private pure func complete_one_global_header(
 			)
 		Some(module_environment):
 			bound_module = module_environment.bound_module
-			planned_dependencies = global_header_completion_plan_dependencies(plan, id)
 			completed_dependencies = completed.filter(func(candidate):
 				planned_dependencies.any(func(dependency):
 					global_ids_equal(dependency, completed_global_header_id(candidate))
@@ -7147,7 +7191,7 @@ private pure func complete_one_global_header(
 
 
 private record GlobalHeaderCompletionFailure {
-	module_identity: ModuleIdentity,
+	module_id: Option[PreparedModuleId],
 	diagnostics: List[TypecheckDiagnostic]
 }
 
@@ -7159,8 +7203,25 @@ private record GlobalHeaderCompletionOutcome {
 	accepted_trait_implementation_table: Option[AcceptedTraitImplementationTable],
 	failures: List[GlobalHeaderCompletionFailure],
 	prepared_environments: List[PreparedCanonicalModuleEnvironment],
+	prepared_environment_positions_by_module_id: List[Int],
 	module_preparation_issues: List[PreparedModuleIssues]
 }
+
+
+private pure func global_header_completion_failure(
+	bound_graph: BoundModuleGraph,
+	module_identity: ModuleIdentity,
+	diagnostics: List[TypecheckDiagnostic],
+) -> GlobalHeaderCompletionFailure:
+	{
+		module_id = bound_module_graph_find(
+			bound_graph,
+			module_identity,
+		).map(
+			func(module): prepared_module_scope_id(bound_module_scope(module)),
+		),
+		diagnostics = diagnostics
+	}
 
 
 private pure func cycle_component_spans_modules(component: List[GlobalId]) -> Bool:
@@ -7217,10 +7278,12 @@ private pure func complete_planned_global_headers(
 		allow_debug_only_calls,
 	)
 	prepared_environments = prepared_modules.environments
+	prepared_environment_positions_by_module_id = prepared_modules.environment_positions_by_module_id
 	callable_headers = implementation_header_graph_callable_headers(implementation_headers)
 	type_headers = trait_topology_graph_type_headers(
 		callable_header_graph_trait_topology(callable_headers),
 	)
+	bound_graph = type_header_graph_bound_graph(type_headers)
 	var completed: List[CompletedGlobalHeader] = []
 	var completed_indices_by_module_and_name: Dict[String, Dict[String, Int]] = {}
 	var failures: List[GlobalHeaderCompletionFailure] = []
@@ -7232,10 +7295,13 @@ private pure func complete_planned_global_headers(
 		binding_diagnostics = bound_module_binding_diagnostics(environment.bound_module)
 
 		if not binding_diagnostics.is_empty():
-			failures = failures.append({
-				module_identity = bound_module_identity(environment.bound_module),
-				diagnostics = binding_diagnostics,
-			})
+			failures = failures.append(
+				global_header_completion_failure(
+					bound_graph,
+					bound_module_identity(environment.bound_module),
+					binding_diagnostics,
+				),
+			)
 
 	for component in cyclic_components:
 		qualify_names = cycle_component_spans_modules(component)
@@ -7244,34 +7310,44 @@ private pure func complete_planned_global_headers(
 			.sort()
 			.join(", ")
 		failures = failures.concat(cycle_component_diagnostic_owners(component).map(
-			func(id): {
-				module_identity = global_id_module_identity(id),
-				diagnostics = [
+			func(
+				id,
+			): global_header_completion_failure(
+				bound_graph,
+				global_id_module_identity(id),
+				[
 					typecheck_diagnostic(
 						"Cannot infer global initializer types because these globals form a cycle: " + names,
 						Some(global_id_source_span(id)),
 					),
-				]
-			},
+				],
+			),
 		))
 
 	failures = failures.concat(blocked.map(
-		func(id): {
-			module_identity = global_id_module_identity(id),
-			diagnostics = [
+		func(
+			id,
+		): global_header_completion_failure(
+			bound_graph,
+			global_id_module_identity(id),
+			[
 				typecheck_diagnostic(
 					"Cannot infer global initializer type for '" + global_id_name(
 						id,
 					) + "' because it depends on a cyclic global",
 					Some(global_id_source_span(id)),
 				),
-			]
-		},
+			],
+		),
 	))
 
 	headers_to_check = global_header_completion_plan_pending(
 		plan,
 	).concat(global_header_completion_plan_annotated(plan))
+	planned_dependencies_by_header = global_header_completion_plan_pending_dependencies(
+		plan,
+	).concat(global_header_completion_plan_annotated_dependencies(plan))
+	var header_index: Int = 0
 
 	for header in headers_to_check:
 		header_id = global_header_id(header)
@@ -7289,8 +7365,10 @@ private pure func complete_planned_global_headers(
 
 		match complete_one_global_header(
 			implementation_headers,
+			bound_graph,
 			prepared_environments,
-			plan,
+			prepared_environment_positions_by_module_id,
+			planned_dependencies_by_header.get_or(header_index, []),
 			completed,
 			header,
 		):
@@ -7305,10 +7383,15 @@ private pure func complete_planned_global_headers(
 				)
 				completed = completed.append(found)
 			Err(found_errors):
-				failures = failures.append({
-					module_identity = global_id_module_identity(global_header_id(header)),
-					diagnostics = found_errors,
-				})
+				failures = failures.append(
+					global_header_completion_failure(
+						bound_graph,
+						global_id_module_identity(global_header_id(header)),
+						found_errors,
+					),
+				)
+
+		header_index += 1
 
 	completed_table = accepted_global_table_complete(
 		initial_global_table,
@@ -7329,6 +7412,7 @@ private pure func complete_planned_global_headers(
 		accepted_trait_implementation_table = prepared_modules.accepted_trait_implementation_table,
 		failures = failures,
 		prepared_environments = prepared_environments,
+		prepared_environment_positions_by_module_id = prepared_environment_positions_by_module_id,
 		module_preparation_issues = prepared_modules.issues
 	}
 
@@ -7395,6 +7479,7 @@ private record TypecheckGraphFacts {
 	accepted_callable_table: AcceptedCallableTable,
 	accepted_trait_implementation_table: AcceptedTraitImplementationTable,
 	prepared_environments: List[PreparedCanonicalModuleEnvironment],
+	prepared_environment_positions_by_module_id: List[Int],
 	module_preparation_issues: List[PreparedModuleIssues],
 	accepted_alias_graph: AcceptedAliasGraph,
 	accepted_record_graph: AcceptedRecordGraph,
@@ -7424,16 +7509,65 @@ union TypecheckGraphCompletion:
 	TypecheckGraphCompletionRejected(List[String])
 
 
+private pure func prepared_environment_positions_by_module_id(
+	prepared_environments: List[PreparedCanonicalModuleEnvironment],
+	module_count: Int,
+) -> Option[List[Int]]:
+	var positions = 0.repeat(module_count)
+	var environment_position: Int = 0
+	var valid: Bool = True
+
+	for environment in prepared_environments:
+		module_index = prepared_module_id_table_index(
+			prepared_module_scope_id(bound_module_scope(environment.bound_module)),
+		)
+
+		if (
+			module_index < 0
+			or module_index >= module_count
+			or positions.get_or(module_index, 0) != 0
+		):
+			valid = False
+		else:
+			positions = positions.set(module_index, environment_position + 1)
+
+		environment_position += 1
+
+	if valid:
+		Some(positions)
+	else:
+		None
+
+
 private pure func finish_typecheck_graph_completion(
 	implementation_headers: ImplementationHeaderGraph,
 	importable_graph: ImportableModuleGraph,
 	accepted_alias_graph: AcceptedAliasGraph,
 	accepted_record_graph: AcceptedRecordGraph,
 	accepted_union_graph: AcceptedUnionGraph,
-	expected_module_count: Int,
+	expected_prepared_module_count: Int,
+	expected_module_table_count: Int,
 	completion: GlobalHeaderCompletionOutcome,
 ) -> TypecheckGraphCompletion:
-	if completion.prepared_environments.length() != expected_module_count:
+	prepared_position_count = completion.prepared_environment_positions_by_module_id.count(
+		func(position): position > 0,
+	)
+	failure_owner_missing = completion.failures.any(func(failure): failure.module_id.is_none())
+
+	if failure_owner_missing:
+		TypecheckGraphCompletionRejected(
+			[
+				(
+					"internal typecheck error: global header completion failure owner is absent from "
+					+ "the module table"
+				),
+			],
+		)
+	else if (
+		completion.prepared_environments.length() != expected_prepared_module_count
+		or completion.prepared_environment_positions_by_module_id.length() != expected_module_table_count
+		or prepared_position_count != expected_prepared_module_count
+	):
 		TypecheckGraphCompletionRejected(
 			[
 				(
@@ -7487,6 +7621,7 @@ private pure func finish_typecheck_graph_completion(
 					accepted_callable_table = accepted_callable_table,
 					accepted_trait_implementation_table = accepted_trait_implementation_table,
 					prepared_environments = completion.prepared_environments,
+					prepared_environment_positions_by_module_id = completion.prepared_environment_positions_by_module_id,
 					module_preparation_issues = completion.module_preparation_issues,
 					accepted_alias_graph = accepted_alias_graph,
 					accepted_record_graph = accepted_record_graph,
@@ -7571,6 +7706,7 @@ pure func complete_typecheck_graph(
 											accepted_record_graph,
 											accepted_union_graph,
 											1 + bound_module_graph_modules(bound_graph).length(),
+											indexed_graph_module_count(indexed_graph),
 											completion,
 										)
 	else:
@@ -7604,13 +7740,38 @@ private pure func accepted_typecheck_graph_trait_topology(
 	)
 
 
+private pure func typecheck_graph_facts_bound_graph(facts: TypecheckGraphFacts) -> BoundModuleGraph:
+	type_header_graph_bound_graph(
+		trait_topology_graph_type_headers(accepted_typecheck_graph_trait_topology(facts)),
+	)
+
+
 private pure func prepared_module_environment_find(
 	facts: TypecheckGraphFacts,
-	module_identity: ModuleIdentity,
+	module_id: PreparedModuleId,
 ) -> Option[PreparedCanonicalModuleEnvironment]:
-	facts.prepared_environments.find(func(environment):
-		module_identities_equal(bound_module_identity(environment.bound_module), module_identity)
+	position = facts.prepared_environment_positions_by_module_id.get_or(
+		prepared_module_id_table_index(module_id),
+		0,
 	)
+
+	if position > 0:
+		facts.prepared_environments.get(position - 1)
+	else:
+		None
+
+
+-- Request-owned IDs are meaningful only after their issuing graph has been
+-- validated. Internal callers with IDs derived from graph-owned modules use
+-- prepared_module_environment_find directly.
+private pure func prepared_module_environment_find_for_scope(
+	facts: TypecheckGraphFacts,
+	request_scope: PreparedModuleScope,
+) -> Option[PreparedCanonicalModuleEnvironment]:
+	if importable_module_graph_accepts_scope(facts.importable_graph, request_scope):
+		prepared_module_environment_find(facts, prepared_module_scope_id(request_scope))
+	else:
+		None
 
 
 private pure func prepared_module_environment_accepts_request(
@@ -7619,13 +7780,9 @@ private pure func prepared_module_environment_accepts_request(
 	allow_debug_only_calls: Bool,
 ) -> Bool:
 	(
-		prepared_module_scopes_are_compatible(
+		prepared_module_scopes_select_same_module(
 			request_scope,
 			bound_module_scope(environment.bound_module),
-		)
-		and module_identities_equal(
-			prepared_module_scope_identity(request_scope),
-			bound_module_identity(environment.bound_module),
 		)
 		and allow_debug_only_calls == environment.module_facts.allow_debug_only_calls
 	)
@@ -7653,9 +7810,22 @@ pure func recoverable_typecheck_graph_diagnostics_for_module(
 ) -> List[TypecheckDiagnostic]:
 	representation = recoverable_typecheck_graph_rep(graph)
 	var diagnostics: List[TypecheckDiagnostic] = []
+	requested_module = bound_module_graph_find(
+		typecheck_graph_facts_bound_graph(representation.facts),
+		module_identity,
+	)
 
 	for failure in representation.global_completion_failures:
-		if module_identities_equal(failure.module_identity, module_identity):
+		matches = match (requested_module, failure.module_id):
+			(Some(module), Some(failure_module_id)):
+				prepared_module_ids_equal(
+					prepared_module_scope_id(bound_module_scope(module)),
+					failure_module_id,
+				)
+			_:
+				False
+
+		if matches:
 			for diagnostic in failure.diagnostics:
 				if not diagnostics.any(
 					func(existing): typecheck_diagnostics_equal(existing, diagnostic),
@@ -7954,18 +8124,18 @@ private pure func frontend_preparation_unique_declaration_observation(
 	var implementation_count: Int = 0
 
 	for module in modules:
-		module_identity = bound_module_identity(module)
-		union_headers = type_header_graph_local_union_headers(type_headers, module_identity)
+		module_scope = bound_module_scope(module)
+		union_headers = type_header_graph_local_union_headers_for_scope(type_headers, module_scope)
 
-		type_count += type_header_graph_local_builtin_headers(
+		type_count += type_header_graph_local_builtin_headers_for_scope(
 			type_headers,
-			module_identity,
-		).length() + type_header_graph_local_record_headers(
+			module_scope,
+		).length() + type_header_graph_local_record_headers_for_scope(
 			type_headers,
-			module_identity,
-		).length() + union_headers.length() + type_header_graph_local_alias_headers(
+			module_scope,
+		).length() + union_headers.length() + type_header_graph_local_alias_headers_for_scope(
 			type_headers,
-			module_identity,
+			module_scope,
 		).length()
 		constructor_count += union_header_constructor_count(union_headers)
 
@@ -8051,21 +8221,21 @@ private pure func prepare_canonical_body_module(
 	environment: PreparedCanonicalModuleEnvironment,
 ) -> Option[PreparedAcceptedBodyModule]:
 	base_state = typecheck_session_for_prepared_module(environment)
-	module_identity = bound_module_identity(environment.bound_module)
-	direct_module_identities = bound_module_direct_import_modules(
+	module_id = prepared_module_scope_id(bound_module_scope(environment.bound_module))
+	direct_module_ids = bound_module_direct_import_modules(
 		environment.bound_module,
 	).map(
-		func(module): prepared_module_scope_identity(importable_module_prepared_scope(module)),
+		func(module): prepared_module_scope_id(importable_module_prepared_scope(module)),
 	)
 	var errors: List[String] = []
 	var diagnostics: List[TypecheckDiagnostic] = []
 
 	for issues in graph.module_preparation_issues:
-		if module_identities_equal(issues.module_identity, module_identity):
+		if prepared_module_ids_equal(issues.module_id, module_id):
 			errors = errors.concat(issues.errors)
 			diagnostics = diagnostics.concat(issues.diagnostics)
-		else if direct_module_identities.any(
-			func(identity): module_identities_equal(issues.module_identity, identity),
+		else if direct_module_ids.any(
+			func(direct_module_id): prepared_module_ids_equal(issues.module_id, direct_module_id),
 		):
 			errors = errors.concat(issues.callable_errors)
 
@@ -8137,7 +8307,7 @@ private pure func prepare_type_alias_authority(
 				),
 				authority = accepted_alias_graph_canonical_authority(
 					graph,
-					bound_module_identity(bound_module),
+					bound_module_scope(bound_module),
 				)
 			}
 
@@ -8168,7 +8338,7 @@ private pure func prepare_record_type_authority(
 				),
 				authority = accepted_record_graph_canonical_authority(
 					graph,
-					bound_module_identity(bound_module),
+					bound_module_scope(bound_module),
 				)
 			}
 
@@ -8204,28 +8374,23 @@ private pure func prepare_union_type_authority(
 				),
 				authority = accepted_union_graph_canonical_authority(
 					graph,
-					bound_module_identity(bound_module),
+					bound_module_scope(bound_module),
 				)
 			}
 
 
 private pure func graph_facts_typecheck_module(
 	graph_facts: TypecheckGraphFacts,
-	module_identity: ModuleIdentity,
 	request_scope: PreparedModuleScope,
 	allow_debug_only_calls: Bool,
 ) -> Option[AcceptedTypecheckModule]:
-	prepared_environment ?= prepared_module_environment_find(graph_facts, module_identity)
+	prepared_environment ?= prepared_module_environment_find_for_scope(graph_facts, request_scope)
 	bound_module = prepared_environment.bound_module
-	bound_scope = bound_module_scope(bound_module)
 
-	if (
-		importable_module_graph_accepts_scope(graph_facts.importable_graph, bound_scope)
-		and prepared_module_environment_accepts_request(
-			prepared_environment,
-			request_scope,
-			allow_debug_only_calls,
-		)
+	if prepared_module_environment_accepts_request(
+		prepared_environment,
+		request_scope,
+		allow_debug_only_calls,
 	):
 		prepared_body ?= prepare_canonical_body_module(graph_facts, prepared_environment)
 		Some(into_opaque AcceptedTypecheckModule({
@@ -8239,13 +8404,11 @@ private pure func graph_facts_typecheck_module(
 
 pure func accepted_graph_typecheck_module(
 	graph: AcceptedTypecheckGraph,
-	module_identity: ModuleIdentity,
 	scope: PreparedModuleScope,
 	allow_debug_only_calls: Bool,
 ) -> Option[AcceptedTypecheckModule]:
 	graph_facts_typecheck_module(
 		accepted_typecheck_graph_rep(graph).facts,
-		module_identity,
 		scope,
 		allow_debug_only_calls,
 	)
@@ -8253,30 +8416,29 @@ pure func accepted_graph_typecheck_module(
 
 private pure func completion_failed_for_module(
 	failures: List[GlobalHeaderCompletionFailure],
-	module_identity: ModuleIdentity,
+	module_id: PreparedModuleId,
 ) -> Bool:
 	failures.any(func(failure):
-		module_identities_equal(failure.module_identity, module_identity)
+		match failure.module_id:
+			Some(failure_module_id):
+				prepared_module_ids_equal(failure_module_id, module_id)
+			None:
+				False
 	)
 
 
 pure func recoverable_graph_typecheck_module(
 	graph: RecoverableTypecheckGraph,
-	module_identity: ModuleIdentity,
 	scope: PreparedModuleScope,
 	allow_debug_only_calls: Bool,
 ) -> Option[AcceptedTypecheckModule]:
 	representation = recoverable_typecheck_graph_rep(graph)
+	module_id = prepared_module_scope_id(scope)
 
-	if completion_failed_for_module(representation.global_completion_failures, module_identity):
+	if completion_failed_for_module(representation.global_completion_failures, module_id):
 		None
 	else:
-		graph_facts_typecheck_module(
-			representation.facts,
-			module_identity,
-			scope,
-			allow_debug_only_calls,
-		)
+		graph_facts_typecheck_module(representation.facts, scope, allow_debug_only_calls)
 
 
 -- Reusable CTFE artifacts use only dependency modules. Construct that narrower
@@ -8291,14 +8453,10 @@ private pure func graph_facts_ctfe_artifact_typecheck_module(
 		accepted_typecheck_graph_trait_topology(graph_facts),
 	)
 	bound_graph = type_header_graph_bound_graph(type_headers)
-	indexed_graph = bound_module_graph_indexed_graph(bound_graph)
-	graph_scope = indexed_graph_target_scope(indexed_graph)
-	module_identity = prepared_module_scope_identity(scope)
-	module_identity_is_owned = bound_module_graph_find(bound_graph, module_identity).is_some()
+	module_is_owned = bound_module_graph_find_for_scope(bound_graph, scope).is_some()
 
 	if (
-		module_identity_is_owned
-		and prepared_module_scopes_are_compatible(graph_scope, scope)
+		module_is_owned
 		and importable_module_graph_accepts_scope(graph_facts.importable_graph, scope)
 		and typecheck_state_is_reserved_for_scope(state, scope)
 	):
@@ -8368,9 +8526,9 @@ pure func recoverable_ctfe_artifact_typecheck_module(
 	state: TypecheckState,
 ) -> Option[AcceptedTypecheckModule]:
 	representation = recoverable_typecheck_graph_rep(graph)
-	module_identity = prepared_module_scope_identity(scope)
+	module_id = prepared_module_scope_id(scope)
 
-	if completion_failed_for_module(representation.global_completion_failures, module_identity):
+	if completion_failed_for_module(representation.global_completion_failures, module_id):
 		None
 	else:
 		graph_facts_ctfe_artifact_typecheck_module(representation.facts, scope, state)
@@ -8412,13 +8570,9 @@ private pure func body_plan_provenances_equal(
 	right_representation = from_opaque BodyPlanProvenance(right)
 
 	(
-		prepared_module_scopes_are_compatible(
+		prepared_module_scopes_select_same_module(
 			left_representation.module_scope,
 			right_representation.module_scope,
-		)
-		and module_identities_equal(
-			prepared_module_scope_identity(left_representation.module_scope),
-			prepared_module_scope_identity(right_representation.module_scope),
 		)
 		and left_representation.allow_debug_only_calls == right_representation.allow_debug_only_calls
 	)
@@ -8503,7 +8657,6 @@ private pure func prepare_ctfe_artifact_body_module(
 		bound_module,
 		type_headers,
 		graph.accepted_trait_implementation_table,
-		bound_module_identity(bound_module),
 		prepared_module_scope_canonical_path(bound_module_scope(bound_module)),
 	)
 	base_state = { base_state |
@@ -8555,7 +8708,7 @@ private pure func observe_accepted_body_module_preparation(
 	type_headers = trait_topology_graph_type_headers(accepted_typecheck_graph_trait_topology(graph))
 	prepared_environment = prepared_module_environment_find(
 		graph,
-		bound_module_identity(bound_module),
+		prepared_module_scope_id(bound_module_scope(bound_module)),
 	)
 
 	prepared: Option[PreparedAcceptedBodyModule] = match (import_scope, prepared_environment):
@@ -8707,7 +8860,10 @@ pure func accepted_typecheck_graph_initializer_preparation_observation(
 	)
 
 	for module in modules:
-		environment = prepared_module_environment_find(facts, bound_module_identity(module))
+		environment = prepared_module_environment_find(
+			facts,
+			prepared_module_scope_id(bound_module_scope(module)),
+		)
 		base_state = environment
 			.map(typecheck_session_for_prepared_module)
 			.get_or(
@@ -8935,7 +9091,7 @@ private pure func implementation_body_signature_from_accepted_header(
 	method_header: ImplementationMethodHeader,
 	signature: CallableSignature,
 ) -> Option[FunctionBodySignature]:
-	implementation_id = implementation_header_id(implementation)
+	owner_scope = bound_module_scope(base.representation.bound_module)
 	type_headers = trait_topology_graph_type_headers(
 		accepted_typecheck_graph_trait_topology(base.representation.graph_facts),
 	)
@@ -8948,7 +9104,7 @@ private pure func implementation_body_signature_from_accepted_header(
 	for parameter in callable_signature_parameters(signature):
 		param_type = callable_header_semantic_type(
 			type_headers,
-			impl_id_module_identity(implementation_id),
+			owner_scope,
 			registration,
 			parameter.typ,
 		)
@@ -8961,7 +9117,7 @@ private pure func implementation_body_signature_from_accepted_header(
 
 	return_type = callable_header_semantic_type(
 		type_headers,
-		impl_id_module_identity(implementation_id),
+		owner_scope,
 		registration,
 		callable_signature_return_type(signature),
 	)
@@ -9427,11 +9583,12 @@ private pure func body_planning_failure_message(failure: BodyCheckPlanningFailur
 
 
 private pure func body_outcome_index(
-	owner: ModuleIdentity,
+	owner_scope: PreparedModuleScope,
 	outcomes: List[BodyCheckOutcome],
 ) -> BodyOutcomeIndexBuild:
 	var index: Dict[Int, BodyCheckOutcome] = {}
 	var errors: List[String] = []
+	owner = prepared_module_scope_identity(owner_scope)
 
 	for outcome in outcomes:
 		id = body_check_outcome_callable_id(outcome)
@@ -9453,10 +9610,7 @@ private pure func body_outcome_index(
 			index = index.set(definition_id, outcome)
 
 	if errors.is_empty():
-		BodyOutcomeIndexAccepted(into_opaque BodyOutcomeIndex({
-					owner = owner,
-					by_definition_id = index
-				}))
+		BodyOutcomeIndexAccepted(into_opaque BodyOutcomeIndex({by_definition_id = index}))
 	else:
 		BodyOutcomeIndexRejected(errors)
 
@@ -9477,7 +9631,7 @@ private pure func body_outcome_index_for_base(
 		)
 
 	if provenance_errors.is_empty():
-		body_outcome_index(bound_module_identity(base.representation.bound_module), outcomes)
+		body_outcome_index(bound_module_scope(base.representation.bound_module), outcomes)
 	else:
 		BodyOutcomeIndexRejected(provenance_errors)
 
@@ -9845,7 +9999,7 @@ private func typecheck_program_with_accepted_type_headers_and_trace(
 				.join("; "),
 		)
 	else:
-		match body_outcome_index(bound_module_identity(bound_module), outcomes):
+		match body_outcome_index(bound_module_scope(bound_module), outcomes):
 			BodyOutcomeIndexRejected(errors):
 				rejected_typecheck_program(
 					body_base.state,

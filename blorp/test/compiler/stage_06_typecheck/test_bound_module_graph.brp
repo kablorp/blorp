@@ -64,6 +64,7 @@ import:
 		bound_module_graph_build,
 		bound_module_graph_find,
 		bound_module_graph_find_canonical_path,
+		bound_module_graph_find_for_scope,
 		bound_module_graph_modules,
 		bound_module_graph_modules_for_prepared,
 		bound_module_graph_target,
@@ -179,6 +180,61 @@ private pure func accept_empty_view(_scope: PreparedModuleScope) -> BoundModuleV
 		COMPILER_BOUND_MODULE_VISIBILITY_EMPTY,
 		[],
 	)
+
+
+func test_bound_graph_selects_exact_modules_by_prepared_scope() -> Bool:
+	match test_indexed_graph():
+		None:
+			False
+		Some(indexed):
+			module_scopes = indexed_graph_module_scopes(indexed)
+
+			match (module_scopes.get(0), module_scopes.get(1)):
+				(Some(first_scope), Some(second_scope)):
+					match bound_module_graph_build(indexed, ["pkg/first"], accept_empty_view):
+						Err(_):
+							False
+						Ok(bound):
+							target = bound_module_graph_find_for_scope(
+								bound,
+								indexed_graph_target_scope(indexed),
+							)
+							first = bound_module_graph_find_for_scope(bound, first_scope)
+							second = bound_module_graph_find_for_scope(bound, second_scope)
+
+							other_graph = indexed_graph_build(
+								fixture_module_load_candidate(
+									"other.brp",
+									"other/main",
+									"VALUE = 0",
+								),
+								[
+									fixture_module_load_candidate(
+										"other-first.brp",
+										"other/first",
+										"VALUE = 1",
+									),
+								],
+							)
+
+							incompatible = match other_graph:
+								Err(_):
+									None
+								Ok(other):
+									match indexed_graph_module_scopes(other).get(0):
+										None:
+											None
+										Some(scope):
+											bound_module_graph_find_for_scope(bound, scope)
+
+							(
+								target.map(bound_module_canonical_path) == Some("app/main")
+								and first.map(bound_module_canonical_path) == Some("pkg/first")
+								and second.is_none()
+								and incompatible.is_none()
+							)
+				_:
+					False
 
 
 private pure func reject_dependency_views(scope: PreparedModuleScope) -> BoundModuleViewBinding:
@@ -473,7 +529,6 @@ func test_bound_graph_reuses_completed_binding_for_typecheck() -> Bool:
 								Some(accepted_graph):
 									match accepted_graph_typecheck_module(
 										accepted_graph,
-										bound_module_identity(bound_target),
 										target_scope,
 										False,
 									):
@@ -492,6 +547,45 @@ func test_bound_graph_reuses_completed_binding_for_typecheck() -> Bool:
 											)
 
 
+private pure func partial_bound_graph_completion_is_exact() -> Option[Bool]:
+	indexed ?= test_indexed_graph()
+	importable_graph = importable_module_graph(indexed)
+	importable_index = importable_module_graph_all_index(importable_graph)
+	module_scopes = indexed_graph_module_scopes(indexed)
+	first_scope ?= module_scopes.get(0)
+	second_scope ?= module_scopes.get(1)
+	bound ?= bound_module_graph_build(
+		indexed,
+		["pkg/first"],
+		func(
+			scope,
+		): typecheck_bind_program_module_view(
+			graph_state(scope),
+			prepared_module_program(prepared_module_scope_module(scope)),
+			importable_index,
+			prepared_module_scope_canonical_path(scope),
+		),
+	).to_option()
+	headers ?= accepted_callable_headers(bound)
+	graph ?= accepted_graph_for(headers, importable_graph)
+
+	Some(
+		(
+			accepted_graph_typecheck_module(
+				graph,
+				indexed_graph_target_scope(indexed),
+				False,
+			).is_some()
+			and accepted_graph_typecheck_module(graph, first_scope, False).is_some()
+			and accepted_graph_typecheck_module(graph, second_scope, False).is_none()
+		),
+	)
+
+
+func test_partial_bound_graph_completes_only_bound_modules() -> Bool:
+	partial_bound_graph_completion_is_exact().get_or(False)
+
+
 private pure func accepted_graph_rejects_unowned_module_or_state() -> Option[Bool]:
 	first_indexed ?= test_indexed_graph()
 	first_bound ?= bound_module_graph_build(
@@ -505,8 +599,6 @@ private pure func accepted_graph_rejects_unowned_module_or_state() -> Option[Boo
 		[],
 	).to_option()
 	other_bound ?= bound_module_graph_build(other_indexed, [], accept_empty_view).to_option()
-	first_target = bound_module_graph_target(first_bound)
-	other_target = bound_module_graph_target(other_bound)
 	first_importable_graph = importable_module_graph(first_indexed)
 	other_importable_graph = importable_module_graph(other_indexed)
 	accepted_graph ?= accepted_graph_for(first_topology, first_importable_graph)
@@ -526,30 +618,9 @@ private pure func accepted_graph_rejects_unowned_module_or_state() -> Option[Boo
 	Some(
 		(
 			provenance_rejected
-			and accepted_graph_typecheck_module(
-				accepted_graph,
-				bound_module_identity(other_target),
-				other_scope,
-				False,
-			).is_none()
-			and accepted_graph_typecheck_module(
-				accepted_graph,
-				bound_module_identity(first_target),
-				other_scope,
-				False,
-			).is_none()
-			and accepted_graph_typecheck_module(
-				accepted_graph,
-				bound_module_identity(first_target),
-				first_scope,
-				False,
-			).is_some()
-			and accepted_graph_typecheck_module(
-				accepted_graph,
-				bound_module_identity(first_target),
-				first_scope,
-				True,
-			).is_none()
+			and accepted_graph_typecheck_module(accepted_graph, other_scope, False).is_none()
+			and accepted_graph_typecheck_module(accepted_graph, first_scope, False).is_some()
+			and accepted_graph_typecheck_module(accepted_graph, first_scope, True).is_none()
 		),
 	)
 
@@ -579,7 +650,6 @@ private pure func recovery_dependency_has_no_semantic_inventory() -> Option[Bool
 	)
 	canonical_accepted_module = accepted_graph_typecheck_module(
 		accepted_graph,
-		prepared_module_scope_identity(recovery_scope),
 		recovery_scope,
 		False,
 	)
@@ -909,6 +979,10 @@ tests: TestSuite = {
 			test_bound_graph_preserves_order_and_exact_identity_lookup,
 		),
 		(
+			"selects exact modules by compatible prepared scope",
+			test_bound_graph_selects_exact_modules_by_prepared_scope,
+		),
+		(
 			"rejects all modules in deterministic order",
 			test_bound_graph_rejects_all_modules_in_deterministic_order,
 		),
@@ -931,6 +1005,10 @@ tests: TestSuite = {
 		(
 			"reuses completed binding for typecheck",
 			test_bound_graph_reuses_completed_binding_for_typecheck,
+		),
+		(
+			"partial bound graph completes only bound modules",
+			test_partial_bound_graph_completes_only_bound_modules,
 		),
 		(
 			"accepted graph rejects unowned module or state",

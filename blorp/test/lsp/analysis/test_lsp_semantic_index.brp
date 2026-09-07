@@ -8,6 +8,7 @@ import:
 		TypecheckImportModule,
 		TypecheckedGraph,
 		typecheck_graph,
+	../../../src/compiler/stage_06_typecheck/decl: TypedDecl(TypedFunctionDecl)
 	../../../src/compiler/stage_06_typecheck/graph/definition_identity:
 		SemanticSymbolKind(SemanticConstructor, SemanticField),
 		exported_symbol_key_module_identity,
@@ -156,7 +157,7 @@ private pure func imported_type_graph_request(source: String) -> TypecheckGraphR
 				import_path = "right",
 				resolved_module = "pkg/right"
 			},
-		],
+		]
 	}
 
 
@@ -170,6 +171,58 @@ private pure func graph_with_failed_dependency() -> TypecheckedGraph:
 		errors = ["dependency analysis failed"]
 	}
 	{ base | modules = [dependency] }
+
+
+private pure func graph_with_partially_unprojectable_dependency() -> TypecheckedGraph:
+	request = graph_request_for_source(
+		"import:\n\tdep: available\n\nfunc main(args: List[String]):\n\tprint(available().to_string())",
+	)
+	dependency: TypecheckImportModule = {
+		path = "/workspace/dep.brp",
+		module_name = "dep",
+		module_path = "dep",
+		text = "pure func unprojectable() -> Int: 1\n\npure func available() -> Int: 2",
+		typecheck_program = None,
+		module_surface = None,
+		origin = UserModule
+	}
+	graph = typecheck_graph(
+		{ request |
+			modules = [dependency],
+			module_targets = ["dep"],
+			resolved_imports = [
+				{
+					from_path = "/workspace/main.brp",
+					from_module = "main",
+					import_path = "dep",
+					resolved_module = "dep"
+				},
+			]
+		},
+	)
+
+	match graph.modules.get(0):
+		None:
+			graph
+		Some(module):
+			var corrupted: Bool = False
+			var decls: List[TypedDecl] = []
+
+			for decl in module.semantic_program.decls:
+				match decl:
+					TypedFunctionDecl(info):
+						if corrupted:
+							decls = decls.append(decl)
+						else:
+							corrupted = True
+							decls = decls.append(TypedFunctionDecl({ info | callable_id = None }))
+					_:
+						decls = decls.append(decl)
+
+			corrupted_module = { module |
+				semantic_program = { module.semantic_program | decls = decls }
+			}
+			{ graph | modules = [corrupted_module] }
 
 
 private pure func exported_name(symbol: SemanticSymbolId) -> Option[String]:
@@ -211,6 +264,7 @@ private pure func exported_symbol_matches(
 	match symbol:
 		ExportedSemanticSymbol(exported):
 			exported_id: ExportedSymbolId = exported
+
 			(
 				exported_symbol_key_name(exported_id.key) == name
 				and module_identity_matches_canonical_path(
@@ -1350,6 +1404,28 @@ func test_unresolved_dependency_marks_target_index_partial() -> Bool:
 			module_semantic_index_coverage(index) == PartialModuleSemanticIndex
 
 
+func test_partial_dependency_projection_retains_valid_referenced_export() -> Bool:
+	graph = graph_with_partially_unprojectable_dependency()
+
+	match semantic_index_for_target(
+		semantic_artifact_id_from_value("semantic-index-partial-export-test"),
+		document_uri("file:///workspace/main.brp"),
+		graph,
+	):
+		Err(_):
+			False
+		Ok(index):
+			(
+				module_semantic_index_coverage(index) == PartialModuleSemanticIndex
+				and module_semantic_index_references(index).any(func(reference):
+					(
+						not reference.is_declaration
+						and exported_symbol_matches(reference.symbol, "dep", "available")
+					)
+				)
+			)
+
+
 private pure func document_symbols_case() -> Option[Bool]:
 	graph = typecheck_graph(graph_request())
 	artifact_id: SemanticArtifactId = semantic_artifact_id_from_value(
@@ -1477,6 +1553,10 @@ tests: TestSuite = {
 		(
 			"unresolved dependency marks target index partial",
 			test_unresolved_dependency_marks_target_index_partial,
+		),
+		(
+			"partial dependency retains valid referenced export",
+			test_partial_dependency_projection_retains_valid_referenced_export,
 		),
 		(
 			"document symbols preserve names and source order",

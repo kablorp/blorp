@@ -1,9 +1,7 @@
 import:
-	../../../src/compiler/stage_04_modules/loaded_module:
-		ModuleIdentity,
-		ModuleOrigin(UserModule),
-		module_identity_from_resolved,
-		resolved_module_identity_from_resolver,
+	../../../src/compiler/stage_06_typecheck/graph/indexed_graph:
+		PreparedModuleId,
+		PreparedModuleScope,
 	../../../src/compiler/stage_06_typecheck/graph/type_identity: TypeId, type_id, type_ids_equal
 	../../../src/compiler/stage_06_typecheck/type_system/accepted_record_authority:
 		AcceptedRecordExactLookup(
@@ -38,11 +36,17 @@ import:
 		canonical_module_type_name,
 		types_equal,
 	../../../src/lib/source: SourceSpan, source_empty_span, source_file, source_start
+	../typecheck_test_support: prepared_module_id_fixture, prepared_module_id_fixture_find
 	test: TestSuite
 
 
-private pure func module_identity(path: String) -> ModuleIdentity:
-	module_identity_from_resolved(resolved_module_identity_from_resolver(path, UserModule))
+private MODULE_PATHS: List[String] = [
+	"app/main",
+	"pkg/left",
+	"pkg/right",
+	"pkg/unrelated",
+	"pkg/pair",
+]
 
 
 private pure func fixture_span(path: String) -> SourceSpan:
@@ -50,8 +54,12 @@ private pure func fixture_span(path: String) -> SourceSpan:
 	source_empty_span(source, source_start(source))
 
 
-private pure func fixture_type_id(module_path: String, name: String) -> TypeId:
-	type_id(module_identity(module_path), name, fixture_span(module_path + ".brp"))
+private pure func fixture_type_id(
+	module_id: PreparedModuleId,
+	module_path: String,
+	name: String,
+) -> TypeId:
+	type_id(module_id, name, fixture_span(module_path + ".brp"))
 
 
 private pure func field(name: String, typ: SemanticType) -> FieldDecl:
@@ -63,13 +71,14 @@ private pure func field(name: String, typ: SemanticType) -> FieldDecl:
 
 
 private pure func fixture_record(
+	module_id: PreparedModuleId,
 	module_path: String,
 	name: String,
 	canonical_visible: Bool,
 	fields: List[FieldDecl],
 ) -> AcceptedRecordTableRecord:
 	{
-		id = fixture_type_id(module_path, name),
+		id = fixture_type_id(module_id, module_path, name),
 		owner_module_path = module_path,
 		canonical_name = canonical_module_type_name(module_path, name),
 		canonical_visible = canonical_visible,
@@ -85,41 +94,59 @@ private pure func fixture_record(
 	}
 
 
-private pure func table_input(include_unrelated: Bool) -> AcceptedRecordTableInput:
-	left = fixture_record(
-		"pkg/left",
-		"Node",
-		True,
-		[field("next", SemanticNamedType(canonical_module_type_name("pkg/left", "Node"), []))],
-	)
-	right = fixture_record("pkg/right", "Node", False, [field("text", TYPE_STRING)])
-	alias_id = fixture_type_id("pkg/left", "AliasOnly")
+private pure func table_input(
+	fixture: PreparedModuleScope,
+	include_unrelated: Bool,
+) -> Option[AcceptedRecordTableInput]:
+	left_owner ?= prepared_module_id_fixture_find(fixture, "pkg/left")
+	right_owner ?= prepared_module_id_fixture_find(fixture, "pkg/right")
+	unrelated_owner ?= prepared_module_id_fixture_find(fixture, "pkg/unrelated")
+	left = fixture_record(left_owner, "pkg/left", "Node", True, [field(
+				"next",
+				SemanticNamedType(
+					canonical_module_type_name("pkg/left", "Node"),
+					[],
+				),
+			)])
+	right = fixture_record(right_owner, "pkg/right", "Node", False, [field("text", TYPE_STRING)])
+	alias_id = fixture_type_id(left_owner, "pkg/left", "AliasOnly")
 	known_type_ids = [left.id, right.id, alias_id]
 	-- Keep the owner-local record away from index zero so module-view bindings
 	-- are proven to address the table rather than accidentally assuming zero.
 	records = [right, left]
 
 	if include_unrelated:
-		{
-			known_type_ids = known_type_ids.append(fixture_type_id("pkg/unrelated", "Other")),
-			records = records.append(
-				fixture_record("pkg/unrelated", "Other", True, [field("value", TYPE_INT)]),
-			)
-		}
+		Some(
+			fixture_record(
+				unrelated_owner,
+				"pkg/unrelated",
+				"Other",
+				True,
+				[field("value", TYPE_INT)],
+			),
+		).map(
+			func(unrelated): {
+				known_type_ids = known_type_ids.append(unrelated.id),
+				records = records.append(unrelated)
+			},
+		)
 	else:
-		{
+		Some({
 			known_type_ids = known_type_ids,
-			records = records
-		}
+			records = records,
+		})
 
 
 private pure func record_authority_is_category_safe_and_local_result() -> Option[Bool]:
-	table ?= accepted_record_table(table_input(False))
-	left_id = fixture_type_id("pkg/left", "Node")
-	alias_id = fixture_type_id("pkg/left", "AliasOnly")
+	fixture ?= prepared_module_id_fixture(MODULE_PATHS)
+	input ?= table_input(fixture, False)
+	table ?= accepted_record_table(input)
+	owner ?= prepared_module_id_fixture_find(fixture, "pkg/left")
+	left_id = fixture_type_id(owner, "pkg/left", "Node")
+	alias_id = fixture_type_id(owner, "pkg/left", "AliasOnly")
 	view ?= accepted_record_module_view(
 		table,
-		module_identity("pkg/left"),
+		owner,
 		[
 			{
 				source_name = "Node",
@@ -143,25 +170,31 @@ private pure func record_authority_is_category_safe_and_local_result() -> Option
 		canonical_module_type_name("pkg/left", "Node"),
 	)
 	canonical_only_next ?= canonical_only_entry.fields.get(0)
-	Some(
-		types_equal(next.field_type, SemanticNamedType("Node", []))
-		and types_equal(
+
+	alias_is_wrong_kind = match accepted_record_exact(table, alias_id).lookup:
+		AcceptedRecordExactWrongKind(id):
+			type_ids_equal(id, alias_id)
+		AcceptedRecordExactFound(_) | AcceptedRecordExactMissing:
+			False
+
+	Some(types_equal(
+			next.field_type,
+			SemanticNamedType("Node", []),
+		) and types_equal(
 			canonical_next.field_type,
-			SemanticNamedType(canonical_module_type_name("pkg/left", "Node"), []),
-		)
-		and accepted_record_find(canonical_only, "Node").is_none()
-		and types_equal(
+			SemanticNamedType(
+				canonical_module_type_name("pkg/left", "Node"),
+				[],
+			),
+		) and accepted_record_find(canonical_only, "Node").is_none() and types_equal(
 			canonical_only_next.field_type,
-			SemanticNamedType(canonical_module_type_name("pkg/left", "Node"), []),
-		)
-		and accepted_record_table_entry_count(table) == 2
-		and accepted_record_module_view_binding_count(view) == 1
-		and match accepted_record_exact(table, alias_id).lookup:
-			AcceptedRecordExactWrongKind(id):
-				type_ids_equal(id, alias_id)
-			AcceptedRecordExactFound(_) | AcceptedRecordExactMissing:
-				False
-	)
+			SemanticNamedType(
+				canonical_module_type_name("pkg/left", "Node"),
+				[],
+			),
+		) and accepted_record_table_entry_count(
+			table,
+		) == 2 and accepted_record_module_view_binding_count(view) == 1 and alias_is_wrong_kind)
 
 
 private pure func record_authority_is_category_safe_and_local() -> Bool:
@@ -169,47 +202,50 @@ private pure func record_authority_is_category_safe_and_local() -> Bool:
 
 
 private pure func module_view_rejects_wrong_span_and_private_import_result() -> Option[Bool]:
-	table ?= accepted_record_table(table_input(False))
-	wrong_span = type_id(
-		module_identity("pkg/left"),
-		"Node",
-		fixture_span("pkg/left/other.brp"),
-	)
-	private_id = fixture_type_id("pkg/right", "Node")
-	owner = module_identity("app/main")
+	fixture ?= prepared_module_id_fixture(MODULE_PATHS)
+	input ?= table_input(fixture, False)
+	table ?= accepted_record_table(input)
+	left_owner ?= prepared_module_id_fixture_find(fixture, "pkg/left")
+	main_owner ?= prepared_module_id_fixture_find(fixture, "app/main")
+	right_owner ?= prepared_module_id_fixture_find(fixture, "pkg/right")
+	left_id = fixture_type_id(left_owner, "pkg/left", "Node")
+	wrong_span = type_id(left_owner, "Node", fixture_span("pkg/left/other.brp"))
+	private_id = fixture_type_id(right_owner, "pkg/right", "Node")
 
-	Some(
-		accepted_record_module_view(
+	Some(accepted_record_module_view(
 			table,
-			owner,
-			[{
-				source_name = "WrongSpan",
-				id = wrong_span,
-				owner_local = False,
-				infer_from_fields = True
-			}],
-		).is_none()
-		and accepted_record_module_view(
+			main_owner,
+			[
+				{
+					source_name = "WrongSpan",
+					id = wrong_span,
+					owner_local = False,
+					infer_from_fields = True
+				},
+			],
+		).is_none() and accepted_record_module_view(
 			table,
-			module_identity("pkg/left"),
-			[{
-				source_name = "MisclassifiedLocal",
-				id = fixture_type_id("pkg/left", "Node"),
-				owner_local = False,
-				infer_from_fields = False
-			}],
-		).is_none()
-		and accepted_record_module_view(
+			left_owner,
+			[
+				{
+					source_name = "MisclassifiedLocal",
+					id = left_id,
+					owner_local = False,
+					infer_from_fields = False
+				},
+			],
+		).is_none() and accepted_record_module_view(
 			table,
-			owner,
-			[{
-				source_name = "PrivateNode",
-				id = private_id,
-				owner_local = False,
-				infer_from_fields = True
-			}],
-		).is_none()
-	)
+			main_owner,
+			[
+				{
+					source_name = "PrivateNode",
+					id = private_id,
+					owner_local = False,
+					infer_from_fields = True
+				},
+			],
+		).is_none())
 
 
 private pure func module_view_rejects_wrong_span_and_private_import() -> Bool:
@@ -217,20 +253,26 @@ private pure func module_view_rejects_wrong_span_and_private_import() -> Bool:
 
 
 private pure func exact_record_queries_ignore_unrelated_modules_result() -> Option[Bool]:
-	base ?= accepted_record_table(table_input(False))
-	expanded ?= accepted_record_table(table_input(True))
-	id = fixture_type_id("pkg/left", "Node")
+	fixture ?= prepared_module_id_fixture(MODULE_PATHS)
+	base_input ?= table_input(fixture, False)
+	expanded_input ?= table_input(fixture, True)
+	base ?= accepted_record_table(base_input)
+	expanded ?= accepted_record_table(expanded_input)
+	left_owner ?= prepared_module_id_fixture_find(fixture, "pkg/left")
+	id = fixture_type_id(left_owner, "pkg/left", "Node")
 	base_probe = accepted_record_exact(base, id)
 	expanded_probe = accepted_record_exact(expanded, id)
 
 	Some(
-		base_probe.candidates_visited == 1
-		and expanded_probe.candidates_visited == 1
-		and match (base_probe.lookup, expanded_probe.lookup):
-			(AcceptedRecordExactFound(left), AcceptedRecordExactFound(right)):
-				left.fields.length() == right.fields.length()
-			_:
-				False
+		(
+			base_probe.candidates_visited == 1
+			and expanded_probe.candidates_visited == 1
+			and match (base_probe.lookup, expanded_probe.lookup):
+				(AcceptedRecordExactFound(left), AcceptedRecordExactFound(right)):
+					left.fields.length() == right.fields.length()
+				_:
+					False
+		),
 	)
 
 
@@ -239,8 +281,23 @@ private pure func exact_record_queries_ignore_unrelated_modules() -> Bool:
 
 
 private pure func visible_field_shape_lookup_preserves_binding_order_result() -> Option[Bool]:
-	point = fixture_record("app/main", "Point", True, [field("x", TYPE_INT), field("y", TYPE_INT)])
-	pair = fixture_record("pkg/pair", "Pair", True, [field("y", TYPE_STRING), field("x", TYPE_STRING)])
+	fixture ?= prepared_module_id_fixture(MODULE_PATHS)
+	owner ?= prepared_module_id_fixture_find(fixture, "app/main")
+	pair_owner ?= prepared_module_id_fixture_find(fixture, "pkg/pair")
+	point = fixture_record(
+		owner,
+		"app/main",
+		"Point",
+		True,
+		[field("x", TYPE_INT), field("y", TYPE_INT)],
+	)
+	pair = fixture_record(
+		pair_owner,
+		"pkg/pair",
+		"Pair",
+		True,
+		[field("y", TYPE_STRING), field("x", TYPE_STRING)],
+	)
 	input: AcceptedRecordTableInput = {
 		known_type_ids = [point.id, pair.id],
 		records = [point, pair]
@@ -248,7 +305,7 @@ private pure func visible_field_shape_lookup_preserves_binding_order_result() ->
 	table ?= accepted_record_table(input)
 	view ?= accepted_record_module_view(
 		table,
-		module_identity("app/main"),
+		owner,
 		[
 			{
 				source_name = "Point",
@@ -266,10 +323,10 @@ private pure func visible_field_shape_lookup_preserves_binding_order_result() ->
 	)
 	authority = accepted_record_authority(table, view)
 
-	Some(
-		accepted_record_find_names_with_fields(authority, ["y", "x"])
-		== ["Point", "pkg__pair__Pair"]
-	)
+	Some(accepted_record_find_names_with_fields(
+			authority,
+			["y", "x"],
+		) == ["Point", "pkg__pair__Pair"])
 
 
 private pure func visible_field_shape_lookup_preserves_binding_order() -> Bool:
@@ -277,24 +334,24 @@ private pure func visible_field_shape_lookup_preserves_binding_order() -> Bool:
 
 
 private pure func scalar_queries_read_canonical_payload_result() -> Option[Bool]:
-	base = fixture_record("app/main", "Capabilities", True, [field("value", TYPE_INT)])
-	capable_record = { base |
-		payload = { base.payload |
+	fixture ?= prepared_module_id_fixture(MODULE_PATHS)
+	owner ?= prepared_module_id_fixture_find(fixture, "app/main")
+	base = fixture_record(owner, "app/main", "Capabilities", True, [field("value", TYPE_INT)])
+	capable_record = { base | payload = { base.payload |
 			is_value = True,
 			contains_resource = True,
 			may_contain_function = True,
 			may_contain_one_shot_stream = True,
 			may_contain_resource_source = True
-		}
-	}
-	plain_record = fixture_record("app/main", "Plain", True, [field("value", TYPE_INT)])
+		} }
+	plain_record = fixture_record(owner, "app/main", "Plain", True, [field("value", TYPE_INT)])
 	table ?= accepted_record_table({
 		known_type_ids = [capable_record.id, plain_record.id],
-		records = [capable_record, plain_record]
+		records = [capable_record, plain_record],
 	})
 	view ?= accepted_record_module_view(
 		table,
-		module_identity("app/main"),
+		owner,
 		[
 			{
 				source_name = "Capabilities",
@@ -313,36 +370,29 @@ private pure func scalar_queries_read_canonical_payload_result() -> Option[Bool]
 	authority = accepted_record_authority(table, view)
 
 	Some(
-		accepted_record_contains(authority, "Capabilities")
-		and accepted_record_is_value(authority, "Capabilities").get_or(False)
-		and accepted_record_contains_resource(authority, "Capabilities").get_or(False)
-		and accepted_record_may_contain_function(authority, "Capabilities").get_or(False)
-		and accepted_record_may_contain_one_shot_stream(
-			authority,
-			"Capabilities",
-		).get_or(False)
-		and accepted_record_may_contain_resource_source(
-			authority,
-			"Capabilities",
-		).get_or(False)
-		and not accepted_record_resource_scan_is_proven_unnecessary(
-			authority,
-			"Capabilities",
-		).get_or(True)
-		and accepted_record_resource_scan_is_proven_unnecessary(
-			authority,
-			"Plain",
-		).get_or(False)
-		and not accepted_record_contains(authority, "Missing")
-		and accepted_record_is_value(authority, "Missing").is_none()
-		and accepted_record_contains_resource(authority, "Missing").is_none()
-		and accepted_record_may_contain_function(authority, "Missing").is_none()
-		and accepted_record_may_contain_one_shot_stream(authority, "Missing").is_none()
-		and accepted_record_may_contain_resource_source(authority, "Missing").is_none()
-		and accepted_record_resource_scan_is_proven_unnecessary(
-			authority,
-			"Missing",
-		).is_none()
+		(
+			accepted_record_contains(authority, "Capabilities")
+			and accepted_record_is_value(authority, "Capabilities").get_or(False)
+			and accepted_record_contains_resource(authority, "Capabilities").get_or(False)
+			and accepted_record_may_contain_function(authority, "Capabilities").get_or(False)
+			and accepted_record_may_contain_one_shot_stream(authority, "Capabilities").get_or(False)
+			and accepted_record_may_contain_resource_source(authority, "Capabilities").get_or(False)
+			and not accepted_record_resource_scan_is_proven_unnecessary(
+				authority,
+				"Capabilities",
+			).get_or(True)
+			and accepted_record_resource_scan_is_proven_unnecessary(
+				authority,
+				"Plain",
+			).get_or(False)
+			and not accepted_record_contains(authority, "Missing")
+			and accepted_record_is_value(authority, "Missing").is_none()
+			and accepted_record_contains_resource(authority, "Missing").is_none()
+			and accepted_record_may_contain_function(authority, "Missing").is_none()
+			and accepted_record_may_contain_one_shot_stream(authority, "Missing").is_none()
+			and accepted_record_may_contain_resource_source(authority, "Missing").is_none()
+			and accepted_record_resource_scan_is_proven_unnecessary(authority, "Missing").is_none()
+		),
 	)
 
 

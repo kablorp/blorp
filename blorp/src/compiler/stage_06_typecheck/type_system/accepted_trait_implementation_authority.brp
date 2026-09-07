@@ -4,7 +4,6 @@
 import:
 	../../../lib/source: source_spans_equal
 	../../stage_04_modules/loaded_module:
-		ModuleIdentity,
 		module_identities_equal,
 		module_identity_matches_module_path,
 		module_identity_storage_key,
@@ -106,8 +105,8 @@ private record AcceptedTraitImplementationTableRep {
 	trait_indices_by_module_and_definition_id: Dict[String, Dict[Int, Int]],
 	trait_index_by_compiler_identity: Dict[String, Int],
 	implementation_indices_by_module_and_definition_id: Dict[String, Dict[Int, Int]],
-	trait_indices_by_module_identity: Dict[String, List[Int]],
-	implementation_indices_by_module_identity: Dict[String, List[Int]]
+	trait_indices_by_module_path: Dict[String, List[Int]],
+	implementation_indices_by_module_path: Dict[String, List[Int]]
 }
 
 
@@ -122,7 +121,7 @@ private record AcceptedCompilerImplementationBucket {
 
 private record AcceptedTraitImplementationAuthorityRep {
 	table: AcceptedTraitImplementationTable,
-	owner: ModuleIdentity,
+	owner_module_path: String,
 	visible_trait_indices: List[Int],
 	trait_indices_by_semantic_name: Dict[String, Int],
 	visible_trait_indices_by_name: Dict[String, Int],
@@ -276,6 +275,18 @@ private pure func implementation_record_is_valid(item: AcceptedImplementationTab
 		)
 		and implementation_method_ids_are_valid(item)
 	)
+
+
+private pure func module_path_accepts_identity(
+	identity_keys_by_module_path: Dict[String, String],
+	module_path: String,
+	identity_key: String,
+) -> Bool:
+	match identity_keys_by_module_path.get(module_path):
+		Some(existing):
+			existing == identity_key
+		None:
+			True
 
 
 private pure func implementation_method_ids_conflict_with_index(
@@ -568,8 +579,9 @@ pure func accepted_trait_implementation_table(
 	var trait_indices: Dict[String, Dict[Int, Int]] = {}
 	var implementation_indices: Dict[String, Dict[Int, Int]] = {}
 	var implementation_method_ids: Dict[String, Dict[Int, Bool]] = {}
-	var trait_indices_by_module_identity: Dict[String, List[Int]] = {}
-	var implementation_indices_by_module_identity: Dict[String, List[Int]] = {}
+	var trait_indices_by_module_path: Dict[String, List[Int]] = {}
+	var implementation_indices_by_module_path: Dict[String, List[Int]] = {}
+	var identity_keys_by_module_path: Dict[String, String] = {}
 	var implementation_trait_method_ids: List[List[Option[TraitMethodId]]] = []
 	var satisfied_trait_indices_by_implementation: List[List[Int]] = []
 	var conflicting_implementation_indices_by_implementation: List[List[Int]] = []
@@ -582,19 +594,30 @@ pure func accepted_trait_implementation_table(
 		definitions = trait_indices.get_or(module_key, {})
 		definition_id = trait_id_definition_id(item.id)
 
-		if definitions.contains(definition_id) or not trait_record_is_valid(item):
+		if (
+			definitions.contains(definition_id)
+			or not trait_record_is_valid(item)
+			or not module_path_accepts_identity(
+				identity_keys_by_module_path,
+				item.owner_module_path,
+				module_key,
+			)
+		):
 			valid = False
 		else:
 			trait_indices = trait_indices.set(
 				module_key,
 				definitions.set(definition_id, trait_index),
 			)
-			owner_key = module_identity_storage_key(trait_id_module_identity(item.id))
-			trait_indices_by_module_identity = trait_indices_by_module_identity.set(
-				owner_key,
-				trait_indices_by_module_identity
-					.get_or(owner_key, [])
+			trait_indices_by_module_path = trait_indices_by_module_path.set(
+				item.owner_module_path,
+				trait_indices_by_module_path
+					.get_or(item.owner_module_path, [])
 					.append(trait_index),
+			)
+			identity_keys_by_module_path = identity_keys_by_module_path.set(
+				item.owner_module_path,
+				module_key,
 			)
 
 			match item.compiler_builtin_id:
@@ -623,6 +646,11 @@ pure func accepted_trait_implementation_table(
 		if (
 			definitions.contains(definition_id)
 			or not implementation_record_is_valid(item)
+			or not module_path_accepts_identity(
+				identity_keys_by_module_path,
+				item.owner_module_path,
+				module_key,
+			)
 			or implementation_method_ids_conflict_with_index(implementation_method_ids, item)
 			or (
 				not trait_id_is_compiler_builtin(item.trait_id)
@@ -635,12 +663,15 @@ pure func accepted_trait_implementation_table(
 				module_key,
 				definitions.set(definition_id, implementation_index),
 			)
-			owner_key = module_identity_storage_key(impl_id_module_identity(item.id))
-			implementation_indices_by_module_identity = implementation_indices_by_module_identity.set(
-				owner_key,
-				implementation_indices_by_module_identity
-					.get_or(owner_key, [])
+			implementation_indices_by_module_path = implementation_indices_by_module_path.set(
+				item.owner_module_path,
+				implementation_indices_by_module_path
+					.get_or(item.owner_module_path, [])
 					.append(implementation_index),
+			)
+			identity_keys_by_module_path = identity_keys_by_module_path.set(
+				item.owner_module_path,
+				module_key,
 			)
 			implementation_method_ids = index_implementation_method_ids(
 				implementation_method_ids,
@@ -752,8 +783,8 @@ pure func accepted_trait_implementation_table(
 					trait_indices_by_module_and_definition_id = trait_indices,
 					trait_index_by_compiler_identity = trait_index_by_compiler_identity,
 					implementation_indices_by_module_and_definition_id = implementation_indices,
-					trait_indices_by_module_identity = trait_indices_by_module_identity,
-					implementation_indices_by_module_identity = implementation_indices_by_module_identity
+					trait_indices_by_module_path = trait_indices_by_module_path,
+					implementation_indices_by_module_path = implementation_indices_by_module_path
 				}))
 	else:
 		None
@@ -761,15 +792,12 @@ pure func accepted_trait_implementation_table(
 
 pure func accepted_trait_ids_for_owner(
 	table: AcceptedTraitImplementationTable,
-	owner: ModuleIdentity,
+	owner_module_path: String,
 ) -> List[TraitId]:
 	representation = table_rep(table)
 	var result: List[TraitId] = []
 
-	for index in representation.trait_indices_by_module_identity.get_or(
-		module_identity_storage_key(owner),
-		[],
-	):
+	for index in representation.trait_indices_by_module_path.get_or(owner_module_path, []):
 		match representation.traits.get(index):
 			Some(item):
 				result = result.append(item.id)
@@ -781,15 +809,12 @@ pure func accepted_trait_ids_for_owner(
 
 pure func accepted_implementation_definition_ids_for_owner(
 	table: AcceptedTraitImplementationTable,
-	owner: ModuleIdentity,
+	owner_module_path: String,
 ) -> List[AcceptedImplementationDefinitionIds]:
 	representation = table_rep(table)
 	var result: List[AcceptedImplementationDefinitionIds] = []
 
-	for index in representation.implementation_indices_by_module_identity.get_or(
-		module_identity_storage_key(owner),
-		[],
-	):
+	for index in representation.implementation_indices_by_module_path.get_or(owner_module_path, []):
 		match representation.implementations.get(index):
 			Some(item):
 				result = result.append({
@@ -925,10 +950,10 @@ private pure func table_trait_ids_semantically_equivalent(
 
 
 private pure func implementation_type_label(
-	owner: ModuleIdentity,
+	owner_module_path: String,
 	item: AcceptedImplementationTableRecord,
 ) -> String:
-	for_type = if module_identities_equal(impl_id_module_identity(item.id), owner):
+	for_type = if item.owner_module_path == owner_module_path:
 		localize_module_types(item.owner_module_path, item.instance.for_type)
 	else:
 		item.instance.for_type
@@ -942,9 +967,9 @@ private pure func implementation_type_label(
 
 pure func accepted_trait_implementation_authority(
 	table: AcceptedTraitImplementationTable,
-	owner: ModuleIdentity,
+	owner_module_path: String,
 	bindings: List[AcceptedVisibleTraitBinding],
-	direct_module_identities: List[ModuleIdentity],
+	direct_module_paths: List[String],
 ) -> AcceptedTraitImplementationAuthority:
 	representation = table_rep(table)
 	var visible_traits: Dict[String, Int] = {}
@@ -961,10 +986,8 @@ pure func accepted_trait_implementation_authority(
 	var trait_name_by_method_name: Dict[String, String] = {}
 	var preparation_errors: List[String] = []
 
-	for module_identity in direct_module_identities:
-		module_key = module_identity_storage_key(module_identity)
-
-		for index in representation.trait_indices_by_module_identity.get_or(module_key, []):
+	for module_path in direct_module_paths:
+		for index in representation.trait_indices_by_module_path.get_or(module_path, []):
 			match representation.traits.get(index):
 				Some(item):
 					if item.visibility == PublicDeclaration:
@@ -972,9 +995,7 @@ pure func accepted_trait_implementation_authority(
 				None:
 					void
 
-	owner_key = module_identity_storage_key(owner)
-
-	for index in representation.trait_indices_by_module_identity.get_or(owner_key, []):
+	for index in representation.trait_indices_by_module_path.get_or(owner_module_path, []):
 		visible_trait_indices = append_unique_index(visible_trait_indices, index)
 
 	var visible_trait_index_set: Dict[Int, Bool] = {}
@@ -982,7 +1003,7 @@ pure func accepted_trait_implementation_authority(
 	for index in visible_trait_indices:
 		visible_trait_index_set = visible_trait_index_set.set(index, True)
 
-	for index in representation.trait_indices_by_module_identity.get_or(owner_key, []):
+	for index in representation.trait_indices_by_module_path.get_or(owner_module_path, []):
 		match representation.traits.get(index):
 			Some(item):
 				visible_traits = visible_traits.set(item.definition.name, index)
@@ -1048,13 +1069,8 @@ pure func accepted_trait_implementation_authority(
 			None:
 				void
 
-	for module_identity in direct_module_identities:
-		module_key = module_identity_storage_key(module_identity)
-
-		for index in representation.implementation_indices_by_module_identity.get_or(
-			module_key,
-			[],
-		):
+	for module_path in direct_module_paths:
+		for index in representation.implementation_indices_by_module_path.get_or(module_path, []):
 			match representation.implementations.get(index):
 				Some(item):
 					if item.visibility == PublicDeclaration:
@@ -1065,7 +1081,7 @@ pure func accepted_trait_implementation_authority(
 				None:
 					void
 
-	for index in representation.implementation_indices_by_module_identity.get_or(owner_key, []):
+	for index in representation.implementation_indices_by_module_path.get_or(owner_module_path, []):
 		visible_implementations = append_unique_index(visible_implementations, index)
 
 	var prior_visible_implementation_indices: Dict[Int, Bool] = {}
@@ -1087,7 +1103,7 @@ pure func accepted_trait_implementation_authority(
 				if conflict:
 					preparation_errors = preparation_errors.append(
 						"conflicting implementation of trait '" + item.instance.trait_name + "' for type '" + implementation_type_label(
-							owner,
+							owner_module_path,
 							item,
 						) + "'",
 					)
@@ -1187,7 +1203,7 @@ pure func accepted_trait_implementation_authority(
 
 	into_opaque AcceptedTraitImplementationAuthority({
 			table = table,
-			owner = owner,
+			owner_module_path = owner_module_path,
 			visible_trait_indices = visible_trait_indices,
 			trait_indices_by_semantic_name = semantic_traits,
 			visible_trait_indices_by_name = visible_traits,
@@ -1233,7 +1249,7 @@ private pure func trait_for_authority(
 	authority: AcceptedTraitImplementationAuthorityRep,
 	item: AcceptedTraitTableRecord,
 ) -> TraitDef:
-	if module_identities_equal(trait_id_module_identity(item.id), authority.owner):
+	if item.owner_module_path == authority.owner_module_path:
 		{ item.definition |
 			methods = item.definition.methods.map(
 				func(method): localized_trait_method(item.owner_module_path, method),
@@ -1371,10 +1387,7 @@ private pure func table_find_trait_method_seen(
 			match item.method_ids.get(indexed[0]):
 				Some(method_id):
 					if trait_method_id_name(method_id) == method_name:
-						signature = if module_identities_equal(
-							trait_id_module_identity(item.id),
-							authority.owner,
-						):
+						signature = if item.owner_module_path == authority.owner_module_path:
 							localized_trait_method(item.owner_module_path, indexed[1])
 						else:
 							indexed[1]
@@ -1520,7 +1533,7 @@ private pure func implementation_for_authority(
 	authority: AcceptedTraitImplementationAuthorityRep,
 	item: AcceptedImplementationTableRecord,
 ) -> ImplInstance:
-	if module_identities_equal(impl_id_module_identity(item.id), authority.owner):
+	if item.owner_module_path == authority.owner_module_path:
 		{ item.instance |
 			for_type = localize_module_types(item.owner_module_path, item.instance.for_type),
 			methods = item.instance.methods.map(
@@ -1664,7 +1677,7 @@ private pure func accepted_implementation_matches_type(
 ) -> Bool:
 	representation = authority_rep(authority)
 
-	for_type = if module_identities_equal(impl_id_module_identity(item.id), representation.owner):
+	for_type = if item.owner_module_path == representation.owner_module_path:
 		localize_module_types(item.owner_module_path, item.instance.for_type)
 	else:
 		item.instance.for_type
@@ -1978,10 +1991,7 @@ pure func accepted_find_impl_method_info(
 										False
 
 						if implements_requested_slot:
-							method = if module_identities_equal(
-								impl_id_module_identity(item.id),
-								representation.owner,
-							):
+							method = if item.owner_module_path == representation.owner_module_path:
 								localized_implementation_method(item.owner_module_path, indexed[1])
 							else:
 								indexed[1]
@@ -2060,10 +2070,7 @@ pure func accepted_find_qualified_trait_method_info(
 												False
 
 										if implements_requested_slot:
-											implementation_method = if module_identities_equal(
-												impl_id_module_identity(item.id),
-												representation.owner,
-											):
+											implementation_method = if item.owner_module_path == representation.owner_module_path:
 												localized_implementation_method(
 													item.owner_module_path,
 													indexed[1],

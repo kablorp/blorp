@@ -29,6 +29,19 @@ UNION_GRAPH = (
 TYPE_HEADER_INSTALL = (
     ROOT / "blorp/src/compiler/stage_06_typecheck/headers/type_header_install.brp"
 )
+TYPE_HEADER_GRAPH = (
+    ROOT / "blorp/src/compiler/stage_06_typecheck/headers/type_header_graph.brp"
+)
+GLOBAL_HEADER_COMPLETION = (
+    ROOT
+    / "blorp/src/compiler/stage_06_typecheck/headers/global_header_completion.brp"
+)
+DECLARATION_SKELETON = (
+    ROOT / "blorp/src/compiler/stage_06_typecheck/headers/declaration_skeleton.brp"
+)
+SEMANTIC_OCCURRENCE = (
+    ROOT / "blorp/src/compiler/stage_06_typecheck/graph/semantic_occurrence.brp"
+)
 GLOBAL_AUTHORITY = (
     ROOT
     / "blorp/src/compiler/stage_06_typecheck/type_system/accepted_global_authority.brp"
@@ -219,6 +232,338 @@ class DeclarationCatalogBoundaryTests(unittest.TestCase):
         self.assertIn("definition_index_find_source_definition_id", body)
         self.assertNotIn("typecheck_state_for_prepared_module_scope", body)
 
+    def test_request_scope_is_validated_before_dense_environment_lookup(self) -> None:
+        decl_source = DECL.read_text(encoding="utf-8")
+        function = re.search(
+            r"private pure func graph_facts_typecheck_module\(.*?"
+            r"(?=\n\npure func accepted_graph_typecheck_module)",
+            decl_source,
+            re.DOTALL,
+        )
+
+        self.assertIsNotNone(function)
+        body = function.group(0)
+        self.assertIn("prepared_module_environment_find_for_scope", body)
+        self.assertNotIn("prepared_module_scope_id(request_scope)", body)
+
+    def test_declaration_catalog_indexes_use_the_bound_graph_module_table(self) -> None:
+        source = (
+            ROOT / "blorp/src/compiler/stage_06_typecheck/headers/declaration_catalog.brp"
+        ).read_text(encoding="utf-8")
+        representation = re.search(
+            r"private record AcceptedDeclarationCatalogRep \{.*?\n\}",
+            source,
+            re.DOTALL,
+        )
+
+        self.assertIsNotNone(representation)
+        body = representation.group(0)
+        self.assertIn("bound_graph: BoundModuleGraph", body)
+        self.assertIn("type_index_by_module_and_name: List[Dict[String, Int]]", body)
+        self.assertIn(
+            "callable_index_by_definition_id: Dict[Int, Int]",
+            body,
+        )
+        self.assertIn(
+            "implementation_method_index_by_owner_and_callable: "
+            "Dict[Int, Dict[Int, Int]]",
+            body,
+        )
+        self.assertNotIn("Dict[String, Dict", body)
+        self.assertNotIn("by_module_and_definition_id", body)
+        self.assertNotIn("module_identity_storage_key", source)
+
+    def test_callable_authority_does_not_duplicate_module_identity_indexes(self) -> None:
+        source = CALLABLE_AUTHORITY.read_text(encoding="utf-8")
+        table = re.search(
+            r"private record AcceptedCallableTableRep \{.*?\n\}",
+            source,
+            re.DOTALL,
+        )
+        authority = re.search(
+            r"private record AcceptedCallableAuthorityRep \{.*?\n\}",
+            source,
+            re.DOTALL,
+        )
+
+        self.assertIsNotNone(table)
+        self.assertIsNotNone(authority)
+        self.assertIn(
+            "indices_by_definition_id: Dict[Int, List[Int]]", table.group(0)
+        )
+        self.assertIn("indices_by_module_path_and_name", table.group(0))
+        self.assertNotIn("indices_by_module_and_name", table.group(0))
+        self.assertIn("owner_module_path: Option[String]", authority.group(0))
+        self.assertNotIn("ModuleIdentity", source)
+        self.assertNotIn("identity_keys_by_module_path", table.group(0))
+
+    def test_global_authority_locality_uses_the_existing_module_path_index(self) -> None:
+        source = (
+            ROOT
+            / "blorp/src/compiler/stage_06_typecheck/type_system/accepted_global_authority.brp"
+        ).read_text(encoding="utf-8")
+        authority = re.search(
+            r"private record AcceptedGlobalAuthorityRep \{.*?\n\}",
+            source,
+            re.DOTALL,
+        )
+
+        self.assertIsNotNone(authority)
+        self.assertIn("owner_module_path: String", authority.group(0))
+        self.assertNotIn("owner: ModuleIdentity", authority.group(0))
+        self.assertNotIn("module_identities_equal", source)
+
+    def test_trait_implementation_authority_uses_paths_for_visibility(self) -> None:
+        source = (
+            ROOT
+            / "blorp/src/compiler/stage_06_typecheck/type_system/accepted_trait_implementation_authority.brp"
+        ).read_text(encoding="utf-8")
+        table = re.search(
+            r"private record AcceptedTraitImplementationTableRep \{.*?\n\}",
+            source,
+            re.DOTALL,
+        )
+        authority = re.search(
+            r"private record AcceptedTraitImplementationAuthorityRep \{.*?\n\}",
+            source,
+            re.DOTALL,
+        )
+
+        self.assertIsNotNone(table)
+        self.assertIsNotNone(authority)
+        self.assertIn("trait_indices_by_module_path", table.group(0))
+        self.assertIn("implementation_indices_by_module_path", table.group(0))
+        self.assertNotIn("by_module_identity", table.group(0))
+        self.assertIn("owner_module_path: String", authority.group(0))
+        self.assertNotIn("owner: ModuleIdentity", authority.group(0))
+
+    def test_semantic_occurrences_store_module_owner_once(self) -> None:
+        source = SEMANTIC_OCCURRENCE.read_text(encoding="utf-8")
+        definition = re.search(
+            r"record SemanticDefinitionOccurrence \{.*?\n\}", source, re.DOTALL
+        )
+        reference = re.search(
+            r"record SemanticReferenceOccurrence \{.*?\n\}", source, re.DOTALL
+        )
+        module = re.search(
+            r"record ModuleSemanticOccurrences \{.*?\n\}", source, re.DOTALL
+        )
+        reference_walk = source[source.index("private pure func expr_reference(") :]
+
+        self.assertIsNotNone(definition)
+        self.assertIsNotNone(reference)
+        self.assertIsNotNone(module)
+        self.assertNotIn("module_identity:", definition.group(0))
+        self.assertNotIn("module_identity:", reference.group(0))
+        self.assertIn("module_identity: ModuleIdentity", module.group(0))
+        self.assertNotIn("module_identity: ModuleIdentity", reference_walk)
+
+    def test_type_header_local_queries_require_prepared_scope(self) -> None:
+        source = TYPE_HEADER_GRAPH.read_text(encoding="utf-8")
+
+        self.assertNotIn("private pure func type_header_graph_scope(", source)
+        for category in ("builtin", "record", "union", "alias"):
+            with self.subTest(category=category):
+                self.assertNotIn(
+                    f"pure func type_header_graph_local_{category}_headers(\n",
+                    source,
+                )
+
+    def test_body_outcome_index_does_not_retain_module_identity(self) -> None:
+        source = DECL.read_text(encoding="utf-8")
+        representation = re.search(
+            r"private record BodyOutcomeIndexRep \{.*?\n\}", source, re.DOTALL
+        )
+        constructor = re.search(
+            r"private pure func body_outcome_index\(.*?"
+            r"(?=\n\nprivate pure func body_outcome_index_for_base)",
+            source,
+            re.DOTALL,
+        )
+        lookup = re.search(
+            r"private pure func body_outcome_index_find\(.*?"
+            r"(?=\n\nprivate pure func body_outcome_index_find_definition_id)",
+            source,
+            re.DOTALL,
+        )
+
+        self.assertIsNotNone(representation)
+        self.assertIsNotNone(constructor)
+        self.assertIsNotNone(lookup)
+        self.assertNotIn("owner: ModuleIdentity", representation.group(0))
+        self.assertIn("owner_scope: PreparedModuleScope", constructor.group(0))
+        self.assertIn("callable_ids_equal", lookup.group(0))
+
+    def test_owned_type_resolution_reuses_prepared_module_scope(self) -> None:
+        source = TYPE_HEADER_GRAPH.read_text(encoding="utf-8")
+        preparation = re.search(
+            r"private pure func prepare_owned_type_resolution_context\(.*?"
+            r"(?=\n\nprivate pure func resolve_prepared_type_shape)",
+            source,
+            re.DOTALL,
+        )
+
+        self.assertIsNotNone(preparation)
+        self.assertIn("owner_scope: PreparedModuleScope", preparation.group(0))
+        self.assertIn("bound_module_graph_find_for_scope", preparation.group(0))
+        self.assertNotIn("owner_module_identity: ModuleIdentity", preparation.group(0))
+        self.assertNotIn("bound_module_graph_find(bound_graph", preparation.group(0))
+
+    def test_accepted_graph_fallbacks_require_prepared_scope(self) -> None:
+        for category, path in (
+            ("alias", ALIAS_GRAPH),
+            ("record", RECORD_GRAPH),
+            ("union", UNION_GRAPH),
+        ):
+            with self.subTest(category=category):
+                source = path.read_text(encoding="utf-8")
+                fallback = re.search(
+                    rf"pure func accepted_{category}_graph_canonical_authority\(.*?"
+                    rf"(?=\n\npure func)",
+                    source,
+                    re.DOTALL,
+                )
+
+                self.assertIsNotNone(fallback)
+                self.assertIn("owner_scope: PreparedModuleScope", fallback.group(0))
+                self.assertNotIn("owner: ModuleIdentity", fallback.group(0))
+
+    def test_global_header_owner_index_uses_prepared_module_ids(self) -> None:
+        source = GLOBAL_HEADER_COMPLETION.read_text(encoding="utf-8")
+        header_index = re.search(
+            r"private pure func global_header_index\(.*?"
+            r"(?=\n\nprivate pure func)",
+            source,
+            re.DOTALL,
+        )
+        header_lookup = re.search(
+            r"private pure func global_header_row_for_module_and_name\(.*?"
+            r"(?=\n\nprivate pure func)",
+            source,
+            re.DOTALL,
+        )
+
+        self.assertIn(
+            "rows_by_module_and_name: List[Dict[String, Int]]",
+            source,
+        )
+        self.assertIn("module_indexes_by_header_row: List[Int]", source)
+        self.assertIsNotNone(header_index)
+        self.assertIsNotNone(header_lookup)
+        self.assertIn("prepared_module_id_table_index", header_index.group(0))
+        self.assertIn("prepared_module_id_table_index", header_lookup.group(0))
+        self.assertNotIn("module_identity_storage_key", header_index.group(0))
+        self.assertNotIn("module_identity_storage_key", header_lookup.group(0))
+
+    def test_declaration_skeleton_lookup_is_module_table_indexed(self) -> None:
+        source = DECLARATION_SKELETON.read_text(encoding="utf-8")
+        representation = re.search(
+            r"private record DeclarationSkeletonGraphRep \{.*?\n\}",
+            source,
+            re.DOTALL,
+        )
+        type_lookup = re.search(
+            r"pure func declaration_skeleton_graph_find_type\(.*?"
+            r"(?=\n\npure func)",
+            source,
+            re.DOTALL,
+        )
+        bucket_lookup = re.search(
+            r"private pure func declaration_skeleton_graph_find_module_name_kind\(.*?"
+            r"(?=\n\npure func)",
+            source,
+            re.DOTALL,
+        )
+
+        self.assertIsNotNone(representation)
+        self.assertIsNotNone(type_lookup)
+        self.assertIsNotNone(bucket_lookup)
+        self.assertIn("module_ids_by_skeleton", representation.group(0))
+        self.assertIn("latest_skeleton_index_by_name", representation.group(0))
+        self.assertIn("previous_same_name_index_by_skeleton", representation.group(0))
+        self.assertNotIn("Dict[String, List[Int]]", representation.group(0))
+        self.assertNotIn("skeletons_by_name", representation.group(0))
+        self.assertIn("module_scope: PreparedModuleScope", type_lookup.group(0))
+        self.assertIn("bound_module_graph_find_for_scope", bucket_lookup.group(0))
+        self.assertIn("latest_skeleton_index_by_name", bucket_lookup.group(0))
+        self.assertIn("previous_same_name_index_by_skeleton", bucket_lookup.group(0))
+        self.assertIn("prepared_module_ids_equal", bucket_lookup.group(0))
+        self.assertNotIn("module_identities_equal", bucket_lookup.group(0))
+        self.assertNotIn("TypeNamespaceKey(ModuleIdentity", source)
+        self.assertNotIn("TraitNamespaceKey(ModuleIdentity", source)
+
+    def test_accepted_type_views_do_not_retain_materialized_module_owners(self) -> None:
+        authority_sources = {
+            "alias": ALIAS_AUTHORITY.read_text(encoding="utf-8"),
+            "record": (
+                ROOT
+                / "blorp/src/compiler/stage_06_typecheck/type_system/accepted_record_authority.brp"
+            ).read_text(encoding="utf-8"),
+            "union": (
+                ROOT
+                / "blorp/src/compiler/stage_06_typecheck/type_system/accepted_union_authority.brp"
+            ).read_text(encoding="utf-8"),
+        }
+
+        for category, source in authority_sources.items():
+            with self.subTest(category=category):
+                view = re.search(
+                    rf"private record Accepted{category.title()}ModuleViewRep \{{.*?\n\}}",
+                    source,
+                    re.DOTALL,
+                )
+                self.assertIsNotNone(view)
+                self.assertNotIn("owner: ModuleIdentity", view.group(0))
+
+        alias_authority = re.search(
+            r"record AcceptedAliasAuthority \{.*?\n\}",
+            authority_sources["alias"],
+            re.DOTALL,
+        )
+        record_authority = re.search(
+            r"private record AcceptedRecordAuthorityRep \{.*?\n\}",
+            authority_sources["record"],
+            re.DOTALL,
+        )
+        self.assertIsNotNone(alias_authority)
+        self.assertIsNotNone(record_authority)
+        self.assertNotIn("owner: ModuleIdentity", alias_authority.group(0))
+        self.assertNotIn("owner: ModuleIdentity", record_authority.group(0))
+        self.assertIn(
+            "private type alias AcceptedRecordLocator = Int",
+            authority_sources["record"],
+        )
+        self.assertNotIn("struct AcceptedRecordLocator", authority_sources["record"])
+        self.assertIn("accepted_record_locator_owner_local", authority_sources["record"])
+
+        for source in authority_sources.values():
+            self.assertNotIn("_empty_module_view(owner", source)
+
+    def test_recoverable_completion_failures_store_graph_module_ids(self) -> None:
+        source = DECL.read_text(encoding="utf-8")
+        failure = re.search(
+            r"private record GlobalHeaderCompletionFailure \{.*?\n\}",
+            source,
+            re.DOTALL,
+        )
+        failed_lookup = re.search(
+            r"private pure func completion_failed_for_module\(.*?"
+            r"(?=\n\npure func recoverable_graph_typecheck_module)",
+            source,
+            re.DOTALL,
+        )
+
+        self.assertIsNotNone(failure)
+        self.assertIsNotNone(failed_lookup)
+        self.assertIn("module_id: Option[PreparedModuleId]", failure.group(0))
+        self.assertNotIn("module_identity", failure.group(0))
+        self.assertIn("module_id: PreparedModuleId", failed_lookup.group(0))
+        self.assertIn("prepared_module_ids_equal", failed_lookup.group(0))
+        self.assertNotIn("module_identities_equal", failed_lookup.group(0))
+        self.assertIn("failure_owner_missing", source)
+        self.assertIn("global header completion failure owner is absent from ", source)
+        self.assertIn('+ "the module table"', source)
+
     def test_global_table_completion_failure_is_not_silently_discarded(self) -> None:
         decl_source = DECL.read_text(encoding="utf-8")
 
@@ -313,7 +658,8 @@ class DeclarationCatalogBoundaryTests(unittest.TestCase):
             ),
             1,
         )
-        self.assertIn("base_indices_by_module", graph_preparation.group(0))
+        self.assertIn("base_positions_by_module_id", graph_preparation.group(0))
+        self.assertNotIn("base_indices_by_module", graph_preparation.group(0))
 
 if __name__ == "__main__":
     unittest.main()

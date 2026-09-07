@@ -48,22 +48,30 @@ import:
 		definition_index_find_func_callable_id,
 		definition_index_find_source_definition_id,
 		definition_index_func_callables_at_span,
-	../graph/indexed_graph: indexed_graph_definition_index
+	../graph/indexed_graph:
+		PreparedModuleId,
+		PreparedModuleScope,
+		indexed_graph_definition_index,
+		prepared_module_ids_equal,
+		prepared_module_scope_id,
 	../graph/type_identity:
 		TypeId,
 		type_id,
-		type_id_module_identity,
+		type_id_module_id,
 		type_id_name,
 		type_id_source_span,
 		type_ids_equal,
 	../modules/bound_module_graph:
 		BoundModule,
 		BoundModuleGraph,
+		bound_module_graph_find,
+		bound_module_graph_find_for_scope,
 		bound_module_graph_indexed_graph,
 		bound_module_graph_modules,
 		bound_module_graph_target,
 		bound_module_identity,
 		bound_module_program,
+		bound_module_scope,
 	../type_system/builtins: builtin_trait_is_prelude, builtin_trait_supertraits
 
 
@@ -215,13 +223,13 @@ record ImplementationDeclarationSkeletonInfo {
 
 
 union DeclarationSkeletonGraphError:
-	CallableSkeletonMissingDefinition(ModuleIdentity, String, SourceSpan)
-	ConstructorSkeletonMissingDefinition(ModuleIdentity, String, String, SourceSpan)
-	TraitSkeletonMissingDefinition(ModuleIdentity, String, SourceSpan)
-	ImplementationSkeletonMissingDefinition(ModuleIdentity, String, SourceSpan)
-	DuplicateTypeDeclaration(ModuleIdentity, String, SourceSpan)
-	DuplicateTraitDeclaration(ModuleIdentity, String, SourceSpan)
-	DuplicateConstructorDeclaration(TypeId, String, SourceSpan)
+	CallableSkeletonMissingDefinition(String, String, SourceSpan)
+	ConstructorSkeletonMissingDefinition(String, String, String, SourceSpan)
+	TraitSkeletonMissingDefinition(String, String, SourceSpan)
+	ImplementationSkeletonMissingDefinition(String, String, SourceSpan)
+	DuplicateTypeDeclaration(String, String, SourceSpan)
+	DuplicateTraitDeclaration(String, String, SourceSpan)
+	DuplicateConstructorDeclaration(String, TypeId, String, SourceSpan)
 	DuplicateDeclarationSkeleton(DeclarationId)
 
 
@@ -230,15 +238,17 @@ union DeclarationSkeletonGraphError:
 -- name-indexed header resolution can begin. Callable overloads deliberately do
 -- not have a key here.
 private union DeclarationNamespaceKey:
-	TypeNamespaceKey(ModuleIdentity, String)
-	TraitNamespaceKey(ModuleIdentity, String)
+	TypeNamespaceKey(String)
+	TraitNamespaceKey(String)
 	ConstructorNamespaceKey(TypeId, String)
 
 
 private record DeclarationSkeletonGraphRep {
 	bound_graph: BoundModuleGraph,
 	skeletons: List[DeclarationSkeleton],
-	skeletons_by_name: Dict[String, List[DeclarationSkeleton]]
+	module_ids_by_skeleton: List[PreparedModuleId],
+	previous_same_name_index_by_skeleton: List[Int],
+	latest_skeleton_index_by_name: Dict[String, Int]
 }
 
 
@@ -255,6 +265,7 @@ private union DeclarationSkeletonBuildItem:
 
 private record DeclarationSkeletonBuildContext {
 	module_identity: ModuleIdentity,
+	module_id: PreparedModuleId,
 	definition_index: DefinitionIndex
 }
 
@@ -498,33 +509,24 @@ pure func trait_method_id_source_span(id: TraitMethodId) -> SourceSpan:
 	from_opaque TraitMethodId(id).structural.span
 
 
-private pure func declaration_id_structural(id: DeclarationId) -> StructuralDeclarationIdRep:
+private pure func declaration_id_structural(
+	id: DeclarationId,
+) -> Option[StructuralDeclarationIdRep]:
 	match id:
-		TypeDeclarationId(type_id):
-			{
-				module_identity = type_id_module_identity(type_id),
-				name = type_id_name(type_id),
-				owner = None,
-				span = type_id_source_span(type_id)
-			}
+		TypeDeclarationId(_):
+			None
 		ConstructorDeclarationId(constructor_id):
-			from_opaque ConstructorId(constructor_id).structural
+			Some(from_opaque ConstructorId(constructor_id).structural)
 		CallableDeclarationId(callable_id):
-			from_opaque CallableId(callable_id).structural
+			Some(from_opaque CallableId(callable_id).structural)
 		TraitDeclarationId(trait_id):
-			from_opaque TraitId(trait_id).structural
+			Some(from_opaque TraitId(trait_id).structural)
 		TraitMethodDeclarationId(method_id):
-			from_opaque TraitMethodId(method_id).structural
+			Some(from_opaque TraitMethodId(method_id).structural)
 		GlobalDeclarationId(global_id):
-			from_opaque GlobalId(global_id)
+			Some(from_opaque GlobalId(global_id))
 		ImplementationDeclarationId(impl_id):
-			from_opaque ImplId(impl_id).structural
-
-
-private pure func skeleton_structural_id(
-	skeleton: DeclarationSkeleton,
-) -> StructuralDeclarationIdRep:
-	declaration_id_structural(declaration_skeleton_id(skeleton))
+			Some(from_opaque ImplId(impl_id).structural)
 
 
 pure func declaration_skeleton_id(skeleton: DeclarationSkeleton) -> DeclarationId:
@@ -564,7 +566,13 @@ pure func declaration_skeleton_kind(skeleton: DeclarationSkeleton) -> Declaratio
 
 
 pure func declaration_skeleton_name(skeleton: DeclarationSkeleton) -> String:
-	skeleton_structural_id(skeleton).name
+	match skeleton:
+		TypeDeclarationSkeleton(id, _, _):
+			type_id_name(id)
+		_:
+			declaration_id_structural(declaration_skeleton_id(skeleton))
+				.map(func(structural): structural.name)
+				.get_or("")
 
 
 pure func declaration_skeleton_visibility(skeleton: DeclarationSkeleton) -> DeclarationVisibility:
@@ -608,9 +616,9 @@ private pure func declaration_namespace_key(
 ) -> Option[DeclarationNamespaceKey]:
 	match skeleton:
 		TypeDeclarationSkeleton(id, _, _):
-			Some(TypeNamespaceKey(type_id_module_identity(id), type_id_name(id)))
+			Some(TypeNamespaceKey(type_id_name(id)))
 		TraitDeclarationSkeleton(id, _, _):
-			Some(TraitNamespaceKey(trait_id_module_identity(id), trait_id_name(id)))
+			Some(TraitNamespaceKey(trait_id_name(id)))
 		ConstructorDeclarationSkeleton(_, _, parent_type_id, source):
 			Some(ConstructorNamespaceKey(parent_type_id, source.name.text))
 		_:
@@ -622,10 +630,10 @@ private pure func declaration_namespace_keys_equal(
 	right: DeclarationNamespaceKey,
 ) -> Bool:
 	match (left, right):
-		(TypeNamespaceKey(left_module, left_name), TypeNamespaceKey(right_module, right_name)):
-			left_name == right_name and module_identities_equal(left_module, right_module)
-		(TraitNamespaceKey(left_module, left_name), TraitNamespaceKey(right_module, right_name)):
-			left_name == right_name and module_identities_equal(left_module, right_module)
+		(TypeNamespaceKey(left_name), TypeNamespaceKey(right_name)):
+			left_name == right_name
+		(TraitNamespaceKey(left_name), TraitNamespaceKey(right_name)):
+			left_name == right_name
 		(ConstructorNamespaceKey(left_parent, left_name), ConstructorNamespaceKey(right_parent, right_name)):
 			left_name == right_name and type_ids_equal(left_parent, right_parent)
 		_:
@@ -633,17 +641,23 @@ private pure func declaration_namespace_keys_equal(
 
 
 private pure func duplicate_namespace_error(
+	module_identity: ModuleIdentity,
 	skeleton: DeclarationSkeleton,
 ) -> DeclarationSkeletonGraphError:
-	structural = skeleton_structural_id(skeleton)
+	module_path = module_identity_display_name(module_identity)
 
 	match skeleton:
-		TypeDeclarationSkeleton(_, _, _):
-			DuplicateTypeDeclaration(structural.module_identity, structural.name, structural.span)
-		TraitDeclarationSkeleton(_, _, _):
-			DuplicateTraitDeclaration(structural.module_identity, structural.name, structural.span)
-		ConstructorDeclarationSkeleton(_, _, parent_type_id, _):
-			DuplicateConstructorDeclaration(parent_type_id, structural.name, structural.span)
+		TypeDeclarationSkeleton(id, _, _):
+			DuplicateTypeDeclaration(module_path, type_id_name(id), type_id_source_span(id))
+		TraitDeclarationSkeleton(id, _, _):
+			DuplicateTraitDeclaration(module_path, trait_id_name(id), trait_id_source_span(id))
+		ConstructorDeclarationSkeleton(id, _, parent_type_id, _):
+			DuplicateConstructorDeclaration(
+				module_path,
+				parent_type_id,
+				from_opaque ConstructorId(id).structural.name,
+				constructor_id_source_span(id),
+			)
 		_:
 			DuplicateDeclarationSkeleton(declaration_skeleton_id(skeleton))
 
@@ -662,7 +676,7 @@ private pure func function_skeleton_build_items(
 			[
 				DeclarationSkeletonBuildError(
 					CallableSkeletonMissingDefinition(
-						context.module_identity,
+						module_identity_display_name(context.module_identity),
 						function_decl.name.text,
 						function_decl.span,
 					),
@@ -691,7 +705,7 @@ private pure func foreign_function_skeleton_build_items(
 			[
 				DeclarationSkeletonBuildError(
 					CallableSkeletonMissingDefinition(
-						context.module_identity,
+						module_identity_display_name(context.module_identity),
 						function_decl.name.text,
 						function_decl.span,
 					),
@@ -721,7 +735,7 @@ private pure func union_skeleton_build_items(
 	visibility: DeclarationVisibility,
 	union_decl: ParsedUnionDecl,
 ) -> List[DeclarationSkeletonBuildItem]:
-	type_id = type_id(context.module_identity, union_decl.name.text, union_decl.span)
+	type_id = type_id(context.module_id, union_decl.name.text, union_decl.span)
 	var items: List[DeclarationSkeletonBuildItem] = [
 		DeclarationSkeletonCandidate(
 			TypeDeclarationSkeleton(
@@ -746,7 +760,7 @@ private pure func union_skeleton_build_items(
 				items = items.append(
 					DeclarationSkeletonBuildError(
 						ConstructorSkeletonMissingDefinition(
-							context.module_identity,
+							module_identity_display_name(context.module_identity),
 							union_decl.name.text,
 							variant.name.text,
 							variant.span,
@@ -793,7 +807,7 @@ private pure func trait_skeleton_build_items(
 			[
 				DeclarationSkeletonBuildError(
 					TraitSkeletonMissingDefinition(
-						context.module_identity,
+						module_identity_display_name(context.module_identity),
 						trait_decl.name.text,
 						trait_decl.span,
 					),
@@ -866,7 +880,7 @@ private pure func implementation_skeleton_build_items(
 			[
 				DeclarationSkeletonBuildError(
 					ImplementationSkeletonMissingDefinition(
-						context.module_identity,
+						module_identity_display_name(context.module_identity),
 						impl_decl.trait_name.text,
 						impl_decl.span,
 					),
@@ -943,7 +957,7 @@ private pure func type_skeleton_build_items(
 	span: SourceSpan,
 	source: TypeDeclarationSource,
 ) -> List[DeclarationSkeletonBuildItem]:
-	id = type_id(context.module_identity, name, span)
+	id = type_id(context.module_id, name, span)
 	[DeclarationSkeletonCandidate(TypeDeclarationSkeleton(id, visibility, source))]
 
 
@@ -1044,6 +1058,7 @@ private pure func module_skeleton_build_items(
 	else:
 		context: DeclarationSkeletonBuildContext = {
 			module_identity = bound_module_identity(module),
+			module_id = prepared_module_scope_id(bound_module_scope(module)),
 			definition_index = definition_index
 		}
 		program.decls.flat_map(func(decl):
@@ -1053,47 +1068,91 @@ private pure func module_skeleton_build_items(
 
 private pure func validate_skeleton_build_items(
 	bound_graph: BoundModuleGraph,
-	items: List[DeclarationSkeletonBuildItem],
+	definition_index: DefinitionIndex,
 ) -> Result[DeclarationSkeletonGraph, List[DeclarationSkeletonGraphError]]:
 	var skeletons: List[DeclarationSkeleton] = []
-	var skeletons_by_name: Dict[String, List[DeclarationSkeleton]] = {}
+	var module_ids_by_skeleton: List[PreparedModuleId] = []
+	var previous_same_name_index_by_skeleton: List[Int] = []
+	var latest_skeleton_index_by_name: Dict[String, Int] = {}
 	var errors: List[DeclarationSkeletonGraphError] = []
+	target = bound_module_graph_target(bound_graph)
+	modules = bound_module_graph_modules(bound_graph)
+	var module_position: Int = -1
 
-	for item in items:
-		match item:
-			DeclarationSkeletonBuildError(error):
-				errors = errors.append(error)
-			DeclarationSkeletonCandidate(skeleton):
-				id = declaration_skeleton_id(skeleton)
-				name = declaration_id_structural(id).name
-				name_bucket = skeletons_by_name.get_or(name, [])
-				exact_duplicate = name_bucket.any(
-					func(existing): declaration_ids_equal(declaration_skeleton_id(existing), id),
-				)
-				namespace_key = declaration_namespace_key(skeleton)
+	while module_position < modules.length():
+		module = if module_position < 0:
+			target
+		else:
+			modules.get_or(module_position, target)
 
-				namespace_duplicate = match namespace_key:
-					None:
-						False
-					Some(key):
-						name_bucket.any(func(existing):
-							match declaration_namespace_key(existing):
-								Some(existing_key):
-									declaration_namespace_keys_equal(existing_key, key)
-								None:
-									False
+		module_id = prepared_module_scope_id(bound_module_scope(module))
+
+		for item in module_skeleton_build_items(definition_index, module):
+			match item:
+				DeclarationSkeletonBuildError(error):
+					errors = errors.append(error)
+				DeclarationSkeletonCandidate(skeleton):
+					id = declaration_skeleton_id(skeleton)
+					name = declaration_skeleton_name(skeleton)
+					namespace_key = declaration_namespace_key(skeleton)
+					var exact_duplicate: Bool = False
+					var namespace_duplicate: Bool = False
+					var existing_index = latest_skeleton_index_by_name.get_or(name, -1)
+
+					while existing_index >= 0 and not (exact_duplicate or namespace_duplicate):
+						match (
+							skeletons.get(existing_index),
+							module_ids_by_skeleton.get(existing_index),
+						):
+							(Some(existing), Some(existing_module_id)):
+								if prepared_module_ids_equal(existing_module_id, module_id):
+									exact_duplicate = declaration_ids_equal(
+										declaration_skeleton_id(existing),
+										id,
+									)
+
+									match (namespace_key, declaration_namespace_key(existing)):
+										(Some(key), Some(existing_key)):
+											namespace_duplicate = declaration_namespace_keys_equal(
+												existing_key,
+												key,
+											)
+										_:
+											void
+							_:
+								void
+
+						existing_index = previous_same_name_index_by_skeleton.get_or(
+							existing_index,
+							-1,
 						)
 
-				if namespace_duplicate:
-					errors = errors.append(duplicate_namespace_error(skeleton))
-				else if exact_duplicate:
-					errors = errors.append(DuplicateDeclarationSkeleton(id))
-				else:
-					skeletons = skeletons.append(skeleton)
-					skeletons_by_name = skeletons_by_name.set(
-						name,
-						name_bucket.append(skeleton),
-					)
+					if namespace_duplicate:
+						errors = errors.append(
+							duplicate_namespace_error(
+								bound_module_identity(module),
+								skeleton,
+							),
+						)
+					else if exact_duplicate:
+						errors = errors.append(DuplicateDeclarationSkeleton(id))
+					else:
+						skeleton_index = skeletons.length()
+						skeletons = skeletons.append(skeleton)
+						module_ids_by_skeleton = module_ids_by_skeleton.append(module_id)
+						previous_same_name_index_by_skeleton = previous_same_name_index_by_skeleton.append(
+							latest_skeleton_index_by_name.get_or(
+								name,
+								-1,
+							),
+						)
+
+						latest_skeleton_index_by_name = latest_skeleton_index_by_name.set(
+							name,
+							skeleton_index,
+						)
+
+		module_position += 1
 
 	if errors.length() > 0:
 		Err(errors)
@@ -1101,7 +1160,9 @@ private pure func validate_skeleton_build_items(
 		representation: DeclarationSkeletonGraphRep = {
 			bound_graph = bound_graph,
 			skeletons = skeletons,
-			skeletons_by_name = skeletons_by_name
+			module_ids_by_skeleton = module_ids_by_skeleton,
+			previous_same_name_index_by_skeleton = previous_same_name_index_by_skeleton,
+			latest_skeleton_index_by_name = latest_skeleton_index_by_name
 		}
 		Ok(into_opaque DeclarationSkeletonGraph(representation))
 
@@ -1110,15 +1171,7 @@ pure func declaration_skeleton_graph_build(
 	bound_graph: BoundModuleGraph,
 ) -> Result[DeclarationSkeletonGraph, List[DeclarationSkeletonGraphError]]:
 	definition_index = indexed_graph_definition_index(bound_module_graph_indexed_graph(bound_graph))
-	var items = module_skeleton_build_items(
-		definition_index,
-		bound_module_graph_target(bound_graph),
-	)
-
-	for module in bound_module_graph_modules(bound_graph):
-		items = items.concat(module_skeleton_build_items(definition_index, module))
-
-	validate_skeleton_build_items(bound_graph, items)
+	validate_skeleton_build_items(bound_graph, definition_index)
 
 
 private pure func declaration_skeleton_graph_rep(
@@ -1272,50 +1325,98 @@ pure func declaration_skeleton_graph_implementation_skeletons(
 	implementation_skeletons
 
 
-pure func declaration_skeleton_graph_find_type(
+private pure func declaration_skeleton_graph_find_module_name_kind(
 	graph: DeclarationSkeletonGraph,
-	module_identity: ModuleIdentity,
+	module_scope: PreparedModuleScope,
 	name: String,
-) -> Option[TypeDeclarationSkeletonInfo]:
-	var result: Option[TypeDeclarationSkeletonInfo] = None
+	kind: DeclarationSkeletonKind,
+) -> Option[DeclarationSkeleton]:
+	representation = declaration_skeleton_graph_rep(graph)
+	owned_module ?= bound_module_graph_find_for_scope(representation.bound_graph, module_scope)
+	module_id = prepared_module_scope_id(bound_module_scope(owned_module))
+	var result: Option[DeclarationSkeleton] = None
+	var index = representation.latest_skeleton_index_by_name.get_or(name, -1)
 
-	for skeleton in declaration_skeleton_graph_rep(graph).skeletons_by_name.get_or(name, []):
-		match skeleton:
-			TypeDeclarationSkeleton(id, visibility, source):
-				if module_identities_equal(type_id_module_identity(id), module_identity):
-					result = Some({
-						id = id,
-						visibility = visibility,
-						source = source,
-					})
+	while index >= 0 and result.is_none():
+		match (
+			representation.skeletons.get(index),
+			representation.module_ids_by_skeleton.get(index),
+		):
+			(Some(skeleton), Some(skeleton_module_id)):
+				if (
+					prepared_module_ids_equal(skeleton_module_id, module_id)
+					and declaration_skeleton_kind(skeleton) == kind
+				):
+					result = Some(skeleton)
 					break
 			_:
 				void
 
+		index = representation.previous_same_name_index_by_skeleton.get_or(index, -1)
+
 	result
+
+
+pure func declaration_skeleton_graph_find_type(
+	graph: DeclarationSkeletonGraph,
+	module_scope: PreparedModuleScope,
+	name: String,
+) -> Option[TypeDeclarationSkeletonInfo]:
+	match declaration_skeleton_graph_find_module_name_kind(
+		graph,
+		module_scope,
+		name,
+		TypeSkeletonKind,
+	):
+		Some(TypeDeclarationSkeleton(id, visibility, source)):
+			Some({
+				id = id,
+				visibility = visibility,
+				source = source,
+			})
+		_:
+			None
 
 
 pure func declaration_skeleton_graph_find_trait(
 	graph: DeclarationSkeletonGraph,
-	module_identity: ModuleIdentity,
+	module_scope: PreparedModuleScope,
 	name: String,
 ) -> Option[TraitDeclarationSkeletonInfo]:
-	var result: Option[TraitDeclarationSkeletonInfo] = None
+	match declaration_skeleton_graph_find_module_name_kind(
+		graph,
+		module_scope,
+		name,
+		TraitSkeletonKind,
+	):
+		Some(TraitDeclarationSkeleton(id, visibility, source)):
+			Some({
+				id = id,
+				visibility = visibility,
+				source = source,
+			})
+		_:
+			None
 
-	for skeleton in declaration_skeleton_graph_rep(graph).skeletons_by_name.get_or(name, []):
-		match skeleton:
-			TraitDeclarationSkeleton(id, visibility, source):
-				if module_identities_equal(trait_id_module_identity(id), module_identity):
-					result = Some({
-						id = id,
-						visibility = visibility,
-						source = source,
-					})
-					break
-			_:
-				void
 
-	result
+private pure func declaration_id_module_id(
+	graph: DeclarationSkeletonGraph,
+	id: DeclarationId,
+) -> Option[PreparedModuleId]:
+	match id:
+		TypeDeclarationId(type_id):
+			Some(type_id_module_id(type_id))
+		_:
+			match declaration_id_structural(id):
+				None:
+					None
+				Some(structural):
+					bound_module_graph_find(
+						declaration_skeleton_graph_bound_graph(graph),
+						structural.module_identity,
+					).map(
+						func(module): prepared_module_scope_id(bound_module_scope(module)),
+					)
 
 
 pure func declaration_skeleton_graph_find(
@@ -1323,47 +1424,57 @@ pure func declaration_skeleton_graph_find(
 	id: DeclarationId,
 ) -> Option[DeclarationSkeleton]:
 	var result: Option[DeclarationSkeleton] = None
-	name = declaration_id_structural(id).name
+	representation = declaration_skeleton_graph_rep(graph)
 
-	for skeleton in declaration_skeleton_graph_rep(graph).skeletons_by_name.get_or(name, []):
-		if declaration_ids_equal(declaration_skeleton_id(skeleton), id):
-			result = Some(skeleton)
-			break
+	name = match id:
+		TypeDeclarationId(type_id):
+			type_id_name(type_id)
+		_:
+			declaration_id_structural(id)
+				.map(func(structural): structural.name)
+				.get_or("")
+
+	module_id ?= declaration_id_module_id(graph, id)
+
+	var index = representation.latest_skeleton_index_by_name.get_or(name, -1)
+
+	while index >= 0 and result.is_none():
+		match (
+			representation.skeletons.get(index),
+			representation.module_ids_by_skeleton.get(index),
+		):
+			(Some(skeleton), Some(skeleton_module_id)):
+				if (
+					prepared_module_ids_equal(skeleton_module_id, module_id)
+					and declaration_ids_equal(declaration_skeleton_id(skeleton), id)
+				):
+					result = Some(skeleton)
+					break
+			_:
+				void
+
+		index = representation.previous_same_name_index_by_skeleton.get_or(index, -1)
 
 	result
 
 
 pure func declaration_skeleton_graph_error_message(error: DeclarationSkeletonGraphError) -> String:
 	match error:
-		CallableSkeletonMissingDefinition(module_identity, name, _):
-			"declaration skeleton is missing callable definition '" + name + "' in module '" + module_identity_display_name(
-				module_identity,
-			) + "'"
-		ConstructorSkeletonMissingDefinition(module_identity, owner, name, _):
-			"declaration skeleton is missing constructor definition '" + owner + "." + name + "' in module '" + module_identity_display_name(
-				module_identity,
-			) + "'"
-		TraitSkeletonMissingDefinition(module_identity, name, _):
-			"declaration skeleton is missing trait definition '" + name + "' in module '" + module_identity_display_name(
-				module_identity,
-			) + "'"
-		ImplementationSkeletonMissingDefinition(module_identity, name, _):
-			"declaration skeleton is missing implementation definition for '" + name + "' in module '" + module_identity_display_name(
-				module_identity,
-			) + "'"
-		DuplicateTypeDeclaration(module_identity, name, _):
-			"duplicate type declaration '" + name + "' in module '" + module_identity_display_name(
-				module_identity,
-			) + "'"
-		DuplicateTraitDeclaration(module_identity, name, _):
-			"duplicate trait declaration '" + name + "' in module '" + module_identity_display_name(
-				module_identity,
-			) + "'"
-		DuplicateConstructorDeclaration(parent_type_id, name, _):
+		CallableSkeletonMissingDefinition(module_path, name, _):
+			"declaration skeleton is missing callable definition '" + name + "' in module '" + module_path + "'"
+		ConstructorSkeletonMissingDefinition(module_path, owner, name, _):
+			"declaration skeleton is missing constructor definition '" + owner + "." + name + "' in module '" + module_path + "'"
+		TraitSkeletonMissingDefinition(module_path, name, _):
+			"declaration skeleton is missing trait definition '" + name + "' in module '" + module_path + "'"
+		ImplementationSkeletonMissingDefinition(module_path, name, _):
+			"declaration skeleton is missing implementation definition for '" + name + "' in module '" + module_path + "'"
+		DuplicateTypeDeclaration(module_path, name, _):
+			"duplicate type declaration '" + name + "' in module '" + module_path + "'"
+		DuplicateTraitDeclaration(module_path, name, _):
+			"duplicate trait declaration '" + name + "' in module '" + module_path + "'"
+		DuplicateConstructorDeclaration(module_path, parent_type_id, name, _):
 			"duplicate constructor '" + name + "' in union '" + type_id_name(
 				parent_type_id,
-			) + "' in module '" + module_identity_display_name(
-				type_id_module_identity(parent_type_id),
-			) + "'"
+			) + "' in module '" + module_path + "'"
 		DuplicateDeclarationSkeleton(_):
 			"duplicate declaration skeleton identity"

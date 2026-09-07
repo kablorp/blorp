@@ -13,9 +13,18 @@
 --
 -- Construction does not rely on source spellings as declaration authority.
 import:
-	../../stage_04_modules/loaded_module: ModuleIdentity, module_identity_storage_key
-	../graph/type_identity: TypeId, type_id_module_identity, type_id_name, type_ids_equal
-	../modules/bound_module_graph: bound_module_graph_target, bound_module_scope
+	../graph/indexed_graph:
+		indexed_graph_module_count,
+		prepared_module_id_table_index,
+		prepared_module_scope_id,
+	../graph/type_identity: TypeId, type_id_module_id, type_id_name, type_ids_equal
+	../modules/bound_module_graph:
+		BoundModuleGraph,
+		bound_module_graph_find,
+		bound_module_graph_find_for_id,
+		bound_module_graph_indexed_graph,
+		bound_module_graph_target,
+		bound_module_scope,
 	../modules/module_binding: ImportableModuleGraph, importable_module_graph_matches_scope
 	../type_system/semantic_type: SemanticType
 	callable_headers:
@@ -49,20 +58,18 @@ import:
 		TraitId,
 		TraitMethodId,
 		callable_id_definition_id,
-		callable_id_module_identity,
 		callable_ids_equal,
 		constructor_id_definition_id,
 		constructor_id_module_identity,
 		constructor_ids_equal,
+		declaration_skeleton_graph_bound_graph,
 		declaration_skeleton_graph_skeletons,
 		global_id_module_identity,
 		global_id_name,
 		global_ids_equal,
 		impl_id_definition_id,
-		impl_id_module_identity,
 		impl_ids_equal,
 		trait_id_definition_id,
-		trait_id_module_identity,
 		trait_ids_equal,
 		trait_method_id_index,
 		trait_method_id_owner,
@@ -250,31 +257,32 @@ union DeclarationCatalogError:
 	DeclarationCatalogDuplicateTraitMethodIdentity(TraitMethodId)
 	DeclarationCatalogDuplicateImplementationIdentity(ImplId)
 	DeclarationCatalogDuplicateImplementationMethodIdentity(ImplId, CallableId)
-	DeclarationCatalogDuplicateTypeKey(ModuleIdentity, String)
-	DeclarationCatalogDuplicateGlobalKey(ModuleIdentity, String)
+	DeclarationCatalogDuplicateTypeKey(TypeId)
+	DeclarationCatalogDuplicateGlobalKey(GlobalId)
 	DeclarationCatalogMissingTypeSkeleton(TypeId)
 	DeclarationCatalogMissingConstructorSkeleton(ConstructorId)
 	DeclarationCatalogImplementationMethodSignatureMissing(ImplId, CallableId)
-	DeclarationCatalogRuntimeDefinitionIdCategoryReuse(ModuleIdentity, Int, DeclarationCatalogCategory, DeclarationCatalogCategory)
+	DeclarationCatalogRuntimeDefinitionIdCategoryReuse(Int, DeclarationCatalogCategory, DeclarationCatalogCategory)
 
 
 private record AcceptedDeclarationCatalogRep {
+	bound_graph: BoundModuleGraph,
 	type_entries: List[AcceptedCatalogTypeEntry],
-	type_index_by_module_and_name: Dict[String, Dict[String, Int]],
+	type_index_by_module_and_name: List[Dict[String, Int]],
 	constructor_entries: List[AcceptedCatalogConstructorEntry],
-	constructor_index_by_module_and_definition_id: Dict[String, Dict[Int, Int]],
+	constructor_index_by_definition_id: Dict[Int, Int],
 	callable_entries: List[AcceptedCatalogCallableEntry],
-	callable_index_by_module_and_definition_id: Dict[String, Dict[Int, Int]],
+	callable_index_by_definition_id: Dict[Int, Int],
 	global_entries: List[AcceptedCatalogGlobalEntry],
-	global_index_by_module_and_name: Dict[String, Dict[String, Int]],
+	global_index_by_module_and_name: List[Dict[String, Int]],
 	trait_entries: List[AcceptedCatalogTraitEntry],
-	trait_index_by_module_and_definition_id: Dict[String, Dict[Int, Int]],
+	trait_index_by_definition_id: Dict[Int, Int],
 	trait_method_entries: List[AcceptedCatalogTraitMethodEntry],
-	trait_method_index_by_module_owner_and_slot: Dict[String, Dict[Int, Dict[Int, Int]]],
+	trait_method_index_by_owner_and_slot: Dict[Int, Dict[Int, Int]],
 	implementation_entries: List[AcceptedCatalogImplementationEntry],
-	implementation_index_by_module_and_definition_id: Dict[String, Dict[Int, Int]],
+	implementation_index_by_definition_id: Dict[Int, Int],
 	implementation_method_entries: List[AcceptedCatalogImplementationMethodEntry],
-	implementation_method_index_by_module_owner_and_callable: Dict[String, Dict[Int, Dict[Int, Int]]],
+	implementation_method_index_by_owner_and_callable: Dict[Int, Dict[Int, Int]],
 	metrics: AcceptedDeclarationCatalogMetrics
 }
 
@@ -292,31 +300,47 @@ private pure func checksum_step(current: Int, value: Int) -> Int:
 	current * 33 + value + 17
 
 
+private pure func declaration_catalog_type_module_index(
+	bound_graph: BoundModuleGraph,
+	id: TypeId,
+) -> Option[Int]:
+	module ?= bound_module_graph_find_for_id(bound_graph, type_id_module_id(id))
+	Some(prepared_module_id_table_index(prepared_module_scope_id(bound_module_scope(module))))
+
+
+private pure func declaration_catalog_constructor_module_index(
+	bound_graph: BoundModuleGraph,
+	id: ConstructorId,
+) -> Option[Int]:
+	module ?= bound_module_graph_find(bound_graph, constructor_id_module_identity(id))
+	Some(prepared_module_id_table_index(prepared_module_scope_id(bound_module_scope(module))))
+
+
+private pure func declaration_catalog_global_module_index(
+	bound_graph: BoundModuleGraph,
+	id: GlobalId,
+) -> Option[Int]:
+	module ?= bound_module_graph_find(bound_graph, global_id_module_identity(id))
+	Some(prepared_module_id_table_index(prepared_module_scope_id(bound_module_scope(module))))
+
+
 private pure func add_runtime_definition_category(
-	categories_by_module_and_definition_id: Dict[String, Dict[Int, DeclarationCatalogCategory]],
-	module_identity: ModuleIdentity,
+	categories_by_definition_id: Dict[Int, DeclarationCatalogCategory],
 	definition_id: Int,
 	category: DeclarationCatalogCategory,
 	errors: List[DeclarationCatalogError],
-) -> (Dict[String, Dict[Int, DeclarationCatalogCategory]], List[DeclarationCatalogError]):
-	module_key = module_identity_storage_key(module_identity)
-	categories = categories_by_module_and_definition_id.get_or(module_key, {})
-
-	match categories.get(definition_id):
+) -> (Dict[Int, DeclarationCatalogCategory], List[DeclarationCatalogError]):
+	match categories_by_definition_id.get(definition_id):
 		None:
-			(categories_by_module_and_definition_id.set(
-					module_key,
-					categories.set(definition_id, category),
-				), errors)
+			(categories_by_definition_id.set(definition_id, category), errors)
 		Some(existing):
 			if existing == category:
-				(categories_by_module_and_definition_id, errors)
+				(categories_by_definition_id, errors)
 			else:
 				(
-					categories_by_module_and_definition_id,
+					categories_by_definition_id,
 					errors.append(
 						DeclarationCatalogRuntimeDefinitionIdCategoryReuse(
-							module_identity,
 							definition_id,
 							existing,
 							category,
@@ -326,89 +350,96 @@ private pure func add_runtime_definition_category(
 
 
 private pure func add_single_name_index(
-	index_by_module_and_name: Dict[String, Dict[String, Int]],
-	module_identity: ModuleIdentity,
+	index_by_module_and_name: List[Dict[String, Int]],
+	module_index: Option[Int],
 	name: String,
 	index: Int,
-) -> Result[Dict[String, Dict[String, Int]], Bool]:
-	module_key = module_identity_storage_key(module_identity)
-	names = index_by_module_and_name.get_or(module_key, {})
+) -> Result[List[Dict[String, Int]], Bool]:
+	match module_index:
+		None:
+			Err(False)
+		Some(module_index):
+			names = index_by_module_and_name.get_or(module_index, {})
 
-	if names.contains(name):
-		Err(True)
-	else:
-		Ok(index_by_module_and_name.set(module_key, names.set(name, index)))
+			if names.contains(name):
+				Err(True)
+			else:
+				Ok(index_by_module_and_name.set(module_index, names.set(name, index)))
 
 
 private pure func add_runtime_definition_index(
-	index_by_module_and_definition_id: Dict[String, Dict[Int, Int]],
-	module_identity: ModuleIdentity,
+	index_by_definition_id: Dict[Int, Int],
 	definition_id: Int,
 	entry_index: Int,
-) -> Result[Dict[String, Dict[Int, Int]], Bool]:
-	module_key = module_identity_storage_key(module_identity)
-	module_index = index_by_module_and_definition_id.get_or(module_key, {})
-
-	if module_index.contains(definition_id):
+) -> Result[Dict[Int, Int], Bool]:
+	if index_by_definition_id.contains(definition_id):
 		Err(True)
 	else:
-		Ok(
-			index_by_module_and_definition_id.set(
-				module_key,
-				module_index.set(definition_id, entry_index),
-			),
-		)
+		Ok(index_by_definition_id.set(definition_id, entry_index))
 
 
 private pure func runtime_definition_index(
-	index_by_module_and_definition_id: Dict[String, Dict[Int, Int]],
-	module_identity: ModuleIdentity,
+	index_by_definition_id: Dict[Int, Int],
 	definition_id: Int,
 ) -> Option[Int]:
-	match index_by_module_and_definition_id.get(module_identity_storage_key(module_identity)):
-		Some(module_index):
-			module_index.get(definition_id)
-		None:
-			None
+	index_by_definition_id.get(definition_id)
 
 
 private record DeclarationVisibilityIndexes {
-	types: Dict[String, Dict[String, DeclarationVisibility]],
-	constructors: Dict[String, Dict[Int, DeclarationVisibility]],
-	globals: Dict[String, Dict[String, (GlobalId, DeclarationVisibility)]]
+	types: List[Dict[String, DeclarationVisibility]],
+	constructors: List[Dict[Int, DeclarationVisibility]],
+	globals: List[Dict[String, (GlobalId, DeclarationVisibility)]]
 }
 
 
 private pure func declaration_visibility_indexes(
 	declaration_graph: DeclarationSkeletonGraph,
 ) -> DeclarationVisibilityIndexes:
-	var types: Dict[String, Dict[String, DeclarationVisibility]] = {}
-	var constructors: Dict[String, Dict[Int, DeclarationVisibility]] = {}
-	var globals: Dict[String, Dict[String, (GlobalId, DeclarationVisibility)]] = {}
+	bound_graph = declaration_skeleton_graph_bound_graph(declaration_graph)
+	module_count = indexed_graph_module_count(bound_module_graph_indexed_graph(bound_graph))
+	var types: List[Dict[String, DeclarationVisibility]] = []
+	var constructors: List[Dict[Int, DeclarationVisibility]] = []
+	var globals: List[Dict[String, (GlobalId, DeclarationVisibility)]] = []
+	var module_index: Int = 0
+
+	while module_index < module_count:
+		types = types.append({})
+		constructors = constructors.append({})
+		globals = globals.append({})
+		module_index += 1
 
 	for skeleton in declaration_skeleton_graph_skeletons(declaration_graph):
 		match skeleton:
 			TypeDeclarationSkeleton(id, visibility, _):
-				module_key = module_identity_storage_key(type_id_module_identity(id))
-				module_visibilities = types.get_or(module_key, {})
-				types = types.set(
-					module_key,
-					module_visibilities.set(type_id_name(id), visibility),
-				)
+				match declaration_catalog_type_module_index(bound_graph, id):
+					Some(owner_index):
+						module_visibilities = types.get_or(owner_index, {})
+						types = types.set(
+							owner_index,
+							module_visibilities.set(type_id_name(id), visibility),
+						)
+					None:
+						void
 			ConstructorDeclarationSkeleton(id, visibility, _, _):
-				module_key = module_identity_storage_key(constructor_id_module_identity(id))
-				module_visibilities = constructors.get_or(module_key, {})
-				constructors = constructors.set(
-					module_key,
-					module_visibilities.set(constructor_id_definition_id(id), visibility),
-				)
+				match declaration_catalog_constructor_module_index(bound_graph, id):
+					Some(owner_index):
+						module_visibilities = constructors.get_or(owner_index, {})
+						constructors = constructors.set(
+							owner_index,
+							module_visibilities.set(constructor_id_definition_id(id), visibility),
+						)
+					None:
+						void
 			GlobalDeclarationSkeleton(id, visibility, _):
-				module_key = module_identity_storage_key(global_id_module_identity(id))
-				module_globals = globals.get_or(module_key, {})
-				globals = globals.set(
-					module_key,
-					module_globals.set(global_id_name(id), (id, visibility)),
-				)
+				match declaration_catalog_global_module_index(bound_graph, id):
+					Some(owner_index):
+						module_globals = globals.get_or(owner_index, {})
+						globals = globals.set(
+							owner_index,
+							module_globals.set(global_id_name(id), (id, visibility)),
+						)
+					None:
+						void
 			_:
 				void
 
@@ -420,10 +451,13 @@ private pure func declaration_visibility_indexes(
 
 
 private pure func type_visibility(
-	index: Dict[String, Dict[String, DeclarationVisibility]],
+	index: List[Dict[String, DeclarationVisibility]],
+	bound_graph: BoundModuleGraph,
 	id: TypeId,
 ) -> Option[DeclarationVisibility]:
-	match index.get(module_identity_storage_key(type_id_module_identity(id))):
+	module_index ?= declaration_catalog_type_module_index(bound_graph, id)
+
+	match index.get(module_index):
 		Some(module_visibilities):
 			module_visibilities.get(type_id_name(id))
 		None:
@@ -431,10 +465,13 @@ private pure func type_visibility(
 
 
 private pure func constructor_visibility(
-	index: Dict[String, Dict[Int, DeclarationVisibility]],
+	index: List[Dict[Int, DeclarationVisibility]],
+	bound_graph: BoundModuleGraph,
 	id: ConstructorId,
 ) -> Option[DeclarationVisibility]:
-	match index.get(module_identity_storage_key(constructor_id_module_identity(id))):
+	module_index ?= declaration_catalog_constructor_module_index(bound_graph, id)
+
+	match index.get(module_index):
 		Some(module_visibilities):
 			module_visibilities.get(constructor_id_definition_id(id))
 		None:
@@ -442,20 +479,25 @@ private pure func constructor_visibility(
 
 
 private pure func completed_global_matches_declaration(
-	index: Dict[String, Dict[String, (GlobalId, DeclarationVisibility)]],
+	index: List[Dict[String, (GlobalId, DeclarationVisibility)]],
+	bound_graph: BoundModuleGraph,
 	global: AcceptedDeclarationCatalogGlobalInput,
 ) -> Bool:
-	module_key = module_identity_storage_key(global_id_module_identity(global.id))
+	module_index = declaration_catalog_global_module_index(bound_graph, global.id)
 
-	match index.get(module_key):
-		Some(module_globals):
-			match module_globals.get(global_id_name(global.id)):
-				Some((id, visibility)):
-					global_ids_equal(id, global.id) and visibility == global.visibility
-				None:
-					False
+	match module_index:
 		None:
 			False
+		Some(index_value):
+			match index.get(index_value):
+				None:
+					False
+				Some(module_globals):
+					match module_globals.get(global_id_name(global.id)):
+						Some((id, visibility)):
+							global_ids_equal(id, global.id) and visibility == global.visibility
+						None:
+							False
 
 
 pure func accepted_declaration_catalog_build(
@@ -475,29 +517,32 @@ pure func accepted_declaration_catalog_build(
 	):
 		Err([DeclarationCatalogProductProvenanceMismatch])
 	else:
+		module_count = indexed_graph_module_count(bound_module_graph_indexed_graph(bound_graph))
 		var type_entries: List[AcceptedCatalogTypeEntry] = []
-		var type_index_by_module_and_name: Dict[String, Dict[String, Int]] = {}
+		var type_index_by_module_and_name: List[Dict[String, Int]] = []
 		var constructor_entries: List[AcceptedCatalogConstructorEntry] = []
-		var constructor_index_by_module_and_definition_id: Dict[String, Dict[Int, Int]] = {}
+		var constructor_index_by_definition_id: Dict[Int, Int] = {}
 		var callable_entries: List[AcceptedCatalogCallableEntry] = []
-		var callable_index_by_module_and_definition_id: Dict[String, Dict[Int, Int]] = {}
+		var callable_index_by_definition_id: Dict[Int, Int] = {}
 		var global_entries: List[AcceptedCatalogGlobalEntry] = []
-		var global_index_by_module_and_name: Dict[String, Dict[String, Int]] = {}
+		var global_index_by_module_and_name: List[Dict[String, Int]] = []
 		var trait_entries: List[AcceptedCatalogTraitEntry] = []
-		var trait_index_by_module_and_definition_id: Dict[String, Dict[Int, Int]] = {}
+		var trait_index_by_definition_id: Dict[Int, Int] = {}
 		var trait_method_entries: List[AcceptedCatalogTraitMethodEntry] = []
-		var trait_method_index_by_module_owner_and_slot: Dict[String, Dict[Int, Dict[Int, Int]]] = {
-
-		}
+		var trait_method_index_by_owner_and_slot: Dict[Int, Dict[Int, Int]] = {}
 		var implementation_entries: List[AcceptedCatalogImplementationEntry] = []
-		var implementation_index_by_module_and_definition_id: Dict[String, Dict[Int, Int]] = {}
+		var implementation_index_by_definition_id: Dict[Int, Int] = {}
 		var implementation_method_entries: List[AcceptedCatalogImplementationMethodEntry] = []
-		var implementation_method_index_by_module_owner_and_callable: Dict[String, Dict[Int, Dict[Int, Int]]] = {
+		var implementation_method_index_by_owner_and_callable: Dict[Int, Dict[Int, Int]] = {}
+		var module_index: Int = 0
 
-		}
-		var runtime_categories_by_module_and_definition_id: Dict[String, Dict[Int, DeclarationCatalogCategory]] = {
+		while module_index < module_count:
+			type_index_by_module_and_name = type_index_by_module_and_name.append({})
+			global_index_by_module_and_name = global_index_by_module_and_name.append({})
+			module_index += 1
 
-		}
+		var runtime_categories_by_definition_id: Dict[Int, DeclarationCatalogCategory] = {}
+
 		var errors: List[DeclarationCatalogError] = []
 		var builder_visits: Int = 0
 		var duplicate_checks: Int = 0
@@ -511,21 +556,21 @@ pure func accepted_declaration_catalog_build(
 
 			match add_single_name_index(
 				type_index_by_module_and_name,
-				type_id_module_identity(id),
+				declaration_catalog_type_module_index(bound_graph, id),
 				type_id_name(id),
 				type_entries.length(),
 			):
 				Ok(next_index):
 					type_index_by_module_and_name = next_index
-				Err(_):
+				Err(duplicate):
 					errors = errors.append(
-						DeclarationCatalogDuplicateTypeKey(
-							type_id_module_identity(id),
-							type_id_name(id),
-						),
+						if duplicate:
+							DeclarationCatalogDuplicateTypeKey(id)
+						else:
+							DeclarationCatalogProductProvenanceMismatch
 					)
 
-			visibility = type_visibility(visibility_indexes.types, id)
+			visibility = type_visibility(visibility_indexes.types, bound_graph, id)
 
 			if visibility.is_none():
 				errors = errors.append(DeclarationCatalogMissingTypeSkeleton(id))
@@ -546,30 +591,34 @@ pure func accepted_declaration_catalog_build(
 						builder_visits += 1
 						duplicate_checks += 1
 						constructor_runtime_category = add_runtime_definition_category(
-							runtime_categories_by_module_and_definition_id,
-							type_id_module_identity(id),
+							runtime_categories_by_definition_id,
 							constructor_id_definition_id(constructor_id),
 							CatalogConstructorDeclaration,
 							errors,
 						)
-						runtime_categories_by_module_and_definition_id = constructor_runtime_category[0]
+						runtime_categories_by_definition_id = constructor_runtime_category[0]
 						errors = constructor_runtime_category[1]
 
 						match add_runtime_definition_index(
-							constructor_index_by_module_and_definition_id,
-							type_id_module_identity(id),
+							constructor_index_by_definition_id,
 							constructor_id_definition_id(constructor_id),
 							constructor_entries.length(),
 						):
 							Ok(next_index):
-								constructor_index_by_module_and_definition_id = next_index
-							Err(_):
+								constructor_index_by_definition_id = next_index
+							Err(duplicate):
 								errors = errors.append(
-									DeclarationCatalogDuplicateConstructorIdentity(constructor_id),
+									if duplicate:
+										DeclarationCatalogDuplicateConstructorIdentity(
+											constructor_id,
+										)
+									else:
+										DeclarationCatalogProductProvenanceMismatch
 								)
 
 						constructor_visibility = constructor_visibility(
 							visibility_indexes.constructors,
+							bound_graph,
 							constructor_id,
 						)
 
@@ -596,25 +645,28 @@ pure func accepted_declaration_catalog_build(
 			builder_visits += 1
 			duplicate_checks += 1
 			callable_runtime_category = add_runtime_definition_category(
-				runtime_categories_by_module_and_definition_id,
-				callable_id_module_identity(id),
+				runtime_categories_by_definition_id,
 				callable_id_definition_id(id),
 				CatalogCallableDeclaration,
 				errors,
 			)
-			runtime_categories_by_module_and_definition_id = callable_runtime_category[0]
+			runtime_categories_by_definition_id = callable_runtime_category[0]
 			errors = callable_runtime_category[1]
 
 			match add_runtime_definition_index(
-				callable_index_by_module_and_definition_id,
-				callable_id_module_identity(id),
+				callable_index_by_definition_id,
 				callable_id_definition_id(id),
 				callable_entries.length(),
 			):
 				Ok(next_index):
-					callable_index_by_module_and_definition_id = next_index
-				Err(_):
-					errors = errors.append(DeclarationCatalogDuplicateCallableIdentity(id))
+					callable_index_by_definition_id = next_index
+				Err(duplicate):
+					errors = errors.append(
+						if duplicate:
+							DeclarationCatalogDuplicateCallableIdentity(id)
+						else:
+							DeclarationCatalogProductProvenanceMismatch
+					)
 
 			callable_entries = callable_entries.append({
 				id = id,
@@ -628,25 +680,29 @@ pure func accepted_declaration_catalog_build(
 			checksum = checksum_step(checksum, builder_visits + callable_id_definition_id(id))
 
 		for global in input.completed_globals:
-			if completed_global_matches_declaration(visibility_indexes.globals, global):
+			if completed_global_matches_declaration(
+				visibility_indexes.globals,
+				bound_graph,
+				global,
+			):
 				id = global.id
 				builder_visits += 1
 				duplicate_checks += 1
 
 				match add_single_name_index(
 					global_index_by_module_and_name,
-					global_id_module_identity(id),
+					declaration_catalog_global_module_index(bound_graph, id),
 					global_id_name(id),
 					global_entries.length(),
 				):
 					Ok(next_index):
 						global_index_by_module_and_name = next_index
-					Err(_):
+					Err(duplicate):
 						errors = errors.append(
-							DeclarationCatalogDuplicateGlobalKey(
-								global_id_module_identity(id),
-								global_id_name(id),
-							),
+							if duplicate:
+								DeclarationCatalogDuplicateGlobalKey(id)
+							else:
+								DeclarationCatalogProductProvenanceMismatch
 						)
 
 				global_entries = global_entries.append({
@@ -665,25 +721,28 @@ pure func accepted_declaration_catalog_build(
 			builder_visits += 1
 			duplicate_checks += 1
 			trait_runtime_category = add_runtime_definition_category(
-				runtime_categories_by_module_and_definition_id,
-				trait_id_module_identity(id),
+				runtime_categories_by_definition_id,
 				trait_id_definition_id(id),
 				CatalogTraitDeclaration,
 				errors,
 			)
-			runtime_categories_by_module_and_definition_id = trait_runtime_category[0]
+			runtime_categories_by_definition_id = trait_runtime_category[0]
 			errors = trait_runtime_category[1]
 
 			match add_runtime_definition_index(
-				trait_index_by_module_and_definition_id,
-				trait_id_module_identity(id),
+				trait_index_by_definition_id,
 				trait_id_definition_id(id),
 				trait_entries.length(),
 			):
 				Ok(next_index):
-					trait_index_by_module_and_definition_id = next_index
-				Err(_):
-					errors = errors.append(DeclarationCatalogDuplicateTraitIdentity(id))
+					trait_index_by_definition_id = next_index
+				Err(duplicate):
+					errors = errors.append(
+						if duplicate:
+							DeclarationCatalogDuplicateTraitIdentity(id)
+						else:
+							DeclarationCatalogProductProvenanceMismatch
+					)
 
 			trait_entries = trait_entries.append({
 				id = id,
@@ -698,25 +757,17 @@ pure func accepted_declaration_catalog_build(
 				builder_visits += 1
 				duplicate_checks += 1
 
-				module_key = module_identity_storage_key(trait_id_module_identity(id))
 				owner_key = trait_id_definition_id(id)
-				owner_index = trait_method_index_by_module_owner_and_slot.get_or(module_key, {})
-				slots = owner_index.get_or(owner_key, {})
+				slots = trait_method_index_by_owner_and_slot.get_or(owner_key, {})
 
 				if slots.contains(trait_method_id_index(method_id)):
 					errors = errors.append(
 						DeclarationCatalogDuplicateTraitMethodIdentity(method_id),
 					)
 				else:
-					trait_method_index_by_module_owner_and_slot = trait_method_index_by_module_owner_and_slot.set(
-						module_key,
-						owner_index.set(
-							owner_key,
-							slots.set(
-								trait_method_id_index(method_id),
-								trait_method_entries.length(),
-							),
-						),
+					trait_method_index_by_owner_and_slot = trait_method_index_by_owner_and_slot.set(
+						owner_key,
+						slots.set(trait_method_id_index(method_id), trait_method_entries.length()),
 					)
 
 				trait_method_entries = trait_method_entries.append({
@@ -735,25 +786,28 @@ pure func accepted_declaration_catalog_build(
 			builder_visits += 1
 			duplicate_checks += 1
 			implementation_runtime_category = add_runtime_definition_category(
-				runtime_categories_by_module_and_definition_id,
-				impl_id_module_identity(id),
+				runtime_categories_by_definition_id,
 				impl_id_definition_id(id),
 				CatalogImplementationDeclaration,
 				errors,
 			)
-			runtime_categories_by_module_and_definition_id = implementation_runtime_category[0]
+			runtime_categories_by_definition_id = implementation_runtime_category[0]
 			errors = implementation_runtime_category[1]
 
 			match add_runtime_definition_index(
-				implementation_index_by_module_and_definition_id,
-				impl_id_module_identity(id),
+				implementation_index_by_definition_id,
 				impl_id_definition_id(id),
 				implementation_entries.length(),
 			):
 				Ok(next_index):
-					implementation_index_by_module_and_definition_id = next_index
-				Err(_):
-					errors = errors.append(DeclarationCatalogDuplicateImplementationIdentity(id))
+					implementation_index_by_definition_id = next_index
+				Err(duplicate):
+					errors = errors.append(
+						if duplicate:
+							DeclarationCatalogDuplicateImplementationIdentity(id)
+						else:
+							DeclarationCatalogProductProvenanceMismatch
+					)
 
 			implementation_entries = implementation_entries.append({
 				id = id,
@@ -770,21 +824,16 @@ pure func accepted_declaration_catalog_build(
 				builder_visits += 1
 				duplicate_checks += 1
 				method_runtime_category = add_runtime_definition_category(
-					runtime_categories_by_module_and_definition_id,
-					impl_id_module_identity(id),
+					runtime_categories_by_definition_id,
 					callable_id_definition_id(method_id),
 					CatalogImplementationMethodDeclaration,
 					errors,
 				)
-				runtime_categories_by_module_and_definition_id = method_runtime_category[0]
+				runtime_categories_by_definition_id = method_runtime_category[0]
 				errors = method_runtime_category[1]
 
-				module_key = module_identity_storage_key(impl_id_module_identity(id))
-				owner_index = implementation_method_index_by_module_owner_and_callable.get_or(
-					module_key,
-					{},
-				)
-				methods = owner_index.get_or(impl_id_definition_id(id), {})
+				owner_key = impl_id_definition_id(id)
+				methods = implementation_method_index_by_owner_and_callable.get_or(owner_key, {})
 
 				if methods.contains(callable_id_definition_id(method_id)):
 					errors = errors.append(
@@ -794,14 +843,11 @@ pure func accepted_declaration_catalog_build(
 						),
 					)
 				else:
-					implementation_method_index_by_module_owner_and_callable = implementation_method_index_by_module_owner_and_callable.set(
-						module_key,
-						owner_index.set(
-							impl_id_definition_id(id),
-							methods.set(
-								callable_id_definition_id(method_id),
-								implementation_method_entries.length(),
-							),
+					implementation_method_index_by_owner_and_callable = implementation_method_index_by_owner_and_callable.set(
+						owner_key,
+						methods.set(
+							callable_id_definition_id(method_id),
+							implementation_method_entries.length(),
 						),
 					)
 
@@ -844,22 +890,23 @@ pure func accepted_declaration_catalog_build(
 
 		if errors.is_empty():
 			Ok(into_opaque AcceptedDeclarationCatalog({
+						bound_graph = bound_graph,
 						type_entries = type_entries,
 						type_index_by_module_and_name = type_index_by_module_and_name,
 						constructor_entries = constructor_entries,
-						constructor_index_by_module_and_definition_id = constructor_index_by_module_and_definition_id,
+						constructor_index_by_definition_id = constructor_index_by_definition_id,
 						callable_entries = callable_entries,
-						callable_index_by_module_and_definition_id = callable_index_by_module_and_definition_id,
+						callable_index_by_definition_id = callable_index_by_definition_id,
 						global_entries = global_entries,
 						global_index_by_module_and_name = global_index_by_module_and_name,
 						trait_entries = trait_entries,
-						trait_index_by_module_and_definition_id = trait_index_by_module_and_definition_id,
+						trait_index_by_definition_id = trait_index_by_definition_id,
 						trait_method_entries = trait_method_entries,
-						trait_method_index_by_module_owner_and_slot = trait_method_index_by_module_owner_and_slot,
+						trait_method_index_by_owner_and_slot = trait_method_index_by_owner_and_slot,
 						implementation_entries = implementation_entries,
-						implementation_index_by_module_and_definition_id = implementation_index_by_module_and_definition_id,
+						implementation_index_by_definition_id = implementation_index_by_definition_id,
 						implementation_method_entries = implementation_method_entries,
-						implementation_method_index_by_module_owner_and_callable = implementation_method_index_by_module_owner_and_callable,
+						implementation_method_index_by_owner_and_callable = implementation_method_index_by_owner_and_callable,
 						metrics = {
 							type_entries = type_entries.length(),
 							constructor_entries = constructor_entries.length(),
@@ -938,8 +985,8 @@ pure func accepted_declaration_catalog_find_type(
 	id: TypeId,
 ) -> Option[AcceptedCatalogTypeEntry]:
 	representation = declaration_catalog_rep(catalog)
-	module_key = module_identity_storage_key(type_id_module_identity(id))
-	names ?= representation.type_index_by_module_and_name.get(module_key)
+	module_index ?= declaration_catalog_type_module_index(representation.bound_graph, id)
+	names ?= representation.type_index_by_module_and_name.get(module_index)
 	index ?= names.get(type_id_name(id))
 	entry ?= representation.type_entries.get(index)
 
@@ -954,8 +1001,8 @@ pure func accepted_declaration_catalog_find_global(
 	id: GlobalId,
 ) -> Option[AcceptedCatalogGlobalEntry]:
 	representation = declaration_catalog_rep(catalog)
-	module_key = module_identity_storage_key(global_id_module_identity(id))
-	names ?= representation.global_index_by_module_and_name.get(module_key)
+	module_index ?= declaration_catalog_global_module_index(representation.bound_graph, id)
+	names ?= representation.global_index_by_module_and_name.get(module_index)
 	index ?= names.get(global_id_name(id))
 	entry ?= representation.global_entries.get(index)
 
@@ -971,8 +1018,7 @@ pure func accepted_declaration_catalog_find_constructor(
 ) -> Option[AcceptedCatalogConstructorEntry]:
 	representation = declaration_catalog_rep(catalog)
 	index ?= runtime_definition_index(
-		representation.constructor_index_by_module_and_definition_id,
-		constructor_id_module_identity(id),
+		representation.constructor_index_by_definition_id,
 		constructor_id_definition_id(id),
 	)
 	entry ?= representation.constructor_entries.get(index)
@@ -989,8 +1035,7 @@ pure func accepted_declaration_catalog_find_callable(
 ) -> Option[AcceptedCatalogCallableEntry]:
 	representation = declaration_catalog_rep(catalog)
 	index ?= runtime_definition_index(
-		representation.callable_index_by_module_and_definition_id,
-		callable_id_module_identity(id),
+		representation.callable_index_by_definition_id,
 		callable_id_definition_id(id),
 	)
 	entry ?= representation.callable_entries.get(index)
@@ -1007,8 +1052,7 @@ pure func accepted_declaration_catalog_find_trait(
 ) -> Option[AcceptedCatalogTraitEntry]:
 	representation = declaration_catalog_rep(catalog)
 	index ?= runtime_definition_index(
-		representation.trait_index_by_module_and_definition_id,
-		trait_id_module_identity(id),
+		representation.trait_index_by_definition_id,
 		trait_id_definition_id(id),
 	)
 	entry ?= representation.trait_entries.get(index)
@@ -1024,10 +1068,8 @@ pure func accepted_declaration_catalog_find_trait_method(
 	id: TraitMethodId,
 ) -> Option[AcceptedCatalogTraitMethodEntry]:
 	representation = declaration_catalog_rep(catalog)
-	module_key = module_identity_storage_key(trait_id_module_identity(trait_method_id_owner(id)))
 	owner_key = trait_id_definition_id(trait_method_id_owner(id))
-	owner_index ?= representation.trait_method_index_by_module_owner_and_slot.get(module_key)
-	slots ?= owner_index.get(owner_key)
+	slots ?= representation.trait_method_index_by_owner_and_slot.get(owner_key)
 	index ?= slots.get(trait_method_id_index(id))
 	entry ?= representation.trait_method_entries.get(index)
 
@@ -1043,8 +1085,7 @@ pure func accepted_declaration_catalog_find_implementation(
 ) -> Option[AcceptedCatalogImplementationEntry]:
 	representation = declaration_catalog_rep(catalog)
 	index ?= runtime_definition_index(
-		representation.implementation_index_by_module_and_definition_id,
-		impl_id_module_identity(id),
+		representation.implementation_index_by_definition_id,
 		impl_id_definition_id(id),
 	)
 	entry ?= representation.implementation_entries.get(index)
@@ -1061,11 +1102,9 @@ pure func accepted_declaration_catalog_find_implementation_method(
 	id: CallableId,
 ) -> Option[AcceptedCatalogImplementationMethodEntry]:
 	representation = declaration_catalog_rep(catalog)
-	module_key = module_identity_storage_key(impl_id_module_identity(owner))
-	owner_index ?= representation.implementation_method_index_by_module_owner_and_callable.get(
-		module_key,
+	methods ?= representation.implementation_method_index_by_owner_and_callable.get(
+		impl_id_definition_id(owner),
 	)
-	methods ?= owner_index.get(impl_id_definition_id(owner))
 	index ?= methods.get(callable_id_definition_id(id))
 	entry ?= representation.implementation_method_entries.get(index)
 

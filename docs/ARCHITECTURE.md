@@ -208,9 +208,14 @@ source order, or generated C spelling.
 addressing graph-owned products such as TypeHeader per-module inventories. The
 slot is valid only after compatibility with that product's owning graph is
 proved, is unstable when graph composition changes, and is not a nominal module
-identity. Durable `ModuleIdentity`, declaration IDs, typed programs, semantic
-occurrences, diagnostics, and external projections therefore never replace
-their owners with this internal ordinal.
+identity. Graph-issued `TypeId` values are the measured exception: they store
+this unboxed slot and are interpreted only by accepted type-header, alias,
+record, and union products constructed from the same `IndexedGraph`. Boundaries
+that require canonical identity materialize it from that owning graph. Other
+durable declaration IDs, typed programs, semantic occurrences, diagnostics,
+and external projections continue to retain or project `ModuleIdentity`. Issues
+56-57 replace this construction-time graph-local convention with one retained,
+compilation-owned module table before broadening integer ownership further.
 
 Compilation projects a successful typechecked graph into a Core-lowering input
 containing only typed programs, exact import bindings, source include

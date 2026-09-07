@@ -4,12 +4,19 @@ import:
 		compiler_mixed_type_header_phase_profile_fixture,
 	../../../benchmark/compiler/compiler_typecheck_phase_profile_fixture:
 		CompilerTypecheckPhaseProfileFixture,
+		compiler_typecheck_phase_profile_fixture,
 		compiler_typecheck_phase_profile_fixture_accepted_graph,
 		compiler_typecheck_phase_profile_fixture_type_headers,
+	../../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
+	../../../src/compiler/stage_03_parse/source_ast_finalize: finalized_typecheck_program
 	../../../src/compiler/stage_04_modules/loaded_module:
 		ANONYMOUS_IDENTITY,
+		ModuleLoadCandidate,
+		ModuleOrigin(StdlibModule, UserModule),
 		module_identities_equal,
 		module_identity_display_name,
+		module_load_candidate,
+		resolved_module_identity_from_resolver,
 	../../../src/compiler/stage_06_typecheck/decl:
 		AcceptedTypecheckGraph,
 		CompletedGlobalHeader,
@@ -30,7 +37,7 @@ import:
 		completed_global_header_graph_headers,
 		completed_global_header_id,
 		completed_global_header_visibility,
-	../../../src/compiler/stage_06_typecheck/graph/type_identity: type_ids_equal
+	../../../src/compiler/stage_06_typecheck/graph/type_identity: type_id_name, type_ids_equal
 	../../../src/compiler/stage_06_typecheck/headers/callable_headers:
 		CallableHeaderGraph,
 		callable_header_graph_callables,
@@ -97,6 +104,7 @@ import:
 		type_header_graph_bound_graph,
 		type_header_graph_headers,
 	../../../src/compiler/stage_06_typecheck/modules/bound_module_graph: bound_module_graph_modules
+	../../../src/compiler/stage_06_typecheck/state: typecheck_state_for_origin
 	../../../src/compiler/stage_06_typecheck/type_system/accepted_callable_authority:
 		AcceptedCallableTableRecord,
 		accepted_callable_authority,
@@ -128,6 +136,8 @@ import:
 		TYPE_INT,
 		canonical_module_type_name,
 		types_equal,
+	../../../src/lib/source: source_file
+	../typecheck_test_support: typecheck_test_accepted_graph
 	test: TestSuite
 
 
@@ -141,6 +151,32 @@ private pure func catalog_fixture() -> Option[CompilerTypecheckPhaseProfileFixtu
 		retain_parsed_programs = False
 	}
 	compiler_mixed_type_header_phase_profile_fixture(config).to_option()
+
+
+private pure func catalog_module_candidate(
+	module_path: String,
+	text: String,
+) -> ModuleLoadCandidate:
+	module_load_candidate(
+		resolved_module_identity_from_resolver(module_path, UserModule),
+		finalized_typecheck_program(
+			parse_compiler_source(source_file("/${module_path}.brp", module_path, text)),
+		),
+	)
+
+
+private pure func sparse_catalog_fixture() -> Option[CompilerTypecheckPhaseProfileFixture]:
+	target = catalog_module_candidate(
+		"app/main",
+		"import:\n\tapp/selected: SparseType\n\nfunc main(args: List[String]) -> Int:\n\t0",
+	)
+	modules = [
+		catalog_module_candidate("app/first", "pure func first() -> Int: 1"),
+		catalog_module_candidate("app/second", "pure func second() -> Int: 2"),
+		catalog_module_candidate("app/selected", "record SparseType {value: Int}"),
+	]
+
+	compiler_typecheck_phase_profile_fixture(target, modules, ["app/selected"]).to_option()
 
 
 private pure func catalog_global_input(
@@ -544,11 +580,8 @@ private pure func duplicate_global_reports_exact_error() -> Option[Bool]:
 
 	Some(
 		match result:
-			Err([DeclarationCatalogDuplicateGlobalKey(module_identity, name)]):
-				(
-					module_identities_equal(module_identity, global_id_module_identity(first.id))
-					and name == global_id_name(first.id)
-				)
+			Err([DeclarationCatalogDuplicateGlobalKey(id)]):
+				global_ids_equal(id, first.id)
 			_:
 				False
 	)
@@ -593,8 +626,27 @@ private pure func inconsistent_global_projection_is_rejected() -> Option[Bool]:
 	)
 
 
+private pure func catalog_dense_indexes_cover_sparse_module_positions() -> Option[Bool]:
+	fixture ?= sparse_catalog_fixture()
+	graph = compiler_typecheck_phase_profile_fixture_accepted_graph(fixture)
+	catalog ?= accepted_declaration_catalog_build(catalog_input(graph)).to_option()
+	header ?= type_header_graph_headers(
+		compiler_typecheck_phase_profile_fixture_type_headers(
+			fixture,
+		),
+	).find(
+		func(item): type_id_name(item.id) == "SparseType",
+	)
+
+	Some(accepted_declaration_catalog_find_type(catalog, header.id).is_some())
+
+
 func test_catalog_build_projects_every_accepted_category() -> Bool:
 	catalog_build_projects_every_accepted_category().get_or(False)
+
+
+func test_catalog_dense_indexes_cover_sparse_module_positions() -> Bool:
+	catalog_dense_indexes_cover_sparse_module_positions().get_or(False)
 
 
 func test_catalog_duplicate_global_reports_exact_error() -> Bool:
@@ -808,6 +860,91 @@ private pure func fixture_callable_table_record() -> Option[AcceptedCallableTabl
 	})
 
 
+private pure func callable_table_record_for_module(
+	module_path: String,
+	origin: ModuleOrigin,
+) -> Option[AcceptedCallableTableRecord]:
+	program = parse_compiler_source(
+		source_file(
+			"${module_path}.brp",
+			module_path,
+			"pure func shared() -> Int: 0",
+		),
+	)
+	graph ?= typecheck_test_accepted_graph(
+		typecheck_state_for_origin(origin),
+		program,
+		[],
+	).to_option()
+	header ?= callable_header_graph_callables(
+		implementation_header_graph_callable_headers(
+			accepted_typecheck_graph_implementation_headers(graph),
+		),
+	).get(0)
+	id = callable_header_id(header)
+
+	Some({
+		id = id,
+		owner_module_path = module_path,
+		source_name = callable_id_name(id),
+		visibility = PublicDeclaration,
+		entry = {
+			def_id = callable_id_definition_id(id),
+			func_type = SemanticFunctionType(True, [], TYPE_INT),
+			type_params = [],
+			param_names = [],
+			purity = Pure,
+			origin = UserDefinedFunc,
+			resource_args = RejectResourceArgs,
+			module_path = Some(module_path),
+			dim_constraints = [],
+			loop_producer = None,
+			debug_only = False
+		},
+	})
+
+
+private pure func callable_table_disambiguates_equal_raw_ids() -> Option[Bool]:
+	first ?= callable_table_record_for_module("first", UserModule)
+	second ?= callable_table_record_for_module("second", UserModule)
+	table ?= accepted_callable_table(
+		{callables = [first, second]},
+	)
+	first_authority ?= accepted_callable_authority(table, Some("first"), [], [])
+	second_authority ?= accepted_callable_authority(table, Some("second"), [], [])
+	first_entry ?= accepted_callable_find_exact(first_authority, first.id)
+	second_entry ?= accepted_callable_find_exact(second_authority, second.id)
+
+	Some(
+		(
+			callable_id_definition_id(first.id) == callable_id_definition_id(second.id)
+			and not callable_ids_equal(first.id, second.id)
+			and accepted_callable_table(
+				{callables = [first, first]},
+			).is_none()
+			and first_entry.module_path.is_none()
+			and second_entry.module_path.is_none()
+		),
+	)
+
+
+func test_callable_table_disambiguates_equal_raw_ids() -> Bool:
+	callable_table_disambiguates_equal_raw_ids().get_or(False)
+
+
+private pure func callable_table_rejects_path_with_distinct_identities() -> Option[Bool]:
+	user ?= callable_table_record_for_module("shared/path", UserModule)
+	stdlib ?= callable_table_record_for_module("shared/path", StdlibModule)
+
+	Some(not callable_ids_equal(user.id, stdlib.id) and accepted_callable_table(
+			{callables = [user, stdlib]},
+		).is_none())
+
+
+func test_callable_table_rejects_path_with_distinct_identities() -> Bool:
+	callable_table_rejects_path_with_distinct_identities().get_or(False)
+
+
 private pure func accepted_callable_table_rejects_mismatched_name_and_owner() -> Option[Bool]:
 	item ?= fixture_callable_table_record()
 	wrong_path = "not/the/callable/owner"
@@ -846,7 +983,7 @@ private pure func accepted_callable_owner_query_localizes_canonical_types() -> O
 	}
 	canonical_item = { item | entry = entry }
 	table ?= accepted_callable_table({callables = [canonical_item]})
-	authority ?= accepted_callable_authority(table, callable_id_module_identity(item.id), [], [])
+	authority ?= accepted_callable_authority(table, Some(module_path), [], [])
 	result ?= accepted_callable_find_exact(authority, item.id)
 
 	Some(result.module_path.is_none() and types_equal(
@@ -875,7 +1012,7 @@ private pure func accepted_callable_foreign_exact_query_preserves_canonical_type
 	}
 	canonical_item = { item | entry = entry }
 	table ?= accepted_callable_table({callables = [canonical_item]})
-	foreign_authority ?= accepted_callable_authority(table, ANONYMOUS_IDENTITY, [], [])
+	foreign_authority ?= accepted_callable_authority(table, None, [], [])
 	result ?= accepted_callable_find_exact(foreign_authority, item.id)
 
 	Some(result.module_path == Some(module_path) and types_equal(result.func_type, entry.func_type))
@@ -890,17 +1027,19 @@ private pure func accepted_global_authority_availability_is_exact() -> Option[Bo
 	graph = compiler_typecheck_phase_profile_fixture_accepted_graph(fixture)
 	global_ids ?= two_globals_from_different_modules(graph)
 	(first_id, second_id) = global_ids
+	first_path = module_identity_display_name(global_id_module_identity(first_id))
+	second_path = module_identity_display_name(global_id_module_identity(second_id))
 	table ?= accepted_global_table(
 		{globals = [
 				{
 					id = first_id,
-					owner_module_path = "first",
+					owner_module_path = first_path,
 					visibility = PublicDeclaration,
 					declared_binding = Some(accepted_global_binding(first_id))
 				},
 				{
 					id = second_id,
-					owner_module_path = "second",
+					owner_module_path = second_path,
 					visibility = PublicDeclaration,
 					declared_binding = None
 				},
@@ -908,11 +1047,11 @@ private pure func accepted_global_authority_availability_is_exact() -> Option[Bo
 	)
 	authority ?= accepted_global_authority(
 		table,
-		global_id_module_identity(first_id),
+		first_path,
 		[
 			{
 				source_name = "imported",
-				owner_module_path = "second",
+				owner_module_path = second_path,
 				original_name = global_id_name(second_id)
 			},
 		],
@@ -980,11 +1119,12 @@ private pure func accepted_global_table_rejects_duplicate_completion() -> Option
 	graph = compiler_typecheck_phase_profile_fixture_accepted_graph(fixture)
 	global_ids ?= two_globals_from_different_modules(graph)
 	(first_id, _) = global_ids
+	first_path = module_identity_display_name(global_id_module_identity(first_id))
 	table ?= accepted_global_table(
 		{globals = [
 				{
 					id = first_id,
-					owner_module_path = "first",
+					owner_module_path = first_path,
 					visibility = PublicDeclaration,
 					declared_binding = Some(accepted_global_binding(first_id))
 				},
@@ -995,6 +1135,15 @@ private pure func accepted_global_table_rejects_duplicate_completion() -> Option
 	Some(accepted_global_table_complete(
 			table,
 			[binding, binding],
+		).is_none() and accepted_global_table(
+			{globals = [
+					{
+						id = first_id,
+						owner_module_path = "not/the/global/owner",
+						visibility = PublicDeclaration,
+						declared_binding = None
+					},
+				]},
 		).is_none())
 
 
@@ -1007,17 +1156,19 @@ private pure func accepted_global_module_view_rejects_private_import() -> Option
 	graph = compiler_typecheck_phase_profile_fixture_accepted_graph(fixture)
 	global_ids ?= two_globals_from_different_modules(graph)
 	(first_id, second_id) = global_ids
+	first_path = module_identity_display_name(global_id_module_identity(first_id))
+	second_path = module_identity_display_name(global_id_module_identity(second_id))
 	table ?= accepted_global_table(
 		{globals = [
 				{
 					id = first_id,
-					owner_module_path = "first",
+					owner_module_path = first_path,
 					visibility = PublicDeclaration,
 					declared_binding = None
 				},
 				{
 					id = second_id,
-					owner_module_path = "second",
+					owner_module_path = second_path,
 					visibility = PrivateDeclaration,
 					declared_binding = None
 				},
@@ -1026,11 +1177,11 @@ private pure func accepted_global_module_view_rejects_private_import() -> Option
 
 	Some(accepted_global_authority(
 			table,
-			global_id_module_identity(first_id),
+			first_path,
 			[
 				{
 					source_name = "hidden",
-					owner_module_path = "second",
+					owner_module_path = second_path,
 					original_name = global_id_name(second_id)
 				},
 			],
@@ -1047,6 +1198,10 @@ tests: TestSuite = {
 		(
 			"catalog build projects every accepted category",
 			test_catalog_build_projects_every_accepted_category,
+		),
+		(
+			"catalog dense indexes cover sparse module positions",
+			test_catalog_dense_indexes_cover_sparse_module_positions,
 		),
 		(
 			"catalog duplicate global reports exact error",
@@ -1081,12 +1236,20 @@ tests: TestSuite = {
 			test_retained_callable_authority_has_one_entry_per_header_and_compact_views,
 		),
 		((
-				"retained trait and implementation authority has one entry per header and compact "
-				+ "views"
+				"retained trait and implementation authority has one entry per header and "
+				+ "compact views"
 			), test_retained_trait_implementation_authority_has_one_entry_per_header_and_compact_views),
 		(
 			"accepted callable table rejects mismatched name and owner",
 			test_accepted_callable_table_rejects_mismatched_name_and_owner,
+		),
+		(
+			"accepted callable table disambiguates equal raw ids",
+			test_callable_table_disambiguates_equal_raw_ids,
+		),
+		(
+			"accepted callable table rejects one path with distinct identities",
+			test_callable_table_rejects_path_with_distinct_identities,
 		),
 		(
 			"accepted callable owner queries localize canonical types",

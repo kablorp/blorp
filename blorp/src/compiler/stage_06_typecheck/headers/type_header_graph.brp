@@ -33,31 +33,34 @@ import:
 		ParsedUnionDecl,
 		ParsedVariantDecl,
 		parsed_type_expr_span,
-	../../stage_04_modules/loaded_module:
-		ModuleIdentity,
-		ModuleOrigin(StdlibModule),
-		module_identities_equal,
-		module_identity_display_name,
+	../../stage_04_modules/loaded_module: ModuleOrigin(StdlibModule), module_identities_equal
 	../graph/definition_identity: SourceDefinitionKind(FieldDefinition), source_definition_key
 	../graph/definition_index: definition_index_find_source_definition_id
 	../graph/indexed_graph:
 		PreparedModuleScope,
 		indexed_graph_definition_index,
 		indexed_graph_modules,
+		prepared_module_ids_equal,
 		prepared_module_scope_canonical_path,
 		prepared_module_scope_compatible_index,
+		prepared_module_scope_id,
 		prepared_module_scope_origin,
+		prepared_module_scopes_select_same_module,
 	../graph/type_identity:
 		TypeId,
-		type_id_module_identity,
+		type_id_module_id,
 		type_id_name,
 		type_id_source_span,
 		type_ids_equal,
 	../modules/bound_module_graph:
 		BoundModule,
 		BoundModuleGraph,
+		bound_module_canonical_path,
+		bound_module_graph_canonical_path_for_id,
 		bound_module_graph_find,
 		bound_module_graph_find_canonical_path,
+		bound_module_graph_find_for_id,
+		bound_module_graph_find_for_scope,
 		bound_module_graph_indexed_graph,
 		bound_module_graph_target,
 		bound_module_identity,
@@ -237,7 +240,7 @@ union TypeShapeResolutionError:
 	TypeShapeUnknownType(TypeResolutionOwner, String, SourceSpan)
 	TypeShapeUnknownQualifier(TypeResolutionOwner, String, SourceSpan)
 	TypeShapeImportedModuleMissing(TypeResolutionOwner, String, SourceSpan)
-	TypeShapePrivateTypeReference(TypeResolutionOwner, TypeId, SourceSpan)
+	TypeShapePrivateTypeReference(TypeResolutionOwner, String, TypeId, SourceSpan)
 	TypeShapeArityMismatch(TypeResolutionOwner, String, Int, Int, SourceSpan)
 	TypeShapeUnknownTypeParameter(TypeResolutionOwner, String, SourceSpan)
 	TypeShapeInvalidDimension(TypeResolutionOwner, String, SourceSpan)
@@ -430,7 +433,7 @@ union TypeHeaderError:
 	TypeHeaderEmptyStruct(TypeId)
 	TypeHeaderInvalidStructField(TypeId, String)
 	TypeHeaderRecursiveValueLayout(TypeId, Bool)
-	TypeHeaderInlineStorageCycle(List[TypeId])
+	TypeHeaderInlineStorageCycle(List[TypeId], List[String])
 
 
 private record LayoutTypeSubstitution {
@@ -918,7 +921,7 @@ private pure func declared_type_at_path(
 		Some(module):
 			match declaration_skeleton_graph_find_type(
 				context.declaration_graph,
-				bound_module_identity(module),
+				bound_module_scope(module),
 				name,
 			):
 				None:
@@ -926,12 +929,19 @@ private pure func declared_type_at_path(
 				Some(skeleton):
 					if (
 						skeleton.visibility == PrivateDeclaration
-						and not module_identities_equal(
-							bound_module_identity(context.module),
-							bound_module_identity(module),
+						and not prepared_module_scopes_select_same_module(
+							bound_module_scope(context.module),
+							bound_module_scope(module),
 						)
 					):
-						Err(TypeShapePrivateTypeReference(context.owner, skeleton.id, span))
+						Err(
+							TypeShapePrivateTypeReference(
+								context.owner,
+								bound_module_canonical_path(module),
+								skeleton.id,
+								span,
+							),
+						)
 					else:
 						Ok(skeleton)
 
@@ -943,7 +953,7 @@ private pure func declared_unqualified_type(
 ) -> Result[Option[TypeDeclarationSkeletonInfo], TypeShapeResolutionError]:
 	match declaration_skeleton_graph_find_type(
 		context.declaration_graph,
-		bound_module_identity(context.module),
+		bound_module_scope(context.module),
 		name,
 	):
 		Some(local):
@@ -1059,11 +1069,7 @@ pure func type_header_graph_has_unqualified_type_name(
 	declaration_graph = type_header_graph_declaration_graph(graph)
 	bound_graph = type_header_graph_bound_graph(graph)
 
-	match declaration_skeleton_graph_find_type(
-		declaration_graph,
-		bound_module_identity(module),
-		name,
-	):
+	match declaration_skeleton_graph_find_type(declaration_graph, bound_module_scope(module), name):
 		Some(_):
 			True
 		None:
@@ -1309,9 +1315,34 @@ private pure func resolve_type_expr(
 			ResolvedTypeRejected([TypeShapeMissingType(context.owner, span)])
 
 
+private pure func type_resolution_owner_matches_module(
+	owner: TypeResolutionOwner,
+	module: BoundModule,
+) -> Bool:
+	match owner:
+		TypeDeclarationResolutionOwner(id):
+			prepared_module_ids_equal(
+				type_id_module_id(id),
+				prepared_module_scope_id(bound_module_scope(module)),
+			)
+		TraitMethodResolutionOwner(method_id):
+			module_identities_equal(
+				trait_id_module_identity(trait_method_id_owner(method_id)),
+				bound_module_identity(module),
+			)
+		CallableResolutionOwner(id):
+			module_identities_equal(callable_id_module_identity(id), bound_module_identity(module))
+		GlobalResolutionOwner(id):
+			module_identities_equal(global_id_module_identity(id), bound_module_identity(module))
+		ImplementationResolutionOwner(id):
+			module_identities_equal(impl_id_module_identity(id), bound_module_identity(module))
+		ImplementationMethodResolutionOwner(id, _, _):
+			module_identities_equal(impl_id_module_identity(id), bound_module_identity(module))
+
+
 private pure func prepare_owned_type_resolution_context(
 	graph: TypeHeaderGraph,
-	owner_module_identity: ModuleIdentity,
+	owner_scope: PreparedModuleScope,
 	owner: TypeResolutionOwner,
 	parameters: List[ResolutionTypeParameter],
 	diagnostic_span: SourceSpan,
@@ -1319,18 +1350,20 @@ private pure func prepare_owned_type_resolution_context(
 	declaration_graph = type_header_graph_declaration_graph(graph)
 	bound_graph = type_header_graph_bound_graph(graph)
 
-	match bound_module_graph_find(bound_graph, owner_module_identity):
+	match bound_module_graph_find_for_scope(bound_graph, owner_scope):
 		None:
 			Err([TypeShapeOwnerModuleMissing(owner, diagnostic_span)])
 		Some(module):
-			context: TypeResolutionContext = {
-				declaration_graph = declaration_graph,
-				bound_graph = bound_graph,
-				module = module,
-				owner = owner,
-				parameters = parameters
-			}
-			Ok(context)
+			if type_resolution_owner_matches_module(owner, module):
+				Ok({
+					declaration_graph = declaration_graph,
+					bound_graph = bound_graph,
+					module = module,
+					owner = owner,
+					parameters = parameters,
+				})
+			else:
+				Err([TypeShapeOwnerModuleMissing(owner, diagnostic_span)])
 
 
 private pure func resolve_prepared_type_shape(
@@ -1346,14 +1379,14 @@ private pure func resolve_prepared_type_shape(
 
 private pure func resolve_owned_type_shape(
 	graph: TypeHeaderGraph,
-	owner_module_identity: ModuleIdentity,
+	owner_scope: PreparedModuleScope,
 	owner: TypeResolutionOwner,
 	parameters: List[ResolutionTypeParameter],
 	type_expr: ParsedTypeExpr,
 ) -> Result[ResolvedTypeShape, List[TypeShapeResolutionError]]:
 	match prepare_owned_type_resolution_context(
 		graph,
-		owner_module_identity,
+		owner_scope,
 		owner,
 		parameters,
 		parsed_type_expr_span(type_expr),
@@ -1366,6 +1399,7 @@ private pure func resolve_owned_type_shape(
 
 pure func prepare_callable_type_resolution_context(
 	graph: TypeHeaderGraph,
+	owner_scope: PreparedModuleScope,
 	callable_id: CallableId,
 	parameters: List[CallableTypeParameterId],
 ) -> Result[CallableTypeResolutionContext, List[TypeShapeResolutionError]]:
@@ -1381,7 +1415,7 @@ pure func prepare_callable_type_resolution_context(
 		None:
 			match prepare_owned_type_resolution_context(
 				graph,
-				callable_id_module_identity(callable_id),
+				owner_scope,
 				owner,
 				parameters.map(func(parameter): CallableResolutionParameter(parameter)),
 				diagnostic_span,
@@ -1401,6 +1435,7 @@ pure func resolve_callable_type_shape_in_context(
 
 pure func resolve_trait_method_type_shape(
 	graph: TypeHeaderGraph,
+	owner_scope: PreparedModuleScope,
 	method_id: TraitMethodId,
 	parameters: List[TraitTypeParameterId],
 	type_expr: ParsedTypeExpr,
@@ -1425,7 +1460,7 @@ pure func resolve_trait_method_type_shape(
 		None:
 			resolve_owned_type_shape(
 				graph,
-				trait_id_module_identity(trait_id),
+				owner_scope,
 				owner,
 				parameters.map(func(parameter): TraitResolutionParameter(parameter)),
 				type_expr,
@@ -1434,20 +1469,16 @@ pure func resolve_trait_method_type_shape(
 
 pure func resolve_global_type_shape(
 	graph: TypeHeaderGraph,
+	owner_scope: PreparedModuleScope,
 	global_id: GlobalId,
 	type_expr: ParsedTypeExpr,
 ) -> Result[ResolvedTypeShape, List[TypeShapeResolutionError]]:
-	resolve_owned_type_shape(
-		graph,
-		global_id_module_identity(global_id),
-		GlobalResolutionOwner(global_id),
-		[],
-		type_expr,
-	)
+	resolve_owned_type_shape(graph, owner_scope, GlobalResolutionOwner(global_id), [], type_expr)
 
 
 pure func resolve_implementation_type_shape(
 	graph: TypeHeaderGraph,
+	owner_scope: PreparedModuleScope,
 	implementation_id: ImplId,
 	parameters: List[ImplementationTypeParameterId],
 	type_expr: ParsedTypeExpr,
@@ -1471,7 +1502,7 @@ pure func resolve_implementation_type_shape(
 		None:
 			resolve_owned_type_shape(
 				graph,
-				impl_id_module_identity(implementation_id),
+				owner_scope,
 				owner,
 				parameters.map(func(parameter): ImplementationResolutionParameter(parameter)),
 				type_expr,
@@ -1480,6 +1511,7 @@ pure func resolve_implementation_type_shape(
 
 pure func resolve_implementation_method_type_shape(
 	graph: TypeHeaderGraph,
+	owner_scope: PreparedModuleScope,
 	implementation_id: ImplId,
 	implementation_parameters: List[ImplementationTypeParameterId],
 	callable_id: CallableId,
@@ -1519,7 +1551,7 @@ pure func resolve_implementation_method_type_shape(
 		(None, None):
 			resolve_owned_type_shape(
 				graph,
-				impl_id_module_identity(implementation_id),
+				owner_scope,
 				owner,
 				implementation_parameters
 					.map(func(parameter): ImplementationResolutionParameter(parameter))
@@ -1549,7 +1581,7 @@ private pure func resolve_fields(
 					definition_id = definition_index_find_source_definition_id(
 						definition_index,
 						source_definition_key(
-							type_id_module_identity(context.owner),
+							bound_module_identity(context.resolution.module),
 							FieldDefinition,
 							field.name.text,
 							Some(type_id_name(context.owner)),
@@ -1824,7 +1856,7 @@ private pure func build_type_header(
 	)
 	bound_graph = declaration_skeleton_graph_bound_graph(declaration_graph)
 
-	match bound_module_graph_find(bound_graph, type_id_module_identity(skeleton.id)):
+	match bound_module_graph_find_for_id(bound_graph, type_id_module_id(skeleton.id)):
 		None:
 			TypeHeaderRejected([TypeHeaderOwnerModuleMissing(skeleton.id)])
 		Some(module):
@@ -1859,13 +1891,10 @@ private pure func build_type_header(
 
 private pure func type_header_is_public(
 	declaration_graph: DeclarationSkeletonGraph,
+	module_scope: PreparedModuleScope,
 	header: TypeHeader,
 ) -> Bool:
-	declaration_skeleton_graph_find_type(
-		declaration_graph,
-		type_id_module_identity(header.id),
-		type_id_name(header.id),
-	)
+	declaration_skeleton_graph_find_type(declaration_graph, module_scope, type_id_name(header.id))
 		.map(func(skeleton): skeleton.visibility == PublicDeclaration)
 		.get_or(False)
 
@@ -1922,7 +1951,7 @@ private pure func type_header_table(
 				.append(index),
 		)
 
-		match bound_module_graph_find(bound_graph, type_id_module_identity(header.id)):
+		match bound_module_graph_find_for_id(bound_graph, type_id_module_id(header.id)):
 			None:
 				errors = errors.append(TypeHeaderOwnerModuleMissing(header.id))
 			Some(module):
@@ -1937,7 +1966,11 @@ private pure func type_header_table(
 							header_indices_by_module,
 							module_index,
 							index,
-							type_header_is_public(declaration_graph, header),
+							type_header_is_public(
+								declaration_graph,
+								bound_module_scope(module),
+								header,
+							),
 						)
 
 		index += 1
@@ -3124,7 +3157,13 @@ pure func type_header_graph_build(
 			Ok(table):
 				match inline_layout_cycle(table):
 					Some(cycle):
-						Err([TypeHeaderInlineStorageCycle(cycle)])
+						Err([TypeHeaderInlineStorageCycle(
+									cycle,
+									type_header_cycle_display_names(
+										declaration_skeleton_graph_bound_graph(declaration_graph),
+										cycle,
+									),
+								)])
 					None:
 						struct_field_errors = invalid_struct_field_errors(table)
 						recursive_layout_errors = recursive_value_layout_errors(table)
@@ -3170,16 +3209,6 @@ pure func type_header_graph_declaration_skeleton_count(graph: TypeHeaderGraph) -
 
 pure func type_header_graph_find(graph: TypeHeaderGraph, id: TypeId) -> Option[TypeHeader]:
 	type_header_table_find(type_header_graph_rep(graph).table, id)
-
-
-private pure func type_header_graph_scope(
-	graph: TypeHeaderGraph,
-	module_identity: ModuleIdentity,
-) -> Option[PreparedModuleScope]:
-	bound_module_graph_find(
-		type_header_graph_bound_graph(graph),
-		module_identity,
-	).map(bound_module_scope)
 
 
 pure func type_header_graph_declared_type_expansion(
@@ -3244,17 +3273,6 @@ pure func type_header_graph_public_builtin_headers_for_scope(
 	type_header_graph_builtin_headers_for_scope(graph, module_scope, PublicModuleHeaders)
 
 
-pure func type_header_graph_local_builtin_headers(
-	graph: TypeHeaderGraph,
-	module_identity: ModuleIdentity,
-) -> List[AcceptedBuiltinHeader]:
-	match type_header_graph_scope(graph, module_identity):
-		Some(module_scope):
-			type_header_graph_local_builtin_headers_for_scope(graph, module_scope)
-		None:
-			[]
-
-
 private pure func record_type_header(header: TypeHeader) -> Option[AcceptedRecordHeader]:
 	match header.shape:
 		RecordTypeHeader(layout, fields):
@@ -3303,17 +3321,6 @@ pure func type_header_graph_public_record_headers_for_scope(
 	module_scope: PreparedModuleScope,
 ) -> List[AcceptedRecordHeader]:
 	type_header_graph_record_headers_for_scope(graph, module_scope, PublicModuleHeaders)
-
-
-pure func type_header_graph_local_record_headers(
-	graph: TypeHeaderGraph,
-	module_identity: ModuleIdentity,
-) -> List[AcceptedRecordHeader]:
-	match type_header_graph_scope(graph, module_identity):
-		Some(module_scope):
-			type_header_graph_local_record_headers_for_scope(graph, module_scope)
-		None:
-			[]
 
 
 private pure func union_type_header(header: TypeHeader) -> Option[AcceptedUnionHeader]:
@@ -3366,17 +3373,6 @@ pure func type_header_graph_public_union_headers_for_scope(
 	type_header_graph_union_headers_for_scope(graph, module_scope, PublicModuleHeaders)
 
 
-pure func type_header_graph_local_union_headers(
-	graph: TypeHeaderGraph,
-	module_identity: ModuleIdentity,
-) -> List[AcceptedUnionHeader]:
-	match type_header_graph_scope(graph, module_identity):
-		Some(module_scope):
-			type_header_graph_local_union_headers_for_scope(graph, module_scope)
-		None:
-			[]
-
-
 private pure func alias_type_header(header: TypeHeader) -> Option[AcceptedAliasHeader]:
 	match header.shape:
 		AliasTypeHeader(layout, target):
@@ -3427,26 +3423,15 @@ pure func type_header_graph_public_alias_headers_for_scope(
 	type_header_graph_alias_headers_for_scope(graph, module_scope, PublicModuleHeaders)
 
 
-pure func type_header_graph_local_alias_headers(
-	graph: TypeHeaderGraph,
-	module_identity: ModuleIdentity,
-) -> List[AcceptedAliasHeader]:
-	match type_header_graph_scope(graph, module_identity):
-		Some(module_scope):
-			type_header_graph_local_alias_headers_for_scope(graph, module_scope)
-		None:
-			[]
-
-
 pure func type_header_graph_type_module_path(graph: TypeHeaderGraph, id: TypeId) -> Option[String]:
 	parameter_graph = type_header_graph_rep(graph).parameter_graph
 	declaration_graph = acyclic_type_alias_dependency_graph_declaration_graph(
 		resolved_type_parameter_graph_alias_dependencies(parameter_graph),
 	)
 	bound_graph = declaration_skeleton_graph_bound_graph(declaration_graph)
-	bound_module_graph_find(
+	bound_module_graph_find_for_id(
 		bound_graph,
-		type_id_module_identity(
+		type_id_module_id(
 			id,
 		),
 	).map(
@@ -3456,7 +3441,7 @@ pure func type_header_graph_type_module_path(graph: TypeHeaderGraph, id: TypeId)
 
 pure func type_header_graph_owner_provides_prelude_type(
 	graph: TypeHeaderGraph,
-	owner_identity: ModuleIdentity,
+	owner_scope: PreparedModuleScope,
 	prelude_type: PreludeType,
 ) -> Bool:
 	parameter_graph = type_header_graph_rep(graph).parameter_graph
@@ -3465,7 +3450,7 @@ pure func type_header_graph_owner_provides_prelude_type(
 	)
 	bound_graph = declaration_skeleton_graph_bound_graph(declaration_graph)
 
-	match bound_module_graph_find(bound_graph, owner_identity):
+	match bound_module_graph_find_for_scope(bound_graph, owner_scope):
 		None:
 			False
 		Some(module):
@@ -3623,12 +3608,12 @@ pure func type_shape_resolution_error_message(error: TypeShapeResolutionError) -
 			"Imported module '" + module_path + "' is missing while resolving '" + type_resolution_owner_display_name(
 				owner,
 			) + "'"
-		TypeShapePrivateTypeReference(owner, referenced, _):
+		TypeShapePrivateTypeReference(owner, module_path, referenced, _):
 			"Declaration '" + type_resolution_owner_display_name(
 				owner,
-			) + "' cannot reference private imported type '" + module_identity_display_name(
-				type_id_module_identity(referenced),
-			) + "." + type_id_name(referenced) + "'"
+			) + "' cannot reference private imported type '" + module_path + "." + type_id_name(
+				referenced,
+			) + "'"
 		TypeShapeArityMismatch(owner, name, expected, actual, _):
 			"Type '" + name + "' expects " + expected.to_string() + " argument(s), got " + actual.to_string() + " while resolving '" + type_resolution_owner_display_name(
 				owner,
@@ -3651,8 +3636,38 @@ pure func type_shape_resolution_error_message(error: TypeShapeResolutionError) -
 
 pure func type_shape_resolution_error_span(error: TypeShapeResolutionError) -> SourceSpan:
 	match error:
-		TypeShapeOwnerModuleMissing(_, span) | TypeShapeForeignTraitParameter(_, _, span) | TypeShapeForeignCallableParameter(_, _, span) | TypeShapeForeignImplementationParameter(_, _, span) | TypeShapeUnknownType(_, _, span) | TypeShapeUnknownQualifier(_, _, span) | TypeShapeImportedModuleMissing(_, _, span) | TypeShapePrivateTypeReference(_, _, span) | TypeShapeArityMismatch(_, _, _, _, span) | TypeShapeUnknownTypeParameter(_, _, span) | TypeShapeInvalidDimension(_, _, span) | TypeShapeMissingType(_, span) | TypeShapeSelfNotAllowed(_, span):
+		TypeShapeOwnerModuleMissing(_, span) | TypeShapeForeignTraitParameter(_, _, span) | TypeShapeForeignCallableParameter(_, _, span) | TypeShapeForeignImplementationParameter(_, _, span) | TypeShapeUnknownType(_, _, span) | TypeShapeUnknownQualifier(_, _, span) | TypeShapeImportedModuleMissing(_, _, span) | TypeShapePrivateTypeReference(_, _, _, span) | TypeShapeArityMismatch(_, _, _, _, span) | TypeShapeUnknownTypeParameter(_, _, span) | TypeShapeInvalidDimension(_, _, span) | TypeShapeMissingType(_, span) | TypeShapeSelfNotAllowed(_, span):
 			span
+
+
+private pure func type_header_identity_display_name(
+	bound_graph: BoundModuleGraph,
+	id: TypeId,
+) -> String:
+	module_name = bound_module_graph_canonical_path_for_id(
+		bound_graph,
+		type_id_module_id(id),
+	).get_or("<unknown module>")
+	module_name + "." + type_id_name(id)
+
+
+private pure func type_header_cycle_display_names(
+	bound_graph: BoundModuleGraph,
+	cycle: List[TypeId],
+) -> List[String]:
+	match cycle.get(0):
+		None:
+			[]
+		Some(first):
+			first_module = type_id_module_id(first)
+			local = cycle.all(func(id):
+				prepared_module_ids_equal(type_id_module_id(id), first_module)
+			)
+
+			if local:
+				cycle.map(type_id_name)
+			else:
+				cycle.map(func(id): type_header_identity_display_name(bound_graph, id))
 
 
 pure func type_header_error_message(error: TypeHeaderError) -> String:
@@ -3686,26 +3701,11 @@ pure func type_header_error_message(error: TypeHeaderError) -> String:
 				"Type '" + type_id_name(
 					id,
 				) + "' has a recursive value layout — every construction path requires another product value"
-		TypeHeaderInlineStorageCycle(cycle):
-			match cycle.get(0):
-				None:
-					"Infinitely sized value layout"
-				Some(first):
-					first_module = type_id_module_identity(first)
-					local = cycle.all(func(id):
-						module_identities_equal(type_id_module_identity(id), first_module)
-					)
-
-					names = if local:
-						cycle.map(type_id_name)
-					else:
-						cycle.map(func(id):
-							module_identity_display_name(
-								type_id_module_identity(id),
-							) + "." + type_id_name(id)
-						)
-
-					"Infinitely sized value layout: " + names.join(" -> ")
+		TypeHeaderInlineStorageCycle(cycle, names):
+			if cycle.is_empty():
+				"Infinitely sized value layout"
+			else:
+				"Infinitely sized value layout: " + names.join(" -> ")
 
 
 pure func type_header_error_span(error: TypeHeaderError) -> Option[SourceSpan]:
@@ -3714,7 +3714,7 @@ pure func type_header_error_span(error: TypeHeaderError) -> Option[SourceSpan]:
 			Some(type_id_source_span(id))
 		TypeHeaderResolutionError(resolution_error):
 			Some(type_shape_resolution_error_span(resolution_error))
-		TypeHeaderInlineStorageCycle(cycle):
+		TypeHeaderInlineStorageCycle(cycle, _):
 			cycle
 				.get(0)
 				.map(type_id_source_span)

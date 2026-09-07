@@ -67,11 +67,12 @@ import:
 			PreludeTypeShape,
 			WildcardDimensionShape,
 		),
-		TypeShapeResolutionError(TypeShapeForeignCallableParameter),
+		TypeShapeResolutionError(TypeShapeForeignCallableParameter, TypeShapeOwnerModuleMissing),
 		callable_type_parameter_id_index,
 		callable_type_parameter_id_owner,
 		callable_type_parameter_ids,
 		prepare_callable_type_resolution_context,
+		type_header_graph_bound_graph,
 		type_header_graph_build,
 		type_header_graph_declaration_graph,
 	../../../src/compiler/stage_06_typecheck/headers/type_parameter_headers:
@@ -80,6 +81,9 @@ import:
 		BoundModuleViewBinding(BoundModuleViewReady),
 		COMPILER_BOUND_MODULE_VISIBILITY_EMPTY,
 		bound_module_graph_build,
+		bound_module_graph_find_canonical_path,
+		bound_module_graph_target,
+		bound_module_scope,
 	../../../src/compiler/stage_06_typecheck/modules/module_view: COMPILER_MODULE_VIEW_EMPTY
 	../../../src/lib/source: source_spans_equal
 	../typecheck_test_support as TypecheckTestSupport
@@ -197,9 +201,17 @@ private pure func prepared_context_rejects_foreign_parameters() -> Option[Bool]:
 	second_id = callable_header_id(second)
 	foreign_parameters = callable_type_parameter_ids(first_id, ["T"])
 	type_headers = trait_topology_graph_type_headers(callable_header_graph_trait_topology(graph))
+	owner_scope = bound_module_scope(
+		bound_module_graph_target(type_header_graph_bound_graph(type_headers)),
+	)
 
 	Some(
-		match prepare_callable_type_resolution_context(type_headers, second_id, foreign_parameters):
+		match prepare_callable_type_resolution_context(
+			type_headers,
+			owner_scope,
+			second_id,
+			foreign_parameters,
+		):
 			Err([TypeShapeForeignCallableParameter(_, parameter, span)]):
 				(
 					callable_ids_equal(callable_type_parameter_id_owner(parameter), first_id)
@@ -212,6 +224,69 @@ private pure func prepared_context_rejects_foreign_parameters() -> Option[Bool]:
 
 pure func test_prepared_context_rejects_foreign_parameters() -> Bool:
 	prepared_context_rejects_foreign_parameters().get_or(False)
+
+
+private pure func prepared_context_rejects_foreign_graph_scope() -> Option[Bool]:
+	graph ?= callable_graph("pure func local(value: Int) -> Int: value")
+	header ?= callable_header_by_name(graph, "local")
+	type_headers = trait_topology_graph_type_headers(callable_header_graph_trait_topology(graph))
+	foreign_graph ?= callable_graph_at("other", "pure func remote(value: Int) -> Int: value")
+	foreign_type_headers = trait_topology_graph_type_headers(
+		callable_header_graph_trait_topology(foreign_graph),
+	)
+	foreign_scope = bound_module_scope(
+		bound_module_graph_target(type_header_graph_bound_graph(foreign_type_headers)),
+	)
+
+	Some(
+		match prepare_callable_type_resolution_context(
+			type_headers,
+			foreign_scope,
+			callable_header_id(header),
+			[],
+		):
+			Err([TypeShapeOwnerModuleMissing(_, span)]):
+				source_spans_equal(span, callable_id_source_span(callable_header_id(header)))
+			_:
+				False
+	)
+
+
+pure func test_prepared_context_rejects_foreign_graph_scope() -> Bool:
+	prepared_context_rejects_foreign_graph_scope().get_or(False)
+
+
+private pure func prepared_context_rejects_wrong_same_graph_scope() -> Option[Bool]:
+	indexed ?= indexed_graph_build(
+		module_load_candidate_at("main", "pure func local(value: Int) -> Int: value"),
+		[module_load_candidate_at("dep", "pure func remote(value: Int) -> Int: value")],
+	).to_option()
+	bound ?= bound_module_graph_build(indexed, ["dep"], accept_empty_view).to_option()
+	skeletons ?= declaration_skeleton_graph_build(bound).to_option()
+	aliases ?= type_alias_dependency_graph_validate(skeletons).to_option()
+	parameters ?= resolved_type_parameter_graph_build(aliases).to_option()
+	type_headers ?= type_header_graph_build(parameters).to_option()
+	topology ?= trait_topology_graph_build(type_headers).to_option()
+	graph ?= callable_header_graph_build(topology).to_option()
+	header ?= callable_header_by_name(graph, "local")
+	dependency ?= bound_module_graph_find_canonical_path(bound, "dep")
+
+	Some(
+		match prepare_callable_type_resolution_context(
+			type_headers,
+			bound_module_scope(dependency),
+			callable_header_id(header),
+			[],
+		):
+			Err([TypeShapeOwnerModuleMissing(_, span)]):
+				source_spans_equal(span, callable_id_source_span(callable_header_id(header)))
+			_:
+				False
+	)
+
+
+pure func test_prepared_context_rejects_wrong_same_graph_scope() -> Bool:
+	prepared_context_rejects_wrong_same_graph_scope().get_or(False)
 
 
 private pure func prepared_context_resolves_dimension_constraints() -> Option[Bool]:
@@ -433,6 +508,14 @@ tests: TestSuite = {
 		(
 			"prepared context rejects foreign parameters",
 			test_prepared_context_rejects_foreign_parameters,
+		),
+		(
+			"prepared context rejects foreign graph scope",
+			test_prepared_context_rejects_foreign_graph_scope,
+		),
+		(
+			"prepared context rejects wrong same-graph scope",
+			test_prepared_context_rejects_wrong_same_graph_scope,
 		),
 		(
 			"prepared context resolves dimension constraints",

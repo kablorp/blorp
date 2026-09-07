@@ -168,6 +168,7 @@ import:
 		indexed_graph_module_scopes,
 		indexed_graph_modules,
 		indexed_graph_select_dependency_scopes,
+		indexed_graph_select_dependency_scopes_by_table_index,
 		indexed_graph_target,
 		indexed_graph_target_scope,
 		prepared_module_canonical_path,
@@ -175,9 +176,10 @@ import:
 		prepared_module_program,
 		prepared_module_scope_canonical_path,
 		prepared_module_scope_definition_index,
-		prepared_module_scope_find_module,
+		prepared_module_scope_id,
 		prepared_module_scope_identity,
 		prepared_module_scope_module,
+		prepared_module_scopes_are_compatible,
 		prepared_module_surface,
 	headers/callable_headers:
 		CallableHeaderGraph,
@@ -230,6 +232,7 @@ import:
 		BoundModuleGraphError,
 		bound_module_canonical_path,
 		bound_module_graph_build,
+		bound_module_graph_build_all,
 		bound_module_graph_error_message,
 		bound_module_graph_modules,
 		bound_module_graph_modules_for_prepared,
@@ -240,6 +243,7 @@ import:
 	modules/import_binding: ImportBinding(QualifiedModuleBinding, SelectiveDefinitionBinding)
 	modules/module_binding:
 		ImportableModule,
+		ImportableModuleGraph,
 		ImportableModuleIndex,
 		importable_module_decls,
 		importable_module_graph,
@@ -666,6 +670,24 @@ private pure func bind_typecheck_graph(
 	bound_module_graph_build(
 		indexed_graph,
 		module_paths,
+		func(scope): typecheck_bind_program_module_view(
+			graph_typecheck_state(scope, allow_debug_only_calls),
+			prepared_module_program(prepared_module_scope_module(scope)),
+			importable_index,
+			prepared_module_scope_canonical_path(scope),
+		),
+	)
+
+
+private pure func bind_all_typecheck_graph(
+	indexed_graph: IndexedGraph,
+	selected_scopes: List[PreparedModuleScope],
+	importable_index: ImportableModuleIndex,
+	allow_debug_only_calls: Bool,
+) -> Result[BoundModuleGraph, List[BoundModuleGraphError]]:
+	bound_module_graph_build_all(
+		indexed_graph,
+		selected_scopes,
 		func(scope): typecheck_bind_program_module_view(
 			graph_typecheck_state(scope, allow_debug_only_calls),
 			prepared_module_program(prepared_module_scope_module(scope)),
@@ -1251,24 +1273,14 @@ private record FrontendTypecheckInput {
 }
 
 
-private pure func frontend_graph_module_paths_for_ids(
-	graph: FrontendGraph,
+private pure func indexed_graph_module_scopes_for_frontend_ids(
+	indexed_graph: IndexedGraph,
 	module_ids: List[FrontendModuleId],
-) -> Option[List[String]]:
-	var paths: List[String] = []
-	var valid: Bool = True
-
-	for module_id in module_ids:
-		match frontend_graph_module(graph, module_id):
-			Some(module):
-				paths = paths.append(resolved_module_canonical_path(module.identity))
-			None:
-				valid = False
-
-	if valid:
-		Some(paths)
-	else:
-		None
+) -> Result[List[PreparedModuleScope], List[IndexedGraphError]]:
+	indexed_graph_select_dependency_scopes_by_table_index(
+		indexed_graph,
+		module_ids.map(frontend_module_id_table_index),
+	)
 
 
 private pure func frontend_typecheck_input(
@@ -1280,6 +1292,11 @@ private pure func frontend_typecheck_input(
 	rewrites = frontend_graph_import_path_rewrites(graph)
 	target = prepare_frontend_graph_module(graph, root_id, root, rewrites)
 	var module_candidates: List[ModuleLoadCandidate] = []
+	var module_targets_valid: Bool = True
+
+	for module_target_id in module_target_ids:
+		if frontend_graph_module(graph, module_target_id).is_none():
+			module_targets_valid = False
 
 	for module_id in frontend_graph_module_ids(graph):
 		if module_id == root_id:
@@ -1298,12 +1315,15 @@ private pure func frontend_typecheck_input(
 				None:
 					void
 
-	Some({
-		target = target,
-		module_candidates = module_candidates,
-		target_id = root_id,
-		module_target_ids = module_target_ids,
-	})
+	if module_targets_valid:
+		Some({
+			target = target,
+			module_candidates = module_candidates,
+			target_id = root_id,
+			module_target_ids = module_target_ids,
+		})
+	else:
+		None
 
 
 private pure func indexed_graph_error_messages(errors: List[IndexedGraphError]) -> List[String]:
@@ -1468,25 +1488,14 @@ private pure func ctfe_imported_program_from_accepted_module(
 
 private pure func body_graph_typecheck_module(
 	graph: BodyTypecheckGraph,
-	module_identity: ModuleIdentity,
 	scope: PreparedModuleScope,
 	allow_debug_only_calls: Bool,
 ) -> Option[AcceptedTypecheckModule]:
 	match graph:
 		AcceptedBodyTypecheckGraph(accepted):
-			accepted_graph_typecheck_module(
-				accepted,
-				module_identity,
-				scope,
-				allow_debug_only_calls,
-			)
+			accepted_graph_typecheck_module(accepted, scope, allow_debug_only_calls)
 		RecoverableBodyTypecheckGraph(recoverable):
-			recoverable_graph_typecheck_module(
-				recoverable,
-				module_identity,
-				scope,
-				allow_debug_only_calls,
-			)
+			recoverable_graph_typecheck_module(recoverable, scope, allow_debug_only_calls)
 
 
 private pure func body_graph_ctfe_artifact_typecheck_module(
@@ -1536,12 +1545,7 @@ private pure func ctfe_imported_program_from_bound(
 	scope = bound_module_scope(bound_module)
 	state = graph_typecheck_state(scope, allow_debug_only_calls)
 
-	match body_graph_typecheck_module(
-		typecheck_graph,
-		bound_module_identity(bound_module),
-		scope,
-		allow_debug_only_calls,
-	):
+	match body_graph_typecheck_module(typecheck_graph, scope, allow_debug_only_calls):
 		Some(header_module):
 			ctfe_imported_program_from_accepted_module(scope, header_module)
 		None:
@@ -1834,18 +1838,15 @@ private pure func prepare_ctfe_dependency_program(
 	allow_debug_only_calls: Bool,
 	accepted_graph: BodyTypecheckGraph,
 ) -> PreparedCtfeProgramBuild:
-	dependency_module = prepared_module_scope_module(bound_module_scope(dependency))
+	dependency_scope = bound_module_scope(dependency)
 
-	match prepared_module_scope_find_module(
-		target_scope,
-		prepared_module_canonical_path(dependency_module),
-	):
-		None:
+	match prepared_module_scopes_are_compatible(target_scope, dependency_scope):
+		False:
 			{
 				program = FailedCtfeProgram,
 				body_checks = 0
 			}
-		Some(dependency_scope):
+		True:
 			can_try_artifact_environment = reusable_artifact_paths.contains(
 				prepared_module_canonical_path(prepared_module_scope_module(dependency_scope)),
 			)
@@ -1920,12 +1921,7 @@ private pure func ctfe_body_module_registries(
 	var registries: List[CtfeBodyModuleRegistry] = []
 	var failed: Bool = False
 
-	match accepted_graph_typecheck_module(
-		graph,
-		prepared_module_scope_identity(target_scope),
-		target_scope,
-		allow_debug_only_calls,
-	):
+	match accepted_graph_typecheck_module(graph, target_scope, allow_debug_only_calls):
 		Some(module):
 			registries = registries.append({
 				module_path = prepared_module_scope_canonical_path(target_scope),
@@ -1938,7 +1934,6 @@ private pure func ctfe_body_module_registries(
 		if not failed:
 			match accepted_graph_typecheck_module(
 				graph,
-				bound_module_identity(dependency),
 				bound_module_scope(dependency),
 				allow_debug_only_calls,
 			):
@@ -2608,12 +2603,7 @@ private pure func typecheck_bound_program(
 	scope = bound_module_scope(bound_module)
 	initial_state = graph_typecheck_state(scope, allow_debug_only_calls)
 
-	match body_graph_typecheck_module(
-		accepted_graph,
-		bound_module_identity(bound_module),
-		scope,
-		allow_debug_only_calls,
-	):
+	match body_graph_typecheck_module(accepted_graph, scope, allow_debug_only_calls):
 		Some(header_module):
 			typecheck_program_with_type_header_module_for_policy(header_module, main_policy)
 		None:
@@ -2646,12 +2636,7 @@ private pure func typecheck_bound_program_with_seeded_bodies(
 	scope = bound_module_scope(bound_module)
 	initial_state = graph_typecheck_state(scope, allow_debug_only_calls)
 
-	match body_graph_typecheck_module(
-		accepted_graph,
-		bound_module_identity(bound_module),
-		scope,
-		allow_debug_only_calls,
-	):
+	match body_graph_typecheck_module(accepted_graph, scope, allow_debug_only_calls):
 		Some(header_module):
 			body_check_registry_materialize_complete_with_seed(
 				accepted_typecheck_module_body_registry(header_module),
@@ -2772,12 +2757,7 @@ private func typechecked_prepared_module_with_ownership_and_trace(
 	scope = bound_module_scope(bound_module)
 	initial_state = graph_typecheck_state(scope, allow_debug_only_calls)
 
-	typed_result = match body_graph_typecheck_module(
-		accepted_graph,
-		bound_module_identity(bound_module),
-		scope,
-		allow_debug_only_calls,
-	):
+	typed_result = match body_graph_typecheck_module(accepted_graph, scope, allow_debug_only_calls):
 		Some(header_module):
 			typecheck_program_with_type_header_module_and_trace_for_policy(
 				header_module,
@@ -3315,18 +3295,17 @@ private func typechecked_graph_module_with_trace(
 
 
 private pure func prepare_typecheck_graph_from_completed_headers(
-	module_targets: List[String],
 	allow_debug_only_calls: Bool,
 	target: PreparedModule,
 	target_scope: PreparedModuleScope,
 	bound_graph: BoundModuleGraph,
+	bound_modules: List[BoundModule],
 	ctfe_dependency_plan: List[PreparedModule],
 	modules: List[PreparedModule],
 	selected_modules: List[PreparedModule],
 	typecheck_graph: BodyTypecheckGraph,
 ) -> PreparedTypecheckGraphResult:
 	bound_target = bound_module_graph_target(bound_graph)
-	bound_modules = selected_bound_modules(bound_graph, module_targets)
 	ctfe_result = prepare_ctfe_dependencies_from_bound_graph(
 		target_scope,
 		bound_graph,
@@ -3357,13 +3336,66 @@ private pure func prepare_typecheck_graph_from_completed_headers(
 			})
 
 
+private pure func prepare_bound_typecheck_graph(
+	indexed_graph: IndexedGraph,
+	importable_graph: ImportableModuleGraph,
+	bound_graph: BoundModuleGraph,
+	bound_modules: List[BoundModule],
+	selected_scopes: List[PreparedModuleScope],
+	allow_debug_only_calls: Bool,
+) -> PreparedTypecheckGraphResult:
+	target_scope = indexed_graph_target_scope(indexed_graph)
+	target = prepared_module_scope_module(target_scope)
+	modules = indexed_graph_modules(indexed_graph)
+	selected_modules = selected_scopes.map(prepared_module_scope_module)
+	ctfe_dependency_plan = ctfe_dependencies_for_graph(target, modules, selected_modules)
+
+	match validated_implementation_headers(bound_graph):
+		Err(errors):
+			PreparedTypecheckGraphRejected(RejectedPreparedTarget(target), errors)
+		Ok(implementation_headers):
+			match complete_typecheck_graph(
+				implementation_headers,
+				importable_graph,
+				allow_debug_only_calls,
+			):
+				TypecheckGraphCompletionRejected(completion_errors):
+					PreparedTypecheckGraphRejected(
+						RejectedPreparedTarget(target),
+						typecheck_diagnostics_from_messages(completion_errors),
+					)
+				TypecheckGraphRecoverable(recoverable_graph):
+					prepare_typecheck_graph_from_completed_headers(
+						allow_debug_only_calls,
+						target,
+						target_scope,
+						bound_graph,
+						bound_modules,
+						ctfe_dependency_plan,
+						modules,
+						selected_modules,
+						RecoverableBodyTypecheckGraph(recoverable_graph),
+					)
+				TypecheckGraphAccepted(accepted_graph):
+					prepare_typecheck_graph_from_completed_headers(
+						allow_debug_only_calls,
+						target,
+						target_scope,
+						bound_graph,
+						bound_modules,
+						ctfe_dependency_plan,
+						modules,
+						selected_modules,
+						AcceptedBodyTypecheckGraph(accepted_graph),
+					)
+
+
 private pure func prepare_indexed_typecheck_graph(
 	indexed_graph: IndexedGraph,
 	module_targets: List[String],
 	allow_debug_only_calls: Bool,
 ) -> PreparedTypecheckGraphResult:
-	target_scope = indexed_graph_target_scope(indexed_graph)
-	target = prepared_module_scope_module(target_scope)
+	target = indexed_graph_target(indexed_graph)
 	modules = indexed_graph_modules(indexed_graph)
 	importable_graph = importable_module_graph(indexed_graph)
 	importable_index = importable_module_graph_all_index(importable_graph)
@@ -3375,8 +3407,6 @@ private pure func prepare_indexed_typecheck_graph(
 				typecheck_diagnostics_from_messages(indexed_graph_error_messages(errors)),
 			)
 		Ok(selected_scopes):
-			selected_modules = selected_scopes.map(prepared_module_scope_module)
-			ctfe_dependency_plan = ctfe_dependencies_for_graph(target, modules, selected_modules)
 			binding_module_paths = append_unique_binding_module_paths(module_targets, modules)
 
 			match bind_typecheck_graph(
@@ -3393,44 +3423,55 @@ private pure func prepare_indexed_typecheck_graph(
 						),
 					)
 				Ok(bound_graph):
-					match validated_implementation_headers(bound_graph):
-						Err(errors):
-							PreparedTypecheckGraphRejected(RejectedPreparedTarget(target), errors)
-						Ok(implementation_headers):
-							match complete_typecheck_graph(
-								implementation_headers,
-								importable_graph,
-								allow_debug_only_calls,
-							):
-								TypecheckGraphCompletionRejected(completion_errors):
-									PreparedTypecheckGraphRejected(
-										RejectedPreparedTarget(target),
-										typecheck_diagnostics_from_messages(completion_errors),
-									)
-								TypecheckGraphRecoverable(recoverable_graph):
-									prepare_typecheck_graph_from_completed_headers(
-										module_targets,
-										allow_debug_only_calls,
-										target,
-										target_scope,
-										bound_graph,
-										ctfe_dependency_plan,
-										modules,
-										selected_modules,
-										RecoverableBodyTypecheckGraph(recoverable_graph),
-									)
-								TypecheckGraphAccepted(accepted_graph):
-									prepare_typecheck_graph_from_completed_headers(
-										module_targets,
-										allow_debug_only_calls,
-										target,
-										target_scope,
-										bound_graph,
-										ctfe_dependency_plan,
-										modules,
-										selected_modules,
-										AcceptedBodyTypecheckGraph(accepted_graph),
-									)
+					prepare_bound_typecheck_graph(
+						indexed_graph,
+						importable_graph,
+						bound_graph,
+						selected_bound_modules(bound_graph, module_targets),
+						selected_scopes,
+						allow_debug_only_calls,
+					)
+
+
+private pure func prepare_indexed_typecheck_graph_by_id(
+	indexed_graph: IndexedGraph,
+	module_target_ids: List[FrontendModuleId],
+	allow_debug_only_calls: Bool,
+) -> PreparedTypecheckGraphResult:
+	target = indexed_graph_target(indexed_graph)
+	importable_graph = importable_module_graph(indexed_graph)
+
+	match indexed_graph_module_scopes_for_frontend_ids(indexed_graph, module_target_ids):
+		Err(errors):
+			PreparedTypecheckGraphRejected(
+				RejectedPreparedTarget(target),
+				typecheck_diagnostics_from_messages(indexed_graph_error_messages(errors)),
+			)
+		Ok(selected_scopes):
+			importable_index = importable_module_graph_all_index(importable_graph)
+
+			match bind_all_typecheck_graph(
+				indexed_graph,
+				selected_scopes,
+				importable_index,
+				allow_debug_only_calls,
+			):
+				Err(errors):
+					PreparedTypecheckGraphRejected(
+						RejectedPreparedTarget(target),
+						typecheck_diagnostics_from_messages(
+							bound_module_graph_error_messages(errors),
+						),
+					)
+				Ok(bound_graph):
+					prepare_bound_typecheck_graph(
+						indexed_graph,
+						importable_graph,
+						bound_graph,
+						bound_module_graph_modules(bound_graph).take(selected_scopes.length()),
+						selected_scopes,
+						allow_debug_only_calls,
+					)
 
 
 private pure func prepare_typecheck_graph(
@@ -3847,7 +3888,6 @@ pure func typecheck_frontend_graph_ids(
 	allow_debug_only_calls: Bool,
 ) -> Option[TypecheckedGraph]:
 	input ?= frontend_typecheck_input(graph, root_id, module_target_ids)
-	module_targets ?= frontend_graph_module_paths_for_ids(graph, input.module_target_ids)
 
 	prepared = match indexed_graph_build_for_module_table(
 		input.module_candidates,
@@ -3859,7 +3899,11 @@ pure func typecheck_frontend_graph_ids(
 				typecheck_diagnostics_from_messages(indexed_graph_error_messages(errors)),
 			)
 		Ok(indexed_graph):
-			prepare_indexed_typecheck_graph(indexed_graph, module_targets, allow_debug_only_calls)
+			prepare_indexed_typecheck_graph_by_id(
+				indexed_graph,
+				input.module_target_ids,
+				allow_debug_only_calls,
+			)
 
 	Some(typechecked_graph_from_prepared(prepared, allow_debug_only_calls))
 
