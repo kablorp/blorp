@@ -38757,22 +38757,6 @@ static void* __process_command_error(
     );
 }
 
-static void* __process_command_errno(
-    blorp_ProcessErrorKind kind,
-    const char* operation,
-    int errnum
-) {
-    char detail[256];
-    snprintf(
-        detail,
-        sizeof(detail),
-        "%s: %s",
-        operation,
-        strerror(errnum)
-    );
-    return __process_command_error(kind, detail);
-}
-
 static void* __process_command_success(
     blorp_ProcessExitKind exit_kind,
     long exit_code,
