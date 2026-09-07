@@ -28,6 +28,10 @@ import:
 -- scheduling margin for all four clients without weakening socket deadlines.
 http_stream_timeout_ms: Int = 5000
 
+-- Requests are explicitly queued before accepting, so this only detects the
+-- end of the finite test workload rather than racing client startup.
+http_listener_idle_timeout_ms: Int = 1000
+
 http_client_result_timeout_ms: Int = 15000
 
 -- Intentionally force each HTTP message to span multiple TCP reads.
@@ -45,13 +49,14 @@ pure func route(req: Request) -> Response:
 	HTTP.ok_text("handled " + req.path)
 
 
-func client_get(port_num: Int, path: String) -> Result[Bool, TcpError]:
+func client_get(port_num: Int, path: String, ready: Channel[Bool]) -> Result[Bool, TcpError]:
 	remote ?= port(port_num)
 
 	with stream ?= connect_loopback(IPv4, remote):
 		ignored_timeout ?= set_stream_timeout(stream, http_stream_timeout_ms)
 		request: Bytes = ("GET " + path + " HTTP/1.1\r\nHost: localhost\r\n\r\n").to_bytes()
 		ignored ?= write_all(stream, request)
+		_ = send(ready, True)
 		var raw: Bytes = "".to_bytes()
 		var reading: Bool = True
 		var read_error: Option[TcpError] = None
@@ -70,36 +75,49 @@ func client_get(port_num: Int, path: String) -> Result[Bool, TcpError]:
 					reading = False
 
 		match read_error:
-			Some(err):
-				Err(err)
+			Some(_):
+				-- Read failures happen after readiness has already been published.
+				Ok(False)
 			None:
 				text: String = raw.to_string()
 				Ok(text.contains("HTTP/1.1 200 OK") and text.contains("handled " + path))
 
 
-func detached_client(port: Int, path: String, results: Channel[Bool]):
-	match client_get(port, path):
+func detached_client(
+	port: Int,
+	path: String,
+	ready: Channel[Bool],
+	results: Channel[Bool],
+):
+	match client_get(port, path, ready):
 		Ok(ok):
 			_ = send(results, ok)
 		Err(_):
+			-- Every error propagated by client_get occurs before it publishes readiness.
+			_ = send(ready, False)
 			_ = send(results, False)
 
 
-func launch_clients(port: Int, count: Int, results: Channel[Bool]):
+func launch_clients(
+	port: Int,
+	count: Int,
+	ready: Channel[Bool],
+	results: Channel[Bool],
+):
 	var i: Int = 0
 
 	while i < count:
 		path: String = "/item-${i}"
-		detach detached_client(port, path, results)
+		detach detached_client(port, path, ready, results)
 		i += 1
 
 
-func collect_client_results(results: Channel[Bool], count: Int) -> Bool:
+func collect_client_statuses(statuses: Channel[Bool], count: Int) -> Bool:
 	var seen: Int = 0
 	var ok: Bool = True
 
 	while seen < count:
-		match recv_timeout(results, http_client_result_timeout_ms):
+		match recv_timeout(statuses, http_client_result_timeout_ms):
 			Some(value):
 				ok = ok and value
 				seen += 1
@@ -112,11 +130,15 @@ func collect_client_results(results: Channel[Bool], count: Int) -> Bool:
 
 func run_resource_http_server(client_count: Int) -> Result[Bool, TcpError]:
 	with listener ?= listen_loopback_any_port(IPv4, http_listener_backlog):
-		ignored ?= set_timeout(listener, http_stream_timeout_ms)
+		ignored ?= set_timeout(listener, http_listener_idle_timeout_ms)
 		port_num ?= local_port(listener)
+		ready: Channel[Bool] = channel(client_count)
 		results: Channel[Bool] = channel(client_count)
-		launch_clients(port_num, client_count, results)
+		launch_clients(port_num, client_count, ready, results)
+		clients_ready: Bool = collect_client_statuses(ready, client_count)
 
+		-- Successful requests are queued before the listener's idle timeout begins
+		-- to delimit the finite test server run.
 		for peer in connections_stop_on_error(listener) concurrently(limit: 4):
 			match set_stream_timeout(peer, http_stream_timeout_ms):
 				Ok(_):
@@ -156,7 +178,8 @@ func run_resource_http_server(client_count: Int) -> Result[Bool, TcpError]:
 				Err(_):
 					void
 
-		Ok(collect_client_results(results, client_count))
+		client_results_ok: Bool = collect_client_statuses(results, client_count)
+		Ok(clients_ready and client_results_ok)
 
 
 func test_concurrent_resource_http_server() -> Bool:
