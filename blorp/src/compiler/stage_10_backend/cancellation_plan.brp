@@ -225,6 +225,11 @@ record CancellationProtectionPlan {
 }
 
 
+private union CancellationPlanningMode:
+	CurrentBehaviorCancellationPlanning
+	RegionSensitiveCancellationPlanning(CancellationProgramSummary, CancellationIdentityIndex)
+
+
 pure func cancellation_cleanup_action_for_release_policy(
 	policy: CoreReleasePolicy,
 ) -> Option[CancellationCleanupAction]:
@@ -271,7 +276,8 @@ private record CancellationOwnershipFacts {
 	consumed: List[CoreVar],
 	consumed_before_suspension: List[CoreVar],
 	direct_returns: List[CoreVar],
-	non_suspending_transfer: Bool
+	non_suspending_transfer: Bool,
+	may_cancel: Bool
 }
 
 
@@ -289,7 +295,8 @@ private EMPTY_OWNERSHIP_FACTS: CancellationOwnershipFacts = {
 	consumed = [],
 	consumed_before_suspension = [],
 	direct_returns = [],
-	non_suspending_transfer = False
+	non_suspending_transfer = False,
+	may_cancel = False
 }
 
 
@@ -317,6 +324,10 @@ private pure func merge_vars(left: List[CoreVar], right: List[CoreVar]) -> List[
 	result
 
 
+private pure func intersect_vars(left: List[CoreVar], right: List[CoreVar]) -> List[CoreVar]:
+	left.filter(func(variable): vars_contain(right, variable))
+
+
 private pure func remove_var(variables: List[CoreVar], removed: CoreVar) -> List[CoreVar]:
 	variables.filter(func(variable): not core_vars_equal(variable, removed))
 
@@ -329,6 +340,21 @@ private pure func merge_child_vars(
 
 	for child in children:
 		result = merge_vars(result, selector(child))
+
+	result
+
+
+private pure func consumed_before_cancellation_in_sequence(
+	children: List[CancellationOwnershipFacts],
+) -> List[CoreVar]:
+	var result: List[CoreVar] = []
+	var prefix_is_non_suspending: Bool = True
+
+	for child in children:
+		if prefix_is_non_suspending:
+			result = merge_vars(result, child.consumed_before_suspension)
+
+		prefix_is_non_suspending = prefix_is_non_suspending and child.non_suspending_transfer
 
 	result
 
@@ -438,6 +464,24 @@ pure func cancellation_call_consumed_arg_indices(kind: CoreCallKind, arg_count: 
 					fallback_consumed_arg_indices(kind)
 
 
+private pure func cancellation_call_argument_has_entry_handoff(
+	kind: CoreCallKind,
+	arg_index: Int,
+	arg_count: Int,
+) -> Bool:
+	match kind:
+		UserCall(_, _, _):
+			-- Final Core does not yet retain the callee's parameter-ownership
+			-- contract, and the runtime cannot transfer a cleanup frame between
+			-- caller and callee slots. A consumed_args entry alone cannot prove
+			-- entry handoff.
+			False
+		_:
+			-- Non-user ownership contracts describe the runtime ABI itself, so a
+			-- consuming argument transfers at C entry.
+			cancellation_call_consumed_arg_indices(kind, arg_count).contains(arg_index)
+
+
 private pure func call_kind_is_non_suspending_transfer(kind: CoreCallKind) -> Bool:
 	match kind:
 		IntrinsicCall(name):
@@ -520,24 +564,35 @@ private pure func consumed_call_vars_before_suspension(
 	kind: CoreCallKind,
 	args: List[CoreExpr],
 	children: List[CancellationOwnershipFacts],
+	mode: CancellationPlanningMode,
 ) -> List[CoreVar]:
 	indices: List[Int] = cancellation_call_consumed_arg_indices(kind, args.length())
 	var variables: List[CoreVar] = []
-	var prefix_is_non_suspending: Bool = True
+	var reaches_call_entry_without_suspension: Bool = True
 	var index: Int = 0
 
+	for child in children:
+		if not child.non_suspending_transfer:
+			reaches_call_entry_without_suspension = False
+			break
+
 	for arg in args:
-		if prefix_is_non_suspending and indices.contains(index):
+		has_entry_handoff: Bool = match mode:
+			CurrentBehaviorCancellationPlanning:
+				True
+			RegionSensitiveCancellationPlanning(_, _):
+				cancellation_call_argument_has_entry_handoff(kind, index, args.length())
+
+		if (
+			reaches_call_entry_without_suspension
+			and indices.contains(index)
+			and has_entry_handoff
+		):
 			match expr_is_var_reference(arg):
 				Some(variable):
 					variables = add_var(variables, variable)
 				None:
 					void
-
-		prefix_is_non_suspending = (
-			prefix_is_non_suspending
-			and child_facts(children, index + 1).non_suspending_transfer
-		)
 
 		index += 1
 
@@ -632,12 +687,15 @@ private pure func analyzed_consumed_vars(
 private pure func analyzed_consumed_before_suspension_vars(
 	expr: CoreExpr,
 	children: List[CancellationOwnershipFacts],
+	mode: CancellationPlanningMode,
 ) -> List[CoreVar]:
 	match expr:
 		RawMatchExpr(_, _, _, _) | SemanticMatchExpr(_, _, _, _):
-			merge_child_vars(children, func(child): child.consumed_before_suspension)
+			-- Match branches are alternatives, not a sequence. A branch-local
+			-- endpoint cannot establish ownership transfer on every path.
+			child_facts(children, 0).consumed_before_suspension
 		CallExpr(kind, _, args, _, _):
-			consumed_call_vars_before_suspension(kind, args, children)
+			consumed_call_vars_before_suspension(kind, args, children, mode)
 		DebugBlockExpr(_, _, _) | DupExpr(_, _, _, _, _, _):
 			child_facts(children, 0).consumed_before_suspension
 		DropExpr(variable, _, _, _, _, _):
@@ -674,11 +732,25 @@ private pure func analyzed_consumed_before_suspension_vars(
 		AssignExpr(_, rhs, _, _):
 			optional_var_list(expr_is_var_reference(rhs))
 		BinaryExpr(op, left, right, _, _):
-			collection_equality_vars(op, left, right)
+			if children.all(func(child): child.non_suspending_transfer):
+				collection_equality_vars(op, left, right)
+			else:
+				[]
 		TupleExpr(_, _, _) | VectorExpr(_, _, _) | DictExpr(_, _, _):
-			merge_child_vars(children, func(child): child.consumed_before_suspension)
+			consumed_before_cancellation_in_sequence(children)
 		IfExpr(_, _, _, _, _):
-			merge_child_vars(children, func(child): child.consumed)
+			condition: CancellationOwnershipFacts = child_facts(children, 0)
+
+			if condition.non_suspending_transfer:
+				merge_vars(
+					condition.consumed_before_suspension,
+					intersect_vars(
+						child_facts(children, 1).consumed_before_suspension,
+						child_facts(children, 2).consumed_before_suspension,
+					),
+				)
+			else:
+				condition.consumed_before_suspension
 		_:
 			[]
 
@@ -719,10 +791,70 @@ private pure func let_cleanup_action(
 				)
 
 
+private pure func program_identity_index(
+	program_summary: CancellationProgramSummary,
+) -> CancellationIdentityIndex:
+	{
+		by_def_id = program_summary.function_identities_by_def_id,
+		collisions_by_def_id = program_summary.function_identity_collisions_by_def_id
+	}
+
+
+private pure func region_call_may_cancel(
+	kind: CoreCallKind,
+	program_summary: CancellationProgramSummary,
+	identities: CancellationIdentityIndex,
+) -> Bool:
+	match classify_call(kind, identities):
+		NonCancellingCall:
+			False
+		CancellingCall(_):
+			True
+		CallableCall(identity):
+			match cancellation_function_summary(program_summary, identity):
+				Some(summary):
+					cancellation_effect_may_cancel(summary)
+				None:
+					True
+
+
+private pure func expression_node_may_cancel(
+	expr: CoreExpr,
+	mode: CancellationPlanningMode,
+) -> Bool:
+	match expr:
+		CooperativeCheckpointExpr(_, _):
+			True
+		CallExpr(kind, _, _, _, _):
+			match mode:
+				CurrentBehaviorCancellationPlanning:
+					True
+				RegionSensitiveCancellationPlanning(program_summary, identities):
+					region_call_may_cancel(kind, program_summary, identities)
+		ForChannelExpr(_, _, _) | ForStreamExpr(_, _, _) | PreClosureConcurrentlyLoopExpr(_, _, _) | ConcurrentlyLoopExpr(_, _, _) | PreClosureConcurrentExpr(_, _, _) | ConcurrentExpr(_, _, _) | SelectExpr(_, _, _):
+			True
+		PreClosureDetachExpr(_, _, _) | DetachExpr(_, _, _):
+			True
+		_:
+			False
+
+
+private pure func child_may_cancel(children: List[CancellationOwnershipFacts]) -> Bool:
+	var result: Bool = False
+
+	for child in children:
+		if child.may_cancel:
+			result = True
+			break
+
+	result
+
+
 private pure func analyze_current_behavior_expr(
 	expr: CoreExpr,
 	next_site: Int,
 	next_owner: Int,
+	mode: CancellationPlanningMode,
 ) -> CancellationPlanAnalysis:
 	current_site: CancellationSiteId = cancellation_site_id(next_site)
 
@@ -750,6 +882,7 @@ private pure func analyze_current_behavior_expr(
 			child_expr,
 			child_site,
 			child_owner,
+			mode,
 		)
 		children = children.append(child_analysis.facts)
 		child_live_slots = child_live_slots.append(child_analysis.max_live_slots)
@@ -774,7 +907,18 @@ private pure func analyze_current_behavior_expr(
 				or vars_contain(body_facts.consumed_before_suspension, variable)
 			)
 
-			tracks_cleanup: Bool = action.is_some() and not body_takes_ownership
+			crosses_cancellation: Bool = match mode:
+				CurrentBehaviorCancellationPlanning:
+					True
+				RegionSensitiveCancellationPlanning(_, _):
+					body_facts.may_cancel
+
+			tracks_cleanup: Bool = (
+				action.is_some()
+				and not body_takes_ownership
+				and crosses_cancellation
+			)
+
 			untracks_after_body: Bool = (
 				tracks_cleanup
 				and not vars_contain(body_facts.consumed, variable)
@@ -824,9 +968,14 @@ private pure func analyze_current_behavior_expr(
 	{
 		facts = {
 			consumed = analyzed_consumed_vars(expr, children),
-			consumed_before_suspension = analyzed_consumed_before_suspension_vars(expr, children),
+			consumed_before_suspension = analyzed_consumed_before_suspension_vars(
+				expr,
+				children,
+				mode,
+			),
 			direct_returns = analyzed_direct_returns(expr, children),
-			non_suspending_transfer = analyzed_non_suspending_transfer(expr, children)
+			non_suspending_transfer = analyzed_non_suspending_transfer(expr, children),
+			may_cancel = expression_node_may_cancel(expr, mode) or child_may_cancel(children)
 		},
 		sites = sites,
 		let_protections = protections,
@@ -840,7 +989,21 @@ pure func build_current_behavior_cancellation_plan(
 	activation: CancellationActivationIdentity,
 	body: CoreExpr,
 ) -> CancellationProtectionPlan:
-	analysis: CancellationPlanAnalysis = analyze_current_behavior_expr(body, 0, 0)
+	analysis: CancellationPlanAnalysis = analyze_current_behavior_expr(
+		body,
+		0,
+		0,
+		CurrentBehaviorCancellationPlanning,
+	)
+
+	protection_plan_from_analysis(activation, MayCancelCurrentTask, analysis)
+
+
+private pure func protection_plan_from_analysis(
+	activation: CancellationActivationIdentity,
+	effect: CoreCancellationEffect,
+	analysis: CancellationPlanAnalysis,
+) -> CancellationProtectionPlan:
 	var protections_by_uniq: Dict[Int, List[CancellationLetProtection]] = {}
 
 	for protection in analysis.let_protections:
@@ -855,7 +1018,7 @@ pure func build_current_behavior_cancellation_plan(
 
 	{
 		activation = activation,
-		effect = MayCancelCurrentTask,
+		effect = effect,
 		max_live_slots = analysis.max_live_slots,
 		sites = analysis.sites,
 		let_protections = analysis.let_protections,
@@ -873,6 +1036,40 @@ pure func build_current_behavior_cancellation_plan_with_summary(
 	{ plan | effect = cancellation_summary_effect(summary) }
 
 
+pure func build_region_sensitive_cancellation_plan(
+	activation: CancellationActivationIdentity,
+	body: CoreExpr,
+	program_summary: CancellationProgramSummary,
+) -> CancellationProtectionPlan:
+	analysis: CancellationPlanAnalysis = analyze_current_behavior_expr(
+		body,
+		0,
+		0,
+		RegionSensitiveCancellationPlanning(
+			program_summary,
+			program_identity_index(program_summary),
+		),
+	)
+
+	activation_summary: CancellationSummary = match activation:
+		FunctionCancellationActivation(identity):
+			cancellation_function_summary(
+				program_summary,
+				identity,
+			).get_or({reasons = [UnknownCallBoundary]})
+		GlobalInitializerCancellationActivation(identity):
+			cancellation_global_initializer_summary(
+				program_summary,
+				identity,
+			).get_or({reasons = [UnknownCallBoundary]})
+
+	protection_plan_from_analysis(
+		activation,
+		cancellation_summary_effect(activation_summary),
+		analysis,
+	)
+
+
 pure func cancellation_let_protection(
 	plan: CancellationProtectionPlan,
 	variable: CoreVar,
@@ -880,6 +1077,20 @@ pure func cancellation_let_protection(
 	plan.let_protections_by_uniq
 		.get_or(variable.uniq, [])
 		.find(func(decision): core_vars_equal(decision.variable, variable))
+
+
+pure func cancellation_variable_requires_protection(
+	plan: CancellationProtectionPlan,
+	variable: CoreVar,
+) -> Bool:
+	if not cancellation_plan_requires_local_owner_protection(plan):
+		False
+	else:
+		match cancellation_let_protection(plan, variable):
+			Some(protection):
+				protection.tracks_cleanup
+			None:
+				True
 
 
 pure func cancellation_backend_temporary_candidate(
@@ -982,7 +1193,9 @@ record CancellationProgramSummary {
 	functions: List[CancellationFunctionSummary],
 	global_initializers: List[CancellationGlobalInitializerSummary],
 	functions_by_def_id: Dict[Int, CancellationFunctionSummary],
-	global_initializers_by_def_id: Dict[Int, CancellationGlobalInitializerSummary]
+	global_initializers_by_def_id: Dict[Int, CancellationGlobalInitializerSummary],
+	function_identities_by_def_id: Dict[Int, CoreDefinitionIdentity],
+	function_identity_collisions_by_def_id: Dict[Int, Bool]
 }
 
 
@@ -1374,7 +1587,9 @@ pure func analyze_program_cancellation(program: CoreProgram) -> CancellationProg
 		functions = function_results,
 		global_initializers = global_results,
 		functions_by_def_id = function_results_by_def_id,
-		global_initializers_by_def_id = global_results_by_def_id
+		global_initializers_by_def_id = global_results_by_def_id,
+		function_identities_by_def_id = identities.by_def_id,
+		function_identity_collisions_by_def_id = identities.collisions_by_def_id
 	}
 
 
@@ -1382,17 +1597,25 @@ pure func cancellation_function_summary(
 	program_summary: CancellationProgramSummary,
 	identity: CoreDefinitionIdentity,
 ) -> Option[CancellationSummary]:
-	program_summary.functions_by_def_id
-		.get(identity.def_id)
-		.filter(func(entry): definition_identities_equal(entry.identity, identity))
-		.map(func(entry): entry.summary)
+	match program_summary.functions_by_def_id.get(identity.def_id):
+		Some(entry):
+			if definition_identities_equal(entry.identity, identity):
+				Some(entry.summary)
+			else:
+				None
+		None:
+			None
 
 
 pure func cancellation_global_initializer_summary(
 	program_summary: CancellationProgramSummary,
 	identity: CoreDefinitionIdentity,
 ) -> Option[CancellationSummary]:
-	program_summary.global_initializers_by_def_id
-		.get(identity.def_id)
-		.filter(func(entry): definition_identities_equal(entry.identity, identity))
-		.map(func(entry): entry.summary)
+	match program_summary.global_initializers_by_def_id.get(identity.def_id):
+		Some(entry):
+			if definition_identities_equal(entry.identity, identity):
+				Some(entry.summary)
+			else:
+				None
+		None:
+			None

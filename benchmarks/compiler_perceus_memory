@@ -28,7 +28,7 @@ from compiler_backend_worker import (
 )
 
 
-FIXTURE_VERSION = 9
+FIXTURE_VERSION = 10
 DEFAULT_TIMEOUT_SECONDS = 60.0
 PERCEUS_ACTION = "run_perceus"
 MEASURE_OWNERSHIP_PREPARATION_PERCEUS_ACTION = (
@@ -47,6 +47,7 @@ BODY_SHAPES = (
     "mixed_function_owner_catalog",
     "borrowed_boundary_fusion",
     "lambda_borrowed_boundary",
+    "managed_let_transfer",
     "nested_user_call",
     "mutually_recursive_calls",
 )
@@ -118,6 +119,9 @@ PERCEUS_WORK_COUNTER_NAMES = (
     "insert_node_reconstructions",
     "insert_original_nodes_reused",
     "insert_opaque_rewrite_results",
+    "insert_managed_let_visits",
+    "insert_managed_let_original_nodes_reused",
+    "insert_managed_let_reconstructions",
     "declarations_rewritten",
     "functions_rewritten",
     "globals_rewritten",
@@ -165,6 +169,9 @@ CHANGE_AWARE_INSERT_WORK_COUNTER_NAMES = (
     "insert_node_reconstructions",
     "insert_original_nodes_reused",
     "insert_opaque_rewrite_results",
+    "insert_managed_let_visits",
+    "insert_managed_let_original_nodes_reused",
+    "insert_managed_let_reconstructions",
 )
 LEGACY_PERCEUS_WORK_COUNTER_NAMES = tuple(
     name for name in PERCEUS_WORK_COUNTER_NAMES
@@ -193,6 +200,7 @@ PRIMITIVE_PARAMETER_TYPE = "Int"
 MANAGED_PARAMETER_TYPE = "String"
 BORROWED_OWNER_TYPE_NAME = "BenchBorrowOwner"
 PERCEUS_SENTINEL_NAME = "BENCH_PERCEUS_SENTINEL"
+MANAGED_LET_TRANSFER_BINDING_ID_OFFSET = 1_000_000
 AGGREGATE_ESCAPE_SITES_PER_FUNCTION = 12
 RESULT_ALIAS_TERMINALS_PER_FUNCTION = 32
 REFERENCED_GLOBAL_MATRIX_GLOBALS = 384
@@ -327,6 +335,38 @@ def validate_change_aware_insert_counters(counters: dict[str, int]) -> None:
     if opaque > reconstructions:
         raise RuntimeError(
             "Perceus opaque insertion results exceed reconstructed source roots"
+        )
+
+
+def validate_change_aware_managed_let_counters(counters: dict[str, int]) -> None:
+    """Require one exact source-reuse decision per managed Let."""
+    visits = counters["insert_managed_let_visits"]
+    reused = counters["insert_managed_let_original_nodes_reused"]
+    reconstructions = counters["insert_managed_let_reconstructions"]
+
+    if reused + reconstructions != visits:
+        raise RuntimeError(
+            "Perceus managed-let decisions are incomplete"
+        )
+
+
+def validate_managed_let_transfer_counters(
+    counters: dict[str, int],
+    function_count: int,
+) -> None:
+    """Require one reused source Let per transfer worker plus the sentinel."""
+    visits = counters["insert_managed_let_visits"]
+    reused = counters["insert_managed_let_original_nodes_reused"]
+    reconstructions = counters["insert_managed_let_reconstructions"]
+    expected_visits = function_count + 1
+
+    if (
+        visits != expected_visits
+        or reused != function_count
+        or reconstructions != 1
+    ):
+        raise RuntimeError(
+            "Perceus managed-let transfer worker source reuse changed"
         )
 
 
@@ -1839,6 +1879,35 @@ def worker_decl(
     user_call_edges: int,
     branch_arms: int,
 ) -> JsonObject:
+    if body_shape == "managed_let_transfer":
+        variable = core_var(
+            f"BENCH_TRANSFER_LOCAL_{index:04d}",
+            MANAGED_LET_TRANSFER_BINDING_ID_OFFSET + def_id,
+        )
+        return user_function(
+            f"bench_worker_{index:04d}",
+            def_id,
+            {
+                "kind": "let",
+                "name": variable,
+                "mutable": False,
+                "type": named_type(MANAGED_PARAMETER_TYPE),
+                "rhs": literal_expr(
+                    "string",
+                    f"managed-transfer-{index:04d}",
+                    MANAGED_PARAMETER_TYPE,
+                ),
+                "body": {
+                    "kind": "var",
+                    "var": variable,
+                    "type": named_type(MANAGED_PARAMETER_TYPE),
+                    "loc": synthetic_loc(),
+                },
+            },
+            [],
+            MANAGED_PARAMETER_TYPE,
+        )
+
     if body_shape == "borrowed_boundary_fusion":
         return user_function(
             f"bench_worker_{index:04d}",
@@ -2078,7 +2147,11 @@ def call_worker_expr(
             if body_shape == "lambda_borrowed_boundary"
             else (
                 MANAGED_PARAMETER_TYPE
-                if body_shape in ("borrowed_return", "referenced_global_boundary")
+                if body_shape in (
+                    "borrowed_return",
+                    "referenced_global_boundary",
+                    "managed_let_transfer",
+                )
                 else "Int"
             )
         ),
@@ -2127,6 +2200,15 @@ def fixture_request(
 ) -> tuple[JsonObject, JsonObject]:
     if body_shape not in BODY_SHAPES:
         raise ValueError(f"unsupported Perceus body shape: {body_shape}")
+    if body_shape == "managed_let_transfer":
+        if body_leaves != 1:
+            raise ValueError("managed-let transfer requires exactly one body leaf")
+        if global_reads_per_function != 0:
+            raise ValueError("managed-let transfer does not read globals")
+        if params_per_function != 0:
+            raise ValueError("managed-let transfer does not accept parameters")
+        if parameter_type != MANAGED_PARAMETER_TYPE:
+            raise ValueError("managed-let transfer uses String values")
     globals_json = [global_decl(index) for index in range(global_count)]
     type_decls = (
         [borrowed_owner_decl()]
@@ -3247,7 +3329,13 @@ def run_benchmark(
                     counter_stderr.read_text(encoding="utf-8", errors="replace")
                 )
                 validate_change_aware_insert_counters(parsed_counters)
-                if body_shape == "referenced_global_boundary":
+                validate_change_aware_managed_let_counters(parsed_counters)
+                if body_shape == "managed_let_transfer":
+                    validate_managed_let_transfer_counters(
+                        parsed_counters,
+                        args.functions,
+                    )
+                elif body_shape == "referenced_global_boundary":
                     parsed_counters = add_referenced_global_derived_counters(
                         parsed_counters
                     )

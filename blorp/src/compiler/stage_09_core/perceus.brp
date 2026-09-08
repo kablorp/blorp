@@ -483,6 +483,18 @@ private @debug_only pure func perceus_work_insert_opaque_rewrite_results() -> In
 	black_box_int(0)
 
 
+private @debug_only pure func perceus_work_insert_managed_let_visits() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func perceus_work_insert_managed_let_original_nodes_reused() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func perceus_work_insert_managed_let_reconstructions() -> Int:
+	black_box_int(0)
+
+
 private @debug_only pure func perceus_work_declarations_rewritten() -> Int:
 	black_box_int(0)
 
@@ -568,6 +580,9 @@ pure func register_perceus_work_counters() -> Int:
 		perceus_work_insert_node_reconstructions()
 		perceus_work_insert_original_nodes_reused()
 		perceus_work_insert_opaque_rewrite_results()
+		perceus_work_insert_managed_let_visits()
+		perceus_work_insert_managed_let_original_nodes_reused()
+		perceus_work_insert_managed_let_reconstructions()
 		perceus_work_declarations_rewritten()
 		perceus_work_functions_rewritten()
 		perceus_work_globals_rewritten()
@@ -863,13 +878,16 @@ private union TemporaryBindingContractPlan:
 
 
 private record PerceusManagedLetPlan {
+	source: CoreExpr,
 	variable: CoreVar,
 	is_mutable: Bool,
 	bind_type: CoreType,
 	source_rhs: CoreExpr,
 	source_body: CoreExpr,
 	owned_rhs: CoreExpr,
-	branch_safe_body: CoreExpr
+	owned_rhs_reuses_source: Bool,
+	branch_safe_body: CoreExpr,
+	branch_safe_body_reuses_source: Bool
 }
 
 
@@ -15236,7 +15254,21 @@ private pure func normalize_scoped_binding_alias_result(
 	bindings: List[CoreMatchBinding],
 	expr: CoreExpr,
 ) -> CoreExpr:
-	if is_owned_temporary_expr(env, expr):
+	normalize_scoped_binding_alias_result_with_owned_status(
+		env,
+		bindings,
+		expr,
+		is_owned_temporary_expr(env, expr),
+	)
+
+
+private pure func normalize_scoped_binding_alias_result_with_owned_status(
+	env: PerceusEnv,
+	bindings: List[CoreMatchBinding],
+	expr: CoreExpr,
+	is_owned_temporary: Bool,
+) -> CoreExpr:
+	if is_owned_temporary:
 		expr
 	else:
 		match expr:
@@ -15293,10 +15325,30 @@ private pure func normalize_scoped_binding_alias_result(
 					expr
 
 
-private pure func normalize_binding_alias_rhs(
+private pure func binding_alias_rhs_is_owned_temporary(
 	env: PerceusEnv,
 	bind_type: CoreType,
 	rhs: CoreExpr,
+) -> Bool:
+	if not is_managed_type(env, bind_type):
+		False
+	else:
+		match rhs:
+			VarExpr(variable, typ, loc):
+				False
+			FieldExpr(owner, field, typ, loc):
+				False
+			TupleFieldExpr(owner, field_index, typ, loc):
+				False
+			_:
+				is_owned_temporary_expr(env, rhs)
+
+
+private pure func normalize_binding_alias_rhs_with_owned_status(
+	env: PerceusEnv,
+	bind_type: CoreType,
+	rhs: CoreExpr,
+	rhs_is_owned_temporary: Bool,
 ) -> CoreExpr:
 	if not is_managed_type(env, bind_type):
 		rhs
@@ -15325,7 +15377,54 @@ private pure func normalize_binding_alias_rhs(
 				else:
 					retain_alias_as_owned(rhs)
 			_:
-				normalize_scoped_binding_alias_result(env, [], rhs)
+				normalize_scoped_binding_alias_result_with_owned_status(
+					env,
+					[],
+					rhs,
+					rhs_is_owned_temporary,
+				)
+
+
+private pure func normalize_binding_alias_rhs(
+	env: PerceusEnv,
+	bind_type: CoreType,
+	rhs: CoreExpr,
+) -> CoreExpr:
+	normalize_binding_alias_rhs_with_owned_status(
+		env,
+		bind_type,
+		rhs,
+		binding_alias_rhs_is_owned_temporary(env, bind_type, rhs),
+	)
+
+
+-- This is the exact identity subset of `normalize_binding_alias_rhs`. Keep the
+-- proof beside that normalizer so a new normalization case cannot silently
+-- make a managed Let claim source reuse. Cases outside the subset remain
+-- conservative even when their rebuilt output happens to serialize equally.
+private pure func normalize_binding_alias_rhs_reuses_source(
+	env: PerceusEnv,
+	bind_type: CoreType,
+	rhs: CoreExpr,
+	rhs_is_owned_temporary: Bool,
+) -> Bool:
+	if not is_managed_type(env, bind_type):
+		True
+	else:
+		match rhs:
+			VarExpr(variable, typ, loc):
+				is_nullary_constructor_reference(env, variable)
+			FieldExpr(owner, field, typ, loc):
+				False
+			TupleFieldExpr(owner, field_index, typ, loc):
+				False
+			_:
+				-- The scoped normalizer returns an already-owned temporary
+				-- immediately. Immortal values also bypass alias retention.
+				(
+					is_immortal_value_expr(env, rhs)
+					or rhs_is_owned_temporary
+				)
 
 
 private pure func body_starts_with_dup(name: String, body: CoreExpr) -> Bool:
@@ -15790,13 +15889,33 @@ private pure func retain_mutable_match_branch_results(
 
 private pure func plan_managed_let(
 	env: PerceusEnv,
+	source: CoreExpr,
 	variable: CoreVar,
 	is_mutable: Bool,
 	bind_type: CoreType,
 	rhs: CoreExpr,
 	body: CoreExpr,
 ) -> PerceusManagedLetPlan:
-	owned_rhs: CoreExpr = normalize_binding_alias_rhs(env, bind_type, rhs)
+	rhs_is_owned_temporary: Bool = binding_alias_rhs_is_owned_temporary(
+		env,
+		bind_type,
+		rhs,
+	)
+	owned_rhs_reuses_source: Bool = normalize_binding_alias_rhs_reuses_source(
+		env,
+		bind_type,
+		rhs,
+		rhs_is_owned_temporary,
+	)
+	owned_rhs: CoreExpr = if owned_rhs_reuses_source:
+		rhs
+	else:
+		normalize_binding_alias_rhs_with_owned_status(
+			env,
+			bind_type,
+			rhs,
+			rhs_is_owned_temporary,
+		)
 
 	branch_safe_body: CoreExpr = if is_mutable:
 		retain_mutable_match_branch_results(
@@ -15812,14 +15931,35 @@ private pure func plan_managed_let(
 		body
 
 	{
+		source = source,
 		variable = variable,
 		is_mutable = is_mutable,
 		bind_type = bind_type,
 		source_rhs = rhs,
 		source_body = body,
 		owned_rhs = owned_rhs,
-		branch_safe_body = branch_safe_body
+		owned_rhs_reuses_source = owned_rhs_reuses_source,
+		branch_safe_body = branch_safe_body,
+		-- Mutable result normalization reconstructs its result spine. Mutable
+		-- managed lets are never eligible for the identity paths below.
+		branch_safe_body_reuses_source = not is_mutable
 	}
+
+
+-- Reusing the source Let requires identity through planning and both recursive
+-- children. The caller separately proves that the selected ownership decision
+-- inserts no Dup/Drop and performs no balancing rewrite.
+private pure func managed_let_reuses_source(
+	plan: PerceusManagedLetPlan,
+	rewritten_rhs: PerceusInsertedExpr,
+	rewritten_body: PerceusInsertedExpr,
+) -> Bool:
+	(
+		plan.owned_rhs_reuses_source
+		and plan.branch_safe_body_reuses_source
+		and rewritten_rhs.reuses_source
+		and rewritten_body.reuses_source
+	)
 
 
 private pure func rebuild_managed_let(
@@ -16526,8 +16666,11 @@ private pure func insert_drops_expr_inner_result(
 				match current:
 					LetExpr(variable, is_mutable, bind_type, rhs, body):
 						if is_managed_type(env, bind_type):
+							debug:
+								perceus_work_insert_managed_let_visits()
 							plan: PerceusManagedLetPlan = plan_managed_let(
 								env,
+								current,
 								variable,
 								is_mutable,
 								bind_type,
@@ -16611,22 +16754,39 @@ private pure func insert_drops_expr_inner_result(
 								)
 								action = PerceusInsertVisitBindingExpr(plan.branch_safe_body)
 							PerceusInsertManagedLetBodyFrame(plan, rewritten_rhs):
-								rebuilt: CoreExpr = if managed_let_is_proven_unused(
+								proven_unused: Bool = managed_let_is_proven_unused(
 									env,
 									plan,
 									resolved_values,
-								):
+								)
+								direct_consume: Bool = managed_let_has_single_direct_consume(
+									env,
+									plan,
+									rewritten,
+									resolved_values,
+								)
+								ownership_neutral: Bool = (
+									direct_consume
+									or (
+										not plan.is_mutable
+										and is_immortal_value_expr(env, plan.owned_rhs)
+									)
+								)
+								reuses_source: Bool = (
+									not proven_unused
+									and ownership_neutral
+									and managed_let_reuses_source(plan, rewritten_rhs, rewritten)
+								)
+
+								rebuilt: CoreExpr = if proven_unused:
 									rebuild_proven_unused_managed_let(
 										plan,
 										rewritten_rhs.expr,
 										rewritten.expr,
 									)
-								else if managed_let_has_single_direct_consume(
-									env,
-									plan,
-									rewritten,
-									resolved_values,
-								):
+								else if reuses_source:
+									plan.source
+								else if direct_consume:
 									LetExpr(
 										plan.variable,
 										False,
@@ -16642,6 +16802,12 @@ private pure func insert_drops_expr_inner_result(
 										rewritten.expr,
 									)
 
+								debug:
+									if reuses_source:
+										perceus_work_insert_managed_let_original_nodes_reused()
+									else:
+										perceus_work_insert_managed_let_reconstructions()
+
 								resolved_values = without_bound_value(
 									resolved_values,
 									plan.variable,
@@ -16652,7 +16818,7 @@ private pure func insert_drops_expr_inner_result(
 										rebuilt,
 										plan.variable,
 										rewritten,
-										False,
+										reuses_source,
 									),
 								)
 							PerceusInsertLetRhsFrame(source, variable, is_mutable, bind_type, body):

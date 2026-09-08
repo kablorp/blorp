@@ -80,6 +80,29 @@ included in `bench.sh all`.
 | `paradigms` | Functional dispatch, list destructuring, pattern matching, and coroutine-style control flow | blorp |
 | `virtual_threads` | Fiber spawn, join, park, and wake scaling | blorp |
 
+## Runtime Managed-Buffer Copy Diagnostic
+
+`runtime_managed_buffer_copy_profile` compares collection serialization in the
+working tree with a Git control. It compiles both native runtimes at `-O2`,
+alternates their execution order, verifies byte-identical output, and reports
+managed capacity and retained-memory facts alongside median wall time. Timing
+runs use the ordinary uninstrumented allocator path; allocation facts come
+from separate lightweight-stat processes. It is deliberately excluded from
+`bench.sh all`.
+
+```bash
+# Short feedback while editing runtime.c.
+benchmarks/runtime_managed_buffer_copy_profile --quick
+
+# Seven paired samples against current origin/main.
+benchmarks/runtime_managed_buffer_copy_profile --control-ref origin/main
+```
+
+Use platform CPU-counter tooling on binaries emitted with
+`--emit-binaries <directory>` when accepting or rejecting a serializer. Wall
+time is a secondary signal; the issue-specific gate requires fewer retired
+instructions without changed output or retained capacity.
+
 ## Compiler Memory Diagnostics
 
 These opt-in compiler benchmarks exercise production bridge actions with

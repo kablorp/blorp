@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""Compare collection-to-string runtime paths against a Git control."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import statistics
+import subprocess
+import tempfile
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+RUNTIME = ROOT / "blorp/src/lib/runtime/native/runtime.c"
+NATIVE = RUNTIME.parent
+
+HARNESS = r'''
+#define MINICORO_IMPL
+#include "minicoro.h"
+#include "RUNTIME_PATH"
+
+static volatile unsigned long benchmark_checksum = 0;
+
+static uint64_t monotonic_ns(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+}
+
+static long benchmark_int_value(long index, bool short_values) {
+    if (short_values) return index % 19 - 9;
+    switch (index % 8) {
+        case 0: return 0;
+        case 1: return -1;
+        case 2: return 42;
+        case 3: return -9999;
+        case 4: return LONG_MAX;
+        case 5: return LONG_MIN;
+        case 6: return 1000000007L;
+        default: return -1000000007L;
+    }
+}
+
+static blorp_List* string_input(long size) {
+    static const char* values[] = {
+        "", "hello", "caf\xc3\xa9", "100%", "visible\0hidden",
+        "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!?"
+    };
+    static const size_t lengths[] = {0, 5, 5, 4, 14, 64};
+    blorp_List* list = blorp_list_new(size);
+    list->elem_release = blorp_elem_release_fn;
+    for (long i = 0; i < size; i++) {
+        long selected = i % 7;
+        list->data[i] = selected == 6
+            ? NULL
+            : blorp_string_create_len(values[selected], (long)lengths[selected]);
+    }
+    list->len = size;
+    return list;
+}
+
+static blorp_List* bool_input(long size, const char* scenario) {
+    blorp_List* list = blorp_list_new(size);
+    for (long i = 0; i < size; i++) {
+        long value = strcmp(scenario, "bool-list-true") == 0
+            ? true
+            : strcmp(scenario, "bool-list-false") == 0
+                ? false
+                : i % 3 != 0;
+        list->data[i] = (void*)(intptr_t)value;
+    }
+    list->len = size;
+    return list;
+}
+
+static blorp_List* int_list_input(long size, bool short_integers) {
+    blorp_List* list = blorp_list_new(size);
+    for (long i = 0; i < size; i++) {
+        list->data[i] = (void*)(intptr_t)benchmark_int_value(i, short_integers);
+    }
+    list->len = size;
+    return list;
+}
+
+static blorp_Vector* vector_input(long size, const char* scenario, bool short_integers) {
+    bool matrix = strncmp(scenario, "int-matrix-", 11) == 0;
+    long rows = strstr(scenario, "one-row")
+        ? 1
+        : strstr(scenario, "one-column")
+            ? size
+            : matrix ? 8 : size;
+    blorp_Vector* vector = matrix
+        ? blorp_matrix_new_fill_i64(0, rows, size / rows)
+        : blorp_vector_new_i64(size);
+    for (long i = 0; i < size; i++) {
+        blorp_vector_write_i64(
+            vector, i, benchmark_int_value(i, short_integers));
+    }
+    return vector;
+}
+
+static blorp_String* render(const char* scenario, void* input) {
+    if (strcmp(scenario, "string-list") == 0) {
+        return blorp_list_to_string_string((blorp_List*)input);
+    }
+    if (strncmp(scenario, "bool-list-", 10) == 0) {
+        return blorp_list_to_string_bool((blorp_List*)input);
+    }
+    if (strncmp(scenario, "int-list-", 9) == 0) {
+        return blorp_list_to_string_int((blorp_List*)input);
+    }
+    return blorp_vector_to_string_int((blorp_Vector*)input);
+}
+
+static unsigned long output_hash(const blorp_String* value) {
+    unsigned long hash = 1469598103934665603UL;
+    for (long i = 0; i < value->len; i++) {
+        hash ^= (unsigned char)value->data[i];
+        hash *= 1099511628211UL;
+    }
+    return hash;
+}
+
+static void benchmark_reset_lightweight_mem_stats(void) {
+    __blorp_stats_enabled = false;
+    __blorp_lightweight_stats_enabled = true;
+    atomic_store(&global_mem_stats.total_allocations, 0);
+    atomic_store(&global_mem_stats.total_releases, 0);
+    atomic_store(&global_mem_stats.current_objects, 0);
+    atomic_store(&global_mem_stats.bytes_allocated, 0);
+}
+
+int main(int argc, char** argv) {
+    if (argc != 6) return 2;
+    const char* scenario = argv[1];
+    long size = strtol(argv[2], NULL, 10);
+    long iterations = strtol(argv[3], NULL, 10);
+    bool retain = strcmp(argv[4], "retain") == 0;
+    bool measure_stats = strcmp(argv[5], "stats") == 0;
+    bool regular_matrix = strcmp(scenario, "int-matrix-extrema") == 0;
+    if (size < 0 || iterations < 1 || (regular_matrix && size % 8 != 0)) {
+        return 3;
+    }
+
+    void* input;
+    if (strcmp(scenario, "string-list") == 0) {
+        input = string_input(size);
+    } else if (strncmp(scenario, "bool-list-", 10) == 0) {
+        input = bool_input(size, scenario);
+    } else if (strncmp(scenario, "int-list-", 9) == 0) {
+        input = int_list_input(size, strstr(scenario, "short") != NULL);
+    } else if (strncmp(scenario, "int-vector-", 11) == 0) {
+        input = vector_input(size, scenario, strstr(scenario, "short") != NULL);
+    } else if (strncmp(scenario, "int-matrix-", 11) == 0) {
+        input = vector_input(size, scenario, strstr(scenario, "short") != NULL);
+    } else {
+        return 4;
+    }
+
+    blorp_String** retained = retain
+        ? (blorp_String**)calloc((size_t)iterations, sizeof(blorp_String*))
+        : NULL;
+    if (retain && !retained) return 5;
+
+    blorp_String* characterized = render(scenario, input);
+    unsigned long characterization_hash = output_hash(characterized);
+    blorp_release(characterized);
+
+    if (measure_stats) benchmark_reset_lightweight_mem_stats();
+    size_t logical_bytes = 0;
+    size_t capacity_bytes = 0;
+    uint64_t started = monotonic_ns();
+    for (long i = 0; i < iterations; i++) {
+        blorp_String* result = render(scenario, input);
+        logical_bytes = blorp_checked_add(logical_bytes, (size_t)result->len);
+        capacity_bytes = blorp_checked_add(capacity_bytes, (size_t)result->capacity);
+        benchmark_checksum += (unsigned long)result->len;
+        if (result->len > 0) {
+            benchmark_checksum += (unsigned char)result->data[0];
+            benchmark_checksum += (unsigned char)result->data[result->len - 1];
+        }
+        if (retain) retained[i] = result;
+        else blorp_release(result);
+    }
+    uint64_t elapsed_ns = monotonic_ns() - started;
+    blorp_MemStats stats = measure_stats
+        ? blorp_get_mem_stats()
+        : (blorp_MemStats){-1, -1, -1, -1};
+
+    printf(
+        "{\"elapsed_ns\":%llu,\"checksum\":%lu,\"output_hash\":%lu,"
+        "\"allocations\":%ld,\"releases\":%ld,\"live_objects\":%ld,"
+        "\"allocator_bytes\":%ld,\"peak_rss_bytes\":%ld,"
+        "\"logical_bytes\":%zu,\"capacity_bytes\":%zu}\n",
+        (unsigned long long)elapsed_ns,
+        benchmark_checksum,
+        characterization_hash,
+        stats.total_allocations,
+        stats.total_releases,
+        stats.current_objects,
+        stats.bytes_allocated,
+        __blorp_peak_rss_bytes(),
+        logical_bytes,
+        capacity_bytes
+    );
+
+    if (retain) {
+        for (long i = 0; i < iterations; i++) blorp_release(retained[i]);
+        free(retained);
+    }
+    blorp_release(input);
+    return 0;
+}
+'''
+
+
+def runtime_at(ref: str) -> str:
+    completed = subprocess.run(
+        ["git", "show", f"{ref}:blorp/src/lib/runtime/native/runtime.c"],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise SystemExit(completed.stderr.strip())
+    return completed.stdout
+
+
+def compile_harness(runtime: Path, output: Path) -> None:
+    source = HARNESS.replace("RUNTIME_PATH", str(runtime))
+    completed = subprocess.run(
+        [
+            os.environ.get("CC", "cc"),
+            "-O2",
+            "-fwrapv",
+            "-pipe",
+            "-w",
+            f"-I{NATIVE}",
+            "-x",
+            "c",
+            "-",
+            "-lm",
+            "-lpthread",
+            "-o",
+            str(output),
+        ],
+        cwd=ROOT,
+        input=source,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise SystemExit(completed.stderr)
+
+
+def run(
+    executable: Path,
+    scenario: str,
+    size: int,
+    iterations: int,
+    retain: bool,
+    measure_stats: bool,
+) -> dict[str, int]:
+    environment = os.environ.copy()
+    for flag in (
+        "BLORP_ALLOCATOR_STATS",
+        "BLORP_COMPILER_MEMORY_PROFILE",
+        "BLORP_LEAK_CHECK",
+        "BLORP_MEM_WATCH",
+        "BLORP_TRACE_ALLOCS",
+        "BLORP_TRACK_STATS",
+    ):
+        environment.pop(flag, None)
+    if measure_stats:
+        environment["BLORP_ALLOCATOR_STATS"] = "1"
+    completed = subprocess.run(
+        [
+            str(executable),
+            scenario,
+            str(size),
+            str(iterations),
+            "retain" if retain else "release",
+            "stats" if measure_stats else "time",
+        ],
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise SystemExit(completed.stderr or f"benchmark exited {completed.returncode}")
+    return json.loads(completed.stdout)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--control-ref", default="origin/main")
+    parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--samples", type=int, default=7)
+    parser.add_argument("--emit-binaries", type=Path)
+    args = parser.parse_args()
+    if args.samples < 1:
+        parser.error("--samples must be positive")
+
+    scale = 8 if args.quick else 1
+    scenarios = [
+        ("string-list", 0, max(1, 500000 // scale), False),
+        ("string-list", 1, max(1, 200000 // scale), False),
+        ("string-list", 64, max(1, 12000 // scale), False),
+        ("string-list", 4096, max(1, 300 // scale), True),
+        ("bool-list-mixed", 0, max(1, 500000 // scale), False),
+        ("bool-list-false", 1, max(1, 200000 // scale), False),
+        ("bool-list-true", 64, max(1, 20000 // scale), False),
+        ("bool-list-false", 64, max(1, 20000 // scale), False),
+        ("bool-list-mixed", 64, max(1, 20000 // scale), False),
+        ("bool-list-mixed", 4096, max(1, 500 // scale), True),
+        ("int-list-short", 0, max(1, 500000 // scale), False),
+        ("int-list-short", 1, max(1, 200000 // scale), False),
+        ("int-list-short", 64, max(1, 12000 // scale), False),
+        ("int-list-extrema", 4096, max(1, 300 // scale), True),
+        ("int-vector-short", 0, max(1, 500000 // scale), False),
+        ("int-vector-short", 1, max(1, 200000 // scale), False),
+        ("int-vector-short", 64, max(1, 12000 // scale), False),
+        ("int-vector-extrema", 4096, max(1, 300 // scale), True),
+        ("int-matrix-one-row", 64, max(1, 12000 // scale), False),
+        ("int-matrix-one-column", 64, max(1, 12000 // scale), False),
+        ("int-matrix-extrema", 4096, max(1, 300 // scale), True),
+    ]
+
+    with tempfile.TemporaryDirectory(prefix="blorp-buffer-profile-") as temp_name:
+        temp = Path(temp_name)
+        control_runtime = temp / "runtime-control.c"
+        control_runtime.write_text(runtime_at(args.control_ref))
+        control = temp / "control"
+        candidate = temp / "candidate"
+        compile_harness(control_runtime, control)
+        compile_harness(RUNTIME, candidate)
+
+        if args.emit_binaries:
+            args.emit_binaries.mkdir(parents=True, exist_ok=True)
+            emitted_control = args.emit_binaries / "control"
+            emitted_candidate = args.emit_binaries / "candidate"
+            emitted_control.write_bytes(control.read_bytes())
+            emitted_candidate.write_bytes(candidate.read_bytes())
+            emitted_control.chmod(0o755)
+            emitted_candidate.chmod(0o755)
+            print(emitted_control)
+            print(emitted_candidate)
+            return 0
+
+        print(
+            "scenario\tsize\tmode\tcontrol_ns\tcandidate_ns\tchange\t"
+            "allocations\tcapacity/logical\tallocator_bytes\tpeak_rss_change"
+        )
+        for scenario, size, iterations, retain in scenarios:
+            control_times: list[int] = []
+            candidate_times: list[int] = []
+            control_timing: dict[str, int] | None = None
+            candidate_timing: dict[str, int] | None = None
+            for sample in range(args.samples):
+                order = ((control, control_times), (candidate, candidate_times))
+                if sample % 2:
+                    order = tuple(reversed(order))
+                for executable, times in order:
+                    result = run(
+                        executable, scenario, size, iterations, retain, False)
+                    times.append(result["elapsed_ns"])
+                    if executable == control:
+                        control_timing = result
+                    else:
+                        candidate_timing = result
+
+            assert control_timing is not None and candidate_timing is not None
+            for field in ("checksum", "output_hash", "logical_bytes"):
+                if control_timing[field] != candidate_timing[field]:
+                    raise SystemExit(f"{scenario}: mismatched {field}")
+
+            control_stats = run(control, scenario, size, iterations, retain, True)
+            candidate_stats = run(candidate, scenario, size, iterations, retain, True)
+            for field in ("checksum", "output_hash", "logical_bytes"):
+                if control_stats[field] != candidate_stats[field]:
+                    raise SystemExit(f"{scenario}: stats run mismatched {field}")
+            expected_allocations = iterations
+            for label, result in (("control", control_stats), ("candidate", candidate_stats)):
+                if result["allocations"] != expected_allocations:
+                    raise SystemExit(
+                        f"{scenario}: {label} made {result['allocations']} managed allocations; "
+                        f"expected {expected_allocations}"
+                    )
+            if candidate_stats["capacity_bytes"] != candidate_stats["logical_bytes"]:
+                raise SystemExit(f"{scenario}: candidate returned excess managed capacity")
+            control_median = statistics.median(control_times)
+            candidate_median = statistics.median(candidate_times)
+            change = (candidate_median / control_median - 1.0) * 100.0
+            capacity_ratio = candidate_stats["capacity_bytes"] / candidate_stats["logical_bytes"]
+            peak_rss_change = (
+                candidate_timing["peak_rss_bytes"]
+                / control_timing["peak_rss_bytes"]
+                - 1.0
+            ) * 100.0
+            print(
+                f"{scenario}\t{size}\t{'retain' if retain else 'release'}\t"
+                f"{control_median:.0f}\t{candidate_median:.0f}\t{change:+.2f}%\t"
+                f"{candidate_stats['allocations']}\t{capacity_ratio:.3f}\t"
+                f"{candidate_stats['allocator_bytes']}\t{peak_rss_change:+.2f}%"
+            )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
