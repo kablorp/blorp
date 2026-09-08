@@ -59,6 +59,56 @@
   runtime tests, and all 880 leak checks pass. The formerly failing LSP leak
   checks are covered by the retained-projection ownership normalization now in
   the merge base. The full default gate passes all 10,733 tests.
+- Checkpoint 5, semantic-owner tranche: production planning is region-sensitive
+  for final-Core `let` owners. The existing post-prepare traversal now computes
+  subtree cancellation effects together with ownership endpoints. A managed
+  owner is registered only when its lifetime crosses a cancellation point;
+  owners created after the last cancellation point or consumed before the first
+  one retain ordinary ARC but omit cancellation registration. Unknown calls,
+  identity collisions, branches without an all-path handoff, and loops remain
+  conservative.
+
+  A consumed argument establishes entry handoff only after the callee expression
+  and every source argument have been evaluated without suspension. In
+  particular, an earlier consumed argument remains protected across later
+  argument evaluation. Runtime calls with explicit consuming contracts may
+  then accept ownership at C entry. User calls do not establish this proof from
+  `consumed_args`: final Core does not yet carry a callee parameter-protection
+  contract.
+
+  The existing user-call emitter still unregisters a consumed caller slot
+  immediately before entering the callee. Keeping that caller frame registered
+  through the call is not a correct substitute: if the callee releases the
+  parameter and later cancels, cancellation would release the stale caller
+  frame a second time. Completing this required Checkpoint 5 case therefore
+  needs explicit consumed-parameter metadata and a generated callee prologue
+  that registers the callee slot before its first possible cancellation. The
+  current runtime has no slot-adoption or frame-rebind operation, and matching
+  by heap value would be ambiguous when distinct ownership units alias the same
+  allocation. This tranche deliberately preserves the existing call boundary
+  until that typed ABI is implemented.
+
+  Backend-created temporaries remain activation-conservative in this tranche.
+  One narrow zero-scan proof is used for direct-runtime consumed arguments: a
+  consumed argument omits registration when every later argument is a
+  structurally inert value, because the runtime ABI accepts ownership at C
+  entry. Borrowed arguments and any later argument that can execute code remain
+  protected. An experimental implementation that rescanned loop bodies and
+  later call arguments during emission added about 1.6 seconds to self-host
+  backend time and was removed. Region-sensitive backend-temporary suppression
+  must instead make the planner's stable site identities directly consumable by
+  emission; it remains the unfinished part of Checkpoint 5.
+
+  In a same-source self-host census against the Checkpoint 4 compiler, cleanup
+  pushes fell from 35,825 to 28,381, pops from 77,745 to 59,235, and duplicate
+  calls from 48,437 to 41,806: 32,585 fewer cleanup calls, or 20.1%. Cleanup
+  frame declarations fell by 7,444 (20.8%). Generated C fell by 43,923 lines
+  (3.37%) and 3,442,426 bytes (3.75%). Retain, release, ARC-only release, and
+  stack-result retain/release counts were exactly equal. One local C compile
+  improved from 7.77 to 7.49 seconds and reduced maximum RSS from 1,355,120,640
+  to 1,336,999,936 bytes. Blorp backend generation increased from 27.64 to
+  29.86 seconds, so further planning work must preserve the no-rescan boundary
+  and target this remaining analysis overhead.
 
 ## Objective
 

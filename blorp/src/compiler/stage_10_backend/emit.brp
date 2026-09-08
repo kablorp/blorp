@@ -490,7 +490,7 @@ import:
 		CancellationProtectionPlan,
 		analyze_program_cancellation,
 		build_current_behavior_cancellation_plan,
-		build_current_behavior_cancellation_plan_with_summary,
+		build_region_sensitive_cancellation_plan,
 		cancellation_backend_temporary_candidate,
 		cancellation_call_consumed_arg_indices,
 		cancellation_cleanup_action_for_release_policy,
@@ -498,6 +498,7 @@ import:
 		cancellation_global_initializer_summary,
 		cancellation_let_protection,
 		cancellation_plan_requires_local_owner_protection,
+		cancellation_variable_requires_protection,
 	canonical_empty_list: CanonicalEmptyList, canonical_empty_list_for_construct
 	emit_record_layout:
 		CHeapRecordFieldStorage(OrdinaryCHeapRecordField, PackedBooleanCHeapRecordField),
@@ -937,8 +938,8 @@ private pure func function_emission_context(
 		program_summary,
 		identity,
 	):
-		Some(summary):
-			build_current_behavior_cancellation_plan_with_summary(activation, body, summary)
+		Some(_):
+			build_region_sensitive_cancellation_plan(activation, body, program_summary)
 		None:
 			build_current_behavior_cancellation_plan(activation, body)
 
@@ -959,8 +960,8 @@ private pure func global_emission_context(
 		program_summary,
 		identity,
 	):
-		Some(summary):
-			build_current_behavior_cancellation_plan_with_summary(activation, global.init, summary)
+		Some(_):
+			build_region_sensitive_cancellation_plan(activation, global.init, program_summary)
 		None:
 			build_current_behavior_cancellation_plan(activation, global.init)
 
@@ -3273,6 +3274,20 @@ private pure func simple_call_args_require_ordering(args: List[CoreExpr]) -> Boo
 		requires_ordering
 
 
+private pure func later_call_arg_can_execute_code(args: List[CoreExpr], current_index: Int) -> Bool:
+	var result: Bool = False
+	var index: Int = 0
+
+	for arg in args:
+		if index > current_index and simple_call_arg_requires_ordering(arg):
+			result = True
+			break
+
+		index += 1
+
+	result
+
+
 private pure func adapt_direct_call_result(
 	result: CoreDirectRuntimeResult,
 	call_c: String,
@@ -5248,9 +5263,22 @@ private pure func emit_direct_runtime_call_args_body(
 									expr_transfers_ownership(arg),
 								)
 								needs_cleanup_slot: Bool = candidate.is_some()
+								ownership: CallArgOwnership = direct_runtime_call_arg_ownership(
+									call,
+									args.length(),
+									index,
+								)
+
+								spans_cancellation_interval: Bool = match ownership:
+									CallConsumesArg:
+										later_call_arg_can_execute_code(args, index)
+									CallBorrowsArg:
+										True
+
 								tracks_cleanup: Bool = (
 									activation_requires_local_owner_protection(emission_context)
 									and needs_cleanup_slot
+									and spans_cancellation_interval
 								)
 
 								scoped_arg: FunctionBodyC = materialized_call_arg_value(
@@ -5258,11 +5286,6 @@ private pure func emit_direct_runtime_call_args_body(
 									arg_body,
 									ordered_arguments,
 									needs_cleanup_slot,
-								)
-								ownership: CallArgOwnership = direct_runtime_call_arg_ownership(
-									call,
-									args.length(),
-									index,
 								)
 								statements += scoped_arg.statements
 
@@ -11746,7 +11769,10 @@ private pure func emit_drop_statement(
 	release_policy: CoreReleasePolicy,
 	emission_context: FunctionEmissionContext,
 ) -> String:
-	cleanup_pop: String = if activation_requires_local_owner_protection(emission_context):
+	cleanup_pop: String = if cancellation_variable_requires_protection(
+		emission_context.cleanup_plan,
+		variable,
+	):
 		owned_temp_cleanup_pop_statement(c_var_name(variable), release_policy)
 	else:
 		""
@@ -11992,10 +12018,19 @@ private pure func variable_has_cleanup_slot(variable: CoreVar) -> Bool:
 			not variable.name.starts_with(MANGLED_DEF_ID_PREFIX)
 
 
-private pure func call_arg_transfer_cleanup_pop_statement(arg: CoreExpr) -> String:
+private pure func call_arg_transfer_cleanup_pop_statement(
+	arg: CoreExpr,
+	emission_context: FunctionEmissionContext,
+) -> String:
 	match arg:
 		VarExpr(variable, typ, loc):
-			if variable_has_cleanup_slot(variable):
+			if (
+				variable_has_cleanup_slot(variable)
+				and cancellation_variable_requires_protection(
+					emission_context.cleanup_plan,
+					variable,
+				)
+			):
 				owned_temp_cleanup_pop_statement(
 					c_var_name(variable),
 					CoreTypePolicy.cleanup_release_policy_for_type(typ),
@@ -12188,12 +12223,11 @@ private pure func call_args_transfer_cleanup_pop_statements(
 	var statements: String = ""
 	var index: Int = 0
 
-	if activation_requires_local_owner_protection(emission_context):
-		for arg in args:
-			if consumed_args.contains(index):
-				statements += call_arg_transfer_cleanup_pop_statement(arg)
+	for arg in args:
+		if consumed_args.contains(index):
+			statements += call_arg_transfer_cleanup_pop_statement(arg, emission_context)
 
-			index += 1
+		index += 1
 
 	statements
 
@@ -12261,7 +12295,10 @@ private pure func emit_dup_statement(
 	retain_policy: CoreRetainPolicy,
 	emission_context: FunctionEmissionContext,
 ) -> String:
-	duplicate_cleanup: String = if activation_requires_local_owner_protection(emission_context):
+	duplicate_cleanup: String = if cancellation_variable_requires_protection(
+		emission_context.cleanup_plan,
+		variable,
+	):
 		"\n  blorp_task_cleanup_duplicate_slot(&" + c_var_name(variable) + ");"
 	else:
 		""

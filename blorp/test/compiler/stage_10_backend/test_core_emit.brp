@@ -12874,7 +12874,27 @@ pure func test_emit_statement_shaped_binary_operand() -> Bool:
 		and artifact.c_code.contains("blorp_release(__borrowed_text);")
 		and artifact.c_code.contains("int __bin_result_")
 		and artifact.c_code.contains("return __bin_result_")
-		and artifact.c_code.count("blorp_task_cleanup_pop_slot(&__borrowed_text);") == 1
+		and not artifact.c_code.contains("blorp_task_cleanup_pop_slot(&__borrowed_text);")
+	)
+
+
+pure func test_emit_protects_owned_argument_during_later_checkpoint() -> Bool:
+	program: CoreProgram = {
+		decls = [FunctionDecl(owned_argument_before_checkpoint_function())],
+		foreign_includes = []
+	}
+	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	push_index: Option[Int] = artifact.c_code.index_of(
+		"blorp_task_cleanup_push(&__blorp_cleanup___borrow_arg_0",
+	)
+	checkpoint_index: Option[Int] = artifact.c_code.index_of("blorp_cooperative_checkpoint();")
+	call_index: Option[Int] = artifact.c_code.index_of("blorp_string_eq(__call_arg_")
+
+	(
+		option_int_less_than(push_index, checkpoint_index)
+		and option_int_less_than(checkpoint_index, call_index)
+		and artifact.c_code.contains("blorp_task_cleanup_pop_slot(&__borrow_arg_0);")
+		and artifact.c_code.contains("blorp_release(__borrow_arg_0);")
 	)
 
 
@@ -14697,6 +14717,52 @@ pure func statement_shaped_binary_operand_function() -> CoreFunction:
 		is_pure = True,
 		function_kind = UserFunction,
 		def_id = 186,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func owned_argument_before_checkpoint_function() -> CoreFunction:
+	formatted: CoreExpr = CallExpr(
+		direct_runtime_call_kind("blorp_format_float"),
+		VarExpr(
+			named_var("blorp_format_float"),
+			closure_type(),
+			SyntheticSourceLoc,
+		),
+		[
+			LiteralExpr(FloatLiteral(3.14159), float_type(), SyntheticSourceLoc),
+			LiteralExpr(IntLiteral(2), int_type(), SyntheticSourceLoc),
+		],
+		string_type(),
+		SyntheticSourceLoc,
+	)
+	later: CoreExpr = SeqExpr(
+		CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc),
+		LiteralExpr(StringLiteral("3.14"), string_type(), SyntheticSourceLoc),
+	)
+
+	{
+		name = "owned_argument_before_checkpoint",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = bool_type(),
+		body = Some(
+			CallExpr(
+				direct_runtime_call_kind("blorp_string_eq"),
+				VarExpr(
+					named_var("blorp_string_eq"),
+					closure_type(),
+					SyntheticSourceLoc,
+				),
+				[formatted, later],
+				bool_type(),
+				SyntheticSourceLoc,
+			),
+		),
+		is_pure = False,
+		function_kind = UserFunction,
+		def_id = 187,
 		loc = SyntheticSourceLoc
 	}
 
@@ -22023,7 +22089,8 @@ pure func test_emit_direct_runtime_tensor_set_consumes_owned_receiver() -> Bool:
 	(
 		artifact.c_code.contains("blorp_Vector* set_owned_int_tensor(void)")
 		and artifact.c_code.contains("blorp_vector_set_inplace_i64(__call_arg_")
-		and artifact.c_code.contains("blorp_task_cleanup_pop_slot(&__call_arg_")
+		and not artifact.c_code.contains("__blorp_owned_cleanup___call_arg_")
+		and not artifact.c_code.contains("blorp_task_cleanup_pop_slot(&__call_arg_")
 		and not artifact.c_code.contains("blorp_release(__call_arg_")
 	)
 
@@ -22043,7 +22110,8 @@ pure func test_emit_direct_runtime_consumes_owned_nonfirst_argument() -> Bool:
 		and artifact.c_code.contains(
 			"blorp_string_concat_many(__call_arg_0, __call_arg_1, __call_arg_2)",
 		)
-		and artifact.c_code.contains("blorp_task_cleanup_pop_slot(&__call_arg_2);")
+		and not artifact.c_code.contains("__blorp_owned_cleanup___call_arg_2")
+		and not artifact.c_code.contains("blorp_task_cleanup_pop_slot(&__call_arg_2);")
 		and not artifact.c_code.contains("blorp_release_arc_only(__call_arg_2)")
 	)
 
@@ -24401,6 +24469,10 @@ tests: TestSuite = {
 		("emit channel send retains boxed temp", test_emit_channel_send_retains_boxed_temp),
 		("emit raw scalar tensor get unchecked", test_emit_raw_scalar_tensor_get_unchecked),
 		("emit statement-shaped binary operand", test_emit_statement_shaped_binary_operand),
+		(
+			"emit owned argument protection across later checkpoint",
+			test_emit_protects_owned_argument_during_later_checkpoint,
+		),
 		("emit nullable option construction", test_emit_nullable_option_construction),
 		(
 			"emit nullable option statement list payload",

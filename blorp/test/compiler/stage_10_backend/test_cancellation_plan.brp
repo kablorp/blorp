@@ -24,17 +24,19 @@ import:
 			CallExpr,
 			CooperativeCheckpointExpr,
 			DropExpr,
+			IfExpr,
 			LetExpr,
 			LiteralExpr,
 			SeqExpr,
 			VarExpr,
 			VoidExpr,
+			WhileExpr,
 		),
 		CoreFallibleStreamTerminalPayload(FallibleStreamPayloadInt),
 		CoreForeignArgPassing(ForeignBorrowArgs),
 		CoreFunctionKind(UserFunction),
 		CoreHashContainerConstructor(GenericHashContainerConstructor),
-		CoreLiteral(StringLiteral),
+		CoreLiteral(BoolLiteral, StringLiteral),
 		CoreOperationResultLayoutPolicy(DefaultResultLayoutPolicy),
 		CoreProgram,
 		CoreReleasePolicy(
@@ -61,6 +63,7 @@ import:
 		),
 		CancellationOwnerIdentity(BackendTemporaryCancellationOwner),
 		CancellationProtectionEvent(TrackCancellationOwner, UntrackCancellationOwner),
+		CancellationProtectionPlan,
 		CancellationReason(
 			BuiltinCancellationPoint,
 			ClosureCallBoundary,
@@ -76,6 +79,7 @@ import:
 		analyze_program_cancellation,
 		build_current_behavior_cancellation_plan,
 		build_current_behavior_cancellation_plan_with_summary,
+		build_region_sensitive_cancellation_plan,
 		cancellation_backend_temporary_candidate,
 		cancellation_cleanup_action_for_release_policy,
 		cancellation_effect_may_cancel,
@@ -96,6 +100,8 @@ import:
 private VOID_EXPR: CoreExpr = VoidExpr(VoidType, SyntheticSourceLoc)
 
 private STRING_TYPE: CoreType = NamedType("String", [])
+
+private BOOL_TYPE: CoreType = NamedType("Bool", [])
 
 
 pure func call_expr(kind: CoreCallKind) -> CoreExpr:
@@ -438,6 +444,298 @@ pure func cancelling_activation_retains_local_cleanup_candidates() -> Bool:
 	)
 
 
+pure func region_plan(body: CoreExpr) -> CancellationProtectionPlan:
+	identity = {
+		name = "region_owner",
+		def_id = 170
+	}
+	program: CoreProgram = program_with([function_decl(identity.name, identity.def_id, body)])
+
+	build_region_sensitive_cancellation_plan(
+		FunctionCancellationActivation(identity),
+		body,
+		analyze_program_cancellation(program),
+	)
+
+
+pure func region_plan_ignores_cancellation_before_owner_acquisition() -> Bool:
+	variable: CoreVar = local_var("value", 1)
+	body: CoreExpr = SeqExpr(
+		CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc),
+		LetExpr(variable, False, STRING_TYPE, owned_string(), VOID_EXPR),
+	)
+	plan = region_plan(body)
+
+	match cancellation_let_protection(plan, variable):
+		Some(protection):
+			(
+				plan.effect == MayCancelCurrentTask
+				and not protection.tracks_cleanup
+				and not protection.untracks_after_body
+			)
+		None:
+			False
+
+
+pure func region_plan_protects_owner_across_cancellation() -> Bool:
+	variable: CoreVar = local_var("value", 2)
+	body: CoreExpr = LetExpr(
+		variable,
+		False,
+		STRING_TYPE,
+		owned_string(),
+		CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc),
+	)
+	plan = region_plan(body)
+
+	match cancellation_let_protection(plan, variable):
+		Some(protection):
+			protection.tracks_cleanup and protection.untracks_after_body
+		None:
+			False
+
+
+pure func region_plan_stops_protection_at_first_consuming_drop() -> Bool:
+	variable: CoreVar = local_var("value", 3)
+	body: CoreExpr = LetExpr(
+		variable,
+		False,
+		STRING_TYPE,
+		owned_string(),
+		SeqExpr(
+			DropExpr(
+				variable,
+				STRING_TYPE,
+				ArcReleasePolicy,
+				VOID_EXPR,
+				VoidType,
+				SyntheticSourceLoc,
+			),
+			CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc),
+		),
+	)
+	plan = region_plan(body)
+
+	match cancellation_let_protection(plan, variable):
+		Some(protection):
+			not protection.tracks_cleanup and not protection.untracks_after_body
+		None:
+			False
+
+
+pure func region_plan_keeps_unknown_lifetimes_protected() -> Bool:
+	variable: CoreVar = local_var("value", 4)
+	body: CoreExpr = LetExpr(variable, False, STRING_TYPE, owned_string(), call_expr(UnknownCall))
+	plan = region_plan(body)
+
+	match cancellation_let_protection(plan, variable):
+		Some(protection):
+			protection.tracks_cleanup and protection.untracks_after_body
+		None:
+			False
+
+
+pure func region_plan_keeps_colliding_callable_identity_protected() -> Bool:
+	variable: CoreVar = local_var("value", 40)
+	body: CoreExpr = LetExpr(
+		variable,
+		False,
+		STRING_TYPE,
+		owned_string(),
+		call_expr(SelectedDirectCall(41)),
+	)
+	identity = {
+		name = "collision_owner",
+		def_id = 42
+	}
+	program: CoreProgram = program_with([
+		function_decl(identity.name, identity.def_id, body),
+		function_decl("first", 41, VOID_EXPR),
+		function_decl("second", 41, VOID_EXPR),
+	])
+	plan = build_region_sensitive_cancellation_plan(
+		FunctionCancellationActivation(identity),
+		body,
+		analyze_program_cancellation(program),
+	)
+
+	cancellation_let_protection(plan, variable)
+		.map(func(protection): protection.tracks_cleanup)
+		.get_or(False)
+
+
+pure func region_plan_distinguishes_disjoint_owner_lifetimes() -> Bool:
+	first: CoreVar = local_var("first", 5)
+	second: CoreVar = local_var("second", 6)
+	body: CoreExpr = SeqExpr(
+		LetExpr(first, False, STRING_TYPE, owned_string(), VOID_EXPR),
+		LetExpr(
+			second,
+			False,
+			STRING_TYPE,
+			owned_string(),
+			CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc),
+		),
+	)
+	plan = region_plan(body)
+
+	match (cancellation_let_protection(plan, first), cancellation_let_protection(plan, second)):
+		(Some(first_protection), Some(second_protection)):
+			(
+				not first_protection.tracks_cleanup
+				and second_protection.tracks_cleanup
+				and plan.max_live_slots == 1
+			)
+		_:
+			False
+
+
+pure func region_plan_protects_branch_and_loop_lifetimes() -> Bool:
+	branch_owner: CoreVar = local_var("branch_owner", 7)
+	loop_owner: CoreVar = local_var("loop_owner", 8)
+	condition: CoreExpr = LiteralExpr(BoolLiteral(True), BOOL_TYPE, SyntheticSourceLoc)
+	checkpoint: CoreExpr = CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc)
+	branch_plan = region_plan(
+		LetExpr(
+			branch_owner,
+			False,
+			STRING_TYPE,
+			owned_string(),
+			IfExpr(condition, checkpoint, VOID_EXPR, VoidType, SyntheticSourceLoc),
+		),
+	)
+	loop_plan = region_plan(
+		LetExpr(
+			loop_owner,
+			False,
+			STRING_TYPE,
+			owned_string(),
+			WhileExpr(condition, checkpoint, VoidType, SyntheticSourceLoc),
+		),
+	)
+
+	(
+		cancellation_let_protection(branch_plan, branch_owner)
+			.map(func(protection): protection.tracks_cleanup)
+			.get_or(False)
+		and cancellation_let_protection(loop_plan, loop_owner)
+			.map(func(protection): protection.tracks_cleanup)
+			.get_or(False)
+	)
+
+
+pure func region_plan_does_not_treat_one_branch_consumption_as_a_handoff() -> Bool:
+	variable: CoreVar = local_var("branch_value", 11)
+	condition: CoreExpr = LiteralExpr(BoolLiteral(True), BOOL_TYPE, SyntheticSourceLoc)
+	body: CoreExpr = LetExpr(
+		variable,
+		False,
+		STRING_TYPE,
+		owned_string(),
+		IfExpr(
+			condition,
+			DropExpr(
+				variable,
+				STRING_TYPE,
+				ArcReleasePolicy,
+				VOID_EXPR,
+				VoidType,
+				SyntheticSourceLoc,
+			),
+			CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc),
+			VoidType,
+			SyntheticSourceLoc,
+		),
+	)
+	plan = region_plan(body)
+
+	cancellation_let_protection(plan, variable)
+		.map(func(protection): protection.tracks_cleanup)
+		.get_or(False)
+
+
+pure func overlapping_region_events_preserve_lexical_order() -> Bool:
+	outer: CoreVar = local_var("outer", 9)
+	inner: CoreVar = local_var("inner", 10)
+	plan = region_plan(
+		LetExpr(
+			outer,
+			False,
+			STRING_TYPE,
+			owned_string(),
+			LetExpr(
+				inner,
+				False,
+				STRING_TYPE,
+				owned_string(),
+				CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc),
+			),
+		),
+	)
+
+	match plan.sites:
+		[outer_site, inner_site]:
+			match (outer_site.before, outer_site.after, inner_site.before, inner_site.after):
+				([TrackCancellationOwner(_, outer_id, _)], [UntrackCancellationOwner(_)], [TrackCancellationOwner(_, inner_id, _)], [UntrackCancellationOwner(_)]):
+					(
+						cancellation_owner_id_value(outer_id) == 0
+						and cancellation_owner_id_value(inner_id) == 1
+						and plan.max_live_slots == 2
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func earlier_consumed_argument_spans_later_argument_evaluation() -> Bool:
+	variable: CoreVar = local_var("value", 53)
+	body: CoreExpr = LetExpr(
+		variable,
+		False,
+		STRING_TYPE,
+		owned_string(),
+		CallExpr(
+			BuiltinCall("blorp_vector_set_inplace_i64"),
+			VOID_EXPR,
+			[
+				VarExpr(variable, STRING_TYPE, SyntheticSourceLoc),
+				CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc),
+				VOID_EXPR,
+			],
+			VoidType,
+			SyntheticSourceLoc,
+		),
+	)
+	plan = region_plan(body)
+
+	cancellation_let_protection(plan, variable)
+		.map(func(protection): protection.tracks_cleanup)
+		.get_or(False)
+
+
+pure func unresolved_consumed_call_does_not_establish_entry_handoff() -> Bool:
+	variable: CoreVar = local_var("value", 52)
+	body: CoreExpr = LetExpr(
+		variable,
+		False,
+		STRING_TYPE,
+		owned_string(),
+		CallExpr(
+			UserCall("missing", None, [0]),
+			VOID_EXPR,
+			[VarExpr(variable, STRING_TYPE, SyntheticSourceLoc)],
+			VoidType,
+			SyntheticSourceLoc,
+		),
+	)
+	plan = region_plan(body)
+
+	cancellation_let_protection(plan, variable)
+		.map(func(protection): protection.tracks_cleanup)
+		.get_or(False)
+
+
 pure func known_builtin_and_runtime_effects_are_authoritative() -> Bool:
 	builtin_summary: CancellationSummary = summary_for(
 		program_with([function_decl("builtin_wait", 1, call_expr(BuiltinCall("yield_now")))]),
@@ -697,6 +995,50 @@ tests: TestSuite = {
 		(
 			"cancelling activations retain local cleanup candidates",
 			cancelling_activation_retains_local_cleanup_candidates,
+		),
+		(
+			"region plans ignore cancellation before owner acquisition",
+			region_plan_ignores_cancellation_before_owner_acquisition,
+		),
+		(
+			"region plans protect owners across cancellation",
+			region_plan_protects_owner_across_cancellation,
+		),
+		(
+			"region plans stop at the first consuming drop",
+			region_plan_stops_protection_at_first_consuming_drop,
+		),
+		(
+			"region plans fail closed for unknown lifetimes",
+			region_plan_keeps_unknown_lifetimes_protected,
+		),
+		(
+			"region plans fail closed for colliding callable identities",
+			region_plan_keeps_colliding_callable_identity_protected,
+		),
+		(
+			"region plans distinguish disjoint owner lifetimes",
+			region_plan_distinguishes_disjoint_owner_lifetimes,
+		),
+		(
+			"region plans protect branch and loop lifetimes",
+			region_plan_protects_branch_and_loop_lifetimes,
+		),
+		(
+			"one branch consumption does not establish a handoff",
+			region_plan_does_not_treat_one_branch_consumption_as_a_handoff,
+		),
+		(
+			"overlapping region events preserve lexical order",
+			overlapping_region_events_preserve_lexical_order,
+		),
+		(
+			"earlier consumed arguments span later argument evaluation",
+			earlier_consumed_argument_spans_later_argument_evaluation,
+		),
+		(
+			"unresolved consumed call does not establish entry handoff",
+			unresolved_consumed_call_does_not_establish_entry_handoff,
 		),
 		(
 			"known builtin and runtime effects use the builtin authority",
