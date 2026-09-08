@@ -5,16 +5,21 @@
 -- completion plan supplies their exact accepted identity. Ordinary body
 -- queries expose only successfully completed entries.
 import:
-	../../stage_04_modules/loaded_module:
-		module_identity_matches_module_path,
-		module_identity_storage_key,
+	../../stage_04_modules/module_table:
+		ModuleTable,
+		module_id_table_index,
+		module_table_canonical_path,
+		module_table_count,
+		module_table_find_id_by_canonical_path,
+		module_tables_are_compatible,
 	../headers/declaration_skeleton:
 		DeclarationId(GlobalDeclarationId),
 		DeclarationVisibility(PublicDeclaration),
 		GlobalId,
-		global_id_module_identity,
+		global_id_module_id,
 		global_id_name,
 		global_ids_equal,
+	list: repeat
 	semantic_type: SemanticType, localize_module_types
 
 
@@ -29,20 +34,19 @@ record AcceptedGlobalBinding {
 
 record AcceptedGlobalTableRecord {
 	id: GlobalId,
-	owner_module_path: String,
 	visibility: DeclarationVisibility,
 	declared_binding: Option[AcceptedGlobalBinding]
 }
 
 
 record AcceptedGlobalTableInput {
+	module_table: ModuleTable,
 	globals: List[AcceptedGlobalTableRecord]
 }
 
 
 private record AcceptedGlobalSlot {
 	id: GlobalId,
-	owner_module_path: String,
 	visibility: DeclarationVisibility,
 	declared_binding: Option[AcceptedGlobalBinding],
 	owner_declared_binding: Option[AcceptedGlobalBinding],
@@ -52,9 +56,9 @@ private record AcceptedGlobalSlot {
 
 
 private record AcceptedGlobalTableRep {
+	module_table: ModuleTable,
 	slots: List[AcceptedGlobalSlot],
-	indices_by_module_and_name: Dict[String, Dict[String, Int]],
-	indices_by_module_path_and_name: Dict[String, Dict[String, Int]]
+	indices_by_module_and_name: List[Dict[String, Int]]
 }
 
 
@@ -124,16 +128,20 @@ private pure func localize_binding(
 
 pure func accepted_global_table(input: AcceptedGlobalTableInput) -> Option[AcceptedGlobalTable]:
 	var slots: List[AcceptedGlobalSlot] = []
-	var indices_by_module_and_name: Dict[String, Dict[String, Int]] = {}
-	var indices_by_module_path_and_name: Dict[String, Dict[String, Int]] = {}
-	var identity_keys_by_module_path: Dict[String, String] = {}
+	empty_names: Dict[String, Int] = {}
+	var indices_by_module_and_name: List[Dict[String, Int]] = repeat(
+		empty_names,
+		module_table_count(input.module_table),
+	)
 	var valid: Bool = True
 
 	for entry in input.globals:
-		identity_key = module_identity_storage_key(global_id_module_identity(entry.id))
+		module_id = global_id_module_id(entry.id)
+		module_index = module_id_table_index(module_id)
 		name = global_id_name(entry.id)
-		module_indices = indices_by_module_and_name.get_or(identity_key, {})
-		path_indices = indices_by_module_path_and_name.get_or(entry.owner_module_path, {})
+		module_indices = indices_by_module_and_name
+			.get(module_index)
+			.get_or({})
 
 		declared_matches = match entry.declared_binding:
 			Some(binding):
@@ -141,31 +149,28 @@ pure func accepted_global_table(input: AcceptedGlobalTableInput) -> Option[Accep
 			None:
 				True
 
-		path_identity_matches = match identity_keys_by_module_path.get(entry.owner_module_path):
-			Some(existing):
-				existing == identity_key
-			None:
-				True
+		owner_module_path = module_table_canonical_path(input.module_table, module_id)
 
 		if (
 			module_indices.contains(name)
-			or path_indices.contains(name)
 			or not declared_matches
-			or not path_identity_matches
-			or not module_identity_matches_module_path(
-				global_id_module_identity(entry.id),
-				entry.owner_module_path,
-			)
+			or indices_by_module_and_name
+				.get(module_index)
+				.is_none()
+			or owner_module_path.is_none()
 		):
 			valid = False
 		else:
 			index = slots.length()
-			owner_declared_binding = entry.declared_binding.map(
-				func(binding): localize_binding(entry.owner_module_path, binding),
-			)
+
+			owner_declared_binding = match owner_module_path:
+				Some(path):
+					entry.declared_binding.map(func(binding): localize_binding(path, binding))
+				None:
+					None
+
 			slots = slots.append({
 				id = entry.id,
-				owner_module_path = entry.owner_module_path,
 				visibility = entry.visibility,
 				declared_binding = entry.declared_binding,
 				owner_declared_binding = owner_declared_binding,
@@ -173,32 +178,22 @@ pure func accepted_global_table(input: AcceptedGlobalTableInput) -> Option[Accep
 				owner_completed_binding = None,
 			})
 			indices_by_module_and_name = indices_by_module_and_name.set(
-				identity_key,
+				module_index,
 				module_indices.set(name, index),
-			)
-			indices_by_module_path_and_name = indices_by_module_path_and_name.set(
-				entry.owner_module_path,
-				path_indices.set(name, index),
-			)
-			identity_keys_by_module_path = identity_keys_by_module_path.set(
-				entry.owner_module_path,
-				identity_key,
 			)
 
 	if valid:
 		Some(into_opaque AcceptedGlobalTable({
+					module_table = input.module_table,
 					slots = slots,
-					indices_by_module_and_name = indices_by_module_and_name,
-					indices_by_module_path_and_name = indices_by_module_path_and_name
+					indices_by_module_and_name = indices_by_module_and_name
 				}))
 	else:
 		None
 
 
 private pure func table_index_for_id(table: AcceptedGlobalTableRep, id: GlobalId) -> Option[Int]:
-	names ?= table.indices_by_module_and_name.get(
-		module_identity_storage_key(global_id_module_identity(id)),
-	)
+	names ?= table.indices_by_module_and_name.get(module_id_table_index(global_id_module_id(id)))
 	names.get(global_id_name(id))
 
 
@@ -221,14 +216,21 @@ pure func accepted_global_table_complete(
 						):
 							valid = False
 						else:
-							owner_binding = localize_binding(slot.owner_module_path, binding)
-							slots = slots.set(
-								index,
-								{ slot |
-									completed_binding = Some(binding),
-									owner_completed_binding = Some(owner_binding)
-								},
-							)
+							match module_table_canonical_path(
+								representation.module_table,
+								global_id_module_id(slot.id),
+							):
+								Some(owner_module_path):
+									owner_binding = localize_binding(owner_module_path, binding)
+									slots = slots.set(
+										index,
+										{ slot |
+											completed_binding = Some(binding),
+											owner_completed_binding = Some(owner_binding)
+										},
+									)
+								None:
+									valid = False
 					None:
 						valid = False
 			None:
@@ -269,10 +271,16 @@ pure func accepted_global_authority(
 	var visible_indices_by_source_name: Dict[String, Int] = {}
 	var valid: Bool = True
 
-	local_indices: Dict[String, Int] = representation.indices_by_module_path_and_name.get_or(
+	local_indices: Dict[String, Int] = match module_table_find_id_by_canonical_path(
+		representation.module_table,
 		owner_module_path,
-		{},
-	)
+	):
+		Some(module_id):
+			representation.indices_by_module_and_name
+				.get(module_id_table_index(module_id))
+				.get_or({})
+		None:
+			{}
 
 	for name in local_indices.keys():
 		match local_indices.get(name):
@@ -282,10 +290,16 @@ pure func accepted_global_authority(
 				valid = False
 
 	for binding in bindings:
-		module_indices: Dict[String, Int] = representation.indices_by_module_path_and_name.get_or(
+		module_indices: Dict[String, Int] = match module_table_find_id_by_canonical_path(
+			representation.module_table,
 			binding.owner_module_path,
-			{},
-		)
+		):
+			Some(module_id):
+				representation.indices_by_module_and_name
+					.get(module_id_table_index(module_id))
+					.get_or({})
+			None:
+				{}
 
 		match module_indices.get(binding.original_name):
 			Some(index):
@@ -368,7 +382,12 @@ private pure func available_binding(
 	slot: AcceptedGlobalSlot,
 	index: Int,
 ) -> Option[AcceptedGlobalBinding]:
-	owner_local = slot.owner_module_path == representation.owner_module_path
+	table = table_rep(representation.table)
+	owner_module_path ?= module_table_canonical_path(
+		table.module_table,
+		global_id_module_id(slot.id),
+	)
+	owner_local = owner_module_path == representation.owner_module_path
 
 	match representation.availability:
 		CompletedGlobalAvailability:
@@ -387,7 +406,7 @@ private pure func available_binding(
 					match allowed.get(index):
 						Some(binding):
 							if owner_local:
-								Some(localize_binding(slot.owner_module_path, binding))
+								Some(localize_binding(owner_module_path, binding))
 							else:
 								Some(binding)
 						None:
@@ -419,13 +438,18 @@ pure func accepted_global_find_qualified(
 ) -> Option[AcceptedGlobalBinding]:
 	representation = authority_rep(authority)
 	table = table_rep(representation.table)
-	names ?= table.indices_by_module_path_and_name.get(module_path)
+	module_id ?= module_table_find_id_by_canonical_path(table.module_table, module_path)
+	names ?= table.indices_by_module_and_name.get(module_id_table_index(module_id))
 	index ?= names.get(name)
 	slot ?= table.slots.get(index)
+	owner_module_path ?= module_table_canonical_path(
+		table.module_table,
+		global_id_module_id(slot.id),
+	)
 
 	if (
 		slot.visibility == PublicDeclaration
-		or slot.owner_module_path == representation.owner_module_path
+		or owner_module_path == representation.owner_module_path
 	):
 		binding_at(authority, index)
 	else:
@@ -434,6 +458,7 @@ pure func accepted_global_find_qualified(
 
 pure func accepted_global_exact(
 	authority: AcceptedGlobalAuthority,
+	issuing_table: ModuleTable,
 	declaration_id: DeclarationId,
 ) -> AcceptedGlobalExactProbe:
 	representation = authority_rep(authority)
@@ -441,7 +466,12 @@ pure func accepted_global_exact(
 
 	match declaration_id:
 		GlobalDeclarationId(id):
-			match table_index_for_id(table, id):
+			exact_index = if module_tables_are_compatible(table.module_table, issuing_table):
+				table_index_for_id(table, id)
+			else:
+				None
+
+			match exact_index:
 				Some(index):
 					match table.slots.get(index):
 						Some(slot):

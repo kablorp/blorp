@@ -9,35 +9,54 @@ import:
 		ANONYMOUS_IDENTITY,
 		ModuleIdentity,
 		ModuleOrigin(SourcePackageModule, StdlibModule, UserModule),
-		module_identities_equal,
+		ResolvedModuleIdentity,
 		module_identity_display_name,
 		module_identity_for_program,
+		module_identity_matches_module_path,
+		module_identity_storage_key,
+		resolved_module_identity_from_resolver,
+	../stage_04_modules/module_table:
+		ModuleId,
+		ModuleTable,
+		module_ids_equal,
+		module_table,
+		module_table_count,
+		module_table_find_id_by_canonical_path,
+		module_table_id_at,
+		module_table_resolved_identity,
 	diagnostic: TypecheckDiagnostic, typecheck_diagnostic
 	graph/definition_identity:
 		FuncCallableKey,
 		SourceDefinitionKey,
 		func_callable_key_description,
-		func_callable_key_module_identity,
+		func_callable_key_module_id,
 		source_definition_key_description,
-		source_definition_key_module_identity,
+		source_definition_key_module_id,
 	graph/definition_index:
 		DefinitionIndex,
+		DefinitionIndexSeed,
 		definition_index_advance_to_env,
-		definition_index_bootstrap_empty_index,
 		definition_index_bootstrap_env,
 		definition_index_bootstrap_from_base_env,
-		definition_index_conflict_message,
+		definition_index_bootstrap_seed,
+		definition_index_conflict_message_for_module,
+		definition_index_empty,
 		definition_index_find_func_callable_id,
 		definition_index_find_source_definition_id,
 		definition_index_func_callable_bindings,
 		definition_index_insert_func_callable_id,
 		definition_index_insert_source_definition_id,
+		definition_index_module_table,
 		definition_index_next_def_id,
+		definition_index_rebase_module_table,
+		definition_index_seed_from_index,
 	graph/indexed_graph:
 		PreparedModuleScope,
 		prepared_module_scope_canonical_path,
 		prepared_module_scope_definition_index,
+		prepared_module_scope_id,
 		prepared_module_scope_identity,
+		prepared_module_scope_module_table,
 		prepared_module_scope_origin,
 		prepared_module_scopes_are_compatible,
 		prepared_module_scopes_select_same_module,
@@ -95,8 +114,8 @@ enum ResourceShapeTarget:
 
 
 private union TypecheckModuleScopeRep:
-	UnscopedModuleScope(ModuleOrigin, DefinitionIndex)
-	ExtensibleModuleScope(ModuleOrigin, ModuleIdentity, DefinitionIndex)
+	UnscopedModuleScope(ModuleOrigin, DefinitionIndexSeed)
+	ExtensibleModuleScope(ModuleOrigin, ModuleIdentity, ModuleId, DefinitionIndex)
 	ReservedModuleScope(PreparedModuleScope)
 
 
@@ -208,14 +227,14 @@ pure func typecheck_state_reset_type_shape_memo(state: TypecheckState) -> Typech
 pure func typecheck_state_for_origin(origin: ModuleOrigin) -> TypecheckState:
 	bootstrap = definition_index_bootstrap_from_base_env(ENV_EMPTY)
 	env = definition_index_bootstrap_env(bootstrap)
-	definition_index = definition_index_bootstrap_empty_index(bootstrap)
+	seed = definition_index_bootstrap_seed(bootstrap)
 	{
 		context = CONTEXT_EMPTY,
 		env = env,
 		errors = [],
 		diagnostics = [],
 		module_view = COMPILER_MODULE_VIEW_EMPTY,
-		module_scope = typecheck_module_scope(UnscopedModuleScope(origin, definition_index)),
+		module_scope = typecheck_module_scope(UnscopedModuleScope(origin, seed)),
 		allow_debug_only_calls = False,
 		private_impls = [],
 		known_type_index = KNOWN_TYPE_INDEX_EMPTY,
@@ -225,16 +244,38 @@ pure func typecheck_state_for_origin(origin: ModuleOrigin) -> TypecheckState:
 	}
 
 
-private pure func typecheck_module_scope_index(scope: TypecheckModuleScope) -> DefinitionIndex:
+private pure func typecheck_module_scope_index(
+	scope: TypecheckModuleScope,
+) -> Option[DefinitionIndex]:
 	representation = typecheck_module_scope_rep(scope)
 
 	match representation:
-		UnscopedModuleScope(_, index):
-			index
-		ExtensibleModuleScope(_, _, index):
-			index
+		UnscopedModuleScope(_, _):
+			None
+		ExtensibleModuleScope(_, _, _, index):
+			Some(index)
 		ReservedModuleScope(prepared_scope):
-			prepared_module_scope_definition_index(prepared_scope)
+			Some(prepared_module_scope_definition_index(prepared_scope))
+
+
+private pure func typecheck_module_scope_table(scope: TypecheckModuleScope) -> Option[ModuleTable]:
+	match typecheck_module_scope_rep(scope):
+		UnscopedModuleScope(_, _):
+			None
+		ExtensibleModuleScope(_, _, _, index):
+			Some(definition_index_module_table(index))
+		ReservedModuleScope(prepared_scope):
+			Some(prepared_module_scope_module_table(prepared_scope))
+
+
+private pure func typecheck_module_scope_id(scope: TypecheckModuleScope) -> Option[ModuleId]:
+	match typecheck_module_scope_rep(scope):
+		UnscopedModuleScope(_, _):
+			None
+		ExtensibleModuleScope(_, _, module_id, _):
+			Some(module_id)
+		ReservedModuleScope(prepared_scope):
+			Some(prepared_module_scope_id(prepared_scope))
 
 
 private pure func typecheck_module_scope(
@@ -257,9 +298,21 @@ private pure func typecheck_state_with_definition_index(
 
 	module_scope = match representation:
 		UnscopedModuleScope(origin, _):
-			typecheck_module_scope(UnscopedModuleScope(origin, definition_index))
-		ExtensibleModuleScope(origin, identity, _):
-			typecheck_module_scope(ExtensibleModuleScope(origin, identity, definition_index))
+			typecheck_module_scope(
+				UnscopedModuleScope(
+					origin,
+					definition_index_seed_from_index(definition_index),
+				),
+			)
+		ExtensibleModuleScope(origin, identity, module_id, _):
+			typecheck_module_scope(
+				ExtensibleModuleScope(
+					origin,
+					identity,
+					module_id,
+					definition_index,
+				),
+			)
 		ReservedModuleScope(_):
 			state.module_scope
 
@@ -275,65 +328,98 @@ pure func typecheck_state_scope_to_program(
 	match representation:
 		ReservedModuleScope(_):
 			state
-		UnscopedModuleScope(origin, index):
+		UnscopedModuleScope(origin, seed):
 			identity = module_identity_for_program(program)
-			{ state |
-				module_scope = typecheck_module_scope(
-					ExtensibleModuleScope(
-						origin,
-						identity,
-						index,
-					),
-				)
-			}
-		ExtensibleModuleScope(origin, _, index):
-			identity = module_identity_for_program(program)
-			{ state |
-				module_scope = typecheck_module_scope(
-					ExtensibleModuleScope(
-						origin,
-						identity,
-						index,
-					),
-				)
-			}
-
-
-private pure func typecheck_state_scope_to_module(
-	state: TypecheckState,
-	module_identity: ModuleIdentity,
-) -> TypecheckState:
-	representation = typecheck_module_scope_rep(state.module_scope)
-
-	match representation:
-		UnscopedModuleScope(origin, index):
-			{ state |
-				module_scope = typecheck_module_scope(
-					ExtensibleModuleScope(
-						origin,
-						module_identity,
-						index,
-					),
-				)
-			}
-		ExtensibleModuleScope(origin, _, index):
-			{ state |
-				module_scope = typecheck_module_scope(
-					ExtensibleModuleScope(
-						origin,
-						module_identity,
-						index,
-					),
-				)
-			}
-		ReservedModuleScope(_):
-			typecheck_state_add_error(
-				state,
-				(
-					"internal typecheck error: canonical module scope requires a prepared module, "
-					+ "not identity '"
-				) + module_identity_display_name(module_identity) + "'",
+			resolved = resolved_module_identity_from_resolver(
+				module_identity_storage_key(identity),
+				origin,
 			)
+
+			match module_table([resolved]):
+				Err(_):
+					typecheck_state_add_error(
+						state,
+						"internal typecheck error: direct module table construction failed",
+					)
+				Ok(table):
+					match module_table_id_at(table, 0):
+						None:
+							typecheck_state_add_error(
+								state,
+								"internal typecheck error: direct module table is empty",
+							)
+						Some(module_id):
+							index = definition_index_empty(seed, table)
+							{ state |
+								module_scope = typecheck_module_scope(
+									ExtensibleModuleScope(
+										origin,
+										identity,
+										module_id,
+										index,
+									),
+								)
+							}
+		ExtensibleModuleScope(origin, _, _, index):
+			identity = module_identity_for_program(program)
+			identity_key = module_identity_storage_key(identity)
+			table = definition_index_module_table(index)
+
+			match module_table_find_id_by_canonical_path(table, identity_key):
+				Some(module_id):
+					{ state |
+						module_scope = typecheck_module_scope(
+							ExtensibleModuleScope(
+								origin,
+								identity,
+								module_id,
+								index,
+							),
+						)
+					}
+				None:
+					var identities: List[ResolvedModuleIdentity] = []
+
+					for table_index in 0..module_table_count(table):
+						match module_table_id_at(table, table_index):
+							Some(module_id):
+								match module_table_resolved_identity(table, module_id):
+									Some(existing):
+										identities = identities.append(existing)
+									None:
+										void
+							None:
+								void
+
+					next_resolved = resolved_module_identity_from_resolver(identity_key, origin)
+
+					match module_table(identities.append(next_resolved)):
+						Err(_):
+							typecheck_state_add_error(
+								state,
+								"internal typecheck error: direct module table extension failed",
+							)
+						Ok(next_table):
+							match (
+								module_table_find_id_by_canonical_path(next_table, identity_key),
+								definition_index_rebase_module_table(index, next_table),
+							):
+								(Some(module_id), Some(next_index)):
+									{ state |
+										module_scope = typecheck_module_scope(
+											ExtensibleModuleScope(
+												origin,
+												identity,
+												module_id,
+												next_index,
+											),
+										)
+									}
+								_:
+									typecheck_state_add_error(
+										state,
+										"internal typecheck error: direct definition index rebase failed",
+									)
 
 
 pure func typecheck_state_module_identity(state: TypecheckState) -> ModuleIdentity:
@@ -342,10 +428,28 @@ pure func typecheck_state_module_identity(state: TypecheckState) -> ModuleIdenti
 	match representation:
 		UnscopedModuleScope(_, _):
 			ANONYMOUS_IDENTITY
-		ExtensibleModuleScope(_, identity, _):
+		ExtensibleModuleScope(_, identity, _, _):
 			identity
 		ReservedModuleScope(prepared_scope):
 			prepared_module_scope_identity(prepared_scope)
+
+
+pure func typecheck_state_module_id(state: TypecheckState) -> Option[ModuleId]:
+	typecheck_module_scope_id(state.module_scope)
+
+
+pure func typecheck_state_module_path_matches(state: TypecheckState, module_path: String) -> Bool:
+	match typecheck_module_scope_rep(state.module_scope):
+		UnscopedModuleScope(_, _):
+			False
+		ExtensibleModuleScope(_, identity, _, _):
+			module_identity_matches_module_path(identity, module_path)
+		ReservedModuleScope(prepared_scope):
+			prepared_module_scope_canonical_path(prepared_scope) == module_path
+
+
+private pure func typecheck_state_module_display_name(state: TypecheckState) -> String:
+	module_identity_display_name(typecheck_state_module_identity(state))
 
 
 pure func typecheck_state_with_debug_calls(
@@ -460,7 +564,7 @@ private pure func typecheck_module_scope_origin(scope: TypecheckModuleScope) -> 
 	match representation:
 		UnscopedModuleScope(origin, _):
 			origin
-		ExtensibleModuleScope(origin, _, _):
+		ExtensibleModuleScope(origin, _, _, _):
 			origin
 		ReservedModuleScope(prepared_scope):
 			prepared_module_scope_origin(prepared_scope)
@@ -780,41 +884,74 @@ private pure func typecheck_state_record_func_callable_id(
 	key: FuncCallableKey,
 	def_id: Int,
 ) -> DefinitionIdClaim:
-	current_index = typecheck_module_scope_index(state.module_scope)
-
-	match definition_index_insert_func_callable_id(current_index, key, def_id):
-		Ok(definition_index):
-			aligned_index = definition_index_advance_to_env(definition_index, state.env)
-			updated = typecheck_state_with_definition_index(
-				{ state |
-					env = { state.env | next_def_id = definition_index_next_def_id(aligned_index) }
-				},
-				aligned_index,
-			)
-			DefinitionIdClaimed(updated, def_id)
-		Err(conflict):
-			with_error = typecheck_state_add_error(
-				typecheck_state_with_definition_index(
+	match (
+		typecheck_module_scope_index(state.module_scope),
+		typecheck_module_scope_table(state.module_scope),
+	):
+		(Some(current_index), Some(module_table)):
+			match definition_index_insert_func_callable_id(
+				current_index,
+				module_table,
+				key,
+				def_id,
+			):
+				Ok(definition_index):
+					aligned_index = definition_index_advance_to_env(definition_index, state.env)
+					updated = typecheck_state_with_definition_index(
+						{ state |
+							env = { state.env |
+								next_def_id = definition_index_next_def_id(aligned_index)
+							}
+						},
+						aligned_index,
+					)
+					DefinitionIdClaimed(updated, def_id)
+				Err(conflict):
+					with_error = typecheck_state_add_error(
+						typecheck_state_with_definition_index(
+							state,
+							definition_index_advance_to_env(current_index, state.env),
+						),
+						"internal typecheck error: " + definition_index_conflict_message_for_module(
+							current_index,
+							conflict,
+							func_callable_key_module_id(key),
+							module_identity_display_name(typecheck_state_module_identity(state)),
+						),
+					)
+					DefinitionIdMissing(with_error)
+		_:
+			DefinitionIdMissing(
+				typecheck_state_add_error(
 					state,
-					definition_index_advance_to_env(current_index, state.env),
+					"internal typecheck error: cannot record a callable before selecting a module",
 				),
-				"internal typecheck error: " + definition_index_conflict_message(conflict),
 			)
-			DefinitionIdMissing(with_error)
 
 
 pure func typecheck_state_find_func_callable_id(
 	state: TypecheckState,
 	key: FuncCallableKey,
 ) -> Option[Int]:
-	definition_index_find_func_callable_id(typecheck_module_scope_index(state.module_scope), key)
+	match (
+		typecheck_module_scope_index(state.module_scope),
+		typecheck_module_scope_table(state.module_scope),
+	):
+		(Some(index), Some(module_table)):
+			definition_index_find_func_callable_id(index, module_table, key)
+		_:
+			None
 
 
 pure func typecheck_state_func_callable_bindings(
 	state: TypecheckState,
 	name: String,
 ) -> List[(FuncCallableKey, Int)]:
-	definition_index_func_callable_bindings(typecheck_module_scope_index(state.module_scope), name)
+	match typecheck_module_scope_index(state.module_scope):
+		Some(index):
+			definition_index_func_callable_bindings(index, name)
+		None:
+			[]
 
 
 private pure func typecheck_state_record_source_definition_id(
@@ -822,41 +959,74 @@ private pure func typecheck_state_record_source_definition_id(
 	key: SourceDefinitionKey,
 	def_id: Int,
 ) -> DefinitionIdClaim:
-	current_index = typecheck_module_scope_index(state.module_scope)
-
-	match definition_index_insert_source_definition_id(current_index, key, def_id):
-		Ok(definition_index):
-			aligned_index = definition_index_advance_to_env(definition_index, state.env)
-			updated = typecheck_state_with_definition_index(
-				{ state |
-					env = { state.env | next_def_id = definition_index_next_def_id(aligned_index) }
-				},
-				aligned_index,
-			)
-			DefinitionIdClaimed(updated, def_id)
-		Err(conflict):
-			with_error = typecheck_state_add_error(
-				typecheck_state_with_definition_index(
+	match (
+		typecheck_module_scope_index(state.module_scope),
+		typecheck_module_scope_table(state.module_scope),
+	):
+		(Some(current_index), Some(module_table)):
+			match definition_index_insert_source_definition_id(
+				current_index,
+				module_table,
+				key,
+				def_id,
+			):
+				Ok(definition_index):
+					aligned_index = definition_index_advance_to_env(definition_index, state.env)
+					updated = typecheck_state_with_definition_index(
+						{ state |
+							env = { state.env |
+								next_def_id = definition_index_next_def_id(aligned_index)
+							}
+						},
+						aligned_index,
+					)
+					DefinitionIdClaimed(updated, def_id)
+				Err(conflict):
+					with_error = typecheck_state_add_error(
+						typecheck_state_with_definition_index(
+							state,
+							definition_index_advance_to_env(current_index, state.env),
+						),
+						"internal typecheck error: " + definition_index_conflict_message_for_module(
+							current_index,
+							conflict,
+							source_definition_key_module_id(key),
+							module_identity_display_name(typecheck_state_module_identity(state)),
+						),
+					)
+					DefinitionIdMissing(with_error)
+		_:
+			DefinitionIdMissing(
+				typecheck_state_add_error(
 					state,
-					definition_index_advance_to_env(current_index, state.env),
+					(
+						"internal typecheck error: cannot record a source definition before selecting a "
+						+ "module"
+					),
 				),
-				"internal typecheck error: " + definition_index_conflict_message(conflict),
 			)
-			DefinitionIdMissing(with_error)
 
 
 pure func typecheck_state_find_source_definition_id(
 	state: TypecheckState,
 	key: SourceDefinitionKey,
 ) -> Option[Int]:
-	definition_index_find_source_definition_id(
+	match (
 		typecheck_module_scope_index(state.module_scope),
-		key,
-	)
+		typecheck_module_scope_table(state.module_scope),
+	):
+		(Some(index), Some(module_table)):
+			definition_index_find_source_definition_id(index, module_table, key)
+		_:
+			None
 
 
-pure func typecheck_state_definition_index(state: TypecheckState) -> DefinitionIndex:
-	definition_index_advance_to_env(typecheck_module_scope_index(state.module_scope), state.env)
+pure func typecheck_state_definition_index(state: TypecheckState) -> Option[DefinitionIndex]:
+	match typecheck_module_scope_index(state.module_scope):
+		Some(index):
+			Some(definition_index_advance_to_env(index, state.env))
+		None:
+			None
 
 
 pure func typecheck_state_enter_prepared_module_scope(
@@ -873,7 +1043,7 @@ pure func typecheck_state_enter_prepared_module_scope(
 				env = { state.env | next_def_id = definition_index_next_def_id(aligned_index) },
 				module_scope = typecheck_module_scope(ReservedModuleScope(prepared_scope))
 			}
-		ExtensibleModuleScope(_, _, _):
+		ExtensibleModuleScope(_, _, _, _):
 			typecheck_state_add_error(
 				state,
 				(
@@ -919,16 +1089,8 @@ pure func typecheck_state_scope_to_imported_module(
 					+ "current module"
 				),
 			)
-		ExtensibleModuleScope(_, _, index):
-			{ state |
-				module_scope = typecheck_module_scope(
-					ExtensibleModuleScope(
-						prepared_module_scope_origin(imported_scope),
-						prepared_module_scope_identity(imported_scope),
-						index,
-					),
-				)
-			}
+		ExtensibleModuleScope(_, _, _, _):
+			{ state | module_scope = typecheck_module_scope(ReservedModuleScope(imported_scope)) }
 		ReservedModuleScope(current_scope):
 			if prepared_module_scopes_are_compatible(current_scope, imported_scope):
 				{ state |
@@ -953,7 +1115,7 @@ pure func typecheck_state_accepts_imported_module_scope(
 	match representation:
 		UnscopedModuleScope(_, _):
 			False
-		ExtensibleModuleScope(_, _, _):
+		ExtensibleModuleScope(_, _, _, _):
 			True
 		ReservedModuleScope(current_scope):
 			prepared_module_scopes_are_compatible(current_scope, imported_scope)
@@ -974,7 +1136,7 @@ pure func typecheck_state_is_reserved_for_scope(
 			prepared_module_scopes_select_same_module(current_scope, expected_scope)
 		UnscopedModuleScope(_, _):
 			False
-		ExtensibleModuleScope(_, _, _):
+		ExtensibleModuleScope(_, _, _, _):
 			False
 
 
@@ -990,23 +1152,8 @@ pure func typecheck_state_restore_definition_scope(
 				state,
 				"internal typecheck error: cannot restore an unscoped definition context",
 			)
-		ExtensibleModuleScope(origin, identity, _):
-			restored = typecheck_state_scope_to_module(state, identity)
-			representation = typecheck_module_scope_rep(restored.module_scope)
-
-			match representation:
-				ExtensibleModuleScope(_, restored_identity, index):
-					{ restored |
-						module_scope = typecheck_module_scope(
-							ExtensibleModuleScope(
-								origin,
-								restored_identity,
-								index,
-							),
-						)
-					}
-				_:
-					restored
+		ExtensibleModuleScope(_, _, _, _):
+			{ state | module_scope = target_scope.module_scope }
 		ReservedModuleScope(prepared_scope):
 			current_representation = typecheck_module_scope_rep(state.module_scope)
 			canonical_path = prepared_module_scope_canonical_path(prepared_scope)
@@ -1043,10 +1190,13 @@ pure func typecheck_state_claim_func_callable_id(
 	state: TypecheckState,
 	key: FuncCallableKey,
 ) -> DefinitionIdClaim:
-	if not module_identities_equal(
-		typecheck_state_module_identity(state),
-		func_callable_key_module_identity(key),
-	):
+	owner_matches = match typecheck_state_module_id(state):
+		Some(module_id):
+			module_ids_equal(module_id, func_callable_key_module_id(key))
+		None:
+			True
+
+	if not owner_matches:
 		DefinitionIdMissing(
 			typecheck_state_add_error(
 				state,
@@ -1069,6 +1219,7 @@ pure func typecheck_state_claim_func_callable_id(
 							state,
 							"internal typecheck error: missing reserved definition ID for " + func_callable_key_description(
 								key,
+								typecheck_state_module_display_name(state),
 							),
 						)
 						DefinitionIdMissing(with_error)
@@ -1077,10 +1228,13 @@ pure func typecheck_state_claim_func_callable_id(
 							state,
 							"internal typecheck error: cannot claim " + func_callable_key_description(
 								key,
+								typecheck_state_module_display_name(
+									state,
+								),
 							) + " before selecting a module",
 						)
 						DefinitionIdMissing(with_error)
-					ExtensibleModuleScope(_, _, _):
+					ExtensibleModuleScope(_, _, _, _):
 						match typecheck_state_mint_definition_id(state):
 							(with_id, def_id):
 								typecheck_state_record_func_callable_id(with_id, key, def_id)
@@ -1090,10 +1244,13 @@ pure func typecheck_state_claim_source_definition_id(
 	state: TypecheckState,
 	key: SourceDefinitionKey,
 ) -> DefinitionIdClaim:
-	if not module_identities_equal(
-		typecheck_state_module_identity(state),
-		source_definition_key_module_identity(key),
-	):
+	owner_matches = match typecheck_state_module_id(state):
+		Some(module_id):
+			module_ids_equal(module_id, source_definition_key_module_id(key))
+		None:
+			True
+
+	if not owner_matches:
 		DefinitionIdMissing(
 			typecheck_state_add_error(
 				state,
@@ -1116,6 +1273,7 @@ pure func typecheck_state_claim_source_definition_id(
 							state,
 							"internal typecheck error: missing reserved definition ID for " + source_definition_key_description(
 								key,
+								typecheck_state_module_display_name(state),
 							),
 						)
 						DefinitionIdMissing(with_error)
@@ -1124,10 +1282,13 @@ pure func typecheck_state_claim_source_definition_id(
 							state,
 							"internal typecheck error: cannot claim " + source_definition_key_description(
 								key,
+								typecheck_state_module_display_name(
+									state,
+								),
 							) + " before selecting a module",
 						)
 						DefinitionIdMissing(with_error)
-					ExtensibleModuleScope(_, _, _):
+					ExtensibleModuleScope(_, _, _, _):
 						match typecheck_state_mint_definition_id(state):
 							(with_id, def_id):
 								typecheck_state_record_source_definition_id(with_id, key, def_id)

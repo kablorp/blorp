@@ -76,6 +76,7 @@ import:
 		module_load_candidate,
 		resolved_module_identity_from_resolver,
 	../../../src/compiler/stage_04_modules/module_surface: module_surface_for_program
+	../../../src/compiler/stage_04_modules/module_table: module_table, module_table_canonical_path
 	../../../src/compiler/stage_06_typecheck/decl:
 		AcceptedTypecheckGraph,
 		TypecheckProgramResult,
@@ -109,16 +110,20 @@ import:
 		typecheck_validate_typed_program,
 		typed_foreign_link_platform_to_string,
 	../../../src/compiler/stage_06_typecheck/graph/definition_identity:
-		func_callable_key_module_identity,
+		FuncCallableKey,
+		SourceDefinitionKey,
+		func_callable_key_module_id,
 		func_callable_key_name,
 		func_callable_key_span,
-		source_definition_key_module_identity,
+		source_definition_key_module_id,
 	../../../src/compiler/stage_06_typecheck/graph/definition_index:
+		definition_index_module_table,
 		definition_index_source_definition_bindings,
 	../../../src/compiler/stage_06_typecheck/graph/indexed_graph:
 		indexed_graph_build,
 		indexed_graph_find_dependency_scope,
 		indexed_graph_module_scopes,
+		indexed_graph_module_table,
 		indexed_graph_target,
 		indexed_graph_target_scope,
 		prepared_module_program,
@@ -130,13 +135,16 @@ import:
 		DeclarationVisibility(PublicDeclaration),
 		builtin_trait_id,
 		trait_id_definition_id,
-		trait_id_module_identity,
+		trait_id_module_id,
 		trait_id_name,
 	../../../src/compiler/stage_06_typecheck/headers/implementation_headers:
 		implementation_header_graph_callable_headers,
 	../../../src/compiler/stage_06_typecheck/headers/trait_headers:
 		trait_topology_graph_headers,
+		trait_topology_graph_type_headers,
 		trait_topology_header_id,
+	../../../src/compiler/stage_06_typecheck/headers/type_header_graph:
+		type_header_graph_bound_graph,
 	../../../src/compiler/stage_06_typecheck/infer:
 		ExprTypeOrigin(InferredOrigin),
 		TypedExpr(TypedForExpr, TypedIntLiteralExpr),
@@ -148,6 +156,7 @@ import:
 		BoundModuleViewBinding(BoundModuleViewReady, BoundModuleViewRejected),
 		bound_module_build,
 		bound_module_graph_build,
+		bound_module_graph_indexed_graph,
 		bound_module_graph_target,
 		bound_module_identity,
 	../../../src/compiler/stage_06_typecheck/modules/module_binding:
@@ -1190,6 +1199,39 @@ private pure func program_for_module(module_path: String, decls: List[ParsedDecl
 	}
 
 
+private pure func source_definition_bindings(
+	state: TypecheckState,
+	name: String,
+) -> List[(SourceDefinitionKey, Int)]:
+	match typecheck_state_definition_index(state):
+		Some(index):
+			definition_index_source_definition_bindings(index, name)
+		None:
+			[]
+
+
+private pure func source_definition_key_module_path(
+	state: TypecheckState,
+	key: SourceDefinitionKey,
+) -> Option[String]:
+	index ?= typecheck_state_definition_index(state)
+	module_table_canonical_path(
+		definition_index_module_table(index),
+		source_definition_key_module_id(key),
+	)
+
+
+private pure func func_callable_key_module_path(
+	state: TypecheckState,
+	key: FuncCallableKey,
+) -> Option[String]:
+	index ?= typecheck_state_definition_index(state)
+	module_table_canonical_path(
+		definition_index_module_table(index),
+		func_callable_key_module_id(key),
+	)
+
+
 pure func importable_modules_with_origin(
 	module_path: String,
 	decls: List[ParsedDecl],
@@ -2068,7 +2110,13 @@ private pure func accepted_trait_table_exact_identity_is_owner_safe() -> Option[
 	)
 	header ?= trait_topology_graph_headers(topology).get(0)
 	id = trait_topology_header_id(header)
-	owner_path = module_identity_display_name(trait_id_module_identity(id))
+	owner_table = indexed_graph_module_table(
+		bound_module_graph_indexed_graph(
+			type_header_graph_bound_graph(trait_topology_graph_type_headers(topology)),
+		),
+	)
+	owner_id ?= trait_id_module_id(id)
+	owner_path ?= module_table_canonical_path(owner_table, owner_id)
 	definition = trait_def_with_details(
 		trait_id_definition_id(id),
 		trait_id_name(id),
@@ -2080,33 +2128,35 @@ private pure func accepted_trait_table_exact_identity_is_owner_safe() -> Option[
 	item: AcceptedTraitTableRecord = {
 		id = id,
 		compiler_builtin_id = None,
-		owner_module_path = owner_path,
 		visibility = PublicDeclaration,
 		supertraits = [],
 		method_ids = [],
 		definition = definition
 	}
 	table ?= accepted_trait_implementation_table({
+		module_table = owner_table,
 		traits = [item],
 		implementations = [],
 	})
 	authority = accepted_trait_implementation_authority(table, owner_path, [], [])
 	builtin_id ?= builtin_trait_id("Equatable")
+	foreign_table ?= module_table(
+		[resolved_module_identity_from_resolver(owner_path, UserModule)],
+	).to_option()
 	wrong_owner_path = "not/the/trait/owner"
-	wrong_owner_item = { item |
-		owner_module_path = wrong_owner_path,
-		definition = { definition | module_path = Some(wrong_owner_path) }
-	}
+	wrong_owner_item = { item | definition = { definition | module_path = Some(wrong_owner_path) } }
 
 	Some((
-		accepted_trait_find_exact(authority, id).is_some()
-		and accepted_trait_find_exact(authority, builtin_id).is_none()
+		accepted_trait_find_exact(authority, Some(owner_table), id).is_some()
+		and accepted_trait_find_exact(authority, Some(foreign_table), id).is_none()
+		and accepted_trait_find_exact(authority, None, builtin_id).is_none()
 		and accepted_resolve_trait_obligation(
 			authority,
 			base_state.env,
 			trait_obligation(TYPE_INT, "Equatable"),
 		) == TraitObligationUnsatisfied
 		and accepted_trait_implementation_table({
+			module_table = owner_table,
 			traits = [wrong_owner_item],
 			implementations = [],
 		}).is_none()
@@ -3459,14 +3509,8 @@ func test_foreign_default_args_use_accepted_enum_authority() -> Bool:
 		accepted_index.and_then(
 			func(index): accepted_union_find_constructor(index, "NativeModeOff"),
 		),
-		definition_index_source_definition_bindings(
-			typecheck_state_definition_index(result.state),
-			"NativeModeOn",
-		).get(0),
-		definition_index_source_definition_bindings(
-			typecheck_state_definition_index(result.state),
-			"NativeModeOff",
-		).get(0),
+		source_definition_bindings(result.state, "NativeModeOn").get(0),
+		source_definition_bindings(result.state, "NativeModeOff").get(0),
 	):
 		(Some(on_constructor), Some(off_constructor), Some((_, on_id)), Some((_, off_id))):
 			(
@@ -5760,14 +5804,8 @@ pure func test_direct_definition_ids_are_recorded_in_the_index() -> Bool:
 	(
 		result.state.errors.length() == 0
 		and typecheck_state_func_callable_bindings(result.state, "render").length() == 1
-		and definition_index_source_definition_bindings(
-			typecheck_state_definition_index(result.state),
-			"Ready",
-		).length() == 1
-		and definition_index_source_definition_bindings(
-			typecheck_state_definition_index(result.state),
-			"Measure",
-		).length() == 2
+		and source_definition_bindings(result.state, "Ready").length() == 1
+		and source_definition_bindings(result.state, "Measure").length() == 2
 	)
 
 
@@ -5799,10 +5837,7 @@ pure func test_explicit_import_constructor_ids_are_recorded_for_the_imported_mod
 		),
 	)
 
-	match definition_index_source_definition_bindings(
-		typecheck_state_definition_index(result.state),
-		"Ready",
-	).get(0):
+	match source_definition_bindings(result.state, "Ready").get(0):
 		None:
 			False
 		Some(binding):
@@ -5819,9 +5854,7 @@ pure func test_explicit_import_constructor_ids_are_recorded_for_the_imported_mod
 
 			(
 				result.state.errors.length() == 0
-				and module_identity_display_name(
-					source_definition_key_module_identity(binding[0]),
-				) == "signals"
+				and source_definition_key_module_path(result.state, binding[0]) == Some("signals")
 				and constructor.is_some()
 				and bare_constructor.is_some()
 				and sibling_constructor.is_some()
@@ -5878,22 +5911,16 @@ pure func test_imported_module_prescan_keeps_target_name_index_isolated() -> Boo
 				).map(
 					func(imported): imported.module_path,
 				) == Some("dep")
-				and module_identity_display_name(
-					func_callable_key_module_identity(binding[0]),
-				) == "dep"
+				and func_callable_key_module_path(result.state, binding[0]) == Some("dep")
 				and shared_bindings.any(
 					func(
 						shared,
-					): module_identity_display_name(
-						func_callable_key_module_identity(shared[0]),
-					) == "app",
+					): func_callable_key_module_path(result.state, shared[0]) == Some("app"),
 				)
 				and shared_bindings.any(
 					func(
 						shared,
-					): module_identity_display_name(
-						func_callable_key_module_identity(shared[0]),
-					) == "other",
+					): func_callable_key_module_path(result.state, shared[0]) == Some("other"),
 				)
 			)
 

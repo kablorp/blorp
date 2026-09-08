@@ -13,10 +13,13 @@ import:
 		ANONYMOUS_IDENTITY,
 		ModuleLoadCandidate,
 		ModuleOrigin(StdlibModule, UserModule),
-		module_identities_equal,
-		module_identity_display_name,
 		module_load_candidate,
 		resolved_module_identity_from_resolver,
+	../../../src/compiler/stage_04_modules/module_table:
+		ModuleTable,
+		module_ids_equal,
+		module_table,
+		module_table_canonical_path,
 	../../../src/compiler/stage_06_typecheck/decl:
 		AcceptedTypecheckGraph,
 		CompletedGlobalHeader,
@@ -37,8 +40,10 @@ import:
 		completed_global_header_graph_headers,
 		completed_global_header_id,
 		completed_global_header_visibility,
+	../../../src/compiler/stage_06_typecheck/graph/indexed_graph: indexed_graph_module_table
 	../../../src/compiler/stage_06_typecheck/graph/type_identity: type_id_name, type_ids_equal
 	../../../src/compiler/stage_06_typecheck/headers/callable_headers:
+		CallableHeader,
 		CallableHeaderGraph,
 		callable_header_graph_callables,
 		callable_header_graph_trait_topology,
@@ -75,11 +80,11 @@ import:
 		DeclarationVisibility(PrivateDeclaration, PublicDeclaration),
 		GlobalId,
 		callable_id_definition_id,
-		callable_id_module_identity,
+		callable_id_module_id,
 		callable_id_name,
 		callable_ids_equal,
 		constructor_ids_equal,
-		global_id_module_identity,
+		global_id_module_id,
 		global_id_name,
 		global_ids_equal,
 		impl_ids_equal,
@@ -103,7 +108,9 @@ import:
 		TypeHeaderShape(AliasTypeHeader, RecordTypeHeader, UnionTypeHeader),
 		type_header_graph_bound_graph,
 		type_header_graph_headers,
-	../../../src/compiler/stage_06_typecheck/modules/bound_module_graph: bound_module_graph_modules
+	../../../src/compiler/stage_06_typecheck/modules/bound_module_graph:
+		bound_module_graph_indexed_graph,
+		bound_module_graph_modules,
 	../../../src/compiler/stage_06_typecheck/state: typecheck_state_for_origin
 	../../../src/compiler/stage_06_typecheck/type_system/accepted_callable_authority:
 		AcceptedCallableTableRecord,
@@ -153,6 +160,18 @@ private pure func catalog_fixture() -> Option[CompilerTypecheckPhaseProfileFixtu
 	compiler_mixed_type_header_phase_profile_fixture(config).to_option()
 
 
+private pure func fixture_module_table(
+	fixture: CompilerTypecheckPhaseProfileFixture,
+) -> ModuleTable:
+	indexed_graph_module_table(
+		bound_module_graph_indexed_graph(
+			type_header_graph_bound_graph(
+				compiler_typecheck_phase_profile_fixture_type_headers(fixture),
+			),
+		),
+	)
+
+
 private pure func catalog_module_candidate(
 	module_path: String,
 	text: String,
@@ -177,6 +196,23 @@ private pure func sparse_catalog_fixture() -> Option[CompilerTypecheckPhaseProfi
 	]
 
 	compiler_typecheck_phase_profile_fixture(target, modules, ["app/selected"]).to_option()
+
+
+private pure func callable_catalog_fixture() -> Option[CompilerTypecheckPhaseProfileFixture]:
+	target = catalog_module_candidate(
+		"app/main",
+		"import:\n\tapp/first\n\tapp/second\n\nfunc main(args: List[String]) -> Int:\n\t0",
+	)
+	modules = [
+		catalog_module_candidate("app/first", "pure func first() -> Int: 1"),
+		catalog_module_candidate("app/second", "pure func second() -> Int: 2"),
+	]
+
+	compiler_typecheck_phase_profile_fixture(
+		target,
+		modules,
+		["app/first", "app/second"],
+	).to_option()
 
 
 private pure func catalog_global_input(
@@ -208,9 +244,9 @@ private pure func two_globals_from_different_modules(
 	first ?= headers.get(0)
 	first_id = completed_global_header_id(first)
 	second ?= headers.find(func(header):
-		not module_identities_equal(
-			global_id_module_identity(completed_global_header_id(header)),
-			global_id_module_identity(first_id),
+		not module_ids_equal(
+			global_id_module_id(completed_global_header_id(header)),
+			global_id_module_id(first_id),
 		)
 	)
 	Some((first_id, completed_global_header_id(second)))
@@ -827,65 +863,15 @@ func test_retained_trait_implementation_authority_has_one_entry_per_header_and_c
 	)
 
 
-private pure func fixture_callable_table_record() -> Option[AcceptedCallableTableRecord]:
-	fixture ?= catalog_fixture()
-	graph = compiler_typecheck_phase_profile_fixture_accepted_graph(fixture)
-	header ?= callable_header_graph_callables(
-		implementation_header_graph_callable_headers(
-			accepted_typecheck_graph_implementation_headers(graph),
-		),
-	).get(0)
-	id = callable_header_id(header)
-	module_path = module_identity_display_name(callable_id_module_identity(id))
-	entry: OverloadEntry = {
-		def_id = callable_id_definition_id(id),
-		func_type = SemanticFunctionType(True, [], TYPE_INT),
-		type_params = [],
-		param_names = [],
-		purity = Pure,
-		origin = UserDefinedFunc,
-		resource_args = RejectResourceArgs,
-		module_path = Some(module_path),
-		dim_constraints = [],
-		loop_producer = None,
-		debug_only = False
-	}
-
-	Some({
-		id = id,
-		owner_module_path = module_path,
-		source_name = callable_id_name(id),
-		visibility = PublicDeclaration,
-		entry = entry,
-	})
-
-
-private pure func callable_table_record_for_module(
-	module_path: String,
-	origin: ModuleOrigin,
+private pure func callable_table_record(
+	module_table: ModuleTable,
+	header: CallableHeader,
 ) -> Option[AcceptedCallableTableRecord]:
-	program = parse_compiler_source(
-		source_file(
-			"${module_path}.brp",
-			module_path,
-			"pure func shared() -> Int: 0",
-		),
-	)
-	graph ?= typecheck_test_accepted_graph(
-		typecheck_state_for_origin(origin),
-		program,
-		[],
-	).to_option()
-	header ?= callable_header_graph_callables(
-		implementation_header_graph_callable_headers(
-			accepted_typecheck_graph_implementation_headers(graph),
-		),
-	).get(0)
 	id = callable_header_id(header)
+	module_path ?= module_table_canonical_path(module_table, callable_id_module_id(id))
 
 	Some({
 		id = id,
-		owner_module_path = module_path,
 		source_name = callable_id_name(id),
 		visibility = PublicDeclaration,
 		entry = {
@@ -904,67 +890,145 @@ private pure func callable_table_record_for_module(
 	})
 
 
-private pure func callable_table_disambiguates_equal_raw_ids() -> Option[Bool]:
-	first ?= callable_table_record_for_module("first", UserModule)
-	second ?= callable_table_record_for_module("second", UserModule)
-	table ?= accepted_callable_table(
-		{callables = [first, second]},
-	)
-	first_authority ?= accepted_callable_authority(table, Some("first"), [], [])
-	second_authority ?= accepted_callable_authority(table, Some("second"), [], [])
-	first_entry ?= accepted_callable_find_exact(first_authority, first.id)
-	second_entry ?= accepted_callable_find_exact(second_authority, second.id)
+private pure func fixture_callable_table_record(
 
-	Some(
-		(
-			callable_id_definition_id(first.id) == callable_id_definition_id(second.id)
-			and not callable_ids_equal(first.id, second.id)
-			and accepted_callable_table(
-				{callables = [first, first]},
-			).is_none()
-			and first_entry.module_path.is_none()
-			and second_entry.module_path.is_none()
+) -> Option[(ModuleTable, AcceptedCallableTableRecord)]:
+	fixture ?= catalog_fixture()
+	module_table = fixture_module_table(fixture)
+	graph = compiler_typecheck_phase_profile_fixture_accepted_graph(fixture)
+	header ?= callable_header_graph_callables(
+		implementation_header_graph_callable_headers(
+			accepted_typecheck_graph_implementation_headers(graph),
+		),
+	).get(0)
+	item ?= callable_table_record(module_table, header)
+
+	Some((module_table, item))
+
+
+private pure func callable_table_record_for_module(
+	module_path: String,
+	origin: ModuleOrigin,
+) -> Option[(ModuleTable, AcceptedCallableTableRecord)]:
+	program = parse_compiler_source(
+		source_file(
+			"${module_path}.brp",
+			module_path,
+			"pure func shared() -> Int: 0",
 		),
 	)
+	graph ?= typecheck_test_accepted_graph(
+		typecheck_state_for_origin(origin),
+		program,
+		[],
+	).to_option()
+	header ?= callable_header_graph_callables(
+		implementation_header_graph_callable_headers(
+			accepted_typecheck_graph_implementation_headers(graph),
+		),
+	).get(0)
+	-- A one-module test graph assigns the declaration's owner to table row zero.
+	module_table ?= module_table(
+		[resolved_module_identity_from_resolver(module_path, origin)],
+	).to_option()
+	item ?= callable_table_record(module_table, header)
+
+	Some((module_table, item))
 
 
-func test_callable_table_disambiguates_equal_raw_ids() -> Bool:
-	callable_table_disambiguates_equal_raw_ids().get_or(False)
+private pure func callable_table_disambiguates_equal_definition_ids() -> Option[Bool]:
+	fixture ?= callable_catalog_fixture()
+	module_table = fixture_module_table(fixture)
+	graph = compiler_typecheck_phase_profile_fixture_accepted_graph(fixture)
+	headers = callable_header_graph_callables(
+		implementation_header_graph_callable_headers(
+			accepted_typecheck_graph_implementation_headers(graph),
+		),
+	)
+	first_header ?= headers.get(0)
+	second_header ?= headers.find(func(header):
+		not module_ids_equal(
+			callable_id_module_id(callable_header_id(header)),
+			callable_id_module_id(callable_header_id(first_header)),
+		)
+	)
+	first ?= callable_table_record(module_table, first_header)
+	second ?= callable_table_record(module_table, second_header)
+	first_path ?= module_table_canonical_path(module_table, callable_id_module_id(first.id))
+	second_path ?= module_table_canonical_path(module_table, callable_id_module_id(second.id))
+	table ?= accepted_callable_table({
+		module_table = module_table,
+		callables = [first, second],
+	})
+	first_authority ?= accepted_callable_authority(table, Some(first_path), [], [])
+	second_authority ?= accepted_callable_authority(table, Some(second_path), [], [])
+	first_entry ?= accepted_callable_find_exact(first_authority, module_table, first.id)
+	second_entry ?= accepted_callable_find_exact(second_authority, module_table, second.id)
+
+	Some(not callable_ids_equal(first.id, second.id) and accepted_callable_table({
+		module_table = module_table,
+		callables = [first, first],
+	}).is_none() and first_entry.def_id == callable_id_definition_id(
+		first.id,
+	) and second_entry.def_id == callable_id_definition_id(second.id))
 
 
-private pure func callable_table_rejects_path_with_distinct_identities() -> Option[Bool]:
-	user ?= callable_table_record_for_module("shared/path", UserModule)
-	stdlib ?= callable_table_record_for_module("shared/path", StdlibModule)
-
-	Some(not callable_ids_equal(user.id, stdlib.id) and accepted_callable_table(
-			{callables = [user, stdlib]},
-		).is_none())
+func test_callable_table_disambiguates_equal_definition_ids() -> Bool:
+	callable_table_disambiguates_equal_definition_ids().get_or(False)
 
 
-func test_callable_table_rejects_path_with_distinct_identities() -> Bool:
-	callable_table_rejects_path_with_distinct_identities().get_or(False)
+private pure func callable_table_rejects_foreign_graph_id() -> Option[Bool]:
+	user_fixture ?= callable_table_record_for_module("user/path", UserModule)
+	stdlib_fixture ?= callable_table_record_for_module("stdlib/path", StdlibModule)
+	(user_table, user) = user_fixture
+	(_, stdlib) = stdlib_fixture
+	same_path_user_fixture ?= callable_table_record_for_module("shared/path", UserModule)
+	same_path_stdlib_fixture ?= callable_table_record_for_module("shared/path", StdlibModule)
+	(same_path_user_table, same_path_user) = same_path_user_fixture
+	(same_path_stdlib_table, same_path_stdlib) = same_path_stdlib_fixture
+	same_path_table ?= accepted_callable_table({
+		module_table = same_path_user_table,
+		callables = [same_path_user],
+	})
+	same_path_authority ?= accepted_callable_authority(
+		same_path_table,
+		module_table_canonical_path(same_path_user_table, callable_id_module_id(same_path_user.id)),
+		[],
+		[],
+	)
+
+	Some(accepted_callable_table({
+		module_table = user_table,
+		callables = [user],
+	}).is_some() and accepted_callable_table({
+		module_table = user_table,
+		callables = [user, stdlib],
+	}).is_none() and accepted_callable_find_exact(
+		same_path_authority,
+		same_path_stdlib_table,
+		same_path_stdlib.id,
+	).is_none())
+
+
+func test_callable_table_rejects_foreign_graph_id() -> Bool:
+	callable_table_rejects_foreign_graph_id().get_or(False)
 
 
 private pure func accepted_callable_table_rejects_mismatched_name_and_owner() -> Option[Bool]:
-	item ?= fixture_callable_table_record()
+	fixture ?= fixture_callable_table_record()
+	(module_table, item) = fixture
 	wrong_path = "not/the/callable/owner"
 
-	Some(
-		(
-			accepted_callable_table({callables = [item]}).is_some()
-			and accepted_callable_table(
-				{callables = [{ item | source_name = "not_the_callable_name" }]},
-			).is_none()
-			and accepted_callable_table(
-				{callables = [
-						{ item |
-							owner_module_path = wrong_path,
-							entry = { item.entry | module_path = Some(wrong_path) }
-						},
-					]},
-			).is_none()
-		),
-	)
+	Some(accepted_callable_table({
+		module_table = module_table,
+		callables = [item],
+	}).is_some() and accepted_callable_table({
+		module_table = module_table,
+		callables = [{ item | source_name = "not_the_callable_name" }],
+	}).is_none() and accepted_callable_table({
+		module_table = module_table,
+		callables = [{ item | entry = { item.entry | module_path = Some(wrong_path) } }],
+	}).is_none())
 
 
 func test_accepted_callable_table_rejects_mismatched_name_and_owner() -> Bool:
@@ -972,8 +1036,9 @@ func test_accepted_callable_table_rejects_mismatched_name_and_owner() -> Bool:
 
 
 private pure func accepted_callable_owner_query_localizes_canonical_types() -> Option[Bool]:
-	item ?= fixture_callable_table_record()
-	module_path = item.owner_module_path
+	fixture ?= fixture_callable_table_record()
+	(module_table, item) = fixture
+	module_path ?= module_table_canonical_path(module_table, callable_id_module_id(item.id))
 	canonical_type = SemanticNamedType(
 		canonical_module_type_name(module_path, "OwnerType"),
 		[],
@@ -982,9 +1047,12 @@ private pure func accepted_callable_owner_query_localizes_canonical_types() -> O
 		func_type = SemanticFunctionType(True, [canonical_type], canonical_type)
 	}
 	canonical_item = { item | entry = entry }
-	table ?= accepted_callable_table({callables = [canonical_item]})
+	table ?= accepted_callable_table({
+		module_table = module_table,
+		callables = [canonical_item],
+	})
 	authority ?= accepted_callable_authority(table, Some(module_path), [], [])
-	result ?= accepted_callable_find_exact(authority, item.id)
+	result ?= accepted_callable_find_exact(authority, module_table, item.id)
 
 	Some(result.module_path.is_none() and types_equal(
 			result.func_type,
@@ -1001,8 +1069,9 @@ func test_accepted_callable_owner_query_localizes_canonical_types() -> Bool:
 
 
 private pure func accepted_callable_foreign_exact_query_preserves_canonical_types() -> Option[Bool]:
-	item ?= fixture_callable_table_record()
-	module_path = item.owner_module_path
+	fixture ?= fixture_callable_table_record()
+	(module_table, item) = fixture
+	module_path ?= module_table_canonical_path(module_table, callable_id_module_id(item.id))
 	canonical_type = SemanticNamedType(
 		canonical_module_type_name(module_path, "OwnerType"),
 		[],
@@ -1011,9 +1080,12 @@ private pure func accepted_callable_foreign_exact_query_preserves_canonical_type
 		func_type = SemanticFunctionType(True, [canonical_type], canonical_type)
 	}
 	canonical_item = { item | entry = entry }
-	table ?= accepted_callable_table({callables = [canonical_item]})
+	table ?= accepted_callable_table({
+		module_table = module_table,
+		callables = [canonical_item],
+	})
 	foreign_authority ?= accepted_callable_authority(table, None, [], [])
-	result ?= accepted_callable_find_exact(foreign_authority, item.id)
+	result ?= accepted_callable_find_exact(foreign_authority, module_table, item.id)
 
 	Some(result.module_path == Some(module_path) and types_equal(result.func_type, entry.func_type))
 
@@ -1024,27 +1096,27 @@ func test_accepted_callable_foreign_exact_query_preserves_canonical_types() -> B
 
 private pure func accepted_global_authority_availability_is_exact() -> Option[Bool]:
 	fixture ?= catalog_fixture()
+	shared_table = fixture_module_table(fixture)
 	graph = compiler_typecheck_phase_profile_fixture_accepted_graph(fixture)
 	global_ids ?= two_globals_from_different_modules(graph)
 	(first_id, second_id) = global_ids
-	first_path = module_identity_display_name(global_id_module_identity(first_id))
-	second_path = module_identity_display_name(global_id_module_identity(second_id))
-	table ?= accepted_global_table(
-		{globals = [
-				{
-					id = first_id,
-					owner_module_path = first_path,
-					visibility = PublicDeclaration,
-					declared_binding = Some(accepted_global_binding(first_id))
-				},
-				{
-					id = second_id,
-					owner_module_path = second_path,
-					visibility = PublicDeclaration,
-					declared_binding = None
-				},
-			]},
-	)
+	first_path ?= module_table_canonical_path(shared_table, global_id_module_id(first_id))
+	second_path ?= module_table_canonical_path(shared_table, global_id_module_id(second_id))
+	table ?= accepted_global_table({
+		module_table = shared_table,
+		globals = [
+			{
+				id = first_id,
+				visibility = PublicDeclaration,
+				declared_binding = Some(accepted_global_binding(first_id))
+			},
+			{
+				id = second_id,
+				visibility = PublicDeclaration,
+				declared_binding = None
+			},
+		],
+	})
 	authority ?= accepted_global_authority(
 		table,
 		first_path,
@@ -1061,6 +1133,9 @@ private pure func accepted_global_authority_availability_is_exact() -> Option[Bo
 	initializer = accepted_global_authority_for_initializer(authority, [completed_binding])
 	ordinary = accepted_global_authority_with_completed_table(authority, completed_table)
 	hidden = accepted_global_authority_without_visible_names(initializer)
+	foreign_table ?= module_table(
+		[resolved_module_identity_from_resolver(first_path, UserModule)],
+	).to_option()
 	callable ?= callable_header_graph_callables(
 		implementation_header_graph_callable_headers(
 			accepted_typecheck_graph_implementation_headers(graph),
@@ -1069,6 +1144,7 @@ private pure func accepted_global_authority_availability_is_exact() -> Option[Bo
 
 	initial_exact_missing = match accepted_global_exact(
 		authority,
+		shared_table,
 		GlobalDeclarationId(second_id),
 	).lookup:
 		AcceptedGlobalExactMissing:
@@ -1078,6 +1154,7 @@ private pure func accepted_global_authority_availability_is_exact() -> Option[Bo
 
 	initializer_exact_found = match accepted_global_exact(
 		initializer,
+		shared_table,
 		GlobalDeclarationId(second_id),
 	).lookup:
 		AcceptedGlobalExactFound(binding):
@@ -1085,8 +1162,19 @@ private pure func accepted_global_authority_availability_is_exact() -> Option[Bo
 		_:
 			False
 
+	foreign_exact_missing = match accepted_global_exact(
+		initializer,
+		foreign_table,
+		GlobalDeclarationId(first_id),
+	).lookup:
+		AcceptedGlobalExactMissing:
+			True
+		_:
+			False
+
 	wrong_kind = match accepted_global_exact(
 		authority,
+		shared_table,
 		CallableDeclarationId(callable_header_id(callable)),
 	).lookup:
 		AcceptedGlobalExactWrongKind(_):
@@ -1105,6 +1193,7 @@ private pure func accepted_global_authority_availability_is_exact() -> Option[Bo
 			and accepted_global_find(hidden, "imported").is_none()
 			and initial_exact_missing
 			and initializer_exact_found
+			and foreign_exact_missing
 			and wrong_kind
 		),
 	)
@@ -1116,35 +1205,35 @@ func test_accepted_global_authority_availability_is_exact() -> Bool:
 
 private pure func accepted_global_table_rejects_duplicate_completion() -> Option[Bool]:
 	fixture ?= catalog_fixture()
+	module_table = fixture_module_table(fixture)
 	graph = compiler_typecheck_phase_profile_fixture_accepted_graph(fixture)
 	global_ids ?= two_globals_from_different_modules(graph)
-	(first_id, _) = global_ids
-	first_path = module_identity_display_name(global_id_module_identity(first_id))
-	table ?= accepted_global_table(
-		{globals = [
-				{
-					id = first_id,
-					owner_module_path = first_path,
-					visibility = PublicDeclaration,
-					declared_binding = Some(accepted_global_binding(first_id))
-				},
-			]},
-	)
+	(first_id, second_id) = global_ids
+	table ?= accepted_global_table({
+		module_table = module_table,
+		globals = [
+			{
+				id = first_id,
+				visibility = PublicDeclaration,
+				declared_binding = Some(accepted_global_binding(first_id))
+			},
+		],
+	})
 	binding = accepted_global_binding(first_id)
 
 	Some(accepted_global_table_complete(
-			table,
-			[binding, binding],
-		).is_none() and accepted_global_table(
-			{globals = [
-					{
-						id = first_id,
-						owner_module_path = "not/the/global/owner",
-						visibility = PublicDeclaration,
-						declared_binding = None
-					},
-				]},
-		).is_none())
+		table,
+		[binding, binding],
+	).is_none() and accepted_global_table({
+		module_table = module_table,
+		globals = [
+			{
+				id = first_id,
+				visibility = PublicDeclaration,
+				declared_binding = Some(accepted_global_binding(second_id))
+			},
+		],
+	}).is_none())
 
 
 func test_accepted_global_table_rejects_duplicate_completion() -> Bool:
@@ -1153,27 +1242,27 @@ func test_accepted_global_table_rejects_duplicate_completion() -> Bool:
 
 private pure func accepted_global_module_view_rejects_private_import() -> Option[Bool]:
 	fixture ?= catalog_fixture()
+	module_table = fixture_module_table(fixture)
 	graph = compiler_typecheck_phase_profile_fixture_accepted_graph(fixture)
 	global_ids ?= two_globals_from_different_modules(graph)
 	(first_id, second_id) = global_ids
-	first_path = module_identity_display_name(global_id_module_identity(first_id))
-	second_path = module_identity_display_name(global_id_module_identity(second_id))
-	table ?= accepted_global_table(
-		{globals = [
-				{
-					id = first_id,
-					owner_module_path = first_path,
-					visibility = PublicDeclaration,
-					declared_binding = None
-				},
-				{
-					id = second_id,
-					owner_module_path = second_path,
-					visibility = PrivateDeclaration,
-					declared_binding = None
-				},
-			]},
-	)
+	first_path ?= module_table_canonical_path(module_table, global_id_module_id(first_id))
+	second_path ?= module_table_canonical_path(module_table, global_id_module_id(second_id))
+	table ?= accepted_global_table({
+		module_table = module_table,
+		globals = [
+			{
+				id = first_id,
+				visibility = PublicDeclaration,
+				declared_binding = None
+			},
+			{
+				id = second_id,
+				visibility = PrivateDeclaration,
+				declared_binding = None
+			},
+		],
+	})
 
 	Some(accepted_global_authority(
 			table,
@@ -1244,12 +1333,12 @@ tests: TestSuite = {
 			test_accepted_callable_table_rejects_mismatched_name_and_owner,
 		),
 		(
-			"accepted callable table disambiguates equal raw ids",
-			test_callable_table_disambiguates_equal_raw_ids,
+			"accepted callable table disambiguates equal definition ids",
+			test_callable_table_disambiguates_equal_definition_ids,
 		),
 		(
-			"accepted callable table rejects one path with distinct identities",
-			test_callable_table_rejects_path_with_distinct_identities,
+			"accepted callable table rejects a foreign graph id",
+			test_callable_table_rejects_foreign_graph_id,
 		),
 		(
 			"accepted callable owner queries localize canonical types",

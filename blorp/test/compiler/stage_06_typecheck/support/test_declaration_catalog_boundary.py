@@ -39,6 +39,12 @@ GLOBAL_HEADER_COMPLETION = (
 DECLARATION_SKELETON = (
     ROOT / "blorp/src/compiler/stage_06_typecheck/headers/declaration_skeleton.brp"
 )
+DEFINITION_IDENTITY = (
+    ROOT / "blorp/src/compiler/stage_06_typecheck/graph/definition_identity.brp"
+)
+DEFINITION_INDEX = (
+    ROOT / "blorp/src/compiler/stage_06_typecheck/graph/definition_index.brp"
+)
 SEMANTIC_OCCURRENCE = (
     ROOT / "blorp/src/compiler/stage_06_typecheck/graph/semantic_occurrence.brp"
 )
@@ -63,6 +69,61 @@ def source_without_comments() -> str:
 
 
 class DeclarationCatalogBoundaryTests(unittest.TestCase):
+    def test_graph_declaration_ids_store_only_module_foreign_keys(self) -> None:
+        source = DECLARATION_SKELETON.read_text(encoding="utf-8")
+        structural_id = re.search(
+            r"private record StructuralDeclarationIdRep \{.*?\n\}",
+            source,
+            re.DOTALL,
+        )
+
+        self.assertIsNotNone(structural_id)
+        body = structural_id.group(0)
+        self.assertIn("module_id: ModuleId", body)
+        self.assertNotIn("ModuleIdentity", body)
+        self.assertNotIn("ModuleTable", body)
+        self.assertNotIn("PreparedModuleScope", body)
+
+    def test_internal_definition_keys_store_only_module_foreign_keys(self) -> None:
+        source = DEFINITION_IDENTITY.read_text(encoding="utf-8")
+
+        for representation_name in ("FuncCallableKeyRep", "SourceDefinitionKeyRep"):
+            with self.subTest(representation_name=representation_name):
+                representation = re.search(
+                    rf"private record {representation_name} \{{.*?\n\}}",
+                    source,
+                    re.DOTALL,
+                )
+                self.assertIsNotNone(representation)
+                body = representation.group(0)
+                self.assertIn("module_id: ModuleId", body)
+                self.assertNotIn("ModuleIdentity", body)
+                self.assertNotIn("ModuleTable", body)
+
+        exported_key = re.search(
+            r"private record ExportedSymbolKeyRep \{.*?\n\}",
+            source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(exported_key)
+        self.assertIn("module_identity: ModuleIdentity", exported_key.group(0))
+
+    def test_definition_index_owns_one_module_table_and_dense_module_buckets(self) -> None:
+        source = DEFINITION_INDEX.read_text(encoding="utf-8")
+        representation = re.search(
+            r"private record DefinitionIndexRep \{.*?\n\}",
+            source,
+            re.DOTALL,
+        )
+
+        self.assertIsNotNone(representation)
+        body = representation.group(0)
+        self.assertIn("module_table: ModuleTable", body)
+        self.assertIn("func_callable_ids_by_module_and_name: List[", body)
+        self.assertIn("source_definition_ids_by_module_and_name: List[", body)
+        self.assertNotIn("Dict[String, FuncCallableNameBuckets]", body)
+        self.assertNotIn("Dict[String, SourceDefinitionNameBuckets]", body)
+
     def test_decl_import_pattern_covers_every_import_form(self) -> None:
         for import_line in ("\t../decl", "\t../decl:", "\t../decl as Decl"):
             with self.subTest(import_line=import_line):
@@ -291,8 +352,12 @@ class DeclarationCatalogBoundaryTests(unittest.TestCase):
         self.assertIn(
             "indices_by_definition_id: Dict[Int, List[Int]]", table.group(0)
         )
-        self.assertIn("indices_by_module_path_and_name", table.group(0))
-        self.assertNotIn("indices_by_module_and_name", table.group(0))
+        self.assertIn("module_table: ModuleTable", table.group(0))
+        self.assertIn(
+            "indices_by_module_and_name: List[Dict[String, List[Int]]]",
+            table.group(0),
+        )
+        self.assertNotIn("indices_by_module_path_and_name", table.group(0))
         self.assertIn("owner_module_path: Option[String]", authority.group(0))
         self.assertNotIn("ModuleIdentity", source)
         self.assertNotIn("identity_keys_by_module_path", table.group(0))
@@ -313,7 +378,7 @@ class DeclarationCatalogBoundaryTests(unittest.TestCase):
         self.assertNotIn("owner: ModuleIdentity", authority.group(0))
         self.assertNotIn("module_identities_equal", source)
 
-    def test_trait_implementation_authority_uses_paths_for_visibility(self) -> None:
+    def test_trait_implementation_authority_uses_dense_module_indices(self) -> None:
         source = (
             ROOT
             / "blorp/src/compiler/stage_06_typecheck/type_system/accepted_trait_implementation_authority.brp"
@@ -331,8 +396,11 @@ class DeclarationCatalogBoundaryTests(unittest.TestCase):
 
         self.assertIsNotNone(table)
         self.assertIsNotNone(authority)
-        self.assertIn("trait_indices_by_module_path", table.group(0))
-        self.assertIn("implementation_indices_by_module_path", table.group(0))
+        self.assertIn("module_table: ModuleTable", table.group(0))
+        self.assertIn("trait_indices_by_module: List[List[Int]]", table.group(0))
+        self.assertIn("implementation_indices_by_module: List[List[Int]]", table.group(0))
+        self.assertNotIn("trait_indices_by_module_path", table.group(0))
+        self.assertNotIn("implementation_indices_by_module_path", table.group(0))
         self.assertNotIn("by_module_identity", table.group(0))
         self.assertIn("owner_module_path: String", authority.group(0))
         self.assertNotIn("owner: ModuleIdentity", authority.group(0))

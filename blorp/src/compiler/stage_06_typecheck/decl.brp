@@ -113,17 +113,20 @@ import:
 		parsed_function_body_is_builtin,
 		parsed_function_body_kind,
 	../stage_03_parse/parsed_ast_traverse: map_parsed_expr_children
-	../stage_04_modules/loaded_module:
-		ModuleIdentity,
-		module_identities_equal,
-		module_identity_display_name,
-		module_identity_storage_key,
-	../stage_04_modules/module_table: ModuleId, module_id_table_index, module_ids_equal
+	../stage_04_modules/loaded_module: ModuleIdentity, resolved_module_identities_equal
+	../stage_04_modules/module_table:
+		ModuleId,
+		ModuleTable,
+		module_id_table_index,
+		module_ids_equal,
+		module_table_resolved_identity,
+		module_tables_are_compatible,
 	../stage_04_modules/module_type_identity: local_type_names_from_decls
 	diagnostic: TypecheckDiagnostic, typecheck_diagnostic
 	foreign_validation: validate_foreign_function
 	graph/definition_identity:
 		FuncCallableKey,
+		SourceDefinitionKey,
 		SourceDefinitionKind(FieldDefinition, GlobalDefinition, ImplDefinition, TraitDefinition),
 		func_callable_key,
 		source_definition_key,
@@ -131,6 +134,7 @@ import:
 	graph/indexed_graph:
 		PreparedModuleScope,
 		indexed_graph_module_count,
+		indexed_graph_module_table,
 		indexed_graph_target_scope,
 		prepared_module_program,
 		prepared_module_scope_canonical_path,
@@ -138,6 +142,7 @@ import:
 		prepared_module_scope_id,
 		prepared_module_scope_identity,
 		prepared_module_scope_module,
+		prepared_module_scope_module_table,
 		prepared_module_scope_origin,
 		prepared_module_scopes_select_same_module,
 	graph/typed_expr_children: typed_expr_children
@@ -201,21 +206,21 @@ import:
 		TraitId,
 		builtin_trait_id,
 		callable_id_definition_id,
-		callable_id_module_identity,
+		callable_id_module_id,
 		callable_id_name,
 		callable_id_source_span,
 		callable_ids_equal,
-		global_id_module_identity,
+		global_id_module_id,
 		global_id_name,
 		global_id_source_span,
 		global_ids_equal,
 		impl_id_definition_id,
-		impl_id_module_identity,
+		impl_id_module_id,
 		impl_id_name,
 		impl_id_source_span,
 		trait_id_definition_id,
 		trait_id_is_compiler_builtin,
-		trait_id_module_identity,
+		trait_id_module_id,
 		trait_id_name,
 		trait_id_source_span,
 	headers/global_header_completion:
@@ -348,13 +353,15 @@ import:
 		bound_module_build,
 		bound_module_canonical_path,
 		bound_module_direct_import_modules,
+		bound_module_graph_canonical_path_for_id,
 		bound_module_graph_find,
 		bound_module_graph_find_canonical_path,
+		bound_module_graph_find_for_id,
 		bound_module_graph_find_for_scope,
 		bound_module_graph_indexed_graph,
+		bound_module_graph_module_table,
 		bound_module_graph_modules,
 		bound_module_graph_target,
-		bound_module_identity,
 		bound_module_program,
 		bound_module_scope,
 		bound_module_view,
@@ -444,7 +451,7 @@ import:
 		typecheck_state_is_reserved_for_scope,
 		typecheck_state_is_source_package,
 		typecheck_state_is_stdlib,
-		typecheck_state_module_identity,
+		typecheck_state_module_id,
 		typecheck_state_remember_top_level_name,
 		typecheck_state_reset_type_shape_memo,
 		typecheck_state_restore_definition_scope,
@@ -611,6 +618,7 @@ import:
 		var_mutability,
 	type_system/generic_params:
 		BoundTraitIdentity,
+		BoundTraitOwner(CompilerBuiltinBoundTraitOwner, GraphBoundTraitOwner),
 		BoundTypeParam,
 		make_bound_type_param,
 		make_resolved_bound_type_param,
@@ -756,7 +764,7 @@ pure func completed_global_header_callable_dependencies(
 
 private record CompletedGlobalHeaderGraphRep {
 	headers: List[CompletedGlobalHeader],
-	indices_by_module_and_name: Dict[String, Dict[String, Int]],
+	indices_by_module_and_name: Dict[Int, Dict[String, Int]],
 	metrics: GlobalHeaderCompletionMetrics
 }
 
@@ -785,7 +793,7 @@ pure func completed_global_header_graph_find(
 ) -> Option[CompletedGlobalHeader]:
 	representation = from_opaque CompletedGlobalHeaderGraph(graph)
 	names ?= representation.indices_by_module_and_name.get(
-		module_identity_storage_key(global_id_module_identity(id)),
+		module_id_table_index(global_id_module_id(id)),
 	)
 	index ?= names.get(global_id_name(id))
 	header ?= representation.headers.get(index)
@@ -1423,20 +1431,23 @@ private pure func typed_record_field_from_parsed(
 		type_params,
 		canonical_annotation_type(state, field_type),
 	)
+	definition_key = typecheck_state_module_id(state).map(func(module_id):
+		source_definition_key(
+			module_id,
+			FieldDefinition,
+			field.name.text,
+			Some(record_name),
+			field.span,
+		)
+	)
+	definition_id = definition_key.and_then(func(key):
+		typecheck_state_find_source_definition_id(state, key)
+	)
 	{
 		name = field.name.text,
 		source_type = field_type,
 		semantic_type = semantic_type,
-		definition_id = typecheck_state_find_source_definition_id(
-			state,
-			source_definition_key(
-				typecheck_state_module_identity(state),
-				FieldDefinition,
-				field.name.text,
-				Some(record_name),
-				field.span,
-			),
-		),
+		definition_id = definition_id,
 		declaration_span = field.span,
 		selection_span = field.name.span
 	}
@@ -1832,8 +1843,65 @@ private pure func callable_key_from_span(
 	state: TypecheckState,
 	name: String,
 	span: SourceSpan,
-) -> FuncCallableKey:
-	func_callable_key(typecheck_state_module_identity(state), name, span)
+) -> Option[FuncCallableKey]:
+	typecheck_state_module_id(state).map(func(module_id): func_callable_key(module_id, name, span))
+
+
+private pure func find_callable_id_from_span(
+	state: TypecheckState,
+	name: String,
+	span: SourceSpan,
+) -> Option[Int]:
+	key ?= callable_key_from_span(state, name, span)
+	typecheck_state_find_func_callable_id(state, key)
+
+
+private pure func claim_callable_id_from_span(
+	state: TypecheckState,
+	name: String,
+	span: SourceSpan,
+) -> DefinitionIdClaim:
+	match callable_key_from_span(state, name, span):
+		Some(key):
+			typecheck_state_claim_func_callable_id(state, key)
+		None:
+			DefinitionIdMissing(
+				typecheck_state_add_error(
+					state,
+					"internal typecheck error: callable definition has no module domain",
+				),
+			)
+
+
+private pure func source_key_from_state(
+	state: TypecheckState,
+	kind: SourceDefinitionKind,
+	name: String,
+	owner: Option[String],
+	span: SourceSpan,
+) -> Option[SourceDefinitionKey]:
+	typecheck_state_module_id(state).map(func(module_id):
+		source_definition_key(module_id, kind, name, owner, span)
+	)
+
+
+private pure func claim_source_id_from_state(
+	state: TypecheckState,
+	kind: SourceDefinitionKind,
+	name: String,
+	owner: Option[String],
+	span: SourceSpan,
+) -> DefinitionIdClaim:
+	match source_key_from_state(state, kind, name, owner, span):
+		Some(key):
+			typecheck_state_claim_source_definition_id(state, key)
+		None:
+			DefinitionIdMissing(
+				typecheck_state_add_error(
+					state,
+					"internal typecheck error: source definition has no module domain",
+				),
+			)
 
 
 private pure func trait_method_from_parsed(
@@ -1952,15 +2020,13 @@ private pure func claim_global_definition_id(
 	state: TypecheckState,
 	var_decl: ParsedVarDecl,
 ) -> (TypecheckState, Option[Int]):
-	definition_key = source_definition_key(
-		typecheck_state_module_identity(state),
+	match claim_source_id_from_state(
+		state,
 		GlobalDefinition,
 		var_decl.name.text,
 		None,
 		var_decl.span,
-	)
-
-	match typecheck_state_claim_source_definition_id(state, definition_key):
+	):
 		DefinitionIdClaimed(next, found):
 			(next, Some(found))
 		DefinitionIdMissing(next):
@@ -2234,10 +2300,7 @@ private pure func function_body_signature(
 	state: TypecheckState,
 	function_decl: ParsedFunctionDecl,
 ) -> FunctionBodySignature:
-	callable_id = typecheck_state_find_func_callable_id(
-		state,
-		callable_key_from_span(state, function_decl.name.text, function_decl.span),
-	)
+	callable_id = find_callable_id_from_span(state, function_decl.name.text, function_decl.span)
 
 	match callable_id:
 		Some(def_id):
@@ -2376,9 +2439,7 @@ private pure func register_function_signature_with_semantic_types(
 	)
 	loop_producer = loop_producer_from_body(body)
 
-	callable_key = callable_key_from_span(with_resource_boundary, name, span)
-
-	match typecheck_state_claim_func_callable_id(with_resource_boundary, callable_key):
+	match claim_callable_id_from_span(with_resource_boundary, name, span):
 		DefinitionIdClaimed(with_id, def_id):
 			register_function_with_id(
 				with_id,
@@ -2505,12 +2566,17 @@ private pure func callable_header_parameter_name(binder: CallableParameterBinder
 
 
 private pure func bound_trait_identity(id: TraitId) -> BoundTraitIdentity:
+	owner = match trait_id_module_id(id):
+		Some(module_id):
+			GraphBoundTraitOwner(module_id)
+		None:
+			CompilerBuiltinBoundTraitOwner
+
 	{
-		module_identity = trait_id_module_identity(id),
+		owner = owner,
 		definition_id = trait_id_definition_id(id),
 		name = trait_id_name(id),
-		span = trait_id_source_span(id),
-		compiler_builtin = trait_id_is_compiler_builtin(id)
+		span = trait_id_source_span(id)
 	}
 
 
@@ -2685,17 +2751,12 @@ private pure func prepare_accepted_callable_header(
 							decl.annotations,
 							decl.body,
 						)
-						callable_key = callable_key_from_span(
+						profile_callable_header_event(CALLABLE_HEADER_PROFILE_ID_CLAIMS)
+
+						match claim_callable_id_from_span(
 							with_resource_boundary,
 							decl.name.text,
 							decl.span,
-						)
-
-						profile_callable_header_event(CALLABLE_HEADER_PROFILE_ID_CLAIMS)
-
-						match typecheck_state_claim_func_callable_id(
-							with_resource_boundary,
-							callable_key,
 						):
 							DefinitionIdMissing(with_error):
 								{
@@ -2773,17 +2834,12 @@ private pure func prepare_accepted_callable_header(
 							resolved_return_type,
 							None,
 						)
-						callable_key = callable_key_from_span(
+						profile_callable_header_event(CALLABLE_HEADER_PROFILE_ID_CLAIMS)
+
+						match claim_callable_id_from_span(
 							with_resource_boundary,
 							decl.name.text,
 							decl.span,
-						)
-
-						profile_callable_header_event(CALLABLE_HEADER_PROFILE_ID_CLAIMS)
-
-						match typecheck_state_claim_func_callable_id(
-							with_resource_boundary,
-							callable_key,
 						):
 							DefinitionIdMissing(with_error):
 								{
@@ -2921,15 +2977,13 @@ private pure func register_trait_decl(
 ) -> TypecheckState:
 	next = validate_trait_method_param_types(state, trait_decl)
 
-	definition_key = source_definition_key(
-		typecheck_state_module_identity(next),
+	match claim_source_id_from_state(
+		next,
 		TraitDefinition,
 		trait_decl.name.text,
 		None,
 		trait_decl.span,
-	)
-
-	match typecheck_state_claim_source_definition_id(next, definition_key):
+	):
 		DefinitionIdClaimed(with_id, def_id):
 			register_trait_with_id(with_id, module_path, trait_decl, def_id)
 		DefinitionIdMissing(with_error):
@@ -3047,15 +3101,13 @@ private pure func prepare_accepted_trait_header(
 			),
 		)
 	else:
-		definition_key = source_definition_key(
-			typecheck_state_module_identity(state),
+		match claim_source_id_from_state(
+			state,
 			TraitDefinition,
 			trait_id_name(id),
 			None,
 			trait_id_source_span(id),
-		)
-
-		match typecheck_state_claim_source_definition_id(state, definition_key):
+		):
 			DefinitionIdMissing(with_error):
 				AcceptedTraitRecordMissing(with_error)
 			DefinitionIdClaimed(with_id, definition_id):
@@ -3075,7 +3127,6 @@ private pure func prepare_accepted_trait_header(
 						{
 							id = id,
 							compiler_builtin_id = compiler_builtin_id,
-							owner_module_path = module_path,
 							visibility = trait_topology_header_visibility(header),
 							supertraits = trait_topology_header_supertraits(header),
 							method_ids = trait_topology_header_methods(
@@ -3420,9 +3471,8 @@ private pure func impl_method_info_from_semantic_types(
 	return_type: SemanticType,
 ) -> ImplMethodInfoClaim:
 	func_type: SemanticType = SemanticFunctionType(method.is_pure, param_types, return_type)
-	callable_key = callable_key_from_span(state, method.name.text, method.span)
 
-	match typecheck_state_claim_func_callable_id(state, callable_key):
+	match claim_callable_id_from_span(state, method.name.text, method.span):
 		DefinitionIdMissing(with_error):
 			ImplMethodInfoMissing(with_error)
 		DefinitionIdClaimed(with_id, callable_id):
@@ -3587,9 +3637,8 @@ private pure func implementation_method_info_from_header(
 						)
 					else:
 						method_id = implementation_method_header_id(method_header)
-						callable_key = callable_key_from_span(state, source.name.text, source.span)
 
-						match typecheck_state_claim_func_callable_id(state, callable_key):
+						match claim_callable_id_from_span(state, source.name.text, source.span):
 							DefinitionIdMissing(with_error):
 								ImplMethodInfoMissing(with_error)
 							DefinitionIdClaimed(with_id, callable_id):
@@ -3739,15 +3788,13 @@ private pure func prepare_accepted_implementation_header(
 						None:
 							with_methods
 
-					definition_key = source_definition_key(
-						typecheck_state_module_identity(with_orphan),
+					match claim_source_id_from_state(
+						with_orphan,
 						ImplDefinition,
 						source.trait_name.text,
 						None,
 						source.span,
-					)
-
-					match typecheck_state_claim_source_definition_id(with_orphan, definition_key):
+					):
 						DefinitionIdMissing(with_error):
 							AcceptedImplementationRecordMissing(with_error)
 						DefinitionIdClaimed(with_id, definition_id):
@@ -3795,7 +3842,6 @@ private pure func prepare_accepted_implementation_header(
 									{
 										id = id,
 										trait_id = trait_id,
-										owner_module_path = module_path,
 										visibility = implementation_header_visibility(header),
 										method_ids = implementation_header_methods(header)
 											.filter(implementation_method_header_is_explicit)
@@ -3826,15 +3872,13 @@ private pure func register_impl_decl_with_info(
 		None:
 			state
 
-	definition_key = source_definition_key(
-		typecheck_state_module_identity(next),
+	match claim_source_id_from_state(
+		next,
 		ImplDefinition,
 		impl_decl.trait_name.text,
 		None,
 		impl_decl.span,
-	)
-
-	match typecheck_state_claim_source_definition_id(next, definition_key):
+	):
 		DefinitionIdClaimed(with_id, def_id):
 			register_impl_with_id(with_id, impl_decl, for_type, method_infos, is_private, def_id)
 		DefinitionIdMissing(with_error):
@@ -5472,13 +5516,12 @@ private pure func typecheck_materialize_impl_body(
 							and not impl_has_method(impl_decl.methods, method.name.text)
 						):
 							default_decl = default_impl_method_decl(impl_decl, method)
-							callable_key = callable_key_from_span(
+
+							match claim_callable_id_from_span(
 								next,
 								default_decl.name.text,
 								default_decl.span,
-							)
-
-							match typecheck_state_claim_func_callable_id(next, callable_key):
+							):
 								DefinitionIdMissing(with_error):
 									next = with_error
 								DefinitionIdClaimed(with_id, _):
@@ -5566,10 +5609,7 @@ private pure func typed_foreign_function_info(
 
 	{
 		decl = decl,
-		callable_id = typecheck_state_find_func_callable_id(
-			state,
-			callable_key_from_span(state, name, decl.span),
-		),
+		callable_id = find_callable_id_from_span(state, name, decl.span),
 		param_types = param_types,
 		semantic_return_type = return_type,
 		c_name = decl.c_name.get_or(name),
@@ -5714,10 +5754,7 @@ private pure func body_outcome_for_function_decl(
 	outcomes: BodyOutcomeIndex,
 	callable_headers: CallableHeaderGraph,
 ) -> Option[BodyCheckOutcome]:
-	match typecheck_state_find_func_callable_id(
-		state,
-		callable_key_from_span(state, function_decl.name.text, function_decl.span),
-	):
+	match find_callable_id_from_span(state, function_decl.name.text, function_decl.span):
 		Some(definition_id):
 			match callable_header_graph_find_definition_id(callable_headers, definition_id):
 				Some(header):
@@ -5738,9 +5775,10 @@ private pure func typecheck_materialize_function_from_body_policy(
 		InferStandaloneFunctionBodies:
 			typecheck_materialize_function_body_with_options(state, function_decl, main_policy)
 		ReuseIndependentFunctionBodies(outcomes, callable_headers):
-			callable_id = typecheck_state_find_func_callable_id(
+			callable_id = find_callable_id_from_span(
 				state,
-				callable_key_from_span(state, function_decl.name.text, function_decl.span),
+				function_decl.name.text,
+				function_decl.span,
 			)
 			outcome = body_outcome_for_function_decl(
 				state,
@@ -6048,15 +6086,13 @@ private pure func replay_accepted_trait_definition_id(
 	state: TypecheckState,
 	id: TraitId,
 ) -> TypecheckState:
-	definition_key = source_definition_key(
-		typecheck_state_module_identity(state),
+	match claim_source_id_from_state(
+		state,
 		TraitDefinition,
 		trait_id_name(id),
 		None,
 		trait_id_source_span(id),
-	)
-
-	match typecheck_state_claim_source_definition_id(state, definition_key):
+	):
 		DefinitionIdMissing(with_error):
 			with_error
 		DefinitionIdClaimed(with_id, definition_id):
@@ -6076,9 +6112,7 @@ private pure func replay_accepted_implementation_method_definition_id(
 	state: TypecheckState,
 	id: CallableId,
 ) -> TypecheckState:
-	callable_key = callable_key_from_span(state, callable_id_name(id), callable_id_source_span(id))
-
-	match typecheck_state_claim_func_callable_id(state, callable_key):
+	match claim_callable_id_from_span(state, callable_id_name(id), callable_id_source_span(id)):
 		DefinitionIdMissing(with_error):
 			with_error
 		DefinitionIdClaimed(with_id, definition_id):
@@ -6104,15 +6138,14 @@ private pure func replay_accepted_implementation_definition_ids(
 		next = replay_accepted_implementation_method_definition_id(next, method_id)
 
 	id = definition_ids.id
-	definition_key = source_definition_key(
-		typecheck_state_module_identity(next),
+
+	match claim_source_id_from_state(
+		next,
 		ImplDefinition,
 		impl_id_name(id),
 		None,
 		impl_id_source_span(id),
-	)
-
-	match typecheck_state_claim_source_definition_id(next, definition_key):
+	):
 		DefinitionIdMissing(with_error):
 			with_error
 		DefinitionIdClaimed(with_id, definition_id):
@@ -6279,7 +6312,7 @@ private pure func accepted_global_declared_binding(
 	)
 	source = global_header_source(header)
 	definition_key = source_definition_key(
-		global_id_module_identity(id),
+		global_id_module_id(id),
 		GlobalDefinition,
 		source.name.text,
 		None,
@@ -6293,6 +6326,7 @@ private pure func accepted_global_declared_binding(
 		is_mutable = source.is_mutable,
 		definition_id = definition_index_find_source_definition_id(
 			prepared_module_scope_definition_index(bound_module_scope(bound_module)),
+			prepared_module_scope_module_table(bound_module_scope(bound_module)),
 			definition_key,
 		),
 	})
@@ -6309,7 +6343,11 @@ private pure func accepted_global_table_build(
 	for header in callable_header_graph_globals(callable_headers):
 		id = global_header_id(header)
 
-		match bound_module_graph_find(bound_graph, global_id_module_identity(id)):
+		match bound_module_graph_find_for_id(
+			bound_graph,
+			bound_module_graph_module_table(bound_graph),
+			global_id_module_id(id),
+		):
 			Some(bound_module):
 				declared = accepted_global_declared_binding(type_headers, bound_module, header)
 
@@ -6322,7 +6360,6 @@ private pure func accepted_global_table_build(
 				else:
 					records = records.append({
 						id = id,
-						owner_module_path = bound_module_canonical_path(bound_module),
 						visibility = global_header_visibility(header),
 						declared_binding = declared,
 					})
@@ -6334,7 +6371,12 @@ private pure func accepted_global_table_build(
 	if not errors.is_empty():
 		Err(errors)
 	else:
-		match accepted_global_table({globals = records}):
+		match accepted_global_table({
+			module_table = indexed_graph_module_table(
+				bound_module_graph_indexed_graph(bound_graph),
+			),
+			globals = records,
+		}):
 			Some(table):
 				Ok(table)
 			None:
@@ -6417,7 +6459,6 @@ private pure func prepare_accepted_module_callable(
 				state = prepared.state,
 				callables = base.callables.append({
 					id = id,
-					owner_module_path = base.module_path,
 					source_name = callable_id_name(id),
 					visibility = callable_header_visibility(header),
 					entry = canonical_callable_entry(
@@ -6654,18 +6695,6 @@ private pure func prepared_module_base_index(
 		None
 
 
-private pure func prepared_module_base_index_for_identity(
-	bound_graph: BoundModuleGraph,
-	positions_by_module_id: List[Int],
-	module_identity: ModuleIdentity,
-) -> Option[Int]:
-	bound_module ?= bound_module_graph_find(bound_graph, module_identity)
-	prepared_module_base_index(
-		positions_by_module_id,
-		prepared_module_scope_id(bound_module_scope(bound_module)),
-	)
-
-
 private pure func prepared_module_environments(
 	implementation_headers: ImplementationHeaderGraph,
 	accepted_global_table: AcceptedGlobalTable,
@@ -6723,11 +6752,15 @@ private pure func prepared_module_environments(
 	for header in trait_topology_graph_headers(
 		callable_header_graph_trait_topology(callable_headers),
 	):
-		match prepared_module_base_index_for_identity(
-			bound_graph,
-			base_positions_by_module_id,
-			trait_id_module_identity(trait_topology_header_id(header)),
-		):
+		owner_id = trait_id_module_id(trait_topology_header_id(header))
+
+		owner_index = match owner_id:
+			Some(module_id):
+				prepared_module_base_index(base_positions_by_module_id, module_id)
+			None:
+				None
+
+		match owner_index:
 			Some(index):
 				match bases.get(index):
 					Some(base):
@@ -6770,6 +6803,9 @@ private pure func prepared_module_environments(
 		None
 	else:
 		accepted_trait_implementation_table({
+			module_table = indexed_graph_module_table(
+				bound_module_graph_indexed_graph(bound_graph),
+			),
 			traits = trait_records,
 			implementations = [],
 		})
@@ -6812,10 +6848,9 @@ private pure func prepared_module_environments(
 		preliminary_base_index += 1
 
 	for header in callable_header_graph_callables(callable_headers):
-		match prepared_module_base_index_for_identity(
-			bound_graph,
+		match prepared_module_base_index(
 			base_positions_by_module_id,
-			callable_id_module_identity(callable_header_id(header)),
+			callable_id_module_id(callable_header_id(header)),
 		):
 			Some(index):
 				match bases.get(index):
@@ -6849,13 +6884,17 @@ private pure func prepared_module_environments(
 	callable_table = if callable_owner_missing:
 		None
 	else:
-		accepted_callable_table({callables = callable_records})
+		accepted_callable_table({
+			module_table = indexed_graph_module_table(
+				bound_module_graph_indexed_graph(bound_graph),
+			),
+			callables = callable_records,
+		})
 
 	for header in implementation_header_graph_headers(implementation_headers):
-		match prepared_module_base_index_for_identity(
-			bound_graph,
+		match prepared_module_base_index(
 			base_positions_by_module_id,
-			impl_id_module_identity(implementation_header_id(header)),
+			impl_id_module_id(implementation_header_id(header)),
 		):
 			Some(index):
 				match bases.get(index):
@@ -6880,6 +6919,7 @@ private pure func prepared_module_environments(
 				trait_implementation_owner_missing = True
 
 	trait_implementation_input: AcceptedTraitImplementationTableInput = {
+		module_table = indexed_graph_module_table(bound_module_graph_indexed_graph(bound_graph)),
 		traits = trait_records,
 		implementations = implementation_records
 	}
@@ -7101,7 +7141,11 @@ private pure func complete_one_global_header(
 	header: GlobalHeader,
 ) -> Result[CompletedGlobalHeader, List[TypecheckDiagnostic]]:
 	id = global_header_id(header)
-	owner = bound_module_graph_find(bound_graph, global_id_module_identity(id))
+	owner = bound_module_graph_find_for_id(
+		bound_graph,
+		bound_module_graph_module_table(bound_graph),
+		global_id_module_id(id),
+	)
 
 	module_environment_position = match owner:
 		Some(bound_module):
@@ -7203,17 +7247,11 @@ private record GlobalHeaderCompletionOutcome {
 
 
 private pure func global_header_completion_failure(
-	bound_graph: BoundModuleGraph,
-	module_identity: ModuleIdentity,
+	module_id: ModuleId,
 	diagnostics: List[TypecheckDiagnostic],
 ) -> GlobalHeaderCompletionFailure:
 	{
-		module_id = bound_module_graph_find(
-			bound_graph,
-			module_identity,
-		).map(
-			func(module): prepared_module_scope_id(bound_module_scope(module)),
-		),
+		module_id = Some(module_id),
 		diagnostics = diagnostics
 	}
 
@@ -7223,15 +7261,23 @@ private pure func cycle_component_spans_modules(component: List[GlobalId]) -> Bo
 		None:
 			False
 		Some(first):
-			first_module = global_id_module_identity(first)
+			first_module = global_id_module_id(first)
 			component.any(func(id):
-				not module_identities_equal(global_id_module_identity(id), first_module)
+				not module_ids_equal(global_id_module_id(id), first_module)
 			)
 
 
-private pure func cycle_component_member_name(id: GlobalId, qualify: Bool) -> String:
+private pure func cycle_component_member_name(
+	bound_graph: BoundModuleGraph,
+	id: GlobalId,
+	qualify: Bool,
+) -> String:
 	if qualify:
-		module_identity_display_name(global_id_module_identity(id)) + "::" + global_id_name(id)
+		bound_module_graph_canonical_path_for_id(
+			bound_graph,
+			bound_module_graph_module_table(bound_graph),
+			global_id_module_id(id),
+		).get_or("<unknown module>") + "::" + global_id_name(id)
 	else:
 		global_id_name(id)
 
@@ -7240,11 +7286,11 @@ private pure func cycle_component_diagnostic_owners(component: List[GlobalId]) -
 	var owners: List[GlobalId] = []
 
 	for id in component:
-		module_identity = global_id_module_identity(id)
+		module_id = global_id_module_id(id)
 
 		if (
 			not owners.any(func(owner):
-				module_identities_equal(global_id_module_identity(owner), module_identity)
+				module_ids_equal(global_id_module_id(owner), module_id)
 			)
 		):
 			owners = owners.append(id)
@@ -7279,9 +7325,9 @@ private pure func complete_planned_global_headers(
 	)
 	bound_graph = type_header_graph_bound_graph(type_headers)
 	var completed: List[CompletedGlobalHeader] = []
-	var completed_indices_by_module_and_name: Dict[String, Dict[String, Int]] = {}
+	var completed_indices_by_module_and_name: Dict[Int, Dict[String, Int]] = {}
 	var failures: List[GlobalHeaderCompletionFailure] = []
-	var requested_by_module_and_name: Dict[String, Dict[String, Bool]] = {}
+	var requested_by_module_and_name: Dict[Int, Dict[String, Bool]] = {}
 	var initializer_checks: Int = 0
 	var duplicate_initializer_requests: Int = 0
 
@@ -7291,8 +7337,7 @@ private pure func complete_planned_global_headers(
 		if not binding_diagnostics.is_empty():
 			failures = failures.append(
 				global_header_completion_failure(
-					bound_graph,
-					bound_module_identity(environment.bound_module),
+					prepared_module_scope_id(bound_module_scope(environment.bound_module)),
 					binding_diagnostics,
 				),
 			)
@@ -7300,15 +7345,14 @@ private pure func complete_planned_global_headers(
 	for component in cyclic_components:
 		qualify_names = cycle_component_spans_modules(component)
 		names = component
-			.map(func(id): cycle_component_member_name(id, qualify_names))
+			.map(func(id): cycle_component_member_name(bound_graph, id, qualify_names))
 			.sort()
 			.join(", ")
 		failures = failures.concat(cycle_component_diagnostic_owners(component).map(
 			func(
 				id,
 			): global_header_completion_failure(
-				bound_graph,
-				global_id_module_identity(id),
+				global_id_module_id(id),
 				[
 					typecheck_diagnostic(
 						"Cannot infer global initializer types because these globals form a cycle: " + names,
@@ -7322,8 +7366,7 @@ private pure func complete_planned_global_headers(
 		func(
 			id,
 		): global_header_completion_failure(
-			bound_graph,
-			global_id_module_identity(id),
+			global_id_module_id(id),
 			[
 				typecheck_diagnostic(
 					"Cannot infer global initializer type for '" + global_id_name(
@@ -7345,7 +7388,7 @@ private pure func complete_planned_global_headers(
 
 	for header in headers_to_check:
 		header_id = global_header_id(header)
-		module_key = module_identity_storage_key(global_id_module_identity(header_id))
+		module_key = module_id_table_index(global_id_module_id(header_id))
 		requested_names = requested_by_module_and_name.get_or(module_key, {})
 		initializer_checks += 1
 
@@ -7379,8 +7422,7 @@ private pure func complete_planned_global_headers(
 			Err(found_errors):
 				failures = failures.append(
 					global_header_completion_failure(
-						bound_graph,
-						global_id_module_identity(global_header_id(header)),
+						global_id_module_id(global_header_id(header)),
 						found_errors,
 					),
 				)
@@ -8094,12 +8136,12 @@ private pure func frontend_preparation_module_view_projection_entries(view: Modu
 	).length() + module_view_import_bindings(view).length()
 
 
-private pure func frontend_preparation_modules_include_identity(
+private pure func frontend_preparation_modules_include_id(
 	modules: List[BoundModule],
-	module_identity: ModuleIdentity,
+	module_id: ModuleId,
 ) -> Bool:
 	modules.any(func(module):
-		module_identities_equal(bound_module_identity(module), module_identity)
+		module_ids_equal(prepared_module_scope_id(bound_module_scope(module)), module_id)
 	)
 
 
@@ -8134,30 +8176,33 @@ private pure func frontend_preparation_unique_declaration_observation(
 		constructor_count += union_header_constructor_count(union_headers)
 
 	for header in callable_header_graph_callables(callable_headers):
-		if frontend_preparation_modules_include_identity(
+		if frontend_preparation_modules_include_id(
 			modules,
-			callable_id_module_identity(callable_header_id(header)),
+			callable_id_module_id(callable_header_id(header)),
 		):
 			callable_count += 1
 
 	for header in callable_header_graph_globals(callable_headers):
-		if frontend_preparation_modules_include_identity(
+		if frontend_preparation_modules_include_id(
 			modules,
-			global_id_module_identity(global_header_id(header)),
+			global_id_module_id(global_header_id(header)),
 		):
 			global_count += 1
 
 	for header in trait_topology_graph_headers(topology):
-		if frontend_preparation_modules_include_identity(
-			modules,
-			trait_id_module_identity(trait_topology_header_id(header)),
-		):
+		included = trait_id_module_id(trait_topology_header_id(header))
+			.map(func(module_id):
+				frontend_preparation_modules_include_id(modules, module_id)
+			)
+			.get_or(False)
+
+		if included:
 			trait_count += 1
 
 	for header in implementation_header_graph_headers(implementation_headers):
-		if frontend_preparation_modules_include_identity(
+		if frontend_preparation_modules_include_id(
 			modules,
-			impl_id_module_identity(implementation_header_id(header)),
+			impl_id_module_id(implementation_header_id(header)),
 		):
 			implementation_count += 1
 
@@ -9035,15 +9080,12 @@ private pure func accepted_callable_body_ids(
 	callable_headers = implementation_header_graph_callable_headers(
 		representation.graph_facts.implementation_headers,
 	)
-	module_identity = bound_module_identity(representation.bound_module)
+	module_id = prepared_module_scope_id(bound_module_scope(representation.bound_module))
 
 	callable_header_graph_callables(callable_headers)
 		.filter(func(header):
 			(
-				module_identities_equal(
-					callable_id_module_identity(callable_header_id(header)),
-					module_identity,
-				)
+				module_ids_equal(callable_id_module_id(callable_header_id(header)), module_id)
 				and callable_header_body_category(header) == SourceCallableBody
 			)
 		)
@@ -9065,7 +9107,11 @@ private pure func body_signature_from_accepted_header(
 ) -> Option[FunctionBodySignature]:
 	id = callable_header_id(header)
 	authority ?= module_view_accepted_callable_authority(base.state.module_view)
-	entry ?= accepted_callable_find_exact(authority, id)
+	entry ?= accepted_callable_find_exact(
+		authority,
+		prepared_module_scope_module_table(bound_module_scope(base.representation.bound_module)),
+		id,
+	)
 
 	match entry.func_type:
 		SemanticFunctionType(_, param_types, return_type):
@@ -9306,9 +9352,9 @@ private pure func body_check_context_build_from_base(
 ) -> BodyCheckContextBuild:
 	representation = base.representation
 
-	if not module_identities_equal(
-		callable_id_module_identity(id),
-		bound_module_identity(representation.bound_module),
+	if not module_ids_equal(
+		callable_id_module_id(id),
+		prepared_module_scope_id(bound_module_scope(representation.bound_module)),
 	):
 		BodyContextRejected(BodyContextForeignOwner)
 	else:
@@ -9362,9 +9408,9 @@ pure func body_check_registry_context_for_definition_id(
 		definition_id,
 	)
 
-	if module_identities_equal(
-		callable_id_module_identity(id),
-		bound_module_identity(base.representation.bound_module),
+	if module_ids_equal(
+		callable_id_module_id(id),
+		prepared_module_scope_id(bound_module_scope(base.representation.bound_module)),
 	):
 		Some(body_check_context_build_from_base(base, id, IgnoreMainName))
 	else:
@@ -9376,16 +9422,13 @@ private pure func implementation_body_contexts_from_base(
 ) -> BodyCheckPlanDraft:
 	representation = base.representation
 	graph = representation.graph_facts.implementation_headers
-	module_identity = bound_module_identity(representation.bound_module)
+	module_id = prepared_module_scope_id(bound_module_scope(representation.bound_module))
 	var contexts: List[BodyCheckContext] = []
 	var failures: List[BodyCheckPlanningFailure] = []
 	var implementation_rejections: List[BodyImplementationPlanningFailure] = []
 
 	for implementation in implementation_header_graph_headers(graph):
-		if module_identities_equal(
-			impl_id_module_identity(implementation_header_id(implementation)),
-			module_identity,
-		):
+		if module_ids_equal(impl_id_module_id(implementation_header_id(implementation)), module_id):
 			match prepare_implementation_body(base, implementation):
 				ImplementationBodyRejected(errors, diagnostics):
 					implementation_rejections = implementation_rejections.append({
@@ -9447,9 +9490,40 @@ private pure func body_contexts_from_base(
 
 pure func accepted_typecheck_module_body_context(
 	input: AcceptedTypecheckModule,
+	issuing_table: ModuleTable,
 	id: CallableId,
 ) -> BodyCheckContextBuild:
-	body_check_context_build_from_base(accepted_body_module_base(input), id, ValidateProgramMain)
+	representation = accepted_typecheck_module_rep(input)
+	module_table = prepared_module_scope_module_table(
+		bound_module_scope(representation.bound_module),
+	)
+
+	if module_tables_are_compatible(module_table, issuing_table):
+		body_check_context_build_from_base(
+			accepted_body_module_base(input),
+			id,
+			ValidateProgramMain,
+		)
+	else:
+		accepted_owner = module_table_resolved_identity(
+			module_table,
+			prepared_module_scope_id(bound_module_scope(representation.bound_module)),
+		)
+		issued_owner = module_table_resolved_identity(issuing_table, callable_id_module_id(id))
+
+		match (accepted_owner, issued_owner):
+			(Some(expected), Some(actual)):
+				if resolved_module_identities_equal(expected, actual):
+					BodyContextRejected(BodyContextUnknownIdentity)
+				else:
+					BodyContextRejected(BodyContextForeignOwner)
+			_:
+				BodyContextRejected(BodyContextForeignOwner)
+
+
+pure func accepted_typecheck_module_module_table(input: AcceptedTypecheckModule) -> ModuleTable:
+	representation = accepted_typecheck_module_rep(input)
+	prepared_module_scope_module_table(bound_module_scope(representation.bound_module))
 
 
 private pure func check_function_body_artifact(
@@ -9582,13 +9656,13 @@ private pure func body_outcome_index(
 ) -> BodyOutcomeIndexBuild:
 	var index: Dict[Int, BodyCheckOutcome] = {}
 	var errors: List[String] = []
-	owner = prepared_module_scope_identity(owner_scope)
+	owner = prepared_module_scope_id(owner_scope)
 
 	for outcome in outcomes:
 		id = body_check_outcome_callable_id(outcome)
 		definition_id = callable_id_definition_id(id)
 
-		if not module_identities_equal(owner, callable_id_module_identity(id)):
+		if not module_ids_equal(owner, callable_id_module_id(id)):
 			errors = errors.append(
 				"internal typecheck error: body outcome belongs to a foreign module",
 			)

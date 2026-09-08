@@ -33,13 +33,14 @@ import:
 		ParsedUnionDecl,
 		ParsedVariantDecl,
 		parsed_type_expr_span,
-	../../stage_04_modules/loaded_module: ModuleOrigin(StdlibModule), module_identities_equal
+	../../stage_04_modules/loaded_module: ModuleOrigin(StdlibModule)
 	../../stage_04_modules/module_table: module_ids_equal
 	../graph/definition_identity: SourceDefinitionKind(FieldDefinition), source_definition_key
 	../graph/definition_index: definition_index_find_source_definition_id
 	../graph/indexed_graph:
 		PreparedModuleScope,
 		indexed_graph_definition_index,
+		indexed_graph_module_table,
 		indexed_graph_modules,
 		prepared_module_scope_canonical_path,
 		prepared_module_scope_compatible_index,
@@ -62,8 +63,8 @@ import:
 		bound_module_graph_find_for_id,
 		bound_module_graph_find_for_scope,
 		bound_module_graph_indexed_graph,
+		bound_module_graph_module_table,
 		bound_module_graph_target,
-		bound_module_identity,
 		bound_module_program,
 		bound_module_scope,
 		bound_module_view,
@@ -94,7 +95,7 @@ import:
 			RecordTypeSource,
 			UnionTypeSource,
 		),
-		callable_id_module_identity,
+		callable_id_module_id,
 		callable_id_name,
 		callable_id_source_span,
 		callable_ids_equal,
@@ -103,12 +104,12 @@ import:
 		declaration_skeleton_graph_find_type,
 		declaration_skeleton_graph_skeletons,
 		declaration_skeleton_graph_type_skeletons,
-		global_id_module_identity,
+		global_id_module_id,
 		global_id_name,
-		impl_id_module_identity,
+		impl_id_module_id,
 		impl_id_name,
 		impl_ids_equal,
-		trait_id_module_identity,
+		trait_id_module_id,
 		trait_id_name,
 		trait_ids_equal,
 		trait_method_id_name,
@@ -1326,18 +1327,31 @@ private pure func type_resolution_owner_matches_module(
 				prepared_module_scope_id(bound_module_scope(module)),
 			)
 		TraitMethodResolutionOwner(method_id):
-			module_identities_equal(
-				trait_id_module_identity(trait_method_id_owner(method_id)),
-				bound_module_identity(module),
-			)
+			trait_id_module_id(
+				trait_method_id_owner(
+					method_id,
+				),
+			) == Some(prepared_module_scope_id(bound_module_scope(module)))
 		CallableResolutionOwner(id):
-			module_identities_equal(callable_id_module_identity(id), bound_module_identity(module))
+			module_ids_equal(
+				callable_id_module_id(id),
+				prepared_module_scope_id(bound_module_scope(module)),
+			)
 		GlobalResolutionOwner(id):
-			module_identities_equal(global_id_module_identity(id), bound_module_identity(module))
+			module_ids_equal(
+				global_id_module_id(id),
+				prepared_module_scope_id(bound_module_scope(module)),
+			)
 		ImplementationResolutionOwner(id):
-			module_identities_equal(impl_id_module_identity(id), bound_module_identity(module))
+			module_ids_equal(
+				impl_id_module_id(id),
+				prepared_module_scope_id(bound_module_scope(module)),
+			)
 		ImplementationMethodResolutionOwner(id, _, _):
-			module_identities_equal(impl_id_module_identity(id), bound_module_identity(module))
+			module_ids_equal(
+				impl_id_module_id(id),
+				prepared_module_scope_id(bound_module_scope(module)),
+			)
 
 
 private pure func prepare_owned_type_resolution_context(
@@ -1568,9 +1582,9 @@ private pure func resolve_fields(
 ) -> Result[List[TypeHeaderField], List[TypeHeaderError]]:
 	var resolved: List[TypeHeaderField] = []
 	var errors: List[TypeHeaderError] = []
-	definition_index = indexed_graph_definition_index(
-		bound_module_graph_indexed_graph(context.resolution.bound_graph),
-	)
+	indexed_graph = bound_module_graph_indexed_graph(context.resolution.bound_graph)
+	definition_index = indexed_graph_definition_index(indexed_graph)
+	module_table = indexed_graph_module_table(indexed_graph)
 
 	for field in fields:
 		match resolve_type_expr(context.resolution, field.type_expr):
@@ -1580,8 +1594,9 @@ private pure func resolve_fields(
 					typ = shape,
 					definition_id = definition_index_find_source_definition_id(
 						definition_index,
+						module_table,
 						source_definition_key(
-							bound_module_identity(context.resolution.module),
+							prepared_module_scope_id(bound_module_scope(context.resolution.module)),
 							FieldDefinition,
 							field.name.text,
 							Some(type_id_name(context.owner)),
@@ -1856,7 +1871,11 @@ private pure func build_type_header(
 	)
 	bound_graph = declaration_skeleton_graph_bound_graph(declaration_graph)
 
-	match bound_module_graph_find_for_id(bound_graph, type_id_module_id(skeleton.id)):
+	match bound_module_graph_find_for_id(
+		bound_graph,
+		bound_module_graph_module_table(bound_graph),
+		type_id_module_id(skeleton.id),
+	):
 		None:
 			TypeHeaderRejected([TypeHeaderOwnerModuleMissing(skeleton.id)])
 		Some(module):
@@ -1951,7 +1970,11 @@ private pure func type_header_table(
 				.append(index),
 		)
 
-		match bound_module_graph_find_for_id(bound_graph, type_id_module_id(header.id)):
+		match bound_module_graph_find_for_id(
+			bound_graph,
+			bound_module_graph_module_table(bound_graph),
+			type_id_module_id(header.id),
+		):
 			None:
 				errors = errors.append(TypeHeaderOwnerModuleMissing(header.id))
 			Some(module):
@@ -3431,6 +3454,7 @@ pure func type_header_graph_type_module_path(graph: TypeHeaderGraph, id: TypeId)
 	bound_graph = declaration_skeleton_graph_bound_graph(declaration_graph)
 	bound_module_graph_find_for_id(
 		bound_graph,
+		bound_module_graph_module_table(bound_graph),
 		type_id_module_id(
 			id,
 		),
@@ -3646,6 +3670,7 @@ private pure func type_header_identity_display_name(
 ) -> String:
 	module_name = bound_module_graph_canonical_path_for_id(
 		bound_graph,
+		bound_module_graph_module_table(bound_graph),
 		type_id_module_id(id),
 	).get_or("<unknown module>")
 	module_name + "." + type_id_name(id)

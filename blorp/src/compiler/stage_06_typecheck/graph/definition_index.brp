@@ -28,16 +28,23 @@ import:
 	../../stage_04_modules/loaded_module:
 		LoadedModule,
 		LoadedModuleSet,
-		ModuleIdentity,
 		loaded_module_canonical_path,
-		loaded_module_identity,
 		loaded_module_origin,
 		loaded_module_program,
 		loaded_module_set_modules,
 		loaded_module_set_target,
-		module_identities_equal,
-		module_identity_display_name,
-		module_identity_matches_canonical_path,
+	../../stage_04_modules/module_table:
+		ModuleId,
+		ModuleTable,
+		module_id_table_index,
+		module_ids_equal,
+		module_table_canonical_path,
+		module_table_count,
+		module_table_find_id,
+		module_table_find_id_by_canonical_path,
+		module_table_id_at,
+		module_table_resolved_identity,
+		module_tables_are_compatible,
 	../type_system/builtins:
 		builtin_trait_is_prelude,
 		env_with_builtins,
@@ -56,25 +63,21 @@ import:
 		),
 		func_callable_key,
 		func_callable_key_description,
-		func_callable_key_module_identity,
+		func_callable_key_module_id,
 		func_callable_key_name,
 		func_callable_key_span,
 		func_callable_keys_equal,
 		source_definition_key,
 		source_definition_key_description,
 		source_definition_key_kind,
-		source_definition_key_module_identity,
+		source_definition_key_module_id,
 		source_definition_key_name,
 		source_definition_key_owner,
 		source_definition_keys_equal,
+	list: repeat
 
 
-private struct DefinitionIndexSeedRep {
-	next_def_id: Int
-}
-
-
-opaque type DefinitionIndexSeed = DefinitionIndexSeedRep
+opaque type DefinitionIndexSeed = Int
 
 
 private record FuncCallableIdEntry {
@@ -102,11 +105,13 @@ union DefinitionIndexBindingKey:
 union DefinitionIndexConflict:
 	DefinitionKeyAlreadyAssigned(DefinitionIndexBindingKey, Int, Int)
 	DefinitionIdBelowAllocationFrontier(Int, Int, DefinitionIndexBindingKey)
+	IncompatibleDefinitionModuleTable
 
 
 private record DefinitionIndexRep {
-	func_callable_ids_by_module_bucket_and_name: Dict[String, FuncCallableNameBuckets],
-	source_definition_ids_by_module_bucket_and_name: Dict[String, SourceDefinitionNameBuckets],
+	module_table: ModuleTable,
+	func_callable_ids_by_module_and_name: List[FuncCallableNameBuckets],
+	source_definition_ids_by_module_and_name: List[SourceDefinitionNameBuckets],
 	func_callable_id_count: Int,
 	source_definition_id_count: Int,
 	next_def_id: Int
@@ -117,7 +122,7 @@ private record DefinitionIndexRep {
 -- subsequent reservations reuse the builder-owned maps. Keeping the bucket in
 -- the builder prevents committing a valid build under the wrong module key.
 private record DefinitionModuleBuildState {
-	module_bucket: String,
+	module_id: ModuleId,
 	func_callable_ids_by_name: FuncCallableNameBuckets,
 	source_definition_ids_by_name: SourceDefinitionNameBuckets,
 	next_def_id: Int,
@@ -131,7 +136,7 @@ opaque type DefinitionIndex = DefinitionIndexRep
 
 private record DefinitionIndexBootstrapRep {
 	env: Env,
-	empty_index: DefinitionIndex
+	seed: DefinitionIndexSeed
 }
 
 
@@ -147,7 +152,7 @@ private enum TraitDefaultsModuleKind:
 
 
 private record TraitDefaultMethods {
-	module_identity: ModuleIdentity,
+	module_id: ModuleId,
 	canonical_path: String,
 	module_kind: TraitDefaultsModuleKind,
 	trait_name: String,
@@ -168,8 +173,7 @@ private pure func definition_index_bootstrap_rep(
 
 
 private pure func definition_index_seed_from_env(env: Env) -> DefinitionIndexSeed:
-	representation: DefinitionIndexSeedRep = {next_def_id = env.next_def_id}
-	into_opaque DefinitionIndexSeed(representation)
+	into_opaque DefinitionIndexSeed(env.next_def_id)
 
 
 pure func definition_index_initial_seed(base_env: Env) -> DefinitionIndexSeed:
@@ -177,29 +181,38 @@ pure func definition_index_initial_seed(base_env: Env) -> DefinitionIndexSeed:
 
 
 pure func definition_index_seed_next_def_id(seed: DefinitionIndexSeed) -> Int:
-	representation: DefinitionIndexSeedRep = from_opaque DefinitionIndexSeed(seed)
-	representation.next_def_id
+	from_opaque DefinitionIndexSeed(seed)
 
 
-private pure func definition_index_rep_empty(seed: DefinitionIndexSeed) -> DefinitionIndexRep:
+private pure func definition_index_rep_empty(
+	seed: DefinitionIndexSeed,
+	module_table: ModuleTable,
+) -> DefinitionIndexRep:
+	module_count = module_table_count(module_table)
+	empty_func_buckets: FuncCallableNameBuckets = {}
+	empty_source_buckets: SourceDefinitionNameBuckets = {}
 	{
-		func_callable_ids_by_module_bucket_and_name = {},
-		source_definition_ids_by_module_bucket_and_name = {},
+		module_table = module_table,
+		func_callable_ids_by_module_and_name = empty_func_buckets.repeat(module_count),
+		source_definition_ids_by_module_and_name = empty_source_buckets.repeat(module_count),
 		func_callable_id_count = 0,
 		source_definition_id_count = 0,
 		next_def_id = definition_index_seed_next_def_id(seed)
 	}
 
 
-pure func definition_index_empty(seed: DefinitionIndexSeed) -> DefinitionIndex:
-	into_opaque DefinitionIndex(definition_index_rep_empty(seed))
+pure func definition_index_empty(
+	seed: DefinitionIndexSeed,
+	module_table: ModuleTable,
+) -> DefinitionIndex:
+	into_opaque DefinitionIndex(definition_index_rep_empty(seed, module_table))
 
 
 pure func definition_index_bootstrap_from_base_env(base_env: Env) -> DefinitionIndexBootstrap:
 	env = env_with_builtins(base_env)
 	representation: DefinitionIndexBootstrapRep = {
 		env = env,
-		empty_index = definition_index_empty(definition_index_seed_from_env(env))
+		seed = definition_index_seed_from_env(env)
 	}
 	into_opaque DefinitionIndexBootstrap(representation)
 
@@ -209,31 +222,99 @@ pure func definition_index_bootstrap_env(bootstrap: DefinitionIndexBootstrap) ->
 	representation.env
 
 
-pure func definition_index_bootstrap_empty_index(
+pure func definition_index_bootstrap_seed(
 	bootstrap: DefinitionIndexBootstrap,
-) -> DefinitionIndex:
+) -> DefinitionIndexSeed:
 	representation = definition_index_bootstrap_rep(bootstrap)
-	representation.empty_index
+	representation.seed
 
 
-private pure func definition_binding_key_description(key: DefinitionIndexBindingKey) -> String:
+private pure func definition_index_module_name(
+	index: DefinitionIndexRep,
+	module_id: ModuleId,
+) -> String:
+	module_table_canonical_path(index.module_table, module_id).get_or("<unknown-module>")
+
+
+private pure func definition_index_rendered_module_name(
+	index: DefinitionIndexRep,
+	module_id: ModuleId,
+	override: Option[(ModuleId, String)],
+) -> String:
+	match override:
+		Some((override_id, name)):
+			if module_ids_equal(module_id, override_id):
+				name
+			else:
+				definition_index_module_name(index, module_id)
+		None:
+			definition_index_module_name(index, module_id)
+
+
+private pure func definition_binding_key_description(
+	index: DefinitionIndexRep,
+	key: DefinitionIndexBindingKey,
+	module_name_override: Option[(ModuleId, String)],
+) -> String:
 	match key:
 		FuncCallableBindingKey(callable_key):
-			func_callable_key_description(callable_key)
+			func_callable_key_description(
+				callable_key,
+				definition_index_rendered_module_name(
+					index,
+					func_callable_key_module_id(callable_key),
+					module_name_override,
+				),
+			)
 		SourceDefinitionBindingKey(source_key):
-			source_definition_key_description(source_key)
+			source_definition_key_description(
+				source_key,
+				definition_index_rendered_module_name(
+					index,
+					source_definition_key_module_id(source_key),
+					module_name_override,
+				),
+			)
 
 
-pure func definition_index_conflict_message(conflict: DefinitionIndexConflict) -> String:
+private pure func definition_index_conflict_message_with_override(
+	index: DefinitionIndex,
+	conflict: DefinitionIndexConflict,
+	module_name_override: Option[(ModuleId, String)],
+) -> String:
+	representation: DefinitionIndexRep = from_opaque DefinitionIndex(index)
+
 	match conflict:
 		DefinitionKeyAlreadyAssigned(key, existing_id, requested_id):
 			"definition index conflict: " + definition_binding_key_description(
+				representation,
 				key,
+				module_name_override,
 			) + " already maps to definition ID " + existing_id.to_string() + "; cannot remap it to definition ID " + requested_id.to_string()
 		DefinitionIdBelowAllocationFrontier(def_id, frontier, requested_key):
 			"definition index conflict: definition ID " + def_id.to_string() + " is below allocation frontier " + frontier.to_string() + "; cannot assign it to " + definition_binding_key_description(
+				representation,
 				requested_key,
+				module_name_override,
 			)
+		IncompatibleDefinitionModuleTable:
+			"definition index conflict: module ID was issued by an incompatible module table"
+
+
+pure func definition_index_conflict_message(
+	index: DefinitionIndex,
+	conflict: DefinitionIndexConflict,
+) -> String:
+	definition_index_conflict_message_with_override(index, conflict, None)
+
+
+pure func definition_index_conflict_message_for_module(
+	index: DefinitionIndex,
+	conflict: DefinitionIndexConflict,
+	module_id: ModuleId,
+	module_name: String,
+) -> String:
+	definition_index_conflict_message_with_override(index, conflict, Some((module_id, module_name)))
 
 
 private pure func definition_index_next_after_id(index: DefinitionIndexRep, def_id: Int) -> Int:
@@ -245,16 +326,17 @@ private pure func definition_index_next_after_id(index: DefinitionIndexRep, def_
 
 private pure func definition_index_module_build_state(
 	index: DefinitionIndexRep,
-	module_bucket: String,
+	module_id: ModuleId,
 ) -> DefinitionModuleBuildState:
+	module_index = module_id_table_index(module_id)
 	{
-		module_bucket = module_bucket,
-		func_callable_ids_by_name = index.func_callable_ids_by_module_bucket_and_name.get_or(
-			module_bucket,
+		module_id = module_id,
+		func_callable_ids_by_name = index.func_callable_ids_by_module_and_name.get_or(
+			module_index,
 			{},
 		),
-		source_definition_ids_by_name = index.source_definition_ids_by_module_bucket_and_name.get_or(
-			module_bucket,
+		source_definition_ids_by_name = index.source_definition_ids_by_module_and_name.get_or(
+			module_index,
 			{},
 		),
 		next_def_id = index.next_def_id,
@@ -267,13 +349,14 @@ private pure func definition_index_commit_module_build(
 	index: DefinitionIndexRep,
 	build: DefinitionModuleBuildState,
 ) -> DefinitionIndexRep:
+	module_index = module_id_table_index(build.module_id)
 	{ index |
-		func_callable_ids_by_module_bucket_and_name = index.func_callable_ids_by_module_bucket_and_name.set(
-			build.module_bucket,
+		func_callable_ids_by_module_and_name = index.func_callable_ids_by_module_and_name.set(
+			module_index,
 			build.func_callable_ids_by_name,
 		),
-		source_definition_ids_by_module_bucket_and_name = index.source_definition_ids_by_module_bucket_and_name.set(
-			build.module_bucket,
+		source_definition_ids_by_module_and_name = index.source_definition_ids_by_module_and_name.set(
+			module_index,
 			build.source_definition_ids_by_name,
 		),
 		func_callable_id_count = index.func_callable_id_count + build.added_func_count,
@@ -357,10 +440,10 @@ private pure func definition_index_rep_find_func_callable_id(
 	key: FuncCallableKey,
 ) -> Option[Int]:
 	var result: Option[Int] = None
-	module_bucket = module_identity_display_name(func_callable_key_module_identity(key))
+	module_index = module_id_table_index(func_callable_key_module_id(key))
 	name = func_callable_key_name(key)
-	entries = index.func_callable_ids_by_module_bucket_and_name
-		.get_or(module_bucket, {})
+	entries = index.func_callable_ids_by_module_and_name
+		.get_or(module_index, {})
 		.get_or(name, [])
 
 	-- Display name and declaration name are only search accelerators. Exact
@@ -401,12 +484,12 @@ private pure func definition_index_add_func_callable_id(
 		key = key,
 		def_id = def_id
 	}
-	module_bucket = module_identity_display_name(func_callable_key_module_identity(key))
+	module_index = module_id_table_index(func_callable_key_module_id(key))
 	name = func_callable_key_name(key)
-	name_buckets = index.func_callable_ids_by_module_bucket_and_name.get_or(module_bucket, {})
+	name_buckets = index.func_callable_ids_by_module_and_name.get_or(module_index, {})
 	{ index |
-		func_callable_ids_by_module_bucket_and_name = index.func_callable_ids_by_module_bucket_and_name.set(
-			module_bucket,
+		func_callable_ids_by_module_and_name = index.func_callable_ids_by_module_and_name.set(
+			module_index,
 			name_buckets.set(
 				name,
 				name_buckets
@@ -421,31 +504,41 @@ private pure func definition_index_add_func_callable_id(
 
 pure func definition_index_insert_func_callable_id(
 	index: DefinitionIndex,
+	issuing_table: ModuleTable,
 	key: FuncCallableKey,
 	def_id: Int,
 ) -> Result[DefinitionIndex, DefinitionIndexConflict]:
 	representation: DefinitionIndexRep = from_opaque DefinitionIndex(index)
 	binding_key = FuncCallableBindingKey(key)
-	existing_id = definition_index_rep_find_func_callable_id(representation, key)
 
-	match definition_index_binding_conflict(representation, binding_key, existing_id, def_id):
-		Some(conflict):
-			Err(conflict)
-		None:
-			match existing_id:
-				Some(_):
-					Ok(index)
-				None:
-					updated = definition_index_add_func_callable_id(representation, key, def_id)
-					Ok(into_opaque DefinitionIndex(updated))
+	if not module_tables_are_compatible(representation.module_table, issuing_table):
+		Err(IncompatibleDefinitionModuleTable)
+	else:
+		existing_id = definition_index_rep_find_func_callable_id(representation, key)
+
+		match definition_index_binding_conflict(representation, binding_key, existing_id, def_id):
+			Some(conflict):
+				Err(conflict)
+			None:
+				match existing_id:
+					Some(_):
+						Ok(index)
+					None:
+						updated = definition_index_add_func_callable_id(representation, key, def_id)
+						Ok(into_opaque DefinitionIndex(updated))
 
 
 pure func definition_index_find_func_callable_id(
 	index: DefinitionIndex,
+	issuing_table: ModuleTable,
 	key: FuncCallableKey,
 ) -> Option[Int]:
 	representation: DefinitionIndexRep = from_opaque DefinitionIndex(index)
-	definition_index_rep_find_func_callable_id(representation, key)
+
+	if module_tables_are_compatible(representation.module_table, issuing_table):
+		definition_index_rep_find_func_callable_id(representation, key)
+	else:
+		None
 
 
 pure func definition_index_func_callable_bindings(
@@ -455,7 +548,7 @@ pure func definition_index_func_callable_bindings(
 	representation: DefinitionIndexRep = from_opaque DefinitionIndex(index)
 	var bindings: List[(FuncCallableKey, Int)] = []
 
-	for name_buckets in representation.func_callable_ids_by_module_bucket_and_name.values():
+	for name_buckets in representation.func_callable_ids_by_module_and_name:
 		for entry in name_buckets.get_or(name, []):
 			bindings = bindings.append((entry.key, entry.def_id))
 
@@ -470,7 +563,7 @@ pure func definition_index_all_func_callable_bindings(
 	representation: DefinitionIndexRep = from_opaque DefinitionIndex(index)
 	var bindings: List[(FuncCallableKey, Int)] = []
 
-	for name_buckets in representation.func_callable_ids_by_module_bucket_and_name.values():
+	for name_buckets in representation.func_callable_ids_by_module_and_name:
 		for entries in name_buckets.values():
 			for entry in entries:
 				bindings = bindings.append((entry.key, entry.def_id))
@@ -480,27 +573,25 @@ pure func definition_index_all_func_callable_bindings(
 
 pure func definition_index_func_callables_at_span(
 	index: DefinitionIndex,
-	module_identity: ModuleIdentity,
+	issuing_table: ModuleTable,
+	module_id: ModuleId,
 	span: SourceSpan,
 ) -> List[(FuncCallableKey, Int)]:
 	representation: DefinitionIndexRep = from_opaque DefinitionIndex(index)
-	module_bucket = module_identity_display_name(module_identity)
 	var bindings: List[(FuncCallableKey, Int)] = []
 
-	for entries in (
-		representation.func_callable_ids_by_module_bucket_and_name
-			.get_or(module_bucket, {})
-			.values()
-	):
-		for entry in entries:
-			if (
-				module_identities_equal(
-					func_callable_key_module_identity(entry.key),
-					module_identity,
-				)
-				and source_spans_equal(func_callable_key_span(entry.key), span)
-			):
-				bindings = bindings.append((entry.key, entry.def_id))
+	if module_tables_are_compatible(representation.module_table, issuing_table):
+		for entries in (
+			representation.func_callable_ids_by_module_and_name
+				.get_or(module_id_table_index(module_id), {})
+				.values()
+		):
+			for entry in entries:
+				if (
+					module_ids_equal(func_callable_key_module_id(entry.key), module_id)
+					and source_spans_equal(func_callable_key_span(entry.key), span)
+				):
+					bindings = bindings.append((entry.key, entry.def_id))
 
 	bindings.sort_by(func(binding): binding[1])
 
@@ -510,10 +601,10 @@ private pure func definition_index_rep_find_source_definition_id(
 	key: SourceDefinitionKey,
 ) -> Option[Int]:
 	var result: Option[Int] = None
-	module_bucket = module_identity_display_name(source_definition_key_module_identity(key))
+	module_index = module_id_table_index(source_definition_key_module_id(key))
 	name = source_definition_key_name(key)
-	entries = index.source_definition_ids_by_module_bucket_and_name
-		.get_or(module_bucket, {})
+	entries = index.source_definition_ids_by_module_and_name
+		.get_or(module_index, {})
 		.get_or(name, [])
 
 	for entry in entries:
@@ -533,12 +624,12 @@ private pure func definition_index_add_source_definition_id(
 		key = key,
 		def_id = def_id
 	}
-	module_bucket = module_identity_display_name(source_definition_key_module_identity(key))
+	module_index = module_id_table_index(source_definition_key_module_id(key))
 	name = source_definition_key_name(key)
-	name_buckets = index.source_definition_ids_by_module_bucket_and_name.get_or(module_bucket, {})
+	name_buckets = index.source_definition_ids_by_module_and_name.get_or(module_index, {})
 	{ index |
-		source_definition_ids_by_module_bucket_and_name = index.source_definition_ids_by_module_bucket_and_name.set(
-			module_bucket,
+		source_definition_ids_by_module_and_name = index.source_definition_ids_by_module_and_name.set(
+			module_index,
 			name_buckets.set(
 				name,
 				name_buckets
@@ -553,66 +644,78 @@ private pure func definition_index_add_source_definition_id(
 
 pure func definition_index_insert_source_definition_id(
 	index: DefinitionIndex,
+	issuing_table: ModuleTable,
 	key: SourceDefinitionKey,
 	def_id: Int,
 ) -> Result[DefinitionIndex, DefinitionIndexConflict]:
 	representation: DefinitionIndexRep = from_opaque DefinitionIndex(index)
 	binding_key = SourceDefinitionBindingKey(key)
-	existing_id = definition_index_rep_find_source_definition_id(representation, key)
 
-	match definition_index_binding_conflict(representation, binding_key, existing_id, def_id):
-		Some(conflict):
-			Err(conflict)
-		None:
-			match existing_id:
-				Some(_):
-					Ok(index)
-				None:
-					updated = definition_index_add_source_definition_id(representation, key, def_id)
-					Ok(into_opaque DefinitionIndex(updated))
+	if not module_tables_are_compatible(representation.module_table, issuing_table):
+		Err(IncompatibleDefinitionModuleTable)
+	else:
+		existing_id = definition_index_rep_find_source_definition_id(representation, key)
+
+		match definition_index_binding_conflict(representation, binding_key, existing_id, def_id):
+			Some(conflict):
+				Err(conflict)
+			None:
+				match existing_id:
+					Some(_):
+						Ok(index)
+					None:
+						updated = definition_index_add_source_definition_id(
+							representation,
+							key,
+							def_id,
+						)
+						Ok(into_opaque DefinitionIndex(updated))
 
 
 pure func definition_index_find_source_definition_id(
 	index: DefinitionIndex,
+	issuing_table: ModuleTable,
 	key: SourceDefinitionKey,
 ) -> Option[Int]:
 	representation: DefinitionIndexRep = from_opaque DefinitionIndex(index)
-	definition_index_rep_find_source_definition_id(representation, key)
+
+	if module_tables_are_compatible(representation.module_table, issuing_table):
+		definition_index_rep_find_source_definition_id(representation, key)
+	else:
+		None
 
 
 private pure func definition_index_source_entries(
 	index: DefinitionIndexRep,
-	module_bucket: String,
+	module_id: ModuleId,
 	name: String,
 ) -> List[SourceDefinitionIdEntry]:
-	index.source_definition_ids_by_module_bucket_and_name
-		.get_or(module_bucket, {})
+	index.source_definition_ids_by_module_and_name
+		.get_or(module_id_table_index(module_id), {})
 		.get_or(name, [])
 
 
 pure func definition_index_find_type_definition_id(
 	index: DefinitionIndex,
-	module_identity: ModuleIdentity,
+	issuing_table: ModuleTable,
+	module_id: ModuleId,
 	name: String,
 ) -> Option[Int]:
 	representation: DefinitionIndexRep = from_opaque DefinitionIndex(index)
-	module_bucket = module_identity_display_name(module_identity)
 	var result: Option[Int] = None
 	var match_count: Int = 0
 
-	for entry in definition_index_source_entries(representation, module_bucket, name):
-		key = entry.key
+	if module_tables_are_compatible(representation.module_table, issuing_table):
+		for entry in definition_index_source_entries(representation, module_id, name):
+			key = entry.key
 
-		if (
-			source_definition_key_kind(key) == TypeDefinition
-			and source_definition_key_owner(key).is_none()
-			and module_identities_equal(
-				source_definition_key_module_identity(key),
-				module_identity,
-			)
-		):
-			result = Some(entry.def_id)
-			match_count += 1
+			if (
+				source_definition_key_kind(key) == TypeDefinition
+				and source_definition_key_owner(key).is_none()
+				and module_ids_equal(source_definition_key_module_id(key), module_id)
+			):
+				result = Some(entry.def_id)
+				match_count += 1
 
 	if match_count == 1:
 		result
@@ -626,19 +729,17 @@ pure func definition_index_find_loaded_type_definition_id(
 	name: String,
 ) -> Option[Int]:
 	representation: DefinitionIndexRep = from_opaque DefinitionIndex(index)
+	module_id ?= module_table_find_id_by_canonical_path(representation.module_table, canonical_path)
 	var result: Option[Int] = None
 	var match_count: Int = 0
 
-	for entry in definition_index_source_entries(representation, canonical_path, name):
+	for entry in definition_index_source_entries(representation, module_id, name):
 		key = entry.key
 
 		if (
 			source_definition_key_kind(key) == TypeDefinition
 			and source_definition_key_owner(key).is_none()
-			and module_identity_matches_canonical_path(
-				source_definition_key_module_identity(key),
-				canonical_path,
-			)
+			and module_ids_equal(source_definition_key_module_id(key), module_id)
 		):
 			result = Some(entry.def_id)
 			match_count += 1
@@ -658,7 +759,7 @@ pure func definition_index_source_definition_bindings(
 	representation: DefinitionIndexRep = from_opaque DefinitionIndex(index)
 	var bindings: List[(SourceDefinitionKey, Int)] = []
 
-	for name_buckets in representation.source_definition_ids_by_module_bucket_and_name.values():
+	for name_buckets in representation.source_definition_ids_by_module_and_name:
 		for entry in name_buckets.get_or(name, []):
 			bindings = bindings.append((entry.key, entry.def_id))
 
@@ -673,7 +774,7 @@ pure func definition_index_all_source_definition_bindings(
 	representation: DefinitionIndexRep = from_opaque DefinitionIndex(index)
 	var bindings: List[(SourceDefinitionKey, Int)] = []
 
-	for name_buckets in representation.source_definition_ids_by_module_bucket_and_name.values():
+	for name_buckets in representation.source_definition_ids_by_module_and_name:
 		for entries in name_buckets.values():
 			for entry in entries:
 				bindings = bindings.append((entry.key, entry.def_id))
@@ -696,6 +797,81 @@ pure func definition_index_next_def_id(index: DefinitionIndex) -> Int:
 	representation.next_def_id
 
 
+pure func definition_index_seed_from_index(index: DefinitionIndex) -> DefinitionIndexSeed:
+	representation: DefinitionIndexRep = from_opaque DefinitionIndex(index)
+	into_opaque DefinitionIndexSeed(representation.next_def_id)
+
+
+pure func definition_index_module_table(index: DefinitionIndex) -> ModuleTable:
+	representation: DefinitionIndexRep = from_opaque DefinitionIndex(index)
+	representation.module_table
+
+
+-- Direct-program checking can extend its graphless module domain between
+-- source fragments. Existing rows must keep their numeric positions because
+-- declaration keys already store those IDs.
+pure func definition_index_rebase_module_table(
+	index: DefinitionIndex,
+	next_table: ModuleTable,
+) -> Option[DefinitionIndex]:
+	representation: DefinitionIndexRep = from_opaque DefinitionIndex(index)
+
+	if module_tables_are_compatible(representation.module_table, next_table):
+		Some(index)
+	else:
+		empty_callable_buckets: FuncCallableNameBuckets = {}
+		empty_source_buckets: SourceDefinitionNameBuckets = {}
+		var callable_buckets = repeat(empty_callable_buckets, module_table_count(next_table))
+		var source_buckets = repeat(empty_source_buckets, module_table_count(next_table))
+		var valid = module_table_count(
+			next_table,
+		) >= module_table_count(representation.module_table)
+
+		for table_index in 0..module_table_count(representation.module_table):
+			old_id = module_table_id_at(representation.module_table, table_index)
+
+			new_id = match old_id:
+				Some(module_id):
+					match module_table_resolved_identity(representation.module_table, module_id):
+						Some(identity):
+							module_table_find_id(next_table, identity)
+						None:
+							None
+				None:
+					None
+
+			match new_id:
+				Some(module_id):
+					if module_id_table_index(module_id) == table_index:
+						callable_buckets = callable_buckets.set(
+							table_index,
+							representation.func_callable_ids_by_module_and_name.get_or(
+								table_index,
+								{},
+							),
+						)
+						source_buckets = source_buckets.set(
+							table_index,
+							representation.source_definition_ids_by_module_and_name.get_or(
+								table_index,
+								{},
+							),
+						)
+					else:
+						valid = False
+				None:
+					valid = False
+
+		if valid:
+			Some(into_opaque DefinitionIndex({ representation |
+						module_table = next_table,
+						func_callable_ids_by_module_and_name = callable_buckets,
+						source_definition_ids_by_module_and_name = source_buckets
+					}))
+		else:
+			None
+
+
 pure func definition_index_advance_to_env(index: DefinitionIndex, env: Env) -> DefinitionIndex:
 	representation: DefinitionIndexRep = from_opaque DefinitionIndex(index)
 
@@ -707,11 +883,11 @@ pure func definition_index_advance_to_env(index: DefinitionIndex, env: Env) -> D
 
 private pure func definition_index_reserve_function(
 	build: DefinitionModuleBuildState,
-	module_identity: ModuleIdentity,
+	module_id: ModuleId,
 	name: String,
 	span: SourceSpan,
 ) -> DefinitionModuleBuildState:
-	key = func_callable_key(module_identity, name, span)
+	key = func_callable_key(module_id, name, span)
 
 	match definition_module_find_func_callable_id(build, key):
 		Some(_):
@@ -733,7 +909,7 @@ private pure func definition_index_reserve_source(
 
 private pure func graph_trait_defaults_in_decl(
 	defaults: List[TraitDefaultMethods],
-	module_identity: ModuleIdentity,
+	module_id: ModuleId,
 	canonical_path: String,
 	module_kind: TraitDefaultsModuleKind,
 	decl: ParsedDecl,
@@ -741,7 +917,7 @@ private pure func graph_trait_defaults_in_decl(
 	match decl:
 		TraitParsedDecl(trait_decl):
 			defaults.append({
-				module_identity = module_identity,
+				module_id = module_id,
 				canonical_path = canonical_path,
 				module_kind = module_kind,
 				trait_name = trait_decl.name.text,
@@ -750,70 +926,70 @@ private pure func graph_trait_defaults_in_decl(
 					.map(func(method): method.name.text),
 			})
 		PrivateParsedDecl(inner, _):
-			graph_trait_defaults_in_decl(
-				defaults,
-				module_identity,
-				canonical_path,
-				module_kind,
-				inner,
-			)
+			graph_trait_defaults_in_decl(defaults, module_id, canonical_path, module_kind, inner)
 		_:
 			defaults
 
 
 private pure func graph_trait_defaults_in_module(
 	defaults: List[TraitDefaultMethods],
+	module_table: ModuleTable,
 	module: LoadedModule,
 ) -> List[TraitDefaultMethods]:
-	module_identity = loaded_module_identity(module)
 	canonical_path = loaded_module_canonical_path(module)
-	program = loaded_module_program(module)
 
-	module_kind = if prelude_traits_module_matches(
-		loaded_module_origin(module),
-		canonical_path,
-		program.source.module_name,
-	):
-		PreludeTraitDefaultsModule
-	else:
-		OrdinaryTraitDefaultsModule
+	match module_table_find_id_by_canonical_path(module_table, canonical_path):
+		None:
+			defaults
+		Some(module_id):
+			program = loaded_module_program(module)
 
-	var result = defaults
+			module_kind = if prelude_traits_module_matches(
+				loaded_module_origin(module),
+				canonical_path,
+				program.source.module_name,
+			):
+				PreludeTraitDefaultsModule
+			else:
+				OrdinaryTraitDefaultsModule
 
-	for decl in program.decls:
-		result = graph_trait_defaults_in_decl(
-			result,
-			module_identity,
-			canonical_path,
-			module_kind,
-			decl,
-		)
+			var result = defaults
 
-	result
+			for decl in program.decls:
+				result = graph_trait_defaults_in_decl(
+					result,
+					module_id,
+					canonical_path,
+					module_kind,
+					decl,
+				)
+
+			result
 
 
 private pure func graph_trait_defaults_for_modules(
+	module_table: ModuleTable,
 	target: LoadedModule,
 	modules: List[LoadedModule],
 ) -> List[TraitDefaultMethods]:
-	var defaults = graph_trait_defaults_in_module([], target)
+	var defaults = graph_trait_defaults_in_module([], module_table, target)
 
 	for module in modules:
-		defaults = graph_trait_defaults_in_module(defaults, module)
+		defaults = graph_trait_defaults_in_module(defaults, module_table, module)
 
 	defaults
 
 
 private pure func graph_local_trait_default_methods(
 	defaults: List[TraitDefaultMethods],
-	module_identity: ModuleIdentity,
+	module_id: ModuleId,
 	trait_name: String,
 ) -> Option[List[String]]:
 	var result: Option[List[String]] = None
 
 	for trait_defaults in defaults:
 		if (
-			module_identities_equal(trait_defaults.module_identity, module_identity)
+			module_ids_equal(trait_defaults.module_id, module_id)
 			and trait_defaults.trait_name == trait_name
 		):
 			result = Some(trait_defaults.method_names)
@@ -929,13 +1105,13 @@ private pure func graph_prelude_trait_default_methods(
 
 private pure func graph_default_method_names_for_impl(
 	defaults: List[TraitDefaultMethods],
-	module_identity: ModuleIdentity,
+	module_id: ModuleId,
 	program: ParsedProgram,
 	impl_decl: ParsedImplDecl,
 ) -> List[String]:
 	trait_name = impl_decl.trait_name.text
 
-	method_names = match graph_local_trait_default_methods(defaults, module_identity, trait_name):
+	method_names = match graph_local_trait_default_methods(defaults, module_id, trait_name):
 		Some(local_methods):
 			local_methods
 		None:
@@ -954,7 +1130,7 @@ private pure func graph_default_method_names_for_impl(
 
 private pure func definition_index_reserve_decl(
 	build: DefinitionModuleBuildState,
-	module_identity: ModuleIdentity,
+	module_id: ModuleId,
 	trait_defaults: List[TraitDefaultMethods],
 	program: ParsedProgram,
 	decl: ParsedDecl,
@@ -963,7 +1139,7 @@ private pure func definition_index_reserve_decl(
 		FunctionParsedDecl(function_decl):
 			definition_index_reserve_function(
 				build,
-				module_identity,
+				module_id,
 				function_decl.name.text,
 				function_decl.span,
 			)
@@ -973,7 +1149,7 @@ private pure func definition_index_reserve_decl(
 			for function_decl in functions:
 				result = definition_index_reserve_function(
 					result,
-					module_identity,
+					module_id,
 					function_decl.name.text,
 					function_decl.span,
 				)
@@ -983,7 +1159,7 @@ private pure func definition_index_reserve_decl(
 			var with_variants = definition_index_reserve_source(
 				build,
 				source_definition_key(
-					module_identity,
+					module_id,
 					TypeDefinition,
 					union_decl.name.text,
 					None,
@@ -995,7 +1171,7 @@ private pure func definition_index_reserve_decl(
 				with_variants = definition_index_reserve_source(
 					with_variants,
 					source_definition_key(
-						module_identity,
+						module_id,
 						ConstructorDefinition,
 						variant.name.text,
 						Some(union_decl.name.text),
@@ -1008,7 +1184,7 @@ private pure func definition_index_reserve_decl(
 			var result = definition_index_reserve_source(
 				build,
 				source_definition_key(
-					module_identity,
+					module_id,
 					TypeDefinition,
 					record_decl.name.text,
 					None,
@@ -1020,7 +1196,7 @@ private pure func definition_index_reserve_decl(
 				result = definition_index_reserve_source(
 					result,
 					source_definition_key(
-						module_identity,
+						module_id,
 						FieldDefinition,
 						field.name.text,
 						Some(record_decl.name.text),
@@ -1033,7 +1209,7 @@ private pure func definition_index_reserve_decl(
 			definition_index_reserve_source(
 				build,
 				source_definition_key(
-					module_identity,
+					module_id,
 					TypeDefinition,
 					type_decl.name.text,
 					None,
@@ -1044,7 +1220,7 @@ private pure func definition_index_reserve_decl(
 			definition_index_reserve_source(
 				build,
 				source_definition_key(
-					module_identity,
+					module_id,
 					TypeDefinition,
 					alias_decl.name.text,
 					None,
@@ -1055,7 +1231,7 @@ private pure func definition_index_reserve_decl(
 			definition_index_reserve_source(
 				build,
 				source_definition_key(
-					module_identity,
+					module_id,
 					TraitDefinition,
 					trait_decl.name.text,
 					None,
@@ -1066,7 +1242,7 @@ private pure func definition_index_reserve_decl(
 			with_impl = definition_index_reserve_source(
 				build,
 				source_definition_key(
-					module_identity,
+					module_id,
 					ImplDefinition,
 					impl_decl.trait_name.text,
 					None,
@@ -1077,13 +1253,13 @@ private pure func definition_index_reserve_decl(
 
 			for method_name in graph_default_method_names_for_impl(
 				trait_defaults,
-				module_identity,
+				module_id,
 				program,
 				impl_decl,
 			):
 				result = definition_index_reserve_function(
 					result,
-					module_identity,
+					module_id,
 					method_name,
 					impl_decl.span,
 				)
@@ -1091,7 +1267,7 @@ private pure func definition_index_reserve_decl(
 			for method in impl_decl.methods:
 				result = definition_index_reserve_function(
 					result,
-					module_identity,
+					module_id,
 					method.name.text,
 					method.span,
 				)
@@ -1101,7 +1277,7 @@ private pure func definition_index_reserve_decl(
 			definition_index_reserve_source(
 				build,
 				source_definition_key(
-					module_identity,
+					module_id,
 					GlobalDefinition,
 					var_decl.name.text,
 					None,
@@ -1109,30 +1285,30 @@ private pure func definition_index_reserve_decl(
 				),
 			)
 		PrivateParsedDecl(inner, _):
-			definition_index_reserve_decl(build, module_identity, trait_defaults, program, inner)
+			definition_index_reserve_decl(build, module_id, trait_defaults, program, inner)
 		_:
 			build
 
 
 private pure func definition_index_reserve_program(
 	index: DefinitionIndexRep,
-	module_identity: ModuleIdentity,
+	module_id: ModuleId,
 	trait_defaults: List[TraitDefaultMethods],
 	program: ParsedProgram,
 ) -> DefinitionIndexRep:
-	module_bucket = module_identity_display_name(module_identity)
-	var build = definition_index_module_build_state(index, module_bucket)
+	var build = definition_index_module_build_state(index, module_id)
 
 	for decl in program.decls:
-		build = definition_index_reserve_decl(build, module_identity, trait_defaults, program, decl)
+		build = definition_index_reserve_decl(build, module_id, trait_defaults, program, decl)
 
 	definition_index_commit_module_build(index, build)
 
 
 pure func definition_index_for_loaded_modules(
 	seed: DefinitionIndexSeed,
+	module_table: ModuleTable,
 	loaded_modules: LoadedModuleSet,
-) -> DefinitionIndex:
+) -> Option[DefinitionIndex]:
 	target = loaded_module_set_target(loaded_modules)
 	modules = loaded_module_set_modules(
 		loaded_modules,
@@ -1140,20 +1316,40 @@ pure func definition_index_for_loaded_modules(
 		func(module): loaded_module_canonical_path(module),
 	)
 	target_program = loaded_module_program(target)
-	trait_defaults = graph_trait_defaults_for_modules(target, modules)
-	var index = definition_index_reserve_program(
-		definition_index_rep_empty(seed),
-		loaded_module_identity(target),
-		trait_defaults,
-		target_program,
-	)
+	trait_defaults = graph_trait_defaults_for_modules(module_table, target, modules)
+	var index = definition_index_rep_empty(seed, module_table)
+	var valid = True
+
+	match module_table_find_id_by_canonical_path(
+		module_table,
+		loaded_module_canonical_path(target),
+	):
+		Some(target_id):
+			index = definition_index_reserve_program(
+				index,
+				target_id,
+				trait_defaults,
+				target_program,
+			)
+		None:
+			valid = False
 
 	for module in modules:
-		index = definition_index_reserve_program(
-			index,
-			loaded_module_identity(module),
-			trait_defaults,
-			loaded_module_program(module),
-		)
+		match module_table_find_id_by_canonical_path(
+			module_table,
+			loaded_module_canonical_path(module),
+		):
+			Some(module_id):
+				index = definition_index_reserve_program(
+					index,
+					module_id,
+					trait_defaults,
+					loaded_module_program(module),
+				)
+			None:
+				valid = False
 
-	into_opaque DefinitionIndex(index)
+	if valid:
+		Some(into_opaque DefinitionIndex(index))
+	else:
+		None

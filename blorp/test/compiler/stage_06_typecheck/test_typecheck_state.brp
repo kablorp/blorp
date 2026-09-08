@@ -68,6 +68,7 @@ import:
 		typecheck_state_has_known_resource_type_name,
 		typecheck_state_has_known_type_name,
 		typecheck_state_is_stdlib,
+		typecheck_state_module_id,
 		typecheck_state_module_identity,
 		typecheck_state_record_type_home,
 		typecheck_state_register_imported_name,
@@ -353,67 +354,81 @@ func test_known_names_and_type_home_precedence() -> Bool:
 
 func test_callable_ids_and_private_impls_are_state_local() -> Bool:
 	base = direct_state("app")
-	key = func_callable_key(
-		typecheck_state_module_identity(base),
-		"render",
-		callable_span(10, 12),
-	)
-	other_key = func_callable_key(
-		typecheck_state_module_identity(base),
-		"render",
-		callable_span(20, 22),
-	)
-	instance = impl_instance(7, "Display", TYPE_INT, [], False)
 
-	match typecheck_state_claim_func_callable_id(base, key):
-		DefinitionIdMissing(_):
+	match typecheck_state_module_id(base):
+		None:
 			False
-		DefinitionIdClaimed(with_first, first_id):
-			match typecheck_state_claim_func_callable_id(with_first, key):
+		Some(module_id):
+			key = func_callable_key(
+				module_id,
+				"render",
+				callable_span(10, 12),
+			)
+			other_key = func_callable_key(
+				module_id,
+				"render",
+				callable_span(20, 22),
+			)
+			instance = impl_instance(7, "Display", TYPE_INT, [], False)
+
+			match typecheck_state_claim_func_callable_id(base, key):
 				DefinitionIdMissing(_):
 					False
-				DefinitionIdClaimed(with_repeat, repeated_id):
-					match typecheck_state_claim_func_callable_id(with_repeat, other_key):
+				DefinitionIdClaimed(with_first, first_id):
+					match typecheck_state_claim_func_callable_id(with_first, key):
 						DefinitionIdMissing(_):
 							False
-						DefinitionIdClaimed(with_other, other_id):
-							with_impl = typecheck_state_add_private_impl(with_other, instance)
-							conflict = typecheck_state_find_private_impl_conflict(
-								with_impl,
-								instance,
-							)
+						DefinitionIdClaimed(with_repeat, repeated_id):
+							match typecheck_state_claim_func_callable_id(with_repeat, other_key):
+								DefinitionIdMissing(_):
+									False
+								DefinitionIdClaimed(with_other, other_id):
+									with_impl = typecheck_state_add_private_impl(
+										with_other,
+										instance,
+									)
+									conflict = typecheck_state_find_private_impl_conflict(
+										with_impl,
+										instance,
+									)
 
-							(
-								repeated_id == first_id
-								and other_id == first_id + 1
-								and typecheck_state_func_callable_bindings(
-									with_impl,
-									"render",
-								).length() == 2
-								and with_impl.errors.length() == 0
-								and with_impl.private_impls.length() == 1
-								and conflict.is_some()
-							)
+									(
+										repeated_id == first_id
+										and other_id == first_id + 1
+										and typecheck_state_func_callable_bindings(
+											with_impl,
+											"render",
+										).length() == 2
+										and with_impl.errors.length() == 0
+										and with_impl.private_impls.length() == 1
+										and conflict.is_some()
+									)
 
 
 func test_unscoped_definition_claim_is_rejected() -> Bool:
 	base = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
-	key = func_callable_key(
-		typecheck_state_module_identity(base),
-		"render",
-		callable_span(10, 12),
-	)
+	owner = direct_state("app")
 
-	match typecheck_state_claim_func_callable_id(base, key):
-		DefinitionIdClaimed(_, _):
+	match typecheck_state_module_id(owner):
+		None:
 			False
-		DefinitionIdMissing(with_error):
-			(
-				with_error.errors.length() == 1
-				and with_error.errors
-					.get_or(0, "")
-					.contains("before selecting a module")
+		Some(module_id):
+			key = func_callable_key(
+				module_id,
+				"render",
+				callable_span(10, 12),
 			)
+
+			match typecheck_state_claim_func_callable_id(base, key):
+				DefinitionIdClaimed(_, _):
+					False
+				DefinitionIdMissing(with_error):
+					(
+						with_error.errors.length() == 1
+						and with_error.errors
+							.get_or(0, "")
+							.contains("before selecting a module")
+					)
 
 
 func test_reserved_definition_ids_are_read_only_and_graph_owned() -> Bool:
@@ -429,24 +444,35 @@ func test_reserved_definition_ids_are_read_only_and_graph_owned() -> Bool:
 				typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
 				module,
 			)
-			missing_key = func_callable_key(
-				typecheck_state_module_identity(reserved),
-				"not_planned",
-				callable_span(30, 32),
-			)
 
-			match typecheck_state_claim_func_callable_id(reserved, missing_key):
-				DefinitionIdClaimed(_, _):
+			match typecheck_state_module_id(reserved):
+				None:
 					False
-				DefinitionIdMissing(with_error):
-					(
-						typecheck_state_func_callable_bindings(reserved, "render").length() == 2
-						and typecheck_state_find_func_callable_id(with_error, missing_key).is_none()
-						and with_error.errors.length() == 1
-						and with_error.errors
-							.get_or(0, "")
-							.contains("missing reserved definition ID")
+				Some(module_id):
+					missing_key = func_callable_key(
+						module_id,
+						"not_planned",
+						callable_span(30, 32),
 					)
+
+					match typecheck_state_claim_func_callable_id(reserved, missing_key):
+						DefinitionIdClaimed(_, _):
+							False
+						DefinitionIdMissing(with_error):
+							(
+								typecheck_state_func_callable_bindings(
+									reserved,
+									"render",
+								).length() == 2
+								and typecheck_state_find_func_callable_id(
+									with_error,
+									missing_key,
+								).is_none()
+								and with_error.errors.length() == 1
+								and with_error.errors
+									.get_or(0, "")
+									.contains("missing reserved definition ID")
+							)
 
 
 func test_reserved_source_definition_ids_are_precise() -> Bool:
@@ -459,47 +485,49 @@ func test_reserved_source_definition_ids_are_precise() -> Bool:
 				module,
 			)
 
-			(
-				definition_index_source_definition_bindings(
-					typecheck_state_definition_index(reserved),
-					"Left",
-				).length() == 1
-				and definition_index_source_definition_bindings(
-					typecheck_state_definition_index(reserved),
-					"Right",
-				).length() == 1
-				and reserved.env.next_def_id == definition_index_next_def_id(
-					typecheck_state_definition_index(reserved),
-				)
-			)
+			match typecheck_state_definition_index(reserved):
+				None:
+					False
+				Some(index):
+					(
+						definition_index_source_definition_bindings(index, "Left").length() == 1
+						and definition_index_source_definition_bindings(
+							index,
+							"Right",
+						).length() == 1
+						and reserved.env.next_def_id == definition_index_next_def_id(index)
+					)
 
 
 func test_definition_keys_reuse_source_spans() -> Bool:
-	module_identity = typecheck_state_module_identity(
-		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
-	)
+	state = direct_state("app")
 	source = source_file("app.brp", "app", "func render(): 0")
 	start = source_start(source)
 	span = source_span(source, start, start)
-	callable_key = func_callable_key(module_identity, "render", span)
-	definition_key = source_definition_key(
-		module_identity,
-		ConstructorDefinition,
-		"Render",
-		None,
-		span,
-	)
-	callable_span = func_callable_key_span(callable_key)
-	definition_span = source_definition_key_span(definition_key)
 
-	(
-		callable_span.path == "app.brp"
-		and callable_span.module_name == "app"
-		and callable_span.start_offset == 0
-		and definition_span.path == "app.brp"
-		and definition_span.module_name == "app"
-		and definition_span.end_offset == 0
-	)
+	match typecheck_state_module_id(state):
+		None:
+			False
+		Some(module_id):
+			callable_key = func_callable_key(module_id, "render", span)
+			definition_key = source_definition_key(
+				module_id,
+				ConstructorDefinition,
+				"Render",
+				None,
+				span,
+			)
+			callable_span = func_callable_key_span(callable_key)
+			definition_span = source_definition_key_span(definition_key)
+
+			(
+				callable_span.path == "app.brp"
+				and callable_span.module_name == "app"
+				and callable_span.start_offset == 0
+				and definition_span.path == "app.brp"
+				and definition_span.module_name == "app"
+				and definition_span.end_offset == 0
+			)
 
 
 func test_definition_index_installation_never_lowers_env_frontier() -> Bool:
@@ -512,12 +540,14 @@ func test_definition_index_installation_never_lowers_env_frontier() -> Bool:
 			advanced = { base | env = { base.env | next_def_id = advanced_next_def_id } }
 			installed = typecheck_state_enter_prepared_module_scope(advanced, module)
 
-			(
-				installed.env.next_def_id == advanced_next_def_id
-				and definition_index_next_def_id(
-					typecheck_state_definition_index(installed),
-				) == advanced_next_def_id
-			)
+			match typecheck_state_definition_index(installed):
+				None:
+					False
+				Some(index):
+					(
+						installed.env.next_def_id == advanced_next_def_id
+						and definition_index_next_def_id(index) == advanced_next_def_id
+					)
 
 
 func test_prepared_scope_switches_and_restores_identity_and_origin_together() -> Bool:
@@ -579,13 +609,11 @@ func test_reserved_scope_rejects_definition_ids_owned_by_another_module() -> Boo
 				indexed_graph_target_scope(graph),
 			)
 
-			match (
-				typecheck_state_func_callable_bindings(state, "render").get(0),
-				definition_index_source_definition_bindings(
-					typecheck_state_definition_index(state),
-					"Ready",
-				).get(0),
-			):
+			source_binding = typecheck_state_definition_index(state).and_then(func(index):
+				definition_index_source_definition_bindings(index, "Ready").get(0)
+			)
+
+			match (typecheck_state_func_callable_bindings(state, "render").get(0), source_binding):
 				(Some(callable_binding), Some(source_binding)):
 					callable_claim = typecheck_state_claim_func_callable_id(
 						state,

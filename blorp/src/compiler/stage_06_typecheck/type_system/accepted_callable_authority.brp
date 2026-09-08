@@ -3,23 +3,27 @@
 -- visible to that module. Lexical functions and compiler builtins remain in
 -- Env; trait and implementation methods remain there until their own cutover.
 import:
-	../../stage_04_modules/loaded_module:
-		module_identity_matches_module_path,
-		module_identity_storage_key,
+	../../stage_04_modules/module_table:
+		ModuleTable,
+		module_id_table_index,
+		module_table_canonical_path,
+		module_table_count,
+		module_table_find_id_by_canonical_path,
+		module_tables_are_compatible,
 	../headers/declaration_skeleton:
 		CallableId,
 		DeclarationVisibility(PublicDeclaration),
 		callable_id_definition_id,
-		callable_id_module_identity,
+		callable_id_module_id,
 		callable_id_name,
 		callable_ids_equal,
 	env: OverloadEntry, overload_entry_first_param_matches
+	list: repeat
 	semantic_type: SemanticType, localize_module_types
 
 
 record AcceptedCallableTableRecord {
 	id: CallableId,
-	owner_module_path: String,
 	source_name: String,
 	visibility: DeclarationVisibility,
 	entry: OverloadEntry
@@ -27,13 +31,13 @@ record AcceptedCallableTableRecord {
 
 
 record AcceptedCallableTableInput {
+	module_table: ModuleTable,
 	callables: List[AcceptedCallableTableRecord]
 }
 
 
 private record AcceptedCallableSlot {
 	id: CallableId,
-	owner_module_path: String,
 	source_name: String,
 	visibility: DeclarationVisibility,
 	entry: OverloadEntry
@@ -41,9 +45,10 @@ private record AcceptedCallableSlot {
 
 
 private record AcceptedCallableTableRep {
+	module_table: ModuleTable,
 	slots: List[AcceptedCallableSlot],
 	indices_by_definition_id: Dict[Int, List[Int]],
-	indices_by_module_path_and_name: Dict[String, Dict[String, List[Int]]]
+	indices_by_module_and_name: List[Dict[String, List[Int]]]
 }
 
 
@@ -85,30 +90,19 @@ private pure func authority_rep(
 	from_opaque AcceptedCallableAuthority(authority)
 
 
-private pure func entries_match_id(item: AcceptedCallableTableRecord) -> Bool:
+private pure func entries_match_id(
+	module_table: ModuleTable,
+	item: AcceptedCallableTableRecord,
+) -> Bool:
 	definition_id = callable_id_definition_id(item.id)
+	owner_module_path = module_table_canonical_path(module_table, callable_id_module_id(item.id))
 
 	(
 		item.entry.def_id == definition_id
-		and item.entry.module_path == Some(item.owner_module_path)
+		and item.entry.module_path == owner_module_path
 		and item.source_name == callable_id_name(item.id)
-		and module_identity_matches_module_path(
-			callable_id_module_identity(item.id),
-			item.owner_module_path,
-		)
+		and owner_module_path.is_some()
 	)
-
-
-private pure func module_path_accepts_identity(
-	identity_keys_by_module_path: Dict[String, String],
-	module_path: String,
-	identity_key: String,
-) -> Bool:
-	match identity_keys_by_module_path.get(module_path):
-		Some(existing):
-			existing == identity_key
-		None:
-			True
 
 
 pure func accepted_callable_table(
@@ -116,15 +110,20 @@ pure func accepted_callable_table(
 ) -> Option[AcceptedCallableTable]:
 	var slots: List[AcceptedCallableSlot] = []
 	var indices_by_definition_id: Dict[Int, List[Int]] = {}
-	var indices_by_module_path_and_name: Dict[String, Dict[String, List[Int]]] = {}
-	var identity_keys_by_module_path: Dict[String, String] = {}
+	empty_names: Dict[String, List[Int]] = {}
+	var indices_by_module_and_name: List[Dict[String, List[Int]]] = repeat(
+		empty_names,
+		module_table_count(input.module_table),
+	)
 	var valid: Bool = True
 
 	for item in input.callables:
-		identity_key = module_identity_storage_key(callable_id_module_identity(item.id))
+		module_index = module_id_table_index(callable_id_module_id(item.id))
 		definition_id = callable_id_definition_id(item.id)
 		definition_indices = indices_by_definition_id.get_or(definition_id, [])
-		path_names = indices_by_module_path_and_name.get_or(item.owner_module_path, {})
+		path_names = indices_by_module_and_name
+			.get(module_index)
+			.get_or({})
 		var duplicate: Bool = False
 
 		for candidate_index in definition_indices:
@@ -137,19 +136,16 @@ pure func accepted_callable_table(
 
 		if (
 			duplicate
-			or not entries_match_id(item)
-			or not module_path_accepts_identity(
-				identity_keys_by_module_path,
-				item.owner_module_path,
-				identity_key,
-			)
+			or not entries_match_id(input.module_table, item)
+			or indices_by_module_and_name
+				.get(module_index)
+				.is_none()
 		):
 			valid = False
 		else:
 			index = slots.length()
 			slots = slots.append({
 				id = item.id,
-				owner_module_path = item.owner_module_path,
 				source_name = item.source_name,
 				visibility = item.visibility,
 				entry = item.entry,
@@ -158,8 +154,8 @@ pure func accepted_callable_table(
 				definition_id,
 				definition_indices.append(index),
 			)
-			indices_by_module_path_and_name = indices_by_module_path_and_name.set(
-				item.owner_module_path,
+			indices_by_module_and_name = indices_by_module_and_name.set(
+				module_index,
 				path_names.set(
 					item.source_name,
 					path_names
@@ -167,16 +163,13 @@ pure func accepted_callable_table(
 						.append(index),
 				),
 			)
-			identity_keys_by_module_path = identity_keys_by_module_path.set(
-				item.owner_module_path,
-				identity_key,
-			)
 
 	if valid:
 		Some(into_opaque AcceptedCallableTable({
+					module_table = input.module_table,
 					slots = slots,
 					indices_by_definition_id = indices_by_definition_id,
-					indices_by_module_path_and_name = indices_by_module_path_and_name
+					indices_by_module_and_name = indices_by_module_and_name
 				}))
 	else:
 		None
@@ -213,7 +206,13 @@ pure func accepted_callable_authority(
 
 	local_names: Dict[String, List[Int]] = match owner_module_path:
 		Some(path):
-			representation.indices_by_module_path_and_name.get_or(path, {})
+			match module_table_find_id_by_canonical_path(representation.module_table, path):
+				Some(module_id):
+					representation.indices_by_module_and_name
+						.get(module_id_table_index(module_id))
+						.get_or({})
+				None:
+					{}
 		None:
 			{}
 
@@ -229,10 +228,17 @@ pure func accepted_callable_authority(
 		ufcs_indices_by_source_name = ufcs_indices_by_source_name.set(name, indices)
 
 	for binding in bindings:
-		path_names = representation.indices_by_module_path_and_name.get_or(
+		path_names: Dict[String, List[Int]] = match module_table_find_id_by_canonical_path(
+			representation.module_table,
 			binding.owner_module_path,
-			{},
-		)
+		):
+			Some(module_id):
+				representation.indices_by_module_and_name
+					.get(module_id_table_index(module_id))
+					.get_or({})
+			None:
+				{}
+
 		indices = public_indices(
 			representation,
 			path_names.get_or(binding.original_name, []),
@@ -250,7 +256,16 @@ pure func accepted_callable_authority(
 	-- Source-function UFCS sees owner-local callables first, then direct
 	-- imports in the reverse installation order formerly produced by Env.
 	for module_path in direct_module_paths.reverse():
-		path_names = representation.indices_by_module_path_and_name.get_or(module_path, {})
+		path_names: Dict[String, List[Int]] = match module_table_find_id_by_canonical_path(
+			representation.module_table,
+			module_path,
+		):
+			Some(module_id):
+				representation.indices_by_module_and_name
+					.get(module_id_table_index(module_id))
+					.get_or({})
+			None:
+				{}
 
 		for name in path_names.keys():
 			indices = public_indices(
@@ -287,29 +302,39 @@ pure func accepted_callable_authority_without_visible_names(
 		})
 
 
-private pure func owner_entry(slot: AcceptedCallableSlot) -> OverloadEntry:
-	{ slot.entry |
-		func_type = localize_module_types(slot.owner_module_path, slot.entry.func_type),
-		module_path = None,
-		dim_constraints = slot.entry.dim_constraints.map(
-			func(
-				constraint,
-			): (
-				localize_module_types(slot.owner_module_path, constraint[0]),
-				localize_module_types(slot.owner_module_path, constraint[1]),
-			),
-		)
-	}
+private pure func owner_entry(
+	module_table: ModuleTable,
+	slot: AcceptedCallableSlot,
+) -> Option[OverloadEntry]:
+	owner_module_path ?= module_table_canonical_path(module_table, callable_id_module_id(slot.id))
+
+	Some({ slot.entry |
+			func_type = localize_module_types(owner_module_path, slot.entry.func_type),
+			module_path = None,
+			dim_constraints = slot.entry.dim_constraints.map(
+				func(
+					constraint,
+				): (
+					localize_module_types(owner_module_path, constraint[0]),
+					localize_module_types(owner_module_path, constraint[1]),
+				),
+			)
+		})
 
 
 private pure func entry_at(
 	authority: AcceptedCallableAuthorityRep,
 	index: Int,
 ) -> Option[OverloadEntry]:
-	slot ?= table_rep(authority.table).slots.get(index)
+	table = table_rep(authority.table)
+	slot ?= table.slots.get(index)
+	owner_module_path ?= module_table_canonical_path(
+		table.module_table,
+		callable_id_module_id(slot.id),
+	)
 
-	if authority.owner_module_path == Some(slot.owner_module_path):
-		Some(owner_entry(slot))
+	if authority.owner_module_path == Some(owner_module_path):
+		owner_entry(table.module_table, slot)
 	else:
 		Some(slot.entry)
 
@@ -327,22 +352,25 @@ pure func accepted_callable_find(
 
 pure func accepted_callable_find_exact(
 	authority: AcceptedCallableAuthority,
+	issuing_table: ModuleTable,
 	id: CallableId,
 ) -> Option[OverloadEntry]:
 	representation = authority_rep(authority)
 	table = table_rep(representation.table)
-	index ?= table.indices_by_definition_id
-		.get_or(callable_id_definition_id(id), [])
-		.find(func(candidate_index):
-			match table.slots.get(candidate_index):
-				Some(slot):
-					callable_ids_equal(slot.id, id)
-				None:
-					False
-		)
-	slot ?= table.slots.get(index)
 
-	entry_at(representation, index)
+	if module_tables_are_compatible(table.module_table, issuing_table):
+		index ?= table.indices_by_definition_id
+			.get_or(callable_id_definition_id(id), [])
+			.find(func(candidate_index):
+				match table.slots.get(candidate_index):
+					Some(slot):
+						callable_ids_equal(slot.id, id)
+					None:
+						False
+			)
+		entry_at(representation, index)
+	else:
+		None
 
 
 pure func accepted_callable_find_owner_definition_id(
@@ -356,13 +384,16 @@ pure func accepted_callable_find_owner_definition_id(
 		.find(func(candidate_index):
 			match table.slots.get(candidate_index):
 				Some(slot):
-					representation.owner_module_path == Some(slot.owner_module_path)
+					representation.owner_module_path == module_table_canonical_path(
+						table.module_table,
+						callable_id_module_id(slot.id),
+					)
 				None:
 					False
 		)
 	slot ?= table.slots.get(index)
 
-	Some(owner_entry(slot))
+	owner_entry(table.module_table, slot)
 
 
 pure func accepted_callable_find_qualified(
@@ -372,7 +403,8 @@ pure func accepted_callable_find_qualified(
 ) -> Option[OverloadEntry]:
 	representation = authority_rep(authority)
 	table = table_rep(representation.table)
-	path_names ?= table.indices_by_module_path_and_name.get(module_path)
+	module_id ?= module_table_find_id_by_canonical_path(table.module_table, module_path)
+	path_names ?= table.indices_by_module_and_name.get(module_id_table_index(module_id))
 	indices = public_indices(
 		table,
 		path_names.get_or(name, []),
@@ -410,22 +442,29 @@ pure func accepted_callable_lookup_qualified_ufcs(
 ) -> List[OverloadEntry]:
 	representation = authority_rep(authority)
 	table = table_rep(representation.table)
-	path_names = table.indices_by_module_path_and_name.get_or(module_path, {})
-	indices = public_indices(
-		table,
-		path_names.get_or(name, []),
-	)
-	var result: List[OverloadEntry] = []
 
-	for index in indices:
-		match table.slots.get(index):
-			Some(slot):
-				if overload_entry_first_param_matches(slot.entry, first_arg_type):
-					result = result.append(slot.entry)
-			None:
-				void
+	match module_table_find_id_by_canonical_path(table.module_table, module_path):
+		None:
+			[]
+		Some(module_id):
+			path_names = table.indices_by_module_and_name
+				.get(module_id_table_index(module_id))
+				.get_or({})
+			indices = public_indices(
+				table,
+				path_names.get_or(name, []),
+			)
+			var result: List[OverloadEntry] = []
 
-	result
+			for index in indices:
+				match table.slots.get(index):
+					Some(slot):
+						if overload_entry_first_param_matches(slot.entry, first_arg_type):
+							result = result.append(slot.entry)
+					None:
+						void
+
+			result
 
 
 pure func accepted_callable_authority_metrics(

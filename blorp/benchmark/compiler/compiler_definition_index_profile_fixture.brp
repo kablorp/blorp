@@ -9,22 +9,24 @@ import:
 		finalized_typecheck_program_ast,
 	../../src/compiler/stage_04_modules/loaded_module:
 		LoadedModuleSet,
-		ModuleIdentity,
 		ModuleOrigin(UserModule),
 		loaded_module_canonical_path,
-		loaded_module_identity,
+		loaded_module_origin,
 		loaded_module_set,
 		loaded_module_set_modules,
 		loaded_module_set_target,
-		module_identities_equal,
 		module_load_candidate,
 		resolved_module_identity_from_resolver,
-	../../src/compiler/stage_06_typecheck/type_system/env: ENV_EMPTY
+	../../src/compiler/stage_04_modules/module_table:
+		ModuleTable,
+		module_table,
+		module_table_canonical_path,
+		module_table_find_id_by_canonical_path,
 	../../src/compiler/stage_06_typecheck/graph/definition_identity:
 		SourceDefinitionKey,
 		SourceDefinitionKind(TypeDefinition),
 		source_definition_key,
-		source_definition_key_module_identity,
+		source_definition_key_module_id,
 	../../src/compiler/stage_06_typecheck/graph/definition_index:
 		DefinitionIndex,
 		DefinitionIndexSeed,
@@ -37,6 +39,7 @@ import:
 		definition_index_seed_next_def_id,
 		definition_index_source_definition_bindings,
 		definition_index_source_definition_id_count,
+	../../src/compiler/stage_06_typecheck/type_system/env: ENV_EMPTY
 	../../src/lib/source: SourceSpan
 	parsed_program_fixture as ParsedProgramFixture
 
@@ -62,6 +65,7 @@ record SourceDefinitionBenchmarkQuery {
 
 record CompilerDefinitionIndexBenchmarkInput {
 	loaded_modules: LoadedModuleSet,
+	module_table: ModuleTable,
 	prepared_index: DefinitionIndex,
 	seed: DefinitionIndexSeed,
 	initial_next_def_id: Int,
@@ -174,38 +178,19 @@ private pure func benchmark_module_program(
 	)
 
 
-private pure func benchmark_loaded_module_path(
-	loaded_modules: LoadedModuleSet,
-	identity: ModuleIdentity,
-) -> Option[String]:
-	target = loaded_module_set_target(loaded_modules)
-
-	if module_identities_equal(loaded_module_identity(target), identity):
-		Some(loaded_module_canonical_path(target))
-	else:
-		var result: Option[String] = None
-
-		for module in loaded_module_set_modules(loaded_modules):
-			if module_identities_equal(loaded_module_identity(module), identity):
-				result = Some(loaded_module_canonical_path(module))
-				break
-
-		result
-
-
 private pure func benchmark_source_query(
-	loaded_modules: LoadedModuleSet,
+	module_table: ModuleTable,
 	binding: (SourceDefinitionKey, Int),
 ) -> Option[SourceDefinitionBenchmarkQuery]:
-	module_path ?= benchmark_loaded_module_path(
-		loaded_modules,
-		source_definition_key_module_identity(binding[0]),
+	module_path ?= module_table_canonical_path(
+		module_table,
+		source_definition_key_module_id(binding[0]),
 	)
 	Some({
 		key = binding[0],
 		expected_definition_id = Some(binding[1]),
 		module_path = module_path,
-		collision_entries_examined = 1
+		collision_entries_examined = 1,
 	})
 
 
@@ -247,20 +232,33 @@ pure func compiler_definition_index_benchmark_input(
 		Err(_):
 			None
 		Ok(loaded_modules):
-			setup_index = definition_index_for_loaded_modules(seed, loaded_modules)
 			target_module = loaded_module_set_target(loaded_modules)
+			loaded = [target_module] + loaded_module_set_modules(loaded_modules)
+			module_table ?= module_table(
+				loaded.map(func(module):
+					resolved_module_identity_from_resolver(
+						loaded_module_canonical_path(module),
+						loaded_module_origin(module),
+					)
+				),
+			).to_option()
+			target_module_id ?= module_table_find_id_by_canonical_path(
+				module_table,
+				loaded_module_canonical_path(target_module),
+			)
+			setup_index ?= definition_index_for_loaded_modules(seed, module_table, loaded_modules)
 			hit_source_queries = definition_index_source_definition_bindings(
 				setup_index,
 				SOURCE_QUERY_NAME,
 			).filter_map(
-				func(binding): benchmark_source_query(loaded_modules, binding),
+				func(binding): benchmark_source_query(module_table, binding),
 			)
 
 			source_queries = if hit_source_queries.is_empty():
 				[
 					{
 						key = source_definition_key(
-							loaded_module_identity(target_module),
+							target_module_id,
 							TypeDefinition,
 							SOURCE_QUERY_NAME,
 							None,
@@ -281,6 +279,7 @@ pure func compiler_definition_index_benchmark_input(
 
 			Some({
 				loaded_modules = loaded_modules,
+				module_table = module_table,
 				prepared_index = setup_index,
 				seed = seed,
 				initial_next_def_id = definition_index_seed_next_def_id(seed),
@@ -332,6 +331,7 @@ pure func compiler_definition_index_benchmark_with_input(
 		config.iterations > 0
 		and input.source_queries.length() == input.expected_source_query_key_count
 	)
+
 	query_only = (
 		config.source_query_count > 0
 		or config.source_name_query_count > 0
@@ -342,15 +342,22 @@ pure func compiler_definition_index_benchmark_with_input(
 		-- Query workloads reuse the index built during setup so the measured
 		-- window isolates lookup work. A zero-query workload remains the focused
 		-- definition-index construction benchmark.
-		index = if query_only:
-			input.prepared_index
+		rebuilt = if query_only:
+			Some(input.prepared_index)
 		else:
-			definition_index_for_loaded_modules(input.seed, input.loaded_modules)
+			definition_index_for_loaded_modules(
+				input.seed,
+				input.module_table,
+				input.loaded_modules,
+			)
+
+		index = rebuilt.get_or(input.prepared_index)
 		func_count = definition_index_func_callable_id_count(index)
 		source_count = definition_index_source_definition_id_count(index)
 		allocated_count = definition_index_next_def_id(index) - input.initial_next_def_id
 		iteration_valid = (
-			func_count == input.expected_func_callable_id_count
+			rebuilt.is_some()
+			and func_count == input.expected_func_callable_id_count
 			and source_count == input.expected_source_definition_id_count
 			and allocated_count == input.expected_func_callable_id_count + input.expected_source_definition_id_count
 		)
@@ -367,6 +374,7 @@ pure func compiler_definition_index_benchmark_with_input(
 				Some(query):
 					actual_definition_id = definition_index_find_source_definition_id(
 						index,
+						input.module_table,
 						query.key,
 					)
 

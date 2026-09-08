@@ -5,10 +5,11 @@
 -- making setup and measured work explicit and preventing stage/input mismatch.
 import:
 	../../src/compiler/stage_03_parse/parsed_ast: ParsedImportDecl, ParsedImportSymbol
-	../../src/compiler/stage_04_modules/loaded_module:
-		ModuleLoadCandidate,
-		module_identity_storage_key,
-	../../src/compiler/stage_04_modules/module_table: module_id_table_index
+	../../src/compiler/stage_04_modules/loaded_module: ModuleLoadCandidate
+	../../src/compiler/stage_04_modules/module_table:
+		ModuleTable,
+		module_id_table_index,
+		module_table_canonical_path,
 	../../src/compiler/stage_06_typecheck/decl:
 		AcceptedTypecheckGraph,
 		BodyCheckOrder(SourceBodyOrder),
@@ -41,11 +42,11 @@ import:
 			TraitDefinition,
 			TypeDefinition,
 		),
-		func_callable_key_module_identity,
+		func_callable_key_module_id,
 		func_callable_key_name,
 		func_callable_key_span,
 		source_definition_key_kind,
-		source_definition_key_module_identity,
+		source_definition_key_module_id,
 		source_definition_key_name,
 		source_definition_key_owner,
 		source_definition_key_span,
@@ -61,6 +62,7 @@ import:
 		indexed_graph_build,
 		indexed_graph_definition_index,
 		indexed_graph_error_message,
+		indexed_graph_module_table,
 		indexed_graph_modules,
 		indexed_graph_target,
 		prepared_module_canonical_path,
@@ -109,11 +111,11 @@ import:
 		declaration_skeleton_graph_type_skeletons,
 		declaration_skeleton_kind,
 		declaration_skeleton_name,
-		global_id_module_identity,
+		global_id_module_id,
 		global_id_name,
 		impl_id_definition_id,
 		trait_id_definition_id,
-		trait_id_module_identity,
+		trait_id_module_id,
 		trait_id_name,
 		trait_method_id_index,
 	../../src/compiler/stage_06_typecheck/headers/implementation_headers:
@@ -643,11 +645,18 @@ private pure func source_definition_kind_name(kind: SourceDefinitionKind) -> Str
 			"field"
 
 
-private pure func fingerprint_callable_key(fingerprint: Int, key: FuncCallableKey) -> Int:
+private pure func fingerprint_callable_key(
+	fingerprint: Int,
+	module_table: ModuleTable,
+	key: FuncCallableKey,
+) -> Int:
 	fingerprint_source_span(
 		fingerprint
 			.fingerprint_add_text(
-				module_identity_storage_key(func_callable_key_module_identity(key)),
+				module_table_canonical_path(
+					module_table,
+					func_callable_key_module_id(key),
+				).get_or("<missing-module>"),
 			)
 			.fingerprint_add_text(func_callable_key_name(key)),
 		func_callable_key_span(key),
@@ -656,12 +665,16 @@ private pure func fingerprint_callable_key(fingerprint: Int, key: FuncCallableKe
 
 private pure func fingerprint_source_definition_key(
 	fingerprint: Int,
+	module_table: ModuleTable,
 	key: SourceDefinitionKey,
 ) -> Int:
 	fingerprint_source_span(
 		fingerprint
 			.fingerprint_add_text(
-				module_identity_storage_key(source_definition_key_module_identity(key)),
+				module_table_canonical_path(
+					module_table,
+					source_definition_key_module_id(key),
+				).get_or("<missing-module>"),
 			)
 			.fingerprint_add_text(source_definition_kind_name(source_definition_key_kind(key)))
 			.fingerprint_add_text(source_definition_key_name(key))
@@ -685,11 +698,16 @@ private pure func fingerprint_type_parameter(
 		.fingerprint_add_int(parameter.bounds.length())
 
 	for bound in parameter.bounds:
-		next = next.fingerprint_add_text(
-			module_identity_storage_key(
-				trait_id_module_identity(bound),
-			) + ":" + trait_id_name(bound),
-		)
+		next = match trait_id_module_id(bound):
+			Some(module_id):
+				next
+					.fingerprint_add_text("graph")
+					.fingerprint_add_int(module_id_table_index(module_id))
+					.fingerprint_add_text(trait_id_name(bound))
+			None:
+				next
+					.fingerprint_add_text("builtin")
+					.fingerprint_add_text(trait_id_name(bound))
 
 	next
 
@@ -997,6 +1015,7 @@ private pure func indexed_output_summary(
 	graph: IndexedGraph,
 ) -> CompilerTypecheckPhaseOutputSummary:
 	index = indexed_graph_definition_index(graph)
+	module_table = indexed_graph_module_table(graph)
 	var fingerprint = fingerprint_add_text(
 		0,
 		prepared_module_canonical_path(indexed_graph_target(graph)),
@@ -1008,12 +1027,14 @@ private pure func indexed_output_summary(
 	for binding in definition_index_all_func_callable_bindings(index):
 		fingerprint = fingerprint_callable_key(
 			fingerprint.fingerprint_add_text("callable"),
+			module_table,
 			binding[0],
 		).fingerprint_add_int(binding[1])
 
 	for binding in definition_index_all_source_definition_bindings(index):
 		fingerprint = fingerprint_source_definition_key(
 			fingerprint.fingerprint_add_text("source"),
+			module_table,
 			binding[0],
 		).fingerprint_add_int(binding[1])
 
@@ -1285,7 +1306,7 @@ private pure func callable_header_output_summary(
 	for global in globals:
 		id = global_header_id(global)
 		fingerprint = fingerprint
-			.fingerprint_add_text(module_identity_storage_key(global_id_module_identity(id)))
+			.fingerprint_add_int(module_id_table_index(global_id_module_id(id)))
 			.fingerprint_add_text(global_header_name(global))
 
 		match annotated_global_header_type(global):

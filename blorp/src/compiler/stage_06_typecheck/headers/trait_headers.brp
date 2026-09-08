@@ -7,13 +7,13 @@
 import:
 	../../../lib/source: SourceSpan
 	../../stage_03_parse/parsed_ast: ParsedIdentifier, ParsedTraitMethodDecl, ParsedTypeParamDecl
-	../../stage_04_modules/loaded_module: module_identity_display_name
 	../graph/indexed_graph: PreparedModuleScope
 	../modules/bound_module_graph:
 		BoundModule,
 		BoundModuleGraph,
-		bound_module_graph_find,
-		bound_module_identity,
+		bound_module_graph_canonical_path_for_id,
+		bound_module_graph_find_for_id,
+		bound_module_graph_module_table,
 		bound_module_scope,
 	../type_system/builtins: builtin_trait_supertraits, builtin_trait_topology_is_acyclic
 	callable_signature:
@@ -33,7 +33,7 @@ import:
 		declaration_skeleton_graph_trait_skeletons,
 		trait_id_definition_id,
 		trait_id_is_compiler_builtin,
-		trait_id_module_identity,
+		trait_id_module_id,
 		trait_id_name,
 		trait_id_source_span,
 		trait_ids_equal,
@@ -120,7 +120,7 @@ opaque type TraitTopologyGraph = TraitTopologyGraphRep
 
 union TraitTopologyGraphError:
 	BuiltinTraitTopologyCycle
-	TraitOwnerModuleMissing(TraitId)
+	TraitOwnerModuleMissing(TraitId, String)
 	TraitUnknownSupertrait(TraitId, ParsedIdentifier)
 	TraitDuplicateSupertrait(TraitId, TraitId, ParsedIdentifier)
 	TraitDuplicateTypeParameter(TraitId, ParsedIdentifier)
@@ -481,9 +481,30 @@ private pure func append_trait_topology_header(
 	method_skeletons_by_owner_id: TraitMethodSkeletonBuckets,
 	skeleton: TraitDeclarationSkeletonInfo,
 ) -> TraitTopologyBuildState:
-	match bound_module_graph_find(bound_graph, trait_id_module_identity(skeleton.id)):
+	owner_id = trait_id_module_id(skeleton.id)
+
+	match owner_id.and_then(
+		func(
+			module_id,
+		): bound_module_graph_find_for_id(
+			bound_graph,
+			bound_module_graph_module_table(bound_graph),
+			module_id,
+		),
+	):
 		None:
-			{ state | errors = state.errors.append(TraitOwnerModuleMissing(skeleton.id)) }
+			module_path = owner_id
+				.and_then(func(module_id):
+					bound_module_graph_canonical_path_for_id(
+						bound_graph,
+						bound_module_graph_module_table(bound_graph),
+						module_id,
+					)
+				)
+				.get_or("<compiler builtin>")
+			{ state |
+				errors = state.errors.append(TraitOwnerModuleMissing(skeleton.id, module_path))
+			}
 		Some(module):
 			(with_supertraits, supertraits) = resolve_trait_id_list(
 				state,
@@ -807,12 +828,8 @@ pure func trait_topology_graph_error_message(error: TraitTopologyGraphError) -> 
 	match error:
 		BuiltinTraitTopologyCycle:
 			"compiler builtin trait inheritance contains a cycle"
-		TraitOwnerModuleMissing(id):
-			"trait '" + trait_id_name(
-				id,
-			) + "' has no bound owner module '" + module_identity_display_name(
-				trait_id_module_identity(id),
-			) + "'"
+		TraitOwnerModuleMissing(id, module_path):
+			"trait '" + trait_id_name(id) + "' has no bound owner module '" + module_path + "'"
 		TraitUnknownSupertrait(id, name):
 			"trait '" + trait_id_name(id) + "' has unknown supertrait '" + name.text + "'"
 		TraitDuplicateSupertrait(id, supertrait_id, _):
@@ -845,7 +862,7 @@ pure func trait_topology_graph_error_span(error: TraitTopologyGraphError) -> Opt
 	match error:
 		BuiltinTraitTopologyCycle:
 			None
-		TraitOwnerModuleMissing(id):
+		TraitOwnerModuleMissing(id, _):
 			Some(trait_id_source_span(id))
 		TraitUnknownSupertrait(_, name):
 			Some(name.span)
