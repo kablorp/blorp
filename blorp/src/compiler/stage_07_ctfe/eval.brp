@@ -10,8 +10,9 @@ import:
 		ParsedParam,
 		ParsedParamBinder(ParsedParamNameBinder, ParsedParamTupleBinder, ParsedParamWildcardBinder),
 		ParsedUnaryOp,
-	../stage_06_typecheck/type_system/semantic_type: SemanticType, array_type, array_type_parts
+	../stage_04_modules/module_table: ModuleId, module_ids_equal
 	../stage_06_typecheck/infer: TypedExpr, TypedLambdaParam
+	../stage_06_typecheck/type_system/semantic_type: SemanticType, array_type, array_type_parts
 	context:
 		CtfeContext,
 		CtfeFunction,
@@ -20,6 +21,7 @@ import:
 		ctfe_context_imported_functions_by_source,
 		ctfe_context_module_global_env,
 		ctfe_context_module_global_value,
+		ctfe_context_module_path,
 	env:
 		CTFE_ENV_EMPTY,
 		CtfeEnvError,
@@ -664,15 +666,27 @@ private pure func ctfe_eval_imported_global(
 	context: CtfeContext,
 	imported: CtfeIrImportedGlobal,
 ) -> Result[CtfeValue, CtfeEvalError]:
-	match ctfe_context_module_global_value(context, imported.module_path, imported.name):
+	match ctfe_context_module_global_value(context, imported.module_id, imported.name):
 		Some(value):
 			Ok(value)
 		None:
+			module_path ?= ctfe_eval_module_path(context, imported.module_id)
 			Err(
 				CtfeEvalInvalid(
-					"global constant initializer cannot reference imported value '" + imported.module_path + "." + imported.name + "' because it is not a compile-time constant",
+					"global constant initializer cannot reference imported value '" + module_path + "." + imported.name + "' because it is not a compile-time constant",
 				),
 			)
+
+
+private pure func ctfe_eval_module_path(
+	context: CtfeContext,
+	module_id: ModuleId,
+) -> Result[String, CtfeEvalError]:
+	match ctfe_context_module_path(context, module_id):
+		Some(module_path):
+			Ok(module_path)
+		None:
+			Err(CtfeEvalInvalid("compile-time module id is not present in the CTFE module table"))
 
 
 private pure func ctfe_replace_record_field(
@@ -1053,7 +1067,7 @@ private pure func ctfe_eval_ctfe_function_call(
 	else:
 		match ctfe_function.info.body:
 			Some(body):
-				function_context = { context | active_module_path = ctfe_function.module_path }
+				function_context = { context | active_module_id = ctfe_function.module_id }
 				body_ir ?= ctfe_eval_translate_result(
 					ctfe_ir_from_typed_expr(
 						function_context,
@@ -1063,11 +1077,13 @@ private pure func ctfe_eval_ctfe_function_call(
 
 				param_env ?= ctfe_bind_function_params(ctfe_function.info.decl.params, arg_values)
 
-				global_env: CtfeEnv = match ctfe_function.module_path:
-					Some(module_path):
-						ctfe_context_module_global_env(function_context, module_path)
-					None:
-						ctfe_global_bindings(caller_env)
+				global_env: CtfeEnv = if module_ids_equal(
+					ctfe_function.module_id,
+					context.target_module_id,
+				):
+					ctfe_global_bindings(caller_env)
+				else:
+					ctfe_context_module_global_env(function_context, ctfe_function.module_id)
 
 				function_env = ctfe_env_concat(param_env, global_env)
 				ctfe_eval_ir_in_context(function_context, function_env, body_ir)
@@ -1096,21 +1112,21 @@ private pure func ctfe_eval_function_call(
 private pure func ctfe_eval_imported_function_call(
 	context: CtfeContext,
 	caller_env: CtfeEnv,
-	module_path: String,
+	module_id: ModuleId,
 	callable_id: Int,
 	source_name: String,
 	arg_values: List[CtfeValue],
 ) -> Result[CtfeValue, CtfeEvalError]:
 	match ctfe_context_imported_function_by_callable_id(
 		context,
-		module_path,
+		module_id,
 		source_name,
 		callable_id,
 	):
 		Some(ctfe_function):
 			ctfe_eval_ctfe_function_call(context, caller_env, ctfe_function, arg_values)
 		None:
-			functions = ctfe_context_imported_functions_by_source(context, module_path, source_name)
+			functions = ctfe_context_imported_functions_by_source(context, module_id, source_name)
 
 			if functions.length() == 1:
 				match functions.get(0):
@@ -1122,12 +1138,14 @@ private pure func ctfe_eval_imported_function_call(
 									+ "empty"
 								)))
 			else if functions.length() == 0:
+				module_path ?= ctfe_eval_module_path(context, module_id)
 				Err(
 					CtfeEvalUnsupported(
 						"imported function call '" + module_path + "." + source_name + "'",
 					),
 				)
 			else:
+				module_path ?= ctfe_eval_module_path(context, module_id)
 				Err(
 					CtfeEvalInvalid(
 						"compile-time imported function call '" + module_path + "." + source_name + "' is ambiguous",
@@ -2459,11 +2477,12 @@ private pure func ctfe_eval_call(
 					direct.source_name,
 					arg_values,
 				)
-		CtfeIrImportedCall(direct, module_path):
+		CtfeIrImportedCall(direct, module_id):
 			if not direct.is_pure:
 				Err(CtfeEvalUnsupported("impure function calls"))
 			else:
 				arg_values ?= ctfe_eval_exprs(context, env, call.args)
+				module_path ?= ctfe_eval_module_path(context, module_id)
 
 				match ctfe_imported_intrinsic(module_path, direct.source_name):
 					Some(intrinsic):
@@ -2472,7 +2491,7 @@ private pure func ctfe_eval_call(
 						ctfe_eval_imported_function_call(
 							context,
 							env,
-							module_path,
+							module_id,
 							direct.callable_id,
 							direct.source_name,
 							arg_values,

@@ -24,6 +24,14 @@ import:
 		ParsedVariantDecl,
 		ParsedWithBindingKind(ParsedWithPlainBinding, ParsedWithTryBinding),
 		parsed_identifier,
+	../../../src/compiler/stage_04_modules/loaded_module:
+		ModuleOrigin(UserModule),
+		resolved_module_identity_from_resolver,
+	../../../src/compiler/stage_04_modules/module_table:
+		ModuleId,
+		ModuleTable,
+		module_table,
+		module_table_id_at,
 	../../../src/compiler/stage_06_typecheck/decl:
 		TypedDecl(
 			TypedFunctionDecl,
@@ -157,8 +165,9 @@ import:
 	../../../src/compiler/stage_08_core_lower/flatten:
 		CoreFlattenError(CoreFlattenCallableTargetNameCollision),
 	../../../src/compiler/stage_08_core_lower/graph_prepare:
-		CoreGraphPrepareError(CoreGraphFlattenError),
+		CoreGraphPrepareError(CoreGraphFlattenError, CoreGraphModuleTableError),
 		CoreGraphUnit,
+		core_graph_modules,
 		core_graph_prepare_error_to_string,
 		prepare_core_graph,
 	../../../src/compiler/stage_08_core_lower/identity:
@@ -282,6 +291,31 @@ import:
 		source_file,
 		source_span,
 	test: TestSuite
+
+
+pure func core_graph_test_module_domain(
+	paths: List[String],
+) -> Option[(ModuleTable, List[ModuleId])]:
+	identities = paths.map(func(path): resolved_module_identity_from_resolver(path, UserModule))
+
+	match module_table(identities):
+		Err(_):
+			None
+		Ok(table):
+			var ids: List[ModuleId] = []
+			var valid: Bool = True
+
+			for index in 0..paths.length():
+				match module_table_id_at(table, index):
+					Some(module_id):
+						ids = ids.append(module_id)
+					None:
+						valid = False
+
+			if valid and ids.length() == paths.length():
+				Some((table, ids))
+			else:
+				None
 
 
 pure func fixture_source_file() -> SourceFile:
@@ -4848,7 +4882,11 @@ func test_lowers_program_sequentially() -> Bool:
 			False
 
 
-func test_prepares_module_graph_at_core_boundary() -> Bool:
+private func prepares_module_graph_at_core_boundary(
+	module_table: ModuleTable,
+	target_module_id: ModuleId,
+	dependency_module_id: ModuleId,
+) -> Bool:
 	module_function: TypedFunctionInfo = {
 		decl = parsed_function_decl(),
 		callable_id = None,
@@ -4874,7 +4912,7 @@ func test_prepares_module_graph_at_core_boundary() -> Bool:
 		body = Some(int_expr("2"))
 	}
 	module_program: TypedProgram = {
-		source = fixture_source_file(),
+		source = source_file("pkg/math.brp", "pkg/math", ""),
 		decls = [TypedFunctionDecl(module_function)],
 		diagnostics = [],
 		type_definitions = [],
@@ -4888,12 +4926,17 @@ func test_prepares_module_graph_at_core_boundary() -> Bool:
 		type_references = []
 	}
 	module_unit: CoreGraphUnit = {
-		module_name = "pkg/math",
-		module_path = "pkg/math",
+		module_id = dependency_module_id,
 		typed_program = module_program
 	}
 
-	match prepare_core_graph("target", target_program, [module_unit], 10):
+	match prepare_core_graph(
+		module_table,
+		target_module_id,
+		target_program,
+		core_graph_modules(module_table, [module_unit]),
+		10,
+	):
 		Ok(prepared):
 			match prepared.program.decls:
 				[FunctionDecl(module_info), FunctionDecl(target_info)]:
@@ -4923,7 +4966,63 @@ func test_prepares_module_graph_at_core_boundary() -> Bool:
 			False
 
 
-func test_prepared_graph_uses_canonical_module_path_for_repeated_imports() -> Bool:
+func test_prepares_module_graph_at_core_boundary() -> Bool:
+	match core_graph_test_module_domain(["target", "pkg/math"]):
+		Some((module_table, [target_module_id, dependency_module_id])):
+			prepares_module_graph_at_core_boundary(
+				module_table,
+				target_module_id,
+				dependency_module_id,
+			)
+		_:
+			False
+
+
+func test_core_graph_rejects_module_id_outside_table() -> Bool:
+	match (
+		core_graph_test_module_domain(["target"]),
+		core_graph_test_module_domain(["foreign/zero"]),
+	):
+		(Some((table, [target_id])), Some((foreign_table, [foreign_id]))):
+			foreign_program: TypedProgram = {
+				source = source_file("foreign.brp", "foreign", ""),
+				decls = [],
+				diagnostics = [],
+				type_definitions = [],
+				type_references = []
+			}
+
+			match (
+				prepare_core_graph(
+					table,
+					target_id,
+					foreign_program,
+					core_graph_modules(
+						foreign_table,
+						[
+							{
+								module_id = foreign_id,
+								typed_program = foreign_program
+							},
+						],
+					),
+					10,
+				)
+			):
+				Err(CoreGraphModuleTableError(_)):
+					True
+				_:
+					False
+		_:
+			False
+
+
+private func prepared_graph_uses_canonical_module_path_for_repeated_imports(
+	module_table: ModuleTable,
+	target_module_id: ModuleId,
+	first_module_id: ModuleId,
+	second_module_id: ModuleId,
+) -> Bool:
 	first_module_function: TypedFunctionInfo = {
 		decl = { parsed_function_decl() | name = ident("shared") },
 		callable_id = Some(501),
@@ -4943,8 +5042,7 @@ func test_prepared_graph_uses_canonical_module_path_for_repeated_imports() -> Bo
 		body = Some(int_expr("2"))
 	}
 	first_module: CoreGraphUnit = {
-		module_name = "display/first",
-		module_path = "pkg/v1/display/first",
+		module_id = first_module_id,
 		typed_program = {
 			source = fixture_source_file(),
 			decls = [TypedFunctionDecl(first_module_function)],
@@ -4954,8 +5052,7 @@ func test_prepared_graph_uses_canonical_module_path_for_repeated_imports() -> Bo
 		}
 	}
 	second_module: CoreGraphUnit = {
-		module_name = "display/second",
-		module_path = "pkg/v1/display/second",
+		module_id = second_module_id,
 		typed_program = {
 			source = fixture_source_file(),
 			decls = [TypedFunctionDecl(second_module_function)],
@@ -4997,9 +5094,13 @@ func test_prepared_graph_uses_canonical_module_path_for_repeated_imports() -> Bo
 
 	match (
 		prepare_core_graph(
-			"app/main",
+			module_table,
+			target_module_id,
 			target_program,
-			[first_module, second_module],
+			core_graph_modules(
+				module_table,
+				[first_module, second_module],
+			),
 			10,
 		)
 	):
@@ -5022,7 +5123,27 @@ func test_prepared_graph_uses_canonical_module_path_for_repeated_imports() -> Bo
 			False
 
 
-func test_synthesizes_explicit_program_entrypoint() -> Bool:
+func test_prepared_graph_uses_canonical_module_path_for_repeated_imports() -> Bool:
+	match core_graph_test_module_domain([
+		"app/main",
+		"pkg/v1/display/first",
+		"pkg/v1/display/second",
+	]):
+		Some((module_table, [target_module_id, first_module_id, second_module_id])):
+			prepared_graph_uses_canonical_module_path_for_repeated_imports(
+				module_table,
+				target_module_id,
+				first_module_id,
+				second_module_id,
+			)
+		_:
+			False
+
+
+private func synthesizes_explicit_program_entrypoint(
+	module_table: ModuleTable,
+	target_module_id: ModuleId,
+) -> Bool:
 	main_decl: ParsedFunctionDecl = { parsed_function_decl() |
 		name = ident("main"),
 		params = [
@@ -5071,7 +5192,13 @@ func test_synthesizes_explicit_program_entrypoint() -> Bool:
 		type_references = []
 	}
 
-	match prepare_core_graph("target", program, [], 10):
+	match prepare_core_graph(
+		module_table,
+		target_module_id,
+		program,
+		core_graph_modules(module_table, []),
+		10,
+	):
 		Ok(prepared):
 			match prepared.program.decls:
 				[FunctionDecl(user_main), FunctionDecl(entrypoint)]:
@@ -5094,6 +5221,14 @@ func test_synthesizes_explicit_program_entrypoint() -> Bool:
 				_:
 					False
 		Err(_):
+			False
+
+
+func test_synthesizes_explicit_program_entrypoint() -> Bool:
+	match core_graph_test_module_domain(["main"]):
+		Some((module_table, [target_module_id])):
+			synthesizes_explicit_program_entrypoint(module_table, target_module_id)
+		_:
 			False
 
 
@@ -5489,6 +5624,10 @@ tests: TestSuite = {
 		),
 		("lowers program sequentially", test_lowers_program_sequentially),
 		("prepares module graph at Core boundary", test_prepares_module_graph_at_core_boundary),
+		(
+			"Core graph rejects module ID outside table",
+			test_core_graph_rejects_module_id_outside_table,
+		),
 		(
 			"reports Core graph flatten errors with module context",
 			test_core_graph_flatten_error_has_module_context,

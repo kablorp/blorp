@@ -7,6 +7,15 @@ import:
 		ParsedTypeExpr(ParsedNamedType),
 		ParsedVarDecl,
 		parsed_identifier,
+	../../../src/compiler/stage_04_modules/loaded_module:
+		ModuleOrigin(UserModule),
+		resolved_module_identity_from_resolver,
+	../../../src/compiler/stage_04_modules/module_table:
+		ModuleId,
+		ModuleTable,
+		module_table,
+		module_table_find_id_by_canonical_path,
+		singleton_module_table,
 	../../../src/compiler/stage_06_typecheck/decl:
 		TypedDecl(TypedFunctionDecl, TypedGlobalVarDecl, TypedPrivateDecl),
 		TypedFunctionInfo,
@@ -19,8 +28,6 @@ import:
 		ResolvedCallTarget(ResolvedDirectCall),
 		TypedExpr(TypedBinaryExpr, TypedCallExpr, TypedIntLiteralExpr, TypedNameExpr),
 		TypedExprInfo,
-	../../../src/compiler/stage_06_typecheck/modules/import_binding:
-		ImportBinding(SelectiveDefinitionBinding),
 	../../../src/compiler/stage_06_typecheck/type_system/env:
 		Purity(Pure),
 		ResourceArgPolicy(RejectResourceArgs),
@@ -28,10 +35,11 @@ import:
 	../../../src/compiler/stage_06_typecheck/type_system/semantic_type: TYPE_INT
 	../../../src/compiler/stage_06_typecheck/type_system/type_widening: ValueSlot(KeptValueSlot)
 	../../../src/compiler/stage_07_ctfe/context:
-		CTFE_CONTEXT_EMPTY,
 		CtfeContext,
+		CtfeImportBinding(CtfeSelectiveDefinitionBinding),
 		CtfeImportedProgram,
 		complete_ctfe_imported_program,
+		ctfe_context_empty,
 		ctfe_context_from_program,
 		ctfe_context_module_global_value,
 	../../../src/compiler/stage_07_ctfe/env: CTFE_ENV_EMPTY, ctfe_lookup_value
@@ -53,6 +61,78 @@ import:
 		source_file,
 		source_span,
 	test: TestSuite
+
+
+private pure func ctfe_test_domain() -> (ModuleTable, ModuleId):
+	target_identity = resolved_module_identity_from_resolver("target", UserModule)
+	identities = [
+		"target",
+		"dep",
+		"broken/dep",
+		"self/dep",
+		"later/dep",
+		"left",
+		"right",
+		"base",
+	].map(
+		func(module_path): resolved_module_identity_from_resolver(module_path, UserModule),
+	)
+
+	match module_table(identities):
+		Ok(table):
+			match module_table_find_id_by_canonical_path(table, "target"):
+				Some(module_id):
+					(table, module_id)
+				None:
+					singleton_module_table(target_identity)
+		Err(_):
+			singleton_module_table(target_identity)
+
+
+private pure func ctfe_test_module_id(module_path: String) -> ModuleId:
+	domain = ctfe_test_domain()
+	module_table_find_id_by_canonical_path(domain[0], module_path).get_or(domain[1])
+
+
+private pure func ctfe_test_context() -> CtfeContext:
+	domain = ctfe_test_domain()
+	ctfe_context_empty(domain[0], domain[1])
+
+
+private pure func ctfe_test_context_from_program(
+	program: TypedProgram,
+	imported_programs: List[CtfeImportedProgram],
+) -> CtfeContext:
+	domain = ctfe_test_domain()
+	ctfe_context_from_program(
+		domain[0],
+		domain[1],
+		program,
+		[],
+		imported_programs,
+	).get_or(ctfe_context_empty(domain[0], domain[1]))
+
+
+private pure func ctfe_test_module_global_value(
+	context: CtfeContext,
+	module_path: String,
+	name: String,
+) -> Option[CtfeValue]:
+	ctfe_context_module_global_value(context, ctfe_test_module_id(module_path), name)
+
+
+private pure func ctfe_test_imported_program(
+	module_path: String,
+	decls: List[TypedDecl],
+	import_bindings: List[CtfeImportBinding],
+) -> CtfeImportedProgram:
+	domain = ctfe_test_domain()
+	complete_ctfe_imported_program(
+		domain[0],
+		ctfe_test_module_id(module_path),
+		decls,
+		import_bindings,
+	)
 
 
 pure func fixture_source_file() -> SourceFile:
@@ -192,8 +272,8 @@ pure func selective_import_binding(
 	local_name: String,
 	module_path: String,
 	source_name: String,
-) -> ImportBinding:
-	SelectiveDefinitionBinding(local_name, module_path, source_name)
+) -> CtfeImportBinding:
+	CtfeSelectiveDefinitionBinding(local_name, ctfe_test_module_id(module_path), source_name)
 
 
 pure func lookup_equals(env: CtfeEnv, name: String, expected: Int) -> Bool:
@@ -244,7 +324,7 @@ func test_eval_program_globals_in_source_order() -> Bool:
 			add_expr(name_expr("A"), int_expr("2")),
 		),
 	])
-	result = ctfe_eval_program_global_env(CTFE_CONTEXT_EMPTY, CTFE_ENV_EMPTY, program)
+	result = ctfe_eval_program_global_env(ctfe_test_context(), CTFE_ENV_EMPTY, program)
 
 	match result:
 		Ok(env):
@@ -261,7 +341,7 @@ func test_eval_program_rejects_later_global_reference() -> Bool:
 
 	result_error_message(
 		ctfe_eval_program_global_env(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			CTFE_ENV_EMPTY,
 			program,
 		),
@@ -273,7 +353,7 @@ func test_eval_program_rejects_self_reference() -> Bool:
 
 	result_error_message(
 		ctfe_eval_program_global_env(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			CTFE_ENV_EMPTY,
 			program,
 		),
@@ -288,7 +368,7 @@ func test_eval_program_keeps_mutable_global_runtime_initialized() -> Bool:
 
 	result_error_message(
 		ctfe_eval_program_global_env(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			CTFE_ENV_EMPTY,
 			program,
 		),
@@ -307,7 +387,7 @@ func test_eval_program_evaluates_private_globals() -> Bool:
 			add_expr(name_expr("HIDDEN"), int_expr("1")),
 		),
 	])
-	result = ctfe_eval_program_global_env(CTFE_CONTEXT_EMPTY, CTFE_ENV_EMPTY, program)
+	result = ctfe_eval_program_global_env(ctfe_test_context(), CTFE_ENV_EMPTY, program)
 
 	match result:
 		Ok(env):
@@ -318,20 +398,16 @@ func test_eval_program_evaluates_private_globals() -> Bool:
 
 func test_eval_imported_program_global_envs_attach_to_context() -> Bool:
 	imported_programs: List[CtfeImportedProgram] = [
-		complete_ctfe_imported_program(
-			"dep",
-			[typed_global_decl("VALUE", False, int_expr("42"))],
-			[],
-		),
+		ctfe_test_imported_program("dep", [typed_global_decl("VALUE", False, int_expr("42"))], []),
 	]
 	result: Result[CtfeContext, CtfeEvalError] = ctfe_eval_imported_program_global_envs(
-		CTFE_CONTEXT_EMPTY,
+		ctfe_test_context(),
 		imported_programs,
 	)
 
 	match result:
 		Ok(context):
-			match ctfe_context_module_global_value(context, "dep", "VALUE"):
+			match ctfe_test_module_global_value(context, "dep", "VALUE"):
 				Some(value):
 					ctfe_values_equal(
 						value,
@@ -346,7 +422,7 @@ func test_eval_imported_program_global_envs_attach_to_context() -> Bool:
 func test_eval_imported_global_pure_call_reads_prior_global() -> Bool:
 	read_first_id: Int = 701
 	imported_programs: List[CtfeImportedProgram] = [
-		complete_ctfe_imported_program(
+		ctfe_test_imported_program(
 			"dep",
 			[typed_global_decl("FIRST", False, int_expr("40")), typed_pure_function_decl(
 					read_first_id,
@@ -360,12 +436,12 @@ func test_eval_imported_global_pure_call_reads_prior_global() -> Bool:
 			[],
 		),
 	]
-	context = ctfe_context_from_program(typed_program([]), imported_programs)
+	context = ctfe_test_context_from_program(typed_program([]), imported_programs)
 	result = ctfe_eval_imported_program_global_envs(context, imported_programs)
 
 	match result:
 		Ok(context):
-			match ctfe_context_module_global_value(context, "dep", "SECOND"):
+			match ctfe_test_module_global_value(context, "dep", "SECOND"):
 				Some(value):
 					ctfe_values_equal(
 						value,
@@ -379,13 +455,13 @@ func test_eval_imported_global_pure_call_reads_prior_global() -> Bool:
 
 func test_eval_imported_global_error_names_module() -> Bool:
 	imported_programs: List[CtfeImportedProgram] = [
-		complete_ctfe_imported_program(
+		ctfe_test_imported_program(
 			"broken/dep",
 			[typed_global_decl("VALUE", False, name_expr("MISSING"))],
 			[],
 		),
 	]
-	context = ctfe_context_from_program(typed_program([]), imported_programs)
+	context = ctfe_test_context_from_program(typed_program([]), imported_programs)
 
 	imported_module_env_error_message(
 		ctfe_eval_imported_program_global_envs(context, imported_programs),
@@ -399,7 +475,7 @@ func test_eval_imported_global_error_names_module() -> Bool:
 func test_eval_imported_global_pure_call_rejects_self_reference() -> Bool:
 	read_self_id: Int = 702
 	imported_programs: List[CtfeImportedProgram] = [
-		complete_ctfe_imported_program(
+		ctfe_test_imported_program(
 			"self/dep",
 			[
 				typed_pure_function_decl(read_self_id, "read_self", name_expr("SELF")),
@@ -412,7 +488,7 @@ func test_eval_imported_global_pure_call_rejects_self_reference() -> Bool:
 			[],
 		),
 	]
-	context = ctfe_context_from_program(typed_program([]), imported_programs)
+	context = ctfe_test_context_from_program(typed_program([]), imported_programs)
 
 	imported_module_env_error_message(
 		ctfe_eval_imported_program_global_envs(context, imported_programs),
@@ -426,7 +502,7 @@ func test_eval_imported_global_pure_call_rejects_self_reference() -> Bool:
 func test_eval_imported_global_pure_call_rejects_later_reference() -> Bool:
 	read_later_id: Int = 703
 	imported_programs: List[CtfeImportedProgram] = [
-		complete_ctfe_imported_program(
+		ctfe_test_imported_program(
 			"later/dep",
 			[
 				typed_pure_function_decl(read_later_id, "read_later", name_expr("LATER")),
@@ -440,7 +516,7 @@ func test_eval_imported_global_pure_call_rejects_later_reference() -> Bool:
 			[],
 		),
 	]
-	context = ctfe_context_from_program(typed_program([]), imported_programs)
+	context = ctfe_test_context_from_program(typed_program([]), imported_programs)
 
 	imported_module_env_error_message(
 		ctfe_eval_imported_program_global_envs(context, imported_programs),
@@ -455,7 +531,7 @@ func test_eval_imported_global_pure_calls_keep_module_environments_isolated() ->
 	left_reader_id: Int = 704
 	right_reader_id: Int = 705
 	imported_programs: List[CtfeImportedProgram] = [
-		complete_ctfe_imported_program(
+		ctfe_test_imported_program(
 			"left",
 			[
 				typed_global_decl("VALUE", False, int_expr("1")),
@@ -468,7 +544,7 @@ func test_eval_imported_global_pure_calls_keep_module_environments_isolated() ->
 			],
 			[],
 		),
-		complete_ctfe_imported_program(
+		ctfe_test_imported_program(
 			"right",
 			[
 				typed_global_decl("VALUE", False, int_expr("2")),
@@ -482,12 +558,12 @@ func test_eval_imported_global_pure_calls_keep_module_environments_isolated() ->
 			[],
 		),
 	]
-	context = ctfe_context_from_program(typed_program([]), imported_programs)
+	context = ctfe_test_context_from_program(typed_program([]), imported_programs)
 
 	match ctfe_eval_imported_program_global_envs(context, imported_programs):
 		Ok(result_context):
-			left_value = ctfe_context_module_global_value(result_context, "left", "RESULT")
-			right_value = ctfe_context_module_global_value(result_context, "right", "RESULT")
+			left_value = ctfe_test_module_global_value(result_context, "left", "RESULT")
+			right_value = ctfe_test_module_global_value(result_context, "right", "RESULT")
 
 			match (left_value, right_value):
 				(Some(left), Some(right)):
@@ -506,22 +582,18 @@ func test_eval_imported_global_pure_calls_keep_module_environments_isolated() ->
 
 func test_eval_imported_program_globals_use_dependency_bindings() -> Bool:
 	imported_programs: List[CtfeImportedProgram] = [
-		complete_ctfe_imported_program(
-			"base",
-			[typed_global_decl("VALUE", False, int_expr("40"))],
-			[],
-		),
-		complete_ctfe_imported_program("dep", [typed_global_decl(
+		ctfe_test_imported_program("base", [typed_global_decl("VALUE", False, int_expr("40"))], []),
+		ctfe_test_imported_program("dep", [typed_global_decl(
 					"NEXT",
 					False,
 					add_expr(name_expr("VALUE"), int_expr("1")),
 				)], [selective_import_binding("VALUE", "base", "VALUE")]),
 	]
-	result = ctfe_eval_imported_program_global_envs(CTFE_CONTEXT_EMPTY, imported_programs)
+	result = ctfe_eval_imported_program_global_envs(ctfe_test_context(), imported_programs)
 
 	match result:
 		Ok(context):
-			match ctfe_context_module_global_value(context, "dep", "NEXT"):
+			match ctfe_test_module_global_value(context, "dep", "NEXT"):
 				Some(value):
 					ctfe_values_equal(
 						value,
@@ -546,7 +618,7 @@ pure func rewrite_globals_fixture() -> Result[TypedProgram, CtfeEvalError]:
 			add_expr(int_expr("3"), int_expr("4")),
 		),
 	])
-	ctfe_rewrite_program_globals(CTFE_CONTEXT_EMPTY, CTFE_ENV_EMPTY, program)
+	ctfe_rewrite_program_globals(ctfe_test_context(), CTFE_ENV_EMPTY, program)
 
 
 func test_rewrite_program_globals_materializes_typed_initializer() -> Bool:
@@ -619,13 +691,13 @@ func test_rewrite_program_globals_leaves_mutable_initializer_runtime() -> Bool:
 
 func test_rewrite_program_globals_uses_selective_imported_constant() -> Bool:
 	imported_programs: List[CtfeImportedProgram] = [
-		complete_ctfe_imported_program(
+		ctfe_test_imported_program(
 			"dep",
 			[typed_global_decl("OFFSET", False, int_expr("41"))],
 			[],
 		),
 	]
-	context_result = ctfe_eval_imported_program_global_envs(CTFE_CONTEXT_EMPTY, imported_programs)
+	context_result = ctfe_eval_imported_program_global_envs(ctfe_test_context(), imported_programs)
 	program = typed_program([typed_global_decl(
 				"ANSWER",
 				False,
@@ -659,13 +731,9 @@ func test_rewrite_program_globals_uses_selective_imported_constant() -> Bool:
 
 func test_rewrite_program_globals_rejects_runtime_initialized_selective_import() -> Bool:
 	imported_programs: List[CtfeImportedProgram] = [
-		complete_ctfe_imported_program(
-			"dep",
-			[typed_global_decl("OFFSET", True, int_expr("41"))],
-			[],
-		),
+		ctfe_test_imported_program("dep", [typed_global_decl("OFFSET", True, int_expr("41"))], []),
 	]
-	context_result = ctfe_eval_imported_program_global_envs(CTFE_CONTEXT_EMPTY, imported_programs)
+	context_result = ctfe_eval_imported_program_global_envs(ctfe_test_context(), imported_programs)
 	program = typed_program([typed_global_decl("ANSWER", False, name_expr("OFFSET"))])
 
 	match context_result:
@@ -690,7 +758,7 @@ func test_rewrite_program_globals_rejects_runtime_initialized_selective_import()
 
 func test_evaluate_program_globals_builds_context_and_rewrites_target() -> Bool:
 	imported_programs: List[CtfeImportedProgram] = [
-		complete_ctfe_imported_program(
+		ctfe_test_imported_program(
 			"dep",
 			[typed_global_decl("OFFSET", False, int_expr("40"))],
 			[],
@@ -701,7 +769,10 @@ func test_evaluate_program_globals_builds_context_and_rewrites_target() -> Bool:
 				False,
 				add_expr(name_expr("OFFSET"), int_expr("2")),
 			)])
+	domain = ctfe_test_domain()
 	result = ctfe_evaluate_program_globals(
+		domain[0],
+		domain[1],
 		program,
 		imported_programs,
 		[selective_import_binding("OFFSET", "dep", "OFFSET")],

@@ -1,6 +1,6 @@
 # Normalized Compilation Database Roadmap
 
-**Status:** Active; Horizon 1 Issue 56 implemented
+**Status:** Active; Horizon 1 Issues 56-58 implemented
 
 **Scope:** One compiler invocation and the immutable products retained by an
 LSP analysis snapshot. This is not a cross-run cache, an incremental build
@@ -954,13 +954,13 @@ audit before implementation.
    Stage 04-owned `ModuleId` domain and immutable identity table, retain exact
    module-reference/resolution rows, and make direct and replay Stage 06 entry
    normalize into that shape. Do not yet migrate declaration identities.
-2. **Issue 57: Make module IDs authoritative through Stage 06.** Remove the
+2. **Issue 57: Make module IDs authoritative through Stage 06 (implemented).** Remove the
    independent `PreparedModuleId` domain, align prepared/bound/module-view/
    environment payloads to the Stage 04 table, and migrate remaining
    graph-backed declaration owner fields where the owning table is retained.
    Materialize descriptive identity only for diagnostics and external
    semantic projection.
-3. **Issue 58: Carry module IDs through CTFE and Core lowering.** Replace
+3. **Issue 58: Carry module IDs through CTFE and Core lowering (implemented).** Replace
    module-path/name transport in typed graph, CTFE imported contexts, and
    `CoreGraphUnit` with table-backed IDs at the bounded phase boundaries.
    Keep C name projection later and retain current expression/typed-program
@@ -969,6 +969,13 @@ audit before implementation.
 These issues are sequential. Issue 57 must not invent a second table while
 Issue 56 is unsettled, and Issue 58 must not serialize or independently rebuild
 the ID domain.
+
+The completed Horizon 1 checkpoint removed descriptive module join fields and
+path-keyed CTFE/Core relations while preserving byte-identical replay output.
+Issue 58 measured neutral whole-compiler cost (+0.0003% allocations, -0.14%
+peak RSS, +0.78% median elapsed); this is enabling normalization rather than a
+compiler-wide speedup. Horizon 2 changes must identify and measure a concrete
+consumer of the normalized ID spine.
 
 ### Horizon 2: Stage 06 entity tables (medium fidelity)
 

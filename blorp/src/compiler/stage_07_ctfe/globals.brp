@@ -3,22 +3,24 @@
 -- Immutable top-level initializers are evaluated in source order into the
 -- CTFE global environment. Mutable top-level `var` bindings run at runtime.
 import:
+	../stage_04_modules/module_table: ModuleId, ModuleTable, module_ids_equal
 	../stage_06_typecheck/decl:
 		TypedDecl(TypedGlobalVarDecl, TypedPrivateDecl),
 		TypedGlobalVarInfo,
 		TypedProgram,
-	../stage_06_typecheck/modules/import_binding:
-		ImportBinding(QualifiedModuleBinding, SelectiveDefinitionBinding),
 	context:
 		CtfeContext,
+		CtfeImportBinding(CtfeQualifiedModuleBinding, CtfeSelectiveDefinitionBinding),
 		CtfeImportedProgram,
 		ctfe_context_from_program,
 		ctfe_context_module_global_value,
 		ctfe_context_module_has_global_binding,
+		ctfe_context_module_path,
 		ctfe_context_with_module_global_env,
 		ctfe_imported_program_decls,
 		ctfe_imported_program_import_bindings,
-		ctfe_imported_program_module_path,
+		ctfe_imported_program_module_id,
+		ctfe_imported_program_module_table,
 	env: CTFE_ENV_EMPTY, ctfe_bind_global_value, ctfe_bind_unavailable_global
 	eval: CtfeEvalError(CtfeEvalInModule, CtfeEvalInvalid), ctfe_eval_typed_expr
 	materialize:
@@ -121,14 +123,14 @@ pure func ctfe_bind_unavailable_program_globals(env: CtfeEnv, program: TypedProg
 
 pure func ctfe_imported_program_declares_global(
 	imported_programs: List[CtfeImportedProgram],
-	module_path: String,
+	module_id: ModuleId,
 	name: String,
 ) -> Bool:
 	imported_programs.any(
 		func(
 			imported,
 		): (
-			ctfe_imported_program_module_path(imported) == module_path
+			module_ids_equal(ctfe_imported_program_module_id(imported), module_id)
 			and ctfe_decls_declare_global(ctfe_imported_program_decls(imported), name)
 		),
 	)
@@ -144,14 +146,15 @@ pure func ctfe_eval_global_decl(
 	else:
 		eval_env = ctfe_bind_unavailable_global(env, global_decl.name, CtfeCurrentGlobal)
 
-		eval_context: CtfeContext = match context.active_module_path:
-			Some(module_path):
-				-- Imported pure functions resolve globals through their module context.
-				-- Install the initializer environment here so it includes both prior
-				-- values and the current-binding marker used for cycle diagnostics.
-				ctfe_context_with_module_global_env(context, module_path, eval_env)
-			None:
-				context
+		-- Imported pure functions resolve globals through their module context.
+		-- Install the initializer environment here so it includes both prior
+		-- values and the current-binding marker used for cycle diagnostics.
+		eval_context = ctfe_context_with_module_global_env(
+			context,
+			context.module_table,
+			context.active_module_id,
+			eval_env,
+		)
 
 		value ?= ctfe_eval_typed_expr(eval_context, eval_env, global_decl.info.value)
 
@@ -277,8 +280,8 @@ pure func ctfe_eval_imported_program_global_envs(
 	var failure: Option[CtfeEvalError] = None
 
 	for imported in imported_programs:
-		module_path = ctfe_imported_program_module_path(imported)
-		imported_context = { result_context | active_module_path = Some(module_path) }
+		module_id = ctfe_imported_program_module_id(imported)
+		imported_context = { result_context | active_module_id = module_id }
 
 		match ctfe_eval_decls_global_env(
 			imported_context,
@@ -291,11 +294,21 @@ pure func ctfe_eval_imported_program_global_envs(
 			Ok(env):
 				result_context = ctfe_context_with_module_global_env(
 					result_context,
-					module_path,
+					ctfe_imported_program_module_table(imported),
+					module_id,
 					env,
 				)
 			Err(error):
-				failure = Some(CtfeEvalInModule(module_path, error))
+				match ctfe_context_module_path(result_context, module_id):
+					Some(module_path):
+						failure = Some(CtfeEvalInModule(module_path, error))
+					None:
+						failure = Some(
+							CtfeEvalInvalid(
+								"compile-time module id is not present in the CTFE module table",
+							),
+						)
+
 				break
 
 	match failure:
@@ -308,29 +321,33 @@ pure func ctfe_eval_imported_program_global_envs(
 pure func ctfe_bind_imported_global(
 	context: CtfeContext,
 	env: CtfeEnv,
-	binding: ImportBinding,
+	binding: CtfeImportBinding,
 ) -> CtfeEnv:
 	match binding:
-		QualifiedModuleBinding(_, _):
+		CtfeQualifiedModuleBinding(_, _):
 			env
-		SelectiveDefinitionBinding(local_name, module_path, source_name):
-			match ctfe_context_module_global_value(context, module_path, source_name):
+		CtfeSelectiveDefinitionBinding(local_name, module_id, source_name):
+			match ctfe_context_module_global_value(context, module_id, source_name):
 				Some(value):
 					ctfe_bind_global_value(env, local_name, value)
 				None:
-					if ctfe_context_module_has_global_binding(context, module_path, source_name):
-						ctfe_bind_unavailable_global(
-							env,
-							local_name,
-							CtfeImportedRuntimeInitializedGlobal(module_path, source_name),
-						)
+					if ctfe_context_module_has_global_binding(context, module_id, source_name):
+						match ctfe_context_module_path(context, module_id):
+							Some(module_path):
+								ctfe_bind_unavailable_global(
+									env,
+									local_name,
+									CtfeImportedRuntimeInitializedGlobal(module_path, source_name),
+								)
+							None:
+								env
 					else:
 						env
 
 
 pure func ctfe_imported_global_env(
 	context: CtfeContext,
-	import_bindings: List[ImportBinding],
+	import_bindings: List[CtfeImportBinding],
 ) -> CtfeEnv:
 	var env: CtfeEnv = CTFE_ENV_EMPTY
 
@@ -367,7 +384,7 @@ pure func ctfe_rewrite_program_globals(
 
 pure func ctfe_rewrite_program_globals_with_import_bindings(
 	context: CtfeContext,
-	import_bindings: List[ImportBinding],
+	import_bindings: List[CtfeImportBinding],
 	program: TypedProgram,
 ) -> Result[TypedProgram, CtfeEvalError]:
 	ctfe_rewrite_program_globals(
@@ -378,13 +395,22 @@ pure func ctfe_rewrite_program_globals_with_import_bindings(
 
 
 pure func ctfe_evaluate_program_globals(
+	module_table: ModuleTable,
+	target_module_id: ModuleId,
 	program: TypedProgram,
 	imported_programs: List[CtfeImportedProgram],
-	import_bindings: List[ImportBinding],
+	import_bindings: List[CtfeImportBinding],
 ) -> Result[TypedProgram, CtfeEvalError]:
-	context ?= ctfe_eval_imported_program_global_envs(
-		ctfe_context_from_program(program, imported_programs),
+	match ctfe_context_from_program(
+		module_table,
+		target_module_id,
+		program,
+		import_bindings,
 		imported_programs,
-	)
+	):
+		None:
+			Err(CtfeEvalInvalid("CTFE module IDs do not belong to one module table"))
+		Some(base_context):
+			context ?= ctfe_eval_imported_program_global_envs(base_context, imported_programs)
 
-	ctfe_rewrite_program_globals_with_import_bindings(context, import_bindings, program)
+			ctfe_rewrite_program_globals_with_import_bindings(context, import_bindings, program)

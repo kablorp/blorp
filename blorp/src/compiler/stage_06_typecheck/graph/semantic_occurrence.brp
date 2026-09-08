@@ -6,7 +6,7 @@
 import:
 	../../../lib/source: SourceSpan
 	../../stage_04_modules/loaded_module: ModuleIdentity
-	../bridge: TypecheckedGraph, TypecheckedModule
+	../bridge: TypecheckedGraph, TypecheckedModule, typechecked_module_identity
 	../decl:
 		TypedDecl(
 			TypedForeignFunctionDecl,
@@ -107,6 +107,7 @@ union SemanticOccurrenceError:
 	SemanticDefinitionMissingCallableId(String, SourceSpan)
 	SemanticDefinitionMissingSourceId(String, SourceSpan)
 	SemanticDefinitionHasUnresolvedSignature(String, SourceSpan)
+	SemanticModuleIdOutsideTable
 
 
 private record DefinitionProjection {
@@ -116,6 +117,7 @@ private record DefinitionProjection {
 
 
 private record GraphDefinitionProjections {
+	target_identity: ModuleIdentity,
 	target_projections: List[DefinitionProjection],
 	dependency_projections: List[DefinitionProjection],
 	dependency_projection_complete: Bool
@@ -431,14 +433,12 @@ private pure func decl_definition_projections(
 
 private pure func module_definition_projections(
 	module: TypecheckedModule,
+	module_identity: ModuleIdentity,
 ) -> Result[List[DefinitionProjection], SemanticOccurrenceError]:
 	var projections: List[DefinitionProjection] = []
 	var error: Option[SemanticOccurrenceError] = None
 
-	match type_definition_projections(
-		module.module_identity,
-		module.semantic_program.type_definitions,
-	):
+	match type_definition_projections(module_identity, module.semantic_program.type_definitions):
 		Ok(found):
 			projections += found
 		Err(found):
@@ -446,7 +446,7 @@ private pure func module_definition_projections(
 
 	for decl in module.semantic_program.decls:
 		if error.is_none():
-			match decl_definition_projections(module.module_identity, decl, False):
+			match decl_definition_projections(module_identity, decl, False):
 				Ok(found):
 					projections += found
 				Err(found):
@@ -461,21 +461,19 @@ private pure func module_definition_projections(
 
 private pure func dependency_definition_projections(
 	module: TypecheckedModule,
+	module_identity: ModuleIdentity,
 ) -> DependencyDefinitionProjections:
 	var projections: List[DefinitionProjection] = []
 	var complete: Bool = True
 
-	match type_definition_projections(
-		module.module_identity,
-		module.semantic_program.type_definitions,
-	):
+	match type_definition_projections(module_identity, module.semantic_program.type_definitions):
 		Ok(found):
 			projections += found
 		Err(_):
 			complete = False
 
 	for decl in module.semantic_program.decls:
-		match decl_definition_projections(module.module_identity, decl, False):
+		match decl_definition_projections(module_identity, decl, False):
 			Ok(found):
 				projections += found
 			Err(_):
@@ -490,8 +488,13 @@ private pure func dependency_definition_projections(
 private pure func graph_definition_projections(
 	graph: TypecheckedGraph,
 ) -> Result[GraphDefinitionProjections, SemanticOccurrenceError]:
+	target_identity ?= typechecked_module_identity(
+		graph.module_table,
+		graph.target,
+	).to_result(SemanticModuleIdOutsideTable)
+
 	target_projections ?= if graph.target.errors.is_empty():
-		module_definition_projections(graph.target)
+		module_definition_projections(graph.target, target_identity)
 	else:
 		empty: List[DefinitionProjection] = []
 		Ok(empty)
@@ -506,13 +509,21 @@ private pure func graph_definition_projections(
 	-- projected: target-local navigation must not depend on its full index.
 	for module in graph.modules:
 		if module.errors.is_empty():
-			projected = dependency_definition_projections(module)
-			dependency_projections += projected.projections
-			dependency_projection_complete = dependency_projection_complete and projected.complete
+			match typechecked_module_identity(graph.module_table, module):
+				Some(module_identity):
+					projected = dependency_definition_projections(module, module_identity)
+					dependency_projections += projected.projections
+					dependency_projection_complete = (
+						dependency_projection_complete
+						and projected.complete
+					)
+				None:
+					dependency_projection_complete = False
 		else:
 			dependency_projection_complete = False
 
 	Ok({
+		target_identity = target_identity,
 		target_projections = target_projections,
 		dependency_projections = dependency_projections,
 		dependency_projection_complete = dependency_projection_complete,
@@ -779,7 +790,7 @@ pure func semantic_occurrences_for_target(
 	definitions = projection_result.target_projections.map(func(projection): projection.definition)
 
 	Ok({
-		module_identity = graph.target.module_identity,
+		module_identity = projection_result.target_identity,
 		definitions = definitions,
 		references = module_references(graph.target, bindings),
 		dependency_projection_complete = projection_result.dependency_projection_complete,

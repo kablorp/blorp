@@ -5,6 +5,13 @@
 -- module-owned names, lowers the unprefixed root program, and attaches the FFI
 -- and list-layout facts required by the first middle-Core pass.
 import:
+	../stage_04_modules/module_table:
+		ModuleId,
+		ModuleTable,
+		module_id_table_index,
+		module_table_canonical_path,
+		module_table_count,
+		module_tables_are_compatible,
 	../stage_06_typecheck/decl:
 		TypedDecl(TypedFunctionDecl, TypedImplDecl, TypedPrivateDecl),
 		TypedFunctionInfo,
@@ -31,10 +38,28 @@ import:
 
 
 record CoreGraphUnit {
-	module_name: String,
-	module_path: String,
+	module_id: ModuleId,
 	typed_program: TypedProgram
 }
+
+
+private record CoreGraphModulesRep {
+	module_table: ModuleTable,
+	units: List[CoreGraphUnit]
+}
+
+
+opaque type CoreGraphModules = CoreGraphModulesRep
+
+
+pure func core_graph_modules(
+	module_table: ModuleTable,
+	units: List[CoreGraphUnit],
+) -> CoreGraphModules:
+	into_opaque CoreGraphModules({
+			module_table = module_table,
+			units = units
+		})
 
 
 record CorePreparedGraph {
@@ -46,6 +71,7 @@ record CorePreparedGraph {
 union CoreGraphPrepareError:
 	CoreGraphLowerError(String, CoreLowerError)
 	CoreGraphFlattenError(String, CoreFlattenError)
+	CoreGraphModuleTableError(String)
 	CoreGraphFfiError(CoreFfiBoundaryError)
 	CoreGraphEntrypointError(String)
 
@@ -61,80 +87,116 @@ private record LoweredCoreModules {
 -- flattening may use a separately projected display/module name. Keep both
 -- facts at this boundary and index canonical UFCS names by the resolved path.
 private pure func register_callable_name(
-	by_module: Dict[String, Dict[Int, CoreLowerCallableName]],
-	module_path: String,
+	by_module: List[Dict[Int, CoreLowerCallableName]],
+	module_id: ModuleId,
 	module_prefix: String,
 	function_info: TypedFunctionInfo,
-) -> Dict[String, Dict[Int, CoreLowerCallableName]]:
+) -> Option[List[Dict[Int, CoreLowerCallableName]]]:
 	match function_info.callable_id:
 		Some(callable_id):
-			by_callable: Dict[Int, CoreLowerCallableName] = by_module.get_or(module_path, {})
-			by_module.set(
-				module_path,
-				by_callable.set(
-					callable_id,
-					{
-						source_name = function_info.decl.name.text,
-						ufcs_name = core_ufcs_name_from_prefix(
-							module_prefix,
-							function_info.decl.name.text,
-						)
-					},
+			module_index = module_id_table_index(module_id)
+			by_callable ?= by_module.get(module_index)
+			Some(
+				by_module.set(
+					module_index,
+					by_callable.set(
+						callable_id,
+						{
+							source_name = function_info.decl.name.text,
+							ufcs_name = core_ufcs_name_from_prefix(
+								module_prefix,
+								function_info.decl.name.text,
+							)
+						},
+					),
 				),
 			)
 		None:
-			by_module
+			Some(by_module)
 
 
 private pure func register_decl_callable_names(
-	by_module: Dict[String, Dict[Int, CoreLowerCallableName]],
-	module_path: String,
+	by_module: List[Dict[Int, CoreLowerCallableName]],
+	module_id: ModuleId,
 	module_prefix: String,
 	decl: TypedDecl,
-) -> Dict[String, Dict[Int, CoreLowerCallableName]]:
+) -> Option[List[Dict[Int, CoreLowerCallableName]]]:
 	match decl:
 		TypedFunctionDecl(function_info):
-			register_callable_name(by_module, module_path, module_prefix, function_info)
+			register_callable_name(by_module, module_id, module_prefix, function_info)
 		TypedImplDecl(impl_info):
-			impl_info.methods.fold_left(
-				by_module,
-				func(
-					names,
-					method,
-				): register_callable_name(names, module_path, module_prefix, method),
-			)
+			var result: Option[List[Dict[Int, CoreLowerCallableName]]] = Some(by_module)
+
+			for method in impl_info.methods:
+				match result:
+					Some(names):
+						result = register_callable_name(names, module_id, module_prefix, method)
+					None:
+						void
+
+			result
 		TypedPrivateDecl(inner):
-			register_decl_callable_names(by_module, module_path, module_prefix, inner)
+			register_decl_callable_names(by_module, module_id, module_prefix, inner)
 		_:
-			by_module
+			Some(by_module)
 
 
 private pure func register_program_callable_names(
-	by_module: Dict[String, Dict[Int, CoreLowerCallableName]],
-	module_path: String,
+	by_module: List[Dict[Int, CoreLowerCallableName]],
+	module_table: ModuleTable,
+	module_id: ModuleId,
 	program: TypedProgram,
-) -> Dict[String, Dict[Int, CoreLowerCallableName]]:
+) -> Option[List[Dict[Int, CoreLowerCallableName]]]:
 	-- Escaping occurs once for the entire typed module, not per declaration or
 	-- reference lowered from it.
+	module_path ?= module_table_canonical_path(module_table, module_id)
 	module_prefix: String = core_ufcs_module_prefix(module_path)
-	program.decls.fold_left(
-		by_module,
-		func(names, decl): register_decl_callable_names(names, module_path, module_prefix, decl),
-	)
+	var result: Option[List[Dict[Int, CoreLowerCallableName]]] = Some(by_module)
+
+	for decl in program.decls:
+		match result:
+			Some(names):
+				result = register_decl_callable_names(names, module_id, module_prefix, decl)
+			None:
+				void
+
+	result
 
 
 private pure func core_graph_callable_names(
-	target_module_path: String,
+	module_table: ModuleTable,
+	target_module_id: ModuleId,
 	target: TypedProgram,
 	modules: List[CoreGraphUnit],
-) -> CoreLowerCallableNameRegistry:
-	var by_module: Dict[String, Dict[Int, CoreLowerCallableName]] = {}
-	by_module = register_program_callable_names(by_module, target_module_path, target)
+) -> Option[CoreLowerCallableNameRegistry]:
+	var by_module: List[Dict[Int, CoreLowerCallableName]] = []
+
+	for _ in 0..module_table_count(module_table):
+		by_module = by_module.append({})
+
+	registered_target ?= register_program_callable_names(
+		by_module,
+		module_table,
+		target_module_id,
+		target,
+	)
+	by_module = registered_target
+
+	var registered_modules: Option[List[Dict[Int, CoreLowerCallableName]]] = Some(by_module)
 
 	for unit in modules:
-		by_module = register_program_callable_names(by_module, unit.module_path, unit.typed_program)
+		match registered_modules:
+			Some(names):
+				registered_modules = register_program_callable_names(
+					names,
+					module_table,
+					unit.module_id,
+					unit.typed_program,
+				)
+			None:
+				void
 
-	CoreLowerPreparedCallableNames(by_module)
+	registered_modules.map(func(names): CoreLowerPreparedCallableNames(module_table, names))
 
 
 pure func core_graph_prepare_error_to_string(error: CoreGraphPrepareError) -> String:
@@ -143,6 +205,8 @@ pure func core_graph_prepare_error_to_string(error: CoreGraphPrepareError) -> St
 			"${module_name}: ${core_lower_error_to_string(lower_error)}"
 		CoreGraphFlattenError(module_name, flatten_error):
 			"${module_name}: ${core_flatten_error_to_string(flatten_error)}"
+		CoreGraphModuleTableError(message):
+			message
 		CoreGraphFfiError(ffi_error):
 			core_ffi_boundary_error_to_string(ffi_error)
 		CoreGraphEntrypointError(message):
@@ -161,9 +225,10 @@ private pure func lower_core_modules(
 				callable_aliases = [],
 			})
 		[unit, ...remaining]:
+			module_name = unit.typed_program.source.module_name
 			module_context = core_lower_context_with_callable_names(
 				context.next_def_id,
-				Some(unit.module_name),
+				Some(module_name),
 				context.callable_names,
 			)
 
@@ -171,16 +236,13 @@ private pure func lower_core_modules(
 				Ok(result):
 					Ok(result)
 				Err(error):
-					Err(CoreGraphLowerError(unit.module_name, error))
+					Err(CoreGraphLowerError(module_name, error))
 
-			prefixed ?= match prefix_module_names_with_aliases(
-				unit.module_name,
-				lowered_result.program,
-			):
+			prefixed ?= match prefix_module_names_with_aliases(module_name, lowered_result.program):
 				Ok(result):
 					Ok(result)
 				Err(error):
-					Err(CoreGraphFlattenError(unit.module_name, error))
+					Err(CoreGraphFlattenError(module_name, error))
 
 			rest ?= lower_core_modules(remaining, lowered_result.context)
 
@@ -207,14 +269,32 @@ private pure func assemble_core_program(
 
 
 pure func prepare_core_graph(
-	target_module_path: String,
+	module_table: ModuleTable,
+	target_module_id: ModuleId,
 	target: TypedProgram,
-	modules: List[CoreGraphUnit],
+	modules: CoreGraphModules,
 	next_def_id: Int,
 ) -> Result[CorePreparedGraph, CoreGraphPrepareError]:
-	callable_names = core_graph_callable_names(target_module_path, target, modules)
+	module_product: CoreGraphModulesRep = from_opaque CoreGraphModules(modules)
+
+	compatible_units = if module_tables_are_compatible(module_table, module_product.module_table):
+		Some(module_product.units)
+	else:
+		None
+
+	units ?= compatible_units.to_result(
+		CoreGraphModuleTableError("Core graph module IDs were issued by a different module table"),
+	)
+	callable_names ?= core_graph_callable_names(
+		module_table,
+		target_module_id,
+		target,
+		units,
+	).to_result(
+		CoreGraphModuleTableError("Core graph contains a module ID outside its module table"),
+	)
 	initial_context = core_lower_context_with_callable_names(next_def_id, None, callable_names)
-	lowered_modules ?= lower_core_modules(modules, initial_context)
+	lowered_modules ?= lower_core_modules(units, initial_context)
 	target_context = core_lower_context_with_callable_names(
 		lowered_modules.context.next_def_id,
 		None,

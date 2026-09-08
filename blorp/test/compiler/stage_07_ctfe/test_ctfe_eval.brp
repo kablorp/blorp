@@ -8,6 +8,16 @@ import:
 		ParsedParam,
 		ParsedParamBinder(ParsedParamNameBinder, ParsedParamTupleBinder),
 		parsed_identifier,
+	../../../src/compiler/stage_04_modules/loaded_module:
+		ModuleOrigin(UserModule),
+		resolved_module_identity_from_resolver,
+	../../../src/compiler/stage_04_modules/module_table:
+		ModuleId,
+		ModuleTable,
+		module_table,
+		module_table_find_id_by_canonical_path,
+		module_table_id_at,
+		singleton_module_table,
 	../../../src/compiler/stage_06_typecheck/decl: TypedFunctionInfo
 	../../../src/compiler/stage_06_typecheck/infer:
 		CallableOrigin(CallableBuiltin, CallableConstructor, CallableImported, CallableLocal),
@@ -75,9 +85,9 @@ import:
 		types_equal,
 	../../../src/compiler/stage_06_typecheck/type_system/type_widening: ValueSlot(KeptValueSlot)
 	../../../src/compiler/stage_07_ctfe/context:
-		CTFE_CONTEXT_EMPTY,
 		CtfeContext,
 		CtfeFunction,
+		ctfe_context_empty,
 		ctfe_context_with_module_alias,
 		ctfe_context_with_module_global_env,
 	../../../src/compiler/stage_07_ctfe/env:
@@ -122,6 +132,57 @@ import:
 		source_file,
 		source_span,
 	test: TestSuite
+
+
+private pure func ctfe_test_domain() -> (ModuleTable, ModuleId):
+	target_identity = resolved_module_identity_from_resolver("dep/math", UserModule)
+	identities = [
+		"dep/math",
+		"float",
+		"string",
+		"list",
+		"dict",
+		"option",
+		"result",
+	].map(
+		func(module_path): resolved_module_identity_from_resolver(module_path, UserModule),
+	)
+
+	match module_table(identities):
+		Ok(table):
+			match module_table_find_id_by_canonical_path(table, "dep/math"):
+				Some(module_id):
+					(table, module_id)
+				None:
+					singleton_module_table(target_identity)
+		Err(_):
+			singleton_module_table(target_identity)
+
+
+private pure func ctfe_domain(module_path: String) -> (ModuleTable, ModuleId):
+	singleton_module_table(resolved_module_identity_from_resolver(module_path, UserModule))
+
+
+private pure func ctfe_import_domain(module_path: String) -> (ModuleTable, ModuleId, ModuleId):
+	fallback = singleton_module_table(resolved_module_identity_from_resolver("target", UserModule))
+
+	match module_table([
+		resolved_module_identity_from_resolver("target", UserModule),
+		resolved_module_identity_from_resolver(module_path, UserModule),
+	]):
+		Ok(table):
+			match (module_table_id_at(table, 0), module_table_id_at(table, 1)):
+				(Some(target_id), Some(module_id)):
+					(table, target_id, module_id)
+				_:
+					(fallback[0], fallback[1], fallback[1])
+		Err(_):
+			(fallback[0], fallback[1], fallback[1])
+
+
+private pure func ctfe_test_context() -> CtfeContext:
+	domain = ctfe_test_domain()
+	ctfe_context_empty(domain[0], domain[1])
 
 
 pure func fixture_source_file() -> SourceFile:
@@ -345,14 +406,7 @@ pure func local_function_reference_expr(
 
 
 pure func constructor_context() -> CtfeContext:
-	{
-		functions = [],
-		imported_functions = [],
-		constructors = [("None", ctfe_constructor_info("Option", 0, None))],
-		module_aliases = [],
-		module_global_envs = [],
-		active_module_path = None
-	}
+	{ ctfe_test_context() | constructors = [("None", ctfe_constructor_info("Option", 0, None))] }
 
 
 pure func param(name: String) -> ParsedParam:
@@ -422,7 +476,7 @@ pure func ctfe_function(
 	{
 		info = typed_function_info(callable_id, name, params, body, is_pure),
 		source_name = name,
-		module_path = None
+		module_id = ctfe_test_domain()[1]
 	}
 
 
@@ -434,18 +488,13 @@ pure func imported_ctfe_function(
 	body: Option[TypedExpr],
 	is_pure: Bool,
 ) -> CtfeFunction:
-	{ ctfe_function(callable_id, name, params, body, is_pure) | module_path = Some(module_path) }
+	{ ctfe_function(callable_id, name, params, body, is_pure) |
+		module_id = ctfe_domain(module_path)[1]
+	}
 
 
 pure func function_context(functions: List[(Int, CtfeFunction)]) -> CtfeContext:
-	{
-		functions = functions,
-		imported_functions = [],
-		constructors = [],
-		module_aliases = [],
-		module_global_envs = [],
-		active_module_path = None
-	}
+	{ ctfe_test_context() | functions = functions }
 
 
 pure func imported_function_context(
@@ -453,20 +502,15 @@ pure func imported_function_context(
 	source_name: String,
 	functions: List[CtfeFunction],
 ) -> CtfeContext:
-	{
-		functions = [],
-		imported_functions = [
+	domain = ctfe_import_domain(module_path)
+	module_id = domain[2]
+	{ ctfe_context_empty(domain[0], domain[1]) | imported_functions = [
 			{
-				module_path = module_path,
+				module_id = module_id,
 				source_name = source_name,
-				functions = functions
+				functions = functions.map(func(item): { item | module_id = module_id })
 			},
-		],
-		constructors = [],
-		module_aliases = [],
-		module_global_envs = [],
-		active_module_path = None
-	}
+		] }
 
 
 pure func imported_function_context_with_global(
@@ -476,25 +520,14 @@ pure func imported_function_context_with_global(
 	global_name: String,
 	global_value: CtfeValue,
 ) -> CtfeContext:
-	{
-		functions = [],
-		imported_functions = [
-			{
-				module_path = module_path,
-				source_name = source_name,
-				functions = functions
-			},
-		],
-		constructors = [],
-		module_aliases = [],
-		module_global_envs = [
-			{
-				module_path = module_path,
-				env = ctfe_bind_global_value(CTFE_ENV_EMPTY, global_name, global_value)
-			},
-		],
-		active_module_path = None
-	}
+	context = imported_function_context(module_path, source_name, functions)
+	module_id = ctfe_import_domain(module_path)[2]
+	ctfe_context_with_module_global_env(
+		context,
+		context.module_table,
+		module_id,
+		ctfe_bind_global_value(CTFE_ENV_EMPTY, global_name, global_value),
+	)
 
 
 pure func imported_global_context(
@@ -503,10 +536,16 @@ pure func imported_global_context(
 	global_name: String,
 	global_value: CtfeValue,
 ) -> CtfeContext:
-	with_alias = ctfe_context_with_module_alias(CTFE_CONTEXT_EMPTY, alias_name, module_path)
+	domain = ctfe_import_domain(module_path)
+	with_alias = ctfe_context_with_module_alias(
+		ctfe_context_empty(domain[0], domain[1]),
+		alias_name,
+		domain[2],
+	)
 	ctfe_context_with_module_global_env(
 		with_alias,
-		module_path,
+		domain[0],
+		domain[2],
 		ctfe_bind_global_value(CTFE_ENV_EMPTY, global_name, global_value),
 	)
 
@@ -535,7 +574,7 @@ func test_eval_literals_and_binary_ops() -> Bool:
 		fixture_source_span(),
 		expr_info(),
 	)
-	result = ctfe_eval_typed_expr(CTFE_CONTEXT_EMPTY, CTFE_ENV_EMPTY, expr)
+	result = ctfe_eval_typed_expr(ctfe_test_context(), CTFE_ENV_EMPTY, expr)
 
 	value_equals(
 		result,
@@ -551,7 +590,7 @@ func test_eval_identifier_lookup() -> Bool:
 	)
 
 	value_equals(
-		ctfe_eval_typed_expr(CTFE_CONTEXT_EMPTY, env, name_expr("VALUE")),
+		ctfe_eval_typed_expr(ctfe_test_context(), env, name_expr("VALUE")),
 		ctfe_int(fixture_source_span(), 9),
 	)
 
@@ -565,7 +604,7 @@ func test_eval_logical_short_circuits() -> Bool:
 		expr_info_for(TYPE_BOOL),
 	)
 
-	match ctfe_eval_typed_expr(CTFE_CONTEXT_EMPTY, CTFE_ENV_EMPTY, expr):
+	match ctfe_eval_typed_expr(ctfe_test_context(), CTFE_ENV_EMPTY, expr):
 		Ok(value):
 			match value.desc:
 				CtfeBoolValue(result):
@@ -594,8 +633,8 @@ func test_eval_collection_and_record_values() -> Bool:
 		expr_info_for(SemanticNamedType("Box", [])),
 	)
 
-	list_result = ctfe_eval_typed_expr(CTFE_CONTEXT_EMPTY, CTFE_ENV_EMPTY, list_expr)
-	record_result = ctfe_eval_typed_expr(CTFE_CONTEXT_EMPTY, CTFE_ENV_EMPTY, record_expr)
+	list_result = ctfe_eval_typed_expr(ctfe_test_context(), CTFE_ENV_EMPTY, list_expr)
+	record_result = ctfe_eval_typed_expr(ctfe_test_context(), CTFE_ENV_EMPTY, record_expr)
 
 	var list_ok: Bool = False
 
@@ -700,7 +739,7 @@ func test_eval_if_range_field_and_record_update() -> Bool:
 		expr_info_for(SemanticNamedType("Box", [])),
 	)
 	env: CtfeEnv = CTFE_ENV_EMPTY
-	context = CTFE_CONTEXT_EMPTY
+	context = ctfe_test_context()
 
 	if_ok = value_equals(
 		ctfe_eval_typed_expr(context, env, if_expr),
@@ -810,7 +849,7 @@ func test_eval_record_update_preserves_duplicate_update_semantics() -> Bool:
 		expr_info_for(record_type),
 	)
 
-	match ctfe_eval_typed_expr(CTFE_CONTEXT_EMPTY, CTFE_ENV_EMPTY, expr):
+	match ctfe_eval_typed_expr(ctfe_test_context(), CTFE_ENV_EMPTY, expr):
 		Ok(value):
 			match value.desc:
 				CtfeRecordValue(fields):
@@ -868,7 +907,7 @@ func test_eval_record_update_reports_first_missing_update_field() -> Bool:
 
 	error_message(
 		ctfe_eval_typed_expr(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			CTFE_ENV_EMPTY,
 			expr,
 		),
@@ -899,7 +938,7 @@ func test_eval_block_local_bindings() -> Bool:
 	)
 
 	value_equals(
-		ctfe_eval_typed_expr(CTFE_CONTEXT_EMPTY, CTFE_ENV_EMPTY, block),
+		ctfe_eval_typed_expr(ctfe_test_context(), CTFE_ENV_EMPTY, block),
 		ctfe_int(fixture_source_span(), 42),
 	)
 
@@ -935,7 +974,7 @@ func test_eval_block_mutable_local_assignment() -> Bool:
 	)
 
 	value_equals(
-		ctfe_eval_typed_expr(CTFE_CONTEXT_EMPTY, CTFE_ENV_EMPTY, block),
+		ctfe_eval_typed_expr(ctfe_test_context(), CTFE_ENV_EMPTY, block),
 		ctfe_int(fixture_source_span(), 42),
 	)
 
@@ -968,7 +1007,7 @@ func test_eval_while_updates_mutable_local() -> Bool:
 	)
 
 	value_equals(
-		ctfe_eval_typed_expr(CTFE_CONTEXT_EMPTY, CTFE_ENV_EMPTY, block),
+		ctfe_eval_typed_expr(ctfe_test_context(), CTFE_ENV_EMPTY, block),
 		ctfe_int(fixture_source_span(), 4),
 	)
 
@@ -1038,7 +1077,7 @@ func test_eval_while_break_and_continue_control_flow() -> Bool:
 	)
 
 	value_equals(
-		ctfe_eval_typed_expr(CTFE_CONTEXT_EMPTY, CTFE_ENV_EMPTY, block),
+		ctfe_eval_typed_expr(ctfe_test_context(), CTFE_ENV_EMPTY, block),
 		ctfe_int(fixture_source_span(), 4),
 	)
 
@@ -1094,7 +1133,7 @@ func test_eval_for_range_updates_mutable_local() -> Bool:
 	)
 
 	value_equals(
-		ctfe_eval_typed_expr(CTFE_CONTEXT_EMPTY, CTFE_ENV_EMPTY, block),
+		ctfe_eval_typed_expr(ctfe_test_context(), CTFE_ENV_EMPTY, block),
 		ctfe_int(fixture_source_span(), 8),
 	)
 
@@ -1149,7 +1188,7 @@ func test_eval_for_list_break_control_flow() -> Bool:
 	)
 
 	value_equals(
-		ctfe_eval_typed_expr(CTFE_CONTEXT_EMPTY, CTFE_ENV_EMPTY, block),
+		ctfe_eval_typed_expr(ctfe_test_context(), CTFE_ENV_EMPTY, block),
 		ctfe_int(fixture_source_span(), 3),
 	)
 
@@ -1211,7 +1250,7 @@ func test_eval_for_tuple_binder_over_list() -> Bool:
 	)
 
 	value_equals(
-		ctfe_eval_typed_expr(CTFE_CONTEXT_EMPTY, CTFE_ENV_EMPTY, block),
+		ctfe_eval_typed_expr(ctfe_test_context(), CTFE_ENV_EMPTY, block),
 		ctfe_int(fixture_source_span(), 10),
 	)
 
@@ -1242,7 +1281,7 @@ func test_eval_block_rejects_immutable_local_assignment() -> Bool:
 
 	error_message(
 		ctfe_eval_typed_expr(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			CTFE_ENV_EMPTY,
 			block,
 		),
@@ -1276,7 +1315,7 @@ func test_eval_block_tuple_destructuring() -> Bool:
 	)
 
 	value_equals(
-		ctfe_eval_typed_expr(CTFE_CONTEXT_EMPTY, CTFE_ENV_EMPTY, block),
+		ctfe_eval_typed_expr(ctfe_test_context(), CTFE_ENV_EMPTY, block),
 		ctfe_int(fixture_source_span(), 42),
 	)
 
@@ -1311,7 +1350,7 @@ func test_eval_block_question_bind_option_some() -> Bool:
 	)
 
 	value_equals(
-		ctfe_eval_typed_expr(CTFE_CONTEXT_EMPTY, env, block),
+		ctfe_eval_typed_expr(ctfe_test_context(), env, block),
 		ctfe_int(fixture_source_span(), 42),
 	)
 
@@ -1342,7 +1381,7 @@ func test_eval_block_question_bind_option_none_propagates() -> Bool:
 	)
 
 	value_equals(
-		ctfe_eval_typed_expr(CTFE_CONTEXT_EMPTY, env, block),
+		ctfe_eval_typed_expr(ctfe_test_context(), env, block),
 		ctfe_option_none_value(option_type, fixture_source_span()),
 	)
 
@@ -1400,10 +1439,10 @@ func test_eval_block_question_bind_result_ok_and_err() -> Bool:
 	)
 
 	value_equals(
-		ctfe_eval_typed_expr(CTFE_CONTEXT_EMPTY, ok_env, block),
+		ctfe_eval_typed_expr(ctfe_test_context(), ok_env, block),
 		ctfe_int(fixture_source_span(), 42),
 	) and value_equals(
-		ctfe_eval_typed_expr(CTFE_CONTEXT_EMPTY, err_env, err_block),
+		ctfe_eval_typed_expr(ctfe_test_context(), err_env, err_block),
 		ctfe_result_err_value(
 			result_type,
 			fixture_source_span(),
@@ -1449,7 +1488,7 @@ func test_eval_string_interpolation() -> Bool:
 		expr_info_for(TYPE_STRING),
 	)
 
-	match ctfe_eval_typed_expr(CTFE_CONTEXT_EMPTY, CTFE_ENV_EMPTY, expr):
+	match ctfe_eval_typed_expr(ctfe_test_context(), CTFE_ENV_EMPTY, expr):
 		Ok(value):
 			match value.desc:
 				CtfeStringValue(text):
@@ -1485,7 +1524,7 @@ func test_eval_match_binds_selected_case() -> Bool:
 	)
 
 	value_equals(
-		ctfe_eval_typed_expr(CTFE_CONTEXT_EMPTY, CTFE_ENV_EMPTY, expr),
+		ctfe_eval_typed_expr(ctfe_test_context(), CTFE_ENV_EMPTY, expr),
 		ctfe_int(fixture_source_span(), 42),
 	)
 
@@ -1579,12 +1618,12 @@ func test_eval_sized_float_conversion_builtins() -> Bool:
 	float32_type = SemanticNamedType("Float32", [])
 	float16_type = SemanticNamedType("Float16", [])
 	float32_result = ctfe_eval_typed_expr(
-		CTFE_CONTEXT_EMPTY,
+		ctfe_test_context(),
 		CTFE_ENV_EMPTY,
 		builtin_call_expr("to_float32", float_expr("16777217.0"), float32_type),
 	)
 	float16_result = ctfe_eval_typed_expr(
-		CTFE_CONTEXT_EMPTY,
+		ctfe_test_context(),
 		CTFE_ENV_EMPTY,
 		builtin_call_expr("to_float16", float_expr("1.0001"), float16_type),
 	)
@@ -1622,7 +1661,7 @@ func test_eval_length_builtin() -> Bool:
 
 	value_equals(
 		ctfe_eval_typed_expr(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			CTFE_ENV_EMPTY,
 			builtin_call_expr("length", list_expr, TYPE_INT),
 		),
@@ -1677,7 +1716,7 @@ func test_eval_checked_tensor_get_normalizes_negative_indices() -> Bool:
 	)
 
 	value_equals(
-		ctfe_eval_typed_expr(CTFE_CONTEXT_EMPTY, CTFE_ENV_EMPTY, expr),
+		ctfe_eval_typed_expr(ctfe_test_context(), CTFE_ENV_EMPTY, expr),
 		ctfe_int(fixture_source_span(), 4),
 	)
 
@@ -1685,7 +1724,7 @@ func test_eval_checked_tensor_get_normalizes_negative_indices() -> Bool:
 func test_eval_imported_sized_float_conversion_intrinsics() -> Bool:
 	float32_type = SemanticNamedType("Float32", [])
 	result = ctfe_eval_typed_expr(
-		CTFE_CONTEXT_EMPTY,
+		ctfe_test_context(),
 		CTFE_ENV_EMPTY,
 		imported_call_expr("float", 51, "to_float32#51", [float_expr("16777217.0")], float32_type),
 	)
@@ -1816,7 +1855,7 @@ func test_eval_imported_function_call_reports_ambiguous_source_group() -> Bool:
 func test_eval_imported_std_string_intrinsics() -> Bool:
 	length_ok = value_equals(
 		ctfe_eval_typed_expr(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			CTFE_ENV_EMPTY,
 			imported_call_expr("string", 40, "length#40", [string_expr("blorp")], TYPE_INT),
 		),
@@ -1824,7 +1863,7 @@ func test_eval_imported_std_string_intrinsics() -> Bool:
 	)
 	substring_ok = value_equals(
 		ctfe_eval_typed_expr(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			CTFE_ENV_EMPTY,
 			imported_call_expr(
 				"string",
@@ -1841,7 +1880,7 @@ func test_eval_imported_std_string_intrinsics() -> Bool:
 	)
 	contains_ok = value_equals(
 		ctfe_eval_typed_expr(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			CTFE_ENV_EMPTY,
 			imported_call_expr(
 				"string",
@@ -1859,7 +1898,7 @@ func test_eval_imported_std_string_intrinsics() -> Bool:
 	index_type = SemanticNamedType("Option", [TYPE_INT])
 	index_ok = value_equals(
 		ctfe_eval_typed_expr(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			CTFE_ENV_EMPTY,
 			imported_call_expr(
 				"string",
@@ -1878,7 +1917,7 @@ func test_eval_imported_std_string_intrinsics() -> Bool:
 
 	upper_ok = value_equals(
 		ctfe_eval_typed_expr(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			CTFE_ENV_EMPTY,
 			imported_call_expr("string", 44, "upper#44", [string_expr("Blorp")], TYPE_STRING),
 		),
@@ -1886,7 +1925,7 @@ func test_eval_imported_std_string_intrinsics() -> Bool:
 	)
 	lower_ok = value_equals(
 		ctfe_eval_typed_expr(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			CTFE_ENV_EMPTY,
 			imported_call_expr("string", 45, "lower#45", [string_expr("Blorp")], TYPE_STRING),
 		),
@@ -1894,7 +1933,7 @@ func test_eval_imported_std_string_intrinsics() -> Bool:
 	)
 	drop_left_ok = value_equals(
 		ctfe_eval_typed_expr(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			CTFE_ENV_EMPTY,
 			imported_call_expr(
 				"string",
@@ -1911,7 +1950,7 @@ func test_eval_imported_std_string_intrinsics() -> Bool:
 	)
 	take_left_ok = value_equals(
 		ctfe_eval_typed_expr(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			CTFE_ENV_EMPTY,
 			imported_call_expr(
 				"string",
@@ -1929,7 +1968,7 @@ func test_eval_imported_std_string_intrinsics() -> Bool:
 	char_list_type = type_list(TYPE_CHAR)
 	chars_ok = value_equals(
 		ctfe_eval_typed_expr(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			CTFE_ENV_EMPTY,
 			imported_call_expr("string", 49, "chars#49", [string_expr("az")], char_list_type),
 		),
@@ -1940,7 +1979,7 @@ func test_eval_imported_std_string_intrinsics() -> Bool:
 	)
 	from_char_ok = value_equals(
 		ctfe_eval_typed_expr(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			CTFE_ENV_EMPTY,
 			imported_call_expr("string", 50, "from_char#50", [char_expr(90)], TYPE_STRING),
 		),
@@ -1948,7 +1987,7 @@ func test_eval_imported_std_string_intrinsics() -> Bool:
 	)
 	from_chars_ok = value_equals(
 		ctfe_eval_typed_expr(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			CTFE_ENV_EMPTY,
 			imported_call_expr(
 				"string",
@@ -1988,7 +2027,7 @@ func test_eval_imported_std_string_intrinsics() -> Bool:
 func test_eval_imported_std_string_case_conversion_rejects_non_ascii() -> Bool:
 	error_message(
 		ctfe_eval_typed_expr(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			CTFE_ENV_EMPTY,
 			imported_call_expr("string", 46, "upper#46", [string_expr("é")], TYPE_STRING),
 		),
@@ -1996,7 +2035,7 @@ func test_eval_imported_std_string_case_conversion_rejects_non_ascii() -> Bool:
 
 
 func test_eval_lambda_preserves_lexical_environment() -> Bool:
-	without_locals = match ctfe_eval_typed_expr(CTFE_CONTEXT_EMPTY, CTFE_ENV_EMPTY, lambda_expr()):
+	without_locals = match ctfe_eval_typed_expr(ctfe_test_context(), CTFE_ENV_EMPTY, lambda_expr()):
 		Ok(value):
 			match value.desc:
 				CtfeLambdaValue(closure):
@@ -2012,7 +2051,7 @@ func test_eval_lambda_preserves_lexical_environment() -> Bool:
 		ctfe_int(fixture_source_span(), 3),
 	)
 
-	with_locals = match ctfe_eval_typed_expr(CTFE_CONTEXT_EMPTY, local_env, lambda_expr()):
+	with_locals = match ctfe_eval_typed_expr(ctfe_test_context(), local_env, lambda_expr()):
 		Ok(value):
 			match value.desc:
 				CtfeLambdaValue(closure):
@@ -2033,7 +2072,7 @@ func test_eval_lambda_call_uses_captured_local() -> Bool:
 	)
 
 	value_equals(
-		ctfe_eval_typed_expr(CTFE_CONTEXT_EMPTY, env, lambda_call_expr()),
+		ctfe_eval_typed_expr(ctfe_test_context(), env, lambda_call_expr()),
 		ctfe_int(fixture_source_span(), 42),
 	)
 
@@ -2048,7 +2087,7 @@ func test_eval_imported_std_list_intrinsics() -> Bool:
 	)
 	length_ok = value_equals(
 		ctfe_eval_typed_expr(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			CTFE_ENV_EMPTY,
 			imported_call_expr("list", 50, "length#50", [list_expr], TYPE_INT),
 		),
@@ -2056,7 +2095,7 @@ func test_eval_imported_std_list_intrinsics() -> Bool:
 	)
 	append_ok = value_equals(
 		ctfe_eval_typed_expr(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			CTFE_ENV_EMPTY,
 			imported_call_expr(
 				"list",
@@ -2078,7 +2117,7 @@ func test_eval_imported_std_list_intrinsics() -> Bool:
 	)
 	get_ok = value_equals(
 		ctfe_eval_typed_expr(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			CTFE_ENV_EMPTY,
 			imported_call_expr(
 				"list",
@@ -2096,7 +2135,7 @@ func test_eval_imported_std_list_intrinsics() -> Bool:
 	)
 	contains_ok = value_equals(
 		ctfe_eval_typed_expr(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			CTFE_ENV_EMPTY,
 			imported_call_expr(
 				"list",
@@ -2149,7 +2188,7 @@ func test_eval_imported_std_dict_intrinsics() -> Bool:
 	)
 
 	value_equals(
-		ctfe_eval_typed_expr(CTFE_CONTEXT_EMPTY, CTFE_ENV_EMPTY, get_or_value),
+		ctfe_eval_typed_expr(ctfe_test_context(), CTFE_ENV_EMPTY, get_or_value),
 		ctfe_int(fixture_source_span(), 42),
 	)
 
@@ -2225,7 +2264,7 @@ func test_eval_imported_std_option_and_result_intrinsics() -> Bool:
 	)
 	some_get_ok = value_equals(
 		ctfe_eval_typed_expr(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			env,
 			imported_call_expr(
 				"option",
@@ -2242,7 +2281,7 @@ func test_eval_imported_std_option_and_result_intrinsics() -> Bool:
 	)
 	none_is_none_ok = value_equals(
 		ctfe_eval_typed_expr(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			env,
 			imported_call_expr(
 				"option",
@@ -2256,7 +2295,7 @@ func test_eval_imported_std_option_and_result_intrinsics() -> Bool:
 	)
 	result_get_ok = value_equals(
 		ctfe_eval_typed_expr(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			env,
 			imported_call_expr(
 				"result",
@@ -2273,7 +2312,7 @@ func test_eval_imported_std_option_and_result_intrinsics() -> Bool:
 	)
 	from_some_ok = value_equals(
 		ctfe_eval_typed_expr(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			env,
 			imported_call_expr(
 				"result",
@@ -2291,7 +2330,7 @@ func test_eval_imported_std_option_and_result_intrinsics() -> Bool:
 	)
 	from_none_ok = value_equals(
 		ctfe_eval_typed_expr(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			env,
 			imported_call_expr(
 				"result",
@@ -2309,7 +2348,7 @@ func test_eval_imported_std_option_and_result_intrinsics() -> Bool:
 	)
 	to_option_some_ok = value_equals(
 		ctfe_eval_typed_expr(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			env,
 			imported_call_expr(
 				"result",
@@ -2332,7 +2371,7 @@ func test_eval_imported_std_option_and_result_intrinsics() -> Bool:
 	)
 	to_option_none_ok = value_equals(
 		ctfe_eval_typed_expr(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			ctfe_bind_global_value(env, "err_value", err_value),
 			imported_call_expr(
 				"result",
@@ -2440,7 +2479,7 @@ func test_eval_constructor_call() -> Bool:
 		expr_info_for_with_call(option_type, call),
 	)
 
-	match ctfe_eval_typed_expr(CTFE_CONTEXT_EMPTY, CTFE_ENV_EMPTY, expr):
+	match ctfe_eval_typed_expr(ctfe_test_context(), CTFE_ENV_EMPTY, expr):
 		Ok(value):
 			match value.desc:
 				CtfeConstructorValue(payload):
@@ -2460,14 +2499,14 @@ func test_eval_constructor_call() -> Bool:
 func test_eval_errors_are_reported() -> Bool:
 	unknown_message = error_message(
 		ctfe_eval_typed_expr(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			CTFE_ENV_EMPTY,
 			name_expr("MISSING"),
 		),
 	)
 	function_message = error_message(
 		ctfe_eval_typed_expr(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			CTFE_ENV_EMPTY,
 			name_expr_with_call(
 				"helper",
@@ -2477,7 +2516,7 @@ func test_eval_errors_are_reported() -> Bool:
 	)
 	unresolved_call_message = error_message(
 		ctfe_eval_typed_expr(
-			CTFE_CONTEXT_EMPTY,
+			ctfe_test_context(),
 			CTFE_ENV_EMPTY,
 			TypedCallExpr(name_expr("helper"), [], fixture_source_span(), expr_info()),
 		),

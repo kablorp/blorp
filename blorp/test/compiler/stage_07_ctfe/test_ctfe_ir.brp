@@ -4,6 +4,14 @@ import:
 		ParsedForBinder(ParsedForNameBinder, ParsedForTupleBinder),
 		ParsedIdentifier,
 		parsed_identifier,
+	../../../src/compiler/stage_04_modules/loaded_module:
+		ModuleOrigin(UserModule),
+		resolved_module_identity_from_resolver,
+	../../../src/compiler/stage_04_modules/module_table:
+		ModuleId,
+		ModuleTable,
+		module_ids_equal,
+		singleton_module_table,
 	../../../src/compiler/stage_06_typecheck/infer:
 		CallableOrigin(CallableBuiltin, CallableConstructor, CallableImported, CallableLocal),
 		ExprTypeOrigin(SynthesizedOrigin),
@@ -58,8 +66,8 @@ import:
 		types_equal,
 	../../../src/compiler/stage_06_typecheck/type_system/type_widening: ValueSlot(KeptValueSlot)
 	../../../src/compiler/stage_07_ctfe/context:
-		CTFE_CONTEXT_EMPTY,
 		CtfeContext,
+		ctfe_context_empty,
 		ctfe_context_with_module_alias,
 	../../../src/compiler/stage_07_ctfe/ir:
 		CtfeIrAssignTarget(CtfeIrLocalAssign),
@@ -107,8 +115,8 @@ import:
 			CtfeIrValueReference,
 		),
 		CtfeIrStringPart(CtfeIrStringExpr, CtfeIrStringText),
+		CtfeIrTranslateError,
 		ctfe_ir_from_typed_expr,
-		ctfe_ir_from_typed_expr_without_context,
 		ctfe_ir_translate_error_message,
 	../../../src/compiler/stage_07_ctfe/value: ctfe_constructor_info
 	../../../src/lib/source:
@@ -119,6 +127,25 @@ import:
 		source_file,
 		source_span,
 	test: TestSuite
+
+
+private pure func ctfe_test_domain() -> (ModuleTable, ModuleId):
+	singleton_module_table(resolved_module_identity_from_resolver("list", UserModule))
+
+
+private pure func ctfe_test_context() -> CtfeContext:
+	domain = ctfe_test_domain()
+	ctfe_context_empty(domain[0], domain[1])
+
+
+private pure func ctfe_test_module_id() -> ModuleId:
+	ctfe_test_domain()[1]
+
+
+private pure func ctfe_ir_from_typed_expr_without_context(
+	expr: TypedExpr,
+) -> Result[CtfeIrExpr, CtfeIrTranslateError]:
+	ctfe_ir_from_typed_expr(ctfe_test_context(), expr)
 
 
 pure func fixture_source_file() -> SourceFile:
@@ -210,14 +237,7 @@ pure func name_expr_with_call(name: String, call: ResolvedCallInfo) -> TypedExpr
 
 
 pure func constructor_context() -> CtfeContext:
-	{
-		functions = [],
-		imported_functions = [],
-		constructors = [("None", ctfe_constructor_info("Option", 0, None))],
-		module_aliases = [],
-		module_global_envs = [],
-		active_module_path = None
-	}
+	{ ctfe_test_context() | constructors = [("None", ctfe_constructor_info("Option", 0, None))] }
 
 
 pure func is_int_literal(expr: CtfeIrExpr, expected: String) -> Bool:
@@ -446,7 +466,17 @@ func test_translates_field_access_kinds() -> Bool:
 
 
 func test_translates_imported_global_field_access() -> Bool:
-	context = ctfe_context_with_module_alias(CTFE_CONTEXT_EMPTY, "Dep", "dep/math")
+	alias_domain = singleton_module_table(
+		resolved_module_identity_from_resolver(
+			"dep/math",
+			UserModule,
+		),
+	)
+	context = ctfe_context_with_module_alias(
+		ctfe_context_empty(alias_domain[0], alias_domain[1]),
+		"Dep",
+		alias_domain[1],
+	)
 	typed = TypedFieldAccessExpr(
 		name_expr("Dep"),
 		ident("OFFSET"),
@@ -458,7 +488,10 @@ func test_translates_imported_global_field_access() -> Bool:
 		Ok(expr):
 			match expr.desc:
 				CtfeIrImportedGlobalExpr(imported):
-					imported.module_path == "dep/math" and imported.name == "OFFSET"
+					(
+						module_ids_equal(imported.module_id, alias_domain[1])
+						and imported.name == "OFFSET"
+					)
 				_:
 					False
 		Err(_):
@@ -1051,11 +1084,11 @@ func test_translates_call_kinds() -> Bool:
 			match expr.desc:
 				CtfeIrCallExpr(call):
 					match call.kind:
-						CtfeIrImportedCall(direct, module_path):
+						CtfeIrImportedCall(direct, module_id):
 							imported_ok = (
 								direct.callable_id == 9
 								and direct.source_name == "map"
-								and module_path == "list"
+								and module_ids_equal(module_id, ctfe_test_module_id())
 								and call.args.length() == 1
 							)
 						_:
@@ -1157,11 +1190,11 @@ func test_translates_resolved_trait_method_as_imported_call() -> Bool:
 			match expr.desc:
 				CtfeIrCallExpr(ctfe_call):
 					match ctfe_call.kind:
-						CtfeIrImportedCall(direct, module_path):
+						CtfeIrImportedCall(direct, module_id):
 							(
 								direct.callable_id == 17
 								and direct.source_name == "length"
-								and module_path == "list"
+								and module_ids_equal(module_id, ctfe_test_module_id())
 							)
 						_:
 							False

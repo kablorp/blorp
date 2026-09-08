@@ -8,22 +8,38 @@ import:
 		ParsedUnionDecl,
 		ParsedVariantDecl,
 		parsed_identifier,
-	../../../src/compiler/stage_06_typecheck/type_system/semantic_type: TYPE_INT
+	../../../src/compiler/stage_04_modules/loaded_module:
+		ModuleOrigin(UserModule),
+		resolved_module_identity_from_resolver,
+	../../../src/compiler/stage_04_modules/module_table:
+		ModuleId,
+		ModuleTable,
+		module_ids_equal,
+		module_table,
+		module_table_count,
+		module_table_find_id_by_canonical_path,
+		module_tables_are_compatible,
 	../../../src/compiler/stage_06_typecheck/decl:
 		TypedDecl(TypedFunctionDecl, TypedParsedDecl, TypedPrivateDecl, TypedUnionDecl),
 		TypedFunctionInfo,
 		TypedProgram,
 		TypedUnionInfo,
+	../../../src/compiler/stage_06_typecheck/type_system/semantic_type: TYPE_INT
 	../../../src/compiler/stage_07_ctfe/context:
-		CTFE_CONTEXT_EMPTY,
+		CtfeContext,
+		CtfeFunction,
+		CtfeImportBinding(CtfeQualifiedModuleBinding),
+		CtfeImportedProgram,
 		complete_ctfe_imported_program,
 		ctfe_context_constructor_info,
+		ctfe_context_empty,
 		ctfe_context_from_program,
 		ctfe_context_function_by_callable_id,
 		ctfe_context_imported_functions_by_source,
 		ctfe_context_module_alias,
 		ctfe_context_module_global_value,
 		ctfe_context_module_has_global_binding,
+		ctfe_context_module_path,
 		ctfe_context_nullary_constructor_reference,
 		ctfe_context_with_module_global_env,
 	../../../src/compiler/stage_07_ctfe/env: CTFE_ENV_EMPTY, ctfe_bind_global_value
@@ -182,28 +198,246 @@ private pure func generated_function_program(
 	typed_program(decls)
 
 
+private record CtfeModuleIdFixture {
+	table: ModuleTable,
+	target: ModuleId,
+	dependency: ModuleId,
+	foreign_table: ModuleTable,
+	foreign_id: ModuleId
+}
+
+
+private pure func ctfe_module_id_fixture() -> Option[CtfeModuleIdFixture]:
+	target_identity = resolved_module_identity_from_resolver("target", UserModule)
+	dependency_identity = resolved_module_identity_from_resolver("dep", UserModule)
+	other_identity = resolved_module_identity_from_resolver("other", UserModule)
+	foreign_identity = resolved_module_identity_from_resolver("foreign", UserModule)
+	table ?= module_table([
+		target_identity,
+		dependency_identity,
+		other_identity,
+		resolved_module_identity_from_resolver("generated/module", UserModule),
+		resolved_module_identity_from_resolver("list", UserModule),
+		resolved_module_identity_from_resolver("dep/math", UserModule),
+		resolved_module_identity_from_resolver("dep/first", UserModule),
+		resolved_module_identity_from_resolver("dep/second", UserModule),
+		resolved_module_identity_from_resolver("dep/first_value", UserModule),
+		resolved_module_identity_from_resolver("dep/second_value", UserModule),
+	]).to_option()
+	foreign_table ?= module_table([
+		target_identity,
+		dependency_identity,
+		other_identity,
+		foreign_identity,
+	]).to_option()
+	target ?= module_table_find_id_by_canonical_path(table, "target")
+	dependency ?= module_table_find_id_by_canonical_path(table, "dep")
+	foreign_id ?= module_table_find_id_by_canonical_path(foreign_table, "foreign")
+	Some({
+		table = table,
+		target = target,
+		dependency = dependency,
+		foreign_table = foreign_table,
+		foreign_id = foreign_id,
+	})
+
+
+private pure func ctfe_fixture_context(program: TypedProgram) -> Option[CtfeContext]:
+	fixture ?= ctfe_module_id_fixture()
+	ctfe_context_from_program(fixture.table, fixture.target, program, [], [])
+
+
+private pure func ctfe_fixture_imported_context(
+	program: TypedProgram,
+	module_path: String,
+	imported_decls: List[List[TypedDecl]],
+) -> Option[CtfeContext]:
+	match ctfe_module_id_fixture():
+		Some(fixture):
+			match module_table_find_id_by_canonical_path(fixture.table, module_path):
+				Some(module_id):
+					var imported_programs: List[CtfeImportedProgram] = []
+
+					for decls in imported_decls:
+						imported_programs = imported_programs.append(
+							complete_ctfe_imported_program(
+								fixture.table,
+								module_id,
+								decls,
+								[],
+							),
+						)
+
+					ctfe_context_from_program(
+						fixture.table,
+						fixture.target,
+						program,
+						[],
+						imported_programs,
+					)
+				None:
+					None
+		None:
+			None
+
+
+private pure func ctfe_fixture_module_id(
+	context: CtfeContext,
+	module_path: String,
+) -> Option[ModuleId]:
+	module_table_find_id_by_canonical_path(context.module_table, module_path)
+
+
+private pure func ctfe_fixture_imported_functions_by_source(
+	context: CtfeContext,
+	module_path: String,
+	source_name: String,
+) -> List[CtfeFunction]:
+	match ctfe_fixture_module_id(context, module_path):
+		Some(module_id):
+			ctfe_context_imported_functions_by_source(context, module_id, source_name)
+		None:
+			[]
+
+
+private pure func context_uses_one_aligned_module_id_domain() -> Option[Bool]:
+	fixture ?= ctfe_module_id_fixture()
+	generated_module_id ?= module_table_find_id_by_canonical_path(fixture.table, "generated/module")
+	first = complete_ctfe_imported_program(
+		fixture.table,
+		fixture.dependency,
+		[TypedFunctionDecl(typed_function("render", Some(20)))],
+		[],
+	)
+	second = complete_ctfe_imported_program(
+		fixture.table,
+		fixture.dependency,
+		[TypedFunctionDecl(typed_function("render", Some(21)))],
+		[],
+	)
+	context ?= ctfe_context_from_program(
+		fixture.table,
+		fixture.target,
+		typed_program([]),
+		[CtfeQualifiedModuleBinding("Dep", fixture.dependency)],
+		[first, second],
+	)
+	functions = ctfe_context_imported_functions_by_source(context, fixture.dependency, "render")
+	with_value = ctfe_context_with_module_global_env(
+		context,
+		fixture.table,
+		fixture.dependency,
+		ctfe_bind_global_value(CTFE_ENV_EMPTY, "VALUE", int_value(42)),
+	)
+	with_foreign = ctfe_context_with_module_global_env(
+		with_value,
+		fixture.foreign_table,
+		fixture.foreign_id,
+		ctfe_bind_global_value(CTFE_ENV_EMPTY, "VALUE", int_value(99)),
+	)
+
+	alias_matches = match ctfe_context_module_alias(context, "Dep"):
+		Some(module_id):
+			module_ids_equal(module_id, fixture.dependency)
+		None:
+			False
+
+	foreign_value_was_rejected = not ctfe_context_module_has_global_binding(
+		with_foreign,
+		generated_module_id,
+		"VALUE",
+	)
+
+	functions_match = match (functions.get(0), functions.get(1)):
+		(Some(first_function), Some(second_function)):
+			(
+				functions.length() == 2
+				and first_function.info.callable_id == Some(20)
+				and second_function.info.callable_id == Some(21)
+				and module_ids_equal(first_function.module_id, fixture.dependency)
+				and module_ids_equal(second_function.module_id, fixture.dependency)
+			)
+		_:
+			False
+
+	value_matches = match ctfe_context_module_global_value(
+		with_foreign,
+		fixture.dependency,
+		"VALUE",
+	):
+		Some(value):
+			ctfe_values_equal(value, int_value(42))
+		None:
+			False
+
+	Some(
+		(
+			module_tables_are_compatible(context.module_table, fixture.table)
+			and context.module_global_envs.length() == module_table_count(fixture.table)
+			and alias_matches
+			and functions_match
+			and value_matches
+			and foreign_value_was_rejected
+		),
+	)
+
+
+pure func test_context_uses_one_aligned_module_id_domain() -> Bool:
+	context_uses_one_aligned_module_id_domain().get_or(False)
+
+
+private pure func context_rejects_imported_program_from_incompatible_domain() -> Option[Bool]:
+	fixture ?= ctfe_module_id_fixture()
+	foreign_program = complete_ctfe_imported_program(
+		fixture.foreign_table,
+		fixture.foreign_id,
+		[TypedFunctionDecl(typed_function("foreign", Some(30)))],
+		[],
+	)
+
+	Some(
+		ctfe_context_from_program(
+			fixture.table,
+			fixture.target,
+			typed_program([]),
+			[],
+			[foreign_program],
+		).is_none(),
+	)
+
+
+pure func test_context_rejects_imported_program_from_incompatible_domain() -> Bool:
+	context_rejects_imported_program_from_incompatible_domain().get_or(False)
+
+
 private func imported_context_allocation_bytes(
 	function_count: Int,
 	shared_source_name: Bool,
 ) -> Int:
 	imported_program = generated_function_program(function_count, shared_source_name)
 	reset_mem_stats()
-	context = ctfe_context_from_program(
+	context = ctfe_fixture_imported_context(
 		typed_program([]),
-		[complete_ctfe_imported_program("generated/module", imported_program.decls, [])],
+		"generated/module",
+		[imported_program.decls],
 	)
-	group_count: Int = context.imported_functions.length()
-	allocated_bytes: Int = get_mem_stats().bytes_allocated
 
-	expected_group_count: Int = if shared_source_name:
-		1
-	else:
-		function_count
+	match context:
+		Some(value):
+			group_count: Int = value.imported_functions.length()
+			allocated_bytes: Int = get_mem_stats().bytes_allocated
 
-	if group_count == expected_group_count:
-		allocated_bytes
-	else:
-		-1
+			expected_group_count: Int = if shared_source_name:
+				1
+			else:
+				function_count
+
+			if group_count == expected_group_count:
+				allocated_bytes
+			else:
+				-1
+		None:
+			-1
 
 
 func test_context_imported_function_index_has_bounded_allocation_growth() -> Bool:
@@ -239,38 +473,44 @@ func test_context_collects_constructors_and_nullary_refs() -> Bool:
 			),
 		),
 	])
-	context = ctfe_context_from_program(program, [])
 
-	match ctfe_context_nullary_constructor_reference(context, "None"):
-		Some(ref):
-			(
-				ctfe_context_constructor_info(
-					context,
-					"None",
-				).map(
-					func(info): info.arity,
-				) == Some(0)
-				and ctfe_context_constructor_info(
-					context,
-					"Some",
-				).map(
-					func(info): info.arity,
-				) == Some(1)
-				and ref.name == "None"
-				and ref.parent_type == "Maybe"
-				and ref.callable_id == None
-			)
+	match ctfe_fixture_context(program):
+		Some(context):
+			match ctfe_context_nullary_constructor_reference(context, "None"):
+				Some(ref):
+					(
+						ctfe_context_constructor_info(
+							context,
+							"None",
+						).map(
+							func(info): info.arity,
+						) == Some(0)
+						and ctfe_context_constructor_info(
+							context,
+							"Some",
+						).map(
+							func(info): info.arity,
+						) == Some(1)
+						and ref.name == "None"
+						and ref.parent_type == "Maybe"
+						and ref.callable_id == None
+					)
+				None:
+					False
 		None:
 			False
 
 
 func test_context_collects_typed_union_constructor_ids() -> Bool:
 	program = typed_program([TypedUnionDecl(typed_union_info())])
-	context = ctfe_context_from_program(program, [])
 
-	match ctfe_context_constructor_info(context, "Some"):
-		Some(info):
-			info.parent_type == "Maybe" and info.arity == 1 and info.callable_id == Some(42)
+	match ctfe_fixture_context(program):
+		Some(context):
+			match ctfe_context_constructor_info(context, "Some"):
+				Some(info):
+					info.parent_type == "Maybe" and info.arity == 1 and info.callable_id == Some(42)
+				None:
+					False
 		None:
 			False
 
@@ -281,11 +521,14 @@ func test_context_collects_private_union_constructors() -> Bool:
 		fixture_source_span(),
 	)
 	program = typed_program([TypedPrivateDecl(TypedParsedDecl(private_decl))])
-	context = ctfe_context_from_program(program, [])
 
-	match ctfe_context_constructor_info(context, "Ready"):
-		Some(info):
-			info.parent_type == "Status" and info.arity == 0
+	match ctfe_fixture_context(program):
+		Some(context):
+			match ctfe_context_constructor_info(context, "Ready"):
+				Some(info):
+					info.parent_type == "Status" and info.arity == 0
+				None:
+					False
 		None:
 			False
 
@@ -296,16 +539,19 @@ func test_context_collects_functions_by_callable_id() -> Bool:
 		TypedFunctionDecl(typed_function("ignored", None)),
 		TypedPrivateDecl(TypedFunctionDecl(typed_function("hidden", Some(11)))),
 	])
-	context = ctfe_context_from_program(program, [])
 
-	match (
-		ctfe_context_function_by_callable_id(context, 10),
-		ctfe_context_function_by_callable_id(context, 11),
-		ctfe_context_function_by_callable_id(context, 12),
-	):
-		(Some(top), Some(hidden), None):
-			top.source_name == "top" and hidden.source_name == "hidden"
-		_:
+	match ctfe_fixture_context(program):
+		Some(context):
+			match (
+				ctfe_context_function_by_callable_id(context, 10),
+				ctfe_context_function_by_callable_id(context, 11),
+				ctfe_context_function_by_callable_id(context, 12),
+			):
+				(Some(top), Some(hidden), None):
+					top.source_name == "top" and hidden.source_name == "hidden"
+				_:
+					False
+		None:
 			False
 
 
@@ -315,73 +561,84 @@ func test_context_groups_imported_functions_by_module_and_source() -> Bool:
 		TypedFunctionDecl(typed_function("render", Some(21))),
 		TypedFunctionDecl(typed_function("parse", Some(22))),
 	])
-	context = ctfe_context_from_program(
-		typed_program([]),
-		[complete_ctfe_imported_program("dep", imported_program.decls, [])],
-	)
-	render_functions = ctfe_context_imported_functions_by_source(context, "dep", "render")
-	missing_functions = ctfe_context_imported_functions_by_source(context, "other", "render")
-	var first_function_matches: Bool = False
+	context = ctfe_fixture_imported_context(typed_program([]), "dep", [imported_program.decls])
 
-	match render_functions.get(0):
-		Some(ctfe_function):
-			first_function_matches = (
-				ctfe_function.source_name == "render"
-				and ctfe_function.module_path == Some("dep")
+	match context:
+		Some(value):
+			render_functions = ctfe_fixture_imported_functions_by_source(value, "dep", "render")
+			missing_functions = ctfe_fixture_imported_functions_by_source(value, "other", "render")
+
+			first_function_matches = match render_functions.get(0):
+				Some(ctfe_function):
+					(
+						ctfe_function.source_name == "render"
+						and ctfe_context_module_path(value, ctfe_function.module_id) == Some("dep")
+					)
+				None:
+					False
+
+			(
+				render_functions.length() == 2
+				and missing_functions.length() == 0
+				and first_function_matches
 			)
 		None:
-			void
-
-	render_functions.length() == 2 and missing_functions.length() == 0 and first_function_matches
+			False
 
 
 func test_context_groups_private_imported_functions() -> Bool:
 	imported_program = typed_program(
 		[TypedPrivateDecl(TypedFunctionDecl(typed_function("helper", Some(23))))],
 	)
-	context = ctfe_context_from_program(
-		typed_program([]),
-		[complete_ctfe_imported_program("dep", imported_program.decls, [])],
-	)
-	helper_functions = ctfe_context_imported_functions_by_source(context, "dep", "helper")
+	context = ctfe_fixture_imported_context(typed_program([]), "dep", [imported_program.decls])
 
-	match helper_functions.get(0):
-		Some(ctfe_function):
-			helper_functions.length() == 1 and ctfe_function.module_path == Some("dep")
+	match context:
+		Some(value):
+			helper_functions = ctfe_fixture_imported_functions_by_source(value, "dep", "helper")
+
+			match helper_functions.get(0):
+				Some(ctfe_function):
+					(
+						helper_functions.length() == 1
+						and ctfe_context_module_path(value, ctfe_function.module_id) == Some("dep")
+					)
+				None:
+					False
 		None:
 			False
 
 
 func test_context_merges_duplicate_imported_module_groups() -> Bool:
-	context = ctfe_context_from_program(
+	context = ctfe_fixture_imported_context(
 		typed_program([]),
+		"dep",
 		[
-			complete_ctfe_imported_program(
-				"dep",
-				[TypedFunctionDecl(typed_function("render", Some(24)))],
-				[],
-			),
-			complete_ctfe_imported_program(
-				"dep",
-				[TypedFunctionDecl(typed_function("render", Some(25)))],
-				[],
-			),
+			[TypedFunctionDecl(typed_function("render", Some(24)))],
+			[TypedFunctionDecl(typed_function("render", Some(25)))],
 		],
 	)
-	functions = ctfe_context_imported_functions_by_source(context, "dep", "render")
 
-	match (functions.get(0), functions.get(1)):
-		(Some(first), Some(second)):
-			(
-				functions.length() == 2
-				and first.info.callable_id == Some(24)
-				and second.info.callable_id == Some(25)
-			)
-		_:
+	match context:
+		Some(value):
+			functions = ctfe_fixture_imported_functions_by_source(value, "dep", "render")
+
+			match (functions.get(0), functions.get(1)):
+				(Some(first), Some(second)):
+					(
+						functions.length() == 2
+						and first.info.callable_id == Some(24)
+						and second.info.callable_id == Some(25)
+					)
+				_:
+					False
+		None:
 			False
 
 
-func test_context_collects_module_aliases_from_import_blocks() -> Bool:
+private func context_collects_module_aliases_from_import_blocks() -> Option[Bool]:
+	fixture ?= ctfe_module_id_fixture()
+	list_id ?= module_table_find_id_by_canonical_path(fixture.table, "list")
+	math_id ?= module_table_find_id_by_canonical_path(fixture.table, "dep/math")
 	program = typed_program([
 		TypedParsedDecl(
 			ImportBlockParsedDecl(
@@ -390,26 +647,41 @@ func test_context_collects_module_aliases_from_import_blocks() -> Bool:
 			),
 		),
 	])
-	context = ctfe_context_from_program(program, [])
+	context ?= ctfe_context_from_program(
+		fixture.table,
+		fixture.target,
+		program,
+		[CtfeQualifiedModuleBinding("list", list_id), CtfeQualifiedModuleBinding("Math", math_id)],
+		[],
+	)
 
 	default_ok = match ctfe_context_module_alias(context, "list"):
-		Some(module_path):
-			module_path == "list"
+		Some(module_id):
+			module_ids_equal(module_id, list_id)
 		None:
 			False
 
 	explicit_ok = match ctfe_context_module_alias(context, "Math"):
-		Some(module_path):
-			module_path == "dep/math"
+		Some(module_id):
+			module_ids_equal(module_id, math_id)
 		None:
 			False
 
 	missing_ok = ctfe_context_module_alias(context, "dep").is_none()
 
-	default_ok and explicit_ok and missing_ok
+	Some(default_ok and explicit_ok and missing_ok)
 
 
-func test_context_scopes_module_aliases_to_importing_module() -> Bool:
+func test_context_collects_module_aliases_from_import_blocks() -> Bool:
+	context_collects_module_aliases_from_import_blocks().get_or(False)
+
+
+private func context_scopes_module_aliases_to_importing_module() -> Option[Bool]:
+	fixture ?= ctfe_module_id_fixture()
+	first_id ?= module_table_find_id_by_canonical_path(fixture.table, "dep/first")
+	second_id ?= module_table_find_id_by_canonical_path(fixture.table, "dep/second")
+	first_value_id ?= module_table_find_id_by_canonical_path(fixture.table, "dep/first_value")
+	second_value_id ?= module_table_find_id_by_canonical_path(fixture.table, "dep/second_value")
 	first_program = typed_program(
 		[
 			TypedParsedDecl(
@@ -430,49 +702,90 @@ func test_context_scopes_module_aliases_to_importing_module() -> Bool:
 			),
 		],
 	)
-	context = ctfe_context_from_program(
+	context ?= ctfe_context_from_program(
+		fixture.table,
+		fixture.target,
 		typed_program([]),
+		[],
 		[
-			complete_ctfe_imported_program("dep/first", first_program.decls, []),
-			complete_ctfe_imported_program("dep/second", second_program.decls, []),
+			complete_ctfe_imported_program(
+				fixture.table,
+				first_id,
+				first_program.decls,
+				[CtfeQualifiedModuleBinding("Dep", first_value_id)],
+			),
+			complete_ctfe_imported_program(
+				fixture.table,
+				second_id,
+				second_program.decls,
+				[CtfeQualifiedModuleBinding("Dep", second_value_id)],
+			),
 		],
 	)
-	first_context = { context | active_module_path = Some("dep/first") }
-	second_context = { context | active_module_path = Some("dep/second") }
+	first_context = { context | active_module_id = first_id }
+	second_context = { context | active_module_id = second_id }
 
 	first_ok = match ctfe_context_module_alias(first_context, "Dep"):
-		Some(module_path):
-			module_path == "dep/first_value"
+		Some(module_id):
+			module_ids_equal(module_id, first_value_id)
 		None:
 			False
 
 	second_ok = match ctfe_context_module_alias(second_context, "Dep"):
-		Some(module_path):
-			module_path == "dep/second_value"
+		Some(module_id):
+			module_ids_equal(module_id, second_value_id)
 		None:
 			False
 
-	first_ok and second_ok and ctfe_context_module_alias(context, "Dep").is_none()
+	Some(first_ok and second_ok and ctfe_context_module_alias(context, "Dep").is_none())
+
+
+func test_context_scopes_module_aliases_to_importing_module() -> Bool:
+	context_scopes_module_aliases_to_importing_module().get_or(False)
+
+
+private func context_module_global_env_lookup() -> Option[Bool]:
+	fixture ?= ctfe_module_id_fixture()
+	env = ctfe_bind_global_value(CTFE_ENV_EMPTY, "LIMIT", int_value(42))
+	context = ctfe_context_with_module_global_env(
+		ctfe_context_empty(fixture.table, fixture.target),
+		fixture.table,
+		fixture.dependency,
+		env,
+	)
+
+	match ctfe_context_module_global_value(context, fixture.dependency, "LIMIT"):
+		Some(value):
+			Some(
+				(
+					ctfe_values_equal(value, int_value(42))
+					and ctfe_context_module_has_global_binding(context, fixture.dependency, "LIMIT")
+					and not ctfe_context_module_has_global_binding(
+						context,
+						fixture.dependency,
+						"MISSING",
+					)
+				),
+			)
+		None:
+			Some(False)
 
 
 func test_context_module_global_env_lookup() -> Bool:
-	env = ctfe_bind_global_value(CTFE_ENV_EMPTY, "LIMIT", int_value(42))
-	context = ctfe_context_with_module_global_env(CTFE_CONTEXT_EMPTY, "dep", env)
-
-	match ctfe_context_module_global_value(context, "dep", "LIMIT"):
-		Some(value):
-			(
-				ctfe_values_equal(value, int_value(42))
-				and ctfe_context_module_has_global_binding(context, "dep", "LIMIT")
-				and not ctfe_context_module_has_global_binding(context, "dep", "MISSING")
-			)
-		None:
-			False
+	context_module_global_env_lookup().get_or(False)
 
 
 tests: TestSuite = {
 	description = "Compiler CTFE context",
 	tests = [
+		(
+			"context uses one aligned module id domain",
+			test_context_uses_one_aligned_module_id_domain,
+		),
+		(
+			"context rejects imported program from incompatible module domain",
+			test_context_rejects_imported_program_from_incompatible_domain,
+		),
 		(
 			"context collects constructors and nullary refs",
 			test_context_collects_constructors_and_nullary_refs,

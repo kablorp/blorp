@@ -78,7 +78,17 @@ import:
 		resolved_module_identity_from_resolver,
 	../stage_04_modules/module_surface: ModuleSurface, module_surface_for_program
 	../stage_04_modules/module_surface_json: module_surface_to_json
-	../stage_04_modules/module_table: ModuleId, ModuleTable, module_tables_are_compatible
+	../stage_04_modules/module_table:
+		ModuleId,
+		ModuleTable,
+		module_id_table_index,
+		module_ids_equal,
+		module_table_canonical_path,
+		module_table_count,
+		module_table_find_id_by_canonical_path,
+		module_table_resolved_identity,
+		module_tables_are_compatible,
+		singleton_module_table,
 	../stage_07_ctfe/body_dependencies:
 		CtfeBodyDependencyFallback(CtfeMissingCheckedBody, CtfeUnresolvedTraitDispatch),
 	../stage_07_ctfe/body_worklist:
@@ -94,8 +104,10 @@ import:
 		CtfeCheckedBody,
 		ctfe_check_reachable_bodies,
 	../stage_07_ctfe/context:
+		CtfeImportBinding,
 		CtfeImportedProgram,
 		complete_ctfe_imported_program,
+		ctfe_import_bindings_for_module_table,
 		ctfe_imported_program_decls,
 		ctfe_imported_program_import_bindings,
 		selective_ctfe_imported_program,
@@ -166,6 +178,7 @@ import:
 		indexed_graph_definition_index,
 		indexed_graph_error_message,
 		indexed_graph_module_scopes,
+		indexed_graph_module_table,
 		indexed_graph_modules,
 		indexed_graph_select_dependency_scopes,
 		indexed_graph_select_dependency_scopes_by_id,
@@ -177,8 +190,8 @@ import:
 		prepared_module_scope_canonical_path,
 		prepared_module_scope_definition_index,
 		prepared_module_scope_id,
-		prepared_module_scope_identity,
 		prepared_module_scope_module,
+		prepared_module_scope_module_table,
 		prepared_module_scopes_are_compatible,
 		prepared_module_surface,
 	headers/callable_headers:
@@ -234,6 +247,7 @@ import:
 		bound_module_graph_build,
 		bound_module_graph_build_all,
 		bound_module_graph_error_message,
+		bound_module_graph_module_table,
 		bound_module_graph_modules,
 		bound_module_graph_modules_for_prepared,
 		bound_module_graph_target,
@@ -389,7 +403,8 @@ pure func typecheck_graph_request_json(request: TypecheckGraphRequest) -> JsonVa
 -- artifacts remain streamed and are not retained by this graph value.
 private record ReusableCtfeArtifact {
 	imported_program: CtfeImportedProgram,
-	complete_program: TypedProgram
+	complete_program: TypedProgram,
+	import_bindings: List[ImportBinding]
 }
 
 
@@ -414,7 +429,7 @@ enum CtfeEagerFallbackKind:
 
 
 private record PreparedCtfeDependency {
-	module_path: String,
+	module_id: ModuleId,
 	program: PreparedCtfeProgram,
 	body_checks: Int
 }
@@ -431,6 +446,7 @@ private record PreparedCtfeDependencies {
 private record CtfeImportedProgramBuild {
 	program: Option[CtfeImportedProgram],
 	complete_program: Option[TypedProgram],
+	import_bindings: List[ImportBinding],
 	body_checks: Int
 }
 
@@ -447,13 +463,13 @@ private union SelectiveCtfeDependencyPreparation:
 
 
 private record CtfeDependencyOrder {
-	visited_paths: List[String],
+	visited_module_ids: List[Bool],
 	dependencies: List[PreparedModule]
 }
 
 
 private record PreparedTargetImportReachability {
-	importing_module_paths: Dict[String, Bool],
+	importing_module_ids: List[Bool],
 	prelude_imports_target: Bool
 }
 
@@ -483,6 +499,7 @@ private record PreparedTypecheckModule {
 
 
 private record PreparedTypecheckGraph {
+	module_table: ModuleTable,
 	target: PreparedTypecheckModule,
 	modules: List[PreparedTypecheckModule]
 }
@@ -738,10 +755,7 @@ private pure func selected_bound_modules(
 
 
 record TypecheckedModule {
-	path: String,
-	module_name: String,
-	module_path: String,
-	module_identity: ModuleIdentity,
+	module_id: ModuleId,
 	parsed_program: ParsedProgram,
 	module_surface: ModuleSurface,
 	semantic_program: TypedProgram,
@@ -753,7 +767,26 @@ record TypecheckedModule {
 }
 
 
+pure func typechecked_module_path(module: TypecheckedModule) -> String:
+	module.parsed_program.source.path
+
+
+pure func typechecked_module_name(module: TypecheckedModule) -> String:
+	module.parsed_program.source.module_name
+
+
+pure func typechecked_module_identity(
+	module_table: ModuleTable,
+	module: TypecheckedModule,
+) -> Option[ModuleIdentity]:
+	module_table_resolved_identity(
+		module_table,
+		module.module_id,
+	).map(module_identity_from_resolved)
+
+
 record TypecheckedGraph {
+	module_table: ModuleTable,
 	target: TypecheckedModule,
 	modules: List[TypecheckedModule],
 	next_def_id: Int,
@@ -1461,23 +1494,39 @@ private pure func ctfe_imported_program_from_accepted_module(
 	)
 	typed_result = body_run.result
 	body_checks = body_run.metrics.checked_order.length()
+	import_bindings = module_view_import_bindings(typed_result.state.module_view)
 
 	if typed_result.state.errors.length() == 0:
-		{
-			program = Some(
-				complete_ctfe_imported_program(
-					prepared_module_canonical_path(prepared_module_scope_module(scope)),
-					typed_result.program.decls,
-					module_view_import_bindings(typed_result.state.module_view),
-				),
-			),
-			complete_program = Some(typed_result.program),
-			body_checks = body_checks
-		}
+		match ctfe_import_bindings_for_module_table(
+			prepared_module_scope_module_table(scope),
+			import_bindings,
+		):
+			Some(ctfe_import_bindings):
+				{
+					program = Some(
+						complete_ctfe_imported_program(
+							prepared_module_scope_module_table(scope),
+							prepared_module_scope_id(scope),
+							typed_result.program.decls,
+							ctfe_import_bindings,
+						),
+					),
+					complete_program = Some(typed_result.program),
+					import_bindings = import_bindings,
+					body_checks = body_checks
+				}
+			None:
+				{
+					program = None,
+					complete_program = None,
+					import_bindings = import_bindings,
+					body_checks = body_checks
+				}
 	else:
 		{
 			program = None,
 			complete_program = None,
+			import_bindings = import_bindings,
 			body_checks = body_checks
 		}
 
@@ -1548,6 +1597,7 @@ private pure func ctfe_imported_program_from_bound(
 			{
 				program = None,
 				complete_program = None,
+				import_bindings = [],
 				body_checks = 0
 			}
 
@@ -1569,6 +1619,7 @@ private pure func ctfe_imported_program_from_prepared(
 			{
 				program = None,
 				complete_program = None,
+				import_bindings = [],
 				body_checks = 0
 			}
 
@@ -1584,74 +1635,104 @@ private pure func direct_ctfe_dependencies_for_artifact(
 	modules.filter(func(module): import_module_is_explicit_for_ctfe(module, explicit_import_paths))
 
 
+private pure func empty_module_membership(module_table: ModuleTable) -> List[Bool]:
+	False.repeat(module_table_count(module_table))
+
+
 private pure func append_ctfe_dependency_tree(
 	order: CtfeDependencyOrder,
 	dependency: PreparedModule,
 	modules: List[PreparedModule],
+	module_table: ModuleTable,
 ) -> CtfeDependencyOrder:
-	module_path = prepared_module_canonical_path(dependency)
+	match module_table_find_id_by_canonical_path(
+		module_table,
+		prepared_module_canonical_path(dependency),
+	):
+		None:
+			order
+		Some(module_id):
+			module_index = module_id_table_index(module_id)
 
-	if order.visited_paths.contains(module_path):
-		order
-	else:
-		var result = { order | visited_paths = order.visited_paths.append(module_path) }
+			if order.visited_module_ids.get_or(module_index, False):
+				order
+			else:
+				var result = { order |
+					visited_module_ids = order.visited_module_ids.set(module_index, True)
+				}
 
-		for transitive in direct_ctfe_dependencies_for_artifact(dependency, modules):
-			result = append_ctfe_dependency_tree(result, transitive, modules)
+				for transitive in direct_ctfe_dependencies_for_artifact(dependency, modules):
+					result = append_ctfe_dependency_tree(result, transitive, modules, module_table)
 
-		{ result | dependencies = result.dependencies.append(dependency) }
+				{ result | dependencies = result.dependencies.append(dependency) }
 
 
 private pure func append_ctfe_dependencies_for_artifact(
 	order: CtfeDependencyOrder,
 	artifact: PreparedModule,
 	modules: List[PreparedModule],
+	module_table: ModuleTable,
 ) -> CtfeDependencyOrder:
 	var result = order
 
 	if prepared_module_program(artifact).decls.any(parsed_decl_has_ctfe_global_requiring_imports):
 		for dependency in direct_ctfe_dependencies_for_artifact(artifact, modules):
-			result = append_ctfe_dependency_tree(result, dependency, modules)
+			result = append_ctfe_dependency_tree(result, dependency, modules, module_table)
 
 	result
 
 
 private pure func ctfe_dependencies_for_graph(
+	module_table: ModuleTable,
 	target: PreparedModule,
 	modules: List[PreparedModule],
 	selected_modules: List[PreparedModule],
 ) -> List[PreparedModule]:
 	var order: CtfeDependencyOrder = {
-		visited_paths = [],
+		visited_module_ids = empty_module_membership(module_table),
 		dependencies = []
 	}
-	order = append_ctfe_dependencies_for_artifact(order, target, modules)
+	order = append_ctfe_dependencies_for_artifact(order, target, modules, module_table)
 
 	for module in selected_modules:
-		order = append_ctfe_dependencies_for_artifact(order, module, modules)
+		order = append_ctfe_dependencies_for_artifact(order, module, modules, module_table)
 
 	order.dependencies
 
 
 private pure func prepared_ctfe_dependencies_for_artifact(
+	module_table: ModuleTable,
 	artifact: PreparedModule,
 	modules: List[PreparedModule],
 	prepared_dependencies: List[PreparedCtfeDependency],
 ) -> List[PreparedCtfeDependency]:
 	order = append_ctfe_dependencies_for_artifact(
 		{
-			visited_paths = [],
+			visited_module_ids = empty_module_membership(module_table),
 			dependencies = []
 		},
 		artifact,
 		modules,
+		module_table,
 	)
-	dependency_paths = order.dependencies.map(
-		func(dependency): prepared_module_canonical_path(dependency),
-	)
+	var dependency_membership = empty_module_membership(module_table)
 
-	prepared_dependencies.filter(
-		func(dependency): dependency_paths.contains(dependency.module_path),
+	for dependency in order.dependencies:
+		match module_table_find_id_by_canonical_path(
+			module_table,
+			prepared_module_canonical_path(dependency),
+		):
+			Some(module_id):
+				dependency_membership = dependency_membership.set(
+					module_id_table_index(module_id),
+					True,
+				)
+			None:
+				void
+
+	membership = dependency_membership
+	prepared_dependencies.filter(func(dependency):
+		membership.get_or(module_id_table_index(dependency.module_id), False)
 	)
 
 
@@ -1702,6 +1783,7 @@ private pure func prepared_module_import_identity_index(
 private pure func prepared_target_import_reachability(
 	modules: List[PreparedModule],
 	target: PreparedModule,
+	module_table: ModuleTable,
 ) -> PreparedTargetImportReachability:
 	module_indices_by_import_path = prepared_module_import_identity_index(modules)
 	target_indices_by_import_path = prepared_module_import_identity_index([target])
@@ -1773,16 +1855,23 @@ private pure func prepared_target_import_reachability(
 
 		pending_index += 1
 
-	var importing_module_paths: Dict[String, Bool] = {}
+	var importing_module_ids = empty_module_membership(module_table)
 	var prelude_imports_target: Bool = False
 	module_index = 0
 
 	for module in modules:
 		if imports_target.get_or(module_index, False):
-			importing_module_paths = importing_module_paths.set(
+			match module_table_find_id_by_canonical_path(
+				module_table,
 				prepared_module_canonical_path(module),
-				True,
-			)
+			):
+				Some(module_id):
+					importing_module_ids = importing_module_ids.set(
+						module_id_table_index(module_id),
+						True,
+					)
+				None:
+					void
 
 			if prepared_module_is_prelude(module):
 				prelude_imports_target = True
@@ -1790,31 +1879,38 @@ private pure func prepared_target_import_reachability(
 		module_index += 1
 
 	{
-		importing_module_paths = importing_module_paths,
+		importing_module_ids = importing_module_ids,
 		prelude_imports_target = prelude_imports_target
 	}
 
 
-private pure func prepared_reusable_artifact_path_index(
+private pure func prepared_reusable_artifact_id_membership(
 	target_scope: PreparedModuleScope,
 	artifact_modules: List[PreparedModule],
 	reusable_artifact_paths: List[String],
-) -> Dict[String, Bool]:
-	var reusable_paths: Dict[String, Bool] = {}
+) -> List[Bool]:
+	module_table = prepared_module_scope_module_table(target_scope)
+	var reusable_module_ids = empty_module_membership(module_table)
 	target = prepared_module_scope_module(target_scope)
 
 	if (
 		reusable_artifact_paths.length() > 0
 		and not prepared_module_is_ambient_typecheck_module(target)
 	):
-		reachability = prepared_target_import_reachability(artifact_modules, target)
+		reachability = prepared_target_import_reachability(artifact_modules, target, module_table)
 
 		if not reachability.prelude_imports_target:
 			for module_path in reusable_artifact_paths:
-				if not reachability.importing_module_paths.contains(module_path):
-					reusable_paths = reusable_paths.set(module_path, True)
+				match module_table_find_id_by_canonical_path(module_table, module_path):
+					Some(module_id):
+						module_index = module_id_table_index(module_id)
 
-	reusable_paths
+						if not reachability.importing_module_ids.get_or(module_index, False):
+							reusable_module_ids = reusable_module_ids.set(module_index, True)
+					None:
+						void
+
+	reusable_module_ids
 
 
 private pure func ctfe_only_program_from_imported(
@@ -1830,7 +1926,7 @@ private pure func ctfe_only_program_from_imported(
 private pure func prepare_ctfe_dependency_program(
 	target_scope: PreparedModuleScope,
 	dependency: BoundModule,
-	reusable_artifact_paths: Dict[String, Bool],
+	reusable_artifact_ids: List[Bool],
 	allow_debug_only_calls: Bool,
 	accepted_graph: BodyTypecheckGraph,
 ) -> PreparedCtfeProgramBuild:
@@ -1843,8 +1939,9 @@ private pure func prepare_ctfe_dependency_program(
 				body_checks = 0
 			}
 		True:
-			can_try_artifact_environment = reusable_artifact_paths.contains(
-				prepared_module_canonical_path(prepared_module_scope_module(dependency_scope)),
+			can_try_artifact_environment = reusable_artifact_ids.get_or(
+				module_id_table_index(prepared_module_scope_id(dependency_scope)),
+				False,
 			)
 
 			if can_try_artifact_environment:
@@ -1862,6 +1959,7 @@ private pure func prepare_ctfe_dependency_program(
 									program = ReusableCtfeProgram({
 										imported_program = program,
 										complete_program = complete_program,
+										import_bindings = artifact_build.import_bindings,
 									}),
 									body_checks = artifact_build.body_checks
 								}
@@ -1920,7 +2018,7 @@ private pure func ctfe_body_module_registries(
 	match accepted_graph_typecheck_module(graph, target_scope, allow_debug_only_calls):
 		Some(module):
 			registries = registries.append({
-				module_path = prepared_module_scope_canonical_path(target_scope),
+				module_id = prepared_module_scope_id(target_scope),
 				registry = accepted_typecheck_module_body_registry(module),
 			})
 		None:
@@ -1935,7 +2033,7 @@ private pure func ctfe_body_module_registries(
 			):
 				Some(module):
 					registries = registries.append({
-						module_path = bound_module_canonical_path(dependency),
+						module_id = prepared_module_scope_id(bound_module_scope(dependency)),
 						registry = accepted_typecheck_module_body_registry(module),
 					})
 				None:
@@ -1972,11 +2070,11 @@ private pure func ctfe_eager_fallback_for_worklist(
 			CtfeQueueInvariantFallback
 
 
-private pure func ctfe_registry_module_path_for_definition(
+private pure func ctfe_registry_module_id_for_definition(
 	registries: List[CtfeBodyModuleRegistry],
 	definition_id: Int,
-) -> Option[String]:
-	var result: Option[String] = None
+) -> Option[ModuleId]:
+	var result: Option[ModuleId] = None
 
 	for registration in registries:
 		if (
@@ -1986,27 +2084,27 @@ private pure func ctfe_registry_module_path_for_definition(
 				definition_id,
 			).is_some()
 		):
-			result = Some(registration.module_path)
+			result = Some(registration.module_id)
 
 	result
 
 
 private pure func ctfe_attempted_body_checks(
-	target_module_path: String,
+	target_module_id: ModuleId,
 	registries: List[CtfeBodyModuleRegistry],
 	checked: List[CtfeCheckedBody],
 	fallback: CtfeBodyWorklistFallback,
 	checked_body_count: Int,
 ) -> CtfeAttemptedBodyChecks:
 	var target_checks = checked
-		.filter(func(body): body.module_path == target_module_path)
+		.filter(func(body): module_ids_equal(body.module_id, target_module_id))
 		.length()
 
 	match fallback:
 		CtfeRejectedBody(definition_id):
-			match ctfe_registry_module_path_for_definition(registries, definition_id):
-				Some(module_path):
-					if module_path == target_module_path:
+			match ctfe_registry_module_id_for_definition(registries, definition_id):
+				Some(module_id):
+					if module_ids_equal(module_id, target_module_id):
 						target_checks += 1
 				None:
 					void
@@ -2030,12 +2128,12 @@ private pure func prepare_selective_ctfe_dependencies_for_roots(
 		None:
 			SelectiveCtfeDependenciesRequireEager(CtfePreparationFailureFallback, 0, 0)
 		Some(registries):
-			target_module_path = prepared_module_scope_canonical_path(target_scope)
+			target_module_id = prepared_module_scope_id(target_scope)
 
 			match ctfe_check_reachable_bodies(root_definition_ids, registries):
 				CtfeBodyWorklistRequiresEager(fallback, checked, metrics):
 					attempted = ctfe_attempted_body_checks(
-						target_module_path,
+						target_module_id,
 						registries,
 						checked,
 						fallback,
@@ -2050,7 +2148,7 @@ private pure func prepare_selective_ctfe_dependencies_for_roots(
 					var prepared: List[PreparedCtfeDependency] = []
 					var failed: Bool = False
 					target_outcomes = checked
-						.filter(func(body): body.module_path == target_module_path)
+						.filter(func(body): module_ids_equal(body.module_id, target_module_id))
 						.map(func(body): body.outcome)
 
 					target_seed_outcomes: Option[List[BodyCheckOutcome]] = if target_outcomes.is_empty():
@@ -2059,12 +2157,12 @@ private pure func prepare_selective_ctfe_dependencies_for_roots(
 						Some(target_outcomes)
 
 					for dependency in dependencies:
-						module_path = bound_module_canonical_path(dependency)
+						module_id = prepared_module_scope_id(bound_module_scope(dependency))
 						registration = registries.find(
-							func(candidate): candidate.module_path == module_path,
+							func(candidate): module_ids_equal(candidate.module_id, module_id),
 						)
 						outcomes = checked
-							.filter(func(body): body.module_path == module_path)
+							.filter(func(body): module_ids_equal(body.module_id, module_id))
 							.map(func(body): body.outcome)
 
 						match registration:
@@ -2083,19 +2181,31 @@ private pure func prepare_selective_ctfe_dependencies_for_roots(
 										else:
 											Some(outcomes)
 
-										prepared = prepared.append({
-											module_path = module_path,
-											program = SelectiveCtfeProgram(
-												selective_ctfe_imported_program(
-													module_path,
-													body_subset_program_decls(subset),
-													outcomes.map(body_check_outcome_typed_function),
-													body_subset_program_import_bindings(subset),
-												),
-												seed_outcomes,
-											),
-											body_checks = outcomes.length(),
-										})
+										match ctfe_import_bindings_for_module_table(
+											prepared_module_scope_module_table(target_scope),
+											body_subset_program_import_bindings(subset),
+										):
+											None:
+												failed = True
+											Some(import_bindings):
+												prepared = prepared.append({
+													module_id = module_id,
+													program = SelectiveCtfeProgram(
+														selective_ctfe_imported_program(
+															prepared_module_scope_module_table(
+																target_scope,
+															),
+															module_id,
+															body_subset_program_decls(subset),
+															outcomes.map(
+																body_check_outcome_typed_function,
+															),
+															import_bindings,
+														),
+														seed_outcomes,
+													),
+													body_checks = outcomes.length(),
+												})
 
 						if failed:
 							break
@@ -2180,7 +2290,7 @@ private pure func prepare_ctfe_dependencies(
 							eager_fallback = CtfeNoEagerFallback
 						}
 					SelectiveCtfeDependenciesRequireEager(fallback, attempted_dependency_checks, attempted_target_checks):
-						reusable_artifact_path_index = prepared_reusable_artifact_path_index(
+						reusable_artifact_ids = prepared_reusable_artifact_id_membership(
 							target_scope,
 							artifact_modules,
 							reusable_artifact_paths,
@@ -2189,12 +2299,14 @@ private pure func prepare_ctfe_dependencies(
 							build = prepare_ctfe_dependency_program(
 								target_scope,
 								dependency,
-								reusable_artifact_path_index,
+								reusable_artifact_ids,
 								allow_debug_only_calls,
 								accepted_graph,
 							)
 							{
-								module_path = bound_module_canonical_path(dependency),
+								module_id = prepared_module_scope_id(
+									bound_module_scope(dependency),
+								),
 								program = build.program,
 								body_checks = build.body_checks
 							}
@@ -2209,7 +2321,7 @@ private pure func prepare_ctfe_dependencies(
 							eager_fallback = fallback
 						}
 			RecoverableBodyTypecheckGraph(_):
-				reusable_artifact_path_index = prepared_reusable_artifact_path_index(
+				reusable_artifact_ids = prepared_reusable_artifact_id_membership(
 					target_scope,
 					artifact_modules,
 					reusable_artifact_paths,
@@ -2219,12 +2331,12 @@ private pure func prepare_ctfe_dependencies(
 					build = prepare_ctfe_dependency_program(
 						target_scope,
 						dependency,
-						reusable_artifact_path_index,
+						reusable_artifact_ids,
 						allow_debug_only_calls,
 						accepted_graph,
 					)
 					{
-						module_path = bound_module_canonical_path(dependency),
+						module_id = prepared_module_scope_id(bound_module_scope(dependency)),
 						program = build.program,
 						body_checks = build.body_checks
 					}
@@ -2282,7 +2394,7 @@ private func prepare_ctfe_dependencies_with_trace(
 	inventory: (String, String) -> Void,
 ) -> List[PreparedCtfeDependency]:
 	var result: List[PreparedCtfeDependency] = []
-	reusable_artifact_path_index = prepared_reusable_artifact_path_index(
+	reusable_artifact_ids = prepared_reusable_artifact_id_membership(
 		target_scope,
 		artifact_modules,
 		reusable_artifact_paths,
@@ -2294,7 +2406,7 @@ private func prepare_ctfe_dependencies_with_trace(
 		prepared_build = prepare_ctfe_dependency_program(
 			target_scope,
 			dependency,
-			reusable_artifact_path_index,
+			reusable_artifact_ids,
 			allow_debug_only_calls,
 			accepted_graph,
 		)
@@ -2360,7 +2472,7 @@ private func prepare_ctfe_dependencies_with_trace(
 					)
 
 		result = result.append({
-			module_path = module_path,
+			module_id = prepared_module_scope_id(bound_module_scope(dependency)),
 			program = prepared_program,
 			body_checks = prepared_build.body_checks,
 		})
@@ -2453,9 +2565,11 @@ private pure func ctfe_imported_programs_for_artifact(
 
 private pure func ctfe_body_outcomes_for_module(
 	ctfe_dependencies: List[PreparedCtfeDependency],
-	module_path: String,
+	module_id: ModuleId,
 ) -> Option[List[BodyCheckOutcome]]:
-	match ctfe_dependencies.find(func(dependency): dependency.module_path == module_path):
+	match ctfe_dependencies.find(
+		func(dependency): module_ids_equal(dependency.module_id, module_id),
+	):
 		Some(dependency):
 			match dependency.program:
 				SelectiveCtfeProgram(_, outcomes):
@@ -2468,12 +2582,12 @@ private pure func ctfe_body_outcomes_for_module(
 
 private pure func reusable_ctfe_program_for_module(
 	ctfe_dependencies: List[PreparedCtfeDependency],
-	module_path: String,
+	module_id: ModuleId,
 ) -> Option[ReusableCtfeArtifact]:
 	var result: Option[ReusableCtfeArtifact] = None
 
 	for dependency in ctfe_dependencies:
-		if dependency.module_path == module_path:
+		if module_ids_equal(dependency.module_id, module_id):
 			match dependency.program:
 				ReusableCtfeProgram(program):
 					result = Some(program)
@@ -2501,6 +2615,8 @@ private pure func typecheck_ctfe_status_name(evaluated: Bool) -> String:
 
 
 private pure func evaluated_typecheck_artifact(
+	module_table: ModuleTable,
+	target_module_id: ModuleId,
 	program: TypedProgram,
 	errors: List[String],
 	diagnostics: List[TypecheckDiagnostic],
@@ -2516,10 +2632,28 @@ private pure func evaluated_typecheck_artifact(
 			import_bindings = import_bindings,
 			status = TypecheckCtfeNotRun
 		}
+	else if not typed_program_has_ctfe_globals(program):
+		{
+			semantic_program = program,
+			program = program,
+			errors = errors,
+			diagnostics = diagnostics,
+			import_bindings = import_bindings,
+			status = TypecheckCtfeEvaluated
+		}
 	else:
-		match imported_programs:
-			Some(programs):
-				match ctfe_evaluate_program_globals(program, programs, import_bindings):
+		match (
+			imported_programs,
+			ctfe_import_bindings_for_module_table(module_table, import_bindings),
+		):
+			(Some(programs), Some(ctfe_import_bindings)):
+				match ctfe_evaluate_program_globals(
+					module_table,
+					target_module_id,
+					program,
+					programs,
+					ctfe_import_bindings,
+				):
 					Ok(evaluated_program):
 						{
 							semantic_program = program,
@@ -2539,7 +2673,7 @@ private pure func evaluated_typecheck_artifact(
 							diagnostics = diagnostics.append(typecheck_diagnostic(message, None)),
 							import_bindings = import_bindings
 						}
-			None:
+			_:
 				message = "compile-time evaluation could not resolve all imported modules"
 				{
 					semantic_program = program,
@@ -2552,10 +2686,13 @@ private pure func evaluated_typecheck_artifact(
 
 
 private pure func typecheck_ctfe_artifact(
+	scope: PreparedModuleScope,
 	typed_result: TypecheckProgramResult,
 	imported_programs: Option[List[CtfeImportedProgram]],
 ) -> TypecheckCtfeArtifact:
 	evaluated_typecheck_artifact(
+		prepared_module_scope_module_table(scope),
+		prepared_module_scope_id(scope),
 		typed_result.program,
 		typed_result.state.errors,
 		typed_result.state.diagnostics,
@@ -2570,15 +2707,8 @@ private pure func typechecked_module_from_ctfe_artifact(
 	ctfe_artifact: TypecheckCtfeArtifact,
 ) -> TypecheckedModule:
 	prepared = prepared_module_scope_module(scope)
-	resolved_identity = resolved_module_identity_from_resolver(
-		prepared_module_canonical_path(prepared),
-		prepared_module_origin(prepared),
-	)
 	{
-		path = prepared_module_program(prepared).source.path,
-		module_name = prepared_module_program(prepared).source.module_name,
-		module_path = prepared_module_canonical_path(prepared),
-		module_identity = module_identity_from_resolved(resolved_identity),
+		module_id = prepared_module_scope_id(scope),
 		parsed_program = prepared_module_program(prepared),
 		module_surface = module_surface,
 		semantic_program = ctfe_artifact.semantic_program,
@@ -2671,7 +2801,7 @@ private pure func typechecked_prepared_module(
 		typed_program_has_ctfe_globals(typed_result.program),
 		ctfe_dependencies,
 	)
-	ctfe_artifact = typecheck_ctfe_artifact(typed_result, imported_programs)
+	ctfe_artifact = typecheck_ctfe_artifact(scope, typed_result, imported_programs)
 
 	typechecked_module_from_ctfe_artifact(scope, module_surface, ctfe_artifact)
 
@@ -2698,7 +2828,7 @@ private pure func typechecked_prepared_module_with_seeded_bodies(
 		typed_program_has_ctfe_globals(typed_result.program),
 		ctfe_dependencies,
 	)
-	ctfe_artifact = typecheck_ctfe_artifact(typed_result, imported_programs)
+	ctfe_artifact = typecheck_ctfe_artifact(scope, typed_result, imported_programs)
 
 	{
 		module = typechecked_module_from_ctfe_artifact(scope, module_surface, ctfe_artifact),
@@ -2727,7 +2857,7 @@ private pure func typechecked_prepared_module_with_ownership(
 		typed_program_has_ctfe_globals(typed_result.program),
 		ctfe_dependencies,
 	)
-	ctfe_artifact = typecheck_ctfe_artifact(typed_result, imported_programs)
+	ctfe_artifact = typecheck_ctfe_artifact(scope, typed_result, imported_programs)
 	after_ctfe_unique = typed_program_is_unique(ctfe_artifact.program)
 	typechecked = typechecked_module_from_ctfe_artifact(scope, module_surface, ctfe_artifact)
 
@@ -2786,7 +2916,7 @@ private func typechecked_prepared_module_with_ownership_and_trace(
 		typed_program_has_ctfe_globals(typed_result.program),
 		ctfe_dependencies,
 	)
-	ctfe_artifact = typecheck_ctfe_artifact(typed_result, imported_programs)
+	ctfe_artifact = typecheck_ctfe_artifact(scope, typed_result, imported_programs)
 	after_ctfe_unique = typed_program_is_unique(ctfe_artifact.program)
 	typechecked = typechecked_module_from_ctfe_artifact(scope, module_surface, ctfe_artifact)
 
@@ -2816,37 +2946,59 @@ private pure func typechecked_reusable_ctfe_module(
 		Some([])
 
 	ctfe_artifact = evaluated_typecheck_artifact(
+		prepared_module_scope_module_table(scope),
+		prepared_module_scope_id(scope),
 		artifact.complete_program,
 		[],
 		[],
-		ctfe_imported_program_import_bindings(imported_program),
+		artifact.import_bindings,
 		imported_programs,
 	)
 
 	typechecked_module_from_ctfe_artifact(scope, module_surface, ctfe_artifact)
 
 
+private pure func typechecked_module_artifact_from_fields(
+	program: ParsedProgram,
+	typed_program: TypedProgram,
+	module_surface: ModuleSurface,
+	errors: List[String],
+	import_bindings: List[ImportBinding],
+	ctfe_evaluated: Bool,
+	include_comments: Bool,
+) -> JsonValue:
+	var fields: List[(String, JsonValue)] = [
+		("path", JsonString(program.source.path)),
+		("module", JsonString(program.source.module_name)),
+		("ast_phase", JsonString(parsed_program_phase_name(TypecheckSourceProgram))),
+		("typed_program", typed_program_to_json(typed_program)),
+		("ctfe_status", JsonString(typecheck_ctfe_status_name(ctfe_evaluated))),
+		("type_errors", JsonVector(errors.map(
+				pure func(item: String): JsonString(item),
+			))),
+		("import_bindings", JsonVector(import_bindings.map(import_binding_to_json))),
+		("module_surface", module_surface_to_json(module_surface)),
+	]
+
+	if include_comments:
+		fields = fields.append(("comments", source_comment_jsons(program.source)))
+
+	JsonObject(fields)
+
+
 private pure func typechecked_module_artifact(
 	module: TypecheckedModule,
 	include_comments: Bool,
 ) -> JsonValue:
-	var fields: List[(String, JsonValue)] = [
-		("path", JsonString(module.path)),
-		("module", JsonString(module.module_name)),
-		("ast_phase", JsonString(parsed_program_phase_name(TypecheckSourceProgram))),
-		("typed_program", typed_program_to_json(module.typed_program)),
-		("ctfe_status", JsonString(typecheck_ctfe_status_name(module.ctfe_evaluated))),
-		("type_errors", JsonVector(module.errors.map(
-				pure func(item: String): JsonString(item),
-			))),
-		("import_bindings", JsonVector(module.import_bindings.map(import_binding_to_json))),
-		("module_surface", module_surface_to_json(module.module_surface)),
-	]
-
-	if include_comments:
-		fields = fields.append(("comments", source_comment_jsons(module.parsed_program.source)))
-
-	JsonObject(fields)
+	typechecked_module_artifact_from_fields(
+		module.parsed_program,
+		module.typed_program,
+		module.module_surface,
+		module.errors,
+		module.import_bindings,
+		module.ctfe_evaluated,
+		include_comments,
+	)
 
 
 private func emit_json_string_list(
@@ -2885,80 +3037,102 @@ private func emit_import_bindings(
 	emit("]")
 
 
+private func emit_typechecked_module_artifact_field_chunks(
+	program: ParsedProgram,
+	typed_program: TypedProgram,
+	module_surface: ModuleSurface,
+	errors: List[String],
+	import_bindings: List[ImportBinding],
+	ctfe_evaluated: Bool,
+	include_comments: Bool,
+	emit: (String) -> Void,
+) -> Void:
+	emit("{\"path\":")
+	emit_json_chunks(JsonString(program.source.path), emit)
+	emit(",\"module\":")
+	emit_json_chunks(JsonString(program.source.module_name), emit)
+	emit(",\"ast_phase\":")
+	emit_json_chunks(JsonString(parsed_program_phase_name(TypecheckSourceProgram)), emit)
+	emit(",\"typed_program\":")
+	emit_compiler_typed_program_json_chunks(typed_program, emit)
+	emit(",\"ctfe_status\":")
+	emit_json_chunks(JsonString(typecheck_ctfe_status_name(ctfe_evaluated)), emit)
+	emit(",\"type_errors\":")
+	emit_json_string_list(errors, emit)
+	emit(",\"import_bindings\":")
+	emit_import_bindings(import_bindings, emit)
+	emit(",\"module_surface\":")
+	emit_json_chunks(module_surface_to_json(module_surface), emit)
+
+	if include_comments:
+		emit(",\"comments\":")
+		emit_json_chunks(source_comment_jsons(program.source), emit)
+
+	emit("}")
+
+
 private func emit_typechecked_module_artifact_chunks(
 	module: TypecheckedModule,
 	include_comments: Bool,
 	emit: (String) -> Void,
 ) -> Void:
-	emit("{\"path\":")
-	emit_json_chunks(JsonString(module.path), emit)
-	emit(",\"module\":")
-	emit_json_chunks(JsonString(module.module_name), emit)
-	emit(",\"ast_phase\":")
-	emit_json_chunks(JsonString(parsed_program_phase_name(TypecheckSourceProgram)), emit)
-	emit(",\"typed_program\":")
-	emit_compiler_typed_program_json_chunks(module.typed_program, emit)
-	emit(",\"ctfe_status\":")
-	emit_json_chunks(JsonString(typecheck_ctfe_status_name(module.ctfe_evaluated)), emit)
-	emit(",\"type_errors\":")
-	emit_json_string_list(module.errors, emit)
-	emit(",\"import_bindings\":")
-	emit_import_bindings(module.import_bindings, emit)
-	emit(",\"module_surface\":")
-	emit_json_chunks(module_surface_to_json(module.module_surface), emit)
-
-	if include_comments:
-		emit(",\"comments\":")
-		emit_json_chunks(source_comment_jsons(module.parsed_program.source), emit)
-
-	emit("}")
+	emit_typechecked_module_artifact_field_chunks(
+		module.parsed_program,
+		module.typed_program,
+		module.module_surface,
+		module.errors,
+		module.import_bindings,
+		module.ctfe_evaluated,
+		include_comments,
+		emit,
+	)
 
 
-private pure func typechecked_rejected_module_with_diagnostics(
+private pure func rejected_typed_program(target: RejectedTypecheckTarget) -> TypedProgram:
+	program = rejected_target_program(target)
+	{
+		source = program.source,
+		decls = [],
+		diagnostics = program.diagnostics,
+		type_definitions = [],
+		type_references = []
+	}
+
+
+private pure func typechecked_rejected_module_with_id(
 	target: RejectedTypecheckTarget,
+	module_id: ModuleId,
 	diagnostics: List[TypecheckDiagnostic],
 ) -> TypecheckedModule:
 	program = rejected_target_program(target)
-	errors = diagnostics.map(func(diagnostic): diagnostic.message)
-	resolved_identity = resolved_module_identity_from_resolver(
-		rejected_target_path(target),
-		rejected_target_origin(target),
-	)
+	typed_program = rejected_typed_program(target)
 	{
-		path = program.source.path,
-		module_name = program.source.module_name,
-		module_path = rejected_target_path(target),
-		module_identity = module_identity_from_resolved(resolved_identity),
+		module_id = module_id,
 		parsed_program = program,
 		module_surface = module_surface_for_program(program),
-		semantic_program = {
-			source = program.source,
-			decls = [],
-			diagnostics = program.diagnostics,
-			type_definitions = [],
-			type_references = []
-		},
-		typed_program = {
-			source = program.source,
-			decls = [],
-			diagnostics = program.diagnostics,
-			type_definitions = [],
-			type_references = []
-		},
-		errors = errors,
+		semantic_program = typed_program,
+		typed_program = typed_program,
+		errors = diagnostics.map(func(diagnostic): diagnostic.message),
 		diagnostics = diagnostics,
 		import_bindings = [],
 		ctfe_evaluated = False
 	}
 
 
-private pure func typechecked_rejected_module(
+private pure func typechecked_rejected_module_artifact(
 	target: RejectedTypecheckTarget,
-	errors: List[String],
-) -> TypecheckedModule:
-	typechecked_rejected_module_with_diagnostics(
-		target,
-		typecheck_diagnostics_from_messages(errors),
+	diagnostics: List[TypecheckDiagnostic],
+	include_comments: Bool,
+) -> JsonValue:
+	program = rejected_target_program(target)
+	typechecked_module_artifact_from_fields(
+		program,
+		rejected_typed_program(target),
+		module_surface_for_program(program),
+		diagnostics.map(func(diagnostic): diagnostic.message),
+		[],
+		False,
+		include_comments,
 	)
 
 
@@ -2967,8 +3141,14 @@ private pure func rejected_typechecked_graph(
 	diagnostics: List[TypecheckDiagnostic],
 ) -> TypecheckedGraph:
 	seed = definition_index_initial_seed(ENV_EMPTY)
+	identity = resolved_module_identity_from_resolver(
+		rejected_target_path(target),
+		rejected_target_origin(target),
+	)
+	(module_table, module_id) = singleton_module_table(identity)
 	{
-		target = typechecked_rejected_module_with_diagnostics(target, diagnostics),
+		module_table = module_table,
+		target = typechecked_rejected_module_with_id(target, module_id, diagnostics),
 		modules = [],
 		next_def_id = definition_index_seed_next_def_id(seed),
 		analysis_context = None
@@ -3005,14 +3185,13 @@ private pure func typed_source_artifact(
 
 	match indexed_result:
 		Err(errors):
-			typechecked_module_artifact(
-				typechecked_rejected_module(
-					RejectedCandidateTarget(module_candidate),
-					indexed_graph_error_messages(errors),
-				),
+			typechecked_rejected_module_artifact(
+				RejectedCandidateTarget(module_candidate),
+				typecheck_diagnostics_from_messages(indexed_graph_error_messages(errors)),
 				include_comments,
 			)
 		Ok(indexed_graph):
+			module_table = indexed_graph_module_table(indexed_graph)
 			module_scope = indexed_graph_target_scope(indexed_graph)
 			module = prepared_module_scope_module(module_scope)
 			prepared_imports = indexed_graph_modules(indexed_graph)
@@ -3022,11 +3201,12 @@ private pure func typed_source_artifact(
 			binding_importable_index = importable_module_graph_all_index(importable_graph)
 			ctfe_dependency_plan = append_ctfe_dependencies_for_artifact(
 				{
-					visited_paths = [],
+					visited_module_ids = empty_module_membership(module_table),
 					dependencies = []
 				},
 				module,
 				prepared_imports,
+				module_table,
 			).dependencies
 			binding_module_paths = append_unique_binding_module_paths([], prepared_imports)
 
@@ -3042,9 +3222,9 @@ private pure func typed_source_artifact(
 
 			match binding_result:
 				Err(errors):
-					typechecked_module_artifact(
-						typechecked_rejected_module(
-							RejectedPreparedTarget(module),
+					typechecked_rejected_module_artifact(
+						RejectedPreparedTarget(module),
+						typecheck_diagnostics_from_messages(
 							bound_module_graph_error_messages(errors),
 						),
 						include_comments,
@@ -3052,11 +3232,9 @@ private pure func typed_source_artifact(
 				Ok(bound_graph):
 					match validated_implementation_headers(bound_graph):
 						Err(errors):
-							typechecked_module_artifact(
-								typechecked_rejected_module_with_diagnostics(
-									RejectedPreparedTarget(module),
-									errors,
-								),
+							typechecked_rejected_module_artifact(
+								RejectedPreparedTarget(module),
+								errors,
 								include_comments,
 							)
 						Ok(implementation_headers):
@@ -3066,21 +3244,15 @@ private pure func typed_source_artifact(
 								allow_debug_only_calls,
 							):
 								TypecheckGraphCompletionRejected(completion_errors):
-									typechecked_module_artifact(
-										typechecked_rejected_module(
-											RejectedPreparedTarget(module),
-											completion_errors,
-										),
+									typechecked_rejected_module_artifact(
+										RejectedPreparedTarget(module),
+										typecheck_diagnostics_from_messages(completion_errors),
 										include_comments,
 									)
 								TypecheckGraphRecoverable(recoverable_graph):
-									typechecked_module_artifact(
-										typechecked_rejected_module_with_diagnostics(
-											RejectedPreparedTarget(module),
-											recoverable_typecheck_graph_diagnostics(
-												recoverable_graph,
-											),
-										),
+									typechecked_rejected_module_artifact(
+										RejectedPreparedTarget(module),
+										recoverable_typecheck_graph_diagnostics(recoverable_graph),
 										include_comments,
 									)
 								TypecheckGraphAccepted(accepted_graph):
@@ -3096,9 +3268,9 @@ private pure func typed_source_artifact(
 
 									match ctfe_result:
 										Err(errors):
-											typechecked_module_artifact(
-												typechecked_rejected_module(
-													RejectedPreparedTarget(module),
+											typechecked_rejected_module_artifact(
+												RejectedPreparedTarget(module),
+												typecheck_diagnostics_from_messages(
 													bound_module_graph_error_messages(errors),
 												),
 												include_comments,
@@ -3186,6 +3358,7 @@ private pure func typechecked_graph_module(
 	module_scope = bound_module_scope(bound_module)
 	module = prepared_module_scope_module(module_scope)
 	module_ctfe_dependencies = prepared_ctfe_dependencies_for_artifact(
+		prepared_module_scope_module_table(module_scope),
 		module,
 		prepared.context.all_modules,
 		prepared.context.ctfe_dependencies,
@@ -3201,12 +3374,12 @@ private pure func typechecked_graph_module(
 		IgnoreMainName:
 			ctfe_body_outcomes_for_module(
 				prepared.context.ctfe_dependencies,
-				prepared_module_canonical_path(module),
+				prepared_module_scope_id(module_scope),
 			)
 
 	result = match reusable_ctfe_program_for_module(
 		prepared.context.ctfe_dependencies,
-		prepared_module_canonical_path(module),
+		prepared_module_scope_id(module_scope),
 	):
 		Some(imported_program):
 			{
@@ -3245,6 +3418,7 @@ private func typechecked_graph_module_with_trace(
 	module_scope = bound_module_scope(bound_module)
 	module = prepared_module_scope_module(module_scope)
 	module_ctfe_dependencies = prepared_ctfe_dependencies_for_artifact(
+		prepared_module_scope_module_table(module_scope),
 		module,
 		prepared.context.all_modules,
 		prepared.context.ctfe_dependencies,
@@ -3256,7 +3430,7 @@ private func typechecked_graph_module_with_trace(
 
 	result = match reusable_ctfe_program_for_module(
 		prepared.context.ctfe_dependencies,
-		prepared_module_canonical_path(module),
+		prepared_module_scope_id(module_scope),
 	):
 		Some(imported_program):
 			{
@@ -3325,6 +3499,7 @@ private pure func prepare_typecheck_graph_from_completed_headers(
 				typecheck_graph,
 			)
 			PreparedTypecheckGraphReady({
+				module_table = bound_module_graph_module_table(bound_graph),
 				target = prepared_typecheck_module(bound_target, typecheck_context),
 				modules = bound_modules.map(
 					func(module): prepared_typecheck_module(module, typecheck_context),
@@ -3344,7 +3519,12 @@ private pure func prepare_bound_typecheck_graph(
 	target = prepared_module_scope_module(target_scope)
 	modules = indexed_graph_modules(indexed_graph)
 	selected_modules = selected_scopes.map(prepared_module_scope_module)
-	ctfe_dependency_plan = ctfe_dependencies_for_graph(target, modules, selected_modules)
+	ctfe_dependency_plan = ctfe_dependencies_for_graph(
+		indexed_graph_module_table(indexed_graph),
+		target,
+		modules,
+		selected_modules,
+	)
 
 	match validated_implementation_headers(bound_graph):
 		Err(errors):
@@ -3500,10 +3680,10 @@ private pure func prepare_typecheck_graph(
 
 private pure func prepared_ctfe_dependencies_contain_program(
 	dependencies: List[PreparedCtfeDependency],
-	module_path: String,
+	module_id: ModuleId,
 ) -> Bool:
 	dependencies.any(func(dependency):
-		if dependency.module_path != module_path:
+		if not module_ids_equal(dependency.module_id, module_id):
 			False
 		else:
 			match dependency.program:
@@ -3632,6 +3812,7 @@ private func prepare_typecheck_graph_from_completed_headers_with_trace(
 				typecheck_graph,
 			)
 			PreparedTypecheckGraphReady({
+				module_table = bound_module_graph_module_table(bound_graph),
 				target = prepared_typecheck_module(bound_target, typecheck_context),
 				modules = bound_modules.map(
 					func(module): prepared_typecheck_module(module, typecheck_context),
@@ -3680,6 +3861,7 @@ private func prepare_typecheck_graph_with_trace(
 				Ok(selected_scopes):
 					selected_modules = selected_scopes.map(prepared_module_scope_module)
 					ctfe_dependency_plan = ctfe_dependencies_for_graph(
+						indexed_graph_module_table(indexed_graph),
 						target,
 						modules,
 						selected_modules,
@@ -3864,6 +4046,7 @@ pure func typecheck_graph_with_metrics(request: TypecheckGraphRequest) -> Typech
 
 			{
 				graph = {
+					module_table = graph.module_table,
 					target = target_result.module,
 					modules = modules,
 					next_def_id = definition_index_next_def_id(
@@ -3938,6 +4121,7 @@ private pure func typechecked_graph_from_prepared(
 			rejected_typechecked_graph(target, diagnostics)
 		PreparedTypecheckGraphReady(graph):
 			{
+				module_table = graph.module_table,
 				target = typechecked_graph_module(
 					allow_debug_only_calls,
 					graph.target,
@@ -3975,8 +4159,13 @@ private pure func typechecked_rejected_module_response(
 	target: RejectedTypecheckTarget,
 	diagnostics: List[TypecheckDiagnostic],
 ) -> String:
-	typechecked = typechecked_rejected_module_with_diagnostics(target, diagnostics)
-	bridge_success_json(typechecked_module_artifact(typechecked, include_comments)).to_string()
+	bridge_success_json(
+		typechecked_rejected_module_artifact(
+			target,
+			diagnostics,
+			include_comments,
+		),
+	).to_string()
 
 
 private pure func typechecked_graph_module_response(
@@ -4037,7 +4226,7 @@ private func emit_typechecked_graph_module_response(
 		duplicates_retained_ctfe = if reuses_retained_ctfe == 0:
 			if prepared_ctfe_dependencies_contain_program(
 				prepared.context.ctfe_dependencies,
-				module_path,
+				prepared_module_scope_id(module_scope),
 			):
 				1
 			else:
@@ -4086,12 +4275,21 @@ private func emit_typechecked_rejected_module_response(
 ) -> Void:
 	module_path = rejected_target_path(target)
 	trace(TypecheckStart, TYPECHECK_TRACE_UNINDEXED, module_path)
-	typechecked = typechecked_rejected_module_with_diagnostics(target, diagnostics)
+	program = rejected_target_program(target)
 	trace(TypecheckComplete, TYPECHECK_TRACE_UNINDEXED, module_path)
 	emit("{\"schema\":")
 	emit_json_chunks(bridge_schema_json(BRIDGE_SCHEMA_VERSION), emit)
 	emit(",\"ok\":true,\"artifact\":")
-	emit_typechecked_module_artifact_chunks(typechecked, include_comments, emit)
+	emit_typechecked_module_artifact_field_chunks(
+		program,
+		rejected_typed_program(target),
+		module_surface_for_program(program),
+		diagnostics.map(func(diagnostic): diagnostic.message),
+		[],
+		False,
+		include_comments,
+		emit,
+	)
 	trace(ProjectionComplete, TYPECHECK_TRACE_UNINDEXED, module_path)
 	emit("}")
 	emit("\n")

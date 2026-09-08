@@ -11,8 +11,7 @@ import:
 		ParsedIdentifier,
 		ParsedLogicalOp,
 		ParsedUnaryOp,
-	../stage_06_typecheck/type_system/env: Purity(Impure, Pure), purities_equal
-	../stage_06_typecheck/type_system/semantic_type: SemanticType(SemanticNamedType, SemanticTupleType)
+	../stage_04_modules/module_table: ModuleId, module_table_find_id_by_canonical_path
 	../stage_06_typecheck/infer:
 		CallableOrigin(
 			CallableBuiltin,
@@ -86,8 +85,10 @@ import:
 		TypedStringInterpolationPart(TypedInterpolationExpr, TypedInterpolationLiteral),
 		typed_expr_resolved_call,
 		typed_expr_value_type,
+	../stage_06_typecheck/type_system/env: Purity(Impure, Pure), purities_equal
+	../stage_06_typecheck/type_system/semantic_type:
+		SemanticType(SemanticNamedType, SemanticTupleType),
 	context:
-		CTFE_CONTEXT_EMPTY,
 		CtfeContext,
 		CtfeNullaryConstructorReference,
 		ctfe_context_function_by_callable_id,
@@ -132,7 +133,7 @@ union CtfeIrCallKind:
 	CtfeIrClosureCall
 	CtfeIrIntrinsicCall(String)
 	CtfeIrLocalCall(CtfeIrDirectCall)
-	CtfeIrImportedCall(CtfeIrDirectCall, String)
+	CtfeIrImportedCall(CtfeIrDirectCall, ModuleId)
 	CtfeIrConstructorCall(CtfeIrDirectCall, String)
 	CtfeIrBuiltinCall(CtfeIrDirectCall, CtfeBuiltinIntrinsic)
 	CtfeIrUnsupportedCall(String)
@@ -199,7 +200,7 @@ record CtfeIrFieldAccess {
 
 
 record CtfeIrImportedGlobal {
-	module_path: String,
+	module_id: ModuleId,
 	name: String
 }
 
@@ -465,10 +466,21 @@ private pure func ctfe_ir_call_kind(
 									parent_type,
 								)
 							CallableImported(module_path):
-								CtfeIrImportedCall(
-									ctfe_ir_direct_call(callable_id, call.source_name, call.purity),
+								match module_table_find_id_by_canonical_path(
+									context.module_table,
 									module_path,
-								)
+								):
+									Some(module_id):
+										CtfeIrImportedCall(
+											ctfe_ir_direct_call(
+												callable_id,
+												call.source_name,
+												call.purity,
+											),
+											module_id,
+										)
+									None:
+										CtfeIrUnresolvedCall
 							CallableBuiltin:
 								source_name = ctfe_ir_clean_source_name(call.source_name)
 
@@ -507,7 +519,14 @@ private pure func ctfe_ir_call_kind(
 									Some(_):
 										CtfeIrLocalCall(direct)
 									None:
-										CtfeIrImportedCall(direct, method_target.module_path)
+										match module_table_find_id_by_canonical_path(
+											context.module_table,
+											method_target.module_path,
+										):
+											Some(module_id):
+												CtfeIrImportedCall(direct, module_id)
+											None:
+												CtfeIrUnresolvedCall
 							None:
 								CtfeIrIntrinsicCall(ctfe_ir_clean_source_name(call.source_name))
 				ResolvedIntrinsicCall:
@@ -582,10 +601,10 @@ private pure func ctfe_ir_qualified_field_expr(
 	match receiver:
 		TypedNameExpr(receiver_name, _):
 			match ctfe_context_module_alias(context, receiver_name.text):
-				Some(module_path):
-					if ctfe_context_module_has_global_binding(context, module_path, field.text):
+				Some(module_id):
+					if ctfe_context_module_has_global_binding(context, module_id, field.text):
 						Some(CtfeIrImportedGlobalExpr({
-							module_path = module_path,
+							module_id = module_id,
 							name = field.text,
 						}))
 					else:
@@ -597,7 +616,7 @@ private pure func ctfe_ir_qualified_field_expr(
 								}))
 							None:
 								Some(CtfeIrImportedGlobalExpr({
-									module_path = module_path,
+									module_id = module_id,
 									name = field.text,
 								}))
 				None:
@@ -1009,9 +1028,3 @@ pure func ctfe_ir_from_typed_expr(
 			ctfe_ir_unsupported(expr, "missing expressions")
 		TypedUnsupportedExpr(message, _, _):
 			ctfe_ir_unsupported(expr, message)
-
-
-pure func ctfe_ir_from_typed_expr_without_context(
-	expr: TypedExpr,
-) -> Result[CtfeIrExpr, CtfeIrTranslateError]:
-	ctfe_ir_from_typed_expr(CTFE_CONTEXT_EMPTY, expr)

@@ -4,10 +4,17 @@
 -- constructor metadata, and module global environments without performing
 -- evaluation.
 import:
-	../stage_03_parse/parsed_ast:
-		ParsedDecl(ImportBlockParsedDecl, PrivateParsedDecl, UnionParsedDecl),
-		ParsedImportDecl,
-		ParsedUnionDecl,
+	../stage_03_parse/parsed_ast: ParsedDecl(PrivateParsedDecl, UnionParsedDecl), ParsedUnionDecl
+	../stage_04_modules/module_table:
+		ModuleId,
+		ModuleTable,
+		module_id_table_index,
+		module_ids_equal,
+		module_table_canonical_path,
+		module_table_count,
+		module_table_find_id_by_canonical_path,
+		module_tables_are_compatible,
+		module_tables_have_same_identity_rows,
 	../stage_06_typecheck/decl:
 		TypedDecl(
 			TypedFunctionDecl,
@@ -20,8 +27,8 @@ import:
 		TypedProgram,
 		TypedUnionInfo,
 		typed_decls_function_infos,
-	../stage_06_typecheck/modules/import_binding: ImportBinding
-	../stage_06_typecheck/modules/module_binding: import_default_alias
+	../stage_06_typecheck/modules/import_binding:
+		ImportBinding(QualifiedModuleBinding, SelectiveDefinitionBinding),
 	env: CTFE_ENV_EMPTY, ctfe_env_has_binding, ctfe_lookup_value
 	value: CtfeConstructorInfo, CtfeEnv, CtfeValue, ctfe_constructor_info
 
@@ -29,62 +36,85 @@ import:
 record CtfeFunction {
 	info: TypedFunctionInfo,
 	source_name: String,
-	module_path: Option[String]
+	module_id: ModuleId
 }
 
 
+union CtfeImportBinding:
+	CtfeQualifiedModuleBinding(String, ModuleId)
+	CtfeSelectiveDefinitionBinding(String, ModuleId, String)
+
+
 private union CtfeImportedProgramRep:
-	CompleteCtfeImportedProgram(String, List[TypedDecl], List[ImportBinding])
-	DeclarationOnlyCtfeImportedProgram(String, List[TypedDecl], List[ImportBinding])
-	SelectiveCtfeImportedProgram(String, List[TypedDecl], List[TypedFunctionInfo], List[ImportBinding])
+	CompleteCtfeImportedProgram(ModuleTable, ModuleId, List[TypedDecl], List[CtfeImportBinding])
+	DeclarationOnlyCtfeImportedProgram(ModuleTable, ModuleId, List[TypedDecl], List[CtfeImportBinding])
+	SelectiveCtfeImportedProgram(ModuleTable, ModuleId, List[TypedDecl], List[TypedFunctionInfo], List[CtfeImportBinding])
 
 
 opaque type CtfeImportedProgram = CtfeImportedProgramRep
 
 
 pure func complete_ctfe_imported_program(
-	module_path: String,
+	module_table: ModuleTable,
+	module_id: ModuleId,
 	decls: List[TypedDecl],
-	import_bindings: List[ImportBinding],
+	import_bindings: List[CtfeImportBinding],
 ) -> CtfeImportedProgram:
 	into_opaque CtfeImportedProgram(
-		CompleteCtfeImportedProgram(module_path, decls, import_bindings)
+		CompleteCtfeImportedProgram(module_table, module_id, decls, import_bindings)
 	)
 
 
 pure func selective_ctfe_imported_program(
-	module_path: String,
+	module_table: ModuleTable,
+	module_id: ModuleId,
 	decls: List[TypedDecl],
 	selected_functions: List[TypedFunctionInfo],
-	import_bindings: List[ImportBinding],
+	import_bindings: List[CtfeImportBinding],
 ) -> CtfeImportedProgram:
 	if selected_functions.is_empty():
 		into_opaque CtfeImportedProgram(
-			DeclarationOnlyCtfeImportedProgram(module_path, decls, import_bindings)
+			DeclarationOnlyCtfeImportedProgram(module_table, module_id, decls, import_bindings)
 		)
 	else:
 		into_opaque CtfeImportedProgram(
-			SelectiveCtfeImportedProgram(module_path, decls, selected_functions, import_bindings)
+			SelectiveCtfeImportedProgram(
+				module_table,
+				module_id,
+				decls,
+				selected_functions,
+				import_bindings,
+			)
 		)
 
 
-pure func ctfe_imported_program_module_path(program: CtfeImportedProgram) -> String:
+pure func ctfe_imported_program_module_table(program: CtfeImportedProgram) -> ModuleTable:
 	match from_opaque CtfeImportedProgram(program):
-		CompleteCtfeImportedProgram(module_path, _, _):
-			module_path
-		DeclarationOnlyCtfeImportedProgram(module_path, _, _):
-			module_path
-		SelectiveCtfeImportedProgram(module_path, _, _, _):
-			module_path
+		CompleteCtfeImportedProgram(module_table, _, _, _):
+			module_table
+		DeclarationOnlyCtfeImportedProgram(module_table, _, _, _):
+			module_table
+		SelectiveCtfeImportedProgram(module_table, _, _, _, _):
+			module_table
+
+
+pure func ctfe_imported_program_module_id(program: CtfeImportedProgram) -> ModuleId:
+	match from_opaque CtfeImportedProgram(program):
+		CompleteCtfeImportedProgram(_, module_id, _, _):
+			module_id
+		DeclarationOnlyCtfeImportedProgram(_, module_id, _, _):
+			module_id
+		SelectiveCtfeImportedProgram(_, module_id, _, _, _):
+			module_id
 
 
 pure func ctfe_imported_program_decls(program: CtfeImportedProgram) -> List[TypedDecl]:
 	match from_opaque CtfeImportedProgram(program):
-		CompleteCtfeImportedProgram(_, decls, _):
+		CompleteCtfeImportedProgram(_, _, decls, _):
 			decls
-		DeclarationOnlyCtfeImportedProgram(_, decls, _):
+		DeclarationOnlyCtfeImportedProgram(_, _, decls, _):
 			decls
-		SelectiveCtfeImportedProgram(_, decls, _, _):
+		SelectiveCtfeImportedProgram(_, _, decls, _, _):
 			decls
 
 
@@ -92,33 +122,33 @@ pure func ctfe_imported_program_functions(
 	program: CtfeImportedProgram,
 ) -> Option[List[TypedFunctionInfo]]:
 	match from_opaque CtfeImportedProgram(program):
-		CompleteCtfeImportedProgram(_, decls, _):
+		CompleteCtfeImportedProgram(_, _, decls, _):
 			functions = typed_decls_function_infos(decls)
 
 			if functions.is_empty():
 				None
 			else:
 				Some(functions)
-		DeclarationOnlyCtfeImportedProgram(_, _, _):
+		DeclarationOnlyCtfeImportedProgram(_, _, _, _):
 			None
-		SelectiveCtfeImportedProgram(_, _, selected_functions, _):
+		SelectiveCtfeImportedProgram(_, _, _, selected_functions, _):
 			Some(selected_functions)
 
 
 pure func ctfe_imported_program_import_bindings(
 	program: CtfeImportedProgram,
-) -> List[ImportBinding]:
+) -> List[CtfeImportBinding]:
 	match from_opaque CtfeImportedProgram(program):
-		CompleteCtfeImportedProgram(_, _, import_bindings):
+		CompleteCtfeImportedProgram(_, _, _, import_bindings):
 			import_bindings
-		DeclarationOnlyCtfeImportedProgram(_, _, import_bindings):
+		DeclarationOnlyCtfeImportedProgram(_, _, _, import_bindings):
 			import_bindings
-		SelectiveCtfeImportedProgram(_, _, _, import_bindings):
+		SelectiveCtfeImportedProgram(_, _, _, _, import_bindings):
 			import_bindings
 
 
 record CtfeImportedFunctionGroup {
-	module_path: String,
+	module_id: ModuleId,
 	source_name: String,
 	functions: List[CtfeFunction]
 }
@@ -127,16 +157,10 @@ record CtfeImportedFunctionGroup {
 private NO_IMPORTED_FUNCTION_INDEX: Int = -1
 
 
-record CtfeModuleGlobalEnv {
-	module_path: String,
-	env: CtfeEnv
-}
-
-
 record CtfeModuleAlias {
-	owner_module_path: Option[String],
+	owner_module_id: ModuleId,
 	local_name: String,
-	module_path: String
+	module_id: ModuleId
 }
 
 
@@ -148,23 +172,35 @@ record CtfeNullaryConstructorReference {
 
 
 record CtfeContext {
+	module_table: ModuleTable,
+	target_module_id: ModuleId,
 	functions: List[(Int, CtfeFunction)],
 	imported_functions: List[CtfeImportedFunctionGroup],
 	constructors: List[(String, CtfeConstructorInfo)],
 	module_aliases: List[CtfeModuleAlias],
-	module_global_envs: List[CtfeModuleGlobalEnv],
-	active_module_path: Option[String]
+	module_global_envs: List[CtfeEnv],
+	active_module_id: ModuleId
 }
 
 
-CTFE_CONTEXT_EMPTY: CtfeContext = {
-	functions = [],
-	imported_functions = [],
-	constructors = [],
-	module_aliases = [],
-	module_global_envs = [],
-	active_module_path = None
-}
+pure func ctfe_context_empty(module_table: ModuleTable, active_module_id: ModuleId) -> CtfeContext:
+	var module_global_envs: List[CtfeEnv] = []
+	var module_index: Int = 0
+
+	while module_index < module_table_count(module_table):
+		module_global_envs = module_global_envs.append(CTFE_ENV_EMPTY)
+		module_index += 1
+
+	{
+		module_table = module_table,
+		target_module_id = active_module_id,
+		functions = [],
+		imported_functions = [],
+		constructors = [],
+		module_aliases = [],
+		module_global_envs = module_global_envs,
+		active_module_id = active_module_id
+	}
 
 
 pure func ctfe_context_constructor_info(
@@ -209,7 +245,7 @@ pure func ctfe_context_function_by_callable_id(
 		if (
 			result.is_none()
 			and id == callable_id
-			and ctfe_function.module_path == context.active_module_path
+			and module_ids_equal(ctfe_function.module_id, context.active_module_id)
 		):
 			result = Some(ctfe_function)
 			break
@@ -219,7 +255,7 @@ pure func ctfe_context_function_by_callable_id(
 
 pure func ctfe_context_imported_functions_by_source(
 	context: CtfeContext,
-	module_path: String,
+	module_id: ModuleId,
 	source_name: String,
 ) -> List[CtfeFunction]:
 	var result: Option[List[CtfeFunction]] = None
@@ -227,7 +263,7 @@ pure func ctfe_context_imported_functions_by_source(
 	for group in context.imported_functions:
 		if (
 			result.is_none()
-			and group.module_path == module_path
+			and module_ids_equal(group.module_id, module_id)
 			and group.source_name == source_name
 		):
 			result = Some(group.functions)
@@ -238,11 +274,11 @@ pure func ctfe_context_imported_functions_by_source(
 
 pure func ctfe_context_imported_function_by_callable_id(
 	context: CtfeContext,
-	module_path: String,
+	module_id: ModuleId,
 	source_name: String,
 	callable_id: Int,
 ) -> Option[CtfeFunction]:
-	functions = ctfe_context_imported_functions_by_source(context, module_path, source_name)
+	functions = ctfe_context_imported_functions_by_source(context, module_id, source_name)
 	var result: Option[CtfeFunction] = None
 
 	for ctfe_function in functions:
@@ -258,24 +294,21 @@ pure func ctfe_context_imported_function_by_callable_id(
 		None
 
 
-pure func ctfe_context_module_global_env(context: CtfeContext, module_path: String) -> CtfeEnv:
-	var result: Option[CtfeEnv] = None
+pure func ctfe_context_module_path(context: CtfeContext, module_id: ModuleId) -> Option[String]:
+	module_table_canonical_path(context.module_table, module_id)
 
-	for module_env in context.module_global_envs:
-		if result.is_none() and module_env.module_path == module_path:
-			result = Some(module_env.env)
-			break
 
-	result.get_or(CTFE_ENV_EMPTY)
+pure func ctfe_context_module_global_env(context: CtfeContext, module_id: ModuleId) -> CtfeEnv:
+	context.module_global_envs.get_or(module_id_table_index(module_id), CTFE_ENV_EMPTY)
 
 
 pure func ctfe_context_module_global_value(
 	context: CtfeContext,
-	module_path: String,
+	module_id: ModuleId,
 	name: String,
 ) -> Option[CtfeValue]:
 	match ctfe_lookup_value(
-		ctfe_context_module_global_env(context, module_path),
+		ctfe_context_module_global_env(context, module_id),
 		name,
 	):
 		Ok(value):
@@ -284,16 +317,16 @@ pure func ctfe_context_module_global_value(
 			None
 
 
-pure func ctfe_context_module_alias(context: CtfeContext, local_name: String) -> Option[String]:
-	var result: Option[String] = None
+pure func ctfe_context_module_alias(context: CtfeContext, local_name: String) -> Option[ModuleId]:
+	var result: Option[ModuleId] = None
 
 	for module_alias in context.module_aliases:
 		if (
 			result.is_none()
-			and module_alias.owner_module_path == context.active_module_path
+			and module_ids_equal(module_alias.owner_module_id, context.active_module_id)
 			and module_alias.local_name == local_name
 		):
-			result = Some(module_alias.module_path)
+			result = Some(module_alias.module_id)
 			break
 
 	result
@@ -301,11 +334,11 @@ pure func ctfe_context_module_alias(context: CtfeContext, local_name: String) ->
 
 pure func ctfe_context_module_has_global_binding(
 	context: CtfeContext,
-	module_path: String,
+	module_id: ModuleId,
 	name: String,
 ) -> Bool:
 	ctfe_env_has_binding(
-		ctfe_context_module_global_env(context, module_path),
+		ctfe_context_module_global_env(context, module_id),
 		name,
 	)
 
@@ -313,7 +346,7 @@ pure func ctfe_context_module_has_global_binding(
 pure func ctfe_context_with_module_alias(
 	context: CtfeContext,
 	local_name: String,
-	module_path: String,
+	module_id: ModuleId,
 ) -> CtfeContext:
 	var replaced: Bool = False
 	var aliases: List[CtfeModuleAlias] = []
@@ -321,13 +354,13 @@ pure func ctfe_context_with_module_alias(
 	for module_alias in context.module_aliases:
 		if (
 			not replaced
-			and module_alias.owner_module_path == context.active_module_path
+			and module_ids_equal(module_alias.owner_module_id, context.active_module_id)
 			and module_alias.local_name == local_name
 		):
 			aliases = aliases.append({
-				owner_module_path = context.active_module_path,
+				owner_module_id = context.active_module_id,
 				local_name = local_name,
-				module_path = module_path,
+				module_id = module_id,
 			})
 			replaced = True
 		else:
@@ -335,9 +368,9 @@ pure func ctfe_context_with_module_alias(
 
 	if not replaced:
 		aliases = aliases.append({
-			owner_module_path = context.active_module_path,
+			owner_module_id = context.active_module_id,
 			local_name = local_name,
-			module_path = module_path,
+			module_id = module_id,
 		})
 
 	{ context | module_aliases = aliases }
@@ -345,121 +378,94 @@ pure func ctfe_context_with_module_alias(
 
 pure func ctfe_context_with_module_global_env(
 	context: CtfeContext,
-	module_path: String,
+	issuing_table: ModuleTable,
+	module_id: ModuleId,
 	env: CtfeEnv,
 ) -> CtfeContext:
-	var replaced: Bool = False
-	var module_envs: List[CtfeModuleGlobalEnv] = []
-
-	for module_env in context.module_global_envs:
-		if not replaced and module_env.module_path == module_path:
-			module_envs = module_envs.append({
-				module_path = module_path,
-				env = env,
-			})
-			replaced = True
-		else:
-			module_envs = module_envs.append(module_env)
-
-	if not replaced:
-		module_envs = module_envs.append({
-			module_path = module_path,
-			env = env,
-		})
-
-	{ context | module_global_envs = module_envs }
-
-
-private pure func ctfe_collect_import_aliases_from_imports(
-	aliases: List[CtfeModuleAlias],
-	imports: List[ParsedImportDecl],
-	owner_module_path: Option[String],
-) -> List[CtfeModuleAlias]:
-	var result = aliases
-
-	for import_decl in imports:
-		registers_module_alias: Bool = match import_decl.symbols:
-			Some(_):
-				import_decl.module_alias.is_some()
-			None:
-				True
-
-		if registers_module_alias:
-			local_name: String = match import_decl.module_alias:
-				Some(alias_name):
-					alias_name.text
-				None:
-					import_default_alias(import_decl.module_path)
-
-			result = result.append({
-				owner_module_path = owner_module_path,
-				local_name = local_name,
-				module_path = import_decl.module_path,
-			})
-
-	result
-
-
-private pure func ctfe_collect_decl_import_aliases(
-	aliases: List[CtfeModuleAlias],
-	decl: TypedDecl,
-	owner_module_path: Option[String],
-) -> List[CtfeModuleAlias]:
-	match decl:
-		TypedParsedDecl(parsed_decl):
-			match parsed_decl:
-				ImportBlockParsedDecl(imports, _):
-					ctfe_collect_import_aliases_from_imports(aliases, imports, owner_module_path)
-				PrivateParsedDecl(inner, _):
-					ctfe_collect_decl_import_aliases(
-						aliases,
-						TypedParsedDecl(inner),
-						owner_module_path,
-					)
-				_:
-					aliases
-		TypedPrivateDecl(inner):
-			ctfe_collect_decl_import_aliases(aliases, inner, owner_module_path)
+	match (
+		(
+			module_tables_are_compatible(context.module_table, issuing_table)
+			or module_tables_have_same_identity_rows(context.module_table, issuing_table)
+		),
+		ctfe_context_module_path(context, module_id),
+	):
+		(True, Some(_)):
+			{ context |
+				module_global_envs = context.module_global_envs.set(
+					module_id_table_index(module_id),
+					env,
+				)
+			}
 		_:
-			aliases
+			context
 
 
-private pure func ctfe_collect_program_import_aliases(
-	aliases: List[CtfeModuleAlias],
-	program: TypedProgram,
-	owner_module_path: Option[String],
-) -> List[CtfeModuleAlias]:
-	var result = aliases
+pure func ctfe_import_bindings_for_module_table(
+	module_table: ModuleTable,
+	bindings: List[ImportBinding],
+) -> Option[List[CtfeImportBinding]]:
+	var result: List[CtfeImportBinding] = []
+	var failed: Bool = False
 
-	for decl in program.decls:
-		result = ctfe_collect_decl_import_aliases(result, decl, owner_module_path)
+	for binding in bindings:
+		if not failed:
+			match binding:
+				QualifiedModuleBinding(local_name, module_path):
+					match module_table_find_id_by_canonical_path(module_table, module_path):
+						Some(module_id):
+							result = result.append(
+								CtfeQualifiedModuleBinding(
+									local_name,
+									module_id,
+								),
+							)
+						None:
+							failed = True
+				SelectiveDefinitionBinding(local_name, module_path, source_name):
+					match module_table_find_id_by_canonical_path(module_table, module_path):
+						Some(module_id):
+							result = result.append(
+								CtfeSelectiveDefinitionBinding(
+									local_name,
+									module_id,
+									source_name,
+								),
+							)
+						None:
+							failed = True
 
-	result
+	if failed:
+		None
+	else:
+		Some(result)
 
 
-private pure func ctfe_collect_decls_import_aliases(
-	aliases: List[CtfeModuleAlias],
-	decls: List[TypedDecl],
-	owner_module_path: Option[String],
-) -> List[CtfeModuleAlias]:
-	var result = aliases
+pure func ctfe_context_with_import_bindings(
+	context: CtfeContext,
+	bindings: List[CtfeImportBinding],
+) -> CtfeContext:
+	var result = context
 
-	for decl in decls:
-		result = ctfe_collect_decl_import_aliases(result, decl, owner_module_path)
+	for binding in bindings:
+		match binding:
+			CtfeQualifiedModuleBinding(local_name, module_id):
+				result = ctfe_context_with_module_alias(result, local_name, module_id)
+			CtfeSelectiveDefinitionBinding(_, _, _):
+				void
 
 	result
 
 
 private pure func ctfe_function_from_info(
 	info: TypedFunctionInfo,
-	module_path: Option[String],
+	module_id: ModuleId,
 ) -> Option[CtfeFunction]:
 	match info.callable_id:
 		Some(_):
 			Some({
 				info = info,
 				source_name = info.decl.name.text,
-				module_path = module_path,
+				module_id = module_id,
 			})
 		None:
 			None
@@ -468,9 +474,9 @@ private pure func ctfe_function_from_info(
 private pure func ctfe_collect_function(
 	functions: List[(Int, CtfeFunction)],
 	info: TypedFunctionInfo,
-	module_path: Option[String],
+	module_id: ModuleId,
 ) -> List[(Int, CtfeFunction)]:
-	match (info.callable_id, ctfe_function_from_info(info, module_path)):
+	match (info.callable_id, ctfe_function_from_info(info, module_id)):
 		(Some(callable_id), Some(ctfe_function)):
 			functions.append((callable_id, ctfe_function))
 		_:
@@ -480,20 +486,20 @@ private pure func ctfe_collect_function(
 private pure func ctfe_collect_decl_functions(
 	functions: List[(Int, CtfeFunction)],
 	decl: TypedDecl,
-	module_path: Option[String],
+	module_id: ModuleId,
 ) -> List[(Int, CtfeFunction)]:
 	match decl:
 		TypedFunctionDecl(info):
-			ctfe_collect_function(functions, info, module_path)
+			ctfe_collect_function(functions, info, module_id)
 		TypedImplDecl(info):
 			var result = functions
 
 			for method in info.methods:
-				result = ctfe_collect_function(result, method, module_path)
+				result = ctfe_collect_function(result, method, module_id)
 
 			result
 		TypedPrivateDecl(inner):
-			ctfe_collect_decl_functions(functions, inner, module_path)
+			ctfe_collect_decl_functions(functions, inner, module_id)
 		_:
 			functions
 
@@ -501,22 +507,22 @@ private pure func ctfe_collect_decl_functions(
 private pure func ctfe_collect_program_functions(
 	functions: List[(Int, CtfeFunction)],
 	program: TypedProgram,
-	module_path: Option[String],
+	module_id: ModuleId,
 ) -> List[(Int, CtfeFunction)]:
 	var result = functions
 
 	for decl in program.decls:
-		result = ctfe_collect_decl_functions(result, decl, module_path)
+		result = ctfe_collect_decl_functions(result, decl, module_id)
 
 	result
 
 
 private pure func ctfe_collect_imported_function_info(
 	functions: List[CtfeFunction],
-	module_path: String,
+	module_id: ModuleId,
 	info: TypedFunctionInfo,
 ) -> List[CtfeFunction]:
-	match ctfe_function_from_info(info, Some(module_path)):
+	match ctfe_function_from_info(info, module_id):
 		Some(ctfe_function):
 			functions.append(ctfe_function)
 		None:
@@ -598,7 +604,7 @@ private pure func ctfe_collect_decls_constructors(
 
 private pure func ctfe_merge_duplicate_imported_function_group(
 	groups: List[CtfeImportedFunctionGroup],
-	module_path: String,
+	module_id: ModuleId,
 	source_name: String,
 	functions: List[CtfeFunction],
 ) -> List[CtfeImportedFunctionGroup]:
@@ -608,7 +614,7 @@ private pure func ctfe_merge_duplicate_imported_function_group(
 	for group in groups:
 		if (
 			not merged
-			and group.module_path == module_path
+			and module_ids_equal(group.module_id, module_id)
 			and group.source_name == source_name
 		):
 			var merged_functions = group.functions
@@ -623,7 +629,7 @@ private pure func ctfe_merge_duplicate_imported_function_group(
 
 	if not merged:
 		result = result.append({
-			module_path = module_path,
+			module_id = module_id,
 			source_name = source_name,
 			functions = functions,
 		})
@@ -631,8 +637,11 @@ private pure func ctfe_merge_duplicate_imported_function_group(
 	result
 
 
-pure func ctfe_context_from_program(
+private pure func ctfe_context_from_program_in_domain(
+	module_table: ModuleTable,
+	target_module_id: ModuleId,
 	program: TypedProgram,
+	import_bindings: List[CtfeImportBinding],
 	imported_programs: List[CtfeImportedProgram],
 ) -> CtfeContext:
 	var constructors = ctfe_collect_program_constructors([], program)
@@ -643,15 +652,15 @@ pure func ctfe_context_from_program(
 			ctfe_imported_program_decls(imported),
 		)
 
-	var functions = ctfe_collect_program_functions([], program, None)
+	var functions = ctfe_collect_program_functions([], program, target_module_id)
 
 	for imported in imported_programs:
-		module_path = ctfe_imported_program_module_path(imported)
+		module_id = ctfe_imported_program_module_id(imported)
 
 		match ctfe_imported_program_functions(imported):
 			Some(infos):
 				for info in infos:
-					match ctfe_function_from_info(info, Some(module_path)):
+					match ctfe_function_from_info(info, module_id):
 						Some(ctfe_function):
 							match info.callable_id:
 								Some(callable_id):
@@ -664,13 +673,17 @@ pure func ctfe_context_from_program(
 				void
 
 	var imported_groups: List[CtfeImportedFunctionGroup] = []
-	var seen_imported_module_paths: Dict[String, Bool] = {}
+	var seen_imported_module_ids: List[Bool] = []
+
+	for _ in 0..module_table_count(module_table):
+		seen_imported_module_ids = seen_imported_module_ids.append(False)
 
 	for imported in imported_programs:
-		module_path = ctfe_imported_program_module_path(imported)
-		module_path_was_seen: Bool = seen_imported_module_paths.contains(module_path)
-		seen_imported_module_paths = seen_imported_module_paths.set(module_path, True)
-		-- Prepared CTFE dependencies are deduplicated by canonical module path,
+		module_id = ctfe_imported_program_module_id(imported)
+		module_index = module_id_table_index(module_id)
+		module_id_was_seen: Bool = seen_imported_module_ids.get_or(module_index, False)
+		seen_imported_module_ids = seen_imported_module_ids.set(module_index, True)
+		-- Prepared CTFE dependencies are deduplicated by canonical module ID,
 		-- so the function-name index only needs to live for this module.
 		var module_functions: List[CtfeFunction] = []
 
@@ -679,7 +692,7 @@ pure func ctfe_context_from_program(
 				for info in infos:
 					module_functions = ctfe_collect_imported_function_info(
 						module_functions,
-						module_path,
+						module_id,
 						info,
 					)
 			None:
@@ -741,38 +754,79 @@ pure func ctfe_context_from_program(
 					None:
 						current_function_index = NO_IMPORTED_FUNCTION_INDEX
 
-			if module_path_was_seen:
+			if module_id_was_seen:
 				-- Keep the public constructor's historical behavior for manually
 				-- supplied duplicate modules without penalizing production graphs.
 				imported_groups = ctfe_merge_duplicate_imported_function_group(
 					imported_groups,
-					module_path,
+					module_id,
 					source_name,
 					functions,
 				)
 			else:
 				imported_groups = imported_groups.append({
-					module_path = module_path,
+					module_id = module_id,
 					source_name = source_name,
 					functions = functions,
 				})
 
 			group_index += 1
 
-	var aliases = ctfe_collect_program_import_aliases([], program, None)
-
-	for imported in imported_programs:
-		aliases = ctfe_collect_decls_import_aliases(
-			aliases,
-			ctfe_imported_program_decls(imported),
-			Some(ctfe_imported_program_module_path(imported)),
-		)
-
-	{
+	var context = { ctfe_context_empty(module_table, target_module_id) |
 		functions = functions,
 		imported_functions = imported_groups,
-		constructors = constructors,
-		module_aliases = aliases,
-		module_global_envs = [],
-		active_module_path = None
+		constructors = constructors
 	}
+	context = ctfe_context_with_import_bindings(context, import_bindings)
+
+	for imported in imported_programs:
+		context = { context | active_module_id = ctfe_imported_program_module_id(imported) }
+		context = ctfe_context_with_import_bindings(
+			context,
+			ctfe_imported_program_import_bindings(imported),
+		)
+
+	{ context | active_module_id = target_module_id }
+
+
+pure func ctfe_context_from_program(
+	module_table: ModuleTable,
+	target_module_id: ModuleId,
+	program: TypedProgram,
+	import_bindings: List[CtfeImportBinding],
+	imported_programs: List[CtfeImportedProgram],
+) -> Option[CtfeContext]:
+	var domain_is_valid = module_table_canonical_path(module_table, target_module_id).is_some()
+
+	for imported in imported_programs:
+		if (
+			not ((
+				module_tables_are_compatible(
+					module_table,
+					ctfe_imported_program_module_table(imported),
+				)
+				or module_tables_have_same_identity_rows(
+					module_table,
+					ctfe_imported_program_module_table(imported),
+				)
+			))
+			or module_table_canonical_path(
+				module_table,
+				ctfe_imported_program_module_id(imported),
+			).is_none()
+		):
+			domain_is_valid = False
+			break
+
+	if domain_is_valid:
+		Some(
+			ctfe_context_from_program_in_domain(
+				module_table,
+				target_module_id,
+				program,
+				import_bindings,
+				imported_programs,
+			),
+		)
+	else:
+		None

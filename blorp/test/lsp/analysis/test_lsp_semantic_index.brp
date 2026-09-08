@@ -3,6 +3,11 @@ import:
 		ANONYMOUS_IDENTITY,
 		ModuleOrigin(UserModule),
 		module_identity_matches_canonical_path,
+		resolved_module_identity_from_resolver,
+	../../../src/compiler/stage_04_modules/module_table:
+		ModuleId,
+		module_table,
+		module_table_find_id_by_canonical_path,
 	../../../src/compiler/stage_06_typecheck/bridge:
 		TypecheckGraphRequest,
 		TypecheckImportModule,
@@ -13,6 +18,8 @@ import:
 		SemanticSymbolKind(SemanticConstructor, SemanticField),
 		exported_symbol_key_module_identity,
 		exported_symbol_key_name,
+	../../../src/compiler/stage_06_typecheck/graph/semantic_occurrence:
+		SemanticOccurrenceError(SemanticModuleIdOutsideTable),
 	../../../src/lsp/analysis/analysis_model:
 		ArtifactLocalSymbolId,
 		DefinitionEntry,
@@ -56,7 +63,9 @@ import:
 		semantic_index_module_for_uri,
 		semantic_symbol_ids_equal,
 	../../../src/lsp/analysis/fingerprint_model: SemanticArtifactId, semantic_artifact_id_from_value
-	../../../src/lsp/analysis/semantic_index: semantic_index_for_target
+	../../../src/lsp/analysis/semantic_index:
+		SemanticIndexExtractionError(SemanticOccurrenceExtractionError),
+		semantic_index_for_target,
 	../../../src/lsp/capabilities/definition_query: definition_query_snapshot
 	../../../src/lsp/capabilities/document_highlight_query: document_highlights_query_snapshot
 	../../../src/lsp/capabilities/document_symbol_query:
@@ -162,15 +171,38 @@ private pure func imported_type_graph_request(source: String) -> TypecheckGraphR
 
 
 private pure func graph_with_failed_dependency() -> TypecheckedGraph:
-	base = typecheck_graph(graph_request())
-	dependency = { base.target |
-		path = "/workspace/broken.brp",
-		module_name = "broken",
-		module_path = "broken",
-		module_identity = ANONYMOUS_IDENTITY,
-		errors = ["dependency analysis failed"]
+	request = graph_request_for_source(
+		"import:\n\tdep: dependency_value\n\nfunc main(args: List[String]):\n\tprint(dependency_value().to_string())",
+	)
+	dependency: TypecheckImportModule = {
+		path = "/workspace/dep.brp",
+		module_name = "dep",
+		module_path = "dep",
+		text = "pure func dependency_value() -> Int: 1",
+		typecheck_program = None,
+		module_surface = None,
+		origin = UserModule
 	}
-	{ base | modules = [dependency] }
+	base = typecheck_graph(
+		{ request |
+			modules = [dependency],
+			module_targets = ["dep"],
+			resolved_imports = [
+				{
+					from_path = "/workspace/main.brp",
+					from_module = "main",
+					import_path = "dep",
+					resolved_module = "dep"
+				},
+			]
+		},
+	)
+
+	match base.modules.get(0):
+		None:
+			base
+		Some(dependency_module):
+			{ base | modules = [{ dependency_module | errors = ["dependency analysis failed"] }] }
 
 
 private pure func graph_with_partially_unprojectable_dependency() -> TypecheckedGraph:
@@ -1505,6 +1537,61 @@ func test_document_symbols_map_declaration_kinds() -> Bool:
 	document_symbol_kind_case().get_or(False)
 
 
+private pure func foreign_module_id() -> Option[ModuleId]:
+	table ?= module_table([
+		resolved_module_identity_from_resolver("foreign/zero", UserModule),
+		resolved_module_identity_from_resolver("foreign/one", UserModule),
+	]).to_option()
+	module_table_find_id_by_canonical_path(table, "foreign/one")
+
+
+private pure func semantic_index_rejects_target_module_id_outside_table() -> Option[Bool]:
+	module_id ?= foreign_module_id()
+	base = typecheck_graph(graph_request())
+	graph = { base | target = { base.target | module_id = module_id } }
+	artifact_id = semantic_artifact_id_from_value("semantic-index-invalid-target-module")
+
+	Some(
+		match semantic_index_for_target(
+			artifact_id,
+			document_uri("file:///workspace/main.brp"),
+			graph,
+		):
+			Err(SemanticOccurrenceExtractionError(SemanticModuleIdOutsideTable)):
+				True
+			_:
+				False
+	)
+
+
+func test_semantic_index_rejects_target_module_id_outside_table() -> Bool:
+	semantic_index_rejects_target_module_id_outside_table().get_or(False)
+
+
+private pure func semantic_index_marks_invalid_dependency_module_id_partial() -> Option[Bool]:
+	module_id ?= foreign_module_id()
+	base = typecheck_graph(graph_request())
+	dependency = { base.target | module_id = module_id }
+	graph = { base | modules = [dependency] }
+	artifact_id = semantic_artifact_id_from_value("semantic-index-invalid-dependency-module")
+
+	Some(
+		match semantic_index_for_target(
+			artifact_id,
+			document_uri("file:///workspace/main.brp"),
+			graph,
+		):
+			Ok(index):
+				module_semantic_index_coverage(index) == PartialModuleSemanticIndex
+			Err(_):
+				False
+	)
+
+
+func test_semantic_index_marks_invalid_dependency_module_id_partial() -> Bool:
+	semantic_index_marks_invalid_dependency_module_id_partial().get_or(False)
+
+
 tests: TestSuite = {
 	description = "Compiler LSP semantic index extraction",
 	tests = [
@@ -1563,5 +1650,13 @@ tests: TestSuite = {
 			test_document_symbols_preserve_names_and_source_order,
 		),
 		("document symbols map declaration kinds", test_document_symbols_map_declaration_kinds),
+		(
+			"reject target module ID outside table",
+			test_semantic_index_rejects_target_module_id_outside_table,
+		),
+		(
+			"mark invalid dependency module ID partial",
+			test_semantic_index_marks_invalid_dependency_module_id_partial,
+		),
 	]
 }
