@@ -53,13 +53,14 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
             params_per_function=params_per_function,
             parameter_type=parameter_type,
         )
-        worker = program["decls"][global_count]
-        worker["body"] = {
+        main = program["decls"][-1]
+        sentinel_body = main["body"]["body"]
+        main["body"]["body"] = {
             "kind": "drop",
-            "var": self.benchmark.core_var("BENCH_MANAGED_LOCAL_0000", None),
+            "var": self.benchmark.core_var(self.benchmark.PERCEUS_SENTINEL_NAME, None),
             "value_type": self.benchmark.named_type("String"),
             "release_policy": "arc",
-            "body": worker["body"],
+            "body": sentinel_body,
             "type": self.benchmark.named_type("Int"),
             "loc": self.benchmark.synthetic_loc(),
         }
@@ -69,6 +70,39 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
         request, _ = self.benchmark.fixture_request(4, 2, 4, 1)
 
         self.assertEqual(request["action"], self.benchmark.PERCEUS_ACTION)
+
+    def test_perceus_sentinel_is_outside_fixed_worker_geometry(self) -> None:
+        _, program = self.benchmark.fixture_request(
+            1,
+            2,
+            128,
+            0,
+            params_per_function=8,
+            body_shape="borrowed_call_protection",
+        )
+
+        workers = [
+            declaration
+            for declaration in program["decls"]
+            if isinstance(declaration.get("name"), str)
+            and declaration["name"].startswith("bench_worker_")
+        ]
+        main = next(
+            declaration
+            for declaration in program["decls"]
+            if declaration.get("name") == "main"
+        )
+
+        self.assertTrue(all(
+            self.benchmark.expression_node_count(worker["body"]) == 128
+            for worker in workers
+        ))
+        self.assertEqual(main["body"]["kind"], "let")
+        self.assertEqual(
+            main["body"]["name"]["name"],
+            self.benchmark.PERCEUS_SENTINEL_NAME,
+        )
+        self.assertEqual(main["body"]["rhs"]["kind"], "call")
 
     def test_measurement_windows_have_explicit_actions_and_labels(self) -> None:
         self.assertEqual(
@@ -155,6 +189,33 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
 
         self.assertEqual(set(actual), set(self.benchmark.LEGACY_PERCEUS_WORK_COUNTER_NAMES))
 
+    def test_change_aware_insert_counters_partition_completed_visits(self) -> None:
+        counters = {
+            "insert_node_visits": 12,
+            "insert_rebuild_actions": 12,
+            "insert_node_reconstructions": 4,
+            "insert_original_nodes_reused": 8,
+            "insert_opaque_rewrite_results": 2,
+        }
+
+        self.benchmark.validate_change_aware_insert_counters(counters)
+
+        counters["insert_original_nodes_reused"] = 7
+        with self.assertRaisesRegex(RuntimeError, "decisions are incomplete"):
+            self.benchmark.validate_change_aware_insert_counters(counters)
+
+    def test_change_aware_insert_counters_reject_unclassified_opaque_result(self) -> None:
+        counters = {
+            "insert_node_visits": 3,
+            "insert_rebuild_actions": 3,
+            "insert_node_reconstructions": 1,
+            "insert_original_nodes_reused": 2,
+            "insert_opaque_rewrite_results": 2,
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "opaque insertion results"):
+            self.benchmark.validate_change_aware_insert_counters(counters)
+
     def test_contract_inference_uses_collected_equations_without_body_rescans(self) -> None:
         perceus_source = (
             ROOT / "blorp" / "src" / "compiler" / "stage_09_core" / "perceus.brp"
@@ -174,6 +235,22 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
             "private pure func analyze_user_contract_wave(",
         ):
             self.assertNotIn(obsolete, perceus_source)
+
+    def test_insert_drops_tracks_reconstruction_without_a_second_result_wrapper(self) -> None:
+        perceus_source = (
+            ROOT / "blorp" / "src" / "compiler" / "stage_09_core" / "perceus.brp"
+        ).read_text(encoding="utf-8")
+
+        inserted_expr_record = perceus_source.split(
+            "private record PerceusInsertedExpr {", 1
+        )[1].split("}", 1)[0]
+
+        self.assertIn("reuses_source: Bool", inserted_expr_record)
+        self.assertIn("insert_drops_expr_inner_result", perceus_source)
+        self.assertIn("perceus_work_insert_node_reconstructions", perceus_source)
+        self.assertIn("perceus_work_insert_original_nodes_reused", perceus_source)
+        self.assertIn("perceus_work_insert_opaque_rewrite_results", perceus_source)
+        self.assertNotIn("union PerceusInsertRewrite", perceus_source)
 
     def test_core_ownership_census_counts_policies(self) -> None:
         response = self.perceus_response()
@@ -449,7 +526,7 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
             for declaration in program["decls"]
             if declaration.get("name") == "main"
         )
-        call = main["body"]["first"]
+        call = main["body"]["body"]["first"]
 
         self.assertEqual(
             [argument["kind"] for argument in call["args"]],

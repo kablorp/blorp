@@ -471,6 +471,18 @@ private @debug_only pure func perceus_work_insert_rebuild_actions() -> Int:
 	black_box_int(0)
 
 
+private @debug_only pure func perceus_work_insert_node_reconstructions() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func perceus_work_insert_original_nodes_reused() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func perceus_work_insert_opaque_rewrite_results() -> Int:
+	black_box_int(0)
+
+
 private @debug_only pure func perceus_work_declarations_rewritten() -> Int:
 	black_box_int(0)
 
@@ -553,6 +565,9 @@ pure func register_perceus_work_counters() -> Int:
 		perceus_work_resolved_value_queries()
 		perceus_work_insert_node_visits()
 		perceus_work_insert_rebuild_actions()
+		perceus_work_insert_node_reconstructions()
+		perceus_work_insert_original_nodes_reused()
+		perceus_work_insert_opaque_rewrite_results()
 		perceus_work_declarations_rewritten()
 		perceus_work_functions_rewritten()
 		perceus_work_globals_rewritten()
@@ -871,21 +886,26 @@ private record PerceusDirectConsume {
 }
 
 
+-- Carry source identity in the result Perceus already needs for direct-consume
+-- metadata. A separate Changed/Unchanged union would allocate another wrapper
+-- at every visited node. `reuses_source` is intentionally exact: opaque helper
+-- families report False even when their rebuilt value serializes identically.
 private record PerceusInsertedExpr {
 	expr: CoreExpr,
-	direct_consume: Option[PerceusDirectConsume]
+	direct_consume: Option[PerceusDirectConsume],
+	reuses_source: Bool
 }
 
 
 private union PerceusInsertBindingFrame:
 	PerceusInsertManagedLetRhsFrame(PerceusManagedLetPlan)
 	PerceusInsertManagedLetBodyFrame(PerceusManagedLetPlan, PerceusInsertedExpr)
-	PerceusInsertLetRhsFrame(CoreVar, Bool, CoreType, CoreExpr)
-	PerceusInsertLetBodyFrame(CoreVar, Bool, CoreType, PerceusInsertedExpr)
-	PerceusInsertBorrowLetRhsFrame(CoreVar, CoreType, CoreExpr)
-	PerceusInsertBorrowLetBodyFrame(CoreVar, CoreType, PerceusInsertedExpr)
-	PerceusInsertSequenceFirstFrame(CoreExpr)
-	PerceusInsertSequenceSecondFrame(PerceusInsertedExpr)
+	PerceusInsertLetRhsFrame(CoreExpr, CoreVar, Bool, CoreType, CoreExpr)
+	PerceusInsertLetBodyFrame(CoreExpr, CoreVar, Bool, CoreType, PerceusInsertedExpr)
+	PerceusInsertBorrowLetRhsFrame(CoreExpr, CoreVar, CoreType, CoreExpr)
+	PerceusInsertBorrowLetBodyFrame(CoreExpr, CoreVar, CoreType, PerceusInsertedExpr)
+	PerceusInsertSequenceFirstFrame(CoreExpr, CoreExpr)
+	PerceusInsertSequenceSecondFrame(CoreExpr, PerceusInsertedExpr)
 	PerceusInsertAssignRhsFrame(CoreVar, CoreType, CoreSourceLoc)
 
 
@@ -16284,7 +16304,7 @@ private pure func without_bound_value(
 			index
 
 
-private pure func inserted_expr(expr: CoreExpr) -> PerceusInsertedExpr:
+private pure func inserted_expr(expr: CoreExpr, reuses_source: Bool) -> PerceusInsertedExpr:
 	direct_consume: Option[PerceusDirectConsume] = match expr:
 		VarExpr(variable, typ, loc):
 			Some({variable = variable})
@@ -16293,7 +16313,8 @@ private pure func inserted_expr(expr: CoreExpr) -> PerceusInsertedExpr:
 
 	{
 		expr = expr,
-		direct_consume = direct_consume
+		direct_consume = direct_consume,
+		reuses_source = reuses_source
 	}
 
 
@@ -16370,8 +16391,12 @@ private pure func call_single_direct_consume(env: PerceusEnv, expr: CoreExpr) ->
 			None
 
 
-private pure func inserted_non_binding_expr(env: PerceusEnv, expr: CoreExpr) -> PerceusInsertedExpr:
-	base: PerceusInsertedExpr = inserted_expr(expr)
+private pure func inserted_non_binding_expr(
+	env: PerceusEnv,
+	expr: CoreExpr,
+	reuses_source: Bool,
+) -> PerceusInsertedExpr:
+	base: PerceusInsertedExpr = inserted_expr(expr, reuses_source)
 
 	match call_single_direct_consume(env, expr):
 		Some(variable):
@@ -16381,6 +16406,7 @@ private pure func inserted_non_binding_expr(env: PerceusEnv, expr: CoreExpr) -> 
 
 
 private pure func inserted_sequence(
+	source: CoreExpr,
 	first: PerceusInsertedExpr,
 	second: PerceusInsertedExpr,
 ) -> PerceusInsertedExpr:
@@ -16390,9 +16416,17 @@ private pure func inserted_sequence(
 		None:
 			None
 
+	reuses_source: Bool = first.reuses_source and second.reuses_source
+
+	result_expr: CoreExpr = if reuses_source:
+		source
+	else:
+		SeqExpr(first.expr, second.expr)
+
 	{
-		expr = SeqExpr(first.expr, second.expr),
-		direct_consume = direct_consume
+		expr = result_expr,
+		direct_consume = direct_consume,
+		reuses_source = reuses_source
 	}
 
 
@@ -16404,6 +16438,7 @@ private pure func inserted_binding_expr(
 	expr: CoreExpr,
 	variable: CoreVar,
 	body: PerceusInsertedExpr,
+	reuses_source: Bool,
 ) -> PerceusInsertedExpr:
 	direct_consume: Option[PerceusDirectConsume] = match body.direct_consume:
 		Some(consume):
@@ -16416,7 +16451,8 @@ private pure func inserted_binding_expr(
 
 	{
 		expr = expr,
-		direct_consume = direct_consume
+		direct_consume = direct_consume,
+		reuses_source = reuses_source
 	}
 
 
@@ -16468,7 +16504,10 @@ private pure func managed_let_has_single_direct_consume(
 				False
 
 
-private pure func insert_drops_expr_inner(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
+private pure func insert_drops_expr_inner_result(
+	env: PerceusEnv,
+	expr: CoreExpr,
+) -> PerceusInsertedExpr:
 	-- Blocks lower to long right-associated binding chains. Perceus is a
 	-- post-order pass, so retain the exact RHS-before-body order in explicit
 	-- frames instead of consuming one C stack frame per source binding.
@@ -16476,7 +16515,6 @@ private pure func insert_drops_expr_inner(env: PerceusEnv, expr: CoreExpr) -> Co
 	var action: PerceusInsertBindingAction = PerceusInsertVisitBindingExpr(expr)
 	var resolved_values: PerceusResolvedValueIndex = {occurrences_by_def_id_by_uniq_by_name = {}}
 	var managed_binding_frame_count: Int = 0
-	var result: CoreExpr = expr
 	var complete: Bool = False
 
 	while not complete:
@@ -16504,19 +16542,25 @@ private pure func insert_drops_expr_inner(env: PerceusEnv, expr: CoreExpr) -> Co
 							action = PerceusInsertVisitBindingExpr(plan.owned_rhs)
 						else:
 							frames = PerceusInsertMoreBindingFrames(
-								PerceusInsertLetRhsFrame(variable, is_mutable, bind_type, body),
+								PerceusInsertLetRhsFrame(
+									current,
+									variable,
+									is_mutable,
+									bind_type,
+									body,
+								),
 								frames,
 							)
 							action = PerceusInsertVisitBindingExpr(rhs)
 					BorrowLetExpr(variable, bind_type, rhs, body):
 						frames = PerceusInsertMoreBindingFrames(
-							PerceusInsertBorrowLetRhsFrame(variable, bind_type, body),
+							PerceusInsertBorrowLetRhsFrame(current, variable, bind_type, body),
 							frames,
 						)
 						action = PerceusInsertVisitBindingExpr(rhs)
 					SeqExpr(first, second):
 						frames = PerceusInsertMoreBindingFrames(
-							PerceusInsertSequenceFirstFrame(second),
+							PerceusInsertSequenceFirstFrame(current, second),
 							frames,
 						)
 						action = PerceusInsertVisitBindingExpr(first)
@@ -16538,20 +16582,23 @@ private pure func insert_drops_expr_inner(env: PerceusEnv, expr: CoreExpr) -> Co
 						else:
 							void
 
-						rewritten_current: CoreExpr = insert_drops_non_binding_expr(env, current)
 						action = PerceusInsertRebuildBindingExpr(
-							inserted_non_binding_expr(
+							insert_drops_non_binding_expr(
 								env,
-								rewritten_current,
+								current,
 							),
 						)
 			PerceusInsertRebuildBindingExpr(rewritten):
 				debug:
 					perceus_work_insert_rebuild_actions()
 
+					if rewritten.reuses_source:
+						perceus_work_insert_original_nodes_reused()
+					else:
+						perceus_work_insert_node_reconstructions()
+
 				match frames:
 					PerceusInsertNoBindingFrame:
-						result = rewritten.expr
 						complete = True
 					PerceusInsertMoreBindingFrames(frame, remaining):
 						frames = remaining
@@ -16605,11 +16652,13 @@ private pure func insert_drops_expr_inner(env: PerceusEnv, expr: CoreExpr) -> Co
 										rebuilt,
 										plan.variable,
 										rewritten,
+										False,
 									),
 								)
-							PerceusInsertLetRhsFrame(variable, is_mutable, bind_type, body):
+							PerceusInsertLetRhsFrame(source, variable, is_mutable, bind_type, body):
 								frames = PerceusInsertMoreBindingFrames(
 									PerceusInsertLetBodyFrame(
+										source,
 										variable,
 										is_mutable,
 										bind_type,
@@ -16618,50 +16667,78 @@ private pure func insert_drops_expr_inner(env: PerceusEnv, expr: CoreExpr) -> Co
 									frames,
 								)
 								action = PerceusInsertVisitBindingExpr(body)
-							PerceusInsertLetBodyFrame(variable, is_mutable, bind_type, rewritten_rhs):
+							PerceusInsertLetBodyFrame(source, variable, is_mutable, bind_type, rewritten_rhs):
 								resolved_values = without_bound_value(resolved_values, variable)
+								reuses_source: Bool = (
+									rewritten_rhs.reuses_source
+									and rewritten.reuses_source
+								)
+
+								rebuilt: CoreExpr = if reuses_source:
+									source
+								else:
+									LetExpr(
+										variable,
+										is_mutable,
+										bind_type,
+										rewritten_rhs.expr,
+										rewritten.expr,
+									)
+
 								action = PerceusInsertRebuildBindingExpr(
 									inserted_binding_expr(
-										LetExpr(
-											variable,
-											is_mutable,
-											bind_type,
-											rewritten_rhs.expr,
-											rewritten.expr,
-										),
+										rebuilt,
 										variable,
 										rewritten,
+										reuses_source,
 									),
 								)
-							PerceusInsertBorrowLetRhsFrame(variable, bind_type, body):
+							PerceusInsertBorrowLetRhsFrame(source, variable, bind_type, body):
 								frames = PerceusInsertMoreBindingFrames(
-									PerceusInsertBorrowLetBodyFrame(variable, bind_type, rewritten),
+									PerceusInsertBorrowLetBodyFrame(
+										source,
+										variable,
+										bind_type,
+										rewritten,
+									),
 									frames,
 								)
 								action = PerceusInsertVisitBindingExpr(body)
-							PerceusInsertBorrowLetBodyFrame(variable, bind_type, rewritten_rhs):
+							PerceusInsertBorrowLetBodyFrame(source, variable, bind_type, rewritten_rhs):
 								resolved_values = without_bound_value(resolved_values, variable)
+								reuses_source: Bool = (
+									rewritten_rhs.reuses_source
+									and rewritten.reuses_source
+								)
+
+								rebuilt: CoreExpr = if reuses_source:
+									source
+								else:
+									BorrowLetExpr(
+										variable,
+										bind_type,
+										rewritten_rhs.expr,
+										rewritten.expr,
+									)
+
 								action = PerceusInsertRebuildBindingExpr(
 									inserted_binding_expr(
-										BorrowLetExpr(
-											variable,
-											bind_type,
-											rewritten_rhs.expr,
-											rewritten.expr,
-										),
+										rebuilt,
 										variable,
 										rewritten,
+										reuses_source,
 									),
 								)
-							PerceusInsertSequenceFirstFrame(second):
+							PerceusInsertSequenceFirstFrame(source, second):
 								frames = PerceusInsertMoreBindingFrames(
-									PerceusInsertSequenceSecondFrame(rewritten),
+									PerceusInsertSequenceSecondFrame(source, rewritten),
 									frames,
 								)
 								action = PerceusInsertVisitBindingExpr(second)
-							PerceusInsertSequenceSecondFrame(rewritten_first):
+							PerceusInsertSequenceSecondFrame(source, rewritten_first):
 								action = PerceusInsertRebuildBindingExpr(
 									inserted_sequence(
+										source,
 										rewritten_first,
 										rewritten,
 									),
@@ -16670,63 +16747,272 @@ private pure func insert_drops_expr_inner(env: PerceusEnv, expr: CoreExpr) -> Co
 								resolved_values = add_resolved_value(resolved_values, variable)
 								action = PerceusInsertRebuildBindingExpr(
 									inserted_expr(
-										rebuild_assignment(
-											env,
-											variable,
-											rewritten.expr,
-											typ,
-											loc,
-										),
+										rebuild_assignment(env, variable, rewritten.expr, typ, loc),
+										False,
 									),
 								)
 
-	result
+	-- Completion leaves the final result in the action itself. Reading it here
+	-- avoids allocating a placeholder PerceusInsertedExpr before every walk.
+	match action:
+		PerceusInsertRebuildBindingExpr(rewritten):
+			rewritten
+		PerceusInsertVisitBindingExpr(current):
+			-- The loop can exit only from the rebuild arm. Preserve a total,
+			-- non-panicking function if that state-machine invariant changes.
+			inserted_expr(current, True)
 
 
-private pure func insert_drops_non_binding_expr(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
+private pure func insert_drops_expr_inner(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
+	insert_drops_expr_inner_result(env, expr).expr
+
+
+private pure func opaque_inserted_non_binding_expr(
+	env: PerceusEnv,
+	expr: CoreExpr,
+) -> PerceusInsertedExpr:
+	debug:
+		perceus_work_insert_opaque_rewrite_results()
+
+	inserted_non_binding_expr(env, expr, False)
+
+
+private pure func insert_drops_non_binding_expr(
+	env: PerceusEnv,
+	expr: CoreExpr,
+) -> PerceusInsertedExpr:
 	match expr:
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
-			insert_drops_ownership_node(env, expr)
+			opaque_inserted_non_binding_expr(
+				env,
+				insert_drops_ownership_node(env, expr),
+			)
 		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
-			insert_drops_ownership_node(env, expr)
+			opaque_inserted_non_binding_expr(
+				env,
+				insert_drops_ownership_node(env, expr),
+			)
 		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
-			insert_drops_ownership_node(env, expr)
+			opaque_inserted_non_binding_expr(
+				env,
+				insert_drops_ownership_node(env, expr),
+			)
 		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
-			insert_drops_ownership_node(env, expr)
+			opaque_inserted_non_binding_expr(
+				env,
+				insert_drops_ownership_node(env, expr),
+			)
 		TupleExpr(items, typ, loc):
-			rewrite_aggregate_with_owned_field_aliases(env, expr)
+			opaque_inserted_non_binding_expr(
+				env,
+				rewrite_aggregate_with_owned_field_aliases(env, expr),
+			)
 		VectorExpr(items, typ, loc):
-			rewrite_aggregate_with_owned_field_aliases(env, expr)
+			opaque_inserted_non_binding_expr(
+				env,
+				rewrite_aggregate_with_owned_field_aliases(env, expr),
+			)
 		RecordExpr(fields, typ, loc):
-			rewrite_aggregate_with_owned_field_aliases(env, expr)
+			opaque_inserted_non_binding_expr(
+				env,
+				rewrite_aggregate_with_owned_field_aliases(env, expr),
+			)
 		RecordUpdateExpr(base, fields, typ, loc):
-			rewrite_aggregate_with_owned_field_aliases(env, expr)
+			opaque_inserted_non_binding_expr(
+				env,
+				rewrite_aggregate_with_owned_field_aliases(env, expr),
+			)
 		RecordReuseExpr(source, fields, typ, loc):
-			rewrite_aggregate_with_owned_field_aliases(env, expr)
+			opaque_inserted_non_binding_expr(
+				env,
+				rewrite_aggregate_with_owned_field_aliases(env, expr),
+			)
 		RecordCowUpdateExpr(source, fields, typ, loc):
-			rewrite_aggregate_with_owned_field_aliases(env, expr)
+			opaque_inserted_non_binding_expr(
+				env,
+				rewrite_aggregate_with_owned_field_aliases(env, expr),
+			)
 		RecordConstructExpr(type_name, fields, typ, loc):
-			rewrite_aggregate_with_owned_field_aliases(env, expr)
+			opaque_inserted_non_binding_expr(
+				env,
+				rewrite_aggregate_with_owned_field_aliases(env, expr),
+			)
 		ListConstructExpr(construct, typ, loc):
-			rewrite_aggregate_with_owned_field_aliases(env, expr)
+			opaque_inserted_non_binding_expr(
+				env,
+				rewrite_aggregate_with_owned_field_aliases(env, expr),
+			)
 		TensorBoxedLiteralExpr(literal, typ, loc):
-			rewrite_aggregate_with_owned_field_aliases(env, expr)
+			opaque_inserted_non_binding_expr(
+				env,
+				rewrite_aggregate_with_owned_field_aliases(env, expr),
+			)
 		DictConstructExpr(construct, typ, loc):
-			rewrite_aggregate_with_owned_field_aliases(env, expr)
+			opaque_inserted_non_binding_expr(
+				env,
+				rewrite_aggregate_with_owned_field_aliases(env, expr),
+			)
 		UnionConstructExpr(construct, typ, loc):
-			rewrite_aggregate_with_owned_field_aliases(env, expr)
+			opaque_inserted_non_binding_expr(
+				env,
+				rewrite_aggregate_with_owned_field_aliases(env, expr),
+			)
 		CallExpr(kind, callee, args, typ, loc):
-			insert_drops_ownership_node(env, expr)
+			opaque_inserted_non_binding_expr(
+				env,
+				insert_drops_ownership_node(env, expr),
+			)
 		UnboxExpr(kind, inner, typ, loc):
-			insert_drops_ownership_node(env, expr)
+			opaque_inserted_non_binding_expr(
+				env,
+				insert_drops_ownership_node(env, expr),
+			)
 		BinaryExpr(op, left, right, typ, loc):
-			insert_drops_ownership_node(env, expr)
+			opaque_inserted_non_binding_expr(
+				env,
+				insert_drops_ownership_node(env, expr),
+			)
 		FieldExpr(owner, field, typ, loc):
-			insert_drops_ownership_node(env, expr)
+			opaque_inserted_non_binding_expr(
+				env,
+				insert_drops_ownership_node(env, expr),
+			)
 		TupleFieldExpr(owner, field_index, typ, loc):
-			insert_drops_ownership_node(env, expr)
+			opaque_inserted_non_binding_expr(
+				env,
+				insert_drops_ownership_node(env, expr),
+			)
 		_:
-			insert_drops_normalized_expr(env, expr)
+			insert_drops_change_aware_normalized_expr(env, expr)
+
+
+private pure func insert_drops_change_aware_normalized_expr(
+	env: PerceusEnv,
+	expr: CoreExpr,
+) -> PerceusInsertedExpr:
+	match expr:
+		LiteralExpr(literal, typ, loc):
+			inserted_expr(expr, True)
+		StaticStringLiteralExpr(id, value, typ, loc):
+			inserted_expr(expr, True)
+		VarExpr(variable, typ, loc):
+			inserted_expr(expr, True)
+		VoidExpr(typ, loc):
+			inserted_expr(expr, True)
+		CooperativeCheckpointExpr(typ, loc):
+			inserted_expr(expr, True)
+		BreakExpr(typ, loc):
+			inserted_expr(expr, True)
+		ContinueExpr(typ, loc):
+			inserted_expr(expr, True)
+		SetAllocExpr(alloc, typ, loc):
+			inserted_expr(expr, True)
+		DebugBlockExpr(body, typ, loc):
+			rewritten_body: PerceusInsertedExpr = insert_drops_expr_inner_result(env, body)
+
+			if rewritten_body.reuses_source:
+				inserted_expr(expr, True)
+			else:
+				inserted_expr(
+					DebugBlockExpr(rewritten_body.expr, typ, loc),
+					False,
+				)
+		UnaryExpr(op, value, typ, loc):
+			rewritten_value: PerceusInsertedExpr = insert_drops_expr_inner_result(env, value)
+
+			if rewritten_value.reuses_source:
+				inserted_expr(expr, True)
+			else:
+				inserted_expr(
+					UnaryExpr(op, rewritten_value.expr, typ, loc),
+					False,
+				)
+		CastExpr(inner, typ, loc):
+			rewritten_inner: PerceusInsertedExpr = insert_drops_expr_inner_result(env, inner)
+
+			if rewritten_inner.reuses_source:
+				inserted_expr(expr, True)
+			else:
+				inserted_expr(
+					CastExpr(rewritten_inner.expr, typ, loc),
+					False,
+				)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			rewritten_cond: PerceusInsertedExpr = insert_drops_expr_inner_result(env, cond)
+			rewritten_then: PerceusInsertedExpr = insert_drops_expr_inner_result(env, then_expr)
+			rewritten_else: PerceusInsertedExpr = insert_drops_expr_inner_result(env, else_expr)
+			reuses_source: Bool = (
+				rewritten_cond.reuses_source
+				and rewritten_then.reuses_source
+				and rewritten_else.reuses_source
+			)
+
+			if reuses_source:
+				inserted_expr(expr, True)
+			else:
+				inserted_expr(
+					IfExpr(rewritten_cond.expr, rewritten_then.expr, rewritten_else.expr, typ, loc),
+					False,
+				)
+		WhileExpr(cond, body, typ, loc):
+			rewritten_cond: PerceusInsertedExpr = insert_drops_expr_inner_result(env, cond)
+			rewritten_body: PerceusInsertedExpr = insert_drops_expr_inner_result(env, body)
+			reuses_source: Bool = rewritten_cond.reuses_source and rewritten_body.reuses_source
+
+			if reuses_source:
+				inserted_expr(expr, True)
+			else:
+				inserted_expr(
+					WhileExpr(rewritten_cond.expr, rewritten_body.expr, typ, loc),
+					False,
+				)
+		RangeExpr(start, end_value, typ, loc):
+			rewritten_start: PerceusInsertedExpr = insert_drops_expr_inner_result(env, start)
+			rewritten_end: PerceusInsertedExpr = insert_drops_expr_inner_result(env, end_value)
+			reuses_source: Bool = rewritten_start.reuses_source and rewritten_end.reuses_source
+
+			if reuses_source:
+				inserted_expr(expr, True)
+			else:
+				inserted_expr(
+					RangeExpr(rewritten_start.expr, rewritten_end.expr, typ, loc),
+					False,
+				)
+		PreClosureDetachExpr(detached, typ, loc):
+			rewritten: PerceusInsertedExpr = insert_drops_expr_inner_result(env, detached)
+
+			if rewritten.reuses_source:
+				inserted_expr(expr, True)
+			else:
+				inserted_expr(
+					PreClosureDetachExpr(rewritten.expr, typ, loc),
+					False,
+				)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			rewritten_body: PerceusInsertedExpr = insert_drops_expr_inner_result(env, body)
+
+			if rewritten_body.reuses_source:
+				inserted_expr(expr, True)
+			else:
+				inserted_expr(
+					DupExpr(variable, value_type, retain_policy, rewritten_body.expr, typ, loc),
+					False,
+				)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			rewritten_body: PerceusInsertedExpr = insert_drops_expr_inner_result(env, body)
+
+			if rewritten_body.reuses_source:
+				inserted_expr(expr, True)
+			else:
+				inserted_expr(
+					DropExpr(variable, value_type, release_policy, rewritten_body.expr, typ, loc),
+					False,
+				)
+		_:
+			opaque_inserted_non_binding_expr(
+				env,
+				insert_drops_normalized_expr(env, expr),
+			)
 
 
 private pure func insert_drops_normalized_expr(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
@@ -23655,10 +23941,13 @@ private pure func simple_consumed_parameter_catalog(
 
 
 -- This proof recognizes only a linear post-insertion body where balancing
--- every consumed parameter is an identity operation. Calls, branches,
--- aliases, repetition, shadowing, and ownership nodes for parameters all
--- reject the proof and retain the established parameter-by-parameter logic.
+-- every consumed parameter is an identity operation. A call is supported only
+-- when its exact ownership contract directly consumes each referenced
+-- candidate once. Borrowed arguments, branches, aliases, repetition,
+-- shadowing, and ownership nodes for parameters all retain the established
+-- parameter-by-parameter logic.
 private pure func prove_simple_consumed_parameter_balance(
+	env: PerceusEnv,
 	catalog: SimpleConsumedParameterCatalog,
 	body: CoreExpr,
 ) -> SimpleConsumedParameterBalance:
@@ -23716,6 +24005,72 @@ private pure func prove_simple_consumed_parameter_balance(
 								pending = SimpleConsumedParameterScanMore(let_body, pending)
 							else:
 								supported = False
+						CallExpr(kind, callee, args, typ, loc):
+							callee_is_unrelated_function: Bool = match callee:
+								VarExpr(variable, _, _):
+									not catalog.all_parameter_names.contains(variable.name)
+								_:
+									False
+
+							if not callee_is_unrelated_function:
+								supported = False
+							else:
+								match contract_for_call(env, kind, args.length(), typ):
+									Some(contract):
+										var arg_index: Int = 0
+
+										while supported and arg_index < args.length():
+											match args.get(arg_index):
+												Some(argument):
+													match contract.args.get(arg_index):
+														Some(mode):
+															match argument:
+																VarExpr(variable, _, _):
+																	variable_name: String = variable.name
+
+																	match catalog.consumed_indices_by_name.get(
+																		variable_name,
+																	):
+																		Some(index):
+																			if (
+																				arg_consumes_caller(
+																					mode,
+																				)
+																				and variable.uniq == 0
+																				and variable.def_id == None
+																				and not observed_indices.contains(
+																					index,
+																				)
+																			):
+																				observed_indices = observed_indices.set(
+																					index,
+																					True,
+																				)
+																				observed_count += 1
+																			else:
+																				supported = False
+																		None:
+																			supported = False
+																LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _):
+																	void
+																_:
+																	supported = False
+														None:
+															supported = False
+												None:
+													supported = False
+
+											arg_index += 1
+									None:
+										supported = False
+						CastExpr(inner, _, _):
+							if (
+								not is_managed_type(env, core_expr_type(inner))
+								and not is_managed_type(env, core_expr_type(expr))
+							):
+								pending = SimpleConsumedParameterScanMore(inner, pending)
+							else:
+								supported = False
 						DropExpr(variable, value_type, release_policy, drop_body, typ, loc):
 							if catalog.all_parameter_names.contains(variable.name):
 								supported = False
@@ -23747,7 +24102,7 @@ pure func consumed_parameter_balancing_is_identity(
 		consumed_params,
 	):
 		Some(catalog):
-			match prove_simple_consumed_parameter_balance(catalog, body):
+			match prove_simple_consumed_parameter_balance(env, catalog, body):
 				UnchangedSimpleConsumedParameterBalance:
 					True
 				UnsupportedSimpleConsumedParameterBalance:

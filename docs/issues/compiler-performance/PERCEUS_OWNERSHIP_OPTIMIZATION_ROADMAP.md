@@ -1,6 +1,6 @@
 # Perceus Ownership Optimization Roadmap
 
-**Status:** Tranches 0–3 implemented; Tranches 4–9 proposed
+**Status:** Tranches 0–4 and 7A–7B implemented; Tranches 5–6 and 8–9 proposed
 
 ## Objective
 
@@ -1163,6 +1163,34 @@ realizing the prospective 10% improvement. See
 - Compiler self-compilation is reprofiled after 4D. Its result guides the
   Tranche 5 stop/go decision but is not substituted for the focused gates.
 
+### Post-Tranche-4 stop/go result
+
+The required self profile is complete. Borrowed-boundary normalization is no
+longer a leading Perceus cost. General insertion/reconstruction is largest, and
+consumed-parameter balancing is the clearest remaining multiplicative family.
+
+The fixed 644-node nested-call fixture grew from 112,363 scalar-summary visits
+at one consumed owner to 60,347,649 visits at 128 owners while insertion stayed
+fixed at 5,159 visits. [Issue 59](59-skip-identity-consumed-parameter-balancing.md)
+therefore extends the existing broad-signature identity proof to exact
+contract-directed consuming calls. At 32 owners it reduces the direct Perceus
+median by 99.8% and allocations by 99.87% with byte-identical Core. Compiler
+self-compilation is neutral, so this is recorded as a scaling fix rather than a
+self-host speedup.
+
+This evidence changes the Tranche 5 order: migrate consumed-parameter
+whole-body and branch summaries first. Do not build unrelated all-value fact
+consumers merely because they appeared earlier in the original list.
+
+Before starting that larger analysis product, a bounded change-aware insertion
+checkpoint reused the immediate source Core node for proven ownership-neutral
+leaves, simple shells, and unchanged unmanaged binding spines. On the
+8,838-node linear direct-Perceus fixture, 8,644 insertion results reused their
+source; measured-window allocations fell 5.97% and time fell 3.93%, with
+byte-identical post-Perceus
+Core. Ownership-sensitive helper families remain explicitly conservative. See
+[`compiler_perceus_change_aware_insertion_2026-09-07.md`](../../../benchmarks/results/compiler_perceus_change_aware_insertion_2026-09-07.md).
+
 ## Tranche 5: Build All-Value Ownership Facts Once
 
 ### Change
@@ -1214,14 +1242,14 @@ compile time or ownership ingress.
 
 ### Incremental consumers
 
-Cut over and delete one old query family at a time:
+Cut over and delete one old query family at a time, in measured order:
 
-1. unused managed-let detection;
-2. single-direct-consume detection;
-3. referenced borrowed match-binding detection;
-4. whole-body legacy balance summaries;
-5. nested branch summaries; and
-6. repetition summaries and scalar `count_uses` fallbacks.
+1. consumed-parameter whole-body legacy balance summaries;
+2. consumed-parameter nested branch summaries;
+3. repetition summaries and scalar `count_uses` fallbacks;
+4. unused managed-let detection;
+5. single-direct-consume detection; and
+6. referenced borrowed match-binding detection.
 
 Each cutover is a mergeable checkpoint with its own counter improvement.
 

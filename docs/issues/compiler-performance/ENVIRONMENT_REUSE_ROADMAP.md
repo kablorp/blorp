@@ -1,6 +1,7 @@
 # Stage 06 Environment Reuse Roadmap
 
-**Status:** Complete through Issue 43; Issue 44 remains conditional
+**Status:** Issue 44 selected a candidate; Issue 59 is ready for admission
+measurement before any production implementation
 
 ## Objective
 
@@ -105,7 +106,9 @@ Continuation after 37
    |
   43 delete legacy materialization and reprofile
    |
-  44 optimize lexical environments only if still measured
+  44 select a measured lexical-environment target
+   |
+  59 measure, then conditionally batch lexical parameter scope publication
 ```
 
 ## Parallelization
@@ -202,9 +205,12 @@ adapters. Accepted aliases now check their retained authority before
 provisional target/containment conversion, removing exactly 24,177 resolved
 shape conversions in the measured compiler self-check. Median Phase 01-06
 retired instructions fell 1.298% and median peak footprint fell 0.788% versus
-the Issue 42 parent. Remaining sampled cost is broad ARC/list/dictionary work;
-Issue 44 remains conditional on identifying a specific lexical-environment
-hotspot rather than treating those runtime families as sufficient evidence.
+the Issue 42 parent. The later 2026-09-07 Phase 01-06 profile identified scalar
+scope publication as a candidate family while keeping the broad
+ARC/list/dictionary sample explicitly unattributed. Issue 44 selects function
+and lambda parameter scope entry for exact attribution. Issue 59 owns that
+admission measurement and permits production implementation only if its
+wide-parameter fail-fast gate passes.
 
 ### Later declaration families
 
@@ -214,8 +220,10 @@ writers, and readers from the same `Env`, module-view, and declaration-query
 surfaces. Parallel implementation would create avoidable conflicts and a risk
 of temporary dual authority.
 
-Issue 43 is strictly last. Issue 44 is conditional and starts only if the final
-profile still identifies lexical environment work as material.
+Issue 43 remains the final declaration-materialization audit. Issue 44 has
+selected one lexical candidate for measurement; Issue 59 must first attribute
+its production cost and remain limited to function and lambda parameter
+scope-entry publication if admitted.
 
 ## Issues
 
@@ -239,6 +247,7 @@ profile still identifies lexical environment work as material.
 
 - [43 — Delete legacy environment materialization and reprofile](43-delete-legacy-environment-materialization-and-reprofile.md)
 - [44 — Optimize lexical environments only if still measured](44-optimize-lexical-environments-if-measured.md)
+- [59 — Batch lexical parameter scope publication](59-batch-lexical-parameter-scope-publication.md)
 
 ## Merge Discipline
 

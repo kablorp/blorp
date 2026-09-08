@@ -1,12 +1,12 @@
 # Optimize Lexical Environments Only If Still Measured
 
-**Status:** Conditional on Issue 43 profile evidence
+**Status:** Candidate selected; Issue 59 owns the required admission measurement
 
-**Dependencies:** Issue 43 and a measured remaining lexical-environment
-bottleneck
+**Dependencies:** Issue 43 is complete
 
-**Parallel work:** None specified until the profile identifies an isolated
-target.
+**Parallel work:** Decision work is complete. Issue 59 edits `env.brp`,
+`decl.brp`, and `infer.brp`; coordinate any concurrent Stage 06 changes to
+those files before integration.
 
 ## Objective
 
@@ -16,6 +16,32 @@ scope construction, copying, lookup, or destruction remains material.
 
 This issue is a decision gate, not authorization to redesign `Scope` in
 advance.
+
+## Candidate Selection
+
+The 2026-09-07 Phase 01-06 profile identified repeated scalar scope publication
+as a candidate family. The instrumented compiler self-check called
+`scope_add_symbol` approximately 198,000 times and `env_add_symbol`
+approximately 185,000 times. Ordinary name lookup remained inexpensive at
+about 17-18 ns per query in the optimized isolated benchmark.
+
+Those aggregate counts include every publication caller. The maintained
+function-heavy fixture also has only one parameter and one local declaration
+per generated function, so its 1,152 wrapper calls do not isolate parameter
+installation or demonstrate a wide-parameter batching payoff.
+
+Broad ARC/list/dictionary samples are not attributed wholesale to lexical
+environments. They only motivate removing unobserved snapshots. The selected
+candidate is therefore limited to the existing scope-entry boundary at which
+all ordinary function or lambda parameters are already known, but production
+implementation remains conditional on call-path attribution and a
+wide-parameter fail-fast benchmark.
+
+The implementation brief, profiling protocol, semantic invariants, stop
+conditions, Phase 0 admission gate, and acceptance thresholds are recorded in
+[Issue 59: Batch Lexical Parameter Scope Publication](59-batch-lexical-parameter-scope-publication.md).
+This decision document remains the roadmap terminus; implementation belongs to
+Issue 59.
 
 ## Entry Criteria
 
