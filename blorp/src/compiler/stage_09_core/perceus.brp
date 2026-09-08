@@ -23655,10 +23655,13 @@ private pure func simple_consumed_parameter_catalog(
 
 
 -- This proof recognizes only a linear post-insertion body where balancing
--- every consumed parameter is an identity operation. Calls, branches,
--- aliases, repetition, shadowing, and ownership nodes for parameters all
--- reject the proof and retain the established parameter-by-parameter logic.
+-- every consumed parameter is an identity operation. A call is supported only
+-- when its exact ownership contract directly consumes each referenced
+-- candidate once. Borrowed arguments, branches, aliases, repetition,
+-- shadowing, and ownership nodes for parameters all retain the established
+-- parameter-by-parameter logic.
 private pure func prove_simple_consumed_parameter_balance(
+	env: PerceusEnv,
 	catalog: SimpleConsumedParameterCatalog,
 	body: CoreExpr,
 ) -> SimpleConsumedParameterBalance:
@@ -23716,6 +23719,63 @@ private pure func prove_simple_consumed_parameter_balance(
 								pending = SimpleConsumedParameterScanMore(let_body, pending)
 							else:
 								supported = False
+						CallExpr(kind, callee, args, typ, loc):
+							callee_is_unrelated_function: Bool = match callee:
+								VarExpr(variable, _, _):
+									not catalog.all_parameter_names.contains(variable.name)
+								_:
+									False
+
+							if not callee_is_unrelated_function:
+								supported = False
+							else:
+								match contract_for_call(env, kind, args.length(), typ):
+									Some(contract):
+										var arg_index: Int = 0
+
+										while supported and arg_index < args.length():
+											match args.get(arg_index):
+												Some(argument):
+													match contract.args.get(arg_index):
+														Some(mode):
+															match argument:
+																VarExpr(variable, _, _):
+																	variable_name: String = variable.name
+
+																	match catalog.consumed_indices_by_name.get(variable_name):
+																		Some(index):
+																			if (
+																				arg_consumes_caller(mode)
+																				and variable.uniq == 0
+																				and variable.def_id == None
+																				and not observed_indices.contains(index)
+																			):
+																				observed_indices = observed_indices.set(index, True)
+																				observed_count += 1
+																			else:
+																				supported = False
+																		None:
+																			supported = False
+																LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _):
+																	void
+																_:
+																	supported = False
+														None:
+															supported = False
+												None:
+													supported = False
+
+											arg_index += 1
+									None:
+										supported = False
+						CastExpr(inner, _, _):
+							if (
+								not is_managed_type(env, core_expr_type(inner))
+								and not is_managed_type(env, core_expr_type(expr))
+							):
+								pending = SimpleConsumedParameterScanMore(inner, pending)
+							else:
+								supported = False
 						DropExpr(variable, value_type, release_policy, drop_body, typ, loc):
 							if catalog.all_parameter_names.contains(variable.name):
 								supported = False
@@ -23747,7 +23807,7 @@ pure func consumed_parameter_balancing_is_identity(
 		consumed_params,
 	):
 		Some(catalog):
-			match prove_simple_consumed_parameter_balance(catalog, body):
+			match prove_simple_consumed_parameter_balance(env, catalog, body):
 				UnchangedSimpleConsumedParameterBalance:
 					True
 				UnsupportedSimpleConsumedParameterBalance:

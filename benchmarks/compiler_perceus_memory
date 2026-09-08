@@ -183,6 +183,7 @@ CONTRACT_FIXTURE_LET_NODES = 2
 PRIMITIVE_PARAMETER_TYPE = "Int"
 MANAGED_PARAMETER_TYPE = "String"
 BORROWED_OWNER_TYPE_NAME = "BenchBorrowOwner"
+PERCEUS_SENTINEL_NAME = "BENCH_PERCEUS_SENTINEL"
 AGGREGATE_ESCAPE_SITES_PER_FUNCTION = 12
 RESULT_ALIAS_TERMINALS_PER_FUNCTION = 32
 REFERENCED_GLOBAL_MATRIX_GLOBALS = 384
@@ -504,6 +505,26 @@ def literal_expr(kind: str, value: Any, type_name: str) -> JsonObject:
         "kind": "literal",
         "literal": {"kind": kind, "value": value},
         "type": named_type(type_name),
+        "loc": synthetic_loc(),
+    }
+
+
+def mortal_string_expr(value: str) -> JsonObject:
+    """Construct one owned String for the fixed-cost Perceus sentinel."""
+    return {
+        "kind": "call",
+        "call_kind": {"kind": "builtin", "name": "blorp_string_concat"},
+        "callee": {
+            "kind": "var",
+            "var": core_var("blorp_string_concat", None),
+            "type": named_type("Function"),
+            "loc": synthetic_loc(),
+        },
+        "args": [
+            literal_expr("string", value, MANAGED_PARAMETER_TYPE),
+            literal_expr("string", "", MANAGED_PARAMETER_TYPE),
+        ],
+        "type": named_type(MANAGED_PARAMETER_TYPE),
         "loc": synthetic_loc(),
     }
 
@@ -2195,10 +2216,18 @@ def fixture_request(
             for index in range(function_count)
         ]
     main_expressions.append(literal_expr("int", 0, "Int"))
+    main_body = {
+        "kind": "let",
+        "name": core_var(PERCEUS_SENTINEL_NAME, None),
+        "mutable": False,
+        "type": named_type(MANAGED_PARAMETER_TYPE),
+        "rhs": mortal_string_expr("perceus-sentinel"),
+        "body": seq_expr(main_expressions),
+    }
     main_json = user_function(
         "main",
         first_function_id + function_count,
-        seq_expr(main_expressions),
+        main_body,
     )
     core_program = {
         "kind": "program",
@@ -2222,7 +2251,9 @@ def input_expression_count(
     invoke_workers: bool = True,
 ) -> int:
     worker_nodes = function_count * ((2 * body_leaves) + 1)
-    main_nodes = 1
+    # One LetExpr and its four-node mortal String call form a fixed-cost
+    # Perceus sentinel outside every worker scaling axis.
+    main_nodes = 6
     if invoke_workers:
         call_nodes = 3 + params_per_function
         main_nodes += function_count * call_nodes
@@ -2428,23 +2459,23 @@ def project_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def has_expected_managed_local_drop(value: Any) -> bool:
+def has_expected_perceus_sentinel_drop(value: Any) -> bool:
     if isinstance(value, dict):
         variable = value.get("var")
         value_type = value.get("value_type")
         if (
             value.get("kind") == "drop"
             and isinstance(variable, dict)
-            and variable.get("name") == "BENCH_MANAGED_LOCAL_0000"
+            and variable.get("name") == PERCEUS_SENTINEL_NAME
             and isinstance(value_type, dict)
             and value_type.get("kind") == "named"
             and value_type.get("name") == "String"
             and value.get("release_policy") == "arc"
         ):
             return True
-        return any(has_expected_managed_local_drop(child) for child in value.values())
+        return any(has_expected_perceus_sentinel_drop(child) for child in value.values())
     if isinstance(value, list):
-        return any(has_expected_managed_local_drop(child) for child in value)
+        return any(has_expected_perceus_sentinel_drop(child) for child in value)
     return False
 
 
@@ -2678,9 +2709,9 @@ def validate_response(
         MEASURE_OWNERSHIP_PREPARATION_PERCEUS_ACTION,
         MEASURE_PERCEUS_DIRECT_ACTION,
     ):
-        if not has_expected_managed_local_drop(output):
+        if not has_expected_perceus_sentinel_drop(output):
             raise RuntimeError(
-                "Perceus Core is missing the expected managed-local ownership event"
+                "Perceus Core is missing the fixed sentinel ownership event"
             )
     return len(encoded_output), hashlib.sha256(encoded_output).hexdigest()
 

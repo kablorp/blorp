@@ -53,13 +53,14 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
             params_per_function=params_per_function,
             parameter_type=parameter_type,
         )
-        worker = program["decls"][global_count]
-        worker["body"] = {
+        main = program["decls"][-1]
+        sentinel_body = main["body"]["body"]
+        main["body"]["body"] = {
             "kind": "drop",
-            "var": self.benchmark.core_var("BENCH_MANAGED_LOCAL_0000", None),
+            "var": self.benchmark.core_var(self.benchmark.PERCEUS_SENTINEL_NAME, None),
             "value_type": self.benchmark.named_type("String"),
             "release_policy": "arc",
-            "body": worker["body"],
+            "body": sentinel_body,
             "type": self.benchmark.named_type("Int"),
             "loc": self.benchmark.synthetic_loc(),
         }
@@ -69,6 +70,39 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
         request, _ = self.benchmark.fixture_request(4, 2, 4, 1)
 
         self.assertEqual(request["action"], self.benchmark.PERCEUS_ACTION)
+
+    def test_perceus_sentinel_is_outside_fixed_worker_geometry(self) -> None:
+        _, program = self.benchmark.fixture_request(
+            1,
+            2,
+            128,
+            0,
+            params_per_function=8,
+            body_shape="borrowed_call_protection",
+        )
+
+        workers = [
+            declaration
+            for declaration in program["decls"]
+            if isinstance(declaration.get("name"), str)
+            and declaration["name"].startswith("bench_worker_")
+        ]
+        main = next(
+            declaration
+            for declaration in program["decls"]
+            if declaration.get("name") == "main"
+        )
+
+        self.assertTrue(all(
+            self.benchmark.expression_node_count(worker["body"]) == 128
+            for worker in workers
+        ))
+        self.assertEqual(main["body"]["kind"], "let")
+        self.assertEqual(
+            main["body"]["name"]["name"],
+            self.benchmark.PERCEUS_SENTINEL_NAME,
+        )
+        self.assertEqual(main["body"]["rhs"]["kind"], "call")
 
     def test_measurement_windows_have_explicit_actions_and_labels(self) -> None:
         self.assertEqual(
@@ -449,7 +483,7 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
             for declaration in program["decls"]
             if declaration.get("name") == "main"
         )
-        call = main["body"]["first"]
+        call = main["body"]["body"]["first"]
 
         self.assertEqual(
             [argument["kind"] for argument in call["args"]],
