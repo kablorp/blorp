@@ -1,12 +1,13 @@
 # Optimize Lexical Environments Only If Still Measured
 
-**Status:** Candidate selected; Issue 59 owns the required admission measurement
+**Status:** Complete; Issue 59 rejected parameter batching and retained only a
+smaller scalar scope-list cleanup
 
 **Dependencies:** Issue 43 is complete
 
-**Parallel work:** Decision work is complete. Issue 59 edits `env.brp`,
-`decl.brp`, and `infer.brp`; coordinate any concurrent Stage 06 changes to
-those files before integration.
+**Parallel work:** Decision work is complete. Issue 59's rejected batching
+prototype was removed. Its retained production cleanup is confined to
+`type_system/env.brp`.
 
 ## Objective
 
@@ -42,6 +43,16 @@ conditions, Phase 0 admission gate, and acceptance thresholds are recorded in
 [Issue 59: Batch Lexical Parameter Scope Publication](59-batch-lexical-parameter-scope-publication.md).
 This decision document remains the roadmap terminus; implementation belongs to
 Issue 59.
+
+Issue 59's 2026-09-08 fail-fast prototype did not meet the required allocation
+or wide retired-instruction thresholds and regressed exact one-parameter
+allocation counts. Its production and profiling changes were removed. The
+measurement record remains in Issue 59, and no lexical environment redesign is
+authorized by this roadmap. A subsequent review did retain a separate
+deletion-heavy cleanup: current-scope replacement now uses `List.set`, and
+scope removal uses `List.drop`, instead of rebuilding those lists with manual
+`get`/`append` loops. This preserves scalar publication and measured a small
+reduction in whole-compiler retired instructions.
 
 ## Entry Criteria
 
