@@ -1,6 +1,5 @@
 import:
 	../../src/lib/build_artifact:
-		BuildOptimization(BuildFast, BuildRelease),
 		BuildPlatform(BuildLinux, BuildMacos),
 		BuildSanitizer(BuildAddressUndefinedSanitizer, BuildNoSanitizer),
 	../../src/lib/host_c:
@@ -42,7 +41,6 @@ private pure func configuration(cache_root: String) -> RuntimeCacheConfiguration
 		identity = "cc test identity",
 		target_identity = "test-target",
 		platform = BuildLinux,
-		optimization = BuildFast,
 		sanitizer = BuildNoSanitizer,
 		tls = {
 			backend = HostTlsUnsupported,
@@ -85,7 +83,6 @@ pure func test_cache_key_covers_semantic_inputs() -> Bool:
 		runtime_cache_key({ base | identity = "other identity" }),
 		runtime_cache_key({ base | target_identity = "other target" }),
 		runtime_cache_key({ base | platform = BuildMacos }),
-		runtime_cache_key({ base | optimization = BuildRelease }),
 		runtime_cache_key({ base | sanitizer = BuildAddressUndefinedSanitizer }),
 		runtime_cache_key({ base | tls = openssl }),
 		runtime_cache_key(
@@ -171,6 +168,69 @@ private func test_cache_reuses_and_repairs_verified_entries() -> Bool:
 
 private func interrupt_runtime_compiler(_: ProcessCommand) -> RuntimeCacheCompileExecution:
 	RuntimeCacheCompileInterrupted(2, "partial stdout".to_bytes(), "partial stderr".to_bytes())
+
+
+private func inspect_optimized_runtime_compiler(
+	request: ProcessCommand,
+) -> RuntimeCacheCompileExecution:
+	signal: Int = if request.args.contains("-O2") and not request.args.contains("-O0"):
+		2
+	else:
+		3
+
+	RuntimeCacheCompileInterrupted(signal, "".to_bytes(), "".to_bytes())
+
+
+private func inspect_sanitized_runtime_compiler(
+	request: ProcessCommand,
+) -> RuntimeCacheCompileExecution:
+	signal: Int = if request.args.contains("-O0") and not request.args.contains("-O2"):
+		2
+	else:
+		3
+
+	RuntimeCacheCompileInterrupted(signal, "".to_bytes(), "".to_bytes())
+
+
+private func exercise_cached_runtime_optimization() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_runtime_cache_optimization_"):
+		match prepare_runtime_cache_with_runner(
+			configuration(directory.resource_path() + "/cas"),
+			inspect_optimized_runtime_compiler,
+		):
+			Err(RuntimeCacheInterrupted(signal, _, _)):
+				Ok(signal == 2)
+			_:
+				Ok(False)
+
+
+private func test_cached_runtime_uses_release_optimization() -> Bool:
+	match exercise_cached_runtime_optimization():
+		Ok(result):
+			result
+		Err(_):
+			False
+
+
+private func exercise_sanitized_runtime_optimization() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_runtime_cache_sanitized_"):
+		configured = { configuration(directory.resource_path() + "/cas") |
+			sanitizer = BuildAddressUndefinedSanitizer
+		}
+
+		match prepare_runtime_cache_with_runner(configured, inspect_sanitized_runtime_compiler):
+			Err(RuntimeCacheInterrupted(signal, _, _)):
+				Ok(signal == 2)
+			_:
+				Ok(False)
+
+
+private func test_sanitized_runtime_retains_debug_optimization() -> Bool:
+	match exercise_sanitized_runtime_optimization():
+		Ok(result):
+			result
+		Err(_):
+			False
 
 
 private func exercise_interrupted_cold_cache() -> Result[Bool, IOError]:
@@ -296,6 +356,11 @@ tests: TestSuite = {
 	description = "Blorp compiler runtime cache",
 	tests = [
 		("cache key covers semantic inputs", test_cache_key_covers_semantic_inputs),
+		("cached runtime uses release optimization", test_cached_runtime_uses_release_optimization),
+		(
+			"sanitized runtime retains debug optimization",
+			test_sanitized_runtime_retains_debug_optimization,
+		),
 		(
 			"cache reuses and repairs verified entries",
 			test_cache_reuses_and_repairs_verified_entries,

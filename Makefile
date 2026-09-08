@@ -1,6 +1,6 @@
 # Blorp Compiler Makefile
 
-.PHONY: all build build-blorp-cli generate-blorp-cli-c prepare-blorp-cli-c compile-prepared-blorp-cli compile-blorp-cli install-prepared-blorp-cli compiler-build-source-generator install warm warm-formatter clean test smoke runtime-test test-asan compiler-blorp-test compiler-tools-test compiler-core-sanitize-test compiler-blorp-sanitize-test lsp-test package-test c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all force-generated-sources
+.PHONY: all build build-blorp-cli generate-blorp-cli-c prepare-blorp-cli-c prepare-blorp-cli-runtime compile-prepared-blorp-cli compile-blorp-cli install-prepared-blorp-cli compiler-build-source-generator install warm warm-formatter clean test smoke runtime-test test-asan compiler-blorp-test compiler-tools-test compiler-core-sanitize-test compiler-blorp-sanitize-test lsp-test package-test c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all force-generated-sources
 
 STANDARD_LIBRARY_SOURCE_ROOT := standard_library/src
 STANDARD_LIBRARY_TEST_ROOT := standard_library/test
@@ -15,7 +15,8 @@ BLORP_CLI_C_INPUT_HASH := $(BLORP_CLI_BUILD_DIR)/generated-c-inputs.sha256
 BLORP_CLI_C_HASH := $(BLORP_CLI_BUILD_DIR)/blorp_cli_main.c.sha256
 BLORP_CLI_C_BUILD_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/generated-c-build-inputs.sha256
 BLORP_CLI_C_OPTIMIZATION ?= -O0
-BLORP_CLI_RUNTIME_CONFIG_HASH := $(shell { printf '%s\n' '$(BLORP_CLI_C_OPTIMIZATION)' '-fwrapv -pipe -w -DMINICORO_IMPL -DBLORP_COMPILER_RUNTIME_SOURCES=1'; command -v cc; cc --version 2>/dev/null | head -n 1; } | shasum -a 256 | awk '{print $$1}')
+BLORP_CLI_RUNTIME_C_OPTIMIZATION ?= -O2
+BLORP_CLI_RUNTIME_CONFIG_HASH := $(shell { printf '%s\n' '$(BLORP_CLI_RUNTIME_C_OPTIMIZATION)' '-fwrapv -pipe -w -DMINICORO_IMPL -DBLORP_COMPILER_RUNTIME_SOURCES=1'; shasum -a 256 blorp/src/lib/runtime/native/minicoro.h blorp/src/lib/runtime/native/runtime.c blorp/src/lib/runtime/native/runtime_decl.c; command -v cc; cc --version 2>/dev/null | head -n 1; } | shasum -a 256 | awk '{print $$1}')
 BLORP_CLI_BUILD_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/build-inputs.sha256
 BLORP_CLI_INSTALL_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/install-inputs.sha256
 BLORP_CLI_BIN_HASH := $(BLORP_CLI_BUILD_DIR)/blorp.sha256
@@ -144,11 +145,13 @@ $(BLORP_CLI_RUNTIME_OBJECT): blorp/src/lib/runtime/native/minicoro.h blorp/src/l
 	@set -e; \
 	tmp="$@.tmp"; \
 	trap 'rm -f "$$tmp"' EXIT; \
-	cc "$(BLORP_CLI_C_OPTIMIZATION)" -fwrapv -pipe -w -DMINICORO_IMPL \
+	cc "$(BLORP_CLI_RUNTIME_C_OPTIMIZATION)" -fwrapv -pipe -w -DMINICORO_IMPL \
 		-DBLORP_COMPILER_RUNTIME_SOURCES=1 \
 		-include blorp/src/lib/runtime/native/minicoro.h -c blorp/src/lib/runtime/native/runtime.c -o "$$tmp"; \
 	mv "$$tmp" "$@"; \
 	trap - EXIT
+
+prepare-blorp-cli-runtime: $(BLORP_CLI_RUNTIME_OBJECT)
 
 # Generate the compiler C separately so CI reports self-hosting time independently.
 generate-blorp-cli-c: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP_CLI_SOURCE)
@@ -266,7 +269,7 @@ compile-prepared-blorp-cli: $(BLORP_CLI_RUNTIME_OBJECT)
 	trap - EXIT
 
 # Preserve the safe all-in-one build path for local callers.
-compile-blorp-cli: prepare-blorp-cli-c $(BLORP_CLI_RUNTIME_OBJECT)
+compile-blorp-cli: prepare-blorp-cli-c prepare-blorp-cli-runtime
 	@$(MAKE) --no-print-directory compile-prepared-blorp-cli
 
 build-blorp-cli: compile-blorp-cli

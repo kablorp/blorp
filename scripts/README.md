@@ -276,15 +276,19 @@ trees or prepare an intermediate compiler. The compiler is a single
 executable; tests, packages, the LSP, and releases do not prepare or install
 private workers.
 
-Local compiler builds use `-O0` by default for the shortest edit/build cycle.
-Set `BLORP_CLI_C_OPTIMIZATION` to select a different single C optimization
-level. Main CI and tagged release builds use `-O2`, and the selected level is
-part of the generated CLI cache identity. `make generate-blorp-cli-c` runs the
-self-hosted source-to-C phase. CI uses `make prepare-blorp-cli-c` to produce all
-C inputs, `make compile-prepared-blorp-cli` to invoke only the host C toolchain,
-and `make install-prepared-blorp-cli` to publish the result. These appear as
-`Generate C`, `Compile`, and `Install`; local `make install` still composes all
-three phases safely.
+Local compiler builds compile generated compiler C at `-O0` by default for the
+shortest edit/build cycle. The separately cached runtime object uses `-O2` and
+is shared by fast and release compiler builds; set
+`BLORP_CLI_RUNTIME_C_OPTIMIZATION` only when debugging the runtime itself. Set
+`BLORP_CLI_C_OPTIMIZATION` to select the generated compiler C optimization
+level. Main CI and tagged release builds use `-O2` for both. Both selected
+levels participate in their respective cache identities. `make
+generate-blorp-cli-c` runs the self-hosted source-to-C phase, and `make
+prepare-blorp-cli-runtime` prepares the content-addressed runtime object. CI
+uses `make prepare-blorp-cli-c` to produce all C inputs, `make
+compile-prepared-blorp-cli` to invoke only the host C toolchain, and `make
+install-prepared-blorp-cli` to publish the result. Local `make install` still
+composes all phases safely.
 
 Normal builds use `scripts/blorp-compiler-bootstrap`, which reads the immutable
 release identity and per-target checksums from

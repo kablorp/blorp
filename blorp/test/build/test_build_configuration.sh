@@ -45,6 +45,12 @@ do
 		echo "FAIL: compiler cache inputs must include standard-library sources but not tests: $workflow" >&2
 		exit 1
 	fi
+	if ! grep -Fq 'name: Cache compiled runtime' "$workflow" ||
+		! grep -Fq 'make prepare-blorp-cli-runtime' "$workflow"
+	then
+		echo "FAIL: CI must explicitly prepare the content-addressed runtime: $workflow" >&2
+		exit 1
+	fi
 done
 
 build_plan=$(make -n build)
@@ -403,9 +409,37 @@ fi
 local_runtime_object=$(grep -o 'runtime-[0-9a-f]\{64\}\.o' <<<"$cli_build_plan" | head -n 1)
 release_runtime_object=$(grep -o 'runtime-[0-9a-f]\{64\}\.o' <<<"$release_cli_build_plan" | head -n 1)
 if [ -z "$local_runtime_object" ] || [ -z "$release_runtime_object" ] ||
-	[ "$local_runtime_object" = "$release_runtime_object" ]
+	[ "$local_runtime_object" != "$release_runtime_object" ]
 then
-	echo "FAIL: the runtime object identity must change with its C optimization level" >&2
+	echo "FAIL: fast and release compiler builds must share the optimized runtime object" >&2
+	exit 1
+fi
+runtime_build_plan=$(make -n -B prepare-blorp-cli-runtime)
+if ! grep -Fq 'cc "-O2" -fwrapv -pipe -w' <<<"$runtime_build_plan"; then
+	echo "FAIL: the separately cached compiler runtime must use -O2" >&2
+	exit 1
+fi
+debug_runtime_build_plan=$(
+	make -n -B BLORP_CLI_RUNTIME_C_OPTIMIZATION=-O0 prepare-blorp-cli-runtime
+)
+debug_runtime_object=$(
+	grep -o 'runtime-[0-9a-f]\{64\}\.o' <<<"$debug_runtime_build_plan" | head -n 1
+)
+if ! grep -Fq 'cc "-O0" -fwrapv -pipe -w' <<<"$debug_runtime_build_plan" ||
+	[ -z "$debug_runtime_object" ] || [ "$debug_runtime_object" = "$local_runtime_object" ]
+then
+	echo "FAIL: an explicit runtime optimization override must get a distinct object" >&2
+	exit 1
+fi
+runtime_cache_identity=$(sed -n '/^BLORP_CLI_RUNTIME_CONFIG_HASH/,/^BLORP_CLI_RUNTIME_OBJECT/p' Makefile)
+for runtime_source in minicoro.h runtime.c runtime_decl.c; do
+	if ! grep -Fq "$runtime_source" <<<"$runtime_cache_identity"; then
+		echo "FAIL: runtime object identity must cover $runtime_source content" >&2
+		exit 1
+	fi
+done
+if ! grep -Fq '$(BLORP_CLI_RUNTIME_C_OPTIMIZATION)' <<<"$runtime_cache_identity"; then
+	echo "FAIL: runtime object identity must cover its independent optimization level" >&2
 	exit 1
 fi
 cli_cache_identity=$(sed -n '/new_hash=/,/old_hash=/p' Makefile)
