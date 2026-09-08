@@ -1,7 +1,7 @@
 # Batch Lexical Parameter Scope Publication
 
-**Status:** Ready for admission measurement; production implementation is
-conditional on the Phase 0 gate
+**Status:** Parameter batching rejected at the Phase 0 admission gate;
+profiling scaffolding removed and a smaller scalar scope-list cleanup retained
 
 **Dependencies:** Issue 43 is complete. Issue 44 selected this lexical
 candidate for exact admission measurement.
@@ -23,6 +23,159 @@ lexical scope as one ordered batch rather than publishing a complete `Scope`,
 This issue deliberately selects one narrow direction from Issue 44. It does
 not authorize a general `Env` redesign, accepted-declaration rematerialization,
 or batching of bindings whose visibility is genuinely sequential.
+
+## Phase 0 Outcome (2026-09-08)
+
+The ordered batch prototype preserved the focused environment, function, and
+lambda semantics, and it reduced parameter publication to one update per
+non-empty scope. It did not meet the admission thresholds. In particular, the
+one-parameter function and lambda shapes increased exact allocation/release
+counts, while the wide shapes remained well below both the 15% allocation and
+10% retired-instruction requirements. The prototype, its tests, the temporary
+benchmark fixture, and its profile-only runtime counters were therefore
+removed rather than retained as unadmitted production complexity.
+
+### Revisions and executable identity
+
+- Baseline source revision: `4a7aa34b7ecfa237085435cb1d484083143e2400`.
+- Candidate source: an uncommitted Phase 0 prototype on that revision; no
+  candidate commit was created because the stop gate required deletion.
+- Baseline compiler executable SHA-256: `8de2ac88f80f90b5a9e49afd67568b76a1b8659067e903aecfd1418f7a307fa5`.
+- Candidate compiler executable SHA-256: `082b22e870108f5d16a8f9e2a805efaa0d652a49dac5f98a9affe80ae3b680b3`.
+- Baseline focused executable SHA-256: `c7f86e5e1059d084dbea55de9f73f64c03bd6848fcabbc3986efe9d3ee1deb61`.
+- Candidate focused executable SHA-256: `e0973a755dc86cac36aa2e7cefcac7033f189c80529ef9165f55856bb244e6fc`.
+
+### Exact production attribution
+
+A temporary profile-only call-stack classifier attributed every scalar
+`scope_add_symbol` entry in a Phase 01-06 self-check. The category sum equals
+the exact total; there was no unclassified remainder:
+
+| Category | Scalar publications |
+| --- | ---: |
+| Ordinary function parameters | 26,105 |
+| Lambda parameters | 3,071 |
+| Sequential locals | 20,389 |
+| Pattern and control-flow bindings | 42,038 |
+| Builtin and provisional publication | 106,844 |
+| Unclassified | 0 |
+| **Total** | **198,447** |
+
+The focused workload also exposed one fixed function-parameter publication
+from its required `main` harness. Excluding that separately reported harness,
+the scalar baseline count equaled the configured number of bound parameter
+names in every isolated shape.
+
+### Logical publication counts
+
+The prototype used a three-field `ParameterBinding` record (`name`, semantic
+type, and optional source type). `env.brp` fixed mutability, origin,
+refinement, module path, and definition identity for that narrow API, built
+the ordered `Symbol` list, and replaced the current scope once. The same
+private `scope_add_symbols` primitive temporarily served existing type batches.
+
+The following counts include the fixed harness publication. Candidate scalar
+parameter publications were zero; candidate batch publications were one for
+the harness plus one for each configured non-empty parameter scope.
+
+| Family | Width | Bound names | Baseline scalar publications | Candidate batch publications |
+| --- | ---: | ---: | ---: | ---: |
+| Function | 0 | 0 | 1 | 1 |
+| Function | 1 | 512 | 513 | 513 |
+| Function | 4 | 2,048 | 2,049 | 513 |
+| Function | 16 | 8,192 | 8,193 | 513 |
+| Function stress | 64 | 8,192 | 8,193 | 129 |
+| Lambda | 0 | 0 | 1 | 1 |
+| Lambda | 1 | 512 | 513 | 513 |
+| Lambda | 4 | 2,048 | 2,049 | 513 |
+| Lambda | 16 | 8,192 | 8,193 | 513 |
+| Lambda stress | 64 | 8,192 | 8,193 | 129 |
+
+### Allocation and elapsed evidence
+
+Fixture generation and retained parsing occurred before the internal measured
+window. Allocations and releases were identical in every row. Both executables
+reported zero retained objects and zero retained bytes after each measured
+window. Elapsed time is one supporting sample in microseconds; exact allocation
+counts are the admission signal in this table.
+
+| Family | Width | Baseline allocations | Candidate allocations | Change | Baseline us | Candidate us |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Function | 0 | 129,619 | 130,134 | +0.397% | 16,018 | 25,507 |
+| Function | 1 | 153,683 | 155,222 | +1.001% | 19,545 | 29,029 |
+| Function | 4 | 268,883 | 261,206 | -2.855% | 29,323 | 41,419 |
+| Function | 16 | 733,779 | 691,286 | -5.791% | 86,881 | 102,169 |
+| Function stress | 64 | 659,513 | 612,540 | -7.122% | 75,873 | 84,541 |
+| Lambda | 0 | 408,687 | 408,690 | +0.001% | 47,474 | 59,539 |
+| Lambda | 1 | 436,335 | 437,874 | +0.353% | 58,205 | 65,316 |
+| Lambda | 4 | 557,167 | 551,026 | -1.102% | 77,768 | 82,333 |
+| Lambda | 16 | 1,049,711 | 1,014,898 | -3.316% | 198,266 | 131,063 |
+| Lambda stress | 64 | 714,703 | 675,794 | -5.444% | 145,199 | 118,449 |
+
+### Retired-instruction evidence
+
+The optimized focused executables were run in three alternating pairs with
+five typecheck iterations per process to amortize setup. Values below are the
+median process-level retired instructions. The first run's higher cold-start
+function-wide baseline did not affect its median.
+
+| Family | Width | Baseline instructions | Candidate instructions | Change |
+| --- | ---: | ---: | ---: | ---: |
+| Function | 16 | 6,675,194,523 | 6,261,227,667 | -6.202% |
+| Function stress | 64 | 5,977,194,097 | 5,378,103,863 | -10.023% |
+| Lambda | 16 | 9,780,545,643 | 9,420,808,045 | -3.678% |
+| Lambda stress | 64 | 7,048,535,065 | 6,519,228,026 | -7.509% |
+
+Only the function stress row crossed the 10% instruction threshold. Neither
+wide row did, neither lambda row did, and no row crossed the 15% allocation
+threshold. The common one-parameter allocation regression was additional
+negative evidence against the design.
+
+### Correctness and stop decision
+
+During the prototype, the focused suites passed with 32/32 environment tests,
+127/127 declaration tests, and 305/305 inference tests. Every benchmark shape
+reported zero errors, zero retained objects, and the same semantic checksum
+between baseline and candidate (`1028`, `1540`, `3076`, `9220`, and `8452` for
+widths 0, 1, 4, 16, and stress 64 respectively). The new batch-API test failed
+before implementation because the API was absent, then passed with the
+prototype.
+
+Because the focused admission gate failed, the controlled Phase 01-06
+candidate comparison, sanitizer sweep, and final production review were not
+run. Running them could not admit a design that had already failed exact
+allocation and wide-instruction criteria. No adjacent lexical category is
+authorized by this result; any future attempt needs a representation that
+does not allocate a pending record per binding and must start with a new
+admission issue.
+
+## Post-gate Mechanical Cleanup
+
+A review of the rejected prototype exposed an independent inefficiency in the
+existing scalar path. `env_add_symbol`, `env_add_accepted_type_symbol`, and
+`env_replace_current_scope` rebuilt the complete scope list with a
+`get`/`append` loop merely to replace element zero. `env_pop_scope` used the
+same pattern merely to remove element zero. The retained cleanup uses the
+existing value-semantic `List.set(0, ...)` and `List.drop(1)` operations while
+preserving the explicit empty-scope fallback. It does not add an API, builder,
+cache, compatibility path, or parameter representation. The production diff
+is 10 added and 50 deleted lines.
+
+A clean compiler from baseline revision `4a7aa34b7ecfa237085435cb1d484083143e2400`
+and the cleanup candidate were run in three alternating Phase 01-06 self-check
+pairs. Every run produced the same output hash. Median supporting results were:
+
+| Measure | Baseline | Cleanup | Change |
+| --- | ---: | ---: | ---: |
+| Retired instructions | 204,305,300,650 | 204,063,938,254 | -0.118% |
+| Cycles | 47,280,074,733 | 46,929,494,300 | -0.741% |
+| Wall time | 12.45 s | 12.40 s | -0.402% |
+| Peak footprint | 822,723,496 bytes | 823,493,568 bytes | +0.094% |
+
+The footprint difference is less than 0.1% and was not treated as evidence of
+a retained-memory change. The instruction reduction, identical output, and
+smaller implementation justify this narrow cleanup independently of the
+failed batching design.
 
 ## Required Reading
 
