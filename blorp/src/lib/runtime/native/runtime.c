@@ -6989,17 +6989,28 @@ blorp_String* blorp_string_append(blorp_String* s, const blorp_String* other) {
     return s;
 }
 
+static unsigned long blorp_long_magnitude(long value) {
+    return value < 0
+        ? (unsigned long)(-(value + 1L)) + 1UL
+        : (unsigned long)value;
+}
+
+static size_t blorp_long_decimal_width(long value) {
+    size_t width = value < 0 ? 1 : 0;
+    unsigned long magnitude = blorp_long_magnitude(value);
+    do {
+        width++;
+        magnitude /= 10UL;
+    } while (magnitude != 0UL);
+    return width;
+}
+
 static int blorp_format_long_decimal(char* buf, size_t buf_len, long value) {
     if (buf_len == 0) return 0;
 
     size_t pos = buf_len;
     bool negative = value < 0;
-    unsigned long magnitude;
-    if (negative) {
-        magnitude = (unsigned long)(-(value + 1L)) + 1UL;
-    } else {
-        magnitude = (unsigned long)value;
-    }
+    unsigned long magnitude = blorp_long_magnitude(value);
 
     do {
         if (pos == 0) return 0;
@@ -7013,7 +7024,7 @@ static int blorp_format_long_decimal(char* buf, size_t buf_len, long value) {
     }
 
     int len = (int)(buf_len - pos);
-    memmove(buf, buf + pos, (size_t)len);
+    if (pos != 0) memmove(buf, buf + pos, (size_t)len);
     return len;
 }
 
@@ -10949,35 +10960,75 @@ blorp_String* blorp_vector_to_string_float16(blorp_Vector* v) {
 // Vector to_string: format as {1, 2, 3}
 blorp_String* blorp_vector_to_string_int(blorp_Vector* v) {
     if (!v || v->capacity == 0) {
-        return blorp_string_create("{}");
+        return blorp_string_create_len("{}", 2);
     }
     long is_2d = (v->len > 0 && v->capacity > v->len);
     long cols = is_2d ? v->capacity / v->len : 0;
-    // Buffer: each int ~20 chars + separators + nested braces
-    size_t buf_size = blorp_checked_add(blorp_checked_mul(v->capacity, 24), is_2d ? v->len * 4 + 10 : 3);
-    char* buf = (char*)blorp_malloc_checked(buf_size);
-    long pos = 0;
-    buf[pos++] = '{';
+    size_t output_size = 2; // Opening and closing braces.
     if (is_2d) {
         for (long r = 0; r < v->len; r++) {
-            if (r > 0) { buf[pos++] = ','; buf[pos++] = ' '; }
-            buf[pos++] = '{';
+            if (r > 0) output_size = blorp_checked_add(output_size, 2);
+            output_size = blorp_checked_add(output_size, 2); // Row braces.
             for (long c = 0; c < cols; c++) {
-                if (c > 0) { buf[pos++] = ','; buf[pos++] = ' '; }
-                pos += snprintf(buf + pos, buf_size - pos, "%ld", blorp_vector_read_i64(v, r * cols + c));
+                if (c > 0) output_size = blorp_checked_add(output_size, 2);
+                output_size = blorp_checked_add(
+                    output_size,
+                    blorp_long_decimal_width(
+                        blorp_vector_read_i64(v, r * cols + c)
+                    )
+                );
             }
-            buf[pos++] = '}';
         }
     } else {
         for (long i = 0; i < v->capacity; i++) {
-            if (i > 0) { buf[pos++] = ','; buf[pos++] = ' '; }
-            pos += snprintf(buf + pos, buf_size - pos, "%ld", blorp_vector_read_i64(v, i));
+            if (i > 0) output_size = blorp_checked_add(output_size, 2);
+            output_size = blorp_checked_add(
+                output_size,
+                blorp_long_decimal_width(blorp_vector_read_i64(v, i))
+            );
         }
     }
-    buf[pos++] = '}';
-    buf[pos] = '\0';
-    blorp_String* result = blorp_string_from_buf(buf, pos);
-    free(buf);
+    if (output_size > (size_t)LONG_MAX) {
+        blorp_fatal_invalid_runtime_length("String", LONG_MAX, LONG_MAX);
+    }
+
+    blorp_String* result = blorp_string_alloc_uninit(
+        (long)output_size, (long)output_size);
+    size_t pos = 0;
+    result->data[pos++] = '{';
+    if (is_2d) {
+        for (long r = 0; r < v->len; r++) {
+            if (r > 0) {
+                result->data[pos++] = ',';
+                result->data[pos++] = ' ';
+            }
+            result->data[pos++] = '{';
+            for (long c = 0; c < cols; c++) {
+                if (c > 0) {
+                    result->data[pos++] = ',';
+                    result->data[pos++] = ' ';
+                }
+                long value = blorp_vector_read_i64(v, r * cols + c);
+                size_t width = blorp_long_decimal_width(value);
+                blorp_format_long_decimal(result->data + pos, width, value);
+                pos += width;
+            }
+            result->data[pos++] = '}';
+        }
+    } else {
+        for (long i = 0; i < v->capacity; i++) {
+            if (i > 0) {
+                result->data[pos++] = ',';
+                result->data[pos++] = ' ';
+            }
+            long value = blorp_vector_read_i64(v, i);
+            size_t width = blorp_long_decimal_width(value);
+            blorp_format_long_decimal(result->data + pos, width, value);
+            pos += width;
+        }
+    }
+    result->data[pos++] = '}';
+    result->data[pos] = '\0';
     return result;
 }
 
@@ -11019,20 +11070,37 @@ blorp_String* blorp_vector_to_string_float(blorp_Vector* v) {
 // List to_string: format as [1, 2, 3]
 blorp_String* blorp_list_to_string_int(blorp_List* list) {
     if (!list || list->len == 0) {
-        return blorp_string_create("[]");
+        return blorp_string_create_len("[]", 2);
     }
-    size_t buf_size = blorp_checked_add(blorp_checked_mul(list->len, 24), 3);
-    char* buf = (char*)blorp_malloc_checked(buf_size);
-    long pos = 0;
-    buf[pos++] = '[';
+
+    size_t output_size = 2; // Opening and closing brackets.
     for (long i = 0; i < list->len; i++) {
-        if (i > 0) { buf[pos++] = ','; buf[pos++] = ' '; }
-        pos += snprintf(buf + pos, buf_size - pos, "%ld", (long)blorp_list_get(list, i));
+        if (i > 0) output_size = blorp_checked_add(output_size, 2);
+        output_size = blorp_checked_add(
+            output_size,
+            blorp_long_decimal_width((long)blorp_list_get(list, i))
+        );
     }
-    buf[pos++] = ']';
-    buf[pos] = '\0';
-    blorp_String* result = blorp_string_from_buf(buf, pos);
-    free(buf);
+    if (output_size > (size_t)LONG_MAX) {
+        blorp_fatal_invalid_runtime_length("String", LONG_MAX, LONG_MAX);
+    }
+
+    blorp_String* result = blorp_string_alloc_uninit(
+        (long)output_size, (long)output_size);
+    size_t pos = 0;
+    result->data[pos++] = '[';
+    for (long i = 0; i < list->len; i++) {
+        if (i > 0) {
+            result->data[pos++] = ',';
+            result->data[pos++] = ' ';
+        }
+        long value = (long)blorp_list_get(list, i);
+        size_t width = blorp_long_decimal_width(value);
+        blorp_format_long_decimal(result->data + pos, width, value);
+        pos += width;
+    }
+    result->data[pos++] = ']';
+    result->data[pos] = '\0';
     return result;
 }
 
@@ -11102,51 +11170,82 @@ blorp_String* blorp_list_to_string_float16(blorp_List* list) {
 
 blorp_String* blorp_list_to_string_string(blorp_List* list) {
     if (!list || list->len == 0) {
-        return blorp_string_create("[]");
+        return blorp_string_create_len("[]", 2);
     }
-    // Each string: quotes + content + ", " separator
-    size_t buf_size = 3; // "[]" + null
+
+    size_t output_size = 2; // Opening and closing brackets.
     for (long i = 0; i < list->len; i++) {
         blorp_String* s = (blorp_String*)blorp_list_get(list, i);
-        buf_size = blorp_checked_add(buf_size, s ? s->len + 4 : 8); // quotes + ", " + content or "null"
-    }
-    char* buf = (char*)blorp_malloc_checked(buf_size);
-    long pos = 0;
-    buf[pos++] = '[';
-    for (long i = 0; i < list->len; i++) {
-        if (i > 0) { buf[pos++] = ','; buf[pos++] = ' '; }
-        blorp_String* s = (blorp_String*)blorp_list_get(list, i);
+        if (i > 0) output_size = blorp_checked_add(output_size, 2);
+        output_size = blorp_checked_add(output_size, 2); // Element quotes.
         if (s) {
-            pos += snprintf(buf + pos, buf_size - pos, "\"%s\"", s->data);
-        } else {
-            pos += snprintf(buf + pos, buf_size - pos, "\"\"");
+            const char* nul = (const char*)memchr(s->data, '\0', (size_t)s->len);
+            size_t visible_size = nul ? (size_t)(nul - s->data) : (size_t)s->len;
+            output_size = blorp_checked_add(output_size, visible_size);
         }
     }
-    buf[pos++] = ']';
-    buf[pos] = '\0';
-    blorp_String* result = blorp_string_from_buf(buf, pos);
-    free(buf);
+    if (output_size > (size_t)LONG_MAX) {
+        blorp_fatal_invalid_runtime_length("String", LONG_MAX, LONG_MAX);
+    }
+
+    blorp_String* result = blorp_string_alloc_uninit(
+        (long)output_size, (long)output_size);
+    size_t pos = 0;
+    result->data[pos++] = '[';
+    for (long i = 0; i < list->len; i++) {
+        if (i > 0) {
+            result->data[pos++] = ',';
+            result->data[pos++] = ' ';
+        }
+        blorp_String* s = (blorp_String*)blorp_list_get(list, i);
+        result->data[pos++] = '"';
+        if (s) {
+            const char* nul = (const char*)memchr(s->data, '\0', (size_t)s->len);
+            size_t visible_size = nul ? (size_t)(nul - s->data) : (size_t)s->len;
+            memcpy(result->data + pos, s->data, visible_size);
+            pos += visible_size;
+        }
+        result->data[pos++] = '"';
+    }
+    result->data[pos++] = ']';
+    result->data[pos] = '\0';
     return result;
 }
 
 blorp_String* blorp_list_to_string_bool(blorp_List* list) {
     if (!list || list->len == 0) {
-        return blorp_string_create("[]");
+        return blorp_string_create_len("[]", 2);
     }
-    // "True" = 4, "False" = 5, ", " = 2 each
-    size_t buf_size = blorp_checked_add(blorp_checked_mul(list->len, 8), 3);
-    char* buf = (char*)blorp_malloc_checked(buf_size);
-    long pos = 0;
-    buf[pos++] = '[';
+
+    size_t output_size = 2; // Opening and closing brackets.
     for (long i = 0; i < list->len; i++) {
-        if (i > 0) { buf[pos++] = ','; buf[pos++] = ' '; }
-        const char* val = (long)blorp_list_get(list, i) ? "True" : "False";
-        pos += snprintf(buf + pos, buf_size - pos, "%s", val);
+        if (i > 0) output_size = blorp_checked_add(output_size, 2);
+        output_size = blorp_checked_add(
+            output_size, (long)blorp_list_get(list, i) ? 4 : 5);
     }
-    buf[pos++] = ']';
-    buf[pos] = '\0';
-    blorp_String* result = blorp_string_from_buf(buf, pos);
-    free(buf);
+    if (output_size > (size_t)LONG_MAX) {
+        blorp_fatal_invalid_runtime_length("String", LONG_MAX, LONG_MAX);
+    }
+
+    blorp_String* result = blorp_string_alloc_uninit(
+        (long)output_size, (long)output_size);
+    size_t pos = 0;
+    result->data[pos++] = '[';
+    for (long i = 0; i < list->len; i++) {
+        if (i > 0) {
+            result->data[pos++] = ',';
+            result->data[pos++] = ' ';
+        }
+        if ((long)blorp_list_get(list, i)) {
+            memcpy(result->data + pos, "True", 4);
+            pos += 4;
+        } else {
+            memcpy(result->data + pos, "False", 5);
+            pos += 5;
+        }
+    }
+    result->data[pos++] = ']';
+    result->data[pos] = '\0';
     return result;
 }
 
