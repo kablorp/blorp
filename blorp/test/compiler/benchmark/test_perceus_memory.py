@@ -71,6 +71,48 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
 
         self.assertEqual(request["action"], self.benchmark.PERCEUS_ACTION)
 
+    def test_managed_let_transfer_fixture_uses_resolved_single_transfer_bindings(self) -> None:
+        _, program = self.benchmark.fixture_request(
+            1,
+            2,
+            1,
+            0,
+            body_shape="managed_let_transfer",
+        )
+
+        for worker in program["decls"][1:3]:
+            body = worker["body"]
+            self.assertEqual(body["kind"], "let")
+            self.assertIsNotNone(body["name"]["def_id"])
+            self.assertEqual(body["rhs"]["kind"], "literal")
+            self.assertEqual(body["rhs"]["literal"]["kind"], "string")
+            self.assertEqual(body["body"]["kind"], "var")
+            self.assertEqual(body["body"]["var"], body["name"])
+            self.assertEqual(worker["return_type"], self.benchmark.named_type("String"))
+
+    def test_managed_let_transfer_fixture_rejects_mislabeled_geometry(self) -> None:
+        invalid_options = (
+            {"body_leaves": 2},
+            {"global_reads_per_function": 1},
+            {"params_per_function": 1},
+            {"parameter_type": "Int"},
+        )
+
+        for options in invalid_options:
+            arguments = {
+                "global_count": 1,
+                "function_count": 2,
+                "body_leaves": 1,
+                "global_reads_per_function": 0,
+                "params_per_function": 0,
+                "parameter_type": "String",
+                "body_shape": "managed_let_transfer",
+                **options,
+            }
+            with self.subTest(options=options):
+                with self.assertRaisesRegex(ValueError, "managed-let transfer"):
+                    self.benchmark.fixture_request(**arguments)
+
     def test_perceus_sentinel_is_outside_fixed_worker_geometry(self) -> None:
         _, program = self.benchmark.fixture_request(
             1,
@@ -216,6 +258,33 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "opaque insertion results"):
             self.benchmark.validate_change_aware_insert_counters(counters)
 
+    def test_managed_let_insert_counters_partition_managed_let_visits(self) -> None:
+        counters = {
+            "insert_managed_let_visits": 7,
+            "insert_managed_let_original_nodes_reused": 5,
+            "insert_managed_let_reconstructions": 2,
+        }
+
+        self.benchmark.validate_change_aware_managed_let_counters(counters)
+
+        counters["insert_managed_let_reconstructions"] = 1
+        with self.assertRaisesRegex(RuntimeError, "managed-let decisions are incomplete"):
+            self.benchmark.validate_change_aware_managed_let_counters(counters)
+
+    def test_managed_let_transfer_counters_require_every_worker_to_reuse(self) -> None:
+        counters = {
+            "insert_managed_let_visits": 3,
+            "insert_managed_let_original_nodes_reused": 2,
+            "insert_managed_let_reconstructions": 1,
+        }
+
+        self.benchmark.validate_managed_let_transfer_counters(counters, 2)
+
+        counters["insert_managed_let_original_nodes_reused"] = 1
+        counters["insert_managed_let_reconstructions"] = 2
+        with self.assertRaisesRegex(RuntimeError, "worker source reuse changed"):
+            self.benchmark.validate_managed_let_transfer_counters(counters, 2)
+
     def test_contract_inference_uses_collected_equations_without_body_rescans(self) -> None:
         perceus_source = (
             ROOT / "blorp" / "src" / "compiler" / "stage_09_core" / "perceus.brp"
@@ -251,6 +320,31 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
         self.assertIn("perceus_work_insert_original_nodes_reused", perceus_source)
         self.assertIn("perceus_work_insert_opaque_rewrite_results", perceus_source)
         self.assertNotIn("union PerceusInsertRewrite", perceus_source)
+
+    def test_managed_let_source_reuse_has_an_explicit_identity_proof(self) -> None:
+        perceus_source = (
+            ROOT / "blorp" / "src" / "compiler" / "stage_09_core" / "perceus.brp"
+        ).read_text(encoding="utf-8")
+
+        managed_let_plan = perceus_source.split(
+            "private record PerceusManagedLetPlan {", 1
+        )[1].split("}", 1)[0]
+
+        self.assertIn("source: CoreExpr", managed_let_plan)
+        self.assertIn("owned_rhs_reuses_source: Bool", managed_let_plan)
+        self.assertIn("branch_safe_body_reuses_source: Bool", managed_let_plan)
+        self.assertIn("normalize_binding_alias_rhs_reuses_source", perceus_source)
+        self.assertIn("normalize_binding_alias_rhs_with_owned_status", perceus_source)
+        self.assertIn("managed_let_reuses_source", perceus_source)
+        self.assertIn("perceus_work_insert_managed_let_visits", perceus_source)
+        self.assertIn(
+            "perceus_work_insert_managed_let_original_nodes_reused",
+            perceus_source,
+        )
+        self.assertIn(
+            "perceus_work_insert_managed_let_reconstructions",
+            perceus_source,
+        )
 
     def test_core_ownership_census_counts_policies(self) -> None:
         response = self.perceus_response()
@@ -301,12 +395,15 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
                 "mixed_function_owner_catalog",
                 "borrowed_boundary_fusion",
             )
+            managed_let_transfer = body_shape == "managed_let_transfer"
             _, program = self.benchmark.fixture_request(
-                8 if fixed_large_shape else 4,
+                1 if managed_let_transfer else (8 if fixed_large_shape else 4),
                 3,
-                1536 if fixed_large_shape else 256,
-                8 if fixed_large_shape else 2,
-                params_per_function=32 if fixed_large_shape else 2,
+                1 if managed_let_transfer else (1536 if fixed_large_shape else 256),
+                0 if managed_let_transfer else (8 if fixed_large_shape else 2),
+                params_per_function=(
+                    0 if managed_let_transfer else (32 if fixed_large_shape else 2)
+                ),
                 body_shape=body_shape,
                 branch_arms=8 if body_shape == "borrowed_boundary_fusion" else 2,
                 user_call_edges=2,

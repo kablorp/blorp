@@ -1191,6 +1191,18 @@ byte-identical post-Perceus
 Core. Ownership-sensitive helper families remain explicitly conservative. See
 [`compiler_perceus_change_aware_insertion_2026-09-07.md`](../../../benchmarks/results/compiler_perceus_change_aware_insertion_2026-09-07.md).
 
+The next bounded checkpoint extended that identity proof through managed-let
+planning. It reuses an original managed `LetExpr` only when alias and mutable
+branch normalization, both recursive children, and the ownership decision are
+all proven neutral. A fixed 512-worker transfer workload reused 512 of 513
+managed lets and removed 1,536 measured-window allocations and releases
+(-1.50% and -1.56%) with byte-identical Core. The unchanged default fixture
+reused 64 of 65 managed lets for a smaller 0.09% allocation reduction. Neither
+workload showed a measurable timing change. Opaque call and aggregate results
+are now the next prerequisite for exposing useful non-immortal managed-let
+parents. See
+[`compiler_perceus_change_aware_managed_lets_2026-09-08.md`](../../../benchmarks/results/compiler_perceus_change_aware_managed_lets_2026-09-08.md).
+
 ## Tranche 5: Build All-Value Ownership Facts Once
 
 ### Change
