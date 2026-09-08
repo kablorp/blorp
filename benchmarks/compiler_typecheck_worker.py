@@ -12,8 +12,9 @@ TYPECHECK_WORKER_ENV = "BLORP_TYPECHECK_BENCHMARK_WORKER"
 WORKER_SOURCE = Path("blorp/benchmark/compiler/compiler_typecheck_worker.brp")
 WORKER_NAME = "compiler_typecheck_worker"
 WORKER_MAIN_SYMBOL = "__blorp_typecheck_benchmark_worker_main"
-# Generated typecheck C includes the graph-owned allocation identity helper.
+# Generated typecheck C includes graph/table allocation identity helpers.
 WORKER_INCLUDE_DIRS = (
+    Path("blorp/src/compiler/stage_04_modules"),
     Path("blorp/src/compiler/stage_06_typecheck/graph"),
 )
 

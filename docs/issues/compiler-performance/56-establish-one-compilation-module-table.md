@@ -1,6 +1,6 @@
 # Issue 56: Establish One Compilation Module Table
 
-**Status:** Proposed
+**Status:** Implemented; awaiting integration
 
 **Roadmap:** [Normalized Compilation Database Roadmap](NORMALIZED_COMPILATION_DATABASE_ROADMAP.md)
 
@@ -363,3 +363,142 @@ Stop and consult before:
 - using path hashes or negative integers as IDs;
 - changing `ResolvedModuleIdentity` semantics; or
 - broadening into declaration, CTFE, Core, or LSP representation work.
+
+## Implementation Result
+
+Stage 04 now owns the sole opaque `ModuleId = Int` domain and `ModuleTable`.
+The table retains one ordered `ResolvedModuleIdentity` column and one
+canonical-path index. Exact identity lookup probes that index and validates the
+row's complete resolved identity, so a second identity-key dictionary is not
+retained. The table also provides an allocation-identity compatibility check
+for provenance-sensitive boundaries.
+
+`FrontendGraph` retains that table plus table-aligned finalized-program and
+module-surface columns. Roots, importers, and resolved module-reference outcomes
+use `ModuleId`. Compatibility accessors can still materialize a
+`FrontendModule`, but the graph no longer retains another complete list of
+identity-bearing `FrontendModule` records.
+
+The direct Stage 06 bridge passes the exact graph-owned table into
+`indexed_graph_build_for_module_table`. That constructor validates payload
+length and every row identity, resolves the target candidate through that
+table, and only then publishes table-aligned prepared module payloads.
+Dependency-ID selection and the direct frontend-ID entrance require the
+issuing table and reject a different allocation before positional access. This
+keeps each `ModuleId` one unboxed integer while enforcing provenance at product
+boundaries. The descriptive replay constructor invokes the same Stage 04 table
+constructor once, then enters the same indexed representation. The independent
+`PreparedModuleId`, `FrontendModuleId`, their conversion helpers, and the Stage
+06 `dependencies_by_path` index are deleted.
+
+No `SourceId` exists at this stage, so the module row deliberately owns only
+resolved identity. Source files remain in phase-specific finalized/prepared
+payload columns. Adding a speculative source table was outside this issue.
+
+### Preserved behavior
+
+The focused tests retain exact module/root/reference/source ordering, repeated
+and unresolved import occurrences, duplicate and conflicting-origin errors,
+definition allocation, graph provenance, accepted authority ownership, and
+direct-versus-replay typed output. Two independent tables can both issue the
+same numeric row, but table-paired selection rejects the foreign ID. Three
+conflicting claims for one canonical path also prove that every diagnostic
+retains the original first claimant rather than the previous duplicate.
+
+During implementation, sanitizer inspection exposed an ownership-codegen
+constraint: retaining a field-projected `ResolvedModuleIdentity` in a branch
+local did not reliably retain the value in generated C. Canonical table rows
+are therefore reconstructed directly into the owning list append, and
+compatibility import-edge projections continue to build from the owned
+`FrontendModule.identity` field. This source shape is covered by sanitizer and
+leak tests; the table API does not expose this compiler implementation detail.
+
+### Deterministic work evidence
+
+The existing indexed-phase function instrumentation reports the exact
+production constructor boundary. For five iterations with 64 dependency
+modules it observed five `indexed_graph_build` calls, five `ModuleTable`
+publications, 325 canonical identity rows/index entries, and 325
+`resolved_module_identity_storage_key` calls. Each normalized input therefore
+publishes one table and 65 aligned prepared payload rows. The direct bridge has
+zero Stage-04-to-Stage-06 integer translation calls: it passes `ModuleId`
+values and the issuing table directly. Repeated/unresolved reference behavior
+is covered by exact structural tests; the existing profile does not expose a
+separate exact low-level list-read or dictionary-probe counter.
+
+Generated C at
+`logs/issue56-compilation-module-table/generated-c-final/` confirms that `ModuleId`
+is an unboxed `long`, the table has one identity-row loop and one non-error
+table construction, and no per-ID heap allocation is emitted. The final
+generated-C inspection separately covers both `FrontendGraphRep` and
+`IndexedGraphRep`; raw logs are ignored.
+
+### Measurements
+
+Baseline was `0b5258dab08790a40a2c2efbcd0451bdb79ead16` on macOS arm64.
+All matrices used three alternating baseline/candidate pairs after warmup.
+
+The uninstrumented import-graph replay matrix varied module count independently
+(`1`, `16`, `64`) and import fan-out at 64 modules (`0`, `4`, `16`), with eight
+functions per module and three in-process iterations. All 30 samples had exact
+matching artifact/declaration/import/error/checksum fields and
+`workload_valid=True`. At 16/64 modules, candidate median elapsed ranged from
+`-0.07%` to `+1.87%`, retired instructions from `+0.04%` to `+0.16%`, and peak
+RSS from `-0.25%` to `+0.71%`: neutral within local measurement noise.
+
+The same fixture also has a direct mode that constructs an actual
+`FrontendGraph` and executes the graph-owned table handoff. Baseline and
+candidate used byte-identical fixture and runner sources (SHA-256
+`2222314bfcf52bfca4fdc265743fcbbf4087ac542bb58e3509b3ba163d58ebe2`
+and `45b96e4d0a16626f4866607cecbc98ba7a070b81e746167ea9601b0d33583805`)
+with three alternating pairs at module/fan-out shapes `1/0`, `16/4`, `64/0`,
+`64/4`, and `64/16`. Every sample had exact artifact, source/typed declaration,
+resolved-import, import-binding, error, and checksum fields. Candidate
+allocations and releases changed by only `+0.02%` to `+0.03%`; retained objects
+and bytes were exactly `1` and `96` in both builds. Three-pair elapsed medians
+ranged from `-6.8%` to `+5.0%`; four additional pairs at both 64-module
+sentinels produced seven-pair medians of `+2.0%` at fan-out 4 and `-0.14%` at
+fan-out 16. Direct-path latency is therefore treated as noisy and neutral, not
+as a speedup claim. Raw and summary logs are under the ignored
+`direct-import-matrix-identical/` directory.
+
+The allocator-enabled indexed-phase matrix used 20 iterations at 1, 16, 64,
+and 256 modules. Exact output counts and checksums matched. Allocations changed
+by `+0.28%` to `+0.40%`, allocated bytes by `+0.72%` to `+2.03%`, retained
+objects by `+0.94%` to `+2.76%` (the largest percentage is the two-row case),
+and process RSS by `-0.23%` to `+0.06%` outside the smallest process-floor row.
+The instrumented elapsed/instruction results favored the candidate by roughly
+13-23%, but are not used as a production speed claim because changing the
+instrumented function set can change profile-registry overhead.
+
+Production compiler replay used request SHA-256
+`de93c30a153c0e60a75c3fdb548866d08eb76ebab1721266d5b16f8ddb539b4c`
+and three alternating allocator-enabled target-only pairs. Baseline worker
+SHA-256 was `e653ae702e9b3969d6efac77db5652d16f867b27da8049dafa36f54ae69ed2c4`;
+candidate worker SHA-256 was
+`ed955f0062ae6f6ef6c4f2f8c76c177d0dc8827b8e6ccf97e06554a3d29b5dd6`.
+Every run was verified, cleanly bounded, and returned the same 1,755,080-byte
+response with SHA-256
+`f11d97d6f1cf5ac91ae76d1461ded8ba5a8884f1217504621bf3707d75363851`.
+Candidate medians were elapsed `-0.14%`, peak RSS `+0.02%`, allocations
+`+0.0006%` (366 of 58.9 million), releases below `+0.0001%`, current objects
+`+0.0068%`, and allocated bytes `+0.0035%`. The final worker includes the
+provenance guards and closure-free ID lookup; this is production-neutral.
+
+### Remaining descriptive boundaries
+
+Issue 57 still owns migration of descriptive identity in
+`ModuleLoadCandidate`, `LoadedModule`/`PreparedModule`, graph-backed declaration
+and definition records, accepted authorities, typecheck state, typed graph
+outputs, diagnostics, semantic/LSP projection, and compatibility accessors.
+`TypecheckGraphRequest` remains the sanctioned serialized replay boundary.
+Multi-root frontend validation plus current lint/purify compatibility helpers
+also enter through that descriptive request because they preserve the legacy
+dependency-before-other-roots definition-allocation order; Issue 57 must
+migrate that ordering explicitly rather than silently adopting native table
+order.
+CTFE and Core remain explicitly outside this issue.
+
+**Recommendation:** accept this foundation and proceed to Issue 57. It deletes
+a real duplicate ID namespace and a redundant Stage 06 path index, has direct
+production consumers, preserves semantics, and is neutral on production replay.

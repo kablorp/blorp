@@ -428,7 +428,7 @@ class DeclarationCatalogBoundaryTests(unittest.TestCase):
                 self.assertIn("owner_scope: PreparedModuleScope", fallback.group(0))
                 self.assertNotIn("owner: ModuleIdentity", fallback.group(0))
 
-    def test_global_header_owner_index_uses_prepared_module_ids(self) -> None:
+    def test_global_header_owner_index_uses_compilation_module_ids(self) -> None:
         source = GLOBAL_HEADER_COMPLETION.read_text(encoding="utf-8")
         header_index = re.search(
             r"private pure func global_header_index\(.*?"
@@ -450,8 +450,8 @@ class DeclarationCatalogBoundaryTests(unittest.TestCase):
         self.assertIn("module_indexes_by_header_row: List[Int]", source)
         self.assertIsNotNone(header_index)
         self.assertIsNotNone(header_lookup)
-        self.assertIn("prepared_module_id_table_index", header_index.group(0))
-        self.assertIn("prepared_module_id_table_index", header_lookup.group(0))
+        self.assertIn("module_id_table_index", header_index.group(0))
+        self.assertIn("module_id_table_index", header_lookup.group(0))
         self.assertNotIn("module_identity_storage_key", header_index.group(0))
         self.assertNotIn("module_identity_storage_key", header_lookup.group(0))
 
@@ -487,7 +487,8 @@ class DeclarationCatalogBoundaryTests(unittest.TestCase):
         self.assertIn("bound_module_graph_find_for_scope", bucket_lookup.group(0))
         self.assertIn("latest_skeleton_index_by_name", bucket_lookup.group(0))
         self.assertIn("previous_same_name_index_by_skeleton", bucket_lookup.group(0))
-        self.assertIn("prepared_module_ids_equal", bucket_lookup.group(0))
+        self.assertIn("module_ids_equal", bucket_lookup.group(0))
+        self.assertNotIn("prepared_module_ids_equal", bucket_lookup.group(0))
         self.assertNotIn("module_identities_equal", bucket_lookup.group(0))
         self.assertNotIn("TypeNamespaceKey(ModuleIdentity", source)
         self.assertNotIn("TraitNamespaceKey(ModuleIdentity", source)
@@ -555,10 +556,11 @@ class DeclarationCatalogBoundaryTests(unittest.TestCase):
 
         self.assertIsNotNone(failure)
         self.assertIsNotNone(failed_lookup)
-        self.assertIn("module_id: Option[PreparedModuleId]", failure.group(0))
+        self.assertIn("module_id: Option[ModuleId]", failure.group(0))
         self.assertNotIn("module_identity", failure.group(0))
-        self.assertIn("module_id: PreparedModuleId", failed_lookup.group(0))
-        self.assertIn("prepared_module_ids_equal", failed_lookup.group(0))
+        self.assertIn("module_id: ModuleId", failed_lookup.group(0))
+        self.assertIn("module_ids_equal", failed_lookup.group(0))
+        self.assertNotIn("PreparedModuleId", failed_lookup.group(0))
         self.assertNotIn("module_identities_equal", failed_lookup.group(0))
         self.assertIn("failure_owner_missing", source)
         self.assertIn("global header completion failure owner is absent from ", source)

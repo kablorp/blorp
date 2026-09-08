@@ -1,13 +1,27 @@
 -- Bounded in-process workload for import-heavy typechecker changes.
 import:
-	../../src/compiler/stage_03_parse/source_ast_finalize: FinalizedTypecheckProgram
-	../../src/compiler/stage_04_modules/loaded_module: ModuleOrigin(UserModule)
+	../../src/compiler/stage_03_parse/source_ast_finalize:
+		FinalizedTypecheckProgram,
+		finalized_typecheck_program_ast,
+	../../src/compiler/stage_04_modules/frontend_graph:
+		FrontendGraph,
+		FrontendGraphError,
+		FrontendImportEdge,
+		FrontendImportResolution(FrontendResolvedImport),
+		FrontendModule,
+		frontend_graph,
+	../../src/compiler/stage_04_modules/loaded_module:
+		ModuleOrigin(UserModule),
+		ResolvedModuleIdentity,
+		resolved_module_identity_from_resolver,
+	../../src/compiler/stage_04_modules/module_surface: module_surface_for_program
 	../../src/compiler/stage_06_typecheck/bridge:
 		TypecheckGraphRequest,
 		TypecheckImportModule,
 		TypecheckResolvedImport,
 		TypecheckedGraph,
 		typecheck_graph,
+	../../src/compiler/stage_06_typecheck/frontend_graph_typecheck: typecheck_frontend_graph_direct
 	parsed_program_fixture as ParsedProgramFixture
 
 
@@ -285,6 +299,57 @@ pure func compiler_import_graph_benchmark_request(
 	}
 
 
+private pure func benchmark_resolved_identity(
+	module: TypecheckImportModule,
+) -> ResolvedModuleIdentity:
+	resolved_module_identity_from_resolver(module.module_path, module.origin)
+
+
+private pure func benchmark_finalized_program(
+	module: TypecheckImportModule,
+) -> FinalizedTypecheckProgram:
+	match module.typecheck_program:
+		Some(program):
+			program
+		None:
+			ParsedProgramFixture.finalized_typecheck_program_fixture(
+				module.path,
+				module.module_name,
+				module.text,
+			)
+
+
+private pure func benchmark_frontend_module(module: TypecheckImportModule) -> FrontendModule:
+	program = benchmark_finalized_program(module)
+
+	{
+		identity = benchmark_resolved_identity(module),
+		program = program,
+		surface = module_surface_for_program(finalized_typecheck_program_ast(program))
+	}
+
+
+pure func compiler_import_graph_benchmark_frontend_graph(
+	request: TypecheckGraphRequest,
+) -> Result[FrontendGraph, List[FrontendGraphError]]:
+	target = benchmark_frontend_module(request.target)
+	modules = request.modules
+		.map(benchmark_frontend_module)
+		.append(target)
+	edges: List[FrontendImportEdge] = request.resolved_imports.map(func(resolved): {
+			importer = resolved_module_identity_from_resolver(resolved.from_module, UserModule),
+			requested_path = resolved.import_path,
+			resolution = FrontendResolvedImport(
+				resolved_module_identity_from_resolver(
+					resolved.resolved_module,
+					UserModule,
+				),
+			)
+		})
+
+	frontend_graph(modules, [target.identity], edges)
+
+
 private pure func typechecked_graph_error_count(graph: TypecheckedGraph) -> Int:
 	var count: Int = graph.target.errors.length()
 
@@ -405,8 +470,87 @@ pure func compiler_import_graph_benchmark_with_request(
 	}
 
 
+pure func compiler_import_graph_direct_benchmark_with_request(
+	config: CompilerImportGraphBenchmarkConfig,
+	request: TypecheckGraphRequest,
+) -> CompilerImportGraphBenchmarkResult:
+	expected_artifact_count: Int = config.module_count + 1
+	expected_declarations = expected_declaration_count(
+		config.module_count,
+		config.functions_per_module,
+		config.import_fanout,
+	)
+	expected_imports = expected_resolved_import_count(config.module_count, config.import_fanout)
+	module_target_identities = request.modules.map(benchmark_resolved_identity)
+	var artifact_count: Int = 0
+	var source_declaration_count: Int = 0
+	var typed_declaration_count: Int = 0
+	var import_binding_count: Int = 0
+	var error_count: Int = 0
+	var checksum: Int = 0
+	var workload_valid: Bool = (
+		config.iterations > 0
+		and config.module_count > 0
+		and config.functions_per_module > 0
+		and config.import_fanout >= 0
+	)
+
+	match compiler_import_graph_benchmark_frontend_graph(request):
+		Err(_):
+			workload_valid = False
+		Ok(frontend):
+			for _ in 0..config.iterations:
+				match typecheck_frontend_graph_direct(
+					frontend,
+					benchmark_resolved_identity(request.target),
+					module_target_identities,
+					False,
+					False,
+				):
+					Err(_):
+						error_count += 1
+						workload_valid = False
+					Ok(graph):
+						artifact_count = graph.modules.length() + 1
+						source_declaration_count = typechecked_graph_source_declaration_count(graph)
+						typed_declaration_count = typechecked_graph_declaration_count(graph)
+						import_binding_count = typechecked_graph_import_binding_count(graph)
+						iteration_error_count = typechecked_graph_error_count(graph)
+						error_count += iteration_error_count
+						workload_valid = (
+							workload_valid
+							and iteration_error_count == 0
+							and artifact_count == expected_artifact_count
+							and source_declaration_count == expected_declarations
+							and typed_declaration_count == expected_declarations
+							and request.resolved_imports.length() == expected_imports
+							and import_binding_count == expected_imports
+						)
+
+						checksum += artifact_count + source_declaration_count + typed_declaration_count + request.resolved_imports.length() + import_binding_count
+
+	{
+		artifact_count = artifact_count,
+		source_declaration_count = source_declaration_count,
+		typed_declaration_count = typed_declaration_count,
+		resolved_import_count = request.resolved_imports.length(),
+		import_binding_count = import_binding_count,
+		imported_function_registration_pressure = request.resolved_imports.length() * config.functions_per_module,
+		error_count = error_count,
+		checksum = checksum,
+		workload_valid = workload_valid
+	}
+
+
 pure func compiler_import_graph_benchmark(
 	config: CompilerImportGraphBenchmarkConfig,
 ) -> CompilerImportGraphBenchmarkResult:
 	request = compiler_import_graph_benchmark_request(config)
 	compiler_import_graph_benchmark_with_request(config, request)
+
+
+pure func compiler_import_graph_direct_benchmark(
+	config: CompilerImportGraphBenchmarkConfig,
+) -> CompilerImportGraphBenchmarkResult:
+	request = compiler_import_graph_benchmark_request(config)
+	compiler_import_graph_direct_benchmark_with_request(config, request)

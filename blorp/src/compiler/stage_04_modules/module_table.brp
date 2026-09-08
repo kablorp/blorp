@@ -1,0 +1,180 @@
+-- Compilation-owned module identity rows and their dense integer domain.
+--
+-- ModuleId values are meaningful only with their issuing ModuleTable. The
+-- table owns descriptive identity and lookup indexes once; later phase tables
+-- align their payload rows to this order.
+import:
+	loaded_module:
+		ModuleOrigin,
+		ResolvedModuleIdentity,
+		module_origins_equal,
+		resolved_module_canonical_path,
+		resolved_module_identities_equal,
+		resolved_module_identity_from_resolver,
+		resolved_module_origin,
+
+
+opaque type ModuleId = Int
+
+
+union ModuleTableError:
+	DuplicateModuleTableIdentity(ResolvedModuleIdentity)
+	ConflictingModuleTableOrigins(ResolvedModuleIdentity, ResolvedModuleIdentity)
+
+
+private record ModuleTableRep {
+	identities: List[ResolvedModuleIdentity],
+	id_by_canonical_path: Dict[String, Int]
+}
+
+
+opaque type ModuleTable = ModuleTableRep
+
+
+private pure func module_id(index: Int) -> ModuleId:
+	into_opaque ModuleId(index)
+
+
+pure func module_id_table_index(id: ModuleId) -> Int:
+	from_opaque ModuleId(id)
+
+
+pure func module_ids_equal(left: ModuleId, right: ModuleId) -> Bool:
+	module_id_table_index(left) == module_id_table_index(right)
+
+
+foreign(include: "module_table_ffi.h"):
+	private pure func module_tables_are_same_allocation(
+		left: ModuleTable,
+		right: ModuleTable,
+	) -> Bool = "blorp_compiler_module_tables_are_same_allocation"
+
+
+pure func module_table(
+	identities: List[ResolvedModuleIdentity],
+) -> Result[ModuleTable, List[ModuleTableError]]:
+	var id_by_canonical_path: Dict[String, Int] = {}
+	var stored_identities: List[ResolvedModuleIdentity] = []
+	var errors: List[ModuleTableError] = []
+	var index: Int = 0
+
+	for identity in identities:
+		canonical_path = resolved_module_canonical_path(identity)
+
+		match id_by_canonical_path.get(canonical_path):
+			Some(first_index):
+				match stored_identities.get(first_index):
+					Some(first):
+						if resolved_module_identities_equal(first, identity):
+							errors = errors.append(DuplicateModuleTableIdentity(identity))
+						else if not module_origins_equal(
+							resolved_module_origin(first),
+							resolved_module_origin(identity),
+						):
+							errors = errors.append(ConflictingModuleTableOrigins(first, identity))
+					None:
+						void
+			None:
+				id_by_canonical_path = id_by_canonical_path.set(canonical_path, index)
+
+		stored_identities = stored_identities.append(
+			resolved_module_identity_from_resolver(
+				resolved_module_canonical_path(identity),
+				resolved_module_origin(identity),
+			),
+		)
+		index += 1
+
+	if errors.length() > 0:
+		Err(errors)
+	else:
+		representation: ModuleTableRep = {
+			identities = stored_identities,
+			id_by_canonical_path = id_by_canonical_path
+		}
+		Ok(into_opaque ModuleTable(representation))
+
+
+pure func module_table_count(table: ModuleTable) -> Int:
+	from_opaque ModuleTable(table).identities.length()
+
+
+pure func module_table_id_at(table: ModuleTable, index: Int) -> Option[ModuleId]:
+	match from_opaque ModuleTable(table).identities.get(index):
+		Some(_):
+			Some(module_id(index))
+		None:
+			None
+
+
+pure func module_table_find_id(
+	table: ModuleTable,
+	identity: ResolvedModuleIdentity,
+) -> Option[ModuleId]:
+	representation: ModuleTableRep = from_opaque ModuleTable(table)
+	index ?= representation.id_by_canonical_path.get(resolved_module_canonical_path(identity))
+	stored ?= representation.identities.get(index)
+
+	if resolved_module_identities_equal(stored, identity):
+		Some(module_id(index))
+	else:
+		None
+
+
+pure func module_table_find_id_by_canonical_path(
+	table: ModuleTable,
+	canonical_path: String,
+) -> Option[ModuleId]:
+	from_opaque ModuleTable(table).id_by_canonical_path
+		.get(canonical_path)
+		.map(module_id)
+
+
+pure func module_table_id_matches_identity(
+	table: ModuleTable,
+	id: ModuleId,
+	identity: ResolvedModuleIdentity,
+) -> Bool:
+	match module_table_find_id(table, identity):
+		Some(found):
+			module_ids_equal(found, id)
+		None:
+			False
+
+
+pure func module_table_resolved_identity(
+	table: ModuleTable,
+	id: ModuleId,
+) -> Option[ResolvedModuleIdentity]:
+	representation: ModuleTableRep = from_opaque ModuleTable(table)
+
+	match representation.identities.get(module_id_table_index(id)):
+		None:
+			None
+		Some(identity):
+			-- Compatibility projections own their descriptive value independently
+			-- from the canonical table row that issued the ModuleId.
+			Some(
+				resolved_module_identity_from_resolver(
+					resolved_module_canonical_path(identity),
+					resolved_module_origin(identity),
+				),
+			)
+
+
+pure func module_table_canonical_path(table: ModuleTable, id: ModuleId) -> Option[String]:
+	representation: ModuleTableRep = from_opaque ModuleTable(table)
+	representation.identities
+		.get(module_id_table_index(id))
+		.map(resolved_module_canonical_path)
+
+
+pure func module_table_origin(table: ModuleTable, id: ModuleId) -> Option[ModuleOrigin]:
+	representation: ModuleTableRep = from_opaque ModuleTable(table)
+	representation.identities
+		.get(module_id_table_index(id))
+		.map(resolved_module_origin)
+
+
+pure func module_tables_are_compatible(left: ModuleTable, right: ModuleTable) -> Bool:
+	module_tables_are_same_allocation(left, right)

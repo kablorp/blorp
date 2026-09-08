@@ -204,18 +204,21 @@ Exact identities established by the graph must survive later phases. A pass
 must not reconstruct semantic identity from declaration names, module strings,
 source order, or generated C spelling.
 
-`PreparedModuleScope` may carry a private target-first numeric slot for
-addressing graph-owned products such as TypeHeader per-module inventories. The
-slot is valid only after compatibility with that product's owning graph is
-proved, is unstable when graph composition changes, and is not a nominal module
-identity. Graph-issued `TypeId` values are the measured exception: they store
-this unboxed slot and are interpreted only by accepted type-header, alias,
-record, and union products constructed from the same `IndexedGraph`. Boundaries
-that require canonical identity materialize it from that owning graph. Other
-durable declaration IDs, typed programs, semantic occurrences, diagnostics,
-and external projections continue to retain or project `ModuleIdentity`. Issues
-56-57 replace this construction-time graph-local convention with one retained,
-compilation-owned module table before broadening integer ownership further.
+Stage 04 issues the compilation's opaque `ModuleId` values from one immutable
+`ModuleTable`. `FrontendGraph` retains that table with aligned finalized-program
+and surface columns; direct Stage 06 typechecking retains the exact same table
+with aligned prepared-module payloads. Descriptive replay input reconstructs
+the table once through the same Stage 04 constructor. A `ModuleId` remains
+invocation-local and is meaningful only with its issuing table.
+
+`PreparedModuleScope` carries this shared unboxed ID for addressing graph-owned
+products such as TypeHeader per-module inventories. Compatibility with the
+owning graph is still proved before positional access. Graph-issued `TypeId`
+values store the same `ModuleId` and are interpreted only by products tied to
+that graph. Boundaries that require canonical identity materialize it from the
+owning table or prepared payload. Other durable declaration IDs, typed
+programs, semantic occurrences, diagnostics, and external projections still
+retain or project `ModuleIdentity`; Issue 57 migrates those graph-backed owners.
 
 Compilation projects a successful typechecked graph into a Core-lowering input
 containing only typed programs, exact import bindings, source include

@@ -1,6 +1,6 @@
 # Normalized Compilation Database Roadmap
 
-**Status:** Proposed architecture and sequenced migration plan
+**Status:** Active; Horizon 1 Issue 56 implemented
 
 **Scope:** One compiler invocation and the immutable products retained by an
 LSP analysis snapshot. This is not a cross-run cache, an incremental build
@@ -25,13 +25,10 @@ retroactively change current production truth.
   records the accepted and rejected Stage 06 representation experiments,
   including the large win from unboxed type ownership and the regressions from
   per-declaration managed scopes and compensating dictionaries.
-- `docs/ARCHITECTURE.md` states that `PreparedModuleId` is a private, unstable
-  table slot. Graph-issued `TypeId` is the measured current exception: it stores
-  that slot under an owning-`IndexedGraph` construction contract. Other durable
-  and external products remain descriptive until Issues 56-58 establish one
-  retained compilation-owned table and migrate each consumer. Update the
-  architecture reference only with accepted implementation, not in
-  anticipation.
+- `docs/ARCHITECTURE.md` records the Stage 04-owned `ModuleTable` implemented by
+  Issue 56. Graph-issued `TypeId` and `PreparedModuleScope` now carry that shared
+  ID domain. Other durable and external products remain descriptive until
+  Issues 57-58 migrate each consumer.
 - `docs/COMPILER_PRIORITIES.md` remains authoritative for semantic
   typechecking phase decomposition, accepted/recoverable products, and
   demand-driven CTFE. Table normalization must follow those semantic
@@ -259,29 +256,28 @@ boundary is plausible, but it is intentionally not a near-term module-ID
 issue because spans touch diagnostics, parser recovery, Core locations, JSON,
 tests, and LSP UTF-16 conversion.
 
-### Stage 04 is partially normalized already
+### Stage 04 owns the compilation module identity spine
 
 `stage_04_modules/frontend_graph.brp` owns:
 
 ```text
-List[FrontendModule]
-List[FrontendModuleId]
-identity -> table-position index
+ModuleTable: ModuleId -> ResolvedModuleIdentity
+canonical path -> ModuleId index with exact row validation
+ModuleId-aligned finalized program and ModuleSurface columns
 List[FrontendModuleReference]
 ModuleReferenceId -> resolution outcome
 ModuleId -> ordered ModuleReferenceId list
 ```
 
-This is the strongest current precedent. Module and reference IDs are assigned
-in deterministic graph construction order, and repeated source import
-occurrences retain separate reference rows. The remaining problem is ownership:
-`FrontendModuleId` belongs to the Stage 04 graph, while Stage 06 constructs a
-second `PreparedModuleId` domain and another module payload table.
+Issue 56 established this as the single invocation-local module ID domain.
+Stage 06 retains the same table with aligned prepared payloads; descriptive
+replay requests reconstruct it once through the Stage 04 constructor. Module
+and reference IDs are assigned in deterministic graph construction order, and
+repeated source import occurrences retain separate reference rows.
 
-`FrontendModule` also combines intrinsic resolved identity with phase-specific
-parsed program and surface payload. The normalized form should separate the
-stable module row from aligned Stage 03/04 payload tables without duplicating
-the identity on each phase payload.
+`FrontendModule` remains only a compatibility projection assembled from the
+stable identity row and aligned Stage 03/04 payloads. Issue 57 removes more
+descriptive projections from Stage 06 hot paths.
 
 ### Stage 06 has table-like authorities but mixed ownership forms
 
@@ -294,7 +290,7 @@ These are useful domain-specific tables, but their keys and payloads mix:
 
 - complete `ModuleIdentity` values;
 - canonical module-path strings;
-- graph-local `PreparedModuleId` values;
+- shared compilation-owned `ModuleId` values;
 - raw definition integers whose domain is implicit;
 - source names repeated with owner records; and
 - transient `Env` symbols copied from accepted graph facts.
@@ -489,10 +485,10 @@ remain transient.
 
 **Current input:** Root and seed source candidates plus a resolution callback.
 
-**Current output:** `FrontendGraph` with `FrontendModuleId`,
-`FrontendModuleReferenceId`, module rows, roots, reference rows, exact
-resolution outcomes, and per-module ordered reference IDs. Each module row
-also retains a complete resolved identity, finalized AST, and module surface.
+**Current output:** `FrontendGraph` with a Stage 04-owned `ModuleTable`,
+`ModuleId`, `FrontendModuleReferenceId`, roots, aligned finalized-program and
+surface columns, reference rows, exact resolution outcomes, and per-module
+ordered reference IDs.
 
 **Should consume:** Source and parsed-module tables, root `SourceId` values,
 package/module resolution policy, and accepted parser state.
@@ -548,9 +544,10 @@ described under Stage 06.
 
 **Current input:** A validated `FrontendGraph` in the direct path, or a
 descriptive `TypecheckGraphRequest` in the replay boundary. The direct path
-still constructs `ModuleLoadCandidate`, `LoadedModuleSet`, `IndexedGraph`, and
-prepared modules. `IndexedGraph` assigns `PreparedModuleId` independently of
-Stage 04.
+passes the exact Stage 04 `ModuleTable` into `IndexedGraph`; replay constructs
+one table through the same Stage 04 owner. Prepared payloads are aligned to the
+shared `ModuleId` domain, although `ModuleLoadCandidate`, `LoadedModule`, and
+many later graph-backed rows still retain descriptive identity.
 
 **Current output:** Rich `TypecheckedModule` and `TypecheckedGraph` values,
 plus graph-owned authorities, prepared environments, completed headers,
@@ -953,7 +950,7 @@ audit before implementation.
 
 ### Horizon 1: One module identity spine (high fidelity)
 
-1. **Issue 56: Establish one compilation module table.** Extract one
+1. **Issue 56: Establish one compilation module table (implemented).** Extract one
    Stage 04-owned `ModuleId` domain and immutable identity table, retain exact
    module-reference/resolution rows, and make direct and replay Stage 06 entry
    normalize into that shape. Do not yet migrate declaration identities.

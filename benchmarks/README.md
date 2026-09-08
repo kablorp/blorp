@@ -583,16 +583,21 @@ opportunities per iteration:
 ```bash
 benchmarks/compiler_import_graph_profile
 benchmarks/compiler_import_graph_profile 3 30 32 20 fallback
+benchmarks/compiler_import_graph_profile 3 30 32 20 retained direct
 ```
 
 The positional controls are iterations, module count, functions per module,
-import fan-out, and parsed-program mode. The benchmark validates artifact,
-declaration, resolved-import, and import-binding counts on every iteration and
-prints `workload_valid=True` only when the complete graph matches those
-invariants without type errors. Every generated module calls every imported
-callable through its qualified module alias, so dropping or mis-registering an
-imported signature fails the workload rather than appearing as a speedup.
-Request construction is reported separately from measured graph typechecking.
+import fan-out, parsed-program mode, and optional `direct` frontend mode. The
+default measures descriptive replay. Direct mode builds a real
+`FrontendGraph` and enters typechecking through the compiler's graph-owned
+table boundary. The benchmark validates artifact, declaration,
+resolved-import, and import-binding counts on every iteration and prints
+`workload_valid=True` only when the complete graph matches those invariants
+without type errors. Every generated module calls every imported callable
+through its qualified module alias, so dropping or mis-registering an imported
+signature fails the workload rather than appearing as a speedup. Request
+construction is reported separately; elapsed and allocator counters cover the
+selected graph construction/typechecking mode.
 
 This runner is deliberately uninstrumented and optimized by default. A cached
 invocation takes roughly two seconds on the development machine. Compiler-source

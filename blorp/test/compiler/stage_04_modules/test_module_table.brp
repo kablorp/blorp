@@ -1,0 +1,151 @@
+import:
+	../../../src/compiler/stage_04_modules/loaded_module:
+		ModuleOrigin(SourcePackageModule, UserModule),
+		ResolvedModuleIdentity,
+		resolved_module_identities_equal,
+		resolved_module_identity_from_resolver,
+	../../../src/compiler/stage_04_modules/module_table:
+		ModuleTableError(ConflictingModuleTableOrigins, DuplicateModuleTableIdentity),
+		module_id_table_index,
+		module_table,
+		module_table_canonical_path,
+		module_table_count,
+		module_table_find_id,
+		module_table_find_id_by_canonical_path,
+		module_table_id_at,
+		module_table_origin,
+		module_table_resolved_identity,
+		module_tables_are_compatible,
+	test: TestSuite
+
+
+private pure func identity(canonical_path: String, origin: ModuleOrigin) -> ResolvedModuleIdentity:
+	resolved_module_identity_from_resolver(canonical_path, origin)
+
+
+pure func test_module_table_issues_deterministic_rows_and_indexes() -> Bool:
+	app = identity("app/main", UserModule)
+	dependency = identity("packages/math/stats", SourcePackageModule("math"))
+
+	match module_table([app, dependency]):
+		Err(_):
+			False
+		Ok(table):
+			match (
+				module_table_id_at(table, 0),
+				module_table_id_at(table, 1),
+				module_table_find_id(table, dependency),
+				module_table_find_id_by_canonical_path(table, "app/main"),
+			):
+				(Some(app_id), Some(dependency_id), Some(found_dependency), Some(found_app)):
+					(
+						module_table_count(table) == 2
+						and module_id_table_index(app_id) == 0
+						and module_id_table_index(dependency_id) == 1
+						and found_dependency == dependency_id
+						and found_app == app_id
+						and module_table_find_id(
+							table,
+							identity("app/main", SourcePackageModule("other")),
+						).is_none()
+						and module_table_canonical_path(
+							table,
+							dependency_id,
+						) == Some("packages/math/stats")
+						and match module_table_origin(table, dependency_id):
+							Some(SourcePackageModule(package)):
+								package == "math"
+							_:
+								False
+						and match module_table_resolved_identity(table, dependency_id):
+							Some(found):
+								resolved_module_identities_equal(found, dependency)
+							None:
+								False
+					)
+				_:
+					False
+
+
+pure func test_module_table_accepts_empty_input() -> Bool:
+	match module_table([]):
+		Err(_):
+			False
+		Ok(table):
+			(
+				module_table_count(table) == 0
+				and module_table_id_at(table, 0).is_none()
+				and module_table_find_id_by_canonical_path(table, "missing").is_none()
+			)
+
+
+pure func test_module_table_rejects_duplicate_identity() -> Bool:
+	first = identity("shared", UserModule)
+	duplicate = identity("shared", UserModule)
+
+	match module_table([first, duplicate]):
+		Err([DuplicateModuleTableIdentity(found)]):
+			resolved_module_identities_equal(found, first)
+		_:
+			False
+
+
+pure func test_module_table_rejects_one_path_with_distinct_origins() -> Bool:
+	user = identity("shared", UserModule)
+	package = identity("shared", SourcePackageModule("math"))
+	other_package = identity("shared", SourcePackageModule("stats"))
+
+	match module_table([user, package, other_package]):
+		Err(errors):
+			match errors:
+				[ConflictingModuleTableOrigins(first, second), ConflictingModuleTableOrigins(next_first, third)]:
+					(
+						resolved_module_identities_equal(first, user)
+						and resolved_module_identities_equal(second, package)
+						and resolved_module_identities_equal(next_first, user)
+						and resolved_module_identities_equal(third, other_package)
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_module_table_row_zero_requires_issuing_domain() -> Bool:
+	match (
+		module_table([identity("left", UserModule)]),
+		module_table([identity("right", UserModule)]),
+	):
+		(Ok(left), Ok(right)):
+			match (module_table_id_at(left, 0), module_table_id_at(right, 0)):
+				(Some(left_id), Some(right_id)):
+					(
+						module_id_table_index(left_id) == 0
+						and module_id_table_index(right_id) == 0
+						and not module_tables_are_compatible(left, right)
+					)
+				_:
+					False
+		_:
+			False
+
+
+tests: TestSuite = {
+	description = "Compiler module table",
+	tests = [
+		("accept empty input", test_module_table_accepts_empty_input),
+		(
+			"issue deterministic rows and indexes",
+			test_module_table_issues_deterministic_rows_and_indexes,
+		),
+		("reject duplicate identity", test_module_table_rejects_duplicate_identity),
+		(
+			"reject one path with distinct origins",
+			test_module_table_rejects_one_path_with_distinct_origins,
+		),
+		(
+			"row zero requires the issuing domain",
+			test_module_table_row_zero_requires_issuing_domain,
+		),
+	]
+}

@@ -56,6 +56,7 @@ fi
 if ! "${CC:-cc}" -O0 -fwrapv -pipe -w \
     -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
     -Iblorp/src/compiler/stage_01_generated_inputs \
+    -Iblorp/src/compiler/stage_04_modules \
     -Iblorp/src/compiler/stage_06_typecheck/graph \
     -Iblorp/src \
     -Iblorp/src/lib \

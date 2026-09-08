@@ -18,6 +18,9 @@ ROOT = Path(__file__).resolve().parents[5]
 BUILDER_MODULE_PATH = ROOT / "benchmarks" / "compiler_benchmark_worker.py"
 MODULE_PATH = ROOT / "benchmarks" / "compiler_typecheck_worker.py"
 BACKEND_MODULE_PATH = ROOT / "benchmarks" / "compiler_backend_worker.py"
+MODULE_TABLE_INCLUDE_DIR = Path(
+    "blorp/src/compiler/stage_04_modules"
+)
 TYPECHECK_GRAPH_INCLUDE_DIR = Path(
     "blorp/src/compiler/stage_06_typecheck/graph"
 )
@@ -88,6 +91,10 @@ class CompilerTypecheckWorkerTests(unittest.TestCase):
             self.assertEqual(compile_command[-1], str(source))
             self.assertIn(
                 f"-Dmain={self.worker.WORKER_MAIN_SYMBOL}",
+                object_command,
+            )
+            self.assertIn(
+                f"-I{(root / MODULE_TABLE_INCLUDE_DIR).resolve()}",
                 object_command,
             )
             self.assertIn(
@@ -165,7 +172,8 @@ class CompilerTypecheckWorkerTests(unittest.TestCase):
                             shift
                         fi
                     done
-                    printf '%s\\n' '#include "indexed_graph_ffi.h"' > "$output"
+                    printf '%s\\n' '#include "module_table_ffi.h"' > "$output"
+                    printf '%s\\n' '#include "indexed_graph_ffi.h"' >> "$output"
                     printf '%s\\n' 'int main(int argc, char **argv) { return argc == 2 ? 0 : 9; }' >> "$output"
                     """
                 ),
@@ -177,11 +185,19 @@ class CompilerTypecheckWorkerTests(unittest.TestCase):
                 "func main(args: List[String]) -> Int: 0\n",
                 encoding="utf-8",
             )
-            ffi_header = (
+            module_table_ffi_header = (
+                root / MODULE_TABLE_INCLUDE_DIR / "module_table_ffi.h"
+            )
+            module_table_ffi_header.parent.mkdir(parents=True)
+            module_table_ffi_header.write_text(
+                "/* module table FFI fixture */\n",
+                encoding="utf-8",
+            )
+            graph_ffi_header = (
                 root / TYPECHECK_GRAPH_INCLUDE_DIR / "indexed_graph_ffi.h"
             )
-            ffi_header.parent.mkdir(parents=True)
-            ffi_header.write_text(
+            graph_ffi_header.parent.mkdir(parents=True)
+            graph_ffi_header.write_text(
                 "/* benchmark worker FFI fixture */\n",
                 encoding="utf-8",
             )

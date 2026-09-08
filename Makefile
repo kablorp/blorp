@@ -249,6 +249,7 @@ compile-prepared-blorp-cli: $(BLORP_CLI_RUNTIME_OBJECT)
 		cc "$(BLORP_CLI_C_OPTIMIZATION)" -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
 			-include blorp/src/lib/runtime/native/runtime_decl.c \
 			-Iblorp/src/compiler/stage_01_generated_inputs \
+			-Iblorp/src/compiler/stage_04_modules \
 			-Iblorp/src/compiler/stage_06_typecheck/graph \
 			-Iblorp/src \
 			-Iblorp/src/lib \

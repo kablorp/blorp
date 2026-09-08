@@ -10,9 +10,14 @@ import:
 		module_identity_display_name,
 		module_load_candidate,
 		module_load_candidate_canonical_path,
+		module_load_candidate_resolved_identity,
 		module_load_candidate_with_surface,
 		resolved_module_identity_from_resolver,
 	../../../src/compiler/stage_04_modules/module_surface: module_surface_for_program
+	../../../src/compiler/stage_04_modules/module_table:
+		module_id_table_index,
+		module_table,
+		module_table_id_at,
 	../../../src/compiler/stage_06_typecheck/graph/definition_index:
 		definition_index_find_type_definition_id,
 		definition_index_func_callable_id_count,
@@ -32,11 +37,13 @@ import:
 		indexed_graph_modules,
 		indexed_graph_select_dependencies,
 		indexed_graph_select_dependency_scopes,
+		indexed_graph_select_dependency_scopes_by_id,
 		indexed_graph_target,
 		indexed_graph_target_scope,
 		prepared_module_identity,
 		prepared_module_program,
 		prepared_module_scope_compatible_index,
+		prepared_module_scope_id,
 		prepared_module_scope_module,
 		prepared_module_scopes_are_compatible,
 	../../../src/compiler/stage_06_typecheck/type_system/env: ENV_EMPTY
@@ -568,12 +575,24 @@ pure func test_indexed_graph_preserves_issuing_module_table_ids() -> Bool:
 	first = fixture_module_load_candidate("first.brp", "pkg/first", "type First = Int")
 	second = fixture_module_load_candidate("second.brp", "pkg/second", "type Second = Int")
 
+	identities = [first, target, second].map(module_load_candidate_resolved_identity)
+	table_result = module_table(identities)
+
+	graph_result = match table_result:
+		Err(errors):
+			Err(errors.map(
+				func(_): UnknownCompilerModuleTableIndex(-1),
+			))
+		Ok(table):
+			indexed_graph_build_for_module_table(
+				table,
+				[first, target, second],
+				target,
+			)
+
 	match (
 		(
-			indexed_graph_build_for_module_table(
-				[first, target, second],
-				1,
-			),
+			graph_result,
 			indexed_graph_build(
 				target,
 				[first, second],
@@ -656,15 +675,110 @@ pure func test_indexed_graph_preserves_issuing_module_table_ids() -> Bool:
 			False
 
 
-pure func test_indexed_graph_rejects_invalid_module_table_target_indices() -> Bool:
+pure func test_indexed_graph_retains_exact_compilation_module_table() -> Bool:
+	first_identity = resolved_module_identity_from_resolver("pkg/first", UserModule)
+	target_identity = resolved_module_identity_from_resolver("app", UserModule)
+	second_identity = resolved_module_identity_from_resolver("pkg/second", UserModule)
+	first = module_load_candidate(
+		first_identity,
+		finalized_program("first.brp", "pkg/first", "type First = Int"),
+	)
+	target = module_load_candidate(
+		target_identity,
+		finalized_program("main.brp", "app", "type Target = Int"),
+	)
+	second = module_load_candidate(
+		second_identity,
+		finalized_program("second.brp", "pkg/second", "type Second = Int"),
+	)
+
+	match module_table([first_identity, target_identity, second_identity]):
+		Err(_):
+			False
+		Ok(table):
+			match (
+				indexed_graph_build_for_module_table(
+					table,
+					[first, target, second],
+					target,
+				)
+			):
+				Err(_):
+					False
+				Ok(graph):
+					match (module_table_id_at(table, 0), module_table_id_at(table, 2)):
+						(Some(first_id), Some(second_id)):
+							indexed_graph_select_dependency_scopes_by_id(
+								graph,
+								table,
+								[first_id, second_id],
+							).is_ok() and module_id_table_index(
+								prepared_module_scope_id(indexed_graph_target_scope(graph)),
+							) == 1
+						_:
+							False
+
+
+pure func test_indexed_graph_rejects_misaligned_module_table_payloads() -> Bool:
+	target_identity = resolved_module_identity_from_resolver("app", UserModule)
+	other_identity = resolved_module_identity_from_resolver("other", UserModule)
 	target = fixture_module_load_candidate("main.brp", "app", "func main(): 0")
+	other = fixture_module_load_candidate("other.brp", "other", "func main(): 0")
+
+	match (module_table([target_identity]), module_table([other_identity])):
+		(Ok(target_table), Ok(other_table)):
+			match (
+				indexed_graph_build_for_module_table(target_table, [], target),
+				indexed_graph_build_for_module_table(other_table, [target], other),
+			):
+				(Err([CompilerModuleTableLengthMismatch(1, 0)]), Err([CompilerModuleTableIdentityMismatch(0, "other", "app")])):
+					True
+				_:
+					False
+		_:
+			False
+
+
+pure func test_indexed_graph_rejects_dependency_ids_from_another_table() -> Bool:
+	target = fixture_module_load_candidate("main.brp", "app", "func main(): 0")
+	dependency = fixture_module_load_candidate("dep.brp", "dep", "pure func value(): 1")
+	other = fixture_module_load_candidate("other.brp", "other", "pure func value(): 2")
 
 	match (
-		indexed_graph_build_for_module_table([target], -1),
-		indexed_graph_build_for_module_table([target], 1),
+		module_table([target, dependency].map(module_load_candidate_resolved_identity)),
+		module_table([target, other].map(module_load_candidate_resolved_identity)),
 	):
-		(Err([UnknownCompilerModuleTableIndex(-1)]), Err([UnknownCompilerModuleTableIndex(1)])):
-			True
+		(Ok(table), Ok(other_table)):
+			match (
+				(
+					indexed_graph_build_for_module_table(
+						table,
+						[target, dependency],
+						target,
+					),
+					module_table_id_at(table, 1),
+					module_table_id_at(other_table, 1),
+				)
+			):
+				(Ok(graph), Some(dependency_id), Some(other_id)):
+					(
+						indexed_graph_select_dependency_scopes_by_id(
+							graph,
+							table,
+							[dependency_id],
+						).is_ok()
+						and match indexed_graph_select_dependency_scopes_by_id(
+							graph,
+							other_table,
+							[other_id],
+						):
+							Err([IncompatibleCompilerModuleTable]):
+								True
+							_:
+								False
+					)
+				_:
+					False
 		_:
 			False
 
@@ -770,8 +884,16 @@ tests: TestSuite = {
 			test_indexed_graph_preserves_issuing_module_table_ids,
 		),
 		(
-			"rejects invalid module table target indices",
-			test_indexed_graph_rejects_invalid_module_table_target_indices,
+			"retains exact compilation module table",
+			test_indexed_graph_retains_exact_compilation_module_table,
+		),
+		(
+			"rejects misaligned module table payloads",
+			test_indexed_graph_rejects_misaligned_module_table_payloads,
+		),
+		(
+			"rejects dependency ids from another table",
+			test_indexed_graph_rejects_dependency_ids_from_another_table,
 		),
 		("indexed graph releases owned values", test_indexed_graph_releases_owned_values),
 	]

@@ -328,9 +328,9 @@ maintained document.
 
 The module-identity graph modes isolate functions whose signatures or bodies
 directly carry `ResolvedModuleIdentity`, `ModuleIdentity`, `FrontendModuleId`,
-explicit `module_path`/`module_name` String bindings or fields, or a String-bearing
-function whose name contains an exact `_module_path`/`_module_name` token. They
-then walk callers transitively.
+`ModuleId`, explicit `module_path`/`module_name` String bindings or fields, or a
+String-bearing function whose name contains an exact `_module_path`/
+`_module_name` token. They then walk callers transitively.
 JSON output is intended for mechanical migration inventories: every node has a
 deterministic module/function key, source location, direct-fact categories, and its
 shortest caller distance from a direct fact. DOT output renders the same node

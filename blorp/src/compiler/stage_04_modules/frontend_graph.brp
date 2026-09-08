@@ -10,9 +10,19 @@ import:
 		ModuleOrigin(StdlibModule),
 		ResolvedModuleIdentity,
 		resolved_module_canonical_path,
-		resolved_module_identity_storage_key,
+		resolved_module_identities_equal,
 		resolved_module_origin,
 	module_surface: ModuleSurface
+	module_table:
+		ModuleId,
+		ModuleTable,
+		ModuleTableError(ConflictingModuleTableOrigins, DuplicateModuleTableIdentity),
+		module_id_table_index,
+		module_table,
+		module_table_count,
+		module_table_find_id,
+		module_table_id_at,
+		module_table_resolved_identity,
 	set as Sets
 
 
@@ -23,19 +33,17 @@ record FrontendModule {
 }
 
 
-opaque type FrontendModuleId = Int
-
 opaque type FrontendModuleReferenceId = Int
 
 
 record FrontendModuleReference {
-	importer: FrontendModuleId,
+	importer: ModuleId,
 	requested_path: String
 }
 
 
 union FrontendModuleReferenceResolution:
-	ResolvedFrontendModuleReference(FrontendModuleId)
+	ResolvedFrontendModuleReference(ModuleId)
 	UnresolvedFrontendModuleReference
 
 
@@ -84,10 +92,10 @@ pure func frontend_graph_error_message(error: FrontendGraphError) -> String:
 
 
 private record FrontendGraphRep {
-	modules: List[FrontendModule],
-	module_ids: List[FrontendModuleId],
-	module_ids_by_identity: Dict[String, Int],
-	roots: List[FrontendModuleId],
+	programs: List[FinalizedTypecheckProgram],
+	surfaces: List[ModuleSurface],
+	module_table: ModuleTable,
+	roots: List[ModuleId],
 	is_root_by_module: List[Bool],
 	references: List[FrontendModuleReference],
 	resolution_by_reference: List[FrontendModuleReferenceResolution],
@@ -98,12 +106,12 @@ private record FrontendGraphRep {
 opaque type FrontendGraph = FrontendGraphRep
 
 
-private pure func frontend_module_id(index: Int) -> FrontendModuleId:
-	into_opaque FrontendModuleId(index)
+private pure func frontend_module_program(module: FrontendModule) -> FinalizedTypecheckProgram:
+	module.program
 
 
-pure func frontend_module_id_table_index(id: FrontendModuleId) -> Int:
-	from_opaque FrontendModuleId(id)
+private pure func frontend_module_surface(module: FrontendModule) -> ModuleSurface:
+	module.surface
 
 
 private pure func frontend_module_reference_id(index: Int) -> FrontendModuleReferenceId:
@@ -184,19 +192,25 @@ private pure func frontend_source_ordered_reference_ids(
 	ordered
 
 
-private pure func frontend_module_membership_contains_identity(
-	membership: Dict[String, Int],
+private pure func frontend_modules_contain_identity(
+	module_table_result: Result[ModuleTable, List[ModuleTableError]],
+	modules: List[FrontendModule],
 	identity: ResolvedModuleIdentity,
 ) -> Bool:
-	membership.contains(resolved_module_identity_storage_key(identity))
+	match module_table_result:
+		Ok(table):
+			module_table_find_id(table, identity).is_some()
+		Err(_):
+			modules.any(func(module): resolved_module_identities_equal(module.identity, identity))
 
 
 private pure func missing_root_errors(
-	membership: Dict[String, Int],
+	module_table_result: Result[ModuleTable, List[ModuleTableError]],
+	modules: List[FrontendModule],
 	roots: List[ResolvedModuleIdentity],
 ) -> List[FrontendGraphError]:
 	roots.filter_map(func(root) -> Option[FrontendGraphError]:
-		if frontend_module_membership_contains_identity(membership, root):
+		if frontend_modules_contain_identity(module_table_result, modules, root):
 			None
 		else:
 			Some(MissingCompilerFrontendRoot(root))
@@ -204,18 +218,19 @@ private pure func missing_root_errors(
 
 
 private pure func missing_edge_errors(
-	membership: Dict[String, Int],
+	module_table_result: Result[ModuleTable, List[ModuleTableError]],
+	modules: List[FrontendModule],
 	edges: List[FrontendImportEdge],
 ) -> List[FrontendGraphError]:
 	var errors: List[FrontendGraphError] = []
 
 	for edge in edges:
-		if not frontend_module_membership_contains_identity(membership, edge.importer):
+		if not frontend_modules_contain_identity(module_table_result, modules, edge.importer):
 			errors = errors.append(MissingCompilerFrontendEdgeImporter(edge.importer))
 
 		match edge.resolution:
 			FrontendResolvedImport(target):
-				if not frontend_module_membership_contains_identity(membership, target):
+				if not frontend_modules_contain_identity(module_table_result, modules, target):
 					errors = errors.append(MissingCompilerFrontendEdgeTarget(target))
 			FrontendUnresolvedImport:
 				void
@@ -223,28 +238,30 @@ private pure func missing_edge_errors(
 	errors
 
 
+private pure func frontend_graph_errors_from_module_table(
+	errors: List[ModuleTableError],
+) -> List[FrontendGraphError]:
+	errors.map(func(error):
+		match error:
+			DuplicateModuleTableIdentity(identity):
+				DuplicateCompilerFrontendModulePath(identity, identity)
+			ConflictingModuleTableOrigins(first, second):
+				DuplicateCompilerFrontendModulePath(first, second)
+	)
+
+
 pure func frontend_graph(
 	modules: List[FrontendModule],
 	roots: List[ResolvedModuleIdentity],
 	import_edges: List[FrontendImportEdge],
 ) -> Result[FrontendGraph, List[FrontendGraphError]]:
-	var module_ids_by_identity: Dict[String, Int] = {}
-	var first_by_path: Dict[String, ResolvedModuleIdentity] = {}
 	var reserved_errors: List[FrontendGraphError] = []
-	var duplicate_errors: List[FrontendGraphError] = []
 	var reference_ids_by_module: List[List[FrontendModuleReferenceId]] = []
-	var module_ids: List[FrontendModuleId] = []
-	var module_index: Int = 0
 
 	for module in modules:
 		identity = module.identity
 		canonical_path = resolved_module_canonical_path(identity)
-		module_ids_by_identity = module_ids_by_identity.set(
-			resolved_module_identity_storage_key(identity),
-			module_index,
-		)
 		reference_ids_by_module = reference_ids_by_module.append([])
-		module_ids = module_ids.append(frontend_module_id(module_index))
 
 		if embedded_std_contains_module(canonical_path):
 			match resolved_module_origin(identity):
@@ -255,137 +272,165 @@ pure func frontend_graph(
 						ReservedCompilerFrontendModulePath(identity),
 					)
 
-		match first_by_path.get(canonical_path):
-			Some(first):
-				duplicate_errors = duplicate_errors.append(
-					DuplicateCompilerFrontendModulePath(
-						first,
-						identity,
-					),
-				)
-			None:
-				first_by_path = first_by_path.set(canonical_path, identity)
+	module_table_result = module_table(modules.map(
+		func(module): module.identity,
+	))
 
-		module_index += 1
+	duplicate_errors: List[FrontendGraphError] = match module_table_result:
+		Ok(_):
+			[]
+		Err(module_errors):
+			frontend_graph_errors_from_module_table(module_errors)
 
 	errors = reserved_errors
 		.concat(duplicate_errors)
-		.concat(missing_root_errors(module_ids_by_identity, roots))
-		.concat(missing_edge_errors(module_ids_by_identity, import_edges))
+		.concat(missing_root_errors(module_table_result, modules, roots))
+		.concat(missing_edge_errors(module_table_result, modules, import_edges))
 
 	if errors.length() > 0:
 		Err(errors)
 	else:
-		var root_ids: List[FrontendModuleId] = []
-		var is_root_by_module: List[Bool] = False.repeat(modules.length())
+		match module_table_result:
+			Err(module_errors):
+				Err(frontend_graph_errors_from_module_table(module_errors))
+			Ok(table):
+				var root_ids: List[ModuleId] = []
+				var is_root_by_module: List[Bool] = False.repeat(modules.length())
 
-		for root in roots:
-			match module_ids_by_identity.get(resolved_module_identity_storage_key(root)):
-				Some(root_index):
-					root_ids = root_ids.append(frontend_module_id(root_index))
-					is_root_by_module = is_root_by_module.set(root_index, True)
-				None:
-					-- Root validation above makes this branch unreachable.
-					void
-
-		var references: List[FrontendModuleReference] = []
-		var resolution_by_reference: List[FrontendModuleReferenceResolution] = []
-
-		for edge in import_edges:
-			match module_ids_by_identity.get(resolved_module_identity_storage_key(edge.importer)):
-				Some(importer_index):
-					reference_id = frontend_module_reference_id(references.length())
-					references = references.append({
-						importer = frontend_module_id(importer_index),
-						requested_path = edge.requested_path,
-					})
-					existing = reference_ids_by_module.get_or(importer_index, [])
-					reference_ids_by_module = reference_ids_by_module.set(
-						importer_index,
-						existing.append(reference_id),
-					)
-
-					match edge.resolution:
-						FrontendUnresolvedImport:
-							resolution_by_reference = resolution_by_reference.append(
-								UnresolvedFrontendModuleReference,
+				for root in roots:
+					match module_table_find_id(table, root):
+						Some(root_id):
+							root_ids = root_ids.append(root_id)
+							is_root_by_module = is_root_by_module.set(
+								module_id_table_index(root_id),
+								True,
 							)
-						FrontendResolvedImport(target):
-							match module_ids_by_identity.get(
-								resolved_module_identity_storage_key(target),
-							):
-								Some(target_index):
+						None:
+							-- Root validation above makes this branch unreachable.
+							void
+
+				var references: List[FrontendModuleReference] = []
+				var resolution_by_reference: List[FrontendModuleReferenceResolution] = []
+
+				for edge in import_edges:
+					match module_table_find_id(table, edge.importer):
+						Some(importer_id):
+							importer_index = module_id_table_index(importer_id)
+							reference_id = frontend_module_reference_id(references.length())
+							references = references.append({
+								importer = importer_id,
+								requested_path = edge.requested_path,
+							})
+							existing = reference_ids_by_module.get_or(importer_index, [])
+							reference_ids_by_module = reference_ids_by_module.set(
+								importer_index,
+								existing.append(reference_id),
+							)
+
+							match edge.resolution:
+								FrontendUnresolvedImport:
 									resolution_by_reference = resolution_by_reference.append(
-										ResolvedFrontendModuleReference(
-											frontend_module_id(target_index),
-										),
+										UnresolvedFrontendModuleReference,
 									)
-								None:
-									-- Endpoint validation above makes this branch unreachable.
-									void
+								FrontendResolvedImport(target):
+									match module_table_find_id(table, target):
+										Some(target_id):
+											resolution_by_reference = resolution_by_reference.append(
+												ResolvedFrontendModuleReference(target_id),
+											)
+										None:
+											-- Endpoint validation above makes this branch unreachable.
+											void
 
-					void
-				None:
-					-- Endpoint validation above makes this branch unreachable.
-					void
+							void
+						None:
+							-- Endpoint validation above makes this branch unreachable.
+							void
 
-		reference_ids_by_module = frontend_source_ordered_reference_ids(
-			modules,
-			references,
-			reference_ids_by_module,
-		)
-		representation: FrontendGraphRep = {
-			modules = modules,
-			module_ids = module_ids,
-			module_ids_by_identity = module_ids_by_identity,
-			roots = root_ids,
-			is_root_by_module = is_root_by_module,
-			references = references,
-			resolution_by_reference = resolution_by_reference,
-			reference_ids_by_module = reference_ids_by_module
-		}
-		Ok(into_opaque FrontendGraph(representation))
+				reference_ids_by_module = frontend_source_ordered_reference_ids(
+					modules,
+					references,
+					reference_ids_by_module,
+				)
+				representation: FrontendGraphRep = {
+					programs = modules.map(frontend_module_program),
+					surfaces = modules.map(frontend_module_surface),
+					module_table = table,
+					roots = root_ids,
+					is_root_by_module = is_root_by_module,
+					references = references,
+					resolution_by_reference = resolution_by_reference,
+					reference_ids_by_module = reference_ids_by_module
+				}
+				Ok(into_opaque FrontendGraph(representation))
 
 
 pure func frontend_graph_modules(graph: FrontendGraph) -> List[FrontendModule]:
-	representation: FrontendGraphRep = from_opaque FrontendGraph(graph)
-	representation.modules
+	var modules: List[FrontendModule] = []
+
+	for module_id in frontend_graph_module_ids(graph):
+		match frontend_graph_module(graph, module_id):
+			Some(module):
+				modules = modules.append(module)
+			None:
+				void
+
+	modules
 
 
-pure func frontend_graph_module_ids(graph: FrontendGraph) -> List[FrontendModuleId]:
+pure func frontend_graph_module_table(graph: FrontendGraph) -> ModuleTable:
 	representation: FrontendGraphRep = from_opaque FrontendGraph(graph)
-	representation.module_ids
+	representation.module_table
+
+
+pure func frontend_graph_module_ids(graph: FrontendGraph) -> List[ModuleId]:
+	table = frontend_graph_module_table(graph)
+	var ids: List[ModuleId] = []
+	var index: Int = 0
+
+	while index < module_table_count(table):
+		match module_table_id_at(table, index):
+			Some(id):
+				ids = ids.append(id)
+			None:
+				void
+
+		index += 1
+
+	ids
 
 
 pure func frontend_graph_find_module_id(
 	graph: FrontendGraph,
 	identity: ResolvedModuleIdentity,
-) -> Option[FrontendModuleId]:
+) -> Option[ModuleId]:
 	representation: FrontendGraphRep = from_opaque FrontendGraph(graph)
-	representation.module_ids_by_identity
-		.get(resolved_module_identity_storage_key(identity))
-		.map(frontend_module_id)
+	module_table_find_id(representation.module_table, identity)
 
 
-pure func frontend_graph_module(
-	graph: FrontendGraph,
-	id: FrontendModuleId,
-) -> Option[FrontendModule]:
+pure func frontend_graph_module(graph: FrontendGraph, id: ModuleId) -> Option[FrontendModule]:
 	representation: FrontendGraphRep = from_opaque FrontendGraph(graph)
-	representation.modules.get(frontend_module_id_table_index(id))
+	identity ?= module_table_resolved_identity(representation.module_table, id)
+	program ?= representation.programs.get(module_id_table_index(id))
+	surface ?= representation.surfaces.get(module_id_table_index(id))
+	Some({
+		identity = identity,
+		program = program,
+		surface = surface,
+	})
 
 
-pure func frontend_graph_root_ids(graph: FrontendGraph) -> List[FrontendModuleId]:
+pure func frontend_graph_root_ids(graph: FrontendGraph) -> List[ModuleId]:
 	representation: FrontendGraphRep = from_opaque FrontendGraph(graph)
 	representation.roots
 
 
 pure func frontend_graph_reference_ids(
 	graph: FrontendGraph,
-	module_id: FrontendModuleId,
+	module_id: ModuleId,
 ) -> List[FrontendModuleReferenceId]:
 	representation: FrontendGraphRep = from_opaque FrontendGraph(graph)
-	representation.reference_ids_by_module.get_or(frontend_module_id_table_index(module_id), [])
+	representation.reference_ids_by_module.get_or(module_id_table_index(module_id), [])
 
 
 pure func frontend_graph_reference(
@@ -406,9 +451,7 @@ pure func frontend_graph_reference_resolution(
 
 pure func frontend_graph_root_modules(graph: FrontendGraph) -> List[FrontendModule]:
 	representation: FrontendGraphRep = from_opaque FrontendGraph(graph)
-	representation.roots.filter_map(func(root):
-		representation.modules.get(frontend_module_id_table_index(root))
-	)
+	representation.roots.filter_map(func(root): frontend_graph_module(graph, root))
 
 
 pure func frontend_graph_dependency_modules(graph: FrontendGraph) -> List[FrontendModule]:
@@ -416,9 +459,13 @@ pure func frontend_graph_dependency_modules(graph: FrontendGraph) -> List[Fronte
 	var dependencies: List[FrontendModule] = []
 	var index: Int = 0
 
-	for module in representation.modules:
+	for module_id in frontend_graph_module_ids(graph):
 		if not representation.is_root_by_module.get_or(index, False):
-			dependencies = dependencies.append(module)
+			match frontend_graph_module(graph, module_id):
+				Some(module):
+					dependencies = dependencies.append(module)
+				None:
+					void
 
 		index += 1
 
@@ -429,11 +476,11 @@ pure func frontend_graph_import_edges(graph: FrontendGraph) -> List[FrontendImpo
 	representation: FrontendGraphRep = from_opaque FrontendGraph(graph)
 	var edges: List[FrontendImportEdge] = []
 
-	for module_id in representation.module_ids:
-		match representation.modules.get(frontend_module_id_table_index(module_id)):
+	for module_id in frontend_graph_module_ids(graph):
+		match frontend_graph_module(graph, module_id):
 			Some(importer):
 				for reference_id in representation.reference_ids_by_module.get_or(
-					frontend_module_id_table_index(module_id),
+					module_id_table_index(module_id),
 					[],
 				):
 					reference_index = frontend_module_reference_id_value(reference_id)
@@ -448,9 +495,7 @@ pure func frontend_graph_import_edges(graph: FrontendGraph) -> List[FrontendImpo
 										resolution = FrontendUnresolvedImport,
 									})
 								Some(ResolvedFrontendModuleReference(target_id)):
-									match representation.modules.get(
-										frontend_module_id_table_index(target_id),
-									):
+									match frontend_graph_module(graph, target_id):
 										Some(target):
 											edges = edges.append({
 												importer = importer.identity,
