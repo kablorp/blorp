@@ -1182,6 +1182,15 @@ This evidence changes the Tranche 5 order: migrate consumed-parameter
 whole-body and branch summaries first. Do not build unrelated all-value fact
 consumers merely because they appeared earlier in the original list.
 
+Before starting that larger analysis product, a bounded change-aware insertion
+checkpoint reused the immediate source Core node for proven ownership-neutral
+leaves, simple shells, and unchanged unmanaged binding spines. On the
+8,838-node linear direct-Perceus fixture, 8,644 insertion results reused their
+source; measured-window allocations fell 5.97% and time fell 3.93%, with
+byte-identical post-Perceus
+Core. Ownership-sensitive helper families remain explicitly conservative. See
+[`compiler_perceus_change_aware_insertion_2026-09-07.md`](../../../benchmarks/results/compiler_perceus_change_aware_insertion_2026-09-07.md).
+
 ## Tranche 5: Build All-Value Ownership Facts Once
 
 ### Change
