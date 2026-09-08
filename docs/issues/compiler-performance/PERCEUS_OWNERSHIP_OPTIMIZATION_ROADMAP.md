@@ -1,6 +1,9 @@
 # Perceus Ownership Optimization Roadmap
 
-**Status:** Tranches 0–4 and 7A–7B implemented; Tranches 5–6 and 8–9 proposed
+**Status:** Tranches 0–4 and 7A–7B implemented; the post-Tranche-4
+change-aware insertion checkpoint is complete through aggregates; Tranches
+5–6 and 8–9 remain gated proposals. Issue 53's compact cleanup-ABI continuation
+is tracked separately from completed Tranches 7A–7B.
 
 ## Objective
 
@@ -583,9 +586,11 @@ not noisy process or Core JSON time, are the primary fast proof.
 ### Forecasts versus acceptance gates
 
 Rows not yet implemented are prioritization hypotheses rather than
-production-current promises. Every row is relative to its immediate parent;
-the cumulative statement following the table is relative to Tranche 0. The
-Tranche 4 rows are stricter issue-level landing gates: their deliberately
+production-current promises. Completed rows retain their original forecasts
+as historical priors; their realized results are recorded in the corresponding
+tranche sections and benchmark reports. Every row is relative to its immediate
+parent; the cumulative statement following the table is relative to Tranche 0.
+The Tranche 4 rows are stricter issue-level landing gates: their deliberately
 dominant fixed-shape fixtures must expose an observable gain before the change
 can merge. Production self-compilation percentages remain measurements, not
 promises, because earlier tranches change the remaining Perceus denominator.
@@ -607,7 +612,7 @@ promises, because earlier tranches change the remaining Perceus denominator.
 
 The kind of improvement also changes at explicit boundaries:
 
-| Completion point | Compiler work | Generated C | Executed ownership work | Heap allocations |
+| Completion point | Compiler work | Generated C | Executed ownership work | Emitted-program heap allocations |
 | --- | --- | --- | --- | --- |
 | Tranche 0 | Measurement overhead only | Unchanged | Unchanged | Unchanged |
 | Tranches 1–4 | Less contract and borrowed-boundary work | Byte-identical | Identical | Identical |
@@ -1178,9 +1183,13 @@ median by 99.8% and allocations by 99.87% with byte-identical Core. Compiler
 self-compilation is neutral, so this is recorded as a scaling fix rather than a
 self-host speedup.
 
-This evidence changes the Tranche 5 order: migrate consumed-parameter
-whole-body and branch summaries first. Do not build unrelated all-value fact
-consumers merely because they appeared earlier in the original list.
+This evidence changed the Tranche 5 order: the worst consumed-parameter shape
+was fixed first. Do not build unrelated all-value fact consumers merely
+because they appeared earlier in the original list. The narrow shortcut is
+transitional and must be removed only after the general Tranche 6 planner
+meets or beats it.
+
+### Post-Tranche-4 change-aware insertion checkpoint
 
 Before starting that larger analysis product, a bounded change-aware insertion
 checkpoint reused the immediate source Core node for proven ownership-neutral
@@ -1203,7 +1212,60 @@ are now the next prerequisite for exposing useful non-immortal managed-let
 parents. See
 [`compiler_perceus_change_aware_managed_lets_2026-09-08.md`](../../../benchmarks/results/compiler_perceus_change_aware_managed_lets_2026-09-08.md).
 
+The next bounded checkpoint made call normalization and recursive call
+insertion change-aware. It reuses a source `CallExpr` only when consuming-field
+protection, borrowed-temporary materialization, and every recursive child are
+proven neutral. The 512-worker transfer workload reused all 513 calls and
+removed 1,037 measured-window allocations and releases (-1.02% and -1.07%).
+Its paired direct-window time improved 1.29%, while whole-worker time remained
+neutral and post-Perceus Core was byte-identical. Aggregate construction
+retained a separate proof surface in the following checkpoint. See
+[`compiler_perceus_change_aware_calls_2026-09-08.md`](../../../benchmarks/results/compiler_perceus_change_aware_calls_2026-09-08.md).
+
+The aggregate checkpoint now makes that proof explicit for expression lists,
+record fields and reuse/COW variants, boxed list/tensor/union storage, and
+dictionary keys and values. Fieldless typed `Unchanged` results preserve the
+original collections and aggregate roots; changed results carry only the
+replacement collection. On the focused aggregate-escape fixture, 256 of 280
+aggregate roots were reused and measured-window allocations and releases fell
+2.60% and 2.77%, with byte-identical Core. Timing remained neutral. A closed
+behavioral matrix covers neutral and ownership-sensitive decisions for every
+aggregate family at the real Perceus boundary, including independent dict key
+and value cases and the preparatory lowering of `RecordUpdateExpr`. See
+[`compiler_perceus_change_aware_aggregates_2026-09-08.md`](../../../benchmarks/results/compiler_perceus_change_aware_aggregates_2026-09-08.md).
+
+The final bounded insertion checkpoint is complete. [Issue
+60](60-make-fixed-arity-ownership-normalization-change-aware.md) makes the
+normalization of `UnboxExpr`, `BinaryExpr`, `FieldExpr`, and `TupleFieldExpr`
+report exact source identity before composing recursive child identity. Its
+scaled neutral workload reused all 584 eligible roots and removed 8.42% of
+direct-window allocations and 8.85% of releases while preserving byte-exact
+Core. See
+[`compiler_perceus_change_aware_fixed_ownership_2026-09-08.md`](../../../benchmarks/results/compiler_perceus_change_aware_fixed_ownership_2026-09-08.md).
+
+Do **not** automatically extend the same technique to literal, accessor,
+length, or constructor matches. Their branch bindings, fallbacks, and result
+ownership are the facts Tranches 5–6 intend to collect and plan together. A
+standalone change-aware match framework is admitted only if the post-Issue-60
+profile shows match reconstruction itself is material and the proposed work
+will survive the Tranche 6 design.
+
+The post-Issue-60 self-host sample makes the new fixed-root helper negligible.
+It leaves 2.18% of the capture under `insert_drops_ownership_node`, but that
+path combines ownership-sensitive calls and match normalization; it does not
+attribute a material match-only reconstruction cost. No remaining
+target-specific scalar-summary family is material enough to pay for the
+all-value fact collection. Accordingly, neither a match identity checkpoint
+nor Tranche 5 is admitted by current evidence. The automatic compiler-time
+workstream stops here. Any continuation begins with narrower residual-work
+measurement, not speculative shared architecture.
+
 ## Tranche 5: Build All-Value Ownership Facts Once
+
+**Admission:** Not admitted by the 2026-09-08 post-Issue-60 profile. Before any
+future implementation, write a separate issue for the first newly measured
+consumer. That issue must name the exact legacy requests and visits it removes;
+do not begin with a consumer-free universal analysis product.
 
 ### Change
 
@@ -1254,7 +1316,8 @@ compile time or ownership ingress.
 
 ### Incremental consumers
 
-Cut over and delete one old query family at a time, in measured order:
+Cut over and delete one old query family at a time, in the order established
+by the admission profile. The current candidate list is:
 
 1. consumed-parameter whole-body legacy balance summaries;
 2. consumed-parameter nested branch summaries;
@@ -1264,6 +1327,10 @@ Cut over and delete one old query family at a time, in measured order:
 6. referenced borrowed match-binding detection.
 
 Each cutover is a mergeable checkpoint with its own counter improvement.
+Items 1–2 refer only to residual paths not handled by Issue 59's proven-identity
+shortcut. Admission counters must separate those paths from calls that already
+take the shortcut; historical worst-case totals are not evidence for a new
+all-value product.
 
 ### Acceptance criteria
 
@@ -1285,6 +1352,11 @@ Each cutover is a mergeable checkpoint with its own counter improvement.
   window before proceeding.
 
 ## Tranche 6: Separate Ownership Planning From Materialization
+
+**Admission:** Begin only after shared Tranche 5 value/region facts have proved
+useful to multiple measured consumers without an offsetting allocation or
+retained-memory regression. Split the migration into region-family issues; do
+not implement the ten steps below as one change.
 
 ### Change
 
@@ -1493,7 +1565,27 @@ fraction before an output-size promise is made.
   generalize to region-sensitive analysis until profiling identifies a
   representative workload where the added complexity pays for itself.
 
+### Implemented result and remaining cleanup boundary
+
+Tranches 7A–7B correspond to Issue 53 Checkpoints 0–4 and are complete.
+Whole-activation suppression removed 8,497 local cleanup calls (5.25%) and
+about 0.9% of generated self-host C while preserving ordinary retain/release
+counts. This clears the roadmap's minimum usefulness floor, but it does not by
+itself admit region-sensitive lifetime analysis.
+
+[Issue 53](53-minimize-and-compact-cancellation-cleanup.md) separately retains
+three possible continuation checkpoints: measure and, only if justified,
+implement region-sensitive liveness; replace the per-owner linked-frame ABI
+with compact activation scopes; and delete the old emitter/runtime path after
+cutover. If region-sensitive liveness is rejected, the Checkpoint 4 semantic
+plan is the stable input to compact-ABI work. If it is admitted, it must land
+before the ABI changes so semantic and representation changes remain separate.
+
 ## Tranche 8: Simplify Proven Ownership Actions
+
+**Admission:** Requires the explicit Tranche 6 ownership plan. Do not recreate
+partial provenance analysis beside the current scalar insertion path merely to
+land an isolated action-removal rule.
 
 ### First rule
 
@@ -1537,6 +1629,11 @@ first teach reuse to consume an explicit `DeadOwnerAt(site)` fact.
   remains documented rather than adding production complexity.
 
 ## Tranche 9: Remove Nonescaping Container Allocations
+
+**Admission:** Independent of the late cancellation-cleanup representation but
+gated by a current compiler/self-host occurrence census. Create the first
+record-only issue only when eligible nonescaping records occur often enough to
+measure; a synthetic-only win does not admit production complexity.
 
 ### Start with scalar replacement
 
@@ -1715,9 +1812,14 @@ building more shared analysis infrastructure.
 
 ### After Tranche 4
 
-Reprofile compiler self-compilation. If borrowed normalization is no longer a
-material part of Perceus, skip directly to whichever scalar-summary family is
-measured hot rather than mechanically implementing every planned abstraction.
+Completed. Borrowed normalization stopped being the dominant repeated work;
+[Issue 59](59-skip-identity-consumed-parameter-balancing.md) removed the
+catastrophic exact consuming-call shape, and bounded change-aware insertion
+checkpoints then removed deterministic reconstruction allocations. Issue 60
+completed the final fixed-arity slice. Its post-change profile did not identify
+a material named scalar-summary family and did not isolate match reconstruction
+from sensitive-call normalization, so neither Tranche 5 nor match identity work
+is admitted. Stop unless a later profile supplies that missing evidence.
 
 ### After Tranche 6
 
@@ -1728,9 +1830,11 @@ provenance and cancellation facts.
 
 ### After Tranche 7B
 
-Measure the eligible noncancelling fraction and actual cleanup-statement
-reduction. Do not implement region-sensitive cleanup if whole-function effects
-cover too little code and the profile does not show a runtime or C-size return.
+Completed for the whole-function rule: 7.65% of self-host functions were
+eligible and local cleanup calls fell 5.25%. Region-sensitive cleanup remains
+conditional on a profile showing meaningful residual cleanup cost in functions
+whose owner lifetimes do not span their cancellation points. Compact-ABI work
+may use the whole-function plan directly if that condition is not met.
 
 ### After each Tranche 8 or 9 rule
 
@@ -1738,9 +1842,14 @@ Require a representative occurrence count and measured effect. Prefer deleting
 an unproductive rule to accumulating a general optimizer whose useful cases do
 not occur in real programs.
 
-## Completion Criteria
+## Full Architecture Completion Criteria, If Admitted
 
-This roadmap is complete when:
+The workstream may close earlier at a stop/go gate when current production
+profiles show no remaining consumer that can repay the added analysis or
+runtime complexity. In that case, record the rejected tranche and its evidence
+rather than treating an intentionally avoided architecture as unfinished work.
+
+If all remaining tranches are admitted, this roadmap is complete when:
 
 - every function body is collected once for ownership facts;
 - recursive contract and cancellation solving revisits compact graph facts,

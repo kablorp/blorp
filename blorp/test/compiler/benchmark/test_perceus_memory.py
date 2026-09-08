@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import contextlib
 import importlib.machinery
 import importlib.util
@@ -271,6 +272,116 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "managed-let decisions are incomplete"):
             self.benchmark.validate_change_aware_managed_let_counters(counters)
 
+    def test_call_insert_counters_partition_call_visits(self) -> None:
+        counters = {
+            "insert_call_visits": 11,
+            "insert_call_original_nodes_reused": 8,
+            "insert_call_reconstructions": 3,
+        }
+
+        self.benchmark.validate_change_aware_call_counters(counters)
+
+        counters["insert_call_reconstructions"] = 2
+        with self.assertRaisesRegex(RuntimeError, "call decisions are incomplete"):
+            self.benchmark.validate_change_aware_call_counters(counters)
+
+    def test_managed_let_transfer_requires_every_call_to_reuse(self) -> None:
+        counters = {
+            "insert_call_visits": 3,
+            "insert_call_original_nodes_reused": 3,
+            "insert_call_reconstructions": 0,
+        }
+
+        self.benchmark.validate_managed_let_transfer_call_counters(counters, 2)
+
+        counters["insert_call_original_nodes_reused"] = 2
+        counters["insert_call_reconstructions"] = 1
+        with self.assertRaisesRegex(RuntimeError, "transfer call reuse changed"):
+            self.benchmark.validate_managed_let_transfer_call_counters(counters, 2)
+
+    def test_borrowed_call_protection_requires_a_conservative_call(self) -> None:
+        counters = {"insert_call_reconstructions": 1}
+        self.benchmark.validate_borrowed_call_protection_stays_conservative(counters)
+
+        counters["insert_call_reconstructions"] = 0
+        with self.assertRaisesRegex(RuntimeError, "unexpectedly reused every call"):
+            self.benchmark.validate_borrowed_call_protection_stays_conservative(counters)
+
+    def test_aggregate_insert_counters_partition_aggregate_visits(self) -> None:
+        counters = {
+            "insert_aggregate_visits": 13,
+            "insert_aggregate_original_nodes_reused": 9,
+            "insert_aggregate_reconstructions": 4,
+        }
+
+        self.benchmark.validate_change_aware_aggregate_counters(counters)
+
+        counters["insert_aggregate_reconstructions"] = 3
+        with self.assertRaisesRegex(RuntimeError, "aggregate decisions are incomplete"):
+            self.benchmark.validate_change_aware_aggregate_counters(counters)
+
+    def test_fixed_ownership_insert_counters_partition_fixed_root_visits(self) -> None:
+        counters = {
+            "insert_fixed_ownership_visits": 12,
+            "insert_fixed_ownership_original_nodes_reused": 7,
+            "insert_fixed_ownership_reconstructions": 5,
+            "insert_fixed_ownership_normalization_rewrites": 3,
+        }
+
+        self.benchmark.validate_change_aware_fixed_ownership_counters(counters)
+
+        counters["insert_fixed_ownership_reconstructions"] = 4
+        with self.assertRaisesRegex(RuntimeError, "fixed-ownership decisions are incomplete"):
+            self.benchmark.validate_change_aware_fixed_ownership_counters(counters)
+
+        counters["insert_fixed_ownership_reconstructions"] = 5
+        counters["insert_fixed_ownership_normalization_rewrites"] = 6
+        with self.assertRaisesRegex(RuntimeError, "normalization rewrites exceed"):
+            self.benchmark.validate_change_aware_fixed_ownership_counters(counters)
+
+    def test_fixed_ownership_change_matrix_requires_exact_decisions(self) -> None:
+        counters = {
+            "insert_fixed_ownership_visits": 32,
+            "insert_fixed_ownership_original_nodes_reused": 16,
+            "insert_fixed_ownership_reconstructions": 16,
+            "insert_fixed_ownership_normalization_rewrites": 8,
+        }
+
+        self.benchmark.validate_fixed_ownership_change_matrix_counters(counters, 2)
+
+        counters["insert_fixed_ownership_original_nodes_reused"] = 15
+        with self.assertRaisesRegex(RuntimeError, "matrix decisions changed"):
+            self.benchmark.validate_fixed_ownership_change_matrix_counters(counters, 2)
+
+    def test_aggregate_escape_requires_reuse_and_reconstruction(self) -> None:
+        counters = {
+            "insert_aggregate_original_nodes_reused": 1,
+            "insert_aggregate_reconstructions": 1,
+        }
+        self.benchmark.validate_aggregate_escape_covers_both_decisions(counters)
+
+        counters["insert_aggregate_original_nodes_reused"] = 0
+        with self.assertRaisesRegex(RuntimeError, "did not reuse a neutral aggregate"):
+            self.benchmark.validate_aggregate_escape_covers_both_decisions(counters)
+
+        counters["insert_aggregate_original_nodes_reused"] = 1
+        counters["insert_aggregate_reconstructions"] = 0
+        with self.assertRaisesRegex(RuntimeError, "lost ownership-sensitive reconstruction"):
+            self.benchmark.validate_aggregate_escape_covers_both_decisions(counters)
+
+    def test_aggregate_change_matrix_requires_exact_decisions(self) -> None:
+        counters = {
+            "insert_aggregate_visits": 50,
+            "insert_aggregate_original_nodes_reused": 26,
+            "insert_aggregate_reconstructions": 24,
+        }
+
+        self.benchmark.validate_aggregate_change_matrix_counters(counters, 2)
+
+        counters["insert_aggregate_original_nodes_reused"] = 25
+        with self.assertRaisesRegex(RuntimeError, "matrix decisions changed"):
+            self.benchmark.validate_aggregate_change_matrix_counters(counters, 2)
+
     def test_managed_let_transfer_counters_require_every_worker_to_reuse(self) -> None:
         counters = {
             "insert_managed_let_visits": 3,
@@ -346,6 +457,83 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
             perceus_source,
         )
 
+    def test_call_source_reuse_has_an_explicit_normalization_proof(self) -> None:
+        perceus_source = (
+            ROOT / "blorp" / "src" / "compiler" / "stage_09_core" / "perceus.brp"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("call_ownership_normalization_reuses_source", perceus_source)
+        self.assertIn("insert_drops_change_aware_call", perceus_source)
+        self.assertNotIn("PerceusNormalizedExpr", perceus_source)
+        self.assertIn("perceus_work_insert_call_visits", perceus_source)
+        self.assertIn(
+            "perceus_work_insert_call_original_nodes_reused",
+            perceus_source,
+        )
+        self.assertIn(
+            "perceus_work_insert_call_reconstructions",
+            perceus_source,
+        )
+
+    def test_aggregate_source_reuse_has_typed_change_results(self) -> None:
+        perceus_source = (
+            ROOT / "blorp" / "src" / "compiler" / "stage_09_core" / "perceus.brp"
+        ).read_text(encoding="utf-8")
+
+        for result_type in (
+            "PerceusAggregateExprsRewrite",
+            "PerceusAggregateRecordFieldsRewrite",
+            "PerceusAggregateCowFieldsRewrite",
+            "PerceusAggregateBoxedValuesRewrite",
+            "PerceusAggregateDictEntriesRewrite",
+        ):
+            self.assertIn(f"private union {result_type}:", perceus_source)
+
+        self.assertIn("insert_drops_change_aware_aggregate", perceus_source)
+        self.assertIn("perceus_work_insert_aggregate_visits", perceus_source)
+        self.assertIn(
+            "perceus_work_insert_aggregate_original_nodes_reused",
+            perceus_source,
+        )
+        self.assertIn(
+            "perceus_work_insert_aggregate_reconstructions",
+            perceus_source,
+        )
+
+    def test_fixed_ownership_source_reuse_has_typed_change_results(self) -> None:
+        perceus_source = (
+            ROOT / "blorp" / "src" / "compiler" / "stage_09_core" / "perceus.brp"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("private union PerceusOwnershipNormalization", perceus_source)
+        self.assertIn("UnchangedPerceusOwnershipNormalization", perceus_source)
+        self.assertIn(
+            "ChangedPerceusOwnershipNormalization(CoreExpr)",
+            perceus_source,
+        )
+        self.assertIn("normalize_unbox_ownership_change_aware", perceus_source)
+        self.assertIn("normalize_binary_ownership_change_aware", perceus_source)
+        self.assertIn("normalize_projection_ownership_change_aware", perceus_source)
+        self.assertIn("insert_drops_change_aware_fixed_ownership", perceus_source)
+        self.assertIn("perceus_work_insert_fixed_ownership_visits", perceus_source)
+        self.assertIn(
+            "perceus_work_insert_fixed_ownership_original_nodes_reused",
+            perceus_source,
+        )
+        self.assertIn(
+            "perceus_work_insert_fixed_ownership_reconstructions",
+            perceus_source,
+        )
+        self.assertIn(
+            "perceus_work_insert_fixed_ownership_normalization_rewrites",
+            perceus_source,
+        )
+        self.assertNotIn(
+            "bind_borrowed_owned_temporary_args_through_unbox",
+            perceus_source,
+        )
+        self.assertNotIn("protect_consuming_field_aliases", perceus_source)
+
     def test_core_ownership_census_counts_policies(self) -> None:
         response = self.perceus_response()
         body = response["artifact"]["core"]["decls"][4]["body"]
@@ -396,13 +584,32 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
                 "borrowed_boundary_fusion",
             )
             managed_let_transfer = body_shape == "managed_let_transfer"
+            aggregate_change_matrix = body_shape == "aggregate_change_matrix"
+            fixed_ownership_shape = body_shape in (
+                "fixed_ownership_change_matrix",
+                "fixed_ownership_neutral",
+            )
             _, program = self.benchmark.fixture_request(
                 1 if managed_let_transfer else (8 if fixed_large_shape else 4),
                 3,
                 1 if managed_let_transfer else (1536 if fixed_large_shape else 256),
-                0 if managed_let_transfer else (8 if fixed_large_shape else 2),
+                (
+                    0
+                    if (
+                        managed_let_transfer
+                        or aggregate_change_matrix
+                        or fixed_ownership_shape
+                    )
+                    else (8 if fixed_large_shape else 2)
+                ),
                 params_per_function=(
-                    0 if managed_let_transfer else (32 if fixed_large_shape else 2)
+                    0
+                    if managed_let_transfer
+                    else (
+                        2
+                        if aggregate_change_matrix or fixed_ownership_shape
+                        else (32 if fixed_large_shape else 2)
+                    )
                 ),
                 body_shape=body_shape,
                 branch_arms=8 if body_shape == "borrowed_boundary_fusion" else 2,
@@ -419,6 +626,134 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
 
     def test_aggregate_escape_is_a_supported_body_shape(self) -> None:
         self.assertIn("aggregate_escape", self.benchmark.BODY_SHAPES)
+
+    def test_aggregate_change_matrix_covers_every_reconstruction_family(self) -> None:
+        _, program = self.benchmark.fixture_request(
+            1,
+            2,
+            128,
+            0,
+            params_per_function=2,
+            body_shape="aggregate_change_matrix",
+            invoke_workers=False,
+        )
+        worker = next(
+            declaration
+            for declaration in program["decls"]
+            if declaration.get("name") == "bench_worker_0000"
+        )
+        roots = {
+            kind: 0 for kind in self.benchmark.AGGREGATE_CHANGE_MATRIX_ROOTS
+        }
+        pending = [worker["body"]]
+        while pending:
+            current = pending.pop()
+            if isinstance(current, dict):
+                kind = current.get("kind")
+                if (
+                    isinstance(kind, str)
+                    and kind in roots
+                    and "type" in current
+                    and "loc" in current
+                ):
+                    roots[kind] += 1
+                pending.extend(current.values())
+            elif isinstance(current, list):
+                pending.extend(current)
+
+        self.assertEqual(
+            roots,
+            {
+                **{
+                    kind: 2
+                    for kind in self.benchmark.AGGREGATE_CHANGE_MATRIX_ROOTS
+                    if kind != "dict_construct"
+                },
+                "dict_construct": 3,
+            },
+        )
+        self.assertEqual(
+            self.benchmark.count_parameter_reads(
+                worker["body"],
+                "BENCH_BORROWED_PARAM_0000_0000",
+            ),
+            16,
+        )
+        self.assertEqual(
+            self.benchmark.count_parameter_reads(
+                worker["body"],
+                "BENCH_BORROWED_PARAM_0000_0001",
+            ),
+            2,
+        )
+
+    def test_fixed_ownership_change_matrix_has_three_cases_per_root(self) -> None:
+        expressions = self.benchmark.fixed_ownership_change_matrix_exprs(0)
+
+        self.assertEqual(len(expressions), 12)
+        self.assertEqual(
+            collections.Counter(expression["kind"] for expression in expressions),
+            collections.Counter({
+                kind: self.benchmark.FIXED_OWNERSHIP_CHANGE_CASES_PER_ROOT
+                for kind in self.benchmark.FIXED_OWNERSHIP_ROOT_KINDS
+            }),
+        )
+
+        _, program = self.benchmark.fixture_request(
+            1,
+            2,
+            128,
+            0,
+            params_per_function=2,
+            body_shape="fixed_ownership_change_matrix",
+            invoke_workers=False,
+        )
+        worker = next(
+            declaration
+            for declaration in program["decls"]
+            if declaration.get("name") == "bench_worker_0000"
+        )
+        self.assertEqual(self.benchmark.expression_node_count(worker["body"]), 128)
+        self.assertEqual(
+            self.benchmark.count_parameter_reads(
+                worker["body"],
+                "BENCH_BORROWED_PARAM_0000_0000",
+            ),
+            2,
+        )
+        self.assertEqual(
+            self.benchmark.count_parameter_reads(
+                worker["body"],
+                "BENCH_BORROWED_PARAM_0000_0001",
+            ),
+            1,
+        )
+
+    def test_fixed_ownership_neutral_fixture_fills_an_exact_node_budget(self) -> None:
+        _, program = self.benchmark.fixture_request(
+            1,
+            2,
+            1024,
+            0,
+            params_per_function=2,
+            body_shape="fixed_ownership_neutral",
+            invoke_workers=False,
+        )
+        worker = next(
+            declaration
+            for declaration in program["decls"]
+            if declaration.get("name") == "bench_worker_0000"
+        )
+        self.assertEqual(self.benchmark.expression_node_count(worker["body"]), 1024)
+        reads = [
+            self.benchmark.count_parameter_reads(
+                worker["body"],
+                f"BENCH_BORROWED_PARAM_0000_{parameter_index:04d}",
+            )
+            for parameter_index in range(2)
+        ]
+        self.assertEqual(reads[0], reads[1])
+        self.assertGreater(reads[0], 0)
 
     def test_borrowed_return_is_a_supported_body_shape(self) -> None:
         self.assertIn("borrowed_return", self.benchmark.BODY_SHAPES)

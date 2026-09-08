@@ -495,6 +495,46 @@ private @debug_only pure func perceus_work_insert_managed_let_reconstructions() 
 	black_box_int(0)
 
 
+private @debug_only pure func perceus_work_insert_call_visits() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func perceus_work_insert_call_original_nodes_reused() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func perceus_work_insert_call_reconstructions() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func perceus_work_insert_aggregate_visits() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func perceus_work_insert_aggregate_original_nodes_reused() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func perceus_work_insert_aggregate_reconstructions() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func perceus_work_insert_fixed_ownership_visits() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func perceus_work_insert_fixed_ownership_original_nodes_reused() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func perceus_work_insert_fixed_ownership_reconstructions() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func perceus_work_insert_fixed_ownership_normalization_rewrites() -> Int:
+	black_box_int(0)
+
+
 private @debug_only pure func perceus_work_declarations_rewritten() -> Int:
 	black_box_int(0)
 
@@ -583,6 +623,16 @@ pure func register_perceus_work_counters() -> Int:
 		perceus_work_insert_managed_let_visits()
 		perceus_work_insert_managed_let_original_nodes_reused()
 		perceus_work_insert_managed_let_reconstructions()
+		perceus_work_insert_call_visits()
+		perceus_work_insert_call_original_nodes_reused()
+		perceus_work_insert_call_reconstructions()
+		perceus_work_insert_aggregate_visits()
+		perceus_work_insert_aggregate_original_nodes_reused()
+		perceus_work_insert_aggregate_reconstructions()
+		perceus_work_insert_fixed_ownership_visits()
+		perceus_work_insert_fixed_ownership_original_nodes_reused()
+		perceus_work_insert_fixed_ownership_reconstructions()
+		perceus_work_insert_fixed_ownership_normalization_rewrites()
 		perceus_work_declarations_rewritten()
 		perceus_work_functions_rewritten()
 		perceus_work_globals_rewritten()
@@ -913,6 +963,45 @@ private record PerceusInsertedExpr {
 	direct_consume: Option[PerceusDirectConsume],
 	reuses_source: Bool
 }
+
+
+-- Fieldless unchanged cases avoid allocating a result wrapper for the common
+-- identity path. A changed case alone carries the replacement collection.
+private union PerceusAggregateExprsRewrite:
+	UnchangedPerceusAggregateExprs
+	ChangedPerceusAggregateExprs(List[CoreExpr])
+
+
+private union PerceusAggregateRecordFieldsRewrite:
+	UnchangedPerceusAggregateRecordFields
+	ChangedPerceusAggregateRecordFields(List[CoreRecordFieldValue])
+
+
+private union PerceusAggregateCowFieldsRewrite:
+	UnchangedPerceusAggregateCowFields
+	ChangedPerceusAggregateCowFields(List[CoreRecordCowField])
+
+
+private union PerceusAggregateBoxedValuesRewrite:
+	UnchangedPerceusAggregateBoxedValues
+	ChangedPerceusAggregateBoxedValues(List[CoreBoxedStorageValue])
+
+
+private union PerceusAggregateDictEntriesRewrite:
+	UnchangedPerceusAggregateDictEntries
+	ChangedPerceusAggregateDictEntries(List[CoreDictEntry])
+
+
+private union PerceusAggregateBoxedValueRewrite:
+	UnchangedPerceusAggregateBoxedValue
+	ChangedPerceusAggregateBoxedValue(CoreBoxedStorageValue)
+
+
+-- The fieldless identity result lets fixed-arity normalization avoid allocating
+-- a replacement root or a result payload on its common unchanged path.
+private union PerceusOwnershipNormalization:
+	UnchangedPerceusOwnershipNormalization
+	ChangedPerceusOwnershipNormalization(CoreExpr)
 
 
 private union PerceusInsertBindingFrame:
@@ -13870,7 +13959,10 @@ private pure func binary_operands_are_borrowed(
 	not is_consuming_collection_equality(op, left, right)
 
 
-private pure func protect_consuming_field_aliases(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
+private pure func protect_consuming_call_field_aliases(
+	env: PerceusEnv,
+	expr: CoreExpr,
+) -> CoreExpr:
 	match expr:
 		CallExpr(kind, callee, args, typ, loc):
 			match contract_for_call(env, kind, args.length(), typ):
@@ -13915,38 +14007,6 @@ private pure func protect_consuming_field_aliases(env: PerceusEnv, expr: CoreExp
 					)
 				None:
 					expr
-		BinaryExpr(op, left, right, typ, loc):
-			if is_consuming_collection_equality(op, left, right):
-				var bindings: List[SyntheticOwnershipBinding] = []
-				var rewritten_args: List[CoreExpr] = []
-				var index: Int = 0
-
-				for arg in [left, right]:
-					arg_type: CoreType = core_expr_type(arg)
-
-					if is_managed_type(env, arg_type) and direct_field_alias(arg):
-						temp: CoreVar = synthetic_binding_var("equality_arg", index, loc)
-						bindings = bindings.append({
-							variable = temp,
-							typ = arg_type,
-							rhs = arg,
-						})
-						rewritten_args = rewritten_args.append(VarExpr(temp, arg_type, loc))
-					else:
-						rewritten_args = rewritten_args.append(arg)
-
-					index += 1
-
-				match rewritten_args:
-					[rewritten_left, rewritten_right]:
-						wrap_synthetic_bindings(
-							bindings,
-							BinaryExpr(op, rewritten_left, rewritten_right, typ, loc),
-						)
-					_:
-						expr
-			else:
-				expr
 		_:
 			expr
 
@@ -14651,6 +14711,96 @@ private pure func bind_borrowed_owned_temporary_binary_operands(
 			expr
 
 
+private pure func binary_operand_has_trivial_unmanaged_materialization(
+	env: PerceusEnv,
+	expr: CoreExpr,
+) -> Bool:
+	if is_managed_type(env, core_expr_type(expr)):
+		False
+	else:
+		match expr:
+			LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _) | VarExpr(_, _, _) | VoidExpr(_, _):
+				True
+			CallExpr(kind, _, args, return_type, _):
+				match contract_for_call(env, kind, args.length(), return_type):
+					Some(contract):
+						match contract.result:
+							ReturnPrimitive | ReturnVoid:
+								True
+							_:
+								False
+					None:
+						False
+			_:
+				False
+
+
+private pure func normalize_binary_ownership_change_aware(
+	env: PerceusEnv,
+	source: CoreExpr,
+) -> PerceusOwnershipNormalization:
+	match source:
+		BinaryExpr(op, left, right, typ, loc):
+			if is_consuming_collection_equality(op, left, right):
+				left_type: CoreType = core_expr_type(left)
+				right_type: CoreType = core_expr_type(right)
+				left_needs_protection: Bool = (
+					is_managed_type(env, left_type)
+					and direct_field_alias(left)
+				)
+				right_needs_protection: Bool = (
+					is_managed_type(env, right_type)
+					and direct_field_alias(right)
+				)
+
+				if not left_needs_protection and not right_needs_protection:
+					UnchangedPerceusOwnershipNormalization
+				else:
+					var bindings: List[SyntheticOwnershipBinding] = []
+					var protected_left: CoreExpr = left
+					var protected_right: CoreExpr = right
+
+					if left_needs_protection:
+						left_temp: CoreVar = synthetic_binding_var("equality_arg", 0, loc)
+						bindings = bindings.append({
+							variable = left_temp,
+							typ = left_type,
+							rhs = left,
+						})
+						protected_left = VarExpr(left_temp, left_type, loc)
+					else:
+						void
+
+					if right_needs_protection:
+						right_temp: CoreVar = synthetic_binding_var("equality_arg", 1, loc)
+						bindings = bindings.append({
+							variable = right_temp,
+							typ = right_type,
+							rhs = right,
+						})
+						protected_right = VarExpr(right_temp, right_type, loc)
+					else:
+						void
+
+					ChangedPerceusOwnershipNormalization(
+						wrap_synthetic_bindings(
+							bindings,
+							BinaryExpr(op, protected_left, protected_right, typ, loc),
+						),
+					)
+			else if (
+				binary_operand_has_trivial_unmanaged_materialization(env, left)
+				and binary_operand_has_trivial_unmanaged_materialization(env, right)
+			):
+				UnchangedPerceusOwnershipNormalization
+			else:
+				ChangedPerceusOwnershipNormalization(
+					bind_borrowed_owned_temporary_binary_operands(env, source),
+				)
+		_:
+			ChangedPerceusOwnershipNormalization(source)
+
+
 private pure func prepare_borrowed_owned_temporary_call(
 	env: PerceusEnv,
 	kind: CoreCallKind,
@@ -14755,11 +14905,11 @@ private pure func result_mode_may_alias_argument(mode: OwnershipResultMode) -> B
 			False
 
 
-private pure func bind_borrowed_owned_temporary_args_through_unbox(
+private pure func normalize_unbox_ownership_change_aware(
 	env: PerceusEnv,
-	expr: CoreExpr,
-) -> CoreExpr:
-	match expr:
+	source: CoreExpr,
+) -> PerceusOwnershipNormalization:
+	match source:
 		UnboxExpr(unbox_kind, CastExpr(CallExpr(kind, callee, args, call_type, call_loc), cast_type, cast_loc), typ, loc):
 			match contract_for_call(env, kind, args.length(), call_type):
 				Some(contract):
@@ -14783,11 +14933,13 @@ private pure func bind_borrowed_owned_temporary_args_through_unbox(
 							typ,
 							loc,
 						)
-						wrap_borrowed_owned_temporary_bindings(prepared.bindings, unboxed)
+						ChangedPerceusOwnershipNormalization(
+							wrap_borrowed_owned_temporary_bindings(prepared.bindings, unboxed),
+						)
 					else:
-						expr
+						UnchangedPerceusOwnershipNormalization
 				None:
-					expr
+					UnchangedPerceusOwnershipNormalization
 		UnboxExpr(unbox_kind, CallExpr(kind, callee, args, call_type, call_loc), typ, loc):
 			match contract_for_call(env, kind, args.length(), call_type):
 				Some(contract):
@@ -14806,13 +14958,17 @@ private pure func bind_borrowed_owned_temporary_args_through_unbox(
 							True,
 						)
 						unboxed: CoreExpr = UnboxExpr(unbox_kind, prepared.call, typ, loc)
-						wrap_borrowed_owned_temporary_bindings(prepared.bindings, unboxed)
+						ChangedPerceusOwnershipNormalization(
+							wrap_borrowed_owned_temporary_bindings(prepared.bindings, unboxed),
+						)
 					else:
-						expr
+						UnchangedPerceusOwnershipNormalization
 				None:
-					expr
+					UnchangedPerceusOwnershipNormalization
+		UnboxExpr(_, _, _, _):
+			UnchangedPerceusOwnershipNormalization
 		_:
-			expr
+			ChangedPerceusOwnershipNormalization(source)
 
 
 private pure func retain_alias_as_owned(expr: CoreExpr) -> CoreExpr:
@@ -15419,12 +15575,7 @@ private pure func normalize_binding_alias_rhs_reuses_source(
 			TupleFieldExpr(owner, field_index, typ, loc):
 				False
 			_:
-				-- The scoped normalizer returns an already-owned temporary
-				-- immediately. Immortal values also bypass alias retention.
-				(
-					is_immortal_value_expr(env, rhs)
-					or rhs_is_owned_temporary
-				)
+				is_immortal_value_expr(env, rhs) or rhs_is_owned_temporary
 
 
 private pure func body_starts_with_dup(name: String, body: CoreExpr) -> Bool:
@@ -15470,78 +15621,110 @@ private pure func balance_concurrent_binding_body(
 		balance_let_body_legacy(env, variable, typ, body)
 
 
-private pure func retain_direct_field_alias_value(env: PerceusEnv, value: CoreExpr) -> CoreExpr:
+private pure func aggregate_value_requires_direct_field_retain(
+	env: PerceusEnv,
+	value: CoreExpr,
+) -> Bool:
 	match value:
-		FieldExpr(owner, field, typ, loc):
-			if is_managed_type(env, typ) and direct_field_alias(value):
-				temp: CoreVar = synthetic_binding_var("aggregate_field", 0, loc)
-				BorrowLetExpr(
+		FieldExpr(_, _, typ, _) | TupleFieldExpr(_, _, typ, _):
+			is_managed_type(env, typ) and direct_field_alias(value)
+		_:
+			False
+
+
+-- The caller proves the direct-alias condition once before entering here.
+private pure func retain_proven_direct_field_alias_value(value: CoreExpr) -> CoreExpr:
+	match value:
+		FieldExpr(_, _, typ, loc) | TupleFieldExpr(_, _, typ, loc):
+			temp: CoreVar = synthetic_binding_var("aggregate_field", 0, loc)
+			BorrowLetExpr(
+				temp,
+				typ,
+				value,
+				DupExpr(
 					temp,
 					typ,
-					value,
-					DupExpr(
-						temp,
-						typ,
-						retain_policy_for_type(typ),
-						VarExpr(temp, typ, loc),
-						typ,
-						loc,
-					),
-				)
-			else:
-				value
-		TupleFieldExpr(owner, field_index, typ, loc):
-			if is_managed_type(env, typ) and direct_field_alias(value):
-				temp: CoreVar = synthetic_binding_var("aggregate_field", 0, loc)
-				BorrowLetExpr(
-					temp,
+					retain_policy_for_type(typ),
+					VarExpr(temp, typ, loc),
 					typ,
-					value,
-					DupExpr(
-						temp,
-						typ,
-						retain_policy_for_type(typ),
-						VarExpr(temp, typ, loc),
-						typ,
-						loc,
-					),
-				)
-			else:
-				value
+					loc,
+				),
+			)
 		_:
 			value
 
 
-private pure func retain_direct_field_alias_exprs(
+private pure func insert_aggregate_child(
+	env: PerceusEnv,
+	value: CoreExpr,
+	retains_direct_field_aliases: Bool,
+) -> PerceusInsertedExpr:
+	requires_retain: Bool = (
+		retains_direct_field_aliases
+		and aggregate_value_requires_direct_field_retain(env, value)
+	)
+
+	owned_value: CoreExpr = if requires_retain:
+		retain_proven_direct_field_alias_value(value)
+	else:
+		value
+
+	rewritten: PerceusInsertedExpr = insert_drops_expr_inner_result(env, owned_value)
+
+	if requires_retain:
+		{ rewritten | reuses_source = False }
+	else:
+		rewritten
+
+
+private pure func rewrite_aggregate_exprs(
 	env: PerceusEnv,
 	values: List[CoreExpr],
-) -> List[CoreExpr]:
-	var retained: List[CoreExpr] = []
+) -> PerceusAggregateExprsRewrite:
+	var rewritten: List[CoreExpr] = values
+	var changed: Bool = False
+	var index: Int = 0
 
 	for value in values:
-		owned_value: CoreExpr = retain_direct_field_alias_value(env, value)
-		rewritten_value: CoreExpr = insert_drops_expr_inner(env, owned_value)
-		retained = retained.append(rewritten_value)
+		result: PerceusInsertedExpr = insert_aggregate_child(env, value, True)
 
-	retained
+		if not result.reuses_source:
+			rewritten = rewritten.set(index, result.expr)
+			changed = True
+		else:
+			void
+
+		index += 1
+
+	if changed:
+		ChangedPerceusAggregateExprs(rewritten)
+	else:
+		UnchangedPerceusAggregateExprs
 
 
-private pure func retain_direct_field_alias_record_fields(
+private pure func rewrite_aggregate_record_fields(
 	env: PerceusEnv,
 	fields: List[CoreRecordFieldValue],
-) -> List[CoreRecordFieldValue]:
-	var retained: List[CoreRecordFieldValue] = []
+) -> PerceusAggregateRecordFieldsRewrite:
+	var rewritten: List[CoreRecordFieldValue] = fields
+	var changed: Bool = False
+	var index: Int = 0
 
 	for field in fields:
-		field_name: String = field.name
-		owned_value: CoreExpr = retain_direct_field_alias_value(env, field.value)
-		rewritten_value: CoreExpr = insert_drops_expr_inner(env, owned_value)
-		retained = retained.append({
-			name = field_name,
-			value = rewritten_value,
-		})
+		result: PerceusInsertedExpr = insert_aggregate_child(env, field.value, True)
 
-	retained
+		if not result.reuses_source:
+			rewritten = rewritten.set(index, { field | value = result.expr })
+			changed = True
+		else:
+			void
+
+		index += 1
+
+	if changed:
+		ChangedPerceusAggregateRecordFields(rewritten)
+	else:
+		UnchangedPerceusAggregateRecordFields
 
 
 private pure func aggregate_value_can_transfer_without_retain(
@@ -15559,159 +15742,295 @@ private pure func aggregate_value_can_transfer_without_retain(
 			is_owned_temporary_expr(env, expr)
 
 
-private pure func retain_direct_field_alias_boxed_value(
+private pure func rewrite_aggregate_boxed_value(
 	env: PerceusEnv,
 	value: CoreBoxedStorageValue,
-) -> CoreBoxedStorageValue:
-	kind = value.kind
+) -> PerceusAggregateBoxedValueRewrite:
 	needs_release: Bool = value.needs_release
 	transfers_ownership: Bool = (
 		value.transfers_ownership
 		or needs_release and aggregate_value_can_transfer_without_retain(env, value.value)
 	)
 
-	owned_value: CoreExpr = if transfers_ownership:
-		retain_direct_field_alias_value(env, value.value)
+	rewritten_value: PerceusInsertedExpr = insert_aggregate_child(
+		env,
+		value.value,
+		transfers_ownership,
+	)
+
+	if rewritten_value.reuses_source and transfers_ownership == value.transfers_ownership:
+		UnchangedPerceusAggregateBoxedValue
 	else:
-		value.value
-
-	rewritten_value: CoreExpr = insert_drops_expr_inner(env, owned_value)
-	{
-		kind = kind,
-		value = rewritten_value,
-		needs_release = needs_release,
-		transfers_ownership = transfers_ownership
-	}
+		ChangedPerceusAggregateBoxedValue({ value |
+				value = rewritten_value.expr,
+				transfers_ownership = transfers_ownership
+			})
 
 
-private pure func retain_direct_field_alias_boxed_values(
+private pure func rewrite_aggregate_boxed_values(
 	env: PerceusEnv,
 	values: List[CoreBoxedStorageValue],
-) -> List[CoreBoxedStorageValue]:
-	var retained: List[CoreBoxedStorageValue] = []
+) -> PerceusAggregateBoxedValuesRewrite:
+	var rewritten: List[CoreBoxedStorageValue] = values
+	var changed: Bool = False
+	var index: Int = 0
 
 	for value in values:
-		retained = retained.append(retain_direct_field_alias_boxed_value(env, value))
+		match rewrite_aggregate_boxed_value(env, value):
+			ChangedPerceusAggregateBoxedValue(rewritten_value):
+				rewritten = rewritten.set(index, rewritten_value)
+				changed = True
+			UnchangedPerceusAggregateBoxedValue:
+				void
 
-	retained
+		index += 1
+
+	if changed:
+		ChangedPerceusAggregateBoxedValues(rewritten)
+	else:
+		UnchangedPerceusAggregateBoxedValues
 
 
-private pure func retain_direct_field_alias_dict_entries(
+private pure func rewrite_aggregate_dict_entries(
 	env: PerceusEnv,
 	entries: List[CoreDictEntry],
-) -> List[CoreDictEntry]:
-	var retained: List[CoreDictEntry] = []
+) -> PerceusAggregateDictEntriesRewrite:
+	var rewritten: List[CoreDictEntry] = entries
+	var changed: Bool = False
+	var index: Int = 0
 
 	for entry in entries:
-		key = entry.key
-		value = entry.value
-		retained = retained.append({
-			key = retain_direct_field_alias_boxed_value(env, key),
-			value = retain_direct_field_alias_boxed_value(env, value),
-		})
+		var rewritten_key: CoreBoxedStorageValue = entry.key
+		var rewritten_value: CoreBoxedStorageValue = entry.value
+		var entry_changed: Bool = False
 
-	retained
+		match rewrite_aggregate_boxed_value(env, entry.key):
+			ChangedPerceusAggregateBoxedValue(key):
+				rewritten_key = key
+				entry_changed = True
+			UnchangedPerceusAggregateBoxedValue:
+				void
+
+		match rewrite_aggregate_boxed_value(env, entry.value):
+			ChangedPerceusAggregateBoxedValue(value):
+				rewritten_value = value
+				entry_changed = True
+			UnchangedPerceusAggregateBoxedValue:
+				void
+
+		if entry_changed:
+			rewritten = rewritten.set(
+				index,
+				{
+					key = rewritten_key,
+					value = rewritten_value
+				},
+			)
+			changed = True
+		else:
+			void
+
+		index += 1
+
+	if changed:
+		ChangedPerceusAggregateDictEntries(rewritten)
+	else:
+		UnchangedPerceusAggregateDictEntries
 
 
-private pure func rewrite_aggregate_with_owned_field_aliases(
+private pure func rewrite_aggregate_cow_fields(
 	env: PerceusEnv,
-	expr: CoreExpr,
-) -> CoreExpr:
-	match expr:
+	fields: List[CoreRecordCowField],
+) -> PerceusAggregateCowFieldsRewrite:
+	var rewritten: List[CoreRecordCowField] = fields
+	var changed: Bool = False
+	var index: Int = 0
+
+	for field in fields:
+		match field.replacement:
+			Some(replacement):
+				result: PerceusInsertedExpr = insert_aggregate_child(env, replacement, True)
+
+				if not result.reuses_source:
+					rewritten = rewritten.set(index, { field | replacement = Some(result.expr) })
+					changed = True
+				else:
+					void
+			None:
+				void
+
+		index += 1
+
+	if changed:
+		ChangedPerceusAggregateCowFields(rewritten)
+	else:
+		UnchangedPerceusAggregateCowFields
+
+
+private pure func insert_drops_change_aware_aggregate(
+	env: PerceusEnv,
+	source: CoreExpr,
+) -> PerceusInsertedExpr:
+	debug:
+		perceus_work_insert_aggregate_visits()
+
+	result: PerceusInsertedExpr = match source:
 		TupleExpr(items, typ, loc):
-			owned_type: CoreType = typ
-			rewritten_items: List[CoreExpr] = retain_direct_field_alias_exprs(env, items)
-			TupleExpr(rewritten_items, owned_type, loc)
-		VectorExpr(items, typ, loc):
-			owned_type: CoreType = typ
-			rewritten_items: List[CoreExpr] = retain_direct_field_alias_exprs(env, items)
-			VectorExpr(rewritten_items, owned_type, loc)
-		RecordExpr(fields, typ, loc):
-			owned_type: CoreType = typ
-			rewritten_fields: List[CoreRecordFieldValue] = retain_direct_field_alias_record_fields(
-				env,
-				fields,
-			)
-			RecordExpr(rewritten_fields, owned_type, loc)
-		RecordUpdateExpr(base, fields, typ, loc):
-			owned_type: CoreType = typ
-			rewritten_base: CoreExpr = insert_drops_expr_inner(env, base)
-			rewritten_fields: List[CoreRecordFieldValue] = retain_direct_field_alias_record_fields(
-				env,
-				fields,
-			)
-			RecordUpdateExpr(rewritten_base, rewritten_fields, owned_type, loc)
-		RecordReuseExpr(source, fields, typ, loc):
-			owned_type: CoreType = typ
-			rewritten_source: CoreExpr = insert_drops_expr_inner(env, source)
-			rewritten_fields: List[CoreRecordFieldValue] = retain_direct_field_alias_record_fields(
-				env,
-				fields,
-			)
-			RecordReuseExpr(rewritten_source, rewritten_fields, owned_type, loc)
-		RecordCowUpdateExpr(source, fields, typ, loc):
-			RecordCowUpdateExpr(
-				insert_drops_expr_inner(env, source),
-				CoreTraverse.map_core_record_cow_fields(
-					fields,
-					pure func(replacement): insert_drops_expr_inner(
+			match rewrite_aggregate_exprs(env, items):
+				UnchangedPerceusAggregateExprs:
+					inserted_non_binding_expr(env, source, True)
+				ChangedPerceusAggregateExprs(rewritten):
+					inserted_non_binding_expr(
 						env,
-						retain_direct_field_alias_value(env, replacement),
-					),
-				),
-				typ,
-				loc,
+						TupleExpr(rewritten, typ, loc),
+						False,
+					)
+		VectorExpr(items, typ, loc):
+			match rewrite_aggregate_exprs(env, items):
+				UnchangedPerceusAggregateExprs:
+					inserted_non_binding_expr(env, source, True)
+				ChangedPerceusAggregateExprs(rewritten):
+					inserted_non_binding_expr(
+						env,
+						VectorExpr(rewritten, typ, loc),
+						False,
+					)
+		RecordExpr(fields, typ, loc):
+			match rewrite_aggregate_record_fields(env, fields):
+				UnchangedPerceusAggregateRecordFields:
+					inserted_non_binding_expr(env, source, True)
+				ChangedPerceusAggregateRecordFields(rewritten):
+					inserted_non_binding_expr(
+						env,
+						RecordExpr(rewritten, typ, loc),
+						False,
+					)
+		RecordUpdateExpr(base, fields, typ, loc):
+			rewritten_base: PerceusInsertedExpr = insert_drops_expr_inner_result(env, base)
+
+			match rewrite_aggregate_record_fields(env, fields):
+				UnchangedPerceusAggregateRecordFields:
+					if rewritten_base.reuses_source:
+						inserted_non_binding_expr(env, source, True)
+					else:
+						inserted_non_binding_expr(
+							env,
+							RecordUpdateExpr(rewritten_base.expr, fields, typ, loc),
+							False,
+						)
+				ChangedPerceusAggregateRecordFields(rewritten):
+					inserted_non_binding_expr(
+						env,
+						RecordUpdateExpr(rewritten_base.expr, rewritten, typ, loc),
+						False,
+					)
+		RecordReuseExpr(record_source, fields, typ, loc):
+			rewritten_source: PerceusInsertedExpr = insert_drops_expr_inner_result(
+				env,
+				record_source,
 			)
+
+			match rewrite_aggregate_record_fields(env, fields):
+				UnchangedPerceusAggregateRecordFields:
+					if rewritten_source.reuses_source:
+						inserted_non_binding_expr(env, source, True)
+					else:
+						inserted_non_binding_expr(
+							env,
+							RecordReuseExpr(rewritten_source.expr, fields, typ, loc),
+							False,
+						)
+				ChangedPerceusAggregateRecordFields(rewritten):
+					inserted_non_binding_expr(
+						env,
+						RecordReuseExpr(rewritten_source.expr, rewritten, typ, loc),
+						False,
+					)
+		RecordCowUpdateExpr(record_source, fields, typ, loc):
+			rewritten_source: PerceusInsertedExpr = insert_drops_expr_inner_result(
+				env,
+				record_source,
+			)
+
+			match rewrite_aggregate_cow_fields(env, fields):
+				UnchangedPerceusAggregateCowFields:
+					if rewritten_source.reuses_source:
+						inserted_non_binding_expr(env, source, True)
+					else:
+						inserted_non_binding_expr(
+							env,
+							RecordCowUpdateExpr(rewritten_source.expr, fields, typ, loc),
+							False,
+						)
+				ChangedPerceusAggregateCowFields(rewritten):
+					inserted_non_binding_expr(
+						env,
+						RecordCowUpdateExpr(rewritten_source.expr, rewritten, typ, loc),
+						False,
+					)
 		RecordConstructExpr(type_name, fields, typ, loc):
-			owned_type_name: String = type_name
-			owned_type: CoreType = typ
-			rewritten_fields: List[CoreRecordFieldValue] = retain_direct_field_alias_record_fields(
-				env,
-				fields,
-			)
-			RecordConstructExpr(owned_type_name, rewritten_fields, owned_type, loc)
+			match rewrite_aggregate_record_fields(env, fields):
+				UnchangedPerceusAggregateRecordFields:
+					inserted_non_binding_expr(env, source, True)
+				ChangedPerceusAggregateRecordFields(rewritten):
+					inserted_non_binding_expr(
+						env,
+						RecordConstructExpr(type_name, rewritten, typ, loc),
+						False,
+					)
 		ListConstructExpr(construct, typ, loc):
-			elements: List[CoreBoxedStorageValue] = construct.elements
-			owned_construct = { construct | elements = [] }
-			owned_type: CoreType = typ
-			rewritten_elements: List[CoreBoxedStorageValue] = retain_direct_field_alias_boxed_values(
-				env,
-				elements,
-			)
-			ListConstructExpr({ owned_construct | elements = rewritten_elements }, owned_type, loc)
+			match rewrite_aggregate_boxed_values(env, construct.elements):
+				UnchangedPerceusAggregateBoxedValues:
+					inserted_non_binding_expr(env, source, True)
+				ChangedPerceusAggregateBoxedValues(rewritten):
+					inserted_non_binding_expr(
+						env,
+						ListConstructExpr({ construct | elements = rewritten }, typ, loc),
+						False,
+					)
 		TensorBoxedLiteralExpr(literal, typ, loc):
-			elements: List[CoreBoxedStorageValue] = literal.elements
-			owned_literal = { literal | elements = [] }
-			owned_type: CoreType = typ
-			rewritten_elements: List[CoreBoxedStorageValue] = retain_direct_field_alias_boxed_values(
-				env,
-				elements,
-			)
-			TensorBoxedLiteralExpr(
-				{ owned_literal | elements = rewritten_elements },
-				owned_type,
-				loc,
-			)
+			match rewrite_aggregate_boxed_values(env, literal.elements):
+				UnchangedPerceusAggregateBoxedValues:
+					inserted_non_binding_expr(env, source, True)
+				ChangedPerceusAggregateBoxedValues(rewritten):
+					inserted_non_binding_expr(
+						env,
+						TensorBoxedLiteralExpr({ literal | elements = rewritten }, typ, loc),
+						False,
+					)
 		DictConstructExpr(construct, typ, loc):
-			entries: List[CoreDictEntry] = construct.entries
-			owned_construct = { construct | entries = [] }
-			owned_type: CoreType = typ
-			rewritten_entries: List[CoreDictEntry] = retain_direct_field_alias_dict_entries(
-				env,
-				entries,
-			)
-			DictConstructExpr({ owned_construct | entries = rewritten_entries }, owned_type, loc)
+			match rewrite_aggregate_dict_entries(env, construct.entries):
+				UnchangedPerceusAggregateDictEntries:
+					inserted_non_binding_expr(env, source, True)
+				ChangedPerceusAggregateDictEntries(rewritten):
+					inserted_non_binding_expr(
+						env,
+						DictConstructExpr({ construct | entries = rewritten }, typ, loc),
+						False,
+					)
 		UnionConstructExpr(construct, typ, loc):
-			args: List[CoreBoxedStorageValue] = construct.args
-			owned_construct = { construct | args = [] }
-			owned_type: CoreType = typ
-			rewritten_args: List[CoreBoxedStorageValue] = retain_direct_field_alias_boxed_values(
-				env,
-				args,
-			)
-			UnionConstructExpr({ owned_construct | args = rewritten_args }, owned_type, loc)
+			match rewrite_aggregate_boxed_values(env, construct.args):
+				UnchangedPerceusAggregateBoxedValues:
+					inserted_non_binding_expr(env, source, True)
+				ChangedPerceusAggregateBoxedValues(rewritten):
+					inserted_non_binding_expr(
+						env,
+						UnionConstructExpr({ construct | args = rewritten }, typ, loc),
+						False,
+					)
 		_:
-			expr
+			opaque_inserted_non_binding_expr(
+				env,
+				insert_drops_normalized_expr(env, source),
+			)
+
+	debug:
+		if result.reuses_source:
+			perceus_work_insert_aggregate_original_nodes_reused()
+		else:
+			perceus_work_insert_aggregate_reconstructions()
+
+	result
 
 
 private pure func bind_owned_temporary_field_projection(
@@ -15725,6 +16044,46 @@ private pure func bind_owned_temporary_field_projection(
 	-- contains managed fields. Keep the lexical wrapper that releases that
 	-- owner; `is_owned` describes the result value, not required cleanup.
 	materialized.expr
+
+
+private pure func normalize_projection_owner_ownership_change_aware(
+	env: PerceusEnv,
+	source: CoreExpr,
+	owner: CoreExpr,
+) -> PerceusOwnershipNormalization:
+	proven_borrowed_owner: Bool = match owner:
+		VarExpr(_, _, _):
+			True
+		CallExpr(kind, _, args, return_type, _):
+			match contract_for_call(env, kind, args.length(), return_type):
+				Some(contract):
+					match contract.result:
+						ReturnBorrowed | ReturnAliasOfArg(_):
+							True
+						_:
+							False
+				None:
+					False
+		_:
+			False
+
+	if proven_borrowed_owner:
+		UnchangedPerceusOwnershipNormalization
+	else:
+		ChangedPerceusOwnershipNormalization(
+			bind_owned_temporary_field_projection(env, source),
+		)
+
+
+private pure func normalize_projection_ownership_change_aware(
+	env: PerceusEnv,
+	source: CoreExpr,
+) -> PerceusOwnershipNormalization:
+	match source:
+		FieldExpr(owner, _, _, _) | TupleFieldExpr(owner, _, _, _):
+			normalize_projection_owner_ownership_change_aware(env, source, owner)
+		_:
+			ChangedPerceusOwnershipNormalization(source)
 
 
 private pure func materialize_owned_temporary_projection(
@@ -15785,6 +16144,103 @@ private pure func materialize_owned_temporary_field_projection(
 			expr
 
 
+-- This deliberately small proof covers only argument forms for which
+-- `materialize_borrowed_temporary` returns the exact input node. Complex
+-- result-producing forms remain conservative until their own normalization
+-- reports source identity.
+private pure func simple_borrowed_argument_materialization_reuses_source(
+	env: PerceusEnv,
+	expr: CoreExpr,
+) -> Bool:
+	match expr:
+		LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _) | VarExpr(_, _, _) | VoidExpr(_, _):
+			not is_owned_temporary_expr(env, expr)
+		_:
+			False
+
+
+private pure func call_field_alias_protection_reuses_source(
+	env: PerceusEnv,
+	kind: CoreCallKind,
+	args: List[CoreExpr],
+	return_type: CoreType,
+) -> Bool:
+	match contract_for_call(env, kind, args.length(), return_type):
+		Some(contract):
+			var reuses_source: Bool = True
+			var index: Int = 0
+
+			for arg in args:
+				match contract.args.get(index):
+					Some(mode):
+						if (
+							arg_consumes_caller(mode)
+							and is_managed_type(env, core_expr_type(arg))
+							and direct_field_alias(arg)
+						):
+							reuses_source = False
+						else:
+							void
+					None:
+						void
+
+				index += 1
+
+			reuses_source
+		None:
+			True
+
+
+private pure func call_temporary_binding_reuses_source(
+	env: PerceusEnv,
+	kind: CoreCallKind,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	return_type: CoreType,
+) -> Bool:
+	match contract_for_temporary_binding(env, kind, args.length(), return_type):
+		Some(plan):
+			contract: OwnershipCallContract = temporary_binding_plan_contract(plan)
+			var reuses_source: Bool = not ((
+				is_closure_call(kind)
+				and is_owned_temporary_expr(env, callee)
+			))
+
+			var index: Int = 0
+
+			for arg in args:
+				match contract.args.get(index):
+					Some(mode):
+						if (
+							arg_preserves_caller(mode)
+							and not simple_borrowed_argument_materialization_reuses_source(env, arg)
+						):
+							reuses_source = False
+						else:
+							void
+					None:
+						void
+
+				index += 1
+
+			reuses_source
+		None:
+			True
+
+
+private pure func call_ownership_normalization_reuses_source(
+	env: PerceusEnv,
+	kind: CoreCallKind,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	return_type: CoreType,
+) -> Bool:
+	(
+		call_field_alias_protection_reuses_source(env, kind, args, return_type)
+		and call_temporary_binding_reuses_source(env, kind, callee, args, return_type)
+	)
+
+
 private pure func normalize_ownership_node(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
 	match expr:
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
@@ -15796,20 +16252,8 @@ private pure func normalize_ownership_node(env: PerceusEnv, expr: CoreExpr) -> C
 		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
 			retain_borrowed_match_binding_results(env, expr)
 		CallExpr(kind, callee, args, typ, loc):
-			field_safe: CoreExpr = protect_consuming_field_aliases(env, expr)
+			field_safe: CoreExpr = protect_consuming_call_field_aliases(env, expr)
 			bind_borrowed_owned_temporary_args_at_call(env, field_safe)
-		UnboxExpr(kind, inner, typ, loc):
-			bind_borrowed_owned_temporary_args_through_unbox(env, expr)
-		BinaryExpr(op, left, right, typ, loc):
-			field_safe: CoreExpr = protect_consuming_field_aliases(env, expr)
-			-- Opaque scalar equality can remain a BinaryExpr through Core instead
-			-- of resolving to a call. Its operands are still borrowed and owned
-			-- call results must be released after the comparison.
-			bind_borrowed_owned_temporary_binary_operands(env, field_safe)
-		FieldExpr(owner, field, typ, loc):
-			bind_owned_temporary_field_projection(env, expr)
-		TupleFieldExpr(owner, field_index, typ, loc):
-			bind_owned_temporary_field_projection(env, expr)
 		_:
 			expr
 
@@ -15896,26 +16340,18 @@ private pure func plan_managed_let(
 	rhs: CoreExpr,
 	body: CoreExpr,
 ) -> PerceusManagedLetPlan:
-	rhs_is_owned_temporary: Bool = binding_alias_rhs_is_owned_temporary(
-		env,
-		bind_type,
-		rhs,
-	)
+	rhs_is_owned_temporary: Bool = binding_alias_rhs_is_owned_temporary(env, bind_type, rhs)
 	owned_rhs_reuses_source: Bool = normalize_binding_alias_rhs_reuses_source(
 		env,
 		bind_type,
 		rhs,
 		rhs_is_owned_temporary,
 	)
+
 	owned_rhs: CoreExpr = if owned_rhs_reuses_source:
 		rhs
 	else:
-		normalize_binding_alias_rhs_with_owned_status(
-			env,
-			bind_type,
-			rhs,
-			rhs_is_owned_temporary,
-		)
+		normalize_binding_alias_rhs_with_owned_status(env, bind_type, rhs, rhs_is_owned_temporary)
 
 	branch_safe_body: CoreExpr = if is_mutable:
 		retain_mutable_match_branch_results(
@@ -15940,8 +16376,6 @@ private pure func plan_managed_let(
 		owned_rhs = owned_rhs,
 		owned_rhs_reuses_source = owned_rhs_reuses_source,
 		branch_safe_body = branch_safe_body,
-		-- Mutable result normalization reconstructs its result spine. Mutable
-		-- managed lets are never eligible for the identity paths below.
 		branch_safe_body_reuses_source = not is_mutable
 	}
 
@@ -16668,6 +17102,7 @@ private pure func insert_drops_expr_inner_result(
 						if is_managed_type(env, bind_type):
 							debug:
 								perceus_work_insert_managed_let_visits()
+
 							plan: PerceusManagedLetPlan = plan_managed_let(
 								env,
 								current,
@@ -16772,6 +17207,7 @@ private pure func insert_drops_expr_inner_result(
 										and is_immortal_value_expr(env, plan.owned_rhs)
 									)
 								)
+
 								reuses_source: Bool = (
 									not proven_unused
 									and ownership_neutral
@@ -16943,6 +17379,181 @@ private pure func opaque_inserted_non_binding_expr(
 	inserted_non_binding_expr(env, expr, False)
 
 
+private pure func insert_drops_change_aware_call(
+	env: PerceusEnv,
+	source: CoreExpr,
+	kind: CoreCallKind,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> PerceusInsertedExpr:
+	debug:
+		perceus_work_insert_call_visits()
+
+	normalization_reuses_source: Bool = call_ownership_normalization_reuses_source(
+		env,
+		kind,
+		callee,
+		args,
+		typ,
+	)
+
+	result: PerceusInsertedExpr = if not normalization_reuses_source:
+		opaque_inserted_non_binding_expr(
+			env,
+			insert_drops_ownership_node(env, source),
+		)
+	else:
+		rewritten_callee: PerceusInsertedExpr = insert_drops_expr_inner_result(env, callee)
+		var rewritten_args: List[CoreExpr] = args
+		var reuses_source: Bool = rewritten_callee.reuses_source
+		var index: Int = 0
+
+		for arg in args:
+			rewritten_arg: PerceusInsertedExpr = insert_drops_expr_inner_result(env, arg)
+
+			if not rewritten_arg.reuses_source:
+				rewritten_args = rewritten_args.set(index, rewritten_arg.expr)
+				reuses_source = False
+			else:
+				void
+
+			index += 1
+
+		if reuses_source:
+			inserted_non_binding_expr(env, source, True)
+		else:
+			inserted_non_binding_expr(
+				env,
+				CallExpr(kind, rewritten_callee.expr, rewritten_args, typ, loc),
+				False,
+			)
+
+	debug:
+		if result.reuses_source:
+			perceus_work_insert_call_original_nodes_reused()
+		else:
+			perceus_work_insert_call_reconstructions()
+
+	result
+
+
+private pure func insert_drops_change_aware_fixed_ownership(
+	env: PerceusEnv,
+	source: CoreExpr,
+) -> PerceusInsertedExpr:
+	debug:
+		perceus_work_insert_fixed_ownership_visits()
+
+	normalization: PerceusOwnershipNormalization = match source:
+		UnboxExpr(_, _, _, _):
+			normalize_unbox_ownership_change_aware(env, source)
+		BinaryExpr(_, _, _, _, _):
+			normalize_binary_ownership_change_aware(env, source)
+		FieldExpr(_, _, _, _) | TupleFieldExpr(_, _, _, _):
+			normalize_projection_ownership_change_aware(env, source)
+		_:
+			ChangedPerceusOwnershipNormalization(source)
+
+	result: PerceusInsertedExpr = match normalization:
+		ChangedPerceusOwnershipNormalization(normalized):
+			debug:
+				perceus_work_insert_fixed_ownership_normalization_rewrites()
+
+			opaque_inserted_non_binding_expr(
+				env,
+				insert_drops_normalized_expr(env, normalized),
+			)
+		UnchangedPerceusOwnershipNormalization:
+			match source:
+				UnboxExpr(kind, inner, typ, loc):
+					rewritten_inner: PerceusInsertedExpr = insert_drops_expr_inner_result(
+						env,
+						inner,
+					)
+
+					if rewritten_inner.reuses_source:
+						inserted_non_binding_expr(env, source, True)
+					else:
+						inserted_non_binding_expr(
+							env,
+							UnboxExpr(kind, rewritten_inner.expr, typ, loc),
+							False,
+						)
+				BinaryExpr(op, left, right, typ, loc):
+					rewritten_left: PerceusInsertedExpr = insert_drops_expr_inner_result(env, left)
+					rewritten_right: PerceusInsertedExpr = insert_drops_expr_inner_result(
+						env,
+						right,
+					)
+					reuses_source: Bool = (
+						rewritten_left.reuses_source
+						and rewritten_right.reuses_source
+					)
+
+					if reuses_source:
+						inserted_non_binding_expr(env, source, True)
+					else:
+						inserted_non_binding_expr(
+							env,
+							BinaryExpr(
+								op,
+								rewritten_left.expr,
+								rewritten_right.expr,
+								typ,
+								loc,
+							),
+							False,
+						)
+				FieldExpr(owner, field, typ, loc):
+					rewritten_owner: PerceusInsertedExpr = insert_drops_expr_inner_result(
+						env,
+						owner,
+					)
+
+					if rewritten_owner.reuses_source:
+						inserted_non_binding_expr(env, source, True)
+					else:
+						inserted_non_binding_expr(
+							env,
+							FieldExpr(rewritten_owner.expr, field, typ, loc),
+							False,
+						)
+				TupleFieldExpr(owner, field_index, typ, loc):
+					rewritten_owner: PerceusInsertedExpr = insert_drops_expr_inner_result(
+						env,
+						owner,
+					)
+
+					if rewritten_owner.reuses_source:
+						inserted_non_binding_expr(env, source, True)
+					else:
+						inserted_non_binding_expr(
+							env,
+							TupleFieldExpr(
+								rewritten_owner.expr,
+								field_index,
+								typ,
+								loc,
+							),
+							False,
+						)
+				_:
+					opaque_inserted_non_binding_expr(
+						env,
+						insert_drops_normalized_expr(env, source),
+					)
+
+	debug:
+		if result.reuses_source:
+			perceus_work_insert_fixed_ownership_original_nodes_reused()
+		else:
+			perceus_work_insert_fixed_ownership_reconstructions()
+
+	result
+
+
 private pure func insert_drops_non_binding_expr(
 	env: PerceusEnv,
 	expr: CoreExpr,
@@ -16968,86 +17579,12 @@ private pure func insert_drops_non_binding_expr(
 				env,
 				insert_drops_ownership_node(env, expr),
 			)
-		TupleExpr(items, typ, loc):
-			opaque_inserted_non_binding_expr(
-				env,
-				rewrite_aggregate_with_owned_field_aliases(env, expr),
-			)
-		VectorExpr(items, typ, loc):
-			opaque_inserted_non_binding_expr(
-				env,
-				rewrite_aggregate_with_owned_field_aliases(env, expr),
-			)
-		RecordExpr(fields, typ, loc):
-			opaque_inserted_non_binding_expr(
-				env,
-				rewrite_aggregate_with_owned_field_aliases(env, expr),
-			)
-		RecordUpdateExpr(base, fields, typ, loc):
-			opaque_inserted_non_binding_expr(
-				env,
-				rewrite_aggregate_with_owned_field_aliases(env, expr),
-			)
-		RecordReuseExpr(source, fields, typ, loc):
-			opaque_inserted_non_binding_expr(
-				env,
-				rewrite_aggregate_with_owned_field_aliases(env, expr),
-			)
-		RecordCowUpdateExpr(source, fields, typ, loc):
-			opaque_inserted_non_binding_expr(
-				env,
-				rewrite_aggregate_with_owned_field_aliases(env, expr),
-			)
-		RecordConstructExpr(type_name, fields, typ, loc):
-			opaque_inserted_non_binding_expr(
-				env,
-				rewrite_aggregate_with_owned_field_aliases(env, expr),
-			)
-		ListConstructExpr(construct, typ, loc):
-			opaque_inserted_non_binding_expr(
-				env,
-				rewrite_aggregate_with_owned_field_aliases(env, expr),
-			)
-		TensorBoxedLiteralExpr(literal, typ, loc):
-			opaque_inserted_non_binding_expr(
-				env,
-				rewrite_aggregate_with_owned_field_aliases(env, expr),
-			)
-		DictConstructExpr(construct, typ, loc):
-			opaque_inserted_non_binding_expr(
-				env,
-				rewrite_aggregate_with_owned_field_aliases(env, expr),
-			)
-		UnionConstructExpr(construct, typ, loc):
-			opaque_inserted_non_binding_expr(
-				env,
-				rewrite_aggregate_with_owned_field_aliases(env, expr),
-			)
+		TupleExpr(_, _, _) | VectorExpr(_, _, _) | RecordExpr(_, _, _) | RecordUpdateExpr(_, _, _, _) | RecordReuseExpr(_, _, _, _) | RecordCowUpdateExpr(_, _, _, _) | RecordConstructExpr(_, _, _, _) | ListConstructExpr(_, _, _) | TensorBoxedLiteralExpr(_, _, _) | DictConstructExpr(_, _, _) | UnionConstructExpr(_, _, _):
+			insert_drops_change_aware_aggregate(env, expr)
 		CallExpr(kind, callee, args, typ, loc):
-			opaque_inserted_non_binding_expr(
-				env,
-				insert_drops_ownership_node(env, expr),
-			)
-		UnboxExpr(kind, inner, typ, loc):
-			opaque_inserted_non_binding_expr(
-				env,
-				insert_drops_ownership_node(env, expr),
-			)
-		BinaryExpr(op, left, right, typ, loc):
-			opaque_inserted_non_binding_expr(
-				env,
-				insert_drops_ownership_node(env, expr),
-			)
-		FieldExpr(owner, field, typ, loc):
-			opaque_inserted_non_binding_expr(
-				env,
-				insert_drops_ownership_node(env, expr),
-			)
-		TupleFieldExpr(owner, field_index, typ, loc):
-			opaque_inserted_non_binding_expr(
-				env,
-				insert_drops_ownership_node(env, expr),
-			)
+			insert_drops_change_aware_call(env, expr, kind, callee, args, typ, loc)
+		UnboxExpr(_, _, _, _) | BinaryExpr(_, _, _, _, _) | FieldExpr(_, _, _, _) | TupleFieldExpr(_, _, _, _):
+			insert_drops_change_aware_fixed_ownership(env, expr)
 		_:
 			insert_drops_change_aware_normalized_expr(env, expr)
 

@@ -28,7 +28,7 @@ from compiler_backend_worker import (
 )
 
 
-FIXTURE_VERSION = 10
+FIXTURE_VERSION = 11
 DEFAULT_TIMEOUT_SECONDS = 60.0
 PERCEUS_ACTION = "run_perceus"
 MEASURE_OWNERSHIP_PREPARATION_PERCEUS_ACTION = (
@@ -42,6 +42,9 @@ BODY_SHAPES = (
     "linear",
     "borrowed_call_protection",
     "aggregate_escape",
+    "aggregate_change_matrix",
+    "fixed_ownership_change_matrix",
+    "fixed_ownership_neutral",
     "borrowed_return",
     "referenced_global_boundary",
     "mixed_function_owner_catalog",
@@ -122,6 +125,16 @@ PERCEUS_WORK_COUNTER_NAMES = (
     "insert_managed_let_visits",
     "insert_managed_let_original_nodes_reused",
     "insert_managed_let_reconstructions",
+    "insert_call_visits",
+    "insert_call_original_nodes_reused",
+    "insert_call_reconstructions",
+    "insert_aggregate_visits",
+    "insert_aggregate_original_nodes_reused",
+    "insert_aggregate_reconstructions",
+    "insert_fixed_ownership_visits",
+    "insert_fixed_ownership_original_nodes_reused",
+    "insert_fixed_ownership_reconstructions",
+    "insert_fixed_ownership_normalization_rewrites",
     "declarations_rewritten",
     "functions_rewritten",
     "globals_rewritten",
@@ -172,6 +185,16 @@ CHANGE_AWARE_INSERT_WORK_COUNTER_NAMES = (
     "insert_managed_let_visits",
     "insert_managed_let_original_nodes_reused",
     "insert_managed_let_reconstructions",
+    "insert_call_visits",
+    "insert_call_original_nodes_reused",
+    "insert_call_reconstructions",
+    "insert_aggregate_visits",
+    "insert_aggregate_original_nodes_reused",
+    "insert_aggregate_reconstructions",
+    "insert_fixed_ownership_visits",
+    "insert_fixed_ownership_original_nodes_reused",
+    "insert_fixed_ownership_reconstructions",
+    "insert_fixed_ownership_normalization_rewrites",
 )
 LEGACY_PERCEUS_WORK_COUNTER_NAMES = tuple(
     name for name in PERCEUS_WORK_COUNTER_NAMES
@@ -199,9 +222,34 @@ CONTRACT_FIXTURE_LET_NODES = 2
 PRIMITIVE_PARAMETER_TYPE = "Int"
 MANAGED_PARAMETER_TYPE = "String"
 BORROWED_OWNER_TYPE_NAME = "BenchBorrowOwner"
+AGGREGATE_COW_OWNER_TYPE_NAME = "BenchAggregateCowOwner"
 PERCEUS_SENTINEL_NAME = "BENCH_PERCEUS_SENTINEL"
 MANAGED_LET_TRANSFER_BINDING_ID_OFFSET = 1_000_000
 AGGREGATE_ESCAPE_SITES_PER_FUNCTION = 12
+AGGREGATE_CHANGE_MATRIX_NEUTRAL_ROOTS = 11
+AGGREGATE_CHANGE_MATRIX_SENSITIVE_ROOTS = 12
+AGGREGATE_CHANGE_MATRIX_ARGUMENT_ROOTS = 2
+AGGREGATE_CHANGE_MATRIX_ROOTS = (
+    "tuple",
+    "vector",
+    "record",
+    "record_update",
+    "record_reuse",
+    "record_cow_update",
+    "record_construct",
+    "list_construct",
+    "tensor_boxed_literal",
+    "dict_construct",
+    "union_construct",
+)
+FIXED_OWNERSHIP_ROOT_KINDS = ("unbox", "binary", "field", "tuple_field")
+FIXED_OWNERSHIP_CHANGE_CASES_PER_ROOT = 3
+FIXED_OWNERSHIP_CHANGE_MATRIX_VISITS_PER_FUNCTION = 16
+FIXED_OWNERSHIP_CHANGE_MATRIX_REUSED_PER_FUNCTION = 8
+FIXED_OWNERSHIP_CHANGE_MATRIX_RECONSTRUCTIONS_PER_FUNCTION = 8
+FIXED_OWNERSHIP_CHANGE_MATRIX_NORMALIZATIONS_PER_FUNCTION = 4
+FIXED_OWNERSHIP_PARAMETER_COUNT = 2
+FIXED_OWNERSHIP_OWNER_TYPE_NAME = "BenchFixedOwnershipOwner"
 RESULT_ALIAS_TERMINALS_PER_FUNCTION = 32
 REFERENCED_GLOBAL_MATRIX_GLOBALS = 384
 REFERENCED_GLOBAL_MATRIX_FUNCTIONS = 2
@@ -348,6 +396,138 @@ def validate_change_aware_managed_let_counters(counters: dict[str, int]) -> None
         raise RuntimeError(
             "Perceus managed-let decisions are incomplete"
         )
+
+
+def validate_change_aware_call_counters(counters: dict[str, int]) -> None:
+    """Require one exact source-reuse decision per call insertion visit."""
+    visits = counters["insert_call_visits"]
+    reused = counters["insert_call_original_nodes_reused"]
+    reconstructions = counters["insert_call_reconstructions"]
+
+    if reused + reconstructions != visits:
+        raise RuntimeError(
+            "Perceus call decisions are incomplete"
+        )
+
+
+def validate_managed_let_transfer_call_counters(
+    counters: dict[str, int],
+    function_count: int,
+) -> None:
+    """Require every ownership-neutral transfer-workload call to be reused."""
+    visits = counters["insert_call_visits"]
+    reused = counters["insert_call_original_nodes_reused"]
+    reconstructions = counters["insert_call_reconstructions"]
+    expected_visits = function_count + 1
+
+    if (
+        visits != expected_visits
+        or reused != expected_visits
+        or reconstructions != 0
+    ):
+        raise RuntimeError(
+            "Perceus managed-let transfer call reuse changed"
+        )
+
+
+def validate_borrowed_call_protection_stays_conservative(
+    counters: dict[str, int],
+) -> None:
+    """Require the ownership-sensitive call fixture to retain reconstruction."""
+    if counters["insert_call_reconstructions"] < 1:
+        raise RuntimeError(
+            "Perceus borrowed-call protection unexpectedly reused every call"
+        )
+
+
+def validate_change_aware_aggregate_counters(counters: dict[str, int]) -> None:
+    """Require one exact source-reuse decision per aggregate insertion visit."""
+    visits = counters["insert_aggregate_visits"]
+    reused = counters["insert_aggregate_original_nodes_reused"]
+    reconstructions = counters["insert_aggregate_reconstructions"]
+
+    if reused + reconstructions != visits:
+        raise RuntimeError(
+            "Perceus aggregate decisions are incomplete"
+        )
+
+
+def validate_change_aware_fixed_ownership_counters(counters: dict[str, int]) -> None:
+    """Require one exact decision per fixed-arity ownership root."""
+    visits = counters["insert_fixed_ownership_visits"]
+    reused = counters["insert_fixed_ownership_original_nodes_reused"]
+    reconstructions = counters["insert_fixed_ownership_reconstructions"]
+    normalization_rewrites = counters[
+        "insert_fixed_ownership_normalization_rewrites"
+    ]
+
+    if reused + reconstructions != visits:
+        raise RuntimeError(
+            "Perceus fixed-ownership decisions are incomplete"
+        )
+    if normalization_rewrites > reconstructions:
+        raise RuntimeError(
+            "Perceus fixed-ownership normalization rewrites exceed reconstructions"
+        )
+
+
+def validate_fixed_ownership_change_matrix_counters(
+    counters: dict[str, int],
+    function_count: int,
+) -> None:
+    """Require exact fixed-root decisions for the closed behavioral matrix."""
+    expected = {
+        "insert_fixed_ownership_visits": (
+            FIXED_OWNERSHIP_CHANGE_MATRIX_VISITS_PER_FUNCTION * function_count
+        ),
+        "insert_fixed_ownership_original_nodes_reused": (
+            FIXED_OWNERSHIP_CHANGE_MATRIX_REUSED_PER_FUNCTION * function_count
+        ),
+        "insert_fixed_ownership_reconstructions": (
+            FIXED_OWNERSHIP_CHANGE_MATRIX_RECONSTRUCTIONS_PER_FUNCTION
+            * function_count
+        ),
+        "insert_fixed_ownership_normalization_rewrites": (
+            FIXED_OWNERSHIP_CHANGE_MATRIX_NORMALIZATIONS_PER_FUNCTION
+            * function_count
+        ),
+    }
+    if any(counters[name] != value for name, value in expected.items()):
+        raise RuntimeError("Perceus fixed-ownership change matrix decisions changed")
+
+
+def validate_aggregate_escape_covers_both_decisions(
+    counters: dict[str, int],
+) -> None:
+    """Require neutral and ownership-sensitive aggregates in the mixed fixture."""
+    if counters["insert_aggregate_original_nodes_reused"] < 1:
+        raise RuntimeError(
+            "Perceus aggregate-escape fixture did not reuse a neutral aggregate"
+        )
+    if counters["insert_aggregate_reconstructions"] < 1:
+        raise RuntimeError(
+            "Perceus aggregate-escape fixture lost ownership-sensitive reconstruction"
+        )
+
+
+def validate_aggregate_change_matrix_counters(
+    counters: dict[str, int],
+    function_count: int,
+) -> None:
+    """Require exact aggregate decisions for the closed behavioral matrix."""
+    expected_reused = (
+        AGGREGATE_CHANGE_MATRIX_NEUTRAL_ROOTS
+        + AGGREGATE_CHANGE_MATRIX_ARGUMENT_ROOTS
+    ) * function_count
+    expected_reconstructed = (
+        AGGREGATE_CHANGE_MATRIX_SENSITIVE_ROOTS * function_count
+    )
+    if (
+        counters["insert_aggregate_visits"] != expected_reused + expected_reconstructed
+        or counters["insert_aggregate_original_nodes_reused"] != expected_reused
+        or counters["insert_aggregate_reconstructions"] != expected_reconstructed
+    ):
+        raise RuntimeError("Perceus aggregate change matrix decisions changed")
 
 
 def validate_managed_let_transfer_counters(
@@ -565,6 +745,14 @@ def named_type(name: str) -> JsonObject:
 
 def heap_record_type(name: str) -> JsonObject:
     return {"kind": "heap_record", "name": name}
+
+
+def tuple_type(items: list[JsonObject]) -> JsonObject:
+    return {"kind": "tuple", "items": items}
+
+
+def list_type(item: JsonObject) -> JsonObject:
+    return {"kind": "named", "name": "List", "args": [item]}
 
 
 def core_var(name: str, def_id: int | None) -> JsonObject:
@@ -840,6 +1028,50 @@ def borrowed_owner_decl() -> JsonObject:
             "type": named_type(MANAGED_PARAMETER_TYPE),
             "release_policy": "arc",
         }],
+        "loc": synthetic_loc(),
+    }
+
+
+def aggregate_cow_owner_decl() -> JsonObject:
+    return {
+        "kind": "heap_record",
+        "abi_type": None,
+        "name": AGGREGATE_COW_OWNER_TYPE_NAME,
+        "type_params": [],
+        "fields": [
+            {
+                "name": "BENCH_PAYLOAD",
+                "type": named_type(MANAGED_PARAMETER_TYPE),
+                "release_policy": "arc",
+            },
+            {
+                "name": "BENCH_INHERITED",
+                "type": named_type(MANAGED_PARAMETER_TYPE),
+                "release_policy": "arc",
+            },
+        ],
+        "loc": synthetic_loc(),
+    }
+
+
+def fixed_ownership_owner_decl() -> JsonObject:
+    return {
+        "kind": "heap_record",
+        "abi_type": None,
+        "name": FIXED_OWNERSHIP_OWNER_TYPE_NAME,
+        "type_params": [],
+        "fields": [
+            {
+                "name": "BENCH_SCALAR",
+                "type": named_type("Int"),
+                "release_policy": "none",
+            },
+            {
+                "name": "BENCH_ITEMS",
+                "type": list_type(named_type(MANAGED_PARAMETER_TYPE)),
+                "release_policy": "arc",
+            },
+        ],
         "loc": synthetic_loc(),
     }
 
@@ -1768,6 +2000,129 @@ def borrowed_owner_argument_expr(param_index: int) -> JsonObject:
     }
 
 
+def aggregate_cow_owner_argument_expr() -> JsonObject:
+    return {
+        "kind": "record_construct",
+        "type_name": AGGREGATE_COW_OWNER_TYPE_NAME,
+        "fields": [
+            {
+                "name": "BENCH_PAYLOAD",
+                "value": literal_expr("string", "cow-payload", MANAGED_PARAMETER_TYPE),
+            },
+            {
+                "name": "BENCH_INHERITED",
+                "value": literal_expr("string", "cow-inherited", MANAGED_PARAMETER_TYPE),
+            },
+        ],
+        "type": heap_record_type(AGGREGATE_COW_OWNER_TYPE_NAME),
+        "loc": synthetic_loc(),
+    }
+
+
+def fixed_ownership_record_param_ref(function_index: int) -> JsonObject:
+    return {
+        "kind": "var",
+        "var": core_var(borrowed_param_name(function_index, 0), None),
+        "type": heap_record_type(FIXED_OWNERSHIP_OWNER_TYPE_NAME),
+        "loc": synthetic_loc(),
+    }
+
+
+def fixed_ownership_tuple_param_ref(function_index: int) -> JsonObject:
+    return {
+        "kind": "var",
+        "var": core_var(borrowed_param_name(function_index, 1), None),
+        "type": tuple_type([named_type("Int")]),
+        "loc": synthetic_loc(),
+    }
+
+
+def fixed_ownership_empty_list_expr() -> JsonObject:
+    return {
+        "kind": "list_construct",
+        "construct": {
+            "layout": {"kind": "pointer"},
+            "elements": [],
+            "elem_needs_release": True,
+        },
+        "type": list_type(named_type(MANAGED_PARAMETER_TYPE)),
+        "loc": synthetic_loc(),
+    }
+
+
+def fixed_ownership_record_argument_expr() -> JsonObject:
+    return {
+        "kind": "record_construct",
+        "type_name": FIXED_OWNERSHIP_OWNER_TYPE_NAME,
+        "fields": [
+            {"name": "BENCH_SCALAR", "value": literal_expr("int", 7, "Int")},
+            {"name": "BENCH_ITEMS", "value": fixed_ownership_empty_list_expr()},
+        ],
+        "type": heap_record_type(FIXED_OWNERSHIP_OWNER_TYPE_NAME),
+        "loc": synthetic_loc(),
+    }
+
+
+def fixed_ownership_tuple_argument_expr() -> JsonObject:
+    return {
+        "kind": "tuple",
+        "items": [literal_expr("int", 9, "Int")],
+        "type": tuple_type([named_type("Int")]),
+        "loc": synthetic_loc(),
+    }
+
+
+def fixed_ownership_call(
+    call_kind: JsonObject,
+    name: str,
+    args: list[JsonObject],
+    result_type: JsonObject,
+) -> JsonObject:
+    return {
+        "kind": "call",
+        "call_kind": call_kind,
+        "callee": {
+            "kind": "var",
+            "var": core_var(name, None),
+            "type": named_type("Function"),
+            "loc": synthetic_loc(),
+        },
+        "args": args,
+        "type": result_type,
+        "loc": synthetic_loc(),
+    }
+
+
+def fixed_ownership_borrowing_int_call() -> JsonObject:
+    return fixed_ownership_call(
+        {"kind": "intrinsic", "name": "list_len"},
+        "list_len",
+        [fixed_ownership_empty_list_expr()],
+        named_type("Int"),
+    )
+
+
+def fixed_ownership_aliasing_call(
+    owned_argument: JsonObject,
+    result_type: JsonObject,
+) -> JsonObject:
+    return fixed_ownership_call(
+        {"kind": "builtin", "name": "blorp_checked_get"},
+        "blorp_checked_get",
+        [owned_argument, literal_expr("int", 0, "Int")],
+        result_type,
+    )
+
+
+def fixed_ownership_owned_call(result_type: JsonObject, name: str) -> JsonObject:
+    return fixed_ownership_call(
+        {"kind": "unknown"},
+        name,
+        [],
+        result_type,
+    )
+
+
 def borrowed_owner_projection_expr(function_index: int) -> JsonObject:
     return {
         "kind": "field",
@@ -1794,6 +2149,360 @@ def borrowed_aggregate_escape_expr(function_index: int) -> JsonObject:
         "type": heap_record_type(BORROWED_OWNER_TYPE_NAME),
         "loc": synthetic_loc(),
     }
+
+
+def aggregate_matrix_boxed_value(value: JsonObject) -> JsonObject:
+    return {
+        "kind": {"kind": "pointer"},
+        "value": value,
+        "needs_release": True,
+        "transfers_ownership": True,
+    }
+
+
+def aggregate_change_matrix_exprs(function_index: int) -> list[JsonObject]:
+    """Pair neutral/sensitive children across every change-aware aggregate root."""
+    neutral = lambda: literal_expr("string", "neutral", MANAGED_PARAMETER_TYPE)
+    sensitive = lambda: borrowed_owner_projection_expr(function_index)
+    record_base = lambda: {
+        "kind": "var",
+        "var": core_var(borrowed_param_name(function_index, 0), None),
+        "type": heap_record_type(BORROWED_OWNER_TYPE_NAME),
+        "loc": synthetic_loc(),
+    }
+    cow_base = lambda: {
+        "kind": "var",
+        "var": core_var(borrowed_param_name(function_index, 1), None),
+        "type": heap_record_type(AGGREGATE_COW_OWNER_TYPE_NAME),
+        "loc": synthetic_loc(),
+    }
+    record_field = lambda value: [{"name": "BENCH_PAYLOAD", "value": value}]
+    cow_field = lambda value: [
+        {
+            "field": {
+                "name": "BENCH_PAYLOAD",
+                "type": named_type(MANAGED_PARAMETER_TYPE),
+                "release_policy": "arc",
+            },
+            "replacement": value,
+        },
+        {
+            "field": {
+                "name": "BENCH_INHERITED",
+                "type": named_type(MANAGED_PARAMETER_TYPE),
+                "release_policy": "arc",
+            },
+            "replacement": None,
+        },
+    ]
+    boxed = lambda value: [aggregate_matrix_boxed_value(value)]
+    result_type = heap_record_type(BORROWED_OWNER_TYPE_NAME)
+
+    def tuple_expr(value: JsonObject) -> JsonObject:
+        return {
+            "kind": "tuple",
+            "items": [value],
+            "type": named_type("Tuple"),
+            "loc": synthetic_loc(),
+        }
+
+    def vector_expr(value: JsonObject) -> JsonObject:
+        return {
+            "kind": "vector",
+            "items": [value],
+            "type": named_type("Vector"),
+            "loc": synthetic_loc(),
+        }
+
+    def record_expr(value: JsonObject) -> JsonObject:
+        return {
+            "kind": "record",
+            "fields": record_field(value),
+            "type": named_type("Record"),
+            "loc": synthetic_loc(),
+        }
+
+    def record_update_expr(value: JsonObject) -> JsonObject:
+        return {
+            "kind": "record_update",
+            "base": record_base(),
+            "fields": record_field(value),
+            "type": result_type,
+            "loc": synthetic_loc(),
+        }
+
+    def record_reuse_expr(value: JsonObject) -> JsonObject:
+        return {
+            "kind": "record_reuse",
+            "source": record_base(),
+            "fields": record_field(value),
+            "type": result_type,
+            "loc": synthetic_loc(),
+        }
+
+    def record_cow_update_expr(value: JsonObject) -> JsonObject:
+        return {
+            "kind": "record_cow_update",
+            "source": cow_base(),
+            "fields": cow_field(value),
+            "type": heap_record_type(AGGREGATE_COW_OWNER_TYPE_NAME),
+            "loc": synthetic_loc(),
+        }
+
+    def record_construct_expr(value: JsonObject) -> JsonObject:
+        return {
+            "kind": "record_construct",
+            "type_name": BORROWED_OWNER_TYPE_NAME,
+            "fields": record_field(value),
+            "type": result_type,
+            "loc": synthetic_loc(),
+        }
+
+    def list_construct_expr(value: JsonObject) -> JsonObject:
+        return {
+            "kind": "list_construct",
+            "construct": {
+                "layout": {"kind": "pointer"},
+                "elements": boxed(value),
+                "elem_needs_release": True,
+            },
+            "type": named_type("List"),
+            "loc": synthetic_loc(),
+        }
+
+    def tensor_boxed_literal_expr(value: JsonObject) -> JsonObject:
+        return {
+            "kind": "tensor_boxed_literal",
+            "literal": {
+                "shape": {"kind": "vector", "length": 1},
+                "elements": boxed(value),
+                "elem_needs_release": True,
+            },
+            "type": named_type("Tensor"),
+            "loc": synthetic_loc(),
+        }
+
+    def dict_construct_expr(key: JsonObject, value: JsonObject) -> JsonObject:
+        return {
+            "kind": "dict_construct",
+            "construct": {
+                "constructor": {"kind": "string"},
+                "entries": [{
+                    "key": aggregate_matrix_boxed_value(key),
+                    "value": aggregate_matrix_boxed_value(value),
+                }],
+                "value_needs_release": True,
+            },
+            "type": named_type("Dict"),
+            "loc": synthetic_loc(),
+        }
+
+    def union_construct_expr(value: JsonObject) -> JsonObject:
+        return {
+            "kind": "union_construct",
+            "construct": {
+                "type_name": "BenchAggregateUnion",
+                "constructor_name": "BenchAggregateValue",
+                "constructor_c_name": "bench_aggregate_value",
+                "representation": {"kind": "generic"},
+                "payload_storage": "typed",
+                "uses_release_mask": False,
+                "release_mask": 0,
+                "args": boxed(value),
+            },
+            "type": named_type("BenchAggregateUnion"),
+            "loc": synthetic_loc(),
+        }
+
+    paired_builders = (
+        tuple_expr,
+        vector_expr,
+        record_expr,
+        record_update_expr,
+        record_reuse_expr,
+        record_cow_update_expr,
+        record_construct_expr,
+        list_construct_expr,
+        tensor_boxed_literal_expr,
+        union_construct_expr,
+    )
+    expressions = [
+        expression
+        for build in paired_builders
+        for expression in (build(neutral()), build(sensitive()))
+    ]
+    expressions.extend((
+        dict_construct_expr(neutral(), neutral()),
+        dict_construct_expr(sensitive(), neutral()),
+        dict_construct_expr(neutral(), sensitive()),
+    ))
+    return expressions
+
+
+def aggregate_change_matrix_body(
+    function_index: int,
+    body_nodes: int,
+) -> JsonObject:
+    expressions = [
+        *aggregate_change_matrix_exprs(function_index),
+        literal_expr("int", 0, "Int"),
+    ]
+    return padded_sequence(expressions, body_nodes)
+
+
+def fixed_ownership_field_expr(owner: JsonObject) -> JsonObject:
+    return {
+        "kind": "field",
+        "expr": owner,
+        "field": "BENCH_SCALAR",
+        "type": named_type("Int"),
+        "loc": synthetic_loc(),
+    }
+
+
+def fixed_ownership_tuple_field_expr(owner: JsonObject) -> JsonObject:
+    return {
+        "kind": "tuple_field",
+        "expr": owner,
+        "index": 0,
+        "type": named_type("Int"),
+        "loc": synthetic_loc(),
+    }
+
+
+def fixed_ownership_unbox_expr(inner: JsonObject) -> JsonObject:
+    return {
+        "kind": "unbox",
+        "unbox_kind": {"kind": "prim"},
+        "expr": inner,
+        "type": named_type("Int"),
+        "loc": synthetic_loc(),
+    }
+
+
+def fixed_ownership_binary_expr(left: JsonObject, right: JsonObject) -> JsonObject:
+    return {
+        "kind": "binary",
+        "op": "add",
+        "left": left,
+        "right": right,
+        "type": named_type("Int"),
+        "loc": synthetic_loc(),
+    }
+
+
+def fixed_ownership_sensitive_binary_expr(function_index: int) -> JsonObject:
+    return {
+        "kind": "binary",
+        "op": "equal",
+        "left": {
+            "kind": "field",
+            "expr": fixed_ownership_record_param_ref(function_index),
+            "field": "BENCH_ITEMS",
+            "type": list_type(named_type(MANAGED_PARAMETER_TYPE)),
+            "loc": synthetic_loc(),
+        },
+        "right": fixed_ownership_empty_list_expr(),
+        "type": named_type("Bool"),
+        "loc": synthetic_loc(),
+    }
+
+
+def fixed_ownership_change_matrix_exprs(function_index: int) -> list[JsonObject]:
+    """Cover neutral, child-only, and normalization-changing fixed roots."""
+    borrowed_record = lambda: fixed_ownership_record_param_ref(function_index)
+    borrowed_tuple = lambda: fixed_ownership_tuple_param_ref(function_index)
+    borrowed_record_call = lambda: fixed_ownership_aliasing_call(
+        fixed_ownership_record_argument_expr(),
+        heap_record_type(FIXED_OWNERSHIP_OWNER_TYPE_NAME),
+    )
+    borrowed_tuple_call = lambda: fixed_ownership_aliasing_call(
+        fixed_ownership_tuple_argument_expr(),
+        tuple_type([named_type("Int")]),
+    )
+
+    return [
+        # Unbox: direct neutral, recursive call reconstruction, alias protection.
+        fixed_ownership_unbox_expr({
+            "kind": "var",
+            "var": core_var(f"BENCH_RAW_{function_index:04d}", None),
+            "type": named_type("Ptr"),
+            "loc": synthetic_loc(),
+        }),
+        fixed_ownership_unbox_expr(fixed_ownership_borrowing_int_call()),
+        fixed_ownership_unbox_expr(fixed_ownership_aliasing_call(
+            fixed_ownership_empty_list_expr(),
+            named_type("Ptr"),
+        )),
+        # Binary: direct neutral, recursive call reconstruction, field protection.
+        fixed_ownership_binary_expr(
+            literal_expr("int", 1, "Int"),
+            literal_expr("int", 2, "Int"),
+        ),
+        fixed_ownership_binary_expr(
+            fixed_ownership_borrowing_int_call(),
+            literal_expr("int", 3, "Int"),
+        ),
+        fixed_ownership_sensitive_binary_expr(function_index),
+        # Projection pairs use explicit alias contracts for child-only changes.
+        fixed_ownership_field_expr(borrowed_record()),
+        fixed_ownership_field_expr(borrowed_record_call()),
+        fixed_ownership_field_expr(fixed_ownership_owned_call(
+            heap_record_type(FIXED_OWNERSHIP_OWNER_TYPE_NAME),
+            "bench_owned_record",
+        )),
+        fixed_ownership_tuple_field_expr(borrowed_tuple()),
+        fixed_ownership_tuple_field_expr(borrowed_tuple_call()),
+        fixed_ownership_tuple_field_expr(fixed_ownership_owned_call(
+            tuple_type([named_type("Int")]),
+            "bench_owned_tuple",
+        )),
+    ]
+
+
+def fixed_ownership_change_matrix_body(
+    function_index: int,
+    body_nodes: int,
+) -> JsonObject:
+    return padded_sequence(
+        [
+            *fixed_ownership_change_matrix_exprs(function_index),
+            literal_expr("int", 0, "Int"),
+        ],
+        body_nodes,
+    )
+
+
+def fixed_ownership_neutral_exprs(function_index: int) -> list[JsonObject]:
+    return [
+        fixed_ownership_unbox_expr({
+            "kind": "var",
+            "var": core_var(f"BENCH_RAW_{function_index:04d}", None),
+            "type": named_type("Ptr"),
+            "loc": synthetic_loc(),
+        }),
+        fixed_ownership_binary_expr(
+            literal_expr("int", 4, "Int"),
+            literal_expr("int", 5, "Int"),
+        ),
+        fixed_ownership_field_expr(fixed_ownership_record_param_ref(function_index)),
+        fixed_ownership_tuple_field_expr(fixed_ownership_tuple_param_ref(function_index)),
+    ]
+
+
+def fixed_ownership_neutral_body(
+    function_index: int,
+    body_nodes: int,
+) -> JsonObject:
+    group = fixed_ownership_neutral_exprs(function_index)
+    expressions: list[JsonObject] = []
+    while expression_node_count(
+        seq_expr([*expressions, *group, literal_expr("int", 0, "Int")])
+    ) <= body_nodes:
+        expressions.extend(fixed_ownership_neutral_exprs(function_index))
+    if not expressions:
+        raise ValueError("fixed-ownership neutral workload is too small")
+    return padded_sequence([*expressions, literal_expr("int", 0, "Int")], body_nodes)
 
 
 def borrowed_result_tree(function_index: int) -> JsonObject:
@@ -1906,6 +2615,49 @@ def worker_decl(
             },
             [],
             MANAGED_PARAMETER_TYPE,
+        )
+
+    if body_shape == "aggregate_change_matrix":
+        if params_per_function != 2:
+            raise ValueError("aggregate change matrix requires exactly two parameters")
+        return user_function(
+            f"bench_worker_{index:04d}",
+            def_id,
+            aggregate_change_matrix_body(index, body_leaves),
+            [
+                core_param_with_type(
+                    borrowed_param_name(index, 0),
+                    heap_record_type(BORROWED_OWNER_TYPE_NAME),
+                ),
+                core_param_with_type(
+                    borrowed_param_name(index, 1),
+                    heap_record_type(AGGREGATE_COW_OWNER_TYPE_NAME),
+                ),
+            ],
+        )
+
+    if body_shape in ("fixed_ownership_change_matrix", "fixed_ownership_neutral"):
+        if params_per_function != FIXED_OWNERSHIP_PARAMETER_COUNT:
+            raise ValueError("fixed ownership fixtures require exactly two parameters")
+        body = (
+            fixed_ownership_change_matrix_body(index, body_leaves)
+            if body_shape == "fixed_ownership_change_matrix"
+            else fixed_ownership_neutral_body(index, body_leaves)
+        )
+        return user_function(
+            f"bench_worker_{index:04d}",
+            def_id,
+            body,
+            [
+                core_param_with_type(
+                    borrowed_param_name(index, 0),
+                    heap_record_type(FIXED_OWNERSHIP_OWNER_TYPE_NAME),
+                ),
+                core_param_with_type(
+                    borrowed_param_name(index, 1),
+                    tuple_type([named_type("Int")]),
+                ),
+            ],
         )
 
     if body_shape == "borrowed_boundary_fusion":
@@ -2079,7 +2831,13 @@ def worker_decl(
                 )
             )
         expressions = [*calls, *expressions]
-    elif body_shape not in ("linear", "borrowed_call_protection", "aggregate_escape"):
+    elif body_shape not in (
+        "linear",
+        "borrowed_call_protection",
+        "aggregate_escape",
+        "fixed_ownership_change_matrix",
+        "fixed_ownership_neutral",
+    ):
         raise ValueError(f"unsupported Perceus body shape: {body_shape}")
     if body_shape == "linear":
         literal_count = body_leaves - global_reads_per_function - params_per_function
@@ -2108,7 +2866,11 @@ def worker_decl(
                 borrowed_param_name(index, param_index),
                 heap_record_type(BORROWED_OWNER_TYPE_NAME),
             )
-            if body_shape in ("borrowed_call_protection", "aggregate_escape")
+            if body_shape in (
+                "borrowed_call_protection",
+                "aggregate_escape",
+                "aggregate_change_matrix",
+            )
             else core_param(borrowed_param_name(index, param_index), parameter_type)
         )
         for param_index in range(params_per_function)
@@ -2125,6 +2887,24 @@ def call_worker_expr(
 ) -> JsonObject:
     name = f"bench_worker_{index:04d}"
     function_type = named_type("Function")
+    if body_shape == "lambda_borrowed_boundary":
+        arguments: list[JsonObject] = []
+    elif body_shape == "aggregate_change_matrix":
+        arguments = [borrowed_owner_argument_expr(0), aggregate_cow_owner_argument_expr()]
+    elif body_shape in ("fixed_ownership_change_matrix", "fixed_ownership_neutral"):
+        arguments = [
+            fixed_ownership_record_argument_expr(),
+            fixed_ownership_tuple_argument_expr(),
+        ]
+    else:
+        arguments = [
+            (
+                borrowed_owner_argument_expr(param_index)
+                if body_shape in ("borrowed_call_protection", "aggregate_escape")
+                else parameter_argument_expr(param_index, parameter_type)
+            )
+            for param_index in range(params_per_function)
+        ]
     return {
         "kind": "call",
         "call_kind": {"kind": "selected_direct", "def_id": def_id},
@@ -2134,14 +2914,7 @@ def call_worker_expr(
             "type": function_type,
             "loc": synthetic_loc(),
         },
-        "args": [] if body_shape == "lambda_borrowed_boundary" else [
-            (
-                borrowed_owner_argument_expr(param_index)
-                if body_shape in ("borrowed_call_protection", "aggregate_escape")
-                else parameter_argument_expr(param_index, parameter_type)
-            )
-            for param_index in range(params_per_function)
-        ],
+        "args": arguments,
         "type": named_type(
             "Function"
             if body_shape == "lambda_borrowed_boundary"
@@ -2209,12 +2982,40 @@ def fixture_request(
             raise ValueError("managed-let transfer does not accept parameters")
         if parameter_type != MANAGED_PARAMETER_TYPE:
             raise ValueError("managed-let transfer uses String values")
+    if body_shape == "aggregate_change_matrix":
+        if global_reads_per_function != 0:
+            raise ValueError("aggregate change matrix does not read globals")
+        if params_per_function != 2:
+            raise ValueError("aggregate change matrix requires exactly two parameters")
+        if parameter_type != MANAGED_PARAMETER_TYPE:
+            raise ValueError("aggregate change matrix uses String field values")
+    if body_shape in ("fixed_ownership_change_matrix", "fixed_ownership_neutral"):
+        if global_reads_per_function != 0:
+            raise ValueError("fixed ownership fixtures do not read globals")
+        if params_per_function != FIXED_OWNERSHIP_PARAMETER_COUNT:
+            raise ValueError("fixed ownership fixtures require exactly two parameters")
+        if parameter_type != MANAGED_PARAMETER_TYPE:
+            raise ValueError("fixed ownership fixtures use the managed benchmark schema")
     globals_json = [global_decl(index) for index in range(global_count)]
     type_decls = (
-        [borrowed_owner_decl()]
+        (
+            [borrowed_owner_decl(), aggregate_cow_owner_decl()]
+            if body_shape == "aggregate_change_matrix"
+            else (
+                [fixed_ownership_owner_decl()]
+                if body_shape in (
+                    "fixed_ownership_change_matrix",
+                    "fixed_ownership_neutral",
+                )
+                else [borrowed_owner_decl()]
+            )
+        )
         if body_shape in (
             "borrowed_call_protection",
             "aggregate_escape",
+            "aggregate_change_matrix",
+            "fixed_ownership_change_matrix",
+            "fixed_ownership_neutral",
             "referenced_global_boundary",
             "mixed_function_owner_catalog",
             "borrowed_boundary_fusion",
@@ -2673,16 +3474,27 @@ def validate_perceus_parameter_shape(
                 raise RuntimeError(f"Perceus Core parameter shape changed for {function_name}")
             variable = param.get("name")
             value_type = param.get("type")
-            expected_type = (
-                heap_record_type(BORROWED_OWNER_TYPE_NAME)
-                if body_shape in (
-                    "borrowed_call_protection",
-                    "aggregate_escape",
-                    "mixed_function_owner_catalog",
-                    "borrowed_boundary_fusion",
+            if body_shape in (
+                "fixed_ownership_change_matrix",
+                "fixed_ownership_neutral",
+            ):
+                expected_type = (
+                    heap_record_type(FIXED_OWNERSHIP_OWNER_TYPE_NAME)
+                    if param_index == 0
+                    else tuple_type([named_type("Int")])
                 )
-                else named_type(parameter_type)
-            )
+            else:
+                expected_type = (
+                    heap_record_type(AGGREGATE_COW_OWNER_TYPE_NAME)
+                    if body_shape == "aggregate_change_matrix" and param_index == 1
+                    else heap_record_type(BORROWED_OWNER_TYPE_NAME)
+                ) if body_shape in (
+                        "borrowed_call_protection",
+                        "aggregate_escape",
+                        "aggregate_change_matrix",
+                        "mixed_function_owner_catalog",
+                        "borrowed_boundary_fusion",
+                    ) else named_type(parameter_type)
             if (
                 not isinstance(variable, dict)
                 or variable.get("name") != expected_name
@@ -2699,6 +3511,15 @@ def validate_perceus_parameter_shape(
                     if param_index == 0
                     else 0
                 )
+            elif body_shape == "aggregate_change_matrix":
+                expected_reads = 14 if param_index == 0 else 2
+            elif body_shape == "fixed_ownership_change_matrix":
+                expected_reads = 2 if param_index == 0 else 1
+            elif body_shape == "fixed_ownership_neutral":
+                # The scaled fixture fills an exact node budget, so its number
+                # of repeated four-root groups deliberately varies with that
+                # budget. Its closed input census validates the read geometry.
+                continue
             elif body_shape == "borrowed_return":
                 expected_reads = (
                     RESULT_ALIAS_TERMINALS_PER_FUNCTION
@@ -2762,6 +3583,244 @@ def count_parameter_reads(value: Any, expected_name: str) -> int:
     return 0
 
 
+def aggregate_root_children(expr: JsonObject) -> tuple[JsonObject, ...]:
+    """Return only the aggregate slots whose rewrite decision is under test."""
+    kind = expr.get("kind")
+    if kind in ("tuple", "vector"):
+        values = expr.get("items")
+    elif kind in ("record", "record_update", "record_reuse", "record_construct"):
+        fields = expr.get("fields")
+        values = (
+            [field.get("value") for field in fields if isinstance(field, dict)]
+            if isinstance(fields, list)
+            else None
+        )
+    elif kind == "record_cow_update":
+        fields = expr.get("fields")
+        values = (
+            [
+                replacement
+                for field in fields
+                if isinstance(field, dict)
+                for replacement in [field.get("replacement")]
+                if isinstance(replacement, dict)
+            ]
+            if isinstance(fields, list)
+            else None
+        )
+    elif kind == "list_construct":
+        construct = expr.get("construct")
+        elements = construct.get("elements") if isinstance(construct, dict) else None
+        values = (
+            [element.get("value") for element in elements]
+            if isinstance(elements, list)
+            else None
+        )
+    elif kind == "tensor_boxed_literal":
+        literal = expr.get("literal")
+        elements = literal.get("elements") if isinstance(literal, dict) else None
+        values = (
+            [element.get("value") for element in elements]
+            if isinstance(elements, list)
+            else None
+        )
+    elif kind == "union_construct":
+        construct = expr.get("construct")
+        args = construct.get("args") if isinstance(construct, dict) else None
+        values = (
+            [argument.get("value") for argument in args]
+            if isinstance(args, list)
+            else None
+        )
+    else:
+        values = None
+
+    if not isinstance(values, list) or not all(isinstance(value, dict) for value in values):
+        raise RuntimeError(f"aggregate change matrix has malformed {kind} children")
+    return tuple(values)
+
+
+def aggregate_change_matrix_output_census(core_program: JsonObject) -> JsonObject:
+    declarations = core_program.get("decls")
+    if not isinstance(declarations, list):
+        raise RuntimeError("aggregate change matrix is missing declarations")
+    workers = [
+        declaration
+        for declaration in declarations
+        if isinstance(declaration, dict)
+        and declaration.get("kind") == "function"
+        and str(declaration.get("name", "")).startswith("bench_worker_")
+    ]
+
+    census: JsonObject = {
+        kind: {"neutral": 0, "sensitive": 0}
+        for kind in AGGREGATE_CHANGE_MATRIX_ROOTS
+        if kind != "dict_construct"
+    }
+    census["dict_construct"] = {
+        "neutral": 0,
+        "sensitive_key": 0,
+        "sensitive_value": 0,
+    }
+
+    pending = [worker.get("body") for worker in workers]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            kind = current.get("kind")
+            if (
+                isinstance(kind, str)
+                and kind in AGGREGATE_CHANGE_MATRIX_ROOTS
+                and "type" in current
+                and "loc" in current
+            ):
+                if kind == "dict_construct":
+                    construct = current.get("construct")
+                    entries = construct.get("entries") if isinstance(construct, dict) else None
+                    if not isinstance(entries, list) or len(entries) != 1:
+                        raise RuntimeError("aggregate change matrix has malformed dict entries")
+                    entry = entries[0]
+                    if not isinstance(entry, dict):
+                        raise RuntimeError("aggregate change matrix has malformed dict entry")
+                    key = entry.get("key", {}).get("value")
+                    value = entry.get("value", {}).get("value")
+                    key_changed = isinstance(key, dict) and key.get("kind") == "borrow_let"
+                    value_changed = isinstance(value, dict) and value.get("kind") == "borrow_let"
+                    if key_changed and value_changed:
+                        raise RuntimeError(
+                            "aggregate change matrix combined dict key/value decisions"
+                        )
+                    decision = "sensitive_key" if key_changed else (
+                        "sensitive_value" if value_changed else "neutral"
+                    )
+                    census[kind][decision] += 1
+                else:
+                    children = aggregate_root_children(current)
+                    changed = any(child.get("kind") == "borrow_let" for child in children)
+                    census[kind]["sensitive" if changed else "neutral"] += 1
+            pending.extend(current.values())
+        elif isinstance(current, list):
+            pending.extend(current)
+    return census
+
+
+def validate_aggregate_change_matrix_output(
+    core_program: JsonObject,
+    function_count: int,
+) -> None:
+    expected: JsonObject = {
+        kind: {"neutral": function_count, "sensitive": function_count}
+        for kind in AGGREGATE_CHANGE_MATRIX_ROOTS
+        if kind not in ("record", "record_update", "dict_construct")
+    }
+    # Ownership preparation deliberately lowers RecordUpdateExpr to RecordExpr
+    # before the measured Perceus boundary. Preserve that boundary invariant in
+    # the matrix while still constructing RecordUpdateExpr in the input census.
+    expected["record"] = {
+        "neutral": 2 * function_count,
+        "sensitive": 2 * function_count,
+    }
+    expected["record_update"] = {"neutral": 0, "sensitive": 0}
+    expected["dict_construct"] = {
+        "neutral": function_count,
+        "sensitive_key": function_count,
+        "sensitive_value": function_count,
+    }
+    if aggregate_change_matrix_output_census(core_program) != expected:
+        raise RuntimeError("Perceus aggregate change matrix output decisions changed")
+
+
+def fixed_ownership_change_matrix_output_census(
+    core_program: JsonObject,
+) -> JsonObject:
+    """Count the exact roots and ownership wrappers in the fixed matrix."""
+    declarations = core_program.get("decls")
+    if not isinstance(declarations, list):
+        raise RuntimeError("fixed-ownership change matrix is missing declarations")
+    workers = [
+        declaration
+        for declaration in declarations
+        if isinstance(declaration, dict)
+        and declaration.get("kind") == "function"
+        and str(declaration.get("name", "")).startswith("bench_worker_")
+    ]
+    census: JsonObject = {
+        "roots": {kind: 0 for kind in FIXED_OWNERSHIP_ROOT_KINDS},
+        "borrow_arg_lets": 0,
+        "borrow_arg_views": 0,
+        "borrow_arg_drops": 0,
+        "owned_field_owner_lets": 0,
+        "owned_field_owner_drops": 0,
+        "equality_borrowed_results": 0,
+    }
+
+    pending = [worker.get("body") for worker in workers]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            kind = current.get("kind")
+            if (
+                isinstance(kind, str)
+                and kind in FIXED_OWNERSHIP_ROOT_KINDS
+                and "type" in current
+                and "loc" in current
+            ):
+                census["roots"][kind] += 1
+
+            variable = (
+                current.get("name")
+                if kind in ("let", "borrow_let")
+                else current.get("var") if kind == "drop" else None
+            )
+            name = variable.get("name") if isinstance(variable, dict) else None
+            if isinstance(name, str):
+                if kind == "let" and name == "__borrow_arg_0":
+                    census["borrow_arg_lets"] += 1
+                elif kind == "borrow_let" and name == "__borrow_arg_0_view":
+                    census["borrow_arg_views"] += 1
+                elif kind == "drop" and name == "__borrow_arg_0":
+                    census["borrow_arg_drops"] += 1
+                elif kind == "let" and name == "__owned_field_owner_0":
+                    census["owned_field_owner_lets"] += 1
+                elif kind == "drop" and name == "__owned_field_owner_0":
+                    census["owned_field_owner_drops"] += 1
+                elif (
+                    kind == "borrow_let"
+                    and name.endswith("_equality_arg_0")
+                ):
+                    census["equality_borrowed_results"] += 1
+            pending.extend(current.values())
+        elif isinstance(current, list):
+            pending.extend(current)
+    return census
+
+
+def validate_fixed_ownership_change_matrix_output(
+    core_program: JsonObject,
+    function_count: int,
+) -> None:
+    """Require every matrix case and its established ownership wrapper."""
+    expected: JsonObject = {
+        "roots": {
+            "unbox": 3 * function_count,
+            "binary": 3 * function_count,
+            # The consuming binary owns one nested field root as well.
+            "field": 4 * function_count,
+            "tuple_field": 3 * function_count,
+        },
+        # Two child-only borrowing calls, two projection alias calls, and the
+        # sensitive unbox each materialize their owned argument.
+        "borrow_arg_lets": 5 * function_count,
+        "borrow_arg_views": function_count,
+        "borrow_arg_drops": 3 * function_count,
+        "owned_field_owner_lets": 2 * function_count,
+        "owned_field_owner_drops": 2 * function_count,
+        "equality_borrowed_results": function_count,
+    }
+    if fixed_ownership_change_matrix_output_census(core_program) != expected:
+        raise RuntimeError("Perceus fixed-ownership change matrix output changed")
+
+
 def validate_response(
     response_path: Path,
     global_count: int,
@@ -2802,6 +3861,10 @@ def validate_response(
             global_count,
             branch_arms,
         )
+        if body_shape == "aggregate_change_matrix":
+            validate_aggregate_change_matrix_output(output, function_count)
+        elif body_shape == "fixed_ownership_change_matrix":
+            validate_fixed_ownership_change_matrix_output(output, function_count)
         encoded_output = json.dumps(output, separators=(",", ":")).encode("utf-8")
 
     if action != END_TO_END_ACTION:
@@ -3330,8 +4393,33 @@ def run_benchmark(
                 )
                 validate_change_aware_insert_counters(parsed_counters)
                 validate_change_aware_managed_let_counters(parsed_counters)
+                validate_change_aware_call_counters(parsed_counters)
+                validate_change_aware_aggregate_counters(parsed_counters)
+                validate_change_aware_fixed_ownership_counters(parsed_counters)
                 if body_shape == "managed_let_transfer":
                     validate_managed_let_transfer_counters(
+                        parsed_counters,
+                        args.functions,
+                    )
+                    validate_managed_let_transfer_call_counters(
+                        parsed_counters,
+                        args.functions,
+                    )
+                elif body_shape == "borrowed_call_protection":
+                    validate_borrowed_call_protection_stays_conservative(
+                        parsed_counters
+                    )
+                elif body_shape == "aggregate_escape":
+                    validate_aggregate_escape_covers_both_decisions(
+                        parsed_counters
+                    )
+                elif body_shape == "aggregate_change_matrix":
+                    validate_aggregate_change_matrix_counters(
+                        parsed_counters,
+                        args.functions,
+                    )
+                elif body_shape == "fixed_ownership_change_matrix":
+                    validate_fixed_ownership_change_matrix_counters(
                         parsed_counters,
                         args.functions,
                     )
