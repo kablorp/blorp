@@ -7,6 +7,18 @@ import:
 		ModuleOrigin(UserModule),
 		resolved_module_identity_from_resolver,
 	../../../src/compiler/stage_04_modules/module_table: singleton_module_table
+	../../../src/compiler/stage_06_typecheck/graph/definition_identity:
+		SourceDefinitionKind(ConstructorDefinition),
+		source_definition_key,
+	../../../src/compiler/stage_06_typecheck/graph/definition_index:
+		definition_index_definition_table,
+		definition_index_empty,
+		definition_index_initial_seed,
+		definition_index_insert_source_definition_id,
+		definition_index_next_def_id,
+		definition_index_seed_next_def_id,
+	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
+		constructor_id_from_definition_table,
 	../../../src/compiler/stage_06_typecheck/infer:
 		TypedPattern(
 			TypedConstructorPattern,
@@ -18,6 +30,7 @@ import:
 			TypedTuplePattern,
 			TypedWildcardPattern,
 		),
+	../../../src/compiler/stage_06_typecheck/type_system/env: ENV_EMPTY
 	../../../src/compiler/stage_06_typecheck/type_system/semantic_type:
 		SemanticType(SemanticNamedType),
 		TYPE_INT,
@@ -49,7 +62,59 @@ private pure func ctfe_test_context() -> CtfeContext:
 			UserModule,
 		),
 	)
-	ctfe_context_empty(table, module_id)
+	empty = definition_index_empty(definition_index_initial_seed(ENV_EMPTY), table)
+	none_id = definition_index_next_def_id(empty)
+	with_none = definition_index_insert_source_definition_id(
+		empty,
+		table,
+		source_definition_key(
+			module_id,
+			ConstructorDefinition,
+			"None",
+			Some("Option"),
+			fixture_source_span(),
+		),
+		none_id,
+	).to_option().get_or(empty)
+	some_id = definition_index_next_def_id(with_none)
+	with_some = definition_index_insert_source_definition_id(
+		with_none,
+		table,
+		source_definition_key(
+			module_id,
+			ConstructorDefinition,
+			"Some",
+			Some("Option"),
+			fixture_source_span(),
+		),
+		some_id,
+	).to_option().get_or(with_none)
+	other_id = definition_index_next_def_id(with_some)
+	complete = definition_index_insert_source_definition_id(
+		with_some,
+		table,
+		source_definition_key(
+			module_id,
+			ConstructorDefinition,
+			"Other",
+			Some("Option"),
+			fixture_source_span(),
+		),
+		other_id,
+	).to_option().get_or(with_some)
+	ctfe_context_empty(definition_index_definition_table(complete), module_id)
+
+
+private pure func none_constructor_id() -> Int:
+	definition_index_seed_next_def_id(definition_index_initial_seed(ENV_EMPTY))
+
+
+private pure func some_constructor_id() -> Int:
+	none_constructor_id() + 1
+
+
+private pure func other_constructor_id() -> Int:
+	none_constructor_id() + 2
 
 
 pure func fixture_source_file() -> SourceFile:
@@ -107,16 +172,19 @@ pure func resolved_constructor_value(
 	args: List[CtfeValue],
 	definition_id: Int,
 ) -> CtfeValue:
-	ctfe_value(option_int_type(), CtfeConstructorValue({
-			name = name,
-			args = args,
-			constructor_info = ctfe_resolved_constructor_info(
-				"Option",
-				args.length(),
-				context.module_table,
-				definition_id,
-			),
-		}), fixture_source_span())
+	match constructor_id_from_definition_table(context.definition_table, definition_id):
+		Some(constructor_id):
+			ctfe_value(option_int_type(), CtfeConstructorValue({
+					name = name,
+					args = args,
+					constructor_info = ctfe_resolved_constructor_info(
+						"Option",
+						args.length(),
+						constructor_id,
+					),
+				}), fixture_source_span())
+		None:
+			constructor_value("Invalid", args)
 
 
 pure func pattern_matches(
@@ -265,7 +333,7 @@ func test_matches_constructor_and_or_patterns() -> Bool:
 			[TypedNamePattern(ident("value"), TYPE_INT)],
 			fixture_source_span(),
 			"Option",
-			42,
+			some_constructor_id(),
 		),
 		some_value,
 	)
@@ -283,14 +351,14 @@ func test_matches_constructor_and_or_patterns() -> Bool:
 					[],
 					fixture_source_span(),
 					"Option",
-					41,
+					none_constructor_id(),
 				),
 				TypedConstructorPattern(
 					ident("Some"),
 					[TypedNamePattern(ident("value"), TYPE_INT)],
 					fixture_source_span(),
 					"Option",
-					42,
+					some_constructor_id(),
 				),
 			],
 			fixture_source_span(),
@@ -325,7 +393,7 @@ func test_matches_constructor_and_or_patterns() -> Bool:
 	constructor_ok and nullary_name_ok and or_ok
 
 
-func test_constructor_patterns_require_same_resolved_identity_domain() -> Bool:
+func test_constructor_patterns_require_same_resolved_identity() -> Bool:
 	context = ctfe_test_context()
 	foreign_context = ctfe_test_context()
 	pattern = TypedConstructorPattern(
@@ -333,17 +401,15 @@ func test_constructor_patterns_require_same_resolved_identity_domain() -> Bool:
 		[TypedNamePattern(ident("value"), TYPE_INT)],
 		fixture_source_span(),
 		"Option",
-		42,
+		some_constructor_id(),
 	)
 
-	same = resolved_constructor_value(context, "Some", [int_value(1)], 42)
-	different_id = resolved_constructor_value(context, "Some", [int_value(1)], 43)
-	different_domain = resolved_constructor_value(foreign_context, "Some", [int_value(1)], 42)
+	same = resolved_constructor_value(context, "Some", [int_value(1)], some_constructor_id())
+	different_id = resolved_constructor_value(context, "Some", [int_value(1)], other_constructor_id())
 
 	(
 		pattern_matches(context, pattern, same)
 		and not pattern_matches(context, pattern, different_id)
-		and not pattern_matches(context, pattern, different_domain)
 	)
 
 
@@ -355,7 +421,7 @@ func test_qualified_nested_patterns_keep_exact_constructor_identity() -> Bool:
 		[],
 		fixture_source_span(),
 		"Option",
-		41,
+		none_constructor_id(),
 	)
 	pattern = TypedQualifiedConstructorPattern(
 		ident("OptionModule"),
@@ -363,19 +429,19 @@ func test_qualified_nested_patterns_keep_exact_constructor_identity() -> Bool:
 		[none_pattern],
 		fixture_source_span(),
 		"Option",
-		42,
+		some_constructor_id(),
 	)
 	value = resolved_constructor_value(
 		context,
 		"Some",
-		[resolved_constructor_value(context, "None", [], 41)],
-		42,
+		[resolved_constructor_value(context, "None", [], none_constructor_id())],
+		some_constructor_id(),
 	)
 	wrong_nested = resolved_constructor_value(
 		context,
 		"Some",
-		[resolved_constructor_value(context, "None", [], 99)],
-		42,
+		[resolved_constructor_value(context, "None", [], other_constructor_id())],
+		some_constructor_id(),
 	)
 
 	pattern_matches(context, pattern, value) and not pattern_matches(context, pattern, wrong_nested)
@@ -388,7 +454,7 @@ func test_synthesized_constructor_fallback_checks_parent_and_name() -> Bool:
 		[TypedWildcardPattern(fixture_source_span())],
 		fixture_source_span(),
 		"Option",
-		42,
+		some_constructor_id(),
 	)
 	correct = constructor_value("Some", [int_value(1)])
 	wrong_name = constructor_value("Other", [int_value(1)])
@@ -412,8 +478,8 @@ tests: TestSuite = {
 		("binds tuple list and spread patterns", test_binds_tuple_list_and_spread_patterns),
 		("uses typed constructor decisions and preserves name bindings", test_matches_constructor_and_or_patterns),
 		(
-			"requires constructor identity and definition domains to match",
-			test_constructor_patterns_require_same_resolved_identity_domain,
+			"requires exact constructor identity to match",
+			test_constructor_patterns_require_same_resolved_identity,
 		),
 		(
 			"keeps exact identity in qualified nested constructor patterns",

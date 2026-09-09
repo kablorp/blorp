@@ -10,12 +10,17 @@ import:
 		module_table_count,
 		module_table_find_id_by_canonical_path,
 		module_tables_are_compatible,
+	../graph/definition_index:
+		DefinitionKind(CallableDefinitionKind),
+		DefinitionTable,
+		definition_table_definition_id,
+		definition_table_is_compatible_with_module_table,
+		definition_table_row,
 	../headers/declaration_skeleton:
 		CallableId,
 		DeclarationVisibility(PublicDeclaration),
 		callable_id_definition_id,
 		callable_id_module_id,
-		callable_id_name,
 		callable_ids_equal,
 	env: OverloadEntry, overload_entry_first_param_matches
 	list: repeat
@@ -32,6 +37,7 @@ record AcceptedCallableTableRecord {
 
 record AcceptedCallableTableInput {
 	module_table: ModuleTable,
+	definition_table: DefinitionTable,
 	callables: List[AcceptedCallableTableRecord]
 }
 
@@ -46,6 +52,7 @@ private record AcceptedCallableSlot {
 
 private record AcceptedCallableTableRep {
 	module_table: ModuleTable,
+	definition_table: DefinitionTable,
 	slots: List[AcceptedCallableSlot],
 	indices_by_definition_id: Dict[Int, List[Int]],
 	indices_by_module_and_name: List[Dict[String, List[Int]]]
@@ -91,16 +98,22 @@ private pure func authority_rep(
 
 
 private pure func entries_match_id(
+	definition_table: DefinitionTable,
 	module_table: ModuleTable,
 	item: AcceptedCallableTableRecord,
 ) -> Bool:
 	definition_id = callable_id_definition_id(item.id)
-	owner_module_path = module_table_canonical_path(module_table, callable_id_module_id(item.id))
+	definition = definition_table_definition_id(definition_table, definition_id)
+	row = definition.and_then(func(id): definition_table_row(definition_table, id))
+	owner_module_path = row.and_then(func(value):
+		module_table_canonical_path(module_table, value.module_id)
+	)
 
 	(
 		item.entry.def_id == definition_id
 		and item.entry.module_path == owner_module_path
-		and item.source_name == callable_id_name(item.id)
+		and item.source_name == row.map(func(value): value.name).get_or("")
+		and row.map(func(value): value.kind == CallableDefinitionKind).get_or(False)
 		and owner_module_path.is_some()
 	)
 
@@ -117,8 +130,16 @@ pure func accepted_callable_table(
 	)
 	var valid: Bool = True
 
+	if not definition_table_is_compatible_with_module_table(
+		input.definition_table,
+		input.module_table,
+	):
+		valid = False
+
 	for item in input.callables:
-		module_index = module_id_table_index(callable_id_module_id(item.id))
+		module_index = callable_id_module_id(input.definition_table, item.id)
+			.map(module_id_table_index)
+			.get_or(-1)
 		definition_id = callable_id_definition_id(item.id)
 		definition_indices = indices_by_definition_id.get_or(definition_id, [])
 		path_names = indices_by_module_and_name
@@ -136,7 +157,7 @@ pure func accepted_callable_table(
 
 		if (
 			duplicate
-			or not entries_match_id(input.module_table, item)
+			or not entries_match_id(input.definition_table, input.module_table, item)
 			or indices_by_module_and_name
 				.get(module_index)
 				.is_none()
@@ -167,6 +188,7 @@ pure func accepted_callable_table(
 	if valid:
 		Some(into_opaque AcceptedCallableTable({
 					module_table = input.module_table,
+					definition_table = input.definition_table,
 					slots = slots,
 					indices_by_definition_id = indices_by_definition_id,
 					indices_by_module_and_name = indices_by_module_and_name
@@ -303,10 +325,11 @@ pure func accepted_callable_authority_without_visible_names(
 
 
 private pure func owner_entry(
-	module_table: ModuleTable,
+	table: AcceptedCallableTableRep,
 	slot: AcceptedCallableSlot,
 ) -> Option[OverloadEntry]:
-	owner_module_path ?= module_table_canonical_path(module_table, callable_id_module_id(slot.id))
+	owner_module_id ?= callable_id_module_id(table.definition_table, slot.id)
+	owner_module_path ?= module_table_canonical_path(table.module_table, owner_module_id)
 
 	Some({ slot.entry |
 			func_type = localize_module_types(owner_module_path, slot.entry.func_type),
@@ -328,13 +351,11 @@ private pure func entry_at(
 ) -> Option[OverloadEntry]:
 	table = table_rep(authority.table)
 	slot ?= table.slots.get(index)
-	owner_module_path ?= module_table_canonical_path(
-		table.module_table,
-		callable_id_module_id(slot.id),
-	)
+	owner_module_id ?= callable_id_module_id(table.definition_table, slot.id)
+	owner_module_path ?= module_table_canonical_path(table.module_table, owner_module_id)
 
 	if authority.owner_module_path == Some(owner_module_path):
-		owner_entry(table.module_table, slot)
+		owner_entry(table, slot)
 	else:
 		Some(slot.entry)
 
@@ -384,16 +405,15 @@ pure func accepted_callable_find_owner_definition_id(
 		.find(func(candidate_index):
 			match table.slots.get(candidate_index):
 				Some(slot):
-					representation.owner_module_path == module_table_canonical_path(
-						table.module_table,
-						callable_id_module_id(slot.id),
-					)
+					callable_id_module_id(table.definition_table, slot.id).and_then(
+						func(module_id): module_table_canonical_path(table.module_table, module_id),
+					) == representation.owner_module_path
 				None:
 					False
 		)
 	slot ?= table.slots.get(index)
 
-	owner_entry(table.module_table, slot)
+	owner_entry(table, slot)
 
 
 pure func accepted_callable_find_qualified(

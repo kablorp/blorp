@@ -112,6 +112,7 @@ import:
 		ctfe_import_bindings_for_module_table,
 		ctfe_imported_program_decls,
 		ctfe_imported_program_import_bindings,
+		ctfe_imported_program_set,
 		selective_ctfe_imported_program,
 	../stage_07_ctfe/eval: ctfe_eval_error_message
 	../stage_07_ctfe/globals: ctfe_evaluate_program_globals
@@ -165,11 +166,15 @@ import:
 	diagnostic: TypecheckDiagnostic, typecheck_diagnostic
 	graph/definition_index:
 		DefinitionIndex,
+		DefinitionTable,
+		definition_index_definition_table,
+		definition_index_empty,
 		definition_index_func_callable_id_count,
 		definition_index_initial_seed,
 		definition_index_next_def_id,
 		definition_index_seed_next_def_id,
 		definition_index_source_definition_id_count,
+		definition_table_module_table,
 	graph/indexed_graph:
 		IndexedGraph,
 		IndexedGraphError,
@@ -297,7 +302,11 @@ import:
 			TypedArtifactScopeComplete,
 		),
 	type_system/env: ENV_EMPTY
-	typed_ast_json: emit_compiler_typed_program_json_chunks, typed_program_to_json
+	typed_ast_json:
+		emit_compiler_typed_program_json_chunks,
+		emit_compiler_typed_program_json_chunks_in_graph,
+		typed_program_to_json,
+		typed_program_to_json_in_graph,
 
 
 foreign:
@@ -502,6 +511,7 @@ private record PreparedTypecheckModule {
 
 private record PreparedTypecheckGraph {
 	module_table: ModuleTable,
+	definition_table: DefinitionTable,
 	target: PreparedTypecheckModule,
 	modules: List[PreparedTypecheckModule]
 }
@@ -789,6 +799,7 @@ pure func typechecked_module_identity(
 
 record TypecheckedGraph {
 	module_table: ModuleTable,
+	definition_table: DefinitionTable,
 	target: TypecheckedModule,
 	modules: List[TypecheckedModule],
 	next_def_id: Int,
@@ -811,6 +822,7 @@ pure func typechecked_graph_view_for_identity(
 
 	Some({
 		module_table = graph.module_table,
+		definition_table = graph.definition_table,
 		target = target,
 		modules = modules.filter(
 			func(candidate): not module_ids_equal(candidate.module_id, target_module_id),
@@ -1531,7 +1543,6 @@ private pure func ctfe_imported_program_from_accepted_module(
 				{
 					program = Some(
 						complete_ctfe_imported_program(
-							prepared_module_scope_module_table(scope),
 							prepared_module_scope_id(scope),
 							typed_result.program.decls,
 							ctfe_import_bindings,
@@ -2218,9 +2229,6 @@ private pure func prepare_selective_ctfe_dependencies_for_roots(
 													module_id = module_id,
 													program = SelectiveCtfeProgram(
 														selective_ctfe_imported_program(
-															prepared_module_scope_module_table(
-																target_scope,
-															),
 															module_id,
 															body_subset_program_decls(subset),
 															outcomes.map(
@@ -2641,7 +2649,7 @@ private pure func typecheck_ctfe_status_name(evaluated: Bool) -> String:
 
 
 private pure func evaluated_typecheck_artifact(
-	module_table: ModuleTable,
+	definition_table: DefinitionTable,
 	target_module_id: ModuleId,
 	program: TypedProgram,
 	errors: List[String],
@@ -2668,16 +2676,21 @@ private pure func evaluated_typecheck_artifact(
 			status = TypecheckCtfeEvaluated
 		}
 	else:
+		module_table = definition_table_module_table(definition_table)
+		imported_program_set = imported_programs.map(
+			func(programs): ctfe_imported_program_set(definition_table, programs),
+		)
+
 		match (
-			imported_programs,
+			imported_program_set,
 			ctfe_import_bindings_for_module_table(module_table, import_bindings),
 		):
-			(Some(programs), Some(ctfe_import_bindings)):
+			(Some(program_set), Some(ctfe_import_bindings)):
 				match ctfe_evaluate_program_globals(
-					module_table,
+					definition_table,
 					target_module_id,
 					program,
-					programs,
+					program_set,
 					ctfe_import_bindings,
 				):
 					Ok(evaluated_program):
@@ -2717,7 +2730,7 @@ private pure func typecheck_ctfe_artifact(
 	imported_programs: Option[List[CtfeImportedProgram]],
 ) -> TypecheckCtfeArtifact:
 	evaluated_typecheck_artifact(
-		prepared_module_scope_module_table(scope),
+		definition_index_definition_table(prepared_module_scope_definition_index(scope)),
 		prepared_module_scope_id(scope),
 		typed_result.program,
 		typed_result.state.errors,
@@ -2972,7 +2985,7 @@ private pure func typechecked_reusable_ctfe_module(
 		Some([])
 
 	ctfe_artifact = evaluated_typecheck_artifact(
-		prepared_module_scope_module_table(scope),
+		definition_index_definition_table(prepared_module_scope_definition_index(scope)),
 		prepared_module_scope_id(scope),
 		artifact.complete_program,
 		[],
@@ -3014,17 +3027,34 @@ private pure func typechecked_module_artifact_from_fields(
 
 private pure func typechecked_module_artifact(
 	module: TypecheckedModule,
+	module_table: ModuleTable,
+	definition_table: DefinitionTable,
 	include_comments: Bool,
 ) -> JsonValue:
-	typechecked_module_artifact_from_fields(
-		module.parsed_program,
+	typed_program_json = typed_program_to_json_in_graph(
+		module.module_id,
+		module_table,
+		definition_table,
 		module.typed_program,
-		module.module_surface,
-		module.errors,
-		module.import_bindings,
-		module.ctfe_evaluated,
-		include_comments,
 	)
+
+	var fields: List[(String, JsonValue)] = [
+		("path", JsonString(module.parsed_program.source.path)),
+		("module", JsonString(module.parsed_program.source.module_name)),
+		("ast_phase", JsonString(parsed_program_phase_name(TypecheckSourceProgram))),
+		("typed_program", typed_program_json),
+		("ctfe_status", JsonString(typecheck_ctfe_status_name(module.ctfe_evaluated))),
+		("type_errors", JsonVector(module.errors.map(
+				pure func(item: String): JsonString(item),
+			))),
+		("import_bindings", JsonVector(module.import_bindings.map(import_binding_to_json))),
+		("module_surface", module_surface_to_json(module.module_surface)),
+	]
+
+	if include_comments:
+		fields = fields.append(("comments", source_comment_jsons(module.parsed_program.source)))
+
+	JsonObject(fields)
 
 
 private func emit_json_string_list(
@@ -3099,19 +3129,39 @@ private func emit_typechecked_module_artifact_field_chunks(
 
 private func emit_typechecked_module_artifact_chunks(
 	module: TypecheckedModule,
+	module_table: ModuleTable,
+	definition_table: DefinitionTable,
 	include_comments: Bool,
 	emit: (String) -> Void,
 ) -> Void:
-	emit_typechecked_module_artifact_field_chunks(
-		module.parsed_program,
+	emit("{\"path\":")
+	emit_json_chunks(JsonString(module.parsed_program.source.path), emit)
+	emit(",\"module\":")
+	emit_json_chunks(JsonString(module.parsed_program.source.module_name), emit)
+	emit(",\"ast_phase\":")
+	emit_json_chunks(JsonString(parsed_program_phase_name(TypecheckSourceProgram)), emit)
+	emit(",\"typed_program\":")
+	emit_compiler_typed_program_json_chunks_in_graph(
+		module.module_id,
+		module_table,
+		definition_table,
 		module.typed_program,
-		module.module_surface,
-		module.errors,
-		module.import_bindings,
-		module.ctfe_evaluated,
-		include_comments,
 		emit,
 	)
+	emit(",\"ctfe_status\":")
+	emit_json_chunks(JsonString(typecheck_ctfe_status_name(module.ctfe_evaluated)), emit)
+	emit(",\"type_errors\":")
+	emit_json_string_list(module.errors, emit)
+	emit(",\"import_bindings\":")
+	emit_import_bindings(module.import_bindings, emit)
+	emit(",\"module_surface\":")
+	emit_json_chunks(module_surface_to_json(module.module_surface), emit)
+
+	if include_comments:
+		emit(",\"comments\":")
+		emit_json_chunks(source_comment_jsons(module.parsed_program.source), emit)
+
+	emit("}")
 
 
 private pure func rejected_typed_program(target: RejectedTypecheckTarget) -> TypedProgram:
@@ -3172,8 +3222,10 @@ private pure func rejected_typechecked_graph(
 		rejected_target_origin(target),
 	)
 	(module_table, module_id) = singleton_module_table(identity)
+	definition_table = definition_index_definition_table(definition_index_empty(seed, module_table))
 	{
 		module_table = module_table,
+		definition_table = definition_table,
 		target = typechecked_rejected_module_with_id(target, module_id, diagnostics),
 		modules = [],
 		next_def_id = definition_index_seed_next_def_id(seed),
@@ -3310,6 +3362,12 @@ private pure func typed_source_artifact(
 													ctfe_dependencies.modules,
 													AcceptedBodyTypecheckGraph(accepted_graph),
 													IgnoreMainName,
+												),
+												prepared_module_scope_module_table(module_scope),
+												definition_index_definition_table(
+													prepared_module_scope_definition_index(
+														module_scope,
+													),
 												),
 												include_comments,
 											)
@@ -3526,6 +3584,9 @@ private pure func prepare_typecheck_graph_from_completed_headers(
 			)
 			PreparedTypecheckGraphReady({
 				module_table = bound_module_graph_module_table(bound_graph),
+				definition_table = definition_index_definition_table(
+					prepared_module_scope_definition_index(target_scope),
+				),
 				target = prepared_typecheck_module(bound_target, typecheck_context),
 				modules = bound_modules.map(
 					func(module): prepared_typecheck_module(module, typecheck_context),
@@ -3839,6 +3900,7 @@ private func prepare_typecheck_graph_from_completed_headers_with_trace(
 			)
 			PreparedTypecheckGraphReady({
 				module_table = bound_module_graph_module_table(bound_graph),
+				definition_table = definition_index_definition_table(definition_index),
 				target = prepared_typecheck_module(bound_target, typecheck_context),
 				modules = bound_modules.map(
 					func(module): prepared_typecheck_module(module, typecheck_context),
@@ -4073,6 +4135,7 @@ pure func typecheck_graph_with_metrics(request: TypecheckGraphRequest) -> Typech
 			{
 				graph = {
 					module_table = graph.module_table,
+					definition_table = graph.definition_table,
 					target = target_result.module,
 					modules = modules,
 					next_def_id = definition_index_next_def_id(
@@ -4148,6 +4211,7 @@ private pure func typechecked_graph_from_prepared(
 		PreparedTypecheckGraphReady(graph):
 			{
 				module_table = graph.module_table,
+				definition_table = graph.definition_table,
 				target = typechecked_graph_module(
 					allow_debug_only_calls,
 					graph.target,
@@ -4199,6 +4263,7 @@ private pure func typechecked_graph_module_response(
 	prepared: PreparedTypecheckModule,
 	main_policy: MainValidationPolicy,
 ) -> String:
+	module_scope = bound_module_scope(prepared.bound_module)
 	artifact = typechecked_module_artifact(
 		typechecked_graph_module(
 			request.allow_debug_only_calls,
@@ -4206,6 +4271,8 @@ private pure func typechecked_graph_module_response(
 			False,
 			main_policy,
 		).module,
+		prepared_module_scope_module_table(module_scope),
+		definition_index_definition_table(prepared_module_scope_definition_index(module_scope)),
 		request.include_comments,
 	)
 	bridge_success_json(artifact).to_string()
@@ -4272,7 +4339,13 @@ private func emit_typechecked_graph_module_response(
 	emit("{\"schema\":")
 	emit_json_chunks(bridge_schema_json(BRIDGE_SCHEMA_VERSION), emit)
 	emit(",\"ok\":true,\"artifact\":")
-	emit_typechecked_module_artifact_chunks(typechecked, request.include_comments, emit)
+	emit_typechecked_module_artifact_chunks(
+		typechecked,
+		prepared_module_scope_module_table(module_scope),
+		definition_index_definition_table(prepared_module_scope_definition_index(module_scope)),
+		request.include_comments,
+		emit,
+	)
 	trace(ProjectionComplete, TYPECHECK_TRACE_UNINDEXED, module_path)
 	emit("}")
 	emit("\n")

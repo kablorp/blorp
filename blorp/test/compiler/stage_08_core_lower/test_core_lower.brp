@@ -30,7 +30,10 @@ import:
 	../../../src/compiler/stage_04_modules/module_table:
 		ModuleId,
 		ModuleTable,
+		module_id_table_index,
 		module_table,
+		module_table_count,
+		module_table_find_id_by_canonical_path,
 		module_table_id_at,
 		singleton_module_table,
 	../../../src/compiler/stage_06_typecheck/decl:
@@ -60,19 +63,40 @@ import:
 		TypedTypeAliasInfo,
 		TypedUnionInfo,
 		TypedUnionVariantInfo,
+	../../../src/compiler/stage_06_typecheck/graph/definition_identity:
+		SourceDefinitionKind(ConstructorDefinition),
+		func_callable_key,
+		source_definition_key,
+	../../../src/compiler/stage_06_typecheck/graph/definition_index:
+		DefinitionIndex,
+		DefinitionTable,
+		definition_index_definition_table,
+		definition_index_empty,
+		definition_index_initial_seed,
+		definition_index_insert_func_callable_id,
+		definition_index_insert_source_definition_id,
+		definition_index_next_def_id,
+	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
+		CallableId,
+		ConstructorId,
+		callable_id_definition_id,
+		callable_id_from_definition_table,
+		callable_id_from_reserved_graph_definition,
+		constructor_id_definition_id,
+		constructor_id_from_definition_table,
 	../../../src/compiler/stage_06_typecheck/infer:
-		CallableOrigin(
-			CallableBuiltin,
-			CallableConstructor,
-			CallableForeign,
-			CallableImported,
-			CallableImportedUnresolved,
-			CallableImplMethod,
-			CallableLocal,
-		),
 		ExprTypeOrigin(SynthesizedOrigin),
 		ResolvedCallInfo,
-		ResolvedCallTarget(ResolvedClosureCall, ResolvedDirectCall, ResolvedIntrinsicCall),
+		ResolvedCallTarget(
+			ResolvedClosureCall,
+			ResolvedCompilerBuiltinCall,
+			ResolvedConstructorCall,
+			ResolvedGraphCallableCall,
+			ResolvedIntrinsicCall,
+			ResolvedSelectedTraitMethodCall,
+			ResolvedUnresolvedTraitMethodCall,
+		),
+		ResolvedGraphCallableCategory(ResolvedForeignFunctionCall, ResolvedSourceFunctionCall),
 		TypedAssignScope(LocalAssignScope),
 		TypedConcurrentBinding,
 		TypedConcurrentParam,
@@ -137,7 +161,9 @@ import:
 		TypedVarDeclPayload,
 		TypedWithBinding,
 		TypedWithErrorMap,
+		typed_expr_value_type,
 	../../../src/compiler/stage_06_typecheck/type_system/env:
+		ENV_EMPTY,
 		FieldDecl,
 		Purity(Pure),
 		ResourceArgPolicy(RejectResourceArgs),
@@ -182,8 +208,12 @@ import:
 		core_ufcs_name_from_prefix,
 		core_ufcs_source_name_for_module,
 	../../../src/compiler/stage_08_core_lower/lower:
+		CoreLowerCallableName,
+		CoreLowerCallableNameRegistry(CoreLowerPreparedCallableNames),
+		CoreLowerContext,
 		CoreLowerError(CoreLowerInvalidCall, CoreLowerInvalidType, CoreLowerUnsupported),
 		core_lower_context,
+		core_lower_context_with_callable_names,
 		core_lower_type,
 		core_source_loc,
 		lower_typed_decl,
@@ -296,6 +326,7 @@ import:
 		source_cursor_at,
 		source_file,
 		source_span,
+	list: repeat
 	test: TestSuite
 
 
@@ -335,6 +366,262 @@ pure func fixture_source_span() -> SourceSpan:
 	source_span(src, start, finish)
 
 
+private record CoreResolvedCallFixture {
+	module_table: ModuleTable,
+	definition_table: DefinitionTable,
+	current_module_id: ModuleId,
+	callable_names: CoreLowerCallableNameRegistry,
+	main: CallableId,
+	test_callback: CallableId,
+	add_one: CallableId,
+	field: CallableId,
+	owned_json: CallableId,
+	map: CallableId,
+	option_to_result: CallableId,
+	list_external_add: CallableId,
+	math_external_add: CallableId,
+	display_show_int: CallableId,
+	display_display: CallableId,
+	foreign_puts: CallableId,
+	tree_leaf: ConstructorId,
+	option_some: ConstructorId
+}
+
+
+private pure func insert_core_test_callable(
+	index: DefinitionIndex,
+	table: ModuleTable,
+	module_id: ModuleId,
+	name: String,
+) -> Option[(DefinitionIndex, Int)]:
+	definition_id = definition_index_next_def_id(index)
+	updated ?= definition_index_insert_func_callable_id(
+		index,
+		table,
+		func_callable_key(module_id, name, fixture_source_span()),
+		definition_id,
+	).to_option()
+	Some((updated, definition_id))
+
+
+private pure func insert_core_test_constructor(
+	index: DefinitionIndex,
+	table: ModuleTable,
+	module_id: ModuleId,
+	owner: String,
+	name: String,
+) -> Option[(DefinitionIndex, Int)]:
+	definition_id = definition_index_next_def_id(index)
+	updated ?= definition_index_insert_source_definition_id(
+		index,
+		table,
+		source_definition_key(
+			module_id,
+			ConstructorDefinition,
+			name,
+			Some(owner),
+			fixture_source_span(),
+		),
+		definition_id,
+	).to_option()
+	Some((updated, definition_id))
+
+
+private pure func core_test_callable_names(
+	module_table: ModuleTable,
+	entries: List[(ModuleId, Int, String, String)],
+) -> CoreLowerCallableNameRegistry:
+	var names_by_module: List[Dict[Int, CoreLowerCallableName]] = repeat(
+		{},
+		module_table_count(module_table),
+	)
+
+	for entry in entries:
+		module_index = module_id_table_index(entry[0])
+		module_names = names_by_module.get_or(module_index, {})
+		names_by_module = names_by_module.set(
+			module_index,
+			module_names.set(
+				entry[1],
+				{
+					source_name = entry[2],
+					ufcs_name = entry[3]
+				},
+			),
+		)
+
+	CoreLowerPreparedCallableNames(module_table, names_by_module)
+
+
+private pure func core_resolved_call_fixture() -> Option[CoreResolvedCallFixture]:
+	paths = ["test", "option", "list", "math", "display", "ffi"]
+	identities = paths.map(func(path): resolved_module_identity_from_resolver(path, UserModule))
+	table ?= module_table(identities).to_option()
+	test_module ?= module_table_find_id_by_canonical_path(table, "test")
+	option_module ?= module_table_find_id_by_canonical_path(table, "option")
+	list_module ?= module_table_find_id_by_canonical_path(table, "list")
+	math_module ?= module_table_find_id_by_canonical_path(table, "math")
+	display_module ?= module_table_find_id_by_canonical_path(table, "display")
+	ffi_module ?= module_table_find_id_by_canonical_path(table, "ffi")
+	var index = definition_index_empty(definition_index_initial_seed(ENV_EMPTY), table)
+	var entries: List[(ModuleId, Int, String, String)] = []
+
+	main_result ?= insert_core_test_callable(index, table, test_module, "main")
+	index = main_result[0]
+	main_raw = main_result[1]
+	entries = entries.append((test_module, main_raw, "main", "main"))
+	callback_result ?= insert_core_test_callable(index, table, test_module, "test_callback")
+	index = callback_result[0]
+	callback_raw = callback_result[1]
+	entries = entries.append((test_module, callback_raw, "test_callback", "test_callback"))
+	add_one_result ?= insert_core_test_callable(index, table, test_module, "add_one")
+	index = add_one_result[0]
+	add_one_raw = add_one_result[1]
+	entries = entries.append((test_module, add_one_raw, "add_one", "add_one"))
+	field_result ?= insert_core_test_callable(index, table, test_module, "field")
+	index = field_result[0]
+	field_raw = field_result[1]
+	entries = entries.append((test_module, field_raw, "field", "field"))
+	owned_json_result ?= insert_core_test_callable(index, table, test_module, "owned_json")
+	index = owned_json_result[0]
+	owned_json_raw = owned_json_result[1]
+	entries = entries.append((test_module, owned_json_raw, "owned_json", "owned_json"))
+	map_result ?= insert_core_test_callable(index, table, test_module, "__ufcs_map")
+	index = map_result[0]
+	map_raw = map_result[1]
+	entries = entries.append((test_module, map_raw, "__ufcs_map", "__ufcs_map"))
+	option_result ?= insert_core_test_callable(index, table, option_module, "to_result")
+	index = option_result[0]
+	option_raw = option_result[1]
+	option_ufcs = core_ufcs_function_name("option", "to_result")
+	entries = entries.append((option_module, option_raw, "to_result", option_ufcs))
+	list_result ?= insert_core_test_callable(index, table, list_module, "external_add")
+	index = list_result[0]
+	list_raw = list_result[1]
+	list_ufcs = core_ufcs_function_name("list", "external_add")
+	entries = entries.append((list_module, list_raw, "external_add", list_ufcs))
+	math_result ?= insert_core_test_callable(index, table, math_module, "external_add")
+	index = math_result[0]
+	math_raw = math_result[1]
+	math_ufcs = core_ufcs_function_name("math", "external_add")
+	entries = entries.append((math_module, math_raw, "external_add", math_ufcs))
+	show_result ?= insert_core_test_callable(index, table, display_module, "show_int")
+	index = show_result[0]
+	show_raw = show_result[1]
+	show_ufcs = core_ufcs_function_name("display", "show_int")
+	entries = entries.append((display_module, show_raw, "show_int", show_ufcs))
+	display_result ?= insert_core_test_callable(index, table, display_module, "display")
+	index = display_result[0]
+	display_raw = display_result[1]
+	display_ufcs = core_ufcs_function_name("display", "display")
+	entries = entries.append((display_module, display_raw, "display", display_ufcs))
+	puts_result ?= insert_core_test_callable(index, table, ffi_module, "puts")
+	index = puts_result[0]
+	puts_raw = puts_result[1]
+	entries = entries.append((ffi_module, puts_raw, "puts", "puts"))
+	leaf_result ?= insert_core_test_constructor(index, table, test_module, "Tree", "Leaf")
+	index = leaf_result[0]
+	leaf_raw = leaf_result[1]
+	some_result ?= insert_core_test_constructor(index, table, option_module, "Option", "Some")
+	index = some_result[0]
+	some_raw = some_result[1]
+	definitions = definition_index_definition_table(index)
+	main_id ?= callable_id_from_definition_table(definitions, main_raw)
+	callback_id ?= callable_id_from_definition_table(definitions, callback_raw)
+	add_one_id ?= callable_id_from_definition_table(definitions, add_one_raw)
+	field_id ?= callable_id_from_definition_table(definitions, field_raw)
+	owned_json_id ?= callable_id_from_definition_table(definitions, owned_json_raw)
+	map_id ?= callable_id_from_definition_table(definitions, map_raw)
+	option_id ?= callable_id_from_definition_table(definitions, option_raw)
+	list_id ?= callable_id_from_definition_table(definitions, list_raw)
+	math_id ?= callable_id_from_definition_table(definitions, math_raw)
+	show_id ?= callable_id_from_definition_table(definitions, show_raw)
+	display_id ?= callable_id_from_definition_table(definitions, display_raw)
+	puts_id ?= callable_id_from_definition_table(definitions, puts_raw)
+	leaf_id ?= constructor_id_from_definition_table(definitions, leaf_raw)
+	some_id ?= constructor_id_from_definition_table(definitions, some_raw)
+
+	Some({
+		module_table = table,
+		definition_table = definitions,
+		current_module_id = test_module,
+		callable_names = core_test_callable_names(table, entries),
+		main = main_id,
+		test_callback = callback_id,
+		add_one = add_one_id,
+		field = field_id,
+		owned_json = owned_json_id,
+		map = map_id,
+		option_to_result = option_id,
+		list_external_add = list_id,
+		math_external_add = math_id,
+		display_show_int = show_id,
+		display_display = display_id,
+		foreign_puts = puts_id,
+		tree_leaf = leaf_id,
+		option_some = some_id,
+	})
+
+
+private pure func lower_core_test_expr_with_context(
+	context: CoreLowerContext,
+	expr: TypedExpr,
+) -> Result[CoreExpr, CoreLowerError]:
+	value_type = typed_expr_value_type(expr)
+	function_info: TypedFunctionInfo = {
+		decl = parsed_function_decl(),
+		callable_id = None,
+		effective_type_params = [],
+		param_types = [int_type()],
+		source_return_type = Some(value_type),
+		semantic_return_type = value_type,
+		body = Some(expr)
+	}
+	program: TypedProgram = {
+		source = fixture_source_file(),
+		decls = [TypedFunctionDecl(function_info)],
+		diagnostics = [],
+		type_definitions = [],
+		type_references = []
+	}
+	lowered ?= lower_typed_program(context, program)
+
+	match lowered.program.decls:
+		[FunctionDecl(info)]:
+			match info.body:
+				Some(body):
+					Ok(body)
+				None:
+					Err(CoreLowerUnsupported("test function body was not lowered"))
+		_:
+			Err(CoreLowerUnsupported("test program did not lower one function"))
+
+
+private pure func lower_core_test_expr(
+	fixture: CoreResolvedCallFixture,
+	expr: TypedExpr,
+) -> Result[CoreExpr, CoreLowerError]:
+	lower_core_test_expr_with_context(
+		core_lower_context_with_callable_names(
+			0,
+			None,
+			fixture.definition_table,
+			fixture.current_module_id,
+			fixture.callable_names,
+		),
+		expr,
+	)
+
+
+private pure func empty_core_definition_table(module_table: ModuleTable) -> DefinitionTable:
+	definition_index_definition_table(
+		definition_index_empty(
+			definition_index_initial_seed(ENV_EMPTY),
+			module_table,
+		),
+	)
+
+
 pure func ident(text: String) -> ParsedIdentifier:
 	parsed_identifier(text, fixture_source_span())
 
@@ -371,12 +658,12 @@ pure func main_function_type() -> SemanticType:
 	semantic_function_type(True, [type_list(TYPE_STRING)], int_type())
 
 
-pure func main_resolved_call_info() -> ResolvedCallInfo:
+pure func main_resolved_call_info(callable_id: CallableId) -> ResolvedCallInfo:
 	{
 		callee_name = "main",
 		source_name = "main",
 		purity = Pure,
-		target = ResolvedDirectCall(10, CallableLocal),
+		target = ResolvedGraphCallableCall(callable_id, ResolvedSourceFunctionCall),
 		trait_identity = None,
 		bound_type_params = [],
 		debug_only = False,
@@ -953,21 +1240,23 @@ func test_lowers_ufcs_identifier_suffix_to_def_id() -> Bool:
 			False
 
 
-func test_lowers_resolved_function_value_with_callable_id() -> Bool:
+private pure func lowers_resolved_function_value_with_callable_id(
+	fixture: CoreResolvedCallFixture,
+) -> Bool:
 	resolved = resolved_call_info(
 		"test_callback",
-		ResolvedDirectCall(78, CallableLocal),
+		ResolvedGraphCallableCall(fixture.test_callback, ResolvedSourceFunctionCall),
 	)
 	expr = TypedNameExpr(
 		ident("test_callback"),
 		expr_info_with_resolved(function_type(), resolved),
 	)
 
-	match lower_typed_expr(expr):
+	match lower_core_test_expr(fixture, expr):
 		Ok(VarExpr(variable, typ, _)):
 			(
 				variable.name == "test_callback"
-				and variable.def_id == Some(78)
+				and variable.def_id == Some(callable_id_definition_id(fixture.test_callback))
 				and core_type_to_json(
 					typ,
 				).to_string() == core_type_to_json(core_function_type()).to_string()
@@ -976,10 +1265,20 @@ func test_lowers_resolved_function_value_with_callable_id() -> Bool:
 			False
 
 
-func test_lowers_resolved_constructor_value_with_constructor_id() -> Bool:
+func test_lowers_resolved_function_value_with_callable_id() -> Bool:
+	match core_resolved_call_fixture():
+		Some(fixture):
+			lowers_resolved_function_value_with_callable_id(fixture)
+		None:
+			False
+
+
+private pure func lowers_resolved_constructor_value_with_constructor_id(
+	fixture: CoreResolvedCallFixture,
+) -> Bool:
 	resolved = resolved_call_info(
 		"Leaf",
-		ResolvedDirectCall(79, CallableConstructor("Tree")),
+		ResolvedConstructorCall(fixture.tree_leaf, "Tree"),
 	)
 	expr = TypedNameExpr(
 		ident("Leaf"),
@@ -989,16 +1288,24 @@ func test_lowers_resolved_constructor_value_with_constructor_id() -> Bool:
 		),
 	)
 
-	match lower_typed_expr(expr):
+	match lower_core_test_expr(fixture, expr):
 		Ok(VarExpr(variable, typ, _)):
 			(
 				variable.name == "Leaf"
-				and variable.def_id == Some(79)
+				and variable.def_id == Some(constructor_id_definition_id(fixture.tree_leaf))
 				and core_type_to_json(
 					typ,
 				).to_string() == core_type_to_json(NamedType("Tree", [])).to_string()
 			)
 		_:
+			False
+
+
+func test_lowers_resolved_constructor_value_with_constructor_id() -> Bool:
+	match core_resolved_call_fixture():
+		Some(fixture):
+			lowers_resolved_constructor_value_with_constructor_id(fixture)
+		None:
 			False
 
 
@@ -1027,14 +1334,15 @@ func test_lowers_binary_expression() -> Bool:
 
 
 func direct_call_lowers_to_selected_direct_call(
+	fixture: CoreResolvedCallFixture,
 	callee_name: String,
-	callable_id: Int,
-	origin: CallableOrigin,
+	callable_id: CallableId,
+	category: ResolvedGraphCallableCategory,
 ) -> Bool:
 	callee = TypedNameExpr(ident(callee_name), expr_info(function_type()))
 	resolved = resolved_call_info(
 		callee_name,
-		ResolvedDirectCall(callable_id, origin),
+		ResolvedGraphCallableCall(callable_id, category),
 	)
 	expr = TypedCallExpr(
 		callee,
@@ -1043,31 +1351,120 @@ func direct_call_lowers_to_selected_direct_call(
 		expr_info_with_resolved(int_type(), resolved),
 	)
 
-	match lower_typed_expr(expr):
+	match lower_core_test_expr(fixture, expr):
 		Ok(CallExpr(SelectedDirectCall(def_id), lowered_callee, args, typ, _)):
-			def_id == callable_id and args.length() == 1 and core_exprs_equal(
-				lowered_callee,
-				VarExpr(
-					{
-						name = callee_name,
-						uniq = 0,
-						def_id = None
-					},
-					core_function_type(),
-					core_source_loc(fixture_source_span()),
-				),
-			) and core_type_to_json(
-				typ,
-			).to_string() == core_type_to_json(core_int_type()).to_string()
+			(
+				def_id == callable_id_definition_id(callable_id)
+				and args.length() == 1
+				and core_exprs_equal(
+					lowered_callee,
+					VarExpr(
+						{
+							name = callee_name,
+							uniq = 0,
+							def_id = None
+						},
+						core_function_type(),
+						core_source_loc(fixture_source_span()),
+					),
+				)
+				and core_type_to_json(
+					typ,
+				).to_string() == core_type_to_json(core_int_type()).to_string()
+			)
 		_:
 			False
 
 
 func test_lowers_resolved_local_direct_call() -> Bool:
-	direct_call_lowers_to_selected_direct_call("add_one", 88, CallableLocal)
+	match core_resolved_call_fixture():
+		Some(fixture):
+			direct_call_lowers_to_selected_direct_call(
+				fixture,
+				"add_one",
+				fixture.add_one,
+				ResolvedSourceFunctionCall,
+			)
+		None:
+			False
 
 
-func test_does_not_apply_inner_direct_identity_to_returned_function_call() -> Bool:
+private pure func rejects_definition_backed_call_outside_core_table(
+	fixture: CoreResolvedCallFixture,
+) -> Bool:
+	empty_definitions = empty_core_definition_table(fixture.module_table)
+	context = core_lower_context_with_callable_names(
+		0,
+		None,
+		empty_definitions,
+		fixture.current_module_id,
+		core_test_callable_names(fixture.module_table, []),
+	)
+	resolved = resolved_call_info(
+		"add_one",
+		ResolvedGraphCallableCall(fixture.add_one, ResolvedSourceFunctionCall),
+	)
+	expr = TypedCallExpr(
+		TypedNameExpr(ident("add_one"), expr_info(function_type())),
+		[int_expr("5")],
+		fixture_source_span(),
+		expr_info_with_resolved(int_type(), resolved),
+	)
+
+	match lower_core_test_expr_with_context(context, expr):
+		Err(CoreLowerInvalidCall(message)):
+			expected_id = callable_id_definition_id(fixture.add_one)
+			message == "graph callable ${expected_id} 'add_one' is outside the canonical definition table"
+		Ok(_):
+			False
+		_:
+			False
+
+
+func test_rejects_definition_backed_call_outside_core_table() -> Bool:
+	match core_resolved_call_fixture():
+		Some(fixture):
+			rejects_definition_backed_call_outside_core_table(fixture)
+		None:
+			False
+
+
+private pure func rejects_definition_backed_call_with_wrong_kind(
+	fixture: CoreResolvedCallFixture,
+) -> Bool:
+	wrong_kind = callable_id_from_reserved_graph_definition(
+		constructor_id_definition_id(fixture.tree_leaf),
+	)
+	resolved = resolved_call_info(
+		"Leaf",
+		ResolvedGraphCallableCall(wrong_kind, ResolvedSourceFunctionCall),
+	)
+	expr = TypedCallExpr(
+		TypedNameExpr(ident("Leaf"), expr_info(function_type())),
+		[int_expr("5")],
+		fixture_source_span(),
+		expr_info_with_resolved(int_type(), resolved),
+	)
+
+	match lower_core_test_expr(fixture, expr):
+		Err(CoreLowerInvalidCall(message)):
+			expected_id = callable_id_definition_id(wrong_kind)
+			message == "graph callable ${expected_id} 'Leaf' is outside the canonical definition table"
+		_:
+			False
+
+
+func test_rejects_definition_backed_call_with_wrong_kind() -> Bool:
+	match core_resolved_call_fixture():
+		Some(fixture):
+			rejects_definition_backed_call_with_wrong_kind(fixture)
+		None:
+			False
+
+
+private pure func does_not_apply_inner_direct_identity_to_returned_function_call(
+	fixture: CoreResolvedCallFixture,
+) -> Bool:
 	factory = TypedNameExpr(ident("field"), expr_info(function_type()))
 	factory_call = TypedCallExpr(
 		factory,
@@ -1077,7 +1474,7 @@ func test_does_not_apply_inner_direct_identity_to_returned_function_call() -> Bo
 			function_type(),
 			resolved_call_info(
 				"field",
-				ResolvedDirectCall(199, CallableLocal),
+				ResolvedGraphCallableCall(fixture.field, ResolvedSourceFunctionCall),
 			),
 		),
 	)
@@ -1089,15 +1486,15 @@ func test_does_not_apply_inner_direct_identity_to_returned_function_call() -> Bo
 			int_type(),
 			resolved_call_info(
 				"field",
-				ResolvedDirectCall(199, CallableLocal),
+				ResolvedGraphCallableCall(fixture.field, ResolvedSourceFunctionCall),
 			),
 		),
 	)
 
-	match lower_typed_expr(expr):
+	match lower_core_test_expr(fixture, expr):
 		Ok(CallExpr(UnknownCall, CallExpr(SelectedDirectCall(def_id), _, _, _, _), args, typ, _)):
 			(
-				def_id == 199
+				def_id == callable_id_definition_id(fixture.field)
 				and args.length() == 1
 				and core_type_to_json(
 					typ,
@@ -1107,67 +1504,103 @@ func test_does_not_apply_inner_direct_identity_to_returned_function_call() -> Bo
 			False
 
 
-func test_lowers_local_function_reference_with_callable_id() -> Bool:
-	resolved = resolved_call_info(
-		"owned_json",
-		ResolvedDirectCall(7444, CallableLocal),
-	)
-	expr = TypedNameExpr(
-		ident("owned_json"),
-		expr_info_with_resolved(function_type(), resolved),
-	)
-
-	match lower_typed_expr(expr):
-		Ok(VarExpr(variable, _, _)):
-			variable.name == "owned_json" and variable.def_id == Some(7444)
-		_:
+func test_does_not_apply_inner_direct_identity_to_returned_function_call() -> Bool:
+	match core_resolved_call_fixture():
+		Some(fixture):
+			does_not_apply_inner_direct_identity_to_returned_function_call(fixture)
+		None:
 			False
 
 
-func test_lowers_imported_function_reference_with_callable_id() -> Bool:
+func test_lowers_local_function_reference_with_callable_id() -> Bool:
+	match core_resolved_call_fixture():
+		Some(fixture):
+			resolved = resolved_call_info(
+				"owned_json",
+				ResolvedGraphCallableCall(fixture.owned_json, ResolvedSourceFunctionCall),
+			)
+			expr = TypedNameExpr(
+				ident("owned_json"),
+				expr_info_with_resolved(function_type(), resolved),
+			)
+
+			match lower_core_test_expr(fixture, expr):
+				Ok(VarExpr(variable, _, _)):
+					(
+						variable.name == "owned_json"
+						and variable.def_id == Some(callable_id_definition_id(fixture.owned_json))
+					)
+				_:
+					False
+		None:
+			False
+
+
+private pure func lowers_imported_function_reference_with_callable_id(
+	fixture: CoreResolvedCallFixture,
+) -> Bool:
 	resolved = resolved_call_info(
 		"to_result",
-		ResolvedDirectCall(2180, CallableImportedUnresolved("option")),
+		ResolvedGraphCallableCall(fixture.option_to_result, ResolvedSourceFunctionCall),
 	)
 	expr = TypedNameExpr(
 		ident("to_result"),
 		expr_info_with_resolved(function_type(), resolved),
 	)
 
-	match lower_typed_expr(expr):
+	match lower_core_test_expr(fixture, expr):
 		Ok(VarExpr(variable, _, _)):
-			variable.name == "__ufcs_option__to_result" and variable.def_id == Some(2180)
+			(
+				variable.name == "__ufcs_option__to_result"
+				and variable.def_id == Some(callable_id_definition_id(fixture.option_to_result))
+			)
 		_:
 			False
 
 
-func test_rejects_conflicting_function_reference_ids() -> Bool:
+func test_lowers_imported_function_reference_with_callable_id() -> Bool:
+	match core_resolved_call_fixture():
+		Some(fixture):
+			lowers_imported_function_reference_with_callable_id(fixture)
+		None:
+			False
+
+
+private pure func rejects_conflicting_function_reference_ids(
+	fixture: CoreResolvedCallFixture,
+) -> Bool:
+	encoded_id = callable_id_definition_id(fixture.map) + 1
 	resolved = resolved_call_info(
 		"__ufcs_map",
-		ResolvedDirectCall(78, CallableLocal),
+		ResolvedGraphCallableCall(fixture.map, ResolvedSourceFunctionCall),
 	)
 	expr = TypedNameExpr(
-		ident("__ufcs_map#77"),
+		ident("__ufcs_map#" + encoded_id.to_string()),
 		expr_info_with_resolved(function_type(), resolved),
 	)
 
-	match lower_typed_expr(expr):
+	match lower_core_test_expr(fixture, expr):
 		Err(CoreLowerInvalidCall(message)):
 			message.contains("conflicting callable ids")
 		_:
 			False
 
 
+func test_rejects_conflicting_function_reference_ids() -> Bool:
+	match core_resolved_call_fixture():
+		Some(fixture):
+			rejects_conflicting_function_reference_ids(fixture)
+		None:
+			False
+
+
 func direct_call_lowers_to_unknown_call(
+	fixture: CoreResolvedCallFixture,
 	callee_name: String,
-	callable_id: Int,
-	origin: CallableOrigin,
+	target: ResolvedCallTarget,
 ) -> Bool:
 	callee = TypedNameExpr(ident(callee_name), expr_info(function_type()))
-	resolved = resolved_call_info(
-		callee_name,
-		ResolvedDirectCall(callable_id, origin),
-	)
+	resolved = resolved_call_info(callee_name, target)
 	expr = TypedCallExpr(
 		callee,
 		[int_expr("5")],
@@ -1175,7 +1608,7 @@ func direct_call_lowers_to_unknown_call(
 		expr_info_with_resolved(int_type(), resolved),
 	)
 
-	match lower_typed_expr(expr):
+	match lower_core_test_expr(fixture, expr):
 		Ok(CallExpr(UnknownCall, _, args, typ, _)):
 			(
 				args.length() == 1
@@ -1187,11 +1620,13 @@ func direct_call_lowers_to_unknown_call(
 			False
 
 
-func test_lowers_resolved_imported_direct_call_with_explicit_identity() -> Bool:
+private pure func lowers_resolved_imported_direct_call_with_explicit_identity(
+	fixture: CoreResolvedCallFixture,
+) -> Bool:
 	callee = TypedNameExpr(ident("external_add"), expr_info(function_type()))
 	resolved = resolved_call_info(
 		"external_add",
-		ResolvedDirectCall(92, CallableImportedUnresolved("list")),
+		ResolvedGraphCallableCall(fixture.list_external_add, ResolvedSourceFunctionCall),
 	)
 	expr = TypedCallExpr(
 		callee,
@@ -1200,10 +1635,10 @@ func test_lowers_resolved_imported_direct_call_with_explicit_identity() -> Bool:
 		expr_info_with_resolved(int_type(), resolved),
 	)
 
-	match lower_typed_expr(expr):
+	match lower_core_test_expr(fixture, expr):
 		Ok(CallExpr(SelectedDirectCall(def_id), VarExpr(variable, _, _), args, typ, _)):
 			(
-				def_id == 92
+				def_id == callable_id_definition_id(fixture.list_external_add)
 				and variable.name == "__ufcs_list__external_add"
 				and args.length() == 1
 				and core_type_to_json(
@@ -1214,7 +1649,17 @@ func test_lowers_resolved_imported_direct_call_with_explicit_identity() -> Bool:
 			False
 
 
-func test_lowers_qualified_imported_direct_call_with_explicit_identity() -> Bool:
+func test_lowers_resolved_imported_direct_call_with_explicit_identity() -> Bool:
+	match core_resolved_call_fixture():
+		Some(fixture):
+			lowers_resolved_imported_direct_call_with_explicit_identity(fixture)
+		None:
+			False
+
+
+private pure func lowers_qualified_imported_direct_call_with_explicit_identity(
+	fixture: CoreResolvedCallFixture,
+) -> Bool:
 	module_receiver = TypedNameExpr(ident("StdList"), expr_info(SemanticNamedType("Module", [])))
 	callee = TypedFieldAccessExpr(
 		module_receiver,
@@ -1224,7 +1669,7 @@ func test_lowers_qualified_imported_direct_call_with_explicit_identity() -> Bool
 	)
 	resolved = { resolved_call_info(
 		"StdList.external_add",
-		ResolvedDirectCall(92, CallableImportedUnresolved("list")),
+		ResolvedGraphCallableCall(fixture.list_external_add, ResolvedSourceFunctionCall),
 	) | source_name = "external_add" }
 	expr = TypedCallExpr(
 		callee,
@@ -1233,17 +1678,29 @@ func test_lowers_qualified_imported_direct_call_with_explicit_identity() -> Bool
 		expr_info_with_resolved(int_type(), resolved),
 	)
 
-	match lower_typed_expr(expr):
+	match lower_core_test_expr(fixture, expr):
 		Ok(CallExpr(SelectedDirectCall(def_id), VarExpr(variable, _, _), args, _, _)):
-			def_id == 92 and variable.name == "__ufcs_list__external_add" and args.length() == 1
+			(
+				def_id == callable_id_definition_id(fixture.list_external_add)
+				and variable.name == "__ufcs_list__external_add"
+				and args.length() == 1
+			)
 		_:
 			False
 
 
-func test_lowers_resolved_imported_direct_call() -> Bool:
+func test_lowers_qualified_imported_direct_call_with_explicit_identity() -> Bool:
+	match core_resolved_call_fixture():
+		Some(fixture):
+			lowers_qualified_imported_direct_call_with_explicit_identity(fixture)
+		None:
+			False
+
+
+private pure func lowers_resolved_imported_direct_call(fixture: CoreResolvedCallFixture) -> Bool:
 	resolved = resolved_call_info(
 		"external_add",
-		ResolvedDirectCall(92, CallableImportedUnresolved("math")),
+		ResolvedGraphCallableCall(fixture.math_external_add, ResolvedSourceFunctionCall),
 	)
 	callee = TypedNameExpr(ident("external_add"), expr_info(function_type()))
 	expr = TypedCallExpr(
@@ -1253,10 +1710,10 @@ func test_lowers_resolved_imported_direct_call() -> Bool:
 		expr_info_with_resolved(int_type(), resolved),
 	)
 
-	match lower_typed_expr(expr):
+	match lower_core_test_expr(fixture, expr):
 		Ok(CallExpr(SelectedDirectCall(def_id), VarExpr(variable, _, _), args, _, _)):
 			(
-				def_id == 92
+				def_id == callable_id_definition_id(fixture.math_external_add)
 				and variable.name == "__ufcs_math__external_add"
 				and variable.def_id.is_none()
 				and args.length() == 1
@@ -1265,20 +1722,29 @@ func test_lowers_resolved_imported_direct_call() -> Bool:
 			False
 
 
+func test_lowers_resolved_imported_direct_call() -> Bool:
+	match core_resolved_call_fixture():
+		Some(fixture):
+			lowers_resolved_imported_direct_call(fixture)
+		None:
+			False
+
+
 func test_lowers_resolved_constructor_direct_call_as_unknown() -> Bool:
-	direct_call_lowers_to_unknown_call("Some", 93, CallableConstructor("Option"))
-
-
-func test_lowers_resolved_impl_method_direct_call() -> Bool:
-	direct_call_lowers_to_selected_direct_call("show_int", 94, CallableImplMethod)
+	match core_resolved_call_fixture():
+		Some(fixture):
+			direct_call_lowers_to_unknown_call(
+				fixture,
+				"Some",
+				ResolvedConstructorCall(fixture.option_some, "Option"),
+			)
+		None:
+			False
 
 
 func test_lowers_deferred_trait_method_call_with_dispatch_identity() -> Bool:
 	callee = TypedNameExpr(ident("to_string"), expr_info(function_type()))
-	resolved = resolved_call_info(
-		"to_string",
-		ResolvedTraitMethodCall("Stringable", None),
-	)
+	resolved = resolved_call_info("to_string", ResolvedUnresolvedTraitMethodCall("Stringable"))
 	expr = TypedCallExpr(
 		callee,
 		[int_expr("5")],
@@ -1300,16 +1766,13 @@ func test_lowers_deferred_trait_method_call_with_dispatch_identity() -> Bool:
 			False
 
 
-func test_lowers_selected_trait_method_call_with_dispatch_identity() -> Bool:
-	domain = singleton_module_table(resolved_module_identity_from_resolver("display", UserModule))
+private pure func lowers_selected_trait_method_call_with_dispatch_identity(
+	fixture: CoreResolvedCallFixture,
+) -> Bool:
 	callee = TypedNameExpr(ident("display"), expr_info(function_type()))
 	resolved = resolved_call_info(
 		"display",
-		ResolvedTraitMethodCall("Display", Some({
-				callable_id = 94,
-				module_id = domain[1],
-				module_path = "display",
-			})),
+		ResolvedSelectedTraitMethodCall("Display", fixture.display_display),
 	)
 	expr = TypedCallExpr(
 		callee,
@@ -1318,13 +1781,13 @@ func test_lowers_selected_trait_method_call_with_dispatch_identity() -> Bool:
 		expr_info_with_resolved(int_type(), resolved),
 	)
 
-	match lower_typed_expr(expr):
+	match lower_core_test_expr(fixture, expr):
 		Ok(CallExpr(SelectedTraitCall(trait_name, method_name, module_path, def_id), VarExpr(variable, _, _), args, _, _)):
 			(
 				trait_name == "Display"
 				and method_name == "display"
 				and module_path == "display"
-				and def_id == 94
+				and def_id == callable_id_definition_id(fixture.display_display)
 				and variable.name == "__ufcs_display__display"
 				and args.length() == 1
 			)
@@ -1332,8 +1795,24 @@ func test_lowers_selected_trait_method_call_with_dispatch_identity() -> Bool:
 			False
 
 
+func test_lowers_selected_trait_method_call_with_dispatch_identity() -> Bool:
+	match core_resolved_call_fixture():
+		Some(fixture):
+			lowers_selected_trait_method_call_with_dispatch_identity(fixture)
+		None:
+			False
+
+
 func test_lowers_resolved_foreign_direct_call_as_unknown() -> Bool:
-	direct_call_lowers_to_unknown_call("puts", 95, CallableForeign)
+	match core_resolved_call_fixture():
+		Some(fixture):
+			direct_call_lowers_to_unknown_call(
+				fixture,
+				"puts",
+				ResolvedGraphCallableCall(fixture.foreign_puts, ResolvedForeignFunctionCall),
+			)
+		None:
+			False
 
 
 func test_lowers_non_reflection_intrinsic_call_as_unknown() -> Bool:
@@ -1383,10 +1862,7 @@ func test_lowers_debug_reflection_intrinsic_call() -> Bool:
 
 func test_lowers_resolved_builtin_direct_call() -> Bool:
 	callee = TypedNameExpr(ident("print"), expr_info(function_type()))
-	resolved = resolved_call_info(
-		"print",
-		ResolvedDirectCall(91, CallableBuiltin),
-	)
+	resolved = resolved_call_info("print", ResolvedCompilerBuiltinCall(91))
 	expr = TypedCallExpr(
 		callee,
 		[int_expr("5")],
@@ -1406,10 +1882,7 @@ func test_lowers_resolved_builtin_direct_call() -> Bool:
 
 func test_lowers_to_string_builtin_as_trait_dispatch_sentinel() -> Bool:
 	callee = TypedNameExpr(ident("to_string"), expr_info(function_type()))
-	resolved = resolved_call_info(
-		"to_string",
-		ResolvedDirectCall(91, CallableBuiltin),
-	)
+	resolved = resolved_call_info("to_string", ResolvedCompilerBuiltinCall(91))
 	expr = TypedCallExpr(
 		callee,
 		[tuple_int_bool_expr()],
@@ -1449,11 +1922,15 @@ func test_lowers_resolved_closure_call() -> Bool:
 			False
 
 
-func test_rejects_conflicting_encoded_call_id() -> Bool:
-	callee = TypedNameExpr(ident("__ufcs_map#77"), expr_info(function_type()))
+private pure func rejects_conflicting_encoded_call_id(fixture: CoreResolvedCallFixture) -> Bool:
+	encoded_id = callable_id_definition_id(fixture.map) + 1
+	callee = TypedNameExpr(
+		ident("__ufcs_map#" + encoded_id.to_string()),
+		expr_info(function_type()),
+	)
 	resolved = resolved_call_info(
 		"__ufcs_map",
-		ResolvedDirectCall(78, CallableLocal),
+		ResolvedGraphCallableCall(fixture.map, ResolvedSourceFunctionCall),
 	)
 	expr = TypedCallExpr(
 		callee,
@@ -1462,10 +1939,18 @@ func test_rejects_conflicting_encoded_call_id() -> Bool:
 		expr_info_with_resolved(int_type(), resolved),
 	)
 
-	match lower_typed_expr(expr):
+	match lower_core_test_expr(fixture, expr):
 		Err(CoreLowerInvalidCall(message)):
 			message.contains("conflicting callable ids")
 		_:
+			False
+
+
+func test_rejects_conflicting_encoded_call_id() -> Bool:
+	match core_resolved_call_fixture():
+		Some(fixture):
+			rejects_conflicting_encoded_call_id(fixture)
+		None:
 			False
 
 
@@ -4939,11 +5424,13 @@ private func prepares_module_graph_at_core_boundary(
 		typed_program = module_program
 	}
 
+	definitions = empty_core_definition_table(module_table)
+
 	match prepare_core_graph(
-		module_table,
+		definitions,
 		target_module_id,
 		target_program,
-		core_graph_modules(module_table, [module_unit]),
+		core_graph_modules(definitions, [module_unit]),
 		10,
 	):
 		Ok(prepared):
@@ -4993,6 +5480,8 @@ func test_core_graph_rejects_module_id_outside_table() -> Bool:
 		core_graph_test_module_domain(["foreign/zero"]),
 	):
 		(Some((table, [target_id])), Some((foreign_table, [foreign_id]))):
+			definitions = empty_core_definition_table(table)
+			foreign_definitions = empty_core_definition_table(foreign_table)
 			foreign_program: TypedProgram = {
 				source = source_file("foreign.brp", "foreign", ""),
 				decls = [],
@@ -5003,11 +5492,11 @@ func test_core_graph_rejects_module_id_outside_table() -> Bool:
 
 			match (
 				prepare_core_graph(
-					table,
+					definitions,
 					target_id,
 					foreign_program,
 					core_graph_modules(
-						foreign_table,
+						foreign_definitions,
 						[
 							{
 								module_id = foreign_id,
@@ -5026,17 +5515,52 @@ func test_core_graph_rejects_module_id_outside_table() -> Bool:
 			False
 
 
+func test_core_graph_rejects_duplicate_definition_authority() -> Bool:
+	match core_graph_test_module_domain(["target"]):
+		Some((module_table, [target_id])):
+			first = empty_core_definition_table(module_table)
+			duplicate = empty_core_definition_table(module_table)
+			program: TypedProgram = {
+				source = fixture_source_file(),
+				decls = [],
+				diagnostics = [],
+				type_definitions = [],
+				type_references = []
+			}
+
+			match prepare_core_graph(
+				first,
+				target_id,
+				program,
+				core_graph_modules(duplicate, []),
+				10,
+			):
+				Err(CoreGraphModuleTableError(message)):
+					message == "Core graph modules use an incompatible definition table"
+				_:
+					False
+		_:
+			False
+
+
 private func prepared_graph_resolves_repeated_imports(
 	module_table: ModuleTable,
 	target_module_id: ModuleId,
 	first_module_id: ModuleId,
 	second_module_id: ModuleId,
-	resolved_module_path: String,
-	expect_rejection: Bool,
-) -> Bool:
+) -> Option[Bool]:
+	empty = definition_index_empty(definition_index_initial_seed(ENV_EMPTY), module_table)
+	first_result ?= insert_core_test_callable(empty, module_table, first_module_id, "shared")
+	with_first = first_result[0]
+	first_raw = first_result[1]
+	second_result ?= insert_core_test_callable(with_first, module_table, second_module_id, "shared")
+	complete = second_result[0]
+	second_raw = second_result[1]
+	definitions = definition_index_definition_table(complete)
+	first_callable ?= callable_id_from_definition_table(definitions, first_raw)
 	first_module_function: TypedFunctionInfo = {
 		decl = { parsed_function_decl() | name = ident("shared") },
-		callable_id = Some(501),
+		callable_id = Some(first_raw),
 		effective_type_params = [],
 		param_types = [int_type()],
 		source_return_type = Some(int_type()),
@@ -5045,7 +5569,7 @@ private func prepared_graph_resolves_repeated_imports(
 	}
 	second_module_function: TypedFunctionInfo = {
 		decl = { parsed_function_decl() | name = ident("shared") },
-		callable_id = Some(502),
+		callable_id = Some(second_raw),
 		effective_type_params = [],
 		param_types = [int_type()],
 		source_return_type = Some(int_type()),
@@ -5074,10 +5598,7 @@ private func prepared_graph_resolves_repeated_imports(
 	}
 	resolved = resolved_call_info(
 		"shared",
-		ResolvedDirectCall(
-			501,
-			CallableImported(first_module_id, resolved_module_path),
-		),
+		ResolvedGraphCallableCall(first_callable, ResolvedSourceFunctionCall),
 	)
 	referenced_shared = TypedNameExpr(
 		ident("shared"),
@@ -5106,22 +5627,20 @@ private func prepared_graph_resolves_repeated_imports(
 		type_references = []
 	}
 
-	match (
-		prepare_core_graph(
-			module_table,
-			target_module_id,
-			target_program,
-			core_graph_modules(
-				module_table,
-				[first_module, second_module],
-			),
-			10,
-		)
-	):
-		Ok(prepared):
-			if expect_rejection:
-				False
-			else:
+	Some(
+		match (
+			prepare_core_graph(
+				definitions,
+				target_module_id,
+				target_program,
+				core_graph_modules(
+					definitions,
+					[first_module, second_module],
+				),
+				10,
+			)
+		):
+			Ok(prepared):
 				match prepared.program.decls:
 					[FunctionDecl(_), FunctionDecl(_), FunctionDecl(target_info)]:
 						match target_info.body:
@@ -5129,17 +5648,16 @@ private func prepared_graph_resolves_repeated_imports(
 								(
 									first.name == "__ufcs_pkg$v1$display$first__shared"
 									and second.name == first.name
-									and first.def_id == Some(501)
-									and second.def_id == Some(501)
+									and first.def_id == Some(first_raw)
+									and second.def_id == Some(first_raw)
 								)
 							_:
 								False
 					_:
 						False
-		Err(CoreGraphLowerError(_, CoreLowerInvalidCall(message))):
-			expect_rejection and message.contains("does not match module ID")
-		Err(_):
-			False
+			Err(_):
+				False
+	)
 
 
 func test_prepared_graph_uses_module_id_for_repeated_imports() -> Bool:
@@ -5154,28 +5672,7 @@ func test_prepared_graph_uses_module_id_for_repeated_imports() -> Bool:
 				target_module_id,
 				first_module_id,
 				second_module_id,
-				"pkg/v1/display/first",
-				False,
-			)
-		_:
-			False
-
-
-func test_prepared_graph_rejects_mismatched_import_module_metadata() -> Bool:
-	match core_graph_test_module_domain([
-		"app/main",
-		"pkg/v1/display/first",
-		"pkg/v1/display/second",
-	]):
-		Some((module_table, [target_module_id, first_module_id, second_module_id])):
-			prepared_graph_resolves_repeated_imports(
-				module_table,
-				target_module_id,
-				first_module_id,
-				second_module_id,
-				"pkg/v1/display/second",
-				True,
-			)
+			).get_or(False)
 		_:
 			False
 
@@ -5183,7 +5680,14 @@ func test_prepared_graph_rejects_mismatched_import_module_metadata() -> Bool:
 private func synthesizes_explicit_program_entrypoint(
 	module_table: ModuleTable,
 	target_module_id: ModuleId,
-) -> Bool:
+) -> Option[Bool]:
+	empty = definition_index_empty(definition_index_initial_seed(ENV_EMPTY), module_table)
+	main_result ?= insert_core_test_callable(empty, module_table, target_module_id, "main")
+	complete = main_result[0]
+	main_raw = main_result[1]
+	definitions = definition_index_definition_table(complete)
+	main_callable ?= callable_id_from_definition_table(definitions, main_raw)
+	core_frontier = definition_index_next_def_id(complete)
 	main_decl: ParsedFunctionDecl = { parsed_function_decl() |
 		name = ident("main"),
 		params = [
@@ -5201,7 +5705,7 @@ private func synthesizes_explicit_program_entrypoint(
 	}
 	main_function: TypedFunctionInfo = {
 		decl = main_decl,
-		callable_id = None,
+		callable_id = Some(main_raw),
 		effective_type_params = [],
 		param_types = [type_list(TYPE_STRING)],
 		source_return_type = Some(TYPE_INT),
@@ -5211,15 +5715,15 @@ private func synthesizes_explicit_program_entrypoint(
 				TypedNameExpr(
 					ident("main"),
 					{ expr_info(main_function_type()) |
-						resolved_call = Some(main_resolved_call_info()),
-						resolved_definition_id = Some(10)
+						resolved_call = Some(main_resolved_call_info(main_callable)),
+						resolved_definition_id = Some(main_raw)
 					},
 				),
 				[TypedNameExpr(ident("args"), expr_info(type_list(TYPE_STRING)))],
 				fixture_source_span(),
 				expr_info_with_resolved(
 					TYPE_INT,
-					main_resolved_call_info(),
+					main_resolved_call_info(main_callable),
 				),
 			),
 		)
@@ -5232,42 +5736,48 @@ private func synthesizes_explicit_program_entrypoint(
 		type_references = []
 	}
 
-	match prepare_core_graph(
-		module_table,
-		target_module_id,
-		program,
-		core_graph_modules(module_table, []),
-		10,
-	):
-		Ok(prepared):
-			match prepared.program.decls:
-				[FunctionDecl(user_main), FunctionDecl(entrypoint)]:
-					user_main_calls_renamed_main: Bool = match user_main.body:
-						Some(CallExpr(SelectedDirectCall(10), VarExpr(variable, _, _), _, _, _)):
-							variable.name == "$blorp$user_main_10" and variable.def_id == Some(10)
-						_:
-							False
+	Some(
+		match prepare_core_graph(
+			definitions,
+			target_module_id,
+			program,
+			core_graph_modules(definitions, []),
+			core_frontier,
+		):
+			Ok(prepared):
+				match prepared.program.decls:
+					[FunctionDecl(user_main), FunctionDecl(entrypoint)]:
+						user_main_calls_renamed_main: Bool = match user_main.body:
+							Some(CallExpr(SelectedDirectCall(def_id), VarExpr(variable, _, _), _, _, _)):
+								(
+									def_id == main_raw
+									and variable.name == "$blorp$user_main_" + main_raw.to_string()
+									and variable.def_id == Some(main_raw)
+								)
+							_:
+								False
 
-					(
-						prepared.next_def_id == 12
-						and user_main.name == "$blorp$user_main_10"
-						and user_main.def_id == 10
-						and user_main.function_kind == UserFunction
-						and entrypoint.name == "$blorp$program"
-						and entrypoint.def_id == 11
-						and entrypoint.function_kind == ProgramEntrypointFunction
-						and user_main_calls_renamed_main
-					)
-				_:
-					False
-		Err(_):
-			False
+						(
+							prepared.next_def_id == core_frontier + 1
+							and user_main.name == "$blorp$user_main_" + main_raw.to_string()
+							and user_main.def_id == main_raw
+							and user_main.function_kind == UserFunction
+							and entrypoint.name == "$blorp$program"
+							and entrypoint.def_id == core_frontier
+							and entrypoint.function_kind == ProgramEntrypointFunction
+							and user_main_calls_renamed_main
+						)
+					_:
+						False
+			Err(_):
+				False
+	)
 
 
 func test_synthesizes_explicit_program_entrypoint() -> Bool:
 	match core_graph_test_module_domain(["main"]):
 		Some((module_table, [target_module_id])):
-			synthesizes_explicit_program_entrypoint(module_table, target_module_id)
+			synthesizes_explicit_program_entrypoint(module_table, target_module_id).get_or(False)
 		_:
 			False
 
@@ -5430,6 +5940,14 @@ tests: TestSuite = {
 		("lowers binary expression", test_lowers_binary_expression),
 		("lowers resolved local direct call", test_lowers_resolved_local_direct_call),
 		(
+			"rejects a definition-backed call outside the Core table",
+			test_rejects_definition_backed_call_outside_core_table,
+		),
+		(
+			"rejects a definition-backed call with the wrong kind",
+			test_rejects_definition_backed_call_with_wrong_kind,
+		),
+		(
 			"does not apply inner direct identity to returned function call",
 			test_does_not_apply_inner_direct_identity_to_returned_function_call,
 		),
@@ -5458,7 +5976,6 @@ tests: TestSuite = {
 			"lowers resolved constructor direct call as unknown",
 			test_lowers_resolved_constructor_direct_call_as_unknown,
 		),
-		("lowers resolved impl method direct call", test_lowers_resolved_impl_method_direct_call),
 		(
 			"lowers deferred trait method call with dispatch identity",
 			test_lowers_deferred_trait_method_call_with_dispatch_identity,
@@ -5669,16 +6186,16 @@ tests: TestSuite = {
 			test_core_graph_rejects_module_id_outside_table,
 		),
 		(
+			"Core graph rejects duplicate definition authority",
+			test_core_graph_rejects_duplicate_definition_authority,
+		),
+		(
 			"reports Core graph flatten errors with module context",
 			test_core_graph_flatten_error_has_module_context,
 		),
 		(
 			"prepared graph uses module ID for repeated imports",
 			test_prepared_graph_uses_module_id_for_repeated_imports,
-		),
-		(
-			"prepared graph rejects mismatched import module metadata",
-			test_prepared_graph_rejects_mismatched_import_module_metadata,
 		),
 		("synthesizes explicit program entrypoint", test_synthesizes_explicit_program_entrypoint),
 		(

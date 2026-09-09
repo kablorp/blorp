@@ -1,6 +1,6 @@
 # Normalized Compilation Database Roadmap
 
-**Status:** Active; Horizon 1 Issues 56-58 and typed-call cleanup Issue 61 implemented
+**Status:** Active; Horizon 1 and Issues 61B, 68, and 69 implemented; Issues 70-73 defined
 
 **Scope:** One compiler invocation and the immutable products retained by an
 LSP analysis snapshot. This is not a cross-run cache, an incremental build
@@ -9,10 +9,13 @@ with a generic database.
 
 **Near-term issues:**
 
-1. [Issue 56: Establish One Compilation Module Table](56-establish-one-compilation-module-table.md)
-2. [Issue 57: Make Module IDs Authoritative Through Stage 06](57-make-module-ids-authoritative-through-stage-06.md)
-3. [Issue 58: Carry Module IDs Through CTFE And Core Lowering](58-carry-module-ids-through-ctfe-and-core-lowering.md)
-4. [Issue 61: Carry Module IDs In Resolved Call Metadata](61-carry-module-ids-in-resolved-call-metadata.md)
+1. [Issue 61B: Establish The Canonical Graph Definition Table](61-establish-canonical-graph-definition-table.md)
+2. [Issue 68: Use Scalar Definition IDs For Constructor Identity](68-use-scalar-definition-ids-for-constructor-identity.md)
+3. [Issue 69: Make Resolved Calls Definition-Backed](69-make-resolved-calls-definition-backed.md)
+4. [Issue 70: Make Nominal Type IDs Definition-Backed](70-make-nominal-type-ids-definition-backed.md)
+5. [Issue 71: Make Global IDs Definition-Backed](71-make-global-ids-definition-backed.md)
+6. [Issue 72: Make Field IDs Definition-Backed](72-make-field-ids-definition-backed.md)
+7. [Issue 73: Normalize Trait And Implementation Identities](73-normalize-trait-and-implementation-identities.md)
 
 ## Relationship To Current Documentation
 
@@ -27,13 +30,19 @@ retroactively change current production truth.
   including the large win from unboxed type ownership and the regressions from
   per-declaration managed scopes and compensating dictionaries.
 - `docs/ARCHITECTURE.md` records the Stage 04-owned `ModuleTable` implemented by
-  Issue 56. Graph-issued `TypeId` and `PreparedModuleScope` now carry that shared
-  ID domain. Other durable and external products remain descriptive until
-  Issues 57-58 migrate each consumer.
+  Issue 56. Issues 57-58 made that shared domain authoritative through Stage 06,
+  CTFE, and Core graph lowering. External products remain descriptive where
+  their protocol requires names and paths; internal typed call metadata and
+  declaration identities are the next remaining normalization boundaries.
 - `docs/COMPILER_PRIORITIES.md` remains authoritative for semantic
   typechecking phase decomposition, accepted/recoverable products, and
   demand-driven CTFE. Table normalization must follow those semantic
   boundaries rather than create a parallel typechecker.
+- [Issue 59's rejected lexical-parameter batching experiment](59-batch-lexical-parameter-scope-publication.md)
+  confirms that transient `Env` and lexical scope state should not be pulled
+  into the compilation database merely because it is expensive. The retained
+  scalar scope-list cleanup is independent of the durable entity-table work
+  below.
 
 The new direction is not that the existing graph-local slot was secretly
 durable. It is to make the issuing table a retained compilation product so a
@@ -123,9 +132,13 @@ unrelated tables is invalid.
 ### Entity table
 
 An entity table owns one canonical row for each admitted entity of one kind.
-The dense row position is the entity ID. A table is built under private,
-single-owner construction and becomes immutable when published through an
-opaque phase product.
+Normally the dense row position is the entity ID. When a pre-existing
+observable allocator has a nonzero base or proven gaps, the table may instead
+use a named offset, explicit sparse slots, or a typed relation to a separate
+dense row ID. That exception must be represented and measured; it cannot be
+hidden behind a magic integer. A table is built under private, single-owner
+construction and becomes immutable when published through an opaque phase
+product.
 
 A row should contain intrinsic facts about that entity. Facts that describe a
 relationship between two entities belong in an edge table. For example, a
@@ -277,8 +290,9 @@ and reference IDs are assigned in deterministic graph construction order, and
 repeated source import occurrences retain separate reference rows.
 
 `FrontendModule` remains only a compatibility projection assembled from the
-stable identity row and aligned Stage 03/04 payloads. Issue 57 removes more
-descriptive projections from Stage 06 hot paths.
+stable identity row and aligned Stage 03/04 payloads. Issues 57-58 removed the
+corresponding descriptive module owner fields from Stage 06, CTFE, and Core
+graph transport.
 
 ### Stage 06 has table-like authorities but mixed ownership forms
 
@@ -287,20 +301,27 @@ records, unions, callables, globals, traits, and implementations. It also has
 a `DefinitionIndex`, module views, declaration skeletons, completed global
 headers, checked body artifacts, and semantic occurrence projection.
 
-These are useful domain-specific tables, but their keys and payloads mix:
+These are useful domain-specific tables, but their keys and payloads still
+mix:
 
-- complete `ModuleIdentity` values;
-- canonical module-path strings;
 - shared compilation-owned `ModuleId` values;
+- canonical module-path strings at some type and external-projection boundaries;
 - raw definition integers whose domain is implicit;
-- source names repeated with owner records; and
-- transient `Env` symbols copied from accepted graph facts.
+- managed structural declaration IDs that repeat module, source name, owner,
+  and span; and
+- source names repeated in category rows and owner indexes.
 
-`TypecheckedModule` currently retains path, source module name, canonical
-module path, `ModuleIdentity`, parsed program, module surface, semantic and
-final typed programs, diagnostics, import bindings, and CTFE status in one
-record. `TypecheckedGraph` then stores one target plus a module list. This is a
-rich transport object, not a normalized phase product.
+After Issue 43, accepted graph-owned declaration payloads are not copied back
+into `Env`. Its remaining builtin, provisional, lexical, and body-session facts
+are transient state and are not candidates for this database.
+
+`TypecheckedModule` now retains one `ModuleId` rather than copied path, source
+module name, canonical path, and complete `ModuleIdentity` fields. It still
+retains parsed and typed programs, the module surface, diagnostics, import
+bindings, and CTFE status in one row. `TypecheckedGraph` owns the shared
+`ModuleTable`, one target row, and a module list. This is a materially cleaner
+module transport, but it is still a rich payload product rather than a
+definition/body/reference table product.
 
 The current Stage 06 migration has measured an important representation rule:
 one unboxed module integer on a hot declaration identity can materially reduce
@@ -308,30 +329,38 @@ allocations, while retaining one managed graph/scope carrier per declaration
 can materially regress elapsed work. The shared table must therefore be owned
 once by the containing product, not copied into every entity row.
 
-### CTFE reconstructs module contexts through strings and programs
+### CTFE uses module and callable IDs but still reconstructs other entity contexts
 
 Stage 07 receives complete `TypedProgram` values and constructs
 `CtfeImportedProgram`, `CtfeContext`, `CtfeModuleGlobalEnv`, aliases,
-constructor references, and function groups. Many queries use canonical module
-paths and source names. This preserves behavior but reconstructs relationships
-that Stage 04 and Stage 06 already resolved.
+constructor references, and function groups. Issue 58 made the module table and
+module-aligned contexts authoritative. Issue 69 carries category-checked
+`CallableId` values in resolved calls, retains the issuing `DefinitionTable`
+once in the imported-program set, and derives callable ownership directly from
+that table during CTFE translation. Global, nominal-type, field, trait, and
+implementation identities remain later normalization cuts.
 
 CTFE should eventually consume exact module, global, callable, constructor,
 and body IDs plus accepted relationship tables. Its local evaluation
 environment remains transient.
 
-### Core lowering denormalizes module ownership
+### Core lowering retains module ownership and definition-backed call owners
 
-`stage_08_core_lower/graph_prepare.brp` accepts `CoreGraphUnit` rows containing
-`module_name`, `module_path`, and a complete `TypedProgram`. It constructs a
-`Dict[String, Dict[Int, CoreLowerCallableName]]`, lowers each module, prefixes
-module-owned names into strings, concatenates all declarations into one
-`CoreProgram`, and rewrites aliases.
+`stage_08_core_lower/graph_prepare.brp` now accepts `CoreGraphUnit` rows
+containing one unboxed `ModuleId` and a complete `TypedProgram`. Its callable
+registry uses a dense module-indexed outer list. Issue 69 makes resolved calls
+definition-backed and requires the exact issuing `DefinitionTable` at the Core
+graph boundary, so `lower.brp` derives callable owners without path-to-module
+probes. It still projects canonical paths into UFCS/Core names at the existing
+naming boundary, flattens module declarations into one `CoreProgram`, and
+rewrites aliases.
 
-This is a clear later migration boundary. The lowerer should receive module
-and declaration IDs directly. Canonical or C-safe names should be projected
-once at an explicit naming boundary rather than being the primary relation
-between modules, calls, and definitions.
+The next clear migration boundary is therefore definition identity rather than
+module transport. The lowerer should receive definition-backed callable IDs
+directly and derive their owner through the retained definition table.
+Canonical or C-safe names should continue to be projected once at an explicit
+naming boundary rather than serving as the relation between modules, calls,
+and definitions.
 
 ### Core is one nested rewrite value
 
@@ -546,9 +575,10 @@ described under Stage 06.
 **Current input:** A validated `FrontendGraph` in the direct path, or a
 descriptive `TypecheckGraphRequest` in the replay boundary. The direct path
 passes the exact Stage 04 `ModuleTable` into `IndexedGraph`; replay constructs
-one table through the same Stage 04 owner. Prepared payloads are aligned to the
-shared `ModuleId` domain, although `ModuleLoadCandidate`, `LoadedModule`, and
-many later graph-backed rows still retain descriptive identity.
+one table through the same Stage 04 owner. Prepared, bound, skeleton,
+environment, accepted-authority, and typed-module ownership is aligned to the
+shared `ModuleId` domain. Descriptive identities remain at replay, diagnostic,
+semantic-projection, and source-spelling boundaries.
 
 **Current output:** Rich `TypecheckedModule` and `TypecheckedGraph` values,
 plus graph-owned authorities, prepared environments, completed headers,
@@ -627,9 +657,12 @@ and Core lowering.
 
 ### Stage 07: Compile-Time Evaluation
 
-**Current input:** Typed programs, imported program wrappers, canonical module
-paths, import bindings, and reconstructed function/global/constructor
-contexts. Production currently invokes Stage 07 helpers from the Stage 06
+**Current input:** Retained `ModuleTable` and `DefinitionTable` authorities,
+module-ID-keyed typed programs and imported-program wrappers, import bindings,
+definition-backed resolved callable IDs, and reconstructed
+function/global/constructor contexts. CTFE derives graph-call ownership from
+the canonical definition row rather than converting a stored module path back
+to `ModuleId`. Production currently invokes Stage 07 helpers from the Stage 06
 bridge while assembling the final typed graph; the numbered boundary is not
 yet a standalone top-level pipeline product.
 
@@ -674,9 +707,11 @@ CTFE body scheduler.
 
 ### Stage 08: Core Lowering
 
-**Current input:** Target path/name/path strings, a target `TypedProgram`, a
-list of `CoreGraphUnit { module_name, module_path, typed_program }`, import
-binding strings, include directories, and the definition-ID frontier.
+**Current input:** One retained `ModuleTable`, a target `ModuleId` and
+`TypedProgram`, a list of `CoreGraphUnit { module_id, typed_program }`, import
+binding strings, include directories, and the definition-ID frontier. Typed
+call metadata still contains canonical owner paths that lowering resolves back
+to module IDs.
 
 **Current output:** One flattened `CoreProgram` with module names prefixed into
 declaration strings, callable aliases rewritten, FFI boundaries annotated,
@@ -937,11 +972,14 @@ An enabling issue may be accepted with neutral whole-compiler timing if it:
 - makes a later cut mechanical rather than speculative; and
 - does not retain two authoritative representations.
 
-The first three near-term issues form one cumulative checkpoint. Their final
-combined state should show a repeatable reduction in module-identity
-materialization, string-keyed module lookup, allocations, or retired
-instructions on compiler self-check. A negative result must be recorded and
-the offending tranche removed rather than justified solely by architecture.
+Issues 56-58 formed the completed module-identity checkpoint. Issues 68-73 form
+the next cumulative definition-identity checkpoint. Each new issue must remove
+an old authority or a measured reconstruction in the same cut; by the end of
+Issue 73 the combined state must show a repeatable reduction in managed
+declaration-identity traffic, serialized identity keys, per-expression module
+path probes, allocations, or retired instructions. A negative result must be
+recorded and the offending representation change removed rather than justified
+solely by architecture.
 
 ## Sequenced Roadmap
 
@@ -966,14 +1004,10 @@ audit before implementation.
    `CoreGraphUnit` with table-backed IDs at the bounded phase boundaries.
    Keep C name projection later and retain current expression/typed-program
    payloads initially.
-4. **Issue 61: Carry module IDs in resolved call metadata (implemented).** Resolve
-   imported callable and selected implementation-method ownership once in
-   Stage 06, then carry the exact ID through CTFE IR and Core expression
-   lowering. Retain path spellings only for semantic/debug/external projection.
 
 These issues are sequential. Issue 57 must not invent a second table while
-Issue 56 is unsettled, and Issues 58/61 must not serialize or independently
-rebuild the ID domain.
+Issue 56 is unsettled, and Issue 58 must not serialize or independently rebuild
+the ID domain.
 
 The completed Horizon 1 checkpoint removed descriptive module join fields and
 path-keyed CTFE/Core relations while preserving byte-identical replay output.
@@ -982,27 +1016,61 @@ peak RSS, +0.78% median elapsed); this is enabling normalization rather than a
 compiler-wide speedup. Horizon 2 changes must identify and measure a concrete
 consumer of the normalized ID spine.
 
-### Horizon 2: Stage 06 entity tables (medium fidelity)
+### Horizon 2: Stage 06 entity tables (high to medium fidelity)
 
-After the module spine is stable:
+Horizon 2 has one table foundation followed by six bounded identity cuts:
 
-1. **Issue 61B: Establish the canonical graph definition table (implemented).**
-   Normalize declaration ownership into one accepted `DefinitionTable` keyed
-   by the existing exact definition allocation domain. Definition-name indexes
-   now retain ordered IDs only, and the dormant competing declaration catalog
-   has been removed.
-2. Replace nested structural/runtime declaration identity records with typed
-   category IDs whose canonical owner/name/span facts live in tables.
-3. Make callable, global, trait, implementation, constructor, field, and
-   overload relationships explicit edge tables.
-4. Make accepted module views ordered ID/locator projections only.
-5. Publish checked body and semantic occurrence tables keyed by exact
-   definition IDs.
-6. Retain a snapshot-safe subset for LSP navigation and references.
+1. **[Issue 61B: Establish the canonical graph definition table](61-establish-canonical-graph-definition-table.md) (implemented).**
+   Turn the production `DefinitionIndex` allocation entries into one immutable
+   table of graph-owned definition rows plus owner/name indexes. Preserve the
+   exact existing allocation frontier and make builtin, graphless, and rejected
+   provenance explicit. Retire the benchmark-only `AcceptedDeclarationCatalog`
+   if its required reachability audit still finds no production reader; do not
+   add a second declaration catalog. The completed cut selected a dense table
+   with an explicit graph base after proving that every production extension is
+   append-only; it also deleted the dormant catalog and its private harnesses.
+2. **[Issue 68: Use scalar definition IDs for constructor identity](68-use-scalar-definition-ids-for-constructor-identity.md) (implemented).**
+   Replace the managed structural/runtime constructor identity with a
+   table-scoped, category-checked scalar ID. Materialize canonical
+   owner/name/span facts only from the issuing `DefinitionTable`.
+3. **[Issue 69: Make resolved calls definition-backed](69-make-resolved-calls-definition-backed.md) (implemented).**
+   Replace managed callable identity records, raw direct-call integers, and
+   imported/implementation-method module-path metadata with scalar callable
+   IDs backed by the definition table. CTFE and Core lowering derive the owner
+   module from the table and delete per-expression path-to-ID probes. The
+   completed cut also replaced a modules-times-callables body-planning scan
+   with contiguous per-module ranges over the canonical callable list.
+4. **[Issue 70: Make nominal type IDs definition-backed](70-make-nominal-type-ids-definition-backed.md).**
+   Replace `TypeIdRep { module_id, name, span }` and its serialized storage keys
+   with a category-safe scalar definition ID. Cut accepted alias, record, and
+   union authorities over in the same issue so the old managed identity does
+   not survive beside the new one.
+5. **[Issue 71: Make global IDs definition-backed](71-make-global-ids-definition-backed.md).**
+   Claim the already reserved global definition row, replace structural
+   `GlobalId`, remove duplicate raw IDs from accepted graph bindings, and make
+   exact accepted-global lookup integer-addressed.
+6. **[Issue 72: Make field IDs definition-backed](72-make-field-ids-definition-backed.md).**
+   Replace raw optional field definition integers with `FieldId`, publish the
+   exact field-to-parent-type relation once, and thread typed field identity
+   through inference and semantic occurrences.
+7. **[Issue 73: Normalize trait and implementation identities](73-normalize-trait-and-implementation-identities.md).**
+   Scalarize graph trait and implementation IDs, give compiler builtins an
+   explicit identity domain, compact trait method identity, and consolidate
+   relationship/module-view indexes around named production queries.
+
+Issue 61B establishes the table foundation and Issue 68 establishes the scalar
+constructor precedent. Issues 69, 70, and 71 are
+conceptually independent after it, but they share Stage 06 skeleton/projection
+files and should be integrated one at a time unless separate worktrees prove
+their diffs do not overlap. Issue 72 follows Issue 70. Issue 73 follows all
+earlier cuts and closes the declaration-identity checkpoint.
 
 This horizon must coordinate with the typechecking phase-product roadmap.
-Database normalization must not make unfinished body state look accepted or
-reintroduce broad mutable `TypecheckState` ownership.
+Database normalization must not make unfinished body state look accepted,
+retain the benchmark-only `AcceptedDeclarationCatalog` as a second authority,
+or reintroduce broad mutable `TypecheckState` ownership. Checked-body and
+semantic-occurrence tables remain later Horizon 2 work after the six identity
+cuts have been measured.
 
 ### Horizon 3: Accepted type and CTFE normalization (medium to low fidelity)
 
@@ -1095,44 +1163,49 @@ scope history, diagnostics, imports, CTFE work, and Core declarations all have
 observable or tested order. Dense tables must preserve those orders rather
 than sorting for implementation convenience.
 
-## Open Design Questions
+## Design Decisions And Open Questions
 
-These questions are intentionally not resolved by the master roadmap. The
-named horizon must answer them with a current code audit and measurement.
+Issues 56-58 resolved the module-table decisions recorded below. The remaining
+questions are assigned to the named horizon and must be answered from a current
+code audit and measurement rather than treated as settled architecture.
 
 ### Module table payload
 
-Issue 56 must decide whether the stable module row owns only
-`ResolvedModuleIdentity`, also owns a future `SourceId`, or points to a
-separate source relation. It must not embed finalized programs, module
-surfaces, prepared modules, or typecheck environments merely because those
-payloads are currently adjacent.
+Issue 56 resolved this for the current horizon: `ModuleTable` owns canonical
+`ResolvedModuleIdentity` rows and their indexes. Finalized programs, module
+surfaces, prepared modules, typed programs, and environments remain aligned
+phase payloads rather than fields of the identity row. A future `SourceId`
+relation remains separate work.
 
 ### Table compatibility proof
 
-Within one compilation, opaque product construction should make integer
-comparison sufficient. It remains to be decided whether rare cross-product
-admission proves compatibility by shared immutable allocation, exact table
-identity, a compact product token, or structural table validation. The chosen
-proof must not add a managed provenance field to every ID or rely on bare
-numeric equality.
+Issues 56-58 use opaque product construction plus exact structural module-table
+compatibility at rare cross-product admission points. IDs remain unboxed and
+carry no managed provenance. Later tables should follow that pattern unless a
+focused measurement demonstrates that structural admission checks are hot
+enough to justify a compact product token.
 
 ### Compiler-owned and graphless rows
 
-Compiler prelude surfaces, direct programs, anonymous modules, replay inputs,
-and generated Core definitions do not all follow ordinary project discovery.
-Issues 56-57 must determine which are legitimate module/definition rows and
-which require explicit phase-specific variants. No issue may invent a sentinel
-while this remains open.
+Issues 56-58 gave direct programs, anonymous modules, and replay inputs
+sanctioned Stage 04 table construction paths. Compiler builtins still occupy
+the definition allocator below the graph-owned frontier, and generated Core
+definitions are a later phase-specific domain. Issue 68 must represent that
+boundary explicitly: graph definition rows may use a named base/frontier or a
+provenance variant, but no issue may use a magic numeric ID or an empty module
+path as a sentinel.
 
 ### Definition ID density
 
 Stage 06 and Core share observable definition-allocation behavior, but raw
 definition integers can collide across independently built products and may
-contain gaps. Horizon 2 must determine whether the existing definition ID can
-directly address a list, needs a separate dense row ID, or should remain an
-external key into a compact table. Preserve claim order and the final frontier
-before optimizing lookup representation.
+contain gaps through the current explicit insertion API. Issue 68 must audit
+normal graph construction, direct/graphless extension, replay, compiler
+builtins, and tests before choosing one of three explicit layouts: a contiguous
+graph-owned slice with a named base, an option-valued sparse slot table, or a
+separate dense row ID plus exact runtime-definition relation. Preserve claim
+order and the final frontier; do not assume that a test-supported gap is a
+production requirement or silently renumber observable IDs.
 
 ### Source and span normalization
 

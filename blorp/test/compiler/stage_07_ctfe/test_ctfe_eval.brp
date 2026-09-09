@@ -14,22 +14,48 @@ import:
 	../../../src/compiler/stage_04_modules/module_table:
 		ModuleId,
 		ModuleTable,
+		module_ids_equal,
 		module_table,
 		module_table_find_id_by_canonical_path,
 		module_table_id_at,
 		singleton_module_table,
 	../../../src/compiler/stage_06_typecheck/decl: TypedFunctionInfo
+	../../../src/compiler/stage_06_typecheck/graph/definition_identity:
+		SourceDefinitionKind(ConstructorDefinition),
+		func_callable_key,
+		source_definition_key,
+	../../../src/compiler/stage_06_typecheck/graph/definition_index:
+		DefinitionIndex,
+		DefinitionTable,
+		definition_index_definition_table,
+		definition_index_empty,
+		definition_index_initial_seed,
+		definition_index_insert_func_callable_id,
+		definition_index_insert_source_definition_id,
+		definition_index_next_def_id,
+		definition_index_seed_next_def_id,
+		definition_table_definition_count,
+		definition_table_definition_id,
+		definition_table_row,
+	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
+		CallableId,
+		ConstructorId,
+		callable_id_definition_id,
+		callable_id_from_definition_table,
+		constructor_id_definition_id,
+		constructor_id_from_definition_table,
 	../../../src/compiler/stage_06_typecheck/infer:
-		CallableOrigin(
-			CallableBuiltin,
-			CallableConstructor,
-			CallableImported,
-			CallableImportedUnresolved,
-			CallableLocal,
-		),
 		ExprTypeOrigin(SynthesizedOrigin),
 		ResolvedCallInfo,
-		ResolvedCallTarget(ResolvedClosureCall, ResolvedDirectCall, ResolvedIntrinsicCall),
+		ResolvedCallTarget(
+			ResolvedClosureCall,
+			ResolvedCompilerBuiltinCall,
+			ResolvedConstructorCall,
+			ResolvedGraphCallableCall,
+			ResolvedIntrinsicCall,
+			ResolvedUnindexedConstructorCall,
+		),
+		ResolvedGraphCallableCategory(ResolvedSourceFunctionCall),
 		TypedAssignScope(LocalAssignScope),
 		TypedExpr(
 			TypedAssignExpr,
@@ -70,6 +96,7 @@ import:
 		TypedStringInterpolationPart(TypedInterpolationExpr, TypedInterpolationLiteral),
 		TypedVarDeclPayload,
 	../../../src/compiler/stage_06_typecheck/type_system/env:
+		ENV_EMPTY,
 		Purity(Pure),
 		ResourceArgPolicy(RejectResourceArgs),
 	../../../src/compiler/stage_06_typecheck/type_system/refinement: UNREFINED_BINDING
@@ -150,6 +177,7 @@ private pure func ctfe_test_domain() -> (ModuleTable, ModuleId):
 		"dict",
 		"option",
 		"result",
+		"dep/helper",
 	].map(
 		func(module_path): resolved_module_identity_from_resolver(module_path, UserModule),
 	)
@@ -188,7 +216,7 @@ private pure func ctfe_import_domain(module_path: String) -> (ModuleTable, Modul
 
 private pure func ctfe_test_context() -> CtfeContext:
 	domain = ctfe_test_domain()
-	ctfe_context_empty(domain[0], domain[1])
+	ctfe_context_empty(ctfe_definition_table(domain[0]), domain[1])
 
 
 pure func fixture_source_file() -> SourceFile:
@@ -199,6 +227,144 @@ pure func fixture_source_span() -> SourceSpan:
 	src: SourceFile = fixture_source_file()
 	cursor: Cursor = source_cursor_at(src, 0)
 	source_span(src, cursor, cursor)
+
+
+private CTFE_CALLABLE_SPECS: List[(String, String)] = [
+	("dep/math", "add_one"),
+	("dep/math", "sum_pair"),
+	("dep/math", "increment"),
+	("dep/math", "add_offset"),
+	("dep/math", "pick"),
+	("dep/helper", "helper"),
+	("float", "to_float32"),
+	("string", "length"),
+	("string", "substring"),
+	("string", "contains"),
+	("string", "index_of"),
+	("string", "upper"),
+	("string", "lower"),
+	("string", "drop_left"),
+	("string", "take_left"),
+	("string", "chars"),
+	("string", "from_char"),
+	("string", "from_chars"),
+	("list", "length"),
+	("list", "append"),
+	("list", "get"),
+	("list", "contains"),
+	("list", "map"),
+	("dict", "from_list"),
+	("dict", "set"),
+	("dict", "get_or"),
+	("option", "get_or"),
+	("option", "is_none"),
+	("option", "map"),
+	("result", "get_or"),
+	("result", "from_option"),
+	("result", "to_option"),
+	("result", "map"),
+]
+
+
+private pure func ctfe_definition_table(table: ModuleTable) -> DefinitionTable:
+	var index = definition_index_empty(definition_index_initial_seed(ENV_EMPTY), table)
+
+	for (module_path, name) in CTFE_CALLABLE_SPECS:
+		match module_table_find_id_by_canonical_path(table, module_path):
+			Some(module_id):
+				definition_id = definition_index_next_def_id(index)
+
+				match definition_index_insert_func_callable_id(
+					index,
+					table,
+					func_callable_key(module_id, name, fixture_source_span()),
+					definition_id,
+				):
+					Ok(updated):
+						index = updated
+					Err(_):
+						void
+			None:
+				void
+
+	match module_table_find_id_by_canonical_path(table, "dep/math"):
+		Some(module_id):
+			definition_id = definition_index_next_def_id(index)
+
+			match definition_index_insert_source_definition_id(
+				index,
+				table,
+				source_definition_key(
+					module_id,
+					ConstructorDefinition,
+					"Some",
+					Some("Option"),
+					fixture_source_span(),
+				),
+				definition_id,
+			):
+				Ok(updated):
+					index = updated
+				Err(_):
+					void
+		None:
+			void
+
+	definition_index_definition_table(index)
+
+
+private pure func ctfe_callable_id(
+	table: ModuleTable,
+	definitions: DefinitionTable,
+	module_path: String,
+	name: String,
+) -> Option[CallableId]:
+	module_id ?= module_table_find_id_by_canonical_path(table, module_path)
+	var runtime_id = definition_index_seed_next_def_id(definition_index_initial_seed(ENV_EMPTY))
+	var result: Option[CallableId] = None
+	var offset: Int = 0
+
+	while offset < definition_table_definition_count(definitions):
+		match definition_table_definition_id(definitions, runtime_id).and_then(
+			func(id): definition_table_row(definitions, id),
+		):
+			Some(row):
+				if module_ids_equal(row.module_id, module_id) and row.name == name:
+					result = callable_id_from_definition_table(definitions, runtime_id)
+					break
+			None:
+				void
+
+		runtime_id += 1
+		offset += 1
+
+	result
+
+
+private pure func ctfe_some_constructor_id(
+	table: ModuleTable,
+	definitions: DefinitionTable,
+) -> Option[ConstructorId]:
+	module_id ?= module_table_find_id_by_canonical_path(table, "dep/math")
+	var runtime_id = definition_index_seed_next_def_id(definition_index_initial_seed(ENV_EMPTY))
+	var result: Option[ConstructorId] = None
+	var offset: Int = 0
+
+	while offset < definition_table_definition_count(definitions):
+		match definition_table_definition_id(definitions, runtime_id).and_then(
+			func(id): definition_table_row(definitions, id),
+		):
+			Some(row):
+				if module_ids_equal(row.module_id, module_id) and row.name == "Some":
+					result = constructor_id_from_definition_table(definitions, runtime_id)
+					break
+			None:
+				void
+
+		runtime_id += 1
+		offset += 1
+
+	result
 
 
 pure func ident(text: String) -> ParsedIdentifier:
@@ -284,20 +450,34 @@ pure func name_expr_with_call(name: String, call: ResolvedCallInfo) -> TypedExpr
 	TypedNameExpr(ident(name), expr_info_with_call(call))
 
 
-pure func local_resolved_call(callable_id: Int, source_name: String) -> ResolvedCallInfo:
-	resolved_call_with_origin(callable_id, source_name, CallableLocal)
+private pure func clean_test_source_name(source_name: String) -> String:
+	separator = source_name.raw_index_of("#")
+
+	if separator < 0:
+		source_name
+	else:
+		source_name.substring(0, separator)
 
 
-pure func resolved_call_with_origin(
-	callable_id: Int,
+private pure func graph_resolved_call(
+	table: ModuleTable,
+	module_path: String,
 	source_name: String,
-	origin: CallableOrigin,
 ) -> ResolvedCallInfo:
+	definitions = ctfe_definition_table(table)
+	name = clean_test_source_name(source_name)
+
+	target = match ctfe_callable_id(table, definitions, module_path, name):
+		Some(callable_id):
+			ResolvedGraphCallableCall(callable_id, ResolvedSourceFunctionCall)
+		None:
+			ResolvedCompilerBuiltinCall(-1)
+
 	{
 		callee_name = source_name,
 		source_name = source_name,
 		purity = Pure,
-		target = ResolvedDirectCall(callable_id, origin),
+		target = target,
 		trait_identity = None,
 		bound_type_params = [],
 		debug_only = False,
@@ -309,14 +489,35 @@ pure func resolved_call_with_origin(
 	}
 
 
-pure func resolved_call_with_return(
-	callable_id: Int,
+pure func local_resolved_call(_: Int, source_name: String) -> ResolvedCallInfo:
+	domain = ctfe_test_domain()
+	graph_resolved_call(domain[0], "dep/math", source_name)
+
+
+private pure func imported_resolved_call(
+	module_path: String,
 	source_name: String,
-	origin: CallableOrigin,
+) -> ResolvedCallInfo:
+	domain = ctfe_import_domain(module_path)
+	graph_resolved_call(domain[0], module_path, source_name)
+
+
+private pure func resolved_call_with_return(
+	table: ModuleTable,
+	module_path: String,
+	source_name: String,
 	return_type: SemanticType,
 ) -> ResolvedCallInfo:
-	{ resolved_call_with_origin(callable_id, source_name, origin) |
-		instantiated_return = return_type
+	{ graph_resolved_call(table, module_path, source_name) | instantiated_return = return_type }
+
+
+private pure func unindexed_constructor_resolved_call(
+	id: Int,
+	source_name: String,
+	parent_type: String,
+) -> ResolvedCallInfo:
+	{ graph_resolved_call(ctfe_test_domain()[0], "option", source_name) |
+		target = ResolvedUnindexedConstructorCall(id, parent_type)
 	}
 
 
@@ -327,12 +528,8 @@ pure func imported_call_expr(
 	args: List[TypedExpr],
 	return_type: SemanticType,
 ) -> TypedExpr:
-	call = resolved_call_with_return(
-		callable_id,
-		source_name,
-		CallableImportedUnresolved(module_path),
-		return_type,
-	)
+	domain = ctfe_test_domain()
+	call = resolved_call_with_return(domain[0], module_path, source_name, return_type)
 	TypedCallExpr(
 		name_expr_with_call(source_name, call),
 		args,
@@ -387,7 +584,10 @@ pure func lambda_call_expr() -> TypedExpr:
 
 
 pure func builtin_call_expr(name: String, arg: TypedExpr, return_type: SemanticType) -> TypedExpr:
-	call = resolved_call_with_return(50, name, CallableBuiltin, return_type)
+	call: ResolvedCallInfo = { graph_resolved_call(ctfe_test_domain()[0], "float", name) |
+		target = ResolvedCompilerBuiltinCall(50),
+		instantiated_return = return_type
+	}
 	TypedCallExpr(
 		name_expr_with_call(name, call),
 		[arg],
@@ -403,7 +603,7 @@ pure func local_function_reference_expr(
 	return_type: SemanticType,
 ) -> TypedExpr:
 	source_name = name + "#" + callable_id.to_string()
-	call = resolved_call_with_return(callable_id, source_name, CallableLocal, return_type)
+	call = resolved_call_with_return(ctfe_test_domain()[0], "dep/math", source_name, return_type)
 	function_type = SemanticFunctionType(True, param_types, return_type)
 	TypedNameExpr(
 		ident(name),
@@ -496,7 +696,32 @@ pure func imported_ctfe_function(
 
 
 pure func function_context(functions: List[(Int, CtfeFunction)]) -> CtfeContext:
-	{ ctfe_test_context() | functions = functions }
+	domain = ctfe_test_domain()
+	definitions = ctfe_definition_table(domain[0])
+	var normalized: List[(Int, CtfeFunction)] = []
+
+	for entry in functions:
+		function = entry[1]
+		match ctfe_callable_id(
+			domain[0],
+			definitions,
+			"dep/math",
+			function.source_name,
+		):
+			Some(callable_id):
+				runtime_id = callable_id_definition_id(callable_id)
+				updated_info = { function.info | callable_id = Some(runtime_id) }
+				normalized = normalized.append((
+					runtime_id,
+					{ function |
+						info = updated_info,
+						module_id = domain[1]
+					},
+				))
+			None:
+				normalized = normalized.append(entry)
+
+	{ ctfe_context_empty(definitions, domain[1]) | functions = normalized }
 
 
 pure func imported_function_context(
@@ -506,13 +731,15 @@ pure func imported_function_context(
 ) -> CtfeContext:
 	domain = ctfe_import_domain(module_path)
 	module_id = domain[2]
-	{ ctfe_context_empty(domain[0], domain[1]) | imported_functions = [
+	{ ctfe_context_empty(ctfe_definition_table(domain[0]), domain[1]) |
+		imported_functions = [
 			{
 				module_id = module_id,
 				source_name = source_name,
 				functions = functions.map(func(item): { item | module_id = module_id })
 			},
-		] }
+		]
+	}
 
 
 pure func imported_function_context_with_global(
@@ -540,7 +767,7 @@ pure func imported_global_context(
 ) -> CtfeContext:
 	domain = ctfe_import_domain(module_path)
 	with_alias = ctfe_context_with_module_alias(
-		ctfe_context_empty(domain[0], domain[1]),
+		ctfe_context_empty(ctfe_definition_table(domain[0]), domain[1]),
 		alias_name,
 		domain[2],
 	)
@@ -1455,7 +1682,7 @@ func test_eval_block_question_bind_result_ok_and_err() -> Bool:
 
 func test_eval_nullary_constructor_reference() -> Bool:
 	option_type = SemanticNamedType("Option", [TYPE_INT])
-	call = resolved_call_with_origin(11, "None#11", CallableConstructor("Option"))
+	call = unindexed_constructor_resolved_call(11, "None#11", "Option")
 	result = ctfe_eval_typed_expr(
 		ctfe_test_context(),
 		CTFE_ENV_EMPTY,
@@ -1469,7 +1696,7 @@ func test_eval_nullary_constructor_reference() -> Bool:
 					(
 						payload.name == "None"
 						and payload.constructor_info.parent_type == "Option"
-						and ctfe_constructor_info_definition_id(payload.constructor_info) == Some(11)
+						and ctfe_constructor_info_definition_id(payload.constructor_info) == None
 					)
 				_:
 					False
@@ -1539,7 +1766,7 @@ func test_eval_match_binds_selected_case() -> Bool:
 
 func test_eval_match_uses_typed_name_pattern_as_binding() -> Bool:
 	option_type = SemanticNamedType("Option", [TYPE_INT])
-	call = resolved_call_with_origin(11, "None#11", CallableConstructor("Option"))
+	call = unindexed_constructor_resolved_call(11, "None#11", "Option")
 	case_none: TypedMatchCase = {
 		pattern = TypedNamePattern(
 			ident("None"),
@@ -1787,7 +2014,7 @@ func test_eval_local_function_call_binds_tuple_param() -> Bool:
 
 func test_eval_imported_function_call_uses_module_globals() -> Bool:
 	module_path = "dep/math"
-	call = resolved_call_with_origin(21, "add_offset#21", CallableImportedUnresolved(module_path))
+	call = imported_resolved_call(module_path, "add_offset#21")
 	body = TypedBinaryExpr(
 		ParsedAddOp,
 		name_expr("value"),
@@ -1837,7 +2064,7 @@ func test_eval_imported_global_field_access() -> Bool:
 
 func test_eval_imported_function_call_reports_ambiguous_source_group() -> Bool:
 	module_path = "dep/math"
-	call = resolved_call_with_origin(22, "pick#22", CallableImportedUnresolved(module_path))
+	call = imported_resolved_call(module_path, "pick#22")
 	expr = TypedCallExpr(
 		name_expr_with_call("pick", call),
 		[],
@@ -2479,9 +2706,13 @@ func test_eval_imported_std_option_and_result_map_use_named_callback() -> Bool:
 	option_map_ok and result_map_ok
 
 
-func test_eval_constructor_call() -> Bool:
+private pure func eval_constructor_call(constructor_id: ConstructorId) -> Bool:
 	option_type = SemanticNamedType("Option", [TYPE_INT])
-	call = resolved_call_with_origin(12, "Some#12", CallableConstructor("Option"))
+	domain = ctfe_test_domain()
+	runtime_constructor_id = constructor_id_definition_id(constructor_id)
+	call: ResolvedCallInfo = { graph_resolved_call(domain[0], "dep/math", "Some") |
+		target = ResolvedConstructorCall(constructor_id, "Option")
+	}
 	expr = TypedCallExpr(
 		name_expr_with_call("Some", call),
 		[int_expr("42")],
@@ -2499,12 +2730,23 @@ func test_eval_constructor_call() -> Bool:
 						and payload.constructor_info.arity == 1
 						and ctfe_constructor_info_definition_id(
 							payload.constructor_info,
-						) == Some(12)
+						) == Some(runtime_constructor_id)
 						and payload.args.length() == 1
 					)
 				_:
 					False
 		Err(_):
+			False
+
+
+func test_eval_constructor_call() -> Bool:
+	domain = ctfe_test_domain()
+	definitions = ctfe_definition_table(domain[0])
+
+	match ctfe_some_constructor_id(domain[0], definitions):
+		Some(constructor_id):
+			eval_constructor_call(constructor_id)
+		None:
 			False
 
 
@@ -2522,7 +2764,7 @@ func test_eval_errors_are_reported() -> Bool:
 			CTFE_ENV_EMPTY,
 			name_expr_with_call(
 				"helper",
-				resolved_call_with_origin(3, "helper#3", CallableImportedUnresolved("dep/helper")),
+				graph_resolved_call(ctfe_test_domain()[0], "dep/helper", "helper#3"),
 			),
 		),
 	)

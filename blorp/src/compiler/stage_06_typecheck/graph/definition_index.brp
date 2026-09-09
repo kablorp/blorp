@@ -116,6 +116,13 @@ private record DefinitionTableRep {
 opaque type DefinitionTable = DefinitionTableRep
 
 
+foreign(include: "definition_index_ffi.h"):
+	private pure func definition_tables_are_same_allocation(
+		left: DefinitionTable,
+		right: DefinitionTable,
+	) -> Bool = "blorp_compiler_definition_tables_are_same_allocation"
+
+
 union DefinitionIndexBindingKey:
 	FuncCallableBindingKey(FuncCallableKey)
 	SourceDefinitionBindingKey(SourceDefinitionKey)
@@ -198,8 +205,19 @@ pure func definition_id_runtime_value(id: DefinitionId) -> Int:
 	from_opaque DefinitionId(id)
 
 
+pure func definition_ids_equal(left: DefinitionId, right: DefinitionId) -> Bool:
+	definition_id_runtime_value(left) == definition_id_runtime_value(right)
+
+
 private pure func definition_id(value: Int) -> DefinitionId:
 	into_opaque DefinitionId(value)
+
+
+-- Reserved graph authorities receive their IDs from this index after exact
+-- key/category validation. This projection preserves that already-proved
+-- identity without repeating a managed table lookup at every typed use.
+pure func definition_id_from_reserved_graph(value: Int) -> DefinitionId:
+	definition_id(value)
 
 
 private pure func definition_kind_for_source(kind: SourceDefinitionKind) -> DefinitionKind:
@@ -343,11 +361,25 @@ private pure func definition_table_id_with_kind(
 	runtime_definition_id: Int,
 	expected_kind: DefinitionKind,
 ) -> Option[DefinitionId]:
-	id ?= definition_table_definition_id(table, runtime_definition_id)
-	row ?= definition_table_row(table, id)
+	id = definition_id(runtime_definition_id)
+	row ?= definition_table_rep_row(definition_table_rep(table), id)
 
 	if row.kind == expected_kind:
 		Some(id)
+	else:
+		None
+
+
+private pure func definition_table_row_with_kind(
+	table: DefinitionTable,
+	runtime_definition_id: Int,
+	expected_kind: DefinitionKind,
+) -> Option[DefinitionRow]:
+	id = definition_id(runtime_definition_id)
+	row ?= definition_table_rep_row(definition_table_rep(table), id)
+
+	if row.kind == expected_kind:
+		Some(row)
 	else:
 		None
 
@@ -366,8 +398,64 @@ pure func definition_table_constructor_definition_id(
 	definition_table_id_with_kind(table, runtime_definition_id, ConstructorDefinitionKind)
 
 
+pure func definition_table_callable_row(
+	table: DefinitionTable,
+	runtime_definition_id: Int,
+) -> Option[DefinitionRow]:
+	definition_table_row_with_kind(table, runtime_definition_id, CallableDefinitionKind)
+
+
+pure func definition_table_constructor_row(
+	table: DefinitionTable,
+	runtime_definition_id: Int,
+) -> Option[DefinitionRow]:
+	definition_table_row_with_kind(table, runtime_definition_id, ConstructorDefinitionKind)
+
+
 pure func definition_table_module_table(table: DefinitionTable) -> ModuleTable:
 	definition_table_rep(table).module_table
+
+
+pure func definition_table_is_compatible_with_module_table(
+	table: DefinitionTable,
+	module_table: ModuleTable,
+) -> Bool:
+	module_tables_are_compatible(definition_table_module_table(table), module_table)
+
+
+-- CTFE phase products must share the exact frozen definition authority. This
+-- O(1) provenance check avoids rescanning all rows once per imported module.
+pure func definition_tables_share_provenance(left: DefinitionTable, right: DefinitionTable) -> Bool:
+	definition_tables_are_same_allocation(left, right)
+
+
+pure func definition_tables_are_compatible(left: DefinitionTable, right: DefinitionTable) -> Bool:
+	left_rep = definition_table_rep(left)
+	right_rep = definition_table_rep(right)
+	var compatible = (
+		left_rep.first_graph_definition_id == right_rep.first_graph_definition_id
+		and left_rep.rows.length() == right_rep.rows.length()
+		and module_tables_are_compatible(left_rep.module_table, right_rep.module_table)
+	)
+
+	var index: Int = 0
+
+	while compatible and index < left_rep.rows.length():
+		match (left_rep.rows.get(index), right_rep.rows.get(index)):
+			(Some(left_row), Some(right_row)):
+				compatible = (
+					module_ids_equal(left_row.module_id, right_row.module_id)
+					and left_row.kind == right_row.kind
+					and left_row.name == right_row.name
+					and left_row.owner_name == right_row.owner_name
+					and source_spans_equal(left_row.span, right_row.span)
+				)
+			_:
+				compatible = False
+
+		index += 1
+
+	compatible
 
 
 pure func definition_table_definition_count(table: DefinitionTable) -> Int:
@@ -757,6 +845,7 @@ private pure func definition_index_add_func_callable_id(
 ) -> DefinitionIndexRep:
 	id = definition_id(def_id)
 	table = definition_table_rep(index.definition_table)
+	row = definition_row_for_func_callable_key(key)
 	module_index = module_id_table_index(func_callable_key_module_id(key))
 	name = func_callable_key_name(key)
 	name_buckets = index.func_callable_ids_by_module_and_name.get_or(module_index, {})
@@ -770,9 +859,7 @@ private pure func definition_index_add_func_callable_id(
 					.append(id),
 			),
 		),
-		definition_table = into_opaque DefinitionTable(
-			{ table | rows = table.rows.append(definition_row_for_func_callable_key(key)) }
-		),
+		definition_table = into_opaque DefinitionTable({ table | rows = table.rows.append(row) }),
 		func_callable_id_count = index.func_callable_id_count + 1,
 		next_def_id = def_id + 1
 	}
@@ -821,6 +908,18 @@ pure func definition_index_find_func_callable_id(
 		definition_index_rep_find_func_callable_id(representation, key)
 	else:
 		None
+
+
+-- Callable identity is published as the table-issued scalar. Raw integer
+-- projections remain available to declaration categories that have not yet
+-- migrated to DefinitionId-backed identities.
+pure func definition_index_find_func_callable(
+	index: DefinitionIndex,
+	issuing_table: ModuleTable,
+	key: FuncCallableKey,
+) -> Option[DefinitionId]:
+	runtime_id ?= definition_index_find_func_callable_id(index, issuing_table, key)
+	definition_table_callable_definition_id(definition_index_definition_table(index), runtime_id)
 
 
 pure func definition_index_func_callable_bindings(
@@ -970,6 +1069,7 @@ private pure func definition_index_add_source_definition_id(
 ) -> DefinitionIndexRep:
 	id = definition_id(def_id)
 	table = definition_table_rep(index.definition_table)
+	row = definition_row_for_source_key(key)
 	module_index = module_id_table_index(source_definition_key_module_id(key))
 	name = source_definition_key_name(key)
 	name_buckets = index.source_definition_ids_by_module_and_name.get_or(module_index, {})
@@ -983,9 +1083,7 @@ private pure func definition_index_add_source_definition_id(
 					.append(id),
 			),
 		),
-		definition_table = into_opaque DefinitionTable(
-			{ table | rows = table.rows.append(definition_row_for_source_key(key)) }
-		),
+		definition_table = into_opaque DefinitionTable({ table | rows = table.rows.append(row) }),
 		source_definition_id_count = index.source_definition_id_count + 1,
 		next_def_id = def_id + 1
 	}
@@ -1038,6 +1136,15 @@ pure func definition_index_find_source_definition_id(
 		definition_index_rep_find_source_definition_id(representation, key)
 	else:
 		None
+
+
+pure func definition_index_find_constructor_definition(
+	index: DefinitionIndex,
+	issuing_table: ModuleTable,
+	key: SourceDefinitionKey,
+) -> Option[DefinitionId]:
+	runtime_id ?= definition_index_find_source_definition_id(index, issuing_table, key)
+	definition_table_constructor_definition_id(definition_index_definition_table(index), runtime_id)
 
 
 private pure func definition_index_source_entries(

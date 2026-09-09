@@ -21,6 +21,8 @@ import:
 		ParsedTypeParamDecl,
 		ParsedVarDecl,
 		parsed_function_body_kind,
+	../../stage_04_modules/module_table: ModuleId, module_id_table_index
+	../graph/definition_index: DefinitionTable
 	../modules/bound_module_graph:
 		BoundModule,
 		bound_module_graph_canonical_path_for_id,
@@ -47,10 +49,9 @@ import:
 		TraitId,
 		callable_id_definition_id,
 		callable_id_module_id,
-		callable_id_name,
-		callable_id_source_span,
 		callable_ids_equal,
 		declaration_skeleton_graph_callable_skeletons,
+		declaration_skeleton_graph_definition_table,
 		declaration_skeleton_graph_global_skeletons,
 		global_id_module_id,
 		global_id_name,
@@ -144,10 +145,18 @@ union GlobalHeader:
 	PendingGlobalInitializer(PendingGlobalInitializerHeader)
 
 
+private struct CallableHeaderModuleRange {
+	module_index: Int,
+	start: Int,
+	count: Int
+}
+
+
 private record CallableHeaderGraphRep {
 	trait_topology: TraitTopologyGraph,
 	callables: List[CallableHeader],
 	callable_index_by_definition_id: Dict[Int, Int],
+	callable_range_by_module: Dict[Int, CallableHeaderModuleRange],
 	globals: List[GlobalHeader]
 }
 
@@ -156,11 +165,11 @@ opaque type CallableHeaderGraph = CallableHeaderGraphRep
 
 
 union CallableHeaderGraphError:
-	CallableOwnerModuleMissing(CallableId, String)
+	CallableOwnerModuleMissing(String, String, SourceSpan)
 	GlobalOwnerModuleMissing(GlobalId, String)
-	CallableDuplicateTypeParameter(CallableId, ParsedIdentifier)
-	CallableTypeParameterUnknownBound(CallableId, ParsedIdentifier, ParsedIdentifier)
-	CallableMissingParameterType(CallableId, Int, SourceSpan)
+	CallableDuplicateTypeParameter(String, ParsedIdentifier)
+	CallableTypeParameterUnknownBound(String, ParsedIdentifier, ParsedIdentifier)
+	CallableMissingParameterType(String, Int, SourceSpan)
 	CallableTypeResolutionError(TypeShapeResolutionError)
 	GlobalTypeResolutionError(TypeShapeResolutionError)
 
@@ -181,9 +190,54 @@ private record CallableSignatureResolution {
 private record CallableHeaderBuildState {
 	callables: List[CallableHeader],
 	callable_index_by_definition_id: Dict[Int, Int],
+	callable_range_by_module: Dict[Int, CallableHeaderModuleRange],
+	current_callable_range: Option[CallableHeaderModuleRange],
 	globals: List[GlobalHeader],
 	errors: List[CallableHeaderGraphError]
 }
+
+
+-- DeclarationSkeletonGraph traverses one module at a time, and its callable
+-- projection preserves that order. Keep only the active module range while
+-- headers are appended so a wide module remains O(callables), not O(callables²)
+-- through repeated copy-on-write appends to an inner list.
+private pure func append_callable_module_range(
+	state: CallableHeaderBuildState,
+	module_index: Int,
+	callable_index: Int,
+) -> CallableHeaderBuildState:
+	match state.current_callable_range:
+		None:
+			{ state | current_callable_range = Some({
+					module_index = module_index,
+					start = callable_index,
+					count = 1,
+				}) }
+		Some(current):
+			if current.module_index == module_index:
+				{ state | current_callable_range = Some({ current | count = current.count + 1 }) }
+			else:
+				{ state |
+					callable_range_by_module = state.callable_range_by_module.set(
+						current.module_index,
+						current,
+					),
+					current_callable_range = Some({
+						module_index = module_index,
+						start = callable_index,
+						count = 1,
+					})
+				}
+
+
+private pure func finish_callable_module_ranges(
+	state: CallableHeaderBuildState,
+) -> Dict[Int, CallableHeaderModuleRange]:
+	match state.current_callable_range:
+		Some(current):
+			state.callable_range_by_module.set(current.module_index, current)
+		None:
+			state.callable_range_by_module
 
 
 pure func callable_type_parameter_id(
@@ -201,7 +255,27 @@ pure func callable_header_id(header: CallableHeader) -> CallableId:
 
 
 pure func callable_header_name(header: CallableHeader) -> String:
-	callable_id_name(callable_header_id(header))
+	match callable_header_source(header):
+		FunctionCallableHeaderSource(decl):
+			decl.name.text
+		ForeignCallableHeaderSource(decl):
+			decl.name.text
+
+
+private pure func callable_header_source_span(source: CallableHeaderSource) -> SourceSpan:
+	match source:
+		FunctionCallableHeaderSource(decl):
+			decl.span
+		ForeignCallableHeaderSource(decl):
+			decl.span
+
+
+private pure func callable_header_source_name(source: CallableHeaderSource) -> String:
+	match source:
+		FunctionCallableHeaderSource(decl):
+			decl.name.text
+		ForeignCallableHeaderSource(decl):
+			decl.name.text
 
 
 pure func callable_header_category(header: CallableHeader) -> CallableHeaderCategory:
@@ -353,6 +427,7 @@ private pure func resolve_callable_type_parameters(
 	type_headers: TypeHeaderGraph,
 	module: BoundModule,
 	owner: CallableId,
+	owner_name: String,
 	parsed_parameters: List[ParsedTypeParamDecl],
 ) -> CallableTypeParameterResolution:
 	declaration_graph = type_header_graph_declaration_graph(type_headers)
@@ -371,7 +446,7 @@ private pure func resolve_callable_type_parameters(
 		var bounds: List[TraitId] = []
 
 		if names.contains(parsed.name.text):
-			errors = errors.append(CallableDuplicateTypeParameter(owner, parsed.name))
+			errors = errors.append(CallableDuplicateTypeParameter(owner_name, parsed.name))
 		else:
 			names = names.append(parsed.name.text)
 
@@ -380,7 +455,7 @@ private pure func resolve_callable_type_parameters(
 				None:
 					errors = errors.append(
 						CallableTypeParameterUnknownBound(
-							owner,
+							owner_name,
 							parsed.name,
 							bound,
 						),
@@ -431,7 +506,7 @@ private pure func resolve_callable_return_type(
 
 private pure func resolve_callable_signature(
 	context: CallableTypeResolutionContext,
-	owner: CallableId,
+	owner_name: String,
 	parsed_params: List[ParsedParam],
 	parsed_return_type: Option[ParsedTypeExpr],
 	dimension_constraints: List[ParsedDimConstraint],
@@ -447,7 +522,7 @@ private pure func resolve_callable_signature(
 			None:
 				errors = errors.append(
 					CallableMissingParameterType(
-						owner,
+						owner_name,
 						parameter_index,
 						param.span,
 					),
@@ -514,22 +589,43 @@ private pure func append_callable_header(
 	is_pure: Bool,
 ) -> CallableHeaderBuildState:
 	bound_graph = type_header_graph_bound_graph(type_headers)
+	definition_table = declaration_skeleton_graph_definition_table(
+		type_header_graph_declaration_graph(type_headers),
+	)
+	owner_name = callable_header_source_name(source)
+	owner_span = callable_header_source_span(source)
+	owner_module_id = callable_id_module_id(definition_table, skeleton.id)
+	owner = owner_module_id.and_then(func(module_id):
+		bound_module_graph_find_for_id(
+			bound_graph,
+			bound_module_graph_module_table(bound_graph),
+			module_id,
+		).map(
+			func(module): (module_id, module),
+		)
+	)
 
-	match bound_module_graph_find_for_id(
-		bound_graph,
-		bound_module_graph_module_table(bound_graph),
-		callable_id_module_id(skeleton.id),
-	):
+	match owner:
 		None:
-			module_path = bound_module_graph_canonical_path_for_id(
-				bound_graph,
-				bound_module_graph_module_table(bound_graph),
-				callable_id_module_id(skeleton.id),
-			).get_or("<unknown-module>")
+			module_path = owner_module_id
+				.and_then(func(module_id):
+					bound_module_graph_canonical_path_for_id(
+						bound_graph,
+						bound_module_graph_module_table(bound_graph),
+						module_id,
+					)
+				)
+				.get_or("<unknown-module>")
 			{ state |
-				errors = state.errors.append(CallableOwnerModuleMissing(skeleton.id, module_path))
+				errors = state.errors.append(
+					CallableOwnerModuleMissing(
+						owner_name,
+						module_path,
+						owner_span,
+					),
+				)
 			}
-		Some(module):
+		Some((module_id, module)):
 			effective_type_parameters = effective_callable_type_parameters(
 				type_headers,
 				module,
@@ -542,6 +638,7 @@ private pure func append_callable_header(
 				type_headers,
 				module,
 				skeleton.id,
+				owner_name,
 				effective_type_parameters,
 			)
 			parameter_ids = parameter_resolution.parameters.map(callable_type_parameter_id)
@@ -549,6 +646,8 @@ private pure func append_callable_header(
 				type_headers,
 				bound_module_scope(module),
 				skeleton.id,
+				owner_name,
+				owner_span,
 				parameter_ids,
 			)
 
@@ -562,7 +661,7 @@ private pure func append_callable_header(
 				Ok(context):
 					signature_resolution = resolve_callable_signature(
 						context,
-						skeleton.id,
+						owner_name,
 						params,
 						return_type,
 						dimension_constraints,
@@ -580,13 +679,15 @@ private pure func append_callable_header(
 								dimension_constraints = signature_resolution.dimension_constraints
 							})
 						index = state.callables.length()
-						{ state |
+						module_index = module_id_table_index(module_id)
+						with_header = { state |
 							callables = state.callables.append(header),
 							callable_index_by_definition_id = state.callable_index_by_definition_id.set(
 								callable_id_definition_id(skeleton.id),
 								index,
 							)
 						}
+						append_callable_module_range(with_header, module_index, index)
 					else:
 						{ state | errors = state.errors.concat(all_errors) }
 
@@ -662,6 +763,8 @@ pure func callable_header_graph_build(
 	var state: CallableHeaderBuildState = {
 		callables = [],
 		callable_index_by_definition_id = {},
+		callable_range_by_module = {},
+		current_callable_range = None,
 		globals = [],
 		errors = []
 	}
@@ -703,6 +806,7 @@ pure func callable_header_graph_build(
 			trait_topology = trait_topology,
 			callables = state.callables,
 			callable_index_by_definition_id = state.callable_index_by_definition_id,
+			callable_range_by_module = finish_callable_module_ranges(state),
 			globals = state.globals
 		}
 		Ok(into_opaque CallableHeaderGraph(representation))
@@ -718,8 +822,47 @@ pure func callable_header_graph_trait_topology(graph: CallableHeaderGraph) -> Tr
 	callable_header_graph_rep(graph).trait_topology
 
 
+pure func callable_header_graph_definition_table(graph: CallableHeaderGraph) -> DefinitionTable:
+	declaration_skeleton_graph_definition_table(
+		type_header_graph_declaration_graph(
+			trait_topology_graph_type_headers(callable_header_graph_trait_topology(graph)),
+		),
+	)
+
+
 pure func callable_header_graph_callables(graph: CallableHeaderGraph) -> List[CallableHeader]:
 	callable_header_graph_rep(graph).callables
+
+
+-- Module-local body planning must not rescan the complete callable graph. This
+-- immutable range index points into the canonical header list and preserves its
+-- source order without introducing invalidation or a second identity authority.
+pure func callable_header_graph_callables_for_module(
+	graph: CallableHeaderGraph,
+	module_id: ModuleId,
+) -> List[CallableHeader]:
+	representation = callable_header_graph_rep(graph)
+
+	match representation.callable_range_by_module.get(module_id_table_index(module_id)):
+		Some(range):
+			-- List.drop copies and retains the complete remaining tail. Reading
+			-- exactly this range keeps total module planning proportional to the
+			-- number of callable headers instead of modules times callables.
+			var result: List[CallableHeader] = []
+			var offset: Int = 0
+
+			while offset < range.count:
+				match representation.callables.get(range.start + offset):
+					Some(header):
+						result = result.append(header)
+					None:
+						void
+
+				offset = offset + 1
+
+			result
+		None:
+			[]
 
 
 pure func callable_header_graph_globals(graph: CallableHeaderGraph) -> List[GlobalHeader]:
@@ -759,32 +902,24 @@ pure func callable_header_graph_find_definition_id(
 
 pure func callable_header_graph_error_message(error: CallableHeaderGraphError) -> String:
 	match error:
-		CallableOwnerModuleMissing(id, module_path):
-			"callable '" + callable_id_name(
-				id,
-			) + "' has no bound owner module '" + module_path + "'"
+		CallableOwnerModuleMissing(name, module_path, _):
+			"callable '" + name + "' has no bound owner module '" + module_path + "'"
 		GlobalOwnerModuleMissing(id, module_path):
 			"global '" + global_id_name(id) + "' has no bound owner module '" + module_path + "'"
-		CallableDuplicateTypeParameter(id, name):
-			"callable '" + callable_id_name(
-				id,
-			) + "' declares type parameter '" + name.text + "' more than once"
-		CallableTypeParameterUnknownBound(id, parameter, bound):
-			"callable '" + callable_id_name(
-				id,
-			) + "' type parameter '" + parameter.text + "' has unknown bound '" + bound.text + "'"
-		CallableMissingParameterType(id, parameter_index, _):
-			"callable '" + callable_id_name(
-				id,
-			) + "' parameter " + (parameter_index + 1).to_string() + " must have an explicit type"
+		CallableDuplicateTypeParameter(owner_name, name):
+			"callable '" + owner_name + "' declares type parameter '" + name.text + "' more than once"
+		CallableTypeParameterUnknownBound(owner_name, parameter, bound):
+			"callable '" + owner_name + "' type parameter '" + parameter.text + "' has unknown bound '" + bound.text + "'"
+		CallableMissingParameterType(owner_name, parameter_index, _):
+			"callable '" + owner_name + "' parameter " + (parameter_index + 1).to_string() + " must have an explicit type"
 		CallableTypeResolutionError(resolution_error) | GlobalTypeResolutionError(resolution_error):
 			type_shape_resolution_error_message(resolution_error)
 
 
 pure func callable_header_graph_error_span(error: CallableHeaderGraphError) -> Option[SourceSpan]:
 	match error:
-		CallableOwnerModuleMissing(id, _):
-			Some(callable_id_source_span(id))
+		CallableOwnerModuleMissing(_, _, span):
+			Some(span)
 		GlobalOwnerModuleMissing(id, _):
 			Some(global_id_source_span(id))
 		CallableDuplicateTypeParameter(_, name):

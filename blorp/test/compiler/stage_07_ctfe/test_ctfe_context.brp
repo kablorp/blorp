@@ -21,6 +21,13 @@ import:
 		TypedDecl(TypedFunctionDecl, TypedParsedDecl, TypedPrivateDecl),
 		TypedFunctionInfo,
 		TypedProgram,
+		TypedUnionInfo,
+	../../../src/compiler/stage_06_typecheck/graph/definition_index:
+		DefinitionTable,
+		definition_index_definition_table,
+		definition_index_empty,
+		definition_index_initial_seed,
+	../../../src/compiler/stage_06_typecheck/type_system/env: ENV_EMPTY
 	../../../src/compiler/stage_06_typecheck/type_system/semantic_type: TYPE_INT
 	../../../src/compiler/stage_07_ctfe/context:
 		CtfeContext,
@@ -37,6 +44,7 @@ import:
 		ctfe_context_module_has_global_binding,
 		ctfe_context_module_path,
 		ctfe_context_with_module_global_env,
+		ctfe_imported_program_set,
 	../../../src/compiler/stage_07_ctfe/env: CTFE_ENV_EMPTY, ctfe_bind_global_value
 	../../../src/compiler/stage_07_ctfe/value: CtfeValue, ctfe_int, ctfe_values_equal
 	../../../src/lib/source:
@@ -149,9 +157,11 @@ private pure func generated_function_program(
 
 private record CtfeModuleIdFixture {
 	table: ModuleTable,
+	definitions: DefinitionTable,
 	target: ModuleId,
 	dependency: ModuleId,
 	foreign_table: ModuleTable,
+	foreign_definitions: DefinitionTable,
 	foreign_id: ModuleId
 }
 
@@ -184,16 +194,44 @@ private pure func ctfe_module_id_fixture() -> Option[CtfeModuleIdFixture]:
 	foreign_id ?= module_table_find_id_by_canonical_path(foreign_table, "foreign")
 	Some({
 		table = table,
+		definitions = definition_index_definition_table(
+			definition_index_empty(
+				definition_index_initial_seed(ENV_EMPTY),
+				table,
+			),
+		),
 		target = target,
 		dependency = dependency,
 		foreign_table = foreign_table,
+		foreign_definitions = definition_index_definition_table(
+			definition_index_empty(
+				definition_index_initial_seed(ENV_EMPTY),
+				foreign_table,
+			),
+		),
 		foreign_id = foreign_id,
 	})
 
 
 private pure func ctfe_fixture_context(program: TypedProgram) -> Option[CtfeContext]:
 	fixture ?= ctfe_module_id_fixture()
-	ctfe_context_from_program(fixture.table, fixture.target, program, [], [])
+	context_from_programs(fixture.definitions, fixture.target, program, [], [])
+
+
+private pure func context_from_programs(
+	definition_table: DefinitionTable,
+	target_module_id: ModuleId,
+	program: TypedProgram,
+	import_bindings: List[CtfeImportBinding],
+	imported_programs: List[CtfeImportedProgram],
+) -> Option[CtfeContext]:
+	ctfe_context_from_program(
+		definition_table,
+		target_module_id,
+		program,
+		import_bindings,
+		ctfe_imported_program_set(definition_table, imported_programs),
+	)
 
 
 private pure func ctfe_fixture_imported_context(
@@ -210,15 +248,14 @@ private pure func ctfe_fixture_imported_context(
 					for decls in imported_decls:
 						imported_programs = imported_programs.append(
 							complete_ctfe_imported_program(
-								fixture.table,
 								module_id,
 								decls,
 								[],
 							),
 						)
 
-					ctfe_context_from_program(
-						fixture.table,
+					context_from_programs(
+						fixture.definitions,
 						fixture.target,
 						program,
 						[],
@@ -253,19 +290,17 @@ private pure func context_uses_one_aligned_module_id_domain() -> Option[Bool]:
 	fixture ?= ctfe_module_id_fixture()
 	generated_module_id ?= module_table_find_id_by_canonical_path(fixture.table, "generated/module")
 	first = complete_ctfe_imported_program(
-		fixture.table,
 		fixture.dependency,
 		[TypedFunctionDecl(typed_function("render", Some(20)))],
 		[],
 	)
 	second = complete_ctfe_imported_program(
-		fixture.table,
 		fixture.dependency,
 		[TypedFunctionDecl(typed_function("render", Some(21)))],
 		[],
 	)
-	context ?= ctfe_context_from_program(
-		fixture.table,
+	context ?= context_from_programs(
+		fixture.definitions,
 		fixture.target,
 		typed_program([]),
 		[CtfeQualifiedModuleBinding("Dep", fixture.dependency)],
@@ -338,25 +373,53 @@ pure func test_context_uses_one_aligned_module_id_domain() -> Bool:
 private pure func context_rejects_imported_program_from_incompatible_domain() -> Option[Bool]:
 	fixture ?= ctfe_module_id_fixture()
 	foreign_program = complete_ctfe_imported_program(
-		fixture.foreign_table,
 		fixture.foreign_id,
 		[TypedFunctionDecl(typed_function("foreign", Some(30)))],
 		[],
 	)
 
+	foreign_program_set = ctfe_imported_program_set(fixture.foreign_definitions, [foreign_program])
 	Some(
 		ctfe_context_from_program(
-			fixture.table,
+			fixture.definitions,
 			fixture.target,
 			typed_program([]),
 			[],
-			[foreign_program],
+			foreign_program_set,
 		).is_none(),
 	)
 
 
 pure func test_context_rejects_imported_program_from_incompatible_domain() -> Bool:
 	context_rejects_imported_program_from_incompatible_domain().get_or(False)
+
+
+private pure func context_rejects_imported_program_from_different_definition_snapshot(
+
+) -> Option[Bool]:
+	fixture ?= ctfe_module_id_fixture()
+	other_definitions = definition_index_definition_table(
+		definition_index_empty(
+			definition_index_initial_seed(ENV_EMPTY),
+			fixture.table,
+		),
+	)
+	imported_program = complete_ctfe_imported_program(fixture.dependency, [], [])
+
+	other_program_set = ctfe_imported_program_set(other_definitions, [imported_program])
+	Some(
+		ctfe_context_from_program(
+			fixture.definitions,
+			fixture.target,
+			typed_program([]),
+			[],
+			other_program_set,
+		).is_none(),
+	)
+
+
+pure func test_context_rejects_different_definition_snapshot() -> Bool:
+	context_rejects_imported_program_from_different_definition_snapshot().get_or(False)
 
 
 private func imported_context_allocation_bytes(
@@ -525,8 +588,8 @@ private func context_collects_module_aliases_from_import_blocks() -> Option[Bool
 			),
 		),
 	])
-	context ?= ctfe_context_from_program(
-		fixture.table,
+	context ?= context_from_programs(
+		fixture.definitions,
 		fixture.target,
 		program,
 		[CtfeQualifiedModuleBinding("list", list_id), CtfeQualifiedModuleBinding("Math", math_id)],
@@ -580,20 +643,18 @@ private func context_scopes_module_aliases_to_importing_module() -> Option[Bool]
 			),
 		],
 	)
-	context ?= ctfe_context_from_program(
-		fixture.table,
+	context ?= context_from_programs(
+		fixture.definitions,
 		fixture.target,
 		typed_program([]),
 		[],
 		[
 			complete_ctfe_imported_program(
-				fixture.table,
 				first_id,
 				first_program.decls,
 				[CtfeQualifiedModuleBinding("Dep", first_value_id)],
 			),
 			complete_ctfe_imported_program(
-				fixture.table,
 				second_id,
 				second_program.decls,
 				[CtfeQualifiedModuleBinding("Dep", second_value_id)],
@@ -626,7 +687,7 @@ private func context_module_global_env_lookup() -> Option[Bool]:
 	fixture ?= ctfe_module_id_fixture()
 	env = ctfe_bind_global_value(CTFE_ENV_EMPTY, "LIMIT", int_value(42))
 	context = ctfe_context_with_module_global_env(
-		ctfe_context_empty(fixture.table, fixture.target),
+		ctfe_context_empty(fixture.definitions, fixture.target),
 		fixture.table,
 		fixture.dependency,
 		env,
@@ -663,6 +724,10 @@ tests: TestSuite = {
 		(
 			"context rejects imported program from incompatible module domain",
 			test_context_rejects_imported_program_from_incompatible_domain,
+		),
+		(
+			"context rejects imported program from a different definition snapshot",
+			test_context_rejects_different_definition_snapshot,
 		),
 		(
 			"context collects functions by callable id",

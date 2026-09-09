@@ -4,6 +4,8 @@ import:
 		ModuleOrigin(UserModule),
 		module_load_candidate,
 		resolved_module_identity_from_resolver,
+	../../../src/compiler/stage_04_modules/module_table: module_tables_are_compatible
+	../../../src/compiler/stage_06_typecheck/graph/definition_index: definition_table_module_table
 	../../../src/compiler/stage_06_typecheck/graph/indexed_graph:
 		PreparedModuleScope,
 		indexed_graph_build,
@@ -19,6 +21,8 @@ import:
 		callable_header_dimension_constraints,
 		callable_header_graph_build,
 		callable_header_graph_callables,
+		callable_header_graph_callables_for_module,
+		callable_header_graph_definition_table,
 		callable_header_graph_error_message,
 		callable_header_graph_error_span,
 		callable_header_graph_find,
@@ -36,6 +40,8 @@ import:
 		callable_signature_parameters,
 		callable_signature_return_type,
 	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
+		callable_id_module_id,
+		callable_id_name,
 		callable_id_source_span,
 		callable_ids_equal,
 		declaration_skeleton_graph_build,
@@ -75,6 +81,7 @@ import:
 		type_header_graph_bound_graph,
 		type_header_graph_build,
 		type_header_graph_declaration_graph,
+		type_header_graph_definition_table,
 	../../../src/compiler/stage_06_typecheck/headers/type_parameter_headers:
 		resolved_type_parameter_graph_build,
 	../../../src/compiler/stage_06_typecheck/modules/bound_module_graph:
@@ -201,6 +208,9 @@ private pure func prepared_context_rejects_foreign_parameters() -> Option[Bool]:
 	second_id = callable_header_id(second)
 	foreign_parameters = callable_type_parameter_ids(first_id, ["T"])
 	type_headers = trait_topology_graph_type_headers(callable_header_graph_trait_topology(graph))
+	definition_table = type_header_graph_definition_table(type_headers)
+	second_name ?= callable_id_name(definition_table, second_id)
+	second_span ?= callable_id_source_span(definition_table, second_id)
 	owner_scope = bound_module_scope(
 		bound_module_graph_target(type_header_graph_bound_graph(type_headers)),
 	)
@@ -210,12 +220,14 @@ private pure func prepared_context_rejects_foreign_parameters() -> Option[Bool]:
 			type_headers,
 			owner_scope,
 			second_id,
+			second_name,
+			second_span,
 			foreign_parameters,
 		):
 			Err([TypeShapeForeignCallableParameter(_, parameter, span)]):
 				(
 					callable_ids_equal(callable_type_parameter_id_owner(parameter), first_id)
-					and source_spans_equal(span, callable_id_source_span(second_id))
+					and source_spans_equal(span, second_span)
 				)
 			_:
 				False
@@ -229,7 +241,11 @@ pure func test_prepared_context_rejects_foreign_parameters() -> Bool:
 private pure func prepared_context_rejects_foreign_graph_scope() -> Option[Bool]:
 	graph ?= callable_graph("pure func local(value: Int) -> Int: value")
 	header ?= callable_header_by_name(graph, "local")
+	callable_id = callable_header_id(header)
 	type_headers = trait_topology_graph_type_headers(callable_header_graph_trait_topology(graph))
+	definition_table = type_header_graph_definition_table(type_headers)
+	callable_name ?= callable_id_name(definition_table, callable_id)
+	diagnostic_span ?= callable_id_source_span(definition_table, callable_id)
 	foreign_graph ?= callable_graph_at("other", "pure func remote(value: Int) -> Int: value")
 	foreign_type_headers = trait_topology_graph_type_headers(
 		callable_header_graph_trait_topology(foreign_graph),
@@ -242,11 +258,13 @@ private pure func prepared_context_rejects_foreign_graph_scope() -> Option[Bool]
 		match prepare_callable_type_resolution_context(
 			type_headers,
 			foreign_scope,
-			callable_header_id(header),
+			callable_id,
+			callable_name,
+			diagnostic_span,
 			[],
 		):
 			Err([TypeShapeOwnerModuleMissing(_, span)]):
-				source_spans_equal(span, callable_id_source_span(callable_header_id(header)))
+				source_spans_equal(span, diagnostic_span)
 			_:
 				False
 	)
@@ -269,17 +287,23 @@ private pure func prepared_context_rejects_wrong_same_graph_scope() -> Option[Bo
 	topology ?= trait_topology_graph_build(type_headers).to_option()
 	graph ?= callable_header_graph_build(topology).to_option()
 	header ?= callable_header_by_name(graph, "local")
+	callable_id = callable_header_id(header)
+	definition_table = type_header_graph_definition_table(type_headers)
+	callable_name ?= callable_id_name(definition_table, callable_id)
+	diagnostic_span ?= callable_id_source_span(definition_table, callable_id)
 	dependency ?= bound_module_graph_find_canonical_path(bound, "dep")
 
 	Some(
 		match prepare_callable_type_resolution_context(
 			type_headers,
 			bound_module_scope(dependency),
-			callable_header_id(header),
+			callable_id,
+			callable_name,
+			diagnostic_span,
 			[],
 		):
 			Err([TypeShapeOwnerModuleMissing(_, span)]):
-				source_spans_equal(span, callable_id_source_span(callable_header_id(header)))
+				source_spans_equal(span, diagnostic_span)
 			_:
 				False
 	)
@@ -332,7 +356,11 @@ private pure func callable_and_global_ids_are_exact() -> Option[Bool]:
 	global_headers = callable_header_graph_globals(graph)
 	global_skeletons = declaration_skeleton_graph_global_skeletons(declarations)
 	foreign_callable ?= callable_header_graph_callables(foreign_graph).get(0)
+	definition_table = callable_header_graph_definition_table(graph)
+	foreign_definition_table = callable_header_graph_definition_table(foreign_graph)
 
+	-- Scalar declaration IDs are exact only within their definition-table domain;
+	-- the issuing table carries cross-graph identity at public boundaries.
 	Some((
 			callable_headers.length() == callable_skeletons.length()
 			and callable_headers
@@ -351,12 +379,58 @@ private pure func callable_and_global_ids_are_exact() -> Option[Bool]:
 				.all(func(pair):
 					global_ids_equal(global_header_id(pair[0]), pair[1].id)
 				)
-			and callable_header_graph_find(graph, callable_header_id(foreign_callable)).is_none()
+			and callable_header_graph_find(
+				foreign_graph,
+				callable_header_id(foreign_callable),
+			).is_some()
+			and not module_tables_are_compatible(
+				definition_table_module_table(definition_table),
+				definition_table_module_table(foreign_definition_table),
+			)
 		))
 
 
 pure func test_callable_and_global_ids_are_exact() -> Bool:
 	callable_and_global_ids_are_exact().get_or(False)
+
+
+private pure func callable_headers_are_indexed_by_module() -> Option[Bool]:
+	indexed ?= indexed_graph_build(
+		module_load_candidate_at(
+			"main",
+			"pure func first(value: Int) -> Int: value\n\npure func second(value: Int) -> Int: value",
+		),
+		[module_load_candidate_at("dep", "pure func remote(value: Int) -> Int: value")],
+	).to_option()
+	bound ?= bound_module_graph_build(indexed, ["dep"], accept_empty_view).to_option()
+	skeletons ?= declaration_skeleton_graph_build(bound).to_option()
+	aliases ?= type_alias_dependency_graph_validate(skeletons).to_option()
+	parameters ?= resolved_type_parameter_graph_build(aliases).to_option()
+	type_headers ?= type_header_graph_build(parameters).to_option()
+	topology ?= trait_topology_graph_build(type_headers).to_option()
+	graph ?= callable_header_graph_build(topology).to_option()
+	first ?= callable_header_by_name(graph, "first")
+	remote ?= callable_header_by_name(graph, "remote")
+	definition_table = callable_header_graph_definition_table(graph)
+	main_module_id ?= callable_id_module_id(definition_table, callable_header_id(first))
+	dependency_module_id ?= callable_id_module_id(definition_table, callable_header_id(remote))
+
+	Some(
+		(
+			callable_header_graph_callables_for_module(
+				graph,
+				main_module_id,
+			).map(callable_header_name) == ["first", "second"]
+			and callable_header_graph_callables_for_module(
+				graph,
+				dependency_module_id,
+			).map(callable_header_name) == ["remote"]
+		),
+	)
+
+
+pure func test_callable_headers_are_indexed_by_module() -> Bool:
+	callable_headers_are_indexed_by_module().get_or(False)
 
 
 private pure func callable_headers_infer_implicit_parameters() -> Option[Bool]:
@@ -522,6 +596,7 @@ tests: TestSuite = {
 			test_prepared_context_resolves_dimension_constraints,
 		),
 		("callable and global ids are exact", test_callable_and_global_ids_are_exact),
+		("index callable headers by module", test_callable_headers_are_indexed_by_module),
 		("infer implicit callable parameters", test_callable_headers_infer_implicit_parameters),
 		(
 			"distinguish pending global initializers",

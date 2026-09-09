@@ -21,9 +21,12 @@ import:
 	../../../src/compiler/stage_06_typecheck/decl:
 		TypedDecl(TypedFunctionDecl, TypedImplDecl, TypedPrivateDecl, TypedUnionDecl),
 		TypedProgram,
+	../../../src/compiler/stage_06_typecheck/graph/definition_index:
+		DefinitionTable,
+		definition_table_module_table,
+	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton: callable_id_module_id
 	../../../src/compiler/stage_06_typecheck/infer:
-		CallableOrigin(CallableImported),
-		ResolvedCallTarget(ResolvedDirectCall, ResolvedTraitMethodCall),
+		ResolvedCallTarget(ResolvedGraphCallableCall, ResolvedSelectedTraitMethodCall),
 		TypedExpr(TypedBlockExpr, TypedCallExpr),
 		resolved_call_callable_id,
 		typed_expr_resolved_call,
@@ -3270,7 +3273,11 @@ pure func test_typed_graph_api_returns_in_memory_results() -> Bool:
 	module_ids_are_aligned = match (
 		module_table_find_id_by_canonical_path(graph.module_table, "util"),
 		graph.modules.get(0),
-		typed_function_body_call_module(graph.target.typed_program, "main"),
+		typed_function_body_call_module(
+			graph.definition_table,
+			graph.target.typed_program,
+			"main",
+		),
 	):
 		(Some(dependency_id), Some(dependency), Some((call_module_id, call_module_path))):
 			(
@@ -3394,6 +3401,7 @@ private pure func typed_function_body_call_id(program: TypedProgram, name: Strin
 
 
 private pure func typed_function_body_call_module(
+	definition_table: DefinitionTable,
 	program: TypedProgram,
 	name: String,
 ) -> Option[(ModuleId, String)]:
@@ -3408,10 +3416,22 @@ private pure func typed_function_body_call_module(
 							match typed_expr_resolved_call(body):
 								Some(call):
 									match call.target:
-										ResolvedTraitMethodCall(_, Some(target)):
-											result = Some((target.module_id, target.module_path))
-										ResolvedDirectCall(_, CallableImported(module_id, module_path)):
-											result = Some((module_id, module_path))
+										ResolvedGraphCallableCall(callable_id, _):
+											result = callable_id_module_id(definition_table, callable_id)
+												.and_then(func(module_id):
+													module_table_canonical_path(
+														definition_table_module_table(definition_table),
+														module_id,
+													).map(func(path): (module_id, path))
+												)
+										ResolvedSelectedTraitMethodCall(_, callable_id):
+											result = callable_id_module_id(definition_table, callable_id)
+												.and_then(func(module_id):
+													module_table_canonical_path(
+														definition_table_module_table(definition_table),
+														module_id,
+													).map(func(path): (module_id, path))
+												)
 										_:
 											void
 								None:
@@ -3426,14 +3446,22 @@ private pure func typed_function_body_call_module(
 	result
 
 
-private pure func typed_expr_callee_call_module_path(expr: TypedExpr) -> Option[String]:
+private pure func typed_expr_callee_call_module_path(
+	definition_table: DefinitionTable,
+	expr: TypedExpr,
+) -> Option[String]:
 	match expr:
 		TypedCallExpr(callee, _, _, _):
 			match typed_expr_resolved_call(callee):
 				Some(call):
 					match call.target:
-						ResolvedTraitMethodCall(_, Some(target)):
-							Some(target.module_path)
+						ResolvedSelectedTraitMethodCall(_, callable_id):
+							callable_id_module_id(definition_table, callable_id).and_then(
+								func(module_id): module_table_canonical_path(
+									definition_table_module_table(definition_table),
+									module_id,
+								),
+							)
 						_:
 							None
 				None:
@@ -3441,7 +3469,7 @@ private pure func typed_expr_callee_call_module_path(expr: TypedExpr) -> Option[
 		TypedBlockExpr(items, _, _):
 			match items.get(items.length() - 1):
 				Some(last):
-					typed_expr_callee_call_module_path(last)
+					typed_expr_callee_call_module_path(definition_table, last)
 				None:
 					None
 		_:
@@ -3449,6 +3477,7 @@ private pure func typed_expr_callee_call_module_path(expr: TypedExpr) -> Option[
 
 
 private pure func typed_function_body_callee_call_module_path(
+	definition_table: DefinitionTable,
 	program: TypedProgram,
 	name: String,
 ) -> Option[String]:
@@ -3460,7 +3489,7 @@ private pure func typed_function_body_callee_call_module_path(
 				if info.decl.name.text == name:
 					match info.body:
 						Some(body):
-							result = typed_expr_callee_call_module_path(body)
+							result = typed_expr_callee_call_module_path(definition_table, body)
 						None:
 							void
 
@@ -3854,7 +3883,11 @@ pure func test_typed_graph_ufcs_rejects_mismatched_local_generic_receiver() -> B
 		include_comments = False,
 		allow_debug_only_calls = False,
 	})
-	body_call_module = typed_function_body_call_module(graph.target.typed_program, "measure")
+	body_call_module = typed_function_body_call_module(
+		graph.definition_table,
+		graph.target.typed_program,
+		"measure",
+	)
 	dep_module_id = module_table_find_id_by_canonical_path(graph.module_table, "dep")
 
 	call_module_matches = match (body_call_module, dep_module_id):
@@ -3866,7 +3899,11 @@ pure func test_typed_graph_ufcs_rejects_mismatched_local_generic_receiver() -> B
 	match (
 		typed_function_callable_id(graph.target.typed_program, "length"),
 		typed_function_body_call_id(graph.target.typed_program, "measure"),
-		typed_function_body_callee_call_module_path(graph.target.typed_program, "measure"),
+		typed_function_body_callee_call_module_path(
+			graph.definition_table,
+			graph.target.typed_program,
+			"measure",
+		),
 		typed_module_program(graph.module_table, graph.modules, "dep"),
 	):
 		(Some(local_length_id), Some(measure_call_id), Some("dep"), Some(dep_program)):

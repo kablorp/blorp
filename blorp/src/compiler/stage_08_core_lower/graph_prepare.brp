@@ -11,11 +11,14 @@ import:
 		module_id_table_index,
 		module_table_canonical_path,
 		module_table_count,
-		module_tables_are_compatible,
 	../stage_06_typecheck/decl:
 		TypedDecl(TypedFunctionDecl, TypedImplDecl, TypedPrivateDecl),
 		TypedFunctionInfo,
 		TypedProgram,
+	../stage_06_typecheck/graph/definition_index:
+		DefinitionTable,
+		definition_table_module_table,
+		definition_tables_share_provenance,
 	../stage_09_core/ir: CoreProgram
 	entrypoint: synthesize_program_entrypoint
 	ffi_boundary: CoreFfiBoundaryError, annotate_ffi_boundaries, core_ffi_boundary_error_to_string
@@ -44,7 +47,7 @@ record CoreGraphUnit {
 
 
 private record CoreGraphModulesRep {
-	module_table: ModuleTable,
+	definition_table: DefinitionTable,
 	units: List[CoreGraphUnit]
 }
 
@@ -53,11 +56,11 @@ opaque type CoreGraphModules = CoreGraphModulesRep
 
 
 pure func core_graph_modules(
-	module_table: ModuleTable,
+	definition_table: DefinitionTable,
 	units: List[CoreGraphUnit],
 ) -> CoreGraphModules:
 	into_opaque CoreGraphModules({
-			module_table = module_table,
+			definition_table = definition_table,
 			units = units
 		})
 
@@ -83,9 +86,9 @@ private record LoweredCoreModules {
 }
 
 
--- Resolved calls retain canonical module paths, while Core's module-name
--- flattening may use a separately projected display/module name. Keep both
--- facts at this boundary and index canonical UFCS names by the resolved path.
+-- Resolved calls carry definition-backed identity. Core's emitted UFCS name
+-- still needs the module prefix, so register that display projection once at
+-- this boundary and index it by the definition's owning ModuleId.
 private pure func register_callable_name(
 	by_module: List[Dict[Int, CoreLowerCallableName]],
 	module_id: ModuleId,
@@ -216,6 +219,7 @@ pure func core_graph_prepare_error_to_string(error: CoreGraphPrepareError) -> St
 private pure func lower_core_modules(
 	modules: List[CoreGraphUnit],
 	context: CoreLowerContext,
+	definition_table: DefinitionTable,
 ) -> Result[LoweredCoreModules, CoreGraphPrepareError]:
 	match modules:
 		[]:
@@ -229,6 +233,8 @@ private pure func lower_core_modules(
 			module_context = core_lower_context_with_callable_names(
 				context.next_def_id,
 				Some(module_name),
+				definition_table,
+				unit.module_id,
 				context.callable_names,
 			)
 
@@ -244,7 +250,7 @@ private pure func lower_core_modules(
 				Err(error):
 					Err(CoreGraphFlattenError(module_name, error))
 
-			rest ?= lower_core_modules(remaining, lowered_result.context)
+			rest ?= lower_core_modules(remaining, lowered_result.context, definition_table)
 
 			Ok({
 				context = rest.context,
@@ -269,21 +275,25 @@ private pure func assemble_core_program(
 
 
 pure func prepare_core_graph(
-	module_table: ModuleTable,
+	definition_table: DefinitionTable,
 	target_module_id: ModuleId,
 	target: TypedProgram,
 	modules: CoreGraphModules,
 	next_def_id: Int,
 ) -> Result[CorePreparedGraph, CoreGraphPrepareError]:
 	module_product: CoreGraphModulesRep = from_opaque CoreGraphModules(modules)
+	module_table: ModuleTable = definition_table_module_table(definition_table)
 
-	compatible_units = if module_tables_are_compatible(module_table, module_product.module_table):
+	compatible_units = if definition_tables_share_provenance(
+		definition_table,
+		module_product.definition_table,
+	):
 		Some(module_product.units)
 	else:
 		None
 
 	units ?= compatible_units.to_result(
-		CoreGraphModuleTableError("Core graph module IDs were issued by a different module table"),
+		CoreGraphModuleTableError("Core graph modules use an incompatible definition table"),
 	)
 	callable_names ?= core_graph_callable_names(
 		module_table,
@@ -293,11 +303,19 @@ pure func prepare_core_graph(
 	).to_result(
 		CoreGraphModuleTableError("Core graph contains a module ID outside its module table"),
 	)
-	initial_context = core_lower_context_with_callable_names(next_def_id, None, callable_names)
-	lowered_modules ?= lower_core_modules(units, initial_context)
+	initial_context = core_lower_context_with_callable_names(
+		next_def_id,
+		None,
+		definition_table,
+		target_module_id,
+		callable_names,
+	)
+	lowered_modules ?= lower_core_modules(units, initial_context, definition_table)
 	target_context = core_lower_context_with_callable_names(
 		lowered_modules.context.next_def_id,
 		None,
+		definition_table,
+		target_module_id,
 		callable_names,
 	)
 

@@ -13,6 +13,7 @@ import:
 		ParsedParamBinder(ParsedParamNameBinder),
 		parsed_function_body_kind,
 	../compiler/stage_04_modules/frontend_graph: frontend_graph_root_modules
+	../compiler/stage_04_modules/module_table: module_table_canonical_path
 	../compiler/stage_06_typecheck/bridge:
 		TypecheckedGraph,
 		TypecheckedModule,
@@ -29,9 +30,23 @@ import:
 		),
 		TypedFunctionInfo,
 	../compiler/stage_06_typecheck/graph/typed_expr_children: typed_expr_children
+	../compiler/stage_06_typecheck/graph/definition_index:
+		DefinitionTable,
+		definition_table_module_table,
+	../compiler/stage_06_typecheck/headers/declaration_skeleton:
+		callable_id_definition_id,
+		callable_id_module_id,
+		constructor_id_definition_id,
 	../compiler/stage_06_typecheck/infer:
-		CallableOrigin(CallableConstructor, CallableImported, CallableImportedUnresolved),
-		ResolvedCallTarget(ResolvedDirectCall, ResolvedTraitMethodCall),
+		ResolvedGraphCallableCategory(ResolvedSourceFunctionCall),
+		ResolvedCallTarget(
+			ResolvedConstructorCall,
+			ResolvedGraphCallableCall,
+			ResolvedSelectedTraitMethodCall,
+			ResolvedUnindexedConstructorCall,
+			ResolvedUnindexedSelectedTraitMethodCall,
+			ResolvedUnresolvedTraitMethodCall,
+		),
 		TypedExpr(
 			TypedAscriptionExpr,
 			TypedAssignExpr,
@@ -109,6 +124,7 @@ import:
 
 
 record LintContext {
+	definition_table: DefinitionTable,
 	value_referenced_callable_ids: List[Int],
 	constant_parameter_facts: List[LintConstantParameterFact]
 }
@@ -221,15 +237,22 @@ pure func lint_context(graph: TypecheckedGraph) -> LintContext:
 	modules = graph.modules.append(graph.target)
 	value_referenced_callable_ids = modules.flat_map(module_value_referenced_callable_ids)
 	constant_definition_ids = modules.flat_map(module_constant_definition_ids)
-	lint_context_for_module(graph.target, value_referenced_callable_ids, constant_definition_ids)
+	lint_context_for_module(
+		graph.target,
+		graph.definition_table,
+		value_referenced_callable_ids,
+		constant_definition_ids,
+	)
 
 
 private pure func lint_context_for_module(
 	module: TypecheckedModule,
+	definition_table: DefinitionTable,
 	value_referenced_callable_ids: List[Int],
 	constant_definition_ids: List[Int],
 ) -> LintContext:
 	{
+		definition_table = definition_table,
 		value_referenced_callable_ids = value_referenced_callable_ids,
 		constant_parameter_facts = graph_constant_parameter_facts(
 			module,
@@ -523,7 +546,14 @@ private pure func observed_argument(
 			match (typed_expr_resolved_call(expr), args):
 				(Some(call), []):
 					match call.target:
-						ResolvedDirectCall(callable_id, CallableConstructor(parent_type)):
+						ResolvedConstructorCall(constructor_id, parent_type):
+							LintConcreteArgument(
+								"constructor:" + parent_type + ":" + constructor_id_definition_id(
+									constructor_id,
+								).to_string(),
+								call.callee_name,
+							)
+						ResolvedUnindexedConstructorCall(callable_id, parent_type):
 							LintConcreteArgument(
 								"constructor:" + parent_type + ":" + callable_id.to_string(),
 								call.callee_name,
@@ -879,7 +909,7 @@ private pure func constant_value_expression(expr: TypedExpr) -> Bool:
 			match typed_expr_resolved_call(expr):
 				Some(call):
 					match call.target:
-						ResolvedDirectCall(_, CallableConstructor(_)):
+						ResolvedConstructorCall(_, _) | ResolvedUnindexedConstructorCall(_, _):
 							args.all(constant_value_expression)
 						_:
 							False
@@ -1057,18 +1087,32 @@ private pure func repeated_list_lookup_finding(span: SourceSpan) -> LintFinding:
 	}
 
 
-private pure func resolved_std_list_call(expr: TypedExpr, expected_name: String) -> Bool:
+private pure func resolved_std_list_call(
+	context: LintContext,
+	expr: TypedExpr,
+	expected_name: String,
+) -> Bool:
 	match typed_expr_resolved_call(expr):
 		Some(call):
 			if call.source_name != expected_name:
 				False
 			else:
 				match call.target:
-					ResolvedDirectCall(_, CallableImported(_, "list")):
-						True
-					ResolvedDirectCall(_, CallableImportedUnresolved("list")):
-						True
-					ResolvedTraitMethodCall(trait_name, _):
+					ResolvedGraphCallableCall(callable_id, ResolvedSourceFunctionCall):
+						callable_id_module_id(context.definition_table, callable_id)
+							.and_then(func(module_id):
+								module_table_canonical_path(
+									definition_table_module_table(context.definition_table),
+									module_id,
+								)
+							)
+							.map(func(module_path): module_path == "list")
+							.get_or(False)
+					ResolvedSelectedTraitMethodCall(trait_name, _):
+						expected_name == "length" and trait_name == "HasLength"
+					ResolvedUnindexedSelectedTraitMethodCall(trait_name, _):
+						expected_name == "length" and trait_name == "HasLength"
+					ResolvedUnresolvedTraitMethodCall(trait_name):
 						expected_name == "length" and trait_name == "HasLength"
 					_:
 						False
@@ -1076,11 +1120,14 @@ private pure func resolved_std_list_call(expr: TypedExpr, expected_name: String)
 			False
 
 
-private pure func list_length_collection_identity(expr: TypedExpr) -> Option[String]:
+private pure func list_length_collection_identity(
+	context: LintContext,
+	expr: TypedExpr,
+) -> Option[String]:
 	match expr:
 		TypedCallExpr(TypedFieldAccessExpr(receiver, field, _, _), args, _, _):
 			if (
-				resolved_std_list_call(expr, "length")
+				resolved_std_list_call(context, expr, "length")
 				and args.length() == 0
 				and semantic_type_is_list(typed_expr_semantic_type(receiver))
 			):
@@ -1091,7 +1138,7 @@ private pure func list_length_collection_identity(expr: TypedExpr) -> Option[Str
 			match args.get(0):
 				Some(receiver):
 					if (
-						resolved_std_list_call(expr, "length")
+						resolved_std_list_call(context, expr, "length")
 						and semantic_type_is_list(typed_expr_semantic_type(receiver))
 					):
 						expression_identity(receiver)
@@ -1103,21 +1150,27 @@ private pure func list_length_collection_identity(expr: TypedExpr) -> Option[Str
 			None
 
 
-private pure func manual_list_index_condition(expr: TypedExpr) -> Option[(String, String)]:
+private pure func manual_list_index_condition(
+	context: LintContext,
+	expr: TypedExpr,
+) -> Option[(String, String)]:
 	match expr:
 		TypedBinaryExpr(ParsedLessOp, left, right, _, _):
 			index_identity ?= expression_identity(left)
-			collection_identity ?= list_length_collection_identity(right)
+			collection_identity ?= list_length_collection_identity(context, right)
 			Some((collection_identity, index_identity))
 		_:
 			None
 
 
-private pure func is_list_lookup_call(expr: TypedExpr) -> Bool:
+private pure func is_list_lookup_call(context: LintContext, expr: TypedExpr) -> Bool:
 	match expr:
 		TypedCallExpr(TypedFieldAccessExpr(receiver, field, _, _), _, _, _):
 			(
-				(resolved_std_list_call(expr, "get") or resolved_std_list_call(expr, "get_or"))
+				(
+					resolved_std_list_call(context, expr, "get")
+					or resolved_std_list_call(context, expr, "get_or")
+				)
 				and semantic_type_is_list(typed_expr_semantic_type(receiver))
 			)
 		TypedCallExpr(TypedNameExpr(callee, _), args, _, _):
@@ -1125,8 +1178,8 @@ private pure func is_list_lookup_call(expr: TypedExpr) -> Bool:
 				Some(receiver):
 					(
 						((
-							resolved_std_list_call(expr, "get")
-							or resolved_std_list_call(expr, "get_or")
+								resolved_std_list_call(context, expr, "get")
+								or resolved_std_list_call(context, expr, "get_or")
 						))
 						and semantic_type_is_list(typed_expr_semantic_type(receiver))
 					)
@@ -1212,10 +1265,13 @@ private pure func list_lookup_occurrence_for_parts(
 			})
 
 
-private pure func list_lookup_occurrence(expr: TypedExpr) -> Option[LintListLookupOccurrence]:
+private pure func list_lookup_occurrence(
+	analysis: LintContext,
+	expr: TypedExpr,
+) -> Option[LintListLookupOccurrence]:
 	match expr:
 		TypedCallExpr(callee, args, span, _):
-			if is_list_lookup_call(expr):
+			if is_list_lookup_call(analysis, expr):
 				receiver_and_index: Option[(TypedExpr, TypedExpr)] = match callee:
 					TypedFieldAccessExpr(receiver, _, _, _):
 						args
@@ -1245,7 +1301,10 @@ private pure func list_lookup_occurrence(expr: TypedExpr) -> Option[LintListLook
 			None
 
 
-private pure func loop_body_lookup_occurrences(expr: TypedExpr) -> List[LintListLookupOccurrence]:
+private pure func loop_body_lookup_occurrences(
+	analysis: LintContext,
+	expr: TypedExpr,
+) -> List[LintListLookupOccurrence]:
 	match expr:
 		TypedForExpr(_, _, _, _, _, _):
 			[]
@@ -1254,13 +1313,15 @@ private pure func loop_body_lookup_occurrences(expr: TypedExpr) -> List[LintList
 		TypedWhileExpr(_, _, _, _):
 			[]
 		_:
-			current: List[LintListLookupOccurrence] = match list_lookup_occurrence(expr):
+			current: List[LintListLookupOccurrence] = match list_lookup_occurrence(analysis, expr):
 				Some(occurrence):
 					[occurrence]
 				None:
 					[]
 
-			current.concat(typed_expr_children(expr).flat_map(loop_body_lookup_occurrences))
+			current.concat(typed_expr_children(expr).flat_map(
+				func(child): loop_body_lookup_occurrences(analysis, child),
+			))
 
 
 private pure func repeated_loop_lookup_findings(
@@ -1297,6 +1358,7 @@ private pure func expression_name_reference_count(expr: TypedExpr, expected: Str
 
 
 private pure func indexed_loop_context(
+	analysis: LintContext,
 	binder: ParsedForBinder,
 	iterable: TypedExpr,
 	body: TypedExpr,
@@ -1307,7 +1369,7 @@ private pure func indexed_loop_context(
 			if expression_binds_name(body, index.text):
 				None
 			else:
-				collection_name ?= list_length_collection_identity(end)
+				collection_name ?= list_length_collection_identity(analysis, end)
 				index_name: String = "index-name:" + index.text
 				index_lookup_count: Int = occurrences
 					.filter(func(occurrence):
@@ -1387,6 +1449,7 @@ private pure func loop_lookup_replacement(
 
 
 private pure func loop_lookup_finding(
+	analysis: LintContext,
 	expr: TypedExpr,
 	context: LintLoopContext,
 ) -> List[LintFinding]:
@@ -1394,7 +1457,7 @@ private pure func loop_lookup_finding(
 		LintOutsideLoop:
 			[]
 		LintInsideLoop(loop_occurrences, indexed_context):
-			match list_lookup_occurrence(expr):
+			match list_lookup_occurrence(analysis, expr):
 				Some(occurrence):
 					[loop_list_lookup_finding(
 							occurrence.span,
@@ -1405,10 +1468,11 @@ private pure func loop_lookup_finding(
 
 
 private pure func loop_children_findings(
+	analysis: LintContext,
 	children: List[TypedExpr],
 	context: LintLoopContext,
 ) -> List[LintFinding]:
-	children.flat_map(func(child): loop_expression_findings(child, context))
+	children.flat_map(func(child): loop_expression_findings(analysis, child, context))
 
 
 private pure func manual_occurrence_matches(
@@ -1420,35 +1484,37 @@ private pure func manual_occurrence_matches(
 
 
 private pure func loop_expression_findings_in_context(
+	analysis: LintContext,
 	expr: TypedExpr,
 	context: LintLoopContext,
 ) -> List[LintFinding]:
 	match expr:
 		TypedForExpr(binder, iterable, _, body, _, _):
-			body_occurrences = loop_body_lookup_occurrences(body)
+			body_occurrences = loop_body_lookup_occurrences(analysis, body)
 			body_context = LintInsideLoop(
 				body_occurrences,
-				indexed_loop_context(binder, iterable, body, body_occurrences),
+				indexed_loop_context(analysis, binder, iterable, body, body_occurrences),
 			)
-			loop_expression_findings(iterable, context)
+			loop_expression_findings(analysis, iterable, context)
 				.concat(repeated_loop_lookup_findings(body_occurrences))
-				.concat(loop_expression_findings(body, body_context))
+				.concat(loop_expression_findings(analysis, body, body_context))
 		TypedConcurrentForExpr(_, iterable, params, body, _, _):
 			param_findings = loop_children_findings(
+				analysis,
 				params.map(func(param): param.value),
 				context,
 			)
-			body_occurrences = loop_body_lookup_occurrences(body)
+			body_occurrences = loop_body_lookup_occurrences(analysis, body)
 			body_context = LintInsideLoop(body_occurrences, None)
-			loop_expression_findings(iterable, context)
+			loop_expression_findings(analysis, iterable, context)
 				.concat(param_findings)
 				.concat(repeated_loop_lookup_findings(body_occurrences))
-				.concat(loop_expression_findings(body, body_context))
+				.concat(loop_expression_findings(analysis, body, body_context))
 		TypedWhileExpr(condition, body, span, _):
-			body_occurrences = loop_body_lookup_occurrences(body)
+			body_occurrences = loop_body_lookup_occurrences(analysis, body)
 			body_context = LintInsideLoop(body_occurrences, None)
 
-			manual: List[LintFinding] = match manual_list_index_condition(condition):
+			manual: List[LintFinding] = match manual_list_index_condition(analysis, condition):
 				Some((collection_identity, index_identity)):
 					if (
 						body_occurrences.any(func(occurrence):
@@ -1466,38 +1532,39 @@ private pure func loop_expression_findings_in_context(
 					[]
 
 			manual
-				.concat(loop_expression_findings(condition, body_context))
+				.concat(loop_expression_findings(analysis, condition, body_context))
 				.concat(repeated_loop_lookup_findings(body_occurrences))
-				.concat(loop_expression_findings(body, body_context))
+				.concat(loop_expression_findings(analysis, body, body_context))
 		TypedSubscriptExpr(receiver, indices, _, _):
-			current: List[LintFinding] = loop_lookup_finding(expr, context)
+			current: List[LintFinding] = loop_lookup_finding(analysis, expr, context)
 
-			current.concat(loop_children_findings([receiver] + indices, context))
+			current.concat(loop_children_findings(analysis, [receiver] + indices, context))
 		TypedCallExpr(_, _, _, _):
-			current: List[LintFinding] = loop_lookup_finding(expr, context)
+			current: List[LintFinding] = loop_lookup_finding(analysis, expr, context)
 
-			current.concat(loop_children_findings(typed_expr_children(expr), context))
+			current.concat(loop_children_findings(analysis, typed_expr_children(expr), context))
 		_:
-			loop_children_findings(typed_expr_children(expr), context)
+			loop_children_findings(analysis, typed_expr_children(expr), context)
 
 
 private pure func loop_expression_findings(
+	analysis: LintContext,
 	expr: TypedExpr,
 	context: LintLoopContext,
 ) -> List[LintFinding]:
 	match context:
 		LintInsideLoop(_, _):
-			loop_expression_findings_in_context(expr, context)
+			loop_expression_findings_in_context(analysis, expr, context)
 		LintOutsideLoop:
 			match expr:
 				TypedForExpr(_, _, _, _, _, _):
-					loop_expression_findings_in_context(expr, context)
+					loop_expression_findings_in_context(analysis, expr, context)
 				TypedConcurrentForExpr(_, _, _, _, _, _):
-					loop_expression_findings_in_context(expr, context)
+					loop_expression_findings_in_context(analysis, expr, context)
 				TypedWhileExpr(_, _, _, _):
-					loop_expression_findings_in_context(expr, context)
+					loop_expression_findings_in_context(analysis, expr, context)
 				_:
-					loop_children_findings(typed_expr_children(expr), context)
+					loop_children_findings(analysis, typed_expr_children(expr), context)
 
 
 private pure func expression_is_name(expr: TypedExpr, expected: String) -> Bool:
@@ -1526,20 +1593,21 @@ private pure func single_block_expression(expr: TypedExpr) -> Option[TypedExpr]:
 
 
 private pure func self_append_payload(
+	context: LintContext,
 	expr: TypedExpr,
 	accumulator_name: String,
 ) -> Option[TypedExpr]:
 	match expr:
 		TypedCallExpr(TypedFieldAccessExpr(receiver, field, _, _), args, _, _):
 			if (
-				resolved_std_list_call(expr, "append")
+				resolved_std_list_call(context, expr, "append")
 				and expression_is_name(receiver, accumulator_name)
 			):
 				args.get(0)
 			else:
 				None
 		TypedCallExpr(TypedNameExpr(callee, _), args, _, _):
-			if resolved_std_list_call(expr, "append"):
+			if resolved_std_list_call(context, expr, "append"):
 				match (args.get(0), args.get(1)):
 					(Some(receiver), Some(payload)):
 						if expression_is_name(receiver, accumulator_name):
@@ -1555,6 +1623,7 @@ private pure func self_append_payload(
 
 
 private pure func accumulator_assignment_payload(
+	context: LintContext,
 	expr: TypedExpr,
 	accumulator_name: String,
 ) -> Option[TypedExpr]:
@@ -1563,7 +1632,7 @@ private pure func accumulator_assignment_payload(
 	match assignment:
 		TypedAssignExpr(name, _, value, _, _):
 			if name.text == accumulator_name:
-				self_append_payload(value, accumulator_name)
+				self_append_payload(context, value, accumulator_name)
 			else:
 				None
 		_:
@@ -1571,6 +1640,7 @@ private pure func accumulator_assignment_payload(
 
 
 private pure func accumulator_loop_kind(
+	context: LintContext,
 	body: TypedExpr,
 	accumulator_name: String,
 	item_name: String,
@@ -1582,7 +1652,7 @@ private pure func accumulator_loop_kind(
 			if expression_references_name(condition, accumulator_name):
 				None
 			else:
-				payload ?= accumulator_assignment_payload(then_branch, accumulator_name)
+				payload ?= accumulator_assignment_payload(context, then_branch, accumulator_name)
 
 				if expression_is_name(payload, item_name):
 					Some(LintFilterAccumulator)
@@ -1591,7 +1661,7 @@ private pure func accumulator_loop_kind(
 				else:
 					Some(LintFilterMapAccumulator)
 		_:
-			payload ?= accumulator_assignment_payload(item, accumulator_name)
+			payload ?= accumulator_assignment_payload(context, item, accumulator_name)
 
 			if expression_references_name(payload, accumulator_name):
 				None
@@ -1609,7 +1679,10 @@ private pure func accumulator_kind_name(kind: LintAccumulatorKind) -> String:
 			"filter_map"
 
 
-private pure func canonical_accumulator_finding(items: List[TypedExpr]) -> Option[LintFinding]:
+private pure func canonical_accumulator_finding(
+	context: LintContext,
+	items: List[TypedExpr],
+) -> Option[LintFinding]:
 	match items:
 		[TypedVarDeclExpr(payload, _), TypedForExpr(binder, iterable, _, body, _, _), final]:
 			if not payload.is_mutable:
@@ -1624,7 +1697,12 @@ private pure func canonical_accumulator_finding(items: List[TypedExpr]) -> Optio
 						):
 							None
 						else:
-							kind ?= accumulator_loop_kind(body, payload.name.text, item_name.text)
+							kind ?= accumulator_loop_kind(
+								context,
+								body,
+								payload.name.text,
+								item_name.text,
+							)
 							kind_name: String = accumulator_kind_name(kind)
 							Some({
 								rule_id = LintListAppendAccumulator,
@@ -1638,10 +1716,13 @@ private pure func canonical_accumulator_finding(items: List[TypedExpr]) -> Optio
 			None
 
 
-private pure func function_accumulator_findings(info: TypedFunctionInfo) -> List[LintFinding]:
+private pure func function_accumulator_findings(
+	info: TypedFunctionInfo,
+	context: LintContext,
+) -> List[LintFinding]:
 	match info.body:
 		Some(TypedBlockExpr(items, _, _)):
-			match canonical_accumulator_finding(items):
+			match canonical_accumulator_finding(context, items):
 				Some(finding):
 					[finding]
 				None:
@@ -1700,10 +1781,10 @@ private pure func local_function_findings(
 		.concat(immediate_option_match_findings(info))
 		.concat(
 			info.body
-				.map(func(body): loop_expression_findings(body, LintOutsideLoop))
+					.map(func(body): loop_expression_findings(context, body, LintOutsideLoop))
 				.get_or([]),
 		)
-		.concat(function_accumulator_findings(info))
+		.concat(function_accumulator_findings(info, context))
 		.concat(constant_parameter_findings(info, context))
 
 
@@ -1847,6 +1928,7 @@ func execute_lint_plan(plan: CliLintRunPlan) -> CliHandledResult:
 						if selected_paths.contains(typechecked_module_path(module)):
 							context = lint_context_for_module(
 								module,
+								typechecked.definition_table,
 								value_referenced_callable_ids,
 								constant_definition_ids,
 							)

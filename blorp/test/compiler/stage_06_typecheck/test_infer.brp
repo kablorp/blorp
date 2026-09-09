@@ -97,12 +97,6 @@ import:
 	../../../src/compiler/stage_04_modules/module_table: module_table, module_table_id_at
 	../../../src/compiler/stage_06_typecheck/diagnostic: typecheck_diagnostic
 	../../../src/compiler/stage_06_typecheck/infer:
-		CallableOrigin(
-			CallableBuiltin,
-			CallableConstructor,
-			CallableImported,
-			CallableImportedUnresolved,
-		),
 		ExpectedValueSlotContext(ExpectedArgumentSlot),
 		ExprTypeOrigin(ExplicitAnnotationOrigin, InferredOrigin),
 		InferResult,
@@ -113,10 +107,16 @@ import:
 		),
 		ResolvedCallTarget(
 			ResolvedClosureCall,
-			ResolvedDirectCall,
+			ResolvedCompilerBuiltinCall,
+			ResolvedConstructorCall,
 			ResolvedIntrinsicCall,
-			ResolvedTraitMethodCall,
+			ResolvedSelectedTraitMethodCall,
+			ResolvedUnindexedCallableCall,
+			ResolvedUnindexedConstructorCall,
+			ResolvedUnindexedSelectedTraitMethodCall,
+			ResolvedUnresolvedTraitMethodCall,
 		),
+		ResolvedGraphCallableCategory(ResolvedForeignFunctionCall, ResolvedSourceFunctionCall),
 		TypedExpr(
 			TypedAssignExpr,
 			TypedBinaryExpr,
@@ -2179,7 +2179,11 @@ pure func resolved_call_targets_trait(result: InferResult, expected_trait: Strin
 	match typed_expr_resolved_call(result.expr):
 		Some(info):
 			match info.target:
-				ResolvedTraitMethodCall(trait_name, _):
+				ResolvedSelectedTraitMethodCall(trait_name, _):
+					trait_name == expected_trait
+				ResolvedUnindexedSelectedTraitMethodCall(trait_name, _):
+					trait_name == expected_trait
+				ResolvedUnresolvedTraitMethodCall(trait_name):
 					trait_name == expected_trait
 				_:
 					False
@@ -2191,7 +2195,7 @@ pure func resolved_call_targets_builtin(result: InferResult) -> Bool:
 	match typed_expr_resolved_call(result.expr):
 		Some(info):
 			match info.target:
-				ResolvedDirectCall(_, CallableBuiltin):
+				ResolvedCompilerBuiltinCall(_):
 					True
 				_:
 					False
@@ -2466,8 +2470,8 @@ func test_imported_builtin_function_reference_preserves_module_origin() -> Bool:
 		and match typed_expr_resolved_call(result.expr):
 			Some(info):
 				match info.target:
-					ResolvedDirectCall(_, CallableImportedUnresolved(module_path)):
-						module_path == "float" and info.source_name == "sqrt"
+					ResolvedUnindexedCallableCall(_, ResolvedSourceFunctionCall):
+						info.source_name == "sqrt"
 					_:
 						False
 			None:
@@ -2631,8 +2635,8 @@ func test_explicit_import_wins_scoped_trait_method_name() -> Bool:
 	result.context.state.errors.length() == 0 and match typed_expr_resolved_call(result.expr):
 		Some(info):
 			match info.target:
-				ResolvedDirectCall(_, CallableImportedUnresolved(module_path)):
-					module_path == "helpers/equality"
+				ResolvedUnindexedCallableCall(_, ResolvedSourceFunctionCall):
+					info.source_name == "equals"
 				_:
 					False
 		None:
@@ -4350,7 +4354,9 @@ func test_constructor_identifier_uses_expected_parent_type() -> Bool:
 	) and match typed_expr_resolved_call(result.expr):
 		Some(call):
 			match call.target:
-				ResolvedDirectCall(_, CallableConstructor(parent_type)):
+				ResolvedUnindexedConstructorCall(_, parent_type):
+					parent_type == "Option"
+				ResolvedConstructorCall(_, parent_type):
 					parent_type == "Option"
 				_:
 					False
@@ -5372,29 +5378,20 @@ func test_closure_call_records_resolved_metadata() -> Bool:
 	)
 
 
-func test_resolved_call_metadata_compares_import_module_id_and_path() -> Bool:
+func test_resolved_call_metadata_compares_definition_id_and_call_category() -> Bool:
 	result = infer_expr(
 		infer_context(state_with_imported_scalar_sqrt_and_tensor()),
 		call_expr(ParsedNameExpr(ident("sqrt")), [float_expr("4.0")]),
 	)
-	module_domain = module_table([
-		resolved_module_identity_from_resolver("first", UserModule),
-		resolved_module_identity_from_resolver("second", UserModule),
-	])
 
-	match (result.expr, module_domain):
-		(TypedCallExpr(TypedNameExpr(name, callee_info), args, span, call_info), Ok(table)):
-			match (
-				callee_info.resolved_call,
-				call_info.resolved_call,
-				module_table_id_at(table, 0),
-				module_table_id_at(table, 1),
-			):
-				(Some(callee_call), Some(call_call), Some(first_id), Some(second_id)):
+	match result.expr:
+		TypedCallExpr(TypedNameExpr(name, callee_info), args, span, call_info):
+			match (callee_info.resolved_call, call_info.resolved_call):
+				(Some(callee_call), Some(call_call)):
 					callable_id = resolved_call_callable_id(callee_call).get_or(-1)
-					direct = { callee_call | target = ResolvedDirectCall(
+					direct = { callee_call | target = ResolvedUnindexedCallableCall(
 							callable_id,
-							CallableImported(first_id, "first"),
+							ResolvedSourceFunctionCall,
 						) }
 					callee = TypedNameExpr(name, { callee_info | resolved_call = Some(direct) })
 					direct_id_mismatch = TypedCallExpr(
@@ -5402,28 +5399,26 @@ func test_resolved_call_metadata_compares_import_module_id_and_path() -> Bool:
 						args,
 						span,
 						{ call_info |
-							resolved_call = Some({ call_call | target = ResolvedDirectCall(
-										callable_id,
-										CallableImported(second_id, "first"),
+							resolved_call = Some({ call_call | target = ResolvedUnindexedCallableCall(
+										callable_id + 1,
+										ResolvedSourceFunctionCall,
 									) })
 						},
 					)
-					direct_path_mismatch = TypedCallExpr(
+					direct_category_mismatch = TypedCallExpr(
 						callee,
 						args,
 						span,
 						{ call_info |
-							resolved_call = Some({ call_call | target = ResolvedDirectCall(
+							resolved_call = Some({ call_call | target = ResolvedUnindexedCallableCall(
 										callable_id,
-										CallableImported(first_id, "second"),
+										ResolvedForeignFunctionCall,
 									) })
 						},
 					)
-					trait_call = { callee_call | target = ResolvedTraitMethodCall("Show", Some({
-								callable_id = callable_id,
-								module_id = first_id,
-								module_path = "first",
-							})) }
+					trait_call = { callee_call |
+						target = ResolvedUnindexedSelectedTraitMethodCall("Show", callable_id)
+					}
 					trait_callee = TypedNameExpr(
 						name,
 						{ callee_info | resolved_call = Some(trait_call) },
@@ -5434,25 +5429,27 @@ func test_resolved_call_metadata_compares_import_module_id_and_path() -> Bool:
 						span,
 						{ call_info |
 							resolved_call = Some(
-								{ call_call | target = ResolvedTraitMethodCall("Show", Some({
-											callable_id = callable_id,
-											module_id = second_id,
-											module_path = "first",
-										})) },
+								{ call_call |
+									target = ResolvedUnindexedSelectedTraitMethodCall(
+										"Show",
+										callable_id + 1,
+									)
+								},
 							)
 						},
 					)
-					trait_path_mismatch = TypedCallExpr(
+					trait_name_mismatch = TypedCallExpr(
 						trait_callee,
 						args,
 						span,
 						{ call_info |
 							resolved_call = Some(
-								{ call_call | target = ResolvedTraitMethodCall("Show", Some({
-											callable_id = callable_id,
-											module_id = first_id,
-											module_path = "second",
-										})) },
+								{ call_call |
+									target = ResolvedUnindexedSelectedTraitMethodCall(
+										"Display",
+										callable_id,
+									)
+								},
 							)
 						},
 					)
@@ -5460,9 +5457,9 @@ func test_resolved_call_metadata_compares_import_module_id_and_path() -> Bool:
 
 					(
 						typed_expr_type_error(direct_id_mismatch) == expected
-						and typed_expr_type_error(direct_path_mismatch) == expected
+						and typed_expr_type_error(direct_category_mismatch) == expected
 						and typed_expr_type_error(trait_id_mismatch) == expected
-						and typed_expr_type_error(trait_path_mismatch) == expected
+						and typed_expr_type_error(trait_name_mismatch) == expected
 					)
 				_:
 					False
@@ -5596,7 +5593,9 @@ func test_qualified_module_nullary_constructor_uses_expected_type() -> Bool:
 	) and match typed_expr_resolved_call(result.expr):
 		Some(info):
 			info.callee_name == "None" and match info.target:
-				ResolvedDirectCall(_, CallableConstructor(parent_type)):
+				ResolvedUnindexedConstructorCall(_, parent_type):
+					parent_type == "Option"
+				ResolvedConstructorCall(_, parent_type):
 					parent_type == "Option"
 				_:
 					False
@@ -11080,8 +11079,8 @@ tests: TestSuite = {
 		),
 		("direct call records resolved metadata", test_direct_call_records_resolved_metadata),
 		(
-			"resolved call metadata compares import module ID and path",
-			test_resolved_call_metadata_compares_import_module_id_and_path,
+			"resolved call metadata compares definition ID and call category",
+			test_resolved_call_metadata_compares_definition_id_and_call_category,
 		),
 		("closure call records resolved metadata", test_closure_call_records_resolved_metadata),
 		(

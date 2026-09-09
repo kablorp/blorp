@@ -13,24 +13,29 @@ import:
 		ParsedUnaryOp,
 	../stage_04_modules/module_table:
 		ModuleId,
+		module_ids_equal,
 		module_table_canonical_path,
-		module_table_find_id_by_canonical_path,
+	../stage_06_typecheck/headers/declaration_skeleton:
+		CallableId,
+		callable_id_definition_id,
+		callable_id_from_definition_table,
+		callable_id_module_id,
+		constructor_id_definition_id,
+		constructor_id_from_definition_table,
 	../stage_06_typecheck/infer:
-		CallableOrigin(
-			CallableBuiltin,
-			CallableConstructor,
-			CallableForeign,
-			CallableImported,
-			CallableImportedUnresolved,
-			CallableImplMethod,
-			CallableLocal,
-		),
+		ResolvedGraphCallableCategory(ResolvedForeignFunctionCall, ResolvedSourceFunctionCall),
 		ResolvedCallInfo,
 		ResolvedCallTarget(
 			ResolvedClosureCall,
-			ResolvedDirectCall,
+			ResolvedCompilerBuiltinCall,
+			ResolvedConstructorCall,
+			ResolvedGraphCallableCall,
 			ResolvedIntrinsicCall,
-			ResolvedTraitMethodCall,
+			ResolvedSelectedTraitMethodCall,
+			ResolvedUnindexedCallableCall,
+			ResolvedUnindexedConstructorCall,
+			ResolvedUnindexedSelectedTraitMethodCall,
+			ResolvedUnresolvedTraitMethodCall,
 		),
 		TypedAssignScope(LocalAssignScope, ModuleAssignScope),
 		TypedDictEntry,
@@ -94,6 +99,7 @@ import:
 		SemanticType(SemanticNamedType, SemanticTupleType),
 	context:
 		CtfeContext,
+		CtfeIdentityDomain(CtfeUnindexedIdentityDomain),
 		ctfe_context_function_by_callable_id,
 		ctfe_context_module_alias,
 	intrinsic: CtfeBuiltinIntrinsic, ctfe_builtin_intrinsic
@@ -124,8 +130,9 @@ record CtfeNullaryConstructorReference {
 
 union CtfeIrReferenceKind:
 	CtfeIrValueReference
-	CtfeIrLocalFunctionReference(CtfeIrDirectCall)
+	CtfeIrLocalFunctionReference(CallableId, CtfeIrDirectCall)
 	CtfeIrNullaryConstructorReference(CtfeNullaryConstructorReference)
+	CtfeIrUnindexedNullaryConstructorReference(String, String)
 	CtfeIrUnsupportedFunctionReference(String)
 	CtfeIrImpureFunctionReference
 
@@ -142,7 +149,8 @@ union CtfeIrCallKind:
 	CtfeIrIntrinsicCall(String)
 	CtfeIrLocalCall(CtfeIrDirectCall)
 	CtfeIrImportedCall(CtfeIrDirectCall, ModuleId)
-	CtfeIrConstructorCall(CtfeIrDirectCall, String)
+	CtfeIrConstructorCall(CtfeIrDirectCall, String, CtfeResolvedConstructorId)
+	CtfeIrUnindexedConstructorCall(CtfeIrDirectCall, String)
 	CtfeIrBuiltinCall(CtfeIrDirectCall, CtfeBuiltinIntrinsic)
 	CtfeIrUnsupportedCall(String)
 	CtfeIrImpureCall
@@ -256,14 +264,24 @@ record CtfeIrExpr {
 }
 
 
+enum CtfeIrTranslateErrorKind:
+	CtfeIrUnsupportedForm
+	CtfeIrInvalidGraphIdentity
+
+
 record CtfeIrTranslateError {
 	span: SourceSpan,
-	form: String
+	form: String,
+	kind: CtfeIrTranslateErrorKind
 }
 
 
 pure func ctfe_ir_translate_error_message(error: CtfeIrTranslateError) -> String:
-	"compile-time constant evaluation does not support " + error.form + " yet"
+	match error.kind:
+		CtfeIrUnsupportedForm:
+			"compile-time constant evaluation does not support " + error.form + " yet"
+		CtfeIrInvalidGraphIdentity:
+			"internal compiler error: compile-time evaluation received " + error.form
 
 
 private pure func ctfe_ir_expr_span(expr: TypedExpr) -> SourceSpan:
@@ -379,7 +397,45 @@ private pure func ctfe_ir_unsupported(
 	Err({
 		span = ctfe_ir_expr_span(expr),
 		form = form,
+		kind = CtfeIrUnsupportedForm,
 	})
+
+
+private pure func ctfe_ir_invalid_graph_identity(
+	expr: TypedExpr,
+	form: String,
+) -> Result[CtfeIrExpr, CtfeIrTranslateError]:
+	Err({
+		span = ctfe_ir_expr_span(expr),
+		form = form,
+		kind = CtfeIrInvalidGraphIdentity,
+	})
+
+
+private pure func ctfe_resolved_call_target_is_valid(
+	context: CtfeContext,
+	target: ResolvedCallTarget,
+) -> Bool:
+	match target:
+		ResolvedGraphCallableCall(callable_id, _):
+			callable_id_from_definition_table(
+				context.definition_table,
+				callable_id_definition_id(callable_id),
+			).is_some()
+		ResolvedConstructorCall(constructor_id, _):
+			constructor_id_from_definition_table(
+				context.definition_table,
+				constructor_id_definition_id(constructor_id),
+			).is_some()
+		ResolvedSelectedTraitMethodCall(_, callable_id):
+			callable_id_from_definition_table(
+				context.definition_table,
+				callable_id_definition_id(callable_id),
+			).is_some()
+		ResolvedUnindexedCallableCall(_, _) | ResolvedUnindexedSelectedTraitMethodCall(_, _):
+			context.identity_domain == CtfeUnindexedIdentityDomain
+		_:
+			True
 
 
 private pure func ctfe_ir_clean_source_name(name: String) -> String:
@@ -409,37 +465,49 @@ private pure func ctfe_ir_reference_kind(
 	match resolved_call:
 		Some(call):
 			match call.target:
-				ResolvedDirectCall(callable_id, origin):
-					match origin:
-						CallableLocal:
-							CtfeIrLocalFunctionReference(
-								ctfe_ir_direct_call(
+				ResolvedGraphCallableCall(callable_id, ResolvedSourceFunctionCall):
+					match callable_id_module_id(context.definition_table, callable_id):
+						Some(owner_module_id):
+							if module_ids_equal(owner_module_id, context.active_module_id):
+								CtfeIrLocalFunctionReference(
 									callable_id,
-									call.source_name,
-									call.purity,
-								),
-							)
-						CallableConstructor(parent_type):
-							if call.instantiated_params.length() == 0:
-								CtfeIrNullaryConstructorReference({
-									name = ctfe_ir_clean_source_name(call.source_name),
-									parent_type = parent_type,
-									constructor_id = ctfe_resolved_constructor_id(
-										context.module_table,
-										callable_id,
+									ctfe_ir_direct_call(
+										callable_id_definition_id(callable_id),
+										call.source_name,
+										call.purity,
 									),
-								})
+								)
 							else:
 								CtfeIrUnsupportedFunctionReference(
 									ctfe_ir_clean_source_name(call.source_name),
 								)
-						_:
-							if purities_equal(call.purity, Pure):
-								CtfeIrUnsupportedFunctionReference(
-									ctfe_ir_clean_source_name(call.source_name),
-								)
-							else:
-								CtfeIrImpureFunctionReference
+						None:
+							CtfeIrUnsupportedFunctionReference(
+								ctfe_ir_clean_source_name(call.source_name),
+							)
+				ResolvedConstructorCall(constructor_id, parent_type):
+					if call.instantiated_params.length() == 0:
+						CtfeIrNullaryConstructorReference({
+							name = ctfe_ir_clean_source_name(call.source_name),
+							parent_type = parent_type,
+							constructor_id = ctfe_resolved_constructor_id(constructor_id),
+						})
+					else:
+						CtfeIrUnsupportedFunctionReference(
+							ctfe_ir_clean_source_name(call.source_name),
+						)
+				ResolvedUnindexedConstructorCall(_, parent_type):
+					if call.instantiated_params.length() == 0:
+						CtfeIrUnindexedNullaryConstructorReference(
+							ctfe_ir_clean_source_name(call.source_name),
+							parent_type,
+						)
+					else:
+						CtfeIrUnsupportedFunctionReference(
+							ctfe_ir_clean_source_name(call.source_name),
+						)
+				ResolvedGraphCallableCall(_, ResolvedForeignFunctionCall):
+					CtfeIrImpureFunctionReference
 				_:
 					CtfeIrUnsupportedFunctionReference(ctfe_ir_clean_source_name(call.source_name))
 		None:
@@ -453,102 +521,112 @@ private pure func ctfe_ir_call_kind(
 	match resolved_call:
 		Some(call):
 			match call.target:
-				ResolvedDirectCall(callable_id, origin):
+				ResolvedGraphCallableCall(callable_id, category):
 					if not purities_equal(call.purity, Pure):
 						CtfeIrImpureCall
 					else:
-						match origin:
-							CallableLocal:
-								CtfeIrLocalCall(
-									ctfe_ir_direct_call(
-										callable_id,
-										call.source_name,
-										call.purity,
-									),
-								)
-							CallableConstructor(parent_type):
-								CtfeIrConstructorCall(
-									ctfe_ir_direct_call(callable_id, call.source_name, call.purity),
-									parent_type,
-								)
-							CallableImported(module_id, module_path):
-								if module_table_canonical_path(
-									context.module_table,
-									module_id,
-								) == Some(module_path):
-									CtfeIrImportedCall(
-										ctfe_ir_direct_call(
-											callable_id,
-											call.source_name,
-											call.purity,
-										),
-										module_id,
-									)
-								else:
-									CtfeIrUnresolvedCall
-							CallableImportedUnresolved(module_path):
-								match module_table_find_id_by_canonical_path(
-									context.module_table,
-									module_path,
-								):
-									Some(module_id):
-										CtfeIrImportedCall(
-											ctfe_ir_direct_call(
-												callable_id,
-												call.source_name,
-												call.purity,
-											),
-											module_id,
-										)
-									None:
-										CtfeIrUnresolvedCall
-							CallableBuiltin:
-								source_name = ctfe_ir_clean_source_name(call.source_name)
-
-								match ctfe_builtin_intrinsic(source_name):
-									Some(intrinsic):
-										CtfeIrBuiltinCall(
-											ctfe_ir_direct_call(
-												callable_id,
-												call.source_name,
-												call.purity,
-											),
-											intrinsic,
-										)
-									None:
-										CtfeIrUnsupportedCall(source_name)
-							CallableForeign:
-								CtfeIrUnsupportedCall("foreign function calls")
-							CallableImplMethod:
-								CtfeIrUnsupportedCall("impl method calls")
-				ResolvedTraitMethodCall(_, target):
-					if not purities_equal(call.purity, Pure):
-						CtfeIrImpureCall
-					else:
-						match target:
-							Some(method_target):
+						match category:
+							ResolvedSourceFunctionCall:
 								direct = ctfe_ir_direct_call(
-									method_target.callable_id,
+									callable_id_definition_id(callable_id),
 									call.source_name,
 									call.purity,
 								)
-
-								if module_table_canonical_path(
-									context.module_table,
-									method_target.module_id,
-								) != Some(method_target.module_path):
-									CtfeIrUnresolvedCall
-								else:
-									match ctfe_context_function_by_callable_id(
-										context,
-										method_target.callable_id,
-									):
-										Some(_):
+								match callable_id_module_id(context.definition_table, callable_id):
+									Some(owner_module_id):
+										if module_ids_equal(owner_module_id, context.active_module_id):
 											CtfeIrLocalCall(direct)
-										None:
-											CtfeIrImportedCall(direct, method_target.module_id)
+										else:
+											CtfeIrImportedCall(direct, owner_module_id)
+									None:
+										-- The validation wrapper rejects identities missing
+										-- from the canonical table. This fallback therefore
+										-- only preserves graphless/bootstrap CTFE behavior.
+										CtfeIrUnresolvedCall
+							ResolvedForeignFunctionCall:
+								CtfeIrUnsupportedCall("foreign function calls")
+				ResolvedConstructorCall(constructor_id, parent_type):
+					if not purities_equal(call.purity, Pure):
+						CtfeIrImpureCall
+					else:
+						CtfeIrConstructorCall(
+							ctfe_ir_direct_call(
+								constructor_id_definition_id(constructor_id),
+								call.source_name,
+								call.purity,
+							),
+							parent_type,
+							ctfe_resolved_constructor_id(constructor_id),
+						)
+				ResolvedUnindexedCallableCall(callable_id, category):
+					if not purities_equal(call.purity, Pure):
+						CtfeIrImpureCall
+					else:
+						match category:
+							ResolvedSourceFunctionCall:
+								direct = ctfe_ir_direct_call(
+									callable_id,
+									call.source_name,
+									call.purity,
+								)
+								match ctfe_context_function_by_callable_id(context, callable_id):
+									Some(_):
+										CtfeIrLocalCall(direct)
+									None:
+										CtfeIrUnresolvedCall
+							ResolvedForeignFunctionCall:
+								CtfeIrUnsupportedCall("foreign function calls")
+				ResolvedUnindexedConstructorCall(constructor_id, parent_type):
+					if not purities_equal(call.purity, Pure):
+						CtfeIrImpureCall
+					else:
+						CtfeIrUnindexedConstructorCall(
+							ctfe_ir_direct_call(
+								constructor_id,
+								call.source_name,
+								call.purity,
+							),
+							parent_type,
+						)
+				ResolvedCompilerBuiltinCall(callable_id):
+					source_name = ctfe_ir_clean_source_name(call.source_name)
+					match ctfe_builtin_intrinsic(source_name):
+						Some(intrinsic):
+							CtfeIrBuiltinCall(
+								ctfe_ir_direct_call(callable_id, call.source_name, call.purity),
+								intrinsic,
+							)
+						None:
+							CtfeIrUnsupportedCall(source_name)
+				ResolvedSelectedTraitMethodCall(_, callable_id):
+					if not purities_equal(call.purity, Pure):
+						CtfeIrImpureCall
+					else:
+						direct = ctfe_ir_direct_call(
+							callable_id_definition_id(callable_id),
+							call.source_name,
+							call.purity,
+						)
+						match callable_id_module_id(context.definition_table, callable_id):
+							Some(owner_module_id):
+								if module_ids_equal(owner_module_id, context.active_module_id):
+									CtfeIrLocalCall(direct)
+								else:
+									CtfeIrImportedCall(direct, owner_module_id)
 							None:
-								CtfeIrIntrinsicCall(ctfe_ir_clean_source_name(call.source_name))
+								CtfeIrUnresolvedCall
+				ResolvedUnindexedSelectedTraitMethodCall(_, callable_id):
+					if not purities_equal(call.purity, Pure):
+						CtfeIrImpureCall
+					else:
+						direct = ctfe_ir_direct_call(callable_id, call.source_name, call.purity)
+						match ctfe_context_function_by_callable_id(context, callable_id):
+							Some(_):
+								CtfeIrLocalCall(direct)
+							None:
+								CtfeIrUnresolvedCall
+				ResolvedUnresolvedTraitMethodCall(_):
+					CtfeIrIntrinsicCall(ctfe_ir_clean_source_name(call.source_name))
 				ResolvedIntrinsicCall:
 					CtfeIrIntrinsicCall(ctfe_ir_clean_source_name(call.source_name))
 				ResolvedClosureCall:
@@ -696,6 +774,7 @@ private pure func ctfe_ir_block_from_typed(
 		Err({
 			span = ctfe_ir_expr_span(source),
 			form = "empty blocks",
+			kind = CtfeIrUnsupportedForm,
 		})
 	else:
 		var block_items: List[CtfeIrBlockItem] = []
@@ -745,6 +824,7 @@ private pure func ctfe_ir_block_from_typed(
 						Err({
 							span = ctfe_ir_expr_span(source),
 							form = "empty blocks",
+							kind = CtfeIrUnsupportedForm,
 						})
 
 
@@ -861,6 +941,23 @@ private pure func ctfe_ir_match_cases_from_typed(
 
 
 pure func ctfe_ir_from_typed_expr(
+	context: CtfeContext,
+	expr: TypedExpr,
+) -> Result[CtfeIrExpr, CtfeIrTranslateError]:
+	match typed_expr_resolved_call(expr):
+		Some(call):
+			if ctfe_resolved_call_target_is_valid(context, call.target):
+				ctfe_ir_from_valid_typed_expr(context, expr)
+			else:
+				ctfe_ir_invalid_graph_identity(
+					expr,
+					"a definition-backed call outside the canonical definition table",
+				)
+		None:
+			ctfe_ir_from_valid_typed_expr(context, expr)
+
+
+private pure func ctfe_ir_from_valid_typed_expr(
 	context: CtfeContext,
 	expr: TypedExpr,
 ) -> Result[CtfeIrExpr, CtfeIrTranslateError]:

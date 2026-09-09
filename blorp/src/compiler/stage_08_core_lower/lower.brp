@@ -39,6 +39,7 @@ import:
 		ModuleId,
 		ModuleTable,
 		module_id_table_index,
+		module_ids_equal,
 		module_table_canonical_path,
 	../stage_06_typecheck/decl:
 		TypedDecl(
@@ -68,23 +69,27 @@ import:
 		TypedUnionInfo,
 		TypedUnionVariantInfo,
 		typed_foreign_arg_passing_borrows,
+	../stage_06_typecheck/graph/definition_index: DefinitionTable, definition_table_module_table
+	../stage_06_typecheck/headers/declaration_skeleton:
+		callable_id_definition_id,
+		callable_id_module_id,
+		constructor_id_definition_id,
+		constructor_id_module_id,
 	../stage_06_typecheck/infer:
-		CallableOrigin(
-			CallableBuiltin,
-			CallableConstructor,
-			CallableForeign,
-			CallableImported,
-			CallableImportedUnresolved,
-			CallableImplMethod,
-			CallableLocal,
-		),
 		ResolvedCallInfo,
 		ResolvedCallTarget(
 			ResolvedClosureCall,
-			ResolvedDirectCall,
+			ResolvedCompilerBuiltinCall,
+			ResolvedConstructorCall,
+			ResolvedGraphCallableCall,
 			ResolvedIntrinsicCall,
-			ResolvedTraitMethodCall,
+			ResolvedSelectedTraitMethodCall,
+			ResolvedUnindexedCallableCall,
+			ResolvedUnindexedConstructorCall,
+			ResolvedUnindexedSelectedTraitMethodCall,
+			ResolvedUnresolvedTraitMethodCall,
 		),
+		ResolvedGraphCallableCategory(ResolvedForeignFunctionCall, ResolvedSourceFunctionCall),
 		TypedConcurrentBinding,
 		TypedConcurrentParam,
 		TypedDictEntry,
@@ -451,6 +456,8 @@ enum CoreLowerCarrierKind:
 record CoreLowerContext {
 	next_def_id: Int,
 	source_module: Option[String],
+	definition_table: Option[DefinitionTable],
+	module_id: Option[ModuleId],
 	callable_names: CoreLowerCallableNameRegistry
 }
 
@@ -534,6 +541,8 @@ pure func core_lower_context(next_def_id: Int, source_module: Option[String]) ->
 	{
 		next_def_id = next_def_id,
 		source_module = source_module,
+		definition_table = None,
+		module_id = None,
 		callable_names = CoreLowerDefaultCallableNames
 	}
 
@@ -541,11 +550,15 @@ pure func core_lower_context(next_def_id: Int, source_module: Option[String]) ->
 pure func core_lower_context_with_callable_names(
 	next_def_id: Int,
 	source_module: Option[String],
+	definition_table: DefinitionTable,
+	module_id: ModuleId,
 	callable_names: CoreLowerCallableNameRegistry,
 ) -> CoreLowerContext:
 	{
 		next_def_id = next_def_id,
 		source_module = source_module,
+		definition_table = Some(definition_table),
+		module_id = Some(module_id),
 		callable_names = callable_names
 	}
 
@@ -653,32 +666,62 @@ private pure func resolved_call_explicit_name(
 	resolved: ResolvedCallInfo,
 ) -> Result[Option[String], CoreLowerError]:
 	match resolved.target:
-		ResolvedTraitMethodCall(_, Some(target)):
-			resolved_imported_call_explicit_name(
-				context,
-				resolved,
-				target.module_id,
-				target.module_path,
-				target.callable_id,
+		ResolvedGraphCallableCall(callable_id, ResolvedSourceFunctionCall):
+			definitions ?= context.definition_table.to_result(
+				CoreLowerInvalidCall("graph callable is missing its definition table"),
 			)
-		ResolvedDirectCall(callable_id, CallableImported(module_id, module_path)):
+			runtime_callable_id = callable_id_definition_id(callable_id)
+			module_id ?= callable_id_module_id(
+				definitions,
+				callable_id,
+			).to_result(
+				CoreLowerInvalidCall(
+					"graph callable ${runtime_callable_id} '${resolved.source_name}' is outside the canonical definition table",
+				),
+			)
+			current_module ?= context.module_id.to_result(
+				CoreLowerInvalidCall("graph callable is missing the active module"),
+			)
+
+			if module_ids_equal(module_id, current_module):
+				Ok(None)
+			else:
+				module_path ?= module_table_canonical_path(
+					definition_table_module_table(definitions),
+					module_id,
+				).to_result(CoreLowerInvalidCall("graph callable module has no canonical path"))
+				resolved_imported_call_explicit_name(
+					context,
+					resolved,
+					module_id,
+					module_path,
+					runtime_callable_id,
+				)
+		ResolvedSelectedTraitMethodCall(_, callable_id):
+			definitions ?= context.definition_table.to_result(
+				CoreLowerInvalidCall("selected trait method is missing its definition table"),
+			)
+			module_id ?= callable_id_module_id(
+				definitions,
+				callable_id,
+			).to_result(CoreLowerInvalidCall("selected trait method is missing its owning module"))
+			module_path ?= module_table_canonical_path(
+				definition_table_module_table(definitions),
+				module_id,
+			).to_result(CoreLowerInvalidCall("selected trait method module has no canonical path"))
 			resolved_imported_call_explicit_name(
 				context,
 				resolved,
 				module_id,
 				module_path,
-				callable_id,
+				callable_id_definition_id(callable_id),
 			)
-		ResolvedDirectCall(callable_id, CallableImportedUnresolved(module_path)):
-			match context.callable_names:
-				CoreLowerPreparedCallableNames(_, _):
-					Err(
-						CoreLowerInvalidCall(
-							"prepared graph callable ${callable_id} in ${module_path} is missing its module ID",
-						),
-					)
-				CoreLowerDefaultCallableNames:
+		ResolvedUnindexedSelectedTraitMethodCall(_, _):
+			match context.source_module:
+				Some(module_path):
 					Ok(Some(core_ufcs_function_name(module_path, resolved.source_name)))
+				None:
+					Ok(None)
 		_:
 			Ok(None)
 
@@ -696,30 +739,69 @@ private pure func lowered_name_expr_name(
 			Ok(name.text)
 
 
-private pure func resolved_core_decl_callable_id(resolved: ResolvedCallInfo) -> Option[Int]:
+private pure func resolved_core_decl_callable_id(
+	context: CoreLowerContext,
+	resolved: ResolvedCallInfo,
+) -> Result[Option[Int], CoreLowerError]:
 	match resolved.target:
-		ResolvedDirectCall(callable_id, origin):
-			match origin:
-				CallableLocal:
-					Some(callable_id)
-				CallableImported(_, _):
-					Some(callable_id)
-				CallableImportedUnresolved(_):
-					Some(callable_id)
-				CallableConstructor(_):
-					Some(callable_id)
-				CallableImplMethod:
-					Some(callable_id)
-				_:
-					None
-		ResolvedTraitMethodCall(_, impl_target):
-			match impl_target:
-				Some(target):
-					Some(target.callable_id)
-				None:
-					None
+		ResolvedGraphCallableCall(callable_id, _):
+			definitions ?= context.definition_table.to_result(
+				CoreLowerInvalidCall("graph callable is missing its definition table"),
+			)
+			owner_module_id ?= callable_id_module_id(
+				definitions,
+				callable_id,
+			).to_result(
+				CoreLowerInvalidCall("graph callable is outside the canonical definition table"),
+			)
+			_ = owner_module_id
+			Ok(Some(callable_id_definition_id(callable_id)))
+		ResolvedConstructorCall(constructor_id, _):
+			definitions ?= context.definition_table.to_result(
+				CoreLowerInvalidCall("graph constructor is missing its definition table"),
+			)
+			owner_module_id ?= constructor_id_module_id(
+				definitions,
+				constructor_id,
+			).to_result(
+				CoreLowerInvalidCall(
+					"graph constructor is outside the canonical definition table",
+				),
+			)
+			_ = owner_module_id
+			Ok(Some(constructor_id_definition_id(constructor_id)))
+		ResolvedUnindexedCallableCall(callable_id, ResolvedSourceFunctionCall):
+			if context.definition_table.is_some():
+				Err(CoreLowerInvalidCall("unindexed callable entered graph-backed Core lowering"))
+			else:
+				Ok(Some(callable_id))
+		ResolvedUnindexedConstructorCall(constructor_id, _):
+			Ok(Some(constructor_id))
+		ResolvedSelectedTraitMethodCall(_, callable_id):
+			definitions ?= context.definition_table.to_result(
+				CoreLowerInvalidCall("selected trait method is missing its definition table"),
+			)
+			owner_module_id ?= callable_id_module_id(
+				definitions,
+				callable_id,
+			).to_result(
+				CoreLowerInvalidCall(
+					"selected trait method is outside the canonical definition table",
+				),
+			)
+			_ = owner_module_id
+			Ok(Some(callable_id_definition_id(callable_id)))
+		ResolvedUnindexedSelectedTraitMethodCall(_, callable_id):
+			if context.definition_table.is_some():
+				Err(
+					CoreLowerInvalidCall(
+						"unindexed selected trait method entered graph-backed Core lowering",
+					),
+				)
+			else:
+				Ok(Some(callable_id))
 		_:
-			None
+			Ok(None)
 
 
 private pure func lower_name_expr_identity(
@@ -730,11 +812,11 @@ private pure func lower_name_expr_identity(
 	lowered_name ?= lowered_name_expr_name(context, name, info)
 	(clean_name, encoded_id) = split_var_callable_id(lowered_name)
 
-	resolved_id: Option[Int] = match info.resolved_call:
+	resolved_id ?= match info.resolved_call:
 		Some(resolved):
-			resolved_core_decl_callable_id(resolved)
+			resolved_core_decl_callable_id(context, resolved)
 		None:
-			None
+			Ok(None)
 
 	match (encoded_id, resolved_id):
 		(Some(encoded), Some(resolved)):
@@ -3767,35 +3849,78 @@ private pure func lower_resolved_call_kind(
 	match resolved:
 		Some(info):
 			match info.target:
-				ResolvedDirectCall(callable_id, origin):
-					match origin:
-						CallableLocal:
-							lower_user_call_kind(info, callable_id, callee)
-						CallableBuiltin:
-							Ok(lower_builtin_call_kind(info))
-						CallableImported(_, _):
-							lower_user_call_kind(info, callable_id, callee)
-						CallableImportedUnresolved(_):
-							lower_user_call_kind(info, callable_id, callee)
-						CallableConstructor(_):
-							Ok(UnknownCall)
-						CallableImplMethod:
-							lower_user_call_kind(info, callable_id, callee)
-						CallableForeign:
-							Ok(UnknownCall)
-				ResolvedTraitMethodCall(trait_name, impl_target):
-					match impl_target:
-						Some(target):
+				ResolvedGraphCallableCall(_, ResolvedSourceFunctionCall):
+					callable_id ?= resolved_core_decl_callable_id(context, info).and_then(
+						func(identity): identity.to_result(
+						CoreLowerInvalidCall("graph callable has no definition identity"),
+						),
+					)
+					lower_user_call_kind(info, callable_id, callee)
+				ResolvedGraphCallableCall(_, ResolvedForeignFunctionCall):
+					validated_identity ?= resolved_core_decl_callable_id(context, info)
+					_ = validated_identity
+					Ok(UnknownCall)
+				ResolvedConstructorCall(_, _):
+					validated_identity ?= resolved_core_decl_callable_id(context, info)
+					_ = validated_identity
+					Ok(UnknownCall)
+				ResolvedUnindexedCallableCall(_, ResolvedSourceFunctionCall):
+					callable_id ?= resolved_core_decl_callable_id(context, info).and_then(
+						func(identity): identity.to_result(
+							CoreLowerInvalidCall("unindexed callable has no identity"),
+						),
+					)
+					lower_user_call_kind(info, callable_id, callee)
+				ResolvedUnindexedCallableCall(_, ResolvedForeignFunctionCall):
+					validated_identity ?= resolved_core_decl_callable_id(context, info)
+					_ = validated_identity
+					Ok(UnknownCall)
+				ResolvedUnindexedConstructorCall(_, _):
+					validated_identity ?= resolved_core_decl_callable_id(context, info)
+					_ = validated_identity
+					Ok(UnknownCall)
+				ResolvedCompilerBuiltinCall(_):
+					Ok(lower_builtin_call_kind(info))
+				ResolvedSelectedTraitMethodCall(trait_name, callable_id):
+					definitions ?= context.definition_table.to_result(
+						CoreLowerInvalidCall(
+							"selected trait method is missing its definition table",
+						),
+					)
+					module_id ?= callable_id_module_id(definitions, callable_id).to_result(
+						CoreLowerInvalidCall("selected trait method is missing its owning module"),
+					)
+					module_path ?= module_table_canonical_path(
+						definition_table_module_table(definitions),
+						module_id,
+					).to_result(
+						CoreLowerInvalidCall("selected trait method module has no canonical path"),
+					)
+					Ok(
+						SelectedTraitCall(
+							trait_name,
+							info.callee_name,
+							module_path,
+							callable_id_definition_id(callable_id),
+						),
+					)
+				ResolvedUnindexedSelectedTraitMethodCall(trait_name, callable_id):
+					validated_identity ?= resolved_core_decl_callable_id(context, info)
+					_ = validated_identity
+					match context.source_module:
+						Some(module_path):
 							Ok(
 								SelectedTraitCall(
 									trait_name,
 									info.callee_name,
-									target.module_path,
-									target.callable_id,
+									module_path,
+									callable_id,
 								),
 							)
 						None:
 							Ok(DeferredTraitCall(trait_name, info.callee_name))
+				ResolvedUnresolvedTraitMethodCall(trait_name):
+					Ok(DeferredTraitCall(trait_name, info.callee_name))
 				ResolvedIntrinsicCall:
 					if info.source_name == "type_name" or info.source_name == "is_heap":
 						Ok(IntrinsicCall(info.source_name))

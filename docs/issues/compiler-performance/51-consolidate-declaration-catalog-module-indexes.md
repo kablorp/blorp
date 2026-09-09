@@ -1,7 +1,12 @@
 # Consolidate Declaration Catalog Module Indexes If Measured
 
-**Status:** Deferred until a production catalog-retention milestone,
-measurement-gated
+**Status:** Superseded by Issue 68; no action
+
+Issue 68 deleted the production-unreachable `AcceptedDeclarationCatalog` and
+established the canonical dense graph definition table instead. This document
+is retained only as the historical proposal that was considered before that
+ownership decision; its catalog-specific implementation steps no longer
+apply.
 
 **Dependencies:** Issue 43, or another accepted milestone that retains and
 queries `AcceptedDeclarationCatalog` in production, must be complete. Issues

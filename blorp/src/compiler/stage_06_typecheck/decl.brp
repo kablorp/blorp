@@ -130,7 +130,12 @@ import:
 		SourceDefinitionKind(FieldDefinition, GlobalDefinition, ImplDefinition, TraitDefinition),
 		func_callable_key,
 		source_definition_key,
-	graph/definition_index: definition_index_find_source_definition_id
+	graph/definition_index:
+		DefinitionTable,
+		definition_index_definition_table,
+		definition_index_find_source_definition_id,
+		definition_table_is_compatible_with_module_table,
+		definition_table_module_table,
 	graph/indexed_graph:
 		PreparedModuleScope,
 		indexed_graph_module_count,
@@ -178,11 +183,14 @@ import:
 		callable_header_body_category,
 		callable_header_dimension_constraints,
 		callable_header_graph_callables,
+		callable_header_graph_callables_for_module,
+		callable_header_graph_definition_table,
 		callable_header_graph_find,
 		callable_header_graph_find_definition_id,
 		callable_header_graph_globals,
 		callable_header_graph_trait_topology,
 		callable_header_id,
+		callable_header_name,
 		callable_header_parameters,
 		callable_header_signature,
 		callable_header_source,
@@ -248,6 +256,7 @@ import:
 		explicit_implementation_method_signature,
 		explicit_implementation_method_source,
 		implementation_header_graph_callable_headers,
+		implementation_header_graph_definition_table,
 		implementation_header_graph_headers,
 		implementation_header_id,
 		implementation_header_methods,
@@ -291,6 +300,7 @@ import:
 		implementation_type_parameter_id_name,
 		type_header_graph_bound_graph,
 		type_header_graph_declaration_skeleton_count,
+		type_header_graph_definition_table,
 		type_header_graph_local_alias_headers_for_scope,
 		type_header_graph_local_builtin_headers_for_scope,
 		type_header_graph_local_record_headers_for_scope,
@@ -440,6 +450,7 @@ import:
 		typecheck_state_allows_foreign,
 		typecheck_state_claim_func_callable_id,
 		typecheck_state_claim_source_definition_id,
+		typecheck_state_definition_index,
 		typecheck_state_find_func_callable_id,
 		typecheck_state_find_imported_name,
 		typecheck_state_find_private_impl_conflict,
@@ -3499,11 +3510,7 @@ private pure func impl_method_info_from_semantic_types(
 					Some(module_id):
 						info = impl_method_info(
 							method.name.text,
-							Some({
-								callable_id = callable_id,
-								module_id = module_id,
-								module_path = module_path,
-							}),
+							Some({callable_id = callable_id}),
 							func_type,
 							effective_bound_type_params(with_id, method.type_params, func_type),
 							method.params.map(param_name_from_parsed),
@@ -3686,38 +3693,23 @@ private pure func implementation_method_info_from_header(
 										resolved_return_type,
 									)
 
-									match typecheck_state_module_id(with_id):
-										None:
-											ImplMethodInfoMissing(
-												typecheck_state_add_error(
-													with_id,
-													"internal typecheck error: implementation method is missing its module ID",
-												),
-											)
-										Some(module_id):
-											info = impl_method_info(
-												source.name.text,
-												Some({
-													callable_id = callable_id,
-													module_id = module_id,
-													module_path = module_path,
-												}),
-												func_type,
-												implementation_method_bound_type_params(
-													method_header,
-												),
-												param_names,
-												purity_from_parsed(source.is_pure),
-												function_resource_arg_policy(
-													with_id,
-													param_types,
-													source.annotations,
-													source.body,
-												),
-												dim_constraints,
-												source.annotations.any(annotation_is_debug_only),
-											)
-											ImplMethodInfoClaimed(with_id, info)
+									info = impl_method_info(
+										source.name.text,
+										Some({callable_id = callable_id}),
+										func_type,
+										implementation_method_bound_type_params(method_header),
+										param_names,
+										purity_from_parsed(source.is_pure),
+										function_resource_arg_policy(
+											with_id,
+											param_types,
+											source.annotations,
+											source.body,
+										),
+										dim_constraints,
+										source.annotations.any(annotation_is_debug_only),
+									)
+									ImplMethodInfoClaimed(with_id, info)
 		_:
 			ImplMethodInfoMissing(
 				typecheck_state_add_error(
@@ -6152,7 +6144,37 @@ private pure func replay_accepted_implementation_method_definition_id(
 	state: TypecheckState,
 	id: CallableId,
 ) -> TypecheckState:
-	match claim_callable_id_from_span(state, callable_id_name(id), callable_id_source_span(id)):
+	definition_table = typecheck_state_definition_index(
+		state,
+	).map(definition_index_definition_table)
+	name = definition_table.and_then(func(table): callable_id_name(table, id))
+	span = definition_table.and_then(func(table): callable_id_source_span(table, id))
+
+	match (name, span):
+		(None, _) | (_, None):
+			typecheck_state_add_error(
+				state,
+				(
+					"internal typecheck error: implementation method ID is absent from the "
+					+ "definition table"
+				),
+			)
+		(Some(method_name), Some(method_span)):
+			replay_accepted_implementation_method_definition_id_from_source(
+				state,
+				id,
+				method_name,
+				method_span,
+			)
+
+
+private pure func replay_accepted_implementation_method_definition_id_from_source(
+	state: TypecheckState,
+	id: CallableId,
+	name: String,
+	span: SourceSpan,
+) -> TypecheckState:
+	match claim_callable_id_from_span(state, name, span):
 		DefinitionIdMissing(with_error):
 			with_error
 		DefinitionIdClaimed(with_id, definition_id):
@@ -6499,7 +6521,7 @@ private pure func prepare_accepted_module_callable(
 				state = prepared.state,
 				callables = base.callables.append({
 					id = id,
-					source_name = callable_id_name(id),
+					source_name = callable_header_name(header),
 					visibility = callable_header_visibility(header),
 					entry = canonical_callable_entry(
 						entry,
@@ -6748,6 +6770,7 @@ private pure func prepared_module_environments(
 		callable_header_graph_trait_topology(callable_headers),
 	)
 	bound_graph = type_header_graph_bound_graph(type_headers)
+	definition_table = type_header_graph_definition_table(type_headers)
 	modules = [
 		bound_module_graph_target(bound_graph),
 	].concat(bound_module_graph_modules(bound_graph))
@@ -6846,6 +6869,7 @@ private pure func prepared_module_environments(
 			module_table = indexed_graph_module_table(
 				bound_module_graph_indexed_graph(bound_graph),
 			),
+			definition_table = definition_table,
 			traits = trait_records,
 			implementations = [],
 		})
@@ -6888,10 +6912,13 @@ private pure func prepared_module_environments(
 		preliminary_base_index += 1
 
 	for header in callable_header_graph_callables(callable_headers):
-		match prepared_module_base_index(
-			base_positions_by_module_id,
-			callable_id_module_id(callable_header_id(header)),
-		):
+		owner_index = match callable_id_module_id(definition_table, callable_header_id(header)):
+			Some(module_id):
+				prepared_module_base_index(base_positions_by_module_id, module_id)
+			None:
+				None
+
+		match owner_index:
 			Some(index):
 				match bases.get(index):
 					Some(base):
@@ -6928,6 +6955,7 @@ private pure func prepared_module_environments(
 			module_table = indexed_graph_module_table(
 				bound_module_graph_indexed_graph(bound_graph),
 			),
+			definition_table = definition_table,
 			callables = callable_records,
 		})
 
@@ -6960,6 +6988,7 @@ private pure func prepared_module_environments(
 
 	trait_implementation_input: AcceptedTraitImplementationTableInput = {
 		module_table = indexed_graph_module_table(bound_module_graph_indexed_graph(bound_graph)),
+		definition_table = definition_table,
 		traits = trait_records,
 		implementations = implementation_records
 	}
@@ -8192,6 +8221,7 @@ private pure func frontend_preparation_unique_declaration_observation(
 	implementation_headers: ImplementationHeaderGraph,
 	modules: List[BoundModule],
 ) -> FrontendDeclarationPreparationObservation:
+	definition_table = type_header_graph_definition_table(type_headers)
 	var type_count: Int = 0
 	var constructor_count: Int = 0
 	var callable_count: Int = 0
@@ -8216,9 +8246,10 @@ private pure func frontend_preparation_unique_declaration_observation(
 		constructor_count += union_header_constructor_count(union_headers)
 
 	for header in callable_header_graph_callables(callable_headers):
-		if frontend_preparation_modules_include_id(
-			modules,
-			callable_id_module_id(callable_header_id(header)),
+		if (
+			callable_id_module_id(definition_table, callable_header_id(header))
+				.map(func(module_id): frontend_preparation_modules_include_id(modules, module_id))
+				.get_or(False)
 		):
 			callable_count += 1
 
@@ -9122,12 +9153,9 @@ private pure func accepted_callable_body_ids(
 	)
 	module_id = prepared_module_scope_id(bound_module_scope(representation.bound_module))
 
-	callable_header_graph_callables(callable_headers)
+	callable_header_graph_callables_for_module(callable_headers, module_id)
 		.filter(func(header):
-			(
-				module_ids_equal(callable_id_module_id(callable_header_id(header)), module_id)
-				and callable_header_body_category(header) == SourceCallableBody
-			)
+			callable_header_body_category(header) == SourceCallableBody
 		)
 		.map(callable_header_id)
 
@@ -9391,11 +9419,14 @@ private pure func body_check_context_build_from_base(
 	main_policy: MainValidationPolicy,
 ) -> BodyCheckContextBuild:
 	representation = base.representation
+	definition_table = implementation_header_graph_definition_table(
+		representation.graph_facts.implementation_headers,
+	)
 
-	if not module_ids_equal(
-		callable_id_module_id(id),
-		prepared_module_scope_id(bound_module_scope(representation.bound_module)),
-	):
+	if callable_id_module_id(
+		definition_table,
+		id,
+	) != Some(prepared_module_scope_id(bound_module_scope(representation.bound_module))):
 		BodyContextRejected(BodyContextForeignOwner)
 	else:
 		callable_headers = implementation_header_graph_callable_headers(
@@ -9443,15 +9474,18 @@ pure func body_check_registry_context_for_definition_id(
 	definition_id: Int,
 ) -> Option[BodyCheckContextBuild]:
 	base = from_opaque BodyCheckRegistry(registry).base
+	definition_table = implementation_header_graph_definition_table(
+		base.representation.graph_facts.implementation_headers,
+	)
 	id ?= callable_id_for_definition(
 		base.representation.graph_facts.implementation_headers,
 		definition_id,
 	)
 
-	if module_ids_equal(
-		callable_id_module_id(id),
-		prepared_module_scope_id(bound_module_scope(base.representation.bound_module)),
-	):
+	if callable_id_module_id(
+		definition_table,
+		id,
+	) == Some(prepared_module_scope_id(bound_module_scope(base.representation.bound_module))):
 		Some(body_check_context_build_from_base(base, id, IgnoreMainName))
 	else:
 		None
@@ -9530,7 +9564,7 @@ private pure func body_contexts_from_base(
 
 pure func accepted_typecheck_module_body_context(
 	input: AcceptedTypecheckModule,
-	issuing_table: ModuleTable,
+	issuing_definition_table: DefinitionTable,
 	id: CallableId,
 ) -> BodyCheckContextBuild:
 	representation = accepted_typecheck_module_rep(input)
@@ -9538,18 +9572,24 @@ pure func accepted_typecheck_module_body_context(
 		bound_module_scope(representation.bound_module),
 	)
 
-	if module_tables_are_compatible(module_table, issuing_table):
+	if definition_table_is_compatible_with_module_table(issuing_definition_table, module_table):
 		body_check_context_build_from_base(
 			accepted_body_module_base(input),
 			id,
 			ValidateProgramMain,
 		)
 	else:
+		issuing_table = definition_table_module_table(issuing_definition_table)
 		accepted_owner = module_table_resolved_identity(
 			module_table,
 			prepared_module_scope_id(bound_module_scope(representation.bound_module)),
 		)
-		issued_owner = module_table_resolved_identity(issuing_table, callable_id_module_id(id))
+		issued_owner = callable_id_module_id(
+			issuing_definition_table,
+			id,
+		).and_then(
+			func(module_id): module_table_resolved_identity(issuing_table, module_id),
+		)
 
 		match (accepted_owner, issued_owner):
 			(Some(expected), Some(actual)):
@@ -9564,6 +9604,14 @@ pure func accepted_typecheck_module_body_context(
 pure func accepted_typecheck_module_module_table(input: AcceptedTypecheckModule) -> ModuleTable:
 	representation = accepted_typecheck_module_rep(input)
 	prepared_module_scope_module_table(bound_module_scope(representation.bound_module))
+
+
+pure func accepted_typecheck_module_definition_table(
+	input: AcceptedTypecheckModule,
+) -> DefinitionTable:
+	implementation_header_graph_definition_table(
+		accepted_typecheck_module_rep(input).graph_facts.implementation_headers,
+	)
 
 
 private pure func check_function_body_artifact(
@@ -9691,6 +9739,7 @@ private pure func body_planning_failure_message(failure: BodyCheckPlanningFailur
 
 
 private pure func body_outcome_index(
+	definition_table: DefinitionTable,
 	owner_scope: PreparedModuleScope,
 	outcomes: List[BodyCheckOutcome],
 ) -> BodyOutcomeIndexBuild:
@@ -9702,7 +9751,7 @@ private pure func body_outcome_index(
 		id = body_check_outcome_callable_id(outcome)
 		definition_id = callable_id_definition_id(id)
 
-		if not module_ids_equal(owner, callable_id_module_id(id)):
+		if callable_id_module_id(definition_table, id) != Some(owner):
 			errors = errors.append(
 				"internal typecheck error: body outcome belongs to a foreign module",
 			)
@@ -9739,7 +9788,13 @@ private pure func body_outcome_index_for_base(
 		)
 
 	if provenance_errors.is_empty():
-		body_outcome_index(bound_module_scope(base.representation.bound_module), outcomes)
+		body_outcome_index(
+			implementation_header_graph_definition_table(
+				base.representation.graph_facts.implementation_headers,
+			),
+			bound_module_scope(base.representation.bound_module),
+			outcomes,
+		)
 	else:
 		BodyOutcomeIndexRejected(provenance_errors)
 
@@ -9954,7 +10009,7 @@ private pure func body_check_outcome_reusable_for_context(
 ) -> Bool:
 	id = body_check_context_callable_id(context)
 
-	if callable_id_name(id) == "main":
+	if from_opaque BodyCheckContext(context).source.name.text == "main":
 		body_check_outcome_main_policy(outcome) == from_opaque BodyCheckContext(context).main_policy
 	else:
 		True
@@ -10107,7 +10162,11 @@ private func typecheck_program_with_accepted_type_headers_and_trace(
 				.join("; "),
 		)
 	else:
-		match body_outcome_index(bound_module_scope(bound_module), outcomes):
+		match body_outcome_index(
+			implementation_header_graph_definition_table(graph.implementation_headers),
+			bound_module_scope(bound_module),
+			outcomes,
+		):
 			BodyOutcomeIndexRejected(errors):
 				rejected_typecheck_program(
 					body_base.state,

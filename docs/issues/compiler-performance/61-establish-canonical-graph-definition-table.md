@@ -9,8 +9,8 @@ IDs in resolved-call metadata. This document retains the normalized roadmap's
 original title while calling the prerequisite 61B to avoid changing either
 completed issue's history.
 
-**Blocks:** Issue 62, which needs a category-checked definition foreign key and
-an exact `DefinitionId -> ModuleId` query.
+**Blocks:** Issue 68, which needs a category-checked definition foreign key and
+an exact source-definition lookup.
 
 ## Objective
 
@@ -28,7 +28,7 @@ DefinitionIndex
 The table stores each definition's module, category, source name, optional
 owner name, and span once. Callable and source-name buckets retain only
 ordered scalar `DefinitionId` values and validate candidates against canonical
-rows. This is the inverse owner query required by Issue 62; it does not yet
+rows. This is the exact lookup boundary required by Issue 68; it does not yet
 change typed callable, constructor, type, global, trait, or implementation
 identity payloads.
 
@@ -169,7 +169,7 @@ The compact table API provides:
 - validated raw-runtime-ID admission;
 - row and owner-module lookup;
 - access to the issuing `ModuleTable`; and
-- callable- and constructor-category checked admission for Issue 62.
+- callable- and constructor-category checked admission for Issue 68.
 
 There is no public row insertion, table constructor, generic transaction API,
 semantic type, typed body, `Env`, or Scope exposure.
@@ -219,7 +219,7 @@ allocation counts are the query regression gate.
 The broad row is intentionally retained as a compatibility-boundary warning:
 that API promises managed legacy key records, so the canonical implementation
 must reconstruct one key for every returned row. It is not the lookup path
-Issue 62 will consume, and the declaration-skeleton production caller now uses
+Issue 68 will consume, and the declaration-skeleton production caller now uses
 `DefinitionId` plus canonical rows directly. Removing remaining compatibility
 projection APIs is explicit follow-up work; this issue does not hide their cost
 or claim it as a win.
@@ -313,8 +313,8 @@ Generated C in the ignored
 
 This prerequisite is accepted as normalized infrastructure with a focused
 construction win. It removes duplicate retained key records, establishes the
-inverse owner query needed by Issue 62, and keeps exact lookup allocations
-neutral. Issue 62 may proceed against this boundary without carrying structural
+exact lookup boundary needed by Issue 68, and keeps exact lookup allocations
+neutral. Issue 68 may proceed against this boundary without carrying structural
 declaration identities into its leaf products.
 
 ## Limits
@@ -325,9 +325,9 @@ declaration identities into its leaf products.
   canonical rows. Production exact lookup and declaration-skeleton matching
   read IDs/rows directly.
 - Repeated direct-program insertion has the measured persistent-publication
-  regression above; Issue 62 must not route graph registration through it.
+  regression above; Issue 68 must not route graph registration through it.
 - The production replay does not isolate definition-index wall time because
   the current phase markers bracket larger graph work.
 - This change does not claim a compiler-wide latency improvement. Its measured
   wins are focused construction allocations/time and production retained
-  objects/bytes; its architectural value is making Issue 62 mechanical.
+  objects/bytes; its architectural value is making Issue 68 mechanical.

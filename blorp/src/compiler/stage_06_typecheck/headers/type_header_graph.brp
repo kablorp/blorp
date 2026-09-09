@@ -36,7 +36,9 @@ import:
 	../../stage_04_modules/loaded_module: ModuleOrigin(StdlibModule)
 	../../stage_04_modules/module_table: module_ids_equal
 	../graph/definition_identity: SourceDefinitionKind(FieldDefinition), source_definition_key
-	../graph/definition_index: definition_index_find_source_definition_id
+	../graph/definition_index:
+		DefinitionTable,
+		definition_index_find_source_definition_id,
 	../graph/indexed_graph:
 		PreparedModuleScope,
 		indexed_graph_definition_index,
@@ -96,10 +98,9 @@ import:
 			UnionTypeSource,
 		),
 		callable_id_module_id,
-		callable_id_name,
-		callable_id_source_span,
 		callable_ids_equal,
 		declaration_skeleton_graph_bound_graph,
+		declaration_skeleton_graph_definition_table,
 		declaration_skeleton_graph_find_constructor,
 		declaration_skeleton_graph_find_type,
 		declaration_skeleton_graph_skeletons,
@@ -220,10 +221,10 @@ union ResolvedTypeShape:
 union TypeResolutionOwner:
 	TypeDeclarationResolutionOwner(TypeId)
 	TraitMethodResolutionOwner(TraitMethodId)
-	CallableResolutionOwner(CallableId)
+	CallableResolutionOwner(CallableId, String)
 	GlobalResolutionOwner(GlobalId)
 	ImplementationResolutionOwner(ImplId)
-	ImplementationMethodResolutionOwner(ImplId, CallableId, ResolvedTypeShape)
+	ImplementationMethodResolutionOwner(ImplId, CallableId, String, ResolvedTypeShape)
 
 
 private union ResolutionTypeParameter:
@@ -678,13 +679,13 @@ private pure func resolution_owner_self_shape(
 			Some(SelfTypeShape(id))
 		TraitMethodResolutionOwner(method_id):
 			Some(TraitSelfTypeShape(trait_method_id_owner(method_id)))
-		CallableResolutionOwner(_):
+		CallableResolutionOwner(_, _):
 			None
 		GlobalResolutionOwner(_):
 			None
 		ImplementationResolutionOwner(_):
 			None
-		ImplementationMethodResolutionOwner(_, _, receiver):
+		ImplementationMethodResolutionOwner(_, _, _, receiver):
 			Some(receiver)
 
 
@@ -1317,6 +1318,7 @@ private pure func resolve_type_expr(
 
 
 private pure func type_resolution_owner_matches_module(
+	definition_table: DefinitionTable,
 	owner: TypeResolutionOwner,
 	module: BoundModule,
 ) -> Bool:
@@ -1332,9 +1334,8 @@ private pure func type_resolution_owner_matches_module(
 					method_id,
 				),
 			) == Some(prepared_module_scope_id(bound_module_scope(module)))
-		CallableResolutionOwner(id):
-			module_ids_equal(
-				callable_id_module_id(id),
+		CallableResolutionOwner(id, _):
+			callable_id_module_id(definition_table, id) == Some(
 				prepared_module_scope_id(bound_module_scope(module)),
 			)
 		GlobalResolutionOwner(id):
@@ -1347,7 +1348,7 @@ private pure func type_resolution_owner_matches_module(
 				impl_id_module_id(id),
 				prepared_module_scope_id(bound_module_scope(module)),
 			)
-		ImplementationMethodResolutionOwner(id, _, _):
+		ImplementationMethodResolutionOwner(id, _, _, _):
 			module_ids_equal(
 				impl_id_module_id(id),
 				prepared_module_scope_id(bound_module_scope(module)),
@@ -1368,7 +1369,11 @@ private pure func prepare_owned_type_resolution_context(
 		None:
 			Err([TypeShapeOwnerModuleMissing(owner, diagnostic_span)])
 		Some(module):
-			if type_resolution_owner_matches_module(owner, module):
+			if type_resolution_owner_matches_module(
+				declaration_skeleton_graph_definition_table(declaration_graph),
+				owner,
+				module,
+			):
 				Ok({
 					declaration_graph = declaration_graph,
 					bound_graph = bound_graph,
@@ -1415,10 +1420,11 @@ pure func prepare_callable_type_resolution_context(
 	graph: TypeHeaderGraph,
 	owner_scope: PreparedModuleScope,
 	callable_id: CallableId,
+	callable_name: String,
+	diagnostic_span: SourceSpan,
 	parameters: List[CallableTypeParameterId],
 ) -> Result[CallableTypeResolutionContext, List[TypeShapeResolutionError]]:
-	owner = CallableResolutionOwner(callable_id)
-	diagnostic_span = callable_id_source_span(callable_id)
+	owner = CallableResolutionOwner(callable_id, callable_name)
 	foreign_parameter = parameters.find(func(parameter):
 		not callable_ids_equal(callable_type_parameter_id_owner(parameter), callable_id)
 	)
@@ -1529,11 +1535,17 @@ pure func resolve_implementation_method_type_shape(
 	implementation_id: ImplId,
 	implementation_parameters: List[ImplementationTypeParameterId],
 	callable_id: CallableId,
+	callable_name: String,
 	callable_parameters: List[CallableTypeParameterId],
 	receiver: ResolvedTypeShape,
 	type_expr: ParsedTypeExpr,
 ) -> Result[ResolvedTypeShape, List[TypeShapeResolutionError]]:
-	owner = ImplementationMethodResolutionOwner(implementation_id, callable_id, receiver)
+	owner = ImplementationMethodResolutionOwner(
+		implementation_id,
+		callable_id,
+		callable_name,
+		receiver,
+	)
 	foreign_implementation_parameter = implementation_parameters.find(func(parameter):
 		not impl_ids_equal(implementation_type_parameter_id_owner(parameter), implementation_id)
 	)
@@ -3218,6 +3230,10 @@ pure func type_header_graph_bound_graph(graph: TypeHeaderGraph) -> BoundModuleGr
 	declaration_skeleton_graph_bound_graph(type_header_graph_declaration_graph(graph))
 
 
+pure func type_header_graph_definition_table(graph: TypeHeaderGraph) -> DefinitionTable:
+	declaration_skeleton_graph_definition_table(type_header_graph_declaration_graph(graph))
+
+
 pure func type_header_graph_headers(graph: TypeHeaderGraph) -> List[TypeHeader]:
 	type_header_graph_rep(graph).table.headers
 
@@ -3582,14 +3598,14 @@ pure func type_resolution_owner_display_name(owner: TypeResolutionOwner) -> Stri
 			type_id_name(id)
 		TraitMethodResolutionOwner(method_id):
 			trait_id_name(trait_method_id_owner(method_id)) + "." + trait_method_id_name(method_id)
-		CallableResolutionOwner(id):
-			callable_id_name(id)
+		CallableResolutionOwner(_, name):
+			name
 		GlobalResolutionOwner(id):
 			global_id_name(id)
 		ImplementationResolutionOwner(id):
 			"implementation of " + impl_id_name(id)
-		ImplementationMethodResolutionOwner(_, callable_id, _):
-			callable_id_name(callable_id)
+		ImplementationMethodResolutionOwner(_, _, name, _):
+			name
 
 
 pure func type_shape_resolution_error_message(error: TypeShapeResolutionError) -> String:

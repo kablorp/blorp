@@ -45,6 +45,11 @@ import:
 		parsed_type_alias_decl_to_json,
 		parsed_union_decl_to_json,
 		parsed_var_decl_to_json,
+	../stage_04_modules/module_table:
+		ModuleId,
+		ModuleTable,
+		module_ids_equal,
+		module_table_canonical_path,
 	decl:
 		TypedDecl(
 			TypedFunctionDecl,
@@ -70,24 +75,29 @@ import:
 		TypedUnionInfo,
 		TypedUnionVariantInfo,
 		typed_foreign_link_platform_to_string,
+	graph/definition_index: DefinitionTable, definition_table_is_compatible_with_module_table
+	headers/declaration_skeleton:
+		CallableId,
+		callable_id_definition_id,
+		callable_id_module_id,
+		constructor_id_definition_id,
+		constructor_id_module_id,
 	infer:
-		CallableOrigin(
-			CallableBuiltin,
-			CallableConstructor,
-			CallableForeign,
-			CallableImported,
-			CallableImportedUnresolved,
-			CallableImplMethod,
-			CallableLocal,
-		),
 		ExprTypeOrigin(ExplicitAnnotationOrigin, InferredOrigin, SynthesizedOrigin),
 		ResolvedCallInfo,
 		ResolvedCallTarget(
 			ResolvedClosureCall,
-			ResolvedDirectCall,
+			ResolvedCompilerBuiltinCall,
+			ResolvedConstructorCall,
+			ResolvedGraphCallableCall,
 			ResolvedIntrinsicCall,
-			ResolvedTraitMethodCall,
+			ResolvedSelectedTraitMethodCall,
+			ResolvedUnindexedCallableCall,
+			ResolvedUnindexedConstructorCall,
+			ResolvedUnindexedSelectedTraitMethodCall,
+			ResolvedUnresolvedTraitMethodCall,
 		),
+		ResolvedGraphCallableCategory(ResolvedForeignFunctionCall, ResolvedSourceFunctionCall),
 		TypedAssignScope(LocalAssignScope, ModuleAssignScope),
 		TypedAssignTarget,
 		TypedConcurrentBinding,
@@ -179,7 +189,6 @@ import:
 		JsonValue(JsonBool, JsonNull, JsonNumber, JsonObject, JsonString, JsonVector),
 		emit_json_chunks,
 	type_system/env:
-		ImplMethodTarget,
 		Purity(Impure, Pure),
 		ResourceArgPolicy(AllowResourceArgs, RejectResourceArgs),
 		ResourceResultPolicy(
@@ -387,46 +396,166 @@ private pure func dim_constraint_to_json(constraint: (SemanticType, SemanticType
 	])
 
 
-private pure func callable_origin_to_json(origin: CallableOrigin) -> JsonValue:
-	match origin:
-		CallableLocal:
-			JsonObject([(KIND_FIELD, JsonString("local"))])
-		CallableImported(_, module_path):
-			JsonObject([
-				(KIND_FIELD, JsonString("imported")),
-				("module", JsonString(module_path)),
-			])
-		CallableImportedUnresolved(module_path):
-			JsonObject([
-				(KIND_FIELD, JsonString("imported")),
-				("module", JsonString(module_path)),
-			])
-		CallableBuiltin:
-			JsonObject([(KIND_FIELD, JsonString("builtin"))])
-		CallableForeign:
+record TypedAstJsonContext {
+	module_id: ModuleId,
+	module_table: ModuleTable,
+	definition_table: DefinitionTable
+}
+
+
+private pure func resolved_call_target_is_valid(
+	context: TypedAstJsonContext,
+	target: ResolvedCallTarget,
+) -> Bool:
+	if (
+		not definition_table_is_compatible_with_module_table(
+			context.definition_table,
+			context.module_table,
+		)
+		or module_table_canonical_path(context.module_table, context.module_id).is_none()
+	):
+		False
+	else:
+		match target:
+			ResolvedGraphCallableCall(callable_id, _):
+				callable_id_module_id(context.definition_table, callable_id).is_some()
+			ResolvedConstructorCall(constructor_id, _):
+				constructor_id_module_id(context.definition_table, constructor_id).is_some()
+			ResolvedSelectedTraitMethodCall(_, callable_id):
+				callable_id_module_id(context.definition_table, callable_id).is_some()
+			ResolvedUnindexedConstructorCall(_, _):
+				True
+			ResolvedUnindexedCallableCall(_, _) | ResolvedUnindexedSelectedTraitMethodCall(_, _):
+				False
+			_:
+				True
+
+
+private pure func graph_callable_origin_to_json(
+	context: TypedAstJsonContext,
+	callable_id: CallableId,
+	category: ResolvedGraphCallableCategory,
+) -> JsonValue:
+	match category:
+		ResolvedForeignFunctionCall:
 			JsonObject([(KIND_FIELD, JsonString("foreign"))])
-		CallableConstructor(parent_type):
+		ResolvedSourceFunctionCall:
+			match callable_id_module_id(context.definition_table, callable_id):
+				Some(owner_module_id):
+					if module_ids_equal(owner_module_id, context.module_id):
+						JsonObject([(KIND_FIELD, JsonString("local"))])
+					else:
+						match module_table_canonical_path(context.module_table, owner_module_id):
+							Some(module_path):
+								JsonObject([
+									(KIND_FIELD, JsonString("imported")),
+									("module", JsonString(module_path)),
+								])
+							None:
+								JsonNull
+				None:
+					JsonNull
+
+
+private pure func resolved_trait_method_target_to_json(
+	context: TypedAstJsonContext,
+	callable_id: CallableId,
+) -> JsonValue:
+	module_path = callable_id_module_id(
+		context.definition_table,
+		callable_id,
+	).and_then(
+		func(module_id): module_table_canonical_path(context.module_table, module_id),
+	)
+
+	match module_path:
+		Some(path):
 			JsonObject([
-				(KIND_FIELD, JsonString("constructor")),
-				("parent_type", JsonString(parent_type)),
+				("callable_id", json_int(callable_id_definition_id(callable_id))),
+				("module_path", JsonString(path)),
 			])
-		CallableImplMethod:
-			JsonObject([(KIND_FIELD, JsonString("impl_method"))])
+		None:
+			JsonNull
 
 
-private pure func resolved_call_target_to_json(target: ResolvedCallTarget) -> JsonValue:
+private pure func resolved_call_target_to_json(
+	context: Option[TypedAstJsonContext],
+	target: ResolvedCallTarget,
+) -> JsonValue:
 	match target:
-		ResolvedDirectCall(callable_id, origin):
+		ResolvedGraphCallableCall(callable_id, category):
+			match context:
+				Some(projection):
+					JsonObject([
+						(KIND_FIELD, JsonString("direct")),
+						("callable_id", json_int(callable_id_definition_id(callable_id))),
+						(
+							"origin",
+							graph_callable_origin_to_json(projection, callable_id, category),
+						),
+					])
+				None:
+					JsonNull
+		ResolvedConstructorCall(constructor_id, parent_type):
+			JsonObject([
+				(KIND_FIELD, JsonString("direct")),
+				("callable_id", json_int(constructor_id_definition_id(constructor_id))),
+				("origin", JsonObject([
+					(KIND_FIELD, JsonString("constructor")),
+					("parent_type", JsonString(parent_type)),
+				])),
+			])
+		ResolvedUnindexedCallableCall(callable_id, category):
+			origin = match category:
+				ResolvedSourceFunctionCall:
+					JsonObject([(KIND_FIELD, JsonString("local"))])
+				ResolvedForeignFunctionCall:
+					JsonObject([(KIND_FIELD, JsonString("foreign"))])
+
 			JsonObject([
 				(KIND_FIELD, JsonString("direct")),
 				("callable_id", json_int(callable_id)),
-				("origin", callable_origin_to_json(origin)),
+				("origin", origin),
 			])
-		ResolvedTraitMethodCall(trait_name, impl_target):
+		ResolvedUnindexedConstructorCall(constructor_id, parent_type):
+			JsonObject([
+				(KIND_FIELD, JsonString("direct")),
+				("callable_id", json_int(constructor_id)),
+				("origin", JsonObject([
+					(KIND_FIELD, JsonString("constructor")),
+					("parent_type", JsonString(parent_type)),
+				])),
+			])
+		ResolvedCompilerBuiltinCall(callable_id):
+			JsonObject([
+				(KIND_FIELD, JsonString("direct")),
+				("callable_id", json_int(callable_id)),
+				("origin", JsonObject([(KIND_FIELD, JsonString("builtin"))])),
+			])
+		ResolvedSelectedTraitMethodCall(trait_name, callable_id):
+			match context:
+				Some(projection):
+					JsonObject([
+						(KIND_FIELD, JsonString("trait_method")),
+						("trait_name", JsonString(trait_name)),
+						(
+							"impl_target",
+							resolved_trait_method_target_to_json(projection, callable_id),
+						),
+					])
+				None:
+					JsonNull
+		ResolvedUnindexedSelectedTraitMethodCall(trait_name, _):
 			JsonObject([
 				(KIND_FIELD, JsonString("trait_method")),
 				("trait_name", JsonString(trait_name)),
-				("impl_target", resolved_trait_method_target_to_json(impl_target)),
+				("impl_target", JsonNull),
+			])
+		ResolvedUnresolvedTraitMethodCall(trait_name):
+			JsonObject([
+				(KIND_FIELD, JsonString("trait_method")),
+				("trait_name", JsonString(trait_name)),
+				("impl_target", JsonNull),
 			])
 		ResolvedIntrinsicCall:
 			JsonObject([(KIND_FIELD, JsonString("intrinsic"))])
@@ -434,25 +563,15 @@ private pure func resolved_call_target_to_json(target: ResolvedCallTarget) -> Js
 			JsonObject([(KIND_FIELD, JsonString("closure"))])
 
 
-private pure func resolved_trait_method_target_to_json(
-	target: Option[ImplMethodTarget],
+private pure func resolved_call_to_json_with_context(
+	context: Option[TypedAstJsonContext],
+	info: ResolvedCallInfo,
 ) -> JsonValue:
-	match target:
-		Some(value):
-			JsonObject([
-				("callable_id", json_int(value.callable_id)),
-				("module_path", JsonString(value.module_path)),
-			])
-		None:
-			JsonNull
-
-
-pure func resolved_call_to_json(info: ResolvedCallInfo) -> JsonValue:
 	JsonObject([
 		("callee_name", JsonString(info.callee_name)),
 		("source_name", JsonString(info.source_name)),
 		("purity", purity_to_json(info.purity)),
-		("target", resolved_call_target_to_json(info.target)),
+		("target", resolved_call_target_to_json(context, info.target)),
 		("instantiated_params", type_list_to_json(info.instantiated_params)),
 		("instantiated_return", type_to_json(info.instantiated_return)),
 		("resource_args", resource_arg_policy_to_json(info.resource_args)),
@@ -460,10 +579,35 @@ pure func resolved_call_to_json(info: ResolvedCallInfo) -> JsonValue:
 	])
 
 
-private pure func optional_resolved_call_to_json(info: Option[ResolvedCallInfo]) -> JsonValue:
+pure func resolved_call_to_json(info: ResolvedCallInfo) -> JsonValue:
+	resolved_call_to_json_with_context(None, info)
+
+
+pure func resolved_call_to_json_in_graph(
+	module_id: ModuleId,
+	module_table: ModuleTable,
+	definition_table: DefinitionTable,
+	info: ResolvedCallInfo,
+) -> Result[JsonValue, String]:
+	context: TypedAstJsonContext = {
+		module_id = module_id,
+		module_table = module_table,
+		definition_table = definition_table
+	}
+
+	if resolved_call_target_is_valid(context, info.target):
+		Ok(resolved_call_to_json_with_context(Some(context), info))
+	else:
+		Err("definition-backed resolved call is outside the typed-AST projection table")
+
+
+private pure func optional_resolved_call_to_json(
+	context: Option[TypedAstJsonContext],
+	info: Option[ResolvedCallInfo],
+) -> JsonValue:
 	match info:
 		Some(value):
-			resolved_call_to_json(value)
+			resolved_call_to_json_with_context(context, value)
 		None:
 			JsonNull
 
@@ -579,7 +723,10 @@ pure func value_proofs_to_json(proofs: ValueProofs) -> JsonValue:
 	])
 
 
-pure func typed_expr_info_to_json(info: TypedExprInfo) -> JsonValue:
+private pure func typed_expr_info_to_json_with_context(
+	context: Option[TypedAstJsonContext],
+	info: TypedExprInfo,
+) -> JsonValue:
 	JsonObject([
 		("source_type", optional_type_to_json(info.source_type)),
 		("semantic_type", type_to_json(typed_expr_info_semantic_type(info))),
@@ -587,12 +734,16 @@ pure func typed_expr_info_to_json(info: TypedExprInfo) -> JsonValue:
 		("origin", expr_type_origin_to_json(info.origin)),
 		("value_slot", value_slot_to_json(info.value_slot)),
 		("proofs", value_proofs_to_json(info.proofs)),
-		("resolved_call", optional_resolved_call_to_json(info.resolved_call)),
+		("resolved_call", optional_resolved_call_to_json(context, info.resolved_call)),
 		("resolved_definition_id", optional_definition_id_to_json(info.resolved_definition_id)),
 		("resource_dependencies", JsonVector(info.resource_dependencies.map(
 				func(item: String): JsonString(item),
 			))),
 	])
+
+
+pure func typed_expr_info_to_json(info: TypedExprInfo) -> JsonValue:
+	typed_expr_info_to_json_with_context(None, info)
 
 
 private pure func optional_string_to_json(value: Option[String]) -> JsonValue:
@@ -604,6 +755,7 @@ private pure func optional_string_to_json(value: Option[String]) -> JsonValue:
 
 
 private pure func typed_expr_json(
+	context: Option[TypedAstJsonContext],
 	kind: String,
 	span: SourceSpan,
 	info: TypedExprInfo,
@@ -612,7 +764,7 @@ private pure func typed_expr_json(
 	var result: List[(String, JsonValue)] = [
 		(KIND_FIELD, JsonString(kind)),
 		("span", parsed_source_span_to_json(span)),
-		("info", typed_expr_info_to_json(info)),
+		("info", typed_expr_info_to_json_with_context(context, info)),
 	]
 
 	for field in fields:
@@ -621,15 +773,19 @@ private pure func typed_expr_json(
 	JsonObject(result)
 
 
-private pure func optional_typed_expr_to_json(expr: Option[TypedExpr]) -> JsonValue:
+private pure func optional_typed_expr_to_json(
+	context: Option[TypedAstJsonContext],
+	expr: Option[TypedExpr],
+) -> JsonValue:
 	match expr:
 		Some(value):
-			typed_expr_to_json(value)
+			typed_expr_to_json_with_context(context, value)
 		None:
 			JsonNull
 
 
 private pure func typed_loop_view_to_json(
+	context: Option[TypedAstJsonContext],
 	loop_view: Option[TypedLoopView],
 	iterable: TypedExpr,
 ) -> JsonValue:
@@ -639,19 +795,19 @@ private pure func typed_loop_view_to_json(
 				(TypedIndicesLoopView(element_type), Some(source)):
 					JsonObject([
 						(KIND_FIELD, JsonString("indices")),
-						("source", typed_expr_to_json(source)),
+						("source", typed_expr_to_json_with_context(context, source)),
 						("element_type", type_to_json(element_type)),
 					])
 				(TypedEnumerateLoopView(element_type), Some(source)):
 					JsonObject([
 						(KIND_FIELD, JsonString("enumerate")),
-						("source", typed_expr_to_json(source)),
+						("source", typed_expr_to_json_with_context(context, source)),
 						("element_type", type_to_json(element_type)),
 					])
 				(TypedEnumerate2LoopView(element_type), Some(source)):
 					JsonObject([
 						(KIND_FIELD, JsonString("enumerate2")),
-						("source", typed_expr_to_json(source)),
+						("source", typed_expr_to_json_with_context(context, source)),
 						("element_type", type_to_json(element_type)),
 					])
 				(TypedWindowsLoopView(size, element_type), Some(source)):
@@ -659,8 +815,8 @@ private pure func typed_loop_view_to_json(
 						Some(size_arg):
 							JsonObject([
 								(KIND_FIELD, JsonString("windows")),
-								("source", typed_expr_to_json(source)),
-								("size_arg", typed_expr_to_json(size_arg)),
+								("source", typed_expr_to_json_with_context(context, source)),
+								("size_arg", typed_expr_to_json_with_context(context, size_arg)),
 								("size", json_int(size)),
 								("element_type", type_to_json(element_type)),
 							])
@@ -822,32 +978,46 @@ pure func typed_pattern_to_json(pattern: TypedPattern) -> JsonValue:
 			])
 
 
-private pure func typed_match_case_to_json(case: TypedMatchCase) -> JsonValue:
+private pure func typed_match_case_to_json(
+	context: Option[TypedAstJsonContext],
+	case: TypedMatchCase,
+) -> JsonValue:
 	JsonObject([
 		("pattern", typed_pattern_to_json(case.pattern)),
-		("body", typed_expr_to_json(case.body)),
+		("body", typed_expr_to_json_with_context(context, case.body)),
 		("span", parsed_source_span_to_json(case.span)),
 	])
 
 
-private pure func typed_dict_entry_to_json(entry: TypedDictEntry) -> JsonValue:
+private pure func typed_dict_entry_to_json(
+	context: Option[TypedAstJsonContext],
+	entry: TypedDictEntry,
+) -> JsonValue:
 	JsonObject([
-		("key", typed_expr_to_json(entry.key)),
-		("value", typed_expr_to_json(entry.value)),
+		("key", typed_expr_to_json_with_context(context, entry.key)),
+		("value", typed_expr_to_json_with_context(context, entry.value)),
 	])
 
 
-private pure func typed_record_field_to_json(field: TypedRecordField) -> JsonValue:
+private pure func typed_record_field_to_json(
+	context: Option[TypedAstJsonContext],
+	field: TypedRecordField,
+) -> JsonValue:
 	JsonObject([
 		("name", parsed_identifier_to_json(field.name)),
-		("value", typed_expr_to_json(field.value)),
+		("value", typed_expr_to_json_with_context(context, field.value)),
 		("span", parsed_source_span_to_json(field.span)),
 		("definition_id", optional_definition_id_to_json(field.definition_id)),
 	])
 
 
-private pure func typed_record_fields_to_json(fields: List[TypedRecordField]) -> JsonValue:
-	JsonVector(fields.map(typed_record_field_to_json))
+private pure func typed_record_fields_to_json(
+	context: Option[TypedAstJsonContext],
+	fields: List[TypedRecordField],
+) -> JsonValue:
+	JsonVector(fields.map(
+		func(field): typed_record_field_to_json(context, field),
+	))
 
 
 private pure func typed_lambda_param_to_json(param: TypedLambdaParam) -> JsonValue:
@@ -858,32 +1028,38 @@ private pure func typed_lambda_param_to_json(param: TypedLambdaParam) -> JsonVal
 	])
 
 
-private pure func typed_select_arm_kind_to_json(kind: TypedSelectArmKind) -> JsonValue:
+private pure func typed_select_arm_kind_to_json(
+	context: Option[TypedAstJsonContext],
+	kind: TypedSelectArmKind,
+) -> JsonValue:
 	match kind:
 		TypedSelectReceiveArm(name, elem_type, channel):
 			JsonObject([
 				(KIND_FIELD, JsonString("receive")),
 				("name", parsed_identifier_to_json(name)),
 				("elem_type", type_to_json(elem_type)),
-				("channel", typed_expr_to_json(channel)),
+				("channel", typed_expr_to_json_with_context(context, channel)),
 			])
 		TypedSelectSealedArm(elem_type, channel):
 			JsonObject([
 				(KIND_FIELD, JsonString("sealed")),
 				("elem_type", type_to_json(elem_type)),
-				("channel", typed_expr_to_json(channel)),
+				("channel", typed_expr_to_json_with_context(context, channel)),
 			])
 		TypedSelectAfterArm(timeout):
 			JsonObject([
 				(KIND_FIELD, JsonString("after")),
-				("timeout", typed_expr_to_json(timeout)),
+				("timeout", typed_expr_to_json_with_context(context, timeout)),
 			])
 
 
-private pure func typed_select_arm_to_json(arm: TypedSelectArm) -> JsonValue:
+private pure func typed_select_arm_to_json(
+	context: Option[TypedAstJsonContext],
+	arm: TypedSelectArm,
+) -> JsonValue:
 	JsonObject([
-		("kind", typed_select_arm_kind_to_json(arm.kind)),
-		("body", typed_expr_to_json(arm.body)),
+		("kind", typed_select_arm_kind_to_json(context, arm.kind)),
+		("body", typed_expr_to_json_with_context(context, arm.body)),
 		("span", parsed_source_span_to_json(arm.span)),
 	])
 
@@ -913,27 +1089,39 @@ private pure func optional_typed_assign_target_to_json(
 			JsonNull
 
 
-private pure func typed_concurrent_param_to_json(param: TypedConcurrentParam) -> JsonValue:
+private pure func typed_concurrent_param_to_json(
+	context: Option[TypedAstJsonContext],
+	param: TypedConcurrentParam,
+) -> JsonValue:
 	JsonObject([
 		("name", parsed_identifier_to_json(param.name)),
-		("value", typed_expr_to_json(param.value)),
+		("value", typed_expr_to_json_with_context(context, param.value)),
 		("span", parsed_source_span_to_json(param.span)),
 	])
 
 
-private pure func typed_concurrent_params_to_json(params: List[TypedConcurrentParam]) -> JsonValue:
-	JsonVector(params.map(typed_concurrent_param_to_json))
+private pure func typed_concurrent_params_to_json(
+	context: Option[TypedAstJsonContext],
+	params: List[TypedConcurrentParam],
+) -> JsonValue:
+	JsonVector(params.map(
+		func(param): typed_concurrent_param_to_json(context, param),
+	))
 
 
-private pure func typed_concurrent_binding_to_json(binding: TypedConcurrentBinding) -> JsonValue:
+private pure func typed_concurrent_binding_to_json(
+	context: Option[TypedAstJsonContext],
+	binding: TypedConcurrentBinding,
+) -> JsonValue:
 	typed_expr_json(
+		context,
 		"concurrent_bind",
 		binding.span,
 		binding.info,
 		[
 			("name", parsed_identifier_to_json(binding.name)),
 			("annotation", optional_type_to_json(binding.annotation)),
-			("value", typed_expr_to_json(binding.value)),
+			("value", typed_expr_to_json_with_context(context, binding.value)),
 		],
 	)
 
@@ -946,37 +1134,45 @@ private pure func typed_with_binding_kind_to_json(kind: ParsedWithBindingKind) -
 			JsonString("try")
 
 
-private pure func typed_with_error_map_to_json(error_map: TypedWithErrorMap) -> JsonValue:
+private pure func typed_with_error_map_to_json(
+	context: Option[TypedAstJsonContext],
+	error_map: TypedWithErrorMap,
+) -> JsonValue:
 	JsonObject([
 		("name", parsed_identifier_to_json(error_map.name)),
-		("value", typed_expr_to_json(error_map.value)),
+		("value", typed_expr_to_json_with_context(context, error_map.value)),
 		("span", parsed_source_span_to_json(error_map.span)),
 	])
 
 
 private pure func optional_typed_with_error_map_to_json(
+	context: Option[TypedAstJsonContext],
 	error_map: Option[TypedWithErrorMap],
 ) -> JsonValue:
 	match error_map:
 		Some(value):
-			typed_with_error_map_to_json(value)
+			typed_with_error_map_to_json(context, value)
 		None:
 			JsonNull
 
 
-private pure func typed_with_binding_to_json(binding: TypedWithBinding) -> JsonValue:
+private pure func typed_with_binding_to_json(
+	context: Option[TypedAstJsonContext],
+	binding: TypedWithBinding,
+) -> JsonValue:
 	JsonObject([
 		("name", parsed_identifier_to_json(binding.name)),
 		("annotation", optional_type_to_json(binding.annotation)),
-		("value", typed_expr_to_json(binding.value)),
+		("value", typed_expr_to_json_with_context(context, binding.value)),
 		("kind", typed_with_binding_kind_to_json(binding.kind)),
-		("error_map", optional_typed_with_error_map_to_json(binding.error_map)),
+		("error_map", optional_typed_with_error_map_to_json(context, binding.error_map)),
 		("cleanup_function", optional_string_to_json(binding.cleanup_function)),
 		("span", parsed_source_span_to_json(binding.span)),
 	])
 
 
 private pure func typed_string_interpolation_part_to_json(
+	context: Option[TypedAstJsonContext],
 	part: TypedStringInterpolationPart,
 ) -> JsonValue:
 	match part:
@@ -988,21 +1184,25 @@ private pure func typed_string_interpolation_part_to_json(
 		TypedInterpolationExpr(expr):
 			JsonObject([
 				(KIND_FIELD, JsonString("expr")),
-				("expr", typed_expr_to_json(expr)),
+				("expr", typed_expr_to_json_with_context(context, expr)),
 			])
 
 
-private pure func typed_var_decl_payload_to_json(payload: TypedVarDeclPayload) -> JsonValue:
+private pure func typed_var_decl_payload_to_json(
+	context: Option[TypedAstJsonContext],
+	payload: TypedVarDeclPayload,
+) -> JsonValue:
 	JsonObject([
 		("name", parsed_identifier_to_json(payload.name)),
 		("annotation", optional_type_to_json(payload.annotation)),
-		("initializer", typed_expr_to_json(payload.initializer)),
+		("initializer", typed_expr_to_json_with_context(context, payload.initializer)),
 		("is_mutable", JsonBool(payload.is_mutable)),
 		("span", parsed_source_span_to_json(payload.span)),
 	])
 
 
 private pure func typed_for_expr_to_json(
+	context: Option[TypedAstJsonContext],
 	binder: ParsedForBinder,
 	iterable: TypedExpr,
 	loop_view: Option[TypedLoopView],
@@ -1011,19 +1211,21 @@ private pure func typed_for_expr_to_json(
 	info: TypedExprInfo,
 ) -> JsonValue:
 	typed_expr_json(
+		context,
 		"for",
 		span,
 		info,
 		[
 			("binder", parsed_for_binder_to_json(binder)),
-			("iterable", typed_expr_to_json(iterable)),
-			("loop_view", typed_loop_view_to_json(loop_view, iterable)),
-			("body", typed_expr_to_json(body)),
+			("iterable", typed_expr_to_json_with_context(context, iterable)),
+			("loop_view", typed_loop_view_to_json(context, loop_view, iterable)),
+			("body", typed_expr_to_json_with_context(context, body)),
 		],
 	)
 
 
 private pure func typed_concurrent_for_expr_to_json(
+	context: Option[TypedAstJsonContext],
 	name: ParsedIdentifier,
 	iterable: TypedExpr,
 	params: List[TypedConcurrentParam],
@@ -1032,34 +1234,39 @@ private pure func typed_concurrent_for_expr_to_json(
 	info: TypedExprInfo,
 ) -> JsonValue:
 	typed_expr_json(
+		context,
 		"concurrent_for",
 		span,
 		info,
 		[
 			("name", parsed_identifier_to_json(name)),
-			("iterable", typed_expr_to_json(iterable)),
-			("params", typed_concurrent_params_to_json(params)),
-			("body", typed_expr_to_json(body)),
+			("iterable", typed_expr_to_json_with_context(context, iterable)),
+			("params", typed_concurrent_params_to_json(context, params)),
+			("body", typed_expr_to_json_with_context(context, body)),
 		],
 	)
 
 
-pure func typed_expr_to_json(expr: TypedExpr) -> JsonValue:
+private pure func typed_expr_to_json_with_context(
+	context: Option[TypedAstJsonContext],
+	expr: TypedExpr,
+) -> JsonValue:
 	match expr:
 		TypedNameExpr(name, info):
 			JsonObject([
 				(KIND_FIELD, JsonString("name")),
 				("name", parsed_identifier_to_json(name)),
-				("info", typed_expr_info_to_json(info)),
+				("info", typed_expr_info_to_json_with_context(context, info)),
 			])
 		TypedIntLiteralExpr(value, span, info):
-			typed_expr_json("int_literal", span, info, [("value", JsonString(value))])
+			typed_expr_json(context, "int_literal", span, info, [("value", JsonString(value))])
 		TypedFloatLiteralExpr(value, span, info):
-			typed_expr_json("float_literal", span, info, [("value", JsonString(value))])
+			typed_expr_json(context, "float_literal", span, info, [("value", JsonString(value))])
 		TypedStringLiteralExpr(value, span, info):
-			typed_expr_json("string_literal", span, info, [("value", JsonString(value))])
+			typed_expr_json(context, "string_literal", span, info, [("value", JsonString(value))])
 		TypedStringInterpolationExpr(value, raw, span, info):
 			typed_expr_json(
+				context,
 				"string_interpolation_raw",
 				span,
 				info,
@@ -1067,163 +1274,188 @@ pure func typed_expr_to_json(expr: TypedExpr) -> JsonValue:
 			)
 		TypedStringInterpolationPartsExpr(parts, multiline, span, info):
 			typed_expr_json(
+				context,
 				"string_interpolation",
 				span,
 				info,
-				[
-					("parts", JsonVector(parts.map(typed_string_interpolation_part_to_json))),
-					("multiline", JsonBool(multiline)),
-				],
+				[("parts", JsonVector(parts.map(
+							func(part): typed_string_interpolation_part_to_json(context, part),
+						))), ("multiline", JsonBool(multiline))],
 			)
 		TypedBoolLiteralExpr(value, span, info):
-			typed_expr_json("bool_literal", span, info, [("value", JsonBool(value))])
+			typed_expr_json(context, "bool_literal", span, info, [("value", JsonBool(value))])
 		TypedCharLiteralExpr(value, span, info):
-			typed_expr_json("char_literal", span, info, [("value", json_int(value))])
+			typed_expr_json(context, "char_literal", span, info, [("value", json_int(value))])
 		TypedUnaryExpr(op, inner, span, info):
 			typed_expr_json(
+				context,
 				"unary",
 				span,
 				info,
-				[("op", parsed_unary_op_to_json(op)), ("inner", typed_expr_to_json(inner))],
+				[
+					("op", parsed_unary_op_to_json(op)),
+					("inner", typed_expr_to_json_with_context(context, inner)),
+				],
 			)
 		TypedBinaryExpr(op, left, right, span, info):
 			typed_expr_json(
+				context,
 				"binary",
 				span,
 				info,
 				[
 					("op", parsed_binary_op_to_json(op)),
-					("left", typed_expr_to_json(left)),
-					("right", typed_expr_to_json(right)),
+					("left", typed_expr_to_json_with_context(context, left)),
+					("right", typed_expr_to_json_with_context(context, right)),
 				],
 			)
 		TypedLogicalExpr(op, left, right, span, info):
 			typed_expr_json(
+				context,
 				"logical",
 				span,
 				info,
 				[
 					("op", parsed_logical_op_to_json(op)),
-					("left", typed_expr_to_json(left)),
-					("right", typed_expr_to_json(right)),
+					("left", typed_expr_to_json_with_context(context, left)),
+					("right", typed_expr_to_json_with_context(context, right)),
 				],
 			)
 		TypedCallExpr(callee, args, span, info):
 			typed_expr_json(
+				context,
 				"call",
 				span,
 				info,
 				[
-					("callee", typed_expr_to_json(callee)),
-					("args", JsonVector(args.map(typed_expr_to_json))),
+					("callee", typed_expr_to_json_with_context(context, callee)),
+					("args", JsonVector(args.map(
+							func(arg): typed_expr_to_json_with_context(context, arg),
+						))),
 				],
 			)
 		TypedTupleExpr(items, span, info):
-			typed_expr_json(
-				"tuple",
-				span,
-				info,
-				[("items", JsonVector(items.map(typed_expr_to_json)))],
-			)
+			typed_expr_json(context, "tuple", span, info, [("items", JsonVector(items.map(
+							func(item): typed_expr_to_json_with_context(context, item),
+						)))])
 		TypedTupleDestructExpr(names, value, span, info):
 			typed_expr_json(
+				context,
 				"tuple_destruct",
 				span,
 				info,
-				[("names", identifiers_to_json(names)), ("value", typed_expr_to_json(value))],
+				[
+					("names", identifiers_to_json(names)),
+					("value", typed_expr_to_json_with_context(context, value)),
+				],
 			)
 		TypedAssignExpr(name, scope, value, span, info):
 			typed_expr_json(
+				context,
 				"assign",
 				span,
 				info,
 				[
 					("name", parsed_identifier_to_json(name)),
 					("scope", typed_assign_scope_to_json(scope)),
-					("value", typed_expr_to_json(value)),
+					("value", typed_expr_to_json_with_context(context, value)),
 				],
 			)
 		TypedSubscriptExpr(receiver, indices, span, info):
 			typed_expr_json(
+				context,
 				"subscript",
 				span,
 				info,
 				[
-					("receiver", typed_expr_to_json(receiver)),
-					("indices", JsonVector(indices.map(typed_expr_to_json))),
+					("receiver", typed_expr_to_json_with_context(context, receiver)),
+					("indices", JsonVector(indices.map(
+							func(index): typed_expr_to_json_with_context(context, index),
+						))),
 				],
 			)
 		TypedSubscriptAssignExpr(target, receiver, indices, value, span, info):
 			typed_expr_json(
+				context,
 				"subscript_assign",
 				span,
 				info,
 				[
 					("target", optional_typed_assign_target_to_json(target)),
-					("receiver", typed_expr_to_json(receiver)),
-					("indices", JsonVector(indices.map(typed_expr_to_json))),
-					("value", typed_expr_to_json(value)),
+					("receiver", typed_expr_to_json_with_context(context, receiver)),
+					("indices", JsonVector(indices.map(
+							func(index): typed_expr_to_json_with_context(context, index),
+						))),
+					("value", typed_expr_to_json_with_context(context, value)),
 				],
 			)
 		TypedListExpr(items, span, info):
-			typed_expr_json(
-				"list",
-				span,
-				info,
-				[("items", JsonVector(items.map(typed_expr_to_json)))],
-			)
+			typed_expr_json(context, "list", span, info, [("items", JsonVector(items.map(
+							func(item): typed_expr_to_json_with_context(context, item),
+						)))])
 		TypedVectorExpr(items, span, info):
-			typed_expr_json(
-				"vector",
-				span,
-				info,
-				[("items", JsonVector(items.map(typed_expr_to_json)))],
-			)
+			typed_expr_json(context, "vector", span, info, [("items", JsonVector(items.map(
+							func(item): typed_expr_to_json_with_context(context, item),
+						)))])
 		TypedDictExpr(entries, span, info):
-			typed_expr_json(
-				"dict",
-				span,
-				info,
-				[("entries", JsonVector(entries.map(typed_dict_entry_to_json)))],
-			)
+			typed_expr_json(context, "dict", span, info, [("entries", JsonVector(entries.map(
+							func(entry): typed_dict_entry_to_json(context, entry),
+						)))])
 		TypedOpaqueIntoExpr(target_type, inner, span, info):
 			typed_expr_json(
+				context,
 				"opaque_into",
 				span,
 				info,
-				[("target_type", type_to_json(target_type)), ("inner", typed_expr_to_json(inner))],
+				[
+					("target_type", type_to_json(target_type)),
+					("inner", typed_expr_to_json_with_context(context, inner)),
+				],
 			)
 		TypedOpaqueFromExpr(source_type, inner, span, info):
 			typed_expr_json(
+				context,
 				"opaque_from",
 				span,
 				info,
-				[("source_type", type_to_json(source_type)), ("inner", typed_expr_to_json(inner))],
+				[
+					("source_type", type_to_json(source_type)),
+					("inner", typed_expr_to_json_with_context(context, inner)),
+				],
 			)
 		TypedRecordExpr(fields, span, info):
-			typed_expr_json("record", span, info, [("fields", typed_record_fields_to_json(fields))])
+			typed_expr_json(
+				context,
+				"record",
+				span,
+				info,
+				[("fields", typed_record_fields_to_json(context, fields))],
+			)
 		TypedRecordUpdateExpr(receiver, fields, _, span, info):
 			typed_expr_json(
+				context,
 				"record_update",
 				span,
 				info,
 				[
-					("receiver", typed_expr_to_json(receiver)),
-					("fields", typed_record_fields_to_json(fields)),
+					("receiver", typed_expr_to_json_with_context(context, receiver)),
+					("fields", typed_record_fields_to_json(context, fields)),
 				],
 			)
 		TypedFieldAccessExpr(receiver, field, span, info):
 			typed_expr_json(
+				context,
 				"field_access",
 				span,
 				info,
 				[
-					("receiver", typed_expr_to_json(receiver)),
+					("receiver", typed_expr_to_json_with_context(context, receiver)),
 					("field", parsed_identifier_to_json(field)),
 				],
 			)
 		TypedLambdaExpr(is_pure, params, return_annotation, body, span, info):
 			typed_expr_json(
+				context,
 				"lambda",
 				span,
 				info,
@@ -1231,50 +1463,59 @@ pure func typed_expr_to_json(expr: TypedExpr) -> JsonValue:
 					("is_pure", JsonBool(is_pure)),
 					("params", JsonVector(params.map(typed_lambda_param_to_json))),
 					("return_annotation", optional_type_to_json(return_annotation)),
-					("body", typed_expr_to_json(body)),
+					("body", typed_expr_to_json_with_context(context, body)),
 				],
 			)
 		TypedRangeExpr(start_expr, end_expr, span, info):
 			typed_expr_json(
+				context,
 				"range",
 				span,
 				info,
-				[("start", typed_expr_to_json(start_expr)), ("end", typed_expr_to_json(end_expr))],
+				[
+					("start", typed_expr_to_json_with_context(context, start_expr)),
+					("end", typed_expr_to_json_with_context(context, end_expr)),
+				],
 			)
 		TypedIfExpr(condition, then_branch, else_branch, span, info):
 			typed_expr_json(
+				context,
 				"if",
 				span,
 				info,
 				[
-					("condition", typed_expr_to_json(condition)),
-					("then", typed_expr_to_json(then_branch)),
-					("else", optional_typed_expr_to_json(else_branch)),
+					("condition", typed_expr_to_json_with_context(context, condition)),
+					("then", typed_expr_to_json_with_context(context, then_branch)),
+					("else", optional_typed_expr_to_json(context, else_branch)),
 				],
 			)
 		TypedMatchExpr(scrutinee, cases, span, info):
 			typed_expr_json(
+				context,
 				"match",
 				span,
 				info,
 				[
-					("scrutinee", typed_expr_to_json(scrutinee)),
-					("cases", JsonVector(cases.map(typed_match_case_to_json))),
+					("scrutinee", typed_expr_to_json_with_context(context, scrutinee)),
+					("cases", JsonVector(cases.map(
+							func(case): typed_match_case_to_json(context, case),
+						))),
 				],
 			)
 		TypedSelectExpr(arms, span, info):
-			typed_expr_json(
-				"select",
-				span,
-				info,
-				[("arms", JsonVector(arms.map(typed_select_arm_to_json)))],
-			)
+			typed_expr_json(context, "select", span, info, [("arms", JsonVector(arms.map(
+							func(arm): typed_select_arm_to_json(context, arm),
+						)))])
 		TypedWhileExpr(condition, body, span, info):
 			typed_expr_json(
+				context,
 				"while",
 				span,
 				info,
-				[("condition", typed_expr_to_json(condition)), ("body", typed_expr_to_json(body))],
+				[
+					("condition", typed_expr_to_json_with_context(context, condition)),
+					("body", typed_expr_to_json_with_context(context, body)),
+				],
 			)
 		TypedForExpr(binder, iterable, loop_view, body, span, info):
 			match (binder, body):
@@ -1283,6 +1524,7 @@ pure func typed_expr_to_json(expr: TypedExpr) -> JsonValue:
 						Some(resource_item_name):
 							if resource_item_name == item_name.text:
 								typed_expr_json(
+									context,
 									"for",
 									span,
 									info,
@@ -1293,13 +1535,26 @@ pure func typed_expr_to_json(expr: TypedExpr) -> JsonValue:
 												ParsedForNameBinder(binding.name),
 											),
 										),
-										("iterable", typed_expr_to_json(iterable)),
-										("loop_view", typed_loop_view_to_json(loop_view, iterable)),
-										("body", typed_expr_to_json(scoped_body)),
+										(
+											"iterable",
+											typed_expr_to_json_with_context(context, iterable),
+										),
+										(
+											"loop_view",
+											typed_loop_view_to_json(context, loop_view, iterable),
+										),
+										(
+											"body",
+											typed_expr_to_json_with_context(
+												context,
+												scoped_body,
+											),
+										),
 									],
 								)
 							else:
 								typed_for_expr_to_json(
+									context,
 									binder,
 									iterable,
 									loop_view,
@@ -1308,17 +1563,28 @@ pure func typed_expr_to_json(expr: TypedExpr) -> JsonValue:
 									info,
 								)
 						None:
-							typed_for_expr_to_json(binder, iterable, loop_view, body, span, info)
+							typed_for_expr_to_json(
+								context,
+								binder,
+								iterable,
+								loop_view,
+								body,
+								span,
+								info,
+							)
 				_:
-					typed_for_expr_to_json(binder, iterable, loop_view, body, span, info)
+					typed_for_expr_to_json(context, binder, iterable, loop_view, body, span, info)
 		TypedConcurrentBlockExpr(params, bindings, span, info):
 			typed_expr_json(
+				context,
 				"concurrent_block",
 				span,
 				info,
 				[
-					("params", typed_concurrent_params_to_json(params)),
-					("bindings", JsonVector(bindings.map(typed_concurrent_binding_to_json))),
+					("params", typed_concurrent_params_to_json(context, params)),
+					("bindings", JsonVector(bindings.map(
+							func(binding): typed_concurrent_binding_to_json(context, binding),
+						))),
 				],
 			)
 		TypedConcurrentForExpr(name, iterable, params, body, span, info):
@@ -1328,6 +1594,7 @@ pure func typed_expr_to_json(expr: TypedExpr) -> JsonValue:
 						Some(resource_item_name):
 							if resource_item_name == name.text:
 								typed_concurrent_for_expr_to_json(
+									context,
 									binding.name,
 									iterable,
 									params,
@@ -1337,6 +1604,7 @@ pure func typed_expr_to_json(expr: TypedExpr) -> JsonValue:
 								)
 							else:
 								typed_concurrent_for_expr_to_json(
+									context,
 									name,
 									iterable,
 									params,
@@ -1346,6 +1614,7 @@ pure func typed_expr_to_json(expr: TypedExpr) -> JsonValue:
 								)
 						None:
 							typed_concurrent_for_expr_to_json(
+								context,
 								name,
 								iterable,
 								params,
@@ -1354,65 +1623,99 @@ pure func typed_expr_to_json(expr: TypedExpr) -> JsonValue:
 								info,
 							)
 				_:
-					typed_concurrent_for_expr_to_json(name, iterable, params, body, span, info)
+					typed_concurrent_for_expr_to_json(
+						context,
+						name,
+						iterable,
+						params,
+						body,
+						span,
+						info,
+					)
 		TypedDetachExpr(body, span, info):
-			typed_expr_json("detach", span, info, [("body", typed_expr_to_json(body))])
+			typed_expr_json(
+				context,
+				"detach",
+				span,
+				info,
+				[("body", typed_expr_to_json_with_context(context, body))],
+			)
 		TypedAscriptionExpr(inner, target_type, span, info):
 			typed_expr_json(
+				context,
 				"ascription",
 				span,
 				info,
-				[("inner", typed_expr_to_json(inner)), ("target_type", type_to_json(target_type))],
+				[
+					("inner", typed_expr_to_json_with_context(context, inner)),
+					("target_type", type_to_json(target_type)),
+				],
 			)
 		TypedBlockExpr(items, span, info):
-			typed_expr_json(
-				"block",
-				span,
-				info,
-				[("items", JsonVector(items.map(typed_expr_to_json)))],
-			)
+			typed_expr_json(context, "block", span, info, [("items", JsonVector(items.map(
+							func(item): typed_expr_to_json_with_context(context, item),
+						)))])
 		TypedWithExpr(binding, body, span, info):
 			typed_expr_json(
+				context,
 				"with",
 				span,
 				info,
 				[
-					("binding", typed_with_binding_to_json(binding)),
-					("body", typed_expr_to_json(body)),
+					("binding", typed_with_binding_to_json(context, binding)),
+					("body", typed_expr_to_json_with_context(context, body)),
 				],
 			)
 		TypedDebugBlockExpr(body, span, info):
-			typed_expr_json("debug_block", span, info, [("body", typed_expr_to_json(body))])
+			typed_expr_json(
+				context,
+				"debug_block",
+				span,
+				info,
+				[("body", typed_expr_to_json_with_context(context, body))],
+			)
 		TypedVarDeclExpr(payload, info):
 			typed_expr_json(
+				context,
 				"var_decl",
 				payload.span,
 				info,
-				[("payload", typed_var_decl_payload_to_json(payload))],
+				[("payload", typed_var_decl_payload_to_json(context, payload))],
 			)
 		TypedQuestionBindExpr(name, annotation, value, span, info):
 			typed_expr_json(
+				context,
 				"question_bind",
 				span,
 				info,
 				[
 					("name", parsed_identifier_to_json(name)),
 					("annotation", optional_type_to_json(annotation)),
-					("value", typed_expr_to_json(value)),
+					("value", typed_expr_to_json_with_context(context, value)),
 				],
 			)
 		TypedBreakExpr(span, info):
-			typed_expr_json("break", span, info, [])
+			typed_expr_json(context, "break", span, info, [])
 		TypedContinueExpr(span, info):
-			typed_expr_json("continue", span, info, [])
+			typed_expr_json(context, "continue", span, info, [])
 		TypedVoidExpr(span, info):
-			typed_expr_json("void", span, info, [])
+			typed_expr_json(context, "void", span, info, [])
 		TypedBuiltinExpr(name, span, info):
-			typed_expr_json("builtin", span, info, [("name", optional_string_to_json(name))])
+			typed_expr_json(
+				context,
+				"builtin",
+				span,
+				info,
+				[("name", optional_string_to_json(name))],
+			)
 		TypedMissingExpr(span, info):
-			typed_expr_json("missing", span, info, [])
+			typed_expr_json(context, "missing", span, info, [])
 		TypedUnsupportedExpr(label, span, info):
-			typed_expr_json("unsupported", span, info, [("label", JsonString(label))])
+			typed_expr_json(context, "unsupported", span, info, [("label", JsonString(label))])
+
+
+pure func typed_expr_to_json(expr: TypedExpr) -> JsonValue:
+	typed_expr_to_json_with_context(None, expr)
 
 
 private pure func bound_type_param_to_json(param: BoundTypeParam) -> JsonValue:
@@ -1424,7 +1727,10 @@ private pure func bound_type_param_to_json(param: BoundTypeParam) -> JsonValue:
 	])
 
 
-pure func typed_function_info_to_json(info: TypedFunctionInfo) -> JsonValue:
+private pure func typed_function_info_to_json_with_context(
+	context: Option[TypedAstJsonContext],
+	info: TypedFunctionInfo,
+) -> JsonValue:
 	JsonObject([
 		("decl", parsed_function_decl_to_json(info.decl)),
 		("callable_id", option_int_to_json(info.callable_id)),
@@ -1435,8 +1741,12 @@ pure func typed_function_info_to_json(info: TypedFunctionInfo) -> JsonValue:
 		("param_types", type_list_to_json(info.param_types)),
 		("source_return_type", optional_type_to_json(info.source_return_type)),
 		("semantic_return_type", type_to_json(info.semantic_return_type)),
-		("body", optional_typed_expr_to_json(info.body)),
+		("body", optional_typed_expr_to_json(context, info.body)),
 	])
+
+
+pure func typed_function_info_to_json(info: TypedFunctionInfo) -> JsonValue:
+	typed_function_info_to_json_with_context(None, info)
 
 
 private pure func typed_foreign_link_arg_name(link_flag: TypedForeignLinkFlag) -> String:
@@ -1486,14 +1796,21 @@ private pure func typed_foreign_function_to_bridge_json(
 	])
 
 
-pure func typed_global_var_info_to_json(info: TypedGlobalVarInfo) -> JsonValue:
+private pure func typed_global_var_info_to_json_with_context(
+	context: Option[TypedAstJsonContext],
+	info: TypedGlobalVarInfo,
+) -> JsonValue:
 	JsonObject([
 		("decl", parsed_var_decl_to_json(info.decl)),
 		("definition_id", optional_definition_id_to_json(info.definition_id)),
 		("binding_type", type_to_json(info.binding_type)),
 		("source_type", optional_type_to_json(info.source_type)),
-		("value", typed_expr_to_json(info.value)),
+		("value", typed_expr_to_json_with_context(context, info.value)),
 	])
+
+
+pure func typed_global_var_info_to_json(info: TypedGlobalVarInfo) -> JsonValue:
+	typed_global_var_info_to_json_with_context(None, info)
 
 
 pure func typed_record_field_info_to_json(info: TypedRecordFieldInfo) -> JsonValue:
@@ -1540,28 +1857,40 @@ pure func typed_union_info_to_json(info: TypedUnionInfo) -> JsonValue:
 	])
 
 
-pure func typed_impl_info_to_json(info: TypedImplInfo) -> JsonValue:
+private pure func typed_impl_info_to_json_with_context(
+	context: Option[TypedAstJsonContext],
+	info: TypedImplInfo,
+) -> JsonValue:
 	JsonObject([
 		("decl", parsed_impl_decl_to_json(info.decl)),
 		("for_type", type_to_json(info.for_type)),
 		("type_params", JsonVector(info.type_params.map(bound_type_param_to_json))),
-		("methods", JsonVector(info.methods.map(typed_function_info_to_json))),
+		("methods", JsonVector(info.methods.map(
+				func(method): typed_function_info_to_json_with_context(context, method),
+			))),
 	])
 
 
-pure func typed_decl_to_json(decl: TypedDecl) -> JsonValue:
+pure func typed_impl_info_to_json(info: TypedImplInfo) -> JsonValue:
+	typed_impl_info_to_json_with_context(None, info)
+
+
+private pure func typed_decl_to_json_with_context(
+	context: Option[TypedAstJsonContext],
+	decl: TypedDecl,
+) -> JsonValue:
 	match decl:
 		TypedFunctionDecl(info):
 			JsonObject([
 				(KIND_FIELD, JsonString("function")),
-				("info", typed_function_info_to_json(info)),
+				("info", typed_function_info_to_json_with_context(context, info)),
 			])
 		TypedForeignFunctionDecl(info):
 			typed_foreign_function_to_bridge_json(info)
 		TypedGlobalVarDecl(info):
 			JsonObject([
 				(KIND_FIELD, JsonString("global_var")),
-				("info", typed_global_var_info_to_json(info)),
+				("info", typed_global_var_info_to_json_with_context(context, info)),
 			])
 		TypedRecordDecl(info):
 			JsonObject([
@@ -1588,12 +1917,12 @@ pure func typed_decl_to_json(decl: TypedDecl) -> JsonValue:
 		TypedImplDecl(info):
 			JsonObject([
 				(KIND_FIELD, JsonString("impl")),
-				("info", typed_impl_info_to_json(info)),
+				("info", typed_impl_info_to_json_with_context(context, info)),
 			])
 		TypedPrivateDecl(inner):
 			JsonObject([
 				(KIND_FIELD, JsonString("private")),
-				("inner", typed_decl_to_json(inner)),
+				("inner", typed_decl_to_json_with_context(context, inner)),
 			])
 		TypedParsedDecl(parsed):
 			JsonObject([
@@ -1602,13 +1931,45 @@ pure func typed_decl_to_json(decl: TypedDecl) -> JsonValue:
 			])
 
 
-pure func typed_program_to_json(program: TypedProgram) -> JsonValue:
+pure func typed_decl_to_json(decl: TypedDecl) -> JsonValue:
+	typed_decl_to_json_with_context(None, decl)
+
+
+private pure func typed_program_to_json_with_context(
+	context: Option[TypedAstJsonContext],
+	program: TypedProgram,
+) -> JsonValue:
 	JsonObject([
 		(KIND_FIELD, JsonString("typed_program")),
 		("source", parsed_source_file_to_json(program.source)),
-		("decls", JsonVector(program.decls.map(typed_decl_to_json))),
+		("decls", JsonVector(program.decls.map(
+				func(decl): typed_decl_to_json_with_context(context, decl),
+			))),
 		("diagnostics", JsonVector(program.diagnostics.map(parse_diagnostic_to_json))),
 	])
+
+
+pure func typed_program_to_json(program: TypedProgram) -> JsonValue:
+	typed_program_to_json_with_context(None, program)
+
+
+-- Production callers pass a program and tables from the same TypecheckedGraph.
+-- Call identities were admitted while constructing that phase product, so
+-- rescanning the full AST here would duplicate typechecking work and allocate
+-- a child list for every expression before serialization.
+pure func typed_program_to_json_in_graph(
+	module_id: ModuleId,
+	module_table: ModuleTable,
+	definition_table: DefinitionTable,
+	program: TypedProgram,
+) -> JsonValue:
+	context: TypedAstJsonContext = {
+		module_id = module_id,
+		module_table = module_table,
+		definition_table = definition_table
+	}
+
+	typed_program_to_json_with_context(Some(context), program)
 
 
 ---
@@ -1617,6 +1978,32 @@ schema owned by the existing declaration encoders while avoiding a second
 program-sized JsonValue tree.
 ---
 func emit_compiler_typed_program_json_chunks(
+	program: TypedProgram,
+	emit: (String) -> Void,
+) -> Void:
+	emit_compiler_typed_program_json_chunks_with_context(None, program, emit)
+
+
+-- See typed_program_to_json_in_graph: the containing TypecheckedGraph is the
+-- provenance boundary. Streaming must remain a single traversal.
+func emit_compiler_typed_program_json_chunks_in_graph(
+	module_id: ModuleId,
+	module_table: ModuleTable,
+	definition_table: DefinitionTable,
+	program: TypedProgram,
+	emit: (String) -> Void,
+) -> Void:
+	context: TypedAstJsonContext = {
+		module_id = module_id,
+		module_table = module_table,
+		definition_table = definition_table
+	}
+
+	emit_compiler_typed_program_json_chunks_with_context(Some(context), program, emit)
+
+
+private func emit_compiler_typed_program_json_chunks_with_context(
+	context: Option[TypedAstJsonContext],
 	program: TypedProgram,
 	emit: (String) -> Void,
 ) -> Void:
@@ -1631,7 +2018,10 @@ func emit_compiler_typed_program_json_chunks(
 		else:
 			emit(",")
 
-		emit_json_chunks(typed_decl_to_json(decl), emit)
+		emit_json_chunks(
+			typed_decl_to_json_with_context(context, decl),
+			emit,
+		)
 
 	emit("],\"diagnostics\":[")
 	first = True

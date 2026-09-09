@@ -35,7 +35,12 @@ import:
 	../../../src/compiler/stage_04_modules/loaded_module:
 		ModuleOrigin(UserModule),
 		resolved_module_identity_from_resolver,
-	../../../src/compiler/stage_04_modules/module_table: singleton_module_table
+	../../../src/compiler/stage_04_modules/module_table:
+		ModuleId,
+		ModuleTable,
+		module_table,
+		module_table_find_id_by_canonical_path,
+		singleton_module_table,
 	../../../src/compiler/stage_06_typecheck/decl:
 		TypedDecl(
 			TypedFunctionDecl,
@@ -62,16 +67,31 @@ import:
 		TypedTypeAliasInfo,
 		TypedUnionInfo,
 		TypedUnionVariantInfo,
+	../../../src/compiler/stage_06_typecheck/graph/definition_identity: func_callable_key
+	../../../src/compiler/stage_06_typecheck/graph/definition_index:
+		DefinitionTable,
+		definition_index_definition_table,
+		definition_index_empty,
+		definition_index_initial_seed,
+		definition_index_insert_func_callable_id,
+		definition_index_next_def_id,
+	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
+		CallableId,
+		callable_id_definition_id,
+		callable_id_from_definition_table,
+		constructor_id_from_reserved_graph_definition,
 	../../../src/compiler/stage_06_typecheck/infer:
-		CallableOrigin(CallableImportedUnresolved),
 		ExprTypeOrigin(ExplicitAnnotationOrigin, SynthesizedOrigin),
 		ResolvedCallInfo,
 		ResolvedCallTarget(
 			ResolvedClosureCall,
-			ResolvedDirectCall,
+			ResolvedCompilerBuiltinCall,
+			ResolvedConstructorCall,
+			ResolvedGraphCallableCall,
 			ResolvedIntrinsicCall,
-			ResolvedTraitMethodCall,
+			ResolvedSelectedTraitMethodCall,
 		),
+		ResolvedGraphCallableCategory(ResolvedSourceFunctionCall),
 		TypedConcurrentBinding,
 		TypedConcurrentParam,
 		TypedExpr(
@@ -90,7 +110,7 @@ import:
 		TypedPattern(TypedIntPattern),
 		TypedWithBinding,
 	../../../src/compiler/stage_06_typecheck/type_system/env:
-		ImplMethodTarget,
+		ENV_EMPTY,
 		Purity(Impure),
 		ResourceArgPolicy(AllowResourceArgs),
 		ResourceResultPolicy(ResourceResultDependent),
@@ -118,6 +138,7 @@ import:
 	../../../src/compiler/stage_06_typecheck/typed_ast_json:
 		expr_type_origin_to_json,
 		resolved_call_to_json,
+		resolved_call_to_json_in_graph,
 		typed_decl_to_json,
 		typed_expr_info_to_json,
 		typed_expr_to_json,
@@ -157,6 +178,50 @@ pure func fixture_source_span() -> SourceSpan:
 	source_span(src, cursor, cursor)
 
 
+private record ResolvedCallJsonFixture {
+	module_table: ModuleTable,
+	current_module_id: ModuleId,
+	definition_table: DefinitionTable,
+	file_callable_id: CallableId,
+	dict_callable_id: CallableId
+}
+
+
+private pure func resolved_call_json_fixture() -> Option[ResolvedCallJsonFixture]:
+	identities = ["typed_ast_json", "file", "dict"].map(func(module_path):
+		resolved_module_identity_from_resolver(module_path, UserModule)
+	)
+	table ?= module_table(identities).to_option()
+	current_module_id ?= module_table_find_id_by_canonical_path(table, "typed_ast_json")
+	file_module_id ?= module_table_find_id_by_canonical_path(table, "file")
+	dict_module_id ?= module_table_find_id_by_canonical_path(table, "dict")
+	empty = definition_index_empty(definition_index_initial_seed(ENV_EMPTY), table)
+	file_definition_id = definition_index_next_def_id(empty)
+	with_file ?= definition_index_insert_func_callable_id(
+		empty,
+		table,
+		func_callable_key(file_module_id, "read_chunk_at", fixture_source_span()),
+		file_definition_id,
+	).to_option()
+	dict_definition_id = definition_index_next_def_id(with_file)
+	complete ?= definition_index_insert_func_callable_id(
+		with_file,
+		table,
+		func_callable_key(dict_module_id, "length", fixture_source_span()),
+		dict_definition_id,
+	).to_option()
+	definitions = definition_index_definition_table(complete)
+	file_callable_id ?= callable_id_from_definition_table(definitions, file_definition_id)
+	dict_callable_id ?= callable_id_from_definition_table(definitions, dict_definition_id)
+	Some({
+		module_table = table,
+		current_module_id = current_module_id,
+		definition_table = definitions,
+		file_callable_id = file_callable_id,
+		dict_callable_id = dict_callable_id,
+	})
+
+
 pure func ident(text: String) -> ParsedIdentifier:
 	parsed_identifier(text, fixture_source_span())
 
@@ -166,7 +231,7 @@ pure func sample_resolved_call() -> ResolvedCallInfo:
 		callee_name = "read_chunk_at",
 		source_name = "read_chunk_at",
 		purity = Impure,
-		target = ResolvedDirectCall(42, CallableImportedUnresolved("file")),
+		target = ResolvedCompilerBuiltinCall(42),
 		trait_identity = None,
 		bound_type_params = [],
 		debug_only = False,
@@ -437,14 +502,22 @@ func test_widening_decision_json_preserves_source_target_and_reason() -> Bool:
 	json_values_equal(widening_decision_to_json(decision), expected)
 
 
-func test_resolved_call_json_preserves_origin_policy_and_dim_constraints() -> Bool:
+private pure func resolved_call_json_preserves_origin_policy_and_dim_constraints(
+	fixture: ResolvedCallJsonFixture,
+) -> Bool:
+	info = { sample_resolved_call() |
+		target = ResolvedGraphCallableCall(fixture.file_callable_id, ResolvedSourceFunctionCall)
+	}
 	expected = JsonObject([
 		("callee_name", JsonString("read_chunk_at")),
 		("source_name", JsonString("read_chunk_at")),
 		("purity", JsonString("impure")),
 		("target", JsonObject([
 			("kind", JsonString("direct")),
-			("callable_id", JsonNumber(42.0)),
+			(
+				"callable_id",
+				JsonNumber(to_float(callable_id_definition_id(fixture.file_callable_id))),
+			),
 			("origin", JsonObject([
 				("kind", JsonString("imported")),
 				("module", JsonString("file")),
@@ -462,7 +535,86 @@ func test_resolved_call_json_preserves_origin_policy_and_dim_constraints() -> Bo
 			])])),
 	])
 
-	json_values_equal(resolved_call_to_json(sample_resolved_call()), expected)
+	json_values_equal(
+		resolved_call_to_json_in_graph(
+			fixture.current_module_id,
+			fixture.module_table,
+			fixture.definition_table,
+			info,
+		).get_or(JsonNull),
+		expected,
+	)
+
+
+func test_resolved_call_json_preserves_origin_policy_and_dim_constraints() -> Bool:
+	match resolved_call_json_fixture():
+		Some(fixture):
+			resolved_call_json_preserves_origin_policy_and_dim_constraints(fixture)
+		None:
+			False
+
+
+private pure func rejects_resolved_call_json_with_incompatible_module_table(
+	fixture: ResolvedCallJsonFixture,
+) -> Bool:
+	(incompatible_table, incompatible_module_id) = singleton_module_table(
+		resolved_module_identity_from_resolver(
+			"typed_ast_json",
+			UserModule,
+		),
+	)
+	info = { sample_resolved_call() |
+		target = ResolvedGraphCallableCall(fixture.file_callable_id, ResolvedSourceFunctionCall)
+	}
+
+	match resolved_call_to_json_in_graph(
+		incompatible_module_id,
+		incompatible_table,
+		fixture.definition_table,
+		info,
+	):
+		Err(message):
+			message == "definition-backed resolved call is outside the typed-AST projection table"
+		Ok(_):
+			False
+
+
+func test_rejects_resolved_call_json_with_incompatible_module_table() -> Bool:
+	match resolved_call_json_fixture():
+		Some(fixture):
+			rejects_resolved_call_json_with_incompatible_module_table(fixture)
+		None:
+			False
+
+
+private pure func rejects_resolved_call_json_with_wrong_definition_kind(
+	fixture: ResolvedCallJsonFixture,
+) -> Bool:
+	wrong_kind = constructor_id_from_reserved_graph_definition(
+		callable_id_definition_id(fixture.file_callable_id),
+	)
+	info = { sample_resolved_call() |
+		target = ResolvedConstructorCall(wrong_kind, "NotAConstructor")
+	}
+
+	match resolved_call_to_json_in_graph(
+		fixture.current_module_id,
+		fixture.module_table,
+		fixture.definition_table,
+		info,
+	):
+		Err(message):
+			message == "definition-backed resolved call is outside the typed-AST projection table"
+		Ok(_):
+			False
+
+
+func test_rejects_resolved_call_json_with_wrong_definition_kind() -> Bool:
+	match resolved_call_json_fixture():
+		Some(fixture):
+			rejects_resolved_call_json_with_wrong_definition_kind(fixture)
+		None:
+			False
 
 
 func test_resolved_call_json_encodes_closure_target() -> Bool:
@@ -494,18 +646,14 @@ func test_resolved_call_json_encodes_closure_target() -> Bool:
 	json_values_equal(resolved_call_to_json(info), expected)
 
 
-func test_resolved_call_json_encodes_trait_impl_target() -> Bool:
-	domain = singleton_module_table(resolved_module_identity_from_resolver("dict", UserModule))
-	impl_target: ImplMethodTarget = {
-		callable_id = 254,
-		module_id = domain[1],
-		module_path = "dict"
-	}
+private pure func resolved_call_json_encodes_trait_impl_target(
+	fixture: ResolvedCallJsonFixture,
+) -> Bool:
 	info: ResolvedCallInfo = {
 		callee_name = "length",
 		source_name = "length",
 		purity = Pure,
-		target = ResolvedTraitMethodCall("HasLength", Some(impl_target)),
+		target = ResolvedSelectedTraitMethodCall("HasLength", fixture.dict_callable_id),
 		trait_identity = None,
 		bound_type_params = [],
 		debug_only = False,
@@ -523,7 +671,10 @@ func test_resolved_call_json_encodes_trait_impl_target() -> Bool:
 			("kind", JsonString("trait_method")),
 			("trait_name", JsonString("HasLength")),
 			("impl_target", JsonObject([
-				("callable_id", JsonNumber(254.0)),
+				(
+					"callable_id",
+					JsonNumber(to_float(callable_id_definition_id(fixture.dict_callable_id))),
+				),
 				("module_path", JsonString("dict")),
 			])),
 		])),
@@ -533,7 +684,23 @@ func test_resolved_call_json_encodes_trait_impl_target() -> Bool:
 		("dim_constraints", JsonVector([])),
 	])
 
-	json_values_equal(resolved_call_to_json(info), expected)
+	json_values_equal(
+		resolved_call_to_json_in_graph(
+			fixture.current_module_id,
+			fixture.module_table,
+			fixture.definition_table,
+			info,
+		).get_or(JsonNull),
+		expected,
+	)
+
+
+func test_resolved_call_json_encodes_trait_impl_target() -> Bool:
+	match resolved_call_json_fixture():
+		Some(fixture):
+			resolved_call_json_encodes_trait_impl_target(fixture)
+		None:
+			False
 
 
 func test_resolved_call_json_encodes_intrinsic_target() -> Bool:
@@ -1105,6 +1272,14 @@ tests: TestSuite = {
 		(
 			"resolved call JSON preserves origin policy and dim constraints",
 			test_resolved_call_json_preserves_origin_policy_and_dim_constraints,
+		),
+		(
+			"resolved call JSON rejects an incompatible module table",
+			test_rejects_resolved_call_json_with_incompatible_module_table,
+		),
+		(
+			"resolved call JSON rejects a wrong definition kind",
+			test_rejects_resolved_call_json_with_wrong_definition_kind,
 		),
 		(
 			"resolved call JSON encodes closure target",

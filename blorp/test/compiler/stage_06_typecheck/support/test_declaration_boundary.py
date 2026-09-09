@@ -60,6 +60,16 @@ TRAIT_IMPLEMENTATION_AUTHORITY = (
     / "blorp/src/compiler/stage_06_typecheck/type_system/accepted_trait_implementation_authority.brp"
 )
 class DeclarationBoundaryTests(unittest.TestCase):
+    def test_constructor_ids_are_scalar_definition_foreign_keys(self) -> None:
+        source = DECLARATION_SKELETON.read_text(encoding="utf-8")
+
+        self.assertIn("opaque type ConstructorId = Int", source)
+        self.assertNotIn("opaque type ConstructorId = RuntimeDeclarationIdRep", source)
+        self.assertNotRegex(
+            source,
+            r"from_opaque ConstructorId\([^)]*\)\.structural",
+        )
+
     def test_graph_declaration_ids_store_only_module_foreign_keys(self) -> None:
         source = DECLARATION_SKELETON.read_text(encoding="utf-8")
         structural_id = re.search(

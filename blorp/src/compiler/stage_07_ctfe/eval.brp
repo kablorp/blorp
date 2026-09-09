@@ -11,6 +11,7 @@ import:
 		ParsedParamBinder(ParsedParamNameBinder, ParsedParamTupleBinder, ParsedParamWildcardBinder),
 		ParsedUnaryOp,
 	../stage_04_modules/module_table: ModuleId, module_ids_equal
+	../stage_06_typecheck/headers/declaration_skeleton: callable_id_definition_id
 	../stage_06_typecheck/infer: TypedExpr, TypedLambdaParam
 	../stage_06_typecheck/type_system/semantic_type: SemanticType, array_type, array_type_parts
 	context:
@@ -146,6 +147,7 @@ import:
 			CtfeIrImportedCall,
 			CtfeIrIntrinsicCall,
 			CtfeIrLocalCall,
+			CtfeIrUnindexedConstructorCall,
 			CtfeIrUnresolvedCall,
 			CtfeIrUnsupportedCall,
 		),
@@ -204,6 +206,7 @@ import:
 			CtfeIrImpureFunctionReference,
 			CtfeIrLocalFunctionReference,
 			CtfeIrNullaryConstructorReference,
+			CtfeIrUnindexedNullaryConstructorReference,
 			CtfeIrUnsupportedFunctionReference,
 			CtfeIrValueReference,
 		),
@@ -217,6 +220,7 @@ import:
 		CtfeEnv,
 		CtfeError,
 		CtfeLambdaPayload,
+		CtfeResolvedConstructorId,
 		CtfeValue,
 		CtfeValueDesc(
 			CtfeConstructorValue,
@@ -235,7 +239,7 @@ import:
 		),
 		ctfe_bool,
 		ctfe_char,
-		ctfe_resolved_constructor_info,
+		ctfe_constructor_info,
 		ctfe_resolved_constructor_info_from_id,
 		ctfe_error_message,
 		ctfe_eval_binary,
@@ -451,12 +455,22 @@ private pure func ctfe_eval_identifier(
 				}),
 				expr.span,
 			))
-		CtfeIrLocalFunctionReference(call):
+		CtfeIrUnindexedNullaryConstructorReference(name, parent_type):
+			Ok(ctfe_value(
+				expr.value_type,
+				CtfeConstructorValue({
+					name = name,
+					args = [],
+					constructor_info = ctfe_constructor_info(parent_type, 0),
+				}),
+				expr.span,
+			))
+		CtfeIrLocalFunctionReference(callable_id, call):
 			Ok(
 				ctfe_function_reference(
 					expr.value_type,
 					expr.span,
-					call.callable_id,
+					callable_id,
 					call.source_name,
 					call.is_pure,
 				),
@@ -1155,9 +1169,8 @@ private pure func ctfe_eval_imported_function_call(
 
 
 private pure func ctfe_eval_constructor_call(
-	context: CtfeContext,
 	expr: CtfeIrExpr,
-	callable_id: Int,
+	constructor_id: CtfeResolvedConstructorId,
 	source_name: String,
 	parent_type: String,
 	arg_values: List[CtfeValue],
@@ -1167,11 +1180,10 @@ private pure func ctfe_eval_constructor_call(
 		CtfeConstructorValue({
 			name = source_name,
 			args = arg_values,
-			constructor_info = ctfe_resolved_constructor_info(
+			constructor_info = ctfe_resolved_constructor_info_from_id(
 				parent_type,
 				arg_values.length(),
-				context.module_table,
-				callable_id,
+				constructor_id,
 			),
 		}),
 		expr.span,
@@ -1312,7 +1324,10 @@ private pure func ctfe_eval_callback(value: CtfeValue) -> Result[CtfeCallback, C
 	match value.desc:
 		CtfeFunctionReferenceValue(reference):
 			if reference.is_pure:
-				Ok(CtfeNamedCallback(reference.callable_id, reference.source_name))
+				Ok(CtfeNamedCallback(
+					callable_id_definition_id(reference.callable_id),
+					reference.source_name,
+				))
 			else:
 				Err(CtfeEvalUnsupported("impure callback calls"))
 		CtfeLambdaValue(closure):
@@ -2499,19 +2514,35 @@ private pure func ctfe_eval_call(
 							direct.source_name,
 							arg_values,
 						)
-		CtfeIrConstructorCall(direct, parent_type):
+		CtfeIrConstructorCall(direct, parent_type, constructor_id):
 			if not direct.is_pure:
 				Err(CtfeEvalUnsupported("impure function calls"))
 			else:
 				arg_values ?= ctfe_eval_exprs(context, env, call.args)
 				ctfe_eval_constructor_call(
-					context,
 					expr,
-					direct.callable_id,
+					constructor_id,
 					direct.source_name,
 					parent_type,
 					arg_values,
 				)
+		CtfeIrUnindexedConstructorCall(direct, parent_type):
+			if not direct.is_pure:
+				Err(CtfeEvalUnsupported("impure function calls"))
+			else:
+				arg_values ?= ctfe_eval_exprs(context, env, call.args)
+				Ok(ctfe_value(
+					expr.value_type,
+					CtfeConstructorValue({
+						name = direct.source_name,
+						args = arg_values,
+						constructor_info = ctfe_constructor_info(
+							parent_type,
+							arg_values.length(),
+						),
+					}),
+					expr.span,
+				))
 
 
 private pure func ctfe_bind_pattern_values(

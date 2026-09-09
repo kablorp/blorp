@@ -109,8 +109,19 @@ import:
 		ParsedWithErrorMap,
 		parsed_expr_span,
 		parsed_identifier,
-	../stage_04_modules/module_table: ModuleId, module_ids_equal
+	../stage_04_modules/module_table: ModuleId, module_ids_equal, module_table_canonical_path
 	diagnostic: TypecheckDiagnostic, typecheck_diagnostic
+	graph/definition_index: DefinitionTable, definition_table_module_table
+	headers/declaration_skeleton:
+		CallableId,
+		ConstructorId,
+		callable_id_definition_id,
+		callable_id_from_definition_table,
+		callable_id_from_reserved_graph_definition,
+		callable_id_module_id,
+		callable_ids_equal,
+		constructor_id_definition_id,
+		constructor_id_from_reserved_graph_definition,
 	int: add_saturating, multiply_saturating
 	modules/module_view:
 		ImportedNameBinding,
@@ -135,7 +146,9 @@ import:
 		TypeShapeMemo,
 		TypecheckState,
 		TypecheckTypeHome,
-		infer_module_facts_find_module_id,
+		infer_module_facts_definition_table,
+		infer_module_facts_module_id,
+		infer_module_facts_requires_graph_definition,
 		infer_session_from_typecheck_state,
 		known_type_index_has_resource,
 		typecheck_module_scope_is_source_package,
@@ -215,6 +228,7 @@ import:
 		DimSolveResult(DimBindMeta, DimBindVar, DimContradiction, DimSolved, DimStuck),
 		dim_solve,
 	type_system/env:
+		ConstructorIdentityDomain(GraphConstructorIdentity, UnindexedConstructorIdentity),
 		ConstructorSymbol,
 		Env,
 		FieldDecl,
@@ -406,19 +420,20 @@ union ExprTypeOrigin:
 	SynthesizedOrigin(String)
 
 
-union CallableOrigin:
-	CallableLocal
-	CallableImported(ModuleId, String)
-	CallableImportedUnresolved(String)
-	CallableBuiltin
-	CallableForeign
-	CallableConstructor(String)
-	CallableImplMethod
+enum ResolvedGraphCallableCategory:
+	ResolvedSourceFunctionCall
+	ResolvedForeignFunctionCall
 
 
 union ResolvedCallTarget:
-	ResolvedDirectCall(Int, CallableOrigin)
-	ResolvedTraitMethodCall(String, Option[ImplMethodTarget])
+	ResolvedGraphCallableCall(CallableId, ResolvedGraphCallableCategory)
+	ResolvedConstructorCall(ConstructorId, String)
+	ResolvedUnindexedCallableCall(Int, ResolvedGraphCallableCategory)
+	ResolvedUnindexedConstructorCall(Int, String)
+	ResolvedCompilerBuiltinCall(Int)
+	ResolvedSelectedTraitMethodCall(String, CallableId)
+	ResolvedUnindexedSelectedTraitMethodCall(String, Int)
+	ResolvedUnresolvedTraitMethodCall(String)
 	ResolvedIntrinsicCall
 	ResolvedClosureCall
 
@@ -509,14 +524,7 @@ union TypedPattern:
 	TypedStringPattern(String, SourceSpan)
 	TypedCharPattern(Int, SourceSpan)
 	TypedConstructorPattern(ParsedIdentifier, List[TypedPattern], SourceSpan, String, Int)
-	TypedQualifiedConstructorPattern(
-		ParsedIdentifier,
-		ParsedIdentifier,
-		List[TypedPattern],
-		SourceSpan,
-		String,
-		Int,
-	)
+	TypedQualifiedConstructorPattern(ParsedIdentifier, ParsedIdentifier, List[TypedPattern], SourceSpan, String, Int)
 	TypedTuplePattern(List[TypedPattern], SourceSpan)
 	TypedListPattern(List[TypedPattern], Option[ParsedListPatternSpread], SourceSpan)
 	TypedOrPattern(List[TypedPattern], SourceSpan)
@@ -1232,46 +1240,73 @@ private pure func inferred_info(
 	)
 
 
-private pure func callable_origin_from_func(
-	facts: InferModuleFacts,
-	origin: FuncOrigin,
-	module_path: Option[String],
-) -> CallableOrigin:
-	match origin:
-		UserDefinedFunc:
-			match module_path:
-				Some(path):
-					match infer_module_facts_find_module_id(facts, path):
-						Some(module_id):
-							CallableImported(module_id, path)
-						None:
-							CallableImportedUnresolved(path)
-				None:
-					CallableLocal
-		BuiltinFunc:
-			match module_path:
-				Some(path):
-					match infer_module_facts_find_module_id(facts, path):
-						Some(module_id):
-							CallableImported(module_id, path)
-						None:
-							CallableImportedUnresolved(path)
-				None:
-					CallableBuiltin
-		ForeignFunc:
-			CallableForeign
-
-
 pure func resolved_call_callable_id(info: ResolvedCallInfo) -> Option[Int]:
 	match info.target:
-		ResolvedDirectCall(callable_id, _):
+		ResolvedGraphCallableCall(callable_id, _):
+			Some(callable_id_definition_id(callable_id))
+		ResolvedConstructorCall(constructor_id, _):
+			Some(constructor_id_definition_id(constructor_id))
+		ResolvedUnindexedCallableCall(callable_id, _):
 			Some(callable_id)
-		ResolvedTraitMethodCall(_, impl_target):
-			impl_target.map(func(target): target.callable_id)
+		ResolvedUnindexedConstructorCall(callable_id, _):
+			Some(callable_id)
+		ResolvedCompilerBuiltinCall(callable_id):
+			Some(callable_id)
+		ResolvedSelectedTraitMethodCall(_, callable_id):
+			Some(callable_id_definition_id(callable_id))
+		ResolvedUnindexedSelectedTraitMethodCall(_, callable_id):
+			Some(callable_id)
+		ResolvedUnresolvedTraitMethodCall(_):
+			None
 		ResolvedIntrinsicCall:
 			None
 		ResolvedClosureCall:
 			None
+
+
+private pure func infer_facts_callable_id(
+	facts: InferModuleFacts,
+	runtime_definition_id: Int,
+) -> Option[CallableId]:
+	if infer_module_facts_requires_graph_definition(facts):
+		-- Graph authorities already category-validated these accepted method
+		-- targets when publishing them. Preserve that proof on the hot path.
+		Some(callable_id_from_reserved_graph_definition(runtime_definition_id))
+	else:
+		table ?= infer_module_facts_definition_table(facts)
+		callable_id_from_definition_table(table, runtime_definition_id)
+
+
+private pure func infer_facts_contains_callable_id(
+	facts: InferModuleFacts,
+	runtime_definition_id: Int,
+) -> Bool:
+	match infer_module_facts_definition_table(facts):
+		Some(table):
+			callable_id_from_definition_table(table, runtime_definition_id).is_some()
+		None:
+			False
+
+
+private pure func infer_facts_callable_owner_path(
+	facts: InferModuleFacts,
+	callable_id: CallableId,
+) -> Option[String]:
+	table ?= infer_module_facts_definition_table(facts)
+	module_id ?= callable_id_module_id(table, callable_id)
+	module_table_canonical_path(definition_table_module_table(table), module_id)
+
+
+private pure func graph_definition_invariant_error(
+	context: InferContext,
+	kind: String,
+	name: String,
+	runtime_definition_id: Int,
+) -> InferContext:
+	infer_error(
+		context,
+		"internal typecheck error: resolved ${kind} '${name}' has definition ID ${runtime_definition_id} outside the canonical definition table",
+	)
 
 
 private pure func resolved_loop_producer(
@@ -1310,6 +1345,7 @@ private pure func resolved_call_return_from_type(func_type: SemanticType) -> Sem
 
 
 private pure func resolved_call_from_trait_method_callee(
+	facts: InferModuleFacts,
 	callee: TraitMethodCallee,
 	impl_method: Option[ImplMethodInfo],
 	trait_identity: Option[BoundTraitIdentity],
@@ -1325,11 +1361,24 @@ private pure func resolved_call_from_trait_method_callee(
 		None:
 			(None, [], False)
 
+	target = match implementation_facts[0]:
+		Some(impl_target):
+			match infer_facts_callable_id(facts, impl_target.callable_id):
+				Some(callable_id):
+					ResolvedSelectedTraitMethodCall(callee.trait_name, callable_id)
+				None:
+					ResolvedUnindexedSelectedTraitMethodCall(
+						callee.trait_name,
+						impl_target.callable_id,
+					)
+		None:
+			ResolvedUnresolvedTraitMethodCall(callee.trait_name)
+
 	{
 		callee_name = callee.method_name,
 		source_name = callee.source_name,
 		purity = purity,
-		target = ResolvedTraitMethodCall(callee.trait_name, implementation_facts[0]),
+		target = target,
 		trait_identity = trait_identity,
 		bound_type_params = implementation_facts[1],
 		debug_only = implementation_facts[2],
@@ -1339,6 +1388,19 @@ private pure func resolved_call_from_trait_method_callee(
 		dim_constraints = [],
 		loop_producer = None
 	}
+
+
+private pure func trait_impl_target_is_outside_definition_table(
+	facts: InferModuleFacts,
+	impl_method: Option[ImplMethodInfo],
+) -> Bool:
+	(
+		infer_module_facts_requires_graph_definition(facts)
+		and impl_method
+			.and_then(func(method): method.target)
+			.map(func(target): not infer_facts_contains_callable_id(facts, target.callable_id))
+			.get_or(False)
+	)
 
 
 private pure func resolved_call_from_closure(
@@ -1387,14 +1449,26 @@ private pure func resolved_call_from_func_symbol_with_source(
 	source_name: String,
 	func_symbol: FuncSymbol,
 ) -> ResolvedCallInfo:
+	category = if func_symbol.origin == ForeignFunc:
+		ResolvedForeignFunctionCall
+	else:
+		ResolvedSourceFunctionCall
+
+	resolved_target = if func_symbol.origin == BuiltinFunc and func_symbol.module_path.is_none():
+		ResolvedCompilerBuiltinCall(func_symbol.callable_id)
+	else if infer_module_facts_requires_graph_definition(facts):
+		ResolvedGraphCallableCall(
+			callable_id_from_reserved_graph_definition(func_symbol.callable_id),
+			category,
+		)
+	else:
+		ResolvedUnindexedCallableCall(func_symbol.callable_id, category)
+
 	{
 		callee_name = callee_name,
 		source_name = source_name,
 		purity = func_symbol.purity,
-		target = ResolvedDirectCall(
-			func_symbol.callable_id,
-			callable_origin_from_func(facts, func_symbol.origin, func_symbol.module_path),
-		),
+		target = resolved_target,
 		trait_identity = None,
 		bound_type_params = func_symbol.type_params,
 		debug_only = func_symbol.debug_only,
@@ -1406,20 +1480,17 @@ private pure func resolved_call_from_func_symbol_with_source(
 	}
 
 
-private pure func resolved_call_from_overload_entry(
-	facts: InferModuleFacts,
+private pure func resolved_call_from_overload_entry_with_target(
 	callee_name: String,
 	source_name: String,
 	entry: OverloadEntry,
+	resolved_target: ResolvedCallTarget,
 ) -> ResolvedCallInfo:
 	{
 		callee_name = callee_name,
 		source_name = source_name,
 		purity = entry.purity,
-		target = ResolvedDirectCall(
-			entry.def_id,
-			callable_origin_from_func(facts, entry.origin, entry.module_path),
-		),
+		target = resolved_target,
 		trait_identity = None,
 		bound_type_params = entry.type_params,
 		debug_only = entry.debug_only,
@@ -1431,17 +1502,72 @@ private pure func resolved_call_from_overload_entry(
 	}
 
 
+private pure func resolved_call_from_graph_overload_entry(
+	callee_name: String,
+	source_name: String,
+	entry: OverloadEntry,
+) -> ResolvedCallInfo:
+	category = if entry.origin == ForeignFunc:
+		ResolvedForeignFunctionCall
+	else:
+		ResolvedSourceFunctionCall
+
+	resolved_call_from_overload_entry_with_target(
+		callee_name,
+		source_name,
+		entry,
+		ResolvedGraphCallableCall(
+			callable_id_from_reserved_graph_definition(entry.def_id),
+			category,
+		),
+	)
+
+
+private pure func resolved_call_from_overload_entry(
+	facts: InferModuleFacts,
+	callee_name: String,
+	source_name: String,
+	entry: OverloadEntry,
+) -> ResolvedCallInfo:
+	category = if entry.origin == ForeignFunc:
+		ResolvedForeignFunctionCall
+	else:
+		ResolvedSourceFunctionCall
+
+	target = if entry.origin == BuiltinFunc and entry.module_path.is_none():
+		ResolvedCompilerBuiltinCall(entry.def_id)
+	else if infer_module_facts_requires_graph_definition(facts):
+		ResolvedGraphCallableCall(
+			callable_id_from_reserved_graph_definition(entry.def_id),
+			category,
+		)
+	else:
+		ResolvedUnindexedCallableCall(entry.def_id, category)
+
+	resolved_call_from_overload_entry_with_target(callee_name, source_name, entry, target)
+
+
 private pure func resolved_call_from_constructor(
 	callee_name: String,
-	callable_id: Int,
+	runtime_constructor_id: Int,
+	identity_domain: ConstructorIdentityDomain,
 	parent_type: String,
 	constructor_type: SemanticType,
 ) -> ResolvedCallInfo:
+	resolved_target = match identity_domain:
+		GraphConstructorIdentity:
+			ResolvedConstructorCall(
+				constructor_id_from_reserved_graph_definition(runtime_constructor_id),
+				parent_type,
+			)
+		UnindexedConstructorIdentity:
+			ResolvedUnindexedConstructorCall(runtime_constructor_id, parent_type)
+
 	{
 		callee_name = callee_name,
 		source_name = callee_name,
 		purity = Pure,
-		target = ResolvedDirectCall(callable_id, CallableConstructor(parent_type)),
+		target = resolved_target,
 		trait_identity = None,
 		bound_type_params = [],
 		debug_only = False,
@@ -1799,52 +1925,6 @@ private pure func dim_constraints_equal(
 		equal
 
 
-private pure func callable_origins_equal(left: CallableOrigin, right: CallableOrigin) -> Bool:
-	match left:
-		CallableLocal:
-			match right:
-				CallableLocal:
-					True
-				_:
-					False
-		CallableImported(left_module_id, left_path):
-			match right:
-				CallableImported(right_module_id, right_path):
-					module_ids_equal(left_module_id, right_module_id) and left_path == right_path
-				_:
-					False
-		CallableImportedUnresolved(left_path):
-			match right:
-				CallableImportedUnresolved(right_path):
-					left_path == right_path
-				_:
-					False
-		CallableBuiltin:
-			match right:
-				CallableBuiltin:
-					True
-				_:
-					False
-		CallableForeign:
-			match right:
-				CallableForeign:
-					True
-				_:
-					False
-		CallableConstructor(left_parent):
-			match right:
-				CallableConstructor(right_parent):
-					left_parent == right_parent
-				_:
-					False
-		CallableImplMethod:
-			match right:
-				CallableImplMethod:
-					True
-				_:
-					False
-
-
 private pure func optional_bound_trait_identities_equal(
 	left: Option[BoundTraitIdentity],
 	right: Option[BoundTraitIdentity],
@@ -1860,43 +1940,62 @@ private pure func optional_bound_trait_identities_equal(
 			right.is_none()
 
 
-private pure func impl_method_targets_equal(
-	left: Option[ImplMethodTarget],
-	right: Option[ImplMethodTarget],
-) -> Bool:
-	match left:
-		Some(left_value):
-			match right:
-				Some(right_value):
-					(
-						left_value.callable_id == right_value.callable_id
-						and module_ids_equal(left_value.module_id, right_value.module_id)
-						and left_value.module_path == right_value.module_path
-					)
-				None:
-					False
-		None:
-			right.is_none()
-
-
 private pure func resolved_call_targets_equal(
 	left: ResolvedCallTarget,
 	right: ResolvedCallTarget,
 ) -> Bool:
 	match left:
-		ResolvedDirectCall(left_id, left_origin):
+		ResolvedGraphCallableCall(left_id, left_category):
 			match right:
-				ResolvedDirectCall(right_id, right_origin):
-					left_id == right_id and callable_origins_equal(left_origin, right_origin)
+				ResolvedGraphCallableCall(right_id, right_category):
+					callable_ids_equal(left_id, right_id) and left_category == right_category
 				_:
 					False
-		ResolvedTraitMethodCall(left_trait, left_target):
+		ResolvedConstructorCall(left_id, left_parent):
 			match right:
-				ResolvedTraitMethodCall(right_trait, right_target):
+				ResolvedConstructorCall(right_id, right_parent):
 					(
-						left_trait == right_trait
-						and impl_method_targets_equal(left_target, right_target)
+						constructor_id_definition_id(
+							left_id,
+						) == constructor_id_definition_id(right_id)
+						and left_parent == right_parent
 					)
+				_:
+					False
+		ResolvedUnindexedCallableCall(left_id, left_category):
+			match right:
+				ResolvedUnindexedCallableCall(right_id, right_category):
+					left_id == right_id and left_category == right_category
+				_:
+					False
+		ResolvedUnindexedConstructorCall(left_id, left_parent):
+			match right:
+				ResolvedUnindexedConstructorCall(right_id, right_parent):
+					left_id == right_id and left_parent == right_parent
+				_:
+					False
+		ResolvedCompilerBuiltinCall(left_id):
+			match right:
+				ResolvedCompilerBuiltinCall(right_id):
+					left_id == right_id
+				_:
+					False
+		ResolvedSelectedTraitMethodCall(left_trait, left_id):
+			match right:
+				ResolvedSelectedTraitMethodCall(right_trait, right_id):
+					left_trait == right_trait and callable_ids_equal(left_id, right_id)
+				_:
+					False
+		ResolvedUnindexedSelectedTraitMethodCall(left_trait, left_id):
+			match right:
+				ResolvedUnindexedSelectedTraitMethodCall(right_trait, right_id):
+					left_trait == right_trait and left_id == right_id
+				_:
+					False
+		ResolvedUnresolvedTraitMethodCall(left_trait):
+			match right:
+				ResolvedUnresolvedTraitMethodCall(right_trait):
+					left_trait == right_trait
 				_:
 					False
 		ResolvedIntrinsicCall:
@@ -6534,13 +6633,12 @@ private pure func infer_constructor_name_expr(
 		ctor.field_types,
 	)
 	constructor_type = constructor_step.typ
-	resolved_call = Some(
-		resolved_call_from_constructor(
-			name.text,
-			ctor.constructor_id,
-			ctor.parent_type,
-			constructor_type,
-		),
+	resolved_call = resolved_call_from_constructor(
+		name.text,
+		ctor.constructor_id,
+		ctor.identity_domain,
+		ctor.parent_type,
+		constructor_type,
 	)
 	expr = TypedNameExpr(
 		name,
@@ -6548,7 +6646,7 @@ private pure func infer_constructor_name_expr(
 			None,
 			InferredOrigin,
 			UNREFINED_BINDING,
-			resolved_call,
+			Some(resolved_call),
 			KeptValueSlot(constructor_type),
 		),
 	)
@@ -7006,7 +7104,7 @@ private pure func infer_trait_method_name_expr(
 			None,
 			InferredOrigin,
 			UNREFINED_BINDING,
-			Some(resolved_call_from_trait_method_callee(callee, None, None)),
+			Some(resolved_call_from_trait_method_callee(context.state.facts, callee, None, None)),
 			infer_expected_slot(context, func_type),
 		),
 	)
@@ -7061,26 +7159,20 @@ private pure func builtin_ufcs_prefers_trait_dispatch(
 private pure func infer_name_expr(context: InferContext, name: ParsedIdentifier) -> InferResult:
 	match lookup_bare_value(context, name):
 		Some(BareAcceptedCallable(entry)):
-			next_context = check_debug_only_reference(context, name.text, entry.debug_only)
 			source_name = source_name_for_imported_module_path(
 				context,
 				name.text,
 				entry.module_path,
 			)
+			resolved_call = resolved_call_from_graph_overload_entry(name.text, source_name, entry)
+			next_context = check_debug_only_reference(context, name.text, entry.debug_only)
 			expr = TypedNameExpr(
 				name,
 				typed_expr_info_from_slot(
 					None,
 					InferredOrigin,
 					UNREFINED_BINDING,
-					Some(
-						resolved_call_from_overload_entry(
-							context.state.facts,
-							name.text,
-							source_name,
-							entry,
-						),
-					),
+					Some(resolved_call),
 					infer_expected_slot(next_context, entry.func_type),
 				),
 			)
@@ -7167,15 +7259,21 @@ private pure func infer_name_expr(context: InferContext, name: ParsedIdentifier)
 						Some(callee):
 							infer_trait_method_name_expr(context, name, callee)
 						None:
-							next_context = check_debug_only_reference(
-								context,
-								name.text,
-								func_symbol.debug_only,
-							)
 							source_name = source_name_for_imported_module_path(
 								context,
 								name.text,
 								func_symbol.module_path,
+							)
+							resolved_call = resolved_call_from_func_symbol_with_source(
+								context.state.facts,
+								name.text,
+								source_name,
+								func_symbol,
+							)
+							next_context = check_debug_only_reference(
+								context,
+								name.text,
+								func_symbol.debug_only,
 							)
 							expr = TypedNameExpr(
 								name,
@@ -7183,14 +7281,7 @@ private pure func infer_name_expr(context: InferContext, name: ParsedIdentifier)
 									None,
 									InferredOrigin,
 									UNREFINED_BINDING,
-									Some(
-										resolved_call_from_func_symbol_with_source(
-											context.state.facts,
-											name.text,
-											source_name,
-											func_symbol,
-										),
-									),
+									Some(resolved_call),
 									infer_expected_slot(next_context, func_symbol.func_type),
 								),
 							)
@@ -8350,24 +8441,32 @@ private pure func trait_method_supports_elementwise_tensor_call(
 
 
 private pure func resolved_call_supports_elementwise_tensor_call(
+	facts: InferModuleFacts,
 	resolved_call: Option[ResolvedCallInfo],
 ) -> Bool:
 	match resolved_call:
 		Some(call):
 			match call.target:
-				ResolvedDirectCall(_, CallableBuiltin):
+				ResolvedCompilerBuiltinCall(_):
 					builtin_is_elementwise_tensor_function(call.source_name)
-				ResolvedDirectCall(_, CallableImported(_, module_path)):
+				ResolvedGraphCallableCall(callable_id, ResolvedSourceFunctionCall):
 					(
-						module_path == "float"
+						infer_facts_callable_owner_path(facts, callable_id) == Some("float")
 						and builtin_is_elementwise_tensor_function(call.source_name)
 					)
-				ResolvedDirectCall(_, CallableImportedUnresolved(module_path)):
+				ResolvedUnindexedCallableCall(_, ResolvedSourceFunctionCall):
+					owner_path = module_view_find_imported_name(
+						facts.module_view,
+						call.callee_name,
+					).map(
+						func(binding): binding.module_path,
+					)
+
 					(
-						module_path == "float"
+						owner_path == Some("float")
 						and builtin_is_elementwise_tensor_function(call.source_name)
 					)
-				ResolvedTraitMethodCall(trait_name, _):
+				ResolvedSelectedTraitMethodCall(trait_name, _) | ResolvedUnindexedSelectedTraitMethodCall(trait_name, _) | ResolvedUnresolvedTraitMethodCall(trait_name):
 					trait_method_supports_elementwise_tensor_call(trait_name, call.callee_name)
 				_:
 					False
@@ -8376,10 +8475,11 @@ private pure func resolved_call_supports_elementwise_tensor_call(
 
 
 private pure func elementwise_tensor_element_type(
+	facts: InferModuleFacts,
 	resolved_call: Option[ResolvedCallInfo],
 	typ: SemanticType,
 ) -> Option[SemanticType]:
-	if resolved_call_supports_elementwise_tensor_call(resolved_call):
+	if resolved_call_supports_elementwise_tensor_call(facts, resolved_call):
 		match array_type_parts(typ):
 			Some((element_type, _)):
 				Some(element_type)
@@ -8399,7 +8499,11 @@ private pure func call_argument_assignable_context(
 		Some(assignable_context):
 			Some(assignable_context)
 		None:
-			match elementwise_tensor_element_type(direct_callable_resolution(callee), found):
+			match elementwise_tensor_element_type(
+				context.state.facts,
+				direct_callable_resolution(callee),
+				found,
+			):
 				Some(element_type):
 					assignable_context(context, expected, element_type)
 				None:
@@ -8603,6 +8707,13 @@ private pure func typed_qualified_module_constructor_expr(
 		ctor.field_types,
 	)
 	constructor_type = constructor_step.typ
+	resolved_call = resolved_call_from_constructor(
+		field.text,
+		ctor.constructor_id,
+		ctor.identity_domain,
+		ctor.parent_type,
+		constructor_type,
+	)
 
 	infer_result(
 		constructor_step.context,
@@ -8611,14 +8722,7 @@ private pure func typed_qualified_module_constructor_expr(
 			field,
 			span,
 			constructor_type,
-			Some(
-				resolved_call_from_constructor(
-					field.text,
-					ctor.constructor_id,
-					ctor.parent_type,
-					constructor_type,
-				),
-			),
+			Some(resolved_call),
 		),
 	)
 
@@ -8654,19 +8758,17 @@ private pure func infer_qualified_module_callee(
 								field.text,
 							):
 								Some(entry):
+									resolved_call = resolved_call_from_graph_overload_entry(
+										field.text,
+										field.text,
+										entry,
+									)
 									typed = typed_qualified_module_field_expr(
 										module_ident,
 										field,
 										span,
 										entry.func_type,
-										Some(
-											resolved_call_from_overload_entry(
-												context.state.facts,
-												field.text,
-												field.text,
-												entry,
-											),
-										),
+										Some(resolved_call),
 									)
 									Some(infer_result(context, typed))
 								None:
@@ -8708,6 +8810,11 @@ private pure func infer_qualified_module_field_expr(
 				Some(module_path):
 					match find_accepted_qualified_callable(context, module_path, field.text):
 						Some(entry):
+							resolved_call = resolved_call_from_graph_overload_entry(
+								field.text,
+								field.text,
+								entry,
+							)
 							next_context = check_debug_only_reference(
 								context,
 								field.text,
@@ -8718,14 +8825,7 @@ private pure func infer_qualified_module_field_expr(
 								field,
 								span,
 								entry.func_type,
-								Some(
-									resolved_call_from_overload_entry(
-										context.state.facts,
-										field.text,
-										field.text,
-										entry,
-									),
-								),
+								Some(resolved_call),
 							)
 							Some(infer_result(next_context, typed))
 						None:
@@ -9083,8 +9183,9 @@ private pure func check_trait_method_self_bound(
 	match resolved_call:
 		Some(call):
 			match call.target:
-				ResolvedTraitMethodCall(trait_name, _):
+				ResolvedSelectedTraitMethodCall(trait_name, _) | ResolvedUnindexedSelectedTraitMethodCall(trait_name, _) | ResolvedUnresolvedTraitMethodCall(trait_name):
 					obligation_type = elementwise_tensor_element_type(
+						context.state.facts,
 						resolved_call,
 						self_type,
 					).get_or(self_type)
@@ -9130,7 +9231,7 @@ private pure func resolve_trait_self_call(
 	is_trait_method = match resolved_call:
 		Some(call):
 			match call.target:
-				ResolvedTraitMethodCall(_, _):
+				ResolvedSelectedTraitMethodCall(_, _) | ResolvedUnindexedSelectedTraitMethodCall(_, _) | ResolvedUnresolvedTraitMethodCall(_):
 					True
 				_:
 					False
@@ -9158,7 +9259,7 @@ private pure func resolve_trait_self_call(
 				resource_args = match updated_resolved_call:
 					Some(call):
 						match call.target:
-							ResolvedTraitMethodCall(trait_name, _):
+							ResolvedSelectedTraitMethodCall(trait_name, _) | ResolvedUnindexedSelectedTraitMethodCall(trait_name, _) | ResolvedUnresolvedTraitMethodCall(trait_name):
 								if call.trait_identity.is_some():
 									call.resource_args
 								else:
@@ -9601,6 +9702,7 @@ private pure func refined_tensor_constructor_return_type(
 
 
 private pure func refined_builtin_return_type(
+	facts: InferModuleFacts,
 	resolved_call: Option[ResolvedCallInfo],
 	args: List[TypedExpr],
 	fallback: SemanticType,
@@ -9613,7 +9715,7 @@ private pure func refined_builtin_return_type(
 			Some(arg):
 				arg_type = typed_expr_semantic_type(arg)
 
-				match elementwise_tensor_element_type(resolved_call, arg_type):
+				match elementwise_tensor_element_type(facts, resolved_call, arg_type):
 					Some(_):
 						Some(arg_type)
 					None:
@@ -9645,17 +9747,33 @@ private pure func refined_builtin_return_type(
 						fallback
 
 
-private pure func debug_reflection_name(resolved_call: Option[ResolvedCallInfo]) -> Option[String]:
+private pure func debug_reflection_name(
+	facts: InferModuleFacts,
+	resolved_call: Option[ResolvedCallInfo],
+) -> Option[String]:
 	match resolved_call:
 		Some(call):
 			match call.target:
-				ResolvedDirectCall(_, CallableImported(_, "debug")):
-					if call.source_name == "type_name" or call.source_name == "is_heap":
+				ResolvedGraphCallableCall(callable_id, ResolvedSourceFunctionCall):
+					if (
+						infer_facts_callable_owner_path(facts, callable_id) == Some("debug")
+						and (call.source_name == "type_name" or call.source_name == "is_heap")
+					):
 						Some(call.source_name)
 					else:
 						None
-				ResolvedDirectCall(_, CallableImportedUnresolved("debug")):
-					if call.source_name == "type_name" or call.source_name == "is_heap":
+				ResolvedUnindexedCallableCall(_, ResolvedSourceFunctionCall):
+					owner_path = module_view_find_imported_name(
+						facts.module_view,
+						call.callee_name,
+					).map(
+						func(binding): binding.module_path,
+					)
+
+					if (
+						owner_path == Some("debug")
+						and (call.source_name == "type_name" or call.source_name == "is_heap")
+					):
 						Some(call.source_name)
 					else:
 						None
@@ -9698,7 +9816,7 @@ private pure func debug_reflection_result(
 	return_type: SemanticType,
 	resolved_call: Option[ResolvedCallInfo],
 ) -> Option[InferResult]:
-	reflection_name ?= debug_reflection_name(resolved_call)
+	reflection_name ?= debug_reflection_name(context.state.facts, resolved_call)
 	call ?= resolved_call
 
 	match args:
@@ -9860,6 +9978,7 @@ private pure func infer_call_with_callee_result(
 					apply_subst(complete_subst.subst, call_return_type),
 				)
 				resolved_return_type = refined_builtin_return_type(
+					var_dims_bind.context.state.facts,
 					self_resolved_call,
 					arg_result.args,
 					resolved_return_base,
@@ -9936,19 +10055,21 @@ private pure func infer_ufcs_call_with_receiver_result(
 	span: SourceSpan,
 ) -> Option[InferResult]:
 	source_name = source_name_for_imported_module_path(context, method.text, entry.module_path)
-	resolved_call = resolved_call_from_overload_entry(
+	resolved_call_info = resolved_call_from_overload_entry(
 		context.state.facts,
 		method.text,
 		source_name,
 		entry,
 	)
+	resolved_call = Some(resolved_call_info)
+	resolved_context = receiver_result.context
 	callee_expr = TypedNameExpr(
 		method,
 		typed_expr_info_from_slot(
 			None,
 			InferredOrigin,
 			UNREFINED_BINDING,
-			Some(resolved_call),
+			resolved_call,
 			KeptValueSlot(entry.func_type),
 		),
 	)
@@ -9962,7 +10083,7 @@ private pure func infer_ufcs_call_with_receiver_result(
 
 			if expected_arg_count != args.length():
 				next = call_arity_error(
-					infer_without_expected(receiver_result.context),
+					infer_without_expected(resolved_context),
 					callee_expr,
 					expected_arg_count,
 					args.length(),
@@ -9971,7 +10092,7 @@ private pure func infer_ufcs_call_with_receiver_result(
 					callee_expr,
 					[receiver_result.expr],
 					span,
-					inferred_call_info(next, TYPE_VOID, Some(resolved_call)),
+					inferred_call_info(next, TYPE_VOID, resolved_call),
 				)
 				Some(infer_result(next, typed))
 			else:
@@ -9982,7 +10103,7 @@ private pure func infer_ufcs_call_with_receiver_result(
 						)
 						receiver_type = typed_expr_value_type(receiver_result.expr)
 						receiver_bind = bind_type_subst_with_type_params(
-							receiver_result.context,
+							resolved_context,
 							type_param_names,
 							receiver_param,
 							receiver_type,
@@ -10022,16 +10143,16 @@ private pure func infer_ufcs_call_with_receiver_result(
 						)
 						dim_checked_context = check_call_dim_constraints(
 							checked_context,
-							Some(resolved_call),
+							resolved_call,
 							complete_subst.subst,
 						)
 						debug_checked_context = check_debug_only_call(
 							dim_checked_context,
-							Some(resolved_call),
+							resolved_call,
 						)
 						resource_checked_context = check_call_resource_args(
 							debug_checked_context,
-							Some(resolved_call),
+							resolved_call,
 							[receiver_result.expr].concat(arg_result.args),
 						)
 						substituted_param_types = call_params.map(
@@ -10051,14 +10172,15 @@ private pure func infer_ufcs_call_with_receiver_result(
 							apply_subst(complete_subst.subst, call_return_type),
 						)
 						resolved_return_type = refined_builtin_return_type(
-							Some(resolved_call),
+							var_dims_bind.context.state.facts,
+							resolved_call,
 							call_args,
 							resolved_return_base,
 						)
-						instantiated_resolved_call = { resolved_call |
-							instantiated_params = resolved_param_types,
-							instantiated_return = resolved_return_type
-						}
+						instantiated_resolved_call = resolved_call.map(func(call): { call |
+								instantiated_params = resolved_param_types,
+								instantiated_return = resolved_return_type
+							})
 						typed = TypedCallExpr(
 							callee_expr,
 							call_args,
@@ -10066,7 +10188,7 @@ private pure func infer_ufcs_call_with_receiver_result(
 							inferred_call_info(
 								var_dims_bind.context,
 								resolved_return_type,
-								Some(instantiated_resolved_call),
+								instantiated_resolved_call,
 							),
 						)
 						Some(infer_result(var_dims_bind.context, typed))
@@ -10189,12 +10311,30 @@ private pure func infer_trait_method_ufcs_call_expr(
 							.map(func(method): method.resource_args)
 							.get_or(RejectResourceArgs)
 						resolved_call = { resolved_call_from_trait_method_callee(
+							context.state.facts,
 							method_callee,
 							impl_method,
 							None,
 						) |
 							resource_args = resource_args
 						}
+
+						resolved_context = if trait_impl_target_is_outside_definition_table(
+							context.state.facts,
+							impl_method,
+						):
+							graph_definition_invariant_error(
+								context,
+								"implementation method",
+								method_callee.method_name,
+								impl_method
+									.and_then(func(method): method.target)
+									.map(func(target): target.callable_id)
+									.get_or(-1),
+							)
+						else:
+							context
+
 						callee_expr = TypedNameExpr(
 							method,
 							typed_expr_info_from_slot(
@@ -10205,10 +10345,10 @@ private pure func infer_trait_method_ufcs_call_expr(
 								KeptValueSlot(func_type),
 							),
 						)
-						callee_result = infer_result(context, callee_expr)
+						callee_result = infer_result(resolved_context, callee_expr)
 						Some(
 							infer_call_with_callee_result(
-								context,
+								resolved_context,
 								callee_result,
 								[receiver].concat(args),
 								span,
@@ -10398,12 +10538,29 @@ private pure func infer_qualified_module_trait_call_expr(
 											method = qualified_method.method
 										}
 										resolved_call = { resolved_call_from_trait_method_callee(
+											context.state.facts,
 											method_callee,
 											Some(method_info),
 											qualified_method.trait_identity,
 										) |
 											resource_args = method_info.resource_args
 										}
+
+										resolved_context = if trait_impl_target_is_outside_definition_table(
+											context.state.facts,
+											Some(method_info),
+										):
+											graph_definition_invariant_error(
+												context,
+												"implementation method",
+												method_callee.method_name,
+												method_info.target
+													.map(func(target): target.callable_id)
+													.get_or(-1),
+											)
+										else:
+											context
+
 										callee_expr = typed_qualified_module_field_expr(
 											module_ident,
 											method,
@@ -10413,8 +10570,8 @@ private pure func infer_qualified_module_trait_call_expr(
 										)
 										Some(
 											infer_call_with_callee_result(
-												context,
-												infer_result(context, callee_expr),
+												resolved_context,
+												infer_result(resolved_context, callee_expr),
 												args,
 												span,
 											),

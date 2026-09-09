@@ -139,6 +139,7 @@ import:
 		DeclarationVisibility(PublicDeclaration),
 		builtin_trait_id,
 		callable_id_definition_id,
+		callable_id_from_reserved_graph_definition,
 		impl_id_definition_id,
 		impl_id_module_id,
 		trait_id_definition_id,
@@ -146,6 +147,7 @@ import:
 		trait_id_name,
 	../../../src/compiler/stage_06_typecheck/headers/implementation_headers:
 		implementation_header_graph_callable_headers,
+		implementation_header_graph_definition_table,
 		implementation_header_graph_headers,
 		implementation_header_id,
 		implementation_header_method_ids,
@@ -2121,6 +2123,9 @@ private pure func accepted_trait_table_exact_identity_is_owner_safe() -> Option[
 		program([trait_decl("Equatable")]),
 		[],
 	).to_option()
+	definition_table = implementation_header_graph_definition_table(
+		accepted_typecheck_graph_implementation_headers(graph),
+	)
 	topology = callable_header_graph_trait_topology(
 		implementation_header_graph_callable_headers(
 			accepted_typecheck_graph_implementation_headers(graph),
@@ -2153,6 +2158,7 @@ private pure func accepted_trait_table_exact_identity_is_owner_safe() -> Option[
 	}
 	table ?= accepted_trait_implementation_table({
 		module_table = owner_table,
+		definition_table = definition_table,
 		traits = [item],
 		implementations = [],
 	})
@@ -2175,6 +2181,7 @@ private pure func accepted_trait_table_exact_identity_is_owner_safe() -> Option[
 		) == TraitObligationUnsatisfied
 		and accepted_trait_implementation_table({
 			module_table = owner_table,
+			definition_table = definition_table,
 			traits = [wrong_owner_item],
 			implementations = [],
 		}).is_none()
@@ -2224,7 +2231,7 @@ func test_impl_registration_rejects_mismatched_module_path() -> Bool:
 	] and env_find_impl_method_info(result.env, "Identity", "identity", TYPE_INT).is_none()
 
 
-private pure func accepted_table_rejects_mismatched_method_module() -> Option[Bool]:
+private pure func accepted_table_rejects_mismatched_method_identity() -> Option[Bool]:
 	method_span = source_span_at(1)
 	method: ParsedFunctionDecl = {
 		name = ident("identity"),
@@ -2272,7 +2279,6 @@ private pure func accepted_table_rejects_mismatched_method_module() -> Option[Bo
 	implementation_id = implementation_header_id(implementation)
 	owner_module_id = impl_id_module_id(implementation_id)
 	owner_path ?= module_table_canonical_path(module_table, owner_module_id)
-	other_module_id ?= module_table_find_id_by_canonical_path(module_table, "other/module")
 	method_id ?= implementation_header_method_ids(implementation).get(0)
 	trait_id = implementation_header_trait_id(implementation)
 	trait_record: AcceptedTraitTableRecord = {
@@ -2292,11 +2298,7 @@ private pure func accepted_table_rejects_mismatched_method_module() -> Option[Bo
 	}
 	correct_method = impl_method_info(
 		"identity",
-		Some({
-			callable_id = callable_id_definition_id(method_id),
-			module_id = owner_module_id,
-			module_path = owner_path,
-		}),
+		Some({callable_id = callable_id_definition_id(method_id)}),
 		SemanticFunctionType(True, [TYPE_INT], TYPE_INT),
 		[],
 		[Some("value")],
@@ -2320,32 +2322,44 @@ private pure func accepted_table_rejects_mismatched_method_module() -> Option[Bo
 		method_ids = [method_id],
 		instance = instance
 	}
-	mismatched_method = { correct_method | target = Some({
-			callable_id = callable_id_definition_id(method_id),
-			module_id = other_module_id,
-			module_path = owner_path,
-		}) }
+	mismatched_method = { correct_method |
+		target = Some({callable_id = callable_id_definition_id(method_id) + 1})
+	}
 	mismatched = { correct | instance = { instance | methods = [mismatched_method] } }
+	wrong_kind_id = callable_id_from_reserved_graph_definition(trait_id_definition_id(trait_id))
+	wrong_kind_method = { correct_method |
+		target = Some({callable_id = callable_id_definition_id(wrong_kind_id)})
+	}
+	wrong_kind = { correct |
+		method_ids = [wrong_kind_id],
+		instance = { instance | methods = [wrong_kind_method] }
+	}
 	correct_input = {
 		module_table = module_table,
+		definition_table = implementation_header_graph_definition_table(implementation_headers),
 		traits = [trait_record],
 		implementations = [correct]
 	}
 	mismatched_input = { correct_input | implementations = [mismatched] }
+	wrong_kind_input = { correct_input | implementations = [wrong_kind] }
 
 	Some(
 		(
 			accepted_trait_implementation_table(correct_input).is_some()
 			and accepted_trait_implementation_table(mismatched_input).is_none()
+			and accepted_trait_implementation_table(wrong_kind_input).is_none()
 			and accepted_trait_implementation_table_validation_errors(
 				mismatched_input,
+			) == ["invalid accepted implementation record for trait 'Identity'"]
+			and accepted_trait_implementation_table_validation_errors(
+				wrong_kind_input,
 			) == ["invalid accepted implementation record for trait 'Identity'"]
 		),
 	)
 
 
-func test_accepted_table_rejects_mismatched_method_module() -> Bool:
-	accepted_table_rejects_mismatched_method_module().get_or(False)
+func test_accepted_table_rejects_mismatched_method_identity() -> Bool:
+	accepted_table_rejects_mismatched_method_identity().get_or(False)
 
 
 func test_import_modules_register_canonical_type_payloads() -> Bool:
@@ -4262,8 +4276,8 @@ func test_materialize_impl_method_type_param_shadows_alias() -> Bool:
 			match info.methods.get(0):
 				Some(method_info):
 					target_ok = match (registered.target, method_info.callable_id):
-						(Some(target), Some(callable_id)):
-							target.callable_id == callable_id and target.module_path == "decl"
+						(Some(target), Some(callable_definition_id)):
+							target.callable_id == callable_definition_id
 						_:
 							False
 
@@ -6615,8 +6629,8 @@ tests: TestSuite = {
 			test_impl_registration_rejects_mismatched_module_path,
 		),
 		(
-			"accepted table rejects mismatched method module",
-			test_accepted_table_rejects_mismatched_method_module,
+			"accepted table rejects mismatched method identity",
+			test_accepted_table_rejects_mismatched_method_identity,
 		),
 	]
 }

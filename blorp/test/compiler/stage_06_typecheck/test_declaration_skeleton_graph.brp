@@ -29,6 +29,7 @@ import:
 			FunctionCallableSource,
 			ImplementationMethodCallableSource,
 		),
+		ConstructorId,
 		DeclarationSkeleton(ConstructorDeclarationSkeleton),
 		DeclarationSkeletonGraph,
 		DeclarationSkeletonGraphError(
@@ -61,7 +62,7 @@ import:
 			RecordTypeSource,
 			UnionTypeSource,
 		),
-		constructor_ids_equal,
+		constructor_id_definition_id,
 		declaration_skeleton_graph_build,
 		declaration_skeleton_graph_callable_skeletons,
 		declaration_skeleton_graph_constructor_lookup_candidate_count,
@@ -437,8 +438,19 @@ func test_skeleton_graph_rejects_duplicate_constructor_within_parent() -> Bool:
 	errors = skeleton_graph_errors("union Signal:\n\tReady\n\tReady")
 
 	match errors:
-		[DuplicateConstructorDeclaration(_, parent, name, _)]:
-			type_id_name(parent) == "Signal" and name == "Ready"
+		[DuplicateConstructorDeclaration(_, parent, name, span)]:
+			(
+				type_id_name(parent) == "Signal"
+				and name == "Ready"
+				and span.path == "main.brp"
+				and span.module_name == "app/main"
+				and span.start_offset == 22
+				and span.start_line == 3
+				and span.start_column == 5
+				and span.end_offset == 27
+				and span.end_line == 3
+				and span.end_column == 10
+			)
 		_:
 			False
 
@@ -496,7 +508,9 @@ private pure func exact_constructor_lookup_matches_skeleton(
 					):
 						Some(found):
 							(
-								constructor_ids_equal(found.id, id)
+								constructor_id_definition_id(
+									found.id,
+								) == constructor_id_definition_id(id)
 								and type_ids_equal(found.parent_type_id, parent)
 								and found.visibility == visibility
 								and found.visibility == expected_visibility
@@ -511,6 +525,25 @@ private pure func exact_constructor_lookup_matches_skeleton(
 				void
 
 	matches
+
+
+private pure func constructor_id_for_parent(
+	graph: DeclarationSkeletonGraph,
+	parent_type_id: TypeId,
+	name: String,
+) -> Option[ConstructorId]:
+	var found: Option[ConstructorId] = None
+
+	for skeleton in declaration_skeleton_graph_skeletons(graph):
+		match skeleton:
+			ConstructorDeclarationSkeleton(id, _, parent, source):
+				if type_ids_equal(parent, parent_type_id) and source.name.text == name:
+					found = Some(id)
+					break
+			_:
+				void
+
+	found
 
 
 func test_constructor_lookup_is_exact_across_modules_parents_and_spans() -> Bool:
@@ -580,6 +613,28 @@ func test_constructor_lookup_is_exact_across_modules_parents_and_spans() -> Bool
 
 									match dependency_signal:
 										Some(dependency_type):
+											target_ready_id = constructor_id_for_parent(
+												graph,
+												public_type.id,
+												"Ready",
+											)
+											dependency_ready_id = constructor_id_for_parent(
+												graph,
+												dependency_type.id,
+												"Ready",
+											)
+
+											ready_ids_distinct = match (
+												target_ready_id,
+												dependency_ready_id,
+											):
+												(Some(target_id), Some(dependency_id)):
+													constructor_id_definition_id(
+														target_id,
+													) != constructor_id_definition_id(dependency_id)
+												_:
+													False
+
 											var same_name_ok: Bool = (
 												exact_constructor_lookup_matches_skeleton(
 													graph,
@@ -593,6 +648,7 @@ func test_constructor_lookup_is_exact_across_modules_parents_and_spans() -> Bool
 													"Ready",
 													PublicDeclaration,
 												)
+												and ready_ids_distinct
 											)
 
 											var wrong_identity_ok: Bool = True

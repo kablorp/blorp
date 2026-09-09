@@ -1,11 +1,4 @@
 import:
-	../../../src/lib/source:
-		Cursor,
-		SourceFile,
-		SourceSpan,
-		source_cursor_at,
-		source_file,
-		source_span,
 	../../../src/compiler/stage_03_parse/parsed_ast:
 		ParsedExpr(
 			ParsedBoolLiteralExpr,
@@ -23,19 +16,29 @@ import:
 		ModuleOrigin(UserModule),
 		resolved_module_identity_from_resolver,
 	../../../src/compiler/stage_04_modules/module_table: singleton_module_table
-	../../../src/compiler/stage_06_typecheck/type_system/refinement: UNREFINED_BINDING
-	../../../src/compiler/stage_06_typecheck/type_system/semantic_type:
-		SemanticType(SemanticFunctionType, SemanticNamedType, SemanticRangeType, SemanticTupleType),
-		TYPE_INT,
-		TYPE_STRING,
-		TYPE_VOID,
-		type_list,
-		types_equal,
-	../../../src/compiler/stage_06_typecheck/type_system/type_widening: ValueSlot(KeptValueSlot)
+	../../../src/compiler/stage_06_typecheck/graph/definition_identity:
+		SourceDefinitionKind(ConstructorDefinition),
+		func_callable_key,
+		source_definition_key,
+	../../../src/compiler/stage_06_typecheck/graph/definition_index:
+		DefinitionTable,
+		definition_index_definition_table,
+		definition_index_empty,
+		definition_index_initial_seed,
+		definition_index_insert_func_callable_id,
+		definition_index_insert_source_definition_id,
+		definition_index_next_def_id,
+	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
+		CallableId,
+		ConstructorId,
+		callable_id_definition_id,
+		callable_id_from_definition_table,
+		constructor_id_definition_id,
+		constructor_id_from_definition_table,
 	../../../src/compiler/stage_06_typecheck/infer:
-		CallableOrigin(CallableConstructor, CallableLocal),
 		ExprTypeOrigin(SynthesizedOrigin),
-		ResolvedCallTarget(ResolvedDirectCall),
+		ResolvedCallTarget(ResolvedConstructorCall, ResolvedGraphCallableCall),
+		ResolvedGraphCallableCategory(ResolvedSourceFunctionCall),
 		TypedExpr(
 			TypedBoolLiteralExpr,
 			TypedCallExpr,
@@ -55,9 +58,22 @@ import:
 		typed_expr_info_value_type,
 		typed_expr_resolved_call,
 		typed_expr_value_type,
+	../../../src/compiler/stage_06_typecheck/type_system/env: ENV_EMPTY
+	../../../src/compiler/stage_06_typecheck/type_system/refinement: UNREFINED_BINDING
+	../../../src/compiler/stage_06_typecheck/type_system/semantic_type:
+		SemanticType(SemanticFunctionType, SemanticNamedType, SemanticRangeType, SemanticTupleType),
+		TYPE_INT,
+		TYPE_STRING,
+		TYPE_VOID,
+		type_list,
+		types_equal,
+	../../../src/compiler/stage_06_typecheck/type_system/type_widening: ValueSlot(KeptValueSlot)
 	../../../src/compiler/stage_07_ctfe/env: CTFE_ENV_EMPTY, ctfe_bind_local_value
 	../../../src/compiler/stage_07_ctfe/materialize:
-		CtfeMaterializeError(CtfeCapturedLambda, CtfeLambdaSourceUnavailable),
+		CtfeMaterializeError(
+			CtfeCapturedLambda,
+			CtfeLambdaSourceUnavailable,
+		),
 		ctfe_materialize_parsed_expr,
 		ctfe_materialize_value,
 	../../../src/compiler/stage_07_ctfe/value:
@@ -83,6 +99,13 @@ import:
 		ctfe_string,
 		ctfe_value,
 		ctfe_void,
+	../../../src/lib/source:
+		Cursor,
+		SourceFile,
+		SourceSpan,
+		source_cursor_at,
+		source_file,
+		source_span,
 	test: TestSuite
 
 
@@ -94,6 +117,73 @@ pure func fixture_source_span() -> SourceSpan:
 	src: SourceFile = fixture_source_file()
 	cursor: Cursor = source_cursor_at(src, 0)
 	source_span(src, cursor, cursor)
+
+
+private record MaterializeFixture {
+	definitions: DefinitionTable,
+	none_constructor: ConstructorId,
+	some_constructor: ConstructorId,
+	increment: CallableId
+}
+
+
+private pure func materialize_fixture() -> Option[MaterializeFixture]:
+	(table, module_id) = singleton_module_table(
+		resolved_module_identity_from_resolver(
+			"materialize",
+			UserModule,
+		),
+	)
+	empty = definition_index_empty(definition_index_initial_seed(ENV_EMPTY), table)
+	none_id = definition_index_next_def_id(empty)
+	with_none ?= definition_index_insert_source_definition_id(
+		empty,
+		table,
+		source_definition_key(
+			module_id,
+			ConstructorDefinition,
+			"None",
+			Some("Option"),
+			fixture_source_span(),
+		),
+		none_id,
+	).to_option()
+	some_id = definition_index_next_def_id(with_none)
+	with_some ?= definition_index_insert_source_definition_id(
+		with_none,
+		table,
+		source_definition_key(
+			module_id,
+			ConstructorDefinition,
+			"Some",
+			Some("Option"),
+			fixture_source_span(),
+		),
+		some_id,
+	).to_option()
+	increment_id = definition_index_next_def_id(with_some)
+	complete ?= definition_index_insert_func_callable_id(
+		with_some,
+		table,
+		func_callable_key(module_id, "increment", fixture_source_span()),
+		increment_id,
+	).to_option()
+	definitions = definition_index_definition_table(complete)
+	none_constructor ?= constructor_id_from_definition_table(definitions, none_id)
+	some_constructor ?= constructor_id_from_definition_table(definitions, some_id)
+	increment ?= callable_id_from_definition_table(definitions, increment_id)
+	Some({
+		definitions = definitions,
+		none_constructor = none_constructor,
+		some_constructor = some_constructor,
+		increment = increment,
+	})
+
+
+private pure func materialize_test_value(
+	value: CtfeValue,
+) -> Result[TypedExpr, CtfeMaterializeError]:
+	ctfe_materialize_value(value)
 
 
 pure func int_value(value: Int) -> CtfeValue:
@@ -156,18 +246,14 @@ pure func range_value(start: CtfeValue, end: CtfeValue) -> CtfeValue:
 pure func constructor_value(
 	name: String,
 	args: List[CtfeValue],
-	callable_id: Option[Int],
+	constructor_id: Option[ConstructorId],
 ) -> CtfeValue:
-	constructor_info = match callable_id:
-		Some(definition_id):
-			domain = singleton_module_table(
-				resolved_module_identity_from_resolver("materialize", UserModule),
-			)
+	constructor_info = match constructor_id:
+		Some(id):
 			ctfe_resolved_constructor_info(
 				"Option",
 				args.length(),
-				domain[0],
-				definition_id,
+				id,
 			)
 		None:
 			ctfe_constructor_info("Option", args.length())
@@ -183,11 +269,11 @@ pure func constructor_value(
 	)
 
 
-pure func function_reference_value() -> CtfeValue:
+pure func function_reference_value(callable_id: CallableId) -> CtfeValue:
 	ctfe_function_reference(
 		SemanticFunctionType(True, [TYPE_INT], TYPE_INT),
 		fixture_source_span(),
-		23,
+		callable_id,
 		"increment",
 		True,
 	)
@@ -260,7 +346,7 @@ pure func captured_lambda_value() -> CtfeValue:
 
 
 pure func materialized_type_is(value: CtfeValue, expected: SemanticType) -> Bool:
-	match ctfe_materialize_value(value):
+	match materialize_test_value(value):
 		Ok(materialized):
 			types_equal(typed_expr_value_type(materialized), expected)
 		Err(_):
@@ -272,55 +358,55 @@ pure func materialize_error_is(error: CtfeMaterializeError, expected: CtfeMateri
 
 
 func test_materializes_scalar_literals() -> Bool:
-	int_ok = match ctfe_materialize_value(int_value(42)):
+	int_ok = match materialize_test_value(int_value(42)):
 		Ok(TypedIntLiteralExpr(text, _, _)):
 			text == "42"
 		_:
 			False
 
-	float_ok = match ctfe_materialize_value(float_value(3.141592653589793)):
+	float_ok = match materialize_test_value(float_value(3.141592653589793)):
 		Ok(TypedFloatLiteralExpr(text, _, _)):
 			text == "3.141592653589793"
 		_:
 			False
 
-	non_finite_float_ok = match ctfe_materialize_value(float_value(1.0 / 0.0)):
+	non_finite_float_ok = match materialize_test_value(float_value(1.0 / 0.0)):
 		Ok(TypedFloatLiteralExpr(text, _, _)):
 			text == "inf"
 		_:
 			False
 
-	negative_infinity_float_ok = match ctfe_materialize_value(float_value(-1.0 / 0.0)):
+	negative_infinity_float_ok = match materialize_test_value(float_value(-1.0 / 0.0)):
 		Ok(TypedFloatLiteralExpr(text, _, _)):
 			text == "-inf"
 		_:
 			False
 
-	nan_float_ok = match ctfe_materialize_value(float_value(0.0 / 0.0)):
+	nan_float_ok = match materialize_test_value(float_value(0.0 / 0.0)):
 		Ok(TypedFloatLiteralExpr(text, _, _)):
 			text == "nan"
 		_:
 			False
 
-	bool_ok = match ctfe_materialize_value(bool_value(True)):
+	bool_ok = match materialize_test_value(bool_value(True)):
 		Ok(TypedBoolLiteralExpr(value, _, _)):
 			value
 		_:
 			False
 
-	char_ok = match ctfe_materialize_value(char_value(65)):
+	char_ok = match materialize_test_value(char_value(65)):
 		Ok(TypedCharLiteralExpr(value, _, _)):
 			value == 65
 		_:
 			False
 
-	string_ok = match ctfe_materialize_value(string_value("blorp")):
+	string_ok = match materialize_test_value(string_value("blorp")):
 		Ok(TypedStringLiteralExpr(value, _, _)):
 			value == "blorp"
 		_:
 			False
 
-	void_ok = match ctfe_materialize_value(ctfe_void(fixture_source_span())):
+	void_ok = match materialize_test_value(ctfe_void(fixture_source_span())):
 		Ok(TypedVoidExpr(_, _)):
 			True
 		_:
@@ -342,19 +428,19 @@ func test_materializes_scalar_literals() -> Bool:
 
 
 func test_materializes_aggregate_literals() -> Bool:
-	tuple_ok = match ctfe_materialize_value(tuple_value([int_value(1), string_value("x")])):
+	tuple_ok = match materialize_test_value(tuple_value([int_value(1), string_value("x")])):
 		Ok(TypedTupleExpr(items, _, _)):
 			items.length() == 2
 		_:
 			False
 
-	list_ok = match ctfe_materialize_value(list_value([int_value(1), int_value(2)])):
+	list_ok = match materialize_test_value(list_value([int_value(1), int_value(2)])):
 		Ok(TypedListExpr(items, _, _)):
 			items.length() == 2
 		_:
 			False
 
-	record_ok = match ctfe_materialize_value(record_value([("value", int_value(3))])):
+	record_ok = match materialize_test_value(record_value([("value", int_value(3))])):
 		Ok(TypedRecordExpr(fields, _, _)):
 			match fields.get(0):
 				Some(field):
@@ -364,13 +450,13 @@ func test_materializes_aggregate_literals() -> Bool:
 		_:
 			False
 
-	dict_ok = match ctfe_materialize_value(dict_value([(string_value("answer"), int_value(42))])):
+	dict_ok = match materialize_test_value(dict_value([(string_value("answer"), int_value(42))])):
 		Ok(TypedDictExpr(entries, _, _)):
 			entries.length() == 1
 		_:
 			False
 
-	range_ok = match ctfe_materialize_value(range_value(int_value(0), int_value(3))):
+	range_ok = match materialize_test_value(range_value(int_value(0), int_value(3))):
 		Ok(TypedRangeExpr(_, _, _, _)):
 			True
 		_:
@@ -379,18 +465,20 @@ func test_materializes_aggregate_literals() -> Bool:
 	tuple_ok and list_ok and record_ok and dict_ok and range_ok
 
 
-func test_materializes_constructors() -> Bool:
-	nullary_ok = match ctfe_materialize_value(constructor_value("None", [], Some(16))):
+private pure func materializes_constructors(fixture: MaterializeFixture) -> Bool:
+	nullary_ok = match materialize_test_value(
+		constructor_value("None", [], Some(fixture.none_constructor)),
+	):
 		Ok(TypedNameExpr(name, info)):
 			name.text == "None" and match info.resolved_call:
 				Some(call):
 					match call.target:
-						ResolvedDirectCall(callable_id, origin):
-							match origin:
-								CallableConstructor(parent_type):
-									callable_id == 16 and parent_type == "Option"
-								_:
-									False
+						ResolvedConstructorCall(constructor_id, parent_type):
+							(
+							constructor_id_definition_id(constructor_id)
+								== constructor_id_definition_id(fixture.none_constructor)
+								and parent_type == "Option"
+							)
 						_:
 							False
 				None:
@@ -398,7 +486,9 @@ func test_materializes_constructors() -> Bool:
 		_:
 			False
 
-	expr = ctfe_materialize_value(constructor_value("Some", [int_value(42)], Some(17)))
+	expr = materialize_test_value(
+		constructor_value("Some", [int_value(42)], Some(fixture.some_constructor)),
+	)
 
 	call_ok = match expr:
 		Ok(call_expr):
@@ -413,12 +503,13 @@ func test_materializes_constructors() -> Bool:
 					resolved_ok = match typed_expr_resolved_call(call_expr):
 						Some(call):
 							match call.target:
-								ResolvedDirectCall(callable_id, origin):
-									match origin:
-										CallableConstructor(parent_type):
-											callable_id == 17 and parent_type == "Option"
-										_:
-											False
+								ResolvedConstructorCall(constructor_id, parent_type):
+									(
+										constructor_id_definition_id(
+											constructor_id,
+									) == constructor_id_definition_id(fixture.some_constructor)
+										and parent_type == "Option"
+									)
 								_:
 									False
 						None:
@@ -433,24 +524,29 @@ func test_materializes_constructors() -> Bool:
 	nullary_ok and call_ok
 
 
-func test_materializes_function_references() -> Bool:
-	value = function_reference_value()
+func test_materializes_constructors() -> Bool:
+	match materialize_fixture():
+		Some(fixture):
+			materializes_constructors(fixture)
+		None:
+			False
 
-	typed_ok = match ctfe_materialize_value(value):
+
+private pure func materializes_function_references(fixture: MaterializeFixture) -> Bool:
+	value = function_reference_value(fixture.increment)
+
+	typed_ok = match materialize_test_value(value):
 		Ok(materialized):
 			resolved_ok = match typed_expr_resolved_call(materialized):
 				Some(call):
 					match call.target:
-						ResolvedDirectCall(callable_id, origin):
-							match origin:
-								CallableLocal:
-									(
-										callable_id == 23
-										and call.instantiated_params.length() == 1
-										and types_equal(call.instantiated_return, TYPE_INT)
-									)
-								_:
-									False
+						ResolvedGraphCallableCall(callable_id, ResolvedSourceFunctionCall):
+							(
+								callable_id_definition_id(callable_id)
+									== callable_id_definition_id(fixture.increment)
+								and call.instantiated_params.length() == 1
+								and types_equal(call.instantiated_return, TYPE_INT)
+							)
 						_:
 							False
 				None:
@@ -473,8 +569,16 @@ func test_materializes_function_references() -> Bool:
 	typed_ok and parsed_ok
 
 
+func test_materializes_function_references() -> Bool:
+	match materialize_fixture():
+		Some(fixture):
+			materializes_function_references(fixture)
+		None:
+			False
+
+
 func test_materializes_lambda_without_inventing_parsed_source() -> Bool:
-	typed_ok = match ctfe_materialize_value(lambda_value()):
+	typed_ok = match materialize_test_value(lambda_value()):
 		Ok(TypedLambdaExpr(_, _, _, _, _, _)):
 			True
 		_:
@@ -490,7 +594,7 @@ func test_materializes_lambda_without_inventing_parsed_source() -> Bool:
 
 
 func test_rejects_captured_lambda_materialization() -> Bool:
-	match ctfe_materialize_value(captured_lambda_value()):
+	match materialize_test_value(captured_lambda_value()):
 		Err(error):
 			materialize_error_is(error, CtfeCapturedLambda)
 		_:
@@ -498,7 +602,7 @@ func test_rejects_captured_lambda_materialization() -> Bool:
 
 
 func test_rejects_captured_lambda_nested_in_aggregate() -> Bool:
-	match ctfe_materialize_value(record_value([("callback", captured_lambda_value())])):
+	match materialize_test_value(record_value([("callback", captured_lambda_value())])):
 		Err(error):
 			materialize_error_is(error, CtfeCapturedLambda)
 		_:
@@ -582,7 +686,7 @@ func test_materializes_parsed_aggregates_and_constructors() -> Bool:
 		constructor_value(
 			"Some",
 			[int_value(4)],
-			Some(9),
+			None,
 		),
 	):
 		Ok(ParsedCallExpr(callee, args, _)):

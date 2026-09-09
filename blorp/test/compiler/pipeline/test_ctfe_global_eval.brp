@@ -1,7 +1,7 @@
 import:
 	../../../src/compiler/stage_03_parse/parsed_ast:
-		ParsedDecl(UnionParsedDecl),
 		ParsedBinaryOp(ParsedAddOp),
+		ParsedDecl(UnionParsedDecl),
 		ParsedExpr(ParsedIntLiteralExpr),
 		ParsedFunctionDecl,
 		ParsedIdentifier,
@@ -24,16 +24,33 @@ import:
 		TypedFunctionInfo,
 		TypedGlobalVarInfo,
 		TypedProgram,
+	../../../src/compiler/stage_06_typecheck/graph/definition_identity: func_callable_key
+	../../../src/compiler/stage_06_typecheck/graph/definition_index:
+		DefinitionTable,
+		definition_index_definition_table,
+		definition_index_empty,
+		definition_index_initial_seed,
+		definition_index_insert_func_callable_id,
+		definition_index_next_def_id,
+	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
+		callable_id_from_definition_table,
 	../../../src/compiler/stage_06_typecheck/infer:
-		CallableOrigin(CallableLocal),
 		ExprTypeOrigin(SynthesizedOrigin),
 		ResolvedCallInfo,
-		ResolvedCallTarget(ResolvedDirectCall),
-		TypedExpr(TypedBinaryExpr, TypedCallExpr, TypedIntLiteralExpr, TypedMatchExpr, TypedNameExpr),
+		ResolvedCallTarget(ResolvedCompilerBuiltinCall, ResolvedGraphCallableCall),
+		ResolvedGraphCallableCategory(ResolvedSourceFunctionCall),
+		TypedExpr(
+			TypedBinaryExpr,
+			TypedCallExpr,
+			TypedIntLiteralExpr,
+			TypedMatchExpr,
+			TypedNameExpr,
+		),
 		TypedExprInfo,
 		TypedMatchCase,
 		TypedPattern(TypedNamePattern),
 	../../../src/compiler/stage_06_typecheck/type_system/env:
+		ENV_EMPTY,
 		Purity(Pure),
 		ResourceArgPolicy(RejectResourceArgs),
 	../../../src/compiler/stage_06_typecheck/type_system/refinement: UNREFINED_BINDING
@@ -47,6 +64,7 @@ import:
 		ctfe_context_empty,
 		ctfe_context_from_program,
 		ctfe_context_module_global_value,
+		ctfe_imported_program_set,
 	../../../src/compiler/stage_07_ctfe/env: CTFE_ENV_EMPTY, ctfe_lookup_value
 	../../../src/compiler/stage_07_ctfe/eval:
 		CtfeEvalError(CtfeEvalEnvError, CtfeEvalInModule),
@@ -102,8 +120,18 @@ private pure func ctfe_test_module_id(context: CtfeContext, module_path: String)
 
 
 private pure func ctfe_test_context() -> CtfeContext:
-	domain = new_ctfe_test_domain()
-	ctfe_context_empty(domain[0], domain[1])
+	match ctfe_global_definition_fixture():
+		Some(fixture):
+			ctfe_context_empty(fixture.definitions, fixture.target)
+		None:
+			domain = new_ctfe_test_domain()
+			definitions = definition_index_definition_table(
+				definition_index_empty(
+					definition_index_initial_seed(ENV_EMPTY),
+					domain[0],
+				),
+			)
+			ctfe_context_empty(definitions, domain[1])
 
 
 private pure func ctfe_test_context_from_program(
@@ -111,12 +139,16 @@ private pure func ctfe_test_context_from_program(
 	program: TypedProgram,
 	imported_programs: List[CtfeImportedProgram],
 ) -> CtfeContext:
+	imported_program_set = ctfe_imported_program_set(
+		base_context.definition_table,
+		imported_programs,
+	)
 	ctfe_context_from_program(
-		base_context.module_table,
+		base_context.definition_table,
 		base_context.target_module_id,
 		program,
 		[],
-		imported_programs,
+		imported_program_set,
 	).get_or(base_context)
 
 
@@ -125,7 +157,11 @@ private pure func ctfe_test_module_global_value(
 	module_path: String,
 	name: String,
 ) -> Option[CtfeValue]:
-	ctfe_context_module_global_value(context, ctfe_test_module_id(context, module_path), name)
+	ctfe_context_module_global_value(
+		context,
+		ctfe_test_module_id(context, module_path),
+		name,
+	)
 
 
 private pure func ctfe_test_imported_program(
@@ -135,7 +171,6 @@ private pure func ctfe_test_imported_program(
 	import_bindings: List[CtfeImportBinding],
 ) -> CtfeImportedProgram:
 	complete_ctfe_imported_program(
-		context.module_table,
 		ctfe_test_module_id(context, module_path),
 		decls,
 		import_bindings,
@@ -150,6 +185,80 @@ pure func fixture_source_span() -> SourceSpan:
 	src: SourceFile = fixture_source_file()
 	cursor: Cursor = source_cursor_at(src, 0)
 	source_span(src, cursor, cursor)
+
+
+private record CtfeGlobalDefinitionFixture {
+	table: ModuleTable,
+	definitions: DefinitionTable,
+	target: ModuleId,
+	read_first_id: Int,
+	read_self_id: Int,
+	read_later_id: Int,
+	left_reader_id: Int,
+	right_reader_id: Int
+}
+
+
+private pure func ctfe_global_definition_fixture() -> Option[CtfeGlobalDefinitionFixture]:
+	domain = new_ctfe_test_domain()
+	var index = definition_index_empty(definition_index_initial_seed(ENV_EMPTY), domain[0])
+	var ids: List[Int] = []
+	specs = [
+		("dep", "read_first"),
+		("self/dep", "read_self"),
+		("later/dep", "read_later"),
+		("left", "read_value"),
+		("right", "read_value"),
+	]
+
+	for (module_path, name) in specs:
+		match module_table_find_id_by_canonical_path(domain[0], module_path):
+			Some(module_id):
+				definition_id = definition_index_next_def_id(index)
+
+				match definition_index_insert_func_callable_id(
+					index,
+					domain[0],
+					func_callable_key(module_id, name, fixture_source_span()),
+					definition_id,
+				):
+					Ok(updated):
+						index = updated
+						ids = ids.append(definition_id)
+					Err(_):
+						void
+			None:
+				void
+
+	read_first_id ?= ids.get(0)
+	read_self_id ?= ids.get(1)
+	read_later_id ?= ids.get(2)
+	left_reader_id ?= ids.get(3)
+	right_reader_id ?= ids.get(4)
+	Some({
+		table = domain[0],
+		definitions = definition_index_definition_table(index),
+		target = domain[1],
+		read_first_id = read_first_id,
+		read_self_id = read_self_id,
+		read_later_id = read_later_id,
+		left_reader_id = left_reader_id,
+		right_reader_id = right_reader_id,
+	})
+
+
+private pure func ctfe_test_definition_table() -> DefinitionTable:
+	match ctfe_global_definition_fixture():
+		Some(fixture):
+			fixture.definitions
+		None:
+			domain = new_ctfe_test_domain()
+			definition_index_definition_table(
+				definition_index_empty(
+					definition_index_initial_seed(ENV_EMPTY),
+					domain[0],
+				),
+			)
 
 
 pure func ident(text: String) -> ParsedIdentifier:
@@ -238,11 +347,20 @@ pure func typed_pure_function_decl(callable_id: Int, name: String, body: TypedEx
 
 
 pure func local_pure_call(callable_id: Int, name: String) -> TypedExpr:
+	resolved_target = match callable_id_from_definition_table(
+		ctfe_test_definition_table(),
+		callable_id,
+	):
+		Some(resolved_id):
+			ResolvedGraphCallableCall(resolved_id, ResolvedSourceFunctionCall)
+		None:
+			ResolvedCompilerBuiltinCall(-1)
+
 	call: ResolvedCallInfo = {
 		callee_name = name,
 		source_name = name,
 		purity = Pure,
-		target = ResolvedDirectCall(callable_id, CallableLocal),
+		target = resolved_target,
 		trait_identity = None,
 		bound_type_params = [],
 		debug_only = False,
@@ -463,9 +581,11 @@ func test_eval_imported_program_global_envs_attach_to_context() -> Bool:
 			False
 
 
-func test_eval_imported_global_pure_call_reads_prior_global() -> Bool:
-	read_first_id: Int = 701
-	base_context = ctfe_test_context()
+private pure func eval_imported_global_pure_call_reads_prior_global(
+	fixture: CtfeGlobalDefinitionFixture,
+) -> Bool:
+	read_first_id = fixture.read_first_id
+	base_context = ctfe_context_empty(fixture.definitions, fixture.target)
 	imported_programs: List[CtfeImportedProgram] = [
 		ctfe_test_imported_program(
 			base_context,
@@ -499,6 +619,14 @@ func test_eval_imported_global_pure_call_reads_prior_global() -> Bool:
 			False
 
 
+func test_eval_imported_global_pure_call_reads_prior_global() -> Bool:
+	match ctfe_global_definition_fixture():
+		Some(fixture):
+			eval_imported_global_pure_call_reads_prior_global(fixture)
+		None:
+			False
+
+
 func test_eval_imported_global_error_names_module() -> Bool:
 	base_context = ctfe_test_context()
 	imported_programs: List[CtfeImportedProgram] = [
@@ -520,9 +648,11 @@ func test_eval_imported_global_error_names_module() -> Bool:
 	)
 
 
-func test_eval_imported_global_pure_call_rejects_self_reference() -> Bool:
-	read_self_id: Int = 702
-	base_context = ctfe_test_context()
+private pure func eval_imported_global_pure_call_rejects_self_reference(
+	fixture: CtfeGlobalDefinitionFixture,
+) -> Bool:
+	read_self_id = fixture.read_self_id
+	base_context = ctfe_context_empty(fixture.definitions, fixture.target)
 	imported_programs: List[CtfeImportedProgram] = [
 		ctfe_test_imported_program(
 			base_context,
@@ -549,9 +679,19 @@ func test_eval_imported_global_pure_call_rejects_self_reference() -> Bool:
 	)
 
 
-func test_eval_imported_global_pure_call_rejects_later_reference() -> Bool:
-	read_later_id: Int = 703
-	base_context = ctfe_test_context()
+func test_eval_imported_global_pure_call_rejects_self_reference() -> Bool:
+	match ctfe_global_definition_fixture():
+		Some(fixture):
+			eval_imported_global_pure_call_rejects_self_reference(fixture)
+		None:
+			False
+
+
+private pure func eval_imported_global_pure_call_rejects_later_reference(
+	fixture: CtfeGlobalDefinitionFixture,
+) -> Bool:
+	read_later_id = fixture.read_later_id
+	base_context = ctfe_context_empty(fixture.definitions, fixture.target)
 	imported_programs: List[CtfeImportedProgram] = [
 		ctfe_test_imported_program(
 			base_context,
@@ -579,10 +719,20 @@ func test_eval_imported_global_pure_call_rejects_later_reference() -> Bool:
 	)
 
 
-func test_eval_imported_global_pure_calls_keep_module_environments_isolated() -> Bool:
-	left_reader_id: Int = 704
-	right_reader_id: Int = 705
-	base_context = ctfe_test_context()
+func test_eval_imported_global_pure_call_rejects_later_reference() -> Bool:
+	match ctfe_global_definition_fixture():
+		Some(fixture):
+			eval_imported_global_pure_call_rejects_later_reference(fixture)
+		None:
+			False
+
+
+private pure func eval_imported_global_pure_calls_keep_module_environments_isolated(
+	fixture: CtfeGlobalDefinitionFixture,
+) -> Bool:
+	left_reader_id = fixture.left_reader_id
+	right_reader_id = fixture.right_reader_id
+	base_context = ctfe_context_empty(fixture.definitions, fixture.target)
 	imported_programs: List[CtfeImportedProgram] = [
 		ctfe_test_imported_program(
 			base_context,
@@ -635,6 +785,14 @@ func test_eval_imported_global_pure_calls_keep_module_environments_isolated() ->
 			False
 
 
+func test_eval_imported_global_pure_calls_keep_module_environments_isolated() -> Bool:
+	match ctfe_global_definition_fixture():
+		Some(fixture):
+			eval_imported_global_pure_calls_keep_module_environments_isolated(fixture)
+		None:
+			False
+
+
 func test_eval_imported_program_globals_use_dependency_bindings() -> Bool:
 	base_context = ctfe_test_context()
 	imported_programs: List[CtfeImportedProgram] = [
@@ -668,18 +826,11 @@ func test_eval_imported_program_globals_use_dependency_bindings() -> Bool:
 
 private pure func dependency_name_binding_value(target: TypedProgram) -> Option[CtfeValue]:
 	base_context = ctfe_test_context()
-	dependency = ctfe_test_imported_program(
-		base_context,
-		"dep",
-		[
-			typed_global_decl(
+	dependency = ctfe_test_imported_program(base_context, "dep", [typed_global_decl(
 				"VALUE",
 				False,
 				name_binding_match_expr("Ready", int_expr("1")),
-			),
-		],
-		[],
-	)
+			)], [])
 	context = ctfe_test_context_from_program(base_context, target, [dependency])
 
 	match ctfe_eval_imported_program_global_envs(context, [dependency]):
@@ -874,8 +1025,10 @@ func test_rewrite_program_globals_rejects_runtime_initialized_selective_import()
 			False
 
 
-func test_evaluate_program_globals_builds_context_and_rewrites_target() -> Bool:
-	base_context = ctfe_test_context()
+private pure func evaluate_program_globals_builds_context_and_rewrites_target(
+	fixture: CtfeGlobalDefinitionFixture,
+) -> Bool:
+	base_context = ctfe_context_empty(fixture.definitions, fixture.target)
 	imported_programs: List[CtfeImportedProgram] = [
 		ctfe_test_imported_program(
 			base_context,
@@ -890,10 +1043,10 @@ func test_evaluate_program_globals_builds_context_and_rewrites_target() -> Bool:
 				add_expr(name_expr("OFFSET"), int_expr("2")),
 			)])
 	result = ctfe_evaluate_program_globals(
-		base_context.module_table,
-		base_context.target_module_id,
+		fixture.definitions,
+		fixture.target,
 		program,
-		imported_programs,
+		ctfe_imported_program_set(fixture.definitions, imported_programs),
 		[selective_import_binding(base_context, "OFFSET", "dep", "OFFSET")],
 	)
 
@@ -909,6 +1062,14 @@ func test_evaluate_program_globals_builds_context_and_rewrites_target() -> Bool:
 				_:
 					False
 		Err(_):
+			False
+
+
+func test_evaluate_program_globals_builds_context_and_rewrites_target() -> Bool:
+	match ctfe_global_definition_fixture():
+		Some(fixture):
+			evaluate_program_globals_builds_context_and_rewrites_target(fixture)
+		None:
 			False
 
 
