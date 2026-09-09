@@ -1,0 +1,505 @@
+-- Deterministic workload for isolated backend match-projection measurement.
+import:
+	../../src/compiler/stage_09_core/ir:
+		CoreDecl(FunctionDecl, UnionDecl),
+		CoreExpr(LiteralExpr, SemanticMatchExpr, SeqExpr, VarExpr),
+		CoreFunction,
+		CoreFunctionKind(UserFunction),
+		CoreLiteral(IntLiteral),
+		CoreMatchBindingMode(MatchBorrowBindingMode),
+		CoreProgram,
+		CoreReleasePolicy(NoReleasePolicy),
+		CoreSemanticMatchAccessor(RootSemanticMatchAccessor, VariantFieldSemanticMatchAccessor),
+		CoreSemanticMatchBinding,
+		CoreSemanticMatchTree(SemanticConstructorMatch, SemanticMatchLeaf),
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(NamedType, TypeParameterType),
+		CoreUnionDecl,
+		CoreUnionPayloadStorage(ErasedUnionPayloadStorage),
+		CoreUnionVariant,
+		CoreVar,
+		core_program_to_json,
+	../../src/compiler/stage_09_core/match_projection:
+		MatchProjectionIndexedResult,
+		project_backend_matches_indexed,
+	bytes: get as get_byte
+
+
+private MATCH_PROJECTION_TARGET_UNION: String = "MatchProjectionTarget"
+
+private MATCH_PROJECTION_DEF_ID_BASE: Int = 810000
+
+
+record CompilerMatchProjectionProfileConfig {
+	iterations: Int,
+	declarations: Int,
+	matches: Int,
+	variants_per_union: Int,
+	accessor_depth: Int,
+	generic_arguments: Int,
+	target_union_index: Int,
+	target_variant_index: Int
+}
+
+
+record MatchProjectionProfileObservation {
+	declaration_index_entries: Int,
+	variant_name_index_entries: Int,
+	variant_id_index_entries: Int,
+	modeled_union_lookup_requests: Int,
+	structural_union_linear_candidates_visited: Int,
+	modeled_variant_lookup_requests: Int,
+	structural_variant_linear_candidates_visited: Int,
+	projected_match_nodes: Int,
+	projected_accessor_nodes: Int,
+	semantic_checksum: Int
+}
+
+
+record CompilerMatchProjectionProfileResult {
+	observation: MatchProjectionProfileObservation,
+	workload_valid: Bool
+}
+
+
+record CompilerMatchProjectionProjectResult {
+	program: CoreProgram,
+	declaration_index_entries: Int,
+	variant_name_index_entries: Int,
+	variant_id_index_entries: Int,
+	workload_valid: Bool
+}
+
+
+private record ModeledMatchProjectionLookupRequests {
+	modeled_union_lookup_requests: Int,
+	modeled_variant_lookup_requests: Int
+}
+
+
+private pure func positive_value(value: Int, default: Int) -> Int:
+	if value > 0:
+		value
+	else:
+		default
+
+
+private pure func bounded_index(value: Int, count: Int) -> Int:
+	if value >= 0 and value < count:
+		value
+	else:
+		count - 1
+
+
+private pure func normalized_config(
+	config: CompilerMatchProjectionProfileConfig,
+) -> CompilerMatchProjectionProfileConfig:
+	declarations: Int = positive_value(config.declarations, 1)
+	variants_per_union: Int = positive_value(config.variants_per_union, 1)
+	{
+		iterations = positive_value(config.iterations, 1),
+		declarations = declarations,
+		matches = positive_value(config.matches, 1),
+		variants_per_union = variants_per_union,
+		accessor_depth = positive_value(config.accessor_depth, 1),
+		generic_arguments = positive_value(config.generic_arguments, 1),
+		target_union_index = bounded_index(config.target_union_index, declarations),
+		target_variant_index = bounded_index(config.target_variant_index, variants_per_union)
+	}
+
+
+private pure func int_type() -> CoreType:
+	NamedType("Int", [])
+
+
+private pure func type_param_name(index: Int) -> String:
+	"T${index}"
+
+
+private pure func generic_type_params(count: Int) -> List[String]:
+	var params: List[String] = []
+	var index: Int = 0
+
+	while index < count:
+		params = params.append(type_param_name(index))
+		index += 1
+
+	params
+
+
+private pure func generic_type_arguments(count: Int) -> List[CoreType]:
+	var args: List[CoreType] = []
+	var index: Int = 0
+
+	while index < count:
+		args = args.append(int_type())
+		index += 1
+
+	args
+
+
+private pure func generic_type_parameters_as_args(count: Int) -> List[CoreType]:
+	var args: List[CoreType] = []
+	var index: Int = 0
+
+	while index < count:
+		args = args.append(TypeParameterType(type_param_name(index)))
+		index += 1
+
+	args
+
+
+private pure func benchmark_var(name: String, def_id: Option[Int]) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = def_id
+	}
+
+
+private pure func int_literal(value: Int) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), int_type(), SyntheticSourceLoc)
+
+
+private pure func variant_name(index: Int) -> String:
+	"Projected${index}"
+
+
+private pure func union_name(index: Int) -> String:
+	if index == 0:
+		MATCH_PROJECTION_TARGET_UNION
+	else:
+		"UnrelatedMatchProjectionUnion${index}"
+
+
+private pure func target_type(config: CompilerMatchProjectionProfileConfig) -> CoreType:
+	NamedType(
+		union_name(config.target_union_index),
+		generic_type_arguments(config.generic_arguments),
+	)
+
+
+private pure func benchmark_variant(
+	config: CompilerMatchProjectionProfileConfig,
+	union_index: Int,
+	variant_index: Int,
+) -> CoreUnionVariant:
+	{
+		name = variant_name(variant_index),
+		c_name = "match_projection_${union_index}_${variant_index}",
+		tag_c_name = "MATCH_PROJECTION_${union_index}_${variant_index}",
+		tag = variant_index,
+		fields = [
+			{
+				typ = NamedType(
+					union_name(union_index),
+					generic_type_parameters_as_args(config.generic_arguments),
+				),
+				release_policy = NoReleasePolicy
+			},
+		],
+		def_id = Some(MATCH_PROJECTION_DEF_ID_BASE + union_index * 1000 + variant_index)
+	}
+
+
+private pure func benchmark_union_decl(
+	config: CompilerMatchProjectionProfileConfig,
+	union_index: Int,
+) -> CoreDecl:
+	var variants: List[CoreUnionVariant] = []
+	var variant_index: Int = 0
+
+	while variant_index < config.variants_per_union:
+		variants = variants.append(benchmark_variant(config, union_index, variant_index))
+		variant_index += 1
+
+	UnionDecl({
+		abi_type = None,
+		name = union_name(union_index),
+		type_params = generic_type_params(config.generic_arguments),
+		payload_storage = ErasedUnionPayloadStorage,
+		variants = variants,
+		loc = SyntheticSourceLoc,
+	})
+
+
+private pure func nested_accessor(depth: Int, variant_index: Int) -> CoreSemanticMatchAccessor:
+	var accessor: CoreSemanticMatchAccessor = RootSemanticMatchAccessor
+	var index: Int = 0
+
+	while index < depth:
+		accessor = VariantFieldSemanticMatchAccessor(accessor, variant_name(variant_index), 0)
+		index += 1
+
+	accessor
+
+
+private pure func match_binding(
+	config: CompilerMatchProjectionProfileConfig,
+	match_index: Int,
+) -> CoreSemanticMatchBinding:
+	{
+		variable = benchmark_var("payload_${match_index}", None),
+		accessor = nested_accessor(config.accessor_depth, config.target_variant_index),
+		mode = MatchBorrowBindingMode
+	}
+
+
+private pure func semantic_match_expr(
+	config: CompilerMatchProjectionProfileConfig,
+	index: Int,
+) -> CoreExpr:
+	SemanticMatchExpr(
+		VarExpr(
+			benchmark_var("value_${index}", None),
+			target_type(config),
+			SyntheticSourceLoc,
+		),
+		SemanticConstructorMatch(
+			RootSemanticMatchAccessor,
+			[
+				{
+					constructor = variant_name(config.target_variant_index),
+					body = SemanticMatchLeaf([match_binding(config, index)], int_literal(index))
+				},
+			],
+			Some(SemanticMatchLeaf([], int_literal(index + 1))),
+		),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+
+private pure func benchmark_body(config: CompilerMatchProjectionProfileConfig) -> CoreExpr:
+	var body: CoreExpr = int_literal(0)
+	var index: Int = 0
+
+	while index < config.matches:
+		body = SeqExpr(
+			body,
+			semantic_match_expr(config, index),
+		)
+		index += 1
+
+	body
+
+
+private pure func benchmark_function(config: CompilerMatchProjectionProfileConfig) -> CoreFunction:
+	{
+		name = "match_projection_profile_entry",
+		source_module = Some("bench/match_projection_profile"),
+		type_params = [],
+		params = [],
+		return_type = int_type(),
+		body = Some(benchmark_body(config)),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = MATCH_PROJECTION_DEF_ID_BASE - 1,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func compiler_match_projection_profile_program(
+	config: CompilerMatchProjectionProfileConfig,
+) -> CoreProgram:
+	normalized: CompilerMatchProjectionProfileConfig = normalized_config(config)
+	var decls: List[CoreDecl] = []
+	var union_index: Int = 0
+
+	while union_index < normalized.declarations:
+		decls = decls.append(benchmark_union_decl(normalized, union_index))
+		union_index += 1
+
+	{
+		decls = decls.append(FunctionDecl(benchmark_function(normalized))),
+		foreign_includes = []
+	}
+
+
+pure func compiler_match_projection_profile_project(
+	program: CoreProgram,
+	iterations: Int,
+) -> CompilerMatchProjectionProjectResult:
+	normalized_iterations: Int = positive_value(iterations, 1)
+	var result: MatchProjectionIndexedResult = project_backend_matches_indexed(program)
+	var projected: CoreProgram = result.program
+	var declaration_index_entries: Int = result.declaration_index_entries
+	var variant_name_index_entries: Int = result.variant_name_index_entries
+	var variant_id_index_entries: Int = result.variant_id_index_entries
+	var workload_valid: Bool = result.workload_valid
+	var index: Int = 1
+
+	while index < normalized_iterations:
+		result = project_backend_matches_indexed(program)
+		projected = result.program
+		declaration_index_entries += result.declaration_index_entries
+		variant_name_index_entries += result.variant_name_index_entries
+		variant_id_index_entries += result.variant_id_index_entries
+		workload_valid = workload_valid and result.workload_valid
+		index += 1
+
+	{
+		program = projected,
+		declaration_index_entries = declaration_index_entries,
+		variant_name_index_entries = variant_name_index_entries,
+		variant_id_index_entries = variant_id_index_entries,
+		workload_valid = workload_valid
+	}
+
+
+private pure func checksum_text(seed: Int, text: String) -> Int:
+	bytes = text.to_bytes()
+	var checksum: Int = seed
+	var index: Int = 0
+
+	while index < bytes.length():
+		checksum = checksum * 131 + get_byte(bytes, index).get_or(0)
+		index += 1
+
+	checksum
+
+
+private pure func add_modeled_lookup_requests(
+	left: ModeledMatchProjectionLookupRequests,
+	right: ModeledMatchProjectionLookupRequests,
+) -> ModeledMatchProjectionLookupRequests:
+	{
+		modeled_union_lookup_requests = left.modeled_union_lookup_requests + right.modeled_union_lookup_requests,
+		modeled_variant_lookup_requests = left.modeled_variant_lookup_requests + right.modeled_variant_lookup_requests
+	}
+
+
+private pure func modeled_accessor_type_lookup_requests(
+	depth: Int,
+) -> ModeledMatchProjectionLookupRequests:
+	{
+		modeled_union_lookup_requests = depth * 2,
+		modeled_variant_lookup_requests = depth
+	}
+
+
+private pure func modeled_lower_accessor_lookup_requests(
+	depth: Int,
+) -> ModeledMatchProjectionLookupRequests:
+	var requests: ModeledMatchProjectionLookupRequests = {
+		modeled_union_lookup_requests = 0,
+		modeled_variant_lookup_requests = 0
+	}
+	var parent_depth: Int = 0
+
+	while parent_depth < depth:
+		requests = add_modeled_lookup_requests(
+			requests,
+			modeled_accessor_type_lookup_requests(parent_depth),
+		)
+		requests = {
+			modeled_union_lookup_requests = requests.modeled_union_lookup_requests + 1,
+			modeled_variant_lookup_requests = requests.modeled_variant_lookup_requests
+		}
+		parent_depth += 1
+
+	requests
+
+
+private pure func modeled_match_lookup_requests_per_case(
+	accessor_depth: Int,
+) -> ModeledMatchProjectionLookupRequests:
+	-- A root constructor test performs one union-backed variant lookup. Each
+	-- VariantField accessor type re-resolution performs union+variant lookup
+	-- over every parent level, and lowering repeats parent type re-resolution
+	-- before choosing erased union payload access.
+	-- S(d) = d * (2 union, 1 variant). L(d) = sum(S(parent) + 1
+	-- union layout lookup). Total per case = root constructor + S(d) + L(d).
+	add_modeled_lookup_requests(
+		{
+			modeled_union_lookup_requests = 1,
+			modeled_variant_lookup_requests = 1
+		},
+		add_modeled_lookup_requests(
+			modeled_accessor_type_lookup_requests(accessor_depth),
+			modeled_lower_accessor_lookup_requests(accessor_depth),
+		),
+	)
+
+
+private pure func modeled_lookup_requests(
+	config: CompilerMatchProjectionProfileConfig,
+) -> ModeledMatchProjectionLookupRequests:
+	per_case: ModeledMatchProjectionLookupRequests = modeled_match_lookup_requests_per_case(
+		config.accessor_depth,
+	)
+	multiplier: Int = config.matches * config.iterations
+	{
+		modeled_union_lookup_requests = per_case.modeled_union_lookup_requests * multiplier,
+		modeled_variant_lookup_requests = per_case.modeled_variant_lookup_requests * multiplier
+	}
+
+
+private pure func compiler_match_projection_profile_formula_small_depths_hold() -> Bool:
+	depth_zero: ModeledMatchProjectionLookupRequests = modeled_match_lookup_requests_per_case(0)
+	depth_one: ModeledMatchProjectionLookupRequests = modeled_match_lookup_requests_per_case(1)
+	depth_two: ModeledMatchProjectionLookupRequests = modeled_match_lookup_requests_per_case(2)
+
+	(
+		depth_zero.modeled_union_lookup_requests == 1
+		and depth_zero.modeled_variant_lookup_requests == 1
+		and depth_one.modeled_union_lookup_requests == 4
+		and depth_one.modeled_variant_lookup_requests == 2
+		and depth_two.modeled_union_lookup_requests == 9
+		and depth_two.modeled_variant_lookup_requests == 4
+	)
+
+
+private pure func compiler_match_projection_profile_formula_shape_checks_hold() -> Bool:
+	config: CompilerMatchProjectionProfileConfig = {
+		iterations = 3,
+		declarations = 5,
+		matches = 2,
+		variants_per_union = 4,
+		accessor_depth = 2,
+		generic_arguments = 1,
+		target_union_index = 4,
+		target_variant_index = 3
+	}
+	normalized: CompilerMatchProjectionProfileConfig = normalized_config(config)
+	requests: ModeledMatchProjectionLookupRequests = modeled_lookup_requests(normalized)
+
+	requests.modeled_union_lookup_requests == 54 and requests.modeled_variant_lookup_requests == 24
+
+
+pure func compiler_match_projection_profile_observation(
+	config: CompilerMatchProjectionProfileConfig,
+	projected: CompilerMatchProjectionProjectResult,
+) -> CompilerMatchProjectionProfileResult:
+	normalized: CompilerMatchProjectionProfileConfig = normalized_config(config)
+	modeled_requests: ModeledMatchProjectionLookupRequests = modeled_lookup_requests(normalized)
+	observation: MatchProjectionProfileObservation = {
+		declaration_index_entries = projected.declaration_index_entries,
+		variant_name_index_entries = projected.variant_name_index_entries,
+		variant_id_index_entries = projected.variant_id_index_entries,
+		modeled_union_lookup_requests = modeled_requests.modeled_union_lookup_requests,
+		structural_union_linear_candidates_visited = 0,
+		modeled_variant_lookup_requests = modeled_requests.modeled_variant_lookup_requests,
+		structural_variant_linear_candidates_visited = 0,
+		projected_match_nodes = normalized.matches * normalized.iterations,
+		projected_accessor_nodes = normalized.matches * normalized.accessor_depth * normalized.iterations,
+		semantic_checksum = checksum_text(17, core_program_to_json(projected.program).to_string())
+	}
+
+	{
+		observation = observation,
+		workload_valid = (
+			projected.workload_valid
+			and observation.declaration_index_entries == normalized.declarations * normalized.iterations
+			and observation.variant_name_index_entries == normalized.declarations * normalized.variants_per_union * normalized.iterations
+			and observation.variant_id_index_entries == observation.variant_name_index_entries
+			and observation.projected_match_nodes == normalized.matches * normalized.iterations
+			and observation.projected_accessor_nodes == normalized.matches * normalized.accessor_depth * normalized.iterations
+			and observation.modeled_union_lookup_requests == modeled_requests.modeled_union_lookup_requests
+			and observation.modeled_variant_lookup_requests == modeled_requests.modeled_variant_lookup_requests
+			and observation.structural_union_linear_candidates_visited == 0
+			and observation.structural_variant_linear_candidates_visited == 0
+			and compiler_match_projection_profile_formula_small_depths_hold()
+			and compiler_match_projection_profile_formula_shape_checks_hold()
+		)
+	}

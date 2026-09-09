@@ -157,35 +157,182 @@ union LoweredLengthFallback:
 	LoweredLengthFallbackAbsent
 
 
-private pure func find_union_decl(program: CoreProgram, name: String) -> Option[CoreUnionDecl]:
-	var result: Option[CoreUnionDecl] = None
+private record MatchProjectionUnionLayout {
+	declaration: CoreUnionDecl,
+	variants_by_name: Dict[String, CoreUnionVariant],
+	variants_by_def_id: Dict[Int, CoreUnionVariant]
+}
+
+
+record MatchProjectionIndexedResult {
+	program: CoreProgram,
+	declaration_index_entries: Int,
+	variant_name_index_entries: Int,
+	variant_id_index_entries: Int,
+	workload_valid: Bool
+}
+
+
+private record MatchProjectionLayoutCounters {
+	declaration_index_entries: Int,
+	variant_name_index_entries: Int,
+	variant_id_index_entries: Int
+}
+
+
+private record MatchProjectionUnionLayoutBuild {
+	layout: MatchProjectionUnionLayout,
+	counters: MatchProjectionLayoutCounters,
+	valid: Bool
+}
+
+
+private record MatchProjectionLayoutState {
+	unions_by_name: Dict[String, MatchProjectionUnionLayout],
+	counters: MatchProjectionLayoutCounters,
+	valid: Bool
+}
+
+
+private record MatchProjectionLayout {
+	specialize: CoreSpecializeLayout,
+	unions_by_name: Dict[String, MatchProjectionUnionLayout],
+	index_counters: MatchProjectionLayoutCounters,
+	valid: Bool
+}
+
+
+private pure func build_union_layout(union_decl: CoreUnionDecl) -> MatchProjectionUnionLayoutBuild:
+	var variants_by_name: Dict[String, CoreUnionVariant] = {}
+	var variants_by_def_id: Dict[Int, CoreUnionVariant] = {}
+	var variant_name_entries: Int = 0
+	var variant_id_entries: Int = 0
+	var valid: Bool = True
+
+	for variant in union_decl.variants:
+		if variants_by_name.contains(variant.name):
+			valid = False
+		else:
+			variants_by_name = variants_by_name.set(variant.name, variant)
+			variant_name_entries += 1
+
+		match variant.def_id:
+			Some(def_id):
+				if variants_by_def_id.contains(def_id):
+					valid = False
+				else:
+					variants_by_def_id = variants_by_def_id.set(def_id, variant)
+					variant_id_entries += 1
+			None:
+				void
+
+	{
+		layout = {
+			declaration = union_decl,
+			variants_by_name = variants_by_name,
+			variants_by_def_id = variants_by_def_id
+		},
+		counters = {
+			declaration_index_entries = 1,
+			variant_name_index_entries = variant_name_entries,
+			variant_id_index_entries = variant_id_entries
+		},
+		valid = valid
+	}
+
+
+private pure func add_union_layout(
+	state: MatchProjectionLayoutState,
+	union_decl: CoreUnionDecl,
+) -> MatchProjectionLayoutState:
+	if state.unions_by_name.contains(union_decl.name):
+		{ state | valid = False }
+	else:
+		built: MatchProjectionUnionLayoutBuild = build_union_layout(union_decl)
+		{
+			unions_by_name = state.unions_by_name.set(union_decl.name, built.layout),
+			counters = {
+				declaration_index_entries = state.counters.declaration_index_entries + built.counters.declaration_index_entries,
+				variant_name_index_entries = state.counters.variant_name_index_entries + built.counters.variant_name_index_entries,
+				variant_id_index_entries = state.counters.variant_id_index_entries + built.counters.variant_id_index_entries
+			},
+			valid = state.valid and built.valid
+		}
+
+
+private pure func build_match_projection_layout(program: CoreProgram) -> MatchProjectionLayout:
+	var state: MatchProjectionLayoutState = {
+		unions_by_name = {},
+		counters = {
+			declaration_index_entries = 0,
+			variant_name_index_entries = 0,
+			variant_id_index_entries = 0
+		},
+		valid = True
+	}
 
 	for decl in program.decls:
 		match decl:
 			UnionDecl(union_decl):
-				if union_decl.name == name:
-					result = Some(union_decl)
-					break
+				state = add_union_layout(state, union_decl)
 			_:
 				void
 
-	result
+	{
+		specialize = build_specialize_layout(program),
+		unions_by_name = state.unions_by_name,
+		index_counters = state.counters,
+		valid = state.valid
+	}
 
 
-private pure func find_union_variant(
-	program: CoreProgram,
+private pure func match_projection_union(
+	layout: MatchProjectionLayout,
 	type_name: String,
-	constructor: String,
+) -> Option[CoreUnionDecl]:
+	match layout.unions_by_name.get(type_name):
+		Some(union_layout):
+			Some(union_layout.declaration)
+		None:
+			None
+
+
+private pure func match_projection_variant(
+	layout: MatchProjectionLayout,
+	type_name: String,
+	constructor_name: String,
+	constructor_def_id: Option[Int],
 ) -> Option[CoreUnionVariant]:
-	union_decl ?= find_union_decl(program, type_name)
-	var result: Option[CoreUnionVariant] = None
+	union_layout ?= layout.unions_by_name.get(type_name)
 
-	for variant in union_decl.variants:
-		if variant.name == constructor:
-			result = Some(variant)
-			break
+	if layout.valid:
+		match constructor_def_id:
+			Some(def_id):
+				match union_layout.variants_by_def_id.get(def_id):
+					Some(variant):
+						if variant.name == constructor_name:
+							Some(variant)
+						else:
+							None
+					None:
+						None
+			None:
+				union_layout.variants_by_name.get(constructor_name)
+	else:
+		variant ?= union_layout.variants_by_name.get(constructor_name)
 
-	result
+		match constructor_def_id:
+			Some(def_id):
+				match variant.def_id:
+					Some(variant_def_id):
+						if variant_def_id == def_id:
+							Some(variant)
+						else:
+							None
+					None:
+						None
+			None:
+				Some(variant)
 
 
 private pure func find_enum_variant(
@@ -221,36 +368,37 @@ private pure func constructor_variable_matches(variable: CoreVar, def_id: Option
 
 
 private pure func singleton_constructor_value(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	variable: CoreVar,
 	typ: CoreType,
 ) -> Bool:
-	match resolve_specialize_type(layout, typ):
+	match resolve_specialize_type(layout.specialize, typ):
 		NamedType("Option", args):
 			if args.length() == 1:
-				match find_union_variant(layout.program, "Option", variable.name):
+				match match_projection_variant(layout, "Option", variable.name, variable.def_id):
 					Some(variant):
-						(
-							variant.fields.is_empty()
-							and constructor_variable_matches(variable, variant.def_id)
+						fields_empty: Bool = variant.fields.is_empty()
+						exact_constructor: Bool = constructor_variable_matches(
+							variable,
+							variant.def_id,
 						)
+						fields_empty and exact_constructor
 					None:
 						False
 			else:
 				False
 		EnumType(type_name):
-			match find_enum_variant(layout.program, type_name, variable.name):
+			match find_enum_variant(layout.specialize.program, type_name, variable.name):
 				Some(variant):
 					constructor_variable_matches(variable, variant.def_id)
 				None:
 					False
 		UnionType(type_name) | NamedType(type_name, _):
-			match find_union_variant(layout.program, type_name, variable.name):
+			match match_projection_variant(layout, type_name, variable.name, variable.def_id):
 				Some(variant):
-					(
-						variant.fields.is_empty()
-						and constructor_variable_matches(variable, variant.def_id)
-					)
+					fields_empty: Bool = variant.fields.is_empty()
+					exact_constructor: Bool = constructor_variable_matches(variable, variant.def_id)
+					fields_empty and exact_constructor
 				None:
 					False
 		_:
@@ -303,19 +451,19 @@ private pure func union_type_substitution(
 
 
 private pure func instantiate_union_variant_field_type(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	type_name: String,
 	args: List[CoreType],
 	constructor: String,
 	field_index: Int,
 ) -> Option[CoreType]:
-	union_decl ?= find_union_decl(layout.program, type_name)
-	variant ?= find_union_variant(layout.program, type_name, constructor)
+	union_decl ?= match_projection_union(layout, type_name)
+	variant ?= match_projection_variant(layout, type_name, constructor, None)
 	field ?= variant.fields.get(field_index)
 
 	Some(
 		resolve_specialize_type(
-			layout,
+			layout.specialize,
 			apply_type_substitution(
 				union_type_substitution(union_decl.type_params, args),
 				field.typ,
@@ -325,12 +473,12 @@ private pure func instantiate_union_variant_field_type(
 
 
 private pure func union_variant_field_type(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	parent_type: CoreType,
 	constructor: String,
 	field_index: Int,
 ) -> Option[CoreType]:
-	match resolve_specialize_type(layout, parent_type):
+	match resolve_specialize_type(layout.specialize, parent_type):
 		NamedType(type_name, args):
 			instantiate_union_variant_field_type(layout, type_name, args, constructor, field_index)
 		UnionType(type_name):
@@ -340,34 +488,34 @@ private pure func union_variant_field_type(
 
 
 private pure func semantic_accessor_type(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	root_type: CoreType,
 	accessor: CoreSemanticMatchAccessor,
 ) -> Option[CoreType]:
 	match accessor:
 		RootSemanticMatchAccessor:
-			Some(resolve_specialize_type(layout, root_type))
+			Some(resolve_specialize_type(layout.specialize, root_type))
 		TupleFieldSemanticMatchAccessor(parent, index):
 			parent_type ?= semantic_accessor_type(layout, root_type, parent)
 
-			match resolve_specialize_type(layout, parent_type):
+			match resolve_specialize_type(layout.specialize, parent_type):
 				TupleType(items):
 					items.get(index)
 				_:
 					None
 		ListElementSemanticMatchAccessor(parent, _):
 			parent_type ?= semantic_accessor_type(layout, root_type, parent)
-			single_named_type_argument(layout, parent_type, "List")
+			single_named_type_argument(layout.specialize, parent_type, "List")
 		ListSpreadSemanticMatchAccessor(parent, _):
 			semantic_accessor_type(layout, root_type, parent)
 		VariantFieldSemanticMatchAccessor(parent, constructor, field_index):
 			parent_type ?= semantic_accessor_type(layout, root_type, parent)
-			resolved_parent: CoreType = resolve_specialize_type(layout, parent_type)
+			resolved_parent: CoreType = resolve_specialize_type(layout.specialize, parent_type)
 
 			match resolved_parent:
 				NamedType("Option", _):
 					if constructor == "Some" and field_index == 0:
-						single_named_type_argument(layout, resolved_parent, "Option")
+						single_named_type_argument(layout.specialize, resolved_parent, "Option")
 					else:
 						None
 				StackResultType(ok_type, error_type) | BoxedResultType(ok_type, error_type):
@@ -386,19 +534,19 @@ private pure func semantic_accessor_type(
 
 
 private pure func lower_generic_variant_accessor(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	parent: CoreAccessor,
 	parent_type: CoreType,
 	constructor: String,
 	field_index: Int,
 ) -> Option[CoreAccessor]:
-	type_name ?= match resolve_specialize_type(layout, parent_type):
+	type_name ?= match resolve_specialize_type(layout.specialize, parent_type):
 		UnionType(name) | NamedType(name, _):
 			Some(name)
 		_:
 			None
 
-	union_decl ?= find_union_decl(layout.program, type_name)
+	union_decl ?= match_projection_union(layout, type_name)
 
 	match union_decl.payload_storage:
 		TypedUnionPayloadStorage:
@@ -408,7 +556,7 @@ private pure func lower_generic_variant_accessor(
 
 
 private pure func lower_accessor(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	root_type: CoreType,
 	accessor: CoreSemanticMatchAccessor,
 ) -> Option[CoreAccessor]:
@@ -428,20 +576,24 @@ private pure func lower_accessor(
 		VariantFieldSemanticMatchAccessor(parent, constructor, field_index):
 			lowered_parent ?= lower_accessor(layout, root_type, parent)
 			parent_type ?= semantic_accessor_type(layout, root_type, parent)
-			resolved_parent: CoreType = resolve_specialize_type(layout, parent_type)
+			resolved_parent: CoreType = resolve_specialize_type(layout.specialize, parent_type)
 
 			match resolved_parent:
 				NamedType("Option", _):
 					if constructor != "Some" or field_index != 0:
 						None
 					else:
-						payload ?= single_named_type_argument(layout, resolved_parent, "Option")
+						payload ?= single_named_type_argument(
+							layout.specialize,
+							resolved_parent,
+							"Option",
+						)
 
 						match stack_option_c_type(payload):
 							Some(_):
 								Some(StackOptionPayloadAccessor(lowered_parent))
 							None:
-								match option_runtime_layout(layout, resolved_parent):
+								match option_runtime_layout(layout.specialize, resolved_parent):
 									Some(NullableManagedOptionLayout):
 										Some(NullableOptionPayloadAccessor(lowered_parent))
 									_:
@@ -495,17 +647,17 @@ private pure func lower_accessor(
 
 
 private pure func constructor_test(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	root_type: CoreType,
 	accessor: CoreSemanticMatchAccessor,
 	constructor: String,
 ) -> Option[CoreConstructorMatchTest]:
 	scrutinee_type ?= semantic_accessor_type(layout, root_type, accessor)
-	resolved_type: CoreType = resolve_specialize_type(layout, scrutinee_type)
+	resolved_type: CoreType = resolve_specialize_type(layout.specialize, scrutinee_type)
 
 	match resolved_type:
 		NamedType("Option", _):
-			payload ?= single_named_type_argument(layout, resolved_type, "Option")
+			payload ?= single_named_type_argument(layout.specialize, resolved_type, "Option")
 
 			match stack_option_c_type(payload):
 				Some(option_c_type):
@@ -516,7 +668,7 @@ private pure func constructor_test(
 					else:
 						None
 				None:
-					match option_runtime_layout(layout, resolved_type):
+					match option_runtime_layout(layout.specialize, resolved_type):
 						Some(NullableManagedOptionLayout):
 							if constructor == "Some":
 								Some(NullableOptionSomeConstructorTest)
@@ -525,7 +677,7 @@ private pure func constructor_test(
 							else:
 								None
 						_:
-							variant ?= find_union_variant(layout.program, "Option", constructor)
+							variant ?= match_projection_variant(layout, "Option", constructor, None)
 							Some(UnionTagConstructorTest(variant.tag_c_name, "Option"))
 		StackResultType(_, _):
 			if constructor == "Ok":
@@ -549,17 +701,17 @@ private pure func constructor_test(
 			else:
 				None
 		EnumType(type_name):
-			variant ?= find_enum_variant(layout.program, type_name, constructor)
+			variant ?= find_enum_variant(layout.specialize.program, type_name, constructor)
 			Some(EnumConstructorTest(variant.c_name))
 		UnionType(type_name) | NamedType(type_name, _):
-			variant ?= find_union_variant(layout.program, type_name, constructor)
+			variant ?= match_projection_variant(layout, type_name, constructor, None)
 			Some(UnionTagConstructorTest(variant.tag_c_name, type_name))
 		_:
 			None
 
 
 private pure func lower_binding(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	root_type: CoreType,
 	binding: CoreSemanticMatchBinding,
 ) -> Option[CoreMatchBinding]:
@@ -581,7 +733,7 @@ private pure func lower_binding(
 
 
 private pure func lower_bindings(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	root_type: CoreType,
 	bindings: List[CoreSemanticMatchBinding],
 ) -> Option[List[CoreMatchBinding]]:
@@ -603,7 +755,7 @@ private pure func lower_bindings(
 
 
 private pure func lower_literal_case(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	root: CoreExpr,
 	result_type: CoreType,
 	loc: CoreSourceLoc,
@@ -633,7 +785,7 @@ private pure func lower_literal_case(
 
 
 private pure func lower_literal_cases(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	root: CoreExpr,
 	result_type: CoreType,
 	loc: CoreSourceLoc,
@@ -657,7 +809,7 @@ private pure func lower_literal_cases(
 
 
 private pure func lower_literal_fallback(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	root: CoreExpr,
 	tree: CoreSemanticMatchTree,
 	result_type: CoreType,
@@ -678,7 +830,7 @@ private pure func lower_literal_fallback(
 
 
 private pure func lower_constructor_literal_match(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	root: CoreExpr,
 	accessor: CoreSemanticMatchAccessor,
 	cases: List[CoreSemanticLiteralMatchCase],
@@ -711,7 +863,7 @@ private pure func lower_constructor_literal_match(
 
 
 private pure func lower_length_branch(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	root: CoreExpr,
 	tree: CoreSemanticMatchTree,
 	result_type: CoreType,
@@ -735,7 +887,7 @@ private pure func lower_length_branch(
 
 
 private pure func lower_length_cases(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	root: CoreExpr,
 	cases: List[CoreSemanticLengthMatchCase],
 	result_type: CoreType,
@@ -762,7 +914,7 @@ private pure func lower_length_cases(
 
 
 private pure func lower_length_geq(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	root: CoreExpr,
 	geq: Option[CoreSemanticLengthMatchGeq],
 	result_type: CoreType,
@@ -780,7 +932,7 @@ private pure func lower_length_geq(
 
 
 private pure func lower_optional_length_branch(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	root: CoreExpr,
 	tree: Option[CoreSemanticMatchTree],
 	result_type: CoreType,
@@ -797,7 +949,7 @@ private pure func lower_optional_length_branch(
 
 
 private pure func lower_constructor_length_match(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	root: CoreExpr,
 	accessor: CoreSemanticMatchAccessor,
 	cases: List[CoreSemanticLengthMatchCase],
@@ -834,7 +986,7 @@ private pure func lower_constructor_length_match(
 
 
 private pure func lower_constructor_body(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	root: CoreExpr,
 	tree: CoreSemanticMatchTree,
 	result_type: CoreType,
@@ -882,7 +1034,7 @@ private pure func lower_constructor_body(
 
 
 private pure func lower_constructor_case(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	root: CoreExpr,
 	accessor: CoreSemanticMatchAccessor,
 	match_case: CoreSemanticConstructorMatchCase,
@@ -917,7 +1069,7 @@ private pure func lower_constructor_case(
 
 
 private pure func lower_constructor_cases(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	root: CoreExpr,
 	accessor: CoreSemanticMatchAccessor,
 	cases: List[CoreSemanticConstructorMatchCase],
@@ -942,7 +1094,7 @@ private pure func lower_constructor_cases(
 
 
 private pure func lower_constructor_fallback(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	root: CoreExpr,
 	fallback: Option[CoreSemanticMatchTree],
 	result_type: CoreType,
@@ -963,7 +1115,7 @@ private pure func lower_constructor_fallback(
 
 
 private pure func lower_constructor_expr(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	root: CoreExpr,
 	accessor: CoreSemanticMatchAccessor,
 	cases: List[CoreSemanticConstructorMatchCase],
@@ -987,7 +1139,7 @@ private pure func lower_constructor_expr(
 
 
 private pure func lower_tree_expr(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	root: CoreExpr,
 	tree: CoreSemanticMatchTree,
 	result_type: CoreType,
@@ -1103,7 +1255,7 @@ private pure func call_without_contract_returns_owned(kind: CoreCallKind) -> Boo
 
 
 private pure func match_scrutinee_needs_release(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	ownership: PerceusEnv,
 	scrutinee: CoreExpr,
 ) -> Bool:
@@ -1115,7 +1267,7 @@ private pure func match_scrutinee_needs_release(
 		_:
 			policy: CoreReleasePolicy = cleanup_release_policy_for_type(
 				resolve_specialize_type(
-					layout,
+					layout.specialize,
 					core_expr_type(scrutinee),
 				),
 			)
@@ -1140,12 +1292,17 @@ private pure func match_scrutinee_needs_release(
 
 
 private pure func match_scrutinee_release_policy(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	ownership: PerceusEnv,
 	scrutinee: CoreExpr,
 ) -> CoreReleasePolicy:
 	if match_scrutinee_needs_release(layout, ownership, scrutinee):
-		cleanup_release_policy_for_type(resolve_specialize_type(layout, core_expr_type(scrutinee)))
+		cleanup_release_policy_for_type(
+			resolve_specialize_type(
+				layout.specialize,
+				core_expr_type(scrutinee),
+			),
+		)
 	else:
 		NoReleasePolicy
 
@@ -1166,7 +1323,7 @@ private pure func apply_root_match_release_policy(
 
 
 private pure func lower_semantic_match(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	ownership: PerceusEnv,
 	owner_def_id: Int,
 	nesting_depth: Int,
@@ -1305,7 +1462,7 @@ private pure func typed_accessor_to_semantic(
 
 
 private pure func reproject_typed_match_binding(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	root_type: CoreType,
 	binding: CoreMatchBinding,
 ) -> CoreMatchBinding:
@@ -1328,7 +1485,7 @@ private pure func reproject_typed_match_binding(
 
 
 private pure func reproject_typed_match_case(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	root_type: CoreType,
 	match_case: CoreConstructorMatchCase,
 ) -> CoreConstructorMatchCase:
@@ -1352,7 +1509,7 @@ private pure func reproject_typed_match_case(
 
 
 private pure func project_current_expr(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	ownership: PerceusEnv,
 	owner_def_id: Int,
 	nesting_depth: Int,
@@ -1399,7 +1556,7 @@ private pure func project_current_expr(
 
 
 private pure func project_logical_expr(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	ownership: PerceusEnv,
 	owner_def_id: Int,
 	nesting_depth: Int,
@@ -1501,7 +1658,7 @@ private pure func project_logical_expr(
 
 
 private pure func project_expr(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	ownership: PerceusEnv,
 	owner_def_id: Int,
 	nesting_depth: Int,
@@ -1538,7 +1695,7 @@ private pure func project_expr(
 
 
 private pure func project_function(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	ownership: PerceusEnv,
 	function_info: CoreFunction,
 ) -> CoreFunction:
@@ -1550,7 +1707,7 @@ private pure func project_function(
 
 
 private pure func project_global(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	ownership: PerceusEnv,
 	global: CoreGlobal,
 ) -> CoreGlobal:
@@ -1558,7 +1715,7 @@ private pure func project_global(
 
 
 private pure func project_decl(
-	layout: CoreSpecializeLayout,
+	layout: MatchProjectionLayout,
 	ownership: PerceusEnv,
 	decl: CoreDecl,
 ) -> CoreDecl:
@@ -1571,7 +1728,26 @@ private pure func project_decl(
 			decl
 
 
-pure func project_backend_matches(program: CoreProgram) -> CoreProgram:
-	layout: CoreSpecializeLayout = build_specialize_layout(program)
+private pure func project_backend_matches_with_layout(
+	program: CoreProgram,
+	layout: MatchProjectionLayout,
+) -> CoreProgram:
 	ownership: PerceusEnv = build_env(program)
 	{ program | decls = program.decls.map(func(decl): project_decl(layout, ownership, decl)) }
+
+
+pure func project_backend_matches_indexed(program: CoreProgram) -> MatchProjectionIndexedResult:
+	layout: MatchProjectionLayout = build_match_projection_layout(program)
+	projected: CoreProgram = project_backend_matches_with_layout(program, layout)
+	{
+		program = projected,
+		declaration_index_entries = layout.index_counters.declaration_index_entries,
+		variant_name_index_entries = layout.index_counters.variant_name_index_entries,
+		variant_id_index_entries = layout.index_counters.variant_id_index_entries,
+		workload_valid = layout.valid
+	}
+
+
+pure func project_backend_matches(program: CoreProgram) -> CoreProgram:
+	layout: MatchProjectionLayout = build_match_projection_layout(program)
+	project_backend_matches_with_layout(program, layout)
