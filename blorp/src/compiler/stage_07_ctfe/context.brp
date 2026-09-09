@@ -1,10 +1,9 @@
 -- Compile-time evaluator context construction and lookup.
 --
--- This is the metadata layer for CTFE. It indexes typed functions,
--- constructor metadata, and module global environments without performing
--- evaluation.
+-- This is the metadata layer for CTFE. It indexes typed functions and module
+-- global environments without performing evaluation. Constructor meaning is
+-- carried by typed nodes and must not be rediscovered from a context catalog.
 import:
-	../stage_03_parse/parsed_ast: ParsedDecl(PrivateParsedDecl, UnionParsedDecl), ParsedUnionDecl
 	../stage_04_modules/module_table:
 		ModuleId,
 		ModuleTable,
@@ -14,23 +13,19 @@ import:
 		module_table_count,
 		module_table_find_id_by_canonical_path,
 		module_tables_are_compatible,
-		module_tables_have_same_identity_rows,
 	../stage_06_typecheck/decl:
 		TypedDecl(
 			TypedFunctionDecl,
 			TypedImplDecl,
-			TypedParsedDecl,
 			TypedPrivateDecl,
-			TypedUnionDecl,
 		),
 		TypedFunctionInfo,
 		TypedProgram,
-		TypedUnionInfo,
 		typed_decls_function_infos,
 	../stage_06_typecheck/modules/import_binding:
 		ImportBinding(QualifiedModuleBinding, SelectiveDefinitionBinding),
 	env: CTFE_ENV_EMPTY, ctfe_env_has_binding, ctfe_lookup_value
-	value: CtfeConstructorInfo, CtfeEnv, CtfeValue, ctfe_constructor_info
+	value: CtfeEnv, CtfeValue
 
 
 record CtfeFunction {
@@ -164,19 +159,11 @@ record CtfeModuleAlias {
 }
 
 
-record CtfeNullaryConstructorReference {
-	name: String,
-	parent_type: String,
-	callable_id: Option[Int]
-}
-
-
 record CtfeContext {
 	module_table: ModuleTable,
 	target_module_id: ModuleId,
 	functions: List[(Int, CtfeFunction)],
 	imported_functions: List[CtfeImportedFunctionGroup],
-	constructors: List[(String, CtfeConstructorInfo)],
 	module_aliases: List[CtfeModuleAlias],
 	module_global_envs: List[CtfeEnv],
 	active_module_id: ModuleId
@@ -196,43 +183,10 @@ pure func ctfe_context_empty(module_table: ModuleTable, active_module_id: Module
 		target_module_id = active_module_id,
 		functions = [],
 		imported_functions = [],
-		constructors = [],
 		module_aliases = [],
 		module_global_envs = module_global_envs,
 		active_module_id = active_module_id
 	}
-
-
-pure func ctfe_context_constructor_info(
-	context: CtfeContext,
-	name: String,
-) -> Option[CtfeConstructorInfo]:
-	var result: Option[CtfeConstructorInfo] = None
-
-	for (constructor_name, info) in context.constructors:
-		if result.is_none() and constructor_name == name:
-			result = Some(info)
-			break
-
-	result
-
-
-pure func ctfe_context_nullary_constructor_reference(
-	context: CtfeContext,
-	name: String,
-) -> Option[CtfeNullaryConstructorReference]:
-	match ctfe_context_constructor_info(context, name):
-		Some(info):
-			if info.arity == 0:
-				Some({
-					name = name,
-					parent_type = info.parent_type,
-					callable_id = info.callable_id,
-				})
-			else:
-				None
-		None:
-			None
 
 
 pure func ctfe_context_function_by_callable_id(
@@ -382,11 +336,10 @@ pure func ctfe_context_with_module_global_env(
 	module_id: ModuleId,
 	env: CtfeEnv,
 ) -> CtfeContext:
+	-- CTFE values can carry graph-issued constructor IDs. Identical module rows
+	-- from a separately built table do not prove that those IDs share a domain.
 	match (
-		(
-			module_tables_are_compatible(context.module_table, issuing_table)
-			or module_tables_have_same_identity_rows(context.module_table, issuing_table)
-		),
+		module_tables_are_compatible(context.module_table, issuing_table),
 		ctfe_context_module_path(context, module_id),
 	):
 		(True, Some(_)):
@@ -529,79 +482,6 @@ private pure func ctfe_collect_imported_function_info(
 			functions
 
 
-private pure func ctfe_collect_decl_constructors(
-	constructors: List[(String, CtfeConstructorInfo)],
-	decl: TypedDecl,
-) -> List[(String, CtfeConstructorInfo)]:
-	match decl:
-		TypedUnionDecl(info):
-			var result = constructors
-
-			for variant in info.variants:
-				result = result.append(
-					(
-						variant.name,
-						ctfe_constructor_info(
-							info.decl.name.text,
-							variant.fields.length(),
-							variant.def_id,
-						),
-					),
-				)
-
-			result
-		TypedParsedDecl(parsed_decl):
-			match parsed_decl:
-				UnionParsedDecl(union_decl):
-					var result = constructors
-
-					for variant in union_decl.variants:
-						result = result.append(
-							(
-								variant.name.text,
-								ctfe_constructor_info(
-									union_decl.name.text,
-									variant.fields.length(),
-									None,
-								),
-							),
-						)
-
-					result
-				PrivateParsedDecl(inner, _):
-					ctfe_collect_decl_constructors(constructors, TypedParsedDecl(inner))
-				_:
-					constructors
-		TypedPrivateDecl(inner):
-			ctfe_collect_decl_constructors(constructors, inner)
-		_:
-			constructors
-
-
-private pure func ctfe_collect_program_constructors(
-	constructors: List[(String, CtfeConstructorInfo)],
-	program: TypedProgram,
-) -> List[(String, CtfeConstructorInfo)]:
-	var result = constructors
-
-	for decl in program.decls:
-		result = ctfe_collect_decl_constructors(result, decl)
-
-	result
-
-
-private pure func ctfe_collect_decls_constructors(
-	constructors: List[(String, CtfeConstructorInfo)],
-	decls: List[TypedDecl],
-) -> List[(String, CtfeConstructorInfo)]:
-	var result = constructors
-
-	for decl in decls:
-		result = ctfe_collect_decl_constructors(result, decl)
-
-	result
-
-
 private pure func ctfe_merge_duplicate_imported_function_group(
 	groups: List[CtfeImportedFunctionGroup],
 	module_id: ModuleId,
@@ -644,14 +524,6 @@ private pure func ctfe_context_from_program_in_domain(
 	import_bindings: List[CtfeImportBinding],
 	imported_programs: List[CtfeImportedProgram],
 ) -> CtfeContext:
-	var constructors = ctfe_collect_program_constructors([], program)
-
-	for imported in imported_programs:
-		constructors = ctfe_collect_decls_constructors(
-			constructors,
-			ctfe_imported_program_decls(imported),
-		)
-
 	var functions = ctfe_collect_program_functions([], program, target_module_id)
 
 	for imported in imported_programs:
@@ -774,8 +646,7 @@ private pure func ctfe_context_from_program_in_domain(
 
 	var context = { ctfe_context_empty(module_table, target_module_id) |
 		functions = functions,
-		imported_functions = imported_groups,
-		constructors = constructors
+		imported_functions = imported_groups
 	}
 	context = ctfe_context_with_import_bindings(context, import_bindings)
 
@@ -799,17 +670,13 @@ pure func ctfe_context_from_program(
 	var domain_is_valid = module_table_canonical_path(module_table, target_module_id).is_some()
 
 	for imported in imported_programs:
+		-- Require the actual graph table allocation. Row equality alone cannot
+		-- authenticate the imported program's raw definition IDs.
 		if (
-			not ((
-				module_tables_are_compatible(
-					module_table,
-					ctfe_imported_program_module_table(imported),
-				)
-				or module_tables_have_same_identity_rows(
-					module_table,
-					ctfe_imported_program_module_table(imported),
-				)
-			))
+			not module_tables_are_compatible(
+				module_table,
+				ctfe_imported_program_module_table(imported),
+			)
 			or module_table_canonical_path(
 				module_table,
 				ctfe_imported_program_module_id(imported),

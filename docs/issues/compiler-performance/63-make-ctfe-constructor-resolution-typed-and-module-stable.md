@@ -1,6 +1,6 @@
 # Make CTFE Constructor Resolution Typed and Module-Stable
 
-**Status:** Ready after Issue 62
+**Status:** Implemented 2026-09-08
 
 **Roadmap:** [Stage 06 Latency Reduction Roadmap](STAGE06_LATENCY_REDUCTION_ROADMAP.md)
 
@@ -34,12 +34,13 @@ Stage 06 already distinguishes constructor patterns from binding patterns:
 ```blorp
 union TypedPattern:
 	TypedNamePattern(ParsedIdentifier, SemanticType)
-	TypedConstructorPattern(ParsedIdentifier, List[TypedPattern], SourceSpan, Int)
+	TypedConstructorPattern(ParsedIdentifier, List[TypedPattern], SourceSpan, String, Int)
 	TypedQualifiedConstructorPattern(
 		ParsedIdentifier,
 		ParsedIdentifier,
 		List[TypedPattern],
 		SourceSpan,
+		String,
 		Int,
 	)
 	-- other patterns
@@ -354,37 +355,37 @@ take precedence over a wall-time claim.
 
 ## Measurable Acceptance Criteria
 
-- [ ] The target-contamination regression fails before the fix and passes
+- [x] The target-contamination regression fails before the fix and passes
       afterward in both artifact orders.
-- [ ] A `TypedNamePattern` performs zero constructor queries and always binds.
-- [ ] Typed constructor patterns compare exact definition/callable identity
+- [x] A `TypedNamePattern` performs zero constructor queries and always binds.
+- [x] Typed constructor patterns compare exact definition/callable identity
       whenever both sides carry it.
-- [ ] Exact constructor comparison is permitted only after graph/index-domain
+- [x] Exact constructor comparison is permitted only after graph/index-domain
       compatibility has been validated; equal raw integers from incompatible
       definition domains do not match.
-- [ ] Two present but unequal constructor IDs never fall back to name equality.
-- [ ] Absent-ID fallback is limited to explicitly tested compiler-created
+- [x] Two present but unequal constructor IDs never fall back to name equality.
+- [x] Absent-ID fallback is limited to explicitly tested compiler-created
       values and validates parent/type plus name.
-- [ ] Typed expression translation performs zero name-only constructor
+- [x] Typed expression translation performs zero name-only constructor
       fallbacks.
-- [ ] Direct IR tests prove that all typed bare and qualified nullary
+- [x] Direct IR tests prove that all typed bare and qualified nullary
       constructors carry resolved constructor calls before the `None` branch is
       treated as an ordinary value reference.
-- [ ] Materialized built-in `Option`/`Result` constructor values with absent
+- [x] Materialized built-in `Option`/`Result` constructor values with absent
       callable IDs either cannot re-enter typed expression translation or use
       an explicit, tested synthesized-constructor representation.
-- [ ] `flat_constructor_candidates_visited` is zero on the compiler self-check;
+- [x] `flat_constructor_candidates_visited` is zero on the compiler self-check;
       delete the flat constructor catalog if no narrow non-production consumer
       remains.
-- [ ] The same dependency `ModuleId` has the same CTFE evaluation checksum in
+- [x] The same dependency `ModuleId` has the same CTFE evaluation checksum in
       every requesting artifact context.
-- [ ] Existing non-collision compiler output and diagnostics are identical.
-- [ ] The collision fixture adopts the typed-AST-authoritative result documented
+- [x] Existing non-collision compiler output and diagnostics are identical.
+- [x] The collision fixture adopts the typed-AST-authoritative result documented
       by this issue.
-- [ ] Stage 07 constructor/pattern lookup retired instructions do not increase;
+- [x] Stage 07 constructor/pattern lookup retired instructions do not increase;
       whole-check wall time may vary within 2% because correctness, not a large
       isolated speedup, is the admission reason.
-- [ ] Focused CTFE, bridge, typecheck-stage, and leak checks pass.
+- [x] Focused CTFE, bridge, typecheck-stage, and leak checks pass.
 
 ## Pitfalls and Gotchas
 
@@ -426,3 +427,55 @@ bug.
 CTFE constructor behavior becomes a projection of the typed AST rather than a
 second name-resolution pass. That removes the target-dependent semantic input
 which otherwise makes safe `ModuleId`-keyed dependency-global reuse impossible.
+
+## Implementation Result
+
+Implemented on 2026-09-08 against parent `21de2e85` (the bootstrap-pin
+successor to roadmap commit `95917f7c`).
+
+Stage 06 remains authoritative and now retains the resolved constructor's
+parent type beside its definition ID in typed constructor patterns. Stage 07
+uses that parent only for the explicit synthesized-value fallback;
+`TypedNamePattern` always binds.
+
+Resolved CTFE constructors now carry an opaque `CtfeResolvedConstructorId`.
+The representation pairs the graph-issued definition ID with the issuing
+`ModuleTable` allocation, and equality requires both the same table allocation
+and the same definition ID. CTFE context admission was tightened accordingly:
+an imported typed program must carry the context's actual module table, not an
+independently rebuilt table with merely identical rows. Direct tests prove that
+equal raw integers from two independently allocated tables do not match.
+
+Compiler-created `Option` and `Result` values carry the explicit
+`SynthesizedCtfeConstructor` variant. That narrow fallback verifies constructor
+name and parent type. Two resolved identities never fall back to those strings.
+
+IR translation now recognizes bare and qualified nullary constructors only
+from `ResolvedDirectCall(_, CallableConstructor(_))`. An unresolved bare name
+is a value reference, and an unresolved qualified field remains an imported
+global. The former target-first constructor catalog, its construction walks,
+and all name-only query helpers were deleted. Production source changed by
+217 additions and 233 deletions, a net reduction of 16 lines despite adding the
+identity boundary.
+
+The bridge regression uses a transitive CTFE dependency whose typed `Ready`
+pattern is a binding. One requested artifact declares an unrelated nullary
+`Ready` constructor and another does not. Both artifact orders evaluate
+successfully, and the dependency's emitted typed-program JSON is byte-identical
+between orders.
+
+Validation completed with:
+
+- 123 focused CTFE/context/global tests;
+- 304 inference tests, including bare and qualified nullary resolved-call
+  assertions;
+- 111 bridge tests, including the transitive artifact-order regression;
+- 128 Core-lowering tests;
+- `scripts/compiler-check --changed` (15 suites and 2 checks); and
+- `scripts/compiler-check --stage typecheck` (34 suites and 2 checks,
+  including the leak gate).
+
+No wall-time speedup is claimed for this correctness prerequisite. The hot
+name-only constructor scans and temporary catalog construction are absent from
+production code, so their retired work is structurally zero; the next roadmap
+issue should remeasure after adding graph-owned dependency-global reuse.

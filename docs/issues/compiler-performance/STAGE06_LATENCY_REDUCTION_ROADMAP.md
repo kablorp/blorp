@@ -55,7 +55,7 @@ The current opportunities are:
 | Order | Issue | Direct evidence | Expected whole-check opportunity |
 | ---: | --- | --- | ---: |
 | 1 | [62: Use exact constructor-skeleton lookup](62-use-exact-constructor-skeleton-lookup.md) | 3,429 full projections across 19,666 skeletons | likely 2-5% |
-| 2 | [63: Make CTFE constructor resolution typed and module-stable](63-make-ctfe-constructor-resolution-typed-and-module-stable.md) | typed binders are reclassified through a target-first name list | correctness prerequisite; small speedup |
+| 2 | [63: Make CTFE constructor resolution typed and module-stable](63-make-ctfe-constructor-resolution-typed-and-module-stable.md) — implemented | typed binders were reclassified through a target-first name list | correctness prerequisite completed; name-only catalog deleted |
 | 3 | [64: Evaluate CTFE dependency globals once per graph](64-evaluate-ctfe-dependency-globals-once-per-graph.md) | 1,748 dependency evaluations for 157 artifacts | likely 3-8% |
 | 4 | [65: Index type-home state](65-index-type-home-state.md) | about 215,000 linear finds and 215,000 writes | likely 1-3% |
 | 5 | [66: Canonicalize accepted semantic-type projection](66-canonicalize-accepted-semantic-type-projection.md) | accepted phase is 13x the next isolated phase; alias-depth scaling is superlinear | measurement-gated |
@@ -194,10 +194,11 @@ type-header portion of later profiles easier to interpret.
 
 ### Issue 63: typed and module-stable CTFE constructors
 
-Begin after Issue 62's measurement checkpoint. Stage 07 currently reclassifies
-typed binding patterns through a target-first, name-only constructor list. Fix
-that semantic contamination before assuming dependency global evaluation is a
-function of `ModuleId` and graph policy.
+Implemented after Issue 62's measurement checkpoint. Stage 07 now treats typed
+binding and constructor decisions as authoritative, resolved constructors carry
+an explicit issuing-table domain, and the target-first name-only catalog has
+been deleted. Dependency global evaluation is now stable across requesting
+artifact order, satisfying Issue 64's correctness prerequisite.
 
 ### Issue 64: graph-owned CTFE global evaluation
 

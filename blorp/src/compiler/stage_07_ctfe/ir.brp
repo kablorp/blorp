@@ -90,13 +90,10 @@ import:
 		SemanticType(SemanticNamedType, SemanticTupleType),
 	context:
 		CtfeContext,
-		CtfeNullaryConstructorReference,
 		ctfe_context_function_by_callable_id,
 		ctfe_context_module_alias,
-		ctfe_context_module_has_global_binding,
-		ctfe_context_nullary_constructor_reference,
 	intrinsic: CtfeBuiltinIntrinsic, ctfe_builtin_intrinsic
-	value: CtfeLambdaSource
+	value: CtfeLambdaSource, CtfeResolvedConstructorId, ctfe_resolved_constructor_id
 
 
 union CtfeIrLiteral:
@@ -111,6 +108,13 @@ record CtfeIrDirectCall {
 	callable_id: Int,
 	source_name: String,
 	is_pure: Bool
+}
+
+
+record CtfeNullaryConstructorReference {
+	name: String,
+	parent_type: String,
+	constructor_id: CtfeResolvedConstructorId
 }
 
 
@@ -396,7 +400,6 @@ private pure func ctfe_ir_direct_call(
 
 private pure func ctfe_ir_reference_kind(
 	context: CtfeContext,
-	name: String,
 	resolved_call: Option[ResolvedCallInfo],
 ) -> CtfeIrReferenceKind:
 	match resolved_call:
@@ -417,7 +420,10 @@ private pure func ctfe_ir_reference_kind(
 								CtfeIrNullaryConstructorReference({
 									name = ctfe_ir_clean_source_name(call.source_name),
 									parent_type = parent_type,
-									callable_id = Some(callable_id),
+									constructor_id = ctfe_resolved_constructor_id(
+										context.module_table,
+										callable_id,
+									),
 								})
 							else:
 								CtfeIrUnsupportedFunctionReference(
@@ -433,11 +439,7 @@ private pure func ctfe_ir_reference_kind(
 				_:
 					CtfeIrUnsupportedFunctionReference(ctfe_ir_clean_source_name(call.source_name))
 		None:
-			match ctfe_context_nullary_constructor_reference(context, name):
-				Some(constructor):
-					CtfeIrNullaryConstructorReference(constructor)
-				None:
-					CtfeIrValueReference
+			CtfeIrValueReference
 
 
 private pure func ctfe_ir_call_kind(
@@ -597,28 +599,23 @@ private pure func ctfe_ir_qualified_field_expr(
 	context: CtfeContext,
 	receiver: TypedExpr,
 	field: ParsedIdentifier,
+	resolved_call: Option[ResolvedCallInfo],
 ) -> Option[CtfeIrExprDesc]:
 	match receiver:
 		TypedNameExpr(receiver_name, _):
 			match ctfe_context_module_alias(context, receiver_name.text):
 				Some(module_id):
-					if ctfe_context_module_has_global_binding(context, module_id, field.text):
-						Some(CtfeIrImportedGlobalExpr({
-							module_id = module_id,
-							name = field.text,
-						}))
-					else:
-						match ctfe_context_nullary_constructor_reference(context, field.text):
-							Some(constructor):
-								Some(CtfeIrIdentExpr({
-									name = field.text,
-									reference_kind = CtfeIrNullaryConstructorReference(constructor),
-								}))
-							None:
-								Some(CtfeIrImportedGlobalExpr({
-									module_id = module_id,
-									name = field.text,
-								}))
+					match ctfe_ir_reference_kind(context, resolved_call):
+						CtfeIrNullaryConstructorReference(constructor):
+							Some(CtfeIrIdentExpr({
+								name = field.text,
+								reference_kind = CtfeIrNullaryConstructorReference(constructor),
+							}))
+						_:
+							Some(CtfeIrImportedGlobalExpr({
+								module_id = module_id,
+								name = field.text,
+							}))
 				None:
 					None
 		_:
@@ -857,7 +854,6 @@ pure func ctfe_ir_from_typed_expr(
 					name = name.text,
 					reference_kind = ctfe_ir_reference_kind(
 						context,
-						name.text,
 						typed_expr_resolved_call(expr),
 					),
 				}),
@@ -918,7 +914,12 @@ pure func ctfe_ir_from_typed_expr(
 			entries_ir ?= ctfe_ir_dict_entries_from_typed(context, entries)
 			Ok(ctfe_ir_expr(expr, CtfeIrDictExpr(entries_ir)))
 		TypedFieldAccessExpr(receiver, field, _, _):
-			match ctfe_ir_qualified_field_expr(context, receiver, field):
+			match ctfe_ir_qualified_field_expr(
+				context,
+				receiver,
+				field,
+				typed_expr_resolved_call(expr),
+			):
 				Some(desc):
 					Ok(ctfe_ir_expr(expr, desc))
 				None:

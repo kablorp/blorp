@@ -118,7 +118,7 @@ import:
 		CtfeIrTranslateError,
 		ctfe_ir_from_typed_expr,
 		ctfe_ir_translate_error_message,
-	../../../src/compiler/stage_07_ctfe/value: ctfe_constructor_info
+	../../../src/compiler/stage_07_ctfe/value: ctfe_resolved_constructor_definition_id
 	../../../src/lib/source:
 		Cursor,
 		SourceFile,
@@ -237,7 +237,7 @@ pure func name_expr_with_call(name: String, call: ResolvedCallInfo) -> TypedExpr
 
 
 pure func constructor_context() -> CtfeContext:
-	{ ctfe_test_context() | constructors = [("None", ctfe_constructor_info("Option", 0, None))] }
+	ctfe_test_context()
 
 
 pure func is_int_literal(expr: CtfeIrExpr, expected: String) -> Bool:
@@ -496,6 +496,73 @@ func test_translates_imported_global_field_access() -> Bool:
 					False
 		Err(_):
 			False
+
+
+func test_translates_qualified_constructor_only_from_resolved_call() -> Bool:
+	alias_domain = singleton_module_table(
+		resolved_module_identity_from_resolver(
+			"dep/option",
+			UserModule,
+		),
+	)
+	context = ctfe_context_with_module_alias(
+		ctfe_context_empty(alias_domain[0], alias_domain[1]),
+		"Dep",
+		alias_domain[1],
+	)
+	constructor_call = resolved_call_with_origin(
+		41,
+		"None#41",
+		Pure,
+		CallableConstructor("Option"),
+	)
+	resolved = TypedFieldAccessExpr(
+		name_expr("Dep"),
+		ident("None"),
+		fixture_source_span(),
+		expr_info_for_with_call(
+			SemanticNamedType("Option", [TYPE_INT]),
+			constructor_call,
+		),
+	)
+	unresolved = TypedFieldAccessExpr(
+		name_expr("Dep"),
+		ident("None"),
+		fixture_source_span(),
+		expr_info_for(SemanticNamedType("Option", [TYPE_INT])),
+	)
+
+	resolved_ok = match ctfe_ir_from_typed_expr(context, resolved):
+		Ok(expr):
+			match expr.desc:
+				CtfeIrIdentExpr(identifier):
+					match identifier.reference_kind:
+						CtfeIrNullaryConstructorReference(constructor):
+							(
+								constructor.name == "None"
+								and constructor.parent_type == "Option"
+								and ctfe_resolved_constructor_definition_id(
+									constructor.constructor_id,
+								) == 41
+							)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+	unresolved_ok = match ctfe_ir_from_typed_expr(context, unresolved):
+		Ok(expr):
+			match expr.desc:
+				CtfeIrImportedGlobalExpr(imported):
+					imported.name == "None"
+				_:
+					False
+		Err(_):
+			False
+
+	resolved_ok and unresolved_ok
 
 
 func test_translates_block_local_bindings() -> Bool:
@@ -917,18 +984,15 @@ func test_translates_name_references() -> Bool:
 		Err(_):
 			void
 
-	var constructor_ok: Bool = False
+	var unresolved_name_ok: Bool = False
 
 	match constructor_result:
-		Ok(constructor_expr):
-			match constructor_expr.desc:
-				CtfeIrIdentExpr(constructor_ident):
-					match constructor_ident.reference_kind:
-						CtfeIrNullaryConstructorReference(constructor):
-							constructor_ok = (
-								constructor.name == "None"
-								and constructor.parent_type == "Option"
-							)
+		Ok(unresolved_expr):
+			match unresolved_expr.desc:
+				CtfeIrIdentExpr(identifier):
+					match identifier.reference_kind:
+						CtfeIrValueReference:
+							unresolved_name_ok = True
 						_:
 							void
 				_:
@@ -936,7 +1000,7 @@ func test_translates_name_references() -> Bool:
 		Err(_):
 			void
 
-	value_ok and constructor_ok
+	value_ok and unresolved_name_ok
 
 
 func test_translates_resolved_nullary_constructor_reference_without_context() -> Bool:
@@ -951,7 +1015,9 @@ func test_translates_resolved_nullary_constructor_reference_without_context() ->
 							(
 								constructor.name == "None"
 								and constructor.parent_type == "Option"
-								and constructor.callable_id == Some(41)
+								and ctfe_resolved_constructor_definition_id(
+									constructor.constructor_id,
+								) == 41
 							)
 						_:
 							False
@@ -1266,6 +1332,10 @@ tests: TestSuite = {
 		("translates lambdas as explicit CTFE IR", test_translates_lambda_as_explicit_ctfe_ir),
 		("translates field access kinds", test_translates_field_access_kinds),
 		("translates imported global field access", test_translates_imported_global_field_access),
+		(
+			"translates qualified constructors only from resolved calls",
+			test_translates_qualified_constructor_only_from_resolved_call,
+		),
 		("translates block local bindings", test_translates_block_local_bindings),
 		("translates block local assignment items", test_translates_block_local_assignment_items),
 		(

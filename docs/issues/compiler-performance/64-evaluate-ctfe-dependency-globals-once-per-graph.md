@@ -1,11 +1,11 @@
 # Evaluate CTFE Dependency Globals Once per Graph
 
-**Status:** Ready after Issue 63
+**Status:** Ready; Issue 63 prerequisite satisfied 2026-09-08
 
 **Roadmap:** [Stage 06 Latency Reduction Roadmap](STAGE06_LATENCY_REDUCTION_ROADMAP.md)
 
-**Dependencies:** Issue 63 must first make dependency evaluation independent of
-the requesting artifact's constructor namespace
+**Dependencies:** Issue 63 made dependency evaluation independent of the
+requesting artifact's constructor namespace
 
 **Primary owners:**
 

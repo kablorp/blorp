@@ -14,6 +14,7 @@ import:
 			TypedListPattern,
 			TypedNamePattern,
 			TypedOrPattern,
+			TypedQualifiedConstructorPattern,
 			TypedTuplePattern,
 			TypedWildcardPattern,
 		),
@@ -28,6 +29,7 @@ import:
 		CtfeValueDesc(CtfeConstructorValue, CtfeListValue, CtfeTupleValue),
 		ctfe_constructor_info,
 		ctfe_int,
+		ctfe_resolved_constructor_info,
 		ctfe_value,
 		ctfe_values_equal,
 	../../../src/lib/source:
@@ -69,12 +71,7 @@ pure func option_int_type() -> SemanticType:
 
 
 pure func constructor_context() -> CtfeContext:
-	{ ctfe_test_context() |
-		constructors = [
-			("None", ctfe_constructor_info("Option", 0, None)),
-			("Some", ctfe_constructor_info("Option", 1, None)),
-		]
-	}
+	ctfe_test_context()
 
 
 pure func int_value(value: Int) -> CtfeValue:
@@ -100,8 +97,38 @@ pure func constructor_value(name: String, args: List[CtfeValue]) -> CtfeValue:
 	ctfe_value(option_int_type(), CtfeConstructorValue({
 			name = name,
 			args = args,
-			constructor_info = ctfe_constructor_info("Option", args.length(), None),
+			constructor_info = ctfe_constructor_info("Option", args.length()),
 		}), fixture_source_span())
+
+
+pure func resolved_constructor_value(
+	context: CtfeContext,
+	name: String,
+	args: List[CtfeValue],
+	definition_id: Int,
+) -> CtfeValue:
+	ctfe_value(option_int_type(), CtfeConstructorValue({
+			name = name,
+			args = args,
+			constructor_info = ctfe_resolved_constructor_info(
+				"Option",
+				args.length(),
+				context.module_table,
+				definition_id,
+			),
+		}), fixture_source_span())
+
+
+pure func pattern_matches(
+	context: CtfeContext,
+	pattern: TypedPattern,
+	value: CtfeValue,
+) -> Bool:
+	match ctfe_pattern_bind(context, pattern, value):
+		Ok(Some(_)):
+			True
+		_:
+			False
 
 
 pure func binding_value(bindings: List[(String, CtfeValue)], name: String) -> Option[CtfeValue]:
@@ -237,6 +264,7 @@ func test_matches_constructor_and_or_patterns() -> Bool:
 			ident("Some"),
 			[TypedNamePattern(ident("value"), TYPE_INT)],
 			fixture_source_span(),
+			"Option",
 			42,
 		),
 		some_value,
@@ -250,11 +278,18 @@ func test_matches_constructor_and_or_patterns() -> Bool:
 		constructor_context(),
 		TypedOrPattern(
 			[
-				TypedConstructorPattern(ident("None"), [], fixture_source_span(), 41),
+				TypedConstructorPattern(
+					ident("None"),
+					[],
+					fixture_source_span(),
+					"Option",
+					41,
+				),
 				TypedConstructorPattern(
 					ident("Some"),
 					[TypedNamePattern(ident("value"), TYPE_INT)],
 					fixture_source_span(),
+					"Option",
 					42,
 				),
 			],
@@ -275,7 +310,7 @@ func test_matches_constructor_and_or_patterns() -> Bool:
 
 	match nullary_name_result:
 		Ok(Some(bindings)):
-			nullary_name_ok = bindings.length() == 0
+			nullary_name_ok = binding_matches(bindings, "None", none_value)
 		_:
 			void
 
@@ -290,11 +325,103 @@ func test_matches_constructor_and_or_patterns() -> Bool:
 	constructor_ok and nullary_name_ok and or_ok
 
 
+func test_constructor_patterns_require_same_resolved_identity_domain() -> Bool:
+	context = ctfe_test_context()
+	foreign_context = ctfe_test_context()
+	pattern = TypedConstructorPattern(
+		ident("Some"),
+		[TypedNamePattern(ident("value"), TYPE_INT)],
+		fixture_source_span(),
+		"Option",
+		42,
+	)
+
+	same = resolved_constructor_value(context, "Some", [int_value(1)], 42)
+	different_id = resolved_constructor_value(context, "Some", [int_value(1)], 43)
+	different_domain = resolved_constructor_value(foreign_context, "Some", [int_value(1)], 42)
+
+	(
+		pattern_matches(context, pattern, same)
+		and not pattern_matches(context, pattern, different_id)
+		and not pattern_matches(context, pattern, different_domain)
+	)
+
+
+func test_qualified_nested_patterns_keep_exact_constructor_identity() -> Bool:
+	context = ctfe_test_context()
+	none_pattern = TypedQualifiedConstructorPattern(
+		ident("OptionModule"),
+		ident("None"),
+		[],
+		fixture_source_span(),
+		"Option",
+		41,
+	)
+	pattern = TypedQualifiedConstructorPattern(
+		ident("OptionModule"),
+		ident("Some"),
+		[none_pattern],
+		fixture_source_span(),
+		"Option",
+		42,
+	)
+	value = resolved_constructor_value(
+		context,
+		"Some",
+		[resolved_constructor_value(context, "None", [], 41)],
+		42,
+	)
+	wrong_nested = resolved_constructor_value(
+		context,
+		"Some",
+		[resolved_constructor_value(context, "None", [], 99)],
+		42,
+	)
+
+	pattern_matches(context, pattern, value) and not pattern_matches(context, pattern, wrong_nested)
+
+
+func test_synthesized_constructor_fallback_checks_parent_and_name() -> Bool:
+	context = ctfe_test_context()
+	pattern = TypedConstructorPattern(
+		ident("Some"),
+		[TypedWildcardPattern(fixture_source_span())],
+		fixture_source_span(),
+		"Option",
+		42,
+	)
+	correct = constructor_value("Some", [int_value(1)])
+	wrong_name = constructor_value("Other", [int_value(1)])
+	wrong_parent = ctfe_value(option_int_type(), CtfeConstructorValue({
+			name = "Some",
+			args = [int_value(1)],
+			constructor_info = ctfe_constructor_info("Result", 1),
+		}), fixture_source_span())
+
+	(
+		pattern_matches(context, pattern, correct)
+		and not pattern_matches(context, pattern, wrong_name)
+		and not pattern_matches(context, pattern, wrong_parent)
+	)
+
+
 tests: TestSuite = {
 	description = "Compiler CTFE pattern",
 	tests = [
 		("binds wildcard name and literal patterns", test_binds_wildcard_name_and_literal_patterns),
 		("binds tuple list and spread patterns", test_binds_tuple_list_and_spread_patterns),
-		("matches constructor and or patterns", test_matches_constructor_and_or_patterns),
+		("uses typed constructor decisions and preserves name bindings", test_matches_constructor_and_or_patterns),
+		(
+			"requires constructor identity and definition domains to match",
+			test_constructor_patterns_require_same_resolved_identity_domain,
+		),
+		(
+			"keeps exact identity in qualified nested constructor patterns",
+			test_qualified_nested_patterns_keep_exact_constructor_identity,
+		),
+		(
+			"limits synthesized constructor fallback to matching parent and name",
+			test_synthesized_constructor_fallback_checks_parent_and_name,
+		),
 	]
 }

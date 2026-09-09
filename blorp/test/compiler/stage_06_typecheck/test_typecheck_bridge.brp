@@ -1342,6 +1342,85 @@ func test_typecheck_graph_evaluates_shared_ctfe_dependency() -> Bool:
 			False
 
 
+private func ctfe_collision_dependency_program(
+	artifact_paths: List[String],
+) -> Option[String]:
+	base_source: String =
+		|answer: Int = match 41:
+		|	Ready: Ready
+	base: JsonValue = user_import_module_json("base", "base", base_source)
+	dep_source: String =
+		|import:
+		|	base: answer
+		|
+		|next_answer: Int = answer + 1
+	dep: JsonValue = user_import_module_json("dep", "dep", dep_source)
+	left_source: String =
+		|import:
+		|	dep: next_answer
+		|
+		|left_answer: Int = next_answer
+	left: JsonValue = user_import_module_json("left", "left", left_source)
+	right_source: String =
+		|import:
+		|	dep: next_answer
+		|
+		|union Status:
+		|	Ready
+		|
+		|right_answer: Int = next_answer
+	right: JsonValue = user_import_module_json("right", "right", right_source)
+	target_source: String =
+		|import:
+		|	dep: next_answer
+		|
+		|main_answer: Int = next_answer
+	target: JsonValue = user_import_module_json("main", "main", target_source)
+
+	match streamed_graph_responses(
+		typecheck_graph_request(
+			target,
+			[base, dep, left, right],
+			artifact_paths,
+		),
+		4,
+	):
+		Some(responses):
+			all_evaluated = responses.all(func(response):
+				(
+					artifact_array_length(response, "type_errors") == 0
+					and artifact_string_field(response, "ctfe_status") == "evaluated"
+				)
+			)
+			base_response = responses.find(func(response):
+				artifact_string_field(response, "path") == "base.brp"
+			)
+
+			if all_evaluated:
+				match base_response:
+					Some(response):
+						artifact_field(response, "typed_program").map(func(program):
+							program.to_string()
+						)
+					None:
+						None
+			else:
+				None
+		None:
+			None
+
+
+func test_typecheck_graph_ctfe_constructor_resolution_is_artifact_stable() -> Bool:
+	left_first = ctfe_collision_dependency_program(["base", "left", "right"])
+	right_first = ctfe_collision_dependency_program(["right", "left", "base"])
+
+	match (left_first, right_first):
+		(Some(left_program), Some(right_program)):
+			left_program == right_program
+		_:
+			False
+
+
 func test_typecheck_graph_evaluates_transitive_ctfe_dependencies_first() -> Bool:
 	base: JsonValue = user_import_module_json("base", "base", "answer: Int = 40")
 	dep_source: String =
@@ -4282,6 +4361,10 @@ tests: TestSuite = {
 		(
 			"typecheck_graph evaluates shared CTFE dependency",
 			test_typecheck_graph_evaluates_shared_ctfe_dependency,
+		),
+		(
+			"typecheck_graph keeps CTFE constructor resolution stable across artifact order",
+			test_typecheck_graph_ctfe_constructor_resolution_is_artifact_stable,
 		),
 		(
 			"typecheck_graph evaluates transitive CTFE dependencies first",
