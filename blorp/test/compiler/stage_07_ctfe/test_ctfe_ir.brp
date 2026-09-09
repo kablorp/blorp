@@ -13,7 +13,13 @@ import:
 		module_ids_equal,
 		singleton_module_table,
 	../../../src/compiler/stage_06_typecheck/infer:
-		CallableOrigin(CallableBuiltin, CallableConstructor, CallableImported, CallableLocal),
+		CallableOrigin(
+			CallableBuiltin,
+			CallableConstructor,
+			CallableImported,
+			CallableImportedUnresolved,
+			CallableLocal,
+		),
 		ExprTypeOrigin(SynthesizedOrigin),
 		ResolvedCallInfo,
 		ResolvedCallTarget(ResolvedDirectCall, ResolvedTraitMethodCall),
@@ -82,6 +88,7 @@ import:
 			CtfeIrConstructorCall,
 			CtfeIrImportedCall,
 			CtfeIrLocalCall,
+			CtfeIrUnresolvedCall,
 			CtfeIrUnsupportedCall,
 		),
 		CtfeIrExpr,
@@ -1075,7 +1082,12 @@ func test_translates_local_function_references() -> Bool:
 func test_translates_call_kinds() -> Bool:
 	local_call = resolved_call(7, "helper#7", Pure)
 	constructor_call = resolved_call_with_origin(8, "Some#8", Pure, CallableConstructor("Option"))
-	imported_call = resolved_call_with_origin(9, "map#9", Pure, CallableImported("list"))
+	imported_call = resolved_call_with_origin(
+		9,
+		"map#9",
+		Pure,
+		CallableImported(ctfe_test_module_id(), "list"),
+	)
 	local_typed = TypedCallExpr(
 		name_expr_with_call("helper", local_call),
 		[int_expr("1")],
@@ -1233,6 +1245,7 @@ func test_translates_resolved_trait_method_as_imported_call() -> Bool:
 		purity = Pure,
 		target = ResolvedTraitMethodCall("Length", Some({
 				callable_id = 17,
+				module_id = ctfe_test_module_id(),
 				module_path = "list",
 			})),
 		trait_identity = None,
@@ -1268,6 +1281,75 @@ func test_translates_resolved_trait_method_as_imported_call() -> Bool:
 					False
 		Err(_):
 			False
+
+
+func test_rejects_mismatched_import_module_metadata() -> Bool:
+	direct_call = resolved_call_with_origin(
+		19,
+		"map#19",
+		Pure,
+		CallableImported(ctfe_test_module_id(), "not/list"),
+	)
+	trait_call: ResolvedCallInfo = {
+		callee_name = "length",
+		source_name = "length#20",
+		purity = Pure,
+		target = ResolvedTraitMethodCall("Length", Some({
+				callable_id = 20,
+				module_id = ctfe_test_module_id(),
+				module_path = "not/list",
+			})),
+		trait_identity = None,
+		bound_type_params = [],
+		debug_only = False,
+		instantiated_params = [TYPE_INT],
+		instantiated_return = TYPE_INT,
+		resource_args = RejectResourceArgs,
+		dim_constraints = [],
+		loop_producer = None
+	}
+	direct_typed = TypedCallExpr(
+		name_expr_with_call("map", direct_call),
+		[int_expr("1")],
+		fixture_source_span(),
+		expr_info_with_call(direct_call),
+	)
+	trait_typed = TypedCallExpr(
+		name_expr_with_call("length", trait_call),
+		[int_expr("1")],
+		fixture_source_span(),
+		expr_info_with_call(trait_call),
+	)
+
+	direct_unresolved = match ctfe_ir_from_typed_expr_without_context(direct_typed):
+		Ok(direct_expr):
+			match direct_expr.desc:
+				CtfeIrCallExpr(direct):
+					match direct.kind:
+						CtfeIrUnresolvedCall:
+							True
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+	trait_unresolved = match ctfe_ir_from_typed_expr_without_context(trait_typed):
+		Ok(trait_expr):
+			match trait_expr.desc:
+				CtfeIrCallExpr(trait_call_value):
+					match trait_call_value.kind:
+						CtfeIrUnresolvedCall:
+							True
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+	direct_unresolved and trait_unresolved
 
 
 func test_rejects_unsupported_forms_at_translation_boundary() -> Bool:
@@ -1362,6 +1444,10 @@ tests: TestSuite = {
 		(
 			"translates resolved trait method as imported call",
 			test_translates_resolved_trait_method_as_imported_call,
+		),
+		(
+			"rejects mismatched import module metadata",
+			test_rejects_mismatched_import_module_metadata,
 		),
 		(
 			"rejects unsupported forms at translation boundary",

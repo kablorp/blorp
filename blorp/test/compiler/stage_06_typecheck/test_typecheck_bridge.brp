@@ -2,6 +2,7 @@ import:
 	../../../src/compiler/stage_03_parse/source_ast_finalize: FinalizedTypecheckProgram
 	../../../src/compiler/stage_04_modules/loaded_module: ModuleOrigin(StdlibModule, UserModule)
 	../../../src/compiler/stage_04_modules/module_table:
+		ModuleId,
 		ModuleTable,
 		module_ids_equal,
 		module_table_canonical_path,
@@ -21,7 +22,8 @@ import:
 		TypedDecl(TypedFunctionDecl, TypedImplDecl, TypedPrivateDecl, TypedUnionDecl),
 		TypedProgram,
 	../../../src/compiler/stage_06_typecheck/infer:
-		ResolvedCallTarget(ResolvedTraitMethodCall),
+		CallableOrigin(CallableImported),
+		ResolvedCallTarget(ResolvedDirectCall, ResolvedTraitMethodCall),
 		TypedExpr(TypedBlockExpr, TypedCallExpr),
 		resolved_call_callable_id,
 		typed_expr_resolved_call,
@@ -3268,14 +3270,17 @@ pure func test_typed_graph_api_returns_in_memory_results() -> Bool:
 	module_ids_are_aligned = match (
 		module_table_find_id_by_canonical_path(graph.module_table, "util"),
 		graph.modules.get(0),
+		typed_function_body_call_module(graph.target.typed_program, "main"),
 	):
-		(Some(dependency_id), Some(dependency)):
+		(Some(dependency_id), Some(dependency), Some((call_module_id, call_module_path))):
 			(
 				module_table_canonical_path(
 					graph.module_table,
 					graph.target.module_id,
 				) == Some("main")
 				and module_ids_equal(dependency_id, dependency.module_id)
+				and module_ids_equal(call_module_id, dependency_id)
+				and call_module_path == "util"
 			)
 		_:
 			False
@@ -3388,11 +3393,11 @@ private pure func typed_function_body_call_id(program: TypedProgram, name: Strin
 	result
 
 
-private pure func typed_function_body_call_module_path(
+private pure func typed_function_body_call_module(
 	program: TypedProgram,
 	name: String,
-) -> Option[String]:
-	var result: Option[String] = None
+) -> Option[(ModuleId, String)]:
+	var result: Option[(ModuleId, String)] = None
 
 	for decl in program.decls:
 		match decl:
@@ -3404,7 +3409,9 @@ private pure func typed_function_body_call_module_path(
 								Some(call):
 									match call.target:
 										ResolvedTraitMethodCall(_, Some(target)):
-											result = Some(target.module_path)
+											result = Some((target.module_id, target.module_path))
+										ResolvedDirectCall(_, CallableImported(module_id, module_path)):
+											result = Some((module_id, module_path))
 										_:
 											void
 								None:
@@ -3847,10 +3854,14 @@ pure func test_typed_graph_ufcs_rejects_mismatched_local_generic_receiver() -> B
 		include_comments = False,
 		allow_debug_only_calls = False,
 	})
-	body_call_module_path = typed_function_body_call_module_path(
-		graph.target.typed_program,
-		"measure",
-	)
+	body_call_module = typed_function_body_call_module(graph.target.typed_program, "measure")
+	dep_module_id = module_table_find_id_by_canonical_path(graph.module_table, "dep")
+
+	call_module_matches = match (body_call_module, dep_module_id):
+		(Some((call_module_id, "dep")), Some(expected_module_id)):
+			module_ids_equal(call_module_id, expected_module_id)
+		_:
+			False
 
 	match (
 		typed_function_callable_id(graph.target.typed_program, "length"),
@@ -3861,7 +3872,7 @@ pure func test_typed_graph_ufcs_rejects_mismatched_local_generic_receiver() -> B
 		(Some(local_length_id), Some(measure_call_id), Some("dep"), Some(dep_program)):
 			(
 				graph.target.errors.length() == 0
-				and body_call_module_path == Some("dep")
+				and call_module_matches
 				and measure_call_id != local_length_id
 				and typed_impl_method_callable_id(
 					dep_program,

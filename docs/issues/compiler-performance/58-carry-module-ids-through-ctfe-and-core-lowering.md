@@ -493,11 +493,11 @@ Changing `TypedExpr`, Stage 09 IR, or LSP snapshot representations remains out
 of scope. No `Env`, inference meta, CTFE evaluation stack, or other rich
 typecheck session state is retained across the Core boundary.
 
-Because `TypedExpr` is intentionally unchanged, imported and trait call
-expressions still carry their existing canonical-path metadata and perform a
-path-to-ID probe when entering CTFE IR or Core lowering. Eliminating those
-per-expression probes requires an explicit typed-expression owner-ID change;
-it is not claimed by this issue.
+At Issue 58 completion, imported and trait call expressions still carried only
+canonical-path metadata and performed a path-to-ID probe when entering CTFE IR
+or Core lowering. [Issue 61](61-carry-module-ids-in-resolved-call-metadata.md)
+owns that explicit typed-expression metadata follow-up; it does not change the
+scope or measurements reported here.
 
 ## Measurement Result
 

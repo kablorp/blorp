@@ -109,6 +109,7 @@ import:
 		ParsedWithErrorMap,
 		parsed_expr_span,
 		parsed_identifier,
+	../stage_04_modules/module_table: ModuleId, module_ids_equal
 	diagnostic: TypecheckDiagnostic, typecheck_diagnostic
 	int: add_saturating, multiply_saturating
 	modules/module_view:
@@ -134,6 +135,7 @@ import:
 		TypeShapeMemo,
 		TypecheckState,
 		TypecheckTypeHome,
+		infer_module_facts_find_module_id,
 		infer_session_from_typecheck_state,
 		known_type_index_has_resource,
 		typecheck_module_scope_is_source_package,
@@ -406,7 +408,8 @@ union ExprTypeOrigin:
 
 union CallableOrigin:
 	CallableLocal
-	CallableImported(String)
+	CallableImported(ModuleId, String)
+	CallableImportedUnresolved(String)
 	CallableBuiltin
 	CallableForeign
 	CallableConstructor(String)
@@ -1230,6 +1233,7 @@ private pure func inferred_info(
 
 
 private pure func callable_origin_from_func(
+	facts: InferModuleFacts,
 	origin: FuncOrigin,
 	module_path: Option[String],
 ) -> CallableOrigin:
@@ -1237,13 +1241,21 @@ private pure func callable_origin_from_func(
 		UserDefinedFunc:
 			match module_path:
 				Some(path):
-					CallableImported(path)
+					match infer_module_facts_find_module_id(facts, path):
+						Some(module_id):
+							CallableImported(module_id, path)
+						None:
+							CallableImportedUnresolved(path)
 				None:
 					CallableLocal
 		BuiltinFunc:
 			match module_path:
 				Some(path):
-					CallableImported(path)
+					match infer_module_facts_find_module_id(facts, path):
+						Some(module_id):
+							CallableImported(module_id, path)
+						None:
+							CallableImportedUnresolved(path)
 				None:
 					CallableBuiltin
 		ForeignFunc:
@@ -1370,6 +1382,7 @@ private pure func trait_method_resource_args_for_type(
 
 
 private pure func resolved_call_from_func_symbol_with_source(
+	facts: InferModuleFacts,
 	callee_name: String,
 	source_name: String,
 	func_symbol: FuncSymbol,
@@ -1380,7 +1393,7 @@ private pure func resolved_call_from_func_symbol_with_source(
 		purity = func_symbol.purity,
 		target = ResolvedDirectCall(
 			func_symbol.callable_id,
-			callable_origin_from_func(func_symbol.origin, func_symbol.module_path),
+			callable_origin_from_func(facts, func_symbol.origin, func_symbol.module_path),
 		),
 		trait_identity = None,
 		bound_type_params = func_symbol.type_params,
@@ -1394,6 +1407,7 @@ private pure func resolved_call_from_func_symbol_with_source(
 
 
 private pure func resolved_call_from_overload_entry(
+	facts: InferModuleFacts,
 	callee_name: String,
 	source_name: String,
 	entry: OverloadEntry,
@@ -1404,7 +1418,7 @@ private pure func resolved_call_from_overload_entry(
 		purity = entry.purity,
 		target = ResolvedDirectCall(
 			entry.def_id,
-			callable_origin_from_func(entry.origin, entry.module_path),
+			callable_origin_from_func(facts, entry.origin, entry.module_path),
 		),
 		trait_identity = None,
 		bound_type_params = entry.type_params,
@@ -1793,9 +1807,15 @@ private pure func callable_origins_equal(left: CallableOrigin, right: CallableOr
 					True
 				_:
 					False
-		CallableImported(left_path):
+		CallableImported(left_module_id, left_path):
 			match right:
-				CallableImported(right_path):
+				CallableImported(right_module_id, right_path):
+					module_ids_equal(left_module_id, right_module_id) and left_path == right_path
+				_:
+					False
+		CallableImportedUnresolved(left_path):
+			match right:
+				CallableImportedUnresolved(right_path):
 					left_path == right_path
 				_:
 					False
@@ -1840,6 +1860,25 @@ private pure func optional_bound_trait_identities_equal(
 			right.is_none()
 
 
+private pure func impl_method_targets_equal(
+	left: Option[ImplMethodTarget],
+	right: Option[ImplMethodTarget],
+) -> Bool:
+	match left:
+		Some(left_value):
+			match right:
+				Some(right_value):
+					(
+						left_value.callable_id == right_value.callable_id
+						and module_ids_equal(left_value.module_id, right_value.module_id)
+						and left_value.module_path == right_value.module_path
+					)
+				None:
+					False
+		None:
+			right.is_none()
+
+
 private pure func resolved_call_targets_equal(
 	left: ResolvedCallTarget,
 	right: ResolvedCallTarget,
@@ -1854,18 +1893,10 @@ private pure func resolved_call_targets_equal(
 		ResolvedTraitMethodCall(left_trait, left_target):
 			match right:
 				ResolvedTraitMethodCall(right_trait, right_target):
-					left_trait == right_trait and match left_target:
-						Some(left_value):
-							match right_target:
-								Some(right_value):
-									(
-										left_value.callable_id == right_value.callable_id
-										and left_value.module_path == right_value.module_path
-									)
-								None:
-									False
-						None:
-							right_target.is_none()
+					(
+						left_trait == right_trait
+						and impl_method_targets_equal(left_target, right_target)
+					)
 				_:
 					False
 		ResolvedIntrinsicCall:
@@ -7042,7 +7073,14 @@ private pure func infer_name_expr(context: InferContext, name: ParsedIdentifier)
 					None,
 					InferredOrigin,
 					UNREFINED_BINDING,
-					Some(resolved_call_from_overload_entry(name.text, source_name, entry)),
+					Some(
+						resolved_call_from_overload_entry(
+							context.state.facts,
+							name.text,
+							source_name,
+							entry,
+						),
+					),
 					infer_expected_slot(next_context, entry.func_type),
 				),
 			)
@@ -7147,6 +7185,7 @@ private pure func infer_name_expr(context: InferContext, name: ParsedIdentifier)
 									UNREFINED_BINDING,
 									Some(
 										resolved_call_from_func_symbol_with_source(
+											context.state.facts,
 											name.text,
 											source_name,
 											func_symbol,
@@ -8318,7 +8357,12 @@ private pure func resolved_call_supports_elementwise_tensor_call(
 			match call.target:
 				ResolvedDirectCall(_, CallableBuiltin):
 					builtin_is_elementwise_tensor_function(call.source_name)
-				ResolvedDirectCall(_, CallableImported(module_path)):
+				ResolvedDirectCall(_, CallableImported(_, module_path)):
+					(
+						module_path == "float"
+						and builtin_is_elementwise_tensor_function(call.source_name)
+					)
+				ResolvedDirectCall(_, CallableImportedUnresolved(module_path)):
 					(
 						module_path == "float"
 						and builtin_is_elementwise_tensor_function(call.source_name)
@@ -8617,6 +8661,7 @@ private pure func infer_qualified_module_callee(
 										entry.func_type,
 										Some(
 											resolved_call_from_overload_entry(
+												context.state.facts,
 												field.text,
 												field.text,
 												entry,
@@ -8675,6 +8720,7 @@ private pure func infer_qualified_module_field_expr(
 								entry.func_type,
 								Some(
 									resolved_call_from_overload_entry(
+										context.state.facts,
 										field.text,
 										field.text,
 										entry,
@@ -9603,7 +9649,12 @@ private pure func debug_reflection_name(resolved_call: Option[ResolvedCallInfo])
 	match resolved_call:
 		Some(call):
 			match call.target:
-				ResolvedDirectCall(_, CallableImported("debug")):
+				ResolvedDirectCall(_, CallableImported(_, "debug")):
+					if call.source_name == "type_name" or call.source_name == "is_heap":
+						Some(call.source_name)
+					else:
+						None
+				ResolvedDirectCall(_, CallableImportedUnresolved("debug")):
 					if call.source_name == "type_name" or call.source_name == "is_heap":
 						Some(call.source_name)
 					else:
@@ -9885,7 +9936,12 @@ private pure func infer_ufcs_call_with_receiver_result(
 	span: SourceSpan,
 ) -> Option[InferResult]:
 	source_name = source_name_for_imported_module_path(context, method.text, entry.module_path)
-	resolved_call = resolved_call_from_overload_entry(method.text, source_name, entry)
+	resolved_call = resolved_call_from_overload_entry(
+		context.state.facts,
+		method.text,
+		source_name,
+		entry,
+	)
 	callee_expr = TypedNameExpr(
 		method,
 		typed_expr_info_from_slot(

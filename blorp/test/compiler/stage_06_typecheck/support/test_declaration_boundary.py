@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Guard the declaration catalog's pre-assembly dependency boundary."""
+"""Guard Stage 06 declaration ownership and phase boundaries."""
 
 from pathlib import Path
 import re
@@ -7,7 +7,6 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[5]
-CATALOG = ROOT / "blorp/src/compiler/stage_06_typecheck/headers/declaration_catalog.brp"
 DECL = ROOT / "blorp/src/compiler/stage_06_typecheck/decl.brp"
 INFER = ROOT / "blorp/src/compiler/stage_06_typecheck/infer.brp"
 ENV = ROOT / "blorp/src/compiler/stage_06_typecheck/type_system/env.brp"
@@ -60,15 +59,7 @@ TRAIT_IMPLEMENTATION_AUTHORITY = (
     ROOT
     / "blorp/src/compiler/stage_06_typecheck/type_system/accepted_trait_implementation_authority.brp"
 )
-DECL_IMPORT = re.compile(r"(?m)^\s*\.\./decl(?:\s|:|$)")
-
-
-def source_without_comments() -> str:
-    lines = CATALOG.read_text(encoding="utf-8").splitlines()
-    return "\n".join(line.split("--", 1)[0] for line in lines)
-
-
-class DeclarationCatalogBoundaryTests(unittest.TestCase):
+class DeclarationBoundaryTests(unittest.TestCase):
     def test_graph_declaration_ids_store_only_module_foreign_keys(self) -> None:
         source = DECLARATION_SKELETON.read_text(encoding="utf-8")
         structural_id = re.search(
@@ -108,7 +99,7 @@ class DeclarationCatalogBoundaryTests(unittest.TestCase):
         self.assertIsNotNone(exported_key)
         self.assertIn("module_identity: ModuleIdentity", exported_key.group(0))
 
-    def test_definition_index_owns_one_module_table_and_dense_module_buckets(self) -> None:
+    def test_definition_index_owns_canonical_table_and_id_only_name_buckets(self) -> None:
         source = DEFINITION_INDEX.read_text(encoding="utf-8")
         representation = re.search(
             r"private record DefinitionIndexRep \{.*?\n\}",
@@ -118,33 +109,23 @@ class DeclarationCatalogBoundaryTests(unittest.TestCase):
 
         self.assertIsNotNone(representation)
         body = representation.group(0)
-        self.assertIn("module_table: ModuleTable", body)
+        self.assertIn("definition_table: DefinitionTable", body)
         self.assertIn("func_callable_ids_by_module_and_name: List[", body)
         self.assertIn("source_definition_ids_by_module_and_name: List[", body)
         self.assertNotIn("Dict[String, FuncCallableNameBuckets]", body)
         self.assertNotIn("Dict[String, SourceDefinitionNameBuckets]", body)
-
-    def test_decl_import_pattern_covers_every_import_form(self) -> None:
-        for import_line in ("\t../decl", "\t../decl:", "\t../decl as Decl"):
-            with self.subTest(import_line=import_line):
-                self.assertRegex(import_line, DECL_IMPORT)
-
-        self.assertNotRegex("\t../declaration_skeleton: GlobalId", DECL_IMPORT)
-
-    def test_catalog_does_not_depend_on_decl_graph_assembly(self) -> None:
-        source = source_without_comments()
-
-        self.assertNotRegex(source, DECL_IMPORT)
-
-        for forbidden_name in (
-            "AcceptedTypecheckGraph",
-            "CompletedGlobalHeader",
-            "CompletedGlobalHeaderGraph",
-            "accepted_typecheck_graph_",
-            "completed_global_header_",
-        ):
-            with self.subTest(forbidden_name=forbidden_name):
-                self.assertNotIn(forbidden_name, source)
+        self.assertIn(
+            "private type alias FuncCallableNameBuckets = "
+            "Dict[String, List[DefinitionId]]",
+            source,
+        )
+        self.assertIn(
+            "private type alias SourceDefinitionNameBuckets = "
+            "Dict[String, List[DefinitionId]]",
+            source,
+        )
+        self.assertNotIn("FuncCallableIdEntry", source)
+        self.assertNotIn("SourceDefinitionIdEntry", source)
 
     def test_migration_only_zero_metrics_are_not_production_fields(self) -> None:
         production_sources = "\n".join(
@@ -306,33 +287,6 @@ class DeclarationCatalogBoundaryTests(unittest.TestCase):
         body = function.group(0)
         self.assertIn("prepared_module_environment_find_for_scope", body)
         self.assertNotIn("prepared_module_scope_id(request_scope)", body)
-
-    def test_declaration_catalog_indexes_use_the_bound_graph_module_table(self) -> None:
-        source = (
-            ROOT / "blorp/src/compiler/stage_06_typecheck/headers/declaration_catalog.brp"
-        ).read_text(encoding="utf-8")
-        representation = re.search(
-            r"private record AcceptedDeclarationCatalogRep \{.*?\n\}",
-            source,
-            re.DOTALL,
-        )
-
-        self.assertIsNotNone(representation)
-        body = representation.group(0)
-        self.assertIn("bound_graph: BoundModuleGraph", body)
-        self.assertIn("type_index_by_module_and_name: List[Dict[String, Int]]", body)
-        self.assertIn(
-            "callable_index_by_definition_id: Dict[Int, Int]",
-            body,
-        )
-        self.assertIn(
-            "implementation_method_index_by_owner_and_callable: "
-            "Dict[Int, Dict[Int, Int]]",
-            body,
-        )
-        self.assertNotIn("Dict[String, Dict", body)
-        self.assertNotIn("by_module_and_definition_id", body)
-        self.assertNotIn("module_identity_storage_key", source)
 
     def test_callable_authority_does_not_duplicate_module_identity_indexes(self) -> None:
         source = CALLABLE_AUTHORITY.read_text(encoding="utf-8")

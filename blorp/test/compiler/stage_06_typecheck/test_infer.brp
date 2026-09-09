@@ -91,10 +91,18 @@ import:
 		ParsedWithBindingKind(ParsedWithPlainBinding, ParsedWithTryBinding),
 		ParsedWithErrorMap,
 		parsed_identifier,
-	../../../src/compiler/stage_04_modules/loaded_module: ModuleOrigin(SourcePackageModule)
+	../../../src/compiler/stage_04_modules/loaded_module:
+		ModuleOrigin(SourcePackageModule, UserModule),
+		resolved_module_identity_from_resolver,
+	../../../src/compiler/stage_04_modules/module_table: module_table, module_table_id_at
 	../../../src/compiler/stage_06_typecheck/diagnostic: typecheck_diagnostic
 	../../../src/compiler/stage_06_typecheck/infer:
-		CallableOrigin(CallableBuiltin, CallableConstructor, CallableImported),
+		CallableOrigin(
+			CallableBuiltin,
+			CallableConstructor,
+			CallableImported,
+			CallableImportedUnresolved,
+		),
 		ExpectedValueSlotContext(ExpectedArgumentSlot),
 		ExprTypeOrigin(ExplicitAnnotationOrigin, InferredOrigin),
 		InferResult,
@@ -1138,11 +1146,7 @@ pure func infer_generic_overload_entry(
 	}
 
 
-pure func env_add_test_ufcs_function(
-	env: Env,
-	name: String,
-	entry: OverloadEntry,
-) -> Env:
+pure func env_add_test_ufcs_function(env: Env, name: String, entry: OverloadEntry) -> Env:
 	env_add_func_with_info(
 		env,
 		name,
@@ -1996,11 +2000,9 @@ pure func state_with_dim_constraint_func() -> TypecheckState:
 
 pure func state_with_bounded_show_ufcs() -> TypecheckState:
 	state = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
-	{ state | env = env_add_test_ufcs_function(
-		state.env,
-		"show_bound",
-		bounded_show_overload_entry(210),
-	) }
+	{ state |
+		env = env_add_test_ufcs_function(state.env, "show_bound", bounded_show_overload_entry(210))
+	}
 
 
 pure func state_with_bounded_show_ufcs_and_string_impl() -> TypecheckState:
@@ -2464,7 +2466,7 @@ func test_imported_builtin_function_reference_preserves_module_origin() -> Bool:
 		and match typed_expr_resolved_call(result.expr):
 			Some(info):
 				match info.target:
-					ResolvedDirectCall(_, CallableImported(module_path)):
+					ResolvedDirectCall(_, CallableImportedUnresolved(module_path)):
 						module_path == "float" and info.source_name == "sqrt"
 					_:
 						False
@@ -2629,7 +2631,7 @@ func test_explicit_import_wins_scoped_trait_method_name() -> Bool:
 	result.context.state.errors.length() == 0 and match typed_expr_resolved_call(result.expr):
 		Some(info):
 			match info.target:
-				ResolvedDirectCall(_, CallableImported(module_path)):
+				ResolvedDirectCall(_, CallableImportedUnresolved(module_path)):
 					module_path == "helpers/equality"
 				_:
 					False
@@ -5370,6 +5372,104 @@ func test_closure_call_records_resolved_metadata() -> Bool:
 	)
 
 
+func test_resolved_call_metadata_compares_import_module_id_and_path() -> Bool:
+	result = infer_expr(
+		infer_context(state_with_imported_scalar_sqrt_and_tensor()),
+		call_expr(ParsedNameExpr(ident("sqrt")), [float_expr("4.0")]),
+	)
+	module_domain = module_table([
+		resolved_module_identity_from_resolver("first", UserModule),
+		resolved_module_identity_from_resolver("second", UserModule),
+	])
+
+	match (result.expr, module_domain):
+		(TypedCallExpr(TypedNameExpr(name, callee_info), args, span, call_info), Ok(table)):
+			match (
+				callee_info.resolved_call,
+				call_info.resolved_call,
+				module_table_id_at(table, 0),
+				module_table_id_at(table, 1),
+			):
+				(Some(callee_call), Some(call_call), Some(first_id), Some(second_id)):
+					callable_id = resolved_call_callable_id(callee_call).get_or(-1)
+					direct = { callee_call | target = ResolvedDirectCall(
+							callable_id,
+							CallableImported(first_id, "first"),
+						) }
+					callee = TypedNameExpr(name, { callee_info | resolved_call = Some(direct) })
+					direct_id_mismatch = TypedCallExpr(
+						callee,
+						args,
+						span,
+						{ call_info |
+							resolved_call = Some({ call_call | target = ResolvedDirectCall(
+										callable_id,
+										CallableImported(second_id, "first"),
+									) })
+						},
+					)
+					direct_path_mismatch = TypedCallExpr(
+						callee,
+						args,
+						span,
+						{ call_info |
+							resolved_call = Some({ call_call | target = ResolvedDirectCall(
+										callable_id,
+										CallableImported(first_id, "second"),
+									) })
+						},
+					)
+					trait_call = { callee_call | target = ResolvedTraitMethodCall("Show", Some({
+								callable_id = callable_id,
+								module_id = first_id,
+								module_path = "first",
+							})) }
+					trait_callee = TypedNameExpr(
+						name,
+						{ callee_info | resolved_call = Some(trait_call) },
+					)
+					trait_id_mismatch = TypedCallExpr(
+						trait_callee,
+						args,
+						span,
+						{ call_info |
+							resolved_call = Some(
+								{ call_call | target = ResolvedTraitMethodCall("Show", Some({
+											callable_id = callable_id,
+											module_id = second_id,
+											module_path = "first",
+										})) },
+							)
+						},
+					)
+					trait_path_mismatch = TypedCallExpr(
+						trait_callee,
+						args,
+						span,
+						{ call_info |
+							resolved_call = Some(
+								{ call_call | target = ResolvedTraitMethodCall("Show", Some({
+											callable_id = callable_id,
+											module_id = first_id,
+											module_path = "second",
+										})) },
+							)
+						},
+					)
+					expected = Some("call expression resolved-call metadata must match callee")
+
+					(
+						typed_expr_type_error(direct_id_mismatch) == expected
+						and typed_expr_type_error(direct_path_mismatch) == expected
+						and typed_expr_type_error(trait_id_mismatch) == expected
+						and typed_expr_type_error(trait_path_mismatch) == expected
+					)
+				_:
+					False
+		_:
+			False
+
+
 func test_typed_expr_type_error_rejects_missing_call_metadata() -> Bool:
 	result = infer_expr(
 		infer_context(state_with_add_one_func()),
@@ -5600,7 +5700,10 @@ func test_source_ufcs_method_precedes_same_named_builtin() -> Bool:
 func test_imported_session_ufcs_method_precedes_same_named_builtin() -> Bool:
 	result = infer_expr(
 		infer_context(state_with_imported_print_and_builtin()),
-		call_expr(field_access_expr(string_expr("hello"), "print"), []),
+		call_expr(
+			field_access_expr(string_expr("hello"), "print"),
+			[],
+		),
 	)
 
 	(
@@ -10976,6 +11079,10 @@ tests: TestSuite = {
 			test_direct_call_preserves_range_proof_for_range_parameter,
 		),
 		("direct call records resolved metadata", test_direct_call_records_resolved_metadata),
+		(
+			"resolved call metadata compares import module ID and path",
+			test_resolved_call_metadata_compares_import_module_id_and_path,
+		),
 		("closure call records resolved metadata", test_closure_call_records_resolved_metadata),
 		(
 			"typed expr type error rejects missing call metadata",

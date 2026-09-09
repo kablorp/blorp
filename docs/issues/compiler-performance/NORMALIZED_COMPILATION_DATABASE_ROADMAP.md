@@ -1,6 +1,6 @@
 # Normalized Compilation Database Roadmap
 
-**Status:** Active; Horizon 1 Issues 56-58 implemented
+**Status:** Active; Horizon 1 Issues 56-58 and typed-call cleanup Issue 61 implemented
 
 **Scope:** One compiler invocation and the immutable products retained by an
 LSP analysis snapshot. This is not a cross-run cache, an incremental build
@@ -12,6 +12,7 @@ with a generic database.
 1. [Issue 56: Establish One Compilation Module Table](56-establish-one-compilation-module-table.md)
 2. [Issue 57: Make Module IDs Authoritative Through Stage 06](57-make-module-ids-authoritative-through-stage-06.md)
 3. [Issue 58: Carry Module IDs Through CTFE And Core Lowering](58-carry-module-ids-through-ctfe-and-core-lowering.md)
+4. [Issue 61: Carry Module IDs In Resolved Call Metadata](61-carry-module-ids-in-resolved-call-metadata.md)
 
 ## Relationship To Current Documentation
 
@@ -965,10 +966,14 @@ audit before implementation.
    `CoreGraphUnit` with table-backed IDs at the bounded phase boundaries.
    Keep C name projection later and retain current expression/typed-program
    payloads initially.
+4. **Issue 61: Carry module IDs in resolved call metadata (implemented).** Resolve
+   imported callable and selected implementation-method ownership once in
+   Stage 06, then carry the exact ID through CTFE IR and Core expression
+   lowering. Retain path spellings only for semantic/debug/external projection.
 
 These issues are sequential. Issue 57 must not invent a second table while
-Issue 56 is unsettled, and Issue 58 must not serialize or independently rebuild
-the ID domain.
+Issue 56 is unsettled, and Issues 58/61 must not serialize or independently
+rebuild the ID domain.
 
 The completed Horizon 1 checkpoint removed descriptive module join fields and
 path-keyed CTFE/Core relations while preserving byte-identical replay output.
@@ -981,8 +986,11 @@ consumer of the normalized ID spine.
 
 After the module spine is stable:
 
-1. Normalize declaration ownership into one accepted `DefinitionTable` keyed
-   by the existing exact definition allocation domain.
+1. **Issue 61B: Establish the canonical graph definition table (implemented).**
+   Normalize declaration ownership into one accepted `DefinitionTable` keyed
+   by the existing exact definition allocation domain. Definition-name indexes
+   now retain ordered IDs only, and the dormant competing declaration catalog
+   has been removed.
 2. Replace nested structural/runtime declaration identity records with typed
    category IDs whose canonical owner/name/span facts live in tables.
 3. Make callable, global, trait, implementation, constructor, field, and

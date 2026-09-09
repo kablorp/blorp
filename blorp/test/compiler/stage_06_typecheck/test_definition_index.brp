@@ -12,6 +12,7 @@ import:
 	../../../src/compiler/stage_04_modules/module_table:
 		ModuleId,
 		ModuleTable,
+		module_ids_equal,
 		module_table,
 		module_table_find_id_by_canonical_path,
 	../../../src/compiler/stage_06_typecheck/graph/definition_identity:
@@ -23,11 +24,17 @@ import:
 	../../../src/compiler/stage_06_typecheck/graph/definition_index:
 		DefinitionIndex,
 		DefinitionIndexSeed,
+		DefinitionKind(CallableDefinitionKind, FieldDefinitionKind),
+		definition_id_runtime_value,
+		definition_index_advance_to_env,
 		definition_index_all_func_callable_bindings,
 		definition_index_all_source_definition_bindings,
 		definition_index_bootstrap_env,
 		definition_index_bootstrap_from_base_env,
 		definition_index_bootstrap_seed,
+		definition_index_callable_definition_ids_at_span,
+		definition_index_conflict_message,
+		definition_index_definition_table,
 		definition_index_empty,
 		definition_index_find_func_callable_id,
 		definition_index_find_loaded_type_definition_id,
@@ -45,8 +52,18 @@ import:
 		definition_index_seed_next_def_id,
 		definition_index_source_definition_bindings,
 		definition_index_source_definition_id_count,
+		definition_table_callable_definition_id,
+		definition_table_constructor_definition_id,
+		definition_table_definition_count,
+		definition_table_definition_id,
+		definition_table_row,
 	../../../src/compiler/stage_06_typecheck/type_system/env: ENV_EMPTY
-	../../../src/lib/source: source_cursor_at, source_file, source_span, source_start
+	../../../src/lib/source:
+		source_cursor_at,
+		source_file,
+		source_span,
+		source_spans_equal,
+		source_start,
 	../typecheck_test_support as TypecheckTestSupport
 	test: TestSuite
 
@@ -168,7 +185,7 @@ pure func test_definition_index_uses_explicit_seed_and_exact_keys() -> Bool:
 				Some("Signal"),
 				span,
 			)
-			first_id = definition_index_seed_next_def_id(seed) + 2
+			first_id = definition_index_seed_next_def_id(seed)
 			with_callable = insert_callable(empty, callable_key, first_id)
 			with_source = insert_source_definition(with_callable, source_key, first_id + 1)
 
@@ -301,7 +318,7 @@ pure func test_source_definition_name_projection_matches_exact_lookup_after_conf
 				Some("Other"),
 				second_span,
 			)
-			first_id = definition_index_seed_next_def_id(seed) + 10
+			first_id = definition_index_seed_next_def_id(seed)
 			conflicting_id = first_id - 1
 			with_first = insert_source_definition(empty, first_key, first_id)
 			conflict = definition_index_insert_source_definition_id(
@@ -529,6 +546,146 @@ pure func test_definition_index_rebases_only_append_only_module_domains() -> Boo
 	definition_index_rebases_only_append_only_module_domains().get_or(False)
 
 
+private pure func definition_table_owns_exact_canonical_rows() -> Option[Bool]:
+	seed = definition_index_seed()
+	program = parsed_program("index.brp", "index", "func render(): 0")
+	domain ?= fixture_loaded_module_set(program, [])
+	source = source_file("index.brp", "index", "func render(): 0")
+	start = source_start(source)
+	callable_span = source_span(source, start, start)
+	field_cursor = source_cursor_at(source, 1)
+	field_span = source_span(source, field_cursor, field_cursor)
+	callable_key = func_callable_key(domain.target_id, "render", callable_span)
+	field_key = source_definition_key(
+		domain.target_id,
+		FieldDefinition,
+		"value",
+		Some("Box"),
+		field_span,
+	)
+	constructor_key = source_definition_key(
+		domain.target_id,
+		ConstructorDefinition,
+		"Ready",
+		Some("Signal"),
+		field_span,
+	)
+	first_id = definition_index_seed_next_def_id(seed)
+	with_callable = insert_callable(
+		definition_index_empty(seed, domain.module_table),
+		callable_key,
+		first_id,
+	)
+	with_field = insert_source_definition(with_callable, field_key, first_id + 1)
+	index = insert_source_definition(with_field, constructor_key, first_id + 2)
+	table = definition_index_definition_table(index)
+	callable_id ?= definition_table_definition_id(table, first_id)
+	field_id ?= definition_table_definition_id(table, first_id + 1)
+	constructor_id ?= definition_table_definition_id(table, first_id + 2)
+	callable_row ?= definition_table_row(table, callable_id)
+	field_row ?= definition_table_row(table, field_id)
+	callable_ids_at_span = definition_index_callable_definition_ids_at_span(
+		index,
+		domain.module_table,
+		domain.target_id,
+		callable_span,
+	)
+
+	Some(
+		(
+			definition_id_runtime_value(callable_id) == first_id
+			and definition_table_definition_count(table) == 3
+			and callable_row.kind == CallableDefinitionKind
+			and callable_row.name == "render"
+			and callable_row.owner_name.is_none()
+			and module_ids_equal(callable_row.module_id, domain.target_id)
+			and source_spans_equal(callable_row.span, callable_span)
+			and definition_id_runtime_value(field_id) == first_id + 1
+			and field_row.kind == FieldDefinitionKind
+			and field_row.name == "value"
+			and field_row.owner_name == Some("Box")
+			and module_ids_equal(field_row.module_id, domain.target_id)
+			and source_spans_equal(field_row.span, field_span)
+			and definition_table_definition_id(table, first_id - 1).is_none()
+			and definition_table_definition_id(table, first_id + 3).is_none()
+			and definition_table_callable_definition_id(table, first_id) == Some(callable_id)
+			and definition_table_callable_definition_id(table, first_id + 1).is_none()
+			and definition_table_constructor_definition_id(table, first_id).is_none()
+			and definition_table_constructor_definition_id(
+				table,
+				first_id + 2,
+			) == Some(constructor_id)
+			and callable_ids_at_span == [callable_id]
+			and definition_index_callable_definition_ids_at_span(
+				index,
+				domain.module_table,
+				domain.target_id,
+				field_span,
+			).is_empty()
+		),
+	)
+
+
+pure func test_definition_table_owns_exact_canonical_rows() -> Bool:
+	definition_table_owns_exact_canonical_rows().get_or(False)
+
+
+private pure func definition_index_rejects_forward_definition_id_gaps() -> Option[Bool]:
+	seed = definition_index_seed()
+	program = parsed_program("index.brp", "index", "func render(): 0")
+	domain ?= fixture_loaded_module_set(program, [])
+	source = source_file("index.brp", "index", "func render(): 0")
+	start = source_start(source)
+	key = func_callable_key(
+		domain.target_id,
+		"render",
+		source_span(source, start, start),
+	)
+	index = definition_index_empty(seed, domain.module_table)
+	frontier = definition_index_next_def_id(index)
+	advanced_frontier = frontier + 20
+	advanced = definition_index_advance_to_env(
+		index,
+		{ ENV_EMPTY | next_def_id = advanced_frontier },
+	)
+	advanced_table = definition_index_definition_table(advanced)
+	advanced_insert = definition_index_insert_func_callable_id(
+		advanced,
+		domain.module_table,
+		key,
+		advanced_frontier,
+	)
+
+	match definition_index_insert_func_callable_id(index, domain.module_table, key, frontier + 1):
+		Ok(_):
+			Some(False)
+		Err(conflict):
+			Some(
+				(
+					definition_index_conflict_message(
+						index,
+						conflict,
+					).contains(
+						"definition ID " + (frontier + 1).to_string() + " is above allocation frontier " + frontier.to_string(),
+					)
+					and definition_index_next_def_id(index) == frontier
+					and definition_index_find_func_callable_id(
+						index,
+						domain.module_table,
+						key,
+					).is_none()
+					and definition_index_next_def_id(advanced) == advanced_frontier
+					and definition_table_definition_count(advanced_table) == 0
+					and definition_table_definition_id(advanced_table, advanced_frontier).is_none()
+					and advanced_insert.is_err()
+				),
+			)
+
+
+pure func test_definition_index_rejects_forward_definition_id_gaps() -> Bool:
+	definition_index_rejects_forward_definition_id_gaps().get_or(False)
+
+
 tests: TestSuite = {
 	description = "Compiler definition index",
 	tests = [
@@ -563,6 +720,14 @@ tests: TestSuite = {
 		(
 			"definition index rebases only append-only module domains",
 			test_definition_index_rebases_only_append_only_module_domains,
+		),
+		(
+			"definition table owns exact canonical rows",
+			test_definition_table_owns_exact_canonical_rows,
+		),
+		(
+			"definition index rejects forward definition id gaps",
+			test_definition_index_rejects_forward_definition_id_gaps,
 		),
 	]
 }

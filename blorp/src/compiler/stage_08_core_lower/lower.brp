@@ -36,9 +36,10 @@ import:
 		ParsedUnaryOp(ParsedNegateOp, ParsedNotOp),
 		parsed_function_body_kind,
 	../stage_04_modules/module_table:
+		ModuleId,
 		ModuleTable,
 		module_id_table_index,
-		module_table_find_id_by_canonical_path,
+		module_table_canonical_path,
 	../stage_06_typecheck/decl:
 		TypedDecl(
 			TypedFunctionDecl,
@@ -73,6 +74,7 @@ import:
 			CallableConstructor,
 			CallableForeign,
 			CallableImported,
+			CallableImportedUnresolved,
 			CallableImplMethod,
 			CallableLocal,
 		),
@@ -594,61 +596,90 @@ private pure func split_var_callable_id(name: String) -> (String, Option[Int]):
 		(name, None)
 
 
-private pure func resolved_call_target_identity(
+private pure func resolved_imported_call_explicit_name(
+	context: CoreLowerContext,
 	resolved: ResolvedCallInfo,
-) -> Option[(String, Int)]:
-	match resolved.target:
-		ResolvedTraitMethodCall(_, Some(target)):
-			Some((target.module_path, target.callable_id))
-		ResolvedDirectCall(callable_id, CallableImported(module_path)):
-			Some((module_path, callable_id))
-		_:
-			None
+	module_id: ModuleId,
+	module_path: String,
+	callable_id: Int,
+) -> Result[Option[String], CoreLowerError]:
+	match context.callable_names:
+		CoreLowerPreparedCallableNames(module_table, by_module):
+			match module_table_canonical_path(module_table, module_id):
+				Some(canonical_path):
+					if canonical_path != module_path:
+						Err(
+							CoreLowerInvalidCall(
+								"callable ${callable_id} path ${module_path} does not match module ID path ${canonical_path}",
+							),
+						)
+					else:
+						match by_module.get(module_id_table_index(module_id)):
+							Some(by_callable):
+								match by_callable.get(callable_id):
+									Some(entry):
+										if entry.source_name == resolved.source_name:
+											Ok(Some(entry.ufcs_name))
+										else:
+											Err(
+												CoreLowerInvalidCall(
+													"callable ${callable_id} in ${module_path} changed source name during graph preparation",
+												),
+											)
+									None:
+										Err(
+											CoreLowerInvalidCall(
+												"prepared graph is missing callable ${callable_id} in ${module_path}",
+											),
+										)
+							None:
+								Err(
+									CoreLowerInvalidCall(
+										"prepared graph is missing module ${module_path} for callable ${callable_id}",
+									),
+								)
+				None:
+					Err(
+						CoreLowerInvalidCall(
+							"prepared graph is missing module ID for callable ${callable_id} in ${module_path}",
+						),
+					)
+		CoreLowerDefaultCallableNames:
+			Ok(Some(core_ufcs_function_name(module_path, resolved.source_name)))
 
 
 private pure func resolved_call_explicit_name(
 	context: CoreLowerContext,
 	resolved: ResolvedCallInfo,
 ) -> Result[Option[String], CoreLowerError]:
-	match resolved_call_target_identity(resolved):
-		Some((module_path, callable_id)):
+	match resolved.target:
+		ResolvedTraitMethodCall(_, Some(target)):
+			resolved_imported_call_explicit_name(
+				context,
+				resolved,
+				target.module_id,
+				target.module_path,
+				target.callable_id,
+			)
+		ResolvedDirectCall(callable_id, CallableImported(module_id, module_path)):
+			resolved_imported_call_explicit_name(
+				context,
+				resolved,
+				module_id,
+				module_path,
+				callable_id,
+			)
+		ResolvedDirectCall(callable_id, CallableImportedUnresolved(module_path)):
 			match context.callable_names:
-				CoreLowerPreparedCallableNames(module_table, by_module):
-					match module_table_find_id_by_canonical_path(module_table, module_path):
-						Some(module_id):
-							match by_module.get(module_id_table_index(module_id)):
-								Some(by_callable):
-									match by_callable.get(callable_id):
-										Some(entry):
-											if entry.source_name == resolved.source_name:
-												Ok(Some(entry.ufcs_name))
-											else:
-												Err(
-													CoreLowerInvalidCall(
-														"callable ${callable_id} in ${module_path} changed source name during graph preparation",
-													),
-												)
-										None:
-											Err(
-												CoreLowerInvalidCall(
-													"prepared graph is missing callable ${callable_id} in ${module_path}",
-												),
-											)
-								None:
-									Err(
-										CoreLowerInvalidCall(
-											"prepared graph is missing module ${module_path} for callable ${callable_id}",
-										),
-									)
-						None:
-							Err(
-								CoreLowerInvalidCall(
-									"prepared graph is missing module ${module_path} for callable ${callable_id}",
-								),
-							)
+				CoreLowerPreparedCallableNames(_, _):
+					Err(
+						CoreLowerInvalidCall(
+							"prepared graph callable ${callable_id} in ${module_path} is missing its module ID",
+						),
+					)
 				CoreLowerDefaultCallableNames:
 					Ok(Some(core_ufcs_function_name(module_path, resolved.source_name)))
-		None:
+		_:
 			Ok(None)
 
 
@@ -671,7 +702,9 @@ private pure func resolved_core_decl_callable_id(resolved: ResolvedCallInfo) -> 
 			match origin:
 				CallableLocal:
 					Some(callable_id)
-				CallableImported(_):
+				CallableImported(_, _):
+					Some(callable_id)
+				CallableImportedUnresolved(_):
 					Some(callable_id)
 				CallableConstructor(_):
 					Some(callable_id)
@@ -3740,7 +3773,9 @@ private pure func lower_resolved_call_kind(
 							lower_user_call_kind(info, callable_id, callee)
 						CallableBuiltin:
 							Ok(lower_builtin_call_kind(info))
-						CallableImported(_):
+						CallableImported(_, _):
+							lower_user_call_kind(info, callable_id, callee)
+						CallableImportedUnresolved(_):
 							lower_user_call_kind(info, callable_id, callee)
 						CallableConstructor(_):
 							Ok(UnknownCall)

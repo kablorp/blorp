@@ -313,12 +313,12 @@ from one accepted graph, where Stage 04 has already rejected conflicting module
 origins for one canonical path. This is not a general claim that canonical
 paths replace durable module identity.
 
-Issue 36 keeps `AcceptedDeclarationCatalog` out of production graph state; its
-only consumers are the focused benchmark and tests. The catalog retains its
-bound graph for exact lookup validation only for that catalog's lifetime. This
-catalog cleanup is therefore structural evidence and is not credited with the
-production replay reduction below. The replay measures the accepted-authority
-and declaration-path changes that production actually executes.
+Issue 36 kept `AcceptedDeclarationCatalog` out of production graph state. Its
+remaining benchmark/test-only implementation was removed by the canonical
+DefinitionTable prerequisite after a fresh reachability audit found no
+production reader. That later cleanup is not credited with the production
+replay reduction below; this replay measures the accepted-authority and
+declaration-path changes that production actually executed at this checkpoint.
 
 Three final production replays against the same capture were verified,
 byte-identical, allocator-complete, and free of timeout or memory-limit events:

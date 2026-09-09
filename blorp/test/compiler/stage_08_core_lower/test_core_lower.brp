@@ -32,6 +32,7 @@ import:
 		ModuleTable,
 		module_table,
 		module_table_id_at,
+		singleton_module_table,
 	../../../src/compiler/stage_06_typecheck/decl:
 		TypedDecl(
 			TypedFunctionDecl,
@@ -65,6 +66,7 @@ import:
 			CallableConstructor,
 			CallableForeign,
 			CallableImported,
+			CallableImportedUnresolved,
 			CallableImplMethod,
 			CallableLocal,
 		),
@@ -165,7 +167,11 @@ import:
 	../../../src/compiler/stage_08_core_lower/flatten:
 		CoreFlattenError(CoreFlattenCallableTargetNameCollision),
 	../../../src/compiler/stage_08_core_lower/graph_prepare:
-		CoreGraphPrepareError(CoreGraphFlattenError, CoreGraphModuleTableError),
+		CoreGraphPrepareError(
+			CoreGraphFlattenError,
+			CoreGraphLowerError,
+			CoreGraphModuleTableError,
+		),
 		CoreGraphUnit,
 		core_graph_modules,
 		core_graph_prepare_error_to_string,
@@ -1121,7 +1127,7 @@ func test_lowers_local_function_reference_with_callable_id() -> Bool:
 func test_lowers_imported_function_reference_with_callable_id() -> Bool:
 	resolved = resolved_call_info(
 		"to_result",
-		ResolvedDirectCall(2180, CallableImported("option")),
+		ResolvedDirectCall(2180, CallableImportedUnresolved("option")),
 	)
 	expr = TypedNameExpr(
 		ident("to_result"),
@@ -1185,7 +1191,7 @@ func test_lowers_resolved_imported_direct_call_with_explicit_identity() -> Bool:
 	callee = TypedNameExpr(ident("external_add"), expr_info(function_type()))
 	resolved = resolved_call_info(
 		"external_add",
-		ResolvedDirectCall(92, CallableImported("list")),
+		ResolvedDirectCall(92, CallableImportedUnresolved("list")),
 	)
 	expr = TypedCallExpr(
 		callee,
@@ -1218,7 +1224,7 @@ func test_lowers_qualified_imported_direct_call_with_explicit_identity() -> Bool
 	)
 	resolved = { resolved_call_info(
 		"StdList.external_add",
-		ResolvedDirectCall(92, CallableImported("list")),
+		ResolvedDirectCall(92, CallableImportedUnresolved("list")),
 	) | source_name = "external_add" }
 	expr = TypedCallExpr(
 		callee,
@@ -1237,7 +1243,7 @@ func test_lowers_qualified_imported_direct_call_with_explicit_identity() -> Bool
 func test_lowers_resolved_imported_direct_call() -> Bool:
 	resolved = resolved_call_info(
 		"external_add",
-		ResolvedDirectCall(92, CallableImported("math")),
+		ResolvedDirectCall(92, CallableImportedUnresolved("math")),
 	)
 	callee = TypedNameExpr(ident("external_add"), expr_info(function_type()))
 	expr = TypedCallExpr(
@@ -1295,11 +1301,13 @@ func test_lowers_deferred_trait_method_call_with_dispatch_identity() -> Bool:
 
 
 func test_lowers_selected_trait_method_call_with_dispatch_identity() -> Bool:
+	domain = singleton_module_table(resolved_module_identity_from_resolver("display", UserModule))
 	callee = TypedNameExpr(ident("display"), expr_info(function_type()))
 	resolved = resolved_call_info(
 		"display",
 		ResolvedTraitMethodCall("Display", Some({
 				callable_id = 94,
+				module_id = domain[1],
 				module_path = "display",
 			})),
 	)
@@ -5018,11 +5026,13 @@ func test_core_graph_rejects_module_id_outside_table() -> Bool:
 			False
 
 
-private func prepared_graph_uses_canonical_module_path_for_repeated_imports(
+private func prepared_graph_resolves_repeated_imports(
 	module_table: ModuleTable,
 	target_module_id: ModuleId,
 	first_module_id: ModuleId,
 	second_module_id: ModuleId,
+	resolved_module_path: String,
+	expect_rejection: Bool,
 ) -> Bool:
 	first_module_function: TypedFunctionInfo = {
 		decl = { parsed_function_decl() | name = ident("shared") },
@@ -5064,7 +5074,10 @@ private func prepared_graph_uses_canonical_module_path_for_repeated_imports(
 	}
 	resolved = resolved_call_info(
 		"shared",
-		ResolvedDirectCall(501, CallableImported("pkg/v1/display/first")),
+		ResolvedDirectCall(
+			501,
+			CallableImported(first_module_id, resolved_module_path),
+		),
 	)
 	referenced_shared = TypedNameExpr(
 		ident("shared"),
@@ -5106,36 +5119,62 @@ private func prepared_graph_uses_canonical_module_path_for_repeated_imports(
 		)
 	):
 		Ok(prepared):
-			match prepared.program.decls:
-				[FunctionDecl(_), FunctionDecl(_), FunctionDecl(target_info)]:
-					match target_info.body:
-						Some(TupleExpr([VarExpr(first, _, _), VarExpr(second, _, _)], _, _)):
-							(
-								first.name == "__ufcs_pkg$v1$display$first__shared"
-								and second.name == first.name
-								and first.def_id == Some(501)
-								and second.def_id == Some(501)
-							)
-						_:
-							False
-				_:
-					False
+			if expect_rejection:
+				False
+			else:
+				match prepared.program.decls:
+					[FunctionDecl(_), FunctionDecl(_), FunctionDecl(target_info)]:
+						match target_info.body:
+							Some(TupleExpr([VarExpr(first, _, _), VarExpr(second, _, _)], _, _)):
+								(
+									first.name == "__ufcs_pkg$v1$display$first__shared"
+									and second.name == first.name
+									and first.def_id == Some(501)
+									and second.def_id == Some(501)
+								)
+							_:
+								False
+					_:
+						False
+		Err(CoreGraphLowerError(_, CoreLowerInvalidCall(message))):
+			expect_rejection and message.contains("does not match module ID")
 		Err(_):
 			False
 
 
-func test_prepared_graph_uses_canonical_module_path_for_repeated_imports() -> Bool:
+func test_prepared_graph_uses_module_id_for_repeated_imports() -> Bool:
 	match core_graph_test_module_domain([
 		"app/main",
 		"pkg/v1/display/first",
 		"pkg/v1/display/second",
 	]):
 		Some((module_table, [target_module_id, first_module_id, second_module_id])):
-			prepared_graph_uses_canonical_module_path_for_repeated_imports(
+			prepared_graph_resolves_repeated_imports(
 				module_table,
 				target_module_id,
 				first_module_id,
 				second_module_id,
+				"pkg/v1/display/first",
+				False,
+			)
+		_:
+			False
+
+
+func test_prepared_graph_rejects_mismatched_import_module_metadata() -> Bool:
+	match core_graph_test_module_domain([
+		"app/main",
+		"pkg/v1/display/first",
+		"pkg/v1/display/second",
+	]):
+		Some((module_table, [target_module_id, first_module_id, second_module_id])):
+			prepared_graph_resolves_repeated_imports(
+				module_table,
+				target_module_id,
+				first_module_id,
+				second_module_id,
+				"pkg/v1/display/second",
+				True,
 			)
 		_:
 			False
@@ -5634,8 +5673,12 @@ tests: TestSuite = {
 			test_core_graph_flatten_error_has_module_context,
 		),
 		(
-			"prepared graph caches canonical imported callable names",
-			test_prepared_graph_uses_canonical_module_path_for_repeated_imports,
+			"prepared graph uses module ID for repeated imports",
+			test_prepared_graph_uses_module_id_for_repeated_imports,
+		),
+		(
+			"prepared graph rejects mismatched import module metadata",
+			test_prepared_graph_rejects_mismatched_import_module_metadata,
 		),
 		("synthesizes explicit program entrypoint", test_synthesizes_explicit_program_entrypoint),
 		(

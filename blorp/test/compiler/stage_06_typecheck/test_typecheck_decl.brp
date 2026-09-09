@@ -76,7 +76,10 @@ import:
 		module_load_candidate,
 		resolved_module_identity_from_resolver,
 	../../../src/compiler/stage_04_modules/module_surface: module_surface_for_program
-	../../../src/compiler/stage_04_modules/module_table: module_table, module_table_canonical_path
+	../../../src/compiler/stage_04_modules/module_table:
+		module_table,
+		module_table_canonical_path,
+		module_table_find_id_by_canonical_path,
 	../../../src/compiler/stage_06_typecheck/decl:
 		AcceptedTypecheckGraph,
 		TypecheckProgramResult,
@@ -104,6 +107,7 @@ import:
 		typecheck_check_standalone_program_bodies,
 		typecheck_materialize_standalone_program_bodies,
 		typecheck_prescan_program,
+		typecheck_register_impl_decls,
 		typecheck_register_program_impl_decls,
 		typecheck_register_program_import_decls,
 		typecheck_register_program_signature_decls,
@@ -134,15 +138,24 @@ import:
 	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
 		DeclarationVisibility(PublicDeclaration),
 		builtin_trait_id,
+		callable_id_definition_id,
+		impl_id_definition_id,
+		impl_id_module_id,
 		trait_id_definition_id,
 		trait_id_module_id,
 		trait_id_name,
 	../../../src/compiler/stage_06_typecheck/headers/implementation_headers:
 		implementation_header_graph_callable_headers,
+		implementation_header_graph_headers,
+		implementation_header_id,
+		implementation_header_method_ids,
+		implementation_header_trait_id,
+		implementation_header_visibility,
 	../../../src/compiler/stage_06_typecheck/headers/trait_headers:
 		trait_topology_graph_headers,
 		trait_topology_graph_type_headers,
 		trait_topology_header_id,
+		trait_topology_header_visibility,
 	../../../src/compiler/stage_06_typecheck/headers/type_header_graph:
 		type_header_graph_bound_graph,
 	../../../src/compiler/stage_06_typecheck/infer:
@@ -232,6 +245,7 @@ import:
 	../../../src/compiler/stage_06_typecheck/type_system/accepted_record_authority:
 		accepted_record_find,
 	../../../src/compiler/stage_06_typecheck/type_system/accepted_trait_implementation_authority:
+		AcceptedImplementationTableRecord,
 		AcceptedTraitTableRecord,
 		accepted_has_direct_trait_evidence,
 		accepted_implementation_candidate_count,
@@ -239,6 +253,7 @@ import:
 		accepted_trait_find_exact,
 		accepted_trait_implementation_authority,
 		accepted_trait_implementation_table,
+		accepted_trait_implementation_table_validation_errors,
 		accepted_trait_module_path,
 	../../../src/compiler/stage_06_typecheck/type_system/accepted_union_authority:
 		AcceptedUnionVariantEntry,
@@ -250,6 +265,7 @@ import:
 		FieldDecl,
 		FuncOrigin(ForeignFunc, UserDefinedFunc),
 		Purity(Impure, Pure),
+		ResourceArgPolicy(RejectResourceArgs),
 		SymbolKind(FuncSymbolKind),
 		TraitObligationResolution(TraitObligationUnsatisfied),
 		TypeKind(TypeResource),
@@ -270,6 +286,8 @@ import:
 		env_lookup,
 		env_type_contains_resource_if_valid,
 		impl_instance,
+		impl_instance_with_methods,
+		impl_method_info,
 		trait_def_with_details,
 		trait_obligation,
 	../../../src/compiler/stage_06_typecheck/type_system/refinement: UNREFINED_BINDING
@@ -2165,6 +2183,169 @@ private pure func accepted_trait_table_exact_identity_is_owner_safe() -> Option[
 
 func test_accepted_trait_table_exact_identity_is_owner_safe() -> Bool:
 	accepted_trait_table_exact_identity_is_owner_safe().get_or(False)
+
+
+func test_impl_registration_rejects_mismatched_module_path() -> Bool:
+	method_span = source_span_at(1)
+	method: ParsedFunctionDecl = {
+		name = ident("identity"),
+		keyword_span = Some(method_span),
+		type_params = [],
+		params = [named_param("value", int_type())],
+		return_type = Some(int_type()),
+		dim_constraints = [],
+		body = Some(decl_name_expr("value")),
+		is_pure = True,
+		annotations = [],
+		doc = None,
+		span = method_span
+	}
+	source_program = program([
+		trait_decl("Identity"),
+		impl_decl_with_methods_at("Identity", int_type(), [method], 2),
+	])
+	with_signatures = typecheck_register_program_signature_decls(
+		typecheck_test_install_validated_type_headers(
+			typecheck_prescan_program(
+				typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+				source_program,
+			),
+			source_program,
+		),
+		source_program,
+	)
+	result = typecheck_register_impl_decls(with_signatures, "other/module", source_program.decls)
+
+	result.errors == [
+		(
+			"internal typecheck error: implementation method module path does not match its "
+			+ "module ID"
+		),
+	] and env_find_impl_method_info(result.env, "Identity", "identity", TYPE_INT).is_none()
+
+
+private pure func accepted_table_rejects_mismatched_method_module() -> Option[Bool]:
+	method_span = source_span_at(1)
+	method: ParsedFunctionDecl = {
+		name = ident("identity"),
+		keyword_span = Some(method_span),
+		type_params = [],
+		params = [named_param("value", int_type())],
+		return_type = Some(int_type()),
+		dim_constraints = [],
+		body = Some(decl_name_expr("value")),
+		is_pure = True,
+		annotations = [],
+		doc = None,
+		span = method_span
+	}
+	source_program = program([
+		import_block_decl([import_decl("other/module", None, None)]),
+		trait_decl("Identity"),
+		impl_decl_with_methods_at("Identity", int_type(), [method], 2),
+	])
+	graph ?= typecheck_test_accepted_graph(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		source_program,
+		importable_modules("other/module", []),
+	).to_option()
+	implementation_headers = accepted_typecheck_graph_implementation_headers(graph)
+	implementation ?= implementation_header_graph_headers(implementation_headers).get(0)
+	trait_header ?= trait_topology_graph_headers(
+		callable_header_graph_trait_topology(
+			implementation_header_graph_callable_headers(implementation_headers),
+		),
+	).get(0)
+	module_table = indexed_graph_module_table(
+		bound_module_graph_indexed_graph(
+			type_header_graph_bound_graph(
+				trait_topology_graph_type_headers(
+					callable_header_graph_trait_topology(
+						implementation_header_graph_callable_headers(
+							implementation_headers,
+						),
+					),
+				),
+			),
+		),
+	)
+	implementation_id = implementation_header_id(implementation)
+	owner_module_id = impl_id_module_id(implementation_id)
+	owner_path ?= module_table_canonical_path(module_table, owner_module_id)
+	other_module_id ?= module_table_find_id_by_canonical_path(module_table, "other/module")
+	method_id ?= implementation_header_method_ids(implementation).get(0)
+	trait_id = implementation_header_trait_id(implementation)
+	trait_record: AcceptedTraitTableRecord = {
+		id = trait_id,
+		compiler_builtin_id = None,
+		visibility = trait_topology_header_visibility(trait_header),
+		supertraits = [],
+		method_ids = [],
+		definition = trait_def_with_details(
+			trait_id_definition_id(trait_id),
+			trait_id_name(trait_id),
+			[],
+			[],
+			[],
+			Some(owner_path),
+		)
+	}
+	correct_method = impl_method_info(
+		"identity",
+		Some({
+			callable_id = callable_id_definition_id(method_id),
+			module_id = owner_module_id,
+			module_path = owner_path,
+		}),
+		SemanticFunctionType(True, [TYPE_INT], TYPE_INT),
+		[],
+		[Some("value")],
+		Pure,
+		RejectResourceArgs,
+		[],
+		False,
+	)
+	instance = impl_instance_with_methods(
+		impl_id_definition_id(implementation_id),
+		trait_id_name(trait_id),
+		TYPE_INT,
+		[],
+		[correct_method],
+		False,
+	)
+	correct: AcceptedImplementationTableRecord = {
+		id = implementation_id,
+		trait_id = trait_id,
+		visibility = implementation_header_visibility(implementation),
+		method_ids = [method_id],
+		instance = instance
+	}
+	mismatched_method = { correct_method | target = Some({
+			callable_id = callable_id_definition_id(method_id),
+			module_id = other_module_id,
+			module_path = owner_path,
+		}) }
+	mismatched = { correct | instance = { instance | methods = [mismatched_method] } }
+	correct_input = {
+		module_table = module_table,
+		traits = [trait_record],
+		implementations = [correct]
+	}
+	mismatched_input = { correct_input | implementations = [mismatched] }
+
+	Some(
+		(
+			accepted_trait_implementation_table(correct_input).is_some()
+			and accepted_trait_implementation_table(mismatched_input).is_none()
+			and accepted_trait_implementation_table_validation_errors(
+				mismatched_input,
+			) == ["invalid accepted implementation record for trait 'Identity'"]
+		),
+	)
+
+
+func test_accepted_table_rejects_mismatched_method_module() -> Bool:
+	accepted_table_rejects_mismatched_method_module().get_or(False)
 
 
 func test_import_modules_register_canonical_type_payloads() -> Bool:
@@ -6428,6 +6609,14 @@ tests: TestSuite = {
 		(
 			"accepted trait table exact identity is owner safe",
 			test_accepted_trait_table_exact_identity_is_owner_safe,
+		),
+		(
+			"impl registration rejects mismatched module path",
+			test_impl_registration_rejects_mismatched_module_path,
+		),
+		(
+			"accepted table rejects mismatched method module",
+			test_accepted_table_rejects_mismatched_method_module,
 		),
 	]
 }

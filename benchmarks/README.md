@@ -437,19 +437,6 @@ them as disjoint wall time. Request construction is excluded from
 use the `compiler_typecheck_benchmark_with_request` subtree when comparing the
 typecheck workload itself.
 
-`compiler_declaration_catalog_profile` isolates construction of the accepted
-declaration catalog from an already accepted mixed typecheck graph:
-
-```bash
-benchmarks/compiler_declaration_catalog_profile 8 4 1 2 20
-```
-
-The positional controls are module count, shapes per module, probes per module,
-import fanout, and catalog build iterations. Graph construction is setup and is
-excluded from the measured window. The summary reports exact entry/visit
-counts, elapsed time, allocations/releases after build-and-discard, and a
-separate retained catalog object/byte observation.
-
 ### Core module flattening profile
 
 `compiler_core_flatten_profile` isolates the callable-heavy module-flattening
