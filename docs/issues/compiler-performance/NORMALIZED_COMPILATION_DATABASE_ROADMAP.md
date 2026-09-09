@@ -1,6 +1,6 @@
 # Normalized Compilation Database Roadmap
 
-**Status:** Active; Horizon 1 and Issues 61B, 68, and 69 implemented; Issues 70-73 defined
+**Status:** Active; Horizon 1 and Issues 61B, 68-70 implemented; Issues 71-73 defined
 
 **Scope:** One compiler invocation and the immutable products retained by an
 LSP analysis snapshot. This is not a cross-run cache, an incremental build
@@ -1040,7 +1040,7 @@ Horizon 2 has one table foundation followed by six bounded identity cuts:
    module from the table and delete per-expression path-to-ID probes. The
    completed cut also replaced a modules-times-callables body-planning scan
    with contiguous per-module ranges over the canonical callable list.
-4. **[Issue 70: Make nominal type IDs definition-backed](70-make-nominal-type-ids-definition-backed.md).**
+4. **[Issue 70: Make nominal type IDs definition-backed](70-make-nominal-type-ids-definition-backed.md) (implemented).**
    Replace `TypeIdRep { module_id, name, span }` and its serialized storage keys
    with a category-safe scalar definition ID. Cut accepted alias, record, and
    union authorities over in the same issue so the old managed identity does

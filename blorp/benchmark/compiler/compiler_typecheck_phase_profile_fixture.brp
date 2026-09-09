@@ -51,6 +51,8 @@ import:
 		source_definition_key_owner,
 		source_definition_key_span,
 	../../src/compiler/stage_06_typecheck/graph/definition_index:
+		DefinitionTable,
+		definition_table_type_row,
 		definition_index_all_func_callable_bindings,
 		definition_index_all_source_definition_bindings,
 		definition_index_func_callable_id_count,
@@ -71,8 +73,7 @@ import:
 		prepared_module_scope_module,
 	../../src/compiler/stage_06_typecheck/graph/type_identity:
 		TypeId,
-		type_id_module_id,
-		type_id_name,
+		type_id_definition_id,
 	../../src/compiler/stage_06_typecheck/headers/callable_headers:
 		CallableHeaderGraph,
 		CallableHeaderGraphError,
@@ -106,6 +107,7 @@ import:
 		),
 		callable_id_definition_id,
 		constructor_id_definition_id,
+		declaration_skeleton_graph_definition_table,
 		declaration_skeleton_graph_build,
 		declaration_skeleton_graph_constructor_lookup_candidate_count,
 		declaration_skeleton_graph_error_message,
@@ -340,7 +342,7 @@ private union CompilerTypecheckPhaseProfileProduct:
 
 
 private union CompilerTypecheckPhaseProfileExecutionRep:
-	CompilerTypecheckPhaseExecutionCompleted(CompilerTypecheckProfileStage, Int, CompilerTypecheckPhaseProfileProduct)
+	CompilerTypecheckPhaseExecutionCompleted(CompilerTypecheckProfileStage, Int, DefinitionTable, CompilerTypecheckPhaseProfileProduct)
 	CompilerTypecheckPhaseExecutionFailed(CompilerTypecheckProfileStage, Int, List[String])
 
 
@@ -488,8 +490,11 @@ private pure func parameter_error_messages(
 	errors.map(resolved_type_parameter_graph_error_message)
 
 
-private pure func header_error_messages(errors: List[TypeHeaderError]) -> List[String]:
-	errors.map(type_header_error_message)
+private pure func header_error_messages(
+	definition_table: DefinitionTable,
+	errors: List[TypeHeaderError],
+) -> List[String]:
+	errors.map(func(error): type_header_error_message(definition_table, error))
 
 
 private pure func trait_topology_error_messages(
@@ -620,7 +625,10 @@ pure func compiler_typecheck_phase_profile_fixture(
 										Ok(parameter_graph):
 											match type_header_graph_build(parameter_graph):
 												Err(errors):
-													Err(header_error_messages(errors))
+													Err(header_error_messages(
+														declaration_skeleton_graph_definition_table(declaration_graph),
+														errors,
+													))
 												Ok(type_headers):
 													complete_profile_fixture(
 														target_candidate,
@@ -737,16 +745,25 @@ private pure func fingerprint_source_definition_key(
 	)
 
 
-private pure func type_id_fingerprint_text(id: TypeId) -> String:
-	module_id_table_index(type_id_module_id(id)).to_string() + ":" + type_id_name(id)
+private pure func type_id_fingerprint_text(
+	definition_table: DefinitionTable,
+	id: TypeId,
+) -> String:
+	match definition_table_type_row(definition_table, type_id_definition_id(id)):
+		Some(row): module_id_table_index(row.module_id).to_string() + ":" + row.name
+		None: "-1:<missing-type>"
 
 
 private pure func fingerprint_type_parameter(
+	definition_table: DefinitionTable,
 	fingerprint: Int,
 	parameter: ResolvedTypeParameter,
 ) -> Int:
 	var next = fingerprint
-		.fingerprint_add_text(type_id_fingerprint_text(type_parameter_id_owner(parameter.id)))
+		.fingerprint_add_text(type_id_fingerprint_text(
+			definition_table,
+			type_parameter_id_owner(parameter.id),
+		))
 		.fingerprint_add_int(type_parameter_id_index(parameter.id))
 		.fingerprint_add_text(type_parameter_id_name(parameter.id))
 		.fingerprint_add_int(parameter.bounds.length())
@@ -767,6 +784,7 @@ private pure func fingerprint_type_parameter(
 
 
 private pure func fingerprint_resolved_type_shape(
+	definition_table: DefinitionTable,
 	fingerprint: Int,
 	shape: ResolvedTypeShape,
 ) -> Int:
@@ -774,11 +792,11 @@ private pure func fingerprint_resolved_type_shape(
 		DeclaredTypeShape(id, args):
 			var next = fingerprint
 				.fingerprint_add_text("declared")
-				.fingerprint_add_text(type_id_fingerprint_text(id))
+				.fingerprint_add_text(type_id_fingerprint_text(definition_table, id))
 				.fingerprint_add_int(args.length())
 
 			for arg in args:
-				next = fingerprint_resolved_type_shape(next, arg)
+				next = fingerprint_resolved_type_shape(definition_table, next, arg)
 
 			next
 		IntrinsicTypeShape(intrinsic, args):
@@ -788,7 +806,7 @@ private pure func fingerprint_resolved_type_shape(
 				.fingerprint_add_int(args.length())
 
 			for arg in args:
-				next = fingerprint_resolved_type_shape(next, arg)
+				next = fingerprint_resolved_type_shape(definition_table, next, arg)
 
 			next
 		PreludeTypeShape(prelude_type, args):
@@ -798,19 +816,19 @@ private pure func fingerprint_resolved_type_shape(
 				.fingerprint_add_int(args.length())
 
 			for arg in args:
-				next = fingerprint_resolved_type_shape(next, arg)
+				next = fingerprint_resolved_type_shape(definition_table, next, arg)
 
 			next
 		TypeParameterShape(id):
 			fingerprint
 				.fingerprint_add_text("parameter")
-				.fingerprint_add_text(type_id_fingerprint_text(type_parameter_id_owner(id)))
+				.fingerprint_add_text(type_id_fingerprint_text(definition_table, type_parameter_id_owner(id)))
 				.fingerprint_add_int(type_parameter_id_index(id))
 				.fingerprint_add_text(type_parameter_id_name(id))
 		SelfTypeShape(id):
 			fingerprint
 				.fingerprint_add_text("self")
-				.fingerprint_add_text(type_id_fingerprint_text(id))
+				.fingerprint_add_text(type_id_fingerprint_text(definition_table, id))
 		TraitTypeParameterShape(id):
 			fingerprint
 				.fingerprint_add_text("trait-parameter")
@@ -833,7 +851,7 @@ private pure func fingerprint_resolved_type_shape(
 		DimensionParameterShape(id, variadic):
 			fingerprint
 				.fingerprint_add_text("dimension-parameter")
-				.fingerprint_add_text(type_id_fingerprint_text(type_parameter_id_owner(id)))
+				.fingerprint_add_text(type_id_fingerprint_text(definition_table, type_parameter_id_owner(id)))
 				.fingerprint_add_int(type_parameter_id_index(id))
 				.fingerprint_add_text(type_parameter_id_name(id))
 				.fingerprint_add_bool(variadic)
@@ -875,7 +893,9 @@ private pure func fingerprint_resolved_type_shape(
 					"divide"
 
 			fingerprint_resolved_type_shape(
+				definition_table,
 				fingerprint_resolved_type_shape(
+					definition_table,
 					fingerprint
 						.fingerprint_add_text("dimension-binary")
 						.fingerprint_add_text(op_name),
@@ -885,6 +905,7 @@ private pure func fingerprint_resolved_type_shape(
 			)
 		RangeTypeShape(inner):
 			fingerprint_resolved_type_shape(
+				definition_table,
 				fingerprint.fingerprint_add_text("range"),
 				inner,
 			)
@@ -894,7 +915,7 @@ private pure func fingerprint_resolved_type_shape(
 				.fingerprint_add_int(items.length())
 
 			for item in items:
-				next = fingerprint_resolved_type_shape(next, item)
+				next = fingerprint_resolved_type_shape(definition_table, next, item)
 
 			next
 		FunctionTypeShape(is_pure, params, return_type):
@@ -904,17 +925,18 @@ private pure func fingerprint_resolved_type_shape(
 				.fingerprint_add_int(params.length())
 
 			for parameter in params:
-				next = fingerprint_resolved_type_shape(next, parameter)
+				next = fingerprint_resolved_type_shape(definition_table, next, parameter)
 
-			fingerprint_resolved_type_shape(next, return_type)
+			fingerprint_resolved_type_shape(definition_table, next, return_type)
 		ArrayTypeShape(element, dimensions):
 			var next = fingerprint_resolved_type_shape(
+				definition_table,
 				fingerprint.fingerprint_add_text("array"),
 				element,
 			).fingerprint_add_int(dimensions.length())
 
 			for dimension in dimensions:
-				next = fingerprint_resolved_type_shape(next, dimension)
+				next = fingerprint_resolved_type_shape(definition_table, next, dimension)
 
 			next
 
@@ -1156,16 +1178,23 @@ private pure func skeleton_output_summary(
 
 
 private pure func alias_output_summary(
+	definition_table: DefinitionTable,
 	graph: AcyclicTypeAliasDependencyGraph,
 ) -> CompilerTypecheckPhaseOutputSummary:
 	nodes = acyclic_type_alias_dependency_graph_nodes(graph)
 	var fingerprint: Int = 0
 
 	for node in nodes:
-		fingerprint = fingerprint_add_text(fingerprint, type_id_fingerprint_text(node.id))
+		fingerprint = fingerprint_add_text(
+			fingerprint,
+			type_id_fingerprint_text(definition_table, node.id),
+		)
 
 		for dependency in node.dependencies:
-			fingerprint = fingerprint_add_text(fingerprint, type_id_fingerprint_text(dependency))
+			fingerprint = fingerprint_add_text(
+				fingerprint,
+				type_id_fingerprint_text(definition_table, dependency),
+			)
 
 	{
 		primary_count = nodes.length(),
@@ -1175,16 +1204,20 @@ private pure func alias_output_summary(
 
 
 private pure func parameter_output_summary(
+	definition_table: DefinitionTable,
 	graph: ResolvedTypeParameterGraph,
 ) -> CompilerTypecheckPhaseOutputSummary:
 	entries = resolved_type_parameter_graph_entries(graph)
 	var fingerprint: Int = 0
 
 	for entry in entries:
-		fingerprint = fingerprint_add_text(fingerprint, type_id_fingerprint_text(entry.type_id))
+		fingerprint = fingerprint_add_text(
+			fingerprint,
+			type_id_fingerprint_text(definition_table, entry.type_id),
+		)
 
 		for parameter in entry.parameters:
-			fingerprint = fingerprint_type_parameter(fingerprint, parameter)
+			fingerprint = fingerprint_type_parameter(definition_table, fingerprint, parameter)
 
 	{
 		primary_count = entries.length(),
@@ -1194,18 +1227,22 @@ private pure func parameter_output_summary(
 
 
 private pure func header_output_summary(
+	definition_table: DefinitionTable,
 	graph: TypeHeaderGraph,
 ) -> CompilerTypecheckPhaseOutputSummary:
 	headers = type_header_graph_headers(graph)
 	var fingerprint: Int = 0
 
 	for header in headers:
-		fingerprint = fingerprint_add_text(fingerprint, type_id_fingerprint_text(header.id))
+		fingerprint = fingerprint_add_text(
+			fingerprint,
+			type_id_fingerprint_text(definition_table, header.id),
+		)
 		parameters = header.parameters
 		fingerprint = fingerprint.fingerprint_add_int(parameters.length())
 
 		for parameter in parameters:
-			fingerprint = fingerprint_type_parameter(fingerprint, parameter)
+			fingerprint = fingerprint_type_parameter(definition_table, fingerprint, parameter)
 
 		fingerprint = fingerprint.fingerprint_add_bool(header.containment.contains_resource)
 
@@ -1224,6 +1261,7 @@ private pure func header_output_summary(
 
 				for field in fields:
 					fingerprint = fingerprint_resolved_type_shape(
+						definition_table,
 						fingerprint
 							.fingerprint_add_text(field.name)
 							.fingerprint_add_optional_int(field.definition_id),
@@ -1246,11 +1284,18 @@ private pure func header_output_summary(
 						.fingerprint_add_text(variant.name)
 						.fingerprint_add_int(variant.tag)
 						.fingerprint_add_int(constructor_id_definition_id(variant.id))
-						.fingerprint_add_text(type_id_fingerprint_text(variant.parent_type_id))
+						.fingerprint_add_text(type_id_fingerprint_text(
+							definition_table,
+							variant.parent_type_id,
+						))
 						.fingerprint_add_int(variant.fields.length())
 
 					for field in variant.fields:
-						fingerprint = fingerprint_resolved_type_shape(fingerprint, field)
+						fingerprint = fingerprint_resolved_type_shape(
+							definition_table,
+							fingerprint,
+							field,
+						)
 			BuiltinTypeHeader(layout):
 				fingerprint = fingerprint.fingerprint_add_text("builtin")
 
@@ -1281,6 +1326,7 @@ private pure func header_output_summary(
 						"opaque"
 
 				fingerprint = fingerprint_resolved_type_shape(
+					definition_table,
 					fingerprint
 						.fingerprint_add_text("alias")
 						.fingerprint_add_text(layout_name),
@@ -1295,6 +1341,7 @@ private pure func header_output_summary(
 
 
 private pure func fingerprint_callable_signature(
+	definition_table: DefinitionTable,
 	fingerprint: Int,
 	signature: CallableSignature,
 ) -> Int:
@@ -1304,12 +1351,17 @@ private pure func fingerprint_callable_signature(
 		.fingerprint_add_bool(callable_signature_is_pure(signature))
 
 	for parameter in parameters:
-		next = fingerprint_resolved_type_shape(next, parameter.typ)
+		next = fingerprint_resolved_type_shape(definition_table, next, parameter.typ)
 
-	fingerprint_resolved_type_shape(next, callable_signature_return_type(signature))
+	fingerprint_resolved_type_shape(
+		definition_table,
+		next,
+		callable_signature_return_type(signature),
+	)
 
 
 private pure func trait_topology_output_summary(
+	definition_table: DefinitionTable,
 	graph: TraitTopologyGraph,
 ) -> CompilerTypecheckPhaseOutputSummary:
 	headers = trait_topology_graph_headers(graph)
@@ -1331,6 +1383,7 @@ private pure func trait_topology_output_summary(
 		for method in methods:
 			method_id = trait_method_slot_id(method)
 			fingerprint = fingerprint_callable_signature(
+				definition_table,
 				fingerprint.fingerprint_add_int(trait_method_id_index(method_id)),
 				trait_method_slot_signature(method),
 			)
@@ -1343,6 +1396,7 @@ private pure func trait_topology_output_summary(
 
 
 private pure func callable_header_output_summary(
+	definition_table: DefinitionTable,
 	graph: CallableHeaderGraph,
 ) -> CompilerTypecheckPhaseOutputSummary:
 	callables = callable_header_graph_callables(graph)
@@ -1351,6 +1405,7 @@ private pure func callable_header_output_summary(
 
 	for callable in callables:
 		fingerprint = fingerprint_callable_signature(
+			definition_table,
 			fingerprint
 				.fingerprint_add_int(callable_id_definition_id(callable_header_id(callable)))
 				.fingerprint_add_text(callable_header_name(callable)),
@@ -1366,6 +1421,7 @@ private pure func callable_header_output_summary(
 		match annotated_global_header_type(global):
 			Some(typ):
 				fingerprint = fingerprint_resolved_type_shape(
+					definition_table,
 					fingerprint.fingerprint_add_text("annotated"),
 					typ,
 				)
@@ -1380,6 +1436,7 @@ private pure func callable_header_output_summary(
 
 
 private pure func implementation_header_output_summary(
+	definition_table: DefinitionTable,
 	graph: ImplementationHeaderGraph,
 ) -> CompilerTypecheckPhaseOutputSummary:
 	headers = implementation_header_graph_headers(graph)
@@ -1390,6 +1447,7 @@ private pure func implementation_header_output_summary(
 		method_ids = implementation_header_method_ids(header)
 		method_count += method_ids.length()
 		fingerprint = fingerprint_resolved_type_shape(
+			definition_table,
 			fingerprint
 				.fingerprint_add_int(impl_id_definition_id(implementation_header_id(header)))
 				.fingerprint_add_int(
@@ -1515,7 +1573,10 @@ private pure func execute_profile_stage_once(
 		CompilerProfileTypeHeaders:
 			match type_header_graph_build(fixture.parameter_graph):
 				Err(errors):
-					Err(header_error_messages(errors))
+					Err(header_error_messages(
+						declaration_skeleton_graph_definition_table(fixture.declaration_graph),
+						errors,
+					))
 				Ok(graph):
 					Ok(CompilerTypeHeadersProfileProduct(graph))
 		CompilerProfileTraitTopology:
@@ -1614,6 +1675,7 @@ pure func compiler_typecheck_phase_profile_execute(
 				CompilerTypecheckPhaseExecutionCompleted(
 					plan_representation.stage,
 					plan_representation.iterations,
+					declaration_skeleton_graph_definition_table(representation.declaration_graph),
 					product,
 				)
 			else:
@@ -1627,6 +1689,7 @@ pure func compiler_typecheck_phase_profile_execute(
 
 
 private pure func profile_product_summary(
+	definition_table: DefinitionTable,
 	product: CompilerTypecheckPhaseProfileProduct,
 ) -> CompilerTypecheckPhaseOutputSummary:
 	match product:
@@ -1639,17 +1702,17 @@ private pure func profile_product_summary(
 		CompilerDeclarationSkeletonsProfileProduct(graph):
 			skeleton_output_summary(graph)
 		CompilerAliasDependenciesProfileProduct(graph):
-			alias_output_summary(graph)
+			alias_output_summary(definition_table, graph)
 		CompilerResolvedTypeParametersProfileProduct(graph):
-			parameter_output_summary(graph)
+			parameter_output_summary(definition_table, graph)
 		CompilerTypeHeadersProfileProduct(graph):
-			header_output_summary(graph)
+			header_output_summary(definition_table, graph)
 		CompilerTraitTopologyProfileProduct(graph):
-			trait_topology_output_summary(graph)
+			trait_topology_output_summary(definition_table, graph)
 		CompilerCallableHeadersProfileProduct(graph):
-			callable_header_output_summary(graph)
+			callable_header_output_summary(definition_table, graph)
 		CompilerImplementationHeadersProfileProduct(graph):
-			implementation_header_output_summary(graph)
+			implementation_header_output_summary(definition_table, graph)
 		CompilerAcceptedGraphProfileProduct(graph):
 			accepted_output_summary(graph)
 		CompilerCheckedBodiesProfileProduct(run):
@@ -1662,8 +1725,8 @@ pure func compiler_typecheck_phase_profile_observe(
 	match profile_execution_rep(execution):
 		CompilerTypecheckPhaseExecutionFailed(_, _, errors):
 			CompilerTypecheckPhaseProfileInvariantFailed(errors)
-		CompilerTypecheckPhaseExecutionCompleted(stage, iterations, product):
-			summary = profile_product_summary(product)
+		CompilerTypecheckPhaseExecutionCompleted(stage, iterations, definition_table, product):
+			summary = profile_product_summary(definition_table, product)
 			CompilerTypecheckPhaseProfileCompleted({
 				stage = stage,
 				iterations = iterations,

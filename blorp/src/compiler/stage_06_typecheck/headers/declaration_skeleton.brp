@@ -35,7 +35,7 @@ import:
 		parsed_program_has_errors,
 	../../stage_04_modules/module_table: ModuleId, ModuleTable, module_ids_equal
 	../graph/definition_identity:
-		SourceDefinitionKind(ConstructorDefinition, ImplDefinition, TraitDefinition),
+		SourceDefinitionKind(ConstructorDefinition, ImplDefinition, TraitDefinition, TypeDefinition),
 		func_callable_key,
 		source_definition_key,
 	../graph/definition_index:
@@ -61,7 +61,7 @@ import:
 		indexed_graph_definition_index,
 		indexed_graph_module_table,
 		prepared_module_scope_id,
-	../graph/type_identity: TypeId, type_id, type_id_name, type_id_source_span, type_ids_equal
+	../graph/type_identity: TypeId, type_id_from_definition_table, type_ids_equal
 	../modules/bound_module_graph:
 		BoundModule,
 		BoundModuleGraph,
@@ -180,6 +180,7 @@ union DeclarationSkeleton:
 
 record TypeDeclarationSkeletonInfo {
 	id: TypeId,
+	module_id: ModuleId,
 	visibility: DeclarationVisibility,
 	source: TypeDeclarationSource
 }
@@ -228,13 +229,14 @@ record ImplementationDeclarationSkeletonInfo {
 
 
 union DeclarationSkeletonGraphError:
+	TypeSkeletonMissingDefinition(String, String, SourceSpan)
 	CallableSkeletonMissingDefinition(String, String, SourceSpan)
 	ConstructorSkeletonMissingDefinition(String, String, String, SourceSpan)
 	TraitSkeletonMissingDefinition(String, String, SourceSpan)
 	ImplementationSkeletonMissingDefinition(String, String, SourceSpan)
 	DuplicateTypeDeclaration(String, String, SourceSpan)
 	DuplicateTraitDeclaration(String, String, SourceSpan)
-	DuplicateConstructorDeclaration(String, TypeId, String, SourceSpan)
+	DuplicateConstructorDeclaration(String, String, String, SourceSpan)
 	DuplicateDeclarationSkeleton(DeclarationId)
 
 
@@ -274,6 +276,22 @@ private record DeclarationSkeletonBuildContext {
 	module_table: ModuleTable,
 	definition_index: DefinitionIndex
 }
+
+
+pure func type_declaration_source_name(source: TypeDeclarationSource) -> String:
+	match source:
+		RecordTypeSource(decl): decl.name.text
+		UnionTypeSource(decl): decl.name.text
+		BuiltinTypeSource(decl): decl.name.text
+		AliasTypeSource(decl): decl.name.text
+
+
+pure func type_declaration_source_span(source: TypeDeclarationSource) -> SourceSpan:
+	match source:
+		RecordTypeSource(decl): decl.span
+		UnionTypeSource(decl): decl.span
+		BuiltinTypeSource(decl): decl.span
+		AliasTypeSource(decl): decl.span
 
 
 private pure func structural_declaration_id(
@@ -603,8 +621,8 @@ pure func declaration_skeleton_kind(skeleton: DeclarationSkeleton) -> Declaratio
 
 pure func declaration_skeleton_name(skeleton: DeclarationSkeleton) -> String:
 	match skeleton:
-		TypeDeclarationSkeleton(id, _, _):
-			type_id_name(id)
+		TypeDeclarationSkeleton(_, _, source):
+			type_declaration_source_name(source)
 		ConstructorDeclarationSkeleton(_, _, _, source):
 			source.name.text
 		CallableDeclarationSkeleton(_, _, source):
@@ -667,8 +685,8 @@ private pure func declaration_namespace_key(
 	skeleton: DeclarationSkeleton,
 ) -> Option[DeclarationNamespaceKey]:
 	match skeleton:
-		TypeDeclarationSkeleton(id, _, _):
-			Some(TypeNamespaceKey(type_id_name(id)))
+		TypeDeclarationSkeleton(_, _, source):
+			Some(TypeNamespaceKey(type_declaration_source_name(source)))
 		TraitDeclarationSkeleton(id, _, _):
 			Some(TraitNamespaceKey(trait_id_name(id)))
 		ConstructorDeclarationSkeleton(_, _, parent_type_id, source):
@@ -692,22 +710,48 @@ private pure func declaration_namespace_keys_equal(
 			False
 
 
+private pure func type_declaration_name_for_id(
+	skeletons: List[DeclarationSkeleton],
+	type_id: TypeId,
+) -> Option[String]:
+	var result: Option[String] = None
+	var index: Int = 0
+
+	while index < skeletons.length() and result.is_none():
+		match skeletons.get(index):
+			Some(TypeDeclarationSkeleton(id, _, source)):
+				if type_ids_equal(id, type_id):
+					result = Some(type_declaration_source_name(source))
+			_:
+				void
+
+		index += 1
+
+	result
+
+
 private pure func duplicate_namespace_error(
 	module_path: String,
+	existing_skeletons: List[DeclarationSkeleton],
 	skeleton: DeclarationSkeleton,
 ) -> DeclarationSkeletonGraphError:
 	match skeleton:
-		TypeDeclarationSkeleton(id, _, _):
-			DuplicateTypeDeclaration(module_path, type_id_name(id), type_id_source_span(id))
+		TypeDeclarationSkeleton(_, _, source):
+			DuplicateTypeDeclaration(
+				module_path,
+				type_declaration_source_name(source),
+				type_declaration_source_span(source),
+			)
 		TraitDeclarationSkeleton(id, _, _):
 			DuplicateTraitDeclaration(module_path, trait_id_name(id), trait_id_source_span(id))
 		ConstructorDeclarationSkeleton(_, _, parent_type_id, source):
-			DuplicateConstructorDeclaration(
-				module_path,
-				parent_type_id,
-				source.name.text,
-				source.span,
-			)
+			parent_name = type_declaration_name_for_id(existing_skeletons, parent_type_id)
+
+			match parent_name:
+				Some(name):
+					DuplicateConstructorDeclaration(module_path, name, source.name.text, source.span)
+				None:
+					DuplicateDeclarationSkeleton(declaration_skeleton_id(skeleton))
 		_:
 			DuplicateDeclarationSkeleton(declaration_skeleton_id(skeleton))
 
@@ -767,16 +811,16 @@ private pure func foreign_function_skeleton_build_items(
 			]
 
 
-private pure func union_skeleton_build_items(
+private pure func union_skeleton_build_items_for_id(
 	context: DeclarationSkeletonBuildContext,
 	visibility: DeclarationVisibility,
 	union_decl: ParsedUnionDecl,
+	resolved_type_id: TypeId,
 ) -> List[DeclarationSkeletonBuildItem]:
-	type_id = type_id(context.module_id, union_decl.name.text, union_decl.span)
 	var items: List[DeclarationSkeletonBuildItem] = [
 		DeclarationSkeletonCandidate(
 			TypeDeclarationSkeleton(
-				type_id,
+				resolved_type_id,
 				visibility,
 				UnionTypeSource(union_decl),
 			),
@@ -815,13 +859,54 @@ private pure func union_skeleton_build_items(
 						ConstructorDeclarationSkeleton(
 							id,
 							visibility,
-							type_id,
+							resolved_type_id,
 							variant,
 						),
 					),
 				)
 
 	items
+
+
+private pure func union_skeleton_build_items(
+	context: DeclarationSkeletonBuildContext,
+	visibility: DeclarationVisibility,
+	union_decl: ParsedUnionDecl,
+) -> List[DeclarationSkeletonBuildItem]:
+	type_key = source_definition_key(
+		context.module_id,
+		TypeDefinition,
+		union_decl.name.text,
+		None,
+		union_decl.span,
+	)
+	type_runtime_id = definition_index_find_source_definition_id(
+		context.definition_index,
+		context.module_table,
+		type_key,
+	)
+	type_id = match type_runtime_id:
+		Some(runtime_id):
+			type_id_from_definition_table(
+				definition_index_definition_table(context.definition_index),
+				runtime_id,
+			)
+		None:
+			None
+
+	match type_id:
+		Some(resolved_type_id):
+			union_skeleton_build_items_for_id(context, visibility, union_decl, resolved_type_id)
+		None:
+			[
+				DeclarationSkeletonBuildError(
+					TypeSkeletonMissingDefinition(
+						context.module_path,
+						union_decl.name.text,
+						union_decl.span,
+					),
+				),
+			]
 
 
 private pure func trait_skeleton_build_items(
@@ -997,8 +1082,32 @@ private pure func type_skeleton_build_items(
 	span: SourceSpan,
 	source: TypeDeclarationSource,
 ) -> List[DeclarationSkeletonBuildItem]:
-	id = type_id(context.module_id, name, span)
-	[DeclarationSkeletonCandidate(TypeDeclarationSkeleton(id, visibility, source))]
+	key = source_definition_key(context.module_id, TypeDefinition, name, None, span)
+
+	match definition_index_find_source_definition_id(
+		context.definition_index,
+		context.module_table,
+		key,
+	):
+		None:
+			[
+				DeclarationSkeletonBuildError(
+					TypeSkeletonMissingDefinition(context.module_path, name, span),
+				),
+			]
+		Some(runtime_id):
+			match type_id_from_definition_table(
+				definition_index_definition_table(context.definition_index),
+				runtime_id,
+			):
+				Some(id):
+					[DeclarationSkeletonCandidate(TypeDeclarationSkeleton(id, visibility, source))]
+				None:
+					[
+						DeclarationSkeletonBuildError(
+							TypeSkeletonMissingDefinition(context.module_path, name, span),
+						),
+					]
 
 
 private pure func declaration_skeleton_build_items(
@@ -1173,6 +1282,7 @@ private pure func validate_skeleton_build_items(
 						errors = errors.append(
 							duplicate_namespace_error(
 								bound_module_canonical_path(module),
+								skeletons,
 								skeleton,
 							),
 						)
@@ -1247,16 +1357,24 @@ pure func declaration_skeleton_graph_skeletons(
 pure func declaration_skeleton_graph_type_skeletons(
 	graph: DeclarationSkeletonGraph,
 ) -> List[TypeDeclarationSkeletonInfo]:
+	representation = declaration_skeleton_graph_rep(graph)
 	var type_skeletons: List[TypeDeclarationSkeletonInfo] = []
 
-	for skeleton in declaration_skeleton_graph_rep(graph).skeletons:
+	for indexed in representation.skeletons.enumerate():
+		skeleton_index = indexed[0]
+		skeleton = indexed[1]
 		match skeleton:
 			TypeDeclarationSkeleton(id, visibility, source):
-				type_skeletons = type_skeletons.append({
-					id = id,
-					visibility = visibility,
-					source = source,
-				})
+				match representation.module_ids_by_skeleton.get(skeleton_index):
+					Some(module_id):
+						type_skeletons = type_skeletons.append({
+							id = id,
+							module_id = module_id,
+							visibility = visibility,
+							source = source,
+						})
+					None:
+						void
 			_:
 				void
 
@@ -1495,6 +1613,7 @@ pure func declaration_skeleton_graph_find_type(
 		Some(TypeDeclarationSkeleton(id, visibility, source)):
 			Some({
 				id = id,
+				module_id = prepared_module_scope_id(module_scope),
 				visibility = visibility,
 				source = source,
 			})
@@ -1525,6 +1644,8 @@ pure func declaration_skeleton_graph_find_trait(
 
 pure func declaration_skeleton_graph_error_message(error: DeclarationSkeletonGraphError) -> String:
 	match error:
+		TypeSkeletonMissingDefinition(module_path, name, _):
+			"declaration skeleton is missing type definition '" + name + "' in module '" + module_path + "'"
 		CallableSkeletonMissingDefinition(module_path, name, _):
 			"declaration skeleton is missing callable definition '" + name + "' in module '" + module_path + "'"
 		ConstructorSkeletonMissingDefinition(module_path, owner, name, _):
@@ -1537,9 +1658,7 @@ pure func declaration_skeleton_graph_error_message(error: DeclarationSkeletonGra
 			"duplicate type declaration '" + name + "' in module '" + module_path + "'"
 		DuplicateTraitDeclaration(module_path, name, _):
 			"duplicate trait declaration '" + name + "' in module '" + module_path + "'"
-		DuplicateConstructorDeclaration(module_path, parent_type_id, name, _):
-			"duplicate constructor '" + name + "' in union '" + type_id_name(
-				parent_type_id,
-			) + "' in module '" + module_path + "'"
+		DuplicateConstructorDeclaration(module_path, parent_name, name, _):
+			"duplicate constructor '" + name + "' in union '" + parent_name + "' in module '" + module_path + "'"
 		DuplicateDeclarationSkeleton(_):
 			"duplicate declaration skeleton identity"

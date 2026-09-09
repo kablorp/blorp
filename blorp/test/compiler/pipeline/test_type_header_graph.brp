@@ -23,6 +23,7 @@ import:
 		DeclarationSkeletonGraph,
 		constructor_id_definition_id,
 		declaration_skeleton_graph_build,
+		declaration_skeleton_graph_definition_table,
 		declaration_skeleton_graph_find_type,
 	../../../src/compiler/stage_06_typecheck/headers/type_header_dependencies:
 		type_alias_dependency_graph_validate,
@@ -55,6 +56,7 @@ import:
 		record_type_header_id,
 		type_header_error_message,
 		type_header_graph_build,
+		type_header_graph_definition_table,
 		type_header_graph_find,
 		type_header_graph_headers,
 		type_header_graph_local_alias_headers_for_scope,
@@ -255,13 +257,14 @@ private pure func type_header_fixture(source: String) -> Option[TypeHeaderFixtur
 
 private pure func type_header_error_messages(source: String) -> Option[List[String]]:
 	fixture ?= type_parameter_graph(source)
-	(_, _, parameters) = fixture
+	(_, skeletons, parameters) = fixture
+	definition_table = declaration_skeleton_graph_definition_table(skeletons)
 
 	match type_header_graph_build(parameters):
 		Ok(_):
 			Some([])
 		Err(errors):
-			Some(errors.map(type_header_error_message))
+			Some(errors.map(func(error): type_header_error_message(definition_table, error)))
 
 
 private pure func type_header_errors_equal(source: String, expected: List[String]) -> Bool:
@@ -415,6 +418,10 @@ private pure func fixture_type_id(fixture: TypeHeaderFixture, name: String) -> O
 	)
 
 
+private pure func header_type_name(graph: TypeHeaderGraph, id: TypeId) -> String:
+	type_id_name(type_header_graph_definition_table(graph), id).get_or("<unknown type>")
+
+
 private pure func source() -> String:
 	|record Node[T] {value: T, next: Option[Node[T]]}
 	|
@@ -475,7 +482,7 @@ func test_type_header_graph_rejects_unknown_shapes_atomically() -> Bool:
 	match type_parameter_graph("record Broken {value: MissingType}"):
 		None:
 			False
-		Some((_, _, parameters)):
+		Some((_, skeletons, parameters)):
 			match type_header_graph_build(parameters):
 				Ok(_):
 					False
@@ -493,7 +500,7 @@ func test_type_header_graph_rejects_enum_payload_before_installation() -> Bool:
 	match type_parameter_graph(source):
 		None:
 			False
-		Some((_, _, parameters)):
+		Some((_, skeletons, parameters)):
 			match type_header_graph_build(parameters):
 				Err([TypeHeaderInvalidEnumVariantFields(_, "Value")]):
 					True
@@ -660,10 +667,11 @@ func test_invalid_struct_field_message_explains_ownership_rule() -> Bool:
 	match type_parameter_graph("struct Bad {name: String}"):
 		None:
 			False
-		Some((_, _, parameters)):
+		Some((_, skeletons, parameters)):
 			match type_header_graph_build(parameters):
 				Err([error]):
 					type_header_error_message(
+						declaration_skeleton_graph_definition_table(skeletons),
 						error,
 					) == "Struct 'Bad' field 'name' has invalid storage: struct fields must be " + "scalar values, fieldless enums, or other structs\n" + "help: Use a record for strings, collections, functions, payload unions, " + "records, and tuples"
 				_:
@@ -837,10 +845,10 @@ func test_type_header_graph_rejects_direct_recursive_value_layouts() -> Bool:
 	match type_parameter_graph("record Node {next: Node}"):
 		None:
 			False
-		Some((_, _, parameters)):
+		Some((_, skeletons, parameters)):
 			match type_header_graph_build(parameters):
 				Err([TypeHeaderRecursiveValueLayout(node, True)]):
-					type_id_name(node) == "Node"
+					type_id_name(declaration_skeleton_graph_definition_table(skeletons), node) == Some("Node")
 				_:
 					False
 
@@ -853,19 +861,21 @@ func test_type_header_graph_rejects_mutual_recursive_value_layouts() -> Bool:
 	match type_parameter_graph(source):
 		None:
 			False
-		Some((_, _, parameters)):
+		Some((_, skeletons, parameters)):
 			match type_header_graph_build(parameters):
 				Err([TypeHeaderRecursiveValueLayout(left, False), TypeHeaderRecursiveValueLayout(right, False)]):
 					(
-						type_id_name(left) == "Left"
-						and type_id_name(right) == "Right"
+						type_id_name(declaration_skeleton_graph_definition_table(skeletons), left) == Some("Left")
+						and type_id_name(declaration_skeleton_graph_definition_table(skeletons), right) == Some("Right")
 						and type_header_error_message(
+							declaration_skeleton_graph_definition_table(skeletons),
 							TypeHeaderRecursiveValueLayout(
 								left,
 								False,
 							),
 						).contains("recursive value layout")
 						and not type_header_error_message(
+							declaration_skeleton_graph_definition_table(skeletons),
 							TypeHeaderRecursiveValueLayout(
 								left,
 								False,
@@ -885,10 +895,10 @@ func test_type_header_graph_rejects_substituted_recursive_value_layouts() -> Boo
 	match type_parameter_graph(source):
 		None:
 			False
-		Some((_, _, parameters)):
+		Some((_, skeletons, parameters)):
 			match type_header_graph_build(parameters):
 				Err([TypeHeaderRecursiveValueLayout(loop, False)]):
-					type_id_name(loop) == "Loop"
+					type_id_name(declaration_skeleton_graph_definition_table(skeletons), loop) == Some("Loop")
 				_:
 					False
 
@@ -902,10 +912,13 @@ func test_type_header_graph_rejects_alias_and_tuple_recursive_value_layouts() ->
 	match type_parameter_graph(source):
 		None:
 			False
-		Some((_, _, parameters)):
+		Some((_, skeletons, parameters)):
 			match type_header_graph_build(parameters):
 				Err([TypeHeaderRecursiveValueLayout(node, True), TypeHeaderRecursiveValueLayout(tuple_node, True)]):
-					type_id_name(node) == "Node" and type_id_name(tuple_node) == "TupleNode"
+					(
+						type_id_name(declaration_skeleton_graph_definition_table(skeletons), node) == Some("Node")
+						and type_id_name(declaration_skeleton_graph_definition_table(skeletons), tuple_node) == Some("TupleNode")
+					)
 				_:
 					False
 
@@ -933,10 +946,10 @@ func test_type_header_graph_rejects_expanding_generic_self_layout() -> Bool:
 	match type_parameter_graph("record Grow[T] {next: Grow[List[T]]}"):
 		None:
 			False
-		Some((_, _, parameters)):
+		Some((_, skeletons, parameters)):
 			match type_header_graph_build(parameters):
 				Err([TypeHeaderRecursiveValueLayout(grow, True)]):
-					type_id_name(grow) == "Grow"
+					type_id_name(declaration_skeleton_graph_definition_table(skeletons), grow) == Some("Grow")
 				_:
 					False
 
@@ -950,10 +963,13 @@ func test_type_header_graph_rejects_generic_wrapper_cycle() -> Bool:
 	match type_parameter_graph(source):
 		None:
 			False
-		Some((_, _, parameters)):
+		Some((_, skeletons, parameters)):
 			match type_header_graph_build(parameters):
 				Err([TypeHeaderRecursiveValueLayout(left, False), TypeHeaderRecursiveValueLayout(right, False)]):
-					type_id_name(left) == "Left" and type_id_name(right) == "Right"
+					(
+						type_id_name(declaration_skeleton_graph_definition_table(skeletons), left) == Some("Left")
+						and type_id_name(declaration_skeleton_graph_definition_table(skeletons), right) == Some("Right")
+					)
 				_:
 					False
 
@@ -967,10 +983,10 @@ func test_type_header_graph_requeues_generic_summary_consumers() -> Bool:
 	match type_parameter_graph(source):
 		None:
 			False
-		Some((_, _, parameters)):
+		Some((_, skeletons, parameters)):
 			match type_header_graph_build(parameters):
 				Err([TypeHeaderRecursiveValueLayout(loop, True)]):
-					type_id_name(loop) == "Loop"
+					type_id_name(declaration_skeleton_graph_definition_table(skeletons), loop) == Some("Loop")
 				_:
 					False
 
@@ -985,10 +1001,10 @@ func test_type_header_graph_tracks_required_generic_parameter_positions() -> Boo
 	):
 		None:
 			False
-		Some((_, _, parameters)):
+		Some((_, skeletons, parameters)):
 			match type_header_graph_build(parameters):
 				Err([TypeHeaderRecursiveValueLayout(through_first, True)]):
-					type_id_name(through_first) == "ThroughFirst"
+					type_id_name(declaration_skeleton_graph_definition_table(skeletons), through_first) == Some("ThroughFirst")
 				_:
 					False
 
@@ -1433,13 +1449,13 @@ func test_type_header_graph_projects_builtin_visibility_by_module() -> Bool:
 				fixture.graph,
 				module_scope,
 			).map(
-				func(header): type_id_name(builtin_type_header_id(header)),
+				func(header): header_type_name(fixture.graph, builtin_type_header_id(header)),
 			)
 			public_names: List[String] = type_header_graph_public_builtin_headers_for_scope(
 				fixture.graph,
 				module_scope,
 			).map(
-				func(header): type_id_name(builtin_type_header_id(header)),
+				func(header): header_type_name(fixture.graph, builtin_type_header_id(header)),
 			)
 
 			local_names == ["Scalar", "HiddenHandle"] and public_names == ["Scalar"]
@@ -1495,13 +1511,13 @@ func test_type_header_graph_projects_record_visibility_by_module() -> Bool:
 				fixture.graph,
 				module_scope,
 			).map(
-				func(header): type_id_name(record_type_header_id(header)),
+				func(header): header_type_name(fixture.graph, record_type_header_id(header)),
 			)
 			public_names = type_header_graph_public_record_headers_for_scope(
 				fixture.graph,
 				module_scope,
 			).map(
-				func(header): type_id_name(record_type_header_id(header)),
+				func(header): header_type_name(fixture.graph, record_type_header_id(header)),
 			)
 
 			local_names == ["PublicRecord", "HiddenStruct"] and public_names == ["PublicRecord"]
@@ -1541,73 +1557,73 @@ func test_type_header_graph_projects_record_visibility_by_graph_scope() -> Bool:
 						graph,
 						target_scope,
 					).map(
-						func(header): type_id_name(builtin_type_header_id(header)),
+						func(header): header_type_name(graph, builtin_type_header_id(header)),
 					)
 					target_names = type_header_graph_local_record_headers_for_scope(
 						graph,
 						target_scope,
 					).map(
-						func(header): type_id_name(record_type_header_id(header)),
+						func(header): header_type_name(graph, record_type_header_id(header)),
 					)
 					target_union_names = type_header_graph_local_union_headers_for_scope(
 						graph,
 						target_scope,
 					).map(
-						func(header): type_id_name(union_type_header_id(header)),
+						func(header): header_type_name(graph, union_type_header_id(header)),
 					)
 					target_alias_names = type_header_graph_local_alias_headers_for_scope(
 						graph,
 						target_scope,
 					).map(
-						func(header): type_id_name(alias_type_header_id(header)),
+						func(header): header_type_name(graph, alias_type_header_id(header)),
 					)
 					dependency_names = type_header_graph_local_record_headers_for_scope(
 						graph,
 						dependency_scope,
 					).map(
-						func(header): type_id_name(record_type_header_id(header)),
+						func(header): header_type_name(graph, record_type_header_id(header)),
 					)
 					public_dependency_names = type_header_graph_public_record_headers_for_scope(
 						graph,
 						dependency_scope,
 					).map(
-						func(header): type_id_name(record_type_header_id(header)),
+						func(header): header_type_name(graph, record_type_header_id(header)),
 					)
 					dependency_builtin_names = type_header_graph_local_builtin_headers_for_scope(
 						graph,
 						dependency_scope,
 					).map(
-						func(header): type_id_name(builtin_type_header_id(header)),
+						func(header): header_type_name(graph, builtin_type_header_id(header)),
 					)
 					public_dependency_builtin_names = type_header_graph_public_builtin_headers_for_scope(
 						graph,
 						dependency_scope,
 					).map(
-						func(header): type_id_name(builtin_type_header_id(header)),
+						func(header): header_type_name(graph, builtin_type_header_id(header)),
 					)
 					dependency_union_names = type_header_graph_local_union_headers_for_scope(
 						graph,
 						dependency_scope,
 					).map(
-						func(header): type_id_name(union_type_header_id(header)),
+						func(header): header_type_name(graph, union_type_header_id(header)),
 					)
 					public_dependency_union_names = type_header_graph_public_union_headers_for_scope(
 						graph,
 						dependency_scope,
 					).map(
-						func(header): type_id_name(union_type_header_id(header)),
+						func(header): header_type_name(graph, union_type_header_id(header)),
 					)
 					dependency_alias_names = type_header_graph_local_alias_headers_for_scope(
 						graph,
 						dependency_scope,
 					).map(
-						func(header): type_id_name(alias_type_header_id(header)),
+						func(header): header_type_name(graph, alias_type_header_id(header)),
 					)
 					public_dependency_alias_names = type_header_graph_public_alias_headers_for_scope(
 						graph,
 						dependency_scope,
 					).map(
-						func(header): type_id_name(alias_type_header_id(header)),
+						func(header): header_type_name(graph, alias_type_header_id(header)),
 					)
 
 					(
@@ -1657,25 +1673,25 @@ func test_type_header_graph_projects_target_empty_middle_and_final_modules() -> 
 						graph,
 						target_scope,
 					).map(
-						func(header): type_id_name(record_type_header_id(header)),
+						func(header): header_type_name(graph, record_type_header_id(header)),
 					)
 					middle_names = type_header_graph_local_record_headers_for_scope(
 						graph,
 						middle_scope,
 					).map(
-						func(header): type_id_name(record_type_header_id(header)),
+						func(header): header_type_name(graph, record_type_header_id(header)),
 					)
 					public_middle_names = type_header_graph_public_record_headers_for_scope(
 						graph,
 						middle_scope,
 					).map(
-						func(header): type_id_name(record_type_header_id(header)),
+						func(header): header_type_name(graph, record_type_header_id(header)),
 					)
 					final_names = type_header_graph_local_union_headers_for_scope(
 						graph,
 						final_scope,
 					).map(
-						func(header): type_id_name(union_type_header_id(header)),
+						func(header): header_type_name(graph, union_type_header_id(header)),
 					)
 
 					(
@@ -1992,9 +2008,9 @@ func test_type_header_graph_projects_alias_visibility_by_module() -> Bool:
 			match (local_headers, public_headers):
 				([transparent_header, opaque_header], [public_header]):
 					(
-						type_id_name(alias_type_header_id(transparent_header)) == "PublicAlias"
-						and type_id_name(alias_type_header_id(opaque_header)) == "HiddenAlias"
-						and type_id_name(alias_type_header_id(public_header)) == "PublicAlias"
+						header_type_name(fixture.graph, alias_type_header_id(transparent_header)) == "PublicAlias"
+						and header_type_name(fixture.graph, alias_type_header_id(opaque_header)) == "HiddenAlias"
+						and header_type_name(fixture.graph, alias_type_header_id(public_header)) == "PublicAlias"
 						and alias_type_header_layout(transparent_header) == TransparentAlias
 						and alias_type_header_layout(opaque_header) == OpaqueAlias
 					)
@@ -2127,13 +2143,13 @@ func test_type_header_graph_projects_union_visibility_by_module() -> Bool:
 				fixture.graph,
 				module_scope,
 			).map(
-				func(header): type_id_name(union_type_header_id(header)),
+				func(header): header_type_name(fixture.graph, union_type_header_id(header)),
 			)
 			public_names = type_header_graph_public_union_headers_for_scope(
 				fixture.graph,
 				module_scope,
 			).map(
-				func(header): type_id_name(union_type_header_id(header)),
+				func(header): header_type_name(fixture.graph, union_type_header_id(header)),
 			)
 
 			local_names == ["PublicChoice", "HiddenKind"] and public_names == ["PublicChoice"]

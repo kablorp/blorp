@@ -44,6 +44,17 @@ DEFINITION_IDENTITY = (
 DEFINITION_INDEX = (
     ROOT / "blorp/src/compiler/stage_06_typecheck/graph/definition_index.brp"
 )
+TYPE_IDENTITY = (
+    ROOT / "blorp/src/compiler/stage_06_typecheck/graph/type_identity.brp"
+)
+RECORD_AUTHORITY = (
+    ROOT
+    / "blorp/src/compiler/stage_06_typecheck/type_system/accepted_record_authority.brp"
+)
+UNION_AUTHORITY = (
+    ROOT
+    / "blorp/src/compiler/stage_06_typecheck/type_system/accepted_union_authority.brp"
+)
 SEMANTIC_OCCURRENCE = (
     ROOT / "blorp/src/compiler/stage_06_typecheck/graph/semantic_occurrence.brp"
 )
@@ -60,6 +71,49 @@ TRAIT_IMPLEMENTATION_AUTHORITY = (
     / "blorp/src/compiler/stage_06_typecheck/type_system/accepted_trait_implementation_authority.brp"
 )
 class DeclarationBoundaryTests(unittest.TestCase):
+    def test_nominal_type_ids_are_definition_backed_scalars(self) -> None:
+        identity_source = TYPE_IDENTITY.read_text(encoding="utf-8")
+        header_source = TYPE_HEADER_GRAPH.read_text(encoding="utf-8")
+
+        self.assertIn("opaque type TypeId = DefinitionId", identity_source)
+        self.assertNotIn("TypeIdRep", identity_source)
+        self.assertNotIn("func type_id_storage_key(", identity_source)
+        self.assertIn(
+            "header_index_by_definition_id: Dict[Int, Int]", header_source
+        )
+
+    def test_nominal_type_tables_do_not_retain_parallel_owner_paths(self) -> None:
+        sources = {
+            "alias": ALIAS_AUTHORITY.read_text(encoding="utf-8"),
+            "record": RECORD_AUTHORITY.read_text(encoding="utf-8"),
+            "union": UNION_AUTHORITY.read_text(encoding="utf-8"),
+        }
+
+        for category, source in sources.items():
+            with self.subTest(category=category):
+                table = re.search(
+                    rf"private record Accepted{category.title()}TableRep \{{.*?\n\}}",
+                    source,
+                    re.DOTALL,
+                )
+                self.assertIsNotNone(table)
+                self.assertNotIn("owner_module_path", table.group(0))
+
+        union_table = re.search(
+            r"private record AcceptedUnionTableRep \{.*?\n\}",
+            sources["union"],
+            re.DOTALL,
+        )
+        self.assertIsNotNone(union_table)
+        self.assertIn(
+            "graph_union_indices_by_definition_id: Dict[Int, Int]",
+            union_table.group(0),
+        )
+        self.assertIn(
+            "builtin_union_indices_by_name: Dict[String, Int]",
+            union_table.group(0),
+        )
+
     def test_constructor_ids_are_scalar_definition_foreign_keys(self) -> None:
         source = DECLARATION_SKELETON.read_text(encoding="utf-8")
 

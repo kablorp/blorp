@@ -4,10 +4,18 @@
 -- retain only established identities, source names, and field-shape lookup
 -- names; owner-local field spellings are materialized only when queried.
 import:
-	../../stage_04_modules/module_table: ModuleId, module_ids_equal
-	../graph/type_identity: TypeId, type_id_module_id, type_id_storage_key, type_ids_equal
+	../../stage_04_modules/module_table: ModuleId, module_table_canonical_path
+	../graph/definition_index:
+		DefinitionTable,
+		definition_table_module_table,
+		definition_table_type_row,
+	../graph/type_identity:
+		TypeId,
+		type_id_definition_id,
+		type_id_module_id,
+		type_ids_equal,
 	env: FieldDecl
-	semantic_type: localize_module_types
+	semantic_type: canonical_module_type_name, localize_module_types
 
 
 record AcceptedRecordEntry {
@@ -23,7 +31,6 @@ record AcceptedRecordEntry {
 
 record AcceptedRecordTableRecord {
 	id: TypeId,
-	owner_module_path: String,
 	canonical_name: String,
 	canonical_visible: Bool,
 	payload: AcceptedRecordEntry
@@ -31,19 +38,20 @@ record AcceptedRecordTableRecord {
 
 
 record AcceptedRecordTableInput {
+	definition_table: DefinitionTable,
 	known_type_ids: List[TypeId],
 	records: List[AcceptedRecordTableRecord]
 }
 
 
 private record AcceptedRecordTableRep {
+	definition_table: DefinitionTable,
 	known_type_ids: List[TypeId],
-	known_type_indices_by_key: Dict[String, Int],
+	known_type_indices_by_definition_id: Dict[Int, Int],
 	records: List[AcceptedRecordEntry],
 	record_ids: List[TypeId],
-	owner_module_paths: List[String],
 	canonical_visibility: List[Bool],
-	record_indices_by_type_key: Dict[String, Int],
+	record_indices_by_definition_id: Dict[Int, Int],
 	canonical_record_indices_by_name: Dict[String, Int]
 }
 
@@ -81,6 +89,7 @@ private pure func accepted_record_locator_owner_local(locator: AcceptedRecordLoc
 
 
 private record AcceptedRecordModuleViewRep {
+	owner_module_path: Option[String],
 	visible_records_by_source_name: Dict[String, AcceptedRecordLocator],
 	visible_names_by_field_key: Dict[String, List[String]]
 }
@@ -91,6 +100,7 @@ opaque type AcceptedRecordModuleView = AcceptedRecordModuleViewRep
 
 private record AcceptedRecordAuthorityRep {
 	table: AcceptedRecordTable,
+	owner_module_path: Option[String],
 	visible_records_by_source_name: Dict[String, AcceptedRecordLocator],
 	visible_names_by_field_key: Dict[String, List[String]]
 }
@@ -123,6 +133,18 @@ private pure func authority_rep(authority: AcceptedRecordAuthority) -> AcceptedR
 	from_opaque AcceptedRecordAuthority(authority)
 
 
+private pure func record_canonical_name(
+	definition_table: DefinitionTable,
+	id: TypeId,
+) -> Option[String]:
+	row ?= definition_table_type_row(definition_table, type_id_definition_id(id))
+	module_path ?= module_table_canonical_path(
+		definition_table_module_table(definition_table),
+		row.module_id,
+	)
+	Some(canonical_module_type_name(module_path, row.name))
+
+
 private pure func record_field_name_key(fields: List[FieldDecl]) -> String:
 	fields
 		.map(func(field): field.name)
@@ -134,7 +156,7 @@ private pure func known_type_at(
 	representation: AcceptedRecordTableRep,
 	id: TypeId,
 ) -> Option[TypeId]:
-	index ?= representation.known_type_indices_by_key.get(type_id_storage_key(id))
+	index ?= representation.known_type_indices_by_definition_id.get(type_id_definition_id(id))
 	known_id ?= representation.known_type_ids.get(index)
 
 	if type_ids_equal(known_id, id):
@@ -144,31 +166,33 @@ private pure func known_type_at(
 
 
 pure func accepted_record_table(input: AcceptedRecordTableInput) -> Option[AcceptedRecordTable]:
-	var known_type_indices_by_key: Dict[String, Int] = {}
+	var known_type_indices_by_definition_id: Dict[Int, Int] = {}
 	var records: List[AcceptedRecordEntry] = []
 	var record_ids: List[TypeId] = []
-	var owner_module_paths: List[String] = []
 	var canonical_visibility: List[Bool] = []
-	var record_indices_by_type_key: Dict[String, Int] = {}
+	var record_indices_by_definition_id: Dict[Int, Int] = {}
 	var canonical_record_indices_by_name: Dict[String, Int] = {}
 	var valid: Bool = True
 	var index: Int = 0
 
 	for id in input.known_type_ids:
-		key = type_id_storage_key(id)
+		key = type_id_definition_id(id)
 
-		if known_type_indices_by_key.contains(key):
+		if (
+			type_id_module_id(input.definition_table, id).is_none()
+			or known_type_indices_by_definition_id.contains(key)
+		):
 			valid = False
 		else:
-			known_type_indices_by_key = known_type_indices_by_key.set(key, index)
+			known_type_indices_by_definition_id = known_type_indices_by_definition_id.set(key, index)
 
 		index += 1
 
 	index = 0
 
 	for entry in input.records:
-		key = type_id_storage_key(entry.id)
-		known_index = known_type_indices_by_key.get(key)
+		key = type_id_definition_id(entry.id)
+		known_index = known_type_indices_by_definition_id.get(key)
 
 		identity_matches = match known_index:
 			Some(found_index):
@@ -182,7 +206,8 @@ pure func accepted_record_table(input: AcceptedRecordTableInput) -> Option[Accep
 
 		if (
 			not identity_matches
-			or record_indices_by_type_key.contains(key)
+			or record_canonical_name(input.definition_table, entry.id) != Some(entry.canonical_name)
+			or record_indices_by_definition_id.contains(key)
 			or (
 				entry.canonical_visible
 				and canonical_record_indices_by_name.contains(entry.canonical_name)
@@ -192,9 +217,8 @@ pure func accepted_record_table(input: AcceptedRecordTableInput) -> Option[Accep
 		else:
 			records = records.append(entry.payload)
 			record_ids = record_ids.append(entry.id)
-			owner_module_paths = owner_module_paths.append(entry.owner_module_path)
 			canonical_visibility = canonical_visibility.append(entry.canonical_visible)
-			record_indices_by_type_key = record_indices_by_type_key.set(key, index)
+			record_indices_by_definition_id = record_indices_by_definition_id.set(key, index)
 
 			if entry.canonical_visible:
 				canonical_record_indices_by_name = canonical_record_indices_by_name.set(
@@ -206,13 +230,13 @@ pure func accepted_record_table(input: AcceptedRecordTableInput) -> Option[Accep
 
 	if valid:
 		Some(into_opaque AcceptedRecordTable({
+					definition_table = input.definition_table,
 					known_type_ids = input.known_type_ids,
-					known_type_indices_by_key = known_type_indices_by_key,
+					known_type_indices_by_definition_id = known_type_indices_by_definition_id,
 					records = records,
 					record_ids = record_ids,
-					owner_module_paths = owner_module_paths,
 					canonical_visibility = canonical_visibility,
-					record_indices_by_type_key = record_indices_by_type_key,
+					record_indices_by_definition_id = record_indices_by_definition_id,
 					canonical_record_indices_by_name = canonical_record_indices_by_name
 				}))
 	else:
@@ -234,8 +258,8 @@ pure func accepted_record_module_view(
 	var valid: Bool = True
 
 	for binding in bindings:
-		key = type_id_storage_key(binding.id)
-		payload_index = representation.record_indices_by_type_key.get(key)
+		key = type_id_definition_id(binding.id)
+		payload_index = representation.record_indices_by_definition_id.get(key)
 
 		match payload_index:
 			Some(index):
@@ -247,9 +271,8 @@ pure func accepted_record_module_view(
 					None:
 						False
 
-				owner_matches = binding.owner_local == module_ids_equal(
-					type_id_module_id(binding.id),
-					owner,
+				owner_matches = binding.owner_local == (
+					type_id_module_id(representation.definition_table, binding.id) == Some(owner)
 				)
 				visible = (
 					binding.owner_local
@@ -287,6 +310,10 @@ pure func accepted_record_module_view(
 
 	if valid:
 		Some(into_opaque AcceptedRecordModuleView({
+					owner_module_path = module_table_canonical_path(
+						definition_table_module_table(representation.definition_table),
+						owner,
+					),
 					visible_records_by_source_name = visible_records_by_source_name,
 					visible_names_by_field_key = visible_names_by_field_key
 				}))
@@ -296,6 +323,7 @@ pure func accepted_record_module_view(
 
 pure func accepted_record_empty_module_view() -> AcceptedRecordModuleView:
 	into_opaque AcceptedRecordModuleView({
+			owner_module_path = None,
 			visible_records_by_source_name = {},
 			visible_names_by_field_key = {}
 		})
@@ -313,6 +341,7 @@ pure func accepted_record_authority(
 
 	into_opaque AcceptedRecordAuthority({
 			table = table,
+			owner_module_path = view_representation.owner_module_path,
 			visible_records_by_source_name = view_representation.visible_records_by_source_name,
 			visible_names_by_field_key = view_representation.visible_names_by_field_key
 		})
@@ -363,7 +392,7 @@ pure func accepted_record_find(
 	payload ?= table.records.get(index)
 
 	if accepted_record_locator_owner_local(locator):
-		owner_path ?= table.owner_module_paths.get(index)
+		owner_path ?= representation.owner_module_path
 		Some(
 			{ payload |
 				fields = payload.fields.map(
@@ -450,9 +479,9 @@ pure func accepted_record_find_names_with_fields(
 
 pure func accepted_record_exact(table: AcceptedRecordTable, id: TypeId) -> AcceptedRecordExactProbe:
 	representation = table_rep(table)
-	key = type_id_storage_key(id)
+	key = type_id_definition_id(id)
 
-	match representation.record_indices_by_type_key.get(key):
+	match representation.record_indices_by_definition_id.get(key):
 		Some(index):
 			lookup = match (
 				representation.record_ids.get(index),
@@ -477,7 +506,7 @@ pure func accepted_record_exact(table: AcceptedRecordTable, id: TypeId) -> Accep
 				None:
 					AcceptedRecordExactMissing
 
-			candidates_visited = if representation.known_type_indices_by_key.contains(key):
+			candidates_visited = if representation.known_type_indices_by_definition_id.contains(key):
 				1
 			else:
 				0

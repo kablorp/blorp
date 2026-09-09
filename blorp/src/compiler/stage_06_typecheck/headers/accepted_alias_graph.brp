@@ -5,13 +5,20 @@
 -- spellings; no alias target, record field, or union variant is projected into
 -- the module view.
 import:
-	../graph/indexed_graph: PreparedModuleScope, prepared_module_scope_id
-	../graph/type_identity: TypeId, type_id_name, type_id_storage_key
+	../graph/definition_index:
+		definition_index_definition_table,
+		definition_tables_share_provenance,
+	../graph/indexed_graph:
+		PreparedModuleScope,
+		indexed_graph_definition_index,
+		prepared_module_scope_id,
+	../graph/type_identity: TypeId, type_id_definition_id
 	../modules/bound_module_graph:
 		BoundModule,
 		BoundModuleGraph,
 		bound_module_canonical_path,
 		bound_module_graph_modules,
+		bound_module_graph_indexed_graph,
 		bound_module_graph_target,
 		bound_module_scope,
 		bound_module_view,
@@ -46,12 +53,16 @@ import:
 		alias_type_header_id,
 		alias_type_header_layout,
 		alias_type_header_parameters,
+		alias_type_header_source_name,
 		alias_type_header_target,
 		builtin_type_header_id,
 		builtin_type_header_parameters,
+		builtin_type_header_source_name,
 		record_type_header_id,
 		record_type_header_parameters,
+		record_type_header_source_name,
 		type_header_graph_local_alias_headers_for_scope,
+		type_header_graph_definition_table,
 		type_header_graph_local_builtin_headers_for_scope,
 		type_header_graph_local_record_headers_for_scope,
 		type_header_graph_local_union_headers_for_scope,
@@ -61,6 +72,7 @@ import:
 		type_header_graph_public_union_headers_for_scope,
 		union_type_header_id,
 		union_type_header_parameters,
+		union_type_header_source_name,
 	type_header_install: imported_semantic_type_from_resolved_shape
 	type_parameter_headers: ResolvedTypeParameter, type_parameter_id_name
 
@@ -91,11 +103,12 @@ private pure func parameter_names(parameters: List[ResolvedTypeParameter]) -> Li
 private pure func accepted_type_identity(
 	module_path: String,
 	id: TypeId,
+	source_name: String,
 	parameters: List[ResolvedTypeParameter],
 ) -> AcceptedTypeIdentity:
 	{
 		id = id,
-		canonical_name = canonical_module_type_name(module_path, type_id_name(id)),
+		canonical_name = canonical_module_type_name(module_path, source_name),
 		type_params = parameter_names(parameters)
 	}
 
@@ -112,6 +125,7 @@ private pure func append_builtin_identities(
 			accepted_type_identity(
 				module_path,
 				builtin_type_header_id(header),
+				builtin_type_header_source_name(header),
 				builtin_type_header_parameters(header),
 			),
 		)
@@ -131,6 +145,7 @@ private pure func append_record_identities(
 			accepted_type_identity(
 				module_path,
 				record_type_header_id(header),
+				record_type_header_source_name(header),
 				record_type_header_parameters(header),
 			),
 		)
@@ -150,6 +165,7 @@ private pure func append_union_identities(
 			accepted_type_identity(
 				module_path,
 				union_type_header_id(header),
+				union_type_header_source_name(header),
 				union_type_header_parameters(header),
 			),
 		)
@@ -171,7 +187,7 @@ private pure func append_alias_inputs(
 	module_scope: PreparedModuleScope,
 	module_path: String,
 	headers: List[AcceptedAliasHeader],
-	public_alias_ids: Dict[String, Bool],
+	public_alias_ids: Dict[Int, Bool],
 ) -> AliasInputCollection:
 	var identities = collection.identities
 	var transparent = collection.transparent
@@ -181,8 +197,13 @@ private pure func append_alias_inputs(
 	for header in headers:
 		id = alias_type_header_id(header)
 		parameters = alias_type_header_parameters(header)
-		identity = accepted_type_identity(module_path, id, parameters)
-		canonical_visible = public_alias_ids.contains(type_id_storage_key(id))
+		identity = accepted_type_identity(
+			module_path,
+			id,
+			alias_type_header_source_name(header),
+			parameters,
+		)
+		canonical_visible = public_alias_ids.contains(type_id_definition_id(id))
 		identities = identities.append(identity)
 
 		match imported_semantic_type_from_resolved_shape(
@@ -196,7 +217,6 @@ private pure func append_alias_inputs(
 					TransparentAlias:
 						transparent = transparent.append({
 							id = id,
-							owner_module_path = module_path,
 							canonical_name = identity.canonical_name,
 							canonical_visible = canonical_visible,
 							payload = {
@@ -207,7 +227,6 @@ private pure func append_alias_inputs(
 					OpaqueAlias:
 						opaque_entries = opaque_entries.append({
 							id = id,
-							owner_module_path = module_path,
 							canonical_name = identity.canonical_name,
 							canonical_visible = canonical_visible,
 							payload = {
@@ -237,11 +256,11 @@ private pure func collect_module_inputs(
 ) -> AliasInputCollection:
 	module_path = bound_module_canonical_path(module)
 	module_scope = bound_module_scope(module)
-	var public_alias_ids: Dict[String, Bool] = {}
+	var public_alias_ids: Dict[Int, Bool] = {}
 
 	for header in type_header_graph_public_alias_headers_for_scope(type_headers, module_scope):
 		public_alias_ids = public_alias_ids.set(
-			type_id_storage_key(alias_type_header_id(header)),
+			type_id_definition_id(alias_type_header_id(header)),
 			True,
 		)
 
@@ -274,14 +293,24 @@ pure func accepted_alias_graph_build(
 	type_headers: TypeHeaderGraph,
 	bound_graph: BoundModuleGraph,
 ) -> Result[AcceptedAliasGraph, List[String]]:
+	definition_tables_match = definition_tables_share_provenance(
+		type_header_graph_definition_table(type_headers),
+		definition_index_definition_table(
+			indexed_graph_definition_index(bound_module_graph_indexed_graph(bound_graph)),
+		),
+	)
 	modules = [
 		bound_module_graph_target(bound_graph),
 	].concat(bound_module_graph_modules(bound_graph))
+	initial_errors: List[String] = if definition_tables_match:
+		[]
+	else:
+		["accepted alias graph inputs have different definition origins"]
 	var collection: AliasInputCollection = {
 		identities = [],
 		transparent = [],
 		opaque_entries = [],
-		errors = []
+		errors = initial_errors
 	}
 
 	for module in modules:
@@ -291,6 +320,7 @@ pure func accepted_alias_graph_build(
 		Err(collection.errors)
 	else:
 		input: AcceptedAliasTableInput = {
+			definition_table = type_header_graph_definition_table(type_headers),
 			type_identities = collection.identities,
 			transparent_aliases = collection.transparent,
 			opaque_aliases = collection.opaque_entries
@@ -325,7 +355,12 @@ private pure func append_local_bindings(
 
 	for header in type_header_graph_local_alias_headers_for_scope(type_headers, module_scope):
 		id = alias_type_header_id(header)
-		next = append_visible_binding(next, type_id_name(id), id, True)
+		next = append_visible_binding(
+			next,
+			alias_type_header_source_name(header),
+			id,
+			True,
+		)
 
 	next
 
@@ -355,12 +390,13 @@ private pure func append_imported_header_binding(
 	bindings: List[AcceptedVisibleTypeBinding],
 	imported_names: List[ImportedNameBinding],
 	module_path: String,
+	type_name: String,
 	id: TypeId,
 ) -> List[AcceptedVisibleTypeBinding]:
 	var next = bindings
-	canonical_name = canonical_module_type_name(module_path, type_id_name(id))
+	canonical_name = canonical_module_type_name(module_path, type_name)
 
-	for local_name in imported_binding_local_names(imported_names, module_path, type_id_name(id)):
+	for local_name in imported_binding_local_names(imported_names, module_path, type_name):
 		-- Canonical spellings already fall through to the shared table. Recording
 		-- one here would create a redirect from the canonical name to itself.
 		if local_name != canonical_name:
@@ -391,6 +427,7 @@ private pure func append_imported_module_bindings(
 				next,
 				imported_names,
 				module_path,
+				builtin_type_header_source_name(header),
 				builtin_type_header_id(header),
 			)
 
@@ -399,6 +436,7 @@ private pure func append_imported_module_bindings(
 				next,
 				imported_names,
 				module_path,
+				record_type_header_source_name(header),
 				record_type_header_id(header),
 			)
 
@@ -407,6 +445,7 @@ private pure func append_imported_module_bindings(
 				next,
 				imported_names,
 				module_path,
+				union_type_header_source_name(header),
 				union_type_header_id(header),
 			)
 
@@ -415,6 +454,7 @@ private pure func append_imported_module_bindings(
 				next,
 				imported_names,
 				module_path,
+				alias_type_header_source_name(header),
 				alias_type_header_id(header),
 			)
 

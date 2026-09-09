@@ -6,8 +6,16 @@
 -- are represented only so owner-local and selective spellings can canonicalize
 -- without copying record or union declarations into this authority.
 import:
-	../../stage_04_modules/module_table: ModuleId, module_ids_equal
-	../graph/type_identity: TypeId, type_id_module_id, type_id_storage_key, type_ids_equal
+	../../stage_04_modules/module_table: ModuleId, module_table_canonical_path
+	../graph/definition_index:
+		DefinitionTable,
+		definition_table_module_table,
+		definition_table_type_row,
+	../graph/type_identity:
+		TypeId,
+		type_id_definition_id,
+		type_id_module_id,
+		type_ids_equal,
 	semantic_type:
 		SemanticType(
 			SemanticArrayType,
@@ -21,6 +29,7 @@ import:
 		SemanticTypeSubstEntry,
 		TYPE_INT,
 		apply_subst,
+		canonical_module_type_name,
 		localize_module_types,
 		type_subst_entry,
 
@@ -34,7 +43,6 @@ record AcceptedTypeIdentity {
 
 record AcceptedTransparentAlias {
 	id: TypeId,
-	owner_module_path: String,
 	canonical_name: String,
 	canonical_visible: Bool,
 	payload: TransparentTypeAlias
@@ -43,7 +51,6 @@ record AcceptedTransparentAlias {
 
 record AcceptedOpaqueAlias {
 	id: TypeId,
-	owner_module_path: String,
 	canonical_name: String,
 	canonical_visible: Bool,
 	payload: OpaqueTypeAlias
@@ -65,6 +72,7 @@ record OpaqueTypeAlias {
 
 
 record AcceptedAliasTableInput {
+	definition_table: DefinitionTable,
 	type_identities: List[AcceptedTypeIdentity],
 	transparent_aliases: List[AcceptedTransparentAlias],
 	opaque_aliases: List[AcceptedOpaqueAlias]
@@ -72,19 +80,18 @@ record AcceptedAliasTableInput {
 
 
 private record AcceptedAliasTableRep {
+	definition_table: DefinitionTable,
 	type_identities: List[AcceptedTypeIdentity],
-	type_identity_indices_by_key: Dict[String, Int],
+	type_identity_indices_by_definition_id: Dict[Int, Int],
 	transparent_aliases: List[TransparentTypeAlias],
-	transparent_owner_module_paths: List[String],
 	transparent_alias_ids: List[TypeId],
 	transparent_canonical_visibility: List[Bool],
-	transparent_indices_by_type_key: Dict[String, Int],
+	transparent_indices_by_definition_id: Dict[Int, Int],
 	transparent_by_canonical_name: Dict[String, TransparentTypeAlias],
 	opaque_aliases: List[OpaqueTypeAlias],
-	opaque_owner_module_paths: List[String],
 	opaque_alias_ids: List[TypeId],
 	opaque_canonical_visibility: List[Bool],
-	opaque_indices_by_type_key: Dict[String, Int],
+	opaque_indices_by_definition_id: Dict[Int, Int],
 	opaque_by_canonical_name: Dict[String, OpaqueTypeAlias]
 }
 
@@ -119,6 +126,7 @@ private record AcceptedVisibleAliasBinding {
 
 
 private record AcceptedAliasModuleViewRep {
+	owner_module_path: Option[String],
 	visible_types_by_source_name: Dict[String, AcceptedVisibleAliasBinding],
 	canonical_type_redirects: List[TransparentTypeAlias]
 }
@@ -128,13 +136,14 @@ opaque type AcceptedAliasModuleView = AcceptedAliasModuleViewRep
 
 
 record AcceptedAliasAuthority {
+	owner_module_path: Option[String],
 	visible_types_by_source_name: Dict[String, AcceptedVisibleAliasBinding],
 	canonical_type_redirects: List[TransparentTypeAlias],
 	transparent_aliases: List[TransparentTypeAlias],
-	transparent_owner_module_paths: List[String],
+	transparent_alias_ids: List[TypeId],
 	transparent_by_canonical_name: Dict[String, TransparentTypeAlias],
 	opaque_aliases: List[OpaqueTypeAlias],
-	opaque_owner_module_paths: List[String],
+	opaque_alias_ids: List[TypeId],
 	opaque_by_canonical_name: Dict[String, OpaqueTypeAlias]
 }
 
@@ -166,7 +175,7 @@ private pure func type_identity_at(
 	representation: AcceptedAliasTableRep,
 	id: TypeId,
 ) -> Option[AcceptedTypeIdentity]:
-	index ?= representation.type_identity_indices_by_key.get(type_id_storage_key(id))
+	index ?= representation.type_identity_indices_by_definition_id.get(type_id_definition_id(id))
 	entry ?= representation.type_identities.get(index)
 
 	if type_ids_equal(entry.id, id):
@@ -185,38 +194,55 @@ pure func accepted_alias_table_find_type_identity(
 	type_identity_at(table_rep(table), id)
 
 
+pure func accepted_alias_table_definition_table(table: AcceptedAliasTable) -> DefinitionTable:
+	table_rep(table).definition_table
+
+
+private pure func type_identity_canonical_name(
+	definition_table: DefinitionTable,
+	id: TypeId,
+) -> Option[String]:
+	row ?= definition_table_type_row(definition_table, type_id_definition_id(id))
+	module_path ?= module_table_canonical_path(
+		definition_table_module_table(definition_table),
+		row.module_id,
+	)
+	Some(canonical_module_type_name(module_path, row.name))
+
+
 pure func accepted_alias_table(input: AcceptedAliasTableInput) -> Option[AcceptedAliasTable]:
-	var type_identity_indices_by_key: Dict[String, Int] = {}
+	var type_identity_indices_by_definition_id: Dict[Int, Int] = {}
 	var transparent_aliases: List[TransparentTypeAlias] = []
-	var transparent_owner_module_paths: List[String] = []
 	var transparent_alias_ids: List[TypeId] = []
 	var transparent_canonical_visibility: List[Bool] = []
-	var transparent_indices_by_type_key: Dict[String, Int] = {}
+	var transparent_indices_by_definition_id: Dict[Int, Int] = {}
 	var transparent_by_canonical_name: Dict[String, TransparentTypeAlias] = {}
 	var opaque_aliases: List[OpaqueTypeAlias] = []
-	var opaque_owner_module_paths: List[String] = []
 	var opaque_alias_ids: List[TypeId] = []
 	var opaque_canonical_visibility: List[Bool] = []
-	var opaque_indices_by_type_key: Dict[String, Int] = {}
+	var opaque_indices_by_definition_id: Dict[Int, Int] = {}
 	var opaque_by_canonical_name: Dict[String, OpaqueTypeAlias] = {}
 	var valid: Bool = True
 	var index: Int = 0
 
 	for entry in input.type_identities:
-		key = type_id_storage_key(entry.id)
+		key = type_id_definition_id(entry.id)
 
-		if type_identity_indices_by_key.contains(key):
+		if (
+			type_identity_canonical_name(input.definition_table, entry.id) != Some(entry.canonical_name)
+			or type_identity_indices_by_definition_id.contains(key)
+		):
 			valid = False
 		else:
-			type_identity_indices_by_key = type_identity_indices_by_key.set(key, index)
+			type_identity_indices_by_definition_id = type_identity_indices_by_definition_id.set(key, index)
 
 		index += 1
 
 	index = 0
 
 	for alias_entry in input.transparent_aliases:
-		key = type_id_storage_key(alias_entry.id)
-		identity_index = type_identity_indices_by_key.get(key)
+		key = type_id_definition_id(alias_entry.id)
+		identity_index = type_identity_indices_by_definition_id.get(key)
 
 		identity_matches = match identity_index:
 			Some(found_index):
@@ -233,8 +259,8 @@ pure func accepted_alias_table(input: AcceptedAliasTableInput) -> Option[Accepte
 
 		if (
 			not identity_matches
-			or transparent_indices_by_type_key.contains(key)
-			or opaque_indices_by_type_key.contains(key)
+			or transparent_indices_by_definition_id.contains(key)
+			or opaque_indices_by_definition_id.contains(key)
 			or (
 				alias_entry.canonical_visible
 				and ((
@@ -246,14 +272,11 @@ pure func accepted_alias_table(input: AcceptedAliasTableInput) -> Option[Accepte
 			valid = False
 		else:
 			transparent_aliases = transparent_aliases.append(alias_entry.payload)
-			transparent_owner_module_paths = transparent_owner_module_paths.append(
-				alias_entry.owner_module_path,
-			)
 			transparent_alias_ids = transparent_alias_ids.append(alias_entry.id)
 			transparent_canonical_visibility = transparent_canonical_visibility.append(
 				alias_entry.canonical_visible,
 			)
-			transparent_indices_by_type_key = transparent_indices_by_type_key.set(key, index)
+			transparent_indices_by_definition_id = transparent_indices_by_definition_id.set(key, index)
 
 			if alias_entry.canonical_visible:
 				transparent_by_canonical_name = transparent_by_canonical_name.set(
@@ -266,8 +289,8 @@ pure func accepted_alias_table(input: AcceptedAliasTableInput) -> Option[Accepte
 	index = 0
 
 	for alias_entry in input.opaque_aliases:
-		key = type_id_storage_key(alias_entry.id)
-		identity_index = type_identity_indices_by_key.get(key)
+		key = type_id_definition_id(alias_entry.id)
+		identity_index = type_identity_indices_by_definition_id.get(key)
 
 		identity_matches = match identity_index:
 			Some(found_index):
@@ -284,8 +307,8 @@ pure func accepted_alias_table(input: AcceptedAliasTableInput) -> Option[Accepte
 
 		if (
 			not identity_matches
-			or transparent_indices_by_type_key.contains(key)
-			or opaque_indices_by_type_key.contains(key)
+			or transparent_indices_by_definition_id.contains(key)
+			or opaque_indices_by_definition_id.contains(key)
 			or (
 				alias_entry.canonical_visible
 				and ((
@@ -297,14 +320,11 @@ pure func accepted_alias_table(input: AcceptedAliasTableInput) -> Option[Accepte
 			valid = False
 		else:
 			opaque_aliases = opaque_aliases.append(alias_entry.payload)
-			opaque_owner_module_paths = opaque_owner_module_paths.append(
-				alias_entry.owner_module_path,
-			)
 			opaque_alias_ids = opaque_alias_ids.append(alias_entry.id)
 			opaque_canonical_visibility = opaque_canonical_visibility.append(
 				alias_entry.canonical_visible,
 			)
-			opaque_indices_by_type_key = opaque_indices_by_type_key.set(key, index)
+			opaque_indices_by_definition_id = opaque_indices_by_definition_id.set(key, index)
 
 			if alias_entry.canonical_visible:
 				opaque_by_canonical_name = opaque_by_canonical_name.set(
@@ -337,19 +357,18 @@ pure func accepted_alias_table(input: AcceptedAliasTableInput) -> Option[Accepte
 
 	if valid:
 		Some(into_opaque AcceptedAliasTable({
+					definition_table = input.definition_table,
 					type_identities = input.type_identities,
-					type_identity_indices_by_key = type_identity_indices_by_key,
+					type_identity_indices_by_definition_id = type_identity_indices_by_definition_id,
 					transparent_aliases = transparent_aliases,
-					transparent_owner_module_paths = transparent_owner_module_paths,
 					transparent_alias_ids = transparent_alias_ids,
 					transparent_canonical_visibility = transparent_canonical_visibility,
-					transparent_indices_by_type_key = transparent_indices_by_type_key,
+					transparent_indices_by_definition_id = transparent_indices_by_definition_id,
 					transparent_by_canonical_name = transparent_by_canonical_name,
 					opaque_aliases = opaque_aliases,
-					opaque_owner_module_paths = opaque_owner_module_paths,
 					opaque_alias_ids = opaque_alias_ids,
 					opaque_canonical_visibility = opaque_canonical_visibility,
-					opaque_indices_by_type_key = opaque_indices_by_type_key,
+					opaque_indices_by_definition_id = opaque_indices_by_definition_id,
 					opaque_by_canonical_name = opaque_by_canonical_name
 				}))
 	else:
@@ -373,11 +392,14 @@ pure func accepted_alias_module_view(
 	var valid: Bool = True
 
 	for binding in bindings:
-		-- The storage key omits the defining span, so validate the complete
-		-- established identity before using the key to address category storage.
+		-- Validate the complete established identity before its scalar definition
+		-- ID addresses category storage.
 		if type_identity_at(table_representation, binding.id).is_none():
 			valid = False
-		else if binding.owner_local and not module_ids_equal(type_id_module_id(binding.id), owner):
+		else if binding.owner_local and type_id_module_id(
+			table_representation.definition_table,
+			binding.id,
+		) != Some(owner):
 			valid = False
 
 		match visible_type_ids_by_source_name.get(binding.source_name):
@@ -398,12 +420,12 @@ pure func accepted_alias_module_view(
 					binding.source_name,
 					binding.id,
 				)
-				key = type_id_storage_key(binding.id)
+				key = type_id_definition_id(binding.id)
 				var kind = VisibleNonAliasType
 				var payload_index = NO_VISIBLE_ALIAS_PAYLOAD_INDEX
 				var canonical_redirect_index = NO_VISIBLE_ALIAS_PAYLOAD_INDEX
 
-				match table_representation.transparent_indices_by_type_key.get(key):
+				match table_representation.transparent_indices_by_definition_id.get(key):
 					Some(index):
 						kind = VisibleTransparentAlias
 						payload_index = index
@@ -416,7 +438,7 @@ pure func accepted_alias_module_view(
 						):
 							valid = False
 					None:
-						match table_representation.opaque_indices_by_type_key.get(key):
+						match table_representation.opaque_indices_by_definition_id.get(key):
 							Some(index):
 								kind = VisibleOpaqueAlias
 								payload_index = index
@@ -475,6 +497,10 @@ pure func accepted_alias_module_view(
 
 	if valid:
 		Some(into_opaque AcceptedAliasModuleView({
+					owner_module_path = module_table_canonical_path(
+						definition_table_module_table(table_representation.definition_table),
+						owner,
+					),
 					visible_types_by_source_name = visible_types_by_source_name,
 					canonical_type_redirects = canonical_type_redirects
 				}))
@@ -488,6 +514,7 @@ pure func accepted_alias_module_view_binding_count(view: AcceptedAliasModuleView
 
 pure func accepted_alias_empty_module_view() -> AcceptedAliasModuleView:
 	into_opaque AcceptedAliasModuleView({
+			owner_module_path = None,
 			visible_types_by_source_name = {},
 			canonical_type_redirects = []
 		})
@@ -501,13 +528,14 @@ pure func accepted_alias_authority(
 	view_representation = view_rep(view)
 
 	{
+		owner_module_path = view_representation.owner_module_path,
 		visible_types_by_source_name = view_representation.visible_types_by_source_name,
 		canonical_type_redirects = view_representation.canonical_type_redirects,
 		transparent_aliases = table_representation.transparent_aliases,
-		transparent_owner_module_paths = table_representation.transparent_owner_module_paths,
+		transparent_alias_ids = table_representation.transparent_alias_ids,
 		transparent_by_canonical_name = table_representation.transparent_by_canonical_name,
 		opaque_aliases = table_representation.opaque_aliases,
-		opaque_owner_module_paths = table_representation.opaque_owner_module_paths,
+		opaque_alias_ids = table_representation.opaque_alias_ids,
 		opaque_by_canonical_name = table_representation.opaque_by_canonical_name
 	}
 
@@ -525,17 +553,16 @@ private pure func local_transparent_alias_value(
 	authority: AcceptedAliasAuthority,
 	index: Int,
 ) -> Option[TransparentTypeAlias]:
-	match (
-		authority.transparent_aliases.get(index),
-		authority.transparent_owner_module_paths.get(index),
-	):
-		(Some(alias_entry), Some(owner_module_path)):
+	owner_module_path ?= authority.owner_module_path
+
+	match authority.transparent_aliases.get(index):
+		Some(alias_entry):
 			Some(
 				{ alias_entry |
 					target = localize_module_types(owner_module_path, alias_entry.target)
 				},
 			)
-		_:
+		None:
 			None
 
 
@@ -543,14 +570,16 @@ private pure func local_opaque_alias_value(
 	authority: AcceptedAliasAuthority,
 	index: Int,
 ) -> Option[OpaqueTypeAlias]:
-	match (authority.opaque_aliases.get(index), authority.opaque_owner_module_paths.get(index)):
-		(Some(alias_entry), Some(owner_module_path)):
+	owner_module_path ?= authority.owner_module_path
+
+	match authority.opaque_aliases.get(index):
+		Some(alias_entry):
 			Some(
 				{ alias_entry |
 					target = localize_module_types(owner_module_path, alias_entry.target)
 				},
 			)
-		_:
+		None:
 			None
 
 
@@ -559,9 +588,9 @@ pure func accepted_alias_exact_transparent(
 	id: TypeId,
 ) -> AcceptedAliasExactProbe:
 	representation = table_rep(table)
-	key = type_id_storage_key(id)
+	key = type_id_definition_id(id)
 
-	match representation.transparent_indices_by_type_key.get(key):
+	match representation.transparent_indices_by_definition_id.get(key):
 		Some(index):
 			lookup = match (
 				representation.transparent_alias_ids.get(index),
@@ -586,7 +615,7 @@ pure func accepted_alias_exact_transparent(
 				None:
 					AcceptedAliasExactMissing
 
-			candidates_visited = if representation.type_identity_indices_by_key.contains(key):
+			candidates_visited = if representation.type_identity_indices_by_definition_id.contains(key):
 				1
 			else:
 				0

@@ -1,6 +1,8 @@
 import:
+	../../../src/compiler/stage_04_modules/loaded_module: ModuleOrigin(StdlibModule)
 	../../../src/compiler/stage_04_modules/module_table: ModuleId
-	../../../src/compiler/stage_06_typecheck/graph/type_identity: TypeId, type_id, type_ids_equal
+	../../../src/compiler/stage_06_typecheck/graph/indexed_graph: PreparedModuleScope
+	../../../src/compiler/stage_06_typecheck/graph/type_identity: TypeId, type_ids_equal
 	../../../src/compiler/stage_06_typecheck/type_system/accepted_alias_authority:
 		AcceptedAliasTable,
 		AcceptedAliasTableInput,
@@ -40,37 +42,57 @@ import:
 		TYPE_STRING,
 		canonical_module_type_name,
 		types_equal,
-	../../../src/lib/source: SourceSpan, source_empty_span, source_file, source_start
-	../typecheck_test_support: module_id_fixture, module_id_fixture_find
+	../typecheck_test_support:
+		DefinitionBackedTypeFixtureModule,
+		definition_backed_type_fixture,
+		definition_backed_type_fixture_definition_table,
+		definition_backed_type_fixture_for_origin,
+		definition_backed_type_fixture_type_id,
+		module_id_fixture_find,
 	test: TestSuite
 
 
-private struct UnionFixtureModuleIds {
+private record UnionFixture {
+	scope: PreparedModuleScope,
 	left: ModuleId,
 	right: ModuleId,
-	unrelated: ModuleId
+	unrelated: ModuleId,
+	left_node: TypeId,
+	right_choice: TypeId,
+	alias_only: TypeId,
+	extra: TypeId,
+	first: TypeId,
+	second: TypeId
 }
 
 
-private pure func union_fixture_module_ids() -> Option[UnionFixtureModuleIds]:
-	fixture ?= module_id_fixture(["pkg/left", "pkg/right", "pkg/unrelated"])
+private pure func union_fixture() -> Option[UnionFixture]:
+	fixture ?= definition_backed_type_fixture([
+		{module_path = "pkg/left", type_names = ["Node", "AliasOnly", "First", "Second"]},
+		{module_path = "pkg/right", type_names = ["Choice"]},
+		{module_path = "pkg/unrelated", type_names = ["Extra"]},
+	])
 	left ?= module_id_fixture_find(fixture, "pkg/left")
 	right ?= module_id_fixture_find(fixture, "pkg/right")
 	unrelated ?= module_id_fixture_find(fixture, "pkg/unrelated")
+	left_node ?= definition_backed_type_fixture_type_id(fixture, "pkg/left", "Node")
+	right_choice ?= definition_backed_type_fixture_type_id(fixture, "pkg/right", "Choice")
+	alias_only ?= definition_backed_type_fixture_type_id(fixture, "pkg/left", "AliasOnly")
+	extra ?= definition_backed_type_fixture_type_id(fixture, "pkg/unrelated", "Extra")
+	first ?= definition_backed_type_fixture_type_id(fixture, "pkg/left", "First")
+	second ?= definition_backed_type_fixture_type_id(fixture, "pkg/left", "Second")
 	Some({
+		scope = fixture,
 		left = left,
 		right = right,
 		unrelated = unrelated,
+		left_node = left_node,
+		right_choice = right_choice,
+		alias_only = alias_only,
+		extra = extra,
+		first = first,
+		second = second,
 	})
-
-
-private pure func fixture_span(path: String) -> SourceSpan:
-	source = source_file(path, path, "")
-	source_empty_span(source, source_start(source))
-
-
-private pure func fixture_type_id(module_id: ModuleId, module_path: String, name: String) -> TypeId:
-	type_id(module_id, name, fixture_span(module_path + ".brp"))
 
 
 private pure func variant(
@@ -88,7 +110,7 @@ private pure func variant(
 
 
 private pure func fixture_union(
-	module_id: ModuleId,
+	id: TypeId,
 	module_path: String,
 	name: String,
 	canonical_visible: Bool,
@@ -96,8 +118,7 @@ private pure func fixture_union(
 	is_enum: Bool,
 ) -> AcceptedUnionTableRecord:
 	{
-		id = fixture_type_id(module_id, module_path, name),
-		owner_module_path = module_path,
+		id = id,
 		canonical_name = canonical_module_type_name(module_path, name),
 		canonical_visible = canonical_visible,
 		payload = {
@@ -113,11 +134,11 @@ private pure func fixture_union(
 
 
 private pure func table_input(
-	module_ids: UnionFixtureModuleIds,
+	fixture: UnionFixture,
 	include_unrelated: Bool,
 ) -> AcceptedUnionTableInput:
 	left = fixture_union(
-		module_ids.left,
+		fixture.left_node,
 		"pkg/left",
 		"Node",
 		True,
@@ -128,7 +149,7 @@ private pure func table_input(
 		False,
 	)
 	right = fixture_union(
-		module_ids.right,
+		fixture.right_choice,
 		"pkg/right",
 		"Choice",
 		True,
@@ -140,16 +161,22 @@ private pure func table_input(
 
 	if include_unrelated:
 		unrelated = fixture_union(
-			module_ids.unrelated,
+			fixture.extra,
 			"pkg/unrelated",
 			"Extra",
 			True,
 			[variant("ExtraValue", 303, [TYPE_INT], 0)],
 			False,
 		)
-		{unions = unions.append(unrelated)}
+		{
+			definition_table = definition_backed_type_fixture_definition_table(fixture.scope),
+			unions = unions.append(unrelated)
+		}
 	else:
-		{unions = unions}
+		{
+			definition_table = definition_backed_type_fixture_definition_table(fixture.scope),
+			unions = unions
+		}
 
 
 private pure func type_identity(id: TypeId, canonical_name: String) -> AcceptedTypeIdentity:
@@ -161,29 +188,30 @@ private pure func type_identity(id: TypeId, canonical_name: String) -> AcceptedT
 
 
 private pure func type_identities(
-	module_ids: UnionFixtureModuleIds,
+	fixture: UnionFixture,
 	include_unrelated: Bool,
 ) -> Option[AcceptedAliasTable]:
 	var identities = [type_identity(
-			fixture_type_id(module_ids.left, "pkg/left", "Node"),
+			fixture.left_node,
 			canonical_module_type_name("pkg/left", "Node"),
 		), type_identity(
-			fixture_type_id(module_ids.right, "pkg/right", "Choice"),
+			fixture.right_choice,
 			canonical_module_type_name("pkg/right", "Choice"),
 		), type_identity(
-			fixture_type_id(module_ids.left, "pkg/left", "AliasOnly"),
+			fixture.alias_only,
 			canonical_module_type_name("pkg/left", "AliasOnly"),
 		)]
 
 	if include_unrelated:
 		identities = identities.append(
 			type_identity(
-				fixture_type_id(module_ids.unrelated, "pkg/unrelated", "Extra"),
+				fixture.extra,
 				canonical_module_type_name("pkg/unrelated", "Extra"),
 			),
 		)
 
 	input: AcceptedAliasTableInput = {
+		definition_table = definition_backed_type_fixture_definition_table(fixture.scope),
 		type_identities = identities,
 		transparent_aliases = [],
 		opaque_aliases = []
@@ -192,37 +220,37 @@ private pure func type_identities(
 
 
 private pure func union_bindings(
-	module_ids: UnionFixtureModuleIds,
+	fixture: UnionFixture,
 ) -> List[AcceptedVisibleUnionBinding]:
 	[
 		{
 			source_name = "Node",
-			id = fixture_type_id(module_ids.left, "pkg/left", "Node"),
+			id = fixture.left_node,
 			owner_local = True
 		},
 		{
 			source_name = "Remote",
-			id = fixture_type_id(module_ids.right, "pkg/right", "Choice"),
+			id = fixture.right_choice,
 			owner_local = False
 		},
 	]
 
 
 private pure func constructor_bindings(
-	module_ids: UnionFixtureModuleIds,
+	fixture: UnionFixture,
 ) -> List[AcceptedVisibleConstructorBinding]:
 	[
 		{
 			source_name = "Next",
 			parent_source_name = "Node",
-			parent_id = fixture_type_id(module_ids.left, "pkg/left", "Node"),
+			parent_id = fixture.left_node,
 			constructor_id = 101,
 			owner_local = True
 		},
 		{
 			source_name = "Other",
 			parent_source_name = "Remote",
-			parent_id = fixture_type_id(module_ids.right, "pkg/right", "Choice"),
+			parent_id = fixture.right_choice,
 			constructor_id = 202,
 			owner_local = False
 		},
@@ -230,7 +258,7 @@ private pure func constructor_bindings(
 
 
 private pure func category_table_and_compact_view_are_authoritative_result() -> Option[Bool]:
-	module_ids ?= union_fixture_module_ids()
+	module_ids ?= union_fixture()
 	identities ?= type_identities(module_ids, False)
 	table ?= accepted_union_table(
 		table_input(module_ids, False),
@@ -259,7 +287,7 @@ private pure func category_table_and_compact_view_are_authoritative_result() -> 
 	local_constructor ?= accepted_union_find_constructor_for_parent(authority, "Node", "Next")
 	remote_constructor ?= accepted_union_find_constructor_for_parent(authority, "Remote", "Other")
 	canonical_only = accepted_union_authority_without_visible_names(authority)
-	alias_id = fixture_type_id(module_ids.left, "pkg/left", "AliasOnly")
+	alias_id = module_ids.alias_only
 
 	alias_is_wrong_kind = match accepted_union_exact(table, identities, alias_id).lookup:
 		AcceptedUnionExactWrongKind(id):
@@ -307,9 +335,9 @@ private pure func category_table_and_compact_view_are_authoritative() -> Bool:
 
 
 private pure func exact_lookup_cost_is_independent_of_unrelated_entries() -> Bool:
-	match union_fixture_module_ids():
+	match union_fixture():
 		Some(module_ids):
-			left_id = fixture_type_id(module_ids.left, "pkg/left", "Node")
+			left_id = module_ids.left_node
 
 			match (type_identities(module_ids, False), type_identities(module_ids, True)):
 				(Some(small_identities), Some(large_identities)):
@@ -346,7 +374,7 @@ private pure func exact_lookup_cost_is_independent_of_unrelated_entries() -> Boo
 
 
 private pure func module_view_rejects_misclassified_owner_binding() -> Bool:
-	match union_fixture_module_ids():
+	match union_fixture():
 		Some(module_ids):
 			match type_identities(module_ids, False):
 				Some(identities):
@@ -365,11 +393,7 @@ private pure func module_view_rejects_misclassified_owner_binding() -> Bool:
 								[
 									{
 										source_name = "Wrong",
-										id = fixture_type_id(
-											module_ids.right,
-											"pkg/right",
-											"Choice",
-										),
+									id = module_ids.right_choice,
 										owner_local = True
 									},
 								],
@@ -384,10 +408,11 @@ private pure func module_view_rejects_misclassified_owner_binding() -> Bool:
 
 
 private pure func later_local_constructor_declaration_wins_result() -> Option[Bool]:
-	module_ids ?= union_fixture_module_ids()
-	first_id = fixture_type_id(module_ids.left, "pkg/left", "First")
-	second_id = fixture_type_id(module_ids.left, "pkg/left", "Second")
+	module_ids ?= union_fixture()
+	first_id = module_ids.first
+	second_id = module_ids.second
 	identity_input: AcceptedAliasTableInput = {
+		definition_table = definition_backed_type_fixture_definition_table(module_ids.scope),
 		type_identities = [type_identity(
 				first_id,
 				canonical_module_type_name("pkg/left", "First"),
@@ -400,9 +425,10 @@ private pure func later_local_constructor_declaration_wins_result() -> Option[Bo
 	}
 	identities ?= accepted_alias_table(identity_input)
 	input: AcceptedUnionTableInput = {
+		definition_table = definition_backed_type_fixture_definition_table(module_ids.scope),
 		unions = [
 			fixture_union(
-				module_ids.left,
+				first_id,
 				"pkg/left",
 				"First",
 				True,
@@ -410,7 +436,7 @@ private pure func later_local_constructor_declaration_wins_result() -> Option[Bo
 				True,
 			),
 			fixture_union(
-				module_ids.left,
+				second_id,
 				"pkg/left",
 				"Second",
 				True,
@@ -454,8 +480,14 @@ private pure func later_local_constructor_declaration_wins() -> Bool:
 
 
 private pure func builtin_union_is_copied_once_into_the_table_result() -> Option[Bool]:
-	input: AcceptedUnionTableInput = {unions = []}
+	fixture ?= union_fixture()
+	definition_table = definition_backed_type_fixture_definition_table(fixture.scope)
+	input: AcceptedUnionTableInput = {
+		definition_table = definition_table,
+		unions = []
+	}
 	identity_input: AcceptedAliasTableInput = {
+		definition_table = definition_table,
 		type_identities = [],
 		transparent_aliases = [],
 		opaque_aliases = []
@@ -483,9 +515,126 @@ private pure func builtin_union_is_copied_once_into_the_table() -> Bool:
 	builtin_union_is_copied_once_into_the_table_result().get_or(False)
 
 
+private pure func matching_graph_and_builtin_union_share_one_payload_result() -> Option[Bool]:
+	fixture ?= definition_backed_type_fixture_for_origin(
+		[{module_path = "option", type_names = ["Option"]}],
+		StdlibModule,
+	)
+	option_id ?= definition_backed_type_fixture_type_id(fixture, "option", "Option")
+	definition_table = definition_backed_type_fixture_definition_table(fixture)
+	empty_identity_input: AcceptedAliasTableInput = {
+		definition_table = definition_table,
+		type_identities = [],
+		transparent_aliases = [],
+		opaque_aliases = []
+	}
+	empty_identities ?= accepted_alias_table(empty_identity_input)
+	builtin_table ?= accepted_union_table(
+		{definition_table = definition_table, unions = []},
+		empty_identities,
+		env_with_builtins(ENV_EMPTY),
+		["Option"],
+	).to_option()
+	builtin_entry ?= accepted_union_find(
+		accepted_union_authority(builtin_table, accepted_union_empty_module_view()),
+		"Option",
+	)
+	graph_identity_input: AcceptedAliasTableInput = {
+		definition_table = definition_table,
+		type_identities = [type_identity(option_id, "Option")],
+		transparent_aliases = [],
+		opaque_aliases = []
+	}
+	graph_identities ?= accepted_alias_table(graph_identity_input)
+	shared_table ?= accepted_union_table(
+		{
+			definition_table = definition_table,
+			unions = [
+				{
+					id = option_id,
+					canonical_name = "Option",
+					canonical_visible = True,
+					payload = builtin_entry
+				},
+			]
+		},
+		graph_identities,
+		env_with_builtins(ENV_EMPTY),
+		["Option"],
+	).to_option()
+	shared_authority = accepted_union_authority(
+		shared_table,
+		accepted_union_empty_module_view(),
+	)
+	some ?= accepted_union_find_constructor(shared_authority, "Some")
+
+	Some(
+		accepted_union_table_entry_count(shared_table) == 1
+		and some.parent_type == "Option"
+		and (
+			match accepted_union_exact(
+				shared_table,
+				graph_identities,
+				option_id,
+			).lookup:
+				AcceptedUnionExactFound(_): True
+				_: False
+		),
+	)
+
+
+private pure func matching_graph_and_builtin_union_share_one_payload() -> Bool:
+	matching_graph_and_builtin_union_share_one_payload_result().get_or(False)
+
+
+private pure func table_rejects_forged_canonical_name_result() -> Option[Bool]:
+	fixture ?= union_fixture()
+	identities ?= type_identities(fixture, False)
+	input = table_input(fixture, False)
+	union_entry ?= input.unions.get(0)
+	forged = { union_entry | canonical_name = "Option" }
+	Some(match accepted_union_table(
+		{ input | unions = input.unions.set(0, forged) },
+		identities,
+		ENV_EMPTY,
+		[],
+	):
+		Err(_): True
+		Ok(_): False
+	)
+
+
+private pure func table_rejects_forged_canonical_name() -> Bool:
+	table_rejects_forged_canonical_name_result().get_or(False)
+
+
+private pure func independent_definition_domains_are_rejected() -> Bool:
+	match (union_fixture(), union_fixture()):
+		(Some(identity_fixture), Some(union_fixture_value)):
+			match type_identities(identity_fixture, False):
+				Some(identities):
+					match accepted_union_table(
+						table_input(union_fixture_value, False),
+						identities,
+						ENV_EMPTY,
+						[],
+					):
+						Err(errors):
+							errors.contains(
+								"accepted union and type identity tables have different origins",
+							)
+						Ok(_):
+							False
+				None:
+					False
+		_:
+			False
+
+
 tests: TestSuite = {
 	description = "Accepted union authority",
 	tests = [
+		("table rejects forged canonical name", table_rejects_forged_canonical_name),
 		(
 			"category table and compact module view are authoritative",
 			category_table_and_compact_view_are_authoritative,
@@ -505,6 +654,14 @@ tests: TestSuite = {
 		(
 			"builtin union is copied once into the table",
 			builtin_union_is_copied_once_into_the_table,
+		),
+		(
+			"matching graph and builtin union share one payload",
+			matching_graph_and_builtin_union_share_one_payload,
+		),
+		(
+			"independent definition domains are rejected",
+			independent_definition_domains_are_rejected,
 		),
 	]
 }

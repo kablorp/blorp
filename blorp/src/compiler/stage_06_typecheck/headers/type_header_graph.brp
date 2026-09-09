@@ -34,7 +34,7 @@ import:
 		ParsedVariantDecl,
 		parsed_type_expr_span,
 	../../stage_04_modules/loaded_module: ModuleOrigin(StdlibModule)
-	../../stage_04_modules/module_table: module_ids_equal
+	../../stage_04_modules/module_table: ModuleId, module_ids_equal
 	../graph/definition_identity: SourceDefinitionKind(FieldDefinition), source_definition_key
 	../graph/definition_index:
 		DefinitionTable,
@@ -51,6 +51,7 @@ import:
 		prepared_module_scopes_select_same_module,
 	../graph/type_identity:
 		TypeId,
+		type_id_definition_id,
 		type_id_module_id,
 		type_id_name,
 		type_id_source_span,
@@ -115,6 +116,7 @@ import:
 		trait_ids_equal,
 		trait_method_id_name,
 		trait_method_id_owner,
+		type_declaration_source_name,
 	list: repeat
 	type_header_dependencies: acyclic_type_alias_dependency_graph_declaration_graph
 	type_parameter_headers:
@@ -219,7 +221,7 @@ union ResolvedTypeShape:
 
 
 union TypeResolutionOwner:
-	TypeDeclarationResolutionOwner(TypeId)
+	TypeDeclarationResolutionOwner(TypeId, String)
 	TraitMethodResolutionOwner(TraitMethodId)
 	CallableResolutionOwner(CallableId, String)
 	GlobalResolutionOwner(GlobalId)
@@ -242,7 +244,7 @@ union TypeShapeResolutionError:
 	TypeShapeUnknownType(TypeResolutionOwner, String, SourceSpan)
 	TypeShapeUnknownQualifier(TypeResolutionOwner, String, SourceSpan)
 	TypeShapeImportedModuleMissing(TypeResolutionOwner, String, SourceSpan)
-	TypeShapePrivateTypeReference(TypeResolutionOwner, String, TypeId, SourceSpan)
+	TypeShapePrivateTypeReference(TypeResolutionOwner, String, String, SourceSpan)
 	TypeShapeArityMismatch(TypeResolutionOwner, String, Int, Int, SourceSpan)
 	TypeShapeUnknownTypeParameter(TypeResolutionOwner, String, SourceSpan)
 	TypeShapeInvalidDimension(TypeResolutionOwner, String, SourceSpan)
@@ -305,11 +307,6 @@ union TypeHeaderShape:
 	AliasTypeHeader(AliasLayout, ResolvedTypeShape)
 
 
-union DeclaredTypeExpansion:
-	NominalDeclaredType
-	TransparentAliasExpansion(List[ResolvedTypeParameter], ResolvedTypeShape)
-
-
 struct TypeContainmentFacts {
 	contains_resource: Bool,
 	may_contain_function: Bool,
@@ -318,8 +315,14 @@ struct TypeContainmentFacts {
 }
 
 
+-- Owner/name are the one measured descriptive projection retained at the
+-- header boundary. They keep header installation and accepted-view publication
+-- from repeatedly materializing the same DefinitionRow; nominal identity
+-- remains solely the scalar definition-backed `id`.
 record TypeHeader {
 	id: TypeId,
+	owner_module_id: ModuleId,
+	source_name: String,
 	parameters: List[ResolvedTypeParameter],
 	shape: TypeHeaderShape,
 	containment: TypeContainmentFacts
@@ -331,6 +334,7 @@ record TypeHeader {
 -- a builtin type.
 private record AcceptedBuiltinHeaderRep {
 	id: TypeId,
+	source_name: String,
 	parameters: List[ResolvedTypeParameter],
 	layout: BuiltinTypeLayout,
 	containment: TypeContainmentFacts
@@ -345,6 +349,7 @@ opaque type AcceptedBuiltinHeader = AcceptedBuiltinHeaderRep
 -- callers cannot construct or accidentally pass another header category.
 private record AcceptedRecordHeaderRep {
 	id: TypeId,
+	source_name: String,
 	parameters: List[ResolvedTypeParameter],
 	layout: RecordLayout,
 	fields: List[TypeHeaderField],
@@ -360,6 +365,7 @@ opaque type AcceptedRecordHeader = AcceptedRecordHeaderRep
 -- reordered constructor-ID and variant lists.
 private record AcceptedUnionHeaderRep {
 	id: TypeId,
+	source_name: String,
 	parameters: List[ResolvedTypeParameter],
 	layout: UnionLayout,
 	variants: List[TypeHeaderVariant],
@@ -375,6 +381,7 @@ opaque type AcceptedUnionHeader = AcceptedUnionHeaderRep
 -- opaque alias as expandable.
 private record AcceptedAliasHeaderRep {
 	id: TypeId,
+	source_name: String,
 	parameters: List[ResolvedTypeParameter],
 	layout: AliasLayout,
 	target: ResolvedTypeShape,
@@ -409,6 +416,7 @@ private EMPTY_MODULE_TYPE_HEADER_INDICES: ModuleTypeHeaderIndices = {
 -- is itself embedded in TypeHeaderGraphRep.
 private record TypeHeaderTable {
 	headers: List[TypeHeader],
+	header_index_by_definition_id: Dict[Int, Int],
 	header_indices_by_name: Dict[String, List[Int]],
 	header_indices_by_module: List[ModuleTypeHeaderIndices],
 	owner_scope: PreparedModuleScope
@@ -426,6 +434,7 @@ opaque type TypeHeaderGraph = TypeHeaderGraphRep
 
 union TypeHeaderError:
 	TypeHeaderOwnerModuleMissing(TypeId)
+	TypeHeaderDuplicateIdentity(TypeId)
 	TypeHeaderParametersMissing(TypeId)
 	TypeHeaderResolutionError(TypeShapeResolutionError)
 	TypeHeaderConstructorMissing(TypeId, String)
@@ -479,6 +488,7 @@ opaque type CallableTypeResolutionContext = TypeResolutionContext
 
 private record TypeHeaderBuildContext {
 	owner: TypeId,
+	owner_name: String,
 	resolution: TypeResolutionContext
 }
 
@@ -675,7 +685,7 @@ private pure func resolution_owner_self_shape(
 	owner: TypeResolutionOwner,
 ) -> Option[ResolvedTypeShape]:
 	match owner:
-		TypeDeclarationResolutionOwner(id):
+		TypeDeclarationResolutionOwner(id, _):
 			Some(SelfTypeShape(id))
 		TraitMethodResolutionOwner(method_id):
 			Some(TraitSelfTypeShape(trait_method_id_owner(method_id)))
@@ -940,7 +950,7 @@ private pure func declared_type_at_path(
 							TypeShapePrivateTypeReference(
 								context.owner,
 								bound_module_canonical_path(module),
-								skeleton.id,
+								name,
 								span,
 							),
 						)
@@ -1323,9 +1333,8 @@ private pure func type_resolution_owner_matches_module(
 	module: BoundModule,
 ) -> Bool:
 	match owner:
-		TypeDeclarationResolutionOwner(id):
-			module_ids_equal(
-				type_id_module_id(id),
+		TypeDeclarationResolutionOwner(id, _):
+			type_id_module_id(definition_table, id) == Some(
 				prepared_module_scope_id(bound_module_scope(module)),
 			)
 		TraitMethodResolutionOwner(method_id):
@@ -1611,7 +1620,7 @@ private pure func resolve_fields(
 							prepared_module_scope_id(bound_module_scope(context.resolution.module)),
 							FieldDefinition,
 							field.name.text,
-							Some(type_id_name(context.owner)),
+							Some(context.owner_name),
 							field.span,
 						),
 					),
@@ -1728,7 +1737,7 @@ private pure func builtin_type_containment_facts(
 	)
 
 	(may_contain_one_shot_stream, may_contain_resource_source) = if is_stream_module:
-		match type_id_name(context.owner):
+		match context.owner_name:
 			"Stream" | "FallibleStream":
 				(True, False)
 			"ResourceSource":
@@ -1771,6 +1780,10 @@ private pure func build_record_header(
 
 				TypeHeaderReady({
 					id = context.owner,
+					owner_module_id = prepared_module_scope_id(
+						bound_module_scope(context.resolution.module),
+					),
+					source_name = context.owner_name,
 					parameters = parameters,
 					shape = RecordTypeHeader(layout, fields),
 					containment = EMPTY_TYPE_CONTAINMENT_FACTS,
@@ -1811,6 +1824,10 @@ private pure func build_union_header(
 
 				TypeHeaderReady({
 					id = context.owner,
+					owner_module_id = prepared_module_scope_id(
+						bound_module_scope(context.resolution.module),
+					),
+					source_name = context.owner_name,
 					parameters = parameters,
 					shape = UnionTypeHeader(layout, variants),
 					containment = EMPTY_TYPE_CONTAINMENT_FACTS,
@@ -1829,7 +1846,7 @@ private pure func build_builtin_header(
 	else:
 		match builtin_value_storage(
 			bound_module_program(context.resolution.module).source.module_name,
-			type_id_name(context.owner),
+			context.owner_name,
 		):
 			Some(BuiltinInlineScalar):
 				ScalarBuiltin
@@ -1842,6 +1859,10 @@ private pure func build_builtin_header(
 
 	TypeHeaderReady({
 		id = context.owner,
+		owner_module_id = prepared_module_scope_id(
+			bound_module_scope(context.resolution.module),
+		),
+		source_name = context.owner_name,
 		parameters = parameters,
 		shape = BuiltinTypeHeader(layout),
 		containment = builtin_type_containment_facts(context, decl.is_resource),
@@ -1864,6 +1885,10 @@ private pure func build_alias_header(
 
 			TypeHeaderReady({
 				id = context.owner,
+				owner_module_id = prepared_module_scope_id(
+					bound_module_scope(context.resolution.module),
+				),
+				source_name = context.owner_name,
 				parameters = parameters,
 				shape = AliasTypeHeader(layout, target),
 				containment = EMPTY_TYPE_CONTAINMENT_FACTS,
@@ -1878,12 +1903,13 @@ private pure func build_type_header(
 		resolved_type_parameter_graph_alias_dependencies(parameter_graph),
 	)
 	bound_graph = declaration_skeleton_graph_bound_graph(declaration_graph)
-
-	match bound_module_graph_find_for_id(
+	owner_module = bound_module_graph_find_for_id(
 		bound_graph,
 		bound_module_graph_module_table(bound_graph),
-		type_id_module_id(skeleton.id),
-	):
+		skeleton.module_id,
+	)
+
+	match owner_module:
 		None:
 			TypeHeaderRejected([TypeHeaderOwnerModuleMissing(skeleton.id)])
 		Some(module):
@@ -1895,13 +1921,17 @@ private pure func build_type_header(
 						declaration_graph = declaration_graph,
 						bound_graph = bound_graph,
 						module = module,
-						owner = TypeDeclarationResolutionOwner(skeleton.id),
+						owner = TypeDeclarationResolutionOwner(
+							skeleton.id,
+							type_declaration_source_name(skeleton.source),
+						),
 						parameters = parameter_entry.parameters.map(
 							func(parameter): TypeDeclarationResolutionParameter(parameter.id),
 						)
 					}
 					context: TypeHeaderBuildContext = {
 						owner = skeleton.id,
+						owner_name = type_declaration_source_name(skeleton.source),
 						resolution = resolution
 					}
 
@@ -1919,9 +1949,9 @@ private pure func build_type_header(
 private pure func type_header_is_public(
 	declaration_graph: DeclarationSkeletonGraph,
 	module_scope: PreparedModuleScope,
-	header: TypeHeader,
+	name: String,
 ) -> Bool:
-	declaration_skeleton_graph_find_type(declaration_graph, module_scope, type_id_name(header.id))
+	declaration_skeleton_graph_find_type(declaration_graph, module_scope, name)
 		.map(func(skeleton): skeleton.visibility == PublicDeclaration)
 		.get_or(False)
 
@@ -1964,32 +1994,33 @@ private pure func type_header_table(
 	bound_graph = declaration_skeleton_graph_bound_graph(declaration_graph)
 	owner_scope = bound_module_scope(bound_module_graph_target(bound_graph))
 	module_count = indexed_graph_modules(bound_module_graph_indexed_graph(bound_graph)).length() + 1
+	var header_index_by_definition_id: Dict[Int, Int] = {}
 	var header_indices_by_name: Dict[String, List[Int]] = {}
 	var header_indices_by_module = empty_module_type_header_indices(module_count)
 	var errors: List[TypeHeaderError] = []
 	var index: Int = 0
 
 	for header in headers:
-		name = type_id_name(header.id)
+		definition_id = type_id_definition_id(header.id)
+		if header_index_by_definition_id.contains(definition_id):
+			errors = errors.append(TypeHeaderDuplicateIdentity(header.id))
+		else:
+			header_index_by_definition_id = header_index_by_definition_id.set(definition_id, index)
+
 		header_indices_by_name = header_indices_by_name.set(
-			name,
-			header_indices_by_name
-				.get_or(name, [])
-				.append(index),
+			header.source_name,
+			header_indices_by_name.get_or(header.source_name, []).append(index),
 		)
 
 		match bound_module_graph_find_for_id(
 			bound_graph,
 			bound_module_graph_module_table(bound_graph),
-			type_id_module_id(header.id),
+			header.owner_module_id,
 		):
 			None:
 				errors = errors.append(TypeHeaderOwnerModuleMissing(header.id))
 			Some(module):
-				match prepared_module_scope_compatible_index(
-					owner_scope,
-					bound_module_scope(module),
-				):
+				match prepared_module_scope_compatible_index(owner_scope, bound_module_scope(module)):
 					None:
 						errors = errors.append(TypeHeaderOwnerModuleMissing(header.id))
 					Some(module_index):
@@ -2000,7 +2031,7 @@ private pure func type_header_table(
 							type_header_is_public(
 								declaration_graph,
 								bound_module_scope(module),
-								header,
+								header.source_name,
 							),
 						)
 
@@ -2009,6 +2040,7 @@ private pure func type_header_table(
 	if errors.is_empty():
 		Ok({
 			headers = headers,
+			header_index_by_definition_id = header_index_by_definition_id,
 			header_indices_by_name = header_indices_by_name,
 			header_indices_by_module = header_indices_by_module,
 			owner_scope = owner_scope,
@@ -2039,18 +2071,7 @@ private pure func type_header_table_module_indices_for_scope(
 
 
 private pure func type_header_table_index(table: TypeHeaderTable, id: TypeId) -> Option[Int]:
-	var result: Option[Int] = None
-
-	for index in table.header_indices_by_name.get_or(type_id_name(id), []):
-		match table.headers.get(index):
-			Some(header):
-				if type_ids_equal(header.id, id):
-					result = Some(index)
-					break
-			None:
-				void
-
-	result
+	table.header_index_by_definition_id.get(type_id_definition_id(id))
 
 
 private pure func type_header_table_find(table: TypeHeaderTable, id: TypeId) -> Option[TypeHeader]:
@@ -3190,9 +3211,10 @@ pure func type_header_graph_build(
 					Some(cycle):
 						Err([TypeHeaderInlineStorageCycle(
 									cycle,
-									type_header_cycle_display_names(
-										declaration_skeleton_graph_bound_graph(declaration_graph),
-										cycle,
+								type_header_cycle_display_names(
+									declaration_skeleton_graph_bound_graph(declaration_graph),
+									declaration_skeleton_graph_definition_table(declaration_graph),
+									cycle,
 									),
 								)])
 					None:
@@ -3246,24 +3268,12 @@ pure func type_header_graph_find(graph: TypeHeaderGraph, id: TypeId) -> Option[T
 	type_header_table_find(type_header_graph_rep(graph).table, id)
 
 
-pure func type_header_graph_declared_type_expansion(
-	graph: TypeHeaderGraph,
-	id: TypeId,
-) -> Option[DeclaredTypeExpansion]:
-	type_header_graph_find(graph, id).map(func(header):
-		match header.shape:
-			AliasTypeHeader(TransparentAlias, target):
-				TransparentAliasExpansion(header.parameters, target)
-			_:
-				NominalDeclaredType
-	)
-
-
 private pure func builtin_type_header(header: TypeHeader) -> Option[AcceptedBuiltinHeader]:
 	match header.shape:
 		BuiltinTypeHeader(layout):
 			Some(into_opaque AcceptedBuiltinHeader({
 						id = header.id,
+						source_name = header.source_name,
 						parameters = header.parameters,
 						layout = layout,
 						containment = header.containment
@@ -3313,6 +3323,7 @@ private pure func record_type_header(header: TypeHeader) -> Option[AcceptedRecor
 		RecordTypeHeader(layout, fields):
 			Some(into_opaque AcceptedRecordHeader({
 						id = header.id,
+						source_name = header.source_name,
 						parameters = header.parameters,
 						layout = layout,
 						fields = fields,
@@ -3363,6 +3374,7 @@ private pure func union_type_header(header: TypeHeader) -> Option[AcceptedUnionH
 		UnionTypeHeader(layout, variants):
 			Some(into_opaque AcceptedUnionHeader({
 						id = header.id,
+						source_name = header.source_name,
 						parameters = header.parameters,
 						layout = layout,
 						variants = variants,
@@ -3413,6 +3425,7 @@ private pure func alias_type_header(header: TypeHeader) -> Option[AcceptedAliasH
 		AliasTypeHeader(layout, target):
 			Some(into_opaque AcceptedAliasHeader({
 						id = header.id,
+						source_name = header.source_name,
 						parameters = header.parameters,
 						layout = layout,
 						target = target,
@@ -3458,7 +3471,10 @@ pure func type_header_graph_public_alias_headers_for_scope(
 	type_header_graph_alias_headers_for_scope(graph, module_scope, PublicModuleHeaders)
 
 
-pure func type_header_graph_type_module_path(graph: TypeHeaderGraph, id: TypeId) -> Option[String]:
+pure func type_header_graph_module_path(
+	graph: TypeHeaderGraph,
+	module_id: ModuleId,
+) -> Option[String]:
 	parameter_graph = type_header_graph_rep(graph).parameter_graph
 	declaration_graph = acyclic_type_alias_dependency_graph_declaration_graph(
 		resolved_type_parameter_graph_alias_dependencies(parameter_graph),
@@ -3467,12 +3483,8 @@ pure func type_header_graph_type_module_path(graph: TypeHeaderGraph, id: TypeId)
 	bound_module_graph_find_for_id(
 		bound_graph,
 		bound_module_graph_module_table(bound_graph),
-		type_id_module_id(
-			id,
-		),
-	).map(
-		func(module): prepared_module_scope_canonical_path(bound_module_scope(module)),
-	)
+		module_id,
+	).map(func(module): prepared_module_scope_canonical_path(bound_module_scope(module)))
 
 
 pure func type_header_graph_owner_provides_prelude_type(
@@ -3504,6 +3516,10 @@ pure func builtin_type_header_id(header: AcceptedBuiltinHeader) -> TypeId:
 	from_opaque AcceptedBuiltinHeader(header).id
 
 
+pure func builtin_type_header_source_name(header: AcceptedBuiltinHeader) -> String:
+	from_opaque AcceptedBuiltinHeader(header).source_name
+
+
 pure func builtin_type_header_parameters(
 	header: AcceptedBuiltinHeader,
 ) -> List[ResolvedTypeParameter]:
@@ -3522,6 +3538,10 @@ pure func builtin_type_header_containment_facts(
 
 pure func record_type_header_id(header: AcceptedRecordHeader) -> TypeId:
 	from_opaque AcceptedRecordHeader(header).id
+
+
+pure func record_type_header_source_name(header: AcceptedRecordHeader) -> String:
+	from_opaque AcceptedRecordHeader(header).source_name
 
 
 pure func record_type_header_parameters(
@@ -3552,6 +3572,10 @@ pure func union_type_header_id(header: AcceptedUnionHeader) -> TypeId:
 	from_opaque AcceptedUnionHeader(header).id
 
 
+pure func union_type_header_source_name(header: AcceptedUnionHeader) -> String:
+	from_opaque AcceptedUnionHeader(header).source_name
+
+
 pure func union_type_header_parameters(header: AcceptedUnionHeader) -> List[ResolvedTypeParameter]:
 	from_opaque AcceptedUnionHeader(header).parameters
 
@@ -3576,6 +3600,10 @@ pure func alias_type_header_id(header: AcceptedAliasHeader) -> TypeId:
 	from_opaque AcceptedAliasHeader(header).id
 
 
+pure func alias_type_header_source_name(header: AcceptedAliasHeader) -> String:
+	from_opaque AcceptedAliasHeader(header).source_name
+
+
 pure func alias_type_header_parameters(header: AcceptedAliasHeader) -> List[ResolvedTypeParameter]:
 	from_opaque AcceptedAliasHeader(header).parameters
 
@@ -3594,8 +3622,8 @@ pure func alias_type_header_containment_facts(header: AcceptedAliasHeader) -> Ty
 
 pure func type_resolution_owner_display_name(owner: TypeResolutionOwner) -> String:
 	match owner:
-		TypeDeclarationResolutionOwner(id):
-			type_id_name(id)
+		TypeDeclarationResolutionOwner(_, name):
+			name
 		TraitMethodResolutionOwner(method_id):
 			trait_id_name(trait_method_id_owner(method_id)) + "." + trait_method_id_name(method_id)
 		CallableResolutionOwner(_, name):
@@ -3644,12 +3672,10 @@ pure func type_shape_resolution_error_message(error: TypeShapeResolutionError) -
 			"Imported module '" + module_path + "' is missing while resolving '" + type_resolution_owner_display_name(
 				owner,
 			) + "'"
-		TypeShapePrivateTypeReference(owner, module_path, referenced, _):
+		TypeShapePrivateTypeReference(owner, module_path, referenced_name, _):
 			"Declaration '" + type_resolution_owner_display_name(
 				owner,
-			) + "' cannot reference private imported type '" + module_path + "." + type_id_name(
-				referenced,
-			) + "'"
+			) + "' cannot reference private imported type '" + module_path + "." + referenced_name + "'"
 		TypeShapeArityMismatch(owner, name, expected, actual, _):
 			"Type '" + name + "' expects " + expected.to_string() + " argument(s), got " + actual.to_string() + " while resolving '" + type_resolution_owner_display_name(
 				owner,
@@ -3678,66 +3704,70 @@ pure func type_shape_resolution_error_span(error: TypeShapeResolutionError) -> S
 
 private pure func type_header_identity_display_name(
 	bound_graph: BoundModuleGraph,
+	definition_table: DefinitionTable,
 	id: TypeId,
 ) -> String:
-	module_name = bound_module_graph_canonical_path_for_id(
-		bound_graph,
-		bound_module_graph_module_table(bound_graph),
-		type_id_module_id(id),
-	).get_or("<unknown module>")
-	module_name + "." + type_id_name(id)
+	module_name = match type_id_module_id(definition_table, id):
+		Some(module_id):
+			bound_module_graph_canonical_path_for_id(
+				bound_graph,
+				bound_module_graph_module_table(bound_graph),
+				module_id,
+			).get_or("<unknown module>")
+		None:
+			"<unknown module>"
+	module_name + "." + type_id_name(definition_table, id).get_or("<unknown type>")
 
 
 private pure func type_header_cycle_display_names(
 	bound_graph: BoundModuleGraph,
+	definition_table: DefinitionTable,
 	cycle: List[TypeId],
 ) -> List[String]:
 	match cycle.get(0):
 		None:
 			[]
 		Some(first):
-			first_module = type_id_module_id(first)
-			local = cycle.all(func(id):
-				module_ids_equal(type_id_module_id(id), first_module)
-			)
+			first_module = type_id_module_id(definition_table, first)
+			local = match first_module:
+				Some(module_id):
+					cycle.all(func(id): type_id_module_id(definition_table, id) == Some(module_id))
+				None:
+					False
 
 			if local:
-				cycle.map(type_id_name)
+				cycle.map(func(id): type_id_name(definition_table, id).get_or("<unknown type>"))
 			else:
-				cycle.map(func(id): type_header_identity_display_name(bound_graph, id))
+				cycle.map(func(id): type_header_identity_display_name(bound_graph, definition_table, id))
 
 
-pure func type_header_error_message(error: TypeHeaderError) -> String:
+pure func type_header_error_message(definition_table: DefinitionTable, error: TypeHeaderError) -> String:
 	match error:
 		TypeHeaderOwnerModuleMissing(id):
-			"Type header owner module is missing for '" + type_id_name(id) + "'"
+			"Type header owner module is missing for '" + type_id_name(definition_table, id).get_or("<unknown type>") + "'"
+		TypeHeaderDuplicateIdentity(id):
+			"Duplicate type header identity for '" + type_id_name(definition_table, id).get_or("<unknown type>") + "'"
 		TypeHeaderParametersMissing(id):
-			"Resolved type parameters are missing for '" + type_id_name(id) + "'"
+			"Resolved type parameters are missing for '" + type_id_name(definition_table, id).get_or("<unknown type>") + "'"
 		TypeHeaderResolutionError(resolution_error):
 			type_shape_resolution_error_message(resolution_error)
 		TypeHeaderConstructorMissing(id, name):
-			"Constructor '" + name + "' is missing for type '" + type_id_name(id) + "'"
+			"Constructor '" + name + "' is missing for type '" + type_id_name(definition_table, id).get_or("<unknown type>") + "'"
 		TypeHeaderInvalidEnumTypeParameters(id):
-			"Enum '" + type_id_name(id) + "' cannot have type parameters"
+			"Enum '" + type_id_name(definition_table, id).get_or("<unknown type>") + "' cannot have type parameters"
 		TypeHeaderInvalidEnumVariantFields(_, name):
 			"Enum variant '" + name + "' cannot have fields; use 'union' instead"
 		TypeHeaderInvalidStructTypeParameters(id):
-			"Struct '" + type_id_name(id) + "' cannot have type parameters"
+			"Struct '" + type_id_name(definition_table, id).get_or("<unknown type>") + "' cannot have type parameters"
 		TypeHeaderEmptyStruct(id):
-			"Struct '" + type_id_name(id) + "' must have at least one field"
+			"Struct '" + type_id_name(definition_table, id).get_or("<unknown type>") + "' must have at least one field"
 		TypeHeaderInvalidStructField(id, field_name):
-			"Struct '" + type_id_name(
-				id,
-			) + "' field '" + field_name + ("' has invalid storage: struct fields must be scalar values, fieldless enums, " + "or other structs\n" + "help: Use a record for strings, collections, functions, payload unions, " + "records, and tuples")
+			"Struct '" + type_id_name(definition_table, id).get_or("<unknown type>") + "' field '" + field_name + ("' has invalid storage: struct fields must be scalar values, fieldless enums, " + "or other structs\n" + "help: Use a record for strings, collections, functions, payload unions, " + "records, and tuples")
 		TypeHeaderRecursiveValueLayout(id, is_direct):
 			if is_direct:
-				"Type '" + type_id_name(
-					id,
-				) + "' is directly recursive — this would require infinite memory"
+				"Type '" + type_id_name(definition_table, id).get_or("<unknown type>") + "' is directly recursive — this would require infinite memory"
 			else:
-				"Type '" + type_id_name(
-					id,
-				) + "' has a recursive value layout — every construction path requires another product value"
+				"Type '" + type_id_name(definition_table, id).get_or("<unknown type>") + "' has a recursive value layout — every construction path requires another product value"
 		TypeHeaderInlineStorageCycle(cycle, names):
 			if cycle.is_empty():
 				"Infinitely sized value layout"
@@ -3745,13 +3775,16 @@ pure func type_header_error_message(error: TypeHeaderError) -> String:
 				"Infinitely sized value layout: " + names.join(" -> ")
 
 
-pure func type_header_error_span(error: TypeHeaderError) -> Option[SourceSpan]:
+pure func type_header_error_span(
+	definition_table: DefinitionTable,
+	error: TypeHeaderError,
+) -> Option[SourceSpan]:
 	match error:
-		TypeHeaderOwnerModuleMissing(id) | TypeHeaderParametersMissing(id) | TypeHeaderConstructorMissing(id, _) | TypeHeaderInvalidEnumTypeParameters(id) | TypeHeaderInvalidEnumVariantFields(id, _) | TypeHeaderInvalidStructTypeParameters(id) | TypeHeaderEmptyStruct(id) | TypeHeaderInvalidStructField(id, _) | TypeHeaderRecursiveValueLayout(id, _):
-			Some(type_id_source_span(id))
+		TypeHeaderOwnerModuleMissing(id) | TypeHeaderDuplicateIdentity(id) | TypeHeaderParametersMissing(id) | TypeHeaderConstructorMissing(id, _) | TypeHeaderInvalidEnumTypeParameters(id) | TypeHeaderInvalidEnumVariantFields(id, _) | TypeHeaderInvalidStructTypeParameters(id) | TypeHeaderEmptyStruct(id) | TypeHeaderInvalidStructField(id, _) | TypeHeaderRecursiveValueLayout(id, _):
+			type_id_source_span(definition_table, id)
 		TypeHeaderResolutionError(resolution_error):
 			Some(type_shape_resolution_error_span(resolution_error))
 		TypeHeaderInlineStorageCycle(cycle, _):
-			cycle
-				.get(0)
-				.map(type_id_source_span)
+			match cycle.get(0):
+				Some(id): type_id_source_span(definition_table, id)
+				None: None

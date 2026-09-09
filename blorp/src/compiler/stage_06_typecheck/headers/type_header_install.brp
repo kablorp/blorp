@@ -5,9 +5,8 @@
 -- The installation target carries importer-local naming separately, so parsed
 -- declarations are not replayed at this boundary.
 import:
-	../../stage_04_modules/module_table: module_ids_equal
+	../../stage_04_modules/module_table: ModuleId, module_ids_equal
 	../graph/indexed_graph: PreparedModuleScope, prepared_module_scope_id
-	../graph/type_identity: TypeId, type_id_module_id, type_id_name
 	../modules/module_view:
 		module_view_accepted_alias_authority,
 		module_view_accepted_record_authority,
@@ -64,7 +63,6 @@ import:
 			ScalarBuiltin,
 			UnclassifiedBuiltin,
 		),
-		DeclaredTypeExpansion(NominalDeclaredType, TransparentAliasExpansion),
 		IntrinsicType(IntrinsicTaskResult),
 		RecordLayout(HeapRecord, ValueStruct),
 		ResolvedDimOp(ResolvedDimAdd, ResolvedDimDivide, ResolvedDimMultiply, ResolvedDimSubtract),
@@ -92,19 +90,23 @@ import:
 		),
 		ResourceCleanupPolicy(ResourceWithCleanup, ResourceWithoutCleanup),
 		TypeContainmentFacts,
+		TypeHeader,
 		TypeHeaderField,
 		TypeHeaderGraph,
+		TypeHeaderShape(AliasTypeHeader),
 		TypeHeaderVariant,
 		UnionLayout(FieldlessEnum, TaggedUnion),
 		alias_type_header_containment_facts,
 		alias_type_header_id,
 		alias_type_header_layout,
 		alias_type_header_parameters,
+		alias_type_header_source_name,
 		alias_type_header_target,
 		builtin_type_header_containment_facts,
 		builtin_type_header_id,
 		builtin_type_header_layout,
 		builtin_type_header_parameters,
+		builtin_type_header_source_name,
 		callable_type_parameter_id_name,
 		implementation_type_parameter_id_name,
 		intrinsic_type_name,
@@ -114,8 +116,9 @@ import:
 		record_type_header_id,
 		record_type_header_layout,
 		record_type_header_parameters,
+		record_type_header_source_name,
 		trait_type_parameter_id_name,
-		type_header_graph_declared_type_expansion,
+		type_header_graph_find,
 		type_header_graph_local_alias_headers_for_scope,
 		type_header_graph_local_builtin_headers_for_scope,
 		type_header_graph_local_record_headers_for_scope,
@@ -125,12 +128,13 @@ import:
 		type_header_graph_public_builtin_headers_for_scope,
 		type_header_graph_public_record_headers_for_scope,
 		type_header_graph_public_union_headers_for_scope,
-		type_header_graph_type_module_path,
+		type_header_graph_module_path,
 		union_type_header_containment_facts,
 		union_type_header_contains_resource,
 		union_type_header_id,
 		union_type_header_layout,
 		union_type_header_parameters,
+		union_type_header_source_name,
 		union_type_header_variants,
 	type_parameter_headers: TypeParameterId, type_parameter_id_name, type_parameter_ids_equal
 	type_resolution: add_imported_accepted_type_aliases
@@ -232,13 +236,12 @@ private pure func finalize_installed_type(
 
 private pure func resolved_declared_type_name(
 	graph: TypeHeaderGraph,
-	id: TypeId,
+	owner_module_id: ModuleId,
+	source_name: String,
 	installation: TypeHeaderInstallation,
 ) -> Option[String]:
-	source_name = type_id_name(id)
-
 	if module_ids_equal(
-		type_id_module_id(id),
+		owner_module_id,
 		prepared_module_scope_id(type_header_installation_scope(installation)),
 	):
 		match installation:
@@ -247,9 +250,9 @@ private pure func resolved_declared_type_name(
 			ImportedTypeHeaderInstallation(_, path):
 				Some(canonical_module_type_name(path, source_name))
 	else:
-		type_header_graph_type_module_path(
+		type_header_graph_module_path(
 			graph,
-			id,
+			owner_module_id,
 		).map(
 			func(path): canonical_module_type_name(path, source_name),
 		)
@@ -324,39 +327,42 @@ private pure func semantic_type_from_resolved_shape_with_substitutions(
 				substitutions,
 			)
 
-			match type_header_graph_declared_type_expansion(graph, id):
-				Some(expansion):
-					match expansion:
-						TransparentAliasExpansion(parameters, target):
-							if parameters.length() != semantic_args.length():
-								None
-							else:
-								var alias_substitutions = substitutions
-								var index: Int = 0
+			header ?= type_header_graph_find(graph, id)
 
-								while index < parameters.length():
-									match (parameters.get(index), semantic_args.get(index)):
-										(Some(parameter), Some(replacement)):
-											alias_substitutions = alias_substitutions.append({
-												parameter = parameter.id,
-												replacement = replacement,
-											})
-										_:
-											void
+			match header.shape:
+				AliasTypeHeader(TransparentAlias, target):
+					if header.parameters.length() != semantic_args.length():
+						None
+					else:
+						var alias_substitutions = substitutions
+						var index: Int = 0
 
-									index += 1
+						while index < header.parameters.length():
+							match (header.parameters.get(index), semantic_args.get(index)):
+								(Some(parameter), Some(replacement)):
+									alias_substitutions = alias_substitutions.append({
+										parameter = parameter.id,
+										replacement = replacement,
+									})
+								_:
+									void
 
-								semantic_type_from_resolved_shape_with_substitutions(
-									graph,
-									target,
-									installation,
-									alias_substitutions,
-								)
-						NominalDeclaredType:
-							name ?= resolved_declared_type_name(graph, id, installation)
-							Some(SemanticNamedType(name, semantic_args))
-				None:
-					None
+							index += 1
+
+						semantic_type_from_resolved_shape_with_substitutions(
+							graph,
+							target,
+							installation,
+							alias_substitutions,
+						)
+				_:
+					name ?= resolved_declared_type_name(
+						graph,
+						header.owner_module_id,
+						header.source_name,
+						installation,
+					)
+					Some(SemanticNamedType(name, semantic_args))
 		IntrinsicTypeShape(intrinsic, args):
 			semantic_args ?= semantic_types_from_resolved_shapes_with_substitutions(
 				graph,
@@ -572,7 +578,7 @@ private pure func install_builtin_header(
 	header: AcceptedBuiltinHeader,
 	installation: BuiltinHeaderInstallation,
 ) -> TypecheckState:
-	source_name = type_id_name(builtin_type_header_id(header))
+	source_name = builtin_type_header_source_name(header)
 
 	module_path = match installation:
 		LocalBuiltinInstallation(path):
@@ -725,7 +731,7 @@ private pure func install_record_header(
 	header: AcceptedRecordHeader,
 	installation: TypeHeaderInstallation,
 ) -> TypecheckState:
-	source_name = type_id_name(record_type_header_id(header))
+	source_name = record_type_header_source_name(header)
 	type_name = installed_type_name(source_name, installation)
 	type_parameters = record_header_type_parameters(header)
 
@@ -855,7 +861,7 @@ private pure func install_union_header(
 	header: AcceptedUnionHeader,
 	installation: TypeHeaderInstallation,
 ) -> TypecheckState:
-	source_name = type_id_name(union_type_header_id(header))
+	source_name = union_type_header_source_name(header)
 	type_name = installed_type_name(source_name, installation)
 
 	match module_view_accepted_union_authority(state.module_view):
@@ -959,7 +965,7 @@ private pure func install_alias_header(
 	header: AcceptedAliasHeader,
 	installation: TypeHeaderInstallation,
 ) -> TypecheckState:
-	source_name = type_id_name(alias_type_header_id(header))
+	source_name = alias_type_header_source_name(header)
 	type_name = installed_type_name(source_name, installation)
 	layout = alias_type_header_layout(header)
 

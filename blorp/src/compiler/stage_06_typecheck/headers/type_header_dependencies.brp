@@ -18,9 +18,13 @@ import:
 			ParsedRangeType,
 			ParsedTupleType,
 		),
-	../../stage_04_modules/module_table: module_ids_equal
 	../graph/indexed_graph: PreparedModuleScope
-	../graph/type_identity: TypeId, type_id_module_id, type_id_name, type_ids_equal
+	../graph/type_identity:
+		TypeId,
+		type_id_definition_id,
+		type_id_module_id,
+		type_id_name,
+		type_ids_equal,
 	../modules/bound_module_graph:
 		BoundModule,
 		BoundModuleGraph,
@@ -40,6 +44,7 @@ import:
 		TypeDeclarationSkeletonInfo,
 		TypeDeclarationSource(AliasTypeSource),
 		declaration_skeleton_graph_bound_graph,
+		declaration_skeleton_graph_definition_table,
 		declaration_skeleton_graph_find_type,
 		declaration_skeleton_graph_type_skeletons,
 
@@ -362,7 +367,7 @@ record TypeAliasDependency {
 private record TypeAliasDependencyGraphRep {
 	declaration_graph: DeclarationSkeletonGraph,
 	nodes: List[TypeAliasDependency],
-	node_indices_by_name: Dict[String, List[Int]]
+	node_indices_by_definition_id: Dict[Int, Int]
 }
 
 
@@ -512,46 +517,42 @@ pure func type_alias_dependency_graph_build(
 	declaration_graph: DeclarationSkeletonGraph,
 ) -> Result[TypeAliasDependencyGraph, List[TypeAliasDependencyGraphError]]:
 	bound_graph = declaration_skeleton_graph_bound_graph(declaration_graph)
+	definition_table = declaration_skeleton_graph_definition_table(declaration_graph)
 	var nodes: List[TypeAliasDependency] = []
-	var node_indices_by_name: Dict[String, List[Int]] = {}
+	var node_indices_by_definition_id: Dict[Int, Int] = {}
 	var errors: List[TypeAliasDependencyGraphError] = []
 
 	for type_skeleton in declaration_skeleton_graph_type_skeletons(declaration_graph):
 		match type_skeleton.source:
 			AliasTypeSource(alias_decl):
-				module_id = type_id_module_id(type_skeleton.id)
-
-				match bound_module_graph_find_for_id(
-					bound_graph,
-					bound_module_graph_module_table(bound_graph),
-					module_id,
-				):
-					Some(module):
-						name = type_id_name(type_skeleton.id)
-						node_index = nodes.length()
-						nodes = nodes.append({
-							id = type_skeleton.id,
-							dependencies = resolved_alias_dependencies(
-								declaration_graph,
-								bound_graph,
-								module,
-								alias_decl,
-							),
-						})
-						node_indices_by_name = node_indices_by_name.set(
-							name,
-							node_indices_by_name
-								.get_or(name, [])
-								.append(node_index),
-						)
+				match type_id_module_id(definition_table, type_skeleton.id):
+					Some(module_id):
+						match bound_module_graph_find_for_id(
+							bound_graph,
+							bound_module_graph_module_table(bound_graph),
+							module_id,
+						):
+							Some(module):
+								node_index = nodes.length()
+								nodes = nodes.append({
+									id = type_skeleton.id,
+									dependencies = resolved_alias_dependencies(
+										declaration_graph,
+										bound_graph,
+										module,
+										alias_decl,
+									),
+								})
+								node_indices_by_definition_id = node_indices_by_definition_id.set(
+									type_id_definition_id(type_skeleton.id),
+									node_index,
+								)
+							None:
+								errors = errors.append(TypeAliasDependencyModuleMissing("<unknown module>"))
 					None:
 						errors = errors.append(
 							TypeAliasDependencyModuleMissing(
-								bound_module_graph_canonical_path_for_id(
-									bound_graph,
-									bound_module_graph_module_table(bound_graph),
-									module_id,
-								).get_or("<unknown module>"),
+								"<unknown module>",
 							),
 						)
 			_:
@@ -563,7 +564,7 @@ pure func type_alias_dependency_graph_build(
 		representation: TypeAliasDependencyGraphRep = {
 			declaration_graph = declaration_graph,
 			nodes = nodes,
-			node_indices_by_name = node_indices_by_name
+			node_indices_by_definition_id = node_indices_by_definition_id
 		}
 		Ok(into_opaque TypeAliasDependencyGraph(representation))
 
@@ -584,19 +585,7 @@ private pure func type_alias_dependency_node_index(
 	graph: TypeAliasDependencyGraphRep,
 	id: TypeId,
 ) -> Option[Int]:
-	name = type_id_name(id)
-	var result: Option[Int] = None
-
-	for node_index in graph.node_indices_by_name.get_or(name, []):
-		match graph.nodes.get(node_index):
-			Some(node):
-				if type_ids_equal(node.id, id):
-					result = Some(node_index)
-					break
-			None:
-				void
-
-	result
+	graph.node_indices_by_definition_id.get(type_id_definition_id(id))
 
 
 private pure func alias_identity_cycle_from_path(
@@ -718,13 +707,23 @@ pure func type_alias_dependency_graph_check_cycles(
 			TypeAliasIdentitiesAcyclic
 
 
-pure func type_alias_identity_display_name(bound_graph: BoundModuleGraph, id: TypeId) -> String:
-	module_name = bound_module_graph_canonical_path_for_id(
-		bound_graph,
-		bound_module_graph_module_table(bound_graph),
-		type_id_module_id(id),
-	).get_or("<unknown module>")
-	module_name + "." + type_id_name(id)
+pure func type_alias_identity_display_name(
+	declaration_graph: DeclarationSkeletonGraph,
+	id: TypeId,
+) -> String:
+	bound_graph = declaration_skeleton_graph_bound_graph(declaration_graph)
+	definition_table = declaration_skeleton_graph_definition_table(declaration_graph)
+	module_name = match type_id_module_id(definition_table, id):
+		Some(module_id):
+			bound_module_graph_canonical_path_for_id(
+				bound_graph,
+				bound_module_graph_module_table(bound_graph),
+				module_id,
+			).get_or("<unknown module>")
+		None:
+			"<unknown module>"
+	type_name = type_id_name(definition_table, id).get_or("<unknown type>")
+	module_name + "." + type_name
 
 
 pure func type_alias_dependency_graph_error_message(error: TypeAliasDependencyGraphError) -> String:
@@ -734,22 +733,25 @@ pure func type_alias_dependency_graph_error_message(error: TypeAliasDependencyGr
 
 
 private pure func type_alias_cycle_display_names(
-	bound_graph: BoundModuleGraph,
+	declaration_graph: DeclarationSkeletonGraph,
 	cycle: List[TypeId],
 ) -> List[String]:
+	definition_table = declaration_skeleton_graph_definition_table(declaration_graph)
 	match cycle.get(0):
 		None:
 			[]
 		Some(first):
-			first_module = type_id_module_id(first)
-			is_local_cycle = cycle.all(
-				func(id): module_ids_equal(type_id_module_id(id), first_module),
-			)
+			first_module = type_id_module_id(definition_table, first)
+			is_local_cycle = match first_module:
+				Some(module_id):
+					cycle.all(func(id): type_id_module_id(definition_table, id) == Some(module_id))
+				None:
+					False
 
 			if is_local_cycle:
-				cycle.map(type_id_name)
+				cycle.map(func(id): type_id_name(definition_table, id).get_or("<unknown type>"))
 			else:
-				cycle.map(func(id): type_alias_identity_display_name(bound_graph, id))
+				cycle.map(func(id): type_alias_identity_display_name(declaration_graph, id))
 
 
 pure func type_alias_dependency_graph_validation_errors(
@@ -769,8 +771,6 @@ pure func type_alias_dependency_graph_validate(
 		Err(errors):
 			Err(errors.map(type_alias_dependency_graph_error_message))
 		Ok(graph):
-			bound_graph = declaration_skeleton_graph_bound_graph(declaration_graph)
-
 			match type_alias_dependency_graph_check_cycles(graph):
 				TypeAliasIdentitiesAcyclic:
 					representation: AcyclicTypeAliasDependencyGraphRep = {graph = graph}
@@ -779,7 +779,7 @@ pure func type_alias_dependency_graph_validate(
 					Err(
 						[
 							"Type alias cycle: " + type_alias_cycle_display_names(
-								bound_graph,
+								declaration_graph,
 								cycle,
 							).join(" -> "),
 						],

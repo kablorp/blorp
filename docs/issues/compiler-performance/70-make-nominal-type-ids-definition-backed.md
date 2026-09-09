@@ -1,14 +1,16 @@
 # Issue 70: Make Nominal Type IDs Definition-Backed
 
-**Status:** Ready after Issue 68
+**Status:** Implemented
 
 **Roadmap:** [Normalized Compilation Database Roadmap](NORMALIZED_COMPILATION_DATABASE_ROADMAP.md)
 
-**Dependency:** Issue 61B must publish one canonical graph `DefinitionTable`
-whose type-definition rows preserve the current module, name, and span facts.
+**Prerequisites:** Issue 61B publishes one canonical graph `DefinitionTable`
+whose type-definition rows preserve the current module, name, and span facts;
+Issue 68 establishes the scalar constructor precedent; and Issue 69 establishes
+category-checked row projection plus exact table-allocation provenance.
 
-**Can proceed independently of:** Issue 69 after Issue 68, subject to
-integration overlap in typed projections.
+**Can proceed independently of:** Issue 71. Integrate the two sequentially
+because both touch Stage 06 declaration products.
 
 **Blocks:** Issues 72-73 and later accepted semantic type normalization.
 
@@ -79,7 +81,8 @@ owner_module_paths
 canonical_constructors_by_module_path
 ```
 
-Issue 68 makes those strings redundant for internal identity and owner joins.
+Issue 61B makes those strings redundant for internal identity and owner joins,
+and Issue 69 proves the intended representation and provenance pattern.
 The expected benefit is therefore broader than changing an equality function:
 
 - smaller copied IDs;
@@ -100,6 +103,7 @@ shape: unboxed ID per entity, shared table once.
 Before editing, read and inventory:
 
 - Issue 61B's final table layout and category-validation APIs;
+- Issue 69's final callable identity, exact-provenance, and generated-C result;
 - `graph/type_identity.brp` and every importer;
 - `headers/declaration_skeleton.brp`;
 - accepted alias, record, and union graph/header/authority files;
@@ -177,10 +181,35 @@ validation belongs at skeleton/table construction, not at every downstream
 read.
 
 Within a coherent opaque product, integer equality is sufficient. At a rare
-cross-product admission boundary, validate definition-table compatibility
-before accepting IDs. Do not attach a provenance pointer/token to each ID.
+cross-product admission boundary, require
+`definition_tables_share_provenance`; compatible module tables, equal rows, or
+equal allocation frontiers are not sufficient because unrelated definition
+tables may issue the same integer. Do not attach a provenance pointer/token to
+each ID.
 
 ## Authority Storage Cutover
+
+### Exact type-header lookup
+
+Scalarizing `TypeId` is not enough if `TypeHeaderTable` continues to recover a
+name, fetch every same-name header, and scan those candidates for identity.
+Publish an exact integer index when the immutable header table is built:
+
+```blorp
+private record TypeHeaderTable {
+	headers: List[TypeHeader],
+	header_index_by_definition_id: Dict[Int, Int],
+	header_indices_by_name: Dict[String, List[Int]],
+	header_indices_by_module: List[ModuleTypeHeaderIndices],
+	owner_scope: PreparedModuleScope
+}
+```
+
+Name and module indexes remain necessary for unresolved source lookup and
+visibility. Exact `TypeId` lookup must use only the definition integer and
+visit at most one candidate. Prefer a direct dense locator only if the existing
+definition-table range makes it compact; do not allocate a sparse list sized
+by an unrelated bootstrap frontier.
 
 ### Integer identity indexes
 
@@ -199,7 +228,7 @@ Names remain valid external lookup keys when the query starts from source
 spelling. The forbidden operation is serializing an already resolved `TypeId`
 back into a compound string key.
 
-Prefer a direct dense row locator only if the Issue 68 table layout makes it
+Prefer a direct dense row locator only if the Issue 61B table layout makes it
 simple and measurement shows it avoids dictionaries without large sparse
 lists. Otherwise `Dict[Int, Int]` is a valid incremental result.
 
@@ -237,43 +266,52 @@ Visibility and ambiguity behavior remains exact. In particular:
 ### Builtin unions and types
 
 `AcceptedUnionTableRep` currently uses `List[Option[TypeId]]` and an empty owner
-path for entries without a graph-issued ID. Replace that implicit distinction
-with an explicit variant, for example:
+path for entries without a graph-issued ID. Remove those sentinel columns, but
+do not wrap every scalar graph `TypeId` in a newly managed data-carrying union.
+One viable representation keeps a single payload list and publishes separate
+relationship indexes:
 
 ```blorp
-union AcceptedUnionIdentity:
-	GraphUnionIdentity(TypeId)
-	CompilerBuiltinUnionIdentity(BuiltinUnionId)
+private record AcceptedUnionTableRep {
+	unions: List[AcceptedUnionEntry],
+	graph_union_indices_by_definition_id: Dict[Int, Int],
+	builtin_union_indices_by_name: Dict[String, Int]
+}
 ```
 
-The exact builtin ID type should match current builtin authority. Do not mint
+This also represents the existing case where a compiler builtin name matches
+accepted graph metadata: both indexes may deliberately point at the same
+payload row. A tagged identity union is acceptable only if generated C proves
+that it does not allocate or add ARC traffic to every graph union. Do not mint
 a fake `DefinitionId`, use `None` as a long-term category tag, or use `""` as
 an owner sentinel.
 
 ## Construction Boundary
 
 Type skeleton construction currently creates `TypeId` from module, name, and
-span. After Issue 68, it should claim the already reserved definition row:
+span. It should instead claim the already reserved definition row through a
+category-specific index query:
 
 ```blorp
-definition_id ?= definition_index_find_source_definition(
+definition_id ?= definition_index_find_type_definition(
 	index,
+	module_table,
 	module_id,
-	TypeDefinition,
 	name,
-	None,
 	span,
 )
-type_id ?= definition_table_type_id(definitions, definition_id)
+type_id ?= type_id_from_definition_table(definitions, definition_id)
 ```
 
 Failure is an internal phase-product error because definition reservation and
 skeleton construction disagree. Do not silently construct a structural
-fallback identity.
+fallback identity. The named type-definition query must reject callable,
+constructor, global, field, trait, and implementation rows even when their
+integer exists.
 
 Accepted alias/record/union tables should receive the same definition table as
-their skeleton graph. Validate compatibility once during opaque product
-construction, then use integer IDs internally.
+their skeleton graph. Validate exact allocation provenance once during opaque
+product construction, then use integer IDs internally.
 
 ## Scope
 
@@ -283,10 +321,12 @@ In scope:
 - checked `DefinitionId -> TypeId` construction;
 - table-based type owner/name/span accessors;
 - all production `TypeId` constructor, equality, and accessor call sites;
+- an exact integer `TypeId -> TypeHeader` index alongside the existing
+  unresolved-name and module visibility indexes;
 - alias, record, union, type-header, and module-view identity indexes;
 - deletion of `type_id_storage_key`;
 - removal of redundant graph-owned type owner-path columns;
-- explicit builtin union/type identity variants; and
+- explicit graph/builtin union index domains without sentinel identity rows;
 - exact external/diagnostic materialization at boundaries.
 
 Out of scope:
@@ -314,6 +354,11 @@ Add failing tests proving:
 - external owner path/name/span projection remains exact; and
 - builtin union identity is explicit.
 
+Build one reusable Stage 06 definition-table fixture for these tests instead
+of teaching each suite to reserve the same graph rows independently. Report
+fixture/support lines separately from behavior-test lines so table setup does
+not hide implementation growth.
+
 ### 2. Change the ID representation at the skeleton boundary
 
 Make the union/record/alias/builtin-type skeleton claim its definition-backed
@@ -323,12 +368,22 @@ add `definition_id` to `TypeIdRep`.
 ### 3. Replace identity-only operations
 
 Convert equality, dictionaries, seen sets, dependency sets, and exact lookup
-to integer IDs first. These readers should not query the definition table.
+to integer IDs first. Add the exact type-header index in this step. These
+readers should not query the definition table or recover a source name before
+performing an exact lookup.
+
+Run the early performance gate after this step. Do not begin the authority and
+owner-path cleanup unless scalar construction plus exact integer lookup shows
+fewer focused allocations and retired instructions without a Phase 01-06
+regression.
 
 ### 4. Replace descriptive accessors
 
 Pass or retain the table at the smallest coherent owner. Convert owner/name/span
 readers and keep path materialization at diagnostics/projection boundaries.
+When one loop needs multiple descriptive fields, validate and load the
+definition row once and reuse it; do not perform separate table probes for
+name, owner, and span.
 
 ### 5. Cut over accepted type authorities
 
@@ -338,8 +393,10 @@ column before moving to the next.
 
 ### 6. Make builtin identity explicit
 
-Replace `Option[TypeId]`/empty-path category signaling with an exhaustive
-variant and update constructor lookup tests.
+Replace `Option[TypeId]`/empty-path category signaling with separate graph and
+builtin relationship indexes. Preserve shared payload rows when accepted graph
+metadata exactly matches a compiler builtin. Update constructor lookup tests
+and inspect generated C for accidental re-boxing.
 
 ### 7. Delete old identity code and reprofile
 
@@ -419,6 +476,23 @@ Add benchmark-only counters for:
 All logical checksums, lookup results, diagnostics, ID order, and definition
 frontier must match.
 
+Use two explicit measurement points:
+
+1. **Early stop gate after scalar identity and exact type-header lookup.** Build
+   clean parent and candidate compilers, run the type-heavy focused fixtures,
+   and run an immutable Phase 01-06 self-check. If allocations and retired
+   instructions do not improve in the focused owner—or if Phase 01-06
+   instructions, latency, or RSS regress repeatably—stop before migrating the
+   three accepted authority families.
+2. **Final gate after authority and builtin cutover.** Rebuild both snapshots
+   and repeat the same workloads in balanced order. Do not reuse counters from
+   an earlier production snapshot.
+
+Keep the entire imported source graph immutable for parent/candidate
+comparison, not only the root `main.brp`; another worktree's dirty imports can
+shift absolute instruction counts. Ensure no concurrent compiler or benchmark
+process is consuming CPU while collecting exact counters.
+
 ## Performance Acceptance
 
 This issue is expected to produce a measurable focused win because it removes
@@ -427,8 +501,8 @@ managed identity and serialized keys from high-volume Stage 06 paths. Require:
 - exactly zero storage-key string constructions for already resolved `TypeId`
   lookup;
 - fewer allocations/releases in type-heavy focused workloads;
-- fewer retired instructions in at least the skeleton/type-header or accepted
-  authority checkpoint; and
+- fewer retired instructions in the early skeleton/type-header checkpoint;
+- fewer final Phase 01-06 retired instructions on an immutable self-check; and
 - no repeatable Phase 01-06 latency or peak-RSS regression.
 
 Do not accept a managed table pointer on each `TypeId` to improve ergonomics.
@@ -442,24 +516,83 @@ materially degrading latency.
 - No graph type row repeats module ID, source name, or span inside `TypeId`.
 - Identity-only equality and membership use integer operations without table
   reads.
+- Exact type-header lookup uses an integer index and visits at most one
+  candidate; name indexes remain only for unresolved source lookup.
 - Descriptive owner/name/span facts come from the issuing definition/module
-  tables at named boundaries.
+  tables at named boundaries, with one row read reused when several fields are
+  needed together.
 - `type_id_storage_key` and all resolved-ID serialized compound keys are
   deleted.
 - Accepted alias, record, and union authorities use integer ID indexes or a
   justified direct row layout.
 - Redundant graph-owned type owner-path columns are deleted.
-- Builtin type/union identity is explicit; no `None`, empty path, or magic ID
-  acts as a category sentinel.
+- Graph and builtin union relationships are indexed explicitly; no `None`,
+  empty path, magic ID, or newly managed per-entry identity wrapper acts as a
+  category sentinel.
 - Module visibility, alias redirection, record lookup/inference, union
   constructor lookup, containment, and ambiguity order are unchanged.
 - Diagnostic text, typed-AST/semantic output, replay output, and definition
   frontier are exact.
 - Definition/module tables are retained once per coherent product, never per
   `TypeId` or type row.
-- Focused allocator and instruction measurements improve, with no material
-  latency or peak-memory regression.
+- Focused allocator/instruction measurements and final Phase 01-06 retired
+  instructions improve, with no material latency or peak-memory regression.
 - Changed, Stage 06, compiler, leak, and sanitizer gates pass.
+
+## Implementation Result
+
+`TypeId` is now an opaque `DefinitionId`, and its only constructor validates
+that the requested definition row has `TypeDefinitionKind`. Identity-only
+comparison and exact lookup use the scalar definition integer. The old managed
+`TypeIdRep`, structural constructor, and `type_id_storage_key` serialization
+path are deleted.
+
+Declaration skeleton construction claims the type rows already reserved by
+the graph definition index. `TypeHeaderTable` publishes one exact
+`Dict[Int, Int]` locator in addition to the unresolved-name and module indexes.
+The header retains owner ID and source name once as a measured hot projection;
+this avoids repeatedly loading the same definition row during header and
+accepted-view publication without restoring a second nominal identity.
+
+Accepted alias, record, and union authorities use integer identity indexes.
+Per-entry owner-path columns are removed; module authorities retain at most one
+owner path for localization. Canonical names are validated against one loaded
+definition row at the opaque construction boundary. Production accepted-graph
+builders validate exact `DefinitionTable` allocation provenance before
+combining header and bound-module products. Builtin and graph union lookup use
+separate indexes, and a matching builtin may explicitly share a graph payload
+row without a `None`, empty-path, or fabricated-ID sentinel.
+
+Generated-C inspection confirms that nominal IDs and type-skeleton IDs are
+passed as `long`; there is no generated `TypeIdRep`, storage-key helper, or
+ARC-managed per-ID provenance carrier. Parent and candidate compilers both
+checked the immutable parent source graph through Phase 06. Five balanced
+alternating runs produced byte-identical output with SHA-256
+`c1758b804e292be62860bce968c8cee14b4b6a8fec681ff19c5318e5195c0963`:
+
+| Metric | Parent median | Candidate median | Difference |
+| --- | ---: | ---: | ---: |
+| retired instructions | 161,533,126,450 | 161,086,636,297 | -0.2764% |
+| wall seconds | 17.78 | 17.51 | -1.5186% |
+| peak RSS bytes | 835,600,384 | 834,125,824 | -0.1765% |
+
+Host contention made elapsed cycles noisy, so retired instructions remain the
+primary acceptance signal. They improved in every paired candidate run, while
+wall time and peak RSS show no regression.
+
+Validation passed 964/964 Stage 06 focused tests, 29/29 structural declaration
+boundary checks, 4,314/4,314 compiler tests, 3,620/3,620 compiler sanitizer
+tests, and 888/888 final leak checks. One earlier Stage wrapper invocation had
+a single 60-second leak-batch timeout while several worktrees saturated the
+host; the explicit rebuilt-candidate leak gate subsequently passed completely.
+Final code review reported no findings.
+
+The implementation diff before recording this result was +942/-551 production
+lines, +102/-37 benchmark lines, and +629/-234 test/support lines. Most net
+test growth is the reusable definition-backed fixture and category,
+provenance, canonical-name, and builtin-domain regressions; production growth
+comes from threading the one shared table to descriptive boundaries rather
+than retaining managed descriptive state per ID.
 
 ## Stop Conditions
 
@@ -472,4 +605,9 @@ Stop and consult before:
 - using a fabricated definition/module ID for builtins;
 - retaining owner-path caches without a measured named consumer;
 - changing external protocol schemas; or
-- broadening into non-type declaration normalization from Issues 71-73.
+- broadening into non-type declaration normalization from Issues 71-73;
+- accepting compatible-but-separately-allocated definition tables as one ID
+  domain;
+- introducing a managed identity union around every graph `TypeId`; or
+- continuing past the early scalar/index checkpoint without a measured
+  focused improvement and a clean Phase 01-06 regression check.
