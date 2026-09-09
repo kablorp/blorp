@@ -17,8 +17,10 @@ import:
 		prepared_module_scope_id,
 		prepared_module_scope_module,
 	../../../src/compiler/stage_06_typecheck/graph/type_identity:
+		TypeId,
 		type_id_module_id,
 		type_id_name,
+		type_id_source_span,
 		type_ids_equal,
 	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
 		CallableDeclarationSource(
@@ -27,7 +29,7 @@ import:
 			FunctionCallableSource,
 			ImplementationMethodCallableSource,
 		),
-		DeclarationSkeleton,
+		DeclarationSkeleton(ConstructorDeclarationSkeleton),
 		DeclarationSkeletonGraph,
 		DeclarationSkeletonGraphError(
 			DuplicateConstructorDeclaration,
@@ -59,9 +61,12 @@ import:
 			RecordTypeSource,
 			UnionTypeSource,
 		),
+		constructor_ids_equal,
 		declaration_skeleton_graph_build,
 		declaration_skeleton_graph_callable_skeletons,
+		declaration_skeleton_graph_constructor_lookup_candidate_count,
 		declaration_skeleton_graph_error_message,
+		declaration_skeleton_graph_find_constructor,
 		declaration_skeleton_graph_find_type,
 		declaration_skeleton_graph_global_skeletons,
 		declaration_skeleton_graph_implementation_skeletons,
@@ -77,9 +82,11 @@ import:
 		COMPILER_BOUND_MODULE_VISIBILITY_EMPTY,
 		bound_module_graph_build,
 		bound_module_graph_find,
+		bound_module_graph_modules,
 		bound_module_graph_target,
 		bound_module_scope,
 	../../../src/compiler/stage_06_typecheck/modules/module_view: COMPILER_MODULE_VIEW_EMPTY
+	../../../src/lib/source: source_spans_equal
 	../typecheck_test_support as TypecheckTestSupport
 	test: TestSuite
 
@@ -469,6 +476,173 @@ func test_skeleton_graph_allows_same_constructor_name_across_parents() -> Bool:
 						.length() == 2
 
 
+private pure func exact_constructor_lookup_matches_skeleton(
+	graph: DeclarationSkeletonGraph,
+	parent_type_id: TypeId,
+	name: String,
+	expected_visibility: DeclarationVisibility,
+) -> Bool:
+	var matches: Bool = False
+
+	for skeleton in declaration_skeleton_graph_skeletons(graph):
+		match skeleton:
+			ConstructorDeclarationSkeleton(id, visibility, parent, source):
+				if type_ids_equal(parent, parent_type_id) and source.name.text == name:
+					matches = match declaration_skeleton_graph_find_constructor(
+						graph,
+						parent_type_id,
+						name,
+						source.span,
+					):
+						Some(found):
+							(
+								constructor_ids_equal(found.id, id)
+								and type_ids_equal(found.parent_type_id, parent)
+								and found.visibility == visibility
+								and found.visibility == expected_visibility
+								and found.source.name.text == source.name.text
+								and source_spans_equal(found.source.span, source.span)
+							)
+						None:
+							False
+
+					break
+			_:
+				void
+
+	matches
+
+
+func test_constructor_lookup_is_exact_across_modules_parents_and_spans() -> Bool:
+	target = fixture_module_load_candidate(
+		"main.brp",
+		"app/main",
+		"union PublicSignal:\n\tReady\n\tBusy(Int)\n\nprivate union HiddenSignal:\n\tHidden",
+	)
+	dependency = fixture_module_load_candidate(
+		"dependency.brp",
+		"app/dependency",
+		"union DependencySignal:\n\tReady",
+	)
+
+	match indexed_graph_build(target, [dependency]):
+		Err(_):
+			False
+		Ok(indexed):
+			match bound_module_graph_build(indexed, ["app/dependency"], accept_empty_view):
+				Err(_):
+					False
+				Ok(bound):
+					match declaration_skeleton_graph_build(bound):
+						Err(_):
+							False
+						Ok(graph):
+							target_scope = bound_module_scope(bound_module_graph_target(bound))
+							dependency_module = bound_module_graph_modules(bound).get(0)
+							public_signal = declaration_skeleton_graph_find_type(
+								graph,
+								target_scope,
+								"PublicSignal",
+							)
+							hidden_signal = declaration_skeleton_graph_find_type(
+								graph,
+								target_scope,
+								"HiddenSignal",
+							)
+
+							match (dependency_module, public_signal, hidden_signal):
+								(Some(dependency_bound), Some(public_type), Some(hidden_type)):
+									dependency_signal = declaration_skeleton_graph_find_type(
+										graph,
+										bound_module_scope(dependency_bound),
+										"DependencySignal",
+									)
+									var exact_and_missing_ok: Bool = (
+										exact_constructor_lookup_matches_skeleton(
+											graph,
+											public_type.id,
+											"Busy",
+											PublicDeclaration,
+										)
+										and exact_constructor_lookup_matches_skeleton(
+											graph,
+											hidden_type.id,
+											"Hidden",
+											PrivateDeclaration,
+										)
+										and declaration_skeleton_graph_find_constructor(
+											graph,
+											public_type.id,
+											"Missing",
+											type_id_source_span(public_type.id),
+										).is_none()
+									)
+
+									match dependency_signal:
+										Some(dependency_type):
+											var same_name_ok: Bool = (
+												exact_constructor_lookup_matches_skeleton(
+													graph,
+													public_type.id,
+													"Ready",
+													PublicDeclaration,
+												)
+												and exact_constructor_lookup_matches_skeleton(
+													graph,
+													dependency_type.id,
+													"Ready",
+													PublicDeclaration,
+												)
+											)
+
+											var wrong_identity_ok: Bool = True
+
+											for skeleton in declaration_skeleton_graph_skeletons(
+												graph,
+											):
+												match skeleton:
+													ConstructorDeclarationSkeleton(_, _, parent, source):
+														if (
+															type_ids_equal(parent, public_type.id)
+															and source.name.text == "Ready"
+														):
+															wrong_span = { source.span |
+																end_offset = source.span.end_offset + 1
+															}
+															wrong_identity_ok = (
+																declaration_skeleton_graph_constructor_lookup_candidate_count(
+																	graph,
+																	public_type.id,
+																	"Ready",
+																	source.span,
+																) == 2
+																and declaration_skeleton_graph_find_constructor(
+																	graph,
+																	dependency_type.id,
+																	"Ready",
+																	source.span,
+																).is_none()
+																and declaration_skeleton_graph_find_constructor(
+																	graph,
+																	public_type.id,
+																	"Ready",
+																	wrong_span,
+																).is_none()
+															)
+													_:
+														void
+
+											(
+												exact_and_missing_ok
+												and same_name_ok
+												and wrong_identity_ok
+											)
+										None:
+											False
+								_:
+									False
+
+
 func test_skeleton_graph_places_target_before_dependencies() -> Bool:
 	target = fixture_module_load_candidate("main.brp", "app/main", "record Target {value: Int}")
 	dependency = fixture_module_load_candidate(
@@ -561,6 +735,10 @@ tests: TestSuite = {
 		(
 			"allows same constructor name across parents",
 			test_skeleton_graph_allows_same_constructor_name_across_parents,
+		),
+		(
+			"constructor lookup is exact across modules, parents, and spans",
+			test_constructor_lookup_is_exact_across_modules_parents_and_spans,
 		),
 		(
 			"places target before dependencies",

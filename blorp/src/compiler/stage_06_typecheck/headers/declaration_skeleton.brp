@@ -1243,24 +1243,96 @@ pure func declaration_skeleton_graph_type_skeletons(
 	type_skeletons
 
 
-pure func declaration_skeleton_graph_constructor_skeletons(
+pure func declaration_skeleton_graph_find_constructor(
 	graph: DeclarationSkeletonGraph,
-) -> List[ConstructorDeclarationSkeletonInfo]:
-	var constructor_skeletons: List[ConstructorDeclarationSkeletonInfo] = []
+	parent_type_id: TypeId,
+	name: String,
+	span: SourceSpan,
+) -> Option[ConstructorDeclarationSkeletonInfo]:
+	representation = declaration_skeleton_graph_rep(graph)
+	var index = representation.latest_skeleton_index_by_name.get_or(name, -1)
+	var result: Option[ConstructorDeclarationSkeletonInfo] = None
+	var index_is_consistent: Bool = True
 
-	for skeleton in declaration_skeleton_graph_rep(graph).skeletons:
-		match skeleton:
-			ConstructorDeclarationSkeleton(id, visibility, parent_type_id, source):
-				constructor_skeletons = constructor_skeletons.append({
-					id = id,
-					visibility = visibility,
-					parent_type_id = parent_type_id,
-					source = source,
-				})
-			_:
+	while (
+		index >= 0
+		and result.is_none()
+		and index_is_consistent
+	):
+		match representation.skeletons.get(index):
+			Some(ConstructorDeclarationSkeleton(id, visibility, parent, source)):
+				if (
+					source.name.text == name
+					and type_ids_equal(parent, parent_type_id)
+					and source_spans_equal(source.span, span)
+				):
+					result = Some({
+						id = id,
+						visibility = visibility,
+						parent_type_id = parent,
+						source = source,
+					})
+			Some(_):
 				void
+			None:
+				index_is_consistent = False
 
-	constructor_skeletons
+		if result.is_none() and index_is_consistent:
+			match representation.previous_same_name_index_by_skeleton.get(index):
+				Some(previous_index):
+					index = previous_index
+				None:
+					index_is_consistent = False
+
+	if index_is_consistent:
+		result
+	else:
+		None
+
+
+-- Test and benchmark work observation over the same name-chain index. The
+-- production query above remains allocation-free beyond its returned payload.
+pure func declaration_skeleton_graph_constructor_lookup_candidate_count(
+	graph: DeclarationSkeletonGraph,
+	parent_type_id: TypeId,
+	name: String,
+	span: SourceSpan,
+) -> Int:
+	representation = declaration_skeleton_graph_rep(graph)
+	var index = representation.latest_skeleton_index_by_name.get_or(name, -1)
+	var candidates_visited: Int = 0
+	var index_is_consistent: Bool = True
+	var found: Bool = False
+
+	while (
+		index >= 0
+		and not found
+		and index_is_consistent
+	):
+		match representation.skeletons.get(index):
+			Some(ConstructorDeclarationSkeleton(_, _, parent, source)):
+				candidates_visited += 1
+				found = (
+					source.name.text == name
+					and type_ids_equal(parent, parent_type_id)
+					and source_spans_equal(source.span, span)
+				)
+			Some(_):
+				candidates_visited += 1
+			None:
+				index_is_consistent = False
+
+		if not found and index_is_consistent:
+			match representation.previous_same_name_index_by_skeleton.get(index):
+				Some(previous_index):
+					index = previous_index
+				None:
+					index_is_consistent = False
+
+	if index_is_consistent:
+		candidates_visited
+	else:
+		0
 
 
 pure func declaration_skeleton_graph_trait_skeletons(
