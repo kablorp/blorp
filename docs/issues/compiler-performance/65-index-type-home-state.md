@@ -1,6 +1,6 @@
 # Index Type-Home State
 
-**Status:** Ready after Issue 64
+**Status:** Ready; Issue 64 completed 2026-09-09
 
 **Roadmap:** [Stage 06 Latency Reduction Roadmap](STAGE06_LATENCY_REDUCTION_ROADMAP.md)
 

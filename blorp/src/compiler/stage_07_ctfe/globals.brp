@@ -3,17 +3,26 @@
 -- Immutable top-level initializers are evaluated in source order into the
 -- CTFE global environment. Mutable top-level `var` bindings run at runtime.
 import:
-	../stage_04_modules/module_table: ModuleId, ModuleTable, module_ids_equal
+	../stage_04_modules/module_table:
+		ModuleId,
+		ModuleTable,
+		module_id_table_index,
+		module_ids_equal,
+		module_table_count,
 	../stage_06_typecheck/decl:
 		TypedDecl(TypedGlobalVarDecl, TypedPrivateDecl),
 		TypedGlobalVarInfo,
 		TypedProgram,
-	../stage_06_typecheck/graph/definition_index: DefinitionTable
+	../stage_06_typecheck/graph/definition_index:
+		DefinitionTable,
+		definition_table_module_table,
+		definition_tables_share_provenance,
 	context:
 		CtfeContext,
 		CtfeImportBinding(CtfeQualifiedModuleBinding, CtfeSelectiveDefinitionBinding),
 		CtfeImportedProgram,
 		CtfeImportedProgramSet,
+		ctfe_context_from_imported_programs,
 		ctfe_context_from_program,
 		ctfe_context_module_global_value,
 		ctfe_context_module_has_global_binding,
@@ -22,6 +31,7 @@ import:
 		ctfe_imported_program_decls,
 		ctfe_imported_program_import_bindings,
 		ctfe_imported_program_module_id,
+		ctfe_imported_program_set,
 		ctfe_imported_program_set_programs,
 	env: CTFE_ENV_EMPTY, ctfe_bind_global_value, ctfe_bind_unavailable_global
 	eval: CtfeEvalError(CtfeEvalInModule, CtfeEvalInvalid), ctfe_eval_typed_expr
@@ -46,9 +56,49 @@ record CtfeGlobalDecl {
 }
 
 
+private union CtfeModuleGlobalEvaluation:
+	CtfeModuleGlobalsUnrequested
+	CtfeModuleGlobalsEvaluating
+	CtfeModuleGlobalsEvaluated(CtfeEnv)
+	CtfeModuleGlobalsRejected(CtfeEvalError)
+
+
+record CtfeEvaluatedGlobalGraphMetrics {
+	planned_unique_modules: Int,
+	module_global_evaluation_starts: Int,
+	duplicate_module_global_evaluations: Int,
+	import_binding_applications: Int,
+	global_declaration_evaluations: Int,
+	rejected_module_evaluations: Int
+}
+
+
+private record CtfeEvaluatedGlobalGraphRep {
+	definition_table: DefinitionTable,
+	modules: List[CtfeModuleGlobalEvaluation],
+	metrics: CtfeEvaluatedGlobalGraphMetrics
+}
+
+
+private record CtfeGlobalGraphEvaluationState {
+	context: CtfeContext,
+	modules: List[CtfeModuleGlobalEvaluation],
+	metrics: CtfeEvaluatedGlobalGraphMetrics
+}
+
+
+opaque type CtfeEvaluatedGlobalGraph = CtfeEvaluatedGlobalGraphRep
+
+
 private record CtfeRewriteDeclResult {
 	env: CtfeEnv,
 	decl: TypedDecl
+}
+
+
+private record CtfeGlobalEnvEvaluationRun {
+	result: Result[CtfeEnv, CtfeEvalError],
+	global_declaration_evaluations: Int
 }
 
 
@@ -252,72 +302,308 @@ private pure func ctfe_eval_decls_global_env(
 	base_env: CtfeEnv,
 	decls: List[TypedDecl],
 ) -> Result[CtfeEnv, CtfeEvalError]:
+	ctfe_eval_decls_global_env_with_metrics(context, base_env, decls).result
+
+
+private pure func ctfe_eval_decls_global_env_with_metrics(
+	context: CtfeContext,
+	base_env: CtfeEnv,
+	decls: List[TypedDecl],
+) -> CtfeGlobalEnvEvaluationRun:
 	var env = base_env
 
 	for decl in decls:
 		env = ctfe_bind_unavailable_decl_globals(env, decl)
 
 	var failure: Option[CtfeEvalError] = None
+	var global_declaration_evaluations: Int = 0
 
 	for decl in decls:
-		match ctfe_eval_decl_global_env(context, env, decl):
-			Ok(next_env):
-				env = next_env
-			Err(error):
-				failure = Some(error)
-				break
+		match ctfe_global_decl_from_typed_decl(decl):
+			Some(_):
+				global_declaration_evaluations += 1
 
-	match failure:
+				match ctfe_eval_decl_global_env(context, env, decl):
+					Ok(next_env):
+						env = next_env
+					Err(error):
+						failure = Some(error)
+						break
+			None:
+				void
+
+	result = match failure:
 		Some(error):
 			Err(error)
 		None:
 			Ok(env)
+
+	{
+		result = result,
+		global_declaration_evaluations = global_declaration_evaluations
+	}
+
+
+private pure func ctfe_empty_module_global_evaluations(
+	module_table: ModuleTable,
+) -> List[CtfeModuleGlobalEvaluation]:
+	var modules: List[CtfeModuleGlobalEvaluation] = []
+
+	for _ in 0..module_table_count(module_table):
+		modules = modules.append(CtfeModuleGlobalsUnrequested)
+
+	modules
+
+
+pure func ctfe_evaluated_global_graph_metrics(
+	graph: CtfeEvaluatedGlobalGraph,
+) -> CtfeEvaluatedGlobalGraphMetrics:
+	from_opaque CtfeEvaluatedGlobalGraph(graph).metrics
+
+
+private pure func ctfe_rejected_global_graph_state(
+	state: CtfeGlobalGraphEvaluationState,
+	module_index: Int,
+	error: CtfeEvalError,
+) -> CtfeGlobalGraphEvaluationState:
+	{ state |
+		modules = state.modules.set(module_index, CtfeModuleGlobalsRejected(error)),
+		metrics = { state.metrics |
+			rejected_module_evaluations = state.metrics.rejected_module_evaluations + 1
+		}
+	}
+
+
+private pure func ctfe_start_planned_module_evaluation(
+	state: CtfeGlobalGraphEvaluationState,
+	module_index: Int,
+) -> CtfeGlobalGraphEvaluationState:
+	{ state |
+		modules = state.modules.set(module_index, CtfeModuleGlobalsEvaluating),
+		metrics = { state.metrics |
+			module_global_evaluation_starts = state.metrics.module_global_evaluation_starts + 1
+		}
+	}
+
+
+private pure func ctfe_evaluate_ready_module_globals(
+	state: CtfeGlobalGraphEvaluationState,
+	imported: CtfeImportedProgram,
+) -> CtfeGlobalGraphEvaluationState:
+	module_id = ctfe_imported_program_module_id(imported)
+	module_index = module_id_table_index(module_id)
+	bindings = ctfe_imported_program_import_bindings(imported)
+	module_context = { state.context | active_module_id = module_id }
+	evaluation = ctfe_eval_decls_global_env_with_metrics(
+		module_context,
+		ctfe_imported_global_env(module_context, bindings),
+		ctfe_imported_program_decls(imported),
+	)
+	var result = { state | metrics = { state.metrics |
+			import_binding_applications = state.metrics.import_binding_applications + bindings.length(),
+			global_declaration_evaluations = state.metrics.global_declaration_evaluations + evaluation.global_declaration_evaluations
+		} }
+
+	match evaluation.result:
+		Ok(env):
+			{ result |
+				modules = result.modules.set(module_index, CtfeModuleGlobalsEvaluated(env)),
+				context = ctfe_context_with_module_global_env(
+					result.context,
+					result.context.module_table,
+					module_id,
+					env,
+				)
+			}
+		Err(error):
+			wrapped_error = match ctfe_context_module_path(result.context, module_id):
+				Some(module_path):
+					CtfeEvalInModule(module_path, error)
+				None:
+					CtfeEvalInvalid(
+						"compile-time module id is not present in the CTFE module table",
+					)
+
+			ctfe_rejected_global_graph_state(result, module_index, wrapped_error)
+
+
+pure func ctfe_evaluate_dependency_global_graph(
+	definition_table: DefinitionTable,
+	active_module_id: ModuleId,
+	imported_program_set: CtfeImportedProgramSet,
+) -> Result[CtfeEvaluatedGlobalGraph, CtfeEvalError]:
+	module_table = definition_table_module_table(definition_table)
+	imported_programs = ctfe_imported_program_set_programs(imported_program_set)
+
+	match ctfe_context_from_imported_programs(
+		definition_table,
+		active_module_id,
+		imported_program_set,
+	):
+		None:
+			Err(
+				CtfeEvalInvalid(
+					"CTFE inputs do not belong to one definition and module identity domain",
+				),
+			)
+		Some(base_context):
+			var planned_modules: List[Bool] = []
+
+			for _ in 0..module_table_count(module_table):
+				planned_modules = planned_modules.append(False)
+
+			var state: CtfeGlobalGraphEvaluationState = {
+				context = base_context,
+				modules = ctfe_empty_module_global_evaluations(module_table),
+				metrics = {
+					planned_unique_modules = 0,
+					module_global_evaluation_starts = 0,
+					duplicate_module_global_evaluations = 0,
+					import_binding_applications = 0,
+					global_declaration_evaluations = 0,
+					rejected_module_evaluations = 0
+				}
+			}
+
+			for imported in imported_programs:
+				module_index = module_id_table_index(ctfe_imported_program_module_id(imported))
+
+				if planned_modules.get_or(module_index, False):
+					state = { state |
+						metrics = { state.metrics |
+							duplicate_module_global_evaluations = state.metrics.duplicate_module_global_evaluations + 1
+						}
+					}
+				else:
+					planned_modules = planned_modules.set(module_index, True)
+					state = { state |
+						metrics = { state.metrics |
+							planned_unique_modules = state.metrics.planned_unique_modules + 1
+						}
+					}
+
+			-- Stage 06 constructs this list dependency-first from the exact CTFE
+			-- artifact closures. Preserve that semantic order; the dense table is
+			-- membership/state authority, not a replacement ordering.
+			for imported in imported_programs:
+				module_index = module_id_table_index(ctfe_imported_program_module_id(imported))
+
+				match state.modules.get(module_index):
+					Some(CtfeModuleGlobalsUnrequested):
+						state = ctfe_start_planned_module_evaluation(state, module_index)
+						state = ctfe_evaluate_ready_module_globals(state, imported)
+					Some(CtfeModuleGlobalsEvaluating):
+						state = ctfe_rejected_global_graph_state(
+							state,
+							module_index,
+							CtfeEvalInvalid(
+								"compile-time dependency global evaluation contains a cycle",
+							),
+						)
+					_:
+						void
+
+			Ok(into_opaque CtfeEvaluatedGlobalGraph({
+						definition_table = definition_table,
+						modules = state.modules,
+						metrics = state.metrics
+					}))
+
+
+private pure func ctfe_context_with_evaluated_dependency_globals(
+	context: CtfeContext,
+	graph: CtfeEvaluatedGlobalGraph,
+	imported_programs: List[CtfeImportedProgram],
+) -> Result[CtfeContext, CtfeEvalError]:
+	rep = from_opaque CtfeEvaluatedGlobalGraph(graph)
+
+	if not definition_tables_share_provenance(context.definition_table, rep.definition_table):
+		Err(
+			CtfeEvalInvalid(
+				"CTFE evaluated globals belong to a different definition identity domain",
+			),
+		)
+	else:
+		var result_context = context
+		var failure: Option[CtfeEvalError] = None
+
+		for imported in imported_programs:
+			module_id = ctfe_imported_program_module_id(imported)
+
+			match rep.modules.get(module_id_table_index(module_id)):
+				Some(CtfeModuleGlobalsEvaluated(env)):
+					result_context = ctfe_context_with_module_global_env(
+						result_context,
+						result_context.module_table,
+						module_id,
+						env,
+					)
+				Some(CtfeModuleGlobalsRejected(error)):
+					failure = Some(error)
+				Some(CtfeModuleGlobalsEvaluating):
+					failure = Some(
+						CtfeEvalInvalid(
+							"compile-time dependency global evaluation is still in progress",
+						),
+					)
+				_:
+					failure = Some(
+						CtfeEvalInvalid("compile-time dependency globals were not evaluated"),
+					)
+
+			if failure.is_some():
+				break
+
+		match failure:
+			Some(error):
+				Err(error)
+			None:
+				Ok(result_context)
+
+
+pure func ctfe_rewrite_program_globals_with_evaluated_dependencies(
+	graph: CtfeEvaluatedGlobalGraph,
+	target_module_id: ModuleId,
+	program: TypedProgram,
+	imported_program_set: CtfeImportedProgramSet,
+	import_bindings: List[CtfeImportBinding],
+) -> Result[TypedProgram, CtfeEvalError]:
+	rep = from_opaque CtfeEvaluatedGlobalGraph(graph)
+	imported_programs = ctfe_imported_program_set_programs(imported_program_set)
+
+	match ctfe_context_from_program(
+		rep.definition_table,
+		target_module_id,
+		program,
+		import_bindings,
+		imported_program_set,
+	):
+		None:
+			Err(
+				CtfeEvalInvalid(
+					"CTFE inputs do not belong to one definition and module identity domain",
+				),
+			)
+		Some(base_context):
+			context ?= ctfe_context_with_evaluated_dependency_globals(
+				base_context,
+				graph,
+				imported_programs,
+			)
+			ctfe_rewrite_program_globals_with_import_bindings(context, import_bindings, program)
 
 
 pure func ctfe_eval_imported_program_global_envs(
 	context: CtfeContext,
 	imported_programs: List[CtfeImportedProgram],
 ) -> Result[CtfeContext, CtfeEvalError]:
-	var result_context = context
-	var failure: Option[CtfeEvalError] = None
-
-	for imported in imported_programs:
-		module_id = ctfe_imported_program_module_id(imported)
-		imported_context = { result_context | active_module_id = module_id }
-
-		match ctfe_eval_decls_global_env(
-			imported_context,
-			ctfe_imported_global_env(
-				imported_context,
-				ctfe_imported_program_import_bindings(imported),
-			),
-			ctfe_imported_program_decls(imported),
-		):
-			Ok(env):
-				result_context = ctfe_context_with_module_global_env(
-					result_context,
-					result_context.module_table,
-					module_id,
-					env,
-				)
-			Err(error):
-				match ctfe_context_module_path(result_context, module_id):
-					Some(module_path):
-						failure = Some(CtfeEvalInModule(module_path, error))
-					None:
-						failure = Some(
-							CtfeEvalInvalid(
-								"compile-time module id is not present in the CTFE module table",
-							),
-						)
-
-				break
-
-	match failure:
-		Some(error):
-			Err(error)
-		None:
-			Ok(result_context)
+	imported_program_set = ctfe_imported_program_set(context.definition_table, imported_programs)
+	graph ?= ctfe_evaluate_dependency_global_graph(
+		context.definition_table,
+		context.active_module_id,
+		imported_program_set,
+	)
+	ctfe_context_with_evaluated_dependency_globals(context, graph, imported_programs)
 
 
 pure func ctfe_bind_imported_global(
@@ -403,18 +689,15 @@ pure func ctfe_evaluate_program_globals(
 	imported_program_set: CtfeImportedProgramSet,
 	import_bindings: List[CtfeImportBinding],
 ) -> Result[TypedProgram, CtfeEvalError]:
-	imported_programs = ctfe_imported_program_set_programs(imported_program_set)
-
-	match ctfe_context_from_program(
+	graph ?= ctfe_evaluate_dependency_global_graph(
 		definition_table,
 		target_module_id,
-		program,
-		import_bindings,
 		imported_program_set,
-	):
-		None:
-			Err(CtfeEvalInvalid("CTFE inputs do not belong to one definition and module identity domain"))
-		Some(base_context):
-			context ?= ctfe_eval_imported_program_global_envs(base_context, imported_programs)
-
-			ctfe_rewrite_program_globals_with_import_bindings(context, import_bindings, program)
+	)
+	ctfe_rewrite_program_globals_with_evaluated_dependencies(
+		graph,
+		target_module_id,
+		program,
+		imported_program_set,
+		import_bindings,
+	)

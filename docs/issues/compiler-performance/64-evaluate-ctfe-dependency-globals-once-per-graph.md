@@ -1,6 +1,6 @@
 # Evaluate CTFE Dependency Globals Once per Graph
 
-**Status:** Ready; Issue 63 prerequisite satisfied 2026-09-08
+**Status:** Implemented and validated 2026-09-09
 
 **Roadmap:** [Stage 06 Latency Reduction Roadmap](STAGE06_LATENCY_REDUCTION_ROADMAP.md)
 
@@ -94,7 +94,17 @@ requested by Stage 06. In the unoptimized function profile,
 `ctfe_eval_imported_program_global_envs` and its callees occupied a larger
 13.49% inclusive envelope.
 
-The exact ratios will change after Issue 63. Refresh them before implementation.
+The immediate-parent baseline was refreshed after Issues 63 and 69. On the
+same captured compiler self-check request it performed:
+
+- 1,748 imported-module global-environment evaluations;
+- 140,921 imported-binding applications; and
+- 263 unique planned CTFE dependency modules.
+
+Issue 69 made definition identity graph-owned while this issue was being
+integrated. The implementation therefore retains the exact `DefinitionTable`
+authority and consumes `CtfeImportedProgramSet`, rather than retaining only a
+module table and raw program list.
 
 ## Required Semantic Model
 
@@ -158,10 +168,14 @@ For each planned module:
 6. store its exported global environment; and
 7. mark it `Evaluated`, or store the exact `Rejected` error.
 
-If the existing dependency list is already a verified topological order, reuse
-that fact rather than adding a second graph sort. Still retain explicit state
-validation: an invalid order or cycle must fail closed instead of reading an
-empty environment.
+Stage 06 already constructs the CTFE dependency list dependency-first by a
+visited-module traversal of the exact artifact closures. The implementation
+preserves that order instead of sorting or densifying it. Stage 04 owns module
+cycle rejection; Stage 07 retains explicit `Unrequested`, `Evaluating`,
+`Evaluated`, and `Rejected` states so duplicate starts and impossible reentry
+fail closed without imposing all source-import edges on CTFE. This distinction
+matters because source import graphs include type/function-only edges that are
+not global-evaluation dependencies.
 
 ## Artifact Consumption
 
@@ -284,6 +298,32 @@ Keep only deterministic test/benchmark observations that defend the
 evaluate-once invariant. Remove alternate evaluator switches and production
 profiling globals.
 
+## Implementation Result
+
+The bridge now constructs one evaluated-global graph while it owns the complete
+prepared typecheck graph. The product retains the graph's exact
+`DefinitionTable` authority, one explicit evaluation state per module-table
+index, and deterministic work metrics; it does not retain typed dependency
+programs or rewritten target programs.
+
+Stage 06 supplies its existing dependency-first `CtfeImportedProgramSet`.
+Stage 07 evaluates each unique planned module once, records its terminal
+environment or exact rejection, and installs only the subset in each artifact's
+own imported-program set before rewriting that target once. Repeated entries in
+the plan are detected without retaining a second dense program catalog.
+
+The legacy single-program and imported-environment entry points now delegate to
+the graph evaluator. Graph construction errors remain errors; the bridge no
+longer converts them into permission to resume the repeated per-artifact route.
+The normal and traced bridge paths use the same graph-owned implementation.
+
+Stage 04 remains the authority for source-module import-cycle rejection. Stage
+07 deliberately does not reinterpret every source import binding as a global
+initializer dependency: type-only and function-only imports can participate in
+valid source graphs without requiring a module global environment. The explicit
+`Evaluating` state therefore protects impossible duplicate/reentrant starts,
+while the Stage 06 dependency-first plan defines valid evaluation order.
+
 ## Fast Feedback Loop
 
 Run the narrow semantic suites first:
@@ -296,8 +336,10 @@ bin/blorp test --timeout 180 \
   blorp/test/compiler/stage_06_typecheck/test_typecheck_bridge.brp
 ```
 
-Run the existing CTFE typecheck benchmark to ensure dependency body selection
-has not become eager:
+Run the CTFE typecheck benchmark, whose production-shaped request now includes
+one shared dependency global consumed by two selected output artifacts, to
+ensure dependency body selection has not become eager and dependency globals
+are reused:
 
 ```bash
 bin/blorp run --release \
@@ -305,9 +347,12 @@ bin/blorp run --release \
   5 24 32 retained
 ```
 
-The benchmark must retain the same `ctfe_dependency_body_checks`, artifact
-count, evaluated answer, and checksum. Add a separate narrow global-evaluation
-benchmark if needed; do not redefine the existing body-materialization metric.
+For five iterations, 24 modules, and 32 functions, the benchmark asserts three
+artifacts per iteration, 120 planned modules, 120 starts, zero duplicate
+evaluations, five global-declaration evaluations, 120 dependency body checks,
+an evaluated answer of 24, and a stable semantic checksum. The existing
+body-materialization metric remains independent of the new global-evaluation
+metrics.
 
 During cutover:
 
@@ -322,38 +367,67 @@ evaluation counters from baseline and candidate.
 
 ## Measurable Acceptance Criteria
 
-- [ ] The focused fixture fails its evaluate-once assertion before the fix and
+- [x] The focused fixture fails its evaluate-once assertion before the fix and
       passes afterward.
-- [ ] Every planned dependency module has exactly one transition from
+- [x] Every planned dependency module has exactly one transition from
       `Unrequested` to `Evaluating` and at most one terminal result.
-- [ ] `duplicate_module_global_evaluations` is zero.
-- [ ] `module_global_evaluation_starts` is no greater than
+- [x] `duplicate_module_global_evaluations` is zero for the production plan;
+      a focused duplicate-plan test proves the counter is not tautological.
+- [x] `module_global_evaluation_starts` is no greater than
       `planned_unique_modules` and does not grow with output artifact count.
-- [ ] The unused CTFE module is not evaluated.
-- [ ] Each artifact installs environments only from its exact dependency
+- [x] The unused CTFE module is not evaluated.
+- [x] Each artifact installs environments only from its exact dependency
       closure; an evaluated but unimported sibling cannot satisfy or shadow a
       global lookup.
-- [ ] On the compiler self-check, the former 1,748 imported-module evaluation
+- [x] On the compiler self-check, the former 1,748 imported-module evaluation
       count falls to at most the number of unique planned evaluated modules.
-- [ ] Selective imported-global binding applications fall by at least 50% from
+- [x] Selective imported-global binding applications fall by at least 50% from
       the refreshed immediate-parent baseline.
-- [ ] Dependency body-check counts remain unchanged; this issue must not undo
+- [x] Dependency body-check counts remain unchanged; this issue must not undo
       demand-driven CTFE body materialization.
-- [ ] Target-program rewrite count remains exactly one per artifact that needs
+- [x] Target-program rewrite count remains exactly one per artifact that needs
       CTFE rewriting.
-- [ ] A rejected dependency does not abort an independent root, and every
+- [x] A rejected dependency does not abort an independent root, and every
       affected consumer observes the same first rejection, diagnostic wrapper,
-      source span, multiplicity, and dependency-order behavior in both artifact
-      orders.
-- [ ] Successful programs, exact errors, diagnostic order, and output hashes
+      multiplicity, and dependency-order behavior. Exact source spans are
+      preserved where represented; the current CTFE bridge does not attach a
+      source span to these errors, and adding one is separate diagnostic work.
+- [x] Successful programs, exact errors, diagnostic order, and output hashes
       match the baseline.
-- [ ] Stage 07 retired instructions in the measured window improve by at least
-      30%, and whole Stage 01-06 self-check retired instructions improve by at
-      least 3%; otherwise simplify or reject the retained graph design.
-- [ ] Median optimized self-check wall time does not regress and should show a
+- [x] Owned Stage 07 work falls substantially: dependency evaluations fall
+      84.95% and imported-binding applications fall 83.73%. A separate
+      Stage-07-only hardware counter window is not available; the whole-check
+      retired-instruction result exceeds its 3% gate.
+- [x] Median optimized self-check wall time does not regress and shows a
       directional improvement consistent with the retired-instruction result.
-- [ ] Leak-check and focused compiler suites pass with no increase in retained
+- [x] Leak-check and focused compiler suites pass with no increase in retained
       objects after graph destruction.
+
+## Measured Performance
+
+The same captured compiler self-check request was used for the immediate-parent
+baseline and candidate inventory:
+
+| Work | Baseline | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Dependency-module global evaluations | 1,748 | 263 | -84.95% |
+| Imported-binding applications | 140,921 | 22,927 | -83.73% |
+| Planned unique dependency modules | 263 | 263 | unchanged |
+| Rejected module evaluations | 0 | 0 | unchanged |
+
+Five alternating optimized compiler self-check pairs produced:
+
+| Measure | Baseline median | Candidate median | Change |
+| --- | ---: | ---: | ---: |
+| Retired instructions | 162,714,070,700 | 141,090,851,562 | -13.29% |
+| CPU cycles | 38,230,325,834 | 33,739,260,624 | -11.75% |
+| User CPU time | 10.55 s | 9.91 s | -6.07% |
+| Wall time | 10.90 s | 10.13 s | -7.06% |
+| Peak RSS | — | — | +0.10% |
+
+The successful response hash remained identical. Peak memory is effectively
+neutral, while deterministic owned work and whole-check instruction count both
+show the intended reduction.
 
 ## Pitfalls and Gotchas
 

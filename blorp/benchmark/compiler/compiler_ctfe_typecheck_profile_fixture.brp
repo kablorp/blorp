@@ -27,6 +27,12 @@ struct CompilerCtfeTypecheckBenchmarkResult {
 	dependency_declaration_count: Int,
 	ctfe_dependency_body_check_count: Int,
 	ctfe_reused_body_check_count: Int,
+	ctfe_planned_global_module_count: Int,
+	ctfe_global_evaluation_start_count: Int,
+	ctfe_duplicate_global_evaluation_count: Int,
+	ctfe_global_import_binding_application_count: Int,
+	ctfe_global_declaration_evaluation_count: Int,
+	ctfe_rejected_global_evaluation_count: Int,
 	expected_ctfe_reachable_function_body_count: Int,
 	expected_ctfe_irrelevant_function_body_count: Int,
 	target_declaration_count: Int,
@@ -206,6 +212,77 @@ pure func compiler_ctfe_typecheck_benchmark_request(
 	}
 
 
+private pure func benchmark_shared_global_consumer(
+	config: CompilerCtfeTypecheckBenchmarkConfig,
+	consumer_index: Int,
+) -> TypecheckImportModule:
+	module_path = "bench/ctfe_typecheck_profile_consumer_" + consumer_index.to_string()
+	path = "/" + module_path + ".brp"
+	last_module_index = config.module_count - 1
+	source = "import:\n\t" + benchmark_module_path(
+		last_module_index,
+	) + ": SHARED_OFFSET\n\nCONSUMER_VALUE: Int = SHARED_OFFSET + " + consumer_index.to_string() + "\n"
+
+	{
+		path = path,
+		module_name = module_path,
+		module_path = module_path,
+		text = source,
+		typecheck_program = benchmark_retained_program(
+			path,
+			module_path,
+			source,
+			config.retain_parsed_programs,
+		),
+		module_surface = None,
+		origin = UserModule
+	}
+
+
+pure func compiler_ctfe_shared_global_benchmark_request(
+	config: CompilerCtfeTypecheckBenchmarkConfig,
+) -> TypecheckGraphRequest:
+	base = compiler_ctfe_typecheck_benchmark_request(config)
+	last_module_index = config.module_count - 1
+	last_module_path = benchmark_module_path(last_module_index)
+	var modules: List[TypecheckImportModule] = []
+
+	for module in base.modules:
+		if module.module_path == last_module_path:
+			source = "SHARED_OFFSET: Int = 40\n\n" + module.text
+			modules = modules.append({ module |
+					text = source,
+					typecheck_program = benchmark_retained_program(
+						module.path,
+						module.module_name,
+						source,
+						config.retain_parsed_programs,
+					)
+				})
+		else:
+			modules = modules.append(module)
+
+	var module_targets: List[String] = []
+	var resolved_imports = base.resolved_imports
+
+	for consumer_index in 1..3:
+		consumer = benchmark_shared_global_consumer(config, consumer_index)
+		modules = modules.append(consumer)
+		module_targets = module_targets.append(consumer.module_path)
+		resolved_imports = resolved_imports.append({
+			from_path = consumer.path,
+			from_module = consumer.module_name,
+			import_path = last_module_path,
+			resolved_module = last_module_path,
+		})
+
+	{ base |
+		modules = modules,
+		module_targets = module_targets,
+		resolved_imports = resolved_imports
+	}
+
+
 private pure func expected_dependency_declarations(
 	module_count: Int,
 	functions_per_module: Int,
@@ -242,6 +319,12 @@ pure func compiler_ctfe_typecheck_benchmark_with_request(
 	var target_declaration_count: Int = 0
 	var ctfe_dependency_body_check_count: Int = 0
 	var ctfe_reused_body_check_count: Int = 0
+	var ctfe_planned_global_module_count: Int = 0
+	var ctfe_global_evaluation_start_count: Int = 0
+	var ctfe_duplicate_global_evaluation_count: Int = 0
+	var ctfe_global_import_binding_application_count: Int = 0
+	var ctfe_global_declaration_evaluation_count: Int = 0
+	var ctfe_rejected_global_evaluation_count: Int = 0
 	var evaluated_answer: Int = -1
 	var error_count: Int = 0
 	var ctfe_evaluated_count: Int = 0
@@ -257,9 +340,25 @@ pure func compiler_ctfe_typecheck_benchmark_with_request(
 		graph = run.graph
 		ctfe_dependency_body_check_count += run.ctfe.dependency_body_checks
 		ctfe_reused_body_check_count += run.ctfe.reused_body_checks
+		ctfe_planned_global_module_count += run.ctfe.planned_global_modules
+		ctfe_global_evaluation_start_count += run.ctfe.global_evaluation_starts
+		ctfe_duplicate_global_evaluation_count += run.ctfe.duplicate_global_evaluations
+		ctfe_global_import_binding_application_count += run.ctfe.global_import_binding_applications
+
+		ctfe_global_declaration_evaluation_count += run.ctfe.global_declaration_evaluations
+		ctfe_rejected_global_evaluation_count += run.ctfe.rejected_global_evaluations
 		artifact_count = graph.modules.length() + 1
 		target_declaration_count = graph.target.parsed_program.decls.length()
 		error_count += graph.target.errors.length()
+		var module_artifacts_valid: Bool = True
+
+		for module in graph.modules:
+			error_count += module.errors.length()
+			module_artifacts_valid = (
+				module_artifacts_valid
+				and module.errors.is_empty()
+				and module.ctfe_evaluated
+			)
 
 		if graph.target.ctfe_evaluated:
 			ctfe_evaluated_count += 1
@@ -272,12 +371,13 @@ pure func compiler_ctfe_typecheck_benchmark_with_request(
 
 		workload_valid = (
 			workload_valid
-			and artifact_count == 1
+			and artifact_count == request.module_targets.length() + 1
 			and target_declaration_count == TARGET_DECLARATION_COUNT
-			and request.modules.length() == config.module_count
-			and request.resolved_imports.length() == config.module_count
+			and request.modules.length() >= config.module_count
+			and request.resolved_imports.length() >= config.module_count
 			and graph.target.errors.length() == 0
 			and graph.target.ctfe_evaluated
+			and module_artifacts_valid
 			and evaluated_answer == expected_answer
 		)
 
@@ -288,6 +388,12 @@ pure func compiler_ctfe_typecheck_benchmark_with_request(
 		dependency_declaration_count = dependency_declarations,
 		ctfe_dependency_body_check_count = ctfe_dependency_body_check_count,
 		ctfe_reused_body_check_count = ctfe_reused_body_check_count,
+		ctfe_planned_global_module_count = ctfe_planned_global_module_count,
+		ctfe_global_evaluation_start_count = ctfe_global_evaluation_start_count,
+		ctfe_duplicate_global_evaluation_count = ctfe_duplicate_global_evaluation_count,
+		ctfe_global_import_binding_application_count = ctfe_global_import_binding_application_count,
+		ctfe_global_declaration_evaluation_count = ctfe_global_declaration_evaluation_count,
+		ctfe_rejected_global_evaluation_count = ctfe_rejected_global_evaluation_count,
 		expected_ctfe_reachable_function_body_count = expected_ctfe_reachable_function_body_count,
 		expected_ctfe_irrelevant_function_body_count = expected_ctfe_irrelevant_function_body_count,
 		target_declaration_count = target_declaration_count,

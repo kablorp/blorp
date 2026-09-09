@@ -72,8 +72,11 @@ import:
 	../../../src/compiler/stage_07_ctfe/globals:
 		ctfe_eval_imported_program_global_envs,
 		ctfe_eval_program_global_env,
+		ctfe_evaluate_dependency_global_graph,
 		ctfe_evaluate_program_globals,
+		ctfe_evaluated_global_graph_metrics,
 		ctfe_rewrite_program_globals,
+		ctfe_rewrite_program_globals_with_evaluated_dependencies,
 		ctfe_rewrite_program_globals_with_import_bindings,
 	../../../src/compiler/stage_07_ctfe/value: CtfeEnv, ctfe_int, ctfe_values_equal
 	../../../src/lib/source:
@@ -1073,6 +1076,299 @@ func test_evaluate_program_globals_builds_context_and_rewrites_target() -> Bool:
 			False
 
 
+private pure func rewritten_global_int(program: TypedProgram, name: String) -> Option[String]:
+	var result: Option[String] = None
+
+	for decl in program.decls:
+		match decl:
+			TypedGlobalVarDecl(info):
+				if info.decl.name.text == name:
+					match info.value:
+						TypedIntLiteralExpr(text, _, _):
+							result = Some(text)
+						_:
+							void
+			_:
+				void
+
+	result
+
+
+func test_dependency_global_graph_evaluates_shared_module_once() -> Bool:
+	base_context = ctfe_test_context()
+	dependency = ctfe_test_imported_program(
+		base_context,
+		"dep",
+		[typed_global_decl("OFFSET", False, int_expr("40"))],
+		[],
+	)
+	first_target = typed_program([typed_global_decl(
+				"FIRST",
+				False,
+				add_expr(name_expr("OFFSET"), int_expr("1")),
+			)])
+	second_target = typed_program([typed_global_decl(
+				"SECOND",
+				False,
+				add_expr(name_expr("OFFSET"), int_expr("2")),
+			)])
+	bindings = [selective_import_binding(base_context, "OFFSET", "dep", "OFFSET")]
+
+	match ctfe_evaluate_dependency_global_graph(
+		base_context.definition_table,
+		base_context.target_module_id,
+		ctfe_imported_program_set(base_context.definition_table, [dependency]),
+	):
+		Err(_):
+			False
+		Ok(graph):
+			metrics = ctfe_evaluated_global_graph_metrics(graph)
+			first = ctfe_rewrite_program_globals_with_evaluated_dependencies(
+				graph,
+				base_context.target_module_id,
+				first_target,
+				ctfe_imported_program_set(base_context.definition_table, [dependency]),
+				bindings,
+			)
+			second = ctfe_rewrite_program_globals_with_evaluated_dependencies(
+				graph,
+				base_context.target_module_id,
+				second_target,
+				ctfe_imported_program_set(base_context.definition_table, [dependency]),
+				bindings,
+			)
+
+			match (first, second):
+				(Ok(first_program), Ok(second_program)):
+					(
+						metrics.planned_unique_modules == 1
+						and metrics.module_global_evaluation_starts == 1
+						and metrics.duplicate_module_global_evaluations == 0
+						and metrics.global_declaration_evaluations == 1
+						and rewritten_global_int(first_program, "FIRST") == Some("41")
+						and rewritten_global_int(second_program, "SECOND") == Some("42")
+					)
+				_:
+					False
+
+
+func test_dependency_global_graph_measures_duplicate_plan_entries() -> Bool:
+	base_context = ctfe_test_context()
+	dependency = ctfe_test_imported_program(
+		base_context,
+		"dep",
+		[typed_global_decl("OFFSET", False, int_expr("40"))],
+		[],
+	)
+
+	match (
+		ctfe_evaluate_dependency_global_graph(
+			base_context.definition_table,
+			base_context.target_module_id,
+			ctfe_imported_program_set(
+				base_context.definition_table,
+				[dependency, dependency],
+			),
+		)
+	):
+		Err(_):
+			False
+		Ok(graph):
+			metrics = ctfe_evaluated_global_graph_metrics(graph)
+
+			(
+				metrics.duplicate_module_global_evaluations == 1
+				and metrics.planned_unique_modules == 1
+				and metrics.module_global_evaluation_starts == 1
+				and metrics.global_declaration_evaluations == 1
+			)
+
+
+func test_dependency_global_graph_uses_dependency_first_plan() -> Bool:
+	base_context = ctfe_test_context()
+	base = ctfe_test_imported_program(
+		base_context,
+		"base",
+		[typed_global_decl("VALUE", False, int_expr("41"))],
+		[],
+	)
+	dependency = ctfe_test_imported_program(
+		base_context,
+		"dep",
+		[typed_global_decl("ANSWER", False, name_expr("VALUE"))],
+		[selective_import_binding(base_context, "VALUE", "base", "VALUE")],
+	)
+
+	match (
+		ctfe_evaluate_dependency_global_graph(
+			base_context.definition_table,
+			base_context.target_module_id,
+			ctfe_imported_program_set(
+				base_context.definition_table,
+				[base, dependency],
+			),
+		)
+	):
+		Err(_):
+			False
+		Ok(graph):
+			result = ctfe_rewrite_program_globals_with_evaluated_dependencies(
+				graph,
+				base_context.target_module_id,
+				typed_program([typed_global_decl("RESULT", False, name_expr("ANSWER"))]),
+				ctfe_imported_program_set(base_context.definition_table, [dependency]),
+				[selective_import_binding(base_context, "ANSWER", "dep", "ANSWER")],
+			)
+
+			match result:
+				Ok(program):
+					rewritten_global_int(program, "RESULT") == Some("41")
+				Err(_):
+					False
+
+
+func test_dependency_global_graph_counts_only_attempted_declarations() -> Bool:
+	base_context = ctfe_test_context()
+	broken = ctfe_test_imported_program(
+		base_context,
+		"broken/dep",
+		[
+			typed_global_decl("BROKEN", False, name_expr("MISSING")),
+			typed_global_decl("NEVER_REACHED", False, int_expr("42")),
+		],
+		[],
+	)
+
+	match ctfe_evaluate_dependency_global_graph(
+		base_context.definition_table,
+		base_context.target_module_id,
+		ctfe_imported_program_set(base_context.definition_table, [broken]),
+	):
+		Err(_):
+			False
+		Ok(graph):
+			metrics = ctfe_evaluated_global_graph_metrics(graph)
+			metrics.global_declaration_evaluations == 1 and metrics.rejected_module_evaluations == 1
+
+
+func test_dependency_global_graph_retains_rejection_and_continues_independent_root() -> Bool:
+	base_context = ctfe_test_context()
+	broken = ctfe_test_imported_program(
+		base_context,
+		"broken/dep",
+		[typed_global_decl("BROKEN", False, name_expr("MISSING"))],
+		[],
+	)
+	independent = ctfe_test_imported_program(
+		base_context,
+		"right",
+		[typed_global_decl("VALUE", False, int_expr("42"))],
+		[],
+	)
+	broken_target = typed_program([typed_global_decl("RESULT", False, name_expr("BROKEN"))])
+	independent_target = typed_program([typed_global_decl("RESULT", False, name_expr("VALUE"))])
+
+	match (
+		ctfe_evaluate_dependency_global_graph(
+			base_context.definition_table,
+			base_context.target_module_id,
+			ctfe_imported_program_set(
+				base_context.definition_table,
+				[broken, independent],
+			),
+		)
+	):
+		Err(_):
+			False
+		Ok(graph):
+			broken_bindings = [
+				selective_import_binding(base_context, "BROKEN", "broken/dep", "BROKEN"),
+			]
+			first_broken = ctfe_rewrite_program_globals_with_evaluated_dependencies(
+				graph,
+				base_context.target_module_id,
+				broken_target,
+				ctfe_imported_program_set(base_context.definition_table, [broken]),
+				broken_bindings,
+			)
+			second_broken = ctfe_rewrite_program_globals_with_evaluated_dependencies(
+				graph,
+				base_context.target_module_id,
+				broken_target,
+				ctfe_imported_program_set(base_context.definition_table, [broken]),
+				broken_bindings,
+			)
+			independent_result = ctfe_rewrite_program_globals_with_evaluated_dependencies(
+				graph,
+				base_context.target_module_id,
+				independent_target,
+				ctfe_imported_program_set(base_context.definition_table, [independent]),
+				[selective_import_binding(base_context, "VALUE", "right", "VALUE")],
+			)
+			metrics = ctfe_evaluated_global_graph_metrics(graph)
+
+			match (first_broken, second_broken, independent_result):
+				(Err(first_error), Err(second_error), Ok(independent_program)):
+					expected_error = (
+						"while evaluating global constants in imported module 'broken/dep': global "
+						+ "constant initializer cannot reference 'MISSING' before it is evaluated"
+					)
+
+					(
+						ctfe_eval_error_message(first_error) == expected_error
+						and ctfe_eval_error_message(second_error) == expected_error
+						and rewritten_global_int(independent_program, "RESULT") == Some("42")
+						and metrics.module_global_evaluation_starts == 2
+						and metrics.rejected_module_evaluations == 1
+					)
+				_:
+					False
+
+
+func test_dependency_global_graph_does_not_install_unimported_sibling() -> Bool:
+	base_context = ctfe_test_context()
+	left = ctfe_test_imported_program(
+		base_context,
+		"left",
+		[typed_global_decl("VALUE", False, int_expr("1"))],
+		[],
+	)
+	right = ctfe_test_imported_program(
+		base_context,
+		"right",
+		[typed_global_decl("VALUE", False, int_expr("2"))],
+		[],
+	)
+	target = typed_program([typed_global_decl("RESULT", False, name_expr("VALUE"))])
+
+	match (
+		ctfe_evaluate_dependency_global_graph(
+			base_context.definition_table,
+			base_context.target_module_id,
+			ctfe_imported_program_set(
+				base_context.definition_table,
+				[left, right],
+			),
+		)
+	):
+		Err(_):
+			False
+		Ok(graph):
+			match ctfe_rewrite_program_globals_with_evaluated_dependencies(
+				graph,
+				base_context.target_module_id,
+				target,
+				ctfe_imported_program_set(base_context.definition_table, [left]),
+				[selective_import_binding(base_context, "VALUE", "right", "VALUE")],
+			):
+				Err(error):
+					ctfe_eval_error_message(
+						error,
+					) == "global constant initializer cannot reference 'VALUE' before it is evaluated"
+				Ok(_):
+					False
+
+
 tests: TestSuite = {
 	description = "Compiler CTFE global eval",
 	tests = [
@@ -1143,6 +1439,30 @@ tests: TestSuite = {
 		(
 			"evaluate program globals builds context and rewrites target",
 			test_evaluate_program_globals_builds_context_and_rewrites_target,
+		),
+		(
+			"dependency global graph evaluates a shared module once",
+			test_dependency_global_graph_evaluates_shared_module_once,
+		),
+		(
+			"dependency global graph measures duplicate plan entries",
+			test_dependency_global_graph_measures_duplicate_plan_entries,
+		),
+		(
+			"dependency global graph uses the dependency-first plan",
+			test_dependency_global_graph_uses_dependency_first_plan,
+		),
+		(
+			"dependency global graph counts only attempted declarations",
+			test_dependency_global_graph_counts_only_attempted_declarations,
+		),
+		(
+			"dependency global graph retains rejection and continues an independent root",
+			test_dependency_global_graph_retains_rejection_and_continues_independent_root,
+		),
+		(
+			"dependency global graph does not install an unimported sibling",
+			test_dependency_global_graph_does_not_install_unimported_sibling,
 		),
 	]
 }

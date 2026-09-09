@@ -56,7 +56,7 @@ The current opportunities are:
 | ---: | --- | --- | ---: |
 | 1 | [62: Use exact constructor-skeleton lookup](62-use-exact-constructor-skeleton-lookup.md) | 3,429 full projections across 19,666 skeletons | likely 2-5% |
 | 2 | [63: Make CTFE constructor resolution typed and module-stable](63-make-ctfe-constructor-resolution-typed-and-module-stable.md) — implemented | typed binders were reclassified through a target-first name list | correctness prerequisite completed; name-only catalog deleted |
-| 3 | [64: Evaluate CTFE dependency globals once per graph](64-evaluate-ctfe-dependency-globals-once-per-graph.md) | 1,748 dependency evaluations for 157 artifacts | likely 3-8% |
+| 3 | [64: Evaluate CTFE dependency globals once per graph](64-evaluate-ctfe-dependency-globals-once-per-graph.md) — implemented | dependency evaluations fell 84.95%; binding applications fell 83.73% | whole-check instructions -13.29%; wall -7.06% |
 | 4 | [65: Index type-home state](65-index-type-home-state.md) | about 215,000 linear finds and 215,000 writes | likely 1-3% |
 | 5 | [66: Canonicalize accepted semantic-type projection](66-canonicalize-accepted-semantic-type-projection.md) | accepted phase is 13x the next isolated phase; alias-depth scaling is superlinear | measurement-gated |
 | 6 | [67: Index remaining CTFE environment lookup](67-index-remaining-ctfe-environment-lookup.md) | binding scans consume about 5.4% before Issue 64 | measurement-gated after Issue 64 |
@@ -202,14 +202,16 @@ artifact order, satisfying Issue 64's correctness prerequisite.
 
 ### Issue 64: graph-owned CTFE global evaluation
 
-Implement only after Issue 63 proves dependency evaluation is module-stable.
-This issue changes evaluation lifetime and needs an uncontaminated profile. It
-is distinct from rejected Issue 35: typed CTFE dependency preparation is
-already deduplicated; evaluated global environments are not.
+Implemented after Issue 63 proved dependency evaluation module-stable. One
+graph-owned evaluation now replaces repeated per-artifact dependency-global
+evaluation while preserving exact artifact closures and definition authority.
+On the compiler self-check, dependency evaluations fell from 1,748 to 263,
+binding applications fell from 140,921 to 22,927, whole-check retired
+instructions fell 13.29%, and median wall time fell 7.06%.
 
 ### Issue 65: type-home index
 
-Implement after Issue 64. It is semantically independent, but both changes
+This is the next ready issue after Issue 64. It is semantically independent, but both changes
 touch prepared typecheck facts and their performance shares overlap. Serial
 integration keeps the attribution honest.
 

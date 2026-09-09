@@ -114,8 +114,13 @@ import:
 		ctfe_imported_program_import_bindings,
 		ctfe_imported_program_set,
 		selective_ctfe_imported_program,
-	../stage_07_ctfe/eval: ctfe_eval_error_message
-	../stage_07_ctfe/globals: ctfe_evaluate_program_globals
+	../stage_07_ctfe/eval: CtfeEvalError, ctfe_eval_error_message
+	../stage_07_ctfe/globals:
+		CtfeEvaluatedGlobalGraph,
+		ctfe_evaluate_dependency_global_graph,
+		ctfe_evaluate_program_globals,
+		ctfe_evaluated_global_graph_metrics,
+		ctfe_rewrite_program_globals_with_evaluated_dependencies,
 	decl:
 		AcceptedTypecheckGraph,
 		AcceptedTypecheckModule,
@@ -513,7 +518,8 @@ private record PreparedTypecheckGraph {
 	module_table: ModuleTable,
 	definition_table: DefinitionTable,
 	target: PreparedTypecheckModule,
-	modules: List[PreparedTypecheckModule]
+	modules: List[PreparedTypecheckModule],
+	ctfe_evaluated_globals: Option[CtfeEvaluatedGlobalGraph]
 }
 
 
@@ -839,7 +845,13 @@ struct CtfeMaterializationMetrics {
 	selective_dependency_modules: Int,
 	eager_dependency_modules: Int,
 	failed_dependency_modules: Int,
-	eager_fallback: CtfeEagerFallbackKind
+	eager_fallback: CtfeEagerFallbackKind,
+	planned_global_modules: Int,
+	global_evaluation_starts: Int,
+	duplicate_global_evaluations: Int,
+	global_import_binding_applications: Int,
+	global_declaration_evaluations: Int,
+	rejected_global_evaluations: Int
 }
 
 
@@ -2587,6 +2599,25 @@ private pure func ctfe_imported_programs_from_dependencies(
 		Some(result)
 
 
+private pure func available_ctfe_imported_programs_from_dependencies(
+	ctfe_dependencies: List[PreparedCtfeDependency],
+) -> List[CtfeImportedProgram]:
+	var result: List[CtfeImportedProgram] = []
+
+	for dependency in ctfe_dependencies:
+		match dependency.program:
+			ReusableCtfeProgram(artifact):
+				result = result.append(artifact.imported_program)
+			SelectiveCtfeProgram(imported_program, _):
+				result = result.append(imported_program)
+			EagerCtfeOnlyProgram(imported_program):
+				result = result.append(imported_program)
+			FailedCtfeProgram:
+				void
+
+	result
+
+
 private pure func ctfe_imported_programs_for_artifact(
 	has_ctfe_globals: Bool,
 	ctfe_dependencies: List[PreparedCtfeDependency],
@@ -2595,6 +2626,17 @@ private pure func ctfe_imported_programs_for_artifact(
 		ctfe_imported_programs_from_dependencies(ctfe_dependencies)
 	else:
 		Some([])
+
+
+private pure func evaluated_ctfe_globals_for_graph(
+	definition_table: DefinitionTable,
+	target_module_id: ModuleId,
+	ctfe_dependencies: List[PreparedCtfeDependency],
+) -> Result[Option[CtfeEvaluatedGlobalGraph], CtfeEvalError]:
+	programs = available_ctfe_imported_programs_from_dependencies(ctfe_dependencies)
+	program_set = ctfe_imported_program_set(definition_table, programs)
+	graph ?= ctfe_evaluate_dependency_global_graph(definition_table, target_module_id, program_set)
+	Ok(Some(graph))
 
 
 private pure func ctfe_body_outcomes_for_module(
@@ -2656,6 +2698,7 @@ private pure func evaluated_typecheck_artifact(
 	diagnostics: List[TypecheckDiagnostic],
 	import_bindings: List[ImportBinding],
 	imported_programs: Option[List[CtfeImportedProgram]],
+	evaluated_globals: Option[CtfeEvaluatedGlobalGraph],
 ) -> TypecheckCtfeArtifact:
 	if errors.length() != 0:
 		{
@@ -2686,13 +2729,25 @@ private pure func evaluated_typecheck_artifact(
 			ctfe_import_bindings_for_module_table(module_table, import_bindings),
 		):
 			(Some(program_set), Some(ctfe_import_bindings)):
-				match ctfe_evaluate_program_globals(
-					definition_table,
-					target_module_id,
-					program,
-					program_set,
-					ctfe_import_bindings,
-				):
+				evaluation = match evaluated_globals:
+					Some(graph):
+						ctfe_rewrite_program_globals_with_evaluated_dependencies(
+							graph,
+							target_module_id,
+							program,
+							program_set,
+							ctfe_import_bindings,
+						)
+					None:
+						ctfe_evaluate_program_globals(
+							definition_table,
+							target_module_id,
+							program,
+							program_set,
+							ctfe_import_bindings,
+						)
+
+				match evaluation:
 					Ok(evaluated_program):
 						{
 							semantic_program = program,
@@ -2728,6 +2783,7 @@ private pure func typecheck_ctfe_artifact(
 	scope: PreparedModuleScope,
 	typed_result: TypecheckProgramResult,
 	imported_programs: Option[List[CtfeImportedProgram]],
+	evaluated_globals: Option[CtfeEvaluatedGlobalGraph],
 ) -> TypecheckCtfeArtifact:
 	evaluated_typecheck_artifact(
 		definition_index_definition_table(prepared_module_scope_definition_index(scope)),
@@ -2737,6 +2793,7 @@ private pure func typecheck_ctfe_artifact(
 		typed_result.state.diagnostics,
 		module_view_import_bindings(typed_result.state.module_view),
 		imported_programs,
+		evaluated_globals,
 	)
 
 
@@ -2826,6 +2883,7 @@ private pure func typechecked_prepared_module(
 	module_surface: ModuleSurface,
 	allow_debug_only_calls: Bool,
 	ctfe_dependencies: List[PreparedCtfeDependency],
+	evaluated_globals: Option[CtfeEvaluatedGlobalGraph],
 	accepted_graph: BodyTypecheckGraph,
 	main_policy: MainValidationPolicy,
 ) -> TypecheckedModule:
@@ -2840,7 +2898,12 @@ private pure func typechecked_prepared_module(
 		typed_program_has_ctfe_globals(typed_result.program),
 		ctfe_dependencies,
 	)
-	ctfe_artifact = typecheck_ctfe_artifact(scope, typed_result, imported_programs)
+	ctfe_artifact = typecheck_ctfe_artifact(
+		scope,
+		typed_result,
+		imported_programs,
+		evaluated_globals,
+	)
 
 	typechecked_module_from_ctfe_artifact(scope, module_surface, ctfe_artifact)
 
@@ -2850,6 +2913,7 @@ private pure func typechecked_prepared_module_with_seeded_bodies(
 	module_surface: ModuleSurface,
 	allow_debug_only_calls: Bool,
 	ctfe_dependencies: List[PreparedCtfeDependency],
+	evaluated_globals: Option[CtfeEvaluatedGlobalGraph],
 	accepted_graph: BodyTypecheckGraph,
 	main_policy: MainValidationPolicy,
 	seed_outcomes: List[BodyCheckOutcome],
@@ -2867,7 +2931,12 @@ private pure func typechecked_prepared_module_with_seeded_bodies(
 		typed_program_has_ctfe_globals(typed_result.program),
 		ctfe_dependencies,
 	)
-	ctfe_artifact = typecheck_ctfe_artifact(scope, typed_result, imported_programs)
+	ctfe_artifact = typecheck_ctfe_artifact(
+		scope,
+		typed_result,
+		imported_programs,
+		evaluated_globals,
+	)
 
 	{
 		module = typechecked_module_from_ctfe_artifact(scope, module_surface, ctfe_artifact),
@@ -2880,6 +2949,7 @@ private pure func typechecked_prepared_module_with_ownership(
 	module_surface: ModuleSurface,
 	allow_debug_only_calls: Bool,
 	ctfe_dependencies: List[PreparedCtfeDependency],
+	evaluated_globals: Option[CtfeEvaluatedGlobalGraph],
 	accepted_graph: BodyTypecheckGraph,
 	main_policy: MainValidationPolicy,
 ) -> TypecheckedPreparedModuleResult:
@@ -2896,7 +2966,12 @@ private pure func typechecked_prepared_module_with_ownership(
 		typed_program_has_ctfe_globals(typed_result.program),
 		ctfe_dependencies,
 	)
-	ctfe_artifact = typecheck_ctfe_artifact(scope, typed_result, imported_programs)
+	ctfe_artifact = typecheck_ctfe_artifact(
+		scope,
+		typed_result,
+		imported_programs,
+		evaluated_globals,
+	)
 	after_ctfe_unique = typed_program_is_unique(ctfe_artifact.program)
 	typechecked = typechecked_module_from_ctfe_artifact(scope, module_surface, ctfe_artifact)
 
@@ -2915,6 +2990,7 @@ private func typechecked_prepared_module_with_ownership_and_trace(
 	module_surface: ModuleSurface,
 	allow_debug_only_calls: Bool,
 	ctfe_dependencies: List[PreparedCtfeDependency],
+	evaluated_globals: Option[CtfeEvaluatedGlobalGraph],
 	accepted_graph: BodyTypecheckGraph,
 	trace: (TypecheckTracePhase, Int) -> Void,
 	main_policy: MainValidationPolicy,
@@ -2955,7 +3031,12 @@ private func typechecked_prepared_module_with_ownership_and_trace(
 		typed_program_has_ctfe_globals(typed_result.program),
 		ctfe_dependencies,
 	)
-	ctfe_artifact = typecheck_ctfe_artifact(scope, typed_result, imported_programs)
+	ctfe_artifact = typecheck_ctfe_artifact(
+		scope,
+		typed_result,
+		imported_programs,
+		evaluated_globals,
+	)
 	after_ctfe_unique = typed_program_is_unique(ctfe_artifact.program)
 	typechecked = typechecked_module_from_ctfe_artifact(scope, module_surface, ctfe_artifact)
 
@@ -2974,6 +3055,7 @@ private pure func typechecked_reusable_ctfe_module(
 	module_surface: ModuleSurface,
 	artifact: ReusableCtfeArtifact,
 	ctfe_dependencies: List[PreparedCtfeDependency],
+	evaluated_globals: Option[CtfeEvaluatedGlobalGraph],
 ) -> TypecheckedModule:
 	imported_program = artifact.imported_program
 
@@ -2992,6 +3074,7 @@ private pure func typechecked_reusable_ctfe_module(
 		[],
 		artifact.import_bindings,
 		imported_programs,
+		evaluated_globals,
 	)
 
 	typechecked_module_from_ctfe_artifact(scope, module_surface, ctfe_artifact)
@@ -3360,6 +3443,7 @@ private pure func typed_source_artifact(
 													module_surface,
 													allow_debug_only_calls,
 													ctfe_dependencies.modules,
+													None,
 													AcceptedBodyTypecheckGraph(accepted_graph),
 													IgnoreMainName,
 												),
@@ -3379,6 +3463,7 @@ private pure func freshly_typechecked_graph_module(
 	bound_module: BoundModule,
 	module_surface: ModuleSurface,
 	module_ctfe_dependencies: List[PreparedCtfeDependency],
+	evaluated_globals: Option[CtfeEvaluatedGlobalGraph],
 	include_inventory: Bool,
 	main_policy: MainValidationPolicy,
 	seed_outcomes: Option[List[BodyCheckOutcome]],
@@ -3389,6 +3474,7 @@ private pure func freshly_typechecked_graph_module(
 			module_surface,
 			allow_debug_only_calls,
 			module_ctfe_dependencies,
+			evaluated_globals,
 			prepared.context.typecheck_graph,
 			main_policy,
 		)
@@ -3406,6 +3492,7 @@ private pure func freshly_typechecked_graph_module(
 					module_surface,
 					allow_debug_only_calls,
 					module_ctfe_dependencies,
+					evaluated_globals,
 					prepared.context.typecheck_graph,
 					main_policy,
 					outcomes,
@@ -3423,6 +3510,7 @@ private pure func freshly_typechecked_graph_module(
 						module_surface,
 						allow_debug_only_calls,
 						module_ctfe_dependencies,
+						evaluated_globals,
 						prepared.context.typecheck_graph,
 						main_policy,
 					),
@@ -3435,6 +3523,7 @@ private pure func freshly_typechecked_graph_module(
 private pure func typechecked_graph_module(
 	allow_debug_only_calls: Bool,
 	prepared: PreparedTypecheckModule,
+	evaluated_globals: Option[CtfeEvaluatedGlobalGraph],
 	include_inventory: Bool,
 	main_policy: MainValidationPolicy,
 ) -> TypecheckedGraphModuleResult:
@@ -3472,6 +3561,7 @@ private pure func typechecked_graph_module(
 					module_surface,
 					imported_program,
 					module_ctfe_dependencies,
+					evaluated_globals,
 				),
 				origin = ReusedCtfeGraphModule,
 				ownership = None,
@@ -3484,6 +3574,7 @@ private pure func typechecked_graph_module(
 				bound_module,
 				module_surface,
 				module_ctfe_dependencies,
+				evaluated_globals,
 				include_inventory,
 				main_policy,
 				seed_outcomes,
@@ -3495,6 +3586,7 @@ private pure func typechecked_graph_module(
 private func typechecked_graph_module_with_trace(
 	allow_debug_only_calls: Bool,
 	prepared: PreparedTypecheckModule,
+	evaluated_globals: Option[CtfeEvaluatedGlobalGraph],
 	trace: (TypecheckTracePhase, Int) -> Void,
 	main_policy: MainValidationPolicy,
 ) -> TypecheckedGraphModuleResult:
@@ -3523,6 +3615,7 @@ private func typechecked_graph_module_with_trace(
 					module_surface,
 					imported_program,
 					module_ctfe_dependencies,
+					evaluated_globals,
 				),
 				origin = ReusedCtfeGraphModule,
 				ownership = None,
@@ -3534,6 +3627,7 @@ private func typechecked_graph_module_with_trace(
 				module_surface,
 				allow_debug_only_calls,
 				module_ctfe_dependencies,
+				evaluated_globals,
 				prepared.context.typecheck_graph,
 				trace,
 				main_policy,
@@ -3577,21 +3671,37 @@ private pure func prepare_typecheck_graph_from_completed_headers(
 				typecheck_diagnostics_from_messages(bound_module_graph_error_messages(errors)),
 			)
 		Ok(ctfe_dependencies):
+			module_table = bound_module_graph_module_table(bound_graph)
+			definition_table = definition_index_definition_table(
+				prepared_module_scope_definition_index(target_scope),
+			)
 			typecheck_context = prepared_typecheck_context(
 				modules,
 				ctfe_dependencies,
 				typecheck_graph,
 			)
-			PreparedTypecheckGraphReady({
-				module_table = bound_module_graph_module_table(bound_graph),
-				definition_table = definition_index_definition_table(
-					prepared_module_scope_definition_index(target_scope),
-				),
-				target = prepared_typecheck_module(bound_target, typecheck_context),
-				modules = bound_modules.map(
-					func(module): prepared_typecheck_module(module, typecheck_context),
-				),
-			})
+
+			match evaluated_ctfe_globals_for_graph(
+				definition_table,
+				prepared_module_scope_id(target_scope),
+				ctfe_dependencies.modules,
+			):
+				Err(error):
+					message = ctfe_eval_error_message(error)
+					PreparedTypecheckGraphRejected(
+						RejectedPreparedTarget(target),
+						[typecheck_diagnostic(message, None)],
+					)
+				Ok(evaluated_globals):
+					PreparedTypecheckGraphReady({
+						module_table = module_table,
+						definition_table = definition_table,
+						target = prepared_typecheck_module(bound_target, typecheck_context),
+						modules = bound_modules.map(
+							func(module): prepared_typecheck_module(module, typecheck_context),
+						),
+						ctfe_evaluated_globals = evaluated_globals,
+					})
 
 
 private pure func prepare_bound_typecheck_graph(
@@ -3844,6 +3954,21 @@ private func emit_prepared_graph_inventory(
 	)
 
 
+private func emit_ctfe_global_evaluation_inventory(
+	evaluated_globals: Option[CtfeEvaluatedGlobalGraph],
+	inventory: (String, String) -> Void,
+) -> Void:
+	match evaluated_globals:
+		None:
+			void
+		Some(graph):
+			metrics = ctfe_evaluated_global_graph_metrics(graph)
+			inventory(
+				"ctfe_global_evaluation",
+				"planned_unique_modules=" + metrics.planned_unique_modules.to_string() + " module_global_evaluation_starts=" + metrics.module_global_evaluation_starts.to_string() + " duplicate_module_global_evaluations=" + metrics.duplicate_module_global_evaluations.to_string() + " import_binding_applications=" + metrics.import_binding_applications.to_string() + " global_declaration_evaluations=" + metrics.global_declaration_evaluations.to_string() + " rejected_module_evaluations=" + metrics.rejected_module_evaluations.to_string(),
+			)
+
+
 private func prepare_typecheck_graph_from_completed_headers_with_trace(
 	request: TypecheckGraphRequest,
 	target: PreparedModule,
@@ -3893,19 +4018,35 @@ private func prepare_typecheck_graph_from_completed_headers_with_trace(
 					inventory,
 				)
 
+			module_table = bound_module_graph_module_table(bound_graph)
+			definition_table = definition_index_definition_table(definition_index)
 			typecheck_context = prepared_typecheck_context(
 				modules,
 				ctfe_dependencies,
 				typecheck_graph,
 			)
-			PreparedTypecheckGraphReady({
-				module_table = bound_module_graph_module_table(bound_graph),
-				definition_table = definition_index_definition_table(definition_index),
-				target = prepared_typecheck_module(bound_target, typecheck_context),
-				modules = bound_modules.map(
-					func(module): prepared_typecheck_module(module, typecheck_context),
-				),
-			})
+
+			match evaluated_ctfe_globals_for_graph(
+				definition_table,
+				prepared_module_scope_id(target_scope),
+				ctfe_dependencies.modules,
+			):
+				Err(error):
+					message = ctfe_eval_error_message(error)
+					PreparedTypecheckGraphRejected(
+						RejectedPreparedTarget(target),
+						[typecheck_diagnostic(message, None)],
+					)
+				Ok(evaluated_globals):
+					PreparedTypecheckGraphReady({
+						module_table = module_table,
+						definition_table = definition_table,
+						target = prepared_typecheck_module(bound_target, typecheck_context),
+						modules = bound_modules.map(
+							func(module): prepared_typecheck_module(module, typecheck_context),
+						),
+						ctfe_evaluated_globals = evaluated_globals,
+					})
 
 
 private func prepare_typecheck_graph_with_trace(
@@ -4068,6 +4209,7 @@ private pure func ctfe_materialization_metrics(
 	target_discovery_body_checks: Int,
 	eager_fallback: CtfeEagerFallbackKind,
 	reused_body_checks: Int,
+	evaluated_globals: Option[CtfeEvaluatedGlobalGraph],
 ) -> CtfeMaterializationMetrics:
 	var selective_dependency_modules: Int = 0
 	var eager_dependency_modules: Int = 0
@@ -4084,6 +4226,19 @@ private pure func ctfe_materialization_metrics(
 			FailedCtfeProgram:
 				failed_dependency_modules += 1
 
+	global_evaluation = match evaluated_globals:
+		Some(graph):
+			ctfe_evaluated_global_graph_metrics(graph)
+		None:
+			{
+				planned_unique_modules = 0,
+				module_global_evaluation_starts = 0,
+				duplicate_module_global_evaluations = 0,
+				import_binding_applications = 0,
+				global_declaration_evaluations = 0,
+				rejected_module_evaluations = 0
+			}
+
 	{
 		dependency_body_checks = dependencies
 			.map(func(dependency): dependency.body_checks)
@@ -4093,7 +4248,13 @@ private pure func ctfe_materialization_metrics(
 		selective_dependency_modules = selective_dependency_modules,
 		eager_dependency_modules = eager_dependency_modules,
 		failed_dependency_modules = failed_dependency_modules,
-		eager_fallback = eager_fallback
+		eager_fallback = eager_fallback,
+		planned_global_modules = global_evaluation.planned_unique_modules,
+		global_evaluation_starts = global_evaluation.module_global_evaluation_starts,
+		duplicate_global_evaluations = global_evaluation.duplicate_module_global_evaluations,
+		global_import_binding_applications = global_evaluation.import_binding_applications,
+		global_declaration_evaluations = global_evaluation.global_declaration_evaluations,
+		rejected_global_evaluations = global_evaluation.rejected_module_evaluations
 	}
 
 
@@ -4109,13 +4270,20 @@ pure func typecheck_graph_with_metrics(request: TypecheckGraphRequest) -> Typech
 					selective_dependency_modules = 0,
 					eager_dependency_modules = 0,
 					failed_dependency_modules = 0,
-					eager_fallback = CtfeNoEagerFallback
+					eager_fallback = CtfeNoEagerFallback,
+					planned_global_modules = 0,
+					global_evaluation_starts = 0,
+					duplicate_global_evaluations = 0,
+					global_import_binding_applications = 0,
+					global_declaration_evaluations = 0,
+					rejected_global_evaluations = 0
 				}
 			}
 		PreparedTypecheckGraphReady(graph):
 			target_result = typechecked_graph_module(
 				request.allow_debug_only_calls,
 				graph.target,
+				graph.ctfe_evaluated_globals,
 				False,
 				ValidateProgramMain,
 			)
@@ -4126,6 +4294,7 @@ pure func typecheck_graph_with_metrics(request: TypecheckGraphRequest) -> Typech
 				module_result = typechecked_graph_module(
 					request.allow_debug_only_calls,
 					prepared,
+					graph.ctfe_evaluated_globals,
 					False,
 					IgnoreMainName,
 				)
@@ -4150,6 +4319,7 @@ pure func typecheck_graph_with_metrics(request: TypecheckGraphRequest) -> Typech
 					graph.target.context.target_ctfe_discovery_body_checks,
 					graph.target.context.ctfe_eager_fallback,
 					reused_body_checks,
+					graph.ctfe_evaluated_globals,
 				)
 			}
 
@@ -4215,6 +4385,7 @@ private pure func typechecked_graph_from_prepared(
 				target = typechecked_graph_module(
 					allow_debug_only_calls,
 					graph.target,
+					graph.ctfe_evaluated_globals,
 					False,
 					ValidateProgramMain,
 				).module,
@@ -4224,6 +4395,7 @@ private pure func typechecked_graph_from_prepared(
 					): typechecked_graph_module(
 						allow_debug_only_calls,
 						prepared,
+						graph.ctfe_evaluated_globals,
 						False,
 						IgnoreMainName,
 					).module,
@@ -4261,6 +4433,7 @@ private pure func typechecked_rejected_module_response(
 private pure func typechecked_graph_module_response(
 	request: TypecheckGraphRequest,
 	prepared: PreparedTypecheckModule,
+	evaluated_globals: Option[CtfeEvaluatedGlobalGraph],
 	main_policy: MainValidationPolicy,
 ) -> String:
 	module_scope = bound_module_scope(prepared.bound_module)
@@ -4268,6 +4441,7 @@ private pure func typechecked_graph_module_response(
 		typechecked_graph_module(
 			request.allow_debug_only_calls,
 			prepared,
+			evaluated_globals,
 			False,
 			main_policy,
 		).module,
@@ -4281,6 +4455,7 @@ private pure func typechecked_graph_module_response(
 private func emit_typechecked_graph_module_response(
 	request: TypecheckGraphRequest,
 	prepared: PreparedTypecheckModule,
+	evaluated_globals: Option[CtfeEvaluatedGlobalGraph],
 	emit: (String) -> Void,
 	trace: (TypecheckTracePhase, Int, String) -> Void,
 	include_inventory: Bool,
@@ -4298,11 +4473,18 @@ private func emit_typechecked_graph_module_response(
 		typechecked_graph_module_with_trace(
 			request.allow_debug_only_calls,
 			prepared,
+			evaluated_globals,
 			trace_callback,
 			main_policy,
 		)
 	else:
-		typechecked_graph_module(request.allow_debug_only_calls, prepared, False, main_policy)
+		typechecked_graph_module(
+			request.allow_debug_only_calls,
+			prepared,
+			evaluated_globals,
+			False,
+			main_policy,
+		)
 
 	typechecked = result.module
 	trace(TypecheckComplete, TYPECHECK_TRACE_UNINDEXED, module_path)
@@ -4468,6 +4650,7 @@ func stream_typecheck_graph_request_value(
 											typechecked_graph_module_response(
 												request,
 												prepared,
+												graph.ctfe_evaluated_globals,
 												IgnoreMainName,
 											),
 										)
@@ -4476,6 +4659,7 @@ func stream_typecheck_graph_request_value(
 										typechecked_graph_module_response(
 											request,
 											graph.target,
+											graph.ctfe_evaluated_globals,
 											ValidateProgramMain,
 										),
 									)
@@ -4531,10 +4715,17 @@ private func stream_typecheck_graph_request_chunks_impl(
 										rejected_target_path(target),
 									)
 								PreparedTypecheckGraphReady(graph):
+									if include_inventory:
+										emit_ctfe_global_evaluation_inventory(
+											graph.ctfe_evaluated_globals,
+											inventory,
+										)
+
 									for prepared in graph.modules:
 										emit_typechecked_graph_module_response(
 											request,
 											prepared,
+											graph.ctfe_evaluated_globals,
 											emit,
 											trace,
 											include_inventory,
@@ -4555,6 +4746,7 @@ private func stream_typecheck_graph_request_chunks_impl(
 									emit_typechecked_graph_module_response(
 										request,
 										graph.target,
+										graph.ctfe_evaluated_globals,
 										emit,
 										trace,
 										include_inventory,
