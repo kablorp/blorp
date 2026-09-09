@@ -40,8 +40,14 @@ import:
 		TYPECHECK_STDLIB_ORIGIN,
 		TYPECHECK_USER_ORIGIN,
 		TYPE_SHAPE_MEMO_EMPTY,
+		TypeHomeIndex,
 		TypecheckState,
 		infer_session_from_typecheck_state,
+		type_home_index_empty,
+		type_home_index_imported_module_path,
+		type_home_index_is_imported,
+		type_home_index_module_path,
+		type_home_index_record,
 		typecheck_state_add_diagnostic,
 		typecheck_state_add_imported_module,
 		typecheck_state_add_known_resource_type_name,
@@ -78,6 +84,7 @@ import:
 		typecheck_state_restore_definition_scope,
 		typecheck_state_scope_to_imported_module,
 		typecheck_state_scope_to_program,
+		typecheck_state_type_home_is_imported,
 		typecheck_state_type_home_matches,
 		typecheck_state_with_debug_calls,
 	../../../src/compiler/stage_06_typecheck/type_system/env: ENV_EMPTY, impl_instance
@@ -315,6 +322,77 @@ func test_name_lookup_indexes_are_complete_and_state_local() -> Bool:
 	)
 
 
+private record LastWriteWinsTypeHome {
+	module_path: String,
+	imported: Bool
+}
+
+
+private pure func last_write_wins_record_type_home(
+	homes: Dict[String, LastWriteWinsTypeHome],
+	type_name: String,
+	module_path: String,
+	imported: Bool,
+) -> Dict[String, LastWriteWinsTypeHome]:
+	homes.set(
+		type_name,
+		{
+			module_path = module_path,
+			imported = imported
+		},
+	)
+
+
+private pure func last_write_wins_imports_fail_required_precedence() -> Bool:
+	first_import = last_write_wins_record_type_home({}, "Widget", "pkg/widgets", True)
+	second_import = last_write_wins_record_type_home(
+		first_import,
+		"Widget",
+		"pkg/other_widgets",
+		True,
+	)
+
+	match second_import.get("Widget"):
+		Some(home):
+			home.module_path != "pkg/widgets"
+		None:
+			False
+
+
+pure func test_type_home_index_precedence() -> Bool:
+	empty: TypeHomeIndex = type_home_index_empty()
+	first_import = type_home_index_record(empty, "Widget", "pkg/widgets", True)
+	repeated_import = type_home_index_record(first_import, "Widget", "pkg/widgets", True)
+	ignored_import = type_home_index_record(repeated_import, "Widget", "pkg/other_widgets", True)
+	local_home = type_home_index_record(ignored_import, "Widget", "app/main", False)
+	repeated_local = type_home_index_record(local_home, "Widget", "app/next", False)
+	import_after_local = type_home_index_record(repeated_local, "Widget", "pkg/final_widgets", True)
+	other_index = type_home_index_record(empty, "Widget", "other/module", True)
+
+	(
+		type_home_index_module_path(empty, "Widget").is_none()
+		and not type_home_index_is_imported(empty, "Widget")
+		and type_home_index_imported_module_path(empty, "Widget").is_none()
+		and type_home_index_module_path(first_import, "Widget") == Some("pkg/widgets")
+		and type_home_index_is_imported(first_import, "Widget")
+		and type_home_index_imported_module_path(first_import, "Widget") == Some("pkg/widgets")
+		and type_home_index_module_path(repeated_import, "Widget") == Some("pkg/widgets")
+		and type_home_index_is_imported(repeated_import, "Widget")
+		and type_home_index_module_path(ignored_import, "Widget") == Some("pkg/widgets")
+		and type_home_index_is_imported(ignored_import, "Widget")
+		and last_write_wins_imports_fail_required_precedence()
+		and type_home_index_module_path(local_home, "Widget") == Some("app/main")
+		and not type_home_index_is_imported(local_home, "Widget")
+		and type_home_index_imported_module_path(local_home, "Widget").is_none()
+		and type_home_index_module_path(repeated_local, "Widget") == Some("app/next")
+		and not type_home_index_is_imported(repeated_local, "Widget")
+		and type_home_index_module_path(import_after_local, "Widget") == Some("app/next")
+		and not type_home_index_is_imported(import_after_local, "Widget")
+		and type_home_index_module_path(other_index, "Widget") == Some("other/module")
+		and type_home_index_is_imported(other_index, "Widget")
+	)
+
+
 func test_known_names_and_type_home_precedence() -> Bool:
 	var state = typecheck_state_add_known_type_name(
 		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
@@ -334,6 +412,22 @@ func test_known_names_and_type_home_precedence() -> Bool:
 		True,
 	)
 	local_home = typecheck_state_record_type_home(ignored_import, "Widget", "app/main", False)
+	repeated_local = typecheck_state_record_type_home(local_home, "Widget", "app/next", False)
+	import_after_local = typecheck_state_record_type_home(
+		repeated_local,
+		"Widget",
+		"pkg/final_widgets",
+		True,
+	)
+	other_state = typecheck_state_record_type_home(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		"Widget",
+		"other/module",
+		True,
+	)
+	body_state = typecheck_state_from_infer_session(
+		infer_session_from_typecheck_state(import_after_local),
+	)
 	cleared = typecheck_state_clear_known_type_index(local_home)
 
 	(
@@ -348,6 +442,15 @@ func test_known_names_and_type_home_precedence() -> Bool:
 		and typecheck_state_find_type_home(imported_home, "Widget") == Some("pkg/widgets")
 		and typecheck_state_find_type_home(ignored_import, "Widget") == Some("pkg/widgets")
 		and typecheck_state_find_type_home(local_home, "Widget") == Some("app/main")
+		and not typecheck_state_type_home_is_imported(local_home, "Widget")
+		and typecheck_state_find_type_home(repeated_local, "Widget") == Some("app/next")
+		and not typecheck_state_type_home_is_imported(repeated_local, "Widget")
+		and typecheck_state_find_type_home(import_after_local, "Widget") == Some("app/next")
+		and not typecheck_state_type_home_is_imported(import_after_local, "Widget")
+		and typecheck_state_find_type_home(other_state, "Widget") == Some("other/module")
+		and typecheck_state_type_home_is_imported(other_state, "Widget")
+		and typecheck_state_find_type_home(body_state, "Widget") == Some("app/next")
+		and not typecheck_state_type_home_is_imported(body_state, "Widget")
 		and typecheck_state_type_home_matches(local_home, "Widget", "app/main")
 	)
 
@@ -726,6 +829,7 @@ tests: TestSuite = {
 			"name lookup indexes are complete and state local",
 			test_name_lookup_indexes_are_complete_and_state_local,
 		),
+		("type home index precedence", test_type_home_index_precedence),
 		("known names and type home precedence", test_known_names_and_type_home_precedence),
 		(
 			"callable ids and private impls are state local",

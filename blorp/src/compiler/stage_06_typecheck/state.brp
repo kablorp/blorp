@@ -33,16 +33,16 @@ import:
 		source_definition_key_description,
 		source_definition_key_module_id,
 	graph/definition_index:
-		DefinitionTable,
 		DefinitionIndex,
 		DefinitionIndexSeed,
+		DefinitionTable,
 		definition_index_advance_to_env,
 		definition_index_bootstrap_env,
 		definition_index_bootstrap_from_base_env,
 		definition_index_bootstrap_seed,
 		definition_index_conflict_message_for_module,
-		definition_index_empty,
 		definition_index_definition_table,
+		definition_index_empty,
 		definition_index_find_func_callable_id,
 		definition_index_find_source_definition_id,
 		definition_index_func_callable_bindings,
@@ -124,15 +124,17 @@ private union TypecheckModuleScopeRep:
 opaque type TypecheckModuleScope = TypecheckModuleScopeRep
 
 
--- Transient provenance for a spelling installed into one module's Env. Exact
--- definition ownership remains on TypeId in TypeHeaderGraph;
--- these entries only disambiguate local, canonical, and selective names during
--- the transitional environment-backed body checker.
-record TypecheckTypeHome {
-	type_name: String,
+-- Transient provenance for a visible spelling installed into one module's Env.
+-- Exact definition ownership remains on TypeId in TypeHeaderGraph; this index
+-- only disambiguates local, canonical, and selective names during the
+-- transitional environment-backed body checker.
+private record TypeHomeEntry {
 	module_path: String,
 	imported: Bool
 }
+
+
+opaque type TypeHomeIndex = Dict[String, TypeHomeEntry]
 
 
 private enum KnownTypeKind:
@@ -169,7 +171,7 @@ record TypecheckState {
 	private_impls: List[ImplInstance],
 	known_type_index: KnownTypeIndex,
 	scoped_trait_functions: List[(String, String)],
-	type_homes: List[TypecheckTypeHome],
+	type_homes: TypeHomeIndex,
 	type_shape_memo: TypeShapeMemo
 }
 
@@ -195,6 +197,98 @@ TYPECHECK_USER_ORIGIN: ModuleOrigin = UserModule
 TYPECHECK_STDLIB_ORIGIN: ModuleOrigin = StdlibModule
 
 private KNOWN_TYPE_INDEX_EMPTY: KnownTypeIndex = into_opaque KnownTypeIndex({})
+
+private TYPE_HOME_INDEX_EMPTY: TypeHomeIndex = into_opaque TypeHomeIndex({})
+
+
+pure func type_home_index_empty() -> TypeHomeIndex:
+	TYPE_HOME_INDEX_EMPTY
+
+
+private pure func type_home_index_entry(
+	index: TypeHomeIndex,
+	type_name: String,
+) -> Option[TypeHomeEntry]:
+	entries = from_opaque TypeHomeIndex(index)
+	entries.get(type_name)
+
+
+pure func type_home_index_module_path(index: TypeHomeIndex, type_name: String) -> Option[String]:
+	type_home_index_entry(index, type_name).map(func(entry): entry.module_path)
+
+
+pure func type_home_index_is_imported(index: TypeHomeIndex, type_name: String) -> Bool:
+	match type_home_index_entry(index, type_name):
+		Some(entry):
+			entry.imported
+		None:
+			False
+
+
+pure func type_home_index_imported_module_path(
+	index: TypeHomeIndex,
+	type_name: String,
+) -> Option[String]:
+	match type_home_index_entry(index, type_name):
+		Some(entry):
+			if entry.imported:
+				Some(entry.module_path)
+			else:
+				None
+		None:
+			None
+
+
+pure func type_home_index_is_empty(index: TypeHomeIndex) -> Bool:
+	entries = from_opaque TypeHomeIndex(index)
+	entries.is_empty()
+
+
+private pure func type_home_index_insert(
+	index: TypeHomeIndex,
+	type_name: String,
+	module_path: String,
+	imported: Bool,
+) -> TypeHomeIndex:
+	entries = from_opaque TypeHomeIndex(index)
+	into_opaque TypeHomeIndex(entries.set(
+			type_name,
+			{
+				module_path = module_path,
+				imported = imported
+			},
+		))
+
+
+private pure func type_home_index_replace_with_local(
+	index: TypeHomeIndex,
+	type_name: String,
+	module_path: String,
+) -> TypeHomeIndex:
+	entries = from_opaque TypeHomeIndex(index)
+	into_opaque TypeHomeIndex(entries.set(
+			type_name,
+			{
+				module_path = module_path,
+				imported = False
+			},
+		))
+
+
+pure func type_home_index_record(
+	index: TypeHomeIndex,
+	type_name: String,
+	module_path: String,
+	imported: Bool,
+) -> TypeHomeIndex:
+	match type_home_index_entry(index, type_name):
+		Some(_):
+			if imported:
+				index
+			else:
+				type_home_index_replace_with_local(index, type_name, module_path)
+		None:
+			type_home_index_insert(index, type_name, module_path, imported)
 
 
 private pure func known_type_index_add_type(index: KnownTypeIndex, name: String) -> KnownTypeIndex:
@@ -241,7 +335,7 @@ pure func typecheck_state_for_origin(origin: ModuleOrigin) -> TypecheckState:
 		private_impls = [],
 		known_type_index = KNOWN_TYPE_INDEX_EMPTY,
 		scoped_trait_functions = [],
-		type_homes = [],
+		type_homes = TYPE_HOME_INDEX_EMPTY,
 		type_shape_memo = TYPE_SHAPE_MEMO_EMPTY
 	}
 
@@ -797,53 +891,15 @@ pure func typecheck_state_clear_known_type_index(state: TypecheckState) -> Typec
 	{ state | known_type_index = KNOWN_TYPE_INDEX_EMPTY }
 
 
-private pure func replace_type_home(
-	homes: List[TypecheckTypeHome],
-	replacement: TypecheckTypeHome,
-) -> List[TypecheckTypeHome]:
-	var result: List[TypecheckTypeHome] = []
-	var replaced: Bool = False
-
-	for home in homes:
-		if home.type_name == replacement.type_name:
-			result = result.append(replacement)
-			replaced = True
-		else:
-			result = result.append(home)
-
-	if replaced:
-		result
-	else:
-		result.append(replacement)
-
-
-private pure func find_type_home_entry(
-	type_homes: List[TypecheckTypeHome],
-	type_name: String,
-) -> Option[TypecheckTypeHome]:
-	var result: Option[TypecheckTypeHome] = None
-
-	for home in type_homes:
-		if home.type_name == type_name:
-			result = Some(home)
-			break
-
-	result
-
-
 pure func typecheck_state_find_type_home(
 	state: TypecheckState,
 	type_name: String,
 ) -> Option[String]:
-	find_type_home_entry(state.type_homes, type_name).map(func(home): home.module_path)
+	type_home_index_module_path(state.type_homes, type_name)
 
 
 pure func typecheck_state_type_home_is_imported(state: TypecheckState, type_name: String) -> Bool:
-	match find_type_home_entry(state.type_homes, type_name):
-		Some(home):
-			home.imported
-		None:
-			False
+	type_home_index_is_imported(state.type_homes, type_name)
 
 
 pure func typecheck_state_type_home_matches(
@@ -860,25 +916,9 @@ pure func typecheck_state_record_type_home(
 	module_path: String,
 	imported: Bool,
 ) -> TypecheckState:
-	match typecheck_state_find_type_home(state, type_name):
-		Some(_):
-			if imported:
-				state
-			else:
-				{ state | type_homes = replace_type_home(
-						state.type_homes,
-						{
-							type_name = type_name,
-							module_path = module_path,
-							imported = False
-						},
-					) }
-		None:
-			{ state | type_homes = state.type_homes.append({
-					type_name = type_name,
-					module_path = module_path,
-					imported = imported,
-				}) }
+	{ state |
+		type_homes = type_home_index_record(state.type_homes, type_name, module_path, imported)
+	}
 
 
 private pure func typecheck_state_record_func_callable_id(
@@ -1338,7 +1378,7 @@ record InferModuleFacts {
 	private_impls: List[ImplInstance],
 	known_type_index: KnownTypeIndex,
 	scoped_trait_functions: List[(String, String)],
-	type_homes: List[TypecheckTypeHome]
+	type_homes: TypeHomeIndex
 }
 
 
@@ -1365,8 +1405,11 @@ pure func infer_session_from_typecheck_state(state: TypecheckState) -> InferSess
 
 pure func infer_module_facts_from_typecheck_state(state: TypecheckState) -> InferModuleFacts:
 	definition_identity_domain = match typecheck_module_scope_rep(state.module_scope):
-		ReservedModuleScope(_): ReservedGraphDefinitionDomain
-		UnscopedModuleScope(_, _) | ExtensibleModuleScope(_, _, _, _): UnindexedDefinitionDomain
+		ReservedModuleScope(_):
+			ReservedGraphDefinitionDomain
+		UnscopedModuleScope(_, _) | ExtensibleModuleScope(_, _, _, _):
+			UnindexedDefinitionDomain
+
 	{
 		module_view = state.module_view,
 		module_scope = state.module_scope,

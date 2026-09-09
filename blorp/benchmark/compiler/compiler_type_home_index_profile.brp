@@ -1,0 +1,895 @@
+-- Isolated type-home provenance workload for Stage 06 state.
+--
+-- The fixture builds one source-order operation plan and measures two
+-- authoritative windows over it: a local copy of the retired list policy and
+-- the production TypecheckState APIs backed by TypeHomeIndex.
+import:
+	../../src/compiler/stage_06_typecheck/state:
+		TYPECHECK_USER_ORIGIN,
+		TypecheckState,
+		infer_session_from_typecheck_state,
+		typecheck_state_find_type_home,
+		typecheck_state_for_origin,
+		typecheck_state_from_infer_session,
+		typecheck_state_record_type_home,
+		typecheck_state_type_home_is_imported,
+	memory: MemStats, get_mem_stats, reset_mem_stats
+	string: parse_int
+	system: now_microseconds
+
+
+private PROFILE_MODE_BOTH: Int = 0
+
+private PROFILE_MODE_BASELINE_LOOKUP_ONLY: Int = 1
+
+private PROFILE_MODE_CANDIDATE_LOOKUP_ONLY: Int = 2
+
+
+struct TypeHomeProfileConfig {
+	visible_name_count: Int,
+	body_count: Int,
+	queries_per_body: Int,
+	window_order: Int,
+	profile_mode: Int
+}
+
+
+private record TypeHomeProfileOperation {
+	type_name: String,
+	module_path: String,
+	imported: Bool,
+	writes_index: Bool
+}
+
+
+private record LegacyTypeHome {
+	type_name: String,
+	module_path: String,
+	imported: Bool
+}
+
+
+private record LegacyFindResult {
+	home: Option[LegacyTypeHome],
+	candidates_visited: Int
+}
+
+
+private record LegacyRecordResult {
+	homes: List[LegacyTypeHome],
+	candidates_visited: Int,
+	replacement_list_rebuilds: Int
+}
+
+
+private record FinalMappingValidation {
+	baseline_checksum: Int,
+	candidate_checksum: Int,
+	workload_valid: Bool
+}
+
+
+private record SingleMappingValidation {
+	checksum: Int,
+	workload_valid: Bool
+}
+
+
+struct TypeHomeProfileWindow {
+	elapsed_microseconds: Int,
+	type_home_record_requests: Int,
+	type_home_find_requests: Int,
+	type_home_linear_candidates_visited: Int,
+	type_home_replacement_list_rebuilds: Int,
+	type_home_index_reads: Int,
+	type_home_index_writes: Int,
+	body_session_index_rebuilds: Int,
+	semantic_checksum: Int,
+	total_allocations: Int,
+	total_releases: Int,
+	retained_objects: Int,
+	allocated_bytes: Int,
+	workload_valid: Bool
+}
+
+
+struct TypeHomeProfileResult {
+	visible_name_count: Int,
+	body_count: Int,
+	queries_per_body: Int,
+	window_order: Int,
+	profile_mode: Int,
+	baseline_populate: TypeHomeProfileWindow,
+	candidate_populate: TypeHomeProfileWindow,
+	baseline_lookup: TypeHomeProfileWindow,
+	candidate_lookup: TypeHomeProfileWindow,
+	baseline_final_mapping_checksum: Int,
+	candidate_final_mapping_checksum: Int,
+	candidate_index_read_requests: Int,
+	candidate_planned_index_writes: Int,
+	candidate_structural_linear_scan_sites: Int,
+	candidate_structural_replacement_rebuild_sites: Int,
+	type_home_record_requests: Int,
+	type_home_find_requests: Int,
+	type_home_linear_candidates_visited: Int,
+	type_home_replacement_list_rebuilds: Int,
+	type_home_index_reads: Int,
+	type_home_index_writes: Int,
+	body_session_index_rebuilds: Int,
+	semantic_checksum: Int,
+	elapsed_microseconds: Int,
+	total_allocations: Int,
+	total_releases: Int,
+	retained_objects: Int,
+	allocated_bytes: Int,
+	workload_valid: Bool
+}
+
+
+private pure func positive_argument(args: List[String], index: Int, default: Int) -> Int:
+	match args.get(index):
+		Some(text):
+			match parse_int(text):
+				Some(value):
+					if value > 0:
+						value
+					else:
+						default
+				None:
+					default
+		None:
+			default
+
+
+private pure func profile_mode_argument(args: List[String], index: Int) -> Int:
+	match args.get(index):
+		Some(text):
+			match parse_int(text):
+				Some(value):
+					if (
+						value == PROFILE_MODE_BASELINE_LOOKUP_ONLY
+						or value == PROFILE_MODE_CANDIDATE_LOOKUP_ONLY
+					):
+						value
+					else:
+						PROFILE_MODE_BOTH
+				None:
+					PROFILE_MODE_BOTH
+		None:
+			PROFILE_MODE_BOTH
+
+
+private pure func profile_mode_label(mode: Int) -> String:
+	if mode == PROFILE_MODE_BASELINE_LOOKUP_ONLY:
+		"baseline_lookup_only"
+	else if mode == PROFILE_MODE_CANDIDATE_LOOKUP_ONLY:
+		"candidate_lookup_only"
+	else:
+		"both"
+
+
+private pure func selected_lookup_semantic_checksum(result: TypeHomeProfileResult) -> Int:
+	if result.profile_mode == PROFILE_MODE_BASELINE_LOOKUP_ONLY:
+		result.baseline_lookup.semantic_checksum
+	else:
+		result.candidate_lookup.semantic_checksum
+
+
+private pure func type_name(index: Int) -> String:
+	"ProfileType" + index.to_string()
+
+
+private pure func imported_module_path(index: Int) -> String:
+	"profile/imported/" + index.to_string()
+
+
+private pure func conflicting_module_path(index: Int) -> String:
+	"profile/conflicting/" + index.to_string()
+
+
+private pure func local_module_path(index: Int) -> String:
+	"profile/local/" + index.to_string()
+
+
+private pure func replacement_local_module_path(index: Int) -> String:
+	"profile/local/replacement/" + index.to_string()
+
+
+private pure func expected_module_path(index: Int) -> String:
+	if index % 8 == 0:
+		replacement_local_module_path(index)
+	else if index % 4 == 0:
+		local_module_path(index)
+	else:
+		imported_module_path(index)
+
+
+private pure func expected_imported(index: Int) -> Bool:
+	index % 4 != 0
+
+
+private pure func query_type_index(
+	config: TypeHomeProfileConfig,
+	body_index: Int,
+	query: Int,
+) -> Int:
+	query_count = config.body_count * config.queries_per_body
+	query_ordinal = body_index * config.queries_per_body + query
+	query_ordinal * config.visible_name_count / query_count
+
+
+private pure func operation_plan(visible_name_count: Int) -> List[TypeHomeProfileOperation]:
+	var operations: List[TypeHomeProfileOperation] = []
+
+	for index in 0..visible_name_count:
+		name = type_name(index)
+		operations = operations.append({
+			type_name = name,
+			module_path = imported_module_path(index),
+			imported = True,
+			writes_index = True,
+		})
+		operations = operations.append({
+			type_name = name,
+			module_path = conflicting_module_path(index),
+			imported = True,
+			writes_index = False,
+		})
+
+		if index % 4 == 0:
+			operations = operations.append({
+				type_name = name,
+				module_path = local_module_path(index),
+				imported = False,
+				writes_index = True,
+			})
+			operations = operations.append({
+				type_name = name,
+				module_path = conflicting_module_path(index),
+				imported = True,
+				writes_index = False,
+			})
+
+		if index % 8 == 0:
+			operations = operations.append({
+				type_name = name,
+				module_path = replacement_local_module_path(index),
+				imported = False,
+				writes_index = True,
+			})
+
+	operations
+
+
+private pure func legacy_scan_home(
+	homes: List[LegacyTypeHome],
+	type_name: String,
+) -> LegacyFindResult:
+	var result: Option[LegacyTypeHome] = None
+	var candidates_visited: Int = 0
+
+	for home in homes:
+		candidates_visited += 1
+
+		if home.type_name == type_name:
+			result = Some(home)
+			break
+
+	{
+		home = result,
+		candidates_visited = candidates_visited
+	}
+
+
+private pure func legacy_rebuild_with_home(
+	homes: List[LegacyTypeHome],
+	replacement: LegacyTypeHome,
+) -> (List[LegacyTypeHome], Int):
+	var result: List[LegacyTypeHome] = []
+	var candidates_visited: Int = 0
+	var replaced: Bool = False
+
+	for home in homes:
+		candidates_visited += 1
+
+		if home.type_name == replacement.type_name:
+			result = result.append(replacement)
+			replaced = True
+		else:
+			result = result.append(home)
+
+	if replaced:
+		(result, candidates_visited)
+	else:
+		(result.append(replacement), candidates_visited)
+
+
+private pure func legacy_record_type_home(
+	homes: List[LegacyTypeHome],
+	operation: TypeHomeProfileOperation,
+) -> LegacyRecordResult:
+	find_result = legacy_scan_home(homes, operation.type_name)
+
+	match find_result.home:
+		Some(_):
+			if operation.imported:
+				{
+					homes = homes,
+					candidates_visited = find_result.candidates_visited,
+					replacement_list_rebuilds = 0
+				}
+			else:
+				(replaced_homes, replacement_candidates) = legacy_rebuild_with_home(
+					homes,
+					{
+						type_name = operation.type_name,
+						module_path = operation.module_path,
+						imported = False
+					},
+				)
+				{
+					homes = replaced_homes,
+					candidates_visited = find_result.candidates_visited + replacement_candidates,
+					replacement_list_rebuilds = 1
+				}
+		None:
+			{
+				homes = homes.append({
+					type_name = operation.type_name,
+					module_path = operation.module_path,
+					imported = operation.imported,
+				}),
+				candidates_visited = find_result.candidates_visited,
+				replacement_list_rebuilds = 0
+			}
+
+
+private pure func build_baseline_homes(
+	operations: List[TypeHomeProfileOperation],
+) -> List[LegacyTypeHome]:
+	var homes: List[LegacyTypeHome] = []
+
+	for operation in operations:
+		recorded = legacy_record_type_home(homes, operation)
+		homes = recorded.homes
+
+	homes
+
+
+private pure func build_candidate_state(
+	operations: List[TypeHomeProfileOperation],
+) -> TypecheckState:
+	var state: TypecheckState = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
+
+	for operation in operations:
+		state = typecheck_state_record_type_home(
+			state,
+			operation.type_name,
+			operation.module_path,
+			operation.imported,
+		)
+
+	state
+
+
+private pure func empty_window() -> TypeHomeProfileWindow:
+	{
+		elapsed_microseconds = 0,
+		type_home_record_requests = 0,
+		type_home_find_requests = 0,
+		type_home_linear_candidates_visited = 0,
+		type_home_replacement_list_rebuilds = 0,
+		type_home_index_reads = 0,
+		type_home_index_writes = 0,
+		body_session_index_rebuilds = 0,
+		semantic_checksum = 0,
+		total_allocations = 0,
+		total_releases = 0,
+		retained_objects = 0,
+		allocated_bytes = 0,
+		workload_valid = True
+	}
+
+
+private pure func window_with_memory(
+	window: TypeHomeProfileWindow,
+	elapsed_microseconds: Int,
+	stats: MemStats,
+) -> TypeHomeProfileWindow:
+	{ window |
+		elapsed_microseconds = elapsed_microseconds,
+		total_allocations = stats.total_allocations,
+		total_releases = stats.total_releases,
+		retained_objects = stats.current_objects,
+		allocated_bytes = stats.bytes_allocated
+	}
+
+
+private func baseline_populate_window(
+	operations: List[TypeHomeProfileOperation],
+) -> (List[LegacyTypeHome], TypeHomeProfileWindow):
+	var homes: List[LegacyTypeHome] = []
+	var window: TypeHomeProfileWindow = empty_window()
+
+	reset_mem_stats()
+	started: Int = now_microseconds()
+
+	for operation in operations:
+		recorded = legacy_record_type_home(homes, operation)
+		homes = recorded.homes
+		window = { window |
+			type_home_record_requests = window.type_home_record_requests + 1,
+			type_home_find_requests = window.type_home_find_requests + 1,
+			type_home_linear_candidates_visited = window.type_home_linear_candidates_visited + recorded.candidates_visited,
+			type_home_replacement_list_rebuilds = window.type_home_replacement_list_rebuilds + recorded.replacement_list_rebuilds,
+			semantic_checksum = window.semantic_checksum + homes.length()
+		}
+
+	elapsed: Int = now_microseconds() - started
+	stats = get_mem_stats()
+	(homes, window_with_memory(window, elapsed, stats))
+
+
+private func candidate_populate_window(
+	operations: List[TypeHomeProfileOperation],
+) -> (TypecheckState, TypeHomeProfileWindow):
+	var state: TypecheckState = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
+	var window: TypeHomeProfileWindow = empty_window()
+
+	reset_mem_stats()
+	started: Int = now_microseconds()
+
+	for operation in operations:
+		state = typecheck_state_record_type_home(
+			state,
+			operation.type_name,
+			operation.module_path,
+			operation.imported,
+		)
+
+		next_writes = if operation.writes_index:
+			window.type_home_index_writes + 1
+		else:
+			window.type_home_index_writes
+
+		next_checksum = if operation.writes_index:
+			window.semantic_checksum + operation.module_path.length()
+		else:
+			window.semantic_checksum
+
+		window = { window |
+			type_home_record_requests = window.type_home_record_requests + 1,
+			type_home_find_requests = window.type_home_find_requests + 1,
+			type_home_index_reads = window.type_home_index_reads + 1,
+			type_home_index_writes = next_writes,
+			semantic_checksum = next_checksum
+		}
+
+	elapsed: Int = now_microseconds() - started
+	stats = get_mem_stats()
+	(state, window_with_memory(window, elapsed, stats))
+
+
+private func baseline_lookup_window(
+	homes: List[LegacyTypeHome],
+	config: TypeHomeProfileConfig,
+) -> TypeHomeProfileWindow:
+	var window: TypeHomeProfileWindow = empty_window()
+
+	reset_mem_stats()
+	started: Int = now_microseconds()
+
+	for body_index in 0..config.body_count:
+		for query in 0..config.queries_per_body:
+			index = query_type_index(config, body_index, query)
+			name = type_name(index)
+			expected_path = expected_module_path(index)
+			expected_home_imported = expected_imported(index)
+			path_result = legacy_scan_home(homes, name)
+			imported_result = legacy_scan_home(homes, name)
+
+			valid = match (path_result.home, imported_result.home):
+				(Some(path_home), Some(imported_home)):
+					(
+						path_home.module_path == expected_path
+						and imported_home.imported == expected_home_imported
+					)
+				_:
+					False
+
+			checksum = match path_result.home:
+				Some(home):
+					if (
+						imported_result.home
+							.map(func(found): found.imported)
+							.get_or(False)
+					):
+						home.module_path.length() + 1
+					else:
+						home.module_path.length()
+				None:
+					0
+
+			window = { window |
+				type_home_find_requests = window.type_home_find_requests + 2,
+				type_home_linear_candidates_visited = window.type_home_linear_candidates_visited + path_result.candidates_visited + imported_result.candidates_visited,
+				semantic_checksum = window.semantic_checksum + checksum,
+				workload_valid = window.workload_valid and valid
+			}
+
+	elapsed: Int = now_microseconds() - started
+	stats = get_mem_stats()
+	window_with_memory(window, elapsed, stats)
+
+
+private func candidate_lookup_window(
+	state: TypecheckState,
+	config: TypeHomeProfileConfig,
+) -> TypeHomeProfileWindow:
+	var window: TypeHomeProfileWindow = empty_window()
+
+	reset_mem_stats()
+	started: Int = now_microseconds()
+
+	for body_index in 0..config.body_count:
+		body_state = typecheck_state_from_infer_session(infer_session_from_typecheck_state(state))
+
+		for query in 0..config.queries_per_body:
+			index = query_type_index(config, body_index, query)
+			name = type_name(index)
+			expected_path = expected_module_path(index)
+			expected_home_imported = expected_imported(index)
+			path = typecheck_state_find_type_home(body_state, name)
+			imported = typecheck_state_type_home_is_imported(body_state, name)
+			valid = path == Some(expected_path) and imported == expected_home_imported
+			checksum = path
+				.map(func(module_path): module_path.length())
+				.get_or(0)
+
+			next_checksum = if imported:
+				window.semantic_checksum + checksum + 1
+			else:
+				window.semantic_checksum + checksum
+
+			window = { window |
+				type_home_find_requests = window.type_home_find_requests + 2,
+				type_home_index_reads = window.type_home_index_reads + 2,
+				semantic_checksum = next_checksum,
+				workload_valid = window.workload_valid and valid
+			}
+
+	elapsed: Int = now_microseconds() - started
+	stats = get_mem_stats()
+	window_with_memory(window, elapsed, stats)
+
+
+private pure func checksum_mapping_entry(module_path: String, imported: Bool) -> Int:
+	if imported:
+		module_path.length() + 1
+	else:
+		module_path.length()
+
+
+private pure func validate_baseline_final_mapping(
+	homes: List[LegacyTypeHome],
+	visible_name_count: Int,
+) -> SingleMappingValidation:
+	var checksum: Int = 0
+	var valid: Bool = True
+
+	for index in 0..visible_name_count:
+		name = type_name(index)
+		expected_path = expected_module_path(index)
+		expected_home_imported = expected_imported(index)
+		legacy = legacy_scan_home(homes, name)
+
+		match legacy.home:
+			Some(home):
+				valid = (
+					valid
+					and home.module_path == expected_path
+					and home.imported == expected_home_imported
+				)
+
+				checksum += checksum_mapping_entry(home.module_path, home.imported)
+			None:
+				valid = False
+
+	{
+		checksum = checksum,
+		workload_valid = valid
+	}
+
+
+private pure func validate_candidate_final_mapping(
+	state: TypecheckState,
+	visible_name_count: Int,
+) -> SingleMappingValidation:
+	var checksum: Int = 0
+	var valid: Bool = True
+
+	for index in 0..visible_name_count:
+		name = type_name(index)
+		expected_path = expected_module_path(index)
+		expected_home_imported = expected_imported(index)
+		candidate_path = typecheck_state_find_type_home(state, name)
+		candidate_imported = typecheck_state_type_home_is_imported(state, name)
+
+		match candidate_path:
+			Some(module_path):
+				valid = (
+					valid
+					and module_path == expected_path
+					and candidate_imported == expected_home_imported
+				)
+
+				checksum += checksum_mapping_entry(module_path, candidate_imported)
+			None:
+				valid = False
+
+	{
+		checksum = checksum,
+		workload_valid = valid
+	}
+
+
+private pure func validate_final_mappings(
+	homes: List[LegacyTypeHome],
+	state: TypecheckState,
+	visible_name_count: Int,
+) -> FinalMappingValidation:
+	baseline = validate_baseline_final_mapping(homes, visible_name_count)
+	candidate = validate_candidate_final_mapping(state, visible_name_count)
+
+	{
+		baseline_checksum = baseline.checksum,
+		candidate_checksum = candidate.checksum,
+		workload_valid = (
+			baseline.workload_valid
+			and candidate.workload_valid
+			and baseline.checksum == candidate.checksum
+		)
+	}
+
+
+private pure func combine_windows(
+	left: TypeHomeProfileWindow,
+	right: TypeHomeProfileWindow,
+) -> TypeHomeProfileWindow:
+	{
+		elapsed_microseconds = left.elapsed_microseconds + right.elapsed_microseconds,
+		type_home_record_requests = left.type_home_record_requests + right.type_home_record_requests,
+		type_home_find_requests = left.type_home_find_requests + right.type_home_find_requests,
+		type_home_linear_candidates_visited = left.type_home_linear_candidates_visited + right.type_home_linear_candidates_visited,
+		type_home_replacement_list_rebuilds = left.type_home_replacement_list_rebuilds + right.type_home_replacement_list_rebuilds,
+		type_home_index_reads = left.type_home_index_reads + right.type_home_index_reads,
+		type_home_index_writes = left.type_home_index_writes + right.type_home_index_writes,
+		body_session_index_rebuilds = left.body_session_index_rebuilds + right.body_session_index_rebuilds,
+		semantic_checksum = left.semantic_checksum + right.semantic_checksum,
+		total_allocations = left.total_allocations + right.total_allocations,
+		total_releases = left.total_releases + right.total_releases,
+		retained_objects = left.retained_objects + right.retained_objects,
+		allocated_bytes = left.allocated_bytes + right.allocated_bytes,
+		workload_valid = left.workload_valid and right.workload_valid
+	}
+
+
+private pure func profile_result_from_windows(
+	config: TypeHomeProfileConfig,
+	baseline_populate: TypeHomeProfileWindow,
+	candidate_populate: TypeHomeProfileWindow,
+	baseline_lookup: TypeHomeProfileWindow,
+	candidate_lookup: TypeHomeProfileWindow,
+	validation: FinalMappingValidation,
+) -> TypeHomeProfileResult:
+	candidate_total = combine_windows(candidate_populate, candidate_lookup)
+	workload_valid = (
+		baseline_populate.workload_valid
+		and candidate_populate.workload_valid
+		and baseline_lookup.workload_valid
+		and candidate_lookup.workload_valid
+		and baseline_lookup.semantic_checksum == candidate_lookup.semantic_checksum
+		and validation.workload_valid
+	)
+
+	{
+		visible_name_count = config.visible_name_count,
+		body_count = config.body_count,
+		queries_per_body = config.queries_per_body,
+		window_order = config.window_order,
+		profile_mode = config.profile_mode,
+		baseline_populate = baseline_populate,
+		candidate_populate = candidate_populate,
+		baseline_lookup = baseline_lookup,
+		candidate_lookup = candidate_lookup,
+		baseline_final_mapping_checksum = validation.baseline_checksum,
+		candidate_final_mapping_checksum = validation.candidate_checksum,
+		candidate_index_read_requests = candidate_total.type_home_index_reads,
+		candidate_planned_index_writes = candidate_total.type_home_index_writes,
+		candidate_structural_linear_scan_sites = 0,
+		candidate_structural_replacement_rebuild_sites = 0,
+		type_home_record_requests = candidate_total.type_home_record_requests,
+		type_home_find_requests = candidate_total.type_home_find_requests,
+		type_home_linear_candidates_visited = candidate_total.type_home_linear_candidates_visited,
+		type_home_replacement_list_rebuilds = candidate_total.type_home_replacement_list_rebuilds,
+		type_home_index_reads = candidate_total.type_home_index_reads,
+		type_home_index_writes = candidate_total.type_home_index_writes,
+		body_session_index_rebuilds = candidate_total.body_session_index_rebuilds,
+		semantic_checksum = validation.candidate_checksum,
+		elapsed_microseconds = candidate_total.elapsed_microseconds,
+		total_allocations = candidate_total.total_allocations,
+		total_releases = candidate_total.total_releases,
+		retained_objects = candidate_total.retained_objects,
+		allocated_bytes = candidate_total.allocated_bytes,
+		workload_valid = workload_valid
+	}
+
+
+private pure func profile_result_from_baseline_lookup(
+	config: TypeHomeProfileConfig,
+	baseline_lookup: TypeHomeProfileWindow,
+	validation: SingleMappingValidation,
+) -> TypeHomeProfileResult:
+	workload_valid = (
+		baseline_lookup.workload_valid
+		and validation.workload_valid
+		and baseline_lookup.semantic_checksum > 0
+		and validation.checksum > 0
+	)
+
+	{
+		visible_name_count = config.visible_name_count,
+		body_count = config.body_count,
+		queries_per_body = config.queries_per_body,
+		window_order = config.window_order,
+		profile_mode = config.profile_mode,
+		baseline_populate = empty_window(),
+		candidate_populate = empty_window(),
+		baseline_lookup = baseline_lookup,
+		candidate_lookup = empty_window(),
+		baseline_final_mapping_checksum = validation.checksum,
+		candidate_final_mapping_checksum = 0,
+		candidate_index_read_requests = 0,
+		candidate_planned_index_writes = 0,
+		candidate_structural_linear_scan_sites = 0,
+		candidate_structural_replacement_rebuild_sites = 0,
+		type_home_record_requests = 0,
+		type_home_find_requests = baseline_lookup.type_home_find_requests,
+		type_home_linear_candidates_visited = baseline_lookup.type_home_linear_candidates_visited,
+		type_home_replacement_list_rebuilds = 0,
+		type_home_index_reads = 0,
+		type_home_index_writes = 0,
+		body_session_index_rebuilds = 0,
+		semantic_checksum = validation.checksum,
+		elapsed_microseconds = baseline_lookup.elapsed_microseconds,
+		total_allocations = baseline_lookup.total_allocations,
+		total_releases = baseline_lookup.total_releases,
+		retained_objects = baseline_lookup.retained_objects,
+		allocated_bytes = baseline_lookup.allocated_bytes,
+		workload_valid = workload_valid
+	}
+
+
+private pure func profile_result_from_candidate_lookup(
+	config: TypeHomeProfileConfig,
+	candidate_lookup: TypeHomeProfileWindow,
+	validation: SingleMappingValidation,
+) -> TypeHomeProfileResult:
+	workload_valid = (
+		candidate_lookup.workload_valid
+		and validation.workload_valid
+		and candidate_lookup.semantic_checksum > 0
+		and validation.checksum > 0
+	)
+
+	{
+		visible_name_count = config.visible_name_count,
+		body_count = config.body_count,
+		queries_per_body = config.queries_per_body,
+		window_order = config.window_order,
+		profile_mode = config.profile_mode,
+		baseline_populate = empty_window(),
+		candidate_populate = empty_window(),
+		baseline_lookup = empty_window(),
+		candidate_lookup = candidate_lookup,
+		baseline_final_mapping_checksum = 0,
+		candidate_final_mapping_checksum = validation.checksum,
+		candidate_index_read_requests = candidate_lookup.type_home_index_reads,
+		candidate_planned_index_writes = 0,
+		candidate_structural_linear_scan_sites = 0,
+		candidate_structural_replacement_rebuild_sites = 0,
+		type_home_record_requests = 0,
+		type_home_find_requests = candidate_lookup.type_home_find_requests,
+		type_home_linear_candidates_visited = 0,
+		type_home_replacement_list_rebuilds = 0,
+		type_home_index_reads = candidate_lookup.type_home_index_reads,
+		type_home_index_writes = 0,
+		body_session_index_rebuilds = candidate_lookup.body_session_index_rebuilds,
+		semantic_checksum = validation.checksum,
+		elapsed_microseconds = candidate_lookup.elapsed_microseconds,
+		total_allocations = candidate_lookup.total_allocations,
+		total_releases = candidate_lookup.total_releases,
+		retained_objects = candidate_lookup.retained_objects,
+		allocated_bytes = candidate_lookup.allocated_bytes,
+		workload_valid = workload_valid
+	}
+
+
+func compiler_type_home_index_profile(config: TypeHomeProfileConfig) -> TypeHomeProfileResult:
+	operations = operation_plan(config.visible_name_count)
+
+	if config.profile_mode == PROFILE_MODE_BASELINE_LOOKUP_ONLY:
+		baseline_homes = build_baseline_homes(operations)
+		baseline_lookup = baseline_lookup_window(baseline_homes, config)
+		validation = validate_baseline_final_mapping(
+			baseline_homes,
+			config.visible_name_count,
+		)
+		profile_result_from_baseline_lookup(config, baseline_lookup, validation)
+	else if config.profile_mode == PROFILE_MODE_CANDIDATE_LOOKUP_ONLY:
+		candidate_state = build_candidate_state(operations)
+		candidate_lookup = candidate_lookup_window(candidate_state, config)
+		validation = validate_candidate_final_mapping(
+			candidate_state,
+			config.visible_name_count,
+		)
+		profile_result_from_candidate_lookup(config, candidate_lookup, validation)
+	else if config.window_order % 2 == 0:
+		(baseline_homes, baseline_populate) = baseline_populate_window(operations)
+		(candidate_state, candidate_populate) = candidate_populate_window(operations)
+		baseline_lookup = baseline_lookup_window(baseline_homes, config)
+		candidate_lookup = candidate_lookup_window(candidate_state, config)
+		validation = validate_final_mappings(
+			baseline_homes,
+			candidate_state,
+			config.visible_name_count,
+		)
+		profile_result_from_windows(
+			config,
+			baseline_populate,
+			candidate_populate,
+			baseline_lookup,
+			candidate_lookup,
+			validation,
+		)
+	else:
+		(candidate_state, candidate_populate) = candidate_populate_window(operations)
+		(baseline_homes, baseline_populate) = baseline_populate_window(operations)
+		candidate_lookup = candidate_lookup_window(candidate_state, config)
+		baseline_lookup = baseline_lookup_window(baseline_homes, config)
+		validation = validate_final_mappings(
+			baseline_homes,
+			candidate_state,
+			config.visible_name_count,
+		)
+		profile_result_from_windows(
+			config,
+			baseline_populate,
+			candidate_populate,
+			baseline_lookup,
+			candidate_lookup,
+			validation,
+		)
+
+
+private pure func default_config(args: List[String]) -> TypeHomeProfileConfig:
+	{
+		visible_name_count = positive_argument(args, 1, 1024),
+		body_count = positive_argument(args, 2, 256),
+		queries_per_body = positive_argument(args, 3, 64),
+		window_order = positive_argument(args, 4, 0),
+		profile_mode = profile_mode_argument(args, 5)
+	}
+
+
+func main(args: List[String]) -> Int:
+	result = compiler_type_home_index_profile(default_config(args))
+
+	print(
+		"TYPE_HOME_INDEX_PROFILE" + " visible_name_count=" + result.visible_name_count.to_string() + " body_count=" + result.body_count.to_string() + " queries_per_body=" + result.queries_per_body.to_string() + " window_order=" + result.window_order.to_string() + " profile_mode=" + result.profile_mode.to_string() + " measurement_mode=" + profile_mode_label(result.profile_mode) + " selected_elapsed_microseconds=" + result.elapsed_microseconds.to_string() + " selected_semantic_checksum=" + result.semantic_checksum.to_string() + " baseline_populate_microseconds=" + result.baseline_populate.elapsed_microseconds.to_string() + " candidate_populate_microseconds=" + result.candidate_populate.elapsed_microseconds.to_string() + " baseline_lookup_microseconds=" + result.baseline_lookup.elapsed_microseconds.to_string() + " candidate_lookup_microseconds=" + result.candidate_lookup.elapsed_microseconds.to_string() + " baseline_type_home_record_requests=" + result.baseline_populate.type_home_record_requests.to_string() + " candidate_type_home_record_requests=" + result.candidate_populate.type_home_record_requests.to_string() + " baseline_type_home_find_requests=" + (result.baseline_populate.type_home_find_requests + result.baseline_lookup.type_home_find_requests).to_string() + " candidate_type_home_find_requests=" + result.type_home_find_requests.to_string() + " baseline_linear_candidates_visited=" + (result.baseline_populate.type_home_linear_candidates_visited + result.baseline_lookup.type_home_linear_candidates_visited).to_string() + " candidate_structural_linear_scan_sites=" + result.candidate_structural_linear_scan_sites.to_string() + " baseline_replacement_list_rebuilds=" + result.baseline_populate.type_home_replacement_list_rebuilds.to_string() + " candidate_structural_replacement_rebuild_sites=" + result.candidate_structural_replacement_rebuild_sites.to_string() + " candidate_index_read_requests=" + result.candidate_index_read_requests.to_string() + " candidate_planned_index_writes=" + result.candidate_planned_index_writes.to_string() + " body_session_index_rebuilds=" + result.body_session_index_rebuilds.to_string() + " lookup_semantic_checksum=" + selected_lookup_semantic_checksum(result).to_string() + " baseline_final_mapping_checksum=" + result.baseline_final_mapping_checksum.to_string() + " candidate_final_mapping_checksum=" + result.candidate_final_mapping_checksum.to_string() + " semantic_checksum=" + result.semantic_checksum.to_string() + " baseline_total_allocations=" + (result.baseline_populate.total_allocations + result.baseline_lookup.total_allocations).to_string() + " candidate_total_allocations=" + result.total_allocations.to_string() + " baseline_total_releases=" + (result.baseline_populate.total_releases + result.baseline_lookup.total_releases).to_string() + " candidate_total_releases=" + result.total_releases.to_string() + " candidate_lookup_total_allocations=" + result.candidate_lookup.total_allocations.to_string() + " candidate_lookup_total_releases=" + result.candidate_lookup.total_releases.to_string() + " candidate_lookup_retained_objects=" + result.candidate_lookup.retained_objects.to_string() + " retained_objects=" + result.retained_objects.to_string() + " allocated_bytes=" + result.allocated_bytes.to_string() + " workload_valid=" + result.workload_valid.to_string(),
+	)
+
+	if result.workload_valid:
+		0
+	else:
+		1
