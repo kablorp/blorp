@@ -19,7 +19,13 @@ import:
 		typecheck_graph,
 		typechecked_module_path,
 	../../../src/compiler/stage_06_typecheck/decl:
-		TypedDecl(TypedFunctionDecl, TypedImplDecl, TypedPrivateDecl, TypedUnionDecl),
+		TypedDecl(
+			TypedFunctionDecl,
+			TypedGlobalVarDecl,
+			TypedImplDecl,
+			TypedPrivateDecl,
+			TypedUnionDecl,
+		),
 		TypedProgram,
 	../../../src/compiler/stage_06_typecheck/graph/definition_index:
 		DefinitionTable,
@@ -27,7 +33,7 @@ import:
 	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton: callable_id_module_id
 	../../../src/compiler/stage_06_typecheck/infer:
 		ResolvedCallTarget(ResolvedGraphCallableCall, ResolvedSelectedTraitMethodCall),
-		TypedExpr(TypedBlockExpr, TypedCallExpr),
+		TypedExpr(TypedBlockExpr, TypedCallExpr, TypedIntLiteralExpr),
 		resolved_call_callable_id,
 		typed_expr_resolved_call,
 	../../../src/compiler/stage_06_typecheck/trace:
@@ -102,6 +108,40 @@ pure func typecheck_program_fixture(
 	source: String,
 ) -> FinalizedTypecheckProgram:
 	TypecheckTestSupport.finalized_typecheck_program_fixture(path, module_name, source)
+
+
+pure func typecheck_import_module_fixture(
+	module_path: String,
+	source: String,
+) -> TypecheckImportModule:
+	path = module_path + ".brp"
+	{
+		path = path,
+		module_name = module_path,
+		module_path = module_path,
+		text = source,
+		typecheck_program = Some(typecheck_program_fixture(path, module_path, source)),
+		module_surface = None,
+		origin = UserModule
+	}
+
+
+pure func typed_program_global_int(program: TypedProgram, name: String) -> Option[String]:
+	var result: Option[String] = None
+
+	for decl in program.decls:
+		match decl:
+			TypedGlobalVarDecl(info):
+				if info.decl.name.text == name:
+					match info.value:
+						TypedIntLiteralExpr(text, _, _):
+							result = Some(text)
+						_:
+							void
+			_:
+				void
+
+	result
 
 
 pure func ctfe_reachability_chain_module(index: Int, module_count: Int) -> TypecheckImportModule:
@@ -1347,9 +1387,7 @@ func test_typecheck_graph_evaluates_shared_ctfe_dependency() -> Bool:
 			False
 
 
-private func ctfe_collision_dependency_program(
-	artifact_paths: List[String],
-) -> Option[String]:
+private func ctfe_collision_dependency_program(artifact_paths: List[String]) -> Option[String]:
 	base_source: String =
 		|answer: Int = match 41:
 		|	Ready: Ready
@@ -1382,13 +1420,15 @@ private func ctfe_collision_dependency_program(
 		|main_answer: Int = next_answer
 	target: JsonValue = user_import_module_json("main", "main", target_source)
 
-	match streamed_graph_responses(
-		typecheck_graph_request(
-			target,
-			[base, dep, left, right],
-			artifact_paths,
-		),
-		4,
+	match (
+		streamed_graph_responses(
+			typecheck_graph_request(
+				target,
+				[base, dep, left, right],
+				artifact_paths,
+			),
+			4,
+		)
 	):
 		Some(responses):
 			all_evaluated = responses.all(func(response):
@@ -1460,6 +1500,212 @@ func test_typecheck_graph_evaluates_transitive_ctfe_dependencies_first() -> Bool
 			)
 		None:
 			False
+
+
+func test_typecheck_graph_orders_globals_across_cyclic_source_imports() -> Bool:
+	left_source: String =
+		|import:
+		|	right: right_value
+		|
+		|left_value: Int = 40
+		|
+		|pure func left_helper() -> Int:
+		|	right_value
+	left = typecheck_import_module_fixture("left", left_source)
+	right_source: String =
+		|import:
+		|	left: left_value
+		|
+		|right_value: Int = left_value + 1
+	right = typecheck_import_module_fixture("right", right_source)
+	target_source: String =
+		|import:
+		|	left: left_value
+		|	right: right_value
+		|
+		|final_answer: Int = right_value + 1
+	target = typecheck_import_module_fixture("main", target_source)
+	graph = typecheck_graph({
+		target = target,
+		modules = [left, right],
+		module_targets = [],
+		resolved_imports = [],
+		include_comments = False,
+		allow_debug_only_calls = False,
+	})
+
+	(
+		graph.target.errors.is_empty()
+		and graph.target.ctfe_evaluated
+		and typed_program_global_int(graph.target.typed_program, "final_answer") == Some("42")
+	)
+
+
+func test_typecheck_graph_resolves_qualified_global_across_cyclic_source_imports() -> Bool:
+	left_source: String =
+		|import:
+		|	right
+		|
+		|left_value: Int = 40
+		|
+		|pure func left_helper() -> Int:
+		|	right.right_value
+	left = typecheck_import_module_fixture("left", left_source)
+	right_source: String =
+		|import:
+		|	left as Left
+		|
+		|right_value: Int = Left.left_value + 1
+	right = typecheck_import_module_fixture("right", right_source)
+	target_source: String =
+		|import:
+		|	left: left_value
+		|	right: right_value
+		|
+		|final_answer: Int = right_value + 1
+	target = typecheck_import_module_fixture("main", target_source)
+	graph = typecheck_graph({
+		target = target,
+		modules = [left, right],
+		module_targets = [],
+		resolved_imports = [],
+		include_comments = False,
+		allow_debug_only_calls = False,
+	})
+
+	(
+		graph.target.errors.is_empty()
+		and graph.target.ctfe_evaluated
+		and typed_program_global_int(graph.target.typed_program, "final_answer") == Some("42")
+	)
+
+
+func test_typecheck_graph_refreshes_global_lambda_imports_across_source_cycle() -> Bool:
+	left_source: String =
+		|import:
+		|	right: getter
+		|
+		|left_value: Int = 40
+	left = typecheck_import_module_fixture("left", left_source)
+	right_source: String =
+		|import:
+		|	left: left_value
+		|
+		|getter: pure () -> Int = pure func(): left_value + 1
+	right = typecheck_import_module_fixture("right", right_source)
+	target_source: String =
+		|import:
+		|	left: left_value
+		|	right: getter
+		|
+		|final_answer: Int = getter() + 1
+	target = typecheck_import_module_fixture("main", target_source)
+	graph = typecheck_graph({
+		target = target,
+		modules = [left, right],
+		module_targets = [],
+		resolved_imports = [],
+		include_comments = False,
+		allow_debug_only_calls = False,
+	})
+
+	(
+		graph.target.errors.is_empty()
+		and graph.target.ctfe_evaluated
+		and typed_program_global_int(graph.target.typed_program, "final_answer") == Some("42")
+	)
+
+
+func test_typecheck_graph_resolves_global_lambda_alias_in_defining_module() -> Bool:
+	base_source: String = "value: Int = 41"
+	base = typecheck_import_module_fixture("base", base_source)
+	wrong_source: String = "value: Int = 99"
+	wrong = typecheck_import_module_fixture("wrong", wrong_source)
+	right_source: String =
+		|import:
+		|	base as Dep
+		|
+		|getter: pure () -> Int = pure func(): Dep.value
+	right = typecheck_import_module_fixture("right", right_source)
+	target_source: String =
+		|import:
+		|	wrong as Dep
+		|	right: getter
+		|
+		|final_answer: Int = getter()
+	target = typecheck_import_module_fixture("main", target_source)
+	graph = typecheck_graph({
+		target = target,
+		modules = [base, wrong, right],
+		module_targets = [],
+		resolved_imports = [],
+		include_comments = False,
+		allow_debug_only_calls = False,
+	})
+
+	(
+		graph.target.errors.is_empty()
+		and graph.target.ctfe_evaluated
+		and typed_program_global_int(graph.target.typed_program, "final_answer") == Some("41")
+	)
+
+
+func test_typecheck_graph_ignores_unused_imports_in_global_lambdas() -> Bool:
+	left_source: String =
+		|import:
+		|	right: right_getter
+		|
+		|left_getter: pure () -> Int = pure func(): 1
+	left = typecheck_import_module_fixture("left", left_source)
+	right_source: String =
+		|import:
+		|	left: left_getter
+		|
+		|right_getter: pure () -> Int = pure func(): 2
+	right = typecheck_import_module_fixture("right", right_source)
+	target_source: String =
+		|import:
+		|	left: left_getter
+		|	right: right_getter
+		|
+		|final_answer: Int = left_getter() + right_getter()
+	target = typecheck_import_module_fixture("main", target_source)
+	graph = typecheck_graph({
+		target = target,
+		modules = [left, right],
+		module_targets = [],
+		resolved_imports = [],
+		include_comments = False,
+		allow_debug_only_calls = False,
+	})
+
+	(
+		graph.target.errors.is_empty()
+		and graph.target.ctfe_evaluated
+		and typed_program_global_int(graph.target.typed_program, "final_answer") == Some("3")
+	)
+
+
+func test_typecheck_source_global_lambda_reads_prior_global() -> Bool:
+	target_source: String =
+		|offset: Int = 40
+		|getter: pure () -> Int = pure func(): offset + 1
+		|answer: Int = getter() + 1
+	target = typecheck_import_module_fixture("main", target_source)
+	graph = typecheck_graph({
+		target = target,
+		modules = [],
+		module_targets = [],
+		resolved_imports = [],
+		include_comments = False,
+		allow_debug_only_calls = False,
+	})
+
+	(
+		graph.target.errors.is_empty()
+		and graph.target.ctfe_evaluated
+		and typed_program_global_int(graph.target.typed_program, "answer") == Some("42")
+	)
 
 
 func test_typecheck_graph_follows_ctfe_dependency_through_function_only_module() -> Bool:
@@ -3417,21 +3663,29 @@ private pure func typed_function_body_call_module(
 								Some(call):
 									match call.target:
 										ResolvedGraphCallableCall(callable_id, _):
-											result = callable_id_module_id(definition_table, callable_id)
-												.and_then(func(module_id):
-													module_table_canonical_path(
-														definition_table_module_table(definition_table),
-														module_id,
-													).map(func(path): (module_id, path))
+											result = callable_id_module_id(
+												definition_table,
+												callable_id,
+											).and_then(func(module_id):
+												module_table_canonical_path(
+													definition_table_module_table(definition_table),
+													module_id,
+												).map(
+													func(path): (module_id, path),
 												)
+											)
 										ResolvedSelectedTraitMethodCall(_, callable_id):
-											result = callable_id_module_id(definition_table, callable_id)
-												.and_then(func(module_id):
-													module_table_canonical_path(
-														definition_table_module_table(definition_table),
-														module_id,
-													).map(func(path): (module_id, path))
+											result = callable_id_module_id(
+												definition_table,
+												callable_id,
+											).and_then(func(module_id):
+												module_table_canonical_path(
+													definition_table_module_table(definition_table),
+													module_id,
+												).map(
+													func(path): (module_id, path),
 												)
+											)
 										_:
 											void
 								None:
@@ -3456,8 +3710,13 @@ private pure func typed_expr_callee_call_module_path(
 				Some(call):
 					match call.target:
 						ResolvedSelectedTraitMethodCall(_, callable_id):
-							callable_id_module_id(definition_table, callable_id).and_then(
-								func(module_id): module_table_canonical_path(
+							callable_id_module_id(
+								definition_table,
+								callable_id,
+							).and_then(
+								func(
+									module_id,
+								): module_table_canonical_path(
 									definition_table_module_table(definition_table),
 									module_id,
 								),
@@ -4417,6 +4676,30 @@ tests: TestSuite = {
 		(
 			"typecheck_graph evaluates transitive CTFE dependencies first",
 			test_typecheck_graph_evaluates_transitive_ctfe_dependencies_first,
+		),
+		(
+			"typecheck_graph orders globals across cyclic source imports",
+			test_typecheck_graph_orders_globals_across_cyclic_source_imports,
+		),
+		(
+			"typecheck_graph resolves qualified global across cyclic source imports",
+			test_typecheck_graph_resolves_qualified_global_across_cyclic_source_imports,
+		),
+		(
+			"typecheck_graph refreshes global lambda imports across source cycle",
+			test_typecheck_graph_refreshes_global_lambda_imports_across_source_cycle,
+		),
+		(
+			"typecheck_graph resolves global lambda alias in defining module",
+			test_typecheck_graph_resolves_global_lambda_alias_in_defining_module,
+		),
+		(
+			"typecheck_graph ignores unused imports in global lambdas",
+			test_typecheck_graph_ignores_unused_imports_in_global_lambdas,
+		),
+		(
+			"typecheck_source global lambda reads prior global",
+			test_typecheck_source_global_lambda_reads_prior_global,
 		),
 		(
 			"typecheck_graph follows CTFE dependency through function-only module",

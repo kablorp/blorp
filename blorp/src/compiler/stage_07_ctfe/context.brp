@@ -41,23 +41,27 @@ union CtfeImportBinding:
 
 
 private union CtfeImportedProgramRep:
-	CompleteCtfeImportedProgram(ModuleId, List[TypedDecl], List[CtfeImportBinding])
-	DeclarationOnlyCtfeImportedProgram(ModuleId, List[TypedDecl], List[CtfeImportBinding])
-	SelectiveCtfeImportedProgram(ModuleId, List[TypedDecl], List[TypedFunctionInfo], List[CtfeImportBinding])
+	CompleteCtfeImportedProgram(DefinitionTable, ModuleId, List[TypedDecl], List[CtfeImportBinding])
+	DeclarationOnlyCtfeImportedProgram(DefinitionTable, ModuleId, List[TypedDecl], List[CtfeImportBinding])
+	SelectiveCtfeImportedProgram(DefinitionTable, ModuleId, List[TypedDecl], List[TypedFunctionInfo], List[CtfeImportBinding])
 
 
 opaque type CtfeImportedProgram = CtfeImportedProgramRep
 
 
 pure func complete_ctfe_imported_program(
+	definition_table: DefinitionTable,
 	module_id: ModuleId,
 	decls: List[TypedDecl],
 	import_bindings: List[CtfeImportBinding],
 ) -> CtfeImportedProgram:
-	into_opaque CtfeImportedProgram(CompleteCtfeImportedProgram(module_id, decls, import_bindings))
+	into_opaque CtfeImportedProgram(
+		CompleteCtfeImportedProgram(definition_table, module_id, decls, import_bindings)
+	)
 
 
 pure func selective_ctfe_imported_program(
+	definition_table: DefinitionTable,
 	module_id: ModuleId,
 	decls: List[TypedDecl],
 	selected_functions: List[TypedFunctionInfo],
@@ -65,31 +69,49 @@ pure func selective_ctfe_imported_program(
 ) -> CtfeImportedProgram:
 	if selected_functions.is_empty():
 		into_opaque CtfeImportedProgram(
-			DeclarationOnlyCtfeImportedProgram(module_id, decls, import_bindings)
+			DeclarationOnlyCtfeImportedProgram(definition_table, module_id, decls, import_bindings)
 		)
 	else:
 		into_opaque CtfeImportedProgram(
-			SelectiveCtfeImportedProgram(module_id, decls, selected_functions, import_bindings)
+			SelectiveCtfeImportedProgram(
+				definition_table,
+				module_id,
+				decls,
+				selected_functions,
+				import_bindings,
+			)
 		)
+
+
+private pure func ctfe_imported_program_definition_table(
+	program: CtfeImportedProgram,
+) -> DefinitionTable:
+	match from_opaque CtfeImportedProgram(program):
+		CompleteCtfeImportedProgram(definition_table, _, _, _):
+			definition_table
+		DeclarationOnlyCtfeImportedProgram(definition_table, _, _, _):
+			definition_table
+		SelectiveCtfeImportedProgram(definition_table, _, _, _, _):
+			definition_table
 
 
 pure func ctfe_imported_program_module_id(program: CtfeImportedProgram) -> ModuleId:
 	match from_opaque CtfeImportedProgram(program):
-		CompleteCtfeImportedProgram(module_id, _, _):
+		CompleteCtfeImportedProgram(_, module_id, _, _):
 			module_id
-		DeclarationOnlyCtfeImportedProgram(module_id, _, _):
+		DeclarationOnlyCtfeImportedProgram(_, module_id, _, _):
 			module_id
-		SelectiveCtfeImportedProgram(module_id, _, _, _):
+		SelectiveCtfeImportedProgram(_, module_id, _, _, _):
 			module_id
 
 
 pure func ctfe_imported_program_decls(program: CtfeImportedProgram) -> List[TypedDecl]:
 	match from_opaque CtfeImportedProgram(program):
-		CompleteCtfeImportedProgram(_, decls, _):
+		CompleteCtfeImportedProgram(_, _, decls, _):
 			decls
-		DeclarationOnlyCtfeImportedProgram(_, decls, _):
+		DeclarationOnlyCtfeImportedProgram(_, _, decls, _):
 			decls
-		SelectiveCtfeImportedProgram(_, decls, _, _):
+		SelectiveCtfeImportedProgram(_, _, decls, _, _):
 			decls
 
 
@@ -97,16 +119,16 @@ pure func ctfe_imported_program_functions(
 	program: CtfeImportedProgram,
 ) -> Option[List[TypedFunctionInfo]]:
 	match from_opaque CtfeImportedProgram(program):
-		CompleteCtfeImportedProgram(_, decls, _):
+		CompleteCtfeImportedProgram(_, _, decls, _):
 			functions = typed_decls_function_infos(decls)
 
 			if functions.is_empty():
 				None
 			else:
 				Some(functions)
-		DeclarationOnlyCtfeImportedProgram(_, _, _):
+		DeclarationOnlyCtfeImportedProgram(_, _, _, _):
 			None
-		SelectiveCtfeImportedProgram(_, _, selected_functions, _):
+		SelectiveCtfeImportedProgram(_, _, _, selected_functions, _):
 			Some(selected_functions)
 
 
@@ -114,11 +136,11 @@ pure func ctfe_imported_program_import_bindings(
 	program: CtfeImportedProgram,
 ) -> List[CtfeImportBinding]:
 	match from_opaque CtfeImportedProgram(program):
-		CompleteCtfeImportedProgram(_, _, import_bindings):
+		CompleteCtfeImportedProgram(_, _, _, import_bindings):
 			import_bindings
-		DeclarationOnlyCtfeImportedProgram(_, _, import_bindings):
+		DeclarationOnlyCtfeImportedProgram(_, _, _, import_bindings):
 			import_bindings
-		SelectiveCtfeImportedProgram(_, _, _, import_bindings):
+		SelectiveCtfeImportedProgram(_, _, _, _, import_bindings):
 			import_bindings
 
 
@@ -128,8 +150,9 @@ private record CtfeImportedProgramSetRep {
 }
 
 
--- Imported modules are one CTFE phase product. Retain the graph authority once
--- here rather than once per imported module.
+-- Imported modules are one CTFE phase product. The set retains its aggregate
+-- graph authority, while each program carries the same table as a provenance
+-- brand so programs from another definition snapshot cannot be laundered into it.
 opaque type CtfeImportedProgramSet = CtfeImportedProgramSetRep
 
 
@@ -155,17 +178,24 @@ private pure func ctfe_imported_program_set_definition_table(
 	from_opaque CtfeImportedProgramSet(set).definition_table
 
 
-private pure func ctfe_imported_program_ids_are_valid(
-	module_table: ModuleTable,
+private pure func ctfe_imported_programs_are_valid(
+	definition_table: DefinitionTable,
 	programs: List[CtfeImportedProgram],
 ) -> Bool:
+	module_table = definition_table_module_table(definition_table)
 	var valid = True
 
 	for program in programs:
-		if module_table_canonical_path(
-			module_table,
-			ctfe_imported_program_module_id(program),
-		).is_none():
+		if (
+			not definition_tables_share_provenance(
+				definition_table,
+				ctfe_imported_program_definition_table(program),
+			)
+			or module_table_canonical_path(
+				module_table,
+				ctfe_imported_program_module_id(program),
+			).is_none()
+		):
 			valid = False
 			break
 
@@ -720,7 +750,7 @@ private pure func ctfe_context_domain_is_valid(
 			definition_table,
 			ctfe_imported_program_set_definition_table(imported_program_set),
 		)
-		and ctfe_imported_program_ids_are_valid(module_table, imported_programs)
+		and ctfe_imported_programs_are_valid(definition_table, imported_programs)
 	)
 
 

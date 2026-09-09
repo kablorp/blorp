@@ -114,6 +114,7 @@ Evaluation state must be explicit. A suitable private model is:
 private union CtfeModuleGlobalEvaluation:
 	CtfeModuleGlobalsUnrequested
 	CtfeModuleGlobalsEvaluating
+	CtfeModuleGlobalsWaiting(ModuleId)
 	CtfeModuleGlobalsEvaluated(CtfeEnv)
 	CtfeModuleGlobalsRejected(CtfeEvalError)
 
@@ -124,9 +125,10 @@ record CtfeEvaluatedGlobalGraph {
 ```
 
 The exact public/private placement may differ, but the states may not be
-represented by nullable parallel lists or sentinel module IDs. `Evaluating` is
-needed to distinguish a cycle from an unrequested module. `Rejected` retains
-the exact error that every dependent artifact must observe.
+represented by nullable parallel lists or sentinel module IDs. `Evaluating`
+distinguishes a started module from an unrequested module. `Waiting` records
+the exact pending module whose global was read, while `Rejected` retains the
+exact error that every dependent artifact must observe.
 
 Index `modules` with the existing module-table index only after proving the
 `ModuleId` belongs to the same compatible table. Do not cache by canonical path
@@ -164,18 +166,25 @@ For each planned module:
 2. require every imported module environment it actually references;
 3. construct its import environment from already evaluated module results;
 4. install unavailable declarations in source order;
-5. evaluate its declarations into one exported `CtfeEnv` once;
-6. store its exported global environment; and
-7. mark it `Evaluated`, or store the exact `Rejected` error.
+5. evaluate its declarations into one exported `CtfeEnv`;
+6. if evaluation reads a pending dependency, push that exact module onto an
+   explicit owner stack and retry only the waiting owner after it completes;
+7. store its exported global environment; and
+8. mark it `Evaluated`, or store the exact `Rejected` error.
 
-Stage 06 already constructs the CTFE dependency list dependency-first by a
-visited-module traversal of the exact artifact closures. The implementation
-preserves that order instead of sorting or densifying it. Stage 04 owns module
-cycle rejection; Stage 07 retains explicit `Unrequested`, `Evaluating`,
-`Evaluated`, and `Rejected` states so duplicate starts and impossible reentry
-fail closed without imposing all source-import edges on CTFE. This distinction
-matters because source import graphs include type/function-only edges that are
-not global-evaluation dependencies.
+Stage 06 normally constructs the CTFE dependency list dependency-first by a
+visited-module traversal of the exact artifact closures. Source-module cycles
+are legal, however, so that order alone is not a proof that every global value
+is ready. Stage 07 initially marks planned module globals as pending. If an
+initializer actually reads a pending imported global, its module enters an
+explicit waiting state and is retried only after that exact dependency reaches
+a terminal state. Encountering a module already on the explicit owner stack is
+therefore a real global-evaluation cycle, not merely a source import cycle. The
+lowest module-table index in that cycle owns the deterministic error; upstream
+dependents and disjoint cycles preserve their own errors. Type-only and
+function-only import edges do not create false global dependencies. The
+ordinary dependency-first case still completes in one pass and does not pay
+for repeated graph scans or native recursion.
 
 ## Artifact Consumption
 
@@ -310,19 +319,40 @@ Stage 06 supplies its existing dependency-first `CtfeImportedProgramSet`.
 Stage 07 evaluates each unique planned module once, records its terminal
 environment or exact rejection, and installs only the subset in each artifact's
 own imported-program set before rewriting that target once. Repeated entries in
-the plan are detected without retaining a second dense program catalog.
+the plan are detected with one temporary dense, module-indexed program catalog;
+that catalog is discarded after graph construction and is not retained by the
+evaluated result.
 
 The legacy single-program and imported-environment entry points now delegate to
-the graph evaluator. Graph construction errors remain errors; the bridge no
-longer converts them into permission to resume the repeated per-artifact route.
-The normal and traced bridge paths use the same graph-owned implementation.
+the graph evaluator. Each opaque `CtfeImportedProgram` is branded with the exact
+`DefinitionTable` supplied at its construction, and the containing
+`CtfeImportedProgramSet` retains the same authority. Context construction checks
+both levels by allocation identity, so wrapping a foreign program in a local
+set cannot reinterpret its numeric module or definition IDs. Graph construction
+errors remain errors; the bridge no longer converts them into permission to
+resume the repeated per-artifact route. The normal and traced bridge paths use
+the same graph-owned implementation.
 
-Stage 04 remains the authority for source-module import-cycle rejection. Stage
-07 deliberately does not reinterpret every source import binding as a global
-initializer dependency: type-only and function-only imports can participate in
-valid source graphs without requiring a module global environment. The explicit
-`Evaluating` state therefore protects impossible duplicate/reentrant starts,
-while the Stage 06 dependency-first plan defines valid evaluation order.
+Stage 04 permits and terminates source-module import cycles. Stage 07 therefore
+does not reinterpret every source import binding as a global initializer
+dependency. Instead it observes only pending module-global values actually read
+by CTFE execution, waits on that module's state, and propagates its exact
+terminal environment or rejection. The ordinary dependency-first plan remains
+single-pass; one grow-only work stack with a logical length handles the unusual
+legal back-edge without per-root membership tables, prefix-copy pops, quadratic
+whole-plan rescans, or native recursion. The stack is scanned only after an
+actual back-edge is observed. Mutable globals are marked runtime-initialized
+immediately and can never manufacture a pending cycle.
+
+CTFE lambdas retain only local lexical bindings plus their defining module ID.
+They resolve immutable globals through the defining module's context when
+called. After every planned module reaches a terminal state, Stage 07 rebuilds
+each successful module's shallow imported-binding layer once from completed
+module environments, using the same first-entry module catalog that drove
+evaluation. This refresh is included in `import_binding_applications`. Pending
+placeholders therefore cannot escape inside a lambda, while an unused import
+cannot become a false lambda dependency. Lambda body translation and nested
+evaluation also use the defining module as the active alias-resolution context.
 
 ## Fast Feedback Loop
 
@@ -350,9 +380,12 @@ bin/blorp run --release \
 For five iterations, 24 modules, and 32 functions, the benchmark asserts three
 artifacts per iteration, 120 planned modules, 120 starts, zero duplicate
 evaluations, five global-declaration evaluations, 120 dependency body checks,
-an evaluated answer of 24, and a stable semantic checksum. The existing
-body-materialization metric remains independent of the new global-evaluation
-metrics.
+an evaluated answer of 24, consumer 1 rewritten to 41, consumer 2 rewritten to
+42, and a stable identity-sensitive semantic checksum of 4,860. Associating
+each value with its module prevents the benchmark from accepting an empty,
+stale, or cross-artifact-swapped evaluated-global graph merely because its work
+counters look correct. The existing body-materialization metric remains
+independent of the new global-evaluation metrics.
 
 During cutover:
 
@@ -379,6 +412,13 @@ evaluation counters from baseline and candidate.
 - [x] Each artifact installs environments only from its exact dependency
       closure; an evaluated but unimported sibling cannot satisfy or shadow a
       global lookup.
+- [x] A legal cyclic source-import graph with an acyclic global-value
+      dependency succeeds regardless of the Stage 06 discovery back-edge.
+- [x] A true cycle between compile-time global values is rejected
+      deterministically, while type-only and function-only import cycles do not
+      become false value cycles.
+- [x] Compatibility entry points preserve the exact definition-table
+      provenance carried by `CtfeImportedProgramSet`.
 - [x] On the compiler self-check, the former 1,748 imported-module evaluation
       count falls to at most the number of unique planned evaluated modules.
 - [x] Selective imported-global binding applications fall by at least 50% from
@@ -395,7 +435,8 @@ evaluation counters from baseline and candidate.
 - [x] Successful programs, exact errors, diagnostic order, and output hashes
       match the baseline.
 - [x] Owned Stage 07 work falls substantially: dependency evaluations fall
-      84.95% and imported-binding applications fall 83.73%. A separate
+      84.95% and imported-binding applications, including the terminal refresh,
+      fall 67.46%. A separate
       Stage-07-only hardware counter window is not available; the whole-check
       retired-instruction result exceeds its 3% gate.
 - [x] Median optimized self-check wall time does not regress and shows a
@@ -405,13 +446,17 @@ evaluation counters from baseline and candidate.
 
 ## Measured Performance
 
+The following tables are the initial graph cutover measurement against the
+immediate parent. The later cyclic-source correction preserves that cutover;
+its fresh deterministic verification follows the tables.
+
 The same captured compiler self-check request was used for the immediate-parent
 baseline and candidate inventory:
 
 | Work | Baseline | Candidate | Change |
 | --- | ---: | ---: | ---: |
 | Dependency-module global evaluations | 1,748 | 263 | -84.95% |
-| Imported-binding applications | 140,921 | 22,927 | -83.73% |
+| Imported-binding applications | 140,921 | 45,854 | -67.46% |
 | Planned unique dependency modules | 263 | 263 | unchanged |
 | Rejected module evaluations | 0 | 0 | unchanged |
 
@@ -428,6 +473,27 @@ Five alternating optimized compiler self-check pairs produced:
 The successful response hash remained identical. Peak memory is effectively
 neutral, while deterministic owned work and whole-check instruction count both
 show the intended reduction.
+
+The original candidate counter covered the 22,927 evaluation-time applications
+but omitted the equal-sized terminal refresh. The corrected candidate total in
+the table includes both passes. After the cyclic-source correction, a fresh
+compiler-sized inventory contained 23,049 evaluation-time applications and
+the same 23,049 refresh applications: 46,098 honestly reported applications,
+263 planned modules, 263 starts, zero duplicates, 895 global-declaration
+attempts, and zero rejected modules. That request includes the correction's
+additional source and therefore is not used as a direct replacement for the
+captured baseline table above; relative to that baseline it would still be a
+67.29% reduction.
+
+The final production-shaped 5 x 24 x 32 benchmark reported 1,275,445
+allocations, 1,275,440 releases, five retained objects/320 bytes, 120 planned
+modules, 120 starts, zero duplicates, 230 honestly counted import-binding
+applications, five global declarations, and checksum 4,860. Compared with the
+earlier pending-state prototype on the same corrected fixture, tracked
+allocations increased by 1,415 (0.111%) while retained objects and bytes
+remained identical. This is the bounded cost of exact per-program provenance,
+the grow-only owner stack, and the final shallow import refresh; the graph-wide
+elimination remains orders of magnitude larger.
 
 ## Pitfalls and Gotchas
 

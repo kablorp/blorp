@@ -8,7 +8,7 @@ import:
 		TypecheckResolvedImport,
 		TypecheckedGraph,
 		typecheck_graph_with_metrics,
-	../../src/compiler/stage_06_typecheck/decl: TypedDecl(TypedGlobalVarDecl)
+	../../src/compiler/stage_06_typecheck/decl: TypedDecl(TypedGlobalVarDecl), TypedProgram
 	../../src/compiler/stage_06_typecheck/infer: TypedExpr(TypedIntLiteralExpr)
 	parsed_program_fixture as ParsedProgramFixture
 	string: parse_int
@@ -44,8 +44,6 @@ struct CompilerCtfeTypecheckBenchmarkResult {
 	workload_valid: Bool
 }
 
-
-private TARGET_GLOBAL_DECLARATION_INDEX: Int = 1
 
 private TARGET_DECLARATION_COUNT: Int = 3
 
@@ -290,16 +288,29 @@ private pure func expected_dependency_declarations(
 	module_count * functions_per_module + module_count - 1
 
 
+private pure func evaluated_program_global_int(
+	program: TypedProgram,
+	global_name: String,
+) -> Option[Int]:
+	var result: Option[Int] = None
+
+	for decl in program.decls:
+		match decl:
+			TypedGlobalVarDecl(info):
+				if info.decl.name.text == global_name:
+					match info.value:
+						TypedIntLiteralExpr(text, _, _):
+							result = parse_int(text)
+						_:
+							void
+			_:
+				void
+
+	result
+
+
 private pure func evaluated_target_answer(graph: TypecheckedGraph) -> Option[Int]:
-	match graph.target.typed_program.decls.get(TARGET_GLOBAL_DECLARATION_INDEX):
-		Some(TypedGlobalVarDecl(info)):
-			match info.value:
-				TypedIntLiteralExpr(text, _, _):
-					parse_int(text)
-				_:
-					None
-		_:
-			None
+	evaluated_program_global_int(graph.target.typed_program, "answer")
 
 
 pure func compiler_ctfe_typecheck_benchmark_with_request(
@@ -351,6 +362,8 @@ pure func compiler_ctfe_typecheck_benchmark_with_request(
 		target_declaration_count = graph.target.parsed_program.decls.length()
 		error_count += graph.target.errors.length()
 		var module_artifacts_valid: Bool = True
+		var first_consumer_value: Option[Int] = None
+		var second_consumer_value: Option[Int] = None
 
 		for module in graph.modules:
 			error_count += module.errors.length()
@@ -359,6 +372,17 @@ pure func compiler_ctfe_typecheck_benchmark_with_request(
 				and module.errors.is_empty()
 				and module.ctfe_evaluated
 			)
+
+			consumer_value = evaluated_program_global_int(module.typed_program, "CONSUMER_VALUE")
+
+			match consumer_value:
+				Some(value):
+					if module.parsed_program.source.path == "/bench/ctfe_typecheck_profile_consumer_1.brp":
+						first_consumer_value = Some(value)
+					else if module.parsed_program.source.path == "/bench/ctfe_typecheck_profile_consumer_2.brp":
+						second_consumer_value = Some(value)
+				None:
+					void
 
 		if graph.target.ctfe_evaluated:
 			ctfe_evaluated_count += 1
@@ -369,6 +393,11 @@ pure func compiler_ctfe_typecheck_benchmark_with_request(
 			None:
 				evaluated_answer = -1
 
+		consumer_values_valid: Bool = if request.module_targets.length() == 2:
+			first_consumer_value == Some(41) and second_consumer_value == Some(42)
+		else:
+			first_consumer_value.is_none() and second_consumer_value.is_none()
+
 		workload_valid = (
 			workload_valid
 			and artifact_count == request.module_targets.length() + 1
@@ -378,10 +407,13 @@ pure func compiler_ctfe_typecheck_benchmark_with_request(
 			and graph.target.errors.length() == 0
 			and graph.target.ctfe_evaluated
 			and module_artifacts_valid
+			and consumer_values_valid
 			and evaluated_answer == expected_answer
 		)
 
-		checksum += artifact_count + dependency_declarations + target_declaration_count + request.resolved_imports.length() + evaluated_answer
+		checksum += artifact_count + dependency_declarations + target_declaration_count + request.resolved_imports.length() + evaluated_answer + first_consumer_value.get_or(
+			0,
+		) + 2 * second_consumer_value.get_or(0)
 
 	{
 		artifact_count = artifact_count,

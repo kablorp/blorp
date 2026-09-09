@@ -21,17 +21,17 @@ import:
 		ctfe_context_imported_function_by_callable_id,
 		ctfe_context_imported_functions_by_source,
 		ctfe_context_module_global_env,
-		ctfe_context_module_global_value,
 		ctfe_context_module_path,
 	env:
 		CTFE_ENV_EMPTY,
-		CtfeEnvError,
+		CtfeEnvError(CtfeImmutableAssignment, CtfeUnavailableBinding, CtfeUnknownBinding),
 		ctfe_assign_value,
 		ctfe_bind_local_value,
 		ctfe_bind_mutable_local_value,
 		ctfe_env_concat,
 		ctfe_env_error_message,
 		ctfe_global_bindings,
+		ctfe_local_bindings,
 		ctfe_lookup_value,
 		ctfe_project_existing_bindings,
 	intrinsic:
@@ -221,6 +221,7 @@ import:
 		CtfeError,
 		CtfeLambdaPayload,
 		CtfeResolvedConstructorId,
+		CtfeUnavailableGlobalReason(CtfePendingModuleGlobal),
 		CtfeValue,
 		CtfeValueDesc(
 			CtfeConstructorValue,
@@ -240,7 +241,6 @@ import:
 		ctfe_bool,
 		ctfe_char,
 		ctfe_constructor_info,
-		ctfe_resolved_constructor_info_from_id,
 		ctfe_error_message,
 		ctfe_eval_binary,
 		ctfe_eval_unary,
@@ -251,6 +251,7 @@ import:
 		ctfe_float,
 		ctfe_function_reference,
 		ctfe_int,
+		ctfe_resolved_constructor_info_from_id,
 		ctfe_string,
 		ctfe_value,
 		ctfe_values_equal,
@@ -273,6 +274,7 @@ union CtfeEvalError:
 	CtfeEvalInvalid(String)
 	CtfeEvalUnsupported(String)
 	CtfeEvalInModule(String, CtfeEvalError)
+	CtfeEvalPendingModuleGlobals(ModuleId)
 
 
 private union CtfeBlockItemResult:
@@ -307,6 +309,8 @@ pure func ctfe_eval_error_message(error: CtfeEvalError) -> String:
 			"while evaluating global constants in imported module '${module_path}': " + ctfe_eval_error_message(
 				cause,
 			)
+		CtfeEvalPendingModuleGlobals(_):
+			"compile-time dependency globals are not available yet"
 
 
 private pure func ctfe_eval_value_result(
@@ -429,6 +433,18 @@ private pure func ctfe_eval_literal(expr: CtfeIrExpr, literal: CtfeIrLiteral) ->
 			ctfe_char(expr.span, to_char(value))
 
 
+private pure func ctfe_pending_module_from_env_error(error: CtfeEnvError) -> Option[ModuleId]:
+	match error:
+		CtfeUnavailableBinding(_, reason):
+			match reason:
+				CtfePendingModuleGlobal(module_id):
+					Some(module_id)
+				_:
+					None
+		_:
+			None
+
+
 private pure func ctfe_eval_identifier(
 	env: CtfeEnv,
 	expr: CtfeIrExpr,
@@ -440,7 +456,11 @@ private pure func ctfe_eval_identifier(
 				Ok(value):
 					Ok(value)
 				Err(error):
-					Err(CtfeEvalEnvError(error))
+					match ctfe_pending_module_from_env_error(error):
+						Some(module_id):
+							Err(CtfeEvalPendingModuleGlobals(module_id))
+						None:
+							Err(CtfeEvalEnvError(error))
 		CtfeIrNullaryConstructorReference(constructor):
 			Ok(ctfe_value(
 				expr.value_type,
@@ -681,16 +701,23 @@ private pure func ctfe_eval_imported_global(
 	context: CtfeContext,
 	imported: CtfeIrImportedGlobal,
 ) -> Result[CtfeValue, CtfeEvalError]:
-	match ctfe_context_module_global_value(context, imported.module_id, imported.name):
-		Some(value):
+	match ctfe_lookup_value(
+		ctfe_context_module_global_env(context, imported.module_id),
+		imported.name,
+	):
+		Ok(value):
 			Ok(value)
-		None:
-			module_path ?= ctfe_eval_module_path(context, imported.module_id)
-			Err(
-				CtfeEvalInvalid(
-					"global constant initializer cannot reference imported value '" + module_path + "." + imported.name + "' because it is not a compile-time constant",
-				),
-			)
+		Err(error):
+			match ctfe_pending_module_from_env_error(error):
+				Some(module_id):
+					Err(CtfeEvalPendingModuleGlobals(module_id))
+				None:
+					module_path ?= ctfe_eval_module_path(context, imported.module_id)
+					Err(
+						CtfeEvalInvalid(
+							"global constant initializer cannot reference imported value '" + module_path + "." + imported.name + "' because it is not a compile-time constant",
+						),
+					)
 
 
 private pure func ctfe_eval_module_path(
@@ -1063,10 +1090,20 @@ private pure func ctfe_eval_lambda_call(
 		Err(CtfeEvalUnsupported("impure closure calls"))
 	else:
 		param_env ?= ctfe_bind_lambda_params(closure.source.params, arg_values)
-		body_ir ?= ctfe_eval_translate_result(ctfe_ir_from_typed_expr(context, closure.source.body))
+		lambda_context = { context | active_module_id = closure.defining_module_id }
+		body_ir ?= ctfe_eval_translate_result(
+			ctfe_ir_from_typed_expr(
+				lambda_context,
+				closure.source.body,
+			),
+		)
+		module_globals = ctfe_context_module_global_env(lambda_context, closure.defining_module_id)
 		ctfe_eval_ir_in_context(
-			context,
-			ctfe_env_concat(param_env, closure.env),
+			lambda_context,
+			ctfe_env_concat(
+				param_env,
+				ctfe_env_concat(closure.env, module_globals),
+			),
 			body_ir,
 		)
 
@@ -1324,10 +1361,12 @@ private pure func ctfe_eval_callback(value: CtfeValue) -> Result[CtfeCallback, C
 	match value.desc:
 		CtfeFunctionReferenceValue(reference):
 			if reference.is_pure:
-				Ok(CtfeNamedCallback(
-					callable_id_definition_id(reference.callable_id),
-					reference.source_name,
-				))
+				Ok(
+					CtfeNamedCallback(
+						callable_id_definition_id(reference.callable_id),
+						reference.source_name,
+					),
+				)
 			else:
 				Err(CtfeEvalUnsupported("impure callback calls"))
 		CtfeLambdaValue(closure):
@@ -2536,10 +2575,7 @@ private pure func ctfe_eval_call(
 					CtfeConstructorValue({
 						name = direct.source_name,
 						args = arg_values,
-						constructor_info = ctfe_constructor_info(
-							parent_type,
-							arg_values.length(),
-						),
+						constructor_info = ctfe_constructor_info(parent_type, arg_values.length()),
 					}),
 					expr.span,
 				))
@@ -3039,7 +3075,8 @@ private pure func ctfe_eval_ir_in_context(
 				expr.value_type,
 				CtfeLambdaValue({
 					source = lambda,
-					env = env,
+					defining_module_id = context.active_module_id,
+					env = ctfe_local_bindings(env),
 				}),
 				expr.span,
 			))
