@@ -56,7 +56,7 @@ only one active entry per visible name.
 Use one private key/value authority:
 
 ```blorp
-private struct TypeHomeEntry {
+private record TypeHomeEntry {
 	module_path: String,
 	imported: Bool
 }
@@ -64,9 +64,10 @@ private struct TypeHomeEntry {
 opaque type TypeHomeIndex = Dict[String, TypeHomeEntry]
 ```
 
-The visible type spelling exists only as the dictionary key. Do not duplicate
-`type_name` inside `TypeHomeEntry`, because key/value disagreement would then be
-representable.
+`TypeHomeEntry` is a record because `String` is managed storage and therefore
+cannot be stored in a struct. The visible type spelling exists only as the
+dictionary key. Do not duplicate `type_name` inside `TypeHomeEntry`, because
+key/value disagreement would then be representable.
 
 Expose semantic operations rather than the dictionary:
 

@@ -102,7 +102,7 @@ linear work.
 Make the one-entry-per-visible-name invariant explicit:
 
 ```blorp
-private struct TypeHomeEntry {
+private record TypeHomeEntry {
 	module_path: String,
 	imported: Bool
 }
