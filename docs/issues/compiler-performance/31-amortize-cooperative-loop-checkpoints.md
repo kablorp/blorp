@@ -1,6 +1,8 @@
 # Amortize Cooperative Loop Checkpoints
 
-**Status:** Proposed
+**Status:** Runtime-only Phase A dispatched to
+[the parallel-safe execution issue](../parallel-safe/05-amortize-cooperative-checkpoints-phase-a.md).
+This file retains the broader historical roadmap, including gated Phase B.
 
 ## Objective
 

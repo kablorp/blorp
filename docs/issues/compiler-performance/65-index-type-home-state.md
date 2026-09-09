@@ -1,6 +1,8 @@
 # Index Type-Home State
 
-**Status:** Ready; Issue 64 completed 2026-09-09
+**Status:** Dispatched to
+[the parallel-safe execution issue](../parallel-safe/03-index-type-home-state.md),
+which is now the implementation source of truth.
 
 **Roadmap:** [Stage 06 Latency Reduction Roadmap](STAGE06_LATENCY_REDUCTION_ROADMAP.md)
 
