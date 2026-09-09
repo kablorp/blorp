@@ -1,12 +1,22 @@
 import:
-	../../src/compiler/pipeline: FrontendCompilePolicy
+	../../src/compiler/pipeline:
+		CompilerPhase(
+			ArtifactConstructionPhase,
+			BackendEmissionPhase,
+			CoreLoweringPhase,
+			EarlyCorePhase,
+			LateCorePhase,
+			RuntimeProjectionPhase,
+			TypedFrontendPhase,
+		),
+		FrontendCompilePolicy,
+		compiler_phase_label,
 	../../src/compiler/stage_09_core/ir:
 		CoreCallKind(SelectedDirectCall, UserCall),
 		CoreDecl(FunctionDecl),
 		CoreExpr(CallExpr),
 		CoreProgram,
 	../../src/compiler/stage_09_core/traverse: immediate_core_expr_children
-	../../src/main: run_cli
 	../../src/lib/cli_plan: CliRunPlan(CliRunCompile)
 	../../src/lib/compilation:
 		CompileExecution(CompileStopped),
@@ -14,6 +24,9 @@ import:
 		execute_compile_plan,
 		prepare_compile_plan_with_frontend_policy,
 		prepare_compile_plan_with_typed_validation,
+	../../src/lib/compilation_timing: CompileTiming
+	../../src/lib/compile_plan_execute: execute_compile_plan_timed
+	../../src/main: run_cli
 	io: print_error
 	system: remove_file, temp_dir, write_file
 	test: TestSuite
@@ -21,6 +34,22 @@ import:
 
 private func write_source(path: String, source: String) -> Bool:
 	write_file(path, source).is_ok()
+
+
+private pure func timing_labels(timings: List[CompileTiming]) -> List[String]:
+	timings.map(func(timing): compiler_phase_label(timing.phase))
+
+
+private pure func successful_phase_labels() -> List[String]:
+	[
+		"typed_frontend",
+		"core_lowering",
+		"early_core",
+		"runtime_projection",
+		"late_core",
+		"backend_emission",
+		"artifact_construction",
+	]
 
 
 private pure func call_targets_def_id(expr: CoreExpr, target_def_id: Int) -> Bool:
@@ -197,6 +226,122 @@ func test_early_stop_returns_requested_core_snapshot() -> Bool:
 				False
 
 
+func test_timed_compile_reports_seven_phase_labels() -> Bool:
+	path: String = temp_dir() + "/blorp_cli_execute_phase_timing_success.brp"
+	_ = remove_file(path)
+
+	if not write_source(path, "func main(args: List[String]) -> Int:\n\t0\n"):
+		False
+	else:
+		plan = run_cli(["compile", "--no-format", path])
+		_ = remove_file(path)
+
+		match plan:
+			CliRunCompile(compile_plan):
+				timed = execute_compile_plan_timed(compile_plan, True)
+
+				(
+					timing_labels(timed.timings) == successful_phase_labels()
+					and timed.timings.all(func(timing): timing.microseconds >= 0)
+				)
+			_:
+				False
+
+
+func test_timed_compile_type_error_reports_typed_frontend_only() -> Bool:
+	path: String = temp_dir() + "/blorp_cli_execute_phase_timing_type_error.brp"
+	_ = remove_file(path)
+	source: String =
+		|func main(args: List[String]) -> Int:
+		|	"wrong"
+
+	if not write_source(path, source):
+		False
+	else:
+		plan = run_cli(["compile", "--no-format", path])
+		_ = remove_file(path)
+
+		match plan:
+			CliRunCompile(compile_plan):
+				timed = execute_compile_plan_timed(compile_plan, True)
+				timing_labels(timed.timings) == ["typed_frontend"]
+			_:
+				False
+
+
+func test_timed_compile_early_stop_reports_reached_phases() -> Bool:
+	path: String = temp_dir() + "/blorp_cli_execute_phase_timing_early_stop.brp"
+	_ = remove_file(path)
+
+	if not write_source(path, "func main(args: List[String]) -> Int:\n\t0\n"):
+		False
+	else:
+		plan = run_cli([
+			"compile",
+			"--no-format",
+			"--dump-core-after=desugar",
+			"--stop-after=desugar",
+			path,
+		])
+		_ = remove_file(path)
+
+		match plan:
+			CliRunCompile(compile_plan):
+				timed = execute_compile_plan_timed(compile_plan, True)
+				timing_labels(timed.timings) == ["typed_frontend", "core_lowering", "early_core"]
+			_:
+				False
+
+
+func test_timed_compile_late_stop_reports_reached_phases() -> Bool:
+	path: String = temp_dir() + "/blorp_cli_execute_phase_timing_late_stop.brp"
+	_ = remove_file(path)
+
+	if not write_source(path, "func main(args: List[String]) -> Int:\n\t0\n"):
+		False
+	else:
+		plan = run_cli([
+			"compile",
+			"--no-format",
+			"--dump-core-after=dce",
+			"--stop-after=dce",
+			path,
+		])
+		_ = remove_file(path)
+
+		match plan:
+			CliRunCompile(compile_plan):
+				timed = execute_compile_plan_timed(compile_plan, True)
+				timing_labels(
+					timed.timings,
+				) == [
+					"typed_frontend",
+					"core_lowering",
+					"early_core",
+					"runtime_projection",
+					"late_core",
+				]
+			_:
+				False
+
+
+func test_timing_disabled_reports_no_phase_rows() -> Bool:
+	path: String = temp_dir() + "/blorp_cli_execute_phase_timing_disabled.brp"
+	_ = remove_file(path)
+
+	if not write_source(path, "func main(args: List[String]) -> Int:\n\t0\n"):
+		False
+	else:
+		plan = run_cli(["compile", "--no-format", path])
+		_ = remove_file(path)
+
+		match plan:
+			CliRunCompile(compile_plan):
+				execute_compile_plan_timed(compile_plan, False).timings.length() == 0
+			_:
+				False
+
+
 tests: TestSuite = {
 	description = "Blorp CLI frontend boundaries",
 	tests = [
@@ -212,5 +357,19 @@ tests: TestSuite = {
 			"early stop returns the requested Core snapshot",
 			test_early_stop_returns_requested_core_snapshot,
 		),
+		("timed compile reports seven phase labels", test_timed_compile_reports_seven_phase_labels),
+		(
+			"timed compile type error reports typed frontend only",
+			test_timed_compile_type_error_reports_typed_frontend_only,
+		),
+		(
+			"timed compile early stop reports reached phases",
+			test_timed_compile_early_stop_reports_reached_phases,
+		),
+		(
+			"timed compile late stop reports reached phases",
+			test_timed_compile_late_stop_reports_reached_phases,
+		),
+		("timing disabled reports no phase rows", test_timing_disabled_reports_no_phase_rows),
 	]
 }

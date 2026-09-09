@@ -281,6 +281,107 @@ $RUN_OUTPUT"
     fi
 }
 
+expect_timing_labels() {
+    local name="$1"
+    local expected_code="$2"
+    local expected_csv="$3"
+    local parse_file
+    shift 3
+
+    TOTAL=$((TOTAL + 1))
+    run_capture "" "$@"
+
+    if [ "$RUN_CODE" -ne "$expected_code" ]; then
+        record_fail "$name" "expected exit $expected_code, got $RUN_CODE
+$RUN_OUTPUT"
+    else
+        parse_file=$(mktemp "$TMPDIR_CLI/timing.XXXXXX") || exit 1
+        printf '%s\n' "$RUN_OUTPUT" > "$parse_file"
+        if python3 - "$expected_csv" "$parse_file" <<'PY'
+import sys
+
+expected = sys.argv[1].split(",") if sys.argv[1] else []
+path = sys.argv[2]
+labels = []
+in_timing = False
+
+with open(path, encoding="utf-8", errors="replace") as output:
+    lines = output.readlines()
+
+for line in lines:
+    line = line.rstrip("\n")
+    if line == "Compiler phase timings":
+        in_timing = True
+        continue
+    if in_timing:
+        if "\t" not in line:
+            break
+        label = line.split("\t", 1)[0]
+        if label not in {"phase_total", "outer_total"}:
+            labels.append(label)
+
+if labels != expected:
+    print(f"expected timing labels {expected}, got {labels}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+        then
+            record_pass "$name"
+        else
+            record_fail "$name" "$RUN_OUTPUT"
+        fi
+        rm -f "$parse_file"
+    fi
+}
+
+expect_memory_checkpoint_labels() {
+    local name="$1"
+    local expected_code="$2"
+    local expected_csv="$3"
+    local parse_file
+    shift 3
+
+    TOTAL=$((TOTAL + 1))
+    run_capture "" "$@"
+
+    if [ "$RUN_CODE" -ne "$expected_code" ]; then
+        record_fail "$name" "expected exit $expected_code, got $RUN_CODE
+$RUN_OUTPUT"
+    else
+        parse_file=$(mktemp "$TMPDIR_CLI/memory.XXXXXX") || exit 1
+        printf '%s\n' "$RUN_OUTPUT" > "$parse_file"
+        if python3 - "$expected_csv" "$parse_file" <<'PY'
+import sys
+
+expected = sys.argv[1].split(",") if sys.argv[1] else []
+path = sys.argv[2]
+labels = []
+
+with open(path, encoding="utf-8", errors="replace") as output:
+    lines = output.readlines()
+
+for line in lines:
+    if not line.startswith("BLORP_COMPILER_MEMORY_CHECKPOINT "):
+        continue
+    fields = dict(
+        part.split("=", 1)
+        for part in line.split()
+        if "=" in part
+    )
+    labels.append(fields.get("phase", ""))
+
+if labels != expected:
+    print(f"expected checkpoint labels {expected}, got {labels}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+        then
+            record_pass "$name"
+        else
+            record_fail "$name" "$RUN_OUTPUT"
+        fi
+        rm -f "$parse_file"
+    fi
+}
+
 expect_test_signal_exit() {
     local name="$1"
     local signal_name="$2"
@@ -702,6 +803,12 @@ same_stem_doctest_left="$same_stem_doctest_left_dir/sample.brp"
 same_stem_doctest_right="$same_stem_doctest_right_dir/sample.brp"
 repeat_marker="$TMPDIR_CLI/repeat_marker.txt"
 compiled_c="$TMPDIR_CLI/valid.c"
+timed_phase_c="$TMPDIR_CLI/timed-phase.c"
+untimed_phase_c="$TMPDIR_CLI/untimed-phase.c"
+timed_invalid_c="$TMPDIR_CLI/timed-invalid.c"
+timed_early_stopped_c="$TMPDIR_CLI/timed-early-stopped.c"
+timed_late_stopped_c="$TMPDIR_CLI/timed-late-stopped.c"
+timed_memory_c="$TMPDIR_CLI/timed-memory.c"
 invariant_at_a_glance_c="$TMPDIR_CLI/invariant-at-a-glance.c"
 invariant_concurrent_duration_c="$TMPDIR_CLI/invariant-concurrent-duration.c"
 internal_synthetic_binary="$TMPDIR_CLI/internal-synthetic-program"
@@ -1247,6 +1354,67 @@ $(cat "$profile_signal_output")"
 fi
 expect_exit "compile succeeds through the production compiler" 0 \
 	"$BLORP_BIN" compile --no-format -o "$TMPDIR_CLI/direct-compile.c" "$valid_prog"
+phase_labels="typed_frontend,core_lowering,early_core,runtime_projection,late_core,backend_emission,artifact_construction"
+expect_timing_labels "compile time phases reports seven compiler phases" 0 "$phase_labels" \
+	"$BLORP_BIN" compile --no-format --no-embed-runtime --time-phases \
+		-o "$timed_phase_c" "$valid_prog"
+TOTAL=$((TOTAL + 1))
+if grep -qF $'phase_total\t' <<<"$RUN_OUTPUT" && grep -qF $'outer_total\t' <<<"$RUN_OUTPUT"; then
+	record_pass "compile time phases reports phase and outer totals"
+else
+	record_fail "compile time phases reports phase and outer totals" "$RUN_OUTPUT"
+fi
+expect_output_excludes "compile without time phases has no timing table" 0 \
+	"Compiler phase timings" \
+	"$BLORP_BIN" compile --no-format --no-embed-runtime \
+		-o "$untimed_phase_c" "$valid_prog"
+TOTAL=$((TOTAL + 1))
+if cmp -s "$timed_phase_c" "$untimed_phase_c"; then
+	record_pass "compile time phases leaves generated C unchanged"
+else
+	record_fail "compile time phases leaves generated C unchanged" \
+		"generated C differs between $timed_phase_c and $untimed_phase_c"
+fi
+expect_timing_labels "compile type failure times typed frontend only" 1 \
+	"typed_frontend" \
+	"$BLORP_BIN" compile --no-format --time-phases -o "$timed_invalid_c" "$invalid_prog"
+expect_timing_labels "compile early stop times reached phases" 0 \
+	"typed_frontend,core_lowering,early_core" \
+	"$BLORP_BIN" compile --no-format --time-phases \
+		--dump-core-after=desugar --stop-after=desugar \
+		-o "$timed_early_stopped_c" "$valid_prog"
+expect_timing_labels "compile late stop times reached phases" 0 \
+	"typed_frontend,core_lowering,early_core,runtime_projection,late_core" \
+	"$BLORP_BIN" compile --no-format --time-phases \
+		--dump-core-after=dce --stop-after=dce \
+		-o "$timed_late_stopped_c" "$resolved_identity_prog"
+expect_memory_checkpoint_labels "compiler memory checkpoints use phase labels" \
+	0 \
+	"typed_frontend_start,typed_frontend_complete,core_lowering_complete,early_core_complete,runtime_projection_complete,late_core_complete,backend_emission_complete,artifact_construction_complete" \
+	env BLORP_COMPILER_MEMORY_PROFILE=1 "$BLORP_BIN" compile --no-format \
+		--no-embed-runtime --time-phases -o "$timed_memory_c" "$valid_prog"
+expect_memory_checkpoint_labels "compiler memory checkpoints report typed frontend failure" \
+	1 \
+	"typed_frontend_start,typed_frontend_failed" \
+	env BLORP_COMPILER_MEMORY_PROFILE=1 "$BLORP_BIN" compile --no-format \
+		--time-phases -o "$timed_invalid_c" "$invalid_prog"
+expect_memory_checkpoint_labels "compiler memory checkpoints report early Core stop" \
+	0 \
+	"typed_frontend_start,typed_frontend_complete,core_lowering_complete,early_core_stopped" \
+	env BLORP_COMPILER_MEMORY_PROFILE=1 "$BLORP_BIN" compile --no-format \
+		--time-phases --dump-core-after=desugar --stop-after=desugar \
+		-o "$timed_early_stopped_c" "$valid_prog"
+expect_memory_checkpoint_labels "compiler memory checkpoints report late Core stop" \
+	0 \
+	"typed_frontend_start,typed_frontend_complete,core_lowering_complete,early_core_complete,runtime_projection_complete,late_core_stopped" \
+	env BLORP_COMPILER_MEMORY_PROFILE=1 "$BLORP_BIN" compile --no-format \
+		--time-phases --dump-core-after=dce --stop-after=dce \
+		-o "$timed_late_stopped_c" "$resolved_identity_prog"
+expect_memory_checkpoint_labels "compiler memory checkpoints report artifact publication failure" \
+	1 \
+	"typed_frontend_start,typed_frontend_complete,core_lowering_complete,early_core_complete,runtime_projection_complete,late_core_complete,backend_emission_complete,artifact_construction_complete,artifact_publication_failed" \
+	env BLORP_COMPILER_MEMORY_PROFILE=1 "$BLORP_BIN" compile --no-format \
+		--time-phases -o "$TMPDIR_CLI" "$valid_prog"
 expect_output_contains "compile AST remains in Blorp frontend" 0 "Func main" \
 	"$BLORP_BIN" compile --no-format --ast "$valid_prog"
 expect_output_contains "compile stops in Blorp-owned Core tail" 0 "stopped after dce" \

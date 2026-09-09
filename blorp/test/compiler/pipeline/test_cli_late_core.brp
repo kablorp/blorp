@@ -1,5 +1,7 @@
 import:
 	../../../src/compiler/pipeline:
+		ArtifactConstructionPhaseExecution(ArtifactConstructionPhaseFailed),
+		BackendEmissionPhaseExecution(BackendEmissionPhaseFailed, BackendEmissionPhaseReady),
 		COMPILER_PHASE_ORDER,
 		CompilerPhase(
 			ArtifactConstructionPhase,
@@ -10,24 +12,44 @@ import:
 			RuntimeProjectionPhase,
 			TypedFrontendPhase,
 		),
+		CompilerPhaseTerminalState(CompilerPhaseFailed, CompilerPhaseStopped),
+		CoreCompilation,
 		LateCoreExecution(LateCoreCompleted, LateCoreFailed, LateCoreStopped),
 		LateCoreStageAction(ObserveLateCoreStage, StopLateCoreStage),
 		LateCoreStageRequest,
+		compiler_phase_complete_checkpoint_label,
+		compiler_phase_label,
+		compiler_phase_terminal_checkpoint_label,
+		construct_backend_artifact,
+		emit_backend_c,
 		execute_late_core_stages,
 		late_core_invariant,
 	../../../src/compiler/stage_09_core/ir:
 		CoreCallKind(SelectedDirectCall),
 		CoreDecl(FunctionDecl, ValueRecordDecl),
 		CoreExpr(CallExpr, DebugBlockExpr, FieldExpr, LiteralExpr, RecordUpdateExpr, VarExpr),
-		CoreFunctionKind(ProgramEntrypointFunction, UserFunction),
+		CoreForeignArgPassing(ForeignBorrowArgs),
+		CoreFunctionKind(ForeignFunction, ProgramEntrypointFunction, UserFunction),
 		CoreLiteral(IntLiteral),
 		CoreProgram,
 		CoreSourceLoc(SyntheticSourceLoc),
 		CoreType(NamedType, ValueRecordType),
 		CoreVar,
 		core_program_to_json,
-	../../../src/compiler/stage_09_core/pipeline: prepared_core_program_value
-	../../../src/compiler/stage_09_core/pipeline_stage: CorePipelineStage(DceStage, FinalStage, PerceusStage)
+	../../../src/compiler/stage_09_core/pipeline: prepared_core_program, prepared_core_program_value
+	../../../src/compiler/stage_09_core/pipeline_stage:
+		CorePipelineStage(DceStage, FinalStage, PerceusStage),
+	../../../src/lib/build_artifact:
+		BuildArtifactConfiguration,
+		BuildOptimization(BuildFast),
+		BuildRuntimeRequirement(BuildExternalRuntime),
+		BuildSanitizer(BuildNoSanitizer),
+	../../../src/lib/compilation:
+		CompileExecution(CompileBuildArtifactFailed, CompileEmitFailed),
+		LateCoreCompileExecution,
+		PreparedCompileExecution,
+	../../../src/lib/compilation_timing: CompileTiming
+	../../../src/lib/compile_plan_execute: execute_backend_artifact_compile_tail_timed
 	test: TestSuite
 
 
@@ -45,6 +67,56 @@ pure func test_compiler_phase_order_is_explicit() -> Bool:
 		BackendEmissionPhase,
 		ArtifactConstructionPhase,
 	]
+
+
+pure func test_compiler_phase_labels_are_exhaustive() -> Bool:
+	(
+		COMPILER_PHASE_ORDER.map(
+			compiler_phase_label,
+		) == [
+			"typed_frontend",
+			"core_lowering",
+			"early_core",
+			"runtime_projection",
+			"late_core",
+			"backend_emission",
+			"artifact_construction",
+		]
+		and compiler_phase_complete_checkpoint_label(
+			BackendEmissionPhase,
+		) == "backend_emission_complete"
+		and compiler_phase_terminal_checkpoint_label(
+			LateCorePhase,
+			CompilerPhaseStopped,
+		) == "late_core_stopped"
+		and compiler_phase_terminal_checkpoint_label(
+			TypedFrontendPhase,
+			CompilerPhaseFailed,
+		) == "typed_frontend_failed"
+	)
+
+
+pure func artifact_configuration() -> BuildArtifactConfiguration:
+	{
+		runtime_requirement = BuildExternalRuntime,
+		native_features = [],
+		include_dirs = [],
+		source = {
+			path = "/tmp/main.brp",
+			module_name = "main"
+		},
+		compatibility = {
+			debug = False,
+			profile = False,
+			optimization = BuildFast,
+			sanitizer = BuildNoSanitizer,
+			leak_check = False
+		}
+	}
+
+
+private pure func timing_labels(timings: List[CompileTiming]) -> List[String]:
+	timings.map(func(timing): compiler_phase_label(timing.phase))
 
 
 pure func function_decl(
@@ -65,6 +137,147 @@ pure func function_decl(
 		def_id = def_id,
 		loc = SyntheticSourceLoc,
 	})
+
+
+pure func duplicate_definition_program() -> CoreProgram:
+	{
+		decls = [function_decl(
+				"main",
+				1,
+				LiteralExpr(IntLiteral(0), int_type(), SyntheticSourceLoc),
+				ProgramEntrypointFunction,
+			), function_decl(
+				"duplicate",
+				1,
+				LiteralExpr(IntLiteral(1), int_type(), SyntheticSourceLoc),
+				UserFunction,
+			)],
+		foreign_includes = []
+	}
+
+
+pure func invalid_foreign_link_program() -> CoreProgram:
+	foreign_decl: CoreDecl = FunctionDecl({
+		name = "native_call",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = int_type(),
+		body = None,
+		is_pure = True,
+		function_kind = ForeignFunction({
+			c_name = "native_call",
+			includes = [],
+			link_flags = [
+				{
+					platform = None,
+					flag = ""
+				},
+			],
+			arg_passing = ForeignBorrowArgs,
+		}),
+		def_id = 4,
+		loc = SyntheticSourceLoc,
+	})
+
+	{
+		decls = [foreign_decl, function_decl(
+				"main",
+				1,
+				LiteralExpr(IntLiteral(0), int_type(), SyntheticSourceLoc),
+				ProgramEntrypointFunction,
+			)],
+		foreign_includes = []
+	}
+
+
+pure func prepared_compile_execution(program: CoreProgram) -> PreparedCompileExecution:
+	compilation: CoreCompilation = {
+		target_path = "/tmp/main.brp",
+		target_module_name = "main",
+		program = program,
+		check_invariants = False
+	}
+
+	{
+		compilation = compilation,
+		configuration = artifact_configuration(),
+		late_stages = [],
+		typed_program_summary = None,
+		early_observations = []
+	}
+
+
+pure func late_core_compile_execution(program: CoreProgram) -> LateCoreCompileExecution:
+	prepared: PreparedCompileExecution = prepared_compile_execution(program)
+
+	{
+		prepared = prepared,
+		prepared_core = prepared_core_program(program),
+		observations = []
+	}
+
+
+pure func test_backend_emission_failure_stops_before_artifact_construction() -> Bool:
+	match emit_backend_c(
+		prepared_core_program(duplicate_definition_program()),
+		artifact_configuration(),
+	):
+		BackendEmissionPhaseFailed(message):
+			message.contains("definition ID")
+		BackendEmissionPhaseReady(emission):
+			match construct_backend_artifact(emission):
+				ArtifactConstructionPhaseFailed(_):
+					False
+				_:
+					False
+
+
+pure func test_artifact_construction_failure_happens_after_backend_emission() -> Bool:
+	match emit_backend_c(
+		prepared_core_program(invalid_foreign_link_program()),
+		artifact_configuration(),
+	):
+		BackendEmissionPhaseFailed(_):
+			False
+		BackendEmissionPhaseReady(emission):
+			match construct_backend_artifact(emission):
+				ArtifactConstructionPhaseFailed(message):
+					message.contains("invalid foreign link arguments")
+				_:
+					False
+
+
+func test_timed_backend_emission_failure_reports_backend_only() -> Bool:
+	timed = execute_backend_artifact_compile_tail_timed(
+		late_core_compile_execution(duplicate_definition_program()),
+		True,
+	)
+
+	match timed.execution:
+		CompileEmitFailed(message):
+			(
+				message.contains("definition ID")
+				and timing_labels(timed.timings) == ["backend_emission"]
+			)
+		_:
+			False
+
+
+func test_timed_artifact_construction_failure_reports_backend_and_artifact() -> Bool:
+	timed = execute_backend_artifact_compile_tail_timed(
+		late_core_compile_execution(invalid_foreign_link_program()),
+		True,
+	)
+
+	match timed.execution:
+		CompileBuildArtifactFailed(message):
+			(
+				message.contains("invalid foreign link arguments")
+				and timing_labels(timed.timings) == ["backend_emission", "artifact_construction"]
+			)
+		_:
+			False
 
 
 pure func selected_helper_call() -> CoreExpr:
@@ -169,6 +382,40 @@ pure func test_stop_returns_requested_snapshot() -> Bool:
 				and rendered.contains("\"call_kind\":{\"kind\":\"user\"")
 				and not rendered.contains("selected_direct")
 			)
+		LateCoreCompleted(_, _):
+			False
+		LateCoreFailed(_, _):
+			False
+
+
+pure func test_late_core_observe_then_stop_uses_previous_stage_output() -> Bool:
+	stages: List[LateCoreStageRequest] = [
+		{
+			name = "dce",
+			stage = DceStage,
+			action = ObserveLateCoreStage
+		},
+		{
+			name = "perceus",
+			stage = PerceusStage,
+			action = StopLateCoreStage
+		},
+	]
+
+	match execute_late_core_stages(record_update_carrier_program(), [], stages, True):
+		LateCoreStopped(stage_name, rendered, observations):
+			match observations:
+				[dce_observation]:
+					(
+						stage_name == "perceus"
+						and dce_observation.stage_name == "dce"
+						and dce_observation.rendered.contains("\"kind\":\"record_update\"")
+						and not dce_observation.rendered.contains("selected_direct")
+						and not rendered.contains("\"kind\":\"record_update\"")
+						and not rendered.contains("selected_direct")
+					)
+				_:
+					False
 		LateCoreCompleted(_, _):
 			False
 		LateCoreFailed(_, _):
@@ -311,6 +558,23 @@ tests: TestSuite = {
 	description = "Blorp CLI late Core execution",
 	tests = [
 		("compiler phase order is explicit", test_compiler_phase_order_is_explicit),
+		("compiler phase labels are exhaustive", test_compiler_phase_labels_are_exhaustive),
+		(
+			"backend emission failure stops before artifact construction",
+			test_backend_emission_failure_stops_before_artifact_construction,
+		),
+		(
+			"artifact construction failure happens after backend emission",
+			test_artifact_construction_failure_happens_after_backend_emission,
+		),
+		(
+			"timed backend emission failure reports backend only",
+			test_timed_backend_emission_failure_reports_backend_only,
+		),
+		(
+			"timed artifact construction failure reports backend and artifact",
+			test_timed_artifact_construction_failure_reports_backend_and_artifact,
+		),
 		(
 			"empty stage requests complete the final pipeline",
 			test_empty_stage_requests_complete_final_pipeline,
@@ -320,6 +584,10 @@ tests: TestSuite = {
 			test_observation_does_not_replace_final_completion,
 		),
 		("stop returns requested snapshot", test_stop_returns_requested_snapshot),
+		(
+			"late Core observe then stop uses previous stage output",
+			test_late_core_observe_then_stop_uses_previous_stage_output,
+		),
 		(
 			"record update invariant starts at Perceus",
 			test_record_update_invariant_starts_at_perceus,

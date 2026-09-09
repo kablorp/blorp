@@ -1,6 +1,6 @@
 # Expose The Seven Compiler Phase Timings
 
-**Status:** Ready
+**Status:** Implemented and accepted
 
 **Kind:** Measurement infrastructure; no intended compiler-latency change
 
@@ -257,29 +257,29 @@ instrumented total.
 
 ## Acceptance Criteria
 
-- [ ] All seven `CompilerPhase` variants are used by production timing.
-- [ ] Successful compile output contains exactly seven stable labels in
+- [x] All seven `CompilerPhase` variants are used by production timing.
+- [x] Successful compile output contains exactly seven stable labels in
       `COMPILER_PHASE_ORDER`.
-- [ ] Failed and stopped compilation reports only reached phases, including the
+- [x] Failed and stopped compilation reports only reached phases, including the
       failing phase.
-- [ ] Timing and memory checkpoints share one phase-label authority.
-- [ ] Every failure and stop path emits a terminal memory checkpoint carrying
+- [x] Timing and memory checkpoints share one phase-label authority.
+- [x] Every failure and stop path emits a terminal memory checkpoint carrying
       the active phase plus `failed` or `stopped` state.
-- [ ] Timed and untimed execution use the same transformation path.
-- [ ] No clock or memory-checkpoint operation is called from pure compiler
+- [x] Timed and untimed execution use the same transformation path.
+- [x] No clock or memory-checkpoint operation is called from pure compiler
       transformation code.
-- [ ] No pass order, stop behavior, observation behavior, diagnostic, Core
+- [x] No pass order, stop behavior, observation behavior, diagnostic, Core
       snapshot, or generated-C byte changes.
-- [ ] Across five alternating runs, timing-disabled compile-to-C does not show
+- [x] Across five alternating runs, timing-disabled compile-to-C does not show
       a repeatable regression outside the paired noise envelope; a median
       regression greater than 2% is a failure.
-- [ ] In each successful invocation, the sum of phase durations is within 2%
+- [x] In each successful invocation, the sum of phase durations is within 2%
       of an outer compilation duration captured during that same invocation.
       CLI startup and final file publication may remain outside the phase sum
       and must be documented.
-- [ ] The legacy `frontend` and `backend` phase labels are deleted from source,
+- [x] The legacy `frontend` and `backend` phase labels are deleted from source,
       tests, and current documentation.
-- [ ] No generated artifacts are committed.
+- [x] No generated artifacts are committed.
 
 ## Pitfalls
 

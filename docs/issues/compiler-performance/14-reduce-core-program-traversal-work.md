@@ -355,8 +355,9 @@ BLORP_COMPILER_MEMORY_PROFILE=1 \
 ```
 
 Capture one externally sampled run and generate semantic, module, and stage
-flamegraphs. Record frontend, backend, total, wall, peak RSS, allocations,
-generated-C bytes and lines, and output SHA-256.
+flamegraphs. Record the seven `--time-phases` rows, `phase_total`,
+`outer_total`, wall, peak RSS, allocations, generated-C bytes and lines, and
+output SHA-256.
 
 The initial report must rank passes by:
 

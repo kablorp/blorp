@@ -453,6 +453,18 @@ bin/blorp compile --time-phases --no-format \
 Phase timing identifies the broad region to investigate. It is not enough to
 attribute cost to a helper or accept an optimization.
 
+`--time-phases` writes one row for each completed compiler phase in this
+order: `typed_frontend`, `core_lowering`, `early_core`,
+`runtime_projection`, `late_core`, `backend_emission`, and
+`artifact_construction`. A failed or stopped compile includes only phases that
+were reached, including the active failed or stopped phase. `phase_total` is
+the sum of these phase rows. `outer_total` is measured during the same
+invocation around compiler-pipeline execution so scripts can detect timing
+gaps; it also includes instrumentation overhead such as memory checkpoint
+calls. CLI startup, compile-plan construction, final artifact file publication,
+host C compilation, and program execution are outside these compiler phase
+totals.
+
 Use `scripts/test --timings` when compilation of test artifacts is the concern:
 
 ```bash

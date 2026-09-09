@@ -5,9 +5,17 @@ import:
 	../compiler/frontend_output: parsed_source_summary
 	../compiler/frontend_request: FrontendCompilationGraph
 	../compiler/pipeline:
+		ArtifactConstructionPhaseExecution(
+			ArtifactConstructionPhaseFailed,
+			ArtifactConstructionPhaseReady,
+		),
+		BackendEmissionCompilation,
+		BackendEmissionPhaseExecution(BackendEmissionPhaseFailed, BackendEmissionPhaseReady),
 		CompiledTypedGraph(CompiledTypedGraphReady, CompiledTypedGraphStopped),
 		CoreCompilation,
 		CoreObservation,
+		EarlyCoreCompilation,
+		EarlyCorePhaseExecution(EarlyCorePhaseFailed, EarlyCorePhaseReady, EarlyCorePhaseStopped),
 		FinishedCompilerPipeline(
 			CompilerPipelineArtifactFailed,
 			CompilerPipelineArtifactReady,
@@ -16,11 +24,32 @@ import:
 			CompilerPipelineStopped,
 		),
 		FrontendCompilePolicy,
+		LateCoreExecution(LateCoreCompleted, LateCoreFailed, LateCoreStopped),
 		LateCoreStageRequest,
+		LoweredCoreCompilation,
+		RuntimeProjectedCompilation,
+		RuntimeProjectionPhaseExecution(
+			RuntimeProjectionPhaseFailed,
+			RuntimeProjectionPhaseReady,
+			RuntimeProjectionPhaseStopped,
+		),
+		TypedFrontendCompilation,
 		compile_frontend_graph,
 		compile_frontend_graph_with_typed_validation,
+		construct_backend_artifact,
+		emit_backend_c,
+		execute_late_core_stages,
 		finish_compiler_pipeline,
+		lower_typed_frontend_compilation,
+		project_runtime_compilation,
+		run_early_core_compilation,
+		run_typed_frontend_compilation,
+		runtime_projected_core_compilation,
+		runtime_projected_include_dirs,
+		runtime_projected_observations,
+		runtime_projected_typed_summary,
 	../compiler/stage_06_typecheck/bridge: TypecheckedGraph
+	../compiler/stage_09_core/pipeline: PreparedCoreProgram
 	../lib/build_artifact:
 		BuildArtifact,
 		BuildArtifactConfiguration,
@@ -112,6 +141,59 @@ union CompilePreparation:
 	CompilePreparationStopped(String, String, String, List[CoreObservation])
 
 
+record TypedCompilePreparation {
+	plan: CliCompilePlan,
+	stage_requests: CompileStageRequests,
+	typed: TypedFrontendCompilation
+}
+
+
+record LoweredCompilePreparation {
+	plan: CliCompilePlan,
+	stage_requests: CompileStageRequests,
+	lowered: LoweredCoreCompilation
+}
+
+
+record EarlyCoreCompilePreparation {
+	plan: CliCompilePlan,
+	stage_requests: CompileStageRequests,
+	early: EarlyCoreCompilation
+}
+
+
+record RuntimeProjectedCompilePreparation {
+	plan: CliCompilePlan,
+	stage_requests: CompileStageRequests,
+	projected: RuntimeProjectedCompilation
+}
+
+
+record LateCoreCompileExecution {
+	prepared: PreparedCompileExecution,
+	prepared_core: PreparedCoreProgram,
+	observations: List[CoreObservation]
+}
+
+
+union LateCoreCompilePhaseExecution:
+	LateCoreCompilePhaseReady(LateCoreCompileExecution)
+	LateCoreCompilePhaseStopped(String, String, List[CoreObservation])
+	LateCoreCompilePhaseInvariantFailed(String, String)
+
+
+record BackendEmissionCompileExecution {
+	prepared: PreparedCompileExecution,
+	emission: BackendEmissionCompilation,
+	observations: List[CoreObservation]
+}
+
+
+union BackendEmissionCompilePhaseExecution:
+	BackendEmissionCompilePhaseReady(BackendEmissionCompileExecution)
+	BackendEmissionCompilePhaseFailed(String)
+
+
 private pure func compile_runtime_requirement(options: CliCompileArgs) -> BuildRuntimeRequirement:
 	if options.embed_runtime:
 		BuildEmbeddedRuntime
@@ -177,34 +259,73 @@ private pure func artifact_configuration(
 	}
 
 
-pure func finish_prepared_compile_execution(prepared: PreparedCompileExecution) -> CompileExecution:
-	match finish_compiler_pipeline(
+pure func run_late_core_compile_execution(
+	prepared: PreparedCompileExecution,
+) -> LateCoreCompilePhaseExecution:
+	match execute_late_core_stages(
 		prepared.compilation.program,
 		prepared.early_observations,
 		prepared.late_stages,
 		prepared.compilation.check_invariants,
-		prepared.configuration,
 	):
-		CompilerPipelineArtifactReady(artifact, completed_observations):
+		LateCoreCompleted(prepared_core, completed_observations):
+			LateCoreCompilePhaseReady({
+				prepared = prepared,
+				prepared_core = prepared_core,
+				observations = completed_observations,
+			})
+		LateCoreStopped(stage_name, rendered, stopped_observations):
+			LateCoreCompilePhaseStopped(stage_name, rendered, stopped_observations)
+		LateCoreFailed(stage_name, detail):
+			LateCoreCompilePhaseInvariantFailed(stage_name, detail)
+
+
+pure func emit_backend_compile_execution(
+	late: LateCoreCompileExecution,
+) -> BackendEmissionCompilePhaseExecution:
+	match emit_backend_c(late.prepared_core, late.prepared.configuration):
+		BackendEmissionPhaseReady(emission):
+			BackendEmissionCompilePhaseReady({
+				prepared = late.prepared,
+				emission = emission,
+				observations = late.observations,
+			})
+		BackendEmissionPhaseFailed(message):
+			BackendEmissionCompilePhaseFailed(message)
+
+
+pure func construct_artifact_compile_execution(
+	emitted: BackendEmissionCompileExecution,
+) -> CompileExecution:
+	match construct_backend_artifact(emitted.emission):
+		ArtifactConstructionPhaseReady(artifact):
 			CompileArtifact(
-				prepared.compilation.target_path,
+				emitted.prepared.compilation.target_path,
 				compile_artifact_output(artifact),
-				compile_observations(completed_observations),
-				prepared.typed_program_summary,
+				compile_observations(emitted.observations),
+				emitted.prepared.typed_program_summary,
 			)
-		CompilerPipelineStopped(stage_name, rendered, stopped_observations):
+		ArtifactConstructionPhaseFailed(message):
+			CompileBuildArtifactFailed(message)
+
+
+pure func finish_prepared_compile_execution(prepared: PreparedCompileExecution) -> CompileExecution:
+	match run_late_core_compile_execution(prepared):
+		LateCoreCompilePhaseStopped(stage_name, rendered, stopped_observations):
 			CompileStopped(
 				prepared.compilation.target_path,
 				stage_name,
 				rendered,
 				compile_observations(stopped_observations),
 			)
-		CompilerPipelineInvariantFailed(stage_name, detail):
+		LateCoreCompilePhaseInvariantFailed(stage_name, detail):
 			CompileCoreInvariantFailed("${stage_name}: ${detail}")
-		CompilerPipelineEmitFailed(message):
-			CompileEmitFailed(message)
-		CompilerPipelineArtifactFailed(message):
-			CompileBuildArtifactFailed(message)
+		LateCoreCompilePhaseReady(late):
+			match emit_backend_compile_execution(late):
+				BackendEmissionCompilePhaseReady(emitted):
+					construct_artifact_compile_execution(emitted)
+				BackendEmissionCompilePhaseFailed(message):
+					CompileEmitFailed(message)
 
 
 pure func finish_prepared_run_artifact_execution(
@@ -287,15 +408,136 @@ pure func prepare_compile_plan_with_frontend_policy(
 	)
 
 
-pure func prepare_compile_plan(plan: CliCompilePlan) -> Result[CompilePreparation, List[String]]:
-	prepare_compile_plan_with_frontend_policy(
-		plan,
-		{
-			allow_debug_only_calls = plan.options.debug,
-			retain_debug_blocks = plan.options.debug,
-			include_typed_summary = plan.options.dump_typed_ast
-		},
+private pure func compile_plan_frontend_policy(plan: CliCompilePlan) -> FrontendCompilePolicy:
+	{
+		allow_debug_only_calls = plan.options.debug,
+		retain_debug_blocks = plan.options.debug,
+		include_typed_summary = plan.options.dump_typed_ast
+	}
+
+
+pure func typed_compile_preparation(
+	plan: CliCompilePlan,
+) -> Result[TypedCompilePreparation, List[String]]:
+	stage_requests: CompileStageRequests = compile_stage_requests(
+		plan.options.dump_core_after,
+		plan.options.stop_after,
 	)
+	typed ?= run_typed_frontend_compilation(
+		plan.graph,
+		compile_plan_frontend_policy(plan),
+		pure func(_): [],
+		cli_error_messages,
+		True,
+		plan.options.check_invariants,
+		stage_requests.early_observations,
+		stage_requests.early_stop,
+	)
+
+	Ok({
+		plan = plan,
+		stage_requests = stage_requests,
+		typed = typed,
+	})
+
+
+pure func lower_compile_preparation(
+	typed: TypedCompilePreparation,
+) -> Result[LoweredCompilePreparation, List[String]]:
+	lowered ?= lower_typed_frontend_compilation(typed.typed)
+
+	Ok({
+		plan = typed.plan,
+		stage_requests = typed.stage_requests,
+		lowered = lowered,
+	})
+
+
+pure func run_early_core_compile_preparation(
+	lowered: LoweredCompilePreparation,
+) -> EarlyCorePhaseExecution:
+	run_early_core_compilation(lowered.lowered)
+
+
+pure func early_core_compile_preparation_ready(
+	lowered: LoweredCompilePreparation,
+	early: EarlyCoreCompilation,
+) -> EarlyCoreCompilePreparation:
+	{
+		plan = lowered.plan,
+		stage_requests = lowered.stage_requests,
+		early = early
+	}
+
+
+pure func project_runtime_compile_preparation(
+	early: EarlyCoreCompilePreparation,
+) -> RuntimeProjectionPhaseExecution:
+	project_runtime_compilation(early.early)
+
+
+pure func runtime_projected_compile_preparation_ready(
+	early: EarlyCoreCompilePreparation,
+	projected: RuntimeProjectedCompilation,
+) -> RuntimeProjectedCompilePreparation:
+	{
+		plan = early.plan,
+		stage_requests = early.stage_requests,
+		projected = projected
+	}
+
+
+pure func prepared_compile_execution_from_projected(
+	projected: RuntimeProjectedCompilePreparation,
+) -> PreparedCompileExecution:
+	compilation: CoreCompilation = runtime_projected_core_compilation(projected.projected)
+
+	{
+		compilation = compilation,
+		configuration = artifact_configuration(
+			compilation,
+			projected.plan.graph,
+			runtime_projected_include_dirs(projected.projected),
+			compile_runtime_requirement(projected.plan.options),
+			compile_compatibility(projected.plan.options),
+		),
+		late_stages = projected.stage_requests.late_stages,
+		typed_program_summary = runtime_projected_typed_summary(projected.projected),
+		early_observations = runtime_projected_observations(projected.projected)
+	}
+
+
+pure func prepare_compile_plan(plan: CliCompilePlan) -> Result[CompilePreparation, List[String]]:
+	typed ?= typed_compile_preparation(plan)
+	lowered ?= lower_compile_preparation(typed)
+
+	match run_early_core_compile_preparation(lowered):
+		EarlyCorePhaseFailed(errors):
+			Err(errors)
+		EarlyCorePhaseStopped(target_path, stage_name, rendered, observations):
+			Ok(CompilePreparationStopped(target_path, stage_name, rendered, observations))
+		EarlyCorePhaseReady(early):
+			early_preparation: EarlyCoreCompilePreparation = early_core_compile_preparation_ready(
+				lowered,
+				early,
+			)
+
+			match project_runtime_compile_preparation(early_preparation):
+				RuntimeProjectionPhaseFailed(errors):
+					Err(errors)
+				RuntimeProjectionPhaseStopped(target_path, stage_name, rendered, observations):
+					Ok(CompilePreparationStopped(target_path, stage_name, rendered, observations))
+				RuntimeProjectionPhaseReady(projected):
+					Ok(
+						CompilePreparationReady(
+							prepared_compile_execution_from_projected(
+								runtime_projected_compile_preparation_ready(
+									early_preparation,
+									projected,
+								),
+							),
+						),
+					)
 
 
 pure func prepare_run_plan(plan: CliRunSourcePlan) -> Result[CompilePreparation, List[String]]:

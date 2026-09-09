@@ -10,6 +10,7 @@ import:
 		BuildArtifact,
 		BuildArtifactConfiguration,
 		BuildArtifactError(InvalidForeignLinkArguments),
+		CArtifact,
 	frontend_output: typed_program_summary
 	frontend_request: FrontendCompilationGraph
 	path: dirname
@@ -52,11 +53,11 @@ import:
 		typechecked_module_name,
 		typechecked_module_path,
 	stage_06_typecheck/decl: TypedDecl(TypedForeignFunctionDecl, TypedPrivateDecl), TypedProgram
-	stage_06_typecheck/graph/definition_index: DefinitionTable
 	stage_06_typecheck/frontend_graph_typecheck:
 		FrontendTypecheckRequestError,
 		typecheck_frontend_graph_direct,
 		typecheck_request_for_frontend_module,
+	stage_06_typecheck/graph/definition_index: DefinitionTable
 	stage_06_typecheck/modules/import_binding:
 		ImportBinding(QualifiedModuleBinding, SelectiveDefinitionBinding),
 	stage_08_core_lower/graph_prepare:
@@ -75,6 +76,7 @@ import:
 		),
 		CoreEarlyPipelineInput,
 		CoreEarlyPipelineObservation,
+		CoreEarlyPipelineOutput,
 		CoreEarlyPipelineStage,
 		core_early_pipeline_diagnostic_hint,
 		core_early_pipeline_diagnostic_message,
@@ -253,6 +255,50 @@ enum CompilerPhase:
 	ArtifactConstructionPhase
 
 
+enum CompilerPhaseTerminalState:
+	CompilerPhaseFailed
+	CompilerPhaseStopped
+
+
+pure func compiler_phase_label(phase: CompilerPhase) -> String:
+	match phase:
+		TypedFrontendPhase:
+			"typed_frontend"
+		CoreLoweringPhase:
+			"core_lowering"
+		EarlyCorePhase:
+			"early_core"
+		RuntimeProjectionPhase:
+			"runtime_projection"
+		LateCorePhase:
+			"late_core"
+		BackendEmissionPhase:
+			"backend_emission"
+		ArtifactConstructionPhase:
+			"artifact_construction"
+
+
+pure func compiler_phase_start_checkpoint_label(phase: CompilerPhase) -> String:
+	"${compiler_phase_label(phase)}_start"
+
+
+pure func compiler_phase_complete_checkpoint_label(phase: CompilerPhase) -> String:
+	"${compiler_phase_label(phase)}_complete"
+
+
+pure func compiler_phase_terminal_checkpoint_label(
+	phase: CompilerPhase,
+	state: CompilerPhaseTerminalState,
+) -> String:
+	suffix: String = match state:
+		CompilerPhaseFailed:
+			"failed"
+		CompilerPhaseStopped:
+			"stopped"
+
+	"${compiler_phase_label(phase)}_${suffix}"
+
+
 -- This manifests cross-stage ownership without duplicating the pass list owned
 -- by stage_09_core/pipeline.brp.
 COMPILER_PHASE_ORDER: List[CompilerPhase] = [
@@ -270,6 +316,76 @@ record CoreObservation {
 	stage_name: String,
 	rendered: String
 }
+
+
+private record TypedFrontendCompilationRep {
+	typechecked: TypecheckedGraph,
+	policy: CoreCompilePolicy,
+	typed_summary: Option[String],
+	require_main: Bool,
+	check_invariants: Bool,
+	early_observations: List[CoreEarlyPipelineStage],
+	early_stop: Option[CoreEarlyPipelineStage]
+}
+
+
+opaque type TypedFrontendCompilation = TypedFrontendCompilationRep
+
+
+private record LoweredCoreCompilationRep {
+	target_path: String,
+	target_module_name: String,
+	target_import_bindings: List[CoreResolveImportBinding],
+	module_imports: List[CoreResolveModuleImports],
+	include_dirs: List[String],
+	typed_summary: Option[String],
+	require_main: Bool,
+	check_invariants: Bool,
+	early_configuration: CoreEarlyPipelineConfiguration,
+	early_input: CoreEarlyPipelineInput
+}
+
+
+opaque type LoweredCoreCompilation = LoweredCoreCompilationRep
+
+
+private record EarlyCoreCompilationRep {
+	target_path: String,
+	target_module_name: String,
+	include_dirs: List[String],
+	typed_summary: Option[String],
+	require_main: Bool,
+	check_invariants: Bool,
+	early_configuration: CoreEarlyPipelineConfiguration,
+	output: CoreEarlyPipelineOutput
+}
+
+
+opaque type EarlyCoreCompilation = EarlyCoreCompilationRep
+
+
+private record RuntimeProjectedCompilationRep {
+	target_path: String,
+	target_module_name: String,
+	include_dirs: List[String],
+	typed_summary: Option[String],
+	check_invariants: Bool,
+	program: CoreProgram,
+	observations: List[CoreObservation]
+}
+
+
+opaque type RuntimeProjectedCompilation = RuntimeProjectedCompilationRep
+
+
+private record BackendEmissionCompilationRep {
+	prepared_core: PreparedCoreProgram,
+	configuration: BuildArtifactConfiguration,
+	emission: CArtifact
+}
+
+
+opaque type BackendEmissionCompilation = BackendEmissionCompilationRep
 
 
 union CompiledTypedGraph:
@@ -308,10 +424,26 @@ union LateCoreExecution:
 	LateCoreFailed(String, String)
 
 
-private union PreparedArtifactEmission:
-	PreparedArtifactReady(BuildArtifact)
-	PreparedArtifactEmitFailed(String)
-	PreparedArtifactBuildFailed(String)
+union EarlyCorePhaseExecution:
+	EarlyCorePhaseReady(EarlyCoreCompilation)
+	EarlyCorePhaseStopped(String, String, String, List[CoreObservation])
+	EarlyCorePhaseFailed(List[String])
+
+
+union RuntimeProjectionPhaseExecution:
+	RuntimeProjectionPhaseReady(RuntimeProjectedCompilation)
+	RuntimeProjectionPhaseStopped(String, String, String, List[CoreObservation])
+	RuntimeProjectionPhaseFailed(List[String])
+
+
+union BackendEmissionPhaseExecution:
+	BackendEmissionPhaseReady(BackendEmissionCompilation)
+	BackendEmissionPhaseFailed(String)
+
+
+union ArtifactConstructionPhaseExecution:
+	ArtifactConstructionPhaseReady(BuildArtifact)
+	ArtifactConstructionPhaseFailed(String)
 
 
 union FinishedCompilerPipeline:
@@ -522,7 +654,7 @@ pure func compile_frontend_graph(
 	)
 
 
-pure func compile_frontend_graph_with_typed_validation(
+pure func run_typed_frontend_compilation(
 	graph: FrontendCompilationGraph,
 	policy: FrontendCompilePolicy,
 	validate: pure (TypecheckedGraph) -> List[String],
@@ -531,7 +663,7 @@ pure func compile_frontend_graph_with_typed_validation(
 	check_invariants: Bool,
 	early_observations: List[CoreEarlyPipelineStage],
 	early_stop: Option[CoreEarlyPipelineStage],
-) -> Result[CompiledTypedGraph, List[String]]:
+) -> Result[TypedFrontendCompilation, List[String]]:
 	match frontend_graph_root_ids(graph.graph):
 		[root_id]:
 			module_target_ids = frontend_graph_module_ids(
@@ -571,17 +703,54 @@ pure func compile_frontend_graph_with_typed_validation(
 								retain_debug_blocks = policy.retain_debug_blocks,
 							}
 
-							compile_typechecked_graph(
-								typechecked,
-								core_policy,
-								typed_summary,
-								require_main,
-								check_invariants,
-								early_observations,
-								early_stop,
-							)
+							Ok(into_opaque TypedFrontendCompilation({
+										typechecked = typechecked,
+										policy = core_policy,
+										typed_summary = typed_summary,
+										require_main = require_main,
+										check_invariants = check_invariants,
+										early_observations = early_observations,
+										early_stop = early_stop
+									}))
 		_:
 			Err(["source compilation requires exactly one root module"])
+
+
+pure func compile_frontend_graph_with_typed_validation(
+	graph: FrontendCompilationGraph,
+	policy: FrontendCompilePolicy,
+	validate: pure (TypecheckedGraph) -> List[String],
+	render_typecheck_diagnostics: pure (List[String]) -> List[String],
+	require_main: Bool,
+	check_invariants: Bool,
+	early_observations: List[CoreEarlyPipelineStage],
+	early_stop: Option[CoreEarlyPipelineStage],
+) -> Result[CompiledTypedGraph, List[String]]:
+	typed ?= run_typed_frontend_compilation(
+		graph,
+		policy,
+		validate,
+		render_typecheck_diagnostics,
+		require_main,
+		check_invariants,
+		early_observations,
+		early_stop,
+	)
+	lowered ?= lower_typed_frontend_compilation(typed)
+
+	match run_early_core_compilation(lowered):
+		EarlyCorePhaseFailed(errors):
+			Err(errors)
+		EarlyCorePhaseStopped(target_path, stage_name, rendered, observations):
+			Ok(CompiledTypedGraphStopped(target_path, stage_name, rendered, observations))
+		EarlyCorePhaseReady(early):
+			match project_runtime_compilation(early):
+				RuntimeProjectionPhaseFailed(errors):
+					Err(errors)
+				RuntimeProjectionPhaseStopped(target_path, stage_name, rendered, observations):
+					Ok(CompiledTypedGraphStopped(target_path, stage_name, rendered, observations))
+				RuntimeProjectionPhaseReady(projected):
+					Ok(compiled_typed_graph_ready(projected))
 
 
 private pure func early_observation(observation: CoreEarlyPipelineObservation) -> CoreObservation:
@@ -639,16 +808,11 @@ private pure func core_lowering_input(
 	}
 
 
-pure func compile_typechecked_graph(
-	typechecked: TypecheckedGraph,
-	policy: CoreCompilePolicy,
-	typed_summary: Option[String],
-	require_main: Bool,
-	check_invariants: Bool,
-	early_observations: List[CoreEarlyPipelineStage],
-	early_stop: Option[CoreEarlyPipelineStage],
-) -> Result[CompiledTypedGraph, List[String]]:
-	input = core_lowering_input(typechecked, typed_summary)
+pure func lower_typed_frontend_compilation(
+	typed: TypedFrontendCompilation,
+) -> Result[LoweredCoreCompilation, List[String]]:
+	representation: TypedFrontendCompilationRep = from_opaque TypedFrontendCompilation(typed)
+	input = core_lowering_input(representation.typechecked, representation.typed_summary)
 	prepared = prepare_core_graph(
 		input.definition_table,
 		input.target_module_id,
@@ -664,73 +828,183 @@ pure func compile_typechecked_graph(
 			Err([core_graph_prepare_error_to_string(error)])
 
 	early_configuration: CoreEarlyPipelineConfiguration = {
-		debug = policy.retain_debug_blocks,
-		check_invariants = check_invariants,
-		observations = early_observations,
-		stop_after = early_stop
+		debug = representation.policy.retain_debug_blocks,
+		check_invariants = representation.check_invariants,
+		observations = representation.early_observations,
+		stop_after = representation.early_stop
 	}
 	early_input: CoreEarlyPipelineInput = {
 		program = prepared_graph.program,
 		next_def_id = prepared_graph.next_def_id
 	}
 
+	Ok(into_opaque LoweredCoreCompilation({
+				target_path = input.target_path,
+				target_module_name = input.target_module_name,
+				target_import_bindings = input.target_import_bindings,
+				module_imports = input.module_imports,
+				include_dirs = input.include_dirs,
+				typed_summary = input.typed_summary,
+				require_main = representation.require_main,
+				check_invariants = representation.check_invariants,
+				early_configuration = early_configuration,
+				early_input = early_input
+			}))
+
+
+pure func run_early_core_compilation(lowered: LoweredCoreCompilation) -> EarlyCorePhaseExecution:
+	representation: LoweredCoreCompilationRep = from_opaque LoweredCoreCompilation(lowered)
+
 	match run_early_core_pipeline_to_runtime_projection(
-		early_input,
-		early_configuration,
-		input.target_import_bindings,
-		input.module_imports,
+		representation.early_input,
+		representation.early_configuration,
+		representation.target_import_bindings,
+		representation.module_imports,
 	):
 		CoreEarlyPipelineFailed(diagnostic):
-			Err([early_pipeline_error(diagnostic)])
+			EarlyCorePhaseFailed([early_pipeline_error(diagnostic)])
 		CoreEarlyPipelineStopped(stage, rendered, completed_observations):
-			Ok(
-				CompiledTypedGraphStopped(
-					input.target_path,
-					core_early_pipeline_stage_name(stage),
-					rendered,
-					completed_observations.map(early_observation),
-				),
+			EarlyCorePhaseStopped(
+				representation.target_path,
+				core_early_pipeline_stage_name(stage),
+				rendered,
+				completed_observations.map(early_observation),
 			)
 		CoreEarlyPipelineCompleted(output):
-			projected_program ?= match project_runtime_program(output.program):
-				Ok(program):
-					Ok(program)
-				Err(error):
-					Err([core_runtime_projection_error_message(error)])
+			EarlyCorePhaseReady(into_opaque EarlyCoreCompilation({
+						target_path = representation.target_path,
+						target_module_name = representation.target_module_name,
+						include_dirs = representation.include_dirs,
+						typed_summary = representation.typed_summary,
+						require_main = representation.require_main,
+						check_invariants = representation.check_invariants,
+						early_configuration = representation.early_configuration,
+						output = output
+					}))
 
+
+pure func project_runtime_compilation(
+	early: EarlyCoreCompilation,
+) -> RuntimeProjectionPhaseExecution:
+	representation: EarlyCoreCompilationRep = from_opaque EarlyCoreCompilation(early)
+
+	match project_runtime_program(representation.output.program):
+		Err(error):
+			RuntimeProjectionPhaseFailed([core_runtime_projection_error_message(error)])
+		Ok(projected_program):
 			match finish_early_core_pipeline_after_projection(
-				{ output | program = projected_program },
-				early_configuration,
+				{ representation.output | program = projected_program },
+				representation.early_configuration,
 			):
 				CoreEarlyPipelineFailed(diagnostic):
-					Err([early_pipeline_error(diagnostic)])
+					RuntimeProjectionPhaseFailed([early_pipeline_error(diagnostic)])
 				CoreEarlyPipelineStopped(stage, rendered, completed_observations):
-					Ok(
-						CompiledTypedGraphStopped(
-							input.target_path,
-							core_early_pipeline_stage_name(stage),
-							rendered,
-							completed_observations.map(early_observation),
-						),
+					RuntimeProjectionPhaseStopped(
+						representation.target_path,
+						core_early_pipeline_stage_name(stage),
+						rendered,
+						completed_observations.map(early_observation),
 					)
 				CoreEarlyPipelineCompleted(completed):
-					if require_main and not program_has_top_level_main(completed.program):
-						Err([missing_main_error(input.target_path)])
-					else:
-						compilation: CoreCompilation = {
-							target_path = input.target_path,
-							target_module_name = input.target_module_name,
-							program = completed.program,
-							check_invariants = check_invariants
-						}
-						Ok(
-							CompiledTypedGraphReady(
-								compilation,
-								input.typed_summary,
-								input.include_dirs,
-								completed.observations.map(early_observation),
-							),
+					if (
+						representation.require_main
+						and not program_has_top_level_main(completed.program)
+					):
+						RuntimeProjectionPhaseFailed(
+							[missing_main_error(representation.target_path)],
 						)
+					else:
+						RuntimeProjectionPhaseReady(into_opaque RuntimeProjectedCompilation({
+									target_path = representation.target_path,
+									target_module_name = representation.target_module_name,
+									include_dirs = representation.include_dirs,
+									typed_summary = representation.typed_summary,
+									check_invariants = representation.check_invariants,
+									program = completed.program,
+									observations = completed.observations.map(early_observation)
+								}))
+
+
+pure func runtime_projected_core_compilation(
+	projected: RuntimeProjectedCompilation,
+) -> CoreCompilation:
+	representation: RuntimeProjectedCompilationRep = from_opaque RuntimeProjectedCompilation(
+		projected
+	)
+	{
+		target_path = representation.target_path,
+		target_module_name = representation.target_module_name,
+		program = representation.program,
+		check_invariants = representation.check_invariants
+	}
+
+
+pure func runtime_projected_include_dirs(projected: RuntimeProjectedCompilation) -> List[String]:
+	representation: RuntimeProjectedCompilationRep = from_opaque RuntimeProjectedCompilation(
+		projected
+	)
+	representation.include_dirs
+
+
+pure func runtime_projected_typed_summary(projected: RuntimeProjectedCompilation) -> Option[String]:
+	representation: RuntimeProjectedCompilationRep = from_opaque RuntimeProjectedCompilation(
+		projected
+	)
+	representation.typed_summary
+
+
+pure func runtime_projected_observations(
+	projected: RuntimeProjectedCompilation,
+) -> List[CoreObservation]:
+	representation: RuntimeProjectedCompilationRep = from_opaque RuntimeProjectedCompilation(
+		projected
+	)
+	representation.observations
+
+
+pure func compiled_typed_graph_ready(projected: RuntimeProjectedCompilation) -> CompiledTypedGraph:
+	compilation: CoreCompilation = runtime_projected_core_compilation(projected)
+	CompiledTypedGraphReady(
+		compilation,
+		runtime_projected_typed_summary(projected),
+		runtime_projected_include_dirs(projected),
+		runtime_projected_observations(projected),
+	)
+
+
+pure func compile_typechecked_graph(
+	typechecked: TypecheckedGraph,
+	policy: CoreCompilePolicy,
+	typed_summary: Option[String],
+	require_main: Bool,
+	check_invariants: Bool,
+	early_observations: List[CoreEarlyPipelineStage],
+	early_stop: Option[CoreEarlyPipelineStage],
+) -> Result[CompiledTypedGraph, List[String]]:
+	typed: TypedFrontendCompilation = into_opaque TypedFrontendCompilation({
+			typechecked = typechecked,
+			policy = policy,
+			typed_summary = typed_summary,
+			require_main = require_main,
+			check_invariants = check_invariants,
+			early_observations = early_observations,
+			early_stop = early_stop
+		})
+	lowered ?= lower_typed_frontend_compilation(typed)
+
+	match run_early_core_compilation(lowered):
+		EarlyCorePhaseFailed(errors):
+			Err(errors)
+		EarlyCorePhaseStopped(target_path, stage_name, rendered, observations):
+			Ok(CompiledTypedGraphStopped(target_path, stage_name, rendered, observations))
+		EarlyCorePhaseReady(early):
+			match project_runtime_compilation(early):
+				RuntimeProjectionPhaseFailed(errors):
+					Err(errors)
+				RuntimeProjectionPhaseStopped(target_path, stage_name, rendered, observations):
+					Ok(CompiledTypedGraphStopped(target_path, stage_name, rendered, observations))
+				RuntimeProjectionPhaseReady(projected):
+					Ok(compiled_typed_graph_ready(projected))
 
 
 private pure func observes_late_stage(action: LateCoreStageAction) -> Bool:
@@ -823,7 +1097,7 @@ pure func execute_late_core_stages(
 						LateCoreStopped(stage.name, rendered, updated_observations)
 					else:
 						execute_late_core_stages(
-							pre_dce_core,
+							transformed,
 							updated_observations,
 							remaining,
 							check_invariants,
@@ -836,24 +1110,50 @@ private pure func build_artifact_error_message(error: BuildArtifactError) -> Str
 			"invalid foreign link arguments in semantic Core: `${arguments}`"
 
 
-private pure func emit_prepared_artifact(
+pure func run_late_core_compilation(
+	projected: RuntimeProjectedCompilation,
+	stages: List[LateCoreStageRequest],
+) -> LateCoreExecution:
+	representation: RuntimeProjectedCompilationRep = from_opaque RuntimeProjectedCompilation(
+		projected
+	)
+	execute_late_core_stages(
+		representation.program,
+		representation.observations,
+		stages,
+		representation.check_invariants,
+	)
+
+
+pure func emit_backend_c(
 	prepared_core: PreparedCoreProgram,
 	configuration: BuildArtifactConfiguration,
-) -> PreparedArtifactEmission:
-	program: CoreProgram = prepared_core_program_value(prepared_core)
-
+) -> BackendEmissionPhaseExecution:
 	match try_emit_prepared_core_program_c_artifact_with_profile(
 		prepared_core,
 		configuration.compatibility.profile,
 	):
 		Ok(emission):
-			match build_artifact(program, emission, configuration):
-				Ok(artifact):
-					PreparedArtifactReady(artifact)
-				Err(error):
-					PreparedArtifactBuildFailed(build_artifact_error_message(error))
+			BackendEmissionPhaseReady(into_opaque BackendEmissionCompilation({
+						prepared_core = prepared_core,
+						configuration = configuration,
+						emission = emission
+					}))
 		Err(error):
-			PreparedArtifactEmitFailed(core_emit_error_message(error))
+			BackendEmissionPhaseFailed(core_emit_error_message(error))
+
+
+pure func construct_backend_artifact(
+	emission: BackendEmissionCompilation,
+) -> ArtifactConstructionPhaseExecution:
+	representation: BackendEmissionCompilationRep = from_opaque BackendEmissionCompilation(emission)
+	program: CoreProgram = prepared_core_program_value(representation.prepared_core)
+
+	match build_artifact(program, representation.emission, representation.configuration):
+		Ok(artifact):
+			ArtifactConstructionPhaseReady(artifact)
+		Err(error):
+			ArtifactConstructionPhaseFailed(build_artifact_error_message(error))
 
 
 pure func finish_compiler_pipeline(
@@ -865,13 +1165,15 @@ pure func finish_compiler_pipeline(
 ) -> FinishedCompilerPipeline:
 	match execute_late_core_stages(pre_dce_core, observations, stages, check_invariants):
 		LateCoreCompleted(completed_core, completed_observations):
-			match emit_prepared_artifact(completed_core, configuration):
-				PreparedArtifactReady(artifact):
-					CompilerPipelineArtifactReady(artifact, completed_observations)
-				PreparedArtifactEmitFailed(message):
+			match emit_backend_c(completed_core, configuration):
+				BackendEmissionPhaseReady(emission):
+					match construct_backend_artifact(emission):
+						ArtifactConstructionPhaseReady(artifact):
+							CompilerPipelineArtifactReady(artifact, completed_observations)
+						ArtifactConstructionPhaseFailed(message):
+							CompilerPipelineArtifactFailed(message)
+				BackendEmissionPhaseFailed(message):
 					CompilerPipelineEmitFailed(message)
-				PreparedArtifactBuildFailed(message):
-					CompilerPipelineArtifactFailed(message)
 		LateCoreStopped(stage_name, rendered, stopped_observations):
 			CompilerPipelineStopped(stage_name, rendered, stopped_observations)
 		LateCoreFailed(stage_name, detail):

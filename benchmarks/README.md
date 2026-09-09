@@ -963,16 +963,26 @@ epoch.
 
 For compile-execution memory profiles, set
 `BLORP_COMPILER_MEMORY_PROFILE=1`. The compiler writes schema-1
-`BLORP_COMPILER_MEMORY_CHECKPOINT` rows to stderr at `frontend_start`,
-`frontend_complete` (or `frontend_stopped`/`frontend_failed`), `backend_complete`,
-`artifact_write_start`, and `artifact_write_complete`. Each row includes a
+`BLORP_COMPILER_MEMORY_CHECKPOINT` rows to stderr at
+`typed_frontend_start`, then at the completed compiler phase checkpoints:
+`typed_frontend_complete`, `core_lowering_complete`, `early_core_complete`,
+`runtime_projection_complete`, `late_core_complete`,
+`backend_emission_complete`, and `artifact_construction_complete`. If a
+compilation fails or stops, the final checkpoint uses the active phase label
+with `_failed` or `_stopped`, such as `typed_frontend_failed` or
+`late_core_stopped`. If final artifact publication fails after compiler
+artifact construction succeeds, `artifact_publication_failed` is emitted after
+`artifact_construction_complete`; publication time is still outside compiler
+phase timing and is not an artifact-construction phase failure. Each row includes a
 monotonic timestamp, managed allocation/release/current-object counters,
 allocator bytes, current RSS, and process peak RSS. Unsupported platform
 measurements are `-1`; do not infer missing values. Compare checkpoint deltas
 and global peak RSS together because allocator retention can keep RSS above the
 managed live-object count. Command planning and source loading happen before
-`frontend_start`, so these rows intentionally measure execution of an already
-constructed compile plan rather than process startup or the entire CLI command.
+`typed_frontend_start`, and final artifact file publication happens after
+`artifact_construction_complete`, so these rows intentionally measure execution
+of an already constructed compile plan rather than process startup or the
+entire CLI command.
 
 On macOS, regular RSS sampling invokes `ps` every 20 ms and observes only the
 helper leader process. This is appropriate for the current single-process

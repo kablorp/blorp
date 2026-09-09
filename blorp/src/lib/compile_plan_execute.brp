@@ -1,20 +1,78 @@
 -- Timed plan execution for the contiguous Blorp compile pipeline.
 import:
+	../compiler/pipeline:
+		CompilerPhase(
+			ArtifactConstructionPhase,
+			BackendEmissionPhase,
+			CoreLoweringPhase,
+			EarlyCorePhase,
+			LateCorePhase,
+			RuntimeProjectionPhase,
+			TypedFrontendPhase,
+		),
+		CompilerPhaseTerminalState(CompilerPhaseFailed, CompilerPhaseStopped),
+		EarlyCorePhaseExecution(EarlyCorePhaseFailed, EarlyCorePhaseReady, EarlyCorePhaseStopped),
+		RuntimeProjectionPhaseExecution(
+			RuntimeProjectionPhaseFailed,
+			RuntimeProjectionPhaseReady,
+			RuntimeProjectionPhaseStopped,
+		),
+		compiler_phase_complete_checkpoint_label,
+		compiler_phase_start_checkpoint_label,
+		compiler_phase_terminal_checkpoint_label,
 	cli_plan: CliCompilePlan, CliRunSourcePlan
 	compilation:
-		CompileExecution(CompileFrontendFailed, CompileStopped),
+		BackendEmissionCompilePhaseExecution(
+			BackendEmissionCompilePhaseFailed,
+			BackendEmissionCompilePhaseReady,
+		),
+		CompileExecution(
+			CompileBuildArtifactFailed,
+			CompileCoreInvariantFailed,
+			CompileEmitFailed,
+			CompileFrontendFailed,
+			CompileStopped,
+		),
 		CompilePreparation(CompilePreparationReady, CompilePreparationStopped),
+		LateCoreCompileExecution,
+		LateCoreCompilePhaseExecution(
+			LateCoreCompilePhaseInvariantFailed,
+			LateCoreCompilePhaseReady,
+			LateCoreCompilePhaseStopped,
+		),
+		PreparedCompileExecution,
 		RunArtifactExecution(RunArtifactFailed, RunArtifactStopped),
 		compile_observations,
-		finish_prepared_compile_execution,
+		construct_artifact_compile_execution,
+		early_core_compile_preparation_ready,
+		emit_backend_compile_execution,
 		finish_prepared_run_artifact_execution,
-		prepare_compile_plan,
+		lower_compile_preparation,
 		prepare_run_plan,
+		prepared_compile_execution_from_projected,
+		project_runtime_compile_preparation,
+		run_early_core_compile_preparation,
+		run_late_core_compile_execution,
+		runtime_projected_compile_preparation_ready,
+		typed_compile_preparation,
 	compilation_timing: CompileTiming
 	system: now_microseconds
 
 
 record TimedCompileExecution {
+	execution: CompileExecution,
+	timings: List[CompileTiming],
+	outer_microseconds: Int
+}
+
+
+record TimedBackendArtifactCompileTail {
+	execution: CompileExecution,
+	timings: List[CompileTiming]
+}
+
+
+private record TimedPreparedCompileTail {
 	execution: CompileExecution,
 	timings: List[CompileTiming]
 }
@@ -26,11 +84,39 @@ foreign:
 	) -> Void = "blorp_compiler_memory_checkpoint_c"
 
 
-private pure func elapsed_timing(label: String, started_at: Int, finished_at: Int) -> CompileTiming:
+private pure func elapsed_timing(
+	phase: CompilerPhase,
+	started_at: Int,
+	finished_at: Int,
+) -> CompileTiming:
 	{
-		label = label,
+		phase = phase,
 		microseconds = finished_at - started_at
 	}
+
+
+private pure func append_elapsed_timing(
+	timings: List[CompileTiming],
+	record_timings: Bool,
+	phase: CompilerPhase,
+	started_at: Int,
+	finished_at: Int,
+) -> List[CompileTiming]:
+	if record_timings:
+		timings.append(elapsed_timing(phase, started_at, finished_at))
+	else:
+		timings
+
+
+private func record_phase_complete_checkpoint(phase: CompilerPhase) -> Void:
+	record_compile_memory_checkpoint(compiler_phase_complete_checkpoint_label(phase))
+
+
+private func record_phase_terminal_checkpoint(
+	phase: CompilerPhase,
+	state: CompilerPhaseTerminalState,
+) -> Void:
+	record_compile_memory_checkpoint(compiler_phase_terminal_checkpoint_label(phase, state))
 
 
 private func current_time_when(enabled: Bool) -> Int:
@@ -40,65 +126,342 @@ private func current_time_when(enabled: Bool) -> Int:
 		0
 
 
-func execute_compile_plan_timed(
-	plan: CliCompilePlan,
+private func finalize_timed_compile_execution(
+	execution: CompileExecution,
+	timings: List[CompileTiming],
 	record_timings: Bool,
+	outer_started: Int,
 ) -> TimedCompileExecution:
-	record_compile_memory_checkpoint("frontend_start")
-	frontend_started: Int = current_time_when(record_timings)
+	outer_finished: Int = current_time_when(record_timings)
 
-	match prepare_compile_plan(plan):
-		Err(errors):
-			record_compile_memory_checkpoint("frontend_failed")
-			frontend_finished: Int = current_time_when(record_timings)
+	outer_microseconds: Int = if record_timings:
+		outer_finished - outer_started
+	else:
+		0
 
-			timings: List[CompileTiming] = if record_timings:
-				[elapsed_timing("frontend", frontend_started, frontend_finished)]
-			else:
-				[]
+	{
+		execution = execution,
+		timings = timings,
+		outer_microseconds = outer_microseconds
+	}
 
-			{
-				execution = CompileFrontendFailed(errors),
-				timings = timings
-			}
-		Ok(CompilePreparationStopped(target_path, stage_name, rendered, observations)):
-			record_compile_memory_checkpoint("frontend_stopped")
-			frontend_finished: Int = current_time_when(record_timings)
 
-			timings: List[CompileTiming] = if record_timings:
-				[elapsed_timing("frontend", frontend_started, frontend_finished)]
-			else:
-				[]
+func execute_backend_artifact_compile_tail_timed(
+	late: LateCoreCompileExecution,
+	record_timings: Bool,
+) -> TimedBackendArtifactCompileTail:
+	var timings: List[CompileTiming] = []
+	backend_started: Int = current_time_when(record_timings)
 
-			{
-				execution = CompileStopped(
-					target_path,
-					stage_name,
-					rendered,
-					compile_observations(observations),
-				),
-				timings = timings
-			}
-		Ok(CompilePreparationReady(prepared)):
-			record_compile_memory_checkpoint("frontend_complete")
-			frontend_finished: Int = current_time_when(record_timings)
-			backend_started: Int = frontend_finished
-			execution: CompileExecution = finish_prepared_compile_execution(prepared)
-			record_compile_memory_checkpoint("backend_complete")
+	match emit_backend_compile_execution(late):
+		BackendEmissionCompilePhaseFailed(message):
+			record_phase_terminal_checkpoint(BackendEmissionPhase, CompilerPhaseFailed)
 			backend_finished: Int = current_time_when(record_timings)
+			timings = append_elapsed_timing(
+				timings,
+				record_timings,
+				BackendEmissionPhase,
+				backend_started,
+				backend_finished,
+			)
 
-			timings: List[CompileTiming] = if record_timings:
-				[
-					elapsed_timing("frontend", frontend_started, frontend_finished),
-					elapsed_timing("backend", backend_started, backend_finished),
-				]
+			{
+				execution = CompileEmitFailed(message),
+				timings = timings
+			}
+		BackendEmissionCompilePhaseReady(emitted):
+			record_phase_complete_checkpoint(BackendEmissionPhase)
+			backend_finished: Int = current_time_when(record_timings)
+			timings = append_elapsed_timing(
+				timings,
+				record_timings,
+				BackendEmissionPhase,
+				backend_started,
+				backend_finished,
+			)
+			artifact_started: Int = backend_finished
+			execution: CompileExecution = construct_artifact_compile_execution(emitted)
+
+			artifact_terminal: Bool = match execution:
+				CompileBuildArtifactFailed(_):
+					True
+				_:
+					False
+
+			if artifact_terminal:
+				record_phase_terminal_checkpoint(ArtifactConstructionPhase, CompilerPhaseFailed)
 			else:
-				[]
+				record_phase_complete_checkpoint(ArtifactConstructionPhase)
+
+			artifact_finished: Int = current_time_when(record_timings)
+			timings = append_elapsed_timing(
+				timings,
+				record_timings,
+				ArtifactConstructionPhase,
+				artifact_started,
+				artifact_finished,
+			)
 
 			{
 				execution = execution,
 				timings = timings
 			}
+
+
+private func execute_prepared_compile_execution_timed(
+	prepared: PreparedCompileExecution,
+	record_timings: Bool,
+) -> TimedPreparedCompileTail:
+	var timings: List[CompileTiming] = []
+	late_started: Int = current_time_when(record_timings)
+
+	match run_late_core_compile_execution(prepared):
+		LateCoreCompilePhaseStopped(stage_name, rendered, stopped_observations):
+			record_phase_terminal_checkpoint(LateCorePhase, CompilerPhaseStopped)
+			late_finished: Int = current_time_when(record_timings)
+			timings = append_elapsed_timing(
+				timings,
+				record_timings,
+				LateCorePhase,
+				late_started,
+				late_finished,
+			)
+
+			{
+				execution = CompileStopped(
+					prepared.compilation.target_path,
+					stage_name,
+					rendered,
+					compile_observations(stopped_observations),
+				),
+				timings = timings
+			}
+		LateCoreCompilePhaseInvariantFailed(stage_name, detail):
+			record_phase_terminal_checkpoint(LateCorePhase, CompilerPhaseFailed)
+			late_finished: Int = current_time_when(record_timings)
+			timings = append_elapsed_timing(
+				timings,
+				record_timings,
+				LateCorePhase,
+				late_started,
+				late_finished,
+			)
+
+			{
+				execution = CompileCoreInvariantFailed("${stage_name}: ${detail}"),
+				timings = timings
+			}
+		LateCoreCompilePhaseReady(late):
+			record_phase_complete_checkpoint(LateCorePhase)
+			late_finished: Int = current_time_when(record_timings)
+			timings = append_elapsed_timing(
+				timings,
+				record_timings,
+				LateCorePhase,
+				late_started,
+				late_finished,
+			)
+			tail = execute_backend_artifact_compile_tail_timed(late, record_timings)
+			{
+				execution = tail.execution,
+				timings = timings.concat(tail.timings)
+			}
+
+
+func execute_compile_plan_timed(
+	plan: CliCompilePlan,
+	record_timings: Bool,
+) -> TimedCompileExecution:
+	outer_started: Int = current_time_when(record_timings)
+	record_compile_memory_checkpoint(compiler_phase_start_checkpoint_label(TypedFrontendPhase))
+	typed_started: Int = current_time_when(record_timings)
+	var timings: List[CompileTiming] = []
+
+	match typed_compile_preparation(plan):
+		Err(errors):
+			record_phase_terminal_checkpoint(TypedFrontendPhase, CompilerPhaseFailed)
+			typed_finished: Int = current_time_when(record_timings)
+			timings = append_elapsed_timing(
+				timings,
+				record_timings,
+				TypedFrontendPhase,
+				typed_started,
+				typed_finished,
+			)
+
+			finalize_timed_compile_execution(
+				CompileFrontendFailed(errors),
+				timings,
+				record_timings,
+				outer_started,
+			)
+		Ok(typed):
+			record_phase_complete_checkpoint(TypedFrontendPhase)
+			typed_finished: Int = current_time_when(record_timings)
+			timings = append_elapsed_timing(
+				timings,
+				record_timings,
+				TypedFrontendPhase,
+				typed_started,
+				typed_finished,
+			)
+			lowering_started: Int = typed_finished
+
+			match lower_compile_preparation(typed):
+				Err(errors):
+					record_phase_terminal_checkpoint(CoreLoweringPhase, CompilerPhaseFailed)
+					lowering_finished: Int = current_time_when(record_timings)
+					timings = append_elapsed_timing(
+						timings,
+						record_timings,
+						CoreLoweringPhase,
+						lowering_started,
+						lowering_finished,
+					)
+
+					finalize_timed_compile_execution(
+						CompileFrontendFailed(errors),
+						timings,
+						record_timings,
+						outer_started,
+					)
+				Ok(lowered):
+					record_phase_complete_checkpoint(CoreLoweringPhase)
+					lowering_finished: Int = current_time_when(record_timings)
+					timings = append_elapsed_timing(
+						timings,
+						record_timings,
+						CoreLoweringPhase,
+						lowering_started,
+						lowering_finished,
+					)
+					early_started: Int = lowering_finished
+
+					match run_early_core_compile_preparation(lowered):
+						EarlyCorePhaseFailed(errors):
+							record_phase_terminal_checkpoint(EarlyCorePhase, CompilerPhaseFailed)
+							early_finished: Int = current_time_when(record_timings)
+							timings = append_elapsed_timing(
+								timings,
+								record_timings,
+								EarlyCorePhase,
+								early_started,
+								early_finished,
+							)
+
+							finalize_timed_compile_execution(
+								CompileFrontendFailed(errors),
+								timings,
+								record_timings,
+								outer_started,
+							)
+						EarlyCorePhaseStopped(target_path, stage_name, rendered, observations):
+							record_phase_terminal_checkpoint(EarlyCorePhase, CompilerPhaseStopped)
+							early_finished: Int = current_time_when(record_timings)
+							timings = append_elapsed_timing(
+								timings,
+								record_timings,
+								EarlyCorePhase,
+								early_started,
+								early_finished,
+							)
+
+							finalize_timed_compile_execution(
+								CompileStopped(
+									target_path,
+									stage_name,
+									rendered,
+									compile_observations(observations),
+								),
+								timings,
+								record_timings,
+								outer_started,
+							)
+						EarlyCorePhaseReady(early):
+							record_phase_complete_checkpoint(EarlyCorePhase)
+							early_finished: Int = current_time_when(record_timings)
+							timings = append_elapsed_timing(
+								timings,
+								record_timings,
+								EarlyCorePhase,
+								early_started,
+								early_finished,
+							)
+							early_preparation = early_core_compile_preparation_ready(lowered, early)
+							runtime_started: Int = early_finished
+
+							match project_runtime_compile_preparation(early_preparation):
+								RuntimeProjectionPhaseFailed(errors):
+									record_phase_terminal_checkpoint(
+										RuntimeProjectionPhase,
+										CompilerPhaseFailed,
+									)
+									runtime_finished: Int = current_time_when(record_timings)
+									timings = append_elapsed_timing(
+										timings,
+										record_timings,
+										RuntimeProjectionPhase,
+										runtime_started,
+										runtime_finished,
+									)
+
+									finalize_timed_compile_execution(
+										CompileFrontendFailed(errors),
+										timings,
+										record_timings,
+										outer_started,
+									)
+								RuntimeProjectionPhaseStopped(target_path, stage_name, rendered, observations):
+									record_phase_terminal_checkpoint(
+										RuntimeProjectionPhase,
+										CompilerPhaseStopped,
+									)
+									runtime_finished: Int = current_time_when(record_timings)
+									timings = append_elapsed_timing(
+										timings,
+										record_timings,
+										RuntimeProjectionPhase,
+										runtime_started,
+										runtime_finished,
+									)
+
+									finalize_timed_compile_execution(
+										CompileStopped(
+											target_path,
+											stage_name,
+											rendered,
+											compile_observations(observations),
+										),
+										timings,
+										record_timings,
+										outer_started,
+									)
+								RuntimeProjectionPhaseReady(projected):
+									record_phase_complete_checkpoint(RuntimeProjectionPhase)
+									runtime_finished: Int = current_time_when(record_timings)
+									timings = append_elapsed_timing(
+										timings,
+										record_timings,
+										RuntimeProjectionPhase,
+										runtime_started,
+										runtime_finished,
+									)
+									prepared = prepared_compile_execution_from_projected(
+										runtime_projected_compile_preparation_ready(
+											early_preparation,
+											projected,
+										),
+									)
+									tail = execute_prepared_compile_execution_timed(
+										prepared,
+										record_timings,
+									)
+									finalize_timed_compile_execution(
+										tail.execution,
+										timings.concat(tail.timings),
+										record_timings,
+										outer_started,
+									)
 
 
 func execute_run_artifact_plan(plan: CliRunSourcePlan) -> RunArtifactExecution:

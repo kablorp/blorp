@@ -455,7 +455,7 @@ construction, `benchmarks/compiler_ctfe_typecheck_profile` for Phase 7,
 `benchmarks/compiler_typecheck_name_lookup_profile` for lookup-heavy changes.
 Add a new benchmark only when these cannot isolate the phase.
 
-Compiler memory profiles must include the frontend, backend, and artifact
+Compiler memory profiles must include the seven compile-execution phase
 checkpoints documented in [`benchmarks/README.md`](../benchmarks/README.md).
 Baseline and candidate runs use the same bootstrap, C compiler, flags, fixture,
 and worker configuration. Record raw samples, median, range, checksum,
