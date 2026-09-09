@@ -110,6 +110,60 @@
   29.86 seconds, so further planning work must preserve the no-rescan boundary
   and target this remaining analysis overhead.
 
+  The next backend-temporary slice now gives managed match scrutinees the same
+  region-sensitive treatment without adding an emitter rescan. The planner
+  reserves a typed `MatchScrutineeTemporary` owner at the match node, excludes
+  scrutinee evaluation from that owner's lifetime, and protects it only when a
+  match branch may cancel. Emission looks up the decision by exact `CoreVar`
+  identity. A repeated exact scrutinee is ambiguous without a shared traversal
+  cursor. The planner therefore reruns only an affected activation with every
+  duplicate exact scrutinee forced protected, producing exact nested event and
+  live-slot plans before emission performs its fail-closed lookup. The normal
+  path remains one traversal. Non-variable scrutinees, action mismatches, and
+  missing decisions also retain the existing linked cleanup path.
+
+  Against the immediately preceding Checkpoint 5 compiler, the self-host
+  translation removed 1,166 match frames, guards, pushes, and pops. Generated C
+  fell from 1,266,980 to 1,262,316 lines (4,664 lines, 0.37%) and from
+  88,663,678 to 88,006,228 bytes (657,450 bytes, 0.74%). The diff contained
+  only the four old cleanup lines per omitted frame; retain, release, ARC-only
+  release, stack-result retain/release, and duplicate counts were unchanged.
+  On the preceding same-source snapshot, one directional `-O2` compile sample
+  improved from 106.82 to 102.50 seconds, while retired instructions fell from
+  123,602,616 to 117,361,448 (5.05%).
+
+  Planner cleanup accompanied the slice. Against the direct parent before that
+  cleanup, computing the maximum child live-slot count directly removed a
+  temporary list from every expression. On a focused 10,000-managed-let backend
+  request, allocations and releases each fell by exactly 10,000 (1.79%) with
+  byte-identical C; seven-sample median emission time improved from 1,077,868 to
+  1,072,442 microseconds (0.50%). Match decision concatenation now skips empty
+  child lists, and the per-function match index is absent rather than allocated
+  when a function has no managed match. A broader threaded accumulator
+  prototype produced neither an allocation nor timing improvement on the same
+  request and was rejected rather than retained. To isolate the match-planning
+  slice from that earlier child-list cleanup, a balanced six-sample replay
+  compared it with the immediately preceding candidate on the same no-match
+  request. Both versions performed 549,102 allocations and 549,100 releases;
+  median emission time changed from 1,464,777 to 1,441,994 microseconds (-1.56%,
+  within the observed timing noise).
+
+  A match-bearing replay used 100 functions with 100 uniquely owned,
+  releasing accessor-literal matches apiece. Each function had one checkpoint
+  before those owners were acquired and inert match branches. The direct parent
+  emitted 10,000 frames, guards, pushes, and pops; the candidate emitted none,
+  while both emitted the same 10,000 ordinary releases. After deleting only
+  those four cleanup-line families, the generated C hashes were identical.
+  Generated C fell from 90,726 to 50,726 lines and from 5,156,950 to 1,783,610
+  bytes. Backend-window allocations fell from 1,963,487 to 1,773,587 (9.67%).
+  In a balanced four-sample ABBA run, median inner emission time changed from
+  326,255 to 330,185 microseconds (+1.20%), while a separate balanced six-sample
+  process replay, which includes response serialization, improved from 1.926 to
+  1.860 seconds (-3.42%) and median peak RSS fell from 293,240,832 to
+  272,465,920 bytes (-7.08%). The small isolated emission-time cost buys a much
+  larger allocation, output-size, downstream C-compilation, and resident-memory
+  reduction on the exact optimized path.
+
 ## Objective
 
 Reduce generated cancellation cleanup without weakening Blorp's ownership or

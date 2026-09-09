@@ -17,12 +17,14 @@ import:
 			UnknownCall,
 			UserCall,
 		),
+		CoreConstructorMatchFallback(ConstructorMatchFallbackBody),
 		CoreDecl(FunctionDecl, GlobalDecl),
 		CoreDirectRuntimeArgs(DirectRuntimeArgsAsWritten),
 		CoreDirectRuntimeResult(DirectRuntimeResultAsWritten),
 		CoreExpr(
 			CallExpr,
 			CooperativeCheckpointExpr,
+			ConstructorMatchExpr,
 			DropExpr,
 			IfExpr,
 			LetExpr,
@@ -52,7 +54,11 @@ import:
 		CoreType(NamedType, VoidType),
 		CoreVar,
 	../../../src/compiler/stage_10_backend/cancellation_plan:
-		BackendCleanupTemporaryRole(CallArgumentTemporary, SelectValueTemporary),
+		BackendCleanupTemporaryRole(
+			CallArgumentTemporary,
+			MatchScrutineeTemporary,
+			SelectValueTemporary,
+		),
 		CancellationActivationIdentity(FunctionCancellationActivation),
 		CancellationCleanupAction(
 			ReleaseArcCancellationOwner,
@@ -86,6 +92,7 @@ import:
 		cancellation_function_summary,
 		cancellation_global_initializer_summary,
 		cancellation_let_protection,
+		cancellation_match_scrutinee_protection,
 		cancellation_owner_id_value,
 		cancellation_plan_requires_local_owner_protection,
 		cancellation_site_id,
@@ -269,6 +276,17 @@ pure func local_var(name: String, uniq: Int) -> CoreVar:
 
 pure func owned_string() -> CoreExpr:
 	LiteralExpr(StringLiteral("owned"), STRING_TYPE, SyntheticSourceLoc)
+
+
+pure func releasing_match(scrutinee: CoreVar, branch: CoreExpr) -> CoreExpr:
+	ConstructorMatchExpr(
+		VarExpr(scrutinee, STRING_TYPE, SyntheticSourceLoc),
+		ArcReleasePolicy,
+		[],
+		ConstructorMatchFallbackBody(branch),
+		VoidType,
+		SyntheticSourceLoc,
+	)
 
 
 pure func current_behavior_plan_tracks_live_let_in_lexical_order() -> Bool:
@@ -456,6 +474,115 @@ pure func region_plan(body: CoreExpr) -> CancellationProtectionPlan:
 		body,
 		analyze_program_cancellation(program),
 	)
+
+
+pure func region_plan_omits_inert_match_scrutinee_cleanup() -> Bool:
+	scrutinee: CoreVar = local_var("scrutinee", 61)
+	plan = region_plan(releasing_match(scrutinee, VOID_EXPR))
+
+	match cancellation_match_scrutinee_protection(plan, scrutinee, ArcReleasePolicy):
+		Some(protection):
+			match protection.candidate.owner:
+				BackendTemporaryCancellationOwner(site, MatchScrutineeTemporary):
+					(
+						not protection.tracks_cleanup
+						and cancellation_site_id_value(site) == 0
+						and cancellation_owner_id_value(protection.candidate.id) == 0
+						and plan.match_scrutinee_protections.length() == 1
+						and plan.planned_owner_count == 1
+						and plan.max_live_slots == 0
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func region_plan_protects_match_scrutinee_across_cancellation() -> Bool:
+	scrutinee: CoreVar = local_var("scrutinee", 62)
+	plan = region_plan(
+		releasing_match(
+			scrutinee,
+			CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc),
+		),
+	)
+
+	match cancellation_match_scrutinee_protection(plan, scrutinee, ArcReleasePolicy):
+		Some(protection):
+			protection.tracks_cleanup and plan.max_live_slots == 1
+		None:
+			False
+
+
+pure func repeated_match_scrutinee_lookup_fails_closed() -> Bool:
+	scrutinee: CoreVar = local_var("scrutinee", 63)
+	body: CoreExpr = SeqExpr(
+		releasing_match(scrutinee, VOID_EXPR),
+		releasing_match(scrutinee, VOID_EXPR),
+	)
+	plan = region_plan(body)
+
+	match plan.sites:
+		[first_site, second_site]:
+			(
+				first_site.before.length() == 1
+				and first_site.after.length() == 1
+				and second_site.before.length() == 1
+				and second_site.after.length() == 1
+				and plan.max_live_slots == 1
+				and plan.match_scrutinee_protections.length() == 2
+				and plan.planned_owner_count == 2
+				and cancellation_match_scrutinee_protection(
+					plan,
+					scrutinee,
+					ArcReleasePolicy,
+				).is_none()
+			)
+		_:
+			False
+
+
+pure func nested_repeated_match_scrutinees_preserve_live_slot_capacity() -> Bool:
+	scrutinee: CoreVar = local_var("scrutinee", 66)
+	plan = region_plan(releasing_match(scrutinee, releasing_match(scrutinee, VOID_EXPR)))
+
+	(
+		plan.sites.all(func(site): site.before.length() == 1 and site.after.length() == 1)
+		and plan.sites.length() == 2
+		and plan.max_live_slots == 2
+		and plan.expression_visits == 10
+		and cancellation_match_scrutinee_protection(plan, scrutinee, ArcReleasePolicy).is_none()
+	)
+
+
+pure func match_scrutinee_action_mismatch_fails_closed() -> Bool:
+	scrutinee: CoreVar = local_var("scrutinee", 64)
+	plan = region_plan(releasing_match(scrutinee, VOID_EXPR))
+
+	cancellation_match_scrutinee_protection(plan, scrutinee, ArcReleaseOnlyPolicy).is_none()
+
+
+pure func planned_match_owner_does_not_collide_with_fallback_temporary() -> Bool:
+	scrutinee: CoreVar = local_var("scrutinee", 65)
+	plan = region_plan(releasing_match(scrutinee, VOID_EXPR))
+	fallback = cancellation_backend_temporary_candidate(
+		plan,
+		0,
+		CallArgumentTemporary(0),
+		ArcReleasePolicy,
+		True,
+		False,
+	)
+
+	match (cancellation_match_scrutinee_protection(plan, scrutinee, ArcReleasePolicy), fallback):
+		(Some(match_protection), Some(fallback_protection)):
+			(
+				cancellation_owner_id_value(match_protection.candidate.id) == 0
+				and cancellation_owner_id_value(fallback_protection.id) == 1
+				and match_protection.candidate.slot != fallback_protection.slot
+			)
+		_:
+			False
 
 
 pure func region_plan_ignores_cancellation_before_owner_acquisition() -> Bool:
@@ -999,6 +1126,30 @@ tests: TestSuite = {
 		(
 			"region plans ignore cancellation before owner acquisition",
 			region_plan_ignores_cancellation_before_owner_acquisition,
+		),
+		(
+			"region plans omit inert match scrutinee cleanup",
+			region_plan_omits_inert_match_scrutinee_cleanup,
+		),
+		(
+			"region plans protect match scrutinees across cancellation",
+			region_plan_protects_match_scrutinee_across_cancellation,
+		),
+		(
+			"repeated match scrutinee lookup fails closed",
+			repeated_match_scrutinee_lookup_fails_closed,
+		),
+		(
+			"nested repeated match scrutinees preserve live slot capacity",
+			nested_repeated_match_scrutinees_preserve_live_slot_capacity,
+		),
+		(
+			"match scrutinee action mismatch fails closed",
+			match_scrutinee_action_mismatch_fails_closed,
+		),
+		(
+			"planned match owners do not collide with fallback temporaries",
+			planned_match_owner_does_not_collide_with_fallback_temporary,
 		),
 		(
 			"region plans protect owners across cancellation",
