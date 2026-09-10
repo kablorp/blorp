@@ -1,7 +1,8 @@
 # Compiler Priorities
 
 This document records current cross-cutting compiler outcomes. GitHub issues
-own individual implementation slices, status, assignees, and completed work.
+own active implementation slices, status, and assignees; Git history owns
+completed work.
 Architecture and semantic contracts belong in the reference documents linked
 from [README.md](README.md).
 
@@ -232,8 +233,6 @@ body APIs cannot mutate graph facts, CTFE and ordinary output share one facade,
 and `InferContext` no longer embeds the complete typechecking state.
 
 ### Phase 7: Demand-Driven CTFE Body Materialization
-
-Implementation issue: [Materialize CTFE Bodies On Demand](issues/typechecking/phase-07-demand-driven-ctfe.md).
 
 **Goal:** check only bodies reachable from exact CTFE roots, memoize each body
 once, and reuse accepted artifacts for ordinary output.

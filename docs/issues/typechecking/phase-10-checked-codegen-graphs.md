@@ -46,8 +46,7 @@ Current production behavior, verified on 2026-08-23:
   outcomes.
 - The completed Phase 6 boundary provides per-definition body outcomes and
   exact artifacts.
-- [Phase 7](phase-07-demand-driven-ctfe.md) provides explicit CTFE outcomes and
-  a shared body store.
+- Demand-driven CTFE provides explicit outcomes and a shared body store.
 - [Phase 8](phase-08-solver-finalization.md) ensures accepted body facts are
   meta-free.
 - [Phase 9](phase-09-semantic-validation.md) provides validated/rejected body

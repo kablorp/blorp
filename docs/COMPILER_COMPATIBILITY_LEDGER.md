@@ -20,16 +20,12 @@ a current semantic purpose or a concrete removal prerequisite.
 | Bootstrap-only implementation bridges | 4 clusters | Likely removable, but each needs a focused two-generation self-host check |
 | Internal test/client compatibility | 5 clusters | Mostly small; remove after tightening construction boundaries |
 | Transitional representation adapters | 1 cluster | Still required by the current upstream representation |
-| Legacy compiler architecture | 1 large program | Known and roadmap-owned; not safe for piecemeal deletion |
 | Reviewed false positives | 9 families | Retain; these are not legacy compatibility |
 
 The directly identifiable active compatibility helpers are modest: roughly 220-300
 production lines across Core ownership, CTFE, and explicit bootstrap-shaped
 code. That number excludes the type-containment side-table representation and
-understates migration cost. The resolved source-syntax migration touched
-hundreds of call sites; the remaining accepted-declaration `Env` architecture
-spans many readers and writers and does not yet have a responsible line-count
-estimate.
+understates migration cost.
 
 ## Resolved Entries
 
@@ -184,32 +180,6 @@ The comment calls the input a “temporary legacy group,” but the current
 production data model still produces groups such as `-framework Cocoa`.
 Removing the splitter today would change or break valid foreign-link metadata.
 
-### COMPAT-009: Accepted-declaration `Env` architecture
-
-| Field | Finding |
-| --- | --- |
-| Category | Large internal legacy architecture, not public backwards compatibility |
-| Primary locations | `stage_06_typecheck/type_system/env.brp`; `stage_06_typecheck/decl.brp`; `infer.brp`; header and module-view modules |
-| Remaining categories | Graph-owned aliases, types, constructors, fields, globals, functions, overloads, traits, trait methods, implementations, implementation methods, and UFCS candidates; each roadmap issue must verify its current readers/writers before cutover |
-| Current replacement | Accepted declaration catalog plus per-module visibility views |
-| Current status | The catalog exists as an isolated test/benchmark product but is not yet retained as complete production authority; the environment-reuse roadmap sequences production retention and category cutovers |
-| Lower-bound size signal | At least 27 public `env_add`/`env_get`/`env_find` entry points concern variables, functions, traits, implementations, or overloads; lexical uses must be separated from graph-declaration uses before counting removable lines |
-| Removal prerequisite | Complete `docs/issues/compiler-performance/ENVIRONMENT_REUSE_ROADMAP.md` through Issue 43, including each issue's reader/writer inventory and deletion criteria |
-| Recommendation | **Proceed through the isolated roadmap issues; do not remove individual reads outside their authority cutover** |
-| Confidence | High that the architecture is legacy; intentionally not estimated in lines yet |
-
-`docs/ARCHITECTURE.md` explicitly says callables, globals, traits, and
-implementations still use the legacy accepted-environment path. A precise LOC
-number before the roadmap's category-specific query inventories would be misleading because the
-same `Env` APIs also own valid lexical variables, refinements, type parameters,
-and provisional header state.
-
-The “legacy Env spelling” adapters in
-`stage_06_typecheck/headers/type_header_install.brp:526-554` belong to this
-entry. They preserve owner-local versus importer-local naming during header
-installation and currently have production callers. They are not an
-independent compatibility shim that can be deleted first.
-
 ### COMPAT-010: Expanded match-pattern bootstrap bridge
 
 | Field | Finding |
@@ -257,13 +227,12 @@ of this removal candidate.
 | Introduced | `e3616e35` on 2026-08-16 |
 | Size | Representation-wide; intentionally excluded from the direct-helper line estimate until the alternative payload shape is prototyped |
 | Removal prerequisite | Prototype the embedded representation with the current bootstrap, verify recursive-type projection and containment tests, measure build impact, and prove two-generation self-hosting |
-| Recommendation | **Evaluate before the remaining `Env` cutover; fold into that project if it is not independently simpler** |
+| Recommendation | **Evaluate as an independent bootstrap-representation experiment against the current accepted-authority and session architecture** |
 | Confidence | High that the side-table shape is bootstrap-driven; medium that embedding remains the preferred current design |
 
-This entry overlaps the broader accepted-declaration `Env` architecture but
-has a distinct removal test. If an environment-reuse roadmap issue changes the
-owning representation first, close this entry by documenting that the
-compatibility shape was subsumed rather than attempting a separate rewrite.
+This entry has a distinct removal test. Any replacement must fit the current
+accepted-authority and body-session boundaries rather than recreating the
+superseded declaration-environment architecture.
 
 ## Reviewed Non-Candidates
 
@@ -303,16 +272,13 @@ These matches should not be included in a compatibility-code total:
    phase-specific input type, then delete invalid fixtures.
 9. **Perceus duplicate identities:** reject malformed Core at ingress before
    simplifying precedence behavior.
-10. **Typechecker declaration authority:** execute
-   `docs/issues/compiler-performance/ENVIRONMENT_REUSE_ROADMAP.md` as its own
-   measured architectural project.
-11. **Foreign link groups:** address only as part of a typed foreign-metadata
+10. **Foreign link groups:** address only as part of a typed foreign-metadata
    representation change.
 
 Most entries are candidates for focused cleanup issues. The type-containment
-prototype and declaration-authority work are explicitly not quick compatibility
-purges: they change representation or authority throughout Stage 06's type-system
-and typechecking layers and need the evidence specified above and in their roadmap.
+prototype is explicitly not a quick compatibility purge: it changes
+representation throughout Stage 06's type-system and typechecking layers and
+needs the evidence specified above.
 
 ## Audit Queries
 

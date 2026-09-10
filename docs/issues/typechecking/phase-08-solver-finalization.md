@@ -44,9 +44,9 @@ metas and a fully resolved tree accepted by later semantic checks.
 
 ### Independent But Sequenced Work
 
-- [Phase 7: Demand-Driven CTFE](phase-07-demand-driven-ctfe.md) is scheduled
-  before this issue because it addresses a measured major cost. It consumes the
-  complete Phase 6 facade and should not depend on solver internals.
+- Demand-driven CTFE was implemented before this issue because it addressed a
+  measured major cost. It consumes the complete Phase 6 facade and must not
+  depend on solver internals.
 
 ### Unlocks
 

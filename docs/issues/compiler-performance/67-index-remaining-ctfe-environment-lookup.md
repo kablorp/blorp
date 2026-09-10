@@ -1,6 +1,6 @@
 # Index Remaining CTFE Environment Lookup
 
-**Status:** Recount and admit after Issue 64
+**Status:** Measurement-gated after Issue 66
 
 **Roadmap:** [Stage 06 Latency Reduction Roadmap](STAGE06_LATENCY_REDUCTION_ROADMAP.md)
 
@@ -420,4 +420,3 @@ Residual CTFE binding reads should require one name-index lookup and one exact
 history-position read, while the ordered history continues to express lexical
 scope and immutable assignment semantics. The representation should be kept
 only if it wins after Issue 64 removes the larger source of duplicate requests.
-

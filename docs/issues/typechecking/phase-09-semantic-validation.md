@@ -54,9 +54,8 @@ making final acceptance explicit.
 
 ### Consumers
 
-- [Phase 7: Demand-Driven CTFE](phase-07-demand-driven-ctfe.md) continues to
-  consume the complete Phase 6 artifact; after this issue that artifact can be
-  constructed only from a validated body.
+- Demand-driven CTFE continues to consume the complete Phase 6 artifact; after
+  this issue that artifact can be constructed only from a validated body.
 - [Phase 10: Checked And Codegen-Ready Graphs](phase-10-checked-codegen-graphs.md)
   stores accepted/rejected validation outcomes and prevents rejected bodies
   from reaching Core.

@@ -16,30 +16,16 @@ This document remains authoritative for long-term identity, table, lifetime,
 and migration invariants; the execution roadmap owns the current step order and
 multi-metric acceptance gates.
 
-**Near-term issues:**
-
-1. Execute the [Normalized Semantic Compilation Roadmap](NORMALIZED_SEMANTIC_COMPILATION_ROADMAP.md).
-2. Keep the completed identity checkpoint as the required foundation:
-   [Issue 61B](61-establish-canonical-graph-definition-table.md),
-   [Issue 68](68-use-scalar-definition-ids-for-constructor-identity.md),
-   [Issue 69](69-make-resolved-calls-definition-backed.md),
-   [Issue 70](70-make-nominal-type-ids-definition-backed.md),
-   [Issue 71](71-make-global-ids-definition-backed.md),
-   [Issue 72](72-make-field-ids-definition-backed.md), and
-   [Issue 73](73-normalize-trait-and-implementation-identities.md).
+**Near-term work:** Execute the
+[Normalized Semantic Compilation Roadmap](NORMALIZED_SEMANTIC_COMPILATION_ROADMAP.md).
+The completed module and definition identity checkpoints are prerequisites,
+not active issues.
 
 ## Relationship To Current Documentation
 
 This roadmap changes the proposed long-term ownership model; it does not
 retroactively change current production truth.
 
-- [Graph-Local Module ID Roadmap](GRAPH_MODULE_ID_ROADMAP.md) records why a
-  bare graph-local integer cannot act as durable identity and preserves the
-  measurements from Issues 45-55.
-- [Stage 6 Dense Module-Index Migration Roadmap](STAGE6_DENSE_MODULE_INDEX_MIGRATION_ROADMAP.md)
-  records the accepted and rejected Stage 06 representation experiments,
-  including the large win from unboxed type ownership and the regressions from
-  per-declaration managed scopes and compensating dictionaries.
 - `docs/ARCHITECTURE.md` records the Stage 04-owned `ModuleTable` implemented by
   Issue 56. Issues 57-58 made that shared domain authoritative through Stage 06,
   CTFE, and Core graph lowering. External products remain descriptive where
@@ -49,11 +35,10 @@ retroactively change current production truth.
   typechecking phase decomposition, accepted/recoverable products, and
   demand-driven CTFE. Table normalization must follow those semantic
   boundaries rather than create a parallel typechecker.
-- [Issue 59's rejected lexical-parameter batching experiment](59-batch-lexical-parameter-scope-publication.md)
-  confirms that transient `Env` and lexical scope state should not be pulled
-  into the compilation database merely because it is expensive. The retained
-  scalar scope-list cleanup is independent of the durable entity-table work
-  below.
+- A rejected lexical-parameter batching experiment confirmed that transient
+  `Env` and lexical scope state should not be pulled into the compilation
+  database merely because it is expensive. The retained scalar scope-list
+  cleanup is independent of the durable entity-table work below.
 
 The new direction is not that the existing graph-local slot was secretly
 durable. It is to make the issuing table a retained compilation product so a
@@ -1031,7 +1016,7 @@ consumer of the normalized ID spine.
 
 Horizon 2 has one table foundation followed by six bounded identity cuts:
 
-1. **[Issue 61B: Establish the canonical graph definition table](61-establish-canonical-graph-definition-table.md) (implemented).**
+1. **Issue 61B: Establish the canonical graph definition table (implemented).**
    Turn the production `DefinitionIndex` allocation entries into one immutable
    table of graph-owned definition rows plus owner/name indexes. Preserve the
    exact existing allocation frontier and make builtin, graphless, and rejected
@@ -1040,31 +1025,31 @@ Horizon 2 has one table foundation followed by six bounded identity cuts:
    add a second declaration catalog. The completed cut selected a dense table
    with an explicit graph base after proving that every production extension is
    append-only; it also deleted the dormant catalog and its private harnesses.
-2. **[Issue 68: Use scalar definition IDs for constructor identity](68-use-scalar-definition-ids-for-constructor-identity.md) (implemented).**
+2. **Issue 68: Use scalar definition IDs for constructor identity (implemented).**
    Replace the managed structural/runtime constructor identity with a
    table-scoped, category-checked scalar ID. Materialize canonical
    owner/name/span facts only from the issuing `DefinitionTable`.
-3. **[Issue 69: Make resolved calls definition-backed](69-make-resolved-calls-definition-backed.md) (implemented).**
+3. **Issue 69: Make resolved calls definition-backed (implemented).**
    Replace managed callable identity records, raw direct-call integers, and
    imported/implementation-method module-path metadata with scalar callable
    IDs backed by the definition table. CTFE and Core lowering derive the owner
    module from the table and delete per-expression path-to-ID probes. The
    completed cut also replaced a modules-times-callables body-planning scan
    with contiguous per-module ranges over the canonical callable list.
-4. **[Issue 70: Make nominal type IDs definition-backed](70-make-nominal-type-ids-definition-backed.md) (implemented).**
+4. **Issue 70: Make nominal type IDs definition-backed (implemented).**
    Replace `TypeIdRep { module_id, name, span }` and its serialized storage keys
    with a category-safe scalar definition ID. Cut accepted alias, record, and
    union authorities over in the same issue so the old managed identity does
    not survive beside the new one.
-5. **[Issue 71: Make global IDs definition-backed](71-make-global-ids-definition-backed.md) (implemented).**
+5. **Issue 71: Make global IDs definition-backed (implemented).**
    Claim the already reserved global definition row, replace structural
    `GlobalId`, remove duplicate raw IDs from accepted graph bindings, and make
    exact accepted-global lookup integer-addressed.
-6. **[Issue 72: Make field IDs definition-backed](72-make-field-ids-definition-backed.md) (implemented).**
+6. **Issue 72: Make field IDs definition-backed (implemented).**
    Replace raw optional field definition integers with `FieldId`, publish the
    exact field-to-parent-type relation once, and thread typed field identity
    through inference and semantic occurrences.
-7. **[Issue 73: Normalize trait and implementation identities](73-normalize-trait-and-implementation-identities.md) (implemented).**
+7. **Issue 73: Normalize trait and implementation identities (implemented).**
    Scalarize graph trait and implementation IDs, give compiler builtins an
    explicit identity domain, compact trait method identity, and consolidate
    relationship/module-view indexes around named production queries.
