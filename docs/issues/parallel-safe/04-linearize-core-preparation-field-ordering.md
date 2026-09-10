@@ -1,9 +1,19 @@
 # Linearize Core Preparation Field Ordering
 
-**Status:** Candidate committed at `9ea9b1f3`; acceptance measurement and
-integration decision remain
+**Status:** Rejected after quiet-host acceptance measurement; candidate
+`18742c18` is not to be merged
 
 **Kind:** Independent late-Core optimization
+
+## Rejection Result
+
+Twelve alternating quiet-host samples per side rejected the candidate on its
+focused gates. The one-field case regressed 9.60% in elapsed time and 9.09% in
+allocations. The 64-field case regressed 0.60%. The 256-field case improved
+15.63%, below the required 30%, and the mixed-width fixture improved 6.28%,
+below the required 10%. The representation is cleaner asymptotically, but its
+measured common-case and allocation costs make it unsuitable as the production
+algorithm without a different design.
 
 **Parallel owner boundary:**
 

@@ -51,20 +51,18 @@ the late-Core profile review.
 ## Dependency And Conflict Map
 
 The prepared-reuse and consume-specialization issues own separate production
-files and can be developed independently. Preparation declaration indexing
-must begin only after the field-ordering candidate at `9ea9b1f3` is either
-merged or rejected because both changes edit `prepare.brp` and its focused
-tests. The checkpoint issue is runtime-only and has no source-file dependency
-on the three Core indexes.
+files and can be developed independently. The field-ordering candidate was
+rejected after quiet-host measurement, so preparation declaration indexing
+starts from current `main` without it. The checkpoint issue is runtime-only and
+has no source-file dependency on the three Core indexes.
 
 Recommended integration order:
 
-1. validate and decide the field-ordering candidate;
-2. prepared-reuse declaration indexing;
-3. Core-preparation declaration indexing;
-4. consume-specialization candidate indexing;
-5. repeat the clean late-Core profile;
-6. checkpoint amortization against that new parent.
+1. prepared-reuse declaration indexing;
+2. Core-preparation declaration indexing;
+3. consume-specialization candidate indexing;
+4. repeat the clean late-Core profile;
+5. checkpoint amortization against that new parent.
 
 Checkpoint amortization is deliberately last even though it is source-file
 independent. Removing algorithmic scans first gives its semantic tradeoff a

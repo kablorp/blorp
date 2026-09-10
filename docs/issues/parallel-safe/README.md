@@ -1,7 +1,7 @@
 # Parallel-Safe Compiler Latency Work
 
-**Status:** Historical packet; lanes 1–3 are merged, lane 4 has an unaccepted
-candidate, and lane 5 moved to the late-Core latency packet
+**Status:** Historical packet; lanes 1–3 are merged, lane 4 was rejected, and
+lane 5 moved to the late-Core latency packet
 
 **Baseline:** `30ff91683cda52fde14d76f5babe43ee7753bbd3`
 
@@ -17,8 +17,7 @@ Current reconciliation:
 - phase timing is implemented and accepted;
 - match-projection declaration indexing is merged in `c109117b`;
 - type-home indexing is merged in `174983f4`;
-- field-order linearization is committed at `9ea9b1f3` and still requires its
-  acceptance decision; and
+- field-order linearization was rejected after quiet-host measurement; and
 - runtime checkpoint Phase A is now specified by
   [the late-Core execution issue](../late-core-latency/04-amortize-runtime-cooperative-checkpoints.md).
 
@@ -196,6 +195,6 @@ repeat the clean compile-through-C profile and update the compiler performance
 roadmap from the new bottleneck distribution.
 
 The completed issue files in this directory retain their execution history.
-Field ordering remains governed here until its acceptance decision. Runtime
-checkpoint work is governed by the linked late-Core issue, whose narrower
-carrier-thread and cancellation contracts supersede the earlier Phase A text.
+Runtime checkpoint work is governed by the linked late-Core issue, whose
+narrower carrier-thread and cancellation contracts supersede the earlier
+Phase A text.

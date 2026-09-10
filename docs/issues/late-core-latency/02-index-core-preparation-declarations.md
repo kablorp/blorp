@@ -1,14 +1,15 @@
 # Index Core-Preparation Declarations
 
-**Status:** Ready after the field-ordering acceptance decision is recorded
+**Status:** Ready; field-ordering dependency was rejected after measurement
 
 **Kind:** Pass-local late-Core latency and API-precision improvement
 
 **Production owner:** `blorp/src/compiler/stage_09_core/prepare.brp`
 
-**Dependency:** Decide commit `9ea9b1f3` before starting. If accepted, base this
-work on that commit. If rejected, base it on the resulting `main`. The candidate
-edits the same production helper and focused test suite.
+**Dependency:** The field-ordering candidate was rejected after quiet-host
+measurement. Base this work on current `main`; do not incorporate `18742c18` or
+`9ea9b1f3`. The rejected candidate edited the same production helper and
+focused test suite.
 
 ## Objective
 
@@ -204,29 +205,26 @@ available instead of accepting an arbitrary program list.
 
 ## Interaction With Field-Order Linearization
 
-Commit `9ea9b1f3` replaces nested supplied-field search with one temporary
-field dictionary per record literal. It intentionally leaves declaration
-lookup unchanged.
+The field-order candidate at `18742c18` was rejected because it missed its
+focused latency and allocation gates. Current `main` therefore retains nested
+supplied-field search per record literal. That operation is distinct from the
+whole-program declaration scans owned by this issue.
 
-After both changes, a record literal should perform:
+After this change, a record literal should perform:
 
 ```text
-one program declaration lookup
-+ one supplied-field indexing visit per field
-+ one declaration-order field read per field
+one program declaration index read
++ the existing supplied-field ordering work
 ```
 
-Resolve field ordering first. If accepted, preserve its
-`index_unique_record_fields` helper and duplicate-field semantics, keep the
-per-program declaration index separate from the per-literal supplied-field
-index, and rerun its one- and four-field benchmarks as regression controls. If
-rejected, preserve the current nested field-order behavior and use the existing
-record-order semantic tests plus the declaration benchmark's one- and
-four-field cases as regression controls; do not invoke branch-only artifacts.
+Preserve current field-order behavior byte for byte. Use the record-order tests
+already present on `main` plus the declaration benchmark's one- and four-field
+cases as regression controls. Do not invoke or copy the rejected branch's
+benchmark artifacts.
 
 ## Test-First Plan
 
-Extend `test_core_prepare.brp` after resolving the field-order branch:
+Extend the current-parent `test_core_prepare.brp`:
 
 1. each supported declaration kind at the beginning, middle, and end;
 2. large unrelated declaration prefixes and suffixes do not change output;
@@ -246,9 +244,7 @@ Extend `test_core_prepare.brp` after resolving the field-order branch:
 14. Epoch A and Epoch B each build from their own supplied program; and
 15. complete prepared Core and generated C remain identical.
 
-If field ordering was accepted, its tests for missing, extra, duplicate,
-generic, nested, and release-policy-sensitive records remain mandatory. If it
-was rejected, retain every record-order test present on the selected parent.
+Retain every record-order test present on current `main`.
 
 ## Focused Benchmark
 
@@ -308,8 +304,8 @@ high-declaration control to expose unconditional index-construction cost.
 
 ## Incremental Implementation
 
-1. Record the field-order acceptance decision. Rebase onto it if accepted;
-   otherwise start from the resulting `main`.
+1. Start from current `main` and verify that neither rejected field-order
+   commit is present.
 2. Add work counters to the existing declaration and variant scans.
 3. Record immediate-parent focused and compiler self-compilation baselines.
 4. Add duplicate, fallback, exact-ID, cross-kind, and two-epoch tests.
@@ -323,8 +319,8 @@ high-declaration control to expose unconditional index-construction cost.
     solely for lookup.
 11. Report the retained variant-axis measurement and leave its implementation
     unchanged.
-12. Verify complete Core and generated C identity. If field ordering was
-    accepted, also verify its benchmark identity.
+12. Verify complete Core and generated C identity, including current record
+    field ordering.
 13. Collect alternating optimized measurements and run final review.
 
 The counters in step 2 belong in the issue-owned profiler or behind
@@ -343,13 +339,6 @@ bin/blorp test --timeout 180 \
 benchmarks/compiler_prepare_decl_index_profile plain 1 256 128 128 128 8
 
 scripts/compiler-check --changed
-```
-
-If field ordering was accepted, guard its performance on common widths:
-
-```bash
-benchmarks/compiler_prepare_field_order_profile plain 10 4096 1
-benchmarks/compiler_prepare_field_order_profile plain 10 4096 4
 ```
 
 Mechanical completion search:
@@ -393,8 +382,8 @@ and paired timings.
 - Every whole-declaration scan in `prepare.brp` is deleted.
 - Variant traversal is retained with explicit counters and unchanged semantics.
 - Record field ordering remains a distinct per-literal operation.
-- Complete Core and generated C are identical. Field-order results are also
-  identical to whichever accepted/rejected parent this issue uses.
+- Complete Core and generated C are identical, including current-main
+  field-order results.
 - Focused and compiler-on-compiler results are recorded against the immediate
   parent.
 - Correctness, performance, test-runner, and code-reviewer reviews pass.
@@ -423,9 +412,8 @@ and paired timings.
       the issue is rejected.
 - [ ] Other named phases show no repeatable regression above 1%, and whole
       compilation shows no repeatable regression above 2%.
-- [ ] Prepared Core JSON, generated C bytes/SHA-256, diagnostics, and
-      declaration order match the baseline. If field ordering was accepted,
-      its benchmark checksum also matches.
+- [ ] Prepared Core JSON, generated C bytes/SHA-256, diagnostics, declaration
+      order, and record field order match current `main`.
 - [ ] Core prepare, Core pipeline, Core sanitizer, changed compiler, and
       compiler-owned suites pass.
 
