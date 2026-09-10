@@ -513,6 +513,12 @@ generation only in backend projection.
 Profile before changing representation or allocation policy. Prefer removing
 structural work over allocator tuning.
 
+The cross-platform profiling infrastructure, exact-probe scalability, sampling,
+and reproducible compiler-profile workflow are tracked in the
+[Profiling Capability Roadmap](issues/profiling/README.md). Performance work
+should use that ladder as its profiling slices land rather than grow new
+revision-specific scripts under ignored `logs/` directories.
+
 Highest-value generated-program opportunities:
 
 - ownership-aware record, union, and collection reuse;
