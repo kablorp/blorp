@@ -1,6 +1,6 @@
 # Issue 72: Make Field IDs Definition-Backed
 
-**Status:** Ready after Issues 68 and 70
+**Status:** Implemented
 
 **Roadmap:** [Normalized Compilation Database Roadmap](NORMALIZED_COMPILATION_DATABASE_ROADMAP.md)
 
@@ -19,7 +19,7 @@ updates/patterns, semantic occurrences, and external projection. Publish the
 field-to-parent-type relation once and remove untyped `Option[Int]` field
 identity from accepted/resolved paths.
 
-The target relationship is:
+The implemented relationship is:
 
 ```text
 FieldId -> DefinitionId -> DefinitionRow {
@@ -111,15 +111,42 @@ represented explicitly.
 Make the ID a checked scalar:
 
 ```blorp
-opaque type FieldId = DefinitionId
+opaque type FieldId = Int
 
 pure func definition_table_field_id(
 	table: DefinitionTable,
-	definition_id: DefinitionId,
+	runtime_definition_id: Int,
 ) -> Option[FieldId]
 
-pure func field_id_definition_id(id: FieldId) -> DefinitionId
+pure func field_id_definition_id(id: FieldId) -> Int
 ```
+
+`FieldId` uses the same non-negative runtime value as its checked
+`DefinitionId`; construction remains private to category-checking table APIs.
+Typed nodes store a scalar `ResolvedFieldIdentity` rather than
+`Option[FieldId]`. This is the explicit graph-field-or-no-graph-field state,
+and avoids an existing lowering limitation that otherwise boxes the option in
+every containing record and union variant.
+
+## Completed Absence-State Ledger
+
+| Location | Present state | Absent state | Result |
+| --- | --- | --- | --- |
+| `TypeHeaderField.id` | reserved, category-checked field row | impossible in an accepted header | mandatory `FieldId` |
+| `AcceptedFieldRow.id` | accepted field with exact parent and source index | impossible | mandatory `FieldId` |
+| provisional `FieldDecl` | no graph identity is published yet | normal before accepted publication | identity removed from `FieldDecl` |
+| `TypedRecordFieldInfo.field_id` | accepted declaration field | only recovery/unindexed construction | scalar `ResolvedFieldIdentity` |
+| `TypedRecordField.field_id` | resolved record literal/update field | unknown/recovery or CTFE-synthetic field | scalar `ResolvedFieldIdentity` |
+| `TypedFieldAccessExpr` identity | resolved record field access, including callable-field/UFCS resolution | tuple field, qualified module member, or recovery | scalar `ResolvedFieldIdentity` |
+| `ResolvedRecordField.field_id` | accepted ordered record shape | provisional/recovery shape | scalar `ResolvedFieldIdentity` |
+| `TypedExprInfo.resolved_definition_id` | existing non-field mixed identities | expression is not such a reference | unchanged; field access projects its `FieldId` first |
+
+The audit found no record-field assignment target or record-field pattern in
+the current parsed or typed language. Those prospective paths were therefore
+removed from the implementation scope rather than represented heuristically.
+Tuple fields, qualified module members, recovery expressions, and CTFE-created
+record values legitimately carry the explicit missing state; none receives a
+fabricated graph ID.
 
 Publish exact parent ownership in the accepted type/record product:
 
@@ -208,8 +235,7 @@ In scope:
 - accepted record field metadata and lookup;
 - field identities in `Env` only where accepted/provisional field metadata is
   intentionally present;
-- record construction, update, access, assignment, patterns, and UFCS field
-  resolution;
+- record construction, update, access, and UFCS field resolution;
 - semantic occurrences and typed-AST/LSP projection;
 - explicit tuple/synthetic/recovery field states found by the audit; and
 - deletion of raw optional field definition identity and redundant owner/name
@@ -301,7 +327,7 @@ Vary:
 - modules and records per module;
 - fields per record;
 - same-name fields across different parent records;
-- field access, construction, update, assignment, and pattern occurrence count;
+- field access, construction, and update occurrence count;
 - resolved versus recovery occurrences; and
 - source-name versus exact-ID query count.
 
@@ -334,6 +360,71 @@ regression.
 - Focused field-heavy work reduces allocations or retired instructions with no
   material latency or RSS regression.
 - Focused, changed, Stage 06, compiler, leak, and sanitizer gates pass.
+
+## Implementation Result
+
+`FieldId` is now a category-checked opaque integer backed by an existing
+`FieldDefinition` row. Accepted type headers and record authority require it,
+and `AcceptedFieldRow` stores its exact parent `TypeId`, semantic type, and
+source-order index once per declaration. Accepted construction rejects a wrong
+parent, wrong order, duplicate identity, wrong module/owner, or wrong
+definition category.
+
+Typed record fields, record shapes, and field accesses carry a scalar
+`ResolvedFieldIdentity`. The scalar uses a named impossible negative value for
+the legitimate tuple/module/recovery/synthetic cases in the completed ledger;
+this avoids the per-occurrence box that `Option[FieldId]` generated inside
+records and union variants. Record-field assignment and record-field patterns
+do not exist in the current parsed or typed language and were not fabricated
+for this issue.
+
+Source field spelling is resolved once through the existing visible record
+shape. The resulting `FieldId` addresses a compact exact locator in accepted
+record authority, validates the parent `TypeId`, and substitutes only the
+selected field type. The previous path localized and substituted the complete
+record field list before selecting one field. Semantic occurrences,
+typed-AST JSON, CTFE, Core lowering, and lint project the raw integer only at
+their existing boundaries; external schemas did not change.
+
+Generated C inspection confirms that `FieldId` and
+`ResolvedFieldIdentity` are emitted as unboxed `long` values throughout type
+headers, accepted rows, record shapes, and typed expressions. Field identities
+are absent from ARC release masks and do not retain an option box or table.
+
+The production-shaped `bodies` benchmark was extended without increasing the
+number of functions or body sessions: each target body performs repeated
+resolved field accesses. Clean `-O2` before/after results with identical
+fixtures and checksums were:
+
+| Resolved field accesses per module | Baseline median | Current median | Latency | Allocations |
+| --- | ---: | ---: | ---: | ---: |
+| 64 | 4,372 us | 3,776 us | -13.6% | 17,514 -> 13,930 (-20.5%) |
+| 256 | 17,304 us | 14,836 us | -14.3% | 65,146 -> 50,810 (-22.0%) |
+
+The reduction scales at seven allocations per resolved field access. Headers
+retain the same allocation count with a median latency delta of about +0.6%,
+within noise. Accepted-graph construction adds about 0.49% transient
+allocations for the mandatory relation rows, while its median latency improved
+about 3.2%; retained objects and bytes were unchanged.
+
+Validation completed:
+
+- focused field/decl/JSON/CTFE/Core suites: 664 tests passed;
+- semantic-index focused leak suite: 18 tests passed with zero per-test leaks;
+- `scripts/compiler-check --stage typecheck`: 43 sources, 37 suites, and 2
+  special checks passed;
+- `scripts/compiler-check --changed`: 16 sources, 24 suites, and 4 special
+  checks passed, including Core sanitizers, compiler tools, declaration
+  boundaries, and the leak gate; and
+- full `compiler-blorp` plus `compiler-blorp-sanitize`: 8,021 tests passed
+  (4,360 ordinary and 3,661 ASan/UBSan), zero failures.
+
+Final diffstat is separated by ownership: production `+725/-173` (net +552),
+tests `+417/-81` (net +336), benchmark fixtures `+27/-5` (net +22), and docs
+`+100/-9` (net +91). The production increase is the explicit identity cutover
+across typed AST, accepted authority, CTFE/Core consumers, category validation,
+and boundary projection; no compatibility layer or duplicate old field-ID
+path remains.
 
 ## Stop Conditions
 

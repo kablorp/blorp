@@ -1,8 +1,18 @@
 import:
 	../../../src/compiler/stage_04_modules/module_table: ModuleId
 	../../../src/compiler/stage_06_typecheck/graph/indexed_graph: PreparedModuleScope
+	../../../src/compiler/stage_06_typecheck/graph/definition_index:
+		FieldId,
+		field_id_definition_id,
+		field_ids_equal,
 	../../../src/compiler/stage_06_typecheck/graph/type_identity: TypeId, type_ids_equal
 	../../../src/compiler/stage_06_typecheck/type_system/accepted_record_authority:
+		AcceptedFieldExactLookup(
+			AcceptedFieldExactFound,
+			AcceptedFieldExactIncompatibleDefinitionTable,
+			AcceptedFieldExactMissing,
+		),
+		AcceptedFieldRow,
 		AcceptedRecordExactLookup(
 			AcceptedRecordExactFound,
 			AcceptedRecordExactMissing,
@@ -17,7 +27,10 @@ import:
 		accepted_record_contains_resource,
 		accepted_record_exact,
 		accepted_record_find,
+		accepted_record_find_field_id,
+		accepted_record_find_field_type_by_id,
 		accepted_record_find_names_with_fields,
+		accepted_record_field_exact,
 		accepted_record_is_value,
 		accepted_record_may_contain_function,
 		accepted_record_may_contain_one_shot_stream,
@@ -27,7 +40,6 @@ import:
 		accepted_record_resource_scan_is_proven_unnecessary,
 		accepted_record_table,
 		accepted_record_table_entry_count,
-	../../../src/compiler/stage_06_typecheck/type_system/env: FieldDecl
 	../../../src/compiler/stage_06_typecheck/type_system/semantic_type:
 		SemanticType(SemanticNamedType),
 		TYPE_INT,
@@ -35,20 +47,29 @@ import:
 		canonical_module_type_name,
 		types_equal,
 	../typecheck_test_support:
-		DefinitionBackedTypeFixtureModule,
-		definition_backed_type_fixture,
+		DefinitionBackedRecordFixture,
+		DefinitionBackedRecordFixtureModule,
+		definition_backed_record_fixture,
+		definition_backed_record_fixture_field_id,
 		definition_backed_type_fixture_definition_table,
 		definition_backed_type_fixture_type_id,
 		module_id_fixture_find,
 	test: TestSuite
 
 
-private FIXTURE_MODULES: List[DefinitionBackedTypeFixtureModule] = [
-	{module_path = "app/main", type_names = ["Point", "Capabilities", "Plain"]},
-	{module_path = "pkg/left", type_names = ["Node", "AliasOnly"]},
-	{module_path = "pkg/right", type_names = ["Node"]},
-	{module_path = "pkg/unrelated", type_names = ["Other"]},
-	{module_path = "pkg/pair", type_names = ["Pair"]},
+private FIXTURE_MODULES: List[DefinitionBackedRecordFixtureModule] = [
+	{module_path = "app/main", records = [
+		{name = "Point", field_names = ["x", "y"]},
+		{name = "Capabilities", field_names = ["value"]},
+		{name = "Plain", field_names = ["value"]},
+	]},
+	{module_path = "pkg/left", records = [
+		{name = "Node", field_names = ["next"]},
+		{name = "AliasOnly", field_names = ["value"]},
+	]},
+	{module_path = "pkg/right", records = [{name = "Node", field_names = ["text"]}]},
+	{module_path = "pkg/unrelated", records = [{name = "Other", field_names = ["value"]}]},
+	{module_path = "pkg/pair", records = [{name = "Pair", field_names = ["y", "x"]}]},
 ]
 
 
@@ -60,50 +81,67 @@ private pure func fixture_type_id(
 	definition_backed_type_fixture_type_id(fixture, module_path, name)
 
 
-private pure func field(name: String, typ: SemanticType) -> FieldDecl:
-	{
-		name = name,
-		field_type = typ,
-		definition_id = None
-	}
-
-
 private pure func fixture_record(
 	fixture: PreparedModuleScope,
 	module_path: String,
 	name: String,
 	canonical_visible: Bool,
-	fields: List[FieldDecl],
+	fields: List[(String, SemanticType)],
 ) -> Option[AcceptedRecordTableRecord]:
 	id ?= fixture_type_id(fixture, module_path, name)
-	Some({
+	var accepted_fields: List[AcceptedFieldRow] = []
+	var valid: Bool = True
+	var index: Int = 0
+
+	for (field_name, field_type) in fields:
+		match definition_backed_record_fixture_field_id(
+			fixture,
+			module_path,
+			name,
+			field_name,
+		):
+			Some(field_id):
+				accepted_fields = accepted_fields.append({
+					id = field_id,
+					parent = id,
+					field_type = field_type,
+					index = index
+				})
+			None:
+				valid = False
+		index += 1
+
+	if not valid:
+		None
+	else:
+		Some({
 		id = id,
 		canonical_name = canonical_module_type_name(module_path, name),
 		canonical_visible = canonical_visible,
 		payload = {
 			type_params = [],
-			fields = fields,
+			fields = accepted_fields,
 			is_value = False,
 			contains_resource = False,
 			may_contain_function = False,
 			may_contain_one_shot_stream = False,
 			may_contain_resource_source = False
 		}
-	})
+		})
 
 
 private pure func table_input(
 	fixture: PreparedModuleScope,
 	include_unrelated: Bool,
 ) -> Option[AcceptedRecordTableInput]:
-	left ?= fixture_record(fixture, "pkg/left", "Node", True, [field(
+	left ?= fixture_record(fixture, "pkg/left", "Node", True, [(
 				"next",
 				SemanticNamedType(
 					canonical_module_type_name("pkg/left", "Node"),
 					[],
 				),
 			)])
-	right ?= fixture_record(fixture, "pkg/right", "Node", False, [field("text", TYPE_STRING)])
+	right ?= fixture_record(fixture, "pkg/right", "Node", False, [("text", TYPE_STRING)])
 	alias_id ?= fixture_type_id(fixture, "pkg/left", "AliasOnly")
 	known_type_ids = [left.id, right.id, alias_id]
 	-- Keep the owner-local record away from index zero so module-view bindings
@@ -116,7 +154,7 @@ private pure func table_input(
 				"pkg/unrelated",
 				"Other",
 				True,
-				[field("value", TYPE_INT)],
+				[("value", TYPE_INT)],
 			).map(
 			func(unrelated): {
 				definition_table = definition_backed_type_fixture_definition_table(fixture),
@@ -133,7 +171,7 @@ private pure func table_input(
 
 
 private pure func record_authority_is_category_safe_and_local_result() -> Option[Bool]:
-	fixture ?= definition_backed_type_fixture(FIXTURE_MODULES)
+	fixture ?= definition_backed_record_fixture(FIXTURE_MODULES)
 	input ?= table_input(fixture, False)
 	table ?= accepted_record_table(input)
 	owner ?= module_id_fixture_find(fixture, "pkg/left")
@@ -153,6 +191,8 @@ private pure func record_authority_is_category_safe_and_local_result() -> Option
 	)
 	authority = accepted_record_authority(table, view)
 	entry ?= accepted_record_find(authority, "Node")
+	selected_id ?= accepted_record_find_field_id(authority, "Node", "next")
+	selected_type ?= accepted_record_find_field_type_by_id(authority, "Node", selected_id)
 	canonical_entry ?= accepted_record_find(
 		authority,
 		canonical_module_type_name("pkg/left", "Node"),
@@ -174,6 +214,12 @@ private pure func record_authority_is_category_safe_and_local_result() -> Option
 
 	Some(types_equal(
 			next.field_type,
+			SemanticNamedType("Node", []),
+		) and field_ids_equal(
+			selected_id,
+			next.id,
+		) and types_equal(
+			selected_type,
 			SemanticNamedType("Node", []),
 		) and types_equal(
 			canonical_next.field_type,
@@ -197,7 +243,7 @@ private pure func record_authority_is_category_safe_and_local() -> Bool:
 
 
 private pure func table_rejects_forged_canonical_name_result() -> Option[Bool]:
-	fixture ?= definition_backed_type_fixture(FIXTURE_MODULES)
+	fixture ?= definition_backed_record_fixture(FIXTURE_MODULES)
 	input ?= table_input(fixture, False)
 	record_entry ?= input.records.get(0)
 	forged = { record_entry | canonical_name = "Option" }
@@ -210,8 +256,52 @@ private pure func table_rejects_forged_canonical_name() -> Bool:
 	table_rejects_forged_canonical_name_result().get_or(False)
 
 
+private pure func table_rejects_invalid_field_relations_result() -> Option[Bool]:
+	fixture ?= definition_backed_record_fixture(FIXTURE_MODULES)
+	point ?= fixture_record(
+		fixture,
+		"app/main",
+		"Point",
+		True,
+		[("x", TYPE_INT), ("y", TYPE_INT)],
+	)
+	pair ?= fixture_record(
+		fixture,
+		"pkg/pair",
+		"Pair",
+		True,
+		[("y", TYPE_STRING), ("x", TYPE_STRING)],
+	)
+	first ?= point.payload.fields.get(0)
+	second ?= point.payload.fields.get(1)
+	base: AcceptedRecordTableInput = {
+		definition_table = definition_backed_type_fixture_definition_table(fixture),
+		known_type_ids = [point.id, pair.id],
+		records = [point, pair]
+	}
+	wrong_parent = { point | payload = { point.payload |
+			fields = point.payload.fields.set(0, { first | parent = pair.id })
+		} }
+	wrong_order = { point | payload = { point.payload |
+			fields = point.payload.fields.set(0, { first | index = 1 })
+		} }
+	duplicate_id = { point | payload = { point.payload |
+			fields = point.payload.fields.set(1, { second | id = first.id })
+		} }
+
+	Some(
+		accepted_record_table({ base | records = [wrong_parent, pair] }).is_none()
+		and accepted_record_table({ base | records = [wrong_order, pair] }).is_none()
+		and accepted_record_table({ base | records = [duplicate_id, pair] }).is_none()
+	)
+
+
+private pure func table_rejects_invalid_field_relations() -> Bool:
+	table_rejects_invalid_field_relations_result().get_or(False)
+
+
 private pure func module_view_rejects_private_import_result() -> Option[Bool]:
-	fixture ?= definition_backed_type_fixture(FIXTURE_MODULES)
+	fixture ?= definition_backed_record_fixture(FIXTURE_MODULES)
 	input ?= table_input(fixture, False)
 	table ?= accepted_record_table(input)
 	left_owner ?= module_id_fixture_find(fixture, "pkg/left")
@@ -249,7 +339,7 @@ private pure func module_view_rejects_private_import() -> Bool:
 
 
 private pure func exact_record_queries_ignore_unrelated_modules_result() -> Option[Bool]:
-	fixture ?= definition_backed_type_fixture(FIXTURE_MODULES)
+	fixture ?= definition_backed_record_fixture(FIXTURE_MODULES)
 	base_input ?= table_input(fixture, False)
 	expanded_input ?= table_input(fixture, True)
 	base ?= accepted_record_table(base_input)
@@ -277,7 +367,7 @@ private pure func exact_record_queries_ignore_unrelated_modules() -> Bool:
 
 
 private pure func visible_field_shape_lookup_preserves_binding_order_result() -> Option[Bool]:
-	fixture ?= definition_backed_type_fixture(FIXTURE_MODULES)
+	fixture ?= definition_backed_record_fixture(FIXTURE_MODULES)
 	owner ?= module_id_fixture_find(fixture, "app/main")
 	pair_owner ?= module_id_fixture_find(fixture, "pkg/pair")
 	point ?= fixture_record(
@@ -285,14 +375,14 @@ private pure func visible_field_shape_lookup_preserves_binding_order_result() ->
 		"app/main",
 		"Point",
 		True,
-		[field("x", TYPE_INT), field("y", TYPE_INT)],
+		[("x", TYPE_INT), ("y", TYPE_INT)],
 	)
 	pair ?= fixture_record(
 		fixture,
 		"pkg/pair",
 		"Pair",
 		True,
-		[field("y", TYPE_STRING), field("x", TYPE_STRING)],
+		[("y", TYPE_STRING), ("x", TYPE_STRING)],
 	)
 	input: AcceptedRecordTableInput = {
 		definition_table = definition_backed_type_fixture_definition_table(fixture),
@@ -331,9 +421,9 @@ private pure func visible_field_shape_lookup_preserves_binding_order() -> Bool:
 
 
 private pure func scalar_queries_read_canonical_payload_result() -> Option[Bool]:
-	fixture ?= definition_backed_type_fixture(FIXTURE_MODULES)
+	fixture ?= definition_backed_record_fixture(FIXTURE_MODULES)
 	owner ?= module_id_fixture_find(fixture, "app/main")
-	base ?= fixture_record(fixture, "app/main", "Capabilities", True, [field("value", TYPE_INT)])
+	base ?= fixture_record(fixture, "app/main", "Capabilities", True, [("value", TYPE_INT)])
 	capable_record = { base | payload = { base.payload |
 			is_value = True,
 			contains_resource = True,
@@ -341,7 +431,7 @@ private pure func scalar_queries_read_canonical_payload_result() -> Option[Bool]
 			may_contain_one_shot_stream = True,
 			may_contain_resource_source = True
 		} }
-	plain_record ?= fixture_record(fixture, "app/main", "Plain", True, [field("value", TYPE_INT)])
+	plain_record ?= fixture_record(fixture, "app/main", "Plain", True, [("value", TYPE_INT)])
 	table ?= accepted_record_table({
 		definition_table = definition_backed_type_fixture_definition_table(fixture),
 		known_type_ids = [capable_record.id, plain_record.id],
@@ -398,10 +488,110 @@ private pure func scalar_queries_read_canonical_payload() -> Bool:
 	scalar_queries_read_canonical_payload_result().get_or(False)
 
 
+private pure func exact_field_queries_preserve_distinct_parent_identity_result() -> Option[Bool]:
+	fixture ?= definition_backed_record_fixture(FIXTURE_MODULES)
+	point ?= fixture_record(
+		fixture,
+		"app/main",
+		"Point",
+		True,
+		[("x", TYPE_INT), ("y", TYPE_INT)],
+	)
+	pair ?= fixture_record(
+		fixture,
+		"pkg/pair",
+		"Pair",
+		True,
+		[("y", TYPE_STRING), ("x", TYPE_STRING)],
+	)
+	table ?= accepted_record_table({
+		definition_table = definition_backed_type_fixture_definition_table(fixture),
+		known_type_ids = [point.id, pair.id],
+		records = [point, pair],
+	})
+	point_x ?= definition_backed_record_fixture_field_id(
+		fixture,
+		"app/main",
+		"Point",
+		"x",
+	)
+	pair_x ?= definition_backed_record_fixture_field_id(
+		fixture,
+		"pkg/pair",
+		"Pair",
+		"x",
+	)
+	definition_table = definition_backed_type_fixture_definition_table(fixture)
+
+	matches = match (
+		accepted_record_field_exact(table, definition_table, point_x),
+		accepted_record_field_exact(table, definition_table, pair_x),
+	):
+		(AcceptedFieldExactFound(point_field), AcceptedFieldExactFound(pair_field)):
+			(
+				point_field.index == 0
+				and pair_field.index == 1
+				and type_ids_equal(point_field.parent, point.id)
+				and type_ids_equal(pair_field.parent, pair.id)
+				and field_id_definition_id(point_field.id) != field_id_definition_id(pair_field.id)
+			)
+		_:
+			False
+
+	Some(matches)
+
+
+private pure func exact_field_queries_preserve_distinct_parent_identity() -> Bool:
+	exact_field_queries_preserve_distinct_parent_identity_result().get_or(False)
+
+
+private pure func exact_field_queries_reject_foreign_definition_table_result() -> Option[Bool]:
+	fixture ?= definition_backed_record_fixture(FIXTURE_MODULES)
+	foreign_fixture ?= definition_backed_record_fixture(FIXTURE_MODULES)
+	point ?= fixture_record(
+		fixture,
+		"app/main",
+		"Point",
+		True,
+		[("x", TYPE_INT), ("y", TYPE_INT)],
+	)
+	table ?= accepted_record_table({
+		definition_table = definition_backed_type_fixture_definition_table(fixture),
+		known_type_ids = [point.id],
+		records = [point],
+	})
+	foreign_x ?= definition_backed_record_fixture_field_id(
+		foreign_fixture,
+		"app/main",
+		"Point",
+		"x",
+	)
+
+	rejects_foreign = match accepted_record_field_exact(
+		table,
+		definition_backed_type_fixture_definition_table(foreign_fixture),
+		foreign_x,
+	):
+		AcceptedFieldExactIncompatibleDefinitionTable:
+			True
+		AcceptedFieldExactFound(_) | AcceptedFieldExactMissing:
+			False
+
+	Some(rejects_foreign)
+
+
+private pure func exact_field_queries_reject_foreign_definition_table() -> Bool:
+	exact_field_queries_reject_foreign_definition_table_result().get_or(False)
+
+
 tests: TestSuite = {
 	description = "Accepted record authority",
 	tests = [
 		("table rejects forged canonical name", table_rejects_forged_canonical_name),
+		(
+			"table rejects invalid field parent order and duplicate identity",
+			table_rejects_invalid_field_relations,
+		),
 		(
 			"record authority is category safe and localizes owner payloads",
 			record_authority_is_category_safe_and_local,
@@ -421,6 +611,14 @@ tests: TestSuite = {
 		(
 			"scalar queries read canonical payloads and preserve missing results",
 			scalar_queries_read_canonical_payload,
+		),
+		(
+			"exact field queries preserve distinct same-name parent identities",
+			exact_field_queries_preserve_distinct_parent_identity,
+		),
+		(
+			"exact field queries reject foreign definition tables",
+			exact_field_queries_reject_foreign_definition_table,
 		),
 	]
 }

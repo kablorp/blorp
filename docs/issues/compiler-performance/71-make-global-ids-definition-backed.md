@@ -1,6 +1,6 @@
 # Issue 71: Make Global IDs Definition-Backed
 
-**Status:** Ready after Issue 68
+**Status:** Implemented
 
 **Roadmap:** [Normalized Compilation Database Roadmap](NORMALIZED_COMPILATION_DATABASE_ROADMAP.md)
 
@@ -383,3 +383,19 @@ Stop and consult before:
   global category;
 - adding a cache or invalidation; or
 - broadening into field, trait, implementation, body, or semantic-type work.
+
+## Implementation Result
+
+`GlobalId` now wraps the reserved `GlobalDefinition` ID, and descriptive facts
+are projected through the graph `DefinitionTable`. Accepted bindings no longer
+duplicate the raw definition integer. Exact lookups and module-view locators
+are definition-ID-addressed, while source-name indexes remain only at source
+lookup boundaries. Cross-product operations fail closed on definition-table
+provenance, including completed-table replacement with a different slot order.
+
+The accepted-stage profile retained identical outputs and checksums while
+reducing allocations from 7,344,621 to 7,339,481, allocated bytes from
+17,344,984 to 17,336,792, and retained objects from 222,319 to 222,255. Paired
+wall-clock samples crossed in both directions, with no repeatable latency
+regression. Production changed by +572/-342 lines, focused tests by +212/-21,
+and the benchmark fixture by +9/-2.

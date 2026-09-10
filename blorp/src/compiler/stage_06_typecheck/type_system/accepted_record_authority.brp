@@ -4,23 +4,38 @@
 -- retain only established identities, source names, and field-shape lookup
 -- names; owner-local field spellings are materialized only when queried.
 import:
-	../../stage_04_modules/module_table: ModuleId, module_table_canonical_path
+	../../stage_04_modules/module_table: ModuleId, module_ids_equal, module_table_canonical_path
 	../graph/definition_index:
 		DefinitionTable,
+		FieldId,
+		definition_table_definition_count,
+		definition_table_field_row,
 		definition_table_module_table,
 		definition_table_type_row,
+		definition_tables_share_provenance,
+		field_id_definition_id,
+		field_ids_equal,
 	../graph/type_identity:
 		TypeId,
 		type_id_definition_id,
 		type_id_module_id,
+		type_id_name,
 		type_ids_equal,
 	env: FieldDecl
-	semantic_type: canonical_module_type_name, localize_module_types
+	semantic_type: SemanticType, canonical_module_type_name, localize_module_types
+
+
+record AcceptedFieldRow {
+	id: FieldId,
+	parent: TypeId,
+	field_type: SemanticType,
+	index: Int
+}
 
 
 record AcceptedRecordEntry {
 	type_params: List[String],
-	fields: List[FieldDecl],
+	fields: List[AcceptedFieldRow],
 	is_value: Bool,
 	contains_resource: Bool,
 	may_contain_function: Bool,
@@ -51,7 +66,11 @@ private record AcceptedRecordTableRep {
 	records: List[AcceptedRecordEntry],
 	record_ids: List[TypeId],
 	canonical_visibility: List[Bool],
-	record_indices_by_definition_id: Dict[Int, Int],
+	-- Type definition IDs map to non-negative record indices. Field definition
+	-- IDs map to `-(record_index * stride + field_index) - 1`. Definition kinds
+	-- are disjoint, so the sign is an unambiguous tag without a second map.
+	record_or_field_locators_by_definition_id: Dict[Int, Int],
+	field_locator_stride: Int,
 	canonical_record_indices_by_name: Dict[String, Int]
 }
 
@@ -115,6 +134,12 @@ union AcceptedRecordExactLookup:
 	AcceptedRecordExactWrongKind(TypeId)
 
 
+union AcceptedFieldExactLookup:
+	AcceptedFieldExactFound(AcceptedFieldRow)
+	AcceptedFieldExactMissing
+	AcceptedFieldExactIncompatibleDefinitionTable
+
+
 record AcceptedRecordExactProbe {
 	lookup: AcceptedRecordExactLookup,
 	candidates_visited: Int
@@ -145,11 +170,60 @@ private pure func record_canonical_name(
 	Some(canonical_module_type_name(module_path, row.name))
 
 
-private pure func record_field_name_key(fields: List[FieldDecl]) -> String:
-	fields
-		.map(func(field): field.name)
-		.sort()
-		.join("\n")
+private pure func record_field_name_key(
+	definition_table: DefinitionTable,
+	fields: List[AcceptedFieldRow],
+) -> String:
+	var names: List[String] = []
+
+	for field in fields:
+		match definition_table_field_row(definition_table, field.id):
+			Some(row):
+				names = names.append(row.name)
+			None:
+				void
+
+	names.sort().join("\n")
+
+
+private pure func accepted_fields_are_valid(
+	definition_table: DefinitionTable,
+	parent: TypeId,
+	fields: List[AcceptedFieldRow],
+	seen_field_ids: Dict[Int, Bool],
+) -> Bool:
+	match (
+		type_id_module_id(definition_table, parent),
+		type_id_name(definition_table, parent),
+	):
+		(Some(parent_module), Some(parent_name)):
+			var names: Dict[String, Bool] = {}
+			var valid: Bool = True
+			var index: Int = 0
+
+			for field in fields:
+				match definition_table_field_row(definition_table, field.id):
+					Some(row):
+						definition_id = field_id_definition_id(field.id)
+						if (
+							not type_ids_equal(field.parent, parent)
+							or field.index != index
+							or not module_ids_equal(row.module_id, parent_module)
+							or row.owner_name != Some(parent_name)
+							or names.contains(row.name)
+							or seen_field_ids.contains(definition_id)
+						):
+							valid = False
+						else:
+							names = names.set(row.name, True)
+					None:
+						valid = False
+
+				index += 1
+
+			valid
+		_:
+			False
 
 
 private pure func known_type_at(
@@ -170,8 +244,10 @@ pure func accepted_record_table(input: AcceptedRecordTableInput) -> Option[Accep
 	var records: List[AcceptedRecordEntry] = []
 	var record_ids: List[TypeId] = []
 	var canonical_visibility: List[Bool] = []
-	var record_indices_by_definition_id: Dict[Int, Int] = {}
+	var record_or_field_locators_by_definition_id: Dict[Int, Int] = {}
+	field_locator_stride = definition_table_definition_count(input.definition_table) + 1
 	var canonical_record_indices_by_name: Dict[String, Int] = {}
+	var seen_field_ids: Dict[Int, Bool] = {}
 	var valid: Bool = True
 	var index: Int = 0
 
@@ -207,7 +283,13 @@ pure func accepted_record_table(input: AcceptedRecordTableInput) -> Option[Accep
 		if (
 			not identity_matches
 			or record_canonical_name(input.definition_table, entry.id) != Some(entry.canonical_name)
-			or record_indices_by_definition_id.contains(key)
+			or not accepted_fields_are_valid(
+				input.definition_table,
+				entry.id,
+				entry.payload.fields,
+				seen_field_ids,
+			)
+			or record_or_field_locators_by_definition_id.contains(key)
 			or (
 				entry.canonical_visible
 				and canonical_record_indices_by_name.contains(entry.canonical_name)
@@ -215,10 +297,21 @@ pure func accepted_record_table(input: AcceptedRecordTableInput) -> Option[Accep
 		):
 			valid = False
 		else:
+			var field_index: Int = 0
+
+			for field in entry.payload.fields:
+				field_key = field_id_definition_id(field.id)
+				seen_field_ids = seen_field_ids.set(field_key, True)
+				record_or_field_locators_by_definition_id = record_or_field_locators_by_definition_id.set(
+					field_key,
+					0 - (index * field_locator_stride + field_index) - 1,
+				)
+				field_index += 1
+
 			records = records.append(entry.payload)
 			record_ids = record_ids.append(entry.id)
 			canonical_visibility = canonical_visibility.append(entry.canonical_visible)
-			record_indices_by_definition_id = record_indices_by_definition_id.set(key, index)
+			record_or_field_locators_by_definition_id = record_or_field_locators_by_definition_id.set(key, index)
 
 			if entry.canonical_visible:
 				canonical_record_indices_by_name = canonical_record_indices_by_name.set(
@@ -236,7 +329,8 @@ pure func accepted_record_table(input: AcceptedRecordTableInput) -> Option[Accep
 					records = records,
 					record_ids = record_ids,
 					canonical_visibility = canonical_visibility,
-					record_indices_by_definition_id = record_indices_by_definition_id,
+					record_or_field_locators_by_definition_id = record_or_field_locators_by_definition_id,
+					field_locator_stride = field_locator_stride,
 					canonical_record_indices_by_name = canonical_record_indices_by_name
 				}))
 	else:
@@ -259,7 +353,7 @@ pure func accepted_record_module_view(
 
 	for binding in bindings:
 		key = type_id_definition_id(binding.id)
-		payload_index = representation.record_indices_by_definition_id.get(key)
+		payload_index = representation.record_or_field_locators_by_definition_id.get(key)
 
 		match payload_index:
 			Some(index):
@@ -297,7 +391,10 @@ pure func accepted_record_module_view(
 					if binding.infer_from_fields:
 						match representation.records.get(index):
 							Some(payload):
-								field_key = record_field_name_key(payload.fields)
+								field_key = record_field_name_key(
+									representation.definition_table,
+									payload.fields,
+								)
 								names = visible_names_by_field_key.get_or(field_key, [])
 								visible_names_by_field_key = visible_names_by_field_key.set(
 									field_key,
@@ -408,6 +505,111 @@ pure func accepted_record_find(
 		Some(payload)
 
 
+private pure func accepted_record_field_index(
+	definition_table: DefinitionTable,
+	fields: List[AcceptedFieldRow],
+	field_name: String,
+) -> Option[Int]:
+	var selected: Option[Int] = None
+	var index: Int = 0
+
+	while index < fields.length() and selected.is_none():
+		match fields.get(index):
+			Some(field):
+				match definition_table_field_row(definition_table, field.id):
+					Some(row):
+						if row.name == field_name:
+							selected = Some(index)
+					None:
+						void
+			None:
+				void
+
+		index += 1
+
+	selected
+
+
+-- Field access and callable-field resolution need one field, not a localized
+-- copy of the complete record. Keep each projection scalar so resolving a
+-- field does not allocate a temporary selection record.
+pure func accepted_record_find_field_id(
+	authority: AcceptedRecordAuthority,
+	record_name: String,
+	field_name: String,
+) -> Option[FieldId]:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+	locator ?= accepted_record_locator(representation, table, record_name)
+	payload ?= table.records.get(accepted_record_locator_index(locator))
+	field_index ?= accepted_record_field_index(table.definition_table, payload.fields, field_name)
+	field ?= payload.fields.get(field_index)
+	Some(field.id)
+
+
+pure func accepted_record_field_name(
+	authority: AcceptedRecordAuthority,
+	id: FieldId,
+) -> Option[String]:
+	table = table_rep(authority_rep(authority).table)
+	match definition_table_field_row(table.definition_table, id):
+		Some(row):
+			Some(row.name)
+		None:
+			None
+
+
+private pure func accepted_record_table_field(
+	representation: AcceptedRecordTableRep,
+	id: FieldId,
+) -> Option[AcceptedFieldRow]:
+	locator ?= representation.record_or_field_locators_by_definition_id.get(field_id_definition_id(id))
+	packed_locator = 0 - locator - 1
+	record_index = packed_locator / representation.field_locator_stride
+	field_index = packed_locator % representation.field_locator_stride
+	entry ?= representation.records.get(record_index)
+	field ?= entry.fields.get(field_index)
+
+	if field_ids_equal(field.id, id):
+		Some(field)
+	else:
+		None
+
+
+pure func accepted_record_find_field_type_by_id(
+	authority: AcceptedRecordAuthority,
+	record_name: String,
+	id: FieldId,
+) -> Option[SemanticType]:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+	locator ?= accepted_record_locator(representation, table, record_name)
+	record_id ?= table.record_ids.get(accepted_record_locator_index(locator))
+	field ?= accepted_record_table_field(table, id)
+
+	if not type_ids_equal(field.parent, record_id):
+		None
+	else if accepted_record_locator_owner_local(locator):
+		match representation.owner_module_path:
+			Some(owner_path):
+				Some(localize_module_types(owner_path, field.field_type))
+			None:
+				None
+	else:
+		Some(field.field_type)
+
+
+pure func accepted_record_find_type_params(
+	authority: AcceptedRecordAuthority,
+	record_name: String,
+) -> Option[List[String]]:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+	locator ?= accepted_record_locator(representation, table, record_name)
+	entry ?= table.records.get(accepted_record_locator_index(locator))
+	Some(entry.type_params)
+
+
 pure func accepted_record_contains(authority: AcceptedRecordAuthority, name: String) -> Bool:
 	representation = authority_rep(authority)
 	table = table_rep(representation.table)
@@ -481,7 +683,7 @@ pure func accepted_record_exact(table: AcceptedRecordTable, id: TypeId) -> Accep
 	representation = table_rep(table)
 	key = type_id_definition_id(id)
 
-	match representation.record_indices_by_definition_id.get(key):
+	match representation.record_or_field_locators_by_definition_id.get(key):
 		Some(index):
 			lookup = match (
 				representation.record_ids.get(index),
@@ -515,3 +717,20 @@ pure func accepted_record_exact(table: AcceptedRecordTable, id: TypeId) -> Accep
 				lookup = lookup,
 				candidates_visited = candidates_visited
 			}
+
+
+pure func accepted_record_field_exact(
+	table: AcceptedRecordTable,
+	issuing_table: DefinitionTable,
+	id: FieldId,
+) -> AcceptedFieldExactLookup:
+	representation = table_rep(table)
+
+	if not definition_tables_share_provenance(representation.definition_table, issuing_table):
+		AcceptedFieldExactIncompatibleDefinitionTable
+	else:
+		match accepted_record_table_field(representation, id):
+			Some(field):
+				AcceptedFieldExactFound(field)
+			None:
+				AcceptedFieldExactMissing

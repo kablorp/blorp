@@ -111,7 +111,16 @@ import:
 		parsed_identifier,
 	../stage_04_modules/module_table: ModuleId, module_ids_equal, module_table_canonical_path
 	diagnostic: TypecheckDiagnostic, typecheck_diagnostic
-	graph/definition_index: DefinitionTable, definition_table_module_table
+	graph/definition_index:
+		DefinitionTable,
+		FieldId,
+		MISSING_RESOLVED_FIELD_IDENTITY,
+		ResolvedFieldIdentity,
+		definition_table_module_table,
+		field_id_definition_id,
+		resolved_field_identity,
+		resolved_field_identity_field_id,
+		resolved_field_identity_from_optional_id,
 	headers/declaration_skeleton:
 		CallableId,
 		ConstructorId,
@@ -122,6 +131,7 @@ import:
 		callable_ids_equal,
 		constructor_id_definition_id,
 		constructor_id_from_reserved_graph_definition,
+		global_id_definition_id,
 	int: add_saturating, multiply_saturating
 	modules/module_view:
 		ImportedNameBinding,
@@ -170,10 +180,16 @@ import:
 		accepted_global_find,
 		accepted_global_find_qualified,
 	type_system/accepted_record_authority:
+		AcceptedFieldRow,
+		AcceptedRecordAuthority,
+		accepted_record_field_name,
 		accepted_record_contains,
 		accepted_record_contains_resource,
 		accepted_record_find,
+		accepted_record_find_field_id,
+		accepted_record_find_field_type_by_id,
 		accepted_record_find_names_with_fields,
+		accepted_record_find_type_params,
 		accepted_record_may_contain_function,
 		accepted_record_may_contain_one_shot_stream,
 		accepted_record_may_contain_resource_source,
@@ -500,7 +516,7 @@ record TypedRecordField {
 	name: ParsedIdentifier,
 	value: TypedExpr,
 	span: SourceSpan,
-	definition_id: Option[Int]
+	field_id: ResolvedFieldIdentity
 }
 
 
@@ -637,8 +653,8 @@ union TypedExpr:
 	TypedOpaqueIntoExpr(SemanticType, TypedExpr, SourceSpan, TypedExprInfo)
 	TypedOpaqueFromExpr(SemanticType, TypedExpr, SourceSpan, TypedExprInfo)
 	TypedRecordExpr(List[TypedRecordField], SourceSpan, TypedExprInfo)
-	TypedRecordUpdateExpr(TypedExpr, List[TypedRecordField], List[FieldDecl], SourceSpan, TypedExprInfo)
-	TypedFieldAccessExpr(TypedExpr, ParsedIdentifier, SourceSpan, TypedExprInfo)
+	TypedRecordUpdateExpr(TypedExpr, List[TypedRecordField], List[ResolvedRecordField], SourceSpan, TypedExprInfo)
+	TypedFieldAccessExpr(TypedExpr, ParsedIdentifier, ResolvedFieldIdentity, SourceSpan, TypedExprInfo)
 	TypedLambdaExpr(Bool, List[TypedLambdaParam], Option[SemanticType], TypedExpr, SourceSpan, TypedExprInfo)
 	TypedRangeExpr(TypedExpr, TypedExpr, SourceSpan, TypedExprInfo)
 	TypedIfExpr(TypedExpr, TypedExpr, Option[TypedExpr], SourceSpan, TypedExprInfo)
@@ -1619,7 +1635,7 @@ pure func typed_expr_info(expr: TypedExpr) -> TypedExprInfo:
 			info
 		TypedRecordUpdateExpr(_, _, _, _, info):
 			info
-		TypedFieldAccessExpr(_, _, _, info):
+		TypedFieldAccessExpr(_, _, _, _, info):
 			info
 		TypedLambdaExpr(_, _, _, _, _, info):
 			info
@@ -1717,8 +1733,8 @@ private pure func typed_expr_with_info(expr: TypedExpr, info: TypedExprInfo) -> 
 			TypedRecordExpr(fields, span, info)
 		TypedRecordUpdateExpr(receiver, fields, record_fields, span, _):
 			TypedRecordUpdateExpr(receiver, fields, record_fields, span, info)
-		TypedFieldAccessExpr(receiver, field, span, _):
-			TypedFieldAccessExpr(receiver, field, span, info)
+		TypedFieldAccessExpr(receiver, field, field_id, span, _):
+			TypedFieldAccessExpr(receiver, field, field_id, span, info)
 		TypedLambdaExpr(is_pure, params, return_annotation, body, span, _):
 			TypedLambdaExpr(is_pure, params, return_annotation, body, span, info)
 		TypedRangeExpr(start_expr, end_expr, span, _):
@@ -1803,7 +1819,15 @@ pure func typed_expr_resolved_call(expr: TypedExpr) -> Option[ResolvedCallInfo]:
 
 
 pure func typed_expr_resolved_definition_id(expr: TypedExpr) -> Option[Int]:
-	typed_expr_info(expr).resolved_definition_id
+	match expr:
+		TypedFieldAccessExpr(_, _, field_identity, _, _):
+			match resolved_field_identity_field_id(field_identity):
+				Some(field_id):
+					Some(field_id_definition_id(field_id))
+				None:
+					typed_expr_info(expr).resolved_definition_id
+		_:
+			typed_expr_info(expr).resolved_definition_id
 
 
 private pure func optional_type_contains_meta(typ: Option[SemanticType]) -> Bool:
@@ -2037,7 +2061,7 @@ private pure func direct_callable_resolution(callee: TypedExpr) -> Option[Resolv
 	match callee:
 		TypedNameExpr(_, _):
 			typed_expr_resolved_call(callee)
-		TypedFieldAccessExpr(_, _, _, _):
+		TypedFieldAccessExpr(_, _, _, _, _):
 			typed_expr_resolved_call(callee)
 		_:
 			None
@@ -2343,7 +2367,7 @@ pure func typed_expr_type_error(expr: TypedExpr) -> Option[String]:
 							Some(message)
 						None:
 							typed_record_fields_type_error(fields)
-				TypedFieldAccessExpr(receiver, _, _, _):
+				TypedFieldAccessExpr(receiver, _, _, _, _):
 					typed_expr_type_error(receiver)
 				TypedLambdaExpr(_, _, _, body, _, _):
 					typed_expr_type_error(body)
@@ -2566,7 +2590,7 @@ pure func typed_expr_contains_meta(expr: TypedExpr) -> Bool:
 					typed_expr_contains_meta(receiver)
 					or fields.any(func(field): typed_expr_contains_meta(field.value))
 				)
-			TypedFieldAccessExpr(receiver, _, _, _):
+			TypedFieldAccessExpr(receiver, _, _, _, _):
 				typed_expr_contains_meta(receiver)
 			TypedLambdaExpr(_, params, return_annotation, body, _, _):
 				(
@@ -2777,7 +2801,7 @@ private pure func zonk_typed_record_field(
 		name = field.name,
 		value = zonk_typed_expr(context, field.value),
 		span = field.span,
-		definition_id = field.definition_id
+		field_id = field.field_id
 	}
 
 
@@ -3112,10 +3136,11 @@ pure func zonk_typed_expr(context: Context, expr: TypedExpr) -> TypedExpr:
 				span,
 				info,
 			)
-		TypedFieldAccessExpr(receiver, field, span, _):
+		TypedFieldAccessExpr(receiver, field, field_id, span, _):
 			TypedFieldAccessExpr(
 				zonk_typed_expr(context, receiver),
 				field,
+				field_id,
 				span,
 				info,
 			)
@@ -3444,7 +3469,7 @@ private pure func typed_expr_resource_dependency_refs(
 				typed_expr_resource_dependency_refs(context, base),
 				typed_record_fields_resource_dependency_refs(context, fields),
 			)
-		TypedFieldAccessExpr(receiver, _, _, _):
+		TypedFieldAccessExpr(receiver, _, _, _, _):
 			typed_expr_resource_dependency_refs(context, receiver)
 		TypedRangeExpr(start_expr, end_expr, _, _):
 			append_resource_refs(
@@ -3735,7 +3760,7 @@ pure func typed_expr_purity_requirements(expr: TypedExpr) -> List[PurityRequirem
 				typed_expr_purity_requirements(base),
 				typed_record_fields_purity_requirements(fields),
 			)
-		TypedFieldAccessExpr(receiver, _, _, _):
+		TypedFieldAccessExpr(receiver, _, _, _, _):
 			typed_expr_purity_requirements(receiver)
 		TypedLambdaExpr(is_pure, _, _, body, _, _):
 			if is_pure:
@@ -4034,7 +4059,7 @@ pure func typed_expr_module_assign_names(expr: TypedExpr) -> List[String]:
 				typed_expr_module_assign_names(base),
 				typed_record_fields_module_assign_names(fields),
 			)
-		TypedFieldAccessExpr(receiver, _, _, _):
+		TypedFieldAccessExpr(receiver, _, _, _, _):
 			typed_expr_module_assign_names(receiver)
 		TypedLambdaExpr(is_pure, _, _, body, _, _):
 			if is_pure:
@@ -4121,7 +4146,7 @@ private pure func startup_call_name(callee: TypedExpr, info: TypedExprInfo) -> S
 			match callee:
 				TypedNameExpr(name, _):
 					name.text
-				TypedFieldAccessExpr(_, field, _, _):
+				TypedFieldAccessExpr(_, field, _, _, _):
 					field.text
 				_:
 					"<expression>"
@@ -4339,7 +4364,7 @@ pure func typed_expr_startup_work_scan(expr: TypedExpr) -> TypedStartupWorkScan:
 				typed_expr_startup_work_scan(base),
 				typed_record_fields_startup_work_scan(fields),
 			)
-		TypedFieldAccessExpr(receiver, _, _, _):
+		TypedFieldAccessExpr(receiver, _, _, _, _):
 			typed_expr_startup_work_scan(receiver)
 		TypedLambdaExpr(_, _, _, _, _, _):
 			STARTUP_WORK_SCAN_EMPTY
@@ -4664,7 +4689,7 @@ private pure func typed_expr_has_non_tail_recursive_call_inner(
 				typed_expr_has_non_tail_recursive_call_inner(base, function_name, False)
 				or typed_record_fields_have_non_tail_recursive_call(fields, function_name)
 			)
-		TypedFieldAccessExpr(receiver, _, _, _):
+		TypedFieldAccessExpr(receiver, _, _, _, _):
 			typed_expr_has_non_tail_recursive_call_inner(receiver, function_name, False)
 		TypedLambdaExpr(_, _, _, body, _, _):
 			typed_expr_has_non_tail_recursive_call_inner(body, function_name, True)
@@ -4948,7 +4973,7 @@ pure func typed_expr_pure_lambda_impure_call_names(expr: TypedExpr) -> List[Stri
 				typed_expr_pure_lambda_impure_call_names(base),
 				typed_record_fields_pure_lambda_impure_call_names(fields),
 			)
-		TypedFieldAccessExpr(receiver, _, _, _):
+		TypedFieldAccessExpr(receiver, _, _, _, _):
 			typed_expr_pure_lambda_impure_call_names(receiver)
 		TypedLambdaExpr(is_pure, _, _, body, _, _):
 			if is_pure:
@@ -5207,7 +5232,7 @@ pure func typed_expr_debug_block_impure_call_names(expr: TypedExpr) -> List[Stri
 				typed_expr_debug_block_impure_call_names(base),
 				typed_record_fields_debug_block_impure_call_names(fields),
 			)
-		TypedFieldAccessExpr(receiver, _, _, _):
+		TypedFieldAccessExpr(receiver, _, _, _, _):
 			typed_expr_debug_block_impure_call_names(receiver)
 		TypedLambdaExpr(_, _, _, body, _, _):
 			typed_expr_debug_block_impure_call_names(body)
@@ -5339,7 +5364,7 @@ private pure func typed_expr_has_assignment_inside_debug_block(expr: TypedExpr) 
 				typed_expr_has_assignment_inside_debug_block(base)
 				or typed_record_fields_have_assignment_inside_debug_block(fields)
 			)
-		TypedFieldAccessExpr(receiver, _, _, _):
+		TypedFieldAccessExpr(receiver, _, _, _, _):
 			typed_expr_has_assignment_inside_debug_block(receiver)
 		TypedSubscriptExpr(receiver, indices, _, _):
 			(
@@ -5804,7 +5829,7 @@ pure func typed_expr_record_field_widening(
 
 pure func typed_expr_field_access_receiver_type(expr: TypedExpr) -> Option[SemanticType]:
 	match expr:
-		TypedFieldAccessExpr(receiver, _, _, _):
+		TypedFieldAccessExpr(receiver, _, _, _, _):
 			Some(typed_expr_semantic_type(receiver))
 		_:
 			None
@@ -7189,7 +7214,7 @@ private pure func infer_name_expr(context: InferContext, name: ParsedIdentifier)
 					None,
 					value_slot,
 				) |
-					resolved_definition_id = binding.definition_id
+					resolved_definition_id = Some(global_id_definition_id(binding.id))
 				},
 			)
 			infer_result(context, expr)
@@ -8626,6 +8651,7 @@ private pure func typed_qualified_module_field_expr(
 	TypedFieldAccessExpr(
 		typed_module_marker_expr(module_ident),
 		field,
+		MISSING_RESOLVED_FIELD_IDENTITY,
 		span,
 		typed_expr_info_from_slot(
 			None,
@@ -8646,6 +8672,7 @@ private pure func typed_qualified_module_var_expr(
 	TypedFieldAccessExpr(
 		typed_module_marker_expr(module_ident),
 		field,
+		MISSING_RESOLVED_FIELD_IDENTITY,
 		span,
 		{ typed_expr_info_from_slot(
 			binding.source_type,
@@ -8654,7 +8681,7 @@ private pure func typed_qualified_module_var_expr(
 			None,
 			KeptValueSlot(binding.binding_type),
 		) |
-			resolved_definition_id = binding.definition_id
+			resolved_definition_id = Some(global_id_definition_id(binding.id))
 		},
 	)
 
@@ -9047,7 +9074,7 @@ private pure func declared_callee_bound_type_params(
 					type_params
 				None:
 					[]
-		TypedFieldAccessExpr(receiver, field, _, _):
+		TypedFieldAccessExpr(receiver, field, _, _, _):
 			[]
 		_:
 			[]
@@ -10666,7 +10693,7 @@ private pure func type_is_callable(typ: SemanticType) -> Bool:
 
 private record CallableFieldInfo {
 	field_type: SemanticType,
-	definition_id: Option[Int]
+	field_id: ResolvedFieldIdentity
 }
 
 
@@ -10681,7 +10708,7 @@ private pure func callable_field_info(
 				.filter(type_is_callable)
 				.map(func(field_type): {
 						field_type = field_type,
-						definition_id = None
+						field_id = MISSING_RESOLVED_FIELD_IDENTITY
 					})
 		SemanticNamedType(name, args):
 			if name == "Tuple":
@@ -10689,19 +10716,18 @@ private pure func callable_field_info(
 					.filter(type_is_callable)
 					.map(func(field_type): {
 							field_type = field_type,
-							definition_id = None
+							field_id = MISSING_RESOLVED_FIELD_IDENTITY
 						})
 			else:
-				match record_field_types(context, name, args):
-					Some(fields):
-						find_record_field(fields, field_name)
-							.filter(func(field): type_is_callable(field.field_type))
-							.map(func(field): {
-									field_type = field.field_type,
-									definition_id = field.definition_id
-								})
-					None:
-						None
+				field_id = record_field_id(context, name, field_name)
+				record_field_type(context, name, args, field_name, field_id)
+					.filter(type_is_callable)
+					.map(func(field_type): {
+							field_type = field_type,
+							field_id = resolved_field_identity_from_optional_id(
+								field_id,
+							)
+						})
 		_:
 			None
 
@@ -10742,10 +10768,9 @@ private pure func infer_ufcs_call_expr(
 							field_expr = TypedFieldAccessExpr(
 								receiver_result.expr,
 								method,
+								field.field_id,
 								field_span,
-								{ inferred_info(field_context, field.field_type) |
-									resolved_definition_id = field.definition_id
-								},
+								inferred_info(field_context, field.field_type),
 							)
 							field_result = infer_result(field_context, field_expr)
 							Some(infer_call_with_callee_result(context, field_result, args, span))
@@ -11727,23 +11752,25 @@ private pure func named_type_component_types_without_scan_proof(
 ) -> Option[List[SemanticType]]:
 	session = resource_type_facts_session(facts)
 
-	record_info = match module_view_accepted_record_authority(session.facts.module_view):
+	record_components = match module_view_accepted_record_authority(session.facts.module_view):
 		Some(authority):
-			accepted_record_find(
-				authority,
-				name,
-			).map(
-				func(entry): (entry.type_params, entry.fields),
-			)
+			match accepted_record_find(authority, name):
+				Some(entry):
+					subst = type_param_subst_for_args(entry.type_params, args)
+					Some(entry.fields.map(func(field): apply_subst(subst, field.field_type)))
+				None:
+					None
 		None:
-			env_get_record(session.env, name)
+			match env_get_record(session.env, name):
+				Some((type_params, fields)):
+					subst = type_param_subst_for_args(type_params, args)
+					Some(fields.map(func(field): apply_subst(subst, field.field_type)))
+				None:
+					None
 
-	match record_info:
-		Some((type_params, fields)):
-			subst = type_param_subst_for_args(type_params, args)
-			Some(fields.map(
-				func(field): apply_subst(subst, field.field_type),
-			))
+	match record_components:
+		Some(components):
+			Some(components)
 		None:
 			union_components = match module_view_accepted_union_authority(
 				session.facts.module_view,
@@ -13986,21 +14013,67 @@ private pure func record_subst_for_args(
 	subst
 
 
+record ResolvedRecordField {
+	name: String,
+	field_type: SemanticType,
+	field_id: ResolvedFieldIdentity
+}
+
+
+private pure func accepted_fields_for_inference(
+	authority: AcceptedRecordAuthority,
+	fields: List[AcceptedFieldRow],
+) -> Option[List[ResolvedRecordField]]:
+	var resolved: List[ResolvedRecordField] = []
+	var valid: Bool = True
+
+	for field in fields:
+		match accepted_record_field_name(authority, field.id):
+			Some(name):
+				resolved = resolved.append({
+					name = name,
+					field_type = field.field_type,
+					field_id = resolved_field_identity(field.id)
+				})
+			None:
+				valid = False
+
+	if valid:
+		Some(resolved)
+	else:
+		None
+
+
+private pure func provisional_field_for_inference(field: FieldDecl) -> ResolvedRecordField:
+	{
+		name = field.name,
+		field_type = field.field_type,
+		field_id = MISSING_RESOLVED_FIELD_IDENTITY
+	}
+
+
 private pure func record_field_types(
 	context: InferContext,
 	record_name: String,
 	args: List[SemanticType],
-) -> Option[List[FieldDecl]]:
+) -> Option[List[ResolvedRecordField]]:
 	record_info = match module_view_accepted_record_authority(context.state.facts.module_view):
 		Some(authority):
-			accepted_record_find(
-				authority,
-				record_name,
-			).map(
-				func(entry): (entry.type_params, entry.fields),
-			)
+			match accepted_record_find(authority, record_name):
+				Some(entry):
+					match accepted_fields_for_inference(authority, entry.fields):
+						Some(fields):
+							Some((entry.type_params, fields))
+						None:
+							None
+				None:
+					None
 		None:
-			env_get_record(context.state.env, record_name)
+			match env_get_record(context.state.env, record_name):
+				Some((type_params, fields)):
+					Some((type_params, fields.map(provisional_field_for_inference)))
+				None:
+					None
 
 	match record_info:
 		Some((type_params, fields)):
@@ -14010,14 +14083,39 @@ private pure func record_field_types(
 				subst = record_subst_for_args(type_params, args)
 				Some(fields.map(
 					func(
-						field: FieldDecl,
-					) -> FieldDecl: { field | field_type = apply_subst(subst, field.field_type) },
+						field: ResolvedRecordField,
+					) -> ResolvedRecordField: { field |
+						field_type = apply_subst(subst, field.field_type)
+					},
 				))
 		None:
 			None
 
 
-private pure func find_record_field(fields: List[FieldDecl], name: String) -> Option[FieldDecl]:
+private pure func find_record_field(
+	fields: List[ResolvedRecordField],
+	name: String,
+) -> Option[ResolvedRecordField]:
+	var result: Option[ResolvedRecordField] = None
+	var index: Int = 0
+
+	while index < fields.length() and result.is_none():
+		match fields.get(index):
+			Some(field):
+				if field.name == name:
+					result = Some(field)
+			None:
+				void
+
+		index += 1
+
+	result
+
+
+private pure func find_provisional_record_field(
+	fields: List[FieldDecl],
+	name: String,
+) -> Option[FieldDecl]:
 	var result: Option[FieldDecl] = None
 	var index: Int = 0
 
@@ -14034,12 +14132,77 @@ private pure func find_record_field(fields: List[FieldDecl], name: String) -> Op
 	result
 
 
-private pure func record_field_names(fields: List[FieldDecl]) -> List[String]:
+-- Successful access should resolve and substitute only the selected field.
+-- Whole-record materialization remains available for literals, updates, and
+-- missing-field diagnostics, all of which need the complete ordered shape.
+private pure func substitute_record_field_type(
+	type_params: List[String],
+	args: List[SemanticType],
+	field_type: SemanticType,
+) -> Option[SemanticType]:
+	if type_params.length() != args.length():
+		None
+	else:
+		subst = record_subst_for_args(type_params, args)
+		Some(apply_subst(subst, field_type))
+
+
+private pure func record_field_type(
+	context: InferContext,
+	record_name: String,
+	args: List[SemanticType],
+	field_name: String,
+	field_id: Option[FieldId],
+) -> Option[SemanticType]:
+	match module_view_accepted_record_authority(context.state.facts.module_view):
+		Some(authority):
+			match accepted_record_find_type_params(authority, record_name):
+				Some(type_params):
+					match field_id:
+						Some(id):
+							match accepted_record_find_field_type_by_id(
+								authority,
+								record_name,
+								id,
+							):
+								Some(field_type):
+									substitute_record_field_type(type_params, args, field_type)
+								None:
+									None
+						None:
+							None
+				None:
+					None
+		None:
+			match env_get_record(context.state.env, record_name):
+				Some((type_params, fields)):
+					match find_provisional_record_field(fields, field_name):
+						Some(field):
+							substitute_record_field_type(type_params, args, field.field_type)
+						None:
+							None
+				None:
+					None
+
+
+private pure func record_field_id(
+	context: InferContext,
+	record_name: String,
+	field_name: String,
+) -> Option[FieldId]:
+	match module_view_accepted_record_authority(context.state.facts.module_view):
+		Some(authority):
+			accepted_record_find_field_id(authority, record_name, field_name)
+		None:
+			None
+
+
+private pure func record_field_names(fields: List[ResolvedRecordField]) -> List[String]:
 	fields.map(func(field): field.name)
 
 
 private pure func missing_record_field_names(
-	expected_fields: List[FieldDecl],
+	expected_fields: List[ResolvedRecordField],
 	actual_fields: List[ParsedRecordExprField],
 ) -> List[String]:
 	provided_names = actual_fields.map(func(field): field.name.text)
@@ -14055,7 +14218,7 @@ private pure func missing_record_field_names(
 private pure func infer_record_fields(
 	context: InferContext,
 	fields: List[ParsedRecordExprField],
-	expected_fields: List[FieldDecl],
+	expected_fields: List[ResolvedRecordField],
 ) -> InferRecordFieldsResult:
 	var next_context: InferContext = context
 	var typed_fields: List[TypedRecordField] = []
@@ -14095,7 +14258,7 @@ private pure func infer_record_fields(
 							name = field.name,
 							value = value_result.expr,
 							span = field.span,
-							definition_id = expected_field.definition_id,
+							field_id = expected_field.field_id,
 						})
 					None:
 						unknown_context = infer_error(
@@ -14117,7 +14280,7 @@ private pure func infer_record_fields(
 							name = field.name,
 							value = value_result.expr,
 							span = field.span,
-							definition_id = None,
+							field_id = MISSING_RESOLVED_FIELD_IDENTITY,
 						})
 			None:
 				void
@@ -14151,7 +14314,7 @@ private pure func infer_unconstrained_record_fields(
 					name = field.name,
 					value = value_result.expr,
 					span = field.span,
-					definition_id = None,
+					field_id = MISSING_RESOLVED_FIELD_IDENTITY,
 				})
 			None:
 				void
@@ -14169,7 +14332,7 @@ private pure func infer_known_record_expr(
 	fields: List[ParsedRecordExprField],
 	span: SourceSpan,
 	record_type: SemanticType,
-	expected_fields: List[FieldDecl],
+	expected_fields: List[ResolvedRecordField],
 ) -> InferResult:
 	fields_result = infer_record_fields(context, fields, expected_fields)
 	missing_names = missing_record_field_names(expected_fields, fields)
@@ -14376,7 +14539,7 @@ private pure func infer_record_update_fields(
 	context: InferContext,
 	record_name: String,
 	fields: List[ParsedRecordExprField],
-	expected_fields: List[FieldDecl],
+	expected_fields: List[ResolvedRecordField],
 ) -> InferRecordFieldsResult:
 	var next_context: InferContext = context
 	var typed_fields: List[TypedRecordField] = []
@@ -14416,7 +14579,7 @@ private pure func infer_record_update_fields(
 							name = field.name,
 							value = value_result.expr,
 							span = field.span,
-							definition_id = expected_field.definition_id,
+							field_id = expected_field.field_id,
 						})
 					None:
 						unknown_context = infer_error(
@@ -14438,7 +14601,7 @@ private pure func infer_record_update_fields(
 							name = field.name,
 							value = value_result.expr,
 							span = field.span,
-							definition_id = None,
+							field_id = MISSING_RESOLVED_FIELD_IDENTITY,
 						})
 			None:
 				void
@@ -14576,6 +14739,7 @@ private pure func infer_ordinary_field_access_expr(
 					typed = TypedFieldAccessExpr(
 						receiver_result.expr,
 						field,
+						MISSING_RESOLVED_FIELD_IDENTITY,
 						span,
 						inferred_info(result_context, field_type),
 					)
@@ -14587,6 +14751,7 @@ private pure func infer_ordinary_field_access_expr(
 					typed = TypedFieldAccessExpr(
 						receiver_result.expr,
 						field,
+						MISSING_RESOLVED_FIELD_IDENTITY,
 						span,
 						inferred_info(next, TYPE_VOID),
 					)
@@ -14602,6 +14767,7 @@ private pure func infer_ordinary_field_access_expr(
 						typed = TypedFieldAccessExpr(
 							receiver_result.expr,
 							field,
+							MISSING_RESOLVED_FIELD_IDENTITY,
 							span,
 							inferred_info(result_context, field_type),
 						)
@@ -14613,29 +14779,32 @@ private pure func infer_ordinary_field_access_expr(
 						typed = TypedFieldAccessExpr(
 							receiver_result.expr,
 							field,
+							MISSING_RESOLVED_FIELD_IDENTITY,
 							span,
 							inferred_info(next, TYPE_VOID),
 						)
 						infer_result(next, typed)
 			else:
-				match record_field_types(context, name, args):
-					Some(fields):
-						match find_record_field(fields, field.text):
-							Some(field_decl):
-								result_context = infer_context_with_state(
-									context,
-									receiver_result.context.state,
-								)
-								typed = TypedFieldAccessExpr(
-									receiver_result.expr,
-									field,
-									span,
-									{ inferred_info(result_context, field_decl.field_type) |
-										resolved_definition_id = field_decl.definition_id
-									},
-								)
-								infer_result(result_context, typed)
-							None:
+				field_id = record_field_id(context, name, field.text)
+				match record_field_type(context, name, args, field.text, field_id):
+					Some(field_type):
+						result_context = infer_context_with_state(
+							context,
+							receiver_result.context.state,
+						)
+						typed = TypedFieldAccessExpr(
+							receiver_result.expr,
+							field,
+							resolved_field_identity_from_optional_id(
+								field_id,
+							),
+							span,
+							inferred_info(result_context, field_type),
+						)
+						infer_result(result_context, typed)
+					None:
+						match record_field_types(context, name, args):
+							Some(fields):
 								next = infer_error(
 									receiver_result.context,
 									"Record " + name + " has no field '" + field.text + "'. Valid fields: " + record_field_names(
@@ -14645,24 +14814,30 @@ private pure func infer_ordinary_field_access_expr(
 								typed = TypedFieldAccessExpr(
 									receiver_result.expr,
 									field,
+									MISSING_RESOLVED_FIELD_IDENTITY,
 									span,
 									inferred_info(next, TYPE_VOID),
 								)
 								infer_result(next, typed)
-					None:
-						next = record_field_access_error(receiver_result.context, receiver_type)
-						typed = TypedFieldAccessExpr(
-							receiver_result.expr,
-							field,
-							span,
-							inferred_info(next, TYPE_VOID),
-						)
-						infer_result(next, typed)
+							None:
+								next = record_field_access_error(
+									receiver_result.context,
+									receiver_type,
+								)
+								typed = TypedFieldAccessExpr(
+									receiver_result.expr,
+									field,
+									MISSING_RESOLVED_FIELD_IDENTITY,
+									span,
+									inferred_info(next, TYPE_VOID),
+								)
+								infer_result(next, typed)
 		_:
 			next = record_field_access_error(receiver_result.context, receiver_type)
 			typed = TypedFieldAccessExpr(
 				receiver_result.expr,
 				field,
+				MISSING_RESOLVED_FIELD_IDENTITY,
 				span,
 				inferred_info(next, TYPE_VOID),
 			)
@@ -15741,6 +15916,7 @@ private pure func checked_get_tuple_result(
 	typed = TypedFieldAccessExpr(
 		receiver,
 		parsed_identifier(index_value.to_string(), span),
+		MISSING_RESOLVED_FIELD_IDENTITY,
 		span,
 		inferred_info(result_context, result_type),
 	)
@@ -19003,7 +19179,7 @@ private pure func infer_assign_expr(
 							span,
 							ModuleAssignScope,
 							binding.binding_type,
-							binding.definition_id,
+							Some(global_id_definition_id(binding.id)),
 						)
 					else:
 						next_context = infer_error(

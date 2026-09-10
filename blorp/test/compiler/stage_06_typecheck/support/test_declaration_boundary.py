@@ -82,6 +82,26 @@ class DeclarationBoundaryTests(unittest.TestCase):
             "header_index_by_definition_id: Dict[Int, Int]", header_source
         )
 
+    def test_global_ids_are_definition_backed_scalars(self) -> None:
+        skeleton_source = DECLARATION_SKELETON.read_text(encoding="utf-8")
+        authority_source = GLOBAL_AUTHORITY.read_text(encoding="utf-8")
+
+        self.assertIn("opaque type GlobalId = DefinitionId", skeleton_source)
+        self.assertNotIn(
+            "opaque type GlobalId = StructuralDeclarationIdRep", skeleton_source
+        )
+        self.assertIn(
+            "index_by_global_definition_id: Dict[Int, Int]", authority_source
+        )
+
+        binding = re.search(
+            r"record AcceptedGlobalBinding \{.*?\n\}",
+            authority_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(binding)
+        self.assertNotIn("definition_id:", binding.group(0))
+
     def test_nominal_type_tables_do_not_retain_parallel_owner_paths(self) -> None:
         sources = {
             "alias": ALIAS_AUTHORITY.read_text(encoding="utf-8"),
@@ -324,7 +344,7 @@ class DeclarationBoundaryTests(unittest.TestCase):
         self.assertNotIn("env_get_module_var_symbol", infer_source)
         self.assertNotIn("env_get_module_var_symbol", env_source)
 
-    def test_global_table_uses_the_prepared_definition_index_directly(self) -> None:
+    def test_global_table_does_not_recover_an_already_claimed_definition_id(self) -> None:
         decl_source = DECL.read_text(encoding="utf-8")
         function = re.search(
             r"private pure func accepted_global_declared_binding\(.*?"
@@ -335,7 +355,7 @@ class DeclarationBoundaryTests(unittest.TestCase):
 
         self.assertIsNotNone(function)
         body = function.group(0)
-        self.assertIn("definition_index_find_source_definition_id", body)
+        self.assertNotIn("definition_index_find_source_definition_id", body)
         self.assertNotIn("typecheck_state_for_prepared_module_scope", body)
 
     def test_request_scope_is_validated_before_dense_environment_lookup(self) -> None:

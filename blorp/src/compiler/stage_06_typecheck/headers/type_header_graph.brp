@@ -38,6 +38,8 @@ import:
 	../graph/definition_identity: SourceDefinitionKind(FieldDefinition), source_definition_key
 	../graph/definition_index:
 		DefinitionTable,
+		FieldId,
+		definition_table_field_id,
 		definition_index_find_source_definition_id,
 	../graph/indexed_graph:
 		PreparedModuleScope,
@@ -224,7 +226,7 @@ union TypeResolutionOwner:
 	TypeDeclarationResolutionOwner(TypeId, String)
 	TraitMethodResolutionOwner(TraitMethodId)
 	CallableResolutionOwner(CallableId, String)
-	GlobalResolutionOwner(GlobalId)
+	GlobalResolutionOwner(GlobalId, String)
 	ImplementationResolutionOwner(ImplId)
 	ImplementationMethodResolutionOwner(ImplId, CallableId, String, ResolvedTypeShape)
 
@@ -285,9 +287,9 @@ union BuiltinTypeLayout:
 
 
 record TypeHeaderField {
+	id: FieldId,
 	name: String,
-	typ: ResolvedTypeShape,
-	definition_id: Option[Int]
+	typ: ResolvedTypeShape
 }
 
 
@@ -438,6 +440,7 @@ union TypeHeaderError:
 	TypeHeaderParametersMissing(TypeId)
 	TypeHeaderResolutionError(TypeShapeResolutionError)
 	TypeHeaderConstructorMissing(TypeId, String)
+	TypeHeaderFieldDefinitionMissing(TypeId, String, SourceSpan)
 	TypeHeaderInvalidEnumTypeParameters(TypeId)
 	TypeHeaderInvalidEnumVariantFields(TypeId, String)
 	TypeHeaderInvalidStructTypeParameters(TypeId)
@@ -691,7 +694,7 @@ private pure func resolution_owner_self_shape(
 			Some(TraitSelfTypeShape(trait_method_id_owner(method_id)))
 		CallableResolutionOwner(_, _):
 			None
-		GlobalResolutionOwner(_):
+		GlobalResolutionOwner(_, _):
 			None
 		ImplementationResolutionOwner(_):
 			None
@@ -1347,9 +1350,8 @@ private pure func type_resolution_owner_matches_module(
 			callable_id_module_id(definition_table, id) == Some(
 				prepared_module_scope_id(bound_module_scope(module)),
 			)
-		GlobalResolutionOwner(id):
-			module_ids_equal(
-				global_id_module_id(id),
+		GlobalResolutionOwner(id, _):
+			global_id_module_id(definition_table, id) == Some(
 				prepared_module_scope_id(bound_module_scope(module)),
 			)
 		ImplementationResolutionOwner(id):
@@ -1502,7 +1504,15 @@ pure func resolve_global_type_shape(
 	global_id: GlobalId,
 	type_expr: ParsedTypeExpr,
 ) -> Result[ResolvedTypeShape, List[TypeShapeResolutionError]]:
-	resolve_owned_type_shape(graph, owner_scope, GlobalResolutionOwner(global_id), [], type_expr)
+	definition_table = type_header_graph_definition_table(graph)
+	owner_name = global_id_name(definition_table, global_id).get_or("<unknown global>")
+	resolve_owned_type_shape(
+		graph,
+		owner_scope,
+		GlobalResolutionOwner(global_id, owner_name),
+		[],
+		type_expr,
+	)
 
 
 pure func resolve_implementation_type_shape(
@@ -1608,23 +1618,41 @@ private pure func resolve_fields(
 	module_table = indexed_graph_module_table(indexed_graph)
 
 	for field in fields:
+		definition_id = definition_index_find_source_definition_id(
+			definition_index,
+			module_table,
+			source_definition_key(
+				prepared_module_scope_id(bound_module_scope(context.resolution.module)),
+				FieldDefinition,
+				field.name.text,
+				Some(context.owner_name),
+				field.span,
+			),
+		)
+		field_id = definition_table_field_id(
+			declaration_skeleton_graph_definition_table(
+				context.resolution.declaration_graph,
+			),
+			definition_id.get_or(-1),
+		)
+
 		match resolve_type_expr(context.resolution, field.type_expr):
 			ResolvedTypeReady(shape):
-				resolved = resolved.append({
-					name = field.name.text,
-					typ = shape,
-					definition_id = definition_index_find_source_definition_id(
-						definition_index,
-						module_table,
-						source_definition_key(
-							prepared_module_scope_id(bound_module_scope(context.resolution.module)),
-							FieldDefinition,
-							field.name.text,
-							Some(context.owner_name),
-							field.span,
-						),
-					),
-				})
+				match field_id:
+					Some(id):
+						resolved = resolved.append({
+							id = id,
+							name = field.name.text,
+							typ = shape,
+						})
+					None:
+						errors = errors.append(
+							TypeHeaderFieldDefinitionMissing(
+								context.owner,
+								field.name.text,
+								field.span,
+							),
+						)
 			ResolvedTypeRejected(field_errors):
 				errors = errors.concat(type_header_resolution_errors(field_errors))
 
@@ -3628,8 +3656,8 @@ pure func type_resolution_owner_display_name(owner: TypeResolutionOwner) -> Stri
 			trait_id_name(trait_method_id_owner(method_id)) + "." + trait_method_id_name(method_id)
 		CallableResolutionOwner(_, name):
 			name
-		GlobalResolutionOwner(id):
-			global_id_name(id)
+		GlobalResolutionOwner(_, name):
+			name
 		ImplementationResolutionOwner(id):
 			"implementation of " + impl_id_name(id)
 		ImplementationMethodResolutionOwner(_, _, name, _):
@@ -3753,6 +3781,8 @@ pure func type_header_error_message(definition_table: DefinitionTable, error: Ty
 			type_shape_resolution_error_message(resolution_error)
 		TypeHeaderConstructorMissing(id, name):
 			"Constructor '" + name + "' is missing for type '" + type_id_name(definition_table, id).get_or("<unknown type>") + "'"
+		TypeHeaderFieldDefinitionMissing(id, name, _):
+			"Field '" + name + "' is missing a reserved definition for type '" + type_id_name(definition_table, id).get_or("<unknown type>") + "'"
 		TypeHeaderInvalidEnumTypeParameters(id):
 			"Enum '" + type_id_name(definition_table, id).get_or("<unknown type>") + "' cannot have type parameters"
 		TypeHeaderInvalidEnumVariantFields(_, name):
@@ -3782,6 +3812,8 @@ pure func type_header_error_span(
 	match error:
 		TypeHeaderOwnerModuleMissing(id) | TypeHeaderDuplicateIdentity(id) | TypeHeaderParametersMissing(id) | TypeHeaderConstructorMissing(id, _) | TypeHeaderInvalidEnumTypeParameters(id) | TypeHeaderInvalidEnumVariantFields(id, _) | TypeHeaderInvalidStructTypeParameters(id) | TypeHeaderEmptyStruct(id) | TypeHeaderInvalidStructField(id, _) | TypeHeaderRecursiveValueLayout(id, _):
 			type_id_source_span(definition_table, id)
+		TypeHeaderFieldDefinitionMissing(_, _, span):
+			Some(span)
 		TypeHeaderResolutionError(resolution_error):
 			Some(type_shape_resolution_error_span(resolution_error))
 		TypeHeaderInlineStorageCycle(cycle, _):

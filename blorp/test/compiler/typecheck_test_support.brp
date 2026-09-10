@@ -13,7 +13,7 @@ import:
 		module_load_candidate,
 		module_load_candidate_resolved_identity,
 		resolved_module_identity_from_resolver,
-	../../src/compiler/stage_04_modules/module_table: ModuleId, module_table
+	../../src/compiler/stage_04_modules/module_table: ModuleId, module_ids_equal, module_table
 	../../src/compiler/stage_06_typecheck/decl:
 		AcceptedTypecheckGraph,
 		AcceptedTypecheckModule,
@@ -29,10 +29,18 @@ import:
 		rejected_typecheck_program,
 		typecheck_bind_program_module_view,
 		typecheck_program_with_type_header_module,
+	../../src/compiler/stage_06_typecheck/graph/definition_identity:
+		SourceDefinitionKind(FieldDefinition),
+		source_definition_key_kind,
+		source_definition_key_module_id,
+		source_definition_key_owner,
 	../../src/compiler/stage_06_typecheck/graph/definition_index:
 		DefinitionTable,
+		FieldId,
+		definition_index_source_definition_bindings,
 		definition_index_definition_table,
 		definition_index_find_type_definition_id,
+		definition_table_field_id,
 	../../src/compiler/stage_06_typecheck/graph/indexed_graph:
 		PreparedModuleScope,
 		indexed_graph_build,
@@ -148,6 +156,18 @@ record DefinitionBackedTypeFixtureModule {
 }
 
 
+record DefinitionBackedRecordFixture {
+	name: String,
+	field_names: List[String]
+}
+
+
+record DefinitionBackedRecordFixtureModule {
+	module_path: String,
+	records: List[DefinitionBackedRecordFixture]
+}
+
+
 pure func definition_backed_type_fixture_for_origin(
 	modules: List[DefinitionBackedTypeFixtureModule],
 	origin: ModuleOrigin,
@@ -185,6 +205,38 @@ pure func definition_backed_type_fixture(
 	definition_backed_type_fixture_for_origin(modules, UserModule)
 
 
+pure func definition_backed_record_fixture(
+	modules: List[DefinitionBackedRecordFixtureModule],
+) -> Option[PreparedModuleScope]:
+	candidates = modules.map(func(module):
+		source = module.records.map(func(record_fixture):
+			"record " + record_fixture.name + " {" + record_fixture.field_names
+				.map(func(name): name + ": Int")
+				.join(", ") + "}"
+		).join("\n")
+		module_load_candidate(
+			resolved_module_identity_from_resolver(module.module_path, UserModule),
+			finalized_typecheck_program_fixture(
+				module.module_path + ".brp",
+				module.module_path,
+				source,
+			),
+		)
+	)
+
+	match module_table(candidates.map(module_load_candidate_resolved_identity)):
+		Err(_):
+			None
+		Ok(table):
+			match candidates.get(0):
+				None:
+					None
+				Some(target):
+					indexed_graph_build_for_module_table(table, candidates, target)
+						.to_option()
+						.map(indexed_graph_target_scope)
+
+
 pure func definition_backed_type_fixture_definition_table(
 	fixture: PreparedModuleScope,
 ) -> DefinitionTable:
@@ -201,6 +253,33 @@ pure func definition_backed_type_fixture_type_id(
 	table = prepared_module_scope_module_table(fixture)
 	runtime_id ?= definition_index_find_type_definition_id(index, table, module_id, name)
 	type_id_from_definition_table(definition_index_definition_table(index), runtime_id)
+
+
+pure func definition_backed_record_fixture_field_id(
+	fixture: PreparedModuleScope,
+	module_path: String,
+	record_name: String,
+	field_name: String,
+) -> Option[FieldId]:
+	module_id ?= module_id_fixture_find(fixture, module_path)
+	index = prepared_module_scope_definition_index(fixture)
+	definition_table = definition_index_definition_table(index)
+	var result: Option[FieldId] = None
+	var match_count: Int = 0
+
+	for (key, definition_id) in definition_index_source_definition_bindings(index, field_name):
+		if (
+			source_definition_key_kind(key) == FieldDefinition
+			and module_ids_equal(source_definition_key_module_id(key), module_id)
+			and source_definition_key_owner(key) == Some(record_name)
+		):
+			result = definition_table_field_id(definition_table, definition_id)
+			match_count += 1
+
+	if match_count == 1:
+		result
+	else:
+		None
 
 
 private pure func module_candidate_from_program(

@@ -18,6 +18,7 @@ import:
 		prepared_module_scope_module,
 	../../../src/compiler/stage_06_typecheck/graph/type_identity:
 		TypeId,
+		type_id_definition_id,
 		type_id_module_id,
 		type_id_name,
 		type_id_source_span,
@@ -30,6 +31,9 @@ import:
 			ImplementationMethodCallableSource,
 		),
 		ConstructorId,
+		DeclarationId(GlobalDeclarationId),
+		GlobalDeclarationSkeletonInfo,
+		GlobalId,
 		DeclarationSkeleton(ConstructorDeclarationSkeleton),
 		DeclarationSkeletonGraph,
 		DeclarationSkeletonGraphError(
@@ -78,6 +82,12 @@ import:
 		declaration_skeleton_name,
 		declaration_skeleton_source,
 		declaration_skeleton_visibility,
+		global_id_definition_id,
+		global_id_from_definition_table,
+		global_id_module_id,
+		global_id_name,
+		global_id_source_span,
+		global_ids_equal,
 		type_declaration_source_span,
 	../../../src/compiler/stage_06_typecheck/modules/bound_module_graph:
 		BoundModuleGraph,
@@ -89,6 +99,17 @@ import:
 		bound_module_graph_target,
 		bound_module_scope,
 	../../../src/compiler/stage_06_typecheck/modules/module_view: COMPILER_MODULE_VIEW_EMPTY
+	../../../src/compiler/stage_06_typecheck/type_system/accepted_global_authority:
+		AcceptedGlobalBinding,
+		AcceptedGlobalExactLookup(AcceptedGlobalExactFound, AcceptedGlobalExactMissing),
+		AcceptedGlobalTableRecord,
+		accepted_global_authority,
+		accepted_global_authority_with_completed_table,
+		accepted_global_exact,
+		accepted_global_find,
+		accepted_global_table,
+		accepted_global_table_complete,
+	../../../src/compiler/stage_06_typecheck/type_system/semantic_type: TYPE_INT, types_equal
 	../../../src/lib/source: source_spans_equal
 	../typecheck_test_support as TypecheckTestSupport
 	test: TestSuite
@@ -313,11 +334,37 @@ func test_skeleton_graph_round_trips_exact_identity_and_visibility() -> Bool:
 							).is_some()
 						)
 					)
+					all_global_ids_round_trip = global_skeletons.all(func(global_skeleton):
+						id = global_skeleton.id
+						(
+							global_id_from_definition_table(
+								definition_table,
+								global_id_definition_id(id),
+							) == Some(id)
+							and global_id_module_id(definition_table, id) == Some(
+								prepared_module_scope_id(
+									bound_module_scope(bound_module_graph_target(bound)),
+								),
+							)
+							and global_id_name(definition_table, id) == Some("count")
+							and global_id_source_span(definition_table, id).map(func(span):
+								source_spans_equal(span, global_skeleton.source.span)
+							).get_or(False)
+						)
+					)
+					wrong_kind_is_rejected = type_skeletons.get(0).map(func(type_skeleton):
+						global_id_from_definition_table(
+							definition_table,
+							type_id_definition_id(type_skeleton.id),
+						).is_none()
+					).get_or(False)
 
 					match (first, hidden):
 						(Some(first_skeleton), Some(hidden_skeleton)):
 							(
 								all_type_ids_round_trip
+								and all_global_ids_round_trip
+								and wrong_kind_is_rejected
 								and type_skeletons.length() == 5
 								and callable_skeletons.length() == 4
 								and global_skeletons.length() == 1
@@ -332,6 +379,86 @@ func test_skeleton_graph_round_trips_exact_identity_and_visibility() -> Bool:
 							)
 						_:
 							False
+
+
+private pure func accepted_global_binding(id: GlobalId) -> AcceptedGlobalBinding:
+	{
+		id = id,
+		binding_type = TYPE_INT,
+		source_type = Some(TYPE_INT),
+		is_mutable = False
+	}
+
+
+private pure func accepted_global_record(
+	skeleton: GlobalDeclarationSkeletonInfo,
+) -> AcceptedGlobalTableRecord:
+	{
+		id = skeleton.id,
+		visibility = skeleton.visibility,
+		declared_binding = Some(accepted_global_binding(skeleton.id))
+	}
+
+
+private pure func accepted_global_ids_are_product_and_layout_safe() -> Option[Bool]:
+	owner ?= bound_graph_from_source("first: Int = 1\n\nsecond: Int = 2")
+	foreign_graph ?= bound_graph_from_source("first: Int = 3\n\nsecond: Int = 4")
+	owner_skeletons ?= declaration_skeleton_graph_build(owner).to_option()
+	foreign_skeletons ?= declaration_skeleton_graph_build(foreign_graph).to_option()
+	owner_globals = declaration_skeleton_graph_global_skeletons(owner_skeletons)
+	foreign_globals = declaration_skeleton_graph_global_skeletons(foreign_skeletons)
+	first ?= owner_globals.get(0)
+	second ?= owner_globals.get(1)
+	foreign_first ?= foreign_globals.get(0)
+	definition_table = declaration_skeleton_graph_definition_table(owner_skeletons)
+	foreign_definition_table = declaration_skeleton_graph_definition_table(foreign_skeletons)
+	initial ?= accepted_global_table({
+		definition_table = definition_table,
+		globals = [accepted_global_record(first), accepted_global_record(second)]
+	})
+	reordered ?= accepted_global_table({
+		definition_table = definition_table,
+		globals = [accepted_global_record(second), accepted_global_record(first)]
+	})
+	completed ?= accepted_global_table_complete(
+		reordered,
+		definition_table,
+		[accepted_global_binding(first.id), accepted_global_binding(second.id)],
+	)
+	authority ?= accepted_global_authority(initial, "app/main", [])
+	completed_authority ?= accepted_global_authority_with_completed_table(authority, completed)
+
+	by_name = accepted_global_find(completed_authority, "first")
+	exact = accepted_global_exact(
+		completed_authority,
+		definition_table,
+		GlobalDeclarationId(first.id),
+	)
+	foreign_exact = accepted_global_exact(
+		completed_authority,
+		foreign_definition_table,
+		GlobalDeclarationId(foreign_first.id),
+	)
+
+	Some(
+		global_id_definition_id(foreign_first.id) == global_id_definition_id(first.id)
+			and by_name.map(func(binding):
+			global_ids_equal(binding.id, first.id) and types_equal(binding.binding_type, TYPE_INT)
+		).get_or(False)
+			and match exact.lookup:
+				AcceptedGlobalExactFound(binding): global_ids_equal(binding.id, first.id)
+				_:
+					False
+			and match foreign_exact.lookup:
+				AcceptedGlobalExactMissing:
+					foreign_exact.candidates_visited == 0
+				_:
+					False
+	)
+
+
+func test_accepted_global_ids_are_product_and_layout_safe() -> Bool:
+	accepted_global_ids_are_product_and_layout_safe().get_or(False)
 
 
 func test_skeleton_graph_rejects_foreign_module_scope() -> Bool:
@@ -768,6 +895,10 @@ tests: TestSuite = {
 		(
 			"round trips exact identity and visibility",
 			test_skeleton_graph_round_trips_exact_identity_and_visibility,
+		),
+		(
+			"accepted global IDs are product and layout safe",
+			test_accepted_global_ids_are_product_and_layout_safe,
 		),
 		("rejects foreign module scope", test_skeleton_graph_rejects_foreign_module_scope),
 		(

@@ -35,7 +35,7 @@ import:
 		parsed_program_has_errors,
 	../../stage_04_modules/module_table: ModuleId, ModuleTable, module_ids_equal
 	../graph/definition_identity:
-		SourceDefinitionKind(ConstructorDefinition, ImplDefinition, TraitDefinition, TypeDefinition),
+		SourceDefinitionKind(ConstructorDefinition, GlobalDefinition, ImplDefinition, TraitDefinition, TypeDefinition),
 		func_callable_key,
 		source_definition_key,
 	../graph/definition_index:
@@ -55,6 +55,8 @@ import:
 		definition_table_callable_row,
 		definition_table_constructor_definition_id,
 		definition_table_constructor_row,
+		definition_table_global_definition_id,
+		definition_table_global_row,
 		definition_table_row,
 	../graph/indexed_graph:
 		PreparedModuleScope,
@@ -105,7 +107,7 @@ private record RuntimeDeclarationIdRep {
 }
 
 
-opaque type GlobalId = StructuralDeclarationIdRep
+opaque type GlobalId = DefinitionId
 
 opaque type ConstructorId = Int
 
@@ -232,6 +234,7 @@ union DeclarationSkeletonGraphError:
 	TypeSkeletonMissingDefinition(String, String, SourceSpan)
 	CallableSkeletonMissingDefinition(String, String, SourceSpan)
 	ConstructorSkeletonMissingDefinition(String, String, String, SourceSpan)
+	GlobalSkeletonMissingDefinition(String, String, SourceSpan)
 	TraitSkeletonMissingDefinition(String, String, SourceSpan)
 	ImplementationSkeletonMissingDefinition(String, String, SourceSpan)
 	DuplicateTypeDeclaration(String, String, SourceSpan)
@@ -356,10 +359,7 @@ private pure func declaration_ids_equal(left: DeclarationId, right: DeclarationI
 		(TypeDeclarationId(left_id), TypeDeclarationId(right_id)):
 			type_ids_equal(left_id, right_id)
 		(GlobalDeclarationId(left_id), GlobalDeclarationId(right_id)):
-			structural_declaration_ids_equal(
-				from_opaque GlobalId(left_id),
-				from_opaque GlobalId(right_id),
-			)
+			global_ids_equal(left_id, right_id)
 		(TraitMethodDeclarationId(left_id), TraitMethodDeclarationId(right_id)):
 			trait_method_ids_equal(left_id, right_id)
 		(ConstructorDeclarationId(left_id), ConstructorDeclarationId(right_id)):
@@ -457,19 +457,35 @@ pure func callable_id_source_span(table: DefinitionTable, id: CallableId) -> Opt
 
 
 pure func global_ids_equal(left: GlobalId, right: GlobalId) -> Bool:
-	structural_declaration_ids_equal(from_opaque GlobalId(left), from_opaque GlobalId(right))
+	definition_ids_equal(from_opaque GlobalId(left), from_opaque GlobalId(right))
 
 
-pure func global_id_name(id: GlobalId) -> String:
-	from_opaque GlobalId(id).name
+pure func global_id_from_definition_table(
+	table: DefinitionTable,
+	runtime_definition_id: Int,
+) -> Option[GlobalId]:
+	definition_table_global_definition_id(table, runtime_definition_id).map(
+		func(id): into_opaque GlobalId(id),
+	)
 
 
-pure func global_id_module_id(id: GlobalId) -> ModuleId:
-	from_opaque GlobalId(id).module_id
+pure func global_id_definition_id(id: GlobalId) -> Int:
+	definition_id_runtime_value(from_opaque GlobalId(id))
 
 
-pure func global_id_source_span(id: GlobalId) -> SourceSpan:
-	from_opaque GlobalId(id).span
+pure func global_id_name(table: DefinitionTable, id: GlobalId) -> Option[String]:
+	definition_table_global_row(table, global_id_definition_id(id)).map(func(row): row.name)
+
+
+pure func global_id_module_id(table: DefinitionTable, id: GlobalId) -> Option[ModuleId]:
+	definition_table_global_row(
+		table,
+		global_id_definition_id(id),
+	).map(func(row): row.module_id)
+
+
+pure func global_id_source_span(table: DefinitionTable, id: GlobalId) -> Option[SourceSpan]:
+	definition_table_global_row(table, global_id_definition_id(id)).map(func(row): row.span)
 
 
 pure func impl_ids_equal(left: ImplId, right: ImplId) -> Bool:
@@ -639,8 +655,8 @@ pure func declaration_skeleton_name(skeleton: DeclarationSkeleton) -> String:
 			trait_id_name(id)
 		TraitMethodDeclarationSkeleton(id, _, _):
 			trait_method_id_name(id)
-		GlobalDeclarationSkeleton(id, _, _):
-			global_id_name(id)
+		GlobalDeclarationSkeleton(_, _, source):
+			source.name.text
 		ImplementationDeclarationSkeleton(id, _, _):
 			impl_id_name(id)
 
@@ -1171,14 +1187,45 @@ private pure func declaration_skeleton_build_items(
 
 			items
 		VarParsedDecl(var_decl):
-			structural = structural_declaration_id(
+			key = source_definition_key(
 				context.module_id,
+				GlobalDefinition,
 				var_decl.name.text,
 				None,
 				var_decl.span,
 			)
-			id = into_opaque GlobalId(structural)
-			[DeclarationSkeletonCandidate(GlobalDeclarationSkeleton(id, visibility, var_decl))]
+			match definition_index_find_source_definition_id(
+				context.definition_index,
+				context.module_table,
+				key,
+			):
+				Some(runtime_id):
+					match global_id_from_definition_table(
+						definition_index_definition_table(context.definition_index),
+						runtime_id,
+					):
+						Some(id):
+							[DeclarationSkeletonCandidate(GlobalDeclarationSkeleton(id, visibility, var_decl))]
+						None:
+							[
+								DeclarationSkeletonBuildError(
+									GlobalSkeletonMissingDefinition(
+										context.module_path,
+										var_decl.name.text,
+										var_decl.span,
+									),
+								),
+							]
+				None:
+					[
+						DeclarationSkeletonBuildError(
+							GlobalSkeletonMissingDefinition(
+								context.module_path,
+								var_decl.name.text,
+								var_decl.span,
+							),
+						),
+					]
 		TraitParsedDecl(trait_decl):
 			trait_skeleton_build_items(context, visibility, trait_decl)
 		ImplParsedDecl(impl_decl):
@@ -1650,6 +1697,8 @@ pure func declaration_skeleton_graph_error_message(error: DeclarationSkeletonGra
 			"declaration skeleton is missing callable definition '" + name + "' in module '" + module_path + "'"
 		ConstructorSkeletonMissingDefinition(module_path, owner, name, _):
 			"declaration skeleton is missing constructor definition '" + owner + "." + name + "' in module '" + module_path + "'"
+		GlobalSkeletonMissingDefinition(module_path, name, _):
+			"declaration skeleton is missing global definition '" + name + "' in module '" + module_path + "'"
 		TraitSkeletonMissingDefinition(module_path, name, _):
 			"declaration skeleton is missing trait definition '" + name + "' in module '" + module_path + "'"
 		ImplementationSkeletonMissingDefinition(module_path, name, _):

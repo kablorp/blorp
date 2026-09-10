@@ -1,6 +1,6 @@
 # Normalized Compilation Database Roadmap
 
-**Status:** Active; Horizon 1 and Issues 61B, 68-70 implemented; Issues 71-73 defined
+**Status:** Active; Horizon 1 and Issues 61B, 68-72 implemented; Issue 73 defined
 
 **Scope:** One compiler invocation and the immutable products retained by an
 LSP analysis snapshot. This is not a cross-run cache, an incremental build
@@ -1045,7 +1045,7 @@ Horizon 2 has one table foundation followed by six bounded identity cuts:
    with a category-safe scalar definition ID. Cut accepted alias, record, and
    union authorities over in the same issue so the old managed identity does
    not survive beside the new one.
-5. **[Issue 71: Make global IDs definition-backed](71-make-global-ids-definition-backed.md).**
+5. **[Issue 71: Make global IDs definition-backed](71-make-global-ids-definition-backed.md) (implemented).**
    Claim the already reserved global definition row, replace structural
    `GlobalId`, remove duplicate raw IDs from accepted graph bindings, and make
    exact accepted-global lookup integer-addressed.

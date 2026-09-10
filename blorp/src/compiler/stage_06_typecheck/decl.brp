@@ -132,10 +132,13 @@ import:
 		source_definition_key,
 	graph/definition_index:
 		DefinitionTable,
+		ResolvedFieldIdentity,
 		definition_index_definition_table,
 		definition_index_find_source_definition_id,
+		definition_table_field_id,
 		definition_table_is_compatible_with_module_table,
 		definition_table_module_table,
+		resolved_field_identity_from_optional_id,
 	graph/indexed_graph:
 		PreparedModuleScope,
 		indexed_graph_module_count,
@@ -218,6 +221,7 @@ import:
 		callable_id_name,
 		callable_id_source_span,
 		callable_ids_equal,
+		global_id_definition_id,
 		global_id_module_id,
 		global_id_name,
 		global_id_source_span,
@@ -775,7 +779,7 @@ pure func completed_global_header_callable_dependencies(
 
 private record CompletedGlobalHeaderGraphRep {
 	headers: List[CompletedGlobalHeader],
-	indices_by_module_and_name: Dict[Int, Dict[String, Int]],
+	index_by_global_definition_id: Dict[Int, Int],
 	metrics: GlobalHeaderCompletionMetrics
 }
 
@@ -803,10 +807,7 @@ pure func completed_global_header_graph_find(
 	id: GlobalId,
 ) -> Option[CompletedGlobalHeader]:
 	representation = from_opaque CompletedGlobalHeaderGraph(graph)
-	names ?= representation.indices_by_module_and_name.get(
-		module_id_table_index(global_id_module_id(id)),
-	)
-	index ?= names.get(global_id_name(id))
+	index ?= representation.index_by_global_definition_id.get(global_id_definition_id(id))
 	header ?= representation.headers.get(index)
 
 	if global_ids_equal(completed_global_header_id(header), id):
@@ -819,7 +820,7 @@ record TypedRecordFieldInfo {
 	name: String,
 	source_type: SemanticType,
 	semantic_type: SemanticType,
-	definition_id: Option[Int],
+	field_id: ResolvedFieldIdentity,
 	declaration_span: SourceSpan,
 	selection_span: SourceSpan
 }
@@ -1454,11 +1455,20 @@ private pure func typed_record_field_from_parsed(
 	definition_id = definition_key.and_then(func(key):
 		typecheck_state_find_source_definition_id(state, key)
 	)
+	runtime_definition_id = definition_id.get_or(-1)
+	field_id = match typecheck_state_definition_index(state):
+		Some(index):
+			definition_table_field_id(
+				definition_index_definition_table(index),
+				runtime_definition_id,
+			)
+		None:
+			None
 	{
 		name = field.name.text,
 		source_type = field_type,
 		semantic_type = semantic_type,
-		definition_id = definition_id,
+		field_id = resolved_field_identity_from_optional_id(field_id),
 		declaration_span = field.span,
 		selection_span = field.name.span
 	}
@@ -6352,8 +6362,7 @@ private pure func accepted_global_binding_from_completed(
 		id = completed_global_header_id(header),
 		binding_type = canonical_type,
 		source_type = canonical_source_type,
-		is_mutable = typed.decl.is_mutable,
-		definition_id = typed.definition_id
+		is_mutable = typed.decl.is_mutable
 	}
 
 
@@ -6372,24 +6381,12 @@ private pure func accepted_global_declared_binding(
 		shape,
 	)
 	source = global_header_source(header)
-	definition_key = source_definition_key(
-		global_id_module_id(id),
-		GlobalDefinition,
-		source.name.text,
-		None,
-		source.span,
-	)
 
 	Some({
 		id = id,
 		binding_type = typ,
 		source_type = Some(typ),
 		is_mutable = source.is_mutable,
-		definition_id = definition_index_find_source_definition_id(
-			prepared_module_scope_definition_index(bound_module_scope(bound_module)),
-			prepared_module_scope_module_table(bound_module_scope(bound_module)),
-			definition_key,
-		),
 	})
 
 
@@ -6400,23 +6397,29 @@ private pure func accepted_global_table_build(
 ) -> Result[AcceptedGlobalTable, List[String]]:
 	var records: List[AcceptedGlobalTableRecord] = []
 	var errors: List[String] = []
+	definition_table = callable_header_graph_definition_table(callable_headers)
 
 	for header in callable_header_graph_globals(callable_headers):
 		id = global_header_id(header)
+		source = global_header_source(header)
 
-		match bound_module_graph_find_for_id(
-			bound_graph,
-			bound_module_graph_module_table(bound_graph),
-			global_id_module_id(id),
-		):
+		owner = match global_id_module_id(definition_table, id):
+			Some(module_id):
+				bound_module_graph_find_for_id(
+					bound_graph,
+					bound_module_graph_module_table(bound_graph),
+					module_id,
+				)
+			None:
+				None
+
+		match owner:
 			Some(bound_module):
 				declared = accepted_global_declared_binding(type_headers, bound_module, header)
 
 				if annotated_global_header_type(header).is_some() and declared.is_none():
 					errors = errors.append(
-						"accepted global table could not resolve annotated type for '" + global_id_name(
-							id,
-						) + "'",
+						"accepted global table could not resolve annotated type for '" + source.name.text + "'",
 					)
 				else:
 					records = records.append({
@@ -6426,16 +6429,14 @@ private pure func accepted_global_table_build(
 					})
 			None:
 				errors = errors.append(
-					"accepted global table owner is absent for '" + global_id_name(id) + "'",
+					"accepted global table owner is absent for '" + source.name.text + "'",
 				)
 
 	if not errors.is_empty():
 		Err(errors)
 	else:
 		match accepted_global_table({
-			module_table = indexed_graph_module_table(
-				bound_module_graph_indexed_graph(bound_graph),
-			),
+			definition_table = definition_table,
 			globals = records,
 		}):
 			Some(table):
@@ -6617,6 +6618,7 @@ private record PreparedModuleEnvironmentCollection {
 
 private record InitializerCheckContext {
 	module_environment: PreparedCanonicalModuleEnvironment,
+	definition_table: DefinitionTable,
 	completed_dependencies: List[CompletedGlobalHeader]
 }
 
@@ -7112,16 +7114,26 @@ private pure func initializer_check_state(context: InitializerCheckContext) -> T
 
 	match module_view_accepted_global_authority(base_state.module_view):
 		Some(authority):
-			initializer_authority = accepted_global_authority_for_initializer(
+			match accepted_global_authority_for_initializer(
 				authority,
+				context.definition_table,
 				context.completed_dependencies.map(accepted_global_binding_from_completed),
-			)
-			{ base_state |
-				module_view = module_view_with_accepted_global_authority(
-					base_state.module_view,
-					initializer_authority,
-				)
-			}
+			):
+				Some(initializer_authority):
+					{ base_state |
+						module_view = module_view_with_accepted_global_authority(
+							base_state.module_view,
+							initializer_authority,
+						)
+					}
+				None:
+					typecheck_state_add_error(
+						base_state,
+						(
+							"internal typecheck error: initializer global dependencies have "
+							+ "different definition provenance"
+						),
+					)
 		None:
 			typecheck_state_add_error(
 				base_state,
@@ -7209,11 +7221,18 @@ private pure func complete_one_global_header(
 	header: GlobalHeader,
 ) -> Result[CompletedGlobalHeader, List[TypecheckDiagnostic]]:
 	id = global_header_id(header)
-	owner = bound_module_graph_find_for_id(
-		bound_graph,
-		bound_module_graph_module_table(bound_graph),
-		global_id_module_id(id),
+	definition_table = callable_header_graph_definition_table(
+		implementation_header_graph_callable_headers(implementation_headers),
 	)
+	owner = match global_id_module_id(definition_table, id):
+		Some(module_id):
+			bound_module_graph_find_for_id(
+				bound_graph,
+				bound_module_graph_module_table(bound_graph),
+				module_id,
+			)
+		None:
+			None
 
 	module_environment_position = match owner:
 		Some(bound_module):
@@ -7248,6 +7267,7 @@ private pure func complete_one_global_header(
 			)
 			state = initializer_check_state({
 				module_environment = module_environment,
+				definition_table = definition_table,
 				completed_dependencies = completed_dependencies,
 			})
 			initial_diagnostic_count = state.diagnostics.length()
@@ -7324,44 +7344,64 @@ private pure func global_header_completion_failure(
 	}
 
 
-private pure func cycle_component_spans_modules(component: List[GlobalId]) -> Bool:
+private pure func cycle_component_spans_modules(
+	definition_table: DefinitionTable,
+	component: List[GlobalId],
+) -> Bool:
 	match component.get(0):
 		None:
 			False
 		Some(first):
-			first_module = global_id_module_id(first)
-			component.any(func(id):
-				not module_ids_equal(global_id_module_id(id), first_module)
-			)
+			match global_id_module_id(definition_table, first):
+				Some(first_module):
+					component.any(func(id):
+						global_id_module_id(definition_table, id).map(func(module_id):
+							not module_ids_equal(module_id, first_module)
+						).get_or(True)
+					)
+				None:
+					False
 
 
 private pure func cycle_component_member_name(
 	bound_graph: BoundModuleGraph,
+	definition_table: DefinitionTable,
 	id: GlobalId,
 	qualify: Bool,
 ) -> String:
+	name = global_id_name(definition_table, id).get_or("<unknown global>")
 	if qualify:
-		bound_module_graph_canonical_path_for_id(
-			bound_graph,
-			bound_module_graph_module_table(bound_graph),
-			global_id_module_id(id),
-		).get_or("<unknown module>") + "::" + global_id_name(id)
+		module_path = match global_id_module_id(definition_table, id):
+			Some(module_id):
+				bound_module_graph_canonical_path_for_id(
+					bound_graph,
+					bound_module_graph_module_table(bound_graph),
+					module_id,
+				)
+			None:
+				None
+		module_path.get_or("<unknown module>") + "::" + name
 	else:
-		global_id_name(id)
+		name
 
 
-private pure func cycle_component_diagnostic_owners(component: List[GlobalId]) -> List[GlobalId]:
+private pure func cycle_component_diagnostic_owners(
+	definition_table: DefinitionTable,
+	component: List[GlobalId],
+) -> List[GlobalId]:
 	var owners: List[GlobalId] = []
 
 	for id in component:
-		module_id = global_id_module_id(id)
-
-		if (
-			not owners.any(func(owner):
-				module_ids_equal(global_id_module_id(owner), module_id)
-			)
-		):
-			owners = owners.append(id)
+		match global_id_module_id(definition_table, id):
+			Some(module_id):
+				if not owners.any(func(owner):
+					global_id_module_id(definition_table, owner).map(func(owner_module_id):
+						module_ids_equal(owner_module_id, module_id)
+					).get_or(False)
+				):
+					owners = owners.append(id)
+			None:
+				void
 
 	owners
 
@@ -7392,10 +7432,11 @@ private pure func complete_planned_global_headers(
 		callable_header_graph_trait_topology(callable_headers),
 	)
 	bound_graph = type_header_graph_bound_graph(type_headers)
+	definition_table = type_header_graph_definition_table(type_headers)
 	var completed: List[CompletedGlobalHeader] = []
-	var completed_indices_by_module_and_name: Dict[Int, Dict[String, Int]] = {}
+	var completed_index_by_global_definition_id: Dict[Int, Int] = {}
 	var failures: List[GlobalHeaderCompletionFailure] = []
-	var requested_by_module_and_name: Dict[Int, Dict[String, Bool]] = {}
+	var requested_global_definition_ids: Dict[Int, Bool] = {}
 	var initializer_checks: Int = 0
 	var duplicate_initializer_requests: Int = 0
 
@@ -7411,39 +7452,40 @@ private pure func complete_planned_global_headers(
 			)
 
 	for component in cyclic_components:
-		qualify_names = cycle_component_spans_modules(component)
+		qualify_names = cycle_component_spans_modules(definition_table, component)
 		names = component
-			.map(func(id): cycle_component_member_name(bound_graph, id, qualify_names))
+			.map(func(id): cycle_component_member_name(bound_graph, definition_table, id, qualify_names))
 			.sort()
 			.join(", ")
-		failures = failures.concat(cycle_component_diagnostic_owners(component).map(
+		failures = failures.concat(cycle_component_diagnostic_owners(definition_table, component).map(
 			func(
 				id,
-			): global_header_completion_failure(
-				global_id_module_id(id),
-				[
+			): {
+				module_id = global_id_module_id(definition_table, id),
+				diagnostics = [
 					typecheck_diagnostic(
 						"Cannot infer global initializer types because these globals form a cycle: " + names,
-						Some(global_id_source_span(id)),
+						global_id_source_span(definition_table, id),
 					),
-				],
-			),
+				]
+			},
 		))
 
 	failures = failures.concat(blocked.map(
 		func(
 			id,
-		): global_header_completion_failure(
-			global_id_module_id(id),
-			[
+		): {
+			module_id = global_id_module_id(definition_table, id),
+			diagnostics = [
 				typecheck_diagnostic(
 					"Cannot infer global initializer type for '" + global_id_name(
+						definition_table,
 						id,
-					) + "' because it depends on a cyclic global",
-					Some(global_id_source_span(id)),
+					).get_or("<unknown global>") + "' because it depends on a cyclic global",
+					global_id_source_span(definition_table, id),
 				),
-			],
-		),
+			]
+		},
 	))
 
 	headers_to_check = global_header_completion_plan_pending(
@@ -7456,16 +7498,15 @@ private pure func complete_planned_global_headers(
 
 	for header in headers_to_check:
 		header_id = global_header_id(header)
-		module_key = module_id_table_index(global_id_module_id(header_id))
-		requested_names = requested_by_module_and_name.get_or(module_key, {})
+		definition_id = global_id_definition_id(header_id)
 		initializer_checks += 1
 
-		if requested_names.contains(global_id_name(header_id)):
+		if requested_global_definition_ids.contains(definition_id):
 			duplicate_initializer_requests += 1
 
-		requested_by_module_and_name = requested_by_module_and_name.set(
-			module_key,
-			requested_names.set(global_id_name(header_id), True),
+		requested_global_definition_ids = requested_global_definition_ids.set(
+			definition_id,
+			True,
 		)
 
 		match complete_one_global_header(
@@ -7478,34 +7519,29 @@ private pure func complete_planned_global_headers(
 			header,
 		):
 			Ok(found):
-				completed_names: Dict[String, Int] = completed_indices_by_module_and_name.get_or(
-					module_key,
-					{},
-				)
-				completed_indices_by_module_and_name = completed_indices_by_module_and_name.set(
-					module_key,
-					completed_names.set(global_id_name(header_id), completed.length()),
+				completed_index_by_global_definition_id = completed_index_by_global_definition_id.set(
+					definition_id,
+					completed.length(),
 				)
 				completed = completed.append(found)
 			Err(found_errors):
-				failures = failures.append(
-					global_header_completion_failure(
-						global_id_module_id(global_header_id(header)),
-						found_errors,
-					),
-				)
+				failures = failures.append({
+					module_id = global_id_module_id(definition_table, header_id),
+					diagnostics = found_errors,
+				})
 
 		header_index += 1
 
 	completed_table = accepted_global_table_complete(
 		initial_global_table,
+		definition_table,
 		completed.map(accepted_global_binding_from_completed),
 	)
 
 	{
 		completed = into_opaque CompletedGlobalHeaderGraph({
 				headers = completed,
-				indices_by_module_and_name = completed_indices_by_module_and_name,
+				index_by_global_definition_id = completed_index_by_global_definition_id,
 				metrics = {
 					initializer_checks = initializer_checks,
 					duplicate_initializer_requests = duplicate_initializer_requests
@@ -7973,6 +8009,16 @@ pure func accepted_typecheck_graph_implementation_headers(
 	accepted_typecheck_graph_rep(graph).facts.implementation_headers
 
 
+pure func accepted_typecheck_graph_definition_table(
+	graph: AcceptedTypecheckGraph,
+) -> DefinitionTable:
+	callable_header_graph_definition_table(
+		implementation_header_graph_callable_headers(
+			accepted_typecheck_graph_implementation_headers(graph),
+		),
+	)
+
+
 pure func accepted_typecheck_graph_importable_graph(
 	graph: AcceptedTypecheckGraph,
 ) -> ImportableModuleGraph:
@@ -8253,10 +8299,9 @@ private pure func frontend_preparation_unique_declaration_observation(
 			callable_count += 1
 
 	for header in callable_header_graph_globals(callable_headers):
-		if frontend_preparation_modules_include_id(
-			modules,
-			global_id_module_id(global_header_id(header)),
-		):
+		if global_id_module_id(definition_table, global_header_id(header)).map(func(module_id):
+			frontend_preparation_modules_include_id(modules, module_id)
+		).get_or(False):
 			global_count += 1
 
 	for header in trait_topology_graph_headers(topology):
@@ -8325,6 +8370,35 @@ private pure func typecheck_state_with_accepted_type_authority(
 	}
 
 
+private pure func typecheck_state_with_completed_global_table(
+	state: TypecheckState,
+	table: AcceptedGlobalTable,
+) -> TypecheckState:
+	match module_view_accepted_global_authority(state.module_view):
+		Some(authority):
+			match accepted_global_authority_with_completed_table(authority, table):
+				Some(completed_authority):
+					{ state |
+						module_view = module_view_with_accepted_global_authority(
+							state.module_view,
+							completed_authority,
+						)
+					}
+				None:
+					typecheck_state_add_error(
+						state,
+						(
+							"internal typecheck error: completed global table has "
+							+ "different definition provenance"
+						),
+					)
+		None:
+			typecheck_state_add_error(
+				state,
+				"internal typecheck error: prepared module has no accepted global authority",
+			)
+
+
 private pure func prepare_canonical_body_module(
 	graph: TypecheckGraphFacts,
 	environment: PreparedCanonicalModuleEnvironment,
@@ -8353,22 +8427,10 @@ private pure func prepare_canonical_body_module(
 		diagnostics = diagnostics
 	}
 
-	with_completed_globals = match module_view_accepted_global_authority(
-		state_with_issues.module_view,
-	):
-		Some(authority):
-			{ state_with_issues | module_view = module_view_with_accepted_global_authority(
-					state_with_issues.module_view,
-					accepted_global_authority_with_completed_table(
-						authority,
-						graph.accepted_global_table,
-					),
-				) }
-		None:
-			typecheck_state_add_error(
-				state_with_issues,
-				"internal typecheck error: prepared module has no accepted global authority",
-			)
+	with_completed_globals = typecheck_state_with_completed_global_table(
+		state_with_issues,
+		graph.accepted_global_table,
+	)
 
 	session_seed ?= body_infer_session_seed(with_completed_globals)
 
@@ -8727,13 +8789,13 @@ private pure func prepare_ctfe_artifact_body_module(
 
 	with_view = match global_authority:
 		Ok(authority):
-			{ with_view | module_view = module_view_with_accepted_global_authority(
-					with_view.module_view,
-					accepted_global_authority_with_completed_table(
+			typecheck_state_with_completed_global_table(
+				{ with_view | module_view = module_view_with_accepted_global_authority(
+						with_view.module_view,
 						authority,
-						graph.accepted_global_table,
-					),
-				) }
+					) },
+				graph.accepted_global_table,
+			)
 		Err(message):
 			typecheck_state_add_error(with_view, "internal typecheck error: " + message)
 
@@ -8984,20 +9046,10 @@ pure func accepted_typecheck_graph_initializer_preparation_observation(
 
 		installed_state = match environment:
 			Some(found):
-				match module_view_accepted_global_authority(base_state.module_view):
-					Some(authority):
-						{ base_state | module_view = module_view_with_accepted_global_authority(
-								base_state.module_view,
-								accepted_global_authority_with_completed_table(
-									authority,
-									facts.accepted_global_table,
-								),
-							) }
-					None:
-						typecheck_state_add_error(
-							base_state,
-							"internal typecheck error: prepared module has no accepted global authority",
-						)
+				typecheck_state_with_completed_global_table(
+					base_state,
+					facts.accepted_global_table,
+				)
 			None:
 				base_state
 

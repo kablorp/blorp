@@ -54,8 +54,6 @@ import:
 		declaration_skeleton_graph_definition_table,
 		declaration_skeleton_graph_global_skeletons,
 		global_id_module_id,
-		global_id_name,
-		global_id_source_span,
 		trait_id_name,
 		trait_ids_equal,
 	trait_headers: TraitTopologyGraph, trait_topology_graph_type_headers
@@ -166,7 +164,7 @@ opaque type CallableHeaderGraph = CallableHeaderGraphRep
 
 union CallableHeaderGraphError:
 	CallableOwnerModuleMissing(String, String, SourceSpan)
-	GlobalOwnerModuleMissing(GlobalId, String)
+	GlobalOwnerModuleMissing(String, String, SourceSpan)
 	CallableDuplicateTypeParameter(String, ParsedIdentifier)
 	CallableTypeParameterUnknownBound(String, ParsedIdentifier, ParsedIdentifier)
 	CallableMissingParameterType(String, Int, SourceSpan)
@@ -335,11 +333,7 @@ private pure func pending_global_rep(
 
 
 pure func global_header_name(header: GlobalHeader) -> String:
-	match header:
-		AnnotatedGlobalHeader(annotated):
-			global_id_name(annotated_global_rep(annotated).id)
-		PendingGlobalInitializer(pending):
-			global_id_name(pending_global_rep(pending).id)
+	global_header_source(header).name.text
 
 
 pure func global_header_id(header: GlobalHeader) -> GlobalId:
@@ -698,20 +692,40 @@ private pure func append_global_header(
 	skeleton: GlobalDeclarationSkeletonInfo,
 ) -> CallableHeaderBuildState:
 	bound_graph = type_header_graph_bound_graph(type_headers)
+	definition_table = declaration_skeleton_graph_definition_table(
+		type_header_graph_declaration_graph(type_headers),
+	)
+	module_id = global_id_module_id(definition_table, skeleton.id)
 
-	match bound_module_graph_find_for_id(
-		bound_graph,
-		bound_module_graph_module_table(bound_graph),
-		global_id_module_id(skeleton.id),
-	):
-		None:
-			module_path = bound_module_graph_canonical_path_for_id(
+	owner = match module_id:
+		Some(id):
+			bound_module_graph_find_for_id(
 				bound_graph,
 				bound_module_graph_module_table(bound_graph),
-				global_id_module_id(skeleton.id),
-			).get_or("<unknown-module>")
+				id,
+			)
+		None:
+			None
+
+	match owner:
+		None:
+			module_path = match module_id:
+				Some(id):
+					bound_module_graph_canonical_path_for_id(
+						bound_graph,
+						bound_module_graph_module_table(bound_graph),
+						id,
+					)
+				None:
+					None
 			{ state |
-				errors = state.errors.append(GlobalOwnerModuleMissing(skeleton.id, module_path))
+				errors = state.errors.append(
+					GlobalOwnerModuleMissing(
+						skeleton.source.name.text,
+						module_path.get_or("<unknown-module>"),
+						skeleton.source.span,
+					),
+				)
 			}
 		Some(module):
 			match skeleton.source.type_expr:
@@ -904,8 +918,8 @@ pure func callable_header_graph_error_message(error: CallableHeaderGraphError) -
 	match error:
 		CallableOwnerModuleMissing(name, module_path, _):
 			"callable '" + name + "' has no bound owner module '" + module_path + "'"
-		GlobalOwnerModuleMissing(id, module_path):
-			"global '" + global_id_name(id) + "' has no bound owner module '" + module_path + "'"
+		GlobalOwnerModuleMissing(name, module_path, _):
+			"global '" + name + "' has no bound owner module '" + module_path + "'"
 		CallableDuplicateTypeParameter(owner_name, name):
 			"callable '" + owner_name + "' declares type parameter '" + name.text + "' more than once"
 		CallableTypeParameterUnknownBound(owner_name, parameter, bound):
@@ -920,8 +934,8 @@ pure func callable_header_graph_error_span(error: CallableHeaderGraphError) -> O
 	match error:
 		CallableOwnerModuleMissing(_, _, span):
 			Some(span)
-		GlobalOwnerModuleMissing(id, _):
-			Some(global_id_source_span(id))
+		GlobalOwnerModuleMissing(_, _, span):
+			Some(span)
 		CallableDuplicateTypeParameter(_, name):
 			Some(name.span)
 		CallableTypeParameterUnknownBound(_, _, bound):
