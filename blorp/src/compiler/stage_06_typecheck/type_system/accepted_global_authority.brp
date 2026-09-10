@@ -8,8 +8,8 @@ import:
 	../../stage_04_modules/module_table:
 		ModuleId,
 		ModuleTable,
-		module_ids_equal,
 		module_id_table_index,
+		module_ids_equal,
 		module_table_canonical_path,
 		module_table_count,
 		module_table_find_id_by_canonical_path,
@@ -63,6 +63,7 @@ private record AcceptedGlobalSlot {
 private record AcceptedGlobalTableRep {
 	definition_table: DefinitionTable,
 	slots: List[AcceptedGlobalSlot],
+	completed_count: Int,
 	index_by_global_definition_id: Dict[Int, Int],
 	indices_by_module_and_name: List[Dict[String, Int]]
 }
@@ -176,28 +177,42 @@ pure func accepted_global_table(input: AcceptedGlobalTableInput) -> Option[Accep
 
 	for entry in input.globals:
 		definition_id = global_id_definition_id(entry.id)
+
 		match definition_table_global_row(input.definition_table, definition_id):
 			Some(row):
 				module_index = module_id_table_index(row.module_id)
-				module_indices = indices_by_module_and_name.get(module_index).get_or({})
+				module_indices = indices_by_module_and_name
+					.get(module_index)
+					.get_or({})
+
 				declared_matches = match entry.declared_binding:
-					Some(binding): global_ids_equal(binding.id, entry.id)
-					None: True
+					Some(binding):
+						global_ids_equal(binding.id, entry.id)
+					None:
+						True
+
 				owner_module_path = module_table_canonical_path(module_table, row.module_id)
 
 				if (
 					index_by_global_definition_id.contains(definition_id)
 					or module_indices.contains(row.name)
 					or not declared_matches
-					or indices_by_module_and_name.get(module_index).is_none()
+					or indices_by_module_and_name
+						.get(module_index)
+						.is_none()
 					or owner_module_path.is_none()
 				):
 					valid = False
 				else:
 					index = slots.length()
+
 					owner_declared_binding = match owner_module_path:
-						Some(path): entry.declared_binding.map(func(binding): localize_binding(path, binding))
-						None: None
+						Some(path):
+							entry.declared_binding.map(
+								func(binding): localize_binding(path, binding),
+							)
+						None:
+							None
 
 					slots = slots.append({
 						id = entry.id,
@@ -222,6 +237,7 @@ pure func accepted_global_table(input: AcceptedGlobalTableInput) -> Option[Accep
 		Some(into_opaque AcceptedGlobalTable({
 					definition_table = input.definition_table,
 					slots = slots,
+					completed_count = 0,
 					index_by_global_definition_id = index_by_global_definition_id,
 					indices_by_module_and_name = indices_by_module_and_name
 				}))
@@ -274,19 +290,29 @@ pure func accepted_global_table_complete(
 				valid = False
 
 	if valid:
-		Some(into_opaque AcceptedGlobalTable({ representation | slots = slots }))
+		Some(into_opaque AcceptedGlobalTable({ representation |
+					slots = slots,
+					completed_count = representation.completed_count + bindings.length()
+				}))
 	else:
 		None
 
 
 pure func accepted_global_table_completed_count(table: AcceptedGlobalTable) -> Int:
-	var count: Int = 0
+	table_rep(table).completed_count
 
-	for slot in table_rep(table).slots:
-		if slot.completed_binding.is_some():
-			count += 1
 
-	count
+pure func accepted_global_table_entry_count(table: AcceptedGlobalTable) -> Int:
+	table_rep(table).slots.length()
+
+
+pure func accepted_global_table_is_complete(table: AcceptedGlobalTable) -> Bool:
+	representation = table_rep(table)
+	representation.completed_count == representation.slots.length()
+
+
+pure func accepted_global_table_definition_table(table: AcceptedGlobalTable) -> DefinitionTable:
+	table_rep(table).definition_table
 
 
 pure func accepted_global_authority_metrics(
@@ -312,6 +338,7 @@ pure func accepted_global_authority(
 		table_module_table(representation),
 		owner_module_path,
 	)
+
 	local_indices: Dict[String, Int] = match owner_module_id:
 		Some(module_id):
 			representation.indices_by_module_and_name
@@ -402,9 +429,9 @@ pure func accepted_global_authority_with_completed_table(
 		completed_representation.definition_table,
 	):
 		Some(into_opaque AcceptedGlobalAuthority({ representation |
-				table = table,
-				availability = CompletedGlobalAvailability
-			}))
+					table = table,
+					availability = CompletedGlobalAvailability
+				}))
 	else:
 		None
 
@@ -417,14 +444,12 @@ pure func accepted_global_authority_for_initializer(
 	representation = authority_rep(authority)
 	table_representation = table_rep(representation.table)
 	var allowed: Dict[Int, AcceptedGlobalBinding] = {}
-	valid = definition_tables_share_provenance(
-		table_representation.definition_table,
-		issuing_table,
-	)
+	valid = definition_tables_share_provenance(table_representation.definition_table, issuing_table)
 
 	if valid:
 		for binding in completed_dependencies:
 			definition_id = global_id_definition_id(binding.id)
+
 			match table_index_for_id(table_representation, binding.id):
 				Some(index):
 					match table_representation.slots.get(index):
@@ -434,6 +459,7 @@ pure func accepted_global_authority_for_initializer(
 									localize_binding(representation.owner_module_path, binding)
 								else:
 									binding
+
 								allowed = allowed.set(definition_id, available)
 						None:
 							void
@@ -441,9 +467,11 @@ pure func accepted_global_authority_for_initializer(
 					void
 
 	if valid:
-		Some(into_opaque AcceptedGlobalAuthority(
-			{ representation | availability = InitializerGlobalAvailability(allowed) }
-		))
+		Some(
+			into_opaque AcceptedGlobalAuthority(
+				{ representation | availability = InitializerGlobalAvailability(allowed) }
+			),
+		)
 	else:
 		None
 
@@ -452,10 +480,7 @@ private pure func authority_owns_global(
 	representation: AcceptedGlobalAuthorityRep,
 	id: GlobalId,
 ) -> Bool:
-	owner_module_id = global_id_module_id(
-		table_rep(representation.table).definition_table,
-		id,
-	)
+	owner_module_id = global_id_module_id(table_rep(representation.table).definition_table, id)
 
 	match (representation.owner_module_id, owner_module_id):
 		(Some(authority_module_id), Some(global_module_id)):
@@ -519,20 +544,15 @@ pure func accepted_global_find_qualified(
 	names ?= table.indices_by_module_and_name.get(module_id_table_index(module_id))
 	index ?= names.get(name)
 	slot ?= table.slots.get(index)
-	owner_local = match representation.owner_module_id:
-		Some(owner_module_id): module_ids_equal(module_id, owner_module_id)
-		None: False
 
-	if (
-		slot.visibility == PublicDeclaration
-		or owner_local
-	):
-		available_binding(
-			representation,
-			slot,
-			global_id_definition_id(slot.id),
-			owner_local,
-		)
+	owner_local = match representation.owner_module_id:
+		Some(owner_module_id):
+			module_ids_equal(module_id, owner_module_id)
+		None:
+			False
+
+	if slot.visibility == PublicDeclaration or owner_local:
+		available_binding(representation, slot, global_id_definition_id(slot.id), owner_local)
 	else:
 		None
 
@@ -547,7 +567,10 @@ pure func accepted_global_exact(
 
 	match declaration_id:
 		GlobalDeclarationId(id):
-			exact_index = if definition_tables_share_provenance(table.definition_table, issuing_table):
+			exact_index = if definition_tables_share_provenance(
+				table.definition_table,
+				issuing_table,
+			):
 				table_index_for_id(table, id)
 			else:
 				None
@@ -558,6 +581,7 @@ pure func accepted_global_exact(
 						Some(slot):
 							if global_ids_equal(slot.id, id):
 								definition_id = global_id_definition_id(id)
+
 								match available_binding(
 									representation,
 									slot,

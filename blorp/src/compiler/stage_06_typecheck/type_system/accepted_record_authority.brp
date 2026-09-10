@@ -66,9 +66,6 @@ private record AcceptedRecordTableRep {
 	records: List[AcceptedRecordEntry],
 	record_ids: List[TypeId],
 	canonical_visibility: List[Bool],
-	-- Type definition IDs map to non-negative record indices. Field definition
-	-- IDs map to `-(record_index * stride + field_index) - 1`. Definition kinds
-	-- are disjoint, so the sign is an unambiguous tag without a second map.
 	record_or_field_locators_by_definition_id: Dict[Int, Int],
 	field_locator_stride: Int,
 	canonical_record_indices_by_name: Dict[String, Int]
@@ -183,7 +180,9 @@ private pure func record_field_name_key(
 			None:
 				void
 
-	names.sort().join("\n")
+	names
+		.sort()
+		.join("\n")
 
 
 private pure func accepted_fields_are_valid(
@@ -192,10 +191,7 @@ private pure func accepted_fields_are_valid(
 	fields: List[AcceptedFieldRow],
 	seen_field_ids: Dict[Int, Bool],
 ) -> Bool:
-	match (
-		type_id_module_id(definition_table, parent),
-		type_id_name(definition_table, parent),
-	):
+	match (type_id_module_id(definition_table, parent), type_id_name(definition_table, parent)):
 		(Some(parent_module), Some(parent_name)):
 			var names: Dict[String, Bool] = {}
 			var valid: Bool = True
@@ -205,6 +201,7 @@ private pure func accepted_fields_are_valid(
 				match definition_table_field_row(definition_table, field.id):
 					Some(row):
 						definition_id = field_id_definition_id(field.id)
+
 						if (
 							not type_ids_equal(field.parent, parent)
 							or field.index != index
@@ -260,7 +257,10 @@ pure func accepted_record_table(input: AcceptedRecordTableInput) -> Option[Accep
 		):
 			valid = False
 		else:
-			known_type_indices_by_definition_id = known_type_indices_by_definition_id.set(key, index)
+			known_type_indices_by_definition_id = known_type_indices_by_definition_id.set(
+				key,
+				index,
+			)
 
 		index += 1
 
@@ -299,6 +299,9 @@ pure func accepted_record_table(input: AcceptedRecordTableInput) -> Option[Accep
 		else:
 			var field_index: Int = 0
 
+			-- Non-negative locators are record indices. Field locators are encoded
+			-- as `-(record_index * stride + field_index) - 1`; the definition-count
+			-- stride is greater than every field index, so decoding is unambiguous.
 			for field in entry.payload.fields:
 				field_key = field_id_definition_id(field.id)
 				seen_field_ids = seen_field_ids.set(field_key, True)
@@ -311,7 +314,10 @@ pure func accepted_record_table(input: AcceptedRecordTableInput) -> Option[Accep
 			records = records.append(entry.payload)
 			record_ids = record_ids.append(entry.id)
 			canonical_visibility = canonical_visibility.append(entry.canonical_visible)
-			record_or_field_locators_by_definition_id = record_or_field_locators_by_definition_id.set(key, index)
+			record_or_field_locators_by_definition_id = record_or_field_locators_by_definition_id.set(
+				key,
+				index,
+			)
 
 			if entry.canonical_visible:
 				canonical_record_indices_by_name = canonical_record_indices_by_name.set(
@@ -341,6 +347,19 @@ pure func accepted_record_table_entry_count(table: AcceptedRecordTable) -> Int:
 	table_rep(table).records.length()
 
 
+pure func accepted_record_table_field_count(table: AcceptedRecordTable) -> Int:
+	var count: Int = 0
+
+	for record_entry in table_rep(table).records:
+		count += record_entry.fields.length()
+
+	count
+
+
+pure func accepted_record_table_definition_table(table: AcceptedRecordTable) -> DefinitionTable:
+	table_rep(table).definition_table
+
+
 pure func accepted_record_module_view(
 	table: AcceptedRecordTable,
 	owner: ModuleId,
@@ -365,9 +384,11 @@ pure func accepted_record_module_view(
 					None:
 						False
 
-				owner_matches = binding.owner_local == (
-					type_id_module_id(representation.definition_table, binding.id) == Some(owner)
-				)
+				owner_matches = binding.owner_local == (type_id_module_id(
+					representation.definition_table,
+					binding.id,
+				) == Some(owner))
+
 				visible = (
 					binding.owner_local
 					or representation.canonical_visibility
@@ -552,6 +573,7 @@ pure func accepted_record_field_name(
 	id: FieldId,
 ) -> Option[String]:
 	table = table_rep(authority_rep(authority).table)
+
 	match definition_table_field_row(table.definition_table, id):
 		Some(row):
 			Some(row.name)
@@ -563,7 +585,9 @@ private pure func accepted_record_table_field(
 	representation: AcceptedRecordTableRep,
 	id: FieldId,
 ) -> Option[AcceptedFieldRow]:
-	locator ?= representation.record_or_field_locators_by_definition_id.get(field_id_definition_id(id))
+	locator ?= representation.record_or_field_locators_by_definition_id.get(
+		field_id_definition_id(id),
+	)
 	packed_locator = 0 - locator - 1
 	record_index = packed_locator / representation.field_locator_stride
 	field_index = packed_locator % representation.field_locator_stride
@@ -708,7 +732,9 @@ pure func accepted_record_exact(table: AcceptedRecordTable, id: TypeId) -> Accep
 				None:
 					AcceptedRecordExactMissing
 
-			candidates_visited = if representation.known_type_indices_by_definition_id.contains(key):
+			candidates_visited = if representation.known_type_indices_by_definition_id.contains(
+				key,
+			):
 				1
 			else:
 				0
@@ -734,3 +760,22 @@ pure func accepted_record_field_exact(
 				AcceptedFieldExactFound(field)
 			None:
 				AcceptedFieldExactMissing
+
+
+-- Zero-copy parent projection for the catalog's logical field table. The
+-- record table remains the sole physical owner and source order is preserved.
+pure func accepted_record_table_fields(
+	table: AcceptedRecordTable,
+	issuing_table: DefinitionTable,
+	parent: TypeId,
+) -> Option[List[AcceptedFieldRow]]:
+	representation = table_rep(table)
+
+	if definition_tables_share_provenance(representation.definition_table, issuing_table):
+		match accepted_record_exact(table, parent).lookup:
+			AcceptedRecordExactFound(entry):
+				Some(entry.fields)
+			_:
+				None
+	else:
+		None

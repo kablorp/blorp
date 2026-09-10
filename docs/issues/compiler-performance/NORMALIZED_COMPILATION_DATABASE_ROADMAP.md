@@ -1,6 +1,7 @@
 # Normalized Compilation Database Roadmap
 
-**Status:** Active; Horizon 1 and Issues 61B, 68-73 implemented
+**Status:** Active; Horizon 1, Issues 61B and 68-73, and normalized semantic
+Step 1 implemented
 
 **Scope:** One compiler invocation and the immutable products retained by an
 LSP analysis snapshot. This is not a cross-run cache, an incremental build
@@ -18,7 +19,7 @@ multi-metric acceptance gates.
 
 **Near-term issues:**
 
-1. Execute the [Normalized Semantic Compilation Roadmap](NORMALIZED_SEMANTIC_COMPILATION_ROADMAP.md).
+1. Continue with Step 2 of the [Normalized Semantic Compilation Roadmap](NORMALIZED_SEMANTIC_COMPILATION_ROADMAP.md); Step 1 now publishes the accepted semantic catalog.
 2. Keep the completed identity checkpoint as the required foundation:
    [Issue 61B](61-establish-canonical-graph-definition-table.md),
    [Issue 68](68-use-scalar-definition-ids-for-constructor-identity.md),

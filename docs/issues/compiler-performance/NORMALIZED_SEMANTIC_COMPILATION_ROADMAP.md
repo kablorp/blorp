@@ -1,8 +1,8 @@
 # Normalized Semantic Compilation Roadmap
 
-**Status:** Ready for sequential implementation after Step 0 records a fresh
-baseline. The completed module and definition identity work is the foundation;
-this roadmap defines the next finite checkpoint.
+**Status:** Step 1 implemented and measured; Step 2 is next. The completed
+module and definition identity work is the foundation; this roadmap defines
+the next finite checkpoint.
 
 **Scope:** One compiler invocation and one immutable analysis snapshot. This
 roadmap makes accepted and recoverable semantic facts directly queryable by the
@@ -286,8 +286,16 @@ or slightly negative enabling layers on the promise of a later win.
 Use separate clean worktrees for baseline and candidate. Record commits,
 compiler/worker SHA-256 values, host, architecture, compiler flags, and workload
 arguments. Warm both variants, alternate execution order, retain raw samples,
-and use at least five valid pairs. Use more pairs when the observed difference
-is close to host noise.
+and normally use three valid pairs. Add pairs only when the observed difference
+is close to host noise or the counters are unstable.
+
+Keep iteration cheaper than acceptance. During implementation, run the smallest
+owned fixture and one baseline/candidate counter-screening pair. A failed screen
+stops there; do not spend five pairs quantifying a known regression. Request
+review before the final measurement so review fixes do not invalidate it. Once
+the design and counters are stable, run one three-pair acceptance sample and the
+broad changed-owner gate once. Additional pairs are for genuinely ambiguous
+counter results, not the default feedback loop.
 
 Headline timing runs remain uninstrumented. Allocation, logical counter,
 sampling, and instruction measurements run as separate matrices because their
@@ -501,8 +509,6 @@ private record AcceptedSemanticCatalogRep {
 	aliases: AcceptedAliasTable,
 	records: AcceptedRecordTable,
 	unions: AcceptedUnionTable,
-	constructors: AcceptedConstructorTable,
-	fields: AcceptedFieldTable,
 	callables: AcceptedCallableTable,
 	globals: AcceptedGlobalTable,
 	traits_and_implementations: AcceptedTraitImplementationTable
@@ -523,6 +529,13 @@ must publish zero-copy opaque constructor/field table views over one canonical
 allocation, or move those payload columns once and make union/record rows retain
 ordered IDs/ranges. It must not copy the same constructor or field payload into
 both a parent row and a new standalone table.
+
+The implemented catalog follows the first representation: it stores each
+accepted union and record table once, then projects opaque
+`AcceptedConstructorTable` and `AcceptedFieldTable` logical capabilities over
+those same allocations. Parent-keyed projections return variants and fields in
+their canonical source order, validate the ID's issuing `DefinitionTable`, and
+do not build flat copies or add retained payload owners.
 
 ### Implementation strategy
 
@@ -547,9 +560,12 @@ Run category-table suites and the accepted phase benchmark after each migrated
 category:
 
 ```bash
-scripts/compiler-check --stage typecheck
-benchmarks/compiler_typecheck_phase_profile accepted 100 8 32 64 4
-benchmarks/compiler_typecheck_name_lookup_profile
+# Iteration: smallest affected suite, then one baseline/candidate screen.
+bin/blorp test blorp/test/compiler/stage_06_typecheck/test_accepted_semantic_catalog.brp
+benchmarks/compiler_typecheck_phase_profile accepted 5 8 32 64 4 memory
+
+# Acceptance, once the screen and review are clean.
+scripts/compiler-check --changed
 ```
 
 Inspect generated C for unboxed IDs, one shared table retain per product rather
@@ -565,17 +581,93 @@ retiring a consumer path fails this step.
 ### Acceptance criteria
 
 - One opaque accepted catalog proves all included tables share provenance.
-- Every accepted constructor and field has one canonical logical row; parent
-  union/record rows retain only ordered identity/range relations after cutover.
+- Every accepted constructor and field is addressable through one logical
+  authority in canonical parent/source order. If payload columns move, parent
+  union/record rows retain only ordered identity/range relations; if payloads
+  remain co-located, the parent table remains their sole physical owner.
 - Constructor/field publication does not duplicate payload storage or add a
   second independently owned authority.
 - Rejected or pending declarations cannot construct it.
 - At least one production consumer reads each included category through catalog
   queries before that category's slice merges.
-- The corresponding superseded graph carrier or index is deleted.
+- The corresponding superseded allocating graph carrier or index is deleted;
+  a category build proof may retain the graph name only as a zero-cost opaque
+  alias over the canonical table.
 - Accepted output, diagnostics, IDs, and replay bytes remain exact.
 - Allocations, retained bytes, and latency are neutral or better for each slice;
   the combined step improves a majority of its applicable resource metrics.
+
+### Implemented result
+
+Step 1 is complete. `AcceptedTypecheckGraph` now owns one
+`AcceptedSemanticCatalog`, constructed once at graph completion from the exact
+module, definition, alias, record, union, callable, global, and
+trait/implementation tables. Construction derives exact expected category
+counts from the accepted header graph and rejects missing rows, a mixed module
+or definition provenance domain, or any global table with pending completion
+slots. Type-header counts are accumulated as scalar metadata during the
+existing successful header-build loop, avoiding a second graph traversal.
+Only the opaque accepted graph representation contains the catalog. Recoverable
+declaration and initializer outcomes retain separate semantic tables and cannot
+publish the accepted capability.
+
+Production body preparation and accepted-graph observations select all included
+categories through the catalog. Frontend declaration profiling now reads
+constructor and field rows from the catalog instead of reconstructing
+constructor totals from type-header variants. The old `AcceptedAliasGraph`,
+`AcceptedRecordGraph`, and `AcceptedUnionGraph` one-field record wrappers were
+replaced by zero-cost opaque aliases over their canonical category tables.
+Those aliases are phase-sealed build proofs: the catalog cannot accept a raw or
+cross-category table, but the proof adds no allocation or retained owner. This
+replaces three retained carrier allocations with one catalog allocation while
+keeping module views as the narrow visibility projections required by body
+checking.
+
+Catalog tests cover coherent and mixed provenance domains plus completed-global
+coverage. Existing category suites continue to own wrong-kind, duplicate-row,
+ordering, and exact lookup behavior. The accepted graph integration suite
+verifies that the production graph publishes the catalog and can read nonempty
+constructor and field rows in parent/source order through the logical views.
+The declaration-boundary check proves that alias, record, and union catalog
+inputs require zero-cost sealed graph products rather than raw tables.
+
+The closure screen compared the final implementation with immutable `main`
+revision `66d510c9`. The focused profile used five accepted-stage iterations,
+eight modules, 32 shapes per module, 64 probes per module, import fan-out four,
+and allocator instrumentation. One alternating warm pair was sufficient to
+confirm that the frozen representation retained the earlier directional wins;
+it is counter evidence, not a wall-time study:
+
+| Metric | Parent median/deterministic value | Step 1 median/deterministic value | Change |
+| --- | ---: | ---: | ---: |
+| accepted-stage retired instructions | 127,076,367,886 | 124,673,487,328 | -1.8909% |
+| accepted-stage allocations | 1,684,396 | 1,684,391 | -5 per five iterations |
+| accepted-stage releases | 1,565,183 | 1,565,180 | -3 per five iterations |
+| accepted-stage retained objects | 119,213 | 119,211 | -2 |
+| accepted-stage allocated bytes | 8,839,080 | 8,839,016 | -64 bytes |
+| accepted-stage peak RSS | 83,050,496 bytes | 83,312,640 bytes | +0.3156% |
+| profiled benchmark executable | 9,114,848 bytes | 9,166,432 bytes | +0.5659% |
+
+The semantic and constructor-lookup checksums were identical.
+The deterministic ARC reductions are consistent with replacing three carrier
+allocations with the one accepted catalog. RSS and profiled-worker size remain
+well below their 1% investigation thresholds.
+
+For this representation-only cut, managed allocation/release work, retained
+product memory, retired instructions, and native artifact size are primary.
+Focused and whole-compiler latency, peak RSS, and semantic-work counters are
+guards. Tooling-query cost is not applicable yet because Step 1 changes no LSP,
+lint, or snapshot query; Step 8 owns that cutover. Generated program C and host
+C compilation are also unchanged because the catalog is a compiler-internal
+product and does not alter backend output.
+
+The final production compiler executable shrank from 19,248,856 to 19,173,184
+bytes (`-0.3931%`). Net production Blorp source grew by 864 lines, including
+the catalog queries, proof boundary, consumer migration, and their explicit
+validation paths. Host contention made wall time unsuitable for acceptance, so
+no latency claim is made. Raw counters, hashes, commands, and the full
+interpretation are in
+[`benchmarks/results/compiler_accepted_semantic_catalog_step1_2026-09-10.md`](../../../benchmarks/results/compiler_accepted_semantic_catalog_step1_2026-09-10.md).
 
 ## Step 2: Normalize Module Visibility And Binding Precedence
 

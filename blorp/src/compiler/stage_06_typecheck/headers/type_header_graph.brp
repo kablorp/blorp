@@ -39,8 +39,8 @@ import:
 	../graph/definition_index:
 		DefinitionTable,
 		FieldId,
-		definition_table_field_id,
 		definition_index_find_source_definition_id,
+		definition_table_field_id,
 	../graph/indexed_graph:
 		PreparedModuleScope,
 		indexed_graph_definition_index,
@@ -411,6 +411,16 @@ private EMPTY_MODULE_TYPE_HEADER_INDICES: ModuleTypeHeaderIndices = {
 }
 
 
+struct TypeHeaderSemanticCounts {
+	type_identities: Int,
+	aliases: Int,
+	records: Int,
+	fields: Int,
+	unions: Int,
+	constructors: Int
+}
+
+
 -- This must remain ARC-managed: its fields own heap containers, and the table
 -- is itself embedded in TypeHeaderGraphRep.
 private record TypeHeaderTable {
@@ -418,6 +428,7 @@ private record TypeHeaderTable {
 	header_index_by_definition_id: Dict[Int, Int],
 	header_indices_by_name: Dict[String, List[Int]],
 	header_indices_by_module: List[ModuleTypeHeaderIndices],
+	semantic_counts: TypeHeaderSemanticCounts,
 	owner_scope: PreparedModuleScope
 }
 
@@ -1334,30 +1345,35 @@ private pure func type_resolution_owner_matches_module(
 ) -> Bool:
 	match owner:
 		TypeDeclarationResolutionOwner(id, _):
-			type_id_module_id(definition_table, id) == Some(
-				prepared_module_scope_id(bound_module_scope(module)),
-			)
+			type_id_module_id(
+				definition_table,
+				id,
+			) == Some(prepared_module_scope_id(bound_module_scope(module)))
 		TraitMethodResolutionOwner(trait_id, _, _):
 			trait_id_module_id(
 				definition_table,
 				trait_id,
 			) == Some(prepared_module_scope_id(bound_module_scope(module)))
 		CallableResolutionOwner(id, _):
-			callable_id_module_id(definition_table, id) == Some(
-				prepared_module_scope_id(bound_module_scope(module)),
-			)
+			callable_id_module_id(
+				definition_table,
+				id,
+			) == Some(prepared_module_scope_id(bound_module_scope(module)))
 		GlobalResolutionOwner(id, _):
-			global_id_module_id(definition_table, id) == Some(
-				prepared_module_scope_id(bound_module_scope(module)),
-			)
+			global_id_module_id(
+				definition_table,
+				id,
+			) == Some(prepared_module_scope_id(bound_module_scope(module)))
 		ImplementationResolutionOwner(id, _):
-			impl_id_module_id(definition_table, id) == Some(
-				prepared_module_scope_id(bound_module_scope(module)),
-			)
+			impl_id_module_id(
+				definition_table,
+				id,
+			) == Some(prepared_module_scope_id(bound_module_scope(module)))
 		ImplementationMethodResolutionOwner(id, _, _, _):
-			impl_id_module_id(definition_table, id) == Some(
-				prepared_module_scope_id(bound_module_scope(module)),
-			)
+			impl_id_module_id(
+				definition_table,
+				id,
+			) == Some(prepared_module_scope_id(bound_module_scope(module)))
 
 
 private pure func prepare_owned_type_resolution_context(
@@ -1627,9 +1643,7 @@ private pure func resolve_fields(
 			),
 		)
 		field_id = definition_table_field_id(
-			declaration_skeleton_graph_definition_table(
-				context.resolution.declaration_graph,
-			),
+			declaration_skeleton_graph_definition_table(context.resolution.declaration_graph),
 			definition_id.get_or(-1),
 		)
 
@@ -1884,9 +1898,7 @@ private pure func build_builtin_header(
 
 	TypeHeaderReady({
 		id = context.owner,
-		owner_module_id = prepared_module_scope_id(
-			bound_module_scope(context.resolution.module),
-		),
+		owner_module_id = prepared_module_scope_id(bound_module_scope(context.resolution.module)),
 		source_name = context.owner_name,
 		parameters = parameters,
 		shape = BuiltinTypeHeader(layout),
@@ -2015,6 +2027,7 @@ private pure func empty_module_type_header_indices(
 private pure func type_header_table(
 	headers: List[TypeHeader],
 	declaration_graph: DeclarationSkeletonGraph,
+	semantic_counts: TypeHeaderSemanticCounts,
 ) -> Result[TypeHeaderTable, List[TypeHeaderError]]:
 	bound_graph = declaration_skeleton_graph_bound_graph(declaration_graph)
 	owner_scope = bound_module_scope(bound_module_graph_target(bound_graph))
@@ -2027,6 +2040,7 @@ private pure func type_header_table(
 
 	for header in headers:
 		definition_id = type_id_definition_id(header.id)
+
 		if header_index_by_definition_id.contains(definition_id):
 			errors = errors.append(TypeHeaderDuplicateIdentity(header.id))
 		else:
@@ -2034,7 +2048,9 @@ private pure func type_header_table(
 
 		header_indices_by_name = header_indices_by_name.set(
 			header.source_name,
-			header_indices_by_name.get_or(header.source_name, []).append(index),
+			header_indices_by_name
+				.get_or(header.source_name, [])
+				.append(index),
 		)
 
 		match bound_module_graph_find_for_id(
@@ -2045,7 +2061,10 @@ private pure func type_header_table(
 			None:
 				errors = errors.append(TypeHeaderOwnerModuleMissing(header.id))
 			Some(module):
-				match prepared_module_scope_compatible_index(owner_scope, bound_module_scope(module)):
+				match prepared_module_scope_compatible_index(
+					owner_scope,
+					bound_module_scope(module),
+				):
 					None:
 						errors = errors.append(TypeHeaderOwnerModuleMissing(header.id))
 					Some(module_index):
@@ -2068,6 +2087,7 @@ private pure func type_header_table(
 			header_index_by_definition_id = header_index_by_definition_id,
 			header_indices_by_name = header_indices_by_name,
 			header_indices_by_module = header_indices_by_module,
+			semantic_counts = semantic_counts,
 			owner_scope = owner_scope,
 		})
 	else:
@@ -3216,19 +3236,47 @@ pure func type_header_graph_build(
 		resolved_type_parameter_graph_alias_dependencies(parameter_graph),
 	)
 	var headers: List[TypeHeader] = []
+	var type_identity_count: Int = 0
+	var alias_count: Int = 0
+	var record_count: Int = 0
+	var field_count: Int = 0
+	var union_count: Int = 0
+	var constructor_count: Int = 0
 	var errors: List[TypeHeaderError] = []
 
 	for skeleton in declaration_skeleton_graph_type_skeletons(declaration_graph):
 		match build_type_header(parameter_graph, skeleton):
 			TypeHeaderReady(header):
 				headers = headers.append(header)
+				type_identity_count += 1
+
+				match skeleton.source:
+					RecordTypeSource(decl):
+						record_count += 1
+						field_count += decl.fields.length()
+					UnionTypeSource(decl):
+						union_count += 1
+						constructor_count += decl.variants.length()
+					BuiltinTypeSource(_):
+						void
+					AliasTypeSource(_):
+						alias_count += 1
 			TypeHeaderRejected(header_errors):
 				errors = errors.concat(header_errors)
 
 	if not errors.is_empty():
 		Err(errors)
 	else:
-		match type_header_table(headers, declaration_graph):
+		semantic_counts: TypeHeaderSemanticCounts = {
+			type_identities = type_identity_count,
+			aliases = alias_count,
+			records = record_count,
+			fields = field_count,
+			unions = union_count,
+			constructors = constructor_count
+		}
+
+		match type_header_table(headers, declaration_graph, semantic_counts):
 			Err(table_errors):
 				Err(table_errors)
 			Ok(table):
@@ -3236,10 +3284,12 @@ pure func type_header_graph_build(
 					Some(cycle):
 						Err([TypeHeaderInlineStorageCycle(
 									cycle,
-								type_header_cycle_display_names(
-									declaration_skeleton_graph_bound_graph(declaration_graph),
-									declaration_skeleton_graph_definition_table(declaration_graph),
-									cycle,
+									type_header_cycle_display_names(
+										declaration_skeleton_graph_bound_graph(declaration_graph),
+										declaration_skeleton_graph_definition_table(
+											declaration_graph,
+										),
+										cycle,
 									),
 								)])
 					None:
@@ -3283,6 +3333,10 @@ pure func type_header_graph_definition_table(graph: TypeHeaderGraph) -> Definiti
 
 pure func type_header_graph_headers(graph: TypeHeaderGraph) -> List[TypeHeader]:
 	type_header_graph_rep(graph).table.headers
+
+
+pure func type_header_graph_semantic_counts(graph: TypeHeaderGraph) -> TypeHeaderSemanticCounts:
+	type_header_graph_rep(graph).table.semantic_counts
 
 
 pure func type_header_graph_declaration_skeleton_count(graph: TypeHeaderGraph) -> Int:
@@ -3509,7 +3563,9 @@ pure func type_header_graph_module_path(
 		bound_graph,
 		bound_module_graph_module_table(bound_graph),
 		module_id,
-	).map(func(module): prepared_module_scope_canonical_path(bound_module_scope(module)))
+	).map(
+		func(module): prepared_module_scope_canonical_path(bound_module_scope(module)),
+	)
 
 
 pure func type_header_graph_owner_provides_prelude_type(
@@ -3741,6 +3797,7 @@ private pure func type_header_identity_display_name(
 			).get_or("<unknown module>")
 		None:
 			"<unknown module>"
+
 	module_name + "." + type_id_name(definition_table, id).get_or("<unknown type>")
 
 
@@ -3754,6 +3811,7 @@ private pure func type_header_cycle_display_names(
 			[]
 		Some(first):
 			first_module = type_id_module_id(definition_table, first)
+
 			local = match first_module:
 				Some(module_id):
 					cycle.all(func(id): type_id_module_id(definition_table, id) == Some(module_id))
@@ -3763,38 +3821,82 @@ private pure func type_header_cycle_display_names(
 			if local:
 				cycle.map(func(id): type_id_name(definition_table, id).get_or("<unknown type>"))
 			else:
-				cycle.map(func(id): type_header_identity_display_name(bound_graph, definition_table, id))
+				cycle.map(
+					func(id): type_header_identity_display_name(bound_graph, definition_table, id),
+				)
 
 
-pure func type_header_error_message(definition_table: DefinitionTable, error: TypeHeaderError) -> String:
+pure func type_header_error_message(
+	definition_table: DefinitionTable,
+	error: TypeHeaderError,
+) -> String:
 	match error:
 		TypeHeaderOwnerModuleMissing(id):
-			"Type header owner module is missing for '" + type_id_name(definition_table, id).get_or("<unknown type>") + "'"
+			"Type header owner module is missing for '" + type_id_name(
+				definition_table,
+				id,
+			).get_or("<unknown type>") + "'"
 		TypeHeaderDuplicateIdentity(id):
-			"Duplicate type header identity for '" + type_id_name(definition_table, id).get_or("<unknown type>") + "'"
+			"Duplicate type header identity for '" + type_id_name(
+				definition_table,
+				id,
+			).get_or("<unknown type>") + "'"
 		TypeHeaderParametersMissing(id):
-			"Resolved type parameters are missing for '" + type_id_name(definition_table, id).get_or("<unknown type>") + "'"
+			"Resolved type parameters are missing for '" + type_id_name(
+				definition_table,
+				id,
+			).get_or("<unknown type>") + "'"
 		TypeHeaderResolutionError(resolution_error):
 			type_shape_resolution_error_message(resolution_error)
 		TypeHeaderConstructorMissing(id, name):
-			"Constructor '" + name + "' is missing for type '" + type_id_name(definition_table, id).get_or("<unknown type>") + "'"
+			"Constructor '" + name + "' is missing for type '" + type_id_name(
+				definition_table,
+				id,
+			).get_or("<unknown type>") + "'"
 		TypeHeaderFieldDefinitionMissing(id, name, _):
-			"Field '" + name + "' is missing a reserved definition for type '" + type_id_name(definition_table, id).get_or("<unknown type>") + "'"
+			"Field '" + name + "' is missing a reserved definition for type '" + type_id_name(
+				definition_table,
+				id,
+			).get_or("<unknown type>") + "'"
 		TypeHeaderInvalidEnumTypeParameters(id):
-			"Enum '" + type_id_name(definition_table, id).get_or("<unknown type>") + "' cannot have type parameters"
+			"Enum '" + type_id_name(
+				definition_table,
+				id,
+			).get_or("<unknown type>") + "' cannot have type parameters"
 		TypeHeaderInvalidEnumVariantFields(_, name):
 			"Enum variant '" + name + "' cannot have fields; use 'union' instead"
 		TypeHeaderInvalidStructTypeParameters(id):
-			"Struct '" + type_id_name(definition_table, id).get_or("<unknown type>") + "' cannot have type parameters"
+			"Struct '" + type_id_name(
+				definition_table,
+				id,
+			).get_or("<unknown type>") + "' cannot have type parameters"
 		TypeHeaderEmptyStruct(id):
-			"Struct '" + type_id_name(definition_table, id).get_or("<unknown type>") + "' must have at least one field"
+			"Struct '" + type_id_name(
+				definition_table,
+				id,
+			).get_or("<unknown type>") + "' must have at least one field"
 		TypeHeaderInvalidStructField(id, field_name):
-			"Struct '" + type_id_name(definition_table, id).get_or("<unknown type>") + "' field '" + field_name + ("' has invalid storage: struct fields must be scalar values, fieldless enums, " + "or other structs\n" + "help: Use a record for strings, collections, functions, payload unions, " + "records, and tuples")
+			"Struct '" + type_id_name(
+				definition_table,
+				id,
+			).get_or(
+				"<unknown type>",
+			) + "' field '" + field_name + ("' has invalid storage: struct fields must be scalar values, fieldless enums, " + "or other structs\n" + "help: Use a record for strings, collections, functions, payload unions, " + "records, and tuples")
 		TypeHeaderRecursiveValueLayout(id, is_direct):
 			if is_direct:
-				"Type '" + type_id_name(definition_table, id).get_or("<unknown type>") + "' is directly recursive — this would require infinite memory"
+				"Type '" + type_id_name(
+					definition_table,
+					id,
+				).get_or(
+					"<unknown type>",
+				) + "' is directly recursive — this would require infinite memory"
 			else:
-				"Type '" + type_id_name(definition_table, id).get_or("<unknown type>") + "' has a recursive value layout — every construction path requires another product value"
+				"Type '" + type_id_name(
+					definition_table,
+					id,
+				).get_or(
+					"<unknown type>",
+				) + "' has a recursive value layout — every construction path requires another product value"
 		TypeHeaderInlineStorageCycle(cycle, names):
 			if cycle.is_empty():
 				"Infinitely sized value layout"
@@ -3815,5 +3917,7 @@ pure func type_header_error_span(
 			Some(type_shape_resolution_error_span(resolution_error))
 		TypeHeaderInlineStorageCycle(cycle, _):
 			match cycle.get(0):
-				Some(id): type_id_source_span(definition_table, id)
-				None: None
+				Some(id):
+					type_id_source_span(definition_table, id)
+				None:
+					None

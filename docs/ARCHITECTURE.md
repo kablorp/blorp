@@ -137,11 +137,20 @@ Stage 06 owns:
 - construction of typed modules consumed by CTFE and Core lowering.
 
 Accepted aliases, records, unions, globals, source/foreign callables, traits,
-and implementations use
-separate graph-owned, category-specific
-authorities. Their canonical payloads are built from accepted type headers
-or completed global headers once; each selected module retains only established
-declaration identities and scalar source-name/visibility or constructor locators. Exact lookup validates the complete nominal
+and implementations use separate graph-owned, category-specific authorities.
+At graph completion, one opaque `AcceptedSemanticCatalog` proves that all of
+those tables share the exact `ModuleTable` and `DefinitionTable` provenance.
+The accepted graph publishes that catalog as its semantic capability; ordinary
+body preparation and graph metrics select category tables through it instead
+of retaining parallel allocating carrier records. Alias, record, and union
+builders publish zero-cost opaque aliases over their canonical tables; those
+phase-sealed values prove that catalog inputs came from the complete accepted
+header projections without adding owners or runtime checks. Constructor and
+field table capabilities are zero-copy logical views over the union and record
+tables that canonically own their payloads. Their canonical payloads are built from accepted type
+headers or completed global headers once; each selected module retains only
+established declaration identities and scalar source-name/visibility or
+constructor locators. Exact lookup validates the complete nominal
 identity before addressing category storage, and canonical-name fallback
 exposes only public declarations. Canonical module views are retained in the
 prepared module facts used by initializer and ordinary-body sessions. The CTFE

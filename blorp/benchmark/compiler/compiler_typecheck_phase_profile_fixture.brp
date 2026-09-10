@@ -19,13 +19,14 @@ import:
 		TypecheckGraphCompletion(TypecheckGraphAccepted),
 		accepted_graph_typecheck_module,
 		accepted_typecheck_graph_completed_globals,
-		accepted_typecheck_graph_definition_table,
 		accepted_typecheck_graph_ctfe_artifact_preparation_observation,
 		accepted_typecheck_graph_declaration_preparation_observation,
 		accepted_typecheck_graph_declaration_skeleton_count,
+		accepted_typecheck_graph_definition_table,
 		accepted_typecheck_graph_global_completion_metrics,
 		accepted_typecheck_graph_import_modules,
 		accepted_typecheck_graph_initializer_preparation_observation,
+		accepted_typecheck_graph_semantic_catalog,
 		complete_typecheck_graph,
 		completed_global_header_callable_dependencies,
 		completed_global_header_global_dependencies,
@@ -53,12 +54,12 @@ import:
 		source_definition_key_span,
 	../../src/compiler/stage_06_typecheck/graph/definition_index:
 		DefinitionTable,
-		definition_table_type_row,
-		field_id_definition_id,
 		definition_index_all_func_callable_bindings,
 		definition_index_all_source_definition_bindings,
 		definition_index_func_callable_id_count,
 		definition_index_source_definition_id_count,
+		definition_table_type_row,
+		field_id_definition_id,
 	../../src/compiler/stage_06_typecheck/graph/indexed_graph:
 		IndexedGraph,
 		IndexedGraphError,
@@ -73,9 +74,7 @@ import:
 		prepared_module_program,
 		prepared_module_scope_canonical_path,
 		prepared_module_scope_module,
-	../../src/compiler/stage_06_typecheck/graph/type_identity:
-		TypeId,
-		type_id_definition_id,
+	../../src/compiler/stage_06_typecheck/graph/type_identity: TypeId, type_id_definition_id
 	../../src/compiler/stage_06_typecheck/headers/callable_headers:
 		CallableHeaderGraph,
 		CallableHeaderGraphError,
@@ -109,9 +108,9 @@ import:
 		),
 		callable_id_definition_id,
 		constructor_id_definition_id,
-		declaration_skeleton_graph_definition_table,
 		declaration_skeleton_graph_build,
 		declaration_skeleton_graph_constructor_lookup_candidate_count,
+		declaration_skeleton_graph_definition_table,
 		declaration_skeleton_graph_error_message,
 		declaration_skeleton_graph_find_constructor,
 		declaration_skeleton_graph_skeletons,
@@ -248,6 +247,11 @@ import:
 		module_view_imported_names,
 		module_view_module_aliases,
 	../../src/compiler/stage_06_typecheck/state: typecheck_state_for_prepared_module_scope
+	../../src/compiler/stage_06_typecheck/type_system/accepted_semantic_catalog:
+		accepted_constructor_table_entry_count,
+		accepted_field_table_entry_count,
+		accepted_semantic_catalog_constructor_table,
+		accepted_semantic_catalog_field_table,
 	../../src/compiler/stage_06_typecheck/type_system/language_surface_manifest: prelude_type_name
 	../../src/lib/source: SourceSpan
 	hash: crc32, hash_combine
@@ -282,6 +286,8 @@ record CompilerTypecheckPhaseProfileObservation {
 	iterations: Int,
 	primary_output_count: Int,
 	secondary_output_count: Int,
+	accepted_constructor_rows: Int,
+	accepted_field_rows: Int,
 	checksum: Int
 }
 
@@ -325,6 +331,13 @@ private struct CompilerTypecheckPhaseOutputSummary {
 	primary_count: Int,
 	secondary_count: Int,
 	fingerprint: Int
+}
+
+
+private struct CompilerTypecheckPhaseProductObservation {
+	summary: CompilerTypecheckPhaseOutputSummary,
+	accepted_constructor_rows: Int,
+	accepted_field_rows: Int
 }
 
 
@@ -627,10 +640,14 @@ pure func compiler_typecheck_phase_profile_fixture(
 										Ok(parameter_graph):
 											match type_header_graph_build(parameter_graph):
 												Err(errors):
-													Err(header_error_messages(
-														declaration_skeleton_graph_definition_table(declaration_graph),
-														errors,
-													))
+													Err(
+														header_error_messages(
+															declaration_skeleton_graph_definition_table(
+																declaration_graph,
+															),
+															errors,
+														),
+													)
 												Ok(type_headers):
 													complete_profile_fixture(
 														target_candidate,
@@ -747,13 +764,12 @@ private pure func fingerprint_source_definition_key(
 	)
 
 
-private pure func type_id_fingerprint_text(
-	definition_table: DefinitionTable,
-	id: TypeId,
-) -> String:
+private pure func type_id_fingerprint_text(definition_table: DefinitionTable, id: TypeId) -> String:
 	match definition_table_type_row(definition_table, type_id_definition_id(id)):
-		Some(row): module_id_table_index(row.module_id).to_string() + ":" + row.name
-		None: "-1:<missing-type>"
+		Some(row):
+			module_id_table_index(row.module_id).to_string() + ":" + row.name
+		None:
+			"-1:<missing-type>"
 
 
 private pure func fingerprint_type_parameter(
@@ -762,10 +778,12 @@ private pure func fingerprint_type_parameter(
 	parameter: ResolvedTypeParameter,
 ) -> Int:
 	var next = fingerprint
-		.fingerprint_add_text(type_id_fingerprint_text(
-			definition_table,
-			type_parameter_id_owner(parameter.id),
-		))
+		.fingerprint_add_text(
+			type_id_fingerprint_text(
+				definition_table,
+				type_parameter_id_owner(parameter.id),
+			),
+		)
 		.fingerprint_add_int(type_parameter_id_index(parameter.id))
 		.fingerprint_add_text(type_parameter_id_name(parameter.id))
 		.fingerprint_add_int(parameter.bounds.length())
@@ -824,7 +842,12 @@ private pure func fingerprint_resolved_type_shape(
 		TypeParameterShape(id):
 			fingerprint
 				.fingerprint_add_text("parameter")
-				.fingerprint_add_text(type_id_fingerprint_text(definition_table, type_parameter_id_owner(id)))
+				.fingerprint_add_text(
+					type_id_fingerprint_text(
+						definition_table,
+						type_parameter_id_owner(id),
+					),
+				)
 				.fingerprint_add_int(type_parameter_id_index(id))
 				.fingerprint_add_text(type_parameter_id_name(id))
 		SelfTypeShape(id):
@@ -853,7 +876,12 @@ private pure func fingerprint_resolved_type_shape(
 		DimensionParameterShape(id, variadic):
 			fingerprint
 				.fingerprint_add_text("dimension-parameter")
-				.fingerprint_add_text(type_id_fingerprint_text(definition_table, type_parameter_id_owner(id)))
+				.fingerprint_add_text(
+					type_id_fingerprint_text(
+						definition_table,
+						type_parameter_id_owner(id),
+					),
+				)
 				.fingerprint_add_int(type_parameter_id_index(id))
 				.fingerprint_add_text(type_parameter_id_name(id))
 				.fingerprint_add_bool(variadic)
@@ -1266,7 +1294,7 @@ private pure func header_output_summary(
 						definition_table,
 						fingerprint
 							.fingerprint_add_text(field.name)
-								.fingerprint_add_optional_int(Some(field_id_definition_id(field.id))),
+							.fingerprint_add_optional_int(Some(field_id_definition_id(field.id))),
 						field.typ,
 					)
 			UnionTypeHeader(layout, variants):
@@ -1286,10 +1314,12 @@ private pure func header_output_summary(
 						.fingerprint_add_text(variant.name)
 						.fingerprint_add_int(variant.tag)
 						.fingerprint_add_int(constructor_id_definition_id(variant.id))
-						.fingerprint_add_text(type_id_fingerprint_text(
-							definition_table,
-							variant.parent_type_id,
-						))
+						.fingerprint_add_text(
+							type_id_fingerprint_text(
+								definition_table,
+								variant.parent_type_id,
+							),
+						)
 						.fingerprint_add_int(variant.fields.length())
 
 					for field in variant.fields:
@@ -1418,7 +1448,9 @@ private pure func callable_header_output_summary(
 		id = global_header_id(global)
 		fingerprint = fingerprint
 			.fingerprint_add_int(
-				global_id_module_id(definition_table, id).map(module_id_table_index).get_or(-1),
+				global_id_module_id(definition_table, id)
+					.map(module_id_table_index)
+					.get_or(-1),
 			)
 			.fingerprint_add_text(global_header_name(global))
 
@@ -1581,10 +1613,12 @@ private pure func execute_profile_stage_once(
 		CompilerProfileTypeHeaders:
 			match type_header_graph_build(fixture.parameter_graph):
 				Err(errors):
-					Err(header_error_messages(
-						declaration_skeleton_graph_definition_table(fixture.declaration_graph),
-						errors,
-					))
+					Err(
+						header_error_messages(
+							declaration_skeleton_graph_definition_table(fixture.declaration_graph),
+							errors,
+						),
+					)
 				Ok(graph):
 					Ok(CompilerTypeHeadersProfileProduct(graph))
 		CompilerProfileTraitTopology:
@@ -1696,35 +1730,84 @@ pure func compiler_typecheck_phase_profile_execute(
 			profile_execution_from_rep(execution_rep)
 
 
-private pure func profile_product_summary(
+private pure func profile_product_observation_without_catalog(
+	summary: CompilerTypecheckPhaseOutputSummary,
+) -> CompilerTypecheckPhaseProductObservation:
+	{
+		summary = summary,
+		accepted_constructor_rows = 0,
+		accepted_field_rows = 0
+	}
+
+
+private pure func profile_product_observation(
 	definition_table: DefinitionTable,
 	product: CompilerTypecheckPhaseProfileProduct,
-) -> CompilerTypecheckPhaseOutputSummary:
+) -> CompilerTypecheckPhaseProductObservation:
 	match product:
 		CompilerIndexedGraphProfileProduct(graph):
-			indexed_output_summary(graph)
+			profile_product_observation_without_catalog(indexed_output_summary(graph))
 		CompilerImportableModulesProfileProduct(graph):
-			importable_output_summary(graph)
+			profile_product_observation_without_catalog(importable_output_summary(graph))
 		CompilerBoundModulesProfileProduct(graph):
-			bound_output_summary(graph)
+			profile_product_observation_without_catalog(bound_output_summary(graph))
 		CompilerDeclarationSkeletonsProfileProduct(graph):
-			skeleton_output_summary(graph)
+			profile_product_observation_without_catalog(skeleton_output_summary(graph))
 		CompilerAliasDependenciesProfileProduct(graph):
-			alias_output_summary(definition_table, graph)
+			profile_product_observation_without_catalog(
+				alias_output_summary(
+					definition_table,
+					graph,
+				),
+			)
 		CompilerResolvedTypeParametersProfileProduct(graph):
-			parameter_output_summary(definition_table, graph)
+			profile_product_observation_without_catalog(
+				parameter_output_summary(
+					definition_table,
+					graph,
+				),
+			)
 		CompilerTypeHeadersProfileProduct(graph):
-			header_output_summary(definition_table, graph)
+			profile_product_observation_without_catalog(
+				header_output_summary(
+					definition_table,
+					graph,
+				),
+			)
 		CompilerTraitTopologyProfileProduct(graph):
-			trait_topology_output_summary(definition_table, graph)
+			profile_product_observation_without_catalog(
+				trait_topology_output_summary(
+					definition_table,
+					graph,
+				),
+			)
 		CompilerCallableHeadersProfileProduct(graph):
-			callable_header_output_summary(definition_table, graph)
+			profile_product_observation_without_catalog(
+				callable_header_output_summary(
+					definition_table,
+					graph,
+				),
+			)
 		CompilerImplementationHeadersProfileProduct(graph):
-			implementation_header_output_summary(definition_table, graph)
+			profile_product_observation_without_catalog(
+				implementation_header_output_summary(
+					definition_table,
+					graph,
+				),
+			)
 		CompilerAcceptedGraphProfileProduct(graph):
-			accepted_output_summary(graph)
+			catalog = accepted_typecheck_graph_semantic_catalog(graph)
+			{
+				summary = accepted_output_summary(graph),
+				accepted_constructor_rows = accepted_constructor_table_entry_count(
+					accepted_semantic_catalog_constructor_table(catalog),
+				),
+				accepted_field_rows = accepted_field_table_entry_count(
+					accepted_semantic_catalog_field_table(catalog),
+				)
+			}
 		CompilerCheckedBodiesProfileProduct(run):
-			checked_bodies_output_summary(run)
+			profile_product_observation_without_catalog(checked_bodies_output_summary(run))
 
 
 pure func compiler_typecheck_phase_profile_observe(
@@ -1734,12 +1817,15 @@ pure func compiler_typecheck_phase_profile_observe(
 		CompilerTypecheckPhaseExecutionFailed(_, _, errors):
 			CompilerTypecheckPhaseProfileInvariantFailed(errors)
 		CompilerTypecheckPhaseExecutionCompleted(stage, iterations, definition_table, product):
-			summary = profile_product_summary(definition_table, product)
+			observation = profile_product_observation(definition_table, product)
+			summary = observation.summary
 			CompilerTypecheckPhaseProfileCompleted({
 				stage = stage,
 				iterations = iterations,
 				primary_output_count = summary.primary_count,
 				secondary_output_count = summary.secondary_count,
+				accepted_constructor_rows = observation.accepted_constructor_rows,
+				accepted_field_rows = observation.accepted_field_rows,
 				checksum = fingerprint_add_int(summary.fingerprint, summary.primary_count)
 					.fingerprint_add_int(summary.secondary_count)
 					.fingerprint_add_int(iterations),

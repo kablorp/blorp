@@ -73,7 +73,66 @@ TRAIT_IMPLEMENTATION_AUTHORITY = (
     ROOT
     / "blorp/src/compiler/stage_06_typecheck/type_system/accepted_trait_implementation_authority.brp"
 )
+SEMANTIC_CATALOG = (
+    ROOT
+    / "blorp/src/compiler/stage_06_typecheck/type_system/accepted_semantic_catalog.brp"
+)
+
+
 class DeclarationBoundaryTests(unittest.TestCase):
+
+    def test_only_accepted_graph_contains_semantic_catalog(self) -> None:
+        source = DECL.read_text(encoding="utf-8")
+        accepted = re.search(
+            r"private record AcceptedTypecheckGraphRep \{.*?\n\}",
+            source,
+            re.DOTALL,
+        )
+        recoverable = re.search(
+            r"private record RecoverableTypecheckGraphRep \{.*?\n\}",
+            source,
+            re.DOTALL,
+        )
+
+        self.assertIsNotNone(accepted)
+        self.assertIsNotNone(recoverable)
+        self.assertIn("semantic_catalog: AcceptedSemanticCatalog", accepted.group(0))
+        self.assertNotIn("AcceptedSemanticCatalog", recoverable.group(0))
+
+    def test_catalog_is_opaque_and_requires_completed_globals(self) -> None:
+        source = SEMANTIC_CATALOG.read_text(encoding="utf-8")
+
+        self.assertIn("private record AcceptedSemanticCatalogRep", source)
+        self.assertIn(
+            "opaque type AcceptedSemanticCatalog = AcceptedSemanticCatalogRep",
+            source,
+        )
+        self.assertIn("and accepted_global_table_is_complete(input.globals)", source)
+
+    def test_catalog_requires_zero_cost_sealed_category_build_proofs(self) -> None:
+        catalog_source = SEMANTIC_CATALOG.read_text(encoding="utf-8")
+        catalog_input = re.search(
+            r"record AcceptedSemanticCatalogInput \{.*?\n\}",
+            catalog_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(catalog_input)
+
+        for carrier, table, field, path in (
+            ("AcceptedAliasGraph", "AcceptedAliasTable", "aliases", ALIAS_GRAPH),
+            ("AcceptedRecordGraph", "AcceptedRecordTable", "records", RECORD_GRAPH),
+            ("AcceptedUnionGraph", "AcceptedUnionTable", "unions", UNION_GRAPH),
+        ):
+            with self.subTest(carrier=carrier):
+                source = path.read_text(encoding="utf-8")
+                self.assertIn(f"opaque type {carrier} = {table}", source)
+                self.assertNotIn(f"private record {carrier}Rep", source)
+                self.assertIn(f"{field}: {carrier}", catalog_input.group(0))
+
+        self.assertNotIn("aliases: AcceptedAliasTable", catalog_input.group(0))
+        self.assertNotIn("records: AcceptedRecordTable", catalog_input.group(0))
+        self.assertNotIn("unions: AcceptedUnionTable", catalog_input.group(0))
+
     def test_nominal_type_ids_are_definition_backed_scalars(self) -> None:
         identity_source = TYPE_IDENTITY.read_text(encoding="utf-8")
         header_source = TYPE_HEADER_GRAPH.read_text(encoding="utf-8")
@@ -284,7 +343,6 @@ class DeclarationBoundaryTests(unittest.TestCase):
 
     def test_unreachable_declaration_adapters_are_absent(self) -> None:
         sources_by_obsolete_helper = {
-            "accepted_record_graph_table": RECORD_GRAPH,
             "local_record_header_fields": TYPE_HEADER_INSTALL,
             "local_union_header_variants": TYPE_HEADER_INSTALL,
             "accepted_implementation_find_exact": TRAIT_IMPLEMENTATION_AUTHORITY,
@@ -547,7 +605,7 @@ class DeclarationBoundaryTests(unittest.TestCase):
         self.assertNotIn("owner_module_identity: ModuleIdentity", preparation.group(0))
         self.assertNotIn("bound_module_graph_find(bound_graph", preparation.group(0))
 
-    def test_accepted_graph_fallbacks_require_prepared_scope(self) -> None:
+    def test_accepted_table_fallbacks_require_prepared_scope(self) -> None:
         for category, path in (
             ("alias", ALIAS_GRAPH),
             ("record", RECORD_GRAPH),
@@ -556,8 +614,8 @@ class DeclarationBoundaryTests(unittest.TestCase):
             with self.subTest(category=category):
                 source = path.read_text(encoding="utf-8")
                 fallback = re.search(
-                    rf"pure func accepted_{category}_graph_canonical_authority\(.*?"
-                    rf"(?=\n\npure func)",
+                    rf"pure func accepted_{category}_table_canonical_authority\(.*?"
+                    rf"(?=\n\npure func|\Z)",
                     source,
                     re.DOTALL,
                 )

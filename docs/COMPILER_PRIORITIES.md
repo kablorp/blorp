@@ -26,7 +26,7 @@ types or tests.
 
 | Phase | Product | Status | Verified production state |
 | --- | --- | --- | --- |
-| 1-4 | Indexed, bound, skeleton, type-header, trait, callable, global-header, and implementation-header graphs | Complete | `AcceptedTypecheckGraph` combines accepted implementation headers with the compatible importable graph. Parser-recovery modules cannot contribute accepted semantic inventory. |
+| 1-4 | Indexed, bound, skeleton, type-header, trait, callable, global-header, and implementation-header graphs | Complete | `AcceptedTypecheckGraph` combines accepted implementation headers with the compatible importable graph and publishes one provenance-checked `AcceptedSemanticCatalog`. Parser-recovery modules cannot contribute accepted semantic inventory. |
 | 5 | Completed global headers | Complete | `TypecheckGraphCompletion` separates opaque accepted and recoverable graphs. Accepted graphs contain only completed initializers; recoverable graphs retain exact global/callable dependencies, typed expressions, and structured per-module diagnostics while admitting only healthy modules to accepted body entry. Pending globals reserve identity but never publish `TYPE_VOID`. |
 | 6 | Independently checked body artifacts | Complete | `AcceptedTypecheckModule` retains one immutable prepared body base; each body receives a fresh body-local session, and accepted/recovered artifacts are assembled by exact identity independently of check order. |
 | 7 | Demand-driven CTFE body set | Implemented with explicit closure work | The accepted production path uses an exact definition-identity worklist and reuses body outcomes. Unsupported accepted shapes retain measured eager fallbacks, and recoverable graphs retain complete diagnostic materialization. |
