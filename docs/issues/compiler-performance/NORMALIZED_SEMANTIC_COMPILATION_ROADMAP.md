@@ -131,7 +131,7 @@ edge.
 record VisibleBindingRow {
 	viewer_module: ModuleId,
 	namespace: SemanticNamespace,
-	local_name: String,
+	local_name: SourceNameId,
 	entity: VisibleSemanticEntity,
 	origin: VisibilityOrigin,
 	order: VisibilityOrder
@@ -140,7 +140,7 @@ record VisibleBindingRow {
 record SemanticReferenceRow {
 	owner: SemanticOccurrenceOwner,
 	target: SemanticEntityId,
-	span: SourceSpan,
+	span: SourceSpanId,
 	kind: SemanticReferenceKind
 }
 ```
@@ -186,6 +186,81 @@ product. Core lowering must not accept the recoverable form or a raw
 10. **Fail closed.** Foreign-key, ordering, provenance, duplicate, and accepted
     state validation happens before an opaque product is published.
 
+## Progressive String Retirement Contract
+
+Normalization must monotonically reduce the hot compilation pipeline's
+dependence on managed strings. Source spelling is necessary while lexing,
+parsing, binding, and explaining errors; it is not semantic identity after the
+compiler has assigned an exact ID. A later product must not reintroduce a path,
+canonical name, serialized composite key, or display type as an ownership or
+join key when an earlier product already resolved that fact.
+
+Use compilation-local, lifetime-specific handles for descriptive or external
+payloads that must survive their source phase:
+
+```blorp
+opaque type SourceNameId = Int
+opaque type SourceSpanId = Int
+opaque type StringLiteralId = Int
+opaque type ExternalNameId = Int
+
+record EmissionPayloadProjection {
+	string_literals: StringLiteralTable,
+	external_names: ExternalNameTable,
+	debug_sources: Option[DebugSourceTable]
+}
+```
+
+These handle domains are deliberately distinct. A `SourceNameId` supports
+early lookup and diagnostic spelling but must not replace a `DefinitionId` in
+later semantic code. `StringLiteralId` identifies runtime program data.
+`ExternalNameId` identifies exact ABI, foreign-symbol, library, or linker text.
+The compiler must not introduce one process-global interner or one universal
+string pool whose lifetime keeps every source spelling alive until emission.
+
+The expected boundary is:
+
+| Boundary | Permitted string state |
+| --- | --- |
+| Lex and parse | Source buffers, token spellings, trivia, and recovery text may be live. Repeated paths and spans use source-local handles where measured. |
+| Module load and binding | Paths and names may be interned in compilation-local tables while lookup is active; successful resolution publishes `ModuleId`, `DefinitionId`, and precise category IDs. |
+| Accepted semantic compilation | Semantic entities and relations join by typed IDs. Source-name/span handles survive only in cold source, diagnostic, or analysis tables with named consumers. |
+| Codegen-ready handoff | The hot product contains IDs, enums, layouts, ranges, typed values, and literal/external handles. It does not retain source buffers, parser trees, display names, or diagnostic text. |
+| Core | Passes must not use source strings as semantic keys. Generated definitions carry explicit provenance; runtime string literals remain pooled payloads, not identifiers. |
+| Backend emission | Stage 10 materializes C symbols, directives, external spellings, debug paths, and final C text from IDs and cold payload tables at their last responsible boundary. |
+
+Compile-only mode should release source buffers, source-name/span tables,
+diagnostics, and analysis products before or at the codegen-ready handoff unless
+debug emission explicitly requests a narrow source projection. Check, lint,
+and LSP may retain those cold tables in their own immutable snapshot without
+making Core retain them. Diagnostics store codes, typed payloads, IDs, and span
+handles; human strings are rendered only for an external consumer.
+
+There are legitimate late strings, but each must be classified: runtime string
+literals; exact FFI/ABI/linker payloads; requested debug metadata; internal
+invariant diagnostics; and final emitted text. Ordinary source identifiers,
+module paths, canonical semantic names, display types, and serialized storage
+keys are not legitimate late semantic state.
+
+Every affected issue records, at its entry and exit boundaries:
+
+- live managed `String` objects and payload bytes;
+- source/name/span table bytes and their last named consumer;
+- string-keyed dictionary entries, probes, bytes hashed, and bytes compared;
+- canonical/display/storage-key strings materialized;
+- pooled runtime-literal, external-name, and optional debug bytes separately;
+- allocations/releases, retained objects, peak RSS, and retired instructions.
+
+A migration does not count as string retirement if it merely moves the same
+owned strings into a longer-lived interner. Acceptance requires deleting the
+old string-bearing field/key, demonstrating the intended release checkpoint,
+and preserving exact diagnostics, external symbols, literals, and debug output.
+The expected gains are fewer managed allocations and ARC operations, less
+string hashing/comparison, denser hot rows, earlier release of large source
+ownership graphs, and better cache locality. These are hypotheses to verify at
+phase handoffs; an interner or ID layer that raises the memory ceiling or total
+instructions is rejected.
+
 ## Performance And Evidence Contract
 
 Normalization is expected to improve compiler and tooling efficiency, not only
@@ -223,6 +298,7 @@ raw evidence for the applicable rows:
 | Peak RSS | compiler worker and retained LSP snapshot |
 | Retired instructions | focused benchmark and representative production replay where available |
 | Hash/string work | storage-key construction, string bytes compared, dictionary probes |
+| String retirement | live string objects/payload bytes and source/name/span table bytes at each phase handoff |
 | Traversal work | typed/Core nodes visited and complete-program scans |
 | Product size | row/edge counts and retained payload bytes |
 | Generated C and native artifact size | benchmark worker, compiler, and affected generated program |
@@ -394,6 +470,7 @@ Old copies, scans, keys, or adapters deleted by the packet
 Failing structural and end-to-end tests written first
 Focused and broad validation commands
 Primary expected resource win and guard metrics
+Entry/exit string budget, retained string exceptions, and release checkpoint
 Baseline/candidate workload and raw-result location
 Acceptance, rejection, and rollback decision
 ```
@@ -719,7 +796,7 @@ union VisibleSemanticEntity:
 record VisibleBindingRow {
 	viewer_module: ModuleId,
 	namespace: SemanticNamespace,
-	local_name: String,
+	local_name: SourceNameId,
 	entity: VisibleSemanticEntity,
 	origin: VisibilityOrigin,
 	order: VisibilityOrder
@@ -735,7 +812,9 @@ first-import/newest-first rules, overload ordering, and tie/conflict behavior.
 It publishes accepted winner/overload-set or rejected-conflict outcomes beside
 the candidate rows. Derived indexes support `(module, namespace, local
 spelling)` and qualified lookup, but index replacement never decides the
-winner.
+winner. `SourceNameId` is valid only with the compilation-local source-name
+table used while binding; resolved consumers carry the selected entity ID and
+do not propagate the spelling handle as semantic identity.
 
 ### Implementation strategy
 
@@ -767,7 +846,7 @@ scripts/test lsp
 
 Add a scaling fixture varying modules, imports per module, overloads per name,
 duplicate spellings, and query count. Record candidate visits, string hashes,
-dictionary probes, and rows retained.
+dictionary probes, source-name table bytes, and rows retained.
 
 ### Performance hypothesis
 
@@ -783,6 +862,8 @@ index eagerly is likely a regression.
 - Lookup, privacy, collision, overload, import, and UFCS behavior is unchanged.
 - No consumer reconstructs module visibility from parsed imports plus accepted
   category tables after cutover.
+- Visibility indexes use source-name handles while lookup is active; resolved
+  products retain entity IDs and do not copy local spellings into later stages.
 - Only indexes with a named production query remain.
 - Lookup scaling, hashes/probes, allocations, and retired instructions improve
   in the intended workload.
@@ -968,8 +1049,8 @@ opaque type BodyLocalSymbolId = Int
 
 record BodyLocalSymbolRow {
 	id: BodyLocalSymbolId,
-	name: String,
-	declaration_span: SourceSpan,
+	name: SourceNameId,
+	declaration_span: SourceSpanId,
 	kind: BodyLocalSymbolKind
 }
 
@@ -1000,14 +1081,14 @@ union SemanticEntityId:
 record SemanticOccurrenceRow {
 	owner: SemanticOccurrenceOwner,
 	target: SemanticEntityId,
-	span: SourceSpan,
+	span: SourceSpanId,
 	kind: SemanticOccurrenceKind
 }
 
 record CallableEdgeRow {
 	caller: CallableId,
 	callee: CallableId,
-	call_span: SourceSpan
+	call_span: SourceSpanId
 }
 ```
 
@@ -1097,17 +1178,17 @@ union DiagnosticOwner:
 	DefinitionDiagnosticOwner(DefinitionId)
 
 union DiagnosticPrimaryLocation:
-	LocatedDiagnostic(SourceSpan)
+	LocatedDiagnostic(SourceSpanId)
 	UnlocatedCompilationDiagnostic
 
 union DiagnosticPayload:
-	UnknownNameDiagnosticPayload(String, SemanticNamespace)
+	UnknownNameDiagnosticPayload(SourceNameId, SemanticNamespace)
 	TypeMismatchDiagnosticPayload(SemanticType, SemanticType)
 	InvalidImportDiagnosticPayload(ModuleReferenceId, ModuleResolutionFailure)
 	CompilerInvariantDiagnosticPayload(String)
 
 union DiagnosticHelp:
-	UseNameDiagnosticHelp(String)
+	UseNameDiagnosticHelp(SourceNameId)
 	AddImportDiagnosticHelp(ModuleId, DefinitionId)
 	ChangeTypeDiagnosticHelp(SemanticType)
 
@@ -1124,7 +1205,7 @@ record DiagnosticRow {
 
 record DiagnosticRelatedSpanRow {
 	diagnostic: DiagnosticId,
-	span: SourceSpan,
+	span: SourceSpanId,
 	role: DiagnosticRelatedRole
 }
 ```
@@ -1245,7 +1326,11 @@ execution can therefore release the accepted/recovery parent before Core.
 7. Change Core preparation to accept only the codegen-ready projection.
 8. Release syntax, recovery, occurrence, and analysis-only tables at their last
    consumer in compile-only mode.
-9. Delete `TypecheckedModule`, `TypecheckedGraph`, CTFE Booleans, error-list
+9. Add a string-retirement audit at accepted publication, codegen-ready
+   construction, Core entry, and backend entry. Move literals and exact
+   external spellings into distinct cold tables; derive ordinary C-safe symbols
+   from IDs in Stage 10.
+10. Delete `TypecheckedModule`, `TypecheckedGraph`, CTFE Booleans, error-list
    validity checks, and raw-`TypedProgram` Core admission once consumers move.
 
 ### Fast feedback
@@ -1283,6 +1368,12 @@ graph accidentally.
   alive.
 - The broad `TypecheckedGraph` and raw typed-program Core entry are deleted.
 - Check, lint, LSP, compile, run, and test use products matching their needs.
+- Compile-only Core entry retains no source buffers, parser/recovery trees,
+  diagnostic text, display names, module-path keys, or canonical-name keys.
+  Runtime literals and exact external names survive only through typed handles
+  and cold payload tables; requested debug sources use a separate projection.
+- Boundary counters demonstrate that live source/name string objects and bytes
+  fall at accepted publication and materially again before Core.
 - Peak RSS, retained objects/bytes, allocations, and production product size
   improve materially; latency and generated artifact size do not regress.
 
@@ -1414,8 +1505,11 @@ surviving semantic identities.
 4. Promote an index only when at least two adjacent production consumers rebuild
    it or one consumer has measured scaling cost.
 5. Migrate one pass cluster at a time and delete its superseded scan/index.
-6. Keep C-safe symbol materialization in Stage 10.
-7. Evaluate a `CoreExprId` arena only as a reversible benchmark candidate with
+6. Replace semantic string keys with exact IDs. Preserve `StringLiteralId`,
+   `ExternalNameId`, and optional debug-source handles only where their payload
+   category is genuinely required.
+7. Keep C-safe symbol and external-text materialization in Stage 10.
+8. Evaluate a `CoreExprId` arena only as a reversible benchmark candidate with
    locality, COW, allocation, instruction, and code-size evidence.
 
 ### Fast feedback
@@ -1446,6 +1540,10 @@ survives a negative measurement.
 - No migrated pass rebuilds an index already owned by the Core product.
 - Semantic names are not used as ownership or join keys after the naming
   boundary moves.
+- Core declaration, edge, and pass-state tables contain no ordinary source
+  identifier, module-path, canonical-name, display-type, or serialized-key
+  strings. String literals, external spellings, and requested debug metadata
+  remain isolated and are counted separately.
 - Core dumps, runtime behavior, ownership, and generated C remain correct.
 - The pass cluster improves a majority of applicable latency, allocation,
   instruction, memory, and code-size metrics without a guard regression.
@@ -1463,6 +1561,7 @@ survives a negative measurement.
 | Relations | calls, function values, global references, type uses, fields, implementations |
 | Tooling | check, lint, hover, definition, references, highlights, completion prerequisites |
 | Lifetime | compile-only release, recoverable analysis, retained LSP snapshot, Core handoff |
+| String retirement | source/name bytes at each handoff, no late semantic string keys, literal/external/debug exceptions |
 | Scaling | modules, declarations, imports, overloads, type depth, bodies, references, failures |
 
 Every table constructor needs negative invariant tests. Every query needs exact
@@ -1506,12 +1605,16 @@ The normalized semantic compilation checkpoint is complete when:
 9. LSP, lint, inspection, and compiler consumers use shared semantic query APIs;
 10. migrated reconstruction, string-join, duplicate-program, and parallel-index
     paths are deleted;
-11. IDs never escape without their issuing product or masquerade as cross-run
+11. ordinary source strings decrease monotonically across phase products;
+    codegen-ready and Core products use typed IDs for semantic identity and
+    isolate runtime literals, exact external names, and requested debug sources
+    in separately measured cold tables;
+12. IDs never escape without their issuing product or masquerade as cross-run
     identity;
-12. compile-only and analysis modes retain only their named products;
-13. exact semantic, diagnostic, LSP, Core, runtime, sanitizer, and leak gates
+13. compile-only and analysis modes retain only their named products;
+14. exact semantic, diagnostic, LSP, Core, runtime, sanitizer, and leak gates
     pass; and
-14. the combined checkpoint improves more than half of its applicable primary
+15. the combined checkpoint improves more than half of its applicable primary
     resource metrics, including latency, allocations, retired instructions,
     peak/retained memory, traversal/hash work, and product/artifact size, with no
     untriaged material guard regression.
