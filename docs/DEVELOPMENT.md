@@ -131,14 +131,48 @@ owner of a new rule or transformation.
 A reliable narrow loop is:
 
 1. Read the implementation, nearby tests, and local precedent.
-2. Add or identify a test that fails for the intended reason.
-3. Make one coherent change.
-4. Format and typecheck the changed source.
-5. Run the smallest behavior test that proves the change.
-6. Inspect generated Core or C when the change crosses those boundaries.
-7. Run manifest-owned compiler checks or the relevant broad gate.
-8. Get a code review and a test-evidence review.
-9. Record rough edges and measured performance claims.
+2. Define the fastest feedback loop for the behavior or cost being changed.
+3. Add or identify a test that fails for the intended reason.
+4. Make one coherent change.
+5. Format and typecheck the changed source.
+6. Run the smallest behavior test or measurement that proves the change.
+7. Inspect generated Core or C when the change crosses those boundaries.
+8. Run manifest-owned compiler checks or the relevant broad gate.
+9. Get a code review and a test-evidence review.
+10. Record rough edges and measured performance claims.
+
+The feedback loop is part of the task design, not an afterthought. It should be
+fast enough to run after each coherent edit and narrow enough that a failure
+points back to the change under development. Useful forms include:
+
+- a properly scoped unit or regression test;
+- a tiny standalone reproduction under `scratch/`;
+- a custom fixture or harness that tightly isolates one compiler phase, pass,
+  ownership pattern, or runtime operation;
+- a checked-in benchmark wrapper with setup outside its measurement window;
+  and
+- a reusable profiling or sampling command that can be repeated against the
+  same workload.
+
+Do not repeatedly run end-to-end compilation or a broad test gate when a
+narrower boundary can answer the current question. Conversely, a focused
+harness does not replace final integration coverage. Use the narrow loop while
+iterating, then run the relevant broad checks once the implementation is
+stable.
+
+Sometimes the shortest route to a clean main change is a small preparatory
+refactor. Make that easy change first when it exposes the correct boundary,
+removes incidental branching or wrappers, or lets the main implementation be
+mechanical. Keep the preparation semantics-preserving and independently
+verifiable. If it expands beyond a bounded change, adds a new architecture, or
+becomes larger than the original task, stop and reassess rather than allowing
+the prerequisite to consume the workstream.
+
+Development friction is useful information. Surface confusing ownership
+behavior, missing instrumentation, slow gates, awkward APIs, stale docs, and
+suspected compiler defects as soon as they become relevant. Include the effect
+on the task and a concrete, bounded remedy when one is apparent. This keeps a
+local workaround from becoming invisible maintenance debt.
 
 Typical commands:
 
@@ -623,6 +657,21 @@ Trustworthy performance evidence requires:
    relevant.
 9. A scaling matrix when the suspected algorithm depends on modules,
    declarations, imports, type depth, or query count.
+
+Elapsed time is important, but it is often the least stable early signal. Host
+load, filesystem state, thermal behavior, sampling, and unrelated work can
+move latency without changing the mechanism under investigation. Prefer
+direct, repeatable measurements while iterating: allocation and release
+counts, allocator bytes, retired instruction counts, deterministic visit or
+candidate counters, peak and retained memory, and native stack samples. These
+metrics can show whether the intended work disappeared even when wall-clock
+results are noisy.
+
+No single proxy proves a user-visible speedup. Use direct counters and samples
+to establish causality, then use paired latency measurements on an appropriate
+production-shaped workload when the claim is that users wait less. If latency
+and direct metrics disagree, investigate the disagreement rather than choosing
+the more favorable number.
 
 A microbenchmark can prove a mechanism and expose an exponent. It cannot by
 itself prove that compiling the compiler became faster. Use production replay

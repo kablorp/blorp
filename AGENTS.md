@@ -148,27 +148,43 @@ the fix and passes after.
 
 **2. One change per change.** Fix the bug, add the feature, or refactor — not all three.
 If you discover adjacent work, note it separately. If you can't describe your change in one
-sentence, it's too big.
+sentence, it's too big. A bounded preparatory refactor may precede the main change when it makes
+the target change substantially easier to reason about, implement, or verify. Keep that refactor
+semantics-preserving, validate it independently, and do not use it as permission for unrelated
+cleanup.
 
 **3. Check for precedent.** Before implementing, look at how blorp already handles similar things.
 Follow existing naming conventions, error styles, and API patterns. If you're establishing a
 new pattern, call it out explicitly.
 
+**4. Design the fast feedback loop.** Before broad implementation, identify the shortest repeatable
+command that exercises the behavior or cost under investigation. Prefer a properly scoped unit
+test, a small scratch reproduction, a custom harness that tightly isolates the subject, a retained
+benchmark script, or a reusable profiling command. Keep setup and unrelated pipeline work outside
+the measured or tested boundary. Use the narrow loop while iterating, then run broader integration
+and regression gates once the change is stable.
+
+**5. Make the easy change so the change is easy.** When a small, opportunistic refactor will expose
+the right boundary, remove incidental complexity, or make the main change mechanical, do that
+refactor first. The preparation must be bounded, independently reviewable, and protected against
+regression. Stop and reassess if the preparation grows into an architectural project or becomes
+larger than the problem it was meant to simplify.
+
 
 ### While you write code
 
-**4. Catch mistakes at compile time, not runtime.** Reject errors at the earliest phase where
+**6. Catch mistakes at compile time, not runtime.** Reject errors at the earliest phase where
 the necessary information exists. Syntax errors in the parser. Name errors after parsing.
 Type errors in type-checking. Never add semantic checks in codegen unless monomorphization
 forces it. Every compile error should include a help suggestion that teaches the user what
 to do instead.
 
-**5. Optimize for the first-time user.** If a feature requires reading the GUIDE to use correctly,
+**7. Optimize for the first-time user.** If a feature requires reading the GUIDE to use correctly,
 it needs a better error message. If an error says "unexpected token" with no hint, it's incomplete.
 Think about what a programmer coming from Python, JS, or Rust would try first, and make that
 either work or produce a helpful message.
 
-**6. Respect phase boundaries.** The compiler pipeline is:
+**8. Respect phase boundaries.** The compiler pipeline is:
 
     lex → parse → interp desugar → module load →
     subscript desugar → infer/typecheck →
@@ -186,39 +202,46 @@ type-checking. If a check belongs in an earlier phase, move it there. If it must
 later phase (e.g., monomorphization in `mono`), document why. See
 `docs/ARCHITECTURE.md` for the current pipeline reference.
 
-**7. Measure, don't guess.** If there's any doubt about efficiency, use `--profile` for runtime
-cost and `--leak-check` for memory. Claims like "this is faster" require before/after numbers.
-Improve the profiling and memory tools when you find gaps.
+**9. Measure, don't guess.** If there's any doubt about efficiency, use `--profile` for runtime
+cost and `--leak-check` for memory. Claims like "this is faster" require before/after evidence.
+Elapsed latency matters, but it is often noisy and can hide the mechanism. During investigation,
+also prefer direct and repeatable signals such as allocation and release counts, retired
+instructions, peak and retained memory, deterministic work counters, and native samples. Use the
+metrics that best isolate the claimed change, then confirm user-visible latency when that is the
+claim. Improve the profiling and memory tools when you find gaps.
 
 ### After you write code
 
-**8. Prove it works.** Every change must include evidence: passing tests, benchmark numbers,
+**10. Prove it works.** Every change must include evidence: passing tests, benchmark numbers,
 or before/after error message comparison. "It compiles" is not proof. For error paths, verify
 the error message content — a `should_fail` test that doesn't check the message is incomplete.
 For codegen changes, read the generated C.
 
-**9. Get it reviewed.** Every change gets reviewed before commit. Use the code-reviewer and
+**11. Get it reviewed.** Every change gets reviewed before commit. Use the code-reviewer and
 test-runner agents. No exceptions for "trivial" changes — trivial changes have trivial reviews.
 
-**10. Update docs with the code.** If your change is user-facing (syntax, API, error message),
+**12. Update docs with the code.** If your change is user-facing (syntax, API, error message),
 update `docs/GUIDE.md` and `docs/GRAMMAR.md` in the same commit. Documentation drift is a bug.
 The formal grammar must stay in sync with the parser.
 
-**11. Prefer coherent pre-0.1 behavior over backwards compatibility.** Blorp is pre-0.1.0, so
+**13. Prefer coherent pre-0.1 behavior over backwards compatibility.** Blorp is pre-0.1.0, so
 do not preserve old syntax, APIs, or compatibility shims merely to avoid breaking users. If the
 new behavior is clearer, safer, or simpler, remove the old form and make the current language
 coherent. Breaking changes still require updating all call sites in standard_library/, tests/, examples/, docs,
 and formatter expectations in the same change. Add migration-style error messages only when they
 meaningfully improve first-time user experience or prevent confusing parser/typechecker failures.
 
-**12. Focus on quality.** If your code is not ready to pass a review for production, then your
+**14. Focus on quality.** If your code is not ready to pass a review for production, then your
 work is incomplete. Do not settle for ad-hoc hacks or incoherent architecture.
 
-**13. Document the "Why"s.** When your code is read in the future, readers need to understand why
+**15. Document the "Why"s.** When your code is read in the future, readers need to understand why
 any non-obvious solutions exist.
 
-**14. Keep Track of Rough Edges.** If you run into obstacles, confusion, or bugs, surface them. We
-don't want subtle bugs to remain simmering under the surface.
+**16. Surface rough edges promptly.** Fast iteration depends on making friction visible. If you run
+into an obstacle, confusing boundary, unreliable tool, missing probe, or likely compiler bug,
+report it while the context is fresh. Explain its effect on the current task and suggest a bounded
+solution when one is apparent. Do not silently route around recurring friction or spend a long time
+building a workaround without reassessing the task with the user.
 
 ---
 
