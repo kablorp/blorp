@@ -1,6 +1,6 @@
 # Index Type-Home State
 
-**Status:** Ready
+**Status:** Implemented and merged in `174983f4`
 
 **Kind:** Independent Stage 06 optimization
 

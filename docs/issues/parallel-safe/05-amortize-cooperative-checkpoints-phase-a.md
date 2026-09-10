@@ -1,12 +1,16 @@
 # Amortize Cooperative Checkpoints In The Runtime
 
-**Status:** Ready, with explicit semantic gate
+**Status:** Superseded as an execution issue by
+[Amortize Runtime Cooperative Checkpoints](../late-core-latency/04-amortize-runtime-cooperative-checkpoints.md)
 
 **Kind:** Independent compiler/runtime latency optimization
 
 **Detailed predecessor:**
 [Amortize Cooperative Loop Checkpoints](../compiler-performance/31-amortize-cooperative-loop-checkpoints.md).
-This file is the execution source of truth for runtime-only Phase A.
+This file is retained as the original parallel-lane specification. The newer
+late-Core issue is the execution source of truth and clarifies carrier-thread
+budget ownership, reset-before-cancellation ordering, and cancellation-counter
+semantics.
 
 **Parallel owner boundary:**
 
@@ -76,8 +80,8 @@ For a thread repeatedly executing generated cooperative checkpoints:
 - blocking runtime operations retain their existing immediate cancellation
   boundaries;
 - explicit source `yield_now()` remains immediate;
-- task/fiber transitions cannot inherit an exhausted or pathologically delayed
-  budget; and
+- task/fiber transitions inherit the carrier thread's remaining budget and
+  therefore cannot delay a poll beyond the interval; and
 - reduction counts remain infrastructure state, not observable source-level
   ordering.
 
@@ -111,17 +115,17 @@ void blorp_cooperative_checkpoint(void) {
 This is illustrative. Use existing portability macros and branch conventions.
 Do not add a compiler-specific mode or environment variable.
 
-Audit exact task/fiber entry points before implementation. The thread-local
-budget must persist across ordinary suspension and resumption of the same or a
-different runnable fiber. In particular, do not reset it to a full interval on
-every scheduler resume: a series of short resumptions could then postpone slow
-polling indefinitely.
+The thread-local budget belongs to the OS carrier thread. It persists across
+task entry, task exit, suspension, and resumption of the same or a different
+runnable fiber. Do not add a task/fiber reset path: a series of short
+resumptions could otherwise postpone slow polling indefinitely. A task inherits
+the carrier's remaining budget and may poll earlier, never later, than the
+interval.
 
-Reset only at worker-thread initialization unless an exact new-task boundary
-can be proved to preserve the global polling bound. Any additional reset point
-requires a counter-based test showing that repeated short resumes cannot defer
-slow polling beyond one interval. Do not spread resets across unrelated runtime
-operations.
+Reset the budget before calling the cancellation helper because cancellation
+may perform a non-local exit. "One cancellation poll per interval" refers only
+to the checkpoint-owned poll; `blorp_yield_now` performs additional checks on
+the slow path.
 
 The slow cancellation and scheduling logic remains centralized. Generated C
 continues calling the same function.
@@ -203,9 +207,9 @@ object hashes so an old embedded runtime cannot invalidate the comparison.
 1. Write exact budget and cancellation-bound tests against current behavior.
 2. Add test-only counters around the existing slow operations.
 3. Record focused and stage-two compiler baselines.
-4. Audit task/fiber transition points and document the reset policy.
+4. Audit task/fiber transition points and confirm carrier ownership.
 5. Move the budget fast path ahead of slow checks.
-6. Add the narrow reset at an existing lifecycle boundary if required.
+6. Preserve the absence of task/fiber lifecycle resets.
 7. Verify the slow-poll count is approximately one per 64 checkpoint calls.
 8. Run concurrency, signal, timeout, sanitizer, and leak gates.
 9. Collect paired focused and stage-two compiler measurements.
@@ -263,8 +267,9 @@ compilers and alternate `compile --no-format --no-embed-runtime` on
       documented and tested.
 - [ ] The common checkpoint path executes the budget test before cancellation
       and fiber slow checks.
-- [ ] Slow cancellation polling occurs approximately once per interval during
-      uninterrupted CPU work.
+- [ ] Checkpoint-owned slow cancellation polling occurs approximately once per
+      interval during uninterrupted CPU work; `blorp_yield_now` checks are
+      counted separately.
 - [ ] Cancellation, timeout, signal, nested-loop, and tail-recursive tests prove
       bounded behavior.
 - [ ] Blocking operations and explicit `yield_now()` remain unchanged.

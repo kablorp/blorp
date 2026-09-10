@@ -1,8 +1,10 @@
 # Amortize Cooperative Loop Checkpoints
 
 **Status:** Runtime-only Phase A dispatched to
-[the parallel-safe execution issue](../parallel-safe/05-amortize-cooperative-checkpoints-phase-a.md).
+[the late-Core execution issue](../late-core-latency/04-amortize-runtime-cooperative-checkpoints.md).
 This file retains the broader historical roadmap, including gated Phase B.
+All Phase A lifecycle, counter, implementation, and acceptance instructions in
+this historical file are superseded by the linked execution issue.
 
 ## Objective
 
@@ -77,10 +79,11 @@ For any thread repeatedly executing generated checkpoints:
 - explicit source `yield_now()` remains immediate and unchanged; and
 - the reduction count is not observable as program ordering.
 
-Document whether the bound is inclusive and how a task/fiber transition resets
-or inherits the thread-local budget. Prefer resetting at task execution
-boundaries when an exact boundary already exists; do not add lifecycle coupling
-solely for cosmetic counter values.
+The bound is inclusive: calls 1–63 take the fast path and call 64 enters the
+slow path. The budget belongs to the OS carrier thread and persists across task
+entry, task exit, fiber suspension, and fiber resumption. A task inherits the
+carrier's remaining budget and may therefore poll earlier, never later, than
+the bound. Do not add a task/fiber reset path.
 
 ## Phase A: Runtime Budget Fast Path
 
@@ -109,6 +112,10 @@ This is illustrative, not permission to skip lifecycle analysis. Confirm:
 - scheduler stats and the existing checkpoint probe still report accurately;
 - the budget cannot underflow through reentrancy; and
 - each worker thread has an independent budget.
+
+Reset the budget before calling the cancellation helper: cancellation may
+perform a non-local exit. "One cancellation poll per interval" refers to the
+checkpoint-owned poll; `blorp_yield_now` performs its own slow-path checks.
 
 Keep the slow operation in one function. Do not duplicate task cancellation or
 fiber-yield logic into generated programs.

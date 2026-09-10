@@ -1,6 +1,7 @@
 # Parallel-Safe Compiler Latency Work
 
-**Status:** Ready for parallel assignment
+**Status:** Historical packet; lanes 1–3 are merged, lane 4 has an unaccepted
+candidate, and lane 5 moved to the late-Core latency packet
 
 **Baseline:** `30ff91683cda52fde14d76f5babe43ee7753bbd3`
 
@@ -10,6 +11,16 @@ This directory contains compiler-latency work that can proceed concurrently
 without requiring workers to coordinate edits to the same production owner.
 Every issue is a bounded vertical change with an explicit semantic authority,
 a focused measurement, and an independent merge decision.
+
+Current reconciliation:
+
+- phase timing is implemented and accepted;
+- match-projection declaration indexing is merged in `c109117b`;
+- type-home indexing is merged in `174983f4`;
+- field-order linearization is committed at `9ea9b1f3` and still requires its
+  acceptance decision; and
+- runtime checkpoint Phase A is now specified by
+  [the late-Core execution issue](../late-core-latency/04-amortize-runtime-cooperative-checkpoints.md).
 
 The packet deliberately excludes work that is merely plausible. An item belongs
 here only when:
@@ -66,7 +77,7 @@ are not yet mapped robustly enough for exact production pass attribution.
 | 2 | [Index match-projection declarations](02-index-match-projection-declarations.md) | `stage_09_core/match_projection.brp` |
 | 3 | [Index type-home state](03-index-type-home-state.md) | Stage 06 type-home state and consumers |
 | 4 | [Linearize Core preparation field ordering](04-linearize-core-preparation-field-ordering.md) | `stage_09_core/prepare.brp` |
-| 5 | [Amortize cooperative checkpoints, Phase A](05-amortize-cooperative-checkpoints-phase-a.md) | native runtime checkpoint policy |
+| 5 | [Amortize cooperative checkpoints, Phase A](../late-core-latency/04-amortize-runtime-cooperative-checkpoints.md) | native runtime checkpoint policy |
 
 Every optimization lane owns a uniquely named focused fixture and benchmark
 driver. It must not add a mode to a shared benchmark, edit a shared benchmark
@@ -184,7 +195,7 @@ evidence or rejected with retained baseline/candidate results. Afterward,
 repeat the clean compile-through-C profile and update the compiler performance
 roadmap from the new bottleneck distribution.
 
-The issue files in this directory are the execution source of truth for these
-five lanes. Older roadmap issues retain historical evidence and link here;
-when wording differs, this packet's narrower scope and acceptance criteria
-control the parallel work.
+The completed issue files in this directory retain their execution history.
+Field ordering remains governed here until its acceptance decision. Runtime
+checkpoint work is governed by the linked late-Core issue, whose narrower
+carrier-thread and cancellation contracts supersede the earlier Phase A text.

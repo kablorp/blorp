@@ -1,6 +1,6 @@
 # Index Match-Projection Declarations
 
-**Status:** Ready
+**Status:** Implemented and merged in `c109117b`
 
 **Kind:** Independent late-Core optimization
 

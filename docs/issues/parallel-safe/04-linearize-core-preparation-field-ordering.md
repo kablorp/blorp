@@ -1,6 +1,7 @@
 # Linearize Core Preparation Field Ordering
 
-**Status:** Ready
+**Status:** Candidate committed at `9ea9b1f3`; acceptance measurement and
+integration decision remain
 
 **Kind:** Independent late-Core optimization
 
