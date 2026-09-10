@@ -47,6 +47,8 @@ module inventory lives in
   issues. Versioned handoff specifications may live under `docs/issues/` when
   they define architectural dependencies, implementation boundaries, and
   durable acceptance criteria; they must not become a second status tracker.
+  The [active engineering issue index](issues/README.md) defines the retention
+  and size rules. Delete resolved issue documents instead of archiving them.
 - Put raw performance evidence in `benchmarks/results/` and link it from the
   issue or change that uses it.
 - Prefer generated inventories and `--help` output over copied file, command,

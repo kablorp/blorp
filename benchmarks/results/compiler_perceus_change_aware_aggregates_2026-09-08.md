@@ -118,8 +118,8 @@ reuses, 24 reconstructions, and deterministic post-Perceus SHA-256
 ## Next boundary
 
 Change-aware insertion now composes through leaves, simple shells, managed
-lets, calls, and aggregates. [Issue 60](../../docs/issues/compiler-performance/60-make-fixed-arity-ownership-normalization-change-aware.md)
-is the final automatically admitted checkpoint and covers only the fixed-arity
+lets, calls, and aggregates. Completed Issue 60 was the final automatically
+admitted checkpoint and covers only the fixed-arity
 unbox, binary, field-projection, and tuple-field-projection roots.
 
 Match ownership nodes are deliberately excluded. Their branch bindings,

@@ -1,8 +1,7 @@
 # Reduce Whole-Core Traversals And Superlinear Declaration Queries
 
-**Dispatch:** The match-projection portion of Slice 1 is now owned by
-[the parallel-safe execution issue](../parallel-safe/02-index-match-projection-declarations.md).
-That narrower issue is the implementation source of truth for this lane.
+**Current boundary:** The match-projection index has landed. Reprofile current
+`main` before choosing another traversal or declaration-query target.
 
 **Status:** Ready for measurement-first implementation
 

@@ -1,17 +1,15 @@
 # Reduce Callable-Header Registration Work
 
-**Status:** Investigation first; implementation should remain bounded
+**Status:** Measurement harness implemented; optimization selection pending a
+fresh current-main profile
 
 ## Issue Summary
 
-Measure and remove repeated work in `register_callable_header`, especially
-semantic-type conversion and one-at-a-time environment installation. This is a
-high-value typechecking target, but it overlaps with scope construction and
-must be decomposed before editing.
-
-The first deliverable is a selective profiling harness with counters for each
-sub-operation. The implementation should optimize the dominant proven
-sub-operation, not rewrite declaration typechecking as a whole.
+Use the existing selective profiling harness to determine whether
+`register_callable_header` still performs material repeated semantic-type
+conversion or one-at-a-time environment installation. Optimize only the
+dominant proven sub-operation; do not rewrite declaration typechecking as a
+whole.
 
 ## Profile Evidence
 
@@ -81,10 +79,9 @@ work unchanged. Instrumentation is therefore required before production edits.
 - Do not combine this work with broad `Env` representation changes.
 - Do not claim the 10.429% inclusive subtree as recoverable savings.
 
-## Required Measurement Slice
+## Available Measurement Slice
 
-Add selective counters, enabled only by the existing compiler profiling path,
-for:
+The existing compiler profiling path reports:
 
 - headers entered;
 - source versus foreign headers;
@@ -97,8 +94,8 @@ for:
 - environment symbol insertions; and
 - repeat registrations of the same nominal `CallableId` and owner.
 
-Counters must not change normal compilation behavior or emit unbounded logs.
-The workload result should include a checksum and accepted/error counts.
+The maintained workload also reports a checksum and accepted/error counts
+without changing normal compilation behavior.
 
 ## Candidate Solutions
 
@@ -142,31 +139,26 @@ diagnostic order rather than implementing a second batch mechanism.
 
 ## Mechanical Implementation Sequence
 
-1. Read `register_callable_header_for_source`, all loops that call it, and the
-   callable-header graph construction/acceptance code.
-2. Capture focused tests before instrumentation.
-3. Add the bounded counters and a benchmark fixture with modules, headers,
-   parameters, generics, and dimension constraints as independent controls.
-4. Record a baseline table and identify the dominant repeat ratio.
-5. Write a regression that asserts the intended upper bound, such as one
+1. Re-audit `register_callable_header_for_source`, its callers, and the current
+   counter output on `main`.
+2. Record a baseline table and identify the dominant repeat ratio.
+3. Write a regression that asserts the intended upper bound, such as one
    semantic conversion per header type occurrence.
-6. Implement exactly one candidate solution above.
-7. Re-run counters and prove the targeted repeated work disappeared.
-8. Inspect errors from malformed headers and compare exact ordering/text.
-9. Run focused, typecheck-stage, leak/sanitizer, and whole-compiler checks.
+4. Implement exactly one candidate solution above.
+5. Re-run counters and prove the targeted repeated work disappeared.
+6. Inspect errors from malformed headers and compare exact ordering/text.
+7. Run focused, typecheck-stage, leak/sanitizer, and whole-compiler checks.
 
 ## Fast Feedback Loop
 
-Use the existing typecheck benchmark infrastructure where possible:
+Use the dedicated maintained benchmark:
 
 ```bash
 BLORP_COMPILER_BENCHMARK_SKIP_BUILD=1 \
-  benchmarks/compiler_typecheck_profile 5 1 16 256 fallback
+  benchmarks/compiler_callable_header_profile 5 8 128 4 2 fallback
 ```
 
-If that fixture does not isolate headers, add a dedicated
-`compiler_callable_header_profile` benchmark instead of overloading unrelated
-inference controls. Suggested matrix:
+Scale its independent controls only as needed:
 
 ```text
 modules: 1, 8, 32

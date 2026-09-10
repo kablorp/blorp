@@ -1060,7 +1060,7 @@ direct-Perceus performance gate.
 
 ### 4A: All-owner function results
 
-[Issue 48](48-normalize-borrowed-results-for-all-owners.md) replaces the
+Completed Issue 48 replaced the
 per-parameter result-path loop with one branch-local all-owner result walk.
 Result satisfaction is distinct from lexical shadowing: an existing `DupExpr`
 may satisfy one owner's result obligation without hiding that owner from call
@@ -1078,7 +1078,7 @@ visits by 97.9%, the paired direct-Perceus median by 27.5%, and allocations by
 
 ### 4B: Exact referenced globals
 
-[Issue 49](49-normalize-referenced-globals-as-owner-catalog.md) replaces the
+Completed Issue 49 replaced the
 per-global call/aggregate/result triples in function bodies and dynamic global
 initializers. Only exact resolved, referenced, managed globals enter the
 catalog. Parameter owners retain declaration order and referenced globals
@@ -1098,7 +1098,7 @@ release controls remained within 0.4% of the immediate parent. See
 
 ### 4C: Lambda ownership regions
 
-[Issue 50](50-use-owner-catalogs-for-lambda-regions.md) applies the same
+Completed Issue 50 applied the same
 all-owner mechanisms to lambda parameters, runtime captures, and exact
 referenced globals. A nested lambda is opaque to its outer region and is
 normalized exactly once as its own ownership region.
@@ -1116,7 +1116,7 @@ boundary fusion.
 
 ### 4D: Fuse the boundary passes
 
-[Issue 51](51-fuse-borrowed-boundary-normalization.md) combines the independently
+Completed Issue 51 combined the independently
 validated call, aggregate, and result passes into one post-order reconstruction
 per nonempty function, lambda, or dynamic-global-initializer region. It first
 removes the transitional split between ordinary-function parameter and global
@@ -1176,8 +1176,8 @@ consumed-parameter balancing is the clearest remaining multiplicative family.
 
 The fixed 644-node nested-call fixture grew from 112,363 scalar-summary visits
 at one consumed owner to 60,347,649 visits at 128 owners while insertion stayed
-fixed at 5,159 visits. [Issue 59](59-skip-identity-consumed-parameter-balancing.md)
-therefore extends the existing broad-signature identity proof to exact
+fixed at 5,159 visits. Completed Issue 59 therefore extended the existing
+broad-signature identity proof to exact
 contract-directed consuming calls. At 32 owners it reduces the direct Perceus
 median by 99.8% and allocations by 99.87% with byte-identical Core. Compiler
 self-compilation is neutral, so this is recorded as a scaling fix rather than a
@@ -1234,8 +1234,7 @@ aggregate family at the real Perceus boundary, including independent dict key
 and value cases and the preparatory lowering of `RecordUpdateExpr`. See
 [`compiler_perceus_change_aware_aggregates_2026-09-08.md`](../../../benchmarks/results/compiler_perceus_change_aware_aggregates_2026-09-08.md).
 
-The final bounded insertion checkpoint is complete. [Issue
-60](60-make-fixed-arity-ownership-normalization-change-aware.md) makes the
+The final bounded insertion checkpoint is complete. Issue 60 made the
 normalization of `UnboxExpr`, `BinaryExpr`, `FieldExpr`, and `TupleFieldExpr`
 report exact source identity before composing recursive child identity. Its
 scaled neutral workload reused all 584 eligible roots and removed 8.42% of
@@ -1813,8 +1812,7 @@ building more shared analysis infrastructure.
 ### After Tranche 4
 
 Completed. Borrowed normalization stopped being the dominant repeated work;
-[Issue 59](59-skip-identity-consumed-parameter-balancing.md) removed the
-catastrophic exact consuming-call shape, and bounded change-aware insertion
+Issue 59 removed the catastrophic exact consuming-call shape, and bounded change-aware insertion
 checkpoints then removed deterministic reconstruction allocations. Issue 60
 completed the final fixed-arity slice. Its post-change profile did not identify
 a material named scalar-summary family and did not isolate match reconstruction
