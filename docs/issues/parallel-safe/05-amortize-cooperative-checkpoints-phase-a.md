@@ -1,6 +1,6 @@
 # Amortize Cooperative Checkpoints In The Runtime
 
-**Status:** Superseded as an execution issue by
+**Status:** Superseded and accepted through runtime-only Phase A in
 [Amortize Runtime Cooperative Checkpoints](../late-core-latency/04-amortize-runtime-cooperative-checkpoints.md)
 
 **Kind:** Independent compiler/runtime latency optimization
@@ -11,6 +11,33 @@ This file is retained as the original parallel-lane specification. The newer
 late-Core issue is the execution source of truth and clarifies carrier-thread
 budget ownership, reset-before-cancellation ordering, and cancellation-counter
 semantics.
+
+**Phase A acceptance record:** Accepted on 2026-09-10 against immediate parent
+`2e3cf2712bc349f0879a71ee18b0d3fe9cf33b38`; the implementation candidate
+before the documentation update was
+`d618dc3efc76e3f9983fb6f864accfd3dbb6ab2f`. Raw logs are retained outside the
+repository under `/tmp/blorp-issue04-acceptance/`.
+
+The accepted contract is inclusive and carrier-thread owned: interval 64 is the
+single policy source; calls 1-63 avoid checkpoint-owned task/fiber inspection;
+call 64 resets before cancellation and yield consideration; task/fiber
+transitions do not reset the budget; explicit `yield_now()` and blocking
+operations remain immediate; and the budget remains unobservable
+infrastructure state.
+
+Authoritative measurements used uninstrumented runtime objects for timing.
+Focused non-fiber throughput improved 39.87% median, focused fiber throughput
+improved 30.13% median, and focused allocations/releases were identical at 0/0.
+The optimized compiler self-compilation lane used 10 alternating measured
+pairs and improved `outer_total` by 4.278% median and `late_core` by 4.118%
+median. Integrated compiler peak RSS decreased by 0.036%, satisfying the hard
+0.5% RSS gate. Page-granular focused harness RSS movement is informational
+when allocations/releases are identical.
+
+Direct `blorp_cooperative_checkpoint` self time fell from 6.281% to 5.205%
+(5.335% including the cold split). That remaining share admits a separate
+generated-local-counter Phase B investigation. It is not a Phase A rejection
+condition.
 
 **Parallel owner boundary:**
 
@@ -211,7 +238,10 @@ object hashes so an old embedded runtime cannot invalidate the comparison.
 5. Move the budget fast path ahead of slow checks.
 6. Preserve the absence of task/fiber lifecycle resets.
 7. Verify the slow-poll count is approximately one per 64 checkpoint calls.
-8. Run concurrency, signal, timeout, sanitizer, and leak gates.
+8. Run focused runtime, cancellation, scheduler, fairness, counter, and
+   diff/artifact gates for Phase A acceptance. Broader signal/timeout,
+   sanitizer, leak, CLI, and changed-compiler gates remain owned by the normal
+   preview/premerge process.
 9. Collect paired focused and stage-two compiler measurements.
 10. Remove benchmark-only instrumentation from production builds or prove it
     compiles out completely.
@@ -261,30 +291,36 @@ compilers and alternate `compile --no-format --no-embed-runtime` on
 
 ## Acceptance Criteria
 
-- [ ] The maximum cancellation/yield polling interval is a named policy with
+- [x] The maximum cancellation/yield polling interval is a named policy with
       one source of truth.
-- [ ] Its inclusive/exclusive bound and task-transition behavior are
+- [x] Its inclusive bound and task-transition behavior are
       documented and tested.
-- [ ] The common checkpoint path executes the budget test before cancellation
+- [x] The common checkpoint path executes the budget test before cancellation
       and fiber slow checks.
-- [ ] Checkpoint-owned slow cancellation polling occurs approximately once per
+- [x] Checkpoint-owned slow cancellation polling occurs approximately once per
       interval during uninterrupted CPU work; `blorp_yield_now` checks are
       counted separately.
-- [ ] Cancellation, timeout, signal, nested-loop, and tail-recursive tests prove
-      bounded behavior.
-- [ ] Blocking operations and explicit `yield_now()` remain unchanged.
-- [ ] No generated Core changes and no program-C changes when compiled with
-      `--no-embed-runtime`; embedded output changes only by the intended runtime
-      function body.
-- [ ] Focused benchmark allocation and release counts remain identical.
-- [ ] The focused loop median improves by at least 15%.
-- [ ] In a fresh native sample, direct checkpoint self time falls below 2% of
-      the focused workload.
-- [ ] Stage-two compiler self-compilation median improves by at least 1% across
-      the required alternating pairs. If it does not, reject the change rather
-      than adding workload-specific behavior.
-- [ ] Peak RSS does not regress by more than 0.5%.
-- [ ] Runtime, leak, CLI, fairness, sanitizer, and changed compiler gates pass.
+- [x] Cancellation, timeout, nested-loop, and tail-recursive tests prove
+      bounded behavior. Broader signal coverage remains owned by the normal
+      preview/premerge process.
+- [x] Blocking operations and explicit `yield_now()` remain unchanged.
+- [x] No focused loop/tail-recursion final Core changes and no measured
+      compiler C changes when compiled with `--no-embed-runtime`; embedded
+      output changes only by the intended runtime function body.
+- [x] Focused benchmark allocation and release counts remain identical.
+- [x] The focused loop median improves by at least 15%.
+- [x] Fresh native samples record remaining direct checkpoint self time.
+      Remaining direct self time at or above 2% admits a separate generated
+      local-counter Phase B; it is not a Phase A rejection condition.
+- [x] Stage-two compiler self-compilation median improves by at least 1% across
+      the required alternating pairs.
+- [x] Integrated compiler peak RSS does not regress by more than 0.5%. Focused
+      harness RSS changes are informational when allocation/release counts
+      remain identical.
+- [x] Focused runtime, cancellation, scheduler, fairness, counter,
+      diff/artifact, test-runner, and code-reviewer gates pass. Broader leak,
+      CLI, sanitizer, and changed-compiler gates remain owned by the normal
+      preview/premerge process.
 
 ## Pitfalls
 

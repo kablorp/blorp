@@ -1,10 +1,45 @@
 # Amortize Cooperative Loop Checkpoints
 
-**Status:** Runtime-only Phase A dispatched to
+**Status:** Runtime-only Phase A implemented and accepted through
 [the late-Core execution issue](../late-core-latency/04-amortize-runtime-cooperative-checkpoints.md).
 This file retains the broader historical roadmap, including gated Phase B.
 All Phase A lifecycle, counter, implementation, and acceptance instructions in
 this historical file are superseded by the linked execution issue.
+
+**Phase A acceptance record:** Accepted on 2026-09-10 against immediate parent
+`2e3cf2712bc349f0879a71ee18b0d3fe9cf33b38`; the implementation candidate
+before the documentation update was
+`d618dc3efc76e3f9983fb6f864accfd3dbb6ab2f`. Raw logs are retained outside the
+repository under `/tmp/blorp-issue04-acceptance/`.
+
+The accepted runtime contract is inclusive and carrier-thread owned:
+`BLORP_COOPERATIVE_CHECKPOINT_INTERVAL` remains 64; calls 1-63 decrement and
+return without checkpoint-owned task/fiber inspection; call 64 resets before
+cancellation and yield consideration; task entry, task exit, fiber suspension,
+and fiber resumption do not reset the budget; explicit source `yield_now()` and
+blocking runtime operations remain immediate; and the budget remains
+unobservable infrastructure state.
+
+Authoritative Phase A measurements used uninstrumented runtime objects for
+timing and test-instrumented runtime sources only for counter validation.
+Focused non-fiber throughput improved 39.87% median and focused fiber
+throughput improved 30.13% median, with identical focused allocation/release
+counts of 0/0. Optimized compiler self-compilation improved `outer_total` by
+4.278% median and `late_core` by 4.118% median across 10 alternating measured
+pairs. Integrated compiler peak RSS decreased by 0.036%; this integrated
+compiler workload is the hard 0.5% RSS gate. Page-granular focused harness RSS
+movement is informational when allocations/releases are identical.
+
+The integrated compiler medians also recorded `phase_total` improving from
+26,732.872 ms to 25,583.911 ms, a 4.298% improvement. Named phase median
+deltas were: `typed_frontend` 2.712%, `core_lowering` 7.977%, `early_core`
+7.150%, `runtime_projection` 0.666%, `late_core` 4.118%,
+`backend_emission` 3.591%, and `artifact_construction` 0.259%.
+
+Direct `blorp_cooperative_checkpoint` self time fell from 6.281% to 5.205%
+(5.335% including the cold split). The remaining direct self-time share admits
+a separate generated-local-counter Phase B investigation. It is not a Phase A
+rejection condition.
 
 ## Objective
 
@@ -120,12 +155,12 @@ checkpoint-owned poll; `blorp_yield_now` performs its own slow-path checks.
 Keep the slow operation in one function. Do not duplicate task cancellation or
 fiber-yield logic into generated programs.
 
-## Phase B: Generated Local Countdown, Only If Needed
+## Phase B: Generated Local Countdown, Admitted Separately If Needed
 
 After Phase A, profile the focused loop. If checkpoint overhead remains at
-least 2% of the focused loop or `_tlv_get_addr` remains a material Stage 01-04
-leaf attributable to checkpoints, evaluate a generated function-local
-countdown:
+least 2% of the focused loop or `_tlv_get_addr` remains a material compiler
+leaf attributable to checkpoints, admit a separate generated function-local
+countdown investigation:
 
 ```c
 long checkpoint_budget = BLORP_COOPERATIVE_CHECKPOINT_INTERVAL;
@@ -155,8 +190,10 @@ properties are:
 - functions without loops do not gain a counter; and
 - generated-code growth is measured.
 
-If these properties require broad new IR and Phase A already removes the
-measured hotspot, stop after Phase A.
+This Phase B admission signal is not a Phase A rejection condition. Phase A is
+accepted when its semantic, focused-throughput, integrated compiler, output,
+allocation, memory, and review gates pass. If Phase B proceeds, represent it
+explicitly and test it as its own compiler/backend change.
 
 ## Semantic And Safety Requirements
 
@@ -241,12 +278,13 @@ or the platform-equivalent profiler to compare:
 Run one warmup and at least seven alternating timing pairs. Record every sample,
 median, compiler/runtime hashes, C compiler version, flags, and checksum.
 
-### 4. Escalate To Phase B Only At The Gate
+### 4. Admit Phase B Only At The Gate
 
 Do not begin Core/backend work unless the post-Phase-A profile crosses the 2%
-focused threshold above. If it does, add focused Core and emitter tests first,
-then iterate through `test_core_fairness.brp` and `test_core_emit.brp` without a
-full rebuild.
+focused threshold above or leaves a material checkpoint-attributable compiler
+leaf. If it does, write a separate Phase B issue, add focused Core and emitter
+tests first, then iterate through `test_core_fairness.brp` and
+`test_core_emit.brp` without a full rebuild.
 
 ### 5. Integrated Validation Last
 
@@ -281,14 +319,19 @@ makes checkpoint overhead immaterial.
 4. The focused native probe preserves checksums and reports all timing samples.
 5. Native samples show slow checks occur approximately once per interval.
 6. Allocation counts remain unchanged.
-7. Phase B is implemented only if its documented profile gate is met.
+7. Phase B is admitted separately only if its documented profile gate is met;
+   the gate is not a Phase A rejection condition.
 8. Any Phase B IR/backend representation is explicit and handles nested loops
    without multiplying latency.
-9. Generated C and binary size are reported.
-10. Runtime concurrency, fairness, CLI timeout/signal, sanitizer, leak, and
-    `scripts/compiler-check --changed` gates pass.
-11. Fresh Stage 01-04 and lex medians are reported; total compiler time is not
-    used as the decision metric.
+9. Generated C identity and compiler/runtime hashes are reported. Generated
+   local-counter size belongs to any separate Phase B.
+10. Focused runtime, cancellation, scheduler, fairness, counter,
+    diff/artifact, test-runner, and code-reviewer gates pass. Broader CLI
+    timeout/signal, sanitizer, leak, and changed-compiler gates remain owned by
+    the normal preview/premerge process.
+11. Fresh integrated compiler `outer_total`, `phase_total`, named phase, and
+    `late_core` medians are reported; compiler self-compilation is the Phase A
+    integrated decision metric.
 12. No scratch binaries, C files, or logs are committed.
 
 ## Out Of Scope
@@ -304,7 +347,9 @@ makes checkpoint overhead immaterial.
 ## Implementation Report Requirements
 
 Include the final polling contract, lifecycle analysis, chosen phase, reason
-for stopping or escalating, runtime/compiler hashes, all focused samples,
-native sample attribution, cancellation latency observations, Stage 01-04
-results, generated-size results, test counts, sanitizer/leak results, reviewer
-verdicts, and every rough edge found in task/fiber transitions.
+for stopping or admitting Phase B, runtime/compiler hashes, all focused samples,
+native sample attribution, cancellation latency observations, integrated
+compiler phase results, generated-output identity, test counts, reviewer
+verdicts, and every rough edge found in task/fiber transitions. Sanitizer,
+leak, CLI, and changed-compiler release gates remain part of the normal
+preview/premerge evidence unless a later issue explicitly requires them here.

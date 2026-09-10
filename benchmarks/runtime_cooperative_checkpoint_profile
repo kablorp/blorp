@@ -1,0 +1,798 @@
+#!/usr/bin/env python3
+"""Profile runtime cooperative checkpoint amortization against a control ref."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import shutil
+import statistics
+import subprocess
+import tempfile
+import textwrap
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+RUNTIME_RELATIVE = "blorp/src/lib/runtime/native/runtime.c"
+RUNTIME_PATH = ROOT / RUNTIME_RELATIVE
+RUNTIME_INCLUDE = RUNTIME_PATH.parent
+
+
+TEST_STATS_BLOCK = """\
+#if defined(BLORP_COOPERATIVE_CHECKPOINT_TESTING)
+typedef struct blorp_CooperativeCheckpointTestStats {
+    long checkpoint_calls;
+    long checkpoint_slow_path_entries;
+    long checkpoint_owned_cancellation_polls;
+    long yield_considerations;
+} blorp_CooperativeCheckpointTestStats;
+
+static _Thread_local blorp_CooperativeCheckpointTestStats
+    __blorp_cooperative_checkpoint_test_stats = {0};
+
+static void __blorp_cooperative_checkpoint_test_reset(long budget) {
+    __blorp_cooperative_checkpoint_budget = budget;
+    __blorp_cooperative_checkpoint_test_stats =
+        (blorp_CooperativeCheckpointTestStats){0};
+}
+
+static blorp_CooperativeCheckpointTestStats
+__blorp_cooperative_checkpoint_test_snapshot(void) {
+    return __blorp_cooperative_checkpoint_test_stats;
+}
+
+#define BLORP_COOPERATIVE_CHECKPOINT_TEST_STAT_INC(field) \\
+    (__blorp_cooperative_checkpoint_test_stats.field++)
+#else
+#define BLORP_COOPERATIVE_CHECKPOINT_TEST_STAT_INC(field) ((void)0)
+#endif
+"""
+
+OLD_CHECKPOINT_BODY = """\
+void blorp_cooperative_checkpoint(void) {
+    if (__blorp_cancel_current_task_if_requested()) return;
+    if (!__blorp_current_fiber) return;
+    __blorp_cooperative_checkpoint_budget--;
+    if (__blorp_cooperative_checkpoint_budget > 0) return;
+    __blorp_cooperative_checkpoint_budget =
+        BLORP_COOPERATIVE_CHECKPOINT_INTERVAL;
+    blorp_yield_now();
+}
+"""
+
+INSTRUMENTED_OLD_CHECKPOINT_BODY = """\
+void blorp_cooperative_checkpoint(void) {
+    BLORP_COOPERATIVE_CHECKPOINT_TEST_STAT_INC(checkpoint_calls);
+    BLORP_COOPERATIVE_CHECKPOINT_TEST_STAT_INC(
+        checkpoint_owned_cancellation_polls);
+    if (__blorp_cancel_current_task_if_requested()) return;
+    if (!__blorp_current_fiber) return;
+    __blorp_cooperative_checkpoint_budget--;
+    if (__blorp_cooperative_checkpoint_budget > 0) return;
+    BLORP_COOPERATIVE_CHECKPOINT_TEST_STAT_INC(checkpoint_slow_path_entries);
+    __blorp_cooperative_checkpoint_budget =
+        BLORP_COOPERATIVE_CHECKPOINT_INTERVAL;
+    BLORP_COOPERATIVE_CHECKPOINT_TEST_STAT_INC(yield_considerations);
+    blorp_yield_now();
+}
+"""
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    return sha256_bytes(path.read_bytes())
+
+
+def run(
+    command: list[str], *, input_bytes: bytes | None = None
+) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        command,
+        cwd=ROOT,
+        input=input_bytes,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def git_show(ref: str, path: str) -> bytes:
+    completed = run(["git", "show", f"{ref}:{path}"])
+    if completed.returncode != 0:
+        raise SystemExit(completed.stderr.decode("utf-8", errors="replace"))
+    return completed.stdout
+
+
+def source_with_test_stats(source_bytes: bytes) -> bytes:
+    source = source_bytes.decode("utf-8")
+    if "blorp_CooperativeCheckpointTestStats" in source:
+        return source_bytes
+
+    budget_declaration = (
+        "static _Thread_local long __blorp_cooperative_checkpoint_budget =\n"
+        "    BLORP_COOPERATIVE_CHECKPOINT_INTERVAL;\n"
+    )
+    if budget_declaration not in source:
+        raise SystemExit("runtime source is missing the checkpoint budget declaration")
+    source = source.replace(
+        budget_declaration,
+        budget_declaration + TEST_STATS_BLOCK,
+        1,
+    )
+    if OLD_CHECKPOINT_BODY not in source:
+        raise SystemExit("runtime source is missing the expected legacy checkpoint body")
+    source = source.replace(
+        OLD_CHECKPOINT_BODY,
+        INSTRUMENTED_OLD_CHECKPOINT_BODY,
+        1,
+    )
+    return source.encode("utf-8")
+
+
+def timing_harness_source(iterations: int) -> str:
+    return textwrap.dedent(
+        f"""\
+        #include <sys/resource.h>
+        #include "runtime_decl.c"
+
+        #ifndef BLORP_RUNTIME_LABEL
+        #define BLORP_RUNTIME_LABEL "unknown"
+        #endif
+
+        typedef struct FiberLoopEnv {{
+            long iterations;
+        }} FiberLoopEnv;
+
+        static uint64_t now_ns(void) {{
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+        }}
+
+        static long peak_rss_bytes(void) {{
+            struct rusage usage;
+            if (getrusage(RUSAGE_SELF, &usage) != 0) return 0;
+        #if defined(__APPLE__)
+            return usage.ru_maxrss;
+        #else
+            if (usage.ru_maxrss > LONG_MAX / 1024) return LONG_MAX;
+            return usage.ru_maxrss * 1024;
+        #endif
+        }}
+
+        static void emit_timing(
+            const char* workload,
+            long checkpoint_calls,
+            long elapsed_nanoseconds,
+            long checksum
+        ) {{
+            blorp_SchedulerStats scheduler_stats = blorp_get_scheduler_stats();
+            blorp_MemStats mem_stats = blorp_get_mem_stats();
+            printf(
+                "runtime_cooperative_checkpoint_timing_sample "
+                "runtime_label=%s workload=%s checkpoint_calls=%ld "
+                "elapsed_nanoseconds=%ld allocations=%ld releases=%ld "
+                "peak_rss_bytes=%ld checksum=%ld cooperative_yields=%ld\\n",
+                BLORP_RUNTIME_LABEL,
+                workload,
+                checkpoint_calls,
+                elapsed_nanoseconds,
+                mem_stats.total_allocations,
+                mem_stats.total_releases,
+                peak_rss_bytes(),
+                checksum,
+                scheduler_stats.cooperative_yields);
+        }}
+
+        static long checkpoint_iterations(void) {{
+            return {iterations}L;
+        }}
+
+        static void reset_public_stats(void) {{
+            setenv("BLORP_ALLOCATOR_STATS", "1", 1);
+            blorp_reset_scheduler_stats();
+            blorp_reset_mem_stats();
+        }}
+
+        static void run_non_fiber_loop(void) {{
+            long iterations = checkpoint_iterations();
+            long checksum = 0;
+            reset_public_stats();
+            uint64_t start_ns = now_ns();
+            for (long i = 0; i < iterations; i++) {{
+                blorp_cooperative_checkpoint();
+                checksum += i & 7;
+            }}
+            uint64_t end_ns = now_ns();
+            emit_timing("non_fiber_loop", iterations, (long)(end_ns - start_ns), checksum);
+        }}
+
+        static void* fiber_loop_task(void* raw_env) {{
+            FiberLoopEnv* env = (FiberLoopEnv*)raw_env;
+            long checksum = 0;
+            reset_public_stats();
+            uint64_t start_ns = now_ns();
+            for (long i = 0; i < env->iterations; i++) {{
+                blorp_cooperative_checkpoint();
+                checksum += i & 3;
+            }}
+            uint64_t end_ns = now_ns();
+            emit_timing("fiber_loop", env->iterations, (long)(end_ns - start_ns), checksum);
+            return NULL;
+        }}
+
+        static void run_fiber_loop(void) {{
+            FiberLoopEnv env = {{0}};
+            env.iterations = checkpoint_iterations() / 16L;
+            if (env.iterations < 64L) env.iterations = 64L;
+            blorp_thread_pool_init(1);
+            blorp_Closure* closure = blorp_closure_new((void*)fiber_loop_task, &env);
+            void* task = blorp_task_spawn(closure);
+            void* joined = blorp_concurrent_join(task, -1);
+            (void)joined;
+            (void)task;
+            (void)closure;
+        }}
+
+        static long nested_loop_body(long outer, long inner) {{
+            long checksum = 0;
+            for (long i = 0; i < outer; i++) {{
+                for (long j = 0; j < inner; j++) {{
+                    blorp_cooperative_checkpoint();
+                    checksum += ((i + 1) * (j + 3)) & 31;
+                }}
+            }}
+            return checksum;
+        }}
+
+        static void run_nested_loop(void) {{
+            long outer = 256L;
+            long inner = checkpoint_iterations() / outer;
+            reset_public_stats();
+            uint64_t start_ns = now_ns();
+            long checksum = nested_loop_body(outer, inner);
+            uint64_t end_ns = now_ns();
+            emit_timing("nested_loop", outer * inner, (long)(end_ns - start_ns), checksum);
+        }}
+
+        static long tail_loop_body(long remaining, long checksum) {{
+            while (remaining > 0) {{
+                blorp_cooperative_checkpoint();
+                checksum += remaining & 63;
+                remaining--;
+            }}
+            return checksum;
+        }}
+
+        static void run_tail_loop(void) {{
+            long iterations = checkpoint_iterations();
+            reset_public_stats();
+            uint64_t start_ns = now_ns();
+            long checksum = tail_loop_body(iterations, 0);
+            uint64_t end_ns = now_ns();
+            emit_timing("tail_loop", iterations, (long)(end_ns - start_ns), checksum);
+        }}
+
+        static void run_explicit_yield_control(void) {{
+            reset_public_stats();
+            uint64_t start_ns = now_ns();
+            blorp_yield_now();
+            uint64_t end_ns = now_ns();
+            emit_timing("explicit_yield_control", 0, (long)(end_ns - start_ns), 1);
+        }}
+
+        static void run_blocking_control(void) {{
+            reset_public_stats();
+            uint64_t start_ns = now_ns();
+            blorp_sleep(0);
+            uint64_t end_ns = now_ns();
+            emit_timing("blocking_sleep_zero_control", 0, (long)(end_ns - start_ns), 1);
+        }}
+
+        int main(void) {{
+            run_non_fiber_loop();
+            run_fiber_loop();
+            run_nested_loop();
+            run_tail_loop();
+            run_explicit_yield_control();
+            run_blocking_control();
+            return 0;
+        }}
+        """
+    )
+
+
+def counter_harness_source(runtime_source: Path, iterations: int) -> str:
+    runtime_literal = str(runtime_source).replace("\\", "\\\\").replace('"', '\\"')
+    return textwrap.dedent(
+        f"""\
+        #define MINICORO_IMPL
+        #define BLORP_COOPERATIVE_CHECKPOINT_TESTING 1
+        #include "minicoro.h"
+        #include "{runtime_literal}"
+
+        #ifndef BLORP_RUNTIME_LABEL
+        #define BLORP_RUNTIME_LABEL "unknown"
+        #endif
+
+        typedef struct CounterResult {{
+            const char* workload;
+            long checkpoint_calls;
+            long checkpoint_slow_path_entries;
+            long checkpoint_owned_cancellation_polls;
+            long yield_considerations;
+            long cooperative_yields;
+            long checksum;
+        }} CounterResult;
+
+        typedef struct FiberLoopEnv {{
+            long iterations;
+            CounterResult result;
+        }} FiberLoopEnv;
+
+        static long checkpoint_iterations(void) {{
+            return {iterations}L;
+        }}
+
+        static void emit_counter(CounterResult result) {{
+            printf(
+                "runtime_cooperative_checkpoint_counter_sample "
+                "runtime_label=%s workload=%s checkpoint_calls=%ld "
+                "checkpoint_slow_path_entries=%ld "
+                "checkpoint_owned_cancellation_polls=%ld "
+                "yield_considerations=%ld cooperative_yields=%ld checksum=%ld\\n",
+                BLORP_RUNTIME_LABEL,
+                result.workload,
+                result.checkpoint_calls,
+                result.checkpoint_slow_path_entries,
+                result.checkpoint_owned_cancellation_polls,
+                result.yield_considerations,
+                result.cooperative_yields,
+                result.checksum);
+        }}
+
+        static CounterResult finish_counter(const char* workload, long checksum) {{
+            blorp_CooperativeCheckpointTestStats checkpoint_stats =
+                __blorp_cooperative_checkpoint_test_snapshot();
+            blorp_SchedulerStats scheduler_stats = blorp_get_scheduler_stats();
+            CounterResult result;
+            result.workload = workload;
+            result.checkpoint_calls = checkpoint_stats.checkpoint_calls;
+            result.checkpoint_slow_path_entries =
+                checkpoint_stats.checkpoint_slow_path_entries;
+            result.checkpoint_owned_cancellation_polls =
+                checkpoint_stats.checkpoint_owned_cancellation_polls;
+            result.yield_considerations = checkpoint_stats.yield_considerations;
+            result.cooperative_yields = scheduler_stats.cooperative_yields;
+            result.checksum = checksum;
+            return result;
+        }}
+
+        static void counter_reset(long budget) {{
+            blorp_reset_scheduler_stats();
+            __blorp_cooperative_checkpoint_test_reset(budget);
+        }}
+
+        static void run_non_fiber_loop(void) {{
+            long iterations = checkpoint_iterations();
+            long checksum = 0;
+            __blorp_current_task = NULL;
+            __blorp_current_fiber = NULL;
+            counter_reset(BLORP_COOPERATIVE_CHECKPOINT_INTERVAL);
+            for (long i = 0; i < iterations; i++) {{
+                blorp_cooperative_checkpoint();
+                checksum += i & 7;
+            }}
+            emit_counter(finish_counter("non_fiber_loop", checksum));
+        }}
+
+        static void* fiber_loop_task(void* raw_env) {{
+            FiberLoopEnv* env = (FiberLoopEnv*)raw_env;
+            long checksum = 0;
+            counter_reset(BLORP_COOPERATIVE_CHECKPOINT_INTERVAL);
+            for (long i = 0; i < env->iterations; i++) {{
+                blorp_cooperative_checkpoint();
+                checksum += i & 3;
+            }}
+            env->result = finish_counter("fiber_loop", checksum);
+            return NULL;
+        }}
+
+        static void run_fiber_loop(void) {{
+            FiberLoopEnv env = {{0}};
+            env.iterations = checkpoint_iterations() / 16L;
+            if (env.iterations < 64L) env.iterations = 64L;
+            blorp_thread_pool_init(1);
+            blorp_Closure* closure = blorp_closure_new((void*)fiber_loop_task, &env);
+            void* task = blorp_task_spawn(closure);
+            void* joined = blorp_concurrent_join(task, -1);
+            emit_counter(env.result);
+            (void)joined;
+            (void)task;
+            (void)closure;
+        }}
+
+        static void run_cancellation_offsets(void) {{
+            blorp_Task task;
+            memset(&task, 0, sizeof(task));
+            pthread_mutex_init(&task.mutex, NULL);
+            pthread_cond_init(&task.done_cond, NULL);
+            atomic_store_explicit(&task.cancelled, 1, memory_order_relaxed);
+            __blorp_current_task = &task;
+            __blorp_current_fiber = NULL;
+            long checksum = 0;
+            long total_calls = 0;
+            long total_slow_paths = 0;
+            long total_checkpoint_polls = 0;
+            for (long offset = 1; offset <= BLORP_COOPERATIVE_CHECKPOINT_INTERVAL; offset++) {{
+                counter_reset(offset);
+                for (long call = 1; call <= offset; call++) {{
+                    blorp_cooperative_checkpoint();
+                    checksum += offset + call;
+                }}
+                blorp_CooperativeCheckpointTestStats stats =
+                    __blorp_cooperative_checkpoint_test_snapshot();
+                total_calls += stats.checkpoint_calls;
+                total_slow_paths += stats.checkpoint_slow_path_entries;
+                total_checkpoint_polls += stats.checkpoint_owned_cancellation_polls;
+            }}
+            CounterResult result = finish_counter("cancellation_offsets", checksum);
+            result.checkpoint_calls = total_calls;
+            result.checkpoint_slow_path_entries = total_slow_paths;
+            result.checkpoint_owned_cancellation_polls = total_checkpoint_polls;
+            emit_counter(result);
+            __blorp_current_task = NULL;
+            pthread_cond_destroy(&task.done_cond);
+            pthread_mutex_destroy(&task.mutex);
+        }}
+
+        static void init_stack_task(blorp_Task* task) {{
+            memset(task, 0, sizeof(*task));
+            pthread_mutex_init(&task->mutex, NULL);
+            pthread_cond_init(&task->done_cond, NULL);
+        }}
+
+        static void destroy_stack_task(blorp_Task* task) {{
+            pthread_cond_destroy(&task->done_cond);
+            pthread_mutex_destroy(&task->mutex);
+        }}
+
+        static void run_short_task_transitions(void) {{
+            blorp_Task first_task;
+            blorp_Task second_task;
+            init_stack_task(&first_task);
+            init_stack_task(&second_task);
+            __blorp_current_fiber = NULL;
+            counter_reset(BLORP_COOPERATIVE_CHECKPOINT_INTERVAL);
+            long checksum = 0;
+            long iterations = checkpoint_iterations() / 128L;
+            if (iterations < BLORP_COOPERATIVE_CHECKPOINT_INTERVAL) {{
+                iterations = BLORP_COOPERATIVE_CHECKPOINT_INTERVAL;
+            }}
+            for (long i = 0; i < iterations; i++) {{
+                blorp_Task* task = (i & 1) == 0 ? &first_task : &second_task;
+                __blorp_task_enter_runner(task);
+                blorp_cooperative_checkpoint();
+                __blorp_task_leave_runner(task);
+                checksum += i & 15;
+            }}
+            emit_counter(finish_counter("short_task_transitions", checksum));
+            destroy_stack_task(&second_task);
+            destroy_stack_task(&first_task);
+        }}
+
+        static long nested_loop_body(long outer, long inner) {{
+            long checksum = 0;
+            for (long i = 0; i < outer; i++) {{
+                for (long j = 0; j < inner; j++) {{
+                    blorp_cooperative_checkpoint();
+                    checksum += ((i + 1) * (j + 3)) & 31;
+                }}
+            }}
+            return checksum;
+        }}
+
+        static void run_nested_loop(void) {{
+            __blorp_current_task = NULL;
+            __blorp_current_fiber = NULL;
+            counter_reset(BLORP_COOPERATIVE_CHECKPOINT_INTERVAL);
+            long checksum = nested_loop_body(256, checkpoint_iterations() / 256L);
+            emit_counter(finish_counter("nested_loop", checksum));
+        }}
+
+        static long tail_loop_body(long remaining, long checksum) {{
+            while (remaining > 0) {{
+                blorp_cooperative_checkpoint();
+                checksum += remaining & 63;
+                remaining--;
+            }}
+            return checksum;
+        }}
+
+        static void run_tail_loop(void) {{
+            __blorp_current_task = NULL;
+            __blorp_current_fiber = NULL;
+            counter_reset(BLORP_COOPERATIVE_CHECKPOINT_INTERVAL);
+            long checksum = tail_loop_body(checkpoint_iterations(), 0);
+            emit_counter(finish_counter("tail_loop", checksum));
+        }}
+
+        static void run_explicit_yield_control(void) {{
+            __blorp_current_task = NULL;
+            __blorp_current_fiber = NULL;
+            counter_reset(7);
+            blorp_yield_now();
+            emit_counter(finish_counter("explicit_yield_control",
+                __blorp_cooperative_checkpoint_budget));
+        }}
+
+        static void run_blocking_control(void) {{
+            __blorp_current_task = NULL;
+            __blorp_current_fiber = NULL;
+            counter_reset(5);
+            blorp_sleep(0);
+            emit_counter(finish_counter("blocking_sleep_zero_control",
+                __blorp_cooperative_checkpoint_budget));
+        }}
+
+        int main(void) {{
+            run_non_fiber_loop();
+            run_fiber_loop();
+            run_cancellation_offsets();
+            run_short_task_transitions();
+            run_nested_loop();
+            run_tail_loop();
+            run_explicit_yield_control();
+            run_blocking_control();
+            return 0;
+        }}
+        """
+    )
+
+
+def compile_runtime_object(
+    cc_command: list[str], runtime_source: Path, output: Path, *, testing: bool
+) -> None:
+    command = [
+        *cc_command,
+        "-O2",
+        "-fwrapv",
+        "-pipe",
+        "-w",
+        "-DMINICORO_IMPL",
+    ]
+    if testing:
+        command.append("-DBLORP_COOPERATIVE_CHECKPOINT_TESTING=1")
+    command.extend(
+        [
+            "-include",
+            str(RUNTIME_INCLUDE / "minicoro.h"),
+            "-c",
+            str(runtime_source),
+            "-o",
+            str(output),
+        ]
+    )
+    completed = run(command)
+    if completed.returncode != 0:
+        raise SystemExit(completed.stderr.decode("utf-8", errors="replace"))
+
+
+def compile_c(
+    cc_command: list[str], source: str, label: str, executable: Path, objects: list[Path]
+) -> None:
+    completed = run(
+        [
+            *cc_command,
+            "-O2",
+            "-fwrapv",
+            "-pipe",
+            "-w",
+            f"-I{RUNTIME_INCLUDE}",
+            f'-DBLORP_RUNTIME_LABEL="{label}"',
+            "-x",
+            "c",
+            "-",
+            "-x",
+            "none",
+            *[str(obj) for obj in objects],
+            "-lm",
+            "-lpthread",
+            "-o",
+            str(executable),
+        ],
+        input_bytes=source.encode(),
+    )
+    if completed.returncode != 0:
+        raise SystemExit(completed.stderr.decode("utf-8", errors="replace"))
+
+
+def parse_rows(output: str, prefix: str) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for line in output.splitlines():
+        if not line.startswith(prefix + " "):
+            continue
+        rows.append(dict(part.split("=", 1) for part in line.split()[1:]))
+    return rows
+
+
+def run_executable(executable: Path, label: str, prefix: str, expected: int) -> list[dict[str, str]]:
+    completed = subprocess.run(
+        [str(executable)],
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise SystemExit(
+            f"{label} failed with exit {completed.returncode}:\n{completed.stderr}"
+        )
+    rows = parse_rows(completed.stdout, prefix)
+    if len(rows) != expected:
+        raise SystemExit(f"{label} emitted {len(rows)} {prefix} rows, expected {expected}")
+    return rows
+
+
+def summarize_timing(rows: list[dict[str, str]]) -> dict[tuple[str, str], list[int]]:
+    elapsed: dict[tuple[str, str], list[int]] = {}
+    for row in rows:
+        key = (row["runtime_label"], row["workload"])
+        elapsed.setdefault(key, []).append(int(row["elapsed_nanoseconds"]))
+    return elapsed
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Compare cooperative checkpoint runtime profiles."
+    )
+    parser.add_argument("--control-ref", default="HEAD")
+    parser.add_argument("--control-label", default="control")
+    parser.add_argument("--candidate-label", default="candidate")
+    parser.add_argument("--pairs", type=int, default=3)
+    parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--counters-only", action="store_true")
+    parser.add_argument("--keep-stage", action="store_true")
+    args = parser.parse_args()
+
+    if args.pairs < 1:
+        parser.error("--pairs must be positive")
+
+    cc_command = os.environ.get("CC", "cc").split()
+    if not cc_command or shutil.which(cc_command[0]) is None:
+        raise SystemExit(f"C compiler is not available: {' '.join(cc_command)}")
+    iterations = 1_000_000 if args.quick else 8_000_000
+
+    stage = Path(tempfile.mkdtemp(prefix="blorp-runtime-checkpoint-profile-"))
+    try:
+        control_runtime = stage / "control_runtime.c"
+        candidate_runtime = stage / "candidate_runtime.c"
+        control_counter_runtime = stage / "control_counter_runtime.c"
+        candidate_counter_runtime = stage / "candidate_counter_runtime.c"
+
+        control_original = git_show(args.control_ref, RUNTIME_RELATIVE)
+        candidate_original = RUNTIME_PATH.read_bytes()
+        control_runtime.write_bytes(control_original)
+        candidate_runtime.write_bytes(candidate_original)
+        control_counter_runtime.write_bytes(source_with_test_stats(control_original))
+        candidate_counter_runtime.write_bytes(source_with_test_stats(candidate_original))
+
+        control_object = stage / "control_runtime.o"
+        candidate_object = stage / "candidate_runtime.o"
+        compile_runtime_object(cc_command, control_runtime, control_object, testing=False)
+        compile_runtime_object(cc_command, candidate_runtime, candidate_object, testing=False)
+
+        control_counter = stage / "control_counter"
+        candidate_counter = stage / "candidate_counter"
+        compile_c(
+            cc_command,
+            counter_harness_source(control_counter_runtime, iterations),
+            args.control_label,
+            control_counter,
+            [],
+        )
+        compile_c(
+            cc_command,
+            counter_harness_source(candidate_counter_runtime, iterations),
+            args.candidate_label,
+            candidate_counter,
+            [],
+        )
+
+        print(
+            "runtime_cooperative_checkpoint_profile_meta "
+            f"schema=2 control_ref={args.control_ref} "
+            f"control_runtime_source_sha256={sha256_bytes(control_original)} "
+            f"candidate_runtime_source_sha256={sha256_bytes(candidate_original)} "
+            f"control_counter_runtime_source_sha256={sha256_file(control_counter_runtime)} "
+            f"candidate_counter_runtime_source_sha256={sha256_file(candidate_counter_runtime)} "
+            f"control_runtime_object_sha256={sha256_file(control_object)} "
+            f"candidate_runtime_object_sha256={sha256_file(candidate_object)} "
+            f"timing_code=unmodified_runtime_object "
+            f"counter_code=test_instrumented_runtime_source "
+            f"iterations={iterations} pairs={args.pairs} "
+            f"counters_only={str(args.counters_only).lower()}"
+        )
+
+        for label, executable in (
+            (args.control_label, control_counter),
+            (args.candidate_label, candidate_counter),
+        ):
+            for row in run_executable(
+                executable,
+                f"{label} counters",
+                "runtime_cooperative_checkpoint_counter_sample",
+                8,
+            ):
+                print(
+                    "runtime_cooperative_checkpoint_counter_row "
+                    + " ".join(f"{key}={value}" for key, value in row.items())
+                )
+
+        if args.counters_only:
+            return 0
+
+        control_timing = stage / "control_timing"
+        candidate_timing = stage / "candidate_timing"
+        compile_c(
+            cc_command,
+            timing_harness_source(iterations),
+            args.control_label,
+            control_timing,
+            [control_object],
+        )
+        compile_c(
+            cc_command,
+            timing_harness_source(iterations),
+            args.candidate_label,
+            candidate_timing,
+            [candidate_object],
+        )
+
+        all_timing_rows: list[dict[str, str]] = []
+        for pair in range(args.pairs):
+            ordered = (
+                [(args.control_label, control_timing), (args.candidate_label, candidate_timing)]
+                if pair % 2 == 0
+                else [(args.candidate_label, candidate_timing), (args.control_label, control_timing)]
+            )
+            for label, executable in ordered:
+                rows = run_executable(
+                    executable,
+                    f"{label} timing",
+                    "runtime_cooperative_checkpoint_timing_sample",
+                    6,
+                )
+                for row in rows:
+                    row["pair"] = str(pair + 1)
+                    all_timing_rows.append(row)
+                    print(
+                        "runtime_cooperative_checkpoint_timing_row "
+                        + " ".join(f"{key}={value}" for key, value in row.items())
+                    )
+
+        for (label, workload), samples in sorted(summarize_timing(all_timing_rows).items()):
+            print(
+                "runtime_cooperative_checkpoint_timing_summary "
+                f"runtime_label={label} workload={workload} "
+                f"median_elapsed_nanoseconds={int(statistics.median(samples))} "
+                f"min_elapsed_nanoseconds={min(samples)} "
+                f"max_elapsed_nanoseconds={max(samples)}"
+            )
+    finally:
+        if args.keep_stage:
+            print(f"runtime_cooperative_checkpoint_profile_stage path={stage}")
+        else:
+            shutil.rmtree(stage)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

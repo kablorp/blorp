@@ -20716,6 +20716,33 @@ static _Thread_local blorp_Fiber* __blorp_current_fiber = NULL;
 _Thread_local void* __blorp_current_task = NULL;  // current blorp_Task* (for cancellation checks)
 static _Thread_local long __blorp_cooperative_checkpoint_budget =
     BLORP_COOPERATIVE_CHECKPOINT_INTERVAL;
+#if defined(BLORP_COOPERATIVE_CHECKPOINT_TESTING)
+typedef struct blorp_CooperativeCheckpointTestStats {
+    long checkpoint_calls;
+    long checkpoint_slow_path_entries;
+    long checkpoint_owned_cancellation_polls;
+    long yield_considerations;
+} blorp_CooperativeCheckpointTestStats;
+
+static _Thread_local blorp_CooperativeCheckpointTestStats
+    __blorp_cooperative_checkpoint_test_stats = {0};
+
+static void __blorp_cooperative_checkpoint_test_reset(long budget) {
+    __blorp_cooperative_checkpoint_budget = budget;
+    __blorp_cooperative_checkpoint_test_stats =
+        (blorp_CooperativeCheckpointTestStats){0};
+}
+
+static blorp_CooperativeCheckpointTestStats
+__blorp_cooperative_checkpoint_test_snapshot(void) {
+    return __blorp_cooperative_checkpoint_test_stats;
+}
+
+#define BLORP_COOPERATIVE_CHECKPOINT_TEST_STAT_INC(field) \
+    (__blorp_cooperative_checkpoint_test_stats.field++)
+#else
+#define BLORP_COOPERATIVE_CHECKPOINT_TEST_STAT_INC(field) ((void)0)
+#endif
 void blorp_cooperative_checkpoint(void);
 static _Atomic int __blorp_scheduler_debug_cache = -1;
 static _Atomic uint64_t __blorp_next_wait_operation_id = 1;
@@ -25165,15 +25192,23 @@ void blorp_yield_now(void) {
 // Compiler-owned cooperative checkpoint.
 //
 // Unlike source-level yield_now(), this is intended for generated checkpoints
-// in CPU-heavy loops. It observes cancellation on every call, but only performs
-// a scheduler yield when the per-thread reduction budget expires.
+// in CPU-heavy loops. It uses a carrier-thread reduction budget so hot paths do
+// not inspect task or fiber TLS until the budget expires.
 void blorp_cooperative_checkpoint(void) {
-    if (__blorp_cancel_current_task_if_requested()) return;
-    if (!__blorp_current_fiber) return;
+    BLORP_COOPERATIVE_CHECKPOINT_TEST_STAT_INC(checkpoint_calls);
     __blorp_cooperative_checkpoint_budget--;
-    if (__blorp_cooperative_checkpoint_budget > 0) return;
+    if (__builtin_expect(__blorp_cooperative_checkpoint_budget > 0, 1)) return;
+
+    BLORP_COOPERATIVE_CHECKPOINT_TEST_STAT_INC(checkpoint_slow_path_entries);
+    // Reset before cancellation, which may exit this frame through longjmp.
     __blorp_cooperative_checkpoint_budget =
         BLORP_COOPERATIVE_CHECKPOINT_INTERVAL;
+
+    BLORP_COOPERATIVE_CHECKPOINT_TEST_STAT_INC(
+        checkpoint_owned_cancellation_polls);
+    if (__blorp_cancel_current_task_if_requested()) return;
+    if (!__blorp_current_fiber) return;
+    BLORP_COOPERATIVE_CHECKPOINT_TEST_STAT_INC(yield_considerations);
     blorp_yield_now();
 }
 
