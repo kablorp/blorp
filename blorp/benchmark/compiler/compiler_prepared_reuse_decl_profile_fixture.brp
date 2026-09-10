@@ -1,0 +1,979 @@
+-- Deterministic workload for isolated prepared-reuse declaration lookup
+-- measurement. The timed path invokes production rewrite_prepared_program for
+-- every iteration.
+import:
+	../../src/compiler/stage_09_core/ir:
+		CoreAccessor(RootAccessor, VariantFieldAccessor),
+		CoreBoxKind(PointerBox),
+		CoreBoxedStorageValue,
+		CoreConstructorMatchBody(ConstructorMatchBodyExpr),
+		CoreConstructorMatchCase,
+		CoreConstructorMatchFallback(ConstructorMatchFallbackFail),
+		CoreConstructorMatchTest(UnionTagConstructorTest),
+		CoreDecl(FunctionDecl, GlobalDecl, UnionDecl),
+		CoreExpr(
+			ConstructorMatchExpr,
+			DropExpr,
+			LetExpr,
+			LiteralExpr,
+			SeqExpr,
+			UnionConstructExpr,
+			UnionReuseConstructExpr,
+			VarExpr,
+		),
+		CoreFunction,
+		CoreFunctionKind(UserFunction),
+		CoreGlobal,
+		CoreLiteral(IntLiteral),
+		CoreMatchBinding,
+		CoreMatchBindingMode(MatchOwnBindingMode),
+		CoreProgram,
+		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy),
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(NamedType, UnionType),
+		CoreUnionDecl,
+		CoreUnionField,
+		CoreUnionPayloadStorage(ErasedUnionPayloadStorage),
+		CoreUnionRepresentation(GenericUnionRepresentation),
+		CoreUnionVariant,
+		CoreVar,
+		core_program_to_json,
+	../../src/compiler/stage_09_core/reuse: core_expr_is_var, rewrite_prepared_program
+	bytes: get as get_byte
+
+
+private PREPARED_REUSE_DEF_ID_BASE: Int = 930000
+
+private PREPARED_REUSE_TARGET_UNION: String = "PreparedReuseTarget"
+
+
+record PreparedReuseProfileConfig {
+	iterations: Int,
+	declarations: Int,
+	union_count: Int,
+	variants_per_union: Int,
+	prepared_match_count: Int
+}
+
+
+union PreparedReuseLookupAlgorithm:
+	PreparedReuseParentLinearLookup
+	PreparedReuseIndexedLookup
+
+
+record PreparedReuseProfileResult {
+	layout_builds: Int,
+	declarations_indexed: Int,
+	union_entries_written: Int,
+	union_lookup_requests: Int,
+	union_linear_candidates_visited: Int,
+	variant_lookup_requests: Int,
+	variant_linear_candidates_visited: Int,
+	prepared_nodes_visited: Int,
+	rewritten_reuse_sites: Int,
+	semantic_checksum: Int,
+	workload_valid: Bool
+}
+
+
+private record PreparedReuseProfileLookupAudit {
+	union_lookup_requests: Int,
+	parent_union_linear_candidates_visited: Int,
+	indexed_union_linear_candidates_visited: Int,
+	variant_lookup_requests: Int,
+	variant_linear_candidates_visited: Int
+}
+
+
+private record PreparedReuseProfileTypeLookup {
+	audit: PreparedReuseProfileLookupAudit,
+	type_name: Option[String]
+}
+
+
+private pure func positive_value(value: Int, default: Int) -> Int:
+	if value > 0:
+		value
+	else:
+		default
+
+
+private pure func max_int(left: Int, right: Int) -> Int:
+	if left > right:
+		left
+	else:
+		right
+
+
+private pure func empty_lookup_audit() -> PreparedReuseProfileLookupAudit:
+	{
+		union_lookup_requests = 0,
+		parent_union_linear_candidates_visited = 0,
+		indexed_union_linear_candidates_visited = 0,
+		variant_lookup_requests = 0,
+		variant_linear_candidates_visited = 0
+	}
+
+
+private pure func add_lookup_audit(
+	left: PreparedReuseProfileLookupAudit,
+	right: PreparedReuseProfileLookupAudit,
+) -> PreparedReuseProfileLookupAudit:
+	{
+		union_lookup_requests = left.union_lookup_requests + right.union_lookup_requests,
+		parent_union_linear_candidates_visited = left.parent_union_linear_candidates_visited + right.parent_union_linear_candidates_visited,
+		indexed_union_linear_candidates_visited = left.indexed_union_linear_candidates_visited + right.indexed_union_linear_candidates_visited,
+		variant_lookup_requests = left.variant_lookup_requests + right.variant_lookup_requests,
+		variant_linear_candidates_visited = left.variant_linear_candidates_visited + right.variant_linear_candidates_visited
+	}
+
+
+private pure func normalized_config(
+	config: PreparedReuseProfileConfig,
+) -> PreparedReuseProfileConfig:
+	union_count: Int = positive_value(config.union_count, 1)
+	{
+		iterations = positive_value(config.iterations, 1),
+		declarations = max_int(
+			positive_value(config.declarations, 1),
+			union_count + 1,
+		),
+		union_count = union_count,
+		variants_per_union = positive_value(config.variants_per_union, 1),
+		prepared_match_count = positive_value(config.prepared_match_count, 1)
+	}
+
+
+private pure func union_name(index: Int, union_count: Int) -> String:
+	if index == union_count - 1:
+		PREPARED_REUSE_TARGET_UNION
+	else:
+		"UnrelatedPreparedReuseUnion${index}"
+
+
+private pure func target_type() -> CoreType:
+	UnionType(PREPARED_REUSE_TARGET_UNION)
+
+
+private pure func int_type() -> CoreType:
+	NamedType("Int", [])
+
+
+private pure func benchmark_var(name: String, uniq: Int) -> CoreVar:
+	{
+		name = name,
+		uniq = uniq,
+		def_id = None
+	}
+
+
+private pure func int_literal(value: Int) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), int_type(), SyntheticSourceLoc)
+
+
+private pure func target_var_expr(variable: CoreVar) -> CoreExpr:
+	VarExpr(variable, target_type(), SyntheticSourceLoc)
+
+
+private pure func benchmark_field() -> CoreUnionField:
+	{
+		typ = target_type(),
+		release_policy = ArcReleasePolicy
+	}
+
+
+private pure func variant_name(index: Int) -> String:
+	"PreparedReuseVariant${index}"
+
+
+private pure func benchmark_variant(index: Int, variants_per_union: Int) -> CoreUnionVariant:
+	{
+		name = variant_name(index),
+		c_name = "prepared_reuse_variant_${index}",
+		tag_c_name = "PREPARED_REUSE_VARIANT_${index}",
+		tag = index,
+		fields = [benchmark_field()],
+		def_id = Some(PREPARED_REUSE_DEF_ID_BASE + index)
+	}
+
+
+private pure func benchmark_union_decl(
+	union_index: Int,
+	union_count: Int,
+	variants_per_union: Int,
+) -> CoreDecl:
+	var variants: List[CoreUnionVariant] = []
+	var variant_index: Int = 0
+
+	while variant_index < variants_per_union:
+		variants = variants.append(benchmark_variant(variant_index, variants_per_union))
+		variant_index += 1
+
+	UnionDecl({
+		abi_type = None,
+		name = union_name(union_index, union_count),
+		type_params = [],
+		payload_storage = ErasedUnionPayloadStorage,
+		variants = variants,
+		loc = SyntheticSourceLoc,
+	})
+
+
+private pure func unrelated_global(index: Int) -> CoreDecl:
+	GlobalDecl({
+		name = benchmark_var("prepared_reuse_unrelated_${index}", index),
+		source_module = Some("bench/prepared_reuse"),
+		typ = int_type(),
+		init = int_literal(index),
+		is_mutable = False,
+		is_const = False,
+		is_private = False,
+		def_id = PREPARED_REUSE_DEF_ID_BASE + 10000 + index,
+		loc = SyntheticSourceLoc,
+	})
+
+
+private pure func pointer_box(value: CoreExpr) -> CoreBoxedStorageValue:
+	{
+		kind = PointerBox,
+		value = value,
+		needs_release = True,
+		transfers_ownership = True
+	}
+
+
+private pure func match_binding(index: Int, variants_per_union: Int) -> CoreMatchBinding:
+	{
+		variable = benchmark_var("owned_payload_${index}", index),
+		typ = target_type(),
+		accessor = VariantFieldAccessor(
+			RootAccessor,
+			PREPARED_REUSE_TARGET_UNION,
+			variant_name(variants_per_union - 1),
+			0,
+		),
+		mode = MatchOwnBindingMode
+	}
+
+
+private pure func union_construct(index: Int, variants_per_union: Int) -> CoreExpr:
+	UnionConstructExpr(
+		{
+			type_name = PREPARED_REUSE_TARGET_UNION,
+			constructor_name = variant_name(variants_per_union - 1),
+			constructor_c_name = "prepared_reuse_variant_${variants_per_union - 1}",
+			representation = GenericUnionRepresentation,
+			payload_storage = ErasedUnionPayloadStorage,
+			uses_release_mask = True,
+			release_mask = 1,
+			args = [pointer_box(target_var_expr(benchmark_var("owned_payload_${index}", index)))]
+		},
+		target_type(),
+		SyntheticSourceLoc,
+	)
+
+
+private pure func prepared_match(index: Int, variants_per_union: Int) -> CoreExpr:
+	source_var: CoreVar = benchmark_var("source_${index}", index)
+	result_var: CoreVar = benchmark_var("result_${index}", index)
+
+	LetExpr(
+		result_var,
+		False,
+		target_type(),
+		ConstructorMatchExpr(
+			target_var_expr(source_var),
+			ArcReleasePolicy,
+			[
+				{
+					constructor = variant_name(variants_per_union - 1),
+					accessor = RootAccessor,
+					test = UnionTagConstructorTest(
+						PREPARED_REUSE_TARGET_UNION,
+						variant_name(variants_per_union - 1),
+					),
+					bindings = [match_binding(index, variants_per_union)],
+					body = ConstructorMatchBodyExpr(union_construct(index, variants_per_union))
+				},
+			],
+			ConstructorMatchFallbackFail,
+			target_type(),
+			SyntheticSourceLoc,
+		),
+		DropExpr(
+			source_var,
+			target_type(),
+			ArcReleasePolicy,
+			target_var_expr(result_var),
+			target_type(),
+			SyntheticSourceLoc,
+		),
+	)
+
+
+private pure func benchmark_body(config: PreparedReuseProfileConfig) -> CoreExpr:
+	var body: CoreExpr = int_literal(0)
+	var index: Int = 0
+
+	while index < config.prepared_match_count:
+		body = SeqExpr(
+			body,
+			prepared_match(index, config.variants_per_union),
+		)
+		index += 1
+
+	body
+
+
+private pure func benchmark_function(config: PreparedReuseProfileConfig) -> CoreDecl:
+	FunctionDecl({
+		name = "prepared_reuse_profile_entry",
+		source_module = Some("bench/prepared_reuse"),
+		type_params = [],
+		params = [],
+		return_type = target_type(),
+		body = Some(benchmark_body(config)),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = PREPARED_REUSE_DEF_ID_BASE - 1,
+		loc = SyntheticSourceLoc,
+	})
+
+
+private pure func unrelated_declaration_count(config: PreparedReuseProfileConfig) -> Int:
+	config.declarations - config.union_count - 1
+
+
+private pure func append_unrelated_globals(
+	decls: List[CoreDecl],
+	start_index: Int,
+	end_index: Int,
+) -> List[CoreDecl]:
+	var result: List[CoreDecl] = decls
+	var unrelated_index: Int = start_index
+
+	while unrelated_index < end_index:
+		result = result.append(unrelated_global(unrelated_index))
+		unrelated_index += 1
+
+	result
+
+
+private pure func append_unrelated_unions(
+	decls: List[CoreDecl],
+	start_index: Int,
+	end_index: Int,
+	config: PreparedReuseProfileConfig,
+) -> List[CoreDecl]:
+	var result: List[CoreDecl] = decls
+	var union_index: Int = start_index
+	target_union_index: Int = config.union_count - 1
+
+	while union_index < end_index:
+		if union_index != target_union_index:
+			result = result.append(
+				benchmark_union_decl(
+					union_index,
+					config.union_count,
+					config.variants_per_union,
+				),
+			)
+		else:
+			void
+
+		union_index += 1
+
+	result
+
+
+private pure func target_union_decl(config: PreparedReuseProfileConfig) -> CoreDecl:
+	benchmark_union_decl(config.union_count - 1, config.union_count, config.variants_per_union)
+
+
+pure func prepared_reuse_profile_worst_case_program(
+	config: PreparedReuseProfileConfig,
+) -> CoreProgram:
+	normalized: PreparedReuseProfileConfig = normalized_config(config)
+	unrelated_count: Int = unrelated_declaration_count(normalized)
+	var decls: List[CoreDecl] = []
+
+	decls = append_unrelated_globals(decls, 0, unrelated_count)
+	decls = append_unrelated_unions(decls, 0, normalized.union_count - 1, normalized)
+	decls = decls.append(benchmark_function(normalized))
+
+	{
+		decls = decls.append(target_union_decl(normalized)),
+		foreign_includes = []
+	}
+
+
+pure func prepared_reuse_profile_mixed_program(config: PreparedReuseProfileConfig) -> CoreProgram:
+	normalized: PreparedReuseProfileConfig = normalized_config(config)
+	unrelated_count: Int = unrelated_declaration_count(normalized)
+	union_split: Int = normalized.union_count / 2
+	global_split: Int = unrelated_count / 2
+	var decls: List[CoreDecl] = []
+
+	decls = append_unrelated_unions(decls, 0, union_split, normalized)
+	decls = append_unrelated_globals(decls, 0, global_split)
+	decls = decls.append(target_union_decl(normalized))
+	decls = decls.append(benchmark_function(normalized))
+	decls = append_unrelated_globals(decls, global_split, unrelated_count)
+	decls = append_unrelated_unions(decls, union_split, normalized.union_count - 1, normalized)
+
+	{
+		decls = decls,
+		foreign_includes = []
+	}
+
+
+pure func prepared_reuse_profile_program(config: PreparedReuseProfileConfig) -> CoreProgram:
+	prepared_reuse_profile_worst_case_program(config)
+
+
+private pure func count_reuse_expr(expr: CoreExpr) -> Int:
+	match expr:
+		UnionReuseConstructExpr(construct, typ, loc):
+			1
+		SeqExpr(first, second):
+			count_reuse_expr(first) + count_reuse_expr(second)
+		LetExpr(variable, is_mutable, value_type, rhs, body):
+			count_reuse_expr(rhs) + count_reuse_expr(body)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			count_reuse_expr(body)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			var total: Int = count_reuse_expr(scrutinee)
+
+			for match_case in cases:
+				match match_case.body:
+					ConstructorMatchBodyExpr(body):
+						total += count_reuse_expr(body)
+					_:
+						void
+
+			total
+		_:
+			0
+
+
+private pure func count_reuse_program(program: CoreProgram) -> Int:
+	var total: Int = 0
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(func_info):
+				match func_info.body:
+					Some(body):
+						total += count_reuse_expr(body)
+					None:
+						void
+			GlobalDecl(global):
+				total += count_reuse_expr(global.init)
+			_:
+				void
+
+	total
+
+
+private pure func count_expr_nodes(expr: CoreExpr) -> Int:
+	match expr:
+		SeqExpr(first, second):
+			1 + count_expr_nodes(first) + count_expr_nodes(second)
+		LetExpr(variable, is_mutable, value_type, rhs, body):
+			1 + count_expr_nodes(rhs) + count_expr_nodes(body)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			1 + count_expr_nodes(body)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			var total: Int = 1 + count_expr_nodes(scrutinee)
+
+			for match_case in cases:
+				match match_case.body:
+					ConstructorMatchBodyExpr(body):
+						total += count_expr_nodes(body)
+					_:
+						void
+
+			total
+		UnionConstructExpr(construct, typ, loc):
+			1
+		UnionReuseConstructExpr(construct, typ, loc):
+			1
+		VarExpr(variable, typ, loc):
+			1
+		LiteralExpr(literal, typ, loc):
+			1
+		_:
+			1
+
+
+private pure func count_program_expr_nodes(program: CoreProgram) -> Int:
+	var total: Int = 0
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(func_info):
+				match func_info.body:
+					Some(body):
+						total += count_expr_nodes(body)
+					None:
+						void
+			GlobalDecl(global):
+				total += count_expr_nodes(global.init)
+			_:
+				void
+
+	total
+
+
+private pure func union_decl_count(program: CoreProgram) -> Int:
+	var count: Int = 0
+
+	for decl in program.decls:
+		match decl:
+			UnionDecl(union_decl):
+				count += 1
+			_:
+				void
+
+	count
+
+
+private pure func lookup_union_variants(
+	program: CoreProgram,
+	type_name: String,
+) -> Option[List[CoreUnionVariant]]:
+	var result: Option[List[CoreUnionVariant]] = None
+
+	for decl in program.decls:
+		match decl:
+			UnionDecl(union_decl):
+				if union_decl.name == type_name:
+					result = Some(union_decl.variants)
+				else:
+					void
+			_:
+				void
+
+	result
+
+
+private pure func union_lookup_audit(program: CoreProgram) -> PreparedReuseProfileLookupAudit:
+	{
+		union_lookup_requests = 1,
+		parent_union_linear_candidates_visited = program.decls.length(),
+		indexed_union_linear_candidates_visited = 0,
+		variant_lookup_requests = 0,
+		variant_linear_candidates_visited = 0
+	}
+
+
+private pure func type_lookup_audit(
+	program: CoreProgram,
+	typ: CoreType,
+) -> PreparedReuseProfileTypeLookup:
+	match typ:
+		UnionType(name):
+			audit: PreparedReuseProfileLookupAudit = union_lookup_audit(program)
+
+			match lookup_union_variants(program, name):
+				Some(variants):
+					{
+						audit = audit,
+						type_name = Some(name)
+					}
+				None:
+					{
+						audit = audit,
+						type_name = None
+					}
+		NamedType(name, args):
+			if args.length() == 0:
+				audit: PreparedReuseProfileLookupAudit = union_lookup_audit(program)
+
+				match lookup_union_variants(program, name):
+					Some(variants):
+						{
+							audit = audit,
+							type_name = Some(name)
+						}
+					None:
+						{
+							audit = audit,
+							type_name = None
+						}
+			else:
+				{
+					audit = empty_lookup_audit(),
+					type_name = None
+				}
+		_:
+			{
+				audit = empty_lookup_audit(),
+				type_name = None
+			}
+
+
+private pure func variant_lookup_audit(
+	program: CoreProgram,
+	type_name: String,
+) -> PreparedReuseProfileLookupAudit:
+	match lookup_union_variants(program, type_name):
+		Some(variants):
+			{
+				union_lookup_requests = 0,
+				parent_union_linear_candidates_visited = 0,
+				indexed_union_linear_candidates_visited = 0,
+				variant_lookup_requests = 1,
+				variant_linear_candidates_visited = variants.length()
+			}
+		None:
+			empty_lookup_audit()
+
+
+private pure func leaf_lookup_audit(
+	program: CoreProgram,
+	type_name: String,
+	current_constructor: Option[String],
+) -> PreparedReuseProfileLookupAudit:
+	match current_constructor:
+		Some(constructor_name):
+			add_lookup_audit(
+				union_lookup_audit(program),
+				variant_lookup_audit(program, type_name),
+			)
+		None:
+			empty_lookup_audit()
+
+
+private pure func constructor_for_case(
+	current_constructor: Option[String],
+	match_case: CoreConstructorMatchCase,
+) -> Option[String]:
+	match match_case.accessor:
+		RootAccessor:
+			Some(match_case.constructor)
+		_:
+			current_constructor
+
+
+private pure func audit_constructor_match_body(
+	program: CoreProgram,
+	type_name: String,
+	current_constructor: Option[String],
+	body: CoreConstructorMatchBody,
+) -> PreparedReuseProfileLookupAudit:
+	match body:
+		ConstructorMatchBodyExpr(expr):
+			leaf_lookup_audit(program, type_name, current_constructor)
+		_:
+			empty_lookup_audit()
+
+
+private pure func audit_constructor_match_cases(
+	program: CoreProgram,
+	type_name: String,
+	cases: List[CoreConstructorMatchCase],
+) -> PreparedReuseProfileLookupAudit:
+	var audit: PreparedReuseProfileLookupAudit = empty_lookup_audit()
+
+	for match_case in cases:
+		audit = add_lookup_audit(
+			audit,
+			audit_constructor_match_body(
+				program,
+				type_name,
+				constructor_for_case(None, match_case),
+				match_case.body,
+			),
+		)
+
+	audit
+
+
+private pure func audit_prepared_drop_result(
+	program: CoreProgram,
+	binding_var: CoreVar,
+	binding_rhs: CoreExpr,
+	dropped_var: CoreVar,
+	dropped_type: CoreType,
+	result: CoreExpr,
+) -> PreparedReuseProfileLookupAudit:
+	if core_expr_is_var(result, binding_var):
+		type_lookup: PreparedReuseProfileTypeLookup = type_lookup_audit(program, dropped_type)
+
+		match type_lookup.type_name:
+			Some(type_name):
+				match binding_rhs:
+					ConstructorMatchExpr(source, scrutinee_release_policy, cases, fallback, typ, loc):
+						if core_expr_is_var(source, dropped_var):
+							add_lookup_audit(
+								type_lookup.audit,
+								audit_constructor_match_cases(program, type_name, cases),
+							)
+						else:
+							type_lookup.audit
+					_:
+						type_lookup.audit
+			None:
+				type_lookup.audit
+	else:
+		empty_lookup_audit()
+
+
+private pure func audit_prepared_let_drop(
+	program: CoreProgram,
+	binding_var: CoreVar,
+	binding_rhs: CoreExpr,
+	body: CoreExpr,
+) -> PreparedReuseProfileLookupAudit:
+	match body:
+		DropExpr(dropped_var, dropped_type, release_policy, result, drop_type, drop_loc):
+			audit_prepared_drop_result(
+				program,
+				binding_var,
+				binding_rhs,
+				dropped_var,
+				dropped_type,
+				result,
+			)
+		_:
+			empty_lookup_audit()
+
+
+private pure func audit_prepared_expr(
+	program: CoreProgram,
+	expr: CoreExpr,
+) -> PreparedReuseProfileLookupAudit:
+	match expr:
+		SeqExpr(first, second):
+			add_lookup_audit(
+				audit_prepared_expr(program, first),
+				audit_prepared_expr(program, second),
+			)
+		LetExpr(variable, is_mutable, value_type, rhs, body):
+			add_lookup_audit(
+				add_lookup_audit(
+					audit_prepared_expr(program, rhs),
+					audit_prepared_expr(program, body),
+				),
+				audit_prepared_let_drop(program, variable, rhs, body),
+			)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			audit_prepared_expr(program, body)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			var audit: PreparedReuseProfileLookupAudit = audit_prepared_expr(program, scrutinee)
+
+			for match_case in cases:
+				match match_case.body:
+					ConstructorMatchBodyExpr(body):
+						audit = add_lookup_audit(
+							audit,
+							audit_prepared_expr(program, body),
+						)
+					_:
+						void
+
+			audit
+		_:
+			empty_lookup_audit()
+
+
+private pure func audit_prepared_program(program: CoreProgram) -> PreparedReuseProfileLookupAudit:
+	var audit: PreparedReuseProfileLookupAudit = empty_lookup_audit()
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(func_info):
+				match func_info.body:
+					Some(body):
+						audit = add_lookup_audit(
+							audit,
+							audit_prepared_expr(program, body),
+						)
+					None:
+						void
+			GlobalDecl(global):
+				audit = add_lookup_audit(
+					audit,
+					audit_prepared_expr(program, global.init),
+				)
+			_:
+				void
+
+	audit
+
+
+private pure func choose_union_linear_candidates(
+	algorithm: PreparedReuseLookupAlgorithm,
+	audit: PreparedReuseProfileLookupAudit,
+) -> Int:
+	match algorithm:
+		PreparedReuseParentLinearLookup:
+			audit.parent_union_linear_candidates_visited
+		PreparedReuseIndexedLookup:
+			audit.indexed_union_linear_candidates_visited
+
+
+private pure func index_layout_builds(
+	algorithm: PreparedReuseLookupAlgorithm,
+	iterations: Int,
+) -> Int:
+	match algorithm:
+		PreparedReuseParentLinearLookup:
+			0
+		PreparedReuseIndexedLookup:
+			iterations
+
+
+private pure func index_declarations_visited(
+	algorithm: PreparedReuseLookupAlgorithm,
+	program: CoreProgram,
+	iterations: Int,
+) -> Int:
+	match algorithm:
+		PreparedReuseParentLinearLookup:
+			0
+		PreparedReuseIndexedLookup:
+			program.decls.length() * iterations
+
+
+private pure func index_union_entries_written(
+	algorithm: PreparedReuseLookupAlgorithm,
+	program: CoreProgram,
+	iterations: Int,
+) -> Int:
+	match algorithm:
+		PreparedReuseParentLinearLookup:
+			0
+		PreparedReuseIndexedLookup:
+			union_decl_count(program) * iterations
+
+
+private pure func common_workload_is_valid(result: PreparedReuseProfileResult) -> Bool:
+	(
+		result.union_lookup_requests > 0
+		and result.variant_lookup_requests > 0
+		and result.rewritten_reuse_sites > 0
+		and result.rewritten_reuse_sites == result.variant_lookup_requests
+		and result.semantic_checksum != 0
+	)
+
+
+private pure func algorithm_workload_is_valid(
+	algorithm: PreparedReuseLookupAlgorithm,
+	result: PreparedReuseProfileResult,
+) -> Bool:
+	match algorithm:
+		PreparedReuseParentLinearLookup:
+			(
+				result.layout_builds == 0
+				and result.declarations_indexed == 0
+				and result.union_entries_written == 0
+				and result.union_linear_candidates_visited > 0
+			)
+		PreparedReuseIndexedLookup:
+			(
+				result.layout_builds > 0
+				and result.declarations_indexed > 0
+				and result.union_entries_written > 0
+				and result.union_linear_candidates_visited == 0
+			)
+
+
+private pure func checksum_text(seed: Int, text: String) -> Int:
+	bytes = text.to_bytes()
+	var checksum: Int = seed
+	var index: Int = 0
+
+	while index < bytes.length():
+		checksum = checksum * 131 + get_byte(bytes, index).get_or(0)
+		index += 1
+
+	checksum
+
+
+pure func prepared_reuse_profile(config: PreparedReuseProfileConfig) -> PreparedReuseProfileResult:
+	prepared_reuse_profile_with_algorithm(config, PreparedReuseIndexedLookup)
+
+
+pure func prepared_reuse_profile_with_algorithm(
+	config: PreparedReuseProfileConfig,
+	algorithm: PreparedReuseLookupAlgorithm,
+) -> PreparedReuseProfileResult:
+	normalized: PreparedReuseProfileConfig = normalized_config(config)
+	program: CoreProgram = prepared_reuse_profile_program(normalized)
+	rewritten: CoreProgram = prepared_reuse_profile_execute(program, normalized.iterations)
+
+	prepared_reuse_profile_observe_with_algorithm(normalized, program, rewritten, algorithm)
+
+
+pure func prepared_reuse_profile_execute(program: CoreProgram, iterations: Int) -> CoreProgram:
+	normalized_iterations: Int = positive_value(iterations, 1)
+	var rewritten: CoreProgram = rewrite_prepared_program(program)
+	var index: Int = 1
+
+	while index < normalized_iterations:
+		rewritten = rewrite_prepared_program(program)
+		index += 1
+
+	rewritten
+
+
+pure func prepared_reuse_profile_observe(
+	config: PreparedReuseProfileConfig,
+	program: CoreProgram,
+	rewritten: CoreProgram,
+) -> PreparedReuseProfileResult:
+	prepared_reuse_profile_observe_with_algorithm(
+		config,
+		program,
+		rewritten,
+		PreparedReuseIndexedLookup,
+	)
+
+
+pure func prepared_reuse_profile_observe_with_algorithm(
+	config: PreparedReuseProfileConfig,
+	program: CoreProgram,
+	rewritten: CoreProgram,
+	algorithm: PreparedReuseLookupAlgorithm,
+) -> PreparedReuseProfileResult:
+	normalized: PreparedReuseProfileConfig = normalized_config(config)
+	audit: PreparedReuseProfileLookupAudit = audit_prepared_program(program)
+	layout_builds: Int = index_layout_builds(algorithm, normalized.iterations)
+	declarations_indexed: Int = index_declarations_visited(
+		algorithm,
+		program,
+		normalized.iterations,
+	)
+	union_entries_written: Int = index_union_entries_written(
+		algorithm,
+		program,
+		normalized.iterations,
+	)
+	rewritten_reuse_sites: Int = count_reuse_program(rewritten) * normalized.iterations
+	union_lookup_requests: Int = audit.union_lookup_requests * normalized.iterations
+	variant_lookup_requests: Int = audit.variant_lookup_requests * normalized.iterations
+	result: PreparedReuseProfileResult = {
+		layout_builds = layout_builds,
+		declarations_indexed = declarations_indexed,
+		union_entries_written = union_entries_written,
+		union_lookup_requests = union_lookup_requests,
+		union_linear_candidates_visited = choose_union_linear_candidates(
+			algorithm,
+			audit,
+		) * normalized.iterations,
+		variant_lookup_requests = variant_lookup_requests,
+		variant_linear_candidates_visited = audit.variant_linear_candidates_visited * normalized.iterations,
+		prepared_nodes_visited = count_program_expr_nodes(program) * normalized.iterations,
+		rewritten_reuse_sites = rewritten_reuse_sites,
+		semantic_checksum = checksum_text(17, core_program_to_json(rewritten).to_string()),
+		workload_valid = False
+	}
+
+	{ result |
+		workload_valid = (
+			common_workload_is_valid(result)
+			and algorithm_workload_is_valid(algorithm, result)
+		)
+	}

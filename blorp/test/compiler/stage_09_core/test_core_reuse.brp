@@ -1,4 +1,13 @@
 import:
+	../../../benchmark/compiler/compiler_prepared_reuse_decl_profile_fixture:
+		PreparedReuseLookupAlgorithm(PreparedReuseIndexedLookup, PreparedReuseParentLinearLookup),
+		PreparedReuseProfileConfig,
+		prepared_reuse_profile,
+		prepared_reuse_profile_execute,
+		prepared_reuse_profile_mixed_program,
+		prepared_reuse_profile_observe,
+		prepared_reuse_profile_observe_with_algorithm,
+		prepared_reuse_profile_worst_case_program,
 	../../../src/compiler/stage_09_core/ir:
 		CoreAccessor(RootAccessor, VariantFieldAccessor),
 		CoreBoxKind(PointerBox),
@@ -26,7 +35,7 @@ import:
 		CoreConstructorMatchCase,
 		CoreConstructorMatchFallback(ConstructorMatchFallbackFail),
 		CoreConstructorMatchTest(UnionTagConstructorTest),
-		CoreDecl(UnionDecl),
+		CoreDecl(FunctionDecl, GlobalDecl, UnionDecl),
 		CoreDictLiteralEntry,
 		CoreExpr(
 			AccessorLiteralMatchExpr,
@@ -120,6 +129,9 @@ import:
 			WhileExpr,
 		),
 		CoreForList,
+		CoreFunction,
+		CoreFunctionKind(UserFunction),
+		CoreGlobal,
 		CoreHashContainerConstructor(GenericHashContainerConstructor),
 		CoreListHandoffMode(BorrowFreshHandoff, ConsumeReuseHandoff),
 		CoreListHandoffWriteOrder(ForwardCompactingHandoff),
@@ -129,6 +141,7 @@ import:
 		CoreLoopRangeDirection(RangeForwardOnly),
 		CoreMatchBinding,
 		CoreMatchBindingMode(MatchBorrowBindingMode, MatchOwnBindingMode),
+		CoreProgram,
 		CoreRawMatchCase,
 		CoreRecordFieldValue,
 		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy),
@@ -145,8 +158,13 @@ import:
 		CoreUnionField,
 		CoreUnionPayloadStorage(ErasedUnionPayloadStorage),
 		CoreUnionRepresentation(GenericUnionRepresentation),
+		CoreUnionVariant,
 		CoreVar,
-	../../../src/compiler/stage_09_core/reuse: rewrite_post_perceus_expr, rewrite_prepared_expr
+		core_program_to_json,
+	../../../src/compiler/stage_09_core/reuse:
+		rewrite_post_perceus_expr,
+		rewrite_prepared_expr,
+		rewrite_prepared_program,
 	test: TestSuite
 
 
@@ -168,6 +186,10 @@ pure func unique_var(name: String, uniq: Int) -> CoreVar:
 
 pure func expr_type() -> CoreType:
 	UnionType("Expr")
+
+
+pure func union_type(name: String) -> CoreType:
+	UnionType(name)
 
 
 pure func int_type() -> CoreType:
@@ -256,6 +278,76 @@ pure func decls() -> List[CoreDecl]:
 	[UnionDecl(expr_union_decl())]
 
 
+pure func prepared_program(custom_decls: List[CoreDecl], body: CoreExpr) -> CoreProgram:
+	{
+		decls = custom_decls.append(FunctionDecl({
+			name = "entry",
+			source_module = None,
+			type_params = [],
+			params = [],
+			return_type = expr_type(),
+			body = Some(body),
+			is_pure = True,
+			function_kind = UserFunction,
+			def_id = 9001,
+			loc = SyntheticSourceLoc,
+		})),
+		foreign_includes = []
+	}
+
+
+pure func dummy_global_decl(name: String, order_value: Int) -> CoreDecl:
+	GlobalDecl({
+		name = unique_var(name, order_value),
+		source_module = None,
+		typ = int_type(),
+		init = int_expr(order_value),
+		is_mutable = False,
+		is_const = False,
+		is_private = False,
+		def_id = 9100 + order_value,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func union_decl_with_name_and_variants(
+	name: String,
+	variants: List[CoreUnionVariant],
+) -> CoreDecl:
+	UnionDecl({ expr_union_decl() |
+			name = name,
+			variants = variants
+		})
+
+
+pure func variant_with_fields(
+	name: String,
+	tag: Int,
+	fields: List[CoreUnionField],
+) -> CoreUnionVariant:
+	{
+		name = name,
+		c_name = name + "_c",
+		tag_c_name = "TAG_" + name,
+		tag = tag,
+		fields = fields,
+		def_id = Some(9200 + tag)
+	}
+
+
+pure func variant_with_field_policy(name: String, policy: CoreReleasePolicy) -> CoreUnionVariant:
+	variant_with_fields(
+		name,
+		1,
+		[
+			{
+				typ = expr_type(),
+				release_policy = policy
+			},
+		],
+	)
+
+
 pure func expr_var() -> CoreVar:
 	named_var("expr")
 
@@ -276,6 +368,10 @@ pure func expr_var_expr(variable: CoreVar) -> CoreExpr:
 	VarExpr(variable, expr_type(), SyntheticSourceLoc)
 
 
+pure func typed_var_expr(variable: CoreVar, typ: CoreType) -> CoreExpr:
+	VarExpr(variable, typ, SyntheticSourceLoc)
+
+
 pure func pointer_box(value: CoreExpr) -> CoreBoxedStorageValue:
 	{
 		kind = PointerBox,
@@ -286,18 +382,28 @@ pure func pointer_box(value: CoreExpr) -> CoreBoxedStorageValue:
 
 
 pure func add_construct(args: List[CoreBoxedStorageValue]) -> CoreExpr:
+	union_construct("Expr", "Add", "Expr_Add", expr_type(), args)
+
+
+pure func union_construct(
+	type_name: String,
+	constructor_name: String,
+	constructor_c_name: String,
+	typ: CoreType,
+	args: List[CoreBoxedStorageValue],
+) -> CoreExpr:
 	UnionConstructExpr(
 		{
-			type_name = "Expr",
-			constructor_name = "Add",
-			constructor_c_name = "Expr_Add",
+			type_name = type_name,
+			constructor_name = constructor_name,
+			constructor_c_name = constructor_c_name,
 			representation = GenericUnionRepresentation,
 			payload_storage = ErasedUnionPayloadStorage,
 			uses_release_mask = True,
 			release_mask = 3,
 			args = args
 		},
-		expr_type(),
+		typ,
 		SyntheticSourceLoc,
 	)
 
@@ -314,10 +420,21 @@ pure func field_binding(
 	field_index: Int,
 	mode: CoreMatchBindingMode,
 ) -> CoreMatchBinding:
+	field_binding_for(variable, "Expr", "Add", expr_type(), field_index, mode)
+
+
+pure func field_binding_for(
+	variable: CoreVar,
+	type_name: String,
+	constructor_name: String,
+	typ: CoreType,
+	field_index: Int,
+	mode: CoreMatchBindingMode,
+) -> CoreMatchBinding:
 	{
 		variable = variable,
-		typ = expr_type(),
-		accessor = VariantFieldAccessor(RootAccessor, "Expr", "Add", field_index),
+		typ = typ,
+		accessor = VariantFieldAccessor(RootAccessor, type_name, constructor_name, field_index),
 		mode = mode
 	}
 
@@ -337,38 +454,65 @@ pure func borrowed_add_bindings() -> List[CoreMatchBinding]:
 
 
 pure func add_case(bindings: List[CoreMatchBinding], body: CoreExpr) -> CoreConstructorMatchCase:
+	constructor_case("Expr", "Add", bindings, body)
+
+
+pure func constructor_case(
+	type_name: String,
+	constructor_name: String,
+	bindings: List[CoreMatchBinding],
+	body: CoreExpr,
+) -> CoreConstructorMatchCase:
 	{
-		constructor = "Add",
+		constructor = constructor_name,
 		accessor = RootAccessor,
-		test = UnionTagConstructorTest("Expr", "Add"),
+		test = UnionTagConstructorTest(type_name, constructor_name),
 		bindings = bindings,
 		body = ConstructorMatchBodyExpr(body)
 	}
 
 
 pure func prepared_match(bindings: List[CoreMatchBinding], body: CoreExpr) -> CoreExpr:
+	prepared_match_for("Expr", "Add", expr_type(), expr_var_expr(expr_var()), bindings, body)
+
+
+pure func prepared_match_for(
+	type_name: String,
+	constructor_name: String,
+	typ: CoreType,
+	source: CoreExpr,
+	bindings: List[CoreMatchBinding],
+	body: CoreExpr,
+) -> CoreExpr:
 	ConstructorMatchExpr(
-		expr_var_expr(expr_var()),
+		source,
 		ArcReleasePolicy,
-		[add_case(bindings, body)],
+		[constructor_case(type_name, constructor_name, bindings, body)],
 		ConstructorMatchFallbackFail,
-		expr_type(),
+		typ,
 		SyntheticSourceLoc,
 	)
 
 
 pure func prepared_let_drop(bindings: List[CoreMatchBinding], body: CoreExpr) -> CoreExpr:
+	prepared_let_drop_with_type(
+		expr_type(),
+		prepared_match(bindings, body),
+	)
+
+
+pure func prepared_let_drop_with_type(dropped_type: CoreType, rhs: CoreExpr) -> CoreExpr:
 	LetExpr(
 		result_var(),
 		False,
-		expr_type(),
-		prepared_match(bindings, body),
+		dropped_type,
+		rhs,
 		DropExpr(
 			expr_var(),
-			expr_type(),
+			dropped_type,
 			ArcReleasePolicy,
-			expr_var_expr(result_var()),
-			expr_type(),
+			typed_var_expr(result_var(), dropped_type),
+			dropped_type,
 			SyntheticSourceLoc,
 		),
 	)
@@ -1388,6 +1532,386 @@ pure func count_reuse(expr: CoreExpr) -> Int:
 			0
 
 
+pure func count_reuse_in_function(func_info: CoreFunction) -> Int:
+	match func_info.body:
+		Some(body):
+			count_reuse(body)
+		None:
+			0
+
+
+pure func count_reuse_in_decl(decl: CoreDecl) -> Int:
+	match decl:
+		FunctionDecl(func_info):
+			count_reuse_in_function(func_info)
+		GlobalDecl(global):
+			count_reuse(global.init)
+		_:
+			0
+
+
+pure func count_reuse_in_program(program: CoreProgram) -> Int:
+	var total: Int = 0
+
+	for decl in program.decls:
+		total += count_reuse_in_decl(decl)
+
+	total
+
+
+pure func rewrite_program(custom_decls: List[CoreDecl], body: CoreExpr) -> CoreProgram:
+	rewrite_prepared_program(prepared_program(custom_decls, body))
+
+
+pure func rewrite_program_reuse_count(custom_decls: List[CoreDecl], body: CoreExpr) -> Int:
+	count_reuse_in_program(rewrite_program(custom_decls, body))
+
+
+pure func named_expr_type() -> CoreType:
+	NamedType("Expr", [])
+
+
+pure func prepared_named_expr_let_drop(body: CoreExpr) -> CoreExpr:
+	prepared_let_drop_with_type(
+		named_expr_type(),
+		prepared_match_for(
+			"Expr",
+			"Add",
+			named_expr_type(),
+			typed_var_expr(expr_var(), named_expr_type()),
+			owned_add_bindings(),
+			body,
+		),
+	)
+
+
+pure func single_field_variant_decl(policy: CoreReleasePolicy) -> CoreDecl:
+	union_decl_with_name_and_variants("Expr", [variant_with_field_policy("Add", policy)])
+
+
+pure func single_field_construct() -> CoreExpr:
+	add_construct([pointer_box(expr_var_expr(left_var()))])
+
+
+pure func test_prepared_reuse_recognizes_union_declaration_positions() -> Bool:
+	body: CoreExpr = prepared_let_drop(owned_add_bindings(), add_construct_from_fields())
+
+	beginning: Int = rewrite_program_reuse_count(
+		[UnionDecl(expr_union_decl()), dummy_global_decl("after", 1)],
+		body,
+	)
+	middle: Int = rewrite_program_reuse_count(
+		[
+			dummy_global_decl("before", 1),
+			UnionDecl(expr_union_decl()),
+			dummy_global_decl("after", 2),
+		],
+		body,
+	)
+	end: Int = rewrite_program_reuse_count(
+		[
+			dummy_global_decl("before", 1),
+			dummy_global_decl("middle", 2),
+			UnionDecl(expr_union_decl()),
+		],
+		body,
+	)
+
+	beginning == 1 and middle == 1 and end == 1
+
+
+pure func test_prepared_reuse_recognizes_union_and_zero_arg_named_types() -> Bool:
+	union_type_count: Int = rewrite_program_reuse_count(
+		decls(),
+		prepared_let_drop(owned_add_bindings(), add_construct_from_fields()),
+	)
+	named_type_count: Int = rewrite_program_reuse_count(
+		decls(),
+		prepared_named_expr_let_drop(
+			union_construct(
+				"Expr",
+				"Add",
+				"Expr_Add",
+				named_expr_type(),
+				[pointer_box(typed_var_expr(left_var(), named_expr_type()))],
+			),
+		),
+	)
+	parameterized_count: Int = rewrite_program_reuse_count(
+		decls(),
+		prepared_let_drop_with_type(
+			NamedType("Expr", [int_type()]),
+			prepared_match_for(
+				"Expr",
+				"Add",
+				NamedType("Expr", [int_type()]),
+				typed_var_expr(
+					expr_var(),
+					NamedType("Expr", [int_type()]),
+				),
+				owned_add_bindings(),
+				add_construct_from_fields(),
+			),
+		),
+	)
+
+	union_type_count == 1 and named_type_count == 1 and parameterized_count == 0
+
+
+pure func test_prepared_reuse_fails_closed_for_missing_union_or_variant() -> Bool:
+	body: CoreExpr = prepared_let_drop(owned_add_bindings(), add_construct_from_fields())
+	missing_union: Int = rewrite_program_reuse_count([], body)
+	missing_variant: Int = rewrite_program_reuse_count(
+		[union_decl_with_name_and_variants("Expr", [variant_with_fields("Num", 1, [])])],
+		body,
+	)
+
+	missing_union == 0 and missing_variant == 0
+
+
+pure func test_prepared_reuse_keeps_same_spelling_variants_independent() -> Bool:
+	other_type: CoreType = union_type("Other")
+	other_body: CoreExpr = prepared_let_drop_with_type(
+		other_type,
+		prepared_match_for(
+			"Other",
+			"Add",
+			other_type,
+			typed_var_expr(expr_var(), other_type),
+			[],
+			union_construct(
+				"Other",
+				"Add",
+				"Other_Add",
+				other_type,
+				[pointer_box(typed_var_expr(left_var(), other_type))],
+			),
+		),
+	)
+	count: Int = rewrite_program_reuse_count(
+		[
+			union_decl_with_name_and_variants("Expr", [variant_with_fields("Add", 1, [])]),
+			union_decl_with_name_and_variants(
+				"Other",
+				[variant_with_field_policy("Add", ArcReleasePolicy)],
+			),
+		],
+		other_body,
+	)
+
+	count == 0
+
+
+pure func test_prepared_reuse_preserves_release_policy_and_binding_decisions() -> Bool:
+	unmanaged_without_binding: Int = rewrite_program_reuse_count(
+		[single_field_variant_decl(NoReleasePolicy)],
+		prepared_let_drop([], single_field_construct()),
+	)
+	managed_without_binding: Int = rewrite_program_reuse_count(
+		[single_field_variant_decl(ArcReleasePolicy)],
+		prepared_let_drop([], single_field_construct()),
+	)
+	managed_with_direct_binding: Int = rewrite_program_reuse_count(
+		[single_field_variant_decl(ArcReleasePolicy)],
+		prepared_let_drop(
+			[field_binding(left_var(), 0, MatchOwnBindingMode)],
+			single_field_construct(),
+		),
+	)
+	managed_with_wrong_index: Int = rewrite_program_reuse_count(
+		[single_field_variant_decl(ArcReleasePolicy)],
+		prepared_let_drop(
+			[field_binding(left_var(), 1, MatchOwnBindingMode)],
+			single_field_construct(),
+		),
+	)
+
+	(
+		unmanaged_without_binding == 1
+		and managed_without_binding == 0
+		and managed_with_direct_binding == 1
+		and managed_with_wrong_index == 0
+	)
+
+
+pure func test_prepared_reuse_preserves_last_match_duplicate_behavior() -> Bool:
+	duplicate_union_count: Int = rewrite_program_reuse_count(
+		[single_field_variant_decl(ArcReleasePolicy), single_field_variant_decl(NoReleasePolicy)],
+		prepared_let_drop(
+			[],
+			single_field_construct(),
+		),
+	)
+	duplicate_variant_count: Int = rewrite_program_reuse_count(
+		[
+			union_decl_with_name_and_variants(
+				"Expr",
+				[
+					variant_with_field_policy("Add", ArcReleasePolicy),
+					variant_with_field_policy("Add", NoReleasePolicy),
+				],
+			),
+		],
+		prepared_let_drop(
+			[],
+			single_field_construct(),
+		),
+	)
+
+	duplicate_union_count == 1 and duplicate_variant_count == 1
+
+
+pure func test_prepared_reuse_preserves_unrewritten_declaration_order_json() -> Bool:
+	program: CoreProgram = prepared_program(
+		[
+			dummy_global_decl("first", 1),
+			UnionDecl(expr_union_decl()),
+			dummy_global_decl("second", 2),
+		],
+		int_expr(7),
+	)
+
+	core_program_to_json(
+		rewrite_prepared_program(program),
+	).to_string() == core_program_to_json(program).to_string()
+
+
+pure func deeply_nested_if_result(depth: Int) -> CoreExpr:
+	var body: CoreExpr = add_construct_from_fields()
+	var index: Int = 0
+
+	while index < depth:
+		body = IfExpr(
+			bool_expr(True),
+			body,
+			add_construct_from_fields(),
+			expr_type(),
+			SyntheticSourceLoc,
+		)
+		index += 1
+
+	body
+
+
+pure func test_prepared_reuse_rewrites_deep_nested_match_result() -> Bool:
+	depth: Int = 128
+	body: CoreExpr = prepared_let_drop(owned_add_bindings(), deeply_nested_if_result(depth))
+
+	rewrite_program_reuse_count(decls(), body) == depth + 1
+
+
+pure func prepared_reuse_profile_target_union_index(program: CoreProgram) -> Int:
+	var result: Int = -1
+	var index: Int = 0
+
+	for decl in program.decls:
+		match decl:
+			UnionDecl(union_decl):
+				if union_decl.name == "PreparedReuseTarget":
+					result = index
+				else:
+					void
+			_:
+				void
+
+		index += 1
+
+	result
+
+
+pure func test_prepared_reuse_profile_fixture_layouts_are_explicit() -> Bool:
+	config: PreparedReuseProfileConfig = {
+		iterations = 1,
+		declarations = 64,
+		union_count = 8,
+		variants_per_union = 4,
+		prepared_match_count = 32
+	}
+	worst_program: CoreProgram = prepared_reuse_profile_worst_case_program(config)
+	mixed_program: CoreProgram = prepared_reuse_profile_mixed_program(config)
+	mixed_rewritten: CoreProgram = prepared_reuse_profile_execute(mixed_program, 1)
+	mixed_result = prepared_reuse_profile_observe(config, mixed_program, mixed_rewritten)
+	worst_target_index: Int = prepared_reuse_profile_target_union_index(worst_program)
+	mixed_target_index: Int = prepared_reuse_profile_target_union_index(mixed_program)
+
+	(
+		worst_program.decls.length() == 64
+		and worst_target_index == 63
+		and mixed_program.decls.length() == 64
+		and mixed_target_index > 0
+		and mixed_target_index < 63
+		and mixed_result.workload_valid
+	)
+
+
+pure func test_prepared_reuse_profile_observes_parent_and_indexed_lookup_work() -> Bool:
+	config: PreparedReuseProfileConfig = {
+		iterations = 1,
+		declarations = 64,
+		union_count = 8,
+		variants_per_union = 4,
+		prepared_match_count = 32
+	}
+	program: CoreProgram = prepared_reuse_profile_worst_case_program(config)
+	rewritten: CoreProgram = prepared_reuse_profile_execute(program, config.iterations)
+	parent_result = prepared_reuse_profile_observe_with_algorithm(
+		config,
+		program,
+		rewritten,
+		PreparedReuseParentLinearLookup,
+	)
+	indexed_result = prepared_reuse_profile_observe_with_algorithm(
+		config,
+		program,
+		rewritten,
+		PreparedReuseIndexedLookup,
+	)
+	expected_union_requests: Int = config.prepared_match_count * 2
+	expected_variant_requests: Int = config.prepared_match_count
+
+	(
+		parent_result.workload_valid
+		and indexed_result.workload_valid
+		and parent_result.layout_builds == 0
+		and parent_result.declarations_indexed == 0
+		and parent_result.union_entries_written == 0
+		and parent_result.union_lookup_requests == expected_union_requests
+		and parent_result.union_linear_candidates_visited == expected_union_requests * program.decls.length()
+		and parent_result.variant_lookup_requests == expected_variant_requests
+		and parent_result.variant_linear_candidates_visited == expected_variant_requests * config.variants_per_union
+		and indexed_result.layout_builds == 1
+		and indexed_result.declarations_indexed == program.decls.length()
+		and indexed_result.union_entries_written == config.union_count
+		and indexed_result.union_lookup_requests == expected_union_requests
+		and indexed_result.union_linear_candidates_visited == 0
+		and indexed_result.variant_lookup_requests == expected_variant_requests
+		and indexed_result.variant_linear_candidates_visited == expected_variant_requests * config.variants_per_union
+	)
+
+
+pure func test_prepared_reuse_profile_reports_indexed_declaration_work() -> Bool:
+	config: PreparedReuseProfileConfig = {
+		iterations = 1,
+		declarations = 64,
+		union_count = 8,
+		variants_per_union = 4,
+		prepared_match_count = 32
+	}
+	result = prepared_reuse_profile(config)
+
+	(
+		result.workload_valid
+		and result.layout_builds == 1
+		and result.declarations_indexed == 64
+		and result.union_entries_written == 8
+		and result.union_lookup_requests == 64
+		and result.union_linear_candidates_visited == 0
+		and result.variant_lookup_requests == 32
+		and result.variant_linear_candidates_visited == 128
+		and result.rewritten_reuse_sites == 32
+	)
+
+
 pure func test_rewrites_owned_union_match_result() -> Bool:
 	rewritten: CoreExpr = rewrite_expr(
 		prepared_let_drop(
@@ -1764,6 +2288,50 @@ tests: TestSuite = {
 			test_rejects_dead_record_allocation_that_assigns_source,
 		),
 		("upgrades post handoff drop", test_upgrades_post_handoff_drop),
+		(
+			"prepared reuse recognizes union declaration positions",
+			test_prepared_reuse_recognizes_union_declaration_positions,
+		),
+		(
+			"prepared reuse recognizes union and zero-argument named types",
+			test_prepared_reuse_recognizes_union_and_zero_arg_named_types,
+		),
+		(
+			"prepared reuse fails closed for missing union or variant",
+			test_prepared_reuse_fails_closed_for_missing_union_or_variant,
+		),
+		(
+			"prepared reuse keeps same-spelling variants independent",
+			test_prepared_reuse_keeps_same_spelling_variants_independent,
+		),
+		(
+			"prepared reuse preserves release policy and binding decisions",
+			test_prepared_reuse_preserves_release_policy_and_binding_decisions,
+		),
+		(
+			"prepared reuse preserves last-match duplicate behavior",
+			test_prepared_reuse_preserves_last_match_duplicate_behavior,
+		),
+		(
+			"prepared reuse preserves unrewritten declaration order JSON",
+			test_prepared_reuse_preserves_unrewritten_declaration_order_json,
+		),
+		(
+			"prepared reuse rewrites deep nested match result",
+			test_prepared_reuse_rewrites_deep_nested_match_result,
+		),
+		(
+			"prepared reuse profile fixture layouts are explicit",
+			test_prepared_reuse_profile_fixture_layouts_are_explicit,
+		),
+		(
+			"prepared reuse profile observes parent and indexed lookup work",
+			test_prepared_reuse_profile_observes_parent_and_indexed_lookup_work,
+		),
+		(
+			"prepared reuse profile reports indexed declaration work",
+			test_prepared_reuse_profile_reports_indexed_declaration_work,
+		),
 		("rewrites owned union match result", test_rewrites_owned_union_match_result),
 		("rejects borrowed union match fields", test_rejects_borrowed_union_match_fields),
 		("reuses all if branches", test_reuses_all_if_branches),

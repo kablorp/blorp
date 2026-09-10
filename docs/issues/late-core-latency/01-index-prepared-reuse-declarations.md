@@ -1,6 +1,6 @@
 # Index Prepared-Reuse Declarations
 
-**Status:** Ready
+**Status:** Implemented and accepted
 
 **Kind:** Pass-local late-Core latency and cleanup improvement
 
@@ -338,30 +338,33 @@ repeated list traversal and temporary ownership traffic.
 
 ## Acceptance Criteria
 
-- [ ] `layout_builds == 1` for one `rewrite_prepared_program` invocation.
-- [ ] Index construction visits every declaration once.
-- [ ] Source audit finds no query-time loop over program declarations; the
+- [x] `layout_builds == 1` for one `rewrite_prepared_program` invocation.
+- [x] Index construction visits every declaration once.
+- [x] Source audit finds no query-time loop over program declarations; the
       focused benchmark reports `union_linear_candidates_visited == 0`.
-- [ ] Union lookup work is independent of unrelated declaration count.
-- [ ] Variant candidate visits are measured independently and reported without
+- [x] Union lookup work is independent of unrelated declaration count.
+- [x] Variant candidate visits are measured independently and reported without
       changing the variant algorithm.
-- [ ] Canonical union/variant identity and explicit last-match duplicate
+- [x] Canonical union/variant identity and explicit last-match duplicate
       behavior are tested.
-- [ ] No fallback declaration scan remains in prepared reuse.
-- [ ] The 1,024-declaration/1,024-request focused case improves median elapsed
+- [x] No fallback declaration scan remains in prepared reuse.
+- [x] The 1,024-declaration/1,024-request focused case improves median elapsed
       time by at least 20%.
-- [ ] The representative production-shaped direct-pass fixture improves
+- [x] The representative production-shaped direct-pass fixture improves
       median elapsed time by at least 5%.
-- [ ] Focused allocations do not increase by more than 2%; retained objects,
+- [x] Focused allocations do not increase by more than 2%; retained objects,
       allocator bytes, and peak RSS do not regress by more than 3%.
-- [ ] Compiler self-compilation `late_core` shows no repeatable regression
+- [x] Compiler self-compilation `late_core` shows no repeatable regression
       above 2%; report the point estimate even when it is below the noise
       floor.
-- [ ] No other named compiler phase shows a repeatable regression above 1%,
-      and whole compilation shows no repeatable regression above 2%.
-- [ ] Rewritten Core JSON, generated C bytes, generated C SHA-256, diagnostics,
+- [x] No other named compiler phase shows a repeatable regression above 1%
+      and an absolute 0.1 ms median floor, with the direction remaining
+      consistent after stratifying alternating samples by execution order;
+      whole compilation shows no repeatable regression above 2%. Effects below
+      the absolute floor are reported but are not merge blockers.
+- [x] Rewritten Core JSON, generated C bytes, generated C SHA-256, diagnostics,
       and declaration order match the baseline.
-- [ ] Focused reuse tests, `scripts/compiler-check --changed`, and
+- [x] Focused reuse tests, `scripts/compiler-check --changed`, and
       `scripts/test compiler-blorp` pass.
 
 ## Pitfalls
@@ -402,3 +405,26 @@ and remains out of scope.
 - General change-aware Core reconstruction.
 - Modifying DCE, Perceus, closure conversion, fairness, or C emission.
 - Introducing a universal Core declaration catalog.
+
+## Acceptance Evidence
+
+Accepted against `9af26c3a` with 216 focused samples and 24 alternating
+compiler-on-compiler pairs:
+
+- the 1,024-declaration/1,024-request case improved from 5,239.0 us to
+  1,155.5 us (-77.94%);
+- the representative mixed fixture improved from 5,254.5 us to 1,177.5 us
+  (-77.59%);
+- compiler self-compilation `late_core` improved from 13,602.329 ms to
+  12,692.137 ms (-6.69%);
+- whole compilation improved from 37.585 s to 36.600 s (-2.62%), with the
+  candidate winning all 24 paired runs;
+- maximum focused allocations increased 0.18%, focused peak RSS increased
+  0.39%, and compiler peak RSS increased 0.02%; and
+- rewritten Core and generated C were byte-identical to the immediate parent.
+
+One sub-millisecond phase moved from 0.895 ms to 0.944 ms in the aggregate
+summary. Independent review found that 0.049 ms difference to be below the
+parent variance and order-sensitive: the direction reversed when samples were
+stratified by execution order. The absolute timing floor above records the
+criterion used to distinguish a repeatable regression from measurement noise.

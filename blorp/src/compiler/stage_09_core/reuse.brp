@@ -224,6 +224,11 @@ record SourceAlias {
 }
 
 
+private record PreparedReuseLayout {
+	variants_by_union_name: Dict[String, List[CoreUnionVariant]]
+}
+
+
 pure func core_var_equal(left: CoreVar, right: CoreVar) -> Bool:
 	left.name == right.name and left.uniq == right.uniq
 
@@ -3003,14 +3008,24 @@ pure func union_reuse_constructor_name(type_name: String, constructor_c_name: St
 	"__blorp_reuse_" + type_name + "_" + constructor_c_name
 
 
-pure func find_union_decl(decls: List[CoreDecl], name: String) -> Option[CoreUnionDecl]:
-	var result: Option[CoreUnionDecl] = None
+private pure func record_last_prepared_reuse_union(
+	by_name: Dict[String, List[CoreUnionVariant]],
+	union_decl: CoreUnionDecl,
+) -> Dict[String, List[CoreUnionVariant]]:
+	-- Deliberately preserve the previous full scan's last-match behavior.
+	by_name.set(union_decl.name, union_decl.variants)
 
-	for decl in decls:
+
+private pure func build_prepared_reuse_layout(program: CoreProgram) -> PreparedReuseLayout:
+	var variants_by_union_name: Dict[String, List[CoreUnionVariant]] = {}
+
+	for decl in program.decls:
 		match decl:
 			UnionDecl(union_decl):
-				if union_decl.name == name:
-					result = Some(union_decl)
+				variants_by_union_name = record_last_prepared_reuse_union(
+					variants_by_union_name,
+					union_decl,
+				)
 			FunctionDecl(func_info):
 				void
 			GlobalDecl(global):
@@ -3028,34 +3043,44 @@ pure func find_union_decl(decls: List[CoreDecl], name: String) -> Option[CoreUni
 			ImplDecl(impl_decl):
 				void
 
-	result
+	{variants_by_union_name = variants_by_union_name}
 
 
-pure func find_union_variant(
-	union_decl: CoreUnionDecl,
+private pure func prepared_reuse_union(
+	layout: PreparedReuseLayout,
+	type_name: String,
+) -> Option[List[CoreUnionVariant]]:
+	layout.variants_by_union_name.get(type_name)
+
+
+private pure func find_union_variant(
+	variants: List[CoreUnionVariant],
 	constructor_name: String,
 ) -> Option[CoreUnionVariant]:
 	var result: Option[CoreUnionVariant] = None
 
-	for variant in union_decl.variants:
+	for variant in variants:
 		if variant.name == constructor_name:
 			result = Some(variant)
 
 	result
 
 
-pure func prepared_union_type_name(decls: List[CoreDecl], typ: CoreType) -> Option[String]:
+private pure func prepared_reuse_union_type_name(
+	layout: PreparedReuseLayout,
+	typ: CoreType,
+) -> Option[String]:
 	match typ:
 		UnionType(name):
-			match find_union_decl(decls, name):
-				Some(union_decl):
+			match prepared_reuse_union(layout, name):
+				Some(variants):
 					Some(name)
 				None:
 					None
 		NamedType(name, args):
 			if args.length() == 0:
-				match find_union_decl(decls, name):
-					Some(union_decl):
+				match prepared_reuse_union(layout, name):
+					Some(variants):
 						Some(name)
 					None:
 						None
@@ -3172,15 +3197,15 @@ pure func has_direct_owned_field_binding(
 	found
 
 
-pure func leaf_owns_managed_variant_fields(
-	decls: List[CoreDecl],
+private pure func leaf_owns_managed_variant_fields(
+	layout: PreparedReuseLayout,
 	type_name: String,
 	constructor_name: String,
 	bindings: List[CoreMatchBinding],
 ) -> Bool:
-	match find_union_decl(decls, type_name):
-		Some(union_decl):
-			match find_union_variant(union_decl, constructor_name):
+	match prepared_reuse_union(layout, type_name):
+		Some(variants):
+			match find_union_variant(variants, constructor_name):
 				Some(variant):
 					var owns_fields: Bool = True
 					var index: Int = 0
@@ -3734,8 +3759,7 @@ pure func union_reuse_construct(
 	}
 
 
-pure func rewrite_prepared_union_result(
-	decls: List[CoreDecl],
+private pure func rewrite_prepared_union_result(
 	source: CoreExpr,
 	source_name: String,
 	aliases: List[SourceAlias],
@@ -3774,7 +3798,6 @@ pure func rewrite_prepared_union_result(
 				None
 		IfExpr(cond, then_expr, else_expr, typ, loc):
 			then_rewritten ?= rewrite_prepared_union_result(
-				decls,
 				source,
 				source_name,
 				aliases,
@@ -3782,7 +3805,6 @@ pure func rewrite_prepared_union_result(
 				then_expr,
 			)
 			else_rewritten ?= rewrite_prepared_union_result(
-				decls,
 				source,
 				source_name,
 				aliases,
@@ -3796,7 +3818,6 @@ pure func rewrite_prepared_union_result(
 			else:
 				binding_aliases: Bool = result_may_alias_source(source_name, aliases, rhs)
 				body_rewritten ?= rewrite_prepared_union_result(
-					decls,
 					source,
 					source_name,
 					update_bool_assoc(variable.name, binding_aliases, aliases),
@@ -3810,7 +3831,6 @@ pure func rewrite_prepared_union_result(
 			else:
 				binding_aliases: Bool = result_may_alias_source(source_name, aliases, rhs)
 				body_rewritten ?= rewrite_prepared_union_result(
-					decls,
 					source,
 					source_name,
 					update_bool_assoc(variable.name, binding_aliases, aliases),
@@ -3820,7 +3840,6 @@ pure func rewrite_prepared_union_result(
 				Some(BorrowLetExpr(variable, value_type, rhs, body_rewritten))
 		SeqExpr(head, tail):
 			tail_rewritten ?= rewrite_prepared_union_result(
-				decls,
 				source,
 				source_name,
 				aliases,
@@ -3994,8 +4013,8 @@ pure func rewrite_prepared_union_result(
 			None
 
 
-pure func rewrite_leaf_expr(
-	decls: List[CoreDecl],
+private pure func rewrite_leaf_expr(
+	layout: PreparedReuseLayout,
 	source: CoreExpr,
 	source_name: String,
 	type_name: String,
@@ -4005,8 +4024,8 @@ pure func rewrite_leaf_expr(
 ) -> Option[CoreExpr]:
 	match current_constructor:
 		Some(constructor_name):
-			if leaf_owns_managed_variant_fields(decls, type_name, constructor_name, bindings):
-				rewrite_prepared_union_result(decls, source, source_name, [], type_name, body)
+			if leaf_owns_managed_variant_fields(layout, type_name, constructor_name, bindings):
+				rewrite_prepared_union_result(source, source_name, [], type_name, body)
 			else:
 				None
 		None:
@@ -4048,8 +4067,8 @@ pure func constructor_for_case(
 			current_constructor
 
 
-pure func rewrite_constructor_match_body(
-	decls: List[CoreDecl],
+private pure func rewrite_constructor_match_body(
+	layout: PreparedReuseLayout,
 	source: CoreExpr,
 	source_name: String,
 	type_name: String,
@@ -4060,7 +4079,7 @@ pure func rewrite_constructor_match_body(
 	match body:
 		ConstructorMatchBodyExpr(expr):
 			rewritten ?= rewrite_leaf_expr(
-				decls,
+				layout,
 				source,
 				source_name,
 				type_name,
@@ -4071,7 +4090,7 @@ pure func rewrite_constructor_match_body(
 			Some(ConstructorMatchBodyExpr(rewritten))
 		ConstructorMatchBodyLiteral(match_expr):
 			rewritten ?= rewrite_constructor_literal_match(
-				decls,
+				layout,
 				source,
 				source_name,
 				type_name,
@@ -4082,7 +4101,7 @@ pure func rewrite_constructor_match_body(
 			Some(ConstructorMatchBodyLiteral(rewritten))
 		ConstructorMatchBodyLength(match_expr):
 			rewritten ?= rewrite_constructor_length_match(
-				decls,
+				layout,
 				source,
 				source_name,
 				type_name,
@@ -4093,8 +4112,8 @@ pure func rewrite_constructor_match_body(
 			Some(ConstructorMatchBodyLength(rewritten))
 
 
-pure func rewrite_constructor_match_case(
-	decls: List[CoreDecl],
+private pure func rewrite_constructor_match_case(
+	layout: PreparedReuseLayout,
 	source: CoreExpr,
 	source_name: String,
 	type_name: String,
@@ -4103,7 +4122,7 @@ pure func rewrite_constructor_match_case(
 ) -> Option[CoreConstructorMatchCase]:
 	case_constructor: Option[String] = constructor_for_case(current_constructor, match_case)
 	body ?= rewrite_constructor_match_body(
-		decls,
+		layout,
 		source,
 		source_name,
 		type_name,
@@ -4114,8 +4133,8 @@ pure func rewrite_constructor_match_case(
 	Some({ match_case | body = body })
 
 
-pure func rewrite_constructor_match_cases(
-	decls: List[CoreDecl],
+private pure func rewrite_constructor_match_cases(
+	layout: PreparedReuseLayout,
 	source: CoreExpr,
 	source_name: String,
 	type_name: String,
@@ -4127,7 +4146,7 @@ pure func rewrite_constructor_match_cases(
 
 	for match_case in cases:
 		match rewrite_constructor_match_case(
-			decls,
+			layout,
 			source,
 			source_name,
 			type_name,
@@ -4146,8 +4165,8 @@ pure func rewrite_constructor_match_cases(
 		Some(rewritten)
 
 
-pure func rewrite_constructor_match_fallback(
-	decls: List[CoreDecl],
+private pure func rewrite_constructor_match_fallback(
+	layout: PreparedReuseLayout,
 	source: CoreExpr,
 	source_name: String,
 	type_name: String,
@@ -4157,7 +4176,7 @@ pure func rewrite_constructor_match_fallback(
 	match fallback:
 		ConstructorMatchFallbackBody(body):
 			rewritten ?= rewrite_leaf_expr(
-				decls,
+				layout,
 				source,
 				source_name,
 				type_name,
@@ -4168,7 +4187,7 @@ pure func rewrite_constructor_match_fallback(
 			Some(ConstructorMatchFallbackBody(rewritten))
 		ConstructorMatchFallbackBindings(bindings, body):
 			rewritten ?= rewrite_leaf_expr(
-				decls,
+				layout,
 				source,
 				source_name,
 				type_name,
@@ -4181,8 +4200,8 @@ pure func rewrite_constructor_match_fallback(
 			Some(ConstructorMatchFallbackFail)
 
 
-pure func rewrite_literal_match_case(
-	decls: List[CoreDecl],
+private pure func rewrite_literal_match_case(
+	layout: PreparedReuseLayout,
 	source: CoreExpr,
 	source_name: String,
 	type_name: String,
@@ -4192,7 +4211,7 @@ pure func rewrite_literal_match_case(
 ) -> Option[CoreLiteralMatchCase]:
 	bindings: List[CoreMatchBinding] = append_bindings(parent_bindings, match_case.bindings)
 	body ?= rewrite_leaf_expr(
-		decls,
+		layout,
 		source,
 		source_name,
 		type_name,
@@ -4203,8 +4222,8 @@ pure func rewrite_literal_match_case(
 	Some({ match_case | body = body })
 
 
-pure func rewrite_literal_match_cases(
-	decls: List[CoreDecl],
+private pure func rewrite_literal_match_cases(
+	layout: PreparedReuseLayout,
 	source: CoreExpr,
 	source_name: String,
 	type_name: String,
@@ -4217,7 +4236,7 @@ pure func rewrite_literal_match_cases(
 
 	for match_case in cases:
 		match rewrite_literal_match_case(
-			decls,
+			layout,
 			source,
 			source_name,
 			type_name,
@@ -4237,8 +4256,8 @@ pure func rewrite_literal_match_cases(
 		Some(rewritten)
 
 
-pure func rewrite_literal_match_fallback(
-	decls: List[CoreDecl],
+private pure func rewrite_literal_match_fallback(
+	layout: PreparedReuseLayout,
 	source: CoreExpr,
 	source_name: String,
 	type_name: String,
@@ -4249,7 +4268,7 @@ pure func rewrite_literal_match_fallback(
 	match fallback:
 		LiteralMatchFallbackBody(body):
 			rewritten ?= rewrite_leaf_expr(
-				decls,
+				layout,
 				source,
 				source_name,
 				type_name,
@@ -4261,7 +4280,7 @@ pure func rewrite_literal_match_fallback(
 		LiteralMatchFallbackBindings(bindings, body):
 			combined: List[CoreMatchBinding] = append_bindings(parent_bindings, bindings)
 			rewritten ?= rewrite_leaf_expr(
-				decls,
+				layout,
 				source,
 				source_name,
 				type_name,
@@ -4274,8 +4293,8 @@ pure func rewrite_literal_match_fallback(
 			Some(LiteralMatchFallbackFail)
 
 
-pure func rewrite_constructor_literal_match(
-	decls: List[CoreDecl],
+private pure func rewrite_constructor_literal_match(
+	layout: PreparedReuseLayout,
 	source: CoreExpr,
 	source_name: String,
 	type_name: String,
@@ -4284,7 +4303,7 @@ pure func rewrite_constructor_literal_match(
 	match_expr: CoreConstructorLiteralMatch,
 ) -> Option[CoreConstructorLiteralMatch]:
 	cases ?= rewrite_literal_match_cases(
-		decls,
+		layout,
 		source,
 		source_name,
 		type_name,
@@ -4293,7 +4312,7 @@ pure func rewrite_constructor_literal_match(
 		match_expr.cases,
 	)
 	fallback ?= rewrite_literal_match_fallback(
-		decls,
+		layout,
 		source,
 		source_name,
 		type_name,
@@ -4307,8 +4326,8 @@ pure func rewrite_constructor_literal_match(
 		})
 
 
-pure func rewrite_constructor_length_branch(
-	decls: List[CoreDecl],
+private pure func rewrite_constructor_length_branch(
+	layout: PreparedReuseLayout,
 	source: CoreExpr,
 	source_name: String,
 	type_name: String,
@@ -4318,7 +4337,7 @@ pure func rewrite_constructor_length_branch(
 ) -> Option[CoreConstructorLengthMatchBranch]:
 	bindings: List[CoreMatchBinding] = append_bindings(parent_bindings, branch.bindings)
 	body ?= rewrite_constructor_match_body(
-		decls,
+		layout,
 		source,
 		source_name,
 		type_name,
@@ -4329,8 +4348,8 @@ pure func rewrite_constructor_length_branch(
 	Some({ branch | body = body })
 
 
-pure func rewrite_constructor_length_case(
-	decls: List[CoreDecl],
+private pure func rewrite_constructor_length_case(
+	layout: PreparedReuseLayout,
 	source: CoreExpr,
 	source_name: String,
 	type_name: String,
@@ -4339,7 +4358,7 @@ pure func rewrite_constructor_length_case(
 	match_case: CoreConstructorLengthMatchCase,
 ) -> Option[CoreConstructorLengthMatchCase]:
 	branch ?= rewrite_constructor_length_branch(
-		decls,
+		layout,
 		source,
 		source_name,
 		type_name,
@@ -4350,8 +4369,8 @@ pure func rewrite_constructor_length_case(
 	Some({ match_case | branch = branch })
 
 
-pure func rewrite_constructor_length_cases(
-	decls: List[CoreDecl],
+private pure func rewrite_constructor_length_cases(
+	layout: PreparedReuseLayout,
 	source: CoreExpr,
 	source_name: String,
 	type_name: String,
@@ -4364,7 +4383,7 @@ pure func rewrite_constructor_length_cases(
 
 	for match_case in cases:
 		match rewrite_constructor_length_case(
-			decls,
+			layout,
 			source,
 			source_name,
 			type_name,
@@ -4384,8 +4403,8 @@ pure func rewrite_constructor_length_cases(
 		Some(rewritten)
 
 
-pure func rewrite_constructor_length_geq(
-	decls: List[CoreDecl],
+private pure func rewrite_constructor_length_geq(
+	layout: PreparedReuseLayout,
 	source: CoreExpr,
 	source_name: String,
 	type_name: String,
@@ -4396,7 +4415,7 @@ pure func rewrite_constructor_length_geq(
 	match geq:
 		Some(value):
 			match rewrite_constructor_length_branch(
-				decls,
+				layout,
 				source,
 				source_name,
 				type_name,
@@ -4412,8 +4431,8 @@ pure func rewrite_constructor_length_geq(
 			Some(None)
 
 
-pure func rewrite_constructor_length_fallback(
-	decls: List[CoreDecl],
+private pure func rewrite_constructor_length_fallback(
+	layout: PreparedReuseLayout,
 	source: CoreExpr,
 	source_name: String,
 	type_name: String,
@@ -4424,7 +4443,7 @@ pure func rewrite_constructor_length_fallback(
 	match fallback:
 		Some(branch):
 			match rewrite_constructor_length_branch(
-				decls,
+				layout,
 				source,
 				source_name,
 				type_name,
@@ -4440,8 +4459,8 @@ pure func rewrite_constructor_length_fallback(
 			Some(None)
 
 
-pure func rewrite_constructor_length_match(
-	decls: List[CoreDecl],
+private pure func rewrite_constructor_length_match(
+	layout: PreparedReuseLayout,
 	source: CoreExpr,
 	source_name: String,
 	type_name: String,
@@ -4450,7 +4469,7 @@ pure func rewrite_constructor_length_match(
 	match_expr: CoreConstructorLengthMatch,
 ) -> Option[CoreConstructorLengthMatch]:
 	cases ?= rewrite_constructor_length_cases(
-		decls,
+		layout,
 		source,
 		source_name,
 		type_name,
@@ -4459,7 +4478,7 @@ pure func rewrite_constructor_length_match(
 		match_expr.cases,
 	)
 	geq ?= rewrite_constructor_length_geq(
-		decls,
+		layout,
 		source,
 		source_name,
 		type_name,
@@ -4468,7 +4487,7 @@ pure func rewrite_constructor_length_match(
 		match_expr.geq,
 	)
 	fallback ?= rewrite_constructor_length_fallback(
-		decls,
+		layout,
 		source,
 		source_name,
 		type_name,
@@ -4483,8 +4502,8 @@ pure func rewrite_constructor_length_match(
 		})
 
 
-pure func rewrite_prepared_drop_result(
-	decls: List[CoreDecl],
+private pure func rewrite_prepared_drop_result(
+	layout: PreparedReuseLayout,
 	binding_var: CoreVar,
 	binding_rhs: CoreExpr,
 	dropped_var: CoreVar,
@@ -4492,7 +4511,7 @@ pure func rewrite_prepared_drop_result(
 	result: CoreExpr,
 ) -> Option[CoreExpr]:
 	if core_expr_is_var(result, binding_var):
-		type_name ?= prepared_union_type_name(decls, dropped_type)
+		type_name ?= prepared_reuse_union_type_name(layout, dropped_type)
 
 		match binding_rhs:
 			RawMatchExpr(scrutinee, cases, typ, loc):
@@ -4502,7 +4521,7 @@ pure func rewrite_prepared_drop_result(
 			ConstructorMatchExpr(source, scrutinee_release_policy, cases, fallback, match_type, match_loc):
 				if core_expr_is_var(source, dropped_var):
 					rewritten_cases ?= rewrite_constructor_match_cases(
-						decls,
+						layout,
 						source,
 						dropped_var.name,
 						type_name,
@@ -4510,7 +4529,7 @@ pure func rewrite_prepared_drop_result(
 						cases,
 					)
 					rewritten_fallback ?= rewrite_constructor_match_fallback(
-						decls,
+						layout,
 						source,
 						dropped_var.name,
 						type_name,
@@ -4706,7 +4725,7 @@ pure func rewrite_prepared_drop_result(
 
 
 private pure func rewrite_prepared_let_drop(
-	decls: List[CoreDecl],
+	layout: PreparedReuseLayout,
 	binding_var: CoreVar,
 	binding_rhs: CoreExpr,
 	body: CoreExpr,
@@ -4718,7 +4737,7 @@ private pure func rewrite_prepared_let_drop(
 			None
 		DropExpr(dropped_var, dropped_type, release_policy, result, drop_type, drop_loc):
 			rewrite_prepared_drop_result(
-				decls,
+				layout,
 				binding_var,
 				binding_rhs,
 				dropped_var,
@@ -4899,22 +4918,33 @@ private pure func rewrite_prepared_let_drop(
 			None
 
 
-pure func rewrite_prepared_expr(decls: List[CoreDecl], expr: CoreExpr) -> CoreExpr:
+private pure func rewrite_prepared_expr_with_layout(
+	layout: PreparedReuseLayout,
+	expr: CoreExpr,
+) -> CoreExpr:
 	match expr:
 		RawMatchExpr(scrutinee, cases, typ, loc):
 			RawMatchExpr(
-				rewrite_prepared_expr(decls, scrutinee),
-				cases.map(func(case): { case | body = rewrite_prepared_expr(decls, case.body) }),
+				rewrite_prepared_expr_with_layout(layout, scrutinee),
+				cases.map(
+					func(
+						case,
+					): { case | body = rewrite_prepared_expr_with_layout(layout, case.body) },
+				),
 				typ,
 				loc,
 			)
 		SemanticMatchExpr(scrutinee, tree, typ, loc):
-			CoreTraverse.map_core_expr_children_with_context(expr, decls, rewrite_prepared_expr)
+			CoreTraverse.map_core_expr_children_with_context(
+				expr,
+				layout,
+				rewrite_prepared_expr_with_layout,
+			)
 		LetExpr(variable, is_mutable, value_type, rhs, body):
-			rewritten_rhs: CoreExpr = rewrite_prepared_expr(decls, rhs)
-			rewritten_body: CoreExpr = rewrite_prepared_expr(decls, body)
+			rewritten_rhs: CoreExpr = rewrite_prepared_expr_with_layout(layout, rhs)
+			rewritten_body: CoreExpr = rewrite_prepared_expr_with_layout(layout, body)
 
-			match rewrite_prepared_let_drop(decls, variable, rewritten_rhs, rewritten_body):
+			match rewrite_prepared_let_drop(layout, variable, rewritten_rhs, rewritten_body):
 				Some(rewritten):
 					rewritten
 				None:
@@ -4923,15 +4953,15 @@ pure func rewrite_prepared_expr(decls: List[CoreDecl], expr: CoreExpr) -> CoreEx
 			BorrowLetExpr(
 				variable,
 				value_type,
-				rewrite_prepared_expr(decls, rhs),
-				rewrite_prepared_expr(decls, body),
+				rewrite_prepared_expr_with_layout(layout, rhs),
+				rewrite_prepared_expr_with_layout(layout, body),
 			)
 		DropExpr(variable, value_type, release_policy, body, typ, loc):
 			DropExpr(
 				variable,
 				value_type,
 				release_policy,
-				rewrite_prepared_expr(decls, body),
+				rewrite_prepared_expr_with_layout(layout, body),
 				typ,
 				loc,
 			)
@@ -4940,29 +4970,29 @@ pure func rewrite_prepared_expr(decls: List[CoreDecl], expr: CoreExpr) -> CoreEx
 				variable,
 				value_type,
 				retain_policy,
-				rewrite_prepared_expr(decls, body),
+				rewrite_prepared_expr_with_layout(layout, body),
 				typ,
 				loc,
 			)
 		SeqExpr(first, second):
 			SeqExpr(
-				rewrite_prepared_expr(decls, first),
-				rewrite_prepared_expr(decls, second),
+				rewrite_prepared_expr_with_layout(layout, first),
+				rewrite_prepared_expr_with_layout(layout, second),
 			)
 		IfExpr(cond, then_expr, else_expr, typ, loc):
 			IfExpr(
-				rewrite_prepared_expr(decls, cond),
-				rewrite_prepared_expr(decls, then_expr),
-				rewrite_prepared_expr(decls, else_expr),
+				rewrite_prepared_expr_with_layout(layout, cond),
+				rewrite_prepared_expr_with_layout(layout, then_expr),
+				rewrite_prepared_expr_with_layout(layout, else_expr),
 				typ,
 				loc,
 			)
 		ConstructorMatchExpr(scrutinee, scrutinee_release_policy, cases, fallback, typ, loc):
 			ConstructorMatchExpr(
-				rewrite_prepared_expr(decls, scrutinee),
+				rewrite_prepared_expr_with_layout(layout, scrutinee),
 				scrutinee_release_policy,
-				rewrite_child_constructor_match_cases(decls, cases),
-				rewrite_child_constructor_match_fallback(decls, fallback),
+				rewrite_child_constructor_match_cases(layout, cases),
+				rewrite_child_constructor_match_fallback(layout, fallback),
 				typ,
 				loc,
 			)
@@ -4976,7 +5006,7 @@ pure func rewrite_prepared_expr(decls: List[CoreDecl], expr: CoreExpr) -> CoreEx
 			expr
 		DebugBlockExpr(body, typ, loc):
 			DebugBlockExpr(
-				rewrite_prepared_expr(decls, body),
+				rewrite_prepared_expr_with_layout(layout, body),
 				typ,
 				loc,
 			)
@@ -5132,139 +5162,147 @@ pure func rewrite_prepared_expr(decls: List[CoreDecl], expr: CoreExpr) -> CoreEx
 			expr
 
 
-pure func rewrite_child_constructor_match_body(
-	decls: List[CoreDecl],
+private pure func rewrite_child_constructor_match_body(
+	layout: PreparedReuseLayout,
 	body: CoreConstructorMatchBody,
 ) -> CoreConstructorMatchBody:
 	match body:
 		ConstructorMatchBodyExpr(expr):
-			ConstructorMatchBodyExpr(rewrite_prepared_expr(decls, expr))
+			ConstructorMatchBodyExpr(rewrite_prepared_expr_with_layout(layout, expr))
 		ConstructorMatchBodyLiteral(match_expr):
 			ConstructorMatchBodyLiteral({ match_expr |
-					cases = rewrite_child_literal_match_cases(decls, match_expr.cases),
-					fallback = rewrite_child_literal_match_fallback(decls, match_expr.fallback)
+					cases = rewrite_child_literal_match_cases(layout, match_expr.cases),
+					fallback = rewrite_child_literal_match_fallback(layout, match_expr.fallback)
 				})
 		ConstructorMatchBodyLength(match_expr):
 			ConstructorMatchBodyLength({ match_expr |
-					cases = rewrite_child_length_match_cases(decls, match_expr.cases),
-					geq = rewrite_child_length_match_geq(decls, match_expr.geq),
-					fallback = rewrite_child_length_match_fallback(decls, match_expr.fallback)
+					cases = rewrite_child_length_match_cases(layout, match_expr.cases),
+					geq = rewrite_child_length_match_geq(layout, match_expr.geq),
+					fallback = rewrite_child_length_match_fallback(layout, match_expr.fallback)
 				})
 
 
-pure func rewrite_child_constructor_match_case(
-	decls: List[CoreDecl],
+private pure func rewrite_child_constructor_match_case(
+	layout: PreparedReuseLayout,
 	match_case: CoreConstructorMatchCase,
 ) -> CoreConstructorMatchCase:
-	{ match_case | body = rewrite_child_constructor_match_body(decls, match_case.body) }
+	{ match_case | body = rewrite_child_constructor_match_body(layout, match_case.body) }
 
 
-pure func rewrite_child_constructor_match_cases(
-	decls: List[CoreDecl],
+private pure func rewrite_child_constructor_match_cases(
+	layout: PreparedReuseLayout,
 	cases: List[CoreConstructorMatchCase],
 ) -> List[CoreConstructorMatchCase]:
-	cases.map(func(match_case): rewrite_child_constructor_match_case(decls, match_case))
+	cases.map(func(match_case): rewrite_child_constructor_match_case(layout, match_case))
 
 
-pure func rewrite_child_constructor_match_fallback(
-	decls: List[CoreDecl],
+private pure func rewrite_child_constructor_match_fallback(
+	layout: PreparedReuseLayout,
 	fallback: CoreConstructorMatchFallback,
 ) -> CoreConstructorMatchFallback:
 	match fallback:
 		ConstructorMatchFallbackBody(body):
-			ConstructorMatchFallbackBody(rewrite_prepared_expr(decls, body))
+			ConstructorMatchFallbackBody(rewrite_prepared_expr_with_layout(layout, body))
 		ConstructorMatchFallbackBindings(bindings, body):
 			ConstructorMatchFallbackBindings(
 				bindings,
-				rewrite_prepared_expr(decls, body),
+				rewrite_prepared_expr_with_layout(layout, body),
 			)
 		ConstructorMatchFallbackFail:
 			ConstructorMatchFallbackFail
 
 
-pure func rewrite_child_literal_match_cases(
-	decls: List[CoreDecl],
+private pure func rewrite_child_literal_match_cases(
+	layout: PreparedReuseLayout,
 	cases: List[CoreLiteralMatchCase],
 ) -> List[CoreLiteralMatchCase]:
 	cases.map(
-		func(match_case): { match_case | body = rewrite_prepared_expr(decls, match_case.body) },
+		func(
+			match_case,
+		): { match_case | body = rewrite_prepared_expr_with_layout(layout, match_case.body) },
 	)
 
 
-pure func rewrite_child_literal_match_fallback(
-	decls: List[CoreDecl],
+private pure func rewrite_child_literal_match_fallback(
+	layout: PreparedReuseLayout,
 	fallback: CoreLiteralMatchFallback,
 ) -> CoreLiteralMatchFallback:
 	match fallback:
 		LiteralMatchFallbackBody(body):
-			LiteralMatchFallbackBody(rewrite_prepared_expr(decls, body))
+			LiteralMatchFallbackBody(rewrite_prepared_expr_with_layout(layout, body))
 		LiteralMatchFallbackBindings(bindings, body):
 			LiteralMatchFallbackBindings(
 				bindings,
-				rewrite_prepared_expr(decls, body),
+				rewrite_prepared_expr_with_layout(layout, body),
 			)
 		LiteralMatchFallbackFail:
 			LiteralMatchFallbackFail
 
 
-pure func rewrite_child_length_branch(
-	decls: List[CoreDecl],
+private pure func rewrite_child_length_branch(
+	layout: PreparedReuseLayout,
 	branch: CoreConstructorLengthMatchBranch,
 ) -> CoreConstructorLengthMatchBranch:
-	{ branch | body = rewrite_child_constructor_match_body(decls, branch.body) }
+	{ branch | body = rewrite_child_constructor_match_body(layout, branch.body) }
 
 
-pure func rewrite_child_length_match_cases(
-	decls: List[CoreDecl],
+private pure func rewrite_child_length_match_cases(
+	layout: PreparedReuseLayout,
 	cases: List[CoreConstructorLengthMatchCase],
 ) -> List[CoreConstructorLengthMatchCase]:
 	cases.map(
 		func(
 			match_case,
-		): { match_case | branch = rewrite_child_length_branch(decls, match_case.branch) },
+		): { match_case | branch = rewrite_child_length_branch(layout, match_case.branch) },
 	)
 
 
-pure func rewrite_child_length_match_geq(
-	decls: List[CoreDecl],
+private pure func rewrite_child_length_match_geq(
+	layout: PreparedReuseLayout,
 	geq: Option[CoreConstructorLengthMatchGeq],
 ) -> Option[CoreConstructorLengthMatchGeq]:
 	match geq:
 		Some(value):
-			Some({ value | branch = rewrite_child_length_branch(decls, value.branch) })
+			Some({ value | branch = rewrite_child_length_branch(layout, value.branch) })
 		None:
 			None
 
 
-pure func rewrite_child_length_match_fallback(
-	decls: List[CoreDecl],
+private pure func rewrite_child_length_match_fallback(
+	layout: PreparedReuseLayout,
 	fallback: Option[CoreConstructorLengthMatchBranch],
 ) -> Option[CoreConstructorLengthMatchBranch]:
 	match fallback:
 		Some(branch):
-			Some(rewrite_child_length_branch(decls, branch))
+			Some(rewrite_child_length_branch(layout, branch))
 		None:
 			None
 
 
-pure func rewrite_prepared_function(decls: List[CoreDecl], func_info: CoreFunction) -> CoreFunction:
+private pure func rewrite_prepared_function(
+	layout: PreparedReuseLayout,
+	func_info: CoreFunction,
+) -> CoreFunction:
 	match func_info.body:
 		Some(body):
-			{ func_info | body = Some(rewrite_prepared_expr(decls, body)) }
+			{ func_info | body = Some(rewrite_prepared_expr_with_layout(layout, body)) }
 		None:
 			func_info
 
 
-pure func rewrite_prepared_global(decls: List[CoreDecl], global: CoreGlobal) -> CoreGlobal:
-	{ global | init = rewrite_prepared_expr(decls, global.init) }
+private pure func rewrite_prepared_global(
+	layout: PreparedReuseLayout,
+	global: CoreGlobal,
+) -> CoreGlobal:
+	{ global | init = rewrite_prepared_expr_with_layout(layout, global.init) }
 
 
-pure func rewrite_prepared_decl(decls: List[CoreDecl], decl: CoreDecl) -> CoreDecl:
+private pure func rewrite_prepared_decl(layout: PreparedReuseLayout, decl: CoreDecl) -> CoreDecl:
 	match decl:
 		FunctionDecl(func_info):
-			FunctionDecl(rewrite_prepared_function(decls, func_info))
+			FunctionDecl(rewrite_prepared_function(layout, func_info))
 		GlobalDecl(global):
-			GlobalDecl(rewrite_prepared_global(decls, global))
+			GlobalDecl(rewrite_prepared_global(layout, global))
 		UnionDecl(union_decl):
 			decl
 		EnumDecl(enum_decl):
@@ -5281,16 +5319,25 @@ pure func rewrite_prepared_decl(decls: List[CoreDecl], decl: CoreDecl) -> CoreDe
 			ImplDecl(
 				{ impl_decl |
 					methods = impl_decl.methods.map(
-						pure func(method): rewrite_prepared_function(decls, method),
+						pure func(method): rewrite_prepared_function(layout, method),
 					)
 				},
 			)
 
 
+pure func rewrite_prepared_expr(decls: List[CoreDecl], expr: CoreExpr) -> CoreExpr:
+	layout: PreparedReuseLayout = build_prepared_reuse_layout({
+		decls = decls,
+		foreign_includes = [],
+	})
+	rewrite_prepared_expr_with_layout(layout, expr)
+
+
 pure func rewrite_prepared_program(program: CoreProgram) -> CoreProgram:
+	layout: PreparedReuseLayout = build_prepared_reuse_layout(program)
 	var decls: List[CoreDecl] = []
 
 	for decl in program.decls:
-		decls = decls.append(rewrite_prepared_decl(program.decls, decl))
+		decls = decls.append(rewrite_prepared_decl(layout, decl))
 
 	{ program | decls = decls }
