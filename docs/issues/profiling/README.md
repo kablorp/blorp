@@ -1,6 +1,6 @@
 # Profiling Capability Roadmap
 
-**Status:** Ready for incremental implementation
+**Status:** In progress (Issues 1-2 implemented)
 
 **Created:** 2026-09-09
 
@@ -27,8 +27,8 @@ measurement window, or a focused parent/child decomposition is required.
 
 ## Why This Roadmap Exists
 
-The current function profiler is useful for small focused benchmarks, but its
-representation does not scale to the compiler itself:
+The function profiler at the roadmap baseline was useful for small focused
+benchmarks, but its representation did not scale to the compiler itself:
 
 - `BLORP_PROFILE_MAX_FUNCS` fixes the registry at 1,024 entries;
 - later function registrations are silently discarded;
@@ -40,6 +40,11 @@ representation does not scale to the compiler itself:
 - names, rather than emitted function identity, are the registry key;
 - reported percentages sum overlapping inclusive times; and
 - `FLAME:` rows contain a single function rather than a sampled call stack.
+
+Issue 1 removed the fixed function registry, name cache, lookup mutex, and
+silent function omission. It also made retained stack overflow explicit. The
+remaining shared-atomic probe cost, fixed frame capacity, inclusive-time
+semantics, and synthetic one-frame `FLAME:` rows are owned by Issues 2-5.
 
 The implementation is in
 `blorp/src/lib/runtime/native/runtime.c`, under `Function Profiling`. Probe
@@ -120,8 +125,8 @@ allocation, or runtime branch solely for profiling.
 
 ## Issues
 
-1. [Replace name registration with dense profile function IDs](01-dense-profile-function-ids.md)
-2. [Introduce explicit count, exact, and selective instrumentation modes](02-profile-modes-and-selection.md)
+1. [Replace name registration with dense profile function IDs](01-dense-profile-function-ids.md) - implemented
+2. [Introduce explicit count, exact, and selective instrumentation modes](02-profile-modes-and-selection.md) - implemented
 3. [Make exact timing fiber-correct and report self time](03-fiber-correct-exact-timing.md)
 4. [Move exact counters to local shards and define structured output](04-local-aggregation-and-output.md)
 5. [Make optimized native sampling and symbolization first-class](05-native-sampling-and-symbol-maps.md)

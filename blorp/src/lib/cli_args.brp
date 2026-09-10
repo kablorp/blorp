@@ -3,6 +3,13 @@
 -- Commands use this typed argument surface before Blorp executes them.
 import:
 	../compiler/stage_09_core/stage_manifest: CORE_STAGE_NAMES
+	function_profile:
+		FunctionProfileConfiguration(
+			FunctionProfileCalls,
+			FunctionProfileExact,
+			FunctionProfileOff,
+		),
+		FunctionProfileSelector(ProfileFunction, ProfileModule),
 	lint_model: lint_rule_id_from_name
 
 
@@ -44,7 +51,7 @@ record CliCheckArgs {
 
 record CliCompileArgs {
 	ast_only: Bool,
-	profile: Bool,
+	profile: FunctionProfileConfiguration,
 	dump_ast: Bool,
 	dump_typed_ast: Bool,
 	dump_core_after: List[String],
@@ -62,7 +69,7 @@ record CliCompileArgs {
 
 
 record CliRunArgs {
-	profile: Bool,
+	profile: FunctionProfileConfiguration,
 	debug: Bool,
 	sanitizer: Option[CliSanitizerMode],
 	leak_check: Bool,
@@ -77,7 +84,7 @@ record CliRunArgs {
 
 
 record CliTestArgs {
-	profile: Bool,
+	profile: FunctionProfileConfiguration,
 	debug: Bool,
 	sanitizer: Option[CliSanitizerMode],
 	leak_check: Bool,
@@ -275,7 +282,7 @@ private DEFAULT_CHECK_ARGS: CliCheckArgs = {
 
 private DEFAULT_COMPILE_ARGS: CliCompileArgs = {
 	ast_only = False,
-	profile = False,
+	profile = FunctionProfileOff,
 	dump_ast = False,
 	dump_typed_ast = False,
 	dump_core_after = [],
@@ -292,7 +299,7 @@ private DEFAULT_COMPILE_ARGS: CliCompileArgs = {
 }
 
 private DEFAULT_RUN_ARGS: CliRunArgs = {
-	profile = False,
+	profile = FunctionProfileOff,
 	debug = False,
 	sanitizer = None,
 	leak_check = False,
@@ -306,7 +313,7 @@ private DEFAULT_RUN_ARGS: CliRunArgs = {
 }
 
 private DEFAULT_TEST_ARGS: CliTestArgs = {
-	profile = False,
+	profile = FunctionProfileOff,
 	debug = False,
 	sanitizer = None,
 	leak_check = False,
@@ -377,8 +384,64 @@ private pure func parse_eq_arg(arg: String, flag: String) -> Option[String]:
 		None
 
 
+private pure func parse_profile_mode(
+	value: String,
+) -> Result[FunctionProfileConfiguration, CliAction]:
+	match value:
+		"off":
+			Ok(FunctionProfileOff)
+		"calls":
+			Ok(FunctionProfileCalls([]))
+		"exact":
+			Ok(FunctionProfileExact([]))
+		_:
+			Err(CliError("Error: --profile-mode must be one of: off, calls, exact"))
+
+
+private pure func parse_profile_function_selector(
+	value: String,
+) -> Result[FunctionProfileSelector, CliAction]:
+	separator: Int = value.raw_index_of("::")
+
+	if separator <= 0 or separator + 2 >= value.length():
+		Err(CliError("Error: --profile-function must use <module>::<function>"))
+	else:
+		module_path: String = value.substring(0, separator)
+		function_name: String = value.substring(separator + 2, value.length() - separator - 2)
+
+		if function_name.contains("::"):
+			Err(CliError("Error: --profile-function must use <module>::<function>"))
+		else:
+			Ok(ProfileFunction(module_path, function_name))
+
+
+private pure func profile_with_selectors(
+	profile: FunctionProfileConfiguration,
+	selectors: List[FunctionProfileSelector],
+) -> Result[FunctionProfileConfiguration, CliAction]:
+	match profile:
+		FunctionProfileOff:
+			if selectors.length() == 0:
+				Ok(FunctionProfileOff)
+			else:
+				selector_name: String = match selectors.get(0):
+					Some(ProfileModule(_)):
+						"--profile-module"
+					Some(ProfileFunction(_, _)):
+						"--profile-function"
+					None:
+						"profile selector"
+
+				Err(CliError("Error: ${selector_name} requires --profile-mode calls or exact"))
+		FunctionProfileCalls(_):
+			Ok(FunctionProfileCalls(selectors))
+		FunctionProfileExact(_):
+			Ok(FunctionProfileExact(selectors))
+
+
 private pure func parse_compile_args(args: List[String]) -> CliAction:
 	var parsed: CliCompileArgs = DEFAULT_COMPILE_ARGS
+	var profile_selectors: List[FunctionProfileSelector] = []
 	var result: Option[CliAction] = None
 	var index: Int = 0
 
@@ -413,7 +476,66 @@ private pure func parse_compile_args(args: List[String]) -> CliAction:
 									else if arg == "--ast":
 										parsed = { parsed | ast_only = True }
 									else if arg == "--profile":
-										parsed = { parsed | profile = True }
+										parsed = { parsed | profile = FunctionProfileExact([]) }
+									else if arg == "--profile-mode":
+										match args.get(index + 1):
+											Some(value):
+												match parse_profile_mode(value):
+													Ok(profile):
+														parsed = { parsed | profile = profile }
+													Err(action):
+														result = Some(action)
+
+												index += 1
+											None:
+												result = Some(
+													CliError(
+														option_requires_value("--profile-mode"),
+													),
+												)
+									else if arg == "--profile-module":
+										match args.get(index + 1):
+											Some(module_path):
+												if module_path.is_empty():
+													result = Some(
+														CliError(
+															"Error: --profile-module requires a non-empty module path",
+														),
+													)
+												else:
+													profile_selectors = profile_selectors.append(
+														ProfileModule(module_path),
+													)
+
+												index += 1
+											None:
+												result = Some(
+													CliError(
+														option_requires_value(
+															"--profile-module",
+														),
+													),
+												)
+									else if arg == "--profile-function":
+										match args.get(index + 1):
+											Some(value):
+												match parse_profile_function_selector(value):
+													Ok(selector):
+														profile_selectors = profile_selectors.append(
+															selector,
+														)
+													Err(action):
+														result = Some(action)
+
+												index += 1
+											None:
+												result = Some(
+													CliError(
+														option_requires_value(
+															"--profile-function",
+														),
+													),
+												)
 									else if arg == "--dump-ast":
 										parsed = { parsed | dump_ast = True }
 									else if arg == "--dump-typed-ast":
@@ -511,6 +633,13 @@ private pure func parse_compile_args(args: List[String]) -> CliAction:
 
 		index += 1
 
+	if result.is_none():
+		match profile_with_selectors(parsed.profile, profile_selectors):
+			Ok(profile):
+				parsed = { parsed | profile = profile }
+			Err(action):
+				result = Some(action)
+
 	match result:
 		Some(action):
 			action
@@ -543,6 +672,7 @@ private pure func parse_compile_args(args: List[String]) -> CliAction:
 
 private pure func parse_run_args(args: List[String]) -> CliAction:
 	var parsed: CliRunArgs = DEFAULT_RUN_ARGS
+	var profile_selectors: List[FunctionProfileSelector] = []
 	var result: Option[CliAction] = None
 	var index: Int = 0
 
@@ -556,7 +686,46 @@ private pure func parse_run_args(args: List[String]) -> CliAction:
 			else if is_help_arg(arg):
 				result = Some(CliRunHelp)
 			else if arg == "--profile":
-				parsed = { parsed | profile = True }
+				parsed = { parsed | profile = FunctionProfileExact([]) }
+			else if arg == "--profile-mode":
+				match args.get(index + 1):
+					Some(value):
+						match parse_profile_mode(value):
+							Ok(profile):
+								parsed = { parsed | profile = profile }
+							Err(action):
+								result = Some(action)
+
+						index += 1
+					None:
+						result = Some(CliError(option_requires_value("--profile-mode")))
+			else if arg == "--profile-module":
+				match args.get(index + 1):
+					Some(module_path):
+						if module_path.is_empty():
+							result = Some(
+								CliError(
+									"Error: --profile-module requires a non-empty module path",
+								),
+							)
+						else:
+							profile_selectors = profile_selectors.append(ProfileModule(module_path))
+
+						index += 1
+					None:
+						result = Some(CliError(option_requires_value("--profile-module")))
+			else if arg == "--profile-function":
+				match args.get(index + 1):
+					Some(value):
+						match parse_profile_function_selector(value):
+							Ok(selector):
+								profile_selectors = profile_selectors.append(selector)
+							Err(action):
+								result = Some(action)
+
+						index += 1
+					None:
+						result = Some(CliError(option_requires_value("--profile-function")))
 			else if arg == "--release":
 				parsed = { parsed | release = True }
 			else if arg == "--debug":
@@ -605,6 +774,13 @@ private pure func parse_run_args(args: List[String]) -> CliAction:
 
 		index += 1
 
+	if result.is_none():
+		match profile_with_selectors(parsed.profile, profile_selectors):
+			Ok(profile):
+				parsed = { parsed | profile = profile }
+			Err(action):
+				result = Some(action)
+
 	match result:
 		Some(action):
 			action
@@ -619,6 +795,7 @@ private pure func parse_run_args(args: List[String]) -> CliAction:
 
 private pure func parse_test_args(args: List[String]) -> CliAction:
 	var parsed: CliTestArgs = DEFAULT_TEST_ARGS
+	var profile_selectors: List[FunctionProfileSelector] = []
 	var result: Option[CliAction] = None
 	var warmup_only: Bool = False
 	var index: Int = 0
@@ -630,7 +807,46 @@ private pure func parse_test_args(args: List[String]) -> CliAction:
 			if is_help_arg(arg):
 				result = Some(CliTestHelp)
 			else if arg == "--profile":
-				parsed = { parsed | profile = True }
+				parsed = { parsed | profile = FunctionProfileExact([]) }
+			else if arg == "--profile-mode":
+				match args.get(index + 1):
+					Some(value):
+						match parse_profile_mode(value):
+							Ok(profile):
+								parsed = { parsed | profile = profile }
+							Err(action):
+								result = Some(action)
+
+						index += 1
+					None:
+						result = Some(CliError(option_requires_value("--profile-mode")))
+			else if arg == "--profile-module":
+				match args.get(index + 1):
+					Some(module_path):
+						if module_path.is_empty():
+							result = Some(
+								CliError(
+									"Error: --profile-module requires a non-empty module path",
+								),
+							)
+						else:
+							profile_selectors = profile_selectors.append(ProfileModule(module_path))
+
+						index += 1
+					None:
+						result = Some(CliError(option_requires_value("--profile-module")))
+			else if arg == "--profile-function":
+				match args.get(index + 1):
+					Some(value):
+						match parse_profile_function_selector(value):
+							Ok(selector):
+								profile_selectors = profile_selectors.append(selector)
+							Err(action):
+								result = Some(action)
+
+						index += 1
+					None:
+						result = Some(CliError(option_requires_value("--profile-function")))
 			else if arg == "--debug":
 				parsed = { parsed | debug = True }
 			else if arg == "--sanitize" or arg.starts_with("--sanitize="):
@@ -682,6 +898,13 @@ private pure func parse_test_args(args: List[String]) -> CliAction:
 				parsed = { parsed | paths = parsed.paths.append(arg) }
 
 		index += 1
+
+	if result.is_none():
+		match profile_with_selectors(parsed.profile, profile_selectors):
+			Ok(profile):
+				parsed = { parsed | profile = profile }
+			Err(action):
+				result = Some(action)
 
 	match result:
 		Some(action):

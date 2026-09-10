@@ -522,11 +522,10 @@ The profile includes function rows and `FLAME:` rows. Function times are
 inclusive: parent and child cumulative times overlap and must not be added.
 Compare the same function, call count, and workload across revisions.
 
-The current runtime profile registry stores at most 1,024 functions and
-silently omits later registrations. A compiler-sized profile can therefore be
-incomplete. Confirm that every function under investigation appears, and use a
-focused benchmark or phase-specific profile when the whole-compiler registry is
-saturated.
+The runtime profiler assigns every emitted function a dense artifact-local ID
+and reports explicit completeness diagnostics. Check `functions_described`,
+`functions_observed`, `calls_completed`, and all loss/corruption counters before
+drawing conclusions from a profile.
 
 Render the collapsed rows when `flamegraph.pl` is installed:
 

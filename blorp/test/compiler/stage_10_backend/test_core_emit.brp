@@ -306,6 +306,13 @@ import:
 		try_emit_prepared_core_program_c_artifact_with_profile,
 		try_emit_unprojected_prepared_core_program_c_artifact_for_tests,
 	../../../src/lib/build_artifact: CArtifact
+	../../../src/lib/function_profile:
+		FunctionProfileConfiguration(
+			FunctionProfileCalls,
+			FunctionProfileExact,
+			FunctionProfileOff,
+		),
+		FunctionProfileSelector(ProfileFunction, ProfileModule),
 	bytes: from_hex
 	test: TestSuite
 
@@ -9656,16 +9663,47 @@ pure func test_emit_profiled_main_enables_report() -> Bool:
 	}
 	artifact: CArtifact = emit_unprojected_core_program_c_artifact_with_profile_for_tests(
 		program,
-		True,
+		FunctionProfileExact([]),
 	)
 
 	(
-		artifact.c_code.contains("blorp_profile_enable();")
+		artifact.c_code.contains(
+			"static const blorp_ProfileFunctionMetadata __blorp_profile_functions[1]",
+		)
+		and artifact.c_code.contains("{\"main\", \"main\", NULL, 1, 0u}")
+		and artifact.c_code.contains(
+			"blorp_profile_enable(BLORP_PROFILE_MODE_EXACT, __blorp_profile_functions, 1, 1)",
+		)
 		and artifact.c_code.contains("atexit(blorp_profile_report);")
-		and artifact.c_code.contains("blorp_profile_start(\"main\");")
+		and artifact.c_code.contains(
+			"if (blorp_profile_enable(BLORP_PROFILE_MODE_EXACT, __blorp_profile_functions, 1, 1) != 0) return 1;\n  atexit(blorp_profile_report);\n  __blorp_init_globals();\n  blorp_profile_start_id(0);",
+		)
+		and artifact.c_code.contains("blorp_profile_start_id(0);")
 		and artifact.c_code.contains("int __blorp_main_result = (int)0;")
-		and artifact.c_code.contains("blorp_profile_end(\"main\");")
+		and artifact.c_code.contains("blorp_profile_end_id(0);")
 		and artifact.c_code.contains("return (int)__blorp_main_result;")
+	)
+
+
+pure func test_profile_is_enabled_before_dynamic_global_initializers() -> Bool:
+	artifact: CArtifact = emit_unprojected_core_program_c_artifact_with_profile_for_tests(
+		{
+			decls = [
+				FunctionDecl(identity_function()),
+				GlobalDecl(dynamic_answer_global()),
+				FunctionDecl(main_return_zero_function()),
+			],
+			foreign_includes = []
+		},
+		FunctionProfileCalls([]),
+	)
+
+	(
+		artifact.c_code.contains("long id(long x) {\n  blorp_profile_count_id(0);")
+		and artifact.c_code.contains("DYNAMIC_ANSWER = id(41);")
+		and artifact.c_code.contains(
+			"if (blorp_profile_enable(BLORP_PROFILE_MODE_CALLS, __blorp_profile_functions, 2, 2) != 0) return 1;\n  atexit(blorp_profile_report);\n  __blorp_init_globals();\n  blorp_profile_count_id(1);",
+		)
 	)
 
 
@@ -9676,24 +9714,27 @@ pure func test_emit_profile_disabled_omits_hooks() -> Bool:
 	}
 	explicit: CArtifact = emit_unprojected_core_program_c_artifact_with_profile_for_tests(
 		program,
-		False,
+		FunctionProfileOff,
 	)
 	default: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
 
 	(
 		not explicit.c_code.contains("blorp_profile_enable")
-		and not explicit.c_code.contains("blorp_profile_start")
-		and not explicit.c_code.contains("blorp_profile_end")
+		and not explicit.c_code.contains("blorp_profile_start_id")
+		and not explicit.c_code.contains("blorp_profile_end_id")
+		and not explicit.c_code.contains("__blorp_profile_functions")
 		and not default.c_code.contains("blorp_profile_enable")
-		and not default.c_code.contains("blorp_profile_start")
-		and not default.c_code.contains("blorp_profile_end")
+		and not default.c_code.contains("blorp_profile_start_id")
+		and not default.c_code.contains("blorp_profile_end_id")
+		and not default.c_code.contains("__blorp_profile_functions")
+		and explicit.c_code == default.c_code
 	)
 
 
 pure func test_emit_prepared_program_boundary() -> Bool:
 	match try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
 		prepared_core_program(empty_program()),
-		False,
+		FunctionProfileOff,
 	):
 		Ok(artifact):
 			artifact.c_code.contains("Blorp final Core C artifact")
@@ -9704,7 +9745,7 @@ pure func test_emit_prepared_program_boundary() -> Bool:
 pure func test_emit_unsupported_global_returns_structured_error() -> Bool:
 	match try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
 		prepared_core_program(unsupported_global_program()),
-		False,
+		FunctionProfileOff,
 	):
 		Ok(_):
 			False
@@ -9733,14 +9774,14 @@ pure func test_emit_profiled_named_function() -> Bool:
 	}
 	artifact: CArtifact = emit_unprojected_core_program_c_artifact_with_profile_for_tests(
 		program,
-		True,
+		FunctionProfileExact([]),
 	)
 
 	(
 		artifact.c_code.contains("long id(long x)")
-		and artifact.c_code.contains("blorp_profile_start(\"id\");")
+		and artifact.c_code.contains("blorp_profile_start_id(0);")
 		and artifact.c_code.contains("long __blorp_profile_result = x;")
-		and artifact.c_code.contains("blorp_profile_end(\"id\");")
+		and artifact.c_code.contains("blorp_profile_end_id(0);")
 		and artifact.c_code.contains("return __blorp_profile_result;")
 	)
 
@@ -9751,21 +9792,320 @@ pure func test_production_emit_projects_symbol_but_preserves_profile_label() -> 
 		foreign_includes = []
 	}
 	projected_name: String = projected_callable_base_symbol(2)
-	projected_profile_start: String = "blorp_profile_start(\"" + projected_name + "\");"
+	metadata_row: String = "{\"id\", \"" + projected_name + "\", NULL, 2, 0u}"
 
 	match try_emit_prepared_core_program_c_artifact_with_profile(
 		prepared_core_program(program),
-		True,
+		FunctionProfileExact([]),
 	):
 		Ok(artifact):
 			(
 				artifact.c_code.contains("static long ${projected_name}(long x)")
-				and artifact.c_code.contains("blorp_profile_start(\"id\");")
-				and artifact.c_code.contains("blorp_profile_end(\"id\");")
-				and not artifact.c_code.contains(projected_profile_start)
+				and artifact.c_code.contains(metadata_row)
+				and artifact.c_code.contains("blorp_profile_start_id(0);")
+				and artifact.c_code.contains("blorp_profile_end_id(0);")
 			)
 		Err(_):
 			False
+
+
+pure func test_profile_ids_distinguish_duplicate_logical_names() -> Bool:
+	first: CoreFunction = identity_function()
+	second: CoreFunction = { identity_function() | def_id = 3 }
+	program: CoreProgram = {
+		decls = [FunctionDecl(first), FunctionDecl(second)],
+		foreign_includes = []
+	}
+
+	match try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
+		prepared_core_program(program),
+		FunctionProfileExact([]),
+	):
+		Ok(artifact):
+			(
+				artifact.c_code.contains(
+					"static const blorp_ProfileFunctionMetadata __blorp_profile_functions[2]",
+				)
+				and artifact.c_code.contains("{\"id\", \"id\", NULL, 2, 0u}")
+				and artifact.c_code.contains("blorp_profile_start_id(0);")
+				and artifact.c_code.contains("blorp_profile_end_id(0);")
+				and artifact.c_code.contains("blorp_profile_start_id(1);")
+				and artifact.c_code.contains("blorp_profile_end_id(1);")
+			)
+		Err(_):
+			False
+
+
+pure func test_profile_id_order_matches_metadata_and_function_bodies() -> Bool:
+	first: CoreFunction = { identity_function() |
+		name = "profile_first",
+		def_id = 31
+	}
+	second: CoreFunction = { identity_function() |
+		name = "profile_second",
+		def_id = 32
+	}
+	artifact: CArtifact = emit_unprojected_core_program_c_artifact_with_profile_for_tests(
+		{
+			decls = [FunctionDecl(first), FunctionDecl(second)],
+			foreign_includes = []
+		},
+		FunctionProfileExact([]),
+	)
+
+	(
+		artifact.c_code.contains("{\"profile_first\", \"profile_first\", NULL, 31, 0u}")
+		and artifact.c_code.contains("{\"profile_second\", \"profile_second\", NULL, 32, 0u}")
+		and artifact.c_code.contains("long profile_first(long x) {\n  blorp_profile_start_id(0);")
+		and artifact.c_code.contains("long profile_second(long x) {\n  blorp_profile_start_id(1);")
+	)
+
+
+pure func test_profile_ids_have_no_fixed_function_ceiling() -> Bool:
+	expected_count: Int = 1025
+	var decls: List[CoreDecl] = []
+
+	for index in 0..expected_count:
+		function_info: CoreFunction = { identity_function() |
+			name = "profile_${index}",
+			def_id = index + 100
+		}
+		decls = decls.append(FunctionDecl(function_info))
+
+	artifact: CArtifact = emit_unprojected_core_program_c_artifact_with_profile_for_tests(
+		{
+			decls = decls,
+			foreign_includes = []
+		},
+		FunctionProfileExact([]),
+	)
+
+	(
+		artifact.c_code.contains(
+			"static const blorp_ProfileFunctionMetadata __blorp_profile_functions[1025]",
+		)
+		and artifact.c_code.contains("blorp_profile_start_id(1024);")
+		and artifact.c_code.contains("blorp_profile_end_id(1024);")
+	)
+
+
+pure func test_profile_plan_empty_selection_emits_no_profile_data() -> Bool:
+	artifact: CArtifact = emit_unprojected_core_program_c_artifact_with_profile_for_tests(
+		empty_program(),
+		FunctionProfileExact([]),
+	)
+
+	(
+		not artifact.c_code.contains("__blorp_profile_functions")
+		and not artifact.c_code.contains("blorp_profile_start_id")
+		and not artifact.c_code.contains("blorp_profile_end_id")
+	)
+
+
+pure func test_profile_plan_is_deterministic_and_excludes_bodyless_functions() -> Bool:
+	special_logical_name: String = "profile\"\t" + unicode_fixture_string()
+	profiled_identity: CoreFunction = { identity_function() |
+		name = special_logical_name,
+		source_module = Some("fixture\nmodule")
+	}
+	program: CoreProgram = {
+		decls = [FunctionDecl(foreign_compact_name_function()), FunctionDecl(profiled_identity)],
+		foreign_includes = []
+	}
+	first: CArtifact = emit_unprojected_core_program_c_artifact_with_profile_for_tests(
+		program,
+		FunctionProfileExact([]),
+	)
+	second: CArtifact = emit_unprojected_core_program_c_artifact_with_profile_for_tests(
+		program,
+		FunctionProfileExact([]),
+	)
+
+	(
+		first.c_code == second.c_code
+		and first.c_code.contains(
+			"static const blorp_ProfileFunctionMetadata __blorp_profile_functions[1]",
+		)
+		and first.c_code.contains("{\"profile\\\"\\tcaf\\303\\251\\360\\237\\230\\200\", ")
+		and first.c_code.contains("\"fixture\\nmodule\", 2, BLORP_PROFILE_METADATA_HAS_MODULE}")
+		and not first.c_code.contains("{\"foreign_compact_name\",")
+		and first.c_code.contains("blorp_profile_start_id(0);")
+		and not first.c_code.contains("blorp_profile_start_id(1);")
+	)
+
+
+pure func test_calls_profile_selects_module_without_timing_probes() -> Bool:
+	first: CoreFunction = { identity_function() |
+		name = "first__selected",
+		source_module = Some("first"),
+		def_id = 41
+	}
+	second: CoreFunction = { identity_function() |
+		name = "second__unselected",
+		source_module = Some("second"),
+		def_id = 42
+	}
+
+	match (
+		try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
+			prepared_core_program({
+				decls = [FunctionDecl(second), FunctionDecl(first)],
+				foreign_includes = [],
+			}),
+			FunctionProfileCalls([ProfileModule("first"), ProfileModule("first")]),
+		)
+	):
+		Ok(artifact):
+			(
+				artifact.c_code.contains("BLORP_PROFILE mode=calls")
+				and artifact.c_code.contains("functions_described=2")
+				and artifact.c_code.contains("functions_selected=1")
+				and artifact.c_code.contains("{\"first__selected\", \"first__selected\"")
+				and not artifact.c_code.contains("{\"second__unselected\", \"second__unselected\"")
+				and artifact.c_code.contains("blorp_profile_count_id(0);")
+				and not artifact.c_code.contains("blorp_profile_count_id(1);")
+				and not artifact.c_code.contains("blorp_profile_start_id")
+				and not artifact.c_code.contains("blorp_profile_end_id")
+				and not artifact.c_code.contains("__blorp_profile_result")
+			)
+		Err(_):
+			False
+
+
+pure func test_exact_profile_selects_canonical_function_identity() -> Bool:
+	selected: CoreFunction = { identity_function() |
+		name = "fixture__selected__mono_Int",
+		source_module = Some("fixture"),
+		def_id = 51
+	}
+	same_name_other_module: CoreFunction = { identity_function() |
+		name = "other__selected__mono_Int",
+		source_module = Some("other"),
+		def_id = 52
+	}
+	unselected: CoreFunction = { identity_function() |
+		name = "fixture__other",
+		source_module = Some("fixture"),
+		def_id = 53
+	}
+
+	match (
+		try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
+			prepared_core_program({
+				decls = [
+					FunctionDecl(selected),
+					FunctionDecl(same_name_other_module),
+					FunctionDecl(unselected),
+				],
+				foreign_includes = [],
+			}),
+			FunctionProfileExact([ProfileFunction("fixture", "selected__mono_Int")]),
+		)
+	):
+		Ok(artifact):
+			(
+				artifact.c_code.contains("BLORP_PROFILE mode=exact")
+				and artifact.c_code.contains("functions_described=3 functions_selected=1")
+				and artifact.c_code.contains("blorp_profile_start_id(0);")
+				and artifact.c_code.contains("blorp_profile_end_id(0);")
+				and not artifact.c_code.contains("blorp_profile_start_id(1);")
+				and not artifact.c_code.contains(
+					"{\"other__selected__mono_Int\", \"other__selected__mono_Int\"",
+				)
+				and not artifact.c_code.contains("{\"fixture__other\", \"fixture__other\"")
+			)
+		Err(_):
+			False
+
+
+pure func test_exact_profile_selector_preserves_composite_module_identity() -> Bool:
+	path_module: CoreFunction = { identity_function() |
+		name = "a_b__selected",
+		source_module = Some("a/b"),
+		def_id = 54
+	}
+	underscore_module: CoreFunction = { identity_function() |
+		name = "a_b__selected",
+		source_module = Some("a_b"),
+		def_id = 55
+	}
+
+	match (
+		try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
+			prepared_core_program({
+				decls = [FunctionDecl(path_module), FunctionDecl(underscore_module)],
+				foreign_includes = [],
+			}),
+			FunctionProfileExact([ProfileFunction("a/b", "selected")]),
+		)
+	):
+		Ok(artifact):
+			(
+				artifact.c_code.contains(
+					"{\"a_b__selected\", \"a_b__selected\", \"a/b\", 54, BLORP_PROFILE_METADATA_HAS_MODULE}",
+				)
+				and not artifact.c_code.contains(
+					"{\"a_b__selected\", \"a_b__selected\", \"a_b\", 55, BLORP_PROFILE_METADATA_HAS_MODULE}",
+				)
+				and artifact.c_code.contains("blorp_profile_start_id(0);")
+				and not artifact.c_code.contains("blorp_profile_start_id(1);")
+			)
+		Err(_):
+			False
+
+
+pure func test_profile_rejects_unknown_selectors_before_emission() -> Bool:
+	program: CoreProgram = {
+		decls = [FunctionDecl({ identity_function() |
+					name = "fixture__selected",
+					source_module = Some("fixture")
+				})],
+		foreign_includes = []
+	}
+
+	unknown_module_ok: Bool = match try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
+		prepared_core_program(program),
+		FunctionProfileCalls([ProfileModule("missing")]),
+	):
+		Err(error):
+			core_emit_error_message(error) == (
+				"unknown profile module `missing`; expected a workspace-relative logical module "
+				+ "path"
+			)
+		Ok(_):
+			False
+
+	unknown_function_ok: Bool = match try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
+		prepared_core_program(program),
+		FunctionProfileExact([ProfileFunction("fixture", "missing")]),
+	):
+		Err(error):
+			core_emit_error_message(error) == (
+				"unknown profile function `fixture::missing`; expected --profile-function "
+				+ "<module>::<emitted-logical-function>"
+			)
+		Ok(_):
+			False
+
+	duplicate: CoreFunction = { identity_function() |
+		name = "fixture__selected",
+		source_module = Some("fixture"),
+		def_id = 2
+	}
+
+	ambiguous_ok: Bool = match try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
+		prepared_core_program({ program | decls = program.decls.append(FunctionDecl(duplicate)) }),
+		FunctionProfileExact([ProfileFunction("fixture", "selected")]),
+	):
+		Err(error):
+			core_emit_error_message(error) == (
+				"ambiguous profile function `fixture::selected`; multiple emitted functions "
+				+ "share this exact module/name identity"
+			)
+		Ok(_):
+			False
+
+	unknown_module_ok and unknown_function_ok and ambiguous_ok
 
 
 pure func test_production_emit_escapes_preserved_compact_foreign_name() -> Bool:
@@ -9776,7 +10116,7 @@ pure func test_production_emit_escapes_preserved_compact_foreign_name() -> Bool:
 
 	match try_emit_prepared_core_program_c_artifact_with_profile(
 		prepared_core_program(program),
-		False,
+		FunctionProfileOff,
 	):
 		Ok(artifact):
 			(
@@ -10624,6 +10964,23 @@ pure func test_emit_unmanaged_tailrec_loop() -> Bool:
 		and artifact.c_code.contains("n = __tailrec_arg_0_0;")
 		and artifact.c_code.contains("acc = __tailrec_arg_1_1;")
 		and artifact.c_code.contains("continue;")
+	)
+
+
+pure func test_emit_profiled_tailrec_loop_balances_direct_return() -> Bool:
+	program: CoreProgram = {
+		decls = [FunctionDecl(tailrec_sum_function())],
+		foreign_includes = []
+	}
+	artifact: CArtifact = emit_unprojected_core_program_c_artifact_with_profile_for_tests(
+		program,
+		FunctionProfileExact([]),
+	)
+
+	(
+		artifact.c_code.contains("blorp_profile_start_id(0);")
+		and artifact.c_code.contains("blorp_profile_end_id(0);\n      return acc;")
+		and not artifact.c_code.contains("blorp_profile_end_id(1);")
 	)
 
 
@@ -21043,7 +21400,7 @@ pure func test_emit_stack_result_tuple_construct() -> Bool:
 
 	match try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
 		prepared_core_program(program),
-		False,
+		FunctionProfileOff,
 	):
 		Ok(artifact):
 			(
@@ -21083,7 +21440,7 @@ pure func test_emit_statement_stack_result_tuple_construct() -> Bool:
 
 	match try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
 		prepared_core_program(rewrite_static_string_literals(program)),
-		False,
+		FunctionProfileOff,
 	):
 		Ok(artifact):
 			(
@@ -22554,7 +22911,7 @@ pure func test_emit_tensor_raw_scalar_for_loop() -> Bool:
 
 	match try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
 		prepared_core_program(program),
-		False,
+		FunctionProfileOff,
 	):
 		Ok(artifact):
 			(
@@ -24591,6 +24948,10 @@ tests: TestSuite = {
 			test_emit_main_with_source_args_uses_c_entrypoint_signature,
 		),
 		("emit profiled main enables report", test_emit_profiled_main_enables_report),
+		(
+			"profile is enabled before dynamic global initializers",
+			test_profile_is_enabled_before_dynamic_global_initializers,
+		),
 		("emit profile disabled omits hooks", test_emit_profile_disabled_omits_hooks),
 		("emit prepared program boundary", test_emit_prepared_program_boundary),
 		(
@@ -24602,6 +24963,42 @@ tests: TestSuite = {
 		(
 			"production emit projects symbol but preserves profile label",
 			test_production_emit_projects_symbol_but_preserves_profile_label,
+		),
+		(
+			"profile IDs distinguish duplicate logical names",
+			test_profile_ids_distinguish_duplicate_logical_names,
+		),
+		(
+			"profile ID order matches metadata and function bodies",
+			test_profile_id_order_matches_metadata_and_function_bodies,
+		),
+		(
+			"profile IDs have no fixed function ceiling",
+			test_profile_ids_have_no_fixed_function_ceiling,
+		),
+		(
+			"profile plan empty selection emits no profile data",
+			test_profile_plan_empty_selection_emits_no_profile_data,
+		),
+		(
+			"profile plan is deterministic and excludes bodyless functions",
+			test_profile_plan_is_deterministic_and_excludes_bodyless_functions,
+		),
+		(
+			"calls profile selects module without timing probes",
+			test_calls_profile_selects_module_without_timing_probes,
+		),
+		(
+			"exact profile selects canonical function identity",
+			test_exact_profile_selects_canonical_function_identity,
+		),
+		(
+			"exact profile selector preserves composite module identity",
+			test_exact_profile_selector_preserves_composite_module_identity,
+		),
+		(
+			"profile rejects unknown selectors before emission",
+			test_profile_rejects_unknown_selectors_before_emission,
 		),
 		(
 			"production emit escapes preserved compact foreign name",
@@ -24686,6 +25083,10 @@ tests: TestSuite = {
 		("emit sized scalar function signature", test_emit_sized_scalar_function_signature),
 		("emit unsigned sized scalar return", test_emit_unsigned_sized_scalar_return),
 		("emit unmanaged tailrec loop", test_emit_unmanaged_tailrec_loop),
+		(
+			"emit profiled tailrec loop balances direct return",
+			test_emit_profiled_tailrec_loop_balances_direct_return,
+		),
 		("emit tailrec literal match loop", test_emit_tailrec_literal_match_loop),
 		("emit tailrec list-spread loop", test_emit_tailrec_list_spread_loop),
 		("emit range for loop with dynamic step", test_emit_range_for_loop_with_dynamic_step),

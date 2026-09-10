@@ -1,6 +1,6 @@
 # Replace Name Registration With Dense Profile Function IDs
 
-**Status:** Ready for implementation
+**Status:** Implemented
 
 **Roadmap dependency:** None
 
@@ -63,7 +63,8 @@ small.
 - Keep two functions distinct even when their source/display names match.
 - Emit deterministic IDs and metadata for a deterministic input artifact.
 - Detect corrupt or out-of-range IDs explicitly.
-- Reduce profile-only generated C by storing each metadata string once.
+- Store each metadata string once rather than repeating an identity string at
+  both probes, and measure the total profile-only generated-C size separately.
 - Leave non-profiled C byte-identical to the current non-profiled route.
 
 ## Non-Goals
@@ -101,10 +102,9 @@ before declaration rendering:
 struct ProfileFunctionId { value: Int }
 
 struct ProfileFunctionMetadata {
-    id: ProfileFunctionId,
     logical_name: String,
     c_symbol: String,
-    module_path: String,
+    module_path: Option[String],
     definition_id: Int,
 }
 
@@ -119,7 +119,7 @@ if a stronger type is available. Generated helpers without a source definition
 must use an explicit origin variant or documented sentinel-free optional field,
 not a fabricated definition number.
 
-IDs are dense indexes into `functions`:
+The metadata list position is the ID. IDs are dense indexes into `functions`:
 
 ```text
 0 <= id < functions.length()
@@ -345,27 +345,199 @@ and must materially improve a compiler-sized exact profile whose function
 inventory exceeds the old cap. If wall time is noisy, retired instructions and
 the eliminated lookup/lock counts are the primary evidence.
 
+## Implementation Result
+
+Implemented on 2026-09-09 from parent `f3fbb5542641ff42fe50acd7683cdf4ffa70f656`.
+The final backend builds one private profile plan from projected declaration
+order. Only body-bearing user functions and the program entrypoint receive
+dense IDs, matching the pre-change instrumentation boundary. Builtins, foreign
+declarations, bodyless declarations, and closure bodies remain outside exact
+profiling. Metadata list position is the sole ID authority; the plan does not
+store a redundant ID field.
+
+Generated artifacts now contain one immutable metadata table and numeric
+`blorp_profile_start_id` / `blorp_profile_end_id` probes. The runtime allocates
+exactly one counter entry per metadata row and indexes it directly. The old
+fixed registry, TLS name cache, linear string comparison, registration mutex,
+and string-keyed fallback were deleted. Reports retain both logical names and
+compact C symbols so duplicate logical labels remain distinct.
+
+The implementation also corrected an existing balancing defect: direct
+returns inside lowered tail-recursive bodies previously received a start probe
+without an end probe. The function emission context now carries only the
+optional numeric function ID into that narrow return renderer. Closure and
+global contexts carry `None`, so this does not expand profiling eligibility or
+introduce managed-string traffic in non-profile emission.
+
+The transitional diagnostics row reports:
+
+```text
+functions_described functions_observed calls_completed
+invalid_start_ids invalid_end_ids unmatched_ends out_of_order_ends
+metadata_initialization_failures stack_overflows
+```
+
+Each active frame retains its start epoch. This preserves the existing rule
+that frames crossing a window boundary are discarded without falsely reporting
+their later ends as unmatched. Starts that race a window boundary carry a
+reserved suppressed epoch, so they cannot become measured frames if a new
+window opens before the frame is pushed. The callable-header benchmark marker
+ignores suppressed frames and continues to inspect the current measured
+frame's logical metadata name; normal entry/exit performs no string lookup.
+
+### Controlled Evidence
+
+Raw logs are retained locally under ignored
+`logs/profiling-issue-01/final-sentinel-measurement/`. The final production patch
+SHA-256 relative to `f3fbb554` is
+`53db1781ef91bf09f1c5d3a58b3988c1c647aa808e26213e09cc3da74830c10a`.
+The compiler bootstrap was `dev-174983f4e9a9`
+(`0.0.1-dev.174983f4e9a9`, Apple arm64 SHA-256
+`4577f9e001903d91f7c7f7977856c7548dc279c1c174d6e3ed64dcaf2eb06da7`).
+The host compiler was Apple Clang 21.0.0. All measured native and compiler
+binaries used `-O2 -fwrapv -pipe -w`.
+
+| Identity | SHA-256 |
+| --- | --- |
+| Parent build compiler from `f3fbb554` | `4f48e00801aa38cd47108f4c66e249903786a70ed99da124b6337bb1d22080c5` |
+| Final candidate build compiler | `289cb9afd8a964de9291ba4c45bea64c25557d3dafb0f01da53cb4f8a9ccb229` |
+| Parent optimized plain compiler | `6e02086fb3b3652999aecec18f7ebdbd81fdbc90617b38c0095d222d6b54f439` |
+| Parent optimized profiled compiler | `cd7b94d9dc3ffdffe3567130b982bddeaea5d0eede044c478024bd06993a3a23` |
+| Candidate optimized plain compiler | `dd59905781d4f28bd8e0f97d91fb093d1de40bef0e31b8699bb2f072c6146597` |
+| Candidate optimized profiled compiler | `7344900c80e2109730cd305fe0b2df3b79b63cd54cd8651bd8e296a1ff66efcf` |
+
+The final generated-C artifact sizes were:
+
+| Profile-only C overhead | Parent | Candidate | Delta |
+| --- | ---: | ---: | ---: |
+| Bytes | 3,454,074 | 3,885,391 | +12.49% |
+| Lines | 36,224 | 48,320 | +33.39% |
+
+The candidate stores each descriptive string once, but its metadata rows also
+carry the C symbol, optional module path, definition ID, and flags. That richer
+identity inventory outweighed removal of the second probe-name literal, so the
+aggregate profile-only C artifact grew. Non-profile artifacts contain neither
+the table nor probes and remained byte-identical across the parent and
+candidate compilers for the measured source and flags.
+
+The parent cache-miss and registry-mutex acquisition counts requested by the
+measurement plan were not captured: the retained parent executable exposes no
+such counters, and no temporary instrumented parent artifact was retained.
+The candidate source and generated C prove structurally that the registry,
+cache, string lookup, and registry mutex are absent, but modeled or inferred
+parent counts are not substituted for measured facts. That evidence item
+therefore remains incomplete.
+
+Each workload used one warmup followed by seven serial alternating runs.
+`/usr/bin/time -l` supplied wall, RSS, retired-instruction, and cycle
+measurements. Medians below include median absolute deviation and range.
+
+The native control called one non-inlined empty leaf 1,000,000 times. Plain and
+profiled variants used the same optimized runtime for their side. Internal
+elapsed samples in milliseconds were:
+
+```text
+parent plain:      0.799 0.672 0.690 0.674 0.672 0.672 0.675
+candidate plain:   0.798 0.672 0.672 0.673 0.684 0.672 0.672
+parent exact:     40.955 39.225 38.848 38.779 38.713 39.044 39.176
+candidate exact:  38.366 38.293 38.446 38.618 38.874 38.561 38.853
+```
+
+| Native metric | Parent exact median, MAD (range) | Candidate exact median, MAD (range) | Exact delta |
+| --- | ---: | ---: | ---: |
+| Internal elapsed ms | 39.044, 0.196 (38.713-40.955) | 38.561, 0.195 (38.293-38.874) | -1.24% |
+| Retired instructions | 624,844,742, 57,123 (624,781,736-624,957,901) | 581,952,486, 32,903 (581,897,615-582,031,882) | -6.86% |
+| Cycles | 177,217,253, 119,921 (176,804,959-177,950,902) | 176,592,511, 236,924 (176,341,655-176,866,574) | -0.35% |
+| Peak RSS bytes | 1,753,088 | 1,818,624 | +3.74% |
+
+The plain native medians were 0.674 ms for the parent and 0.672 ms for the
+candidate. Exact overhead was 5,693% for the parent and 5,638% for the
+candidate because clock reads and shared
+atomics dominate a single-function leaf; Issue 4 owns local aggregation. The
+dense route nevertheless retired 6.86% fewer instructions and did not regress
+elapsed time.
+
+The optimized compiler workload was exactly:
+
+```bash
+<compiler> compile --std-dir standard_library/src --no-format \
+  --no-embed-runtime --time-phases -o <temporary-output> blorp/src/main.brp
+```
+
+Every one of the 28 measured invocations emitted byte-identical C with SHA-256
+`944ad986818d2dd542ed3194c58e8e0e51012bdb6d0e8cfaea0930cc4a682899`.
+Raw process-wall samples in seconds were:
+
+```text
+parent plain:      27.61 27.58 27.54 27.44 27.20 27.38 27.55
+candidate plain:   27.22 27.15 27.55 27.22 27.41 27.28 27.38
+parent exact:     480.73 480.63 481.38 482.12 482.27 483.91 482.35
+candidate exact:   61.08  61.12  61.07  61.16  60.92  61.20  61.22
+```
+
+| Compiler metric | Parent exact median, MAD (range) | Candidate exact median, MAD (range) | Exact delta |
+| --- | ---: | ---: | ---: |
+| Process wall s | 482.12, 0.74 (480.63-483.91) | 61.12, 0.05 (60.92-61.22) | -87.32% |
+| Phase total ms | 470,017.866, 771.145 (468,436.144-471,790.476) | 54,544.224, 61.435 (54,335.125-54,656.156) | -88.40% |
+| Retired instructions | 8,637,514,249,007, 97,792,591 (8,637,416,456,416-8,638,089,423,242) | 911,654,493,391, 46,304,719 (911,492,070,018-911,774,814,776) | -89.45% |
+| Cycles | 1,951,157,701,739, 2,501,411,028 (1,946,717,200,301-1,958,021,725,201) | 247,464,160,104, 257,556,985 (246,814,300,911-247,823,774,555) | -87.32% |
+| Peak RSS bytes | 2,764,488,704, 49,152 (2,764,374,016-2,765,504,512) | 2,763,145,216, 131,072 (2,762,260,480-2,763,620,352) | -0.05% |
+
+Plain compiler medians were 27.54 s parent and 27.28 s candidate (-0.94%),
+with retired instructions differing by -0.01% and peak RSS by +0.01%.
+Exact-profile process overhead relative to each plain binary fell from 1,651%
+to 124%; phase-total overhead fell from 1,726% to 114%.
+
+The final candidate described 12,084 functions, observed 7,247, and completed
+962,939,075 balanced calls in every run. All invalid-ID, unmatched-end,
+out-of-order-end, metadata-failure, and stack-overflow counters were zero. The
+parent emitted over 12,000 string probes but its runtime could register only
+1,024 entries. The exact comparison therefore favors the candidate despite it
+recording substantially more functions; the native leaf is the
+equivalent-logical-work control.
+
+The concurrent Blorp profile-window fixture also passed with crossing functions
+excluded and every loss/corruption counter zero. The generated 4,096-leaf
+integration fixture described 4,167 functions, observed 4,164, and completed
+4,164 calls with no loss. Its non-profile output remains byte-identical between
+explicitly disabled and default emission.
+
+### Remaining Limits
+
+- Exact timing is still wall-inclusive and uses shared atomic counters; Issues
+  3 and 4 own fiber-correct timing, self time, and local aggregation.
+- `BLORP_PROFILE_MAX_STACK` remains intentionally until Issue 3, but every
+  overflow is now explicit.
+- The legacy one-frame `FLAME:` rows remain until Issue 4 replaces the output
+  schema; they are not claimed as real stacks.
+- Runtime counter storage uses one raw `calloc` plus one report snapshot
+  allocation. These are visible in RSS/native allocation tools but are outside
+  Blorp object-allocation counters.
+- Closure-body profiling remains unchanged and out of scope.
+
 ## Acceptance Criteria
 
-- [ ] `BLORP_PROFILE_MAX_FUNCS` and the fixed `profile_entries` array are gone.
-- [ ] No replacement policy cap limits the number of described functions.
-- [ ] Generated probes carry numeric IDs and perform direct indexed lookup.
-- [ ] The name cache, registry mutex, linear string search, and name-keyed
+- [x] `BLORP_PROFILE_MAX_FUNCS` and the fixed `profile_entries` array are gone.
+- [x] No replacement policy cap limits the number of described functions.
+- [x] Generated probes carry numeric IDs and perform direct indexed lookup.
+- [x] The name cache, registry mutex, linear string search, and name-keyed
       fallback are removed from production.
-- [ ] Every profile metadata row has unique artifact-local identity plus
+- [x] Every profile metadata row has unique artifact-local identity plus
       readable logical and C-symbol metadata.
-- [ ] The >1,024 integration fixture reports every called function.
-- [ ] Duplicate display names remain distinct.
-- [ ] Corrupt IDs and initialization failure are explicit diagnostics.
-- [ ] The retained fixed stack reports every overflow until Issue 3 removes the
+- [x] The >1,024 integration fixture reports every called function.
+- [x] Duplicate display names remain distinct.
+- [x] Corrupt IDs and initialization failure are explicit diagnostics.
+- [x] The retained fixed stack reports every overflow until Issue 3 removes the
       limit.
-- [ ] Non-profiled generated C is byte-identical to the parent for the same
+- [x] Non-profiled generated C is byte-identical to the parent for the same
       input and flags.
-- [ ] Profiled C stores each metadata string once and does not grow two repeated
+- [x] Profiled C stores each metadata string once and does not grow two repeated
       name literals per function.
-- [ ] Focused, CLI, runtime, leak, and quality owners pass.
-- [ ] Before/after profiler overhead and artifact-size evidence is retained in
+- [x] Focused, CLI, runtime, leak, and quality owners pass.
+- [x] Before/after profiler overhead and artifact-size evidence is retained in
       the change report.
+- [ ] Exact parent cache-miss and registry-mutex acquisition counts were
+      captured; the retained parent artifact did not expose them.
 
 ## Pitfalls And Review Questions
 

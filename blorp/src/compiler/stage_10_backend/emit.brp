@@ -6,6 +6,21 @@
 -- separately by build_artifact.
 import:
 	../../lib/build_artifact: CArtifact
+	../../lib/function_profile:
+		FunctionProfileConfiguration(
+			FunctionProfileCalls,
+			FunctionProfileExact,
+			FunctionProfileOff,
+		),
+		FunctionProfileMode(
+			FunctionProfileCallsMode,
+			FunctionProfileExactMode,
+			FunctionProfileOffMode,
+		),
+		FunctionProfileSelector(ProfileFunction, ProfileModule),
+		function_profile_mode,
+		function_profile_selectors,
+	../stage_08_core_lower/identity: core_module_member_name
 	../stage_09_core/c_type_layout as TypeLayout
 	../stage_09_core/ir:
 		CoreAccessor(
@@ -879,6 +894,9 @@ union CoreEmitError:
 	UnsupportedGlobalInitializer(String)
 	CallableSymbolProjectionFailed(CSymbolProjectionError)
 	InvalidStaticStringLiteralPool(StaticStringLiteralPoolError)
+	UnknownProfileModule(String)
+	UnknownProfileFunction(String, String)
+	AmbiguousProfileFunction(String, String)
 
 
 pure func core_emit_error_message(error: CoreEmitError) -> String:
@@ -897,11 +915,44 @@ pure func core_emit_error_message(error: CoreEmitError) -> String:
 					"static string literal bytes use conflicting IDs `${first_id}` and `${second_id}`"
 				UnpooledValueStringLiteral(value):
 					"unpooled value-position string literal reached the backend"
+		UnknownProfileModule(module_path):
+			"unknown profile module `${module_path}`; expected a workspace-relative logical module path"
+		UnknownProfileFunction(module_path, function_name):
+			"unknown profile function `${module_path}::${function_name}`; expected --profile-function <module>::<emitted-logical-function>"
+		AmbiguousProfileFunction(module_path, function_name):
+			"ambiguous profile function `${module_path}::${function_name}`; multiple emitted functions share this exact module/name identity"
 
 
-private DEFAULT_PROFILE_ENABLED: Bool = False
+private DEFAULT_PROFILE_CONFIGURATION: FunctionProfileConfiguration = FunctionProfileOff
 
 private MANGLED_DEF_ID_PREFIX: String = "__def_"
+
+
+private struct ProfileFunctionId {
+	value: Int,
+	mode: FunctionProfileMode
+}
+
+
+private record ProfileFunctionMetadata {
+	logical_name: String,
+	c_symbol: String,
+	module_path: Option[String],
+	definition_id: Int
+}
+
+
+private record ProfileEmissionPlan {
+	mode: FunctionProfileMode,
+	described_count: Int,
+	functions: List[ProfileFunctionMetadata]
+}
+
+
+private record ProfileSelectorIndex {
+	modules: Dict[String, Bool],
+	functions: Dict[String, Bool]
+}
 
 
 private record FunctionBodyC {
@@ -913,7 +964,8 @@ private record FunctionBodyC {
 
 
 private record FunctionEmissionContext {
-	cleanup_plan: CancellationProtectionPlan
+	cleanup_plan: CancellationProtectionPlan,
+	profile_function_id: Option[ProfileFunctionId]
 }
 
 
@@ -927,6 +979,7 @@ private pure func function_emission_context(
 	func_info: CoreFunction,
 	body: CoreExpr,
 	program_summary: CancellationProgramSummary,
+	profile_function_id: Option[ProfileFunctionId],
 ) -> FunctionEmissionContext:
 	identity: CoreDefinitionIdentity = {
 		name = func_info.name,
@@ -943,7 +996,10 @@ private pure func function_emission_context(
 		None:
 			build_current_behavior_cancellation_plan(activation, body)
 
-	{cleanup_plan = plan}
+	{
+		cleanup_plan = plan,
+		profile_function_id = profile_function_id
+	}
 
 
 private pure func global_emission_context(
@@ -965,14 +1021,20 @@ private pure func global_emission_context(
 		None:
 			build_current_behavior_cancellation_plan(activation, global.init)
 
-	{cleanup_plan = plan}
+	{
+		cleanup_plan = plan,
+		profile_function_id = None
+	}
 
 
 private pure func diagnostic_emission_context(expr: CoreExpr) -> FunctionEmissionContext:
-	{cleanup_plan = build_current_behavior_cancellation_plan(FunctionCancellationActivation({
+	{
+		cleanup_plan = build_current_behavior_cancellation_plan(FunctionCancellationActivation({
 				name = "__backend_diagnostic",
 				def_id = -1,
-			}), expr)}
+			}), expr),
+		profile_function_id = None
+	}
 
 
 private MIN_STRING_LENGTH_DISPATCH_CASES: Int = 4
@@ -1230,6 +1292,205 @@ private pure func c_function_name(func_info: CoreFunction) -> String:
 		c_identifier(func_info.name)
 
 
+private pure func profile_function_is_eligible(func_info: CoreFunction) -> Bool:
+	(
+		func_info.body.is_some()
+		and ((
+			func_info.function_kind == UserFunction
+			or func_info.function_kind == ProgramEntrypointFunction
+		))
+	)
+
+
+private pure func described_profile_functions(
+	decls: List[CoreDecl],
+	projected: Option[CProjectedProgram],
+) -> List[ProfileFunctionMetadata]:
+	var functions: List[ProfileFunctionMetadata] = []
+
+	for decl in decls:
+		match decl:
+			FunctionDecl(func_info):
+				if profile_function_is_eligible(func_info):
+					functions = functions.append({
+						logical_name = emitted_function_display_name(projected, func_info.name),
+						c_symbol = c_function_name(func_info),
+						module_path = func_info.source_module,
+						definition_id = func_info.def_id,
+					})
+			_:
+				void
+
+	functions
+
+
+private pure func profile_selector_index(
+	functions: List[ProfileFunctionMetadata],
+	selectors: List[FunctionProfileSelector],
+) -> Result[ProfileSelectorIndex, CoreEmitError]:
+	var described_modules: Dict[String, Bool] = {}
+	var described_function_counts: Dict[String, Int] = {}
+
+	for metadata in functions:
+		match metadata.module_path:
+			Some(module_path):
+				described_modules = described_modules.set(module_path, True)
+				function_key: String = profile_function_selector_key(
+					module_path,
+					metadata.logical_name,
+				)
+				described_function_counts = described_function_counts.set(
+					function_key,
+					described_function_counts.get_or(function_key, 0) + 1,
+				)
+			None:
+				void
+
+	var selected_modules: Dict[String, Bool] = {}
+	var selected_functions: Dict[String, Bool] = {}
+	var error: Option[CoreEmitError] = None
+
+	for selector in selectors:
+		if error.is_none():
+			match selector:
+				ProfileModule(module_path):
+					if not described_modules.contains(module_path):
+						error = Some(UnknownProfileModule(module_path))
+					else:
+						selected_modules = selected_modules.set(module_path, True)
+				ProfileFunction(module_path, function_name):
+					logical_name: String = core_module_member_name(module_path, function_name)
+					function_key: String = profile_function_selector_key(module_path, logical_name)
+					function_count: Int = described_function_counts.get_or(function_key, 0)
+
+					if not described_modules.contains(module_path):
+						error = Some(UnknownProfileModule(module_path))
+					else if function_count == 0:
+						error = Some(UnknownProfileFunction(module_path, function_name))
+					else if function_count > 1:
+						error = Some(AmbiguousProfileFunction(module_path, function_name))
+					else:
+						selected_functions = selected_functions.set(function_key, True)
+
+	match error:
+		Some(existing):
+			Err(existing)
+		None:
+			Ok({
+				modules = selected_modules,
+				functions = selected_functions,
+			})
+
+
+private pure func profile_function_selector_key(
+	module_path: String,
+	logical_name: String,
+) -> String:
+	-- The length prefix keeps the pair injective even when either component
+	-- contains the Core module separator.
+	module_path
+		.length()
+		.to_string() + ":" + module_path + logical_name
+
+
+private pure func profile_selector_index_selects(
+	index: ProfileSelectorIndex,
+	metadata: ProfileFunctionMetadata,
+) -> Bool:
+	match metadata.module_path:
+		Some(module_path):
+			(
+				index.modules.contains(module_path)
+				or index.functions.contains(
+					profile_function_selector_key(
+						module_path,
+						metadata.logical_name,
+					),
+				)
+			)
+		None:
+			False
+
+
+private pure func select_profile_functions(
+	functions: List[ProfileFunctionMetadata],
+	selectors: List[FunctionProfileSelector],
+) -> Result[List[ProfileFunctionMetadata], CoreEmitError]:
+	if selectors.length() == 0:
+		Ok(functions)
+	else:
+		index ?= profile_selector_index(functions, selectors)
+		Ok(functions.filter(
+			func(metadata): profile_selector_index_selects(index, metadata),
+		))
+
+
+private pure func profile_emission_plan(
+	decls: List[CoreDecl],
+	projected: Option[CProjectedProgram],
+	configuration: FunctionProfileConfiguration,
+) -> Result[Option[ProfileEmissionPlan], CoreEmitError]:
+	match configuration:
+		FunctionProfileOff:
+			Ok(None)
+		FunctionProfileCalls(_) | FunctionProfileExact(_):
+			described: List[ProfileFunctionMetadata] = described_profile_functions(decls, projected)
+			selectors: List[FunctionProfileSelector] = function_profile_selectors(configuration)
+			selected ?= select_profile_functions(described, selectors)
+
+			if selected.length() == 0:
+				Ok(None)
+			else:
+				Ok(Some({
+					mode = function_profile_mode(configuration),
+					described_count = described.length(),
+					functions = selected,
+				}))
+
+
+private pure func emit_profile_metadata(plan: Option[ProfileEmissionPlan]) -> String:
+	match plan:
+		Some(profile_plan):
+			if profile_plan.functions.length() == 0:
+				""
+			else:
+				var rows: String = make_string(0)
+
+				for metadata in profile_plan.functions:
+					module_path: String = match metadata.module_path:
+						Some(path):
+							c_string_literal(path)
+						None:
+							"NULL"
+
+					flags: String = if metadata.module_path.is_some():
+						"BLORP_PROFILE_METADATA_HAS_MODULE"
+					else:
+						"0u"
+
+					rows += "  {" + c_string_literal(
+						metadata.logical_name,
+					) + ", " + c_string_literal(
+						metadata.c_symbol,
+					) + ", " + module_path + ", " + metadata.definition_id.to_string() + ", " + flags + "},\n"
+
+				profile_mode_name: String = match profile_plan.mode:
+					FunctionProfileCallsMode:
+						"calls"
+					FunctionProfileExactMode:
+						"exact"
+					FunctionProfileOffMode:
+						"off"
+
+				"/* BLORP_PROFILE mode=" + profile_mode_name + " functions_described=" + profile_plan.described_count.to_string() + " functions_selected=" + profile_plan.functions
+					.length()
+					.to_string() + " */\n" + "static const blorp_ProfileFunctionMetadata __blorp_profile_functions[" + profile_plan.functions
+					.length()
+					.to_string() + "] = {\n" + rows + "};\n\n"
+		None:
+			""
+
+
 private pure func c_function_signature(func_info: CoreFunction) -> String:
 	if entrypoint_has_source_args(func_info):
 		c_return_type(func_info) + " " + c_function_name(func_info) + "(int argc, char** argv)"
@@ -1271,25 +1532,58 @@ private pure func entrypoint_arg_cleanup(func_info: CoreFunction) -> String:
 		""
 
 
-private pure func emit_profile_runtime_setup(profile_enabled: Bool) -> String:
-	if profile_enabled:
-		"  blorp_profile_enable();\n  atexit(blorp_profile_report);\n"
-	else:
-		""
+private pure func emit_profile_runtime_setup(plan: Option[ProfileEmissionPlan]) -> String:
+	match plan:
+		Some(profile_plan):
+			profile_mode: String = match profile_plan.mode:
+				FunctionProfileCallsMode:
+					"BLORP_PROFILE_MODE_CALLS"
+				FunctionProfileExactMode:
+					"BLORP_PROFILE_MODE_EXACT"
+				FunctionProfileOffMode:
+					"BLORP_PROFILE_MODE_OFF"
+
+			"  if (blorp_profile_enable(" + profile_mode + ", __blorp_profile_functions, " + profile_plan.functions
+				.length()
+				.to_string() + ", " + profile_plan.described_count.to_string() + ") != 0) return 1;\n  atexit(blorp_profile_report);\n"
+		None:
+			""
 
 
-private pure func emit_profile_start(profile_enabled: Bool, name: String) -> String:
-	if profile_enabled:
-		"  blorp_profile_start(" + c_string_literal(name) + ");\n"
-	else:
-		""
+private pure func emit_profile_start(profile_function_id: Option[ProfileFunctionId]) -> String:
+	match profile_function_id:
+		Some(id):
+			match id.mode:
+				FunctionProfileCallsMode:
+					"  blorp_profile_count_id(" + id.value.to_string() + ");\n"
+				FunctionProfileExactMode:
+					"  blorp_profile_start_id(" + id.value.to_string() + ");\n"
+				FunctionProfileOffMode:
+					""
+		None:
+			""
 
 
-private pure func emit_profile_end(profile_enabled: Bool, name: String) -> String:
-	if profile_enabled:
-		"  blorp_profile_end(" + c_string_literal(name) + ");\n"
-	else:
-		""
+private pure func emit_profile_end(profile_function_id: Option[ProfileFunctionId]) -> String:
+	match profile_function_id:
+		Some(id):
+			match id.mode:
+				FunctionProfileExactMode:
+					"  blorp_profile_end_id(" + id.value.to_string() + ");\n"
+				FunctionProfileCallsMode | FunctionProfileOffMode:
+					""
+		None:
+			""
+
+
+private pure func profile_function_requires_exit(
+	profile_function_id: Option[ProfileFunctionId],
+) -> Bool:
+	match profile_function_id:
+		Some(id):
+			id.mode == FunctionProfileExactMode
+		None:
+			False
 
 
 private pure func c_param_list(params: List[CoreParam]) -> String:
@@ -11739,6 +12033,7 @@ private pure func emit_closure_body_function(
 				func_info,
 				body,
 				program_summary,
+				None,
 			)
 			param_decls ?= closure_param_decls(abi.params)
 			env_prelude ?= closure_env_prelude(abi, emission_context)
@@ -13151,12 +13446,22 @@ private pure func emit_tailrec_return(
 	body_c ?= emit_function_body(expr, next_temp, emission_context)
 
 	if TypeLayout.is_void_type(return_type):
-		Some(terminal_body(discard_expr_body(expr, body_c) + "  return;\n", body_c.next_temp))
+		Some(
+			terminal_body(
+				discard_expr_body(
+					expr,
+					body_c,
+				) + emit_profile_end(emission_context.profile_function_id) + "  return;\n",
+				body_c.next_temp,
+			),
+		)
 	else:
 		return_value ?= required_body_value(body_c)
 		Some(
 			terminal_body(
-				body_c.statements + "  return " + return_value + ";\n",
+				body_c.statements + emit_profile_end(
+					emission_context.profile_function_id,
+				) + "  return " + return_value + ";\n",
 				body_c.next_temp,
 			),
 		)
@@ -20954,8 +21259,8 @@ private pure func emit_channel_attempt_user_function(
 private pure func emit_supported_user_function(
 	decls: List[CoreDecl],
 	func_info: CoreFunction,
-	profile_enabled: Bool,
-	display_name: String,
+	profile_plan: Option[ProfileEmissionPlan],
+	profile_function_id: Option[ProfileFunctionId],
 	program_summary: CancellationProgramSummary,
 ) -> Option[String]:
 	match func_info.body:
@@ -20964,13 +21269,14 @@ private pure func emit_supported_user_function(
 				func_info,
 				body,
 				program_summary,
+				profile_function_id,
 			)
 
-			if profile_enabled:
+			if profile_function_id.is_some():
 				emit_general_supported_user_function(
-					profile_enabled,
+					profile_plan,
+					profile_function_id,
 					func_info,
-					display_name,
 					emission_context,
 				)
 			else:
@@ -20979,9 +21285,9 @@ private pure func emit_supported_user_function(
 						Some(c_code)
 					None:
 						emit_general_supported_user_function(
-							profile_enabled,
+							profile_plan,
+							profile_function_id,
 							func_info,
-							display_name,
 							emission_context,
 						)
 		None:
@@ -20989,9 +21295,9 @@ private pure func emit_supported_user_function(
 
 
 private pure func emit_general_supported_user_function(
-	profile_enabled: Bool,
+	profile_plan: Option[ProfileEmissionPlan],
+	profile_function_id: Option[ProfileFunctionId],
 	func_info: CoreFunction,
-	display_name: String,
 	emission_context: FunctionEmissionContext,
 ) -> Option[String]:
 	match func_info.body:
@@ -21001,7 +21307,6 @@ private pure func emit_general_supported_user_function(
 					prefix: String = c_function_signature(func_info) + " {\n"
 					body_prelude: String = entrypoint_arg_prelude(func_info)
 					body_cleanup: String = entrypoint_arg_cleanup(func_info)
-					profile_name: String = display_name
 					is_entrypoint_function: Bool = func_info.function_kind == ProgramEntrypointFunction
 
 					global_init: String = if is_entrypoint_function:
@@ -21010,13 +21315,12 @@ private pure func emit_general_supported_user_function(
 						""
 
 					profile_runtime_setup: String = if is_entrypoint_function:
-						emit_profile_runtime_setup(profile_enabled)
+						emit_profile_runtime_setup(profile_plan)
 					else:
 						""
 
-					body_prefix: String = prefix + global_init + profile_runtime_setup + body_prelude + emit_profile_start(
-						profile_enabled,
-						profile_name,
+					body_prefix: String = prefix + profile_runtime_setup + global_init + body_prelude + emit_profile_start(
+						profile_function_id,
 					)
 
 					if TypeLayout.is_void_type(func_info.return_type):
@@ -21025,36 +21329,36 @@ private pure func emit_general_supported_user_function(
 								body_prefix + discard_body(
 									body_c,
 								) + emit_profile_end(
-									profile_enabled,
-									profile_name,
+									profile_function_id,
 								) + body_cleanup + "  return 0;\n}\n",
 							)
 						else:
 							Some(
 								body_prefix + discard_body(
 									body_c,
-								) + emit_profile_end(profile_enabled, profile_name) + "}\n",
+								) + emit_profile_end(profile_function_id) + "}\n",
 							)
 					else:
 						match required_body_value(body_c):
 							Some(return_value):
 								if (
 									is_entrypoint_function
-									and (entrypoint_has_source_args(func_info) or profile_enabled)
+									and ((
+										entrypoint_has_source_args(func_info)
+										or profile_function_requires_exit(profile_function_id)
+									))
 								):
 									Some(
 										body_prefix + body_c.statements + "  int __blorp_main_result = (int)" + return_value + ";\n" + emit_profile_end(
-											profile_enabled,
-											profile_name,
+											profile_function_id,
 										) + body_cleanup + "  return (int)__blorp_main_result;\n}\n",
 									)
-								else if profile_enabled:
+								else if profile_function_requires_exit(profile_function_id):
 									Some(
 										body_prefix + body_c.statements + "  " + c_return_type(
 											func_info,
 										) + " __blorp_profile_result = " + return_value + ";\n" + emit_profile_end(
-											profile_enabled,
-											profile_name,
+											profile_function_id,
 										) + "  return __blorp_profile_result;\n}\n",
 									)
 								else:
@@ -21075,7 +21379,8 @@ private pure func emit_general_supported_user_function(
 private pure func emit_function(
 	decls: List[CoreDecl],
 	func_info: CoreFunction,
-	profile_enabled: Bool,
+	profile_plan: Option[ProfileEmissionPlan],
+	profile_function_id: Option[ProfileFunctionId],
 	display_name: String,
 	internal_linkage: Bool,
 	program_summary: CancellationProgramSummary,
@@ -21087,8 +21392,8 @@ private pure func emit_function(
 					match emit_supported_user_function(
 						decls,
 						func_info,
-						profile_enabled,
-						display_name,
+						profile_plan,
+						profile_function_id,
 						program_summary,
 					):
 						Some(c_code):
@@ -21103,8 +21408,8 @@ private pure func emit_function(
 					match emit_supported_user_function(
 						decls,
 						func_info,
-						profile_enabled,
-						display_name,
+						profile_plan,
+						profile_function_id,
 						program_summary,
 					):
 						Some(c_code):
@@ -24068,24 +24373,66 @@ private pure func emitted_function_display_name(
 			emitted_name
 
 
+private pure func profile_metadata_matches_function(
+	metadata: ProfileFunctionMetadata,
+	func_info: CoreFunction,
+) -> Bool:
+	metadata.definition_id == func_info.def_id and metadata.module_path == func_info.source_module
+
+
+private pure func profile_function_id_at_cursor(
+	profile_plan: Option[ProfileEmissionPlan],
+	next_profile_id: Int,
+	func_info: CoreFunction,
+) -> Option[ProfileFunctionId]:
+	match profile_plan:
+		Some(plan):
+			match plan.functions.get(next_profile_id):
+				Some(metadata):
+					if profile_metadata_matches_function(metadata, func_info):
+						Some({
+							value = next_profile_id,
+							mode = plan.mode,
+						})
+					else:
+						None
+				None:
+					None
+		None:
+			None
+
+
 private pure func emit_function_decls(
 	decls: List[CoreDecl],
-	profile_enabled: Bool,
+	profile_plan: Option[ProfileEmissionPlan],
 	projected: Option[CProjectedProgram],
 	internal_linkage: Bool,
 	program_summary: CancellationProgramSummary,
 ) -> String:
 	var c_code: String = make_string(0)
+	var next_profile_id: Int = 0
 
+	-- Selection preserves declaration order, so one cursor assigns IDs without
+	-- scanning the selected list for every emitted function.
 	for decl in decls:
 		match decl:
 			FunctionDecl(func_info):
+				profile_function_id: Option[ProfileFunctionId] = profile_function_id_at_cursor(
+					profile_plan,
+					next_profile_id,
+					func_info,
+				)
+
+				if profile_function_id.is_some():
+					next_profile_id += 1
+
 				c_code = append_emitted_c(
 					c_code,
 					emit_function(
 						decls,
 						func_info,
-						profile_enabled,
+						profile_plan,
+						profile_function_id,
 						emitted_function_display_name(projected, func_info.name),
 						internal_linkage,
 						program_summary,
@@ -24182,7 +24529,7 @@ private pure func emit_static_closure_forward_decls(decls: List[CoreDecl]) -> St
 
 private pure func emit_decls(
 	program: CoreProgram,
-	profile_enabled: Bool,
+	profile_configuration: FunctionProfileConfiguration,
 	projected: Option[CProjectedProgram],
 	canonical_empty_lists: List[CanonicalEmptyList],
 	internal_linkage: Bool,
@@ -24196,6 +24543,9 @@ private pure func emit_decls(
 		func(error): InvalidStaticStringLiteralPool(error),
 	)
 	global_init ?= emit_global_init_function(decls, cancellation_summary)
+
+	profile_plan ?= profile_emission_plan(decls, projected, profile_configuration)
+
 	var c_code: String = make_string(0)
 	c_code = append_emitted_c(c_code, emit_heap_record_and_union_forward_decls(decls))
 	c_code = append_emitted_c(
@@ -24221,15 +24571,10 @@ private pure func emit_decls(
 	)
 	c_code = append_emitted_c(c_code, emit_global_decls(decls))
 	c_code = append_emitted_c(c_code, global_init)
+	c_code = append_emitted_c(c_code, emit_profile_metadata(profile_plan))
 	c_code = append_emitted_c(
 		c_code,
-		emit_function_decls(
-			decls,
-			profile_enabled,
-			projected,
-			internal_linkage,
-			cancellation_summary,
-		),
+		emit_function_decls(decls, profile_plan, projected, internal_linkage, cancellation_summary),
 	)
 	Ok(c_code)
 
@@ -24246,7 +24591,7 @@ private pure func error_artifact(error: CoreEmitError) -> CArtifact:
 
 pure func try_emit_prepared_core_program_c_artifact_with_profile(
 	prepared: PreparedCoreProgram,
-	profile_enabled: Bool,
+	profile_configuration: FunctionProfileConfiguration,
 ) -> Result[CArtifact, CoreEmitError]:
 	program: CoreProgram = prepared_core_program_value(prepared)
 
@@ -24257,7 +24602,7 @@ pure func try_emit_prepared_core_program_c_artifact_with_profile(
 			projected_program: CoreProgram = projected_core_program_value(projected)
 			decls_c ?= emit_decls(
 				projected_program,
-				profile_enabled,
+				profile_configuration,
 				Some(projected),
 				projected_canonical_empty_lists(projected),
 				True,
@@ -24273,7 +24618,7 @@ pure func try_emit_prepared_core_program_c_artifact_with_profile(
 
 pure func try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
 	prepared: PreparedCoreProgram,
-	profile_enabled: Bool,
+	profile_configuration: FunctionProfileConfiguration,
 ) -> Result[CArtifact, CoreEmitError]:
 	program: CoreProgram = prepared_core_program_value(prepared)
 	canonical_empty_lists ?= canonical_empty_lists_for_unprojected_program(
@@ -24282,7 +24627,7 @@ pure func try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
 		func(error): CallableSymbolProjectionFailed(error),
 	)
 
-	decls_c ?= emit_decls(program, profile_enabled, None, canonical_empty_lists, False)
+	decls_c ?= emit_decls(program, profile_configuration, None, canonical_empty_lists, False)
 	Ok({
 		c_code = C_ARTIFACT_HEADER + emit_foreign_includes(program.foreign_includes) + decls_c,
 		link_flags = [],
@@ -24292,13 +24637,13 @@ pure func try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
 
 pure func emit_unprojected_core_program_c_artifact_with_profile_for_tests(
 	program: CoreProgram,
-	profile_enabled: Bool,
+	profile_configuration: FunctionProfileConfiguration,
 ) -> CArtifact:
 	prepared_program: PreparedCoreProgram = run_pre_dce_tail(program)
 
 	match try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
 		prepared_program,
-		profile_enabled,
+		profile_configuration,
 	):
 		Ok(artifact):
 			artifact
@@ -24308,15 +24653,15 @@ pure func emit_unprojected_core_program_c_artifact_with_profile_for_tests(
 
 pure func try_emit_core_program_c_artifact_with_profile(
 	program: CoreProgram,
-	profile_enabled: Bool,
+	profile_configuration: FunctionProfileConfiguration,
 ) -> Result[CArtifact, CoreEmitError]:
 	prepared_program: PreparedCoreProgram = run_pre_dce_tail(program)
 
-	try_emit_prepared_core_program_c_artifact_with_profile(prepared_program, profile_enabled)
+	try_emit_prepared_core_program_c_artifact_with_profile(prepared_program, profile_configuration)
 
 
 pure func emit_unprojected_core_program_c_artifact_for_tests(program: CoreProgram) -> CArtifact:
 	emit_unprojected_core_program_c_artifact_with_profile_for_tests(
 		program,
-		DEFAULT_PROFILE_ENABLED,
+		DEFAULT_PROFILE_CONFIGURATION,
 	)

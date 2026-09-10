@@ -2331,9 +2331,31 @@ void blorp_compiler_memory_checkpoint_c(const char* phase);
 void blorp_print_live_object_summary(void);
 blorp_SchedulerStats blorp_get_scheduler_stats(void);
 void blorp_reset_scheduler_stats(void);
-void blorp_profile_enable(void);
-void blorp_profile_start(const char* func_name);
-void blorp_profile_end(const char* func_name);
+#define BLORP_PROFILE_METADATA_HAS_MODULE 1u
+#ifndef BLORP_PROFILE_FUNCTION_METADATA_DEFINED
+#define BLORP_PROFILE_FUNCTION_METADATA_DEFINED
+typedef size_t blorp_ProfileFunctionId;
+typedef enum {
+    BLORP_PROFILE_MODE_OFF = 0,
+    BLORP_PROFILE_MODE_CALLS = 1,
+    BLORP_PROFILE_MODE_EXACT = 2,
+} blorp_ProfileMode;
+typedef struct {
+    const char* logical_name;
+    const char* c_symbol;
+    const char* module_path;
+    long definition_id;
+    unsigned int metadata_flags;
+} blorp_ProfileFunctionMetadata;
+#endif
+int blorp_profile_enable(
+    blorp_ProfileMode mode,
+    const blorp_ProfileFunctionMetadata* metadata,
+    size_t function_count,
+    size_t described_function_count);
+void blorp_profile_count_id(blorp_ProfileFunctionId id);
+void blorp_profile_start_id(blorp_ProfileFunctionId id);
+void blorp_profile_end_id(blorp_ProfileFunctionId id);
 void blorp_profile_window_begin(void);
 void blorp_profile_window_end(void);
 void blorp_profile_report(void);

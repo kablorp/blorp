@@ -333,7 +333,7 @@ run_case() {
         else
             while IFS= read -r expected; do
                 [ -z "$expected" ] && continue
-                if ! grep -qF -- "blorp_profile_start(\"$expected\");" "$profile_c_file"; then
+                if ! grep -qF -- "  {\"$expected\", " "$profile_c_file"; then
                     echo "DETAIL: $test_name (missing semantic callable: $expected)"
                     failed=1
                 fi
@@ -341,7 +341,7 @@ run_case() {
 
             while IFS= read -r forbidden; do
                 [ -z "$forbidden" ] && continue
-                if grep -qF -- "blorp_profile_start(\"$forbidden\");" "$profile_c_file"; then
+                if grep -qF -- "  {\"$forbidden\", " "$profile_c_file"; then
                     echo "DETAIL: $test_name (forbidden semantic callable present: $forbidden)"
                     failed=1
                 fi

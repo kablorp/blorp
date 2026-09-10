@@ -1,6 +1,6 @@
 # Introduce Explicit Count, Exact, And Selective Instrumentation Modes
 
-**Status:** Ready after Issue 1
+**Status:** Implemented
 
 **Roadmap dependency:** Dense profile function IDs
 
@@ -69,30 +69,32 @@ simpler ahead-of-time compiler-owned plan.
 - Do not add per-call argument or return-value logging.
 - Do not retain the Boolean option as a second production path.
 
-## Proposed Configuration Types
+## Implemented Configuration Types
 
 Use variants at the CLI boundary and preserve them through the compile plan:
 
 ```blorp
-union FunctionProfileMode:
-    FunctionProfileOff
-    FunctionProfileCalls
-    FunctionProfileExact
+enum FunctionProfileMode:
+	FunctionProfileOffMode
+	FunctionProfileCallsMode
+	FunctionProfileExactMode
 
 union FunctionProfileSelector:
-    ProfileAllFunctions
-    ProfileModule(module_path: String)
-    ProfileFunction(module_path: String, function_name: String)
+	ProfileModule(module_path: String)
+	ProfileFunction(module_path: String, function_name: String)
 
-struct FunctionProfileConfig {
-    mode: FunctionProfileMode,
-    selectors: List[FunctionProfileSelector],
-}
+union FunctionProfileConfiguration:
+	FunctionProfileOff
+	FunctionProfileCalls(List[FunctionProfileSelector])
+	FunctionProfileExact(List[FunctionProfileSelector])
 ```
 
-If current parser conventions favor enum-like nullary cases, follow them. Do
-not encode modes as strings or as booleans such as `profile`, `profile_calls`,
-and `profile_exact` that admit contradictory states.
+The configuration union makes selectors impossible in off mode. An empty
+selector list means all eligible emitted functions, so a separate all-functions
+selector is unnecessary. The benchmark JSON bridge retains its existing
+Boolean wire field and immediately converts it to exact-all or off; no
+production compile, pipeline, artifact, or backend API retains Boolean profile
+state.
 
 The profile emission plan from Issue 1 becomes:
 
@@ -320,25 +322,155 @@ compiler workload, selected exact mode must reduce instrumentation work in
 proportion to excluded completed calls; if it does not, investigate residual
 global work before accepting the slice.
 
+## Implementation Result
+
+The implementation preserves one typed `FunctionProfileConfiguration` from CLI
+parsing through artifact construction and backend emission. The backend first
+describes eligible emitted functions, validates selectors, filters that list,
+and only then renders metadata and probes. Selected functions retain final
+emission order and receive dense IDs in that order. Emission consumes that
+ordered selection with a single cursor, so each function does not rescan the
+selected metadata list. Selector validation and filtering first build exact
+module and collision-free length-prefixed composite-function dictionaries,
+then walk selectors and described functions once; repeatable selectors
+therefore do not create a functions-by-selectors scan or nested COW updates.
+
+Module selectors use exact workspace-relative `CoreFunction.source_module`
+paths. Function selectors use the exact emitted logical function identity. A
+monomorphized function therefore requires its specialization discriminator,
+for example `module::function__mono_Int`; the implementation does not guess a
+source-definition grouping that is no longer retained at this pipeline stage.
+Unknown modules, unknown functions, and duplicate exact emitted identities fail
+before C emission.
+
+Calls mode has a separate `calls_observed` total and emits only
+`blorp_profile_count_id(id)`. Exact mode retains `calls_completed` and balanced
+start/end probes. This naming is deliberate: a count-only entry is observed
+without claiming that the call returned. Both modes retain deferred signal
+polling. Runtime diagnostics distinguish described, selected, and nonzero
+observed function inventories and report all existing loss counters. The
+calls total is derived from the selected per-function counters when reporting;
+the hot path does not also update a contended global total.
+
+### Measurement identity and method
+
+- Parent revision: `13e391b29cb3ffeba3275ed4c79de748acac96be`
+- Final rebuilt compiler SHA-256: `02be0557261cb11ddc24f35d1388243f6421e458ea3359cb34718d2b4dc9e1bb`
+- Runtime-matrix artifact producer SHA-256:
+  `4932f90a8b71f776f784b669807df9769f58c03fdfbc2d83361668e43d74812c`
+- Parent Issue 1 compiler SHA-256: `dd59905781d4f28bd8e0f97d91fb093d1de40bef0e31b8699bb2f072c6146597`
+- Bootstrap version: `0.0.1`
+- Native compiler: Apple clang 21.0.0 (`clang-2100.1.1.101`), `-O2 -fwrapv -pipe -w`
+- Workload: each generated compiler compiled `blorp/src/main.brp` through C
+  emission with `--no-format --no-embed-runtime --time-phases` and compiler
+  allocator checkpoints enabled.
+- Protocol: one warmup, then three serialized samples in alternating orders.
+  `/usr/bin/time -l` supplied wall, instructions, cycles, and peak RSS.
+- Runtime-matrix validity: every measured mode produced byte-identical output C
+  from the measured source tree with SHA-256
+  `276fac8dfb6eb2998d79c50e28a446cdb961dd5916eecb1e7869ffb098747d86`.
+  The off output is also byte-identical to output from the retained parent
+  compiler.
+- Raw and machine-readable summary data are retained in ignored
+  `logs/profiling-issue-02/`.
+
+Wall time had visible external-host outliers, so retired instructions are the
+primary overhead signal. The table still reports every wall sample and its
+median, median absolute deviation, and range rather than filtering results.
+After this matrix, review replaced a nested COW selector index with the final
+flat length-prefixed composite index. Generated C confirms the nested index is
+absent. That correction is confined to constructing a profiled artifact; it
+does not run in the measured compiler workload or alter runtime probes. It does
+change the emitted compiler target because the compiler source itself changed.
+An untimed final-source regeneration through each of the six retained mode
+artifacts produced byte-identical output C with SHA-256
+`ef6c46ecac4a96656e1172e5d16ace34acdb657373a2e4ed8867806572a67582`;
+the final rebuilt compiler produced the same hash in off mode. The runtime
+matrix was not repeated for this cold-path-only representation fix.
+
+| Mode | Raw wall samples (s) | Wall median / MAD / range (s) | Retired instructions median | Delta vs off | Phase median (ms) |
+| --- | --- | ---: | ---: | ---: | ---: |
+| off | 41.14, 29.13, 28.74 | 29.13 / 0.39 / 28.74-41.14 | 334,142,438,253 | baseline | 26,945 |
+| calls, all | 48.86, 31.14, 31.72 | 31.72 / 0.58 / 31.14-48.86 | 372,346,034,138 | +11.43% | 29,102 |
+| exact, all | 82.19, 65.68, 66.50 | 66.50 / 0.82 / 65.68-82.19 | 870,070,088,892 | +160.39% | 59,189 |
+| calls, infer module | 29.42, 31.06, 28.67 | 29.42 / 0.75 / 28.67-31.06 | 335,829,200,508 | +0.50% | 27,369 |
+| exact, infer module | 29.62, 32.50, 31.01 | 31.01 / 1.39 / 29.62-32.50 | 360,904,735,366 | +8.01% | 28,888 |
+| exact, `infer_expr` | 31.11, 31.08, 29.37 | 31.08 / 0.03 / 29.37-31.11 | 334,368,771,330 | +0.07% | 29,066 |
+
+The first off, calls-all, and exact-all samples show a common cold-host wall
+outlier. Retired instructions are stable and remain the primary comparison;
+wall time is reported without filtering.
+
+| Mode | Selected / described | Observed | Count entries / completed calls | Generated C bytes | Probe census (count/start/end) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| off | 0 / 0 | 0 | 0 / 0 | 90,593,928 | 0 / 0 / 0 |
+| calls, all | 12,100 / 12,100 | 7,252 | 965,229,643 / 0 | 93,192,229 | 12,100 / 0 / 0 |
+| exact, all | 12,100 / 12,100 | 7,252 | 0 / 965,229,643 | 94,483,971 | 0 / 12,100 / 12,100 |
+| calls, infer module | 759 / 12,100 | 573 | 48,035,042 / 0 | 90,754,681 | 759 / 0 / 0 |
+| exact, infer module | 759 / 12,100 | 573 | 0 / 48,035,042 | 90,841,529 | 0 / 759 / 759 |
+| exact, `infer_expr` | 1 / 12,100 | 1 | 0 / 566,776 | 90,594,551 | 0 / 1 / 1 |
+
+All six modes reported the same Blorp allocator object counts at artifact
+completion: 330,323,976 allocations, 306,952,977 releases, and 23,370,999
+retained objects. Median allocator bytes were 1,946,910,960 off;
+1,947,107,600 for either all-function mode; 1,946,923,280 for either infer
+mode; and 1,946,911,008 for one exact function. Median peak RSS ranged from
+2,773,565,440 to 2,776,121,344 bytes, within 0.10% of off. Runtime C profiler
+storage is allocated by native `calloc` and is therefore represented in RSS,
+not the Blorp allocator counters.
+
+### Isolated probe cost
+
+A native leaf probe performed 5,000,000 calls per sample with one warmup and
+seven alternating samples:
+
+| Mode | Median / MAD / range (ms) | Instructions median | Clock reads | Final stack depth |
+| --- | ---: | ---: | ---: | ---: |
+| off | 3.739 / 0.017 / 3.716-4.303 | 43,297,932 | 0 | 0 |
+| calls | 22.057 / 0.256 / 21.426-23.385 | 279,085,176 | 0 | 0 |
+| exact | 215.564 / 0.381 / 215.183-271.391 | 2,875,944,776 | 10,000,000 | 0 |
+
+Count-only probes were 89.77% cheaper than exact probes by elapsed median and
+performed zero clock reads and zero stack operations. The focused runtime suite
+also covers recursive calls, repeated calls, a selected zero-call function,
+multiple native threads, signal delivery, invalid operations, profile-window
+boundaries, and the prior 1,024-function ceiling.
+
+### Limitations and follow-on ownership
+
+- Calls and exact modes still update shared atomic counters. Issue 4 owns local
+  shards and structured output.
+- Exact timing still uses the fixed thread-local stack and is not fiber-aware.
+  Issue 3 owns fiber-local stacks and self time.
+- The backend retains emitted module/function identity but not a durable
+  source-definition-to-specializations relation. Selectors therefore require
+  exact emitted logical specialization names.
+- Optimized-away functions are not eligible selector targets because selection
+  applies to final emitted functions.
+- `--profile` remains a temporary exact-all alias so the branch stays
+  bisectable. Issue 6 must remove it when the unified profile command lands.
+- The benchmark bridge Boolean is a compatibility field of its existing JSON
+  protocol, not a second compiler profiling model.
+
 ## Acceptance Criteria
 
-- [ ] Profile mode is a variant, not a Boolean or stringly internal state.
-- [ ] Calls mode emits only one entry counter probe per selected function call.
-- [ ] Calls mode performs no clock read or profile stack operation.
-- [ ] Exact mode emits balanced timing probes only for selected functions.
-- [ ] Selection uses compiler-owned module/function identity, never compact C
+- [x] Profile mode is a variant, not a Boolean or stringly internal state.
+- [x] Calls mode emits only one entry counter probe per selected function call.
+- [x] Calls mode performs no clock read or profile stack operation.
+- [x] Exact mode emits balanced timing probes only for selected functions.
+- [x] Selection uses compiler-owned module/function identity, never compact C
       spelling or rendered-text scanning.
-- [ ] Unknown and ambiguous selectors fail before C emission with actionable
+- [x] Unknown and ambiguous selectors fail before C emission with actionable
       diagnostics.
-- [ ] Metadata states mode, described count, and selected count.
-- [ ] Count mode preserves SIGINT/SIGTERM delivery for CPU-bound programs.
-- [ ] Unselected functions carry zero profiling runtime overhead.
-- [ ] Non-profiled C remains byte-identical to the immediate parent.
-- [ ] All production Boolean profile routes and any temporary compatibility
+- [x] Metadata states mode, described count, and selected count.
+- [x] Count mode preserves SIGINT/SIGTERM delivery for CPU-bound programs.
+- [x] Unselected functions carry zero profiling runtime overhead.
+- [x] Non-profiled C remains byte-identical to the immediate parent.
+- [x] All production Boolean profile routes and any temporary compatibility
       alias are removed by Issue 6.
-- [ ] Mode overhead, call totals, and generated-C size are measured and
+- [x] Mode overhead, call totals, and generated-C size are measured and
       reported.
-- [ ] Focused, compiler, runtime, leak, CLI, and quality owners pass.
+- [x] Focused, compiler, runtime, leak, CLI, and quality owners pass.
 
 ## Pitfalls And Review Questions
 

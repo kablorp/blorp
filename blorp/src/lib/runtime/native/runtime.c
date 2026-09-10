@@ -1859,6 +1859,7 @@ static void __blorp_leak_report(void) {
 // refs that are still owned by worker fibers between waking a joiner and
 // releasing the worker's runtime ref.
 void blorp_thread_pool_shutdown(void);
+static void blorp_profile_cleanup(void);
 typedef void (*blorp_GlobalCleanupFn)(void);
 static blorp_GlobalCleanupFn __blorp_global_cleanup = NULL;
 
@@ -1930,6 +1931,7 @@ static void blorp_pool_drain(void) {
 
 static void __blorp_teardown_before_leak_report(void) {
     blorp_thread_pool_shutdown();
+    blorp_profile_cleanup();
     if (__blorp_global_cleanup) {
         blorp_GlobalCleanupFn cleanup = __blorp_global_cleanup;
         __blorp_global_cleanup = NULL;
@@ -36980,9 +36982,9 @@ void blorp_reset_scheduler_stats(void) {
 // Function Profiling
 // ============================================================================
 
-#define BLORP_PROFILE_MAX_FUNCS 1024
 #define BLORP_PROFILE_MAX_STACK 4096
-#define BLORP_PROFILE_TLS_CACHE 128
+#define BLORP_PROFILE_METADATA_HAS_MODULE 1u
+#define BLORP_PROFILE_SUPPRESSED_EPOCH 0UL
 // The callable-header fixture has a documented 32 * 512 header maximum. Keep
 // enough exact identity slots for that matrix plus the generated entrypoint.
 #define BLORP_PROFILE_CALLABLE_HEADER_SEEN_CAPACITY 32768
@@ -37011,24 +37013,39 @@ enum {
 #define BLORP_THREAD_LOCAL __thread
 #endif
 
+#ifndef BLORP_PROFILE_FUNCTION_METADATA_DEFINED
+#define BLORP_PROFILE_FUNCTION_METADATA_DEFINED
+typedef size_t blorp_ProfileFunctionId;
+
+typedef enum {
+    BLORP_PROFILE_MODE_OFF = 0,
+    BLORP_PROFILE_MODE_CALLS = 1,
+    BLORP_PROFILE_MODE_EXACT = 2,
+} blorp_ProfileMode;
+
+typedef struct {
+    const char* logical_name;
+    const char* c_symbol;
+    const char* module_path;
+    long definition_id;
+    unsigned int metadata_flags;
+} blorp_ProfileFunctionMetadata;
+#endif
+
 typedef struct blorp_ProfileEntry {
-    const char* name;
     atomic_long total_ns;      // Total time in nanoseconds
     atomic_long call_count;
 } blorp_ProfileEntry;
 
 typedef struct {
-    blorp_ProfileEntry* entry;
+    blorp_ProfileFunctionId id;
     long start_ns;
+    unsigned long epoch;
 } blorp_ProfileFrame;
 
 typedef struct {
-    const char* name;
-    blorp_ProfileEntry* entry;
-} blorp_ProfileCacheEntry;
-
-typedef struct {
-    const char* name;
+    blorp_ProfileFunctionId id;
+    const blorp_ProfileFunctionMetadata* metadata;
     long total_ns;
     long call_count;
 } blorp_ProfileSnapshot;
@@ -37038,23 +37055,30 @@ typedef struct {
 	bool used;
 } blorp_CallableHeaderProfileSeen;
 
-static blorp_ProfileEntry profile_entries[BLORP_PROFILE_MAX_FUNCS];
-static atomic_int profile_count = 0;
+static const blorp_ProfileFunctionMetadata* profile_metadata = NULL;
+static blorp_ProfileEntry* profile_entries = NULL;
+static size_t profile_function_count = 0;
+static size_t profile_described_function_count = 0;
+static blorp_ProfileMode profile_mode = BLORP_PROFILE_MODE_OFF;
 static atomic_int profiling_enabled = 0;
 static atomic_int profile_recording_enabled = 0;
 static atomic_int profile_window_active = 0;
-// Window boundaries wait for profile-end commits that could still update counters.
-static atomic_long profile_active_end_operations = 0;
+// Window boundaries wait for exact-end or count commits that can update counters.
+static atomic_long profile_active_update_operations = 0;
 static atomic_int profile_reported = 0;
 static atomic_int profile_termination_signal = 0;
 static atomic_ulong profile_epoch = 1;
-static pthread_mutex_t profile_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t profile_window_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t callable_header_profile_mutex = PTHREAD_MUTEX_INITIALIZER;
 static BLORP_THREAD_LOCAL blorp_ProfileFrame profile_stack[BLORP_PROFILE_MAX_STACK];
 static BLORP_THREAD_LOCAL int profile_stack_depth = 0;
-static BLORP_THREAD_LOCAL unsigned long profile_stack_epoch = 0;
-static BLORP_THREAD_LOCAL blorp_ProfileCacheEntry profile_cache[BLORP_PROFILE_TLS_CACHE];
+static atomic_long profile_invalid_start_ids = 0;
+static atomic_long profile_invalid_end_ids = 0;
+static atomic_long profile_unmatched_ends = 0;
+static atomic_long profile_out_of_order_ends = 0;
+static atomic_long profile_metadata_initialization_failures = 0;
+static atomic_long profile_stack_overflows = 0;
+static atomic_long profile_calls_completed = 0;
 static atomic_long callable_header_profile_counters[
     BLORP_PROFILE_CALLABLE_HEADER_COUNTER_COUNT];
 static atomic_int callable_header_profile_marker_used = 0;
@@ -37151,7 +37175,12 @@ static void blorp_profile_callable_header_marker(long value) {
         return;
     }
 
-    const char* caller = profile_stack[profile_stack_depth - 1].entry->name;
+    blorp_ProfileFrame* caller_frame = &profile_stack[profile_stack_depth - 1];
+    if (caller_frame->epoch == BLORP_PROFILE_SUPPRESSED_EPOCH) return;
+    blorp_ProfileFunctionId caller_id = caller_frame->id;
+    if (caller_id >= profile_function_count) return;
+    const char* caller = profile_metadata[caller_id].logical_name;
+    if (!caller) return;
     if (strstr(caller, "__profile_callable_header_event")) {
         atomic_store_explicit(&callable_header_profile_marker_used, 1,
             memory_order_relaxed);
@@ -37172,123 +37201,231 @@ static long blorp_profile_now_ns(void) {
     return ts.tv_sec * 1000000000L + ts.tv_nsec;
 }
 
-// Find or create profile entry for a function. Caller must hold profile_mutex.
-static blorp_ProfileEntry* blorp_profile_get_locked(const char* name, bool create) {
-    // Linear search (good enough for small number of functions)
-    int count = atomic_load(&profile_count);
-    for (int i = 0; i < count; i++) {
-        if (strcmp(profile_entries[i].name, name) == 0) {
-            return &profile_entries[i];
-        }
-    }
-    if (!create) return NULL;
-    // Create new entry
-    if (count < BLORP_PROFILE_MAX_FUNCS) {
-        int index = count;
-        blorp_ProfileEntry* entry = &profile_entries[index];
-        entry->name = name;
-        atomic_store(&entry->total_ns, 0);
-        atomic_store(&entry->call_count, 0);
-        atomic_store(&profile_count, index + 1);
-        return entry;
-    }
-    return NULL;  // Too many functions
-}
-
-static inline blorp_ProfileEntry* blorp_profile_lookup_cached(const char* name) {
-    uintptr_t slot = (((uintptr_t)name) >> 4) % BLORP_PROFILE_TLS_CACHE;
-    blorp_ProfileCacheEntry* cached = &profile_cache[slot];
-    if (cached->name == name) return cached->entry;
-
-    pthread_mutex_lock(&profile_mutex);
-    blorp_ProfileEntry* entry = blorp_profile_get_locked(name, true);
-    pthread_mutex_unlock(&profile_mutex);
-
-    cached->name = name;
-    cached->entry = entry;
-    return entry;
-}
-
 static void blorp_profile_signal_handler(int signum);
 static void blorp_profile_maybe_terminate(void);
 
-static bool blorp_profile_recording_end_enter(void) {
-    atomic_fetch_add(&profile_active_end_operations, 1);
+static bool blorp_profile_recording_update_enter(void) {
+    atomic_fetch_add(&profile_active_update_operations, 1);
     if (!atomic_load(&profile_recording_enabled)) {
-        atomic_fetch_sub(&profile_active_end_operations, 1);
+        atomic_fetch_sub(&profile_active_update_operations, 1);
         return false;
     }
     return true;
 }
 
-static void blorp_profile_recording_end_leave(void) {
-    atomic_fetch_sub(&profile_active_end_operations, 1);
+static void blorp_profile_recording_update_leave(void) {
+    atomic_fetch_sub(&profile_active_update_operations, 1);
 }
 
 static void blorp_profile_pause_recording(void) {
     atomic_store(&profile_recording_enabled, 0);
-    while (atomic_load(&profile_active_end_operations) != 0) sched_yield();
+    while (atomic_load(&profile_active_update_operations) != 0) sched_yield();
 }
 
-void blorp_profile_start(const char* func_name) {
+static void blorp_profile_push_suppressed_frame(blorp_ProfileFunctionId id) {
+    profile_stack[profile_stack_depth++] = (blorp_ProfileFrame) {
+        .id = id,
+        .start_ns = 0,
+        .epoch = BLORP_PROFILE_SUPPRESSED_EPOCH
+    };
+}
+
+void blorp_profile_start_id(blorp_ProfileFunctionId id) {
     if (!atomic_load(&profiling_enabled)) return;
 
     blorp_profile_maybe_terminate();
-    if (!atomic_load(&profile_recording_enabled)) return;
-
-    unsigned long epoch = atomic_load(&profile_epoch);
-    if (profile_stack_epoch != epoch) {
-        profile_stack_epoch = epoch;
-        profile_stack_depth = 0;
+    bool recording = atomic_load(&profile_recording_enabled);
+    if (id >= profile_function_count) {
+        if (recording) {
+            atomic_fetch_add_explicit(&profile_invalid_start_ids, 1,
+                memory_order_relaxed);
+        }
+        return;
     }
 
-    blorp_ProfileEntry* entry = blorp_profile_lookup_cached(func_name);
-    if (entry
-        && atomic_load(&profile_recording_enabled)
-        && epoch == atomic_load(&profile_epoch)
-        && profile_stack_depth < BLORP_PROFILE_MAX_STACK) {
+    unsigned long epoch = atomic_load(&profile_epoch);
+
+    if (profile_stack_depth >= BLORP_PROFILE_MAX_STACK) {
+        atomic_fetch_add_explicit(&profile_stack_overflows, 1,
+            memory_order_relaxed);
+        return;
+    }
+
+    if (!recording) {
+        blorp_profile_push_suppressed_frame(id);
+    } else if (atomic_load(&profile_recording_enabled)
+               && epoch == atomic_load(&profile_epoch)) {
         profile_stack[profile_stack_depth++] = (blorp_ProfileFrame) {
-            .entry = entry,
-            .start_ns = blorp_profile_now_ns()
+            .id = id,
+            .start_ns = blorp_profile_now_ns(),
+            .epoch = epoch
         };
+    } else {
+        blorp_profile_push_suppressed_frame(id);
     }
 }
 
-void blorp_profile_enable(void) {
+void blorp_profile_count_id(blorp_ProfileFunctionId id) {
+    if (!atomic_load(&profiling_enabled)) return;
+
+    blorp_profile_maybe_terminate();
+    if (id >= profile_function_count) {
+        atomic_fetch_add_explicit(&profile_invalid_start_ids, 1,
+            memory_order_relaxed);
+        return;
+    }
+    if (!blorp_profile_recording_update_enter()) return;
+
+    atomic_fetch_add_explicit(&profile_entries[id].call_count, 1,
+        memory_order_relaxed);
+    blorp_profile_recording_update_leave();
+    blorp_profile_maybe_terminate();
+}
+
+int blorp_profile_enable(
+    blorp_ProfileMode mode,
+    const blorp_ProfileFunctionMetadata* metadata,
+    size_t function_count,
+    size_t described_function_count
+) {
+    if (atomic_load(&profiling_enabled)) {
+        atomic_fetch_add_explicit(&profile_metadata_initialization_failures, 1,
+            memory_order_relaxed);
+        fprintf(stderr,
+            "PROFILE_INITIALIZATION_FAILURE reason=already_enabled "
+            "functions_described=%zu functions_selected=%zu\n",
+            described_function_count, function_count);
+        return 1;
+    }
+    if ((mode != BLORP_PROFILE_MODE_CALLS && mode != BLORP_PROFILE_MODE_EXACT)
+        || described_function_count < function_count
+        || (function_count > 0 && metadata == NULL)
+        || function_count > SIZE_MAX / sizeof(blorp_ProfileEntry)) {
+        atomic_fetch_add_explicit(&profile_metadata_initialization_failures, 1,
+            memory_order_relaxed);
+        fprintf(stderr,
+            "PROFILE_INITIALIZATION_FAILURE reason=invalid_metadata "
+            "functions_described=%zu functions_selected=%zu\n",
+            described_function_count, function_count);
+        return 1;
+    }
+
+    for (size_t index = 0; index < function_count; index++) {
+        const blorp_ProfileFunctionMetadata* function = &metadata[index];
+        bool has_module =
+            (function->metadata_flags & BLORP_PROFILE_METADATA_HAS_MODULE) != 0;
+        if (!function->logical_name || !function->c_symbol
+            || (function->metadata_flags & ~BLORP_PROFILE_METADATA_HAS_MODULE) != 0
+            || has_module != (function->module_path != NULL)) {
+            atomic_fetch_add_explicit(
+                &profile_metadata_initialization_failures, 1,
+                memory_order_relaxed);
+            fprintf(stderr,
+                "PROFILE_INITIALIZATION_FAILURE reason=invalid_metadata_row "
+                "function_id=%zu functions_described=%zu functions_selected=%zu\n",
+                index, described_function_count, function_count);
+            return 1;
+        }
+    }
+
+    blorp_ProfileEntry* entries = NULL;
+    if (function_count > 0) {
+        entries = calloc(function_count, sizeof(blorp_ProfileEntry));
+        if (!entries) {
+            atomic_fetch_add_explicit(
+                &profile_metadata_initialization_failures, 1,
+                memory_order_relaxed);
+            fprintf(stderr,
+                "PROFILE_INITIALIZATION_FAILURE reason=counter_allocation "
+                "functions_described=%zu functions_selected=%zu\n",
+                described_function_count, function_count);
+            return 1;
+        }
+    }
+
+    profile_metadata = metadata;
+    profile_entries = entries;
+    profile_function_count = function_count;
+    profile_described_function_count = described_function_count;
+    profile_mode = mode;
+    atomic_store_explicit(&profile_invalid_start_ids, 0, memory_order_relaxed);
+    atomic_store_explicit(&profile_invalid_end_ids, 0, memory_order_relaxed);
+    atomic_store_explicit(&profile_unmatched_ends, 0, memory_order_relaxed);
+    atomic_store_explicit(&profile_out_of_order_ends, 0, memory_order_relaxed);
+    atomic_store_explicit(&profile_stack_overflows, 0, memory_order_relaxed);
+    atomic_store_explicit(&profile_calls_completed, 0, memory_order_relaxed);
     atomic_store(&profiling_enabled, 1);
     atomic_store(&profile_recording_enabled, 1);
     signal(SIGTERM, blorp_profile_signal_handler);
     signal(SIGINT, blorp_profile_signal_handler);
+    return 0;
 }
 
-void blorp_profile_end(const char* func_name) {
+static void blorp_profile_discard_end_id(blorp_ProfileFunctionId id) {
+    int match_idx = -1;
+    if (profile_stack_depth > 0
+        && profile_stack[profile_stack_depth - 1].id == id) {
+        match_idx = profile_stack_depth - 1;
+    } else {
+        for (int i = profile_stack_depth - 2; i >= 0; i--) {
+            if (profile_stack[i].id == id) {
+                match_idx = i;
+                break;
+            }
+        }
+    }
+    if (match_idx < 0) return;
+
+    for (int i = match_idx; i < profile_stack_depth - 1; i++)
+        profile_stack[i] = profile_stack[i + 1];
+    profile_stack_depth--;
+}
+
+void blorp_profile_end_id(blorp_ProfileFunctionId id) {
     if (!atomic_load(&profiling_enabled)) return;
     blorp_profile_maybe_terminate();
-    if (!blorp_profile_recording_end_enter()) return;
+    if (id >= profile_function_count) {
+        atomic_fetch_add_explicit(&profile_invalid_end_ids, 1,
+            memory_order_relaxed);
+        return;
+    }
+    if (!blorp_profile_recording_update_enter()) {
+        blorp_profile_discard_end_id(id);
+        return;
+    }
 
     long end_ns = blorp_profile_now_ns();
     unsigned long epoch = atomic_load(&profile_epoch);
-    if (profile_stack_epoch != epoch) {
-        profile_stack_epoch = epoch;
-        profile_stack_depth = 0;
-        blorp_profile_recording_end_leave();
-        return;
-    }
-
     int match_idx = -1;
-    for (int i = profile_stack_depth - 1; i >= 0; i--) {
-        const char* frame_name = profile_stack[i].entry->name;
-        if (frame_name == func_name || strcmp(frame_name, func_name) == 0) {
-            match_idx = i;
-            break;
+    if (profile_stack_depth > 0
+        && profile_stack[profile_stack_depth - 1].id == id) {
+        match_idx = profile_stack_depth - 1;
+    } else {
+        for (int i = profile_stack_depth - 2; i >= 0; i--) {
+            if (profile_stack[i].id == id) {
+                match_idx = i;
+                break;
+            }
         }
     }
     if (match_idx < 0) {
-        blorp_profile_recording_end_leave();
+        atomic_fetch_add_explicit(&profile_unmatched_ends, 1,
+            memory_order_relaxed);
+        blorp_profile_recording_update_leave();
+        return;
+    }
+    if (match_idx != profile_stack_depth - 1) {
+        atomic_fetch_add_explicit(&profile_out_of_order_ends, 1,
+            memory_order_relaxed);
+    }
+
+    if (profile_stack[match_idx].epoch != epoch) {
+        profile_stack_depth = match_idx;
+        blorp_profile_recording_update_leave();
         return;
     }
 
-    blorp_ProfileEntry* entry = profile_stack[match_idx].entry;
+    blorp_ProfileEntry* entry = &profile_entries[id];
     long elapsed_ns = end_ns - profile_stack[match_idx].start_ns;
     if (elapsed_ns < 0) elapsed_ns = 0;
 
@@ -37298,7 +37435,9 @@ void blorp_profile_end(const char* func_name) {
 
     atomic_fetch_add(&entry->total_ns, elapsed_ns);
     atomic_fetch_add(&entry->call_count, 1);
-    blorp_profile_recording_end_leave();
+    atomic_fetch_add_explicit(&profile_calls_completed, 1,
+        memory_order_relaxed);
+    blorp_profile_recording_update_leave();
     blorp_profile_maybe_terminate();
 }
 
@@ -37308,16 +37447,18 @@ void blorp_profile_window_begin(void) {
     pthread_mutex_lock(&profile_window_mutex);
     blorp_profile_pause_recording();
     atomic_fetch_add(&profile_epoch, 1);
-    profile_stack_epoch = atomic_load(&profile_epoch);
-    profile_stack_depth = 0;
 
-    pthread_mutex_lock(&profile_mutex);
-    int count = atomic_load(&profile_count);
-    for (int i = 0; i < count; i++) {
+    for (size_t i = 0; i < profile_function_count; i++) {
         atomic_store(&profile_entries[i].total_ns, 0);
         atomic_store(&profile_entries[i].call_count, 0);
     }
-    pthread_mutex_unlock(&profile_mutex);
+
+    atomic_store_explicit(&profile_invalid_start_ids, 0, memory_order_relaxed);
+    atomic_store_explicit(&profile_invalid_end_ids, 0, memory_order_relaxed);
+    atomic_store_explicit(&profile_unmatched_ends, 0, memory_order_relaxed);
+    atomic_store_explicit(&profile_out_of_order_ends, 0, memory_order_relaxed);
+    atomic_store_explicit(&profile_stack_overflows, 0, memory_order_relaxed);
+    atomic_store_explicit(&profile_calls_completed, 0, memory_order_relaxed);
 
     pthread_mutex_lock(&callable_header_profile_mutex);
     blorp_profile_callable_header_reset_locked();
@@ -37340,8 +37481,6 @@ void blorp_profile_window_end(void) {
 
     blorp_profile_pause_recording();
     atomic_fetch_add(&profile_epoch, 1);
-    profile_stack_epoch = atomic_load(&profile_epoch);
-    profile_stack_depth = 0;
     pthread_mutex_unlock(&profile_window_mutex);
 }
 
@@ -37349,64 +37488,170 @@ void blorp_profile_window_end(void) {
 static int profile_compare(const void* a, const void* b) {
     const blorp_ProfileSnapshot* ea = (const blorp_ProfileSnapshot*)a;
     const blorp_ProfileSnapshot* eb = (const blorp_ProfileSnapshot*)b;
+    if (profile_mode == BLORP_PROFILE_MODE_CALLS) {
+        if (eb->call_count > ea->call_count) return 1;
+        if (eb->call_count < ea->call_count) return -1;
+    }
     if (eb->total_ns > ea->total_ns) return 1;
     if (eb->total_ns < ea->total_ns) return -1;
+    if (ea->id < eb->id) return -1;
+    if (ea->id > eb->id) return 1;
     return 0;
+}
+
+static const char* blorp_profile_mode_name(void) {
+    if (profile_mode == BLORP_PROFILE_MODE_CALLS) return "calls";
+    if (profile_mode == BLORP_PROFILE_MODE_EXACT) return "exact";
+    return "off";
+}
+
+static void blorp_profile_print_diagnostics(
+    size_t functions_observed,
+    long calls_observed
+) {
+    fprintf(stderr,
+        "PROFILE_DIAGNOSTICS profile_mode=%s functions_described=%zu "
+        "functions_selected=%zu functions_observed=%zu "
+        "invalid_start_ids=%ld invalid_end_ids=%ld unmatched_ends=%ld "
+        "out_of_order_ends=%ld "
+        "metadata_initialization_failures=%ld stack_overflows=%ld "
+        "calls_observed=%ld calls_completed=%ld\n",
+        blorp_profile_mode_name(),
+        profile_described_function_count,
+        profile_function_count,
+        functions_observed,
+        atomic_load_explicit(&profile_invalid_start_ids, memory_order_relaxed),
+        atomic_load_explicit(&profile_invalid_end_ids, memory_order_relaxed),
+        atomic_load_explicit(&profile_unmatched_ends, memory_order_relaxed),
+        atomic_load_explicit(&profile_out_of_order_ends, memory_order_relaxed),
+        atomic_load_explicit(&profile_metadata_initialization_failures,
+            memory_order_relaxed),
+        atomic_load_explicit(&profile_stack_overflows, memory_order_relaxed),
+        calls_observed,
+        atomic_load_explicit(&profile_calls_completed, memory_order_relaxed));
+}
+
+static long blorp_profile_observed_call_count(void) {
+    if (profile_mode != BLORP_PROFILE_MODE_CALLS) return 0;
+
+    long calls_observed = 0;
+    for (size_t i = 0; i < profile_function_count; i++) {
+        calls_observed += atomic_load_explicit(
+            &profile_entries[i].call_count,
+            memory_order_relaxed);
+    }
+    return calls_observed;
 }
 
 void blorp_profile_report(void) {
     if (!atomic_load(&profiling_enabled)) return;
     if (atomic_exchange(&profile_reported, 1)) return;
 
-    blorp_ProfileSnapshot entries[BLORP_PROFILE_MAX_FUNCS];
-    int count = atomic_load(&profile_count);
-    if (count == 0) {
-        return;
+    blorp_ProfileSnapshot* entries = NULL;
+    if (profile_function_count > 0) {
+        if (profile_function_count > SIZE_MAX / sizeof(blorp_ProfileSnapshot)) {
+            fprintf(stderr,
+                "PROFILE_REPORT_FAILURE reason=snapshot_size functions_described=%zu "
+                "functions_selected=%zu\n",
+                profile_described_function_count, profile_function_count);
+            blorp_profile_print_diagnostics(
+                0,
+                blorp_profile_observed_call_count());
+            return;
+        }
+        entries = malloc(profile_function_count * sizeof(blorp_ProfileSnapshot));
+        if (!entries) {
+            fprintf(stderr,
+                "PROFILE_REPORT_FAILURE reason=snapshot_allocation functions_described=%zu "
+                "functions_selected=%zu\n",
+                profile_described_function_count, profile_function_count);
+            blorp_profile_print_diagnostics(
+                0,
+                blorp_profile_observed_call_count());
+            return;
+        }
     }
-    for (int i = 0; i < count; i++) {
-        entries[i].name = profile_entries[i].name;
+
+    size_t functions_observed = 0;
+    long calls_observed = 0;
+    for (size_t i = 0; i < profile_function_count; i++) {
+        entries[i].id = i;
+        entries[i].metadata = &profile_metadata[i];
         entries[i].total_ns = atomic_load(&profile_entries[i].total_ns);
         entries[i].call_count = atomic_load(&profile_entries[i].call_count);
+        if (entries[i].call_count > 0) functions_observed++;
+        if (profile_mode == BLORP_PROFILE_MODE_CALLS)
+            calls_observed += entries[i].call_count;
     }
 
     // Sort by total time (descending)
-    qsort(entries, count, sizeof(blorp_ProfileSnapshot), profile_compare);
+    if (profile_function_count > 1) {
+        qsort(entries, profile_function_count, sizeof(blorp_ProfileSnapshot),
+            profile_compare);
+    }
 
     // Compute total time for percentage column
     long grand_total_ns = 0;
-    for (int i = 0; i < count; i++)
+    for (size_t i = 0; i < profile_function_count; i++)
         grand_total_ns += entries[i].total_ns;
 
-    fprintf(stderr, "\n=== Function Profile ===\n");
-    fprintf(stderr, "%-50s %10s %6s %10s %10s\n",
-        "Function", "Time (ms)", "%", "Calls", "Avg (us)");
-    fprintf(stderr, "%-50s %10s %6s %10s %10s\n",
-        "--------------------------------------------------",
-        "----------", "------", "----------", "----------");
-
-    for (int i = 0; i < count; i++) {
-        blorp_ProfileSnapshot* e = &entries[i];
-        if (e->call_count > 0) {
-            double total_ms = e->total_ns / 1000000.0;
-            double pct = grand_total_ns > 0
-                ? (e->total_ns * 100.0 / grand_total_ns) : 0.0;
-            double avg_us = (e->total_ns / 1000.0) / e->call_count;
-            fprintf(stderr, "%-50s %10.3f %5.1f%% %10ld %10.3f\n",
-                e->name, total_ms, pct, e->call_count, avg_us);
+    if (profile_mode == BLORP_PROFILE_MODE_CALLS) {
+        fprintf(stderr, "\n=== Function Calls ===\n");
+        fprintf(stderr, "%-40s %-20s %10s\n", "Function", "C Symbol", "Calls");
+        fprintf(stderr, "%-40s %-20s %10s\n",
+            "----------------------------------------",
+            "--------------------", "----------");
+        for (size_t i = 0; i < profile_function_count; i++) {
+            blorp_ProfileSnapshot* e = &entries[i];
+            if (e->call_count > 0) {
+                fprintf(stderr, "%-40s %-20s %10ld\n",
+                    e->metadata->logical_name, e->metadata->c_symbol,
+                    e->call_count);
+            }
         }
+    } else {
+        fprintf(stderr, "\n=== Function Profile ===\n");
+        fprintf(stderr, "%-40s %-20s %10s %6s %10s %10s\n",
+            "Function", "C Symbol", "Time (ms)", "%", "Calls", "Avg (us)");
+        fprintf(stderr, "%-40s %-20s %10s %6s %10s %10s\n",
+            "----------------------------------------",
+            "--------------------",
+            "----------", "------", "----------", "----------");
+
+        for (size_t i = 0; i < profile_function_count; i++) {
+            blorp_ProfileSnapshot* e = &entries[i];
+            if (e->call_count > 0) {
+                double total_ms = e->total_ns / 1000000.0;
+                double pct = grand_total_ns > 0
+                    ? (e->total_ns * 100.0 / grand_total_ns) : 0.0;
+                double avg_us = (e->total_ns / 1000.0) / e->call_count;
+                fprintf(stderr, "%-40s %-20s %10.3f %5.1f%% %10ld %10.3f\n",
+                    e->metadata->logical_name, e->metadata->c_symbol,
+                    total_ms, pct, e->call_count, avg_us);
+            }
+        }
+        fprintf(stderr, "%-40s %-20s %10.3f\n", "TOTAL", "",
+            grand_total_ns / 1000000.0);
     }
-    fprintf(stderr, "%-50s %10.3f\n", "TOTAL", grand_total_ns / 1000000.0);
     fprintf(stderr, "\n");
 
     // Collapsed stack format for flame graph tools
     // Usage: bin/blorp run --profile prog.brp 2>profile.txt
     //        grep FLAME: profile.txt | sed 's/FLAME://' > collapsed.txt
     //        flamegraph.pl collapsed.txt > profile.svg
-    for (int i = 0; i < count; i++) {
-        blorp_ProfileSnapshot* e = &entries[i];
-        if (e->call_count > 0 && e->total_ns > 0)
-            fprintf(stderr, "FLAME:%s %ld\n", e->name, e->total_ns / 1000);
+    if (profile_mode == BLORP_PROFILE_MODE_EXACT) {
+        for (size_t i = 0; i < profile_function_count; i++) {
+            blorp_ProfileSnapshot* e = &entries[i];
+            if (e->call_count > 0 && e->total_ns > 0)
+                fprintf(stderr, "FLAME:%s[%s] %ld\n",
+                    e->metadata->logical_name, e->metadata->c_symbol,
+                    e->total_ns / 1000);
+        }
     }
+
+    blorp_profile_print_diagnostics(
+        functions_observed,
+        calls_observed);
 
     if (atomic_load_explicit(&callable_header_profile_marker_used,
             memory_order_relaxed)) {
@@ -37433,6 +37678,8 @@ void blorp_profile_report(void) {
             blorp_profile_callable_header_counter(
                 BLORP_PROFILE_CALLABLE_SEEN_CAPACITY_OVERFLOWS));
     }
+
+    free(entries);
 }
 
 static void blorp_profile_signal_handler(int signum) {
@@ -37447,6 +37694,17 @@ static void blorp_profile_maybe_terminate(void) {
     signal(signum, SIG_DFL);
     raise(signum);
     _Exit(128 + signum);
+}
+
+static void blorp_profile_cleanup(void) {
+    atomic_store(&profiling_enabled, 0);
+    blorp_profile_pause_recording();
+    free(profile_entries);
+    profile_entries = NULL;
+    profile_metadata = NULL;
+    profile_function_count = 0;
+    profile_described_function_count = 0;
+    profile_mode = BLORP_PROFILE_MODE_OFF;
 }
 
 // ============================================================================

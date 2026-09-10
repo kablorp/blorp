@@ -1303,7 +1303,8 @@ expect_exit "internal synthetic executable runs" 0 "$internal_synthetic_binary"
 expect_exit "compile profile success" 0 \
 	"$BLORP_BIN" compile --profile --no-format -o "$profiled_c" "$valid_prog"
 TOTAL=$((TOTAL + 1))
-if grep -qF 'blorp_profile_start("$blorp$program")' "$profiled_c" \
+if grep -qF '{"$blorp$program", "main"' "$profiled_c" \
+	&& grep -qF 'blorp_profile_start_id(0)' "$profiled_c" \
 	&& grep -qF 'atexit(blorp_profile_report)' "$profiled_c"
 then
 	record_pass "compile profile emits runtime hooks"
@@ -1331,6 +1332,12 @@ elif grep -qF "profile_window_setup_probe" <<<"$RUN_OUTPUT" \
 	|| grep -qF "profile_window_crosses_end_probe" <<<"$RUN_OUTPUT"; then
 	record_fail "profile window isolates measured functions" \
 		"setup, crossing, or post-window function leaked into profile output
+$RUN_OUTPUT"
+elif ! grep -qF \
+	"invalid_start_ids=0 invalid_end_ids=0 unmatched_ends=0 out_of_order_ends=0 metadata_initialization_failures=0 stack_overflows=0" \
+	<<<"$RUN_OUTPUT"; then
+	record_fail "profile window isolates measured functions" \
+		"profile window reported a lost or corrupt frame
 $RUN_OUTPUT"
 else
 	record_pass "profile window isolates measured functions"
