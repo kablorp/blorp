@@ -36,6 +36,9 @@ module inventory lives in
   concurrency, cancellation, resources, streams, and networking contracts.
 - [Compiler Priorities](COMPILER_PRIORITIES.md) contains only current
   cross-cutting compiler work and its completion criteria.
+- [Normalized Semantic Compilation Roadmap](issues/compiler-performance/NORMALIZED_SEMANTIC_COMPILATION_ROADMAP.md)
+  sequences the next table-backed semantic products, tooling queries, and
+  multi-metric performance gates.
 
 ## Maintenance Rules
 

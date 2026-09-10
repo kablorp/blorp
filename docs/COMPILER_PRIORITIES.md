@@ -5,6 +5,11 @@ own individual implementation slices, status, assignees, and completed work.
 Architecture and semantic contracts belong in the reference documents linked
 from [README.md](README.md).
 
+The
+[Normalized Semantic Compilation Roadmap](issues/compiler-performance/NORMALIZED_SEMANTIC_COMPILATION_ROADMAP.md)
+coordinates the table/product execution sequence with Typechecking Phases 8-10.
+It does not replace the semantic phase contracts in this document.
+
 ## 1. Typechecking Migration
 
 The accepted frontend already owns module binding, declaration skeletons,
@@ -23,8 +28,8 @@ types or tests.
 | --- | --- | --- | --- |
 | 1-4 | Indexed, bound, skeleton, type-header, trait, callable, global-header, and implementation-header graphs | Complete | `AcceptedTypecheckGraph` combines accepted implementation headers with the compatible importable graph. Parser-recovery modules cannot contribute accepted semantic inventory. |
 | 5 | Completed global headers | Complete | `TypecheckGraphCompletion` separates opaque accepted and recoverable graphs. Accepted graphs contain only completed initializers; recoverable graphs retain exact global/callable dependencies, typed expressions, and structured per-module diagnostics while admitting only healthy modules to accepted body entry. Pending globals reserve identity but never publish `TYPE_VOID`. |
-| 6 | Independently checked body artifacts | Not complete | `AcceptedTypecheckModule` still carries full `TypecheckState`; body entry reconstructs imports and local headers in `Env`, then threads one state through every declaration. |
-| 7 | Demand-driven CTFE body set | Not complete | CTFE selects dependency modules, typechecks complete dependency programs, and scans every imported typed program for functions and constructors. |
+| 6 | Independently checked body artifacts | Complete | `AcceptedTypecheckModule` retains one immutable prepared body base; each body receives a fresh body-local session, and accepted/recovered artifacts are assembled by exact identity independently of check order. |
+| 7 | Demand-driven CTFE body set | Implemented with explicit closure work | The accepted production path uses an exact definition-identity worklist and reuses body outcomes. Unsupported accepted shapes retain measured eager fallbacks, and recoverable graphs retain complete diagnostic materialization. |
 | 8 | Solved body | Not started as a phase product | Inference, metavariable storage, resolution, zonking, and finalization remain owned by the broad inference implementation. |
 | 9 | Validated body | Not started as a phase product | Lexical and final-type checks are not represented by an accepted/rejected validation boundary; final typed-program validation still walks the complete program. |
 | 10 | Checked graph and codegen-ready graph | Partial | The CLI already projects a successful rich graph and ends that graph's lifetime before Core preparation. `TypecheckedGraph` remains broad, and Core preparation still accepts raw `TypedProgram` values. |
@@ -233,12 +238,14 @@ Implementation issue: [Materialize CTFE Bodies On Demand](issues/typechecking/ph
 **Goal:** check only bodies reachable from exact CTFE roots, memoize each body
 once, and reuse accepted artifacts for ordinary output.
 
-Current dependency selection is module-level. Each selected dependency is
-prepared as a complete typed program, after which CTFE scans every imported
-program for constructors and functions. The maintained 24-module by 32-function
-profile materialized 768 dependency bodies while evaluation reached 24. The
-fixture currently models expected reachable and irrelevant counts; it does not
-observe actual materialization.
+The accepted production path now seeds an exact definition-identity worklist
+from completed globals, discovers resolved direct/trait/implementation/
+recursive/function-reference dependencies from accepted typed bodies, and
+reuses body outcomes for selected ordinary modules and target-local helpers.
+The maintained 24-module by 32-function workload checks 24 bodies rather than
+768 and improved its recorded median by 42.0%. Unsupported accepted dependency
+shapes and accepted graphs without callable CTFE roots retain explicit measured
+eager fallbacks; recoverable graphs retain complete diagnostic materialization.
 
 Target products:
 
@@ -249,38 +256,35 @@ CtfeBodySet: definition identity -> CheckedBodyArtifact
 WorkState = Unseen | Queued | Checking | Accepted | Rejected
 ```
 
-Implementation slices:
+Implemented production slices:
 
-1. **7A: Instrument current behavior.** Add observed counters for requested,
-   queued, checked, accepted, reused, and rejected bodies before changing
-   scheduling. Update the width/depth fixture to fail when irrelevant width
-   increases actual materialization.
-2. **7B: Exact deterministic worklist.** Seed from typed global initializer
-   roots and key every state by exact callable/global identity. Prevent
-   duplicate queue entries by construction and define stable ordering for
-   roots and discovered dependencies.
-3. **7C: Typed dependency discovery.** Check a queued body through the Phase 6
-   facade, traverse resolved call and function-reference metadata, and enqueue
-   exact targets. Handle recursion with work state. Dynamic dispatch and
-   higher-order calls require explicit typed targets or an explicit
-   conservative candidate set; names, source text, and depth limits are not
-   correctness mechanisms.
-4. **7D: Artifact reuse.** Store each accepted artifact under its identity.
-   Ordinary selected-module assembly asks the same store before checking a
-   body. Preserve source output order separately from worklist order and sort
-   diagnostics by stable module/definition order.
-5. **7E: Cut over ownership.** Move CTFE scheduling out of
-   `stage_06_typecheck/bridge.brp` into Stage 07. Delete complete dependency
-   `TypedProgram` preparation and old imported-program reconstruction once no
-   consumer remains. The bridge should orchestrate requests and transport
-   results only.
+1. **7A: Observed counters.** Production metrics distinguish requested,
+   checked, accepted, reused, rejected, selective, eager, and failed work.
+2. **7B: Exact deterministic worklist.** Work state is keyed by exact identity
+   and prevents duplicate scheduling while preserving deterministic roots and
+   discovered-dependency order.
+3. **7C: Typed dependency discovery.** Accepted typed bodies expose resolved
+   direct dependencies; unsupported dynamic shapes select an explicit
+   conservative fallback rather than guessing from names or source text.
+4. **7D: Artifact reuse.** Selected ordinary modules and target-local helpers
+   consume the same provenance-checked body outcomes.
 
-Phase 7 validation must use the existing CTFE profile with the same checksum.
-The representative case should check approximately 24 reachable dependency
-functions rather than all 768, except for explicitly recorded conservative
-dynamic candidates. Record total declarations, queued bodies, body checks,
-duplicate requests, header lookups, CTFE evaluations, wall time, and peak
-memory. Include a low-CTFE control to catch fixed overhead regressions.
+Remaining closure work:
+
+1. Move the retained trace adapter from `stage_06_typecheck/bridge.brp` to
+   direct Stage 07 worklist events without falsifying event timing.
+2. Reduce or remove the measured eager fallbacks only when every accepted
+   dependency shape has an exact representation.
+3. Preserve complete recoverable-graph diagnostic materialization while
+   deleting superseded complete-program preparation and reconstruction paths.
+
+Phase 7 closure validation must continue using the existing CTFE profile with
+the same checksum. The representative case must keep checking approximately 24
+reachable dependency functions rather than all 768, except for explicitly
+recorded conservative dynamic candidates. Record total declarations, queued
+bodies, body checks, duplicate requests, header lookups, CTFE evaluations,
+wall time, and peak memory. Retain the low-CTFE control to catch fixed overhead
+regressions.
 
 ### Phase 8: Constraint Solving And Type Finalization
 

@@ -7,15 +7,26 @@ LSP analysis snapshot. This is not a cross-run cache, an incremental build
 cache, a process-global interner, or a request to replace every compiler tree
 with a generic database.
 
+**Current execution roadmap:**
+[`NORMALIZED_SEMANTIC_COMPILATION_ROADMAP.md`](NORMALIZED_SEMANTIC_COMPILATION_ROADMAP.md)
+defines the next finite checkpoint: publish accepted semantic tables and edges,
+replace the broad typed graph with recoverable/accepted/codegen-ready products,
+and migrate compiler and tooling queries without retaining a parallel database.
+This document remains authoritative for long-term identity, table, lifetime,
+and migration invariants; the execution roadmap owns the current step order and
+multi-metric acceptance gates.
+
 **Near-term issues:**
 
-1. [Issue 61B: Establish The Canonical Graph Definition Table](61-establish-canonical-graph-definition-table.md)
-2. [Issue 68: Use Scalar Definition IDs For Constructor Identity](68-use-scalar-definition-ids-for-constructor-identity.md)
-3. [Issue 69: Make Resolved Calls Definition-Backed](69-make-resolved-calls-definition-backed.md)
-4. [Issue 70: Make Nominal Type IDs Definition-Backed](70-make-nominal-type-ids-definition-backed.md)
-5. [Issue 71: Make Global IDs Definition-Backed](71-make-global-ids-definition-backed.md)
-6. [Issue 72: Make Field IDs Definition-Backed](72-make-field-ids-definition-backed.md)
-7. [Issue 73: Normalize Trait And Implementation Identities](73-normalize-trait-and-implementation-identities.md)
+1. Execute the [Normalized Semantic Compilation Roadmap](NORMALIZED_SEMANTIC_COMPILATION_ROADMAP.md).
+2. Keep the completed identity checkpoint as the required foundation:
+   [Issue 61B](61-establish-canonical-graph-definition-table.md),
+   [Issue 68](68-use-scalar-definition-ids-for-constructor-identity.md),
+   [Issue 69](69-make-resolved-calls-definition-backed.md),
+   [Issue 70](70-make-nominal-type-ids-definition-backed.md),
+   [Issue 71](71-make-global-ids-definition-backed.md),
+   [Issue 72](72-make-field-ids-definition-backed.md), and
+   [Issue 73](73-normalize-trait-and-implementation-identities.md).
 
 ## Relationship To Current Documentation
 
