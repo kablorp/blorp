@@ -438,6 +438,26 @@ for runtime_source in minicoro.h runtime.c runtime_decl.c; do
 		exit 1
 	fi
 done
+runtime_object_path="blorp/build/_build/blorp-cli/$local_runtime_object"
+runtime_object_probe_created=false
+if [ ! -e "$runtime_object_path" ]; then
+	mkdir -p "$(dirname "$runtime_object_path")"
+	touch "$runtime_object_path"
+	runtime_object_probe_created=true
+	trap 'rm -f "$runtime_object_path"' EXIT
+fi
+for runtime_source in minicoro.h runtime.c runtime_decl.c; do
+	runtime_source_path="blorp/src/lib/runtime/native/$runtime_source"
+	runtime_timestamp_plan=$(make -n -W "$runtime_source_path" prepare-blorp-cli-runtime)
+	if grep -Fq 'cc "' <<<"$runtime_timestamp_plan"; then
+		echo "FAIL: content-addressed runtime object must ignore $runtime_source timestamps" >&2
+		exit 1
+	fi
+done
+if [ "$runtime_object_probe_created" = true ]; then
+	rm -f "$runtime_object_path"
+	trap - EXIT
+fi
 if ! grep -Fq '$(BLORP_CLI_RUNTIME_C_OPTIMIZATION)' <<<"$runtime_cache_identity"; then
 	echo "FAIL: runtime object identity must cover its independent optimization level" >&2
 	exit 1

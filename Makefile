@@ -140,7 +140,10 @@ $(BLORP_CLI_RUNTIME_SOURCES_C): force-generated-sources $(BLORP_BUILD_SOURCE_GEN
 	$(BLORP_BUILD_SOURCE_GENERATOR) embedded-runtime-c blorp/src/lib/runtime/native/minicoro.h blorp/src/lib/runtime/native/runtime.c blorp/src/lib/runtime/native/runtime_decl.c > $@.tmp
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
-$(BLORP_CLI_RUNTIME_OBJECT): blorp/src/lib/runtime/native/minicoro.h blorp/src/lib/runtime/native/runtime.c blorp/src/lib/runtime/native/runtime_decl.c
+# The content-addressed target name already covers every runtime input. Normal
+# timestamp prerequisites would rebuild a valid object restored by CI when a
+# fresh checkout gives unchanged sources newer mtimes than the cached object.
+$(BLORP_CLI_RUNTIME_OBJECT):
 	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
 	@set -e; \
 	tmp="$@.tmp"; \
