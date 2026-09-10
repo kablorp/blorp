@@ -2586,8 +2586,11 @@ private pure func callable_header_parameter_name(binder: CallableParameterBinder
 			None
 
 
-private pure func bound_trait_identity(id: TraitId) -> BoundTraitIdentity:
-	owner = match trait_id_module_id(id):
+private pure func bound_trait_identity(
+	definition_table: DefinitionTable,
+	id: TraitId,
+) -> BoundTraitIdentity:
+	owner = match trait_id_module_id(definition_table, id):
 		Some(module_id):
 			GraphBoundTraitOwner(module_id)
 		None:
@@ -2596,12 +2599,13 @@ private pure func bound_trait_identity(id: TraitId) -> BoundTraitIdentity:
 	{
 		owner = owner,
 		definition_id = trait_id_definition_id(id),
-		name = trait_id_name(id),
-		span = trait_id_source_span(id)
+		name = trait_id_name(definition_table, id),
+		span = trait_id_source_span(definition_table, id)
 	}
 
 
 private pure func callable_header_bound_type_params(
+	definition_table: DefinitionTable,
 	header: CallableHeader,
 	declared: List[ParsedTypeParamDecl],
 	func_type: SemanticType,
@@ -2645,7 +2649,9 @@ private pure func callable_header_bound_type_params(
 			result = result.append(
 				make_resolved_bound_type_param(
 					name,
-					callable_type_parameter_bounds(parameter).map(bound_trait_identity),
+					callable_type_parameter_bounds(parameter).map(
+						func(id): bound_trait_identity(definition_table, id),
+					),
 				),
 			)
 
@@ -2808,6 +2814,7 @@ private pure func prepare_accepted_callable_header(
 											def_id = definition_id,
 											func_type = func_type,
 											type_params = callable_header_bound_type_params(
+												type_header_graph_definition_table(type_headers),
 												header,
 												decl.type_params,
 												func_type,
@@ -3056,6 +3063,7 @@ private pure func prepare_accepted_trait_header(
 	compiler_builtin_id: Option[TraitId],
 ) -> AcceptedTraitRecordClaim:
 	id = trait_topology_header_id(header)
+	definition_table = type_header_graph_definition_table(type_headers)
 	registration = LocalCallableHeaderRegistration(module_path)
 	var methods: List[TraitMethodSig] = []
 	var conversion_failed: Bool = False
@@ -3125,9 +3133,9 @@ private pure func prepare_accepted_trait_header(
 		match claim_source_id_from_state(
 			state,
 			TraitDefinition,
-			trait_id_name(id),
+			trait_id_name(definition_table, id),
 			None,
-			trait_id_source_span(id),
+			trait_id_source_span(definition_table, id),
 		):
 			DefinitionIdMissing(with_error):
 				AcceptedTraitRecordMissing(with_error)
@@ -3155,11 +3163,13 @@ private pure func prepare_accepted_trait_header(
 							).map(trait_method_slot_id),
 							definition = trait_def_with_details(
 								definition_id,
-								trait_id_name(id),
+								trait_id_name(definition_table, id),
 								trait_topology_header_parameters(
 									header,
 								).map(trait_type_parameter_name),
-								trait_topology_header_supertraits(header).map(trait_id_name),
+								trait_topology_header_supertraits(header).map(
+									func(supertrait_id): trait_id_name(definition_table, supertrait_id),
+								),
 								methods,
 								Some(module_path),
 							)
@@ -3561,17 +3571,21 @@ private pure func impl_method_infos_from_decl(
 
 
 private pure func implementation_bound_type_params(
+	definition_table: DefinitionTable,
 	header: ImplementationHeader,
 ) -> List[BoundTypeParam]:
 	implementation_header_parameters(header).map(func(parameter): make_resolved_bound_type_param(
 			implementation_type_parameter_id_name(
 				resolved_implementation_type_parameter_id(parameter),
 			),
-			resolved_implementation_type_parameter_bounds(parameter).map(bound_trait_identity),
+			resolved_implementation_type_parameter_bounds(parameter).map(
+				func(id): bound_trait_identity(definition_table, id),
+			),
 		))
 
 
 private pure func implementation_method_bound_type_params(
+	definition_table: DefinitionTable,
 	header: ImplementationMethodHeader,
 ) -> List[BoundTypeParam]:
 	explicit_implementation_method_parameters(
@@ -3583,7 +3597,7 @@ private pure func implementation_method_bound_type_params(
 			),
 			resolved_implementation_method_type_parameter_bounds(
 				parameter,
-			).map(bound_trait_identity),
+			).map(func(id): bound_trait_identity(definition_table, id)),
 		),
 	)
 
@@ -3706,7 +3720,10 @@ private pure func implementation_method_info_from_header(
 										source.name.text,
 										Some({callable_id = callable_id}),
 										func_type,
-										implementation_method_bound_type_params(method_header),
+										implementation_method_bound_type_params(
+											type_header_graph_definition_table(type_headers),
+											method_header,
+										),
 										param_names,
 										purity_from_parsed(source.is_pure),
 										function_resource_arg_policy(
@@ -3786,6 +3803,7 @@ private pure func prepare_accepted_implementation_header(
 ) -> AcceptedImplementationRecordClaim:
 	id = implementation_header_id(header)
 	trait_id = implementation_header_trait_id(header)
+	definition_table = type_header_graph_definition_table(type_headers)
 	registration = LocalCallableHeaderRegistration(module_path)
 
 	match callable_header_semantic_type(
@@ -3889,9 +3907,9 @@ private pure func prepare_accepted_implementation_header(
 											.map(implementation_method_header_id),
 										instance = impl_instance_with_methods(
 											definition_id,
-											trait_id_name(trait_id),
+											trait_id_name(definition_table, trait_id),
 											canonical_for_type,
-											implementation_bound_type_params(header),
+											implementation_bound_type_params(definition_table, header),
 											canonical_methods,
 											False,
 										)
@@ -6127,37 +6145,43 @@ private pure func replay_accepted_trait_definition_id(
 	state: TypecheckState,
 	id: TraitId,
 ) -> TypecheckState:
-	match claim_source_id_from_state(
-		state,
-		TraitDefinition,
-		trait_id_name(id),
-		None,
-		trait_id_source_span(id),
-	):
-		DefinitionIdMissing(with_error):
-			with_error
-		DefinitionIdClaimed(with_id, definition_id):
-			if definition_id == trait_id_definition_id(id):
-				with_id
-			else:
-				typecheck_state_add_error(
-					with_id,
-					(
-						"internal typecheck error: trait header definition ID does not match its "
-						+ "reserved module ID"
-					),
-				)
+	match typecheck_state_definition_index(state):
+		None:
+			typecheck_state_add_error(
+				state,
+				"internal typecheck error: trait ID is absent from the definition table",
+			)
+		Some(index):
+			table = definition_index_definition_table(index)
+			match claim_source_id_from_state(
+				state,
+				TraitDefinition,
+				trait_id_name(table, id),
+				None,
+				trait_id_source_span(table, id),
+			):
+				DefinitionIdMissing(with_error):
+					with_error
+				DefinitionIdClaimed(with_id, definition_id):
+					if definition_id == trait_id_definition_id(id):
+						with_id
+					else:
+						typecheck_state_add_error(
+							with_id,
+							(
+								"internal typecheck error: trait header definition ID does not match its "
+								+ "reserved module ID"
+							),
+						)
 
 
 private pure func replay_accepted_implementation_method_definition_id(
 	state: TypecheckState,
+	definition_table: DefinitionTable,
 	id: CallableId,
 ) -> TypecheckState:
-	definition_table = typecheck_state_definition_index(
-		state,
-	).map(definition_index_definition_table)
-	name = definition_table.and_then(func(table): callable_id_name(table, id))
-	span = definition_table.and_then(func(table): callable_id_source_span(table, id))
+	name = callable_id_name(definition_table, id)
+	span = callable_id_source_span(definition_table, id)
 
 	match (name, span):
 		(None, _) | (_, None):
@@ -6203,33 +6227,44 @@ private pure func replay_accepted_implementation_definition_ids(
 	state: TypecheckState,
 	definition_ids: AcceptedImplementationDefinitionIds,
 ) -> TypecheckState:
-	var next = state
+	match typecheck_state_definition_index(state):
+		None:
+			typecheck_state_add_error(
+				state,
+				"internal typecheck error: implementation ID is absent from the definition table",
+			)
+		Some(index):
+			table = definition_index_definition_table(index)
+			var next = state
 
-	for method_id in definition_ids.method_ids:
-		next = replay_accepted_implementation_method_definition_id(next, method_id)
-
-	id = definition_ids.id
-
-	match claim_source_id_from_state(
-		next,
-		ImplDefinition,
-		impl_id_name(id),
-		None,
-		impl_id_source_span(id),
-	):
-		DefinitionIdMissing(with_error):
-			with_error
-		DefinitionIdClaimed(with_id, definition_id):
-			if definition_id == impl_id_definition_id(id):
-				with_id
-			else:
-				typecheck_state_add_error(
-					with_id,
-					(
-						"internal typecheck error: implementation header definition ID does not match "
-						+ "its reserved module ID"
-					),
+			for method_id in definition_ids.method_ids:
+				next = replay_accepted_implementation_method_definition_id(
+					next,
+					table,
+					method_id,
 				)
+
+			id = definition_ids.id
+			match claim_source_id_from_state(
+				next,
+				ImplDefinition,
+				impl_id_name(table, id),
+				None,
+				impl_id_source_span(table, id),
+			):
+				DefinitionIdMissing(with_error):
+					with_error
+				DefinitionIdClaimed(with_id, definition_id):
+					if definition_id == impl_id_definition_id(id):
+						with_id
+					else:
+						typecheck_state_add_error(
+							with_id,
+							(
+								"internal typecheck error: implementation header definition ID does not match "
+								+ "its reserved module ID"
+							),
+						)
 
 
 private pure func typecheck_state_after_accepted_definition_id_replay(
@@ -6816,7 +6851,7 @@ private pure func prepared_module_environments(
 	for header in trait_topology_graph_headers(
 		callable_header_graph_trait_topology(callable_headers),
 	):
-		owner_id = trait_id_module_id(trait_topology_header_id(header))
+		owner_id = trait_id_module_id(definition_table, trait_topology_header_id(header))
 
 		owner_index = match owner_id:
 			Some(module_id):
@@ -6836,7 +6871,9 @@ private pure func prepared_module_environments(
 						)
 
 						compiler_builtin_id = if is_prelude_traits:
-							builtin_trait_id(trait_id_name(trait_topology_header_id(header)))
+							builtin_trait_id(
+								trait_id_name(definition_table, trait_topology_header_id(header)),
+							)
 						else:
 							None
 
@@ -6961,9 +6998,9 @@ private pure func prepared_module_environments(
 		})
 
 	for header in implementation_header_graph_headers(implementation_headers):
-		match prepared_module_base_index(
-			base_positions_by_module_id,
-			impl_id_module_id(implementation_header_id(header)),
+		base_positions = base_positions_by_module_id
+		match impl_id_module_id(definition_table, implementation_header_id(header)).and_then(
+			func(module_id): prepared_module_base_index(base_positions, module_id),
 		):
 			Some(index):
 				match bases.get(index):
@@ -8305,7 +8342,7 @@ private pure func frontend_preparation_unique_declaration_observation(
 			global_count += 1
 
 	for header in trait_topology_graph_headers(topology):
-		included = trait_id_module_id(trait_topology_header_id(header))
+		included = trait_id_module_id(definition_table, trait_topology_header_id(header))
 			.map(func(module_id):
 				frontend_preparation_modules_include_id(modules, module_id)
 			)
@@ -8315,10 +8352,9 @@ private pure func frontend_preparation_unique_declaration_observation(
 			trait_count += 1
 
 	for header in implementation_header_graph_headers(implementation_headers):
-		if frontend_preparation_modules_include_id(
-			modules,
-			impl_id_module_id(implementation_header_id(header)),
-		):
+		if impl_id_module_id(definition_table, implementation_header_id(header)).map(func(module_id):
+			frontend_preparation_modules_include_id(modules, module_id)
+		).get_or(False):
 			implementation_count += 1
 
 	frontend_preparation_observation_finish({ frontend_preparation_observation_empty(0) |
@@ -9254,6 +9290,9 @@ private pure func implementation_body_signature_from_accepted_header(
 	type_headers = trait_topology_graph_type_headers(
 		accepted_typecheck_graph_trait_topology(base.representation.graph_facts),
 	)
+	definition_table = implementation_header_graph_definition_table(
+		base.representation.graph_facts.implementation_headers,
+	)
 	registration = LocalCallableHeaderRegistration(
 		prepared_module_scope_canonical_path(bound_module_scope(base.representation.bound_module)),
 	)
@@ -9290,8 +9329,12 @@ private pure func implementation_body_signature_from_accepted_header(
 				Some({
 					callable_id = Some(callable_id_definition_id(id)),
 					effective_type_params = implementation_bound_type_params(
+						definition_table,
 						implementation,
-					).concat(implementation_method_bound_type_params(method_header)),
+					).concat(implementation_method_bound_type_params(
+						definition_table,
+						method_header,
+					)),
 					param_types = param_types,
 					semantic_return_type = resolved_return_type,
 				})
@@ -9547,13 +9590,16 @@ private pure func implementation_body_contexts_from_base(
 ) -> BodyCheckPlanDraft:
 	representation = base.representation
 	graph = representation.graph_facts.implementation_headers
+	definition_table = implementation_header_graph_definition_table(graph)
 	module_id = prepared_module_scope_id(bound_module_scope(representation.bound_module))
 	var contexts: List[BodyCheckContext] = []
 	var failures: List[BodyCheckPlanningFailure] = []
 	var implementation_rejections: List[BodyImplementationPlanningFailure] = []
 
 	for implementation in implementation_header_graph_headers(graph):
-		if module_ids_equal(impl_id_module_id(implementation_header_id(implementation)), module_id):
+		if impl_id_module_id(definition_table, implementation_header_id(implementation))
+			.map(func(owner_id): module_ids_equal(owner_id, module_id))
+			.get_or(False):
 			match prepare_implementation_body(base, implementation):
 				ImplementationBodyRejected(errors, diagnostics):
 					implementation_rejections = implementation_rejections.append({

@@ -1,9 +1,8 @@
--- Exact, definition-owned implementation headers and conservative lookup.
+-- Exact, definition-owned implementation headers in declaration order.
 --
--- The candidate index is deliberately a superset: it buckets by exact trait
--- definition ID and receiver head category, then validates both exact trait
--- identity and category on lookup. Hash collisions can add work but cannot
--- hide a legal implementation.
+-- This phase publishes the canonical header rows. Production implementation
+-- selection builds its justified reverse indexes at the accepted-authority
+-- boundary, so header construction does not retain a second candidate index.
 import:
 	../../../lib/source: SourceSpan
 	../../stage_03_parse/parsed_ast:
@@ -51,15 +50,9 @@ import:
 		callable_ids_equal,
 		declaration_skeleton_graph_callable_skeletons,
 		declaration_skeleton_graph_implementation_skeletons,
-		impl_id_definition_id,
 		impl_id_module_id,
-		impl_id_name,
-		impl_id_source_span,
 		impl_ids_equal,
-		trait_id_definition_id,
-		trait_id_name,
 		trait_ids_equal,
-		trait_method_id_name,
 	trait_headers:
 		TraitMethodCategory(DefaultTraitMethod, RequiredTraitMethod),
 		TraitMethodSlot,
@@ -162,18 +155,6 @@ union ImplementationMethodHeader:
 	DefaultImplementationMethodHeaderValue(DefaultImplementationMethodHeader)
 
 
-enum ImplementationReceiverHeadCategory:
-	DeclaredReceiverHead
-	IntrinsicReceiverHead
-	PreludeReceiverHead
-	ArrayReceiverHead
-	TupleReceiverHead
-	FunctionReceiverHead
-	RangeReceiverHead
-	ParameterReceiverHead
-	DimensionReceiverHead
-
-
 private record ImplementationHeaderRep {
 	id: ImplId,
 	visibility: DeclarationVisibility,
@@ -181,7 +162,6 @@ private record ImplementationHeaderRep {
 	trait_id: TraitId,
 	parameters: List[ResolvedImplementationTypeParameter],
 	receiver: ResolvedTypeShape,
-	receiver_head: ImplementationReceiverHeadCategory,
 	methods: List[ImplementationMethodHeader]
 }
 
@@ -191,9 +171,7 @@ opaque type ImplementationHeader = ImplementationHeaderRep
 
 private record ImplementationHeaderGraphRep {
 	callable_headers: CallableHeaderGraph,
-	headers: List[ImplementationHeader],
-	header_index_by_definition_id: Dict[Int, Int],
-	index_by_trait_definition_id: Dict[Int, Dict[Int, List[Int]]]
+	headers: List[ImplementationHeader]
 }
 
 
@@ -201,16 +179,16 @@ opaque type ImplementationHeaderGraph = ImplementationHeaderGraphRep
 
 
 union ImplementationHeaderGraphError:
-	ImplementationOwnerModuleMissing(ImplId, String)
-	ImplementationUnknownTrait(ImplId, ParsedIdentifier)
-	ImplementationDuplicateTypeParameter(ImplId, ParsedIdentifier)
-	ImplementationTypeParameterUnknownBound(ImplId, ParsedIdentifier, ParsedIdentifier)
+	ImplementationOwnerModuleMissing(String, String, SourceSpan)
+	ImplementationUnknownTrait(String, ParsedIdentifier)
+	ImplementationDuplicateTypeParameter(String, ParsedIdentifier)
+	ImplementationTypeParameterUnknownBound(String, ParsedIdentifier, ParsedIdentifier)
 	ImplementationMethodDuplicateTypeParameter(String, ParsedIdentifier)
 	ImplementationMethodShadowsImplementationTypeParameter(String, ParsedIdentifier)
 	ImplementationMethodTypeParameterUnknownBound(String, ParsedIdentifier, ParsedIdentifier)
 	ImplementationMethodMissingParameterType(String, Int, SourceSpan)
-	ImplementationDefaultMethodMissing(ImplId, String)
-	ImplementationMissingRequiredMethod(ImplId, TraitMethodId, SourceSpan)
+	ImplementationDefaultMethodMissing(String, String, SourceSpan)
+	ImplementationMissingRequiredMethod(String, String, SourceSpan)
 	ImplementationTypeResolutionError(TypeShapeResolutionError)
 
 
@@ -241,8 +219,6 @@ private record ImplementationMethodsResolution {
 
 private record ImplementationHeaderBuildState {
 	headers: List[ImplementationHeader],
-	header_index_by_definition_id: Dict[Int, Int],
-	index_by_trait_definition_id: Dict[Int, Dict[Int, List[Int]]],
 	errors: List[ImplementationHeaderGraphError]
 }
 
@@ -301,12 +277,6 @@ pure func implementation_header_parameters(
 
 pure func implementation_header_receiver(header: ImplementationHeader) -> ResolvedTypeShape:
 	implementation_header_rep(header).receiver
-
-
-pure func implementation_header_receiver_head(
-	header: ImplementationHeader,
-) -> ImplementationReceiverHeadCategory:
-	implementation_header_rep(header).receiver_head
 
 
 pure func implementation_header_method_ids(header: ImplementationHeader) -> List[CallableId]:
@@ -413,52 +383,6 @@ pure func explicit_implementation_method_dimension_constraints(
 			[]
 
 
-private pure func receiver_head_category(
-	shape: ResolvedTypeShape,
-) -> ImplementationReceiverHeadCategory:
-	match shape:
-		DeclaredTypeShape(_, _):
-			DeclaredReceiverHead
-		IntrinsicTypeShape(_, _):
-			IntrinsicReceiverHead
-		PreludeTypeShape(_, _):
-			PreludeReceiverHead
-		ArrayTypeShape(_, _):
-			ArrayReceiverHead
-		TupleTypeShape(_):
-			TupleReceiverHead
-		FunctionTypeShape(_, _, _):
-			FunctionReceiverHead
-		RangeTypeShape(_):
-			RangeReceiverHead
-		TypeParameterShape(_) | SelfTypeShape(_) | TraitTypeParameterShape(_) | TraitSelfTypeShape(_) | CallableTypeParameterShape(_) | ImplementationTypeParameterShape(_):
-			ParameterReceiverHead
-		DimensionParameterShape(_, _) | TraitDimensionParameterShape(_, _) | CallableDimensionParameterShape(_, _) | ImplementationDimensionParameterShape(_, _) | WildcardDimensionShape(_) | DimensionLiteralShape(_) | DimensionBinaryShape(_, _, _):
-			DimensionReceiverHead
-
-
-private pure func receiver_head_key(category: ImplementationReceiverHeadCategory) -> Int:
-	match category:
-		DeclaredReceiverHead:
-			0
-		IntrinsicReceiverHead:
-			1
-		PreludeReceiverHead:
-			2
-		ArrayReceiverHead:
-			3
-		TupleReceiverHead:
-			4
-		FunctionReceiverHead:
-			5
-		RangeReceiverHead:
-			6
-		ParameterReceiverHead:
-			7
-		DimensionReceiverHead:
-			8
-
-
 private pure func effective_implementation_type_parameters(
 	type_headers: TypeHeaderGraph,
 	module: BoundModule,
@@ -508,7 +432,7 @@ private pure func resolve_implementation_parameters(
 		if names.contains(parameter.name.text):
 			errors = errors.append(
 				ImplementationDuplicateTypeParameter(
-					skeleton.id,
+					skeleton.source.trait_name.text,
 					parameter.name,
 				),
 			)
@@ -520,7 +444,7 @@ private pure func resolve_implementation_parameters(
 				None:
 					errors = errors.append(
 						ImplementationTypeParameterUnknownBound(
-							skeleton.id,
+							skeleton.source.trait_name.text,
 							parameter.name,
 							bound,
 						),
@@ -980,7 +904,7 @@ private pure func implementation_methods(
 						methods = methods.append(ExplicitImplementationMethodHeaderValue(explicit))
 					else:
 						errors = errors.concat(all_errors)
-			DefaultImplementationMethodCallableSource(owner, method_name, _):
+			DefaultImplementationMethodCallableSource(owner, method_name, impl_decl):
 				if impl_ids_equal(owner, implementation_id):
 					match find_default_trait_method(topology, trait_id, method_name):
 						Some(trait_method):
@@ -997,8 +921,9 @@ private pure func implementation_methods(
 						None:
 							errors = errors.append(
 								ImplementationDefaultMethodMissing(
-									implementation_id,
+									impl_decl.trait_name.text,
 									method_name,
+									impl_decl.span,
 								),
 							)
 			FunctionCallableSource(_) | ForeignCallableSource(_):
@@ -1012,7 +937,7 @@ private pure func implementation_methods(
 
 private pure func missing_required_method_errors(
 	topology: TraitTopologyGraph,
-	implementation_id: ImplId,
+	implementation_name: String,
 	trait_id: TraitId,
 	methods: List[ImplementationMethodHeader],
 ) -> List[ImplementationHeaderGraphError]:
@@ -1043,8 +968,8 @@ private pure func missing_required_method_errors(
 						):
 							errors = errors.append(
 								ImplementationMissingRequiredMethod(
-									implementation_id,
-									trait_method_slot_id(slot),
+									implementation_name,
+									name,
 									trait_method_slot_source(slot).span,
 								),
 							)
@@ -1054,55 +979,41 @@ private pure func missing_required_method_errors(
 	errors
 
 
-private pure func append_candidate_index(
-	index: Dict[Int, Dict[Int, List[Int]]],
-	trait_id: TraitId,
-	receiver_head: ImplementationReceiverHeadCategory,
-	header_index: Int,
-) -> Dict[Int, Dict[Int, List[Int]]]:
-	trait_key = trait_id_definition_id(trait_id)
-	head_key = receiver_head_key(receiver_head)
-	trait_bucket = index.get_or(trait_key, {})
-	head_bucket = trait_bucket
-		.get_or(head_key, [])
-		.append(header_index)
-	index.set(
-		trait_key,
-		trait_bucket.set(head_key, head_bucket),
-	)
-
-
 pure func implementation_header_graph_build(
 	callable_headers: CallableHeaderGraph,
 ) -> Result[ImplementationHeaderGraph, List[ImplementationHeaderGraphError]]:
 	topology = callable_header_graph_trait_topology(callable_headers)
 	type_headers = trait_topology_graph_type_headers(topology)
+	definition_table = callable_header_graph_definition_table(callable_headers)
 	declaration_graph = type_header_graph_declaration_graph(type_headers)
 	bound_graph = type_header_graph_bound_graph(type_headers)
 	var state: ImplementationHeaderBuildState = {
 		headers = [],
-		header_index_by_definition_id = {},
-		index_by_trait_definition_id = {},
 		errors = []
 	}
 
 	for skeleton in declaration_skeleton_graph_implementation_skeletons(declaration_graph):
-		match bound_module_graph_find_for_id(
+		owner_id = impl_id_module_id(definition_table, skeleton.id)
+
+		match owner_id.and_then(func(module_id): bound_module_graph_find_for_id(
 			bound_graph,
 			bound_module_graph_module_table(bound_graph),
-			impl_id_module_id(skeleton.id),
-		):
+			module_id,
+		)):
 			None:
-				module_path = bound_module_graph_canonical_path_for_id(
-					bound_graph,
-					bound_module_graph_module_table(bound_graph),
-					impl_id_module_id(skeleton.id),
+				module_path = owner_id.and_then(func(module_id):
+					bound_module_graph_canonical_path_for_id(
+						bound_graph,
+						bound_module_graph_module_table(bound_graph),
+						module_id,
+					)
 				).get_or("<unknown module>")
 				state = { state |
 					errors = state.errors.append(
 						ImplementationOwnerModuleMissing(
-							skeleton.id,
+							skeleton.source.trait_name.text,
 							module_path,
+							skeleton.source.span,
 						),
 					)
 				}
@@ -1117,7 +1028,7 @@ pure func implementation_header_graph_build(
 						state = { state |
 							errors = state.errors.append(
 								ImplementationUnknownTrait(
-									skeleton.id,
+									skeleton.source.trait_name.text,
 									skeleton.source.trait_name,
 								),
 							)
@@ -1136,6 +1047,7 @@ pure func implementation_header_graph_build(
 							type_headers,
 							bound_module_scope(module),
 							skeleton.id,
+							skeleton.source.trait_name.text,
 							parameter_ids,
 							skeleton.source.for_type,
 						):
@@ -1160,14 +1072,13 @@ pure func implementation_header_graph_build(
 									.concat(
 										missing_required_method_errors(
 											topology,
-											skeleton.id,
+											skeleton.source.trait_name.text,
 											trait_id,
 											method_resolution.methods,
 										),
-									)
+								)
 
 								if all_errors.is_empty():
-									receiver_head = receiver_head_category(receiver)
 									header: ImplementationHeader = into_opaque ImplementationHeader(
 										{
 											id = skeleton.id,
@@ -1176,24 +1087,11 @@ pure func implementation_header_graph_build(
 											trait_id = trait_id,
 											parameters = parameter_resolution.parameters,
 											receiver = receiver,
-											receiver_head = receiver_head,
 											methods = method_resolution.methods
 										}
 									)
-									header_index = state.headers.length()
-									state = {
-										headers = state.headers.append(header),
-										header_index_by_definition_id = state.header_index_by_definition_id.set(
-											impl_id_definition_id(skeleton.id),
-											header_index,
-										),
-										index_by_trait_definition_id = append_candidate_index(
-											state.index_by_trait_definition_id,
-											trait_id,
-											receiver_head,
-											header_index,
-										),
-										errors = state.errors
+									state = { state |
+										headers = state.headers.append(header)
 									}
 								else:
 									state = { state | errors = state.errors.concat(all_errors) }
@@ -1201,9 +1099,7 @@ pure func implementation_header_graph_build(
 	if state.errors.is_empty():
 		Ok(into_opaque ImplementationHeaderGraph({
 					callable_headers = callable_headers,
-					headers = state.headers,
-					header_index_by_definition_id = state.header_index_by_definition_id,
-					index_by_trait_definition_id = state.index_by_trait_definition_id
+					headers = state.headers
 				}))
 	else:
 		Err(state.errors)
@@ -1221,20 +1117,6 @@ pure func implementation_header_graph_headers(
 	implementation_header_graph_rep(graph).headers
 
 
-pure func implementation_header_graph_find_definition_id(
-	graph: ImplementationHeaderGraph,
-	definition_id: Int,
-) -> Option[ImplementationHeader]:
-	representation = implementation_header_graph_rep(graph)
-	index ?= representation.header_index_by_definition_id.get(definition_id)
-	header ?= representation.headers.get(index)
-
-	if impl_id_definition_id(implementation_header_id(header)) == definition_id:
-		Some(header)
-	else:
-		None
-
-
 pure func implementation_header_graph_callable_headers(
 	graph: ImplementationHeaderGraph,
 ) -> CallableHeaderGraph:
@@ -1247,57 +1129,18 @@ pure func implementation_header_graph_definition_table(
 	callable_header_graph_definition_table(implementation_header_graph_callable_headers(graph))
 
 
-pure func implementation_header_graph_candidates(
-	graph: ImplementationHeaderGraph,
-	trait_id: TraitId,
-	receiver_head: ImplementationReceiverHeadCategory,
-) -> List[ImplementationHeader]:
-	representation = implementation_header_graph_rep(graph)
-
-	indices: List[Int] = match representation.index_by_trait_definition_id.get(
-		trait_id_definition_id(trait_id),
-	):
-		Some(bucket):
-			bucket.get_or(receiver_head_key(receiver_head), [])
-		None:
-			[]
-
-	var result: List[ImplementationHeader] = []
-
-	for index in indices:
-		match representation.headers.get(index):
-			Some(header):
-				if (
-					trait_ids_equal(implementation_header_trait_id(header), trait_id)
-					and implementation_header_receiver_head(header) == receiver_head
-				):
-					result = result.append(header)
-			None:
-				void
-
-	result
-
-
 pure func implementation_header_graph_error_message(
 	error: ImplementationHeaderGraphError,
 ) -> String:
 	match error:
-		ImplementationOwnerModuleMissing(id, module_path):
-			"implementation of '" + impl_id_name(
-				id,
-			) + "' has no bound owner module '" + module_path + "'"
-		ImplementationUnknownTrait(id, trait_name):
-			"implementation '" + impl_id_name(
-				id,
-			) + "' refers to unknown trait '" + trait_name.text + "'"
-		ImplementationDuplicateTypeParameter(id, parameter):
-			"implementation of '" + impl_id_name(
-				id,
-			) + "' declares type parameter '" + parameter.text + "' more than once"
-		ImplementationTypeParameterUnknownBound(id, parameter, bound):
-			"implementation of '" + impl_id_name(
-				id,
-			) + "' type parameter '" + parameter.text + "' has unknown bound '" + bound.text + "'"
+		ImplementationOwnerModuleMissing(name, module_path, _):
+			"implementation of '" + name + "' has no bound owner module '" + module_path + "'"
+		ImplementationUnknownTrait(name, trait_name):
+			"implementation '" + name + "' refers to unknown trait '" + trait_name.text + "'"
+		ImplementationDuplicateTypeParameter(name, parameter):
+			"implementation of '" + name + "' declares type parameter '" + parameter.text + "' more than once"
+		ImplementationTypeParameterUnknownBound(name, parameter, bound):
+			"implementation of '" + name + "' type parameter '" + parameter.text + "' has unknown bound '" + bound.text + "'"
 		ImplementationMethodDuplicateTypeParameter(name, parameter):
 			"implementation method '" + name + "' declares type parameter '" + parameter.text + "' more than once"
 		ImplementationMethodShadowsImplementationTypeParameter(name, parameter):
@@ -1309,14 +1152,10 @@ pure func implementation_header_graph_error_message(
 			"implementation method '" + name + "' type parameter '" + parameter.text + "' has unknown bound '" + bound.text + "'"
 		ImplementationMethodMissingParameterType(name, parameter_index, _):
 			"implementation method '" + name + "' parameter " + (parameter_index + 1).to_string() + " must have an explicit type"
-		ImplementationDefaultMethodMissing(id, method_name):
-			"implementation of '" + impl_id_name(
-				id,
-			) + "' references missing default method '" + method_name + "'"
-		ImplementationMissingRequiredMethod(id, method_id, _):
-			"implementation of '" + impl_id_name(
-				id,
-			) + "' is missing required method '" + trait_method_id_name(method_id) + "'"
+		ImplementationDefaultMethodMissing(name, method_name, _):
+			"implementation of '" + name + "' references missing default method '" + method_name + "'"
+		ImplementationMissingRequiredMethod(name, method_name, _):
+			"implementation of '" + name + "' is missing required method '" + method_name + "'"
 		ImplementationTypeResolutionError(resolution_error):
 			type_shape_resolution_error_message(resolution_error)
 
@@ -1325,8 +1164,8 @@ pure func implementation_header_graph_error_span(
 	error: ImplementationHeaderGraphError,
 ) -> SourceSpan:
 	match error:
-		ImplementationOwnerModuleMissing(id, _):
-			impl_id_source_span(id)
+		ImplementationOwnerModuleMissing(_, _, span):
+			span
 		ImplementationUnknownTrait(_, trait_name):
 			trait_name.span
 		ImplementationDuplicateTypeParameter(_, parameter):
@@ -1341,8 +1180,8 @@ pure func implementation_header_graph_error_span(
 			bound.span
 		ImplementationMethodMissingParameterType(_, _, span):
 			span
-		ImplementationDefaultMethodMissing(id, _):
-			impl_id_source_span(id)
+		ImplementationDefaultMethodMissing(_, _, span):
+			span
 		ImplementationMissingRequiredMethod(_, _, span):
 			span
 		ImplementationTypeResolutionError(resolution_error):

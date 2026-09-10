@@ -38,6 +38,9 @@ GLOBAL_HEADER_COMPLETION = (
 DECLARATION_SKELETON = (
     ROOT / "blorp/src/compiler/stage_06_typecheck/headers/declaration_skeleton.brp"
 )
+IMPLEMENTATION_HEADERS = (
+    ROOT / "blorp/src/compiler/stage_06_typecheck/headers/implementation_headers.brp"
+)
 DEFINITION_IDENTITY = (
     ROOT / "blorp/src/compiler/stage_06_typecheck/graph/definition_identity.brp"
 )
@@ -144,20 +147,24 @@ class DeclarationBoundaryTests(unittest.TestCase):
             r"from_opaque ConstructorId\([^)]*\)\.structural",
         )
 
-    def test_graph_declaration_ids_store_only_module_foreign_keys(self) -> None:
+    def test_trait_and_implementation_ids_are_compact_definition_keys(self) -> None:
         source = DECLARATION_SKELETON.read_text(encoding="utf-8")
-        structural_id = re.search(
-            r"private record StructuralDeclarationIdRep \{.*?\n\}",
+
+        self.assertIn("opaque type ImplId = DefinitionId", source)
+        self.assertIn("opaque type TraitId = Int", source)
+        self.assertNotIn("StructuralDeclarationIdRep", source)
+        self.assertNotIn("RuntimeDeclarationIdRep", source)
+
+        method_id = re.search(
+            r"private struct TraitMethodIdRep \{.*?\n\}",
             source,
             re.DOTALL,
         )
-
-        self.assertIsNotNone(structural_id)
-        body = structural_id.group(0)
-        self.assertIn("module_id: ModuleId", body)
-        self.assertNotIn("ModuleIdentity", body)
-        self.assertNotIn("ModuleTable", body)
-        self.assertNotIn("PreparedModuleScope", body)
+        self.assertIsNotNone(method_id)
+        self.assertIn("owner: TraitId", method_id.group(0))
+        self.assertIn("index: Int", method_id.group(0))
+        self.assertNotIn("String", method_id.group(0))
+        self.assertNotIn("SourceSpan", method_id.group(0))
 
     def test_internal_definition_keys_store_only_module_foreign_keys(self) -> None:
         source = DEFINITION_IDENTITY.read_text(encoding="utf-8")
@@ -435,13 +442,38 @@ class DeclarationBoundaryTests(unittest.TestCase):
         self.assertIsNotNone(table)
         self.assertIsNotNone(authority)
         self.assertIn("module_table: ModuleTable", table.group(0))
+        self.assertIn("definition_table: DefinitionTable", table.group(0))
+        self.assertIn("trait_index_by_definition_id: Dict[Int, Int]", table.group(0))
+        self.assertIn(
+            "implementation_index_by_definition_id: Dict[Int, Int]",
+            table.group(0),
+        )
+        self.assertIn(
+            "trait_index_by_compiler_identity: Dict[Int, Int]", table.group(0)
+        )
         self.assertIn("trait_indices_by_module: List[List[Int]]", table.group(0))
         self.assertIn("implementation_indices_by_module: List[List[Int]]", table.group(0))
+        self.assertNotIn("trait_indices_by_module_and_definition_id", table.group(0))
+        self.assertNotIn(
+            "implementation_indices_by_module_and_definition_id", table.group(0)
+        )
         self.assertNotIn("trait_indices_by_module_path", table.group(0))
         self.assertNotIn("implementation_indices_by_module_path", table.group(0))
         self.assertNotIn("by_module_identity", table.group(0))
         self.assertIn("owner_module_path: String", authority.group(0))
         self.assertNotIn("owner: ModuleIdentity", authority.group(0))
+
+        implementation_headers = IMPLEMENTATION_HEADERS.read_text(encoding="utf-8")
+        implementation_graph = re.search(
+            r"private record ImplementationHeaderGraphRep \{.*?\n\}",
+            implementation_headers,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(implementation_graph)
+        self.assertNotIn(
+            "header_index_by_definition_id", implementation_graph.group(0)
+        )
+        self.assertNotIn("index_by_trait_identity", implementation_graph.group(0))
 
     def test_semantic_occurrences_store_module_owner_once(self) -> None:
         source = SEMANTIC_OCCURRENCE.read_text(encoding="utf-8")

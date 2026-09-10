@@ -1,9 +1,8 @@
 -- Stable, category-safe declaration identities and source provenance.
 --
 -- Skeletons reserve declaration identity before any header resolves a type.
--- Runtime definition-bearing categories retain their graph-reserved integer
--- ID; categories without runtime IDs use an opaque structural identity rather
--- than an invented sentinel integer.
+-- Definition-bearing categories retain their graph-reserved integer ID;
+-- declaration-only trait methods use their exact owner and source slot.
 import:
 	../../../lib/source: SourceSpan, source_spans_equal
 	../../stage_03_parse/parsed_ast:
@@ -57,7 +56,11 @@ import:
 		definition_table_constructor_row,
 		definition_table_global_definition_id,
 		definition_table_global_row,
+		definition_table_implementation_definition_id,
+		definition_table_implementation_row,
 		definition_table_row,
+		definition_table_trait_definition_id,
+		definition_table_trait_row,
 	../graph/indexed_graph:
 		PreparedModuleScope,
 		indexed_graph_definition_index,
@@ -75,7 +78,12 @@ import:
 		bound_module_graph_target,
 		bound_module_program,
 		bound_module_scope,
-	../type_system/builtins: builtin_trait_is_prelude, builtin_trait_supertraits
+	../type_system/builtins:
+		builtin_trait_is_prelude,
+		builtin_trait_registry_id,
+		builtin_trait_registry_id_from_value,
+		builtin_trait_registry_id_value,
+		builtin_trait_registry_name,
 
 
 enum DeclarationVisibility:
@@ -93,41 +101,24 @@ enum DeclarationSkeletonKind:
 	ImplementationSkeletonKind
 
 
-private record StructuralDeclarationIdRep {
-	module_id: ModuleId,
-	name: String,
-	owner: Option[String],
-	span: SourceSpan
-}
-
-
-private record RuntimeDeclarationIdRep {
-	structural: StructuralDeclarationIdRep,
-	definition_id: Int
-}
-
-
 opaque type GlobalId = DefinitionId
 
 opaque type ConstructorId = Int
 
 opaque type CallableId = DefinitionId
 
-opaque type ImplId = RuntimeDeclarationIdRep
+opaque type ImplId = DefinitionId
+
+-- Graph trait IDs are their non-negative DefinitionId. Compiler builtins use
+-- `-(registry_id + 1)`, keeping the domains explicit in one unboxed scalar.
+-- A graph ID is meaningful only with the DefinitionTable that issued it;
+-- graph products validate table compatibility before exchanging IDs.
+opaque type TraitId = Int
 
 
-private union TraitIdRep:
-	GraphTraitId(RuntimeDeclarationIdRep)
-	CompilerBuiltinTraitId(String, SourceSpan)
-
-
-opaque type TraitId = TraitIdRep
-
-
-private record TraitMethodIdRep {
+private struct TraitMethodIdRep {
 	owner: TraitId,
-	index: Int,
-	structural: StructuralDeclarationIdRep
+	index: Int
 }
 
 
@@ -135,13 +126,26 @@ opaque type TraitMethodId = TraitMethodIdRep
 
 private COMPILER_PRELUDE_TRAIT_DEFINITION_ID: Int = 0
 
+private BUILTIN_TRAIT_ENCODING_OFFSET: Int = 1
+
+private COMPILER_PRELUDE_SOURCE_SPAN: SourceSpan = {
+	path = "<compiler-prelude>",
+	module_name = "<compiler-prelude>",
+	start_offset = 0,
+	start_line = 1,
+	start_column = 1,
+	end_offset = 0,
+	end_line = 1,
+	end_column = 1
+}
+
 
 union DeclarationId:
 	TypeDeclarationId(TypeId)
 	ConstructorDeclarationId(ConstructorId)
 	CallableDeclarationId(CallableId)
 	TraitDeclarationId(TraitId)
-	TraitMethodDeclarationId(TraitMethodId)
+	TraitMethodDeclarationId(TraitId, Int)
 	GlobalDeclarationId(GlobalId)
 	ImplementationDeclarationId(ImplId)
 
@@ -175,7 +179,7 @@ union DeclarationSkeleton:
 	ConstructorDeclarationSkeleton(ConstructorId, DeclarationVisibility, TypeId, ParsedVariantDecl)
 	CallableDeclarationSkeleton(CallableId, DeclarationVisibility, CallableDeclarationSource)
 	TraitDeclarationSkeleton(TraitId, DeclarationVisibility, ParsedTraitDecl)
-	TraitMethodDeclarationSkeleton(TraitMethodId, DeclarationVisibility, ParsedTraitMethodDecl)
+	TraitMethodDeclarationSkeleton(TraitId, Int, DeclarationVisibility, ParsedTraitMethodDecl)
 	GlobalDeclarationSkeleton(GlobalId, DeclarationVisibility, ParsedVarDecl)
 	ImplementationDeclarationSkeleton(ImplId, DeclarationVisibility, ParsedImplDecl)
 
@@ -297,52 +301,6 @@ pure func type_declaration_source_span(source: TypeDeclarationSource) -> SourceS
 		AliasTypeSource(decl): decl.span
 
 
-private pure func structural_declaration_id(
-	module_id: ModuleId,
-	name: String,
-	owner: Option[String],
-	span: SourceSpan,
-) -> StructuralDeclarationIdRep:
-	{
-		module_id = module_id,
-		name = name,
-		owner = owner,
-		span = span
-	}
-
-
-private pure func runtime_declaration_id(
-	structural: StructuralDeclarationIdRep,
-	definition_id: Int,
-) -> RuntimeDeclarationIdRep:
-	{
-		structural = structural,
-		definition_id = definition_id
-	}
-
-
-private pure func structural_declaration_ids_equal(
-	left: StructuralDeclarationIdRep,
-	right: StructuralDeclarationIdRep,
-) -> Bool:
-	(
-		module_ids_equal(left.module_id, right.module_id)
-		and left.name == right.name
-		and left.owner == right.owner
-		and source_spans_equal(left.span, right.span)
-	)
-
-
-private pure func runtime_declaration_ids_equal(
-	left: RuntimeDeclarationIdRep,
-	right: RuntimeDeclarationIdRep,
-) -> Bool:
-	(
-		left.definition_id == right.definition_id
-		and structural_declaration_ids_equal(left.structural, right.structural)
-	)
-
-
 pure func trait_method_ids_equal(left: TraitMethodId, right: TraitMethodId) -> Bool:
 	left_rep = from_opaque TraitMethodId(left)
 	right_rep = from_opaque TraitMethodId(right)
@@ -350,7 +308,6 @@ pure func trait_method_ids_equal(left: TraitMethodId, right: TraitMethodId) -> B
 	(
 		trait_ids_equal(left_rep.owner, right_rep.owner)
 		and left_rep.index == right_rep.index
-		and structural_declaration_ids_equal(left_rep.structural, right_rep.structural)
 	)
 
 
@@ -360,8 +317,8 @@ private pure func declaration_ids_equal(left: DeclarationId, right: DeclarationI
 			type_ids_equal(left_id, right_id)
 		(GlobalDeclarationId(left_id), GlobalDeclarationId(right_id)):
 			global_ids_equal(left_id, right_id)
-		(TraitMethodDeclarationId(left_id), TraitMethodDeclarationId(right_id)):
-			trait_method_ids_equal(left_id, right_id)
+		(TraitMethodDeclarationId(left_owner, left_index), TraitMethodDeclarationId(right_owner, right_index)):
+			trait_ids_equal(left_owner, right_owner) and left_index == right_index
 		(ConstructorDeclarationId(left_id), ConstructorDeclarationId(right_id)):
 			constructor_ids_equal(left_id, right_id)
 		(CallableDeclarationId(left_id), CallableDeclarationId(right_id)):
@@ -369,7 +326,7 @@ private pure func declaration_ids_equal(left: DeclarationId, right: DeclarationI
 		(TraitDeclarationId(left_id), TraitDeclarationId(right_id)):
 			trait_ids_equal(left_id, right_id)
 		(ImplementationDeclarationId(left_id), ImplementationDeclarationId(right_id)):
-			runtime_declaration_ids_equal(from_opaque ImplId(left_id), from_opaque ImplId(right_id))
+			impl_ids_equal(left_id, right_id)
 		_:
 			False
 
@@ -489,65 +446,102 @@ pure func global_id_source_span(table: DefinitionTable, id: GlobalId) -> Option[
 
 
 pure func impl_ids_equal(left: ImplId, right: ImplId) -> Bool:
-	runtime_declaration_ids_equal(from_opaque ImplId(left), from_opaque ImplId(right))
+	definition_ids_equal(from_opaque ImplId(left), from_opaque ImplId(right))
 
 
-pure func impl_id_module_id(id: ImplId) -> ModuleId:
-	from_opaque ImplId(id).structural.module_id
+pure func impl_id_from_definition_table(
+	table: DefinitionTable,
+	runtime_definition_id: Int,
+) -> Option[ImplId]:
+	definition_table_implementation_definition_id(table, runtime_definition_id).map(
+		func(id): into_opaque ImplId(id),
+	)
 
 
-pure func impl_id_name(id: ImplId) -> String:
-	from_opaque ImplId(id).structural.name
+pure func impl_id_module_id(table: DefinitionTable, id: ImplId) -> Option[ModuleId]:
+	definition_table_implementation_row(table, impl_id_definition_id(id)).map(func(row): row.module_id)
 
 
 pure func impl_id_definition_id(id: ImplId) -> Int:
-	from_opaque ImplId(id).definition_id
+	definition_id_runtime_value(from_opaque ImplId(id))
 
 
-pure func impl_id_source_span(id: ImplId) -> SourceSpan:
-	from_opaque ImplId(id).structural.span
+pure func impl_id_name(table: DefinitionTable, id: ImplId) -> String:
+	definition_table_implementation_row(table, impl_id_definition_id(id))
+		.map(func(row): row.name)
+		.get_or("<unknown implementation>")
+
+
+pure func impl_id_source_span(table: DefinitionTable, id: ImplId) -> SourceSpan:
+	definition_table_implementation_row(table, impl_id_definition_id(id))
+		.map(func(row): row.span)
+		.get_or(COMPILER_PRELUDE_SOURCE_SPAN)
 
 
 pure func trait_ids_equal(left: TraitId, right: TraitId) -> Bool:
-	match (from_opaque TraitId(left), from_opaque TraitId(right)):
-		(GraphTraitId(left_id), GraphTraitId(right_id)):
-			runtime_declaration_ids_equal(left_id, right_id)
-		(CompilerBuiltinTraitId(left_name, left_span), CompilerBuiltinTraitId(right_name, right_span)):
-			left_name == right_name and source_spans_equal(left_span, right_span)
-		_:
-			False
+	from_opaque TraitId(left) == from_opaque TraitId(right)
 
 
-pure func trait_id_name(id: TraitId) -> String:
-	match from_opaque TraitId(id):
-		GraphTraitId(runtime):
-			runtime.structural.name
-		CompilerBuiltinTraitId(name, _):
-			name
+pure func trait_id_from_definition_table(
+	table: DefinitionTable,
+	runtime_definition_id: Int,
+) -> Option[TraitId]:
+	definition_table_trait_definition_id(table, runtime_definition_id).map(
+		func(id): into_opaque TraitId(definition_id_runtime_value(id)),
+	)
 
 
-pure func trait_id_module_id(id: TraitId) -> Option[ModuleId]:
-	match from_opaque TraitId(id):
-		GraphTraitId(runtime):
-			Some(runtime.structural.module_id)
-		CompilerBuiltinTraitId(_, _):
-			None
+pure func trait_id_storage_key(id: TraitId) -> Int:
+	from_opaque TraitId(id)
+
+
+pure func builtin_trait_id_name(id: TraitId) -> Option[String]:
+	raw = trait_id_storage_key(id)
+
+	if raw < 0:
+		builtin_trait_registry_id_from_value(
+			0 - raw - BUILTIN_TRAIT_ENCODING_OFFSET,
+		).and_then(builtin_trait_registry_name)
+	else:
+		None
+
+
+pure func trait_id_name(table: DefinitionTable, id: TraitId) -> String:
+	raw = trait_id_storage_key(id)
+
+	if raw < 0:
+		builtin_trait_id_name(id).get_or("<unknown builtin trait>")
+	else:
+		definition_table_trait_row(table, raw).map(func(row): row.name).get_or("<unknown trait>")
+
+
+pure func trait_id_module_id(table: DefinitionTable, id: TraitId) -> Option[ModuleId]:
+	raw = trait_id_storage_key(id)
+
+	if raw < 0:
+		None
+	else:
+		definition_table_trait_row(table, raw).map(func(row): row.module_id)
 
 
 pure func trait_id_definition_id(id: TraitId) -> Int:
-	match from_opaque TraitId(id):
-		GraphTraitId(runtime):
-			runtime.definition_id
-		CompilerBuiltinTraitId(_, _):
-			COMPILER_PRELUDE_TRAIT_DEFINITION_ID
+	raw = trait_id_storage_key(id)
+
+	if raw < 0:
+		COMPILER_PRELUDE_TRAIT_DEFINITION_ID
+	else:
+		raw
 
 
-pure func trait_id_source_span(id: TraitId) -> SourceSpan:
-	match from_opaque TraitId(id):
-		GraphTraitId(runtime):
-			runtime.structural.span
-		CompilerBuiltinTraitId(_, span):
-			span
+pure func trait_id_source_span(table: DefinitionTable, id: TraitId) -> SourceSpan:
+	raw = trait_id_storage_key(id)
+
+	if raw < 0:
+		COMPILER_PRELUDE_SOURCE_SPAN
+	else:
+		definition_table_trait_row(table, raw)
+			.map(func(row): row.span)
+			.get_or(COMPILER_PRELUDE_SOURCE_SPAN)
 
 
 pure func prelude_trait_id(name: String) -> Option[TraitId]:
@@ -558,33 +552,15 @@ pure func prelude_trait_id(name: String) -> Option[TraitId]:
 
 
 pure func builtin_trait_id(name: String) -> Option[TraitId]:
-	match builtin_trait_supertraits(name):
-		None:
-			None
-		Some(_):
-			span: SourceSpan = {
-				path = "<compiler-prelude>",
-				module_name = "<compiler-prelude>",
-				start_offset = 0,
-				start_line = 1,
-				start_column = 1,
-				end_offset = 0,
-				end_line = 1,
-				end_column = 1
-			}
-			Some(into_opaque TraitId(CompilerBuiltinTraitId(name, span)))
+	builtin_trait_registry_id(name).map(func(registry_id):
+		into_opaque TraitId(
+			0 - builtin_trait_registry_id_value(registry_id) - BUILTIN_TRAIT_ENCODING_OFFSET
+		)
+	)
 
 
 pure func trait_id_is_compiler_builtin(id: TraitId) -> Bool:
-	match from_opaque TraitId(id):
-		CompilerBuiltinTraitId(name, _):
-			builtin_trait_supertraits(name).is_some()
-		GraphTraitId(_):
-			False
-
-
-pure func trait_method_id_name(id: TraitMethodId) -> String:
-	from_opaque TraitMethodId(id).structural.name
+	trait_id_storage_key(id) < 0
 
 
 pure func trait_method_id_owner(id: TraitMethodId) -> TraitId:
@@ -595,8 +571,8 @@ pure func trait_method_id_index(id: TraitMethodId) -> Int:
 	from_opaque TraitMethodId(id).index
 
 
-pure func trait_method_id_source_span(id: TraitMethodId) -> SourceSpan:
-	from_opaque TraitMethodId(id).structural.span
+private pure func trait_method_id(owner: TraitId, index: Int) -> TraitMethodId:
+	into_opaque TraitMethodId({owner = owner, index = index})
 
 
 pure func declaration_skeleton_id(skeleton: DeclarationSkeleton) -> DeclarationId:
@@ -609,8 +585,8 @@ pure func declaration_skeleton_id(skeleton: DeclarationSkeleton) -> DeclarationI
 			CallableDeclarationId(id)
 		TraitDeclarationSkeleton(id, _, _):
 			TraitDeclarationId(id)
-		TraitMethodDeclarationSkeleton(id, _, _):
-			TraitMethodDeclarationId(id)
+		TraitMethodDeclarationSkeleton(owner, index, _, _):
+			TraitMethodDeclarationId(owner, index)
 		GlobalDeclarationSkeleton(id, _, _):
 			GlobalDeclarationId(id)
 		ImplementationDeclarationSkeleton(id, _, _):
@@ -627,7 +603,7 @@ pure func declaration_skeleton_kind(skeleton: DeclarationSkeleton) -> Declaratio
 			CallableSkeletonKind
 		TraitDeclarationSkeleton(_, _, _):
 			TraitSkeletonKind
-		TraitMethodDeclarationSkeleton(_, _, _):
+		TraitMethodDeclarationSkeleton(_, _, _, _):
 			TraitMethodSkeletonKind
 		GlobalDeclarationSkeleton(_, _, _):
 			GlobalSkeletonKind
@@ -651,14 +627,14 @@ pure func declaration_skeleton_name(skeleton: DeclarationSkeleton) -> String:
 					decl.name.text
 				DefaultImplementationMethodCallableSource(_, method_name, _):
 					method_name
-		TraitDeclarationSkeleton(id, _, _):
-			trait_id_name(id)
-		TraitMethodDeclarationSkeleton(id, _, _):
-			trait_method_id_name(id)
+		TraitDeclarationSkeleton(_, _, source):
+			source.name.text
+		TraitMethodDeclarationSkeleton(_, _, _, source):
+			source.name.text
 		GlobalDeclarationSkeleton(_, _, source):
 			source.name.text
-		ImplementationDeclarationSkeleton(id, _, _):
-			impl_id_name(id)
+		ImplementationDeclarationSkeleton(_, _, source):
+			source.trait_name.text
 
 
 pure func declaration_skeleton_visibility(skeleton: DeclarationSkeleton) -> DeclarationVisibility:
@@ -671,7 +647,7 @@ pure func declaration_skeleton_visibility(skeleton: DeclarationSkeleton) -> Decl
 			visibility
 		TraitDeclarationSkeleton(_, visibility, _):
 			visibility
-		TraitMethodDeclarationSkeleton(_, visibility, _):
+		TraitMethodDeclarationSkeleton(_, _, visibility, _):
 			visibility
 		GlobalDeclarationSkeleton(_, visibility, _):
 			visibility
@@ -689,7 +665,7 @@ pure func declaration_skeleton_source(skeleton: DeclarationSkeleton) -> Declarat
 			CallableDeclarationSourceValue(source)
 		TraitDeclarationSkeleton(_, _, source):
 			TraitDeclarationSourceValue(source)
-		TraitMethodDeclarationSkeleton(_, _, source):
+		TraitMethodDeclarationSkeleton(_, _, _, source):
 			TraitMethodDeclarationSourceValue(source)
 		GlobalDeclarationSkeleton(_, _, source):
 			GlobalDeclarationSourceValue(source)
@@ -703,8 +679,8 @@ private pure func declaration_namespace_key(
 	match skeleton:
 		TypeDeclarationSkeleton(_, _, source):
 			Some(TypeNamespaceKey(type_declaration_source_name(source)))
-		TraitDeclarationSkeleton(id, _, _):
-			Some(TraitNamespaceKey(trait_id_name(id)))
+		TraitDeclarationSkeleton(_, _, source):
+			Some(TraitNamespaceKey(source.name.text))
 		ConstructorDeclarationSkeleton(_, _, parent_type_id, source):
 			Some(ConstructorNamespaceKey(parent_type_id, source.name.text))
 		_:
@@ -758,8 +734,8 @@ private pure func duplicate_namespace_error(
 				type_declaration_source_name(source),
 				type_declaration_source_span(source),
 			)
-		TraitDeclarationSkeleton(id, _, _):
-			DuplicateTraitDeclaration(module_path, trait_id_name(id), trait_id_source_span(id))
+		TraitDeclarationSkeleton(_, _, source):
+			DuplicateTraitDeclaration(module_path, source.name.text, source.span)
 		ConstructorDeclarationSkeleton(_, _, parent_type_id, source):
 			parent_name = type_declaration_name_for_id(existing_skeletons, parent_type_id)
 
@@ -954,54 +930,39 @@ private pure func trait_skeleton_build_items(
 				),
 			]
 		Some(definition_id):
-			structural = structural_declaration_id(
-				context.module_id,
-				trait_decl.name.text,
-				None,
-				trait_decl.span,
-			)
-			trait_id = into_opaque TraitId(
-				GraphTraitId(runtime_declaration_id(structural, definition_id))
-			)
-			var items: List[DeclarationSkeletonBuildItem] = [
-				DeclarationSkeletonCandidate(
-					TraitDeclarationSkeleton(
-						trait_id,
-						visibility,
-						trait_decl,
-					),
-				),
-			]
+			definition_table = definition_index_definition_table(context.definition_index)
 
-			var method_index: Int = 0
-
-			for method in trait_decl.methods:
-				-- The exact owner lives only in TraitMethodIdRep. Repeating
-				-- its source name in the structural component would permit the two
-				-- owner representations to disagree inside this module.
-				method_structural = structural_declaration_id(
-					context.module_id,
-					method.name.text,
-					None,
-					method.span,
-				)
-				method_id = into_opaque TraitMethodId({
-						owner = trait_id,
-						index = method_index,
-						structural = method_structural
-					})
-				items = items.append(
-					DeclarationSkeletonCandidate(
-						TraitMethodDeclarationSkeleton(
-							method_id,
-							visibility,
-							method,
+			match trait_id_from_definition_table(definition_table, definition_id):
+				None:
+					[DeclarationSkeletonBuildError(
+						TraitSkeletonMissingDefinition(
+							context.module_path,
+							trait_decl.name.text,
+							trait_decl.span,
 						),
-					),
-				)
-				method_index += 1
+					)]
+				Some(trait_id):
+					var items: List[DeclarationSkeletonBuildItem] = [
+						DeclarationSkeletonCandidate(
+							TraitDeclarationSkeleton(trait_id, visibility, trait_decl),
+						),
+					]
+					var method_index: Int = 0
 
-			items
+					for method in trait_decl.methods:
+						items = items.append(
+							DeclarationSkeletonCandidate(
+								TraitMethodDeclarationSkeleton(
+									trait_id,
+									method_index,
+									visibility,
+									method,
+								),
+							),
+						)
+						method_index += 1
+
+					items
 
 
 private pure func implementation_skeleton_build_items(
@@ -1033,62 +994,65 @@ private pure func implementation_skeleton_build_items(
 				),
 			]
 		Some(definition_id):
-			structural = structural_declaration_id(
-				context.module_id,
-				impl_decl.trait_name.text,
-				None,
-				impl_decl.span,
-			)
-			impl_id = into_opaque ImplId(runtime_declaration_id(structural, definition_id))
-			var items: List[DeclarationSkeletonBuildItem] = [
-				DeclarationSkeletonCandidate(
-					ImplementationDeclarationSkeleton(
-						impl_id,
-						visibility,
-						impl_decl,
-					),
-				),
-			]
-
 			definition_table = definition_index_definition_table(context.definition_index)
 
-			for default_definition_id in definition_index_callable_definition_ids_at_span(
-				context.definition_index,
-				context.module_table,
-				context.module_id,
-				impl_decl.span,
-			):
-				match definition_table_row(definition_table, default_definition_id):
-					Some(default_row):
-						method_name = default_row.name
-						default_id = into_opaque CallableId(default_definition_id)
-						items = items.append(
-							DeclarationSkeletonCandidate(
-								CallableDeclarationSkeleton(
-									default_id,
-									visibility,
-									DefaultImplementationMethodCallableSource(
-										impl_id,
-										method_name,
-										impl_decl,
+			match impl_id_from_definition_table(definition_table, definition_id):
+				None:
+					[DeclarationSkeletonBuildError(
+						ImplementationSkeletonMissingDefinition(
+							context.module_path,
+							impl_decl.trait_name.text,
+							impl_decl.span,
+						),
+					)]
+				Some(impl_id):
+					var items: List[DeclarationSkeletonBuildItem] = [
+						DeclarationSkeletonCandidate(
+							ImplementationDeclarationSkeleton(
+								impl_id,
+								visibility,
+								impl_decl,
+							),
+						),
+					]
+
+					for default_definition_id in definition_index_callable_definition_ids_at_span(
+						context.definition_index,
+						context.module_table,
+						context.module_id,
+						impl_decl.span,
+					):
+						match definition_table_row(definition_table, default_definition_id):
+							Some(default_row):
+								method_name = default_row.name
+								default_id = into_opaque CallableId(default_definition_id)
+								items = items.append(
+									DeclarationSkeletonCandidate(
+										CallableDeclarationSkeleton(
+											default_id,
+											visibility,
+											DefaultImplementationMethodCallableSource(
+												impl_id,
+												method_name,
+												impl_decl,
+											),
+										),
 									),
-								),
+								)
+							None:
+								void
+
+					for method in impl_decl.methods:
+						items = items.concat(
+							function_skeleton_build_items(
+								context,
+								visibility,
+								method,
+								ImplementationMethodCallableSource(impl_id, method),
 							),
 						)
-					None:
-						void
 
-			for method in impl_decl.methods:
-				items = items.concat(
-					function_skeleton_build_items(
-						context,
-						visibility,
-						method,
-						ImplementationMethodCallableSource(impl_id, method),
-					),
-				)
-
-			items
+					items
 
 
 private pure func type_skeleton_build_items(
@@ -1546,9 +1510,9 @@ pure func declaration_skeleton_graph_trait_method_skeletons(
 
 	for skeleton in declaration_skeleton_graph_rep(graph).skeletons:
 		match skeleton:
-			TraitMethodDeclarationSkeleton(id, _, source):
+			TraitMethodDeclarationSkeleton(owner, index, _, source):
 				method_skeletons = method_skeletons.append({
-					id = id,
+					id = trait_method_id(owner, index),
 					source = source,
 				})
 			_:

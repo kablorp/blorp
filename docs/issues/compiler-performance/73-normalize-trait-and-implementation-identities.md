@@ -1,6 +1,6 @@
 # Issue 73: Normalize Trait And Implementation Identities
 
-**Status:** Ready after Issues 68-72
+**Status:** Implemented
 
 **Roadmap:** [Normalized Compilation Database Roadmap](NORMALIZED_COMPILATION_DATABASE_ROADMAP.md)
 
@@ -117,6 +117,39 @@ Produce a relationship/index ledger:
 
 The completed ledger must cover all fields and indexes in the accepted
 authority, not only names containing `id`.
+
+### Completed reader ledger
+
+| Relation/index | Production query | Decision |
+| --- | --- | --- |
+| trait topology `headers` | ordered topology traversal and exact trait lookup | keep as canonical rows |
+| trait topology `header_index_by_definition_id` | exact graph-trait lookup | keep; graph `TraitId` is its definition ID |
+| trait row `methods` / `supertraits` | method resolution and inheritance traversal | keep; these are the ordered canonical relations |
+| implementation header `header_index_by_definition_id` | none | delete |
+| implementation header `index_by_trait_definition_id` | test-only candidate lookup | delete; accepted-authority selection owns the production reverse query |
+| accepted `traits` / `implementations` | all accepted semantic projections | keep as canonical rows |
+| accepted trait/implementation module lists | source-order module visibility projection | keep |
+| accepted nested module-plus-definition indexes | exact ID lookup | replace with one graph-wide `DefinitionId -> row` index per category |
+| accepted builtin trait string identity index | builtin link lookup | replace with the builtin registry's dense numeric identity |
+| `implementation_trait_method_ids` | exact implementation-method to trait-slot dispatch relation | keep; it is an ordered aligned column |
+| satisfied/conflicting implementation adjacency | visible selection and coherence queries | keep; both have production readers |
+| semantic-name and qualified module/method maps | source-name and UFCS queries | keep |
+| compiler implementation string identity map | builtin implementation lookup | replace with the builtin registry's dense numeric identity |
+
+Generated-C inspection showed that a source union around scalar graph/builtin
+variants is managed in the current compiler. The implementation therefore uses
+one opaque `Int` domain: non-negative values are category-checked graph
+`DefinitionId`s, and negative values encode `-(builtin_registry_id + 1)`.
+Construction and decoding remain behind named APIs. This preserves an explicit,
+dense builtin domain while keeping every `TraitId` unboxed; using the illustrative
+union from the target design would retain the allocation this issue removes.
+
+`ImplInstance.for_type` remains the canonical semantic receiver. Replacing it
+with `ResolvedTypeShape` here would change the accepted-authority boundary and
+duplicate later conversion work; Issue 73 normalizes implementation identity
+and indexes without changing that receiver contract. A full-tree reader audit
+also found no `TraitId`, `TraitMethodId`, or `ImplId` consumer beyond Stage 06,
+so CTFE/Core require verification but no compatibility projection.
 
 ## Target Identity Design
 
@@ -404,6 +437,77 @@ materially.
   material latency or RSS regression.
 - Focused, changed, Stage 06, compiler, leak, and proportionate sanitizer gates
   pass.
+
+## Implementation Result
+
+Graph `TraitId` and `ImplId` are now category-checked scalar identities backed
+by their existing `DefinitionTable` rows. Graph traits occupy the non-negative
+definition-ID domain; builtin traits use an opaque `BuiltinTraitId` and occupy
+the explicit negative encoding `-(builtin_registry_id + 1)`. The builtin
+registry owns the dense numeric ID to name relation, so trait identity no
+longer retains a source name or span.
+
+`TraitMethodId` is now the unboxed two-integer `{ owner, index }` value selected
+by the issue. Method spelling, source, category, and signature remain on the
+ordered trait-method row. One generated-C ownership edge required an additional
+boundary cleanup: data-carrying unions now store the scalar owner and slot
+separately rather than boxing `TraitMethodId`. This preserves the compact value
+representation in records, lists, and calls without leaking a compiler-created
+box from union payloads.
+
+The accepted table now uses one graph-wide definition-ID index for traits and
+one for implementations. Builtin trait and compiler implementation lookup use
+the numeric builtin identity. Ordered method, supertrait, satisfied-trait, and
+conflict relations remain canonical. Two implementation-header indexes were
+deleted after the reader audit found no production exact-ID consumer and only
+a test-only candidate consumer; production implementation selection continues
+to use the accepted authority's justified reverse indexes.
+
+Diagnostics materialize names and spans from definition/source rows at their
+boundary instead of retaining those values in IDs. A full-tree reader audit
+found no migrated ID crossing into CTFE or Core, so no compatibility projection
+or Core sanitizer expansion was added.
+
+Generated C confirms graph trait and implementation IDs are emitted as `long`,
+and `TraitMethodIdRep` is the inline two-`long` struct. The former managed
+`RuntimeDeclarationIdRep`, structural identity copies, and string/span builtin
+trait variants are absent.
+
+Clean `-O2` before/after measurements against the immediate parent used the
+same 256-trait, four-method, 100-iteration topology workload and produced the
+same checksum:
+
+| Measurement | Parent | Issue 73 | Delta |
+| --- | ---: | ---: | ---: |
+| measured topology window | 291,870 us | 276,331 us | -5.3% |
+| allocations | 3,740,700 | 3,408,800 | -8.9% |
+| retained objects | 9,214 | 9,214 | unchanged |
+
+A warmed Stage 01-06 self-check of the same parent source remained neutral:
+8.37 s / 138.90 billion retired instructions / 843.5 MB peak RSS for the
+parent versus 8.41 s / 139.32 billion instructions / 842.8 MB for Issue 73.
+That is +0.5% wall time, +0.3% instructions, and -0.1% peak RSS, all within the
+issue's no-material-regression boundary while the trait-heavy target shows a
+clear allocation and latency reduction.
+
+Validation completed before acceptance:
+
+- `scripts/compiler-check --changed`: 9 sources, 20 suites, and 2 checks passed;
+- `scripts/compiler-check --stage typecheck`: 43 sources, 37 suites, and 2
+  checks passed;
+- focused implementation-header and trait-topology leak checks passed with
+  zero leaked bytes;
+- the frozen-tree ordinary compiler, ASan/UBSan compiler, and leak gates passed
+  4,358, 3,659, and 886 tests respectively: 8,903 passed and zero failed;
+- final generated C retained the scalar/inline representations and contained
+  none of the deleted managed identity types;
+- independent production review reported zero findings; and
+- `git diff --check` passed.
+
+The final diff is separated by ownership: production `+698/-827` (net -129),
+tests `+132/-107` (net +25), and benchmark fixtures `+9/-6` (net +3). No
+compatibility identity path, test-only production lookup, or duplicate
+receiver-head column remains.
 
 ## Stop Conditions
 

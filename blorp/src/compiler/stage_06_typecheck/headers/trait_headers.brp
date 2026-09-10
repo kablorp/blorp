@@ -35,10 +35,8 @@ import:
 		trait_id_is_compiler_builtin,
 		trait_id_module_id,
 		trait_id_name,
-		trait_id_source_span,
 		trait_ids_equal,
 		trait_method_id_index,
-		trait_method_id_name,
 		trait_method_id_owner,
 		trait_method_ids_equal,
 	trait_reference_resolution: resolve_visible_trait_id
@@ -54,6 +52,7 @@ import:
 		trait_type_parameter_ids,
 		type_header_graph_bound_graph,
 		type_header_graph_declaration_graph,
+		type_header_graph_definition_table,
 		type_shape_resolution_error_message,
 		type_shape_resolution_error_span,
 
@@ -120,15 +119,15 @@ opaque type TraitTopologyGraph = TraitTopologyGraphRep
 
 union TraitTopologyGraphError:
 	BuiltinTraitTopologyCycle
-	TraitOwnerModuleMissing(TraitId, String)
-	TraitUnknownSupertrait(TraitId, ParsedIdentifier)
-	TraitDuplicateSupertrait(TraitId, TraitId, ParsedIdentifier)
-	TraitDuplicateTypeParameter(TraitId, ParsedIdentifier)
-	TraitTypeParameterUnknownBound(TraitId, ParsedIdentifier, ParsedIdentifier)
-	TraitMethodMissingParameterType(TraitMethodId, Int, SourceSpan)
+	TraitOwnerModuleMissing(String, String, SourceSpan)
+	TraitUnknownSupertrait(String, ParsedIdentifier)
+	TraitDuplicateSupertrait(String, String, ParsedIdentifier)
+	TraitDuplicateTypeParameter(String, ParsedIdentifier)
+	TraitTypeParameterUnknownBound(String, ParsedIdentifier, ParsedIdentifier)
+	TraitMethodMissingParameterType(String, Int, SourceSpan)
 	TraitMethodTypeResolutionError(TypeShapeResolutionError)
-	TraitDuplicateMethod(TraitId, ParsedIdentifier)
-	TraitInheritanceCycle(List[TraitId], ParsedIdentifier)
+	TraitDuplicateMethod(String, ParsedIdentifier)
+	TraitInheritanceCycle(List[String], ParsedIdentifier)
 
 
 private record TraitTopologyBuildState {
@@ -174,7 +173,7 @@ pure func trait_method_slot_id(slot: TraitMethodSlot) -> TraitMethodId:
 
 
 pure func trait_method_slot_name(slot: TraitMethodSlot) -> String:
-	trait_method_id_name(from_opaque TraitMethodSlot(slot).id)
+	from_opaque TraitMethodSlot(slot).source.name.text
 
 
 pure func trait_method_slot_category(slot: TraitMethodSlot) -> TraitMethodCategory:
@@ -245,10 +244,11 @@ private pure func trait_topology_table_find_index(
 
 private pure func resolve_trait_id_list(
 	state: TraitTopologyBuildState,
+	type_header_graph: TypeHeaderGraph,
 	declaration_graph: DeclarationSkeletonGraph,
 	bound_graph: BoundModuleGraph,
 	module: BoundModule,
-	owner: TraitId,
+	owner_name: String,
 	names: List[ParsedIdentifier],
 ) -> (TraitTopologyBuildState, List[ResolvedSupertrait]):
 	var next = state
@@ -257,11 +257,18 @@ private pure func resolve_trait_id_list(
 	for name in names:
 		match resolve_visible_trait_id(declaration_graph, bound_graph, module, name.text):
 			None:
-				next = { next | errors = next.errors.append(TraitUnknownSupertrait(owner, name)) }
+				next = { next | errors = next.errors.append(TraitUnknownSupertrait(owner_name, name)) }
 			Some(id):
 				if edges.any(func(edge): trait_ids_equal(edge.id, id)):
 					next = { next |
-						errors = next.errors.append(TraitDuplicateSupertrait(owner, id, name))
+						errors = next.errors.append(TraitDuplicateSupertrait(
+							owner_name,
+							trait_id_name(
+								type_header_graph_definition_table(type_header_graph),
+								id,
+							),
+							name,
+						))
 					}
 				else:
 					edges = edges.append({
@@ -277,6 +284,7 @@ private pure func resolve_trait_type_parameters(
 	bound_graph: BoundModuleGraph,
 	module: BoundModule,
 	owner: TraitId,
+	owner_name: String,
 	parsed_parameters: List[ParsedTypeParamDecl],
 ) -> Result[List[ResolvedTraitTypeParameter], List[TraitTopologyGraphError]]:
 	var parameters: List[ResolvedTraitTypeParameter] = []
@@ -294,7 +302,7 @@ private pure func resolve_trait_type_parameters(
 		if parameters.any(
 			func(parameter): trait_type_parameter_name(parameter) == parsed_parameter.name.text,
 		):
-			errors = errors.append(TraitDuplicateTypeParameter(owner, parsed_parameter.name))
+			errors = errors.append(TraitDuplicateTypeParameter(owner_name, parsed_parameter.name))
 
 		for parsed_bound in parsed_parameter.bounds:
 			match resolve_visible_trait_id(
@@ -306,7 +314,7 @@ private pure func resolve_trait_type_parameters(
 				None:
 					errors = errors.append(
 						TraitTypeParameterUnknownBound(
-							owner,
+							owner_name,
 							parsed_parameter.name,
 							parsed_bound,
 						),
@@ -362,6 +370,7 @@ private pure func resolved_trait_type_parameter_id(
 private pure func resolve_trait_method_signature(
 	type_header_graph: TypeHeaderGraph,
 	owner_scope: PreparedModuleScope,
+	owner_name: String,
 	parameters: List[ResolvedTraitTypeParameter],
 	method: TraitMethodDeclarationSkeletonInfo,
 ) -> Result[CallableSignature, List[TraitTopologyGraphError]]:
@@ -375,7 +384,7 @@ private pure func resolve_trait_method_signature(
 			None:
 				errors = errors.append(
 					TraitMethodMissingParameterType(
-						method.id,
+						method.source.name.text,
 						parameter_index,
 						param.span,
 					),
@@ -385,6 +394,8 @@ private pure func resolve_trait_method_signature(
 					type_header_graph,
 					owner_scope,
 					method.id,
+					owner_name,
+					method.source.name.text,
 					parameter_ids,
 					type_expr,
 				):
@@ -413,6 +424,8 @@ private pure func resolve_trait_method_signature(
 				type_header_graph,
 				owner_scope,
 				method.id,
+				owner_name,
+				method.source.name.text,
 				parameter_ids,
 				type_expr,
 			):
@@ -436,6 +449,7 @@ private pure func resolve_trait_method_slots(
 	type_header_graph: TypeHeaderGraph,
 	owner_scope: PreparedModuleScope,
 	owner: TraitId,
+	owner_name: String,
 	parameters: List[ResolvedTraitTypeParameter],
 	method_skeletons_by_owner_id: TraitMethodSkeletonBuckets,
 ) -> (TraitTopologyBuildState, List[TraitMethodSlot]):
@@ -448,7 +462,7 @@ private pure func resolve_trait_method_slots(
 
 		if names.contains(name):
 			next = { next |
-				errors = next.errors.append(TraitDuplicateMethod(owner, method.source.name))
+				errors = next.errors.append(TraitDuplicateMethod(owner_name, method.source.name))
 			}
 		else:
 			names = names.append(name)
@@ -458,7 +472,13 @@ private pure func resolve_trait_method_slots(
 		else:
 			RequiredTraitMethod
 
-		match resolve_trait_method_signature(type_header_graph, owner_scope, parameters, method):
+		match resolve_trait_method_signature(
+			type_header_graph,
+			owner_scope,
+			owner_name,
+			parameters,
+			method,
+		):
 			Ok(signature):
 				slot: TraitMethodSlot = into_opaque TraitMethodSlot({
 						id = method.id,
@@ -481,7 +501,9 @@ private pure func append_trait_topology_header(
 	method_skeletons_by_owner_id: TraitMethodSkeletonBuckets,
 	skeleton: TraitDeclarationSkeletonInfo,
 ) -> TraitTopologyBuildState:
-	owner_id = trait_id_module_id(skeleton.id)
+	definition_table = type_header_graph_definition_table(type_header_graph)
+	owner_name = skeleton.source.name.text
+	owner_id = trait_id_module_id(definition_table, skeleton.id)
 
 	match owner_id.and_then(
 		func(
@@ -503,15 +525,18 @@ private pure func append_trait_topology_header(
 				)
 				.get_or("<compiler builtin>")
 			{ state |
-				errors = state.errors.append(TraitOwnerModuleMissing(skeleton.id, module_path))
+				errors = state.errors.append(
+					TraitOwnerModuleMissing(owner_name, module_path, skeleton.source.span),
+				)
 			}
 		Some(module):
 			(with_supertraits, supertraits) = resolve_trait_id_list(
 				state,
+				type_header_graph,
 				declaration_graph,
 				bound_graph,
 				module,
-				skeleton.id,
+				owner_name,
 				skeleton.source.supertraits,
 			)
 			parameter_resolution = resolve_trait_type_parameters(
@@ -519,6 +544,7 @@ private pure func append_trait_topology_header(
 				bound_graph,
 				module,
 				skeleton.id,
+				owner_name,
 				skeleton.source.type_params,
 			)
 			var with_parameters = with_supertraits
@@ -537,6 +563,7 @@ private pure func append_trait_topology_header(
 				type_header_graph,
 				bound_module_scope(module),
 				skeleton.id,
+				owner_name,
 				parameters,
 				method_skeletons_by_owner_id,
 			)
@@ -703,7 +730,11 @@ pure func trait_topology_graph_build(
 
 		match trait_topology_cycle(table):
 			Some((cycle, closing_reference)):
-				Err([TraitInheritanceCycle(cycle, closing_reference)])
+				definition_table = type_header_graph_definition_table(type_header_graph)
+				Err([TraitInheritanceCycle(
+					cycle.map(func(id): trait_id_name(definition_table, id)),
+					closing_reference,
+				)])
 			None:
 				representation: TraitTopologyGraphRep = {
 					type_header_graph = type_header_graph,
@@ -758,11 +789,15 @@ pure func trait_topology_graph_find_method(
 		None
 
 
-private pure func builtin_supertrait_ids(id: TraitId) -> Option[List[TraitId]]:
+private pure func builtin_supertrait_ids(
+	graph: TraitTopologyGraph,
+	id: TraitId,
+) -> Option[List[TraitId]]:
 	if not trait_id_is_compiler_builtin(id):
 		None
 	else:
-		names ?= builtin_trait_supertraits(trait_id_name(id))
+		definition_table = type_header_graph_definition_table(trait_topology_graph_type_headers(graph))
+		names ?= builtin_trait_supertraits(trait_id_name(definition_table, id))
 		var ids: List[TraitId] = []
 		var complete: Bool = True
 
@@ -787,7 +822,7 @@ private pure func trait_topology_graph_direct_supertraits(
 		Some(header):
 			Some(trait_topology_header_supertraits(header))
 		None:
-			builtin_supertrait_ids(id)
+			builtin_supertrait_ids(graph, id)
 
 
 pure func trait_topology_graph_transitive_supertraits(
@@ -828,42 +863,32 @@ pure func trait_topology_graph_error_message(error: TraitTopologyGraphError) -> 
 	match error:
 		BuiltinTraitTopologyCycle:
 			"compiler builtin trait inheritance contains a cycle"
-		TraitOwnerModuleMissing(id, module_path):
-			"trait '" + trait_id_name(id) + "' has no bound owner module '" + module_path + "'"
-		TraitUnknownSupertrait(id, name):
-			"trait '" + trait_id_name(id) + "' has unknown supertrait '" + name.text + "'"
-		TraitDuplicateSupertrait(id, supertrait_id, _):
-			"trait '" + trait_id_name(
-				id,
-			) + "' names supertrait '" + trait_id_name(supertrait_id) + "' more than once"
-		TraitDuplicateTypeParameter(id, name):
-			"trait '" + trait_id_name(
-				id,
-			) + "' declares type parameter '" + name.text + "' more than once"
-		TraitTypeParameterUnknownBound(id, parameter_name, bound_name):
-			"trait '" + trait_id_name(
-				id,
-			) + "' type parameter '" + parameter_name.text + "' has unknown bound '" + bound_name.text + "'"
-		TraitMethodMissingParameterType(method_id, parameter_index, _):
-			"trait method '" + trait_method_id_name(
-				method_id,
-			) + "' parameter " + (parameter_index + 1).to_string() + " must have an explicit type"
+		TraitOwnerModuleMissing(name, module_path, _):
+			"trait '" + name + "' has no bound owner module '" + module_path + "'"
+		TraitUnknownSupertrait(owner_name, name):
+			"trait '" + owner_name + "' has unknown supertrait '" + name.text + "'"
+		TraitDuplicateSupertrait(owner_name, supertrait_name, _):
+			"trait '" + owner_name + "' names supertrait '" + supertrait_name + "' more than once"
+		TraitDuplicateTypeParameter(owner_name, name):
+			"trait '" + owner_name + "' declares type parameter '" + name.text + "' more than once"
+		TraitTypeParameterUnknownBound(owner_name, parameter_name, bound_name):
+			"trait '" + owner_name + "' type parameter '" + parameter_name.text + "' has unknown bound '" + bound_name.text + "'"
+		TraitMethodMissingParameterType(method_name, parameter_index, _):
+			"trait method '" + method_name + "' parameter " + (parameter_index + 1).to_string() + " must have an explicit type"
 		TraitMethodTypeResolutionError(resolution_error):
 			type_shape_resolution_error_message(resolution_error)
-		TraitDuplicateMethod(id, name):
-			"trait '" + trait_id_name(id) + "' declares method '" + name.text + "' more than once"
+		TraitDuplicateMethod(owner_name, name):
+			"trait '" + owner_name + "' declares method '" + name.text + "' more than once"
 		TraitInheritanceCycle(cycle, _):
-			"trait inheritance cycle: " + cycle
-				.map(trait_id_name)
-				.join(" -> ")
+			"trait inheritance cycle: " + cycle.join(" -> ")
 
 
 pure func trait_topology_graph_error_span(error: TraitTopologyGraphError) -> Option[SourceSpan]:
 	match error:
 		BuiltinTraitTopologyCycle:
 			None
-		TraitOwnerModuleMissing(id, _):
-			Some(trait_id_source_span(id))
+		TraitOwnerModuleMissing(_, _, span):
+			Some(span)
 		TraitUnknownSupertrait(_, name):
 			Some(name.span)
 		TraitDuplicateSupertrait(_, _, name):

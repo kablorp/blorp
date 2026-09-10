@@ -1,6 +1,6 @@
 # Normalized Compilation Database Roadmap
 
-**Status:** Active; Horizon 1 and Issues 61B, 68-72 implemented; Issue 73 defined
+**Status:** Active; Horizon 1 and Issues 61B, 68-73 implemented
 
 **Scope:** One compiler invocation and the immutable products retained by an
 LSP analysis snapshot. This is not a cross-run cache, an incremental build
@@ -1049,11 +1049,11 @@ Horizon 2 has one table foundation followed by six bounded identity cuts:
    Claim the already reserved global definition row, replace structural
    `GlobalId`, remove duplicate raw IDs from accepted graph bindings, and make
    exact accepted-global lookup integer-addressed.
-6. **[Issue 72: Make field IDs definition-backed](72-make-field-ids-definition-backed.md).**
+6. **[Issue 72: Make field IDs definition-backed](72-make-field-ids-definition-backed.md) (implemented).**
    Replace raw optional field definition integers with `FieldId`, publish the
    exact field-to-parent-type relation once, and thread typed field identity
    through inference and semantic occurrences.
-7. **[Issue 73: Normalize trait and implementation identities](73-normalize-trait-and-implementation-identities.md).**
+7. **[Issue 73: Normalize trait and implementation identities](73-normalize-trait-and-implementation-identities.md) (implemented).**
    Scalarize graph trait and implementation IDs, give compiler builtins an
    explicit identity domain, compact trait method identity, and consolidate
    relationship/module-view indexes around named production queries.
