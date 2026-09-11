@@ -77,6 +77,7 @@ import:
 		resolved_module_identity_from_resolver,
 	../../../src/compiler/stage_04_modules/module_surface: module_surface_for_program
 	../../../src/compiler/stage_04_modules/module_table:
+		module_ids_equal,
 		module_table_canonical_path,
 		module_table_find_id_by_canonical_path,
 	../../../src/compiler/stage_06_typecheck/decl:
@@ -102,6 +103,7 @@ import:
 		TypedUnionInfo,
 		accepted_typecheck_graph_implementation_headers,
 		typecheck_bind_program_module_view,
+		typecheck_bind_standalone_program_module_view,
 		typecheck_check_function_body,
 		typecheck_check_standalone_program_bodies,
 		typecheck_materialize_standalone_program_bodies,
@@ -132,7 +134,9 @@ import:
 		indexed_graph_target_scope,
 		prepared_module_program,
 		prepared_module_scope_canonical_path,
+		prepared_module_scope_id,
 		prepared_module_scope_module,
+		prepared_module_scope_module_table,
 	../../../src/compiler/stage_06_typecheck/headers/callable_headers:
 		callable_header_graph_trait_topology,
 	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
@@ -168,11 +172,13 @@ import:
 		typed_expr_value_type,
 	../../../src/compiler/stage_06_typecheck/modules/bound_module_graph:
 		BoundModuleViewBinding(BoundModuleViewReady, BoundModuleViewRejected),
+		bound_module_binding_diagnostics,
 		bound_module_build,
 		bound_module_graph_build,
 		bound_module_graph_indexed_graph,
 		bound_module_graph_target,
 		bound_module_identity,
+		bound_module_source_direct_import_count,
 	../../../src/compiler/stage_06_typecheck/modules/module_binding:
 		ImportableModule,
 		ImportableModuleIndex,
@@ -187,6 +193,7 @@ import:
 		importable_module_graph,
 		importable_module_graph_all_index,
 		importable_module_impl_decls,
+		importable_module_index_find,
 		importable_module_index_prelude,
 		importable_module_local_type_names,
 		importable_module_origin,
@@ -195,7 +202,7 @@ import:
 		importable_module_signature_decls,
 	../../../src/compiler/stage_06_typecheck/modules/module_prelude: program_with_prelude_imports
 	../../../src/compiler/stage_06_typecheck/modules/module_selection:
-		importable_module_selection_for_program,
+		importable_module_selection_for_accepted_imports,
 	../../../src/compiler/stage_06_typecheck/modules/module_view:
 		TopLevelNameKind(
 			TopLevelConstructor,
@@ -210,7 +217,9 @@ import:
 		module_view_accepted_record_authority,
 		module_view_accepted_trait_implementation_authority,
 		module_view_accepted_union_authority,
+		module_view_find_graph_module_alias,
 		module_view_find_local_name,
+		module_view_find_standalone_module_alias,
 		module_view_has_selective_binding,
 	../../../src/compiler/stage_06_typecheck/modules/module_visibility:
 		ImportIdentityResolution(
@@ -233,9 +242,11 @@ import:
 		typecheck_state_find_type_home,
 		typecheck_state_for_origin,
 		typecheck_state_func_callable_bindings,
-		typecheck_state_has_imported_module,
 		typecheck_state_has_known_resource_type_name,
 		typecheck_state_has_known_type_name,
+		typecheck_state_register_graph_module_alias,
+		typecheck_state_register_standalone_module_alias,
+		typecheck_state_remember_top_level_name,
 	../../../src/compiler/stage_06_typecheck/type_system/accepted_alias_authority:
 		accepted_alias_find_opaque,
 		accepted_alias_find_transparent,
@@ -246,6 +257,7 @@ import:
 	../../../src/compiler/stage_06_typecheck/type_system/accepted_record_authority:
 		AcceptedFieldRow,
 		accepted_record_find,
+		accepted_record_find_names_with_fields,
 	../../../src/compiler/stage_06_typecheck/type_system/accepted_trait_implementation_authority:
 		AcceptedImplementationTableRecord,
 		AcceptedTraitTableRecord,
@@ -1302,9 +1314,27 @@ private pure func recovery_importable_modules(
 private pure func importable_module_index(
 	modules: List[ImportableModule],
 ) -> Option[ImportableModuleIndex]:
-	target_program = program_for_module("index_target", [])
+	importable_module_index_for_target_origin(modules, UserModule)
+
+
+private pure func importable_module_index_for_target_origin(
+	modules: List[ImportableModule],
+	target_origin: ModuleOrigin,
+) -> Option[ImportableModuleIndex]:
+	importable_module_index_for_target_program(
+		modules,
+		target_origin,
+		program_for_module("index_target", []),
+	)
+
+
+private pure func importable_module_index_for_target_program(
+	modules: List[ImportableModule],
+	target_origin: ModuleOrigin,
+	target_program: ParsedProgram,
+) -> Option[ImportableModuleIndex]:
 	target = module_load_candidate(
-		resolved_module_identity_from_resolver("index_target", UserModule),
+		resolved_module_identity_from_resolver("index_target", target_origin),
 		finalized_typecheck_program(target_program),
 	)
 	indexed ?= indexed_graph_build(
@@ -1475,7 +1505,6 @@ func test_register_imports_records_qualified_module_alias() -> Bool:
 	(
 		typecheck_state_find_module_alias(state, "File") == Some("file")
 		and typecheck_state_find_module_alias(state, "json") == Some("json")
-		and typecheck_state_has_imported_module(state, "file")
 	)
 
 
@@ -1566,32 +1595,449 @@ func test_bind_program_module_view_returns_completed_namespace() -> Bool:
 	])
 	modules = importable_modules("dep", [record_decl("Token")])
 
-	match importable_module_index(modules):
+	match importable_module_index_for_target_program(modules, UserModule, source_program):
 		None:
 			False
 		Some(index):
-			match typecheck_bind_program_module_view(
-				typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
-				source_program,
-				index,
-				"decl",
-			):
-				BoundModuleViewRejected(_, _):
+			match importable_module_index_find(index, "index_target"):
+				None:
 					False
-				BoundModuleViewReady(view, bound_program, _, diagnostics):
-					(
-						module_view_has_selective_binding(view, "Token", "dep", "Token")
-						and module_view_find_local_name(
-							view,
-							"local_value",
-						) == Some(TopLevelFunction)
-						and bound_program.source.module_name == source_program.source.module_name
-						and diagnostics.length() == 0
+				Some(owner):
+					owner_scope = importable_module_prepared_scope(owner)
+
+					match typecheck_bind_program_module_view(
+						typecheck_state_enter_prepared_module_scope(
+							typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+							owner_scope,
+						),
+						source_program,
+						index,
+						owner_scope,
+					):
+						BoundModuleViewRejected(_, _):
+							False
+						BoundModuleViewReady(view, bound_program, _, diagnostics):
+							(
+								module_view_has_selective_binding(view, "Token", "dep", "Token")
+								and module_view_find_local_name(
+									view,
+									"local_value",
+								) == Some(TopLevelFunction)
+								and bound_program.source.module_name == source_program.source.module_name
+								and diagnostics.length() == 0
+							)
+
+
+func test_bound_module_alias_retains_graph_module_id() -> Bool:
+	source_program = program([import_block_decl([import_decl("dep", Some("Dep"), None)])])
+
+	match importable_module_index_for_target_program(
+		importable_modules("dep", []),
+		UserModule,
+		source_program,
+	):
+		None:
+			False
+		Some(index):
+			match (
+				importable_module_index_find(index, "index_target"),
+				importable_module_index_find(index, "dep"),
+			):
+				(Some(owner), Some(dependency)):
+					owner_scope = importable_module_prepared_scope(owner)
+
+					match typecheck_bind_program_module_view(
+						typecheck_state_enter_prepared_module_scope(
+							typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+							owner_scope,
+						),
+						source_program,
+						index,
+						owner_scope,
+					):
+						BoundModuleViewRejected(_, _):
+							False
+						BoundModuleViewReady(view, _, _, diagnostics):
+							match module_view_find_graph_module_alias(view, "Dep"):
+								Some(actual_id):
+									(
+										diagnostics.is_empty()
+										and module_ids_equal(
+											actual_id,
+											prepared_module_scope_id(
+												importable_module_prepared_scope(dependency),
+											),
+										)
+									)
+								_:
+									False
+				_:
+					False
+
+
+func test_bind_program_module_view_rejects_unreserved_state() -> Bool:
+	match importable_module_index(importable_modules("dep", [])):
+		None:
+			False
+		Some(index):
+			match importable_module_index_find(index, "index_target"):
+				None:
+					False
+				Some(owner):
+					match typecheck_bind_program_module_view(
+						typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+						program([]),
+						index,
+						importable_module_prepared_scope(owner),
+					):
+						BoundModuleViewRejected(message, diagnostics):
+							message == (
+								"internal typecheck error: graph module binding requires the exact prepared "
+								+ "module scope"
+							) and diagnostics.is_empty()
+						BoundModuleViewReady(_, _, _, _):
+							False
+
+
+func test_bind_program_module_view_rejects_equivalent_foreign_scope() -> Bool:
+	match (
+		importable_module_index(importable_modules("dep", [])),
+		importable_module_index(importable_modules("dep", [])),
+	):
+		(Some(state_index), Some(binding_index)):
+			match (
+				importable_module_index_find(state_index, "index_target"),
+				importable_module_index_find(binding_index, "index_target"),
+			):
+				(Some(state_owner), Some(binding_owner)):
+					state_scope = importable_module_prepared_scope(state_owner)
+					binding_scope = importable_module_prepared_scope(binding_owner)
+					state = typecheck_state_enter_prepared_module_scope(
+						typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+						state_scope,
 					)
+
+					match typecheck_bind_program_module_view(
+						state,
+						program([]),
+						binding_index,
+						binding_scope,
+					):
+						BoundModuleViewRejected(message, diagnostics):
+							message == (
+								"internal typecheck error: graph module binding requires the exact prepared "
+								+ "module scope"
+							) and diagnostics.is_empty()
+						BoundModuleViewReady(_, _, _, _):
+							False
+				_:
+					False
+		_:
+			False
+
+
+func test_bind_program_module_view_rejects_preloaded_standalone_alias() -> Bool:
+	match importable_module_index(importable_modules("dep", [])):
+		None:
+			False
+		Some(index):
+			match importable_module_index_find(index, "index_target"):
+				None:
+					False
+				Some(owner):
+					owner_scope = importable_module_prepared_scope(owner)
+					standalone_state = typecheck_state_register_standalone_module_alias(
+						typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+						"Dep",
+						"dep",
+					)
+					graph_state = typecheck_state_enter_prepared_module_scope(
+						typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+						owner_scope,
+					)
+					state = { graph_state | module_view = standalone_state.module_view }
+
+					match typecheck_bind_program_module_view(
+						state,
+						program([]),
+						index,
+						owner_scope,
+					):
+						BoundModuleViewRejected(message, diagnostics):
+							message == (
+								"internal typecheck error: graph module binding cannot accept standalone import "
+								+ "bindings"
+							) and diagnostics.is_empty()
+						BoundModuleViewReady(_, _, _, _):
+							False
+
+
+func test_graph_module_alias_rejects_same_index_from_foreign_table() -> Bool:
+	match (
+		importable_module_index(importable_modules("local/dep", [])),
+		importable_module_index(importable_modules("foreign/dep", [])),
+	):
+		(Some(local_index), Some(foreign_index)):
+			match (
+				importable_module_index_find(local_index, "index_target"),
+				importable_module_index_find(local_index, "local/dep"),
+				importable_module_index_find(foreign_index, "foreign/dep"),
+			):
+				(Some(local_owner), Some(local_dependency), Some(foreign_dependency)):
+					local_scope = importable_module_prepared_scope(local_owner)
+					foreign_scope = importable_module_prepared_scope(foreign_dependency)
+					state = typecheck_state_enter_prepared_module_scope(
+						typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+						local_scope,
+					)
+					result = typecheck_state_register_graph_module_alias(
+						state,
+						"Foreign",
+						"foreign/dep",
+						prepared_module_scope_module_table(foreign_scope),
+						prepared_module_scope_id(foreign_scope),
+					)
+
+					(
+						module_ids_equal(
+							prepared_module_scope_id(
+								importable_module_prepared_scope(local_dependency),
+							),
+							prepared_module_scope_id(foreign_scope),
+						)
+						and result.errors == [
+							(
+								"internal typecheck error: module alias target does not belong to the active "
+								+ "module graph"
+							),
+						]
+						and module_view_find_graph_module_alias(
+							result.module_view,
+							"Foreign",
+						).is_none()
+					)
+				_:
+					False
+		_:
+			False
+
+
+func test_graph_module_alias_rejects_wrong_expected_path() -> Bool:
+	match importable_module_index(importable_modules("local/dep", [])):
+		None:
+			False
+		Some(local_index):
+			match (
+				importable_module_index_find(local_index, "index_target"),
+				importable_module_index_find(local_index, "local/dep"),
+			):
+				(Some(local_owner), Some(local_dependency)):
+					local_scope = importable_module_prepared_scope(local_owner)
+					dependency_scope = importable_module_prepared_scope(local_dependency)
+					state = typecheck_state_enter_prepared_module_scope(
+						typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+						local_scope,
+					)
+					result = typecheck_state_register_graph_module_alias(
+						state,
+						"Dep",
+						"wrong/path",
+						prepared_module_scope_module_table(dependency_scope),
+						prepared_module_scope_id(dependency_scope),
+					)
+
+					result.errors == [
+						(
+							"internal typecheck error: module alias target does not belong to the active "
+							+ "module graph"
+						),
+					] and module_view_find_graph_module_alias(result.module_view, "Dep").is_none()
+				_:
+					False
+
+
+func test_graph_module_alias_rejects_out_of_range_id() -> Bool:
+	foreign_modules = importable_modules("foreign/a", [])
+		.concat(importable_modules("foreign/b", []))
+		.concat(importable_modules("foreign/c", []))
+
+	match (
+		importable_module_index(importable_modules("local/dep", [])),
+		importable_module_index(foreign_modules),
+	):
+		(Some(local_index), Some(foreign_index)):
+			match (
+				importable_module_index_find(local_index, "index_target"),
+				importable_module_index_find(foreign_index, "foreign/c"),
+			):
+				(Some(local_owner), Some(foreign_dependency)):
+					local_scope = importable_module_prepared_scope(local_owner)
+					state = typecheck_state_enter_prepared_module_scope(
+						typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+						local_scope,
+					)
+					result = typecheck_state_register_graph_module_alias(
+						state,
+						"Foreign",
+						"foreign/c",
+						prepared_module_scope_module_table(local_scope),
+						prepared_module_scope_id(
+							importable_module_prepared_scope(foreign_dependency),
+						),
+					)
+
+					result.errors == [
+						(
+							"internal typecheck error: module alias target does not belong to the active "
+							+ "module graph"
+						),
+					] and module_view_find_graph_module_alias(
+						result.module_view,
+						"Foreign",
+					).is_none()
+				_:
+					False
+		_:
+			False
+
+
+func test_graph_module_alias_rejects_uncataloged_local_name() -> Bool:
+	match importable_module_index(importable_modules("dep", [])):
+		None:
+			False
+		Some(index):
+			match (
+				importable_module_index_find(index, "index_target"),
+				importable_module_index_find(index, "dep"),
+			):
+				(Some(owner), Some(dependency)):
+					owner_scope = importable_module_prepared_scope(owner)
+					dependency_scope = importable_module_prepared_scope(dependency)
+					state = typecheck_state_enter_prepared_module_scope(
+						typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+						owner_scope,
+					)
+					result = typecheck_state_register_graph_module_alias(
+						state,
+						"Unexpected",
+						"dep",
+						prepared_module_scope_module_table(dependency_scope),
+						prepared_module_scope_id(dependency_scope),
+					)
+
+					result.errors == [
+						(
+							"internal typecheck error: module alias target does not belong to the active "
+							+ "module graph"
+						),
+					] and module_view_find_graph_module_alias(
+						result.module_view,
+						"Unexpected",
+					).is_none()
+		_:
+			False
+
+
+func test_graph_local_name_rejects_uncataloged_source_name() -> Bool:
+	match importable_module_index(importable_modules("dep", [])):
+		None:
+			False
+		Some(index):
+			match importable_module_index_find(index, "index_target"):
+				Some(owner):
+					state = typecheck_state_enter_prepared_module_scope(
+						typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+						importable_module_prepared_scope(owner),
+					)
+					result = typecheck_state_remember_top_level_name(
+						state,
+						"Unexpected",
+						TopLevelFunction,
+					)
+
+					result.errors == [
+						(
+							"internal typecheck error: top-level name 'Unexpected' is not cataloged by the "
+							+ "active module graph"
+						),
+					] and module_view_find_local_name(result.module_view, "Unexpected").is_none()
+				None:
+					False
+
+
+func test_standalone_module_view_retains_qualified_import_path() -> Bool:
+	source_program = program([import_block_decl([import_decl("dep", Some("Dep"), None)])])
+
+	match importable_module_index(importable_modules("dep", [])):
+		None:
+			False
+		Some(index):
+			match importable_module_index_find(index, "index_target"):
+				None:
+					False
+				Some(owner):
+					owner_scope = importable_module_prepared_scope(owner)
+					state = typecheck_state_enter_prepared_module_scope(
+						typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+						owner_scope,
+					)
+
+					match typecheck_bind_standalone_program_module_view(state, source_program):
+						BoundModuleViewReady(view, _, _, diagnostics):
+							(
+								diagnostics.is_empty()
+								and module_view_find_standalone_module_alias(
+									view,
+									"Dep",
+								) == Some("dep")
+								and module_view_find_graph_module_alias(view, "Dep").is_none()
+							)
+						BoundModuleViewRejected(_, _):
+							False
+
+
+func test_standalone_module_view_rejects_preloaded_graph_alias() -> Bool:
+	source_program = program([import_block_decl([import_decl("dep", Some("Dep"), None)])])
+
+	match importable_module_index_for_target_program(
+		importable_modules("dep", []),
+		UserModule,
+		source_program,
+	):
+		None:
+			False
+		Some(index):
+			match (
+				importable_module_index_find(index, "index_target"),
+				importable_module_index_find(index, "dep"),
+			):
+				(Some(owner), Some(dependency)):
+					owner_scope = importable_module_prepared_scope(owner)
+					dependency_scope = importable_module_prepared_scope(dependency)
+					state = typecheck_state_register_graph_module_alias(
+						typecheck_state_enter_prepared_module_scope(
+							typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+							owner_scope,
+						),
+						"Dep",
+						"dep",
+						prepared_module_scope_module_table(dependency_scope),
+						prepared_module_scope_id(dependency_scope),
+					)
+
+					match typecheck_bind_standalone_program_module_view(state, program([])):
+						BoundModuleViewRejected(message, diagnostics):
+							message == (
+								"internal typecheck error: standalone module binding cannot accept graph import "
+								+ "bindings"
+							) and diagnostics.is_empty()
+						BoundModuleViewReady(_, _, _, _):
+							False
+				_:
+					False
 
 
 func test_reachable_import_modules_exclude_current_and_unrelated_modules() -> Bool:
-	source_program = program([import_block_decl([import_decl("dep", None, None)])])
 	modules = importable_modules("decl", [function_decl("current_only")])
 		.concat(
 			importable_modules(
@@ -1605,7 +2051,11 @@ func test_reachable_import_modules_exclude_current_and_unrelated_modules() -> Bo
 		.map(
 			func(
 				index,
-			): importable_module_selection_for_program(source_program, index, Some("decl"))[0],
+			): importable_module_selection_for_accepted_imports(
+				index,
+				["dep"],
+				Some("decl"),
+			).visible_import_modules,
 		)
 		.get_or([])
 
@@ -1621,7 +2071,6 @@ func test_reachable_import_modules_exclude_current_and_unrelated_modules() -> Bo
 
 
 func test_reachable_import_modules_follow_private_source_name_alias() -> Bool:
-	source_program = program([import_block_decl([import_decl("dep", None, None)])])
 	modules = importable_modules(
 		"dep",
 		[
@@ -1635,7 +2084,11 @@ func test_reachable_import_modules_follow_private_source_name_alias() -> Bool:
 		.map(
 			func(
 				index,
-			): importable_module_selection_for_program(source_program, index, Some("decl"))[0],
+			): importable_module_selection_for_accepted_imports(
+				index,
+				["dep"],
+				Some("decl"),
+			).visible_import_modules,
 		)
 		.get_or([])
 
@@ -1774,7 +2227,6 @@ func test_import_dependency_closure_preserves_boundary_semantics() -> Bool:
 
 
 func test_combined_import_selection_preserves_visible_and_direct_order() -> Bool:
-	source_program = program([import_block_decl([import_decl("dep", None, None)])])
 	modules = importable_modules(
 		"dep",
 		[import_block_decl([import_decl("transitive", None, None)])],
@@ -1786,11 +2238,18 @@ func test_combined_import_selection_preserves_visible_and_direct_order() -> Bool
 		None:
 			False
 		Some(index):
-			selection = importable_module_selection_for_program(source_program, index, Some("decl"))
+			selection = importable_module_selection_for_accepted_imports(
+				index,
+				["dep"],
+				Some("decl"),
+			)
 
 			(
-				selection[0].map(importable_module_path) == ["dep", "transitive", "tuple"]
-				and selection[1].map(importable_module_path) == ["dep", "tuple"]
+				selection.visible_import_modules.map(
+					importable_module_path,
+				) == ["dep", "transitive", "tuple"]
+				and selection.direct_import_modules.map(importable_module_path) == ["dep", "tuple"]
+				and selection.source_direct_import_count == 1
 			)
 
 
@@ -1989,6 +2448,7 @@ func test_prelude_import_merge_preserves_symbols_for_qualified_import() -> Bool:
 func test_ambient_tuple_module_registers_impls_without_source_import() -> Bool:
 	base_state = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
 	ambient_decls = [
+		record_with_fields_decl("AmbientTupleRecord", [int_type()]),
 		trait_decl("AmbientTupleTrait"),
 		impl_decl_with_methods("AmbientTupleTrait", int_type(), []),
 	]
@@ -2007,13 +2467,75 @@ func test_ambient_tuple_module_registers_impls_without_source_import() -> Bool:
 		)
 		.get_or(0)
 
+	ambient_record_inference_candidates: List[String] = match module_view_accepted_record_authority(
+		result.state.module_view,
+	):
+		Some(authority):
+			accepted_record_find_names_with_fields(authority, ["field"])
+		None:
+			[]
+
 	(
 		result.state.errors.length() == 0
 		and result.state.env.impls.length() == base_state.env.impls.length()
 		and accepted_impl_count == 1
-		and not typecheck_state_has_imported_module(result.state, "tuple")
+		and not ambient_record_inference_candidates.contains(
+			canonical_module_type_name(
+				"tuple",
+				"AmbientTupleRecord",
+			),
+		)
 		and typecheck_state_find_module_alias(result.state, "tuple").is_none()
 	)
+
+
+func test_rejected_std_package_import_is_not_a_record_inference_candidate() -> Bool:
+	module_path: String = "forbidden_package"
+	record_name: String = "ForbiddenPackageRecord"
+	source_program = program([import_block_decl([import_decl(module_path, None, None)])])
+	modules = importable_modules_with_origin(
+		module_path,
+		[record_with_fields_decl(record_name, [int_type()])],
+		SourcePackageModule("test"),
+	)
+
+	match importable_module_index_for_target_origin(modules, StdlibModule):
+		None:
+			False
+		Some(index):
+			match importable_module_index_find(index, "index_target"):
+				None:
+					False
+				Some(owner):
+					owner_scope = importable_module_prepared_scope(owner)
+
+					match bound_module_build(
+						owner_scope,
+						func(_): typecheck_bind_program_module_view(
+							typecheck_state_enter_prepared_module_scope(
+								typecheck_state_for_origin(TYPECHECK_STDLIB_ORIGIN),
+								owner_scope,
+							),
+							source_program,
+							index,
+							owner_scope,
+						),
+					):
+						Err(_):
+							False
+						Ok(bound_module):
+							(
+								bound_module_source_direct_import_count(bound_module) == 0
+								and bound_module_binding_diagnostics(
+									bound_module,
+								).any(
+									func(
+										diagnostic,
+									): diagnostic.message.contains(
+										"standard library modules cannot import package modules",
+									),
+								)
+							)
 
 
 private pure func compiler_trait_bridge_has_expected_direct_evidence(
@@ -2168,19 +2690,16 @@ private pure func accepted_trait_table_validation_is_owner_safe() -> Option[Bool
 	wrong_owner_path = "not/the/trait/owner"
 	wrong_owner_item = { item | definition = { definition | module_path = Some(wrong_owner_path) } }
 
-	Some((
-		accepted_resolve_trait_obligation(
-			authority,
-			base_state.env,
-			trait_obligation(TYPE_INT, "Equatable"),
-		) == TraitObligationUnsatisfied
-		and accepted_trait_implementation_table({
-			module_table = owner_table,
-			definition_table = definition_table,
-			traits = [wrong_owner_item],
-			implementations = [],
-		}).is_none()
-	))
+	Some(accepted_resolve_trait_obligation(
+		authority,
+		base_state.env,
+		trait_obligation(TYPE_INT, "Equatable"),
+	) == TraitObligationUnsatisfied and accepted_trait_implementation_table({
+		module_table = owner_table,
+		definition_table = definition_table,
+		traits = [wrong_owner_item],
+		implementations = [],
+	}).is_none())
 
 
 func test_accepted_trait_table_validation_is_owner_safe() -> Bool:
@@ -6174,6 +6693,50 @@ tests: TestSuite = {
 			test_bind_program_module_view_returns_completed_namespace,
 		),
 		(
+			"bound module alias retains graph module id",
+			test_bound_module_alias_retains_graph_module_id,
+		),
+		(
+			"bind program module view rejects unreserved state",
+			test_bind_program_module_view_rejects_unreserved_state,
+		),
+		(
+			"bind program module view rejects equivalent foreign scope",
+			test_bind_program_module_view_rejects_equivalent_foreign_scope,
+		),
+		(
+			"bind program module view rejects preloaded standalone alias",
+			test_bind_program_module_view_rejects_preloaded_standalone_alias,
+		),
+		(
+			"graph module alias rejects same index from foreign table",
+			test_graph_module_alias_rejects_same_index_from_foreign_table,
+		),
+		(
+			"graph module alias rejects wrong expected path",
+			test_graph_module_alias_rejects_wrong_expected_path,
+		),
+		(
+			"graph module alias rejects out of range id",
+			test_graph_module_alias_rejects_out_of_range_id,
+		),
+		(
+			"graph module alias rejects uncataloged local name",
+			test_graph_module_alias_rejects_uncataloged_local_name,
+		),
+		(
+			"graph local name rejects uncataloged source name",
+			test_graph_local_name_rejects_uncataloged_source_name,
+		),
+		(
+			"standalone module view retains qualified import path",
+			test_standalone_module_view_retains_qualified_import_path,
+		),
+		(
+			"standalone module view rejects preloaded graph alias",
+			test_standalone_module_view_rejects_preloaded_graph_alias,
+		),
+		(
 			"reachable import modules exclude current and unrelated modules",
 			test_reachable_import_modules_exclude_current_and_unrelated_modules,
 		),
@@ -6224,6 +6787,10 @@ tests: TestSuite = {
 		(
 			"ambient tuple module registers impls without source import",
 			test_ambient_tuple_module_registers_impls_without_source_import,
+		),
+		(
+			"rejected std package import is not a record inference candidate",
+			test_rejected_std_package_import_is_not_a_record_inference_candidate,
 		),
 		(
 			"import modules register canonical type payloads",

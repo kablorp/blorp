@@ -1,7 +1,7 @@
 # Normalized Compilation Database Roadmap
 
 **Status:** Active; Horizon 1, Issues 61B and 68-73, and normalized semantic
-Step 1 implemented
+Steps 1 and 2a-2d implemented; Step 2e is in progress
 
 **Scope:** One compiler invocation and the immutable products retained by an
 LSP analysis snapshot. This is not a cross-run cache, an incremental build

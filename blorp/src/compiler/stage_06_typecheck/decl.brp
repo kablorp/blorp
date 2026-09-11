@@ -358,9 +358,12 @@ import:
 		BoundModuleGraph,
 		BoundModuleViewBinding(BoundModuleViewReady, BoundModuleViewRejected),
 		BoundModuleVisibilityBuild(
+			BoundModuleVisibilityIncompatibleDirect,
+			BoundModuleVisibilityIncompatibleVisible,
 			BoundModuleVisibilityDirectNotVisible,
 			BoundModuleVisibilityDuplicateDirect,
 			BoundModuleVisibilityDuplicateVisible,
+			BoundModuleVisibilityInvalidSourceDirectCount,
 			BoundModuleVisibilityReady,
 		),
 		COMPILER_BOUND_MODULE_VISIBILITY_EMPTY,
@@ -410,7 +413,7 @@ import:
 		register_program_import_syntax,
 		register_program_imports,
 	modules/module_prelude: program_with_prelude_imports
-	modules/module_selection: importable_module_selection_for_program
+	modules/module_selection: importable_module_selection_for_accepted_imports
 	modules/module_view:
 		ModuleView,
 		TopLevelNameKind(
@@ -426,8 +429,10 @@ import:
 		module_view_accepted_record_authority,
 		module_view_accepted_trait_implementation_authority,
 		module_view_accepted_union_authority,
+		module_view_for_standalone_source_bindings,
+		module_view_has_graph_import_bindings,
+		module_view_has_standalone_import_bindings,
 		module_view_import_bindings,
-		module_view_imported_modules,
 		module_view_imported_names,
 		module_view_module_aliases,
 		module_view_with_accepted_alias_authority,
@@ -436,7 +441,7 @@ import:
 		module_view_with_accepted_record_authority,
 		module_view_with_accepted_trait_implementation_authority,
 		module_view_with_accepted_union_authority,
-	modules/module_visibility: importable_module_surfaces
+	modules/module_visibility: importable_module_surfaces, importable_modules_for_program
 	state:
 		DefinitionIdClaim(DefinitionIdClaimed, DefinitionIdMissing),
 		InferModuleFacts,
@@ -463,6 +468,7 @@ import:
 		typecheck_state_find_type_home,
 		typecheck_state_for_prepared_module_scope,
 		typecheck_state_has_known_type_name,
+		typecheck_state_is_reserved_for_exact_scope,
 		typecheck_state_is_reserved_for_scope,
 		typecheck_state_is_source_package,
 		typecheck_state_is_stdlib,
@@ -6359,28 +6365,45 @@ private pure func typecheck_state_after_accepted_definition_id_replay(
 	with_definition_ids
 
 
-pure func typecheck_bind_program_module_view(
+private pure func typecheck_bind_program_module_view_for_reserved_state(
 	state: TypecheckState,
 	program: ParsedProgram,
 	import_index: ImportableModuleIndex,
-	current_module_path: String,
+	current_scope: PreparedModuleScope,
 ) -> BoundModuleViewBinding:
+	current_module_path = prepared_module_scope_canonical_path(current_scope)
 	module_state = typecheck_state_scope_to_program(state, program)
 	program_with_prelude = program_with_prelude_imports(state, program, import_index)
-	import_selection = importable_module_selection_for_program(
-		program_with_prelude,
+	candidate_import_modules = importable_modules_for_program(
 		import_index,
+		program_with_prelude,
 		Some(current_module_path),
 	)
-	type_import_modules = import_selection[0]
-	import_surfaces = importable_module_surfaces(type_import_modules)
-	direct_import_modules = import_selection[1]
+	candidate_import_surfaces = importable_module_surfaces(candidate_import_modules)
 	with_names = typecheck_prescan_program(module_state, program_with_prelude)
-	with_imports = register_program_imports(with_names, import_surfaces, program_with_prelude)
+	import_registration = register_program_imports(
+		with_names,
+		candidate_import_surfaces,
+		program_with_prelude,
+	)
+	with_imports = import_registration.state
+	import_selection = importable_module_selection_for_accepted_imports(
+		import_index,
+		import_registration.accepted_canonical_module_paths,
+		Some(current_module_path),
+	)
+	type_import_modules = import_selection.visible_import_modules
+	direct_import_modules = import_selection.direct_import_modules
+	source_direct_import_count = import_selection.source_direct_import_count
 
 	match with_imports.diagnostics:
 		binding_diagnostics:
-			match bound_module_visibility(type_import_modules, direct_import_modules):
+			match bound_module_visibility(
+				current_scope,
+				type_import_modules,
+				direct_import_modules,
+				source_direct_import_count,
+			):
 				BoundModuleVisibilityReady(visibility):
 					BoundModuleViewReady(
 						with_imports.module_view,
@@ -6403,12 +6426,61 @@ pure func typecheck_bind_program_module_view(
 						"internal typecheck error: direct module '" + module_path + "' is not visible",
 						[],
 					)
+				BoundModuleVisibilityInvalidSourceDirectCount(count):
+					BoundModuleViewRejected(
+						"internal typecheck error: invalid source-direct module count " + count.to_string(),
+						[],
+					)
+				BoundModuleVisibilityIncompatibleVisible(module_path):
+					BoundModuleViewRejected(
+						"internal typecheck error: visible module '" + module_path + "' belongs to another compilation",
+						[],
+					)
+				BoundModuleVisibilityIncompatibleDirect(module_path):
+					BoundModuleViewRejected(
+						"internal typecheck error: direct module '" + module_path + "' belongs to another compilation",
+						[],
+					)
+
+
+-- Graph binding accepts only a state already reserved for the exact prepared
+-- scope. Constructing a fresh table from an unscoped state would give equal
+-- raw ModuleId indexes semantic authority in an unrelated compilation.
+pure func typecheck_bind_program_module_view(
+	state: TypecheckState,
+	program: ParsedProgram,
+	import_index: ImportableModuleIndex,
+	current_scope: PreparedModuleScope,
+) -> BoundModuleViewBinding:
+	if not typecheck_state_is_reserved_for_exact_scope(state, current_scope):
+		BoundModuleViewRejected(
+			(
+				"internal typecheck error: graph module binding requires the exact prepared "
+				+ "module scope"
+			),
+			[],
+		)
+	else if module_view_has_standalone_import_bindings(state.module_view):
+		BoundModuleViewRejected(
+			(
+				"internal typecheck error: graph module binding cannot accept standalone import "
+				+ "bindings"
+			),
+			[],
+		)
+	else:
+		typecheck_bind_program_module_view_for_reserved_state(
+			state,
+			program,
+			import_index,
+			current_scope,
+		)
 
 
 -- Standalone source tooling has no loaded module graph to validate against.
 -- Preserve its syntax-level bindings explicitly rather than pretending an
 -- absent module surface is a validated semantic import.
-pure func typecheck_bind_standalone_program_module_view(
+private pure func typecheck_bind_standalone_program_module_view_without_graph_bindings(
 	state: TypecheckState,
 	program: ParsedProgram,
 ) -> BoundModuleViewBinding:
@@ -6421,6 +6493,26 @@ pure func typecheck_bind_standalone_program_module_view(
 		COMPILER_BOUND_MODULE_VISIBILITY_EMPTY,
 		with_imports.diagnostics,
 	)
+
+
+pure func typecheck_bind_standalone_program_module_view(
+	state: TypecheckState,
+	program: ParsedProgram,
+) -> BoundModuleViewBinding:
+	match module_view_for_standalone_source_bindings(state.module_view):
+		Some(standalone_view):
+			typecheck_bind_standalone_program_module_view_without_graph_bindings(
+				{ state | module_view = standalone_view },
+				program,
+			)
+		None:
+			BoundModuleViewRejected(
+				(
+					"internal typecheck error: standalone module binding cannot accept graph import "
+					+ "bindings"
+				),
+				[],
+			)
 
 
 private pure func accepted_global_binding_from_completed(
@@ -8419,8 +8511,6 @@ private pure func frontend_preparation_module_view_projection_entries(view: Modu
 		view,
 	).length() + module_view_imported_names(
 		view,
-	).length() + module_view_imported_modules(
-		view,
 	).length() + module_view_import_bindings(view).length()
 
 
@@ -8865,7 +8955,7 @@ private pure func graph_facts_ctfe_artifact_typecheck_module(
 				state,
 				prepared_module_program(prepared_module_scope_module(binding_scope)),
 				artifact_index,
-				prepared_module_scope_canonical_path(binding_scope),
+				binding_scope,
 			),
 		).to_option()
 		type_alias_authority = prepare_type_alias_authority(

@@ -15,6 +15,7 @@ import:
 		ModuleTable,
 		module_id_table_index,
 		module_table_canonical_path,
+		module_table_count,
 		module_tables_are_compatible,
 	../diagnostic: TypecheckDiagnostic
 	../graph/indexed_graph:
@@ -34,14 +35,16 @@ import:
 		prepared_module_scope_identity,
 		prepared_module_scope_module_table,
 		prepared_module_scopes_are_compatible,
-	list: repeat
-	module_binding: ImportableModule, importable_module_path
+	module_binding: ImportableModule, importable_module_path, importable_module_prepared_scope
 	module_view: ModuleView
 
 
+-- source_direct_import_count records the validated prefix of direct modules
+-- that came from source imports; ambient semantic modules follow that prefix.
 private record BoundModuleVisibilityRep {
 	visible_import_modules: List[ImportableModule],
-	direct_import_modules: List[ImportableModule]
+	direct_import_modules: List[ImportableModule],
+	source_direct_import_count: Int
 }
 
 
@@ -53,11 +56,15 @@ union BoundModuleVisibilityBuild:
 	BoundModuleVisibilityDuplicateVisible(String)
 	BoundModuleVisibilityDuplicateDirect(String)
 	BoundModuleVisibilityDirectNotVisible(String)
+	BoundModuleVisibilityInvalidSourceDirectCount(Int)
+	BoundModuleVisibilityIncompatibleVisible(String)
+	BoundModuleVisibilityIncompatibleDirect(String)
 
 
 private EMPTY_BOUND_MODULE_VISIBILITY_REP: BoundModuleVisibilityRep = {
 	visible_import_modules = [],
-	direct_import_modules = []
+	direct_import_modules = [],
+	source_direct_import_count = 0
 }
 
 
@@ -168,34 +175,75 @@ pure func bound_module_binding_diagnostics(module: BoundModule) -> List[Typechec
 	bound_module_rep(module).binding_diagnostics
 
 
+-- A table-issued ID can index the owner's sparse relation only after exact
+-- issuing-table provenance agrees. The table, rather than structural graph
+-- equality, is the capability that gives the raw integer its meaning.
+private pure func bound_module_visibility_index(
+	owner_scope: PreparedModuleScope,
+	module: ImportableModule,
+) -> Option[Int]:
+	requested_scope = importable_module_prepared_scope(module)
+	owner_table = prepared_module_scope_module_table(owner_scope)
+
+	if module_tables_are_compatible(
+		owner_table,
+		prepared_module_scope_module_table(requested_scope),
+	):
+		module_index = module_id_table_index(prepared_module_scope_id(requested_scope))
+
+		if module_index >= 0 and module_index < module_table_count(owner_table):
+			Some(module_index)
+		else:
+			None
+	else:
+		None
+
+
 pure func bound_module_visibility(
+	owner_scope: PreparedModuleScope,
 	visible_import_modules: List[ImportableModule],
 	direct_import_modules: List[ImportableModule],
+	source_direct_import_count: Int,
 ) -> BoundModuleVisibilityBuild:
-	var visible_paths: Dict[String, Bool] = {}
-	var issue: Option[BoundModuleVisibilityBuild] = None
+	var visible_module_ids: Dict[Int, Bool] = {}
+
+	var issue: Option[BoundModuleVisibilityBuild] = if (
+		source_direct_import_count < 0
+		or source_direct_import_count > direct_import_modules.length()
+	):
+		Some(BoundModuleVisibilityInvalidSourceDirectCount(source_direct_import_count))
+	else:
+		None
 
 	for module in visible_import_modules:
 		if issue.is_none():
 			path = importable_module_path(module)
 
-			if visible_paths.contains(path):
-				issue = Some(BoundModuleVisibilityDuplicateVisible(path))
-			else:
-				visible_paths = visible_paths.set(path, True)
+			match bound_module_visibility_index(owner_scope, module):
+				None:
+					issue = Some(BoundModuleVisibilityIncompatibleVisible(path))
+				Some(module_index):
+					if visible_module_ids.contains(module_index):
+						issue = Some(BoundModuleVisibilityDuplicateVisible(path))
+					else:
+						visible_module_ids = visible_module_ids.set(module_index, True)
 
-	var direct_paths: Dict[String, Bool] = {}
+	var direct_module_ids: Dict[Int, Bool] = {}
 
 	for module in direct_import_modules:
 		if issue.is_none():
 			path = importable_module_path(module)
 
-			if direct_paths.contains(path):
-				issue = Some(BoundModuleVisibilityDuplicateDirect(path))
-			else if not visible_paths.contains(path):
-				issue = Some(BoundModuleVisibilityDirectNotVisible(path))
-			else:
-				direct_paths = direct_paths.set(path, True)
+			match bound_module_visibility_index(owner_scope, module):
+				None:
+					issue = Some(BoundModuleVisibilityIncompatibleDirect(path))
+				Some(module_index):
+					if direct_module_ids.contains(module_index):
+						issue = Some(BoundModuleVisibilityDuplicateDirect(path))
+					else if not visible_module_ids.contains(module_index):
+						issue = Some(BoundModuleVisibilityDirectNotVisible(path))
+					else:
+						direct_module_ids = direct_module_ids.set(module_index, True)
 
 	match issue:
 		Some(problem):
@@ -203,7 +251,8 @@ pure func bound_module_visibility(
 		None:
 			representation: BoundModuleVisibilityRep = {
 				visible_import_modules = visible_import_modules,
-				direct_import_modules = direct_import_modules
+				direct_import_modules = direct_import_modules,
+				source_direct_import_count = source_direct_import_count
 			}
 			BoundModuleVisibilityReady(bound_module_visibility_from_rep(representation))
 
@@ -220,6 +269,22 @@ pure func bound_module_visible_import_modules(module: BoundModule) -> List[Impor
 
 pure func bound_module_direct_import_modules(module: BoundModule) -> List[ImportableModule]:
 	bound_module_visibility_rep(bound_module_rep(module).visibility).direct_import_modules
+
+
+pure func bound_module_source_direct_import_count(module: BoundModule) -> Int:
+	bound_module_visibility_rep(bound_module_rep(module).visibility).source_direct_import_count
+
+
+pure func bound_module_source_direct_import_module_at(
+	module: BoundModule,
+	index: Int,
+) -> Option[ImportableModule]:
+	representation = bound_module_visibility_rep(bound_module_rep(module).visibility)
+
+	if index >= 0 and index < representation.source_direct_import_count:
+		representation.direct_import_modules.get(index)
+	else:
+		None
 
 
 pure func bound_module_identity(module: BoundModule) -> ModuleIdentity:

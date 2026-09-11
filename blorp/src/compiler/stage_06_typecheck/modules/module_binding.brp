@@ -38,10 +38,24 @@ import:
 	../../stage_04_modules/module_surface:
 		ModuleSurface,
 		ModuleSurfaceSymbol,
-		ModuleSurfaceSymbolKind(RecordSurfaceSymbol, TypeAliasSurfaceSymbol, TypeSurfaceSymbol),
+		ModuleSurfaceSymbolKind(
+			RecordSurfaceSymbol,
+			TraitMethodSurfaceSymbol,
+			TypeAliasSurfaceSymbol,
+			TypeSurfaceSymbol,
+		),
 		module_surface_for_program,
-	../../stage_04_modules/module_table: module_ids_equal
+	../../stage_04_modules/module_table: ModuleId, module_ids_equal
 	../../stage_04_modules/module_type_identity: local_type_names_from_decls
+	../graph/definition_index:
+		DefinitionId,
+		DefinitionTable,
+		EXPORTED_DEFINITION_TARGETS_EMPTY,
+		ExportedDefinitionTargets,
+		definition_index_definition_table,
+		definition_index_exported_definition_targets,
+		definition_table_module_table,
+		exported_definition_targets_find,
 	../graph/indexed_graph:
 		IndexedGraph,
 		PreparedModuleScope,
@@ -50,31 +64,56 @@ import:
 		prepared_module_canonical_path,
 		prepared_module_origin,
 		prepared_module_program,
+		prepared_module_scope_definition_index,
 		prepared_module_scope_id,
 		prepared_module_scope_module,
+		prepared_module_scope_module_table,
 		prepared_module_scopes_are_compatible,
 		prepared_module_surface,
+	../graph/source_name_table: source_name_default_module_alias
 	../state:
 		TypecheckState,
 		typecheck_state_add_error,
 		typecheck_state_add_error_at,
-		typecheck_state_add_imported_module,
 		typecheck_state_add_known_type_name,
-		typecheck_state_has_imported_module,
 		typecheck_state_is_stdlib,
 		typecheck_state_record_type_home,
+		typecheck_state_register_graph_imported_constructor,
+		typecheck_state_register_graph_imported_name,
+		typecheck_state_register_graph_imported_trait_method,
+		typecheck_state_register_graph_module_alias,
 		typecheck_state_register_imported_constructor,
 		typecheck_state_register_imported_name,
-		typecheck_state_register_module_alias,
+		typecheck_state_register_standalone_module_alias,
 	../type_system/context: module_origin_is_package, module_origin_is_std
 	module_view: ImportedNameBinding, ModuleView, module_view_imported_names
 	set as Sets
 
 
-record ImportableModuleSurface {
-	module_path: String,
-	origin: ModuleOrigin,
-	surface: ModuleSurface
+-- Graph surfaces carry the table and ID together until the alias row is
+-- validated. Standalone surfaces remain explicitly path-backed. Keeping the
+-- distinction in this already-allocated row avoids a second target object per
+-- import while making mixed provenance unrepresentable.
+private union ImportableModuleSurfaceRep:
+	GraphImportableModuleSurface(String, DefinitionTable, ModuleId, ModuleOrigin, ModuleSurface, ExportedDefinitionTargets)
+	StandaloneImportableModuleSurface(String, ModuleOrigin, ModuleSurface)
+
+
+opaque type ImportableModuleSurface = ImportableModuleSurfaceRep
+
+
+private pure func importable_module_surface_rep(
+	module: ImportableModuleSurface,
+) -> ImportableModuleSurfaceRep:
+	from_opaque ImportableModuleSurface(module)
+
+
+-- Canonical source-import membership is transient binder output. Graph-aware
+-- callers immediately normalize these paths to prepared modules and ModuleIds;
+-- ModuleView does not retain a parallel string-keyed membership relation.
+record ProgramImportRegistration {
+	state: TypecheckState,
+	accepted_canonical_module_paths: List[String]
 }
 
 
@@ -87,6 +126,7 @@ union ImportableSignatureDecl:
 
 private record AcceptedImportableModuleContents {
 	surface: ModuleSurface,
+	exported_definition_targets: ExportedDefinitionTargets,
 	local_type_names: List[String],
 	declared_imports: List[ParsedImportDecl],
 	signature_decls: List[ImportableSignatureDecl],
@@ -148,11 +188,33 @@ pure func importable_module_surface(
 	origin: ModuleOrigin,
 	surface: ModuleSurface,
 ) -> ImportableModuleSurface:
-	{
-		module_path = module_path,
-		origin = origin,
-		surface = surface
-	}
+	into_opaque ImportableModuleSurface(
+		StandaloneImportableModuleSurface(module_path, origin, surface)
+	)
+
+
+pure func importable_module_surface_path(module: ImportableModuleSurface) -> String:
+	match importable_module_surface_rep(module):
+		GraphImportableModuleSurface(module_path, _, _, _, _, _):
+			module_path
+		StandaloneImportableModuleSurface(module_path, _, _):
+			module_path
+
+
+private pure func importable_module_surface_origin(module: ImportableModuleSurface) -> ModuleOrigin:
+	match importable_module_surface_rep(module):
+		GraphImportableModuleSurface(_, _, _, origin, _, _):
+			origin
+		StandaloneImportableModuleSurface(_, origin, _):
+			origin
+
+
+private pure func importable_surface_value(module: ImportableModuleSurface) -> ModuleSurface:
+	match importable_module_surface_rep(module):
+		GraphImportableModuleSurface(_, _, _, _, surface, _):
+			surface
+		StandaloneImportableModuleSurface(_, _, surface):
+			surface
 
 
 private EMPTY_IMPORTABLE_DECLARATION_FACTS: ImportableDeclarationFacts = {
@@ -261,7 +323,10 @@ private pure func recovery_module_surface(program: ParsedProgram) -> ModuleSurfa
 	}
 
 
-pure func importable_module(prepared_scope: PreparedModuleScope) -> ImportableModule:
+private pure func importable_module_for_requested_names(
+	prepared_scope: PreparedModuleScope,
+	requested_names: Option[Set[String]],
+) -> ImportableModule:
 	module = prepared_module_scope_module(prepared_scope)
 	program = prepared_module_program(module)
 
@@ -277,8 +342,18 @@ pure func importable_module(prepared_scope: PreparedModuleScope) -> ImportableMo
 			None:
 				module_surface_for_program(program)
 
+		exported_definition_targets = definition_index_exported_definition_targets(
+			prepared_module_scope_definition_index(prepared_scope),
+			prepared_module_scope_module_table(prepared_scope),
+			prepared_module_scope_id(prepared_scope),
+			program,
+			surface,
+			requested_names,
+		).get_or(EXPORTED_DEFINITION_TARGETS_EMPTY)
+
 		AcceptedImportableModuleContentsValue({
 			surface = surface,
+			exported_definition_targets = exported_definition_targets,
 			local_type_names = local_type_names_from_decls(decls),
 			declared_imports = facts.declared_imports,
 			signature_decls = facts.signature_decls,
@@ -295,10 +370,59 @@ pure func importable_module(prepared_scope: PreparedModuleScope) -> ImportableMo
 	into_opaque ImportableModule(representation)
 
 
+pure func importable_module(prepared_scope: PreparedModuleScope) -> ImportableModule:
+	importable_module_for_requested_names(prepared_scope, None)
+
+
+private pure func selective_definition_names_for_decl(
+	names: Set[String],
+	decl: ParsedDecl,
+) -> Set[String]:
+	match decl:
+		ImportBlockParsedDecl(imports, _):
+			var next = names
+
+			for import_decl in imports:
+				match import_decl.symbols:
+					Some(symbols):
+						for symbol in symbols:
+							next = next.add(symbol.name.text)
+					None:
+						void
+
+			next
+		PrivateParsedDecl(inner, _):
+			selective_definition_names_for_decl(names, inner)
+		_:
+			names
+
+
+private pure func selective_definition_names_for_scopes(
+	scopes: List[PreparedModuleScope],
+) -> Set[String]:
+	var names: Set[String] = Sets.set()
+
+	for scope in scopes:
+		for decl in prepared_module_program(prepared_module_scope_module(scope)).decls:
+			names = selective_definition_names_for_decl(names, decl)
+
+	names
+
+
 pure func importable_module_graph(indexed_graph: IndexedGraph) -> ImportableModuleGraph:
 	target_scope = indexed_graph_target_scope(indexed_graph)
-	dependency_modules = indexed_graph_module_scopes(indexed_graph).map(importable_module)
-	all_modules = dependency_modules.append(importable_module(target_scope))
+	dependency_scopes = indexed_graph_module_scopes(indexed_graph)
+	all_scopes = dependency_scopes.append(target_scope)
+	requested_names = selective_definition_names_for_scopes(all_scopes)
+	dependency_modules = dependency_scopes.map(func(scope):
+		importable_module_for_requested_names(scope, Some(requested_names))
+	)
+	all_modules = dependency_modules.append(
+		importable_module_for_requested_names(
+			target_scope,
+			Some(requested_names),
+		),
+	)
 	representation: ImportableModuleGraphRep = {
 		target_scope = target_scope,
 		dependency_index = importable_module_index(dependency_modules),
@@ -402,6 +526,16 @@ pure func importable_module_surface_value(module: ImportableModule) -> ModuleSur
 			surface
 
 
+private pure func importable_module_exported_definition_targets(
+	module: ImportableModule,
+) -> ExportedDefinitionTargets:
+	match importable_module_contents(module):
+		AcceptedImportableModuleContentsValue(contents):
+			contents.exported_definition_targets
+		RecoveryImportableModuleContents(_):
+			EXPORTED_DEFINITION_TARGETS_EMPTY
+
+
 pure func importable_module_local_type_names(module: ImportableModule) -> List[String]:
 	match importable_module_contents(module):
 		AcceptedImportableModuleContentsValue(contents):
@@ -445,26 +579,21 @@ pure func importable_module_decls(module: ImportableModule) -> List[ParsedDecl]:
 
 
 pure func importable_module_to_surface(module: ImportableModule) -> ImportableModuleSurface:
-	importable_module_surface(
-		importable_module_path(module),
-		importable_module_origin(module),
-		importable_module_surface_value(module),
+	scope = importable_module_prepared_scope(module)
+	into_opaque ImportableModuleSurface(
+		GraphImportableModuleSurface(
+			importable_module_path(module),
+			definition_index_definition_table(prepared_module_scope_definition_index(scope)),
+			prepared_module_scope_id(scope),
+			importable_module_origin(module),
+			importable_module_surface_value(module),
+			importable_module_exported_definition_targets(module),
+		)
 	)
 
 
 pure func import_default_alias(module_path: String) -> String:
-	parts: List[String] = module_path.split("/")
-
-	raw_name: String = match parts.last():
-		Some(name):
-			name
-		None:
-			module_path
-
-	if raw_name.ends_with(".brp"):
-		raw_name.substring(0, raw_name.length() - 4)
-	else:
-		raw_name
+	source_name_default_module_alias(module_path)
 
 
 pure func importable_module_request_aliases(
@@ -751,17 +880,18 @@ private pure func import_module_index(modules: List[ImportableModuleSurface]) ->
 	var candidates_by_request: Dict[String, List[ImportableModuleSurface]] = {}
 
 	for module in modules:
+		module_path = importable_module_surface_path(module)
 		exact_by_path = exact_by_path.set(
-			module.module_path,
+			module_path,
 			exact_by_path
-				.get_or(module.module_path, [])
+				.get_or(module_path, [])
 				.append(module),
 		)
 
 		for request_alias in importable_module_request_aliases(
-			module.module_path,
-			module.origin,
-			module.surface.module_name,
+			module_path,
+			importable_module_surface_origin(module),
+			importable_surface_value(module).module_name,
 		):
 			candidates_by_request = candidates_by_request.set(
 				request_alias,
@@ -795,7 +925,7 @@ private pure func find_importable_module(
 		_:
 			ImportModuleAmbiguous(
 				matches
-					.map(func(module): module.module_path)
+					.map(importable_module_surface_path)
 					.sort(),
 			)
 
@@ -897,7 +1027,7 @@ pure func register_import_decl_syntax(
 	import_decl: ParsedImportDecl,
 ) -> TypecheckState:
 	module_path: String = import_decl.module_path
-	var next: TypecheckState = typecheck_state_add_imported_module(state, module_path)
+	var next: TypecheckState = state
 
 	match import_decl.symbols:
 		Some(symbols):
@@ -905,7 +1035,7 @@ pure func register_import_decl_syntax(
 
 			match import_decl_explicit_alias(import_decl):
 				Some(alias_name):
-					typecheck_state_register_module_alias(next, alias_name, module_path)
+					typecheck_state_register_standalone_module_alias(next, alias_name, module_path)
 				None:
 					next
 		None:
@@ -913,7 +1043,7 @@ pure func register_import_decl_syntax(
 				import_decl,
 			).get_or(import_default_alias(module_path))
 
-			typecheck_state_register_module_alias(next, alias_name, module_path)
+			typecheck_state_register_standalone_module_alias(next, alias_name, module_path)
 
 
 private pure func register_imports_decl_syntax(
@@ -1047,8 +1177,10 @@ private pure func importable_module_surfaces_by_first_path(
 	var by_path: Dict[String, ImportableModuleSurface] = {}
 
 	for module in modules:
-		if not by_path.contains(module.module_path):
-			by_path = by_path.set(module.module_path, module)
+		module_path = importable_module_surface_path(module)
+
+		if not by_path.contains(module_path):
+			by_path = by_path.set(module_path, module)
 
 	by_path
 
@@ -1058,7 +1190,7 @@ private pure func register_module_view_type_fact(
 	module: ImportableModuleSurface,
 	binding: ImportedNameBinding,
 ) -> TypecheckState:
-	match find_surface_symbol(module.surface.exports, binding.original_name):
+	match find_surface_symbol(importable_surface_value(module).exports, binding.original_name):
 		Some(symbol):
 			record_imported_type_symbol(state, binding.module_path, binding.local_name, symbol)
 		None:
@@ -1077,7 +1209,9 @@ pure func register_module_view_type_facts(
 		[]:
 			next
 		[binding]:
-			match modules.find(func(module): module.module_path == binding.module_path):
+			match modules.find(
+				func(module): importable_module_surface_path(module) == binding.module_path,
+			):
 				Some(module):
 					register_module_view_type_fact(next, module, binding)
 				None:
@@ -1100,18 +1234,56 @@ private pure func register_import_symbol(
 	imported_module: ImportableModuleSurface,
 	symbol: ParsedImportSymbol,
 ) -> TypecheckState:
-	module_path: String = imported_module.module_path
+	module_path = importable_module_surface_path(imported_module)
 	original_name: String = symbol.name.text
 	local_name: String = import_symbol_local_name(symbol)
 
-	match find_surface_symbol(imported_module.surface.exports, original_name):
-		Some(exported_symbol):
-			registration = typecheck_state_register_imported_name(
-				state,
-				local_name,
-				module_path,
-				original_name,
-			)
+	exported_target = match importable_module_surface_rep(imported_module):
+		GraphImportableModuleSurface(_, _, _, _, _, targets):
+			exported_definition_targets_find(targets, original_name)
+		StandaloneImportableModuleSurface(_, _, module_surface):
+			match find_surface_symbol(module_surface.exports, original_name):
+				Some(found_symbol):
+					empty_definition_ids: List[DefinitionId] = []
+					Some((found_symbol, empty_definition_ids))
+				None:
+					None
+
+	match exported_target:
+		Some(target):
+			exported_symbol = target[0]
+			definition_ids = target[1]
+
+			registration = match importable_module_surface_rep(imported_module):
+				GraphImportableModuleSurface(_, issuing_definition_table, module_id, _, _, _):
+					match exported_symbol.kind:
+						TraitMethodSurfaceSymbol:
+							typecheck_state_register_graph_imported_trait_method(
+								state,
+								local_name,
+								module_path,
+								original_name,
+								issuing_definition_table,
+								module_id,
+								definition_ids,
+							)
+						_:
+							typecheck_state_register_graph_imported_name(
+								state,
+								local_name,
+								module_path,
+								original_name,
+								issuing_definition_table,
+								module_id,
+								definition_ids,
+							)
+				StandaloneImportableModuleSurface(_, _, _):
+					typecheck_state_register_imported_name(
+						state,
+						local_name,
+						module_path,
+						original_name,
+					)
 
 			if registration.registered:
 				var next: TypecheckState = record_imported_type_symbol(
@@ -1122,9 +1294,9 @@ private pure func register_import_symbol(
 				)
 
 				for constructor in symbol.constructors:
-					next = register_import_constructor(
+					next = register_import_constructor_for_module(
 						next,
-						module_path,
+						imported_module,
 						local_name,
 						symbol.name.text,
 						constructor,
@@ -1134,11 +1306,48 @@ private pure func register_import_symbol(
 			else:
 				registration.state
 		None:
-			match find_surface_symbol(imported_module.surface.private_names, original_name):
+			match find_surface_symbol(
+				importable_surface_value(imported_module).private_names,
+				original_name,
+			):
 				Some(_):
 					import_private_symbol_error(state, module_path, original_name)
 				None:
 					import_missing_symbol_error(state, module_path, original_name)
+
+
+private pure func register_import_constructor_for_module(
+	state: TypecheckState,
+	imported_module: ImportableModuleSurface,
+	parent_local_name: String,
+	parent_name: String,
+	constructor: ParsedIdentifier,
+) -> TypecheckState:
+	module_path = importable_module_surface_path(imported_module)
+
+	registration = match importable_module_surface_rep(imported_module):
+		GraphImportableModuleSurface(_, issuing_definition_table, module_id, _, _, _):
+			typecheck_state_register_graph_imported_constructor(
+				state,
+				constructor.text,
+				module_path,
+				parent_local_name,
+				parent_name,
+				constructor.text,
+				issuing_definition_table,
+				module_id,
+			)
+		StandaloneImportableModuleSurface(_, _, _):
+			typecheck_state_register_imported_constructor(
+				state,
+				constructor.text,
+				module_path,
+				parent_local_name,
+				parent_name,
+				constructor.text,
+			)
+
+	registration.state
 
 
 private pure func register_import_symbols(
@@ -1168,47 +1377,76 @@ private pure func register_import_alias_if_present(
 ) -> TypecheckState:
 	match maybe_alias:
 		Some(alias_name):
-			typecheck_state_register_module_alias(state, alias_name, imported_module.module_path)
+			register_import_module_alias(state, imported_module, alias_name)
 		None:
 			state
+
+
+private pure func register_import_module_alias(
+	state: TypecheckState,
+	imported_module: ImportableModuleSurface,
+	alias_name: String,
+) -> TypecheckState:
+	match importable_module_surface_rep(imported_module):
+		GraphImportableModuleSurface(module_path, issuing_definition_table, module_id, _, _, _):
+			typecheck_state_register_graph_module_alias(
+				state,
+				alias_name,
+				module_path,
+				definition_table_module_table(issuing_definition_table),
+				module_id,
+			)
+		StandaloneImportableModuleSurface(module_path, _, _):
+			typecheck_state_register_standalone_module_alias(state, alias_name, module_path)
 
 
 private pure func register_import_decl_indexed(
 	state: TypecheckState,
 	index: ImportModuleIndex,
 	decl: ParsedImportDecl,
-) -> TypecheckState:
+	seen_module_paths: Dict[String, Bool],
+	accepted_canonical_module_paths: List[String],
+) -> (TypecheckState, Dict[String, Bool], List[String]):
 	match find_importable_module(index, decl.module_path):
 		ImportModuleMissing:
-			import_not_loaded_error(state, decl.module_path, decl.module_path_span)
+			(
+				import_not_loaded_error(state, decl.module_path, decl.module_path_span),
+				seen_module_paths,
+				accepted_canonical_module_paths,
+			)
 		ImportModuleAmbiguous(canonical_paths):
-			import_ambiguous_module_error(
-				state,
-				decl.module_path,
-				canonical_paths,
-				decl.module_path_span,
+			(
+				import_ambiguous_module_error(
+					state,
+					decl.module_path,
+					canonical_paths,
+					decl.module_path_span,
+				),
+				seen_module_paths,
+				accepted_canonical_module_paths,
 			)
 		ImportModuleFound(imported_module):
+			module_path = importable_module_surface_path(imported_module)
+
 			if (
 				typecheck_state_is_stdlib(state)
-				and module_origin_is_package(imported_module.origin)
+				and module_origin_is_package(importable_module_surface_origin(imported_module))
 			):
-				import_std_package_error(state, decl.module_path_span)
-			else if typecheck_state_has_imported_module(state, imported_module.module_path):
-				import_duplicate_module_error(state, decl.module_path, decl.module_path_span)
-			else:
-				with_module = typecheck_state_add_imported_module(
-					state,
-					imported_module.module_path,
+				(
+					import_std_package_error(state, decl.module_path_span),
+					seen_module_paths,
+					accepted_canonical_module_paths,
 				)
-
-				match decl.symbols:
+			else if seen_module_paths.contains(module_path):
+				(
+					import_duplicate_module_error(state, decl.module_path, decl.module_path_span),
+					seen_module_paths,
+					accepted_canonical_module_paths,
+				)
+			else:
+				next_state = match decl.symbols:
 					Some(symbols):
-						with_symbols = register_import_symbols(
-							with_module,
-							imported_module,
-							symbols,
-						)
+						with_symbols = register_import_symbols(state, imported_module, symbols)
 						register_import_alias_if_present(
 							with_symbols,
 							imported_module,
@@ -1221,39 +1459,62 @@ private pure func register_import_decl_indexed(
 							None:
 								import_default_alias(decl.module_path)
 
-						typecheck_state_register_module_alias(
-							with_module,
-							alias_name,
-							imported_module.module_path,
-						)
+						register_import_module_alias(state, imported_module, alias_name)
+
+				(
+					next_state,
+					seen_module_paths.set(module_path, True),
+					accepted_canonical_module_paths.append(module_path),
+				)
 
 
 private pure func register_import_decls_indexed(
 	state: TypecheckState,
 	index: ImportModuleIndex,
 	imports: List[ParsedImportDecl],
-) -> TypecheckState:
+	seen_module_paths: Dict[String, Bool],
+	accepted_canonical_module_paths: List[String],
+) -> (TypecheckState, Dict[String, Bool], List[String]):
 	var current: TypecheckState = state
+	var seen = seen_module_paths
+	var accepted_paths = accepted_canonical_module_paths
 
 	for import_decl in imports:
-		current = register_import_decl_indexed(current, index, import_decl)
+		result = register_import_decl_indexed(current, index, import_decl, seen, accepted_paths)
+		current = result[0]
+		seen = result[1]
+		accepted_paths = result[2]
 
-	current
+	(current, seen, accepted_paths)
 
 
 pure func register_program_imports(
 	state: TypecheckState,
 	modules: List[ImportableModuleSurface],
 	program: ParsedProgram,
-) -> TypecheckState:
+) -> ProgramImportRegistration:
 	var current: TypecheckState = state
+	var seen_module_paths: Dict[String, Bool] = {}
+	var accepted_canonical_module_paths: List[String] = []
 	index = import_module_index(modules)
 
 	for decl in program.decls:
 		match decl:
 			ImportBlockParsedDecl(imports, _):
-				current = register_import_decls_indexed(current, index, imports)
+				result = register_import_decls_indexed(
+					current,
+					index,
+					imports,
+					seen_module_paths,
+					accepted_canonical_module_paths,
+				)
+				current = result[0]
+				seen_module_paths = result[1]
+				accepted_canonical_module_paths = result[2]
 			_:
 				void
 
-	current
+	{
+		state = current,
+		accepted_canonical_module_paths = accepted_canonical_module_paths
+	}

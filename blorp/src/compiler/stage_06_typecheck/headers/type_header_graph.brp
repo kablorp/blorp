@@ -74,7 +74,10 @@ import:
 		bound_module_scope,
 		bound_module_view,
 	../modules/module_binding: importable_module_request_aliases
-	../modules/module_view: module_view_find_imported_name, module_view_find_module_alias
+	../modules/module_view:
+		module_view_find_graph_module_alias,
+		module_view_find_imported_name,
+		module_view_find_standalone_module_alias,
 	../type_system/language_surface_manifest:
 		BuiltinValueStorage(BuiltinInlineScalar, BuiltinManagedReference, BuiltinNoValue),
 		PreludeType,
@@ -932,6 +935,39 @@ private pure func parsed_type_parameter_count(skeleton: TypeDeclarationSkeletonI
 			decl.type_params.length()
 
 
+private pure func declared_type_in_module(
+	context: TypeResolutionContext,
+	module: BoundModule,
+	name: String,
+	span: SourceSpan,
+) -> Result[TypeDeclarationSkeletonInfo, TypeShapeResolutionError]:
+	match declaration_skeleton_graph_find_type(
+		context.declaration_graph,
+		bound_module_scope(module),
+		name,
+	):
+		None:
+			Err(TypeShapeUnknownType(context.owner, name, span))
+		Some(skeleton):
+			if (
+				skeleton.visibility == PrivateDeclaration
+				and not prepared_module_scopes_select_same_module(
+					bound_module_scope(context.module),
+					bound_module_scope(module),
+				)
+			):
+				Err(
+					TypeShapePrivateTypeReference(
+						context.owner,
+						bound_module_canonical_path(module),
+						name,
+						span,
+					),
+				)
+			else:
+				Ok(skeleton)
+
+
 private pure func declared_type_at_path(
 	context: TypeResolutionContext,
 	module_path: String,
@@ -942,31 +978,7 @@ private pure func declared_type_at_path(
 		None:
 			Err(TypeShapeImportedModuleMissing(context.owner, module_path, span))
 		Some(module):
-			match declaration_skeleton_graph_find_type(
-				context.declaration_graph,
-				bound_module_scope(module),
-				name,
-			):
-				None:
-					Err(TypeShapeUnknownType(context.owner, name, span))
-				Some(skeleton):
-					if (
-						skeleton.visibility == PrivateDeclaration
-						and not prepared_module_scopes_select_same_module(
-							bound_module_scope(context.module),
-							bound_module_scope(module),
-						)
-					):
-						Err(
-							TypeShapePrivateTypeReference(
-								context.owner,
-								bound_module_canonical_path(module),
-								name,
-								span,
-							),
-						)
-					else:
-						Ok(skeleton)
+			declared_type_in_module(context, module, name, span)
 
 
 private pure func declared_unqualified_type(
@@ -1204,23 +1216,69 @@ private pure func resolve_qualified_named_type(
 		ResolvedTypesRejected(errors):
 			ResolvedTypeRejected(errors)
 		ResolvedTypesReady(resolved_args):
-			match module_view_find_module_alias(bound_module_view(context.module), qualifier):
+			view = bound_module_view(context.module)
+
+			match module_view_find_graph_module_alias(view, qualifier):
 				None:
-					ResolvedTypeRejected(
-						[TypeShapeUnknownQualifier(context.owner, qualifier, span)],
-					)
-				Some(module_path):
-					match declared_type_at_path(context, module_path, name, span):
-						Err(error):
-							ResolvedTypeRejected([error])
-						Ok(skeleton):
-							resolved_skeleton_type(
-								context,
-								skeleton,
-								qualifier + "." + name,
-								resolved_args,
-								span,
+					match module_view_find_standalone_module_alias(view, qualifier):
+						None:
+							ResolvedTypeRejected(
+								[TypeShapeUnknownQualifier(context.owner, qualifier, span)],
 							)
+						Some(module_path):
+							match bound_module_graph_find_canonical_path(
+								context.bound_graph,
+								module_path,
+							):
+								None:
+									ResolvedTypeRejected(
+										[
+											TypeShapeImportedModuleMissing(
+												context.owner,
+												module_path,
+												span,
+											),
+										],
+									)
+								Some(module):
+									match declared_type_in_module(context, module, name, span):
+										Err(error):
+											ResolvedTypeRejected([error])
+										Ok(skeleton):
+											resolved_skeleton_type(
+												context,
+												skeleton,
+												qualifier + "." + name,
+												resolved_args,
+												span,
+											)
+				Some(module_id):
+					match bound_module_graph_find_for_id(
+						context.bound_graph,
+						bound_module_graph_module_table(context.bound_graph),
+						module_id,
+					):
+						None:
+							module_path = bound_module_graph_canonical_path_for_id(
+								context.bound_graph,
+								bound_module_graph_module_table(context.bound_graph),
+								module_id,
+							).get_or(qualifier)
+							ResolvedTypeRejected(
+								[TypeShapeImportedModuleMissing(context.owner, module_path, span)],
+							)
+						Some(module):
+							match declared_type_in_module(context, module, name, span):
+								Err(error):
+									ResolvedTypeRejected([error])
+								Ok(skeleton):
+									resolved_skeleton_type(
+										context,
+										skeleton,
+										qualifier + "." + name,
+										resolved_args,
+										span,
+									)
 
 
 private pure func combine_binary_dimension(

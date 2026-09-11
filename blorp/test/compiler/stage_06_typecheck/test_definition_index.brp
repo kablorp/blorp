@@ -9,6 +9,7 @@ import:
 		loaded_module_set,
 		module_load_candidate,
 		resolved_module_identity_from_resolver,
+	../../../src/compiler/stage_04_modules/module_surface: module_surface_for_program
 	../../../src/compiler/stage_04_modules/module_table:
 		ModuleId,
 		ModuleTable,
@@ -25,6 +26,7 @@ import:
 		DefinitionIndex,
 		DefinitionIndexSeed,
 		DefinitionKind(CallableDefinitionKind, FieldDefinitionKind),
+		EXPORTED_DEFINITION_TARGETS_EMPTY,
 		definition_id_runtime_value,
 		definition_index_advance_to_env,
 		definition_index_all_func_callable_bindings,
@@ -34,8 +36,10 @@ import:
 		definition_index_bootstrap_seed,
 		definition_index_callable_definition_ids_at_span,
 		definition_index_conflict_message,
+		definition_index_constructor_definition_ids_for_export,
 		definition_index_definition_table,
 		definition_index_empty,
+		definition_index_exported_definition_targets,
 		definition_index_find_func_callable_id,
 		definition_index_find_loaded_type_definition_id,
 		definition_index_find_source_definition_id,
@@ -57,8 +61,10 @@ import:
 		definition_table_definition_count,
 		definition_table_definition_id,
 		definition_table_row,
+		definition_table_selective_definition_name,
 		definition_table_type_definition_id,
 		definition_table_type_row,
+		exported_definition_targets_find,
 	../../../src/compiler/stage_06_typecheck/graph/type_identity:
 		type_id_definition_id,
 		type_id_from_definition_table,
@@ -251,26 +257,76 @@ pure func test_definition_index_plans_programs_without_exposing_maps() -> Bool:
 				None:
 					False
 				Some(index):
-					(
-						definition_index_func_callable_id_count(index) == 2
-						and definition_index_source_definition_id_count(index) == 3
-						and definition_index_next_def_id(
-							index,
-						) == definition_index_seed_next_def_id(seed) + 5
-						and definition_index_func_callable_bindings(index, "main").length() == 1
-						and definition_index_func_callable_bindings(index, "answer").length() == 1
-						and definition_index_source_definition_bindings(
-							index,
-							"Signal",
-						).length() == 1
-						and definition_index_source_definition_bindings(
-							index,
-							"Ready",
-						).length() == 1
-						and definition_index_source_definition_bindings(index, "Busy").length() == 1
-						and definition_index_all_func_callable_bindings(index).length() == 2
-						and definition_index_all_source_definition_bindings(index).length() == 3
-					)
+					match module_table_find_id_by_canonical_path(domain.module_table, "signal"):
+						None:
+							False
+						Some(dependency_id):
+							dependency_surface = module_surface_for_program(dependency)
+							exported_targets = definition_index_exported_definition_targets(
+								index,
+								domain.module_table,
+								dependency_id,
+								dependency,
+								dependency_surface,
+								None,
+							).get_or(EXPORTED_DEFINITION_TARGETS_EMPTY)
+							answer_ids = exported_definition_targets_find(
+								exported_targets,
+								"answer",
+							)
+								.map(func(target): target[1])
+								.get_or([])
+							ready_ids = definition_index_constructor_definition_ids_for_export(
+								index,
+								domain.module_table,
+								dependency_id,
+								"Ready",
+								"Signal",
+							).get_or([])
+
+							(
+								definition_index_func_callable_id_count(index) == 2
+								and definition_index_source_definition_id_count(index) == 3
+								and definition_index_next_def_id(
+									index,
+								) == definition_index_seed_next_def_id(seed) + 5
+								and definition_index_func_callable_bindings(
+									index,
+									"main",
+								).length() == 1
+								and definition_index_func_callable_bindings(
+									index,
+									"answer",
+								).length() == 1
+								and definition_index_source_definition_bindings(
+									index,
+									"Signal",
+								).length() == 1
+								and definition_index_source_definition_bindings(
+									index,
+									"Ready",
+								).length() == 1
+								and definition_index_source_definition_bindings(
+									index,
+									"Busy",
+								).length() == 1
+								and definition_index_all_func_callable_bindings(index).length() == 2
+								and definition_index_all_source_definition_bindings(
+									index,
+								).length() == 3
+								and answer_ids.length() == 1
+								and ready_ids.length() == 1
+								and definition_table_selective_definition_name(
+									definition_index_definition_table(index),
+									dependency_id,
+									answer_ids,
+								) == Some("answer")
+								and definition_table_selective_definition_name(
+									definition_index_definition_table(index),
+									dependency_id,
+									answer_ids.concat(ready_ids),
+								).is_none()
+							)
 
 
 pure func test_definition_index_bootstrap_aligns_environment_and_empty_index() -> Bool:
@@ -507,6 +563,14 @@ pure func test_definition_index_rejects_module_id_from_independent_table() -> Bo
 					first.module_table,
 					key,
 				) == Some(definition_id)
+				and definition_index_exported_definition_targets(
+					with_entry,
+					second.module_table,
+					second.target_id,
+					program,
+					module_surface_for_program(program),
+					None,
+				).is_none()
 			)
 		_:
 			False
@@ -640,10 +704,22 @@ pure func test_definition_table_owns_exact_canonical_rows() -> Bool:
 
 private pure func definition_table_issues_scalar_type_ids_by_category() -> Option[Bool]:
 	seed = definition_index_seed()
-	source = source_file("types.brp", "types", "record Item {value: Int}\n\npure func item(): Int: 0")
+	source = source_file(
+		"types.brp",
+		"types",
+		"record Item {value: Int}\n\npure func item(): Int: 0",
+	)
 	start = source_start(source)
-	type_span = source_span(source, start, source_cursor_at(source, 6))
-	callable_span = source_span(source, source_cursor_at(source, 27), source_cursor_at(source, 31))
+	type_span = source_span(
+		source,
+		start,
+		source_cursor_at(source, 6),
+	)
+	callable_span = source_span(
+		source,
+		source_cursor_at(source, 27),
+		source_cursor_at(source, 31),
+	)
 	domain ?= fixture_loaded_module_set(
 		parsed_program("types.brp", "types", source.text),
 		[],
@@ -652,13 +728,7 @@ private pure func definition_table_issues_scalar_type_ids_by_category() -> Optio
 	first_id = definition_index_next_def_id(empty)
 	with_type = insert_source_definition(
 		empty,
-		source_definition_key(
-			domain.target_id,
-			TypeDefinition,
-			"Item",
-			None,
-			type_span,
-		),
+		source_definition_key(domain.target_id, TypeDefinition, "Item", None, type_span),
 		first_id,
 	)
 	with_callable = insert_callable(

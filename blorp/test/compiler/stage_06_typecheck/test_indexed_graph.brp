@@ -39,6 +39,7 @@ import:
 		indexed_graph_select_dependencies,
 		indexed_graph_select_dependency_scopes,
 		indexed_graph_select_dependency_scopes_by_id,
+		indexed_graph_source_name_table,
 		indexed_graph_target,
 		indexed_graph_target_scope,
 		prepared_module_identity,
@@ -47,6 +48,12 @@ import:
 		prepared_module_scope_id,
 		prepared_module_scope_module,
 		prepared_module_scopes_are_compatible,
+	../../../src/compiler/stage_06_typecheck/graph/source_name_table:
+		source_name_ids_equal,
+		source_name_table,
+		source_name_table_count,
+		source_name_table_find_id,
+		source_name_table_spelling,
 	../../../src/compiler/stage_06_typecheck/type_system/env: ENV_EMPTY
 	../typecheck_test_support as TypecheckTestSupport
 	memory: get_mem_stats, reset_mem_stats
@@ -159,6 +166,107 @@ pure func test_indexed_graph_owns_canonical_modules_and_definition_index() -> Bo
 				and indexed_graph_find_dependency(graph, "math").is_none()
 				and definition_index_func_callable_id_count(definition_index) == 2
 				and definition_index_next_def_id(definition_index) == initial_next_def_id + 2
+			)
+		Err(_):
+			False
+
+
+pure func test_source_name_table_issues_stable_dense_ids() -> Bool:
+	table = source_name_table(["map", "List", "map"])
+	first_map = source_name_table_find_id(table, "map")
+	second_map = source_name_table_find_id(table, "map")
+
+	match (first_map, second_map, source_name_table_find_id(table, "List")):
+		(Some(first), Some(second), Some(list_name)):
+			(
+				source_name_table_count(table) == 2
+				and source_name_ids_equal(first, second)
+				and not source_name_ids_equal(first, list_name)
+				and source_name_table_spelling(table, first) == Some("map")
+				and source_name_table_spelling(table, list_name) == Some("List")
+				and source_name_table_find_id(table, "missing").is_none()
+			)
+		_:
+			False
+
+
+pure func test_indexed_graph_catalogs_qualified_aliases_and_local_declarations() -> Bool:
+	target = fixture_module_load_candidate(
+		"src/main.brp",
+		"app/main",
+		"import:\n\tpkg/math as Math\n\tpkg/text\n\nfunc main(args: List[String]) -> Int:\n\tMath.answer()",
+	)
+	dependency = fixture_module_load_candidate(
+		"src/math.brp",
+		"pkg/math",
+		"pure func answer() -> Int:\n\t42",
+	)
+	default_alias_dependency = fixture_module_load_candidate(
+		"src/text.brp",
+		"pkg/text",
+		"pure func empty() -> String:\n\t\"\"",
+	)
+
+	match (
+		indexed_graph_build(
+			target,
+			[dependency, default_alias_dependency],
+		)
+	):
+		Ok(graph):
+			table = indexed_graph_source_name_table(graph)
+			alias_name = source_name_table_find_id(table, "Math")
+			default_alias_name = source_name_table_find_id(table, "text")
+			main_name = source_name_table_find_id(table, "main")
+			answer_name = source_name_table_find_id(table, "answer")
+			empty_name = source_name_table_find_id(table, "empty")
+
+			match (alias_name, default_alias_name):
+				(Some(alias_id), Some(default_alias_id)):
+					(
+						source_name_table_count(table) == 5
+						and source_name_table_spelling(table, alias_id) == Some("Math")
+						and source_name_table_spelling(table, default_alias_id) == Some("text")
+						and main_name.is_some()
+						and answer_name.is_some()
+						and empty_name.is_some()
+						and source_name_table_find_id(table, "missing").is_none()
+					)
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_indexed_graph_catalogs_every_module_local_name_kind() -> Bool:
+	target = fixture_module_load_candidate(
+		"src/main.brp",
+		"app/main",
+		"record Box {value: Int}\n\nunion Signal:\n\tReady\n\n" + "type Scalar = builtin\n\ntype alias AnswerAlias = Int\n\n" + "pure func answer() -> Int:\n\t42\n\n" + "foreign:\n\tpure func native_floor(value: Float) -> Float = \"floor\"\n\n" + "count: Int = 1\n\ntrait Measure:\n\tpure func measure(value: Self) -> Int\n\n" + "private pure func hidden() -> Int:\n\t0\n\nfunc main(args: List[String]) -> Int:\n\t0",
+	)
+
+	match indexed_graph_build(target, []):
+		Ok(graph):
+			table = indexed_graph_source_name_table(graph)
+			expected_names = [
+				"Box",
+				"Signal",
+				"Ready",
+				"Scalar",
+				"AnswerAlias",
+				"answer",
+				"native_floor",
+				"count",
+				"Measure",
+				"hidden",
+				"main",
+			]
+
+			(
+				source_name_table_count(table) == expected_names.length()
+				and expected_names.all(func(name): source_name_table_find_id(table, name).is_some())
+				and source_name_table_find_id(table, "value").is_none()
+				and source_name_table_find_id(table, "measure").is_none()
 			)
 		Err(_):
 			False
@@ -848,6 +956,18 @@ func test_indexed_graph_releases_owned_values() -> Bool:
 tests: TestSuite = {
 	description = "Compiler indexed graph",
 	tests = [
+		(
+			"source-name table issues stable dense IDs",
+			test_source_name_table_issues_stable_dense_ids,
+		),
+		(
+			"catalogs qualified aliases and local declarations",
+			test_indexed_graph_catalogs_qualified_aliases_and_local_declarations,
+		),
+		(
+			"catalogs every module-local name kind",
+			test_indexed_graph_catalogs_every_module_local_name_kind,
+		),
 		(
 			"owns canonical modules and definition index",
 			test_indexed_graph_owns_canonical_modules_and_definition_index,

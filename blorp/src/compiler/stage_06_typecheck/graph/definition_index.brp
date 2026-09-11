@@ -34,6 +34,20 @@ import:
 		loaded_module_program,
 		loaded_module_set_modules,
 		loaded_module_set_target,
+	../../stage_04_modules/module_surface:
+		ModuleSurface,
+		ModuleSurfaceSymbol,
+		ModuleSurfaceSymbolKind(
+			FunctionSurfaceSymbol,
+			ImplMethodSurfaceSymbol,
+			RecordSurfaceSymbol,
+			TraitMethodSurfaceSymbol,
+			TraitSurfaceSymbol,
+			TypeAliasSurfaceSymbol,
+			TypeSurfaceSymbol,
+			VariableSurfaceSymbol,
+		),
+		module_surface_symbols_with_spans,
 	../../stage_04_modules/module_table:
 		ModuleId,
 		ModuleTable,
@@ -75,6 +89,7 @@ import:
 		source_definition_key_owner,
 		source_definition_key_span,
 	list: repeat
+	set: Set
 
 
 opaque type DefinitionIndexSeed = Int
@@ -91,7 +106,9 @@ opaque type ResolvedFieldIdentity = Int
 
 private MISSING_RESOLVED_FIELD_IDENTITY_VALUE: Int = -1
 
-MISSING_RESOLVED_FIELD_IDENTITY: ResolvedFieldIdentity = into_opaque ResolvedFieldIdentity(MISSING_RESOLVED_FIELD_IDENTITY_VALUE)
+MISSING_RESOLVED_FIELD_IDENTITY: ResolvedFieldIdentity = into_opaque ResolvedFieldIdentity(
+	MISSING_RESOLVED_FIELD_IDENTITY_VALUE
+)
 
 
 enum DefinitionKind:
@@ -116,6 +133,31 @@ record DefinitionRow {
 private type alias FuncCallableNameBuckets = Dict[String, List[DefinitionId]]
 
 private type alias SourceDefinitionNameBuckets = Dict[String, List[DefinitionId]]
+
+
+private record ExportedDefinitionTarget {
+	symbol: ModuleSurfaceSymbol,
+	definition_ids: List[DefinitionId]
+}
+
+
+private type alias ExportedDefinitionTargetBuckets = Dict[String, ExportedDefinitionTarget]
+
+opaque type ExportedDefinitionTargets = ExportedDefinitionTargetBuckets
+
+EXPORTED_DEFINITION_TARGETS_EMPTY: ExportedDefinitionTargets = into_opaque ExportedDefinitionTargets(
+	{}
+)
+
+
+pure func exported_definition_targets_find(
+	targets: ExportedDefinitionTargets,
+	name: String,
+) -> Option[(ModuleSurfaceSymbol, List[DefinitionId])]:
+	representation: ExportedDefinitionTargetBuckets = from_opaque ExportedDefinitionTargets(targets)
+	representation
+		.get(name)
+		.map(func(target): (target.symbol, target.definition_ids))
 
 
 private record DefinitionTableRep {
@@ -442,11 +484,7 @@ pure func definition_table_field_id(
 	table: DefinitionTable,
 	runtime_definition_id: Int,
 ) -> Option[FieldId]:
-	match definition_table_id_with_kind(
-		table,
-		runtime_definition_id,
-		FieldDefinitionKind,
-	):
+	match definition_table_id_with_kind(table, runtime_definition_id, FieldDefinitionKind):
 		Some(id):
 			Some(into_opaque FieldId(definition_id_runtime_value(id)))
 		None:
@@ -465,9 +503,7 @@ pure func resolved_field_identity(id: FieldId) -> ResolvedFieldIdentity:
 	into_opaque ResolvedFieldIdentity(field_id_definition_id(id))
 
 
-pure func resolved_field_identity_from_optional_id(
-	id: Option[FieldId],
-) -> ResolvedFieldIdentity:
+pure func resolved_field_identity_from_optional_id(id: Option[FieldId]) -> ResolvedFieldIdentity:
 	match id:
 		Some(found):
 			resolved_field_identity(found)
@@ -475,9 +511,7 @@ pure func resolved_field_identity_from_optional_id(
 			MISSING_RESOLVED_FIELD_IDENTITY
 
 
-pure func resolved_field_identity_field_id(
-	identity: ResolvedFieldIdentity,
-) -> Option[FieldId]:
+pure func resolved_field_identity_field_id(identity: ResolvedFieldIdentity) -> Option[FieldId]:
 	value = from_opaque ResolvedFieldIdentity(identity)
 
 	if value == MISSING_RESOLVED_FIELD_IDENTITY_VALUE:
@@ -528,10 +562,7 @@ pure func definition_table_implementation_row(
 	definition_table_row_with_kind(table, runtime_definition_id, ImplementationDefinitionKind)
 
 
-pure func definition_table_field_row(
-	table: DefinitionTable,
-	id: FieldId,
-) -> Option[DefinitionRow]:
+pure func definition_table_field_row(table: DefinitionTable, id: FieldId) -> Option[DefinitionRow]:
 	definition_table_row_with_kind(table, field_id_definition_id(id), FieldDefinitionKind)
 
 
@@ -1257,6 +1288,239 @@ pure func definition_index_find_source_definition_id(
 		issuing_table,
 	):
 		definition_index_rep_find_source_definition_id(representation, key)
+	else:
+		None
+
+
+private pure func definition_kind_for_surface_symbol(
+	kind: ModuleSurfaceSymbolKind,
+) -> Option[DefinitionKind]:
+	match kind:
+		FunctionSurfaceSymbol | ImplMethodSurfaceSymbol:
+			Some(CallableDefinitionKind)
+		VariableSurfaceSymbol:
+			Some(GlobalDefinitionKind)
+		TypeSurfaceSymbol | RecordSurfaceSymbol | TypeAliasSurfaceSymbol:
+			Some(TypeDefinitionKind)
+		TraitSurfaceSymbol:
+			Some(TraitDefinitionKind)
+		TraitMethodSurfaceSymbol:
+			None
+
+
+private pure func definition_index_ids_for_kind_and_name(
+	index: DefinitionIndexRep,
+	module_id: ModuleId,
+	kind: DefinitionKind,
+	name: String,
+) -> List[DefinitionId]:
+	if kind == CallableDefinitionKind:
+		index.func_callable_ids_by_module_and_name
+			.get_or(module_id_table_index(module_id), {})
+			.get_or(name, [])
+	else:
+		index.source_definition_ids_by_module_and_name
+			.get_or(module_id_table_index(module_id), {})
+			.get_or(name, [])
+
+
+private pure func exported_definition_targets_for_exports(
+	representation: DefinitionIndexRep,
+	module_id: ModuleId,
+	program: ParsedProgram,
+	surface: ModuleSurface,
+	requested_exports: List[ModuleSurfaceSymbol],
+) -> ExportedDefinitionTargets:
+	var result: ExportedDefinitionTargetBuckets = {}
+
+	for symbol in requested_exports:
+		if not result.contains(symbol.name):
+			result = result.set(
+				symbol.name,
+				{
+					symbol = symbol,
+					definition_ids = []
+				},
+			)
+
+	requested_surface = { surface | exports = requested_exports }
+
+	for pair in module_surface_symbols_with_spans(program, requested_surface):
+		symbol = pair[0]
+		expected_span = pair[1]
+
+		match definition_kind_for_surface_symbol(symbol.kind):
+			Some(expected_kind):
+				for id in definition_index_ids_for_kind_and_name(
+					representation,
+					module_id,
+					expected_kind,
+					symbol.name,
+				):
+					match definition_index_rep_row(representation, id):
+						Some(row):
+							if (
+								module_ids_equal(row.module_id, module_id)
+								and row.kind == expected_kind
+								and row.name == symbol.name
+								and source_spans_equal(row.span, expected_span)
+							):
+								match result.get(symbol.name):
+									Some(target):
+										result = result.set(
+											symbol.name,
+											{ target |
+												definition_ids = target.definition_ids.append(id)
+											},
+										)
+									None:
+										void
+						None:
+							void
+			None:
+				void
+
+	into_opaque ExportedDefinitionTargets(result)
+
+
+-- Build one public export bucket per prepared module. Binding then reuses the
+-- bucket list for every selective import instead of rescanning declarations or
+-- allocating a new overload list per importer. Qualified-only graphs reuse the
+-- shared empty value and do no export scan or per-module map allocation.
+pure func definition_index_exported_definition_targets(
+	index: DefinitionIndex,
+	issuing_table: ModuleTable,
+	module_id: ModuleId,
+	program: ParsedProgram,
+	surface: ModuleSurface,
+	requested_names: Option[Set[String]],
+) -> Option[ExportedDefinitionTargets]:
+	representation: DefinitionIndexRep = from_opaque DefinitionIndex(index)
+
+	if not module_tables_are_compatible(
+		definition_table_module_table(representation.definition_table),
+		issuing_table,
+	):
+		None
+	else:
+		match requested_names:
+			Some(names):
+				if names.is_empty():
+					Some(EXPORTED_DEFINITION_TARGETS_EMPTY)
+				else:
+					Some(
+						exported_definition_targets_for_exports(
+							representation,
+							module_id,
+							program,
+							surface,
+							surface.exports.filter(func(symbol): names.contains(symbol.name)),
+						),
+					)
+			None:
+				Some(
+					exported_definition_targets_for_exports(
+						representation,
+						module_id,
+						program,
+						surface,
+						surface.exports,
+					),
+				)
+
+
+-- Constructor syntax is nested under an already-validated exported union.
+-- Include the exact owner so a same-named field or constructor from another
+-- union cannot be retained.
+pure func definition_index_constructor_definition_ids_for_export(
+	index: DefinitionIndex,
+	issuing_table: ModuleTable,
+	module_id: ModuleId,
+	name: String,
+	owner_name: String,
+) -> Option[List[DefinitionId]]:
+	representation: DefinitionIndexRep = from_opaque DefinitionIndex(index)
+
+	if not module_tables_are_compatible(
+		definition_table_module_table(representation.definition_table),
+		issuing_table,
+	):
+		None
+	else:
+		candidates = definition_index_ids_for_kind_and_name(
+			representation,
+			module_id,
+			ConstructorDefinitionKind,
+			name,
+		)
+		var every_candidate_matches: Bool = not candidates.is_empty()
+
+		for id in candidates:
+			match definition_index_rep_row(representation, id):
+				Some(row):
+					if not ((
+						module_ids_equal(row.module_id, module_id)
+						and row.kind == ConstructorDefinitionKind
+						and row.name == name
+						and row.owner_name == Some(owner_name)
+					)):
+						every_candidate_matches = False
+				None:
+					every_candidate_matches = False
+
+		if every_candidate_matches:
+			Some(candidates)
+		else:
+			var result: List[DefinitionId] = []
+
+			for id in candidates:
+				match definition_index_rep_row(representation, id):
+					Some(row):
+						if (
+							module_ids_equal(row.module_id, module_id)
+							and row.kind == ConstructorDefinitionKind
+							and row.name == name
+							and row.owner_name == Some(owner_name)
+						):
+							result = result.append(id)
+					None:
+						void
+
+			if result.is_empty():
+				None
+			else:
+				Some(result.sort_by(definition_id_runtime_value))
+
+
+-- Definition-bearing late products use this projection only at an external
+-- or compatibility boundary. It also validates that an alleged overload set
+-- belongs to one module/name pair in this table's provenance domain.
+pure func definition_table_selective_definition_name(
+	table: DefinitionTable,
+	module_id: ModuleId,
+	definition_ids: List[DefinitionId],
+) -> Option[String]:
+	var source_name: Option[String] = None
+	var valid: Bool = not definition_ids.is_empty()
+
+	for id in definition_ids:
+		if valid:
+			match definition_table_row(table, id):
+				Some(row):
+					if not module_ids_equal(row.module_id, module_id):
+						valid = False
+					else:
+						match source_name:
+							Some(expected):
+								if row.name != expected:
+									valid = False
+							None:
+								source_name = Some(row.name)
+				None:
+					valid = False
+
+	if valid:
+		source_name
 	else:
 		None
 

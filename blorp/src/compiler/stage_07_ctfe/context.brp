@@ -19,11 +19,19 @@ import:
 		TypedProgram,
 		typed_decls_function_infos,
 	../stage_06_typecheck/graph/definition_index:
+		DefinitionId,
 		DefinitionTable,
 		definition_table_module_table,
+		definition_table_selective_definition_name,
 		definition_tables_share_provenance,
 	../stage_06_typecheck/modules/import_binding:
-		ImportBinding(QualifiedModuleBinding, SelectiveDefinitionBinding),
+		ImportBinding(
+			GraphQualifiedModuleBinding,
+			GraphSelectiveDefinitionBinding,
+			GraphSelectiveTraitMethodBinding,
+			StandaloneQualifiedModuleBinding,
+			StandaloneSelectiveDefinitionBinding,
+		),
 	env: CTFE_ENV_EMPTY, ctfe_env_has_binding, ctfe_lookup_value
 	value: CtfeEnv, CtfeValue
 
@@ -37,7 +45,8 @@ record CtfeFunction {
 
 union CtfeImportBinding:
 	CtfeQualifiedModuleBinding(String, ModuleId)
-	CtfeSelectiveDefinitionBinding(String, ModuleId, String)
+	CtfeSelectiveDefinitionBinding(String, ModuleId, List[DefinitionId])
+	CtfeStandaloneSelectiveDefinitionBinding(String, ModuleId, String)
 
 
 private union CtfeImportedProgramRep:
@@ -428,15 +437,21 @@ pure func ctfe_context_with_module_global_env(
 
 pure func ctfe_import_bindings_for_module_table(
 	module_table: ModuleTable,
+	definition_table: DefinitionTable,
 	bindings: List[ImportBinding],
 ) -> Option[List[CtfeImportBinding]]:
 	var result: List[CtfeImportBinding] = []
-	var failed: Bool = False
+	var failed: Bool = not module_tables_are_compatible(
+		module_table,
+		definition_table_module_table(definition_table),
+	)
 
 	for binding in bindings:
 		if not failed:
 			match binding:
-				QualifiedModuleBinding(local_name, module_path):
+				GraphQualifiedModuleBinding(local_name, module_id):
+					result = result.append(CtfeQualifiedModuleBinding(local_name, module_id))
+				StandaloneQualifiedModuleBinding(local_name, module_path):
 					match module_table_find_id_by_canonical_path(module_table, module_path):
 						Some(module_id):
 							result = result.append(
@@ -447,11 +462,28 @@ pure func ctfe_import_bindings_for_module_table(
 							)
 						None:
 							failed = True
-				SelectiveDefinitionBinding(local_name, module_path, source_name):
+				GraphSelectiveDefinitionBinding(local_name, module_id, definition_ids):
+					if definition_table_selective_definition_name(
+						definition_table,
+						module_id,
+						definition_ids,
+					).is_some():
+						result = result.append(
+							CtfeSelectiveDefinitionBinding(
+								local_name,
+								module_id,
+								definition_ids,
+							),
+						)
+					else:
+						failed = True
+				GraphSelectiveTraitMethodBinding(_, _, _):
+					void
+				StandaloneSelectiveDefinitionBinding(local_name, module_path, source_name):
 					match module_table_find_id_by_canonical_path(module_table, module_path):
 						Some(module_id):
 							result = result.append(
-								CtfeSelectiveDefinitionBinding(
+								CtfeStandaloneSelectiveDefinitionBinding(
 									local_name,
 									module_id,
 									source_name,
@@ -476,7 +508,7 @@ pure func ctfe_context_with_import_bindings(
 		match binding:
 			CtfeQualifiedModuleBinding(local_name, module_id):
 				result = ctfe_context_with_module_alias(result, local_name, module_id)
-			CtfeSelectiveDefinitionBinding(_, _, _):
+			CtfeSelectiveDefinitionBinding(_, _, _) | CtfeStandaloneSelectiveDefinitionBinding(_, _, _):
 				void
 
 	result

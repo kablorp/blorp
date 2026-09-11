@@ -20,10 +20,12 @@ import:
 		ModuleTable,
 		module_ids_equal,
 		module_table,
+		module_table_canonical_path,
 		module_table_count,
 		module_table_find_id_by_canonical_path,
 		module_table_id_at,
 		module_table_resolved_identity,
+		module_tables_are_compatible,
 	diagnostic: TypecheckDiagnostic, typecheck_diagnostic
 	graph/definition_identity:
 		FuncCallableKey,
@@ -33,6 +35,7 @@ import:
 		source_definition_key_description,
 		source_definition_key_module_id,
 	graph/definition_index:
+		DefinitionId,
 		DefinitionIndex,
 		DefinitionIndexSeed,
 		DefinitionTable,
@@ -41,6 +44,7 @@ import:
 		definition_index_bootstrap_from_base_env,
 		definition_index_bootstrap_seed,
 		definition_index_conflict_message_for_module,
+		definition_index_constructor_definition_ids_for_export,
 		definition_index_definition_table,
 		definition_index_empty,
 		definition_index_find_func_callable_id,
@@ -52,6 +56,8 @@ import:
 		definition_index_next_def_id,
 		definition_index_rebase_module_table,
 		definition_index_seed_from_index,
+		definition_table_module_table,
+		definition_tables_share_provenance,
 	graph/indexed_graph:
 		PreparedModuleScope,
 		prepared_module_scope_canonical_path,
@@ -60,6 +66,7 @@ import:
 		prepared_module_scope_identity,
 		prepared_module_scope_module_table,
 		prepared_module_scope_origin,
+		prepared_module_scope_source_name_table,
 		prepared_module_scopes_are_compatible,
 		prepared_module_scopes_select_same_module,
 	modules/module_view:
@@ -71,6 +78,7 @@ import:
 			LocalNameAlreadyPresent,
 			LocalNameConflictsWithAlias,
 			LocalNameConflictsWithImportedName,
+			LocalNameInvalidSourceName,
 		),
 		ModuleAliasRegistration(
 			ModuleAliasAdded,
@@ -78,6 +86,7 @@ import:
 			ModuleAliasConflictsWithAlias,
 			ModuleAliasConflictsWithImportedName,
 			ModuleAliasConflictsWithLocalName,
+			ModuleAliasInvalidTarget,
 		),
 		ModuleView,
 		SelectiveNameRegistration(
@@ -85,17 +94,23 @@ import:
 			SelectiveNameConflictsWithAlias,
 			SelectiveNameConflictsWithImportedName,
 			SelectiveNameConflictsWithLocalName,
+			SelectiveNameInvalidTarget,
 		),
 		TopLevelNameKind,
-		module_view_add_imported_module,
+		module_view_find_graph_module_alias,
 		module_view_find_imported_name,
 		module_view_find_local_name,
-		module_view_find_module_alias,
-		module_view_has_imported_module,
+		module_view_find_standalone_module_alias,
+		module_view_for_graph,
+		module_view_has_graph_source_names,
 		module_view_record_imported_constructor,
+		module_view_register_graph_selective_trait_method,
 		module_view_register_local_name,
-		module_view_register_module_alias,
+		module_view_register_local_name_for_graph,
+		module_view_register_module_alias_target,
 		module_view_register_selective_name,
+		module_view_register_selective_name_for_graph,
+		module_view_register_standalone_module_alias,
 		module_view_without_unqualified_names,
 		top_level_name_kind_is_trait,
 		top_level_name_kind_label,
@@ -362,6 +377,10 @@ private pure func typecheck_module_scope_table(scope: TypecheckModuleScope) -> O
 			Some(definition_index_module_table(index))
 		ReservedModuleScope(prepared_scope):
 			Some(prepared_module_scope_module_table(prepared_scope))
+
+
+pure func typecheck_state_module_table(state: TypecheckState) -> Option[ModuleTable]:
+	typecheck_module_scope_table(state.module_scope)
 
 
 private pure func typecheck_module_scope_id(scope: TypecheckModuleScope) -> Option[ModuleId]:
@@ -686,22 +705,16 @@ pure func typecheck_state_is_source_package(state: TypecheckState) -> Bool:
 	module_origin_is_source_package(typecheck_state_module_origin(state))
 
 
-pure func typecheck_state_add_imported_module(
-	state: TypecheckState,
-	module_path: String,
-) -> TypecheckState:
-	{ state | module_view = module_view_add_imported_module(state.module_view, module_path) }
-
-
-pure func typecheck_state_has_imported_module(state: TypecheckState, module_path: String) -> Bool:
-	module_view_has_imported_module(state.module_view, module_path)
-
-
 pure func typecheck_state_find_module_alias(
 	state: TypecheckState,
 	alias_name: String,
 ) -> Option[String]:
-	module_view_find_module_alias(state.module_view, alias_name)
+	match module_view_find_graph_module_alias(state.module_view, alias_name):
+		Some(module_id):
+			table ?= typecheck_module_scope_table(state.module_scope)
+			module_table_canonical_path(table, module_id)
+		None:
+			module_view_find_standalone_module_alias(state.module_view, alias_name)
 
 
 pure func typecheck_state_find_imported_name(
@@ -723,7 +736,21 @@ pure func typecheck_state_remember_top_level_name(
 	name: String,
 	kind: TopLevelNameKind,
 ) -> TypecheckState:
-	match module_view_register_local_name(state.module_view, name, kind):
+	registration = if module_view_has_graph_source_names(state.module_view):
+		match typecheck_module_scope_table(state.module_scope):
+			Some(module_table):
+				module_view_register_local_name_for_graph(
+					state.module_view,
+					module_table,
+					name,
+					kind,
+				)
+			None:
+				LocalNameInvalidSourceName
+	else:
+		module_view_register_local_name(state.module_view, name, kind)
+
+	match registration:
 		LocalNameAdded(view):
 			{ state | module_view = view }
 		LocalNameAlreadyPresent(_):
@@ -742,18 +769,23 @@ pure func typecheck_state_remember_top_level_name(
 					kind,
 				) + " '" + name + "' declared in this module conflicts with imported name from '" + binding.module_path + "'",
 			)
+		LocalNameInvalidSourceName:
+			typecheck_state_add_error(
+				state,
+				"internal typecheck error: top-level name '" + name + "' is not " + "cataloged by the active module graph",
+			)
 
 
 pure func typecheck_state_clear_module_name_indexes(state: TypecheckState) -> TypecheckState:
 	{ state | module_view = module_view_without_unqualified_names(state.module_view) }
 
 
-pure func typecheck_state_register_module_alias(
+private pure func typecheck_state_apply_module_alias_registration(
 	state: TypecheckState,
 	alias_name: String,
-	canonical_name: String,
+	registration: ModuleAliasRegistration,
 ) -> TypecheckState:
-	match module_view_register_module_alias(state.module_view, alias_name, canonical_name):
+	match registration:
 		ModuleAliasAlreadyPresent:
 			state
 		ModuleAliasConflictsWithAlias(existing_module):
@@ -773,8 +805,59 @@ pure func typecheck_state_register_module_alias(
 					kind,
 				) + " '" + alias_name + "' declared in this module",
 			)
+		ModuleAliasInvalidTarget:
+			typecheck_state_add_error(
+				state,
+				(
+					"internal typecheck error: module alias target does not belong to the active "
+					+ "module graph"
+				),
+			)
 		ModuleAliasAdded(view):
 			{ state | module_view = view }
+
+
+pure func typecheck_state_register_graph_module_alias(
+	state: TypecheckState,
+	alias_name: String,
+	module_path: String,
+	issuing_table: ModuleTable,
+	module_id: ModuleId,
+) -> TypecheckState:
+	match typecheck_module_scope_table(state.module_scope):
+		Some(current_table):
+			typecheck_state_apply_module_alias_registration(
+				state,
+				alias_name,
+				module_view_register_module_alias_target(
+					state.module_view,
+					current_table,
+					alias_name,
+					module_path,
+					issuing_table,
+					module_id,
+				),
+			)
+		None:
+			typecheck_state_add_error(
+				state,
+				(
+					"internal typecheck error: module alias target does not belong to the active "
+					+ "module graph"
+				),
+			)
+
+
+pure func typecheck_state_register_standalone_module_alias(
+	state: TypecheckState,
+	alias_name: String,
+	canonical_name: String,
+) -> TypecheckState:
+	typecheck_state_apply_module_alias_registration(
+		state,
+		alias_name,
+		module_view_register_standalone_module_alias(state.module_view, alias_name, canonical_name),
+	)
 
 
 pure func typecheck_state_register_imported_name(
@@ -783,12 +866,119 @@ pure func typecheck_state_register_imported_name(
 	module_path: String,
 	original_name: String,
 ) -> ImportedNameRegistration:
-	match module_view_register_selective_name(
+	registration = module_view_register_selective_name(
 		state.module_view,
 		local_name,
 		module_path,
 		original_name,
-	):
+	)
+	typecheck_state_apply_selective_name_registration(
+		state,
+		local_name,
+		module_path,
+		original_name,
+		registration,
+	)
+
+
+pure func typecheck_state_register_graph_imported_name(
+	state: TypecheckState,
+	local_name: String,
+	module_path: String,
+	original_name: String,
+	issuing_definition_table: DefinitionTable,
+	module_id: ModuleId,
+	definition_ids: List[DefinitionId],
+) -> ImportedNameRegistration:
+	index = typecheck_module_scope_index(state.module_scope)
+	definition_table = index.map(definition_index_definition_table)
+
+	registration = match definition_table:
+		Some(table):
+			module_view_register_selective_name_for_graph(
+				state.module_view,
+				table,
+				issuing_definition_table,
+				local_name,
+				module_path,
+				original_name,
+				module_id,
+				definition_ids,
+			)
+		_:
+			SelectiveNameInvalidTarget
+
+	typecheck_state_apply_selective_name_registration(
+		state,
+		local_name,
+		module_path,
+		original_name,
+		registration,
+	)
+
+
+-- Trait methods are identified explicitly by their module-surface kind before
+-- reaching this boundary. A trait-only spelling owns TraitMethodIds rather
+-- than DefinitionIds, so its graph import binding explicitly retains the
+-- source name until trait identities are available at this boundary. If the
+-- spelling also denotes ordinary definitions, retain those exact IDs in a
+-- separate graph binding while the visibility row continues to expose the
+-- method.
+pure func typecheck_state_register_graph_imported_trait_method(
+	state: TypecheckState,
+	local_name: String,
+	module_path: String,
+	original_name: String,
+	issuing_definition_table: DefinitionTable,
+	module_id: ModuleId,
+	definition_ids: List[DefinitionId],
+) -> ImportedNameRegistration:
+	index = typecheck_module_scope_index(state.module_scope)
+	definition_table = index.map(definition_index_definition_table)
+
+	registration = match definition_table:
+		Some(table):
+			if definition_ids.is_empty():
+				module_view_register_graph_selective_trait_method(
+					state.module_view,
+					table,
+					issuing_definition_table,
+					local_name,
+					module_path,
+					original_name,
+					module_id,
+				)
+			else:
+				module_view_register_selective_name_for_graph(
+					state.module_view,
+					table,
+					issuing_definition_table,
+					local_name,
+					module_path,
+					original_name,
+					module_id,
+					definition_ids,
+				)
+		None:
+			SelectiveNameInvalidTarget
+
+	typecheck_state_apply_selective_name_registration(
+		state,
+		local_name,
+		module_path,
+		original_name,
+		registration,
+	)
+
+
+private pure func typecheck_state_apply_selective_name_registration(
+	state: TypecheckState,
+	local_name: String,
+	module_path: String,
+	original_name: String,
+	registration: SelectiveNameRegistration,
+) -> ImportedNameRegistration:
+	match registration:
 		SelectiveNameAdded(view):
 			{
 				state = { state | module_view = view },
@@ -823,6 +1013,14 @@ pure func typecheck_state_register_imported_name(
 					"imported name '" + local_name + "' conflicts with " + top_level_name_kind_label(
 						kind,
 					) + " '" + local_name + "' declared in this module",
+				),
+				registered = False
+			}
+		SelectiveNameInvalidTarget:
+			{
+				state = typecheck_state_add_error(
+					state,
+					"internal typecheck error: selective import target '" + original_name + "' from module '" + module_path + "' does not belong to the active module and definition graph",
 				),
 				registered = False
 			}
@@ -862,6 +1060,92 @@ pure func typecheck_state_register_imported_constructor(
 		}
 	else:
 		registration
+
+
+pure func typecheck_state_register_graph_imported_constructor(
+	state: TypecheckState,
+	local_name: String,
+	module_path: String,
+	parent_local_name: String,
+	parent_name: String,
+	original_name: String,
+	issuing_definition_table: DefinitionTable,
+	module_id: ModuleId,
+) -> ImportedNameRegistration:
+	index = typecheck_module_scope_index(state.module_scope)
+	active_definition_table = index.map(definition_index_definition_table)
+
+	registration_result = match (index, active_definition_table):
+		(Some(active_index), Some(active_table)):
+			if not definition_tables_share_provenance(active_table, issuing_definition_table):
+				typecheck_state_apply_selective_name_registration(
+					state,
+					local_name,
+					module_path,
+					original_name,
+					SelectiveNameInvalidTarget,
+				)
+			else:
+				match definition_index_constructor_definition_ids_for_export(
+					active_index,
+					definition_table_module_table(issuing_definition_table),
+					module_id,
+					original_name,
+					parent_name,
+				):
+					Some(ids):
+						typecheck_state_apply_selective_name_registration(
+							state,
+							local_name,
+							module_path,
+							original_name,
+							module_view_register_selective_name_for_graph(
+								state.module_view,
+								active_table,
+								issuing_definition_table,
+								local_name,
+								module_path,
+								original_name,
+								module_id,
+								ids,
+							),
+						)
+					None:
+						{
+							state = typecheck_state_add_error(
+								state,
+								"constructor '" + original_name + "' is not exported by type '" + parent_name + "' from module '" + module_path + "'",
+							),
+							registered = False
+						}
+		_:
+			typecheck_state_apply_selective_name_registration(
+				state,
+				local_name,
+				module_path,
+				original_name,
+				SelectiveNameInvalidTarget,
+			)
+
+	if registration_result.registered:
+		binding: ImportedConstructorBinding = {
+			local_name = local_name,
+			module_path = module_path,
+			parent_local_name = parent_local_name,
+			parent_name = parent_name,
+			original_name = original_name
+		}
+		{
+			state = { registration_result.state |
+				module_view = module_view_record_imported_constructor(
+					registration_result.state.module_view,
+					binding,
+				)
+			},
+			registered = True
+		}
+	else:
+		registration_result
 
 
 pure func typecheck_state_add_known_type_name(
@@ -1083,6 +1367,9 @@ pure func typecheck_state_enter_prepared_module_scope(
 			aligned_index = definition_index_advance_to_env(definition_index, state.env)
 			{ state |
 				env = { state.env | next_def_id = definition_index_next_def_id(aligned_index) },
+				module_view = module_view_for_graph(
+					prepared_module_scope_source_name_table(prepared_scope),
+				),
 				module_scope = typecheck_module_scope(ReservedModuleScope(prepared_scope))
 			}
 		ExtensibleModuleScope(_, _, _, _):
@@ -1176,6 +1463,33 @@ pure func typecheck_state_is_reserved_for_scope(
 	match representation:
 		ReservedModuleScope(current_scope):
 			prepared_module_scopes_select_same_module(current_scope, expected_scope)
+		UnscopedModuleScope(_, _):
+			False
+		ExtensibleModuleScope(_, _, _, _):
+			False
+
+
+-- Exact graph admission is intentionally narrower than structural scope
+-- compatibility: raw ModuleId values are meaningful only in the allocation
+-- that issued them.
+pure func typecheck_state_is_reserved_for_exact_scope(
+	state: TypecheckState,
+	expected_scope: PreparedModuleScope,
+) -> Bool:
+	representation = typecheck_module_scope_rep(state.module_scope)
+
+	match representation:
+		ReservedModuleScope(current_scope):
+			(
+				module_tables_are_compatible(
+					prepared_module_scope_module_table(current_scope),
+					prepared_module_scope_module_table(expected_scope),
+				)
+				and module_ids_equal(
+					prepared_module_scope_id(current_scope),
+					prepared_module_scope_id(expected_scope),
+				)
+			)
 		UnscopedModuleScope(_, _):
 			False
 		ExtensibleModuleScope(_, _, _, _):
@@ -1428,6 +1742,22 @@ pure func infer_module_facts_definition_table(facts: InferModuleFacts) -> Option
 
 pure func infer_module_facts_module_id(facts: InferModuleFacts) -> Option[ModuleId]:
 	typecheck_module_scope_id(facts.module_scope)
+
+
+pure func infer_module_facts_module_table(facts: InferModuleFacts) -> Option[ModuleTable]:
+	typecheck_module_scope_table(facts.module_scope)
+
+
+pure func infer_module_facts_find_module_alias(
+	facts: InferModuleFacts,
+	alias_name: String,
+) -> Option[String]:
+	match module_view_find_graph_module_alias(facts.module_view, alias_name):
+		Some(module_id):
+			table ?= typecheck_module_scope_table(facts.module_scope)
+			module_table_canonical_path(table, module_id)
+		None:
+			module_view_find_standalone_module_alias(facts.module_view, alias_name)
 
 
 pure func infer_module_facts_requires_graph_definition(facts: InferModuleFacts) -> Bool:

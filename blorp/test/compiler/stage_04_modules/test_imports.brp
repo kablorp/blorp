@@ -20,7 +20,6 @@ import:
 		typecheck_state_find_module_alias,
 		typecheck_state_find_type_home,
 		typecheck_state_for_origin,
-		typecheck_state_has_imported_module,
 		typecheck_state_has_known_type_name,
 	../../../src/lib/source: SourceFile, source_file
 	test: TestSuite
@@ -69,7 +68,7 @@ pure func register_import_source(
 		state,
 		modules,
 		parsed_program("imports", text),
-	)
+	).state
 
 
 pure func has_imported_name(
@@ -109,11 +108,7 @@ func test_registers_qualified_import_alias() -> Bool:
 		"import:\n\tdict as D\n\nfunc main(): 0",
 	)
 
-	(
-		state.errors.length() == 0
-		and typecheck_state_has_imported_module(state, "dict")
-		and typecheck_state_find_module_alias(state, "D") == Some("dict")
-	)
+	state.errors.length() == 0 and typecheck_state_find_module_alias(state, "D") == Some("dict")
 
 
 func test_registers_default_alias_from_path() -> Bool:
@@ -139,7 +134,6 @@ func test_bare_std_import_matches_canonical_module_path() -> Bool:
 
 	(
 		state.errors.length() == 0
-		and typecheck_state_has_imported_module(state, "parallel_list")
 		and typecheck_state_find_module_alias(state, "ParallelListOps") == Some("parallel_list")
 	)
 
@@ -151,11 +145,7 @@ func test_canonical_std_import_matches_relative_stdlib_surface() -> Bool:
 		"import:\n\tbool: Bool\n\nfunc main(): 0",
 	)
 
-	(
-		state.errors.length() == 0
-		and typecheck_state_has_imported_module(state, "bool")
-		and has_imported_name(state, "Bool", "bool", "Bool")
-	)
+	state.errors.length() == 0 and has_imported_name(state, "Bool", "bool", "Bool")
 
 
 func test_rejects_redundant_std_import_prefix() -> Bool:
@@ -165,10 +155,7 @@ func test_rejects_redundant_std_import_prefix() -> Bool:
 		"import:\n\tstd/parallel_list as ParallelListOps\n\nfunc main(): 0",
 	)
 
-	(
-		state.errors_contain("module 'std/parallel_list' is not loaded for import registration")
-		and not typecheck_state_has_imported_module(state, "std/parallel_list")
-	)
+	state.errors_contain("module 'std/parallel_list' is not loaded for import registration")
 
 
 func test_bare_std_import_does_not_match_package_basename() -> Bool:
@@ -220,10 +207,53 @@ func test_ambiguous_source_module_name_is_order_independent() -> Bool:
 	(
 		left_first.errors == [expected]
 		and right_first.errors == [expected]
-		and not typecheck_state_has_imported_module(left_first, "pkg/left")
-		and not typecheck_state_has_imported_module(left_first, "pkg/right")
-		and not typecheck_state_has_imported_module(right_first, "pkg/left")
-		and not typecheck_state_has_imported_module(right_first, "pkg/right")
+		and typecheck_state_find_module_alias(left_first, "Shared").is_none()
+		and typecheck_state_find_module_alias(right_first, "Shared").is_none()
+	)
+
+
+func test_registration_publishes_only_accepted_canonical_modules() -> Bool:
+	left = importable_module_with_source_name(
+		"pkg/left",
+		"shared",
+		UserModule,
+		"pure func left() -> Int:\n\t1",
+	)
+	right = importable_module_with_source_name(
+		"pkg/right",
+		"shared",
+		UserModule,
+		"pure func right() -> Int:\n\t2",
+	)
+	accepted = register_program_imports(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		[left],
+		parsed_program("imports", "import:\n\tshared\n\nfunc main(): 0"),
+	)
+	ambiguous = register_program_imports(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		[left, right],
+		parsed_program(
+			"imports",
+			"import:\n\tshared\n\nfunc main(): 0",
+		),
+	)
+	forbidden = register_program_imports(
+		typecheck_state_for_origin(TYPECHECK_STDLIB_ORIGIN),
+		[
+			importable_module(
+				"sample",
+				SourcePackageModule("sample"),
+				"pure func value() -> Int:\n\t1",
+			),
+		],
+		parsed_program("imports", "import:\n\tsample\n\nfunc main(): 0"),
+	)
+
+	(
+		accepted.accepted_canonical_module_paths == ["pkg/left"]
+		and ambiguous.accepted_canonical_module_paths.length() == 0
+		and forbidden.accepted_canonical_module_paths.length() == 0
 	)
 
 
@@ -340,6 +370,7 @@ func test_rejects_duplicate_module_imports_and_std_package_imports() -> Bool:
 		[importable_module("dict", StdlibModule, "record Dict {size: Int}")],
 		"import:\n\tdict as D\n\tdict as D2\n\nfunc main(): 0",
 	)
+
 	std_package_state = register_import_source(
 		typecheck_state_for_origin(TYPECHECK_STDLIB_ORIGIN),
 		[importable_module("sample", SourcePackageModule("sample"), "func value() -> Int:\n\t1")],
@@ -353,7 +384,28 @@ func test_rejects_duplicate_module_imports_and_std_package_imports() -> Bool:
 		and std_package_state.errors_contain(
 			"standard library modules cannot import package modules",
 		)
-		and not typecheck_state_has_imported_module(std_package_state, "sample")
+		and typecheck_state_find_module_alias(std_package_state, "sample").is_none()
+	)
+
+
+func test_duplicate_imports_use_resolved_canonical_identity() -> Bool:
+	state = register_import_source(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		[
+			importable_module_with_source_name(
+				"pkg/shared",
+				"shared",
+				UserModule,
+				"pure func value() -> Int:\n\t1",
+			),
+		],
+		"import:\n\tpkg/shared as First\n\tshared as Second\n\nfunc main(): 0",
+	)
+
+	(
+		state.errors == ["module 'shared' is already imported"]
+		and typecheck_state_find_module_alias(state, "First") == Some("pkg/shared")
+		and typecheck_state_find_module_alias(state, "Second").is_none()
 	)
 
 
@@ -380,6 +432,10 @@ tests: TestSuite = {
 			test_ambiguous_source_module_name_is_order_independent,
 		),
 		(
+			"registration publishes only accepted canonical modules",
+			test_registration_publishes_only_accepted_canonical_modules,
+		),
+		(
 			"registers selective imports and type homes",
 			test_registers_selective_imports_and_type_homes,
 		),
@@ -402,6 +458,10 @@ tests: TestSuite = {
 		(
 			"rejects duplicate module imports and std package imports",
 			test_rejects_duplicate_module_imports_and_std_package_imports,
+		),
+		(
+			"duplicate imports use resolved canonical identity",
+			test_duplicate_imports_use_resolved_canonical_identity,
 		),
 	]
 }

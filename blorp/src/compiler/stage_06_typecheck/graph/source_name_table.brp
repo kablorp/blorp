@@ -1,0 +1,156 @@
+-- Compilation-local source spelling identities.
+--
+-- SourceNameId is deliberately not semantic identity: it only replaces
+-- repeated String keys while a compilation graph is active. Resolved products
+-- must carry DefinitionId, ModuleId, or another semantic entity ID instead.
+import:
+	../../stage_03_parse/parsed_ast:
+		ParsedDecl(
+			BuiltinTypeParsedDecl,
+			ForeignBlockParsedDecl,
+			FunctionParsedDecl,
+			ImplParsedDecl,
+			ImportBlockParsedDecl,
+			ParsedErrorDecl,
+			PrivateParsedDecl,
+			RecordParsedDecl,
+			TraitParsedDecl,
+			TypeAliasParsedDecl,
+			UnionParsedDecl,
+			VarParsedDecl,
+		),
+		ParsedImportDecl,
+
+
+opaque type SourceNameId = Int
+
+
+private record SourceNameTableRep {
+	spellings: List[String],
+	id_by_spelling: Dict[String, Int]
+}
+
+
+opaque type SourceNameTable = SourceNameTableRep
+
+
+private pure func source_name_id(index: Int) -> SourceNameId:
+	into_opaque SourceNameId(index)
+
+
+pure func source_name_id_table_index(id: SourceNameId) -> Int:
+	from_opaque SourceNameId(id)
+
+
+pure func source_name_ids_equal(left: SourceNameId, right: SourceNameId) -> Bool:
+	source_name_id_table_index(left) == source_name_id_table_index(right)
+
+
+-- A qualified import without an explicit alias is visible through the final
+-- path component, without the source extension. Keeping that spelling rule
+-- beside the compilation source-name table prevents graph admission and
+-- import binding from independently deriving different keys.
+pure func source_name_default_module_alias(module_path: String) -> String:
+	parts = module_path.split("/")
+	raw_name = parts
+		.last()
+		.get_or(module_path)
+
+	if raw_name.ends_with(".brp"):
+		raw_name.substring(0, raw_name.length() - 4)
+	else:
+		raw_name
+
+
+private pure func source_name_candidates_for_import(
+	candidates: List[String],
+	import_decl: ParsedImportDecl,
+) -> List[String]:
+	match import_decl.module_alias:
+		Some(alias_name):
+			candidates.append(alias_name.text)
+		None:
+			match import_decl.symbols:
+				Some(_):
+					candidates
+				None:
+					candidates.append(source_name_default_module_alias(import_decl.module_path))
+
+
+-- Catalog exactly the source-visible names admitted to migrated ModuleView
+-- relations. Fields, parameters, implementation methods, and selective import
+-- names are not module-local declarations and remain outside this packet.
+pure func source_name_candidates_for_decl(
+	candidates: List[String],
+	decl: ParsedDecl,
+) -> List[String]:
+	match decl:
+		RecordParsedDecl(record_decl):
+			candidates.append(record_decl.name.text)
+		UnionParsedDecl(union_decl):
+			var result = candidates.append(union_decl.name.text)
+
+			for variant in union_decl.variants:
+				result = result.append(variant.name.text)
+
+			result
+		BuiltinTypeParsedDecl(type_decl):
+			candidates.append(type_decl.name.text)
+		TypeAliasParsedDecl(alias_decl):
+			candidates.append(alias_decl.name.text)
+		FunctionParsedDecl(function_decl):
+			candidates.append(function_decl.name.text)
+		VarParsedDecl(var_decl):
+			candidates.append(var_decl.name.text)
+		TraitParsedDecl(trait_decl):
+			candidates.append(trait_decl.name.text)
+		ForeignBlockParsedDecl(_, functions, _):
+			var result = candidates
+
+			for function_decl in functions:
+				result = result.append(function_decl.name.text)
+
+			result
+		ImportBlockParsedDecl(imports, _):
+			var result = candidates
+
+			for import_decl in imports:
+				result = source_name_candidates_for_import(result, import_decl)
+
+			result
+		PrivateParsedDecl(inner, _):
+			source_name_candidates_for_decl(candidates, inner)
+		ImplParsedDecl(_) | ParsedErrorDecl(_):
+			candidates
+
+
+pure func source_name_table(candidates: List[String]) -> SourceNameTable:
+	var spellings: List[String] = []
+	var id_by_spelling: Dict[String, Int] = {}
+
+	for candidate in candidates:
+		if not id_by_spelling.contains(candidate):
+			id_by_spelling = id_by_spelling.set(candidate, spellings.length())
+			spellings = spellings.append(candidate)
+
+	into_opaque SourceNameTable({
+			spellings = spellings,
+			id_by_spelling = id_by_spelling
+		})
+
+
+pure func source_name_table_count(table: SourceNameTable) -> Int:
+	from_opaque SourceNameTable(table).spellings.length()
+
+
+pure func source_name_table_find_id(
+	table: SourceNameTable,
+	spelling: String,
+) -> Option[SourceNameId]:
+	from_opaque SourceNameTable(table).id_by_spelling
+		.get(spelling)
+		.map(source_name_id)
+
+
+pure func source_name_table_spelling(table: SourceNameTable, id: SourceNameId) -> Option[String]:
+	from_opaque SourceNameTable(table).spellings.get(source_name_id_table_index(id))

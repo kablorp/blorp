@@ -115,6 +115,7 @@ import:
 
 union CoreResolveImportBinding:
 	CoreQualifiedModuleImport(String, String)
+	CoreExactSelectiveDefinitionImport(String, List[Int])
 	CoreSelectiveDefinitionImport(String, String, String)
 
 
@@ -122,16 +123,22 @@ private pure func core_resolve_import_local_name(binding: CoreResolveImportBindi
 	match binding:
 		CoreQualifiedModuleImport(local_name, _):
 			local_name
+		CoreExactSelectiveDefinitionImport(local_name, _):
+			local_name
 		CoreSelectiveDefinitionImport(local_name, _, _):
 			local_name
 
 
-private pure func core_resolve_import_module_path(binding: CoreResolveImportBinding) -> String:
+private pure func core_resolve_import_module_path(
+	binding: CoreResolveImportBinding,
+) -> Option[String]:
 	match binding:
 		CoreQualifiedModuleImport(_, module_path):
-			module_path
+			Some(module_path)
+		CoreExactSelectiveDefinitionImport(_, _):
+			None
 		CoreSelectiveDefinitionImport(_, module_path, _):
-			module_path
+			Some(module_path)
 
 
 record CoreResolveModuleImports {
@@ -160,9 +167,17 @@ private union ResolveGlobalLogicalTask:
 private record CoreCallableTarget {
 	name: String,
 	def_id: Int,
+	is_pure: Bool,
 	params: List[CoreType],
-	return_type: CoreType
+	return_type: CoreType,
+	resolution: CoreCallableTargetResolution
 }
+
+
+private union CoreCallableTargetResolution:
+	CoreUserCallableTarget
+	CoreBuiltinCallableTarget(String)
+	CoreForeignCallableTarget(CoreForeignTarget)
 
 
 private record CoreModuleCallable {
@@ -178,8 +193,16 @@ private record CoreForeignTarget {
 
 
 private record CoreConstructorTarget {
+	name: String,
 	type_name: String,
 	def_id: Option[Int]
+}
+
+
+private record CoreGlobalTarget {
+	name: String,
+	def_id: Int,
+	typ: CoreType
 }
 
 
@@ -192,13 +215,15 @@ private union CoreCallResolveFunctionDisposition:
 
 private record CoreCallResolveEnv {
 	user_functions: Dict[String, CoreCallableTarget],
-	user_functions_by_id: Dict[Int, CoreCallableTarget],
-	colliding_user_function_ids: Set[Int],
+	callable_targets_by_id: Dict[Int, CoreCallableTarget],
+	colliding_definition_ids: Set[Int],
 	module_functions: Dict[String, CoreModuleCallable],
 	global_types: Dict[String, CoreType],
+	global_targets_by_id: Dict[Int, CoreGlobalTarget],
 	foreign_functions: Dict[String, CoreForeignTarget],
 	builtin_functions: Dict[String, String],
 	constructors: Dict[String, List[CoreConstructorTarget]],
+	constructor_targets_by_id: Dict[Int, CoreConstructorTarget],
 	import_bindings: Dict[String, CoreResolveImportBinding],
 	module_imports: Dict[String, Dict[String, CoreResolveImportBinding]],
 	module_paths: List[String]
@@ -211,14 +236,16 @@ private record CoreCallResolveEnv {
 -- the environment or its component collections.
 struct CoreCallResolveEnvObservation {
 	user_function_count: Int,
-	user_function_by_id_count: Int,
-	colliding_user_function_id_count: Int,
+	callable_target_by_id_count: Int,
+	colliding_definition_id_count: Int,
 	module_function_count: Int,
 	global_type_count: Int,
+	global_target_by_id_count: Int,
 	foreign_function_count: Int,
 	builtin_function_count: Int,
 	constructor_name_count: Int,
 	constructor_target_count: Int,
+	constructor_target_by_id_count: Int,
 	import_binding_count: Int,
 	module_import_count: Int,
 	module_import_binding_count: Int,
@@ -231,6 +258,12 @@ struct CoreCallResolveEnvObservation {
 private union CoreGlobalValueResolution:
 	ResolvableGlobalValue(Int)
 	AmbiguousGlobalValue
+
+
+private union CoreImportedVariableResolution:
+	NoImportedVariableResolution
+	ResolvedImportedVariable(CoreVar)
+	InvalidExactImportedVariable
 
 
 private record CoreProgramResolution {
@@ -321,12 +354,17 @@ private pure func source_name_for_function(function_info: CoreFunction) -> Strin
 		source_name
 
 
-private pure func callable_target(function_info: CoreFunction) -> CoreCallableTarget:
+private pure func callable_target(
+	function_info: CoreFunction,
+	resolution: CoreCallableTargetResolution,
+) -> CoreCallableTarget:
 	{
 		name = function_info.name,
 		def_id = function_info.def_id,
+		is_pure = function_info.is_pure,
 		params = function_info.params.map(func(param): param.typ),
-		return_type = function_info.return_type
+		return_type = function_info.return_type,
+		resolution = resolution
 	}
 
 
@@ -406,13 +444,15 @@ private pure func collect_call_resolve_env(
 	module_imports: List[CoreResolveModuleImports],
 ) -> CoreCallResolveEnv:
 	var user_functions: Dict[String, CoreCallableTarget] = {}
-	var user_functions_by_id: Dict[Int, CoreCallableTarget] = {}
-	var colliding_user_function_ids: Set[Int] = Sets.set()
+	var callable_targets_by_id: Dict[Int, CoreCallableTarget] = {}
+	var colliding_definition_ids: Set[Int] = Sets.set()
 	var module_functions: Dict[String, CoreModuleCallable] = {}
 	var global_types: Dict[String, CoreType] = {}
+	var global_targets_by_id: Dict[Int, CoreGlobalTarget] = {}
 	var foreign_functions: Dict[String, CoreForeignTarget] = {}
 	var builtin_functions: Dict[String, String] = {}
 	var constructors: Dict[String, List[CoreConstructorTarget]] = {}
+	var constructor_targets_by_id: Dict[Int, CoreConstructorTarget] = {}
 	var indexed_import_bindings: Dict[String, CoreResolveImportBinding] = import_index(
 		import_bindings,
 	)
@@ -433,21 +473,66 @@ private pure func collect_call_resolve_env(
 		)
 
 	for binding in import_bindings:
-		module_path = core_resolve_import_module_path(binding)
-
-		if not Sets.contains(module_path_set, module_path):
-			module_path_set = Sets.add(module_path_set, module_path)
-			module_paths = module_paths.append(module_path)
-		else:
-			void
+		match core_resolve_import_module_path(binding):
+			Some(module_path):
+				if not Sets.contains(module_path_set, module_path):
+					module_path_set = Sets.add(module_path_set, module_path)
+					module_paths = module_paths.append(module_path)
+				else:
+					void
+			None:
+				void
 
 	for decl in program.decls:
 		match decl:
 			FunctionDecl(function_info):
 				match call_resolve_function_disposition(function_info):
-					CallResolveRememberForeignFunction(target):
-						foreign_functions = foreign_functions.set(function_info.name, target)
+					CallResolveRememberForeignFunction(foreign_target):
+						target = callable_target(
+							function_info,
+							CoreForeignCallableTarget(foreign_target),
+						)
+
+						if (
+							callable_targets_by_id.contains(target.def_id)
+							or global_targets_by_id.contains(target.def_id)
+							or constructor_targets_by_id.contains(target.def_id)
+						):
+							colliding_definition_ids = Sets.add(
+								colliding_definition_ids,
+								target.def_id,
+							)
+						else:
+							callable_targets_by_id = callable_targets_by_id.set(
+								target.def_id,
+								target,
+							)
+
+						foreign_functions = foreign_functions.set(
+							function_info.name,
+							foreign_target,
+						)
 					CallResolveRememberBuiltinFunction(runtime_name):
+						target = callable_target(
+							function_info,
+							CoreBuiltinCallableTarget(runtime_name),
+						)
+
+						if (
+							callable_targets_by_id.contains(target.def_id)
+							or global_targets_by_id.contains(target.def_id)
+							or constructor_targets_by_id.contains(target.def_id)
+						):
+							colliding_definition_ids = Sets.add(
+								colliding_definition_ids,
+								target.def_id,
+							)
+						else:
+							callable_targets_by_id = callable_targets_by_id.set(
+								target.def_id,
+								target,
+							)
+
 						match function_info.source_module:
 							Some(module_path):
 								if not Sets.contains(module_path_set, module_path):
@@ -476,7 +561,25 @@ private pure func collect_call_resolve_env(
 									runtime_name,
 								)
 					CallResolveRememberDefinedFunction:
-						target: CoreCallableTarget = callable_target(function_info)
+						target: CoreCallableTarget = callable_target(
+							function_info,
+							CoreUserCallableTarget,
+						)
+
+						if (
+							callable_targets_by_id.contains(target.def_id)
+							or global_targets_by_id.contains(target.def_id)
+							or constructor_targets_by_id.contains(target.def_id)
+						):
+							colliding_definition_ids = Sets.add(
+								colliding_definition_ids,
+								target.def_id,
+							)
+						else:
+							callable_targets_by_id = callable_targets_by_id.set(
+								target.def_id,
+								target,
+							)
 
 						match function_info.source_module:
 							Some(module_path):
@@ -498,60 +601,88 @@ private pure func collect_call_resolve_env(
 									},
 								)
 
-								if target.name == source_name:
-									void
-								else:
+								if target.name != source_name:
 									user_functions = user_functions.set(target.name, target)
-
-									match user_functions_by_id.get(target.def_id):
-										Some(_):
-											colliding_user_function_ids = Sets.add(
-												colliding_user_function_ids,
-												target.def_id,
-											)
-										None:
-											user_functions_by_id = user_functions_by_id.set(
-												target.def_id,
-												target,
-											)
+								else:
+									void
 							None:
 								user_functions = user_functions.set(target.name, target)
-
-								match user_functions_by_id.get(target.def_id):
-									Some(_):
-										colliding_user_function_ids = Sets.add(
-											colliding_user_function_ids,
-											target.def_id,
-										)
-									None:
-										user_functions_by_id = user_functions_by_id.set(
-											target.def_id,
-											target,
-										)
 					CallResolveIgnoreFunction:
 						void
 			GlobalDecl(global):
 				global_types = global_types.set(global.name.name, global.typ)
+
+				if (
+					global_targets_by_id.contains(global.def_id)
+					or callable_targets_by_id.contains(global.def_id)
+					or constructor_targets_by_id.contains(global.def_id)
+				):
+					colliding_definition_ids = Sets.add(colliding_definition_ids, global.def_id)
+				else:
+					global_targets_by_id = global_targets_by_id.set(
+						global.def_id,
+						{
+							name = global.name.name,
+							def_id = global.def_id,
+							typ = global.typ
+						},
+					)
 			EnumDecl(enum_decl):
 				for variant in enum_decl.variants:
 					existing: List[CoreConstructorTarget] = constructors.get_or(variant.name, [])
+					target: CoreConstructorTarget = {
+						name = variant.name,
+						type_name = enum_decl.name,
+						def_id = variant.def_id
+					}
 					constructors = constructors.set(
 						variant.name,
-						existing.append({
-							type_name = enum_decl.name,
-							def_id = variant.def_id,
-						}),
+						existing.append(target),
 					)
+
+					match variant.def_id:
+						Some(id):
+							if (
+								constructor_targets_by_id.contains(id)
+								or callable_targets_by_id.contains(id)
+								or global_targets_by_id.contains(id)
+							):
+								colliding_definition_ids = Sets.add(colliding_definition_ids, id)
+							else:
+								constructor_targets_by_id = constructor_targets_by_id.set(
+									id,
+									target,
+								)
+						None:
+							void
 			UnionDecl(union_decl):
 				for variant in union_decl.variants:
 					existing: List[CoreConstructorTarget] = constructors.get_or(variant.name, [])
+					target: CoreConstructorTarget = {
+						name = variant.name,
+						type_name = union_decl.name,
+						def_id = variant.def_id
+					}
 					constructors = constructors.set(
 						variant.name,
-						existing.append({
-							type_name = union_decl.name,
-							def_id = variant.def_id,
-						}),
+						existing.append(target),
 					)
+
+					match variant.def_id:
+						Some(id):
+							if (
+								constructor_targets_by_id.contains(id)
+								or callable_targets_by_id.contains(id)
+								or global_targets_by_id.contains(id)
+							):
+								colliding_definition_ids = Sets.add(colliding_definition_ids, id)
+							else:
+								constructor_targets_by_id = constructor_targets_by_id.set(
+									id,
+									target,
+								)
+						None:
+							void
 			ImplDecl(impl_decl):
 				if not core_type_has_unresolved_parameters(impl_decl.for_type):
 					match core_trait_impl_type_key(impl_decl.for_type):
@@ -560,22 +691,27 @@ private pure func collect_call_resolve_env(
 								target: CoreCallableTarget = {
 									name = "${impl_decl.trait_name}_${method.name}_${type_name}",
 									def_id = method.def_id,
+									is_pure = method.is_pure,
 									params = method.params.map(func(param): param.typ),
-									return_type = method.return_type
+									return_type = method.return_type,
+									resolution = CoreUserCallableTarget
 								}
 								user_functions = user_functions.set(target.name, target)
 
-								match user_functions_by_id.get(target.def_id):
-									Some(_):
-										colliding_user_function_ids = Sets.add(
-											colliding_user_function_ids,
-											target.def_id,
-										)
-									None:
-										user_functions_by_id = user_functions_by_id.set(
-											target.def_id,
-											target,
-										)
+								if (
+									callable_targets_by_id.contains(target.def_id)
+									or global_targets_by_id.contains(target.def_id)
+									or constructor_targets_by_id.contains(target.def_id)
+								):
+									colliding_definition_ids = Sets.add(
+										colliding_definition_ids,
+										target.def_id,
+									)
+								else:
+									callable_targets_by_id = callable_targets_by_id.set(
+										target.def_id,
+										target,
+									)
 						None:
 							void
 				else:
@@ -585,13 +721,15 @@ private pure func collect_call_resolve_env(
 
 	{
 		user_functions = user_functions,
-		user_functions_by_id = user_functions_by_id,
-		colliding_user_function_ids = colliding_user_function_ids,
+		callable_targets_by_id = callable_targets_by_id,
+		colliding_definition_ids = colliding_definition_ids,
 		module_functions = module_functions,
 		global_types = global_types,
+		global_targets_by_id = global_targets_by_id,
 		foreign_functions = foreign_functions,
 		builtin_functions = builtin_functions,
 		constructors = constructors,
+		constructor_targets_by_id = constructor_targets_by_id,
 		import_bindings = indexed_import_bindings,
 		module_imports = indexed_module_imports,
 		module_paths = module_paths
@@ -618,16 +756,18 @@ private pure func observe_call_resolve_env(
 	env: CoreCallResolveEnv,
 ) -> CoreCallResolveEnvObservation:
 	user_function_count: Int = env.user_functions.length()
-	user_function_by_id_count: Int = env.user_functions_by_id.length()
-	colliding_user_function_id_count: Int = env.colliding_user_function_ids.length()
+	callable_target_by_id_count: Int = env.callable_targets_by_id.length()
+	colliding_definition_id_count: Int = env.colliding_definition_ids.length()
 	module_function_count: Int = env.module_functions.length()
 	global_type_count: Int = env.global_types.length()
+	global_target_by_id_count: Int = env.global_targets_by_id.length()
 	foreign_function_count: Int = env.foreign_functions.length()
 	builtin_function_count: Int = env.builtin_functions.length()
 	import_binding_count: Int = env.import_bindings.length()
 	module_import_count: Int = env.module_imports.length()
 	var constructor_name_count: Int = 0
 	var constructor_target_count: Int = 0
+	constructor_target_by_id_count: Int = env.constructor_targets_by_id.length()
 	var module_import_binding_count: Int = 0
 	var module_path_count: Int = 0
 	var module_path_order_checksum: Int = 0
@@ -648,14 +788,16 @@ private pure func observe_call_resolve_env(
 
 	var count_checksum: Int = 0
 	count_checksum = call_resolve_count_checksum(count_checksum, user_function_count)
-	count_checksum = call_resolve_count_checksum(count_checksum, user_function_by_id_count)
-	count_checksum = call_resolve_count_checksum(count_checksum, colliding_user_function_id_count)
+	count_checksum = call_resolve_count_checksum(count_checksum, callable_target_by_id_count)
+	count_checksum = call_resolve_count_checksum(count_checksum, colliding_definition_id_count)
 	count_checksum = call_resolve_count_checksum(count_checksum, module_function_count)
 	count_checksum = call_resolve_count_checksum(count_checksum, global_type_count)
+	count_checksum = call_resolve_count_checksum(count_checksum, global_target_by_id_count)
 	count_checksum = call_resolve_count_checksum(count_checksum, foreign_function_count)
 	count_checksum = call_resolve_count_checksum(count_checksum, builtin_function_count)
 	count_checksum = call_resolve_count_checksum(count_checksum, constructor_name_count)
 	count_checksum = call_resolve_count_checksum(count_checksum, constructor_target_count)
+	count_checksum = call_resolve_count_checksum(count_checksum, constructor_target_by_id_count)
 	count_checksum = call_resolve_count_checksum(count_checksum, import_binding_count)
 	count_checksum = call_resolve_count_checksum(count_checksum, module_import_count)
 	count_checksum = call_resolve_count_checksum(count_checksum, module_import_binding_count)
@@ -664,14 +806,16 @@ private pure func observe_call_resolve_env(
 
 	{
 		user_function_count = user_function_count,
-		user_function_by_id_count = user_function_by_id_count,
-		colliding_user_function_id_count = colliding_user_function_id_count,
+		callable_target_by_id_count = callable_target_by_id_count,
+		colliding_definition_id_count = colliding_definition_id_count,
 		module_function_count = module_function_count,
 		global_type_count = global_type_count,
+		global_target_by_id_count = global_target_by_id_count,
 		foreign_function_count = foreign_function_count,
 		builtin_function_count = builtin_function_count,
 		constructor_name_count = constructor_name_count,
 		constructor_target_count = constructor_target_count,
+		constructor_target_by_id_count = constructor_target_by_id_count,
 		import_binding_count = import_binding_count,
 		module_import_count = module_import_count,
 		module_import_binding_count = module_import_binding_count,
@@ -987,8 +1131,11 @@ private pure func selected_signature_matches(
 			False
 		else:
 			match core_expr_type(callee):
-				FunctionType(_, _, return_type):
-					selected_type_matches(target.return_type, return_type)
+				FunctionType(expected_is_pure, _, return_type):
+					(
+						(not expected_is_pure or target.is_pure)
+						and selected_type_matches(target.return_type, return_type)
+					)
 				_:
 					True
 
@@ -997,13 +1144,23 @@ private pure func user_call(target: CoreCallableTarget) -> CoreCallKind:
 	UserCall(target.name, Some(target.def_id), [])
 
 
+private pure func callable_target_call_kind(target: CoreCallableTarget) -> CoreCallKind:
+	match target.resolution:
+		CoreUserCallableTarget:
+			user_call(target)
+		CoreBuiltinCallableTarget(runtime_name):
+			BuiltinCall(runtime_name)
+		CoreForeignCallableTarget(foreign_target):
+			ForeignCall(foreign_target.c_name, foreign_target.arg_passing)
+
+
 private pure func user_call_by_name(env: CoreCallResolveEnv, name: String) -> Option[CoreCallKind]:
 	env.user_functions
 		.get(name)
 		.map(user_call)
 
 
-private pure func user_call_by_id(
+private pure func callable_call_by_id(
 	env: CoreCallResolveEnv,
 	selected_id: Option[Int],
 	callee: CoreExpr,
@@ -1011,13 +1168,124 @@ private pure func user_call_by_id(
 ) -> Option[CoreCallKind]:
 	id ?= selected_id
 
-	if Sets.contains(env.colliding_user_function_ids, id):
+	if Sets.contains(env.colliding_definition_ids, id):
 		None
 	else:
-		match env.user_functions_by_id.get(id):
+		match env.callable_targets_by_id.get(id):
 			Some(target):
 				if selected_signature_matches(target, callee, args):
-					Some(user_call(target))
+					Some(callable_target_call_kind(target))
+				else:
+					None
+			None:
+				None
+
+
+private pure func exact_import_call(
+	env: CoreCallResolveEnv,
+	definition_ids: List[Int],
+	selected_id: Option[Int],
+	callee: CoreExpr,
+	args: List[CoreExpr],
+) -> Option[CoreCallKind]:
+	match selected_id:
+		Some(id):
+			if definition_ids.contains(id):
+				callable_call_by_id(env, Some(id), callee, args)
+			else:
+				None
+		None:
+			exact_import_call_by_signature(env, definition_ids, callee, args)
+
+
+private pure func exact_import_call_by_signature(
+	env: CoreCallResolveEnv,
+	definition_ids: List[Int],
+	callee: CoreExpr,
+	args: List[CoreExpr],
+) -> Option[CoreCallKind]:
+	var selected: Option[CoreCallKind] = None
+	var ambiguous: Bool = False
+
+	for id in definition_ids:
+		if not Sets.contains(env.colliding_definition_ids, id):
+			match env.callable_targets_by_id.get(id):
+				Some(target):
+					if selected_signature_matches(target, callee, args):
+						match selected:
+							Some(_):
+								ambiguous = True
+							None:
+								selected = Some(callable_target_call_kind(target))
+					else:
+						void
+				None:
+					void
+		else:
+			void
+
+	if ambiguous:
+		None
+	else:
+		selected
+
+
+private pure func exact_import_constructor_call(
+	env: CoreCallResolveEnv,
+	definition_ids: List[Int],
+	selected_id: Option[Int],
+	callee: CoreExpr,
+	return_type: CoreType,
+) -> Option[CoreCallKind]:
+	match selected_id:
+		Some(id):
+			if definition_ids.contains(id):
+				constructor_call_by_id(env, id, callee, return_type)
+			else:
+				None
+		None:
+			var selected: Option[CoreCallKind] = None
+			var ambiguous: Bool = False
+
+			for id in definition_ids:
+				match constructor_call_by_id(env, id, callee, return_type):
+					Some(kind):
+						match selected:
+							Some(_):
+								ambiguous = True
+							None:
+								selected = Some(kind)
+					None:
+						void
+
+			if ambiguous:
+				None
+			else:
+				selected
+
+
+private pure func constructor_call_by_id(
+	env: CoreCallResolveEnv,
+	id: Int,
+	callee: CoreExpr,
+	return_type: CoreType,
+) -> Option[CoreCallKind]:
+	if Sets.contains(env.colliding_definition_ids, id):
+		None
+	else:
+		match env.constructor_targets_by_id.get(id):
+			Some(target):
+				callee_return_type: CoreType = match core_expr_type(callee):
+					FunctionType(_, _, typ):
+						typ
+					typ:
+						typ
+
+				if (
+					constructor_target_matches_type(target, return_type)
+					or constructor_target_matches_type(target, callee_return_type)
+				):
+					Some(UserCall(target.name, Some(id), []))
 				else:
 					None
 			None:
@@ -1081,6 +1349,8 @@ private pure func qualified_module_path(
 	match binding:
 		CoreQualifiedModuleImport(_, imported_module_path):
 			Some(imported_module_path)
+		CoreExactSelectiveDefinitionImport(_, _):
+			None
 		CoreSelectiveDefinitionImport(_, _, _):
 			None
 
@@ -1289,14 +1559,37 @@ private pure func unknown_var_call_kind(
 			UnknownCall
 	else:
 		var result: Option[CoreCallKind] = None
+		imported: Option[CoreResolveImportBinding] = active_import(env, module_path, name)
+		var exact_binding_active: Bool = False
 
-		match env.foreign_functions.get(name):
-			Some(foreign_target):
-				result = Some(ForeignCall(foreign_target.c_name, foreign_target.arg_passing))
-			None:
+		match imported:
+			Some(CoreExactSelectiveDefinitionImport(_, definition_ids)):
+				exact_binding_active = True
+				result = exact_import_call(env, definition_ids, variable.def_id, callee, args)
+
+				if result.is_none():
+					result = exact_import_constructor_call(
+						env,
+						definition_ids,
+						variable.def_id,
+						callee,
+						return_type,
+					)
+				else:
+					void
+			_:
 				void
 
-		if result.is_none():
+		if not exact_binding_active:
+			match env.foreign_functions.get(name):
+				Some(foreign_target):
+					result = Some(ForeignCall(foreign_target.c_name, foreign_target.arg_passing))
+				None:
+					void
+		else:
+			void
+
+		if result.is_none() and not exact_binding_active:
 			match env.builtin_functions.get(name):
 				Some(runtime_name):
 					result = Some(BuiltinCall(runtime_name))
@@ -1310,22 +1603,26 @@ private pure func unknown_var_call_kind(
 		else:
 			void
 
-		if result.is_none():
+		if result.is_none() and not exact_binding_active:
 			result = explicit_ufcs_call(env, name, args)
 		else:
 			void
 
-		if result.is_none():
+		if result.is_none() and not exact_binding_active:
 			result = user_call_by_name(env, name)
 		else:
 			void
 
-		if result.is_none():
-			result = user_call_by_id(env, variable.def_id, callee, args)
+		if result.is_none() and not exact_binding_active:
+			result = callable_call_by_id(env, variable.def_id, callee, args)
 		else:
 			void
 
-		if result.is_none() and module_path != "":
+		if (
+			result.is_none()
+			and not exact_binding_active
+			and module_path != ""
+		):
 			match env.builtin_functions.get(module_function_key(module_path, name)):
 				Some(runtime_name):
 					result = Some(BuiltinCall(runtime_name))
@@ -1339,7 +1636,7 @@ private pure func unknown_var_call_kind(
 		else:
 			void
 
-		if result.is_none():
+		if result.is_none() and not exact_binding_active:
 			result = constructor_target_for_call(
 				env,
 				name,
@@ -1351,9 +1648,7 @@ private pure func unknown_var_call_kind(
 		else:
 			void
 
-		imported: Option[CoreResolveImportBinding] = active_import(env, module_path, name)
-
-		if result.is_none():
+		if result.is_none() and not exact_binding_active:
 			match imported:
 				Some(CoreSelectiveDefinitionImport(_, imported_module_path, source_name)):
 					result = module_call(env, imported_module_path, source_name, args)
@@ -1364,7 +1659,7 @@ private pure func unknown_var_call_kind(
 		else:
 			void
 
-		if result.is_none():
+		if result.is_none() and not exact_binding_active:
 			result = ufcs_call_by_first_arg(env, name, args)
 		else:
 			void
@@ -1380,7 +1675,7 @@ private pure func unknown_var_call_kind(
 		else:
 			void
 
-		if result.is_none():
+		if result.is_none() and not exact_binding_active:
 			result = core_bitwise_intrinsic_name(
 				name,
 				args.length(),
@@ -1426,7 +1721,7 @@ private pure func unknown_field_call_kind(
 				)
 
 				if result.is_none():
-					result = user_call_by_id(env, variable.def_id, callee, args)
+					result = callable_call_by_id(env, variable.def_id, callee, args)
 				else:
 					void
 
@@ -1463,7 +1758,7 @@ private pure func resolve_call_kind(
 ) -> CoreCallKind:
 	match kind:
 		SelectedDirectCall(selected_id):
-			match user_call_by_id(env, Some(selected_id), callee, args):
+			match callable_call_by_id(env, Some(selected_id), callee, args):
 				Some(resolved):
 					resolved
 				None:
@@ -1764,23 +2059,156 @@ private pure func resolve_global_value_expr_inner(
 			resolve_global_value_generic_expr(resolutions, scope, expr)
 
 
-private pure func imported_variable_target(
+private pure func imported_variable_resolution(
 	env: CoreCallResolveEnv,
 	module_path: String,
-	name: String,
+	variable: CoreVar,
+	typ: CoreType,
+) -> CoreImportedVariableResolution:
+	match active_import(env, module_path, variable.name):
+		Some(CoreExactSelectiveDefinitionImport(_, definition_ids)):
+			match exact_imported_variable_target(env, definition_ids, variable, typ):
+				Some(target):
+					ResolvedImportedVariable(target)
+				None:
+					InvalidExactImportedVariable
+		Some(CoreSelectiveDefinitionImport(_, source_module_path, source_name)):
+			match descriptive_imported_variable_target(
+				env,
+				variable.name,
+				source_module_path,
+				source_name,
+				typ,
+			):
+				Some(target):
+					ResolvedImportedVariable(target)
+				None:
+					NoImportedVariableResolution
+		Some(CoreQualifiedModuleImport(_, _)) | None:
+			NoImportedVariableResolution
+
+
+private pure func callable_target_matches_function_type(
+	target: CoreCallableTarget,
+	typ: CoreType,
+) -> Bool:
+	match typ:
+		FunctionType(expected_is_pure, params, return_type):
+			if target.params.length() != params.length():
+				False
+			else:
+				var matches: Bool = (
+					(not expected_is_pure or target.is_pure)
+					and selected_type_matches(target.return_type, return_type)
+				)
+
+				var index: Int = 0
+
+				while matches and index < params.length():
+					match (target.params.get(index), params.get(index)):
+						(Some(target_param), Some(expected_param)):
+							matches = selected_type_matches(target_param, expected_param)
+						_:
+							matches = False
+
+					index += 1
+
+				matches
+		_:
+			False
+
+
+private pure func exact_imported_variable_target(
+	env: CoreCallResolveEnv,
+	definition_ids: List[Int],
+	variable: CoreVar,
 	typ: CoreType,
 ) -> Option[CoreVar]:
-	binding ?= active_import(env, module_path, name)
+	match variable.def_id:
+		Some(selected_id):
+			if definition_ids.contains(selected_id):
+				exact_imported_variable_for_id(env, selected_id, typ)
+			else:
+				None
+		None:
+			exact_imported_variable_by_type(env, definition_ids, typ)
 
-	import_target ?= match binding:
-		CoreSelectiveDefinitionImport(_, source_module_path, source_name):
-			Some((source_module_path, source_name))
-		CoreQualifiedModuleImport(_, _):
-			None
 
-	imported_module_path = import_target[0]
-	original_name = import_target[1]
+private pure func exact_imported_variable_for_id(
+	env: CoreCallResolveEnv,
+	id: Int,
+	typ: CoreType,
+) -> Option[CoreVar]:
+	if Sets.contains(env.colliding_definition_ids, id):
+		None
+	else if is_function_type(typ):
+		env.callable_targets_by_id
+			.get(id)
+			.filter(func(target): callable_target_matches_function_type(target, typ))
+			.map(func(target): {
+					name = target.name,
+					uniq = 0,
+					def_id = Some(target.def_id)
+				})
+	else:
+		var target: Option[CoreVar] = env.global_targets_by_id
+			.get(id)
+			.filter(func(global): selected_type_matches(global.typ, typ))
+			.map(func(global): {
+					name = global.name,
+					uniq = 0,
+					def_id = Some(global.def_id)
+				})
 
+		if target.is_none():
+			target = env.constructor_targets_by_id
+				.get(id)
+				.filter(func(constructor): constructor_target_matches_type(constructor, typ))
+				.map(func(constructor): {
+						name = constructor.name,
+						uniq = 0,
+						def_id = Some(id)
+					})
+		else:
+			void
+
+		target
+
+
+private pure func exact_imported_variable_by_type(
+	env: CoreCallResolveEnv,
+	definition_ids: List[Int],
+	typ: CoreType,
+) -> Option[CoreVar]:
+	var selected: Option[CoreVar] = None
+	var ambiguous: Bool = False
+
+	for id in definition_ids:
+		candidate: Option[CoreVar] = exact_imported_variable_for_id(env, id, typ)
+
+		match candidate:
+			Some(target):
+				match selected:
+					Some(_):
+						ambiguous = True
+					None:
+						selected = Some(target)
+			None:
+				void
+
+	if ambiguous:
+		None
+	else:
+		selected
+
+
+private pure func descriptive_imported_variable_target(
+	env: CoreCallResolveEnv,
+	name: String,
+	imported_module_path: String,
+	original_name: String,
+	typ: CoreType,
+) -> Option[CoreVar]:
 	if core_builtin_name("", name).is_some():
 		None
 	else if not is_function_type(typ):
@@ -1838,10 +2266,12 @@ private pure func resolve_program_variable(
 	else:
 		match resolutions.call_env:
 			Some(env):
-				match imported_variable_target(env, resolutions.module_path, variable.name, typ):
-					Some(imported):
+				match imported_variable_resolution(env, resolutions.module_path, variable, typ):
+					ResolvedImportedVariable(imported):
 						imported
-					None:
+					InvalidExactImportedVariable:
+						{ variable | def_id = None }
+					NoImportedVariableResolution:
 						if is_function_type(typ) and variable.def_id.is_none():
 							match env.user_functions.get(variable.name):
 								Some(target):

@@ -17,6 +17,8 @@ import:
 		source_definition_key,
 		source_definition_key_span,
 	../../../src/compiler/stage_06_typecheck/graph/definition_index:
+		definition_index_definition_table,
+		definition_index_empty,
 		definition_index_initial_seed,
 		definition_index_next_def_id,
 		definition_index_seed_next_def_id,
@@ -26,14 +28,22 @@ import:
 		PreparedModuleScope,
 		indexed_graph_build,
 		indexed_graph_target_scope,
+		prepared_module_scope_definition_index,
+		prepared_module_scope_id,
+		prepared_module_scope_module_table,
 	../../../src/compiler/stage_06_typecheck/modules/import_binding:
-		ImportBinding(QualifiedModuleBinding, SelectiveDefinitionBinding),
+		ImportBinding(
+			GraphQualifiedModuleBinding,
+			GraphSelectiveDefinitionBinding,
+			GraphSelectiveTraitMethodBinding,
+			StandaloneQualifiedModuleBinding,
+			StandaloneSelectiveDefinitionBinding,
+		),
 	../../../src/compiler/stage_06_typecheck/modules/module_view:
 		TopLevelNameKind(TopLevelFunction, TopLevelTrait, TopLevelType),
 		module_view_import_bindings,
-		module_view_imported_modules,
 		module_view_imported_names,
-		module_view_module_aliases,
+		module_view_module_alias_count,
 		top_level_name_kind_label,
 	../../../src/compiler/stage_06_typecheck/state:
 		DefinitionIdClaim(DefinitionIdClaimed, DefinitionIdMissing),
@@ -49,7 +59,6 @@ import:
 		type_home_index_module_path,
 		type_home_index_record,
 		typecheck_state_add_diagnostic,
-		typecheck_state_add_imported_module,
 		typecheck_state_add_known_resource_type_name,
 		typecheck_state_add_known_type_name,
 		typecheck_state_add_private_impl,
@@ -70,15 +79,17 @@ import:
 		typecheck_state_for_origin,
 		typecheck_state_from_infer_session,
 		typecheck_state_func_callable_bindings,
-		typecheck_state_has_imported_module,
 		typecheck_state_has_known_resource_type_name,
 		typecheck_state_has_known_type_name,
 		typecheck_state_is_stdlib,
 		typecheck_state_module_id,
 		typecheck_state_module_identity,
 		typecheck_state_record_type_home,
+		typecheck_state_register_graph_imported_constructor,
+		typecheck_state_register_graph_imported_name,
+		typecheck_state_register_graph_imported_trait_method,
 		typecheck_state_register_imported_name,
-		typecheck_state_register_module_alias,
+		typecheck_state_register_standalone_module_alias,
 		typecheck_state_remember_top_level_name,
 		typecheck_state_reset_type_shape_memo,
 		typecheck_state_restore_definition_scope,
@@ -196,22 +207,19 @@ func test_state_initialization_and_origin_policy() -> Bool:
 	)
 
 
-func test_imported_modules_and_import_bindings_are_deduped() -> Bool:
+func test_import_bindings_are_deduped() -> Bool:
 	state = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
-	var with_modules = typecheck_state_add_imported_module(state, "list")
-	with_modules = typecheck_state_add_imported_module(with_modules, "list")
-	with_modules = typecheck_state_add_imported_module(with_modules, "string")
-
-	with_alias = typecheck_state_register_module_alias(with_modules, "List", "list")
-	with_duplicate_alias = typecheck_state_register_module_alias(with_alias, "List", "list")
+	with_alias = typecheck_state_register_standalone_module_alias(state, "List", "list")
+	with_duplicate_alias = typecheck_state_register_standalone_module_alias(
+		with_alias,
+		"List",
+		"list",
+	)
 	with_name = typecheck_state_register_imported_name(with_duplicate_alias, "map", "list", "map")
 	with_bindings = with_name.state
 
 	(
-		module_view_imported_modules(with_bindings.module_view).length() == 2
-		and typecheck_state_has_imported_module(with_bindings, "list")
-		and typecheck_state_has_imported_module(with_bindings, "string")
-		and module_view_import_bindings(with_bindings.module_view).length() == 2
+		module_view_import_bindings(with_bindings.module_view).length() == 2
 		and typecheck_state_find_module_alias(with_bindings, "List") == Some("list")
 		and typecheck_state_find_imported_name(with_bindings, "map").map(func(binding):
 			binding.module_path == "list" and binding.original_name == "map"
@@ -220,19 +228,31 @@ func test_imported_modules_and_import_bindings_are_deduped() -> Bool:
 
 
 func test_import_binding_kind_is_explicit() -> Bool:
-	qualified: ImportBinding = QualifiedModuleBinding("List", "list")
-	selective: ImportBinding = SelectiveDefinitionBinding("map", "list", "map")
+	qualified: ImportBinding = StandaloneQualifiedModuleBinding("List", "list")
+	selective: ImportBinding = StandaloneSelectiveDefinitionBinding("map", "list", "map")
 
 	qualified_shape = match qualified:
-		QualifiedModuleBinding(local_name, module_path):
+		GraphQualifiedModuleBinding(_, _):
+			False
+		GraphSelectiveDefinitionBinding(_, _, _):
+			False
+		GraphSelectiveTraitMethodBinding(_, _, _):
+			False
+		StandaloneQualifiedModuleBinding(local_name, module_path):
 			local_name == "List" and module_path == "list"
-		SelectiveDefinitionBinding(_, _, _):
+		StandaloneSelectiveDefinitionBinding(_, _, _):
 			False
 
 	selective_shape = match selective:
-		QualifiedModuleBinding(_, _):
+		GraphQualifiedModuleBinding(_, _):
 			False
-		SelectiveDefinitionBinding(local_name, module_path, source_name):
+		GraphSelectiveDefinitionBinding(_, _, _):
+			False
+		GraphSelectiveTraitMethodBinding(_, _, _):
+			False
+		StandaloneQualifiedModuleBinding(_, _):
+			False
+		StandaloneSelectiveDefinitionBinding(local_name, module_path, source_name):
 			local_name == "map" and module_path == "list" and source_name == "map"
 
 	qualified_shape and selective_shape
@@ -244,10 +264,18 @@ func test_module_alias_and_imported_name_namespace_collisions() -> Bool:
 		"Result",
 		TopLevelType,
 	)
-	alias_conflict = typecheck_state_register_module_alias(with_top_level, "Result", "result")
-	alias_ok = typecheck_state_register_module_alias(with_top_level, "List", "list")
-	alias_repeat = typecheck_state_register_module_alias(alias_ok, "List", "list")
-	alias_rebind = typecheck_state_register_module_alias(alias_repeat, "List", "other/list")
+	alias_conflict = typecheck_state_register_standalone_module_alias(
+		with_top_level,
+		"Result",
+		"result",
+	)
+	alias_ok = typecheck_state_register_standalone_module_alias(with_top_level, "List", "list")
+	alias_repeat = typecheck_state_register_standalone_module_alias(alias_ok, "List", "list")
+	alias_rebind = typecheck_state_register_standalone_module_alias(
+		alias_repeat,
+		"List",
+		"other/list",
+	)
 	same_module_import = typecheck_state_register_imported_name(alias_ok, "List", "list", "List")
 	import_conflict = typecheck_state_register_imported_name(alias_ok, "List", "other/list", "List")
 	import_ok = typecheck_state_register_imported_name(alias_ok, "map", "list", "map")
@@ -259,7 +287,7 @@ func test_module_alias_and_imported_name_namespace_collisions() -> Bool:
 		and alias_conflict.errors.length() == 1
 		and typecheck_state_find_module_alias(alias_ok, "List") == Some("list")
 		and alias_repeat.errors.length() == 0
-		and module_view_module_aliases(alias_repeat.module_view).length() == 1
+		and module_view_module_alias_count(alias_repeat.module_view) == 1
 		and alias_rebind.errors.length() == 1
 		and same_module_import.registered
 		and same_module_import.state.errors.is_empty()
@@ -702,6 +730,108 @@ func test_reserved_scope_rejects_replacement_from_another_graph() -> Bool:
 			False
 
 
+func test_graph_selective_import_requires_exact_provenance_and_target() -> Bool:
+	match prepared_module(
+		"shared.brp",
+		"shared",
+		"pure func value() -> Int:\n\t1\n\ntrait Inspectable:\n\tpure func inspect(self: Self) -> Int\n\nunion Signal:\n\tReady",
+	):
+		Some(active_scope):
+			active_state = typecheck_state_enter_prepared_module_scope(
+				typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+				active_scope,
+			)
+			foreign_index = definition_index_empty(
+				definition_index_initial_seed(ENV_EMPTY),
+				prepared_module_scope_module_table(active_scope),
+			)
+			foreign_trait = typecheck_state_register_graph_imported_trait_method(
+				active_state,
+				"inspect",
+				"shared",
+				"inspect",
+				definition_index_definition_table(foreign_index),
+				prepared_module_scope_id(active_scope),
+				[],
+			)
+			active_definition_table = definition_index_definition_table(
+				prepared_module_scope_definition_index(active_scope),
+			)
+			empty_ordinary = typecheck_state_register_graph_imported_name(
+				active_state,
+				"value",
+				"shared",
+				"value",
+				active_definition_table,
+				prepared_module_scope_id(active_scope),
+				[],
+			)
+			missing_constructor = typecheck_state_register_graph_imported_constructor(
+				active_state,
+				"Bogus",
+				"shared",
+				"Signal",
+				"Signal",
+				"Bogus",
+				active_definition_table,
+				prepared_module_scope_id(active_scope),
+			)
+			standalone_first = typecheck_state_register_imported_name(
+				active_state,
+				"standalone_value",
+				"standalone",
+				"value",
+			)
+			graph_after_rejected_standalone = typecheck_state_register_graph_imported_trait_method(
+				standalone_first.state,
+				"inspect",
+				"shared",
+				"inspect",
+				active_definition_table,
+				prepared_module_scope_id(active_scope),
+				[],
+			)
+			graph_first = typecheck_state_register_graph_imported_trait_method(
+				active_state,
+				"inspect",
+				"shared",
+				"inspect",
+				active_definition_table,
+				prepared_module_scope_id(active_scope),
+				[],
+			)
+			standalone_after_graph = typecheck_state_register_imported_name(
+				graph_first.state,
+				"standalone_value",
+				"standalone",
+				"value",
+			)
+
+			(
+				not foreign_trait.registered
+				and foreign_trait.state.errors.length() == 1
+				and module_view_import_bindings(foreign_trait.state.module_view).is_empty()
+				and not empty_ordinary.registered
+				and empty_ordinary.state.errors.length() == 1
+				and module_view_import_bindings(empty_ordinary.state.module_view).is_empty()
+				and not missing_constructor.registered
+				and missing_constructor.state.errors.length() == 1
+				and missing_constructor.state.errors
+					.get_or(0, "")
+					.contains("constructor 'Bogus' is not exported by type 'Signal'")
+				and not standalone_first.registered
+				and standalone_first.state.errors.length() == 1
+				and module_view_import_bindings(standalone_first.state.module_view).is_empty()
+				and graph_after_rejected_standalone.registered
+				and graph_after_rejected_standalone.state.errors.length() == 1
+				and graph_first.registered
+				and not standalone_after_graph.registered
+				and standalone_after_graph.state.errors.length() == 1
+			)
+		None:
+			False
+
+
 func test_reserved_scope_rejects_definition_ids_owned_by_another_module() -> Bool:
 	match graph_with_dependency():
 		None:
@@ -816,10 +946,7 @@ tests: TestSuite = {
 	description = "Compiler typecheck state substrate",
 	tests = [
 		("state initialization and origin policy", test_state_initialization_and_origin_policy),
-		(
-			"imported modules and import bindings are deduped",
-			test_imported_modules_and_import_bindings_are_deduped,
-		),
+		("import bindings are deduped", test_import_bindings_are_deduped),
 		("import binding kind is explicit", test_import_binding_kind_is_explicit),
 		(
 			"module alias and imported name namespace collisions",
@@ -852,6 +979,10 @@ tests: TestSuite = {
 		(
 			"prepared scope switches and restores identity and origin together",
 			test_prepared_scope_switches_and_restores_identity_and_origin_together,
+		),
+		(
+			"graph selective import requires exact provenance and target",
+			test_graph_selective_import_requires_exact_provenance_and_target,
 		),
 		(
 			"reserved scope rejects replacement from another graph",

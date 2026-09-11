@@ -180,6 +180,7 @@ import:
 		definition_index_seed_next_def_id,
 		definition_index_source_definition_id_count,
 		definition_table_module_table,
+		definition_table_selective_definition_name,
 	graph/indexed_graph:
 		IndexedGraph,
 		IndexedGraphError,
@@ -267,7 +268,15 @@ import:
 		bound_module_identity,
 		bound_module_program,
 		bound_module_scope,
-	modules/import_binding: ImportBinding(QualifiedModuleBinding, SelectiveDefinitionBinding)
+	modules/import_binding:
+		ImportBinding(
+			GraphQualifiedModuleBinding,
+			GraphSelectiveDefinitionBinding,
+			GraphSelectiveTraitMethodBinding,
+			StandaloneQualifiedModuleBinding,
+			StandaloneSelectiveDefinitionBinding,
+		),
+		MODULE_IMPORT_TARGET_INVALID_LABEL,
 	modules/module_binding:
 		ImportableModule,
 		ImportableModuleGraph,
@@ -715,7 +724,7 @@ private pure func bind_typecheck_graph(
 			graph_typecheck_state(scope, allow_debug_only_calls),
 			prepared_module_program(prepared_module_scope_module(scope)),
 			importable_index,
-			prepared_module_scope_canonical_path(scope),
+			scope,
 		),
 	)
 
@@ -733,7 +742,7 @@ private pure func bind_all_typecheck_graph(
 			graph_typecheck_state(scope, allow_debug_only_calls),
 			prepared_module_program(prepared_module_scope_module(scope)),
 			importable_index,
-			prepared_module_scope_canonical_path(scope),
+			scope,
 		),
 	)
 
@@ -1178,15 +1187,70 @@ private pure func source_comment_jsons(source: SourceFile) -> JsonValue:
 	))
 
 
-private pure func import_binding_to_json(binding: ImportBinding) -> JsonValue:
+private pure func import_binding_to_json(
+	definition_table: Option[DefinitionTable],
+	binding: ImportBinding,
+) -> JsonValue:
 	match binding:
-		QualifiedModuleBinding(local_name, module_path):
+		GraphQualifiedModuleBinding(local_name, module_id):
+			module_path = match definition_table:
+				Some(definitions):
+					module_table_canonical_path(
+						definition_table_module_table(definitions),
+						module_id,
+					).get_or(MODULE_IMPORT_TARGET_INVALID_LABEL)
+				None:
+					MODULE_IMPORT_TARGET_INVALID_LABEL
+
 			JsonObject([
 				("local_name", JsonString(local_name)),
 				("module_path", JsonString(module_path)),
 				("original_name", JsonNull),
 			])
-		SelectiveDefinitionBinding(local_name, module_path, source_name):
+		StandaloneQualifiedModuleBinding(local_name, module_path):
+			JsonObject([
+				("local_name", JsonString(local_name)),
+				("module_path", JsonString(module_path)),
+				("original_name", JsonNull),
+			])
+		GraphSelectiveDefinitionBinding(local_name, module_id, definition_ids):
+			module_path = definition_table
+				.and_then(func(definitions):
+					module_table_canonical_path(
+						definition_table_module_table(definitions),
+						module_id,
+					)
+				)
+				.get_or(MODULE_IMPORT_TARGET_INVALID_LABEL)
+			source_name = definition_table
+				.and_then(func(definitions):
+					definition_table_selective_definition_name(
+						definitions,
+						module_id,
+						definition_ids,
+					)
+				)
+				.get_or(MODULE_IMPORT_TARGET_INVALID_LABEL)
+			JsonObject([
+				("local_name", JsonString(local_name)),
+				("module_path", JsonString(module_path)),
+				("original_name", JsonString(source_name)),
+			])
+		GraphSelectiveTraitMethodBinding(local_name, module_id, source_name):
+			module_path = definition_table
+				.and_then(func(definitions):
+					module_table_canonical_path(
+						definition_table_module_table(definitions),
+						module_id,
+					)
+				)
+				.get_or(MODULE_IMPORT_TARGET_INVALID_LABEL)
+			JsonObject([
+				("local_name", JsonString(local_name)),
+				("module_path", JsonString(module_path)),
+				("original_name", JsonString(source_name)),
+			])
+		StandaloneSelectiveDefinitionBinding(local_name, module_path, source_name):
 			JsonObject([
 				("local_name", JsonString(local_name)),
 				("module_path", JsonString(module_path)),
@@ -1555,6 +1619,7 @@ private pure func ctfe_imported_program_from_accepted_module(
 	if typed_result.state.errors.length() == 0:
 		match ctfe_import_bindings_for_module_table(
 			prepared_module_scope_module_table(scope),
+			definition_index_definition_table(prepared_module_scope_definition_index(scope)),
 			import_bindings,
 		):
 			Some(ctfe_import_bindings):
@@ -2241,6 +2306,11 @@ private pure func prepare_selective_ctfe_dependencies_for_roots(
 
 										match ctfe_import_bindings_for_module_table(
 											prepared_module_scope_module_table(target_scope),
+											definition_index_definition_table(
+												prepared_module_scope_definition_index(
+													target_scope,
+												),
+											),
 											body_subset_program_import_bindings(subset),
 										):
 											None:
@@ -2740,7 +2810,11 @@ private pure func evaluated_typecheck_artifact(
 
 		match (
 			imported_program_set,
-			ctfe_import_bindings_for_module_table(module_table, import_bindings),
+			ctfe_import_bindings_for_module_table(
+				module_table,
+				definition_table,
+				import_bindings,
+			),
 		):
 			(Some(program_set), Some(ctfe_import_bindings)):
 				evaluation = match evaluated_globals:
@@ -3112,7 +3186,9 @@ private pure func typechecked_module_artifact_from_fields(
 		("type_errors", JsonVector(errors.map(
 				pure func(item: String): JsonString(item),
 			))),
-		("import_bindings", JsonVector(import_bindings.map(import_binding_to_json))),
+		("import_bindings", JsonVector(import_bindings.map(
+				func(binding): import_binding_to_json(None, binding),
+			))),
 		("module_surface", module_surface_to_json(module_surface)),
 	]
 
@@ -3144,7 +3220,9 @@ private pure func typechecked_module_artifact(
 		("type_errors", JsonVector(module.errors.map(
 				pure func(item: String): JsonString(item),
 			))),
-		("import_bindings", JsonVector(module.import_bindings.map(import_binding_to_json))),
+		("import_bindings", JsonVector(module.import_bindings.map(
+				func(binding): import_binding_to_json(Some(definition_table), binding),
+			))),
 		("module_surface", module_surface_to_json(module.module_surface)),
 	]
 
@@ -3173,6 +3251,7 @@ private func emit_json_string_list(
 
 
 private func emit_import_bindings(
+	definition_table: Option[DefinitionTable],
 	items: List[ImportBinding],
 	emit: (String) -> Void,
 ) -> Void:
@@ -3185,7 +3264,10 @@ private func emit_import_bindings(
 		else:
 			emit(",")
 
-		emit_json_chunks(import_binding_to_json(item), emit)
+		emit_json_chunks(
+			import_binding_to_json(definition_table, item),
+			emit,
+		)
 
 	emit("]")
 
@@ -3213,7 +3295,7 @@ private func emit_typechecked_module_artifact_field_chunks(
 	emit(",\"type_errors\":")
 	emit_json_string_list(errors, emit)
 	emit(",\"import_bindings\":")
-	emit_import_bindings(import_bindings, emit)
+	emit_import_bindings(None, import_bindings, emit)
 	emit(",\"module_surface\":")
 	emit_json_chunks(module_surface_to_json(module_surface), emit)
 
@@ -3250,7 +3332,7 @@ private func emit_typechecked_module_artifact_chunks(
 	emit(",\"type_errors\":")
 	emit_json_string_list(module.errors, emit)
 	emit(",\"import_bindings\":")
-	emit_import_bindings(module.import_bindings, emit)
+	emit_import_bindings(Some(definition_table), module.import_bindings, emit)
 	emit(",\"module_surface\":")
 	emit_json_chunks(module_surface_to_json(module.module_surface), emit)
 

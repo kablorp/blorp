@@ -1,4 +1,9 @@
 import:
+	../../stage_04_modules/module_table: ModuleTable, module_table_canonical_path
+	../modules/import_binding:
+		ModuleAliasBinding,
+		module_alias_binding_local_name,
+		module_alias_binding_module_id,
 	env: Env, env_disambiguate_nominal_dim_application, env_resolve_alias
 	semantic_type:
 		SemanticType(
@@ -35,6 +40,11 @@ record ResolvedType {
 }
 
 
+private union ModuleAliasLookup:
+	StandaloneModuleAliasLookup(List[(String, String)])
+	GraphModuleAliasLookup(Option[ModuleTable], List[ModuleAliasBinding], Dict[String, String])
+
+
 pure func type_resolution_context(
 	env: Env,
 	module_aliases: List[(String, String)],
@@ -59,21 +69,43 @@ pure func type_resolution_context_with_alias_policy(
 
 
 private pure func find_module_alias(
-	module_aliases: List[(String, String)],
+	lookup: ModuleAliasLookup,
 	alias_name: String,
 ) -> Option[String]:
-	var result: Option[String] = None
+	match lookup:
+		StandaloneModuleAliasLookup(module_aliases):
+			var result: Option[String] = None
 
-	for pair in module_aliases:
-		if pair[0] == alias_name:
-			result = Some(pair[1])
-			break
+			for pair in module_aliases:
+				if pair[0] == alias_name:
+					result = Some(pair[1])
+					break
 
-	result
+			result
+		GraphModuleAliasLookup(module_table, module_aliases, standalone_module_aliases_by_local_name):
+			var result: Option[String] = None
+
+			for binding in module_aliases:
+				if module_alias_binding_local_name(binding) == alias_name:
+					match module_table:
+						Some(table):
+							result = module_table_canonical_path(
+								table,
+								module_alias_binding_module_id(binding),
+							)
+						None:
+							void
+
+					break
+
+			if result.is_none():
+				result = standalone_module_aliases_by_local_name.get(alias_name)
+
+			result
 
 
 private pure func resolve_qualified_type_name_if_changed(
-	module_aliases: List[(String, String)],
+	module_aliases: ModuleAliasLookup,
 	name: String,
 ) -> Option[String]:
 	dot_index: Int = name.raw_index_of(".")
@@ -94,7 +126,7 @@ private pure func resolve_qualified_type_name_if_changed(
 -- List.set clones shared storage on the first changed element, then updates
 -- that unique list in place. A fully unchanged list retains its original tree.
 private pure func resolve_qualified_type_list_if_changed(
-	module_aliases: List[(String, String)],
+	module_aliases: ModuleAliasLookup,
 	types: List[SemanticType],
 ) -> Option[List[SemanticType]]:
 	var resolved: List[SemanticType] = types
@@ -118,7 +150,7 @@ private pure func resolve_qualified_type_list_if_changed(
 
 
 private pure func resolve_qualified_type_names_if_changed(
-	module_aliases: List[(String, String)],
+	module_aliases: ModuleAliasLookup,
 	typ: SemanticType,
 ) -> Option[SemanticType]:
 	match typ:
@@ -191,7 +223,33 @@ pure func resolve_qualified_type_names(
 	if module_aliases.is_empty():
 		typ
 	else:
-		match resolve_qualified_type_names_if_changed(module_aliases, typ):
+		match resolve_qualified_type_names_if_changed(
+			StandaloneModuleAliasLookup(module_aliases),
+			typ,
+		):
+			Some(resolved):
+				resolved
+			None:
+				typ
+
+
+pure func resolve_graph_qualified_type_names(
+	module_table: Option[ModuleTable],
+	module_aliases: List[ModuleAliasBinding],
+	standalone_module_aliases_by_local_name: Dict[String, String],
+	typ: SemanticType,
+) -> SemanticType:
+	if module_aliases.is_empty() and standalone_module_aliases_by_local_name.is_empty():
+		typ
+	else:
+		match resolve_qualified_type_names_if_changed(
+			GraphModuleAliasLookup(
+				module_table,
+				module_aliases,
+				standalone_module_aliases_by_local_name,
+			),
+			typ,
+		):
 			Some(resolved):
 				resolved
 			None:

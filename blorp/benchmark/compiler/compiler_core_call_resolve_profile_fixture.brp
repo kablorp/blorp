@@ -21,7 +21,11 @@ import:
 		CoreVar,
 	../../src/compiler/stage_09_core/resolve:
 		CoreCallResolveEnvObservation,
-		CoreResolveImportBinding(CoreQualifiedModuleImport, CoreSelectiveDefinitionImport),
+		CoreResolveImportBinding(
+			CoreExactSelectiveDefinitionImport,
+			CoreQualifiedModuleImport,
+			CoreSelectiveDefinitionImport,
+		),
 		CoreResolveModuleImports,
 		observe_core_call_resolve_env,
 
@@ -52,14 +56,16 @@ record CompilerCoreCallResolveBenchmarkInput {
 	module_imports: List[CoreResolveModuleImports],
 	expected_declaration_count: Int,
 	expected_user_function_count: Int,
-	expected_user_function_by_id_count: Int,
-	expected_colliding_user_function_id_count: Int,
+	expected_callable_target_by_id_count: Int,
+	expected_colliding_definition_id_count: Int,
 	expected_module_function_count: Int,
 	expected_global_type_count: Int,
+	expected_global_target_by_id_count: Int,
 	expected_foreign_function_count: Int,
 	expected_builtin_function_count: Int,
 	expected_constructor_name_count: Int,
 	expected_constructor_target_count: Int,
+	expected_constructor_target_by_id_count: Int,
 	expected_import_binding_count: Int,
 	expected_module_import_count: Int,
 	expected_module_import_binding_count: Int,
@@ -382,7 +388,10 @@ private pure func benchmark_import_binding(
 	module_path: String = benchmark_import_module_path(module_index, import_index)
 
 	if import_index % 2 == 0:
-		CoreSelectiveDefinitionImport(local_name, module_path, "source_${import_index}")
+		CoreExactSelectiveDefinitionImport(
+			local_name,
+			[BENCHMARK_FUNCTION_DEF_ID_BASE + module_index],
+		)
 	else:
 		CoreQualifiedModuleImport(local_name, module_path)
 
@@ -480,10 +489,18 @@ private pure func configured_import_binding_count(
 	config.module_count * config.imports_per_module
 
 
+private pure func configured_descriptive_import_binding_count(
+	config: CompilerCoreCallResolveProfileConfig,
+) -> Int:
+	config.module_count * (config.imports_per_module / 2)
+
+
 private pure func module_path_membership_check_count(
 	config: CompilerCoreCallResolveProfileConfig,
 ) -> Int:
-	config.module_count + configured_import_binding_count(config) + config.function_count + 2
+	config.module_count + configured_descriptive_import_binding_count(
+		config,
+	) + config.function_count + 2
 
 
 private pure func benchmark_input_from_parts(
@@ -495,7 +512,7 @@ private pure func benchmark_input_from_parts(
 	duplicate_ids = duplicate_function_id_count(config.function_count, config.duplicate_id_interval)
 	import_binding_count = configured_import_binding_count(config)
 	special_user_function_names: Int = 3
-	special_user_function_ids: Int = 4
+	special_callable_ids: Int = 9
 	special_builtin_entries: Int = 5
 	special_foreign_entries: Int = 2
 	special_non_collection_decls: Int = 10
@@ -512,18 +529,22 @@ private pure func benchmark_input_from_parts(
 		module_imports = module_imports,
 		expected_declaration_count = config.function_count + config.module_count + special_non_collection_decls + collection_decls,
 		expected_user_function_count = config.function_count + special_user_function_names,
-		expected_user_function_by_id_count = config.function_count - duplicate_ids + special_user_function_ids,
-		expected_colliding_user_function_id_count = duplicate_ids,
+		expected_callable_target_by_id_count = config.function_count - duplicate_ids + special_callable_ids,
+		expected_colliding_definition_id_count = duplicate_ids,
 		expected_module_function_count = config.function_count,
 		expected_global_type_count = config.module_count,
+		expected_global_target_by_id_count = config.module_count,
 		expected_foreign_function_count = special_foreign_entries,
 		expected_builtin_function_count = special_builtin_entries,
 		expected_constructor_name_count = config.constructors_per_type,
 		expected_constructor_target_count = config.constructors_per_type * 2,
+		expected_constructor_target_by_id_count = config.constructors_per_type * 2,
 		expected_import_binding_count = import_binding_count,
 		expected_module_import_count = config.module_count,
 		expected_module_import_binding_count = import_binding_count,
-		expected_module_path_count = config.module_count + import_binding_count + 2,
+		expected_module_path_count = config.module_count + configured_descriptive_import_binding_count(
+			config,
+		) + 2,
 		module_path_membership_check_count = module_path_membership_check_count(config)
 	}
 
@@ -546,14 +567,16 @@ private pure func observation_matches_expected(
 ) -> Bool:
 	(
 		observation.user_function_count == input.expected_user_function_count
-		and observation.user_function_by_id_count == input.expected_user_function_by_id_count
-		and observation.colliding_user_function_id_count == input.expected_colliding_user_function_id_count
+		and observation.callable_target_by_id_count == input.expected_callable_target_by_id_count
+		and observation.colliding_definition_id_count == input.expected_colliding_definition_id_count
 		and observation.module_function_count == input.expected_module_function_count
 		and observation.global_type_count == input.expected_global_type_count
+		and observation.global_target_by_id_count == input.expected_global_target_by_id_count
 		and observation.foreign_function_count == input.expected_foreign_function_count
 		and observation.builtin_function_count == input.expected_builtin_function_count
 		and observation.constructor_name_count == input.expected_constructor_name_count
 		and observation.constructor_target_count == input.expected_constructor_target_count
+		and observation.constructor_target_by_id_count == input.expected_constructor_target_by_id_count
 		and observation.import_binding_count == input.expected_import_binding_count
 		and observation.module_import_count == input.expected_module_import_count
 		and observation.module_import_binding_count == input.expected_module_import_binding_count
@@ -566,14 +589,16 @@ pure func compiler_core_call_resolve_benchmark_with_input(
 ) -> CompilerCoreCallResolveBenchmarkResult:
 	var observation: CoreCallResolveEnvObservation = {
 		user_function_count = 0,
-		user_function_by_id_count = 0,
-		colliding_user_function_id_count = 0,
+		callable_target_by_id_count = 0,
+		colliding_definition_id_count = 0,
 		module_function_count = 0,
 		global_type_count = 0,
+		global_target_by_id_count = 0,
 		foreign_function_count = 0,
 		builtin_function_count = 0,
 		constructor_name_count = 0,
 		constructor_target_count = 0,
+		constructor_target_by_id_count = 0,
 		import_binding_count = 0,
 		module_import_count = 0,
 		module_import_binding_count = 0,

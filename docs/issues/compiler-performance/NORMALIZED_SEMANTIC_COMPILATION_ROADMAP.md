@@ -1,8 +1,8 @@
 # Normalized Semantic Compilation Roadmap
 
-**Status:** Step 1 implemented and measured; Step 2 is next. The completed
-module and definition identity work is the foundation; this roadmap defines
-the next finite checkpoint.
+**Status:** Steps 1 and 2a-2d are complete; Step 2e is in progress. Its first
+two bounded packets normalized qualified-alias and local-declaration
+source-name identity without pre-paying for unmigrated visibility relations.
 
 **Scope:** One compiler invocation and one immutable analysis snapshot. This
 roadmap makes accepted and recoverable semantic facts directly queryable by the
@@ -361,17 +361,20 @@ or slightly negative enabling layers on the promise of a later win.
 
 Use separate clean worktrees for baseline and candidate. Record commits,
 compiler/worker SHA-256 values, host, architecture, compiler flags, and workload
-arguments. Warm both variants, alternate execution order, retain raw samples,
-and normally use three valid pairs. Add pairs only when the observed difference
-is close to host noise or the counters are unstable.
+arguments. Warm both variants, alternate execution order, and retain raw
+samples. For deterministic mechanism counters, one direct valid pair is the
+default. Add pairs only when a result is close to the acceptance boundary or
+the counter is unstable. Timing claims need enough alternating samples to
+separate the effect from host noise; omit the timing claim when that would not
+change the engineering decision.
 
 Keep iteration cheaper than acceptance. During implementation, run the smallest
 owned fixture and one baseline/candidate counter-screening pair. A failed screen
 stops there; do not spend five pairs quantifying a known regression. Request
 review before the final measurement so review fixes do not invalidate it. Once
-the design and counters are stable, run one three-pair acceptance sample and the
-broad changed-owner gate once. Additional pairs are for genuinely ambiguous
-counter results, not the default feedback loop.
+the design and counters are stable, run one direct acceptance pair and the broad
+changed-owner gate once. Additional pairs are for genuinely ambiguous counter
+results, not the default feedback loop.
 
 Headline timing runs remain uninstrumented. Allocation, logical counter,
 sampling, and instruction measurements run as separate matrices because their
@@ -747,6 +750,95 @@ interpretation are in
 [`benchmarks/results/compiler_accepted_semantic_catalog_step1_2026-09-10.md`](../../../benchmarks/results/compiler_accepted_semantic_catalog_step1_2026-09-10.md).
 
 ## Step 2: Normalize Module Visibility And Binding Precedence
+
+Step 2 is implemented as sequential packets. The completed first packet is
+[`68-normalize-accepted-module-membership.md`](68-normalize-accepted-module-membership.md):
+make graph-owned visible/direct module lists the sole accepted membership
+authority, derive the source-direct prefix from the registrar's accepted
+canonical output, and retire the duplicate `ModuleView` path containers.
+The implemented second packet is
+[`69-normalize-qualified-module-alias-targets.md`](69-normalize-qualified-module-alias-targets.md):
+graph-bound qualified aliases retain `ModuleId`, while their existing scope or
+graph owner retains the issuing `ModuleTable`; qualified header joins and CTFE
+consume that identity directly, and path strings are projected only for
+diagnostics, external JSON, body APIs that remain path-keyed, and the current
+Core compatibility boundary. The standalone binding guard reduced allocations
+by 2.81%, retained bytes by 4.57%, and retired instructions by 0.73%. Graph
+construction kept allocations and retained objects neutral; its resource and
+artifact guards stayed within 1%. The specialized standalone worker grew by
+17,888 bytes (1.0149%), but the full compiler grew only 0.0973%; the narrow
+crossing is documented in the result. The graph benchmark does not execute
+header or CTFE consumers, so their eliminated path lookups are structural/test
+evidence rather than a measured instruction claim.
+
+The implemented third packet is
+[`70-normalize-selective-definition-targets.md`](70-normalize-selective-definition-targets.md):
+ordinary graph selective imports retain an exact `ModuleId` plus their
+nonempty ordered `DefinitionId` set. CTFE carries those identities and removes
+the graph module-path lookup, but its current imported-global environment still
+projects the source name from the authoritative definition table. Core and
+external JSON also project source spelling only at their compatibility
+boundaries. Trait methods follow an explicit graph variant because
+`TraitMethodId` is issued later; that variant still retains source spelling.
+Standalone adapters remain explicitly string-backed, and a binding-domain enum
+prevents either standalone form from mixing with graph bindings.
+
+The new exported-target index is sparse over graph-wide selectively requested
+spellings. Qualified-only graphs reuse one empty value and scan no exports. In
+the final isolated screen, retained objects were neutral, allocations changed
+by +0.04%, and allocated bytes by +0.30%. Selective and qualified production
+retired-instruction, RSS, and peak-footprint guards stayed within 0.69%, and
+the full compiler grew by 0.19%. One-shot cycle counts were unstable and are
+not acceptance evidence.
+
+The implemented fourth packet is
+[`71-normalize-core-selective-definition-targets.md`](71-normalize-core-selective-definition-targets.md):
+ordinary graph selective imports enter Core as a local alias plus exact
+definition IDs. Core no longer reconstructs or retains the target module path
+and source name for these bindings. One callable-ID index preserves explicit
+user, builtin, and foreign behavior; a global-ID index resolves imported
+values; a constructor-ID index preserves aliases; and one collision set makes
+duplicate identities fail closed. In the
+retained workload, module-path entries fell 39.5% and path membership checks
+fell 9.5%. Managed allocations grew 0.71%, retained objects were neutral, all
+production instructions and memory were neutral-to-improved, compiler size
+grew 0.10%, and generated C kept identical size with one inspected private
+symbol rename caused by preserving global semantic IDs. The isolated
+compile-plus-run instruction sample was +1.78%; its
+directly attributed deterministic work stayed bounded and the raw result is
+retained rather than averaged away.
+
+The first Step 2e packet is
+[`72-normalize-qualified-alias-source-name-identities.md`](72-normalize-qualified-alias-source-name-identities.md):
+the indexed graph now owns a compilation-local `SourceNameTable`, and graph
+qualified-alias lookup replaces `Dict[String, ModuleId]` with
+`Dict[Int, ModuleId]`. It catalogs only qualified alias spellings, preserves a
+diagnostic spelling projection, rejects uncataloged graph aliases, and leaves
+standalone source adapters explicitly string-backed. Broader prototypes were
+rejected when they added 1.27%-3.45% retired instructions by cataloging names
+before their consumers could delete string work. The final packet stays within
+0.87% for mixed and production instructions, cycles, RSS, peak footprint, and
+compiler size.
+
+The second Step 2e packet is
+[`73-normalize-local-source-name-identities.md`](73-normalize-local-source-name-identities.md):
+the graph source-name table now catalogs exactly the declaration spellings
+admitted by typecheck prescan, and graph local-name lookup replaces
+`Dict[String, TopLevelNameKind]` with `Dict[Int, TopLevelNameKind]`. Every
+collision consumer uses the normalized relation, uncataloged graph names fail
+closed, and standalone helpers keep a separately named string map. Mixed,
+isolated-phase, and production native guards remain within 0.80%.
+Registration adds one transient allocation/release pair for its required
+source-string-to-ID projection, but reuses that ID for all subsequent local
+and alias probes. It retains no additional objects and grows allocated bytes
+only 0.28%.
+
+Selective `SourceNameId` relations, trait-method identity, CTFE's string-keyed
+global environment, qualified Core lookup, and complete visibility precedence
+remain for later Step 2e packets. Each packet must use the shared
+name/visibility table to delete one old string-keyed relation rather than add a
+parallel index beside it, and should carry IDs forward from admission where
+that avoids repeated source-string projection.
 
 ### Context
 

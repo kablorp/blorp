@@ -92,7 +92,11 @@ import:
 		CoreVar,
 		core_expr_to_json,
 	../../../src/compiler/stage_09_core/resolve:
-		CoreResolveImportBinding(CoreQualifiedModuleImport, CoreSelectiveDefinitionImport),
+		CoreResolveImportBinding(
+			CoreExactSelectiveDefinitionImport,
+			CoreQualifiedModuleImport,
+			CoreSelectiveDefinitionImport,
+		),
 		CoreResolveModuleImports,
 		resolve_callable_id_calls,
 		resolve_core_program,
@@ -481,6 +485,13 @@ pure func import_binding(
 			CoreSelectiveDefinitionImport(local_name, module_path, source_name)
 		None:
 			CoreQualifiedModuleImport(local_name, module_path)
+
+
+pure func exact_import_binding(
+	local_name: String,
+	definition_ids: List[Int],
+) -> CoreResolveImportBinding:
+	CoreExactSelectiveDefinitionImport(local_name, definition_ids)
 
 
 pure func typed_param(name: String, typ: CoreType) -> CoreParam:
@@ -2642,6 +2653,125 @@ pure func test_resolves_selective_import_call() -> Bool:
 	resolved_user_call_is(resolved, "math__twice", Some(2))
 
 
+pure func test_resolves_exact_selective_import_call_by_definition_id() -> Bool:
+	call: CoreExpr = call_expr("double", int_function_type(1), [int_literal(1)])
+	resolved: CoreProgram = resolve_core_program(program([
+			function_decl("main", 1, call),
+			function_decl_in_module("math", "twice", 2, int_literal(2)),
+			function_decl_in_module("other", "twice", 3, int_literal(3)),
+		]), [exact_import_binding("double", [2])], [])
+
+	resolved_user_call_is(resolved, "math__twice", Some(2))
+
+
+pure func test_exact_selective_import_chooses_matching_overload() -> Bool:
+	call: CoreExpr = call_expr("convert", int_function_type(1), [int_literal(1)])
+	bool_overload: CoreDecl = FunctionDecl({
+		name = "conversion__from_bool",
+		source_module = Some("conversion"),
+		type_params = [],
+		params = [typed_param("value", bool_type())],
+		return_type = int_type(),
+		body = Some(int_literal(0)),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 3,
+		loc = SyntheticSourceLoc,
+	})
+	resolved: CoreProgram = resolve_core_program(
+		program([
+			function_decl("main", 1, call),
+			function_decl_in_module("conversion", "from_int", 2, int_literal(2)),
+			bool_overload,
+		]),
+		[
+			exact_import_binding(
+				"convert",
+				[2, 3],
+			),
+		],
+		[],
+	)
+
+	resolved_user_call_is(resolved, "conversion__from_int", Some(2))
+
+
+pure func test_exact_selective_import_does_not_guess_from_local_name() -> Bool:
+	call: CoreExpr = call_expr("twice", int_function_type(1), [int_literal(1)])
+	resolved: CoreProgram = resolve_core_program(program([
+			function_decl("main", 1, call),
+			function_decl_in_module("math", "twice", 2, int_literal(2)),
+			function_decl_with_params("twice", 3, [core_param("value")], int_literal(3)),
+		]), [exact_import_binding("twice", [999])], [])
+
+	resolved_call_kind(resolved) == Some(UnknownCall)
+
+
+pure func test_invalid_exact_import_does_not_fall_through_to_bitwise_intrinsic() -> Bool:
+	call: CoreExpr = call_expr(
+		"bit_and",
+		int_function_type(2),
+		[int_literal(1), int_literal(2)],
+	)
+	resolved: CoreProgram = resolve_core_program(
+		program([function_decl("main", 1, call)]),
+		[exact_import_binding("bit_and", [999])],
+		[],
+	)
+
+	resolved_call_kind(resolved) == Some(UnknownCall)
+
+
+pure func test_invalid_exact_import_does_not_fall_through_to_ufcs() -> Bool:
+	call: CoreExpr = call_expr("join", int_function_type(1), [VarExpr(
+				core_var("values", None),
+				NamedType("List", [int_type()]),
+				SyntheticSourceLoc,
+			)])
+	resolved: CoreProgram = resolve_core_program(program([
+			function_decl("main", 1, call),
+			function_decl_in_module("list", "join", 2, int_literal(2)),
+		]), [exact_import_binding("join", [999])], [])
+
+	resolved_call_kind(resolved) == Some(UnknownCall)
+
+
+pure func test_resolves_exact_selective_builtin_by_definition_id() -> Bool:
+	call: CoreExpr = call_expr("wait", int_function_type(1), [int_literal(1)])
+	resolved: CoreProgram = resolve_core_program(program([
+			function_decl("main", 1, call),
+			builtin_decl_in_module("channel", "sleep", "blorp_sleep", 2),
+			builtin_decl_in_module("other", "sleep", "other_sleep", 3),
+		]), [exact_import_binding("wait", [2])], [])
+
+	resolved_builtin_call_is(resolved, "blorp_sleep")
+
+
+pure func test_resolves_exact_selective_foreign_by_definition_id() -> Bool:
+	call: CoreExpr = call_expr("absolute", int_function_type(1), [int_literal(1)])
+	resolved: CoreProgram = resolve_core_program(program([
+			function_decl("main", 1, call),
+			foreign_decl("host_abs", "labs", 2),
+		]), [exact_import_binding("absolute", [2])], [])
+
+	resolved_foreign_call_is(resolved, "labs")
+
+
+pure func test_resolves_exact_aliased_constructor_call_by_definition_id() -> Bool:
+	option_type: CoreType = NamedType("Option", [int_type()])
+	call: CoreExpr = call_expr(
+		"Just",
+		constructor_function_type([int_type()], option_type),
+		[int_literal(1)],
+	)
+	resolved: CoreProgram = resolve_core_program(program([
+			function_decl("main", 1, call),
+			payload_union_decl("Option", "Some", 2),
+		]), [exact_import_binding("Just", [2])], [])
+
+	resolved_user_call_is(resolved, "Some", Some(2))
+
+
 pure func test_selected_identity_beats_same_named_module_import() -> Bool:
 	selected_id: Int = 1275
 	selected_call: CoreExpr = CallExpr(
@@ -3157,6 +3287,157 @@ pure func test_rewrites_selective_imported_value() -> Bool:
 			False
 
 
+pure func test_rewrites_exact_selective_imported_value_by_definition_id() -> Bool:
+	resolved: CoreProgram = resolve_core_program(program([
+			function_decl("main", 1, var_expr("answer")),
+			global_decl_in_module("constants", "value", 2, int_literal(42)),
+			global_decl_in_module("other", "value", 3, int_literal(0)),
+		]), [exact_import_binding("answer", [2])], [])
+
+	match main_body(resolved):
+		Some(VarExpr(variable, _, _)):
+			variable.name == "constants__value" and variable.def_id == Some(2)
+		_:
+			False
+
+
+pure func test_invalid_exact_import_does_not_fall_through_to_global() -> Bool:
+	resolved: CoreProgram = resolve_core_program(program([
+			function_decl("main", 1, var_expr("answer")),
+			global_decl("answer", 2, int_literal(42)),
+		]), [exact_import_binding("answer", [999])], [])
+
+	match main_body(resolved):
+		Some(VarExpr(variable, _, _)):
+			variable.name == "answer" and variable.def_id.is_none()
+		_:
+			False
+
+
+pure func test_invalid_exact_import_does_not_fall_through_to_constructor() -> Bool:
+	option_type: CoreType = NamedType("Option", [int_type()])
+	resolved: CoreProgram = resolve_core_program(program([
+			function_decl(
+				"main",
+				1,
+				VarExpr(
+					core_var("None", None),
+					option_type,
+					SyntheticSourceLoc,
+				),
+			),
+			enum_decl("Option", "None", 2),
+		]), [exact_import_binding("None", [999])], [])
+
+	match main_body(resolved):
+		Some(VarExpr(variable, _, _)):
+			variable.name == "None" and variable.def_id.is_none()
+		_:
+			False
+
+
+pure func test_exact_function_reference_prefers_selected_purity_overload() -> Bool:
+	impure_type: CoreType = FunctionType(False, [int_type()], int_type())
+	impure_overload: CoreDecl = FunctionDecl({
+		name = "conversion__impure",
+		source_module = Some("conversion"),
+		type_params = [],
+		params = [typed_param("value", int_type())],
+		return_type = int_type(),
+		body = Some(int_literal(3)),
+		is_pure = False,
+		function_kind = UserFunction,
+		def_id = 3,
+		loc = SyntheticSourceLoc,
+	})
+	resolved: CoreProgram = resolve_core_program(
+		program([
+			function_decl(
+				"main",
+				1,
+				VarExpr(
+					core_var("convert", Some(3)),
+					impure_type,
+					SyntheticSourceLoc,
+				),
+			),
+			function_decl_in_module("conversion", "pure", 2, int_literal(2)),
+			impure_overload,
+		]),
+		[
+			exact_import_binding(
+				"convert",
+				[2, 3],
+			),
+		],
+		[],
+	)
+
+	match main_body(resolved):
+		Some(VarExpr(variable, _, _)):
+			variable.name == "conversion__impure" and variable.def_id == Some(3)
+		_:
+			False
+
+
+pure func test_exact_pure_function_reference_satisfies_impure_type() -> Bool:
+	impure_type: CoreType = FunctionType(False, [int_type()], int_type())
+	resolved: CoreProgram = resolve_core_program(program([
+			function_decl(
+				"main",
+				1,
+				VarExpr(
+					core_var("convert", Some(2)),
+					impure_type,
+					SyntheticSourceLoc,
+				),
+			),
+			function_decl_in_module("conversion", "pure", 2, int_literal(2)),
+		]), [exact_import_binding("convert", [2])], [])
+
+	match main_body(resolved):
+		Some(VarExpr(variable, _, _)):
+			variable.name == "conversion__pure" and variable.def_id == Some(2)
+		_:
+			False
+
+
+pure func test_rewrites_exact_aliased_constructor_value_by_definition_id() -> Bool:
+	option_type: CoreType = NamedType("Option", [int_type()])
+	resolved: CoreProgram = resolve_core_program(program([
+			function_decl(
+				"main",
+				1,
+				VarExpr(
+					core_var("Nothing", None),
+					option_type,
+					SyntheticSourceLoc,
+				),
+			),
+			enum_decl("Option", "None", 2),
+		]), [exact_import_binding("Nothing", [2])], [])
+
+	match main_body(resolved):
+		Some(VarExpr(variable, _, _)):
+			variable.name == "None" and variable.def_id == Some(2)
+		_:
+			False
+
+
+pure func test_duplicate_exact_global_identity_does_not_guess() -> Bool:
+	resolved: CoreProgram = resolve_core_program(program([
+			function_decl("main", 1, var_expr("answer")),
+			global_decl_in_module("constants", "value", 2, int_literal(42)),
+			global_decl_in_module("other", "value", 2, int_literal(0)),
+		]), [exact_import_binding("answer", [2])], [])
+
+	match main_body(resolved):
+		Some(VarExpr(variable, _, _)):
+			variable.name == "answer" and variable.def_id.is_none()
+		_:
+			False
+
+
 pure func test_rewrites_qualified_imported_value() -> Bool:
 	resolved: CoreProgram = resolve_core_program(program([
 			function_decl(
@@ -3223,6 +3504,27 @@ pure func test_rewrites_imported_function_reference_identity() -> Bool:
 			),
 			function_decl_in_module("math", "twice", 2, int_literal(2)),
 		]), [import_binding("double", "math", Some("twice"))], [])
+
+	match main_body(resolved):
+		Some(VarExpr(variable, _, _)):
+			variable.name == "math__twice" and variable.def_id == Some(2)
+		_:
+			False
+
+
+pure func test_rewrites_exact_imported_function_reference_identity() -> Bool:
+	resolved: CoreProgram = resolve_core_program(program([
+			function_decl(
+				"main",
+				1,
+				VarExpr(
+					core_var("double", None),
+					int_function_type(1),
+					SyntheticSourceLoc,
+				),
+			),
+			function_decl_in_module("math", "twice", 2, int_literal(2)),
+		]), [exact_import_binding("double", [2])], [])
 
 	match main_body(resolved):
 		Some(VarExpr(variable, _, _)):
@@ -3339,6 +3641,38 @@ tests: TestSuite = {
 		("resolves function parameter as closure", test_resolves_function_parameter_as_closure),
 		("resolves selective import call", test_resolves_selective_import_call),
 		(
+			"resolves exact selective import call by definition id",
+			test_resolves_exact_selective_import_call_by_definition_id,
+		),
+		(
+			"exact selective import chooses matching overload",
+			test_exact_selective_import_chooses_matching_overload,
+		),
+		(
+			"exact selective import does not guess from local name",
+			test_exact_selective_import_does_not_guess_from_local_name,
+		),
+		(
+			"invalid exact import does not fall through to bitwise intrinsic",
+			test_invalid_exact_import_does_not_fall_through_to_bitwise_intrinsic,
+		),
+		(
+			"invalid exact import does not fall through to UFCS",
+			test_invalid_exact_import_does_not_fall_through_to_ufcs,
+		),
+		(
+			"resolves exact selective builtin by definition id",
+			test_resolves_exact_selective_builtin_by_definition_id,
+		),
+		(
+			"resolves exact selective foreign by definition id",
+			test_resolves_exact_selective_foreign_by_definition_id,
+		),
+		(
+			"resolves exact aliased constructor call by definition id",
+			test_resolves_exact_aliased_constructor_call_by_definition_id,
+		),
+		(
 			"selected identity beats same-named module import",
 			test_selected_identity_beats_same_named_module_import,
 		),
@@ -3401,6 +3735,34 @@ tests: TestSuite = {
 		),
 		("module body resolves its own builtin", test_module_body_resolves_its_own_builtin),
 		("rewrites selective imported value", test_rewrites_selective_imported_value),
+		(
+			"rewrites exact selective imported value by definition id",
+			test_rewrites_exact_selective_imported_value_by_definition_id,
+		),
+		(
+			"invalid exact import does not fall through to global",
+			test_invalid_exact_import_does_not_fall_through_to_global,
+		),
+		(
+			"invalid exact import does not fall through to constructor",
+			test_invalid_exact_import_does_not_fall_through_to_constructor,
+		),
+		(
+			"exact function reference prefers selected purity overload",
+			test_exact_function_reference_prefers_selected_purity_overload,
+		),
+		(
+			"exact pure function reference satisfies impure type",
+			test_exact_pure_function_reference_satisfies_impure_type,
+		),
+		(
+			"rewrites exact aliased constructor value by definition id",
+			test_rewrites_exact_aliased_constructor_value_by_definition_id,
+		),
+		(
+			"duplicate exact global identity does not guess",
+			test_duplicate_exact_global_identity_does_not_guess,
+		),
 		("rewrites qualified imported value", test_rewrites_qualified_imported_value),
 		(
 			"rewrites qualified nullary constructor value",
@@ -3409,6 +3771,10 @@ tests: TestSuite = {
 		(
 			"rewrites imported function reference identity",
 			test_rewrites_imported_function_reference_identity,
+		),
+		(
+			"rewrites exact imported function reference identity",
+			test_rewrites_exact_imported_function_reference_identity,
 		),
 	]
 }

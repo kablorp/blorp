@@ -27,6 +27,7 @@ import:
 		),
 		module_surface_for_program,
 	../../../src/compiler/stage_04_modules/module_table:
+		ModuleId,
 		module_ids_equal,
 		module_table_canonical_path,
 		module_tables_are_compatible,
@@ -42,8 +43,23 @@ import:
 		typecheck_frontend_graph_direct,
 		typecheck_request_for_frontend_graph,
 		typecheck_request_for_frontend_module,
+	../../../src/compiler/stage_06_typecheck/graph/definition_index:
+		DefinitionKind(
+			CallableDefinitionKind,
+			ConstructorDefinitionKind,
+			GlobalDefinitionKind,
+			TypeDefinitionKind,
+		),
+		DefinitionTable,
+		definition_ids_equal,
+		definition_table_row,
+		definition_table_selective_definition_name,
 	../../../src/compiler/stage_06_typecheck/modules/import_binding:
-		ImportBinding(QualifiedModuleBinding, SelectiveDefinitionBinding),
+		ImportBinding(
+			GraphQualifiedModuleBinding,
+			GraphSelectiveDefinitionBinding,
+			GraphSelectiveTraitMethodBinding,
+		),
 	../../../src/compiler/stage_06_typecheck/typed_ast_json: typed_program_to_json
 	../../../src/lib/source: SourceSpan, source_file
 	test: TestSuite
@@ -212,18 +228,100 @@ private pure func import_bindings_match(
 			.zip(right)
 			.all(func(pair):
 				match pair:
-					(QualifiedModuleBinding(left_name, left_path), QualifiedModuleBinding(right_name, right_path)):
-						left_name == right_name and left_path == right_path
-					(SelectiveDefinitionBinding(left_name, left_path, left_source), SelectiveDefinitionBinding(right_name, right_path, right_source)):
+					(GraphQualifiedModuleBinding(left_name, left_id), GraphQualifiedModuleBinding(right_name, right_id)):
+						left_name == right_name and module_ids_equal(left_id, right_id)
+					(GraphSelectiveDefinitionBinding(left_name, left_module_id, left_ids), GraphSelectiveDefinitionBinding(right_name, right_module_id, right_ids)):
 						(
 							left_name == right_name
-							and left_path == right_path
+							and module_ids_equal(left_module_id, right_module_id)
+							and left_ids.length() == right_ids.length()
+							and left_ids
+								.zip(right_ids)
+								.all(func(ids):
+									definition_ids_equal(ids[0], ids[1])
+								)
+						)
+					(GraphSelectiveTraitMethodBinding(left_name, left_module_id, left_source), GraphSelectiveTraitMethodBinding(right_name, right_module_id, right_source)):
+						(
+							left_name == right_name
+							and module_ids_equal(left_module_id, right_module_id)
 							and left_source == right_source
 						)
 					_:
 						False
 			)
 	)
+
+
+private pure func graph_selective_binding_matches(
+	definition_table: DefinitionTable,
+	binding: ImportBinding,
+	local_name: String,
+	module_id: ModuleId,
+	source_name: String,
+	expected_kind: DefinitionKind,
+	expected_id_count: Int,
+) -> Bool:
+	match binding:
+		GraphSelectiveDefinitionBinding(actual_local_name, actual_module_id, definition_ids):
+			var rows_are_ordered_and_exact: Bool = True
+			var previous_start_offset: Int = -1
+
+			for id in definition_ids:
+				match definition_table_row(definition_table, id):
+					Some(row):
+						if (
+							row.kind != expected_kind
+							or row.span.start_offset < previous_start_offset
+						):
+							rows_are_ordered_and_exact = False
+
+						previous_start_offset = row.span.start_offset
+					None:
+						rows_are_ordered_and_exact = False
+
+			(
+				actual_local_name == local_name
+				and module_ids_equal(actual_module_id, module_id)
+				and definition_ids.length() == expected_id_count
+				and rows_are_ordered_and_exact
+				and definition_table_selective_definition_name(
+					definition_table,
+					actual_module_id,
+					definition_ids,
+				) == Some(source_name)
+			)
+		_:
+			False
+
+
+private pure func graph_selective_constructor_binding_matches(
+	definition_table: DefinitionTable,
+	binding: ImportBinding,
+	module_id: ModuleId,
+	constructor_name: String,
+	owner_name: String,
+) -> Bool:
+	match binding:
+		GraphSelectiveDefinitionBinding(local_name, actual_module_id, [definition_id]):
+			(
+				local_name == constructor_name
+				and module_ids_equal(actual_module_id, module_id)
+				and definition_table_row(
+					definition_table,
+					definition_id,
+				).map(
+					func(
+						row,
+					): (
+						row.kind == ConstructorDefinitionKind
+						and row.name == constructor_name
+						and row.owner_name == Some(owner_name)
+					),
+				) == Some(True)
+			)
+		_:
+			False
 
 
 pure func test_request_uses_exact_graph_identities_and_requested_import() -> Bool:
@@ -429,13 +527,13 @@ pure func test_direct_graph_typecheck_matches_descriptive_replay() -> Bool:
 	app = module(
 		"/workspace/main.brp",
 		"main",
-		"import:\n\tdep: VALUE, add\n\nfunc main(args: List[String]) -> Int:\n\tadd(VALUE, 1)\n",
+		"import:\n\tdep: VALUE, add, inspect, render, First(Shared)\n\nfunc main(args: List[String]) -> Int:\n\tVALUE\n",
 		UserModule,
 	)
 	dependency = module(
 		"/packages/pkg/dep.brp",
 		"pkg/dep",
-		"VALUE = 2\n\npure func add(left: Int, right: Int) -> Int:\n\tleft + right\n",
+		"record Collisions {add: Int, inspect: Int}\n\nVALUE = 2\n\npure func add(left: Int, right: Int) -> Int:\n\tleft + right\n\npure func add(left: String, right: String) -> String:\n\tleft + right\n\nprivate pure func add(value: Bool) -> Bool:\n\tvalue\n\ntrait Inspectable:\n\tpure func inspect(value: Self) -> Int\n\tpure func render(value: Self) -> Int\n\npure func render(value: Int) -> Int:\n\tvalue\n\nunion First:\n\tShared\n\nunion Second:\n\tShared\n",
 		SourcePackageModule("pkg"),
 	)
 	edge: FrontendImportEdge = {
@@ -454,6 +552,8 @@ pure func test_direct_graph_typecheck_matches_descriptive_replay() -> Bool:
 		Err(_):
 			False
 		Ok(graph):
+			dependency_id = frontend_graph_find_module_id(graph, dependency.identity)
+
 			match typecheck_request_for_frontend_graph(
 				graph,
 				app.identity,
@@ -474,7 +574,82 @@ pure func test_direct_graph_typecheck_matches_descriptive_replay() -> Bool:
 						Err(_):
 							False
 						Ok(direct):
-							typechecked_graphs_match(direct, typecheck_graph(request))
+							match dependency_id:
+								Some(imported_module_id):
+									(
+										typechecked_graphs_match(direct, typecheck_graph(request))
+										and direct.target.errors.is_empty()
+										and direct.target.import_bindings.length() == 6
+										and direct.target.import_bindings.any(func(binding):
+											graph_selective_binding_matches(
+												direct.definition_table,
+												binding,
+												"VALUE",
+												imported_module_id,
+												"VALUE",
+												GlobalDefinitionKind,
+												1,
+											)
+										)
+										and direct.target.import_bindings.any(func(binding):
+											graph_selective_binding_matches(
+												direct.definition_table,
+												binding,
+												"First",
+												imported_module_id,
+												"First",
+												TypeDefinitionKind,
+												1,
+											)
+										)
+										and direct.target.import_bindings.any(func(binding):
+											graph_selective_constructor_binding_matches(
+												direct.definition_table,
+												binding,
+												imported_module_id,
+												"Shared",
+												"First",
+											)
+										)
+										and direct.target.import_bindings.any(func(binding):
+											graph_selective_binding_matches(
+												direct.definition_table,
+												binding,
+												"add",
+												imported_module_id,
+												"add",
+												CallableDefinitionKind,
+												2,
+											)
+										)
+										and direct.target.import_bindings.any(func(binding):
+											match binding:
+												GraphSelectiveTraitMethodBinding(local_name, trait_module_id, source_name):
+													(
+														local_name == "inspect"
+														and module_ids_equal(
+															trait_module_id,
+															imported_module_id,
+														)
+														and source_name == "inspect"
+													)
+												_:
+													False
+										)
+										and direct.target.import_bindings.any(func(binding):
+											graph_selective_binding_matches(
+												direct.definition_table,
+												binding,
+												"render",
+												imported_module_id,
+												"render",
+												CallableDefinitionKind,
+												1,
+											)
+										)
+									)
+								None:
+									False
 
 
 pure func test_direct_graph_typecheck_accepts_graph_module_ids() -> Bool:

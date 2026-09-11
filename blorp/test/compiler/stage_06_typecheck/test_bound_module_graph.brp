@@ -59,9 +59,12 @@ import:
 		BoundModuleGraphError(BoundModuleBindingError, BoundModuleSelectionError),
 		BoundModuleViewBinding(BoundModuleViewReady, BoundModuleViewRejected),
 		BoundModuleVisibilityBuild(
+			BoundModuleVisibilityIncompatibleDirect,
+			BoundModuleVisibilityIncompatibleVisible,
 			BoundModuleVisibilityDirectNotVisible,
 			BoundModuleVisibilityDuplicateDirect,
 			BoundModuleVisibilityDuplicateVisible,
+			BoundModuleVisibilityInvalidSourceDirectCount,
 			BoundModuleVisibilityReady,
 		),
 		COMPILER_BOUND_MODULE_VISIBILITY_EMPTY,
@@ -475,13 +478,16 @@ func test_bound_module_visibility_rejects_invalid_relationships() -> Bool:
 			False
 		Some(indexed):
 			modules = indexed_graph_module_scopes(indexed).map(importable_module)
+			owner_scope = indexed_graph_target_scope(indexed)
 
 			match (modules.get(0), modules.get(1)):
 				(Some(first), Some(second)):
 					duplicate_visible = match (
 						bound_module_visibility(
+							owner_scope,
 							[first, first],
 							[first],
+							1,
 						)
 					):
 						BoundModuleVisibilityDuplicateVisible(path):
@@ -489,7 +495,12 @@ func test_bound_module_visibility_rejects_invalid_relationships() -> Bool:
 						_:
 							False
 
-					missing_visible = match bound_module_visibility([first], [second]):
+					missing_visible = match bound_module_visibility(
+						owner_scope,
+						[first],
+						[second],
+						1,
+					):
 						BoundModuleVisibilityDirectNotVisible(path):
 							path == "pkg/second"
 						_:
@@ -497,8 +508,10 @@ func test_bound_module_visibility_rejects_invalid_relationships() -> Bool:
 
 					duplicate_direct = match (
 						bound_module_visibility(
+							owner_scope,
 							[first],
 							[first, first],
+							1,
 						)
 					):
 						BoundModuleVisibilityDuplicateDirect(path):
@@ -506,10 +519,23 @@ func test_bound_module_visibility_rejects_invalid_relationships() -> Bool:
 						_:
 							False
 
+					invalid_source_direct_count = match bound_module_visibility(
+						owner_scope,
+						[first],
+						[first],
+						2,
+					):
+						BoundModuleVisibilityInvalidSourceDirectCount(count):
+							count == 2
+						_:
+							False
+
 					valid = match (
 						bound_module_visibility(
+							owner_scope,
 							[first, second],
 							[first],
+							1,
 						)
 					):
 						BoundModuleVisibilityReady(_):
@@ -517,9 +543,88 @@ func test_bound_module_visibility_rejects_invalid_relationships() -> Bool:
 						_:
 							False
 
-					duplicate_visible and missing_visible and duplicate_direct and valid
+					(
+						duplicate_visible
+						and missing_visible
+						and duplicate_direct
+						and invalid_source_direct_count
+						and valid
+					)
 				_:
 					False
+
+
+func test_bound_module_visibility_rejects_foreign_module_ids() -> Bool:
+	match (test_indexed_graph(), indexed_graph_build(
+			fixture_module_load_candidate(
+				"foreign-first.brp",
+				"pkg/first",
+				"pure func foreign_first(): 1",
+			),
+			[],
+		)):
+		(Some(owner_graph), Ok(foreign_graph)):
+			foreign_module = importable_module(indexed_graph_target_scope(foreign_graph))
+
+			match bound_module_visibility(
+				indexed_graph_target_scope(owner_graph),
+				[foreign_module],
+				[],
+				0,
+			):
+				BoundModuleVisibilityIncompatibleVisible(path):
+					path == "pkg/first"
+				_:
+					False
+		_:
+			False
+
+
+func test_bound_module_visibility_rejects_separately_issued_equal_graph() -> Bool:
+	match (test_indexed_graph(), test_indexed_graph()):
+		(Some(owner_graph), Some(foreign_graph)):
+			match indexed_graph_module_scopes(foreign_graph).get(0):
+				Some(foreign_scope):
+					foreign_module = importable_module(foreign_scope)
+
+					match bound_module_visibility(
+						indexed_graph_target_scope(owner_graph),
+						[foreign_module],
+						[],
+						0,
+					):
+						BoundModuleVisibilityIncompatibleVisible(path):
+							path == "pkg/first"
+						_:
+							False
+				None:
+					False
+		_:
+			False
+
+
+func test_bound_module_visibility_rejects_foreign_direct_module_id() -> Bool:
+	match (test_indexed_graph(), test_indexed_graph()):
+		(Some(owner_graph), Some(foreign_graph)):
+			match (
+				indexed_graph_module_scopes(owner_graph).get(0),
+				indexed_graph_module_scopes(foreign_graph).get(0),
+			):
+				(Some(owner_scope), Some(foreign_scope)):
+					match bound_module_visibility(
+						indexed_graph_target_scope(owner_graph),
+						[importable_module(owner_scope)],
+						[importable_module(foreign_scope)],
+						0,
+					):
+						BoundModuleVisibilityIncompatibleDirect(path):
+							path == "pkg/first"
+						_:
+							False
+				_:
+					False
+		_:
+			False
 
 
 func test_bound_graph_reuses_completed_binding_for_typecheck() -> Bool:
@@ -539,7 +644,7 @@ func test_bound_graph_reuses_completed_binding_for_typecheck() -> Bool:
 					graph_state(scope),
 					prepared_module_program(prepared_module_scope_module(scope)),
 					importable_index,
-					prepared_module_scope_canonical_path(scope),
+					scope,
 				),
 			)
 
@@ -593,7 +698,7 @@ private pure func partial_bound_graph_completion_is_exact() -> Option[Bool]:
 			graph_state(scope),
 			prepared_module_program(prepared_module_scope_module(scope)),
 			importable_index,
-			prepared_module_scope_canonical_path(scope),
+			scope,
 		),
 	).to_option()
 	headers ?= accepted_callable_headers(bound)
@@ -805,7 +910,7 @@ private pure func ctfe_artifact_binding_excludes_target() -> Option[Bool]:
 			graph_state(scope),
 			prepared_module_program(prepared_module_scope_module(scope)),
 			all_importable_index,
-			prepared_module_scope_canonical_path(scope),
+			scope,
 		),
 	).to_option()
 	topology ?= accepted_callable_headers(bound)
@@ -850,7 +955,7 @@ private pure func ctfe_artifact_binding_excludes_target_alias() -> Option[Bool]:
 			graph_state(scope),
 			prepared_module_program(prepared_module_scope_module(scope)),
 			all_importable_index,
-			prepared_module_scope_canonical_path(scope),
+			scope,
 		),
 	).to_option()
 	topology ?= accepted_callable_headers(bound)
@@ -894,7 +999,7 @@ private pure func accepted_ctfe_artifact_uses_alias_authority() -> Option[Bool]:
 			graph_state(scope),
 			prepared_module_program(prepared_module_scope_module(scope)),
 			all_importable_index,
-			prepared_module_scope_canonical_path(scope),
+			scope,
 		),
 	).to_option()
 	headers ?= accepted_callable_headers(bound)
@@ -956,7 +1061,7 @@ private pure func cross_module_global_cycles_are_recoverable() -> Option[Bool]:
 			graph_state(scope),
 			prepared_module_program(prepared_module_scope_module(scope)),
 			all_importable_index,
-			prepared_module_scope_canonical_path(scope),
+			scope,
 		),
 	).to_option()
 	headers ?= accepted_callable_headers(bound)
@@ -1101,6 +1206,18 @@ tests: TestSuite = {
 		(
 			"visibility rejects invalid relationships",
 			test_bound_module_visibility_rejects_invalid_relationships,
+		),
+		(
+			"visibility rejects IDs issued by another graph",
+			test_bound_module_visibility_rejects_foreign_module_ids,
+		),
+		(
+			"visibility rejects IDs issued by a separately built equal graph",
+			test_bound_module_visibility_rejects_separately_issued_equal_graph,
+		),
+		(
+			"visibility rejects a direct ID issued by another graph",
+			test_bound_module_visibility_rejects_foreign_direct_module_id,
 		),
 		(
 			"preserves recoverable binding diagnostics",

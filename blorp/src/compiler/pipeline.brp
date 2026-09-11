@@ -43,7 +43,7 @@ import:
 		resolved_module_identities_equal,
 		resolved_module_identity_storage_key,
 	stage_04_modules/module_surface: module_surface_for_program
-	stage_04_modules/module_table: ModuleId, ModuleTable
+	stage_04_modules/module_table: ModuleId, ModuleTable, module_table_canonical_path
 	stage_06_typecheck/bridge:
 		TypecheckGraphRequest,
 		TypecheckedGraph,
@@ -57,9 +57,18 @@ import:
 		FrontendTypecheckRequestError,
 		typecheck_frontend_graph_direct,
 		typecheck_request_for_frontend_module,
-	stage_06_typecheck/graph/definition_index: DefinitionTable
+	stage_06_typecheck/graph/definition_index:
+		DefinitionTable,
+		definition_id_runtime_value,
+		definition_table_module_table,
 	stage_06_typecheck/modules/import_binding:
-		ImportBinding(QualifiedModuleBinding, SelectiveDefinitionBinding),
+		ImportBinding(
+			GraphQualifiedModuleBinding,
+			GraphSelectiveDefinitionBinding,
+			GraphSelectiveTraitMethodBinding,
+			StandaloneQualifiedModuleBinding,
+			StandaloneSelectiveDefinitionBinding,
+		),
 	stage_08_core_lower/graph_prepare:
 		CoreGraphModules,
 		CoreGraphUnit,
@@ -100,7 +109,11 @@ import:
 	stage_09_core/pipeline_stage: CorePipelineStage(FinalStage)
 	stage_09_core/record_update: record_update_carrier_survives
 	stage_09_core/resolve:
-		CoreResolveImportBinding(CoreQualifiedModuleImport, CoreSelectiveDefinitionImport),
+		CoreResolveImportBinding(
+			CoreExactSelectiveDefinitionImport,
+			CoreQualifiedModuleImport,
+			CoreSelectiveDefinitionImport,
+		),
 		CoreResolveModuleImports,
 	stage_09_core/runtime_projection: core_runtime_projection_error_message, project_runtime_program
 	stage_10_backend/build_artifact_builder: build_artifact
@@ -469,12 +482,51 @@ private record CoreLoweringInput {
 }
 
 
-private pure func core_resolve_import_binding(binding: ImportBinding) -> CoreResolveImportBinding:
+private pure func core_resolve_import_binding(
+	definition_table: DefinitionTable,
+	binding: ImportBinding,
+) -> Option[CoreResolveImportBinding]:
+	module_table = definition_table_module_table(definition_table)
+
 	match binding:
-		QualifiedModuleBinding(local_name, module_path):
-			CoreQualifiedModuleImport(local_name, module_path)
-		SelectiveDefinitionBinding(local_name, module_path, source_name):
-			CoreSelectiveDefinitionImport(local_name, module_path, source_name)
+		GraphQualifiedModuleBinding(local_name, module_id):
+			module_path ?= module_table_canonical_path(module_table, module_id)
+			Some(CoreQualifiedModuleImport(local_name, module_path))
+		StandaloneQualifiedModuleBinding(local_name, module_path):
+			Some(CoreQualifiedModuleImport(local_name, module_path))
+		GraphSelectiveDefinitionBinding(local_name, _, definition_ids):
+			Some(
+				CoreExactSelectiveDefinitionImport(
+					local_name,
+					definition_ids.map(definition_id_runtime_value),
+				),
+			)
+		GraphSelectiveTraitMethodBinding(local_name, module_id, source_name):
+			module_path ?= module_table_canonical_path(module_table, module_id)
+			Some(CoreSelectiveDefinitionImport(local_name, module_path, source_name))
+		StandaloneSelectiveDefinitionBinding(local_name, module_path, source_name):
+			Some(CoreSelectiveDefinitionImport(local_name, module_path, source_name))
+
+
+private pure func core_resolve_import_bindings(
+	definition_table: DefinitionTable,
+	bindings: List[ImportBinding],
+) -> Option[List[CoreResolveImportBinding]]:
+	var resolved: List[CoreResolveImportBinding] = []
+	var failed: Bool = False
+
+	for binding in bindings:
+		if not failed:
+			match core_resolve_import_binding(definition_table, binding):
+				Some(item):
+					resolved = resolved.append(item)
+				None:
+					failed = True
+
+	if failed:
+		None
+	else:
+		Some(resolved)
 
 
 private pure func core_graph_unit(module: TypecheckedModule) -> CoreGraphUnit:
@@ -485,12 +537,35 @@ private pure func core_graph_unit(module: TypecheckedModule) -> CoreGraphUnit:
 
 
 private pure func core_resolve_module_imports(
+	definition_table: DefinitionTable,
 	module: TypecheckedModule,
-) -> CoreResolveModuleImports:
-	{
+) -> Option[CoreResolveModuleImports]:
+	bindings ?= core_resolve_import_bindings(definition_table, module.import_bindings)
+	Some({
 		module_name = typechecked_module_name(module),
-		import_bindings = module.import_bindings.map(core_resolve_import_binding)
-	}
+		import_bindings = bindings,
+	})
+
+
+private pure func core_resolve_module_import_list(
+	definition_table: DefinitionTable,
+	modules: List[TypecheckedModule],
+) -> Option[List[CoreResolveModuleImports]]:
+	var resolved: List[CoreResolveModuleImports] = []
+	var failed: Bool = False
+
+	for module in modules:
+		if not failed:
+			match core_resolve_module_imports(definition_table, module):
+				Some(imports):
+					resolved = resolved.append(imports)
+				None:
+					failed = True
+
+	if failed:
+		None
+	else:
+		Some(resolved)
 
 
 private pure func typed_decl_uses_source_include(decl: TypedDecl) -> Bool:
@@ -787,8 +862,17 @@ private pure func missing_main_error(path: String) -> String:
 private pure func core_lowering_input(
 	typechecked: TypecheckedGraph,
 	typed_summary: Option[String],
-) -> CoreLoweringInput:
-	{
+) -> Option[CoreLoweringInput]:
+	target_import_bindings ?= core_resolve_import_bindings(
+		typechecked.definition_table,
+		typechecked.target.import_bindings,
+	)
+	module_imports ?= core_resolve_module_import_list(
+		typechecked.definition_table,
+		typechecked.modules,
+	)
+
+	Some({
 		target_path = typechecked_module_path(typechecked.target),
 		target_module_name = typechecked_module_name(typechecked.target),
 		definition_table = typechecked.definition_table,
@@ -798,21 +882,22 @@ private pure func core_lowering_input(
 			typechecked.definition_table,
 			typechecked.modules.map(core_graph_unit),
 		),
-		target_import_bindings = typechecked.target.import_bindings.map(
-			core_resolve_import_binding,
-		),
-		module_imports = typechecked.modules.map(core_resolve_module_imports),
+		target_import_bindings = target_import_bindings,
+		module_imports = module_imports,
 		include_dirs = typechecked_graph_source_include_dirs(typechecked),
 		typed_summary = typed_summary,
-		next_def_id = typechecked.next_def_id
-	}
+		next_def_id = typechecked.next_def_id,
+	})
 
 
 pure func lower_typed_frontend_compilation(
 	typed: TypedFrontendCompilation,
 ) -> Result[LoweredCoreCompilation, List[String]]:
 	representation: TypedFrontendCompilationRep = from_opaque TypedFrontendCompilation(typed)
-	input = core_lowering_input(representation.typechecked, representation.typed_summary)
+	input ?= core_lowering_input(
+		representation.typechecked,
+		representation.typed_summary,
+	).to_result(["internal compiler error: qualified import target is outside its ModuleTable"])
 	prepared = prepare_core_graph(
 		input.definition_table,
 		input.target_module_id,

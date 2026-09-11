@@ -4,8 +4,9 @@ import:
 		module_identity_from_resolved,
 		resolved_module_identity_from_resolver,
 	../../../src/compiler/stage_06_typecheck/graph/definition_index: DefinitionTable
+	../../../src/compiler/stage_06_typecheck/graph/source_name_table: source_name_table
 	../../../src/compiler/stage_06_typecheck/modules/import_binding:
-		ImportBinding(QualifiedModuleBinding, SelectiveDefinitionBinding),
+		ImportBinding(StandaloneQualifiedModuleBinding, StandaloneSelectiveDefinitionBinding),
 	../../../src/compiler/stage_06_typecheck/modules/module_view:
 		COMPILER_MODULE_VIEW_EMPTY,
 		ImportedConstructorBinding,
@@ -14,6 +15,7 @@ import:
 			LocalNameAlreadyPresent,
 			LocalNameConflictsWithAlias,
 			LocalNameConflictsWithImportedName,
+			LocalNameInvalidSourceName,
 		),
 		ModuleAliasRegistration(
 			ModuleAliasAdded,
@@ -21,6 +23,7 @@ import:
 			ModuleAliasConflictsWithAlias,
 			ModuleAliasConflictsWithImportedName,
 			ModuleAliasConflictsWithLocalName,
+			ModuleAliasInvalidTarget,
 		),
 		ModuleView,
 		SelectiveNameRegistration(
@@ -28,24 +31,23 @@ import:
 			SelectiveNameConflictsWithAlias,
 			SelectiveNameConflictsWithImportedName,
 			SelectiveNameConflictsWithLocalName,
+			SelectiveNameInvalidTarget,
 		),
 		TopLevelNameKind(TopLevelFunction, TopLevelType),
 		module_view_accepted_alias_authority,
 		module_view_accepted_record_authority,
 		module_view_accepted_union_authority,
-		module_view_add_imported_module,
 		module_view_find_imported_name,
 		module_view_find_local_name,
-		module_view_find_module_alias,
-		module_view_has_imported_module,
+		module_view_find_standalone_module_alias,
+		module_view_for_graph,
 		module_view_has_selective_binding,
 		module_view_import_bindings,
 		module_view_imported_constructors,
-		module_view_imported_modules,
 		module_view_record_imported_constructor,
 		module_view_register_local_name,
-		module_view_register_module_alias,
 		module_view_register_selective_name,
+		module_view_register_standalone_module_alias,
 		module_view_with_accepted_alias_authority,
 		module_view_with_accepted_record_authority,
 		module_view_with_accepted_union_authority,
@@ -74,9 +76,14 @@ import:
 
 
 private pure func empty_definition_table() -> Option[DefinitionTable]:
-	fixture ?= definition_backed_type_fixture([
-		{module_path = "app/main", type_names = []},
-	])
+	fixture ?= definition_backed_type_fixture(
+		[
+			{
+				module_path = "app/main",
+				type_names = []
+			},
+		],
+	)
 	Some(definition_backed_type_fixture_definition_table(fixture))
 
 
@@ -85,7 +92,7 @@ pure func accepted_alias_view(
 	local_name: String,
 	module_path: String,
 ) -> Option[ModuleView]:
-	match module_view_register_module_alias(view, local_name, module_path):
+	match module_view_register_standalone_module_alias(view, local_name, module_path):
 		ModuleAliasAdded(next):
 			Some(next)
 		ModuleAliasAlreadyPresent:
@@ -108,9 +115,7 @@ pure func accepted_selective_view(
 
 
 func test_module_view_preserves_order_and_exact_indexes() -> Bool:
-	with_module = module_view_add_imported_module(COMPILER_MODULE_VIEW_EMPTY, "list")
-	with_duplicate_module = module_view_add_imported_module(with_module, "list")
-	with_alias = accepted_alias_view(with_duplicate_module, "List", "list")
+	with_alias = accepted_alias_view(COMPILER_MODULE_VIEW_EMPTY, "List", "list")
 
 	match with_alias:
 		Some(alias_view):
@@ -121,21 +126,19 @@ func test_module_view_preserves_order_and_exact_indexes() -> Bool:
 					bindings = module_view_import_bindings(view)
 
 					qualified_matches = match bindings.get(0):
-						Some(QualifiedModuleBinding(local_name, module_path)):
+						Some(StandaloneQualifiedModuleBinding(local_name, module_path)):
 							local_name == "List" and module_path == "list"
 						_:
 							False
 
 					selective_matches = match bindings.get(1):
-						Some(SelectiveDefinitionBinding(local_name, module_path, source_name)):
+						Some(StandaloneSelectiveDefinitionBinding(local_name, module_path, source_name)):
 							local_name == "map" and module_path == "list" and source_name == "map"
 						_:
 							False
 
 					(
-						module_view_imported_modules(view) == ["list"]
-						and module_view_has_imported_module(view, "list")
-						and module_view_find_module_alias(view, "List") == Some("list")
+						module_view_find_standalone_module_alias(view, "List") == Some("list")
 						and module_view_find_imported_name(
 							view,
 							"map",
@@ -166,7 +169,45 @@ func test_module_view_preserves_imported_constructor_parent() -> Bool:
 	module_view_imported_constructors(view) == [binding]
 
 
-private pure func without_unqualified_names_keeps_canonical_alias_authority_result() -> Option[Bool]:
+func test_fresh_graph_view_rejects_standalone_module_alias() -> Bool:
+	view = module_view_for_graph(source_name_table(["GraphAlias"]))
+
+	match module_view_register_standalone_module_alias(view, "Standalone", "pkg/standalone"):
+		ModuleAliasInvalidTarget:
+			(
+				module_view_find_standalone_module_alias(view, "Standalone").is_none()
+				and module_view_import_bindings(view).is_empty()
+			)
+		_:
+			False
+
+
+func test_fresh_graph_view_rejects_standalone_selective_name() -> Bool:
+	view = module_view_for_graph(source_name_table(["GraphAlias"]))
+
+	match module_view_register_selective_name(view, "map", "list", "map"):
+		SelectiveNameInvalidTarget:
+			(
+				module_view_find_imported_name(view, "map").is_none()
+				and module_view_import_bindings(view).is_empty()
+			)
+		_:
+			False
+
+
+func test_fresh_graph_view_rejects_standalone_local_name() -> Bool:
+	view = module_view_for_graph(source_name_table(["GraphLocal"]))
+
+	match module_view_register_local_name(view, "GraphLocal", TopLevelFunction):
+		LocalNameInvalidSourceName:
+			module_view_find_local_name(view, "GraphLocal").is_none()
+		_:
+			False
+
+
+private pure func without_unqualified_names_keeps_canonical_alias_authority_result(
+
+) -> Option[Bool]:
 	definition_table ?= empty_definition_table()
 	input: AcceptedAliasTableInput = {
 		definition_table = definition_table,
@@ -193,6 +234,7 @@ private pure func without_unqualified_names_keeps_canonical_alias_authority_resu
 					False
 		None:
 			False
+
 	Some(result)
 
 
@@ -200,7 +242,9 @@ func test_without_unqualified_names_keeps_canonical_alias_authority() -> Bool:
 	without_unqualified_names_keeps_canonical_alias_authority_result().get_or(False)
 
 
-private pure func without_unqualified_names_keeps_canonical_record_authority_result() -> Option[Bool]:
+private pure func without_unqualified_names_keeps_canonical_record_authority_result(
+
+) -> Option[Bool]:
 	definition_table ?= empty_definition_table()
 	input: AcceptedRecordTableInput = {
 		definition_table = definition_table,
@@ -224,6 +268,7 @@ private pure func without_unqualified_names_keeps_canonical_record_authority_res
 			).is_some()
 		None:
 			False
+
 	Some(result)
 
 
@@ -231,7 +276,9 @@ func test_without_unqualified_names_keeps_canonical_record_authority() -> Bool:
 	without_unqualified_names_keeps_canonical_record_authority_result().get_or(False)
 
 
-private pure func without_unqualified_names_keeps_canonical_union_authority_result() -> Option[Bool]:
+private pure func without_unqualified_names_keeps_canonical_union_authority_result(
+
+) -> Option[Bool]:
 	definition_table ?= empty_definition_table()
 	input: AcceptedUnionTableInput = {
 		definition_table = definition_table,
@@ -269,6 +316,7 @@ private pure func without_unqualified_names_keeps_canonical_union_authority_resu
 					False
 		None:
 			False
+
 	Some(accepted)
 
 
@@ -282,7 +330,7 @@ func test_module_view_rejects_namespace_conflicts() -> Bool:
 
 	match (with_alias, with_name):
 		(Some(alias_view), Some(name_view)):
-			alias_rebind_conflicts = match module_view_register_module_alias(
+			alias_rebind_conflicts = match module_view_register_standalone_module_alias(
 				alias_view,
 				"List",
 				"other/list",
@@ -303,7 +351,7 @@ func test_module_view_rejects_namespace_conflicts() -> Bool:
 				_:
 					False
 
-			selective_alias_conflicts = match module_view_register_module_alias(
+			selective_alias_conflicts = match module_view_register_standalone_module_alias(
 				name_view,
 				"map",
 				"other/list",
@@ -337,10 +385,10 @@ func test_module_view_rejects_namespace_conflicts() -> Bool:
 func test_same_module_alias_and_imported_name_can_coexist() -> Bool:
 	match accepted_selective_view(COMPILER_MODULE_VIEW_EMPTY, "Dict", "dict", "Dict"):
 		Some(with_name):
-			match module_view_register_module_alias(with_name, "Dict", "dict"):
+			match module_view_register_standalone_module_alias(with_name, "Dict", "dict"):
 				ModuleAliasAdded(view):
 					(
-						module_view_find_module_alias(view, "Dict") == Some("dict")
+						module_view_find_standalone_module_alias(view, "Dict") == Some("dict")
 						and module_view_find_imported_name(
 							view,
 							"Dict",
@@ -373,7 +421,7 @@ func test_local_and_imported_names_cannot_coexist() -> Bool:
 				_:
 					False
 
-			alias_after_local = match module_view_register_module_alias(
+			alias_after_local = match module_view_register_standalone_module_alias(
 				local_view,
 				"Widget",
 				"pkg/widget",
@@ -434,8 +482,7 @@ func test_local_and_imported_names_cannot_coexist() -> Bool:
 
 
 func test_clearing_unqualified_names_keeps_view_consistent() -> Bool:
-	with_module = module_view_add_imported_module(COMPILER_MODULE_VIEW_EMPTY, "list")
-	with_alias = accepted_alias_view(with_module, "List", "list")
+	with_alias = accepted_alias_view(COMPILER_MODULE_VIEW_EMPTY, "List", "list")
 
 	match with_alias:
 		Some(alias_view):
@@ -451,7 +498,7 @@ func test_clearing_unqualified_names_keeps_view_consistent() -> Bool:
 							bindings = module_view_import_bindings(cleared)
 
 							qualified_matches = match bindings.get(0):
-								Some(QualifiedModuleBinding(local_name, module_path)):
+								Some(StandaloneQualifiedModuleBinding(local_name, module_path)):
 									local_name == "List" and module_path == "list"
 								_:
 									False
@@ -459,8 +506,10 @@ func test_clearing_unqualified_names_keeps_view_consistent() -> Bool:
 							(
 								module_view_find_local_name(cleared, "local_map").is_none()
 								and module_view_find_imported_name(cleared, "map").is_none()
-								and module_view_find_module_alias(cleared, "List") == Some("list")
-								and module_view_has_imported_module(cleared, "list")
+								and module_view_find_standalone_module_alias(
+									cleared,
+									"List",
+								) == Some("list")
 								and bindings.length() == 1
 								and qualified_matches
 							)
@@ -479,6 +528,18 @@ tests: TestSuite = {
 		(
 			"preserves imported constructor parent",
 			test_module_view_preserves_imported_constructor_parent,
+		),
+		(
+			"fresh graph view rejects standalone module alias",
+			test_fresh_graph_view_rejects_standalone_module_alias,
+		),
+		(
+			"fresh graph view rejects standalone selective name",
+			test_fresh_graph_view_rejects_standalone_selective_name,
+		),
+		(
+			"fresh graph view rejects standalone local name",
+			test_fresh_graph_view_rejects_standalone_local_name,
 		),
 		(
 			"clearing unqualified names keeps canonical alias authority",
