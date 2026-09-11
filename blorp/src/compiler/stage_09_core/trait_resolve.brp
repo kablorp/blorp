@@ -9,6 +9,7 @@ import:
 	../stage_08_core_lower/identity: core_ufcs_function_name
 	builtin_registry: core_builtin_name
 	ir:
+		CoreBinaryOp,
 		CoreCallKind(
 			BuiltinCall,
 			DeferredTraitCall,
@@ -44,6 +45,7 @@ import:
 		),
 		CoreVar,
 		core_expr_type,
+	synth_scalar_operator: native_scalar_binary_impl_target, native_scalar_binary_target
 	trait_dispatch:
 		CoreTraitMethodIdentity,
 		core_binary_trait_method,
@@ -84,12 +86,9 @@ union CoreTraitResolveDiagnostic:
 	MissingSelectedTraitTarget(CoreTraitSelectedTargetDiagnostic)
 
 
-private record CoreTraitImplTarget {
-	trait_name: String,
-	method_name: String,
-	type_name: String,
-	mangled_name: String
-}
+private union CoreTraitImplTargetKind:
+	FunctionTraitTarget(String)
+	NativeBinaryTraitTarget(CoreBinaryOp)
 
 
 private record CoreGenericBuiltinTarget {
@@ -120,7 +119,7 @@ private pure func has_generic_builtin_target(
 
 
 private record CoreTraitResolveRegistry {
-	targets: Dict[String, CoreTraitImplTarget],
+	targets: Dict[String, CoreTraitImplTargetKind],
 	generic_builtin_targets: List[CoreGenericBuiltinTarget],
 	types_by_method: Dict[String, List[String]],
 	static_self_methods: Dict[String, Bool]
@@ -334,21 +333,27 @@ private pure func add_impl_target(
 	registry: CoreTraitResolveRegistry,
 	trait_name: String,
 	type_name: String,
-	method_name: String,
+	method: CoreFunction,
 ) -> CoreTraitResolveRegistry:
-	target: CoreTraitImplTarget = {
-		trait_name = trait_name,
-		method_name = method_name,
-		type_name = type_name,
-		mangled_name = "${trait_name}_${method_name}_${type_name}"
-	}
-	key: String = method_key(trait_name, method_name)
+	mangled_name: String = "${trait_name}_${method.name}_${type_name}"
+
+	kind: CoreTraitImplTargetKind = match native_scalar_binary_impl_target(
+		trait_name,
+		type_name,
+		method,
+	):
+		Some(op):
+			NativeBinaryTraitTarget(op)
+		None:
+			FunctionTraitTarget(mangled_name)
+
+	key: String = method_key(trait_name, method.name)
 	types: List[String] = registry.types_by_method.get_or(key, [])
 
 	{
 		targets = registry.targets.set(
-			target_key(trait_name, method_name, type_name),
-			target,
+			target_key(trait_name, method.name, type_name),
+			kind,
 		),
 		generic_builtin_targets = registry.generic_builtin_targets,
 		types_by_method = registry.types_by_method.set(
@@ -403,12 +408,7 @@ private pure func collect_impl(
 				var updated: CoreTraitResolveRegistry = registry
 
 				for method in implementation.methods:
-					updated = add_impl_target(
-						updated,
-						implementation.trait_name,
-						type_name,
-						method.name,
-					)
+					updated = add_impl_target(updated, implementation.trait_name, type_name, method)
 
 				updated
 
@@ -488,6 +488,28 @@ private pure func has_native_operator_fast_path(typ: CoreType) -> Bool:
 			False
 
 
+private pure func has_migrated_native_operator(
+	identity: CoreTraitMethodIdentity,
+	typ: CoreType,
+) -> Bool:
+	match core_trait_impl_type_key(typ):
+		Some(type_name):
+			native_scalar_binary_target(
+				identity.trait_name,
+				type_name,
+				identity.method_name,
+			).is_some()
+		None:
+			False
+
+
+private pure func uses_legacy_native_operator_fast_path(
+	identity: CoreTraitMethodIdentity,
+	typ: CoreType,
+) -> Bool:
+	has_native_operator_fast_path(typ) and not has_migrated_native_operator(identity, typ)
+
+
 private pure func has_builtin_to_string_fallback(typ: CoreType) -> Bool:
 	match typ:
 		TensorType(_) | RangeType:
@@ -537,7 +559,27 @@ private pure func target_for_dispatch(
 	registry: CoreTraitResolveRegistry,
 	identity: CoreTraitMethodIdentity,
 	dispatch: CoreType,
-) -> Option[CoreTraitImplTarget]:
+) -> Option[CoreTraitImplTargetKind]:
+	type_name ?= core_trait_impl_type_key(dispatch)
+
+	match registry.targets.get(target_key(identity.trait_name, identity.method_name, type_name)):
+		Some(target):
+			Some(target)
+		None:
+			native_scalar_binary_target(
+				identity.trait_name,
+				type_name,
+				identity.method_name,
+			).map(
+				func(op): NativeBinaryTraitTarget(op),
+			)
+
+
+private pure func registered_target_for_dispatch(
+	registry: CoreTraitResolveRegistry,
+	identity: CoreTraitMethodIdentity,
+	dispatch: CoreType,
+) -> Option[CoreTraitImplTargetKind]:
 	type_name ?= core_trait_impl_type_key(dispatch)
 	registry.targets.get(target_key(identity.trait_name, identity.method_name, type_name))
 
@@ -601,6 +643,19 @@ private pure func rewrite_callee(
 			)
 
 
+private pure func native_binary_expr(
+	op: CoreBinaryOp,
+	args: List[CoreExpr],
+	return_type: CoreType,
+	loc: CoreSourceLoc,
+) -> Option[CoreExpr]:
+	match args:
+		[left, right]:
+			Some(BinaryExpr(op, left, right, return_type, loc))
+		_:
+			None
+
+
 -- Prelude builtins are type-dispatched sentinels handled by later Core
 -- stages. A trait lookup miss must preserve that path instead of reporting a
 -- missing user impl. Explicit trait policy wins where the runtime sentinel's
@@ -657,23 +712,38 @@ private pure func rewrite_trait_call(
 	else:
 		match dispatch_type(context.registry, identity, args, return_type):
 			Some(dispatch):
-				match target_for_dispatch(context.registry, identity, dispatch):
-					Some(target):
-						primitive_self_call: Bool = (
-							context.in_function == Some(target.mangled_name)
-							and has_native_operator_fast_path(dispatch)
-						)
+				target: Option[CoreTraitImplTargetKind] = match original_kind:
+					SelectedTraitCall(_, _, _, _):
+						registered_target_for_dispatch(context.registry, identity, dispatch)
+					_:
+						target_for_dispatch(context.registry, identity, dispatch)
 
-						if primitive_self_call:
-							CallExpr(UnknownCall, callee, args, return_type, loc)
-						else:
-							CallExpr(
-								UnknownCall,
-								rewrite_callee(callee, target.mangled_name, loc),
-								args,
-								return_type,
-								loc,
-							)
+				match target:
+					Some(target):
+						match target:
+							NativeBinaryTraitTarget(op):
+								native_binary_expr(
+									op,
+									args,
+									return_type,
+									loc,
+								).get_or(CallExpr(original_kind, callee, args, return_type, loc))
+							FunctionTraitTarget(mangled_name):
+								primitive_self_call: Bool = (
+									context.in_function == Some(mangled_name)
+									and uses_legacy_native_operator_fast_path(identity, dispatch)
+								)
+
+								if primitive_self_call:
+									CallExpr(UnknownCall, callee, args, return_type, loc)
+								else:
+									CallExpr(
+										UnknownCall,
+										rewrite_callee(callee, mangled_name, loc),
+										args,
+										return_type,
+										loc,
+									)
 					None:
 						rewrite_unresolved_trait_call(
 							context.registry,
@@ -708,31 +778,35 @@ private pure func rewrite_operator(
 		Some(first):
 			dispatch: CoreType = core_expr_type(first)
 
-			if has_native_operator_fast_path(dispatch):
-				original
-			else:
-				match target_for_dispatch(context.registry, identity, dispatch):
-					Some(target):
-						CallExpr(
-							UnknownCall,
-							VarExpr(
-								{
-									name = target.mangled_name,
-									uniq = 0,
-									def_id = None
-								},
-								NamedType(
-									"",
-									[],
-								),
-								loc,
-							),
-							operands,
-							return_type,
-							loc,
-						)
-					None:
-						original
+			match target_for_dispatch(context.registry, identity, dispatch):
+				Some(target):
+					match target:
+						NativeBinaryTraitTarget(_):
+							original
+						FunctionTraitTarget(mangled_name):
+							if uses_legacy_native_operator_fast_path(identity, dispatch):
+								original
+							else:
+								CallExpr(
+									UnknownCall,
+									VarExpr(
+										{
+											name = mangled_name,
+											uniq = 0,
+											def_id = None
+										},
+										NamedType(
+											"",
+											[],
+										),
+										loc,
+									),
+									operands,
+									return_type,
+									loc,
+								)
+				None:
+					original
 		None:
 			original
 
@@ -938,10 +1012,13 @@ private pure func missing_impl_diagnostic(
 	if (
 		candidates.is_empty()
 		or target_for_dispatch(registry, identity, dispatch).is_some()
-		or trait_builtin_fallback_name(identity).is_some()
+		or (
+			trait_builtin_fallback_name(identity).is_some()
+			and not has_migrated_native_operator(identity, dispatch)
+		)
 	):
 		None
-	else if has_native_operator_fast_path(dispatch):
+	else if uses_legacy_native_operator_fast_path(identity, dispatch):
 		None
 	else:
 		Some(MissingTraitImpl({

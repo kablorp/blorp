@@ -1,6 +1,8 @@
 import:
 	../../../src/compiler/stage_09_core/ir:
+		CoreBinaryOp(AddOp, MultiplyOp, SubtractOp),
 		CoreDecl(FunctionDecl, ImplDecl, ValueRecordDecl),
+		CoreExpr(BinaryExpr),
 		CoreFunction,
 		CoreFunctionKind(BuiltinFunction, UnresolvedBuiltinFunction),
 		CoreParam,
@@ -12,10 +14,13 @@ import:
 	../../../src/compiler/stage_09_core/synth: synthesize_program
 	../../../src/compiler/stage_09_core/synth_error:
 		CoreSynthError(UnsupportedTensorReductionElement),
+	../../../src/compiler/stage_09_core/synth_scalar_operator: synthesize_scalar_operator_impl_body
 	test: TestSuite
 
 
 private INT_TYPE: CoreType = NamedType("Int", [])
+
+private INT16_TYPE: CoreType = NamedType("Int16", [])
 
 private FLOAT_TYPE: CoreType = NamedType("Float", [])
 
@@ -335,6 +340,78 @@ pure func test_synthesis_promotes_concrete_impl_method() -> Bool:
 			False
 
 
+private pure func synthesis_promotes_int16_operator(
+	trait_name: String,
+	method_name: String,
+	expected_op: CoreBinaryOp,
+) -> Bool:
+	builtin_method: CoreFunction = builtin_function(
+		"int16",
+		method_name,
+		[param("left", INT16_TYPE), param("right", INT16_TYPE)],
+		INT16_TYPE,
+	)
+	method: CoreFunction = { builtin_method | name = method_name }
+	program: CoreProgram = {
+		decls = [ImplDecl({
+				trait_name = trait_name,
+				for_type = INT16_TYPE,
+				type_params = [],
+				methods = [method],
+				loc = SyntheticSourceLoc,
+			})],
+		foreign_includes = []
+	}
+
+	match synthesize_program(program):
+		Ok(result):
+			match result.decls:
+				[ImplDecl(impl_info)]:
+					match impl_info.methods:
+						[synthesized]:
+							match synthesized.body:
+								Some(BinaryExpr(op, _, _, result_type, _)):
+									op == expected_op and result_type == INT16_TYPE
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_synthesis_promotes_int16_add_impl_to_native_operator() -> Bool:
+	synthesis_promotes_int16_operator("Addable", "add", AddOp)
+
+
+pure func test_synthesis_promotes_int16_subtract_impl_to_native_operator() -> Bool:
+	synthesis_promotes_int16_operator("Subtractable", "subtract", SubtractOp)
+
+
+pure func test_synthesis_promotes_int16_multiply_impl_to_native_operator() -> Bool:
+	synthesis_promotes_int16_operator("Multipliable", "multiply", MultiplyOp)
+
+
+pure func test_scalar_operator_synthesis_rejects_malformed_candidates() -> Bool:
+	params: List[CoreParam] = [param("left", INT16_TYPE), param("right", INT16_TYPE)]
+	canonical: CoreFunction = builtin_function("int16", "multiply", params, INT16_TYPE)
+	wrong_owner: CoreFunction = builtin_function("int8", "multiply", params, INT16_TYPE)
+	wrong_arity: CoreFunction = { canonical | params = [param("left", INT16_TYPE)] }
+	wrong_operand: CoreFunction = { canonical |
+		params = [param("left", INT16_TYPE), param("right", INT_TYPE)]
+	}
+	wrong_result: CoreFunction = { canonical | return_type = INT_TYPE }
+
+	(
+		synthesize_scalar_operator_impl_body("Multipliable", INT16_TYPE, canonical).is_some()
+		and [wrong_owner, wrong_arity, wrong_operand, wrong_result].all(pure func(candidate):
+			synthesize_scalar_operator_impl_body("Multipliable", INT16_TYPE, candidate).is_none()
+		)
+	)
+
+
 tests: TestSuite = {
 	description = "Compiler Core synthesis orchestrator",
 	tests = [
@@ -356,5 +433,21 @@ tests: TestSuite = {
 		("synthesis preserves unhandled builtin", test_synthesis_preserves_unhandled_builtin),
 		("synthesis preserves multi-decl order", test_synthesis_preserves_multi_decl_order),
 		("synthesis promotes concrete impl method", test_synthesis_promotes_concrete_impl_method),
+		(
+			"synthesis promotes Int16 add impl to native operator",
+			test_synthesis_promotes_int16_add_impl_to_native_operator,
+		),
+		(
+			"synthesis promotes Int16 subtract impl to native operator",
+			test_synthesis_promotes_int16_subtract_impl_to_native_operator,
+		),
+		(
+			"synthesis promotes Int16 multiply impl to native operator",
+			test_synthesis_promotes_int16_multiply_impl_to_native_operator,
+		),
+		(
+			"scalar operator synthesis rejects malformed candidates",
+			test_scalar_operator_synthesis_rejects_malformed_candidates,
+		),
 	]
 }

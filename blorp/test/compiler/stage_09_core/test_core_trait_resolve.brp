@@ -723,6 +723,38 @@ pure func addable_impl(receiver_type: CoreType) -> CoreDecl:
 	)
 
 
+pure func scalar_addable_impl(receiver_type: CoreType, source_module: String) -> CoreDecl:
+	method: CoreFunction = function(
+		"add",
+		11,
+		[param("left", receiver_type), param("right", receiver_type)],
+		receiver_type,
+		BinaryExpr(
+			AddOp,
+			var_expr("left", receiver_type),
+			var_expr("right", receiver_type),
+			receiver_type,
+			SyntheticSourceLoc,
+		),
+	)
+
+	impl_decl("Addable", receiver_type, [{ method | source_module = Some(source_module) }])
+
+
+pure func native_scalar_addable_impl(receiver_type: CoreType, source_module: String) -> CoreDecl:
+	match scalar_addable_impl(receiver_type, source_module):
+		ImplDecl(implementation):
+			impl_decl(
+				"Addable",
+				receiver_type,
+				implementation.methods.map(pure func(method):
+					{ method | function_kind = UnresolvedBuiltinFunction }
+				),
+			)
+		_:
+			scalar_addable_impl(receiver_type, source_module)
+
+
 pure func test_operator_resolves_for_record_type() -> Bool:
 	body: CoreExpr = BinaryExpr(
 		AddOp,
@@ -752,8 +784,8 @@ pure func test_operator_resolves_for_record_type() -> Bool:
 			False
 
 
-pure func test_primitive_operator_keeps_fast_path() -> Bool:
-	int_type: CoreType = named_type("Int")
+pure func test_int16_add_operator_uses_native_binary_target() -> Bool:
+	int_type: CoreType = named_type("Int16")
 	body: CoreExpr = BinaryExpr(
 		AddOp,
 		var_expr("left", int_type),
@@ -771,10 +803,164 @@ pure func test_primitive_operator_keeps_fast_path() -> Bool:
 		),
 	)
 
-	match resolved_main_body(program([main])):
+	match resolved_main_body(program([
+		addable_trait(int_type),
+		native_scalar_addable_impl(int_type, "int16"),
+		main,
+	])):
 		Some(BinaryExpr(AddOp, _, _, _, _)):
 			True
 		_:
+			False
+
+
+pure func test_int16_explicit_add_uses_native_binary_target() -> Bool:
+	int_type: CoreType = named_type("Int16")
+	body: CoreExpr = call(
+		DeferredTraitCall(
+			"Addable",
+			"add",
+		),
+		"add",
+		[var_expr("left", int_type), var_expr("right", int_type)],
+		int_type,
+	)
+	main: CoreDecl = FunctionDecl(
+		function(
+			"main",
+			20,
+			[param("left", int_type), param("right", int_type)],
+			int_type,
+			body,
+		),
+	)
+
+	match resolved_main_body(program([
+		addable_trait(int_type),
+		native_scalar_addable_impl(int_type, "int16"),
+		main,
+	])):
+		Some(BinaryExpr(AddOp, _, _, _, _)):
+			True
+		_:
+			False
+
+
+pure func test_int16_explicit_add_uses_compiler_native_target_without_source_impl() -> Bool:
+	int_type: CoreType = named_type("Int16")
+	body: CoreExpr = call(
+		DeferredTraitCall(
+			"Addable",
+			"add",
+		),
+		"add",
+		[var_expr("left", int_type), var_expr("right", int_type)],
+		int_type,
+	)
+	main: CoreDecl = FunctionDecl(
+		function(
+			"main",
+			20,
+			[param("left", int_type), param("right", int_type)],
+			int_type,
+			body,
+		),
+	)
+
+	match resolved_main_body(program([addable_trait(int_type), main])):
+		Some(BinaryExpr(AddOp, _, _, _, _)):
+			True
+		_:
+			False
+
+
+pure func test_selected_int16_add_registry_miss_is_an_error() -> Bool:
+	int_type: CoreType = named_type("Int16")
+	body: CoreExpr = call(
+		SelectedTraitCall(
+			"Addable",
+			"add",
+			"int16",
+			99,
+		),
+		"__ufcs_int16__add",
+		[var_expr("left", int_type), var_expr("right", int_type)],
+		int_type,
+	)
+	main: CoreDecl = FunctionDecl(
+		function(
+			"main",
+			20,
+			[param("left", int_type), param("right", int_type)],
+			int_type,
+			body,
+		),
+	)
+
+	match resolve_core_traits(program([addable_trait(int_type), main])):
+		Err(MissingSelectedTraitTarget(error)):
+			(
+				error.trait_name == "Addable"
+				and error.method_name == "add"
+				and error.module_name == "int16"
+				and error.def_id == 99
+			)
+		_:
+			False
+
+
+pure func test_wrong_owner_int16_add_remains_function_target() -> Bool:
+	int_type: CoreType = named_type("Int16")
+	body: CoreExpr = BinaryExpr(
+		AddOp,
+		var_expr("left", int_type),
+		var_expr("right", int_type),
+		int_type,
+		SyntheticSourceLoc,
+	)
+	main: CoreDecl = FunctionDecl(
+		function(
+			"main",
+			20,
+			[param("left", int_type), param("right", int_type)],
+			int_type,
+			body,
+		),
+	)
+
+	match resolved_main_body(program([
+		addable_trait(int_type),
+		scalar_addable_impl(int_type, "user/math"),
+		main,
+	])):
+		Some(resolved):
+			call_targets(resolved, True, "Addable_add_Int16")
+		None:
+			False
+
+
+pure func test_wrong_owner_int16_impl_operator_remains_recursive() -> Bool:
+	int_type: CoreType = named_type("Int16")
+
+	match resolve_core_traits(program([
+		addable_trait(int_type),
+		scalar_addable_impl(int_type, "user/math"),
+	])):
+		Ok(resolved):
+			match resolved.decls.get(1):
+				Some(ImplDecl(implementation)):
+					match implementation.methods.get(0):
+						Some(method):
+							match method.body:
+								Some(body):
+									call_targets(body, True, "Addable_add_Int16")
+								None:
+									False
+						None:
+							False
+				_:
+					False
+		Err(_):
 			False
 
 
@@ -1143,7 +1329,30 @@ tests: TestSuite = {
 			test_aliased_equals_builtin_fallback_uses_canonical_name,
 		),
 		("record operator resolves", test_operator_resolves_for_record_type),
-		("primitive operator keeps fast path", test_primitive_operator_keeps_fast_path),
+		(
+			"Int16 add operator uses native target",
+			test_int16_add_operator_uses_native_binary_target,
+		),
+		(
+			"Int16 explicit add uses native target",
+			test_int16_explicit_add_uses_native_binary_target,
+		),
+		(
+			"Int16 explicit add uses compiler native target without source impl",
+			test_int16_explicit_add_uses_compiler_native_target_without_source_impl,
+		),
+		(
+			"selected Int16 add registry miss is an error",
+			test_selected_int16_add_registry_miss_is_an_error,
+		),
+		(
+			"wrong-owner Int16 add remains function target",
+			test_wrong_owner_int16_add_remains_function_target,
+		),
+		(
+			"wrong-owner Int16 impl operator remains recursive",
+			test_wrong_owner_int16_impl_operator_remains_recursive,
+		),
 		(
 			"unregistered trait call falls through",
 			test_unregistered_trait_call_falls_through_to_later_resolution,
