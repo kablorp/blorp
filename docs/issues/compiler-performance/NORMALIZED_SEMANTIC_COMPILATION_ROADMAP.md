@@ -1,9 +1,8 @@
 # Normalized Semantic Compilation Roadmap
 
 **Status:** Steps 1 and 2a-2d are complete; Step 2e is in progress. Its first
-five bounded packets normalized qualified-alias, local-declaration,
-selective-import, accepted-global visibility source-name identity, and imported
-accepted-global target identity without retaining parallel graph string indexes.
+two bounded packets normalized qualified-alias and local-declaration
+source-name identity without pre-paying for unmigrated visibility relations.
 
 **Scope:** One compiler invocation and one immutable analysis snapshot. This
 roadmap makes accepted and recoverable semantic facts directly queryable by the
@@ -834,46 +833,12 @@ source-string-to-ID projection, but reuses that ID for all subsequent local
 and alias probes. It retains no additional objects and grows allocated bytes
 only 0.28%.
 
-The third Step 2e packet is
-[`74-normalize-selective-local-name-identities.md`](74-normalize-selective-local-name-identities.md):
-the graph source-name table now admits selective aliases, unaliased selections,
-explicit constructors, and combined module aliases. Selected trait methods use
-the same import admission; unselected method declarations remain excluded.
-Graph imported-name lookup replaces `Dict[String, ImportedNameBinding]` with
-`Dict[Int, ImportedNameBinding]`; all collision consumers use the normalized
-relation, uncataloged graph names fail closed, and standalone helpers keep a
-separately named string map. The old graph map is deleted. Retained objects
-are neutral, allocated bytes are effectively flat, and isolated peak memory
-improves 0.67%. Production instructions, RSS, footprint, and compiler size
-remain within 0.53%. One-shot cycles are recorded as noisy rather than
-averaged away.
-
-ID-aware source-name caller boundaries, trait-method target identity, CTFE's
-string-keyed global environment, qualified Core lookup, and complete
-visibility precedence remain for later Step 2e packets. Each packet must use
-the shared name/visibility table to delete one old string-keyed relation rather
-than add a parallel index beside it, and should carry IDs forward from
-admission where that avoids repeated source-string projection.
-
-The fourth Step 2e packet is
-[`75-normalize-accepted-global-visibility-names.md`](75-normalize-accepted-global-visibility-names.md):
-accepted-global unqualified lookup now retains `SourceNameId` keys and the
-graph's spelling projection rather than a second string-keyed semantic index.
-Missing local-global catalog membership fails closed. The isolated bound-phase
-screen is exactly neutral for allocations, releases, retained objects,
-allocated bytes, and compiler size; instructions move +0.25%, with all native
-and memory guards within 0.27%.
-
-The fifth Step 2e packet is
-[`76-normalize-accepted-global-selective-targets.md`](76-normalize-accepted-global-selective-targets.md):
-accepted-global construction now carries exact `GlobalId` targets from graph
-selective import admission. The former module-path plus original-name join is
-deleted, while table provenance and target ownership fail closed. Source-only
-standalone imports remain syntax-only. In the accepted-graph screen,
-allocations, releases, retained objects, and allocated bytes are exactly
-neutral; retired instructions move +0.09%, RSS improves 0.04%, peak footprint
-improves 0.20%, and compiler size grows 0.0008%. One-shot wall time and cycles
-were noisy and are not used as claims.
+Selective `SourceNameId` relations, trait-method identity, CTFE's string-keyed
+global environment, qualified Core lookup, and complete visibility precedence
+remain for later Step 2e packets. Each packet must use the shared
+name/visibility table to delete one old string-keyed relation rather than add a
+parallel index beside it, and should carry IDs forward from admission where
+that avoids repeated source-string projection.
 
 ### Context
 

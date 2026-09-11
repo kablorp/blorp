@@ -92,8 +92,7 @@ private record ModuleViewRep {
 	standalone_module_aliases_by_local_name: Dict[String, String],
 	import_binding_domain: ImportBindingDomain,
 	imported_names: List[ImportedNameBinding],
-	graph_imported_names_by_source_name_id: Dict[Int, ImportedNameBinding],
-	standalone_imported_names_by_local_name: Dict[String, ImportedNameBinding],
+	imported_names_by_local_name: Dict[String, ImportedNameBinding],
 	imported_constructors: List[ImportedConstructorBinding],
 	import_bindings: List[ImportBinding],
 	graph_local_names_by_source_name_id: Dict[Int, TopLevelNameKind],
@@ -124,7 +123,6 @@ union SelectiveNameRegistration:
 	SelectiveNameConflictsWithAlias(String)
 	SelectiveNameConflictsWithImportedName(ImportedNameBinding)
 	SelectiveNameConflictsWithLocalName(TopLevelNameKind)
-	SelectiveNameInvalidSourceName
 	SelectiveNameInvalidTarget
 
 
@@ -151,8 +149,7 @@ COMPILER_MODULE_VIEW_EMPTY: ModuleView = module_view_from_rep({
 	standalone_module_aliases_by_local_name = {},
 	import_binding_domain = NoImportBindings,
 	imported_names = [],
-	graph_imported_names_by_source_name_id = {},
-	standalone_imported_names_by_local_name = {},
+	imported_names_by_local_name = {},
 	imported_constructors = [],
 	import_bindings = [],
 	graph_local_names_by_source_name_id = {},
@@ -410,25 +407,11 @@ private pure func module_view_graph_alias_label(
 			MODULE_IMPORT_TARGET_INVALID_LABEL
 
 
-private pure func module_view_rep_find_imported_name(
-	representation: ModuleViewRep,
-	local_name: String,
-) -> Option[ImportedNameBinding]:
-	match representation.source_name_table:
-		Some(table):
-			name_id ?= source_name_table_find_id(table, local_name)
-			representation.graph_imported_names_by_source_name_id.get(
-				source_name_id_table_index(name_id),
-			)
-		None:
-			representation.standalone_imported_names_by_local_name.get(local_name)
-
-
 pure func module_view_find_imported_name(
 	view: ModuleView,
 	local_name: String,
 ) -> Option[ImportedNameBinding]:
-	module_view_rep_find_imported_name(module_view_rep(view), local_name)
+	module_view_rep(view).imported_names_by_local_name.get(local_name)
 
 
 private pure func module_view_rep_find_local_name(
@@ -506,7 +489,7 @@ private pure func module_view_register_graph_module_alias_by_name_index(
 					),
 				)
 		None:
-			match representation.graph_imported_names_by_source_name_id.get(source_name_index):
+			match representation.imported_names_by_local_name.get(local_name):
 				Some(existing_binding):
 					if not module_view_graph_target_matches_path(
 						Some(module_table),
@@ -575,7 +558,7 @@ private pure func module_view_register_standalone_module_alias_unchecked(
 			else:
 				ModuleAliasConflictsWithAlias(existing_module_path)
 		None:
-			match representation.standalone_imported_names_by_local_name.get(local_name):
+			match representation.imported_names_by_local_name.get(local_name):
 				Some(existing_binding):
 					if existing_binding.module_path != module_path:
 						ModuleAliasConflictsWithImportedName(existing_binding)
@@ -656,84 +639,59 @@ pure func module_view_register_module_alias_target(
 		ModuleAliasInvalidTarget
 
 
-private pure func module_view_finish_add_selective_name(
+private pure func module_view_add_selective_name(
 	representation: ModuleViewRep,
-	binding: ImportedNameBinding,
+	local_name: String,
+	module_path: String,
+	source_name: String,
 	import_binding: ImportBinding,
-	domain: ImportBindingDomain,
 ) -> SelectiveNameRegistration:
+	binding: ImportedNameBinding = {
+		local_name = local_name,
+		module_path = module_path,
+		original_name = source_name
+	}
+
+	domain = match import_binding:
+		GraphQualifiedModuleBinding(_, _) | GraphSelectiveDefinitionBinding(_, _, _) | GraphSelectiveTraitMethodBinding(_, _, _):
+			GraphImportBindings
+		StandaloneQualifiedModuleBinding(_, _) | StandaloneSelectiveDefinitionBinding(_, _, _):
+			StandaloneImportBindings
+
 	SelectiveNameAdded(module_view_from_rep({ representation |
 				import_binding_domain = domain,
 				imported_names = representation.imported_names.append(binding),
+				imported_names_by_local_name = representation.imported_names_by_local_name.set(
+					local_name,
+					binding,
+				),
 				import_bindings = representation.import_bindings.append(import_binding)
 			}))
 
 
-private pure func module_view_add_graph_selective_name(
-	representation: ModuleViewRep,
-	source_name_index: Int,
+private pure func module_view_register_selective_name_with_table(
+	view: ModuleView,
+	module_table: Option[ModuleTable],
 	local_name: String,
 	module_path: String,
 	source_name: String,
 	import_binding: ImportBinding,
 ) -> SelectiveNameRegistration:
-	binding: ImportedNameBinding = {
-		local_name = local_name,
-		module_path = module_path,
-		original_name = source_name
-	}
-	next = { representation |
-		graph_imported_names_by_source_name_id = representation.graph_imported_names_by_source_name_id.set(
-			source_name_index,
-			binding,
-		)
-	}
-	module_view_finish_add_selective_name(next, binding, import_binding, GraphImportBindings)
+	representation = module_view_rep(view)
 
-
-private pure func module_view_add_standalone_selective_name(
-	representation: ModuleViewRep,
-	local_name: String,
-	module_path: String,
-	source_name: String,
-	import_binding: ImportBinding,
-) -> SelectiveNameRegistration:
-	binding: ImportedNameBinding = {
-		local_name = local_name,
-		module_path = module_path,
-		original_name = source_name
-	}
-	next = { representation |
-		standalone_imported_names_by_local_name = representation.standalone_imported_names_by_local_name.set(
-			local_name,
-			binding,
-		)
-	}
-	module_view_finish_add_selective_name(next, binding, import_binding, StandaloneImportBindings)
-
-
-private pure func module_view_register_graph_selective_name(
-	representation: ModuleViewRep,
-	module_table: ModuleTable,
-	source_name_index: Int,
-	local_name: String,
-	module_path: String,
-	source_name: String,
-	import_binding: ImportBinding,
-) -> SelectiveNameRegistration:
-	match representation.graph_imported_names_by_source_name_id.get(source_name_index):
+	match representation.imported_names_by_local_name.get(local_name):
 		Some(existing_binding):
 			SelectiveNameConflictsWithImportedName(existing_binding)
 		None:
-			match representation.graph_module_aliases_by_source_name_id.get(source_name_index):
+			match module_view_find_graph_module_alias(view, local_name):
 				Some(existing_module_id):
-					if module_table_canonical_path(
+					if module_view_graph_target_matches_path(
 						module_table,
 						existing_module_id,
-					) == Some(module_path):
-						module_view_add_graph_selective_name(
+						module_path,
+					):
+						module_view_add_selective_name(
 							representation,
-							source_name_index,
 							local_name,
 							module_path,
 							source_name,
@@ -742,60 +700,35 @@ private pure func module_view_register_graph_selective_name(
 					else:
 						SelectiveNameConflictsWithAlias(
 							module_view_graph_alias_label(
-								Some(module_table),
+								module_table,
 								existing_module_id,
 							),
 						)
 				None:
-					match representation.graph_local_names_by_source_name_id.get(source_name_index):
-						Some(existing_kind):
-							SelectiveNameConflictsWithLocalName(existing_kind)
+					match module_view_find_standalone_module_alias(view, local_name):
+						Some(existing_module_path):
+							if existing_module_path == module_path:
+								module_view_add_selective_name(
+									representation,
+									local_name,
+									module_path,
+									source_name,
+									import_binding,
+								)
+							else:
+								SelectiveNameConflictsWithAlias(existing_module_path)
 						None:
-							module_view_add_graph_selective_name(
-								representation,
-								source_name_index,
-								local_name,
-								module_path,
-								source_name,
-								import_binding,
-							)
-
-
-private pure func module_view_register_standalone_selective_name(
-	representation: ModuleViewRep,
-	local_name: String,
-	module_path: String,
-	source_name: String,
-	import_binding: ImportBinding,
-) -> SelectiveNameRegistration:
-	match representation.standalone_imported_names_by_local_name.get(local_name):
-		Some(existing_binding):
-			SelectiveNameConflictsWithImportedName(existing_binding)
-		None:
-			match representation.standalone_module_aliases_by_local_name.get(local_name):
-				Some(existing_module_path):
-					if existing_module_path == module_path:
-						module_view_add_standalone_selective_name(
-							representation,
-							local_name,
-							module_path,
-							source_name,
-							import_binding,
-						)
-					else:
-						SelectiveNameConflictsWithAlias(existing_module_path)
-				None:
-					match representation.standalone_local_names_by_local_name.get(local_name):
-						Some(existing_kind):
-							SelectiveNameConflictsWithLocalName(existing_kind)
-						None:
-							module_view_add_standalone_selective_name(
-								representation,
-								local_name,
-								module_path,
-								source_name,
-								import_binding,
-							)
+							match module_view_rep_find_local_name(representation, local_name):
+								Some(existing_kind):
+									SelectiveNameConflictsWithLocalName(existing_kind)
+								None:
+									module_view_add_selective_name(
+										representation,
+										local_name,
+										module_path,
+										source_name,
+										import_binding,
+									)
 
 
 pure func module_view_register_selective_name_for_graph(
@@ -808,44 +741,33 @@ pure func module_view_register_selective_name_for_graph(
 	module_id: ModuleId,
 	definition_ids: List[DefinitionId],
 ) -> SelectiveNameRegistration:
-	representation = module_view_rep(view)
 	module_table = definition_table_module_table(issuing_definition_table)
-	name_index = module_view_graph_source_name_index(representation, local_name)
 
-	match name_index:
-		None:
-			SelectiveNameInvalidSourceName
-		Some(source_name_index):
-			if (
-				definition_tables_share_provenance(
-					active_definition_table,
-					issuing_definition_table,
-				)
-				and not module_view_has_standalone_import_bindings(view)
-				and module_table_canonical_path(module_table, module_id) == Some(module_path)
-				and definition_table_selective_definition_name(
-					issuing_definition_table,
-					module_id,
-					definition_ids,
-				) == Some(source_name)
-			):
-				module_view_register_graph_selective_name(
-					representation,
-					module_table,
-					source_name_index,
-					local_name,
-					module_path,
-					source_name,
-					GraphSelectiveDefinitionBinding(local_name, module_id, definition_ids),
-				)
-			else:
-				SelectiveNameInvalidTarget
+	if (
+		definition_tables_share_provenance(active_definition_table, issuing_definition_table)
+		and not module_view_has_standalone_import_bindings(view)
+		and module_table_canonical_path(module_table, module_id) == Some(module_path)
+		and definition_table_selective_definition_name(
+			issuing_definition_table,
+			module_id,
+			definition_ids,
+		) == Some(source_name)
+	):
+		module_view_register_selective_name_with_table(
+			view,
+			Some(module_table),
+			local_name,
+			module_path,
+			source_name,
+			GraphSelectiveDefinitionBinding(local_name, module_id, definition_ids),
+		)
+	else:
+		SelectiveNameInvalidTarget
 
 
 -- TraitMethodId is issued after this binding boundary. Preserve the public
 -- import row explicitly without pretending its source spelling is a generic
--- DefinitionId; a later target-identity packet can replace that spelling with
--- its visibility handle.
+-- DefinitionId; Step 2d can replace that spelling with its visibility handle.
 pure func module_view_register_graph_selective_trait_method(
 	view: ModuleView,
 	active_definition_table: DefinitionTable,
@@ -855,33 +777,23 @@ pure func module_view_register_graph_selective_trait_method(
 	source_name: String,
 	module_id: ModuleId,
 ) -> SelectiveNameRegistration:
-	representation = module_view_rep(view)
 	module_table = definition_table_module_table(issuing_definition_table)
-	name_index = module_view_graph_source_name_index(representation, local_name)
 
-	match name_index:
-		None:
-			SelectiveNameInvalidSourceName
-		Some(source_name_index):
-			if (
-				not definition_tables_share_provenance(
-					active_definition_table,
-					issuing_definition_table,
-				)
-				or module_table_canonical_path(module_table, module_id) != Some(module_path)
-				or module_view_has_standalone_import_bindings(view)
-			):
-				SelectiveNameInvalidTarget
-			else:
-				module_view_register_graph_selective_name(
-					representation,
-					module_table,
-					source_name_index,
-					local_name,
-					module_path,
-					source_name,
-					GraphSelectiveTraitMethodBinding(local_name, module_id, source_name),
-				)
+	if (
+		not definition_tables_share_provenance(active_definition_table, issuing_definition_table)
+		or module_table_canonical_path(module_table, module_id) != Some(module_path)
+		or module_view_has_standalone_import_bindings(view)
+	):
+		SelectiveNameInvalidTarget
+	else:
+		module_view_register_selective_name_with_table(
+			view,
+			Some(module_table),
+			local_name,
+			module_path,
+			source_name,
+			GraphSelectiveTraitMethodBinding(local_name, module_id, source_name),
+		)
 
 
 pure func module_view_register_selective_name(
@@ -896,8 +808,9 @@ pure func module_view_register_selective_name(
 	):
 		SelectiveNameInvalidTarget
 	else:
-		module_view_register_standalone_selective_name(
-			module_view_rep(view),
+		module_view_register_selective_name_with_table(
+			view,
+			None,
 			local_name,
 			module_path,
 			source_name,
@@ -936,13 +849,7 @@ private pure func module_view_add_local_name_without_alias_conflict(
 	kind: TopLevelNameKind,
 	storage: LocalNameStorage,
 ) -> LocalNameRegistration:
-	existing_import = match storage:
-		GraphLocalNameStorage(source_name_index):
-			representation.graph_imported_names_by_source_name_id.get(source_name_index)
-		StandaloneLocalNameStorage:
-			representation.standalone_imported_names_by_local_name.get(local_name)
-
-	match existing_import:
+	match representation.imported_names_by_local_name.get(local_name):
 		Some(existing_binding):
 			LocalNameConflictsWithImportedName(existing_binding)
 		None:
@@ -1049,8 +956,7 @@ pure func module_view_without_unqualified_names(view: ModuleView) -> ModuleView:
 	)
 	module_view_from_rep({ representation |
 			imported_names = [],
-			graph_imported_names_by_source_name_id = {},
-			standalone_imported_names_by_local_name = {},
+			imported_names_by_local_name = {},
 			imported_constructors = [],
 			import_bindings = qualified_bindings,
 			graph_local_names_by_source_name_id = {},
