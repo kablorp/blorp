@@ -1,6 +1,6 @@
 # Profiling Capability Roadmap
 
-**Status:** In progress (Issues 1-2 implemented)
+**Status:** In progress (Issues 1-3 implemented)
 
 **Created:** 2026-09-09
 
@@ -127,7 +127,7 @@ allocation, or runtime branch solely for profiling.
 
 1. [Replace name registration with dense profile function IDs](01-dense-profile-function-ids.md) - implemented
 2. [Introduce explicit count, exact, and selective instrumentation modes](02-profile-modes-and-selection.md) - implemented
-3. [Make exact timing fiber-correct and report self time](03-fiber-correct-exact-timing.md)
+3. [Make exact timing fiber-correct and report self time](03-fiber-correct-exact-timing.md) - implemented
 4. [Move exact counters to local shards and define structured output](04-local-aggregation-and-output.md)
 5. [Make optimized native sampling and symbolization first-class](05-native-sampling-and-symbol-maps.md)
 6. [Add one coherent profiling command and reproducible artifact bundle](06-unified-profile-command.md)
@@ -232,8 +232,11 @@ as an additional diagnostic, not as a replacement for the whole-compiler run.
 ### Timing protocol
 
 - Run one explicit warmup that is not included in the result.
-- Run at least seven alternating baseline/candidate pairs.
-- Use ten pairs when the median change is below 2%.
+- Run three alternating baseline/candidate pairs after one warmup when retired
+  instructions provide a clear deterministic signal.
+- Increase to five pairs only when the median is within 2%, crosses an
+  acceptance boundary, or dispersion could change the conclusion. Do not run
+  ten pairs by default.
 - Report every raw wall-time sample, median, median absolute deviation, and
   range.
 - When available on the host, record retired instructions and CPU cycles.

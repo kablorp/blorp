@@ -1305,12 +1305,20 @@ expect_exit "compile profile success" 0 \
 TOTAL=$((TOTAL + 1))
 if grep -qF '{"$blorp$program", "main"' "$profiled_c" \
 	&& grep -qF 'blorp_profile_start_id(0)' "$profiled_c" \
-	&& grep -qF 'atexit(blorp_profile_report)' "$profiled_c"
+	&& grep -qF '#define BLORP_PROFILE_EXACT_TIMING 1' "$profiled_c" \
+	&& ! grep -qF 'atexit(blorp_profile_report)' "$profiled_c"
 then
 	record_pass "compile profile emits runtime hooks"
 else
 	record_fail "compile profile emits runtime hooks" \
 		"missing function-level profile hooks in $profiled_c"
+fi
+TOTAL=$((TOTAL + 1))
+if grep -qF '#define BLORP_PROFILE_EXACT_TIMING 1' "$compiled_c"; then
+	record_fail "plain compile omits exact scheduler hooks" \
+		"plain artifact enabled exact-profile scheduler hooks"
+else
+	record_pass "plain compile omits exact scheduler hooks"
 fi
 expect_exit "compile profile window probe" 0 \
 	"$BLORP_BIN" compile --profile --no-format -o "$profile_window_c" "$profile_window_prog"
@@ -1334,7 +1342,7 @@ elif grep -qF "profile_window_setup_probe" <<<"$RUN_OUTPUT" \
 		"setup, crossing, or post-window function leaked into profile output
 $RUN_OUTPUT"
 elif ! grep -qF \
-	"invalid_start_ids=0 invalid_end_ids=0 unmatched_ends=0 out_of_order_ends=0 metadata_initialization_failures=0 stack_overflows=0" \
+	"invalid_start_ids=0 invalid_end_ids=0 unmatched_ends=0 out_of_order_ends=0 metadata_initialization_failures=0 stack_growth_failures=0" \
 	<<<"$RUN_OUTPUT"; then
 	record_fail "profile window isolates measured functions" \
 		"profile window reported a lost or corrupt frame
