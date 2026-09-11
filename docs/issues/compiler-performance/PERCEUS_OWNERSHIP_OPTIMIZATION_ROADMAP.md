@@ -1634,6 +1634,12 @@ gated by a current compiler/self-host occurrence census. Create the first
 record-only issue only when eligible nonescaping records occur often enough to
 measure; a synthetic-only win does not admit production complexity.
 
+This tranche removes a local container that is never stored. Folding a child
+record into the allocation of a surviving parent requires a uniform physical
+layout and a stronger escape contract; that separate admission experiment is
+defined by the
+[nested-record folding prototype roadmap](NESTED_RECORD_FOLDING_PROTOTYPE_ROADMAP.md).
+
 ### Start with scalar replacement
 
 Prefer eliminating an object to putting a heap-compatible ARC header on the C
