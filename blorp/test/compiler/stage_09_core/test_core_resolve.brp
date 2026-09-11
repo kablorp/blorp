@@ -87,7 +87,7 @@ import:
 		CoreTaskClosure,
 		CoreTensorForElementStorage(TensorForRawScalarElement),
 		CoreTensorRawScalarKind(TensorInt64Elements),
-		CoreType(FunctionType, NamedType, TupleType, VoidType),
+		CoreType(FunctionType, NamedType, TupleType, TypeParameterType, VoidType),
 		CoreUnionPayloadStorage(TypedUnionPayloadStorage),
 		CoreVar,
 		core_expr_to_json,
@@ -310,6 +310,37 @@ pure func unresolved_builtin_body_decl_in_module(
 		is_pure = True,
 		function_kind = UnresolvedBuiltinFunction,
 		def_id = def_id,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func generic_list_length_builtin_impl(def_id: Int) -> CoreDecl:
+	item_type: CoreType = TypeParameterType("T")
+	list_type: CoreType = NamedType("List", [item_type])
+
+	ImplDecl({
+		trait_name = "HasLength",
+		for_type = list_type,
+		type_params = [
+			{
+				name = "T",
+				bounds = []
+			},
+		],
+		methods = [
+			{
+				name = "length",
+				source_module = Some("list"),
+				type_params = ["T"],
+				params = [typed_param("items", list_type)],
+				return_type = int_type(),
+				body = None,
+				is_pure = True,
+				function_kind = UnresolvedBuiltinFunction,
+				def_id = def_id,
+				loc = SyntheticSourceLoc
+			},
+		],
 		loc = SyntheticSourceLoc,
 	})
 
@@ -2747,6 +2778,31 @@ pure func test_resolves_exact_selective_builtin_by_definition_id() -> Bool:
 	resolved_builtin_call_is(resolved, "blorp_sleep")
 
 
+pure func test_resolves_exact_selective_generic_builtin_trait_method() -> Bool:
+	definition_id: Int = 777
+	list_type: CoreType = NamedType("List", [int_type()])
+	call: CoreExpr = call_expr(
+		"length",
+		FunctionType(True, [list_type], int_type()),
+		[VarExpr(core_var("items", None), list_type, SyntheticSourceLoc)],
+	)
+	resolved: CoreProgram = resolve_core_program(
+		program([
+			function_decl_with_params(
+				"main",
+				1,
+				[typed_param("items", list_type)],
+				call,
+			),
+			generic_list_length_builtin_impl(definition_id),
+		]),
+		[exact_import_binding("length", [definition_id])],
+		[],
+	)
+
+	resolved_builtin_call_is(resolved, "blorp_length")
+
+
 pure func test_resolves_exact_selective_foreign_by_definition_id() -> Bool:
 	call: CoreExpr = call_expr("absolute", int_function_type(1), [int_literal(1)])
 	resolved: CoreProgram = resolve_core_program(program([
@@ -3301,6 +3357,39 @@ pure func test_rewrites_exact_selective_imported_value_by_definition_id() -> Boo
 			False
 
 
+pure func test_rewrites_exact_selective_function_valued_global() -> Bool:
+	definition_id: Int = 2
+	generator_type: CoreType = FunctionType(True, [int_type()], int_type())
+	resolved: CoreProgram = resolve_core_program(
+		program([
+			function_decl(
+				"main",
+				1,
+				VarExpr(core_var("GENERATOR", None), generator_type, SyntheticSourceLoc),
+			),
+			GlobalDecl({
+				name = core_var("property__GENERATOR", None),
+				source_module = Some("property"),
+				typ = generator_type,
+				init = VarExpr(core_var("identity", None), generator_type, SyntheticSourceLoc),
+				is_mutable = False,
+				is_const = True,
+				is_private = False,
+				def_id = definition_id,
+				loc = SyntheticSourceLoc,
+			}),
+		]),
+		[exact_import_binding("GENERATOR", [definition_id])],
+		[],
+	)
+
+	match main_body(resolved):
+		Some(VarExpr(variable, _, _)):
+			variable.name == "property__GENERATOR" and variable.def_id == Some(definition_id)
+		_:
+			False
+
+
 pure func test_invalid_exact_import_does_not_fall_through_to_global() -> Bool:
 	resolved: CoreProgram = resolve_core_program(program([
 			function_decl("main", 1, var_expr("answer")),
@@ -3665,6 +3754,10 @@ tests: TestSuite = {
 			test_resolves_exact_selective_builtin_by_definition_id,
 		),
 		(
+			"resolves exact selective generic builtin trait method",
+			test_resolves_exact_selective_generic_builtin_trait_method,
+		),
+		(
 			"resolves exact selective foreign by definition id",
 			test_resolves_exact_selective_foreign_by_definition_id,
 		),
@@ -3738,6 +3831,10 @@ tests: TestSuite = {
 		(
 			"rewrites exact selective imported value by definition id",
 			test_rewrites_exact_selective_imported_value_by_definition_id,
+		),
+		(
+			"rewrites exact selective function-valued global",
+			test_rewrites_exact_selective_function_valued_global,
 		),
 		(
 			"invalid exact import does not fall through to global",

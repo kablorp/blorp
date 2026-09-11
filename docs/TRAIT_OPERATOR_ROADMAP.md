@@ -1,10 +1,12 @@
 # Trait Operator Authorization Roadmap
 
-**Status:** Restored and rebased on the current compiler architecture. The
-numeric-scalar `Addable`, `Subtractable`, and `Multipliable` Core targets and
-std builtin bodies are implemented on `traits-correct`; the typechecking
-cutover plus `String`, `Fixed`, and tensor coverage remain before those phases
-are complete. The historical
+**Status:** Restored and rebased on the current compiler architecture. All five
+numeric-scalar arithmetic traits, `String` addition, and the four supported
+`Fixed` arithmetic traits now have exact Core targets and std builtin bodies on
+`traits-correct`. Scalar arithmetic authorization checks trait obligations
+during typechecking, and tensor arithmetic is an explicit native lifting of the
+element's exact arithmetic trait. The frontend's primitive arithmetic
+capability table and exclusion are deleted; migrating `Negatable` is next. The historical
 implementation remains on `codex/trait-system`, but it was not merged into
 current `main`. Its design and tests are useful references; its completion
 claims and paths are stale.
@@ -25,7 +27,8 @@ Implement and verify one trait at a time.
 
 ## Current State
 
-Current `main` still has the split model:
+The branch has introduced explicit Core implementation targets and migrated
+all five arithmetic traits for numeric scalars. The remaining split model is:
 
 - `blorp/src/compiler/stage_06_typecheck/infer.brp` directly authorizes
   primitive arithmetic, comparison, equality, and negation through type-shape
@@ -33,10 +36,8 @@ Current `main` still has the split model:
 - `blorp/src/compiler/stage_09_core/trait_resolve.brp` contains
   `has_native_operator_fast_path`, primitive self-call handling, and a
   missing-implementation exception.
-- `CoreTraitImplTarget` only stores a mangled function name; it cannot represent
-  a native unary or binary implementation explicitly.
-- Scalar modules under `standard_library/src/` still contain circular-looking
-  implementations such as `add(a, b): a + b`.
+- Numeric scalar `Negatable`, `Equatable`, and `Orderable` implementations still
+  contain circular-looking operator bodies.
 - The accepted semantic catalog now assigns exact `TraitId`, `TraitMethodId`,
   `ImplId`, and `CallableId` identities. This machinery postdates the historical
   roadmap and should decide whether a visible implementation authorizes an
@@ -130,7 +131,7 @@ Core builtin metadata decides execution. The typechecker does not depend on
 | `Addable` | signed and unsigned integer families; float family | `String`, `Fixed`, tensors; source collections remain function targets |
 | `Subtractable` | signed and unsigned integer families; float family | `Fixed`, tensors |
 | `Multipliable` | signed and unsigned integer families; float family | `Fixed`, tensors |
-| `Divisible` | signed and unsigned integer families; float family | division by zero returns zero; `Fixed`, tensors |
+| `Divisible` | signed and unsigned integer families; float family | integer division by zero returns zero; floats retain IEEE 754 behavior; `Fixed`, tensors |
 | `Modulable` | signed and unsigned integer families; float family | integer zero-divisor and floating remainder semantics |
 | `Negatable` | signed integer and float families | `Fixed`, tensors; unsigned integers remain rejected |
 | `Equatable` | exact native scalar set | enums, unions, tuples, tensors, ranges, and collections retain structural behavior |
@@ -197,8 +198,8 @@ Use this order:
 
 1. `Subtractable` (numeric-scalar slice implemented)
 2. `Multipliable` (numeric-scalar slice implemented)
-3. `Divisible`
-4. `Modulable`
+3. `Divisible` (numeric-scalar slice implemented)
+4. `Modulable` (numeric-scalar slice implemented)
 
 For each trait, add per-type std builtin markers, the marker-to-operation
 mapping, tests, native lowering, explicit-call coverage, generic coverage,

@@ -867,8 +867,14 @@ private record FloatModuloRuntime {
 }
 
 
+private enum InfallibleIntegerArithmeticOp:
+	InfallibleIntegerDivide
+	InfallibleIntegerModulo
+
+
 private C_ARTIFACT_HEADER_BODY: String =
 	|/* Blorp final Core C artifact */
+	|#include <limits.h>
 	|#include <math.h>
 	|#include <stdint.h>
 	|#include <stdio.h>
@@ -2963,12 +2969,58 @@ private pure func c_infix_expr(left_c: String, operator: String, right_c: String
 	"(" + left_c + " " + operator + " " + right_c + ")"
 
 
-private pure func c_zero_guarded_arithmetic_expr(
+private pure func signed_integer_min_c(typ: CoreType) -> Option[String]:
+	match typ:
+		NamedType(name, args):
+			if not args.is_empty():
+				None
+			else:
+				match name:
+					"Int" | "Int64":
+						Some("LONG_MIN")
+					"Int8":
+						Some("INT8_MIN")
+					"Int16":
+						Some("INT16_MIN")
+					"Int32":
+						Some("INT32_MIN")
+					"Int128":
+						Some("(-((__int128)(((unsigned __int128)1 << 127) - 1)) - 1)")
+					_:
+						None
+		_:
+			None
+
+
+private pure func c_infallible_integer_arithmetic_expr(
+	left_type: CoreType,
 	left_c: String,
-	operator: String,
+	operation: InfallibleIntegerArithmeticOp,
 	right_c: String,
 ) -> String:
-	"((" + right_c + ") == 0 ? 0 : (" + left_c + " " + operator + " " + right_c + "))"
+	c_type: String = TypeLayout.c_type_name(left_type)
+	prefix: String = "({ " + c_type + " __blorp_internal_arithmetic_left = " + left_c + "; " + c_type + " __blorp_internal_arithmetic_right = " + right_c + "; "
+
+	operator: String = match operation:
+		InfallibleIntegerDivide:
+			"/"
+		InfallibleIntegerModulo:
+			"%"
+
+	match signed_integer_min_c(left_type):
+		Some(minimum):
+			overflow_result: String = match operation:
+				InfallibleIntegerDivide:
+					minimum
+				InfallibleIntegerModulo:
+					"0"
+
+			prefix + ((
+				"(__blorp_internal_arithmetic_right == 0 ? 0 : (__blorp_internal_arithmetic_right"
+				+ " == -1 && __blorp_internal_arithmetic_left == "
+			)) + minimum + " ? " + overflow_result + " : (__blorp_internal_arithmetic_left " + operator + " __blorp_internal_arithmetic_right))); })"
+		None:
+			prefix + "(__blorp_internal_arithmetic_right == 0 ? 0 : (__blorp_internal_arithmetic_left " + operator + " __blorp_internal_arithmetic_right)); })"
 
 
 private pure func is_string_type(typ: CoreType) -> Bool:
@@ -3451,9 +3503,19 @@ private pure func c_primitive_binary_expr(
 			if is_ieee_float_type(left_type):
 				c_infix_expr(left_c, "/", right_c)
 			else:
-				c_zero_guarded_arithmetic_expr(left_c, "/", right_c)
+				c_infallible_integer_arithmetic_expr(
+					left_type,
+					left_c,
+					InfallibleIntegerDivide,
+					right_c,
+				)
 		ModuloOp:
-			c_zero_guarded_arithmetic_expr(left_c, "%", right_c)
+			c_infallible_integer_arithmetic_expr(
+				left_type,
+				left_c,
+				InfallibleIntegerModulo,
+				right_c,
+			)
 		EqualOp:
 			c_infix_expr(left_c, "==", right_c)
 		NotEqualOp:

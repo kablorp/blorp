@@ -6014,11 +6014,12 @@ private pure func type_satisfies_trait(
 	) == TraitObligationSatisfied
 
 
-private pure func tensor_element_supports_arithmetic(
+private pure func tensor_element_supports_native_arithmetic(
 	context: InferContext,
+	op: ParsedBinaryOp,
 	typ: SemanticType,
 ) -> Bool:
-	if is_any_integer_type(typ) or is_any_float_type(typ):
+	native_family: Bool = if is_any_integer_type(typ) or is_any_float_type(typ):
 		True
 	else:
 		match type_param_name(context, typ):
@@ -6030,6 +6031,8 @@ private pure func tensor_element_supports_arithmetic(
 			None:
 				False
 
+	native_family and type_satisfies_trait(context, typ, arithmetic_trait_name(op))
+
 
 private pure func dim_is_variadic(typ: SemanticType) -> Bool:
 	match typ:
@@ -6040,7 +6043,6 @@ private pure func dim_is_variadic(typ: SemanticType) -> Bool:
 
 
 private pure func tensor_arithmetic_result_type(
-	context: InferContext,
 	op: ParsedBinaryOp,
 	left_type: SemanticType,
 	right_type: SemanticType,
@@ -6049,26 +6051,19 @@ private pure func tensor_arithmetic_result_type(
 		None
 	else:
 		match (array_type_parts(left_type), array_type_parts(right_type)):
-			(Some((element, dims)), None):
-				if (
-					tensor_element_supports_arithmetic(context, element)
-					and types_equal(element, right_type)
-				):
+			(Some((element, _)), None):
+				if types_equal(element, right_type):
 					Some(left_type)
 				else:
 					None
-			(None, Some((element, dims))):
-				if (
-					tensor_element_supports_arithmetic(context, element)
-					and types_equal(left_type, element)
-				):
+			(None, Some((element, _))):
+				if types_equal(left_type, element):
 					Some(right_type)
 				else:
 					None
 			(Some((left_element, left_dims)), Some((right_element, right_dims))):
 				if (
-					tensor_element_supports_arithmetic(context, left_element)
-					and types_equal(left_element, right_element)
+					types_equal(left_element, right_element)
 					and not left_dims.any(dim_is_variadic)
 					and not right_dims.any(dim_is_variadic)
 					and types_equal(left_type, right_type)
@@ -6103,41 +6098,17 @@ private pure func open_exhaustiveness_scalar_name(typ: SemanticType) -> Option[S
 		None
 
 
-private pure func arithmetic_result_type(
+private pure func tensor_arithmetic_satisfies_trait(
 	context: InferContext,
 	op: ParsedBinaryOp,
 	left_type: SemanticType,
 	right_type: SemanticType,
-) -> Option[SemanticType]:
-	match tensor_arithmetic_result_type(context, op, left_type, right_type):
-		Some(result_type):
-			Some(result_type)
-		None:
-			if named_value_type_is(left_type, "Int") and named_value_type_is(right_type, "Int"):
-				Some(TYPE_INT)
-			else if (
-				named_value_type_is(left_type, "Float")
-				and named_value_type_is(right_type, "Float")
-			):
-				Some(TYPE_FLOAT)
-			else if (
-				is_fixed_type(left_type)
-				and is_fixed_type(right_type)
-				and not is_modulo_binary_op(op)
-			):
-				Some(SemanticNamedType("Fixed", []))
-			else if (
-				op == ParsedAddOp
-				and named_value_type_is(left_type, "String")
-				and named_value_type_is(right_type, "String")
-			):
-				Some(TYPE_STRING)
-			else if is_any_float_type(left_type) and types_equal(left_type, right_type):
-				Some(left_type)
-			else if is_any_integer_type(left_type) and types_equal(left_type, right_type):
-				Some(left_type)
-			else:
-				None
+) -> Bool:
+	match (array_type_parts(left_type), array_type_parts(right_type)):
+		(Some((element_type, _)), _) | (_, Some((element_type, _))):
+			tensor_element_supports_native_arithmetic(context, op, element_type)
+		_:
+			False
 
 
 private pure func check_arithmetic_binary_op(
@@ -6146,9 +6117,18 @@ private pure func check_arithmetic_binary_op(
 	left_type: SemanticType,
 	right_type: SemanticType,
 ) -> CheckedType:
-	match arithmetic_result_type(context, op, left_type, right_type):
+	match tensor_arithmetic_result_type(op, left_type, right_type):
 		Some(result_type):
-			checked_type(context, result_type)
+			if tensor_arithmetic_satisfies_trait(context, op, left_type, right_type):
+				checked_type(context, result_type)
+			else:
+				next = infer_error(
+					context,
+					"Cannot apply " + binary_op_symbol(
+						op,
+					) + " to " + type_to_string(left_type) + " and " + type_to_string(right_type),
+				)
+				checked_type(next, TYPE_VOID)
 		None:
 			if array_type_parts(left_type).is_some() or array_type_parts(right_type).is_some():
 				next = infer_error(
@@ -6188,7 +6168,6 @@ private pure func check_arithmetic_binary_op(
 					_:
 						if (
 							types_equal(left_type, right_type)
-							and not is_equality_primitive_type(left_type)
 							and type_satisfies_trait(context, left_type, trait_name)
 						):
 							checked_type(context, left_type)
