@@ -261,11 +261,9 @@ Raw commands, hashes, and counters are retained in
 
 ## Next Packet
 
-Continue Step 2e with one remaining visibility family whose consumers can move
-together. Selective imported local names are the likely boundary, but the
-packet should first prove that registration and resolution can carry a
-`SourceNameId` without adding a second lookup or parallel index. Prefer passing
-the ID from admission into registration so the pipeline progressively stops
-re-projecting source strings. If that cannot be done within a small packet,
-normalize the narrower caller boundary first rather than bulk-cataloging names
-that still have string-only consumers.
+Completed by
+[`74-normalize-selective-local-name-identities.md`](74-normalize-selective-local-name-identities.md).
+That packet catalogs selective aliases, unaliased selections, constructors,
+combined module aliases, and trait method spellings; replaces the graph
+imported-name string index with a source-name-ID index; and preserves
+standalone source tooling as an explicitly separate relation.
