@@ -1,22 +1,15 @@
 # Trait Operator Authorization Roadmap
 
-**Status:** The operator authorization architecture is implemented and passes
-the pinned-bootstrap build, self-hosted compiler, and focused operator gates.
-All arithmetic, negation, equality, and ordering operators use trait
-authorization. Native scalar operations, structural equality, and tensor
-lifting have exact Core targets; source implementations remain ordinary calls.
-Operator syntax, explicit trait calls, and specialized generic calls share the
-same dispatch path. The broad Core native-operator fast path, primitive
-self-call exception, and missing-implementation exceptions have been deleted.
-Generic tensor elements remain rejected because open numeric-family traits do
-not prove native storage.
-
-Equality and ordering retain their exact legacy operator bodies for one
-bootstrap generation. A narrow bridge recognizes only an exact operator body
-with the canonical scalar module, trait method, type, and signature as a native
-target. After a release containing this compiler is pinned, replace those
-bodies with their existing per-type builtin markers and delete
-`has_legacy_native_binary_body` and `binary_operators_equal`.
+**Status:** Complete. The operator authorization architecture passes the
+pinned-bootstrap build, self-hosted compiler, and focused operator gates. All
+arithmetic, negation, equality, and ordering operators use trait authorization.
+Native scalar operations, structural equality, and tensor lifting have exact
+Core targets; source implementations remain ordinary calls. Operator syntax,
+explicit trait calls, and specialized generic calls share the same dispatch
+path. The broad Core native-operator fast path, primitive self-call exception,
+legacy bootstrap bridge, and missing-implementation exceptions have been
+deleted. Generic tensor elements remain rejected because open numeric-family
+traits do not prove native storage.
 
 The historical implementation remains on `codex/trait-system`, but it was not
 merged into current `main`. Its design and tests are useful references; its
@@ -236,8 +229,7 @@ Equality is a separate slice because structural equality is not equivalent to
 native scalar equality.
 
 1. Replace native scalar implementation bodies with exact per-type builtin
-   markers and map them to equality operations. (Core targets are implemented;
-   the source marker swap is staged until the next bootstrap pin.)
+   markers and map them to equality operations. (Implemented.)
 2. Give every intended structural category (enums, unions, tuples, tensors,
    ranges, and standard collections) an explicit compiler-provided or source
    `Equatable` implementation. Do not retain a generic structural fallback.
@@ -253,9 +245,8 @@ native scalar equality.
 ### 6. Migrate `Orderable`
 
 1. Replace ordered scalar implementation bodies with exact per-type builtin
-   markers and map them to comparison operations. (Core targets are implemented
-   for signed and unsigned integers, floating-point scalars, `Char`, `String`,
-   and `Fixed`; the source marker swap is staged until the next bootstrap pin.)
+   markers and map them to comparison operations. (Implemented for signed and
+   unsigned integers, floating-point scalars, `Char`, `String`, and `Fixed`.)
 2. Verify all four comparison operators and explicit calls to `less_than`,
    `greater_than`, `less_than_or_equal`, and `greater_than_or_equal`.
    Cover both native overrides and source implementations that inherit the
@@ -282,8 +273,7 @@ After every capability class is represented and tested, delete:
 - string-keyed Core authorization indexes that are no longer needed;
   (Implemented. The remaining method index only supplies diagnostic
   candidates.)
-- circular scalar operator implementation bodies; (Arithmetic and negation are
-  implemented. Equality and ordering are staged for the next bootstrap pin.)
+- circular scalar operator implementation bodies; (Implemented.)
 - obsolete imports, helpers, comments, and tests. (Implemented; the dead-code
   analyzer found and prompted removal of the orphaned `in_function` context
   field.)
