@@ -70,17 +70,20 @@ single-authority design.
    the ID, signature, and declaring trait.
 4. Imported method signatures preserve their stored module qualification;
    owner-local signatures retain the existing localization behavior.
-5. Duplicate method-name diagnostics preserve their current source-oriented
-   trait names, projected from the conflicting IDs only when the diagnostic is
-   built.
-6. The public compatibility query that enumerates `(method, declaring trait)`
+5. Unqualified method visibility follows the same one-row-per-semantic-name
+   selection as trait and obligation lookup. Qualified-only traits with the
+   same source name do not conflict merely because their exact IDs differ.
+6. Duplicate method-name diagnostics preserve their current source-oriented
+   trait names, projected from conflicting selected IDs only when the
+   diagnostic is built.
+7. The public compatibility query that enumerates `(method, declaring trait)`
    pairs may project strings, but its internal traversal carries method IDs.
-7. Env fallback remains string-backed because standalone and compiler-builtin
+8. Env fallback remains string-backed because standalone and compiler-builtin
    trait methods do not necessarily belong to the accepted table.
-8. The current `TraitMethodCallee` and typed/Core call target remain a named
+9. The current `TraitMethodCallee` and typed/Core call target remain a named
    compatibility boundary. This packet does not extend into CTFE, Core, or C
    emission.
-9. No generic integer dictionary, raw storage-key reconstruction, parallel
+10. No generic integer dictionary, raw storage-key reconstruction, parallel
    method index, sentinel, or name-shape heuristic is introduced.
 
 ## Code Example
@@ -122,15 +125,22 @@ changed.
 ### 2. Build the target relation from canonical rows
 
 `table_trait_methods_seen` now returns `(source method name, TraitMethodId)`.
-Each declared method pairs its signature slot with the table-issued ID at that
-same slot. Supertrait traversal carries those exact pairs, so an inherited
-method continues to point at its declaring trait rather than the visible child
-trait.
+Each selected semantic trait row pairs every declared method signature slot
+with the table-issued ID at that same slot. The selection is shared with trait
+and obligation lookup, so qualified-only namesake rows do not become competing
+unqualified methods. Supertrait traversal carries those exact pairs, so an
+inherited method continues to point at its declaring trait rather than the
+visible child trait.
+
+Authority construction scans the already-unique visible row list and checks
+selection membership through zero-allocation direct dictionary iteration. This
+keeps multiple source aliases for one row from duplicating method registration
+without materializing a values list.
 
 The authority's source-visible dictionary stores those pairs directly. When a
-duplicate source method name names two different IDs, diagnostic construction
-projects the two owner IDs to trait names; diagnostic strings are not retained
-as the semantic relation.
+duplicate source method name names two different selected IDs, diagnostic
+construction projects the two owner IDs to trait names; diagnostic strings are
+not retained as the semantic relation.
 
 ### 3. Validate exact lookup at the table boundary
 
@@ -236,6 +246,11 @@ the exact trait-method lookup dominates compilation time.
   issue.
 
 ## Measurements
+
+These measurements record the original Issue 87 exact-identity cutover. The
+follow-up namesake correction preserves its allocation mechanism by using
+zero-allocation direct dictionary iteration; the historical latency counters
+below were not rebaselined for that correctness fix.
 
 The 32-call imported-trait-method probe remained semantically valid:
 
