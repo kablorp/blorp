@@ -209,6 +209,11 @@ Direct public traits remain available to semantic obligation and
 implementation resolution, but do not enter the bare method map solely because
 their module is reachable.
 
+Standalone source tooling retains syntax-only import rows when no dependency
+graph is loaded. Those rows carry no graph-issued identity, so accepted trait
+visibility ignores them and leaves them on the compatibility path; they neither
+grant accepted authority nor invalidate an otherwise provenance-correct table.
+
 The production adapter obtains the issuing table from the bound module's
 prepared scope definition index. It preserves a rejected visibility product as
 an explicit authority-preparation error instead of silently substituting an
@@ -342,6 +347,11 @@ threshold. Wall time is not a claim for this packet.
 
 ## Measurements
 
+These retained measurements describe the original accepted-identity change and
+predate the standalone-import compatibility correction documented above. The
+follow-up preserves the representation being measured and makes no new
+performance claim.
+
 The retained checked-bodies workload produced identical semantic and
 constructor checksums and identical semantic-work counts in one clean
 baseline/candidate pair. Allocations, releases, retained objects, allocated
@@ -366,10 +376,13 @@ and
 - The focused structural, declaration, bridge, state, JSON, CTFE IR, and Core
   lowering suites cover the representation, provenance, visibility,
   diagnostics, and final string-projection boundaries independently.
-- After the final production-provenance review correction, `make -j1`, the
-  144-test declaration suite, and `bin/blorp check --no-format
+- At the time of the final production-provenance review correction, `make -j1`,
+  the 144-test declaration suite, and `bin/blorp check --no-format
   blorp/src/main.brp` passed. Independent code and test reviews found no
   remaining issue or coverage gap.
+- Revalidation with bootstrap `dev-4e0437da1d17` passed the current 146-test
+  declaration suite, 123-test typecheck bridge suite, and all 4,500
+  compiler-owned tests.
 
 ## Performance Expectations And Rollback
 
