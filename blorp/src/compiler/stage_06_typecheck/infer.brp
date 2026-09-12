@@ -201,7 +201,6 @@ import:
 		accepted_find_impl_method_info,
 		accepted_find_qualified_trait_method_info,
 		accepted_find_unsatisfied_bound_type_param,
-		accepted_find_unsatisfied_trait_obligation,
 		accepted_resolve_exact_trait_obligation,
 		accepted_resolve_trait_obligation,
 		accepted_trait_allows_compiler_fallback,
@@ -295,7 +294,6 @@ import:
 		env_find_impl_method_info,
 		env_find_records_with_fields,
 		env_find_trait_method,
-		env_find_unsatisfied_trait_obligation,
 		env_get_constructor,
 		env_get_constructors,
 		env_get_func_info,
@@ -308,6 +306,7 @@ import:
 		env_get_type_params,
 		env_get_var_refinement,
 		env_get_var_type,
+		env_has_compiler_structural_equality,
 		env_is_scoped_resource_derived_var,
 		env_is_scoped_resource_related_var,
 		env_is_scoped_resource_var,
@@ -1127,26 +1126,52 @@ private pure func infer_find_impl_method_info(
 			env_find_impl_method_info(session.env, trait_name, method_name, receiver_type)
 
 
+private pure func infer_has_compiler_structural_equality(
+	session: InferSession,
+	obligation: TraitObligation,
+) -> Bool:
+	if obligation.trait_name != "Equatable":
+		False
+	else if env_has_compiler_structural_equality(session.env, obligation.obligation_type):
+		True
+	else:
+		match obligation.obligation_type:
+			SemanticNamedType(name, _):
+				match module_view_accepted_union_authority(session.facts.module_view):
+					Some(authority):
+						accepted_union_is_enum(authority, name).is_some()
+					None:
+						False
+			_:
+				False
+
+
 private pure func infer_resolve_trait_obligation(
 	session: InferSession,
 	obligation: TraitObligation,
 ) -> TraitObligationResolution:
-	match module_view_accepted_trait_implementation_authority(session.facts.module_view):
-		Some(authority):
-			accepted_resolve_trait_obligation(authority, session.env, obligation)
-		None:
-			env_resolve_trait_obligation(session.env, obligation)
+	if infer_has_compiler_structural_equality(session, obligation):
+		TraitObligationSatisfied
+	else:
+		match module_view_accepted_trait_implementation_authority(session.facts.module_view):
+			Some(authority):
+				accepted_resolve_trait_obligation(authority, session.env, obligation)
+			None:
+				env_resolve_trait_obligation(session.env, obligation)
 
 
 private pure func infer_find_unsatisfied_trait_obligation(
 	session: InferSession,
 	obligations: List[TraitObligation],
 ) -> Option[TraitObligation]:
-	match module_view_accepted_trait_implementation_authority(session.facts.module_view):
-		Some(authority):
-			accepted_find_unsatisfied_trait_obligation(authority, session.env, obligations)
-		None:
-			env_find_unsatisfied_trait_obligation(session.env, obligations)
+	var unsatisfied: Option[TraitObligation] = None
+
+	for obligation in obligations:
+		if infer_resolve_trait_obligation(session, obligation) == TraitObligationUnsatisfied:
+			unsatisfied = Some(obligation)
+			break
+
+	unsatisfied
 
 
 private pure func infer_find_unsatisfied_bound_type_param(
@@ -1158,8 +1183,8 @@ private pure func infer_find_unsatisfied_bound_type_param(
 		Some(authority):
 			accepted_find_unsatisfied_bound_type_param(authority, session.env, param, concrete_type)
 		None:
-			env_find_unsatisfied_trait_obligation(
-				session.env,
+			infer_find_unsatisfied_trait_obligation(
+				session,
 				trait_obligations_for_bound_type_param(param, concrete_type),
 			)
 
@@ -5950,41 +5975,6 @@ private pure func is_fixed_type(typ: SemanticType) -> Bool:
 	named_value_type_is(typ, "Fixed")
 
 
-private pure func is_orderable_primitive_type(typ: SemanticType) -> Bool:
-	(
-		named_value_type_is(typ, "Int")
-		or named_value_type_is(typ, "Float")
-		or named_value_type_is(typ, "String")
-		or named_value_type_is(typ, "Char")
-		or is_fixed_type(typ)
-		or is_any_float_type(typ)
-		or is_any_integer_type(typ)
-	)
-
-
-private pure func is_equality_primitive_type(typ: SemanticType) -> Bool:
-	is_orderable_primitive_type(typ) or named_value_type_is(typ, "Bool")
-
-
-private pure func is_enum_value_type(context: InferContext, typ: SemanticType) -> Bool:
-	match typ:
-		SemanticNamedType(name, args):
-			if args.length() != 0:
-				False
-			else:
-				match module_view_accepted_union_authority(context.state.facts.module_view):
-					Some(index):
-						accepted_union_is_enum(index, name).get_or(False)
-					None:
-						match env_get_type_kind(context.state.env, name):
-							Some(kind):
-								kind == TypeEnum
-							None:
-								False
-		_:
-			False
-
-
 private pure func type_param_name(context: InferContext, typ: SemanticType) -> Option[String]:
 	type_params = env_get_type_params(context.state.env)
 
@@ -6073,16 +6063,6 @@ private pure func tensor_arithmetic_result_type(
 					None
 			_:
 				None
-
-
-private pure func is_structural_equality_collection(typ: SemanticType) -> Bool:
-	match typ:
-		SemanticNamedType(name, _):
-			normalized_name: String = normalize_type_name(name)
-
-			normalized_name == "List" or normalized_name == "Dict" or normalized_name == "Set"
-		_:
-			False
 
 
 private pure func open_exhaustiveness_scalar_name(typ: SemanticType) -> Option[String]:
@@ -6191,39 +6171,36 @@ private pure func check_comparison_binary_op(
 	left_param_name = type_param_name(context, left_type)
 	right_param_name = type_param_name(context, right_type)
 
-	if types_equal(left_type, right_type) and is_orderable_primitive_type(left_type):
-		checked_type(context, TYPE_BOOL)
-	else:
-		match (left_param_name, right_param_name):
-			(Some(left_name), Some(right_name)):
-				if left_name != right_name:
-					next = infer_error(
-						context,
-						"Comparison requires the same type parameter, got " + left_name + " and " + right_name,
-					)
-					checked_type(next, TYPE_VOID)
-				else if type_satisfies_trait(context, left_type, "Orderable"):
-					checked_type(context, TYPE_BOOL)
-				else:
-					next = infer_error(
-						context,
-						"Type parameter '" + left_name + "' requires Orderable bound for comparison operators",
-					)
-					checked_type(next, TYPE_VOID)
-			_:
-				if (
-					types_equal(left_type, right_type)
-					and type_satisfies_trait(context, left_type, "Orderable")
-				):
-					checked_type(context, TYPE_BOOL)
-				else:
-					next = infer_error(
-						context,
-						"Comparison requires matching types that implement Orderable, got " + type_to_string(
-							left_type,
-						) + " and " + type_to_string(right_type),
-					)
-					checked_type(next, TYPE_VOID)
+	match (left_param_name, right_param_name):
+		(Some(left_name), Some(right_name)):
+			if left_name != right_name:
+				next = infer_error(
+					context,
+					"Comparison requires the same type parameter, got " + left_name + " and " + right_name,
+				)
+				checked_type(next, TYPE_VOID)
+			else if type_satisfies_trait(context, left_type, "Orderable"):
+				checked_type(context, TYPE_BOOL)
+			else:
+				next = infer_error(
+					context,
+					"Type parameter '" + left_name + "' requires Orderable bound for comparison operators",
+				)
+				checked_type(next, TYPE_VOID)
+		_:
+			if (
+				types_equal(left_type, right_type)
+				and type_satisfies_trait(context, left_type, "Orderable")
+			):
+				checked_type(context, TYPE_BOOL)
+			else:
+				next = infer_error(
+					context,
+					"Comparison requires matching types that implement Orderable, got " + type_to_string(
+						left_type,
+					) + " and " + type_to_string(right_type),
+				)
+				checked_type(next, TYPE_VOID)
 
 
 private pure func check_equality_binary_op(
@@ -6243,35 +6220,37 @@ private pure func check_equality_binary_op(
 			left_param_name = type_param_name(next_context, zonked_left)
 			right_param_name = type_param_name(next_context, zonked_right)
 
-			if (
-				is_equality_primitive_type(zonked_left)
-				or is_enum_value_type(next_context, zonked_left)
-				or is_structural_equality_collection(zonked_left)
-			):
-				checked_type(next_context, TYPE_BOOL)
-			else:
-				match (left_param_name, right_param_name):
-					(Some(left_name), Some(right_name)):
-						if left_name != right_name:
-							next = infer_error(
-								next_context,
-								"Cannot compare type parameters " + type_to_string(
-									zonked_left,
-								) + " and " + type_to_string(
-									zonked_right,
-								) + " because equality requires the same type",
-							)
-							checked_type(next, TYPE_VOID)
-						else if type_satisfies_trait(next_context, zonked_left, "Equatable"):
-							checked_type(next_context, TYPE_BOOL)
-						else:
-							next = infer_error(
-								next_context,
-								"Type parameter '" + left_name + "' requires Equatable bound for == and " + "!= operators. Add '" + left_name + ": Equatable' to the function signature",
-							)
-							checked_type(next, TYPE_VOID)
-					_:
+			match (left_param_name, right_param_name):
+				(Some(left_name), Some(right_name)):
+					if left_name != right_name:
+						next = infer_error(
+							next_context,
+							"Cannot compare type parameters " + type_to_string(
+								zonked_left,
+							) + " and " + type_to_string(
+								zonked_right,
+							) + " because equality requires the same type",
+						)
+						checked_type(next, TYPE_VOID)
+					else if type_satisfies_trait(next_context, zonked_left, "Equatable"):
 						checked_type(next_context, TYPE_BOOL)
+					else:
+						next = infer_error(
+							next_context,
+							"Type parameter '" + left_name + "' requires Equatable bound for == and " + "!= operators. Add '" + left_name + ": Equatable' to the function signature",
+						)
+						checked_type(next, TYPE_VOID)
+				_:
+					if type_satisfies_trait(next_context, zonked_left, "Equatable"):
+						checked_type(next_context, TYPE_BOOL)
+					else:
+						next = infer_error(
+							next_context,
+							"Equality requires an implementation of Equatable for " + type_to_string(
+								zonked_left,
+							),
+						)
+						checked_type(next, TYPE_VOID)
 		None:
 			next = infer_error(
 				context,
@@ -6347,14 +6326,16 @@ private pure func unary_operand_slot(op: ParsedUnaryOp, operand_type: SemanticTy
 			KeptValueSlot(operand_type)
 
 
-private pure func is_negatable_array_type(typ: SemanticType) -> Bool:
+private pure func tensor_negation_satisfies_trait(context: InferContext, typ: SemanticType) -> Bool:
 	match typ:
 		SemanticArrayType(element_type, _):
-			(
+			native_family = (
 				named_value_type_is(element_type, "Int")
 				or is_signed_integer_type(element_type)
 				or is_any_float_type(element_type)
 			)
+
+			native_family and type_satisfies_trait(context, element_type, "Negatable")
 		_:
 			False
 
@@ -6366,16 +6347,17 @@ private pure func check_unary_op(
 ) -> CheckedType:
 	match op:
 		ParsedNegateOp:
-			if named_value_type_is(operand_type, "Int"):
-				checked_type(context, TYPE_INT)
-			else if named_value_type_is(operand_type, "Float"):
-				checked_type(context, TYPE_FLOAT)
-			else if is_negatable_array_type(operand_type):
+			if tensor_negation_satisfies_trait(context, operand_type):
 				checked_type(context, operand_type)
-			else if is_any_float_type(operand_type):
-				checked_type(context, operand_type)
-			else if is_signed_integer_type(operand_type):
-				checked_type(context, operand_type)
+			else if array_type_parts(operand_type).is_some():
+				next = infer_error(
+					context,
+					(
+						"Tensor negation requires a concrete signed integer or floating-point element "
+						+ "type with a Negatable implementation, got "
+					) + type_to_string(operand_type),
+				)
+				checked_type(next, TYPE_VOID)
 			else if is_unsigned_integer_type(operand_type):
 				next = infer_error(
 					context,
@@ -6385,11 +6367,21 @@ private pure func check_unary_op(
 			else if type_satisfies_trait(context, operand_type, "Negatable"):
 				checked_type(context, operand_type)
 			else:
-				next = infer_error(
-					context,
-					"Negation requires numeric type, got " + type_to_string(operand_type),
-				)
-				checked_type(next, TYPE_VOID)
+				match type_param_name(context, operand_type):
+					Some(name):
+						next = infer_error(
+							context,
+							"Type parameter '" + name + "' requires Negatable bound for unary -. Add '" + name + ": Negatable' to the function signature",
+						)
+						checked_type(next, TYPE_VOID)
+					None:
+						next = infer_error(
+							context,
+							"Negation requires an implementation of Negatable for " + type_to_string(
+								operand_type,
+							),
+						)
+						checked_type(next, TYPE_VOID)
 		ParsedNotOp:
 			if named_value_type_is(operand_type, "Bool"):
 				checked_type(context, TYPE_BOOL)

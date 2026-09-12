@@ -1,15 +1,26 @@
 # Trait Operator Authorization Roadmap
 
-**Status:** Restored and rebased on the current compiler architecture. All five
-numeric-scalar arithmetic traits, `String` addition, and the four supported
-`Fixed` arithmetic traits now have exact Core targets and std builtin bodies on
-`traits-correct`. Scalar arithmetic authorization checks trait obligations
-during typechecking, and tensor arithmetic is an explicit native lifting of the
-element's exact arithmetic trait. The frontend's primitive arithmetic
-capability table and exclusion are deleted; migrating `Negatable` is next. The historical
-implementation remains on `codex/trait-system`, but it was not merged into
-current `main`. Its design and tests are useful references; its completion
-claims and paths are stale.
+**Status:** The operator authorization architecture is implemented and passes
+the pinned-bootstrap build, self-hosted compiler, and focused operator gates.
+All arithmetic, negation, equality, and ordering operators use trait
+authorization. Native scalar operations, structural equality, and tensor
+lifting have exact Core targets; source implementations remain ordinary calls.
+Operator syntax, explicit trait calls, and specialized generic calls share the
+same dispatch path. The broad Core native-operator fast path, primitive
+self-call exception, and missing-implementation exceptions have been deleted.
+Generic tensor elements remain rejected because open numeric-family traits do
+not prove native storage.
+
+Equality and ordering retain their exact legacy operator bodies for one
+bootstrap generation. A narrow bridge recognizes only an exact operator body
+with the canonical scalar module, trait method, type, and signature as a native
+target. After a release containing this compiler is pinned, replace those
+bodies with their existing per-type builtin markers and delete
+`has_legacy_native_binary_body` and `binary_operators_equal`.
+
+The historical implementation remains on `codex/trait-system`, but it was not
+merged into current `main`. Its design and tests are useful references; its
+completion claims and paths are stale.
 
 ## Objective
 
@@ -27,21 +38,14 @@ Implement and verify one trait at a time.
 
 ## Current State
 
-The branch has introduced explicit Core implementation targets and migrated
-all five arithmetic traits for numeric scalars. The remaining split model is:
-
-- `blorp/src/compiler/stage_06_typecheck/infer.brp` directly authorizes
-  primitive arithmetic, comparison, equality, and negation through type-shape
-  predicates.
-- `blorp/src/compiler/stage_09_core/trait_resolve.brp` contains
-  `has_native_operator_fast_path`, primitive self-call handling, and a
-  missing-implementation exception.
-- Numeric scalar `Negatable`, `Equatable`, and `Orderable` implementations still
-  contain circular-looking operator bodies.
-- The accepted semantic catalog now assigns exact `TraitId`, `TraitMethodId`,
-  `ImplId`, and `CallableId` identities. This machinery postdates the historical
-  roadmap and should decide whether a visible implementation authorizes an
-  operation. It must not import or contain Core operator kinds.
+The branch has migrated all five arithmetic traits plus `Negatable`,
+`Equatable`, and `Orderable`, including compiler-provided structural equality
+categories and native tensor lifting. The accepted semantic catalog assigns
+exact `TraitId`, `TraitMethodId`, `ImplId`, and `CallableId` identities and
+decides whether a visible implementation authorizes an operation. Core maps an
+already-authorized implementation to either an exact native operation or an
+ordinary source function target; it does not contain a broad primitive-type
+authorization predicate.
 
 The historical branch had working slices for arithmetic, negation, equality,
 and ordering, plus focused tests. Do not cherry-pick those commits wholesale:
@@ -213,11 +217,18 @@ arithmetic primitive authorization path. Retain operand and result-shape checks.
 ### 4. Migrate `Negatable`
 
 1. Add `NativeUnaryTraitTarget` if it was not introduced by the preparatory
-   representation slice.
-2. Add exact targets for signed integers and floats, then `Fixed` and tensors.
+   representation slice. (Implemented.)
+2. Add exact targets for signed integers and floats. (Implemented.)
 3. Verify that unsigned negation still fails in typechecking with an actionable
-   diagnostic.
-4. Remove the old primitive negation bypass and redundant scalar std bodies.
+   diagnostic. (Implemented.)
+4. Remove the old primitive scalar negation bypass and redundant scalar std
+   bodies. (Implemented.)
+5. Migrate tensor negation as a separate native lifting slice. (Implemented.)
+   Native lifting remains limited to concrete builtin element types because
+   open family traits do not prove a compatible runtime representation.
+   `Fixed` does not currently implement `Negatable` or support unary negation;
+   adding that behavior remains a separate language decision rather than part
+   of this migration.
 
 ### 5. Migrate `Equatable`
 
@@ -225,44 +236,57 @@ Equality is a separate slice because structural equality is not equivalent to
 native scalar equality.
 
 1. Replace native scalar implementation bodies with exact per-type builtin
-   markers and map them to equality operations.
+   markers and map them to equality operations. (Core targets are implemented;
+   the source marker swap is staged until the next bootstrap pin.)
 2. Give every intended structural category (enums, unions, tuples, tensors,
    ranges, and standard collections) an explicit compiler-provided or source
    `Equatable` implementation. Do not retain a generic structural fallback.
+   (Implemented with an exact compiler inventory.)
 3. Make unsupported concrete equality fail during typechecking rather than
-   passing broadly and failing in Core.
+   passing broadly and failing in Core. (Implemented; records without an
+   `Equatable` implementation are rejected.)
 4. Verify generic `T: Equatable`, explicit `equals` and `not_equals`, both
-   equality operators, and source-defined equality.
+   equality operators, and source-defined equality. (Implemented.)
 5. Delete the primitive equality predicate only after every intentional
-   structural category has an explicit replacement.
+   structural category has an explicit replacement. (Implemented.)
 
 ### 6. Migrate `Orderable`
 
 1. Replace ordered scalar implementation bodies with exact per-type builtin
-   markers and map them to comparison operations.
+   markers and map them to comparison operations. (Core targets are implemented
+   for signed and unsigned integers, floating-point scalars, `Char`, `String`,
+   and `Fixed`; the source marker swap is staged until the next bootstrap pin.)
 2. Verify all four comparison operators and explicit calls to `less_than`,
    `greater_than`, `less_than_or_equal`, and `greater_than_or_equal`.
    Cover both native overrides and source implementations that inherit the
-   default methods from `Orderable`.
-3. Preserve intended `String`, `Char`, and `Fixed` behavior.
+   default methods from `Orderable`. (Implemented.)
+3. Preserve intended `String`, `Char`, and `Fixed` behavior. (Implemented.)
 4. Keep unsupported `Bool`, tensor, and structural comparisons rejected unless
    the language contract is deliberately changed in a separate task.
-5. Delete the primitive ordering predicate and its Core bypasses.
+   (Implemented and covered in inference tests.)
+5. Delete the primitive ordering predicate and its Core bypasses. (Implemented.)
 
 ### 7. Delete the Split Model
 
 After every capability class is represented and tested, delete:
 
-- `has_native_operator_fast_path`;
+- `has_native_operator_fast_path`; (Implemented.)
 - integer/native operator type-name lists used only for authorization;
-- primitive self-call exceptions;
-- missing-implementation diagnostic exceptions;
-- `core_trait_method_builtin_fallback_name` and equivalent trait-method
-  builtin fallback routing once every caller has an explicit target;
-- superseded primitive predicates in inference;
+  (Implemented; the remaining integer-name helper serves non-operator
+  `Stringable` fallback.)
+- primitive self-call exceptions; (Implemented.)
+- missing-implementation diagnostic exceptions; (Implemented.)
+- `core_trait_method_builtin_fallback_name` and equivalent operator fallback
+  routing; (Implemented. Non-operator prelude builtin routing remains.)
+- superseded primitive predicates in inference; (Implemented.)
 - string-keyed Core authorization indexes that are no longer needed;
-- circular scalar operator implementation bodies;
-- obsolete imports, helpers, comments, and tests.
+  (Implemented. The remaining method index only supplies diagnostic
+  candidates.)
+- circular scalar operator implementation bodies; (Arithmetic and negation are
+  implemented. Equality and ordering are staged for the next bootstrap pin.)
+- obsolete imports, helpers, comments, and tests. (Implemented; the dead-code
+  analyzer found and prompted removal of the orphaned `in_function` context
+  field.)
 
 Run exact-reference searches and the unused-Blorp-code analyzer for every
 deleted helper. Do not leave compatibility shims; Blorp is pre-0.1.
@@ -270,14 +294,19 @@ deleted helper. Do not leave compatibility shims; Blorp is pre-0.1.
 ### 8. Documentation and Final Verification
 
 1. Update `docs/GUIDE.md` to explain compiler-provided trait implementations for
-   builtin types.
+   builtin types. (Implemented.)
 2. Update standard-library comments to describe native trait markers or
-   intrinsic bodies accurately.
+   intrinsic bodies accurately. (Implemented.)
 3. Regenerate embedded standard-library artifacts using repository build
-   commands; do not hand-edit generated output.
+   commands; do not hand-edit generated output. (Implemented by the self-hosted
+   build.)
 4. Inspect final Core and generated C for representative native, explicit-call,
-   generic-native, and source-defined cases.
+   generic-native, and source-defined cases. (Implemented in the retained
+   `scripts/test-trait-operators` audit.)
 5. Confirm the final production diff is a net architectural simplification.
+   (Implemented: the Core authorization path removes more production code than
+   it adds, with exact target and structural-type metadata replacing broad
+   exceptions.)
 
 ## Required Behavior Coverage
 
@@ -303,17 +332,11 @@ Before implementation, ensure focused tests cover:
 
 ## Fast Feedback Loop
 
-The historical `scripts/test-trait-operators` no longer exists. Recreate its
-useful behavior against current paths before changing implementation. The loop
-should include:
+The retained `scripts/test-trait-operators` covers the focused typechecker,
+Core lowering, synthesis, trait resolution, runtime, and generated-C cases:
 
 ```bash
-make
-bin/blorp test --timeout 180 \
-  blorp/test/compiler/stage_09_core/test_core_trait_resolve.brp \
-  blorp/test/compiler/stage_09_core/test_core_trait_resolve_diagnostics.brp \
-  blorp/test/compiler/stage_09_core/test_core_pipeline.brp
-blorp/test/compiler/pipeline/codegen_audit/run_codegen_audit.sh bin/blorp
+scripts/test-trait-operators bin/blorp
 ```
 
 Add focused runtime and codegen-audit fixtures to the retained script as they

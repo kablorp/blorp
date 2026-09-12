@@ -1,6 +1,6 @@
 import:
 	../../../src/compiler/stage_09_core/ir:
-		CoreBinaryOp(AddOp),
+		CoreBinaryOp(AddOp, EqualOp, GreaterEqualOp, GreaterOp, LessEqualOp, LessOp, NotEqualOp),
 		CoreCallKind(
 			BuiltinCall,
 			DeferredTraitCall,
@@ -8,7 +8,7 @@ import:
 			SelectedTraitCall,
 			UnknownCall,
 		),
-		CoreDecl(FunctionDecl, ImplDecl, TraitDecl),
+		CoreDecl(EnumDecl, FunctionDecl, ImplDecl, TraitDecl, UnionDecl),
 		CoreDimOp(DimDivide, DimMultiply, DimSubtract),
 		CoreExpr(
 			BinaryExpr,
@@ -16,6 +16,7 @@ import:
 			LiteralExpr,
 			LogicalExpr,
 			ResourceScopeExpr,
+			UnaryExpr,
 			VarExpr,
 			VoidExpr,
 		),
@@ -31,6 +32,7 @@ import:
 		CoreTraitDecl,
 		CoreTraitMethod,
 		CoreType(
+			EnumType,
 			FunctionType,
 			NamedType,
 			RangeType,
@@ -40,6 +42,8 @@ import:
 			TypeParameterType,
 			VoidType,
 		),
+		CoreUnaryOp(NegateOp),
+		CoreUnionPayloadStorage(TypedUnionPayloadStorage),
 		CoreVar,
 		core_expr_type,
 	../../../src/compiler/stage_09_core/trait_resolve:
@@ -161,6 +165,27 @@ pure func trait_decl(trait_name: String, methods: List[CoreTraitMethod]) -> Core
 	})
 
 
+pure func enum_decl(name: String) -> CoreDecl:
+	EnumDecl({
+		abi_type = None,
+		name = name,
+		type_params = [],
+		variants = [],
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func union_decl(name: String) -> CoreDecl:
+	UnionDecl({
+		abi_type = None,
+		name = name,
+		type_params = [],
+		payload_storage = TypedUnionPayloadStorage,
+		variants = [],
+		loc = SyntheticSourceLoc,
+	})
+
+
 pure func impl_decl(
 	trait_name: String,
 	for_type: CoreType,
@@ -216,6 +241,34 @@ pure func equatable_impl(receiver_type: CoreType) -> CoreDecl:
 				[param("left", receiver_type), param("right", receiver_type)],
 				named_type("Bool"),
 				bool_literal(True),
+			),
+		],
+	)
+
+
+pure func orderable_trait(receiver_type: CoreType) -> CoreDecl:
+	trait_decl(
+		"Orderable",
+		[
+			trait_method(
+				"less_than",
+				[param("left", receiver_type), param("right", receiver_type)],
+				named_type("Bool"),
+			),
+			trait_method(
+				"greater_than",
+				[param("left", receiver_type), param("right", receiver_type)],
+				named_type("Bool"),
+			),
+			trait_method(
+				"less_than_or_equal",
+				[param("left", receiver_type), param("right", receiver_type)],
+				named_type("Bool"),
+			),
+			trait_method(
+				"greater_than_or_equal",
+				[param("left", receiver_type), param("right", receiver_type)],
+				named_type("Bool"),
 			),
 		],
 	)
@@ -601,8 +654,8 @@ pure func test_non_trait_builtin_is_preserved() -> Bool:
 			False
 
 
-pure func test_equals_without_impl_uses_builtin_fallback() -> Bool:
-	enum_type: CoreType = named_type("TypeKind")
+pure func test_structural_equals_uses_native_target() -> Bool:
+	enum_type: CoreType = EnumType("TypeKind")
 	left: CoreExpr = var_expr("left", enum_type)
 	right: CoreExpr = var_expr("right", enum_type)
 	body: CoreExpr = call(
@@ -640,14 +693,14 @@ pure func test_equals_without_impl_uses_builtin_fallback() -> Bool:
 			main,
 		]))
 	):
-		Some(CallExpr(UnknownCall, VarExpr(variable, _, _), _, _, _)):
-			variable.name == "equals"
+		Some(BinaryExpr(EqualOp, _, _, NamedType("Bool", args), _)):
+			args.is_empty()
 		_:
 			False
 
 
-pure func test_aliased_equals_builtin_fallback_uses_canonical_name() -> Bool:
-	enum_type: CoreType = named_type("TypeKind")
+pure func test_aliased_structural_equals_uses_native_target() -> Bool:
+	enum_type: CoreType = EnumType("TypeKind")
 	left: CoreExpr = var_expr("left", enum_type)
 	right: CoreExpr = var_expr("right", enum_type)
 	body: CoreExpr = call(
@@ -685,8 +738,244 @@ pure func test_aliased_equals_builtin_fallback_uses_canonical_name() -> Bool:
 			main,
 		]))
 	):
-		Some(CallExpr(UnknownCall, VarExpr(variable, _, _), _, _, _)):
-			variable.name == "equals"
+		Some(BinaryExpr(EqualOp, _, _, NamedType("Bool", args), _)):
+			args.is_empty()
+		_:
+			False
+
+
+pure func test_named_enum_decl_structural_equals_uses_native_target() -> Bool:
+	enum_name: String = "compiler__TypeKind"
+	enum_type: CoreType = named_type(enum_name)
+	body: CoreExpr = call(
+		DeferredTraitCall(
+			"Equatable",
+			"equals",
+		),
+		"equals",
+		[var_expr("left", enum_type), var_expr("right", enum_type)],
+		named_type("Bool"),
+	)
+	main: CoreDecl = FunctionDecl(
+		function(
+			"main",
+			20,
+			[param("left", enum_type), param("right", enum_type)],
+			named_type("Bool"),
+			body,
+		),
+	)
+
+	match resolved_main_body(program([enum_decl(enum_name), equatable_trait(enum_type), main])):
+		Some(BinaryExpr(EqualOp, _, _, NamedType("Bool", args), _)):
+			args.is_empty()
+		_:
+			False
+
+
+pure func test_named_union_decl_structural_equals_uses_native_target() -> Bool:
+	union_name: String = "compiler__TypeResult"
+	union_type: CoreType = named_type(union_name)
+	body: CoreExpr = call(
+		DeferredTraitCall(
+			"Equatable",
+			"equals",
+		),
+		"equals",
+		[var_expr("left", union_type), var_expr("right", union_type)],
+		named_type("Bool"),
+	)
+	main: CoreDecl = FunctionDecl(
+		function(
+			"main",
+			20,
+			[param("left", union_type), param("right", union_type)],
+			named_type("Bool"),
+			body,
+		),
+	)
+
+	match resolved_main_body(program([union_decl(union_name), equatable_trait(union_type), main])):
+		Some(BinaryExpr(EqualOp, _, _, NamedType("Bool", args), _)):
+			args.is_empty()
+		_:
+			False
+
+
+pure func test_range_not_equals_uses_native_target() -> Bool:
+	body: CoreExpr = call(
+		DeferredTraitCall(
+			"Equatable",
+			"not_equals",
+		),
+		"not_equals",
+		[var_expr("left", RangeType), var_expr("right", RangeType)],
+		named_type("Bool"),
+	)
+	main: CoreDecl = FunctionDecl(
+		function(
+			"main",
+			20,
+			[param("left", RangeType), param("right", RangeType)],
+			named_type("Bool"),
+			body,
+		),
+	)
+
+	match resolved_main_body(program([equatable_trait(RangeType), main])):
+		Some(BinaryExpr(NotEqualOp, _, _, NamedType("Bool", args), _)):
+			args.is_empty()
+		_:
+			False
+
+
+pure func test_tensor_not_equals_uses_native_target() -> Bool:
+	tensor_type: CoreType = TensorType({
+		element_type = named_type("Int"),
+		dims = [TensorStaticDim(4)],
+	})
+	left: CoreExpr = var_expr("left", tensor_type)
+	right: CoreExpr = var_expr("right", tensor_type)
+	body: CoreExpr = call(
+		DeferredTraitCall(
+			"Equatable",
+			"not_equals",
+		),
+		"not_equals",
+		[left, right],
+		named_type("Bool"),
+	)
+	main: CoreDecl = FunctionDecl(
+		function(
+			"main",
+			20,
+			[param("left", tensor_type), param("right", tensor_type)],
+			named_type("Bool"),
+			body,
+		),
+	)
+
+	match resolved_main_body(program([equatable_trait(tensor_type), main])):
+		Some(BinaryExpr(NotEqualOp, _, _, NamedType("Bool", args), _)):
+			args.is_empty()
+		_:
+			False
+
+
+pure func unsupported_tensor_call_is_diagnostic(
+	trait_name: String,
+	method_name: String,
+	element_type: CoreType,
+) -> Bool:
+	tensor_type: CoreType = TensorType({
+		element_type = element_type,
+		dims = [TensorStaticDim(4)],
+	})
+
+	return_type: CoreType = if trait_name == "Orderable":
+		named_type("Bool")
+	else:
+		tensor_type
+
+	body: CoreExpr = call(
+		DeferredTraitCall(
+			trait_name,
+			method_name,
+		),
+		method_name,
+		[var_expr("left", tensor_type), var_expr("right", tensor_type)],
+		return_type,
+	)
+	main: CoreDecl = FunctionDecl(
+		function(
+			"main",
+			20,
+			[param("left", tensor_type), param("right", tensor_type)],
+			return_type,
+			body,
+		),
+	)
+	trait_info: CoreDecl = trait_decl(
+		trait_name,
+		[
+			trait_method(
+				method_name,
+				[param("left", SelfType), param("right", SelfType)],
+				return_type,
+			),
+		],
+	)
+
+	match resolve_core_traits(program([trait_info, main])):
+		Err(MissingTraitImpl(missing)):
+			missing.trait_name == trait_name and missing.method_name == method_name
+		_:
+			False
+
+
+pure func test_tensor_native_targets_reject_unsupported_operations() -> Bool:
+	(
+		unsupported_tensor_call_is_diagnostic("Addable", "add", string_type())
+		and unsupported_tensor_call_is_diagnostic("Modulable", "remainder", named_type("Int"))
+		and unsupported_tensor_call_is_diagnostic("Orderable", "less_than", named_type("Int"))
+	)
+
+
+pure func test_tensor_add_call_uses_native_target() -> Bool:
+	tensor_type: CoreType = TensorType({
+		element_type = named_type("Int"),
+		dims = [TensorStaticDim(4)],
+	})
+	body: CoreExpr = call(
+		DeferredTraitCall(
+			"Addable",
+			"add",
+		),
+		"add",
+		[var_expr("left", tensor_type), var_expr("right", tensor_type)],
+		tensor_type,
+	)
+	main: CoreDecl = FunctionDecl(
+		function(
+			"main",
+			20,
+			[param("left", tensor_type), param("right", tensor_type)],
+			tensor_type,
+			body,
+		),
+	)
+
+	match resolved_main_body(program([addable_trait(tensor_type), main])):
+		Some(BinaryExpr(AddOp, _, _, result_type, _)):
+			result_type == tensor_type
+		_:
+			False
+
+
+pure func test_tensor_negate_call_uses_native_target() -> Bool:
+	tensor_type: CoreType = TensorType({
+		element_type = named_type("Int"),
+		dims = [TensorStaticDim(4)],
+	})
+	body: CoreExpr = call(
+		DeferredTraitCall("Negatable", "negate"),
+		"negate",
+		[var_expr("value", tensor_type)],
+		tensor_type,
+	)
+	main: CoreDecl = FunctionDecl(
+		function(
+			"main",
+			20,
+			[param("value", tensor_type)],
+			tensor_type,
+			body,
+		),
+	)
+
+	match resolved_main_body(program([negatable_trait(tensor_type), main])):
+		Some(UnaryExpr(NegateOp, _, result_type, _)):
+			result_type == tensor_type
 		_:
 			False
 
@@ -753,6 +1042,102 @@ pure func native_scalar_addable_impl(receiver_type: CoreType, source_module: Str
 			)
 		_:
 			scalar_addable_impl(receiver_type, source_module)
+
+
+pure func equatable_trait(receiver_type: CoreType) -> CoreDecl:
+	trait_decl(
+		"Equatable",
+		[
+			trait_method(
+				"equals",
+				[param("left", receiver_type), param("right", receiver_type)],
+				named_type("Bool"),
+			),
+			trait_method(
+				"not_equals",
+				[param("left", receiver_type), param("right", receiver_type)],
+				named_type("Bool"),
+			),
+		],
+	)
+
+
+pure func native_scalar_equatable_impl(receiver_type: CoreType, source_module: String) -> CoreDecl:
+	left: CoreExpr = var_expr("left", receiver_type)
+	right: CoreExpr = var_expr("right", receiver_type)
+	bool_type: CoreType = named_type("Bool")
+
+	impl_decl(
+		"Equatable",
+		receiver_type,
+		[
+			{ function(
+				"equals",
+				13,
+				[param("left", receiver_type), param("right", receiver_type)],
+				bool_type,
+				BinaryExpr(
+					EqualOp,
+					left,
+					right,
+					bool_type,
+					SyntheticSourceLoc,
+				),
+			) |
+				source_module = Some(source_module),
+				function_kind = UnresolvedBuiltinFunction
+			},
+			{ function(
+				"not_equals",
+				14,
+				[param("left", receiver_type), param("right", receiver_type)],
+				bool_type,
+				BinaryExpr(
+					NotEqualOp,
+					left,
+					right,
+					bool_type,
+					SyntheticSourceLoc,
+				),
+			) |
+				source_module = Some(source_module),
+				function_kind = UnresolvedBuiltinFunction
+			},
+		],
+	)
+
+
+pure func negatable_trait(receiver_type: CoreType) -> CoreDecl:
+	trait_decl(
+		"Negatable",
+		[trait_method("negate", [param("value", receiver_type)], receiver_type)],
+	)
+
+
+pure func native_scalar_negatable_impl(receiver_type: CoreType, source_module: String) -> CoreDecl:
+	method: CoreFunction = function(
+		"negate",
+		12,
+		[param("value", receiver_type)],
+		receiver_type,
+		UnaryExpr(
+			NegateOp,
+			var_expr("value", receiver_type),
+			receiver_type,
+			SyntheticSourceLoc,
+		),
+	)
+
+	impl_decl(
+		"Negatable",
+		receiver_type,
+		[
+			{ method |
+				source_module = Some(source_module),
+				function_kind = UnresolvedBuiltinFunction
+			},
+		],
+	)
 
 
 pure func test_operator_resolves_for_record_type() -> Bool:
@@ -874,6 +1259,235 @@ pure func test_int16_explicit_add_uses_compiler_native_execution_target() -> Boo
 			False
 
 
+pure func test_int16_equality_operator_uses_native_binary_target() -> Bool:
+	int_type: CoreType = named_type("Int16")
+	body: CoreExpr = BinaryExpr(
+		EqualOp,
+		var_expr("left", int_type),
+		var_expr("right", int_type),
+		named_type("Bool"),
+		SyntheticSourceLoc,
+	)
+	main: CoreDecl = FunctionDecl(
+		function(
+			"main",
+			20,
+			[param("left", int_type), param("right", int_type)],
+			named_type("Bool"),
+			body,
+		),
+	)
+
+	match resolved_main_body(program([
+		equatable_trait(int_type),
+		native_scalar_equatable_impl(int_type, "int16"),
+		main,
+	])):
+		Some(BinaryExpr(EqualOp, _, _, _, _)):
+			True
+		_:
+			False
+
+
+pure func test_int16_explicit_equals_uses_native_binary_target() -> Bool:
+	int_type: CoreType = named_type("Int16")
+	body: CoreExpr = call(
+		DeferredTraitCall(
+			"Equatable",
+			"equals",
+		),
+		"equals",
+		[var_expr("left", int_type), var_expr("right", int_type)],
+		named_type("Bool"),
+	)
+	main: CoreDecl = FunctionDecl(
+		function(
+			"main",
+			20,
+			[param("left", int_type), param("right", int_type)],
+			named_type("Bool"),
+			body,
+		),
+	)
+
+	match resolved_main_body(program([
+		equatable_trait(int_type),
+		native_scalar_equatable_impl(int_type, "int16"),
+		main,
+	])):
+		Some(BinaryExpr(EqualOp, _, _, _, _)):
+			True
+		_:
+			False
+
+
+pure func native_ordering_call_resolves(method_name: String, expected_op: CoreBinaryOp) -> Bool:
+	int_type: CoreType = named_type("Int16")
+	body: CoreExpr = call(
+		DeferredTraitCall(
+			"Orderable",
+			method_name,
+		),
+		method_name,
+		[var_expr("left", int_type), var_expr("right", int_type)],
+		named_type("Bool"),
+	)
+	main: CoreDecl = FunctionDecl(
+		function(
+			"main",
+			20,
+			[param("left", int_type), param("right", int_type)],
+			named_type("Bool"),
+			body,
+		),
+	)
+
+	match (resolved_main_body(program([orderable_trait(int_type), main])), expected_op):
+		(Some(BinaryExpr(LessOp, _, _, _, _)), LessOp):
+			True
+		(Some(BinaryExpr(GreaterOp, _, _, _, _)), GreaterOp):
+			True
+		(Some(BinaryExpr(LessEqualOp, _, _, _, _)), LessEqualOp):
+			True
+		(Some(BinaryExpr(GreaterEqualOp, _, _, _, _)), GreaterEqualOp):
+			True
+		_:
+			False
+
+
+pure func test_int16_ordering_calls_use_compiler_native_execution_targets() -> Bool:
+	[
+		("less_than", LessOp),
+		("greater_than", GreaterOp),
+		("less_than_or_equal", LessEqualOp),
+		(
+			"greater_than_or_equal",
+			GreaterEqualOp,
+		),
+	].all(
+		pure func(case): native_ordering_call_resolves(case[0], case[1]),
+	)
+
+
+pure func test_native_scalar_impl_body_becomes_callable() -> Bool:
+	int_type: CoreType = named_type("Int16")
+
+	match resolve_core_traits(program([
+		equatable_trait(int_type),
+		native_scalar_equatable_impl(int_type, "int16"),
+	])):
+		Ok(result):
+			match result.decls:
+				[TraitDecl(_), ImplDecl(implementation)]:
+					implementation.methods.all(pure func(method):
+						method.function_kind == UserFunction and method.body.is_some()
+					)
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_legacy_native_scalar_impl_operator_remains_native() -> Bool:
+	int_type: CoreType = named_type("Int16")
+
+	match resolve_core_traits(program([
+		addable_trait(int_type),
+		scalar_addable_impl(int_type, "int16"),
+	])):
+		Ok(resolved):
+			match resolved.decls.get(1):
+				Some(ImplDecl(implementation)):
+					match implementation.methods.get(0):
+						Some(method):
+							match method.body:
+								Some(BinaryExpr(AddOp, _, _, _, _)):
+									True
+								_:
+									False
+						None:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_int16_explicit_negate_uses_native_unary_target() -> Bool:
+	int_type: CoreType = named_type("Int16")
+	body: CoreExpr = call(
+		DeferredTraitCall("Negatable", "negate"),
+		"negate",
+		[var_expr("value", int_type)],
+		int_type,
+	)
+	main: CoreDecl = FunctionDecl(function("main", 20, [param("value", int_type)], int_type, body))
+
+	match resolved_main_body(program([
+		negatable_trait(int_type),
+		native_scalar_negatable_impl(int_type, "int16"),
+		main,
+	])):
+		Some(UnaryExpr(NegateOp, _, _, _)):
+			True
+		_:
+			False
+
+
+pure func test_int16_explicit_negate_uses_compiler_native_execution_target() -> Bool:
+	int_type: CoreType = named_type("Int16")
+	body: CoreExpr = call(
+		DeferredTraitCall("Negatable", "negate"),
+		"negate",
+		[var_expr("value", int_type)],
+		int_type,
+	)
+	main: CoreDecl = FunctionDecl(function("main", 20, [param("value", int_type)], int_type, body))
+
+	match resolved_main_body(program([negatable_trait(int_type), main])):
+		Some(UnaryExpr(NegateOp, _, _, _)):
+			True
+		_:
+			False
+
+
+pure func test_wrong_owner_int16_negate_impl_remains_recursive() -> Bool:
+	int_type: CoreType = named_type("Int16")
+	method: CoreFunction = { function(
+		"negate",
+		12,
+		[param("value", int_type)],
+		int_type,
+		UnaryExpr(
+			NegateOp,
+			var_expr("value", int_type),
+			int_type,
+			SyntheticSourceLoc,
+		),
+	) | source_module = Some("user/math") }
+
+	match resolve_core_traits(program([
+		negatable_trait(int_type),
+		impl_decl("Negatable", int_type, [method]),
+	])):
+		Ok(resolved):
+			match resolved.decls.get(1):
+				Some(ImplDecl(implementation)):
+					match implementation.methods.get(0):
+						Some(resolved_method):
+							match resolved_method.body:
+								Some(body):
+									call_targets(body, True, "Negatable_negate_Int16")
+								None:
+									False
+						None:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
 pure func test_selected_int16_add_registry_miss_is_an_error() -> Bool:
 	int_type: CoreType = named_type("Int16")
 	body: CoreExpr = call(
@@ -964,6 +1578,131 @@ pure func test_wrong_owner_int16_impl_operator_remains_recursive() -> Bool:
 			False
 
 
+pure func test_tensor_absolute_call_falls_through_to_specialization() -> Bool:
+	float_type: CoreType = named_type("Float")
+	tensor_type: CoreType = TensorType({
+		element_type = float_type,
+		dims = [TensorStaticDim(4)],
+	})
+	body: CoreExpr = call(
+		DeferredTraitCall("Absolute", "abs"),
+		"abs",
+		[var_expr("value", tensor_type)],
+		tensor_type,
+	)
+	main: CoreDecl = FunctionDecl(
+		function(
+			"main",
+			20,
+			[param("value", tensor_type)],
+			tensor_type,
+			body,
+		),
+	)
+	absolute_trait: CoreDecl = trait_decl(
+		"Absolute",
+		[trait_method("abs", [param("value", SelfType)], SelfType)],
+	)
+	absolute_impl: CoreDecl = impl_decl("Absolute", float_type, [function(
+				"abs",
+				10,
+				[param("value", float_type)],
+				float_type,
+				var_expr("value", float_type),
+			)])
+
+	match resolved_main_body(program([absolute_trait, absolute_impl, main])):
+		Some(resolved):
+			call_targets(resolved, True, "abs")
+		None:
+			False
+
+
+pure func test_non_tensor_absolute_call_without_impl_is_diagnostic() -> Bool:
+	sheep_type: CoreType = named_type("Sheep")
+	body: CoreExpr = call(
+		DeferredTraitCall("Absolute", "abs"),
+		"abs",
+		[var_expr("value", sheep_type)],
+		sheep_type,
+	)
+	main: CoreDecl = FunctionDecl(
+		function(
+			"main",
+			20,
+			[param("value", sheep_type)],
+			sheep_type,
+			body,
+		),
+	)
+	absolute_trait: CoreDecl = trait_decl(
+		"Absolute",
+		[trait_method("abs", [param("value", SelfType)], SelfType)],
+	)
+
+	match resolve_core_traits(program([absolute_trait, main])):
+		Err(MissingTraitImpl(missing)):
+			(
+				missing.trait_name == "Absolute"
+				and missing.method_name == "abs"
+				and missing.type_name == "Sheep"
+			)
+		_:
+			False
+
+
+private pure func unsupported_tensor_absolute_call_is_diagnostic(element_name: String) -> Bool:
+	element_type: CoreType = named_type(element_name)
+	tensor_type: CoreType = TensorType({
+		element_type = element_type,
+		dims = [TensorStaticDim(4)],
+	})
+	body: CoreExpr = call(
+		DeferredTraitCall("Absolute", "abs"),
+		"abs",
+		[var_expr("value", tensor_type)],
+		tensor_type,
+	)
+	main: CoreDecl = FunctionDecl(
+		function(
+			"main",
+			20,
+			[param("value", tensor_type)],
+			tensor_type,
+			body,
+		),
+	)
+	absolute_trait: CoreDecl = trait_decl(
+		"Absolute",
+		[trait_method("abs", [param("value", SelfType)], SelfType)],
+	)
+	absolute_impl: CoreDecl = impl_decl("Absolute", element_type, [function(
+				"abs",
+				10,
+				[param("value", element_type)],
+				element_type,
+				var_expr("value", element_type),
+			)])
+
+	match resolve_core_traits(program([absolute_trait, absolute_impl, main])):
+		Err(MissingTraitImpl(missing)):
+			(
+				missing.trait_name == "Absolute"
+				and missing.method_name == "abs"
+				and missing.type_name == "__Array_${element_name}_4"
+			)
+		_:
+			False
+
+
+pure func test_unsupported_tensor_absolute_calls_are_diagnostic() -> Bool:
+	(
+		unsupported_tensor_absolute_call_is_diagnostic("Int")
+		and unsupported_tensor_absolute_call_is_diagnostic("Float16")
+		and unsupported_tensor_absolute_call_is_diagnostic("Float32")
+	)
+
+
 pure func test_unregistered_trait_call_falls_through_to_later_resolution() -> Bool:
 	int_type: CoreType = named_type("Int")
 	body: CoreExpr = call(
@@ -985,7 +1724,18 @@ pure func test_unregistered_trait_call_falls_through_to_later_resolution() -> Bo
 		),
 	)
 
-	match resolved_main_body(program([main])):
+	integer_trait: CoreDecl = trait_decl(
+		"Integer",
+		[
+			trait_method(
+				"bit_and",
+				[param("left", int_type), param("right", int_type)],
+				int_type,
+			),
+		],
+	)
+
+	match resolved_main_body(program([integer_trait, main])):
 		Some(resolved):
 			call_targets(resolved, True, "bit_and")
 		None:
@@ -1258,6 +2008,38 @@ pure func test_missing_impl_has_structured_diagnostic() -> Bool:
 			False
 
 
+pure func test_explicit_equals_without_impl_is_diagnostic() -> Bool:
+	sheep_type: CoreType = named_type("Sheep")
+	body: CoreExpr = call(
+		DeferredTraitCall(
+			"Equatable",
+			"equals",
+		),
+		"equals",
+		[var_expr("left", sheep_type), var_expr("right", sheep_type)],
+		named_type("Bool"),
+	)
+	main: CoreDecl = FunctionDecl(
+		function(
+			"main",
+			20,
+			[param("left", sheep_type), param("right", sheep_type)],
+			named_type("Bool"),
+			body,
+		),
+	)
+
+	match resolve_core_traits(program([equatable_trait(widget_type()), main])):
+		Err(MissingTraitImpl(missing)):
+			(
+				missing.trait_name == "Equatable"
+				and missing.method_name == "equals"
+				and missing.type_name == "Sheep"
+			)
+		_:
+			False
+
+
 pure func test_deep_left_logical_tree_is_stack_bounded() -> Bool:
 	logical_depth: Int = 2048
 	var body: CoreExpr = bool_literal(True)
@@ -1320,14 +2102,27 @@ tests: TestSuite = {
 		("StringSlice builtin uses impl", test_string_slice_builtin_uses_impl),
 		("synthetic to_string builtin uses impl", test_synthetic_to_string_builtin_uses_impl),
 		("non-trait builtin is preserved", test_non_trait_builtin_is_preserved),
+		("structural equals uses native target", test_structural_equals_uses_native_target),
 		(
-			"equals without impl uses builtin fallback",
-			test_equals_without_impl_uses_builtin_fallback,
+			"aliased structural equals uses native target",
+			test_aliased_structural_equals_uses_native_target,
+		),
+		("tensor not equals uses native target", test_tensor_not_equals_uses_native_target),
+		(
+			"named enum declaration uses native equality target",
+			test_named_enum_decl_structural_equals_uses_native_target,
 		),
 		(
-			"aliased equals builtin fallback uses canonical name",
-			test_aliased_equals_builtin_fallback_uses_canonical_name,
+			"named union declaration uses native equality target",
+			test_named_union_decl_structural_equals_uses_native_target,
 		),
+		("range not equals uses native target", test_range_not_equals_uses_native_target),
+		(
+			"tensor native targets reject unsupported operations",
+			test_tensor_native_targets_reject_unsupported_operations,
+		),
+		("tensor add call uses native target", test_tensor_add_call_uses_native_target),
+		("tensor negate call uses native target", test_tensor_negate_call_uses_native_target),
 		("record operator resolves", test_operator_resolves_for_record_type),
 		(
 			"Int16 add operator uses native target",
@@ -1342,6 +2137,35 @@ tests: TestSuite = {
 			test_int16_explicit_add_uses_compiler_native_execution_target,
 		),
 		(
+			"Int16 equality operator uses native target",
+			test_int16_equality_operator_uses_native_binary_target,
+		),
+		(
+			"Int16 explicit equals uses native target",
+			test_int16_explicit_equals_uses_native_binary_target,
+		),
+		(
+			"Int16 ordering calls use compiler native execution targets",
+			test_int16_ordering_calls_use_compiler_native_execution_targets,
+		),
+		("native scalar impl body becomes callable", test_native_scalar_impl_body_becomes_callable),
+		(
+			"legacy native scalar impl operator remains native",
+			test_legacy_native_scalar_impl_operator_remains_native,
+		),
+		(
+			"Int16 explicit negate uses native unary target",
+			test_int16_explicit_negate_uses_native_unary_target,
+		),
+		(
+			"Int16 explicit negate uses compiler native execution target",
+			test_int16_explicit_negate_uses_compiler_native_execution_target,
+		),
+		(
+			"wrong-owner Int16 negate impl remains recursive",
+			test_wrong_owner_int16_negate_impl_remains_recursive,
+		),
+		(
 			"selected Int16 add registry miss is an error",
 			test_selected_int16_add_registry_miss_is_an_error,
 		),
@@ -1352,6 +2176,18 @@ tests: TestSuite = {
 		(
 			"wrong-owner Int16 impl operator remains recursive",
 			test_wrong_owner_int16_impl_operator_remains_recursive,
+		),
+		(
+			"tensor Absolute call falls through to specialization",
+			test_tensor_absolute_call_falls_through_to_specialization,
+		),
+		(
+			"non-tensor Absolute call without impl is diagnostic",
+			test_non_tensor_absolute_call_without_impl_is_diagnostic,
+		),
+		(
+			"unsupported tensor Absolute calls are diagnostic",
+			test_unsupported_tensor_absolute_calls_are_diagnostic,
 		),
 		(
 			"unregistered trait call falls through",
@@ -1369,6 +2205,10 @@ tests: TestSuite = {
 		("static Self uses return type", test_static_self_dispatch_uses_return_type),
 		("parameterized type keys do not collide", test_parameterized_type_keys_do_not_collide),
 		("missing impl diagnostic is structured", test_missing_impl_has_structured_diagnostic),
+		(
+			"explicit equals without impl is diagnostic",
+			test_explicit_equals_without_impl_is_diagnostic,
+		),
 		("deep left logical tree is stack bounded", test_deep_left_logical_tree_is_stack_bounded),
 	]
 }

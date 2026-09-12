@@ -7,6 +7,7 @@ import:
 			ParsedLessOp,
 			ParsedModuloOp,
 			ParsedMultiplyOp,
+			ParsedNotEqualOp,
 		),
 		ParsedCompoundAssignOp(ParsedAssignAddOp),
 		ParsedConcurrentParam,
@@ -4913,6 +4914,70 @@ func test_tensor_arithmetic_accepts_numeric_family_bound() -> Bool:
 	)
 
 
+func test_tensor_negation_rejects_generic_element_bounds() -> Bool:
+	expected_error = (
+		"Tensor negation requires a concrete signed integer or floating-point element "
+		+ "type with a Negatable implementation, got T[#N]"
+	)
+
+	family_result = infer_expr(
+		infer_context(state_with_generic_tensor_arithmetic_values(["SignedInteger"])),
+		ParsedUnaryExpr(
+			ParsedNegateOp,
+			ParsedNameExpr(ident("generic_left")),
+			fixture_source_span(),
+		),
+	)
+	trait_result = infer_expr(
+		infer_context(state_with_generic_tensor_arithmetic_values(["Negatable"])),
+		ParsedUnaryExpr(
+			ParsedNegateOp,
+			ParsedNameExpr(ident("generic_left")),
+			fixture_source_span(),
+		),
+	)
+
+	(
+		family_result.context.state.errors.length() == 1
+		and family_result.context.state.errors
+			.get_or(0, "")
+			.contains(expected_error)
+		and trait_result.context.state.errors.length() == 1
+		and trait_result.context.state.errors
+			.get_or(0, "")
+			.contains(expected_error)
+	)
+
+
+func test_tensor_negation_requires_concrete_element_trait() -> Bool:
+	base_state = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
+	without_int_negatable = { base_state |
+		env = { base_state.env |
+			impls = base_state.env.impls.filter(
+				func(
+					impl,
+				): not ((
+					impl.trait_name == "SignedInteger"
+					and types_equal(impl.for_type, TYPE_INT)
+				)),
+			)
+		}
+	}
+	tensor_type = SemanticArrayType(TYPE_INT, [SemanticConstIntType(3)])
+	state = add_infer_value(without_int_negatable, "int_tensor", tensor_type)
+	result = infer_expr(
+		infer_context(state),
+		ParsedUnaryExpr(ParsedNegateOp, ParsedNameExpr(ident("int_tensor")), fixture_source_span()),
+	)
+
+	(
+		result.context.state.errors.length() == 1
+		and result.context.state.errors
+			.get_or(0, "")
+			.contains("type with a Negatable implementation, got Int[#3]")
+	)
+
+
 func test_tensor_arithmetic_rejects_invalid_operands() -> Bool:
 	state = state_with_tensor_arithmetic_values()
 	mismatched_result = infer_expr(
@@ -5035,6 +5100,32 @@ func test_comparison_and_equality_return_bool() -> Bool:
 	)
 
 
+func test_non_orderable_comparisons_are_rejected() -> Bool:
+	bool_result = infer_expr(
+		infer_context(typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)),
+		binary_expr(ParsedLessOp, bool_expr(False), bool_expr(True)),
+	)
+	tensor_result = infer_expr(
+		infer_context(state_with_tensor_arithmetic_values()),
+		binary_expr(
+			ParsedLessOp,
+			ParsedNameExpr(ident("left_tensor")),
+			ParsedNameExpr(ident("right_tensor")),
+		),
+	)
+
+	(
+		bool_result.context.state.errors.length() == 1
+		and bool_result.context.state.errors
+			.get_or(0, "")
+			.contains("matching types that implement Orderable")
+		and tensor_result.context.state.errors.length() == 1
+		and tensor_result.context.state.errors
+			.get_or(0, "")
+			.contains("matching types that implement Orderable")
+	)
+
+
 func test_collection_equality_returns_bool() -> Bool:
 	var state: TypecheckState = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
 	state = add_infer_value(
@@ -5047,7 +5138,9 @@ func test_collection_equality_returns_bool() -> Bool:
 		"right_list",
 		SemanticNamedType("List", [TYPE_STRING]),
 	)
-	result = infer_expr(
+	state = add_infer_value(state, "left_tuple", SemanticTupleType([TYPE_INT, TYPE_STRING]))
+	state = add_infer_value(state, "right_tuple", SemanticTupleType([TYPE_INT, TYPE_STRING]))
+	list_result = infer_expr(
 		infer_context(state),
 		binary_expr(
 			ParsedEqualOp,
@@ -5055,10 +5148,30 @@ func test_collection_equality_returns_bool() -> Bool:
 			ParsedNameExpr(ident("right_list")),
 		),
 	)
+	tuple_equal_result = infer_expr(
+		infer_context(state),
+		binary_expr(
+			ParsedEqualOp,
+			ParsedNameExpr(ident("left_tuple")),
+			ParsedNameExpr(ident("right_tuple")),
+		),
+	)
+	tuple_not_equal_result = infer_expr(
+		infer_context(state),
+		binary_expr(
+			ParsedNotEqualOp,
+			ParsedNameExpr(ident("left_tuple")),
+			ParsedNameExpr(ident("right_tuple")),
+		),
+	)
 
 	(
-		result.context.state.errors.length() == 0
-		and types_equal(typed_expr_semantic_type(result.expr), TYPE_BOOL)
+		list_result.context.state.errors.length() == 0
+		and types_equal(typed_expr_semantic_type(list_result.expr), TYPE_BOOL)
+		and tuple_equal_result.context.state.errors.is_empty()
+		and types_equal(typed_expr_semantic_type(tuple_equal_result.expr), TYPE_BOOL)
+		and tuple_not_equal_result.context.state.errors.is_empty()
+		and types_equal(typed_expr_semantic_type(tuple_not_equal_result.expr), TYPE_BOOL)
 	)
 
 
@@ -5118,6 +5231,20 @@ func test_enum_equality_returns_bool() -> Bool:
 	(
 		result.context.state.errors.length() == 0
 		and types_equal(typed_expr_semantic_type(result.expr), TYPE_BOOL)
+	)
+
+
+func test_record_equality_requires_equatable_trait() -> Bool:
+	result = infer_expr(
+		infer_context(state_with_point_binding()),
+		binary_expr(ParsedEqualOp, ParsedNameExpr(ident("point")), ParsedNameExpr(ident("point"))),
+	)
+
+	(
+		result.context.state.errors.length() == 1
+		and result.context.state.errors
+			.get_or(0, "")
+			.contains("Equality requires an implementation of Equatable for Point")
 	)
 
 
@@ -11058,6 +11185,14 @@ tests: TestSuite = {
 			test_tensor_arithmetic_accepts_numeric_family_bound,
 		),
 		(
+			"tensor negation rejects generic element bounds",
+			test_tensor_negation_rejects_generic_element_bounds,
+		),
+		(
+			"tensor negation requires concrete element trait",
+			test_tensor_negation_requires_concrete_element_trait,
+		),
+		(
 			"tensor arithmetic rejects invalid operands",
 			test_tensor_arithmetic_rejects_invalid_operands,
 		),
@@ -11072,12 +11207,14 @@ tests: TestSuite = {
 			test_string_interpolation_rejects_non_stringable_expr,
 		),
 		("comparison and equality return bool", test_comparison_and_equality_return_bool),
+		("non-orderable comparisons are rejected", test_non_orderable_comparisons_are_rejected),
 		("collection equality returns bool", test_collection_equality_returns_bool),
 		(
 			"generic comparison requires Orderable bound",
 			test_generic_comparison_requires_orderable_bound,
 		),
 		("enum equality returns bool", test_enum_equality_returns_bool),
+		("record equality requires Equatable trait", test_record_equality_requires_equatable_trait),
 		("unary and logical ops", test_unary_and_logical_ops),
 		(
 			"negative float literal uses expected sized float type",

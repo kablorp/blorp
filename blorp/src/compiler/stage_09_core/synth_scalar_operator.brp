@@ -3,13 +3,26 @@
 -- operator target to trait resolution.
 import:
 	ir:
-		CoreBinaryOp(AddOp, DivideOp, ModuloOp, MultiplyOp, SubtractOp),
-		CoreExpr(BinaryExpr, VarExpr),
+		CoreBinaryOp(
+			AddOp,
+			DivideOp,
+			EqualOp,
+			GreaterEqualOp,
+			GreaterOp,
+			LessEqualOp,
+			LessOp,
+			ModuloOp,
+			MultiplyOp,
+			NotEqualOp,
+			SubtractOp,
+		),
+		CoreExpr(BinaryExpr, UnaryExpr, VarExpr),
 		CoreFunction,
-		CoreFunctionKind(UnresolvedBuiltinFunction),
+		CoreFunctionKind(UnresolvedBuiltinFunction, UserFunction),
 		CoreParam,
 		CoreSourceLoc(SyntheticSourceLoc),
 		CoreType(NamedType),
+		CoreUnaryOp(NegateOp),
 	synth_name: is_synthesis_candidate, synthesis_source_name
 
 
@@ -45,16 +58,19 @@ private pure func native_scalar_module(type_name: String) -> Option[String]:
 			Some("string")
 		"Fixed":
 			Some("fixed")
+		"Bool":
+			Some("bool")
+		"Char":
+			Some("char")
 		_:
 			None
 
 
-private pure func native_scalar_binary_op(
+pure func native_binary_operator_for_trait_method(
 	trait_name: String,
-	type_name: String,
 	method_name: String,
 ) -> Option[CoreBinaryOp]:
-	op: Option[CoreBinaryOp] = if trait_name == "Addable" and method_name == "add":
+	if trait_name == "Addable" and method_name == "add":
 		Some(AddOp)
 	else if trait_name == "Subtractable" and method_name == "subtract":
 		Some(SubtractOp)
@@ -64,18 +80,51 @@ private pure func native_scalar_binary_op(
 		Some(DivideOp)
 	else if trait_name == "Modulable" and method_name == "remainder":
 		Some(ModuloOp)
+	else if trait_name == "Equatable" and method_name == "equals":
+		Some(EqualOp)
+	else if trait_name == "Equatable" and method_name == "not_equals":
+		Some(NotEqualOp)
+	else if trait_name == "Orderable" and method_name == "less_than":
+		Some(LessOp)
+	else if trait_name == "Orderable" and method_name == "greater_than":
+		Some(GreaterOp)
+	else if trait_name == "Orderable" and method_name == "less_than_or_equal":
+		Some(LessEqualOp)
+	else if trait_name == "Orderable" and method_name == "greater_than_or_equal":
+		Some(GreaterEqualOp)
 	else:
 		None
 
+
+private pure func native_scalar_binary_op(
+	trait_name: String,
+	type_name: String,
+	method_name: String,
+) -> Option[CoreBinaryOp]:
+	op: Option[CoreBinaryOp] = native_binary_operator_for_trait_method(trait_name, method_name)
+
 	match type_name:
 		"String":
-			if op == Some(AddOp):
-				op
-			else:
-				None
+			match op:
+				Some(AddOp) | Some(LessOp) | Some(GreaterOp) | Some(LessEqualOp) | Some(GreaterEqualOp):
+					op
+				_:
+					None
 		"Fixed":
 			match op:
-				Some(AddOp) | Some(SubtractOp) | Some(MultiplyOp) | Some(DivideOp):
+				Some(AddOp) | Some(SubtractOp) | Some(MultiplyOp) | Some(DivideOp) | Some(EqualOp) | Some(NotEqualOp) | Some(LessOp) | Some(GreaterOp) | Some(LessEqualOp) | Some(GreaterEqualOp):
+					op
+				_:
+					None
+		"Bool":
+			match op:
+				Some(EqualOp) | Some(NotEqualOp):
+					op
+				_:
+					None
+		"Char":
+			match op:
+				Some(EqualOp) | Some(NotEqualOp) | Some(LessOp) | Some(GreaterOp) | Some(LessEqualOp) | Some(GreaterEqualOp):
 					op
 				_:
 					None
@@ -94,6 +143,52 @@ pure func native_scalar_binary_target(
 		None
 
 
+pure func native_tensor_binary_target(
+	trait_name: String,
+	type_name: String,
+	method_name: String,
+) -> Option[CoreBinaryOp]:
+	target: Option[CoreBinaryOp] = match type_name:
+		"Int" | "Int8" | "Int16" | "Int32" | "Int128":
+			native_scalar_binary_target(trait_name, type_name, method_name)
+		"UInt8" | "UInt16" | "UInt32" | "UInt64" | "UInt128":
+			native_scalar_binary_target(trait_name, type_name, method_name)
+		"Float" | "Float16" | "Float32":
+			native_scalar_binary_target(trait_name, type_name, method_name)
+		_:
+			None
+
+	match target:
+		Some(AddOp) | Some(SubtractOp) | Some(MultiplyOp) | Some(DivideOp):
+			target
+		_:
+			None
+
+
+pure func native_unary_operator_for_trait_method(
+	trait_name: String,
+	method_name: String,
+) -> Option[CoreUnaryOp]:
+	if trait_name == "Negatable" and method_name == "negate":
+		Some(NegateOp)
+	else:
+		None
+
+
+pure func native_scalar_unary_target(
+	trait_name: String,
+	type_name: String,
+	method_name: String,
+) -> Option[CoreUnaryOp]:
+	op ?= native_unary_operator_for_trait_method(trait_name, method_name)
+
+	match type_name:
+		"Int" | "Int8" | "Int16" | "Int32" | "Int128" | "Float" | "Float16" | "Float32":
+			Some(op)
+		_:
+			None
+
+
 private pure func exact_named_type(typ: CoreType, expected_name: String) -> Bool:
 	match typ:
 		NamedType(name, args):
@@ -102,12 +197,60 @@ private pure func exact_named_type(typ: CoreType, expected_name: String) -> Bool
 			False
 
 
-private pure func has_binary_signature(function_info: CoreFunction, type_name: String) -> Bool:
+private pure func has_binary_signature(
+	function_info: CoreFunction,
+	type_name: String,
+	op: CoreBinaryOp,
+) -> Bool:
+	return_type_matches: Bool = match op:
+		EqualOp | NotEqualOp | LessOp | GreaterOp | LessEqualOp | GreaterEqualOp:
+			exact_named_type(function_info.return_type, "Bool")
+		_:
+			exact_named_type(function_info.return_type, type_name)
+
 	(
 		function_info.params.length() == 2
 		and function_info.params.all(pure func(param): exact_named_type(param.typ, type_name))
+		and return_type_matches
+	)
+
+
+private pure func has_unary_signature(function_info: CoreFunction, type_name: String) -> Bool:
+	(
+		function_info.params.length() == 1
+		and function_info.params.all(pure func(param): exact_named_type(param.typ, type_name))
 		and exact_named_type(function_info.return_type, type_name)
 	)
+
+
+private pure func binary_operators_equal(left: CoreBinaryOp, right: CoreBinaryOp) -> Bool:
+	match (left, right):
+		(AddOp, AddOp) | (SubtractOp, SubtractOp) | (MultiplyOp, MultiplyOp):
+			True
+		(DivideOp, DivideOp) | (ModuloOp, ModuloOp):
+			True
+		(EqualOp, EqualOp) | (NotEqualOp, NotEqualOp):
+			True
+		(LessOp, LessOp) | (GreaterOp, GreaterOp):
+			True
+		(LessEqualOp, LessEqualOp) | (GreaterEqualOp, GreaterEqualOp):
+			True
+		_:
+			False
+
+
+private pure func has_legacy_native_binary_body(
+	function_info: CoreFunction,
+	op: CoreBinaryOp,
+) -> Bool:
+	if function_info.function_kind != UserFunction:
+		False
+	else:
+		match function_info.body:
+			Some(BinaryExpr(body_op, _, _, _, _)):
+				binary_operators_equal(body_op, op)
+			_:
+				False
 
 
 pure func native_scalar_binary_impl_target(
@@ -115,14 +258,38 @@ pure func native_scalar_binary_impl_target(
 	type_name: String,
 	method: CoreFunction,
 ) -> Option[CoreBinaryOp]:
-	-- Lowering assigns this kind only after validating the source builtin marker.
+	-- The source-body case keeps one bootstrap generation compatible. It is
+	-- constrained to the canonical scalar module, exact signature, and exact
+	-- operator body; user-owned implementations remain ordinary function targets.
 	owner_module ?= native_scalar_module(type_name)
 	op ?= native_scalar_binary_op(trait_name, type_name, method.name)
+	native_source: Bool = (
+		method.function_kind == UnresolvedBuiltinFunction
+		or has_legacy_native_binary_body(method, op)
+	)
+
+	if (
+		native_source
+		and method.source_module == Some(owner_module)
+		and has_binary_signature(method, type_name, op)
+	):
+		Some(op)
+	else:
+		None
+
+
+pure func native_scalar_unary_impl_target(
+	trait_name: String,
+	type_name: String,
+	method: CoreFunction,
+) -> Option[CoreUnaryOp]:
+	owner_module ?= native_scalar_module(type_name)
+	op ?= native_scalar_unary_target(trait_name, type_name, method.name)
 
 	if (
 		method.function_kind == UnresolvedBuiltinFunction
 		and method.source_module == Some(owner_module)
-		and has_binary_signature(method, type_name)
+		and has_unary_signature(method, type_name)
 	):
 		Some(op)
 	else:
@@ -145,26 +312,42 @@ pure func synthesize_scalar_operator_impl_body(
 			else:
 				source_name ?= synthesis_source_name(function_info)
 				owner_module ?= native_scalar_module(type_name)
-				op ?= native_scalar_binary_op(trait_name, type_name, source_name)
 
-				if (
-					function_info.source_module == Some(owner_module)
-					and has_binary_signature(function_info, type_name)
-				):
-					match function_info.params:
-						[left, right]:
-							Some(
-								BinaryExpr(
-									op,
-									parameter_value(left),
-									parameter_value(right),
-									function_info.return_type,
-									SyntheticSourceLoc,
-								),
-							)
-						_:
-							None
-				else:
+				if function_info.source_module != Some(owner_module):
 					None
+				else:
+					match native_scalar_binary_op(trait_name, type_name, source_name):
+						Some(op):
+							if not has_binary_signature(function_info, type_name, op):
+								None
+							else:
+								match function_info.params:
+									[left, right]:
+										Some(
+											BinaryExpr(
+												op,
+												parameter_value(left),
+												parameter_value(right),
+												function_info.return_type,
+												SyntheticSourceLoc,
+											),
+										)
+									_:
+										None
+						None:
+							op ?= native_scalar_unary_target(trait_name, type_name, source_name)
+
+							if not has_unary_signature(function_info, type_name):
+								None
+							else:
+								operand ?= function_info.params.get(0)
+								Some(
+									UnaryExpr(
+										op,
+										parameter_value(operand),
+										function_info.return_type,
+										SyntheticSourceLoc,
+									),
+								)
 		_:
 			None
