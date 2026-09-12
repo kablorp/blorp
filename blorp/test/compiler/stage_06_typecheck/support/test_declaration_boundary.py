@@ -73,6 +73,9 @@ TRAIT_IMPLEMENTATION_AUTHORITY = (
     ROOT
     / "blorp/src/compiler/stage_06_typecheck/type_system/accepted_trait_implementation_authority.brp"
 )
+IMPORT_BINDING = (
+    ROOT / "blorp/src/compiler/stage_06_typecheck/modules/import_binding.brp"
+)
 SEMANTIC_CATALOG = (
     ROOT
     / "blorp/src/compiler/stage_06_typecheck/type_system/accepted_semantic_catalog.brp"
@@ -80,6 +83,39 @@ SEMANTIC_CATALOG = (
 
 
 class DeclarationBoundaryTests(unittest.TestCase):
+
+    def test_graph_trait_method_binding_retains_overlapping_definition_ids(self) -> None:
+        source = IMPORT_BINDING.read_text(encoding="utf-8")
+        callable_authority = (
+            ROOT
+            / "blorp/src/compiler/stage_06_typecheck/type_system/accepted_callable_authority.brp"
+        ).read_text(encoding="utf-8")
+        global_authority = (
+            ROOT
+            / "blorp/src/compiler/stage_06_typecheck/type_system/accepted_global_authority.brp"
+        ).read_text(encoding="utf-8")
+        ctfe_context = (
+            ROOT / "blorp/src/compiler/stage_07_ctfe/context.brp"
+        ).read_text(encoding="utf-8")
+        compiler_pipeline = (
+            ROOT / "blorp/src/compiler/pipeline.brp"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "GraphSelectiveTraitMethodBinding(String, ModuleId, String, List[DefinitionId])",
+            source,
+        )
+        for consumer in (
+            callable_authority,
+            global_authority,
+            ctfe_context,
+            compiler_pipeline,
+        ):
+            self.assertRegex(
+                consumer,
+                r"GraphSelectiveTraitMethodBinding\(local_name, module_id, "
+                r"(?:_|source_name), definition_ids\)",
+            )
 
     def test_only_accepted_graph_contains_semantic_catalog(self) -> None:
         source = DECL.read_text(encoding="utf-8")
@@ -1334,6 +1370,155 @@ class DeclarationBoundaryTests(unittest.TestCase):
             qualified_resolution.group(0),
             r"AcceptedTraitMethodCalleeIdentity\(\s*accepted_qualified_trait_method_id\(",
         )
+
+    def test_accepted_trait_policies_consume_exact_identity(self) -> None:
+        authority_source = TRAIT_IMPLEMENTATION_AUTHORITY.read_text(encoding="utf-8")
+        infer_source = INFER.read_text(encoding="utf-8")
+
+        for query in (
+            "accepted_trait_matches_compiler_identity",
+            "accepted_resolve_trait_id_obligation",
+            "accepted_find_impl_method_info_by_trait_id",
+        ):
+            self.assertIn(f"pure func {query}(", authority_source)
+            self.assertIn(query, infer_source)
+
+            exact_query = re.search(
+                rf"pure func {query}\(.*?(?=\n\n(?:private )?pure func)",
+                authority_source,
+                re.DOTALL,
+            )
+            self.assertIsNotNone(exact_query)
+            self.assertIn("issuing_table: DefinitionTable", exact_query.group(0))
+
+        identity_lookup = re.search(
+            r"private pure func table_find_trait_identity_index\(.*?"
+            r"(?=\n\nprivate pure func)",
+            authority_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(identity_lookup)
+        self.assertIn("issuing_table: DefinitionTable", identity_lookup.group(0))
+        self.assertIn("definition_tables_share_provenance", identity_lookup.group(0))
+
+        self.assertNotIn("infer_facts_accepted_trait_method_name", infer_source)
+
+        elementwise = re.search(
+            r"private pure func resolved_call_supports_elementwise_tensor_call\(.*?"
+            r"(?=\n\nprivate pure func)",
+            infer_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(elementwise)
+        accepted_elementwise = elementwise.group(0).split(
+            "ResolvedAcceptedTraitMethodCall", 1
+        )[1]
+        self.assertIn(
+            "accepted_trait_method_supports_elementwise_tensor_call",
+            accepted_elementwise,
+        )
+        accepted_elementwise_policy = re.search(
+            r"private pure func accepted_trait_method_supports_elementwise_tensor_call\(.*?"
+            r"(?=\n\nprivate pure func)",
+            infer_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(accepted_elementwise_policy)
+        self.assertIn(
+            "accepted_trait_matches_compiler_identity",
+            accepted_elementwise_policy.group(0),
+        )
+        self.assertNotIn("trait_id_name", accepted_elementwise_policy.group(0))
+
+        self_bound = re.search(
+            r"private pure func check_trait_method_self_bound\(.*?"
+            r"(?=\n\nprivate pure func)",
+            infer_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(self_bound)
+        accepted_self_bound = self_bound.group(0).split(
+            "ResolvedAcceptedTraitMethodCall", 1
+        )[1].split("ResolvedSelectedTraitMethodCall", 1)[0]
+        self.assertIn("accepted_resolve_trait_id_obligation", accepted_self_bound)
+        self.assertNotIn("trait_obligation(obligation_type", accepted_self_bound)
+
+        self_resolution = re.search(
+            r"private pure func resolve_trait_self_call\(.*?"
+            r"(?=\n\nprivate pure func)",
+            infer_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(self_resolution)
+        resource_policy_match = re.search(
+            r"resource_args = match updated_resolved_call:.*?"
+            r"(?=\n\n\t\t\t\tfinal_resolved_call)",
+            self_resolution.group(0),
+            re.DOTALL,
+        )
+        self.assertIsNotNone(resource_policy_match)
+        accepted_resource_policy = resource_policy_match.group(0).split(
+            "ResolvedAcceptedTraitMethodCall", 1
+        )[1].split("ResolvedSelectedTraitMethodCall", 1)[0]
+        self.assertIn(
+            "accepted_trait_method_resource_args_for_type",
+            accepted_resource_policy,
+        )
+        self.assertNotRegex(
+            accepted_resource_policy,
+            r"(?<!accepted_)trait_method_resource_args_for_type\(",
+        )
+        accepted_resource_query = re.search(
+            r"private pure func accepted_trait_method_resource_args_for_type\(.*?"
+            r"(?=\n\nprivate pure func)",
+            infer_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(accepted_resource_query)
+        self.assertIn(
+            "accepted_find_impl_method_info_by_trait_id",
+            accepted_resource_query.group(0),
+        )
+        self.assertNotIn("trait_id_name", accepted_resource_query.group(0))
+
+    def test_unresolved_accepted_trait_call_preserves_exact_identity(self) -> None:
+        infer_source = INFER.read_text(encoding="utf-8")
+        typed_ast_json = (
+            ROOT / "blorp/src/compiler/stage_06_typecheck/typed_ast_json.brp"
+        ).read_text(encoding="utf-8")
+        ctfe_ir = (
+            ROOT / "blorp/src/compiler/stage_07_ctfe/ir.brp"
+        ).read_text(encoding="utf-8")
+        core_lower = (
+            ROOT / "blorp/src/compiler/stage_08_core_lower/lower.brp"
+        ).read_text(encoding="utf-8")
+
+        target = re.search(
+            r"union ResolvedCallTarget:.*?(?=\n\nenum ResolvedLoopProducer)",
+            infer_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(target)
+        self.assertIn(
+            "ResolvedAcceptedUnresolvedTraitMethodCall(TraitId)",
+            target.group(0),
+        )
+
+        resolution = re.search(
+            r"private pure func resolved_call_from_trait_method_callee\(.*?"
+            r"(?=\n\nprivate pure func)",
+            infer_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(resolution)
+        unresolved = resolution.group(0).split("None:", 1)[1]
+        self.assertIn("AcceptedTraitMethodCalleeIdentity", unresolved)
+        self.assertIn("ResolvedAcceptedUnresolvedTraitMethodCall", unresolved)
+        self.assertIn("ResolvedUnresolvedTraitMethodCall", unresolved)
+
+        for consumer in (typed_ast_json, ctfe_ir, core_lower):
+            self.assertIn("ResolvedAcceptedUnresolvedTraitMethodCall", consumer)
+            self.assertIn("trait_id_is_valid", consumer)
 
 if __name__ == "__main__":
     unittest.main()

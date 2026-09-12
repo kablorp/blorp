@@ -1,6 +1,6 @@
 # Normalized Semantic Compilation Roadmap
 
-**Status:** Steps 1 and 2a-2d are complete; Step 2e is in progress. Its first eighteen
+**Status:** Steps 1 and 2a-2d are complete; Step 2e is in progress. Its first twenty
 bounded packets normalized qualified-alias, local-declaration, selective-import,
 accepted-global visibility source-name identity, imported accepted-global target
 identity, accepted-global visibility inputs, and accepted-global per-module
@@ -10,7 +10,10 @@ last table-level callable string index with compact module ranges, construct
 authorities from prepared scopes, and preserve exact callable identity through
 direct, qualified, and unqualified accepted resolution and retry. They also
 preserve exact accepted trait-method identity through method lookup and
-concrete selected-call targets.
+concrete selected-call targets. The latest packets also keep accepted
+elementwise, self-bound, and resource-argument policy queries in the exact
+trait-identity domain, preserve that identity for unresolved accepted calls,
+and separate bare method visibility from receiver-directed UFCS evidence.
 
 **Scope:** One compiler invocation and one immutable analysis snapshot. This
 roadmap makes accepted and recoverable semantic facts directly queryable by the
@@ -1035,6 +1038,36 @@ all 30,981 transient allocations with zero retained objects or bytes. The
 allocation-neutral checked-bodies comparison keeps instructions within 0.002%,
 improves RSS and peak footprint about 0.91%-1.01%, and leaves compiler size
 effectively neutral.
+
+The nineteenth Step 2e packet is
+[`90-use-exact-trait-identities-for-inference-policies.md`](90-use-exact-trait-identities-for-inference-policies.md):
+accepted elementwise eligibility, trait-method `Self` obligations, and
+resource-argument selection now query the exact retained `TraitId`. Compiler
+policy requires the accepted table's explicit compiler-trait link; equal source
+spelling is not evidence. Exact table and topology paths no longer project
+trait names, while compiler-Env fallback, failed-obligation diagnostics, and
+graphless or unresolved compatibility remain explicitly string-backed. The
+retained screen is exactly neutral for allocations, releases, retained objects,
+and allocated bytes; instructions
+remain within 0.026%, while RSS, peak footprint, and cycles improve 0.08%-0.28%,
+and compiler size grows only 320 bytes.
+
+The twentieth Step 2e packet is
+[`91-preserve-exact-accepted-unresolved-trait-calls.md`](91-preserve-exact-accepted-unresolved-trait-calls.md):
+graph-backed accepted unresolved trait calls now retain exact `TraitId` while
+graphless compatibility remains explicitly string-backed. Typed JSON, CTFE,
+inference policy, and Core validate or consume that identity before projecting
+text at their external boundaries. Trait-method imports preserve their
+explicit kind alongside exact overlapping definition targets, and accepted
+bare-method visibility is now derived only from genuinely unqualified local,
+selective, or compiler-linked traits. Qualified-only namesakes no longer create
+false unqualified collisions. The visibility adapter is now an opaque,
+table-bound product; aliases retain exact identity, and ambiguous implicit UFCS
+reports actionable guidance. The full compiler suite passes all 4,498 tests.
+The retained screen is allocation-, retention-, and byte-neutral while
+instructions improve 0.103%, cycles improve 0.605%, RSS improves 0.850%, peak
+footprint improves 1.015%, the measured window improves 0.373%, and compiler
+size grows 0.183%.
 
 ### Context
 

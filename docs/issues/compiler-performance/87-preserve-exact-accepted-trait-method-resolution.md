@@ -70,9 +70,10 @@ single-authority design.
    the ID, signature, and declaring trait.
 4. Imported method signatures preserve their stored module qualification;
    owner-local signatures retain the existing localization behavior.
-5. Unqualified method visibility follows the same one-row-per-semantic-name
-   selection as trait and obligation lookup. Qualified-only traits with the
-   same source name do not conflict merely because their exact IDs differ.
+5. Unqualified method visibility follows the explicit source-visible trait
+   rows: owner-local traits, selective trait imports, and compiler-linked
+   prelude traits. Qualified-only traits with the same source name do not
+   conflict merely because their exact IDs differ.
 6. Duplicate method-name diagnostics preserve their current source-oriented
    trait names, projected from conflicting selected IDs only when the
    diagnostic is built.
@@ -125,17 +126,13 @@ changed.
 ### 2. Build the target relation from canonical rows
 
 `table_trait_methods_seen` now returns `(source method name, TraitMethodId)`.
-Each selected semantic trait row pairs every declared method signature slot
-with the table-issued ID at that same slot. The selection is shared with trait
-and obligation lookup, so qualified-only namesake rows do not become competing
-unqualified methods. Supertrait traversal carries those exact pairs, so an
-inherited method continues to point at its declaring trait rather than the
-visible child trait.
-
-Authority construction scans the already-unique visible row list and checks
-selection membership through zero-allocation direct dictionary iteration. This
-keeps multiple source aliases for one row from duplicating method registration
-without materializing a values list.
+Each source-visible trait row pairs every declared method signature slot with
+the table-issued ID at that same slot. Authority construction retains those
+rows in a stable, duplicate-free index list, so qualified-only namesake rows do
+not become competing unqualified methods and multiple source aliases for one
+row do not duplicate method registration. Supertrait traversal carries those
+exact pairs, so an inherited method continues to point at its declaring trait
+rather than the visible child trait.
 
 The authority's source-visible dictionary stores those pairs directly. When a
 duplicate source method name names two different selected IDs, diagnostic
@@ -248,9 +245,9 @@ the exact trait-method lookup dominates compilation time.
 ## Measurements
 
 These measurements record the original Issue 87 exact-identity cutover. The
-follow-up namesake correction preserves its allocation mechanism by using
-zero-allocation direct dictionary iteration; the historical latency counters
-below were not rebaselined for that correctness fix.
+follow-up namesake correction was subsequently superseded by Issue 91's
+explicit, stable source-visible trait index list; the historical latency
+counters below were not rebaselined for either correctness refinement.
 
 The 32-call imported-trait-method probe remained semantically valid:
 

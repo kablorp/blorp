@@ -11,7 +11,12 @@ import:
 		module_table_canonical_path,
 		module_table_count,
 		module_table_find_id_by_canonical_path,
-	../graph/definition_index: DefinitionTable, definition_table_is_compatible_with_module_table
+	../graph/definition_index:
+		DefinitionId,
+		DefinitionTable,
+		definition_id_runtime_value,
+		definition_table_is_compatible_with_module_table,
+		definition_tables_share_provenance,
 	../headers/declaration_skeleton:
 		CallableId,
 		DeclarationVisibility(PrivateDeclaration, PublicDeclaration),
@@ -27,6 +32,7 @@ import:
 		impl_id_name,
 		impl_ids_equal,
 		trait_id_definition_id,
+		trait_id_from_definition_table,
 		trait_id_is_compiler_builtin,
 		trait_id_module_id,
 		trait_id_name,
@@ -36,6 +42,14 @@ import:
 		trait_method_id_index,
 		trait_method_id_owner,
 		trait_method_ids_equal,
+	../modules/import_binding:
+		ImportBinding(
+			GraphQualifiedModuleBinding,
+			GraphSelectiveDefinitionBinding,
+			GraphSelectiveTraitMethodBinding,
+			StandaloneQualifiedModuleBinding,
+			StandaloneSelectiveDefinitionBinding,
+		),
 	env:
 		Env,
 		ImplInstance,
@@ -99,11 +113,9 @@ record AcceptedImplementationDefinitionIds {
 }
 
 
-record AcceptedVisibleTraitBinding {
-	source_name: String,
-	owner_module_path: String,
-	original_name: String
-}
+private union AcceptedVisibleTraitBinding:
+	AcceptedVisibleTraitDefinitionBinding(String, TraitId)
+	AcceptedVisibleTraitMethodBinding(String, ModuleId, String)
 
 
 private record AcceptedTraitImplementationTableRep {
@@ -123,6 +135,15 @@ private record AcceptedTraitImplementationTableRep {
 
 
 opaque type AcceptedTraitImplementationTable = AcceptedTraitImplementationTableRep
+
+
+private record AcceptedTraitVisibilityRep {
+	table: AcceptedTraitImplementationTable,
+	bindings: List[AcceptedVisibleTraitBinding]
+}
+
+
+opaque type AcceptedTraitVisibility = AcceptedTraitVisibilityRep
 
 
 private record AcceptedCompilerImplementationBucket {
@@ -170,6 +191,83 @@ pure func accepted_trait_implementation_table_definition_table(
 	table: AcceptedTraitImplementationTable,
 ) -> DefinitionTable:
 	table_rep(table).definition_table
+
+
+private pure func accepted_trait_visibility_rep(
+	visibility: AcceptedTraitVisibility,
+) -> AcceptedTraitVisibilityRep:
+	from_opaque AcceptedTraitVisibility(visibility)
+
+
+pure func accepted_trait_empty_visibility(
+	table: AcceptedTraitImplementationTable,
+) -> AcceptedTraitVisibility:
+	into_opaque AcceptedTraitVisibility({
+			table = table,
+			bindings = []
+		})
+
+
+-- Convert graph import rows into a table-bound visibility product once. Raw
+-- DefinitionId integers never cross into authority construction: applicable
+-- trait definitions become exact TraitIds under the issuing table, and the
+-- aggregate retains the accepted table capability that must consume them.
+pure func accepted_visible_trait_bindings(
+	table: AcceptedTraitImplementationTable,
+	issuing_table: DefinitionTable,
+	import_bindings: List[ImportBinding],
+) -> Option[AcceptedTraitVisibility]:
+	representation = table_rep(table)
+	var bindings: List[AcceptedVisibleTraitBinding] = []
+	var valid = definition_tables_share_provenance(representation.definition_table, issuing_table)
+
+	for binding in import_bindings:
+		match binding:
+			GraphSelectiveDefinitionBinding(local_name, module_id, definition_ids):
+				for definition_id in definition_ids:
+					match trait_id_from_definition_table(
+						issuing_table,
+						definition_id_runtime_value(definition_id),
+					):
+						Some(trait_id):
+							if (
+								trait_id_module_id(issuing_table, trait_id)
+									.map(func(owner_id): module_ids_equal(owner_id, module_id))
+									.get_or(False)
+							):
+								bindings = bindings.append(
+									AcceptedVisibleTraitDefinitionBinding(
+										local_name,
+										trait_id,
+									),
+								)
+							else:
+								valid = False
+						None:
+							void
+			GraphSelectiveTraitMethodBinding(local_name, module_id, original_name, _):
+				if module_table_canonical_path(representation.module_table, module_id).is_some():
+					bindings = bindings.append(
+						AcceptedVisibleTraitMethodBinding(
+							local_name,
+							module_id,
+							original_name,
+						),
+					)
+				else:
+					valid = False
+			GraphQualifiedModuleBinding(_, _):
+				void
+			StandaloneQualifiedModuleBinding(_, _) | StandaloneSelectiveDefinitionBinding(_, _, _):
+				valid = False
+
+	if valid:
+		Some(into_opaque AcceptedTraitVisibility({
+					table = table,
+					bindings = bindings
+				}))
+	else:
+		None
 
 
 pure func accepted_trait_implementation_table_trait_count(
@@ -978,6 +1076,26 @@ private pure func table_find_trait_index(
 		None
 
 
+private pure func table_find_trait_identity_index(
+	table: AcceptedTraitImplementationTableRep,
+	issuing_table: DefinitionTable,
+	id: TraitId,
+) -> Option[Int]:
+	if not definition_tables_share_provenance(table.definition_table, issuing_table):
+		None
+	else if trait_id_is_compiler_builtin(id):
+		index ?= table.trait_index_by_compiler_identity.get(trait_id_storage_key(id))
+		item ?= table.traits.get(index)
+		linked ?= item.compiler_builtin_id
+
+		if trait_ids_equal(linked, id):
+			Some(index)
+		else:
+			None
+	else:
+		table_find_trait_index(table, id)
+
+
 private pure func table_find_bound_trait_index(
 	table: AcceptedTraitImplementationTableRep,
 	identity: BoundTraitIdentity,
@@ -1079,6 +1197,37 @@ private pure func table_trait_ids_semantically_equivalent(
 	)
 
 
+-- Accepted inference policies compare the exact selected trait with a
+-- compiler-owned semantic identity. Source declarations only match when the
+-- accepted table explicitly linked them to that compiler trait; equal
+-- spellings alone are never evidence.
+pure func accepted_trait_matches_compiler_identity(
+	authority: AcceptedTraitImplementationAuthority,
+	issuing_table: DefinitionTable,
+	trait_id: TraitId,
+	compiler_trait_id: TraitId,
+) -> Bool:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+
+	if not trait_id_is_compiler_builtin(compiler_trait_id):
+		False
+	else:
+		match table_find_trait_identity_index(table, issuing_table, trait_id):
+			Some(index):
+				match table.traits.get(index):
+					Some(item):
+						match item.compiler_builtin_id:
+							Some(linked):
+								trait_ids_equal(linked, compiler_trait_id)
+							None:
+								False
+					None:
+						False
+			None:
+				False
+
+
 private pure func implementation_type_label(
 	definition_table: DefinitionTable,
 	module_table: ModuleTable,
@@ -1106,12 +1255,24 @@ private pure func implementation_type_label(
 pure func accepted_trait_implementation_authority(
 	table: AcceptedTraitImplementationTable,
 	owner_module_path: String,
-	bindings: List[AcceptedVisibleTraitBinding],
+	visibility: AcceptedTraitVisibility,
 	direct_module_paths: List[String],
 ) -> AcceptedTraitImplementationAuthority:
 	representation = table_rep(table)
+	visibility_representation = accepted_trait_visibility_rep(visibility)
+	visibility_is_valid = definition_tables_share_provenance(
+		representation.definition_table,
+		table_rep(visibility_representation.table).definition_table,
+	)
+
+	bindings: List[AcceptedVisibleTraitBinding] = if visibility_is_valid:
+		visibility_representation.bindings
+	else:
+		[]
+
 	var visible_traits: Dict[String, Int] = {}
 	var visible_trait_indices: List[Int] = []
+	var unqualified_trait_indices: List[Int] = []
 	var visible_implementations: List[Int] = []
 	var implementation_indices_by_satisfied_trait_index: Dict[Int, List[Int]] = {}
 	var implementation_indices_by_trait_name: Dict[String, List[Int]] = {}
@@ -1122,7 +1283,11 @@ pure func accepted_trait_implementation_authority(
 
 	}
 	var trait_method_id_by_name: Dict[String, TraitMethodId] = {}
-	var preparation_errors: List[String] = []
+
+	var preparation_errors: List[String] = if visibility_is_valid:
+		[]
+	else:
+		["accepted trait visibility belongs to a different definition table"]
 
 	for module_path in direct_module_paths:
 		for index in trait_indices_for_module_path(representation, module_path):
@@ -1145,28 +1310,29 @@ pure func accepted_trait_implementation_authority(
 		match representation.traits.get(index):
 			Some(item):
 				visible_traits = visible_traits.set(item.definition.name, index)
+				unqualified_trait_indices = append_unique_index(unqualified_trait_indices, index)
 			None:
 				void
 
 	for binding in bindings:
-		for index in visible_trait_indices:
-			match representation.traits.get(index):
-				Some(item):
-					item_owner_module_path = trait_owner_module_path(
-						representation.definition_table,
-						representation.module_table,
-						item,
-					)
-
-					if (
-						item.visibility == PublicDeclaration
-						and item_owner_module_path == Some(binding.owner_module_path)
-						and item.definition.name == binding.original_name
-					):
-						visible_traits = visible_traits.set(binding.source_name, index)
-						break
-				None:
-					void
+		match binding:
+			AcceptedVisibleTraitDefinitionBinding(source_name, trait_id):
+				match table_find_trait_index(representation, trait_id):
+					Some(index):
+						match representation.traits.get(index):
+							Some(item):
+								if item.visibility == PublicDeclaration:
+									visible_traits = visible_traits.set(source_name, index)
+									unqualified_trait_indices = append_unique_index(
+										unqualified_trait_indices,
+										index,
+									)
+							None:
+								void
+					None:
+						void
+			AcceptedVisibleTraitMethodBinding(_, _, _):
+				void
 
 	-- Compiler-linked prelude traits are intentionally available without an
 	-- explicit source binding. User-defined traits, including qualified-only
@@ -1179,6 +1345,10 @@ pure func accepted_trait_implementation_authority(
 					and not visible_traits.contains(item.definition.name)
 				):
 					visible_traits = visible_traits.set(item.definition.name, index)
+					unqualified_trait_indices = append_unique_index(
+						unqualified_trait_indices,
+						index,
+					)
 			None:
 				void
 
@@ -1195,42 +1365,70 @@ pure func accepted_trait_implementation_authority(
 			None:
 				void
 
-	-- Unqualified method visibility must use the same selected semantic rows.
-	-- Scan the unique visible rows and the dictionary directly: aliases can map
-	-- multiple source names to one row, and materializing values would allocate.
-	for index in visible_trait_indices:
-		var selected_for_semantic_resolution = False
-
-		for (_, selected_index) in semantic_traits:
-			if selected_index == index:
-				selected_for_semantic_resolution = True
-				break
-
-		if selected_for_semantic_resolution:
-			match representation.traits.get(index):
-				Some(_):
-					for pair in table_trait_methods_seen(representation, [], index):
-						match trait_method_id_by_name.get(pair[0]):
-							Some(existing_method_id):
-								if not trait_method_ids_equal(existing_method_id, pair[1]):
-									existing_trait = trait_id_name(
-										representation.definition_table,
-										trait_method_id_owner(existing_method_id),
-									)
-									incoming_trait = trait_id_name(
-										representation.definition_table,
-										trait_method_id_owner(pair[1]),
-									)
-									preparation_errors = preparation_errors.append(
-										"method '" + pair[0] + "' is already registered under trait '" + existing_trait + "'; cannot also register under '" + incoming_trait + "'",
-									)
-							None:
-								trait_method_id_by_name = trait_method_id_by_name.set(
-									pair[0],
-									pair[1],
+	for index in unqualified_trait_indices:
+		match representation.traits.get(index):
+			Some(_):
+				for pair in table_trait_methods_seen(representation, [], index):
+					match trait_method_id_by_name.get(pair[0]):
+						Some(existing_method_id):
+							if not trait_method_ids_equal(existing_method_id, pair[1]):
+								existing_trait = trait_id_name(
+									representation.definition_table,
+									trait_method_id_owner(existing_method_id),
 								)
-				None:
-					void
+								incoming_trait = trait_id_name(
+									representation.definition_table,
+									trait_method_id_owner(pair[1]),
+								)
+								preparation_errors = preparation_errors.append(
+									"method '" + pair[0] + "' is already registered under trait '" + existing_trait + "'; cannot also register under '" + incoming_trait + "'",
+								)
+						None:
+							trait_method_id_by_name = trait_method_id_by_name.set(pair[0], pair[1])
+			None:
+				void
+
+	-- A selectively imported method is an unqualified binding even when its
+	-- declaring trait name is not imported. Qualified-only and merely direct
+	-- modules do not contribute entries to this source-name relation.
+	for binding in bindings:
+		match binding:
+			AcceptedVisibleTraitMethodBinding(source_name, module_id, original_name):
+				for index in representation.trait_indices_by_module.get_or(
+					module_id_table_index(module_id),
+					[],
+				):
+					match representation.traits.get(index):
+						Some(item):
+							if item.visibility == PublicDeclaration:
+								for pair in table_trait_methods_seen(representation, [], index):
+									if pair[0] == original_name:
+										match trait_method_id_by_name.get(source_name):
+											Some(existing_method_id):
+												if not trait_method_ids_equal(
+													existing_method_id,
+													pair[1],
+												):
+													existing_trait = trait_id_name(
+														representation.definition_table,
+														trait_method_id_owner(existing_method_id),
+													)
+													incoming_trait = trait_id_name(
+														representation.definition_table,
+														trait_method_id_owner(pair[1]),
+													)
+													preparation_errors = preparation_errors.append(
+														"method '" + source_name + "' is already registered under trait '" + existing_trait + "'; cannot also register under '" + incoming_trait + "'",
+													)
+											None:
+												trait_method_id_by_name = trait_method_id_by_name.set(
+													source_name,
+													pair[1],
+												)
+						None:
+							void
+			AcceptedVisibleTraitDefinitionBinding(_, _):
+				void
 
 	for module_path in direct_module_paths:
 		for index in implementation_indices_for_module_path(representation, module_path):
@@ -1426,6 +1624,40 @@ pure func accepted_trait_implementation_authority_preparation_errors(
 	authority_rep(authority).preparation_errors
 
 
+-- Preserve visibility projection failure as an authority preparation error.
+-- Callers must not turn a rejected graph/table pairing into an ordinary empty
+-- namespace, because that would hide a broken compiler invariant.
+pure func accepted_trait_implementation_authority_from_visibility(
+	table: AcceptedTraitImplementationTable,
+	owner_module_path: String,
+	visibility: Option[AcceptedTraitVisibility],
+	direct_module_paths: List[String],
+) -> AcceptedTraitImplementationAuthority:
+	match visibility:
+		Some(accepted_visibility):
+			accepted_trait_implementation_authority(
+				table,
+				owner_module_path,
+				accepted_visibility,
+				direct_module_paths,
+			)
+		None:
+			fallback = accepted_trait_implementation_authority(
+				table,
+				owner_module_path,
+				accepted_trait_empty_visibility(table),
+				direct_module_paths,
+			)
+			representation = authority_rep(fallback)
+			into_opaque AcceptedTraitImplementationAuthority(
+				{ representation |
+					preparation_errors = representation.preparation_errors.append(
+						"accepted trait visibility rejected its graph definition table",
+					)
+				}
+			)
+
+
 private pure func localized_trait_method(
 	module_path: String,
 	method: TraitMethodSig,
@@ -1594,6 +1826,12 @@ private record AcceptedTraitMethodMatch {
 
 
 opaque type AcceptedTraitMethodBinding = AcceptedTraitMethodMatch
+
+
+union AcceptedTraitUfcsMethodLookup:
+	AcceptedTraitUfcsMethodFound(AcceptedTraitMethodBinding)
+	AcceptedTraitUfcsMethodNotFound
+	AcceptedTraitUfcsMethodAmbiguous
 
 
 pure func accepted_trait_method_binding_id(binding: AcceptedTraitMethodBinding) -> TraitMethodId:
@@ -1948,6 +2186,38 @@ private pure func accepted_type_param_has_exact_trait_bound(
 	found
 
 
+private pure func accepted_type_param_has_trait_id_bound(
+	authority: AcceptedTraitImplementationAuthority,
+	env: Env,
+	param_name: String,
+	trait_id: TraitId,
+	target_index: Int,
+) -> Bool:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+	var found: Bool = False
+
+	for bound in env_get_type_param_bound_identities(env, param_name):
+		if bound_trait_identity_matches_id(table.definition_table, bound, trait_id):
+			found = True
+		else:
+			match table_find_bound_trait_index(table, bound):
+				Some(bound_index):
+					match table.traits.get(target_index):
+						Some(target):
+							if table_trait_has_supertrait_seen(table, [], bound_index, target.id):
+								found = True
+						None:
+							void
+				None:
+					void
+
+		if found:
+			break
+
+	found
+
+
 private pure func accepted_bound_obligation_is_satisfied(
 	authority: AcceptedTraitImplementationAuthority,
 	env: Env,
@@ -2024,6 +2294,32 @@ private pure func accepted_has_matching_implementation(
 	found
 
 
+private pure func implementation_candidate_indices_for_trait_index(
+	authority: AcceptedTraitImplementationAuthorityRep,
+	trait_index: Int,
+) -> List[Int]:
+	table = table_rep(authority.table)
+
+	match (
+		table.traits
+			.get(trait_index)
+			.and_then(func(item): item.compiler_builtin_id)
+	):
+		Some(compiler_id):
+			match authority.compiler_implementations_by_trait_identity.get(
+				trait_id_storage_key(compiler_id),
+			):
+				Some(bucket):
+					if trait_ids_equal(compiler_id, bucket.trait_id):
+						bucket.implementation_indices
+					else:
+						[]
+				None:
+					[]
+		None:
+			authority.implementation_indices_by_satisfied_trait_index.get_or(trait_index, [])
+
+
 private pure func accepted_has_matching_exact_implementation(
 	authority: AcceptedTraitImplementationAuthority,
 	env: Env,
@@ -2034,28 +2330,7 @@ private pure func accepted_has_matching_exact_implementation(
 	table = table_rep(representation.table)
 	var found: Bool = False
 
-	candidate_indices: List[Int] = match (
-		table.traits
-			.get(trait_index)
-			.and_then(func(item): item.compiler_builtin_id)
-	):
-		Some(compiler_id):
-			match representation.compiler_implementations_by_trait_identity.get(
-				trait_id_storage_key(compiler_id),
-			):
-				Some(bucket):
-					if trait_ids_equal(compiler_id, bucket.trait_id):
-						bucket.implementation_indices
-					else:
-						empty: List[Int] = []
-						empty
-				None:
-					empty: List[Int] = []
-					empty
-		None:
-			representation.implementation_indices_by_satisfied_trait_index.get_or(trait_index, [])
-
-	for index in candidate_indices:
+	for index in implementation_candidate_indices_for_trait_index(representation, trait_index):
 		match table.implementations.get(index):
 			Some(item):
 				if accepted_implementation_matches_type(authority, env, item, typ):
@@ -2123,6 +2398,81 @@ pure func accepted_resolve_exact_trait_obligation(
 				)
 			else:
 				TraitObligationUnsatisfied
+
+
+private pure func accepted_or_compiler_trait_id_obligation_resolution(
+	authority: AcceptedTraitImplementationAuthority,
+	env: Env,
+	typ: SemanticType,
+	trait_index: Int,
+) -> TraitObligationResolution:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+
+	match (
+		table.traits
+			.get(trait_index)
+			.and_then(func(item): item.compiler_builtin_id)
+	):
+		Some(compiler_id):
+			env_resolve_trait_obligation(
+				env,
+				trait_obligation(
+					typ,
+					trait_id_name(table.definition_table, compiler_id),
+				),
+			)
+		None:
+			TraitObligationUnsatisfied
+
+
+-- Resolve an accepted call's exact trait without reconstructing a semantic
+-- lookup key from its source spelling. A name is projected only when an
+-- explicitly linked compiler trait must use the graphless Env compatibility
+-- fallback.
+pure func accepted_resolve_trait_id_obligation(
+	authority: AcceptedTraitImplementationAuthority,
+	issuing_table: DefinitionTable,
+	env: Env,
+	typ: SemanticType,
+	trait_id: TraitId,
+) -> TraitObligationResolution:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+
+	match table_find_trait_identity_index(table, issuing_table, trait_id):
+		Some(trait_index):
+			match typ:
+				SemanticMetaType(_):
+					TraitObligationDeferred
+				SemanticTypeVar(name):
+					if accepted_type_param_has_trait_id_bound(
+						authority,
+						env,
+						name,
+						trait_id,
+						trait_index,
+					):
+						TraitObligationSatisfied
+					else:
+						accepted_or_compiler_trait_id_obligation_resolution(
+							authority,
+							env,
+							typ,
+							trait_index,
+						)
+				_:
+					if accepted_has_matching_exact_implementation(authority, env, trait_index, typ):
+						TraitObligationSatisfied
+					else:
+						accepted_or_compiler_trait_id_obligation_resolution(
+							authority,
+							env,
+							typ,
+							trait_index,
+						)
+		None:
+			TraitObligationUnsatisfied
 
 
 pure func accepted_find_unsatisfied_bound_type_param(
@@ -2237,29 +2587,20 @@ pure func accepted_find_unsatisfied_trait_obligation(
 	result
 
 
-pure func accepted_find_impl_method_info(
+private pure func accepted_find_impl_method_info_from_candidates(
 	authority: AcceptedTraitImplementationAuthority,
 	env: Env,
-	trait_name: String,
+	trait_method: Option[AcceptedTraitMethodMatch],
+	compiler_trait_id: Option[TraitId],
+	implementation_indices: List[Int],
 	method_name: String,
 	receiver_type: SemanticType,
 ) -> Option[ImplMethodInfo]:
 	representation = authority_rep(authority)
 	table = table_rep(representation.table)
-	trait_method = representation.trait_indices_by_semantic_name
-		.get(trait_name)
-		.and_then(
-			func(
-				trait_index,
-			): table_find_trait_method_seen(representation, [], trait_index, method_name),
-		)
-	compiler_trait_id = builtin_trait_id(trait_name)
 	var result: Option[ImplMethodInfo] = None
 
-	for implementation_index in implementation_candidate_indices_for_trait(
-		representation,
-		trait_name,
-	):
+	for implementation_index in implementation_indices:
 		match table.implementations.get(implementation_index):
 			Some(item):
 				if accepted_implementation_matches_type(authority, env, item, receiver_type):
@@ -2320,6 +2661,118 @@ pure func accepted_find_impl_method_info(
 			break
 
 	result
+
+
+pure func accepted_find_impl_method_info(
+	authority: AcceptedTraitImplementationAuthority,
+	env: Env,
+	trait_name: String,
+	method_name: String,
+	receiver_type: SemanticType,
+) -> Option[ImplMethodInfo]:
+	representation = authority_rep(authority)
+	trait_method = representation.trait_indices_by_semantic_name
+		.get(trait_name)
+		.and_then(
+			func(
+				trait_index,
+			): table_find_trait_method_seen(representation, [], trait_index, method_name),
+		)
+
+	accepted_find_impl_method_info_from_candidates(
+		authority,
+		env,
+		trait_method,
+		builtin_trait_id(trait_name),
+		implementation_candidate_indices_for_trait(representation, trait_name),
+		method_name,
+		receiver_type,
+	)
+
+
+-- Accepted calls already carry the declaring trait identity. Follow that ID
+-- through the topology and implementation-slot relations instead of
+-- projecting a name and entering the compatibility lookup.
+pure func accepted_find_impl_method_info_by_trait_id(
+	authority: AcceptedTraitImplementationAuthority,
+	issuing_table: DefinitionTable,
+	env: Env,
+	trait_id: TraitId,
+	method_name: String,
+	receiver_type: SemanticType,
+) -> Option[ImplMethodInfo]:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+	trait_index ?= table_find_trait_identity_index(table, issuing_table, trait_id)
+	trait_method ?= table_find_trait_method_seen(representation, [], trait_index, method_name)
+
+	accepted_find_impl_method_info_from_candidates(
+		authority,
+		env,
+		Some(trait_method),
+		None,
+		implementation_candidate_indices_for_trait_index(representation, trait_index),
+		method_name,
+		receiver_type,
+	)
+
+
+-- UFCS may use a public implementation from a directly imported module
+-- without importing the trait or method into the bare namespace. Select from
+-- the exact visible trait rows and require one applicable method identity;
+-- same-spelled qualified-only traits remain ambiguous rather than acquiring
+-- arbitrary bare-name precedence.
+pure func accepted_trait_find_ufcs_method(
+	authority: AcceptedTraitImplementationAuthority,
+	env: Env,
+	method_name: String,
+	receiver_type: SemanticType,
+) -> AcceptedTraitUfcsMethodLookup:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+	var selected: Option[AcceptedTraitMethodMatch] = None
+	var ambiguous: Bool = False
+
+	for trait_index in representation.visible_trait_indices:
+		match table_find_trait_method_seen(representation, [], trait_index, method_name):
+			Some(method):
+				method_owner_index = table_find_trait_index(table, trait_method_id_owner(method.id))
+				implementation = method_owner_index.and_then(func(owner_index):
+					accepted_find_impl_method_info_from_candidates(
+						authority,
+						env,
+						Some(method),
+						None,
+						implementation_candidate_indices_for_trait_index(
+							representation,
+							owner_index,
+						),
+						method_name,
+						receiver_type,
+					)
+				)
+
+				if implementation.is_some():
+					match selected:
+						Some(existing):
+							if not trait_method_ids_equal(existing.id, method.id):
+								ambiguous = True
+						None:
+							selected = Some(method)
+			None:
+				void
+
+		if ambiguous:
+			break
+
+	if ambiguous:
+		AcceptedTraitUfcsMethodAmbiguous
+	else:
+		match selected:
+			Some(method):
+				AcceptedTraitUfcsMethodFound(into_opaque AcceptedTraitMethodBinding(method))
+			None:
+				AcceptedTraitUfcsMethodNotFound
 
 
 pure func accepted_find_qualified_trait_method_info(

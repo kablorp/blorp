@@ -130,6 +130,7 @@ import:
 		definition_index_source_definition_bindings,
 		definition_table_definition_id,
 		definition_table_module_table,
+		definition_tables_share_provenance,
 	../../../src/compiler/stage_06_typecheck/graph/indexed_graph:
 		indexed_graph_build,
 		indexed_graph_find_dependency_scope,
@@ -157,6 +158,7 @@ import:
 	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
 		CallableId,
 		DeclarationVisibility(PublicDeclaration),
+		builtin_trait_id,
 		callable_id_definition_id,
 		callable_id_from_reserved_graph_definition,
 		callable_id_module_id,
@@ -202,7 +204,11 @@ import:
 		bound_module_scope,
 		bound_module_source_direct_import_count,
 	../../../src/compiler/stage_06_typecheck/modules/import_binding:
-		ImportBinding(GraphSelectiveDefinitionBinding, StandaloneSelectiveDefinitionBinding),
+		ImportBinding(
+			GraphSelectiveDefinitionBinding,
+			GraphSelectiveTraitMethodBinding,
+			StandaloneSelectiveDefinitionBinding,
+		),
 	../../../src/compiler/stage_06_typecheck/modules/module_binding:
 		ImportableModule,
 		ImportableModuleIndex,
@@ -306,16 +312,21 @@ import:
 		AcceptedTraitTableRecord,
 		accepted_has_direct_trait_evidence,
 		accepted_implementation_candidate_count,
+		accepted_resolve_trait_id_obligation,
 		accepted_resolve_trait_obligation,
+		accepted_trait_empty_visibility,
 		accepted_trait_find_function_method,
 		accepted_trait_implementation_authority,
+		accepted_trait_implementation_authority_from_visibility,
 		accepted_trait_implementation_authority_preparation_errors,
 		accepted_trait_implementation_table,
 		accepted_trait_implementation_table_validation_errors,
+		accepted_trait_matches_compiler_identity,
 		accepted_trait_method_binding_declaring_trait_name,
 		accepted_trait_method_binding_id,
 		accepted_trait_method_binding_signature,
 		accepted_trait_module_path,
+		accepted_visible_trait_bindings,
 	../../../src/compiler/stage_06_typecheck/type_system/accepted_union_authority:
 		AcceptedUnionVariantEntry,
 		accepted_union_find,
@@ -2795,24 +2806,169 @@ private pure func accepted_trait_table_validation_is_owner_safe() -> Option[Bool
 		traits = [item],
 		implementations = [],
 	})
-	authority = accepted_trait_implementation_authority(table, owner_path, [], [])
+	authority = accepted_trait_implementation_authority(
+		table,
+		owner_path,
+		accepted_trait_empty_visibility(table),
+		[],
+	)
+	compiler_equatable_id ?= builtin_trait_id("Equatable")
 	wrong_owner_path = "not/the/trait/owner"
 	wrong_owner_item = { item | definition = { definition | module_path = Some(wrong_owner_path) } }
 
-	Some(accepted_resolve_trait_obligation(
-		authority,
-		base_state.env,
-		trait_obligation(TYPE_INT, "Equatable"),
-	) == TraitObligationUnsatisfied and accepted_trait_implementation_table({
-		module_table = owner_table,
-		definition_table = definition_table,
-		traits = [wrong_owner_item],
-		implementations = [],
-	}).is_none())
+	Some((
+		not accepted_trait_matches_compiler_identity(
+			authority,
+			definition_table,
+			id,
+			compiler_equatable_id,
+		)
+		and accepted_resolve_trait_id_obligation(
+			authority,
+			definition_table,
+			base_state.env,
+			TYPE_INT,
+			id,
+		) == TraitObligationUnsatisfied
+		and accepted_resolve_trait_obligation(
+			authority,
+			base_state.env,
+			trait_obligation(TYPE_INT, "Equatable"),
+		) == TraitObligationUnsatisfied
+		and accepted_trait_implementation_table({
+			module_table = owner_table,
+			definition_table = definition_table,
+			traits = [wrong_owner_item],
+			implementations = [],
+		}).is_none()
+	))
 
 
 func test_accepted_trait_table_validation_is_owner_safe() -> Bool:
 	accepted_trait_table_validation_is_owner_safe().get_or(False)
+
+
+private pure func accepted_trait_policy_queries_reject_foreign_identity_provenance(
+
+) -> Option[Bool]:
+	base_state = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
+	local_graph: AcceptedTypecheckGraph ?= typecheck_test_accepted_graph(
+		base_state,
+		program([trait_decl("Equatable")]),
+		[],
+	).to_option()
+	foreign_graph: AcceptedTypecheckGraph ?= typecheck_test_accepted_graph(
+		base_state,
+		program([trait_decl("Equatable")]),
+		[],
+	).to_option()
+	local_headers = accepted_typecheck_graph_implementation_headers(local_graph)
+	foreign_headers = accepted_typecheck_graph_implementation_headers(foreign_graph)
+	local_definition_table = implementation_header_graph_definition_table(local_headers)
+	foreign_definition_table = implementation_header_graph_definition_table(foreign_headers)
+	local_topology = callable_header_graph_trait_topology(
+		implementation_header_graph_callable_headers(local_headers),
+	)
+	foreign_topology = callable_header_graph_trait_topology(
+		implementation_header_graph_callable_headers(foreign_headers),
+	)
+	local_header ?= trait_topology_graph_headers(local_topology).get(0)
+	foreign_header ?= trait_topology_graph_headers(foreign_topology).get(0)
+	local_id = trait_topology_header_id(local_header)
+	foreign_id = trait_topology_header_id(foreign_header)
+	owner_table = indexed_graph_module_table(
+		bound_module_graph_indexed_graph(
+			type_header_graph_bound_graph(trait_topology_graph_type_headers(local_topology)),
+		),
+	)
+	owner_id ?= trait_id_module_id(local_definition_table, local_id)
+	foreign_owner_id ?= trait_id_module_id(foreign_definition_table, foreign_id)
+	owner_path ?= module_table_canonical_path(owner_table, owner_id)
+	foreign_definition_id ?= definition_table_definition_id(
+		foreign_definition_table,
+		trait_id_definition_id(foreign_id),
+	)
+	compiler_equatable_id ?= builtin_trait_id("Equatable")
+	definition = trait_def_with_details(
+		trait_id_definition_id(local_id),
+		trait_id_name(local_definition_table, local_id),
+		[],
+		[],
+		[],
+		Some(owner_path),
+	)
+	item: AcceptedTraitTableRecord = {
+		id = local_id,
+		compiler_builtin_id = Some(compiler_equatable_id),
+		visibility = PublicDeclaration,
+		supertraits = [],
+		method_ids = [],
+		definition = definition
+	}
+	table ?= accepted_trait_implementation_table({
+		module_table = owner_table,
+		definition_table = local_definition_table,
+		traits = [item],
+		implementations = [],
+	})
+	authority = accepted_trait_implementation_authority(
+		table,
+		owner_path,
+		accepted_trait_empty_visibility(table),
+		[],
+	)
+	foreign_visibility = accepted_visible_trait_bindings(
+		table,
+		foreign_definition_table,
+		[GraphSelectiveDefinitionBinding("Equatable", foreign_owner_id, [foreign_definition_id])],
+	)
+	rejected_visibility_authority = accepted_trait_implementation_authority_from_visibility(
+		table,
+		owner_path,
+		foreign_visibility,
+		[],
+	)
+
+	Some(
+		(
+			not definition_tables_share_provenance(local_definition_table, foreign_definition_table)
+			and trait_id_definition_id(local_id) == trait_id_definition_id(foreign_id)
+			and foreign_visibility.is_none()
+			and accepted_trait_implementation_authority_preparation_errors(
+				rejected_visibility_authority,
+			) == ["accepted trait visibility rejected its graph definition table"]
+			and accepted_trait_matches_compiler_identity(
+				authority,
+				local_definition_table,
+				local_id,
+				compiler_equatable_id,
+			)
+			and not accepted_trait_matches_compiler_identity(
+				authority,
+				foreign_definition_table,
+				foreign_id,
+				compiler_equatable_id,
+			)
+			and accepted_resolve_trait_id_obligation(
+				authority,
+				local_definition_table,
+				base_state.env,
+				TYPE_INT,
+				local_id,
+			) == TraitObligationSatisfied
+			and accepted_resolve_trait_id_obligation(
+				authority,
+				foreign_definition_table,
+				base_state.env,
+				TYPE_INT,
+				foreign_id,
+			) == TraitObligationUnsatisfied
+		),
+	)
+
+
+func test_accepted_trait_policy_queries_reject_foreign_identity_provenance() -> Bool:
+	accepted_trait_policy_queries_reject_foreign_identity_provenance().get_or(False)
 
 
 private pure func accepted_trait_method_lookup_preserves_exact_identity() -> Option[Bool]:
@@ -2891,7 +3047,12 @@ private pure func accepted_trait_method_lookup_preserves_exact_identity() -> Opt
 		],
 		implementations = [],
 	})
-	authority = accepted_trait_implementation_authority(table, owner_path, [], [])
+	authority = accepted_trait_implementation_authority(
+		table,
+		owner_path,
+		accepted_trait_empty_visibility(table),
+		[],
+	)
 	resolved_method ?= accepted_trait_find_function_method(authority, method_name)
 	resolved_signature = accepted_trait_method_binding_signature(resolved_method)
 
@@ -7213,6 +7374,17 @@ private pure func accepted_callable_visibility_preserves_exact_targets() -> Opti
 		),
 		second_id,
 	)
+	overlapping_trait_method_selected = selected_callable_matches(
+		table,
+		definition_table,
+		GraphSelectiveTraitMethodBinding(
+			"selected",
+			owner_module_id,
+			"choose",
+			[first_definition_id, second_definition_id],
+		),
+		second_id,
+	)
 	reversed_selected = selected_callable_matches(
 		table,
 		definition_table,
@@ -7296,6 +7468,7 @@ private pure func accepted_callable_visibility_preserves_exact_targets() -> Opti
 			and second_selected.get_or(False)
 			and ordered_selected.get_or(False)
 			and reversed_selected.get_or(False)
+			and overlapping_trait_method_selected.get_or(False)
 			and wrong_module.is_none()
 			and uncataloged_name.is_none()
 			and foreign_table.is_none()
@@ -7850,6 +8023,10 @@ tests: TestSuite = {
 		(
 			"accepted trait table validation is owner safe",
 			test_accepted_trait_table_validation_is_owner_safe,
+		),
+		(
+			"accepted trait policy queries reject foreign identity provenance",
+			test_accepted_trait_policy_queries_reject_foreign_identity_provenance,
 		),
 		(
 			"accepted trait method lookup preserves exact identity",

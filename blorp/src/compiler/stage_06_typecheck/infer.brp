@@ -125,6 +125,7 @@ import:
 		CallableId,
 		ConstructorId,
 		TraitId,
+		builtin_trait_id,
 		callable_id_definition_id,
 		callable_id_from_definition_table,
 		callable_id_from_reserved_graph_definition,
@@ -133,7 +134,6 @@ import:
 		constructor_id_definition_id,
 		constructor_id_from_reserved_graph_definition,
 		global_id_definition_id,
-		trait_id_is_valid,
 		trait_id_name,
 		trait_ids_equal,
 		trait_method_id_owner,
@@ -213,7 +213,13 @@ import:
 		accepted_record_resource_scan_is_proven_unnecessary,
 	type_system/accepted_trait_implementation_authority:
 		AcceptedQualifiedTraitMethodInfo,
+		AcceptedTraitUfcsMethodLookup(
+			AcceptedTraitUfcsMethodAmbiguous,
+			AcceptedTraitUfcsMethodFound,
+			AcceptedTraitUfcsMethodNotFound,
+		),
 		accepted_find_impl_method_info,
+		accepted_find_impl_method_info_by_trait_id,
 		accepted_find_qualified_trait_method_info,
 		accepted_find_unsatisfied_bound_type_param,
 		accepted_qualified_trait_implementation_method,
@@ -222,10 +228,13 @@ import:
 		accepted_qualified_trait_method_identity,
 		accepted_qualified_trait_method_signature,
 		accepted_resolve_exact_trait_obligation,
+		accepted_resolve_trait_id_obligation,
 		accepted_resolve_trait_obligation,
 		accepted_trait_allows_compiler_fallback,
 		accepted_trait_find_function_method,
 		accepted_trait_find_method,
+		accepted_trait_find_ufcs_method,
+		accepted_trait_matches_compiler_identity,
 		accepted_trait_method_binding_declaring_trait_name,
 		accepted_trait_method_binding_id,
 		accepted_trait_method_binding_signature,
@@ -477,6 +486,7 @@ union ResolvedCallTarget:
 	ResolvedAcceptedTraitMethodCall(TraitId, CallableId)
 	ResolvedSelectedTraitMethodCall(String, CallableId)
 	ResolvedUnindexedSelectedTraitMethodCall(String, Int)
+	ResolvedAcceptedUnresolvedTraitMethodCall(TraitId)
 	ResolvedUnresolvedTraitMethodCall(String)
 	ResolvedIntrinsicCall
 	ResolvedClosureCall
@@ -1119,7 +1129,7 @@ private pure func infer_find_function_trait_method(
 ) -> Option[TraitMethodCallee]:
 	match module_view_accepted_trait_implementation_authority(context.state.facts.module_view):
 		Some(authority):
-			match accepted_trait_find_function_method(authority, method_name):
+			match accepted_trait_find_function_method(authority, source_name):
 				Some(found):
 					Some({
 						source_name = source_name,
@@ -1186,16 +1196,45 @@ private pure func infer_find_impl_method_info(
 			env_find_impl_method_info(session.env, trait_name, method_name, receiver_type)
 
 
-private pure func infer_has_compiler_structural_equality(
+private pure func infer_find_impl_method_info_for_callee(
 	session: InferSession,
-	obligation: TraitObligation,
+	callee: TraitMethodCallee,
+	receiver_type: SemanticType,
+) -> Option[ImplMethodInfo]:
+	match callee.identity:
+		AcceptedTraitMethodCalleeIdentity(trait_id):
+			match (
+				module_view_accepted_trait_implementation_authority(session.facts.module_view),
+				infer_module_facts_definition_table(session.facts),
+			):
+				(Some(authority), Some(issuing_table)):
+					accepted_find_impl_method_info_by_trait_id(
+						authority,
+						issuing_table,
+						session.env,
+						trait_id,
+						callee.method_name,
+						receiver_type,
+					)
+				_:
+					None
+		CompatibilityTraitMethodCalleeIdentity:
+			infer_find_impl_method_info(
+				session,
+				callee.trait_name,
+				callee.method_name,
+				receiver_type,
+			)
+
+
+private pure func infer_type_has_compiler_structural_equality(
+	session: InferSession,
+	typ: SemanticType,
 ) -> Bool:
-	if obligation.trait_name != "Equatable":
-		False
-	else if env_has_compiler_structural_equality(session.env, obligation.obligation_type):
+	if env_has_compiler_structural_equality(session.env, typ):
 		True
 	else:
-		match obligation.obligation_type:
+		match typ:
 			SemanticNamedType(name, _):
 				match module_view_accepted_union_authority(session.facts.module_view):
 					Some(authority):
@@ -1204,6 +1243,16 @@ private pure func infer_has_compiler_structural_equality(
 						False
 			_:
 				False
+
+
+private pure func infer_has_compiler_structural_equality(
+	session: InferSession,
+	obligation: TraitObligation,
+) -> Bool:
+	(
+		obligation.trait_name == "Equatable"
+		and infer_type_has_compiler_structural_equality(session, obligation.obligation_type)
+	)
 
 
 private pure func infer_resolve_trait_obligation(
@@ -1353,7 +1402,7 @@ pure func resolved_call_callable_id(info: ResolvedCallInfo) -> Option[Int]:
 			Some(callable_id_definition_id(callable_id))
 		ResolvedUnindexedSelectedTraitMethodCall(_, callable_id):
 			Some(callable_id)
-		ResolvedUnresolvedTraitMethodCall(_):
+		ResolvedAcceptedUnresolvedTraitMethodCall(_) | ResolvedUnresolvedTraitMethodCall(_):
 			None
 		ResolvedIntrinsicCall:
 			None
@@ -1392,18 +1441,6 @@ private pure func infer_facts_callable_owner_path(
 	table ?= infer_module_facts_definition_table(facts)
 	module_id ?= callable_id_module_id(table, callable_id)
 	module_table_canonical_path(definition_table_module_table(table), module_id)
-
-
-private pure func infer_facts_accepted_trait_method_name(
-	facts: InferModuleFacts,
-	trait_id: TraitId,
-) -> Option[String]:
-	table ?= infer_module_facts_definition_table(facts)
-
-	if trait_id_is_valid(table, trait_id):
-		Some(trait_id_name(table, trait_id))
-	else:
-		None
 
 
 private pure func graph_definition_invariant_error(
@@ -1485,7 +1522,11 @@ private pure func resolved_call_from_trait_method_callee(
 						impl_target.callable_id,
 					)
 		None:
-			ResolvedUnresolvedTraitMethodCall(callee.trait_name)
+			match callee.identity:
+				AcceptedTraitMethodCalleeIdentity(trait_id):
+					ResolvedAcceptedUnresolvedTraitMethodCall(trait_id)
+				CompatibilityTraitMethodCalleeIdentity:
+					ResolvedUnresolvedTraitMethodCall(callee.trait_name)
 
 	{
 		callee_name = callee.method_name,
@@ -1553,6 +1594,34 @@ private pure func trait_method_resource_args_for_type(
 		Some(method_info):
 			method_info.resource_args
 		None:
+			fallback
+
+
+private pure func accepted_trait_method_resource_args_for_type(
+	context: InferContext,
+	trait_id: TraitId,
+	method_name: String,
+	receiver_type: SemanticType,
+	fallback: ResourceArgPolicy,
+) -> ResourceArgPolicy:
+	match (
+		module_view_accepted_trait_implementation_authority(context.state.facts.module_view),
+		infer_module_facts_definition_table(context.state.facts),
+	):
+		(Some(authority), Some(issuing_table)):
+			match accepted_find_impl_method_info_by_trait_id(
+				authority,
+				issuing_table,
+				context.state.env,
+				trait_id,
+				method_name,
+				receiver_type,
+			):
+				Some(method_info):
+					method_info.resource_args
+				None:
+					fallback
+		_:
 			fallback
 
 
@@ -2118,6 +2187,12 @@ private pure func resolved_call_targets_equal(
 			match right:
 				ResolvedUnindexedSelectedTraitMethodCall(right_trait, right_id):
 					left_trait == right_trait and left_id == right_id
+				_:
+					False
+		ResolvedAcceptedUnresolvedTraitMethodCall(left_trait_id):
+			match right:
+				ResolvedAcceptedUnresolvedTraitMethodCall(right_trait_id):
+					trait_ids_equal(left_trait_id, right_trait_id)
 				_:
 					False
 		ResolvedUnresolvedTraitMethodCall(left_trait):
@@ -7000,11 +7075,17 @@ private pure func lookup_trait_method_callee(
 			local_trait_method_callee(context, name.text)
 
 
+private union ImportedReceiverTraitMethodLookup:
+	ImportedReceiverTraitMethodFound(TraitMethodCallee)
+	ImportedReceiverTraitMethodNotFound
+	ImportedReceiverTraitMethodAmbiguous
+
+
 private pure func imported_receiver_trait_method_callee(
 	context: InferContext,
 	name: ParsedIdentifier,
 	receiver_type: SemanticType,
-) -> Option[TraitMethodCallee]:
+) -> ImportedReceiverTraitMethodLookup:
 	type_is_imported = match receiver_type:
 		SemanticNamedType(type_name, _):
 			infer_facts_type_home_is_imported(context.state.facts, type_name)
@@ -7012,22 +7093,44 @@ private pure func imported_receiver_trait_method_callee(
 			False
 
 	if not type_is_imported:
-		None
+		ImportedReceiverTraitMethodNotFound
 	else:
-		match infer_find_function_trait_method(context, name.text, name.text):
-			Some(callee):
-				match infer_find_impl_method_info(
-					context.state,
-					callee.trait_name,
+		match module_view_accepted_trait_implementation_authority(context.state.facts.module_view):
+			Some(authority):
+				match accepted_trait_find_ufcs_method(
+					authority,
+					context.state.env,
 					name.text,
 					receiver_type,
 				):
-					Some(_):
-						Some(callee)
-					None:
-						None
+					AcceptedTraitUfcsMethodFound(found):
+						ImportedReceiverTraitMethodFound({
+							source_name = name.text,
+							method_name = name.text,
+							trait_name = accepted_trait_method_binding_declaring_trait_name(found),
+							method = accepted_trait_method_binding_signature(found),
+							identity = AcceptedTraitMethodCalleeIdentity(
+								trait_method_id_owner(accepted_trait_method_binding_id(found)),
+							),
+						})
+					AcceptedTraitUfcsMethodAmbiguous:
+						ImportedReceiverTraitMethodAmbiguous
+					AcceptedTraitUfcsMethodNotFound:
+						ImportedReceiverTraitMethodNotFound
 			None:
-				None
+				match infer_find_function_trait_method(context, name.text, name.text):
+					Some(callee):
+						match infer_find_impl_method_info_for_callee(
+							context.state,
+							callee,
+							receiver_type,
+						):
+							Some(_):
+								ImportedReceiverTraitMethodFound(callee)
+							None:
+								ImportedReceiverTraitMethodNotFound
+					None:
+						ImportedReceiverTraitMethodNotFound
 
 
 private union BareValueLookup:
@@ -8520,6 +8623,33 @@ private pure func trait_method_supports_elementwise_tensor_call(
 			False
 
 
+private pure func accepted_trait_method_supports_elementwise_tensor_call(
+	facts: InferModuleFacts,
+	trait_id: TraitId,
+	method_name: String,
+) -> Bool:
+	match (
+		module_view_accepted_trait_implementation_authority(facts.module_view),
+		infer_module_facts_definition_table(facts),
+	):
+		(Some(authority), Some(issuing_table)):
+			compiler_trait_id = match method_name:
+				"sqrt" | "exp" | "log":
+					builtin_trait_id("FloatingPoint")
+				"abs":
+					builtin_trait_id("Absolute")
+				_:
+					None
+
+			match compiler_trait_id:
+				Some(id):
+					accepted_trait_matches_compiler_identity(authority, issuing_table, trait_id, id)
+				None:
+					False
+		_:
+			False
+
+
 private pure func resolved_call_supports_elementwise_tensor_call(
 	facts: InferModuleFacts,
 	resolved_call: Option[ResolvedCallInfo],
@@ -8548,15 +8678,12 @@ private pure func resolved_call_supports_elementwise_tensor_call(
 					)
 				ResolvedSelectedTraitMethodCall(trait_name, _) | ResolvedUnindexedSelectedTraitMethodCall(trait_name, _) | ResolvedUnresolvedTraitMethodCall(trait_name):
 					trait_method_supports_elementwise_tensor_call(trait_name, call.callee_name)
-				ResolvedAcceptedTraitMethodCall(trait_id, _):
-					infer_facts_accepted_trait_method_name(facts, trait_id)
-						.map(func(trait_name):
-							trait_method_supports_elementwise_tensor_call(
-								trait_name,
-								call.callee_name,
-							)
-						)
-						.get_or(False)
+				ResolvedAcceptedTraitMethodCall(trait_id, _) | ResolvedAcceptedUnresolvedTraitMethodCall(trait_id):
+					accepted_trait_method_supports_elementwise_tensor_call(
+						facts,
+						trait_id,
+						call.callee_name,
+					)
 				_:
 					False
 		None:
@@ -9278,30 +9405,59 @@ private pure func check_trait_method_self_bound(
 	match resolved_call:
 		Some(call):
 			match call.target:
-				ResolvedAcceptedTraitMethodCall(trait_id, _):
-					trait_name = infer_facts_accepted_trait_method_name(
-						context.state.facts,
-						trait_id,
-					).get_or("<unknown trait>")
+				ResolvedAcceptedTraitMethodCall(trait_id, _) | ResolvedAcceptedUnresolvedTraitMethodCall(trait_id):
 					obligation_type = elementwise_tensor_element_type(
 						context.state.facts,
 						resolved_call,
 						self_type,
 					).get_or(self_type)
+					accepted_context = (
+						module_view_accepted_trait_implementation_authority(
+							context.state.facts.module_view,
+						),
+						infer_module_facts_definition_table(context.state.facts),
+					)
 
-					match infer_find_unsatisfied_trait_obligation(
-						context.state,
-						[trait_obligation(obligation_type, trait_name)],
-					):
-						Some(obligation):
-							call_trait_bound_error(
-								context,
-								call.callee_name,
-								self_type,
-								obligation.trait_name,
-							)
-						None:
-							context
+					resolution = match accepted_context:
+						(Some(accepted_authority), Some(issuing_table)):
+							is_structural_equality = match builtin_trait_id("Equatable"):
+								Some(compiler_trait_id):
+									(
+										accepted_trait_matches_compiler_identity(
+											accepted_authority,
+											issuing_table,
+											trait_id,
+											compiler_trait_id,
+										)
+										and infer_type_has_compiler_structural_equality(
+											context.state,
+											obligation_type,
+										)
+									)
+								None:
+									False
+
+							if is_structural_equality:
+								TraitObligationSatisfied
+							else:
+								accepted_resolve_trait_id_obligation(
+									accepted_authority,
+									issuing_table,
+									context.state.env,
+									obligation_type,
+									trait_id,
+								)
+						_:
+							TraitObligationUnsatisfied
+
+					if resolution == TraitObligationUnsatisfied:
+						trait_name = infer_module_facts_definition_table(context.state.facts)
+							.map(func(table): trait_id_name(table, trait_id))
+							.get_or("<unknown trait>")
+
+						call_trait_bound_error(context, call.callee_name, self_type, trait_name)
+					else:
+						context
 				ResolvedSelectedTraitMethodCall(trait_name, _) | ResolvedUnindexedSelectedTraitMethodCall(trait_name, _) | ResolvedUnresolvedTraitMethodCall(trait_name):
 					obligation_type = elementwise_tensor_element_type(
 						context.state.facts,
@@ -9350,7 +9506,7 @@ private pure func resolve_trait_self_call(
 	is_trait_method = match resolved_call:
 		Some(call):
 			match call.target:
-				ResolvedAcceptedTraitMethodCall(_, _) | ResolvedSelectedTraitMethodCall(_, _) | ResolvedUnindexedSelectedTraitMethodCall(_, _) | ResolvedUnresolvedTraitMethodCall(_):
+				ResolvedAcceptedTraitMethodCall(_, _) | ResolvedAcceptedUnresolvedTraitMethodCall(_) | ResolvedSelectedTraitMethodCall(_, _) | ResolvedUnindexedSelectedTraitMethodCall(_, _) | ResolvedUnresolvedTraitMethodCall(_):
 					True
 				_:
 					False
@@ -9378,14 +9534,10 @@ private pure func resolve_trait_self_call(
 				resource_args = match updated_resolved_call:
 					Some(call):
 						match call.target:
-							ResolvedAcceptedTraitMethodCall(trait_id, _):
-								trait_name = infer_facts_accepted_trait_method_name(
-									context.state.facts,
-									trait_id,
-								).get_or("<unknown trait>")
-								trait_method_resource_args_for_type(
+							ResolvedAcceptedTraitMethodCall(trait_id, _) | ResolvedAcceptedUnresolvedTraitMethodCall(trait_id):
+								accepted_trait_method_resource_args_for_type(
 									context,
-									trait_name,
+									trait_id,
 									call.callee_name,
 									self_type,
 									call.resource_args,
@@ -10499,12 +10651,12 @@ private pure func infer_trait_method_ufcs_call_expr(
 			else:
 				receiver_result = infer_expr(infer_without_expected(context), receiver)
 
-				method_callee: Option[TraitMethodCallee] = match lookup_trait_method_callee(
+				method_lookup: ImportedReceiverTraitMethodLookup = match lookup_trait_method_callee(
 					context,
 					method,
 				):
 					Some(callee):
-						Some(callee)
+						ImportedReceiverTraitMethodFound(callee)
 					None:
 						if receiver_result.context.state.errors.length() == context.state.errors.length():
 							imported_receiver_trait_method_callee(
@@ -10513,10 +10665,10 @@ private pure func infer_trait_method_ufcs_call_expr(
 								typed_expr_value_type(receiver_result.expr),
 							)
 						else:
-							None
+							ImportedReceiverTraitMethodNotFound
 
-				match method_callee:
-					Some(method_callee):
+				match method_lookup:
+					ImportedReceiverTraitMethodFound(method_callee):
 						func_type = SemanticFunctionType(
 							method_callee.method.is_pure,
 							method_callee.method.params,
@@ -10524,10 +10676,9 @@ private pure func infer_trait_method_ufcs_call_expr(
 						)
 						receiver_type = typed_expr_value_type(receiver_result.expr)
 
-						impl_method = infer_find_impl_method_info(
+						impl_method = infer_find_impl_method_info_for_callee(
 							context.state,
-							method_callee.trait_name,
-							method_callee.method_name,
+							method_callee,
 							receiver_type,
 						)
 
@@ -10578,7 +10729,22 @@ private pure func infer_trait_method_ufcs_call_expr(
 								span,
 							),
 						)
-					None:
+					ImportedReceiverTraitMethodAmbiguous:
+						next = infer_error(
+							receiver_result.context,
+							"Ambiguous trait method '" + method.text + "' for receiver type " + type_to_string(
+								typed_expr_value_type(
+									receiver_result.expr,
+								),
+							) + ". Import one trait method explicitly to select it.",
+						)
+						typed = TypedUnsupportedExpr(
+							"ambiguous trait method call",
+							span,
+							inferred_info(next, TYPE_VOID),
+						)
+						Some(infer_result(next, typed))
+					ImportedReceiverTraitMethodNotFound:
 						None
 		_:
 			None

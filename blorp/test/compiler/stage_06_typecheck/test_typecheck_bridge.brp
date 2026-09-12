@@ -40,6 +40,7 @@ import:
 		trait_ids_equal,
 	../../../src/compiler/stage_06_typecheck/infer:
 		ResolvedCallTarget(
+			ResolvedAcceptedUnresolvedTraitMethodCall,
 			ResolvedAcceptedTraitMethodCall,
 			ResolvedGraphCallableCall,
 			ResolvedSelectedTraitMethodCall,
@@ -3010,6 +3011,90 @@ pure func test_typecheck_source_uses_imported_trait_method_as_ufcs() -> Bool:
 			False
 
 
+pure func test_typecheck_source_uses_implicit_trait_method_for_imported_receiver() -> Bool:
+	source: String = "import:\n\tdep: Box, make_box\n\npure func read_box() -> Int:\n\tmake_box().read()"
+	dep_text: String = "record Box {value: Int}\n\ntrait Readable:\n\tpure func read(value: Self) -> Int\n\nimplements Readable for Box:\n\tpure func read(value: Box) -> Int:\n\t\tvalue.value\n\npure func make_box() -> Box:\n\t{value = 7}"
+
+	match response_value(
+		typecheck_source_request_with_imports(
+			source,
+			[import_module_json("dep", "dep", dep_text)],
+		),
+	):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+		None:
+			False
+
+
+private pure func rejects_ambiguous_implicit_trait_method(modules: List[JsonValue]) -> Bool:
+	source: String = "import:\n\tbox: Box, make_box\n\tfirst as First\n\tsecond as Second\n\npure func show_box() -> Int:\n\tmake_box().show()"
+
+	match response_value(typecheck_source_request_with_imports(source, modules)):
+		Some(response):
+			errors: List[JsonValue] = artifact_array_field(response, "type_errors")
+
+			(
+				bool_field(response, "ok")
+				and json_string_array_contains(
+					errors,
+					"Ambiguous trait method 'show' for receiver type",
+				)
+				and json_string_array_contains(
+					errors,
+					"Import one trait method explicitly to select it.",
+				)
+			)
+		None:
+			False
+
+
+pure func test_typecheck_source_rejects_ambiguous_implicit_trait_method_independent_of_order(
+
+) -> Bool:
+	box_module = import_module_json(
+		"box",
+		"box",
+		"record Box {value: Int}\n\npure func make_box() -> Box:\n\t{value = 7}",
+	)
+	first_module = import_module_json(
+		"first",
+		"first",
+		"import:\n\tbox: Box\n\ntrait FirstShow:\n\tpure func show(value: Self) -> Int\n\nimplements FirstShow for Box:\n\tpure func show(value: Box) -> Int:\n\t\t1",
+	)
+	second_module = import_module_json(
+		"second",
+		"second",
+		"import:\n\tbox: Box\n\ntrait SecondShow:\n\tpure func show(value: Self) -> Int\n\nimplements SecondShow for Box:\n\tpure func show(value: Box) -> Int:\n\t\t2",
+	)
+
+	(
+		rejects_ambiguous_implicit_trait_method([box_module, first_module, second_module])
+		and rejects_ambiguous_implicit_trait_method([box_module, second_module, first_module])
+	)
+
+
+pure func test_typecheck_source_rejects_private_implicit_trait_method() -> Bool:
+	source: String = "import:\n\tdep: Box, make_box\n\npure func reveal_box() -> Int:\n\tmake_box().reveal()"
+	dep_text: String = "record Box {value: Int}\n\nprivate trait Hidden:\n\tpure func reveal(value: Self) -> Int\n\nimplements Hidden for Box:\n\tpure func reveal(value: Box) -> Int:\n\t\tvalue.value\n\npure func make_box() -> Box:\n\t{value = 7}"
+
+	match response_value(
+		typecheck_source_request_with_imports(
+			source,
+			[import_module_json("dep", "dep", dep_text)],
+		),
+	):
+		Some(response):
+			errors: List[JsonValue] = artifact_array_field(response, "type_errors")
+
+			(
+				bool_field(response, "ok")
+				and json_string_array_contains(errors, "has no field 'reveal'")
+			)
+		None:
+			False
+
+
 pure func test_typecheck_source_uses_later_same_module_function_as_ufcs() -> Bool:
 	source: String = "import:\n\tdep: helper\n\npure func format(value: String) -> String:\n\tvalue.pad_right(4)\n\nprivate pure func pad_right(value: String, width: Int) -> String:\n\tvalue"
 	dep_text: String = "pure func helper() -> Int:\n\t1\n\npure func pad_right(value: String, width: Int, fill: Char) -> String:\n\tvalue"
@@ -3801,6 +3886,8 @@ private pure func typed_function_body_accepted_trait_id(
 							match typed_expr_resolved_call(body):
 								Some(call):
 									match call.target:
+										ResolvedAcceptedUnresolvedTraitMethodCall(trait_id):
+											result = Some(trait_id)
 										ResolvedAcceptedTraitMethodCall(trait_id, _):
 											result = Some(trait_id)
 										_:
@@ -3815,6 +3902,120 @@ private pure func typed_function_body_accepted_trait_id(
 				void
 
 	result
+
+
+pure func test_typed_graph_preserves_exact_unresolved_trait_method_identity() -> Bool:
+	graph = typecheck_graph({
+		target = {
+			path = "main.brp",
+			module_name = "main",
+			module_path = "main",
+			text = "import:\n\tdep: Stringable, to_string\n\npure func render[T: Stringable](value: T) -> String:\n\tvalue.to_string()",
+			typecheck_program = None,
+			module_surface = None,
+			origin = UserModule
+		},
+		modules = [
+			{
+				path = "dep.brp",
+				module_name = "dep",
+				module_path = "dep",
+				text = "trait Stringable:\n\tpure func to_string(value: Self) -> String",
+				typecheck_program = None,
+				module_surface = None,
+				origin = UserModule
+			},
+		],
+		module_targets = ["dep"],
+		resolved_imports = [
+			{
+				from_path = "main.brp",
+				from_module = "main",
+				import_path = "dep",
+				resolved_module = "dep"
+			},
+		],
+		include_comments = False,
+		allow_debug_only_calls = False,
+	})
+	dep_module_id = module_table_find_id_by_canonical_path(graph.module_table, "dep")
+	actual_trait_id = typed_function_body_accepted_trait_id(graph.target.typed_program, "render")
+	expected_trait_id = dep_module_id.and_then(func(module_id):
+		definition_table_find_trait_id(
+			graph.definition_table,
+			module_id,
+			"Stringable",
+			graph.next_def_id,
+		)
+	)
+
+	(
+		graph.target.errors.length() == 0
+		and graph.modules.all(func(module): module.errors.length() == 0)
+		and match (actual_trait_id, expected_trait_id):
+			(Some(actual), Some(expected)):
+				trait_ids_equal(actual, expected)
+			_:
+				False
+		and typed_function_body_call_id(graph.target.typed_program, "render").is_none()
+	)
+
+
+pure func test_typed_graph_preserves_exact_aliased_trait_method_identity() -> Bool:
+	graph = typecheck_graph({
+		target = {
+			path = "main.brp",
+			module_name = "main",
+			module_path = "main",
+			text = "import:\n\tdep: Stringable, to_string as stringify\n\npure func render[T: Stringable](value: T) -> String:\n\tstringify(value)",
+			typecheck_program = None,
+			module_surface = None,
+			origin = UserModule
+		},
+		modules = [
+			{
+				path = "dep.brp",
+				module_name = "dep",
+				module_path = "dep",
+				text = "trait Stringable:\n\tpure func to_string(value: Self) -> String",
+				typecheck_program = None,
+				module_surface = None,
+				origin = UserModule
+			},
+		],
+		module_targets = ["dep"],
+		resolved_imports = [
+			{
+				from_path = "main.brp",
+				from_module = "main",
+				import_path = "dep",
+				resolved_module = "dep"
+			},
+		],
+		include_comments = False,
+		allow_debug_only_calls = False,
+	})
+	dep_module_id = module_table_find_id_by_canonical_path(graph.module_table, "dep")
+	actual_trait_id = typed_function_body_accepted_trait_id(graph.target.typed_program, "render")
+	expected_trait_id = dep_module_id.and_then(func(module_id):
+		definition_table_find_trait_id(
+			graph.definition_table,
+			module_id,
+			"Stringable",
+			graph.next_def_id,
+		)
+	)
+
+	(
+		graph.target.errors.length() == 0
+		and graph.modules.all(func(module): module.errors.length() == 0)
+		and match (actual_trait_id, expected_trait_id):
+			(Some(actual), Some(expected)):
+				trait_ids_equal(actual, expected)
+			_:
+				False
+		and typed_function_body_call_id(graph.target.typed_program, "render").is_none()
+	)
 
 
 private pure func typed_function_body_trait_identity(
@@ -4887,6 +5088,14 @@ tests: TestSuite = {
 			test_typed_graph_ufcs_rejects_mismatched_local_generic_receiver,
 		),
 		(
+			"typed graph preserves exact unresolved trait method identity",
+			test_typed_graph_preserves_exact_unresolved_trait_method_identity,
+		),
+		(
+			"typed graph preserves exact aliased trait method identity",
+			test_typed_graph_preserves_exact_aliased_trait_method_identity,
+		),
+		(
 			"typed graph preserves exact qualified trait method identity",
 			test_typed_graph_preserves_exact_qualified_trait_method_identity,
 		),
@@ -5143,6 +5352,18 @@ tests: TestSuite = {
 		(
 			"typecheck_source uses imported trait method as UFCS",
 			test_typecheck_source_uses_imported_trait_method_as_ufcs,
+		),
+		(
+			"typecheck_source uses implicit trait method for imported receiver",
+			test_typecheck_source_uses_implicit_trait_method_for_imported_receiver,
+		),
+		(
+			"typecheck_source rejects ambiguous implicit trait method independent of order",
+			test_typecheck_source_rejects_ambiguous_implicit_trait_method_independent_of_order,
+		),
+		(
+			"typecheck_source rejects private implicit trait method",
+			test_typecheck_source_rejects_private_implicit_trait_method,
 		),
 		(
 			"typecheck_source uses later same-module function as UFCS",
