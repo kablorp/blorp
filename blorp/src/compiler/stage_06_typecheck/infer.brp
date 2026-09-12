@@ -124,6 +124,7 @@ import:
 	headers/declaration_skeleton:
 		CallableId,
 		ConstructorId,
+		TraitId,
 		callable_id_definition_id,
 		callable_id_from_definition_table,
 		callable_id_from_reserved_graph_definition,
@@ -132,6 +133,10 @@ import:
 		constructor_id_definition_id,
 		constructor_id_from_reserved_graph_definition,
 		global_id_definition_id,
+		trait_id_is_valid,
+		trait_id_name,
+		trait_ids_equal,
+		trait_method_id_owner,
 	int: add_saturating, multiply_saturating
 	modules/module_view:
 		ImportedNameBinding,
@@ -173,10 +178,20 @@ import:
 		accepted_alias_resolve,
 		accepted_alias_resolve_head,
 	type_system/accepted_callable_authority:
+		AcceptedCallableAuthority,
+		AcceptedCallableBinding,
+		AcceptedCallableUfcsOrigin(
+			DirectAcceptedCallableUfcsOrigin,
+			OwnerAcceptedCallableUfcsOrigin,
+			SelectiveAcceptedCallableUfcsOrigin,
+		),
 		accepted_callable_find,
 		accepted_callable_find_qualified,
 		accepted_callable_lookup_qualified_ufcs,
 		accepted_callable_lookup_ufcs,
+		accepted_callable_select_ufcs_method,
+		accepted_callable_ufcs_bindings_share_owner,
+		accepted_callable_ufcs_origin,
 	type_system/accepted_global_authority:
 		AcceptedGlobalBinding,
 		accepted_global_find,
@@ -201,11 +216,19 @@ import:
 		accepted_find_impl_method_info,
 		accepted_find_qualified_trait_method_info,
 		accepted_find_unsatisfied_bound_type_param,
+		accepted_qualified_trait_implementation_method,
+		accepted_qualified_trait_method_declaring_trait_name,
+		accepted_qualified_trait_method_id,
+		accepted_qualified_trait_method_identity,
+		accepted_qualified_trait_method_signature,
 		accepted_resolve_exact_trait_obligation,
 		accepted_resolve_trait_obligation,
 		accepted_trait_allows_compiler_fallback,
+		accepted_trait_find_function_method,
 		accepted_trait_find_method,
-		accepted_trait_function_trait,
+		accepted_trait_method_binding_declaring_trait_name,
+		accepted_trait_method_binding_id,
+		accepted_trait_method_binding_signature,
 		accepted_trait_module_path,
 	type_system/accepted_union_authority:
 		accepted_union_contains,
@@ -321,7 +344,6 @@ import:
 		env_resolve_alias_head,
 		env_resolve_trait_obligation,
 		env_scoped_resource_unavailable_owner,
-		env_select_overload_for_args,
 		env_select_ufcs_method,
 		env_symbols_named,
 		env_type_contains_resource_if_valid,
@@ -335,6 +357,9 @@ import:
 		loop_producer_is_enumerate2,
 		loop_producer_is_indices,
 		loop_producer_is_windows,
+		overload_entry_arg_types_match,
+		overload_entry_selection_score,
+		overload_entry_ufcs_selection_score,
 		purities_equal,
 		resolve_self,
 		resource_arg_policies_equal,
@@ -449,6 +474,7 @@ union ResolvedCallTarget:
 	ResolvedUnindexedCallableCall(Int, ResolvedGraphCallableCategory)
 	ResolvedUnindexedConstructorCall(Int, String)
 	ResolvedCompilerBuiltinCall(Int)
+	ResolvedAcceptedTraitMethodCall(TraitId, CallableId)
 	ResolvedSelectedTraitMethodCall(String, CallableId)
 	ResolvedUnindexedSelectedTraitMethodCall(String, Int)
 	ResolvedUnresolvedTraitMethodCall(String)
@@ -479,11 +505,17 @@ record ResolvedCallInfo {
 }
 
 
+private union TraitMethodCalleeIdentity:
+	AcceptedTraitMethodCalleeIdentity(TraitId)
+	CompatibilityTraitMethodCalleeIdentity
+
+
 private record TraitMethodCallee {
 	source_name: String,
 	method_name: String,
 	trait_name: String,
-	method: TraitMethodSig
+	method: TraitMethodSig,
+	identity: TraitMethodCalleeIdentity
 }
 
 
@@ -1080,19 +1112,47 @@ private pure func infer_find_trait_method(
 			env_find_trait_method(session.env, trait_name, method_name)
 
 
-private pure func infer_find_function_trait(
-	session: InferSession,
+private pure func infer_find_function_trait_method(
+	context: InferContext,
+	source_name: String,
 	method_name: String,
-) -> Option[String]:
-	match module_view_accepted_trait_implementation_authority(session.facts.module_view):
+) -> Option[TraitMethodCallee]:
+	match module_view_accepted_trait_implementation_authority(context.state.facts.module_view):
 		Some(authority):
-			match accepted_trait_function_trait(authority, method_name):
+			match accepted_trait_find_function_method(authority, method_name):
 				Some(found):
-					Some(found)
+					Some({
+						source_name = source_name,
+						method_name = method_name,
+						trait_name = accepted_trait_method_binding_declaring_trait_name(found),
+						method = accepted_trait_method_binding_signature(found),
+						identity = AcceptedTraitMethodCalleeIdentity(
+							trait_method_id_owner(accepted_trait_method_binding_id(found)),
+						),
+					})
 				None:
-					env_get_function_trait(session.env, method_name)
+					env_get_function_trait(
+						context.state.env,
+						method_name,
+					).and_then(
+						func(
+							trait_name,
+						): trait_method_callee_from_trait(
+							context,
+							source_name,
+							method_name,
+							trait_name,
+						),
+					)
 		None:
-			env_get_function_trait(session.env, method_name)
+			env_get_function_trait(
+				context.state.env,
+				method_name,
+			).and_then(
+				func(
+					trait_name,
+				): trait_method_callee_from_trait(context, source_name, method_name, trait_name),
+			)
 
 
 private pure func infer_find_impl_method_info(
@@ -1287,6 +1347,8 @@ pure func resolved_call_callable_id(info: ResolvedCallInfo) -> Option[Int]:
 			Some(callable_id)
 		ResolvedCompilerBuiltinCall(callable_id):
 			Some(callable_id)
+		ResolvedAcceptedTraitMethodCall(_, callable_id):
+			Some(callable_id_definition_id(callable_id))
 		ResolvedSelectedTraitMethodCall(_, callable_id):
 			Some(callable_id_definition_id(callable_id))
 		ResolvedUnindexedSelectedTraitMethodCall(_, callable_id):
@@ -1330,6 +1392,18 @@ private pure func infer_facts_callable_owner_path(
 	table ?= infer_module_facts_definition_table(facts)
 	module_id ?= callable_id_module_id(table, callable_id)
 	module_table_canonical_path(definition_table_module_table(table), module_id)
+
+
+private pure func infer_facts_accepted_trait_method_name(
+	facts: InferModuleFacts,
+	trait_id: TraitId,
+) -> Option[String]:
+	table ?= infer_module_facts_definition_table(facts)
+
+	if trait_id_is_valid(table, trait_id):
+		Some(trait_id_name(table, trait_id))
+	else:
+		None
 
 
 private pure func graph_definition_invariant_error(
@@ -1400,7 +1474,11 @@ private pure func resolved_call_from_trait_method_callee(
 		Some(impl_target):
 			match infer_facts_callable_id(facts, impl_target.callable_id):
 				Some(callable_id):
-					ResolvedSelectedTraitMethodCall(callee.trait_name, callable_id)
+					match callee.identity:
+						AcceptedTraitMethodCalleeIdentity(trait_id):
+							ResolvedAcceptedTraitMethodCall(trait_id, callable_id)
+						CompatibilityTraitMethodCalleeIdentity:
+							ResolvedSelectedTraitMethodCall(callee.trait_name, callable_id)
 				None:
 					ResolvedUnindexedSelectedTraitMethodCall(
 						callee.trait_name,
@@ -1540,6 +1618,7 @@ private pure func resolved_call_from_overload_entry_with_target(
 private pure func resolved_call_from_graph_overload_entry(
 	callee_name: String,
 	source_name: String,
+	id: CallableId,
 	entry: OverloadEntry,
 ) -> ResolvedCallInfo:
 	category = if entry.origin == ForeignFunc:
@@ -1551,10 +1630,7 @@ private pure func resolved_call_from_graph_overload_entry(
 		callee_name,
 		source_name,
 		entry,
-		ResolvedGraphCallableCall(
-			callable_id_from_reserved_graph_definition(entry.def_id),
-			category,
-		),
+		ResolvedGraphCallableCall(id, category),
 	)
 
 
@@ -2021,6 +2097,15 @@ private pure func resolved_call_targets_equal(
 			match right:
 				ResolvedCompilerBuiltinCall(right_id):
 					left_id == right_id
+				_:
+					False
+		ResolvedAcceptedTraitMethodCall(left_trait_id, left_callable_id):
+			match right:
+				ResolvedAcceptedTraitMethodCall(right_trait_id, right_callable_id):
+					(
+						trait_ids_equal(left_trait_id, right_trait_id)
+						and callable_ids_equal(left_callable_id, right_callable_id)
+					)
 				_:
 					False
 		ResolvedSelectedTraitMethodCall(left_trait, left_id):
@@ -6860,6 +6945,7 @@ private pure func trait_method_callee_from_trait(
 				method_name = method_name,
 				trait_name = declaring_trait,
 				method = method,
+				identity = CompatibilityTraitMethodCalleeIdentity,
 			})
 		None:
 			None
@@ -6870,28 +6956,31 @@ private pure func imported_trait_method_callee(
 	local_name: String,
 	binding: ImportedNameBinding,
 ) -> Option[TraitMethodCallee]:
-	match infer_find_function_trait(context.state, binding.original_name):
-		Some(trait_name):
-			trait_method_callee_from_trait(context, local_name, binding.original_name, trait_name)
-		None:
-			None
+	infer_find_function_trait_method(context, local_name, binding.original_name)
 
 
 private pure func local_trait_method_callee(
 	context: InferContext,
 	name: String,
 ) -> Option[TraitMethodCallee]:
-	match infer_find_function_trait(context.state, name):
-		Some(trait_name):
-			if infer_facts_allows_scoped_trait_function(context.state.facts, name, trait_name):
-				trait_method_callee_from_trait(context, name, name, trait_name)
-			else if builtin_trait_is_prelude(trait_name):
-				trait_method_callee_from_trait(context, name, name, trait_name)
+	match infer_find_function_trait_method(context, name, name):
+		Some(callee):
+			if infer_facts_allows_scoped_trait_function(
+				context.state.facts,
+				name,
+				callee.trait_name,
+			):
+				Some(callee)
+			else if builtin_trait_is_prelude(callee.trait_name):
+				Some(callee)
 			else:
-				match module_view_find_local_name(context.state.facts.module_view, trait_name):
+				match module_view_find_local_name(
+					context.state.facts.module_view,
+					callee.trait_name,
+				):
 					Some(kind):
 						if top_level_name_kind_is_trait(kind):
-							trait_method_callee_from_trait(context, name, name, trait_name)
+							Some(callee)
 						else:
 							None
 					None:
@@ -6925,16 +7014,16 @@ private pure func imported_receiver_trait_method_callee(
 	if not type_is_imported:
 		None
 	else:
-		match infer_find_function_trait(context.state, name.text):
-			Some(trait_name):
+		match infer_find_function_trait_method(context, name.text, name.text):
+			Some(callee):
 				match infer_find_impl_method_info(
 					context.state,
-					trait_name,
+					callee.trait_name,
 					name.text,
 					receiver_type,
 				):
 					Some(_):
-						trait_method_callee_from_trait(context, name.text, name.text, trait_name)
+						Some(callee)
 					None:
 						None
 			None:
@@ -6943,7 +7032,7 @@ private pure func imported_receiver_trait_method_callee(
 
 private union BareValueLookup:
 	BareEnvSymbol(Symbol)
-	BareAcceptedCallable(OverloadEntry)
+	BareAcceptedCallable(AcceptedCallableBinding)
 	BareAcceptedGlobal(AcceptedGlobalBinding)
 
 
@@ -6961,7 +7050,7 @@ private pure func infer_session_accepted_global(
 private pure func infer_session_accepted_callable(
 	session: InferSession,
 	name: String,
-) -> Option[OverloadEntry]:
+) -> Option[AcceptedCallableBinding]:
 	match module_view_accepted_callable_authority(session.facts.module_view):
 		Some(authority):
 			accepted_callable_find(authority, name)
@@ -7023,8 +7112,8 @@ private pure func lookup_bare_value(
 			Some(BareEnvSymbol(symbol))
 		None:
 			match infer_session_accepted_callable(context.state, name.text):
-				Some(entry):
-					Some(BareAcceptedCallable(entry))
+				Some(binding):
+					Some(BareAcceptedCallable(binding))
 				None:
 					match explicit_import:
 						Some(symbol):
@@ -7148,13 +7237,14 @@ private pure func builtin_ufcs_prefers_trait_dispatch(
 
 private pure func infer_name_expr(context: InferContext, name: ParsedIdentifier) -> InferResult:
 	match lookup_bare_value(context, name):
-		Some(BareAcceptedCallable(entry)):
-			source_name = source_name_for_imported_module_path(
-				context,
+		Some(BareAcceptedCallable(binding)):
+			entry = binding.entry
+			resolved_call = resolved_call_from_graph_overload_entry(
 				name.text,
-				entry.module_path,
+				binding.source_name,
+				binding.id,
+				entry,
 			)
-			resolved_call = resolved_call_from_graph_overload_entry(name.text, source_name, entry)
 			next_context = check_debug_only_reference(context, name.text, entry.debug_only)
 			expr = TypedNameExpr(
 				name,
@@ -8458,6 +8548,15 @@ private pure func resolved_call_supports_elementwise_tensor_call(
 					)
 				ResolvedSelectedTraitMethodCall(trait_name, _) | ResolvedUnindexedSelectedTraitMethodCall(trait_name, _) | ResolvedUnresolvedTraitMethodCall(trait_name):
 					trait_method_supports_elementwise_tensor_call(trait_name, call.callee_name)
+				ResolvedAcceptedTraitMethodCall(trait_id, _):
+					infer_facts_accepted_trait_method_name(facts, trait_id)
+						.map(func(trait_name):
+							trait_method_supports_elementwise_tensor_call(
+								trait_name,
+								call.callee_name,
+							)
+						)
+						.get_or(False)
 				_:
 					False
 		None:
@@ -8723,7 +8822,7 @@ private pure func find_accepted_qualified_callable(
 	context: InferContext,
 	module_path: String,
 	name: String,
-) -> Option[OverloadEntry]:
+) -> Option[AcceptedCallableBinding]:
 	match module_view_accepted_callable_authority(context.state.facts.module_view):
 		Some(authority):
 			accepted_callable_find_qualified(authority, module_path, name)
@@ -8749,10 +8848,12 @@ private pure func infer_qualified_module_callee(
 								module_path,
 								field.text,
 							):
-								Some(entry):
+								Some(binding):
+									entry = binding.entry
 									resolved_call = resolved_call_from_graph_overload_entry(
 										field.text,
-										field.text,
+										binding.source_name,
+										binding.id,
 										entry,
 									)
 									typed = typed_qualified_module_field_expr(
@@ -8801,10 +8902,12 @@ private pure func infer_qualified_module_field_expr(
 			match infer_module_facts_find_module_alias(context.state.facts, module_ident.text):
 				Some(module_path):
 					match find_accepted_qualified_callable(context, module_path, field.text):
-						Some(entry):
+						Some(binding):
+							entry = binding.entry
 							resolved_call = resolved_call_from_graph_overload_entry(
 								field.text,
-								field.text,
+								binding.source_name,
+								binding.id,
 								entry,
 							)
 							next_context = check_debug_only_reference(
@@ -9175,6 +9278,30 @@ private pure func check_trait_method_self_bound(
 	match resolved_call:
 		Some(call):
 			match call.target:
+				ResolvedAcceptedTraitMethodCall(trait_id, _):
+					trait_name = infer_facts_accepted_trait_method_name(
+						context.state.facts,
+						trait_id,
+					).get_or("<unknown trait>")
+					obligation_type = elementwise_tensor_element_type(
+						context.state.facts,
+						resolved_call,
+						self_type,
+					).get_or(self_type)
+
+					match infer_find_unsatisfied_trait_obligation(
+						context.state,
+						[trait_obligation(obligation_type, trait_name)],
+					):
+						Some(obligation):
+							call_trait_bound_error(
+								context,
+								call.callee_name,
+								self_type,
+								obligation.trait_name,
+							)
+						None:
+							context
 				ResolvedSelectedTraitMethodCall(trait_name, _) | ResolvedUnindexedSelectedTraitMethodCall(trait_name, _) | ResolvedUnresolvedTraitMethodCall(trait_name):
 					obligation_type = elementwise_tensor_element_type(
 						context.state.facts,
@@ -9223,7 +9350,7 @@ private pure func resolve_trait_self_call(
 	is_trait_method = match resolved_call:
 		Some(call):
 			match call.target:
-				ResolvedSelectedTraitMethodCall(_, _) | ResolvedUnindexedSelectedTraitMethodCall(_, _) | ResolvedUnresolvedTraitMethodCall(_):
+				ResolvedAcceptedTraitMethodCall(_, _) | ResolvedSelectedTraitMethodCall(_, _) | ResolvedUnindexedSelectedTraitMethodCall(_, _) | ResolvedUnresolvedTraitMethodCall(_):
 					True
 				_:
 					False
@@ -9251,6 +9378,18 @@ private pure func resolve_trait_self_call(
 				resource_args = match updated_resolved_call:
 					Some(call):
 						match call.target:
+							ResolvedAcceptedTraitMethodCall(trait_id, _):
+								trait_name = infer_facts_accepted_trait_method_name(
+									context.state.facts,
+									trait_id,
+								).get_or("<unknown trait>")
+								trait_method_resource_args_for_type(
+									context,
+									trait_name,
+									call.callee_name,
+									self_type,
+									call.resource_args,
+								)
 							ResolvedSelectedTraitMethodCall(trait_name, _) | ResolvedUnindexedSelectedTraitMethodCall(trait_name, _) | ResolvedUnresolvedTraitMethodCall(trait_name):
 								if call.trait_identity.is_some():
 									call.resource_args
@@ -10053,6 +10192,52 @@ private pure func infer_ufcs_call_with_receiver_result(
 		source_name,
 		entry,
 	)
+	infer_ufcs_call_with_resolved_call(
+		context,
+		receiver_result,
+		method,
+		entry,
+		resolved_call_info,
+		args,
+		span,
+	)
+
+
+private pure func infer_accepted_ufcs_call_with_receiver_result(
+	context: InferContext,
+	receiver_result: InferResult,
+	method: ParsedIdentifier,
+	binding: AcceptedCallableBinding,
+	args: List[ParsedExpr],
+	span: SourceSpan,
+) -> Option[InferResult]:
+	entry = binding.entry
+	resolved_call_info = resolved_call_from_graph_overload_entry(
+		method.text,
+		binding.source_name,
+		binding.id,
+		entry,
+	)
+	infer_ufcs_call_with_resolved_call(
+		context,
+		receiver_result,
+		method,
+		entry,
+		resolved_call_info,
+		args,
+		span,
+	)
+
+
+private pure func infer_ufcs_call_with_resolved_call(
+	context: InferContext,
+	receiver_result: InferResult,
+	method: ParsedIdentifier,
+	entry: OverloadEntry,
+	resolved_call_info: ResolvedCallInfo,
+	args: List[ParsedExpr],
+	span: SourceSpan,
+) -> Option[InferResult]:
 	resolved_call = Some(resolved_call_info)
 	resolved_context = receiver_result.context
 	callee_expr = TypedNameExpr(
@@ -10190,59 +10375,106 @@ private pure func infer_ufcs_call_with_receiver_result(
 			None
 
 
+private union VisibleUfcsMethod:
+	AcceptedVisibleUfcsMethod(AcceptedCallableBinding)
+	CompatibilityVisibleUfcsMethod(OverloadEntry)
+
+
 private pure func retry_ufcs_call_candidates(
 	context: InferContext,
 	receiver_result: InferResult,
 	method: ParsedIdentifier,
-	selected: OverloadEntry,
+	selected: VisibleUfcsMethod,
 	args: List[ParsedExpr],
 	span: SourceSpan,
 ) -> Option[InferResult]:
 	receiver_type = typed_expr_value_type(receiver_result.expr)
 
-	graph_candidates = match module_view_accepted_callable_authority(
-		context.state.facts.module_view,
-	):
-		Some(authority):
-			accepted_callable_lookup_ufcs(authority, method.text, receiver_type)
-		None:
-			empty: List[OverloadEntry] = []
-			empty
+	match selected:
+		AcceptedVisibleUfcsMethod(selected_binding):
+			match module_view_accepted_callable_authority(context.state.facts.module_view):
+				Some(authority):
+					candidates = accepted_callable_lookup_ufcs(
+						authority,
+						method.text,
+						receiver_type,
+					).filter(func(binding):
+						accepted_callable_ufcs_bindings_share_owner(
+							authority,
+							binding,
+							selected_binding,
+						)
+					)
+					var successful: List[AcceptedCallableBinding] = []
 
-	candidates = env_lookup_session_ufcs_functions(context.state.env, method.text, receiver_type)
-		.concat(graph_candidates)
-		.filter(func(entry): entry.module_path == selected.module_path)
-	var successful: List[OverloadEntry] = []
+					-- An unannotated lambda is purity-flexible: its body must be checked
+					-- with each callback signature before a pure/impure overload can fail.
+					for candidate in candidates:
+						match infer_accepted_ufcs_call_with_receiver_result(
+							context,
+							receiver_result,
+							method,
+							candidate,
+							args,
+							span,
+						):
+							Some(result):
+								if result.context.state.errors.length() == context.state.errors.length():
+									successful = successful.append(candidate)
+							None:
+								void
 
-	-- An unannotated lambda is purity-flexible: its body must be checked with
-	-- each callback signature before a pure/impure overload can be rejected.
-	for candidate in candidates:
-		match infer_ufcs_call_with_receiver_result(
-			context,
-			receiver_result,
-			method,
-			candidate,
-			args,
-			span,
-		):
-			Some(result):
-				if result.context.state.errors.length() == context.state.errors.length():
-					successful = successful.append(candidate)
-			None:
-				void
-
-	match env_select_ufcs_method(successful, receiver_type):
-		Some(candidate):
-			infer_ufcs_call_with_receiver_result(
-				context,
-				receiver_result,
-				method,
-				candidate,
-				args,
-				span,
+					match accepted_callable_select_ufcs_method(successful, receiver_type):
+						Some(candidate):
+							infer_accepted_ufcs_call_with_receiver_result(
+								context,
+								receiver_result,
+								method,
+								candidate,
+								args,
+								span,
+							)
+						None:
+							None
+				None:
+					None
+		CompatibilityVisibleUfcsMethod(selected_entry):
+			candidates = env_lookup_session_ufcs_functions(
+				context.state.env,
+				method.text,
+				receiver_type,
+			).filter(
+				func(entry): entry.module_path == selected_entry.module_path,
 			)
-		None:
-			None
+			var successful: List[OverloadEntry] = []
+
+			for candidate in candidates:
+				match infer_ufcs_call_with_receiver_result(
+					context,
+					receiver_result,
+					method,
+					candidate,
+					args,
+					span,
+				):
+					Some(result):
+						if result.context.state.errors.length() == context.state.errors.length():
+							successful = successful.append(candidate)
+					None:
+						void
+
+			match env_select_ufcs_method(successful, receiver_type):
+				Some(candidate):
+					infer_ufcs_call_with_receiver_result(
+						context,
+						receiver_result,
+						method,
+						candidate,
+						args,
+						span,
+					)
+				None:
+					None
 
 
 private pure func infer_trait_method_ufcs_call_expr(
@@ -10390,21 +10622,21 @@ private pure func infer_qualified_module_ufcs_call_expr(
 													receiver_type,
 												)
 											None:
-												empty: List[OverloadEntry] = []
+												empty: List[AcceptedCallableBinding] = []
 												empty
 
-										selected = env_select_ufcs_method(
+										selected = accepted_callable_select_ufcs_method(
 											graph_matches,
 											receiver_type,
 										)
 
 										match selected:
-											Some(entry):
-												infer_ufcs_call_with_receiver_result(
+											Some(binding):
+												infer_accepted_ufcs_call_with_receiver_result(
 													context,
 													receiver_result,
 													method,
-													entry,
+													binding,
 													parsed_args_after_first(args),
 													span,
 												)
@@ -10444,50 +10676,98 @@ private pure func qualified_module_owns_trait_dispatch(
 	trait_owned or type_owned
 
 
-private pure func infer_find_qualified_trait_method_info(
+private union QualifiedTraitMethodSelection:
+	AcceptedQualifiedTraitMethodSelection(AcceptedQualifiedTraitMethodInfo)
+	CompatibilityQualifiedTraitMethodSelection(TraitMethodCallee, ImplMethodInfo)
+
+
+private pure func infer_find_qualified_trait_method_selection(
 	context: InferContext,
 	module_path: String,
 	method_name: String,
 	receiver_type: SemanticType,
-) -> Option[AcceptedQualifiedTraitMethodInfo]:
+) -> Option[QualifiedTraitMethodSelection]:
 	match module_view_accepted_trait_implementation_authority(context.state.facts.module_view):
 		Some(authority):
-			accepted_find_qualified_trait_method_info(
+			match accepted_find_qualified_trait_method_info(
 				authority,
 				context.state.env,
 				module_path,
 				method_name,
 				receiver_type,
-			)
+			):
+				Some(info):
+					Some(AcceptedQualifiedTraitMethodSelection(info))
+				None:
+					None
 		None:
-			trait_name ?= infer_find_function_trait(context.state, method_name)
+			method_callee ?= infer_find_function_trait_method(context, method_name, method_name)
 
 			if not qualified_module_owns_trait_dispatch(
 				context,
 				module_path,
-				trait_name,
+				method_callee.trait_name,
 				receiver_type,
 			):
 				None
 			else:
-				method_callee ?= trait_method_callee_from_trait(
-					context,
-					method_name,
-					method_name,
-					trait_name,
-				)
 				method_info ?= infer_find_impl_method_info(
 					context.state,
-					trait_name,
+					method_callee.trait_name,
 					method_name,
 					receiver_type,
 				)
-				Some({
-					trait_name = method_callee.trait_name,
-					trait_identity = None,
-					method = method_callee.method,
-					implementation_method = method_info,
-				})
+				Some(CompatibilityQualifiedTraitMethodSelection(method_callee, method_info))
+
+
+private pure func infer_qualified_trait_method_call_with_selection(
+	context: InferContext,
+	module_ident: ParsedIdentifier,
+	method: ParsedIdentifier,
+	field_span: SourceSpan,
+	args: List[ParsedExpr],
+	span: SourceSpan,
+	method_callee: TraitMethodCallee,
+	method_info: ImplMethodInfo,
+	trait_identity: Option[BoundTraitIdentity],
+) -> InferResult:
+	resolved_call = { resolved_call_from_trait_method_callee(
+		context.state.facts,
+		method_callee,
+		Some(method_info),
+		trait_identity,
+	) |
+		resource_args = method_info.resource_args
+	}
+
+	resolved_context = if trait_impl_target_is_outside_definition_table(
+		context.state.facts,
+		Some(method_info),
+	):
+		graph_definition_invariant_error(
+			context,
+			"implementation method",
+			method_callee.method_name,
+			method_info.target
+				.map(func(target): target.callable_id)
+				.get_or(-1),
+		)
+	else:
+		context
+
+	callee_expr = typed_qualified_module_field_expr(
+		module_ident,
+		method,
+		field_span,
+		method_info.func_type,
+		Some(resolved_call),
+	)
+	infer_call_with_callee_result(
+		resolved_context,
+		infer_result(resolved_context, callee_expr),
+		args,
+		span,
+	)
 
 
 private pure func infer_qualified_module_trait_call_expr(
@@ -10515,57 +10795,60 @@ private pure func infer_qualified_module_trait_call_expr(
 							else:
 								receiver_type = typed_expr_value_type(receiver_result.expr)
 
-								match infer_find_qualified_trait_method_info(
+								match infer_find_qualified_trait_method_selection(
 									context,
 									module_path,
 									method.text,
 									receiver_type,
 								):
-									Some(qualified_method):
-										method_info = qualified_method.implementation_method
+									Some(AcceptedQualifiedTraitMethodSelection(qualified_method)):
+										qualified_method_info = accepted_qualified_trait_implementation_method(
+											qualified_method,
+										)
 										method_callee: TraitMethodCallee = {
 											source_name = method.text,
 											method_name = method.text,
-											trait_name = qualified_method.trait_name,
-											method = qualified_method.method
-										}
-										resolved_call = { resolved_call_from_trait_method_callee(
-											context.state.facts,
-											method_callee,
-											Some(method_info),
-											qualified_method.trait_identity,
-										) |
-											resource_args = method_info.resource_args
-										}
-
-										resolved_context = if trait_impl_target_is_outside_definition_table(
-											context.state.facts,
-											Some(method_info),
-										):
-											graph_definition_invariant_error(
-												context,
-												"implementation method",
-												method_callee.method_name,
-												method_info.target
-													.map(func(target): target.callable_id)
-													.get_or(-1),
+											trait_name = accepted_qualified_trait_method_declaring_trait_name(
+												qualified_method,
+											),
+											method = accepted_qualified_trait_method_signature(
+												qualified_method,
+											),
+											identity = AcceptedTraitMethodCalleeIdentity(
+												accepted_qualified_trait_method_id(
+													qualified_method,
+												),
 											)
-										else:
-											context
-
-										callee_expr = typed_qualified_module_field_expr(
-											module_ident,
-											method,
-											field_span,
-											method_info.func_type,
-											Some(resolved_call),
-										)
+										}
 										Some(
-											infer_call_with_callee_result(
-												resolved_context,
-												infer_result(resolved_context, callee_expr),
+											infer_qualified_trait_method_call_with_selection(
+												context,
+												module_ident,
+												method,
+												field_span,
 												args,
 												span,
+												method_callee,
+												qualified_method_info,
+												Some(
+													accepted_qualified_trait_method_identity(
+														qualified_method,
+													),
+												),
+											),
+										)
+									Some(CompatibilityQualifiedTraitMethodSelection(method_callee, method_info)):
+										Some(
+											infer_qualified_trait_method_call_with_selection(
+												context,
+												module_ident,
+												method,
+												field_span,
+												args,
+												span,
+												method_callee,
+												method_info,
+												None,
 											),
 										)
 									None:
@@ -10578,19 +10861,142 @@ private pure func infer_qualified_module_trait_call_expr(
 			None
 
 
-private pure func select_visible_ufcs_candidates(
-	matches: List[OverloadEntry],
-	receiver_type: SemanticType,
-	argument_types: Option[List[SemanticType]],
-) -> Option[OverloadEntry]:
-	match argument_types:
-		Some(types):
-			env_select_overload_for_args(
-				matches,
-				[receiver_type].concat(types),
+private enum VisibleUfcsOrigin:
+	OwnerVisibleUfcsOrigin
+	SelectiveVisibleUfcsOrigin
+	DirectVisibleUfcsOrigin
+	BuiltinVisibleUfcsOrigin
+	AnyVisibleUfcsOrigin
+
+
+private pure func accepted_ufcs_origin_matches(
+	origin: AcceptedCallableUfcsOrigin,
+	target: VisibleUfcsOrigin,
+) -> Bool:
+	match target:
+		OwnerVisibleUfcsOrigin:
+			origin == OwnerAcceptedCallableUfcsOrigin
+		SelectiveVisibleUfcsOrigin:
+			origin == SelectiveAcceptedCallableUfcsOrigin
+		DirectVisibleUfcsOrigin:
+			origin == DirectAcceptedCallableUfcsOrigin
+		BuiltinVisibleUfcsOrigin:
+			False
+		AnyVisibleUfcsOrigin:
+			True
+
+
+private pure func compatibility_ufcs_origin_matches(
+	context: InferContext,
+	name: String,
+	entry: OverloadEntry,
+	target: VisibleUfcsOrigin,
+) -> Bool:
+	is_selective = match entry.module_path:
+		Some(module_path):
+			module_view_has_selective_binding(
+				context.state.facts.module_view,
+				name,
+				module_path,
+				name,
 			)
 		None:
-			env_select_ufcs_method(matches, receiver_type)
+			False
+
+	match target:
+		OwnerVisibleUfcsOrigin:
+			entry.module_path.is_none() and entry.origin != BuiltinFunc
+		SelectiveVisibleUfcsOrigin:
+			is_selective
+		DirectVisibleUfcsOrigin:
+			entry.module_path.is_some() and entry.origin != BuiltinFunc and not is_selective
+		BuiltinVisibleUfcsOrigin:
+			entry.origin == BuiltinFunc
+		AnyVisibleUfcsOrigin:
+			True
+
+
+private pure func visible_ufcs_candidate_matches(
+	entry: OverloadEntry,
+	argument_types: Option[List[SemanticType]],
+) -> Bool:
+	match argument_types:
+		Some(types):
+			overload_entry_arg_types_match(entry, types)
+		None:
+			True
+
+
+private pure func visible_ufcs_candidate_score(
+	entry: OverloadEntry,
+	receiver_type: SemanticType,
+	argument_types: Option[List[SemanticType]],
+) -> Int:
+	match argument_types:
+		Some(types):
+			overload_entry_selection_score(entry, types)
+		None:
+			overload_entry_ufcs_selection_score(entry, receiver_type)
+
+
+private pure func select_visible_ufcs_candidates(
+	context: InferContext,
+	name: String,
+	authority: Option[AcceptedCallableAuthority],
+	graph_matches: List[AcceptedCallableBinding],
+	compatibility_matches: List[OverloadEntry],
+	target_origin: VisibleUfcsOrigin,
+	receiver_type: SemanticType,
+	all_argument_types: Option[List[SemanticType]],
+) -> Option[VisibleUfcsMethod]:
+	var selected: Option[VisibleUfcsMethod] = None
+	var best_score: Int = -1
+	var tied: Bool = False
+
+	match authority:
+		Some(accepted_authority):
+			for binding in graph_matches:
+				origin_matches = accepted_callable_ufcs_origin(accepted_authority, binding)
+					.map(func(origin): accepted_ufcs_origin_matches(origin, target_origin))
+					.get_or(False)
+
+				if (
+					origin_matches
+					and visible_ufcs_candidate_matches(binding.entry, all_argument_types)
+				):
+					score = visible_ufcs_candidate_score(
+						binding.entry,
+						receiver_type,
+						all_argument_types,
+					)
+
+					if score > best_score:
+						selected = Some(AcceptedVisibleUfcsMethod(binding))
+						best_score = score
+						tied = False
+					else if score == best_score:
+						tied = True
+		None:
+			void
+
+	for entry in compatibility_matches:
+		if (
+			compatibility_ufcs_origin_matches(context, name, entry, target_origin)
+			and visible_ufcs_candidate_matches(entry, all_argument_types)
+		):
+			score = visible_ufcs_candidate_score(entry, receiver_type, all_argument_types)
+
+			if score > best_score:
+				selected = Some(CompatibilityVisibleUfcsMethod(entry))
+				best_score = score
+				tied = False
+			else if score == best_score:
+				tied = True
+
+	if tied:
+		None
+	else:
+		selected
 
 
 private pure func resolve_visible_ufcs_method(
@@ -10598,64 +11004,83 @@ private pure func resolve_visible_ufcs_method(
 	name: String,
 	receiver_type: SemanticType,
 	argument_types: Option[List[SemanticType]],
-) -> Option[OverloadEntry]:
-	graph_matches = match module_view_accepted_callable_authority(context.state.facts.module_view):
+) -> Option[VisibleUfcsMethod]:
+	authority = module_view_accepted_callable_authority(context.state.facts.module_view)
+
+	graph_matches = match authority:
 		Some(authority):
 			accepted_callable_lookup_ufcs(authority, name, receiver_type)
 		None:
-			empty: List[OverloadEntry] = []
+			empty: List[AcceptedCallableBinding] = []
 			empty
 
-	matches = env_lookup_session_ufcs_functions(
+	compatibility_matches = env_lookup_session_ufcs_functions(
 		context.state.env,
 		name,
 		receiver_type,
-	).concat(graph_matches)
-	local_matches = matches.filter(func(entry):
-		entry.module_path.is_none() and entry.origin != BuiltinFunc
 	)
-	imported_matches = matches.filter(func(entry):
-		match entry.module_path:
-			Some(module_path):
-				module_view_has_selective_binding(
-					context.state.facts.module_view,
-					name,
-					module_path,
-					name,
-				)
-			None:
-				False
-	)
-	builtin_matches = matches.filter(func(entry): entry.origin == BuiltinFunc)
-	fallback_matches = matches.filter(func(entry):
-		(
-			entry.module_path.is_some()
-			and entry.origin != BuiltinFunc
-			and not imported_matches.any(func(imported): imported.def_id == entry.def_id)
-		)
-	)
-	local_match = select_visible_ufcs_candidates(local_matches, receiver_type, argument_types)
-	imported_match = select_visible_ufcs_candidates(imported_matches, receiver_type, argument_types)
-	builtin_match = select_visible_ufcs_candidates(builtin_matches, receiver_type, argument_types)
-	fallback_match = select_visible_ufcs_candidates(fallback_matches, receiver_type, argument_types)
+	all_argument_types = argument_types.map(func(types): [receiver_type].concat(types))
 
-	match local_match:
-		Some(entry):
-			Some(entry)
-		None:
-			match imported_match:
-				Some(entry):
-					Some(entry)
-				None:
-					match fallback_match:
-						Some(entry):
-							Some(entry)
-						None:
-							match builtin_match:
-								Some(entry):
-									Some(entry)
-								None:
-									env_select_ufcs_method(matches, receiver_type)
+	var selected = select_visible_ufcs_candidates(
+		context,
+		name,
+		authority,
+		graph_matches,
+		compatibility_matches,
+		OwnerVisibleUfcsOrigin,
+		receiver_type,
+		all_argument_types,
+	)
+
+	if selected.is_none():
+		selected = select_visible_ufcs_candidates(
+			context,
+			name,
+			authority,
+			graph_matches,
+			compatibility_matches,
+			SelectiveVisibleUfcsOrigin,
+			receiver_type,
+			all_argument_types,
+		)
+
+	if selected.is_none():
+		selected = select_visible_ufcs_candidates(
+			context,
+			name,
+			authority,
+			graph_matches,
+			compatibility_matches,
+			DirectVisibleUfcsOrigin,
+			receiver_type,
+			all_argument_types,
+		)
+
+	if selected.is_none():
+		selected = select_visible_ufcs_candidates(
+			context,
+			name,
+			authority,
+			graph_matches,
+			compatibility_matches,
+			BuiltinVisibleUfcsOrigin,
+			receiver_type,
+			all_argument_types,
+		)
+
+	if selected.is_none():
+		selected = select_visible_ufcs_candidates(
+			context,
+			name,
+			authority,
+			graph_matches,
+			compatibility_matches,
+			AnyVisibleUfcsOrigin,
+			receiver_type,
+			None,
+		)
+
+	selected
 
 
 private pure func type_is_callable(typ: SemanticType) -> Bool:
@@ -10703,6 +11128,50 @@ private pure func callable_field_info(
 						})
 		_:
 			None
+
+
+private pure func visible_ufcs_method_prefers_trait_dispatch(
+	method: ParsedIdentifier,
+	receiver_type: SemanticType,
+	selected: VisibleUfcsMethod,
+) -> Bool:
+	match selected:
+		CompatibilityVisibleUfcsMethod(entry):
+			(
+				entry.origin == BuiltinFunc
+				and builtin_ufcs_prefers_trait_dispatch(method.text, receiver_type)
+			)
+		AcceptedVisibleUfcsMethod(_):
+			False
+
+
+private pure func infer_visible_ufcs_method(
+	context: InferContext,
+	receiver_result: InferResult,
+	method: ParsedIdentifier,
+	selected: VisibleUfcsMethod,
+	args: List[ParsedExpr],
+	span: SourceSpan,
+) -> Option[InferResult]:
+	match selected:
+		AcceptedVisibleUfcsMethod(binding):
+			infer_accepted_ufcs_call_with_receiver_result(
+				context,
+				receiver_result,
+				method,
+				binding,
+				args,
+				span,
+			)
+		CompatibilityVisibleUfcsMethod(entry):
+			infer_ufcs_call_with_receiver_result(
+				context,
+				receiver_result,
+				method,
+				entry,
+				args,
+				span,
+			)
 
 
 private pure func infer_ufcs_call_expr(
@@ -10756,23 +11225,21 @@ private pure func infer_ufcs_call_expr(
 								receiver_type,
 								argument_types,
 							):
-								Some(entry):
-									if (
-										entry.origin == BuiltinFunc
-										and builtin_ufcs_prefers_trait_dispatch(
-											method.text,
-											receiver_type,
-										)
+								Some(selected):
+									if visible_ufcs_method_prefers_trait_dispatch(
+										method,
+										receiver_type,
+										selected,
 									):
 										-- Preserve the authoritative trait identity instead
 										-- of lowering the builtin fallback as a direct call.
 										None
 									else:
-										initial = infer_ufcs_call_with_receiver_result(
+										initial = infer_visible_ufcs_method(
 											context,
 											receiver_result,
 											method,
-											entry,
+											selected,
 											args,
 											span,
 										)
@@ -10786,7 +11253,7 @@ private pure func infer_ufcs_call_expr(
 														context,
 														receiver_result,
 														method,
-														entry,
+														selected,
 														args,
 														span,
 													):
@@ -10799,7 +11266,7 @@ private pure func infer_ufcs_call_expr(
 													context,
 													receiver_result,
 													method,
-													entry,
+													selected,
 													args,
 													span,
 												)

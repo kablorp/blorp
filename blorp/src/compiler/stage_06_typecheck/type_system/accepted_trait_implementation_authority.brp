@@ -142,7 +142,7 @@ private record AcceptedTraitImplementationAuthorityRep {
 	implementation_indices_by_trait_name: Dict[String, List[Int]],
 	compiler_implementations_by_trait_identity: Dict[Int, AcceptedCompilerImplementationBucket],
 	qualified_implementation_indices_by_module_and_method: Dict[String, Dict[String, List[Int]]],
-	trait_name_by_method_name: Dict[String, String],
+	trait_method_id_by_name: Dict[String, TraitMethodId],
 	preparation_errors: List[String]
 }
 
@@ -1121,7 +1121,7 @@ pure func accepted_trait_implementation_authority(
 	var qualified_implementation_indices_by_module_and_method: Dict[String, Dict[String, List[Int]]] = {
 
 	}
-	var trait_name_by_method_name: Dict[String, String] = {}
+	var trait_method_id_by_name: Dict[String, TraitMethodId] = {}
 	var preparation_errors: List[String] = []
 
 	for module_path in direct_module_paths:
@@ -1199,17 +1199,22 @@ pure func accepted_trait_implementation_authority(
 		match representation.traits.get(index):
 			Some(_):
 				for pair in table_trait_methods_seen(representation, [], index):
-					match trait_name_by_method_name.get(pair[0]):
-						Some(existing_trait):
-							if existing_trait != pair[1]:
+					match trait_method_id_by_name.get(pair[0]):
+						Some(existing_method_id):
+							if not trait_method_ids_equal(existing_method_id, pair[1]):
+								existing_trait = trait_id_name(
+									representation.definition_table,
+									trait_method_id_owner(existing_method_id),
+								)
+								incoming_trait = trait_id_name(
+									representation.definition_table,
+									trait_method_id_owner(pair[1]),
+								)
 								preparation_errors = preparation_errors.append(
-									"method '" + pair[0] + "' is already registered under trait '" + existing_trait + "'; cannot also register under '" + pair[1] + "'",
+									"method '" + pair[0] + "' is already registered under trait '" + existing_trait + "'; cannot also register under '" + incoming_trait + "'",
 								)
 						None:
-							trait_name_by_method_name = trait_name_by_method_name.set(
-								pair[0],
-								pair[1],
-							)
+							trait_method_id_by_name = trait_method_id_by_name.set(pair[0], pair[1])
 			None:
 				void
 
@@ -1384,7 +1389,7 @@ pure func accepted_trait_implementation_authority(
 			implementation_indices_by_trait_name = implementation_indices_by_trait_name,
 			compiler_implementations_by_trait_identity = compiler_implementations_by_trait_identity,
 			qualified_implementation_indices_by_module_and_method = qualified_implementation_indices_by_module_and_method,
-			trait_name_by_method_name = trait_name_by_method_name,
+			trait_method_id_by_name = trait_method_id_by_name,
 			preparation_errors = preparation_errors
 		})
 
@@ -1396,7 +1401,7 @@ pure func accepted_trait_implementation_authority_without_visible_names(
 	into_opaque AcceptedTraitImplementationAuthority({ representation |
 			visible_trait_indices = [],
 			visible_trait_indices_by_name = {},
-			trait_name_by_method_name = {},
+			trait_method_id_by_name = {},
 			preparation_errors = []
 		})
 
@@ -1509,12 +1514,44 @@ pure func accepted_trait_has_supertrait(
 				False
 
 
-record AcceptedQualifiedTraitMethodInfo {
+private record AcceptedQualifiedTraitMethodInfoRep {
+	trait_id: TraitId,
 	trait_name: String,
-	trait_identity: Option[BoundTraitIdentity],
+	trait_identity: BoundTraitIdentity,
 	method: TraitMethodSig,
 	implementation_method: ImplMethodInfo
 }
+
+
+opaque type AcceptedQualifiedTraitMethodInfo = AcceptedQualifiedTraitMethodInfoRep
+
+
+pure func accepted_qualified_trait_method_id(info: AcceptedQualifiedTraitMethodInfo) -> TraitId:
+	from_opaque AcceptedQualifiedTraitMethodInfo(info).trait_id
+
+
+pure func accepted_qualified_trait_method_declaring_trait_name(
+	info: AcceptedQualifiedTraitMethodInfo,
+) -> String:
+	from_opaque AcceptedQualifiedTraitMethodInfo(info).trait_name
+
+
+pure func accepted_qualified_trait_method_identity(
+	info: AcceptedQualifiedTraitMethodInfo,
+) -> BoundTraitIdentity:
+	from_opaque AcceptedQualifiedTraitMethodInfo(info).trait_identity
+
+
+pure func accepted_qualified_trait_method_signature(
+	info: AcceptedQualifiedTraitMethodInfo,
+) -> TraitMethodSig:
+	from_opaque AcceptedQualifiedTraitMethodInfo(info).method
+
+
+pure func accepted_qualified_trait_implementation_method(
+	info: AcceptedQualifiedTraitMethodInfo,
+) -> ImplMethodInfo:
+	from_opaque AcceptedQualifiedTraitMethodInfo(info).implementation_method
 
 
 private pure func bound_trait_identity_from_id(
@@ -1540,6 +1577,25 @@ private record AcceptedTraitMethodMatch {
 	signature: TraitMethodSig,
 	declaring_trait_name: String
 }
+
+
+opaque type AcceptedTraitMethodBinding = AcceptedTraitMethodMatch
+
+
+pure func accepted_trait_method_binding_id(binding: AcceptedTraitMethodBinding) -> TraitMethodId:
+	from_opaque AcceptedTraitMethodBinding(binding).id
+
+
+pure func accepted_trait_method_binding_signature(
+	binding: AcceptedTraitMethodBinding,
+) -> TraitMethodSig:
+	from_opaque AcceptedTraitMethodBinding(binding).signature
+
+
+pure func accepted_trait_method_binding_declaring_trait_name(
+	binding: AcceptedTraitMethodBinding,
+) -> String:
+	from_opaque AcceptedTraitMethodBinding(binding).declaring_trait_name
 
 
 private pure func table_find_trait_method_seen(
@@ -1623,10 +1679,17 @@ pure func accepted_trait_find_method(
 
 
 private pure func append_unique_method_pair(
-	values: List[(String, String)],
-	value: (String, String),
-) -> List[(String, String)]:
-	if values.contains(value):
+	values: List[(String, TraitMethodId)],
+	value: (String, TraitMethodId),
+) -> List[(String, TraitMethodId)]:
+	var present = False
+
+	for existing in values:
+		if existing[0] == value[0] and trait_method_ids_equal(existing[1], value[1]):
+			present = True
+			break
+
+	if present:
 		values
 	else:
 		values.append(value)
@@ -1636,7 +1699,7 @@ private pure func table_trait_methods_seen(
 	table: AcceptedTraitImplementationTableRep,
 	seen: List[Int],
 	trait_index: Int,
-) -> List[(String, String)]:
+) -> List[(String, TraitMethodId)]:
 	if seen.contains(trait_index):
 		[]
 	else:
@@ -1644,13 +1707,17 @@ private pure func table_trait_methods_seen(
 			None:
 				[]
 			Some(item):
-				var methods: List[(String, String)] = []
+				var methods: List[(String, TraitMethodId)] = []
 
-				for method in item.definition.methods:
-					methods = append_unique_method_pair(
-						methods,
-						(method.name, item.definition.name),
-					)
+				for indexed in item.definition.methods.enumerate():
+					match item.method_ids.get(indexed[0]):
+						Some(method_id):
+							methods = append_unique_method_pair(
+								methods,
+								(indexed[1].name, method_id),
+							)
+						None:
+							void
 
 				for supertrait in item.supertraits:
 					match table_find_trait_index(table, supertrait):
@@ -1675,22 +1742,54 @@ pure func accepted_trait_methods_with_declaring_trait(
 
 	match representation.visible_trait_indices_by_name.get(trait_name):
 		Some(index):
-			table_trait_methods_seen(table_rep(representation.table), [], index)
+			table = table_rep(representation.table)
+			table_trait_methods_seen(table, [], index).map(func(pair):
+				(pair[0], trait_id_name(table.definition_table, trait_method_id_owner(pair[1])))
+			)
 		None:
 			[]
 
 
-pure func accepted_trait_function_trait(
+private pure func table_find_trait_method_by_id(
+	authority: AcceptedTraitImplementationAuthorityRep,
+	id: TraitMethodId,
+) -> Option[AcceptedTraitMethodMatch]:
+	table = table_rep(authority.table)
+	trait_index ?= table_find_trait_index(table, trait_method_id_owner(id))
+	item ?= table.traits.get(trait_index)
+	method_index = trait_method_id_index(id)
+	method_id ?= item.method_ids.get(method_index)
+	method ?= item.definition.methods.get(method_index)
+
+	if not trait_method_ids_equal(method_id, id):
+		None
+	else:
+		owner_module_path = trait_owner_module_path(
+			table.definition_table,
+			table.module_table,
+			item,
+		).get_or(authority.owner_module_path)
+
+		signature = if owner_module_path == authority.owner_module_path:
+			localized_trait_method(owner_module_path, method)
+		else:
+			method
+
+		Some({
+			id = id,
+			signature = signature,
+			declaring_trait_name = item.definition.name,
+		})
+
+
+pure func accepted_trait_find_function_method(
 	authority: AcceptedTraitImplementationAuthority,
 	method_name: String,
-) -> Option[String]:
+) -> Option[AcceptedTraitMethodBinding]:
 	representation = authority_rep(authority)
-
-	match representation.trait_name_by_method_name.get(method_name):
-		Some(name):
-			Some(name)
-		None:
-			None
+	method_id ?= representation.trait_method_id_by_name.get(method_name)
+	found ?= table_find_trait_method_by_id(representation, method_id)
+	Some(into_opaque AcceptedTraitMethodBinding(found))
 
 
 private pure func localized_implementation_method(
@@ -2294,17 +2393,20 @@ pure func accepted_find_qualified_trait_method_info(
 											else:
 												indexed[1]
 
-											result = Some({
-												trait_name = requested.declaring_trait_name,
-												trait_identity = Some(
-													bound_trait_identity_from_id(
-														table.definition_table,
-														trait_method_id_owner(requested.id),
-													),
-												),
-												method = requested.signature,
-												implementation_method = implementation_method,
-											})
+											result = Some(
+												into_opaque AcceptedQualifiedTraitMethodInfo({
+														trait_id = trait_method_id_owner(
+															requested.id,
+														),
+														trait_name = requested.declaring_trait_name,
+														trait_identity = bound_trait_identity_from_id(
+															table.definition_table,
+															trait_method_id_owner(requested.id),
+														),
+														method = requested.signature,
+														implementation_method = implementation_method
+													}),
+											)
 											break
 							None:
 								void

@@ -64,7 +64,7 @@ import:
 		TypedUnionInfo,
 		TypedUnionVariantInfo,
 	../../../src/compiler/stage_06_typecheck/graph/definition_identity:
-		SourceDefinitionKind(ConstructorDefinition),
+		SourceDefinitionKind(ConstructorDefinition, TraitDefinition),
 		func_callable_key,
 		source_definition_key,
 	../../../src/compiler/stage_06_typecheck/graph/definition_index:
@@ -80,15 +80,18 @@ import:
 	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
 		CallableId,
 		ConstructorId,
+		TraitId,
 		callable_id_definition_id,
 		callable_id_from_definition_table,
 		callable_id_from_reserved_graph_definition,
 		constructor_id_definition_id,
 		constructor_id_from_definition_table,
+		trait_id_from_definition_table,
 	../../../src/compiler/stage_06_typecheck/infer:
 		ExprTypeOrigin(SynthesizedOrigin),
 		ResolvedCallInfo,
 		ResolvedCallTarget(
+			ResolvedAcceptedTraitMethodCall,
 			ResolvedClosureCall,
 			ResolvedCompilerBuiltinCall,
 			ResolvedConstructorCall,
@@ -384,6 +387,8 @@ private record CoreResolvedCallFixture {
 	math_external_add: CallableId,
 	display_show_int: CallableId,
 	display_display: CallableId,
+	display_trait: TraitId,
+	callable_only_definition_table: DefinitionTable,
 	foreign_puts: CallableId,
 	tree_leaf: ConstructorId,
 	option_some: ConstructorId
@@ -521,6 +526,21 @@ private pure func core_resolved_call_fixture() -> Option[CoreResolvedCallFixture
 	index = puts_result[0]
 	puts_raw = puts_result[1]
 	entries = entries.append((ffi_module, puts_raw, "puts", "puts"))
+	callable_only_definition_table = definition_index_definition_table(index)
+	display_trait_raw = definition_index_next_def_id(index)
+	with_display_trait ?= definition_index_insert_source_definition_id(
+		index,
+		table,
+		source_definition_key(
+			display_module,
+			TraitDefinition,
+			"Display",
+			None,
+			fixture_source_span(),
+		),
+		display_trait_raw,
+	).to_option()
+	index = with_display_trait
 	leaf_result ?= insert_core_test_constructor(index, table, test_module, "Tree", "Leaf")
 	index = leaf_result[0]
 	leaf_raw = leaf_result[1]
@@ -539,6 +559,7 @@ private pure func core_resolved_call_fixture() -> Option[CoreResolvedCallFixture
 	math_id ?= callable_id_from_definition_table(definitions, math_raw)
 	show_id ?= callable_id_from_definition_table(definitions, show_raw)
 	display_id ?= callable_id_from_definition_table(definitions, display_raw)
+	display_trait ?= trait_id_from_definition_table(definitions, display_trait_raw)
 	puts_id ?= callable_id_from_definition_table(definitions, puts_raw)
 	leaf_id ?= constructor_id_from_definition_table(definitions, leaf_raw)
 	some_id ?= constructor_id_from_definition_table(definitions, some_raw)
@@ -559,6 +580,8 @@ private pure func core_resolved_call_fixture() -> Option[CoreResolvedCallFixture
 		math_external_add = math_id,
 		display_show_int = show_id,
 		display_display = display_id,
+		display_trait = display_trait,
+		callable_only_definition_table = callable_only_definition_table,
 		foreign_puts = puts_id,
 		tree_leaf = leaf_id,
 		option_some = some_id,
@@ -1775,7 +1798,7 @@ private pure func lowers_selected_trait_method_call_with_dispatch_identity(
 	callee = TypedNameExpr(ident("display"), expr_info(function_type()))
 	resolved = resolved_call_info(
 		"display",
-		ResolvedSelectedTraitMethodCall("Display", fixture.display_display),
+		ResolvedAcceptedTraitMethodCall(fixture.display_trait, fixture.display_display),
 	)
 	expr = TypedCallExpr(
 		callee,
@@ -1802,6 +1825,42 @@ func test_lowers_selected_trait_method_call_with_dispatch_identity() -> Bool:
 	match core_resolved_call_fixture():
 		Some(fixture):
 			lowers_selected_trait_method_call_with_dispatch_identity(fixture)
+		None:
+			False
+
+
+private pure func rejects_accepted_trait_outside_core_table(
+	fixture: CoreResolvedCallFixture,
+) -> Bool:
+	context = core_lower_context_with_callable_names(
+		0,
+		None,
+		fixture.callable_only_definition_table,
+		fixture.current_module_id,
+		fixture.callable_names,
+	)
+	resolved = resolved_call_info(
+		"display",
+		ResolvedAcceptedTraitMethodCall(fixture.display_trait, fixture.display_display),
+	)
+	expr = TypedCallExpr(
+		TypedNameExpr(ident("display"), expr_info(function_type())),
+		[int_expr("5")],
+		fixture_source_span(),
+		expr_info_with_resolved(int_type(), resolved),
+	)
+
+	match lower_core_test_expr_with_context(context, expr):
+		Err(CoreLowerInvalidCall(message)):
+			message == "accepted trait method has a trait outside the canonical definition table"
+		_:
+			False
+
+
+func test_rejects_accepted_trait_outside_core_table() -> Bool:
+	match core_resolved_call_fixture():
+		Some(fixture):
+			rejects_accepted_trait_outside_core_table(fixture)
 		None:
 			False
 
@@ -6077,6 +6136,10 @@ tests: TestSuite = {
 		(
 			"lowers selected trait method call with dispatch identity",
 			test_lowers_selected_trait_method_call_with_dispatch_identity,
+		),
+		(
+			"rejects accepted trait outside Core definition table",
+			test_rejects_accepted_trait_outside_core_table,
 		),
 		(
 			"lowers resolved foreign direct call as unknown",

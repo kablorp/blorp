@@ -67,7 +67,10 @@ import:
 		TypedTypeAliasInfo,
 		TypedUnionInfo,
 		TypedUnionVariantInfo,
-	../../../src/compiler/stage_06_typecheck/graph/definition_identity: func_callable_key
+	../../../src/compiler/stage_06_typecheck/graph/definition_identity:
+		SourceDefinitionKind(TraitDefinition),
+		func_callable_key,
+		source_definition_key,
 	../../../src/compiler/stage_06_typecheck/graph/definition_index:
 		DefinitionTable,
 		MISSING_RESOLVED_FIELD_IDENTITY,
@@ -75,18 +78,22 @@ import:
 		definition_index_empty,
 		definition_index_initial_seed,
 		definition_index_insert_func_callable_id,
+		definition_index_insert_source_definition_id,
 		definition_index_next_def_id,
 		field_id_definition_id,
 		resolved_field_identity,
 	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
 		CallableId,
+		TraitId,
 		callable_id_definition_id,
 		callable_id_from_definition_table,
 		constructor_id_from_reserved_graph_definition,
+		trait_id_from_definition_table,
 	../../../src/compiler/stage_06_typecheck/infer:
 		ExprTypeOrigin(ExplicitAnnotationOrigin, SynthesizedOrigin),
 		ResolvedCallInfo,
 		ResolvedCallTarget(
+			ResolvedAcceptedTraitMethodCall,
 			ResolvedClosureCall,
 			ResolvedCompilerBuiltinCall,
 			ResolvedConstructorCall,
@@ -157,9 +164,6 @@ import:
 		value_slot_to_json,
 		widening_decision_to_json,
 		widening_reason_to_json,
-	../typecheck_test_support:
-		definition_backed_record_fixture,
-		definition_backed_record_fixture_field_id,
 	../../../src/lib/source:
 		Cursor,
 		SourceFile,
@@ -167,6 +171,9 @@ import:
 		source_cursor_at,
 		source_file,
 		source_span,
+	../typecheck_test_support:
+		definition_backed_record_fixture,
+		definition_backed_record_fixture_field_id,
 	json: JsonValue(JsonBool, JsonNull, JsonNumber, JsonObject, JsonString, JsonVector)
 	test: TestSuite
 
@@ -190,7 +197,9 @@ private record ResolvedCallJsonFixture {
 	current_module_id: ModuleId,
 	definition_table: DefinitionTable,
 	file_callable_id: CallableId,
-	dict_callable_id: CallableId
+	dict_callable_id: CallableId,
+	has_length_trait_id: TraitId,
+	callable_only_definition_table: DefinitionTable
 }
 
 
@@ -211,21 +220,38 @@ private pure func resolved_call_json_fixture() -> Option[ResolvedCallJsonFixture
 		file_definition_id,
 	).to_option()
 	dict_definition_id = definition_index_next_def_id(with_file)
-	complete ?= definition_index_insert_func_callable_id(
+	with_dict ?= definition_index_insert_func_callable_id(
 		with_file,
 		table,
 		func_callable_key(dict_module_id, "length", fixture_source_span()),
 		dict_definition_id,
 	).to_option()
+	callable_only_definition_table = definition_index_definition_table(with_dict)
+	trait_definition_id = definition_index_next_def_id(with_dict)
+	complete ?= definition_index_insert_source_definition_id(
+		with_dict,
+		table,
+		source_definition_key(
+			dict_module_id,
+			TraitDefinition,
+			"HasLength",
+			None,
+			fixture_source_span(),
+		),
+		trait_definition_id,
+	).to_option()
 	definitions = definition_index_definition_table(complete)
 	file_callable_id ?= callable_id_from_definition_table(definitions, file_definition_id)
 	dict_callable_id ?= callable_id_from_definition_table(definitions, dict_definition_id)
+	has_length_trait_id ?= trait_id_from_definition_table(definitions, trait_definition_id)
 	Some({
 		module_table = table,
 		current_module_id = current_module_id,
 		definition_table = definitions,
 		file_callable_id = file_callable_id,
 		dict_callable_id = dict_callable_id,
+		has_length_trait_id = has_length_trait_id,
+		callable_only_definition_table = callable_only_definition_table,
 	})
 
 
@@ -660,7 +686,10 @@ private pure func resolved_call_json_encodes_trait_impl_target(
 		callee_name = "length",
 		source_name = "length",
 		purity = Pure,
-		target = ResolvedSelectedTraitMethodCall("HasLength", fixture.dict_callable_id),
+		target = ResolvedAcceptedTraitMethodCall(
+			fixture.has_length_trait_id,
+			fixture.dict_callable_id,
+		),
 		trait_identity = None,
 		bound_type_params = [],
 		debug_only = False,
@@ -706,6 +735,36 @@ func test_resolved_call_json_encodes_trait_impl_target() -> Bool:
 	match resolved_call_json_fixture():
 		Some(fixture):
 			resolved_call_json_encodes_trait_impl_target(fixture)
+		None:
+			False
+
+
+private pure func rejects_accepted_trait_target_outside_definition_table(
+	fixture: ResolvedCallJsonFixture,
+) -> Bool:
+	info = { sample_resolved_call() |
+		target = ResolvedAcceptedTraitMethodCall(
+			fixture.has_length_trait_id,
+			fixture.dict_callable_id,
+		)
+	}
+
+	match resolved_call_to_json_in_graph(
+		fixture.current_module_id,
+		fixture.module_table,
+		fixture.callable_only_definition_table,
+		info,
+	):
+		Err(message):
+			message == "definition-backed resolved call is outside the typed-AST projection table"
+		Ok(_):
+			False
+
+
+func test_rejects_accepted_trait_target_outside_definition_table() -> Bool:
+	match resolved_call_json_fixture():
+		Some(fixture):
+			rejects_accepted_trait_target_outside_definition_table(fixture)
 		None:
 			False
 
@@ -854,16 +913,18 @@ func test_typed_expr_json_encodes_call_tree() -> Bool:
 
 
 private pure func typed_field_access_json_projects_definition_identity_result() -> Option[Bool]:
-	fixture ?= definition_backed_record_fixture([{
-		module_path = "typed_ast_json",
-		records = [{ name = "Box", field_names = ["value"] }]
-	}])
-	field_id ?= definition_backed_record_fixture_field_id(
-		fixture,
-		"typed_ast_json",
-		"Box",
-		"value",
-	)
+	fixture ?= definition_backed_record_fixture([
+		{
+			module_path = "typed_ast_json",
+			records = [
+				{
+					name = "Box",
+					field_names = ["value"]
+				},
+			]
+		},
+	])
+	field_id ?= definition_backed_record_fixture_field_id(fixture, "typed_ast_json", "Box", "value")
 	definition_id = field_id_definition_id(field_id)
 	span = fixture_source_span()
 	receiver = TypedNameExpr(ident("box"), sample_expr_info())
@@ -1332,6 +1393,10 @@ tests: TestSuite = {
 		(
 			"resolved call JSON encodes trait impl target",
 			test_resolved_call_json_encodes_trait_impl_target,
+		),
+		(
+			"resolved call JSON rejects accepted trait outside definition table",
+			test_rejects_accepted_trait_target_outside_definition_table,
 		),
 		(
 			"resolved call JSON encodes intrinsic target",

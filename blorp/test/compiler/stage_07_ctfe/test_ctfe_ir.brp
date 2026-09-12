@@ -15,7 +15,7 @@ import:
 		module_table_find_id_by_canonical_path,
 		singleton_module_table,
 	../../../src/compiler/stage_06_typecheck/graph/definition_identity:
-		SourceDefinitionKind(ConstructorDefinition),
+		SourceDefinitionKind(ConstructorDefinition, TraitDefinition),
 		func_callable_key,
 		source_definition_key,
 	../../../src/compiler/stage_06_typecheck/graph/definition_index:
@@ -31,14 +31,17 @@ import:
 	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
 		CallableId,
 		ConstructorId,
+		TraitId,
 		callable_id_definition_id,
 		callable_id_from_definition_table,
 		constructor_id_definition_id,
 		constructor_id_from_definition_table,
+		trait_id_from_definition_table,
 	../../../src/compiler/stage_06_typecheck/infer:
 		ExprTypeOrigin(SynthesizedOrigin),
 		ResolvedCallInfo,
 		ResolvedCallTarget(
+			ResolvedAcceptedTraitMethodCall,
 			ResolvedCompilerBuiltinCall,
 			ResolvedConstructorCall,
 			ResolvedGraphCallableCall,
@@ -172,6 +175,8 @@ private record CtfeIrFixture {
 	write_value: CallableId,
 	map: CallableId,
 	trait_length: CallableId,
+	length_trait: TraitId,
+	callable_only_definitions: DefinitionTable,
 	none_constructor: ConstructorId,
 	some_constructor: ConstructorId
 }
@@ -234,8 +239,16 @@ private pure func ctfe_ir_fixture() -> Option[CtfeIrFixture]:
 	map_id = map_result[1]
 	trait_result ?= insert_callable(with_map, table, list_module, "length")
 	with_trait = trait_result[0]
-	trait_id = trait_result[1]
-	none_result ?= insert_constructor(with_trait, table, target, "None")
+	trait_callable_id = trait_result[1]
+	callable_only_definitions = definition_index_definition_table(with_trait)
+	length_trait_definition_id = definition_index_next_def_id(with_trait)
+	with_length_trait ?= definition_index_insert_source_definition_id(
+		with_trait,
+		table,
+		source_definition_key(list_module, TraitDefinition, "Length", None, fixture_source_span()),
+		length_trait_definition_id,
+	).to_option()
+	none_result ?= insert_constructor(with_length_trait, table, target, "None")
 	with_none = none_result[0]
 	none_id = none_result[1]
 	some_result ?= insert_constructor(with_none, table, target, "Some")
@@ -245,7 +258,8 @@ private pure func ctfe_ir_fixture() -> Option[CtfeIrFixture]:
 	helper ?= callable_id_from_definition_table(definitions, helper_id)
 	write_value ?= callable_id_from_definition_table(definitions, write_id)
 	map ?= callable_id_from_definition_table(definitions, map_id)
-	trait_length ?= callable_id_from_definition_table(definitions, trait_id)
+	trait_length ?= callable_id_from_definition_table(definitions, trait_callable_id)
+	length_trait ?= trait_id_from_definition_table(definitions, length_trait_definition_id)
 	none_constructor ?= constructor_id_from_definition_table(definitions, none_id)
 	some_constructor ?= constructor_id_from_definition_table(definitions, some_id)
 	Some({
@@ -257,6 +271,8 @@ private pure func ctfe_ir_fixture() -> Option[CtfeIrFixture]:
 		write_value = write_value,
 		map = map,
 		trait_length = trait_length,
+		length_trait = length_trait,
+		callable_only_definitions = callable_only_definitions,
 		none_constructor = none_constructor,
 		some_constructor = some_constructor,
 	})
@@ -1367,7 +1383,9 @@ private pure func translates_call_kinds(fixture: CtfeIrFixture) -> Bool:
 								direct.callable_id == constructor_id
 								and direct.source_name == "Some"
 								and parent_type == "Option"
-								and ctfe_resolved_constructor_definition_id(resolved_id) == constructor_id
+								and ctfe_resolved_constructor_definition_id(
+									resolved_id,
+								) == constructor_id
 								and call.args.length() == 1
 							)
 						_:
@@ -1420,16 +1438,13 @@ private pure func rejects_definition_backed_call_outside_context_table(
 		fixture_source_span(),
 		expr_info_with_call(call),
 	)
-	context = ctfe_context_empty(
-		empty_definition_table(fixture.table),
-		fixture.target,
-	)
+	context = ctfe_context_empty(empty_definition_table(fixture.table), fixture.target)
 
 	match ctfe_ir_from_typed_expr(context, typed):
 		Err(error):
-			(
-				error.kind == CtfeIrInvalidGraphIdentity
-				and ctfe_ir_translate_error_message(error) == "internal compiler error: compile-time evaluation received a definition-backed call outside the canonical definition table"
+			error.kind == CtfeIrInvalidGraphIdentity and ctfe_ir_translate_error_message(error) == (
+				"internal compiler error: compile-time evaluation received a definition-backed "
+				+ "call outside the canonical definition table"
 			)
 		Ok(_):
 			False
@@ -1466,15 +1481,12 @@ private pure func graph_context_rejects_unindexed_call_target(
 
 
 private pure func rejects_unindexed_calls_in_graph_context(fixture: CtfeIrFixture) -> Bool:
-	(
-		graph_context_rejects_unindexed_call_target(
-			fixture,
-			ResolvedUnindexedCallableCall(999, ResolvedSourceFunctionCall),
-		)
-		and graph_context_rejects_unindexed_call_target(
-			fixture,
-			ResolvedUnindexedSelectedTraitMethodCall("Sized", 999),
-		)
+	graph_context_rejects_unindexed_call_target(
+		fixture,
+		ResolvedUnindexedCallableCall(999, ResolvedSourceFunctionCall),
+	) and graph_context_rejects_unindexed_call_target(
+		fixture,
+		ResolvedUnindexedSelectedTraitMethodCall("Sized", 999),
 	)
 
 
@@ -1545,15 +1557,13 @@ func test_keeps_unadmitted_builtin_call_unsupported() -> Bool:
 			False
 
 
-private pure func translates_resolved_trait_method_as_imported_call(
-	fixture: CtfeIrFixture,
-) -> Bool:
+private pure func translates_resolved_trait_method_as_imported_call(fixture: CtfeIrFixture) -> Bool:
 	callable_id = callable_id_definition_id(fixture.trait_length)
 	call: ResolvedCallInfo = {
 		callee_name = "length",
 		source_name = "length#${callable_id}",
 		purity = Pure,
-		target = ResolvedSelectedTraitMethodCall("Length", fixture.trait_length),
+		target = ResolvedAcceptedTraitMethodCall(fixture.length_trait, fixture.trait_length),
 		trait_identity = None,
 		bound_type_params = [],
 		debug_only = False,
@@ -1595,6 +1605,34 @@ func test_translates_resolved_trait_method_as_imported_call() -> Bool:
 			translates_resolved_trait_method_as_imported_call(fixture)
 		None:
 			False
+
+
+private pure func rejects_accepted_trait_outside_context_table(fixture: CtfeIrFixture) -> Bool:
+	call: ResolvedCallInfo = { resolved_call_template("length", Pure) |
+		target = ResolvedAcceptedTraitMethodCall(fixture.length_trait, fixture.trait_length)
+	}
+	typed = TypedCallExpr(
+		name_expr_with_call("length", call),
+		[int_expr("1")],
+		fixture_source_span(),
+		expr_info_with_call(call),
+	)
+	context = ctfe_context_empty(fixture.callable_only_definitions, fixture.target)
+
+	match ctfe_ir_from_typed_expr(context, typed):
+		Err(error):
+			error.kind == CtfeIrInvalidGraphIdentity
+		Ok(_):
+			False
+
+
+func test_rejects_accepted_trait_outside_context_table() -> Bool:
+	match ctfe_ir_fixture():
+		Some(fixture):
+			rejects_accepted_trait_outside_context_table(fixture)
+		None:
+			False
+
 
 func test_rejects_unsupported_forms_at_translation_boundary() -> Bool:
 	typed = TypedSubscriptExpr(
@@ -1696,6 +1734,10 @@ tests: TestSuite = {
 		(
 			"translates resolved trait method as imported call",
 			test_translates_resolved_trait_method_as_imported_call,
+		),
+		(
+			"rejects accepted trait outside context table",
+			test_rejects_accepted_trait_outside_context_table,
 		),
 		(
 			"rejects unsupported forms at translation boundary",

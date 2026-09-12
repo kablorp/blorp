@@ -1,8 +1,16 @@
 # Normalized Semantic Compilation Roadmap
 
-**Status:** Steps 1 and 2a-2d are complete; Step 2e is in progress. Its first
-two bounded packets normalized qualified-alias and local-declaration
-source-name identity without pre-paying for unmigrated visibility relations.
+**Status:** Steps 1 and 2a-2d are complete; Step 2e is in progress. Its first eighteen
+bounded packets normalized qualified-alias, local-declaration, selective-import,
+accepted-global visibility source-name identity, imported accepted-global target
+identity, accepted-global visibility inputs, and accepted-global per-module
+membership, then imported accepted-callable target and visibility-name identity
+without retaining parallel graph string indexes. The latest packets replace the
+last table-level callable string index with compact module ranges, construct
+authorities from prepared scopes, and preserve exact callable identity through
+direct, qualified, and unqualified accepted resolution and retry. They also
+preserve exact accepted trait-method identity through method lookup and
+concrete selected-call targets.
 
 **Scope:** One compiler invocation and one immutable analysis snapshot. This
 roadmap makes accepted and recoverable semantic facts directly queryable by the
@@ -833,12 +841,200 @@ source-string-to-ID projection, but reuses that ID for all subsequent local
 and alias probes. It retains no additional objects and grows allocated bytes
 only 0.28%.
 
-Selective `SourceNameId` relations, trait-method identity, CTFE's string-keyed
-global environment, qualified Core lookup, and complete visibility precedence
-remain for later Step 2e packets. Each packet must use the shared
-name/visibility table to delete one old string-keyed relation rather than add a
-parallel index beside it, and should carry IDs forward from admission where
-that avoids repeated source-string projection.
+The third Step 2e packet is
+[`74-normalize-selective-local-name-identities.md`](74-normalize-selective-local-name-identities.md):
+the graph source-name table now admits selective aliases, unaliased selections,
+explicit constructors, and combined module aliases. Selected trait methods use
+the same import admission; unselected method declarations remain excluded.
+Graph imported-name lookup replaces `Dict[String, ImportedNameBinding]` with
+`Dict[Int, ImportedNameBinding]`; all collision consumers use the normalized
+relation, uncataloged graph names fail closed, and standalone helpers keep a
+separately named string map. The old graph map is deleted. Retained objects
+are neutral, allocated bytes are effectively flat, and isolated peak memory
+improves 0.67%. Production instructions, RSS, footprint, and compiler size
+remain within 0.53%. One-shot cycles are recorded as noisy rather than
+averaged away.
+
+ID-aware source-name caller boundaries, trait-method target identity, CTFE's
+string-keyed global environment, qualified Core lookup, and complete
+visibility precedence remain for later Step 2e packets. Each packet must use
+the shared name/visibility table to delete one old string-keyed relation rather
+than add a parallel index beside it, and should carry IDs forward from
+admission where that avoids repeated source-string projection.
+
+The fourth Step 2e packet is
+[`75-normalize-accepted-global-visibility-names.md`](75-normalize-accepted-global-visibility-names.md):
+accepted-global unqualified lookup now retains `SourceNameId` keys and the
+graph's spelling projection rather than a second string-keyed semantic index.
+Missing local-global catalog membership fails closed. The isolated bound-phase
+screen is exactly neutral for allocations, releases, retained objects,
+allocated bytes, and compiler size; instructions move +0.25%, with all native
+and memory guards within 0.27%.
+
+The fifth Step 2e packet is
+[`76-normalize-accepted-global-selective-targets.md`](76-normalize-accepted-global-selective-targets.md):
+accepted-global construction now carries exact `GlobalId` targets from graph
+selective import admission. The former module-path plus original-name join is
+deleted, while table provenance and target ownership fail closed. Source-only
+standalone imports remain syntax-only. In the accepted-graph screen,
+allocations, releases, retained objects, and allocated bytes are exactly
+neutral; retired instructions move +0.09%, RSS improves 0.04%, peak footprint
+improves 0.20%, and compiler size grows 0.0008%. One-shot wall time and cycles
+were noisy and are not used as claims.
+
+The sixth Step 2e packet is
+[`77-normalize-accepted-global-visibility-inputs.md`](77-normalize-accepted-global-visibility-inputs.md):
+local and imported accepted-global visibility now cross the authority boundary
+as opaque `SourceNameId + GlobalId` rows inside a provenance-bound aggregate.
+Construction uses the prepared scope's exact `ModuleId`, does not reverse-resolve
+its canonical path, and no longer enumerates or probes string keys. Retired
+instructions improve 0.18%, allocated bytes improve 0.02%, retained objects and
+RSS are neutral, and allocation, peak, and compiler-size guards remain within
+0.05%.
+
+The seventh Step 2e packet is
+[`78-replace-accepted-global-string-index.md`](78-replace-accepted-global-string-index.md):
+the accepted-global table's retained `List[Dict[String, Int]]` is replaced by
+one exact `List[Dict[Int, Int]]` relation keyed by graph `SourceNameId`. The same
+relation serves duplicate validation, local visibility enumeration, and
+qualified compatibility lookup without a module-local scan. Allocation and
+release calls move within 0.11%, retained objects and allocated bytes are
+neutral, instructions and peak footprint improve slightly, and RSS/code size
+remain within 0.09%.
+
+The eighth Step 2e packet is
+[`79-normalize-accepted-callable-selective-targets.md`](79-normalize-accepted-callable-selective-targets.md):
+graph selective callable imports now carry their exact ordered `CallableId`
+targets into a provenance-bound accepted visibility product. The former target
+module-path and original-name reconstruction is deleted. Standalone source
+imports remain explicitly environment-backed. Retained objects and allocated
+bytes are neutral, allocation/release and instruction movements stay within
+0.03%, cycles improve 0.15%, and RSS, peak footprint, and compiler size stay
+within 0.35%. A broader generic integer-key map prototype was rejected after it
+added about 2.4% allocations/releases; a compact relation is prerequisite for
+that later migration.
+
+The ninth Step 2e packet is
+[`80-normalize-accepted-callable-visibility-names.md`](80-normalize-accepted-callable-visibility-names.md):
+accepted-callable visibility rows now retain `SourceNameId` beside exact ordered
+`CallableId` targets, with spelling projected only at the remaining
+string-keyed compatibility authority. Allocations, releases, retained objects,
+and allocated bytes are exactly neutral; instructions remain within 0.13%, RSS
+and peak footprint improve slightly, and compiler size is effectively neutral.
+Two broader list prototypes were rejected because they duplicated the existing
+dictionary after construction. The next relation must be a compact list/CSR
+layout built once at the accepted-callable producing boundary.
+
+The tenth Step 2e packet is
+[`81-replace-accepted-callable-string-index.md`](81-replace-accepted-callable-string-index.md):
+canonical accepted-callable slots now retain `SourceNameId` and are stable-
+grouped by source name inside each owning module. A dense list of module slot
+ranges replaces `List[Dict[String, List[Int]]]`; qualified lookup and authority
+construction lower-bound search the relevant canonical range and scan only a
+matching overload group. Retained objects, allocated bytes, cycles, RSS, and
+peak footprint improve; allocations and releases remain within 0.49%, compiler
+size is effectively neutral, and retired instructions stay within 0.96%. No
+generic integer dictionary or parallel edge list is introduced. Linear module
+scanning and a duplicate per-name range list were both rejected before the
+retained form.
+
+The eleventh Step 2e packet is
+[`82-retain-exact-accepted-callable-visibility-inputs.md`](82-retain-exact-accepted-callable-visibility-inputs.md):
+the remaining accepted-callable visible and UFCS string dictionaries are
+deleted rather than converted to generic integer maps. Authorities retain one
+owner `ModuleId`, exact selective `SourceNameId + CallableId` bindings, and
+ordered direct `ModuleId` values, then reuse canonical table ranges on demand.
+Allocations improve 4.80%, releases 3.35%, retained objects 7.91%, allocated
+bytes 7.25%, instructions 3.23%, cycles 0.90%, RSS 5.93%, and peak footprint
+7.19%; compiler size remains within 0.09%. Two sparse row-list prototypes were
+rejected after increasing retained objects about 7.9% and allocated bytes by
+8.1%-11.5%.
+
+The twelfth Step 2e packet is
+[`83-use-prepared-scopes-for-accepted-callable-authorities.md`](83-use-prepared-scopes-for-accepted-callable-authorities.md):
+accepted-callable authority construction now accepts graph-bound prepared
+scopes instead of owner and direct-module path strings. It validates the scope
+module-table domain before retaining only `ModuleId`; an incompatible
+cross-graph scope fails closed. Allocation, release, retained-object, and byte
+counters are exactly neutral, instructions improve 0.08%, RSS improves 0.13%,
+peak footprint improves 0.21%, and compiler size is effectively neutral.
+
+The thirteenth Step 2e packet is
+[`84-preserve-exact-direct-accepted-callable-resolution.md`](84-preserve-exact-direct-accepted-callable-resolution.md):
+direct accepted-callable lookup now returns a phase-specific binding containing
+the canonical `CallableId`, definition-row source spelling, and compatibility
+semantic payload. Bare and qualified accepted calls consume the exact ID rather
+than rebuilding it from `OverloadEntry.def_id`; bare aliases no longer compare
+module-path strings to recover the original source name. Allocations, releases,
+retained objects, and allocated bytes are exactly neutral. Retired instructions,
+RSS, peak footprint, and compiler size remain within 0.27%; one-shot cycles
+remain within 1.08%. Wall time is retained as a noisy observation rather than a
+performance claim. The final guard uses the checked-bodies stage that executes
+the changed lookup and inference path.
+
+The fourteenth Step 2e packet is
+[`85-preserve-exact-qualified-accepted-ufcs-resolution.md`](85-preserve-exact-qualified-accepted-ufcs-resolution.md):
+qualified accepted UFCS lookup and overload selection now retain
+`AcceptedCallableBinding`, so inference consumes the exact `CallableId` and
+canonical definition-row spelling instead of returning to the generic
+`OverloadEntry` path. Env and accepted selectors share one allocation-free
+receiver-specific score. A focused 64-call probe found one additional transient
+allocation/release per qualified call (+0.0033%) and zero retention; three
+broader scalar/slot/fused prototypes were rejected at three to six allocations
+per call. On the changed end-to-end bridge path, retired instructions remain
+within 0.10%, cycles and RSS improve, and peak footprint is effectively neutral.
+The build-level screen is allocation-neutral and remains within 0.40% for
+instructions, RSS, peak footprint, and compiler size.
+
+The fifteenth Step 2e packet is
+[`86-preserve-exact-unqualified-accepted-ufcs-resolution.md`](86-preserve-exact-unqualified-accepted-ufcs-resolution.md):
+unqualified accepted UFCS lookup, visibility precedence, initial inference, and
+purity-flexible retry now preserve `AcceptedCallableBinding` and exact
+`CallableId`. Owner, selective, and direct origins are derived from canonical
+`ModuleId`, `SourceNameId`, and selective target relations; graph candidates no
+longer use module-path strings or share the Env compatibility list. A retained
+64-iteration retry probe adds 0.0235% transient allocations/releases with zero
+retention. Changed-path instructions improve 0.005%, peak improves 0.12%, RSS
+improves 3.80%, cycles stay within 0.54%, the allocation-neutral build guard
+remains within 0.85%, and compiler size is effectively neutral.
+
+The sixteenth Step 2e packet is
+[`87-preserve-exact-accepted-trait-method-resolution.md`](87-preserve-exact-accepted-trait-method-resolution.md):
+accepted trait-method visibility now targets the topology-issued
+`TraitMethodId`, and inference follows that ID to the exact declaring trait and
+signature before projecting to the current typed-call compatibility boundary.
+The source spelling remains the visibility key because IDs do not exist at the
+earlier import-binding phase. A focused 32-call probe adds 0.0450% transient
+allocations/releases with zero retention growth. Changed-path instructions
+remain within 0.17%, cycles within 0.40%, and peak footprint within 0.26%. The
+build-level screen stays within 0.10% with neutral retained objects and bytes;
+compiler size remains within 0.09%.
+
+The seventeenth Step 2e packet is
+[`88-preserve-exact-selected-accepted-trait-call-targets.md`](88-preserve-exact-selected-accepted-trait-call-targets.md):
+graph-backed unqualified accepted trait calls now retain exact
+`TraitId + CallableId` targets instead of trait-name strings. CTFE consumes the
+callable ID directly; typed JSON and Core validate both IDs before table-backed
+projection. Inference retains three explicit ID-to-name semantic compatibility
+consumers for elementwise, self-bound, and resource policy. A full structured
+`TraitMethodId` target was rejected after adding
+two retained objects per call. The final focused probe adds 0.0090% transient
+allocations/releases with zero retention growth. The build-level guard is
+allocation-neutral and remains within 0.66% for instructions, cycles, RSS, and
+peak footprint; compiler size is effectively neutral.
+
+The eighteenth Step 2e packet is
+[`89-preserve-exact-qualified-accepted-trait-call-targets.md`](89-preserve-exact-qualified-accepted-trait-call-targets.md):
+qualified graph-backed accepted trait selection now publishes the same exact
+`TraitId + CallableId` target as unqualified selection. Accepted authority
+issues one opaque result with mandatory declaring-trait ID and bound identity,
+while a private inference union keeps Env compatibility explicit. An inherited
+method regression proves the declaring trait, matching bound identity, and child
+implementation callable independently. A direct candidate leak screen releases
+all 30,981 transient allocations with zero retained objects or bytes. The
+allocation-neutral checked-bodies comparison keeps instructions within 0.002%,
+improves RSS and peak footprint about 0.91%-1.01%, and leaves compiler size
+effectively neutral.
 
 ### Context
 

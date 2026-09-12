@@ -152,7 +152,9 @@ import:
 		prepared_module_scope_module,
 		prepared_module_scope_module_table,
 		prepared_module_scope_origin,
+		prepared_module_scope_source_name_table,
 		prepared_module_scopes_select_same_module,
+	graph/source_name_table: source_name_id_table_index, source_name_table_find_id
 	graph/typed_expr_children: typed_expr_children
 	headers/accepted_alias_graph:
 		AcceptedAliasGraph,
@@ -513,12 +515,12 @@ import:
 		AcceptedCallableAuthorityMetrics,
 		AcceptedCallableTable,
 		AcceptedCallableTableRecord,
-		AcceptedVisibleCallableBinding,
 		accepted_callable_authority,
 		accepted_callable_authority_metrics,
 		accepted_callable_find_exact,
 		accepted_callable_find_owner_definition_id,
 		accepted_callable_table,
+		accepted_visible_callable_bindings,
 	type_system/accepted_global_authority:
 		AcceptedGlobalAuthority,
 		AcceptedGlobalAuthorityMetrics,
@@ -526,7 +528,6 @@ import:
 		AcceptedGlobalTable,
 		AcceptedGlobalTableInput,
 		AcceptedGlobalTableRecord,
-		AcceptedVisibleGlobalBinding,
 		accepted_global_authority,
 		accepted_global_authority_for_initializer,
 		accepted_global_authority_metrics,
@@ -534,6 +535,7 @@ import:
 		accepted_global_find,
 		accepted_global_table,
 		accepted_global_table_complete,
+		accepted_global_visibility_bindings,
 	type_system/accepted_record_authority:
 		AcceptedRecordAuthority,
 		AcceptedRecordTable,
@@ -6605,6 +6607,9 @@ private pure func accepted_global_table_build(
 	else:
 		match accepted_global_table({
 			definition_table = definition_table,
+			source_name_table = prepared_module_scope_source_name_table(
+				bound_module_scope(bound_module_graph_target(bound_graph)),
+			),
 			globals = records,
 		}):
 			Some(table):
@@ -6617,22 +6622,40 @@ private pure func accepted_global_authority_for_module(
 	table: AcceptedGlobalTable,
 	bound_module: BoundModule,
 ) -> Result[AcceptedGlobalAuthority, String]:
-	owner_module_path = bound_module_canonical_path(bound_module)
 	view = bound_module_view(bound_module)
-	var bindings: List[AcceptedVisibleGlobalBinding] = []
+	owner_scope = bound_module_scope(bound_module)
+	definition_table = definition_index_definition_table(
+		prepared_module_scope_definition_index(owner_scope),
+	)
 
-	for imported in module_view_imported_names(view):
-		bindings = bindings.append({
-			source_name = imported.local_name,
-			owner_module_path = imported.module_path,
-			original_name = imported.original_name,
-		})
-
-	match accepted_global_authority(table, owner_module_path, bindings):
-		Some(authority):
-			Ok(authority)
-		None:
-			Err("accepted global module view rejected conflicting source bindings")
+	if module_view_has_standalone_import_bindings(view):
+		if module_view_has_graph_import_bindings(view):
+			Err("accepted global module view mixed graph and standalone import bindings")
+		else:
+			match accepted_global_visibility_bindings(table, owner_scope, definition_table, []):
+				Some(visibility):
+					match accepted_global_authority(visibility):
+						Some(authority):
+							Ok(authority)
+						None:
+							Err("accepted global module view rejected standalone owner scope")
+				None:
+					Err("accepted global module view rejected standalone visibility bindings")
+	else:
+		match accepted_global_visibility_bindings(
+			table,
+			owner_scope,
+			definition_table,
+			module_view_import_bindings(view),
+		):
+			Some(visibility):
+				match accepted_global_authority(visibility):
+					Some(authority):
+						Ok(authority)
+					None:
+						Err("accepted global module view rejected conflicting exact bindings")
+			None:
+				Err("accepted global module view rejected invalid graph import bindings")
 
 
 private pure func canonical_callable_entry(
@@ -6675,21 +6698,27 @@ private pure func prepare_accepted_module_callable(
 	header: CallableHeader,
 ) -> PreparedModuleCallableBase:
 	id = callable_header_id(header)
+	source_name = callable_header_name(header)
+	owner_scope = bound_module_scope(base.bound_module)
 	prepared = prepare_accepted_callable_header(
 		base.state,
 		type_headers,
-		bound_module_scope(base.bound_module),
+		owner_scope,
 		header,
 		LocalCallableHeaderRegistration(base.module_path),
 	)
+	source_name_id = source_name_table_find_id(
+		prepared_module_scope_source_name_table(owner_scope),
+		source_name,
+	)
 
-	match prepared.entry:
-		Some(entry):
+	match (prepared.entry, source_name_id):
+		(Some(entry), Some(name_id)):
 			{ base |
 				state = prepared.state,
 				callables = base.callables.append({
 					id = id,
-					source_name = callable_header_name(header),
+					source_name_id = name_id,
 					visibility = callable_header_visibility(header),
 					entry = canonical_callable_entry(
 						entry,
@@ -6698,7 +6727,14 @@ private pure func prepare_accepted_module_callable(
 					),
 				})
 			}
-		None:
+		(Some(_), None):
+			{ base |
+				state = typecheck_state_add_error(
+					prepared.state,
+					"internal typecheck error: accepted callable source name '" + source_name + "' is absent from the graph name table",
+				)
+			}
+		_:
 			{ base | state = prepared.state }
 
 
@@ -6707,29 +6743,43 @@ private pure func accepted_callable_authority_for_module(
 	bound_module: BoundModule,
 ) -> Result[AcceptedCallableAuthority, String]:
 	view = bound_module_view(bound_module)
-	var bindings: List[AcceptedVisibleCallableBinding] = []
-
-	for imported in module_view_imported_names(view):
-		bindings = bindings.append({
-			source_name = imported.local_name,
-			owner_module_path = imported.module_path,
-			original_name = imported.original_name,
-		})
-
-	direct_module_paths = bound_module_direct_import_modules(
+	owner_scope = bound_module_scope(bound_module)
+	definition_table = definition_index_definition_table(
+		prepared_module_scope_definition_index(owner_scope),
+	)
+	direct_module_scopes = bound_module_direct_import_modules(
 		bound_module,
-	).map(importable_module_path)
+	).map(importable_module_prepared_scope)
 
-	match accepted_callable_authority(
-		table,
-		Some(bound_module_canonical_path(bound_module)),
-		bindings,
-		direct_module_paths,
-	):
-		Some(authority):
-			Ok(authority)
-		None:
-			Err("accepted callable module view rejected conflicting source bindings")
+	if module_view_has_standalone_import_bindings(view):
+		if module_view_has_graph_import_bindings(view):
+			Err("accepted callable module view mixed graph and standalone import bindings")
+		else:
+			visibility ?= accepted_visible_callable_bindings(
+				table,
+				definition_table,
+				[],
+			).to_result("accepted callable module view rejected standalone owner scope")
+
+			accepted_callable_authority(
+				visibility,
+				Some(owner_scope),
+				direct_module_scopes,
+			).to_result("accepted callable module view rejected conflicting source bindings")
+	else:
+		visibility ?= accepted_visible_callable_bindings(
+			table,
+			definition_table,
+			module_view_import_bindings(
+				view,
+			),
+		).to_result("accepted callable module view rejected invalid exact import bindings")
+
+		accepted_callable_authority(
+			visibility,
+			Some(owner_scope),
+			direct_module_scopes,
+		).to_result("accepted callable module view rejected conflicting source bindings")
 
 
 private pure func accepted_trait_implementation_authority_for_module(
@@ -7116,7 +7166,11 @@ private pure func prepared_module_environments(
 					)
 				}
 				bases = bases.set(base_index, base)
-				callable_records = callable_records.concat(base.callables)
+				-- Stable name grouping lets the accepted table encode module
+				-- membership as searchable ranges without changing overload order.
+				callable_records = callable_records.concat(base.callables.sort_by(
+					func(item): source_name_id_table_index(item.source_name_id),
+				))
 			None:
 				callable_owner_missing = True
 
@@ -7126,10 +7180,7 @@ private pure func prepared_module_environments(
 		None
 	else:
 		accepted_callable_table({
-			module_table = indexed_graph_module_table(
-				bound_module_graph_indexed_graph(bound_graph),
-			),
-			definition_table = definition_table,
+			scope = bound_module_scope(bound_module_graph_target(bound_graph)),
 			callables = callable_records,
 		})
 

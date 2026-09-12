@@ -30,9 +30,20 @@ import:
 	../../../src/compiler/stage_06_typecheck/graph/definition_index:
 		DefinitionTable,
 		definition_table_module_table,
-	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton: callable_id_module_id
+	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
+		TraitId,
+		callable_id_module_id,
+		trait_id_definition_id,
+		trait_id_from_definition_table,
+		trait_id_module_id,
+		trait_id_name,
+		trait_ids_equal,
 	../../../src/compiler/stage_06_typecheck/infer:
-		ResolvedCallTarget(ResolvedGraphCallableCall, ResolvedSelectedTraitMethodCall),
+		ResolvedCallTarget(
+			ResolvedAcceptedTraitMethodCall,
+			ResolvedGraphCallableCall,
+			ResolvedSelectedTraitMethodCall,
+		),
 		TypedExpr(TypedBlockExpr, TypedCallExpr, TypedIntLiteralExpr),
 		resolved_call_callable_id,
 		typed_expr_resolved_call,
@@ -75,6 +86,9 @@ import:
 			TypedArtifactScopeComplete,
 		),
 		typecheck_trace_phase_name,
+	../../../src/compiler/stage_06_typecheck/type_system/generic_params:
+		BoundTraitIdentity,
+		BoundTraitOwner(GraphBoundTraitOwner),
 	../typecheck_test_support as TypecheckTestSupport
 	channel: Channel, channel, recv, seal, send
 	json:
@@ -3699,6 +3713,18 @@ private pure func typed_function_body_call_module(
 													func(path): (module_id, path),
 												)
 											)
+										ResolvedAcceptedTraitMethodCall(_, callable_id):
+											result = callable_id_module_id(
+												definition_table,
+												callable_id,
+											).and_then(func(module_id):
+												module_table_canonical_path(
+													definition_table_module_table(definition_table),
+													module_id,
+												).map(
+													func(path): (module_id, path),
+												)
+											)
 										_:
 											void
 								None:
@@ -3722,6 +3748,18 @@ private pure func typed_expr_callee_call_module_path(
 			match typed_expr_resolved_call(callee):
 				Some(call):
 					match call.target:
+						ResolvedAcceptedTraitMethodCall(_, callable_id):
+							callable_id_module_id(
+								definition_table,
+								callable_id,
+							).and_then(
+								func(
+									module_id,
+								): module_table_canonical_path(
+									definition_table_module_table(definition_table),
+									module_id,
+								),
+							)
 						ResolvedSelectedTraitMethodCall(_, callable_id):
 							callable_id_module_id(
 								definition_table,
@@ -3746,6 +3784,90 @@ private pure func typed_expr_callee_call_module_path(
 					None
 		_:
 			None
+
+
+private pure func typed_function_body_accepted_trait_id(
+	program: TypedProgram,
+	name: String,
+) -> Option[TraitId]:
+	var result: Option[TraitId] = None
+
+	for decl in program.decls:
+		match decl:
+			TypedFunctionDecl(info):
+				if info.decl.name.text == name:
+					match info.body:
+						Some(body):
+							match typed_expr_resolved_call(body):
+								Some(call):
+									match call.target:
+										ResolvedAcceptedTraitMethodCall(trait_id, _):
+											result = Some(trait_id)
+										_:
+											void
+								None:
+									void
+						None:
+							void
+
+					break
+			_:
+				void
+
+	result
+
+
+private pure func typed_function_body_trait_identity(
+	program: TypedProgram,
+	name: String,
+) -> Option[BoundTraitIdentity]:
+	var result: Option[BoundTraitIdentity] = None
+
+	for decl in program.decls:
+		match decl:
+			TypedFunctionDecl(info):
+				if info.decl.name.text == name:
+					match info.body:
+						Some(body):
+							result = typed_expr_resolved_call(
+								body,
+							).and_then(
+								func(call): call.trait_identity,
+							)
+						None:
+							void
+
+					break
+			_:
+				void
+
+	result
+
+
+private pure func definition_table_find_trait_id(
+	definition_table: DefinitionTable,
+	module_id: ModuleId,
+	name: String,
+	next_definition_id: Int,
+) -> Option[TraitId]:
+	var result: Option[TraitId] = None
+	var definition_id: Int = 0
+
+	while definition_id < next_definition_id:
+		match trait_id_from_definition_table(definition_table, definition_id):
+			Some(trait_id):
+				if (
+					trait_id_module_id(definition_table, trait_id) == Some(module_id)
+					and trait_id_name(definition_table, trait_id) == name
+				):
+					result = Some(trait_id)
+					break
+			None:
+				void
+
+		definition_id += 1
+
+	result
 
 
 private pure func typed_function_body_callee_call_module_path(
@@ -4161,6 +4283,15 @@ pure func test_typed_graph_ufcs_rejects_mismatched_local_generic_receiver() -> B
 		"measure",
 	)
 	dep_module_id = module_table_find_id_by_canonical_path(graph.module_table, "dep")
+	accepted_trait_id = typed_function_body_accepted_trait_id(graph.target.typed_program, "measure")
+	expected_trait_id = dep_module_id.and_then(func(module_id):
+		definition_table_find_trait_id(
+			graph.definition_table,
+			module_id,
+			"HasLength",
+			graph.next_def_id,
+		)
+	)
 
 	call_module_matches = match (body_call_module, dep_module_id):
 		(Some((call_module_id, "dep")), Some(expected_module_id)):
@@ -4182,6 +4313,11 @@ pure func test_typed_graph_ufcs_rejects_mismatched_local_generic_receiver() -> B
 			(
 				graph.target.errors.length() == 0
 				and call_module_matches
+				and match (accepted_trait_id, expected_trait_id):
+					(Some(actual), Some(expected)):
+						trait_ids_equal(actual, expected)
+					_:
+						False
 				and measure_call_id != local_length_id
 				and typed_impl_method_callable_id(
 					dep_program,
@@ -4191,6 +4327,94 @@ pure func test_typed_graph_ufcs_rejects_mismatched_local_generic_receiver() -> B
 			)
 		_:
 			False
+
+
+pure func test_typed_graph_preserves_exact_qualified_trait_method_identity() -> Bool:
+	graph = typecheck_graph({
+		target = {
+			path = "main.brp",
+			module_name = "main",
+			module_path = "main",
+			text = "import:\n\tdep as D\n\npure func render(data: D.Data) -> String:\n\tD.show(data)",
+			typecheck_program = None,
+			module_surface = None,
+			origin = UserModule
+		},
+		modules = [
+			{
+				path = "contracts.brp",
+				module_name = "contracts",
+				module_path = "contracts",
+				text = "trait Renderable:\n\tpure func show(value: Self) -> String\n\ntrait Show: Renderable:\n\tpure func detail(value: Self) -> String",
+				typecheck_program = None,
+				module_surface = None,
+				origin = UserModule
+			},
+			{
+				path = "dep.brp",
+				module_name = "dep",
+				module_path = "dep",
+				text = "import:\n\tcontracts: Renderable, Show\n\nrecord Data {value: Int}\n\nimplements Show for Data:\n\tpure func show(value: Data) -> String:\n\t\t\"data\"\n\tpure func detail(value: Data) -> String:\n\t\t\"detail\"\n\nimplements Renderable for Data:\n\tpure func show(value: Data) -> String:\n\t\t\"base\"",
+				typecheck_program = None,
+				module_surface = None,
+				origin = UserModule
+			},
+		],
+		module_targets = ["contracts", "dep"],
+		resolved_imports = [
+			{
+				from_path = "main.brp",
+				from_module = "main",
+				import_path = "dep",
+				resolved_module = "dep"
+			},
+			{
+				from_path = "dep.brp",
+				from_module = "dep",
+				import_path = "contracts",
+				resolved_module = "contracts"
+			},
+		],
+		include_comments = False,
+		allow_debug_only_calls = False,
+	})
+	trait_module_id = module_table_find_id_by_canonical_path(graph.module_table, "contracts")
+	actual_trait_id = typed_function_body_accepted_trait_id(graph.target.typed_program, "render")
+	actual_trait_identity = typed_function_body_trait_identity(graph.target.typed_program, "render")
+	expected_trait_id = trait_module_id.and_then(func(module_id):
+		definition_table_find_trait_id(
+			graph.definition_table,
+			module_id,
+			"Renderable",
+			graph.next_def_id,
+		)
+	)
+	actual_callable_id = typed_function_body_call_id(graph.target.typed_program, "render")
+	dep_program = typed_module_program(graph.module_table, graph.modules, "dep")
+
+	(
+		graph.target.errors.length() == 0
+		and graph.modules.all(func(module): module.errors.length() == 0)
+		and match (actual_trait_id, expected_trait_id):
+			(Some(actual), Some(expected)):
+				trait_ids_equal(actual, expected)
+			_:
+				False
+		and match (actual_trait_identity, expected_trait_id, trait_module_id):
+			(Some(identity), Some(expected), Some(expected_module_id)):
+				identity.definition_id == trait_id_definition_id(expected) and match identity.owner:
+					GraphBoundTraitOwner(actual_module_id):
+						module_ids_equal(actual_module_id, expected_module_id)
+					_:
+						False
+			_:
+				False
+		and match (actual_callable_id, dep_program):
+			(Some(actual), Some(program)):
+				typed_impl_method_callable_id(program, "Show", "show") == Some(actual)
+			_:
+				False
+	)
 
 
 pure func test_typed_graph_imported_ufcs_precedes_builtin_fallback() -> Bool:
@@ -4661,6 +4885,10 @@ tests: TestSuite = {
 		(
 			"typed graph UFCS rejects mismatched local generic receiver",
 			test_typed_graph_ufcs_rejects_mismatched_local_generic_receiver,
+		),
+		(
+			"typed graph preserves exact qualified trait method identity",
+			test_typed_graph_preserves_exact_qualified_trait_method_identity,
 		),
 		(
 			"typed graph imported UFCS precedes builtin fallback",

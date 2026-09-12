@@ -457,19 +457,159 @@ class DeclarationBoundaryTests(unittest.TestCase):
         )
         self.assertIn("module_table: ModuleTable", table.group(0))
         self.assertIn(
-            "indices_by_module_and_name: List[Dict[String, List[Int]]]",
+            "slot_range_by_module: List[AcceptedCallableModuleRange]",
             table.group(0),
         )
+        self.assertNotIn("indices_by_module_and_name", table.group(0))
         self.assertNotIn("indices_by_module_path_and_name", table.group(0))
-        self.assertIn("owner_module_path: Option[String]", authority.group(0))
+        self.assertIn("owner_module_id: Option[ModuleId]", authority.group(0))
+        self.assertNotIn("owner_module_path", authority.group(0))
         self.assertNotIn("ModuleIdentity", source)
         self.assertNotIn("identity_keys_by_module_path", table.group(0))
 
+    def test_callable_selective_visibility_uses_exact_targets(self) -> None:
+        source = CALLABLE_AUTHORITY.read_text(encoding="utf-8")
+        binding = re.search(
+            r"private record AcceptedVisibleCallableBindingRep \{.*?\n\}",
+            source,
+            re.DOTALL,
+        )
+        authority = re.search(
+            r"pure func accepted_callable_authority\(.*?"
+            r"(?=\n\npure func accepted_callable_authority_without_visible_names)",
+            source,
+            re.DOTALL,
+        )
+        decl_source = DECL.read_text(encoding="utf-8")
+        adapter = re.search(
+            r"private pure func accepted_callable_authority_for_module\(.*?"
+            r"(?=\n\nprivate pure func accepted_trait_implementation_authority_for_module)",
+            decl_source,
+            re.DOTALL,
+        )
+
+        self.assertIsNotNone(binding)
+        self.assertIn("targets: List[CallableId]", binding.group(0))
+        self.assertNotIn("owner_module_path", binding.group(0))
+        self.assertNotIn("original_name", binding.group(0))
+        self.assertIsNotNone(authority)
+        self.assertIn("table_indices_for_ids", authority.group(0))
+        self.assertNotIn("binding.owner_module_path", authority.group(0))
+        self.assertNotIn("binding.original_name", authority.group(0))
+        self.assertIsNotNone(adapter)
+        self.assertIn("accepted_visible_callable_bindings", adapter.group(0))
+        self.assertIn("module_view_import_bindings", adapter.group(0))
+        self.assertNotIn("module_view_imported_names", adapter.group(0))
+
+    def test_callable_visibility_uses_source_name_ids(self) -> None:
+        source = CALLABLE_AUTHORITY.read_text(encoding="utf-8")
+        table_input = re.search(
+            r"record AcceptedCallableTableInput \{.*?\n\}",
+            source,
+            re.DOTALL,
+        )
+        table = re.search(
+            r"private record AcceptedCallableTableRep \{.*?\n\}",
+            source,
+            re.DOTALL,
+        )
+        binding = re.search(
+            r"private record AcceptedVisibleCallableBindingRep \{.*?\n\}",
+            source,
+            re.DOTALL,
+        )
+
+        self.assertIsNotNone(table_input)
+        self.assertIsNotNone(table)
+        self.assertIsNotNone(binding)
+        self.assertIn("scope: PreparedModuleScope", table_input.group(0))
+        self.assertNotIn("module_table: ModuleTable", table_input.group(0))
+        self.assertNotIn("definition_table: DefinitionTable", table_input.group(0))
+        self.assertNotIn("source_name_table: SourceNameTable", table_input.group(0))
+        self.assertIn("source_name_table: SourceNameTable", table.group(0))
+        self.assertIn("source_name_id: SourceNameId", binding.group(0))
+        self.assertNotIn("source_name: String", binding.group(0))
+
+    def test_callable_module_membership_uses_compact_ranges(self) -> None:
+        source = CALLABLE_AUTHORITY.read_text(encoding="utf-8")
+        slot = re.search(
+            r"private record AcceptedCallableSlot \{.*?\n\}",
+            source,
+            re.DOTALL,
+        )
+        table = re.search(
+            r"private record AcceptedCallableTableRep \{.*?\n\}",
+            source,
+            re.DOTALL,
+        )
+        record = re.search(
+            r"record AcceptedCallableTableRecord \{.*?\n\}",
+            source,
+            re.DOTALL,
+        )
+
+        self.assertIsNotNone(slot)
+        self.assertIsNotNone(table)
+        self.assertIsNotNone(record)
+        self.assertIn("source_name_id: SourceNameId", record.group(0))
+        self.assertNotIn("source_name: String", record.group(0))
+        self.assertIn("source_name_id: SourceNameId", slot.group(0))
+        self.assertNotIn("source_name: String", slot.group(0))
+        self.assertIn(
+            "slot_range_by_module: List[AcceptedCallableModuleRange]",
+            table.group(0),
+        )
+        self.assertNotIn("name_ranges", table.group(0))
+        self.assertNotIn("indices_by_module_and_name", table.group(0))
+
+    def test_callable_authority_retains_exact_visibility_inputs(self) -> None:
+        source = CALLABLE_AUTHORITY.read_text(encoding="utf-8")
+        constructor = re.search(
+            r"pure func accepted_callable_authority\(.*?\) -> Option\[AcceptedCallableAuthority\]:",
+            source,
+            re.DOTALL,
+        )
+        authority = re.search(
+            r"private record AcceptedCallableAuthorityRep \{.*?\n\}",
+            source,
+            re.DOTALL,
+        )
+        name_access = re.search(
+            r"private record AcceptedCallableNameAccess \{.*?\n\}",
+            source,
+            re.DOTALL,
+        )
+
+        self.assertIsNotNone(constructor)
+        self.assertIsNotNone(authority)
+        self.assertIsNotNone(name_access)
+        self.assertIn("owner_scope: Option[PreparedModuleScope]", constructor.group(0))
+        self.assertIn(
+            "direct_module_scopes: List[PreparedModuleScope]",
+            constructor.group(0),
+        )
+        self.assertNotIn("owner_module_path", constructor.group(0))
+        self.assertNotIn("direct_module_paths", constructor.group(0))
+        self.assertIn(
+            "owner_module_id: Option[ModuleId]",
+            authority.group(0),
+        )
+        self.assertIn(
+            "name_access: Option[AcceptedCallableNameAccess]",
+            authority.group(0),
+        )
+        self.assertIn(
+            "visible_bindings: List[AcceptedVisibleCallableBinding]",
+            name_access.group(0),
+        )
+        self.assertIn("direct_module_ids: List[ModuleId]", name_access.group(0))
+        self.assertNotIn("owner_module_path", authority.group(0))
+        self.assertNotIn("Dict[String, List[Int]]", authority.group(0))
+        self.assertNotIn("Dict[Int, List[Int]]", authority.group(0))
+        self.assertNotIn("AcceptedCallableNameRow", authority.group(0))
+
     def test_global_authority_locality_uses_the_existing_module_path_index(self) -> None:
-        source = (
-            ROOT
-            / "blorp/src/compiler/stage_06_typecheck/type_system/accepted_global_authority.brp"
-        ).read_text(encoding="utf-8")
+        source = GLOBAL_AUTHORITY.read_text(encoding="utf-8")
         authority = re.search(
             r"private record AcceptedGlobalAuthorityRep \{.*?\n\}",
             source,
@@ -480,6 +620,22 @@ class DeclarationBoundaryTests(unittest.TestCase):
         self.assertIn("owner_module_path: String", authority.group(0))
         self.assertNotIn("owner: ModuleIdentity", authority.group(0))
         self.assertNotIn("module_identities_equal", source)
+
+    def test_global_authority_uses_one_exact_per_module_slot_relation(self) -> None:
+        source = GLOBAL_AUTHORITY.read_text(encoding="utf-8")
+        table = re.search(
+            r"private record AcceptedGlobalTableRep \{.*?\n\}",
+            source,
+            re.DOTALL,
+        )
+
+        self.assertIsNotNone(table)
+        self.assertIn(
+            "slot_indices_by_module_and_source_name_id: List[Dict[Int, Int]]",
+            table.group(0),
+        )
+        self.assertNotIn("indices_by_module_and_name", table.group(0))
+        self.assertNotIn("Dict[String", table.group(0))
 
     def test_trait_implementation_authority_uses_dense_module_indices(self) -> None:
         source = (
@@ -858,6 +1014,326 @@ class DeclarationBoundaryTests(unittest.TestCase):
         )
         self.assertIn("base_positions_by_module_id", graph_preparation.group(0))
         self.assertNotIn("base_indices_by_module", graph_preparation.group(0))
+
+    def test_direct_accepted_callable_resolution_preserves_exact_identity(self) -> None:
+        authority_source = CALLABLE_AUTHORITY.read_text(encoding="utf-8")
+        infer_source = INFER.read_text(encoding="utf-8")
+
+        binding = re.search(
+            r"record AcceptedCallableBinding \{.*?\n\}",
+            authority_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(binding)
+        self.assertIn("id: CallableId", binding.group(0))
+        self.assertIn("source_name: String", binding.group(0))
+        self.assertIn("entry: OverloadEntry", binding.group(0))
+
+        for function_name in (
+            "accepted_callable_find",
+            "accepted_callable_find_qualified",
+        ):
+            with self.subTest(function_name=function_name):
+                query = re.search(
+                    rf"pure func {function_name}\(.*?(?=\n\npure func)",
+                    authority_source,
+                    re.DOTALL,
+                )
+                self.assertIsNotNone(query)
+                self.assertIn("Option[AcceptedCallableBinding]", query.group(0))
+
+        graph_resolution = re.search(
+            r"private pure func resolved_call_from_graph_overload_entry\(.*?"
+            r"(?=\n\nprivate pure func)",
+            infer_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(graph_resolution)
+        self.assertIn("id: CallableId", graph_resolution.group(0))
+        self.assertRegex(
+            graph_resolution.group(0),
+            r"ResolvedGraphCallableCall\(\s*id,",
+        )
+        self.assertNotIn("entry.module_path", graph_resolution.group(0))
+        self.assertNotIn("callable_id_from_reserved_graph_definition", graph_resolution.group(0))
+
+        accepted_name = re.search(
+            r"Some\(BareAcceptedCallable\(binding\)\):.*?"
+            r"(?=\n\t\tSome\(BareAcceptedGlobal)",
+            infer_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(accepted_name)
+        self.assertIn("binding.source_name", accepted_name.group(0))
+        self.assertIn("binding.id", accepted_name.group(0))
+        self.assertNotIn("module_path", accepted_name.group(0))
+
+    def test_qualified_accepted_ufcs_preserves_exact_identity(self) -> None:
+        authority_source = CALLABLE_AUTHORITY.read_text(encoding="utf-8")
+        infer_source = INFER.read_text(encoding="utf-8")
+
+        lookup = re.search(
+            r"pure func accepted_callable_lookup_qualified_ufcs\(.*?"
+            r"(?=\n\npure func)",
+            authority_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(lookup)
+        self.assertIn("List[AcceptedCallableBinding]", lookup.group(0))
+        self.assertIn("binding_from_slot", lookup.group(0))
+
+        selection = re.search(
+            r"pure func accepted_callable_select_ufcs_method\(.*?"
+            r"(?=\n\npure func)",
+            authority_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(selection)
+        self.assertIn("Option[AcceptedCallableBinding]", selection.group(0))
+        self.assertIn("overload_entry_ufcs_selection_score", selection.group(0))
+
+        accepted_inference = re.search(
+            r"private pure func infer_accepted_ufcs_call_with_receiver_result\(.*?"
+            r"(?=\n\nprivate pure func)",
+            infer_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(accepted_inference)
+        self.assertIn("binding: AcceptedCallableBinding", accepted_inference.group(0))
+        self.assertIn("binding.id", accepted_inference.group(0))
+        self.assertIn("binding.source_name", accepted_inference.group(0))
+        self.assertNotIn("module_path", accepted_inference.group(0))
+        self.assertNotIn(
+            "callable_id_from_reserved_graph_definition",
+            accepted_inference.group(0),
+        )
+
+        qualified_inference = re.search(
+            r"private pure func infer_qualified_module_ufcs_call_expr\(.*?"
+            r"(?=\n\nprivate pure func)",
+            infer_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(qualified_inference)
+        self.assertIn("accepted_callable_select_ufcs_method", qualified_inference.group(0))
+        self.assertIn(
+            "infer_accepted_ufcs_call_with_receiver_result",
+            qualified_inference.group(0),
+        )
+        self.assertNotIn("env_select_ufcs_method", qualified_inference.group(0))
+        self.assertIn("accepted_callable_lookup_qualified_ufcs", qualified_inference.group(0))
+
+    def test_unqualified_accepted_ufcs_preserves_exact_identity(self) -> None:
+        authority_source = CALLABLE_AUTHORITY.read_text(encoding="utf-8")
+        infer_source = INFER.read_text(encoding="utf-8")
+
+        lookup = re.search(
+            r"pure func accepted_callable_lookup_ufcs\(.*?"
+            r"(?=\n\npure func)",
+            authority_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(lookup)
+        self.assertIn("List[AcceptedCallableBinding]", lookup.group(0))
+        self.assertNotIn("List[OverloadEntry]", lookup.group(0))
+
+        origin = re.search(
+            r"pure func accepted_callable_ufcs_origin\(.*?"
+            r"(?=\n\npure func)",
+            authority_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(origin)
+        self.assertIn("Option[AcceptedCallableUfcsOrigin]", origin.group(0))
+        self.assertIn("slot.source_name_id", origin.group(0))
+        self.assertIn("callable_ids_equal(target, binding.id)", origin.group(0))
+        self.assertNotIn("module_path", origin.group(0))
+
+        resolved = re.search(
+            r"private pure func resolve_visible_ufcs_method\(.*?"
+            r"(?=\n\nprivate pure func)",
+            infer_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(resolved)
+        self.assertIn("Option[VisibleUfcsMethod]", resolved.group(0))
+
+        selection = re.search(
+            r"private pure func select_visible_ufcs_candidates\(.*?"
+            r"(?=\n\nprivate pure func)",
+            infer_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(selection)
+        self.assertIn("AcceptedVisibleUfcsMethod", selection.group(0))
+        self.assertIn("CompatibilityVisibleUfcsMethod", selection.group(0))
+
+        retry = re.search(
+            r"private pure func retry_ufcs_call_candidates\(.*?"
+            r"(?=\n\nprivate pure func)",
+            infer_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(retry)
+        self.assertIn("selected: VisibleUfcsMethod", retry.group(0))
+        self.assertIn("infer_accepted_ufcs_call_with_receiver_result", retry.group(0))
+        self.assertIn("accepted_callable_ufcs_bindings_share_owner", retry.group(0))
+        accepted_retry = retry.group(0).split("CompatibilityVisibleUfcsMethod", 1)[0]
+        self.assertNotIn("module_path", accepted_retry)
+        self.assertNotIn("callable_id_from_reserved_graph_definition", accepted_retry)
+
+    def test_accepted_trait_method_lookup_preserves_exact_identity(self) -> None:
+        authority_source = TRAIT_IMPLEMENTATION_AUTHORITY.read_text(encoding="utf-8")
+        infer_source = INFER.read_text(encoding="utf-8")
+
+        authority_rep = re.search(
+            r"private record AcceptedTraitImplementationAuthorityRep \{.*?\n\}",
+            authority_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(authority_rep)
+        self.assertIn(
+            "trait_method_id_by_name: Dict[String, TraitMethodId]",
+            authority_rep.group(0),
+        )
+        self.assertNotIn("trait_name_by_method_name", authority_rep.group(0))
+
+        lookup = re.search(
+            r"pure func accepted_trait_find_function_method\(.*?"
+            r"(?=\n\npure func)",
+            authority_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(lookup)
+        self.assertIn("Option[AcceptedTraitMethodBinding]", lookup.group(0))
+        self.assertIn("trait_method_id_by_name", lookup.group(0))
+        self.assertIn("table_find_trait_method_by_id", lookup.group(0))
+        self.assertIn("into_opaque AcceptedTraitMethodBinding", lookup.group(0))
+        self.assertNotIn(
+            "pure func accepted_trait_find_method_by_id",
+            authority_source,
+        )
+
+        exact_lookup = re.search(
+            r"private pure func infer_find_function_trait_method\(.*?"
+            r"(?=\n\nprivate pure func)",
+            infer_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(exact_lookup)
+        self.assertIn("accepted_trait_find_function_method", exact_lookup.group(0))
+        self.assertNotIn("accepted_trait_find_method_by_id", exact_lookup.group(0))
+        self.assertNotIn("accepted_trait_function_trait", infer_source)
+
+    def test_selected_accepted_trait_call_preserves_exact_identity(self) -> None:
+        infer_source = INFER.read_text(encoding="utf-8")
+
+        target = re.search(
+            r"union ResolvedCallTarget:.*?(?=\n\nenum ResolvedLoopProducer)",
+            infer_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(target)
+        self.assertIn(
+            "ResolvedAcceptedTraitMethodCall(TraitId, CallableId)",
+            target.group(0),
+        )
+
+        callee_identity = re.search(
+            r"private union TraitMethodCalleeIdentity:.*?"
+            r"(?=\n\nprivate record TraitMethodCallee)",
+            infer_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(callee_identity)
+        self.assertIn(
+            "AcceptedTraitMethodCalleeIdentity(TraitId)",
+            callee_identity.group(0),
+        )
+        self.assertIn(
+            "CompatibilityTraitMethodCalleeIdentity",
+            callee_identity.group(0),
+        )
+
+        resolution = re.search(
+            r"private pure func resolved_call_from_trait_method_callee\(.*?"
+            r"(?=\n\nprivate pure func)",
+            infer_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(resolution)
+        self.assertIn("ResolvedAcceptedTraitMethodCall", resolution.group(0))
+        self.assertIn("AcceptedTraitMethodCalleeIdentity", resolution.group(0))
+        self.assertIn("trait_method_id_owner", infer_source)
+
+    def test_selected_accepted_trait_call_validates_both_ids_at_phase_boundaries(self) -> None:
+        declaration_skeleton = (
+            ROOT
+            / "blorp/src/compiler/stage_06_typecheck/headers/declaration_skeleton.brp"
+        ).read_text(encoding="utf-8")
+        typed_ast_json = (
+            ROOT / "blorp/src/compiler/stage_06_typecheck/typed_ast_json.brp"
+        ).read_text(encoding="utf-8")
+        ctfe_ir = (
+            ROOT / "blorp/src/compiler/stage_07_ctfe/ir.brp"
+        ).read_text(encoding="utf-8")
+        core_lower = (
+            ROOT / "blorp/src/compiler/stage_08_core_lower/lower.brp"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("pure func trait_id_is_valid(", declaration_skeleton)
+        for consumer in (typed_ast_json, ctfe_ir, core_lower):
+            self.assertIn("trait_id_is_valid", consumer)
+
+    def test_qualified_accepted_trait_selection_preserves_exact_identity(self) -> None:
+        authority_source = (
+            ROOT
+            / "blorp/src/compiler/stage_06_typecheck/type_system/accepted_trait_implementation_authority.brp"
+        ).read_text(encoding="utf-8")
+        infer_source = INFER.read_text(encoding="utf-8")
+
+        qualified_info = re.search(
+            r"private record AcceptedQualifiedTraitMethodInfoRep \{.*?\n\}",
+            authority_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(qualified_info)
+        self.assertIn("trait_id: TraitId", qualified_info.group(0))
+        self.assertIn("trait_identity: BoundTraitIdentity", qualified_info.group(0))
+        self.assertNotIn("Option[BoundTraitIdentity]", qualified_info.group(0))
+        self.assertIn(
+            "opaque type AcceptedQualifiedTraitMethodInfo = AcceptedQualifiedTraitMethodInfoRep",
+            authority_source,
+        )
+        for projection in (
+            "accepted_qualified_trait_method_id",
+            "accepted_qualified_trait_method_identity",
+            "accepted_qualified_trait_method_signature",
+            "accepted_qualified_trait_implementation_method",
+        ):
+            self.assertIn(f"pure func {projection}(", authority_source)
+
+        selection = re.search(
+            r"private union QualifiedTraitMethodSelection:.*?"
+            r"(?=\n\nprivate pure func infer_find_qualified_trait_method_selection)",
+            infer_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(selection)
+        self.assertIn("AcceptedQualifiedTraitMethodSelection", selection.group(0))
+        self.assertIn("CompatibilityQualifiedTraitMethodSelection", selection.group(0))
+
+        qualified_resolution = re.search(
+            r"private pure func infer_qualified_module_trait_call_expr\(.*?"
+            r"(?=\n\nprivate enum VisibleUfcsOrigin)",
+            infer_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(qualified_resolution)
+        self.assertRegex(
+            qualified_resolution.group(0),
+            r"AcceptedTraitMethodCalleeIdentity\(\s*accepted_qualified_trait_method_id\(",
+        )
 
 if __name__ == "__main__":
     unittest.main()
