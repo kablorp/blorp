@@ -1,0 +1,155 @@
+-- Isolated profile for source-AST nested-declaration hoisting finalization.
+--
+-- Fixture source construction and parsing happen before the timed window.
+-- The timed work is exactly `finalize_nested_functions_program`.
+--
+-- Usage:
+--   bin/blorp compile -o /tmp/nested_hoist_finalize.c blorp/benchmark/compiler/compiler_nested_hoist_finalize_profile.brp
+--   cc -O2 /tmp/nested_hoist_finalize.c -o /tmp/nested_hoist_finalize
+--   /tmp/nested_hoist_finalize independent 4096
+--   /tmp/nested_hoist_finalize mixed 8192
+import:
+	../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
+	../../src/compiler/stage_03_parse/parsed_ast:
+		ParsedDecl(FunctionParsedDecl, ImplParsedDecl, PrivateParsedDecl),
+		ParsedProgram
+	../../src/compiler/stage_03_parse/source_ast_finalize: finalize_nested_functions_program
+	../../src/lib/source: source_file
+	string: parse_int
+	system: now_microseconds
+
+
+private DEFAULT_VARIANT: String = "independent"
+
+private DEFAULT_FUNCTION_COUNT: Int = 4096
+
+
+private pure func positive_argument(args: List[String], index: Int, default: Int) -> Int:
+	match args.get(index):
+		Some(text):
+			match parse_int(text):
+				Some(value):
+					if value > 0:
+						value
+					else:
+						default
+				None:
+					default
+		None:
+			default
+
+
+private pure func variant_argument(args: List[String]) -> String:
+	match args.get(1):
+		Some("mixed"):
+			"mixed"
+		Some("independent"):
+			"independent"
+		_:
+			DEFAULT_VARIANT
+
+
+private pure func independent_source(function_count: Int) -> String:
+	var text: String = ""
+
+	for index in 0..function_count:
+		text += "func independent_${index}() -> Int:\n\t${index}\n\n"
+
+	text
+
+
+private pure func ordinary_nested_source(index: Int) -> String:
+	"func outer_${index}() -> Int:\n\tfunc helper_${index}() -> Int:\n\t\t${index}\n\thelper_${index}()\n\n"
+
+
+private pure func private_nested_source(index: Int) -> String:
+	"private func hidden_${index}() -> Int:\n\tfunc secret_${index}() -> Int:\n\t\t${index}\n\tsecret_${index}()\n\n"
+
+
+private pure func impl_nested_source(index: Int) -> String:
+	"implements NestedHoistProfileTrait for NestedHoistProfileBox:\n\tfunc value_${index}(self: NestedHoistProfileBox) -> Int:\n\t\tfunc method_helper_${index}() -> Int:\n\t\t\t${index}\n\t\tmethod_helper_${index}()\n\n"
+
+
+private pure func mixed_source(function_count: Int) -> String:
+	var text: String = "record NestedHoistProfileBox {value: Int}\ntrait NestedHoistProfileTrait:\n\tfunc value(self: Self) -> Int\n\n"
+
+	for index in 0..function_count:
+		remainder: Int = index % 3
+
+		if remainder == 0:
+			text += ordinary_nested_source(index)
+		else if remainder == 1:
+			text += private_nested_source(index)
+		else:
+			text += impl_nested_source(index)
+
+	text
+
+
+private pure func source_for_variant(variant: String, function_count: Int) -> String:
+	if variant == "mixed":
+		mixed_source(function_count)
+	else:
+		independent_source(function_count)
+
+
+private pure func expected_output_declarations(variant: String, function_count: Int) -> Int:
+	if variant == "mixed":
+		2 + function_count * 2
+	else:
+		function_count
+
+
+private pure func decl_name_checksum(seed: Int, name: String) -> Int:
+	var checksum: Int = seed
+
+	for character in name:
+		checksum = checksum * 131 + to_int(character)
+
+	checksum
+
+
+private pure func program_decl_checksum(program: ParsedProgram) -> Int:
+	var checksum: Int = 0
+
+	for decl in program.decls:
+		match decl:
+			FunctionParsedDecl(function_decl):
+				checksum = decl_name_checksum(checksum, function_decl.name.text)
+			PrivateParsedDecl(FunctionParsedDecl(function_decl), _):
+				checksum = decl_name_checksum(checksum, function_decl.name.text)
+			ImplParsedDecl(impl_decl):
+				checksum = checksum * 131 + impl_decl.methods.length()
+			_:
+				checksum = checksum * 131 + 17
+
+	checksum
+
+
+func main(args: List[String]) -> Int:
+	variant: String = variant_argument(args)
+	function_count: Int = positive_argument(args, 2, DEFAULT_FUNCTION_COUNT)
+	source_text: String = source_for_variant(variant, function_count)
+	parsed: ParsedProgram = parse_compiler_source(
+		source_file("nested_hoist_finalize_profile.brp", "nested_hoist_finalize_profile", source_text),
+	)
+
+	started: Int = now_microseconds()
+	finalized: ParsedProgram = finalize_nested_functions_program(parsed)
+	elapsed_microseconds: Int = now_microseconds() - started
+	expected_declarations: Int = expected_output_declarations(variant, function_count)
+	workload_valid: Bool = (
+		parsed.diagnostics.length() == 0
+		and finalized.diagnostics.length() == 0
+		and finalized.decls.length() == expected_declarations
+	)
+	checksum: Int = program_decl_checksum(finalized)
+
+	print(
+		"NESTED_HOIST_FINALIZE_PROFILE variant=" + variant + " functions=" + function_count.to_string() + " output_declarations=" + finalized.decls.length().to_string() + " parse_diagnostics=" + parsed.diagnostics.length().to_string() + " finalize_diagnostics=" + finalized.diagnostics.length().to_string() + " checksum=" + checksum.to_string() + " elapsed_microseconds=" + elapsed_microseconds.to_string() + " workload_valid=" + workload_valid.to_string(),
+	)
+
+	if workload_valid:
+		0
+	else:
+		1
