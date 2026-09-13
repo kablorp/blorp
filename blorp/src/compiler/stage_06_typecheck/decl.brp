@@ -1134,22 +1134,25 @@ union BodyCheckOutcome:
 	BodyCheckRejected(RecoveredBodyArtifact)
 
 
-private record BodyOutcomeIndexRep {
+-- Each admitted body has one keyed outcome; a CTFE subset may be partial.
+-- The dictionary is the row store, not a cache beside an outcome list.
+private record BodyOutcomeTableRep {
+	plan_provenance: BodyPlanProvenance,
 	by_definition_id: Dict[Int, BodyCheckOutcome]
 }
 
 
-opaque type BodyOutcomeIndex = BodyOutcomeIndexRep
+opaque type BodyOutcomeTable = BodyOutcomeTableRep
 
 
-private union BodyOutcomeIndexBuild:
-	BodyOutcomeIndexAccepted(BodyOutcomeIndex)
-	BodyOutcomeIndexRejected(List[String])
+union BodyOutcomeTableBuild:
+	BodyOutcomeTableAccepted(BodyOutcomeTable)
+	BodyOutcomeTableRejected(List[String])
 
 
 private union FunctionBodyMaterialization:
 	InferStandaloneFunctionBodies
-	ReuseIndependentFunctionBodies(BodyOutcomeIndex, CallableHeaderGraph)
+	ReuseIndependentFunctionBodies(BodyOutcomeTable, CallableHeaderGraph)
 
 
 private record BodySubsetProgramRep {
@@ -5905,11 +5908,11 @@ pure func body_check_outcome_diagnostics(outcome: BodyCheckOutcome) -> List[Type
 			from_opaque RecoveredBodyArtifact(artifact).diagnostics
 
 
-private pure func body_outcome_index_find(
-	index: BodyOutcomeIndex,
+private pure func body_outcome_table_find(
+	table: BodyOutcomeTable,
 	id: CallableId,
 ) -> Option[BodyCheckOutcome]:
-	representation = from_opaque BodyOutcomeIndex(index)
+	representation = from_opaque BodyOutcomeTable(table)
 	outcome ?= representation.by_definition_id.get(callable_id_definition_id(id))
 
 	if callable_ids_equal(body_check_outcome_callable_id(outcome), id):
@@ -5918,11 +5921,11 @@ private pure func body_outcome_index_find(
 		None
 
 
-private pure func body_outcome_index_find_definition_id(
-	index: BodyOutcomeIndex,
+private pure func body_outcome_table_find_definition_id(
+	table: BodyOutcomeTable,
 	definition_id: Int,
 ) -> Option[BodyCheckOutcome]:
-	representation = from_opaque BodyOutcomeIndex(index)
+	representation = from_opaque BodyOutcomeTable(table)
 	representation.by_definition_id.get(definition_id)
 
 
@@ -5944,16 +5947,16 @@ private pure func apply_body_check_outcome_diagnostics(
 private pure func body_outcome_for_function_decl(
 	state: TypecheckState,
 	function_decl: ParsedFunctionDecl,
-	outcomes: BodyOutcomeIndex,
+	outcomes: BodyOutcomeTable,
 	callable_headers: CallableHeaderGraph,
 ) -> Option[BodyCheckOutcome]:
 	match find_callable_id_from_span(state, function_decl.name.text, function_decl.span):
 		Some(definition_id):
 			match callable_header_graph_find_definition_id(callable_headers, definition_id):
 				Some(header):
-					body_outcome_index_find(outcomes, callable_header_id(header))
+					body_outcome_table_find(outcomes, callable_header_id(header))
 				None:
-					body_outcome_index_find_definition_id(outcomes, definition_id)
+					body_outcome_table_find_definition_id(outcomes, definition_id)
 		None:
 			None
 
@@ -10314,12 +10317,16 @@ private pure func body_planning_failure_message(failure: BodyCheckPlanningFailur
 	).to_string() + ": " + body_context_failure_label(failure.reason)
 
 
-private pure func body_outcome_index(
-	definition_table: DefinitionTable,
-	owner_scope: PreparedModuleScope,
+private pure func body_outcome_table_for_base(
+	base: AcceptedBodyModuleBase,
 	outcomes: List[BodyCheckOutcome],
-) -> BodyOutcomeIndexBuild:
-	var index: Dict[Int, BodyCheckOutcome] = {}
+) -> BodyOutcomeTableBuild:
+	definition_table = implementation_header_graph_definition_table(
+		base.representation.graph_facts.implementation_headers,
+	)
+	owner_scope = bound_module_scope(base.representation.bound_module)
+	var rows: Dict[Int, BodyCheckOutcome] = {}
+	var provenance_errors: List[String] = []
 	var errors: List[String] = []
 	owner = prepared_module_scope_id(owner_scope)
 
@@ -10327,12 +10334,20 @@ private pure func body_outcome_index(
 		id = body_check_outcome_callable_id(outcome)
 		definition_id = callable_id_definition_id(id)
 
+		if not body_plan_provenances_equal(
+			body_check_outcome_plan_provenance(outcome),
+			base.plan_provenance,
+		):
+			provenance_errors = provenance_errors.append(
+				"internal typecheck error: seeded body outcome belongs to a different body plan",
+			)
+
 		if callable_id_module_id(definition_table, id) != Some(owner):
 			errors = errors.append(
 				"internal typecheck error: body outcome belongs to a foreign module",
 			)
 		else if (
-			index
+			rows
 				.get(definition_id)
 				.is_some()
 		):
@@ -10340,39 +10355,46 @@ private pure func body_outcome_index(
 				"internal typecheck error: duplicate body outcome for definition " + definition_id.to_string(),
 			)
 		else:
-			index = index.set(definition_id, outcome)
+			rows = rows.set(definition_id, outcome)
 
-	if errors.is_empty():
-		BodyOutcomeIndexAccepted(into_opaque BodyOutcomeIndex({by_definition_id = index}))
+	-- Plan mismatch takes precedence over identity errors at the seed boundary.
+	if not provenance_errors.is_empty():
+		BodyOutcomeTableRejected(provenance_errors)
+	else if errors.is_empty():
+		BodyOutcomeTableAccepted(into_opaque BodyOutcomeTable({
+				plan_provenance = base.plan_provenance,
+				by_definition_id = rows
+			}))
 	else:
-		BodyOutcomeIndexRejected(errors)
+		BodyOutcomeTableRejected(errors)
 
 
-private pure func body_outcome_index_for_base(
-	base: AcceptedBodyModuleBase,
+pure func body_check_registry_outcome_table(
+	registry: BodyCheckRegistry,
 	outcomes: List[BodyCheckOutcome],
-) -> BodyOutcomeIndexBuild:
-	provenance_errors = outcomes
-		.filter(func(outcome):
-			not body_plan_provenances_equal(
-				body_check_outcome_plan_provenance(outcome),
-				base.plan_provenance,
-			)
-		)
-		.map(func(_):
-			"internal typecheck error: seeded body outcome belongs to a different body plan"
-		)
+) -> BodyOutcomeTableBuild:
+	body_outcome_table_for_base(from_opaque BodyCheckRegistry(registry).base, outcomes)
 
-	if provenance_errors.is_empty():
-		body_outcome_index(
-			implementation_header_graph_definition_table(
-				base.representation.graph_facts.implementation_headers,
-			),
-			bound_module_scope(base.representation.bound_module),
-			outcomes,
-		)
-	else:
-		BodyOutcomeIndexRejected(provenance_errors)
+
+private pure func body_outcome_table_matches_base(
+	table: BodyOutcomeTable,
+	base: AcceptedBodyModuleBase,
+) -> Bool:
+	body_plan_provenances_equal(
+		from_opaque BodyOutcomeTable(table).plan_provenance,
+		base.plan_provenance,
+	)
+
+
+pure func body_outcome_table_count(table: BodyOutcomeTable) -> Int:
+	from_opaque BodyOutcomeTable(table).by_definition_id.length()
+
+
+pure func body_outcome_table_typed_functions(table: BodyOutcomeTable) -> List[TypedFunctionInfo]:
+	var functions: List[TypedFunctionInfo] = []
+	for (_, outcome) in from_opaque BodyOutcomeTable(table).by_definition_id:
+		functions = functions.append(body_check_outcome_typed_function(outcome))
+	functions
 
 
 private record CtfeSubsetDeclMaterialization {
@@ -10387,7 +10409,7 @@ private pure func materialize_ctfe_subset_decl(
 	decls: List[ParsedDecl],
 	import_modules: List[ImportableModule],
 	completed_globals: CompletedGlobalHeaderGraph,
-	outcomes: BodyOutcomeIndex,
+	outcomes: BodyOutcomeTable,
 	callable_headers: CallableHeaderGraph,
 	decl: ParsedDecl,
 ) -> CtfeSubsetDeclMaterialization:
@@ -10434,66 +10456,105 @@ private pure func materialize_ctfe_subset_decl(
 			}
 
 
+private pure func materialize_subset_from_body_table(
+	base: AcceptedBodyModuleBase,
+	table: BodyOutcomeTable,
+) -> BodySubsetProgramBuild:
+	program = bound_module_program(base.representation.bound_module)
+	callable_headers = implementation_header_graph_callable_headers(
+		base.representation.graph_facts.implementation_headers,
+	)
+	var next_state = base.state
+	var typed_decls: List[TypedDecl] = []
+
+	for decl in program.decls:
+		next_state = typecheck_state_reset_type_shape_memo(next_state)
+
+		match decl:
+			ForeignBlockParsedDecl(block_args, functions, block_span):
+				foreign_result = typed_foreign_block(
+					next_state,
+					block_args,
+					functions,
+					block_span,
+				)
+				next_state = foreign_result.state
+				typed_decls = typed_decls.concat(foreign_result.decls)
+			_:
+				result = materialize_ctfe_subset_decl(
+					next_state,
+					program.source.module_name,
+					program.decls,
+					base.import_modules,
+					base.representation.graph_facts.completed_globals,
+					table,
+					callable_headers,
+					decl,
+				)
+				next_state = result.state
+
+				match result.decl:
+					Some(typed):
+						typed_decls = typed_decls.append(typed)
+					None:
+						void
+
+	errors = next_state.errors.concat(next_state.diagnostics.map(
+		func(diagnostic): diagnostic.message,
+	))
+
+	if errors.is_empty():
+		BodySubsetProgramReady(into_opaque BodySubsetProgram({
+				decls = typed_decls,
+				import_bindings = module_view_import_bindings(next_state.module_view)
+			}))
+	else:
+		BodySubsetProgramRejected(errors)
+
+
+pure func body_check_registry_materialize_subset_from_table(
+	registry: BodyCheckRegistry,
+	table: BodyOutcomeTable,
+) -> BodySubsetProgramBuild:
+	base = from_opaque BodyCheckRegistry(registry).base
+
+	if body_outcome_table_matches_base(table, base):
+		materialize_subset_from_body_table(base, table)
+	else:
+		BodySubsetProgramRejected([
+			"internal typecheck error: seeded body outcome belongs to a different body plan",
+		])
+
+
 pure func body_check_registry_materialize_subset(
 	registry: BodyCheckRegistry,
 	outcomes: List[BodyCheckOutcome],
 ) -> BodySubsetProgramBuild:
-	base = from_opaque BodyCheckRegistry(registry).base
-
-	match body_outcome_index_for_base(base, outcomes):
-		BodyOutcomeIndexRejected(errors):
+	match body_check_registry_outcome_table(registry, outcomes):
+		BodyOutcomeTableRejected(errors):
 			BodySubsetProgramRejected(errors)
-		BodyOutcomeIndexAccepted(index):
-			program = bound_module_program(base.representation.bound_module)
-			callable_headers = implementation_header_graph_callable_headers(
+		BodyOutcomeTableAccepted(table):
+			body_check_registry_materialize_subset_from_table(registry, table)
+
+
+private pure func materialize_program_from_body_table(
+	base: AcceptedBodyModuleBase,
+	table: BodyOutcomeTable,
+	main_policy: MainValidationPolicy,
+) -> TypecheckProgramResult:
+	typecheck_materialize_standalone_program_bodies_with_import_modules(
+		base.state,
+		bound_module_program(base.representation.bound_module),
+		base.import_modules,
+		ReuseAcceptedGlobalBodies(base.representation.graph_facts.completed_globals),
+		ReuseIndependentFunctionBodies(
+			table,
+			implementation_header_graph_callable_headers(
 				base.representation.graph_facts.implementation_headers,
-			)
-			var next_state = base.state
-			var typed_decls: List[TypedDecl] = []
-
-			for decl in program.decls:
-				next_state = typecheck_state_reset_type_shape_memo(next_state)
-
-				match decl:
-					ForeignBlockParsedDecl(block_args, functions, block_span):
-						foreign_result = typed_foreign_block(
-							next_state,
-							block_args,
-							functions,
-							block_span,
-						)
-						next_state = foreign_result.state
-						typed_decls = typed_decls.concat(foreign_result.decls)
-					_:
-						result = materialize_ctfe_subset_decl(
-							next_state,
-							program.source.module_name,
-							program.decls,
-							base.import_modules,
-							base.representation.graph_facts.completed_globals,
-							index,
-							callable_headers,
-							decl,
-						)
-						next_state = result.state
-
-						match result.decl:
-							Some(typed):
-								typed_decls = typed_decls.append(typed)
-							None:
-								void
-
-			errors = next_state.errors.concat(next_state.diagnostics.map(
-				func(diagnostic): diagnostic.message,
-			))
-
-			if errors.is_empty():
-				BodySubsetProgramReady(into_opaque BodySubsetProgram({
-							decls = typed_decls,
-							import_bindings = module_view_import_bindings(next_state.module_view)
-						}))
-			else:
-				BodySubsetProgramRejected(errors)
+			),
+		),
+		main_policy,
+	)
 
 
 private pure func materialize_program_from_body_outcomes(
@@ -10513,27 +10574,15 @@ private pure func materialize_program_from_body_outcomes(
 				.join("; "),
 		)
 	else:
-		match body_outcome_index_for_base(base, outcomes):
-			BodyOutcomeIndexRejected(errors):
+		match body_outcome_table_for_base(base, outcomes):
+			BodyOutcomeTableRejected(errors):
 				rejected_typecheck_program(
 					base.state,
 					program,
 					errors.join("; "),
 				)
-			BodyOutcomeIndexAccepted(index):
-				typecheck_materialize_standalone_program_bodies_with_import_modules(
-					base.state,
-					program,
-					base.import_modules,
-					ReuseAcceptedGlobalBodies(base.representation.graph_facts.completed_globals),
-					ReuseIndependentFunctionBodies(
-						index,
-						implementation_header_graph_callable_headers(
-							base.representation.graph_facts.implementation_headers,
-						),
-					),
-					main_policy,
-				)
+			BodyOutcomeTableAccepted(table):
+				materialize_program_from_body_table(base, table, main_policy)
 
 
 private pure func typecheck_program_from_body_base_in_order(
@@ -10562,19 +10611,33 @@ private pure func seeded_body_context_errors(
 	var errors: List[String] = []
 
 	for outcome in seed_outcomes:
-		id = body_check_outcome_callable_id(outcome)
-		matching_context = contexts.find(
-			func(context): callable_ids_equal(body_check_context_callable_id(context), id),
-		)
+		if not seeded_body_context_has_outcome(contexts, outcome):
+			errors = errors.append(
+				"internal typecheck error: seeded body outcome is not part of the current body plan",
+			)
 
-		match matching_context:
-			None:
-				errors = errors.append((
-						"internal typecheck error: seeded body outcome is not part of the current body "
-						+ "plan"
-					))
-			Some(_):
-				void
+	errors
+
+
+private pure func seeded_body_context_has_outcome(
+	contexts: List[BodyCheckContext],
+	outcome: BodyCheckOutcome,
+) -> Bool:
+	id = body_check_outcome_callable_id(outcome)
+	contexts.any(func(context): callable_ids_equal(body_check_context_callable_id(context), id))
+
+
+private pure func seeded_body_context_errors_from_table(
+	contexts: List[BodyCheckContext],
+	table: BodyOutcomeTable,
+) -> List[String]:
+	var errors: List[String] = []
+
+	for (_, outcome) in from_opaque BodyOutcomeTable(table).by_definition_id:
+		if not seeded_body_context_has_outcome(contexts, outcome):
+			errors = errors.append(
+				"internal typecheck error: seeded body outcome is not part of the current body plan",
+			)
 
 	errors
 
@@ -10589,6 +10652,90 @@ private pure func body_check_outcome_reusable_for_context(
 		body_check_outcome_main_policy(outcome) == from_opaque BodyCheckContext(context).main_policy
 	else:
 		True
+
+
+private pure func body_outcome_table_with_checked_context(
+	table: BodyOutcomeTable,
+	context: BodyCheckContext,
+) -> BodyOutcomeTable:
+	-- The context came from this module's accepted body plan. Rechecking it
+	-- produces the sole replacement row without readmitting all seed outcomes.
+	outcome = check_body_context(context)
+	representation = from_opaque BodyOutcomeTable(table)
+	definition_id = callable_id_definition_id(body_check_outcome_callable_id(outcome))
+	into_opaque BodyOutcomeTable({ representation |
+			by_definition_id = representation.by_definition_id.set(definition_id, outcome)
+		})
+
+
+private pure func materialize_complete_from_validated_seed(
+	base: AcceptedBodyModuleBase,
+	contexts: List[BodyCheckContext],
+	seed_table: BodyOutcomeTable,
+	main_policy: MainValidationPolicy,
+) -> SeededBodyCheckRun:
+	var table = seed_table
+	var checked_bodies: Int = 0
+	var reused_bodies: Int = 0
+
+	for context in contexts:
+		id = body_check_context_callable_id(context)
+
+		match body_outcome_table_find(table, id):
+			Some(outcome):
+				if body_check_outcome_reusable_for_context(outcome, context):
+					reused_bodies += 1
+				else:
+					table = body_outcome_table_with_checked_context(table, context)
+					checked_bodies += 1
+			None:
+				table = body_outcome_table_with_checked_context(table, context)
+				checked_bodies += 1
+
+	{
+		result = materialize_program_from_body_table(base, table, main_policy),
+		checked_bodies = checked_bodies,
+		reused_bodies = reused_bodies
+	}
+
+
+pure func body_check_registry_materialize_complete_with_seed_table(
+	registry: BodyCheckRegistry,
+	seed_table: BodyOutcomeTable,
+	main_policy: MainValidationPolicy,
+) -> SeededBodyCheckRun:
+	base = from_opaque BodyCheckRegistry(registry).base
+	draft = body_contexts_from_base(base, main_policy)
+	seed_errors = seeded_body_context_errors_from_table(draft.contexts, seed_table)
+
+	if not draft.failures.is_empty():
+		{
+			result = materialize_program_from_body_outcomes(base, [], draft.failures, main_policy),
+			checked_bodies = 0,
+			reused_bodies = 0
+		}
+	else if not seed_errors.is_empty():
+		{
+			result = rejected_typecheck_program(
+				base.state,
+				bound_module_program(base.representation.bound_module),
+				seed_errors.join("; "),
+			),
+			checked_bodies = 0,
+			reused_bodies = 0
+		}
+	else if not body_outcome_table_matches_base(seed_table, base):
+		{
+			result = rejected_typecheck_program(
+				base.state,
+				bound_module_program(base.representation.bound_module),
+				"internal typecheck error: seeded body outcome belongs to a different body plan",
+			),
+			checked_bodies = 0,
+			reused_bodies = 0
+		}
+	else:
+		materialize_complete_from_validated_seed(base, draft.contexts, seed_table, main_policy)
 
 
 pure func body_check_registry_materialize_complete_with_seed(
@@ -10617,8 +10764,8 @@ pure func body_check_registry_materialize_complete_with_seed(
 			reused_bodies = 0
 		}
 	else:
-		match body_outcome_index_for_base(base, seed_outcomes):
-			BodyOutcomeIndexRejected(errors):
+		match body_outcome_table_for_base(base, seed_outcomes):
+			BodyOutcomeTableRejected(errors):
 				{
 					result = rejected_typecheck_program(
 						base.state,
@@ -10628,36 +10775,13 @@ pure func body_check_registry_materialize_complete_with_seed(
 					checked_bodies = 0,
 					reused_bodies = 0
 				}
-			BodyOutcomeIndexAccepted(seed_index):
-				var outcomes: List[BodyCheckOutcome] = []
-				var checked_bodies: Int = 0
-				var reused_bodies: Int = 0
-
-				for context in draft.contexts:
-					id = body_check_context_callable_id(context)
-
-					match body_outcome_index_find(seed_index, id):
-						Some(outcome):
-							if body_check_outcome_reusable_for_context(outcome, context):
-								outcomes = outcomes.append(outcome)
-								reused_bodies += 1
-							else:
-								outcomes = outcomes.append(check_body_context(context))
-								checked_bodies += 1
-						None:
-							outcomes = outcomes.append(check_body_context(context))
-							checked_bodies += 1
-
-				{
-					result = materialize_program_from_body_outcomes(
-						base,
-						outcomes,
-						[],
-						main_policy,
-					),
-					checked_bodies = checked_bodies,
-					reused_bodies = reused_bodies
-				}
+			BodyOutcomeTableAccepted(seed_table):
+				materialize_complete_from_validated_seed(
+					base,
+					draft.contexts,
+					seed_table,
+					main_policy,
+				)
 
 
 pure func typecheck_program_with_type_header_module_in_body_order(
@@ -10738,24 +10862,20 @@ private func typecheck_program_with_accepted_type_headers_and_trace(
 				.join("; "),
 		)
 	else:
-		match body_outcome_index(
-			implementation_header_graph_definition_table(graph.implementation_headers),
-			bound_module_scope(bound_module),
-			outcomes,
-		):
-			BodyOutcomeIndexRejected(errors):
+		match body_outcome_table_for_base(body_base, outcomes):
+			BodyOutcomeTableRejected(errors):
 				rejected_typecheck_program(
 					body_base.state,
 					program,
 					errors.join("; "),
 				)
-			BodyOutcomeIndexAccepted(index):
+			BodyOutcomeTableAccepted(table):
 				typecheck_materialize_standalone_program_bodies_with_import_modules_with_trace(
 					body_base.state,
 					program,
 					body_base.import_modules,
 					ReuseAcceptedGlobalBodies(graph.completed_globals),
-					ReuseIndependentFunctionBodies(index, callable_headers),
+					ReuseIndependentFunctionBodies(table, callable_headers),
 					trace,
 					main_policy,
 				)

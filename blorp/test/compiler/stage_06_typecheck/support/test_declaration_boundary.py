@@ -836,20 +836,20 @@ class DeclarationBoundaryTests(unittest.TestCase):
                     source,
                 )
 
-    def test_body_outcome_index_does_not_retain_module_identity(self) -> None:
+    def test_body_outcome_table_does_not_retain_module_identity(self) -> None:
         source = DECL.read_text(encoding="utf-8")
         representation = re.search(
-            r"private record BodyOutcomeIndexRep \{.*?\n\}", source, re.DOTALL
+            r"private record BodyOutcomeTableRep \{.*?\n\}", source, re.DOTALL
         )
         constructor = re.search(
-            r"private pure func body_outcome_index\(.*?"
-            r"(?=\n\nprivate pure func body_outcome_index_for_base)",
+            r"private pure func body_outcome_table_for_base\(.*?"
+            r"(?=\n\nprivate record CtfeSubsetDeclMaterialization)",
             source,
             re.DOTALL,
         )
         lookup = re.search(
-            r"private pure func body_outcome_index_find\(.*?"
-            r"(?=\n\nprivate pure func body_outcome_index_find_definition_id)",
+            r"private pure func body_outcome_table_find\(.*?"
+            r"(?=\n\nprivate pure func body_outcome_table_find_definition_id)",
             source,
             re.DOTALL,
         )
@@ -858,8 +858,60 @@ class DeclarationBoundaryTests(unittest.TestCase):
         self.assertIsNotNone(constructor)
         self.assertIsNotNone(lookup)
         self.assertNotIn("owner: ModuleIdentity", representation.group(0))
-        self.assertIn("owner_scope: PreparedModuleScope", constructor.group(0))
+        self.assertIn("owner_scope = bound_module_scope", constructor.group(0))
         self.assertIn("callable_ids_equal", lookup.group(0))
+
+    def test_seeded_body_materialization_does_not_rebuild_outcome_table(self) -> None:
+        source = DECL.read_text(encoding="utf-8")
+        seeded = re.search(
+            r"pure func body_check_registry_materialize_complete_with_seed\(.*?"
+            r"(?=\n\npure func typecheck_program_with_type_header_module_in_body_order)",
+            source,
+            re.DOTALL,
+        )
+
+        self.assertIsNotNone(seeded)
+        success_path = seeded.group(0).split("BodyOutcomeTableAccepted(seed_table):", 1)[1]
+        self.assertNotIn("outcomes = outcomes.append", success_path)
+        self.assertNotIn("materialize_program_from_body_outcomes(", success_path)
+        self.assertIn("materialize_complete_from_validated_seed(", success_path)
+        completion = source.split("private pure func materialize_complete_from_validated_seed(", 1)[1]
+        completion = completion.split("\n\npure func body_check_registry_materialize_complete_with_seed_table(", 1)[0]
+        self.assertIn("materialize_program_from_body_table(", completion)
+
+    def test_selective_ctfe_body_outcomes_have_one_module_grouped_carrier(self) -> None:
+        bridge = (ROOT / "blorp/src/compiler/stage_06_typecheck/bridge.brp").read_text(
+            encoding="utf-8"
+        )
+        selective = bridge.split(
+            "private pure func prepare_selective_ctfe_dependencies_for_roots(", 1
+        )[1].split("\n\nprivate pure func prepare_selective_ctfe_dependencies(", 1)[0]
+
+        self.assertIn("SelectiveCtfeProgram(CtfeImportedProgram)", bridge)
+        self.assertIn("ctfe_checked_body_groups(checked)", selective)
+        self.assertNotRegex(selective, r"checked\s*\.filter\(")
+        self.assertNotIn("target_ctfe_body_outcomes:", bridge)
+        self.assertNotIn("target_body_outcomes:", bridge)
+
+    def test_ctfe_subset_and_seed_consume_one_validated_body_table(self) -> None:
+        declaration = DECL.read_text(encoding="utf-8")
+        bridge = (ROOT / "blorp/src/compiler/stage_06_typecheck/bridge.brp").read_text(
+            encoding="utf-8"
+        )
+        selective = bridge.split(
+            "private pure func prepare_selective_ctfe_dependencies_for_roots(", 1
+        )[1].split("\n\nprivate pure func prepare_selective_ctfe_dependencies(", 1)[0]
+        validation = bridge.split("private pure func ctfe_validated_body_tables(", 1)[1]
+        validation = validation.split("\n\nprivate pure func ctfe_validated_body_tables_find(", 1)[0]
+
+        self.assertIn("plan_provenance: BodyPlanProvenance", declaration.split(
+            "private record BodyOutcomeTableRep {", 1
+        )[1].split("\n}", 1)[0])
+        self.assertIn("body_check_registry_outcome_table(", validation)
+        self.assertIn("body_check_registry_materialize_subset_from_table(", selective)
+        self.assertIn("BodyOutcomeTable", bridge)
+        self.assertIn("body_check_registry_materialize_complete_with_seed_table(", bridge)
+        self.assertNotIn("checked_body_groups: Option[CtfeCheckedBodyGroups]", bridge)
 
     def test_owned_type_resolution_reuses_prepared_module_scope(self) -> None:
         source = TYPE_HEADER_GRAPH.read_text(encoding="utf-8")

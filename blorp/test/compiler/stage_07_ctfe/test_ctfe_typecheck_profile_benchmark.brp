@@ -132,6 +132,105 @@ private func test_ctfe_checked_body_is_reused_for_selected_module_output() -> Bo
 	)
 
 
+private func test_selected_module_reuses_two_reachable_ctfe_bodies() -> Bool:
+	config: CompilerCtfeTypecheckBenchmarkConfig = {
+		iterations = 1,
+		module_count = 1,
+		functions_per_module = 2,
+		retain_parsed_programs = False
+	}
+	request = compiler_ctfe_typecheck_benchmark_request(config)
+	module_source = "pure func first() -> Int: second()\n\npure func second() -> Int: 42\n\npure func unused() -> Int: 100\n"
+	target_source = "import:\n" + "\tbench/ctfe_typecheck_profile_0 as Dependency\n\n" + "answer: Int = Dependency.first()\n\n" + "func main(args: List[String]) -> Int:\n" + "\tanswer\n"
+	module = request.modules
+		.get(0)
+		.map(func(found): { found |
+				text = module_source,
+				typecheck_program = None
+			})
+
+	match module:
+		Some(dependency):
+			run = typecheck_graph_with_metrics(
+				{ request |
+					modules = [dependency],
+					module_targets = [dependency.module_path],
+					target = { request.target |
+						text = target_source,
+						typecheck_program = None
+					}
+				},
+			)
+
+			(
+				run.graph.target.errors.is_empty()
+				and run.graph.modules
+					.get(0)
+					.map(func(found): found.errors.is_empty())
+					.get_or(False)
+				and run.ctfe.dependency_body_checks == 2
+				and run.ctfe.reused_body_checks == 2
+				and run.ctfe.eager_fallback == CtfeNoEagerFallback
+			)
+		None:
+			False
+
+
+private func test_wide_single_module_ctfe_chain_reuses_every_body() -> Bool:
+	chain_length: Int = 16
+	config: CompilerCtfeTypecheckBenchmarkConfig = {
+		iterations = 1,
+		module_count = 1,
+		functions_per_module = chain_length,
+		retain_parsed_programs = False
+	}
+	request = compiler_ctfe_typecheck_benchmark_request(config)
+	var module_source = ""
+
+	for index in 0..chain_length:
+		body = if index + 1 == chain_length:
+			"42"
+		else:
+			"chain_${(index + 1).to_string()}()"
+
+		module_source += "pure func chain_${index.to_string()}() -> Int: ${body}\n\n"
+
+	target_source = "import:\n" + "\tbench/ctfe_typecheck_profile_0 as Dependency\n\n" + "answer: Int = Dependency.chain_0()\n\n" + "func main(args: List[String]) -> Int:\n" + "\tanswer\n"
+	source = module_source
+	module = request.modules
+		.get(0)
+		.map(func(found): { found |
+				text = source,
+				typecheck_program = None
+			})
+
+	match module:
+		Some(dependency):
+			run = typecheck_graph_with_metrics(
+				{ request |
+					modules = [dependency],
+					module_targets = [dependency.module_path],
+					target = { request.target |
+						text = target_source,
+						typecheck_program = None
+					}
+				},
+			)
+
+			(
+				run.graph.target.errors.is_empty()
+				and run.graph.modules
+					.get(0)
+					.map(func(found): found.errors.is_empty())
+					.get_or(False)
+				and run.ctfe.dependency_body_checks == chain_length
+				and run.ctfe.reused_body_checks == chain_length
+				and run.ctfe.eager_fallback == CtfeNoEagerFallback
+			)
+		None:
+			False
+
+
 private func test_recursive_ctfe_body_is_checked_once() -> Bool:
 	config: CompilerCtfeTypecheckBenchmarkConfig = {
 		iterations = 1,
@@ -349,6 +448,52 @@ private func test_imported_constructor_requires_no_source_body() -> Bool:
 			False
 
 
+private func test_bodyless_dependency_keeps_selective_ctfe_mode() -> Bool:
+	config: CompilerCtfeTypecheckBenchmarkConfig = {
+		iterations = 1,
+		module_count = 2,
+		functions_per_module = 1,
+		retain_parsed_programs = False
+	}
+	request = compiler_ctfe_typecheck_benchmark_request(config)
+	worker = request.modules
+		.get(0)
+		.map(func(found): { found |
+				text = "pure func selected() -> Int: 7\n",
+				typecheck_program = None
+			})
+	wrapper = request.modules
+		.get(1)
+		.map(func(found): { found |
+				text = "union Wrapped:\n\tValue(Int)\n",
+				typecheck_program = None
+			})
+	target_source = "import:\n\tbench/ctfe_typecheck_profile_0 as Worker\n\tbench/ctfe_typecheck_profile_1 as Wrapper\n\n" + "answer: Wrapper.Wrapped = Wrapper.Value(42)\n" + "selected: Int = Worker.selected()\n\n" + "func main(args: List[String]) -> Int:\n\tmatch answer:\n\t\tWrapper.Value(value): value + selected\n"
+
+	match (worker, wrapper):
+		(Some(worker_module), Some(wrapper_module)):
+			run = typecheck_graph_with_metrics(
+				{ request |
+					modules = [worker_module, wrapper_module],
+					target = { request.target |
+						text = target_source,
+						typecheck_program = None
+					}
+				},
+			)
+
+			(
+				run.graph.target.errors.is_empty()
+				and run.graph.target.ctfe_evaluated
+				and run.ctfe.dependency_body_checks == 1
+				and run.ctfe.selective_dependency_modules == 2
+				and run.ctfe.eager_dependency_modules == 0
+				and run.ctfe.eager_fallback == CtfeNoEagerFallback
+			)
+		_:
+			False
+
+
 private func test_no_callable_roots_use_explicit_eager_mode() -> Bool:
 	config: CompilerCtfeTypecheckBenchmarkConfig = {
 		iterations = 1,
@@ -524,6 +669,14 @@ tests: TestSuite = {
 			"selected module reuses its CTFE checked body",
 			test_ctfe_checked_body_is_reused_for_selected_module_output,
 		),
+		(
+			"selected module reuses two reachable CTFE bodies",
+			test_selected_module_reuses_two_reachable_ctfe_bodies,
+		),
+		(
+			"wide single-module CTFE chain reuses every body",
+			test_wide_single_module_ctfe_chain_reuses_every_body,
+		),
 		("recursive body is checked once", test_recursive_ctfe_body_is_checked_once),
 		("repeated CTFE roots share one body check", test_repeated_ctfe_roots_share_one_body_check),
 		(
@@ -541,6 +694,10 @@ tests: TestSuite = {
 		(
 			"imported constructor requires no source body",
 			test_imported_constructor_requires_no_source_body,
+		),
+		(
+			"bodyless dependency keeps selective CTFE mode",
+			test_bodyless_dependency_keeps_selective_ctfe_mode,
 		),
 		(
 			"no callable roots use explicit eager mode",

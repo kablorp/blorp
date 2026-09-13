@@ -126,6 +126,8 @@ import:
 		AcceptedTypecheckModule,
 		BodyCheckOrder(SourceBodyOrder),
 		BodyCheckOutcome,
+		BodyOutcomeTable,
+		BodyOutcomeTableBuild(BodyOutcomeTableAccepted, BodyOutcomeTableRejected),
 		BodySubsetProgramBuild(BodySubsetProgramReady, BodySubsetProgramRejected),
 		MainValidationPolicy(ValidateProgramMain, IgnoreMainName),
 		RecoverableTypecheckGraph,
@@ -144,10 +146,12 @@ import:
 		accepted_typecheck_graph_declaration_skeleton_count,
 		accepted_typecheck_graph_import_modules,
 		accepted_typecheck_module_body_registry,
-		body_check_outcome_typed_function,
 		body_check_registry_context_for_definition_id,
-		body_check_registry_materialize_complete_with_seed,
-		body_check_registry_materialize_subset,
+		body_check_registry_materialize_complete_with_seed_table,
+		body_check_registry_materialize_subset_from_table,
+		body_check_registry_outcome_table,
+		body_outcome_table_count,
+		body_outcome_table_typed_functions,
 		body_subset_program_decls,
 		body_subset_program_import_bindings,
 		complete_typecheck_graph,
@@ -436,7 +440,7 @@ private record ReusableCtfeArtifact {
 
 private union PreparedCtfeProgram:
 	ReusableCtfeProgram(ReusableCtfeArtifact)
-	SelectiveCtfeProgram(CtfeImportedProgram, Option[List[BodyCheckOutcome]])
+	SelectiveCtfeProgram(CtfeImportedProgram)
 	EagerCtfeOnlyProgram(CtfeImportedProgram)
 	FailedCtfeProgram
 
@@ -461,9 +465,158 @@ private record PreparedCtfeDependency {
 }
 
 
+-- Worklist order is retained within each module, but checked bodies have one
+-- graph handoff carrier instead of per-dependency and target outcome copies.
+private record CtfeModuleBodyChain {
+	first_row_index: Int,
+	last_row_index: Int,
+	body_count: Int
+}
+
+
+private record CtfeCheckedBodyGroupsRep {
+	rows: List[CtfeCheckedBody],
+	chain_by_module_id: Dict[Int, CtfeModuleBodyChain],
+	next_row_index: Dict[Int, Int]
+}
+
+
+opaque type CtfeCheckedBodyGroups = CtfeCheckedBodyGroupsRep
+
+
+private pure func ctfe_checked_body_groups(checked: List[CtfeCheckedBody]) -> CtfeCheckedBodyGroups:
+	var chain_by_module_id: Dict[Int, CtfeModuleBodyChain] = {}
+	var next_row_index: Dict[Int, Int] = {}
+	var row_index: Int = 0
+
+	for body in checked:
+		module_index = module_id_table_index(body.module_id)
+
+		match chain_by_module_id.get(module_index):
+			None:
+				chain_by_module_id = chain_by_module_id.set(
+					module_index,
+					{
+						first_row_index = row_index,
+						last_row_index = row_index,
+						body_count = 1
+					},
+				)
+			Some(chain):
+				next_row_index = next_row_index.set(chain.last_row_index, row_index)
+				chain_by_module_id = chain_by_module_id.set(
+					module_index,
+					{ chain |
+						last_row_index = row_index,
+						body_count = chain.body_count + 1
+					},
+				)
+
+		row_index += 1
+
+	into_opaque CtfeCheckedBodyGroups({
+			rows = checked,
+			chain_by_module_id = chain_by_module_id,
+			next_row_index = next_row_index
+		})
+
+
+private pure func ctfe_checked_body_groups_outcomes(
+	groups: CtfeCheckedBodyGroups,
+	module_id: ModuleId,
+) -> List[BodyCheckOutcome]:
+	representation = from_opaque CtfeCheckedBodyGroups(groups)
+	var outcomes: List[BodyCheckOutcome] = []
+	var current_row_index = representation.chain_by_module_id
+		.get(module_id_table_index(module_id))
+		.map(func(chain): chain.first_row_index)
+
+	while current_row_index.is_some():
+		match current_row_index:
+			Some(index):
+				match representation.rows.get(index):
+					Some(body):
+						outcomes = outcomes.append(body.outcome)
+					None:
+						void
+
+				current_row_index = representation.next_row_index.get(index)
+			None:
+				void
+
+	outcomes
+
+
+private pure func ctfe_checked_body_groups_count(
+	groups: CtfeCheckedBodyGroups,
+	module_id: ModuleId,
+) -> Int:
+	representation = from_opaque CtfeCheckedBodyGroups(groups)
+	representation.chain_by_module_id
+		.get(module_id_table_index(module_id))
+		.map(func(chain): chain.body_count)
+		.get_or(0)
+
+
+-- Validated module tables are the retained CTFE-to-ordinary handoff. The
+-- worklist's flat rows and adjacency are transient during preparation.
+private record CtfeValidatedBodyTablesRep {
+	by_module_id: Dict[Int, BodyOutcomeTable]
+}
+
+
+opaque type CtfeValidatedBodyTables = CtfeValidatedBodyTablesRep
+
+
+private pure func ctfe_validated_body_tables(
+	groups: CtfeCheckedBodyGroups,
+	registries: List[CtfeBodyModuleRegistry],
+) -> Option[CtfeValidatedBodyTables]:
+	var by_module_id: Dict[Int, BodyOutcomeTable] = {}
+	var failed: Bool = False
+
+	for registration in registries:
+		outcomes = ctfe_checked_body_groups_outcomes(groups, registration.module_id)
+
+		match body_check_registry_outcome_table(registration.registry, outcomes):
+			BodyOutcomeTableRejected(_):
+				failed = True
+				break
+			BodyOutcomeTableAccepted(table):
+				by_module_id = by_module_id.set(
+					module_id_table_index(registration.module_id),
+					table,
+				)
+
+	if failed:
+		None
+	else:
+		Some(into_opaque CtfeValidatedBodyTables({by_module_id = by_module_id}))
+
+
+private pure func ctfe_validated_body_tables_find(
+	tables: CtfeValidatedBodyTables,
+	module_id: ModuleId,
+) -> Option[BodyOutcomeTable]:
+	representation = from_opaque CtfeValidatedBodyTables(tables)
+	representation.by_module_id.get(module_id_table_index(module_id))
+
+
+private pure func ctfe_validated_body_tables_seed(
+	tables: CtfeValidatedBodyTables,
+	module_id: ModuleId,
+) -> Option[BodyOutcomeTable]:
+	table ?= ctfe_validated_body_tables_find(tables, module_id)
+
+	if body_outcome_table_count(table) == 0:
+		None
+	else:
+		Some(table)
+
+
 private record PreparedCtfeDependencies {
 	modules: List[PreparedCtfeDependency],
-	target_body_outcomes: Option[List[BodyCheckOutcome]],
+	validated_body_tables: Option[CtfeValidatedBodyTables],
 	target_discovery_body_checks: Int,
 	eager_fallback: CtfeEagerFallbackKind
 }
@@ -484,7 +637,7 @@ private record PreparedCtfeProgramBuild {
 
 
 private union SelectiveCtfeDependencyPreparation:
-	SelectiveCtfeDependenciesReady(List[PreparedCtfeDependency], Option[List[BodyCheckOutcome]], Int)
+	SelectiveCtfeDependenciesReady(List[PreparedCtfeDependency], CtfeValidatedBodyTables, Int)
 	SelectiveCtfeDependenciesRequireEager(CtfeEagerFallbackKind, Int, Int)
 
 
@@ -511,7 +664,7 @@ private union BodyTypecheckGraph:
 private record PreparedTypecheckContext {
 	all_modules: List[PreparedModule],
 	ctfe_dependencies: List[PreparedCtfeDependency],
-	target_ctfe_body_outcomes: Option[List[BodyCheckOutcome]],
+	ctfe_validated_body_tables: Option[CtfeValidatedBodyTables],
 	target_ctfe_discovery_body_checks: Int,
 	ctfe_eager_fallback: CtfeEagerFallbackKind,
 	typecheck_graph: BodyTypecheckGraph
@@ -575,7 +728,7 @@ private pure func prepared_typecheck_context(
 	{
 		all_modules = all_modules,
 		ctfe_dependencies = ctfe_dependencies.modules,
-		target_ctfe_body_outcomes = ctfe_dependencies.target_body_outcomes,
+		ctfe_validated_body_tables = ctfe_dependencies.validated_body_tables,
 		target_ctfe_discovery_body_checks = ctfe_dependencies.target_discovery_body_checks,
 		ctfe_eager_fallback = ctfe_dependencies.eager_fallback,
 		typecheck_graph = typecheck_graph
@@ -2268,90 +2421,90 @@ private pure func prepare_selective_ctfe_dependencies_for_roots(
 						attempted.target_checks,
 					)
 				CtfeBodyWorklistReady(checked, metrics):
-					var prepared: List[PreparedCtfeDependency] = []
-					var failed: Bool = False
-					target_outcomes = checked
-						.filter(func(body): module_ids_equal(body.module_id, target_module_id))
-						.map(func(body): body.outcome)
+					groups = ctfe_checked_body_groups(checked)
+					target_checks = ctfe_checked_body_groups_count(groups, target_module_id)
 
-					target_seed_outcomes: Option[List[BodyCheckOutcome]] = if target_outcomes.is_empty():
-						None
-					else:
-						Some(target_outcomes)
+					match ctfe_validated_body_tables(groups, registries):
+						None:
+							SelectiveCtfeDependenciesRequireEager(
+								CtfePreparationFailureFallback,
+								metrics.checked_bodies - target_checks,
+								target_checks,
+							)
+						Some(tables):
+							var prepared: List[PreparedCtfeDependency] = []
+							var failed: Bool = False
 
-					for dependency in dependencies:
-						module_id = prepared_module_scope_id(bound_module_scope(dependency))
-						registration = registries.find(
-							func(candidate): module_ids_equal(candidate.module_id, module_id),
-						)
-						outcomes = checked
-							.filter(func(body): module_ids_equal(body.module_id, module_id))
-							.map(func(body): body.outcome)
+							for dependency in dependencies:
+								module_id = prepared_module_scope_id(bound_module_scope(dependency))
+								registration = registries.find(
+									func(
+										candidate,
+									): module_ids_equal(candidate.module_id, module_id),
+								)
 
-						match registration:
-							None:
-								failed = True
-							Some(found):
-								match body_check_registry_materialize_subset(
-									found.registry,
-									outcomes,
-								):
-									BodySubsetProgramRejected(_):
-										failed = True
-									BodySubsetProgramReady(subset):
-										seed_outcomes: Option[List[BodyCheckOutcome]] = if outcomes.is_empty():
-											None
-										else:
-											Some(outcomes)
+								table = ctfe_validated_body_tables_find(tables, module_id)
 
-										match ctfe_import_bindings_for_module_table(
-											prepared_module_scope_module_table(target_scope),
-											definition_index_definition_table(
-												prepared_module_scope_definition_index(
-													target_scope,
-												),
-											),
-											body_subset_program_import_bindings(subset),
+								match (registration, table):
+									(Some(found), Some(validated)):
+										match body_check_registry_materialize_subset_from_table(
+											found.registry,
+											validated,
 										):
-											None:
+											BodySubsetProgramRejected(_):
 												failed = True
-											Some(import_bindings):
-												prepared = prepared.append({
-													module_id = module_id,
-													program = SelectiveCtfeProgram(
-														selective_ctfe_imported_program(
-															definition_index_definition_table(
-																prepared_module_scope_definition_index(
-																	target_scope,
+											BodySubsetProgramReady(subset):
+												match ctfe_import_bindings_for_module_table(
+													prepared_module_scope_module_table(
+														target_scope,
+													),
+													definition_index_definition_table(
+														prepared_module_scope_definition_index(
+															target_scope,
+														),
+													),
+													body_subset_program_import_bindings(subset),
+												):
+													None:
+														failed = True
+													Some(import_bindings):
+														prepared = prepared.append({
+															module_id = module_id,
+															program = SelectiveCtfeProgram(
+																selective_ctfe_imported_program(
+																	definition_index_definition_table(
+																		prepared_module_scope_definition_index(
+																			target_scope,
+																		),
+																	),
+																	module_id,
+																	body_subset_program_decls(
+																		subset,
+																	),
+																	body_outcome_table_typed_functions(
+																		validated,
+																	),
+																	import_bindings,
 																),
 															),
-															module_id,
-															body_subset_program_decls(subset),
-															outcomes.map(
-																body_check_outcome_typed_function,
+															body_checks = body_outcome_table_count(
+																validated,
 															),
-															import_bindings,
-														),
-														seed_outcomes,
-													),
-													body_checks = outcomes.length(),
-												})
+														})
+									_:
+										failed = True
 
-						if failed:
-							break
+								if failed:
+									break
 
-					if failed:
-						SelectiveCtfeDependenciesRequireEager(
-							CtfePreparationFailureFallback,
-							metrics.checked_bodies - target_outcomes.length(),
-							target_outcomes.length(),
-						)
-					else:
-						SelectiveCtfeDependenciesReady(
-							prepared,
-							target_seed_outcomes,
-							target_outcomes.length(),
-						)
+							if failed:
+								SelectiveCtfeDependenciesRequireEager(
+									CtfePreparationFailureFallback,
+									metrics.checked_bodies - target_checks,
+									target_checks,
+								)
+							else:
+								SelectiveCtfeDependenciesReady(prepared, tables, target_checks)
 
 
 private pure func prepare_selective_ctfe_dependencies(
@@ -2399,7 +2552,7 @@ private pure func prepare_ctfe_dependencies(
 	if dependencies.is_empty():
 		{
 			modules = [],
-			target_body_outcomes = None,
+			validated_body_tables = None,
 			target_discovery_body_checks = 0,
 			eager_fallback = CtfeNoEagerFallback
 		}
@@ -2412,10 +2565,10 @@ private pure func prepare_ctfe_dependencies(
 					allow_debug_only_calls,
 					graph,
 				):
-					SelectiveCtfeDependenciesReady(prepared, target_outcomes, target_checks):
+					SelectiveCtfeDependenciesReady(prepared, tables, target_checks):
 						{
 							modules = prepared,
-							target_body_outcomes = target_outcomes,
+							validated_body_tables = Some(tables),
 							target_discovery_body_checks = target_checks,
 							eager_fallback = CtfeNoEagerFallback
 						}
@@ -2446,7 +2599,7 @@ private pure func prepare_ctfe_dependencies(
 								eager,
 								attempted_dependency_checks,
 							),
-							target_body_outcomes = None,
+							validated_body_tables = None,
 							target_discovery_body_checks = attempted_target_checks,
 							eager_fallback = fallback
 						}
@@ -2474,7 +2627,7 @@ private pure func prepare_ctfe_dependencies(
 
 				{
 					modules = eager,
-					target_body_outcomes = None,
+					validated_body_tables = None,
 					target_discovery_body_checks = 0,
 					eager_fallback = CtfeRecoverableGraphFallback
 				}
@@ -2558,7 +2711,7 @@ private func prepare_ctfe_dependencies_with_trace(
 							.length()
 							.to_string() + " reusable_artifact=1",
 					)
-				SelectiveCtfeProgram(program, _):
+				SelectiveCtfeProgram(program):
 					counts = typed_decls_inventory(
 						bound_module_program(dependency).source.text.length(),
 						ctfe_imported_program_decls(program),
@@ -2638,7 +2791,7 @@ private func prepare_ctfe_dependencies_from_bound_graph_with_trace(
 					include_inventory,
 					inventory,
 				),
-				target_body_outcomes = None,
+				validated_body_tables = None,
 				target_discovery_body_checks = 0,
 				eager_fallback = CtfeTracedGraphFallback,
 			})
@@ -2669,7 +2822,7 @@ private pure func ctfe_imported_programs_from_dependencies(
 		match dependency.program:
 			ReusableCtfeProgram(artifact):
 				result = result.append(artifact.imported_program)
-			SelectiveCtfeProgram(imported_program, _):
+			SelectiveCtfeProgram(imported_program):
 				result = result.append(imported_program)
 			EagerCtfeOnlyProgram(imported_program):
 				result = result.append(imported_program)
@@ -2692,7 +2845,7 @@ private pure func available_ctfe_imported_programs_from_dependencies(
 		match dependency.program:
 			ReusableCtfeProgram(artifact):
 				result = result.append(artifact.imported_program)
-			SelectiveCtfeProgram(imported_program, _):
+			SelectiveCtfeProgram(imported_program):
 				result = result.append(imported_program)
 			EagerCtfeOnlyProgram(imported_program):
 				result = result.append(imported_program)
@@ -2721,23 +2874,6 @@ private pure func evaluated_ctfe_globals_for_graph(
 	program_set = ctfe_imported_program_set(definition_table, programs)
 	graph ?= ctfe_evaluate_dependency_global_graph(definition_table, target_module_id, program_set)
 	Ok(Some(graph))
-
-
-private pure func ctfe_body_outcomes_for_module(
-	ctfe_dependencies: List[PreparedCtfeDependency],
-	module_id: ModuleId,
-) -> Option[List[BodyCheckOutcome]]:
-	match ctfe_dependencies.find(
-		func(dependency): module_ids_equal(dependency.module_id, module_id),
-	):
-		Some(dependency):
-			match dependency.program:
-				SelectiveCtfeProgram(_, outcomes):
-					outcomes
-				_:
-					None
-		None:
-			None
 
 
 private pure func reusable_ctfe_program_for_module(
@@ -2941,16 +3077,16 @@ private pure func typecheck_bound_program_with_seeded_bodies(
 	allow_debug_only_calls: Bool,
 	accepted_graph: BodyTypecheckGraph,
 	main_policy: MainValidationPolicy,
-	seed_outcomes: List[BodyCheckOutcome],
+	seed_table: BodyOutcomeTable,
 ) -> SeededBodyCheckRun:
 	scope = bound_module_scope(bound_module)
 	initial_state = graph_typecheck_state(scope, allow_debug_only_calls)
 
 	match body_graph_typecheck_module(accepted_graph, scope, allow_debug_only_calls):
 		Some(header_module):
-			body_check_registry_materialize_complete_with_seed(
+			body_check_registry_materialize_complete_with_seed_table(
 				accepted_typecheck_module_body_registry(header_module),
-				seed_outcomes,
+				seed_table,
 				main_policy,
 			)
 		None:
@@ -3004,7 +3140,7 @@ private pure func typechecked_prepared_module_with_seeded_bodies(
 	evaluated_globals: Option[CtfeEvaluatedGlobalGraph],
 	accepted_graph: BodyTypecheckGraph,
 	main_policy: MainValidationPolicy,
-	seed_outcomes: List[BodyCheckOutcome],
+	seed_table: BodyOutcomeTable,
 ) -> SeededTypecheckedModule:
 	scope = bound_module_scope(bound_module)
 	body_run = typecheck_bound_program_with_seeded_bodies(
@@ -3012,7 +3148,7 @@ private pure func typechecked_prepared_module_with_seeded_bodies(
 		allow_debug_only_calls,
 		accepted_graph,
 		main_policy,
-		seed_outcomes,
+		seed_table,
 	)
 	typed_result = body_run.result
 	imported_programs = ctfe_imported_programs_for_artifact(
@@ -3562,7 +3698,7 @@ private pure func freshly_typechecked_graph_module(
 	evaluated_globals: Option[CtfeEvaluatedGlobalGraph],
 	include_inventory: Bool,
 	main_policy: MainValidationPolicy,
-	seed_outcomes: Option[List[BodyCheckOutcome]],
+	seed_table: Option[BodyOutcomeTable],
 ) -> TypecheckedGraphModuleResult:
 	if include_inventory:
 		prepared_result = typechecked_prepared_module_with_ownership(
@@ -3581,8 +3717,8 @@ private pure func freshly_typechecked_graph_module(
 			reused_bodies = 0
 		}
 	else:
-		match seed_outcomes:
-			Some(outcomes):
+		match seed_table:
+			Some(table):
 				seeded = typechecked_prepared_module_with_seeded_bodies(
 					bound_module,
 					module_surface,
@@ -3591,7 +3727,7 @@ private pure func freshly_typechecked_graph_module(
 					evaluated_globals,
 					prepared.context.typecheck_graph,
 					main_policy,
-					outcomes,
+					table,
 				)
 				{
 					module = seeded.module,
@@ -3637,14 +3773,11 @@ private pure func typechecked_graph_module(
 		body_graph_import_modules(prepared.context.typecheck_graph),
 	)
 
-	seed_outcomes = match main_policy:
-		ValidateProgramMain:
-			prepared.context.target_ctfe_body_outcomes
-		IgnoreMainName:
-			ctfe_body_outcomes_for_module(
-				prepared.context.ctfe_dependencies,
-				prepared_module_scope_id(module_scope),
-			)
+	seed_table = match prepared.context.ctfe_validated_body_tables:
+		Some(tables):
+			ctfe_validated_body_tables_seed(tables, prepared_module_scope_id(module_scope))
+		None:
+			None
 
 	result = match reusable_ctfe_program_for_module(
 		prepared.context.ctfe_dependencies,
@@ -3673,7 +3806,7 @@ private pure func typechecked_graph_module(
 				evaluated_globals,
 				include_inventory,
 				main_policy,
-				seed_outcomes,
+				seed_table,
 			)
 
 	result
@@ -3982,7 +4115,7 @@ private pure func prepared_ctfe_dependencies_contain_program(
 			match dependency.program:
 				ReusableCtfeProgram(_):
 					True
-				SelectiveCtfeProgram(_, _):
+				SelectiveCtfeProgram(_):
 					True
 				EagerCtfeOnlyProgram(_):
 					True
@@ -4313,7 +4446,7 @@ private pure func ctfe_materialization_metrics(
 
 	for dependency in dependencies:
 		match dependency.program:
-			SelectiveCtfeProgram(_, _):
+			SelectiveCtfeProgram(_):
 				selective_dependency_modules += 1
 			ReusableCtfeProgram(_):
 				eager_dependency_modules += 1

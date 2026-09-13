@@ -122,9 +122,10 @@ The remaining split authorities are concrete:
 - `TypecheckedGraph` retains the module and definition tables beside rich module
   payloads, but it does not publish the accepted category, body-outcome,
   visibility, occurrence, and diagnostic tables as one coherent product.
-- `ModuleView` owns string-keyed aliases, imports, local names, and nested
-  accepted authorities. These are useful lookup structures, but they are not
-  yet one canonical visibility relation.
+- Graph `ModuleView` uses `SourceNameId`-keyed bound occupancy and an ordered
+  binding log, but still exposes string-backed compatibility projections and
+  nested accepted authorities. Standalone bindings remain separate. These are
+  useful lookup structures, but not yet one canonical visibility relation.
 - semantic definitions and references are projected for LSP by walking complete
   typed programs after typechecking.
 - CTFE uses exact identities for important paths but still materializes and
@@ -470,24 +471,62 @@ inputs. Scaling fixtures should vary modules, declarations, overload width,
 import density, type depth, body count, reference density, and failure density
 independently so an improvement cannot hide a new quadratic dimension.
 
-## Sequenced Checkpoints
+## Latency-First Execution Order
 
-| Step | Checkpoint | Depends on | Primary expected wins |
+Step numbers name architectural products, not a required wall-clock order. The
+previous presentation put Step 2e ahead of body work and Steps 5-8 ahead of
+Core work, even where their product dependencies did not require that order.
+Use the following bounded cuts instead;
+each still follows the issue extraction rule and resource scorecard below.
+
+| Order | Cut and first production consumer | Cutover requires | Primary latency hypothesis |
 | ---: | --- | --- | --- |
-| 0 | Baseline and authority inventory | Completed identity checkpoint | trustworthy evidence and explicit deletion targets |
-| 1 | Publish one accepted semantic catalog | Step 0 | fewer retained carriers, copies, and reconstructed indexes |
-| 2 | Normalize module visibility and binding precedence | Step 1 | lookup latency, hashes, allocations, completion readiness |
-| 3 | Normalize body lifecycle and outcome storage | Step 1; Typecheck Phase 6 | body scheduling, allocations, retained state, deterministic assembly |
-| 4 | Separate inferred, solved, and validated body facts | Step 3; Typecheck Phases 8-9 | fewer repeated walks, lower solver ownership, impossible invalid states |
-| 5 | Publish occurrence and semantic edge tables | Steps 2 and 4 | LSP/lint latency, traversal work, exact impact analysis |
-| 6 | Publish structured diagnostics and optional explanation provenance | Steps 2, 4, and 5 | string allocations, error usefulness, code actions |
-| 7 | Replace the broad typed graph and attach CTFE results by ID | Steps 3-6; Typecheck Phase 10 | peak RSS, allocations, duplicate program size, Core admission safety |
-| 8 | Expose compiler-owned semantic queries and migrate tools | Steps 5-7 | query latency, smaller context, deletion of tool-side reconstruction |
-| 9 | Preserve IDs into Core declaration and relation tables | Step 7 | repeated Core indexes, name work, allocations, late-phase latency |
+| Done | Steps 0-1: baseline, authority inventory, accepted catalog | Completed identity checkpoint | remove repeated catalog construction |
+| Active, independent | Step 2e: decide the open Cut A performance gate, then finish ordered visibility candidates and accepted joins (Cuts B-C); Cut D audits narrow compiler queries/deletions | Step 1; each earlier visibility cut accepted on its own evidence | reduce import/overload lookup work, publication churn, hashes, and allocations |
+| Start now | Step 3: body outcome table used by CTFE and ordinary compilation | Step 1 and Typecheck Phase 6; **not** completion of Step 2e | eliminate body scans, artifact copies, and scheduling-dependent rematerialization |
+| After Step 3 | Step 4A: solved/validated body products and fused finalization where measured | Step 3 and relevant Typecheck Phases 8-9; **not** Step 2e or an interning experiment | remove repeated typed-tree walks and shorten solver lifetimes |
+| After Step 4A | Step 7A: keyed CTFE results and deletion of a duplicate complete typed-program carrier | validated body outcomes and exact CTFE identity; no new broad accepted product | cut copying, retained bytes, and CTFE handoff latency before the full graph replacement |
+| After Step 7A | Step 7B: narrow successful-codegen projection and compile-only release of recovery/analysis state | exact audit of facts Core consumes; Typecheck Phase 10 admission proof; gate only a specific missing fact on its owner, not on all of Steps 2, 5, or 6 | lower compiler peak RSS, allocations, and handoff latency |
+| After Step 7B | Step 9: ID-backed Core declaration/relation cuts, one measured pass cluster at a time | codegen-ready identity projection; **not** tooling migration or full graph retirement | reduce late-pipeline name hashing, repeated scans, and index builds |
+| Independent compiler lanes | Step 2e Cuts B-D, Step 5A accepted call/dependency edges, and Step 6A required typed diagnostics | 2e: Step 1; 5A: validated accepted bodies; 6A: exact owner/span facts, with visibility-specific payloads after 2e Cuts B-C | improve lookup, dependency traversal, and diagnostic rendering without blocking an unrelated Core projection |
+| Optional experiment | Step 4B: semantic type interning | state-safe 4A products and a focused benchmark proving a worthwhile win | reduce repeated type equality/copy work only if hashing and locality do not regress |
+| Independent analysis lane | Step 5B: on-demand source occurrences, then Step 8: shared queries and tool migration; Step 6B: optional explanations | accepted visibility, validated bodies, exact coverage, analysis projection; individual queries may start as soon as their rows exist | reduce snapshot/query latency and agent output, without charging compile-only mode |
+| Final deletion gate | Step 7C: retire the remaining broad graph and compatibility admission paths | Step 7B plus migration of every remaining graph consumer, including Step 8 tools | remove residual retained state without breaking recoverable analysis |
 
-Steps are sequential where they share an authority. A later step may begin
-design or failing-test work early, but production cutover must not overtake its
-prerequisite product.
+The compiler-latency critical path is **3 → 4A → 7A → 7B → 9**. A Step 2e,
+5A, or 6A packet joins that path only if the Step 7B Core-input audit names
+the exact fact it supplies; neither the complete checkpoint nor optional
+analysis coverage is a blanket prerequisite. Step 2e must still converge,
+but its remaining visibility and tooling-adjacent work must not stall
+independent body or Core preparation. Step 5A is a compiler edge product;
+Step 5B is an analysis-only occurrence product. Step 6A is required diagnostic
+ownership; Step 6B is optional explanation provenance. Step 4B is a measured
+experiment, not a precondition for 7A. Step 7A removes one duplicate carrier,
+Step 7B establishes compile-only admission and lifetime boundaries,
+and Step 7C is the final all-consumer deletion. In particular, Step 9 may
+follow 7B without waiting for 5B, 6B, 8, or 7C.
+
+Do not interpret an early cut as permission to keep two permanent authorities.
+Every cut names the old carrier or walk it deletes and has a first production
+consumer. If a dependency audit finds that a supposedly independent consumer
+still requires the broad graph, expose that exact dependency and move only that
+cut's gate; do not restore a global linear barrier or add a string-keyed
+compatibility path. Keep both compiler and tooling latency visible, with the
+six compiler resource families guarded on every production cut. Use the
+narrowest deterministic counter/fixture first, a small paired sample for a
+clear signal, and a wider sample only when host noise obscures the decision.
+Run the broader replay and correctness gates before accepting the cut. A
+latency win does not excuse allocation, memory, instruction, or code-size
+regressions outside the scorecard policy.
+
+After each accepted packet, rerank the next compiler cut using measured
+production phase time, deterministic work removed, and estimated implementation
+size. Prefer a packet that deletes a measured whole-program walk or copy over
+one that only introduces a cleaner representation. If the expected latency
+mechanism is absent, record that result and advance to the next bounded cut;
+do not spend a long campaign tuning a neutral packet. Tool-query wins are
+valuable but do not substitute for compile/run/test latency on this critical
+path.
 
 ### Issue extraction rule
 
@@ -1309,6 +1348,65 @@ Typed expression trees remain row payloads in this step. Flattening expressions
 would combine identity/outcome normalization with a much riskier locality
 experiment.
 
+The first Step 3 packet promotes the existing validated, module-scoped
+definition-ID map to `BodyOutcomeTable`. CTFE subset and ordinary materializers
+now consume that table; seeded completion retains its validated seed rows,
+checks only missing or policy-incompatible contexts, and passes the resulting
+table directly to ordinary materialization. This deletes the intermediate
+seeded outcome list and second map construction. Plan provenance, module
+ownership, and duplicate checks share one admission loop, while parsed
+declaration traversal still determines output and diagnostic order. The table
+validates rows but may be intentionally partial for a CTFE subset; a complete
+body producer, not the table type, establishes full-body coverage. The table
+does not yet publish source-order rows or replace the CTFE worklist's copied
+outcome lists; this packet is not Step 3 completion.
+
+A seed-bearing retained 3 × 24 × 32 CTFE guard kept checksum 2,538, 72 CTFE
+body checks, three reused bodies, and 3 / 192 retained objects/bytes while
+allocations fell 772,770 → 772,599. Two direct pairs put instructions 0.08–0.14%
+higher and peak footprint between effectively equal and 0.44% higher, all
+below investigation thresholds; elapsed samples do not establish a latency
+win. The 21-case body-order suite, 15-case CTFE suite, 54 structural checks,
+6 changed-owner suites, and 4,551 broad compiler tests pass. Exact raw pairs,
+the retained `selected` benchmark mode, runtime/leak gate results, and the
+deletion/next-cut boundary are recorded in
+[Step 3a's packet](98-step3-body-outcome-table-first-cut.md). That packet
+identified two next actions: carry a validated module table through CTFE's
+bridge/worklist handoff, and replace per-dependency
+`checked.filter(...).map(...)` grouping without a parallel outcome authority.
+
+The next Step 3 packet replaces those per-dependency `checked.filter().map()`
+scans with one worklist-order, module-keyed adjacency over the flat checked
+rows. The prepared graph no longer retains separate target and selective
+dependency outcome lists. A linked row-index representation avoids
+copy-on-write prefix copies for wide single-module workloads. The selected
+retained CTFE guard preserves checksum, body-check/reuse counts, and retained
+bytes while reducing allocations by 0.233% and warm-pair retired instructions
+by 0.18–0.22%; peak footprint and RSS are slightly higher but below guards.
+The final 17-case CTFE suite and 8 changed-owner suites pass. This is still a
+scan-elimination cut: subset and seeded completion rebuild their validated
+module tables from transient lists, and source-order rows are not yet
+published. Raw resource pairs, broad-gate caveat, and the next validated-table
+handoff are recorded in
+[Step 3b's packet](99-step3-ctfe-checked-body-adjacency.md).
+
+Step 3c carries the validated `BodyOutcomeTable` itself across the CTFE
+handoff. The table now records accepted body-plan provenance; both CTFE
+subset materialization and ordinary seeded completion consume the same
+module-ID-keyed table without rebuilding it. The bridge retains an empty
+validated table for a dependency with no checked source body, preserving
+selective CTFE for declaration-only/constructor-only modules. The prepared
+graph no longer retains the checked-row adjacency. Focused parity,
+cross-plan, reuse, and bodyless-dependency tests protect the boundary. The
+final selected 3 × 24 × 32 resource screen kept checksum, body-check/reuse
+counts, and retained bytes, with 0.020% more allocation calls, 0.014–0.084%
+more warm-pair retired instructions, mixed peak/RSS within 0.5%, and 0.007%
+larger worker size. This is a guarded architectural cut, not a demonstrated
+majority-metric win; final-worker measurements and gate status are recorded in
+[Step 3c's packet](100-step3-validated-body-table-handoff.md). Step 3 remains
+open for direct row publication, explicit source order, and complete-body
+coverage.
+
 ### Target contract
 
 ```blorp
@@ -1379,9 +1477,9 @@ Today the broad inference/finalization path relies on convention that metas have
 been resolved and validation has already run. Typechecking Phases 8 and 9 own
 the semantic change required here.
 
-This step does not assume that globally interning every solved semantic type is
-profitable. It first establishes state-safe products; type interning is a
-separate measured sub-gate.
+Step **4A** establishes state-safe products and targets repeated finalization
+work. Step **4B** is a separate, optional type-interning experiment. A rejected
+or deferred 4B does not block the validated body product or Step 7A.
 
 ### Target contract
 
@@ -1409,9 +1507,9 @@ accepted facts needed by CTFE, semantic occurrence publication, and Core.
    order and improves traversal work.
 4. Publish solved/validated outcomes into the Step 3 body table without
    exposing partial bodies publicly.
-5. Instrument solved type shapes, equality calls, repeated canonical values,
-   hash cost, and retained bytes.
-6. Prototype a `SemanticTypeTable` only in a focused benchmark. Accept it only
+5. After 4A is accepted, instrument solved type shapes, equality calls,
+   repeated canonical values, hash cost, and retained bytes for 4B.
+6. Prototype a `SemanticTypeTable` only in a focused 4B benchmark. Accept it only
    if canonicalization is proven and the combined equality/copy/memory metrics
    improve. If rejected, retain canonical semantic type trees as row payloads
    and record the evidence.
@@ -1446,8 +1544,10 @@ path.
 - Diagnostic text/order remains exact until the diagnostic step intentionally
   changes rendering.
 - Typed-node visits and solver-state retained bytes decrease.
-- The type-table candidate is either accepted with multi-metric evidence or
-  removed completely with results retained.
+- 4A is complete when validated bodies are authoritative and its traversal,
+  lifetime, and latency guards pass; it does not wait for 4B.
+- If attempted, the 4B type-table candidate is either accepted with
+  multi-metric evidence or removed completely with results retained.
 
 ## Step 5: Publish Occurrence And Semantic Edge Tables
 
@@ -1457,6 +1557,12 @@ Definitions, references, calls, field selections, and type uses are currently
 available in typed nodes, but tooling reconstructs many of them by traversing
 complete typed programs. This duplicates work and leaves coverage incomplete
 for locals, parameters, methods, type parameters, and foreign declarations.
+
+This checkpoint has two acceptance cuts. **5A** publishes the call/dependency
+edges that compilation already needs, directly from accepted validated bodies;
+it does not wait for module-wide source occurrences or LSP coverage. **5B**
+publishes source occurrences only for requested analysis products and proves
+their coverage. Public tool migration belongs to Step 8, not to 5A.
 
 ### Target contract
 
@@ -1533,23 +1639,22 @@ integer.
 
 ### Implementation strategy
 
-1. Define exact coverage requirements for compile, lint, and LSP products.
-2. Publish edges when resolution/typechecking establishes them, or during one
-   accepted-body traversal shared by all consumers.
-3. Preserve source order independently from reverse-reference indexes.
-4. Represent partial module/workspace coverage explicitly.
-5. Add local/parameter/method/type-parameter identities before claiming those
-   categories are complete.
-6. Give body locals one body-owned issuing table and validate every local
-   occurrence against its owning callable/table. Preserve the existing checked
-   type-parameter identity variants through one explicit umbrella union.
-7. Migrate LSP semantic-index construction, lint, CTFE dependency discovery,
-   and impact analysis one consumer at a time.
-8. Delete `semantic_program` reconstruction traversals after all required
-   categories move.
-9. Build source-occurrence tables only for requested analysis modes when
-   compile-only retention would increase RSS without a consumer. Always-required
-   call/dependency edges may remain in the accepted compilation product.
+1. For 5A, inventory CTFE/Core dependency scans, publish exact call/dependency
+   edges at resolution or in one accepted-body traversal, migrate the first
+   compiler consumer, and delete its old walk in the same packet.
+2. Keep 5A's edges in the accepted compilation product only when a named
+   compile-time consumer needs them; measure publication against scans removed.
+3. For 5B, define exact lint/LSP category and partial-coverage requirements.
+   Preserve source order independently from optional reverse-reference indexes.
+4. Add local/parameter/method/type-parameter identities before claiming those
+   categories are complete. Give body locals one body-owned issuing table and
+   validate every local occurrence against its owning callable/table. Preserve
+   the checked type-parameter identity variants through one umbrella union.
+5. Build source-occurrence tables only for requested analysis modes. Give one
+   compiler-owned query or analysis consumer its first row and delete its old
+   reconstruction walk; Step 8 migrates the remaining public tools.
+6. Delete all remaining `semantic_program` reconstruction traversals as their
+   consumers move; do not make 5A wait for 5B's category completeness.
 
 ### Fast feedback
 
@@ -1574,12 +1679,17 @@ Core index construction.
 
 ### Acceptance criteria
 
+- For 5A, CTFE or Core consumes exact accepted call/dependency edges and its
+  superseded body walk is gone; compile-only publication latency, allocations,
+  instructions, and peak RSS pass the scorecard without source occurrences.
+- For 5B, source occurrences are analysis-only and have a first real query
+  consumer; Step 8 owns migration of the remaining LSP/lint capabilities.
 - Every advertised occurrence category has exact identity and documented
   completeness semantics.
 - Local IDs validate against one body-owned issuing table, and every
   type-parameter occurrence retains its original checked identity domain.
-- LSP and lint do not rematch names or traverse `TypedProgram` to reconstruct
-  migrated occurrences.
+- After Step 8 migrates them, LSP and lint do not rematch names or traverse
+  `TypedProgram` to reconstruct occurrences.
 - Reference/call/type-use ordering is deterministic.
 - Partial coverage cannot be returned as an ordinary complete empty result.
 - Query latency, nodes visited, and allocations improve materially.
@@ -1595,6 +1705,15 @@ reduces failures to a message and optional span. Rendering early loses exact
 definition ownership, related declarations, causal relationships, and safe
 edits. The normalized semantic product can retain those relations without
 forcing diagnostic consumers to rediscover them.
+
+**6A** is the required diagnostic table and typed payload coverage for the
+recoverable/analysis product and final broad-graph retirement. It may migrate body-local diagnostic
+families after Step 4 while import/visibility families await their exact Step
+2e facts. **6B** is optional causal, candidate-explanation, related-span, and
+edit provenance. Neither 6A nor 6B holds up the successful compile-only
+Step 7B projection: failures still use the existing recoverable product until
+6A and Step 7C replace it. Neither cut may weaken error ordering or hide
+independent root failures.
 
 ### Target contract
 
@@ -1651,10 +1770,12 @@ compilation need not retain a complete candidate trace.
    changing human rendering.
 3. Attach exact definition/module identities at the point of failure.
 4. Aggregate body-local diagnostics in stable source order.
-5. Add causal edges so one root failure can suppress or group consequences.
-6. Add related spans and machine edits only when the compiler proves them.
-7. Materialize human, JSON, LSP, and later SARIF forms at output boundaries.
-8. Store optional call/trait/import candidate explanations only for analysis
+5. Complete 6A's required diagnostic families before Step 7C constructs a
+   recoverable/analysis product without the broad graph. Materialize
+   human, JSON, and LSP forms at output boundaries.
+6. In 6B, add causal edges, related spans, and machine edits only when the
+   compiler proves them; add later SARIF rendering as a separate consumer.
+7. Store optional call/trait/import candidate explanations only for analysis
    requests or actionable failures.
 
 ### Fast feedback
@@ -1681,6 +1802,11 @@ must not inflate successful compile-only snapshots.
 
 ### Acceptance criteria
 
+- For 6A, every diagnostic needed after broad-graph-free recoverable analysis has
+  a typed row and one output-boundary renderer; no eager message copy remains
+  in its replaced path. Successful compile-only latency and memory pass guards.
+- For 6B, explanations/edits are requested or failure-only payloads and do not
+  increase successful compile-only retention.
 - Every migrated diagnostic has a stable code, phase, severity, and defensible
   primary span, or an explicit unlocated compilation owner when no source
   location exists. Rendering never invents a range.
@@ -1703,8 +1829,22 @@ two complete typed-program forms, imports, diagnostics, CTFE completion, and
 codegen concerns. It is the largest remaining barrier to precise lifetimes and
 type-enforced phase boundaries.
 
-This step is the Typechecking Phase 10 convergence point. It begins only after
-the preceding accepted body and validation products are authoritative.
+The current pipeline already projects a narrower `CoreLoweringInput` from
+`TypecheckedGraph` before Core preparation. Step 7B must prove an additional
+win: successful compilation no longer needs the broad graph as its accepted
+handoff product, and source/recovery state reaches an earlier measured last-use
+boundary. Do not count the existing Core input projection as a new deletion.
+
+This is the Typechecking Phase 10 convergence point, but it is not one atomic
+cutover. **7A** replaces the duplicate typed-program CTFE carrier as soon as
+validated body outcomes are authoritative. **7B** constructs a narrow
+codegen-ready product for successful compile-only paths and releases their
+recovery/analysis state before Core. Its entry audit names exact Core inputs;
+only a missing input is gated on its Step 2, 5A, or 6A owner. Error recovery
+and analysis may still use the broad compatibility graph. **7C** publishes
+their final separate products and deletes that graph only after check/lint/LSP
+and every other consumer have moved. The early cuts must not label a
+compatibility graph as a new accepted authority.
 
 ### Target contract
 
@@ -1735,30 +1875,41 @@ private record CodegenReadyCompilationRep {
 CTFE results are keyed overrides or materialization outcomes, not a second
 complete typed program. The codegen-ready constructor proves all required
 headers, bodies, validation, CTFE, imports, and generated-ID domains are valid.
-It consumes or borrows `AcceptedSemanticCompilation` only while constructing
+It consumes or borrows accepted phase authorities only while constructing
 the narrow codegen projections; it does not retain the full accepted catalog,
 analysis edges, diagnostic product, or source-oriented body product. Compile-only
-execution can therefore release the accepted/recovery parent before Core.
+execution can therefore release those parents before Core. The final opaque
+`AcceptedSemanticCompilation` wrapper is a 7C product, not a 7B prerequisite.
 
 ### Implementation strategy
 
-1. Add compile-time-negative tests proving recovery products cannot call Core.
-2. Assemble recoverable and accepted products from existing phase products.
-3. Replace `semantic_program`/`typed_program` duplication with one source-faithful
-   body table plus CTFE result/override rows.
-4. Migrate `check`, lint, and LSP to recoverable/analysis projections.
-5. Migrate compile/run/test to `CodegenReadyCompilation`.
-6. Construct narrow codegen identity, declaration, and body projections; verify
-   that they do not retain the full accepted parent allocation.
-7. Change Core preparation to accept only the codegen-ready projection.
-8. Release syntax, recovery, occurrence, and analysis-only tables at their last
-   consumer in compile-only mode.
-9. Add a string-retirement audit at accepted publication, codegen-ready
+1. For 7A, prove keyed CTFE results/overrides preserve exact output, then
+   replace `semantic_program`/`typed_program` duplication with one
+   source-faithful validated body table. Delete the redundant complete-program
+   carrier in the same accepted packet; do not retain a second table-shaped
+   copy while waiting for 7B. If analysis still needs a rich compatibility
+   view, build or retain it only on the analysis path and measure that path
+   separately; successful compile-only must not pay for both full programs.
+2. For 7B, audit every Core input and add compile-time-negative tests proving
+   recovery products cannot call Core. Construct the successful codegen-ready
+   product from existing accepted phase authorities; do not require a new
+   all-diagnostic or all-occurrence product merely to compile valid code.
+3. Construct narrow codegen identity, declaration, and body projections;
+   verify that they do not retain the full accepted parent allocation. Migrate
+   successful compile/run/test paths to `CodegenReadyCompilation` and make Core
+   preparation accept only that projection. Delete raw-`TypedProgram` Core
+   admission and error-list validity checks at this boundary.
+4. Release syntax, recovery, occurrence, and analysis-only tables at their
+   last compile-only consumer. Verify actual release with peak and live-byte
+   checkpoints, not only product type declarations.
+5. Add a string-retirement audit at accepted publication, codegen-ready
    construction, Core entry, and backend entry. Move literals and exact
    external spellings into distinct cold tables; derive ordinary C-safe symbols
    from IDs in Stage 10.
-10. Delete `TypecheckedModule`, `TypecheckedGraph`, CTFE Booleans, error-list
-   validity checks, and raw-`TypedProgram` Core admission once consumers move.
+6. For 7C, assemble the final recoverable and accepted products and migrate
+   check/lint/LSP and any remaining consumer to their projections through
+   Step 8. Delete `TypecheckedModule`, `TypecheckedGraph`, and remaining CTFE
+   Booleans only when no reader remains.
 
 ### Fast feedback
 
@@ -1786,17 +1937,29 @@ graph accidentally.
 
 ### Acceptance criteria
 
+- 7A deletes a duplicate complete typed-program carrier, keys CTFE results by
+  exact identity, and improves the declared compiler-latency primary metric
+  without a resource-guard regression.
+- 7B admits successful compile/run/test through a narrow codegen-ready product, proves
+  compile-only recovery/analysis release, and enables Step 9 without Step 8.
+- 7C removes the remaining broad graph only after all analysis consumers have
+  migrated; it is not a prerequisite for Step 9.
 - Core accepts only `CodegenReadyCompilation` or a narrower opaque projection
   constructible solely from it.
-- Recoverable and accepted modules cannot be confused by flags or empty lists.
+- By 7C, recoverable and accepted modules cannot be confused by flags or empty
+  lists.
 - CTFE results are attached by exact IDs without a duplicate complete program.
 - The codegen-ready product owns only the identity/declaration/body columns Core
   requires and does not keep the full accepted semantic or analysis product
   alive.
-- The broad `TypecheckedGraph` and raw typed-program Core entry are deleted.
-- Check, lint, LSP, compile, run, and test use products matching their needs.
-- Compile-only Core entry retains no source buffers, parser/recovery trees,
-  diagnostic text, display names, module-path keys, or canonical-name keys.
+- By 7C, the broad `TypecheckedGraph` is deleted; raw typed-program Core entry
+  is already deleted by 7B.
+- By 7C, check, lint, LSP, compile, run, and test use products matching their
+  needs.
+- By 7B, the successful codegen-ready product retains no source buffers,
+  parser/recovery trees, diagnostic text, or display names. Any narrow
+  module-path or canonical-name compatibility keys projected for Core are
+  counted and retired by Step 9; they must not keep the broad graph alive.
   Runtime literals and exact external names survive only through typed handles
   and cold payload tables; requested debug sources use a separate projection.
 - Boundary counters demonstrate that live source/name string objects and bytes
@@ -1812,6 +1975,12 @@ Tables are an internal ownership model. Humans, agents, and editor features
 need stable semantic operations, not knowledge of private row layouts. The LSP
 already has a semantic query session pattern that can be generalized without
 exposing actor or typechecker state.
+
+This is the analysis/tooling lane. A query can move as soon as its exact
+visibility and occurrence rows exist; it does not wait for Step 9 or final
+graph retirement. Conversely, Step 7C cannot delete the broad graph while a
+tool still reads it. Keep query snapshot construction and compile-only
+retention separate in every measurement.
 
 ### Target contract
 
@@ -1892,6 +2061,10 @@ After the frontend product is normalized and codegen admission is explicit,
 Core can preserve source semantic ownership rather than encoding it in prefixed
 names and rebuilding callable/type/reachability indexes across passes. This is
 the first lower-confidence horizon and requires a fresh pass-by-pass audit.
+
+The admission dependency is Step 7B, not Step 7C or tool migration. Begin with
+the highest measured late-pass reconstruction cost; do not normalize an
+unmeasured relation merely to complete the table shape.
 
 This step normalizes declarations and stable relations first. Existing
 `CoreExpr` trees remain payloads unless a separate arena experiment proves a
@@ -2023,8 +2196,9 @@ The normalized semantic compilation checkpoint is complete when:
 5. definitions, references, calls, type uses, and field selections required by
    advertised tools are authoritative rows/edges rather than reconstructed
    typed-tree facts;
-6. diagnostics retain stable codes, ownership, spans, and causal relations and
-   render at external boundaries;
+6. diagnostics retain stable codes, ownership, and spans; optional compiler-proven
+   causal relations and explanations remain separate, and all text renders at
+   external boundaries;
 7. recoverable, accepted, and codegen-ready compilations are distinct and Core
    accepts only the codegen-ready refinement;
 8. CTFE results attach by exact identity without retaining a second complete

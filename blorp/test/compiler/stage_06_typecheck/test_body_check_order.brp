@@ -9,6 +9,7 @@ import:
 		BodyCheckOutcome(BodyCheckAccepted, BodyCheckRejected),
 		BodyCheckPlan(BodyCheckPlanReady, BodyCheckPlanRejected),
 		BodyImplementationPlanningFailure,
+		BodyOutcomeTableBuild(BodyOutcomeTableAccepted, BodyOutcomeTableRejected),
 		BodySubsetProgramBuild(BodySubsetProgramReady, BodySubsetProgramRejected),
 		MainValidationPolicy(IgnoreMainName),
 		TypedDecl(TypedImplDecl),
@@ -23,9 +24,13 @@ import:
 		body_check_outcome_errors,
 		body_check_outcome_typed_function,
 		body_check_registry_materialize_complete_with_seed,
+		body_check_registry_materialize_complete_with_seed_table,
 		body_check_registry_materialize_subset,
+		body_check_registry_materialize_subset_from_table,
+		body_check_registry_outcome_table,
 		check_body_context,
 		typecheck_program_with_type_header_module_in_body_order,
+		typecheck_program_with_type_header_module_in_body_order_for_policy,
 	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
 		CallableId,
 		callable_id_definition_id,
@@ -66,7 +71,11 @@ private pure func body_context(
 	input: AcceptedTypecheckModule,
 	id: CallableId,
 ) -> BodyCheckContextBuild:
-	accepted_typecheck_module_body_context(input, accepted_typecheck_module_definition_table(input), id)
+	accepted_typecheck_module_body_context(
+		input,
+		accepted_typecheck_module_definition_table(input),
+		id,
+	)
 
 
 private pure func body_context_rejects_foreign_module_callable() -> Option[Bool]:
@@ -559,6 +568,90 @@ pure func test_seeded_materialization_rejects_stale_same_owner_outcome() -> Bool
 	seeded_materialization_rejects_stale_same_owner_outcome().get_or(False)
 
 
+private pure func seeded_mixed_outcomes_keep_source_diagnostics() -> Option[Bool]:
+	input ?= accepted_module(
+		"seeded_mixed",
+		"func first() -> Int: \"wrong\"\nfunc second() -> Int: 2\nfunc third() -> Bool: 3",
+	).to_option()
+	ids ?= accepted_typecheck_module_callable_body_ids(input)
+	first_id ?= ids.get(0)
+	second_id ?= ids.get(1)
+
+	first_context = match body_context(input, first_id):
+		BodyContextReady(context):
+			Some(context)
+		BodyContextRejected(_):
+			None
+
+	second_context = match body_context(input, second_id):
+		BodyContextReady(context):
+			Some(context)
+		BodyContextRejected(_):
+			None
+
+	first ?= first_context
+	second ?= second_context
+	seeded = body_check_registry_materialize_complete_with_seed(
+		accepted_typecheck_module_body_registry(input),
+		[check_body_context(second), check_body_context(first)],
+		IgnoreMainName,
+	)
+
+	table = match (
+		body_check_registry_outcome_table(
+			accepted_typecheck_module_body_registry(input),
+			[check_body_context(second), check_body_context(first)],
+		)
+	):
+		BodyOutcomeTableAccepted(accepted):
+			Some(accepted)
+		BodyOutcomeTableRejected(_):
+			None
+
+	accepted_table ?= table
+	seeded_from_table = body_check_registry_materialize_complete_with_seed_table(
+		accepted_typecheck_module_body_registry(input),
+		accepted_table,
+		IgnoreMainName,
+	)
+	ordinary = typecheck_program_with_type_header_module_in_body_order_for_policy(
+		input,
+		SourceBodyOrder,
+		IgnoreMainName,
+	)
+
+	Some(
+		(
+			seeded.checked_bodies == 1
+			and seeded.reused_bodies == 2
+			and seeded_from_table.checked_bodies == 1
+			and seeded_from_table.reused_bodies == 2
+			and seeded.result.state.errors == ordinary.result.state.errors
+			and seeded_from_table.result.state.errors == ordinary.result.state.errors
+			and seeded.result.state.diagnostics.map(
+				func(
+					diagnostic,
+				): diagnostic.message,
+			) == ordinary.result.state.diagnostics.map(func(diagnostic): diagnostic.message)
+			and seeded_from_table.result.state.diagnostics.map(
+				func(
+					diagnostic,
+				): diagnostic.message,
+			) == ordinary.result.state.diagnostics.map(func(diagnostic): diagnostic.message)
+			and typed_program_to_json(
+				seeded.result.program,
+			).to_string() == typed_program_to_json(ordinary.result.program).to_string()
+			and typed_program_to_json(
+				seeded_from_table.result.program,
+			).to_string() == typed_program_to_json(ordinary.result.program).to_string()
+		),
+	)
+
+
+pure func test_seeded_mixed_outcomes_keep_source_diagnostics() -> Bool:
+	seeded_mixed_outcomes_keep_source_diagnostics().get_or(False)
+
+
 private pure func seeded_materialization_rejects_changed_same_identity_body() -> Option[Bool]:
 	current ?= accepted_module("same", "func current() -> Int: 2").to_option()
 	stale ?= accepted_module("same", "func current() -> Int: 1").to_option()
@@ -631,6 +724,92 @@ pure func test_subset_materialization_rejects_changed_same_identity_body() -> Bo
 	subset_materialization_rejects_changed_same_identity_body().get_or(False)
 
 
+private pure func validated_body_table_rejects_different_plan_consumers() -> Option[Bool]:
+	current ?= accepted_module("same", "func current() -> Int: 2").to_option()
+	stale ?= accepted_module("same", "func current() -> Int: 1").to_option()
+	stale_ids ?= accepted_typecheck_module_callable_body_ids(stale)
+	id ?= stale_ids.get(0)
+
+	context = match body_context(stale, id):
+		BodyContextReady(ready):
+			Some(ready)
+		BodyContextRejected(_):
+			None
+
+	ready ?= context
+
+	table = match body_check_registry_outcome_table(
+		accepted_typecheck_module_body_registry(stale),
+		[check_body_context(ready)],
+	):
+		BodyOutcomeTableAccepted(accepted):
+			Some(accepted)
+		BodyOutcomeTableRejected(_):
+			None
+
+	accepted_table ?= table
+
+	subset_rejects = match body_check_registry_materialize_subset_from_table(
+		accepted_typecheck_module_body_registry(current),
+		accepted_table,
+	):
+		BodySubsetProgramRejected(errors):
+			errors.any(func(error): error.contains("different body plan"))
+		BodySubsetProgramReady(_):
+			False
+
+	seeded = body_check_registry_materialize_complete_with_seed_table(
+		accepted_typecheck_module_body_registry(current),
+		accepted_table,
+		IgnoreMainName,
+	)
+
+	Some(
+		(
+			subset_rejects
+			and seeded.checked_bodies == 0
+			and seeded.reused_bodies == 0
+			and seeded.result.state.errors.any(func(error): error.contains("different body plan"))
+		),
+	)
+
+
+pure func test_validated_body_table_rejects_different_plan_consumers() -> Bool:
+	validated_body_table_rejects_different_plan_consumers().get_or(False)
+
+
+private pure func subset_materialization_rejects_duplicate_body_outcome() -> Option[Bool]:
+	input ?= accepted_module("duplicate_body", "func value() -> Int: 1").to_option()
+	ids ?= accepted_typecheck_module_callable_body_ids(input)
+	id ?= ids.get(0)
+
+	context = match body_context(input, id):
+		BodyContextReady(ready):
+			Some(ready)
+		BodyContextRejected(_):
+			None
+
+	ready ?= context
+	outcome = check_body_context(ready)
+
+	rejected = match (
+		body_check_registry_materialize_subset(
+			accepted_typecheck_module_body_registry(input),
+			[outcome, outcome],
+		)
+	):
+		BodySubsetProgramRejected(errors):
+			errors.any(func(error): error.contains("duplicate body outcome for definition"))
+		BodySubsetProgramReady(_):
+			False
+
+	Some(rejected)
+
+
+pure func test_subset_materialization_rejects_duplicate_body_outcome() -> Bool:
+	subset_materialization_rejects_duplicate_body_outcome().get_or(False)
+
+
 tests: TestSuite = {
 	description = "Independent body checking order and context",
 	tests = [
@@ -697,12 +876,24 @@ tests: TestSuite = {
 			test_seeded_materialization_rejects_stale_same_owner_outcome,
 		),
 		(
+			"seeded accepted and rejected bodies preserve source diagnostics",
+			test_seeded_mixed_outcomes_keep_source_diagnostics,
+		),
+		(
 			"seeded materialization rejects a changed same-identity body",
 			test_seeded_materialization_rejects_changed_same_identity_body,
 		),
 		(
 			"subset materialization rejects a changed same-identity body",
 			test_subset_materialization_rejects_changed_same_identity_body,
+		),
+		(
+			"validated body table rejects consumers from another plan",
+			test_validated_body_table_rejects_different_plan_consumers,
+		),
+		(
+			"subset materialization rejects a duplicate body outcome",
+			test_subset_materialization_rejects_duplicate_body_outcome,
 		),
 	]
 }
