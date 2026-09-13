@@ -19,6 +19,7 @@ import:
 		ParsedStringInterpolationPart(ParsedInterpolationExpr, ParsedInterpolationLiteral),
 	../../../src/compiler/stage_03_parse/source_ast_finalize:
 		FinalizedImportPathRewrite,
+		NestedFunctionHoistWorkProfile,
 		StringInterpolationRawPart(InterpolationExprText, InterpolationLiteralText),
 		finalize_interpolation_program,
 		finalize_nested_functions_program,
@@ -26,12 +27,15 @@ import:
 		finalized_typecheck_program,
 		finalized_typecheck_program_ast,
 		finalized_typecheck_program_rewrite_import_paths,
+		profile_nested_function_hoist_work,
 		split_interpolated_string,
 	../../../src/lib/source: SourceFile, SourceSpan, source_cursor_at, source_file, source_span
 	test: TestSuite
 
 
 DEEP_LOGICAL_TERM_COUNT: Int = 4096
+
+HOIST_WORK_PROFILE_FUNCTION_COUNT: Int = 512
 
 
 pure func source(text: String) -> SourceFile:
@@ -438,6 +442,47 @@ func test_finalize_typecheck_source_program_composes_interpolation_and_hoist() -
 	)
 
 
+pure func independent_function_source(count: Int) -> String:
+	var text: String = ""
+
+	for index in 0..count:
+		text += "func independent_${index}() -> Int:\n\t${index}\n\n"
+
+	text
+
+
+func test_nested_function_hoist_work_profile_skips_empty_hoists() -> Bool:
+	program: ParsedProgram = parse_compiler_source(
+		source(independent_function_source(HOIST_WORK_PROFILE_FUNCTION_COUNT)),
+	)
+	profile: NestedFunctionHoistWorkProfile = profile_nested_function_hoist_work(program)
+
+	(
+		program.diagnostics.length() == 0
+		and profile.left_prefix_elements_copied == 0
+		and profile.hoisted_decl_elements_appended == 0
+		and profile.output_decl_count == HOIST_WORK_PROFILE_FUNCTION_COUNT
+		and profile.diagnostic_checksum == 0
+	)
+
+
+func test_nested_function_hoist_work_profile_tracks_mixed_hoists() -> Bool:
+	program_source: String = "record Box {value: Int}\ntrait BoxTrait:\n\tfunc value(self: Self) -> Int\nfunc outer() -> Int:\n\tfunc helper() -> Int:\n\t\t1\n\thelper()\nprivate func hidden() -> Int:\n\tfunc secret() -> Int:\n\t\t2\n\tsecret()\nimplements BoxTrait for Box:\n\tfunc value(self: Box) -> Int:\n\t\tfunc method_helper() -> Int:\n\t\t\t3\n\t\tmethod_helper()"
+	program: ParsedProgram = parse_compiler_source(source(program_source))
+	finalized: ParsedProgram = finalize_nested_functions_program(program)
+	profile: NestedFunctionHoistWorkProfile = profile_nested_function_hoist_work(program)
+
+	(
+		program.diagnostics.length() == 0
+		and finalized.diagnostics.length() == 0
+		and finalized.decls.length() == 8
+		and profile.left_prefix_elements_copied == 0
+		and profile.hoisted_decl_elements_appended == 3
+		and profile.output_decl_count == finalized.decls.length()
+		and profile.diagnostic_checksum == 0
+	)
+
+
 func test_finalize_interpolation_program_handles_deep_logical_chain() -> Bool:
 	var expression: String = "\"" + "$" + "{1}\" == \"1\""
 
@@ -619,6 +664,14 @@ tests: TestSuite = {
 		(
 			"finalize typecheck source program composes interpolation and hoist",
 			test_finalize_typecheck_source_program_composes_interpolation_and_hoist,
+		),
+		(
+			"nested function hoist work profile skips empty hoists",
+			test_nested_function_hoist_work_profile_skips_empty_hoists,
+		),
+		(
+			"nested function hoist work profile tracks mixed hoists",
+			test_nested_function_hoist_work_profile_tracks_mixed_hoists,
 		),
 		(
 			"finalize interpolation program handles deep logical chain",
