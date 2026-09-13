@@ -129,7 +129,8 @@ private record ConsumeSpecializeState {
 private record CloneCandidateDiscoveryState {
 	unions: List[CoreUnionDecl],
 	next_def_id: Int,
-	candidates: CloneCandidateCatalog
+	candidates: CloneCandidateCatalog,
+	analysis_state: ConsumeSpecializeState
 }
 
 
@@ -330,6 +331,10 @@ private pure func empty_used_clone_key_index() -> UsedCloneKeyIndex:
 	{arg_indices_by_name_by_def_id = {}}
 
 
+private pure func clone_candidate_catalog_is_empty(catalog: CloneCandidateCatalog) -> Bool:
+	catalog.ordered.length() == 0
+
+
 private pure func append_function_clone_candidate(
 	state: FunctionCandidateAppendState,
 	candidate: CloneCandidate,
@@ -373,11 +378,19 @@ private pure func finish_function_clone_candidates(
 		}
 
 
-private pure func make_state(program: CoreProgram) -> ConsumeSpecializeState:
+private pure func discover_clone_candidates(program: CoreProgram) -> CloneCandidateDiscoveryState:
+	unions: List[CoreUnionDecl] = collect_unions(program)
+	empty_candidates: CloneCandidateCatalog = empty_clone_candidate_catalog()
+	empty_used_keys: UsedCloneKeyIndex = empty_used_clone_key_index()
 	var discovery: CloneCandidateDiscoveryState = {
-		unions = collect_unions(program),
+		unions = unions,
 		next_def_id = core_program_max_declared_definition_id(program) + 1,
-		candidates = empty_clone_candidate_catalog()
+		candidates = empty_candidates,
+		analysis_state = {
+			unions = unions,
+			candidates = empty_candidates,
+			used_clone_keys = empty_used_keys
+		}
 	}
 
 	for decl in program.decls:
@@ -387,6 +400,12 @@ private pure func make_state(program: CoreProgram) -> ConsumeSpecializeState:
 			_:
 				void
 
+	discovery
+
+
+private pure func state_from_discovery(
+	discovery: CloneCandidateDiscoveryState,
+) -> ConsumeSpecializeState:
 	{
 		unions = discovery.unions,
 		candidates = discovery.candidates,
@@ -1454,11 +1473,7 @@ private pure func collect_function_clone_candidates(
 		catalog = state.candidates,
 		ordinals = []
 	}
-	analysis_state: ConsumeSpecializeState = {
-		unions = state.unions,
-		candidates = empty_clone_candidate_catalog(),
-		used_clone_keys = empty_used_clone_key_index()
-	}
+	analysis_state: ConsumeSpecializeState = state.analysis_state
 
 	for param in func_info.params:
 		if function_is_cloneable(analysis_state, arg_index, func_info):
@@ -1838,15 +1853,20 @@ private pure func insert_clones_after_functions(
 
 
 pure func rewrite_program(program: CoreProgram) -> CoreProgram:
-	var state: ConsumeSpecializeState = make_state(program)
-	var rewritten_decls: List[CoreDecl] = []
+	discovery: CloneCandidateDiscoveryState = discover_clone_candidates(program)
 
-	for decl in program.decls:
-		rewritten_decl: CoreDecl = rewrite_decl_body(state, decl)
-		state = collect_used_clone_keys_from_decl(state, rewritten_decl)
-		rewritten_decls = rewritten_decls.append(rewritten_decl)
+	if clone_candidate_catalog_is_empty(discovery.candidates):
+		program
+	else:
+		var state: ConsumeSpecializeState = state_from_discovery(discovery)
+		var rewritten_decls: List[CoreDecl] = []
 
-	{
-		decls = insert_clones_after_functions(state, program.decls, rewritten_decls),
-		foreign_includes = program.foreign_includes
-	}
+		for decl in program.decls:
+			rewritten_decl: CoreDecl = rewrite_decl_body(state, decl)
+			state = collect_used_clone_keys_from_decl(state, rewritten_decl)
+			rewritten_decls = rewritten_decls.append(rewritten_decl)
+
+		{
+			decls = insert_clones_after_functions(state, program.decls, rewritten_decls),
+			foreign_includes = program.foreign_includes
+		}
