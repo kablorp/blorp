@@ -208,6 +208,41 @@ This change should land before relying on string-literal pooling to hide the
 2,049 duplicated error literals. Pooling and match sharing are complementary;
 only this issue removes the duplicated control flow.
 
+## Current measurement artifact
+
+At `644575ed80c30a10b5f9805371719e72fc9bebba`, a focused ordered list-pattern
+fixture confirms the current tree representation still duplicates fallback
+continuations structurally. The retained source probe is
+`blorp/benchmark/compiler/compiler_match_fallback_duplication_probe.brp`.
+
+Direct `compile_match_cases` characterization in
+`blorp/test/compiler/stage_09_core/test_core_match.brp` currently records:
+
+| Ordered list arms | Fallback leaf copies in `CoreSemanticMatchTree` |
+| ---: | ---: |
+| 4 | 24 |
+| 8 | 40,320 |
+
+The desired future assertion is that the same unique fallback body is represented
+once, so the 8-arm count should become `1` after semantic match continuations
+use explicit block/edge identity. Keep the current 24/40,320 characterization
+green until the graph migration lands, then replace it with the sharing
+assertion.
+
+Current-main C-emission reproduction using
+`/Users/keithphilpott/CLionProjects/blorp/bin/blorp` at the same source commit
+reported:
+
+| Ordered list arms | Real/user/sys | Max RSS | Generated C | Fallback helper call sites |
+| ---: | --- | ---: | ---: | ---: |
+| 4 | 0.28s / 0.27s / 0.00s | 48,463,872 bytes | 494 lines / 18,678 bytes | 24 |
+| 8 | 13.65s / 13.55s / 0.08s | 750,534,656 bytes | 334,670 lines / 26,248,898 bytes | 40,320 |
+
+The helper function returning the unique fallback marker is emitted once, but
+calls to it are cloned through failed-test paths. This distinguishes the problem
+from string-literal pooling and confirms the duplication exists before backend
+text emission.
+
 ## Semantic requirements
 
 - Evaluate the scrutinee exactly once, before any decision tests.

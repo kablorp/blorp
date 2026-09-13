@@ -196,6 +196,96 @@ private pure func tree_has_list_spread_binding(tree: CoreSemanticMatchTree, name
 			False
 
 
+private pure func exact_prefix_list_pattern(length: Int) -> CorePattern:
+	var patterns: List[CorePattern] = []
+	var index: Int = 0
+
+	while index < length:
+		patterns = patterns.append(LiteralPattern(IntLiteral(index)))
+		index += 1
+
+	ListPattern(patterns, None)
+
+
+private pure func ordered_list_match_cases(
+	arm_count: Int,
+	fallback_value: Int,
+) -> List[CoreRawMatchCase]:
+	var cases: List[CoreRawMatchCase] = []
+	var index: Int = 0
+
+	while index < arm_count:
+		cases = cases.append(raw_match_case(exact_prefix_list_pattern(index), int_expr(index)))
+		index += 1
+
+	cases.append(raw_match_case(WildcardPattern, int_expr(fallback_value)))
+
+
+private pure func count_semantic_leaf_int_body(
+	tree: CoreSemanticMatchTree,
+	value: Int,
+) -> Int:
+	match tree:
+		SemanticMatchLeaf(_, LiteralExpr(IntLiteral(found), _, _)):
+			if found == value:
+				1
+			else:
+				0
+		SemanticMatchLeaf(_, _):
+			0
+		SemanticMatchFail:
+			0
+		SemanticConstructorMatch(_, cases, fallback):
+			var count: Int = 0
+
+			for match_case in cases:
+				count += count_semantic_leaf_int_body(match_case.body, value)
+
+			match fallback:
+				Some(fallback_tree):
+					count + count_semantic_leaf_int_body(fallback_tree, value)
+				None:
+					count
+		SemanticLiteralMatch(_, cases, fallback):
+			var count: Int = count_semantic_leaf_int_body(fallback, value)
+
+			for match_case in cases:
+				count += count_semantic_leaf_int_body(match_case.body, value)
+
+			count
+		SemanticLengthMatch(_, cases, geq, fallback):
+			var count: Int = 0
+
+			for match_case in cases:
+				count += count_semantic_leaf_int_body(match_case.body, value)
+
+			match geq:
+				Some(geq_case):
+					count += count_semantic_leaf_int_body(geq_case.body, value)
+				None:
+					void
+
+			match fallback:
+				Some(fallback_tree):
+					count + count_semantic_leaf_int_body(fallback_tree, value)
+				None:
+					count
+
+
+private pure func ordered_list_fallback_leaf_count(
+	arm_count: Int,
+	fallback_value: Int,
+) -> Option[Int]:
+	match compile_match_cases(
+		collect_match_constructor_names(empty_program()),
+		ordered_list_match_cases(arm_count, fallback_value),
+	):
+		Some(tree):
+			Some(count_semantic_leaf_int_body(tree, fallback_value))
+		None:
+			None
+
+
 private pure func first_function_body(program: CoreProgram) -> Option[CoreExpr]:
 	match program.decls.get(0):
 		Some(FunctionDecl(function_info)):
@@ -827,6 +917,17 @@ pure func test_compiles_list_tuple_elements() -> Bool:
 			False
 
 
+pure func test_ordered_list_match_current_fallback_duplication_count() -> Bool:
+	match (
+		ordered_list_fallback_leaf_count(4, 9001),
+		ordered_list_fallback_leaf_count(8, 9001),
+	):
+		(Some(small_count), Some(large_count)):
+			small_count == 24 and large_count == 40320
+		_:
+			False
+
+
 pure func test_omits_unused_list_spread_binding() -> Bool:
 	result = compile_match_cases(collect_match_constructor_names(empty_program()), [raw_match_case(
 				ListPattern([NamePattern("head")], Some(NamePattern("rest"))),
@@ -1030,6 +1131,10 @@ tests: TestSuite = {
 		("compiles list literal elements", test_compiles_list_literal_elements),
 		("compiles list constructor elements", test_compiles_list_constructor_elements),
 		("compiles list tuple elements", test_compiles_list_tuple_elements),
+		(
+			"ordered list match current fallback duplication count",
+			test_ordered_list_match_current_fallback_duplication_count,
+		),
 		("omits unused list spread binding", test_omits_unused_list_spread_binding),
 		("preserves used list spread binding", test_preserves_used_list_spread_binding),
 		("omits list spread shadowed by let body", test_omits_list_spread_shadowed_by_let_body),
