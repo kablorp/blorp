@@ -1,6 +1,21 @@
 # Index Consume-Specialization Clone Candidates
 
-**Status:** Ready
+**Status:** Initial index implemented on main; full acceptance remains open
+
+The accepted implementation improves direct-pass latency and preserves Core
+output, but the measured 512-candidate fixture increased allocation count by
+11.2%, above the 2% target below. Its zero-candidate fast path also improved.
+This tradeoff was accepted for the initial change, not waived as a criterion
+for closing this issue. The combined tree's compiler-self C-emission improved,
+but that comparison includes an independent typechecking change and does not
+attribute the gain to this pass. The 1,024-candidate /
+1,024-call stress case, peak-memory gate, and allocation reduction remain
+follow-up work. See `benchmarks/results/compiler_optimization_round2_2026-09-13.md`
+for the paired measurements and decision.
+
+The design and checklist below record the original proposal and its remaining
+full-acceptance gates. References to flat-list scans describe the pre-index
+baseline, not current `main`.
 
 **Kind:** Pass-local late-Core latency and state-model cleanup
 
@@ -28,7 +43,8 @@ lowering and Perceus. It currently:
 4. traverses rewritten expressions to discover which clones were used; and
 5. inserts used clones immediately after their original function.
 
-`ConsumeSpecializeState` stores all candidates and used keys as lists:
+Before the initial index landed, `ConsumeSpecializeState` stored all candidates
+and used keys as lists:
 
 ```blorp
 private record ConsumeSpecializeState {

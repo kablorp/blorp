@@ -1,6 +1,18 @@
 # Index Core-Preparation Declarations
 
-**Status:** Ready; field-ordering dependency was rejected after measurement
+**Status:** Index prototype rejected; revised admission experiment required
+
+The September 2026 prototype removed modeled declaration-scan work but did not
+improve the production pass. With 1,024 unrelated declarations and 128 queries
+of each kind, paired median latency moved from 36,918µs to 37,239µs (+0.87%)
+over five pairs, without a meaningful allocation improvement. Do not repeat
+the full unconditional index described below as a ready implementation plan.
+The next bounded experiment should measure actual query density and index-build
+cost on compiler-self and small-program inputs, then test a query-gated or
+lazy index against the same direct-pass benchmark. Admit another production
+attempt only if the representative workload improves without a zero-query
+regression; preserve the identity and ordering constraints below. See
+`benchmarks/results/compiler_optimization_round2_2026-09-13.md` for the decision.
 
 **Kind:** Pass-local late-Core latency and API-precision improvement
 
