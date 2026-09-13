@@ -208,6 +208,17 @@ future import builder a precise input, but still retains no candidate/outcome
 log and performs per-import immutable-view publication. The builder must next
 represent symbol, alias, and local outcomes (including conflicts) in source
 order and replace, not duplicate, the growing graph inventories.
+The next deletion removes the second graph selective-name inventory:
+`BoundNameOccupancy` owns exact current-name payloads and `import_bindings`
+owns accepted source order. `module_view_imported_names` now projects an
+ordered compatibility list only at named boundaries; header annotation
+resolution uses keyed `module_view_find_imported_name` directly, and accepted
+type-alias installation scans the binding log without building that list.
+Standalone source bindings retain their own list. This reduces direct-width
+admission work but still leaves per-candidate view publication and no rejected
+candidate provenance. Before removing more compatibility storage, measure
+actual selective-import fan-out through the accepted graph, not just the
+qualified-only accepted-stage fixture.
 
 ### C. Accepted enrichment and ordinary resolution
 

@@ -316,6 +316,51 @@ candidate graph inventories only when the owner can publish one immutable
 view with unchanged diagnostics. Do not retain a second full event list
 beside `import_bindings`.
 
+## Second ordered-inventory deletion: graph selective names
+
+Graph selective registration also appended each admitted name to both
+`imported_names` and `import_bindings`. The graph list is now deleted at
+admission: keyed `BoundNameOccupancy` owns the exact current-name payload,
+and the binding log owns source order. `module_view_imported_names` reconstructs
+an ordered list only for compatibility readers; standalone mode retains its
+existing list. Header annotation canonicalization now resolves a graph import
+by exact keyed name instead of constructing and scanning that list for each
+type. A graph fixture checks interleaved alias, definition-selective, and
+trait-method-selective rows; earlier-view snapshots and ordered projection
+remain stable, including module path and source-name payloads. Accepted
+type-alias installation scans the binding log without materializing the
+full graph list for each header. The structural test rejects restoring the
+graph append or the hot annotation list projection.
+
+The matched direct-width worker used one compiler executable and 100 iterations
+at each width. It verifies identical bound rows, accepted bindings, duplicate
+decisions, query hits, checksum, and one retained object/96 live bytes:
+
+| Aliases / selectives / locals | Before allocations | Candidate allocations |
+| --- | ---: | ---: |
+| 80 / 80 / 64 | 157,201 | 149,201 |
+| 320 / 320 / 256 | 627,601 | 595,601 |
+
+The 5.1% allocation reduction is deterministic for these workloads. One
+wide native pair retired 4,766,275,026 → 4,522,872,709 instructions (about
+5.1% fewer); a second pair was within 0.1% of those values. The retained
+worker executable shrank 32 bytes (1,913,120 → 1,913,088). A 32-module
+accepted-stage guard kept its checksum and retained objects, with allocations
+265,702 → 265,735 (+0.012%). That fixture's source uses qualified imports,
+not selective fan-out, so it does **not** validate the compatibility projection
+cost or prove a production latency win. The bound-stage allocation count
+remained 101,427 for the same reason.
+
+Peak process memory remains an investigation item: three wide process pairs
+put the baseline at 2.327–2.376 MB and candidate at 2.376–2.507 MB, with
+overlapping ranges but candidate medians above the roadmap's 1% investigation
+threshold. The binary's text/data segment sizes and net retained objects are
+unchanged or lower, so these process-level samples do not identify a retained
+table regression; they also do not prove the increase is noise. Do not close
+Cut A's combined resource gate on this packet. A narrow production fixture
+with real selective imports and an accepted-graph handoff is the next needed
+check before deleting another compatibility reader or claiming a peak win.
+
 ## Acceptance and next check
 
 - [x] Retained direct fixture varies all named workload dimensions and
@@ -346,6 +391,11 @@ beside `import_bindings`.
   preceding candidate. The changed-owner gate passes (7 production sources,
   13 suites, 2 special checks), and independent review has no actionable
   finding. This does not close Cut B or Cut A's resource gate.
+- [x] Delete the duplicate graph selective-name append, preserve ordered
+  compatibility projection and keyed annotation resolution, and verify the
+  direct-width allocation/instruction reduction. Peak-memory and real
+  selective-import accepted-stage guards remain open, so this is not Cut B
+  completion.
 - [ ] Extend the phase-correct batch construction owner through import
   admission with Cut B candidate
   provenance, remove superseded inventories, and show a strict majority of

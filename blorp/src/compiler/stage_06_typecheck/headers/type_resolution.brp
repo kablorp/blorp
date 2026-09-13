@@ -5,10 +5,18 @@
 -- import aliases independently.
 import:
 	../../stage_03_parse/parsed_ast: ParsedTypeExpr
+	../modules/import_binding:
+		ImportBinding(
+			GraphSelectiveDefinitionBinding,
+			GraphSelectiveTraitMethodBinding,
+			StandaloneSelectiveDefinitionBinding,
+		)
 	../modules/module_view:
 		ImportedNameBinding,
+		ModuleView,
 		module_view_accepted_alias_authority,
-		module_view_imported_names,
+		module_view_find_imported_name,
+		module_view_import_bindings,
 	../state:
 		TypeHomeIndex,
 		TypecheckState,
@@ -46,8 +54,8 @@ pure func canonical_annotation_type(state: TypecheckState, typ: SemanticType) ->
 		state.module_view,
 		typ,
 	)
-	imported = resolve_imported_type_aliases_from_bindings(
-		module_view_imported_names(state.module_view),
+	imported = resolve_imported_type_aliases_from_view(
+		state.module_view,
 		state.type_homes,
 		qualified,
 	)
@@ -88,28 +96,42 @@ pure func canonical_return_type(
 	)
 
 
-private pure func imported_type_name_from_bindings_if_changed(
-	imported_names: List[ImportedNameBinding],
+private union ImportedTypeAliasLookup:
+	ImportedTypeAliasFromBindings(List[ImportedNameBinding])
+	ImportedTypeAliasFromView(ModuleView)
+
+
+private pure func imported_type_name_from_lookup_if_changed(
+	lookup: ImportedTypeAliasLookup,
 	type_homes: TypeHomeIndex,
 	name: String,
 ) -> Option[String]:
-	var result: Option[String] = None
-
-	for binding in imported_names:
-		if binding.local_name == name:
-			match type_home_index_imported_module_path(type_homes, name):
-				Some(module_path):
-					result = Some(canonical_module_type_name(module_path, binding.original_name))
+	match lookup:
+		ImportedTypeAliasFromBindings(imported_names):
+			var result: Option[String] = None
+			for binding in imported_names:
+				if binding.local_name == name:
+					match type_home_index_imported_module_path(type_homes, name):
+						Some(module_path):
+							result = Some(canonical_module_type_name(module_path, binding.original_name))
+						None:
+							void
+					break
+			result
+		ImportedTypeAliasFromView(view):
+			match module_view_find_imported_name(view, name):
+				Some(imported_name):
+					match type_home_index_imported_module_path(type_homes, name):
+						Some(module_path):
+							Some(canonical_module_type_name(module_path, imported_name.original_name))
+						None:
+							None
 				None:
-					void
-
-			break
-
-	result
+					None
 
 
-private pure func resolve_imported_type_alias_list_from_bindings_if_changed(
-	imported_names: List[ImportedNameBinding],
+private pure func resolve_imported_type_alias_list_if_changed(
+	lookup: ImportedTypeAliasLookup,
 	type_homes: TypeHomeIndex,
 	types: List[SemanticType],
 ) -> Option[List[SemanticType]]:
@@ -118,8 +140,8 @@ private pure func resolve_imported_type_alias_list_from_bindings_if_changed(
 	var index: Int = 0
 
 	for typ in types:
-		match resolve_imported_type_aliases_from_bindings_if_changed(
-			imported_names,
+		match resolve_imported_type_aliases_if_changed(
+			lookup,
 			type_homes,
 			typ,
 		):
@@ -137,20 +159,20 @@ private pure func resolve_imported_type_alias_list_from_bindings_if_changed(
 		None
 
 
-private pure func resolve_imported_type_aliases_from_bindings_if_changed(
-	imported_names: List[ImportedNameBinding],
+private pure func resolve_imported_type_aliases_if_changed(
+	lookup: ImportedTypeAliasLookup,
 	type_homes: TypeHomeIndex,
 	typ: SemanticType,
 ) -> Option[SemanticType]:
 	match typ:
 		SemanticNamedType(name, args):
-			name_result = imported_type_name_from_bindings_if_changed(
-				imported_names,
+			name_result = imported_type_name_from_lookup_if_changed(
+				lookup,
 				type_homes,
 				name,
 			)
-			args_result = resolve_imported_type_alias_list_from_bindings_if_changed(
-				imported_names,
+			args_result = resolve_imported_type_alias_list_if_changed(
+				lookup,
 				type_homes,
 				args,
 			)
@@ -160,13 +182,13 @@ private pure func resolve_imported_type_aliases_from_bindings_if_changed(
 			else:
 				None
 		SemanticArrayType(element, dims):
-			element_result = resolve_imported_type_aliases_from_bindings_if_changed(
-				imported_names,
+			element_result = resolve_imported_type_aliases_if_changed(
+				lookup,
 				type_homes,
 				element,
 			)
-			dims_result = resolve_imported_type_alias_list_from_bindings_if_changed(
-				imported_names,
+			dims_result = resolve_imported_type_alias_list_if_changed(
+				lookup,
 				type_homes,
 				dims,
 			)
@@ -176,13 +198,13 @@ private pure func resolve_imported_type_aliases_from_bindings_if_changed(
 			else:
 				None
 		SemanticFunctionType(is_pure, params, return_type):
-			params_result = resolve_imported_type_alias_list_from_bindings_if_changed(
-				imported_names,
+			params_result = resolve_imported_type_alias_list_if_changed(
+				lookup,
 				type_homes,
 				params,
 			)
-			return_result = resolve_imported_type_aliases_from_bindings_if_changed(
-				imported_names,
+			return_result = resolve_imported_type_aliases_if_changed(
+				lookup,
 				type_homes,
 				return_type,
 			)
@@ -198,8 +220,8 @@ private pure func resolve_imported_type_aliases_from_bindings_if_changed(
 			else:
 				None
 		SemanticTupleType(elements):
-			match resolve_imported_type_alias_list_from_bindings_if_changed(
-				imported_names,
+			match resolve_imported_type_alias_list_if_changed(
+				lookup,
 				type_homes,
 				elements,
 			):
@@ -208,8 +230,8 @@ private pure func resolve_imported_type_aliases_from_bindings_if_changed(
 				None:
 					None
 		SemanticRangeType(inner):
-			match resolve_imported_type_aliases_from_bindings_if_changed(
-				imported_names,
+			match resolve_imported_type_aliases_if_changed(
+				lookup,
 				type_homes,
 				inner,
 			):
@@ -218,13 +240,13 @@ private pure func resolve_imported_type_aliases_from_bindings_if_changed(
 				None:
 					None
 		SemanticDimOpType(op, left, right):
-			left_result = resolve_imported_type_aliases_from_bindings_if_changed(
-				imported_names,
+			left_result = resolve_imported_type_aliases_if_changed(
+				lookup,
 				type_homes,
 				left,
 			)
-			right_result = resolve_imported_type_aliases_from_bindings_if_changed(
-				imported_names,
+			right_result = resolve_imported_type_aliases_if_changed(
+				lookup,
 				type_homes,
 				right,
 			)
@@ -245,16 +267,21 @@ private pure func resolve_imported_type_aliases_from_bindings_if_changed(
 			None
 
 
-pure func resolve_imported_type_aliases_from_bindings(
-	imported_names: List[ImportedNameBinding],
+private pure func resolve_imported_type_aliases_with_lookup(
+	lookup: ImportedTypeAliasLookup,
 	type_homes: TypeHomeIndex,
 	typ: SemanticType,
 ) -> SemanticType:
-	if imported_names.is_empty() or type_home_index_is_empty(type_homes):
+	no_bindings = match lookup:
+		ImportedTypeAliasFromBindings(imported_names):
+			imported_names.is_empty()
+		ImportedTypeAliasFromView(_):
+			False
+	if no_bindings or type_home_index_is_empty(type_homes):
 		typ
 	else:
-		match resolve_imported_type_aliases_from_bindings_if_changed(
-			imported_names,
+		match resolve_imported_type_aliases_if_changed(
+			lookup,
 			type_homes,
 			typ,
 		):
@@ -264,12 +291,36 @@ pure func resolve_imported_type_aliases_from_bindings(
 				typ
 
 
+pure func resolve_imported_type_aliases_from_bindings(
+	imported_names: List[ImportedNameBinding],
+	type_homes: TypeHomeIndex,
+	typ: SemanticType,
+) -> SemanticType:
+	resolve_imported_type_aliases_with_lookup(
+		ImportedTypeAliasFromBindings(imported_names),
+		type_homes,
+		typ,
+	)
+
+
+private pure func resolve_imported_type_aliases_from_view(
+	view: ModuleView,
+	type_homes: TypeHomeIndex,
+	typ: SemanticType,
+) -> SemanticType:
+	resolve_imported_type_aliases_with_lookup(
+		ImportedTypeAliasFromView(view),
+		type_homes,
+		typ,
+	)
+
+
 private pure func resolve_imported_type_aliases(
 	import_state: TypecheckState,
 	typ: SemanticType,
 ) -> SemanticType:
-	resolve_imported_type_aliases_from_bindings(
-		module_view_imported_names(import_state.module_view),
+	resolve_imported_type_aliases_from_view(
+		import_state.module_view,
 		import_state.type_homes,
 		typ,
 	)
@@ -322,15 +373,26 @@ pure func imported_function_annotation_type(
 
 
 private pure func imported_type_alias_names(
-	imported_names: List[ImportedNameBinding],
+	view: ModuleView,
 	module_path: String,
 	original_name: String,
 ) -> List[String]:
 	var names: List[String] = []
 
-	for binding in imported_names:
-		if binding.module_path == module_path and binding.original_name == original_name:
-			names = names.append(binding.local_name)
+	for binding in module_view_import_bindings(view):
+		match binding:
+			GraphSelectiveDefinitionBinding(local_name, _, _) | GraphSelectiveTraitMethodBinding(local_name, _, _, _):
+				match module_view_find_imported_name(view, local_name):
+					Some(imported_name):
+						if imported_name.module_path == module_path and imported_name.original_name == original_name:
+							names = names.append(local_name)
+					None:
+						void
+			StandaloneSelectiveDefinitionBinding(local_name, imported_path, source_name):
+				if imported_path == module_path and source_name == original_name:
+					names = names.append(local_name)
+			_:
+				void
 
 	names
 
@@ -345,7 +407,7 @@ pure func add_imported_accepted_type_aliases(
 	var next = state
 
 	for alias_name in imported_type_alias_names(
-		module_view_imported_names(state.module_view),
+		state.module_view,
 		module_path,
 		original_name,
 	):

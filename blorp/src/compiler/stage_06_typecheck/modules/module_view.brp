@@ -111,6 +111,8 @@ private record ModuleViewRep {
 	graph_visibility: Option[BoundVisibility],
 	standalone_module_aliases_by_local_name: Dict[String, String],
 	import_binding_domain: ImportBindingDomain,
+	-- Graph selective names live in bound occupancy and the ordered binding
+	-- log. Only standalone compatibility keeps this second source-facing list.
 	imported_names: List[ImportedNameBinding],
 	standalone_imported_names_by_local_name: Dict[String, ImportedNameBinding],
 	imported_constructors: List[ImportedConstructorBinding],
@@ -367,8 +369,33 @@ pure func module_view_module_alias_count(view: ModuleView) -> Int:
 			0
 
 
+-- Ordered graph projection is intentionally confined to compatibility
+-- readers. Ordinary graph name resolution must use keyed occupancy instead.
+private pure func graph_imported_names_from_bindings(
+	view: ModuleView,
+	bindings: List[ImportBinding],
+) -> List[ImportedNameBinding]:
+	var names: List[ImportedNameBinding] = []
+	for binding in bindings:
+		match binding:
+			GraphSelectiveDefinitionBinding(local_name, _, _) | GraphSelectiveTraitMethodBinding(local_name, _, _, _):
+				match module_view_find_imported_name(view, local_name):
+					Some(name):
+						names = names.append(name)
+					None:
+						void
+			_:
+				void
+	names
+
+
 pure func module_view_imported_names(view: ModuleView) -> List[ImportedNameBinding]:
-	module_view_rep(view).imported_names
+	representation = module_view_rep(view)
+	match representation.graph_visibility:
+		Some(_):
+			graph_imported_names_from_bindings(view, representation.import_bindings)
+		None:
+			representation.imported_names
 
 
 pure func module_view_imported_constructors(view: ModuleView) -> List[ImportedConstructorBinding]:
@@ -877,9 +904,14 @@ private pure func module_view_finish_add_selective_name(
 	import_binding: ImportBinding,
 	domain: ImportBindingDomain,
 ) -> SelectiveNameRegistration:
+	standalone_imported_names = match domain:
+		StandaloneImportBindings:
+			representation.imported_names.append(binding)
+		GraphImportBindings | NoImportBindings:
+			representation.imported_names
 	SelectiveNameAdded(module_view_from_rep({ representation |
 				import_binding_domain = domain,
-				imported_names = representation.imported_names.append(binding),
+				imported_names = standalone_imported_names,
 				import_bindings = representation.import_bindings.append(import_binding)
 			}))
 

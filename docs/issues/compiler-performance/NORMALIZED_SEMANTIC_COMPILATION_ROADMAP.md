@@ -29,6 +29,8 @@ type resolution queries keyed occupancy for an actual qualified name. Import
 module declarations now have an explicit, immediately applied decision
 (missing, ambiguous, forbidden package, duplicate, or selected), with a
 source-order behavior fixture. Import candidates still publish one view per admission;
+the duplicate graph selective-name list is also removed, with ordered
+compatibility projection from `import_bindings` and keyed annotation lookup.
 Cut B's ordered candidate/outcome owner is not yet implemented.
 These category cuts are groundwork, not completion of the shared visibility
 relation. The finite Step 2e exit sequence and current production-authority

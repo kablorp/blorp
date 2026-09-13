@@ -109,6 +109,29 @@ class DeclarationBoundaryTests(unittest.TestCase):
             self.assertIn(outcome, source)
         self.assertIn("private pure func decide_import_decl(", source)
 
+    def test_graph_selective_names_have_one_ordered_binding_owner(self) -> None:
+        source = MODULE_VIEW.read_text(encoding="utf-8")
+        self.assertIn("private pure func graph_imported_names_from_bindings(", source)
+        self.assertIn("GraphSelectiveDefinitionBinding(local_name, _, _)", source)
+        self.assertIn("GraphSelectiveTraitMethodBinding(local_name, _, _, _)", source)
+        self.assertNotIn(
+            "imported_names = representation.imported_names.append(binding),\n"
+            "\t\t\t\timport_bindings = representation.import_bindings.append(import_binding)",
+            source,
+        )
+
+    def test_annotation_import_lookup_uses_keyed_graph_view(self) -> None:
+        source = (ROOT / "blorp/src/compiler/stage_06_typecheck/headers/type_resolution.brp").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("module_view_find_imported_name(view, name)", source)
+        self.assertIn("resolve_imported_type_aliases_from_view(", source)
+        self.assertNotIn("module_view_imported_names(", source)
+        annotation = source.split("pure func canonical_annotation_type(", 1)[1].split(
+            "pure func canonical_function_annotation_type(", 1
+        )[0]
+        self.assertNotIn("module_view_imported_names(state.module_view)", annotation)
+
     def test_graph_module_view_has_one_scope_issued_occupancy_relation(self) -> None:
         view_source = MODULE_VIEW.read_text(encoding="utf-8")
         name_source = SOURCE_NAME_TABLE.read_text(encoding="utf-8")
