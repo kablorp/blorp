@@ -1,0 +1,349 @@
+-- Deterministic Core programs for isolating runtime-declaration projection.
+-- Fixture construction is separate from execution so profile windows can
+-- contain only project_runtime_program.
+import:
+	../../src/compiler/stage_09_core/ir:
+		CoreDecl(FunctionDecl, ImplDecl),
+		CoreExpr(VoidExpr),
+		CoreFunction,
+		CoreFunctionKind(UserFunction),
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(NamedType, TypeParameterType, VoidType),
+		CoreTypeParam,
+	../../src/compiler/stage_09_core/runtime_projection:
+		project_runtime_program
+	list: list
+
+
+record CompilerRuntimeProjectionProfileConfig {
+	iterations: Int,
+	generic_declarations: Int,
+	function_declarations: Int,
+	impl_declarations: Int,
+	methods_per_impl: Int
+}
+
+
+record CompilerRuntimeProjectionObservation {
+	input_declarations: Int,
+	projected_rows: Int,
+	canonicalization_calls: Int,
+	modeled_legacy_concat_prefix_elements_copied: Int,
+	output_checksum: Int
+}
+
+
+record CompilerRuntimeProjectionProfileResult {
+	observation: CompilerRuntimeProjectionObservation,
+	workload_valid: Bool,
+	error_count: Int
+}
+
+
+private pure func nonnegative_value(value: Int) -> Int:
+	if value > 0:
+		value
+	else:
+		0
+
+
+private pure func positive_value(value: Int, default: Int) -> Int:
+	if value > 0:
+		value
+	else:
+		default
+
+
+private pure func normalized_config(
+	config: CompilerRuntimeProjectionProfileConfig,
+) -> CompilerRuntimeProjectionProfileConfig:
+	{
+		iterations = positive_value(config.iterations, 1),
+		generic_declarations = nonnegative_value(config.generic_declarations),
+		function_declarations = nonnegative_value(config.function_declarations),
+		impl_declarations = nonnegative_value(config.impl_declarations),
+		methods_per_impl = nonnegative_value(config.methods_per_impl)
+	}
+
+
+private pure func runtime_projection_function(
+	name: String,
+	def_id: Int,
+	type_params: List[String],
+) -> CoreFunction:
+	{
+		name = name,
+		source_module = None,
+		type_params = type_params,
+		params = [],
+		return_type = VoidType,
+		body = Some(VoidExpr(VoidType, SyntheticSourceLoc)),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = def_id,
+		loc = SyntheticSourceLoc
+	}
+
+
+private pure func runtime_projection_type_param(index: Int) -> CoreTypeParam:
+	{
+		name = "T${index}",
+		bounds = []
+	}
+
+
+private pure func generic_function_decl(index: Int) -> CoreDecl:
+	FunctionDecl(
+		runtime_projection_function(
+			"runtime_projection_generic_${index}",
+			1000000 + index,
+			["T"],
+		),
+	)
+
+
+private pure func concrete_function_decl(index: Int) -> CoreDecl:
+	FunctionDecl(
+		runtime_projection_function(
+			"runtime_projection_function_${index}",
+			2000000 + index,
+			[],
+		),
+	)
+
+
+private pure func impl_method(impl_index: Int, method_index: Int) -> CoreFunction:
+	runtime_projection_function(
+		"method_${method_index}",
+		3000000 + impl_index * 1000 + method_index,
+		[],
+	)
+
+
+private pure func impl_methods(impl_index: Int, count: Int) -> List[CoreFunction]:
+	var methods: List[CoreFunction] = list(count)
+	var index: Int = 0
+
+	while index < count:
+		methods = methods.append(impl_method(impl_index, index))
+		index += 1
+
+	methods
+
+
+private pure func concrete_impl_decl(impl_index: Int, methods_per_impl: Int) -> CoreDecl:
+	ImplDecl({
+		trait_name = "RuntimeProjectionTrait${impl_index}",
+		for_type = NamedType("RuntimeProjectionType${impl_index}", []),
+		type_params = [],
+		methods = impl_methods(impl_index, methods_per_impl),
+		loc = SyntheticSourceLoc,
+	})
+
+
+private pure func generic_impl_decl(impl_index: Int) -> CoreDecl:
+	ImplDecl({
+		trait_name = "RuntimeProjectionGenericTrait${impl_index}",
+		for_type = TypeParameterType("T${impl_index}"),
+		type_params = [runtime_projection_type_param(impl_index)],
+		methods = [],
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func compiler_runtime_projection_profile_program(
+	config: CompilerRuntimeProjectionProfileConfig,
+) -> CoreProgram:
+	normalized: CompilerRuntimeProjectionProfileConfig = normalized_config(config)
+	capacity: Int = (
+		normalized.generic_declarations
+		+ normalized.function_declarations
+		+ normalized.impl_declarations
+	)
+	var decls: List[CoreDecl] = list(capacity)
+	var index: Int = 0
+
+	while index < normalized.generic_declarations:
+		if index % 2 == 0:
+			decls = decls.append(generic_function_decl(index))
+		else:
+			decls = decls.append(generic_impl_decl(index))
+		index += 1
+
+	index = 0
+	while index < normalized.function_declarations:
+		decls = decls.append(concrete_function_decl(index))
+		index += 1
+
+	index = 0
+	while index < normalized.impl_declarations:
+		decls = decls.append(concrete_impl_decl(index, normalized.methods_per_impl))
+		index += 1
+
+	{
+		decls = decls,
+		foreign_includes = ["runtime_projection_profile.h"]
+	}
+
+
+private pure func projection_decl_checksum(decl: CoreDecl) -> Int:
+	match decl:
+		FunctionDecl(function_info):
+			17 + function_info.name.length() * 31 + function_info.def_id
+		ImplDecl(impl_decl):
+			53 + impl_decl.trait_name.length() * 31 + impl_decl.methods.length()
+		_:
+			0
+
+
+private pure func projection_decls_checksum(decls: List[CoreDecl]) -> Int:
+	var checksum: Int = 0
+	var index: Int = 0
+
+	for decl in decls:
+		checksum = checksum * 131 + projection_decl_checksum(decl) + index
+		index += 1
+
+	checksum
+
+
+private pure func modeled_legacy_concat_prefix_elements_copied(
+	config: CompilerRuntimeProjectionProfileConfig,
+) -> Int:
+	var copied: Int = 0
+	var projected_rows: Int = 0
+	var index: Int = 0
+
+	while index < config.generic_declarations:
+		copied += projected_rows
+		index += 1
+
+	index = 0
+	while index < config.function_declarations:
+		copied += projected_rows
+		projected_rows += 1
+		index += 1
+
+	index = 0
+	while index < config.impl_declarations:
+		copied += projected_rows
+		projected_rows += config.methods_per_impl
+		index += 1
+
+	copied
+
+
+private pure func empty_observation() -> CompilerRuntimeProjectionObservation:
+	{
+		input_declarations = 0,
+		projected_rows = 0,
+		canonicalization_calls = 0,
+		modeled_legacy_concat_prefix_elements_copied = 0,
+		output_checksum = 0
+	}
+
+
+private pure func combine_observations(
+	left: CompilerRuntimeProjectionObservation,
+	right: CompilerRuntimeProjectionObservation,
+) -> CompilerRuntimeProjectionObservation:
+	{
+		input_declarations = left.input_declarations + right.input_declarations,
+		projected_rows = left.projected_rows + right.projected_rows,
+		canonicalization_calls = left.canonicalization_calls + right.canonicalization_calls,
+		modeled_legacy_concat_prefix_elements_copied = (
+			left.modeled_legacy_concat_prefix_elements_copied
+			+ right.modeled_legacy_concat_prefix_elements_copied
+		),
+		output_checksum = left.output_checksum * 131 + right.output_checksum
+	}
+
+
+private pure func expected_projected_rows(
+	config: CompilerRuntimeProjectionProfileConfig,
+) -> Int:
+	(
+		config.function_declarations
+		+ config.impl_declarations * config.methods_per_impl
+	)
+
+
+pure func compiler_runtime_projection_profile_execute(
+	config: CompilerRuntimeProjectionProfileConfig,
+) -> CompilerRuntimeProjectionProfileResult:
+	normalized: CompilerRuntimeProjectionProfileConfig = normalized_config(config)
+	program: CoreProgram = compiler_runtime_projection_profile_program(normalized)
+	compiler_runtime_projection_profile_execute_program(program, normalized)
+
+
+pure func compiler_runtime_projection_profile_execute_program(
+	program: CoreProgram,
+	config: CompilerRuntimeProjectionProfileConfig,
+) -> CompilerRuntimeProjectionProfileResult:
+	normalized: CompilerRuntimeProjectionProfileConfig = normalized_config(config)
+	expected_rows: Int = expected_projected_rows(normalized)
+	modeled_legacy_pressure: Int = modeled_legacy_concat_prefix_elements_copied(normalized)
+	var observation: CompilerRuntimeProjectionObservation = empty_observation()
+	var workload_valid: Bool = True
+	var error_count: Int = 0
+	var index: Int = 0
+
+	while index < normalized.iterations:
+		match project_runtime_program(program):
+			Ok(projected):
+				current: CompilerRuntimeProjectionObservation = {
+					input_declarations = program.decls.length(),
+					projected_rows = projected.decls.length(),
+					canonicalization_calls = projected.decls.length(),
+					modeled_legacy_concat_prefix_elements_copied = modeled_legacy_pressure,
+					output_checksum = projection_decls_checksum(projected.decls),
+				}
+				observation = combine_observations(observation, current)
+				workload_valid = (
+					workload_valid
+					and current.input_declarations == program.decls.length()
+					and current.projected_rows == expected_rows
+					and current.canonicalization_calls == expected_rows
+					and projected.foreign_includes == program.foreign_includes
+				)
+			Err(_):
+				error_count += 1
+				workload_valid = False
+
+		index += 1
+
+	{
+		observation = observation,
+		workload_valid = workload_valid,
+		error_count = error_count
+	}
+
+
+pure func compiler_runtime_projection_profile_observe_projected_program(
+	program: CoreProgram,
+	projected: CoreProgram,
+	config: CompilerRuntimeProjectionProfileConfig,
+) -> CompilerRuntimeProjectionProfileResult:
+	normalized: CompilerRuntimeProjectionProfileConfig = normalized_config(config)
+	expected_rows: Int = expected_projected_rows(normalized)
+	modeled_legacy_pressure: Int = modeled_legacy_concat_prefix_elements_copied(normalized)
+	projected_rows: Int = projected.decls.length()
+	observation: CompilerRuntimeProjectionObservation = {
+		input_declarations = program.decls.length(),
+		projected_rows = projected_rows,
+		canonicalization_calls = projected_rows,
+		modeled_legacy_concat_prefix_elements_copied = modeled_legacy_pressure,
+		output_checksum = projection_decls_checksum(projected.decls),
+	}
+
+	{
+		observation = observation,
+		workload_valid = (
+			observation.input_declarations == program.decls.length()
+			and projected_rows == expected_rows
+			and observation.canonicalization_calls == expected_rows
+			and projected.foreign_includes == program.foreign_includes
+		),
+		error_count = 0
+	}
