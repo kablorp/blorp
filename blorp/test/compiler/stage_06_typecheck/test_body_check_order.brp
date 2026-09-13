@@ -28,6 +28,9 @@ import:
 		body_check_registry_materialize_subset,
 		body_check_registry_materialize_subset_from_table,
 		body_check_registry_outcome_table,
+		body_check_registry_outcome_table_from_indexed_rows,
+		body_outcome_table_count,
+		body_subset_program_decls,
 		check_body_context,
 		typecheck_program_with_type_header_module_in_body_order,
 		typecheck_program_with_type_header_module_in_body_order_for_policy,
@@ -38,6 +41,7 @@ import:
 		callable_ids_equal,
 	../../../src/compiler/stage_06_typecheck/state: typecheck_state_for_origin
 	../../../src/compiler/stage_06_typecheck/typed_ast_json:
+		typed_decl_to_json,
 		typed_function_info_to_json,
 		typed_program_to_json,
 	../typecheck_test_support: finalized_typecheck_program_fixture, typecheck_test_accepted_module
@@ -778,6 +782,189 @@ pure func test_validated_body_table_rejects_different_plan_consumers() -> Bool:
 	validated_body_table_rejects_different_plan_consumers().get_or(False)
 
 
+private pure func indexed_body_table_admission_preserves_validation() -> Option[Bool]:
+	input ?= accepted_module(
+		"incremental",
+		"func first() -> Int: 1\nfunc second() -> Int: 2",
+	).to_option()
+	ids ?= accepted_typecheck_module_callable_body_ids(input)
+	first_id ?= ids.get(0)
+	second_id ?= ids.get(1)
+
+	first = match body_context(input, first_id):
+		BodyContextReady(context):
+			Some(context)
+		BodyContextRejected(_):
+			None
+
+	second = match body_context(input, second_id):
+		BodyContextReady(context):
+			Some(context)
+		BodyContextRejected(_):
+			None
+
+	first_context ?= first
+	second_context ?= second
+	first_outcome = check_body_context(first_context)
+	second_outcome = check_body_context(second_context)
+	registry = accepted_typecheck_module_body_registry(input)
+	outcomes = [second_outcome, first_outcome]
+	outcome_at = pure func(index: Int) -> Option[BodyCheckOutcome]: outcomes.get(index)
+	var next_row_index: Dict[Int, Int] = {}
+	next_row_index = next_row_index.set(0, 1)
+
+	empty = match body_check_registry_outcome_table_from_indexed_rows(
+		registry,
+		None,
+		next_row_index,
+		outcome_at,
+		0,
+	):
+		BodyOutcomeTableAccepted(table):
+			Some(table)
+		BodyOutcomeTableRejected(_):
+			None
+
+	second_table = match body_check_registry_outcome_table_from_indexed_rows(
+		registry,
+		Some(0),
+		{},
+		outcome_at,
+		1,
+	):
+		BodyOutcomeTableAccepted(table):
+			Some(table)
+		BodyOutcomeTableRejected(_):
+			None
+
+	empty_table ?= empty
+	with_second ?= second_table
+
+	complete = match body_check_registry_outcome_table_from_indexed_rows(
+		registry,
+		Some(0),
+		next_row_index,
+		outcome_at,
+		2,
+	):
+		BodyOutcomeTableAccepted(table):
+			Some(table)
+		BodyOutcomeTableRejected(_):
+			None
+
+	complete_table ?= complete
+
+	batch = match (
+		body_check_registry_outcome_table(
+			registry,
+			[second_outcome, first_outcome],
+		)
+	):
+		BodyOutcomeTableAccepted(table):
+			Some(table)
+		BodyOutcomeTableRejected(_):
+			None
+
+	batch_table ?= batch
+
+	duplicate_at = pure func(index: Int) -> Option[BodyCheckOutcome]:
+		if index == 0 or index == 1:
+			Some(first_outcome)
+		else:
+			None
+
+	duplicate_rejected = match body_check_registry_outcome_table_from_indexed_rows(
+		registry,
+		Some(0),
+		next_row_index,
+		duplicate_at,
+		2,
+	):
+		BodyOutcomeTableRejected(errors):
+			errors.any(func(error): error.contains("duplicate body outcome for definition"))
+		BodyOutcomeTableAccepted(_):
+			False
+
+	other ?= accepted_module("incremental", "func first() -> Int: 3").to_option()
+
+	foreign_plan_rejected = match body_check_registry_outcome_table_from_indexed_rows(
+		accepted_typecheck_module_body_registry(other),
+		Some(1),
+		{},
+		outcome_at,
+		1,
+	):
+		BodyOutcomeTableRejected(errors):
+			errors.any(func(error): error.contains("different body plan"))
+		BodyOutcomeTableAccepted(_):
+			False
+
+	short_chain_rejected = match body_check_registry_outcome_table_from_indexed_rows(
+		registry,
+		Some(0),
+		{},
+		outcome_at,
+		2,
+	):
+		BodyOutcomeTableRejected(errors):
+			errors.any(func(error): error.contains("malformed indexed body outcome rows"))
+		BodyOutcomeTableAccepted(_):
+			False
+
+	var cyclic_next_row_index: Dict[Int, Int] = {}
+	cyclic_next_row_index = cyclic_next_row_index.set(0, 0)
+
+	cyclic_chain_rejected = match body_check_registry_outcome_table_from_indexed_rows(
+		registry,
+		Some(0),
+		cyclic_next_row_index,
+		outcome_at,
+		2,
+	):
+		BodyOutcomeTableRejected(errors):
+			errors.any(func(error): error.contains("malformed indexed body outcome rows"))
+		BodyOutcomeTableAccepted(_):
+			False
+
+	incremental_subset = body_check_registry_materialize_subset_from_table(registry, complete_table)
+	batch_subset = body_check_registry_materialize_subset_from_table(registry, batch_table)
+
+	subsets_match = match (incremental_subset, batch_subset):
+		(BodySubsetProgramReady(incremental), BodySubsetProgramReady(batch)):
+			body_subset_program_decls(
+				incremental,
+			).map(
+				func(
+					decl,
+				): typed_decl_to_json(
+					decl,
+				).to_string(),
+			) == body_subset_program_decls(
+				batch,
+			).map(
+				func(decl): typed_decl_to_json(decl).to_string(),
+			)
+		_:
+			False
+
+	Some(
+		(
+			body_outcome_table_count(empty_table) == 0
+			and body_outcome_table_count(with_second) == 1
+			and body_outcome_table_count(complete_table) == 2
+			and duplicate_rejected
+			and foreign_plan_rejected
+			and short_chain_rejected
+			and cyclic_chain_rejected
+			and subsets_match
+		),
+	)
+
+
+pure func test_indexed_body_table_admission_preserves_validation() -> Bool:
+	indexed_body_table_admission_preserves_validation().get_or(False)
+
+
 private pure func subset_materialization_rejects_duplicate_body_outcome() -> Option[Bool]:
 	input ?= accepted_module("duplicate_body", "func value() -> Int: 1").to_option()
 	ids ?= accepted_typecheck_module_callable_body_ids(input)
@@ -890,6 +1077,10 @@ tests: TestSuite = {
 		(
 			"validated body table rejects consumers from another plan",
 			test_validated_body_table_rejects_different_plan_consumers,
+		),
+		(
+			"indexed body table admission preserves validation",
+			test_indexed_body_table_admission_preserves_validation,
 		),
 		(
 			"subset materialization rejects a duplicate body outcome",

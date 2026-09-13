@@ -149,7 +149,7 @@ import:
 		body_check_registry_context_for_definition_id,
 		body_check_registry_materialize_complete_with_seed_table,
 		body_check_registry_materialize_subset_from_table,
-		body_check_registry_outcome_table,
+		body_check_registry_outcome_table_from_indexed_rows,
 		body_outcome_table_count,
 		body_outcome_table_typed_functions,
 		body_subset_program_decls,
@@ -465,8 +465,9 @@ private record PreparedCtfeDependency {
 }
 
 
--- Worklist order is retained within each module, but checked bodies have one
--- graph handoff carrier instead of per-dependency and target outcome copies.
+-- Worklist rows are linked by module without copying their outcomes. Each
+-- module table is built locally before being retained by the graph map, so a
+-- wide module does not repeatedly mutate a table still shared by that map.
 private record CtfeModuleBodyChain {
 	first_row_index: Int,
 	last_row_index: Int,
@@ -521,32 +522,6 @@ private pure func ctfe_checked_body_groups(checked: List[CtfeCheckedBody]) -> Ct
 		})
 
 
-private pure func ctfe_checked_body_groups_outcomes(
-	groups: CtfeCheckedBodyGroups,
-	module_id: ModuleId,
-) -> List[BodyCheckOutcome]:
-	representation = from_opaque CtfeCheckedBodyGroups(groups)
-	var outcomes: List[BodyCheckOutcome] = []
-	var current_row_index = representation.chain_by_module_id
-		.get(module_id_table_index(module_id))
-		.map(func(chain): chain.first_row_index)
-
-	while current_row_index.is_some():
-		match current_row_index:
-			Some(index):
-				match representation.rows.get(index):
-					Some(body):
-						outcomes = outcomes.append(body.outcome)
-					None:
-						void
-
-				current_row_index = representation.next_row_index.get(index)
-			None:
-				void
-
-	outcomes
-
-
 private pure func ctfe_checked_body_groups_count(
 	groups: CtfeCheckedBodyGroups,
 	module_id: ModuleId,
@@ -558,8 +533,41 @@ private pure func ctfe_checked_body_groups_count(
 		.get_or(0)
 
 
--- Validated module tables are the retained CTFE-to-ordinary handoff. The
--- worklist's flat rows and adjacency are transient during preparation.
+-- An empty chain still publishes a valid partial table for a bodyless module.
+private pure func ctfe_validated_body_table_for_registration(
+	groups: CtfeCheckedBodyGroups,
+	registration: CtfeBodyModuleRegistry,
+) -> Option[BodyOutcomeTable]:
+	representation = from_opaque CtfeCheckedBodyGroups(groups)
+	chain = representation.chain_by_module_id.get(module_id_table_index(registration.module_id))
+	first_row_index = chain.map(func(found): found.first_row_index)
+	expected_count = chain
+		.map(func(found): found.body_count)
+		.get_or(0)
+	outcome_at = pure func(index: Int) -> Option[BodyCheckOutcome]:
+		match representation.rows.get(index):
+			None:
+				None
+			Some(body):
+				if module_ids_equal(body.module_id, registration.module_id):
+					Some(body.outcome)
+				else:
+					None
+
+	match body_check_registry_outcome_table_from_indexed_rows(
+		registration.registry,
+		first_row_index,
+		representation.next_row_index,
+		outcome_at,
+		expected_count,
+	):
+		BodyOutcomeTableRejected(_):
+			None
+		BodyOutcomeTableAccepted(table):
+			Some(table)
+
+
+-- Validated module tables are the retained CTFE-to-ordinary handoff.
 private record CtfeValidatedBodyTablesRep {
 	by_module_id: Dict[Int, BodyOutcomeTable]
 }
@@ -576,13 +584,11 @@ private pure func ctfe_validated_body_tables(
 	var failed: Bool = False
 
 	for registration in registries:
-		outcomes = ctfe_checked_body_groups_outcomes(groups, registration.module_id)
-
-		match body_check_registry_outcome_table(registration.registry, outcomes):
-			BodyOutcomeTableRejected(_):
+		match ctfe_validated_body_table_for_registration(groups, registration):
+			None:
 				failed = True
 				break
-			BodyOutcomeTableAccepted(table):
+			Some(table):
 				by_module_id = by_module_id.set(
 					module_id_table_index(registration.module_id),
 					table,

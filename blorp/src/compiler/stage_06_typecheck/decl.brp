@@ -10369,6 +10369,75 @@ private pure func body_outcome_table_for_base(
 		BodyOutcomeTableRejected(errors)
 
 
+-- The indexed view reads an existing CTFE row chain without copying outcomes
+-- into a per-module list. Rows stay in this local dictionary until publication,
+-- so no retained table can force a COW copy on each admission.
+pure func body_check_registry_outcome_table_from_indexed_rows(
+	registry: BodyCheckRegistry,
+	first_row_index: Option[Int],
+	next_row_index: Dict[Int, Int],
+	outcome_at: pure (Int) -> Option[BodyCheckOutcome],
+	expected_count: Int,
+) -> BodyOutcomeTableBuild:
+	base = from_opaque BodyCheckRegistry(registry).base
+	definition_table = implementation_header_graph_definition_table(
+		base.representation.graph_facts.implementation_headers,
+	)
+	owner = prepared_module_scope_id(bound_module_scope(base.representation.bound_module))
+	var rows: Dict[Int, BodyCheckOutcome] = {}
+	var provenance_errors: List[String] = []
+	var errors: List[String] = []
+	var current_row_index = first_row_index
+	var scanned_count: Int = 0
+	var missing_row: Bool = False
+
+	while current_row_index.is_some() and scanned_count < expected_count and not missing_row:
+		match current_row_index:
+			Some(index):
+				match outcome_at(index):
+					None:
+						missing_row = True
+					Some(outcome):
+						id = body_check_outcome_callable_id(outcome)
+						definition_id = callable_id_definition_id(id)
+
+						if not body_plan_provenances_equal(
+							body_check_outcome_plan_provenance(outcome),
+							base.plan_provenance,
+						):
+							provenance_errors = provenance_errors.append(
+								"internal typecheck error: seeded body outcome belongs to a different body plan",
+							)
+
+						if callable_id_module_id(definition_table, id) != Some(owner):
+							errors = errors.append(
+								"internal typecheck error: body outcome belongs to a foreign module",
+							)
+						else if rows.get(definition_id).is_some():
+							errors = errors.append(
+								"internal typecheck error: duplicate body outcome for definition " + definition_id.to_string(),
+							)
+						else:
+							rows = rows.set(definition_id, outcome)
+
+				current_row_index = next_row_index.get(index)
+				scanned_count += 1
+			None:
+				void
+
+	if not provenance_errors.is_empty():
+		BodyOutcomeTableRejected(provenance_errors)
+	else if missing_row or scanned_count != expected_count or current_row_index.is_some():
+		BodyOutcomeTableRejected(["internal typecheck error: malformed indexed body outcome rows"])
+	else if errors.is_empty():
+		BodyOutcomeTableAccepted(into_opaque BodyOutcomeTable({
+			plan_provenance = base.plan_provenance,
+			by_definition_id = rows
+		}))
+	else:
+		BodyOutcomeTableRejected(errors)
+
+
 pure func body_check_registry_outcome_table(
 	registry: BodyCheckRegistry,
 	outcomes: List[BodyCheckOutcome],

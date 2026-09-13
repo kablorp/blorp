@@ -1407,6 +1407,25 @@ majority-metric win; final-worker measurements and gate status are recorded in
 open for direct row publication, explicit source order, and complete-body
 coverage.
 
+Step 3d removes the transient per-module outcome lists used to admit the CTFE
+worklist's checked rows. The bridge now follows each module's existing row
+chain through an indexed row view and builds one validated table from a local
+dictionary before retaining it in the graph-scoped map. This keeps bodyless
+modules as valid empty partial tables and avoids repeated copy-on-write
+updates to a table still held by the outer map. An intermediate opaque
+builder was rejected after generated C showed a retained dictionary alias;
+the final generated C keeps the row dictionary local through the scan. The
+selected retained guard preserves checksum, body-check/reuse counts, and
+retained bytes; allocation calls rise by only three (0.0004%), retired
+instructions are near parity, peak footprint is 0.3–0.9% higher in two short
+pairs, and worker size rises 0.022%. The focused, changed-owner, and broad
+4,556-test compiler gates pass. This is a guarded data-flow
+simplification, not the full Step 3 resource win. Raw measurements and
+remaining width-sensitive proof are in
+[Step 3d's packet](101-step3d-linked-row-table-admission.md). Step 3 still
+needs a safe direct row writer, explicit source order, and complete-body
+coverage.
+
 ### Target contract
 
 ```blorp

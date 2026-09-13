@@ -901,17 +901,27 @@ class DeclarationBoundaryTests(unittest.TestCase):
         selective = bridge.split(
             "private pure func prepare_selective_ctfe_dependencies_for_roots(", 1
         )[1].split("\n\nprivate pure func prepare_selective_ctfe_dependencies(", 1)[0]
-        validation = bridge.split("private pure func ctfe_validated_body_tables(", 1)[1]
-        validation = validation.split("\n\nprivate pure func ctfe_validated_body_tables_find(", 1)[0]
+        validation = bridge.split("private pure func ctfe_validated_body_table_for_registration(", 1)[1]
+        validation = validation.split("\n\n-- Validated module tables", 1)[0]
 
         self.assertIn("plan_provenance: BodyPlanProvenance", declaration.split(
             "private record BodyOutcomeTableRep {", 1
         )[1].split("\n}", 1)[0])
-        self.assertIn("body_check_registry_outcome_table(", validation)
+        self.assertIn("body_check_registry_outcome_table_from_indexed_rows(", validation)
         self.assertIn("body_check_registry_materialize_subset_from_table(", selective)
-        self.assertIn("BodyOutcomeTable", bridge)
+        self.assertIn("CtfeValidatedBodyTables", bridge)
         self.assertIn("body_check_registry_materialize_complete_with_seed_table(", bridge)
         self.assertNotIn("checked_body_groups: Option[CtfeCheckedBodyGroups]", bridge)
+
+    def test_ctfe_module_tables_admit_linked_rows_without_outcome_lists(self) -> None:
+        bridge = (ROOT / "blorp/src/compiler/stage_06_typecheck/bridge.brp").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("CtfeCheckedBodyGroups", bridge)
+        self.assertFalse("ctfe_checked_body_groups_outcomes(" in bridge)
+        self.assertFalse("outcomes = outcomes.append(body.outcome)" in bridge)
+        self.assertIn("body_check_registry_outcome_table_from_indexed_rows(", bridge)
 
     def test_owned_type_resolution_reuses_prepared_module_scope(self) -> None:
         source = TYPE_HEADER_GRAPH.read_text(encoding="utf-8")
