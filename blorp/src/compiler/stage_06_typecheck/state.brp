@@ -62,6 +62,7 @@ import:
 		PreparedModuleScope,
 		prepared_module_scope_canonical_path,
 		prepared_module_scope_definition_index,
+		prepared_module_scope_graph_module_name_scope,
 		prepared_module_scope_id,
 		prepared_module_scope_identity,
 		prepared_module_scope_module_table,
@@ -103,6 +104,7 @@ import:
 		module_view_find_local_name,
 		module_view_find_standalone_module_alias,
 		module_view_for_graph,
+		module_view_graph_has_owner,
 		module_view_has_graph_source_names,
 		module_view_record_imported_constructor,
 		module_view_register_graph_selective_trait_method,
@@ -706,30 +708,57 @@ pure func typecheck_state_is_source_package(state: TypecheckState) -> Bool:
 	module_origin_is_source_package(typecheck_state_module_origin(state))
 
 
+private pure func module_view_matches_module_scope(
+	view: ModuleView,
+	scope: TypecheckModuleScope,
+) -> Bool:
+	if not module_view_has_graph_source_names(view):
+		True
+	else:
+		match typecheck_module_scope_table(scope):
+			Some(module_table):
+				match typecheck_module_scope_id(scope):
+					Some(module_id):
+						module_view_graph_has_owner(view, module_table, module_id)
+					None:
+						False
+			None:
+				False
+
+
 pure func typecheck_state_find_module_alias(
 	state: TypecheckState,
 	alias_name: String,
 ) -> Option[String]:
-	match module_view_find_graph_module_alias(state.module_view, alias_name):
-		Some(module_id):
-			table ?= typecheck_module_scope_table(state.module_scope)
-			module_table_canonical_path(table, module_id)
-		None:
-			module_view_find_standalone_module_alias(state.module_view, alias_name)
+	if not module_view_matches_module_scope(state.module_view, state.module_scope):
+		None
+	else:
+		match module_view_find_graph_module_alias(state.module_view, alias_name):
+			Some(module_id):
+				table ?= typecheck_module_scope_table(state.module_scope)
+				module_table_canonical_path(table, module_id)
+			None:
+				module_view_find_standalone_module_alias(state.module_view, alias_name)
 
 
 pure func typecheck_state_find_imported_name(
 	state: TypecheckState,
 	local_name: String,
 ) -> Option[ImportedNameBinding]:
-	module_view_find_imported_name(state.module_view, local_name)
+	if module_view_matches_module_scope(state.module_view, state.module_scope):
+		module_view_find_imported_name(state.module_view, local_name)
+	else:
+		None
 
 
 pure func typecheck_state_find_top_level_name(
 	state: TypecheckState,
 	name: String,
 ) -> Option[TopLevelNameKind]:
-	module_view_find_local_name(state.module_view, name)
+	if module_view_matches_module_scope(state.module_view, state.module_scope):
+		module_view_find_local_name(state.module_view, name)
+	else:
+		None
 
 
 pure func typecheck_state_remember_top_level_name(
@@ -738,14 +767,19 @@ pure func typecheck_state_remember_top_level_name(
 	kind: TopLevelNameKind,
 ) -> TypecheckState:
 	registration = if module_view_has_graph_source_names(state.module_view):
-		match typecheck_module_scope_table(state.module_scope):
-			Some(module_table):
-				module_view_register_local_name_for_graph(
-					state.module_view,
-					module_table,
-					name,
-					kind,
-				)
+		match typecheck_module_scope_id(state.module_scope):
+			Some(current_module_id):
+				match typecheck_module_scope_table(state.module_scope):
+					Some(module_table):
+						module_view_register_local_name_for_graph(
+							state.module_view,
+							module_table,
+							current_module_id,
+							name,
+							kind,
+						)
+					None:
+						LocalNameInvalidSourceName
 			None:
 				LocalNameInvalidSourceName
 	else:
@@ -825,20 +859,31 @@ pure func typecheck_state_register_graph_module_alias(
 	issuing_table: ModuleTable,
 	module_id: ModuleId,
 ) -> TypecheckState:
-	match typecheck_module_scope_table(state.module_scope):
-		Some(current_table):
-			typecheck_state_apply_module_alias_registration(
-				state,
-				alias_name,
-				module_view_register_module_alias_target(
-					state.module_view,
-					current_table,
-					alias_name,
-					module_path,
-					issuing_table,
-					module_id,
-				),
-			)
+	match typecheck_module_scope_id(state.module_scope):
+		Some(current_module_id):
+			match typecheck_module_scope_table(state.module_scope):
+				Some(current_table):
+					typecheck_state_apply_module_alias_registration(
+						state,
+						alias_name,
+						module_view_register_module_alias_target(
+							state.module_view,
+							current_table,
+							current_module_id,
+							alias_name,
+							module_path,
+							issuing_table,
+							module_id,
+						),
+					)
+				None:
+					typecheck_state_add_error(
+						state,
+						(
+							"internal typecheck error: module alias target does not belong to the active "
+							+ "module graph"
+						),
+					)
 		None:
 			typecheck_state_add_error(
 				state,
@@ -896,16 +941,21 @@ pure func typecheck_state_register_graph_imported_name(
 
 	registration = match definition_table:
 		Some(table):
-			module_view_register_selective_name_for_graph(
-				state.module_view,
-				table,
-				issuing_definition_table,
-				local_name,
-				module_path,
-				original_name,
-				module_id,
-				definition_ids,
-			)
+			match typecheck_module_scope_id(state.module_scope):
+				Some(current_module_id):
+					module_view_register_selective_name_for_graph(
+						state.module_view,
+						current_module_id,
+						table,
+						issuing_definition_table,
+						local_name,
+						module_path,
+						original_name,
+						module_id,
+						definition_ids,
+					)
+				None:
+					SelectiveNameInvalidTarget
 		_:
 			SelectiveNameInvalidTarget
 
@@ -937,16 +987,21 @@ pure func typecheck_state_register_graph_imported_trait_method(
 
 	registration = match definition_table:
 		Some(table):
-			module_view_register_graph_selective_trait_method(
-				state.module_view,
-				table,
-				issuing_definition_table,
-				local_name,
-				module_path,
-				original_name,
-				module_id,
-				definition_ids,
-			)
+			match typecheck_module_scope_id(state.module_scope):
+				Some(current_module_id):
+					module_view_register_graph_selective_trait_method(
+						state.module_view,
+						current_module_id,
+						table,
+						issuing_definition_table,
+						local_name,
+						module_path,
+						original_name,
+						module_id,
+						definition_ids,
+					)
+				None:
+					SelectiveNameInvalidTarget
 		None:
 			SelectiveNameInvalidTarget
 
@@ -1073,7 +1128,11 @@ pure func typecheck_state_register_graph_imported_constructor(
 
 	registration_result = match (index, active_definition_table):
 		(Some(active_index), Some(active_table)):
-			if not definition_tables_share_provenance(active_table, issuing_definition_table):
+			current_module_id = typecheck_module_scope_id(state.module_scope)
+			if (
+				current_module_id.is_none()
+				or not definition_tables_share_provenance(active_table, issuing_definition_table)
+			):
 				typecheck_state_apply_selective_name_registration(
 					state,
 					local_name,
@@ -1090,22 +1149,33 @@ pure func typecheck_state_register_graph_imported_constructor(
 					parent_name,
 				):
 					Some(ids):
-						typecheck_state_apply_selective_name_registration(
-							state,
-							local_name,
-							module_path,
-							original_name,
-							module_view_register_selective_name_for_graph(
-								state.module_view,
-								active_table,
-								issuing_definition_table,
-								local_name,
-								module_path,
-								original_name,
-								module_id,
-								ids,
-							),
-						)
+						match current_module_id:
+							Some(owner_id):
+								typecheck_state_apply_selective_name_registration(
+									state,
+									local_name,
+									module_path,
+									original_name,
+									module_view_register_selective_name_for_graph(
+										state.module_view,
+										owner_id,
+										active_table,
+										issuing_definition_table,
+										local_name,
+										module_path,
+										original_name,
+										module_id,
+										ids,
+									),
+								)
+							None:
+								typecheck_state_apply_selective_name_registration(
+									state,
+									local_name,
+									module_path,
+									original_name,
+									SelectiveNameInvalidTarget,
+								)
 					None:
 						{
 							state = typecheck_state_add_error(
@@ -1364,7 +1434,7 @@ pure func typecheck_state_enter_prepared_module_scope(
 			{ state |
 				env = { state.env | next_def_id = definition_index_next_def_id(aligned_index) },
 				module_view = module_view_for_graph(
-					prepared_module_scope_source_name_table(prepared_scope),
+					prepared_module_scope_graph_module_name_scope(prepared_scope),
 				),
 				module_scope = typecheck_module_scope(ReservedModuleScope(prepared_scope))
 			}
@@ -1719,9 +1789,16 @@ pure func infer_module_facts_from_typecheck_state(state: TypecheckState) -> Infe
 			ReservedGraphDefinitionDomain
 		UnscopedModuleScope(_, _) | ExtensibleModuleScope(_, _, _, _):
 			UnindexedDefinitionDomain
+	-- Body inference reads the admitted view directly and often. Discard a
+	-- mismatched graph view once here so none of those reads can observe names
+	-- or accepted authorities belonging to another module in the same graph.
+	admitted_view = if module_view_matches_module_scope(state.module_view, state.module_scope):
+		state.module_view
+	else:
+		COMPILER_MODULE_VIEW_EMPTY
 
 	{
-		module_view = state.module_view,
+		module_view = admitted_view,
 		module_scope = state.module_scope,
 		definition_identity_domain = definition_identity_domain,
 		allow_debug_only_calls = state.allow_debug_only_calls,
@@ -1748,12 +1825,15 @@ pure func infer_module_facts_find_module_alias(
 	facts: InferModuleFacts,
 	alias_name: String,
 ) -> Option[String]:
-	match module_view_find_graph_module_alias(facts.module_view, alias_name):
-		Some(module_id):
-			table ?= typecheck_module_scope_table(facts.module_scope)
-			module_table_canonical_path(table, module_id)
-		None:
-			module_view_find_standalone_module_alias(facts.module_view, alias_name)
+	if not module_view_matches_module_scope(facts.module_view, facts.module_scope):
+		None
+	else:
+		match module_view_find_graph_module_alias(facts.module_view, alias_name):
+			Some(module_id):
+				table ?= typecheck_module_scope_table(facts.module_scope)
+				module_table_canonical_path(table, module_id)
+			None:
+				module_view_find_standalone_module_alias(facts.module_view, alias_name)
 
 
 pure func infer_module_facts_requires_graph_definition(facts: InferModuleFacts) -> Bool:

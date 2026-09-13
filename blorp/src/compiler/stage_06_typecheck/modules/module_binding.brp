@@ -863,10 +863,16 @@ private pure func importable_module_index(modules: List[ImportableModule]) -> Im
 	into_opaque ImportableModuleIndex(indexed_representation)
 
 
-private union ImportModuleLookup:
-	ImportModuleMissing
-	ImportModuleFound(ImportableModuleSurface)
-	ImportModuleAmbiguous(List[String])
+-- A source declaration has one module-level decision before symbol/alias
+-- registration mutates the typecheck state. The source loop applies these
+-- immediately, keeping diagnostic order while exposing the exact decisions
+-- that a later phase-local import builder will need to retain.
+private union ImportDeclDecision:
+	ImportDeclMissing
+	ImportDeclAmbiguous(List[String])
+	ImportDeclForbiddenPackage
+	ImportDeclDuplicateModule
+	ImportDeclSelected(ImportableModuleSurface)
 
 
 private record ImportModuleIndex {
@@ -906,24 +912,32 @@ private pure func import_module_index(modules: List[ImportableModuleSurface]) ->
 	}
 
 
-private pure func find_importable_module(
+private pure func decide_import_decl(
 	index: ImportModuleIndex,
-	requested_path: String,
-) -> ImportModuleLookup:
-	exact_matches = index.exact_by_path.get_or(requested_path, [])
+	decl: ParsedImportDecl,
+	seen_module_paths: Dict[String, Bool],
+	is_stdlib: Bool,
+) -> ImportDeclDecision:
+	exact_matches = index.exact_by_path.get_or(decl.module_path, [])
 
 	matches = if exact_matches.length() > 0:
 		exact_matches
 	else:
-		index.candidates_by_request.get_or(requested_path, [])
+		index.candidates_by_request.get_or(decl.module_path, [])
 
 	match matches:
 		[]:
-			ImportModuleMissing
+			ImportDeclMissing
 		[module]:
-			ImportModuleFound(module)
+			module_path = importable_module_surface_path(module)
+			if is_stdlib and module_origin_is_package(importable_module_surface_origin(module)):
+				ImportDeclForbiddenPackage
+			else if seen_module_paths.contains(module_path):
+				ImportDeclDuplicateModule
+			else:
+				ImportDeclSelected(module)
 		_:
-			ImportModuleAmbiguous(
+			ImportDeclAmbiguous(
 				matches
 					.map(importable_module_surface_path)
 					.sort(),
@@ -1407,14 +1421,14 @@ private pure func register_import_decl_indexed(
 	seen_module_paths: Dict[String, Bool],
 	accepted_canonical_module_paths: List[String],
 ) -> (TypecheckState, Dict[String, Bool], List[String]):
-	match find_importable_module(index, decl.module_path):
-		ImportModuleMissing:
+	match decide_import_decl(index, decl, seen_module_paths, typecheck_state_is_stdlib(state)):
+		ImportDeclMissing:
 			(
 				import_not_loaded_error(state, decl.module_path, decl.module_path_span),
 				seen_module_paths,
 				accepted_canonical_module_paths,
 			)
-		ImportModuleAmbiguous(canonical_paths):
+		ImportDeclAmbiguous(canonical_paths):
 			(
 				import_ambiguous_module_error(
 					state,
@@ -1425,47 +1439,41 @@ private pure func register_import_decl_indexed(
 				seen_module_paths,
 				accepted_canonical_module_paths,
 			)
-		ImportModuleFound(imported_module):
+		ImportDeclForbiddenPackage:
+			(
+				import_std_package_error(state, decl.module_path_span),
+				seen_module_paths,
+				accepted_canonical_module_paths,
+			)
+		ImportDeclDuplicateModule:
+			(
+				import_duplicate_module_error(state, decl.module_path, decl.module_path_span),
+				seen_module_paths,
+				accepted_canonical_module_paths,
+			)
+		ImportDeclSelected(imported_module):
 			module_path = importable_module_surface_path(imported_module)
+			next_state = match decl.symbols:
+				Some(symbols):
+					with_symbols = register_import_symbols(state, imported_module, symbols)
+					register_import_alias_if_present(
+						with_symbols,
+						imported_module,
+						import_decl_explicit_alias(decl),
+					)
+				None:
+					alias_name: String = match import_decl_explicit_alias(decl):
+						Some(explicit_alias):
+							explicit_alias
+						None:
+							import_default_alias(decl.module_path)
+					register_import_module_alias(state, imported_module, alias_name)
 
-			if (
-				typecheck_state_is_stdlib(state)
-				and module_origin_is_package(importable_module_surface_origin(imported_module))
-			):
-				(
-					import_std_package_error(state, decl.module_path_span),
-					seen_module_paths,
-					accepted_canonical_module_paths,
-				)
-			else if seen_module_paths.contains(module_path):
-				(
-					import_duplicate_module_error(state, decl.module_path, decl.module_path_span),
-					seen_module_paths,
-					accepted_canonical_module_paths,
-				)
-			else:
-				next_state = match decl.symbols:
-					Some(symbols):
-						with_symbols = register_import_symbols(state, imported_module, symbols)
-						register_import_alias_if_present(
-							with_symbols,
-							imported_module,
-							import_decl_explicit_alias(decl),
-						)
-					None:
-						alias_name: String = match import_decl_explicit_alias(decl):
-							Some(explicit_alias):
-								explicit_alias
-							None:
-								import_default_alias(decl.module_path)
-
-						register_import_module_alias(state, imported_module, alias_name)
-
-				(
-					next_state,
-					seen_module_paths.set(module_path, True),
-					accepted_canonical_module_paths.append(module_path),
-				)
+			(
+				next_state,
+				seen_module_paths.set(module_path, True),
+				accepted_canonical_module_paths.append(module_path),
+			)
 
 
 private pure func register_import_decls_indexed(

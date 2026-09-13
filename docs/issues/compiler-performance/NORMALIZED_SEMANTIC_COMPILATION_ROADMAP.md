@@ -1,6 +1,6 @@
 # Normalized Semantic Compilation Roadmap
 
-**Status:** Steps 1 and 2a-2d are complete; Step 2e is in progress. Its first twenty
+**Status:** Steps 1 and 2a-2d are complete; Step 2e is in progress. Its first twenty-three
 bounded packets normalized qualified-alias, local-declaration, selective-import,
 accepted-global visibility source-name identity, imported accepted-global target
 identity, accepted-global visibility inputs, and accepted-global per-module
@@ -14,6 +14,26 @@ concrete selected-call targets. The latest packets also keep accepted
 elementwise, self-bound, and resource-argument policy queries in the exact
 trait-identity domain, preserve that identity for unresolved accepted calls,
 and separate bare method visibility from receiver-directed UFCS evidence.
+The latest packet replaces the remaining accepted bare-method string dictionary
+and late module/name scan with compact `SourceNameId + TraitMethodId` rows.
+The accepted bare-trait name dictionary is likewise replaced with compact
+`SourceNameId + TraitId` rows; semantic-name compatibility remains explicit.
+The first convergence packet replaces three bound graph-name occupancy maps
+with one keyed occupancy relation. The next binds selected-module provenance
+to that view. A candidate-only direct visibility-width probe now exists; its
+API-adapted historical comparison reveals a resource regression, so Cut A's
+performance gate remains open. Graph-local prescan now uses one immutable-view
+publication with a scope-local keyed occupancy builder. The duplicate graph
+alias inventory is deleted: the binding log owns admission order, while early
+type resolution queries keyed occupancy for an actual qualified name. Import
+module declarations now have an explicit, immediately applied decision
+(missing, ambiguous, forbidden package, duplicate, or selected), with a
+source-order behavior fixture. Import candidates still publish one view per admission;
+Cut B's ordered candidate/outcome owner is not yet implemented.
+These category cuts are groundwork, not completion of the shared visibility
+relation. The finite Step 2e exit sequence and current production-authority
+audit are in
+[`94-step2e-visibility-convergence.md`](94-step2e-visibility-convergence.md).
 
 **Scope:** One compiler invocation and one immutable analysis snapshot. This
 roadmap makes accepted and recoverable semantic facts directly queryable by the
@@ -139,13 +159,15 @@ entity row is not copied for each importer, reference, call, or containment
 edge.
 
 ```blorp
-record VisibleBindingRow {
-	viewer_module: ModuleId,
-	namespace: SemanticNamespace,
-	local_name: SourceNameId,
-	entity: VisibleSemanticEntity,
-	origin: VisibilityOrigin,
-	order: VisibilityOrder
+opaque type BoundVisibilityCandidateId = Int
+
+union VisibilityCandidateRef:
+	BoundVisibilityCandidateRef(BoundVisibilityCandidateId)
+	CompilerBuiltinVisibilityCandidateRef(BuiltinRegistryOrder)
+
+record AcceptedVisibilityRow {
+	candidate: VisibilityCandidateRef,
+	entity: VisibleSemanticEntity
 }
 
 record SemanticReferenceRow {
@@ -1069,6 +1091,48 @@ instructions improve 0.103%, cycles improve 0.605%, RSS improves 0.850%, peak
 footprint improves 1.015%, the measured window improves 0.373%, and compiler
 size grows 0.183%.
 
+The twenty-first Step 2e packet is
+[`92-normalize-accepted-trait-method-visibility.md`](92-normalize-accepted-trait-method-visibility.md):
+accepted bare trait-method visibility now retains sorted
+`SourceNameId + TraitMethodId` rows and uses lower-bound lookup. Selective method
+imports resolve to exact accepted identity at visibility construction, and the
+former `Dict[String, TraitMethodId]` plus its late module/name rescan are
+deleted rather than retained in parallel. Trait method declarations now enter
+the compilation source-name catalog, while fields and implementation method
+bodies remain outside it. One direct accepted-authority pair preserves semantic
+checksums, retained objects, and allocated bytes; transient allocations rise
+0.150%, instructions 0.325%, cycles 1.261%, RSS 0.087%, peak footprint 0.053%,
+and compiler size 0.002%. The broad checked-bodies guard is allocation-neutral
+and remains within 0.20% for instructions, cycles, RSS, and peak footprint.
+
+The twenty-second Step 2e packet is
+[`93-normalize-accepted-trait-definition-visibility.md`](93-normalize-accepted-trait-definition-visibility.md):
+accepted trait-definition imports and retained bare-name visibility now use
+exact `SourceNameId + TraitId` rows. A sorted compact relation replaces the
+former `Dict[String, Int]` without a parallel numeric dictionary. The separate
+semantic-name compatibility index and UFCS evidence retain their distinct
+query meanings. An accepted-stage pair preserves semantic checksums, adds
+0.20% total allocations, 0.04% retained objects, 0.04% instructions, and
+0.085% executable size; allocated bytes grow 128 while cycles, RSS, and peak
+footprint decrease in the single pair. No latency claim is made.
+
+The twenty-third Step 2e packet is
+[`95-bound-graph-name-occupancy.md`](95-bound-graph-name-occupancy.md):
+the graph binder now retains one `SourceNameId`-keyed occupancy table for
+qualified aliases, selective imports, local names, and the
+same-target alias-plus-selective overlap. The three displaced graph maps are
+deleted. An opaque graph-name issuer bundles the source catalog with the
+exact `ModuleTable` allocation, and low-level and production binding tests
+cover both overlap orders, conflict/idempotence, clearing, and foreign-table
+rejection. The accepted-stage pair preserves checksums and retained objects;
+allocations rise 0.025%, retired instructions 0.588%, peak footprint 0.159%,
+and compiler size 0.011%, while allocated bytes fall 0.013%. This is bounded
+resource impact, not a latency or overall performance-win claim. The owner
+API-adapted direct visibility-width comparison exposes a resource regression,
+so Cut A's performance gate remains open. Selected-module identity is checked
+at registration, state lookup, inference
+admission, and binding.
+
 ### Context
 
 Visibility is the missing relation behind exact completion, import
@@ -1082,6 +1146,16 @@ Module visibility and request-position lexical visibility are distinct. This
 step normalizes the module-level relation. Body-local variables, parameters,
 type parameters, and lexical shadowing remain body-session facts until an
 analysis request asks for a position snapshot.
+
+Early header and trait-reference resolution use bound module visibility before
+accepted category tables publish their IDs. Therefore the target contract has
+two phase-correct product moments: a bound source/module/definition candidate
+relation for early decisions, then an accepted enrichment with exact category
+entities and outcomes. The accepted graph currently retains its bound graph
+through header products, so enrichment references the scope-issued bound rows
+and stores only new semantic/outcome payloads; physical bound-graph release
+belongs to Step 7. See the [finite convergence sequence](94-step2e-visibility-convergence.md)
+for the owners, deletion targets, and stop rule.
 
 ### Target contract
 
@@ -1102,6 +1176,7 @@ opaque type DeclarationSourceOrder = Int
 opaque type ImportedCandidateOrder = Int
 opaque type PreludeDeclarationOrder = Int
 opaque type BuiltinRegistryOrder = Int
+opaque type BoundVisibilityCandidateId = Int
 
 union VisibilityOrder:
 	LocalDeclarationVisibilityOrder(DeclarationSourceOrder)
@@ -1109,22 +1184,47 @@ union VisibilityOrder:
 	PreludeVisibilityOrder(PreludeDeclarationOrder)
 	CompilerBuiltinVisibilityOrder(BuiltinRegistryOrder)
 
+union BoundVisibleCandidate:
+	BoundDefinitionCandidate(DefinitionId)
+	BoundModuleCandidate(ModuleId)
+	BoundTraitMethodSurface(ModuleId, String)
+	BoundLocalNameKind(TopLevelNameKind)
+
 union VisibleSemanticEntity:
-	VisibleDefinitionEntity(DefinitionId)
+	VisibleTypeEntity(TypeId)
+	VisibleCallableEntity(CallableId)
+	VisibleGlobalEntity(GlobalId)
+	VisibleTraitEntity(TraitId)
+	VisibleTraitMethodEntity(TraitMethodId)
 	VisibleModuleEntity(ModuleId)
 	VisibleCompilerBuiltinEntity(CompilerBuiltinIdentity)
 
-record VisibleBindingRow {
-	viewer_module: ModuleId,
-	namespace: SemanticNamespace,
-	local_name: SourceNameId,
-	entity: VisibleSemanticEntity,
-	origin: VisibilityOrigin,
-	order: VisibilityOrder
+union VisibilityCandidateRef:
+	BoundVisibilityCandidateRef(BoundVisibilityCandidateId)
+	CompilerBuiltinVisibilityCandidateRef(BuiltinRegistryOrder)
+
+record AcceptedVisibilityRow {
+	candidate: VisibilityCandidateRef,
+	entity: VisibleSemanticEntity
 }
 ```
 
-The canonical rows preserve every candidate and its exact origin/order. The
+The bound candidate variants are phase-specific: an aliased trait-method import
+may still carry its original source spelling as `String` because the current
+source-name catalog admits its local alias, not necessarily that original
+spelling. It cannot pretend to carry a `TraitMethodId` before topology
+publishes one, and local kind occupancy is not semantic identity. Accepted rows
+use the
+category-safe identity issued by the accepted table; a raw `DefinitionId` is
+not a catch-all accepted fallback. The precise variants for constructors and
+other categories must be settled by the category owner when its cohort cuts
+over. The bound candidate table owns viewer module, namespace, local source
+name, origin, and issued order. `AcceptedVisibilityRow` references that bound
+candidate ID and adds only exact semantic identity. Compiler-builtin
+candidates use a separate registry-issued variant because they have no bound
+source row. A rich `VisibleBindingView` may project bound and accepted fields
+on demand for diagnostics or tooling, but is not a second retained row store.
+The canonical candidates preserve every origin/order. The
 opaque order components are issued from the existing declaration, import,
 prelude, and builtin orders; they are not interchangeable raw counters.
 `VisibilityOrder` is not sorted through one guessed integer rank. The visibility
@@ -1144,12 +1244,16 @@ do not propagate the spelling handle as semantic identity.
 2. Add structural fixtures for local/import/prelude collisions, privacy,
    aliases, selective imports, qualified modules, UFCS, overload order, and
    same-spelling value/type names.
-3. Build canonical visibility rows during accepted module-view construction.
+3. Build bound candidate rows during graph module binding, then enrich them
+   with accepted category identities only after those tables are published.
 4. Validate indexes against rows and preserve candidate order exactly.
 5. Represent winner, overload-set, shadowed, and rejected-conflict outcomes
    explicitly; add no generic numeric comparator that can reorder origin kinds.
-6. Cut ordinary resolution queries over first; then cut LSP module-level
-   visibility projection over.
+6. Cut ordinary resolution queries over first. Add a compiler-owned
+   module-level query only for a named consumer; existing LSP handlers do not
+   consume module visibility, so their migration belongs to Step 8 when a
+   genuine use exists. Public completion is not currently advertised and is
+   not implicit scope for this step.
 7. Reduce `ModuleView` to a transient builder or a narrow query facade and
    delete maps that no longer own a unique semantic rule.
 8. Define a separate optional `LexicalVisibilitySnapshot` only when completion

@@ -136,6 +136,7 @@ import:
 		indexed_graph_find_dependency_scope,
 		indexed_graph_module_scopes,
 		indexed_graph_module_table,
+		indexed_graph_source_name_table,
 		indexed_graph_target,
 		indexed_graph_target_scope,
 		prepared_module_program,
@@ -147,6 +148,7 @@ import:
 	../../../src/compiler/stage_06_typecheck/graph/source_name_table:
 		SourceNameTable,
 		source_name_id_table_index,
+		source_name_table,
 		source_name_table_find_id,
 	../../../src/compiler/stage_06_typecheck/headers/callable_headers:
 		CallableHeader,
@@ -205,6 +207,7 @@ import:
 		bound_module_source_direct_import_count,
 	../../../src/compiler/stage_06_typecheck/modules/import_binding:
 		ImportBinding(
+			GraphQualifiedModuleBinding,
 			GraphSelectiveDefinitionBinding,
 			GraphSelectiveTraitMethodBinding,
 			StandaloneQualifiedModuleBinding,
@@ -249,6 +252,9 @@ import:
 		module_view_accepted_trait_implementation_authority,
 		module_view_accepted_union_authority,
 		module_view_find_graph_module_alias,
+		module_view_find_imported_name,
+		module_view_graph_bound_name_count,
+		module_view_import_bindings,
 		module_view_find_local_name,
 		module_view_find_standalone_module_alias,
 		module_view_has_selective_binding,
@@ -264,6 +270,8 @@ import:
 		TYPECHECK_STDLIB_ORIGIN,
 		TYPECHECK_USER_ORIGIN,
 		TypecheckState,
+		infer_module_facts_find_module_alias,
+		infer_module_facts_from_typecheck_state,
 		typecheck_state_add_error,
 		typecheck_state_definition_index,
 		typecheck_state_enter_prepared_module_scope,
@@ -317,6 +325,7 @@ import:
 		accepted_resolve_trait_obligation,
 		accepted_trait_contains,
 		accepted_trait_empty_visibility,
+		accepted_trait_find,
 		accepted_trait_find_function_method,
 		accepted_trait_implementation_authority,
 		accepted_trait_implementation_authority_from_visibility,
@@ -1691,6 +1700,86 @@ func test_bind_program_module_view_returns_completed_namespace() -> Bool:
 							)
 
 
+func test_graph_binding_batches_local_prescan_before_import_conflicts() -> Bool:
+	var decls: List[ParsedDecl] = [
+		import_block_decl([import_decl("dep", Some("Local_31"), None)]),
+	]
+	for index in 0..40:
+		decls = decls.append(function_decl("Local_" + index.to_string()))
+	source_program = program(decls)
+	match importable_module_index_for_target_program(
+		importable_modules("dep", []),
+		UserModule,
+		source_program,
+	):
+		None:
+			False
+		Some(index):
+			match importable_module_index_find(index, "index_target"):
+				None:
+					False
+				Some(owner):
+					owner_scope = importable_module_prepared_scope(owner)
+					match typecheck_bind_program_module_view(
+						typecheck_state_enter_prepared_module_scope(
+							typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+							owner_scope,
+						),
+						source_program,
+						index,
+						owner_scope,
+					):
+						BoundModuleViewRejected(_, _):
+							False
+						BoundModuleViewReady(view, _, _, diagnostics):
+							(
+								module_view_graph_bound_name_count(view) == 40
+								and module_view_find_local_name(view, "Local_31") == Some(TopLevelFunction)
+								and module_view_find_local_name(view, "Local_32") == Some(TopLevelFunction)
+								and module_view_import_bindings(view).is_empty()
+								and diagnostics.length() == 1
+								and diagnostics.get(0).map(func(item): item.message.contains(
+									"module alias 'Local_31' conflicts with function 'Local_31'",
+								)).get_or(False)
+							)
+
+
+func test_graph_binding_local_batch_preserves_uncataloged_name_error() -> Bool:
+	reserved_program = program([])
+	mismatched_program = program([function_decl("Uncataloged")])
+	match importable_module_index_for_target_program(
+		[],
+		UserModule,
+		reserved_program,
+	):
+		None:
+			False
+		Some(index):
+			match importable_module_index_find(index, "index_target"):
+				None:
+					False
+				Some(owner):
+					owner_scope = importable_module_prepared_scope(owner)
+					match typecheck_bind_program_module_view(
+						typecheck_state_enter_prepared_module_scope(
+							typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+							owner_scope,
+						),
+						mismatched_program,
+						index,
+						owner_scope,
+					):
+						BoundModuleViewRejected(_, _):
+							False
+						BoundModuleViewReady(view, _, _, diagnostics):
+							(
+								module_view_graph_bound_name_count(view) == 0
+								and diagnostics.length() == 1
+								and diagnostics.get(0).map(func(item): item.message)
+									== Some("internal typecheck error: top-level name 'Uncataloged' is not cataloged by the active module graph")
+							)
+
+
 func test_bound_module_alias_retains_graph_module_id() -> Bool:
 	source_program = program([import_block_decl([import_decl("dep", Some("Dep"), None)])])
 
@@ -1734,6 +1823,270 @@ func test_bound_module_alias_retains_graph_module_id() -> Bool:
 									)
 								_:
 									False
+				_:
+					False
+
+
+func test_bound_alias_and_selective_name_share_one_graph_row() -> Bool:
+	source_program = program([
+		import_block_decl([
+			import_decl("dep", Some("Token"), Some([import_symbol("Token", None, [])])),
+		]),
+	])
+
+	match importable_module_index_for_target_program(
+		importable_modules("dep", [record_decl("Token")]),
+		UserModule,
+		source_program,
+	):
+		None:
+			False
+
+
+		Some(index):
+			match importable_module_index_find(index, "index_target"):
+				None:
+					False
+				Some(owner):
+					owner_scope = importable_module_prepared_scope(owner)
+					match typecheck_bind_program_module_view(
+						typecheck_state_enter_prepared_module_scope(
+							typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+							owner_scope,
+						),
+						source_program,
+						index,
+						owner_scope,
+					):
+						BoundModuleViewRejected(_, _):
+							False
+						BoundModuleViewReady(view, _, _, diagnostics):
+							bindings = module_view_import_bindings(view)
+							qualified_second = match bindings.get(1):
+								Some(GraphQualifiedModuleBinding(qualified_name, _)):
+									qualified_name == "Token"
+								_:
+									False
+							selective_first = match bindings.get(0):
+								Some(GraphSelectiveDefinitionBinding(selective_name, _, ids)):
+									selective_name == "Token" and ids.length() == 1
+								_:
+									False
+							(
+								diagnostics.is_empty()
+								and module_view_find_graph_module_alias(view, "Token").is_some()
+								and module_view_has_selective_binding(view, "Token", "dep", "Token")
+								and module_view_graph_bound_name_count(view) == 1
+								and bindings.length() == 2
+								and selective_first
+								and qualified_second
+							)
+
+
+func test_graph_binding_keeps_private_missing_and_duplicate_diagnostics_in_order() -> Bool:
+	source_program = program([import_block_decl([import_decl(
+		"dep",
+		Some("Dep"),
+		Some([
+			import_symbol("Hidden", None, []),
+			import_symbol("Missing", None, []),
+			import_symbol("Visible", Some("Chosen"), []),
+			import_symbol("Visible", Some("Chosen"), []),
+		]),
+	)])])
+	modules = importable_modules("dep", [
+		PrivateParsedDecl(function_decl("Hidden"), fixture_source_span()),
+		function_decl("Visible"),
+	])
+
+	match importable_module_index_for_target_program(modules, UserModule, source_program):
+		None:
+			False
+		Some(index):
+			match importable_module_index_find(index, "index_target"):
+				None:
+					False
+				Some(owner):
+					owner_scope = importable_module_prepared_scope(owner)
+					match typecheck_bind_program_module_view(
+						typecheck_state_enter_prepared_module_scope(
+							typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+							owner_scope,
+						),
+						source_program,
+						index,
+						owner_scope,
+					):
+						BoundModuleViewRejected(_, _):
+							False
+						BoundModuleViewReady(view, _, _, diagnostics):
+							(
+								diagnostics.length() == 3
+								and diagnostics.get(0).map(func(item): item.message)
+									== Some("'Hidden' is private in module 'dep' and cannot be imported")
+								and diagnostics.get(1).map(func(item): item.message)
+									== Some("'Missing' is not exported by module 'dep'")
+								and diagnostics.get(2).map(func(item): item.message)
+									== Some("'Chosen' is already imported from this module")
+								and module_view_find_imported_name(view, "Hidden").is_none()
+								and module_view_find_imported_name(view, "Missing").is_none()
+								and module_view_has_selective_binding(view, "Chosen", "dep", "Visible")
+								and module_view_import_bindings(view).length() == 2
+							)
+
+
+func test_graph_import_module_decisions_preserve_source_order_and_admission() -> Bool:
+	source_program = program([import_block_decl([
+		import_decl("missing", None, None),
+		import_decl("dep", Some("Dep"), None),
+		import_decl("dep", Some("SecondDep"), None),
+	])])
+	modules = importable_modules("dep", [function_decl("Visible")])
+
+	match importable_module_index_for_target_program(modules, UserModule, source_program):
+		None:
+			False
+		Some(index):
+			match importable_module_index_find(index, "index_target"):
+				None:
+					False
+				Some(owner):
+					owner_scope = importable_module_prepared_scope(owner)
+					match typecheck_bind_program_module_view(
+						typecheck_state_enter_prepared_module_scope(
+							typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+							owner_scope,
+						),
+						source_program,
+						index,
+						owner_scope,
+					):
+						BoundModuleViewRejected(_, _):
+							False
+						BoundModuleViewReady(view, _, _, diagnostics):
+							(
+								diagnostics.length() == 2
+								and diagnostics.get(0).map(func(item): item.message)
+									== Some("module 'missing' is not loaded for import registration")
+								and diagnostics.get(1).map(func(item): item.message)
+									== Some("module 'dep' is already imported")
+								and module_view_find_graph_module_alias(view, "Dep").is_some()
+								and module_view_find_graph_module_alias(view, "SecondDep").is_none()
+								and module_view_import_bindings(view).length() == 1
+							)
+
+
+func test_graph_module_alias_rejects_equal_layout_foreign_table() -> Bool:
+	match (
+		importable_module_index(importable_modules("dep", [])),
+		importable_module_index(importable_modules("dep", [])),
+	):
+		(Some(local_index), Some(foreign_index)):
+			match (
+				importable_module_index_find(local_index, "index_target"),
+				importable_module_index_find(foreign_index, "dep"),
+			):
+				(Some(local_owner), Some(foreign_dependency)):
+					local_scope = importable_module_prepared_scope(local_owner)
+					foreign_scope = importable_module_prepared_scope(foreign_dependency)
+					state = typecheck_state_enter_prepared_module_scope(
+						typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+						local_scope,
+					)
+					result = typecheck_state_register_graph_module_alias(
+						state,
+						"Dep",
+						"dep",
+						prepared_module_scope_module_table(foreign_scope),
+						prepared_module_scope_id(foreign_scope),
+					)
+					(
+						result.errors.length() == 1
+						and module_view_find_graph_module_alias(result.module_view, "Dep").is_none()
+					)
+				_:
+					False
+		_:
+			False
+
+
+func test_graph_view_rejects_other_module_in_same_graph() -> Bool:
+	source_program = program([
+		function_decl("Local"),
+		import_block_decl([import_decl("dep", Some("Dep"), None)]),
+	])
+
+	match importable_module_index_for_target_program(
+		importable_modules("dep", []),
+		UserModule,
+		source_program,
+	):
+		None:
+			False
+		Some(index):
+			match (
+				importable_module_index_find(index, "index_target"),
+				importable_module_index_find(index, "dep"),
+			):
+				(Some(owner), Some(dependency)):
+					owner_scope = importable_module_prepared_scope(owner)
+					dependency_scope = importable_module_prepared_scope(dependency)
+					owner_state = typecheck_state_enter_prepared_module_scope(
+						typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+						owner_scope,
+					)
+					dependency_state = typecheck_state_enter_prepared_module_scope(
+						typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+						dependency_scope,
+					)
+					owner_with_local = typecheck_state_remember_top_level_name(
+						owner_state,
+						"Local",
+						TopLevelFunction,
+					)
+					owner_with_alias = typecheck_state_register_graph_module_alias(
+						owner_with_local,
+						"Dep",
+						"dep",
+						prepared_module_scope_module_table(dependency_scope),
+						prepared_module_scope_id(dependency_scope),
+					)
+					mixed_state = { dependency_state | module_view = owner_with_alias.module_view }
+					initial_bound_names = module_view_graph_bound_name_count(mixed_state.module_view)
+					local_result = typecheck_state_remember_top_level_name(
+						mixed_state,
+						"Local",
+						TopLevelFunction,
+					)
+					alias_result = typecheck_state_register_graph_module_alias(
+						mixed_state,
+						"Dep",
+						"dep",
+						prepared_module_scope_module_table(dependency_scope),
+						prepared_module_scope_id(dependency_scope),
+					)
+					(
+						owner_with_alias.errors.is_empty()
+						and initial_bound_names == 2
+						and typecheck_state_find_top_level_name(mixed_state, "Local").is_none()
+						and typecheck_state_find_module_alias(mixed_state, "Dep").is_none()
+						and infer_module_facts_find_module_alias(
+							infer_module_facts_from_typecheck_state(mixed_state),
+							"Dep",
+						).is_none()
+						and module_view_find_local_name(
+							infer_module_facts_from_typecheck_state(mixed_state).module_view,
+							"Local",
+						).is_none()
+						and module_view_find_graph_module_alias(
+							infer_module_facts_from_typecheck_state(mixed_state).module_view,
+							"Dep",
+						).is_none()
+						and local_result.errors.length() == 1
+						and module_view_graph_bound_name_count(local_result.module_view) == initial_bound_names
+						and alias_result.errors.length() == 1
+						and module_view_graph_bound_name_count(alias_result.module_view) == initial_bound_names
+					)
 				_:
 					False
 
@@ -1797,6 +2150,44 @@ func test_bind_program_module_view_rejects_equivalent_foreign_scope() -> Bool:
 					False
 		_:
 			False
+
+
+func test_bind_program_rejects_same_graph_wrong_module_view() -> Bool:
+	match importable_module_index(importable_modules("dep", [])):
+		None:
+			False
+		Some(index):
+			match (
+				importable_module_index_find(index, "index_target"),
+				importable_module_index_find(index, "dep"),
+			):
+				(Some(owner), Some(dependency)):
+					owner_scope = importable_module_prepared_scope(owner)
+					dependency_scope = importable_module_prepared_scope(dependency)
+					owner_state = typecheck_state_enter_prepared_module_scope(
+						typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+						owner_scope,
+					)
+					dependency_state = typecheck_state_enter_prepared_module_scope(
+						typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+						dependency_scope,
+					)
+					mixed_state = { dependency_state | module_view = owner_state.module_view }
+					match typecheck_bind_program_module_view(
+						mixed_state,
+						program([]),
+						index,
+						dependency_scope,
+					):
+						BoundModuleViewRejected(message, diagnostics):
+							message == (
+								"internal typecheck error: graph module binding requires the view "
+								+ "for the selected module"
+							) and diagnostics.is_empty()
+						BoundModuleViewReady(_, _, _, _):
+							False
+				_:
+					False
 
 
 func test_bind_program_module_view_rejects_preloaded_standalone_alias() -> Bool:
@@ -2703,6 +3094,132 @@ func test_qualified_only_namesake_does_not_replace_selective_trait_binding() -> 
 	result.state.errors.is_empty() and selected_path == Some("selected_traits")
 
 
+func test_accepted_trait_visibility_sorts_exact_alias_and_local_rows() -> Bool:
+	modules = importable_modules("first_traits", [trait_decl("First")])
+		.concat(importable_modules("last_traits", [trait_decl("Last")]))
+		.concat(importable_modules("qualified_traits", [trait_decl("Hidden")]))
+	target = program([import_block_decl([
+			import_decl("first_traits", None, Some([import_symbol("First", Some("alpha"), [])])),
+			import_decl("last_traits", None, Some([import_symbol("Last", Some("zeta"), [])])),
+			import_decl("qualified_traits", Some("Qualified"), None),
+		]), trait_decl("Middle")])
+	result = typecheck_test_program_with_import_modules(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		target,
+		modules,
+	)
+	authority = module_view_accepted_trait_implementation_authority(result.state.module_view)
+	alpha = authority.and_then(func(value): accepted_trait_module_path(value, "alpha"))
+	middle = authority.and_then(func(value): accepted_trait_module_path(value, "Middle"))
+	middle_definition = authority.and_then(func(value): accepted_trait_find(value, "Middle"))
+	zeta = authority.and_then(func(value): accepted_trait_module_path(value, "zeta"))
+	hidden = authority.and_then(func(value): accepted_trait_module_path(value, "Hidden"))
+
+	(
+		result.state.errors.is_empty()
+		and alpha == Some("first_traits")
+		and middle.is_some()
+		and middle_definition.map(func(value): value.name) == Some("Middle")
+		and zeta == Some("last_traits")
+		and hidden.is_none()
+		and authority
+			.map(func(value): accepted_trait_contains(value, "alpha"))
+			.get_or(False)
+	)
+
+
+private pure func accepted_trait_visibility_duplicate_alias_is_exact() -> Option[Bool]:
+	graph: AcceptedTypecheckGraph ?= typecheck_test_accepted_graph(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		program([trait_decl("First"), trait_decl("Second")]),
+		[],
+	).to_option()
+	implementation_headers = accepted_typecheck_graph_implementation_headers(graph)
+	definition_table = implementation_header_graph_definition_table(implementation_headers)
+	topology = callable_header_graph_trait_topology(
+		implementation_header_graph_callable_headers(implementation_headers),
+	)
+	first_header ?= trait_topology_graph_headers(topology).get(0)
+	second_header ?= trait_topology_graph_headers(topology).get(1)
+	first_id = trait_topology_header_id(first_header)
+	second_id = trait_topology_header_id(second_header)
+	module_table = definition_table_module_table(definition_table)
+	owner_id ?= trait_id_module_id(definition_table, first_id)
+	owner_path ?= module_table_canonical_path(module_table, owner_id)
+	first_definition_id ?= definition_table_definition_id(
+		definition_table,
+		trait_id_definition_id(first_id),
+	)
+	second_definition_id ?= definition_table_definition_id(
+		definition_table,
+		trait_id_definition_id(second_id),
+	)
+	table ?= accepted_trait_implementation_table({
+		module_table = module_table,
+		definition_table = definition_table,
+		traits = [
+			{
+				id = first_id,
+				compiler_builtin_id = None,
+				visibility = PublicDeclaration,
+				supertraits = [],
+				method_ids = [],
+				definition = trait_def_with_details(
+					trait_id_definition_id(first_id),
+					"First",
+					[],
+					[],
+					[],
+					Some(owner_path),
+				)
+			},
+			{
+				id = second_id,
+				compiler_builtin_id = None,
+				visibility = PublicDeclaration,
+				supertraits = [],
+				method_ids = [],
+				definition = trait_def_with_details(
+					trait_id_definition_id(second_id),
+					"Second",
+					[],
+					[],
+					[],
+					Some(owner_path),
+				)
+			},
+		],
+		implementations = [],
+	})
+	bindings = [
+		GraphSelectiveDefinitionBinding("shared", owner_id, [first_definition_id]),
+		GraphSelectiveDefinitionBinding("shared", owner_id, [second_definition_id]),
+	]
+	visibility ?= accepted_visible_trait_bindings(
+		table,
+		definition_table,
+		source_name_table(["shared"]),
+		bindings,
+	)
+	authority = accepted_trait_implementation_authority(table, "unrelated_owner", visibility, [])
+
+	Some(
+		(
+			accepted_trait_find(authority, "shared").map(func(value): value.name) == Some("Second")
+			and accepted_visible_trait_bindings(
+				table,
+				definition_table,
+				source_name_table([]),
+				bindings,
+			).is_none()
+		),
+	)
+
+
+func test_accepted_trait_visibility_duplicate_alias_is_exact() -> Bool:
+	accepted_trait_visibility_duplicate_alias_is_exact().get_or(False)
+
+
 func test_aliased_trait_rows_report_one_method_collision() -> Bool:
 	encode_method = trait_method_decl(
 		"encode",
@@ -2922,6 +3439,13 @@ private pure func accepted_trait_policy_queries_reject_foreign_identity_provenan
 	foreign_visibility = accepted_visible_trait_bindings(
 		table,
 		foreign_definition_table,
+		indexed_graph_source_name_table(
+			bound_module_graph_indexed_graph(
+				type_header_graph_bound_graph(
+					trait_topology_graph_type_headers(local_topology),
+				),
+			),
+		),
 		[GraphSelectiveDefinitionBinding("Equatable", foreign_owner_id, [foreign_definition_id])],
 	)
 	rejected_visibility_authority = accepted_trait_implementation_authority_from_visibility(
@@ -3018,6 +3542,11 @@ private pure func accepted_trait_visibility_ignores_standalone_syntax_imports() 
 	visibility ?= accepted_visible_trait_bindings(
 		table,
 		definition_table,
+		indexed_graph_source_name_table(
+			bound_module_graph_indexed_graph(
+				type_header_graph_bound_graph(trait_topology_graph_type_headers(topology)),
+			),
+		),
 		[
 			StandaloneQualifiedModuleBinding("standalone", owner_path),
 			StandaloneSelectiveDefinitionBinding(
@@ -3145,6 +3674,104 @@ private pure func accepted_trait_method_lookup_preserves_exact_identity() -> Opt
 
 func test_accepted_trait_method_lookup_preserves_exact_identity() -> Bool:
 	accepted_trait_method_lookup_preserves_exact_identity().get_or(False)
+
+
+private pure func accepted_trait_method_lookup_sorts_exact_visibility_rows() -> Option[Bool]:
+	selected_modules = importable_modules(
+		"selected_methods",
+		[
+			trait_decl_with_methods(
+				"Imported",
+				[],
+				[],
+				[
+					trait_method_decl(
+						"imported",
+						[named_param("value", int_type())],
+						Some(int_type()),
+						True,
+						False,
+					),
+				],
+			),
+		],
+	)
+	qualified_modules = importable_modules(
+		"qualified_methods",
+		[
+			trait_decl_with_methods(
+				"Hidden",
+				[],
+				[],
+				[
+					trait_method_decl(
+						"hidden",
+						[named_param("value", int_type())],
+						Some(int_type()),
+						True,
+						False,
+					),
+				],
+			),
+		],
+	)
+	target = program([
+		import_block_decl([
+			import_decl(
+				"selected_methods",
+				None,
+				Some([import_symbol("imported", Some("alpha"), [])]),
+			),
+			import_decl("qualified_methods", Some("Qualified"), None),
+		]),
+		trait_decl_with_methods(
+			"Local",
+			[],
+			[],
+			[
+				trait_method_decl(
+					"middle",
+					[named_param("value", int_type())],
+					Some(int_type()),
+					True,
+					False,
+				),
+				trait_method_decl(
+					"zeta",
+					[named_param("value", int_type())],
+					Some(int_type()),
+					True,
+					False,
+				),
+			],
+		),
+	])
+	result = typecheck_test_program_with_import_modules(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		target,
+		selected_modules.concat(qualified_modules),
+	)
+	authority ?= module_view_accepted_trait_implementation_authority(result.state.module_view)
+	alpha ?= accepted_trait_find_function_method(authority, "alpha")
+	middle ?= accepted_trait_find_function_method(authority, "middle")
+	zeta ?= accepted_trait_find_function_method(authority, "zeta")
+
+	Some(
+		(
+			result.state.errors.is_empty()
+			and accepted_trait_method_binding_signature(alpha).name == "imported"
+			and accepted_trait_method_binding_declaring_trait_name(alpha) == "Imported"
+			and accepted_trait_method_binding_signature(middle).name == "middle"
+			and accepted_trait_method_binding_declaring_trait_name(middle) == "Local"
+			and accepted_trait_method_binding_signature(zeta).name == "zeta"
+			and accepted_trait_method_binding_declaring_trait_name(zeta) == "Local"
+			and accepted_trait_find_function_method(authority, "hidden").is_none()
+		),
+	)
+
+
+func test_accepted_trait_method_lookup_sorts_exact_visibility_rows() -> Bool:
+	accepted_trait_method_lookup_sorts_exact_visibility_rows().get_or(False)
 
 
 func test_impl_registration_rejects_mismatched_module_path() -> Bool:
@@ -7594,8 +8221,40 @@ tests: TestSuite = {
 			test_bind_program_module_view_returns_completed_namespace,
 		),
 		(
+			"graph binding batches local prescan before import conflicts",
+			test_graph_binding_batches_local_prescan_before_import_conflicts,
+		),
+		(
+			"graph binding local batch preserves uncataloged name error",
+			test_graph_binding_local_batch_preserves_uncataloged_name_error,
+		),
+		(
 			"bound module alias retains graph module id",
 			test_bound_module_alias_retains_graph_module_id,
+		),
+		(
+			"bound alias and selective name share one graph row",
+			test_bound_alias_and_selective_name_share_one_graph_row,
+		),
+		(
+			"graph binding preserves private missing and duplicate diagnostic order",
+			test_graph_binding_keeps_private_missing_and_duplicate_diagnostics_in_order,
+		),
+		(
+			"graph import module decisions preserve source order and admission",
+			test_graph_import_module_decisions_preserve_source_order_and_admission,
+		),
+		(
+			"graph module alias rejects equal-layout foreign table",
+			test_graph_module_alias_rejects_equal_layout_foreign_table,
+		),
+		(
+			"graph view rejects other module in same graph",
+			test_graph_view_rejects_other_module_in_same_graph,
+		),
+		(
+			"bind program rejects same-graph wrong module view",
+			test_bind_program_rejects_same_graph_wrong_module_view,
 		),
 		(
 			"bind program module view rejects unreserved state",
@@ -8093,6 +8752,14 @@ tests: TestSuite = {
 			test_qualified_only_namesake_does_not_replace_selective_trait_binding,
 		),
 		(
+			"accepted trait visibility sorts exact alias and local rows",
+			test_accepted_trait_visibility_sorts_exact_alias_and_local_rows,
+		),
+		((
+				"accepted trait visibility keeps last exact duplicate alias and rejects "
+				+ "uncataloged alias"
+			), test_accepted_trait_visibility_duplicate_alias_is_exact),
+		(
 			"aliased trait rows report one method collision",
 			test_aliased_trait_rows_report_one_method_collision,
 		),
@@ -8111,6 +8778,10 @@ tests: TestSuite = {
 		(
 			"accepted trait method lookup preserves exact identity",
 			test_accepted_trait_method_lookup_preserves_exact_identity,
+		),
+		(
+			"accepted trait method lookup sorts exact visibility rows",
+			test_accepted_trait_method_lookup_sorts_exact_visibility_rows,
 		),
 		(
 			"impl registration rejects mismatched module path",
