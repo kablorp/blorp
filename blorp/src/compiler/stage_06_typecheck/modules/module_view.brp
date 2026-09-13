@@ -16,9 +16,16 @@ import:
 		definition_table_selective_definition_name,
 		definition_tables_share_provenance,
 	../graph/source_name_table:
-		SourceNameTable,
+		GraphModuleNameScope,
+		GraphSourceNameTable,
+		SourceNameId,
+		graph_module_name_scope_graph_names,
+		graph_module_name_scope_module_id,
+		graph_source_name_table_module_table,
+		graph_source_name_table_source_names,
 		source_name_id_table_index,
 		source_name_table_find_id,
+		source_name_table_id_at,
 	../type_system/accepted_alias_authority:
 		AcceptedAliasAuthority,
 		accepted_alias_authority_without_visible_names,
@@ -46,8 +53,6 @@ import:
 			StandaloneSelectiveDefinitionBinding,
 		),
 		MODULE_IMPORT_TARGET_INVALID_LABEL,
-		ModuleAliasBinding,
-		module_alias_binding,
 
 
 record ImportedNameBinding {
@@ -85,18 +90,31 @@ private union LocalNameStorage:
 	StandaloneLocalNameStorage
 
 
+-- One current-occupancy row per graph spelling. Alias and selective import
+-- may coexist only when they target the same module; local names are exclusive.
+private union BoundNameOccupancy:
+	BoundModuleAlias(ModuleId)
+	BoundSelectiveName(ImportedNameBinding)
+	BoundAliasAndSelectiveName(ModuleId, ImportedNameBinding)
+	BoundLocalName(TopLevelNameKind)
+
+
+private record BoundVisibility {
+	issuer: GraphModuleNameScope,
+	-- Occupancy is one row per cataloged name; binding order belongs to the
+	-- ordered import inventory, never to dictionary iteration order.
+	rows_by_source_name_index: Dict[Int, BoundNameOccupancy]
+}
+
+
 private record ModuleViewRep {
-	module_aliases: List[ModuleAliasBinding],
-	source_name_table: Option[SourceNameTable],
-	graph_module_aliases_by_source_name_id: Dict[Int, ModuleId],
+	graph_visibility: Option[BoundVisibility],
 	standalone_module_aliases_by_local_name: Dict[String, String],
 	import_binding_domain: ImportBindingDomain,
 	imported_names: List[ImportedNameBinding],
-	graph_imported_names_by_source_name_id: Dict[Int, ImportedNameBinding],
 	standalone_imported_names_by_local_name: Dict[String, ImportedNameBinding],
 	imported_constructors: List[ImportedConstructorBinding],
 	import_bindings: List[ImportBinding],
-	graph_local_names_by_source_name_id: Dict[Int, TopLevelNameKind],
 	standalone_local_names_by_local_name: Dict[String, TopLevelNameKind],
 	accepted_alias_authority: Option[AcceptedAliasAuthority],
 	accepted_record_authority: Option[AcceptedRecordAuthority],
@@ -145,17 +163,13 @@ private pure func module_view_from_rep(representation: ModuleViewRep) -> ModuleV
 
 
 COMPILER_MODULE_VIEW_EMPTY: ModuleView = module_view_from_rep({
-	module_aliases = [],
-	source_name_table = None,
-	graph_module_aliases_by_source_name_id = {},
+	graph_visibility = None,
 	standalone_module_aliases_by_local_name = {},
 	import_binding_domain = NoImportBindings,
 	imported_names = [],
-	graph_imported_names_by_source_name_id = {},
 	standalone_imported_names_by_local_name = {},
 	imported_constructors = [],
 	import_bindings = [],
-	graph_local_names_by_source_name_id = {},
 	standalone_local_names_by_local_name = {},
 	accepted_alias_authority = None,
 	accepted_record_authority = None,
@@ -169,13 +183,111 @@ COMPILER_MODULE_VIEW_EMPTY: ModuleView = module_view_from_rep({
 -- Indexed graph states receive the one compilation-owned spelling table
 -- before any visibility registration. Standalone source helpers deliberately
 -- retain their source-oriented string maps.
-pure func module_view_for_graph(source_names: SourceNameTable) -> ModuleView:
+pure func module_view_for_graph(issuer: GraphModuleNameScope) -> ModuleView:
 	representation = module_view_rep(COMPILER_MODULE_VIEW_EMPTY)
-	module_view_from_rep({ representation | source_name_table = Some(source_names) })
+	visibility: BoundVisibility = {
+		issuer = issuer,
+		rows_by_source_name_index = {}
+	}
+	module_view_from_rep({ representation | graph_visibility = Some(visibility) })
 
 
 pure func module_view_has_graph_source_names(view: ModuleView) -> Bool:
-	module_view_rep(view).source_name_table.is_some()
+	module_view_rep(view).graph_visibility.is_some()
+
+
+pure func module_view_graph_bound_name_count(view: ModuleView) -> Int:
+	match module_view_rep(view).graph_visibility:
+		Some(visibility):
+			visibility.rows_by_source_name_index.length()
+		None:
+			0
+
+
+-- Prescan knows every graph-local spelling before import admission. Build the
+-- initial occupancy with uniquely owned local collections, then publish one
+-- immutable view. A non-fresh or foreign view must use ordinary registration;
+-- callers can preserve its per-name diagnostics by falling back on None.
+pure func module_view_bind_initial_graph_local_names(
+	view: ModuleView,
+	module_table: ModuleTable,
+	current_module_id: ModuleId,
+	local_names: List[(String, TopLevelNameKind)],
+) -> Option[ModuleView]:
+	if not module_view_graph_has_owner(view, module_table, current_module_id):
+		None
+	else:
+		representation = module_view_rep(view)
+		match representation.graph_visibility:
+			None:
+				None
+			Some(visibility):
+				if (
+					not visibility.rows_by_source_name_index.is_empty()
+					or representation.import_binding_domain != NoImportBindings
+					or not representation.imported_names.is_empty()
+					or not representation.imported_constructors.is_empty()
+					or not representation.import_bindings.is_empty()
+					or representation.accepted_alias_authority.is_some()
+					or representation.accepted_record_authority.is_some()
+					or representation.accepted_union_authority.is_some()
+					or representation.accepted_global_authority.is_some()
+					or representation.accepted_callable_authority.is_some()
+					or representation.accepted_trait_implementation_authority.is_some()
+				):
+					None
+				else if local_names.is_empty():
+					Some(view)
+				else:
+					table = graph_source_name_table_source_names(
+						graph_module_name_scope_graph_names(visibility.issuer),
+					)
+					var rows_by_source_name_index: Dict[Int, BoundNameOccupancy] = {}
+					var all_cataloged = True
+
+					for candidate in local_names:
+						match source_name_table_find_id(table, candidate[0]):
+							None:
+								all_cataloged = False
+							Some(source_name_id):
+								source_name_index = source_name_id_table_index(source_name_id)
+								if not rows_by_source_name_index.contains(source_name_index):
+									rows_by_source_name_index = rows_by_source_name_index.set(
+										source_name_index,
+										BoundLocalName(candidate[1]),
+									)
+
+					if not all_cataloged:
+						None
+					else:
+						Some(module_view_from_rep({ representation |
+							graph_visibility = Some({ visibility |
+								rows_by_source_name_index = rows_by_source_name_index
+							})
+						}))
+
+
+pure func module_view_graph_has_owner(
+	view: ModuleView,
+	module_table: ModuleTable,
+	module_id: ModuleId,
+) -> Bool:
+	match module_view_rep(view).graph_visibility:
+		Some(visibility):
+			(
+				module_tables_are_compatible(
+					graph_source_name_table_module_table(
+						graph_module_name_scope_graph_names(visibility.issuer),
+					),
+					module_table,
+				)
+				and module_ids_equal(
+					graph_module_name_scope_module_id(visibility.issuer),
+					module_id,
+				)
+			)
+		None:
+			False
 
 
 -- Standalone tooling may reuse a graph-reserved TypecheckState for its module
@@ -188,10 +300,14 @@ pure func module_view_for_standalone_source_bindings(view: ModuleView) -> Option
 		GraphImportBindings:
 			None
 		_:
-			if representation.graph_local_names_by_source_name_id.is_empty():
-				Some(module_view_from_rep({ representation | source_name_table = None }))
-			else:
-				None
+			match representation.graph_visibility:
+				Some(visibility):
+					if visibility.rows_by_source_name_index.is_empty():
+						Some(module_view_from_rep({ representation | graph_visibility = None }))
+					else:
+						None
+				None:
+					Some(view)
 
 
 pure func top_level_name_kind_label(kind: TopLevelNameKind) -> String:
@@ -216,14 +332,6 @@ pure func top_level_name_kind_is_trait(kind: TopLevelNameKind) -> Bool:
 			False
 
 
-pure func module_view_module_aliases(view: ModuleView) -> List[ModuleAliasBinding]:
-	module_view_rep(view).module_aliases
-
-
-pure func module_view_standalone_module_alias_index(view: ModuleView) -> Dict[String, String]:
-	module_view_rep(view).standalone_module_aliases_by_local_name
-
-
 pure func module_view_has_standalone_import_bindings(view: ModuleView) -> Bool:
 	match module_view_rep(view).import_binding_domain:
 		StandaloneImportBindings:
@@ -245,7 +353,14 @@ pure func module_view_module_alias_count(view: ModuleView) -> Int:
 
 	match representation.import_binding_domain:
 		GraphImportBindings:
-			representation.module_aliases.length()
+			var count: Int = 0
+			for binding in representation.import_bindings:
+				match binding:
+					GraphQualifiedModuleBinding(_, _):
+						count += 1
+					_:
+						void
+			count
 		StandaloneImportBindings:
 			representation.standalone_module_aliases_by_local_name.length()
 		NoImportBindings:
@@ -362,9 +477,116 @@ private pure func module_view_graph_source_name_index(
 	representation: ModuleViewRep,
 	local_name: String,
 ) -> Option[Int]:
-	table ?= representation.source_name_table
+	visibility ?= representation.graph_visibility
+	table = graph_source_name_table_source_names(
+		graph_module_name_scope_graph_names(visibility.issuer),
+	)
 	name_id ?= source_name_table_find_id(table, local_name)
 	Some(source_name_id_table_index(name_id))
+
+
+private pure func bound_visibility_occupancy(
+	visibility: BoundVisibility,
+	source_name_index: Int,
+) -> Option[BoundNameOccupancy]:
+	visibility.rows_by_source_name_index.get(source_name_index)
+
+
+private pure func module_view_graph_occupancy(
+	representation: ModuleViewRep,
+	source_name_index: Int,
+) -> Option[BoundNameOccupancy]:
+	visibility ?= representation.graph_visibility
+	bound_visibility_occupancy(visibility, source_name_index)
+
+
+private pure func module_view_with_graph_occupancy(
+	representation: ModuleViewRep,
+	source_name_index: Int,
+	occupancy: BoundNameOccupancy,
+) -> ModuleViewRep:
+	match representation.graph_visibility:
+		None:
+			representation
+		Some(visibility):
+			match visibility.rows_by_source_name_index.get(source_name_index):
+				Some(_):
+					next = { visibility |
+						rows_by_source_name_index = visibility.rows_by_source_name_index.set(
+							source_name_index,
+							occupancy,
+						)
+					}
+					{ representation | graph_visibility = Some(next) }
+				None:
+					table = graph_source_name_table_source_names(
+						graph_module_name_scope_graph_names(visibility.issuer),
+					)
+					match source_name_table_id_at(table, source_name_index):
+						Some(_):
+							next = { visibility |
+								rows_by_source_name_index = visibility.rows_by_source_name_index.set(
+									source_name_index,
+									occupancy,
+								)
+							}
+							{ representation | graph_visibility = Some(next) }
+						None:
+							representation
+
+
+private pure func bound_name_module_alias(
+	occupancy: BoundNameOccupancy,
+) -> Option[ModuleId]:
+	match occupancy:
+		BoundModuleAlias(module_id) | BoundAliasAndSelectiveName(module_id, _):
+			Some(module_id)
+		_:
+			None
+
+
+private pure func bound_name_imported_name(
+	occupancy: BoundNameOccupancy,
+) -> Option[ImportedNameBinding]:
+	match occupancy:
+		BoundSelectiveName(binding) | BoundAliasAndSelectiveName(_, binding):
+			Some(binding)
+		_:
+			None
+
+
+private pure func bound_name_local_kind(
+	occupancy: BoundNameOccupancy,
+) -> Option[TopLevelNameKind]:
+	match occupancy:
+		BoundLocalName(kind):
+			Some(kind)
+		_:
+			None
+
+
+private pure func module_view_graph_imported_name_at(
+	representation: ModuleViewRep,
+	source_name_index: Int,
+) -> Option[ImportedNameBinding]:
+	occupancy ?= module_view_graph_occupancy(representation, source_name_index)
+	bound_name_imported_name(occupancy)
+
+
+private pure func module_view_graph_local_kind_at(
+	representation: ModuleViewRep,
+	source_name_index: Int,
+) -> Option[TopLevelNameKind]:
+	occupancy ?= module_view_graph_occupancy(representation, source_name_index)
+	bound_name_local_kind(occupancy)
+
+
+private pure func module_view_graph_module_alias_at(
+	representation: ModuleViewRep,
+	source_name_index: Int,
+) -> Option[ModuleId]:
+	occupancy ?= module_view_graph_occupancy(representation, source_name_index)
+	bound_name_module_alias(occupancy)
 
 
 pure func module_view_find_graph_module_alias(
@@ -372,9 +594,9 @@ pure func module_view_find_graph_module_alias(
 	local_name: String,
 ) -> Option[ModuleId]:
 	representation = module_view_rep(view)
-	table ?= representation.source_name_table
-	name_id ?= source_name_table_find_id(table, local_name)
-	representation.graph_module_aliases_by_source_name_id.get(source_name_id_table_index(name_id))
+	name_index ?= module_view_graph_source_name_index(representation, local_name)
+	occupancy ?= module_view_graph_occupancy(representation, name_index)
+	bound_name_module_alias(occupancy)
 
 
 -- This compatibility projection is for standalone source-oriented consumers.
@@ -414,12 +636,11 @@ private pure func module_view_rep_find_imported_name(
 	representation: ModuleViewRep,
 	local_name: String,
 ) -> Option[ImportedNameBinding]:
-	match representation.source_name_table:
-		Some(table):
-			name_id ?= source_name_table_find_id(table, local_name)
-			representation.graph_imported_names_by_source_name_id.get(
-				source_name_id_table_index(name_id),
-			)
+	match representation.graph_visibility:
+		Some(_):
+			name_index ?= module_view_graph_source_name_index(representation, local_name)
+			occupancy ?= module_view_graph_occupancy(representation, name_index)
+			bound_name_imported_name(occupancy)
 		None:
 			representation.standalone_imported_names_by_local_name.get(local_name)
 
@@ -435,12 +656,11 @@ private pure func module_view_rep_find_local_name(
 	representation: ModuleViewRep,
 	local_name: String,
 ) -> Option[TopLevelNameKind]:
-	match representation.source_name_table:
-		Some(table):
-			name_id ?= source_name_table_find_id(table, local_name)
-			representation.graph_local_names_by_source_name_id.get(
-				source_name_id_table_index(name_id),
-			)
+	match representation.graph_visibility:
+		Some(_):
+			name_index ?= module_view_graph_source_name_index(representation, local_name)
+			occupancy ?= module_view_graph_occupancy(representation, name_index)
+			bound_name_local_kind(occupancy)
 		None:
 			representation.standalone_local_names_by_local_name.get(local_name)
 
@@ -494,8 +714,8 @@ private pure func module_view_register_graph_module_alias_by_name_index(
 	source_name_index: Int,
 	module_id: ModuleId,
 ) -> ModuleAliasRegistration:
-	match representation.graph_module_aliases_by_source_name_id.get(source_name_index):
-		Some(existing_module_id):
+	match module_view_graph_occupancy(representation, source_name_index):
+		Some(BoundModuleAlias(existing_module_id)) | Some(BoundAliasAndSelectiveName(existing_module_id, _)):
 			if module_ids_equal(existing_module_id, module_id):
 				ModuleAliasAlreadyPresent
 			else:
@@ -505,33 +725,29 @@ private pure func module_view_register_graph_module_alias_by_name_index(
 						existing_module_id,
 					),
 				)
+		Some(BoundSelectiveName(existing_binding)):
+			if not module_view_graph_target_matches_path(
+				Some(module_table),
+				module_id,
+				existing_binding.module_path,
+			):
+				ModuleAliasConflictsWithImportedName(existing_binding)
+			else:
+				module_view_add_graph_module_alias(
+					representation,
+					local_name,
+					source_name_index,
+					module_id,
+				)
+		Some(BoundLocalName(existing_kind)):
+			ModuleAliasConflictsWithLocalName(existing_kind)
 		None:
-			match representation.graph_imported_names_by_source_name_id.get(source_name_index):
-				Some(existing_binding):
-					if not module_view_graph_target_matches_path(
-						Some(module_table),
-						module_id,
-						existing_binding.module_path,
-					):
-						ModuleAliasConflictsWithImportedName(existing_binding)
-					else:
-						module_view_add_graph_module_alias(
-							representation,
-							local_name,
-							source_name_index,
-							module_id,
-						)
-				None:
-					match module_view_rep_find_local_name(representation, local_name):
-						Some(existing_kind):
-							ModuleAliasConflictsWithLocalName(existing_kind)
-						None:
-							module_view_add_graph_module_alias(
-								representation,
-								local_name,
-								source_name_index,
-								module_id,
-							)
+			module_view_add_graph_module_alias(
+				representation,
+				local_name,
+				source_name_index,
+				module_id,
+			)
 
 
 private pure func module_view_add_graph_module_alias(
@@ -540,19 +756,15 @@ private pure func module_view_add_graph_module_alias(
 	source_name_index: Int,
 	module_id: ModuleId,
 ) -> ModuleAliasRegistration:
-	ModuleAliasAdded(module_view_from_rep({ representation |
+	occupancy = match module_view_graph_occupancy(representation, source_name_index):
+		Some(BoundSelectiveName(binding)):
+			BoundAliasAndSelectiveName(module_id, binding)
+		_:
+			BoundModuleAlias(module_id)
+	next = module_view_with_graph_occupancy(representation, source_name_index, occupancy)
+	ModuleAliasAdded(module_view_from_rep({ next |
 				import_binding_domain = GraphImportBindings,
-				module_aliases = representation.module_aliases.append(
-					module_alias_binding(
-						local_name,
-						module_id,
-					),
-				),
-				graph_module_aliases_by_source_name_id = representation.graph_module_aliases_by_source_name_id.set(
-					source_name_index,
-					module_id,
-				),
-				import_bindings = representation.import_bindings.append(
+				import_bindings = next.import_bindings.append(
 					GraphQualifiedModuleBinding(
 						local_name,
 						module_id,
@@ -604,7 +816,7 @@ pure func module_view_register_standalone_module_alias(
 ) -> ModuleAliasRegistration:
 	representation = module_view_rep(view)
 
-	if representation.source_name_table.is_some():
+	if representation.graph_visibility.is_some():
 		ModuleAliasInvalidTarget
 	else:
 		match representation.import_binding_domain:
@@ -641,12 +853,15 @@ private pure func module_view_add_standalone_module_alias(
 pure func module_view_register_module_alias_target(
 	view: ModuleView,
 	current_table: ModuleTable,
+	current_module_id: ModuleId,
 	local_name: String,
 	expected_module_path: String,
 	issuing_table: ModuleTable,
 	module_id: ModuleId,
 ) -> ModuleAliasRegistration:
 	if (
+		module_view_graph_has_owner(view, current_table, current_module_id)
+		and
 		module_tables_are_compatible(current_table, issuing_table)
 		and module_table_canonical_path(issuing_table, module_id) == Some(expected_module_path)
 		and not module_view_has_standalone_import_bindings(view)
@@ -682,12 +897,12 @@ private pure func module_view_add_graph_selective_name(
 		module_path = module_path,
 		original_name = source_name
 	}
-	next = { representation |
-		graph_imported_names_by_source_name_id = representation.graph_imported_names_by_source_name_id.set(
-			source_name_index,
-			binding,
-		)
-	}
+	occupancy = match module_view_graph_occupancy(representation, source_name_index):
+		Some(BoundModuleAlias(module_id)):
+			BoundAliasAndSelectiveName(module_id, binding)
+		_:
+			BoundSelectiveName(binding)
+	next = module_view_with_graph_occupancy(representation, source_name_index, occupancy)
 	module_view_finish_add_selective_name(next, binding, import_binding, GraphImportBindings)
 
 
@@ -721,44 +936,34 @@ private pure func module_view_register_graph_selective_name(
 	source_name: String,
 	import_binding: ImportBinding,
 ) -> SelectiveNameRegistration:
-	match representation.graph_imported_names_by_source_name_id.get(source_name_index):
-		Some(existing_binding):
+	match module_view_graph_occupancy(representation, source_name_index):
+		Some(BoundSelectiveName(existing_binding)) | Some(BoundAliasAndSelectiveName(_, existing_binding)):
 			SelectiveNameConflictsWithImportedName(existing_binding)
+		Some(BoundModuleAlias(existing_module_id)):
+			if module_table_canonical_path(module_table, existing_module_id) == Some(module_path):
+				module_view_add_graph_selective_name(
+					representation,
+					source_name_index,
+					local_name,
+					module_path,
+					source_name,
+					import_binding,
+				)
+			else:
+				SelectiveNameConflictsWithAlias(
+					module_view_graph_alias_label(Some(module_table), existing_module_id),
+				)
+		Some(BoundLocalName(existing_kind)):
+			SelectiveNameConflictsWithLocalName(existing_kind)
 		None:
-			match representation.graph_module_aliases_by_source_name_id.get(source_name_index):
-				Some(existing_module_id):
-					if module_table_canonical_path(
-						module_table,
-						existing_module_id,
-					) == Some(module_path):
-						module_view_add_graph_selective_name(
-							representation,
-							source_name_index,
-							local_name,
-							module_path,
-							source_name,
-							import_binding,
-						)
-					else:
-						SelectiveNameConflictsWithAlias(
-							module_view_graph_alias_label(
-								Some(module_table),
-								existing_module_id,
-							),
-						)
-				None:
-					match representation.graph_local_names_by_source_name_id.get(source_name_index):
-						Some(existing_kind):
-							SelectiveNameConflictsWithLocalName(existing_kind)
-						None:
-							module_view_add_graph_selective_name(
-								representation,
-								source_name_index,
-								local_name,
-								module_path,
-								source_name,
-								import_binding,
-							)
+			module_view_add_graph_selective_name(
+				representation,
+				source_name_index,
+				local_name,
+				module_path,
+				source_name,
+				import_binding,
+			)
 
 
 private pure func module_view_register_standalone_selective_name(
@@ -800,6 +1005,7 @@ private pure func module_view_register_standalone_selective_name(
 
 pure func module_view_register_selective_name_for_graph(
 	view: ModuleView,
+	current_module_id: ModuleId,
 	active_definition_table: DefinitionTable,
 	issuing_definition_table: DefinitionTable,
 	local_name: String,
@@ -817,6 +1023,12 @@ pure func module_view_register_selective_name_for_graph(
 			SelectiveNameInvalidSourceName
 		Some(source_name_index):
 			if (
+				module_view_graph_has_owner(
+					view,
+					definition_table_module_table(active_definition_table),
+					current_module_id,
+				)
+				and
 				definition_tables_share_provenance(
 					active_definition_table,
 					issuing_definition_table,
@@ -848,6 +1060,7 @@ pure func module_view_register_selective_name_for_graph(
 -- callable/global authorities that own those identity domains.
 pure func module_view_register_graph_selective_trait_method(
 	view: ModuleView,
+	current_module_id: ModuleId,
 	active_definition_table: DefinitionTable,
 	issuing_definition_table: DefinitionTable,
 	local_name: String,
@@ -865,7 +1078,12 @@ pure func module_view_register_graph_selective_trait_method(
 			SelectiveNameInvalidSourceName
 		Some(source_name_index):
 			if (
-				not definition_tables_share_provenance(
+				not module_view_graph_has_owner(
+					view,
+					definition_table_module_table(active_definition_table),
+					current_module_id,
+				)
+				or not definition_tables_share_provenance(
 					active_definition_table,
 					issuing_definition_table,
 				)
@@ -905,7 +1123,7 @@ pure func module_view_register_selective_name(
 	source_name: String,
 ) -> SelectiveNameRegistration:
 	if (
-		module_view_rep(view).source_name_table.is_some()
+		module_view_rep(view).graph_visibility.is_some()
 		or module_view_has_graph_import_bindings(view)
 	):
 		SelectiveNameInvalidTarget
@@ -927,12 +1145,11 @@ private pure func module_view_add_local_name(
 ) -> LocalNameRegistration:
 	next = match storage:
 		GraphLocalNameStorage(source_name_index):
-			{ representation |
-				graph_local_names_by_source_name_id = representation.graph_local_names_by_source_name_id.set(
-					source_name_index,
-					kind,
-				)
-			}
+			module_view_with_graph_occupancy(
+				representation,
+				source_name_index,
+				BoundLocalName(kind),
+			)
 		StandaloneLocalNameStorage:
 			{ representation |
 				standalone_local_names_by_local_name = representation.standalone_local_names_by_local_name.set(
@@ -952,7 +1169,7 @@ private pure func module_view_add_local_name_without_alias_conflict(
 ) -> LocalNameRegistration:
 	existing_import = match storage:
 		GraphLocalNameStorage(source_name_index):
-			representation.graph_imported_names_by_source_name_id.get(source_name_index)
+			module_view_graph_imported_name_at(representation, source_name_index)
 		StandaloneLocalNameStorage:
 			representation.standalone_imported_names_by_local_name.get(local_name)
 
@@ -974,7 +1191,7 @@ private pure func module_view_register_local_name_with_storage(
 
 	existing_local_name = match storage:
 		GraphLocalNameStorage(source_name_index):
-			representation.graph_local_names_by_source_name_id.get(source_name_index)
+			module_view_graph_local_kind_at(representation, source_name_index)
 		StandaloneLocalNameStorage:
 			representation.standalone_local_names_by_local_name.get(local_name)
 
@@ -984,7 +1201,8 @@ private pure func module_view_register_local_name_with_storage(
 		None:
 			match storage:
 				GraphLocalNameStorage(source_name_index):
-					match representation.graph_module_aliases_by_source_name_id.get(
+					match module_view_graph_module_alias_at(
+						representation,
 						source_name_index,
 					):
 						Some(existing_module_id):
@@ -1017,22 +1235,26 @@ private pure func module_view_register_local_name_with_storage(
 pure func module_view_register_local_name_for_graph(
 	view: ModuleView,
 	module_table: ModuleTable,
+	current_module_id: ModuleId,
 	local_name: String,
 	kind: TopLevelNameKind,
 ) -> LocalNameRegistration:
 	representation = module_view_rep(view)
 
-	match module_view_graph_source_name_index(representation, local_name):
-		Some(source_name_index):
-			module_view_register_local_name_with_storage(
-				view,
-				Some(module_table),
-				local_name,
-				kind,
-				GraphLocalNameStorage(source_name_index),
-			)
-		None:
-			LocalNameInvalidSourceName
+	if not module_view_graph_has_owner(view, module_table, current_module_id):
+		LocalNameInvalidSourceName
+	else:
+		match module_view_graph_source_name_index(representation, local_name):
+			Some(source_name_index):
+				module_view_register_local_name_with_storage(
+					view,
+					Some(module_table),
+					local_name,
+					kind,
+					GraphLocalNameStorage(source_name_index),
+				)
+			None:
+				LocalNameInvalidSourceName
 
 
 pure func module_view_register_local_name(
@@ -1040,7 +1262,7 @@ pure func module_view_register_local_name(
 	local_name: String,
 	kind: TopLevelNameKind,
 ) -> LocalNameRegistration:
-	if module_view_rep(view).source_name_table.is_some():
+	if module_view_rep(view).graph_visibility.is_some():
 		LocalNameInvalidSourceName
 	else:
 		module_view_register_local_name_with_storage(
@@ -1050,6 +1272,29 @@ pure func module_view_register_local_name(
 			kind,
 			StandaloneLocalNameStorage,
 		)
+
+
+private pure func bound_visibility_without_unqualified_names(
+	visibility: BoundVisibility,
+) -> BoundVisibility:
+	var retained_rows: Dict[Int, BoundNameOccupancy] = {}
+
+	for entry in visibility.rows_by_source_name_index.entries():
+		module_alias_id = match entry[1]:
+			BoundModuleAlias(module_id) | BoundAliasAndSelectiveName(module_id, _):
+				Some(module_id)
+			_:
+				None
+
+		match module_alias_id:
+			Some(module_id):
+				retained_rows = retained_rows.set(entry[0], BoundModuleAlias(module_id))
+			None:
+				void
+
+	{ visibility |
+		rows_by_source_name_index = retained_rows
+	}
 
 
 pure func module_view_without_unqualified_names(view: ModuleView) -> ModuleView:
@@ -1063,11 +1308,12 @@ pure func module_view_without_unqualified_names(view: ModuleView) -> ModuleView:
 	)
 	module_view_from_rep({ representation |
 			imported_names = [],
-			graph_imported_names_by_source_name_id = {},
+			graph_visibility = representation.graph_visibility.map(
+				bound_visibility_without_unqualified_names,
+			),
 			standalone_imported_names_by_local_name = {},
 			imported_constructors = [],
 			import_bindings = qualified_bindings,
-			graph_local_names_by_source_name_id = {},
 			standalone_local_names_by_local_name = {},
 			accepted_alias_authority = representation.accepted_alias_authority.map(
 				accepted_alias_authority_without_visible_names,

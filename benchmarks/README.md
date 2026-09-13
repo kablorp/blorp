@@ -658,6 +658,42 @@ The baseline, prescan result, and profile interpretation are recorded in
 only dependency-order list mechanics should not be mistaken for reducing
 semantic registration or body checking.
 
+### Bound Visibility Width Profile
+
+`compiler_visibility_width_profile` isolates the graph `ModuleView` keyed occupancy
+relation from parsing, graph construction, and definition-ID lookup. It varies
+the number of dependency modules, alias/selective/local names, duplicate
+attempts, and successful queries independently. The first three counts set
+the bound row width. Duplicate aliases must be idempotent; duplicate selective
+names must conflict without adding rows or bindings. The bound-query checksum
+combines resolved graph module IDs and checked imported paths; it does not
+prove exact selective `DefinitionId` targets or accepted semantic IDs.
+
+```bash
+benchmarks/compiler_visibility_width_profile 1000 16 32 32 16 16 128
+benchmarks/compiler_visibility_width_profile 1000 16 128 128 64 64 512
+benchmarks/compiler_visibility_width_profile 1000 16 128 128 64 64 512 0 1
+BLORP_VISIBILITY_WIDTH_PROFILE_FUNCTIONS=1 \
+  benchmarks/compiler_visibility_width_profile 1 16 32 32 16 16 128
+```
+
+The first seven positional controls are iterations, dependency modules,
+aliases, selective imports, locals, duplicate attempts, and queries. An
+optional eighth flag (`1`) reuses alias spellings for selectives, separating
+row width from ordered binding count. An optional ninth flag (`1`) batches
+the initial local-name rows before alias/selective admission; the default
+per-name mode uses that same locals-first order. The candidate tuples for
+batch mode are prepared outside the timed window. Setup uses the
+compiler's validated definition identities, then constructs a source-name
+catalog for this direct low-level view workload; this is not a full importer
+or accepted-graph benchmark. `requested_name_operations` counts public
+registration/query requests, not native string hashes or internal index probes.
+Memory `allocated_bytes` is net live bytes after the measured window, not
+cumulative allocation traffic. Profile mode attributes function calls but
+uses unoptimized generated C, so its elapsed time is not comparable to the
+plain run. Binder privacy and diagnostic order are checked separately in the
+declaration suite.
+
 ### Module Binding Profile
 
 `compiler_module_binding_profile` isolates graph-aware source import binding

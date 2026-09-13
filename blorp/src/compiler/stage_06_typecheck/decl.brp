@@ -438,12 +438,14 @@ import:
 		module_view_accepted_record_authority,
 		module_view_accepted_trait_implementation_authority,
 		module_view_accepted_union_authority,
+		module_view_bind_initial_graph_local_names,
 		module_view_for_standalone_source_bindings,
+		module_view_graph_has_owner,
 		module_view_has_graph_import_bindings,
 		module_view_has_standalone_import_bindings,
 		module_view_import_bindings,
 		module_view_imported_names,
-		module_view_module_aliases,
+		module_view_module_alias_count,
 		module_view_with_accepted_alias_authority,
 		module_view_with_accepted_callable_authority,
 		module_view_with_accepted_global_authority,
@@ -1997,6 +1999,51 @@ private pure func trait_method_from_parsed(
 	trait_method_sig_with_details(name, params, return_type, is_pure, has_default, param_names)
 
 
+-- Graph binding collects one candidate list for a single publication. The
+-- ordinary prescan below keeps direct registration so standalone modules do
+-- not allocate a temporary list for every declaration.
+private pure func typecheck_prescan_decl_local_name_candidates(
+	decl: ParsedDecl,
+) -> List[(String, TopLevelNameKind)]:
+	match decl:
+		RecordParsedDecl(record_decl):
+			[(record_decl.name.text, TopLevelType)]
+		UnionParsedDecl(union_decl):
+			var candidates: List[(String, TopLevelNameKind)] = [
+				(union_decl.name.text, TopLevelType),
+			]
+
+			for variant in union_decl.variants:
+				candidates = candidates.append((variant.name.text, TopLevelConstructor))
+
+			candidates
+		BuiltinTypeParsedDecl(type_decl):
+			[(type_decl.name.text, TopLevelType)]
+		TypeAliasParsedDecl(alias_decl):
+			[(alias_decl.name.text, TopLevelType)]
+		FunctionParsedDecl(function_decl):
+			[(function_decl.name.text, TopLevelFunction)]
+		VarParsedDecl(var_decl):
+			[(var_decl.name.text, TopLevelVariable)]
+		TraitParsedDecl(trait_decl):
+			[(trait_decl.name.text, TopLevelTrait)]
+		ForeignBlockParsedDecl(_, functions, _):
+			var candidates: List[(String, TopLevelNameKind)] = []
+
+			for function_decl in functions:
+				candidates = candidates.append((function_decl.name.text, TopLevelFunction))
+
+			candidates
+		PrivateParsedDecl(inner, _):
+			typecheck_prescan_decl_local_name_candidates(inner)
+		ImportBlockParsedDecl(_, _):
+			[]
+		ImplParsedDecl(_):
+			[]
+		ParsedErrorDecl(_):
+			[]
+
+
 private pure func typecheck_prescan_decl_top_level_names(
 	state: TypecheckState,
 	decl: ParsedDecl,
@@ -2072,6 +2119,33 @@ pure func typecheck_prescan_program(
 		typecheck_state_scope_to_program(state, program),
 		program.decls,
 	)
+
+
+-- Graph prescan can publish all local occupancy at once. A non-fresh view or
+-- missing catalog entry falls back to per-name registration so its existing
+-- error behavior remains intact.
+private pure func typecheck_prescan_graph_program(
+	state: TypecheckState,
+	program: ParsedProgram,
+	current_scope: PreparedModuleScope,
+) -> TypecheckState:
+	scoped_state = typecheck_state_scope_to_program(state, program)
+	var with_known_types = scoped_state
+	var local_names: List[(String, TopLevelNameKind)] = []
+	for decl in program.decls:
+		with_known_types = typecheck_prescan_decl_known_type_names(with_known_types, decl)
+		for candidate in typecheck_prescan_decl_local_name_candidates(decl):
+			local_names = local_names.append(candidate)
+	match module_view_bind_initial_graph_local_names(
+		with_known_types.module_view,
+		prepared_module_scope_module_table(current_scope),
+		prepared_module_scope_id(current_scope),
+		local_names,
+	):
+		Some(published):
+			{ with_known_types | module_view = published }
+		None:
+			typecheck_prescan_decls(scoped_state, program.decls)
 
 
 pure func typecheck_register_program_import_decls(
@@ -6391,7 +6465,11 @@ private pure func typecheck_bind_program_module_view_for_reserved_state(
 		Some(current_module_path),
 	)
 	candidate_import_surfaces = importable_module_surfaces(candidate_import_modules)
-	with_names = typecheck_prescan_program(module_state, program_with_prelude)
+	with_names = typecheck_prescan_graph_program(
+		module_state,
+		program_with_prelude,
+		current_scope,
+	)
 	import_registration = register_program_imports(
 		with_names,
 		candidate_import_surfaces,
@@ -6476,6 +6554,18 @@ pure func typecheck_bind_program_module_view(
 			(
 				"internal typecheck error: graph module binding cannot accept standalone import "
 				+ "bindings"
+			),
+			[],
+		)
+	else if not module_view_graph_has_owner(
+		state.module_view,
+		prepared_module_scope_module_table(current_scope),
+		prepared_module_scope_id(current_scope),
+	):
+		BoundModuleViewRejected(
+			(
+				"internal typecheck error: graph module binding requires the view "
+				+ "for the selected module"
 			),
 			[],
 		)
@@ -6802,6 +6892,7 @@ private pure func accepted_trait_implementation_authority_for_module(
 	visibility: Option[AcceptedTraitVisibility] = accepted_visible_trait_bindings(
 		table,
 		issuing_definition_table,
+		prepared_module_scope_source_name_table(bound_module_scope(bound_module)),
 		module_view_import_bindings(view),
 	)
 
@@ -8567,9 +8658,7 @@ private pure func frontend_preparation_observation_add(
 
 
 private pure func frontend_preparation_module_view_projection_entries(view: ModuleView) -> Int:
-	module_view_module_aliases(
-		view,
-	).length() + module_view_imported_names(
+	module_view_module_alias_count(view) + module_view_imported_names(
 		view,
 	).length() + module_view_import_bindings(view).length()
 

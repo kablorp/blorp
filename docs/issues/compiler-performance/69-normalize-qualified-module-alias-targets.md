@@ -2,6 +2,10 @@
 
 **Status:** Complete
 
+**Later change:** [Issue 97](97-bound-visibility-width-probe.md) deletes the
+separate graph-alias list. This document describes the Step 2b packet's
+historical representation, not the current `ModuleView` shape.
+
 **Roadmap:** [Normalized Semantic Compilation Roadmap](NORMALIZED_SEMANTIC_COMPILATION_ROADMAP.md), Step 2b
 
 **Depends on:** Step 2a accepted module membership (`74e9c504`)

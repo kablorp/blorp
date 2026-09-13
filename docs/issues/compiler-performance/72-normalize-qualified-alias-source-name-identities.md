@@ -2,6 +2,10 @@
 
 **Status:** Complete
 
+**Later change:** [Issue 97](97-bound-visibility-width-probe.md) deletes the
+separate graph-alias list and resolves qualified aliases from keyed occupancy.
+The representation below records this packet's historical state.
+
 **Roadmap:** [Normalized Semantic Compilation Roadmap](NORMALIZED_SEMANTIC_COMPILATION_ROADMAP.md), Step 2e, first packet
 
 **Depends on:** Step 2b graph-qualified module targets (`e5fb245d`)

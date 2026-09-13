@@ -1,9 +1,12 @@
 import:
-	../../stage_04_modules/module_table: ModuleTable, module_table_canonical_path
-	../modules/import_binding:
-		ModuleAliasBinding,
-		module_alias_binding_local_name,
-		module_alias_binding_module_id,
+	../../stage_04_modules/module_table: ModuleId, ModuleTable, module_table_canonical_path
+	../modules/module_view:
+		ModuleView,
+		module_view_find_graph_module_alias,
+		module_view_find_standalone_module_alias,
+		module_view_graph_has_owner,
+		module_view_has_graph_source_names,
+		module_view_import_bindings,
 	env: Env, env_disambiguate_nominal_dim_application, env_resolve_alias
 	semantic_type:
 		SemanticType(
@@ -42,7 +45,7 @@ record ResolvedType {
 
 private union ModuleAliasLookup:
 	StandaloneModuleAliasLookup(List[(String, String)])
-	GraphModuleAliasLookup(Option[ModuleTable], List[ModuleAliasBinding], Dict[String, String])
+	GraphModuleAliasLookup(Option[ModuleTable], ModuleView)
 
 
 pure func type_resolution_context(
@@ -82,26 +85,21 @@ private pure func find_module_alias(
 					break
 
 			result
-		GraphModuleAliasLookup(module_table, module_aliases, standalone_module_aliases_by_local_name):
-			var result: Option[String] = None
-
-			for binding in module_aliases:
-				if module_alias_binding_local_name(binding) == alias_name:
-					match module_table:
-						Some(table):
-							result = module_table_canonical_path(
-								table,
-								module_alias_binding_module_id(binding),
-							)
+		GraphModuleAliasLookup(module_table, view):
+			graph_target = match module_table:
+				Some(table):
+					match module_view_find_graph_module_alias(view, alias_name):
+						Some(module_id):
+							module_table_canonical_path(table, module_id)
 						None:
-							void
-
-					break
-
-			if result.is_none():
-				result = standalone_module_aliases_by_local_name.get(alias_name)
-
-			result
+							None
+				None:
+					None
+			match graph_target:
+				Some(path):
+					Some(path)
+				None:
+					module_view_find_standalone_module_alias(view, alias_name)
 
 
 private pure func resolve_qualified_type_name_if_changed(
@@ -233,27 +231,44 @@ pure func resolve_qualified_type_names(
 				typ
 
 
+-- A graph view can carry valid ModuleIds from another selected module or
+-- compilation. Check its exact owner once before traversing a type tree;
+-- individual dotted-name lookups can then use the keyed occupancy directly.
 pure func resolve_graph_qualified_type_names(
 	module_table: Option[ModuleTable],
-	module_aliases: List[ModuleAliasBinding],
-	standalone_module_aliases_by_local_name: Dict[String, String],
+	current_module_id: Option[ModuleId],
+	view: ModuleView,
 	typ: SemanticType,
 ) -> SemanticType:
-	if module_aliases.is_empty() and standalone_module_aliases_by_local_name.is_empty():
+	if module_view_import_bindings(view).is_empty():
+		typ
+	else if module_view_has_graph_source_names(view) and not graph_alias_view_matches_owner(
+		view,
+		module_table,
+		current_module_id,
+	):
 		typ
 	else:
 		match resolve_qualified_type_names_if_changed(
-			GraphModuleAliasLookup(
-				module_table,
-				module_aliases,
-				standalone_module_aliases_by_local_name,
-			),
+			GraphModuleAliasLookup(module_table, view),
 			typ,
 		):
 			Some(resolved):
 				resolved
 			None:
 				typ
+
+
+private pure func graph_alias_view_matches_owner(
+	view: ModuleView,
+	module_table: Option[ModuleTable],
+	current_module_id: Option[ModuleId],
+) -> Bool:
+	match (module_table, current_module_id):
+		(Some(table), Some(module_id)):
+			module_view_graph_has_owner(view, table, module_id)
+		_:
+			False
 
 
 private pure func apply_alias_policy(

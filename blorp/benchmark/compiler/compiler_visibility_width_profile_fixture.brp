@@ -1,0 +1,466 @@
+-- Direct graph-visibility width workload. Graph construction and identity
+-- lookup are setup; the measured loop owns only binding, conflicts, and reads.
+import:
+	../../src/compiler/stage_04_modules/module_table:
+		ModuleId,
+		ModuleTable,
+		module_id_table_index,
+		module_table_canonical_path,
+	../../src/compiler/stage_06_typecheck/graph/definition_index:
+		DefinitionId,
+		DefinitionTable,
+		definition_index_find_type_definition_id,
+		definition_table_definition_id,
+	../../src/compiler/stage_06_typecheck/graph/indexed_graph:
+		PreparedModuleScope,
+		prepared_module_scope_definition_index,
+		prepared_module_scope_id,
+		prepared_module_scope_module_table,
+	../../src/compiler/stage_06_typecheck/graph/source_name_table:
+		graph_module_name_scope,
+		graph_source_name_table,
+	../../src/compiler/stage_06_typecheck/modules/module_view:
+		LocalNameRegistration(LocalNameAdded),
+		ModuleAliasRegistration(ModuleAliasAdded, ModuleAliasAlreadyPresent),
+		ModuleView,
+		SelectiveNameRegistration(SelectiveNameAdded, SelectiveNameConflictsWithImportedName),
+		TopLevelNameKind(TopLevelFunction),
+		module_view_find_graph_module_alias,
+		module_view_find_imported_name,
+		module_view_find_local_name,
+		module_view_bind_initial_graph_local_names,
+		module_view_for_graph,
+		module_view_graph_bound_name_count,
+		module_view_import_bindings,
+		module_view_register_local_name_for_graph,
+		module_view_register_module_alias_target,
+		module_view_register_selective_name_for_graph,
+	../../test/compiler/typecheck_test_support:
+		DefinitionBackedTypeFixtureModule,
+		definition_backed_type_fixture,
+		definition_backed_type_fixture_definition_table,
+		module_id_fixture_find
+
+
+struct VisibilityWidthConfig {
+	iterations: Int,
+	module_count: Int,
+	alias_count: Int,
+	selective_count: Int,
+	local_count: Int,
+	duplicate_attempts: Int,
+	query_count: Int,
+	overlap_selectives_with_aliases: Bool,
+	batch_initial_locals: Bool
+}
+
+
+private record VisibilityWidthInputRep {
+	config: VisibilityWidthConfig,
+	module_table: ModuleTable,
+	current_module_id: ModuleId,
+	module_ids: List[ModuleId],
+	module_paths: List[String],
+	first_module_id: ModuleId,
+	first_module_path: String,
+	definition_table: DefinitionTable,
+	definition_id_lists: List[List[DefinitionId]],
+	first_definition_ids: List[DefinitionId],
+	alias_names: List[String],
+	first_alias_name: String,
+	selective_names: List[String],
+	first_selective_name: String,
+	local_names: List[String],
+	local_candidates: List[(String, TopLevelNameKind)],
+	initial_view: ModuleView
+}
+
+
+opaque type VisibilityWidthInput = VisibilityWidthInputRep
+
+
+record VisibilityWidthResult {
+	final_bound_rows: Int,
+	final_import_bindings: Int,
+	final_duplicate_aliases: Int,
+	final_duplicate_selectives: Int,
+	final_query_hits: Int,
+	total_bound_query_checksum: Int,
+	valid: Bool
+}
+
+
+private pure func dependency_path(index: Int) -> String:
+	"bench/visibility_dep_" + index.to_string()
+
+
+private pure func alias_name(index: Int) -> String:
+	"VisibilityAlias_" + index.to_string()
+
+
+private pure func selective_name(index: Int) -> String:
+	"VisibilitySelected_" + index.to_string()
+
+
+private pure func local_name(index: Int) -> String:
+	"VisibilityLocal_" + index.to_string()
+
+
+pure func visibility_width_prepare(config: VisibilityWidthConfig) -> Option[VisibilityWidthInput]:
+	if (
+		config.iterations <= 0
+		or config.module_count <= 0
+		or config.alias_count <= 0
+		or config.selective_count <= 0
+		or config.local_count <= 0
+		or config.duplicate_attempts < 0
+		or config.query_count < 0
+		or (config.overlap_selectives_with_aliases and config.selective_count > config.alias_count)
+	):
+		None
+	else:
+		visibility_width_prepare_valid_config(config)
+
+
+private pure func visibility_width_prepare_valid_config(
+	config: VisibilityWidthConfig,
+) -> Option[VisibilityWidthInput]:
+
+	var modules: List[DefinitionBackedTypeFixtureModule] = [{
+		module_path = "bench/visibility_target",
+		type_names = []
+	}]
+	for index in 0..config.module_count:
+		modules = modules.append({
+			module_path = dependency_path(index),
+			type_names = ["Token"]
+		})
+
+	scope ?= definition_backed_type_fixture(modules)
+	module_table = prepared_module_scope_module_table(scope)
+	definition_table = definition_backed_type_fixture_definition_table(scope)
+	definition_index = prepared_module_scope_definition_index(scope)
+	var module_ids: List[ModuleId] = []
+	var definition_ids: List[DefinitionId] = []
+	for index in 0..config.module_count:
+		match module_id_fixture_find(scope, dependency_path(index)):
+			Some(module_id):
+				match definition_index_find_type_definition_id(
+					definition_index,
+					module_table,
+					module_id,
+					"Token",
+				):
+					Some(raw_id):
+						match definition_table_definition_id(definition_table, raw_id):
+							Some(definition_id):
+								module_ids = module_ids.append(module_id)
+								definition_ids = definition_ids.append(definition_id)
+							None:
+								void
+					None:
+						void
+			None:
+				void
+
+	if module_ids.length() != config.module_count:
+		None
+	else:
+		visibility_width_finish_prepare(config, scope, module_ids, definition_ids)
+
+
+private pure func visibility_width_finish_prepare(
+	config: VisibilityWidthConfig,
+	scope: PreparedModuleScope,
+	module_ids: List[ModuleId],
+	definition_ids: List[DefinitionId],
+) -> Option[VisibilityWidthInput]:
+	first_module_id ?= module_ids.get(0)
+	module_table = prepared_module_scope_module_table(scope)
+	definition_table = definition_backed_type_fixture_definition_table(scope)
+	var definition_id_lists: List[List[DefinitionId]] = []
+	for definition_id in definition_ids:
+		definition_id_lists = definition_id_lists.append([definition_id])
+	first_definition_ids ?= definition_id_lists.get(0)
+	var module_paths: List[String] = []
+	for index in 0..config.module_count:
+		module_paths = module_paths.append(dependency_path(index))
+	first_module_path ?= module_paths.get(0)
+
+	var candidates: List[String] = []
+	var alias_names: List[String] = []
+	for index in 0..config.alias_count:
+		name = alias_name(index)
+		alias_names = alias_names.append(name)
+		candidates = candidates.append(name)
+	var selective_names: List[String] = []
+	for index in 0..config.selective_count:
+		name = if config.overlap_selectives_with_aliases:
+			alias_names.get_or(index, selective_name(index))
+		else:
+			selective_name(index)
+		selective_names = selective_names.append(name)
+		candidates = candidates.append(name)
+	var local_names: List[String] = []
+	var local_candidates: List[(String, TopLevelNameKind)] = []
+	for index in 0..config.local_count:
+		name = local_name(index)
+		local_names = local_names.append(name)
+		local_candidates = local_candidates.append((name, TopLevelFunction))
+		candidates = candidates.append(name)
+	first_alias_name ?= alias_names.get(0)
+	first_selective_name ?= selective_names.get(0)
+
+	initial_view = module_view_for_graph(graph_module_name_scope(
+		graph_source_name_table(module_table, candidates),
+		prepared_module_scope_id(scope),
+	))
+	Some(into_opaque VisibilityWidthInput({
+		config = config,
+		module_table = module_table,
+		current_module_id = prepared_module_scope_id(scope),
+		module_ids = module_ids,
+		module_paths = module_paths,
+		first_module_id = first_module_id,
+		first_module_path = first_module_path,
+		definition_table = definition_table,
+		definition_id_lists = definition_id_lists,
+		first_definition_ids = first_definition_ids,
+		alias_names = alias_names,
+		first_alias_name = first_alias_name,
+		selective_names = selective_names,
+		first_selective_name = first_selective_name,
+		local_names = local_names,
+		local_candidates = local_candidates,
+		initial_view = initial_view
+	}))
+
+
+private pure func register_alias(
+	input: VisibilityWidthInputRep,
+	view: ModuleView,
+	index: Int,
+) -> Option[ModuleView]:
+	target_index = index % input.config.module_count
+	module_id ?= input.module_ids.get(target_index)
+	module_path ?= input.module_paths.get(target_index)
+	name ?= input.alias_names.get(index)
+	match module_view_register_module_alias_target(
+		view,
+		input.module_table,
+		input.current_module_id,
+		name,
+		module_path,
+		input.module_table,
+		module_id,
+	):
+		ModuleAliasAdded(next):
+			Some(next)
+		_:
+			None
+
+
+private pure func register_selective(
+	input: VisibilityWidthInputRep,
+	view: ModuleView,
+	index: Int,
+) -> Option[ModuleView]:
+	target_index = index % input.config.module_count
+	module_id ?= input.module_ids.get(target_index)
+	module_path ?= input.module_paths.get(target_index)
+	definition_ids ?= input.definition_id_lists.get(target_index)
+	name ?= input.selective_names.get(index)
+	match module_view_register_selective_name_for_graph(
+		view,
+		input.current_module_id,
+		input.definition_table,
+		input.definition_table,
+		name,
+		module_path,
+		"Token",
+		module_id,
+		definition_ids,
+	):
+		SelectiveNameAdded(next):
+			Some(next)
+		_:
+			None
+
+
+private pure func register_local(
+	input: VisibilityWidthInputRep,
+	view: ModuleView,
+	index: Int,
+) -> Option[ModuleView]:
+	name ?= input.local_names.get(index)
+	match module_view_register_local_name_for_graph(
+		view,
+		input.module_table,
+		input.current_module_id,
+		name,
+		TopLevelFunction,
+	):
+		LocalNameAdded(next):
+			Some(next)
+		_:
+			None
+
+
+private pure func query_identity_value(
+	input: VisibilityWidthInputRep,
+	view: ModuleView,
+	index: Int,
+) -> Option[Int]:
+	match index % 3:
+		0:
+			alias_index = index % input.config.alias_count
+			name ?= input.alias_names.get(alias_index)
+			expected = input.module_ids.get(alias_index % input.config.module_count)
+			match module_view_find_graph_module_alias(view, name):
+				Some(found):
+					if Some(found) == expected:
+						Some(module_id_table_index(found) + 1)
+					else:
+						None
+				None:
+					None
+		1:
+			selective_index = index % input.config.selective_count
+			target_index = selective_index % input.config.module_count
+			module_id ?= input.module_ids.get(target_index)
+			module_path ?= input.module_paths.get(target_index)
+			name ?= input.selective_names.get(selective_index)
+			match module_view_find_imported_name(view, name):
+				Some(binding):
+					if binding.module_path == module_path:
+						Some(module_id_table_index(module_id) + 1)
+					else:
+						None
+				None:
+					None
+		_:
+			local_index = index % input.config.local_count
+			name ?= input.local_names.get(local_index)
+			if module_view_find_local_name(view, name) == Some(TopLevelFunction):
+				Some(1)
+			else:
+				None
+
+
+pure func visibility_width_execute(input: VisibilityWidthInput) -> Option[VisibilityWidthResult]:
+	representation: VisibilityWidthInputRep = from_opaque VisibilityWidthInput(input)
+	config = representation.config
+	var result: VisibilityWidthResult = {
+		final_bound_rows = 0,
+		final_import_bindings = 0,
+		final_duplicate_aliases = 0,
+		final_duplicate_selectives = 0,
+		final_query_hits = 0,
+		total_bound_query_checksum = 0,
+		valid = True
+	}
+
+	for _ in 0..config.iterations:
+		var view = representation.initial_view
+		var registration_valid: Bool = True
+		if config.batch_initial_locals:
+			match module_view_bind_initial_graph_local_names(
+				view,
+				representation.module_table,
+				representation.current_module_id,
+				representation.local_candidates,
+			):
+				Some(next):
+					view = next
+				None:
+					registration_valid = False
+		else:
+			for index in 0..config.local_count:
+				match register_local(representation, view, index):
+					Some(next):
+						view = next
+					None:
+						registration_valid = False
+		for index in 0..config.alias_count:
+			match register_alias(representation, view, index):
+				Some(next):
+					view = next
+				None:
+					registration_valid = False
+		for index in 0..config.selective_count:
+			match register_selective(representation, view, index):
+				Some(next):
+					view = next
+				None:
+					registration_valid = False
+
+		var duplicate_aliases: Int = 0
+		var duplicate_selectives: Int = 0
+		for index in 0..config.duplicate_attempts:
+			if index % 2 == 0:
+				match module_view_register_module_alias_target(
+					view,
+					representation.module_table,
+					representation.current_module_id,
+					representation.first_alias_name,
+					representation.first_module_path,
+					representation.module_table,
+					representation.first_module_id,
+				):
+					ModuleAliasAlreadyPresent:
+						duplicate_aliases += 1
+					_:
+						registration_valid = False
+			else:
+				match module_view_register_selective_name_for_graph(
+					view,
+					representation.current_module_id,
+					representation.definition_table,
+					representation.definition_table,
+					representation.first_selective_name,
+					representation.first_module_path,
+					"Token",
+					representation.first_module_id,
+					representation.first_definition_ids,
+				):
+					SelectiveNameConflictsWithImportedName(_):
+						duplicate_selectives += 1
+					_:
+						registration_valid = False
+
+		var query_hits: Int = 0
+		var query_checksum: Int = 0
+		for index in 0..config.query_count:
+			match query_identity_value(representation, view, index):
+				Some(identity_value):
+					query_hits += 1
+					query_checksum += identity_value
+				None:
+					void
+
+		bound_rows = module_view_graph_bound_name_count(view)
+		import_bindings = module_view_import_bindings(view).length()
+		expected_rows = if config.overlap_selectives_with_aliases:
+			config.alias_count + config.local_count
+		else:
+			config.alias_count + config.selective_count + config.local_count
+		result = {
+			final_bound_rows = bound_rows,
+			final_import_bindings = import_bindings,
+			final_duplicate_aliases = duplicate_aliases,
+			final_duplicate_selectives = duplicate_selectives,
+			final_query_hits = query_hits,
+			total_bound_query_checksum = result.total_bound_query_checksum + query_checksum,
+			valid = result.valid and registration_valid
+				and bound_rows == expected_rows
+				and import_bindings == config.alias_count + config.selective_count
+				and duplicate_aliases + duplicate_selectives == config.duplicate_attempts
+				and query_hits == config.query_count
+		}
+
+	Some(result)
+
+
+pure func visibility_width_run(config: VisibilityWidthConfig) -> Option[VisibilityWidthResult]:
+	input ?= visibility_width_prepare(config)
+	visibility_width_execute(input)

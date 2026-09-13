@@ -1,0 +1,100 @@
+-- Direct graph-bound visibility workload. Setup builds the graph identity
+-- domain; only registration, duplicate decisions, and queries are measured.
+import:
+	compiler_visibility_width_profile_fixture:
+		VisibilityWidthConfig,
+		visibility_width_execute,
+		visibility_width_prepare
+	instrumentation: begin_function_profile_window, end_function_profile_window
+	memory: get_mem_stats, reset_mem_stats
+	string: parse_int
+	system: now_microseconds
+
+
+private pure func nonnegative_argument(args: List[String], index: Int, default: Int) -> Int:
+	match args.get(index):
+		Some(text):
+			match parse_int(text):
+				Some(value):
+					if value >= 0:
+						value
+					else:
+						default
+				None:
+					default
+		None:
+			default
+
+
+private pure func positive_argument(args: List[String], index: Int, default: Int) -> Int:
+	value = nonnegative_argument(args, index, default)
+	if value > 0:
+		value
+	else:
+		default
+
+
+func main(args: List[String]) -> Int:
+	config: VisibilityWidthConfig = {
+		iterations = positive_argument(args, 1, 1),
+		module_count = positive_argument(args, 2, 16),
+		alias_count = positive_argument(args, 3, 32),
+		selective_count = positive_argument(args, 4, 32),
+		local_count = positive_argument(args, 5, 16),
+		duplicate_attempts = nonnegative_argument(args, 6, 16),
+		query_count = nonnegative_argument(args, 7, 128),
+		overlap_selectives_with_aliases = nonnegative_argument(args, 8, 0) > 0,
+		batch_initial_locals = nonnegative_argument(args, 9, 0) > 0
+	}
+	setup_started = now_microseconds()
+	match visibility_width_prepare(config):
+		None:
+			print("VISIBILITY_WIDTH_PROFILE status=INVALID_SETUP")
+			1
+		Some(input):
+			setup_microseconds = now_microseconds() - setup_started
+			reset_mem_stats()
+			started = now_microseconds()
+			begin_function_profile_window()
+			result = visibility_width_execute(input)
+			end_function_profile_window()
+			elapsed_microseconds = now_microseconds() - started
+			memory = get_mem_stats()
+			match result:
+				None:
+					print("VISIBILITY_WIDTH_PROFILE status=INVALID_EXECUTION")
+					1
+				Some(observation):
+					status = if observation.valid:
+						"OK"
+					else:
+						"INVALID"
+					print(
+						"VISIBILITY_WIDTH_PROFILE status=" + status
+						+ " iterations=" + config.iterations.to_string()
+						+ " modules=" + config.module_count.to_string()
+						+ " aliases=" + config.alias_count.to_string()
+						+ " selectives=" + config.selective_count.to_string()
+						+ " locals=" + config.local_count.to_string()
+						+ " duplicate_attempts=" + config.duplicate_attempts.to_string()
+						+ " queries=" + config.query_count.to_string()
+						+ " overlap_selectives_with_aliases=" + config.overlap_selectives_with_aliases.to_string()
+						+ " batch_initial_locals=" + config.batch_initial_locals.to_string()
+						+ " final_bound_rows=" + observation.final_bound_rows.to_string()
+						+ " final_import_bindings=" + observation.final_import_bindings.to_string()
+						+ " final_duplicate_aliases=" + observation.final_duplicate_aliases.to_string()
+						+ " final_duplicate_selectives=" + observation.final_duplicate_selectives.to_string()
+						+ " final_query_hits=" + observation.final_query_hits.to_string()
+						+ " total_bound_query_checksum=" + observation.total_bound_query_checksum.to_string()
+						+ " requested_name_operations=" + (config.iterations * (config.alias_count + config.selective_count + config.local_count + config.duplicate_attempts + config.query_count)).to_string()
+						+ " allocations=" + memory.total_allocations.to_string()
+						+ " releases=" + memory.total_releases.to_string()
+						+ " retained_objects=" + memory.current_objects.to_string()
+						+ " allocated_bytes=" + memory.bytes_allocated.to_string()
+						+ " setup_microseconds=" + setup_microseconds.to_string()
+						+ " elapsed_microseconds=" + elapsed_microseconds.to_string(),
+					)
+					if observation.valid:
+						0
+					else:
+						1

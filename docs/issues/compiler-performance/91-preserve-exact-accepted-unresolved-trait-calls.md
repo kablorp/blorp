@@ -402,8 +402,8 @@ size.
 
 ## Next Packet
 
-Replace the accepted trait-method visibility adapter's remaining late
-`ModuleId + source-name` scan with exact `SourceNameId + TraitMethodId` rows
-after the accepted trait table is published. Delete the remaining accepted
-bare-method string dictionary in the same cut; do not add a parallel integer
-dictionary beside it.
+Completed by
+[`92-normalize-accepted-trait-method-visibility.md`](92-normalize-accepted-trait-method-visibility.md):
+the accepted trait-method visibility adapter now publishes exact
+`SourceNameId + TraitMethodId` rows, and the accepted bare-method string
+dictionary has been deleted rather than retained as a parallel index.

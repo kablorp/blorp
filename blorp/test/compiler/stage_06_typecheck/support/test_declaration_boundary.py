@@ -76,6 +76,18 @@ TRAIT_IMPLEMENTATION_AUTHORITY = (
 IMPORT_BINDING = (
     ROOT / "blorp/src/compiler/stage_06_typecheck/modules/import_binding.brp"
 )
+MODULE_VIEW = (
+    ROOT / "blorp/src/compiler/stage_06_typecheck/modules/module_view.brp"
+)
+MODULE_BINDING = (
+    ROOT / "blorp/src/compiler/stage_06_typecheck/modules/module_binding.brp"
+)
+TYPE_RESOLUTION = (
+    ROOT / "blorp/src/compiler/stage_06_typecheck/type_system/type_resolution.brp"
+)
+SOURCE_NAME_TABLE = (
+    ROOT / "blorp/src/compiler/stage_06_typecheck/graph/source_name_table.brp"
+)
 SEMANTIC_CATALOG = (
     ROOT
     / "blorp/src/compiler/stage_06_typecheck/type_system/accepted_semantic_catalog.brp"
@@ -83,6 +95,50 @@ SEMANTIC_CATALOG = (
 
 
 class DeclarationBoundaryTests(unittest.TestCase):
+
+    def test_import_decl_selection_has_explicit_ordered_decisions(self) -> None:
+        source = MODULE_BINDING.read_text(encoding="utf-8")
+        self.assertIn("private union ImportDeclDecision:", source)
+        for outcome in (
+            "ImportDeclMissing",
+            "ImportDeclAmbiguous(List[String])",
+            "ImportDeclForbiddenPackage",
+            "ImportDeclDuplicateModule",
+            "ImportDeclSelected(ImportableModuleSurface)",
+        ):
+            self.assertIn(outcome, source)
+        self.assertIn("private pure func decide_import_decl(", source)
+
+    def test_graph_module_view_has_one_scope_issued_occupancy_relation(self) -> None:
+        view_source = MODULE_VIEW.read_text(encoding="utf-8")
+        name_source = SOURCE_NAME_TABLE.read_text(encoding="utf-8")
+        resolution_source = TYPE_RESOLUTION.read_text(encoding="utf-8")
+
+        self.assertIn("opaque type GraphSourceNameTable", name_source)
+        self.assertIn("source_names = source_name_table(candidates)", name_source)
+        self.assertIn("opaque type GraphModuleNameScope", name_source)
+        self.assertIn("issuer: GraphModuleNameScope", view_source)
+        self.assertIn(
+            "rows_by_source_name_index: Dict[Int, BoundNameOccupancy]",
+            view_source,
+        )
+        self.assertNotIn("rows: List[BoundNameRow]", view_source)
+        self.assertNotIn("row_index_by_source_name: Dict[Int, Int]", view_source)
+        self.assertNotIn("module_aliases: List[ModuleAliasBinding]", view_source)
+        self.assertNotIn("module_aliases = next.module_aliases.append(", view_source)
+        self.assertNotIn("module_view_module_aliases", view_source)
+        self.assertIn(
+            "GraphModuleAliasLookup(Option[ModuleTable], ModuleView)",
+            resolution_source,
+        )
+        self.assertIn("graph_alias_view_matches_owner", resolution_source)
+        self.assertIn("BoundAliasAndSelectiveName(ModuleId, ImportedNameBinding)", view_source)
+        for displaced_map in (
+            "graph_module_aliases_by_source_name_id",
+            "graph_imported_names_by_source_name_id",
+            "graph_local_names_by_source_name_id",
+        ):
+            self.assertNotIn(displaced_map, view_source)
 
     def test_graph_trait_method_binding_retains_overlapping_definition_ids(self) -> None:
         source = IMPORT_BINDING.read_text(encoding="utf-8")
@@ -1229,10 +1285,37 @@ class DeclarationBoundaryTests(unittest.TestCase):
         )
         self.assertIsNotNone(authority_rep)
         self.assertIn(
-            "trait_method_id_by_name: Dict[String, TraitMethodId]",
+            "visible_trait_methods: List[AcceptedVisibleTraitMethodRow]",
             authority_rep.group(0),
         )
+        self.assertNotIn("trait_method_id_by_name", authority_rep.group(0))
         self.assertNotIn("trait_name_by_method_name", authority_rep.group(0))
+
+        visibility_row = re.search(
+            r"private record AcceptedVisibleTraitMethodRow \{.*?\n\}",
+            authority_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(visibility_row)
+        self.assertIn("source_name_id: SourceNameId", visibility_row.group(0))
+        self.assertIn("method_id: TraitMethodId", visibility_row.group(0))
+        self.assertNotIn("String", visibility_row.group(0))
+
+        visibility_binding = re.search(
+            r"private union AcceptedVisibleTraitBinding:.*?"
+            r"(?=\n\nprivate record)",
+            authority_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(visibility_binding)
+        self.assertIn(
+            "AcceptedVisibleTraitMethodBinding(SourceNameId, TraitMethodId)",
+            visibility_binding.group(0),
+        )
+        self.assertNotIn(
+            "AcceptedVisibleTraitMethodBinding(String, ModuleId, String)",
+            visibility_binding.group(0),
+        )
 
         lookup = re.search(
             r"pure func accepted_trait_find_function_method\(.*?"
@@ -1242,7 +1325,8 @@ class DeclarationBoundaryTests(unittest.TestCase):
         )
         self.assertIsNotNone(lookup)
         self.assertIn("Option[AcceptedTraitMethodBinding]", lookup.group(0))
-        self.assertIn("trait_method_id_by_name", lookup.group(0))
+        self.assertIn("source_name_table_find_id", lookup.group(0))
+        self.assertIn("visible_trait_method_for_source_name", lookup.group(0))
         self.assertIn("table_find_trait_method_by_id", lookup.group(0))
         self.assertIn("into_opaque AcceptedTraitMethodBinding", lookup.group(0))
         self.assertNotIn(
@@ -1260,6 +1344,62 @@ class DeclarationBoundaryTests(unittest.TestCase):
         self.assertIn("accepted_trait_find_function_method", exact_lookup.group(0))
         self.assertNotIn("accepted_trait_find_method_by_id", exact_lookup.group(0))
         self.assertNotIn("accepted_trait_function_trait", infer_source)
+
+    def test_accepted_trait_definition_visibility_uses_exact_rows(self) -> None:
+        authority_source = TRAIT_IMPLEMENTATION_AUTHORITY.read_text(encoding="utf-8")
+
+        authority_rep = re.search(
+            r"private record AcceptedTraitImplementationAuthorityRep \{.*?\n\}",
+            authority_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(authority_rep)
+        self.assertIn(
+            "visible_traits: List[AcceptedVisibleTraitRow]",
+            authority_rep.group(0),
+        )
+        self.assertNotIn("visible_trait_indices_by_name", authority_rep.group(0))
+        self.assertIn(
+            "trait_indices_by_semantic_name: Dict[String, Int]",
+            authority_rep.group(0),
+        )
+
+        visibility_row = re.search(
+            r"private record AcceptedVisibleTraitRow \{.*?\n\}",
+            authority_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(visibility_row)
+        self.assertIn("source_name_id: SourceNameId", visibility_row.group(0))
+        self.assertIn("trait_id: TraitId", visibility_row.group(0))
+        self.assertNotIn("String", visibility_row.group(0))
+
+        visibility_binding = re.search(
+            r"private union AcceptedVisibleTraitBinding:.*?"
+            r"(?=\n\nprivate record)",
+            authority_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(visibility_binding)
+        self.assertIn(
+            "AcceptedVisibleTraitDefinitionBinding(SourceNameId, TraitId)",
+            visibility_binding.group(0),
+        )
+        self.assertNotIn(
+            "AcceptedVisibleTraitDefinitionBinding(String, TraitId)",
+            visibility_binding.group(0),
+        )
+
+        lookup = re.search(
+            r"private pure func visible_trait_index_for_name\(.*?"
+            r"(?=\n\npure func)",
+            authority_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(lookup)
+        self.assertIn("source_name_table_find_id", lookup.group(0))
+        self.assertIn("visible_trait_for_source_name", lookup.group(0))
+        self.assertIn("table_find_trait_index", lookup.group(0))
 
     def test_selected_accepted_trait_call_preserves_exact_identity(self) -> None:
         infer_source = INFER.read_text(encoding="utf-8")
