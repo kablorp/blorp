@@ -44,19 +44,20 @@ tree-shaped value. Each insertion copies the fallback into every failing leaf.
 Subsequent arms can copy the result again. Nested list/tuple patterns therefore
 turn a small source match into a very large late-Core tree and C function.
 
-The current self-host artifact at `3d8ec393b04d` demonstrates the scale:
+The historical self-host artifact at `3d8ec393b04d` demonstrated the scale:
 
-| Measurement | Current value |
+| Measurement | Historical value |
 | --- | ---: |
 | Generated compiler C, excluding embedded runtime | 1,416,117 lines / 100,448,633 bytes |
 | Source `parse_package_args` body | about 60 lines |
 | Generated `parse_package_args` body | 66,874 lines |
-| Occurrences of `"Error: unknown package command: "` in that generated body | 2,049 |
+| Occurrences of `"Error: unknown package command: "` in that generated body | 2,049 (stale after string-literal pooling) |
 
 `parse_package_args` in `blorp/src/lib/cli_args.brp` is an ordinary ordered match
 over list shapes. Its final catch-all error expression should exist once. Its
-2,049 copies are a concrete continuation-sharing failure, not useful source
-specialization.
+historical 2,049 repeated literals were a useful symptom of continuation
+cloning, but string-literal pooling has since made literal-counting the wrong
+signal. Use structural fallback copies and generated helper call sites instead.
 
 Do not solve this by pooling the repeated string, deduplicating C text, or
 recognizing this function. Those may reduce a symptom while leaving all cloned
@@ -205,7 +206,7 @@ Do not add an unreachable `goto done` merely to satisfy one rendering template.
    `parse_package_args` contains one copy of each source arm/fallback body.
 
 This change should land before relying on string-literal pooling to hide the
-2,049 duplicated error literals. Pooling and match sharing are complementary;
+historical 2,049 duplicated error literals. Pooling and match sharing are complementary;
 only this issue removes the duplicated control flow.
 
 ## Current measurement artifact
@@ -229,9 +230,19 @@ use explicit block/edge identity. Keep the current 24/40,320 characterization
 green until the graph migration lands, then replace it with the sharing
 assertion.
 
-Current-main C-emission reproduction using
-`/Users/keithphilpott/CLionProjects/blorp/bin/blorp` at the same source commit
-reported:
+Current-main C-emission reproduction at the same source commit used the
+repository-local command:
+
+```bash
+bin/blorp compile --std-dir standard_library/src --no-format \
+  --no-embed-runtime -o "$probe_c" \
+  blorp/benchmark/compiler/compiler_match_fallback_duplication_probe.brp
+```
+
+The measured binary reported `blorp 0.0.1`, `commit: unknown`,
+`channel: local`, embedded standard-library hash
+`12ad4fab27f9ae62e4437c5c399dc095`, and SHA-256
+`86b1ecd6264027b1ca0f5d4672f8b083f26cc8f21172813c6386ad1f1d77a3cb`.
 
 | Ordered list arms | Real/user/sys | Max RSS | Generated C | Fallback helper call sites |
 | ---: | --- | ---: | ---: | ---: |
@@ -242,6 +253,14 @@ The helper function returning the unique fallback marker is emitted once, but
 calls to it are cloned through failed-test paths. This distinguishes the problem
 from string-literal pooling and confirms the duplication exists before backend
 text emission.
+
+Focused suite affordability was measured with `/usr/bin/time -l` around
+`scripts/blorp-compiler-bootstrap test blorp/test/compiler/stage_09_core/test_core_match.brp`:
+
+| Suite state | Result | Real/user/sys | Max RSS |
+| --- | --- | --- | ---: |
+| Before the 8-arm characterization | 30 tests passed | 2.30s / 1.77s / 0.07s | 219,299,840 bytes |
+| With the 8-arm characterization | 31 tests passed | 2.24s / 1.85s / 0.07s | 220,086,272 bytes |
 
 ## Semantic requirements
 
