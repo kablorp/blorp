@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+"""Measure consume_specialize on a prebuilt CoreProgram fixture."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import statistics
+import subprocess
+import sys
+import tempfile
+from typing import Any
+
+
+BENCHMARK_MAIN = Path("blorp/benchmark/compiler/compiler_consume_candidate_index_profile.brp")
+BENCHMARK_FIXTURE = Path(
+    "blorp/benchmark/compiler/compiler_consume_candidate_index_profile_fixture.brp"
+)
+PRODUCTION_SOURCE = Path("blorp/src/compiler/stage_09_core/consume_specialize.brp")
+DEFAULT_TIMEOUT_SECONDS = 60.0
+
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def source_bytes(root: Path) -> dict[Path, bytes]:
+    return {
+        BENCHMARK_MAIN: (root / BENCHMARK_MAIN).read_bytes(),
+        BENCHMARK_FIXTURE: (root / BENCHMARK_FIXTURE).read_bytes(),
+    }
+
+
+def benchmark_source_hash(sources: dict[Path, bytes]) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(sources):
+        digest.update(path.as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(sources[path])
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def overlay_benchmark_sources(root: Path, sources: dict[Path, bytes]) -> None:
+    for relative_path, content in sources.items():
+        target = root / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists() or target.read_bytes() != content:
+            target.write_bytes(content)
+
+
+def parse_args() -> argparse.Namespace:
+    root = repo_root()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("instrumentation", choices=("plain", "profile"))
+    parser.add_argument("iterations", type=int, nargs="?", default=1)
+    parser.add_argument("functions", type=int, nargs="?", default=256)
+    parser.add_argument("candidates_per_function", type=int, nargs="?", default=8)
+    parser.add_argument("user_calls", type=int, nargs="?", default=256)
+    parser.add_argument("used_percent", type=int, nargs="?", default=25)
+    parser.add_argument("collision_mode", nargs="?", default="none")
+    parser.add_argument(
+        "--compiler",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "BLORP_COMPILER_BENCHMARK_COMPILER",
+                root / "blorp/build/_build/blorp-cli/blorp",
+            )
+        ),
+    )
+    parser.add_argument("--compiler-root", type=Path, default=root)
+    parser.add_argument("--baseline-compiler", type=Path)
+    parser.add_argument("--baseline-compiler-root", type=Path)
+    parser.add_argument("--cc", default=os.environ.get("CC", "cc"))
+    parser.add_argument("--samples", type=int, default=1)
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
+    parser.add_argument(
+        "--skip-build",
+        action="store_true",
+        default=os.environ.get("BLORP_COMPILER_BENCHMARK_SKIP_BUILD") == "1",
+    )
+    parser.add_argument("--json", action="store_true")
+    return parser.parse_args()
+
+
+def build_compiler(root: Path) -> None:
+    subprocess.run(["make", "all"], cwd=root, check=True, stdout=subprocess.DEVNULL)
+
+
+def run_command(command: list[str], cwd: Path, timeout: float) -> subprocess.CompletedProcess[str]:
+    completed = subprocess.run(
+        command,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "command failed:\n"
+            + " ".join(command)
+            + "\n"
+            + completed.stdout
+            + completed.stderr
+        )
+    return completed
+
+
+def compile_benchmark_binary(
+    label: str,
+    compiler: Path,
+    compiler_root: Path,
+    instrumentation: str,
+    sources: dict[Path, bytes],
+    cc: str,
+    timeout: float,
+) -> tuple[Path, tempfile.TemporaryDirectory[str]]:
+    overlay_benchmark_sources(compiler_root, sources)
+    cc_path = shutil.which(cc)
+    if cc_path is None:
+        raise RuntimeError(f"C compiler is unavailable: {cc}")
+    if not compiler.is_file():
+        raise RuntimeError(f"{label} compiler does not exist: {compiler}")
+    if not (compiler_root / PRODUCTION_SOURCE).is_file():
+        raise RuntimeError(f"{label} production source does not exist: {compiler_root / PRODUCTION_SOURCE}")
+
+    temp_dir = tempfile.TemporaryDirectory(prefix=f"blorp-consume-candidate-{label}-")
+    temp_path = Path(temp_dir.name)
+    c_output = temp_path / "benchmark.c"
+    binary = temp_path / "benchmark"
+    compile_command = [
+        str(compiler),
+        "compile",
+        "--std-dir",
+        str(compiler_root / "standard_library/src"),
+        "--no-format",
+    ]
+    if instrumentation == "profile":
+        compile_command.append("--profile")
+    compile_command.extend(["-o", str(c_output), str(compiler_root / BENCHMARK_MAIN)])
+    run_command(compile_command, compiler_root, timeout)
+
+    optimization = "-O0" if instrumentation == "profile" else "-O2"
+    run_command(
+        [cc_path, optimization, "-fwrapv", "-pipe", "-w", str(c_output), "-lm", "-lpthread", "-o", str(binary)],
+        compiler_root,
+        timeout,
+    )
+    return binary, temp_dir
+
+
+def parse_profile_line(stdout: str) -> dict[str, Any]:
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    if len(lines) != 1 or not lines[0].startswith("CONSUME_CANDIDATE_INDEX_PROFILE "):
+        raise RuntimeError(f"unexpected benchmark output:\n{stdout}")
+    result: dict[str, Any] = {}
+    for field in lines[0].split()[1:]:
+        key, value = field.split("=", 1)
+        if value == "True":
+            result[key] = True
+        elif value == "False":
+            result[key] = False
+        else:
+            try:
+                result[key] = int(value)
+            except ValueError:
+                result[key] = value
+    return result
+
+
+def run_benchmark_sample(
+    binary: Path,
+    args: argparse.Namespace,
+    timeout: float,
+) -> dict[str, Any]:
+    completed = run_command(
+        [
+            str(binary),
+            str(args.iterations),
+            str(args.functions),
+            str(args.candidates_per_function),
+            str(args.user_calls),
+            str(args.used_percent),
+            args.collision_mode,
+        ],
+        binary.parent,
+        timeout,
+    )
+    return parse_profile_line(completed.stdout)
+
+
+def aggregate(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    if not samples:
+        raise RuntimeError("cannot aggregate zero samples")
+    stable_fields = (
+        "iterations",
+        "functions",
+        "candidates_per_function",
+        "user_calls",
+        "used_percent",
+        "collision_mode",
+        "candidates_discovered",
+        "rewritten_clone_count",
+        "rewritten_function_checksum",
+        "core_json_checksum",
+        "core_json_bytes",
+        "setup_checksum",
+        "workload_valid",
+    )
+    first = samples[0]
+    for sample in samples[1:]:
+        for field in stable_fields:
+            if sample[field] != first[field]:
+                raise RuntimeError(f"benchmark sample changed stable field: {field}")
+    result = dict(first)
+    for field in ("elapsed_microseconds", "allocations", "releases", "retained_objects", "allocator_bytes"):
+        values = [int(sample[field]) for sample in samples]
+        result[f"{field}_samples"] = values
+        result[f"{field}_median"] = int(statistics.median(values))
+    return result
+
+
+def compiler_result(
+    label: str,
+    compiler: Path,
+    compiler_root: Path,
+    args: argparse.Namespace,
+    sources: dict[Path, bytes],
+) -> tuple[dict[str, Any], tempfile.TemporaryDirectory[str]]:
+    if not args.skip_build:
+        build_compiler(compiler_root)
+    binary, temp_dir = compile_benchmark_binary(
+        label,
+        compiler.resolve(),
+        compiler_root.resolve(),
+        args.instrumentation,
+        sources,
+        args.cc,
+        args.timeout,
+    )
+    sample = run_benchmark_sample(binary, args, args.timeout)
+    metadata = {
+        "label": label,
+        "compiler": str(compiler.resolve()),
+        "compiler_root": str(compiler_root.resolve()),
+        "compiler_sha256": sha256_file(compiler.resolve()),
+        "production_consume_specialize_sha256": sha256_file(
+            compiler_root.resolve() / PRODUCTION_SOURCE
+        ),
+        "benchmark_source_sha256": benchmark_source_hash(sources),
+        "benchmark_binary_sha256": sha256_file(binary),
+        "sample": sample,
+    }
+    return metadata, temp_dir
+
+
+def paired_result(args: argparse.Namespace, sources: dict[Path, bytes]) -> dict[str, Any]:
+    if args.baseline_compiler_root is None:
+        raise RuntimeError("--baseline-compiler requires --baseline-compiler-root")
+    if args.samples < 1:
+        raise RuntimeError("--samples must be at least 1")
+
+    specs = {
+        "baseline": (args.baseline_compiler.resolve(), args.baseline_compiler_root.resolve()),
+        "candidate": (args.compiler.resolve(), args.compiler_root.resolve()),
+    }
+    if not args.skip_build:
+        for _, root in specs.values():
+            build_compiler(root)
+
+    compiled: dict[str, tuple[Path, tempfile.TemporaryDirectory[str], dict[str, Any]]] = {}
+    for label, (compiler, root) in specs.items():
+        binary, temp_dir = compile_benchmark_binary(
+            label,
+            compiler,
+            root,
+            args.instrumentation,
+            sources,
+            args.cc,
+            args.timeout,
+        )
+        compiled[label] = (
+            binary,
+            temp_dir,
+            {
+                "compiler": str(compiler),
+                "compiler_root": str(root),
+                "compiler_sha256": sha256_file(compiler),
+                "production_consume_specialize_sha256": sha256_file(root / PRODUCTION_SOURCE),
+                "benchmark_source_sha256": benchmark_source_hash(sources),
+                "benchmark_binary_sha256": sha256_file(binary),
+            },
+        )
+
+    raw: dict[str, list[dict[str, Any]]] = {"baseline": [], "candidate": []}
+    order: list[str] = []
+    for index in range(args.samples):
+        labels = ("baseline", "candidate") if index % 2 == 0 else ("candidate", "baseline")
+        for label in labels:
+            binary = compiled[label][0]
+            raw[label].append(run_benchmark_sample(binary, args, args.timeout))
+            order.append(label)
+
+    baseline = aggregate(raw["baseline"])
+    candidate = aggregate(raw["candidate"])
+    stable_fields = (
+        "candidates_discovered",
+        "rewritten_clone_count",
+        "rewritten_function_checksum",
+        "core_json_checksum",
+        "core_json_bytes",
+        "setup_checksum",
+        "workload_valid",
+    )
+    for field in stable_fields:
+        if baseline[field] != candidate[field]:
+            raise RuntimeError(f"baseline/candidate output mismatch: {field}")
+
+    return {
+        "mode": "paired",
+        "instrumentation": args.instrumentation,
+        "samples_per_compiler": args.samples,
+        "execution_order": order,
+        "baseline": {**compiled["baseline"][2], **baseline},
+        "candidate": {**compiled["candidate"][2], **candidate},
+        "elapsed_microseconds_ratio_median": (
+            candidate["elapsed_microseconds_median"] / baseline["elapsed_microseconds_median"]
+            if baseline["elapsed_microseconds_median"] != 0
+            else None
+        ),
+        "allocations_ratio_median": (
+            candidate["allocations_median"] / baseline["allocations_median"]
+            if baseline["allocations_median"] != 0
+            else None
+        ),
+    }
+
+
+def print_text_result(result: dict[str, Any]) -> None:
+    if result["mode"] == "single":
+        sample = result["sample"]
+        print(
+            "CONSUME_CANDIDATE_INDEX_PROFILE "
+            + " ".join(f"{key}={value}" for key, value in sample.items())
+            + f" compiler_sha256={result['compiler_sha256']}"
+            + f" production_consume_specialize_sha256={result['production_consume_specialize_sha256']}"
+            + f" benchmark_source_sha256={result['benchmark_source_sha256']}"
+            + f" benchmark_binary_sha256={result['benchmark_binary_sha256']}"
+        )
+    else:
+        baseline = result["baseline"]
+        candidate = result["candidate"]
+        print(
+            "CONSUME_CANDIDATE_INDEX_PROFILE_PAIRED "
+            f"samples={result['samples_per_compiler']} "
+            f"iterations={baseline['iterations']} "
+            f"functions={baseline['functions']} "
+            f"candidates_per_function={baseline['candidates_per_function']} "
+            f"user_calls={baseline['user_calls']} "
+            f"used_percent={baseline['used_percent']} "
+            f"collision_mode={baseline['collision_mode']} "
+            f"candidates_discovered={baseline['candidates_discovered']} "
+            f"rewritten_clone_count={baseline['rewritten_clone_count']} "
+            f"core_json_checksum={baseline['core_json_checksum']} "
+            f"core_json_bytes={baseline['core_json_bytes']} "
+            f"baseline_elapsed_us={baseline['elapsed_microseconds_median']} "
+            f"candidate_elapsed_us={candidate['elapsed_microseconds_median']} "
+            f"elapsed_ratio={result['elapsed_microseconds_ratio_median']} "
+            f"baseline_allocations={baseline['allocations_median']} "
+            f"candidate_allocations={candidate['allocations_median']} "
+            f"allocations_ratio={result['allocations_ratio_median']} "
+            f"baseline_compiler_sha256={baseline['compiler_sha256']} "
+            f"candidate_compiler_sha256={candidate['compiler_sha256']} "
+            f"baseline_consume_specialize_sha256={baseline['production_consume_specialize_sha256']} "
+            f"candidate_consume_specialize_sha256={candidate['production_consume_specialize_sha256']} "
+            f"baseline_binary_sha256={baseline['benchmark_binary_sha256']} "
+            f"candidate_binary_sha256={candidate['benchmark_binary_sha256']} "
+            f"benchmark_source_sha256={baseline['benchmark_source_sha256']}"
+        )
+
+
+def main() -> int:
+    args = parse_args()
+    root = repo_root()
+    sources = source_bytes(root)
+    if args.baseline_compiler is not None:
+        result = paired_result(args, sources)
+    elif args.baseline_compiler_root is not None:
+        raise RuntimeError("--baseline-compiler-root requires --baseline-compiler")
+    else:
+        result, _temp_dir = compiler_result(
+            "candidate",
+            args.compiler,
+            args.compiler_root,
+            args,
+            sources,
+        )
+        result["mode"] = "single"
+
+    if args.json:
+        print(json.dumps(result, sort_keys=True))
+    else:
+        print_text_result(result)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as error:
+        print(f"error: {error}", file=sys.stderr)
+        raise SystemExit(1)

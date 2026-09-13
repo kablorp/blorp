@@ -107,11 +107,35 @@ private record CloneCandidate {
 }
 
 
+private record CloneCandidateCatalog {
+	ordered: List[CloneCandidate],
+	ordinals_by_original_def_id: Dict[Int, List[Int]],
+	ordinal_by_clone_def_id: Dict[Int, Int]
+}
+
+
+private record UsedCloneKeyIndex {
+	arg_indices_by_name_by_def_id: Dict[Int, Dict[String, Dict[Int, Bool]]]
+}
+
+
 private record ConsumeSpecializeState {
 	unions: List[CoreUnionDecl],
+	candidates: CloneCandidateCatalog,
+	used_clone_keys: UsedCloneKeyIndex
+}
+
+
+private record CloneCandidateDiscoveryState {
+	unions: List[CoreUnionDecl],
 	next_def_id: Int,
-	candidates: List[CloneCandidate],
-	used_clone_keys: List[CloneKey]
+	candidates: CloneCandidateCatalog
+}
+
+
+private record FunctionCandidateAppendState {
+	catalog: CloneCandidateCatalog,
+	ordinals: List[Int]
 }
 
 
@@ -294,22 +318,80 @@ private pure func collect_unions(program: CoreProgram) -> List[CoreUnionDecl]:
 	unions
 
 
+private pure func empty_clone_candidate_catalog() -> CloneCandidateCatalog:
+	{
+		ordered = [],
+		ordinals_by_original_def_id = {},
+		ordinal_by_clone_def_id = {}
+	}
+
+
+private pure func empty_used_clone_key_index() -> UsedCloneKeyIndex:
+	{arg_indices_by_name_by_def_id = {}}
+
+
+private pure func append_function_clone_candidate(
+	state: FunctionCandidateAppendState,
+	candidate: CloneCandidate,
+) -> FunctionCandidateAppendState:
+	ordinal: Int = state.catalog.ordered.length()
+
+	clone_index: Dict[Int, Int] = if state.catalog.ordinal_by_clone_def_id.contains(
+		candidate.clone_def_id,
+	):
+		state.catalog.ordinal_by_clone_def_id
+	else:
+		state.catalog.ordinal_by_clone_def_id.set(candidate.clone_def_id, ordinal)
+
+	{
+		catalog = {
+			ordered = state.catalog.ordered.append(candidate),
+			ordinals_by_original_def_id = state.catalog.ordinals_by_original_def_id,
+			ordinal_by_clone_def_id = clone_index
+		},
+		ordinals = state.ordinals.append(ordinal)
+	}
+
+
+private pure func finish_function_clone_candidates(
+	catalog: CloneCandidateCatalog,
+	original_def_id: Int,
+	ordinals: List[Int],
+) -> CloneCandidateCatalog:
+	if ordinals.length() == 0:
+		catalog
+	else:
+		original_bucket: List[Int] = catalog.ordinals_by_original_def_id
+			.get_or(original_def_id, [])
+			.concat(ordinals)
+
+		{ catalog |
+			ordinals_by_original_def_id = catalog.ordinals_by_original_def_id.set(
+				original_def_id,
+				original_bucket,
+			)
+		}
+
+
 private pure func make_state(program: CoreProgram) -> ConsumeSpecializeState:
-	var state: ConsumeSpecializeState = {
+	var discovery: CloneCandidateDiscoveryState = {
 		unions = collect_unions(program),
 		next_def_id = core_program_max_declared_definition_id(program) + 1,
-		candidates = [],
-		used_clone_keys = []
+		candidates = empty_clone_candidate_catalog()
 	}
 
 	for decl in program.decls:
 		match decl:
 			FunctionDecl(func_info):
-				state = collect_function_clone_candidates(state, func_info)
+				discovery = collect_function_clone_candidates(discovery, func_info)
 			_:
 				void
 
-	state
+	{
+		unions = discovery.unions,
+		candidates = discovery.candidates,
+		used_clone_keys = empty_used_clone_key_index()
+	}
 
 
 private pure func find_union(state: ConsumeSpecializeState, name: String) -> Option[CoreUnionDecl]:
@@ -1363,29 +1445,47 @@ private pure func make_consuming_clone(
 
 
 private pure func collect_function_clone_candidates(
-	state: ConsumeSpecializeState,
+	state: CloneCandidateDiscoveryState,
 	func_info: CoreFunction,
-) -> ConsumeSpecializeState:
-	var current: ConsumeSpecializeState = state
+) -> CloneCandidateDiscoveryState:
+	var current: CloneCandidateDiscoveryState = state
 	var arg_index: Int = 0
+	var function_candidates: FunctionCandidateAppendState = {
+		catalog = state.candidates,
+		ordinals = []
+	}
+	analysis_state: ConsumeSpecializeState = {
+		unions = state.unions,
+		candidates = empty_clone_candidate_catalog(),
+		used_clone_keys = empty_used_clone_key_index()
+	}
 
 	for param in func_info.params:
-		if function_is_cloneable(current, arg_index, func_info):
-			current = { current |
-				next_def_id = current.next_def_id + 1,
-				candidates = current.candidates.append({
+		if function_is_cloneable(analysis_state, arg_index, func_info):
+			clone_def_id: Int = current.next_def_id
+			current = { current | next_def_id = current.next_def_id + 1 }
+			function_candidates = append_function_clone_candidate(
+				function_candidates,
+				{
 					key = clone_key(func_info.name, func_info.def_id, arg_index),
 					param_type = param.typ,
 					clone_name = clone_name(func_info.name, arg_index),
-					clone_def_id = current.next_def_id,
-				})
-			}
+					clone_def_id = clone_def_id
+				},
+			)
+			current = { current | candidates = function_candidates.catalog }
 		else:
 			void
 
 		arg_index += 1
 
-	current
+	{ current |
+		candidates = finish_function_clone_candidates(
+			current.candidates,
+			func_info.def_id,
+			function_candidates.ordinals,
+		)
+	}
 
 
 private pure func find_clone_target(
@@ -1397,35 +1497,42 @@ private pure func find_clone_target(
 ) -> Option[CloneTarget]:
 	var found: Option[CloneTarget] = None
 
-	for candidate in state.candidates:
-		if (
-			candidate.key.original_name == original_name
-			and candidate.key.original_def_id == original_def_id
-			and candidate.key.arg_index == arg_index
-			and core_type_equal(candidate.param_type, target_type)
-		):
-			found = Some({
-				key = candidate.key,
-				clone_name = candidate.clone_name,
-				clone_def_id = candidate.clone_def_id,
-			})
-		else:
+	match state.candidates.ordinals_by_original_def_id.get(original_def_id):
+		Some(ordinals):
+			for ordinal in ordinals:
+				match state.candidates.ordered.get(ordinal):
+					Some(candidate):
+						if (
+							candidate.key.original_name == original_name
+							and candidate.key.original_def_id == original_def_id
+							and candidate.key.arg_index == arg_index
+							and core_type_equal(candidate.param_type, target_type)
+						):
+							found = Some({
+								key = candidate.key,
+								clone_name = candidate.clone_name,
+								clone_def_id = candidate.clone_def_id,
+							})
+						else:
+							void
+					None:
+						void
+		None:
 			void
 
 	found
 
 
-private pure func clone_key_used(used_clone_keys: List[CloneKey], key: CloneKey) -> Bool:
-	var found: Bool = False
-
-	for used_key in used_clone_keys:
-		if clone_key_equal(used_key, key):
-			found = True
-			break
-		else:
-			void
-
-	found
+private pure func clone_key_used(used_clone_keys: UsedCloneKeyIndex, key: CloneKey) -> Bool:
+	match used_clone_keys.arg_indices_by_name_by_def_id.get(key.original_def_id):
+		Some(by_name):
+			match by_name.get(key.original_name):
+				Some(arg_indices):
+					arg_indices.contains(key.arg_index)
+				None:
+					False
+		None:
+			False
 
 
 private pure func mark_clone_used(
@@ -1435,7 +1542,24 @@ private pure func mark_clone_used(
 	if clone_key_used(state.used_clone_keys, key):
 		state
 	else:
-		{ state | used_clone_keys = state.used_clone_keys.append(key) }
+		by_name: Dict[String, Dict[Int, Bool]] = state.used_clone_keys.arg_indices_by_name_by_def_id.get_or(
+			key.original_def_id,
+			{},
+		)
+		arg_indices: Dict[Int, Bool] = by_name.get_or(key.original_name, {})
+		updated_by_name: Dict[String, Dict[Int, Bool]] = by_name.set(
+			key.original_name,
+			arg_indices.set(key.arg_index, True),
+		)
+
+		{ state |
+			used_clone_keys = {
+				arg_indices_by_name_by_def_id = state.used_clone_keys.arg_indices_by_name_by_def_id.set(
+					key.original_def_id,
+					updated_by_name,
+				),
+			}
+		}
 
 
 private pure func call_arg_consumes_target(
@@ -1532,16 +1656,18 @@ private pure func candidate_for_clone_call(
 	name: String,
 	def_id: Int,
 ) -> Option[CloneCandidate]:
-	var found: Option[CloneCandidate] = None
-
-	for candidate in state.candidates:
-		if candidate.clone_name == name and candidate.clone_def_id == def_id:
-			found = Some(candidate)
-			break
-		else:
-			void
-
-	found
+	match state.candidates.ordinal_by_clone_def_id.get(def_id):
+		Some(ordinal):
+			match state.candidates.ordered.get(ordinal):
+				Some(candidate):
+					if candidate.clone_name == name and candidate.clone_def_id == def_id:
+						Some(candidate)
+					else:
+						None
+				None:
+					None
+		None:
+			None
 
 
 private pure func collect_used_clone_keys_from_expr(
@@ -1646,23 +1772,31 @@ private pure func clones_after(
 ) -> List[CoreDecl]:
 	var result: List[CoreDecl] = []
 
-	for candidate in state.candidates:
-		if (
-			candidate.key.original_name == original_func.name
-			and candidate.key.original_def_id == original_func.def_id
-			and clone_key_used(state.used_clone_keys, candidate.key)
-		):
-			match make_consuming_clone(
-				state,
-				original_func,
-				candidate.key.arg_index,
-				candidate.clone_def_id,
-			):
-				Some(clone):
-					result = result.append(FunctionDecl(clone))
-				None:
-					void
-		else:
+	match state.candidates.ordinals_by_original_def_id.get(original_func.def_id):
+		Some(ordinals):
+			for ordinal in ordinals:
+				match state.candidates.ordered.get(ordinal):
+					Some(candidate):
+						if (
+							candidate.key.original_name == original_func.name
+							and candidate.key.original_def_id == original_func.def_id
+							and clone_key_used(state.used_clone_keys, candidate.key)
+						):
+							match make_consuming_clone(
+								state,
+								original_func,
+								candidate.key.arg_index,
+								candidate.clone_def_id,
+							):
+								Some(clone):
+									result = result.append(FunctionDecl(clone))
+								None:
+									void
+						else:
+							void
+					None:
+						void
+		None:
 			void
 
 	result

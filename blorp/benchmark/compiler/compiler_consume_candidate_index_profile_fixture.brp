@@ -1,0 +1,390 @@
+-- Deterministic consume-specialization candidate workload.
+import:
+	../../src/compiler/stage_09_core/consume_specialize: rewrite_program
+	../../src/compiler/stage_09_core/ir:
+		CoreCallKind(UserCall),
+		CoreDecl(FunctionDecl, UnionDecl),
+		CoreExpr(AssignExpr, CallExpr, LetExpr, LiteralExpr, SeqExpr, VarExpr),
+		CoreFunction,
+		CoreFunctionKind(UserFunction),
+		CoreLiteral(IntLiteral),
+		CoreParam,
+		CoreProgram,
+		CoreReleasePolicy(NoReleasePolicy),
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(NamedType, UnionType, VoidType),
+		CoreUnionDecl,
+		CoreUnionField,
+		CoreUnionPayloadStorage(ErasedUnionPayloadStorage),
+		CoreUnionVariant,
+		CoreVar,
+		core_program_to_json,
+
+
+record CompilerConsumeCandidateIndexProfileConfig {
+	iterations: Int,
+	function_count: Int,
+	candidates_per_function: Int,
+	user_calls: Int,
+	used_percent: Int,
+	collision_mode: String
+}
+
+
+record CompilerConsumeCandidateIndexProfileResult {
+	candidates_discovered: Int,
+	rewritten_clone_count: Int,
+	rewritten_function_checksum: Int,
+	core_json_checksum: Int,
+	core_json_bytes: Int,
+	workload_valid: Bool
+}
+
+
+private pure func int_type() -> CoreType:
+	NamedType("Int", [])
+
+
+private pure func expr_type() -> CoreType:
+	UnionType("Expr")
+
+
+private pure func benchmark_var(name: String, def_id: Option[Int]) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = def_id
+	}
+
+
+private pure func benchmark_param(name: String, typ: CoreType) -> CoreParam:
+	{
+		name = benchmark_var(name, None),
+		typ = typ,
+		loc = SyntheticSourceLoc
+	}
+
+
+private pure func int_expr(value: Int) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), int_type(), SyntheticSourceLoc)
+
+
+private pure func function_var(name: String, def_id: Int) -> CoreVar:
+	benchmark_var(name, Some(def_id))
+
+
+private pure func callee_expr(name: String, def_id: Int) -> CoreExpr:
+	VarExpr(
+		function_var(name, def_id),
+		NamedType("Closure", []),
+		SyntheticSourceLoc,
+	)
+
+
+private pure func expr_var(name: String) -> CoreExpr:
+	VarExpr(
+		benchmark_var(name, None),
+		expr_type(),
+		SyntheticSourceLoc,
+	)
+
+
+private pure func lit_expr(value: Int) -> CoreExpr:
+	CallExpr(
+		UserCall("Lit", Some(100), []),
+		callee_expr("Lit", 100),
+		[int_expr(value)],
+		expr_type(),
+		SyntheticSourceLoc,
+	)
+
+
+private pure func expr_union_field() -> CoreUnionField:
+	{
+		typ = expr_type(),
+		release_policy = NoReleasePolicy
+	}
+
+
+private pure func expr_union_variant(
+	name: String,
+	tag: Int,
+	def_id: Int,
+	fields: List[CoreUnionField],
+) -> CoreUnionVariant:
+	{
+		name = name,
+		c_name = name,
+		tag_c_name = "TAG_Expr_${name}",
+		tag = tag,
+		fields = fields,
+		def_id = Some(def_id)
+	}
+
+
+private pure func expr_union_decl() -> CoreUnionDecl:
+	{
+		abi_type = None,
+		name = "Expr",
+		type_params = [],
+		payload_storage = ErasedUnionPayloadStorage,
+		variants = [
+			expr_union_variant(
+				"Lit",
+				0,
+				100,
+				[
+					{
+						typ = int_type(),
+						release_policy = NoReleasePolicy
+					},
+				],
+			),
+			expr_union_variant(
+				"Pair",
+				1,
+				101,
+				[expr_union_field(), expr_union_field()],
+			),
+		],
+		loc = SyntheticSourceLoc
+	}
+
+
+private pure func benchmark_function_name(index: Int) -> String:
+	"consume_bench_${index}"
+
+
+private pure func benchmark_function_def_id(index: Int, collision_mode: String) -> Int:
+	if collision_mode == "same-def-different-name":
+		200
+	else:
+		200 + index
+
+
+private pure func candidate_param_count(config: CompilerConsumeCandidateIndexProfileConfig) -> Int:
+	if config.candidates_per_function >= 0:
+		config.candidates_per_function
+	else:
+		1
+
+
+private pure func function_count(config: CompilerConsumeCandidateIndexProfileConfig) -> Int:
+	if config.function_count > 0:
+		config.function_count
+	else:
+		1
+
+
+private pure func user_call_count(config: CompilerConsumeCandidateIndexProfileConfig) -> Int:
+	if config.user_calls >= 0:
+		config.user_calls
+	else:
+		1
+
+
+private pure func benchmark_function(
+	index: Int,
+	config: CompilerConsumeCandidateIndexProfileConfig,
+) -> CoreFunction:
+	var params: List[CoreParam] = []
+	var param_index: Int = 0
+
+	while param_index < candidate_param_count(config):
+		params = params.append(benchmark_param("expr_${param_index}", expr_type()))
+		param_index += 1
+
+	params = params.append(benchmark_param("pass", int_type()))
+
+	{
+		name = benchmark_function_name(index),
+		source_module = Some("bench/consume_candidate_index"),
+		type_params = [],
+		params = params,
+		return_type = expr_type(),
+		body = Some(lit_expr(index)),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = benchmark_function_def_id(index, config.collision_mode),
+		loc = SyntheticSourceLoc
+	}
+
+
+private pure func benchmark_call_args(
+	selected_arg_index: Int,
+	config: CompilerConsumeCandidateIndexProfileConfig,
+) -> List[CoreExpr]:
+	var args: List[CoreExpr] = []
+	var arg_index: Int = 0
+
+	while arg_index < candidate_param_count(config):
+		if arg_index == selected_arg_index:
+			args = args.append(expr_var("expr"))
+		else:
+			args = args.append(lit_expr(arg_index))
+
+		arg_index += 1
+
+	args.append(int_expr(selected_arg_index))
+
+
+private pure func benchmark_assignment(
+	call_index: Int,
+	config: CompilerConsumeCandidateIndexProfileConfig,
+) -> CoreExpr:
+	function_total: Int = function_count(config)
+	param_total: Int = candidate_param_count(config)
+	candidate_total: Int = function_total * param_total
+
+	candidate_ordinal: Int = if candidate_total > 0:
+		call_index % candidate_total
+	else:
+		0
+
+	function_index: Int = if candidate_total > 0:
+		candidate_ordinal / param_total
+	else:
+		call_index % function_total
+
+	arg_index: Int = if candidate_total > 0:
+		candidate_ordinal % param_total
+	else:
+		0
+
+	name: String = benchmark_function_name(function_index)
+	def_id: Int = benchmark_function_def_id(function_index, config.collision_mode)
+
+	AssignExpr(
+		benchmark_var("expr", None),
+		CallExpr(
+			UserCall(name, Some(def_id), []),
+			callee_expr(name, def_id),
+			benchmark_call_args(arg_index, config),
+			expr_type(),
+			SyntheticSourceLoc,
+		),
+		VoidType,
+		SyntheticSourceLoc,
+	)
+
+
+private pure func benchmark_run_function(
+	config: CompilerConsumeCandidateIndexProfileConfig,
+) -> CoreFunction:
+	call_total: Int = user_call_count(config)
+	var body: CoreExpr = expr_var("expr")
+	var call_index: Int = call_total - 1
+
+	while call_index >= 0:
+		body = SeqExpr(
+			benchmark_assignment(call_index, config),
+			body,
+		)
+		call_index -= 1
+
+	{
+		name = "run",
+		source_module = Some("bench/consume_candidate_index"),
+		type_params = [],
+		params = [],
+		return_type = expr_type(),
+		body = Some(LetExpr(benchmark_var("expr", None), True, expr_type(), lit_expr(0), body)),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 1000,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func compiler_consume_candidate_index_profile_program(
+	config: CompilerConsumeCandidateIndexProfileConfig,
+) -> CoreProgram:
+	var decls: List[CoreDecl] = [UnionDecl(expr_union_decl())]
+	var index: Int = 0
+
+	while index < function_count(config):
+		decls = decls.append(FunctionDecl(benchmark_function(index, config)))
+		index += 1
+
+	decls = decls.append(FunctionDecl(benchmark_run_function(config)))
+
+	{
+		decls = decls,
+		foreign_includes = []
+	}
+
+
+private pure func mix_checksum(checksum: Int, value: Int) -> Int:
+	checksum * 131 + value
+
+
+private pure func string_checksum(text: String) -> Int:
+	var checksum: Int = 17
+
+	for ch in text:
+		checksum = mix_checksum(checksum, ch.to_int())
+
+	checksum
+
+
+private pure func rewritten_function_summary(program: CoreProgram) -> (Int, Int):
+	var clone_count: Int = 0
+	var checksum: Int = 19
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(func_info):
+				checksum = mix_checksum(
+					mix_checksum(checksum, string_checksum(func_info.name)),
+					func_info.def_id,
+				)
+
+				if func_info.name.contains("__consume_arg"):
+					clone_count += 1
+				else:
+					void
+			_:
+				void
+
+	(clone_count, checksum)
+
+
+pure func compiler_consume_candidate_index_expected_candidates(
+	config: CompilerConsumeCandidateIndexProfileConfig,
+) -> Int:
+	function_count(config) * candidate_param_count(config)
+
+
+pure func compiler_consume_candidate_index_profile_result_for_rewrite(
+	config: CompilerConsumeCandidateIndexProfileConfig,
+	rewritten: CoreProgram,
+) -> CompilerConsumeCandidateIndexProfileResult:
+	summary: (Int, Int) = rewritten_function_summary(rewritten)
+	expected_candidates: Int = compiler_consume_candidate_index_expected_candidates(config)
+	core_json: String = core_program_to_json(rewritten).to_string()
+
+	{
+		candidates_discovered = expected_candidates,
+		rewritten_clone_count = summary[0],
+		rewritten_function_checksum = summary[1],
+		core_json_checksum = string_checksum(core_json),
+		core_json_bytes = core_json.length(),
+		workload_valid = (
+			(expected_candidates == 0 or summary[0] > 0)
+			and summary[0] <= expected_candidates
+		)
+	}
+
+
+pure func compiler_consume_candidate_index_profile_run(
+	config: CompilerConsumeCandidateIndexProfileConfig,
+) -> CompilerConsumeCandidateIndexProfileResult:
+	program: CoreProgram = compiler_consume_candidate_index_profile_program(config)
+	var rewritten: CoreProgram = rewrite_program(program)
+	var index: Int = 1
+
+	while index < config.iterations:
+		rewritten = rewrite_program(program)
+		index += 1
+
+	compiler_consume_candidate_index_profile_result_for_rewrite(config, rewritten)

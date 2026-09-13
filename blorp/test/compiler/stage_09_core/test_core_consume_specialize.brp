@@ -82,6 +82,10 @@ pure func expr_type() -> CoreType:
 	UnionType("Expr")
 
 
+pure func other_expr_type() -> CoreType:
+	UnionType("OtherExpr")
+
+
 pure func closure_type() -> CoreType:
 	NamedType("Closure", [])
 
@@ -194,6 +198,10 @@ pure func expr_union_decl() -> CoreUnionDecl:
 	}
 
 
+pure func other_expr_union_decl() -> CoreUnionDecl:
+	{ expr_union_decl() | name = "OtherExpr" }
+
+
 pure func rewrite_function(body: CoreExpr) -> CoreFunction:
 	{
 		name = "rewrite_expr",
@@ -209,6 +217,25 @@ pure func rewrite_function(body: CoreExpr) -> CoreFunction:
 	}
 
 
+pure func multi_rewrite_function(body: CoreExpr) -> CoreFunction:
+	{
+		name = "multi_rewrite",
+		source_module = None,
+		type_params = [],
+		params = [
+			param("left_expr", expr_type()),
+			param("right_expr", expr_type()),
+			param("pass", int_type()),
+		],
+		return_type = expr_type(),
+		body = Some(body),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 30,
+		loc = SyntheticSourceLoc
+	}
+
+
 pure func assignment_expr() -> CoreExpr:
 	AssignExpr(
 		named_var("expr"),
@@ -218,6 +245,21 @@ pure func assignment_expr() -> CoreExpr:
 			[var_expr("expr", expr_type()), int_expr(1)],
 			expr_type(),
 		),
+		VoidType,
+		SyntheticSourceLoc,
+	)
+
+
+pure func assignment_expr_for_call(
+	target: CoreVar,
+	call_name: String,
+	def_id: Int,
+	args: List[CoreExpr],
+	return_type: CoreType,
+) -> CoreExpr:
+	AssignExpr(
+		target,
+		user_call(call_name, def_id, args, return_type),
 		VoidType,
 		SyntheticSourceLoc,
 	)
@@ -305,6 +347,22 @@ pure func function_definition_id(program_value: CoreProgram, name: String) -> Op
 				void
 
 	found
+
+
+pure func function_occurrence_count(program_value: CoreProgram, name: String) -> Int:
+	var count: Int = 0
+
+	for decl in program_value.decls:
+		match decl:
+			FunctionDecl(func_info):
+				if func_info.name == name:
+					count += 1
+				else:
+					void
+			_:
+				void
+
+	count
 
 
 record CloneBodySummary {
@@ -820,6 +878,62 @@ pure func test_clone_identity_uses_name_and_def_id() -> Bool:
 	) and assignment_call_name_matches(rewritten, "rewrite_expr__consume_arg0")
 
 
+pure func test_later_same_def_id_name_does_not_steal_candidate() -> Bool:
+	later_same_id: CoreFunction = { rewrite_function(lit_expr(99)) | name = "later_rewrite" }
+	source_program: CoreProgram = {
+		decls = [
+			UnionDecl(expr_union_decl()),
+			FunctionDecl(rewrite_function(lit_expr(7))),
+			FunctionDecl(later_same_id),
+			FunctionDecl(run_function()),
+		],
+		foreign_includes = []
+	}
+	rewritten: CoreProgram = rewrite_program(source_program)
+
+	function_names_are(
+		rewritten,
+		["rewrite_expr", "rewrite_expr__consume_arg0", "later_rewrite", "run"],
+	) and assignment_call_name_matches(rewritten, "rewrite_expr__consume_arg0")
+
+
+pure func test_structurally_different_target_type_does_not_select_candidate() -> Bool:
+	other_target: CoreVar = named_var("other_expr")
+	other_run: CoreFunction = { run_function() | body = Some(
+			LetExpr(
+				other_target,
+				True,
+				other_expr_type(),
+				VarExpr(other_target, other_expr_type(), SyntheticSourceLoc),
+				SeqExpr(
+					assignment_expr_for_call(
+						other_target,
+						"rewrite_expr",
+						10,
+						[VarExpr(other_target, other_expr_type(), SyntheticSourceLoc), int_expr(1)],
+						other_expr_type(),
+					),
+					VarExpr(other_target, other_expr_type(), SyntheticSourceLoc),
+				),
+			),
+		) }
+	source_program: CoreProgram = {
+		decls = [
+			UnionDecl(expr_union_decl()),
+			UnionDecl(other_expr_union_decl()),
+			FunctionDecl(rewrite_function(lit_expr(7))),
+			FunctionDecl(other_run),
+		],
+		foreign_includes = []
+	}
+	rewritten: CoreProgram = rewrite_program(source_program)
+
+	function_names_are(
+		rewritten,
+		["rewrite_expr", "run"],
+	) and assignment_call_name_matches(rewritten, "rewrite_expr")
+
+
 pure func test_clone_id_follows_every_declared_definition_id() -> Bool:
 	high_id_enum: CoreEnumDecl = {
 		abi_type = None,
@@ -854,6 +968,137 @@ pure func test_clone_id_follows_every_declared_definition_id() -> Bool:
 	rewritten: CoreProgram = rewrite_program(source_program)
 
 	function_definition_id(rewritten, "rewrite_expr__consume_arg0") == Some(6001)
+
+
+pure func test_later_used_candidate_retains_id_reserved_by_unused_candidate() -> Bool:
+	left: CoreVar = named_var("left_expr")
+	right: CoreVar = named_var("right_expr")
+	arg1_assignment: CoreExpr = assignment_expr_for_call(
+		right,
+		"multi_rewrite",
+		30,
+		[
+			VarExpr(left, expr_type(), SyntheticSourceLoc),
+			VarExpr(right, expr_type(), SyntheticSourceLoc),
+			int_expr(1),
+		],
+		expr_type(),
+	)
+	multi_run: CoreFunction = { run_function() |
+		body = Some(
+			LetExpr(
+				left,
+				True,
+				expr_type(),
+				lit_expr(0),
+				LetExpr(
+					right,
+					True,
+					expr_type(),
+					lit_expr(1),
+					SeqExpr(
+						arg1_assignment,
+						VarExpr(right, expr_type(), SyntheticSourceLoc),
+					),
+				),
+			),
+		)
+	}
+	source_program: CoreProgram = {
+		decls = [
+			UnionDecl(expr_union_decl()),
+			FunctionDecl(multi_rewrite_function(lit_expr(7))),
+			FunctionDecl(multi_run),
+		],
+		foreign_includes = []
+	}
+	rewritten: CoreProgram = rewrite_program(source_program)
+
+	function_names_are(
+		rewritten,
+		["multi_rewrite", "multi_rewrite__consume_arg1", "run"],
+	) and function_definition_id(rewritten, "multi_rewrite__consume_arg1") == Some(103)
+
+
+pure func test_used_clones_emit_once_in_parameter_order() -> Bool:
+	left: CoreVar = named_var("left_expr")
+	right: CoreVar = named_var("right_expr")
+	use_arg0: CoreExpr = assignment_expr_for_call(
+		left,
+		"multi_rewrite",
+		30,
+		[
+			VarExpr(left, expr_type(), SyntheticSourceLoc),
+			VarExpr(right, expr_type(), SyntheticSourceLoc),
+			int_expr(1),
+		],
+		expr_type(),
+	)
+	use_arg1: CoreExpr = assignment_expr_for_call(
+		right,
+		"multi_rewrite",
+		30,
+		[
+			VarExpr(left, expr_type(), SyntheticSourceLoc),
+			VarExpr(right, expr_type(), SyntheticSourceLoc),
+			int_expr(1),
+		],
+		expr_type(),
+	)
+	repeated_arg0: CoreExpr = assignment_expr_for_call(
+		left,
+		"multi_rewrite",
+		30,
+		[
+			VarExpr(left, expr_type(), SyntheticSourceLoc),
+			VarExpr(right, expr_type(), SyntheticSourceLoc),
+			int_expr(2),
+		],
+		expr_type(),
+	)
+	multi_run: CoreFunction = { run_function() |
+		body = Some(
+			LetExpr(
+				left,
+				True,
+				expr_type(),
+				lit_expr(0),
+				LetExpr(
+					right,
+					True,
+					expr_type(),
+					lit_expr(1),
+					SeqExpr(
+						use_arg0,
+						SeqExpr(
+							use_arg1,
+							SeqExpr(
+								repeated_arg0,
+								VarExpr(right, expr_type(), SyntheticSourceLoc),
+							),
+						),
+					),
+				),
+			),
+		)
+	}
+	source_program: CoreProgram = {
+		decls = [
+			UnionDecl(expr_union_decl()),
+			FunctionDecl(multi_rewrite_function(lit_expr(7))),
+			FunctionDecl(multi_run),
+		],
+		foreign_includes = []
+	}
+	rewritten: CoreProgram = rewrite_program(source_program)
+
+	function_names_are(
+		rewritten,
+		["multi_rewrite", "multi_rewrite__consume_arg0", "multi_rewrite__consume_arg1", "run"],
+	) and function_occurrence_count(
+		rewritten,
+		"multi_rewrite__consume_arg0",
+	) == 1 and function_occurrence_count(rewritten, "multi_rewrite__consume_arg1") == 1
 
 
 pure func test_does_not_clone_when_result_is_consumed_param() -> Bool:
@@ -1084,9 +1329,22 @@ tests: TestSuite = {
 		("rewrites safe self-replacement call", test_rewrites_safe_self_replacement_call),
 		("clone identity uses name and def id", test_clone_identity_uses_name_and_def_id),
 		(
+			"later same def id name does not steal candidate",
+			test_later_same_def_id_name_does_not_steal_candidate,
+		),
+		(
+			"structurally different target type does not select candidate",
+			test_structurally_different_target_type_does_not_select_candidate,
+		),
+		(
 			"clone ID follows every declared definition ID",
 			test_clone_id_follows_every_declared_definition_id,
 		),
+		(
+			"later used candidate retains ID reserved by unused candidate",
+			test_later_used_candidate_retains_id_reserved_by_unused_candidate,
+		),
+		("used clones emit once in parameter order", test_used_clones_emit_once_in_parameter_order),
 		(
 			"does not clone when result is consumed param",
 			test_does_not_clone_when_result_is_consumed_param,

@@ -1059,6 +1059,38 @@ stats, elapsed microseconds, and deterministic checksums. Use these rows before
 choosing a production Core optimization; do not extrapolate synthetic wins
 without a production self-compilation replay.
 
+### Consume Candidate Index Profile
+
+`compiler_consume_candidate_index_profile` isolates `consume_specialize` by
+building one Core fixture outside the measured window, warming one rewrite, and
+then timing only repeated production `rewrite_program` calls. The fixture builds
+production Core functions with source-managed parameters, assignment calls that
+can retarget to consuming clones, optional same-definition-ID/different-name
+collision pressure, and a zero-candidate control.
+
+```bash
+benchmarks/compiler_consume_candidate_index_profile plain 1 256 8 256 25 none
+benchmarks/compiler_consume_candidate_index_profile plain 1 64 0 256 25 none
+benchmarks/compiler_consume_candidate_index_profile \
+  plain 1 64 8 256 25 same-def-different-name
+
+benchmarks/compiler_consume_candidate_index_profile \
+  --compiler /path/to/pinned-bootstrap/blorp \
+  --compiler-root /path/to/candidate \
+  --baseline-compiler /path/to/pinned-bootstrap/blorp \
+  --baseline-compiler-root /path/to/base_worktree_644575ed \
+  --samples 7 \
+  plain 20 256 8 256 25 none
+```
+
+Single-compiler rows print `CONSUME_CANDIDATE_INDEX_PROFILE` with discovered
+candidates, emitted clone count, allocator stats, measured rewrite
+microseconds, generated-Core JSON checksum/bytes, compiler/source hashes, and
+benchmark binary hash. Paired rows alternate baseline and candidate execution
+order, overlay byte-identical benchmark sources into both roots, require
+matching generated-Core checksums, and report median elapsed and allocation
+ratios.
+
 ### Captured Backend Replay
 
 `compiler_backend_memory` replays one production `emit_core_c` request against
