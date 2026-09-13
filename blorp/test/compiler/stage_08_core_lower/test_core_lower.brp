@@ -5926,6 +5926,125 @@ func test_prepared_graph_uses_module_id_for_repeated_imports() -> Bool:
 			False
 
 
+private pure func duplicate_callable_registry_function(
+	name: String,
+	callable_id: Option[Int],
+	body: TypedExpr,
+) -> TypedFunctionInfo:
+	{
+		decl = { parsed_function_decl() | name = ident(name) },
+		callable_id = callable_id,
+		effective_type_params = [],
+		param_types = [int_type()],
+		source_return_type = Some(int_type()),
+		semantic_return_type = int_type(),
+		body = Some(body)
+	}
+
+
+private func prepared_graph_duplicate_callable_ids_use_later_name(
+	module_table: ModuleTable,
+	target_module_id: ModuleId,
+	dependency_module_id: ModuleId,
+) -> Option[Bool]:
+	empty = definition_index_empty(definition_index_initial_seed(ENV_EMPTY), module_table)
+	duplicate_result ?= insert_core_test_callable(
+		empty,
+		module_table,
+		dependency_module_id,
+		"first",
+	)
+	complete = duplicate_result[0]
+	duplicate_raw = duplicate_result[1]
+	definitions = definition_index_definition_table(complete)
+	duplicate_callable ?= callable_id_from_definition_table(definitions, duplicate_raw)
+	first_function = duplicate_callable_registry_function(
+		"first",
+		Some(duplicate_raw),
+		int_expr("1"),
+	)
+	second_function = duplicate_callable_registry_function(
+		"second",
+		Some(duplicate_raw),
+		int_expr("2"),
+	)
+	resolved = resolved_call_info(
+		"second",
+		ResolvedGraphCallableCall(duplicate_callable, ResolvedSourceFunctionCall),
+	)
+	target_call = TypedCallExpr(
+		TypedNameExpr(ident("second"), expr_info(function_type())),
+		[int_expr("5")],
+		fixture_source_span(),
+		expr_info_with_resolved(int_type(), resolved),
+	)
+	target_function = duplicate_callable_registry_function("target", None, target_call)
+	dependency_program: TypedProgram = {
+		source = fixture_source_file(),
+		decls = [TypedFunctionDecl(first_function), TypedFunctionDecl(second_function)],
+		diagnostics = [],
+		type_definitions = [],
+		type_references = []
+	}
+	target_program: TypedProgram = {
+		source = fixture_source_file(),
+		decls = [TypedFunctionDecl(target_function)],
+		diagnostics = [],
+		type_definitions = [],
+		type_references = []
+	}
+
+	Some(
+		match (
+			prepare_core_graph(
+				definitions,
+				target_module_id,
+				target_program,
+				core_graph_modules(
+					definitions,
+					[
+						{
+							module_id = dependency_module_id,
+							typed_program = dependency_program
+						},
+					],
+				),
+				definition_index_next_def_id(complete),
+			)
+		):
+			Ok(prepared):
+				match prepared.program.decls:
+					[FunctionDecl(_), FunctionDecl(_), FunctionDecl(target_info)]:
+						match target_info.body:
+							Some(CallExpr(SelectedDirectCall(def_id), VarExpr(variable, _, _), _, _, _)):
+								(
+									def_id == duplicate_raw
+									and variable.name == core_ufcs_function_name(
+										"pkg/dup",
+										"second",
+									)
+								)
+							_:
+								False
+					_:
+						False
+			Err(_):
+				False
+	)
+
+
+func test_prepared_graph_duplicate_callable_ids_use_later_name() -> Bool:
+	match core_graph_test_module_domain(["app/main", "pkg/dup"]):
+		Some((module_table, [target_module_id, dependency_module_id])):
+			prepared_graph_duplicate_callable_ids_use_later_name(
+				module_table,
+				target_module_id,
+				dependency_module_id,
+			).get_or(False)
+		_:
+			False
+
+
 private func synthesizes_explicit_program_entrypoint(
 	module_table: ModuleTable,
 	target_module_id: ModuleId,
@@ -6467,6 +6586,10 @@ tests: TestSuite = {
 		(
 			"prepared graph uses module ID for repeated imports",
 			test_prepared_graph_uses_module_id_for_repeated_imports,
+		),
+		(
+			"prepared graph duplicate callable IDs use later name",
+			test_prepared_graph_duplicate_callable_ids_use_later_name,
 		),
 		("synthesizes explicit program entrypoint", test_synthesizes_explicit_program_entrypoint),
 		(

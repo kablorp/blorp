@@ -1,0 +1,500 @@
+-- Deterministic callable-name registry workload for Core graph preparation.
+import:
+	../../src/compiler/stage_03_parse/parsed_ast:
+		ParsedExpr(ParsedIntLiteralExpr),
+		ParsedFunctionDecl,
+		ParsedIdentifier,
+		ParsedImplDecl,
+		ParsedParam,
+		ParsedParamBinder(ParsedParamNameBinder),
+		ParsedTypeExpr(ParsedNamedType),
+		parsed_identifier,
+	../../src/compiler/stage_04_modules/loaded_module:
+		ModuleOrigin(UserModule),
+		resolved_module_identity_from_resolver,
+	../../src/compiler/stage_04_modules/module_table:
+		ModuleId,
+		ModuleTable,
+		module_table,
+		module_table_id_at,
+	../../src/compiler/stage_06_typecheck/decl:
+		TypedDecl(TypedFunctionDecl, TypedImplDecl, TypedPrivateDecl),
+		TypedFunctionInfo,
+		TypedImplInfo,
+		TypedProgram,
+	../../src/compiler/stage_06_typecheck/graph/definition_identity: func_callable_key
+	../../src/compiler/stage_06_typecheck/graph/definition_index:
+		DefinitionIndex,
+		DefinitionTable,
+		definition_index_definition_table,
+		definition_index_empty,
+		definition_index_initial_seed,
+		definition_index_insert_func_callable_id,
+		definition_index_next_def_id,
+	../../src/compiler/stage_06_typecheck/infer:
+		ExprTypeOrigin(SynthesizedOrigin),
+		TypedExpr(TypedIntLiteralExpr),
+		TypedExprInfo,
+	../../src/compiler/stage_06_typecheck/type_system/env: ENV_EMPTY
+	../../src/compiler/stage_06_typecheck/type_system/refinement: UNREFINED_BINDING
+	../../src/compiler/stage_06_typecheck/type_system/semantic_type:
+		TYPE_INT,
+		TYPE_STRING,
+		type_list,
+	../../src/compiler/stage_06_typecheck/type_system/type_widening: ValueSlot(KeptValueSlot)
+	../../src/compiler/stage_08_core_lower/graph_prepare:
+		CoreGraphModules,
+		CoreGraphUnit,
+		core_graph_modules,
+		prepare_core_graph,
+	../../src/lib/source: Cursor, SourceFile, SourceSpan, source_cursor_at, source_file, source_span
+
+
+record CompilerCallableNameRegistryProfileConfig {
+	iterations: Int,
+	module_count: Int,
+	total_callables: Int
+}
+
+
+union CompilerCallableNameRegistryProfileShape:
+	TopLevelCallableProfileShape
+	PrivateCallableProfileShape
+	ImplCallableProfileShape
+
+
+record CompilerCallableNameRegistryProfileResult {
+	registered_callables: Int,
+	output_declarations: Int,
+	checksum: Int,
+	module_count: Int,
+	total_callables: Int,
+	workload_valid: Bool
+}
+
+
+record CompilerCallableNameRegistryProfileRequest {
+	definition_table: DefinitionTable,
+	target_module_id: ModuleId,
+	target: TypedProgram,
+	modules: CoreGraphModules,
+	next_def_id: Int,
+	total_callables: Int
+}
+
+
+private record RegistryProfileProgramBuild {
+	index: DefinitionIndex,
+	program: TypedProgram,
+	callable_count: Int
+}
+
+
+private pure func fixture_source_file() -> SourceFile:
+	source_file("callable_name_registry_profile.brp", "bench/callable_name_registry", "")
+
+
+private pure func fixture_source_span() -> SourceSpan:
+	src: SourceFile = fixture_source_file()
+	start: Cursor = source_cursor_at(src, 0)
+	finish: Cursor = source_cursor_at(src, 0)
+	source_span(src, start, finish)
+
+
+private pure func ident(text: String) -> ParsedIdentifier:
+	parsed_identifier(text, fixture_source_span())
+
+
+private pure func parsed_type_int() -> ParsedTypeExpr:
+	ParsedNamedType(ident("Int"), [], fixture_source_span())
+
+
+private pure func parsed_type_string() -> ParsedTypeExpr:
+	ParsedNamedType(ident("String"), [], fixture_source_span())
+
+
+private pure func parsed_type_string_list() -> ParsedTypeExpr:
+	ParsedNamedType(ident("List"), [parsed_type_string()], fixture_source_span())
+
+
+private pure func parsed_int_expr(text: String) -> ParsedExpr:
+	ParsedIntLiteralExpr(text, fixture_source_span())
+
+
+private pure func parsed_param(name: String) -> ParsedParam:
+	{
+		binder = ParsedParamNameBinder(ident(name)),
+		type_expr = Some(parsed_type_int()),
+		span = fixture_source_span()
+	}
+
+
+private pure func parsed_function_decl(name: String) -> ParsedFunctionDecl:
+	{
+		name = ident(name),
+		keyword_span = Some(fixture_source_span()),
+		type_params = [],
+		params = [parsed_param("x")],
+		return_type = Some(parsed_type_int()),
+		dim_constraints = [],
+		body = Some(parsed_int_expr("1")),
+		is_pure = True,
+		annotations = [],
+		doc = None,
+		span = fixture_source_span()
+	}
+
+
+private pure func parsed_impl_decl(methods: List[ParsedFunctionDecl]) -> ParsedImplDecl:
+	{
+		trait_name = ident("Display"),
+		for_type = parsed_type_int(),
+		methods = methods,
+		doc = None,
+		span = fixture_source_span()
+	}
+
+
+private pure func parsed_main_function_decl() -> ParsedFunctionDecl:
+	{
+		name = ident("main"),
+		keyword_span = Some(fixture_source_span()),
+		type_params = [],
+		params = [
+			{
+				binder = ParsedParamNameBinder(ident("args")),
+				type_expr = Some(parsed_type_string_list()),
+				span = fixture_source_span()
+			},
+		],
+		return_type = Some(parsed_type_int()),
+		dim_constraints = [],
+		body = Some(parsed_int_expr("0")),
+		is_pure = False,
+		annotations = [],
+		doc = None,
+		span = fixture_source_span()
+	}
+
+
+private pure func registry_profile_function(name: String, callable_id: Int) -> TypedFunctionInfo:
+	{
+		decl = parsed_function_decl(name),
+		callable_id = Some(callable_id),
+		effective_type_params = [],
+		param_types = [TYPE_INT],
+		source_return_type = Some(TYPE_INT),
+		semantic_return_type = TYPE_INT,
+		body = Some(typed_int_expr("1"))
+	}
+
+
+private pure func expr_info_int() -> TypedExprInfo:
+	{
+		source_type = None,
+		origin = SynthesizedOrigin("callable name registry profile"),
+		value_slot = KeptValueSlot(TYPE_INT),
+		proofs = UNREFINED_BINDING,
+		resolved_call = None,
+		resolved_definition_id = None,
+		resource_dependencies = []
+	}
+
+
+private pure func typed_int_expr(text: String) -> TypedExpr:
+	TypedIntLiteralExpr(text, fixture_source_span(), expr_info_int())
+
+
+private pure func registry_profile_main(callable_id: Int) -> TypedFunctionInfo:
+	{
+		decl = parsed_main_function_decl(),
+		callable_id = Some(callable_id),
+		effective_type_params = [],
+		param_types = [type_list(TYPE_STRING)],
+		source_return_type = Some(TYPE_INT),
+		semantic_return_type = TYPE_INT,
+		body = Some(typed_int_expr("0"))
+	}
+
+
+private pure func registry_profile_impl(methods: List[TypedFunctionInfo]) -> TypedImplInfo:
+	{
+		decl = parsed_impl_decl(methods.map(
+			func(method): method.decl,
+		)),
+		for_type = TYPE_INT,
+		type_params = [],
+		methods = methods
+	}
+
+
+private pure func insert_registry_profile_callable(
+	index: DefinitionIndex,
+	table: ModuleTable,
+	module_id: ModuleId,
+	name: String,
+) -> Option[(DefinitionIndex, Int)]:
+	definition_id = definition_index_next_def_id(index)
+	updated ?= definition_index_insert_func_callable_id(
+		index,
+		table,
+		func_callable_key(module_id, name, fixture_source_span()),
+		definition_id,
+	).to_option()
+	Some((updated, definition_id))
+
+
+private pure func registry_profile_program(
+	index: DefinitionIndex,
+	table: ModuleTable,
+	module_id: ModuleId,
+	module_index: Int,
+	callable_count: Int,
+	source_callable_count: Int,
+	shape: CompilerCallableNameRegistryProfileShape,
+) -> Option[RegistryProfileProgramBuild]:
+	var current_index: DefinitionIndex = index
+	var decls: List[TypedDecl] = []
+	var impl_methods: List[TypedFunctionInfo] = []
+	var callable_index: Int = 0
+	var valid: Bool = True
+
+	if module_index == 0 and callable_count > 0:
+		match insert_registry_profile_callable(current_index, table, module_id, "main"):
+			Some(main_result):
+				current_index = main_result[0]
+				decls = decls.append(TypedFunctionDecl(registry_profile_main(main_result[1])))
+				callable_index = 1
+			None:
+				valid = False
+
+	while callable_index < callable_count:
+		if valid:
+			callable_name = "registry_profile_m" + module_index.to_string() + "_" + callable_index.to_string()
+
+			match insert_registry_profile_callable(current_index, table, module_id, callable_name):
+				Some(callable_result):
+					current_index = callable_result[0]
+					function_info = registry_profile_function(callable_name, callable_result[1])
+
+					match shape:
+						TopLevelCallableProfileShape:
+							decls = decls.append(TypedFunctionDecl(function_info))
+						PrivateCallableProfileShape:
+							decls = decls.append(TypedPrivateDecl(TypedFunctionDecl(function_info)))
+						ImplCallableProfileShape:
+							impl_methods = impl_methods.append(function_info)
+				None:
+					valid = False
+
+		callable_index += 1
+
+	if valid:
+		if impl_methods.length() > 0:
+			decls = decls.append(TypedImplDecl(registry_profile_impl(impl_methods)))
+
+		Some({
+			index = current_index,
+			program = {
+				source = fixture_source_file(),
+				decls = decls,
+				diagnostics = [],
+				type_definitions = [],
+				type_references = []
+			},
+			callable_count = source_callable_count + callable_count,
+		})
+	else:
+		None
+
+
+private pure func module_callable_count(
+	total_callables: Int,
+	module_count: Int,
+	module_index: Int,
+) -> Int:
+	base_count: Int = total_callables / module_count
+	remainder: Int = total_callables % module_count
+
+	if module_index < remainder:
+		base_count + 1
+	else:
+		base_count
+
+
+private pure func registry_profile_module_table(module_count: Int) -> Option[ModuleTable]:
+	var paths: List[String] = []
+
+	for module_index in 0..module_count:
+		paths = paths.append("bench/callable_name_registry_" + module_index.to_string())
+
+	identities = paths.map(func(path): resolved_module_identity_from_resolver(path, UserModule))
+	module_table(identities).to_option()
+
+
+private pure func registry_profile_module_ids(
+	table: ModuleTable,
+	module_count: Int,
+) -> Option[List[ModuleId]]:
+	var ids: List[ModuleId] = []
+	var valid: Bool = True
+
+	for module_index in 0..module_count:
+		match module_table_id_at(table, module_index):
+			Some(module_id):
+				ids = ids.append(module_id)
+			None:
+				valid = False
+
+	if valid and ids.length() == module_count:
+		Some(ids)
+	else:
+		None
+
+
+private pure func registry_profile_definition_index(table: ModuleTable) -> DefinitionIndex:
+	definition_index_empty(definition_index_initial_seed(ENV_EMPTY), table)
+
+
+pure func compiler_callable_name_registry_profile_request(
+	config: CompilerCallableNameRegistryProfileConfig,
+) -> Option[CompilerCallableNameRegistryProfileRequest]:
+	compiler_callable_name_registry_profile_request_for_shape(config, TopLevelCallableProfileShape)
+
+
+pure func compiler_callable_name_registry_profile_request_for_shape(
+	config: CompilerCallableNameRegistryProfileConfig,
+	shape: CompilerCallableNameRegistryProfileShape,
+) -> Option[CompilerCallableNameRegistryProfileRequest]:
+	table ?= registry_profile_module_table(config.module_count)
+	module_ids ?= registry_profile_module_ids(table, config.module_count)
+	target_id ?= module_ids.get(0)
+	var modules: List[CoreGraphUnit] = []
+	var index: DefinitionIndex = registry_profile_definition_index(table)
+	var registered_callables: Int = 0
+
+	target_callable_count = module_callable_count(config.total_callables, config.module_count, 0)
+	target_build ?= registry_profile_program(
+		index,
+		table,
+		target_id,
+		0,
+		target_callable_count,
+		registered_callables,
+		shape,
+	)
+	index = target_build.index
+	registered_callables = target_build.callable_count
+	target = target_build.program
+	var valid: Bool = True
+
+	for module_index in 1..config.module_count:
+		match module_ids.get(module_index):
+			Some(module_id):
+				callable_count = module_callable_count(
+					config.total_callables,
+					config.module_count,
+					module_index,
+				)
+				module_build = registry_profile_program(
+					index,
+					table,
+					module_id,
+					module_index,
+					callable_count,
+					registered_callables,
+					shape,
+				)
+
+				match module_build:
+					Some(built):
+						index = built.index
+						registered_callables = built.callable_count
+						modules = modules.append({
+							module_id = module_id,
+							typed_program = built.program,
+						})
+					None:
+						valid = False
+			None:
+				valid = False
+
+	if valid:
+		definition_table = definition_index_definition_table(index)
+		Some({
+			definition_table = definition_table,
+			target_module_id = target_id,
+			target = target,
+			modules = core_graph_modules(definition_table, modules),
+			next_def_id = definition_index_next_def_id(index),
+			total_callables = registered_callables,
+		})
+	else:
+		None
+
+
+pure func compiler_callable_name_registry_profile_with_request(
+	config: CompilerCallableNameRegistryProfileConfig,
+	request: CompilerCallableNameRegistryProfileRequest,
+) -> CompilerCallableNameRegistryProfileResult:
+	var output_declarations: Int = 0
+	var checksum: Int = 0
+	var workload_valid = config.module_count > 0 and config.total_callables > 0
+
+	match prepare_core_graph(
+		request.definition_table,
+		request.target_module_id,
+		request.target,
+		request.modules,
+		request.next_def_id,
+	):
+		Ok(prepared):
+			output_declarations = prepared.program.decls.length()
+			checksum = prepared.next_def_id + output_declarations + request.total_callables
+			workload_valid = workload_valid and output_declarations > 0 and checksum > 0
+		Err(_):
+			workload_valid = False
+
+	{
+		registered_callables = request.total_callables,
+		output_declarations = output_declarations,
+		checksum = checksum,
+		module_count = config.module_count,
+		total_callables = config.total_callables,
+		workload_valid = workload_valid
+	}
+
+
+pure func compiler_callable_name_registry_profile(
+	config: CompilerCallableNameRegistryProfileConfig,
+) -> CompilerCallableNameRegistryProfileResult:
+	match compiler_callable_name_registry_profile_request(config):
+		Some(request):
+			compiler_callable_name_registry_profile_with_request(config, request)
+		None:
+			{
+				registered_callables = 0,
+				output_declarations = 0,
+				checksum = 0,
+				module_count = config.module_count,
+				total_callables = config.total_callables,
+				workload_valid = False
+			}
+
+
+pure func compiler_callable_name_registry_profile_for_shape(
+	config: CompilerCallableNameRegistryProfileConfig,
+	shape: CompilerCallableNameRegistryProfileShape,
+) -> CompilerCallableNameRegistryProfileResult:
+	match compiler_callable_name_registry_profile_request_for_shape(config, shape):
+		Some(request):
+			compiler_callable_name_registry_profile_with_request(config, request)
+		None:
+			{
+				registered_callables = 0,
+				output_declarations = 0,
+				checksum = 0,
+				module_count = config.module_count,
+				total_callables = config.total_callables,
+				workload_valid = False
+			}
