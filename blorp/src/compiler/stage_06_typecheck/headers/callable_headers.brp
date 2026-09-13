@@ -55,6 +55,7 @@ import:
 		declaration_skeleton_graph_global_skeletons,
 		global_id_module_id,
 		trait_ids_equal,
+	dict as D
 	trait_headers: TraitTopologyGraph, trait_topology_graph_type_headers
 	trait_reference_resolution: resolve_visible_trait_id
 	type_header_graph:
@@ -185,8 +186,6 @@ private record CallableSignatureResolution {
 
 
 private record CallableHeaderBuildState {
-	callables: List[CallableHeader],
-	callable_index_by_definition_id: Dict[Int, Int],
 	callable_range_by_module: Dict[Int, CallableHeaderModuleRange],
 	current_callable_range: Option[CallableHeaderModuleRange],
 	globals: List[GlobalHeader],
@@ -571,7 +570,6 @@ private pure func resolve_callable_signature(
 
 
 private pure func append_callable_header(
-	state: CallableHeaderBuildState,
 	type_headers: TypeHeaderGraph,
 	skeleton: CallableDeclarationSkeletonInfo,
 	source: CallableHeaderSource,
@@ -580,7 +578,7 @@ private pure func append_callable_header(
 	return_type: Option[ParsedTypeExpr],
 	dimension_constraints: List[ParsedDimConstraint],
 	is_pure: Bool,
-) -> CallableHeaderBuildState:
+) -> Result[(CallableHeader, Int), List[CallableHeaderGraphError]]:
 	bound_graph = type_header_graph_bound_graph(type_headers)
 	definition_table = declaration_skeleton_graph_definition_table(
 		type_header_graph_declaration_graph(type_headers),
@@ -609,15 +607,7 @@ private pure func append_callable_header(
 					)
 				)
 				.get_or("<unknown-module>")
-			{ state |
-				errors = state.errors.append(
-					CallableOwnerModuleMissing(
-						owner_name,
-						module_path,
-						owner_span,
-					),
-				)
-			}
+			Err([CallableOwnerModuleMissing(owner_name, module_path, owner_span)])
 		Some((module_id, module)):
 			effective_type_parameters = effective_callable_type_parameters(
 				type_headers,
@@ -650,7 +640,7 @@ private pure func append_callable_header(
 						parameter_resolution.errors,
 						context_errors,
 					)
-					{ state | errors = state.errors.concat(callable_errors) }
+					Err(callable_errors)
 				Ok(context):
 					signature_resolution = resolve_callable_signature(
 						context,
@@ -671,18 +661,9 @@ private pure func append_callable_header(
 								signature = signature_resolution.signature,
 								dimension_constraints = signature_resolution.dimension_constraints
 							})
-						index = state.callables.length()
-						module_index = module_id_table_index(module_id)
-						with_header = { state |
-							callables = state.callables.append(header),
-							callable_index_by_definition_id = state.callable_index_by_definition_id.set(
-								callable_id_definition_id(skeleton.id),
-								index,
-							)
-						}
-						append_callable_module_range(with_header, module_index, index)
+						Ok((header, module_id_table_index(module_id)))
 					else:
-						{ state | errors = state.errors.concat(all_errors) }
+						Err(all_errors)
 
 
 private pure func append_global_header(
@@ -717,6 +698,7 @@ private pure func append_global_header(
 					)
 				None:
 					None
+
 			{ state |
 				errors = state.errors.append(
 					GlobalOwnerModuleMissing(
@@ -768,14 +750,26 @@ private pure func append_global_header(
 							{ state | errors = errors }
 
 
+private pure func callable_header_index_by_definition_id(
+	callables: List[CallableHeader],
+) -> Dict[Int, Int]:
+	var index: Dict[Int, Int] = D.with_capacity(callables.length())
+	var header_index: Int = 0
+
+	for header in callables:
+		index = index.set(callable_id_definition_id(callable_header_id(header)), header_index)
+		header_index += 1
+
+	index
+
+
 pure func callable_header_graph_build(
 	trait_topology: TraitTopologyGraph,
 ) -> Result[CallableHeaderGraph, List[CallableHeaderGraphError]]:
 	type_headers = trait_topology_graph_type_headers(trait_topology)
 	declaration_graph = type_header_graph_declaration_graph(type_headers)
+	var callables: List[CallableHeader] = []
 	var state: CallableHeaderBuildState = {
-		callables = [],
-		callable_index_by_definition_id = {},
 		callable_range_by_module = {},
 		current_callable_range = None,
 		globals = [],
@@ -785,8 +779,7 @@ pure func callable_header_graph_build(
 	for skeleton in declaration_skeleton_graph_callable_skeletons(declaration_graph):
 		match skeleton.source:
 			FunctionCallableSource(decl):
-				state = append_callable_header(
-					state,
+				result = append_callable_header(
 					type_headers,
 					skeleton,
 					FunctionCallableHeaderSource(decl),
@@ -796,9 +789,16 @@ pure func callable_header_graph_build(
 					decl.dim_constraints,
 					decl.is_pure,
 				)
+
+				match result:
+					Ok((header, module_index)):
+						index = callables.length()
+						callables = callables.append(header)
+						state = append_callable_module_range(state, module_index, index)
+					Err(errors):
+						state = { state | errors = state.errors.concat(errors) }
 			ForeignCallableSource(decl):
-				state = append_callable_header(
-					state,
+				result = append_callable_header(
 					type_headers,
 					skeleton,
 					ForeignCallableHeaderSource(decl),
@@ -808,6 +808,14 @@ pure func callable_header_graph_build(
 					[],
 					decl.is_pure,
 				)
+
+				match result:
+					Ok((header, module_index)):
+						index = callables.length()
+						callables = callables.append(header)
+						state = append_callable_module_range(state, module_index, index)
+					Err(errors):
+						state = { state | errors = state.errors.concat(errors) }
 			ImplementationMethodCallableSource(_, _) | DefaultImplementationMethodCallableSource(_, _, _):
 				void
 
@@ -817,8 +825,8 @@ pure func callable_header_graph_build(
 	if state.errors.is_empty():
 		representation: CallableHeaderGraphRep = {
 			trait_topology = trait_topology,
-			callables = state.callables,
-			callable_index_by_definition_id = state.callable_index_by_definition_id,
+			callables = callables,
+			callable_index_by_definition_id = callable_header_index_by_definition_id(callables),
 			callable_range_by_module = finish_callable_module_ranges(state),
 			globals = state.globals
 		}

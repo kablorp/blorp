@@ -9,7 +9,11 @@ import:
 		BuildRuntimeRequirement(BuildEmbeddedRuntime, BuildExternalRuntime),
 		BuildSanitizer(BuildAddressUndefinedSanitizer, BuildNoSanitizer),
 	../../src/lib/function_profile:
-		FunctionProfileMode(FunctionProfileExactMode, FunctionProfileOffMode),
+		FunctionProfileMode(
+			FunctionProfileCallsMode,
+			FunctionProfileExactMode,
+			FunctionProfileOffMode,
+		),
 	../../src/lib/host_c:
 		HostCCompileError(HostCCompilerRejected),
 		HostCCompiler,
@@ -240,11 +244,12 @@ pure func test_runtime_requirement_mismatch_is_rejected() -> Bool:
 			False
 
 
-pure func test_exact_profile_prelude_precedes_embedded_runtime() -> Bool:
+private pure func profile_prelude_parts_match(
+	mode: FunctionProfileMode,
+	expected_parts: List[String],
+) -> Bool:
 	base = artifact(BuildEmbeddedRuntime, BuildFast, BuildNoSanitizer, [])
-	profiled = { base |
-		compatibility = { base.compatibility | profile_mode = FunctionProfileExactMode }
-	}
+	profiled = { base | compatibility = { base.compatibility | profile_mode = mode } }
 	prepared = prepare_host_c_compilation(
 		profiled,
 		"build/profiled",
@@ -258,17 +263,30 @@ pure func test_exact_profile_prelude_precedes_embedded_runtime() -> Bool:
 		Ok(value):
 			match value.command.stdin:
 				BytesPartsStdin(parts):
-					parts.map(
-						func(
-							part,
-						): part.to_string(),
-					) == [
-						"#define BLORP_PROFILE_EXACT_TIMING 1\n",
-						"/* runtime */\n",
-						"int main(void) { return 0; }\n",
-					]
+					parts.map(func(part): part.to_string()) == expected_parts
 				_:
 					False
+
+
+pure func test_profile_preludes_precede_embedded_runtime() -> Bool:
+	profile_prelude_parts_match(
+		FunctionProfileExactMode,
+		[
+			"#define BLORP_PROFILE_EXACT_TIMING 1\n#define BLORP_PROFILE_COLLECTION_COPY_COUNTERS 1\n",
+			"/* runtime */\n",
+			"int main(void) { return 0; }\n",
+		],
+	) and profile_prelude_parts_match(
+		FunctionProfileCallsMode,
+		[
+			"#define BLORP_PROFILE_COLLECTION_COPY_COUNTERS 1\n",
+			"/* runtime */\n",
+			"int main(void) { return 0; }\n",
+		],
+	) and profile_prelude_parts_match(
+		FunctionProfileOffMode,
+		["/* runtime */\n", "int main(void) { return 0; }\n"],
+	)
 
 
 pure func test_precompiled_runtime_tls_mismatch_is_rejected() -> Bool:
@@ -353,8 +371,8 @@ tests: TestSuite = {
 			test_embedded_macos_clang_command_has_exact_policy,
 		),
 		(
-			"exact profile prelude precedes embedded runtime",
-			test_exact_profile_prelude_precedes_embedded_runtime,
+			"profile preludes precede embedded runtime",
+			test_profile_preludes_precede_embedded_runtime,
 		),
 		(
 			"external sanitized policy uses runtime artifact",

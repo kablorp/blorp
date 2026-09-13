@@ -22,6 +22,10 @@
 #include <time.h>
 
 static void blorp_profile_callable_header_marker(long value);
+#if BLORP_PROFILE_COLLECTION_COPY_COUNTERS
+static void blorp_profile_record_dict_copy(long capacity, long entries);
+static void blorp_profile_record_list_copy(long entries, size_t stride);
+#endif
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -8301,6 +8305,11 @@ static blorp_List* blorp_list_copy(blorp_List* src) {
             if (list->data[i]) blorp_retain(list->data[i]);
         }
     }
+#if BLORP_PROFILE_COLLECTION_COPY_COUNTERS
+    blorp_profile_record_list_copy(
+        list->len,
+        stride);
+#endif
     return list;
 }
 
@@ -8322,6 +8331,11 @@ static blorp_List* blorp_list_copy_with_capacity(blorp_List* src, long new_capac
             if (list->data[i]) blorp_retain(list->data[i]);
         }
     }
+#if BLORP_PROFILE_COLLECTION_COPY_COUNTERS
+    blorp_profile_record_list_copy(
+        list->len,
+        stride);
+#endif
     return list;
 }
 
@@ -19823,6 +19837,9 @@ static blorp_Dict* blorp_dict_copy(blorp_Dict* src) {
         if (dict->key_release && dict->keys[slot]) blorp_retain(dict->keys[slot]);
         if (dict->value_release && dict->values[slot]) blorp_retain(dict->values[slot]);
     }
+#if BLORP_PROFILE_COLLECTION_COPY_COUNTERS
+    blorp_profile_record_dict_copy(src->capacity, src->order_len);
+#endif
     return dict;
 }
 
@@ -37243,6 +37260,14 @@ static atomic_long callable_header_profile_counters[
 static atomic_int callable_header_profile_marker_used = 0;
 static blorp_CallableHeaderProfileSeen callable_header_profile_seen[
     BLORP_PROFILE_CALLABLE_HEADER_SEEN_CAPACITY];
+#if BLORP_PROFILE_COLLECTION_COPY_COUNTERS
+static atomic_long collection_profile_dict_copies = 0;
+static atomic_long collection_profile_dict_entries_copied = 0;
+static atomic_long collection_profile_dict_bytes_copied = 0;
+static atomic_long collection_profile_list_copies = 0;
+static atomic_long collection_profile_list_entries_copied = 0;
+static atomic_long collection_profile_list_bytes_copied = 0;
+#endif
 
 static bool blorp_profile_state_operation_enter(void) {
     if (!atomic_load_explicit(
@@ -37662,6 +37687,62 @@ static void blorp_profile_callable_header_reset_locked(void) {
             memory_order_relaxed);
     }
 }
+
+#if BLORP_PROFILE_COLLECTION_COPY_COUNTERS
+static void blorp_profile_collection_copy_reset(void) {
+    atomic_store_explicit(
+        &collection_profile_dict_copies, 0, memory_order_relaxed);
+    atomic_store_explicit(
+        &collection_profile_dict_entries_copied, 0, memory_order_relaxed);
+    atomic_store_explicit(
+        &collection_profile_dict_bytes_copied, 0, memory_order_relaxed);
+    atomic_store_explicit(
+        &collection_profile_list_copies, 0, memory_order_relaxed);
+    atomic_store_explicit(
+        &collection_profile_list_entries_copied, 0, memory_order_relaxed);
+    atomic_store_explicit(
+        &collection_profile_list_bytes_copied, 0, memory_order_relaxed);
+}
+
+static bool blorp_profile_collection_copy_active(void) {
+    return atomic_load_explicit(&profiling_enabled, memory_order_relaxed)
+        && atomic_load_explicit(&profile_window_active, memory_order_relaxed);
+}
+
+static void blorp_profile_record_dict_copy(long capacity, long entries) {
+    if (!blorp_profile_collection_copy_active()) return;
+    size_t bytes = blorp_checked_add(
+        blorp_checked_add(
+            blorp_checked_mul((size_t)capacity, sizeof(void*)),
+            blorp_checked_mul((size_t)capacity, sizeof(void*))
+        ),
+        blorp_checked_add(
+            blorp_checked_mul((size_t)capacity, sizeof(uint8_t)),
+            blorp_checked_add(
+                blorp_checked_mul((size_t)entries, sizeof(long)),
+                blorp_checked_mul((size_t)capacity, sizeof(long))
+            )
+        )
+    );
+    atomic_fetch_add_explicit(
+        &collection_profile_dict_copies, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(
+        &collection_profile_dict_entries_copied, entries, memory_order_relaxed);
+    atomic_fetch_add_explicit(
+        &collection_profile_dict_bytes_copied, (long)bytes, memory_order_relaxed);
+}
+
+static void blorp_profile_record_list_copy(long entries, size_t stride) {
+    if (!blorp_profile_collection_copy_active()) return;
+    size_t bytes = blorp_checked_mul((size_t)entries, stride);
+    atomic_fetch_add_explicit(
+        &collection_profile_list_copies, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(
+        &collection_profile_list_entries_copied, entries, memory_order_relaxed);
+    atomic_fetch_add_explicit(
+        &collection_profile_list_bytes_copied, (long)bytes, memory_order_relaxed);
+}
+#endif
 
 static void blorp_profile_callable_header_event(long event) {
     if (!atomic_load(&profiling_enabled)
@@ -38121,6 +38202,9 @@ void blorp_profile_window_begin(void) {
     pthread_mutex_lock(&callable_header_profile_mutex);
     blorp_profile_callable_header_reset_locked();
     pthread_mutex_unlock(&callable_header_profile_mutex);
+#if BLORP_PROFILE_COLLECTION_COPY_COUNTERS
+    blorp_profile_collection_copy_reset();
+#endif
 
     atomic_store(&profile_reported, 0);
     atomic_store(&profile_window_active, 1);
@@ -38405,6 +38489,29 @@ static void blorp_profile_report_with_abandonment_cause(
             blorp_profile_callable_header_counter(
                 BLORP_PROFILE_CALLABLE_SEEN_CAPACITY_OVERFLOWS));
     }
+
+#if BLORP_PROFILE_COLLECTION_COPY_COUNTERS
+    long dict_copies = atomic_load_explicit(
+        &collection_profile_dict_copies, memory_order_relaxed);
+    long list_copies = atomic_load_explicit(
+        &collection_profile_list_copies, memory_order_relaxed);
+    if (dict_copies > 0 || list_copies > 0) {
+        fprintf(stderr,
+            "COLLECTION_COPY_PROFILE_COUNTERS dict_copies=%ld "
+            "dict_entries_copied=%ld dict_bytes_copied=%ld list_copies=%ld "
+            "list_entries_copied=%ld list_bytes_copied=%ld\n",
+            dict_copies,
+            atomic_load_explicit(
+                &collection_profile_dict_entries_copied, memory_order_relaxed),
+            atomic_load_explicit(
+                &collection_profile_dict_bytes_copied, memory_order_relaxed),
+            list_copies,
+            atomic_load_explicit(
+                &collection_profile_list_entries_copied, memory_order_relaxed),
+            atomic_load_explicit(
+                &collection_profile_list_bytes_copied, memory_order_relaxed));
+    }
+#endif
 
     free(entries);
     pthread_mutex_unlock(&profile_window_mutex);
