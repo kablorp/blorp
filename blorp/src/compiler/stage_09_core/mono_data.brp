@@ -68,6 +68,21 @@ record CoreMonoDataSpecialization {
 }
 
 
+record CoreMonoDataTransparentAliasLookupObservation {
+	alias_count: Int,
+	transparent_alias_count: Int,
+	index_entry_count: Int,
+	query_count: Int,
+	legacy_lookup_candidates_inspected: Int,
+	indexed_lookup_count: Int,
+	legacy_found_count: Int,
+	indexed_found_count: Int,
+	legacy_checksum: Int,
+	indexed_checksum: Int,
+	workload_valid: Bool
+}
+
+
 private union CoreMonoDataTemplate:
 	MonoValueRecordTemplate(CoreValueRecordDecl)
 	MonoHeapRecordTemplate(CoreHeapRecordDecl)
@@ -95,7 +110,7 @@ private record CoreMonoDataTypeListRewrite {
 
 private record CoreMonoDataRewriteContext {
 	templates: List[CoreMonoDataTemplate],
-	aliases: List[CoreTypeAliasDecl],
+	transparent_aliases: Dict[String, CoreTypeAliasDecl],
 	active_aliases: List[String],
 	unresolved_type_params: List[String]
 }
@@ -181,12 +196,12 @@ private pure func collect_type_aliases(program: CoreProgram) -> List[CoreTypeAli
 
 private pure func rewrite_context(
 	templates: List[CoreMonoDataTemplate],
-	aliases: List[CoreTypeAliasDecl],
+	transparent_aliases: Dict[String, CoreTypeAliasDecl],
 	unresolved_type_params: List[String],
 ) -> CoreMonoDataRewriteContext:
 	{
 		templates = templates,
-		aliases = aliases,
+		transparent_aliases = transparent_aliases,
 		active_aliases = [],
 		unresolved_type_params = unresolved_type_params
 	}
@@ -207,6 +222,13 @@ private pure func find_template(
 
 
 private pure func find_transparent_alias(
+	transparent_aliases: Dict[String, CoreTypeAliasDecl],
+	name: String,
+) -> Option[CoreTypeAliasDecl]:
+	transparent_aliases.get(name)
+
+
+private pure func find_transparent_alias_legacy(
 	aliases: List[CoreTypeAliasDecl],
 	name: String,
 ) -> Option[CoreTypeAliasDecl]:
@@ -216,8 +238,152 @@ private pure func find_transparent_alias(
 		if alias_decl.name == name and not alias_decl.is_opaque:
 			found = Some(alias_decl)
 			break
+		else:
+			void
 
 	found
+
+
+private pure func transparent_alias_index(
+	aliases: List[CoreTypeAliasDecl],
+) -> Dict[String, CoreTypeAliasDecl]:
+	var by_name: Dict[String, CoreTypeAliasDecl] = {}
+
+	for alias_decl in aliases:
+		if not alias_decl.is_opaque and not by_name.contains(alias_decl.name):
+			by_name = by_name.set(alias_decl.name, alias_decl)
+		else:
+			void
+
+	by_name
+
+
+private pure func transparent_alias_count(aliases: List[CoreTypeAliasDecl]) -> Int:
+	var count: Int = 0
+
+	for alias_decl in aliases:
+		if not alias_decl.is_opaque:
+			count += 1
+		else:
+			void
+
+	count
+
+
+private pure func transparent_alias_legacy_candidate_count(
+	aliases: List[CoreTypeAliasDecl],
+	name: String,
+) -> Int:
+	var inspected: Int = 0
+
+	for alias_decl in aliases:
+		inspected += 1
+
+		if alias_decl.name == name and not alias_decl.is_opaque:
+			break
+		else:
+			void
+
+	inspected
+
+
+private pure func type_profile_checksum(seed: Int, typ: CoreType) -> Int:
+	match typ:
+		NamedType(name, args):
+			var checksum: Int = seed * 131 + name.length() * 7 + args.length()
+
+			for arg in args:
+				checksum = type_profile_checksum(checksum, arg)
+
+			checksum
+		TypeParameterType(name):
+			seed * 131 + name.length() * 11
+		FunctionType(_, params, return_type):
+			var checksum: Int = seed * 131 + params.length() * 13
+
+			for param in params:
+				checksum = type_profile_checksum(checksum, param)
+
+			type_profile_checksum(checksum, return_type)
+		StackResultType(value_type, error_type) | BoxedResultType(value_type, error_type):
+			type_profile_checksum(type_profile_checksum(seed * 131 + 17, value_type), error_type)
+		TensorType(info):
+			type_profile_checksum(seed * 131 + 19, info.element_type)
+		TupleType(items):
+			var checksum: Int = seed * 131 + items.length() * 23
+
+			for item in items:
+				checksum = type_profile_checksum(checksum, item)
+
+			checksum
+		EnumType(name) | ValueRecordType(name) | HeapRecordType(name) | UnionType(name):
+			seed * 131 + name.length() * 29
+		SelfType:
+			seed * 131 + 31
+		VoidType:
+			seed * 131 + 37
+		RangeType:
+			seed * 131 + 41
+
+
+private pure func alias_profile_checksum(seed: Int, alias_decl: CoreTypeAliasDecl) -> Int:
+	type_profile_checksum(
+		seed * 131 + alias_decl.name.length() * 3 + alias_decl.type_params.length(),
+		alias_decl.target,
+	)
+
+
+pure func core_mono_data_transparent_alias_lookup_observation(
+	alias_decls: List[CoreDecl],
+	queries: List[String],
+) -> CoreMonoDataTransparentAliasLookupObservation:
+	aliases: List[CoreTypeAliasDecl] = collect_type_aliases({
+		decls = alias_decls,
+		foreign_includes = []
+	})
+	index: Dict[String, CoreTypeAliasDecl] = transparent_alias_index(aliases)
+	var legacy_candidates: Int = 0
+	var indexed_lookups: Int = 0
+	var legacy_found: Int = 0
+	var indexed_found: Int = 0
+	var legacy_checksum: Int = 0
+	var indexed_checksum: Int = 0
+
+	for query in queries:
+		legacy_candidates += transparent_alias_legacy_candidate_count(aliases, query)
+		indexed_lookups += 1
+
+		match find_transparent_alias_legacy(aliases, query):
+			Some(alias_decl):
+				legacy_found += 1
+				legacy_checksum = alias_profile_checksum(legacy_checksum, alias_decl)
+			None:
+				legacy_checksum = legacy_checksum * 131 + query.length()
+
+		match index.get(query):
+			Some(alias_decl):
+				indexed_found += 1
+				indexed_checksum = alias_profile_checksum(indexed_checksum, alias_decl)
+			None:
+				indexed_checksum = indexed_checksum * 131 + query.length()
+
+	{
+		alias_count = aliases.length(),
+		transparent_alias_count = transparent_alias_count(aliases),
+		index_entry_count = index.length(),
+		query_count = queries.length(),
+		legacy_lookup_candidates_inspected = legacy_candidates,
+		indexed_lookup_count = indexed_lookups,
+		legacy_found_count = legacy_found,
+		indexed_found_count = indexed_found,
+		legacy_checksum = legacy_checksum,
+		indexed_checksum = indexed_checksum,
+		workload_valid = (
+			legacy_found == indexed_found
+			and legacy_checksum == indexed_checksum
+			and indexed_lookups == queries.length()
+		)
+	}
 
 
 private pure func request_exists(
@@ -297,7 +463,7 @@ private pure func rewrite_data_type(
 		NamedType(name, args):
 			args_result: CoreMonoDataTypeListRewrite = rewrite_type_list(context, requests, args)
 
-			match find_transparent_alias(context.aliases, name):
+			match find_transparent_alias(context.transparent_aliases, name):
 				Some(alias_decl):
 					if (
 						not context.active_aliases.contains(name)
@@ -506,11 +672,15 @@ private pure func collect_optional_expr_requests(
 
 private pure func collect_function_requests(
 	templates: List[CoreMonoDataTemplate],
-	aliases: List[CoreTypeAliasDecl],
+	transparent_aliases: Dict[String, CoreTypeAliasDecl],
 	requests: List[CoreMonoDataRequest],
 	function: CoreFunction,
 ) -> List[CoreMonoDataRequest]:
-	context: CoreMonoDataRewriteContext = rewrite_context(templates, aliases, function.type_params)
+	context: CoreMonoDataRewriteContext = rewrite_context(
+		templates,
+		transparent_aliases,
+		function.type_params,
+	)
 	var current: List[CoreMonoDataRequest] = collect_param_requests(
 		context,
 		requests,
@@ -577,34 +747,34 @@ private pure func collect_trait_method_requests(
 
 private pure func collect_impl_requests(
 	templates: List[CoreMonoDataTemplate],
-	aliases: List[CoreTypeAliasDecl],
+	transparent_aliases: Dict[String, CoreTypeAliasDecl],
 	requests: List[CoreMonoDataRequest],
 	impl: CoreImplDecl,
 ) -> List[CoreMonoDataRequest]:
 	context: CoreMonoDataRewriteContext = rewrite_context(
 		templates,
-		aliases,
+		transparent_aliases,
 		impl.type_params.map(pure func(param): param.name),
 	)
 	var current: List[CoreMonoDataRequest] = collect_type_request(context, requests, impl.for_type)
 
 	for method in impl.methods:
-		current = collect_function_requests(templates, aliases, current, method)
+		current = collect_function_requests(templates, transparent_aliases, current, method)
 
 	current
 
 
 private pure func collect_decl_requests(
 	templates: List[CoreMonoDataTemplate],
-	aliases: List[CoreTypeAliasDecl],
+	transparent_aliases: Dict[String, CoreTypeAliasDecl],
 	requests: List[CoreMonoDataRequest],
 	decl: CoreDecl,
 ) -> List[CoreMonoDataRequest]:
 	match decl:
 		FunctionDecl(function):
-			collect_function_requests(templates, aliases, requests, function)
+			collect_function_requests(templates, transparent_aliases, requests, function)
 		GlobalDecl(global):
-			context: CoreMonoDataRewriteContext = rewrite_context(templates, aliases, [])
+			context: CoreMonoDataRewriteContext = rewrite_context(templates, transparent_aliases, [])
 			collect_expr_requests(
 				context,
 				collect_type_request(context, requests, global.typ),
@@ -615,49 +785,49 @@ private pure func collect_decl_requests(
 		UnionDecl(union_decl):
 			context: CoreMonoDataRewriteContext = rewrite_context(
 				templates,
-				aliases,
+				transparent_aliases,
 				union_decl.type_params,
 			)
 			collect_union_requests(context, requests, union_decl.variants)
 		ValueRecordDecl(record_decl):
 			context: CoreMonoDataRewriteContext = rewrite_context(
 				templates,
-				aliases,
+				transparent_aliases,
 				record_decl.type_params,
 			)
 			collect_value_record_requests(context, requests, record_decl.fields)
 		HeapRecordDecl(record_decl):
 			context: CoreMonoDataRewriteContext = rewrite_context(
 				templates,
-				aliases,
+				transparent_aliases,
 				record_decl.type_params,
 			)
 			collect_heap_record_requests(context, requests, record_decl.fields)
 		TypeAliasDecl(alias_decl):
 			collect_type_request(
-				rewrite_context(templates, aliases, alias_decl.type_params),
+				rewrite_context(templates, transparent_aliases, alias_decl.type_params),
 				requests,
 				alias_decl.target,
 			)
 		TraitDecl(trait_decl):
 			collect_trait_method_requests(
-				rewrite_context(templates, aliases, trait_decl.type_params),
+				rewrite_context(templates, transparent_aliases, trait_decl.type_params),
 				requests,
 				trait_decl.methods,
 			)
 		ImplDecl(impl):
-			collect_impl_requests(templates, aliases, requests, impl)
+			collect_impl_requests(templates, transparent_aliases, requests, impl)
 
 
 private pure func collect_program_requests(
 	templates: List[CoreMonoDataTemplate],
-	aliases: List[CoreTypeAliasDecl],
+	transparent_aliases: Dict[String, CoreTypeAliasDecl],
 	program: CoreProgram,
 ) -> List[CoreMonoDataRequest]:
 	var requests: List[CoreMonoDataRequest] = []
 
 	for decl in program.decls:
-		requests = collect_decl_requests(templates, aliases, requests, decl)
+		requests = collect_decl_requests(templates, transparent_aliases, requests, decl)
 
 	requests
 
@@ -722,7 +892,7 @@ private pure func materialized_data_release_policy(
 
 private pure func materialize_value_record(
 	templates: List[CoreMonoDataTemplate],
-	aliases: List[CoreTypeAliasDecl],
+	transparent_aliases: Dict[String, CoreTypeAliasDecl],
 	state: CoreMonoDataMaterializationState,
 	request: CoreMonoDataRequest,
 	record_decl: CoreValueRecordDecl,
@@ -731,7 +901,7 @@ private pure func materialize_value_record(
 		record_decl.type_params,
 		request.args,
 	)
-	context: CoreMonoDataRewriteContext = rewrite_context(templates, aliases, [])
+	context: CoreMonoDataRewriteContext = rewrite_context(templates, transparent_aliases, [])
 	var fields: List[CoreValueRecordField] = []
 	var requests: List[CoreMonoDataRequest] = state.requests
 
@@ -754,7 +924,7 @@ private pure func materialize_value_record(
 
 private pure func materialize_heap_record(
 	templates: List[CoreMonoDataTemplate],
-	aliases: List[CoreTypeAliasDecl],
+	transparent_aliases: Dict[String, CoreTypeAliasDecl],
 	state: CoreMonoDataMaterializationState,
 	request: CoreMonoDataRequest,
 	record_decl: CoreHeapRecordDecl,
@@ -763,7 +933,7 @@ private pure func materialize_heap_record(
 		record_decl.type_params,
 		request.args,
 	)
-	context: CoreMonoDataRewriteContext = rewrite_context(templates, aliases, [])
+	context: CoreMonoDataRewriteContext = rewrite_context(templates, transparent_aliases, [])
 	var fields: List[CoreHeapRecordField] = []
 	var requests: List[CoreMonoDataRequest] = state.requests
 
@@ -818,7 +988,7 @@ private pure func materialize_union_fields(
 
 private pure func materialize_union(
 	templates: List[CoreMonoDataTemplate],
-	aliases: List[CoreTypeAliasDecl],
+	transparent_aliases: Dict[String, CoreTypeAliasDecl],
 	state: CoreMonoDataMaterializationState,
 	request: CoreMonoDataRequest,
 	union_decl: CoreUnionDecl,
@@ -827,7 +997,7 @@ private pure func materialize_union(
 		union_decl.type_params,
 		request.args,
 	)
-	context: CoreMonoDataRewriteContext = rewrite_context(templates, aliases, [])
+	context: CoreMonoDataRewriteContext = rewrite_context(templates, transparent_aliases, [])
 	var variants: List[CoreUnionVariant] = []
 	var requests: List[CoreMonoDataRequest] = state.requests
 	var next_def_id: Int = state.next_def_id
@@ -869,24 +1039,24 @@ private pure func materialize_union(
 
 private pure func materialize_request(
 	templates: List[CoreMonoDataTemplate],
-	aliases: List[CoreTypeAliasDecl],
+	transparent_aliases: Dict[String, CoreTypeAliasDecl],
 	state: CoreMonoDataMaterializationState,
 	request: CoreMonoDataRequest,
 ) -> CoreMonoDataMaterializationState:
 	match find_template(templates, request.source_name):
 		Some(MonoValueRecordTemplate(record_decl)):
-			materialize_value_record(templates, aliases, state, request, record_decl)
+			materialize_value_record(templates, transparent_aliases, state, request, record_decl)
 		Some(MonoHeapRecordTemplate(record_decl)):
-			materialize_heap_record(templates, aliases, state, request, record_decl)
+			materialize_heap_record(templates, transparent_aliases, state, request, record_decl)
 		Some(MonoUnionTemplate(union_decl)):
-			materialize_union(templates, aliases, state, request, union_decl)
+			materialize_union(templates, transparent_aliases, state, request, union_decl)
 		None:
 			state
 
 
 private pure func materialize_requests(
 	templates: List[CoreMonoDataTemplate],
-	aliases: List[CoreTypeAliasDecl],
+	transparent_aliases: Dict[String, CoreTypeAliasDecl],
 	requests: List[CoreMonoDataRequest],
 	next_def_id: Int,
 ) -> CoreMonoDataMaterializationState:
@@ -900,7 +1070,7 @@ private pure func materialize_requests(
 	while index < state.requests.length():
 		match state.requests.get(index):
 			Some(request):
-				state = materialize_request(templates, aliases, state, request)
+				state = materialize_request(templates, transparent_aliases, state, request)
 			None:
 				break
 
@@ -1150,10 +1320,14 @@ private pure func rewrite_optional_body(
 
 private pure func rewrite_function(
 	templates: List[CoreMonoDataTemplate],
-	aliases: List[CoreTypeAliasDecl],
+	transparent_aliases: Dict[String, CoreTypeAliasDecl],
 	function: CoreFunction,
 ) -> CoreFunction:
-	context: CoreMonoDataRewriteContext = rewrite_context(templates, aliases, function.type_params)
+	context: CoreMonoDataRewriteContext = rewrite_context(
+		templates,
+		transparent_aliases,
+		function.type_params,
+	)
 	params: List[CoreParam] = rewrite_params(context, function.params)
 	return_type: CoreType = rewrite_type_without_requests(context, function.return_type)
 	function_kind: CoreFunctionKind = rewrite_function_kind(context, function.function_kind)
@@ -1231,27 +1405,27 @@ private pure func rewrite_trait_methods(
 
 private pure func rewrite_impl_methods(
 	templates: List[CoreMonoDataTemplate],
-	aliases: List[CoreTypeAliasDecl],
+	transparent_aliases: Dict[String, CoreTypeAliasDecl],
 	methods: List[CoreFunction],
 ) -> List[CoreFunction]:
 	var rewritten: List[CoreFunction] = []
 
 	for method in methods:
-		rewritten = rewritten.append(rewrite_function(templates, aliases, method))
+		rewritten = rewritten.append(rewrite_function(templates, transparent_aliases, method))
 
 	rewritten
 
 
 private pure func rewrite_decl(
 	templates: List[CoreMonoDataTemplate],
-	aliases: List[CoreTypeAliasDecl],
+	transparent_aliases: Dict[String, CoreTypeAliasDecl],
 	decl: CoreDecl,
 ) -> CoreDecl:
 	match decl:
 		FunctionDecl(function):
-			FunctionDecl(rewrite_function(templates, aliases, function))
+			FunctionDecl(rewrite_function(templates, transparent_aliases, function))
 		GlobalDecl(global):
-			context: CoreMonoDataRewriteContext = rewrite_context(templates, aliases, [])
+			context: CoreMonoDataRewriteContext = rewrite_context(templates, transparent_aliases, [])
 			typ: CoreType = rewrite_type_without_requests(context, global.typ)
 			init: CoreExpr = rewrite_expr_types(context, global.init)
 			GlobalDecl({ global |
@@ -1263,7 +1437,7 @@ private pure func rewrite_decl(
 		UnionDecl(union_decl):
 			context: CoreMonoDataRewriteContext = rewrite_context(
 				templates,
-				aliases,
+				transparent_aliases,
 				union_decl.type_params,
 			)
 			UnionDecl(
@@ -1272,7 +1446,7 @@ private pure func rewrite_decl(
 		ValueRecordDecl(record_decl):
 			context: CoreMonoDataRewriteContext = rewrite_context(
 				templates,
-				aliases,
+				transparent_aliases,
 				record_decl.type_params,
 			)
 			ValueRecordDecl(
@@ -1283,7 +1457,7 @@ private pure func rewrite_decl(
 		HeapRecordDecl(record_decl):
 			context: CoreMonoDataRewriteContext = rewrite_context(
 				templates,
-				aliases,
+				transparent_aliases,
 				record_decl.type_params,
 			)
 			HeapRecordDecl(
@@ -1292,7 +1466,7 @@ private pure func rewrite_decl(
 		TypeAliasDecl(alias_decl):
 			context: CoreMonoDataRewriteContext = rewrite_context(
 				templates,
-				aliases,
+				transparent_aliases,
 				alias_decl.type_params,
 			)
 			TypeAliasDecl(
@@ -1303,31 +1477,31 @@ private pure func rewrite_decl(
 		TraitDecl(trait_decl):
 			context: CoreMonoDataRewriteContext = rewrite_context(
 				templates,
-				aliases,
+				transparent_aliases,
 				trait_decl.type_params,
 			)
 			TraitDecl({ trait_decl | methods = rewrite_trait_methods(context, trait_decl.methods) })
 		ImplDecl(impl):
 			context: CoreMonoDataRewriteContext = rewrite_context(
 				templates,
-				aliases,
+				transparent_aliases,
 				impl.type_params.map(pure func(param): param.name),
 			)
 			ImplDecl({ impl |
 					for_type = rewrite_type_without_requests(context, impl.for_type),
-					methods = rewrite_impl_methods(templates, aliases, impl.methods)
+					methods = rewrite_impl_methods(templates, transparent_aliases, impl.methods)
 				})
 
 
 private pure func rewrite_program(
 	templates: List[CoreMonoDataTemplate],
-	aliases: List[CoreTypeAliasDecl],
+	transparent_aliases: Dict[String, CoreTypeAliasDecl],
 	program: CoreProgram,
 ) -> CoreProgram:
 	var decls: List[CoreDecl] = []
 
 	for decl in program.decls:
-		decls = decls.append(rewrite_decl(templates, aliases, decl))
+		decls = decls.append(rewrite_decl(templates, transparent_aliases, decl))
 
 	{ program | decls = decls }
 
@@ -1337,7 +1511,6 @@ pure func specialize_generic_data(
 	next_def_id: Int,
 ) -> CoreMonoDataSpecialization:
 	templates: List[CoreMonoDataTemplate] = collect_generic_data_templates(program)
-	aliases: List[CoreTypeAliasDecl] = collect_type_aliases(program)
 
 	if templates.is_empty():
 		{
@@ -1345,10 +1518,16 @@ pure func specialize_generic_data(
 			next_def_id = next_def_id
 		}
 	else:
-		requests: List[CoreMonoDataRequest] = collect_program_requests(templates, aliases, program)
+		aliases: List[CoreTypeAliasDecl] = collect_type_aliases(program)
+		transparent_aliases: Dict[String, CoreTypeAliasDecl] = transparent_alias_index(aliases)
+		requests: List[CoreMonoDataRequest] = collect_program_requests(
+			templates,
+			transparent_aliases,
+			program,
+		)
 		state: CoreMonoDataMaterializationState = materialize_requests(
 			templates,
-			aliases,
+			transparent_aliases,
 			requests,
 			next_def_id,
 		)
@@ -1356,6 +1535,6 @@ pure func specialize_generic_data(
 		combined: CoreProgram = { program | decls = program.decls.concat(ordered_generated) }
 
 		{
-			program = rewrite_program(templates, aliases, combined),
+			program = rewrite_program(templates, transparent_aliases, combined),
 			next_def_id = state.next_def_id
 		}
