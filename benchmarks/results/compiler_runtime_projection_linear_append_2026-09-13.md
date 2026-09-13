@@ -2,13 +2,14 @@
 
 Date: 2026-09-13
 
+Integrated on `main` in `04eb0437`.
+
 Issue 93 changes `project_runtime_program` to build the projected runtime
 declaration list with a preallocated accumulator and per-row `append` instead
 of repeated whole-list concatenation.
 
 Baseline source commit: `eb6893ea5e7d4e1e28fd2d81da468fb69a20d877`.
-Candidate source: final issue-93 commit on
-`codex/issue-93-runtime-projection`.
+Candidate source: `76705425` on `codex/issue-93-runtime-projection`.
 
 ## Corrected Direct Profile
 

@@ -2,6 +2,9 @@
 
 Date: 2026-09-13
 
+Integrated on `main` in `a2f613a2` (optimization) and `4c8c9947`
+(corrected direct benchmark and evidence).
+
 ## Scope
 
 This measures the source-AST nested declaration finalization pass directly.

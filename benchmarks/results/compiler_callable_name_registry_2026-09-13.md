@@ -1,8 +1,10 @@
 # Compiler Callable Name Registry Batching
 
-Issue: `docs/issues/compiler-performance/94-avoid-callable-name-registry-copies.md`
+Former issue: callable-name registry copies (#94). The implementation handoff
+was removed after integration; Git history preserves it.
 
 Measured source commit: `6102a27d Batch callable name registry construction`
+Integrated on `main` in `0d16352a`.
 
 The final branch commit may differ because this results note was added after
 the validation run; no source or benchmark code changed after the measured
@@ -258,8 +260,8 @@ Results:
 
 ## Caveats
 
-- Public elapsed timings above are candidate-only whole-graph preparation
-  timings, not old-vs-new speedup claims.
+- The Public Candidate Matrix above is candidate-only whole-graph preparation
+  timing; the narrower matched-path table separately reports old/new speedups.
 - Old-vs-new copied-entry evidence came from temporary direct counters and is
   retained only as work-counter evidence.
 - The benchmark and production pipeline exercise the normal typechecked graph
