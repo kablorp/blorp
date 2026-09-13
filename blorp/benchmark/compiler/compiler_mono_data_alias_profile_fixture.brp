@@ -1,0 +1,495 @@
+-- Focused workload and observation helpers for Core generic-data alias lookup.
+import:
+	../../src/compiler/stage_09_core/ir:
+		CoreDecl(FunctionDecl, TypeAliasDecl, ValueRecordDecl),
+		CoreExpr(VarExpr),
+		CoreFunctionKind(UserFunction),
+		CoreParam,
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(
+			BoxedResultType,
+			EnumType,
+			FunctionType,
+			HeapRecordType,
+			NamedType,
+			RangeType,
+			SelfType,
+			StackResultType,
+			TensorType,
+			TupleType,
+			TypeParameterType,
+			UnionType,
+			ValueRecordType,
+			VoidType,
+		),
+		CoreTypeAliasDecl,
+		CoreVar,
+		core_program_to_json,
+	../../src/compiler/stage_09_core/mono_data:
+		CoreMonoDataSpecialization,
+		specialize_generic_data
+	../../src/compiler/stage_09_core/mono: mangle_generic_data_name
+
+
+private ALIAS_TARGET_VOID: Int = 0
+
+private ALIAS_TARGET_GENERIC_BOX: Int = 1
+
+
+record CoreMonoDataTransparentAliasLookupObservation {
+	alias_count: Int,
+	transparent_alias_count: Int,
+	index_entry_count: Int,
+	query_count: Int,
+	legacy_lookup_candidates_inspected: Int,
+	indexed_lookup_count: Int,
+	legacy_found_count: Int,
+	indexed_found_count: Int,
+	legacy_checksum: Int,
+	indexed_checksum: Int,
+	workload_valid: Bool
+}
+
+
+struct CompilerMonoDataAliasProfileConfig {
+	alias_count: Int,
+	alias_use_count: Int,
+	iterations: Int,
+	alias_target_mode: Int
+}
+
+
+struct CompilerMonoDataAliasProfileResult {
+	alias_count: Int,
+	alias_use_count: Int,
+	iterations: Int,
+	alias_target_mode: Int,
+	input_declarations: Int,
+	output_declarations: Int,
+	output_checksum: Int,
+	workload_valid: Bool
+}
+
+
+private pure func positive_config_value(value: Int, fallback: Int) -> Int:
+	if value > 0:
+		value
+	else:
+		fallback
+
+
+private pure func non_negative_config_value(value: Int) -> Int:
+	if value > 0:
+		value
+	else:
+		0
+
+
+private pure func normalized_alias_target_mode(value: Int) -> Int:
+	if value == ALIAS_TARGET_GENERIC_BOX:
+		ALIAS_TARGET_GENERIC_BOX
+	else:
+		ALIAS_TARGET_VOID
+
+
+pure func compiler_mono_data_alias_profile_config(
+	config: CompilerMonoDataAliasProfileConfig,
+) -> CompilerMonoDataAliasProfileConfig:
+	{
+		alias_count = positive_config_value(config.alias_count, 1),
+		alias_use_count = non_negative_config_value(config.alias_use_count),
+		iterations = positive_config_value(config.iterations, 1),
+		alias_target_mode = normalized_alias_target_mode(config.alias_target_mode)
+	}
+
+
+private pure func named_type(name: String) -> CoreType:
+	NamedType(name, [])
+
+
+private pure func type_parameter(name: String) -> CoreType:
+	TypeParameterType(name)
+
+
+private pure func applied_type(name: String, args: List[CoreType]) -> CoreType:
+	NamedType(name, args)
+
+
+private pure func named_var(name: String) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = None
+	}
+
+
+private pure func named_param(param: (String, CoreType)) -> CoreParam:
+	match param:
+		(name, typ):
+			{
+				name = named_var(name),
+				typ = typ,
+				loc = SyntheticSourceLoc
+			}
+
+
+private pure func value_record_template(name: String, field_type: CoreType) -> CoreDecl:
+	ValueRecordDecl({
+		abi_type = None,
+		name = name,
+		type_params = ["T"],
+		fields = [
+			{
+				name = "value",
+				typ = field_type
+			},
+		],
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func compiler_mono_data_alias_profile_alias_decl(
+	name: String,
+	target: CoreType,
+	is_opaque: Bool,
+) -> CoreDecl:
+	TypeAliasDecl({
+		abi_type = None,
+		name = name,
+		type_params = ["T"],
+		target = target,
+		is_opaque = is_opaque,
+		loc = SyntheticSourceLoc,
+	})
+
+
+private pure func function_decl(
+	name: String,
+	def_id: Int,
+	typ: CoreType,
+) -> CoreDecl:
+	FunctionDecl({
+		name = name,
+		source_module = None,
+		type_params = [],
+		params = [named_param(("value", typ))],
+		return_type = typ,
+		body = Some(VarExpr(named_var("value"), typ, SyntheticSourceLoc)),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = def_id,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func compiler_mono_data_alias_profile_alias_series(count: Int) -> List[CoreDecl]:
+	var aliases: List[CoreDecl] = []
+
+	for index in 0..count:
+		aliases = aliases.append(
+			compiler_mono_data_alias_profile_alias_decl(
+				"Alias" + index.to_string(),
+				named_type("Target" + index.to_string()),
+				False,
+			),
+		)
+
+	aliases
+
+
+pure func compiler_mono_data_alias_profile_repeated_query(
+	name: String,
+	count: Int,
+) -> List[String]:
+	var queries: List[String] = []
+
+	for _ in 0..count:
+		queries = queries.append(name)
+
+	queries
+
+
+private pure func alias_target_for_mode(mode: Int) -> CoreType:
+	if mode == ALIAS_TARGET_GENERIC_BOX:
+		applied_type("Box", [type_parameter("T")])
+	else:
+		VoidType
+
+
+private pure func alias_name(index: Int) -> String:
+	"Alias" + index.to_string()
+
+
+private pure func alias_decls(count: Int, mode: Int) -> List[CoreDecl]:
+	var decls: List[CoreDecl] = []
+	target: CoreType = alias_target_for_mode(mode)
+
+	for index in 0..count:
+		decls = decls.append(
+			compiler_mono_data_alias_profile_alias_decl(alias_name(index), target, False),
+		)
+
+	decls
+
+
+private pure func alias_use_decls(alias_count: Int, use_count: Int) -> List[CoreDecl]:
+	var decls: List[CoreDecl] = []
+	last_alias_index: Int = alias_count - 1
+	alias_type: CoreType = applied_type(alias_name(last_alias_index), [named_type("String")])
+
+	for index in 0..use_count:
+		decls = decls.append(function_decl("use_alias_" + index.to_string(), 1000 + index, alias_type))
+
+	decls
+
+
+pure func compiler_mono_data_alias_profile_program(
+	config: CompilerMonoDataAliasProfileConfig,
+) -> CoreProgram:
+	normalized: CompilerMonoDataAliasProfileConfig = compiler_mono_data_alias_profile_config(config)
+	var decls: List[CoreDecl] = [value_record_template("Box", type_parameter("T"))]
+	decls = decls.concat(alias_decls(normalized.alias_count, normalized.alias_target_mode))
+	decls = decls.concat(alias_use_decls(normalized.alias_count, normalized.alias_use_count))
+
+	{
+		decls = decls,
+		foreign_includes = []
+	}
+
+
+private pure func collect_type_aliases(decls: List[CoreDecl]) -> List[CoreTypeAliasDecl]:
+	var aliases: List[CoreTypeAliasDecl] = []
+
+	for decl in decls:
+		match decl:
+			TypeAliasDecl(alias_decl):
+				aliases = aliases.append(alias_decl)
+			_:
+				void
+
+	aliases
+
+
+private pure func find_transparent_alias_legacy(
+	aliases: List[CoreTypeAliasDecl],
+	name: String,
+) -> Option[CoreTypeAliasDecl]:
+	var found: Option[CoreTypeAliasDecl] = None
+
+	for alias_decl in aliases:
+		if alias_decl.name == name and not alias_decl.is_opaque:
+			found = Some(alias_decl)
+			break
+		else:
+			void
+
+	found
+
+
+private pure func transparent_alias_index(
+	aliases: List[CoreTypeAliasDecl],
+) -> Dict[String, CoreTypeAliasDecl]:
+	var by_name: Dict[String, CoreTypeAliasDecl] = {}
+
+	for alias_decl in aliases:
+		if not alias_decl.is_opaque and not by_name.contains(alias_decl.name):
+			by_name = by_name.set(alias_decl.name, alias_decl)
+		else:
+			void
+
+	by_name
+
+
+private pure func transparent_alias_count(aliases: List[CoreTypeAliasDecl]) -> Int:
+	var count: Int = 0
+
+	for alias_decl in aliases:
+		if not alias_decl.is_opaque:
+			count += 1
+		else:
+			void
+
+	count
+
+
+private pure func transparent_alias_legacy_candidate_count(
+	aliases: List[CoreTypeAliasDecl],
+	name: String,
+) -> Int:
+	var inspected: Int = 0
+
+	for alias_decl in aliases:
+		inspected += 1
+
+		if alias_decl.name == name and not alias_decl.is_opaque:
+			break
+		else:
+			void
+
+	inspected
+
+
+private pure func type_profile_checksum(seed: Int, typ: CoreType) -> Int:
+	match typ:
+		NamedType(name, args):
+			var checksum: Int = seed * 131 + name.length() * 7 + args.length()
+
+			for arg in args:
+				checksum = type_profile_checksum(checksum, arg)
+
+			checksum
+		TypeParameterType(name):
+			seed * 131 + name.length() * 11
+		FunctionType(_, params, return_type):
+			var checksum: Int = seed * 131 + params.length() * 13
+
+			for param in params:
+				checksum = type_profile_checksum(checksum, param)
+
+			type_profile_checksum(checksum, return_type)
+		StackResultType(value_type, error_type) | BoxedResultType(value_type, error_type):
+			type_profile_checksum(type_profile_checksum(seed * 131 + 17, value_type), error_type)
+		TensorType(info):
+			type_profile_checksum(seed * 131 + 19, info.element_type)
+		TupleType(items):
+			var checksum: Int = seed * 131 + items.length() * 23
+
+			for item in items:
+				checksum = type_profile_checksum(checksum, item)
+
+			checksum
+		EnumType(name) | ValueRecordType(name) | HeapRecordType(name) | UnionType(name):
+			seed * 131 + name.length() * 29
+		SelfType:
+			seed * 131 + 31
+		VoidType:
+			seed * 131 + 37
+		RangeType:
+			seed * 131 + 41
+
+
+private pure func alias_profile_checksum(seed: Int, alias_decl: CoreTypeAliasDecl) -> Int:
+	type_profile_checksum(
+		seed * 131 + alias_decl.name.length() * 3 + alias_decl.type_params.length(),
+		alias_decl.target,
+	)
+
+
+pure func compiler_mono_data_alias_lookup_observation(
+	alias_decls: List[CoreDecl],
+	queries: List[String],
+) -> CoreMonoDataTransparentAliasLookupObservation:
+	aliases: List[CoreTypeAliasDecl] = collect_type_aliases(alias_decls)
+	index: Dict[String, CoreTypeAliasDecl] = transparent_alias_index(aliases)
+	var legacy_candidates: Int = 0
+	var indexed_lookups: Int = 0
+	var legacy_found: Int = 0
+	var indexed_found: Int = 0
+	var legacy_checksum: Int = 0
+	var indexed_checksum: Int = 0
+
+	for query in queries:
+		legacy_candidates += transparent_alias_legacy_candidate_count(aliases, query)
+		indexed_lookups += 1
+
+		match find_transparent_alias_legacy(aliases, query):
+			Some(alias_decl):
+				legacy_found += 1
+				legacy_checksum = alias_profile_checksum(legacy_checksum, alias_decl)
+			None:
+				legacy_checksum = legacy_checksum * 131 + query.length()
+
+		match index.get(query):
+			Some(alias_decl):
+				indexed_found += 1
+				indexed_checksum = alias_profile_checksum(indexed_checksum, alias_decl)
+			None:
+				indexed_checksum = indexed_checksum * 131 + query.length()
+
+	{
+		alias_count = aliases.length(),
+		transparent_alias_count = transparent_alias_count(aliases),
+		index_entry_count = index.length(),
+		query_count = queries.length(),
+		legacy_lookup_candidates_inspected = legacy_candidates,
+		indexed_lookup_count = indexed_lookups,
+		legacy_found_count = legacy_found,
+		indexed_found_count = indexed_found,
+		legacy_checksum = legacy_checksum,
+		indexed_checksum = indexed_checksum,
+		workload_valid = (
+			legacy_found == indexed_found
+			and legacy_checksum == indexed_checksum
+			and indexed_lookups == queries.length()
+		)
+	}
+
+
+private pure func program_checksum(program: CoreProgram) -> Int:
+	core_program_to_json(program).to_string().length()
+
+
+private pure func has_value_record(program: CoreProgram, name: String) -> Bool:
+	var found: Bool = False
+
+	for decl in program.decls:
+		match decl:
+			ValueRecordDecl(record_decl):
+				if record_decl.name == name:
+					found = True
+					break
+				else:
+					void
+			_:
+				void
+
+	found
+
+
+private pure func expected_generic_box_materialized(
+	config: CompilerMonoDataAliasProfileConfig,
+	output: CoreMonoDataSpecialization,
+) -> Bool:
+	if config.alias_target_mode == ALIAS_TARGET_GENERIC_BOX and config.alias_use_count > 0:
+		match mangle_generic_data_name("Box", [named_type("String")]):
+			Some(concrete_name):
+				has_value_record(output.program, concrete_name)
+			None:
+				False
+	else:
+		True
+
+
+pure func compiler_mono_data_alias_profile_execute(
+	config: CompilerMonoDataAliasProfileConfig,
+) -> CompilerMonoDataAliasProfileResult:
+	normalized: CompilerMonoDataAliasProfileConfig = compiler_mono_data_alias_profile_config(config)
+	input: CoreProgram = compiler_mono_data_alias_profile_program(normalized)
+	var output: CoreMonoDataSpecialization = {
+		program = input,
+		next_def_id = 100
+	}
+	var checksum: Int = 0
+
+	for _ in 0..normalized.iterations:
+		output = specialize_generic_data(input, 100)
+		checksum += output.program.decls.length() * 131 + output.next_def_id
+
+	checksum += program_checksum(output.program)
+	expected_min_declarations: Int = input.decls.length()
+
+	{
+		alias_count = normalized.alias_count,
+		alias_use_count = normalized.alias_use_count,
+		iterations = normalized.iterations,
+		alias_target_mode = normalized.alias_target_mode,
+		input_declarations = input.decls.length(),
+		output_declarations = output.program.decls.length(),
+		output_checksum = checksum,
+		workload_valid = (
+			output.program.decls.length() >= expected_min_declarations
+			and expected_generic_box_materialized(normalized, output)
+			and normalized.iterations > 0
+		)
+	}
