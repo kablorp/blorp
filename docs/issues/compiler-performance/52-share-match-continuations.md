@@ -205,9 +205,9 @@ Do not add an unreachable `goto done` merely to satisfy one rendering template.
 8. **Inspect the real outlier.** Rebuild once and confirm that generated
    `parse_package_args` contains one copy of each source arm/fallback body.
 
-This change should land before relying on string-literal pooling to hide the
-historical 2,049 duplicated error literals. Pooling and match sharing are complementary;
-only this issue removes the duplicated control flow.
+String-literal pooling reduces the repeated-literal symptom, but pooling and
+match sharing are complementary; only this issue removes the duplicated control
+flow.
 
 ## Current measurement artifact
 
@@ -235,7 +235,7 @@ repository-local command:
 
 ```bash
 bin/blorp compile --std-dir standard_library/src --no-format \
-  --no-embed-runtime -o "$probe_c" \
+  --no-embed-runtime -o /tmp/match_fallback_duplication_probe.c \
   blorp/benchmark/compiler/compiler_match_fallback_duplication_probe.brp
 ```
 
