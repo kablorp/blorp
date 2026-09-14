@@ -104,6 +104,34 @@ The remaining roots compile and run together in one runtime test invocation.
 required build and need to preserve that exact toolchain through validation.
 Without it, `scripts/test` installs the current compiler before running gates.
 
+## Validation Evidence Packets
+
+Use `scripts/record-validation` when a reviewer needs a reproducible packet for
+one focused check, broad gate, or benchmark. The recorder is opt-in and wraps
+one command without changing its exit status:
+
+```bash
+scripts/record-validation --output /tmp/blorp-evidence/focused \
+  -- scripts/compiler-check --changed
+scripts/record-validation --output /tmp/blorp-evidence/gate \
+  -- scripts/test --no-build --log-dir /tmp/blorp-gate-logs compiler-blorp
+```
+
+Each packet contains `metadata.json`, `stdout.log`, and `stderr.log`. Metadata
+records the exact argv, cwd, UTC start time, elapsed milliseconds, exit code,
+Git HEAD, start and end tracked/untracked worktree fingerprints, whether source
+changed during the run, `bin/blorp` hash when present, captured artifact hashes,
+and a small allowlist of known validation environment variables. If `--output`
+is inside the Git worktree, that output directory is explicitly excluded from
+source fingerprints. The recorder does not parse human output, decide that a
+benchmark is acceptable, or dump arbitrary `BLORP_*` environment values.
+
+Existing output directories are refused by default. `--replace` updates only a
+previous `record-validation` packet with the same schema and refuses unrelated
+files or subdirectories, so an accidental path cannot be recursively deleted.
+Use `--timeout SECONDS` to terminate the wrapped process group and record exit
+`124`.
+
 The supported report-only typed analyzer is `blorp lint <file.brp|dir> [...]`.
 Use `--format json` for the versioned machine-readable envelope and
 `--fail-on-findings` when findings should fail CI. See

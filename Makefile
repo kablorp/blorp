@@ -324,6 +324,7 @@ hygiene-check: build-blorp-cli
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/runtime/test_runtime_profile_dense_ids.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_blorp_cli_embedded_manifest.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_blorp_source_layout.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_record_validation.py
 	@blorp/test/compiler/benchmark/test_record_layout.sh
 	@BLORP_RECORD_UPDATE_SKIP_BUILD=1 benchmarks/compiler_record_update_match_allocations
 	@BLORP_RECORD_UPDATE_SKIP_BUILD=1 benchmarks/compiler_record_update_nested_match_allocations
