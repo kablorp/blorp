@@ -108,3 +108,70 @@ Manual downloads need executable permission before use, for example
   run` and `blorp compile` still invoke the platform C compiler.
 - If macOS distribution starts warning users about unidentified binaries, add
   code signing and notarization as a dedicated release-hardening workstream.
+
+## Preview Validation
+
+Before cutting a preview, run `scripts/premerge-gate` and
+`scripts/test package` (see
+[`scripts/README.md`](../scripts/README.md#premerge-gate)) and check every
+README-supported example restored under `examples/`. Do not gate a preview on
+ignored `scratch/` files. A nonzero exit, timeout, leaked background process,
+or untriaged generated-C warning is a gate failure. The premerge gate includes
+the broad compiler, tool, standard-library, runtime, leak, doctest, CLI, and
+LSP gates, codegen audit, preview CLI/runtime smoke,
+sanitizers, and platform validation when available.
+The package lifecycle gate is separate and must not be skipped just because
+the premerge gate passed.
+When preview examples are restored, record their exact check, run, and format
+commands here so the release gate is explicit and repeatable.
+The repository README currently names `examples/hello.brp`:
+
+```bash
+bin/blorp check --no-format examples/hello.brp
+bin/blorp run --timeout 5 --no-format examples/hello.brp
+bin/blorp format --check examples/hello.brp
+```
+
+For a narrow manual smoke while diagnosing a failure, use temporary outputs:
+
+```bash
+tmpc=$(mktemp "${TMPDIR:-/tmp}/blorp-preview.XXXXXX.c")
+smoke=$(mktemp "${TMPDIR:-/tmp}/blorp-preview.XXXXXX.brp")
+lsp_out=$(mktemp "${TMPDIR:-/tmp}/blorp-lsp-preview.XXXXXX.out")
+trap 'rm -f "$tmpc" "$smoke" "$lsp_out"' EXIT
+
+cat > "$smoke" <<'BRP'
+func main(args: List[String]) -> Int:
+	print("preview smoke")
+	0
+BRP
+
+bin/blorp check --no-format "$smoke"
+bin/blorp compile --no-format -o "$tmpc" "$smoke"
+bin/blorp run --timeout 5 --no-format "$smoke"
+bin/blorp test --warmup-only
+bin/blorp test --timeout 5 blorp/test/runtime/types/test_bool.brp
+bin/blorp test --leak-check --suite --timeout 5 \
+  blorp/test/runtime/memory/leak_check_baselines/empty_main.brp
+bin/blorp test --sanitize --timeout 5 blorp/test/runtime/types/test_bool.brp
+bin/blorp lsp </dev/null >"$lsp_out"
+```
+
+The environment smoke also checks the timeout, standard-library, no-format,
+and sanitizer routes:
+
+```bash
+env BLORP_TIMEOUT=5 bin/blorp test blorp/test/runtime/types/test_bool.brp
+env BLORP_STD=standard_library/src BLORP_NO_FORMAT=1 \
+  bin/blorp check blorp/test/runtime/types/test_bool.brp
+env BLORP_SANITIZE=1 bin/blorp test --timeout 5 \
+  blorp/test/runtime/types/test_bool.brp
+```
+
+The codegen audit owns the warning sweep because normal generated-C
+compile/test routes suppress noisy warnings. Clang `-Wparentheses-equality`
+from extra defensive comparison parentheses is currently benign;
+`-Wunsequenced` and `-Wincompatible-pointer-types` are not accepted. Review
+any new warning before preview rather than adding a blanket suppression.
+Test-artifact timeout defaults and overrides live in
+[`scripts/README.md`](../scripts/README.md#test-gates).

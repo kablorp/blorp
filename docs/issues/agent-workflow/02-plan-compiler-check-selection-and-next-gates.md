@@ -4,6 +4,17 @@
 
 **Owner:** `scripts/compiler-check` and its ownership manifest/tests
 
+**Current state:** Owner selection, one build, and failure reruns exist; a
+read-only plan and broad-gate explanation do not.
+**Next action:** Test `--plan` against the production selector, then implement
+its no-write view and surface the existing `broad_gate` authority.
+**Read first:** `scripts/compiler-check` selection/validation and
+`blorp/test/compiler/compiler_test_ownership.json`.
+**Fast loop:** The proposed `test_compiler_check_plan.py` with a miniature
+manifest; no compiler build for plan-only cases.
+**Decision:** Accept only identical plan/run selections and a no-write plan;
+reject invented ownership or a green claim for a no-op.
+
 ## Objective
 
 Make `scripts/compiler-check` explain exactly what it will select and why,

@@ -4,6 +4,17 @@
 
 **Owner:** `docs/issues/README.md`, active issue index, and a read-only audit
 
+**Current state:** Issue retention and a current-state card are documented;
+there is no mechanical audit or completed human pilot of one issue cluster.
+**Next action:** Test a read-only link/index/shape audit, then review only the
+named pilot directories against current code and measurements.
+**Read first:** `docs/issues/README.md`, the two late-Core latency handoffs,
+and their retained result in `benchmarks/results/`.
+**Fast loop:** The proposed `test_audit_issue_handoffs.py` on tiny Markdown
+fixtures, then one pilot-directory audit.
+**Decision:** Accept mechanical findings plus human dispositions; reject
+automatic deletion or semantic conclusions from status words.
+
 ## Objective
 
 Keep `docs/issues/` a trustworthy list of *next executable work*, not a second

@@ -5,6 +5,17 @@
 **Owner:** Makefile build identity, a small read-only status command, and the
 Developer Guide's direct-test loop
 
+**Current state:** Make records content-derived build hashes; direct
+`bin/blorp` commands do not verify that they match current source inputs.
+**Next action:** Add a failing status-state test, then a read-only verifier
+that reuses Make's identity and fails closed on unknown provenance.
+**Read first:** Makefile's compiler C/binary input-hash recipes and
+`blorp/test/build/test_build_configuration.sh`.
+**Fast loop:** The proposed `test_compiler_build_status.py`, then one real
+`make`/freshness smoke.
+**Decision:** Accept proven fresh/stale/unknown states with no writes; reject
+any shortcut that can call an unverifiable binary fresh.
+
 ## Objective
 
 Give agents a cheap, truthful answer to: "Does `bin/blorp` represent the

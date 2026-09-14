@@ -4,6 +4,17 @@
 
 **Owner:** `blorp/benchmark/compiler/`, `benchmarks/`, and benchmark guidance
 
+**Current state:** Pass-specific runners and fixtures exist, but there is no
+small shared comparison contract for new production-pass experiments.
+**Next action:** Test paired-driver failure modes with fake binaries, then
+pilot the template on one Core and one typecheck pass without production edits.
+**Read first:** `benchmarks/compiler_consume_candidate_index_profile`, its
+`.brp` fixture, and the Developer Guide's profiling section.
+**Fast loop:** One fake-binary pair and one existing consume-runner sample;
+build full pilot binaries only after output checks pass.
+**Decision:** Accept only same-input production-pass timings with raw pairs
+and semantic identity; reject silent fixture overlay or setup in the timer.
+
 ## Objective
 
 Make a small, reproducible baseline/candidate experiment the default first

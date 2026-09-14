@@ -5,6 +5,17 @@
 **Owner:** one opt-in validation recorder, `docs/DEVELOPMENT.md`, and the
 existing structured test/benchmark outputs
 
+**Current state:** Focused failures retain reruns; broad gates and benchmarks
+can emit logs, but successful cross-command handoffs are assembled manually.
+**Next action:** Test one opt-in recorder around fake success/failure commands,
+then verify a real focused and broad packet without changing the runners.
+**Read first:** `scripts/compiler-check` failure artifacts, `scripts/test`
+structured gate output, and the existing benchmark JSON precedent.
+**Fast loop:** The proposed `test_record_validation.py` with fake commands;
+no broad gate while changing packet formatting.
+**Decision:** Accept exact status/provenance with safe environment capture;
+reject a wrapper that hides failures or adds mandatory daily ceremony.
+
 ## Objective
 
 Let an agent hand a reviewer a compact, verifiable account of what was run,

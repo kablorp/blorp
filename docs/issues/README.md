@@ -28,6 +28,24 @@ Issue documents should be narrowly executable:
 - avoid progress diaries, completed sub-issue catalogs, and speculative
   architecture unrelated to the next implementation boundary.
 
+New or substantively revised handoffs should lead with a short current-state
+card so an agent assigned **one** issue can
+start without reading the whole workstream or reconstructing history:
+
+```text
+Current state: what the production code and tests do now.
+Next action: the one bounded experiment or implementation slice.
+Read first: exact owner source, contract, and nearest test.
+Fast loop: one runnable command and the result it must show.
+Decision: acceptance, rejection, and when to ask for guidance.
+```
+
+Keep historical attempts in Git history and durable measurements in
+`benchmarks/results/`; link them only when the next decision depends on them.
+Label proposed commands as proposed so they are not mistaken for working
+tooling. Prefer a link and a small task-specific example over repeating the
+complete `scripts/test` or CLI reference in each issue.
+
 Aim for no more than roughly 300 lines. Longer documents are justified only
 for a genuinely multi-phase architecture and should begin with a concise
 current-state and next-action summary.
@@ -66,7 +84,6 @@ current-state and next-action summary.
 
 ### Agent Development Workflow
 
-- [Task routing to owners and feedback loops](agent-workflow/01-route-agent-tasks-to-owners-and-loops.md)
 - [Compiler-check planning and next-gate guidance](agent-workflow/02-plan-compiler-check-selection-and-next-gates.md)
 - [Local compiler build freshness](agent-workflow/03-report-current-compiler-build-freshness.md)
 - [Production-pass performance experiment template](agent-workflow/04-template-production-pass-performance-experiments.md)

@@ -2,6 +2,61 @@
 
 A compiler for a functional programming language with pure/impure function tracking, algebraic data types, and pattern matching.
 
+## Find The Right Boundary First
+
+This file contains binding principles and development rules. Read the
+task-specific reference below rather than loading every guide, roadmap, source
+file, or test log. [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) owns detailed
+commands and efficient investigation/handoff examples; [`docs/README.md`](docs/README.md)
+routes the maintained references.
+
+| Task | Start with | First feedback |
+| --- | --- | --- |
+| Syntax or diagnostic | `blorp/src/compiler/stage_03_parse/`, matching compiler fixture, [`GRAMMAR`](docs/GRAMMAR.md) | Exact fixture and expected message; `scripts/compiler-check --changed` |
+| Inference or typecheck | `blorp/src/compiler/stage_06_typecheck/`, matching compiler fixture | Exact suite; then `scripts/compiler-check --stage typecheck` |
+| Core/ownership | [`pipeline.brp`](blorp/src/compiler/stage_09_core/pipeline.brp), [`ARCHITECTURE`](docs/ARCHITECTURE.md), owning Core suite | Before/after Core, focused suite, relevant sanitizer |
+| Backend/runtime | `blorp/src/compiler/stage_10_backend/`, `blorp/src/lib/runtime/native/`, codegen audit | Focused emitter/runtime test and generated C |
+| Standard library/package | `standard_library/src/` or `pkg/`, matching tests | Exact module test; `std-check` or runtime/package gate |
+| CLI/LSP | `blorp/src/main.brp` or `blorp/src/lsp/` | `scripts/test cli` or `scripts/test lsp` |
+| Build/bootstrap/release | `blorp/build/bootstrap.env`, [`RELEASES`](docs/RELEASES.md), [`scripts`](scripts/README.md) | `make` and focused build checks; not `compiler-check --changed` |
+| Performance | Production function, [`profiling guide`](docs/DEVELOPMENT.md#function-profiling-and-flame-graphs), retained benchmark | Direct same-boundary baseline/candidate measurement; output identity |
+| Docs-only | Owning reference and [`issue rules`](docs/issues/README.md) | Link/path examples and `git diff --check`; no automatic full gate |
+
+These are starting points, not substitute gates. `scripts/compiler-check`
+selects manifest-owned compiler checks, builds once when checks are selected,
+and does not cover a docs-only or bootstrap-manifest edit. Run broader gates
+proportionate to the change before review.
+
+For common requests, the first command and final gate are concrete:
+
+```bash
+# Parser diagnostic: inspect the exact expected message, then owner checks.
+bin/blorp check --no-format \
+  blorp/test/compiler/stage_03_parse/fixtures/parser/should_fail/subscript_missing_close.brp
+scripts/compiler-check --changed
+scripts/test compiler-blorp
+
+# Core ownership: run the owning suite, then ownership-sensitive gates.
+bin/blorp test --timeout 180 \
+  blorp/test/compiler/stage_09_core/test_core_match.brp
+scripts/compiler-check --changed
+scripts/test compiler-core-sanitize leak
+
+# Bootstrap pin: verify release tag and all target digests before changing the
+# manifest; compiler-check --changed does not select this build input.
+scripts/blorp-compiler-bootstrap --print-id
+make
+bash blorp/test/build/test_build_configuration.sh
+bash blorp/test/build/test_release_toolchain.sh
+scripts/test package
+```
+
+The parser's `should_fail` check is expected to exit nonzero; compare its
+diagnostic text with the fixture expectation, not its status alone. For Core
+codegen changes also inspect generated C and run the codegen audit. For a
+preview/bootstrap release, use the full gate in
+[`docs/RELEASES.md`](docs/RELEASES.md#preview-validation).
+
 ## Language Principles
 
 The priorities of the language, in order: **safe, understandable, expressive, simple, fast, easy to learn,
@@ -184,23 +239,13 @@ it needs a better error message. If an error says "unexpected token" with no hin
 Think about what a programmer coming from Python, JS, or Rust would try first, and make that
 either work or produce a helpful message.
 
-**8. Respect phase boundaries.** The compiler pipeline is:
-
-    lex → parse → interp desugar → module load →
-    subscript desugar → infer/typecheck →
-    lower + ffi_boundary + list_layout →
-    debug_blocks → desugar + ssa →
-    mono + list_layout → synth → match →
-    trait_resolve → resolve → std_inline → tailrec →
-    string_pipeline + collection_pipeline →
-    parallel_tensor_pipeline + tensor_fusion + tuple_sroa →
-    specialize → dce → consume_specialize → perceus → reuse → closure →
-    resource → fairness → compiler_core_prepare → reuse(prepared unions) → backend emit
-
-Don't put type-checking logic in Core IR passes or parsing constraints in
-type-checking. If a check belongs in an earlier phase, move it there. If it must stay in a
-later phase (e.g., monomorphization in `mono`), document why. See
-`docs/ARCHITECTURE.md` for the current pipeline reference.
+**8. Respect phase boundaries.** Lexing/parsing, module loading, inference and
+typechecking, Core lowering/passes, ownership/resource preparation, and backend
+emission have different responsibilities. The exact current order is owned by
+`docs/ARCHITECTURE.md` and `stage_09_core/pipeline.brp`; do not duplicate it
+here. Don't put type-checking logic in Core passes or parsing constraints in
+typechecking. If a check belongs earlier, move it there. If it must stay late
+(for example because monomorphization provides the needed facts), document why.
 
 **9. Measure, don't guess.** If there's any doubt about efficiency, use `--profile` for runtime
 cost and `--leak-check` for memory. Claims like "this is faster" require before/after evidence.
@@ -245,484 +290,96 @@ building a workaround without reassessing the task with the user.
 
 ---
 
-## Build Commands
+## Daily Commands And Validation
+
+Use the repository's `bin/blorp`, not a separately installed release, for
+source-checkout validation. `make` rebuilds it from the immutable bootstrap;
+a direct `bin/blorp` test can otherwise exercise an older executable.
+[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) has the full build, focused-test,
+profiling, CI, cleanup, and diagnostic recipes. [`scripts/README.md`](scripts/README.md)
+defines test gates and timeouts; `bin/blorp <command> --help` defines current CLI
+flags.
 
 ```bash
-# Build the compiler (outputs bin/blorp in project root)
-make
-
-# Run default local tests (compiler-blorp + runtime + leak + doctest + cli)
-scripts/test
-
-# Run specific test gates
-scripts/compiler-check --changed # Manifest-owned focused compiler checks
-scripts/compiler-check --stage typecheck # All focused checks owned by one stage
-scripts/test compiler-blorp     # Blorp TestSuites + marked production check fixtures
-scripts/test compiler-tools     # Formatter, purify, and lint public CLI fixtures
-scripts/test compiler-core-sanitize # Focused Core .brp tests under ASan + UBSan
-scripts/test compiler-blorp-sanitize # Compiler-owned .brp tests under ASan + UBSan
-scripts/test std-check          # Broad standard-library source typecheck sweep
-scripts/test runtime            # Runtime .brp tests
-scripts/test leak               # Ownership suites, leak baselines, and diagnostics
-scripts/test doctest            # Doctests (standard-library sources)
-scripts/test cli                # CLI smoke and exit-code checks
-scripts/test lsp                # Public LSP protocol fixtures
-scripts/test package            # Public package lifecycle integration
-scripts/test compiler-blorp runtime  # Multiple gates
-scripts/test --serial           # Run selected gates one at a time
-scripts/test --no-build         # Test the existing installed toolchain
-scripts/test --timings          # Print generated TestSuite phase timings
-scripts/test --verbose          # Print pass-by-pass child-runner output
-scripts/test --log-dir logs     # Save complete gate logs with compact console output
-
-# Run individual test files
-bin/blorp test blorp/test/runtime/factorial.brp
-
-# Makefile shortcuts
-make test                         # Top-level local test gate
-make runtime-test                 # Runtime tests only
-make compiler-core-sanitize-test  # Late-Core Blorp suites under ASan + UBSan
-make compiler-blorp-test          # Compiler-owned Blorp TestSuites
-make compiler-tools-test          # Formatter, purify, and lint public CLI fixtures
-make lsp-test                     # Public LSP protocol fixtures
-make package-test                 # Public package lifecycle integration
-make quality                      # Hygiene + C static analysis
-make docker-gate                  # Normal test gate in Ubuntu Docker (linux/amd64)
-make docker-premerge-gate         # Premerge gate in Ubuntu Docker (linux/amd64)
-make docker-premerge-gate-all     # Premerge gate in Ubuntu Docker (linux/amd64 + linux/arm64)
+make                              # Build/install the current compiler
+scripts/compiler-check --changed  # Build once and run manifest-owned checks
+bin/blorp test path/to/test.brp    # Narrow behavior loop after a known build
+scripts/test                      # Default compiler/runtime/leak/doctest/CLI gates
+scripts/test compiler-core-sanitize
+scripts/test --no-build --log-dir /tmp/blorp-gates compiler-blorp
 ```
 
-### Preview Gate
-
-Before cutting a preview build, run the normal build/test gates plus any
-README-supported examples currently restored under `examples/`. A nonzero exit,
-timeout, leaked background process, or untriaged generated-C warning is a gate
-failure.
-
-```bash
-make
-scripts/test compiler-blorp
-scripts/test compiler-tools
-scripts/test std-check
-scripts/test runtime
-scripts/test leak
-scripts/test doctest
-scripts/test cli
-scripts/test lsp
-scripts/test package
-blorp/test/compiler/pipeline/codegen_audit/run_codegen_audit.sh bin/blorp
-```
-
-The runtime and leak gates use their `BLORP_RUNTIME_TEST_TIMEOUT` and
-`BLORP_LEAK_TEST_TIMEOUT` overrides, then `BLORP_TEST_TIMEOUT`, and otherwise
-give their consolidated corpus artifacts 60-second timeouts. Other generated
-test artifacts default to 30 seconds. Compiler-owned Blorp suites default to 360 seconds; set
-`BLORP_COMPILER_TEST_TIMEOUT` to override only compiler tests, or
-`BLORP_TEST_TIMEOUT` to share one timeout across compiler, runtime, and leak gates.
-Compiler sanitizer gates default to 180 seconds per generated test binary;
-`BLORP_COMPILER_SANITIZE_TEST_TIMEOUT` overrides that measured ASan allowance.
-
-When preview examples are restored, list their exact check/run/format commands
-here. Do not gate preview on ignored `scratch/` files.
-
-CLI smoke for preview builds:
-
-```bash
-tmpc=$(mktemp "${TMPDIR:-/tmp}/blorp-preview.XXXXXX.c")
-smoke=$(mktemp "${TMPDIR:-/tmp}/blorp-preview.XXXXXX.brp")
-trap 'rm -f "$tmpc" "$smoke" /tmp/blorp-lsp-smoke.out' EXIT
-
-cat > "$smoke" <<'BRP'
-func main(args: List[String]) -> Int:
-	print("preview smoke")
-	0
-BRP
-
-bin/blorp check --no-format "$smoke"
-bin/blorp compile --no-format -o "$tmpc" "$smoke"
-bin/blorp run --timeout 5 --no-format "$smoke"
-bin/blorp test --timeout 5 blorp/test/runtime/types/test_bool.brp
-bin/blorp test --warmup-only
-bin/blorp test --leak-check --suite --timeout 5 \
-  blorp/test/runtime/memory/leak_check_baselines/empty_main.brp
-bin/blorp test --sanitize --timeout 5 blorp/test/runtime/types/test_bool.brp
-bin/blorp lsp </dev/null >/tmp/blorp-lsp-smoke.out
-```
-
-Environment smoke for preview builds:
-
-```bash
-env BLORP_TIMEOUT=5 bin/blorp test blorp/test/runtime/types/test_bool.brp
-env BLORP_STD=standard_library/src BLORP_NO_FORMAT=1 bin/blorp check blorp/test/runtime/types/test_bool.brp
-env BLORP_SANITIZE=1 bin/blorp test --timeout 5 blorp/test/runtime/types/test_bool.brp
-```
-
-Default generated-C compile/test paths suppress noisy generated-code warnings.
-The codegen audit suite performs the preview warning sweep; any warning promoted
-there is a gate failure and must either be fixed or explicitly documented as
-benign before preview release.
-
-For local Linux architecture parity, use Docker:
-
-```bash
-scripts/docker-gate --premerge-gate --platform linux/amd64
-scripts/docker-gate --premerge-gate --platform linux/arm64
-scripts/docker-gate --premerge-gate --all-platforms
-```
-
-The Docker premerge gate runs `scripts/premerge-gate --no-docker` inside the container
-to avoid nested Docker. Cross-architecture runs require Docker support for the
-requested platform, for example Docker Desktop or configured QEMU/binfmt.
-
-Current triage: Clang `-Wparentheses-equality` warnings from generated
-comparisons with extra defensive parentheses are benign. `-Wunsequenced` and
-`-Wincompatible-pointer-types` warnings are not accepted in the preview warning
-sweep; regressions for those classes live in the codegen audit suite.
-
-`bin/blorp test --warmup-only` must succeed before parallel gates. Warmup compiles
-a minimal program through the production Blorp executable, populating the same
-Blorp-owned runtime cache used by subsequent test artifacts.
-
-## CLI Usage
-
-The compiler uses subcommands. Run `bin/blorp --help` for full usage.
-
-```bash
-# Compile a .brp file
-bin/blorp compile program.brp
-
-# Type check only (no codegen)
-bin/blorp check program.brp
-
-# Show AST only
-bin/blorp compile --ast program.brp
-
-# Dump Core after specific stages
-bin/blorp compile --dump-core-after=lower,mono,closure program.brp
-
-# Stop after a stage and auto-dump that snapshot
-bin/blorp compile --stop-after=resolve program.brp
-
-# Debug Core invariants
-bin/blorp compile --check-invariants --dump-core-after=match program.brp
-
-# Compile and run
-bin/blorp run program.brp
-
-# Compile and run with optimized generated C
-bin/blorp run --release program.brp
-
-# Compile and run with CLI arguments
-bin/blorp run program.brp -- arg1 arg2 arg3
-
-# Run with profiling
-bin/blorp run --profile program.brp
-
-# Run a single test file
-bin/blorp test blorp/test/runtime/types/test_accessor.brp
-
-# Run all tests in a directory
-bin/blorp test blorp/test/runtime/
-
-# Run tests with profiling
-bin/blorp test --profile blorp/test/runtime/functions/
-
-# Format source files
-bin/blorp format file.brp           # Format in place
-bin/blorp format --check file.brp   # Check without modifying (exit 1 if unformatted)
-bin/blorp format --check --diff dir/ # Show diff for unformatted files
-
-# Auto-mark pure functions
-bin/blorp purify file.brp           # Modify file in place
-bin/blorp purify --dry-run file.brp # Show what would change
-
-# Report typed source findings without rewriting files
-bin/blorp lint file.brp
-bin/blorp lint --format json --fail-on-findings src/
-
-# Start LSP server (used by editor extensions)
-bin/blorp lsp
-
-```
-
-Notes:
-
-- `--dump-ast` and `--dump-typed-ast` print summaries, not a full expression tree.
-- For compiler debugging, prefer `--dump-core-after=...` and reading the generated C.
-
-## Project Structure
-
-```
-blorp/                 # Complete Blorp executable package
-  src/                 # Sole production source root
-    main.brp           # Sole executable composition root
-    compiler/          # Numbered compiler pipeline stages
-    lsp/               # Native LSP protocol, workspace, capabilities, and server
-    lib/runtime/native/# Native runtime sources and headers
-  test/                # Tests mirrored by production owner
-  benchmark/compiler/ # Compiler-specific benchmarks and fixtures
-  tool/                # Deterministic build-time source generators
-  build/               # Version, bootstrap pin, and ignored build products
-
-standard_library/ # Standard library
-  src/            # Production .brp modules with bare logical paths such as list and net/tcp
-    prelude.brp   # Documents builtins available without imports
-    test.brp      # Test framework
-    traits.brp    # Core traits
-    option.brp    # Option[T] type
-    result.brp    # Result[T,E] type
-    list.brp      # List[T] operations
-    dict.brp      # Dict[K,V] operations
-    set.brp       # Set[T] operations
-    bytes.brp     # Bytes type
-    heap.brp      # Priority queue (min-heap)
-    deque.brp     # Double-ended queue
-    sorted_map.brp # Sorted key-value map
-    int.brp, float.brp, bool.brp, char.brp  # Primitives
-    int8.brp, int16.brp, int32.brp, int128.brp  # Sized signed integers
-    uint8.brp, uint16.brp, uint32.brp, uint64.brp, uint128.brp  # Sized unsigned integers
-    float16.brp, float32.brp, fixed.brp  # Sized floats and fixed-point decimals
-    string.brp, slice.brp  # String ecosystem
-    parser.brp, regex.brp  # Text processing
-    math.brp, tensor.brp, vector.brp, matrix.brp, stats.brp, units.brp  # Numeric
-    parallel_vector.brp, parallel_matrix.brp  # Scoped vector/matrix parallel views
-    geometry.brp, geographic.brp, geojson.brp, physics.brp  # Spatial
-    dsp.brp, fft.brp, noise.brp  # Signal/procedural helpers
-    random.brp, crypto_random.brp  # Random
-    io.brp, file.brp, system.brp, debug.brp, memory.brp, instrumentation.brp, time.brp  # System
-    path.brp, process.brp, log.brp, terminal.brp  # OS/terminal
-    csv.brp, html.brp, json.brp, toml.brp, xml.brp, yaml.brp  # Format parsers
-    argparse.brp, hash.brp, uuid.brp  # Utilities
-    codec.brp, codec_bridge.brp, validation.brp  # Encoding/validation
-    cache.brp, parallel_list.brp, property.brp, stream.brp, channel.brp  # Infrastructure
-    net/          # Portable networking/protocol helpers (tcp, http, url, mime)
-  test/           # Runtime tests mirroring standard_library/src/
-
-pkg/              # Optional native-backed packages and third-party bindings
-  compress.brp, crypto.brp, sqlite.brp
-  net/            # Native DNS, HTTP client, SMTP, TLS, UDP, WebSocket
-
-examples/           # Curated preview examples restored intentionally
-
-pkg/test/         # Runtime and lifecycle tests mirroring pkg/
-
-editor/             # IDE/editor support
-  vscode/           # VSCode extension (TextMate grammar, language config)
-  intellij/         # IntelliJ plugin (TextMate grammar, language config)
-```
-
-## Language Syntax (Quick Reference)
-
-See `docs/GUIDE.md` for the complete language reference with all features.
-See `docs/GRAMMAR.md` for the formal EBNF grammar.
-
-### Essentials
-```
--- Functions
-func name(param: Type) -> ReturnType:
-    body
-pure func name(x: Int) -> Int: x * 2
-
--- main function (required for programs)
-func main(args: List[String]):
-    print("hello")
-
--- main with explicit exit code
-func main(args: List[String]) -> Int:
-    0
-
--- Lambdas (always require func keyword)
-func(x: Int): x + 1
-func(x): x + 1                     # Type inferred from context
-
--- Pattern matching
-match value:
-    Some(x): x
-    None: default
-
--- String interpolation uses ${expr}
-greeting: String = "Hello, ${name}!"
-
--- Records and record update
-record Point {x: Int, y: Int}
-p: Point = {x = 1, y = 2}
-q: Point = { p | x = 10 }
-
--- Visibility: public by default, use private to hide
-private func helper(x: Int) -> Int: x + 1
-
--- Imports (import: block with ':' for selective, as for qualified)
-import:
-    option: Option(Some, None)
-    dict as D
-
--- ?= bindings propagate Option/Result failure from the enclosing function
-func process() -> Option[Int]:
-    x ?= get_value()
-    y ?= get_other()
-    Some(x + y)
-
--- Concurrency (structured)
-concurrent:
-    a = compute_a()
-    b = compute_b()
-detach detach()
-ch: Channel[Int] = channel(10)
-_ = send(ch, 42)
-```
-
-### @tail_recursive
-Marks a function for tail call optimization. The compiler verifies all recursive calls are in tail position and transforms them into efficient loops.
-
-### Struct vs Record
-- **Structs**: `struct Name {field: Type}` — stack-allocated, no ARC/COW
-- **Records**: `record Name {field: Type}` — heap-allocated, ARC-managed, COW
-- Both support update syntax: `{ base | field = val }`
-
-## Key Conventions
-
-### Purity Rules
-
-**Pure functions cannot call impure functions** - this is the core rule. However, pure functions CAN use local mutable state:
-
-```blorp
--- ALLOWED: Local mutation in pure function
-pure func sum(nums: List[Int]) -> Int:
-    var total: Int = 0      -- local var is fine
-    for n in nums:
-        total = total + n   -- local mutation is fine
-    total
-
--- NOT ALLOWED: Calling impure function
-pure func bad(x: Int) -> Int:
-    print(x)    -- ERROR: print is impure
-    x
-```
-
-**What makes a function impure:**
-- Calling impure functions: `print`, imported `system` file APIs, imported `process` APIs, blocking channel operations
-- Calling any impure function (transitively impure)
-- Taking an impure callback parameter
-
-**What does NOT make a function impure:**
-- Local `var` declarations and mutation
-- For loops with local accumulators
-- Calling pure functions
-- Pure callbacks
-
-**Closures cannot capture mutable variables:**
-Closures can only capture immutable values (function parameters, let bindings). Capturing `var` is a compile error. For stateful computations, use explicit state threading with union types.
-
-**Iterators and purity:**
-Pure iterator factories create deterministic sequences. Use explicit state (union types) instead of captured mutable variables for pure lazy evaluation.
-
-See `docs/GUIDE.md` for full purity documentation.
-
-### Other Conventions
-
-- All lambdas require `func` keyword: `func(x): x + 1`
-- Tests use `TestSuite` type from `test`
-
-### Standard Library / Package Boundary
-
-- `standard_library/src/` is the portable, shipped, always-available library. It may use `builtin` only for compiler/runtime primitives.
-- New explicit `foreign` declarations and native `_ffi.h` headers should not be added under `standard_library/src/`. Existing standard-library FFI modules are tracked by an explicit unit-test inventory and should move to `pkg/` or be rewritten in Blorp source.
-- `pkg/` is the intended home for optional native bindings, C/system headers, native link flags, and third-party packages. Bare imports should continue to resolve only local or standard-library modules, not `pkg/` modules.
-
-### Tensor Work
-
-- `Tensor` is the builtin runtime container. Source code writes fixed-shape tensors with postfix dimensions:
-  `T[#N]` for vectors and `T[#M, #N]` for matrices.
-- Storage is flat row-major. Single-index subscript peels one dimension, so `m[i]` on a matrix yields a row tensor while `m[i, j]` yields a scalar.
-- `#Ds...` means "caller-supplied concrete dimensions", not runtime-sized data. Use `List[T]` for data whose size is only known at runtime.
-- `assert_shape` is a narrow runtime refinement. It checks `length(t) == N` for the first dimension and refines the type on success; it does not reshape or copy data.
-- Before changing tensor behavior, cover all three layers: dimension solving / inference tests, runtime tests, and generated Core or C.
-
-### Cleanup
-
-**Do not leave compilation artifacts in the repo.** The compiler generates intermediate `.c` files during compilation. Test commands use temporary outputs, but a manual compile can still place generated C beside its input:
-
-- `bin/blorp test` - Uses system temp directory, auto-cleans
-- `bin/blorp run` - Uses system temp directory, auto-cleans
-- `bin/blorp compile file.brp` - Generates `file.c` in same directory - **delete manually**
-
-If you see `.c` files appearing in the repo, delete them. Generated files have a `/* Generated by blorp compiler */` header.
-
-## Testing
-
-Test files use `TestSuite`:
-```
-import:
-    test: TestSuite
-
-func test_something() -> Bool:
-    actual == expected
-
-tests: TestSuite = {
-    description = "My Tests",
-    tests = [
-        ("test name", test_something)
-    ]
-}
-```
-
-Run with: `bin/blorp test path/to/test.brp`
-
-**Doctests**: Functions with `---` docstring blocks containing `>>>` examples can be run with `bin/blorp test --doc file.brp` (single file) or `bin/blorp test --suite dir/` (directory).
-
-See Development Rule 3 (write a failing test first) for the TDD workflow.
-Do not write tests arbitrarily — understand what is already tested before adding new ones.
-
-### Compiler Test Ownership
-
-New compiler implementation and public source-language behavior belongs in
-`blorp/test/compiler/`. Public format, purify, and lint behavior remains in
-their matching owners under `blorp/test/`.
-
-**Failures:**
-- All tests should pass
-- Diagnose thoroughly why tests are broken
-- Determine if the tests or the implementation is wrong
-- Bias toward trusting tests
-
-### ORGANIZATION
-Keep the project organized in a way that is intuitive. Use subdirectories when a group of files forms a coherent subsystem (e.g., `standard_library/src/net/`, `pkg/net/`, `blorp/test/runtime/tools/`).
-
-**Note**: For quick build verification during iteration, use direct bash commands (`make`) rather than spawning an agent. Reserve agents for tasks requiring analysis.
-
-### Specialized Workflows
-
-**For new syntax/features:**
-```
-parser-specialist → ergonomics-expert → [implement] → test-runner → documenter
-```
-
-**For performance work:**
-```
-code-optimizer → [implement] → test-runner → code-reviewer → code-optimizer (verify)
-```
-
-**For API design:**
-```
-ergonomics-expert → [design] → code-reviewer → documenter
-```
-
-**For user-facing features:**
-```
-data-engineer → ergonomics-expert → [design] → data-engineer (validate) → [implement]
-```
-
-### Agent Output Contracts
-All agents return structured output:
-
-- **test-runner**: Build status + pass/fail counts + failure table
-- **code-reviewer**: Summary counts + issues by severity + verdict
-- **type-checker**: Problem + reproduction + root cause + fix
-- **parser-specialist**: Problem + reproduction + root cause + fix + test cases
-
-### Agent Communication
-- Agents return findings directly in their response (no intermediate files)
-- Agents cannot talk to each other directly - main conversation orchestrates
-- Flow: Main → Agent A → Main → Agent B → Main
-- Each agent verifies prerequisites before proceeding
-- Context hints help agents focus based on prior agent results
+Use the smallest test or production-pass benchmark while iterating, then the
+relevant broad gates. `--no-build` is only for a toolchain already built from
+the intended sources. `bin/blorp test --warmup-only` must succeed before
+parallel gates; a failed warmup is not an acceptable warning. For preview and release work,
+follow [`docs/RELEASES.md`](docs/RELEASES.md#preview-validation) and
+`scripts/premerge-gate`; do not substitute the default local gate for those
+broader checks.
+
+Search for a symbol and read bounded source regions before loading a very
+large module. Keep full Core/C dumps and gate logs on disk; share the relevant
+excerpt, artifact path, and hashes with reviewers. The precise examples and
+handoff format live in
+[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md#efficient-agent-investigation-and-handoff).
+This reduces repeated context, not the required tests or review.
+
+## Language And Repository Boundaries
+
+[`docs/GUIDE.md`](docs/GUIDE.md) is the current language reference and
+[`docs/GRAMMAR.md`](docs/GRAMMAR.md) is the formal syntax. The Developer Guide
+maps production sources and tests. In particular:
+
+- Pure functions may mutate local `var` state but cannot call impure functions
+  or capture mutable variables in closures. Lambdas use `func`; use explicit
+  state threading for pure lazy iterators.
+- `struct` values are stack-allocated without ARC/COW; `record` values are
+  heap-allocated and ARC/COW-managed. Both support value-preserving update
+  syntax. Verify current behavior in tests before changing layout or ownership.
+- `standard_library/src/` is portable and always available. Do not add new
+  explicit `foreign` declarations or native `_ffi.h` headers there. Optional
+  native bindings, link flags, and third-party packages belong in `pkg/`.
+  Bare imports resolve local or standard-library modules, not `pkg/`.
+- Tensor work must cover dimension solving/inference, runtime behavior, and
+  generated Core or C; use the source route above for the first files.
+  `#Ds...` denotes caller-supplied concrete dimensions, not dynamic length;
+  `assert_shape` checks the first dimension and refines without copying.
+- New compiler implementation and public parser/inference/typecheck fixtures
+  live under `blorp/test/compiler/` and are registered in
+  `blorp/test/compiler/compiler_test_ownership.json`. Format, purify, and lint
+  fixtures retain their matching owners; runtime behavior belongs in
+  `blorp/test/runtime/`. Tests use `TestSuite` from `test`; see the Developer
+  Guide for placement and the Guide for syntax.
+- `bin/blorp test` and `run` use temporary artifacts. A bare
+  `bin/blorp compile file.brp` may write `file.c` beside its input. Prefer
+  `-o` with a temporary path and clean up generated files you created; do not
+  delete unrelated user files. Read generated C for codegen changes.
+
+## Agent Coordination
+
+The main task owns integration and passes bounded context to specialists:
+question, base revision/worktree, first source and test, fast loop, scope
+boundary, and expected evidence. Preserve the specialist responsibilities:
+new syntax needs parser-specialist and ergonomics-expert input before
+implementation and documenter review after; API/user-facing design needs
+ergonomics-expert and data-engineer validation; performance work needs a
+code-optimizer hypothesis and measured
+verification. One worker may carry several roles when qualified; do not spawn
+separate agents merely to reproduce a fixed chain. Run a quick `make` directly
+rather than spawning an agent for build status.
+Every change still gets code-reviewer and test-runner review before commit.
+A worker should ask for guidance when a boundary or result is ambiguous, and
+a negative performance experiment is a valid result.
+
+Agent reports should be concise and reproducible:
+
+- Test-runner: build status, pass/fail counts, and failure table.
+- Code-reviewer: issue counts by severity, evidence, and verdict.
+- Diagnostic specialist: reproduction, root cause, proposed fix, and tests.
+- Performance worker: hypothesis, exact workload and commands, source/binary
+  provenance, raw sample location, output identity, caveats, and accept/reject
+  recommendation.
+
+Pass findings through the main task for integration; do not make each agent
+reread the full conversation or every roadmap. Preserve complete artifacts
+when a reviewer needs them, but report only the relevant excerpt and path.

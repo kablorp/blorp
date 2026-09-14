@@ -187,6 +187,71 @@ git diff --check
 Use `--no-format` in diagnostic and performance commands after a separate
 format check. This keeps formatting work out of the behavior or timing window.
 
+## Efficient Agent Investigation And Handoff
+
+Use progressive disclosure: start with the task's owning source, one nearby
+test, and the relevant contract. Read more when a concrete uncertainty or
+failure calls for it. `AGENTS.md` carries binding rules and routes tasks here;
+this guide carries detailed commands. An active issue is a next-action handoff,
+not a requirement to read every roadmap under `docs/issues/`.
+
+Several compiler files are large. Search for a symbol and read a bounded
+region before loading an entire file. Exclude generated embedded inputs when
+they are not the subject of the task:
+
+```bash
+rg -n '^(private )?(pure )?func |find_clone_target' \
+  blorp/src/compiler/stage_09_core/consume_specialize.brp
+sed -n '1490,1565p' \
+  blorp/src/compiler/stage_09_core/consume_specialize.brp
+rg -n 'CoreSemanticMatchTree' blorp/src/compiler \
+  -g '*.brp' -g '!**/stage_01_generated_inputs/**'
+```
+
+The line range is an example, not a stable API; choose it from the preceding
+search result. If a function spans a wider region, expand only that region and
+its immediate callers/tests. Do not split a compiler module solely to shorten
+tool output; split only when it exposes a real ownership boundary.
+
+Keep full diagnostic artifacts on disk and bring only the relevant excerpt
+into the conversation. The default `scripts/test` output is already compact:
+
+```bash
+scripts/test --no-build --log-dir /tmp/blorp-gate-logs compiler-blorp
+rg -n 'FAIL|error:|BLORP_GATE_RESULT' /tmp/blorp-gate-logs
+```
+
+For Core/C changes, write snapshots and generated C to temporary paths, then
+compare hashes or search the relevant symbol. Do not paste a whole compiler C
+file or Core dump when a targeted function body and artifact path suffice.
+Preserve the complete artifact for a reviewer if the identity claim depends
+on it. A quiet successful gate saves reading time and tokens; it does **not**
+replace focused failure diagnosis or final integration coverage.
+
+When delegating or handing off, give a bounded task brief rather than a copy
+of the entire investigation transcript:
+
+```text
+Question: Does candidate lookup improve consume_specialize.rewrite_program?
+Base: exact Git revision and worktree; identify any dirty inputs.
+Read first: consume_specialize.brp, its focused suite, the assigned issue.
+Fast loop: one direct-pass fixture; then the named owner suite.
+Boundary: candidate identity/order only; no union-index or traversal rewrite.
+Return: hypothesis, exact commands, raw sample location, output identity,
+        test counts, caveats, and accept/reject recommendation.
+```
+
+For reviews, send the diff plus the evidence packet and unresolved questions.
+Do not make each reviewer rediscover the same source map. Negative performance
+experiments are valuable results: report the measured counterexample instead
+of expanding scope until a speedup appears. Do not omit a required contract,
+test, or generated-C inspection merely to save context.
+
+To evaluate whether this practice helps, compare tasks by actual token usage
+when available; otherwise track repeated file reads, truncated outputs, time
+to first relevant result, and reviewer follow-up questions. Use a parser
+diagnostic, a Core optimization, and a build change as different pilot tasks.
+
 ## Running Blorp Programs
 
 Given this file:
@@ -853,7 +918,8 @@ Also confirm:
 - Rough edges and deferred follow-ups are recorded explicitly.
 
 Run the broader gate required by the blast radius before merging. For a preview
-release, follow the complete gate list in [`AGENTS.md`](../AGENTS.md).
+release, follow [`Preview Validation`](RELEASES.md#preview-validation),
+including its separate package lifecycle gate.
 
 ## Command Reference
 
