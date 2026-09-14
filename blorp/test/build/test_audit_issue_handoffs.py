@@ -176,6 +176,50 @@ class AuditIssueHandoffsTests(unittest.TestCase):
 			self.assertEqual(payload["summary"]["errors"], 1)
 			self.assertEqual(payload["findings"][0]["kind"], "broken_index_link")
 
+	def test_audits_indexed_nonnumeric_files_without_status(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			issue_root = root / "docs/issues"
+			workflow = issue_root / "agent-workflow"
+			workflow.mkdir(parents=True)
+			(issue_root / "README.md").write_text(
+				"\n".join(
+					[
+						"# Active Engineering Issues",
+						"",
+						"### Agent Development Workflow",
+						"",
+						"- [Named handoff](agent-workflow/named-handoff.md)",
+						"",
+					]
+				),
+				encoding="utf-8",
+			)
+			(workflow / "named-handoff.md").write_text(
+				"# Named Handoff\n\n## Objective\n\nThis indexed handoff is missing status.\n",
+				encoding="utf-8",
+			)
+			(workflow / "support.md").write_text(
+				"# Support\n\nThis unindexed note should not be audited as a handoff.\n",
+				encoding="utf-8",
+			)
+
+			result = self.run_audit(
+				root,
+				"--scope",
+				"docs/issues/agent-workflow",
+				"--json",
+			)
+
+			self.assertEqual(result.returncode, 1, result.stderr)
+			payload = json.loads(result.stdout)
+			self.assertEqual(payload["summary"]["errors"], 1)
+			self.assertEqual(payload["findings"][0]["kind"], "missing_status")
+			self.assertEqual(
+				payload["findings"][0]["path"],
+				"docs/issues/agent-workflow/named-handoff.md",
+			)
+
 	def test_reports_missing_markdown_anchor_targets(self) -> None:
 		with tempfile.TemporaryDirectory() as directory:
 			root = Path(directory)
