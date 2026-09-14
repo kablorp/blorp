@@ -301,13 +301,20 @@ defines test gates and timeouts; `bin/blorp <command> --help` defines current CL
 flags.
 
 ```bash
-make                              # Build/install the current compiler
+scripts/compiler-check --changed --plan  # Read-only selection and next-gate guidance
+scripts/compiler-build-status     # Verify bin/blorp matches current build inputs
+make                              # Build/install when inputs changed or status is uncertain
 scripts/compiler-check --changed  # Build once and run manifest-owned checks
 bin/blorp test path/to/test.brp    # Narrow behavior loop after a known build
 scripts/test                      # Default compiler/runtime/leak/doctest/CLI gates
 scripts/test compiler-core-sanitize
 scripts/test --no-build --log-dir /tmp/blorp-gates compiler-blorp
 ```
+
+An empty `--plan` is a no-op explanation, not validation. Build status reports
+`FRESH`, `STALE`, or `UNKNOWN` without rebuilding; check it before direct
+`bin/blorp` tests, and run `make` then recheck if not fresh. Use the Developer
+Guide for details.
 
 Use the smallest test or production-pass benchmark while iterating, then the
 relevant broad gates. `--no-build` is only for a toolchain already built from
