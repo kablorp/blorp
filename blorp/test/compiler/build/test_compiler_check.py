@@ -342,7 +342,7 @@ class CompilerCheckTestCase(unittest.TestCase):
         for arguments, message in (
             (("--stage", "unknown"), "unknown stage"),
             (("blorp/test/compiler/missing.brp",), "unknown suite"),
-            (("--stage", "typecheck", "--changed"), "not allowed with argument"),
+            (("--stage", "typecheck", "--changed"), "mutually exclusive"),
             (("--base", "HEAD"), "--base requires --changed"),
         ):
             result = self.fixture.run(*arguments)
