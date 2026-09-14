@@ -86,6 +86,13 @@ class Selection:
     checks: tuple[Check, ...]
 
 
+@dataclass(frozen=True)
+class Plan:
+    selection: Selection
+    changed_tests: tuple[Suite, ...]
+    source_label: str
+
+
 def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -334,7 +341,10 @@ def load_manifest(root: Path) -> Manifest:
         if (root / path).is_file()
     )
     for path in sorted(production_paths - set(modules)):
-        errors.append(f"unowned production Blorp module: {path}")
+        errors.append(
+            f"unowned production Blorp module: {path}; update {MANIFEST_PATH} "
+            "and run scripts/compiler-check --validate-manifest"
+        )
     for path in sorted(set(modules) - production_paths):
         if (root / path).is_file():
             errors.append(f"module is outside the production Blorp inventory: {path}")
@@ -422,7 +432,13 @@ def _selection_for_modules(manifest: Manifest, source_paths: Iterable[str]) -> S
     unknown = [path for path in sources if path not in manifest.modules]
     if unknown:
         raise ManifestError(
-            [f"unowned production Blorp source selected by --changed: {path}" for path in unknown]
+            [
+                (
+                    f"unowned production Blorp source selected by --changed: {path}; "
+                    f"update {MANIFEST_PATH} and run scripts/compiler-check --validate-manifest"
+                )
+                for path in unknown
+            ]
         )
     suite_ids = {suite_id for path in sources for suite_id in manifest.modules[path].suites}
     check_ids = {check_id for path in sources for check_id in manifest.modules[path].checks}
@@ -445,6 +461,19 @@ def select_changed(manifest: Manifest, changed_paths: Iterable[str]) -> Selectio
         selection.sources,
         tuple(sorted(suites_by_id.values(), key=lambda item: item.path)),
         selection.checks,
+    )
+
+
+def directly_changed_suites(manifest: Manifest, changed_paths: Iterable[str]) -> tuple[Suite, ...]:
+    return tuple(
+        sorted(
+            {
+                suite.identifier: suite
+                for path in changed_paths
+                if (suite := manifest.suites_by_path.get(path)) is not None
+            }.values(),
+            key=lambda item: item.path,
+        )
     )
 
 
@@ -484,6 +513,106 @@ def _print_selection(selection: Selection) -> None:
     else:
         print("  (none)")
     sys.stdout.flush()
+
+
+def _plan_check_command(check: Check) -> list[str]:
+    if check.gate is not None:
+        return [check.path, "--no-build", "--serial", check.gate]
+    assert check.command is not None
+    return list(check.command)
+
+
+def _focused_action_commands(selection: Selection) -> list[list[str]]:
+    commands: list[list[str]] = []
+    if selection.suites or selection.checks:
+        commands.append(["make"])
+    if selection.suites:
+        timeout = os.environ.get("BLORP_COMPILER_TEST_TIMEOUT", DEFAULT_SUITE_TIMEOUT_SECONDS)
+        commands.append(
+            ["bin/blorp", "test", "--timeout", timeout, *[suite.path for suite in selection.suites]]
+        )
+    commands.extend(_plan_check_command(check) for check in selection.checks)
+    return commands
+
+
+def _broad_gate_commands(manifest: Manifest, selection: Selection) -> tuple[str, ...]:
+    broad_gate_ids = {
+        manifest.modules[path].broad_gate
+        for path in selection.sources
+        if path in manifest.modules
+    }
+    commands = [
+        shlex.join([gate.path, gate.gate])
+        for gate in sorted(
+            (manifest.broad_gates[item] for item in broad_gate_ids),
+            key=lambda item: item.identifier,
+        )
+    ]
+    return tuple(commands)
+
+
+def _selection_paths(selection: Selection) -> dict[str, list[str]]:
+    return {
+        "sources": list(selection.sources),
+        "suites": [suite.path for suite in selection.suites],
+        "checks": [check.identifier for check in selection.checks],
+    }
+
+
+def _print_noop_plan() -> None:
+    print("Selected 0 production sources, 0 suites, 0 special checks.")
+    print(
+        "No compiler-focused behavior was selected for these changes. This is a no-op, "
+        "not a passing validation; use the task-specific build/docs/release checks."
+    )
+
+
+def _print_plan(manifest: Manifest, plan: Plan) -> None:
+    selection = plan.selection
+    print("Mode: plan only (no build, compiler, test, log, or generated-file write)")
+    if not selection.sources and not selection.suites and not selection.checks:
+        _print_noop_plan()
+        return
+
+    print(
+        f"Selected {len(selection.sources)} production sources, "
+        f"{len(selection.suites)} suites, {len(selection.checks)} special checks."
+    )
+    for path in selection.sources:
+        module = manifest.modules[path]
+        print(f"{plan.source_label}: {shlex.quote(path)}")
+        print(f"  owner stage: {module.stage}")
+        for suite_id in module.suites:
+            print(f"  focused suite: {manifest.suites[suite_id].path}")
+        for check_id in module.checks:
+            print(f"  selected special check: {check_id}")
+    for suite in plan.changed_tests:
+        print(f"Changed test: {suite.path}")
+
+    commands = _focused_action_commands(selection)
+    if commands:
+        print(f"Focused action: {'; '.join(shlex.join(command) for command in commands)}")
+    else:
+        print("Focused action: (none)")
+
+    for command in _broad_gate_commands(manifest, selection):
+        print(f"Recommended additional gate: {command}")
+        print("Reason: manifest broad_gate; review guidance only, not run by --plan")
+    sys.stdout.flush()
+
+
+def _print_plan_json(manifest: Manifest, plan: Plan) -> None:
+    payload = {
+        "schema_version": 1,
+        "mode": "plan",
+        "selection": _selection_paths(plan.selection),
+        "changed_tests": [suite.path for suite in plan.changed_tests],
+        "source_label": plan.source_label,
+        "focused_action": [command for command in _focused_action_commands(plan.selection)],
+        "recommendations": list(_broad_gate_commands(manifest, plan.selection)),
+        "recommendation_authority": "manifest broad_gate",
+    }
+    print(json.dumps(payload, indent=2))
 
 
 def _run_logged(command: list[str], root: Path, log_path: Path) -> int:
@@ -530,8 +659,14 @@ def execute_selection(root: Path, selection: Selection, original_arguments: list
     if not selection.suites and not selection.checks:
         elapsed = time.monotonic() - start
         print(
-            f"Compiler check passed: {len(selection.sources)} sources, 0 suites, 0 checks "
-            f"in {elapsed:.2f}s"
+            f"Selected {len(selection.sources)} production sources, 0 suites, 0 special checks."
+        )
+        print(
+            "No compiler-focused behavior was selected for these changes. This is a no-op, "
+            "not a passing validation; use the task-specific build/docs/release checks."
+        )
+        print(
+            f"Compiler check completed with no selected work in {elapsed:.2f}s"
         )
         return 0
 
@@ -613,7 +748,19 @@ def argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--base", metavar="REF", help="also include committed changes from merge base")
     parser.add_argument(
-        "--validate-manifest", action="store_true", help=argparse.SUPPRESS
+        "--plan",
+        action="store_true",
+        help="print selected checks and next-gate guidance without building or running tests",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="with --plan, print the selected checks and recommendations as JSON",
+    )
+    parser.add_argument(
+        "--validate-manifest",
+        action="store_true",
+        help="validate ownership manifest coverage without running checks",
     )
     return parser
 
@@ -624,17 +771,20 @@ def main(arguments: list[str]) -> int:
     selected_modes = int(options.suite is not None) + int(options.stage is not None) + int(options.changed)
     if options.base is not None and not options.changed:
         parser.error("--base requires --changed")
+    if options.json and not options.plan:
+        parser.error("--json requires --plan")
     if options.validate_manifest:
-        if selected_modes or options.base is not None:
+        if selected_modes or options.base is not None or options.plan or options.json:
             parser.error("--validate-manifest is incompatible with selection modes")
     elif selected_modes == 0:
         parser.error("choose a suite path, --stage NAME, or --changed")
     elif selected_modes > 1:
-        parser.error("suite, --stage, and --changed are not allowed with argument each other")
+        parser.error("suite, --stage, and --changed are mutually exclusive")
 
     root = Path(__file__).resolve().parent.parent
     try:
         manifest = load_manifest(root)
+        changed_paths: set[str] = set()
         if options.validate_manifest:
             print(
                 f"Compiler test ownership manifest is valid: {len(manifest.modules)} production modules, "
@@ -646,15 +796,28 @@ def main(arguments: list[str]) -> int:
         elif options.stage is not None:
             selection = select_stage(manifest, options.stage)
         else:
-            selection = select_changed(
-                manifest, changed_repository_paths(root, options.base)
-            )
+            changed_paths = changed_repository_paths(root, options.base)
+            selection = select_changed(manifest, changed_paths)
     except ManifestError as error:
         for message in error.errors:
             print(f"error: {message}", file=sys.stderr)
         return 2
     except (RuntimeError, ValueError) as error:
         parser.error(str(error))
+
+    if options.changed:
+        changed_tests = directly_changed_suites(manifest, changed_paths)
+        source_label = "Changed production source"
+    else:
+        changed_tests = ()
+        source_label = "Selected production source"
+    if options.plan:
+        plan = Plan(selection, changed_tests, source_label)
+        if options.json:
+            _print_plan_json(manifest, plan)
+        else:
+            _print_plan(manifest, plan)
+        return 0
 
     _print_selection(selection)
     return execute_selection(root, selection, arguments)

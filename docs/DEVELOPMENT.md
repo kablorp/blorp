@@ -222,6 +222,7 @@ suites and checks:
 ```bash
 scripts/compiler-check --changed
 scripts/compiler-check --changed --base origin/main
+scripts/compiler-check --changed --plan
 scripts/compiler-check --stage typecheck
 scripts/compiler-check blorp/test/compiler/stage_06_typecheck/type_system/test_env.brp
 scripts/compiler-check --validate-manifest
@@ -230,6 +231,9 @@ scripts/compiler-check --validate-manifest
 Use `--changed` during iteration and the relevant stage before integrating a
 cross-module compiler change. The command complements broad integration gates;
 it does not replace them.
+Use `--plan` when you need the exact focused commands and manifest-owned
+broad-gate recommendation before spending build time. Plan mode is read-only,
+and an empty plan is a no-op explanation rather than validation.
 
 ## Repository Test Gates
 
