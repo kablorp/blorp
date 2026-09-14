@@ -49,6 +49,8 @@ scripts/compiler-check blorp/test/compiler/pipeline/test_type_header_graph.brp
 scripts/compiler-check --stage typecheck
 scripts/compiler-check --changed
 scripts/compiler-check --changed --base origin/main
+scripts/compiler-check --changed --plan
+scripts/compiler-check --validate-manifest
 ```
 
 An exact suite path runs only that registered suite. Stage and changed-source
@@ -57,6 +59,12 @@ selection come from
 owners from names, imports, timings, or previous failures. `--changed` includes
 staged, unstaged, and untracked production compiler sources, while `--base`
 also includes committed changes from the merge base with the named ref.
+
+Add `--plan` to print the selected production sources, focused suites, special
+checks, exact focused commands, and manifest-owned broad-gate recommendations
+without building, running tests, creating logs, or writing generated files. A
+plan that selects nothing is a no-op explanation, not a passing validation; use
+the task-specific build, docs, or release checks for those changes.
 
 The command prints the selected sources, suites, and special checks before it
 prepares the compiler once. Suites then use `bin/blorp test`, and registered gate
