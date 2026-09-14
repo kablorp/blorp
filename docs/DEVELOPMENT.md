@@ -1,9 +1,8 @@
 # Blorp Developer Guide
 
-This guide is the practical entry point for developing Blorp itself. It covers
-the language toolchain, the self-hosted compiler, tests, diagnostics, generated
-artifacts, memory checks, and performance measurement. It is written for both
-human developers and automated coding agents.
+This guide supplies commands and investigation recipes for the self-hosted
+compiler. [`AGENTS.md`](../AGENTS.md) owns engineering rules;
+[`scripts/README.md`](../scripts/README.md) owns test-gate details.
 
 Commands in this guide run from the repository root unless stated otherwise.
 Use the repository's `bin/blorp` executable, not a separately installed release,
@@ -11,24 +10,10 @@ when validating a source checkout.
 
 ## Sources Of Truth
 
-Start with the narrowest relevant source:
-
-- [`AGENTS.md`](../AGENTS.md) defines repository-wide engineering rules and
-  language principles.
-- [`blorp/README.md`](../blorp/README.md) explains the compiler stages,
-  build, and source layout.
-- [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) defines phase ownership and the
-  exact Core pipeline.
-- This guide defines test locations, gate terminology, and fixture conventions.
-- [`scripts/README.md`](../scripts/README.md) documents test and validation
-  scripts.
-- [`benchmarks/README.md`](../benchmarks/README.md) documents benchmark
-  harnesses and their controls.
-- `bin/blorp <command> --help` is authoritative for public CLI flags.
-
-When documentation, tests, and implementation disagree, verify the current
-implementation and tests first, then update stale documentation in the same
-change.
+Start at the task boundary routed by [`AGENTS.md`](../AGENTS.md). For compiler
+phase ownership use [Architecture](ARCHITECTURE.md); for test-gate semantics
+use [`scripts/README.md`](../scripts/README.md); for benchmark arguments use
+[`benchmarks/README.md`](../benchmarks/README.md). CLI help owns current flags.
 
 ## Prerequisites
 
@@ -74,19 +59,12 @@ bin/blorp test --warmup-only
 4. Compile the current compiler sources to C.
 5. Compile and install the resulting executable as `bin/blorp`.
 
-Use these build targets during development:
+Useful build targets:
 
 ```bash
 make                              # Build and install bin/blorp
 make generate-blorp-cli-c         # Generate the compiler C with the pinned compiler
-make prepare-blorp-cli-c          # Generate every C input and native input manifest
-make compile-prepared-blorp-cli   # Compile prepared inputs with the host C compiler
-make install-prepared-blorp-cli   # Install an already compiled compiler artifact
-make compile-blorp-cli            # Compile and link the generated compiler C
-make build-blorp-cli              # Build the compiler CLI artifact
-make warm                         # Build and warm the formatter cache
 make clean                        # Remove generated build products
-make                              # Clean rebuild after make clean
 ```
 
 Run `make` after changing compiler source before using `bin/blorp` to validate
@@ -94,87 +72,12 @@ self-host behavior. A source file can pass with an older executable while the
 new compiler fails to build itself, so the executable timestamp and build
 status matter.
 
-## Repository Map
-
-The primary development areas are:
-
-```text
-blorp/src/compiler/    Self-hosted compiler, split into numbered stages
-blorp/test/compiler/   Compiler suites and public compiler fixtures
-blorp/benchmark/compiler/   Compiler-specific benchmark fixtures and workers
-blorp/src/lib/runtime/native/          C runtime and native declarations
-blorp/tool/        Deterministic build-time source generators
-standard_library/src/  Portable standard-library sources
-standard_library/test/ Standard-library runtime TestSuites
-pkg/                   Optional native-backed packages
-blorp/test/{format,purify,lint}/  Public command fixtures
-blorp/test/runtime/      Language and runtime TestSuites
-blorp/test/lsp/             Native LSP process and protocol tests
-scripts/               Build, test, CI, hygiene, and release helpers
-benchmarks/            Benchmark runners, documentation, and results
-docs/                  Maintained language and implementation references
-```
-
-The high-level compiler flow is:
-
-```text
-lex -> parse -> module load -> infer/typecheck -> Core lower -> Core passes
-    -> ownership/closure/resource preparation -> C emission -> host C compiler
-```
-
-Do not move validation into a later phase merely because that phase has the
-data at hand. Use [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) to identify the
-owner of a new rule or transformation.
-
 ## Daily Development Loop
 
-A reliable narrow loop is:
-
-1. Read the implementation, nearby tests, and local precedent.
-2. Define the fastest feedback loop for the behavior or cost being changed.
-3. Add or identify a test that fails for the intended reason.
-4. Make one coherent change.
-5. Format and typecheck the changed source.
-6. Run the smallest behavior test or measurement that proves the change.
-7. Inspect generated Core or C when the change crosses those boundaries.
-8. Run manifest-owned compiler checks or the relevant broad gate.
-9. Get a code review and a test-evidence review.
-10. Record rough edges and measured performance claims.
-
-The feedback loop is part of the task design, not an afterthought. It should be
-fast enough to run after each coherent edit and narrow enough that a failure
-points back to the change under development. Useful forms include:
-
-- a properly scoped unit or regression test;
-- a tiny standalone reproduction under `scratch/`;
-- a custom fixture or harness that tightly isolates one compiler phase, pass,
-  ownership pattern, or runtime operation;
-- a checked-in benchmark wrapper with setup outside its measurement window;
-  and
-- a reusable profiling or sampling command that can be repeated against the
-  same workload.
-
-Do not repeatedly run end-to-end compilation or a broad test gate when a
-narrower boundary can answer the current question. Conversely, a focused
-harness does not replace final integration coverage. Use the narrow loop while
-iterating, then run the relevant broad checks once the implementation is
-stable.
-
-Sometimes the shortest route to a clean main change is a small preparatory
-refactor. Make that easy change first when it exposes the correct boundary,
-removes incidental branching or wrappers, or lets the main implementation be
-mechanical. Keep the preparation semantics-preserving and independently
-verifiable. If it expands beyond a bounded change, adds a new architecture, or
-becomes larger than the original task, stop and reassess rather than allowing
-the prerequisite to consume the workstream.
-
-Development friction is useful information. Surface confusing ownership
-behavior, missing instrumentation, slow gates, awkward APIs, stale docs, and
-suspected compiler defects as soon as they become relevant. Include the effect
-on the task and a concrete, bounded remedy when one is apparent. This keeps a
-local workaround from becoming invisible maintenance debt.
-
-Typical commands:
+Use the one-boundary loop from [`AGENTS.md`](../AGENTS.md): establish a failing
+test or baseline, iterate with the smallest repeatable check, then run the
+appropriate ownership and broad gates. For a changed compiler source, a
+typical loop is:
 
 ```bash
 bin/blorp format --check --diff path/to/changed.brp
@@ -252,61 +155,21 @@ when available; otherwise track repeated file reads, truncated outputs, time
 to first relevant result, and reviewer follow-up questions. Use a parser
 diagnostic, a Core optimization, and a build change as different pilot tasks.
 
-## Running Blorp Programs
-
-Given this file:
-
-```blorp
-func main(args: List[String]) -> Int:
-	print("hello from blorp")
-	0
-```
-
-the common workflows are:
+## Common CLI Operations
 
 ```bash
-bin/blorp check --no-format /tmp/hello.brp
-bin/blorp run --no-format /tmp/hello.brp
-bin/blorp run --release --no-format /tmp/hello.brp
-bin/blorp run --timeout 10 --no-format /tmp/hello.brp -- first second
-bin/blorp compile --no-format -o /tmp/hello.c /tmp/hello.brp
+bin/blorp check --no-format program.brp
+bin/blorp run --no-format program.brp
+bin/blorp compile --no-format -o /tmp/program.c program.brp
+bin/blorp format --check --diff program.brp
+bin/blorp purify --dry-run program.brp
+bin/blorp lint --fail-on-findings program.brp
 ```
 
-`run --release` compiles generated C with `-O2`. Development runs use the
-normal non-release host-C configuration so failures remain easier to inspect.
-Use `blorp run` for executable behavior; a raw `cc` command must reproduce the
-platform, feature, wrapping-integer, include, and link flags selected by the
-compiler and is therefore not a portable substitute.
-
-Useful environment controls include:
-
-```bash
-BLORP_STD=standard_library/src bin/blorp check --no-format program.brp
-BLORP_TIMEOUT=30 bin/blorp run --no-format program.brp
-BLORP_THREADS=4 bin/blorp run --no-format program.brp
-BLORP_NO_FORMAT=1 bin/blorp check program.brp
-```
-
-Run `bin/blorp --help` for the complete current environment-variable list.
-
-## Formatting, Purity, And Lint
-
-```bash
-bin/blorp format path/to/file.brp
-bin/blorp format --check path/to/file.brp
-bin/blorp format --check --diff blorp/src/compiler/stage_06_typecheck/
-
-bin/blorp purify --dry-run path/to/file.brp
-bin/blorp purify --verbose path/to/file.brp
-
-bin/blorp lint path/to/file.brp
-bin/blorp lint --format json path/to/file.brp
-bin/blorp lint --fail-on-findings blorp/src/compiler/
-bin/blorp lint --disable RULE_ID path/to/file.brp
-```
-
-`lint` typechecks the complete import graph but reports findings only for the
-selected files. It never rewrites source.
+Use `bin/blorp <command> --help` for current flags and environment controls.
+`run` uses the compiler's host-C flags; a raw `cc` invocation is not a
+portable substitute. `lint` typechecks the import graph but reports only for
+selected files and does not rewrite source. See [Lint](LINT.md) for rule IDs.
 
 ## Test Placement
 
@@ -333,21 +196,11 @@ the ownership rules above before adding public fixtures there.
 
 ## Focused Tests
 
-Run one or more Blorp TestSuite files directly:
+Run the smallest relevant TestSuite directly:
 
 ```bash
 bin/blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/type_system/test_env.brp
-bin/blorp test --timeout 180 \
-  blorp/test/compiler/stage_06_typecheck/test_typecheck_state.brp \
-  blorp/test/compiler/stage_06_typecheck/test_typecheck_decl.brp
-bin/blorp test --repeat 3 blorp/test/runtime/types/test_struct.brp
-```
-
-Run a doctest or a directory suite:
-
-```bash
 bin/blorp test --doc standard_library/src/string.brp
-bin/blorp test --suite --timeout 240 standard_library/test/list/
 ```
 
 Exercise instrumentation at the smallest relevant boundary:
@@ -355,8 +208,6 @@ Exercise instrumentation at the smallest relevant boundary:
 ```bash
 bin/blorp test --leak-check --timeout 180 blorp/test/compiler/stage_09_core/test_core_perceus.brp
 bin/blorp test --sanitize --timeout 180 blorp/test/compiler/stage_10_backend/test_core_emit.brp
-bin/blorp test --sanitize=undefined --timeout 180 path/to/fiber_test.brp
-bin/blorp test --profile --timeout 180 path/to/test.brp
 ```
 
 On Darwin, use `--sanitize=undefined` when AddressSanitizer is incompatible
@@ -382,45 +233,19 @@ it does not replace them.
 
 ## Repository Test Gates
 
-The main test entrypoint is `scripts/test`:
+The main test entrypoint is `scripts/test`. Gate composition, timeouts, and
+options are maintained in [`scripts/README.md`](../scripts/README.md):
 
 ```bash
 scripts/test                    # Default local gate set
 scripts/test compiler-blorp     # Compiler .brp suites and public check fixtures
-scripts/test compiler-tools     # Formatter, purify, and lint fixtures
-scripts/test std-check          # Broad standard-library source typecheck sweep
 scripts/test runtime            # Language, std, and package runtime tests
-scripts/test leak               # Ownership and leak checks
-scripts/test doctest            # Standard-library doctests
-scripts/test cli                # CLI smoke and exit-code checks
-scripts/test lsp                # Native LSP protocol tests
-scripts/test package            # Package lifecycle tests
-scripts/test compiler-blorp runtime
+scripts/test --no-build --log-dir /tmp/blorp-gates compiler-blorp
 ```
 
-Control execution and output with:
-
-```bash
-scripts/test --serial
-scripts/test --no-build compiler-blorp
-scripts/test --timings runtime
-scripts/test --verbose compiler-blorp
-scripts/test --log-dir logs compiler-blorp runtime
-```
-
-The runner is intentionally quiet on success. `--log-dir` is generally more
-useful than `--verbose` for a long gate because it preserves complete output
-without flooding the terminal.
-
-Every gate reports a machine-readable summary:
-
-```text
-BLORP_GATE_RESULT gate=<gate> status=<PASS|FAIL> passed=<n> failed=<n> tests=<n>
-```
-
-If a parent runner reports an invalid structured result, find the earlier child
-failure first. The invalid summary is usually a consequence, not the root
-cause.
+The runner is quiet on success. `--log-dir` keeps full output off the
+conversation; inspect the first child failure when a parent summary is
+invalid.
 
 ## Reproducing CI
 
@@ -629,32 +454,10 @@ distinguish local cost, cumulative cost, and scaling.
 ## Compiler Benchmarks
 
 Compiler benchmark wrappers live in `benchmarks/`; fixtures and workers live in
-`blorp/benchmark/compiler/`. Read the corresponding section of
-[`benchmarks/README.md`](../benchmarks/README.md) before running one because the
-positional controls and measurement windows differ.
-
-Representative commands include:
-
-```bash
-benchmarks/compiler_typecheck_profile 2 2 64 128
-benchmarks/compiler_typecheck_phase_profile headers 20 8 32 64 4
-benchmarks/compiler_import_graph_profile 3 30 32 20 fallback
-benchmarks/compiler_module_binding_profile 100 64 16
-benchmarks/compiler_core_flatten_profile aliases 10 128 4
-benchmarks/compiler_scope_construction_profile 20 256 64
-```
-
-Most wrappers build a content-addressed benchmark executable. When the
-workspace compiler is already current, the documented skip-build control can
-shorten repeated runs:
-
-```bash
-BLORP_COMPILER_BENCHMARK_SKIP_BUILD=1 \
-  benchmarks/compiler_core_flatten_profile aliases 10 128 4
-```
-
-Do not use skip-build controls unless the executable and all imported sources
-are known to match the source revision being measured.
+`blorp/benchmark/compiler/`. Use the exact arguments and measurement window in
+[`benchmarks/README.md`](../benchmarks/README.md). Its skip-build controls are
+valid only when the executable and all imported sources match the revision
+being measured.
 
 ## Production Typecheck Replay
 
@@ -786,49 +589,6 @@ Allocation reduction is useful evidence, but lower allocation count does not
 guarantee lower latency or RSS. Persistent indexes, larger objects, hashing,
 and worse locality can reduce allocation calls while slowing the compiler.
 
-## Working By Compiler Area
-
-### Parser, Syntax, And Formatting
-
-- Update parser tests first.
-- Keep `docs/GRAMMAR.md`, `docs/GUIDE.md`, and formatter behavior synchronized.
-- Test both accepted and rejected syntax when both are meaningful.
-- Run `scripts/test compiler-tools` for formatter or purify changes.
-
-### Inference And Typechecking
-
-- Start with focused suites in `blorp/test/compiler/`.
-- Use `--dump-typed-ast` for source-level shape and captured replay for graph
-  performance.
-- Preserve diagnostic order, ambiguity behavior, identity, and recovery paths.
-- Profile call counts and scaling before adding caches or indexes.
-
-### Core Passes
-
-- Read `blorp/src/compiler/stage_09_core/pipeline.brp` and
-  `pipeline_stage.brp` before changing pass order or ownership.
-- Dump Core immediately before and after the affected pass.
-- Use `--check-invariants` and the stage's focused tests.
-- Run `scripts/test compiler-core-sanitize` for broad ownership-sensitive
-  changes.
-
-### Backend And Runtime
-
-- Add a focused emitter/runtime regression first.
-- Compile a public fixture and inspect generated C.
-- Run host-C syntax/warning checks.
-- Run leak and sanitizer modes.
-- Use the codegen audit for warning and unsupported-emission regressions.
-
-### CLI And LSP
-
-- Preserve exit codes, structured output, and process cleanup.
-- Use `scripts/test cli`, `scripts/test lsp`, and the focused Python tests under
-  `blorp/test/lsp/`.
-- Keep temporary directories independent of a pre-existing repository-local
-  `scratch/` directory.
-- Verify shutdown kills child process groups and leaves no background server.
-
 ## Generated Files And Cleanup
 
 `bin/blorp test` and `bin/blorp run` use system temporary directories and clean up
@@ -907,54 +667,6 @@ medians. If pair direction changes repeatedly, treat latency as inconclusive and
 use deterministic work counters or allocation changes only as supporting
 evidence.
 
-## Before Committing
-
-Use a checklist proportional to the change:
-
-```bash
-bin/blorp format --check --diff <changed .brp files>
-bin/blorp check --no-format <changed production .brp files>
-bin/blorp test --timeout 180 <focused suites>
-scripts/compiler-check --changed
-git diff --check
-git status --short
-```
-
-Also confirm:
-
-- The regression failed before the implementation and passes after it.
-- Error-message tests check the expected text.
-- Generated Core/C was inspected when applicable.
-- Performance claims have baseline/candidate evidence.
-- Documentation reflects user-visible or architectural changes.
-- A code reviewer and test-evidence reviewer found no unresolved issue.
-- No generated artifact or unrelated edit is included.
-- Rough edges and deferred follow-ups are recorded explicitly.
-
-Run the broader gate required by the blast radius before merging. For a preview
-release, follow [`Preview Validation`](RELEASES.md#preview-validation),
-including its separate package lifecycle gate.
-
-## Command Reference
-
-The shortest useful command map is:
-
-```bash
-make                                      # Build bin/blorp
-bin/blorp --help                            # List public commands
-bin/blorp <command> --help                  # Current flags
-bin/blorp check --no-format file.brp        # Frontend/typecheck only
-bin/blorp compile --no-format file.brp      # Generate C
-bin/blorp run --no-format file.brp          # Compile and execute
-bin/blorp test file.brp                     # Run a TestSuite
-bin/blorp format --check --diff file.brp    # Check formatting
-bin/blorp lint --fail-on-findings file.brp  # Typed lint gate
-scripts/compiler-check --changed          # Focused compiler ownership gate
-scripts/test --log-dir logs               # Default repository gates
-scripts/test --timings runtime            # CI-shaped phase timing
-bin/blorp compile --time-phases file.brp    # Compiler phase timing
-bin/blorp run --profile file.brp            # Function profile
-```
-
-Use the linked subsystem documents for deeper contracts, but use this guide to
-choose the first command and the evidence needed to finish a change.
+Before committing, follow the review and validation rules in
+[`AGENTS.md`](../AGENTS.md). For a preview release, use the separate
+[`Preview Validation`](RELEASES.md#preview-validation) gate.

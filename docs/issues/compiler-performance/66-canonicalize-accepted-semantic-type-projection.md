@@ -2,10 +2,11 @@
 
 **Status:** Measurement-gated after Issues 62-65
 
-**Roadmap:** [Stage 06 Latency Reduction Roadmap](STAGE06_LATENCY_REDUCTION_ROADMAP.md)
-
 **Dependencies:** Issues 62 through 65; refresh the production profile before
 admitting an implementation
+
+**Sequence:** Decide this admission-gated projection issue before reassessing
+[residual CTFE lookup](67-index-remaining-ctfe-environment-lookup.md).
 
 **Primary owners:**
 

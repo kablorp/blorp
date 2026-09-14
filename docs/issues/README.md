@@ -63,7 +63,6 @@ current-state and next-action summary.
 - [CTFE environment lookup, measurement gated](compiler-performance/67-index-remaining-ctfe-environment-lookup.md)
 - [Step 2e visibility convergence](compiler-performance/94-step2e-visibility-convergence.md)
 - [Step 2e width-probe resource gate](compiler-performance/97-bound-visibility-width-probe.md)
-- [Stage 06 latency roadmap](compiler-performance/STAGE06_LATENCY_REDUCTION_ROADMAP.md)
 - [Normalized semantic compilation roadmap](compiler-performance/NORMALIZED_SEMANTIC_COMPILATION_ROADMAP.md)
 - [Perceus ownership roadmap](compiler-performance/PERCEUS_OWNERSHIP_OPTIMIZATION_ROADMAP.md)
 - [Nested record allocation folding prototype](compiler-performance/NESTED_RECORD_FOLDING_PROTOTYPE_ROADMAP.md)

@@ -2,10 +2,9 @@
 
 **Status:** Measurement-gated after Issue 66
 
-**Roadmap:** [Stage 06 Latency Reduction Roadmap](STAGE06_LATENCY_REDUCTION_ROADMAP.md)
-
-**Dependencies:** Issue 64. Follow the roadmap's serial measurement order and
-recount after the Issue 66 decision.
+**Dependencies:** Issue 64. Recount after the
+[accepted semantic-type projection decision](66-canonicalize-accepted-semantic-type-projection.md)
+so the two performance effects can be attributed separately.
 
 **Primary owners:**
 
@@ -45,8 +44,9 @@ dependency globals for multiple artifacts. Issue 64 should eliminate many
 requests entirely. Optimizing the old request count would risk paying index
 storage and update costs for work that no longer exists.
 
-Refresh the function counts and whole-check share after Issue 64 and the later
-roadmap checkpoints. Admit implementation only if residual binding scans still
+Refresh the function counts and whole-check share after Issue 64 and the
+[Issue 66 decision](66-canonicalize-accepted-semantic-type-projection.md).
+Admit implementation only if residual binding scans still
 account for at least 1% of whole-check retired instructions or allocations.
 
 ## Current Semantics
@@ -336,8 +336,11 @@ scripts/compiler-check --stage typecheck
 scripts/test leak
 ```
 
-Finally run five alternating optimized compiler self-check pairs using the
-roadmap protocol.
+Finally run five alternating optimized compiler self-check pairs. Build
+baseline and candidate with the same bootstrap and optimization level, use
+the same source input, retain raw samples, and require identical successful
+outputs. Follow the [Developer Guide](../../DEVELOPMENT.md#production-typecheck-replay)
+for provenance and paired-measurement controls.
 
 ## Measurable Acceptance Criteria
 
