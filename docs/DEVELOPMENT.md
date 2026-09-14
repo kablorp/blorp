@@ -67,10 +67,10 @@ make generate-blorp-cli-c         # Generate the compiler C with the pinned comp
 make clean                        # Remove generated build products
 ```
 
-Run `make` after changing compiler source before using `bin/blorp` to validate
-self-host behavior. A source file can pass with an older executable while the
-new compiler fails to build itself, so the executable timestamp and build
-status matter.
+Run `make` after a coherent compiler source edit, then use
+`scripts/compiler-build-status` before direct `bin/blorp` validation. A source
+file can pass with an older executable while the new compiler fails to build
+itself, so the local binary's recorded content identity must be fresh.
 
 ## Daily Development Loop
 
@@ -80,12 +80,19 @@ appropriate ownership and broad gates. For a changed compiler source, a
 typical loop is:
 
 ```bash
+make
+scripts/compiler-build-status
 bin/blorp format --check --diff path/to/changed.brp
 bin/blorp check --no-format path/to/changed.brp
 bin/blorp test --timeout 180 blorp/test/compiler/test_relevant_behavior.brp
 scripts/compiler-check --changed
 git diff --check
 ```
+
+`scripts/compiler-build-status --quiet` exits 0 for proven fresh, 1 for known
+stale inputs, and 2 when provenance is missing or unverifiable. Use it after
+`make` in direct-test loops; `scripts/compiler-check` still prepares the
+compiler itself.
 
 Use `--no-format` in diagnostic and performance commands after a separate
 format check. This keeps formatting work out of the behavior or timing window.

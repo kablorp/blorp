@@ -90,7 +90,6 @@ current-state and next-action summary.
 
 ### Agent Development Workflow
 
-- [Local compiler build freshness](agent-workflow/03-report-current-compiler-build-freshness.md)
 - [Reproducible validation evidence](agent-workflow/05-capture-reproducible-validation-evidence.md)
 
 ### Runtime, Core, And Focused Cleanup
