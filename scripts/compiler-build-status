@@ -1,0 +1,648 @@
+#!/usr/bin/env python3
+"""Report whether bin/blorp matches the current compiler build inputs."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import platform
+import shutil
+import stat
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+
+BUILD_DIR = Path("blorp/build/_build/blorp-cli")
+INSTALLED_BIN = Path("bin/blorp")
+BUILD_BIN = BUILD_DIR / "blorp"
+GENERATED_C = BUILD_DIR / "blorp_cli_main.c"
+RUNTIME_SOURCES_C = BUILD_DIR / "runtime_sources.c"
+LSP_NATIVE_RUNTIME_C = Path("blorp/src/lsp/server/native_runtime.c")
+STANDARD_LIBRARY_SOURCE_ROOT = Path("standard_library/src")
+BOOTSTRAP_SCRIPT = Path("scripts/blorp-compiler-bootstrap")
+MANIFEST_TOOL = Path("scripts/blorp-cli-embedded-manifest")
+BUILD_SOURCE_GENERATOR_SOURCE = Path("blorp/tool/generate_build_sources.brp")
+BUILD_VERSION = Path("blorp/build/VERSION")
+MINICORO_H = Path("blorp/src/lib/runtime/native/minicoro.h")
+RUNTIME_C = Path("blorp/src/lib/runtime/native/runtime.c")
+RUNTIME_DECL_C = Path("blorp/src/lib/runtime/native/runtime_decl.c")
+BUILD_INFO_SOURCE = Path("blorp/src/compiler/stage_01_generated_inputs/compiler_build_info.brp")
+
+GENERATED_C_BUILD_INPUT_MANIFEST = BUILD_DIR / "generated-c-build-inputs.sha256"
+GENERATED_C_INPUT_HASH = BUILD_DIR / "generated-c-inputs.sha256"
+GENERATED_C_HASH = BUILD_DIR / "blorp_cli_main.c.sha256"
+BUILD_INPUT_MANIFEST = BUILD_DIR / "build-inputs.sha256"
+BUILD_INPUT_HASH = BUILD_DIR / "inputs.sha256"
+BUILD_BIN_HASH = BUILD_DIR / "blorp.sha256"
+INSTALL_INPUT_MANIFEST = BUILD_DIR / "install-inputs.sha256"
+INSTALLED_INPUT_MANIFEST = BUILD_DIR / "embedded-inputs.sha256"
+
+COMPILER_FINGERPRINT_PREFIX = "blorp-sha256 "
+SHA256_HEX_LENGTH = 64
+
+
+class StatusError(Exception):
+	pass
+
+
+@dataclass(frozen=True)
+class StatusResult:
+	state: str
+	reason: str
+	detail: str = ""
+
+	@property
+	def exit_code(self) -> int:
+		if self.state == "FRESH":
+			return 0
+		if self.state == "STALE":
+			return 1
+		return 2
+
+
+def sha256_bytes(data: bytes) -> str:
+	return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+	digest = hashlib.sha256()
+	with path.open("rb") as source:
+		for chunk in iter(lambda: source.read(1024 * 1024), b""):
+			digest.update(chunk)
+	return digest.hexdigest()
+
+
+def require_file(path: Path) -> None:
+	if not path.is_file():
+		raise StatusError(f"missing file: {path}")
+
+
+def require_executable(path: Path) -> None:
+	require_file(path)
+	if not (path.stat().st_mode & stat.S_IXUSR):
+		raise StatusError(f"not executable: {path}")
+
+
+def one_line_digest(path: Path) -> str:
+	require_file(path)
+	text = path.read_text(encoding="utf-8")
+	if not text.endswith("\n") or text.count("\n") != 1:
+		raise StatusError(f"invalid SHA-256 file: {path}")
+	digest = text[:-1]
+	if len(digest) != SHA256_HEX_LENGTH or any(c not in "0123456789abcdef" for c in digest):
+		raise StatusError(f"invalid SHA-256 file: {path}")
+	return digest
+
+
+def sorted_paths(paths: Iterable[Path | str]) -> list[str]:
+	normalized: set[str] = set()
+	for path in paths:
+		text = str(path)
+		if not text:
+			continue
+		if "\n" in text or "\r" in text:
+			raise StatusError("input path contains a newline")
+		normalized.add(text)
+	return sorted(normalized)
+
+
+def resolve_input(root: Path, recorded_path: str) -> Path:
+	path = Path(recorded_path)
+	return path if path.is_absolute() else root / path
+
+
+def input_manifest_bytes(root: Path, paths: Iterable[Path | str]) -> bytes:
+	records = []
+	for recorded_path in sorted_paths(paths):
+		path = resolve_input(root, recorded_path)
+		require_file(path)
+		records.append(f"{sha256_file(path)}  {recorded_path}\n")
+	if not records:
+		raise StatusError("input manifest has no inputs")
+	return "".join(records).encode("utf-8")
+
+
+def parse_input_manifest(data: bytes, path: Path) -> dict[str, str]:
+	try:
+		text = data.decode("utf-8")
+	except UnicodeDecodeError as error:
+		raise StatusError(f"invalid input manifest: {path}") from error
+	if not text or not text.endswith("\n"):
+		raise StatusError(f"invalid input manifest: {path}")
+	records: dict[str, str] = {}
+	previous: str | None = None
+	for line in text.splitlines():
+		digest, separator, recorded_path = line.partition("  ")
+		if (
+			separator != "  "
+			or len(digest) != SHA256_HEX_LENGTH
+			or any(c not in "0123456789abcdef" for c in digest)
+			or not recorded_path
+			or (previous is not None and recorded_path <= previous)
+		):
+			raise StatusError(f"invalid input manifest: {path}")
+		records[recorded_path] = digest
+		previous = recorded_path
+	return records
+
+
+def changed_manifest_entry(expected: bytes, actual: bytes, path: Path) -> str:
+	expected_records = parse_input_manifest(expected, path)
+	actual_records = parse_input_manifest(actual, path)
+	for recorded_path in sorted(expected_records):
+		if recorded_path not in actual_records:
+			return f"{recorded_path} is a new build input"
+		if actual_records[recorded_path] != expected_records[recorded_path]:
+			return f"{recorded_path} changed"
+	for recorded_path in sorted(actual_records):
+		if recorded_path not in expected_records:
+			return f"{recorded_path} is no longer a build input"
+	return f"{path} changed"
+
+
+def hash_lines(*lines: str) -> str:
+	return sha256_bytes(("".join(f"{line}\n" for line in lines)).encode("utf-8"))
+
+
+def recipe_hash(root: Path, start: str, end: str) -> str:
+	makefile = root / "Makefile"
+	require_file(makefile)
+	lines = makefile.read_text(encoding="utf-8").splitlines(True)
+	capturing = False
+	selected: list[str] = []
+	for line in lines:
+		if line.startswith(start):
+			capturing = True
+		if capturing:
+			selected.append(line)
+		if capturing and line.startswith(end):
+			break
+	if not selected or not selected[-1].startswith(end):
+		raise StatusError(f"could not find Makefile recipe section: {start}")
+	return sha256_bytes("".join(selected).encode("utf-8"))
+
+
+def blorp_string_literal(value: str) -> str:
+	escaped = '"'
+	for character in value:
+		codepoint = ord(character)
+		if character == '"':
+			escaped += '\\"'
+		elif character == "\\":
+			escaped += "\\\\"
+		elif character == "\n":
+			escaped += "\\n"
+		elif character == "\r":
+			escaped += "\\r"
+		elif character == "\t":
+			escaped += "\\t"
+		elif character == "{":
+			escaped += "\\{"
+		elif character == "}":
+			escaped += "\\}"
+		elif codepoint < 32 or codepoint == 127:
+			escaped += "\\u{" + format(codepoint, "x") + "}"
+		else:
+			escaped += character
+	return escaped + '"'
+
+
+def build_version(root: Path) -> str:
+	require_file(root / BUILD_VERSION)
+	text = (root / BUILD_VERSION).read_text(encoding="utf-8")
+	lines = text.split("\n")
+	if len(lines) == 2 and lines[1] == "":
+		version = lines[0]
+	elif len(lines) == 1:
+		version = lines[0]
+	else:
+		raise StatusError(f"invalid build version file: {BUILD_VERSION}")
+	if not version:
+		raise StatusError(f"invalid build version file: {BUILD_VERSION}")
+	return version
+
+
+def generated_build_info_lines(root: Path) -> dict[str, str]:
+	require_file(root / BUILD_INFO_SOURCE)
+	prefixes = {
+		"version": "VERSION: String = ",
+		"description": "VERSION_DESCRIPTION: String = ",
+	}
+	found: dict[str, str] = {}
+	for line in (root / BUILD_INFO_SOURCE).read_text(encoding="utf-8").splitlines():
+		for name, prefix in prefixes.items():
+			if line.startswith(prefix):
+				found[name] = line.removeprefix(prefix)
+	for name in prefixes:
+		if name not in found:
+			raise StatusError(f"generated build info is missing {prefixes[name].strip()}: {BUILD_INFO_SOURCE}")
+	return found
+
+
+def expected_build_info(root: Path) -> dict[str, str]:
+	source_version = build_version(root)
+	version = os.environ.get("BLORP_BUILD_VERSION", "") or source_version
+	commit = os.environ.get("BLORP_BUILD_COMMIT", "unknown")
+	target = os.environ.get("BLORP_BUILD_TARGET", "unknown")
+	channel = os.environ.get("BLORP_BUILD_CHANNEL", "local")
+	dirty = os.environ.get("BLORP_BUILD_DIRTY", "unknown")
+	description = (
+		f"blorp {version}\n"
+		f"commit: {commit}\n"
+		f"target: {target}\n"
+		f"channel: {channel}\n"
+		f"dirty: {dirty}\n"
+		"std: embedded, hash "
+	)
+	return {
+		"version": blorp_string_literal(version),
+		"description": blorp_string_literal(description) + " + embedded_std_digest",
+	}
+
+
+def find_files(root: Path, directory: Path, suffix: str) -> list[Path]:
+	full_directory = root / directory
+	if not full_directory.is_dir():
+		return []
+	return [
+		path.relative_to(root)
+		for path in full_directory.rglob(f"*{suffix}")
+		if path.is_file()
+	]
+
+
+def resolve_bootstrap_compiler(root: Path) -> str:
+	override = os.environ.get("BLORP_BOOTSTRAP_COMPILER_BIN", "")
+	if override:
+		bootstrap = Path(override)
+		if not bootstrap.is_absolute():
+			resolved = shutil.which(override)
+			if resolved is None:
+				raise StatusError(f"bootstrap compiler not found on PATH: {override}")
+			bootstrap = Path(resolved)
+		require_executable(bootstrap)
+		return str(bootstrap.resolve())
+
+	# A read-only status command must not call scripts/blorp-compiler-bootstrap
+	# because --print-path can populate the download cache. Resolve exactly the
+	# configured cache key and verify its marker in place.
+	cache_root = os.environ.get("BLORP_COMPILER_BOOTSTRAP_CACHE_DIR")
+	if not cache_root:
+		cache_root = str(Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "blorp/compiler-bootstrap")
+	bootstrap = read_bootstrap_configuration(root)
+	target = bootstrap_target()
+	artifact_sha = bootstrap_sha_for_target(bootstrap, target)
+	install_dir = Path(cache_root) / bootstrap["BLORP_BOOTSTRAP_TAG"] / bootstrap["BLORP_BOOTSTRAP_LAYOUT"] / target / artifact_sha
+	binary = install_dir / "blorp"
+	marker = install_dir / "MANIFEST"
+	require_executable(binary)
+	require_file(marker)
+	if not bootstrap_marker_matches(marker, binary, bootstrap, target, artifact_sha):
+		raise StatusError(
+			f"cached bootstrap compiler does not match configured pin: {marker}"
+		)
+	return str(binary.resolve())
+
+
+def read_bootstrap_configuration(root: Path) -> dict[str, str]:
+	manifest = root / "blorp/build/bootstrap.env"
+	require_file(manifest)
+	values: dict[str, str] = {}
+	for line in manifest.read_text(encoding="utf-8").splitlines():
+		line = line.strip()
+		if not line or line.startswith("#") or "=" not in line:
+			continue
+		name, value = line.split("=", 1)
+		values[name] = value.strip().strip("'\"")
+	if "BLORP_BOOTSTRAP_REPO" in values:
+		values["BLORP_BOOTSTRAP_REPO"] = os.environ.get(
+			"BLORP_COMPILER_BOOTSTRAP_REPO",
+			values["BLORP_BOOTSTRAP_REPO"],
+		)
+	required = (
+		"BLORP_BOOTSTRAP_REPO",
+		"BLORP_BOOTSTRAP_TAG",
+		"BLORP_BOOTSTRAP_VERSION",
+		"BLORP_BOOTSTRAP_LAYOUT",
+		"BLORP_BOOTSTRAP_SHA256_AARCH64_APPLE_DARWIN",
+		"BLORP_BOOTSTRAP_SHA256_X86_64_UNKNOWN_LINUX_GNU",
+		"BLORP_BOOTSTRAP_SHA256_AARCH64_UNKNOWN_LINUX_GNU",
+	)
+	for name in required:
+		if not values.get(name):
+			raise StatusError(f"bootstrap manifest is missing {name}: blorp/build/bootstrap.env")
+	if values["BLORP_BOOTSTRAP_LAYOUT"] not in {"single", "direct"}:
+		raise StatusError(
+			f"unsupported bootstrap layout: {values['BLORP_BOOTSTRAP_LAYOUT']}"
+		)
+	tag = values["BLORP_BOOTSTRAP_TAG"]
+	version = values["BLORP_BOOTSTRAP_VERSION"]
+	if not is_dev_tag(tag):
+		raise StatusError(f"bootstrap tag must be an immutable dev revision: {tag}")
+	revision = tag.removeprefix("dev-")
+	if not version.endswith(f"-dev.{revision}"):
+		raise StatusError(f"bootstrap version does not match {tag}: {version}")
+	for name in (
+		"BLORP_BOOTSTRAP_SHA256_AARCH64_APPLE_DARWIN",
+		"BLORP_BOOTSTRAP_SHA256_X86_64_UNKNOWN_LINUX_GNU",
+		"BLORP_BOOTSTRAP_SHA256_AARCH64_UNKNOWN_LINUX_GNU",
+	):
+		digest = values[name]
+		if len(digest) != SHA256_HEX_LENGTH or any(c not in "0123456789abcdef" for c in digest):
+			raise StatusError(f"bootstrap manifest contains an invalid SHA-256: {name}")
+	return values
+
+
+def is_dev_tag(tag: str) -> bool:
+	prefix = "dev-"
+	revision_length = 12
+	if not tag.startswith(prefix):
+		return False
+	revision = tag.removeprefix(prefix)
+	return (
+		len(revision) == revision_length
+		and all(c in "0123456789abcdef" for c in revision)
+	)
+
+
+def bootstrap_target() -> str:
+	system = platform.system()
+	machine = platform.machine()
+	if system == "Darwin" and machine == "arm64":
+		return "aarch64-apple-darwin"
+	if system == "Linux" and machine == "x86_64":
+		return "x86_64-unknown-linux-gnu"
+	if system == "Linux" and machine in {"aarch64", "arm64"}:
+		return "aarch64-unknown-linux-gnu"
+	raise StatusError(f"unsupported compiler bootstrap target: {system}/{machine}")
+
+
+def bootstrap_sha_for_target(configuration: dict[str, str], target: str) -> str:
+	key_by_target = {
+		"aarch64-apple-darwin": "BLORP_BOOTSTRAP_SHA256_AARCH64_APPLE_DARWIN",
+		"x86_64-unknown-linux-gnu": "BLORP_BOOTSTRAP_SHA256_X86_64_UNKNOWN_LINUX_GNU",
+		"aarch64-unknown-linux-gnu": "BLORP_BOOTSTRAP_SHA256_AARCH64_UNKNOWN_LINUX_GNU",
+	}
+	try:
+		digest = configuration[key_by_target[target]]
+	except KeyError as error:
+		raise StatusError(f"no bootstrap checksum for target: {target}") from error
+	if len(digest) != SHA256_HEX_LENGTH or any(c not in "0123456789abcdef" for c in digest):
+		raise StatusError(f"invalid bootstrap checksum for target: {target}")
+	return digest
+
+
+def bootstrap_marker_matches(
+	marker: Path,
+	binary: Path,
+	configuration: dict[str, str],
+	target: str,
+	artifact_sha: str,
+) -> bool:
+	records = {}
+	for line in marker.read_text(encoding="utf-8").splitlines():
+		name, separator, value = line.partition("=")
+		if separator:
+			records[name] = value
+	sha_field = "archive_sha256" if configuration["BLORP_BOOTSTRAP_LAYOUT"] == "single" else "artifact_sha256"
+	expected = {
+		"repo": configuration["BLORP_BOOTSTRAP_REPO"],
+		"tag": configuration["BLORP_BOOTSTRAP_TAG"],
+		"version": configuration["BLORP_BOOTSTRAP_VERSION"],
+		"layout": configuration["BLORP_BOOTSTRAP_LAYOUT"],
+		"target": target,
+		sha_field: artifact_sha,
+		"file_sha256_blorp": sha256_file(binary),
+	}
+	return all(records.get(name) == value for name, value in expected.items())
+
+
+def cc_identity(root: Path) -> tuple[str, str]:
+	cc = shutil.which("cc")
+	if cc is None:
+		raise StatusError("C compiler not found on PATH: cc")
+	try:
+		version = subprocess.run(
+			[cc, "--version"],
+			cwd=root,
+			text=True,
+			stdout=subprocess.PIPE,
+			stderr=subprocess.DEVNULL,
+			check=False,
+			timeout=5,
+		).stdout.splitlines()
+	except (OSError, subprocess.SubprocessError) as error:
+		raise StatusError(f"could not read C compiler identity: {cc}") from error
+	first_line = version[0] if version else ""
+	return cc, first_line
+
+
+def runtime_config_hash(root: Path, runtime_optimization: str) -> str:
+	cc_path, cc_version = cc_identity(root)
+	records = [
+		f"{runtime_optimization}\n",
+		"-fwrapv -pipe -w -DMINICORO_IMPL -DBLORP_COMPILER_RUNTIME_SOURCES=1\n",
+		f"{sha256_file(root / MINICORO_H)}  {MINICORO_H}\n",
+		f"{sha256_file(root / RUNTIME_C)}  {RUNTIME_C}\n",
+		f"{sha256_file(root / RUNTIME_DECL_C)}  {RUNTIME_DECL_C}\n",
+		f"{cc_path}\n",
+		f"{cc_version}\n",
+	]
+	return sha256_bytes("".join(records).encode("utf-8"))
+
+
+def generated_c_input_paths(root: Path, bootstrap_compiler: str) -> list[Path | str]:
+	return [
+		*find_files(root, Path("blorp/src"), ".brp"),
+		*find_files(root, STANDARD_LIBRARY_SOURCE_ROOT, ".brp"),
+		bootstrap_compiler,
+		BOOTSTRAP_SCRIPT,
+		MANIFEST_TOOL,
+	]
+
+
+def build_input_paths(root: Path, bootstrap_compiler: str) -> list[Path | str]:
+	return [
+		*find_files(root, Path("blorp/src"), ".brp"),
+		*find_files(root, Path("blorp/src"), ".h"),
+		*find_files(root, STANDARD_LIBRARY_SOURCE_ROOT, ".brp"),
+		bootstrap_compiler,
+		BOOTSTRAP_SCRIPT,
+		MANIFEST_TOOL,
+		RUNTIME_SOURCES_C,
+		LSP_NATIVE_RUNTIME_C,
+		BUILD_SOURCE_GENERATOR_SOURCE,
+		RUNTIME_C,
+		RUNTIME_DECL_C,
+		MINICORO_H,
+	]
+
+
+def verify_manifest_current(
+	root: Path,
+	path: Path,
+	expected: bytes,
+	stale_label: str,
+) -> StatusResult | None:
+	full_path = root / path
+	require_file(full_path)
+	actual = full_path.read_bytes()
+	parse_input_manifest(actual, path)
+	if actual != expected:
+		return StatusResult("STALE", changed_manifest_entry(expected, actual, path), stale_label)
+	return None
+
+
+def verify_hash_file(path: Path, expected: str, unknown_reason: str) -> None:
+	recorded = one_line_digest(path)
+	if recorded != expected:
+		raise StatusError(unknown_reason)
+
+
+def status(root: Path) -> StatusResult:
+	try:
+		require_executable(root / INSTALLED_BIN)
+		require_executable(root / BUILD_BIN)
+		bootstrap_compiler = resolve_bootstrap_compiler(root)
+		expected_build_info_lines = expected_build_info(root)
+		actual_build_info_lines = generated_build_info_lines(root)
+		if actual_build_info_lines != expected_build_info_lines:
+			return StatusResult(
+				"STALE",
+				f"{BUILD_INFO_SOURCE} is stale",
+				f"{BUILD_INFO_SOURCE} is not regenerated",
+			)
+
+		generated_manifest = input_manifest_bytes(
+			root,
+			generated_c_input_paths(root, bootstrap_compiler),
+		)
+		stale = verify_manifest_current(
+			root,
+			GENERATED_C_BUILD_INPUT_MANIFEST,
+			generated_manifest,
+			"compiler C inputs changed",
+		)
+		if stale:
+			return stale
+		generated_input_hash = hash_lines(
+			sha256_bytes(generated_manifest),
+			recipe_hash(
+				root,
+				"# Generate the compiler C separately",
+				"# Prepare every generated C input",
+			),
+		)
+		if one_line_digest(root / GENERATED_C_INPUT_HASH) != generated_input_hash:
+			return StatusResult("STALE", "compiler C input identity changed", "Makefile recipe changed")
+		verify_hash_file(
+			root / GENERATED_C_HASH,
+			sha256_file(root / GENERATED_C),
+			f"generated compiler C hash disagrees with {GENERATED_C_HASH}",
+		)
+
+		build_manifest = input_manifest_bytes(
+			root,
+			build_input_paths(root, bootstrap_compiler),
+		)
+		stale = verify_manifest_current(
+			root,
+			BUILD_INPUT_MANIFEST,
+			build_manifest,
+			"native compiler inputs changed",
+		)
+		if stale:
+			return stale
+
+		cli_optimization = os.environ.get("BLORP_CLI_C_OPTIMIZATION", "-O0")
+		runtime_optimization = os.environ.get("BLORP_CLI_RUNTIME_C_OPTIMIZATION", "-O2")
+		runtime_hash = runtime_config_hash(root, runtime_optimization)
+		binary_input_hash = hash_lines(
+			sha256_bytes(build_manifest),
+			sha256_file(root / GENERATED_C),
+			recipe_hash(
+				root,
+				"# Compile prepared C inputs",
+				"# Preserve the safe all-in-one build path",
+			),
+			cli_optimization,
+			runtime_hash,
+		)
+		if one_line_digest(root / BUILD_INPUT_HASH) != binary_input_hash:
+			return StatusResult(
+				"STALE",
+				"native compiler build identity changed",
+				f"BLORP_CLI_C_OPTIMIZATION={cli_optimization}; "
+				f"BLORP_CLI_RUNTIME_C_OPTIMIZATION={runtime_optimization}",
+			)
+		verify_hash_file(
+			root / BUILD_BIN_HASH,
+			sha256_file(root / BUILD_BIN),
+			f"built compiler hash disagrees with {BUILD_BIN_HASH}",
+		)
+
+		install_manifest = input_manifest_bytes(
+			root,
+			[BUILD_INPUT_HASH, BUILD_BIN_HASH],
+		)
+		stale = verify_manifest_current(
+			root,
+			INSTALL_INPUT_MANIFEST,
+			install_manifest,
+			"installed compiler inputs changed",
+		)
+		if stale:
+			return stale
+
+		installed_manifest_path = root / INSTALLED_INPUT_MANIFEST
+		require_file(installed_manifest_path)
+		installed_text = installed_manifest_path.read_text(encoding="utf-8")
+		header, separator, rest = installed_text.partition("\n")
+		if not separator or not header.startswith(COMPILER_FINGERPRINT_PREFIX):
+			raise StatusError(f"invalid installed compiler provenance: {INSTALLED_INPUT_MANIFEST}")
+		installed_digest = header.removeprefix(COMPILER_FINGERPRINT_PREFIX)
+		if (
+			len(installed_digest) != SHA256_HEX_LENGTH
+			or any(c not in "0123456789abcdef" for c in installed_digest)
+		):
+			raise StatusError(f"invalid installed compiler provenance: {INSTALLED_INPUT_MANIFEST}")
+		if installed_digest != sha256_file(root / INSTALLED_BIN):
+			raise StatusError(f"bin/blorp hash disagrees with {INSTALLED_INPUT_MANIFEST}")
+		parse_input_manifest(rest.encode("utf-8"), INSTALLED_INPUT_MANIFEST)
+		if rest.encode("utf-8") != install_manifest:
+			return StatusResult(
+				"STALE",
+				f"{INSTALLED_INPUT_MANIFEST} does not match current build identity",
+				"installed provenance changed",
+			)
+		return StatusResult("FRESH", "bin/blorp matches current compiler build inputs")
+	except (OSError, UnicodeDecodeError, StatusError) as error:
+		return StatusResult("UNKNOWN", str(error), "unverifiable compiler provenance")
+
+
+def format_result(result: StatusResult) -> str:
+	if result.state == "FRESH":
+		return f"FRESH: {result.reason}\n"
+	if result.state == "STALE":
+		detail = f"\nDetail: {result.detail}" if result.detail else ""
+		return f"STALE: {result.reason}{detail}\nNext: make\n"
+	detail = f"\nDetail: {result.detail}" if result.detail else ""
+	return f"UNKNOWN: {result.reason}{detail}\nNext: make\n"
+
+
+def main(arguments: list[str]) -> int:
+	parser = argparse.ArgumentParser(description=__doc__)
+	parser.add_argument("--quiet", action="store_true")
+	options = parser.parse_args(arguments)
+	result = status(Path.cwd())
+	if not options.quiet:
+		sys.stdout.write(format_result(result))
+	return result.exit_code
+
+
+if __name__ == "__main__":
+	raise SystemExit(main(sys.argv[1:]))
