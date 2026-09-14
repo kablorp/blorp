@@ -64,6 +64,15 @@ current-state and next-action summary.
 - [Layout compatibility follow-ups](blorp-layout/COMPATIBILITY_FOLLOW_UPS.md)
 - [Formatter interpolation diagnostics](formatter-interpolation-projection-errors.md)
 
+### Agent Development Workflow
+
+- [Task routing to owners and feedback loops](agent-workflow/01-route-agent-tasks-to-owners-and-loops.md)
+- [Compiler-check planning and next-gate guidance](agent-workflow/02-plan-compiler-check-selection-and-next-gates.md)
+- [Local compiler build freshness](agent-workflow/03-report-current-compiler-build-freshness.md)
+- [Production-pass performance experiment template](agent-workflow/04-template-production-pass-performance-experiments.md)
+- [Reproducible validation evidence](agent-workflow/05-capture-reproducible-validation-evidence.md)
+- [Active issue handoff audit](agent-workflow/06-audit-active-issue-handoffs.md)
+
 ### Runtime, Core, And Focused Cleanup
 
 - [COW-capable list concatenation](cow-capable-list-concat.md)
