@@ -437,6 +437,93 @@ them as disjoint wall time. Request construction is excluded from
 use the `compiler_typecheck_benchmark_with_request` subtree when comparing the
 typecheck workload itself.
 
+### Paired Production-Pass Comparison
+
+`compiler_pass_compare` is a small shared comparison driver for production-pass
+benchmark experiments. It accepts two already executable benchmark commands or
+binaries, runs a warmup, alternates baseline/candidate order, fails on child
+errors or mismatched semantic fields, rejects dirty source roots unless
+`--allow-dirty-source` is explicit, and writes raw paired samples plus binary,
+fixture, platform, and optional source-worktree provenance. The driver does not
+compile benchmark programs and does not copy sources between worktrees; if a
+pilot needs a benchmark source that is absent from the baseline checkout, make
+that temporary copy explicitly and verify before/after hashes outside the
+timed comparison. Use `--fixture-source` for benchmark sources that must be
+byte-identical under both source roots; use `--fixture` only for shared
+external input files that are not source-root relative.
+
+```bash
+benchmarks/compiler_pass_compare \
+  --label consume-candidate-index \
+  --baseline-bin /path/to/base/benchmarks/compiler_consume_candidate_index_profile \
+  --candidate-bin /path/to/candidate/benchmarks/compiler_consume_candidate_index_profile \
+  --baseline-source-root /path/to/base \
+  --candidate-source-root /path/to/candidate \
+  --fixture-source blorp/benchmark/compiler/compiler_consume_candidate_index_profile.brp \
+  --fixture-source blorp/benchmark/compiler/compiler_consume_candidate_index_profile_fixture.brp \
+  --prefix CONSUME_CANDIDATE_INDEX_PROFILE \
+  --time-field elapsed_microseconds \
+  --checksum-field core_json_checksum \
+  --checksum-field setup_checksum \
+  --checksum-field rewritten_function_checksum \
+  --stable-field functions \
+  --stable-field candidates_per_function \
+  --stable-field user_calls \
+  --stable-field used_percent \
+  --stable-field collision_mode \
+  --stable-field candidates_discovered \
+  --stable-field rewritten_clone_count \
+  --stable-field core_json_bytes \
+  --stable-field workload_valid \
+  --metric-field allocations \
+  --pairs 7 \
+  --warmup-pairs 1 \
+  --results /tmp/consume-candidate-index-pairs.json \
+  -- plain 20 256 8 256 25 none
+```
+
+The Core pilot above compares the existing consume-specialization benchmark:
+the measured production boundary is the benchmark's `rewrite_program` loop, and
+`setup_microseconds` remains an untimed fixture-construction check. Run the same
+shape with `candidates_per_function=0` as the zero-query control before making a
+speed claim.
+
+```bash
+benchmarks/compiler_pass_compare \
+  --label typecheck-phase-headers \
+  --baseline-bin /path/to/base/benchmarks/compiler_typecheck_phase_profile \
+  --candidate-bin /path/to/candidate/benchmarks/compiler_typecheck_phase_profile \
+  --baseline-source-root /path/to/base \
+  --candidate-source-root /path/to/candidate \
+  --fixture-source blorp/benchmark/compiler/compiler_typecheck_phase_profile.brp \
+  --fixture-source blorp/benchmark/compiler/compiler_typecheck_phase_profile_fixture.brp \
+  --prefix TYPECHECK_PHASE_PROFILE \
+  --time-field window_elapsed_microseconds \
+  --checksum-field checksum \
+  --checksum-field constructor_lookup_checksum \
+  --stable-field stage \
+  --stable-field iterations \
+  --stable-field modules \
+  --stable-field shapes_per_module \
+  --stable-field probes_per_module \
+  --stable-field requested_import_fanout \
+  --stable-field effective_import_fanout \
+  --stable-field type_bearing_percent \
+  --stable-field primary_outputs \
+  --stable-field secondary_outputs \
+  --stable-field accepted_constructor_rows \
+  --stable-field accepted_field_rows \
+  --pairs 7 \
+  --warmup-pairs 1 \
+  --results /tmp/typecheck-phase-headers-pairs.json \
+  -- headers 20 8 32 64 4
+```
+
+The typecheck pilot measures the existing phase-harness production constructor
+selected by the `headers` stage. Fixture construction validates the complete
+phase chain before the profile window, while the driver records raw pairs and
+refuses a speed claim if the structural checksums diverge.
+
 ### Core module flattening profile
 
 `compiler_core_flatten_profile` isolates the callable-heavy module-flattening
