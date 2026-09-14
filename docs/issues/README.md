@@ -59,11 +59,15 @@ current-state and next-action summary.
 - [Token and token-kind storage](compiler-performance/30-fuse-token-and-token-kind-storage.md)
 - [Shared match continuations](compiler-performance/52-share-match-continuations.md)
 - [Cancellation cleanup ABI](compiler-performance/53-minimize-and-compact-cancellation-cleanup.md)
+- [Accepted semantic-type projection, measurement gated](compiler-performance/66-canonicalize-accepted-semantic-type-projection.md)
+- [CTFE environment lookup, measurement gated](compiler-performance/67-index-remaining-ctfe-environment-lookup.md)
+- [Step 2e visibility convergence](compiler-performance/94-step2e-visibility-convergence.md)
+- [Step 2e width-probe resource gate](compiler-performance/97-bound-visibility-width-probe.md)
 - [Stage 06 latency roadmap](compiler-performance/STAGE06_LATENCY_REDUCTION_ROADMAP.md)
 - [Normalized semantic compilation roadmap](compiler-performance/NORMALIZED_SEMANTIC_COMPILATION_ROADMAP.md)
-- [Normalized compilation database direction](compiler-performance/NORMALIZED_COMPILATION_DATABASE_ROADMAP.md)
 - [Perceus ownership roadmap](compiler-performance/PERCEUS_OWNERSHIP_OPTIMIZATION_ROADMAP.md)
 - [Nested record allocation folding prototype](compiler-performance/NESTED_RECORD_FOLDING_PROTOTYPE_ROADMAP.md)
+- [Internal C-symbol projection follow-ups](compiler-performance/c-symbol-projection-followups.md)
 
 ### Typechecking
 
@@ -75,11 +79,14 @@ current-state and next-action summary.
 ### Tooling And Profiling
 
 - [Profiling workstream](profiling/README.md)
+- [Local profile aggregation and output](profiling/04-local-aggregation-and-output.md)
+- [Native sampling and symbol maps](profiling/05-native-sampling-and-symbol-maps.md)
+- [Unified profile command](profiling/06-unified-profile-command.md)
 - [Definition and usage navigation](lsp/02-definition-usage-navigation.md)
 - [Exact nonmember completion](lsp/03-exact-nonmember-completion.md)
 - [Workspace rename](lsp/04-workspace-rename.md)
 - [Typed member completion](lsp/05-typed-member-completion.md)
-- [Layout compatibility follow-ups](blorp-layout/COMPATIBILITY_FOLLOW_UPS.md)
+- [Compatibility and migration candidates](compatibility-candidates.md)
 - [Formatter interpolation diagnostics](formatter-interpolation-projection-errors.md)
 
 ### Agent Development Workflow

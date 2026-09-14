@@ -579,13 +579,27 @@ Profile a Blorp program or compiler benchmark:
 
 ```bash
 bin/blorp run --profile --no-format program.brp 2>/tmp/blorp-profile.txt
+bin/blorp run --profile-mode calls --profile-module compiler/stage_06_typecheck/infer program.brp
+bin/blorp run --profile-mode exact --profile-function compiler/stage_06_typecheck/type_system/env::scope_add_symbol program.brp
 benchmarks/compiler_typecheck_profile 2 2 64 128 \
   2>/tmp/compiler-typecheck-profile.txt
 ```
 
-The profile includes function rows and `FLAME:` rows. Function times are
-inclusive: parent and child cumulative times overlap and must not be added.
-Compare the same function, call count, and workload across revisions.
+`calls` counts invocations; `exact` records inclusive and self active time.
+Module and function selectors may repeat; an empty selector set includes all
+eligible functions, and nonempty selectors form a deduplicated union over exact
+logical identities (including monomorphized functions). Exact probes cover
+body-bearing user functions and the entrypoint, not closure bodies, foreign
+functions, or bodyless declarations. The legacy `--profile` spelling selects
+exact/all until the unified profile command replaces it.
+
+The report includes function rows and `FLAME:` rows. Inclusive parent and
+child times overlap and must not be added; self time partitions active work
+and is the appropriate percentage/ranking measure. A call that crosses a
+profile-window boundary is accounted only for its time inside that window.
+Suspended fiber time is not active time; cancellation and nonlocal unwinding
+must balance frames and report any loss. Compare the same function, call
+count, and workload across revisions.
 
 The runtime profiler assigns every emitted function a dense artifact-local ID
 and reports explicit completeness diagnostics. Check `functions_described`,
@@ -608,9 +622,9 @@ ranking, not a true call-hierarchy flame graph. Use explicit profile parent
 rows, focused instrumentation, or an external sampling profiler when call
 hierarchy is required.
 
-A tall function may be expensive because of its own work or because it contains
-expensive descendants. Use call counts, source inspection, and a bounded
-microbenchmark to distinguish self cost, cumulative cost, and scaling.
+A tall inclusive function may mostly contain expensive descendants. Use self
+time, call counts, source inspection, and a bounded microbenchmark to
+distinguish local cost, cumulative cost, and scaling.
 
 ## Compiler Benchmarks
 

@@ -55,48 +55,10 @@ conversion is pure, while process reporting remains an effect of the
 generated entrypoint. Only the root source `main` is treated this way; an
 imported function named `main` remains an ordinary function.
 
-### Compile and Run
-
-```bash
-# Build the compiler
-make
-
-# Compile and run a program
-bin/blorp run hello.brp
-
-# Pass CLI arguments
-bin/blorp run program.brp -- arg1 arg2 arg3
-
-# Type check only (no codegen)
-bin/blorp check program.brp
-bin/blorp check src/              # Recursively checks .brp files
-
-# Show AST
-bin/blorp compile --ast program.brp
-
-# Run tests
-bin/blorp test blorp/test/runtime/
-bin/blorp test blorp/test/runtime/collections/test_dict.brp
-```
-
-### A More Complete Example
-
-
-
-```blorp
-pure func process(items: List[Int]) -> List[Int]:
-    items
-        .filter(func(x): x > 0)
-        .map(func(x): x * 2)
-
-func main(args: List[String]):
-    data: List[Int] = [3, -1, 4, -2, 5]
-    result: List[Int] = process(data)
-    print(to_string(result))
-```
-
-No imports needed for entities included in the prelude, which 
-includes List, Option, String, Dict, Set, Result -- and their "methods"! See "Method Call Syntax" below.
+For a first program and idiomatic examples, start with
+[Learn Blorp in Y Minutes](LEARN_BLORP_IN_Y_MINUTES.md). Build, run, check,
+and test commands belong in the [Developer Guide](DEVELOPMENT.md) and
+`bin/blorp <command> --help`.
 
 ---
 

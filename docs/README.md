@@ -1,8 +1,9 @@
 # Blorp Documentation
 
-These documents describe the current language, toolchain, and implementation.
-Completed implementation history belongs in Git history, pull requests,
-benchmark results, and issues rather than in maintained reference documents.
+The references below describe the current language, toolchain, and
+implementation. The short priorities map and issue index describe future
+work. Completed implementation history belongs in Git history and benchmark
+results, not in maintained docs.
 
 ## Learn The Language
 
@@ -34,11 +35,14 @@ module inventory lives in
   ABI for managed values.
 - [Concurrency And Resources](CONCURRENCY_AND_RESOURCES.md) defines structured
   concurrency, cancellation, resources, streams, and networking contracts.
-- [Compiler Priorities](COMPILER_PRIORITIES.md) contains only current
-  cross-cutting compiler work and its completion criteria.
-- [Normalized Semantic Compilation Roadmap](issues/compiler-performance/NORMALIZED_SEMANTIC_COMPILATION_ROADMAP.md)
-  sequences the next table-backed semantic products, tooling queries, and
-  multi-metric performance gates.
+
+## Plan Current Work
+
+- [Compiler Priorities](COMPILER_PRIORITIES.md) is the short cross-cutting
+  outcomes map.
+- [Active Engineering Issues](issues/README.md) lists every retained handoff.
+- [Normalized Semantic Compilation](issues/compiler-performance/NORMALIZED_SEMANTIC_COMPILATION_ROADMAP.md)
+  sequences the next table-backed semantic products and performance gates.
 
 ## Maintenance Rules
 

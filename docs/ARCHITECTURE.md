@@ -115,6 +115,13 @@ Important invariants:
 - parser recovery never reserves accepted declaration identity; and
 - later phases do not rescan project configuration or rediscover source files.
 
+The Stage 06 prepared-module *request-alias* index is a narrower compatibility
+projection, not the canonical module-identity validator. If two prepared
+modules advertise the same request alias, its current deterministic lookup
+keeps the first module in prepared order, matching the earlier `List.find`
+behavior. Do not remove this rule as legacy code without unifying the alias
+representation and choosing an explicit ambiguity policy.
+
 ### Typechecking
 
 Typechecking admits declarations through opaque phase products. The current
@@ -361,6 +368,15 @@ model is [MEMORY_MODEL.md](MEMORY_MODEL.md).
 Backend projection chooses C spelling and ABI details already justified by
 Core representation facts. Unsupported Core is an internal compiler error,
 not an invitation for the emitter to guess.
+
+At the final Core-to-C boundary, one validated projection gives artifact-local
+user and closure bodies short deterministic C symbols and internal linkage.
+`main`, foreign and runtime names, and currently unclassified type, global,
+field, and local names retain their established spelling. Semantic identities,
+Core dumps, diagnostics, and profile labels remain readable; generated C
+spelling is not a source or package ABI. Do not broaden projection to another
+name family without an explicit ABI-exposure classification and a complete
+reference inventory.
 
 The emitted C embeds or references the runtime according to the compile
 request. Embedded artifact writing and host compilation preserve runtime and

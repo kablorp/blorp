@@ -1,6 +1,9 @@
 # Step 2e Visibility Convergence: Finite Exit Sequence
 
-**Status:** Cut A occupancy, selected-module provenance, and candidate-only width probe implemented in [Issues 95-97](97-bound-visibility-width-probe.md). The API-adapted historical comparison is complete and exposes a resource regression; Cut A's performance gate remains open.
+**Status:** Cut A occupancy, selected-module provenance, and the candidate-only
+[width probe](97-bound-visibility-width-probe.md) are implemented. The
+API-adapted comparison exposes a resource regression, so Cut A's performance
+gate remains open. Completed packet details are in Git history.
 
 **Roadmap:** [Normalized Semantic Compilation Roadmap](NORMALIZED_SEMANTIC_COMPILATION_ROADMAP.md), Step 2e convergence
 
@@ -101,11 +104,11 @@ The opaque `PreparedModuleScope` (or an equivalently checked scope capability)
 owns the `SourceNameTable` and `ModuleTable` domains together. Construction
 must reject a foreign scope, including an equal-layout graph from another
 compilation. The existing `prepared_module_scopes_are_compatible` is not
-sufficient: it deliberately accepts structurally equal foreign graphs. Issue
-95 introduces an opaque graph-issued `GraphSourceNameTable` below
-`indexed_graph` that binds one name catalog to the exact `ModuleTable`
+sufficient: it deliberately accepts structurally equal foreign graphs. An
+opaque graph-issued `GraphSourceNameTable` below `indexed_graph` now binds one
+name catalog to the exact `ModuleTable`
 allocation without an import cycle. Registration checks that exact table.
-Issue 96 binds selected-module ID to the view and checks registration, state
+The implemented view binds selected-module ID and checks registration, state
 lookup, inference admission, and binder publication. Later joins must also reject a reminted
 source-name catalog from the public graph-building factory. Query APIs receive
 an exact capability or retain it under the opaque table; a naked
@@ -118,7 +121,7 @@ until cut B can project it from the bound row. Do not turn this sketch into a
 second copied import-target list. Local definition identities are joined when
 their graph definition rows are available; `TopLevelNameKind` alone is only
 early namespace occupancy, not accepted semantic identity.
-The Issue 95 occupancy row summarizes current occupancy; it is not an ordered
+The current occupancy row summarizes occupancy; it is not an ordered
 candidate history and does not yet retain checked binding references. The
 existing `import_bindings` inventory owns relative order in cut A; cut B
 replaces that inventory with a candidate log, checked row references, and issued order for
@@ -157,8 +160,8 @@ behavior. Keep standalone maps separate. Reject foreign and equal-layout
 graph capabilities. Delete the three graph dictionaries
 in the same cut; do not add the new table beside them.
 
-Issue 95 completed the single-relation occupancy replacement, overlap/conflict
-semantics, and exact foreign-table rejection. Issue 96 binds selected-module
+The completed Cut A foundation has one occupancy relation, exact
+overlap/conflict semantics, and foreign-table rejection. It binds selected-module
 identity to the view and checks graph use against the active scope. The
 API-adapted direct baseline comparison in [Issue 97](97-bound-visibility-width-probe.md)
 exposed a resource regression. Removing the redundant row-list/index pair
@@ -252,10 +255,9 @@ architectural neatness as a performance win.
 
 ## Fast Feedback And Evidence
 
-Before cut A, add a genuine graph-mode binder fixture. The current
-`test_module_view.brp` conflict/ordering cases predominantly use standalone
-registration; its graph cases mainly reject standalone calls on a graph view.
-The new fixture must cover same-source/same-target alias-plus-selective
+Cut A's graph-mode binder and structural fixtures exist. Re-run and extend
+them only for a Cut B behavior not already protected. The required cases are
+same-source/same-target alias-plus-selective
 success in both registration orders; different-target conflicts in both
 orders; duplicate alias same-target idempotence versus different-target
 conflict; duplicate selective conflict even for the same target; local/import
@@ -266,11 +268,9 @@ as well as unchanged `import_bindings` after rejection. Put the private
 imported-name case at the declaration binder/import-validation boundary:
 low-level `ModuleView` receives already-admitted bindings and cannot decide
 source privacy itself. Graph clearing must retain qualified aliases while
-removing selective/local rows. A structural check
-must first fail on the three old graph dictionaries. Add the graph fixture,
-declaration suite, and structural check to `module_view.brp`'s changed-owner
-manifest, or run them explicitly as mandatory cut-A gates; the present owner
-mapping selects only `test_compiler_module_view`.
+removing selective/local rows. Keep the structural absence check for the
+removed graph dictionaries; do not recreate the already-completed Cut A
+test-first sequence.
 
 ```bash
 python3 blorp/test/compiler/stage_06_typecheck/support/test_declaration_boundary.py
@@ -279,9 +279,10 @@ bin/blorp test blorp/test/compiler/stage_06_typecheck/test_typecheck_decl.brp
 scripts/compiler-check --changed
 ```
 
-Use one direct baseline/candidate counter pair before broad gates. Add a
-retained visibility-width fixture varying module count, aliases, selective
-imports, duplicate spellings, and query count; do not infer scaling from a
+Use one direct baseline/candidate counter pair before broad gates. Reuse the
+retained visibility-width fixture from the [width probe](97-bound-visibility-width-probe.md),
+varying module count, aliases, selective imports, duplicate spellings, and
+query count; do not infer scaling from a
 checked-bodies benchmark that barely exercises visibility. Record accepted
 identity and diagnostic checksums, candidate visits, string hashes, index
 probes, allocation/release and retained counts, allocated bytes, retired

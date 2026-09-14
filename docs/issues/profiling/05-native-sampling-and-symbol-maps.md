@@ -2,8 +2,8 @@
 
 **Status:** Ready for implementation
 
-**Roadmap dependency:** None for the sampling adapter; rebase final metadata
-integration over Issue 1
+**Roadmap dependency:** None for the sampling adapter; integrate with the
+current dense-ID metadata builder.
 
 **Unblocks:** Issue 6
 
@@ -79,7 +79,7 @@ runtime.
 | --- | --- |
 | C symbol projection | `blorp/src/compiler/stage_10_backend/c_symbol_projection.brp` |
 | Current display-name handoff | `blorp/src/compiler/stage_10_backend/emit.brp`, `emitted_function_display_name` |
-| Symbol hashing constraints | `docs/C_SYMBOL_HASHING_ROADMAP.md` |
+| Current C-symbol contract and remaining boundary | `docs/ARCHITECTURE.md#backend` and `docs/issues/compiler-performance/c-symbol-projection-followups.md` |
 | Current compiler phase names | `blorp/src/compiler/pipeline.brp` and `docs/DEVELOPMENT.md` |
 | Historical sampling prototype | `logs/compiler-self-profile-current/run_profile.sh` |
 | Historical stack normalizer | `logs/compiler-self-profile-current/collapse_sample.py` |
@@ -99,11 +99,12 @@ Add an explicit compiler option used by the future profile command:
 The exact public spelling may be finalized in Issue 6, but the compiler API
 must be able to request the product independently of function instrumentation.
 
-Emit versioned NDJSON or another equally explicit format. Example:
+Emit versioned NDJSON or another equally explicit format. The IDs, symbol,
+line, and counts below illustrate the schema, not a captured current trace:
 
 ```json
 {"kind":"symbol_map_header","schema_version":1,"build_id":"...","functions":12048}
-{"kind":"function","schema_version":1,"c_symbol":"brp_3i9","logical_name":"scope_add_symbol","module_path":"compiler/stage_05_types/env","stage":"stage_05_types","source_path":"blorp/src/compiler/stage_05_types/env.brp","source_line":312,"definition_id":418,"origin":"source"}
+{"kind":"function","schema_version":1,"c_symbol":"brp_3i9","logical_name":"scope_add_symbol","module_path":"compiler/stage_06_typecheck/type_system/env","stage":"stage_06_typecheck","source_path":"blorp/src/compiler/stage_06_typecheck/type_system/env.brp","source_line":495,"definition_id":418,"origin":"source"}
 {"kind":"symbol_map_end","schema_version":1,"records":12048,"complete":true}
 ```
 
@@ -133,7 +134,7 @@ profile wrapper may create a final manifest joining the C-sidecar identity with
 the native binary hash. Do not rewrite semantic function rows based on `nm`
 ordering.
 
-The profile metadata plan from Issue 1 and the native symbol plan should share
+The current dense-ID profile metadata and the native symbol plan should share
 one authoritative function-description builder. The native map is broader:
 sampling must name uninstrumented functions, whereas exact metadata contains
 only selected probe IDs.
@@ -256,7 +257,7 @@ process;thread;native_root;brp_3i9;malloc 14
 After joining the symbol map, produce semantic stacks:
 
 ```text
-compiler;stage_06_typecheck;compiler/stage_05_types/env;scope_add_symbol 14
+compiler;stage_06_typecheck;compiler/stage_06_typecheck/type_system/env;scope_add_symbol 14
 ```
 
 Keep separate products:

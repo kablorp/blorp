@@ -1,6 +1,7 @@
 # Move Exact Counters To Local Shards And Define Structured Output
 
-**Status:** Ready after Issue 3
+**Status:** Ready for a fresh baseline; dense IDs, selector modes, and
+fiber-correct inclusive/self timing are already in production.
 
 **Roadmap dependencies:** Dense IDs, count/selective modes, and fiber-correct
 exact timing
@@ -18,18 +19,18 @@ It is not the data interchange format.
 
 ## Current Behavior
 
-Each completed exact call currently performs atomic additions to global
-`total_ns` and `call_count`. After self time lands, that would become three
-shared atomic read-modify-write operations per completed call. Frequently
-called compiler helpers execute tens of millions of times, so atomics can
-become a measurable profiler artifact even when threads rarely update the same
-function simultaneously.
+Each completed exact call currently performs three atomic additions to global
+`total_ns`, `self_ns`, and `call_count`; count-only mode updates the global
+call counter. Frequently called compiler helpers can make those shared writes
+a measurable profiler artifact even with little inter-thread contention.
 
-The report copies the fixed registry to a stack array, sorts by inclusive time,
-sums overlapping inclusive values into `TOTAL`, prints a human table, and then
-prints one `FLAME:name value` row per function. Consumers scrape stderr with
-`rg` and `sed`. The rows contain no schema version, clock identity, artifact
-identity, loss diagnostics, source metadata, or real stack hierarchy.
+The report allocates a snapshot proportional to selected functions, sorts
+exact rows by self time (calls mode by count), prints inclusive/self values
+and completeness diagnostics, then emits flat `FLAME:name value` rows. It is
+still stderr text without a versioned data schema, artifact/clock identity,
+source metadata, or real sampled stack hierarchy. Consumers scrape it with
+`rg` and `sed`; this issue replaces that interchange path, not the already
+implemented self-time semantics.
 
 ## Goals
 
@@ -178,7 +179,7 @@ Header example:
 Function example:
 
 ```json
-{"kind":"function","schema_version":1,"id":137,"logical_name":"scope_add_symbol","c_symbol":"brp_3i9","module_path":"compiler/stage_05_types/env","definition_id":418,"calls":1028721,"inclusive_ns":904120000,"self_ns":712330000}
+{"kind":"function","schema_version":1,"id":137,"logical_name":"scope_add_symbol","c_symbol":"brp_3i9","module_path":"compiler/stage_06_typecheck/type_system/env","definition_id":418,"calls":1028721,"inclusive_ns":904120000,"self_ns":712330000}
 ```
 
 Diagnostics example:
