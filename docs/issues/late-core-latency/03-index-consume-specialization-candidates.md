@@ -25,6 +25,12 @@ cost without restoring candidate scans.
 `benchmarks/compiler_consume_candidate_index_profile`, and the retained
 benchmark result.
 
+## Objective
+
+Close the remaining consume-specialization candidate-index gate by reproducing
+and reducing the accepted implementation's allocation and peak-memory costs
+without restoring repeated candidate scans or changing clone semantics.
+
 ## Invariants
 
 `CloneKey` includes original name, original definition ID, and argument

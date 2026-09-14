@@ -23,6 +23,12 @@ and the retained benchmark result. If the old direct-pass runner is absent on
 current `main`, first establish a small fixture that executes the actual
 preparation entry point; do not benchmark a copied lookup model.
 
+## Objective
+
+Determine whether a query-gated or lazy pass-local declaration index can beat
+the current first-match lookup behavior on representative preparation
+workloads without regressing small or zero-query cases.
+
 ## Correctness Boundary
 
 - Canonical Core type names are the current lookup keys. Value-record,

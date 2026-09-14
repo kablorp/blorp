@@ -94,7 +94,6 @@ current-state and next-action summary.
 - [Local compiler build freshness](agent-workflow/03-report-current-compiler-build-freshness.md)
 - [Production-pass performance experiment template](agent-workflow/04-template-production-pass-performance-experiments.md)
 - [Reproducible validation evidence](agent-workflow/05-capture-reproducible-validation-evidence.md)
-- [Active issue handoff audit](agent-workflow/06-audit-active-issue-handoffs.md)
 
 ### Runtime, Core, And Focused Cleanup
 
@@ -111,9 +110,10 @@ When touching this directory:
 
 1. remove resolved or superseded documents;
 2. update this index only for workstream-level additions or removals;
-3. check local Markdown links;
-4. run `git diff --check`; and
-5. use the focused validation described by the issue rather than a full suite
+3. run `scripts/audit-issue-handoffs --scope docs/issues/<workstream>`;
+4. check local Markdown links not covered by the audit when needed;
+5. run `git diff --check`; and
+6. use the focused validation described by the issue rather than a full suite
    until the change is ready.
 
 See the [Developer Guide](../DEVELOPMENT.md) for the shared development and
