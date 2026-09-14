@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+"""Record one opt-in validation command with reproducible evidence."""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import signal
+import subprocess
+import sys
+import threading
+import time
+from typing import Any
+
+
+SCHEMA_VERSION = 1
+TIMEOUT_EXIT_CODE = 124
+PACKET_FILES = ("metadata.json", "stdout.log", "stderr.log")
+SAFE_ENVIRONMENT_KEYS = (
+	"BLORP_COMPILER_TEST_TIMEOUT",
+	"BLORP_TEST_TIMEOUT",
+	"BLORP_RUNTIME_TEST_TIMEOUT",
+	"BLORP_LEAK_TEST_TIMEOUT",
+	"BLORP_COMPILER_SANITIZE_TEST_TIMEOUT",
+	"BLORP_COMPILER_TEST_PROGRESS",
+	"CC",
+)
+
+
+class PacketPreparationError(Exception):
+	pass
+
+
+def safe_packet_filename(value: object) -> str | None:
+	if not isinstance(value, str):
+		return None
+	path = Path(value)
+	if path.is_absolute() or path.name != value or value in {"", ".", ".."}:
+		return None
+	return value
+
+
+def sha256_bytes(value: bytes) -> str:
+	return hashlib.sha256(value).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+	digest = hashlib.sha256()
+	with path.open("rb") as source:
+		for chunk in iter(lambda: source.read(1024 * 1024), b""):
+			digest.update(chunk)
+	return digest.hexdigest()
+
+
+def run_git(root: Path, arguments: list[str]) -> subprocess.CompletedProcess[bytes]:
+	return subprocess.run(
+		["git", *arguments],
+		cwd=root,
+		stdout=subprocess.PIPE,
+		stderr=subprocess.PIPE,
+		check=False,
+	)
+
+
+def git_root(cwd: Path) -> Path | None:
+	result = run_git(cwd, ["rev-parse", "--show-toplevel"])
+	if result.returncode != 0:
+		return None
+	return Path(result.stdout.decode("utf-8", errors="replace").strip()).resolve()
+
+
+def git_head(root: Path | None) -> str:
+	if root is None:
+		return "unavailable"
+	result = run_git(root, ["rev-parse", "HEAD"])
+	if result.returncode != 0:
+		return "unavailable"
+	return result.stdout.decode("utf-8", errors="replace").strip() or "unavailable"
+
+
+def tracked_diff_sha256(root: Path | None) -> str:
+	if root is None:
+		return "unavailable"
+	result = run_git(root, ["diff", "--binary", "HEAD", "--"])
+	if result.returncode != 0:
+		return "unavailable"
+	return sha256_bytes(result.stdout)
+
+
+def git_dirty(root: Path | None) -> bool | str:
+	if root is None:
+		return "unavailable"
+	result = run_git(root, ["status", "--porcelain=v1", "-z"])
+	if result.returncode != 0:
+		return "unavailable"
+	return bool(result.stdout)
+
+
+def git_paths(root: Path, arguments: list[str]) -> list[str] | None:
+	result = run_git(root, arguments)
+	if result.returncode != 0:
+		return None
+	return [
+		item.decode("utf-8", errors="surrogateescape")
+		for item in result.stdout.split(b"\0")
+		if item
+	]
+
+
+def path_is_within(path: Path, directory: Path) -> bool:
+	try:
+		path.relative_to(directory)
+		return True
+	except ValueError:
+		return False
+
+
+def file_identity_sha256(path: Path) -> str | None:
+	if path.is_symlink():
+		return "symlink:" + sha256_bytes(os.readlink(path).encode("utf-8", errors="surrogateescape"))
+	if not path.is_file():
+		return None
+	return "file:" + sha256_file(path)
+
+
+def worktree_fingerprint_sha256(root: Path | None, exclude_directory: Path | None = None) -> str:
+	if root is None:
+		return "unavailable"
+	tracked = git_paths(root, ["ls-files", "-z"])
+	untracked = git_paths(root, ["ls-files", "--others", "--exclude-standard", "-z"])
+	if tracked is None or untracked is None:
+		return "unavailable"
+	digest = hashlib.sha256()
+	for label, paths in (("tracked", tracked), ("untracked", untracked)):
+		for relative in sorted(paths):
+			path = root / relative
+			if exclude_directory is not None and path_is_within(path.absolute(), exclude_directory):
+				continue
+			try:
+				identity = file_identity_sha256(path)
+			except OSError:
+				return "unavailable"
+			if identity is None:
+				continue
+			digest.update(label.encode("utf-8"))
+			digest.update(b"\0")
+			digest.update(relative.encode("utf-8", errors="surrogateescape"))
+			digest.update(b"\0")
+			digest.update(identity.encode("ascii"))
+			digest.update(b"\0")
+	return digest.hexdigest()
+
+
+def untracked_file_fingerprint(
+	root: Path | None,
+	exclude_directory: Path | None = None,
+) -> tuple[str, int]:
+	if root is None:
+		return "unavailable", 0
+	untracked = git_paths(root, ["ls-files", "--others", "--exclude-standard", "-z"])
+	if untracked is None:
+		return "unavailable", 0
+	digest = hashlib.sha256()
+	count = 0
+	for relative in sorted(untracked):
+		path = root / relative
+		if exclude_directory is not None and path_is_within(path.absolute(), exclude_directory):
+			continue
+		try:
+			identity = file_identity_sha256(path)
+		except OSError:
+			return "unavailable", count
+		if identity is None:
+			continue
+		count += 1
+		digest.update(relative.encode("utf-8", errors="surrogateescape"))
+		digest.update(b"\0")
+		digest.update(identity.encode("ascii"))
+		digest.update(b"\0")
+	return digest.hexdigest(), count
+
+
+def bin_blorp_sha256(root: Path | None) -> str:
+	if root is None:
+		return "absent"
+	binary = root / "bin" / "blorp"
+	if not binary.is_file():
+		return "absent"
+	try:
+		return sha256_file(binary)
+	except OSError:
+		return "unavailable"
+
+
+def source_snapshot(repository: Path | None, exclude_directory: Path | None) -> dict[str, object]:
+	untracked_sha256, untracked_count = untracked_file_fingerprint(repository, exclude_directory)
+	return {
+		"git_head": git_head(repository),
+		"git_dirty": git_dirty(repository),
+		"tracked_diff_sha256": tracked_diff_sha256(repository),
+		"untracked_file_count": untracked_count,
+		"untracked_file_sha256": untracked_sha256,
+		"worktree_fingerprint_sha256": worktree_fingerprint_sha256(repository, exclude_directory),
+	}
+
+
+def safe_environment() -> dict[str, str]:
+	return {key: os.environ[key] for key in SAFE_ENVIRONMENT_KEYS if key in os.environ}
+
+
+def prepare_output_directory(output: Path, replace: bool) -> None:
+	if output.exists() and not output.is_dir():
+		raise PacketPreparationError(f"output path exists and is not a directory: {output}")
+	if output.is_dir() and not replace:
+		raise PacketPreparationError(
+			f"output directory already exists: {output}; pass --replace for a previous packet"
+		)
+	if output.is_dir():
+		metadata_path = output / "metadata.json"
+		try:
+			metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+		except (OSError, json.JSONDecodeError) as error:
+			raise PacketPreparationError(
+				f"--replace only accepts an existing record-validation packet: {output}"
+			) from error
+		if metadata.get("schema_version") != SCHEMA_VERSION:
+			raise PacketPreparationError(
+				f"--replace only accepts schema version {SCHEMA_VERSION} packets: {output}"
+			)
+		for item in metadata.get("artifacts", []):
+			if safe_packet_filename(item) is None:
+				raise PacketPreparationError(
+					f"--replace refused unsafe packet artifact name in metadata: {item!r}"
+				)
+		allowed = set(PACKET_FILES)
+		for child in output.iterdir():
+			if child.name not in allowed or child.is_dir() or child.is_symlink():
+				raise PacketPreparationError(
+					f"--replace refused non-packet content in output directory: {child}"
+				)
+		for filename in allowed:
+			path = output / filename
+			if path.exists() or path.is_symlink():
+				path.unlink()
+	else:
+		output.mkdir(parents=True)
+
+
+def copy_stream(source: Any, destination: Any) -> None:
+	for chunk in iter(lambda: source.read(8192), b""):
+		destination.write(chunk)
+		destination.flush()
+
+
+def terminate_process(process: subprocess.Popen[bytes]) -> None:
+	try:
+		os.killpg(process.pid, signal.SIGTERM)
+	except (ProcessLookupError, PermissionError):
+		process.terminate()
+	try:
+		process.wait(timeout=1)
+	except subprocess.TimeoutExpired:
+		try:
+			os.killpg(process.pid, signal.SIGKILL)
+		except (ProcessLookupError, PermissionError):
+			process.kill()
+		process.wait()
+
+
+def run_wrapped_command(command: list[str], cwd: Path, output: Path, timeout: float | None) -> tuple[int, bool, int]:
+	start_ns = time.monotonic_ns()
+	timed_out = False
+	with (output / "stdout.log").open("wb") as stdout_log, (output / "stderr.log").open("wb") as stderr_log:
+		process = subprocess.Popen(
+			command,
+			cwd=cwd,
+			stdout=subprocess.PIPE,
+			stderr=subprocess.PIPE,
+			start_new_session=True,
+		)
+		assert process.stdout is not None
+		assert process.stderr is not None
+		stdout_thread = threading.Thread(target=copy_stream, args=(process.stdout, stdout_log))
+		stderr_thread = threading.Thread(target=copy_stream, args=(process.stderr, stderr_log))
+		stdout_thread.start()
+		stderr_thread.start()
+		try:
+			return_code = process.wait(timeout=timeout)
+		except subprocess.TimeoutExpired:
+			timed_out = True
+			terminate_process(process)
+			return_code = TIMEOUT_EXIT_CODE
+		stdout_thread.join()
+		stderr_thread.join()
+	elapsed_ms = int((time.monotonic_ns() - start_ns) / 1_000_000)
+	return return_code, timed_out, elapsed_ms
+
+
+def display_exit_code(exit_code: int) -> int:
+	if exit_code < 0:
+		return 128 + abs(exit_code)
+	return exit_code
+
+
+def rerun_command(output: Path, command: list[str], timeout: float | None, replace: bool) -> str:
+	parts = ["scripts/record-validation", "--output", str(output)]
+	if replace:
+		parts.append("--replace")
+	if timeout is not None:
+		parts.extend(["--timeout", str(timeout)])
+	parts.append("--")
+	parts.extend(command)
+	return shlex.join(parts)
+
+
+def write_metadata(
+	output: Path,
+	command: list[str],
+	cwd: Path,
+	started_at_utc: str,
+	elapsed_ms: int,
+	exit_code: int,
+	timed_out: bool,
+	repository: Path | None,
+	output_exclusion: Path | None,
+	start_source: dict[str, object],
+	end_source: dict[str, object],
+) -> None:
+	artifacts = ["stdout.log", "stderr.log"]
+	metadata = {
+		"schema_version": SCHEMA_VERSION,
+		"command": command,
+		"cwd": str(cwd),
+		"started_at_utc": started_at_utc,
+		"elapsed_ms": elapsed_ms,
+		"exit_code": exit_code,
+		"timed_out": timed_out,
+		"git_head": end_source["git_head"],
+		"git_dirty": end_source["git_dirty"],
+		"tracked_diff_sha256": end_source["tracked_diff_sha256"],
+		"untracked_file_count": end_source["untracked_file_count"],
+		"untracked_file_sha256": end_source["untracked_file_sha256"],
+		"worktree_fingerprint_sha256": end_source["worktree_fingerprint_sha256"],
+		"start_source": start_source,
+		"end_source": end_source,
+		"source_changed_during_run": (
+			"unknown"
+			if start_source["worktree_fingerprint_sha256"] == "unavailable"
+			or end_source["worktree_fingerprint_sha256"] == "unavailable"
+			else start_source["worktree_fingerprint_sha256"]
+			!= end_source["worktree_fingerprint_sha256"]
+		),
+		"worktree_fingerprint_excludes": (
+			str(output_exclusion) if output_exclusion is not None else None
+		),
+		"bin_blorp_sha256": bin_blorp_sha256(repository),
+		"environment": safe_environment(),
+		"artifacts": artifacts,
+		"artifact_sha256": {
+			artifact: sha256_file(output / artifact)
+			for artifact in artifacts
+		},
+	}
+	(output / "metadata.json").write_text(
+		json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+		encoding="utf-8",
+	)
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+	parser = argparse.ArgumentParser(
+		description="Record one validation command's raw output and provenance.",
+	)
+	parser.add_argument("--output", required=True, type=Path, help="packet output directory")
+	parser.add_argument(
+		"--replace",
+		action="store_true",
+		help="replace a previous record-validation packet at --output",
+	)
+	parser.add_argument(
+		"--timeout",
+		type=float,
+		default=None,
+		help="seconds before terminating the wrapped command and recording exit 124",
+	)
+	parser.add_argument("command", nargs=argparse.REMAINDER)
+	args = parser.parse_args(argv)
+	if args.command and args.command[0] == "--":
+		args.command = args.command[1:]
+	if not args.command:
+		parser.error("expected a command after --")
+	if args.timeout is not None and args.timeout <= 0:
+		parser.error("--timeout must be positive")
+	return args
+
+
+def main(argv: list[str]) -> int:
+	args = parse_args(argv)
+	cwd = Path.cwd().resolve()
+	output = args.output.expanduser()
+	if not output.is_absolute():
+		output = (cwd / output).resolve()
+	else:
+		output = output.resolve()
+
+	repository = git_root(cwd)
+	output_exclusion = None
+	if repository is not None and path_is_within(output.resolve(strict=False), repository):
+		output_exclusion = output.resolve(strict=False)
+
+	try:
+		prepare_output_directory(output, args.replace)
+	except PacketPreparationError as error:
+		print(f"record-validation: {error}", file=sys.stderr)
+		return 2
+
+	started_at_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+	start_source = source_snapshot(repository, output_exclusion)
+	try:
+		exit_code, timed_out, elapsed_ms = run_wrapped_command(
+			args.command,
+			cwd,
+			output,
+			args.timeout,
+		)
+	except FileNotFoundError as error:
+		exit_code = 127
+		timed_out = False
+		elapsed_ms = 0
+		(output / "stdout.log").write_bytes(b"")
+		(output / "stderr.log").write_text(f"{error}\n", encoding="utf-8")
+	except OSError as error:
+		exit_code = 126
+		timed_out = False
+		elapsed_ms = 0
+		(output / "stdout.log").write_bytes(b"")
+		(output / "stderr.log").write_text(f"{error}\n", encoding="utf-8")
+	end_source = source_snapshot(repository, output_exclusion)
+
+	try:
+		write_metadata(
+			output,
+			args.command,
+			cwd,
+			started_at_utc,
+			elapsed_ms,
+			exit_code,
+			timed_out,
+			repository,
+			output_exclusion,
+			start_source,
+			end_source,
+		)
+	except OSError as error:
+		print(f"record-validation: failed to write metadata: {error}", file=sys.stderr)
+		return display_exit_code(exit_code)
+
+	print(f"Validation packet: {output}")
+	print(f"Rerun: {rerun_command(output, args.command, args.timeout, args.replace)}")
+	return display_exit_code(exit_code)
+
+
+if __name__ == "__main__":
+	sys.exit(main(sys.argv[1:]))

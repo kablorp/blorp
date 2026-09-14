@@ -483,6 +483,10 @@ if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_allocator_sta
 	echo "FAIL: hygiene-check must include the optimized runtime allocator regression" >&2
 	exit 1
 fi
+if ! grep -Fq 'python3 -m unittest blorp/test/build/test_record_validation.py' Makefile; then
+	echo "FAIL: hygiene-check must include the validation evidence recorder contract" >&2
+	exit 1
+fi
 if ! grep -Fq -- '--print-path' <<<"$cli_build_plan"; then
 	echo "FAIL: the Blorp CLI build must resolve the pinned public compiler" >&2
 	exit 1

@@ -88,10 +88,6 @@ current-state and next-action summary.
 - [Compatibility and migration candidates](compatibility-candidates.md)
 - [Formatter interpolation diagnostics](formatter-interpolation-projection-errors.md)
 
-### Agent Development Workflow
-
-- [Reproducible validation evidence](agent-workflow/05-capture-reproducible-validation-evidence.md)
-
 ### Runtime, Core, And Focused Cleanup
 
 - [COW-capable list concatenation](cow-capable-list-concat.md)

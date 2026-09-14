@@ -138,6 +138,27 @@ Preserve the complete artifact for a reviewer if the identity claim depends
 on it. A quiet successful gate saves reading time and tokens; it does **not**
 replace focused failure diagnosis or final integration coverage.
 
+For handoffs that need reproducible validation evidence, wrap the exact command
+with the optional recorder:
+
+```bash
+scripts/record-validation --output /tmp/blorp-evidence/focused \
+  -- scripts/compiler-check --changed
+scripts/record-validation --output /tmp/blorp-evidence/default \
+  -- scripts/test --no-build --log-dir /tmp/blorp-gate-logs compiler-blorp
+```
+
+The packet keeps `metadata.json`, stdout, stderr, hashes of captured logs, the
+current Git revision, start and end tracked/untracked worktree fingerprints,
+whether source changed during the run, the `bin/blorp` hash when present, and
+only a small allowlist of known validation environment variables such as
+`BLORP_COMPILER_TEST_TIMEOUT` and `CC`. If the packet output is inside the Git
+worktree, that output directory is explicitly excluded from source
+fingerprints. The recorder returns the wrapped command's status, refuses
+arbitrary existing output directories, and never decides whether a passing
+benchmark is an acceptable optimization. The handoff summary should still state
+the hypothesis, result, caveats, and requested reviewer decision.
+
 When delegating or handing off, give a bounded task brief rather than a copy
 of the entire investigation transcript:
 
