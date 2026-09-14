@@ -91,7 +91,6 @@ current-state and next-action summary.
 ### Agent Development Workflow
 
 - [Local compiler build freshness](agent-workflow/03-report-current-compiler-build-freshness.md)
-- [Production-pass performance experiment template](agent-workflow/04-template-production-pass-performance-experiments.md)
 - [Reproducible validation evidence](agent-workflow/05-capture-reproducible-validation-evidence.md)
 
 ### Runtime, Core, And Focused Cleanup

@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""Compare two already-built compiler pass benchmark executables."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import statistics
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_TIMEOUT_SECONDS = 60.0
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--label", default="compiler-pass")
+    parser.add_argument("--baseline-bin", type=Path, required=True)
+    parser.add_argument("--candidate-bin", type=Path, required=True)
+    parser.add_argument("--baseline-source-root", type=Path)
+    parser.add_argument("--candidate-source-root", type=Path)
+    parser.add_argument("--allow-dirty-source", action="store_true")
+    parser.add_argument("--fixture-source", type=Path, action="append", default=[])
+    parser.add_argument("--fixture", type=Path, action="append", default=[])
+    parser.add_argument("--prefix", required=True)
+    parser.add_argument("--time-field", required=True)
+    parser.add_argument("--checksum-field", action="append", default=[])
+    parser.add_argument("--stable-field", action="append", default=[])
+    parser.add_argument("--metric-field", action="append", default=[])
+    parser.add_argument("--pairs", type=int, default=7)
+    parser.add_argument("--warmup-pairs", type=int, default=1)
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
+    parser.add_argument("--results", type=Path)
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("benchmark_args", nargs=argparse.REMAINDER)
+    return parser.parse_args()
+
+
+def executable_path(path: Path, label: str) -> Path:
+    resolved = path.resolve()
+    if not resolved.is_file():
+        raise RuntimeError(f"{label} binary does not exist: {resolved}")
+    if not os.access(resolved, os.X_OK):
+        raise RuntimeError(f"{label} binary is not executable: {resolved}")
+    return resolved
+
+
+def normalized_benchmark_args(raw_args: list[str]) -> list[str]:
+    if raw_args and raw_args[0] == "--":
+        return raw_args[1:]
+    return raw_args
+
+
+def parse_value(value: str) -> Any:
+    if value == "True":
+        return True
+    if value == "False":
+        return False
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
+
+def parse_prefixed_fields(stdout: str, prefix: str) -> dict[str, Any]:
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    matching = [line for line in lines if line.startswith(prefix + " ")]
+    if len(matching) != 1:
+        raise RuntimeError(f"unexpected benchmark output for {prefix}:\n{stdout}")
+    result: dict[str, Any] = {}
+    for field in matching[0].split()[1:]:
+        if "=" not in field:
+            raise RuntimeError(f"malformed benchmark field: {field}")
+        key, value = field.split("=", 1)
+        result[key] = parse_value(value)
+    return result
+
+
+def run_benchmark_sample(
+    label: str,
+    binary: Path,
+    benchmark_args: list[str],
+    prefix: str,
+    timeout: float,
+) -> dict[str, Any]:
+    started = time.perf_counter_ns()
+    try:
+        completed = subprocess.run(
+            [str(binary), *benchmark_args],
+            cwd=binary.parent,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"benchmark command timed out for {label}: {binary}") from error
+    process_elapsed_microseconds = (time.perf_counter_ns() - started) // 1000
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"benchmark command failed for {label} with status {completed.returncode}:\n"
+            + completed.stdout
+            + completed.stderr
+        )
+    sample = parse_prefixed_fields(completed.stdout, prefix)
+    sample["process_elapsed_microseconds"] = process_elapsed_microseconds
+    return sample
+
+
+def git_source_state(root: Path | None) -> dict[str, Any]:
+    if root is None:
+        return {
+            "provenance": "unknown",
+            "reason": "source root not supplied",
+            "root": None,
+            "git": None,
+            "dirty": None,
+            "revision": None,
+        }
+    resolved = root.resolve()
+    if not resolved.exists():
+        raise RuntimeError(f"source root does not exist: {resolved}")
+    revision = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=resolved,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if revision.returncode != 0:
+        return {
+            "provenance": "unknown",
+            "reason": "not a git worktree",
+            "root": str(resolved),
+            "git": False,
+            "dirty": None,
+            "revision": None,
+        }
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=resolved,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if status.returncode != 0:
+        raise RuntimeError(f"could not inspect git status for {resolved}:\n{status.stderr}")
+    return {
+        "provenance": "git",
+        "root": str(resolved),
+        "git": True,
+        "revision": revision.stdout.strip(),
+        "dirty": status.stdout.strip() != "",
+        "status": status.stdout.splitlines(),
+    }
+
+
+def fixture_hashes(paths: list[Path]) -> dict[str, dict[str, Any]]:
+    hashes: dict[str, dict[str, Any]] = {}
+    for path in paths:
+        resolved = path.resolve()
+        if not resolved.is_file():
+            raise RuntimeError(f"fixture does not exist: {resolved}")
+        hashes[str(resolved)] = {
+            "sha256": sha256_file(resolved),
+            "bytes": resolved.stat().st_size,
+        }
+    return hashes
+
+
+def validate_relative_fixture_source(path: Path) -> Path:
+    if path.is_absolute():
+        raise RuntimeError(f"--fixture-source must be relative to each source root: {path}")
+    if any(part == ".." for part in path.parts):
+        raise RuntimeError(f"--fixture-source cannot contain '..': {path}")
+    return path
+
+
+def paired_fixture_source_hashes(
+    paths: list[Path],
+    baseline_root: Path | None,
+    candidate_root: Path | None,
+) -> dict[str, dict[str, Any]]:
+    if not paths:
+        return {}
+    if baseline_root is None or candidate_root is None:
+        raise RuntimeError("--fixture-source requires both source roots")
+    baseline_root = baseline_root.resolve()
+    candidate_root = candidate_root.resolve()
+    hashes: dict[str, dict[str, Any]] = {}
+    for raw_path in paths:
+        relative_path = validate_relative_fixture_source(raw_path)
+        baseline_path = (baseline_root / relative_path).resolve()
+        candidate_path = (candidate_root / relative_path).resolve()
+        if not baseline_path.is_relative_to(baseline_root):
+            raise RuntimeError(f"baseline fixture source escapes source root: {relative_path}")
+        if not candidate_path.is_relative_to(candidate_root):
+            raise RuntimeError(f"candidate fixture source escapes source root: {relative_path}")
+        if not baseline_path.is_file():
+            raise RuntimeError(f"baseline fixture source does not exist: {baseline_path}")
+        if not candidate_path.is_file():
+            raise RuntimeError(f"candidate fixture source does not exist: {candidate_path}")
+        baseline_hash = sha256_file(baseline_path)
+        candidate_hash = sha256_file(candidate_path)
+        if baseline_hash != candidate_hash:
+            raise RuntimeError(f"baseline/candidate fixture source mismatch: {relative_path}")
+        hashes[relative_path.as_posix()] = {
+            "baseline": {
+                "path": str(baseline_path),
+                "sha256": baseline_hash,
+                "bytes": baseline_path.stat().st_size,
+            },
+            "candidate": {
+                "path": str(candidate_path),
+                "sha256": candidate_hash,
+                "bytes": candidate_path.stat().st_size,
+            },
+            "identical": True,
+        }
+    return hashes
+
+
+def median_int(samples: list[dict[str, Any]], field: str) -> int:
+    return int(statistics.median(int(sample[field]) for sample in samples))
+
+
+def validate_sample_fields(samples: list[dict[str, Any]], fields: list[str]) -> None:
+    for sample in samples:
+        for field in fields:
+            if field not in sample:
+                raise RuntimeError(f"benchmark sample missing required field: {field}")
+
+
+def validate_identity(
+    baseline: list[dict[str, Any]],
+    candidate: list[dict[str, Any]],
+    fields: list[str],
+) -> None:
+    expected = baseline[0]
+    for sample in [*baseline, *candidate]:
+        for field in fields:
+            if sample[field] != expected[field]:
+                raise RuntimeError(f"baseline/candidate output mismatch: {field}")
+
+
+def compare(args: argparse.Namespace) -> dict[str, Any]:
+    if args.pairs < 1:
+        raise RuntimeError("--pairs must be at least 1")
+    if args.warmup_pairs < 0:
+        raise RuntimeError("--warmup-pairs cannot be negative")
+    if args.timeout <= 0:
+        raise RuntimeError("--timeout must be positive")
+    if not args.checksum_field:
+        raise RuntimeError("--checksum-field is required for semantic identity")
+
+    baseline_bin = executable_path(args.baseline_bin, "baseline")
+    candidate_bin = executable_path(args.candidate_bin, "candidate")
+    benchmark_args = normalized_benchmark_args(args.benchmark_args)
+    identity_fields = sorted(set(args.checksum_field + args.stable_field))
+    metric_fields = sorted(set([args.time_field, *args.metric_field]))
+    required_fields = sorted(set(identity_fields + metric_fields))
+    baseline_source = git_source_state(args.baseline_source_root)
+    candidate_source = git_source_state(args.candidate_source_root)
+    paired_fixture_sources = paired_fixture_source_hashes(
+        args.fixture_source,
+        args.baseline_source_root,
+        args.candidate_source_root,
+    )
+    for label, source in (("baseline", baseline_source), ("candidate", candidate_source)):
+        if source is not None and source.get("dirty") and not args.allow_dirty_source:
+            raise RuntimeError(
+                f"{label} source root is dirty; commit/stash changes or pass --allow-dirty-source"
+            )
+
+    for _ in range(args.warmup_pairs):
+        run_benchmark_sample("baseline warmup", baseline_bin, benchmark_args, args.prefix, args.timeout)
+        run_benchmark_sample("candidate warmup", candidate_bin, benchmark_args, args.prefix, args.timeout)
+
+    raw_pairs: list[dict[str, Any]] = []
+    execution_order: list[str] = []
+    raw_by_label: dict[str, list[dict[str, Any]]] = {"baseline": [], "candidate": []}
+    for index in range(args.pairs):
+        labels = ("baseline", "candidate") if index % 2 == 0 else ("candidate", "baseline")
+        pair: dict[str, Any] = {"pair": index}
+        for label in labels:
+            binary = baseline_bin if label == "baseline" else candidate_bin
+            sample = run_benchmark_sample(label, binary, benchmark_args, args.prefix, args.timeout)
+            validate_sample_fields([sample], required_fields)
+            pair[label] = sample
+            raw_by_label[label].append(sample)
+            execution_order.append(label)
+        raw_pairs.append(pair)
+
+    validate_identity(raw_by_label["baseline"], raw_by_label["candidate"], identity_fields)
+
+    paired_deltas: list[dict[str, int]] = []
+    for pair in raw_pairs:
+        paired_deltas.append({
+            "pair": int(pair["pair"]),
+            args.time_field: int(pair["candidate"][args.time_field]) - int(pair["baseline"][args.time_field]),
+        })
+
+    baseline_time = median_int(raw_by_label["baseline"], args.time_field)
+    candidate_time = median_int(raw_by_label["candidate"], args.time_field)
+    median: dict[str, Any] = {
+        f"baseline_{args.time_field}": baseline_time,
+        f"candidate_{args.time_field}": candidate_time,
+        f"{args.time_field}_delta": candidate_time - baseline_time,
+        f"{args.time_field}_ratio": (
+            candidate_time / baseline_time if baseline_time != 0 else None
+        ),
+    }
+    for field in args.metric_field:
+        baseline_value = median_int(raw_by_label["baseline"], field)
+        candidate_value = median_int(raw_by_label["candidate"], field)
+        median[f"baseline_{field}"] = baseline_value
+        median[f"candidate_{field}"] = candidate_value
+        median[f"{field}_delta"] = candidate_value - baseline_value
+        median[f"{field}_ratio"] = candidate_value / baseline_value if baseline_value != 0 else None
+
+    return {
+        "mode": "paired",
+        "label": args.label,
+        "prefix": args.prefix,
+        "pairs": args.pairs,
+        "warmup_pairs": args.warmup_pairs,
+        "argument_vector": benchmark_args,
+        "time_field": args.time_field,
+        "checksum_fields": args.checksum_field,
+        "stable_fields": args.stable_field,
+        "metric_fields": args.metric_field,
+        "execution_order": execution_order,
+        "fixture_hashes": fixture_hashes(args.fixture),
+        "paired_fixture_sources": paired_fixture_sources,
+        "platform": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "machine": platform.machine(),
+            "python": platform.python_version(),
+        },
+        "baseline": {
+            "binary": str(baseline_bin),
+            "binary_sha256": sha256_file(baseline_bin),
+            "source": baseline_source,
+        },
+        "candidate": {
+            "binary": str(candidate_bin),
+            "binary_sha256": sha256_file(candidate_bin),
+            "source": candidate_source,
+        },
+        "raw_pairs": raw_pairs,
+        "paired_deltas": paired_deltas,
+        "median": median,
+    }
+
+
+def print_text_result(result: dict[str, Any]) -> None:
+    median = result["median"]
+    print(
+        "COMPILER_PASS_COMPARE "
+        f"label={result['label']} "
+        f"pairs={result['pairs']} "
+        f"time_field={result['time_field']} "
+        f"baseline_time={median['baseline_' + result['time_field']]} "
+        f"candidate_time={median['candidate_' + result['time_field']]} "
+        f"delta={median[result['time_field'] + '_delta']} "
+        f"ratio={median[result['time_field'] + '_ratio']} "
+        f"baseline_binary_sha256={result['baseline']['binary_sha256']} "
+        f"candidate_binary_sha256={result['candidate']['binary_sha256']}"
+    )
+
+
+def main() -> int:
+    args = parse_args()
+    result = compare(args)
+    if args.results is not None:
+        args.results.parent.mkdir(parents=True, exist_ok=True)
+        args.results.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if args.json:
+        print(json.dumps(result, sort_keys=True))
+    else:
+        print_text_result(result)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as error:
+        print(f"error: {error}", file=sys.stderr)
+        raise SystemExit(1)

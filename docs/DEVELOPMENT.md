@@ -455,6 +455,13 @@ A tall inclusive function may mostly contain expensive descendants. Use self
 time, call counts, source inspection, and a bounded microbenchmark to
 distinguish local cost, cumulative cost, and scaling.
 
+For production-pass optimization experiments, prefer a paired benchmark before
+making a speed claim. `benchmarks/compiler_pass_compare` alternates two already
+executable pass benchmarks, preserves raw pairs, reports binary/source/fixture
+provenance, and fails closed when semantic checksums differ. See
+[`benchmarks/README.md`](../benchmarks/README.md#paired-production-pass-comparison)
+for the Core consume-specialization and typecheck-phase pilot commands.
+
 ## Compiler Benchmarks
 
 Compiler benchmark wrappers live in `benchmarks/`; fixtures and workers live in
