@@ -1,0 +1,587 @@
+-- Isolated implementation-pattern obligation traversal profile.
+--
+-- The counted windows mirror the post-substitution bound traversal in
+-- `implementation_pattern_matches_with`; the production window times the real
+-- matcher on the same synthetic implementation shape.
+import:
+	../../src/lib/source: SourceSpan, source_file, source_span, source_start
+	../../src/compiler/stage_06_typecheck/type_system/env:
+		TraitObligation,
+		implementation_pattern_matches_with
+	../../src/compiler/stage_06_typecheck/type_system/generic_params:
+		BoundTraitIdentity,
+		BoundTraitOwner(CompilerBuiltinBoundTraitOwner),
+		BoundTypeParam,
+		make_resolved_bound_type_param
+	../../src/compiler/stage_06_typecheck/type_system/semantic_type:
+		SemanticType(SemanticNamedType),
+		SemanticTypeSubstEntry,
+		type_subst_entry
+	instrumentation: begin_function_profile_window, black_box_int, end_function_profile_window
+	memory: MemStats, get_mem_stats, reset_mem_stats
+	string: parse_int
+	system: now_microseconds
+
+
+private MISS_TRAIT_NAME: String = "MissingProfileTrait"
+
+private DUPLICATE_TRAIT_NAME: String = "DuplicateProfileTrait"
+
+
+struct ImplementationPatternProfileConfig {
+	iterations: Int,
+	bound_parameter_count: Int,
+	traits_per_parameter: Int,
+	duplicate_obligation_stride: Int,
+	miss_obligation_index: Int
+}
+
+
+struct ImplementationPatternProfileWindow {
+	elapsed_microseconds: Int,
+	pattern_match_requests: Int,
+	bound_parameters_visited: Int,
+	trait_obligations_visited: Int,
+	substitution_entries_compared: Int,
+	obligation_satisfied_calls: Int,
+	enumeration_allocations: Int,
+	matched_requests: Int,
+	semantic_checksum: Int,
+	total_allocations: Int,
+	total_releases: Int,
+	retained_objects: Int,
+	allocated_bytes: Int,
+	workload_valid: Bool
+}
+
+
+struct ImplementationPatternProfileResult {
+	iterations: Int,
+	bound_parameter_count: Int,
+	traits_per_parameter: Int,
+	duplicate_obligation_stride: Int,
+	miss_obligation_index: Int,
+	baseline_scan: ImplementationPatternProfileWindow,
+	indexed_scan: ImplementationPatternProfileWindow,
+	production_match: ImplementationPatternProfileWindow,
+	workload_valid: Bool
+}
+
+
+private record ImplementationPatternProfileWorkload {
+	bounds: List[BoundTypeParam],
+	substitution: List[SemanticTypeSubstEntry],
+	for_type: SemanticType,
+	actual_type: SemanticType,
+	successful_request: Bool,
+	expected_bound_visits: Int,
+	expected_obligation_visits: Int,
+	expected_substitution_comparisons: Int
+}
+
+
+private record CountedSubstitutionLookup {
+	concrete_type: Option[SemanticType],
+	comparisons: Int
+}
+
+
+private pure func positive_argument(args: List[String], index: Int, default: Int) -> Int:
+	match args.get(index):
+		Some(text):
+			match parse_int(text):
+				Some(value):
+					if value > 0:
+						value
+					else:
+						default
+				None:
+					default
+		None:
+			default
+
+
+private pure func nonnegative_argument(args: List[String], index: Int, default: Int) -> Int:
+	match args.get(index):
+		Some(text):
+			match parse_int(text):
+				Some(value):
+					if value >= 0:
+						value
+					else:
+						default
+				None:
+					default
+		None:
+			default
+
+
+private pure func type_parameter_name(index: Int) -> String:
+	"ProfileT" + index.to_string()
+
+
+private pure func concrete_type_name(index: Int) -> String:
+	"ProfileConcrete" + index.to_string()
+
+
+private pure func ordinary_trait_name(bound_index: Int, trait_index: Int) -> String:
+	"ProfileTrait" + bound_index.to_string() + "_" + trait_index.to_string()
+
+
+private pure func linear_obligation_index(
+	traits_per_parameter: Int,
+	bound_index: Int,
+	trait_index: Int,
+) -> Int:
+	bound_index * traits_per_parameter + trait_index
+
+
+private pure func profile_trait_name(
+	config: ImplementationPatternProfileConfig,
+	bound_index: Int,
+	trait_index: Int,
+) -> String:
+	obligation_index = linear_obligation_index(config.traits_per_parameter, bound_index, trait_index)
+
+	if config.miss_obligation_index == obligation_index:
+		MISS_TRAIT_NAME
+	else if (
+		config.duplicate_obligation_stride > 0
+		and obligation_index % config.duplicate_obligation_stride == 0
+	):
+		DUPLICATE_TRAIT_NAME
+	else:
+		ordinary_trait_name(bound_index, trait_index)
+
+
+private pure func profile_source_span() -> SourceSpan:
+	src = source_file("profile/implementation_pattern.brp", "profile/implementation_pattern", "")
+	cursor = source_start(src)
+	source_span(src, cursor, cursor)
+
+
+private pure func profile_bound_trait_identity(trait_name: String) -> BoundTraitIdentity:
+	{
+		owner = CompilerBuiltinBoundTraitOwner,
+		definition_id = trait_name.length(),
+		name = trait_name,
+		span = profile_source_span()
+	}
+
+
+private pure func profile_bound(
+	config: ImplementationPatternProfileConfig,
+	bound_index: Int,
+) -> BoundTypeParam:
+	var bound_identities: List[BoundTraitIdentity] = []
+	var trait_index: Int = 0
+
+	while trait_index < config.traits_per_parameter:
+		trait_name = profile_trait_name(config, bound_index, trait_index)
+		bound_identities = bound_identities.append(profile_bound_trait_identity(trait_name))
+		trait_index += 1
+
+	make_resolved_bound_type_param(type_parameter_name(bound_index), bound_identities)
+
+
+private pure func profile_type_args(count: Int, concrete: Bool) -> List[SemanticType]:
+	var args: List[SemanticType] = []
+	var index: Int = 0
+
+	while index < count:
+		name = if concrete:
+			concrete_type_name(index)
+		else:
+			type_parameter_name(index)
+
+		args = args.append(SemanticNamedType(name, []))
+		index += 1
+
+	args
+
+
+private pure func profile_substitution(count: Int) -> List[SemanticTypeSubstEntry]:
+	var entries: List[SemanticTypeSubstEntry] = []
+	var index: Int = 0
+
+	while index < count:
+		entries = entries.append(
+			type_subst_entry(
+				type_parameter_name(index),
+				SemanticNamedType(concrete_type_name(index), []),
+			),
+		)
+		index += 1
+
+	entries
+
+
+private pure func expected_request_obligation_visits(
+	config: ImplementationPatternProfileConfig,
+) -> Int:
+	total_obligations = config.bound_parameter_count * config.traits_per_parameter
+
+	if config.miss_obligation_index >= 0 and config.miss_obligation_index < total_obligations:
+		config.miss_obligation_index + 1
+	else:
+		total_obligations
+
+
+private pure func expected_request_bound_visits(config: ImplementationPatternProfileConfig) -> Int:
+	if config.traits_per_parameter == 0:
+		config.bound_parameter_count
+	else:
+		visited_obligations = expected_request_obligation_visits(config)
+		(visited_obligations + config.traits_per_parameter - 1) / config.traits_per_parameter
+
+
+private pure func expected_request_substitution_comparisons(
+	config: ImplementationPatternProfileConfig,
+) -> Int:
+	bounds_visited = expected_request_bound_visits(config)
+	bounds_visited * (bounds_visited + 1) / 2
+
+
+private pure func implementation_pattern_profile_workload(
+	config: ImplementationPatternProfileConfig,
+) -> ImplementationPatternProfileWorkload:
+	var bounds: List[BoundTypeParam] = []
+	var index: Int = 0
+
+	while index < config.bound_parameter_count:
+		bounds = bounds.append(profile_bound(config, index))
+		index += 1
+
+	{
+		bounds = bounds,
+		substitution = profile_substitution(config.bound_parameter_count),
+		for_type = SemanticNamedType(
+			"ProfileCarrier",
+			profile_type_args(config.bound_parameter_count, False),
+		),
+		actual_type = SemanticNamedType(
+			"ProfileCarrier",
+			profile_type_args(config.bound_parameter_count, True),
+		),
+		successful_request = (
+			config.miss_obligation_index < 0
+			or config.miss_obligation_index >= config.bound_parameter_count * config.traits_per_parameter
+		),
+		expected_bound_visits = expected_request_bound_visits(config),
+		expected_obligation_visits = expected_request_obligation_visits(config),
+		expected_substitution_comparisons = expected_request_substitution_comparisons(config)
+	}
+
+
+private pure func counted_substitution_lookup(
+	substitution: List[SemanticTypeSubstEntry],
+	name: String,
+) -> CountedSubstitutionLookup:
+	var result: Option[SemanticType] = None
+	var comparisons: Int = 0
+
+	for entry in substitution:
+		comparisons += 1
+
+		if entry.var_name == name:
+			result = Some(entry.concrete_type)
+			break
+
+	{
+		concrete_type = result,
+		comparisons = comparisons
+	}
+
+
+private pure func empty_window() -> ImplementationPatternProfileWindow:
+	{
+		elapsed_microseconds = 0,
+		pattern_match_requests = 0,
+		bound_parameters_visited = 0,
+		trait_obligations_visited = 0,
+		substitution_entries_compared = 0,
+		obligation_satisfied_calls = 0,
+		enumeration_allocations = 0,
+		matched_requests = 0,
+		semantic_checksum = 0,
+		total_allocations = 0,
+		total_releases = 0,
+		retained_objects = 0,
+		allocated_bytes = 0,
+		workload_valid = True
+	}
+
+
+private pure func window_with_memory(
+	window: ImplementationPatternProfileWindow,
+	elapsed_microseconds: Int,
+	stats: MemStats,
+) -> ImplementationPatternProfileWindow:
+	{ window |
+		elapsed_microseconds = elapsed_microseconds,
+		total_allocations = stats.total_allocations,
+		total_releases = stats.total_releases,
+		retained_objects = stats.current_objects,
+		allocated_bytes = stats.bytes_allocated
+	}
+
+
+private pure func obligation_satisfied_for_profile(
+	obligation: TraitObligation,
+	bound_identity: Option[BoundTraitIdentity],
+) -> Bool:
+	identity_matches = match bound_identity:
+		Some(identity):
+			(
+				identity.name == obligation.trait_name
+				and identity.definition_id == obligation.trait_name.length()
+			)
+		None:
+			False
+
+	identity_matches and obligation.trait_name != MISS_TRAIT_NAME
+
+
+private pure func checksum_obligation(concrete_type: SemanticType, trait_name: String) -> Int:
+	match concrete_type:
+		SemanticNamedType(name, _):
+			name.length() * 31 + trait_name.length()
+		_:
+			trait_name.length()
+
+
+private func counted_enumerated_scan_window(
+	workload: ImplementationPatternProfileWorkload,
+	config: ImplementationPatternProfileConfig,
+) -> ImplementationPatternProfileWindow:
+	var window: ImplementationPatternProfileWindow = empty_window()
+	var iteration: Int = 0
+
+	reset_mem_stats()
+	started: Int = now_microseconds()
+
+	while iteration < config.iterations:
+		var satisfied: Bool = True
+		window = { window | pattern_match_requests = window.pattern_match_requests + 1 }
+
+		for bound in workload.bounds:
+			lookup = counted_substitution_lookup(workload.substitution, bound.name)
+			window = { window |
+				bound_parameters_visited = window.bound_parameters_visited + 1,
+				substitution_entries_compared = (
+					window.substitution_entries_compared + lookup.comparisons
+				)
+			}
+
+			match lookup.concrete_type:
+				Some(concrete_type):
+					window = { window | enumeration_allocations = window.enumeration_allocations + 1 }
+
+					for indexed_trait_name in bound.bounds.enumerate():
+						trait_name = indexed_trait_name[1]
+						obligation_satisfied = trait_name != MISS_TRAIT_NAME
+						window = { window |
+							trait_obligations_visited = window.trait_obligations_visited + 1,
+							obligation_satisfied_calls = window.obligation_satisfied_calls + 1,
+							semantic_checksum = black_box_int(
+								window.semantic_checksum + checksum_obligation(concrete_type, trait_name),
+							)
+						}
+
+						if not obligation_satisfied:
+							satisfied = False
+							break
+				None:
+					void
+
+			if not satisfied:
+				break
+
+		if satisfied:
+			window = { window | matched_requests = window.matched_requests + 1 }
+
+		iteration += 1
+
+	elapsed_microseconds: Int = now_microseconds() - started
+	stats = get_mem_stats()
+	window_with_memory(window, elapsed_microseconds, stats)
+
+
+private func counted_indexed_scan_window(
+	workload: ImplementationPatternProfileWorkload,
+	config: ImplementationPatternProfileConfig,
+) -> ImplementationPatternProfileWindow:
+	var window: ImplementationPatternProfileWindow = empty_window()
+	var iteration: Int = 0
+
+	reset_mem_stats()
+	started: Int = now_microseconds()
+
+	while iteration < config.iterations:
+		var satisfied: Bool = True
+		window = { window | pattern_match_requests = window.pattern_match_requests + 1 }
+
+		for bound in workload.bounds:
+			lookup = counted_substitution_lookup(workload.substitution, bound.name)
+			window = { window |
+				bound_parameters_visited = window.bound_parameters_visited + 1,
+				substitution_entries_compared = (
+					window.substitution_entries_compared + lookup.comparisons
+				)
+			}
+
+			match lookup.concrete_type:
+				Some(concrete_type):
+					var trait_index: Int = 0
+
+					for trait_name in bound.bounds:
+						obligation_satisfied = trait_name != MISS_TRAIT_NAME
+						window = { window |
+							trait_obligations_visited = window.trait_obligations_visited + 1,
+							obligation_satisfied_calls = window.obligation_satisfied_calls + 1,
+							semantic_checksum = black_box_int(
+								window.semantic_checksum + checksum_obligation(concrete_type, trait_name),
+							)
+						}
+
+						if not obligation_satisfied:
+							satisfied = False
+							break
+
+						trait_index += 1
+				None:
+					void
+
+			if not satisfied:
+				break
+
+		if satisfied:
+			window = { window | matched_requests = window.matched_requests + 1 }
+
+		iteration += 1
+
+	elapsed_microseconds: Int = now_microseconds() - started
+	stats = get_mem_stats()
+	window_with_memory(window, elapsed_microseconds, stats)
+
+
+private func production_match_window(
+	workload: ImplementationPatternProfileWorkload,
+	config: ImplementationPatternProfileConfig,
+) -> ImplementationPatternProfileWindow:
+	var window: ImplementationPatternProfileWindow = empty_window()
+	var iteration: Int = 0
+
+	reset_mem_stats()
+	begin_function_profile_window()
+	started: Int = now_microseconds()
+
+	while iteration < config.iterations:
+		matched = implementation_pattern_matches_with(
+			workload.for_type,
+			workload.bounds,
+			workload.actual_type,
+			obligation_satisfied_for_profile,
+		)
+		next_matched_requests = if matched:
+			window.matched_requests + 1
+		else:
+			window.matched_requests
+		next_checksum = if matched:
+			window.semantic_checksum + 1
+		else:
+			window.semantic_checksum
+
+		window = { window |
+			pattern_match_requests = window.pattern_match_requests + 1,
+			matched_requests = next_matched_requests,
+			semantic_checksum = black_box_int(next_checksum)
+		}
+		iteration += 1
+
+	elapsed_microseconds: Int = now_microseconds() - started
+	end_function_profile_window()
+	stats = get_mem_stats()
+	window_with_memory(window, elapsed_microseconds, stats)
+
+
+private pure func expected_window_valid(
+	workload: ImplementationPatternProfileWorkload,
+	config: ImplementationPatternProfileConfig,
+	window: ImplementationPatternProfileWindow,
+) -> Bool:
+	expected_matched_requests = if workload.successful_request:
+		config.iterations
+	else:
+		0
+
+	(
+		window.pattern_match_requests == config.iterations
+		and window.bound_parameters_visited == workload.expected_bound_visits * config.iterations
+		and window.trait_obligations_visited == workload.expected_obligation_visits * config.iterations
+		and window.substitution_entries_compared
+			== workload.expected_substitution_comparisons * config.iterations
+		and window.obligation_satisfied_calls == window.trait_obligations_visited
+		and window.matched_requests == expected_matched_requests
+		and window.total_allocations >= window.total_releases
+		and window.workload_valid
+	)
+
+
+func implementation_pattern_profile(
+	config: ImplementationPatternProfileConfig,
+) -> ImplementationPatternProfileResult:
+	workload = implementation_pattern_profile_workload(config)
+	baseline_scan = counted_enumerated_scan_window(workload, config)
+	indexed_scan = counted_indexed_scan_window(workload, config)
+	production_match = production_match_window(workload, config)
+	expected_matched_requests = if workload.successful_request:
+		config.iterations
+	else:
+		0
+	valid = (
+		expected_window_valid(workload, config, baseline_scan)
+		and expected_window_valid(workload, config, indexed_scan)
+		and baseline_scan.enumeration_allocations
+			== baseline_scan.bound_parameters_visited
+		and indexed_scan.enumeration_allocations == 0
+		and baseline_scan.semantic_checksum == indexed_scan.semantic_checksum
+		and production_match.pattern_match_requests == config.iterations
+		and production_match.matched_requests == expected_matched_requests
+		and production_match.total_allocations >= production_match.total_releases
+	)
+
+	{
+		iterations = config.iterations,
+		bound_parameter_count = config.bound_parameter_count,
+		traits_per_parameter = config.traits_per_parameter,
+		duplicate_obligation_stride = config.duplicate_obligation_stride,
+		miss_obligation_index = config.miss_obligation_index,
+		baseline_scan = baseline_scan,
+		indexed_scan = indexed_scan,
+		production_match = production_match,
+		workload_valid = valid
+	}
+
+
+private pure func default_config(args: List[String]) -> ImplementationPatternProfileConfig:
+	{
+		iterations = positive_argument(args, 1, 20000),
+		bound_parameter_count = positive_argument(args, 2, 32),
+		traits_per_parameter = positive_argument(args, 3, 8),
+		duplicate_obligation_stride = nonnegative_argument(args, 4, 0),
+		miss_obligation_index = nonnegative_argument(args, 5, 1000000000)
+	}
+
+
+func main(args: List[String]) -> Int:
+	result = implementation_pattern_profile(default_config(args))
+
+	print(
+		"IMPLEMENTATION_PATTERN_PROFILE" + " iterations=" + result.iterations.to_string() + " bound_parameters=" + result.bound_parameter_count.to_string() + " traits_per_parameter=" + result.traits_per_parameter.to_string() + " duplicate_obligation_stride=" + result.duplicate_obligation_stride.to_string() + " miss_obligation_index=" + result.miss_obligation_index.to_string() + " baseline_elapsed_microseconds=" + result.baseline_scan.elapsed_microseconds.to_string() + " indexed_elapsed_microseconds=" + result.indexed_scan.elapsed_microseconds.to_string() + " production_elapsed_microseconds=" + result.production_match.elapsed_microseconds.to_string() + " pattern_match_requests=" + result.baseline_scan.pattern_match_requests.to_string() + " bound_parameters_visited=" + result.baseline_scan.bound_parameters_visited.to_string() + " trait_obligations_visited=" + result.baseline_scan.trait_obligations_visited.to_string() + " substitution_entries_compared=" + result.baseline_scan.substitution_entries_compared.to_string() + " obligation_satisfied_calls=" + result.baseline_scan.obligation_satisfied_calls.to_string() + " baseline_enumeration_allocations=" + result.baseline_scan.enumeration_allocations.to_string() + " indexed_enumeration_allocations=" + result.indexed_scan.enumeration_allocations.to_string() + " baseline_semantic_checksum=" + result.baseline_scan.semantic_checksum.to_string() + " indexed_semantic_checksum=" + result.indexed_scan.semantic_checksum.to_string() + " production_semantic_checksum=" + result.production_match.semantic_checksum.to_string() + " baseline_total_allocations=" + result.baseline_scan.total_allocations.to_string() + " indexed_total_allocations=" + result.indexed_scan.total_allocations.to_string() + " production_total_allocations=" + result.production_match.total_allocations.to_string() + " baseline_total_releases=" + result.baseline_scan.total_releases.to_string() + " indexed_total_releases=" + result.indexed_scan.total_releases.to_string() + " production_total_releases=" + result.production_match.total_releases.to_string() + " baseline_retained_objects=" + result.baseline_scan.retained_objects.to_string() + " indexed_retained_objects=" + result.indexed_scan.retained_objects.to_string() + " production_retained_objects=" + result.production_match.retained_objects.to_string() + " baseline_allocated_bytes=" + result.baseline_scan.allocated_bytes.to_string() + " indexed_allocated_bytes=" + result.indexed_scan.allocated_bytes.to_string() + " production_allocated_bytes=" + result.production_match.allocated_bytes.to_string() + " workload_valid=" + result.workload_valid.to_string(),
+	)
+
+	if result.workload_valid:
+		0
+	else:
+		1

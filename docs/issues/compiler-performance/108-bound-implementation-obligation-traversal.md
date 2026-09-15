@@ -1,13 +1,18 @@
 # Bound Implementation-Obligation Traversal
 
-**Status:** Proposed diagnosis; refactor not yet admitted
+**Status:** Accepted narrow refactor; substitution lookup remains separate
 
 **Current state:** `implementation_pattern_matches_with` iterates bound type
-parameters and each parameter's trait bounds. It ran 101,735 times in the
-retained self-compile. The structural analyzer reports a nested traversal, but
-the true work may simply be the total number of declared obligations.
-**Next action:** Add counters that distinguish total obligation visits from
-repeated reconstruction and lookup.
+parameters and each parameter's trait bounds. The retained profile confirmed
+that obligation visits are aggregate-linear in declared obligations, while
+`bound.bounds.enumerate()` materialized one indexed collection per visited
+bound. The accepted change carries the trait index manually and preserves
+short-circuit order and bound identity lookup. Substitution lookup still
+performs a linear scan per visited bound; indexing that lookup remains outside
+this issue.
+**Evidence:** [`benchmarks/results/compiler_implementation_pattern_obligation_traversal_2026-09-15.md`](../../../benchmarks/results/compiler_implementation_pattern_obligation_traversal_2026-09-15.md).
+**Next action:** None for the obligation traversal. Open a separate issue if
+substitution lookup width becomes production-significant.
 **Read first:** `blorp/src/compiler/stage_06_typecheck/type_system/env.brp`,
 `blorp/src/compiler/stage_06_typecheck/type_system/accepted_trait_implementation_authority.brp`, `blorp/test/compiler/stage_06_typecheck/test_accepted_semantic_catalog.brp`, and the
 [call-count screen](../../../benchmarks/results/compiler_complexity_call_counts_2026-09-14.md).
