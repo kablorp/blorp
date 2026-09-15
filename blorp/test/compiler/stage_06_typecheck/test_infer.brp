@@ -263,6 +263,7 @@ import:
 		source_cursor_at,
 		source_file,
 		source_span,
+	list: list
 	test: TestSuite
 
 
@@ -1724,6 +1725,29 @@ pure func add_variadic_test_function(
 	param_names: List[Option[String]],
 	return_type: SemanticType,
 ) -> TypecheckState:
+	add_variadic_test_function_with_params(
+		state,
+		name,
+		param_types,
+		param_names,
+		return_type,
+		["#Ds"],
+	)
+
+
+pure func add_variadic_test_function_with_params(
+	state: TypecheckState,
+	name: String,
+	param_types: List[SemanticType],
+	param_names: List[Option[String]],
+	return_type: SemanticType,
+	type_param_names: List[String],
+) -> TypecheckState:
+	var type_params = list(type_param_names.length())
+
+	for type_param_name in type_param_names:
+		type_params = type_params.append(make_bound_type_param(type_param_name, []))
+
 	match env_mint_def_id(state.env):
 		(next_env, def_id):
 			{ state | env = env_add_func_with_info(
@@ -1732,7 +1756,7 @@ pure func add_variadic_test_function(
 					func_symbol(
 						def_id,
 						SemanticFunctionType(True, param_types, return_type),
-						[make_bound_type_param("#Ds", [])],
+						type_params,
 						param_names,
 						Pure,
 						UserDefinedFunc,
@@ -1784,6 +1808,65 @@ pure func state_with_variadic_traversal_functions() -> TypecheckState:
 		[shared_param, shared_param],
 		[Some("left"), Some("right")],
 		TYPE_INT,
+	)
+
+
+pure func state_with_mixed_variadic_return_function() -> TypecheckState:
+	actual_type = SemanticArrayType(
+		TYPE_FLOAT,
+		[
+			SemanticConstIntType(3),
+			SemanticConstIntType(4),
+			SemanticConstIntType(5),
+		],
+	)
+	param_type = SemanticArrayType(TYPE_FLOAT, [SemanticVarDimsType("#Ds")])
+	return_type = SemanticTupleType([
+		SemanticArrayType(
+			TYPE_FLOAT,
+			[
+				SemanticConstIntType(1),
+				SemanticVarDimsType("#Ds"),
+				SemanticConstIntType(2),
+				SemanticVarDimsType("#Missing"),
+				SemanticVarDimsType("#Ds"),
+			],
+		),
+		SemanticNamedType(
+			"Result",
+			[
+				SemanticArrayType(
+					TYPE_FLOAT,
+					[
+						SemanticDimOpType(
+							SemanticDimMultiply,
+							SemanticConstIntType(2),
+							SemanticConstIntType(3),
+						),
+						SemanticVarDimsType("#Ds"),
+					],
+				),
+				SemanticFunctionType(
+					True,
+					[SemanticArrayType(TYPE_FLOAT, [SemanticVarDimsType("#Ds")])],
+					SemanticArrayType(TYPE_FLOAT, [SemanticVarDimsType("#Missing")]),
+				),
+			],
+		),
+	])
+	state = add_infer_value(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		"mixed_values",
+		actual_type,
+	)
+
+	add_variadic_test_function_with_params(
+		state,
+		"mixed_variadic_return",
+		[param_type],
+		[Some("values")],
+		return_type,
+		["#Ds", "#Missing"],
 	)
 
 
@@ -6090,6 +6173,63 @@ func test_shared_variadic_dims_report_exact_conflict() -> Bool:
 			+ "different names for independent dimensions"
 		),
 	]
+
+
+func test_variadic_dims_resolution_preserves_mixed_return_order() -> Bool:
+	result = infer_expr(
+		infer_context(state_with_mixed_variadic_return_function()),
+		call_expr(
+			ParsedNameExpr(ident("mixed_variadic_return")),
+			[ParsedNameExpr(ident("mixed_values"))],
+		),
+	)
+	expected = SemanticTupleType([
+		SemanticArrayType(
+			TYPE_FLOAT,
+			[
+				SemanticConstIntType(1),
+				SemanticConstIntType(3),
+				SemanticConstIntType(4),
+				SemanticConstIntType(5),
+				SemanticConstIntType(2),
+				SemanticVarDimsType("#Missing"),
+				SemanticConstIntType(3),
+				SemanticConstIntType(4),
+				SemanticConstIntType(5),
+			],
+		),
+		SemanticNamedType(
+			"Result",
+			[
+				SemanticArrayType(
+					TYPE_FLOAT,
+					[
+						SemanticConstIntType(6),
+						SemanticConstIntType(3),
+						SemanticConstIntType(4),
+						SemanticConstIntType(5),
+					],
+				),
+				SemanticFunctionType(
+					True,
+					[SemanticArrayType(
+						TYPE_FLOAT,
+						[
+							SemanticConstIntType(3),
+							SemanticConstIntType(4),
+							SemanticConstIntType(5),
+						],
+					)],
+					SemanticArrayType(TYPE_FLOAT, [SemanticVarDimsType("#Missing")]),
+				),
+			],
+		),
+	])
+
+	(
+		result.context.state.errors.is_empty()
+		and types_equal(typed_expr_semantic_type(result.expr), expected)
+	)
 
 
 func test_generic_dim_argument_uses_static_expression_type() -> Bool:
@@ -11316,6 +11456,10 @@ tests: TestSuite = {
 		(
 			"shared variadic dims report exact conflict",
 			test_shared_variadic_dims_report_exact_conflict,
+		),
+		(
+			"variadic dims resolution preserves mixed return order",
+			test_variadic_dims_resolution_preserves_mixed_return_order,
 		),
 		(
 			"generic dim argument uses static expression type",
