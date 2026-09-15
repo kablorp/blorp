@@ -12,10 +12,22 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[3]
 STATUS = ROOT / "scripts" / "compiler-build-status"
+BUILD_METADATA_ENV_VARS = (
+	"BLORP_BUILD_VERSION",
+	"BLORP_BUILD_COMMIT",
+	"BLORP_BUILD_TARGET",
+	"BLORP_BUILD_CHANNEL",
+	"BLORP_BUILD_DIRTY",
+)
+BUILD_OPTIMIZATION_ENV_VARS = (
+	"BLORP_CLI_C_OPTIMIZATION",
+	"BLORP_CLI_RUNTIME_C_OPTIMIZATION",
+)
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -249,6 +261,10 @@ class CompilerBuildStatusTests(unittest.TestCase):
 		use_bootstrap_override: bool = True,
 	) -> subprocess.CompletedProcess[str]:
 		env = os.environ.copy()
+		# Synthetic build info and manifests use local defaults, even when CI
+		# builds the real compiler with release metadata and native flags.
+		for name in (*BUILD_METADATA_ENV_VARS, *BUILD_OPTIMIZATION_ENV_VARS):
+			env.pop(name, None)
 		env.update(
 			{
 				"PATH": f"{self.root / 'fake-bin'}:{env['PATH']}",
@@ -287,6 +303,23 @@ class CompilerBuildStatusTests(unittest.TestCase):
 
 		self.assert_status(result, 0, "FRESH")
 		self.assertEqual(self.snapshot_files(), before)
+
+	def test_inherited_ci_build_environment_does_not_change_fixture_baseline(self) -> None:
+		with patch.dict(
+			os.environ,
+			{
+				"BLORP_BUILD_VERSION": "0.0.1-ci",
+				"BLORP_BUILD_COMMIT": "ci123",
+				"BLORP_BUILD_TARGET": "x86_64-unknown-linux-gnu",
+				"BLORP_BUILD_CHANNEL": "preview",
+				"BLORP_BUILD_DIRTY": "false",
+				"BLORP_CLI_C_OPTIMIZATION": "-O2",
+				"BLORP_CLI_RUNTIME_C_OPTIMIZATION": "-O3",
+			},
+		):
+			result = self.run_status()
+
+		self.assert_status(result, 0, "FRESH")
 
 	def test_quiet_uses_exit_codes_without_output(self) -> None:
 		self.assert_status(self.run_status("--quiet"), 0, "")
@@ -328,13 +361,7 @@ class CompilerBuildStatusTests(unittest.TestCase):
 		self.assertIn("compiler_build_info.brp", result.stdout)
 
 	def test_build_info_environment_override_reports_stale(self) -> None:
-		for name in (
-			"BLORP_BUILD_VERSION",
-			"BLORP_BUILD_COMMIT",
-			"BLORP_BUILD_TARGET",
-			"BLORP_BUILD_CHANNEL",
-			"BLORP_BUILD_DIRTY",
-		):
+		for name in BUILD_METADATA_ENV_VARS:
 			with self.subTest(name=name):
 				result = self.run_status(extra_env={name: "override"})
 				self.assert_status(result, 1, "STALE")
