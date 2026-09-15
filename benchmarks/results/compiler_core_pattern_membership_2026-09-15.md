@@ -242,4 +242,6 @@ shasum -a 256 "$issue113_root"/semantic-core-*.txt \
 - generated Core and C identity: byte-identical;
 - `scripts/compiler-check --changed`: passed three sources, five suites, Core
   sanitizer, and leak checks in 162.15 seconds;
+- `scripts/test compiler-blorp`: passed 4,577/4,577 tests in 3m20s;
+- `scripts/compiler-build-status`: `FRESH` after the broad gates;
 - `git diff --check`: passed.
