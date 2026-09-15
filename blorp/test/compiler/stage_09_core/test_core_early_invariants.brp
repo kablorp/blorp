@@ -9,6 +9,7 @@ import:
 			MutableLocalWithoutAssignmentSurvived,
 			StraightLineMutableAssignmentSurvived,
 			StringOperatorSugarSurvived,
+			SelectedDirectCallSurvived,
 		),
 		check_debug_invariants,
 		check_desugar_invariants,
@@ -19,9 +20,9 @@ import:
 		core_early_invariant_message,
 	../../../src/compiler/stage_09_core/early_stages: run_debug_stage, run_desugar_stage
 	../../../src/compiler/stage_09_core/ir:
-		CoreBinaryOp(AddOp),
+		CoreBinaryOp(AddOp, EqualOp),
 		CoreBoxKind(PrimBox),
-		CoreCallKind(UserCall),
+		CoreCallKind(SelectedDirectCall, UserCall),
 		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
 		CoreExpr(
 			AssignExpr,
@@ -41,6 +42,7 @@ import:
 		CoreSourceLoc(SyntheticSourceLoc),
 		CoreTensorDim(TensorRuntimeDim, TensorVariadicDim),
 		CoreType(FunctionType, NamedType, SelfType, TensorType, TypeParameterType, VoidType),
+		CoreTypeParam,
 		CoreUnboxKind(PrimUnbox),
 		CoreVar,
 	test: TestSuite
@@ -66,6 +68,100 @@ pure func variable(name: String, typ: CoreType) -> CoreExpr:
 	VarExpr(named_var(name), typ, SyntheticSourceLoc)
 
 
+pure func function_info(
+	name: String,
+	def_id: Int,
+	body: CoreExpr,
+	return_type: CoreType,
+	type_params: List[String],
+) -> CoreFunction:
+	{
+		name = name,
+		source_module = None,
+		type_params = type_params,
+		params = [],
+		return_type = return_type,
+		body = Some(body),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = def_id,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func function_decl(
+	name: String,
+	def_id: Int,
+	body: CoreExpr,
+	return_type: CoreType,
+	type_params: List[String],
+) -> CoreDecl:
+	FunctionDecl(function_info(name, def_id, body, return_type, type_params))
+
+
+pure func unresolved_call(name: String, def_id: Int, typ: CoreType) -> CoreExpr:
+	CallExpr(
+		UserCall(name, Some(def_id), []),
+		variable(
+			name,
+			FunctionType(True, [typ], typ),
+		),
+		[variable("value", typ)],
+		typ,
+		SyntheticSourceLoc,
+	)
+
+
+pure func string_equality_expr() -> CoreExpr:
+	string_type: CoreType = named_type("String")
+	BinaryExpr(
+		EqualOp,
+		variable("left", string_type),
+		variable("right", string_type),
+		named_type("Bool"),
+		SyntheticSourceLoc,
+	)
+
+
+pure func debug_expr() -> CoreExpr:
+	DebugBlockExpr(
+		VoidExpr(VoidType, SyntheticSourceLoc),
+		VoidType,
+		SyntheticSourceLoc,
+	)
+
+
+pure func type_param(name: String) -> CoreTypeParam:
+	{
+		name = name,
+		bounds = []
+	}
+
+
+pure func violation_kind(violation: CoreEarlyInvariantViolation) -> String:
+	match violation:
+		DebugBlockSurvived(_):
+			"debug"
+		StringOperatorSugarSurvived(op, _):
+			"string:${op}"
+		MutableLocalWithoutAssignmentSurvived(_):
+			"mutable-no-assignment"
+		StraightLineMutableAssignmentSurvived(_):
+			"mutable-straight-line"
+		MonoUserCallArgumentTypeUnresolved(name, _):
+			"mono-argument:${name}"
+		MonoUserCallReturnTypeUnresolved(name, _):
+			"mono-return:${name}"
+		MonoBoxSourceTypeUnresolved(_):
+			"mono-box"
+		MonoUnboxTargetTypeUnresolved(_):
+			"mono-unbox"
+		SelectedDirectCallSurvived(_, _):
+			"selected-direct-call"
+		_:
+			"other"
+
+
 pure func program(body: CoreExpr, return_type: CoreType) -> CoreProgram:
 	program_with_type_params(body, return_type, [])
 
@@ -76,18 +172,7 @@ pure func program_with_type_params(
 	type_params: List[String],
 ) -> CoreProgram:
 	{
-		decls = [FunctionDecl({
-				name = "main",
-				source_module = None,
-				type_params = type_params,
-				params = [],
-				return_type = return_type,
-				body = Some(body),
-				is_pure = True,
-				function_kind = UserFunction,
-				def_id = 10,
-				loc = SyntheticSourceLoc,
-			})],
+		decls = [function_decl("main", 10, body, return_type, type_params)],
 		foreign_includes = []
 	}
 
@@ -501,6 +586,112 @@ func test_mono_invariant_checks_global_and_concrete_impl_roots() -> Bool:
 		.length() == 2
 
 
+func test_resolve_invariant_preserves_family_priority_over_traversal_order() -> Bool:
+	string_type: CoreType = named_type("String")
+	int_type: CoreType = named_type("Int")
+	string_add: CoreExpr = BinaryExpr(
+		AddOp,
+		variable("left", string_type),
+		variable("right", string_type),
+		string_type,
+		SyntheticSourceLoc,
+	)
+	direct_call: CoreExpr = CallExpr(
+		SelectedDirectCall(20),
+		variable(
+			"callee",
+			FunctionType(True, [], int_type),
+		),
+		[],
+		int_type,
+		SyntheticSourceLoc,
+	)
+
+	source: CoreProgram = {
+		decls = [
+			function_decl("string_first", 10, string_add, string_type, []),
+			function_decl("direct_second", 11, direct_call, int_type, []),
+		],
+		foreign_includes = []
+	}
+
+	check_resolve_invariants(source).map(violation_kind) == ["selected-direct-call", "string:+"]
+
+
+func test_synth_invariant_preserves_family_priority_over_traversal_order() -> Bool:
+	t: CoreType = type_parameter("T")
+
+	check_synth_invariants(
+		program(
+			SeqExpr(
+				string_equality_expr(),
+				SeqExpr(
+					unresolved_call("identity", 20, t),
+					debug_expr(),
+				),
+			),
+			VoidType,
+		),
+	).map(
+		violation_kind,
+	) == ["debug", "string:==", "mono-argument:identity", "mono-return:identity"]
+
+
+func test_synth_invariant_keeps_mono_checks_out_of_generic_roots() -> Bool:
+	t: CoreType = type_parameter("T")
+
+	check_synth_invariants(
+		program_with_type_params(
+			SeqExpr(
+				string_equality_expr(),
+				SeqExpr(
+					unresolved_call("identity", 20, t),
+					debug_expr(),
+				),
+			),
+			VoidType,
+			["T"],
+		),
+	).map(violation_kind) == ["debug", "string:=="]
+
+
+func test_synth_invariant_preserves_impl_root_eligibility() -> Bool:
+	t: CoreType = type_parameter("T")
+	any_type: CoreType = named_type("Any")
+	source: CoreProgram = {
+		decls = [ImplDecl({
+				trait_name = "GenericTrait",
+				for_type = any_type,
+				type_params = [type_param("T")],
+				methods = [function_info(
+						"generic_method",
+						20,
+						unresolved_call("generic_identity", 20, t),
+						t,
+						[],
+					)],
+				loc = SyntheticSourceLoc,
+			}), ImplDecl({
+				trait_name = "ConcreteTrait",
+				for_type = any_type,
+				type_params = [],
+				methods = [function_info(
+						"concrete_method",
+						21,
+						unresolved_call("concrete_identity", 21, t),
+						t,
+						[],
+					)],
+				loc = SyntheticSourceLoc,
+			})],
+		foreign_includes = []
+	}
+
+	check_synth_invariants(
+		source,
+	).map(violation_kind) == ["mono-argument:concrete_identity", "mono-return:concrete_identity"]
+
+
 func test_invariant_diagnostics_include_actionable_guidance() -> Bool:
 	violation: CoreEarlyInvariantViolation = DebugBlockSurvived(SyntheticSourceLoc)
 
@@ -562,6 +753,22 @@ tests: TestSuite = {
 		(
 			"mono invariant checks global and concrete impl roots",
 			test_mono_invariant_checks_global_and_concrete_impl_roots,
+		),
+		(
+			"resolve invariant preserves family priority over traversal order",
+			test_resolve_invariant_preserves_family_priority_over_traversal_order,
+		),
+		(
+			"synth invariant preserves family priority over traversal order",
+			test_synth_invariant_preserves_family_priority_over_traversal_order,
+		),
+		(
+			"synth invariant keeps mono checks out of generic roots",
+			test_synth_invariant_keeps_mono_checks_out_of_generic_roots,
+		),
+		(
+			"synth invariant preserves impl root eligibility",
+			test_synth_invariant_preserves_impl_root_eligibility,
 		),
 		(
 			"invariant diagnostics include actionable guidance",

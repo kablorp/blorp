@@ -1229,6 +1229,31 @@ stats, elapsed microseconds, and deterministic checksums. Use these rows before
 choosing a production Core optimization; do not extrapolate synthetic wins
 without a production self-compilation replay.
 
+### Early-Core Invariant Scan Profile
+
+`compiler_core_invariant_scan_profile` isolates the production debug, mono,
+synth, or resolve invariant check from fixture construction and structural
+census work. The clean compiler-shaped fixture retains ordered violation and
+workload checksums while function profiling supplies actual traversal call
+counts across revisions.
+
+```bash
+benchmarks/compiler_core_invariant_scan_profile plain 100 resolve 64 256
+benchmarks/compiler_core_invariant_scan_profile plain 100 synth 64 256
+
+# Unchanged single-family controls.
+benchmarks/compiler_core_invariant_scan_profile plain 100 debug 64 256
+benchmarks/compiler_core_invariant_scan_profile plain 100 mono 64 256
+
+# Profile builds expose exact helper call counts and inclusive/self time.
+benchmarks/compiler_core_invariant_scan_profile profile 10 resolve 64 256 \
+  2>/tmp/blorp-core-invariant-profile.txt
+```
+
+Use at least one node-count series and matched optimized baseline/candidate
+binaries. Preserve the full ordered diagnostic sequences in unit tests; the
+clean performance fixture intentionally expects zero violations.
+
 ### Core Match Binding Profile
 
 `compiler_core_match_binding_profile` calls the production
