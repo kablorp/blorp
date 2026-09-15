@@ -4,27 +4,31 @@
 -- then records only exact type identities and scalar constructor locators for
 -- the source spellings visible in that module.
 import:
-	../graph/definition_index: definition_index_definition_table, definition_tables_share_provenance
+	../../stage_04_modules/module_table: module_ids_equal
+	../graph/definition_index:
+		definition_id_runtime_value,
+		definition_index_definition_table,
+		definition_tables_share_provenance,
 	../graph/indexed_graph:
 		PreparedModuleScope,
 		indexed_graph_definition_index,
 		prepared_module_scope_id,
-	../graph/type_identity: type_id_definition_id
+	../graph/type_identity: type_id_definition_id, type_id_from_definition_table, type_id_module_id
 	../modules/bound_module_graph:
 		BoundModule,
 		BoundModuleGraph,
 		bound_module_canonical_path,
-		bound_module_graph_find_canonical_path,
+		bound_module_graph_find_for_scope,
 		bound_module_graph_indexed_graph,
 		bound_module_graph_modules,
 		bound_module_graph_target,
 		bound_module_scope,
 		bound_module_view,
 	../modules/module_view:
-		ImportedConstructorBinding,
-		ImportedNameBinding,
-		module_view_imported_constructors,
-		module_view_imported_names,
+		BoundAcceptedConstructorBinding,
+		BoundAcceptedDefinitionBinding,
+		module_view_accepted_constructor_bindings,
+		module_view_accepted_definition_bindings,
 	../type_system/accepted_alias_authority: AcceptedAliasTable
 	../type_system/accepted_union_authority:
 		AcceptedUnionAuthority,
@@ -39,6 +43,7 @@ import:
 		accepted_union_empty_module_view,
 		accepted_union_module_view,
 		accepted_union_table,
+		accepted_union_table_definition_table,
 		accepted_union_table_entry_count,
 	../type_system/env: Env, VariantDef
 	../type_system/semantic_type: canonical_module_type_name
@@ -47,8 +52,11 @@ import:
 		AcceptedUnionHeader,
 		TypeContainmentFacts,
 		TypeHeaderGraph,
+		TypeHeaderShape(UnionTypeHeader),
 		UnionLayout(FieldlessEnum, TaggedUnion),
 		type_header_graph_definition_table,
+		type_header_graph_find,
+		type_header_graph_find_union_for_constructor,
 		type_header_graph_local_union_headers_for_scope,
 		type_header_graph_public_union_headers_for_scope,
 		union_type_header_containment_facts,
@@ -174,20 +182,6 @@ private pure func collect_module_inputs(
 	}
 
 
-private pure func find_public_union_header(
-	type_headers: TypeHeaderGraph,
-	module_scope: PreparedModuleScope,
-	name: String,
-) -> Option[AcceptedUnionHeader]:
-	var result: Option[AcceptedUnionHeader] = None
-
-	for header in type_header_graph_public_union_headers_for_scope(type_headers, module_scope):
-		if result.is_none() and union_type_header_source_name(header) == name:
-			result = Some(header)
-
-	result
-
-
 private pure func local_union_bindings(
 	type_headers: TypeHeaderGraph,
 	module_scope: PreparedModuleScope,
@@ -205,46 +199,71 @@ private pure func local_union_bindings(
 	result
 
 
-private pure func imported_union_binding(
+private pure func append_imported_union_candidate_bindings(
+	bindings: List[AcceptedVisibleUnionBinding],
 	type_headers: TypeHeaderGraph,
-	bound_graph: BoundModuleGraph,
-	binding: ImportedNameBinding,
-) -> Option[AcceptedVisibleUnionBinding]:
-	module ?= bound_module_graph_find_canonical_path(bound_graph, binding.module_path)
-	header ?= find_public_union_header(
-		type_headers,
-		bound_module_scope(module),
-		binding.original_name,
-	)
-	Some({
-		source_name = binding.local_name,
-		id = union_type_header_id(header),
-		owner_local = False,
-	})
+	candidates: List[BoundAcceptedDefinitionBinding],
+) -> List[AcceptedVisibleUnionBinding]:
+	definition_table = type_header_graph_definition_table(type_headers)
+	var next = bindings
+
+	for candidate in candidates:
+		for definition_id in candidate.definition_ids:
+			match type_id_from_definition_table(
+				definition_table,
+				definition_id_runtime_value(definition_id),
+			):
+				Some(type_id):
+					owner_matches = type_id_module_id(definition_table, type_id)
+						.map(func(owner): module_ids_equal(owner, candidate.module_id))
+						.get_or(False)
+
+					match type_header_graph_find(type_headers, type_id):
+						Some(header):
+							match header.shape:
+								UnionTypeHeader(_, _):
+									if owner_matches:
+										next = next.append({
+											source_name = candidate.local_name,
+											id = type_id,
+											owner_local = False,
+										})
+								_:
+									void
+						None:
+							void
+				None:
+					void
+
+	next
 
 
 private pure func selected_constructor_binding(
 	type_headers: TypeHeaderGraph,
-	bound_graph: BoundModuleGraph,
-	binding: ImportedConstructorBinding,
+	binding: BoundAcceptedConstructorBinding,
 ) -> Option[AcceptedVisibleConstructorBinding]:
-	module ?= bound_module_graph_find_canonical_path(bound_graph, binding.module_path)
-	header ?= find_public_union_header(
-		type_headers,
-		bound_module_scope(module),
-		binding.parent_name,
-	)
+	definition_table = type_header_graph_definition_table(type_headers)
 	var result: Option[AcceptedVisibleConstructorBinding] = None
 
-	for variant in union_type_header_variants(header):
-		if result.is_none() and variant.name == binding.original_name:
-			result = Some({
-				source_name = binding.local_name,
-				parent_source_name = binding.parent_local_name,
-				parent_id = union_type_header_id(header),
-				constructor_id = constructor_id_definition_id(variant.id),
-				owner_local = False,
-			})
+	for definition_id in binding.definition_ids:
+		constructor_id = definition_id_runtime_value(definition_id)
+
+		match type_header_graph_find_union_for_constructor(type_headers, constructor_id):
+			Some(header):
+				owner_matches = type_id_module_id(definition_table, union_type_header_id(header))
+					.map(func(owner): module_ids_equal(owner, binding.module_id))
+					.get_or(False)
+
+				if result.is_none() and owner_matches:
+					result = Some({
+						source_name = binding.local_name,
+						parent_source_name = binding.parent_local_name,
+						parent_id = union_type_header_id(header),
+						constructor_id = constructor_id,
+						owner_local = False,
+					})
+			None:
+				void
 
 	result
 
@@ -255,36 +274,52 @@ pure func accepted_union_table_authority_for_module(
 	bound_module: BoundModule,
 	bound_graph: BoundModuleGraph,
 ) -> Result[AcceptedUnionAuthority, String]:
-	view = bound_module_view(bound_module)
-	var union_bindings = local_union_bindings(type_headers, bound_module_scope(bound_module))
-	var constructor_bindings: List[AcceptedVisibleConstructorBinding] = []
+	table_definition_table = accepted_union_table_definition_table(table)
+	header_definition_table = type_header_graph_definition_table(type_headers)
+	graph_definition_table = definition_index_definition_table(
+		indexed_graph_definition_index(bound_module_graph_indexed_graph(bound_graph)),
+	)
+	bound_scope_matches = bound_module_graph_find_for_scope(
+		bound_graph,
+		bound_module_scope(bound_module),
+	).is_some()
 
-	-- Explicit constructor selections retain precedence because their scalar
-	-- locators are appended before constructors exposed by imported unions.
-	for binding in module_view_imported_constructors(view):
-		match selected_constructor_binding(type_headers, bound_graph, binding):
-			Some(visible):
-				constructor_bindings = constructor_bindings.append(visible)
-			None:
-				void
-
-	for binding in module_view_imported_names(view):
-		match imported_union_binding(type_headers, bound_graph, binding):
-			Some(visible):
-				union_bindings = union_bindings.append(visible)
-			None:
-				void
-
-	match accepted_union_module_view(
-		table,
-		prepared_module_scope_id(bound_module_scope(bound_module)),
-		union_bindings,
-		constructor_bindings,
+	if (
+		not definition_tables_share_provenance(table_definition_table, header_definition_table)
+		or not definition_tables_share_provenance(header_definition_table, graph_definition_table)
+		or not bound_scope_matches
 	):
-		Some(module_view):
-			Ok(accepted_union_authority(table, module_view))
-		None:
-			Err("accepted union module view rejected conflicting source bindings")
+		Err("accepted union authority rejected mismatched definition-table provenance")
+	else:
+		view = bound_module_view(bound_module)
+		var union_bindings = local_union_bindings(type_headers, bound_module_scope(bound_module))
+		var constructor_bindings: List[AcceptedVisibleConstructorBinding] = []
+
+		-- Explicit constructor selections retain precedence because their scalar
+		-- locators are appended before constructors exposed by imported unions.
+		for binding in module_view_accepted_constructor_bindings(view):
+			match selected_constructor_binding(type_headers, binding):
+				Some(visible):
+					constructor_bindings = constructor_bindings.append(visible)
+				None:
+					void
+
+		union_bindings = append_imported_union_candidate_bindings(
+			union_bindings,
+			type_headers,
+			module_view_accepted_definition_bindings(view),
+		)
+
+		match accepted_union_module_view(
+			table,
+			prepared_module_scope_id(bound_module_scope(bound_module)),
+			union_bindings,
+			constructor_bindings,
+		):
+			Some(module_view):
+				Ok(accepted_union_authority(table, module_view))
+			None:
+				Err("accepted union module view rejected conflicting source bindings")
 
 
 pure func accepted_union_graph_build(

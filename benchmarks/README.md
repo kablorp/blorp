@@ -781,6 +781,7 @@ prove exact selective `DefinitionId` targets or accepted semantic IDs.
 benchmarks/compiler_visibility_width_profile 1000 16 32 32 16 16 128
 benchmarks/compiler_visibility_width_profile 1000 16 128 128 64 64 512
 benchmarks/compiler_visibility_width_profile 1000 16 128 128 64 64 512 0 1
+benchmarks/compiler_visibility_width_profile 1000 16 128 128 64 64 512 0 1 1
 BLORP_VISIBILITY_WIDTH_PROFILE_FUNCTIONS=1 \
   benchmarks/compiler_visibility_width_profile 1 16 32 32 16 16 128
 ```
@@ -791,7 +792,11 @@ optional eighth flag (`1`) reuses alias spellings for selectives, separating
 row width from ordered binding count. An optional ninth flag (`1`) batches
 the initial local-name rows before alias/selective admission; the default
 per-name mode uses that same locals-first order. The candidate tuples for
-batch mode are prepared outside the timed window. Setup uses the
+batch mode are prepared outside the timed window.
+An optional tenth flag (`1`) uses scope-local graph import admission and
+publishes one view after aliases, selectives, and duplicate decisions; `0`
+keeps scalar per-candidate registration as the direct comparison. Keep the
+ninth flag fixed when comparing those two modes. Setup uses the
 compiler's validated definition identities, then constructs a source-name
 catalog for this direct low-level view workload; this is not a full importer
 or accepted-graph benchmark. `requested_name_operations` counts public
@@ -801,6 +806,25 @@ cumulative allocation traffic. Profile mode attributes function calls but
 uses unoptimized generated C, so its elapsed time is not comparable to the
 plain run. Binder privacy and diagnostic order are checked separately in the
 declaration suite.
+
+### Constructor Admission Profile
+
+`compiler_constructor_admission_profile` isolates repeated validated graph
+constructor selections. Setup builds one indexed union constructor and a
+source-name catalog outside the measured window; each iteration imports that
+constructor under distinct local names, then projects the accepted constructor
+bindings. Use it to compare occupancy writes, allocation calls, and native
+instructions without measuring parser or graph construction:
+
+```bash
+benchmarks/compiler_constructor_admission_profile 100 64
+/usr/bin/time -l env BLORP_COMPILER_BENCHMARK_SKIP_BUILD=1 \
+  benchmarks/compiler_constructor_admission_profile 100 64
+```
+
+The positional controls are iterations and constructor-import width. This is
+a low-level admission workload, not an accepted-union or source-binder fixture;
+the declaration suite covers that handoff.
 
 ### Module Binding Profile
 
@@ -1287,31 +1311,13 @@ ratios.
 
 ### Captured Backend Replay
 
-`compiler_backend_memory` replays one production `emit_core_c` request against
-an isolated benchmark-owned backend worker. Capture mode writes the request and
-deliberately stops before starting the worker:
-
-```bash
-capture=$(mktemp "${TMPDIR:-/tmp}/blorp-emit-core.XXXXXX.json")
-BLORP_COMPILER_CAPTURE_EMIT_CORE_REQUEST="$capture" \
-  bin/blorp test --timeout 30 \
-  blorp/test/compiler/stage_06_typecheck/test_infer.brp
-```
-
-The capture command exits nonzero after reporting the saved path. Its test
-timeout does not govern compilation; safety comes from capture mode stopping
-before worker execution. Capture still runs the compiler frontend and middle
-once and materializes the serialized request. Keep captured requests local:
-they contain the lowered program and source paths, can be large, and should not
-be committed.
-
-Replay a bounded request with:
-
-```bash
-benchmarks/compiler_backend_memory "$capture" --timeout 60
-benchmarks/compiler_backend_memory "$capture" --timeout 60 --json
-benchmarks/compiler_backend_memory "$capture" --timeout 60 --vmmap
-```
+`compiler_backend_memory` replays one schema-1 `emit_core_c` request against an
+isolated benchmark-owned backend worker. The compiler does not currently expose
+a production backend-request capture option; do not rely on the historical
+`BLORP_COMPILER_CAPTURE_EMIT_CORE_REQUEST` recipe. Use a checked-in
+deterministic request generator, or an existing private capture whose
+provenance and request hash are recorded. Keep private captures local: they can
+contain source paths, can be large, and should not be committed.
 
 For source-location representation work, generate a deterministic bounded
 request containing 10,200 known Core locations instead of capturing a full

@@ -20,18 +20,25 @@ import:
 		graph_module_name_scope,
 		graph_source_name_table,
 	../../src/compiler/stage_06_typecheck/modules/module_view:
+		GraphImportAdmission,
+		GraphModuleAliasAdmission(GraphModuleAliasAdded, GraphModuleAliasAlreadyPresent),
+		GraphSelectiveAdmission(GraphSelectiveAdded, GraphSelectiveConflictsWithImportedName),
 		LocalNameRegistration(LocalNameAdded),
 		ModuleAliasRegistration(ModuleAliasAdded, ModuleAliasAlreadyPresent),
 		ModuleView,
 		SelectiveNameRegistration(SelectiveNameAdded, SelectiveNameConflictsWithImportedName),
 		TopLevelNameKind(TopLevelFunction),
+		graph_import_admission_begin,
+		graph_import_admission_finish,
+		graph_import_admission_register_alias,
+		graph_import_admission_register_selective_definition,
+		module_view_bind_initial_graph_local_names,
 		module_view_find_graph_module_alias,
 		module_view_find_imported_name,
 		module_view_find_local_name,
-		module_view_bind_initial_graph_local_names,
 		module_view_for_graph,
 		module_view_graph_bound_name_count,
-		module_view_import_bindings,
+		module_view_import_binding_count,
 		module_view_register_local_name_for_graph,
 		module_view_register_module_alias_target,
 		module_view_register_selective_name_for_graph,
@@ -39,7 +46,7 @@ import:
 		DefinitionBackedTypeFixtureModule,
 		definition_backed_type_fixture,
 		definition_backed_type_fixture_definition_table,
-		module_id_fixture_find
+		module_id_fixture_find,
 
 
 struct VisibilityWidthConfig {
@@ -51,7 +58,8 @@ struct VisibilityWidthConfig {
 	duplicate_attempts: Int,
 	query_count: Int,
 	overlap_selectives_with_aliases: Bool,
-	batch_initial_locals: Bool
+	batch_initial_locals: Bool,
+	batch_graph_imports: Bool
 }
 
 
@@ -115,7 +123,7 @@ pure func visibility_width_prepare(config: VisibilityWidthConfig) -> Option[Visi
 		or config.local_count <= 0
 		or config.duplicate_attempts < 0
 		or config.query_count < 0
-		or (config.overlap_selectives_with_aliases and config.selective_count > config.alias_count)
+		or config.overlap_selectives_with_aliases and config.selective_count > config.alias_count
 	):
 		None
 	else:
@@ -125,15 +133,17 @@ pure func visibility_width_prepare(config: VisibilityWidthConfig) -> Option[Visi
 private pure func visibility_width_prepare_valid_config(
 	config: VisibilityWidthConfig,
 ) -> Option[VisibilityWidthInput]:
+	var modules: List[DefinitionBackedTypeFixtureModule] = [
+		{
+			module_path = "bench/visibility_target",
+			type_names = []
+		},
+	]
 
-	var modules: List[DefinitionBackedTypeFixtureModule] = [{
-		module_path = "bench/visibility_target",
-		type_names = []
-	}]
 	for index in 0..config.module_count:
 		modules = modules.append({
 			module_path = dependency_path(index),
-			type_names = ["Token"]
+			type_names = ["Token"],
 		})
 
 	scope ?= definition_backed_type_fixture(modules)
@@ -142,6 +152,7 @@ private pure func visibility_width_prepare_valid_config(
 	definition_index = prepared_module_scope_definition_index(scope)
 	var module_ids: List[ModuleId] = []
 	var definition_ids: List[DefinitionId] = []
+
 	for index in 0..config.module_count:
 		match module_id_fixture_find(scope, dependency_path(index)):
 			Some(module_id):
@@ -179,61 +190,76 @@ private pure func visibility_width_finish_prepare(
 	module_table = prepared_module_scope_module_table(scope)
 	definition_table = definition_backed_type_fixture_definition_table(scope)
 	var definition_id_lists: List[List[DefinitionId]] = []
+
 	for definition_id in definition_ids:
 		definition_id_lists = definition_id_lists.append([definition_id])
+
 	first_definition_ids ?= definition_id_lists.get(0)
 	var module_paths: List[String] = []
+
 	for index in 0..config.module_count:
 		module_paths = module_paths.append(dependency_path(index))
+
 	first_module_path ?= module_paths.get(0)
 
-	var candidates: List[String] = []
+	-- The low-level fixture mints its graph catalog directly, so include the
+	-- imported declaration spelling as well as every source-visible local name.
+	var candidates: List[String] = ["Token"]
 	var alias_names: List[String] = []
+
 	for index in 0..config.alias_count:
 		name = alias_name(index)
 		alias_names = alias_names.append(name)
 		candidates = candidates.append(name)
+
 	var selective_names: List[String] = []
+
 	for index in 0..config.selective_count:
 		name = if config.overlap_selectives_with_aliases:
 			alias_names.get_or(index, selective_name(index))
 		else:
 			selective_name(index)
+
 		selective_names = selective_names.append(name)
 		candidates = candidates.append(name)
+
 	var local_names: List[String] = []
 	var local_candidates: List[(String, TopLevelNameKind)] = []
+
 	for index in 0..config.local_count:
 		name = local_name(index)
 		local_names = local_names.append(name)
 		local_candidates = local_candidates.append((name, TopLevelFunction))
 		candidates = candidates.append(name)
+
 	first_alias_name ?= alias_names.get(0)
 	first_selective_name ?= selective_names.get(0)
 
-	initial_view = module_view_for_graph(graph_module_name_scope(
-		graph_source_name_table(module_table, candidates),
-		prepared_module_scope_id(scope),
-	))
+	initial_view = module_view_for_graph(
+		graph_module_name_scope(
+			graph_source_name_table(module_table, candidates),
+			prepared_module_scope_id(scope),
+		),
+	)
 	Some(into_opaque VisibilityWidthInput({
-		config = config,
-		module_table = module_table,
-		current_module_id = prepared_module_scope_id(scope),
-		module_ids = module_ids,
-		module_paths = module_paths,
-		first_module_id = first_module_id,
-		first_module_path = first_module_path,
-		definition_table = definition_table,
-		definition_id_lists = definition_id_lists,
-		first_definition_ids = first_definition_ids,
-		alias_names = alias_names,
-		first_alias_name = first_alias_name,
-		selective_names = selective_names,
-		first_selective_name = first_selective_name,
-		local_names = local_names,
-		local_candidates = local_candidates,
-		initial_view = initial_view
-	}))
+				config = config,
+				module_table = module_table,
+				current_module_id = prepared_module_scope_id(scope),
+				module_ids = module_ids,
+				module_paths = module_paths,
+				first_module_id = first_module_id,
+				first_module_path = first_module_path,
+				definition_table = definition_table,
+				definition_id_lists = definition_id_lists,
+				first_definition_ids = first_definition_ids,
+				alias_names = alias_names,
+				first_alias_name = first_alias_name,
+				selective_names = selective_names,
+				first_selective_name = first_selective_name,
+				local_names = local_names,
+				local_candidates = local_candidates,
+				initial_view = initial_view
+			}))
 
 
 private pure func register_alias(
@@ -245,6 +271,7 @@ private pure func register_alias(
 	module_id ?= input.module_ids.get(target_index)
 	module_path ?= input.module_paths.get(target_index)
 	name ?= input.alias_names.get(index)
+
 	match module_view_register_module_alias_target(
 		view,
 		input.module_table,
@@ -268,8 +295,9 @@ private pure func register_selective(
 	target_index = index % input.config.module_count
 	module_id ?= input.module_ids.get(target_index)
 	module_path ?= input.module_paths.get(target_index)
-	definition_ids ?= input.definition_id_lists.get(target_index)
+	definition_ids = input.definition_id_lists.get_or(target_index, [])
 	name ?= input.selective_names.get(index)
+
 	match module_view_register_selective_name_for_graph(
 		view,
 		input.current_module_id,
@@ -287,12 +315,66 @@ private pure func register_selective(
 			None
 
 
+private pure func register_alias_in_admission(
+	input: VisibilityWidthInputRep,
+	admission: GraphImportAdmission,
+	index: Int,
+) -> Option[GraphImportAdmission]:
+	target_index = index % input.config.module_count
+	module_id ?= input.module_ids.get(target_index)
+	module_path ?= input.module_paths.get(target_index)
+	name ?= input.alias_names.get(index)
+
+	match graph_import_admission_register_alias(
+		admission,
+		input.module_table,
+		input.current_module_id,
+		name,
+		module_path,
+		input.module_table,
+		module_id,
+	):
+		GraphModuleAliasAdded(next):
+			Some(next)
+		_:
+			None
+
+
+private pure func register_selective_in_admission(
+	input: VisibilityWidthInputRep,
+	admission: GraphImportAdmission,
+	index: Int,
+) -> Option[GraphImportAdmission]:
+	target_index = index % input.config.module_count
+	module_id ?= input.module_ids.get(target_index)
+	module_path ?= input.module_paths.get(target_index)
+	definition_ids = input.definition_id_lists.get_or(target_index, [])
+	name ?= input.selective_names.get(index)
+
+	match graph_import_admission_register_selective_definition(
+		admission,
+		input.current_module_id,
+		input.definition_table,
+		input.definition_table,
+		name,
+		module_path,
+		"Token",
+		module_id,
+		definition_ids,
+	):
+		GraphSelectiveAdded(next):
+			Some(next)
+		_:
+			None
+
+
 private pure func register_local(
 	input: VisibilityWidthInputRep,
 	view: ModuleView,
 	index: Int,
 ) -> Option[ModuleView]:
 	name ?= input.local_names.get(index)
+
 	match module_view_register_local_name_for_graph(
 		view,
 		input.module_table,
@@ -316,6 +398,7 @@ private pure func query_identity_value(
 			alias_index = index % input.config.alias_count
 			name ?= input.alias_names.get(alias_index)
 			expected = input.module_ids.get(alias_index % input.config.module_count)
+
 			match module_view_find_graph_module_alias(view, name):
 				Some(found):
 					if Some(found) == expected:
@@ -330,6 +413,7 @@ private pure func query_identity_value(
 			module_id ?= input.module_ids.get(target_index)
 			module_path ?= input.module_paths.get(target_index)
 			name ?= input.selective_names.get(selective_index)
+
 			match module_view_find_imported_name(view, name):
 				Some(binding):
 					if binding.module_path == module_path:
@@ -341,15 +425,241 @@ private pure func query_identity_value(
 		_:
 			local_index = index % input.config.local_count
 			name ?= input.local_names.get(local_index)
+
 			if module_view_find_local_name(view, name) == Some(TopLevelFunction):
 				Some(1)
 			else:
 				None
 
 
+private pure func register_initial_locals(input: VisibilityWidthInputRep) -> Option[ModuleView]:
+	if input.config.batch_initial_locals:
+		module_view_bind_initial_graph_local_names(
+			input.initial_view,
+			input.module_table,
+			input.current_module_id,
+			input.local_candidates,
+		)
+	else:
+		var view = input.initial_view
+		var valid = True
+
+		for index in 0..input.config.local_count:
+			match register_local(input, view, index):
+				Some(next):
+					view = next
+				None:
+					valid = False
+					break
+
+		if valid:
+			Some(view)
+		else:
+			None
+
+
+private pure func register_batched_imports(
+	input: VisibilityWidthInputRep,
+	view: ModuleView,
+) -> Option[ModuleView]:
+	initial_admission ?= graph_import_admission_begin(
+		view,
+		input.module_table,
+		input.current_module_id,
+	)
+	var admission = initial_admission
+	var valid = True
+
+	for index in 0..input.config.alias_count:
+		match register_alias_in_admission(input, admission, index):
+			Some(next):
+				admission = next
+			None:
+				valid = False
+				break
+
+	if valid:
+		for index in 0..input.config.selective_count:
+			match register_selective_in_admission(input, admission, index):
+				Some(next):
+					admission = next
+				None:
+					valid = False
+					break
+
+	if valid:
+		for index in 0..input.config.duplicate_attempts:
+			if index % 2 == 0:
+				match graph_import_admission_register_alias(
+					admission,
+					input.module_table,
+					input.current_module_id,
+					input.first_alias_name,
+					input.first_module_path,
+					input.module_table,
+					input.first_module_id,
+				):
+					GraphModuleAliasAlreadyPresent(next):
+						admission = next
+					_:
+						valid = False
+						break
+			else:
+				match graph_import_admission_register_selective_definition(
+					admission,
+					input.current_module_id,
+					input.definition_table,
+					input.definition_table,
+					input.first_selective_name,
+					input.first_module_path,
+					"Token",
+					input.first_module_id,
+					input.first_definition_ids,
+				):
+					GraphSelectiveConflictsWithImportedName(next, _):
+						admission = next
+					_:
+						valid = False
+						break
+
+	if valid:
+		Some(graph_import_admission_finish(admission))
+	else:
+		None
+
+
+private pure func register_sequential_imports(
+	input: VisibilityWidthInputRep,
+	initial_view: ModuleView,
+) -> Option[ModuleView]:
+	var view = initial_view
+	var valid = True
+
+	for index in 0..input.config.alias_count:
+		match register_alias(input, view, index):
+			Some(next):
+				view = next
+			None:
+				valid = False
+				break
+
+	if valid:
+		for index in 0..input.config.selective_count:
+			match register_selective(input, view, index):
+				Some(next):
+					view = next
+				None:
+					valid = False
+					break
+
+	if valid:
+		for index in 0..input.config.duplicate_attempts:
+			if index % 2 == 0:
+				match module_view_register_module_alias_target(
+					view,
+					input.module_table,
+					input.current_module_id,
+					input.first_alias_name,
+					input.first_module_path,
+					input.module_table,
+					input.first_module_id,
+				):
+					ModuleAliasAlreadyPresent:
+						void
+					_:
+						valid = False
+						break
+			else:
+				match module_view_register_selective_name_for_graph(
+					view,
+					input.current_module_id,
+					input.definition_table,
+					input.definition_table,
+					input.first_selective_name,
+					input.first_module_path,
+					"Token",
+					input.first_module_id,
+					input.first_definition_ids,
+				):
+					SelectiveNameConflictsWithImportedName(_):
+						void
+					_:
+						valid = False
+						break
+
+	if valid:
+		Some(view)
+	else:
+		None
+
+
+private pure func register_imports(
+	input: VisibilityWidthInputRep,
+	view: ModuleView,
+) -> Option[ModuleView]:
+	if input.config.batch_graph_imports:
+		register_batched_imports(input, view)
+	else:
+		register_sequential_imports(input, view)
+
+
+private pure func query_bound_names(
+	input: VisibilityWidthInputRep,
+	view: ModuleView,
+) -> Option[Int]:
+	var checksum: Int = 0
+	var valid = True
+
+	for index in 0..input.config.query_count:
+		match query_identity_value(input, view, index):
+			Some(identity_value):
+				checksum += identity_value
+			None:
+				valid = False
+				break
+
+	if valid:
+		Some(checksum)
+	else:
+		None
+
+
+private pure func visibility_width_execute_iteration(
+	input: VisibilityWidthInputRep,
+	prior_query_checksum: Int,
+) -> Option[VisibilityWidthResult]:
+	view ?= register_initial_locals(input)
+	imported_view ?= register_imports(input, view)
+	query_checksum ?= query_bound_names(input, imported_view)
+	bound_rows = module_view_graph_bound_name_count(imported_view)
+	import_bindings = module_view_import_binding_count(imported_view)
+	-- Duplicate attempts alternate alias/selective, beginning with alias.
+	-- Every observed variant was checked in register_imports, so these counts
+	-- follow from the configured number of attempts without per-attempt writes.
+	duplicate_aliases = (input.config.duplicate_attempts + 1) / 2
+	duplicate_selectives = input.config.duplicate_attempts / 2
+
+	expected_rows = if input.config.overlap_selectives_with_aliases:
+		input.config.alias_count + input.config.local_count
+	else:
+		input.config.alias_count + input.config.selective_count + input.config.local_count
+
+	Some({
+		final_bound_rows = bound_rows,
+		final_import_bindings = import_bindings,
+		final_duplicate_aliases = duplicate_aliases,
+		final_duplicate_selectives = duplicate_selectives,
+		final_query_hits = input.config.query_count,
+		total_bound_query_checksum = prior_query_checksum + query_checksum,
+		valid = (
+			bound_rows == expected_rows
+			and import_bindings == input.config.alias_count + input.config.selective_count
+		),
+	})
+
+
 pure func visibility_width_execute(input: VisibilityWidthInput) -> Option[VisibilityWidthResult]:
 	representation: VisibilityWidthInputRep = from_opaque VisibilityWidthInput(input)
-	config = representation.config
 	var result: VisibilityWidthResult = {
 		final_bound_rows = 0,
 		final_import_bindings = 0,
@@ -359,108 +669,38 @@ pure func visibility_width_execute(input: VisibilityWidthInput) -> Option[Visibi
 		total_bound_query_checksum = 0,
 		valid = True
 	}
+	var completed = True
 
-	for _ in 0..config.iterations:
-		var view = representation.initial_view
-		var registration_valid: Bool = True
-		if config.batch_initial_locals:
-			match module_view_bind_initial_graph_local_names(
-				view,
-				representation.module_table,
-				representation.current_module_id,
-				representation.local_candidates,
-			):
-				Some(next):
-					view = next
-				None:
-					registration_valid = False
-		else:
-			for index in 0..config.local_count:
-				match register_local(representation, view, index):
-					Some(next):
-						view = next
-					None:
-						registration_valid = False
-		for index in 0..config.alias_count:
-			match register_alias(representation, view, index):
-				Some(next):
-					view = next
-				None:
-					registration_valid = False
-		for index in 0..config.selective_count:
-			match register_selective(representation, view, index):
-				Some(next):
-					view = next
-				None:
-					registration_valid = False
+	for _ in 0..representation.config.iterations:
+		match visibility_width_execute_iteration(representation, result.total_bound_query_checksum):
+			None:
+				completed = False
+				break
+			Some(iteration):
+				result = iteration
 
-		var duplicate_aliases: Int = 0
-		var duplicate_selectives: Int = 0
-		for index in 0..config.duplicate_attempts:
-			if index % 2 == 0:
-				match module_view_register_module_alias_target(
-					view,
-					representation.module_table,
-					representation.current_module_id,
-					representation.first_alias_name,
-					representation.first_module_path,
-					representation.module_table,
-					representation.first_module_id,
-				):
-					ModuleAliasAlreadyPresent:
-						duplicate_aliases += 1
-					_:
-						registration_valid = False
-			else:
-				match module_view_register_selective_name_for_graph(
-					view,
-					representation.current_module_id,
-					representation.definition_table,
-					representation.definition_table,
-					representation.first_selective_name,
-					representation.first_module_path,
-					"Token",
-					representation.first_module_id,
-					representation.first_definition_ids,
-				):
-					SelectiveNameConflictsWithImportedName(_):
-						duplicate_selectives += 1
-					_:
-						registration_valid = False
+				if not iteration.valid:
+					break
 
-		var query_hits: Int = 0
-		var query_checksum: Int = 0
-		for index in 0..config.query_count:
-			match query_identity_value(representation, view, index):
-				Some(identity_value):
-					query_hits += 1
-					query_checksum += identity_value
-				None:
-					void
-
-		bound_rows = module_view_graph_bound_name_count(view)
-		import_bindings = module_view_import_bindings(view).length()
-		expected_rows = if config.overlap_selectives_with_aliases:
-			config.alias_count + config.local_count
-		else:
-			config.alias_count + config.selective_count + config.local_count
-		result = {
-			final_bound_rows = bound_rows,
-			final_import_bindings = import_bindings,
-			final_duplicate_aliases = duplicate_aliases,
-			final_duplicate_selectives = duplicate_selectives,
-			final_query_hits = query_hits,
-			total_bound_query_checksum = result.total_bound_query_checksum + query_checksum,
-			valid = result.valid and registration_valid
-				and bound_rows == expected_rows
-				and import_bindings == config.alias_count + config.selective_count
-				and duplicate_aliases + duplicate_selectives == config.duplicate_attempts
-				and query_hits == config.query_count
-		}
-
-	Some(result)
+	if completed:
+		Some(result)
+	else:
+		None
 
 
 pure func visibility_width_run(config: VisibilityWidthConfig) -> Option[VisibilityWidthResult]:
 	input ?= visibility_width_prepare(config)
 	visibility_width_execute(input)
+
+
+-- Exercise the first unexpected registration failure without admitting later
+-- rows into a partial benchmark view. Only the benchmark test uses this hook.
+pure func visibility_width_run_with_foreign_current_module_for_test(
+	config: VisibilityWidthConfig,
+) -> Option[VisibilityWidthResult]:
+	input ?= visibility_width_prepare(config)
+	representation: VisibilityWidthInputRep = from_opaque VisibilityWidthInput(input)
+	foreign_input = into_opaque VisibilityWidthInput(
+		{ representation | current_module_id = representation.first_module_id }
+	)
+	visibility_width_execute(foreign_input)

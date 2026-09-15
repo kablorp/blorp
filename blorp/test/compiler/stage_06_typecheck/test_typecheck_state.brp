@@ -62,6 +62,7 @@ import:
 		typecheck_state_add_diagnostic,
 		typecheck_state_add_known_resource_type_name,
 		typecheck_state_add_known_type_name,
+		typecheck_state_begin_graph_import_admission,
 		typecheck_state_add_private_impl,
 		typecheck_state_allows_builtin,
 		typecheck_state_allows_foreign,
@@ -77,6 +78,7 @@ import:
 		typecheck_state_find_private_impl_conflict,
 		typecheck_state_find_top_level_name,
 		typecheck_state_find_type_home,
+		typecheck_state_finish_graph_import_admission,
 		typecheck_state_for_origin,
 		typecheck_state_from_infer_session,
 		typecheck_state_func_callable_bindings,
@@ -99,6 +101,7 @@ import:
 		typecheck_state_type_home_is_imported,
 		typecheck_state_type_home_matches,
 		typecheck_state_with_debug_calls,
+	../../../src/compiler/stage_06_typecheck/type_system/context: fresh_meta
 	../../../src/compiler/stage_06_typecheck/type_system/env: ENV_EMPTY, impl_instance
 	../../../src/compiler/stage_06_typecheck/type_system/semantic_type: TYPE_INT
 	../../../src/lib/source: SourceSpan, source_file, source_span, source_spans_equal, source_start
@@ -607,6 +610,27 @@ func test_reserved_definition_ids_are_read_only_and_graph_owned() -> Bool:
 							)
 
 
+func test_prepared_scope_rejects_unscoped_solver_metas() -> Bool:
+	match prepared_module("owner.brp", "owner", "pure func owner() -> Int:\n\t1"):
+		None:
+			False
+		Some(scope):
+			unscoped = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
+			issued = fresh_meta(unscoped.context)
+			rejected = typecheck_state_enter_prepared_module_scope(
+				{ unscoped | context = issued.context },
+				scope,
+			)
+
+			(
+				rejected.errors.length() == 1
+				and rejected.errors
+					.get_or(0, "")
+					.contains("before selecting a module")
+				and typecheck_state_definition_index(rejected).is_none()
+			)
+
+
 func test_reserved_source_definition_ids_are_precise() -> Bool:
 	match prepared_module("types.brp", "types", "union A:\n\tLeft\n\nunion B:\n\tRight"):
 		None:
@@ -728,6 +752,30 @@ func test_reserved_scope_rejects_replacement_from_another_graph() -> Bool:
 				and typecheck_state_func_callable_bindings(rejected, "second").length() == 0
 			)
 		_:
+			False
+
+
+func test_graph_import_admission_reentry_preserves_pending_owner() -> Bool:
+	match prepared_module(
+		"admission.brp", "admission", "pure func value() -> Int: 1",
+	):
+		Some(scope):
+			state = typecheck_state_enter_prepared_module_scope(
+				typecheck_state_for_origin(TYPECHECK_USER_ORIGIN), scope,
+			)
+			begun = typecheck_state_begin_graph_import_admission(state)
+			reentered = typecheck_state_begin_graph_import_admission(begun)
+			finished = typecheck_state_finish_graph_import_admission(reentered)
+			(
+				begun.graph_import_admission.is_some()
+				and reentered.graph_import_admission.is_some()
+				and finished.graph_import_admission.is_none()
+				and reentered.errors.length() == 1
+				and reentered.errors.get(0) == Some(
+					"internal typecheck error: graph import admission is already active",
+				)
+			)
+		None:
 			False
 
 
@@ -1006,6 +1054,10 @@ tests: TestSuite = {
 			test_reserved_definition_ids_are_read_only_and_graph_owned,
 		),
 		(
+			"prepared scope rejects metas issued before module selection",
+			test_prepared_scope_rejects_unscoped_solver_metas,
+		),
+		(
 			"reserved source definition ids are precise",
 			test_reserved_source_definition_ids_are_precise,
 		),
@@ -1017,6 +1069,10 @@ tests: TestSuite = {
 		(
 			"prepared scope switches and restores identity and origin together",
 			test_prepared_scope_switches_and_restores_identity_and_origin_together,
+		),
+		(
+			"graph import admission reentry preserves pending owner",
+			test_graph_import_admission_reentry_preserves_pending_owner,
 		),
 		(
 			"graph selective import requires exact provenance and target",

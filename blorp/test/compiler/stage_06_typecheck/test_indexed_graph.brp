@@ -18,12 +18,17 @@ import:
 		module_id_table_index,
 		module_table,
 		module_table_id_at,
+	../../../src/compiler/stage_06_typecheck/decl:
+		new_definition_meta_run,
+		prepared_module_scope_meta_session,
 	../../../src/compiler/stage_06_typecheck/graph/definition_index:
+		definition_index_definition_table,
 		definition_index_find_type_definition_id,
 		definition_index_func_callable_id_count,
 		definition_index_initial_seed,
 		definition_index_next_def_id,
 		definition_index_seed_next_def_id,
+		exported_definition_name_demand_contains,
 	../../../src/compiler/stage_06_typecheck/graph/indexed_graph:
 		IndexedGraph,
 		IndexedGraphError,
@@ -45,8 +50,10 @@ import:
 		prepared_module_identity,
 		prepared_module_program,
 		prepared_module_scope_compatible_index,
+		prepared_module_scope_conservative_selective_export_names,
 		prepared_module_scope_id,
 		prepared_module_scope_module,
+		prepared_module_scope_selective_export_names,
 		prepared_module_scopes_are_compatible,
 	../../../src/compiler/stage_06_typecheck/graph/source_name_table:
 		source_name_ids_equal,
@@ -55,6 +62,7 @@ import:
 		source_name_table_find_id,
 		source_name_table_spelling,
 	../../../src/compiler/stage_06_typecheck/type_system/env: ENV_EMPTY
+	../../../src/compiler/stage_06_typecheck/type_system/meta_identity: meta_session_ids_equal
 	../typecheck_test_support as TypecheckTestSupport
 	memory: get_mem_stats, reset_mem_stats
 	test: TestSuite
@@ -133,6 +141,52 @@ private pure func first_error_message(errors: List[IndexedGraphError]) -> Option
 		.map(indexed_graph_error_message)
 
 
+private func module_meta_sessions_require_issuing_definition_table() -> Option[Bool]:
+	target = fixture_module_load_candidate(
+		"src/main.brp",
+		"app/main",
+		"func main(args: List[String]) -> Int:\n\t0",
+	)
+	dependency = fixture_module_load_candidate(
+		"src/math.brp",
+		"pkg/math",
+		"pure func answer() -> Int:\n\t42",
+	)
+	first_graph ?= indexed_graph_build(target, [dependency]).to_option()
+	other_graph ?= indexed_graph_build(target, [dependency]).to_option()
+	first_scope = indexed_graph_target_scope(first_graph)
+	dependency_scope ?= indexed_graph_find_dependency_scope(first_graph, "pkg/math")
+	other_scope = indexed_graph_target_scope(other_graph)
+	first_table = definition_index_definition_table(indexed_graph_definition_index(first_graph))
+	other_table = definition_index_definition_table(indexed_graph_definition_index(other_graph))
+	first_run = new_definition_meta_run(first_table)
+	other_run = new_definition_meta_run(other_table)
+	separate_run = new_definition_meta_run(first_table)
+	first_session ?= prepared_module_scope_meta_session(first_scope, first_run, 0)
+	dependency_session ?= prepared_module_scope_meta_session(dependency_scope, first_run, 0)
+	other_session ?= prepared_module_scope_meta_session(other_scope, other_run, 0)
+	separate_session ?= prepared_module_scope_meta_session(first_scope, separate_run, 0)
+	recheck_session ?= prepared_module_scope_meta_session(first_scope, first_run, 1)
+	copied_session ?= prepared_module_scope_meta_session(first_scope, first_run, 0)
+
+	Some(
+		(
+			prepared_module_scope_meta_session(first_scope, other_run, 0).is_none()
+			and prepared_module_scope_meta_session(other_scope, first_run, 0).is_none()
+			and prepared_module_scope_meta_session(first_scope, first_run, -1).is_none()
+			and not meta_session_ids_equal(first_session, dependency_session)
+			and not meta_session_ids_equal(first_session, other_session)
+			and not meta_session_ids_equal(first_session, separate_session)
+			and not meta_session_ids_equal(first_session, recheck_session)
+			and meta_session_ids_equal(first_session, copied_session)
+		),
+	)
+
+
+func test_module_meta_sessions_require_issuing_definition_table() -> Bool:
+	module_meta_sessions_require_issuing_definition_table().get_or(False)
+
+
 pure func test_indexed_graph_owns_canonical_modules_and_definition_index() -> Bool:
 	target = fixture_module_load_candidate(
 		"src/main.brp",
@@ -167,6 +221,75 @@ pure func test_indexed_graph_owns_canonical_modules_and_definition_index() -> Bo
 				and definition_index_func_callable_id_count(definition_index) == 2
 				and definition_index_next_def_id(definition_index) == initial_next_def_id + 2
 			)
+		Err(_):
+			False
+
+
+pure func test_indexed_graph_scopes_selective_export_names_by_module_id() -> Bool:
+	target = fixture_module_load_candidate(
+		"src/main.brp",
+		"app/main",
+		"import:\n\tpkg/first: First, FirstAlias, Third, Fourth, First\n\tpkg/second: Second\n\tsource-alias: Fallback\n\nfunc main(args: List[String]) -> Int:\n\t0",
+	)
+	first = fixture_module_load_candidate(
+		"src/first.brp",
+		"pkg/first",
+		"record First {value: Int}\n\ntype alias FirstAlias = First\n\ntype alias Third = First\n\ntype alias Fourth = First",
+	)
+	second = fixture_module_load_candidate(
+		"src/second.brp",
+		"pkg/second",
+		"record Second {value: Int}",
+	)
+
+	match (
+		indexed_graph_build(
+			target,
+			[first, second],
+		)
+	):
+		Ok(graph):
+			match (
+				indexed_graph_find_dependency_scope(graph, "pkg/first"),
+				indexed_graph_find_dependency_scope(graph, "pkg/second"),
+			):
+				(Some(first_scope), Some(second_scope)):
+					(
+						prepared_module_scope_selective_export_names(
+							first_scope,
+						).exported_definition_name_demand_contains("First")
+						and prepared_module_scope_selective_export_names(
+							first_scope,
+						).exported_definition_name_demand_contains("FirstAlias")
+						and prepared_module_scope_selective_export_names(
+							first_scope,
+						).exported_definition_name_demand_contains("Third")
+						and prepared_module_scope_selective_export_names(
+							first_scope,
+						).exported_definition_name_demand_contains("Fourth")
+						and prepared_module_scope_selective_export_names(
+							second_scope,
+						).exported_definition_name_demand_contains("Second")
+						and not prepared_module_scope_selective_export_names(
+							first_scope,
+						).exported_definition_name_demand_contains("Second")
+						and not prepared_module_scope_selective_export_names(
+							second_scope,
+						).exported_definition_name_demand_contains("First")
+						and not prepared_module_scope_selective_export_names(
+							indexed_graph_target_scope(
+								graph,
+							),
+						).exported_definition_name_demand_contains("First")
+						and not prepared_module_scope_selective_export_names(
+							first_scope,
+						).exported_definition_name_demand_contains("Fallback")
+						and prepared_module_scope_conservative_selective_export_names(
+							first_scope,
+						).exported_definition_name_demand_contains("Fallback")
+					)
+				_:
+					False
 		Err(_):
 			False
 
@@ -996,6 +1119,14 @@ tests: TestSuite = {
 		(
 			"owns canonical modules and definition index",
 			test_indexed_graph_owns_canonical_modules_and_definition_index,
+		),
+		(
+			"scopes selective export names by module id",
+			test_indexed_graph_scopes_selective_export_names_by_module_id,
+		),
+		(
+			"module meta sessions require the issuing definition table",
+			test_module_meta_sessions_require_issuing_definition_table,
 		),
 		(
 			"rejects duplicate dependency identity",

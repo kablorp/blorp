@@ -9,6 +9,12 @@ without redundant or stringly typed whole-tree scans.
 This issue implements
 [Phase 9 of the typechecking migration](../../COMPILER_PRIORITIES.md#phase-9-semantic-body-validation).
 
+The current-code function-body inventory for Phase 9A is in the
+[Step 4A body-validation packet](../compiler-performance/108-step4a-body-validation-rule-inventory.md).
+It records the post-finalization call sequence, diagnostic order, duplicate
+accepted-reuse audit, and early lexical checks before any further rule move.
+The broader Phase 9A inventory is not yet closed.
+
 ## Context
 
 Blorp typechecking currently performs semantic checks in several places:

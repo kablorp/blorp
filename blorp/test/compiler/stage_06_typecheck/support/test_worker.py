@@ -24,6 +24,9 @@ MODULE_TABLE_INCLUDE_DIR = Path(
 TYPECHECK_GRAPH_INCLUDE_DIR = Path(
     "blorp/src/compiler/stage_06_typecheck/graph"
 )
+TYPE_SYSTEM_INCLUDE_DIR = Path(
+    "blorp/src/compiler/stage_06_typecheck/type_system"
+)
 
 
 def load_module(name: str, path: Path):
@@ -99,6 +102,10 @@ class CompilerTypecheckWorkerTests(unittest.TestCase):
             )
             self.assertIn(
                 f"-I{(root / TYPECHECK_GRAPH_INCLUDE_DIR).resolve()}",
+                object_command,
+            )
+            self.assertIn(
+                f"-I{(root / TYPE_SYSTEM_INCLUDE_DIR).resolve()}",
                 object_command,
             )
             self.assertIn(

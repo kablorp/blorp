@@ -96,6 +96,7 @@ import:
 			TypedUnionDecl,
 		),
 		TypedForeignArgPassing(TypedForeignBorrowArgs, TypedForeignDefaultArgs),
+		TypedFunctionInfo,
 		TypedGlobalVarInfo,
 		TypedProgram,
 		TypedRecordFieldInfo,
@@ -104,6 +105,8 @@ import:
 		accepted_typecheck_graph_definition_table,
 		accepted_typecheck_graph_implementation_headers,
 		accepted_typecheck_graph_semantic_catalog,
+		global_header_completion_plan_meta_session_at,
+		new_definition_meta_run,
 		typecheck_bind_program_module_view,
 		typecheck_bind_standalone_program_module_view,
 		typecheck_check_function_body,
@@ -141,15 +144,27 @@ import:
 		indexed_graph_target_scope,
 		prepared_module_program,
 		prepared_module_scope_canonical_path,
+		prepared_module_scope_graph_module_name_scope,
 		prepared_module_scope_id,
 		prepared_module_scope_module,
 		prepared_module_scope_module_table,
 		prepared_module_scope_source_name_table,
 	../../../src/compiler/stage_06_typecheck/graph/source_name_table:
 		SourceNameTable,
+		graph_module_name_scope,
+		graph_source_name_table,
+		graph_source_name_table_source_names,
 		source_name_id_table_index,
 		source_name_table,
+		source_name_table_count,
 		source_name_table_find_id,
+		source_name_table_id_at,
+		source_name_table_spelling,
+		source_name_tables_are_compatible,
+	../../../src/compiler/stage_06_typecheck/headers/accepted_alias_graph:
+		accepted_alias_table_authority_for_module,
+	../../../src/compiler/stage_06_typecheck/headers/accepted_union_graph:
+		accepted_union_table_authority_for_module,
 	../../../src/compiler/stage_06_typecheck/headers/callable_headers:
 		CallableHeader,
 		callable_header_graph_callables,
@@ -157,6 +172,7 @@ import:
 		callable_header_id,
 		callable_header_name,
 		callable_header_visibility,
+		global_header_name,
 	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
 		CallableId,
 		DeclarationVisibility(PublicDeclaration),
@@ -171,6 +187,15 @@ import:
 		trait_id_module_id,
 		trait_id_name,
 		trait_method_ids_equal,
+	../../../src/compiler/stage_06_typecheck/headers/global_header_completion:
+		GlobalHeaderCompletionPlanBuild(
+			GlobalHeaderCompletionPlanReady,
+			GlobalHeaderCompletionPlanBlocked,
+		),
+		global_header_completion_plan_annotated,
+		global_header_completion_plan_build,
+		global_header_completion_plan_header_at,
+		global_header_completion_plan_pending,
 	../../../src/compiler/stage_06_typecheck/headers/implementation_headers:
 		implementation_header_graph_callable_headers,
 		implementation_header_graph_definition_table,
@@ -253,11 +278,13 @@ import:
 		module_view_accepted_union_authority,
 		module_view_find_graph_module_alias,
 		module_view_find_imported_name,
-		module_view_graph_bound_name_count,
-		module_view_import_bindings,
 		module_view_find_local_name,
 		module_view_find_standalone_module_alias,
+		module_view_for_graph,
+		module_view_graph_bound_name_count,
 		module_view_has_selective_binding,
+		module_view_import_bindings,
+		module_view_imported_constructors,
 	../../../src/compiler/stage_06_typecheck/modules/module_visibility:
 		ImportIdentityResolution(
 			ImportIdentityAmbiguous,
@@ -315,7 +342,9 @@ import:
 		accepted_record_find,
 		accepted_record_find_names_with_fields,
 	../../../src/compiler/stage_06_typecheck/type_system/accepted_semantic_catalog:
+		accepted_semantic_catalog_alias_table,
 		accepted_semantic_catalog_callable_table,
+		accepted_semantic_catalog_union_table,
 	../../../src/compiler/stage_06_typecheck/type_system/accepted_trait_implementation_authority:
 		AcceptedImplementationTableRecord,
 		AcceptedTraitTableRecord,
@@ -343,7 +372,10 @@ import:
 		accepted_union_find,
 		accepted_union_find_constructor,
 		accepted_union_find_module_constructor,
-	../../../src/compiler/stage_06_typecheck/type_system/context: find_resource_cleanup
+	../../../src/compiler/stage_06_typecheck/type_system/context:
+		CONTEXT_EMPTY,
+		find_resource_cleanup,
+		zonk_type,
 	../../../src/compiler/stage_06_typecheck/type_system/env:
 		FieldDecl,
 		FuncOrigin(ForeignFunc, UserDefinedFunc),
@@ -375,6 +407,7 @@ import:
 		trait_def_with_details,
 		trait_method_sig,
 		trait_obligation,
+	../../../src/compiler/stage_06_typecheck/type_system/meta_identity: meta_session_ids_equal
 	../../../src/compiler/stage_06_typecheck/type_system/refinement: UNREFINED_BINDING
 	../../../src/compiler/stage_06_typecheck/type_system/semantic_type:
 		SemanticType(
@@ -392,6 +425,7 @@ import:
 		TYPE_VOID,
 		canonical_module_type_name,
 		types_equal,
+	../../../src/compiler/stage_06_typecheck/type_system/type_widening: ValueSlot(KeptValueSlot)
 	../../../src/lib/source:
 		Cursor,
 		SourceFile,
@@ -1701,12 +1735,13 @@ func test_bind_program_module_view_returns_completed_namespace() -> Bool:
 
 
 func test_graph_binding_batches_local_prescan_before_import_conflicts() -> Bool:
-	var decls: List[ParsedDecl] = [
-		import_block_decl([import_decl("dep", Some("Local_31"), None)]),
-	]
+	var decls: List[ParsedDecl] = [import_block_decl([import_decl("dep", Some("Local_31"), None)])]
+
 	for index in 0..40:
 		decls = decls.append(function_decl("Local_" + index.to_string()))
+
 	source_program = program(decls)
+
 	match importable_module_index_for_target_program(
 		importable_modules("dep", []),
 		UserModule,
@@ -1720,6 +1755,7 @@ func test_graph_binding_batches_local_prescan_before_import_conflicts() -> Bool:
 					False
 				Some(owner):
 					owner_scope = importable_module_prepared_scope(owner)
+
 					match typecheck_bind_program_module_view(
 						typecheck_state_enter_prepared_module_scope(
 							typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
@@ -1734,24 +1770,34 @@ func test_graph_binding_batches_local_prescan_before_import_conflicts() -> Bool:
 						BoundModuleViewReady(view, _, _, diagnostics):
 							(
 								module_view_graph_bound_name_count(view) == 40
-								and module_view_find_local_name(view, "Local_31") == Some(TopLevelFunction)
-								and module_view_find_local_name(view, "Local_32") == Some(TopLevelFunction)
+								and module_view_find_local_name(
+									view,
+									"Local_31",
+								) == Some(TopLevelFunction)
+								and module_view_find_local_name(
+									view,
+									"Local_32",
+								) == Some(TopLevelFunction)
 								and module_view_import_bindings(view).is_empty()
 								and diagnostics.length() == 1
-								and diagnostics.get(0).map(func(item): item.message.contains(
-									"module alias 'Local_31' conflicts with function 'Local_31'",
-								)).get_or(False)
+								and diagnostics
+									.get(0)
+									.map(
+										func(
+											item,
+										): item.message.contains(
+											"module alias 'Local_31' conflicts with function 'Local_31'",
+										),
+									)
+									.get_or(False)
 							)
 
 
 func test_graph_binding_local_batch_preserves_uncataloged_name_error() -> Bool:
 	reserved_program = program([])
 	mismatched_program = program([function_decl("Uncataloged")])
-	match importable_module_index_for_target_program(
-		[],
-		UserModule,
-		reserved_program,
-	):
+
+	match importable_module_index_for_target_program([], UserModule, reserved_program):
 		None:
 			False
 		Some(index):
@@ -1760,6 +1806,7 @@ func test_graph_binding_local_batch_preserves_uncataloged_name_error() -> Bool:
 					False
 				Some(owner):
 					owner_scope = importable_module_prepared_scope(owner)
+
 					match typecheck_bind_program_module_view(
 						typecheck_state_enter_prepared_module_scope(
 							typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
@@ -1775,8 +1822,12 @@ func test_graph_binding_local_batch_preserves_uncataloged_name_error() -> Bool:
 							(
 								module_view_graph_bound_name_count(view) == 0
 								and diagnostics.length() == 1
-								and diagnostics.get(0).map(func(item): item.message)
-									== Some("internal typecheck error: top-level name 'Uncataloged' is not cataloged by the active module graph")
+								and diagnostics
+									.get(0)
+									.map(func(item): item.message) == Some((
+										"internal typecheck error: top-level name 'Uncataloged' is not cataloged by the "
+										+ "active module graph"
+									))
 							)
 
 
@@ -1828,11 +1879,13 @@ func test_bound_module_alias_retains_graph_module_id() -> Bool:
 
 
 func test_bound_alias_and_selective_name_share_one_graph_row() -> Bool:
-	source_program = program([
-		import_block_decl([
-			import_decl("dep", Some("Token"), Some([import_symbol("Token", None, [])])),
-		]),
-	])
+	source_program = program(
+		[
+			import_block_decl(
+				[import_decl("dep", Some("Token"), Some([import_symbol("Token", None, [])]))],
+			),
+		],
+	)
 
 	match importable_module_index_for_target_program(
 		importable_modules("dep", [record_decl("Token")]),
@@ -1841,14 +1894,13 @@ func test_bound_alias_and_selective_name_share_one_graph_row() -> Bool:
 	):
 		None:
 			False
-
-
 		Some(index):
 			match importable_module_index_find(index, "index_target"):
 				None:
 					False
 				Some(owner):
 					owner_scope = importable_module_prepared_scope(owner)
+
 					match typecheck_bind_program_module_view(
 						typecheck_state_enter_prepared_module_scope(
 							typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
@@ -1862,16 +1914,19 @@ func test_bound_alias_and_selective_name_share_one_graph_row() -> Bool:
 							False
 						BoundModuleViewReady(view, _, _, diagnostics):
 							bindings = module_view_import_bindings(view)
+
 							qualified_second = match bindings.get(1):
 								Some(GraphQualifiedModuleBinding(qualified_name, _)):
 									qualified_name == "Token"
 								_:
 									False
+
 							selective_first = match bindings.get(0):
 								Some(GraphSelectiveDefinitionBinding(selective_name, _, ids)):
 									selective_name == "Token" and ids.length() == 1
 								_:
 									False
+
 							(
 								diagnostics.is_empty()
 								and module_view_find_graph_module_alias(view, "Token").is_some()
@@ -1884,20 +1939,19 @@ func test_bound_alias_and_selective_name_share_one_graph_row() -> Bool:
 
 
 func test_graph_binding_keeps_private_missing_and_duplicate_diagnostics_in_order() -> Bool:
-	source_program = program([import_block_decl([import_decl(
+	source_program = program([import_block_decl([import_decl("dep", Some("Dep"), Some([
+					import_symbol("Hidden", None, []),
+					import_symbol("Missing", None, []),
+					import_symbol("Visible", Some("Chosen"), []),
+					import_symbol("Visible", Some("Chosen"), []),
+				]))])])
+	modules = importable_modules(
 		"dep",
-		Some("Dep"),
-		Some([
-			import_symbol("Hidden", None, []),
-			import_symbol("Missing", None, []),
-			import_symbol("Visible", Some("Chosen"), []),
-			import_symbol("Visible", Some("Chosen"), []),
-		]),
-	)])])
-	modules = importable_modules("dep", [
-		PrivateParsedDecl(function_decl("Hidden"), fixture_source_span()),
-		function_decl("Visible"),
-	])
+		[
+			PrivateParsedDecl(function_decl("Hidden"), fixture_source_span()),
+			function_decl("Visible"),
+		],
+	)
 
 	match importable_module_index_for_target_program(modules, UserModule, source_program):
 		None:
@@ -1908,6 +1962,7 @@ func test_graph_binding_keeps_private_missing_and_duplicate_diagnostics_in_order
 					False
 				Some(owner):
 					owner_scope = importable_module_prepared_scope(owner)
+
 					match typecheck_bind_program_module_view(
 						typecheck_state_enter_prepared_module_scope(
 							typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
@@ -1922,25 +1977,47 @@ func test_graph_binding_keeps_private_missing_and_duplicate_diagnostics_in_order
 						BoundModuleViewReady(view, _, _, diagnostics):
 							(
 								diagnostics.length() == 3
-								and diagnostics.get(0).map(func(item): item.message)
-									== Some("'Hidden' is private in module 'dep' and cannot be imported")
-								and diagnostics.get(1).map(func(item): item.message)
-									== Some("'Missing' is not exported by module 'dep'")
-								and diagnostics.get(2).map(func(item): item.message)
-									== Some("'Chosen' is already imported from this module")
+								and diagnostics
+									.get(0)
+									.map(
+										func(
+											item,
+										): item.message,
+									) == Some(
+									"'Hidden' is private in module 'dep' and cannot be imported",
+								)
+								and diagnostics
+									.get(1)
+									.map(
+										func(
+											item,
+										): item.message,
+									) == Some("'Missing' is not exported by module 'dep'")
+								and diagnostics
+									.get(2)
+									.map(
+										func(
+											item,
+										): item.message,
+									) == Some("'Chosen' is already imported from this module")
 								and module_view_find_imported_name(view, "Hidden").is_none()
 								and module_view_find_imported_name(view, "Missing").is_none()
-								and module_view_has_selective_binding(view, "Chosen", "dep", "Visible")
+								and module_view_has_selective_binding(
+									view,
+									"Chosen",
+									"dep",
+									"Visible",
+								)
 								and module_view_import_bindings(view).length() == 2
 							)
 
 
 func test_graph_import_module_decisions_preserve_source_order_and_admission() -> Bool:
 	source_program = program([import_block_decl([
-		import_decl("missing", None, None),
-		import_decl("dep", Some("Dep"), None),
-		import_decl("dep", Some("SecondDep"), None),
-	])])
+			import_decl("missing", None, None),
+			import_decl("dep", Some("Dep"), None),
+			import_decl("dep", Some("SecondDep"), None),
+		])])
 	modules = importable_modules("dep", [function_decl("Visible")])
 
 	match importable_module_index_for_target_program(modules, UserModule, source_program):
@@ -1952,6 +2029,7 @@ func test_graph_import_module_decisions_preserve_source_order_and_admission() ->
 					False
 				Some(owner):
 					owner_scope = importable_module_prepared_scope(owner)
+
 					match typecheck_bind_program_module_view(
 						typecheck_state_enter_prepared_module_scope(
 							typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
@@ -1966,10 +2044,82 @@ func test_graph_import_module_decisions_preserve_source_order_and_admission() ->
 						BoundModuleViewReady(view, _, _, diagnostics):
 							(
 								diagnostics.length() == 2
-								and diagnostics.get(0).map(func(item): item.message)
-									== Some("module 'missing' is not loaded for import registration")
-								and diagnostics.get(1).map(func(item): item.message)
-									== Some("module 'dep' is already imported")
+								and diagnostics
+									.get(0)
+									.map(
+										func(
+											item,
+										): item.message,
+									) == Some(
+									"module 'missing' is not loaded for import registration",
+								)
+								and diagnostics
+									.get(1)
+									.map(
+										func(
+											item,
+										): item.message,
+									) == Some("module 'dep' is already imported")
+								and module_view_find_graph_module_alias(view, "Dep").is_some()
+								and module_view_find_graph_module_alias(view, "SecondDep").is_none()
+								and module_view_import_bindings(view).length() == 1
+							)
+
+
+func test_graph_import_decisions_cross_import_blocks_in_source_order() -> Bool:
+	source_program = program([
+		import_block_decl([import_decl("missing", None, None)]),
+		function_decl("Between"),
+		import_block_decl([]),
+		import_block_decl([import_decl("dep", Some("Dep"), None)]),
+		import_block_decl([import_decl("dep", Some("SecondDep"), None)]),
+	])
+	modules = importable_modules("dep", [function_decl("Visible")])
+
+	match importable_module_index_for_target_program(modules, UserModule, source_program):
+		None:
+			False
+		Some(index):
+			match importable_module_index_find(index, "index_target"):
+				None:
+					False
+				Some(owner):
+					owner_scope = importable_module_prepared_scope(owner)
+
+					match typecheck_bind_program_module_view(
+						typecheck_state_enter_prepared_module_scope(
+							typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+							owner_scope,
+						),
+						source_program,
+						index,
+						owner_scope,
+					):
+						BoundModuleViewRejected(_, _):
+							False
+						BoundModuleViewReady(view, _, _, diagnostics):
+							(
+								diagnostics.length() == 2
+								and diagnostics
+									.get(0)
+									.map(
+										func(
+											item,
+										): item.message,
+									) == Some(
+									"module 'missing' is not loaded for import registration",
+								)
+								and diagnostics
+									.get(1)
+									.map(
+										func(
+											item,
+										): item.message,
+									) == Some("module 'dep' is already imported")
+								and module_view_find_local_name(
+									view,
+									"Between",
+								) == Some(TopLevelFunction)
 								and module_view_find_graph_module_alias(view, "Dep").is_some()
 								and module_view_find_graph_module_alias(view, "SecondDep").is_none()
 								and module_view_import_bindings(view).length() == 1
@@ -2000,6 +2150,7 @@ func test_graph_module_alias_rejects_equal_layout_foreign_table() -> Bool:
 						prepared_module_scope_module_table(foreign_scope),
 						prepared_module_scope_id(foreign_scope),
 					)
+
 					(
 						result.errors.length() == 1
 						and module_view_find_graph_module_alias(result.module_view, "Dep").is_none()
@@ -2052,7 +2203,9 @@ func test_graph_view_rejects_other_module_in_same_graph() -> Bool:
 						prepared_module_scope_id(dependency_scope),
 					)
 					mixed_state = { dependency_state | module_view = owner_with_alias.module_view }
-					initial_bound_names = module_view_graph_bound_name_count(mixed_state.module_view)
+					initial_bound_names = module_view_graph_bound_name_count(
+						mixed_state.module_view,
+					)
 					local_result = typecheck_state_remember_top_level_name(
 						mixed_state,
 						"Local",
@@ -2065,6 +2218,7 @@ func test_graph_view_rejects_other_module_in_same_graph() -> Bool:
 						prepared_module_scope_module_table(dependency_scope),
 						prepared_module_scope_id(dependency_scope),
 					)
+
 					(
 						owner_with_alias.errors.is_empty()
 						and initial_bound_names == 2
@@ -2083,9 +2237,13 @@ func test_graph_view_rejects_other_module_in_same_graph() -> Bool:
 							"Dep",
 						).is_none()
 						and local_result.errors.length() == 1
-						and module_view_graph_bound_name_count(local_result.module_view) == initial_bound_names
+						and module_view_graph_bound_name_count(
+							local_result.module_view,
+						) == initial_bound_names
 						and alias_result.errors.length() == 1
-						and module_view_graph_bound_name_count(alias_result.module_view) == initial_bound_names
+						and module_view_graph_bound_name_count(
+							alias_result.module_view,
+						) == initial_bound_names
 					)
 				_:
 					False
@@ -2173,6 +2331,7 @@ func test_bind_program_rejects_same_graph_wrong_module_view() -> Bool:
 						dependency_scope,
 					)
 					mixed_state = { dependency_state | module_view = owner_state.module_view }
+
 					match typecheck_bind_program_module_view(
 						mixed_state,
 						program([]),
@@ -2181,13 +2340,68 @@ func test_bind_program_rejects_same_graph_wrong_module_view() -> Bool:
 					):
 						BoundModuleViewRejected(message, diagnostics):
 							message == (
-								"internal typecheck error: graph module binding requires the view "
-								+ "for the selected module"
+								"internal typecheck error: graph module binding requires the view for the "
+								+ "selected module"
 							) and diagnostics.is_empty()
 						BoundModuleViewReady(_, _, _, _):
 							False
 				_:
 					False
+
+
+private pure func bind_program_rejects_reminted_source_catalog_on_same_module_table_result(
+
+) -> Option[Bool]:
+	index ?= importable_module_index(importable_modules("dep", []))
+	owner ?= importable_module_index_find(index, "index_target")
+	scope = importable_module_prepared_scope(owner)
+	module_table = prepared_module_scope_module_table(scope)
+	module_id = prepared_module_scope_id(scope)
+	original_names = prepared_module_scope_source_name_table(scope)
+	var copied_names: List[String] = []
+	var copied_all_names = True
+
+	for name_index in 0..source_name_table_count(original_names):
+		match source_name_table_id_at(original_names, name_index):
+			Some(name_id):
+				match source_name_table_spelling(original_names, name_id):
+					Some(name):
+						copied_names = copied_names.append(name)
+					None:
+						copied_all_names = False
+			None:
+				copied_all_names = False
+
+	reminted_names = graph_source_name_table(module_table, copied_names)
+	state = typecheck_state_enter_prepared_module_scope(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		scope,
+	)
+	reminted_view = module_view_for_graph(graph_module_name_scope(reminted_names, module_id))
+	mixed_state = { state | module_view = reminted_view }
+
+	outcome = match typecheck_bind_program_module_view(mixed_state, program([]), index, scope):
+		BoundModuleViewRejected(message, diagnostics):
+			(
+				copied_all_names
+				and source_name_tables_are_compatible(
+					original_names,
+					graph_source_name_table_source_names(reminted_names),
+				)
+				and message == (
+					"internal typecheck error: graph module binding requires the view for the "
+					+ "selected module"
+				)
+				and diagnostics.is_empty()
+			)
+		BoundModuleViewReady(_, _, _, _):
+			False
+
+	Some(outcome)
+
+
+func test_bind_program_rejects_reminted_source_catalog_on_same_module_table() -> Bool:
+	bind_program_rejects_reminted_source_catalog_on_same_module_table_result().get_or(False)
 
 
 func test_bind_program_module_view_rejects_preloaded_standalone_alias() -> Bool:
@@ -4023,6 +4237,62 @@ func test_accepted_imported_builtin_alias_uses_graph_authority() -> Bool:
 				and name == canonical_module_type_name("clock", "Clock")
 				and args.is_empty()
 				and env_get_alias(result.state.env, "Timer").is_none()
+			)
+		_:
+			False
+
+
+func test_accepted_imported_type_keeps_multiple_local_aliases() -> Bool:
+	result = typecheck_test_program_with_import_modules(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		program([import_block_decl([import_decl("clock", None, Some([
+						import_symbol("Clock", Some("Timer"), []),
+						import_symbol("Clock", Some("Timepiece"), []),
+					]))])]),
+		importable_modules("clock", [builtin_type_decl("Clock", False)]),
+	)
+
+	match (
+		accepted_transparent_alias_target(result.state, "Timer"),
+		accepted_transparent_alias_target(result.state, "Timepiece"),
+	):
+		(Some(SemanticNamedType(first, _)), Some(SemanticNamedType(second, _))):
+			(
+				result.state.errors.is_empty()
+				and first == canonical_module_type_name("clock", "Clock")
+				and second == first
+			)
+		_:
+			False
+
+
+func test_accepted_imported_type_aliases_keep_module_identity() -> Bool:
+	result = typecheck_test_program_with_import_modules(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		program([import_block_decl([
+				import_decl("clock_a", None, Some([import_symbol("Clock", Some("TimerA"), [])])),
+				import_decl("clock_b", None, Some([import_symbol("Clock", Some("TimerB"), [])])),
+			])]),
+		importable_modules(
+			"clock_a",
+			[
+				builtin_type_decl(
+					"Clock",
+					False,
+				),
+			],
+		).concat(importable_modules("clock_b", [builtin_type_decl("Clock", False)])),
+	)
+
+	match (
+		accepted_transparent_alias_target(result.state, "TimerA"),
+		accepted_transparent_alias_target(result.state, "TimerB"),
+	):
+		(Some(SemanticNamedType(first, _)), Some(SemanticNamedType(second, _))):
+			(
+				result.state.errors.is_empty()
+				and first == canonical_module_type_name("clock_a", "Clock")
+				and second == canonical_module_type_name("clock_b", "Clock")
 			)
 		_:
 			False
@@ -6511,7 +6781,7 @@ func test_validate_typed_program_rejects_unfinalized_meta() -> Bool:
 		RecordParsedDecl(record_decl):
 			typed_field: TypedRecordFieldInfo = {
 				name = "field",
-				source_type = SemanticMetaType(7),
+				source_type = zonk_type(CONTEXT_EMPTY, SemanticMetaType(7)),
 				semantic_type = TYPE_INT,
 				field_id = MISSING_RESOLVED_FIELD_IDENTITY,
 				declaration_span = fixture_source_span(),
@@ -6541,6 +6811,59 @@ func test_validate_typed_program_rejects_unfinalized_meta() -> Bool:
 							"typed program contains unfinalized inference meta in record 'Broken' field "
 							+ "'field' source type"
 						))
+			)
+		_:
+			False
+
+
+func test_function_body_solver_rejects_all_signature_metas_in_order() -> Bool:
+	match function_body_decl("unsolved", [], Some(int_type()), None):
+		FunctionParsedDecl(function_decl):
+			body_info: TypedExprInfo = {
+				source_type = None,
+				origin = InferredOrigin,
+				value_slot = KeptValueSlot(zonk_type(CONTEXT_EMPTY, SemanticMetaType(10))),
+				proofs = UNREFINED_BINDING,
+				resolved_call = None,
+				resolved_definition_id = None,
+				resource_dependencies = []
+			}
+			typed_function: TypedFunctionInfo = {
+				decl = function_decl,
+				callable_id = None,
+				effective_type_params = [],
+				param_types = [SemanticMetaType(7)],
+				source_return_type = Some(SemanticMetaType(8)),
+				semantic_return_type = SemanticMetaType(9),
+				body = Some(TypedIntLiteralExpr("1", fixture_source_span(), body_info))
+			}
+			typed_program: TypedProgram = {
+				source = fixture_source_file(),
+				decls = [TypedFunctionDecl(typed_function)],
+				diagnostics = [],
+				type_definitions = [],
+				type_references = []
+			}
+			result = typecheck_validate_typed_program({
+				state = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+				program = typed_program,
+			})
+			errors = result.state.errors
+
+			(
+				errors.length() == 4
+				and errors
+					.get_or(0, "")
+					.contains("function 'unsolved' parameter 0")
+				and errors
+					.get_or(1, "")
+					.contains("function 'unsolved' source return type")
+				and errors
+					.get_or(2, "")
+					.contains("function 'unsolved' semantic return type")
+				and errors
+					.get_or(3, "")
+					.contains("function 'unsolved' body")
 			)
 		_:
 			False
@@ -7620,6 +7943,20 @@ pure func test_explicit_import_constructor_ids_are_recorded_for_the_imported_mod
 			False
 		Some(binding):
 			accepted_index = module_view_accepted_union_authority(result.state.module_view)
+			explicit_bindings = module_view_imported_constructors(result.state.module_view)
+
+			explicit_binding_matches = match explicit_bindings.get(0):
+				Some(explicit):
+					(
+						explicit.local_name == "Ready"
+						and explicit.module_path == "signals"
+						and explicit.parent_local_name == "Signal"
+						and explicit.parent_name == "Signal"
+						and explicit.original_name == "Ready"
+					)
+				None:
+					False
+
 			constructor = accepted_index.and_then(
 				func(index): accepted_union_find_module_constructor(index, "signals", "Ready"),
 			)
@@ -7632,6 +7969,8 @@ pure func test_explicit_import_constructor_ids_are_recorded_for_the_imported_mod
 
 			(
 				result.state.errors.length() == 0
+				and explicit_bindings.length() == 1
+				and explicit_binding_matches
 				and source_definition_key_module_path(result.state, binding[0]) == Some("signals")
 				and constructor.is_some()
 				and bare_constructor.is_some()
@@ -8184,9 +8523,256 @@ func test_accepted_callable_visibility_preserves_exact_targets() -> Bool:
 	accepted_callable_visibility_preserves_exact_targets().get_or(False)
 
 
+private pure func accepted_nominal_authorities_reject_equal_layout_foreign_tables_result(
+
+) -> Option[Bool]:
+	fixture_program = program([
+		type_alias_decl("UserId", False),
+		union_decl(
+			"Choice",
+			["First", "Second"],
+		),
+	])
+	local_graph ?= typecheck_test_accepted_graph(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		fixture_program,
+		[],
+	).to_option()
+	foreign_graph ?= typecheck_test_accepted_graph(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		fixture_program,
+		[],
+	).to_option()
+	local_callable_headers = implementation_header_graph_callable_headers(
+		accepted_typecheck_graph_implementation_headers(local_graph),
+	)
+	local_type_headers = trait_topology_graph_type_headers(
+		callable_header_graph_trait_topology(local_callable_headers),
+	)
+	local_bound_graph = type_header_graph_bound_graph(local_type_headers)
+	local_bound_module = bound_module_graph_target(local_bound_graph)
+	foreign_callable_headers = implementation_header_graph_callable_headers(
+		accepted_typecheck_graph_implementation_headers(foreign_graph),
+	)
+	foreign_type_headers = trait_topology_graph_type_headers(
+		callable_header_graph_trait_topology(foreign_callable_headers),
+	)
+	foreign_bound_module = bound_module_graph_target(
+		type_header_graph_bound_graph(foreign_type_headers),
+	)
+	local_catalog = accepted_typecheck_graph_semantic_catalog(local_graph)
+	foreign_catalog = accepted_typecheck_graph_semantic_catalog(foreign_graph)
+
+	alias_rejected = match accepted_alias_table_authority_for_module(
+		accepted_semantic_catalog_alias_table(foreign_catalog),
+		local_type_headers,
+		local_bound_module,
+	):
+		Err(message):
+			message == "accepted alias authority rejected mismatched definition-table provenance"
+		Ok(_):
+			False
+
+	union_rejected = match accepted_union_table_authority_for_module(
+		accepted_semantic_catalog_union_table(foreign_catalog),
+		local_type_headers,
+		local_bound_module,
+		local_bound_graph,
+	):
+		Err(message):
+			message == "accepted union authority rejected mismatched definition-table provenance"
+		Ok(_):
+			False
+
+	foreign_module_alias_rejected = match accepted_alias_table_authority_for_module(
+		accepted_semantic_catalog_alias_table(local_catalog),
+		local_type_headers,
+		foreign_bound_module,
+	):
+		Err(message):
+			message == "accepted alias authority rejected mismatched definition-table provenance"
+		Ok(_):
+			False
+
+	foreign_module_union_rejected = match accepted_union_table_authority_for_module(
+		accepted_semantic_catalog_union_table(local_catalog),
+		local_type_headers,
+		foreign_bound_module,
+		local_bound_graph,
+	):
+		Err(message):
+			message == "accepted union authority rejected mismatched definition-table provenance"
+		Ok(_):
+			False
+
+	Some(
+		(
+			alias_rejected
+			and union_rejected
+			and foreign_module_alias_rejected
+			and foreign_module_union_rejected
+		),
+	)
+
+
+func test_accepted_nominal_authorities_reject_equal_layout_foreign_tables() -> Bool:
+	accepted_nominal_authorities_reject_equal_layout_foreign_tables_result().get_or(False)
+
+
+private func global_initializer_meta_sessions_follow_plan_provenance() -> Option[Bool]:
+	program = program_for_module(
+		"meta_globals",
+		[var_decl("first"), var_decl("second")],
+	)
+	first_graph ?= typecheck_test_accepted_graph(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		program,
+		[],
+	).to_option()
+	other_graph ?= typecheck_test_accepted_graph(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		program,
+		[],
+	).to_option()
+	first_callable_graph = implementation_header_graph_callable_headers(
+		accepted_typecheck_graph_implementation_headers(first_graph),
+	)
+	other_callable_graph = implementation_header_graph_callable_headers(
+		accepted_typecheck_graph_implementation_headers(other_graph),
+	)
+
+	first_plan ?= match global_header_completion_plan_build(first_callable_graph):
+		GlobalHeaderCompletionPlanReady(plan):
+			Some(plan)
+		GlobalHeaderCompletionPlanBlocked(_, _, _):
+			None
+
+	other_plan ?= match global_header_completion_plan_build(other_callable_graph):
+		GlobalHeaderCompletionPlanReady(plan):
+			Some(plan)
+		GlobalHeaderCompletionPlanBlocked(_, _, _):
+			None
+
+	first_table = accepted_typecheck_graph_definition_table(first_graph)
+	other_table = accepted_typecheck_graph_definition_table(other_graph)
+	first_run = new_definition_meta_run(first_table)
+	other_run = new_definition_meta_run(other_table)
+	separate_run = new_definition_meta_run(first_table)
+	first_session ?= global_header_completion_plan_meta_session_at(first_plan, first_run, 0, 0)
+	second_session ?= global_header_completion_plan_meta_session_at(first_plan, first_run, 1, 0)
+	other_session ?= global_header_completion_plan_meta_session_at(other_plan, other_run, 0, 0)
+	separate_session ?= global_header_completion_plan_meta_session_at(
+		first_plan,
+		separate_run,
+		0,
+		0,
+	)
+	recheck_session ?= global_header_completion_plan_meta_session_at(first_plan, first_run, 0, 1)
+	copied_session ?= global_header_completion_plan_meta_session_at(first_plan, first_run, 0, 0)
+
+	Some(
+		(
+			global_header_completion_plan_meta_session_at(first_plan, other_run, 0, 0).is_none()
+			and global_header_completion_plan_meta_session_at(other_plan, first_run, 0, 0).is_none()
+			and global_header_completion_plan_meta_session_at(
+				first_plan,
+				first_run,
+				-1,
+				0,
+			).is_none()
+			and global_header_completion_plan_meta_session_at(first_plan, first_run, 2, 0).is_none()
+			and global_header_completion_plan_meta_session_at(
+				first_plan,
+				first_run,
+				0,
+				-1,
+			).is_none()
+			and not meta_session_ids_equal(first_session, second_session)
+			and not meta_session_ids_equal(first_session, other_session)
+			and not meta_session_ids_equal(first_session, separate_session)
+			and not meta_session_ids_equal(first_session, recheck_session)
+			and meta_session_ids_equal(first_session, copied_session)
+		),
+	)
+
+
+func test_global_initializer_meta_sessions_follow_plan_provenance() -> Bool:
+	global_initializer_meta_sessions_follow_plan_provenance().get_or(False)
+
+
+private func global_initializer_meta_sessions_follow_mixed_plan_order() -> Option[Bool]:
+	program = program_for_module(
+		"meta_global_order",
+		[
+			var_body_decl("first", None, decl_name_expr("second")),
+			var_decl("annotated"),
+			var_body_decl("second", None, int_expr()),
+		],
+	)
+	graph ?= typecheck_test_accepted_graph(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		program,
+		[],
+	).to_option()
+	callable_graph = implementation_header_graph_callable_headers(
+		accepted_typecheck_graph_implementation_headers(graph),
+	)
+
+	plan ?= match global_header_completion_plan_build(callable_graph):
+		GlobalHeaderCompletionPlanReady(ready):
+			Some(ready)
+		GlobalHeaderCompletionPlanBlocked(_, _, _):
+			None
+
+	run = new_definition_meta_run(accepted_typecheck_graph_definition_table(graph))
+	first_header ?= global_header_completion_plan_header_at(plan, 0)
+	second_header ?= global_header_completion_plan_header_at(plan, 1)
+	third_header ?= global_header_completion_plan_header_at(plan, 2)
+	first_session ?= global_header_completion_plan_meta_session_at(plan, run, 0, 0)
+	second_session ?= global_header_completion_plan_meta_session_at(plan, run, 1, 0)
+	third_session ?= global_header_completion_plan_meta_session_at(plan, run, 2, 0)
+	reversed_third ?= global_header_completion_plan_meta_session_at(plan, run, 2, 0)
+	reversed_second ?= global_header_completion_plan_meta_session_at(plan, run, 1, 0)
+	reversed_first ?= global_header_completion_plan_meta_session_at(plan, run, 0, 0)
+
+	Some(
+		(
+			global_header_completion_plan_pending(
+				plan,
+			).map(global_header_name) == ["second", "first"]
+			and global_header_completion_plan_annotated(
+				plan,
+			).map(global_header_name) == ["annotated"]
+			and [
+				global_header_name(first_header),
+				global_header_name(second_header),
+				global_header_name(third_header),
+			] == ["second", "first", "annotated"]
+			and not meta_session_ids_equal(first_session, second_session)
+			and not meta_session_ids_equal(first_session, third_session)
+			and not meta_session_ids_equal(second_session, third_session)
+			and meta_session_ids_equal(first_session, reversed_first)
+			and meta_session_ids_equal(second_session, reversed_second)
+			and meta_session_ids_equal(third_session, reversed_third)
+		),
+	)
+
+
+func test_global_initializer_meta_sessions_follow_mixed_plan_order() -> Bool:
+	global_initializer_meta_sessions_follow_mixed_plan_order().get_or(False)
+
+
 tests: TestSuite = {
 	description = "Compiler typecheck declaration pre-scan",
 	tests = [
+		(
+			"global initializer meta sessions follow plan provenance",
+			test_global_initializer_meta_sessions_follow_plan_provenance,
+		),
+		(
+			"global initializer meta sessions follow mixed plan order",
+			test_global_initializer_meta_sessions_follow_mixed_plan_order,
+		),
 		(
 			"importable module precomputes interface facts",
 			test_importable_module_precomputes_interface_facts,
@@ -8245,6 +8831,10 @@ tests: TestSuite = {
 			test_graph_import_module_decisions_preserve_source_order_and_admission,
 		),
 		(
+			"graph import decisions cross import blocks in source order",
+			test_graph_import_decisions_cross_import_blocks_in_source_order,
+		),
+		(
 			"graph module alias rejects equal-layout foreign table",
 			test_graph_module_alias_rejects_equal_layout_foreign_table,
 		),
@@ -8255,6 +8845,10 @@ tests: TestSuite = {
 		(
 			"bind program rejects same-graph wrong module view",
 			test_bind_program_rejects_same_graph_wrong_module_view,
+		),
+		(
+			"bind program rejects reminted source catalog on same module table",
+			test_bind_program_rejects_reminted_source_catalog_on_same_module_table,
 		),
 		(
 			"bind program module view rejects unreserved state",
@@ -8359,6 +8953,14 @@ tests: TestSuite = {
 		(
 			"accepted imported builtin alias uses graph authority",
 			test_accepted_imported_builtin_alias_uses_graph_authority,
+		),
+		(
+			"accepted imported type keeps multiple local aliases",
+			test_accepted_imported_type_keeps_multiple_local_aliases,
+		),
+		(
+			"accepted imported type aliases keep module identity",
+			test_accepted_imported_type_aliases_keep_module_identity,
 		),
 		(
 			"provisional local aliases retain env authority",
@@ -8579,6 +9181,10 @@ tests: TestSuite = {
 			test_validate_typed_program_rejects_unfinalized_meta,
 		),
 		(
+			"function body solver rejects all signature metas in order",
+			test_function_body_solver_rejects_all_signature_metas_in_order,
+		),
+		(
 			"check function body reports wrong return type",
 			test_check_function_body_reports_wrong_return_type,
 		),
@@ -8730,6 +9336,10 @@ tests: TestSuite = {
 		(
 			"accepted callable visibility preserves exact targets and provenance",
 			test_accepted_callable_visibility_preserves_exact_targets,
+		),
+		(
+			"accepted nominal authorities reject equal-layout foreign definition tables",
+			test_accepted_nominal_authorities_reject_equal_layout_foreign_tables,
 		),
 		(
 			"combined import selection preserves visible and direct order",

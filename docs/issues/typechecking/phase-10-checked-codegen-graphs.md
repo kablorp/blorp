@@ -20,7 +20,7 @@ The frontend serves commands with different correctness and recovery needs:
 - Core lowering requires only accepted typed declarations, exact import
   bindings, includes, identity allocation state, and selected summaries.
 
-Current production behavior, verified on 2026-08-23:
+Current production behavior, verified on 2026-09-15:
 
 - `TypecheckedModule` in `stage_06_typecheck/bridge.brp` stores parsed source,
   module surface, `semantic_program`, CTFE-rewritten `typed_program`, errors,
@@ -29,9 +29,11 @@ Current production behavior, verified on 2026-08-23:
   context.
 - lint and LSP consume `semantic_program`; compilation consumes
   `typed_program`.
-- `prepare_core_lowering_input` already projects a successful rich graph into
-  `CliCoreLoweringInput`, and its helper returns before Core preparation. This
-  is a completed lifetime improvement and must be preserved.
+- private `core_lowering_input` projects a successful rich graph into
+  `CoreLoweringInput`, but `lower_typed_frontend_compilation` retains the
+  `TypedFrontendCompilation` representation while `prepare_core_graph` runs
+  and reads its policy afterward. The narrower read shape exists; early
+  release of the rich owner is not yet proved.
 - `CoreGraphUnit` and `prepare_core_graph` still accept raw `TypedProgram`
   values, so the Core boundary does not encode semantic acceptance.
 - `TypedParsedDecl(ParsedDecl)` is a broad catch-all. Core intentionally treats
@@ -97,7 +99,8 @@ This causes:
 - Each command retains only the graph product it needs.
 - Assembly validates completeness once and does not recompute semantics.
 - Bridge code returns to orchestration and transport responsibilities.
-- Existing early release of rich typecheck state remains intact.
+- The intended early-release boundary for rich typecheck state is established
+  and measured rather than assumed from the narrower read shape.
 
 ## Expected Performance And Cleanup Impact
 
@@ -121,9 +124,10 @@ The direct optimization mechanisms are:
 
 Expected impact is **high for frontend peak memory on large compiler/project
 graphs** and **low to moderate for CPU time**, primarily from fewer allocations,
-copies, and graph traversals. The existing CLI projection already proves that a
-lifetime boundary is practical; this issue strengthens the semantic products
-on either side rather than replacing that working boundary.
+copies, and graph traversals. The existing private `CoreLoweringInput`
+projection shows that a narrow Core read shape is practical. It does not prove
+that the rich owner dies before Core; this issue must establish that lifetime
+while strengthening the semantic products on either side.
 
 This phase enables:
 
@@ -282,9 +286,9 @@ Replace `prepare_core_graph(target: TypedProgram, modules: List[CoreGraphUnit],
 ...)` with an entry accepting `CodegenReadyGraph` or a narrow
 `CoreLoweringInput` constructible only from it.
 
-Preserve the existing CLI lifetime win: the rich checked graph should reach its
-last use before Core preparation. Do not store `CheckedGraph` inside the
-codegen-ready projection.
+Establish the intended lifetime boundary: the rich checked graph must reach its
+last use before Core preparation, with direct ownership/retained-memory
+evidence. Do not store `CheckedGraph` inside the codegen-ready projection.
 
 Read the generated Core/C in focused tests to verify CTFE replacements, imports,
 globals, functions, and compile-time-only declarations lower identically.
@@ -444,7 +448,8 @@ git diff --check
 - CTFE results attach by exact identity without duplicate complete programs.
 - Assembly does not reparse, recheck, rerun CTFE, or reconstruct semantic
   identity.
-- The existing early rich-graph lifetime boundary is preserved.
+- The rich-graph lifetime ends before Core preparation and that boundary is
+  verified by direct ownership/retained-memory evidence.
 - Broad graph contracts, status booleans, raw Core entry points, and semantic
   parsed fallbacks are deleted.
 - Focused, command, sanitizer/leak, determinism, memory, stage, and quality

@@ -58,6 +58,7 @@ if ! "${CC:-cc}" -O0 -fwrapv -pipe -w \
     -Iblorp/src/compiler/stage_01_generated_inputs \
     -Iblorp/src/compiler/stage_04_modules \
     -Iblorp/src/compiler/stage_06_typecheck/graph \
+    -Iblorp/src/compiler/stage_06_typecheck/type_system \
     -Iblorp/src \
     -Iblorp/src/lib \
     -Iblorp/src/lsp/server \

@@ -31,6 +31,9 @@ TYPE_HEADER_INSTALL = (
 TYPE_HEADER_GRAPH = (
     ROOT / "blorp/src/compiler/stage_06_typecheck/headers/type_header_graph.brp"
 )
+HEADER_TYPE_RESOLUTION = (
+    ROOT / "blorp/src/compiler/stage_06_typecheck/headers/type_resolution.brp"
+)
 GLOBAL_HEADER_COMPLETION = (
     ROOT
     / "blorp/src/compiler/stage_06_typecheck/headers/global_header_completion.brp"
@@ -46,6 +49,9 @@ DEFINITION_IDENTITY = (
 )
 DEFINITION_INDEX = (
     ROOT / "blorp/src/compiler/stage_06_typecheck/graph/definition_index.brp"
+)
+DEFINITION_TABLE_STORAGE = (
+    ROOT / "blorp/src/compiler/stage_06_typecheck/graph/definition_table_storage.brp"
 )
 TYPE_IDENTITY = (
     ROOT / "blorp/src/compiler/stage_06_typecheck/graph/type_identity.brp"
@@ -82,6 +88,7 @@ MODULE_VIEW = (
 MODULE_BINDING = (
     ROOT / "blorp/src/compiler/stage_06_typecheck/modules/module_binding.brp"
 )
+TYPECHECK_STATE = ROOT / "blorp/src/compiler/stage_06_typecheck/state.brp"
 TYPE_RESOLUTION = (
     ROOT / "blorp/src/compiler/stage_06_typecheck/type_system/type_resolution.brp"
 )
@@ -92,13 +99,101 @@ SEMANTIC_CATALOG = (
     ROOT
     / "blorp/src/compiler/stage_06_typecheck/type_system/accepted_semantic_catalog.brp"
 )
+META_IDENTITY = ROOT / "blorp/src/compiler/stage_06_typecheck/type_system/meta_identity.brp"
+
+
+def unchecked_meta_session_sources(source_root: Path, allowed_owners: set[Path]) -> list[str]:
+    """Keep raw-index mappers and token mint behind checked table owners."""
+    unchecked: list[str] = []
+    for path in source_root.rglob("*.brp"):
+        if path in allowed_owners:
+            continue
+        source = path.read_text(encoding="utf-8")
+        code = re.sub(r"(?m)--[^\n]*", "", source)
+        if re.search(
+            r"\b(?:meta_body_session|meta_global_session|meta_module_session|new_compilation_run_token)\s*\(",
+            code,
+        ):
+            unchecked.append(str(path.relative_to(ROOT)))
+    return sorted(unchecked)
 
 
 class DeclarationBoundaryTests(unittest.TestCase):
 
-    def test_import_decl_selection_has_explicit_ordered_decisions(self) -> None:
+    def test_meta_identity_does_not_depend_on_semantic_graph_index(self) -> None:
+        source = META_IDENTITY.read_text(encoding="utf-8")
+        imports = source.split("private record", 1)[0]
+        self.assertNotIn("graph/definition_index", imports)
+
+        storage = DEFINITION_TABLE_STORAGE.read_text(encoding="utf-8")
+        storage_imports = storage.split("enum DefinitionRowKind", 1)[0]
+        self.assertNotIn("type_system", storage_imports)
+
+    def test_definition_table_storage_mutation_is_index_owned(self) -> None:
+        constructor = re.compile(
+            r"\b(?:definition_table_from_rows|definition_table_append_row|"
+            r"definition_table_with_module_table)\s*\("
+        )
+        allowed = {DEFINITION_TABLE_STORAGE, DEFINITION_INDEX}
+        callers = []
+        for path in (ROOT / "blorp/src").rglob("*.brp"):
+            if path in allowed:
+                continue
+            source = re.sub(r"(?m)--[^\n]*", "", path.read_text(encoding="utf-8"))
+            if constructor.search(source):
+                callers.append(str(path.relative_to(ROOT)))
+        self.assertEqual(callers, [])
+
+
+    def test_raw_meta_session_issuance_has_checked_production_owner(self) -> None:
+        decl_source = DECL.read_text(encoding="utf-8")
+        decl_code = re.sub(r"(?m)--[^\n]*", "", decl_source)
+        bound_run = re.search(
+            r"func new_definition_meta_run\(.*?(?=\n\n(?:private )?(?:(?:pure )?func|record|union|enum)\b)",
+            decl_code,
+            re.DOTALL,
+        )
+        checked_body = re.search(
+            r"pure func body_check_context_meta_session\(.*?(?=\n\n(?:private )?(?:(?:pure )?func|record|union|enum)\b)",
+            decl_code,
+            re.DOTALL,
+        )
+        checked_module = re.search(
+            r"pure func prepared_module_scope_meta_session\(.*?(?=\n\n(?:private )?(?:(?:pure )?func|record|union|enum)\b)",
+            decl_code,
+            re.DOTALL,
+        )
+        checked_global = re.search(
+            r"pure func global_header_completion_plan_meta_session_at\(.*?(?=\n\n(?:private )?(?:(?:pure )?func|record|union|enum)\b)",
+            decl_code,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(bound_run)
+        self.assertIsNotNone(checked_body)
+        self.assertIsNotNone(checked_module)
+        self.assertIsNotNone(checked_global)
+        self.assertEqual(len(re.findall(r"\bnew_compilation_run_token\s*\(", decl_code)), 1)
+        self.assertEqual(len(re.findall(r"\bmeta_body_session\s*\(", decl_code)), 1)
+        self.assertEqual(len(re.findall(r"\bmeta_module_session\s*\(", decl_code)), 1)
+        self.assertEqual(len(re.findall(r"\bmeta_global_session\s*\(", decl_code)), 1)
+        self.assertIn("new_compilation_run_token()", bound_run.group(0))
+        self.assertIn("definition_tables_share_provenance(", checked_body.group(0))
+        self.assertIn("meta_body_session(", checked_body.group(0))
+        self.assertIn("definition_tables_share_provenance(", checked_module.group(0))
+        self.assertIn("meta_module_session(", checked_module.group(0))
+        self.assertIn("definition_tables_share_provenance(", checked_global.group(0))
+        self.assertIn("global_header_completion_plan_header_at(", checked_global.group(0))
+        self.assertIn("meta_global_session(", checked_global.group(0))
+        self.assertEqual(
+            unchecked_meta_session_sources(ROOT / "blorp/src", {DECL, META_IDENTITY}),
+            [],
+        )
+
+    def test_import_decl_selection_streams_explicit_ordered_decisions(self) -> None:
         source = MODULE_BINDING.read_text(encoding="utf-8")
         self.assertIn("private union ImportDeclDecision:", source)
+        self.assertNotIn("private record OrderedImportDeclDecision {", source)
+        self.assertNotIn("private pure func plan_program_import_decisions(", source)
         for outcome in (
             "ImportDeclMissing",
             "ImportDeclAmbiguous(List[String])",
@@ -108,17 +203,68 @@ class DeclarationBoundaryTests(unittest.TestCase):
         ):
             self.assertIn(outcome, source)
         self.assertIn("private pure func decide_import_decl(", source)
+        self.assertIn("current = apply_import_decl_decision(current, import_decl, decision)", source)
+
+    def test_graph_imports_publish_after_scope_local_admission(self) -> None:
+        module_view = MODULE_VIEW.read_text(encoding="utf-8")
+        state = TYPECHECK_STATE.read_text(encoding="utf-8")
+        module_binding = MODULE_BINDING.read_text(encoding="utf-8")
+        self.assertIn("opaque type GraphImportAdmission", module_view)
+        self.assertIn("graph_import_admission_finish(", module_view)
+        self.assertIn("typecheck_state_begin_graph_import_admission(", state)
+        self.assertIn("typecheck_state_finish_graph_import_admission(", state)
+        self.assertIn("typecheck_state_begin_graph_import_admission(current)", module_binding)
 
     def test_graph_selective_names_have_one_ordered_binding_owner(self) -> None:
         source = MODULE_VIEW.read_text(encoding="utf-8")
         self.assertIn("private pure func graph_imported_names_from_bindings(", source)
         self.assertIn("GraphSelectiveDefinitionBinding(local_name, _, _)", source)
         self.assertIn("GraphSelectiveTraitMethodBinding(local_name, _, _, _)", source)
+        self.assertIn("private union BoundImportRequest:", source)
+        self.assertIn("candidate_accepted_imports: List[BoundImportRequest]", source)
+        self.assertIn("standalone_import_bindings: List[ImportBinding]", source)
+        self.assertNotIn("\n\timport_bindings: List[ImportBinding]", source)
         self.assertNotIn(
             "imported_names = representation.imported_names.append(binding),\n"
             "\t\t\t\timport_bindings = representation.import_bindings.append(import_binding)",
             source,
         )
+
+    def test_accepted_nominal_imports_join_exact_candidate_ids(self) -> None:
+        alias_source = ALIAS_GRAPH.read_text(encoding="utf-8")
+        union_source = UNION_GRAPH.read_text(encoding="utf-8")
+        selected_constructor = re.search(
+            r"private pure func selected_constructor_binding\(.*?\n\tresult",
+            union_source,
+            re.DOTALL,
+        )
+
+        self.assertNotIn("imported_bindings_by_module", alias_source)
+        self.assertNotIn("imported_local_names_by_original_name", alias_source)
+        self.assertIn("definition_id_runtime_value(definition_id)", alias_source)
+        self.assertIn("module_ids_equal(owner, candidate.module_id)", alias_source)
+
+        self.assertNotIn("bound_module_graph_find_canonical_path", union_source)
+        self.assertNotIn("find_public_union_header", union_source)
+        self.assertIn("definition_id_runtime_value(definition_id)", union_source)
+        self.assertIn("module_ids_equal(owner, candidate.module_id)", union_source)
+        self.assertIsNotNone(selected_constructor)
+        self.assertIn(
+            "type_header_graph_find_union_for_constructor",
+            selected_constructor.group(0),
+        )
+        self.assertNotIn("for variant in", selected_constructor.group(0))
+
+    def test_imported_type_alias_installation_does_not_rebuild_graph_bindings(self) -> None:
+        resolution_source = HEADER_TYPE_RESOLUTION.read_text(encoding="utf-8")
+        install_source = TYPE_HEADER_INSTALL.read_text(encoding="utf-8")
+
+        self.assertNotIn("module_view_import_bindings", resolution_source)
+        self.assertIn(
+            "module_view_standalone_imported_type_alias_names",
+            resolution_source,
+        )
+        self.assertIn("module_view_accepted_alias_authority", install_source)
 
     def test_annotation_import_lookup_uses_keyed_graph_view(self) -> None:
         source = (ROOT / "blorp/src/compiler/stage_06_typecheck/headers/type_resolution.brp").read_text(
@@ -155,7 +301,14 @@ class DeclarationBoundaryTests(unittest.TestCase):
             resolution_source,
         )
         self.assertIn("graph_alias_view_matches_owner", resolution_source)
-        self.assertIn("BoundAliasAndSelectiveName(ModuleId, ImportedNameBinding)", view_source)
+        self.assertIn(
+            "BoundAliasAndSelectiveName(BoundCandidateRowId, ModuleId, BoundCandidateRowId, ModuleId, Int)",
+            view_source,
+        )
+        self.assertNotIn(
+            "BoundAliasAndSelectiveName(BoundCandidateRowId, ModuleId, BoundCandidateRowId, BoundImportedNamePayload)",
+            view_source,
+        )
         for displaced_map in (
             "graph_module_aliases_by_source_name_id",
             "graph_imported_names_by_source_name_id",
@@ -922,6 +1075,69 @@ class DeclarationBoundaryTests(unittest.TestCase):
         self.assertFalse("ctfe_checked_body_groups_outcomes(" in bridge)
         self.assertFalse("outcomes = outcomes.append(body.outcome)" in bridge)
         self.assertIn("body_check_registry_outcome_table_from_indexed_rows(", bridge)
+
+    def test_ctfe_accepted_body_uses_validated_product(self) -> None:
+        declaration = DECL.read_text(encoding="utf-8")
+        worklist = (
+            ROOT / "blorp/src/compiler/stage_07_ctfe/body_worklist.brp"
+        ).read_text(encoding="utf-8")
+        accepted = declaration.split("private record CheckedBodyArtifactRep {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("validated: ValidatedBody", accepted)
+        self.assertNotIn("typed: TypedFunctionInfo", accepted)
+        self.assertIn("opaque type InferredBody", declaration)
+        self.assertIn("opaque type SolvedBody", declaration)
+        self.assertIn("opaque type ValidatedBody", declaration)
+        self.assertIn("validate_inferred_body(", declaration)
+        self.assertRegex(worklist, r"checked_body_artifact_validated_body\(\s*artifact")
+        self.assertNotIn("body_check_outcome_typed_function(outcome)", worklist)
+
+    def test_inferred_body_handoff_owns_only_typed_body_and_issues(self) -> None:
+        declaration = DECL.read_text(encoding="utf-8")
+        self.assertTrue("private record InferredBodyRep {" in declaration)
+        inferred = declaration.split("private record InferredBodyRep {", 1)[1].split("\n}", 1)[0]
+        self.assertTrue("typed: TypedFunctionInfo" in inferred)
+        self.assertTrue("issues: BodyValidationIssues" in inferred)
+        self.assertFalse("state: TypecheckState" in inferred)
+        self.assertTrue("inferred_body_from_materialized(" in declaration)
+
+    def test_accepted_reuse_carries_body_proof_into_final_validation(self) -> None:
+        declaration = DECL.read_text(encoding="utf-8")
+        self.assertIn("ReusedValidatedBody(ValidatedBody)", declaration)
+        self.assertIn("MaterializedFunctionDecl(MaterializedFunctionBody)", declaration)
+        self.assertIn("MaterializedUncheckedDecl(TypedDecl)", declaration)
+        validation = declaration.split(
+            "private pure func typecheck_validate_materialized_function_body(", 1
+        )[1].split("\n\n", 1)[0]
+        self.assertIn("ReusedValidatedBody(_):", validation)
+        self.assertIn("UnvalidatedFunctionBody(typed):", validation)
+        self.assertIn("typecheck_validate_typed_function_info(state, label, typed)", validation)
+        self.assertIn("MaterializedUncheckedDecl(decl):", declaration)
+        self.assertIn("typecheck_validate_typed_decl(state, decl)", declaration)
+        self.assertIn("typecheck_validate_materialized_typed_program(", declaration)
+        self.assertIn("decl = MaterializedPrivateDecl(result.decl)", declaration)
+        self.assertIn("decl = MaterializedImplDecl(result.body)", declaration)
+        self.assertIsNotNone(
+            re.search(
+                r"BodyCheckRejected\(artifact\):.{0,300}?"
+                r"body = UnvalidatedFunctionBody\(\s*"
+                r"from_opaque RecoveredBodyArtifact\(artifact\)\.typed",
+                declaration,
+                re.DOTALL,
+            ),
+            "rejected recovery must remain unvalidated",
+        )
+
+    def test_implementation_methods_keep_individual_validation_proofs(self) -> None:
+        declaration = DECL.read_text(encoding="utf-8")
+        self.assertIn("MaterializedImplDecl(MaterializedImplInfo)", declaration)
+        self.assertIn("methods: List[MaterializedFunctionBody]", declaration)
+        self.assertIn("materialized_methods.append(method_result.body)", declaration)
+        self.assertIn("typecheck_validate_materialized_impl_info(", declaration)
+        self.assertIn("materialized_function_body_typed_info(method)", declaration)
+        self.assertNotIn(
+            "MaterializedUncheckedDecl(TypedImplDecl(result.typed))",
+            declaration,
+        )
 
     def test_owned_type_resolution_reuses_prepared_module_scope(self) -> None:
         source = TYPE_HEADER_GRAPH.read_text(encoding="utf-8")

@@ -5,27 +5,31 @@
 -- spellings; no alias target, record field, or union variant is projected into
 -- the module view.
 import:
-	../graph/definition_index: definition_index_definition_table, definition_tables_share_provenance
+	../../stage_04_modules/module_table: module_ids_equal
+	../graph/definition_index:
+		definition_id_runtime_value,
+		definition_index_definition_table,
+		definition_tables_share_provenance,
 	../graph/indexed_graph:
 		PreparedModuleScope,
 		indexed_graph_definition_index,
 		prepared_module_scope_id,
-	../graph/type_identity: TypeId, type_id_definition_id
+	../graph/type_identity:
+		TypeId,
+		type_id_definition_id,
+		type_id_from_definition_table,
+		type_id_module_id,
 	../modules/bound_module_graph:
 		BoundModule,
 		BoundModuleGraph,
 		bound_module_canonical_path,
+		bound_module_graph_find_for_scope,
 		bound_module_graph_indexed_graph,
 		bound_module_graph_modules,
 		bound_module_graph_target,
 		bound_module_scope,
 		bound_module_view,
-		bound_module_visible_import_modules,
-	../modules/module_binding:
-		ImportableModule,
-		importable_module_path,
-		importable_module_prepared_scope,
-	../modules/module_view: ImportedNameBinding, module_view_imported_names
+	../modules/module_view: BoundAcceptedDefinitionBinding, module_view_accepted_definition_bindings
 	../type_system/accepted_alias_authority:
 		AcceptedAliasAuthority,
 		AcceptedAliasModuleView,
@@ -40,6 +44,8 @@ import:
 		accepted_alias_module_view,
 		accepted_alias_table,
 		accepted_alias_table_alias_count,
+		accepted_alias_table_definition_table,
+		accepted_alias_table_find_type_identity,
 	../type_system/semantic_type: canonical_module_type_name
 	type_header_graph:
 		AcceptedAliasHeader,
@@ -59,6 +65,7 @@ import:
 		record_type_header_id,
 		record_type_header_parameters,
 		record_type_header_source_name,
+		type_header_graph_bound_graph,
 		type_header_graph_definition_table,
 		type_header_graph_local_alias_headers_for_scope,
 		type_header_graph_local_builtin_headers_for_scope,
@@ -358,100 +365,41 @@ private pure func append_local_bindings(
 	next
 
 
-private pure func imported_binding_local_names(
-	bindings: List[ImportedNameBinding],
-	module_path: String,
-	original_name: String,
-) -> List[String]:
-	var names: List[String] = []
-
-	for binding in bindings:
-		if binding.module_path == module_path and binding.original_name == original_name:
-			names = names.append(binding.local_name)
-
-	names
-
-
-private pure func has_imported_name_bindings_for_module(
-	bindings: List[ImportedNameBinding],
-	module_path: String,
-) -> Bool:
-	bindings.any(func(binding): binding.module_path == module_path)
-
-
-private pure func append_imported_header_binding(
+private pure func append_imported_candidate_bindings(
 	bindings: List[AcceptedVisibleTypeBinding],
-	imported_names: List[ImportedNameBinding],
-	module_path: String,
-	type_name: String,
-	id: TypeId,
+	table: AcceptedAliasTable,
+	candidates: List[BoundAcceptedDefinitionBinding],
 ) -> List[AcceptedVisibleTypeBinding]:
+	definition_table = accepted_alias_table_definition_table(table)
 	var next = bindings
-	canonical_name = canonical_module_type_name(module_path, type_name)
 
-	for local_name in imported_binding_local_names(imported_names, module_path, type_name):
-		-- Canonical spellings already fall through to the shared table. Recording
-		-- one here would create a redirect from the canonical name to itself.
-		if local_name != canonical_name:
-			next = append_visible_binding(next, local_name, id, False)
+	for candidate in candidates:
+		for definition_id in candidate.definition_ids:
+			match type_id_from_definition_table(
+				definition_table,
+				definition_id_runtime_value(definition_id),
+			):
+				Some(type_id):
+					identity = accepted_alias_table_find_type_identity(table, type_id)
+					owner_matches = type_id_module_id(definition_table, type_id)
+						.map(func(owner): module_ids_equal(owner, candidate.module_id))
+						.get_or(False)
+
+					match identity:
+						Some(found):
+							if owner_matches and candidate.local_name != found.canonical_name:
+								next = append_visible_binding(
+									next,
+									candidate.local_name,
+									type_id,
+									False,
+								)
+						None:
+							void
+				None:
+					void
 
 	next
-
-
-private pure func append_imported_module_bindings(
-	bindings: List[AcceptedVisibleTypeBinding],
-	type_headers: TypeHeaderGraph,
-	module: ImportableModule,
-	imported_names: List[ImportedNameBinding],
-) -> List[AcceptedVisibleTypeBinding]:
-	module_scope = importable_module_prepared_scope(module)
-	module_path = importable_module_path(module)
-
-	if not has_imported_name_bindings_for_module(imported_names, module_path):
-		bindings
-	else:
-		var next = bindings
-
-		for header in type_header_graph_public_builtin_headers_for_scope(
-			type_headers,
-			module_scope,
-		):
-			next = append_imported_header_binding(
-				next,
-				imported_names,
-				module_path,
-				builtin_type_header_source_name(header),
-				builtin_type_header_id(header),
-			)
-
-		for header in type_header_graph_public_record_headers_for_scope(type_headers, module_scope):
-			next = append_imported_header_binding(
-				next,
-				imported_names,
-				module_path,
-				record_type_header_source_name(header),
-				record_type_header_id(header),
-			)
-
-		for header in type_header_graph_public_union_headers_for_scope(type_headers, module_scope):
-			next = append_imported_header_binding(
-				next,
-				imported_names,
-				module_path,
-				union_type_header_source_name(header),
-				union_type_header_id(header),
-			)
-
-		for header in type_header_graph_public_alias_headers_for_scope(type_headers, module_scope):
-			next = append_imported_header_binding(
-				next,
-				imported_names,
-				module_path,
-				alias_type_header_source_name(header),
-				alias_type_header_id(header),
-			)
-
-		next
 
 
 pure func accepted_alias_table_authority_for_module(
@@ -459,26 +407,42 @@ pure func accepted_alias_table_authority_for_module(
 	type_headers: TypeHeaderGraph,
 	bound_module: BoundModule,
 ) -> Result[AcceptedAliasAuthority, String]:
-	imported_names = module_view_imported_names(bound_module_view(bound_module))
-	var bindings = append_local_bindings([], type_headers, bound_module_scope(bound_module))
+	table_definition_table = accepted_alias_table_definition_table(table)
+	header_definition_table = type_header_graph_definition_table(type_headers)
+	graph_definition_table = definition_index_definition_table(
+		indexed_graph_definition_index(
+			bound_module_graph_indexed_graph(type_header_graph_bound_graph(type_headers)),
+		),
+	)
+	bound_graph = type_header_graph_bound_graph(type_headers)
+	bound_scope_matches = bound_module_graph_find_for_scope(
+		bound_graph,
+		bound_module_scope(bound_module),
+	).is_some()
 
-	for imported_module in bound_module_visible_import_modules(bound_module):
-		bindings = append_imported_module_bindings(
+	if (
+		not definition_tables_share_provenance(table_definition_table, header_definition_table)
+		or not definition_tables_share_provenance(header_definition_table, graph_definition_table)
+		or not bound_scope_matches
+	):
+		Err("accepted alias authority rejected mismatched definition-table provenance")
+	else:
+		var bindings = append_local_bindings([], type_headers, bound_module_scope(bound_module))
+		bindings = append_imported_candidate_bindings(
 			bindings,
-			type_headers,
-			imported_module,
-			imported_names,
+			table,
+			module_view_accepted_definition_bindings(bound_module_view(bound_module)),
 		)
 
-	match accepted_alias_module_view(
-		table,
-		prepared_module_scope_id(bound_module_scope(bound_module)),
-		bindings,
-	):
-		Some(view):
-			Ok(accepted_alias_authority(table, view))
-		None:
-			Err("accepted alias module view rejected conflicting source bindings")
+		match accepted_alias_module_view(
+			table,
+			prepared_module_scope_id(bound_module_scope(bound_module)),
+			bindings,
+		):
+			Some(view):
+				Ok(accepted_alias_authority(table, view))
+			None:
+				Err("accepted alias module view rejected conflicting source bindings")
 
 
 pure func accepted_alias_table_canonical_authority(

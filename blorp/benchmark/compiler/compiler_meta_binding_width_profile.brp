@@ -1,0 +1,184 @@
+-- Focused mechanism probe for issued-meta binding and lookup width.
+-- The linear path repeats the former binding-list algorithm in benchmark
+-- code. It is not a substitute for comparing two production compiler workers.
+import:
+	../../src/compiler/stage_06_typecheck/type_system/context:
+		CONTEXT_EMPTY,
+		bind_meta,
+		fresh_meta_with_origin,
+		lookup_meta,
+	../../src/compiler/stage_06_typecheck/type_system/semantic_type:
+		SemanticType(SemanticConstIntType),
+	memory: get_mem_stats, reset_mem_stats
+	string: parse_int
+	system: now_microseconds
+
+
+private record LinearMetaBindingEntry {
+	meta_id: Int,
+	binding: SemanticType
+}
+
+
+private struct WidthProfileMetrics {
+	elapsed_microseconds: Int,
+	allocations: Int,
+	releases: Int,
+	retained_objects: Int,
+	retained_bytes: Int,
+	checksum: Int,
+	valid: Bool
+}
+
+
+private pure func linear_bind(
+	entries: List[LinearMetaBindingEntry],
+	replacement: LinearMetaBindingEntry,
+) -> List[LinearMetaBindingEntry]:
+	var result: List[LinearMetaBindingEntry] = []
+	var replaced: Bool = False
+
+	for entry in entries:
+		if entry.meta_id == replacement.meta_id:
+			result = result.append(replacement)
+			replaced = True
+		else:
+			result = result.append(entry)
+
+	if replaced:
+		result
+	else:
+		result.append(replacement)
+
+
+private pure func linear_lookup(
+	entries: List[LinearMetaBindingEntry],
+	meta_id: Int,
+) -> Option[SemanticType]:
+	var result: Option[SemanticType] = None
+
+	for entry in entries:
+		if entry.meta_id == meta_id:
+			result = Some(entry.binding)
+			break
+
+	result
+
+
+private func linear_profile(width: Int, iterations: Int) -> WidthProfileMetrics:
+	reset_mem_stats()
+	started = now_microseconds()
+	var checksum: Int = 0
+	var valid: Bool = True
+
+	for _ in 0..iterations:
+		var origins: List[String] = []
+		var entries: List[LinearMetaBindingEntry] = []
+
+		for index in 0..width:
+			origins = origins.append("?")
+			entries = linear_bind(
+				entries,
+				{
+					meta_id = index,
+					binding = SemanticConstIntType(index)
+				},
+			)
+
+		for index in 0..width:
+			match linear_lookup(entries, index):
+				Some(SemanticConstIntType(value)):
+					if value == index:
+						checksum += value
+					else:
+						valid = False
+				_:
+					valid = False
+
+		checksum += origins.length()
+
+	elapsed = now_microseconds() - started
+	memory = get_mem_stats()
+	{
+		elapsed_microseconds = elapsed,
+		allocations = memory.total_allocations,
+		releases = memory.total_releases,
+		retained_objects = memory.current_objects,
+		retained_bytes = memory.bytes_allocated,
+		checksum = checksum,
+		valid = valid
+	}
+
+
+private func solver_profile(width: Int, iterations: Int) -> WidthProfileMetrics:
+	reset_mem_stats()
+	started = now_microseconds()
+	var checksum: Int = 0
+	var valid: Bool = True
+
+	for _ in 0..iterations:
+		var context = CONTEXT_EMPTY
+
+		for _ in 0..width:
+			context = fresh_meta_with_origin(context, "?").context
+
+		for index in 0..width:
+			match bind_meta(context, index, SemanticConstIntType(index)):
+				Some(bound):
+					context = bound
+				None:
+					valid = False
+
+		for index in 0..width:
+			match lookup_meta(context, index):
+				Some(SemanticConstIntType(value)):
+					if value == index:
+						checksum += value
+					else:
+						valid = False
+				_:
+					valid = False
+
+		checksum += width
+
+	elapsed = now_microseconds() - started
+	memory = get_mem_stats()
+	{
+		elapsed_microseconds = elapsed,
+		allocations = memory.total_allocations,
+		releases = memory.total_releases,
+		retained_objects = memory.current_objects,
+		retained_bytes = memory.bytes_allocated,
+		checksum = checksum,
+		valid = valid
+	}
+
+
+private pure func positive_argument(args: List[String], index: Int, default: Int) -> Int:
+	match args.get(index):
+		Some(text):
+			match parse_int(text):
+				Some(value):
+					if value > 0:
+						value
+					else:
+						default
+				None:
+					default
+		None:
+			default
+
+
+func main(args: List[String]) -> Int:
+	width = positive_argument(args, 1, 128)
+	iterations = positive_argument(args, 2, 8)
+	linear = linear_profile(width, iterations)
+	solver = solver_profile(width, iterations)
+	print(
+		"META_BINDING_WIDTH width=${width.to_string()} iterations=${iterations.to_string()} linear_us=${linear.elapsed_microseconds.to_string()} solver_us=${solver.elapsed_microseconds.to_string()} linear_allocations=${linear.allocations.to_string()} solver_allocations=${solver.allocations.to_string()} linear_releases=${linear.releases.to_string()} solver_releases=${solver.releases.to_string()} linear_retained_objects=${linear.retained_objects.to_string()} solver_retained_objects=${solver.retained_objects.to_string()} linear_retained_bytes=${linear.retained_bytes.to_string()} solver_retained_bytes=${solver.retained_bytes.to_string()} linear_checksum=${linear.checksum.to_string()} solver_checksum=${solver.checksum.to_string()} linear_valid=${linear.valid.to_string()} solver_valid=${solver.valid.to_string()}",
+	)
+
+	if linear.valid and solver.valid and linear.checksum == solver.checksum:
+		0
+	else:
+		1

@@ -31,6 +31,12 @@ generated C differs only in the intended internal-callable projection. Reject
 name-shape inference, fallback-to-unprojected emission, or opaque profile and
 diagnostic labels.
 
+The independent
+[zero-copy callable-emission issue](136-zero-copy-callable-symbol-emission.md)
+owns removal of the projected Core copy. It may retain this issue's validated
+original-spelling callback index temporarily, but must not broaden or duplicate
+the callback-identity migration.
+
 ## Later Admission Gate
 
 Do not hash aggregate types merely because their C spellings are long. First

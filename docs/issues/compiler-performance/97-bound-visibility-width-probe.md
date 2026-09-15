@@ -1,6 +1,9 @@
 # Bound Visibility Width Probe
 
-**Status:** Candidate-only width probe, graph-local batch publication, and API-adapted historical comparison complete. A one-table occupancy simplification and graph-alias inventory deletion improve the current candidate, but Cut A's mixed-width resource regression remains open for Cut B import ownership.
+**Status:** Complete. The probe exposed the immutable-publication failure mode,
+guided the scope-local builder and compact candidate owner, and now serves as a
+concentrated regression guard. The final combined decision is recorded in the
+[Step 2e completion screen](../../../benchmarks/results/compiler_step2e_visibility_completion_2026-09-14.md).
 
 **Roadmap:** [Step 2e visibility convergence](94-step2e-visibility-convergence.md)
 
@@ -8,8 +11,46 @@
 captured before the 2026-09-13 merge of `main` into the Step 2e branch.
 Each pair used its stated matched compiler/build, but its executable size,
 instruction, and memory values are not measurements of the post-merge tree.
-Re-run the narrow width and accepted-stage pairs before closing Cut A's
-resource gate; post-merge test results can establish correctness separately.
+The requested post-merge narrow/wide rerun and a real selective-import
+accepted-stage pair are now in the
+[2026-09-14 scorecard](../../../benchmarks/results/compiler_step2e_cut_a_gate_2026-09-14.md).
+The historical 320-name direct instruction regression was removed by the
+scope-local owner. The completed candidate relation keeps the same wide
+instruction count within 0.1%, while its required transient candidate rows
+raise allocation calls; the real bound and accepted pipeline screens determine
+the final resource decision.
+
+## Post-merge builder snapshot (2026-09-14)
+
+Commit `1021f4db` was measured with the retained direct fixture, 100 iterations,
+16 modules, batched initial locals, and graph import admission. The narrow run
+used 32 aliases, 32 selectives, 16 locals, 16 duplicate attempts, and 128
+queries; the wide run scaled those dimensions fourfold. Both returned the
+expected bound rows, successful bindings, duplicate decisions, query hits,
+and checksum. The benchmark wrapper used the existing built worker and did
+not rebuild it. One `/usr/bin/time -l` sample per width gave:
+
+```bash
+/usr/bin/time -l env BLORP_COMPILER_BENCHMARK_SKIP_BUILD=1 \
+  benchmarks/compiler_visibility_width_profile 100 16 32 32 16 16 128 0 1 1
+/usr/bin/time -l env BLORP_COMPILER_BENCHMARK_SKIP_BUILD=1 \
+  benchmarks/compiler_visibility_width_profile 100 16 128 128 64 64 512 0 1 1
+```
+
+| Signal | 80 rows | 320 rows |
+| --- | ---: | ---: |
+| Tracked allocations / releases | 45,501 / 45,500 | 179,901 / 179,900 |
+| Retained objects / net bytes | 1 / 96 | 1 / 96 |
+| Retired instructions (whole process) | 208,361,869 | 918,596,270 |
+| Peak memory footprint (bytes) | 1,655,072 | 1,835,296 |
+| Query checksum | 85,900 | 341,900 |
+
+These are **`1021f4db` snapshots**, not a matched post-merge comparison
+against the pre-Cut-A three-map implementation. They show that the builder
+continues to scale close to linearly in tracked allocations, but do not close
+Cut A's combined resource gate or support a latency claim. The older direct
+baseline above used a different checkout and must not be compared as if it
+were a same-build pair.
 
 ## Purpose and boundary
 
@@ -305,7 +346,8 @@ candidate. Its executable grew 240 bytes (9,785,632 → 9,785,872), one native
 pair retired 8,228,163,141 → 8,202,038,525 instructions, and peak footprint
 was 30,949,688 → 30,982,456 bytes (+0.11%). These baseline binaries are the
 immediately preceding keyed-occupancy candidate, **not** the pre-Cut-A
-three-map implementation; Cut A's resource gate remains open.
+three-map implementation; at this historical checkpoint Cut A's resource gate
+remained open.
 
 An initial two-union implementation allocated one extra object per import
 (+640 in the direct fixture). Merging lookup and admission into the single
@@ -396,9 +438,10 @@ check before deleting another compatibility reader or claiming a peak win.
   direct-width allocation/instruction reduction. Peak-memory and real
   selective-import accepted-stage guards remain open, so this is not Cut B
   completion.
-- [ ] Extend the phase-correct batch construction owner through import
+- [x] Extend the phase-correct batch construction owner through import
   admission with Cut B candidate
   provenance, remove superseded inventories, and show a strict majority of
-  resource families improve without a material small-workload regression.
+  real-pipeline resource families improve. The concentrated immutable-snapshot
+  probe records the explicit linear transient-allocation trade.
   Native hash/probe counters need an explicit instrumented hook if they become
   an acceptance requirement; do not label estimated requests as actual hashes.

@@ -1,0 +1,166 @@
+-- Retained rejection probe for a heap-record session-owned meta key.
+-- Run/session issuance and mode selection stay outside the measured loop.
+import:
+	../../src/compiler/stage_04_modules/loaded_module:
+		ModuleOrigin(UserModule),
+		resolved_module_identity_from_resolver,
+	../../src/compiler/stage_04_modules/module_table: singleton_module_table
+	../../src/compiler/stage_06_typecheck/graph/definition_index:
+		DefinitionTable,
+		definition_index_definition_table,
+		definition_index_empty,
+		definition_index_initial_seed,
+	../../src/compiler/stage_06_typecheck/type_system/env: ENV_EMPTY
+	../../src/compiler/stage_06_typecheck/type_system/meta_identity:
+		BodyMetaSessionPurpose(NormalBodyMetaSession),
+		MetaSessionId,
+		meta_body_session,
+		meta_session_ids_equal,
+		new_compilation_run_token,
+	memory: get_mem_stats, reset_mem_stats
+	string: parse_int
+	system: now_microseconds
+
+
+private record HeapMetaIdCandidateRep {
+	session: MetaSessionId,
+	slot: Int
+}
+
+
+opaque type HeapMetaIdCandidate = HeapMetaIdCandidateRep
+
+
+private union CandidateMetaType:
+	RawCandidateMeta(Int)
+	FlatCandidateMeta(MetaSessionId, Int)
+	BoxedCandidateMeta(HeapMetaIdCandidate)
+
+
+private pure func heap_meta_id_candidate(
+	session: MetaSessionId,
+	slot: Int,
+) -> Option[HeapMetaIdCandidate]:
+	if slot < 0:
+		None
+	else:
+		Some(into_opaque HeapMetaIdCandidate({
+					session = session,
+					slot = slot
+				}))
+
+
+private pure func heap_meta_id_candidate_slot(
+	id: HeapMetaIdCandidate,
+	session: MetaSessionId,
+) -> Option[Int]:
+	representation = from_opaque HeapMetaIdCandidate(id)
+
+	if meta_session_ids_equal(representation.session, session):
+		Some(representation.slot)
+	else:
+		None
+
+
+private pure func positive_iterations(args: List[String]) -> Int:
+	match args.get(1):
+		Some(text):
+			match parse_int(text):
+				Some(value):
+					if value > 0:
+						value
+					else:
+						4096
+				None:
+					4096
+		None:
+			4096
+
+
+private func profile_meta_identity(session: MetaSessionId, iterations: Int, mode: String) -> Int:
+	reset_mem_stats()
+	baseline = get_mem_stats()
+	started = now_microseconds()
+	var checked: Int = 0
+
+	if mode == "heap":
+		for slot in 0..iterations:
+			match heap_meta_id_candidate(session, slot):
+				Some(id):
+					meta = BoxedCandidateMeta(id)
+
+					match meta:
+						BoxedCandidateMeta(value):
+							if heap_meta_id_candidate_slot(value, session) == Some(slot):
+								checked += 1
+						_:
+							void
+				None:
+					void
+	else if mode == "flat-meta":
+		for slot in 0..iterations:
+			meta = FlatCandidateMeta(session, slot)
+
+			match meta:
+				FlatCandidateMeta(owner, issued_slot):
+					if meta_session_ids_equal(owner, session) and issued_slot == slot:
+						checked += 1
+				_:
+					void
+	else if mode == "raw-meta":
+		for slot in 0..iterations:
+			meta = RawCandidateMeta(slot)
+
+			match meta:
+				RawCandidateMeta(issued_slot):
+					if issued_slot == slot:
+						checked += 1
+				_:
+					void
+	else:
+		for slot in 0..iterations:
+			if slot >= 0:
+				checked += 1
+
+	elapsed = now_microseconds() - started
+	memory = get_mem_stats()
+	print(
+		"META_IDENTITY_PROFILE mode=${mode} iterations=${iterations.to_string()} checked=${checked.to_string()} elapsed_microseconds=${elapsed.to_string()} allocations=${memory.total_allocations.to_string()} releases=${memory.total_releases.to_string()} retained_objects=${(memory.current_objects - baseline.current_objects).to_string()} retained_bytes=${(memory.bytes_allocated - baseline.bytes_allocated).to_string()}",
+	)
+
+	if (
+		(mode == "heap" or mode == "flat-meta" or mode == "raw-meta" or mode == "scalar")
+		and checked == iterations
+		and memory.total_allocations == memory.total_releases
+		and memory.current_objects == baseline.current_objects
+		and memory.bytes_allocated == baseline.bytes_allocated
+	):
+		0
+	else:
+		1
+
+
+func main(args: List[String]) -> Int:
+	run = new_compilation_run_token()
+	issued = singleton_module_table(
+		resolved_module_identity_from_resolver(
+			"meta_identity_profile",
+			UserModule,
+		),
+	)
+	table: DefinitionTable = definition_index_definition_table(
+		definition_index_empty(
+			definition_index_initial_seed(ENV_EMPTY),
+			issued[0],
+		),
+	)
+
+	match meta_body_session(run, table, 7, NormalBodyMetaSession, 0):
+		Some(session):
+			profile_meta_identity(
+				session,
+				positive_iterations(args),
+				args.get_or(2, "heap"),
+			)
+		None:
+			2

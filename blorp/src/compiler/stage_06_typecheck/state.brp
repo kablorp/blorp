@@ -63,6 +63,7 @@ import:
 		prepared_module_scope_canonical_path,
 		prepared_module_scope_definition_index,
 		prepared_module_scope_graph_module_name_scope,
+		prepared_module_scope_graph_source_name_table,
 		prepared_module_scope_id,
 		prepared_module_scope_identity,
 		prepared_module_scope_module_table,
@@ -70,8 +71,26 @@ import:
 		prepared_module_scope_source_name_table,
 		prepared_module_scopes_are_compatible,
 		prepared_module_scopes_select_same_module,
+	graph/source_name_table: GraphSourceNameTable
 	modules/module_view:
 		COMPILER_MODULE_VIEW_EMPTY,
+		GraphImportAdmission,
+		GraphModuleAliasAdmission(
+			GraphModuleAliasAdded,
+			GraphModuleAliasAlreadyPresent,
+			GraphModuleAliasConflictsWithAlias,
+			GraphModuleAliasConflictsWithImportedName,
+			GraphModuleAliasConflictsWithLocalName,
+			GraphModuleAliasInvalidTarget,
+		),
+		GraphSelectiveAdmission(
+			GraphSelectiveAdded,
+			GraphSelectiveConflictsWithAlias,
+			GraphSelectiveConflictsWithImportedName,
+			GraphSelectiveConflictsWithLocalName,
+			GraphSelectiveInvalidSourceName,
+			GraphSelectiveInvalidTarget,
+		),
 		ImportedConstructorBinding,
 		ImportedNameBinding,
 		LocalNameRegistration(
@@ -99,12 +118,18 @@ import:
 			SelectiveNameInvalidTarget,
 		),
 		TopLevelNameKind,
+		graph_import_admission_begin,
+		graph_import_admission_finish,
+		graph_import_admission_register_alias,
+		graph_import_admission_register_constructor,
+		graph_import_admission_register_selective_definition,
+		graph_import_admission_register_selective_trait_method,
 		module_view_find_graph_module_alias,
 		module_view_find_imported_name,
 		module_view_find_local_name,
 		module_view_find_standalone_module_alias,
 		module_view_for_graph,
-		module_view_graph_has_owner,
+		module_view_graph_has_exact_catalog,
 		module_view_has_graph_source_names,
 		module_view_record_imported_constructor,
 		module_view_register_graph_selective_trait_method,
@@ -120,6 +145,7 @@ import:
 	type_system/context:
 		CONTEXT_EMPTY,
 		Context,
+		meta_solver_allocated_count,
 		module_origin_allows_builtin,
 		module_origin_allows_foreign,
 		module_origin_is_source_package,
@@ -184,6 +210,7 @@ record TypecheckState {
 	errors: List[String],
 	diagnostics: List[TypecheckDiagnostic],
 	module_view: ModuleView,
+	graph_import_admission: Option[GraphImportAdmission],
 	module_scope: TypecheckModuleScope,
 	allow_debug_only_calls: Bool,
 	private_impls: List[ImplInstance],
@@ -348,6 +375,7 @@ pure func typecheck_state_for_origin(origin: ModuleOrigin) -> TypecheckState:
 		errors = [],
 		diagnostics = [],
 		module_view = COMPILER_MODULE_VIEW_EMPTY,
+		graph_import_admission = None,
 		module_scope = typecheck_module_scope(UnscopedModuleScope(origin, seed)),
 		allow_debug_only_calls = False,
 		private_impls = [],
@@ -356,6 +384,39 @@ pure func typecheck_state_for_origin(origin: ModuleOrigin) -> TypecheckState:
 		type_homes = TYPE_HOME_INDEX_EMPTY,
 		type_shape_memo = TYPE_SHAPE_MEMO_EMPTY
 	}
+
+
+pure func typecheck_state_begin_graph_import_admission(state: TypecheckState) -> TypecheckState:
+	match state.graph_import_admission:
+		Some(_):
+			typecheck_state_add_error(
+				state,
+				"internal typecheck error: graph import admission is already active",
+			)
+		None:
+			match (
+				typecheck_module_scope_table(state.module_scope),
+				typecheck_module_scope_id(state.module_scope),
+			):
+				(Some(module_table), Some(module_id)):
+					match graph_import_admission_begin(state.module_view, module_table, module_id):
+						Some(admission):
+							{ state | graph_import_admission = Some(admission) }
+						None:
+							state
+				_:
+					state
+
+
+pure func typecheck_state_finish_graph_import_admission(state: TypecheckState) -> TypecheckState:
+	match state.graph_import_admission:
+		Some(admission):
+			{ state |
+				module_view = graph_import_admission_finish(admission),
+				graph_import_admission = None
+			}
+		None:
+			state
 
 
 private pure func typecheck_module_scope_index(
@@ -384,6 +445,23 @@ private pure func typecheck_module_scope_table(scope: TypecheckModuleScope) -> O
 
 pure func typecheck_state_module_table(state: TypecheckState) -> Option[ModuleTable]:
 	typecheck_module_scope_table(state.module_scope)
+
+
+-- Exact table authority for the state's current module scope. Callers that
+-- replay graph-issued DefinitionIds should derive the table here instead of
+-- accepting an independently supplied table with unproven provenance.
+pure func typecheck_state_definition_table(state: TypecheckState) -> Option[DefinitionTable]:
+	typecheck_module_scope_index(state.module_scope).map(definition_index_definition_table)
+
+
+pure func typecheck_state_graph_source_name_table(
+	state: TypecheckState,
+) -> Option[GraphSourceNameTable]:
+	match typecheck_module_scope_rep(state.module_scope):
+		ReservedModuleScope(prepared_scope):
+			Some(prepared_module_scope_graph_source_name_table(prepared_scope))
+		_:
+			None
 
 
 private pure func typecheck_module_scope_id(scope: TypecheckModuleScope) -> Option[ModuleId]:
@@ -715,15 +793,19 @@ private pure func module_view_matches_module_scope(
 	if not module_view_has_graph_source_names(view):
 		True
 	else:
-		match typecheck_module_scope_table(scope):
-			Some(module_table):
-				match typecheck_module_scope_id(scope):
-					Some(module_id):
-						module_view_graph_has_owner(view, module_table, module_id)
-					None:
-						False
-			None:
+		match typecheck_module_scope_rep(scope):
+			ReservedModuleScope(prepared_scope):
+				module_view_graph_has_exact_catalog(
+					view,
+					prepared_module_scope_graph_source_name_table(prepared_scope),
+					prepared_module_scope_id(prepared_scope),
+				)
+			_:
 				False
+
+
+pure func typecheck_state_has_compatible_module_view(state: TypecheckState) -> Bool:
+	module_view_matches_module_scope(state.module_view, state.module_scope)
 
 
 pure func typecheck_state_find_module_alias(
@@ -859,6 +941,73 @@ pure func typecheck_state_register_graph_module_alias(
 	issuing_table: ModuleTable,
 	module_id: ModuleId,
 ) -> TypecheckState:
+	match state.graph_import_admission:
+		Some(admission):
+			match (
+				typecheck_module_scope_id(state.module_scope),
+				typecheck_module_scope_table(state.module_scope),
+			):
+				(Some(current_module_id), Some(current_table)):
+					match graph_import_admission_register_alias(
+						admission,
+						current_table,
+						current_module_id,
+						alias_name,
+						module_path,
+						issuing_table,
+						module_id,
+					):
+						GraphModuleAliasAdded(next):
+							{ state | graph_import_admission = Some(next) }
+						GraphModuleAliasAlreadyPresent(next):
+							{ state | graph_import_admission = Some(next) }
+						GraphModuleAliasConflictsWithAlias(next, existing):
+							typecheck_state_apply_module_alias_registration(
+								{ state | graph_import_admission = Some(next) },
+								alias_name,
+								ModuleAliasConflictsWithAlias(existing),
+							)
+						GraphModuleAliasConflictsWithImportedName(next, existing):
+							typecheck_state_apply_module_alias_registration(
+								{ state | graph_import_admission = Some(next) },
+								alias_name,
+								ModuleAliasConflictsWithImportedName(existing),
+							)
+						GraphModuleAliasConflictsWithLocalName(next, existing):
+							typecheck_state_apply_module_alias_registration(
+								{ state | graph_import_admission = Some(next) },
+								alias_name,
+								ModuleAliasConflictsWithLocalName(existing),
+							)
+						GraphModuleAliasInvalidTarget(next):
+							typecheck_state_apply_module_alias_registration(
+								{ state | graph_import_admission = Some(next) },
+								alias_name,
+								ModuleAliasInvalidTarget,
+							)
+				_:
+					typecheck_state_apply_module_alias_registration(
+						state,
+						alias_name,
+						ModuleAliasInvalidTarget,
+					)
+		None:
+			typecheck_state_register_graph_module_alias_without_admission(
+				state,
+				alias_name,
+				module_path,
+				issuing_table,
+				module_id,
+			)
+
+
+private pure func typecheck_state_register_graph_module_alias_without_admission(
+	state: TypecheckState,
+	alias_name: String,
+	module_path: String,
+	issuing_table: ModuleTable,
+	module_id: ModuleId,
+) -> TypecheckState:
 	match typecheck_module_scope_id(state.module_scope):
 		Some(current_module_id):
 			match typecheck_module_scope_table(state.module_scope):
@@ -936,6 +1085,61 @@ pure func typecheck_state_register_graph_imported_name(
 	module_id: ModuleId,
 	definition_ids: List[DefinitionId],
 ) -> ImportedNameRegistration:
+	match state.graph_import_admission:
+		Some(admission):
+			index = typecheck_module_scope_index(state.module_scope)
+
+			match (
+				index.map(definition_index_definition_table),
+				typecheck_module_scope_id(state.module_scope),
+			):
+				(Some(table), Some(current_module_id)):
+					typecheck_state_apply_graph_selective_admission(
+						state,
+						local_name,
+						module_path,
+						original_name,
+						graph_import_admission_register_selective_definition(
+							admission,
+							current_module_id,
+							table,
+							issuing_definition_table,
+							local_name,
+							module_path,
+							original_name,
+							module_id,
+							definition_ids,
+						),
+					)
+				_:
+					typecheck_state_apply_graph_selective_admission(
+						state,
+						local_name,
+						module_path,
+						original_name,
+						GraphSelectiveInvalidTarget(admission),
+					)
+		None:
+			typecheck_state_register_graph_imported_name_without_admission(
+				state,
+				local_name,
+				module_path,
+				original_name,
+				issuing_definition_table,
+				module_id,
+				definition_ids,
+			)
+
+
+private pure func typecheck_state_register_graph_imported_name_without_admission(
+	state: TypecheckState,
+	local_name: String,
+	module_path: String,
+	original_name: String,
+	issuing_definition_table: DefinitionTable,
+	module_id: ModuleId,
+	definition_ids: List[DefinitionId],
+) -> ImportedNameRegistration:
 	index = typecheck_module_scope_index(state.module_scope)
 	definition_table = index.map(definition_index_definition_table)
 
@@ -974,6 +1178,61 @@ pure func typecheck_state_register_graph_imported_name(
 -- by overlapping callable/global symbols. Keeping both facts in one variant
 -- lets each later authority consume only the identity domain it owns.
 pure func typecheck_state_register_graph_imported_trait_method(
+	state: TypecheckState,
+	local_name: String,
+	module_path: String,
+	original_name: String,
+	issuing_definition_table: DefinitionTable,
+	module_id: ModuleId,
+	definition_ids: List[DefinitionId],
+) -> ImportedNameRegistration:
+	match state.graph_import_admission:
+		Some(admission):
+			index = typecheck_module_scope_index(state.module_scope)
+
+			match (
+				index.map(definition_index_definition_table),
+				typecheck_module_scope_id(state.module_scope),
+			):
+				(Some(table), Some(current_module_id)):
+					typecheck_state_apply_graph_selective_admission(
+						state,
+						local_name,
+						module_path,
+						original_name,
+						graph_import_admission_register_selective_trait_method(
+							admission,
+							current_module_id,
+							table,
+							issuing_definition_table,
+							local_name,
+							module_path,
+							original_name,
+							module_id,
+							definition_ids,
+						),
+					)
+				_:
+					typecheck_state_apply_graph_selective_admission(
+						state,
+						local_name,
+						module_path,
+						original_name,
+						GraphSelectiveInvalidTarget(admission),
+					)
+		None:
+			typecheck_state_register_graph_imported_trait_method_without_admission(
+				state,
+				local_name,
+				module_path,
+				original_name,
+				issuing_definition_table,
+				module_id,
+				definition_ids,
+			)
+
+
+private pure func typecheck_state_register_graph_imported_trait_method_without_admission(
 	state: TypecheckState,
 	local_name: String,
 	module_path: String,
@@ -1077,6 +1336,76 @@ private pure func typecheck_state_apply_selective_name_registration(
 			}
 
 
+private pure func typecheck_state_apply_graph_selective_admission(
+	state: TypecheckState,
+	local_name: String,
+	module_path: String,
+	original_name: String,
+	decision: GraphSelectiveAdmission,
+) -> ImportedNameRegistration:
+	match decision:
+		GraphSelectiveAdded(admission):
+			{
+				state = { state | graph_import_admission = Some(admission) },
+				registered = True
+			}
+		GraphSelectiveConflictsWithAlias(admission, existing):
+			typecheck_state_apply_selective_name_registration(
+				{ state | graph_import_admission = Some(admission) },
+				local_name,
+				module_path,
+				original_name,
+				SelectiveNameConflictsWithAlias(existing),
+			)
+		GraphSelectiveConflictsWithImportedName(admission, existing):
+			typecheck_state_apply_selective_name_registration(
+				{ state | graph_import_admission = Some(admission) },
+				local_name,
+				module_path,
+				original_name,
+				SelectiveNameConflictsWithImportedName(existing),
+			)
+		GraphSelectiveConflictsWithLocalName(admission, existing):
+			typecheck_state_apply_selective_name_registration(
+				{ state | graph_import_admission = Some(admission) },
+				local_name,
+				module_path,
+				original_name,
+				SelectiveNameConflictsWithLocalName(existing),
+			)
+		GraphSelectiveInvalidSourceName(admission):
+			typecheck_state_apply_selective_name_registration(
+				{ state | graph_import_admission = Some(admission) },
+				local_name,
+				module_path,
+				original_name,
+				SelectiveNameInvalidSourceName,
+			)
+		GraphSelectiveInvalidTarget(admission):
+			typecheck_state_apply_selective_name_registration(
+				{ state | graph_import_admission = Some(admission) },
+				local_name,
+				module_path,
+				original_name,
+				SelectiveNameInvalidTarget,
+			)
+
+
+private pure func imported_constructor_annotation_failure(
+	state: TypecheckState,
+) -> ImportedNameRegistration:
+	{
+		state = typecheck_state_add_error(
+			state,
+			(
+				"internal typecheck error: imported constructor has no matching admitted "
+				+ "selective name"
+			),
+		),
+		registered = False
+	}
+
+
 pure func typecheck_state_register_imported_constructor(
 	state: TypecheckState,
 	local_name: String,
@@ -1100,15 +1429,15 @@ pure func typecheck_state_register_imported_constructor(
 			parent_name = parent_name,
 			original_name = original_name
 		}
-		{
-			state = { registration.state |
-				module_view = module_view_record_imported_constructor(
-					registration.state.module_view,
-					binding,
-				)
-			},
-			registered = True
-		}
+
+		match module_view_record_imported_constructor(registration.state.module_view, binding):
+			Some(view):
+				{
+					state = { registration.state | module_view = view },
+					registered = True
+				}
+			None:
+				imported_constructor_annotation_failure(state)
 	else:
 		registration
 
@@ -1123,12 +1452,20 @@ pure func typecheck_state_register_graph_imported_constructor(
 	issuing_definition_table: DefinitionTable,
 	module_id: ModuleId,
 ) -> ImportedNameRegistration:
+	binding: ImportedConstructorBinding = {
+		local_name = local_name,
+		module_path = module_path,
+		parent_local_name = parent_local_name,
+		parent_name = parent_name,
+		original_name = original_name
+	}
 	index = typecheck_module_scope_index(state.module_scope)
 	active_definition_table = index.map(definition_index_definition_table)
 
 	registration_result = match (index, active_definition_table):
 		(Some(active_index), Some(active_table)):
 			current_module_id = typecheck_module_scope_id(state.module_scope)
+
 			if (
 				current_module_id.is_none()
 				or not definition_tables_share_provenance(active_table, issuing_definition_table)
@@ -1151,23 +1488,41 @@ pure func typecheck_state_register_graph_imported_constructor(
 					Some(ids):
 						match current_module_id:
 							Some(owner_id):
-								typecheck_state_apply_selective_name_registration(
-									state,
-									local_name,
-									module_path,
-									original_name,
-									module_view_register_selective_name_for_graph(
-										state.module_view,
-										owner_id,
-										active_table,
-										issuing_definition_table,
-										local_name,
-										module_path,
-										original_name,
-										module_id,
-										ids,
-									),
-								)
+								match state.graph_import_admission:
+									Some(admission):
+										typecheck_state_apply_graph_selective_admission(
+											state,
+											local_name,
+											module_path,
+											original_name,
+											graph_import_admission_register_constructor(
+												admission,
+												owner_id,
+												active_table,
+												issuing_definition_table,
+												binding,
+												module_id,
+												ids,
+											),
+										)
+									None:
+										typecheck_state_apply_selective_name_registration(
+											state,
+											local_name,
+											module_path,
+											original_name,
+											module_view_register_selective_name_for_graph(
+												state.module_view,
+												owner_id,
+												active_table,
+												issuing_definition_table,
+												local_name,
+												module_path,
+												original_name,
+												module_id,
+												ids,
+											),
+										)
 							None:
 								typecheck_state_apply_selective_name_registration(
 									state,
@@ -1194,22 +1549,22 @@ pure func typecheck_state_register_graph_imported_constructor(
 			)
 
 	if registration_result.registered:
-		binding: ImportedConstructorBinding = {
-			local_name = local_name,
-			module_path = module_path,
-			parent_local_name = parent_local_name,
-			parent_name = parent_name,
-			original_name = original_name
-		}
-		{
-			state = { registration_result.state |
-				module_view = module_view_record_imported_constructor(
+		match registration_result.state.graph_import_admission:
+			Some(_):
+				-- Builder admission publishes the constructor payload atomically.
+				registration_result
+			None:
+				match module_view_record_imported_constructor(
 					registration_result.state.module_view,
 					binding,
-				)
-			},
-			registered = True
-		}
+				):
+					Some(view):
+						{
+							state = { registration_result.state | module_view = view },
+							registered = True
+						}
+					None:
+						imported_constructor_annotation_failure(state)
 	else:
 		registration_result
 
@@ -1429,15 +1784,24 @@ pure func typecheck_state_enter_prepared_module_scope(
 
 	match representation:
 		UnscopedModuleScope(_, _):
-			definition_index = prepared_module_scope_definition_index(prepared_scope)
-			aligned_index = definition_index_advance_to_env(definition_index, state.env)
-			{ state |
-				env = { state.env | next_def_id = definition_index_next_def_id(aligned_index) },
-				module_view = module_view_for_graph(
-					prepared_module_scope_graph_module_name_scope(prepared_scope),
-				),
-				module_scope = typecheck_module_scope(ReservedModuleScope(prepared_scope))
-			}
+			-- Metas allocated before the accepted table exists have no checked
+			-- module session to bind to. Do not silently rehome that solver when
+			-- installing the indexed scope.
+			if meta_solver_allocated_count(state.context) != 0:
+				typecheck_state_add_error(
+					state,
+					"internal typecheck error: inference metas issued before selecting a module",
+				)
+			else:
+				definition_index = prepared_module_scope_definition_index(prepared_scope)
+				aligned_index = definition_index_advance_to_env(definition_index, state.env)
+				{ state |
+					env = { state.env | next_def_id = definition_index_next_def_id(aligned_index) },
+					module_view = module_view_for_graph(
+						prepared_module_scope_graph_module_name_scope(prepared_scope),
+					),
+					module_scope = typecheck_module_scope(ReservedModuleScope(prepared_scope))
+				}
 		ExtensibleModuleScope(_, _, _, _):
 			typecheck_state_add_error(
 				state,
@@ -1789,6 +2153,7 @@ pure func infer_module_facts_from_typecheck_state(state: TypecheckState) -> Infe
 			ReservedGraphDefinitionDomain
 		UnscopedModuleScope(_, _) | ExtensibleModuleScope(_, _, _, _):
 			UnindexedDefinitionDomain
+
 	-- Body inference reads the admitted view directly and often. Discard a
 	-- mismatched graph view once here so none of those reads can observe names
 	-- or accepted authorities belonging to another module in the same graph.
@@ -1815,6 +2180,16 @@ pure func infer_module_facts_definition_table(facts: InferModuleFacts) -> Option
 
 pure func infer_module_facts_module_id(facts: InferModuleFacts) -> Option[ModuleId]:
 	typecheck_module_scope_id(facts.module_scope)
+
+
+pure func infer_module_facts_graph_source_name_table(
+	facts: InferModuleFacts,
+) -> Option[GraphSourceNameTable]:
+	match typecheck_module_scope_rep(facts.module_scope):
+		ReservedModuleScope(prepared_scope):
+			Some(prepared_module_scope_graph_source_name_table(prepared_scope))
+		_:
+			None
 
 
 pure func infer_module_facts_module_table(facts: InferModuleFacts) -> Option[ModuleTable]:
@@ -1847,6 +2222,7 @@ pure func typecheck_state_from_infer_session(session: InferSession) -> Typecheck
 		errors = session.errors,
 		diagnostics = session.diagnostics,
 		module_view = session.facts.module_view,
+		graph_import_admission = None,
 		module_scope = session.facts.module_scope,
 		allow_debug_only_calls = session.facts.allow_debug_only_calls,
 		private_impls = session.facts.private_impls,

@@ -1,22 +1,29 @@
 # Normalized Semantic Compilation
 
-**Status:** Active. The accepted semantic catalog and initial exact-identity
-cutovers are in production. Visibility convergence and body-outcome completion
-remain open; later products are sequenced below.
+**Status:** Active. The accepted semantic catalog, Step 2e visibility
+convergence, and initial exact-identity cutovers are in production.
+Body-outcome and later product completion remain sequenced below.
 
 **Current state:** The compilation has graph-local `ModuleId`, `DefinitionId`,
 category-safe accepted tables, and an `AcceptedSemanticCatalog` with checked
-provenance. `ModuleView` has bound name occupancy and ordered bindings but not
-one canonical accepted visibility relation. A validated `BodyOutcomeTable`
+provenance. `ModuleView` has one scope-issued bound occupancy/candidate owner;
+accepted imports share its exact `ModuleId`/`DefinitionId` payload column and
+accepted alias/union construction no longer regroups by path or spelling. A validated `BodyOutcomeTable`
 survives CTFE handoff, including empty partial tables for bodyless dependencies;
 it does not yet publish complete source-ordered coverage. The broad
 `TypecheckedGraph`, some rebuilt semantic/CTFE typed programs, and late Core
-name projection remain.
+name projection remain. Graph import binding now batches admission under one
+scope-local builder and publishes explicit accepted/rejected candidate rows.
+`IndexedGraph` now owns compact
+module-scoped selective export demand, and downstream import/type-fact paths
+consume its `ModuleId`/`DefinitionId` facts instead of rebuilding graph-wide
+name unions and path-to-surface joins.
 
-**Next actions:** Run [Step 2e's visibility resource decision](94-step2e-visibility-convergence.md)
-on current `main`, independently finish Step 3's direct body-row publication,
-source order, and complete-coverage proof, then start the Phase 8/9 product
-boundary. Do not hold the body path hostage to the visibility experiment.
+**Next actions:** Step 2e is complete; use its
+[completion screen](../../../benchmarks/results/compiler_step2e_visibility_completion_2026-09-14.md)
+as the visibility baseline. Finish Step 3's direct body-row publication,
+source order, and complete-coverage proof, then continue the Phase 8/9 product
+boundary.
 
 **Read first:** [Compiler Architecture](../../ARCHITECTURE.md#frontend),
 [Compiler Priorities](../../COMPILER_PRIORITIES.md#1-finish-the-typechecking-product-boundaries),
@@ -46,18 +53,23 @@ the Step 2e issue, and the Phase 8–10 issues under `docs/issues/typechecking/`
 
 | Cut | First production consumer and exit condition |
 | --- | --- |
-| 2e visibility, independent | One phase-correct ordered candidate/accepted relation serves graph lookup. Admit only after the [resource gate](94-step2e-visibility-convergence.md); delete displaced name dictionaries and reconstructed category paths. |
+| 2e visibility, complete | One phase-correct ordered candidate/accepted relation serves graph lookup. The [resource gate](94-step2e-visibility-convergence.md) is complete; displaced name dictionaries, the successful-only graph inventory, and accepted alias/union reconstruction paths are deleted. |
 | 3 body outcomes, start now | CTFE and ordinary compilation read the same exact row. Publish direct rows, explicit source order, and complete-body coverage; remove remaining transient lists and scans without losing bodyless-module behavior. |
 | 4A solved/validated bodies | [Phases 8 and 9](../../COMPILER_PRIORITIES.md#phase-8-constraint-solving-and-type-finalization) publish meta-free solved and accepted validated facts. Measure and remove repeated finalization walks. Optional semantic-type interning is a separate experiment, never a prerequisite. |
 | 7A keyed CTFE | Attach evaluated initializer replacements by exact identity instead of retaining a second complete typed program. |
-| 7B codegen-ready | Audit the exact facts Core needs, construct a narrow opaque accepted input, and release compile-only recovery/analysis state before Core. [Phase 10](../typechecking/phase-10-checked-codegen-graphs.md) owns admission. |
-| 9 Core identities | Preserve IDs into one measured Core declaration/relation pass cluster at a time after 7B; do not wait for all tooling queries. |
+| 7B codegen-ready | Audit the exact facts Core needs, construct a narrow opaque accepted input, and release compile-only recovery/analysis state before Core. [Phase 10](../typechecking/phase-10-checked-codegen-graphs.md) owns admission; the [last-use and release issue](137-codegen-input-last-use-and-release.md) owns the proof and lifetime measurements. |
+| 9 Core identities | Preserve IDs into one measured Core declaration/relation pass cluster at a time after 7B; do not wait for all tooling queries. This includes classifying ABI exposure, assigning exact nominal type/specialization IDs, and deriving compact internal C type/helper spellings from those IDs. |
 | 5–6, 8, 7C analysis/final retirement | Add accepted call/dependency edges and required diagnostic ownership; publish source occurrences and optional explanations only for named tool consumers. Move check/lint/LSP queries, then delete the remaining broad graph. |
 
 The compiler-latency path is **3 → 4A → 7A → 7B → 9**. Visibility and tooling
 cuts proceed independently unless a Core-input audit names an exact missing
 fact. A cut cannot merge a public empty table and promise a consumer later:
 it must name the first production reader and the old path it deletes.
+
+The [zero-copy callable-emission issue](136-zero-copy-callable-symbol-emission.md)
+is an independent immediate backend-memory packet: it removes a duplicate
+final-Core owner without changing semantic products or generated C. It does
+not reorder the semantic critical path above.
 
 ## Immediate Step 3 Contract
 

@@ -16,6 +16,7 @@ WORKER_MAIN_SYMBOL = "__blorp_typecheck_benchmark_worker_main"
 WORKER_INCLUDE_DIRS = (
     Path("blorp/src/compiler/stage_04_modules"),
     Path("blorp/src/compiler/stage_06_typecheck/graph"),
+    Path("blorp/src/compiler/stage_06_typecheck/type_system"),
 )
 
 

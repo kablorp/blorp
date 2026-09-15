@@ -45,16 +45,24 @@ import:
 			TypeSurfaceSymbol,
 		),
 		module_surface_for_program,
-	../../stage_04_modules/module_table: ModuleId, module_ids_equal
+	../../stage_04_modules/module_table:
+		ModuleId,
+		module_id_table_index,
+		module_ids_equal,
+		module_table_canonical_path,
 	../../stage_04_modules/module_type_identity: local_type_names_from_decls
 	../graph/definition_index:
 		DefinitionId,
 		DefinitionTable,
 		EXPORTED_DEFINITION_TARGETS_EMPTY,
+		ExportedDefinitionNameDemand,
 		ExportedDefinitionTargets,
+		definition_id_runtime_value,
 		definition_index_definition_table,
 		definition_index_exported_definition_targets,
 		definition_table_module_table,
+		definition_table_type_row,
+		exported_definition_name_demand_empty,
 		exported_definition_targets_find,
 	../graph/indexed_graph:
 		IndexedGraph,
@@ -64,10 +72,12 @@ import:
 		prepared_module_canonical_path,
 		prepared_module_origin,
 		prepared_module_program,
+		prepared_module_scope_conservative_selective_export_names,
 		prepared_module_scope_definition_index,
 		prepared_module_scope_id,
 		prepared_module_scope_module,
 		prepared_module_scope_module_table,
+		prepared_module_scope_selective_export_names,
 		prepared_module_scopes_are_compatible,
 		prepared_module_surface,
 	../graph/source_name_table: source_name_default_module_alias
@@ -76,6 +86,10 @@ import:
 		typecheck_state_add_error,
 		typecheck_state_add_error_at,
 		typecheck_state_add_known_type_name,
+		typecheck_state_begin_graph_import_admission,
+		typecheck_state_definition_table,
+		typecheck_state_finish_graph_import_admission,
+		typecheck_state_has_compatible_module_view,
 		typecheck_state_is_stdlib,
 		typecheck_state_record_type_home,
 		typecheck_state_register_graph_imported_constructor,
@@ -86,7 +100,8 @@ import:
 		typecheck_state_register_imported_name,
 		typecheck_state_register_standalone_module_alias,
 	../type_system/context: module_origin_is_package, module_origin_is_std
-	module_view: ImportedNameBinding, ModuleView, module_view_imported_names
+	import_binding: ImportBinding(GraphSelectiveDefinitionBinding)
+	module_view: ModuleView, module_view_import_bindings
 	set as Sets
 
 
@@ -153,7 +168,6 @@ opaque type ImportableModule = ImportableModuleRep
 
 private record ImportableModuleIndexRep {
 	modules: List[ImportableModule],
-	modules_by_path: Dict[String, ImportableModule],
 	module_ordinals_by_path: Dict[String, Int],
 	candidate_paths_by_request: Dict[String, List[String]],
 	dependency_ordinals_by_module: List[List[Int]],
@@ -325,7 +339,8 @@ private pure func recovery_module_surface(program: ParsedProgram) -> ModuleSurfa
 
 private pure func importable_module_for_requested_names(
 	prepared_scope: PreparedModuleScope,
-	requested_names: Option[Set[String]],
+	requested_names: Option[ExportedDefinitionNameDemand],
+	conservative_requested_names: ExportedDefinitionNameDemand,
 ) -> ImportableModule:
 	module = prepared_module_scope_module(prepared_scope)
 	program = prepared_module_program(module)
@@ -349,6 +364,7 @@ private pure func importable_module_for_requested_names(
 			program,
 			surface,
 			requested_names,
+			conservative_requested_names,
 		).get_or(EXPORTED_DEFINITION_TARGETS_EMPTY)
 
 		AcceptedImportableModuleContentsValue({
@@ -371,62 +387,42 @@ private pure func importable_module_for_requested_names(
 
 
 pure func importable_module(prepared_scope: PreparedModuleScope) -> ImportableModule:
-	importable_module_for_requested_names(prepared_scope, None)
-
-
-private pure func selective_definition_names_for_decl(
-	names: Set[String],
-	decl: ParsedDecl,
-) -> Set[String]:
-	match decl:
-		ImportBlockParsedDecl(imports, _):
-			var next = names
-
-			for import_decl in imports:
-				match import_decl.symbols:
-					Some(symbols):
-						for symbol in symbols:
-							next = next.add(symbol.name.text)
-					None:
-						void
-
-			next
-		PrivateParsedDecl(inner, _):
-			selective_definition_names_for_decl(names, inner)
-		_:
-			names
-
-
-private pure func selective_definition_names_for_scopes(
-	scopes: List[PreparedModuleScope],
-) -> Set[String]:
-	var names: Set[String] = Sets.set()
-
-	for scope in scopes:
-		for decl in prepared_module_program(prepared_module_scope_module(scope)).decls:
-			names = selective_definition_names_for_decl(names, decl)
-
-	names
+	importable_module_for_requested_names(
+		prepared_scope,
+		None,
+		exported_definition_name_demand_empty(),
+	)
 
 
 pure func importable_module_graph(indexed_graph: IndexedGraph) -> ImportableModuleGraph:
 	target_scope = indexed_graph_target_scope(indexed_graph)
 	dependency_scopes = indexed_graph_module_scopes(indexed_graph)
-	all_scopes = dependency_scopes.append(target_scope)
-	requested_names = selective_definition_names_for_scopes(all_scopes)
-	dependency_modules = dependency_scopes.map(func(scope):
-		importable_module_for_requested_names(scope, Some(requested_names))
+	var dependency_modules: List[ImportableModule] = []
+
+	for scope in dependency_scopes:
+		dependency_modules = dependency_modules.append(
+			importable_module_for_requested_names(
+				scope,
+				Some(prepared_module_scope_selective_export_names(scope)),
+				prepared_module_scope_conservative_selective_export_names(scope),
+			),
+		)
+
+	target_module = importable_module_for_requested_names(
+		target_scope,
+		Some(prepared_module_scope_selective_export_names(target_scope)),
+		prepared_module_scope_conservative_selective_export_names(target_scope),
 	)
-	all_modules = dependency_modules.append(
-		importable_module_for_requested_names(
-			target_scope,
-			Some(requested_names),
-		),
-	)
+	all_modules = dependency_modules.append(target_module)
+	all_index = importable_module_index(all_modules)
 	representation: ImportableModuleGraphRep = {
 		target_scope = target_scope,
-		dependency_index = importable_module_index(dependency_modules),
-		all_index = importable_module_index(all_modules)
+		dependency_index = importable_module_index_without_target(
+			all_index,
+			dependency_modules,
+			target_module,
+		),
+		all_index = all_index
 	}
 	into_opaque ImportableModuleGraph(representation)
 
@@ -635,7 +631,9 @@ pure func importable_module_index_find(
 	index: ImportableModuleIndex,
 	canonical_path: String,
 ) -> Option[ImportableModule]:
-	importable_module_index_rep(index).modules_by_path.get(canonical_path)
+	representation = importable_module_index_rep(index)
+	ordinal ?= representation.module_ordinals_by_path.get(canonical_path)
+	representation.modules.get(ordinal)
 
 
 pure func importable_module_index_modules_for_paths(
@@ -646,13 +644,14 @@ pure func importable_module_index_modules_for_paths(
 	var ordered: List[(Int, ImportableModule)] = []
 
 	for canonical_path in canonical_paths:
-		match (
-			representation.module_ordinals_by_path.get(canonical_path),
-			representation.modules_by_path.get(canonical_path),
-		):
-			(Some(ordinal), Some(module)):
-				ordered = ordered.append((ordinal, module))
-			_:
+		match representation.module_ordinals_by_path.get(canonical_path):
+			Some(ordinal):
+				match representation.modules.get(ordinal):
+					Some(module):
+						ordered = ordered.append((ordinal, module))
+					None:
+						void
+			None:
 				void
 
 	ordered
@@ -665,7 +664,7 @@ pure func importable_module_index_prelude(index: ImportableModuleIndex) -> Optio
 
 	match representation.prelude_path:
 		Some(module_path):
-			representation.modules_by_path.get(module_path)
+			importable_module_index_find(index, module_path)
 		None:
 			None
 
@@ -676,7 +675,7 @@ pure func importable_module_index_matching_paths(
 ) -> List[String]:
 	representation = importable_module_index_rep(index)
 
-	match representation.modules_by_path.get(requested_path):
+	match representation.module_ordinals_by_path.get(requested_path):
 		Some(_):
 			[requested_path]
 		None:
@@ -767,44 +766,26 @@ pure func importable_module_index_dependency_closure(
 			[]
 
 
-private pure func importable_module_index(modules: List[ImportableModule]) -> ImportableModuleIndex:
-	var modules_by_path: Dict[String, ImportableModule] = {}
-	var module_ordinals_by_path: Dict[String, Int] = {}
-	var candidate_paths_by_request: Dict[String, List[String]] = {}
-	var module_ordinal: Int = 0
-
-	for module in modules:
-		module_path = importable_module_path(module)
-		modules_by_path = modules_by_path.set(module_path, module)
-		module_ordinals_by_path = module_ordinals_by_path.set(module_path, module_ordinal)
-
-		for request_alias in importable_module_request_aliases(
-			module_path,
-			importable_module_origin(module),
-			importable_module_surface_value(module).module_name,
-		):
-			existing = candidate_paths_by_request.get_or(request_alias, [])
-
-			if not existing.contains(module_path):
-				candidate_paths_by_request = candidate_paths_by_request.set(
-					request_alias,
-					existing.append(module_path),
-				)
-
-		module_ordinal += 1
-
+private pure func importable_module_index_prelude_path(
+	modules: List[ImportableModule],
+	module_ordinals_by_path: Dict[String, Int],
+) -> Option[String]:
 	var prelude_path: Option[String] = None
 
 	for canonical_path in ["prelude"]:
-		match modules_by_path.get(canonical_path):
-			Some(module):
-				if importable_module_identity_is_std_prelude(
-					importable_module_path(module),
-					importable_module_origin(module),
-					importable_module_surface_value(module).module_name,
-				):
-					prelude_path = Some(canonical_path)
-					break
+		match module_ordinals_by_path.get(canonical_path):
+			Some(ordinal):
+				match modules.get(ordinal):
+					Some(module):
+						if importable_module_identity_is_std_prelude(
+							importable_module_path(module),
+							importable_module_origin(module),
+							importable_module_surface_value(module).module_name,
+						):
+							prelude_path = Some(canonical_path)
+							break
+					None:
+						void
 			None:
 				void
 
@@ -823,17 +804,25 @@ private pure func importable_module_index(modules: List[ImportableModule]) -> Im
 					prelude_path = Some(importable_module_path(module))
 					break
 
-	base_representation: ImportableModuleIndexRep = {
-		modules = modules,
-		modules_by_path = modules_by_path,
-		module_ordinals_by_path = module_ordinals_by_path,
-		candidate_paths_by_request = candidate_paths_by_request,
-		dependency_ordinals_by_module = [],
-		prelude_path = prelude_path
-	}
+	prelude_path
+
+
+private pure func importable_module_index_with_adjacency(
+	base_representation: ImportableModuleIndexRep,
+) -> ImportableModuleIndex:
+	modules = base_representation.modules
+	module_ordinals_by_path = base_representation.module_ordinals_by_path
+
 	base = into_opaque ImportableModuleIndex(base_representation)
 	var dependency_ordinals_by_module: List[List[Int]] = []
 	var adjacency_valid: Bool = True
+	-- Reuse one dense epoch table across every module. This gives constant-time
+	-- edge deduplication without allocating a Set or sorting each adjacency row.
+	dependency_unseen_epoch: Int = 0
+	var dependency_seen_epoch_by_ordinal: List[Int] = dependency_unseen_epoch.repeat(
+		modules.length(),
+	)
+	var dependency_seen_epoch: Int = dependency_unseen_epoch + 1
 
 	for module in modules:
 		var dependencies: List[Int] = []
@@ -845,12 +834,20 @@ private pure func importable_module_index(modules: List[ImportableModule]) -> Im
 			):
 				match module_ordinals_by_path.get(dependency_path):
 					Some(dependency_ordinal):
-						if not dependencies.contains(dependency_ordinal):
+						if dependency_seen_epoch_by_ordinal.get_or(
+							dependency_ordinal,
+							dependency_unseen_epoch,
+						) != dependency_seen_epoch:
 							dependencies = dependencies.append(dependency_ordinal)
+							dependency_seen_epoch_by_ordinal = dependency_seen_epoch_by_ordinal.set(
+								dependency_ordinal,
+								dependency_seen_epoch,
+							)
 					None:
 						adjacency_valid = False
 
 		dependency_ordinals_by_module = dependency_ordinals_by_module.append(dependencies)
+		dependency_seen_epoch += 1
 
 	final_dependency_ordinals = if adjacency_valid:
 		dependency_ordinals_by_module
@@ -863,10 +860,86 @@ private pure func importable_module_index(modules: List[ImportableModule]) -> Im
 	into_opaque ImportableModuleIndex(indexed_representation)
 
 
+private pure func importable_module_index(modules: List[ImportableModule]) -> ImportableModuleIndex:
+	var module_ordinals_by_path: Dict[String, Int] = {}
+	var candidate_paths_by_request: Dict[String, List[String]] = {}
+	var module_ordinal: Int = 0
+
+	for module in modules:
+		module_path = importable_module_path(module)
+		module_ordinals_by_path = module_ordinals_by_path.set(module_path, module_ordinal)
+
+		for request_alias in importable_module_request_aliases(
+			module_path,
+			importable_module_origin(module),
+			importable_module_surface_value(module).module_name,
+		):
+			existing = candidate_paths_by_request.get_or(request_alias, [])
+			-- Module paths are unique in IndexedGraph, and request_aliases
+			-- de-duplicates aliases within one module. No second membership
+			-- scan is needed before appending this module's path.
+			candidate_paths_by_request = candidate_paths_by_request.set(
+				request_alias,
+				existing.append(module_path),
+				)
+
+		module_ordinal += 1
+
+	importable_module_index_with_adjacency({
+		modules = modules,
+		module_ordinals_by_path = module_ordinals_by_path,
+		candidate_paths_by_request = candidate_paths_by_request,
+		dependency_ordinals_by_module = [],
+		prelude_path = importable_module_index_prelude_path(modules, module_ordinals_by_path),
+	})
+
+
+-- The target is the final module in the all-module inventory. Excluding it
+-- changes exact-path precedence and may change alias ambiguity, so only the
+-- stable keyed catalog is shared; dependency adjacency is resolved again
+-- against the narrower candidate set.
+private pure func importable_module_index_without_target(
+	all_index: ImportableModuleIndex,
+	dependency_modules: List[ImportableModule],
+	target: ImportableModule,
+) -> ImportableModuleIndex:
+	all = importable_module_index_rep(all_index)
+	target_path = importable_module_path(target)
+	module_ordinals_by_path = all.module_ordinals_by_path.remove(target_path)
+	var candidate_paths_by_request = all.candidate_paths_by_request
+
+	for request_alias in importable_module_request_aliases(
+		target_path,
+		importable_module_origin(target),
+		importable_module_surface_value(target).module_name,
+	):
+		remaining = candidate_paths_by_request
+			.get_or(request_alias, [])
+			.filter(func(path): path != target_path)
+
+		candidate_paths_by_request = if remaining.is_empty():
+			candidate_paths_by_request.remove(request_alias)
+		else:
+			candidate_paths_by_request.set(request_alias, remaining)
+
+	prelude_path = if all.prelude_path == Some(target_path):
+		importable_module_index_prelude_path(dependency_modules, module_ordinals_by_path)
+	else:
+		all.prelude_path
+
+	importable_module_index_with_adjacency({
+		modules = dependency_modules,
+		module_ordinals_by_path = module_ordinals_by_path,
+		candidate_paths_by_request = candidate_paths_by_request,
+		dependency_ordinals_by_module = [],
+		prelude_path = prelude_path,
+	})
+
+
 -- A source declaration has one module-level decision before symbol/alias
--- registration mutates the typecheck state. The source loop applies these
--- immediately, keeping diagnostic order while exposing the exact decisions
--- that a later phase-local import builder will need to retain.
+-- registration mutates the typecheck state. The binder applies it immediately
+-- in source order; the later candidate owner can retain this exact outcome
+-- without first materializing a duplicate declaration plan.
 private union ImportDeclDecision:
 	ImportDeclMissing
 	ImportDeclAmbiguous(List[String])
@@ -930,6 +1003,7 @@ private pure func decide_import_decl(
 			ImportDeclMissing
 		[module]:
 			module_path = importable_module_surface_path(module)
+
 			if is_stdlib and module_origin_is_package(importable_module_surface_origin(module)):
 				ImportDeclForbiddenPackage
 			else if seen_module_paths.contains(module_path):
@@ -1185,62 +1259,75 @@ private pure func record_imported_type_symbol(
 		state
 
 
-private pure func importable_module_surfaces_by_first_path(
-	modules: List[ImportableModuleSurface],
-) -> Dict[String, ImportableModuleSurface]:
-	var by_path: Dict[String, ImportableModuleSurface] = {}
+private pure func graph_import_binding_is_type(
+	definition_table: DefinitionTable,
+	module_id: ModuleId,
+	definition_ids: List[DefinitionId],
+) -> Bool:
+	definition_ids.any(func(definition_id):
+		match definition_table_type_row(
+			definition_table,
+			definition_id_runtime_value(definition_id),
+		):
+			Some(row):
+				module_ids_equal(row.module_id, module_id)
+			None:
+				False
+	)
 
-	for module in modules:
-		module_path = importable_module_surface_path(module)
 
-		if not by_path.contains(module_path):
-			by_path = by_path.set(module_path, module)
-
-	by_path
-
-
-private pure func register_module_view_type_fact(
+private pure func register_graph_import_type_fact(
 	state: TypecheckState,
-	module: ImportableModuleSurface,
-	binding: ImportedNameBinding,
+	definition_table: DefinitionTable,
+	local_name: String,
+	module_id: ModuleId,
+	definition_ids: List[DefinitionId],
 ) -> TypecheckState:
-	match find_surface_symbol(importable_surface_value(module).exports, binding.original_name):
-		Some(symbol):
-			record_imported_type_symbol(state, binding.module_path, binding.local_name, symbol)
-		None:
-			state
+	if graph_import_binding_is_type(definition_table, module_id, definition_ids):
+		match module_table_canonical_path(
+			definition_table_module_table(definition_table),
+			module_id,
+		):
+			Some(module_path):
+				typecheck_state_record_type_home(
+					typecheck_state_add_known_type_name(state, local_name),
+					local_name,
+					module_path,
+					True,
+				)
+			None:
+				state
+	else:
+		state
 
 
-pure func register_module_view_type_facts(
-	state: TypecheckState,
-	modules: List[ImportableModuleSurface],
-	view: ModuleView,
-) -> TypecheckState:
-	var next = state
-	imported_names = module_view_imported_names(view)
+-- Accepted graph views already retain exact module and definition IDs for
+-- every selective import. Replay imported type facts from those IDs instead
+-- of rebuilding a path map and rescanning source-facing module exports.
+pure func register_module_view_type_facts(state: TypecheckState) -> TypecheckState:
+	if not typecheck_state_has_compatible_module_view(state):
+		state
+	else:
+		match typecheck_state_definition_table(state):
+			None:
+				state
+			Some(definition_table):
+				var next = state
 
-	match imported_names:
-		[]:
-			next
-		[binding]:
-			match modules.find(
-				func(module): importable_module_surface_path(module) == binding.module_path,
-			):
-				Some(module):
-					register_module_view_type_fact(next, module, binding)
-				None:
-					next
-		_:
-			modules_by_path = importable_module_surfaces_by_first_path(modules)
+				for binding in module_view_import_bindings(state.module_view):
+					match binding:
+						GraphSelectiveDefinitionBinding(local_name, module_id, definition_ids):
+							next = register_graph_import_type_fact(
+								next,
+								definition_table,
+								local_name,
+								module_id,
+								definition_ids,
+							)
+						_:
+							void
 
-			for binding in imported_names:
-				match modules_by_path.get(binding.module_path):
-					Some(module):
-						next = register_module_view_type_fact(next, module, binding)
-					None:
-						void
-
-			next
+				next
 
 
 private pure func register_import_symbol(
@@ -1414,46 +1501,27 @@ private pure func register_import_module_alias(
 			typecheck_state_register_standalone_module_alias(state, alias_name, module_path)
 
 
-private pure func register_import_decl_indexed(
+private pure func apply_import_decl_decision(
 	state: TypecheckState,
-	index: ImportModuleIndex,
 	decl: ParsedImportDecl,
-	seen_module_paths: Dict[String, Bool],
-	accepted_canonical_module_paths: List[String],
-) -> (TypecheckState, Dict[String, Bool], List[String]):
-	match decide_import_decl(index, decl, seen_module_paths, typecheck_state_is_stdlib(state)):
+	decision: ImportDeclDecision,
+) -> TypecheckState:
+	match decision:
 		ImportDeclMissing:
-			(
-				import_not_loaded_error(state, decl.module_path, decl.module_path_span),
-				seen_module_paths,
-				accepted_canonical_module_paths,
-			)
+			import_not_loaded_error(state, decl.module_path, decl.module_path_span)
 		ImportDeclAmbiguous(canonical_paths):
-			(
-				import_ambiguous_module_error(
-					state,
-					decl.module_path,
-					canonical_paths,
-					decl.module_path_span,
-				),
-				seen_module_paths,
-				accepted_canonical_module_paths,
+			import_ambiguous_module_error(
+				state,
+				decl.module_path,
+				canonical_paths,
+				decl.module_path_span,
 			)
 		ImportDeclForbiddenPackage:
-			(
-				import_std_package_error(state, decl.module_path_span),
-				seen_module_paths,
-				accepted_canonical_module_paths,
-			)
+			import_std_package_error(state, decl.module_path_span)
 		ImportDeclDuplicateModule:
-			(
-				import_duplicate_module_error(state, decl.module_path, decl.module_path_span),
-				seen_module_paths,
-				accepted_canonical_module_paths,
-			)
+			import_duplicate_module_error(state, decl.module_path, decl.module_path_span)
 		ImportDeclSelected(imported_module):
-			module_path = importable_module_surface_path(imported_module)
-			next_state = match decl.symbols:
+			match decl.symbols:
 				Some(symbols):
 					with_symbols = register_import_symbols(state, imported_module, symbols)
 					register_import_alias_if_present(
@@ -1467,33 +1535,8 @@ private pure func register_import_decl_indexed(
 							explicit_alias
 						None:
 							import_default_alias(decl.module_path)
+
 					register_import_module_alias(state, imported_module, alias_name)
-
-			(
-				next_state,
-				seen_module_paths.set(module_path, True),
-				accepted_canonical_module_paths.append(module_path),
-			)
-
-
-private pure func register_import_decls_indexed(
-	state: TypecheckState,
-	index: ImportModuleIndex,
-	imports: List[ParsedImportDecl],
-	seen_module_paths: Dict[String, Bool],
-	accepted_canonical_module_paths: List[String],
-) -> (TypecheckState, Dict[String, Bool], List[String]):
-	var current: TypecheckState = state
-	var seen = seen_module_paths
-	var accepted_paths = accepted_canonical_module_paths
-
-	for import_decl in imports:
-		result = register_import_decl_indexed(current, index, import_decl, seen, accepted_paths)
-		current = result[0]
-		seen = result[1]
-		accepted_paths = result[2]
-
-	(current, seen, accepted_paths)
 
 
 pure func register_program_imports(
@@ -1501,28 +1544,44 @@ pure func register_program_imports(
 	modules: List[ImportableModuleSurface],
 	program: ParsedProgram,
 ) -> ProgramImportRegistration:
-	var current: TypecheckState = state
-	var seen_module_paths: Dict[String, Bool] = {}
 	var accepted_canonical_module_paths: List[String] = []
 	index = import_module_index(modules)
+	is_stdlib = typecheck_state_is_stdlib(state)
+	var seen_module_paths: Dict[String, Bool] = {}
+	var current = state
+	var saw_import = False
 
-	for decl in program.decls:
-		match decl:
+	for parsed_decl in program.decls:
+		match parsed_decl:
 			ImportBlockParsedDecl(imports, _):
-				result = register_import_decls_indexed(
-					current,
-					index,
-					imports,
-					seen_module_paths,
-					accepted_canonical_module_paths,
-				)
-				current = result[0]
-				seen_module_paths = result[1]
-				accepted_canonical_module_paths = result[2]
+				for import_decl in imports:
+					-- Begin only for a real import; empty blocks must not publish
+					-- an unchanged graph view. Injected preludes count here.
+					if not saw_import:
+						current = typecheck_state_begin_graph_import_admission(current)
+						saw_import = True
+
+					decision = decide_import_decl(index, import_decl, seen_module_paths, is_stdlib)
+					current = apply_import_decl_decision(current, import_decl, decision)
+
+					match decision:
+						ImportDeclSelected(imported_module):
+							module_path = importable_module_surface_path(imported_module)
+							seen_module_paths = seen_module_paths.set(module_path, True)
+							accepted_canonical_module_paths = accepted_canonical_module_paths.append(
+								module_path,
+							)
+						_:
+							void
 			_:
 				void
 
+	final_state = if saw_import:
+		typecheck_state_finish_graph_import_admission(current)
+	else:
+		current
+
 	{
-		state = current,
+		state = final_state,
 		accepted_canonical_module_paths = accepted_canonical_module_paths
 	}

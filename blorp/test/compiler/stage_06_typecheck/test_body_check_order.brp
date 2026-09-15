@@ -3,6 +3,7 @@ import:
 	../../../src/compiler/stage_04_modules/loaded_module: ModuleOrigin(UserModule)
 	../../../src/compiler/stage_06_typecheck/decl:
 		AcceptedTypecheckModule,
+		BodyCheckContext,
 		BodyCheckContextBuild(BodyContextReady, BodyContextRejected),
 		BodyCheckContextFailure(BodyContextForeignOwner, BodyContextUnknownIdentity),
 		BodyCheckOrder(DeterministicShuffledBodyOrder, ReverseBodyOrder, SourceBodyOrder),
@@ -19,6 +20,7 @@ import:
 		accepted_typecheck_module_definition_table,
 		accepted_typecheck_module_module_table,
 		body_check_context_callable_id,
+		body_check_context_meta_session,
 		body_check_outcome_callable_id,
 		body_check_outcome_diagnostics,
 		body_check_outcome_errors,
@@ -32,14 +34,26 @@ import:
 		body_outcome_table_count,
 		body_subset_program_decls,
 		check_body_context,
+		checked_body_artifact_validated_body,
+		definition_meta_run_for_table,
+		new_definition_meta_run,
 		typecheck_program_with_type_header_module_in_body_order,
 		typecheck_program_with_type_header_module_in_body_order_for_policy,
+		validated_body_typed_function,
 	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
 		CallableId,
 		callable_id_definition_id,
 		callable_id_name,
 		callable_ids_equal,
 	../../../src/compiler/stage_06_typecheck/state: typecheck_state_for_origin
+	../../../src/compiler/stage_06_typecheck/type_system/meta_identity:
+		BodyMetaSessionPurpose(
+			NormalBodyMetaSession,
+			CtfeSelectiveBodyMetaSession,
+			CtfeEagerBodyMetaSession,
+		),
+		meta_session_ids_equal,
+		new_compilation_run_token,
 	../../../src/compiler/stage_06_typecheck/typed_ast_json:
 		typed_decl_to_json,
 		typed_function_info_to_json,
@@ -103,6 +117,213 @@ private pure func body_context_rejects_foreign_module_callable() -> Option[Bool]
 
 pure func test_body_context_rejects_foreign_module_callable() -> Bool:
 	body_context_rejects_foreign_module_callable().get_or(False)
+
+
+private pure func ready_body_context(
+	input: AcceptedTypecheckModule,
+	id: CallableId,
+) -> Option[BodyCheckContext]:
+	match body_context(input, id):
+		BodyContextReady(context):
+			Some(context)
+		BodyContextRejected(_):
+			None
+
+
+private func body_meta_session_provenance() -> Option[Bool]:
+	accepted ?= accepted_module("first", "func one() -> Int: 1").to_option()
+	other_authority ?= accepted_module("first", "func one() -> Int: 1").to_option()
+	first_ids ?= accepted_typecheck_module_callable_body_ids(accepted)
+	other_ids ?= accepted_typecheck_module_callable_body_ids(other_authority)
+	first_id ?= first_ids.get(0)
+	other_id ?= other_ids.get(0)
+	first_context ?= ready_body_context(accepted, first_id)
+	other_context ?= ready_body_context(other_authority, other_id)
+	first_run = new_definition_meta_run(accepted_typecheck_module_definition_table(accepted))
+	other_run = new_definition_meta_run(accepted_typecheck_module_definition_table(other_authority))
+	separate_run = new_definition_meta_run(accepted_typecheck_module_definition_table(accepted))
+	first_session ?= body_check_context_meta_session(
+		first_context,
+		first_run,
+		NormalBodyMetaSession,
+		0,
+	)
+	other_session ?= body_check_context_meta_session(
+		other_context,
+		other_run,
+		NormalBodyMetaSession,
+		0,
+	)
+	separate_session ?= body_check_context_meta_session(
+		first_context,
+		separate_run,
+		NormalBodyMetaSession,
+		0,
+	)
+	copied_session ?= body_check_context_meta_session(
+		first_context,
+		first_run,
+		NormalBodyMetaSession,
+		0,
+	)
+
+	Some(
+		(
+			body_check_context_meta_session(
+				first_context,
+				other_run,
+				NormalBodyMetaSession,
+				0,
+			).is_none()
+			and body_check_context_meta_session(
+				other_context,
+				first_run,
+				NormalBodyMetaSession,
+				0,
+			).is_none()
+			and not meta_session_ids_equal(first_session, other_session)
+			and not meta_session_ids_equal(first_session, separate_session)
+			and meta_session_ids_equal(first_session, copied_session)
+		),
+	)
+
+
+func test_body_meta_session_requires_issuing_definition_table() -> Bool:
+	body_meta_session_provenance().get_or(False)
+
+
+private func shared_host_run_preserves_definition_table_provenance() -> Option[Bool]:
+	first ?= accepted_module("shared", "func one() -> Int: 1").to_option()
+	other ?= accepted_module("shared", "func one() -> Int: 1").to_option()
+	first_ids ?= accepted_typecheck_module_callable_body_ids(first)
+	other_ids ?= accepted_typecheck_module_callable_body_ids(other)
+	first_id ?= first_ids.get(0)
+	other_id ?= other_ids.get(0)
+	first_context ?= ready_body_context(first, first_id)
+	other_context ?= ready_body_context(other, other_id)
+	host_token = new_compilation_run_token()
+	first_table = accepted_typecheck_module_definition_table(first)
+	other_table = accepted_typecheck_module_definition_table(other)
+	first_run = definition_meta_run_for_table(first_table, host_token)
+	first_run_rebound = definition_meta_run_for_table(first_table, host_token)
+	other_run = definition_meta_run_for_table(other_table, host_token)
+	first_session ?= body_check_context_meta_session(
+		first_context,
+		first_run,
+		NormalBodyMetaSession,
+		0,
+	)
+	rebound_session ?= body_check_context_meta_session(
+		first_context,
+		first_run_rebound,
+		NormalBodyMetaSession,
+		0,
+	)
+	other_session ?= body_check_context_meta_session(
+		other_context,
+		other_run,
+		NormalBodyMetaSession,
+		0,
+	)
+
+	Some(
+		(
+			meta_session_ids_equal(first_session, rebound_session)
+			and not meta_session_ids_equal(first_session, other_session)
+			and body_check_context_meta_session(
+				first_context,
+				other_run,
+				NormalBodyMetaSession,
+				0,
+			).is_none()
+			and body_check_context_meta_session(
+				other_context,
+				first_run,
+				NormalBodyMetaSession,
+				0,
+			).is_none()
+		),
+	)
+
+
+func test_shared_host_run_preserves_definition_table_provenance() -> Bool:
+	shared_host_run_preserves_definition_table_provenance().get_or(False)
+
+
+private func ctfe_fallback_check_has_distinct_issued_session() -> Option[Bool]:
+	accepted ?= accepted_module("ctfe_fallback", "func one() -> Int: 1").to_option()
+	ids ?= accepted_typecheck_module_callable_body_ids(accepted)
+	id ?= ids.get(0)
+	context ?= ready_body_context(accepted, id)
+	run = new_definition_meta_run(accepted_typecheck_module_definition_table(accepted))
+	selective ?= body_check_context_meta_session(context, run, CtfeSelectiveBodyMetaSession, 0)
+	eager ?= body_check_context_meta_session(context, run, CtfeEagerBodyMetaSession, 0)
+	normal ?= body_check_context_meta_session(context, run, NormalBodyMetaSession, 0)
+
+	Some(
+		(
+			not meta_session_ids_equal(selective, eager)
+			and not meta_session_ids_equal(selective, normal)
+			and not meta_session_ids_equal(eager, normal)
+		),
+	)
+
+
+func test_ctfe_fallback_check_has_distinct_issued_session() -> Bool:
+	ctfe_fallback_check_has_distinct_issued_session().get_or(False)
+
+
+private func body_meta_sessions_follow_identity_not_schedule() -> Option[Bool]:
+	accepted ?= accepted_module(
+		"two_bodies",
+		"func one() -> Int: 1\nfunc two() -> Int: 2",
+	).to_option()
+
+	contexts ?= match accepted_typecheck_module_body_plan(accepted):
+		BodyCheckPlanReady(ready, _):
+			Some(ready)
+		BodyCheckPlanRejected(_):
+			None
+
+	first ?= contexts.get(0)
+	second ?= contexts.get(1)
+	reversed_first ?= contexts
+		.reverse()
+		.get(0)
+	reversed_second ?= contexts
+		.reverse()
+		.get(1)
+	run = new_definition_meta_run(accepted_typecheck_module_definition_table(accepted))
+	first_session ?= body_check_context_meta_session(first, run, NormalBodyMetaSession, 0)
+	second_session ?= body_check_context_meta_session(second, run, NormalBodyMetaSession, 0)
+	reversed_first_session ?= body_check_context_meta_session(
+		reversed_first,
+		run,
+		NormalBodyMetaSession,
+		0,
+	)
+	reversed_second_session ?= body_check_context_meta_session(
+		reversed_second,
+		run,
+		NormalBodyMetaSession,
+		0,
+	)
+
+	Some(
+		(
+			not callable_ids_equal(
+				body_check_context_callable_id(first),
+				body_check_context_callable_id(second),
+			)
+			and not meta_session_ids_equal(first_session, second_session)
+			and meta_session_ids_equal(first_session, reversed_second_session)
+			and meta_session_ids_equal(second_session, reversed_first_session)
+		),
+	)
+
+
+func test_body_meta_sessions_follow_identity_not_schedule() -> Bool:
+	body_meta_sessions_follow_identity_not_schedule().get_or(False)
 
 
 private pure func body_context_rejects_stale_same_owner_identity() -> Option[Bool]:
@@ -284,6 +505,31 @@ private pure func implementation_body_schedule_does_not_change_typed_output() ->
 
 pure func test_implementation_body_schedule_does_not_change_typed_output() -> Bool:
 	implementation_body_schedule_does_not_change_typed_output().get_or(False)
+
+
+private pure func rejected_implementation_method_keeps_source_diagnostics() -> Option[Bool]:
+	source = "trait Measure:\n\tpure func good(value: Self) -> Int\n\tpure func bad(value: Self) -> Int\n\nimplements Measure for Int:\n\tpure func good(value: Int) -> Int: value\n\tpure func bad(value: Int) -> Int: \"wrong\"\n\nfunc main(args: List[String]) -> Int: 0"
+	source_run ?= run_fingerprint(source, SourceBodyOrder)
+	reverse_run ?= run_fingerprint(source, ReverseBodyOrder)
+	shuffled_run ?= run_fingerprint(source, DeterministicShuffledBodyOrder)
+
+	Some(
+		(
+			source_run.errors.length() == 1
+			and source_run.errors.any(func(error): error.contains("String"))
+			and source_run.checked_ids.length() == 3
+			and source_run.typed == reverse_run.typed
+			and reverse_run.typed == shuffled_run.typed
+			and source_run.errors == reverse_run.errors
+			and reverse_run.errors == shuffled_run.errors
+			and source_run.diagnostics == reverse_run.diagnostics
+			and reverse_run.diagnostics == shuffled_run.diagnostics
+		),
+	)
+
+
+pure func test_rejected_implementation_method_keeps_source_diagnostics() -> Bool:
+	rejected_implementation_method_keeps_source_diagnostics().get_or(False)
 
 
 private pure func implementation_bodies_are_independently_scheduled() -> Option[Bool]:
@@ -474,7 +720,16 @@ private pure func complete_body_facade_returns_explicit_outcomes() -> Option[Boo
 		match (check_body_context(ready), check_body_context(broken)):
 			(BodyCheckAccepted(accepted), BodyCheckRejected(rejected)):
 				(
-					callable_ids_equal(
+					typed_function_info_to_json(
+						validated_body_typed_function(
+							checked_body_artifact_validated_body(
+								accepted,
+							),
+						),
+					).to_string() == typed_function_info_to_json(
+						body_check_outcome_typed_function(BodyCheckAccepted(accepted)),
+					).to_string()
+					and callable_ids_equal(
 						body_check_outcome_callable_id(BodyCheckAccepted(accepted)),
 						accepted_id,
 					)
@@ -1005,6 +1260,22 @@ tests: TestSuite = {
 			test_body_context_rejects_foreign_module_callable,
 		),
 		(
+			"body meta session requires the issuing definition table",
+			test_body_meta_session_requires_issuing_definition_table,
+		),
+		(
+			"shared host run preserves definition table provenance",
+			test_shared_host_run_preserves_definition_table_provenance,
+		),
+		(
+			"ctfe fallback check has a distinct issued session",
+			test_ctfe_fallback_check_has_distinct_issued_session,
+		),
+		(
+			"body meta sessions follow identity rather than schedule",
+			test_body_meta_sessions_follow_identity_not_schedule,
+		),
+		(
 			"body context rejects a stale identity from the same module owner",
 			test_body_context_rejects_stale_same_owner_identity,
 		),
@@ -1021,6 +1292,10 @@ tests: TestSuite = {
 		(
 			"implementation body schedule does not change typed output",
 			test_implementation_body_schedule_does_not_change_typed_output,
+		),
+		(
+			"rejected implementation method keeps source diagnostics",
+			test_rejected_implementation_method_keeps_source_diagnostics,
 		),
 		(
 			"implementation bodies are independently scheduled",

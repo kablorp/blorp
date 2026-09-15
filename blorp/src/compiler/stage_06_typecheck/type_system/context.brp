@@ -29,7 +29,6 @@ import:
 		normalize_type_name,
 		occurs_in,
 		strip_type_param_bounds,
-		type_contains_meta,
 		type_subst_entry,
 		types_equal,
 
@@ -49,20 +48,26 @@ record ResourceCleanupEntry {
 }
 
 
-record MetaBindingEntry {
-	meta_id: Int,
-	binding: SemanticType
+private record MetaSolverStateRep {
+	origins: List[String],
+	bindings: List[Option[SemanticType]]
 }
+
+
+opaque type MetaSolverState = MetaSolverStateRep
+
+private META_SOLVER_EMPTY: MetaSolverState = into_opaque MetaSolverState({
+		origins = [],
+		bindings = []
+	})
 
 
 record Context {
 	package_roots: List[String],
 	source_packages: List[SourcePackage],
 	resource_cleanups: List[ResourceCleanupEntry],
-	meta_origins: List[String],
-	meta_bindings: List[MetaBindingEntry],
+	solver: MetaSolverState,
 	def_id_counter: Int,
-	fresh_meta_counter: Int,
 	lower_destruct_counter: Int,
 	lower_param_counter: Int,
 	lower_question_bind_counter: Int,
@@ -104,14 +109,22 @@ private record UnifyOptions {
 }
 
 
+private enum MetaReferenceCheck:
+	FindTargetMeta
+	ValidateBindingGraph
+	ValidateIssuedReferences
+
+
+-- ValidateIssuedReferences has no target. Use an out-of-range value only for
+-- that private mode; the check never compares a meta to this value.
+private META_REFERENCE_NO_TARGET: Int = -1
+
 CONTEXT_EMPTY: Context = {
 	package_roots = [],
 	source_packages = [],
 	resource_cleanups = [],
-	meta_origins = [],
-	meta_bindings = [],
+	solver = META_SOLVER_EMPTY,
 	def_id_counter = 0,
-	fresh_meta_counter = 0,
 	lower_destruct_counter = 0,
 	lower_param_counter = 0,
 	lower_question_bind_counter = 0,
@@ -127,11 +140,7 @@ CONTEXT_EMPTY: Context = {
 -- immutable inputs, while metas and their allocation order must never leak
 -- from one independently checked body into another.
 pure func context_for_fresh_infer_session(context: Context) -> Context:
-	{ context |
-		meta_origins = [],
-		meta_bindings = [],
-		fresh_meta_counter = 0
-	}
+	{ context | solver = META_SOLVER_EMPTY }
 
 
 pure func prepared_infer_context_facts(context: Context) -> PreparedInferContextFacts:
@@ -262,244 +271,291 @@ pure func find_resource_cleanup(context: Context, type_name: String) -> Option[S
 
 
 pure func meta_origin_name(context: Context, meta_id: Int) -> String:
-	match context.meta_origins.get(meta_id):
+	match from_opaque MetaSolverState(context.solver).origins.get(meta_id):
 		Some(origin):
 			origin
 		None:
 			"?m" + meta_id.to_string()
 
 
-private pure func find_meta_binding_entry(
-	entries: List[MetaBindingEntry],
-	meta_id: Int,
-) -> Option[MetaBindingEntry]:
-	var result: Option[MetaBindingEntry] = None
-
-	for entry in entries:
-		if entry.meta_id == meta_id:
-			result = Some(entry)
-			break
-
-	result
-
-
 pure func lookup_meta(context: Context, meta_id: Int) -> Option[SemanticType]:
-	match find_meta_binding_entry(context.meta_bindings, meta_id):
-		Some(entry):
-			Some(entry.binding)
-		None:
-			None
+	from_opaque MetaSolverState(context.solver).bindings.get_or(meta_id, None)
 
 
-private pure func replace_meta_binding_entry(
-	entries: List[MetaBindingEntry],
-	replacement: MetaBindingEntry,
-) -> List[MetaBindingEntry]:
-	var result: List[MetaBindingEntry] = []
-	var replaced: Bool = False
+pure func meta_solver_allocated_count(context: Context) -> Int:
+	from_opaque MetaSolverState(context.solver).origins.length()
 
-	for entry in entries:
-		if entry.meta_id == replacement.meta_id:
-			result = result.append(replacement)
-			replaced = True
-		else:
-			result = result.append(entry)
 
-	if replaced:
-		result
+pure func meta_solver_bound_count(context: Context) -> Int:
+	var count: Int = 0
+
+	for binding in from_opaque MetaSolverState(context.solver).bindings:
+		if binding.is_some():
+			count += 1
+
+	count
+
+
+pure func meta_solver_states_equal(left: Context, right: Context) -> Bool:
+	left_solver = from_opaque MetaSolverState(left.solver)
+	right_solver = from_opaque MetaSolverState(right.solver)
+	left_solver.origins == right_solver.origins and left_solver.bindings == right_solver.bindings
+
+
+-- A solver may bind only metas issued by this session. An out-of-range ID
+-- fails closed instead of growing a sparse table or silently inventing a meta.
+pure func bind_meta(context: Context, meta_id: Int, typ: SemanticType) -> Option[Context]:
+	solver = from_opaque MetaSolverState(context.solver)
+
+	if (
+		meta_id < 0
+		or meta_id >= solver.bindings.length()
+		or meta_reference_conflicts(context, meta_id, typ, ValidateBindingGraph)
+	):
+		None
 	else:
-		result.append(replacement)
-
-
-pure func bind_meta(context: Context, meta_id: Int, typ: SemanticType) -> Context:
-	entry: MetaBindingEntry = {
-		meta_id = meta_id,
-		binding = typ
-	}
-
-	{ context | meta_bindings = replace_meta_binding_entry(context.meta_bindings, entry) }
-
-
-private pure func head_resolve_seen(
-	context: Context,
-	seen: List[Int],
-	typ: SemanticType,
-) -> SemanticType:
-	match typ:
-		SemanticMetaType(meta_id):
-			if seen.contains(meta_id):
-				typ
-			else:
-				match lookup_meta(context, meta_id):
-					Some(binding):
-						head_resolve_seen(
-							context,
-							seen.append(meta_id),
-							binding,
-						)
-					None:
-						typ
-		_:
-			typ
+		Some(
+			{ context |
+				solver = into_opaque MetaSolverState(
+					{ solver | bindings = solver.bindings.set(meta_id, Some(typ)) }
+				)
+			},
+		)
 
 
 pure func head_resolve(context: Context, typ: SemanticType) -> SemanticType:
-	head_resolve_seen(context, [], typ)
+	-- bind_meta is the only binding constructor and rejects cycles. Head
+	-- resolution can follow the chain without rebuilding a visited-ID list.
+	var resolved: SemanticType = typ
+	var searching: Bool = True
+
+	while searching:
+		match resolved:
+			SemanticMetaType(meta_id):
+				match lookup_meta(context, meta_id):
+					Some(binding):
+						resolved = binding
+					None:
+						searching = False
+			_:
+				searching = False
+
+	resolved
 
 
-private pure func occurs_meta_in_list(
+private pure func meta_reference_conflicts_in_list(
 	context: Context,
 	target_meta_id: Int,
-	seen: List[Int],
 	types: List[SemanticType],
+	check: MetaReferenceCheck,
 ) -> Bool:
 	var result: Bool = False
 
 	for typ in types:
-		if occurs_meta_seen(context, target_meta_id, seen, typ):
+		if meta_reference_conflicts(context, target_meta_id, typ, check):
 			result = True
 			break
 
 	result
 
 
-private pure func occurs_meta_seen(
+private pure func meta_reference_conflicts(
 	context: Context,
 	target_meta_id: Int,
-	seen: List[Int],
 	typ: SemanticType,
+	check: MetaReferenceCheck,
 ) -> Bool:
+	-- bind_meta is the sole binding writer and rejects self/transitive cycles.
+	-- Following existing bindings therefore needs no per-path visited-ID list.
 	match typ:
 		SemanticMetaType(meta_id):
-			if meta_id == target_meta_id:
+			unissued = match check:
+				FindTargetMeta:
+					False
+				ValidateBindingGraph:
+					meta_id < 0 or meta_id >= meta_solver_allocated_count(context)
+				ValidateIssuedReferences:
+					meta_id < 0 or meta_id >= meta_solver_allocated_count(context)
+
+			target_matches = match check:
+				FindTargetMeta:
+					meta_id == target_meta_id
+				ValidateBindingGraph:
+					meta_id == target_meta_id
+				ValidateIssuedReferences:
+					False
+
+			if target_matches:
 				True
-			else if seen.contains(meta_id):
-				False
+			else if unissued:
+				True
 			else:
 				match lookup_meta(context, meta_id):
 					Some(binding):
-						occurs_meta_seen(
-							context,
-							target_meta_id,
-							seen.append(meta_id),
-							binding,
-						)
+						meta_reference_conflicts(context, target_meta_id, binding, check)
 					None:
 						False
 		SemanticNamedType(_, args):
-			occurs_meta_in_list(context, target_meta_id, seen, args)
+			meta_reference_conflicts_in_list(context, target_meta_id, args, check)
 		SemanticArrayType(element, dims):
 			(
-				occurs_meta_seen(context, target_meta_id, seen, element)
-				or occurs_meta_in_list(context, target_meta_id, seen, dims)
+				meta_reference_conflicts(context, target_meta_id, element, check)
+				or meta_reference_conflicts_in_list(context, target_meta_id, dims, check)
 			)
 		SemanticFunctionType(_, params, return_type):
 			(
-				occurs_meta_in_list(context, target_meta_id, seen, params)
-				or occurs_meta_seen(context, target_meta_id, seen, return_type)
+				meta_reference_conflicts_in_list(context, target_meta_id, params, check)
+				or meta_reference_conflicts(context, target_meta_id, return_type, check)
 			)
 		SemanticTupleType(elements):
-			occurs_meta_in_list(context, target_meta_id, seen, elements)
+			meta_reference_conflicts_in_list(context, target_meta_id, elements, check)
 		SemanticRangeType(inner):
-			occurs_meta_seen(context, target_meta_id, seen, inner)
+			meta_reference_conflicts(context, target_meta_id, inner, check)
 		SemanticDimOpType(_, left, right):
 			(
-				occurs_meta_seen(context, target_meta_id, seen, left)
-				or occurs_meta_seen(context, target_meta_id, seen, right)
+				meta_reference_conflicts(context, target_meta_id, left, check)
+				or meta_reference_conflicts(context, target_meta_id, right, check)
 			)
 		_:
 			False
 
 
 pure func occurs_meta(context: Context, target_meta_id: Int, typ: SemanticType) -> Bool:
-	occurs_meta_seen(context, target_meta_id, [], typ)
+	meta_reference_conflicts(context, target_meta_id, typ, FindTargetMeta)
 
 
-private pure func resolve_type_meta_list(
+private pure func meta_references_are_issued(context: Context, typ: SemanticType) -> Bool:
+	not meta_reference_conflicts(context, META_REFERENCE_NO_TARGET, typ, ValidateIssuedReferences)
+
+
+-- None means this subtree is unchanged, not that an unbound meta failed to
+-- resolve. List.set clones shared storage on the first changed child only.
+private pure func resolve_type_meta_list_if_changed(
 	context: Context,
-	seen: List[Int],
 	types: List[SemanticType],
 	finalize_unbound: Bool,
-) -> List[SemanticType]:
-	var result: List[SemanticType] = []
+) -> Option[List[SemanticType]]:
+	var resolved: List[SemanticType] = types
+	var changed: Bool = False
+	var index: Int = 0
 
 	for typ in types:
-		result = result.append(resolve_type_metas_seen(context, seen, typ, finalize_unbound))
+		match resolve_type_metas_if_changed(context, typ, finalize_unbound):
+			Some(next_type):
+				resolved = resolved.set(index, next_type)
+				changed = True
+			None:
+				void
 
-	result
+		index += 1
+
+	if changed:
+		Some(resolved)
+	else:
+		None
 
 
-private pure func unbound_meta_type(
+private pure func unbound_meta_type_if_changed(
 	context: Context,
 	meta_id: Int,
 	finalize_unbound: Bool,
-) -> SemanticType:
+) -> Option[SemanticType]:
 	if finalize_unbound:
-		SemanticTypeVar(meta_origin_name(context, meta_id))
+		-- An issued but unbound meta becomes its generic origin. An unissued
+		-- index must remain a meta so the solved-body guard can reject it.
+		match from_opaque MetaSolverState(context.solver).origins.get(meta_id):
+			Some(origin):
+				Some(SemanticTypeVar(origin))
+			None:
+				None
 	else:
-		SemanticMetaType(meta_id)
+		None
 
 
-private pure func resolve_type_metas_seen(
+private pure func resolve_type_metas_if_changed(
 	context: Context,
-	seen: List[Int],
+	typ: SemanticType,
+	finalize_unbound: Bool,
+) -> Option[SemanticType]:
+	match typ:
+		SemanticMetaType(meta_id):
+			-- bind_meta is the sole binding constructor and rejects transitive
+			-- cycles, so full resolution needs no per-hop visited-ID list.
+			match lookup_meta(context, meta_id):
+				Some(binding):
+					Some(resolve_type_metas_recursive(context, binding, finalize_unbound))
+				None:
+					unbound_meta_type_if_changed(context, meta_id, finalize_unbound)
+		SemanticNamedType(name, args):
+			match resolve_type_meta_list_if_changed(context, args, finalize_unbound):
+				Some(resolved_args):
+					Some(SemanticNamedType(name, resolved_args))
+				None:
+					None
+		SemanticArrayType(element, dims):
+			element_result = resolve_type_metas_if_changed(context, element, finalize_unbound)
+			dims_result = resolve_type_meta_list_if_changed(context, dims, finalize_unbound)
+
+			if element_result.is_some() or dims_result.is_some():
+				Some(SemanticArrayType(element_result.get_or(element), dims_result.get_or(dims)))
+			else:
+				None
+		SemanticFunctionType(is_pure, params, return_type):
+			params_result = resolve_type_meta_list_if_changed(context, params, finalize_unbound)
+			return_result = resolve_type_metas_if_changed(context, return_type, finalize_unbound)
+
+			if params_result.is_some() or return_result.is_some():
+				Some(
+					SemanticFunctionType(
+						is_pure,
+						params_result.get_or(params),
+						return_result.get_or(return_type),
+					),
+				)
+			else:
+				None
+		SemanticTupleType(elements):
+			match resolve_type_meta_list_if_changed(context, elements, finalize_unbound):
+				Some(resolved_elements):
+					Some(SemanticTupleType(resolved_elements))
+				None:
+					None
+		SemanticRangeType(inner):
+			match resolve_type_metas_if_changed(context, inner, finalize_unbound):
+				Some(resolved_inner):
+					Some(SemanticRangeType(resolved_inner))
+				None:
+					None
+		SemanticDimOpType(op, left, right):
+			left_result = resolve_type_metas_if_changed(context, left, finalize_unbound)
+			right_result = resolve_type_metas_if_changed(context, right, finalize_unbound)
+
+			if left_result.is_some() or right_result.is_some():
+				Some(SemanticDimOpType(op, left_result.get_or(left), right_result.get_or(right)))
+			else:
+				None
+		_:
+			None
+
+
+private pure func resolve_type_metas_recursive(
+	context: Context,
 	typ: SemanticType,
 	finalize_unbound: Bool,
 ) -> SemanticType:
-	match typ:
-		SemanticMetaType(meta_id):
-			if seen.contains(meta_id):
-				unbound_meta_type(context, meta_id, finalize_unbound)
-			else:
-				match lookup_meta(context, meta_id):
-					Some(binding):
-						resolve_type_metas_seen(
-							context,
-							seen.append(meta_id),
-							binding,
-							finalize_unbound,
-						)
-					None:
-						unbound_meta_type(context, meta_id, finalize_unbound)
-		SemanticNamedType(name, args):
-			SemanticNamedType(
-				name,
-				resolve_type_meta_list(context, seen, args, finalize_unbound),
-			)
-		SemanticArrayType(element, dims):
-			SemanticArrayType(
-				resolve_type_metas_seen(context, seen, element, finalize_unbound),
-				resolve_type_meta_list(context, seen, dims, finalize_unbound),
-			)
-		SemanticFunctionType(is_pure, params, return_type):
-			SemanticFunctionType(
-				is_pure,
-				resolve_type_meta_list(context, seen, params, finalize_unbound),
-				resolve_type_metas_seen(context, seen, return_type, finalize_unbound),
-			)
-		SemanticTupleType(elements):
-			SemanticTupleType(resolve_type_meta_list(context, seen, elements, finalize_unbound))
-		SemanticRangeType(inner):
-			SemanticRangeType(resolve_type_metas_seen(context, seen, inner, finalize_unbound))
-		SemanticDimOpType(op, left, right):
-			SemanticDimOpType(
-				op,
-				resolve_type_metas_seen(context, seen, left, finalize_unbound),
-				resolve_type_metas_seen(context, seen, right, finalize_unbound),
-			)
-		_:
+	match resolve_type_metas_if_changed(context, typ, finalize_unbound):
+		Some(resolved):
+			resolved
+		None:
 			typ
 
 
 pure func resolve_type_metas(context: Context, typ: SemanticType) -> SemanticType:
-	resolve_type_metas_seen(context, [], typ, False)
+	resolve_type_metas_recursive(context, typ, False)
 
 
 pure func zonk_type(context: Context, typ: SemanticType) -> SemanticType:
-	if type_contains_meta(typ):
-		resolve_type_metas_seen(context, [], typ, True)
-	else:
-		typ
+	resolve_type_metas_recursive(context, typ, True)
 
 
 private pure func unify_options(
@@ -597,17 +653,21 @@ private pure func unify_try_bind(
 	name: String,
 	typ: SemanticType,
 ) -> Option[UnifyStep]:
-	match unify_subst_list_lookup(step.subst, name):
-		Some(existing):
-			if types_equal(existing, typ):
-				Some(step)
-			else:
-				None
-		None:
-			if occurs_in(name, typ):
-				None
-			else:
-				Some({ step | subst = step.subst.append(type_subst_entry(name, typ)) })
+	-- A substitution can carry a meta without calling bind_meta.
+	if not meta_references_are_issued(step.context, typ):
+		None
+	else:
+		match unify_subst_list_lookup(step.subst, name):
+			Some(existing):
+				if types_equal(existing, typ):
+					Some(step)
+				else:
+					None
+			None:
+				if occurs_in(name, typ):
+					None
+				else:
+					Some({ step | subst = step.subst.append(type_subst_entry(name, typ)) })
 
 
 private pure func unify_bind_meta(
@@ -615,10 +675,46 @@ private pure func unify_bind_meta(
 	meta_id: Int,
 	typ: SemanticType,
 ) -> Option[UnifyStep]:
-	if occurs_meta(step.context, meta_id, typ):
-		None
+	match bind_meta(step.context, meta_id, typ):
+		Some(bound_context):
+			Some({ step | context = bound_context })
+		None:
+			None
+
+
+private pure func unify_accept_if_metas_issued(
+	step: UnifyStep,
+	left: SemanticType,
+	right: SemanticType,
+) -> Option[UnifyStep]:
+	if (
+		meta_references_are_issued(step.context, left)
+		and meta_references_are_issued(step.context, right)
+	):
+		Some(step)
 	else:
-		Some({ step | context = bind_meta(step.context, meta_id, typ) })
+		None
+
+
+private pure func meta_tail_references_are_issued(
+	context: Context,
+	types: List[SemanticType],
+	start_index: Int,
+) -> Bool:
+	-- Variadic matching accepts the rest of this list without visiting it.
+	var index: Int = start_index
+	var issued: Bool = True
+
+	while index < types.length() and issued:
+		match types.get(index):
+			Some(typ):
+				issued = meta_references_are_issued(context, typ)
+			None:
+				issued = False
+
+		index += 1
+
+	issued
 
 
 private pure func unify_args_at(
@@ -635,7 +731,10 @@ private pure func unify_args_at(
 		match left_args.get(left_index):
 			Some(left):
 				if unify_is_variadic_dims(left) and left_index == left_args.length() - 1:
-					Some(step)
+					if meta_tail_references_are_issued(step.context, right_args, right_index):
+						Some(step)
+					else:
+						None
 				else if right_index < right_args.length():
 					match right_args.get(right_index):
 						Some(right):
@@ -644,7 +743,14 @@ private pure func unify_args_at(
 								and unify_is_variadic_dims(right)
 								and right_index == right_args.length() - 1
 							):
-								Some(step)
+								if meta_tail_references_are_issued(
+									step.context,
+									left_args,
+									left_index,
+								):
+									Some(step)
+								else:
+									None
 							else:
 								match unify_go(options, step, left, right):
 									Some(next_step):
@@ -775,11 +881,7 @@ private pure func unify_dim_arithmetic(
 	left: SemanticType,
 	right: SemanticType,
 ) -> Option[UnifyStep]:
-	meta_bindings: List[(Int, SemanticType)] = step.context.meta_bindings.map(
-		func(entry): (entry.meta_id, entry.binding),
-	)
-
-	match dim_solve(meta_bindings, left, right):
+	match dim_solve(from_opaque MetaSolverState(step.context.solver).bindings, left, right):
 		DimSolved:
 			Some(step)
 		DimBindMeta(meta_id, value):
@@ -835,7 +937,7 @@ private pure func unify_left_named(
 					unify_arrays(options, step, left, other)
 			SemanticRangeType(_):
 				if unify_is_int_type(left):
-					Some(step)
+					unify_accept_if_metas_issued(step, left, other)
 				else:
 					unify_arrays(options, step, left, other)
 			_:
@@ -862,7 +964,7 @@ private pure func unify_right_named(
 		match other:
 			SemanticRangeType(_):
 				if options.symmetric and unify_is_int_type(right):
-					Some(step)
+					unify_accept_if_metas_issued(step, other, right)
 				else:
 					unify_arrays(options, step, other, right)
 			SemanticTupleType(left_elements):
@@ -908,12 +1010,12 @@ private pure func unify_structural(
 							unify_range_types(options, step, left, right)
 						(_, SemanticRangeType(_)):
 							if unify_is_int_type(left):
-								Some(step)
+								unify_accept_if_metas_issued(step, left, right)
 							else:
 								None
 						(SemanticRangeType(_), _):
 							if options.symmetric and unify_is_int_type(right):
-								Some(step)
+								unify_accept_if_metas_issued(step, left, right)
 							else:
 								None
 						(SemanticSelfType, SemanticSelfType):
@@ -956,7 +1058,15 @@ private pure func unify_go(
 	right: SemanticType = head_resolve(step.context, raw_right)
 
 	if types_equal(left, right):
-		Some(step)
+		if meta_reference_conflicts(
+			step.context,
+			META_REFERENCE_NO_TARGET,
+			left,
+			ValidateIssuedReferences,
+		):
+			None
+		else:
+			Some(step)
 	else if unify_is_string_type(left) and unify_is_literal_string_type(right):
 		Some(step)
 	else if (
@@ -982,7 +1092,14 @@ private pure func unify_go(
 	):
 		Some(step)
 	else if unify_is_dim_expr_type(left) or unify_is_dim_expr_type(right):
-		unify_dim_arithmetic(options, step, left, right)
+		-- Canonicalization can cancel an invalid meta before reporting DimSolved.
+		if (
+			meta_references_are_issued(step.context, left)
+			and meta_references_are_issued(step.context, right)
+		):
+			unify_dim_arithmetic(options, step, left, right)
+		else:
+			None
 	else:
 		match left:
 			SemanticMetaType(meta_id):
@@ -1139,7 +1256,8 @@ pure func mint_def_id(context: Context) -> DefIdStep:
 
 
 pure func fresh_meta_with_origin(context: Context, origin: String) -> FreshMetaStep:
-	meta_id: Int = context.fresh_meta_counter
+	solver = from_opaque MetaSolverState(context.solver)
+	meta_id: Int = solver.origins.length()
 
 	meta_origin: String = if origin.length() == 0:
 		"?"
@@ -1147,10 +1265,10 @@ pure func fresh_meta_with_origin(context: Context, origin: String) -> FreshMetaS
 		origin
 
 	{
-		context = { context |
-			fresh_meta_counter = meta_id + 1,
-			meta_origins = context.meta_origins.append(meta_origin)
-		},
+		context = { context | solver = into_opaque MetaSolverState({ solver |
+					origins = solver.origins.append(meta_origin),
+					bindings = solver.bindings.append(None)
+				}) },
 		meta_type = SemanticMetaType(meta_id)
 	}
 
@@ -1160,11 +1278,7 @@ pure func fresh_meta(context: Context) -> FreshMetaStep:
 
 
 pure func reset_meta(context: Context) -> Context:
-	{ context |
-		fresh_meta_counter = 0,
-		meta_origins = [],
-		meta_bindings = []
-	}
+	{ context | solver = META_SOLVER_EMPTY }
 
 
 pure func reset_core_counters(context: Context) -> Context:

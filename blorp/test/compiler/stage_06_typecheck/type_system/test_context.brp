@@ -1,6 +1,13 @@
 import:
 	../../../../src/compiler/stage_04_modules/loaded_module:
 		ModuleOrigin(NativePackageModule, SourcePackageModule, StdlibModule, UserModule),
+		resolved_module_identity_from_resolver,
+	../../../../src/compiler/stage_04_modules/module_table: singleton_module_table
+	../../../../src/compiler/stage_06_typecheck/graph/definition_index:
+		DefinitionTable,
+		definition_index_definition_table,
+		definition_index_empty,
+		definition_index_initial_seed,
 	../../../../src/compiler/stage_06_typecheck/type_system/context:
 		CONTEXT_EMPTY,
 		UnifyStep,
@@ -37,6 +44,19 @@ import:
 		unify_symmetric_with_type_params,
 		unify_with_type_params,
 		zonk_type,
+	../../../../src/compiler/stage_06_typecheck/type_system/env: ENV_EMPTY
+	../../../../src/compiler/stage_06_typecheck/type_system/meta_identity:
+		BodyMetaSessionPurpose(
+			NormalBodyMetaSession,
+			CtfeSelectiveBodyMetaSession,
+			CtfeEagerBodyMetaSession,
+		),
+		compilation_run_tokens_equal,
+		meta_body_session,
+		meta_global_session,
+		meta_module_session,
+		meta_session_ids_equal,
+		new_compilation_run_token,
 	../../../../src/compiler/stage_06_typecheck/type_system/semantic_type:
 		SemanticDimOp(SemanticDimAdd, SemanticDimMultiply),
 		SemanticType(
@@ -47,6 +67,7 @@ import:
 			SemanticMetaType,
 			SemanticNamedType,
 			SemanticRangeType,
+			SemanticTupleType,
 			SemanticTypeVar,
 			SemanticVarDimsType,
 		),
@@ -54,6 +75,7 @@ import:
 		TYPE_STRING,
 		type_list,
 		types_equal,
+	memory: get_mem_stats, reset_mem_stats
 	test: TestSuite
 
 
@@ -101,16 +123,10 @@ func test_resource_cleanup_registration_is_context_local() -> Bool:
 
 func test_prepared_infer_context_facts_create_fresh_sessions() -> Bool:
 	with_cleanup = register_resource_cleanup(CONTEXT_EMPTY, "File", "close_file")
-	contaminated = { with_cleanup |
-		meta_origins = ["T"],
-		meta_bindings = [
-			{
-				meta_id = 0,
-				binding = TYPE_INT
-			},
-		],
+	issued = fresh_meta_with_origin(with_cleanup, "T")
+	bound = bind_meta(issued.context, 0, TYPE_INT).get_or(issued.context)
+	contaminated = { bound |
 		def_id_counter = 7,
-		fresh_meta_counter = 1,
 		lower_destruct_counter = 2,
 		lower_param_counter = 3,
 		lower_question_bind_counter = 4,
@@ -128,11 +144,12 @@ func test_prepared_infer_context_facts_create_fresh_sessions() -> Bool:
 	(
 		find_resource_cleanup(first, "File") == Some("close_file")
 		and find_resource_cleanup(second, "File") == Some("close_file")
-		and mutated.fresh_meta_counter == 1
-		and second.meta_origins.is_empty()
-		and second.meta_bindings.is_empty()
+		and lookup_meta(contaminated, 0) == Some(TYPE_INT)
+		and types_equal(fresh_meta(mutated).meta_type, SemanticMetaType(1))
+		and meta_origin_name(second, 0) == "?m0"
+		and lookup_meta(second, 0).is_none()
 		and second.def_id_counter == 0
-		and second.fresh_meta_counter == 0
+		and types_equal(fresh_meta(second).meta_type, SemanticMetaType(0))
 		and second.lower_destruct_counter == 0
 		and second.lower_param_counter == 0
 		and second.lower_question_bind_counter == 0
@@ -183,7 +200,7 @@ func test_context_counters_and_meta_reset() -> Bool:
 				and core_reset.lower_current_task_scope_id == 0
 				and core_reset.desugar_counter == 0
 				and core_reset.ssa_mut_counter == 0
-				and core_reset.fresh_meta_counter == 1
+				and types_equal(fresh_meta(core_reset).meta_type, SemanticMetaType(1))
 			)
 		_:
 			False
@@ -193,11 +210,8 @@ func test_meta_bindings_head_resolve_and_zonk() -> Bool:
 	first_meta = fresh_meta_with_origin(CONTEXT_EMPTY, "T")
 	second_meta = fresh_meta_with_origin(first_meta.context, "U")
 	third_meta = fresh_meta_with_origin(second_meta.context, "V")
-	context_with_chain = bind_meta(
-		bind_meta(third_meta.context, 1, type_list(TYPE_INT)),
-		0,
-		SemanticMetaType(1),
-	)
+	bound_one = bind_meta(third_meta.context, 1, type_list(TYPE_INT)).get_or(third_meta.context)
+	context_with_chain = bind_meta(bound_one, 0, SemanticMetaType(1)).get_or(bound_one)
 	nested: SemanticType = SemanticNamedType(
 		"Box",
 		[SemanticMetaType(0), SemanticMetaType(2), SemanticMetaType(9)],
@@ -213,7 +227,7 @@ func test_meta_bindings_head_resolve_and_zonk() -> Bool:
 				zonked,
 				SemanticNamedType(
 					"Box",
-					[type_list(TYPE_INT), SemanticTypeVar("V"), SemanticTypeVar("?m9")],
+					[type_list(TYPE_INT), SemanticTypeVar("V"), SemanticMetaType(9)],
 				),
 			) and meta_origin_name(
 				context_with_chain,
@@ -224,6 +238,70 @@ func test_meta_bindings_head_resolve_and_zonk() -> Bool:
 			) == "?m9" and occurs_meta(context_with_chain, 1, SemanticMetaType(0))
 		None:
 			False
+
+
+func test_head_resolve_follows_long_issued_chain() -> Bool:
+	var context = CONTEXT_EMPTY
+
+	for _ in 0..64:
+		context = fresh_meta(context).context
+
+	var valid: Bool = True
+
+	for index in 0..64:
+		binding = if index + 1 < 64:
+			SemanticMetaType(index + 1)
+		else:
+			TYPE_INT
+
+		match bind_meta(context, index, binding):
+			Some(bound):
+				context = bound
+			None:
+				valid = False
+
+	valid and types_equal(
+		head_resolve(context, SemanticMetaType(0)),
+		TYPE_INT,
+	)
+
+
+func test_full_resolution_preserves_long_chain_and_unbound_recovery() -> Bool:
+	var context = CONTEXT_EMPTY
+	var valid: Bool = True
+
+	for _ in 0..64:
+		context = fresh_meta(context).context
+
+	for index in 0..64:
+		binding = if index + 1 < 64:
+			SemanticMetaType(index + 1)
+		else:
+			TYPE_INT
+
+		match bind_meta(context, index, binding):
+			Some(bound):
+				context = bound
+			None:
+				valid = False
+
+	nested = SemanticNamedType(
+		"Pair",
+		[SemanticMetaType(0), SemanticMetaType(63), SemanticMetaType(64)],
+	)
+	valid and types_equal(
+		zonk_type(context, nested),
+		SemanticNamedType(
+			"Pair",
+			[TYPE_INT, TYPE_INT, SemanticMetaType(64)],
+		),
+	) and types_equal(
+		resolve_type_metas(context, nested),
+		SemanticNamedType(
+			"Pair",
+			[TYPE_INT, TYPE_INT, SemanticMetaType(64)],
+		),
+	)
 
 
 func test_zonk_preserves_meta_free_recursive_type() -> Bool:
@@ -249,23 +327,78 @@ func test_zonk_preserves_meta_free_recursive_type() -> Bool:
 	)
 
 
+func test_resolve_type_metas_reuses_meta_free_recursive_type() -> Bool:
+	meta_free: SemanticType = SemanticFunctionType(
+		True,
+		[SemanticNamedType("Box", [SemanticTupleType([TYPE_INT, SemanticRangeType(TYPE_STRING)])])],
+		SemanticArrayType(
+			TYPE_INT,
+			[
+				SemanticDimOpType(
+					SemanticDimMultiply,
+					SemanticConstIntType(2),
+					SemanticConstIntType(3),
+				),
+			],
+		),
+	)
+
+	reset_mem_stats()
+	resolved = resolve_type_metas(CONTEXT_EMPTY, meta_free)
+	stats = get_mem_stats()
+
+	stats.total_allocations == 0 and types_equal(resolved, meta_free)
+
+
+func test_resolve_type_metas_reuses_unbound_recursive_type() -> Bool:
+	issued = fresh_meta(CONTEXT_EMPTY)
+	unbound: SemanticType = SemanticNamedType(
+		"Box",
+		[issued.meta_type, TYPE_INT],
+	)
+
+	reset_mem_stats()
+	resolved = resolve_type_metas(issued.context, unbound)
+	stats = get_mem_stats()
+
+	stats.total_allocations == 0 and types_equal(resolved, unbound)
+
+
+func test_zonk_keeps_unissued_meta_unresolved_after_reset() -> Bool:
+	first = fresh_meta(CONTEXT_EMPTY)
+	second = fresh_meta(first.context)
+	reset = reset_meta(second.context)
+
+	types_equal(
+		zonk_type(first.context, first.meta_type),
+		SemanticTypeVar("?"),
+	) and types_equal(
+		zonk_type(first.context, second.meta_type),
+		second.meta_type,
+	) and types_equal(
+		zonk_type(reset, second.meta_type),
+		second.meta_type,
+	) and types_equal(
+		zonk_type(CONTEXT_EMPTY, SemanticMetaType(-1)),
+		SemanticMetaType(-1),
+	)
+
+
 func test_meta_origins_are_dense_by_meta_id() -> Bool:
 	first_meta = fresh_meta_with_origin(CONTEXT_EMPTY, "T")
 	second_meta = fresh_meta_with_origin(first_meta.context, "U")
 
 	(
-		second_meta.context.meta_origins.get(0) == Some("T")
-		and second_meta.context.meta_origins.get(1) == Some("U")
-		and second_meta.context.meta_origins
-			.get(2)
-			.is_none()
+		meta_origin_name(second_meta.context, 0) == "T"
+		and meta_origin_name(second_meta.context, 1) == "U"
+		and meta_origin_name(second_meta.context, 2) == "?m2"
 	)
 
 
 func test_resolve_type_metas_preserves_unbound_inference_identity() -> Bool:
 	first_meta = fresh_meta_with_origin(CONTEXT_EMPTY, "T")
 	second_meta = fresh_meta_with_origin(first_meta.context, "U")
-	bound_context = bind_meta(second_meta.context, 1, TYPE_STRING)
+	bound_context = bind_meta(second_meta.context, 1, TYPE_STRING).get_or(second_meta.context)
 	nested: SemanticType = SemanticNamedType(
 		"Pair",
 		[first_meta.meta_type, second_meta.meta_type],
@@ -285,7 +418,7 @@ func test_resolve_type_metas_preserves_unbound_inference_identity() -> Bool:
 
 func test_meta_reset_clears_bindings_and_origins() -> Bool:
 	meta_step = fresh_meta_with_origin(CONTEXT_EMPTY, "T")
-	bound_context = bind_meta(meta_step.context, 0, TYPE_INT)
+	bound_context = bind_meta(meta_step.context, 0, TYPE_INT).get_or(meta_step.context)
 	reset_context = reset_meta(bound_context)
 	fresh_after_reset = fresh_meta(reset_context)
 
@@ -309,14 +442,172 @@ func subst_has(step: UnifyStep, name: String, expected: SemanticType) -> Bool:
 
 
 func test_unify_binds_meta_and_rejects_occurs() -> Bool:
-	bind_result = unify(CONTEXT_EMPTY, SemanticMetaType(0), TYPE_INT)
-	occurs_result = unify(CONTEXT_EMPTY, SemanticMetaType(0), type_list(SemanticMetaType(0)))
+	issued = fresh_meta(CONTEXT_EMPTY)
+	bind_result = unify(issued.context, issued.meta_type, TYPE_INT)
+	occurs_result = unify(issued.context, issued.meta_type, type_list(issued.meta_type))
 
 	match bind_result:
 		Some(step):
 			match lookup_meta(step.context, 0):
 				Some(binding):
 					types_equal(binding, TYPE_INT) and occurs_result.is_none()
+				None:
+					False
+		None:
+			False
+
+
+func test_unification_rejects_meta_not_issued_by_session() -> Bool:
+	(
+		unify(CONTEXT_EMPTY, SemanticMetaType(0), TYPE_INT).is_none()
+		and bind_meta(CONTEXT_EMPTY, 0, TYPE_INT).is_none()
+		and bind_meta(CONTEXT_EMPTY, -1, TYPE_INT).is_none()
+		and lookup_meta(CONTEXT_EMPTY, 0).is_none()
+	)
+
+
+func test_binding_rejects_self_reference() -> Bool:
+	issued = fresh_meta(CONTEXT_EMPTY)
+	bind_meta(issued.context, 0, SemanticMetaType(0)).is_none()
+
+
+func test_binding_rejects_unissued_nested_meta() -> Bool:
+	issued = fresh_meta(CONTEXT_EMPTY)
+	bind_meta(issued.context, 0, type_list(SemanticMetaType(1))).is_none()
+
+
+func test_unification_rejects_equal_unissued_metas() -> Bool:
+	issued = fresh_meta(CONTEXT_EMPTY)
+
+	(
+		unify(CONTEXT_EMPTY, SemanticMetaType(0), SemanticMetaType(0)).is_none()
+		and unify(
+			issued.context,
+			type_list(SemanticMetaType(1)),
+			type_list(SemanticMetaType(1)),
+		).is_none()
+		and unify(issued.context, issued.meta_type, issued.meta_type).is_some()
+	)
+
+
+func test_unification_rejects_unissued_meta_in_type_var_substitution() -> Bool:
+	issued = fresh_meta(CONTEXT_EMPTY)
+
+	(
+		unify(CONTEXT_EMPTY, SemanticTypeVar("T"), type_list(SemanticMetaType(0))).is_none()
+		and unify(issued.context, SemanticTypeVar("T"), type_list(issued.meta_type)).is_some()
+	)
+
+
+func test_unification_rejects_unissued_meta_in_variadic_tail() -> Bool:
+	variadic = SemanticNamedType(
+		"Tensor",
+		[TYPE_INT, SemanticVarDimsType("Ds")],
+	)
+	missing = SemanticNamedType(
+		"Tensor",
+		[TYPE_INT, SemanticMetaType(0)],
+	)
+	missing_late = SemanticNamedType(
+		"Tensor",
+		[TYPE_INT, SemanticConstIntType(4), SemanticMetaType(0)],
+	)
+	issued = fresh_meta(CONTEXT_EMPTY)
+	valid = SemanticNamedType(
+		"Tensor",
+		[TYPE_INT, issued.meta_type],
+	)
+
+	(
+		unify(CONTEXT_EMPTY, variadic, missing).is_none()
+		and unify_symmetric(CONTEXT_EMPTY, missing_late, variadic).is_none()
+		and unify(issued.context, variadic, valid).is_some()
+	)
+
+
+func test_unification_rejects_unissued_meta_in_dimension_identity() -> Bool:
+	left = SemanticDimOpType(SemanticDimAdd, SemanticMetaType(0), SemanticConstIntType(1))
+	right = SemanticDimOpType(SemanticDimAdd, SemanticConstIntType(1), SemanticMetaType(0))
+	issued = fresh_meta(CONTEXT_EMPTY)
+
+	unify(CONTEXT_EMPTY, left, right).is_none() and unify(issued.context, left, right).is_some()
+
+
+func test_unification_rejects_unissued_meta_in_range_shortcut() -> Bool:
+	missing = SemanticRangeType(SemanticMetaType(0))
+	issued = fresh_meta(CONTEXT_EMPTY)
+	valid = SemanticRangeType(issued.meta_type)
+
+	(
+		unify(CONTEXT_EMPTY, TYPE_INT, missing).is_none()
+		and unify_symmetric(CONTEXT_EMPTY, missing, TYPE_INT).is_none()
+		and unify(issued.context, TYPE_INT, valid).is_some()
+	)
+
+
+func test_binding_rejects_transitive_cycle_and_accepts_issued_reference() -> Bool:
+	first = fresh_meta(CONTEXT_EMPTY)
+	second = fresh_meta(first.context)
+	valid = bind_meta(second.context, 0, type_list(SemanticMetaType(1)))
+
+	match valid:
+		Some(bound):
+			match lookup_meta(bound, 0):
+				Some(binding):
+					(
+						bind_meta(bound, 1, SemanticMetaType(0)).is_none()
+						and types_equal(binding, type_list(SemanticMetaType(1)))
+					)
+				None:
+					False
+		None:
+			False
+
+
+func test_binding_shared_acyclic_reference_remains_valid() -> Bool:
+	var context = CONTEXT_EMPTY
+
+	for _ in 0..4:
+		context = fresh_meta(context).context
+
+	chain = bind_meta(context, 1, SemanticMetaType(2))
+
+	match chain:
+		Some(first_bound):
+			match bind_meta(first_bound, 2, TYPE_INT):
+				Some(second_bound):
+					shared = SemanticTupleType([SemanticMetaType(1), SemanticMetaType(1)])
+
+					match bind_meta(second_bound, 0, shared):
+						Some(third_bound):
+							(
+								occurs_meta(third_bound, 2, SemanticMetaType(0))
+								and bind_meta(third_bound, 2, SemanticMetaType(0)).is_none()
+								and bind_meta(third_bound, 3, SemanticMetaType(0)).is_some()
+							)
+						None:
+							False
+				None:
+					False
+		None:
+			False
+
+
+func test_meta_binding_replaces_one_issued_id_without_mutating_prior_context() -> Bool:
+	first = fresh_meta(CONTEXT_EMPTY)
+	second = fresh_meta(first.context)
+
+	match bind_meta(second.context, 1, TYPE_INT):
+		Some(bound):
+			match bind_meta(bound, 1, TYPE_STRING):
+				Some(replaced):
+					(
+						lookup_meta(second.context, 0).is_none()
+						and lookup_meta(second.context, 1).is_none()
+						and lookup_meta(bound, 1) == Some(TYPE_INT)
+						and lookup_meta(replaced, 0).is_none()
+						and lookup_meta(replaced, 1) == Some(TYPE_STRING)
+					)
 				None:
 					False
 		None:
@@ -468,9 +759,127 @@ func test_unify_named_type_params() -> Bool:
 			False
 
 
+private pure func meta_session_test_definition_table() -> DefinitionTable:
+	issued = singleton_module_table(
+		resolved_module_identity_from_resolver(
+			"meta_session_test",
+			UserModule,
+		),
+	)
+	definition_index_definition_table(
+		definition_index_empty(
+			definition_index_initial_seed(ENV_EMPTY),
+			issued[0],
+		),
+	)
+
+
+func test_compilation_run_tokens_preserve_copy_and_distinguish_fresh_runs() -> Bool:
+	first_run = new_compilation_run_token()
+	second_run = new_compilation_run_token()
+	first_copy = first_run
+
+	(
+		compilation_run_tokens_equal(first_run, first_copy)
+		and not compilation_run_tokens_equal(first_run, second_run)
+	)
+
+
+func test_explicit_body_session_keys_distinguish_runs_purposes_and_rechecks() -> Bool:
+	first_run = new_compilation_run_token()
+	second_run = new_compilation_run_token()
+	table = meta_session_test_definition_table()
+
+	match (
+		(
+			meta_body_session(first_run, table, 7, NormalBodyMetaSession, 0),
+			meta_body_session(first_run, table, 7, NormalBodyMetaSession, 0),
+			meta_body_session(first_run, table, 7, NormalBodyMetaSession, 1),
+		),
+		(
+			meta_body_session(first_run, table, 7, CtfeSelectiveBodyMetaSession, 0),
+			meta_body_session(first_run, table, 8, NormalBodyMetaSession, 0),
+			meta_body_session(second_run, table, 7, NormalBodyMetaSession, 0),
+		),
+	):
+		((Some(first), Some(same_key), Some(recheck)), (Some(ctfe), Some(other_body), Some(other_run))):
+			copied = first
+
+			(
+				meta_session_ids_equal(first, copied)
+				and meta_session_ids_equal(first, same_key)
+				and not meta_session_ids_equal(first, recheck)
+				and not meta_session_ids_equal(first, ctfe)
+				and not meta_session_ids_equal(first, other_body)
+				and not meta_session_ids_equal(first, other_run)
+				and meta_body_session(first_run, table, -1, NormalBodyMetaSession, 0).is_none()
+				and meta_body_session(first_run, table, 7, NormalBodyMetaSession, -1).is_none()
+			)
+		_:
+			False
+
+
+func test_ctfe_selective_and_eager_fallback_checks_have_distinct_sessions() -> Bool:
+	run = new_compilation_run_token()
+	table = meta_session_test_definition_table()
+
+	match (
+		meta_body_session(run, table, 7, CtfeSelectiveBodyMetaSession, 0),
+		meta_body_session(run, table, 7, CtfeEagerBodyMetaSession, 0),
+		meta_body_session(run, table, 7, CtfeEagerBodyMetaSession, 1),
+	):
+		(Some(selective), Some(eager), Some(eager_recheck)):
+			(
+				not meta_session_ids_equal(selective, eager)
+				and not meta_session_ids_equal(eager, eager_recheck)
+				and not meta_session_ids_equal(selective, eager_recheck)
+			)
+		_:
+			False
+
+
+func test_module_global_and_body_meta_sessions_have_distinct_owner_domains() -> Bool:
+	run = new_compilation_run_token()
+	table = meta_session_test_definition_table()
+
+	match (
+		meta_module_session(run, table, 7, 0),
+		meta_global_session(run, table, 7, 0),
+		meta_body_session(run, table, 7, NormalBodyMetaSession, 0),
+	):
+		(Some(module_session), Some(global_session), Some(body_session)):
+			(
+				not meta_session_ids_equal(module_session, body_session)
+				and not meta_session_ids_equal(module_session, global_session)
+				and not meta_session_ids_equal(global_session, body_session)
+				and meta_module_session(run, table, -1, 0).is_none()
+				and meta_module_session(run, table, 7, -1).is_none()
+				and meta_global_session(run, table, -1, 0).is_none()
+				and meta_global_session(run, table, 7, -1).is_none()
+			)
+		_:
+			False
+
+
 tests: TestSuite = {
 	description = "Compiler context",
 	tests = [
+		(
+			"compilation run tokens preserve copy and distinguish fresh runs",
+			test_compilation_run_tokens_preserve_copy_and_distinguish_fresh_runs,
+		),
+		(
+			"explicit body session keys distinguish runs, purposes, and rechecks",
+			test_explicit_body_session_keys_distinguish_runs_purposes_and_rechecks,
+		),
+		(
+			"ctfe selective and eager fallback checks have distinct sessions",
+			test_ctfe_selective_and_eager_fallback_checks_have_distinct_sessions,
+		),
+		(
+			"module global and body meta sessions have distinct owner domains",
+			test_module_global_and_body_meta_sessions_have_distinct_owner_domains,
+		),
 		("module origin policies", test_module_origin_policies),
 		(
 			"resource cleanup registration is context local",
@@ -482,7 +891,24 @@ tests: TestSuite = {
 		),
 		("context counters and meta reset", test_context_counters_and_meta_reset),
 		("meta bindings head resolve and zonk", test_meta_bindings_head_resolve_and_zonk),
+		("head resolve follows long issued chain", test_head_resolve_follows_long_issued_chain),
+		(
+			"full resolution preserves long chain and unbound recovery",
+			test_full_resolution_preserves_long_chain_and_unbound_recovery,
+		),
 		("zonk preserves meta-free recursive type", test_zonk_preserves_meta_free_recursive_type),
+		(
+			"resolve type metas reuses meta-free recursive type",
+			test_resolve_type_metas_reuses_meta_free_recursive_type,
+		),
+		(
+			"resolve type metas reuses unbound recursive type",
+			test_resolve_type_metas_reuses_unbound_recursive_type,
+		),
+		(
+			"zonk keeps unissued meta unresolved after reset",
+			test_zonk_keeps_unissued_meta_unresolved_after_reset,
+		),
 		("meta origins are dense by meta id", test_meta_origins_are_dense_by_meta_id),
 		(
 			"resolve type metas preserves unbound inference identity",
@@ -490,6 +916,41 @@ tests: TestSuite = {
 		),
 		("meta reset clears bindings and origins", test_meta_reset_clears_bindings_and_origins),
 		("unify binds meta and rejects occurs", test_unify_binds_meta_and_rejects_occurs),
+		(
+			"unification rejects meta not issued by session",
+			test_unification_rejects_meta_not_issued_by_session,
+		),
+		("binding rejects self reference", test_binding_rejects_self_reference),
+		("binding rejects unissued nested meta", test_binding_rejects_unissued_nested_meta),
+		("unification rejects equal unissued metas", test_unification_rejects_equal_unissued_metas),
+		(
+			"unification rejects unissued meta in type-var substitution",
+			test_unification_rejects_unissued_meta_in_type_var_substitution,
+		),
+		(
+			"unification rejects unissued meta in variadic tail",
+			test_unification_rejects_unissued_meta_in_variadic_tail,
+		),
+		(
+			"unification rejects unissued meta in dimension identity",
+			test_unification_rejects_unissued_meta_in_dimension_identity,
+		),
+		(
+			"unification rejects unissued meta in range shortcut",
+			test_unification_rejects_unissued_meta_in_range_shortcut,
+		),
+		(
+			"binding rejects transitive cycle and accepts issued reference",
+			test_binding_rejects_transitive_cycle_and_accepts_issued_reference,
+		),
+		(
+			"binding accepts shared acyclic references and rejects back edge",
+			test_binding_shared_acyclic_reference_remains_valid,
+		),
+		(
+			"meta binding replaces one issued ID without mutating prior context",
+			test_meta_binding_replaces_one_issued_id_without_mutating_prior_context,
+		),
 		("unify type vars one way and symmetric", test_unify_type_vars_one_way_and_symmetric),
 		("unify functions arrays and variadic dims", test_unify_functions_arrays_and_variadic_dims),
 		(

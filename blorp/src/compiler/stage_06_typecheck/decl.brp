@@ -119,6 +119,7 @@ import:
 		ModuleTable,
 		module_id_table_index,
 		module_ids_equal,
+		module_table_id_at,
 		module_table_resolved_identity,
 		module_tables_are_compatible,
 	../stage_04_modules/module_type_identity: local_type_names_from_decls
@@ -138,6 +139,7 @@ import:
 		definition_table_field_id,
 		definition_table_is_compatible_with_module_table,
 		definition_table_module_table,
+		definition_tables_share_provenance,
 		resolved_field_identity_from_optional_id,
 	graph/indexed_graph:
 		PreparedModuleScope,
@@ -147,6 +149,7 @@ import:
 		prepared_module_program,
 		prepared_module_scope_canonical_path,
 		prepared_module_scope_definition_index,
+		prepared_module_scope_graph_source_name_table,
 		prepared_module_scope_id,
 		prepared_module_scope_identity,
 		prepared_module_scope_module,
@@ -245,6 +248,8 @@ import:
 		global_header_completion_plan_annotated,
 		global_header_completion_plan_annotated_dependencies,
 		global_header_completion_plan_build,
+		global_header_completion_plan_definition_table,
+		global_header_completion_plan_header_at,
 		global_header_completion_plan_pending,
 		global_header_completion_plan_pending_dependencies,
 	headers/implementation_headers:
@@ -440,7 +445,7 @@ import:
 		module_view_accepted_union_authority,
 		module_view_bind_initial_graph_local_names,
 		module_view_for_standalone_source_bindings,
-		module_view_graph_has_owner,
+		module_view_graph_has_exact_catalog,
 		module_view_has_graph_import_bindings,
 		module_view_has_standalone_import_bindings,
 		module_view_import_bindings,
@@ -684,6 +689,14 @@ import:
 		BoundTypeParam,
 		make_bound_type_param,
 		make_resolved_bound_type_param,
+	type_system/meta_identity:
+		BodyMetaSessionPurpose,
+		CompilationRunToken,
+		MetaSessionId,
+		meta_body_session,
+		meta_global_session,
+		meta_module_session,
+		new_compilation_run_token,
 	type_system/refinement: UNREFINED_BINDING
 	type_system/semantic_type:
 		SemanticType(
@@ -1028,18 +1041,6 @@ private union GlobalDefinitionIdentity:
 	ClaimGlobalDefinitionWithoutPublication
 
 
-record TypecheckImplBodyResult {
-	state: TypecheckState,
-	typed: TypedImplInfo
-}
-
-
-record TypecheckDeclBodyResult {
-	state: TypecheckState,
-	decl: TypedDecl
-}
-
-
 record TypecheckProgramResult {
 	state: TypecheckState,
 	program: TypedProgram
@@ -1105,11 +1106,111 @@ private record BodyPlanProvenanceRep {
 opaque type BodyPlanProvenance = BodyPlanProvenanceRep
 
 
+-- Inference owns its broad state through finalization, then hands validation
+-- only the typed body and issues. Only the meta-free solver
+-- path can issue SolvedBody, and only semantic acceptance can issue
+-- ValidatedBody. Accepted artifacts retain the latter before CTFE or ordinary
+-- materialization can project a typed function.
+private record BodyValidationIssues {
+	errors: List[String],
+	diagnostics: List[TypecheckDiagnostic]
+}
+
+
+private record InferredBodyRep {
+	typed: TypedFunctionInfo,
+	issues: BodyValidationIssues
+}
+
+
+opaque type InferredBody = InferredBodyRep
+
+opaque type SolvedBody = TypedFunctionInfo
+
+opaque type ValidatedBody = SolvedBody
+
+
+-- Keep the accepted proof attached to the exact typed function while a
+-- complete program is materialized. An unchecked function, including rejected
+-- recovery, must still pass the final typed-program audit.
+private union MaterializedFunctionBody:
+	ReusedValidatedBody(ValidatedBody)
+	UnvalidatedFunctionBody(TypedFunctionInfo)
+
+
+private record MaterializedFunctionBodyResult {
+	state: TypecheckState,
+	body: MaterializedFunctionBody
+}
+
+
+-- Unlike TypedImplInfo, this keeps each method's accepted or unchecked state
+-- attached to the exact method value until final validation and projection.
+private record MaterializedImplInfo {
+	decl: ParsedImplDecl,
+	for_type: SemanticType,
+	type_params: List[BoundTypeParam],
+	methods: List[MaterializedFunctionBody]
+}
+
+
+private record TypecheckImplBodyResult {
+	state: TypecheckState,
+	body: MaterializedImplInfo
+}
+
+
+private union MaterializedTypedDecl:
+	MaterializedFunctionDecl(MaterializedFunctionBody)
+	MaterializedImplDecl(MaterializedImplInfo)
+	MaterializedUncheckedDecl(TypedDecl)
+	MaterializedPrivateDecl(MaterializedTypedDecl)
+
+
+private record TypecheckDeclBodyResult {
+	state: TypecheckState,
+	decl: MaterializedTypedDecl
+}
+
+
+private pure func inferred_body_from_materialized(
+	result: TypecheckFunctionBodyResult,
+) -> InferredBody:
+	-- Finalization has already consumed the solver. Keep only facts read by
+	-- validation so broad TypecheckState and its solver end here.
+	into_opaque InferredBody({
+			typed = result.typed,
+			issues = {
+				errors = result.state.errors,
+				diagnostics = result.state.diagnostics
+			}
+		})
+
+
+private union BodySolveOutcome:
+	BodySolveReady(BodyValidationIssues, SolvedBody)
+	BodySolveRejected(BodyValidationIssues, TypedFunctionInfo, Bool)
+
+
+private record RejectedSolvedBodyRep {
+	issues: BodyValidationIssues,
+	typed: TypedFunctionInfo
+}
+
+
+opaque type RejectedSolvedBody = RejectedSolvedBodyRep
+
+
+union BodyValidationOutcome:
+	BodyValidationAccepted(ValidatedBody)
+	BodyValidationRejected(RejectedSolvedBody)
+
+
 private record CheckedBodyArtifactRep {
 	id: CallableId,
 	plan_provenance: BodyPlanProvenance,
 	main_policy: MainValidationPolicy,
-	typed: TypedFunctionInfo
+	validated: ValidatedBody
 }
 
 
@@ -1197,6 +1298,22 @@ private pure func typed_program_from_decls(
 	}
 
 
+private pure func unfinalized_type_error_message(label: String, typ: SemanticType) -> String:
+	"internal typecheck error: typed program contains unfinalized inference meta in " + label + ": " + type_to_string(
+		typ,
+	)
+
+
+private pure func body_validation_issues_add_error(
+	issues: BodyValidationIssues,
+	message: String,
+) -> BodyValidationIssues:
+	{
+		errors = issues.errors.append(message),
+		diagnostics = issues.diagnostics.append(typecheck_diagnostic(message, None))
+	}
+
+
 private pure func typecheck_unfinalized_type_error(
 	state: TypecheckState,
 	label: String,
@@ -1205,9 +1322,7 @@ private pure func typecheck_unfinalized_type_error(
 	if type_contains_meta(typ):
 		typecheck_state_add_error(
 			state,
-			"internal typecheck error: typed program contains unfinalized inference meta in " + label + ": " + type_to_string(
-				typ,
-			),
+			unfinalized_type_error_message(label, typ),
 		)
 	else:
 		state
@@ -1249,38 +1364,156 @@ private pure func typecheck_validate_typed_expr(
 				state
 
 
+private pure func solve_typed_function_body(
+	issues: BodyValidationIssues,
+	label: String,
+	info: TypedFunctionInfo,
+) -> BodySolveOutcome:
+	var next = issues
+	var index: Int = 0
+	var has_meta: Bool = False
+
+	for param_type in info.param_types:
+		if type_contains_meta(param_type):
+			has_meta = True
+			next = body_validation_issues_add_error(
+				next,
+				unfinalized_type_error_message(
+					label + " parameter " + index.to_string(),
+					param_type,
+				),
+			)
+
+		index += 1
+
+	match info.source_return_type:
+		Some(source_return_type):
+			if type_contains_meta(source_return_type):
+				has_meta = True
+				next = body_validation_issues_add_error(
+					next,
+					unfinalized_type_error_message(
+						label + " source return type",
+						source_return_type,
+					),
+				)
+		None:
+			void
+
+	if type_contains_meta(info.semantic_return_type):
+		has_meta = True
+		next = body_validation_issues_add_error(
+			next,
+			unfinalized_type_error_message(
+				label + " semantic return type",
+				info.semantic_return_type,
+			),
+		)
+
+	body_has_meta = match info.body:
+		Some(body):
+			typed_expr_contains_meta(body)
+		None:
+			False
+
+	if body_has_meta:
+		has_meta = True
+		next = body_validation_issues_add_error(
+			next,
+			(
+				"internal typecheck error: typed expression contains unfinalized inference meta "
+				+ "in "
+			) + label + " body",
+		)
+
+	if not has_meta:
+		BodySolveReady(next, into_opaque SolvedBody(info))
+	else:
+		BodySolveRejected(next, info, body_has_meta)
+
+
+private pure func validate_body_type_info(
+	issues: BodyValidationIssues,
+	label: String,
+	info: TypedFunctionInfo,
+	body_has_meta: Bool,
+) -> BodyValidationIssues:
+	match info.body:
+		Some(body):
+			if body_has_meta:
+				issues
+			else:
+				match typed_expr_type_error(body):
+					Some(message):
+						body_validation_issues_add_error(
+							issues,
+							"internal typecheck error: typed expression has incoherent type info in " + label + " body: " + message,
+						)
+					None:
+						issues
+		None:
+			issues
+
+
+private pure func validate_solved_body(
+	issues: BodyValidationIssues,
+	label: String,
+	body: SolvedBody,
+) -> BodyValidationOutcome:
+	typed = from_opaque SolvedBody(body)
+	validated_issues = validate_body_type_info(issues, label, typed, False)
+
+	if validated_issues.errors.is_empty() and validated_issues.diagnostics.is_empty():
+		BodyValidationAccepted(into_opaque ValidatedBody(body))
+	else:
+		BodyValidationRejected(into_opaque RejectedSolvedBody({
+					issues = validated_issues,
+					typed = typed
+				}))
+
+
+private pure func validate_typed_function_body(
+	issues: BodyValidationIssues,
+	label: String,
+	info: TypedFunctionInfo,
+) -> BodyValidationOutcome:
+	match solve_typed_function_body(issues, label, info):
+		BodySolveReady(solved_issues, solved):
+			validate_solved_body(solved_issues, label, solved)
+		BodySolveRejected(solve_issues, typed, body_has_meta):
+			BodyValidationRejected(into_opaque RejectedSolvedBody({
+						issues = validate_body_type_info(solve_issues, label, typed, body_has_meta),
+						typed = typed
+					}))
+
+
+private pure func validate_inferred_body(
+	body: InferredBody,
+	label: String,
+) -> BodyValidationOutcome:
+	inferred = from_opaque InferredBody(body)
+	validate_typed_function_body(inferred.issues, label, inferred.typed)
+
+
 private pure func typecheck_validate_typed_function_info(
 	state: TypecheckState,
 	label: String,
 	info: TypedFunctionInfo,
 ) -> TypecheckState:
-	var next = state
-	var index: Int = 0
+	issues: BodyValidationIssues = {
+		errors = state.errors,
+		diagnostics = state.diagnostics
+	}
 
-	for param_type in info.param_types:
-		next = typecheck_unfinalized_type_error(
-			next,
-			label + " parameter " + index.to_string(),
-			param_type,
-		)
-		index += 1
-
-	next = typecheck_validate_optional_typed_type(
-		next,
-		label + " source return type",
-		info.source_return_type,
-	)
-	next = typecheck_unfinalized_type_error(
-		next,
-		label + " semantic return type",
-		info.semantic_return_type,
-	)
-
-	match info.body:
-		Some(body):
-			typecheck_validate_typed_expr(next, label + " body", body)
-		None:
-			next
+	match validate_typed_function_body(issues, label, info):
+		BodyValidationAccepted(_):
+			state
+		BodyValidationRejected(rejected):
+			rejected_issues = from_opaque RejectedSolvedBody(rejected).issues
+			{ state |
+				errors = rejected_issues.errors,
+				diagnostics = rejected_issues.diagnostics
+			}
 
 
 private pure func typecheck_validate_typed_global_info(
@@ -1480,6 +1713,111 @@ pure func typecheck_validate_typed_program(
 		next_state = typecheck_validate_typed_decl(next_state, decl)
 
 	{ result | state = next_state }
+
+
+private pure func materialized_function_body_typed_info(
+	body: MaterializedFunctionBody,
+) -> TypedFunctionInfo:
+	match body:
+		ReusedValidatedBody(validated):
+			validated_body_typed_function(validated)
+		UnvalidatedFunctionBody(typed):
+			typed
+
+
+private pure func materialized_impl_typed_info(info: MaterializedImplInfo) -> TypedImplInfo:
+	{
+		decl = info.decl,
+		for_type = info.for_type,
+		type_params = info.type_params,
+		methods = info.methods.map(materialized_function_body_typed_info)
+	}
+
+
+private pure func materialized_typed_decl(decl: MaterializedTypedDecl) -> TypedDecl:
+	match decl:
+		MaterializedFunctionDecl(body):
+			TypedFunctionDecl(materialized_function_body_typed_info(body))
+		MaterializedImplDecl(info):
+			TypedImplDecl(materialized_impl_typed_info(info))
+		MaterializedUncheckedDecl(typed):
+			typed
+		MaterializedPrivateDecl(inner):
+			TypedPrivateDecl(materialized_typed_decl(inner))
+
+
+private pure func typecheck_validate_materialized_function_body(
+	state: TypecheckState,
+	label: String,
+	body: MaterializedFunctionBody,
+) -> TypecheckState:
+	match body:
+		ReusedValidatedBody(_):
+			state
+		UnvalidatedFunctionBody(typed):
+			typecheck_validate_typed_function_info(state, label, typed)
+
+
+private pure func typecheck_validate_materialized_impl_info(
+	state: TypecheckState,
+	label: String,
+	info: MaterializedImplInfo,
+) -> TypecheckState:
+	var next = typecheck_unfinalized_type_error(state, label + " target type", info.for_type)
+	var index: Int = 0
+
+	for method in info.methods:
+		method_info = materialized_function_body_typed_info(method)
+		next = typecheck_validate_materialized_function_body(
+			next,
+			label + " method " + index.to_string() + " '" + method_info.decl.name.text + "'",
+			method,
+		)
+		index += 1
+
+	next
+
+
+private pure func typecheck_validate_materialized_typed_decl(
+	state: TypecheckState,
+	decl: MaterializedTypedDecl,
+) -> TypecheckState:
+	match decl:
+		MaterializedFunctionDecl(body):
+			method_info = materialized_function_body_typed_info(body)
+			typecheck_validate_materialized_function_body(
+				state,
+				"function '" + method_info.decl.name.text + "'",
+				body,
+			)
+		MaterializedImplDecl(info):
+			typecheck_validate_materialized_impl_info(
+				state,
+				"impl '" + info.decl.trait_name.text + "'",
+				info,
+			)
+		MaterializedUncheckedDecl(decl):
+			typecheck_validate_typed_decl(state, decl)
+		MaterializedPrivateDecl(inner):
+			typecheck_validate_materialized_typed_decl(state, inner)
+
+
+private pure func typecheck_validate_materialized_typed_program(
+	state: TypecheckState,
+	program: ParsedProgram,
+	decls: List[MaterializedTypedDecl],
+) -> TypecheckProgramResult:
+	var next_state = state
+	var typed_decls: List[TypedDecl] = []
+
+	for decl in decls:
+		next_state = typecheck_validate_materialized_typed_decl(next_state, decl)
+		typed_decls = typed_decls.append(materialized_typed_decl(decl))
+
+	{
+		state = next_state,
+		program = typed_program_from_decls(state, program, typed_decls)
+	}
 
 
 private pure func typed_record_field_from_parsed(
@@ -2135,10 +2473,13 @@ private pure func typecheck_prescan_graph_program(
 	scoped_state = typecheck_state_scope_to_program(state, program)
 	var with_known_types = scoped_state
 	var local_names: List[(String, TopLevelNameKind)] = []
+
 	for decl in program.decls:
 		with_known_types = typecheck_prescan_decl_known_type_names(with_known_types, decl)
+
 		for candidate in typecheck_prescan_decl_local_name_candidates(decl):
 			local_names = local_names.append(candidate)
+
 	match module_view_bind_initial_graph_local_names(
 		with_known_types.module_view,
 		prepared_module_scope_module_table(current_scope),
@@ -5680,7 +6021,7 @@ private pure func typecheck_materialize_impl_body(
 	if validated.errors.length() > state.errors.length():
 		{
 			state = typecheck_with_body_env(state.env, validated),
-			typed = {
+			body = {
 				decl = impl_decl,
 				for_type = for_type,
 				type_params = bounds,
@@ -5691,7 +6032,7 @@ private pure func typecheck_materialize_impl_body(
 		body_state = add_impl_body_trait_functions(validated, impl_decl.trait_name.text)
 
 		var next = body_state
-		var typed_methods: List[TypedFunctionInfo] = []
+		var materialized_methods: List[MaterializedFunctionBody] = []
 
 		for method in impl_decl.methods:
 			method_result = typecheck_materialize_function_from_body_policy(
@@ -5701,7 +6042,7 @@ private pure func typecheck_materialize_impl_body(
 				function_bodies,
 			)
 			next = method_result.state
-			typed_methods = typed_methods.append(method_result.typed)
+			materialized_methods = materialized_methods.append(method_result.body)
 
 		if collect_type_vars(for_type).length() == 0:
 			match find_impl_trait_decl(next, decls, import_modules, impl_decl.trait_name.text):
@@ -5728,7 +6069,9 @@ private pure func typecheck_materialize_impl_body(
 										function_bodies,
 									)
 									next = method_result.state
-									typed_methods = typed_methods.append(method_result.typed)
+									materialized_methods = materialized_methods.append(
+										method_result.body,
+									)
 				None:
 					void
 
@@ -5737,11 +6080,11 @@ private pure func typecheck_materialize_impl_body(
 				typecheck_with_body_env(state.env, next),
 				state.scoped_trait_functions,
 			),
-			typed = {
+			body = {
 				decl = impl_decl,
 				for_type = for_type,
 				type_params = bounds,
-				methods = typed_methods
+				methods = materialized_methods
 			}
 		}
 
@@ -5866,10 +6209,18 @@ pure func body_check_outcome_callable_id(outcome: BodyCheckOutcome) -> CallableI
 			from_opaque RecoveredBodyArtifact(artifact).id
 
 
+pure func checked_body_artifact_validated_body(artifact: CheckedBodyArtifact) -> ValidatedBody:
+	from_opaque CheckedBodyArtifact(artifact).validated
+
+
+pure func validated_body_typed_function(body: ValidatedBody) -> TypedFunctionInfo:
+	from_opaque SolvedBody(from_opaque ValidatedBody(body))
+
+
 pure func body_check_outcome_typed_function(outcome: BodyCheckOutcome) -> TypedFunctionInfo:
 	match outcome:
 		BodyCheckAccepted(artifact):
-			from_opaque CheckedBodyArtifact(artifact).typed
+			validated_body_typed_function(checked_body_artifact_validated_body(artifact))
 		BodyCheckRejected(artifact):
 			from_opaque RecoveredBodyArtifact(artifact).typed
 
@@ -5966,10 +6317,16 @@ private pure func typecheck_materialize_function_from_body_policy(
 	function_decl: ParsedFunctionDecl,
 	main_policy: MainValidationPolicy,
 	function_bodies: FunctionBodyMaterialization,
-) -> TypecheckFunctionBodyResult:
+) -> MaterializedFunctionBodyResult:
 	match function_bodies:
 		InferStandaloneFunctionBodies:
-			typecheck_materialize_function_body_with_options(state, function_decl, main_policy)
+			unvalidated_function_body_result(
+				typecheck_materialize_function_body_with_options(
+					state,
+					function_decl,
+					main_policy,
+				),
+			)
 		ReuseIndependentFunctionBodies(outcomes, callable_headers):
 			callable_id = find_callable_id_from_span(
 				state,
@@ -5985,10 +6342,21 @@ private pure func typecheck_materialize_function_from_body_policy(
 
 			match outcome:
 				Some(found):
-					{
-						state = apply_body_check_outcome_diagnostics(state, found),
-						typed = body_check_outcome_typed_function(found)
-					}
+					match found:
+						BodyCheckAccepted(artifact):
+							{
+								state = state,
+								body = ReusedValidatedBody(
+									checked_body_artifact_validated_body(artifact),
+								)
+							}
+						BodyCheckRejected(artifact):
+							{
+								state = apply_body_check_outcome_diagnostics(state, found),
+								body = UnvalidatedFunctionBody(
+									from_opaque RecoveredBodyArtifact(artifact).typed,
+								)
+							}
 				None:
 					header: Option[CallableHeader] = match callable_id:
 						Some(definition_id):
@@ -6002,23 +6370,38 @@ private pure func typecheck_materialize_function_from_body_policy(
 					match header:
 						Some(found_header):
 							if callable_header_body_category(found_header) != SourceCallableBody:
-								typecheck_materialize_function_body_with_options(
-									state,
-									function_decl,
-									main_policy,
+								unvalidated_function_body_result(
+									typecheck_materialize_function_body_with_options(
+										state,
+										function_decl,
+										main_policy,
+									),
 								)
 							else:
+								unvalidated_function_body_result(
+									missing_body_artifact_result(
+										state,
+										function_decl,
+										"source callable",
+									),
+								)
+						None:
+							unvalidated_function_body_result(
 								missing_body_artifact_result(
 									state,
 									function_decl,
-									"source callable",
-								)
-						None:
-							missing_body_artifact_result(
-								state,
-								function_decl,
-								"implementation method",
+									"implementation method",
+								),
 							)
+
+
+private pure func unvalidated_function_body_result(
+	result: TypecheckFunctionBodyResult,
+) -> MaterializedFunctionBodyResult:
+	{
+		state = result.state,
+		body = UnvalidatedFunctionBody(result.typed)
+	}
 
 
 private pure func missing_body_artifact_result(
@@ -6056,7 +6439,7 @@ private pure func typecheck_materialize_decl_body(
 			)
 			{
 				state = result.state,
-				decl = TypedFunctionDecl(result.typed)
+				decl = MaterializedFunctionDecl(result.body)
 			}
 		VarParsedDecl(var_decl):
 			match global_bodies:
@@ -6064,7 +6447,7 @@ private pure func typecheck_materialize_decl_body(
 					result = typecheck_materialize_global_var_body(state, module_path, var_decl)
 					{
 						state = result.state,
-						decl = TypedGlobalVarDecl(result.typed)
+						decl = MaterializedUncheckedDecl(TypedGlobalVarDecl(result.typed))
 					}
 				ReuseAcceptedGlobalBodies(completed_globals):
 					accepted = module_view_accepted_global_authority(state.module_view)
@@ -6081,7 +6464,9 @@ private pure func typecheck_materialize_decl_body(
 						Some(completed):
 							{
 								state = state,
-								decl = TypedGlobalVarDecl(completed_global_header_typed(completed))
+								decl = MaterializedUncheckedDecl(
+									TypedGlobalVarDecl(completed_global_header_typed(completed)),
+								)
 							}
 						None:
 							{
@@ -6092,12 +6477,14 @@ private pure func typecheck_materialize_decl_body(
 										+ "graph"
 									),
 								),
-								decl = TypedParsedDecl(decl)
+								decl = MaterializedUncheckedDecl(TypedParsedDecl(decl))
 							}
 		RecordParsedDecl(record_decl):
 			{
 				state = state,
-				decl = TypedRecordDecl(typed_record_from_parsed(state, record_decl))
+				decl = MaterializedUncheckedDecl(
+					TypedRecordDecl(typed_record_from_parsed(state, record_decl)),
+				)
 			}
 		UnionParsedDecl(union_decl):
 			typed_union = typed_union_from_parsed(state, union_decl)
@@ -6117,17 +6504,21 @@ private pure func typecheck_materialize_decl_body(
 
 			{
 				state = next_state,
-				decl = TypedUnionDecl(typed_union)
+				decl = MaterializedUncheckedDecl(TypedUnionDecl(typed_union))
 			}
 		TypeAliasParsedDecl(alias_decl):
 			{
 				state = state,
-				decl = TypedTypeAliasDecl(typed_type_alias_from_parsed(state, alias_decl))
+				decl = MaterializedUncheckedDecl(
+					TypedTypeAliasDecl(typed_type_alias_from_parsed(state, alias_decl)),
+				)
 			}
 		TraitParsedDecl(trait_decl):
 			{
 				state = state,
-				decl = TypedTraitDecl(typed_trait_from_parsed(state, trait_decl))
+				decl = MaterializedUncheckedDecl(
+					TypedTraitDecl(typed_trait_from_parsed(state, trait_decl)),
+				)
 			}
 		ImplParsedDecl(impl_decl):
 			result = typecheck_materialize_impl_body(
@@ -6139,7 +6530,7 @@ private pure func typecheck_materialize_decl_body(
 			)
 			{
 				state = result.state,
-				decl = TypedImplDecl(result.typed)
+				decl = MaterializedImplDecl(result.body)
 			}
 		PrivateParsedDecl(inner, _):
 			result = typecheck_materialize_decl_body(
@@ -6154,12 +6545,12 @@ private pure func typecheck_materialize_decl_body(
 			)
 			{
 				state = result.state,
-				decl = TypedPrivateDecl(result.decl)
+				decl = MaterializedPrivateDecl(result.decl)
 			}
 		_:
 			{
 				state = state,
-				decl = TypedParsedDecl(decl)
+				decl = MaterializedUncheckedDecl(TypedParsedDecl(decl))
 			}
 
 
@@ -6193,7 +6584,7 @@ private pure func typecheck_materialize_standalone_program_bodies_with_import_mo
 	main_policy: MainValidationPolicy,
 ) -> TypecheckProgramResult:
 	var next_state = state
-	var typed_decls: List[TypedDecl] = []
+	var materialized_decls: List[MaterializedTypedDecl] = []
 
 	for decl in program.decls:
 		next_state = typecheck_state_reset_type_shape_memo(next_state)
@@ -6207,7 +6598,11 @@ private pure func typecheck_materialize_standalone_program_bodies_with_import_mo
 					block_span,
 				)
 				next_state = foreign_result.state
-				typed_decls = typed_decls.concat(foreign_result.decls)
+
+				for foreign_decl in foreign_result.decls:
+					materialized_decls = materialized_decls.append(
+						MaterializedUncheckedDecl(foreign_decl),
+					)
 			_:
 				result = typecheck_materialize_decl_body(
 					next_state,
@@ -6220,12 +6615,13 @@ private pure func typecheck_materialize_standalone_program_bodies_with_import_mo
 					main_policy,
 				)
 				next_state = result.state
-				typed_decls = typed_decls.append(result.decl)
+				materialized_decls = materialized_decls.append(result.decl)
 
-	typecheck_validate_typed_program({
-		state = typecheck_state_reset_type_shape_memo(next_state),
-		program = typed_program_from_decls(next_state, program, typed_decls),
-	})
+	typecheck_validate_materialized_typed_program(
+		typecheck_state_reset_type_shape_memo(next_state),
+		program,
+		materialized_decls,
+	)
 
 
 private func typecheck_materialize_standalone_program_bodies_with_import_modules_with_trace(
@@ -6238,7 +6634,7 @@ private func typecheck_materialize_standalone_program_bodies_with_import_modules
 	main_policy: MainValidationPolicy,
 ) -> TypecheckProgramResult:
 	var next_state = state
-	var typed_decls: List[TypedDecl] = []
+	var materialized_decls: List[MaterializedTypedDecl] = []
 	var decl_index: Int = 0
 
 	for decl in program.decls:
@@ -6254,7 +6650,11 @@ private func typecheck_materialize_standalone_program_bodies_with_import_modules
 					block_span,
 				)
 				next_state = foreign_result.state
-				typed_decls = typed_decls.concat(foreign_result.decls)
+
+				for foreign_decl in foreign_result.decls:
+					materialized_decls = materialized_decls.append(
+						MaterializedUncheckedDecl(foreign_decl),
+					)
 			_:
 				result = typecheck_materialize_decl_body(
 					next_state,
@@ -6267,15 +6667,16 @@ private func typecheck_materialize_standalone_program_bodies_with_import_modules
 					main_policy,
 				)
 				next_state = result.state
-				typed_decls = typed_decls.append(result.decl)
+				materialized_decls = materialized_decls.append(result.decl)
 
 		trace(BodyDeclComplete, decl_index)
 		decl_index += 1
 
-	typecheck_validate_typed_program({
-		state = typecheck_state_reset_type_shape_memo(next_state),
-		program = typed_program_from_decls(next_state, program, typed_decls),
-	})
+	typecheck_validate_materialized_typed_program(
+		typecheck_state_reset_type_shape_memo(next_state),
+		program,
+		materialized_decls,
+	)
 
 
 private pure func replay_accepted_trait_definition_id(
@@ -6468,11 +6869,7 @@ private pure func typecheck_bind_program_module_view_for_reserved_state(
 		Some(current_module_path),
 	)
 	candidate_import_surfaces = importable_module_surfaces(candidate_import_modules)
-	with_names = typecheck_prescan_graph_program(
-		module_state,
-		program_with_prelude,
-		current_scope,
-	)
+	with_names = typecheck_prescan_graph_program(module_state, program_with_prelude, current_scope)
 	import_registration = register_program_imports(
 		with_names,
 		candidate_import_surfaces,
@@ -6560,15 +6957,15 @@ pure func typecheck_bind_program_module_view(
 			),
 			[],
 		)
-	else if not module_view_graph_has_owner(
+	else if not module_view_graph_has_exact_catalog(
 		state.module_view,
-		prepared_module_scope_module_table(current_scope),
+		prepared_module_scope_graph_source_name_table(current_scope),
 		prepared_module_scope_id(current_scope),
 	):
 		BoundModuleViewRejected(
 			(
-				"internal typecheck error: graph module binding requires the view "
-				+ "for the selected module"
+				"internal typecheck error: graph module binding requires the view for the "
+				+ "selected module"
 			),
 			[],
 		)
@@ -6958,7 +7355,6 @@ private pure func prepared_module_environment_base_state(
 	program = bound_module_program(bound_module)
 	view = bound_module_view(bound_module)
 	visible_import_modules = bound_module_visible_import_modules(bound_module)
-	import_surfaces = importable_module_surfaces(visible_import_modules)
 	base = typecheck_state_for_prepared_module_scope(
 		bound_module_scope(bound_module),
 		allow_debug_only_calls,
@@ -7006,11 +7402,7 @@ private pure func prepared_module_environment_base_state(
 		Err(message):
 			typecheck_state_add_error(with_type_authority, "internal typecheck error: " + message)
 
-	with_import_type_facts = register_module_view_type_facts(
-		with_global_authority,
-		import_surfaces,
-		view,
-	)
+	with_import_type_facts = register_module_view_type_facts(with_global_authority)
 	with_import_decls = typecheck_register_import_modules_from(
 		with_import_type_facts,
 		visible_import_modules,
@@ -7431,6 +7823,7 @@ private pure func typecheck_session_for_prepared_module(
 		errors = [],
 		diagnostics = [],
 		module_view = facts.module_view,
+		graph_import_admission = None,
 		module_scope = facts.module_scope,
 		allow_debug_only_calls = facts.allow_debug_only_calls,
 		private_impls = facts.private_impls,
@@ -8661,9 +9054,9 @@ private pure func frontend_preparation_observation_add(
 
 
 private pure func frontend_preparation_module_view_projection_entries(view: ModuleView) -> Int:
-	module_view_module_alias_count(view) + module_view_imported_names(
+	module_view_module_alias_count(
 		view,
-	).length() + module_view_import_bindings(view).length()
+	) + module_view_imported_names(view).length() + module_view_import_bindings(view).length()
 
 
 private pure func frontend_preparation_modules_include_id(
@@ -9266,7 +9659,6 @@ private pure func prepare_ctfe_artifact_body_module(
 	program = bound_module_program(bound_module)
 	view = bound_module_view(bound_module)
 	visible_import_modules = bound_module_visible_import_modules(bound_module)
-	import_surfaces = importable_module_surfaces(visible_import_modules)
 	with_known_types = typecheck_prescan_known_type_names(state, program)
 	var with_view = typecheck_state_with_accepted_type_authority(
 		{ with_known_types | module_view = view },
@@ -9304,7 +9696,7 @@ private pure func prepare_ctfe_artifact_body_module(
 	for diagnostic in bound_module_binding_diagnostics(bound_module):
 		with_view = typecheck_state_add_diagnostic(with_view, diagnostic)
 
-	with_import_type_facts = register_module_view_type_facts(with_view, import_surfaces, view)
+	with_import_type_facts = register_module_view_type_facts(with_view)
 	with_import_decls = typecheck_register_import_modules_from(
 		with_import_type_facts,
 		visible_import_modules,
@@ -9652,6 +10044,67 @@ private record BodyCheckContextRep {
 opaque type BodyCheckContext = BodyCheckContextRep
 
 
+-- A host-issued token can be bound to a definition table after pure graph
+-- preparation. MetaSessionId also retains this exact table provenance, so
+-- binding one token to two graphs cannot alias same-numbered owners.
+private record DefinitionMetaRunRep {
+	definition_table: DefinitionTable,
+	token: CompilationRunToken
+}
+
+
+opaque type DefinitionMetaRun = DefinitionMetaRunRep
+
+
+pure func definition_meta_run_for_table(
+	definition_table: DefinitionTable,
+	token: CompilationRunToken,
+) -> DefinitionMetaRun:
+	into_opaque DefinitionMetaRun({
+			definition_table = definition_table,
+			token = token
+		})
+
+
+func new_definition_meta_run(definition_table: DefinitionTable) -> DefinitionMetaRun:
+	definition_meta_run_for_table(definition_table, new_compilation_run_token())
+
+
+-- The plan retains both its issuing definition table and the exact ordered
+-- headers selected for initializer work. Project by plan position, not a
+-- caller-supplied GlobalId that could come from another same-numbered table.
+pure func global_header_completion_plan_meta_session_at(
+	plan: GlobalHeaderCompletionPlan,
+	run: DefinitionMetaRun,
+	plan_index: Int,
+	invocation: Int,
+) -> Option[MetaSessionId]:
+	run_representation = from_opaque DefinitionMetaRun(run)
+	plan_definition_table = global_header_completion_plan_definition_table(plan)
+
+	if not definition_tables_share_provenance(
+		plan_definition_table,
+		run_representation.definition_table,
+	):
+		None
+	else:
+		header ?= global_header_completion_plan_header_at(plan, plan_index)
+		definition_id = global_id_definition_id(global_header_id(header))
+
+		if global_id_module_id(
+			run_representation.definition_table,
+			global_header_id(header),
+		).is_none():
+			None
+		else:
+			meta_global_session(
+				run_representation.token,
+				run_representation.definition_table,
+				definition_id,
+				invocation,
+			)
+
+
 union BodyCheckContextBuild:
 	BodyContextReady(BodyCheckContext)
 	BodyContextRejected(BodyCheckContextFailure)
@@ -9696,6 +10149,7 @@ private pure func fresh_body_infer_session(seed: BodyInferSessionSeed) -> Typech
 		errors = [],
 		diagnostics = [],
 		module_view = seed.module_facts.module_view,
+		graph_import_admission = None,
 		module_scope = seed.module_facts.module_scope,
 		allow_debug_only_calls = seed.module_facts.allow_debug_only_calls,
 		private_impls = seed.module_facts.private_impls,
@@ -9708,6 +10162,81 @@ private pure func fresh_body_infer_session(seed: BodyInferSessionSeed) -> Typech
 
 pure func body_check_context_callable_id(context: BodyCheckContext) -> CallableId:
 	from_opaque BodyCheckContext(context).id
+
+
+-- Module preparation occurs before there is an accepted body plan. Its
+-- prepared scope still retains the definition table that issued the module
+-- ID, so the run must match that exact table before compacting the ID.
+pure func prepared_module_scope_meta_session(
+	scope: PreparedModuleScope,
+	run: DefinitionMetaRun,
+	invocation: Int,
+) -> Option[MetaSessionId]:
+	run_representation = from_opaque DefinitionMetaRun(run)
+	scope_definition_table = definition_index_definition_table(
+		prepared_module_scope_definition_index(scope),
+	)
+	module_id = prepared_module_scope_id(scope)
+	module_table = definition_table_module_table(run_representation.definition_table)
+
+	if definition_tables_share_provenance(
+		scope_definition_table,
+		run_representation.definition_table,
+	):
+		match module_table_id_at(module_table, module_id_table_index(module_id)):
+			Some(issued_id):
+				if module_ids_equal(issued_id, module_id):
+					meta_module_session(
+						run_representation.token,
+						run_representation.definition_table,
+						module_id_table_index(module_id),
+						invocation,
+					)
+				else:
+					None
+			None:
+				None
+	else:
+		None
+
+
+-- The low-level session representation stores a dense definition index.
+-- Only the accepted table retained by this body plan may project its
+-- CallableId into that index; a same-numbered ID from another table is not
+-- the same body, even if both graphs contain identical source text.
+pure func body_check_context_meta_session(
+	context: BodyCheckContext,
+	run: DefinitionMetaRun,
+	purpose: BodyMetaSessionPurpose,
+	invocation: Int,
+) -> Option[MetaSessionId]:
+	representation = from_opaque BodyCheckContext(context)
+	provenance = from_opaque BodyPlanProvenance(representation.plan_provenance)
+	run_representation = from_opaque DefinitionMetaRun(run)
+	plan_definition_table = definition_index_definition_table(
+		prepared_module_scope_definition_index(provenance.module_scope),
+	)
+	owner = prepared_module_scope_id(provenance.module_scope)
+
+	if (
+		definition_tables_share_provenance(
+			plan_definition_table,
+			run_representation.definition_table,
+		)
+		and callable_id_module_id(
+			run_representation.definition_table,
+			representation.id,
+		) == Some(owner)
+	):
+		meta_body_session(
+			run_representation.token,
+			run_representation.definition_table,
+			callable_id_definition_id(representation.id),
+			purpose,
+			invocation,
+		)
+	else:
+		None
 
 
 private pure func accepted_callable_body_ids(
@@ -10202,34 +10731,34 @@ private pure func check_function_body_artifact(
 	main_policy: MainValidationPolicy,
 ) -> BodyCheckOutcome:
 	state = fresh_body_infer_session(session_seed)
-	result = typecheck_materialize_function_body_with_signature(
-		state,
-		source,
-		signature,
-		main_policy,
+	inferred = inferred_body_from_materialized(
+		typecheck_materialize_function_body_with_signature(
+			state,
+			source,
+			signature,
+			main_policy,
+		),
 	)
-	validated_state = typecheck_validate_typed_function_info(
-		result.state,
-		"function '" + source.name.text + "'",
-		result.typed,
-	)
+	validation = validate_inferred_body(inferred, "function '" + source.name.text + "'")
 
-	if validated_state.errors.is_empty() and validated_state.diagnostics.is_empty():
-		BodyCheckAccepted(into_opaque CheckedBodyArtifact({
-					id = id,
-					plan_provenance = plan_provenance,
-					main_policy = main_policy,
-					typed = result.typed
-				}))
-	else:
-		BodyCheckRejected(into_opaque RecoveredBodyArtifact({
-					id = id,
-					plan_provenance = plan_provenance,
-					main_policy = main_policy,
-					typed = result.typed,
-					errors = validated_state.errors,
-					diagnostics = validated_state.diagnostics
-				}))
+	match validation:
+		BodyValidationAccepted(validated):
+			BodyCheckAccepted(into_opaque CheckedBodyArtifact({
+						id = id,
+						plan_provenance = plan_provenance,
+						main_policy = main_policy,
+						validated = validated
+					}))
+		BodyValidationRejected(rejected):
+			recovered = from_opaque RejectedSolvedBody(rejected)
+			BodyCheckRejected(into_opaque RecoveredBodyArtifact({
+						id = id,
+						plan_provenance = plan_provenance,
+						main_policy = main_policy,
+						typed = recovered.typed,
+						errors = recovered.issues.errors,
+						diagnostics = recovered.issues.diagnostics
+					}))
 
 
 pure func check_body_context(context: BodyCheckContext) -> BodyCheckOutcome:
@@ -10521,7 +11050,7 @@ private pure func materialize_ctfe_subset_decl(
 			)
 			{
 				state = result.state,
-				decl = Some(result.decl)
+				decl = Some(materialized_typed_decl(result.decl))
 			}
 
 

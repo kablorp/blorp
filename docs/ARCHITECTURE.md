@@ -236,14 +236,17 @@ owning table or prepared payload. Other durable declaration IDs, typed
 programs, semantic occurrences, diagnostics, and external projections still
 retain or project `ModuleIdentity`; Issue 57 migrates those graph-backed owners.
 
-Compilation projects a successful typechecked graph into a Core-lowering input
-containing only typed programs, exact import bindings, source include
-directories, identity allocation state, and requested summaries. The helper
-that owns the rich typechecked result returns before Core entry, so semantic
-environments, diagnostics, and CTFE preparation state reach their last use
-before Core preparation starts. The command-level `CliCompilePlan` still owns
-its source graph until command completion; this boundary deliberately does not
-claim otherwise. Adding a typecheck field to the projection requires a
+Compilation computes a private `CoreLoweringInput` from a successful
+typechecked graph. That input contains only typed programs, exact import
+bindings, source include directories, identity allocation state, and requested
+summaries. This is a narrower read boundary, but it is not yet a proven
+lifetime boundary: `lower_typed_frontend_compilation` keeps the opaque
+`TypedFrontendCompilation` representation in scope while `prepare_core_graph`
+runs and reads policy from it afterward. The command-level `CliCompilePlan`
+also owns its source graph until command completion. The
+[last-use issue](issues/compiler-performance/137-codegen-input-last-use-and-release.md)
+owns the direct measurement and first release cut; Phase 10 owns the final
+codegen-ready product. Adding a typecheck field to the projection requires a
 specific Core consumer; it is not a general escape hatch for retaining the
 typed graph.
 

@@ -1070,7 +1070,8 @@ assert_compiler_benchmark_contract() {
 		! grep -Fxq -- '--no-format' "$compiler_args" ||
 		! grep -Fxq "$expected_source" "$compiler_args" ||
 		! grep -Fxq -- "$expected_cc_optimization" "$cc_args" ||
-		! grep -Fxq -- "-I$contract_workspace/blorp/src/compiler/stage_06_typecheck/graph" "$cc_args"
+		! grep -Fxq -- "-I$contract_workspace/blorp/src/compiler/stage_06_typecheck/graph" "$cc_args" ||
+		! grep -Fxq -- "-I$contract_workspace/blorp/src/compiler/stage_06_typecheck/type_system" "$cc_args"
 	then
 		echo "FAIL: $benchmark_entrypoint must compile its expected fixture and compiler headers through the public CLI" >&2
 		exit 1

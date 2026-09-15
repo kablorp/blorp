@@ -88,8 +88,27 @@ import:
 		source_definition_key_name,
 		source_definition_key_owner,
 		source_definition_key_span,
+	definition_table_storage:
+		DefinitionRowKind(
+			CallableDefinitionKind,
+			TypeDefinitionKind,
+			ConstructorDefinitionKind,
+			FieldDefinitionKind,
+			GlobalDefinitionKind,
+			TraitDefinitionKind,
+			ImplementationDefinitionKind,
+		),
+		DefinitionTable as StoredDefinitionTable,
+		DefinitionTableRow,
+		definition_table_append_row,
+		definition_table_first_graph_definition_id,
+		definition_table_from_rows,
+		definition_table_rows,
+		definition_table_storage_module_table,
+		definition_table_with_module_table,
+		definition_tables_share_provenance as storage_tables_share_provenance,
 	list: repeat
-	set: Set
+	set as Sets
 
 
 opaque type DefinitionIndexSeed = Int
@@ -110,25 +129,11 @@ MISSING_RESOLVED_FIELD_IDENTITY: ResolvedFieldIdentity = into_opaque ResolvedFie
 	MISSING_RESOLVED_FIELD_IDENTITY_VALUE
 )
 
+type alias DefinitionKind = DefinitionRowKind
 
-enum DefinitionKind:
-	CallableDefinitionKind
-	TypeDefinitionKind
-	ConstructorDefinitionKind
-	FieldDefinitionKind
-	GlobalDefinitionKind
-	TraitDefinitionKind
-	ImplementationDefinitionKind
+type alias DefinitionRow = DefinitionTableRow
 
-
-record DefinitionRow {
-	module_id: ModuleId,
-	kind: DefinitionKind,
-	name: String,
-	owner_name: Option[String],
-	span: SourceSpan
-}
-
+type alias DefinitionTable = StoredDefinitionTable
 
 private type alias FuncCallableNameBuckets = Dict[String, List[DefinitionId]]
 
@@ -145,6 +150,62 @@ private type alias ExportedDefinitionTargetBuckets = Dict[String, ExportedDefini
 
 opaque type ExportedDefinitionTargets = ExportedDefinitionTargetBuckets
 
+
+-- Most modules export either no selectively requested names or one. Keep
+-- those states allocation-light and pay for a hash set only when a module has
+-- genuinely multiple requested exports.
+union ExportedDefinitionNameDemand:
+	NoExportedDefinitionNames
+	OneExportedDefinitionName(String)
+	MultipleExportedDefinitionNames(Set[String])
+
+
+pure func exported_definition_name_demand_empty() -> ExportedDefinitionNameDemand:
+	NoExportedDefinitionNames
+
+
+pure func exported_definition_name_demand_add(
+	demand: ExportedDefinitionNameDemand,
+	name: String,
+) -> ExportedDefinitionNameDemand:
+	match demand:
+		NoExportedDefinitionNames:
+			OneExportedDefinitionName(name)
+		OneExportedDefinitionName(existing):
+			if existing == name:
+				demand
+			else:
+				MultipleExportedDefinitionNames(
+					Sets
+						.set()
+						.add(existing)
+						.add(name),
+				)
+		MultipleExportedDefinitionNames(names):
+			MultipleExportedDefinitionNames(names.add(name))
+
+
+pure func exported_definition_name_demand_contains(
+	demand: ExportedDefinitionNameDemand,
+	name: String,
+) -> Bool:
+	match demand:
+		NoExportedDefinitionNames:
+			False
+		OneExportedDefinitionName(requested_name):
+			requested_name == name
+		MultipleExportedDefinitionNames(names):
+			names.contains(name)
+
+
+pure func exported_definition_name_demand_is_empty(demand: ExportedDefinitionNameDemand) -> Bool:
+	match demand:
+		NoExportedDefinitionNames:
+			True
+		_:
+			False
+
+
 EXPORTED_DEFINITION_TARGETS_EMPTY: ExportedDefinitionTargets = into_opaque ExportedDefinitionTargets(
 	{}
 )
@@ -158,23 +219,6 @@ pure func exported_definition_targets_find(
 	representation
 		.get(name)
 		.map(func(target): (target.symbol, target.definition_ids))
-
-
-private record DefinitionTableRep {
-	module_table: ModuleTable,
-	first_graph_definition_id: Int,
-	rows: List[DefinitionRow]
-}
-
-
-opaque type DefinitionTable = DefinitionTableRep
-
-
-foreign(include: "definition_index_ffi.h"):
-	private pure func definition_tables_are_same_allocation(
-		left: DefinitionTable,
-		right: DefinitionTable,
-	) -> Bool = "blorp_compiler_definition_tables_are_same_allocation"
 
 
 union DefinitionIndexBindingKey:
@@ -363,24 +407,20 @@ private pure func definition_index_rep_row(
 	index: DefinitionIndexRep,
 	id: DefinitionId,
 ) -> Option[DefinitionRow]:
-	definition_table_rep_row(definition_table_rep(index.definition_table), id)
-
-
-private pure func definition_table_rep(table: DefinitionTable) -> DefinitionTableRep:
-	from_opaque DefinitionTable(table)
+	definition_table_rep_row(index.definition_table, id)
 
 
 private pure func definition_table_rep_row(
-	table: DefinitionTableRep,
+	table: DefinitionTable,
 	id: DefinitionId,
 ) -> Option[DefinitionRow]:
 	raw_id = definition_id_runtime_value(id)
-	row_index = raw_id - table.first_graph_definition_id
+	row_index = raw_id - definition_table_first_graph_definition_id(table)
 
 	if row_index < 0:
 		None
 	else:
-		table.rows.get(row_index)
+		definition_table_rows(table).get(row_index)
 
 
 pure func definition_index_definition_table(index: DefinitionIndex) -> DefinitionTable:
@@ -392,10 +432,9 @@ pure func definition_table_definition_id(
 	table: DefinitionTable,
 	runtime_definition_id: Int,
 ) -> Option[DefinitionId]:
-	representation = definition_table_rep(table)
 	id = definition_id(runtime_definition_id)
 
-	match definition_table_rep_row(representation, id):
+	match definition_table_rep_row(table, id):
 		Some(_):
 			Some(id)
 		None:
@@ -403,7 +442,7 @@ pure func definition_table_definition_id(
 
 
 pure func definition_table_row(table: DefinitionTable, id: DefinitionId) -> Option[DefinitionRow]:
-	definition_table_rep_row(definition_table_rep(table), id)
+	definition_table_rep_row(table, id)
 
 
 pure func definition_table_module_id(table: DefinitionTable, id: DefinitionId) -> Option[ModuleId]:
@@ -416,7 +455,7 @@ private pure func definition_table_id_with_kind(
 	expected_kind: DefinitionKind,
 ) -> Option[DefinitionId]:
 	id = definition_id(runtime_definition_id)
-	row ?= definition_table_rep_row(definition_table_rep(table), id)
+	row ?= definition_table_rep_row(table, id)
 
 	if row.kind == expected_kind:
 		Some(id)
@@ -430,7 +469,7 @@ private pure func definition_table_row_with_kind(
 	expected_kind: DefinitionKind,
 ) -> Option[DefinitionRow]:
 	id = definition_id(runtime_definition_id)
-	row ?= definition_table_rep_row(definition_table_rep(table), id)
+	row ?= definition_table_rep_row(table, id)
 
 	if row.kind == expected_kind:
 		Some(row)
@@ -567,7 +606,7 @@ pure func definition_table_field_row(table: DefinitionTable, id: FieldId) -> Opt
 
 
 pure func definition_table_module_table(table: DefinitionTable) -> ModuleTable:
-	definition_table_rep(table).module_table
+	definition_table_storage_module_table(table)
 
 
 pure func definition_table_is_compatible_with_module_table(
@@ -580,22 +619,27 @@ pure func definition_table_is_compatible_with_module_table(
 -- CTFE phase products must share the exact frozen definition authority. This
 -- O(1) provenance check avoids rescanning all rows once per imported module.
 pure func definition_tables_share_provenance(left: DefinitionTable, right: DefinitionTable) -> Bool:
-	definition_tables_are_same_allocation(left, right)
+	storage_tables_share_provenance(left, right)
 
 
 pure func definition_tables_are_compatible(left: DefinitionTable, right: DefinitionTable) -> Bool:
-	left_rep = definition_table_rep(left)
-	right_rep = definition_table_rep(right)
+	left_rows = definition_table_rows(left)
+	right_rows = definition_table_rows(right)
 	var compatible = (
-		left_rep.first_graph_definition_id == right_rep.first_graph_definition_id
-		and left_rep.rows.length() == right_rep.rows.length()
-		and module_tables_are_compatible(left_rep.module_table, right_rep.module_table)
+		definition_table_first_graph_definition_id(
+			left,
+		) == definition_table_first_graph_definition_id(right)
+		and left_rows.length() == right_rows.length()
+		and module_tables_are_compatible(
+			definition_table_module_table(left),
+			definition_table_module_table(right),
+		)
 	)
 
 	var index: Int = 0
 
-	while compatible and index < left_rep.rows.length():
-		match (left_rep.rows.get(index), right_rep.rows.get(index)):
+	while compatible and index < left_rows.length():
+		match (left_rows.get(index), right_rows.get(index)):
 			(Some(left_row), Some(right_row)):
 				compatible = (
 					module_ids_equal(left_row.module_id, right_row.module_id)
@@ -613,7 +657,7 @@ pure func definition_tables_are_compatible(left: DefinitionTable, right: Definit
 
 
 pure func definition_table_definition_count(table: DefinitionTable) -> Int:
-	definition_table_rep(table).rows.length()
+	definition_table_rows(table).length()
 
 
 private pure func definition_index_seed_from_env(env: Env) -> DefinitionIndexSeed:
@@ -637,11 +681,7 @@ private pure func definition_index_rep_empty(
 	empty_source_buckets: SourceDefinitionNameBuckets = {}
 	first_graph_definition_id = definition_index_seed_next_def_id(seed)
 	{
-		definition_table = into_opaque DefinitionTable({
-				module_table = module_table,
-				first_graph_definition_id = first_graph_definition_id,
-				rows = []
-			}),
+		definition_table = definition_table_from_rows(module_table, first_graph_definition_id, []),
 		func_callable_ids_by_module_and_name = empty_func_buckets.repeat(module_count),
 		source_definition_ids_by_module_and_name = empty_source_buckets.repeat(module_count),
 		func_callable_id_count = 0,
@@ -672,11 +712,11 @@ private pure func definition_index_build_empty(
 
 private pure func definition_index_from_build(build: DefinitionIndexBuildState) -> DefinitionIndex:
 	representation: DefinitionIndexRep = {
-		definition_table = into_opaque DefinitionTable({
-				module_table = build.module_table,
-				first_graph_definition_id = build.first_graph_definition_id,
-				rows = build.definition_rows
-			}),
+		definition_table = definition_table_from_rows(
+			build.module_table,
+			build.first_graph_definition_id,
+			build.definition_rows,
+		),
 		func_callable_ids_by_module_and_name = build.func_callable_ids_by_module_and_name,
 		source_definition_ids_by_module_and_name = build.source_definition_ids_by_module_and_name,
 		func_callable_id_count = build.func_callable_id_count,
@@ -974,8 +1014,9 @@ private pure func definition_index_binding_conflict(
 	existing_id: Option[Int],
 	def_id: Int,
 ) -> Option[DefinitionIndexConflict]:
-	table = definition_table_rep(index.definition_table)
-	row_frontier = table.first_graph_definition_id + table.rows.length()
+	row_frontier = definition_table_first_graph_definition_id(
+		index.definition_table,
+	) + definition_table_rows(index.definition_table).length()
 
 	match existing_id:
 		Some(existing_id):
@@ -998,7 +1039,6 @@ private pure func definition_index_add_func_callable_id(
 	def_id: Int,
 ) -> DefinitionIndexRep:
 	id = definition_id(def_id)
-	table = definition_table_rep(index.definition_table)
 	row = definition_row_for_func_callable_key(key)
 	module_index = module_id_table_index(func_callable_key_module_id(key))
 	name = func_callable_key_name(key)
@@ -1013,7 +1053,7 @@ private pure func definition_index_add_func_callable_id(
 					.append(id),
 			),
 		),
-		definition_table = into_opaque DefinitionTable({ table | rows = table.rows.append(row) }),
+		definition_table = definition_table_append_row(index.definition_table, row),
 		func_callable_id_count = index.func_callable_id_count + 1,
 		next_def_id = def_id + 1
 	}
@@ -1222,7 +1262,6 @@ private pure func definition_index_add_source_definition_id(
 	def_id: Int,
 ) -> DefinitionIndexRep:
 	id = definition_id(def_id)
-	table = definition_table_rep(index.definition_table)
 	row = definition_row_for_source_key(key)
 	module_index = module_id_table_index(source_definition_key_module_id(key))
 	name = source_definition_key_name(key)
@@ -1237,7 +1276,7 @@ private pure func definition_index_add_source_definition_id(
 					.append(id),
 			),
 		),
-		definition_table = into_opaque DefinitionTable({ table | rows = table.rows.append(row) }),
+		definition_table = definition_table_append_row(index.definition_table, row),
 		source_definition_id_count = index.source_definition_id_count + 1,
 		next_def_id = def_id + 1
 	}
@@ -1393,7 +1432,8 @@ pure func definition_index_exported_definition_targets(
 	module_id: ModuleId,
 	program: ParsedProgram,
 	surface: ModuleSurface,
-	requested_names: Option[Set[String]],
+	requested_names: Option[ExportedDefinitionNameDemand],
+	conservative_requested_names: ExportedDefinitionNameDemand,
 ) -> Option[ExportedDefinitionTargets]:
 	representation: DefinitionIndexRep = from_opaque DefinitionIndex(index)
 
@@ -1404,8 +1444,11 @@ pure func definition_index_exported_definition_targets(
 		None
 	else:
 		match requested_names:
-			Some(names):
-				if names.is_empty():
+			Some(demand):
+				if (
+					exported_definition_name_demand_is_empty(demand)
+					and exported_definition_name_demand_is_empty(conservative_requested_names)
+				):
 					Some(EXPORTED_DEFINITION_TARGETS_EMPTY)
 				else:
 					Some(
@@ -1414,7 +1457,15 @@ pure func definition_index_exported_definition_targets(
 							module_id,
 							program,
 							surface,
-							surface.exports.filter(func(symbol): names.contains(symbol.name)),
+							surface.exports.filter(func(symbol):
+								(
+									exported_definition_name_demand_contains(demand, symbol.name)
+									or exported_definition_name_demand_contains(
+										conservative_requested_names,
+										symbol.name,
+									)
+								)
+							),
 						),
 					)
 			None:
@@ -1737,10 +1788,10 @@ pure func definition_index_rebase_module_table(
 					valid = False
 
 		if valid:
-			current_definition_table = definition_table_rep(representation.definition_table)
 			Some(into_opaque DefinitionIndex({ representation |
-						definition_table = into_opaque DefinitionTable(
-							{ current_definition_table | module_table = next_table }
+						definition_table = definition_table_with_module_table(
+							representation.definition_table,
+							next_table,
 						),
 						func_callable_ids_by_module_and_name = callable_buckets,
 						source_definition_ids_by_module_and_name = source_buckets

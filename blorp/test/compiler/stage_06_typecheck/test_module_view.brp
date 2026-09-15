@@ -6,12 +6,14 @@ import:
 	../../../src/compiler/stage_04_modules/module_table: module_ids_equal
 	../../../src/compiler/stage_06_typecheck/graph/definition_index:
 		DefinitionTable,
-		definition_index_find_type_definition_id,
 		definition_ids_equal,
+		definition_index_constructor_definition_ids_for_export,
+		definition_index_find_type_definition_id,
 		definition_table_definition_id,
 	../../../src/compiler/stage_06_typecheck/graph/indexed_graph:
 		prepared_module_scope_definition_index,
 		prepared_module_scope_graph_module_name_scope,
+		prepared_module_scope_graph_source_name_table,
 		prepared_module_scope_id,
 		prepared_module_scope_module_table,
 	../../../src/compiler/stage_06_typecheck/graph/source_name_table:
@@ -26,7 +28,26 @@ import:
 			StandaloneSelectiveDefinitionBinding,
 		),
 	../../../src/compiler/stage_06_typecheck/modules/module_view:
+		BoundCandidate(
+			BoundLocalNameAcceptedCandidate,
+			BoundLocalNameAlreadyPresentCandidate,
+			BoundQualifiedImportAcceptedCandidate,
+			BoundQualifiedImportAlreadyPresentCandidate,
+			BoundSelectiveDefinitionAcceptedCandidate,
+			BoundSelectiveDefinitionAliasConflictCandidate,
+			BoundSelectiveDefinitionInvalidSourceCandidate,
+			BoundSelectiveDefinitionInvalidTargetCandidate,
+			BoundSelectiveDefinitionSelectiveConflictCandidate,
+		),
 		COMPILER_MODULE_VIEW_EMPTY,
+		GraphModuleAliasAdmission(GraphModuleAliasAdded, GraphModuleAliasAlreadyPresent),
+		GraphSelectiveAdmission(
+			GraphSelectiveAdded,
+			GraphSelectiveConflictsWithAlias,
+			GraphSelectiveConflictsWithImportedName,
+			GraphSelectiveInvalidSourceName,
+			GraphSelectiveInvalidTarget,
+		),
 		ImportedConstructorBinding,
 		LocalNameRegistration(
 			LocalNameAdded,
@@ -52,24 +73,34 @@ import:
 			SelectiveNameInvalidTarget,
 		),
 		TopLevelNameKind(TopLevelFunction, TopLevelType),
+		bound_candidate_row_index,
+		graph_import_admission_begin,
+		graph_import_admission_finish,
+		graph_import_admission_record_constructor,
+		graph_import_admission_register_alias,
+		graph_import_admission_register_constructor,
+		graph_import_admission_register_selective_definition,
+		graph_import_admission_register_selective_trait_method,
 		module_view_accepted_alias_authority,
+		module_view_accepted_constructor_bindings,
 		module_view_accepted_record_authority,
 		module_view_accepted_union_authority,
-		module_view_find_imported_name,
+		module_view_bind_initial_graph_local_names,
+		module_view_bound_candidates,
 		module_view_find_graph_module_alias,
+		module_view_find_imported_name,
 		module_view_find_local_name,
 		module_view_find_standalone_module_alias,
-		module_view_bind_initial_graph_local_names,
 		module_view_for_graph,
 		module_view_graph_bound_name_count,
 		module_view_has_selective_binding,
 		module_view_import_bindings,
-		module_view_imported_names,
 		module_view_imported_constructors,
+		module_view_imported_names,
 		module_view_record_imported_constructor,
+		module_view_register_graph_selective_trait_method,
 		module_view_register_local_name,
 		module_view_register_local_name_for_graph,
-		module_view_register_graph_selective_trait_method,
 		module_view_register_module_alias_target,
 		module_view_register_selective_name,
 		module_view_register_selective_name_for_graph,
@@ -200,14 +231,23 @@ func test_module_view_preserves_imported_constructor_parent() -> Bool:
 	}
 	view = module_view_record_imported_constructor(COMPILER_MODULE_VIEW_EMPTY, binding)
 
-	module_view_imported_constructors(view) == [binding]
+	match view:
+		Some(registered):
+			module_view_imported_constructors(registered) == [binding]
+		None:
+			False
 
 
 func test_fresh_graph_view_rejects_standalone_module_alias() -> Bool:
 	match definition_backed_source_fixture("app/main", "func GraphAlias() -> Int: 1"):
 		Some(scope):
 			view = module_view_for_graph(prepared_module_scope_graph_module_name_scope(scope))
-			match module_view_register_standalone_module_alias(view, "Standalone", "pkg/standalone"):
+
+			match module_view_register_standalone_module_alias(
+				view,
+				"Standalone",
+				"pkg/standalone",
+			):
 				ModuleAliasInvalidTarget:
 					(
 						module_view_find_standalone_module_alias(view, "Standalone").is_none()
@@ -223,6 +263,7 @@ func test_fresh_graph_view_rejects_standalone_selective_name() -> Bool:
 	match definition_backed_source_fixture("app/main", "func GraphAlias() -> Int: 1"):
 		Some(scope):
 			view = module_view_for_graph(prepared_module_scope_graph_module_name_scope(scope))
+
 			match module_view_register_selective_name(view, "map", "list", "map"):
 				SelectiveNameInvalidTarget:
 					(
@@ -239,6 +280,7 @@ func test_fresh_graph_view_rejects_standalone_local_name() -> Bool:
 	match definition_backed_source_fixture("app/main", "func GraphLocal() -> Int: 1"):
 		Some(scope):
 			view = module_view_for_graph(prepared_module_scope_graph_module_name_scope(scope))
+
 			match module_view_register_local_name(view, "GraphLocal", TopLevelFunction):
 				LocalNameInvalidSourceName:
 					module_view_find_local_name(view, "GraphLocal").is_none()
@@ -252,6 +294,7 @@ func test_graph_local_name_has_one_bound_row_and_clears() -> Bool:
 	match definition_backed_source_fixture("app/main", "func GraphLocal() -> Int: 1"):
 		Some(scope):
 			view = module_view_for_graph(prepared_module_scope_graph_module_name_scope(scope))
+
 			match module_view_register_local_name_for_graph(
 				view,
 				prepared_module_scope_module_table(scope),
@@ -261,9 +304,13 @@ func test_graph_local_name_has_one_bound_row_and_clears() -> Bool:
 			):
 				LocalNameAdded(with_local):
 					cleared = module_view_without_unqualified_names(with_local)
+
 					(
 						module_view_graph_bound_name_count(with_local) == 1
-						and module_view_find_local_name(with_local, "GraphLocal") == Some(TopLevelFunction)
+						and module_view_find_local_name(
+							with_local,
+							"GraphLocal",
+						) == Some(TopLevelFunction)
 						and module_view_graph_bound_name_count(cleared) == 0
 						and module_view_find_local_name(cleared, "GraphLocal").is_none()
 					)
@@ -274,24 +321,35 @@ func test_graph_local_name_has_one_bound_row_and_clears() -> Bool:
 
 
 func test_graph_local_names_span_wide_source_indexes_and_clear() -> Bool:
-	match definition_backed_type_fixture([{
-		module_path = "app/main",
-		type_names = []
-	}]):
+	match (
+		definition_backed_type_fixture(
+			[
+				{
+					module_path = "app/main",
+					type_names = []
+				},
+			],
+		)
+	):
 		None:
 			False
 		Some(scope):
 			-- Forty names expose wide-index mistakes that one-row fixtures miss.
 			var candidates: List[String] = []
+
 			for index in 0..40:
 				candidates = candidates.append("Local_" + index.to_string())
+
 			table = prepared_module_scope_module_table(scope)
 			module_id = prepared_module_scope_id(scope)
-			var view = module_view_for_graph(graph_module_name_scope(
-				graph_source_name_table(table, candidates),
-				module_id,
-			))
+			var view = module_view_for_graph(
+				graph_module_name_scope(
+					graph_source_name_table(table, candidates),
+					module_id,
+				),
+			)
 			var registered_all: Bool = True
+
 			for name in candidates:
 				match module_view_register_local_name_for_graph(
 					view,
@@ -304,7 +362,9 @@ func test_graph_local_names_span_wide_source_indexes_and_clear() -> Bool:
 						view = next
 					_:
 						registered_all = False
+
 			cleared = module_view_without_unqualified_names(view)
+
 			(
 				registered_all
 				and module_view_graph_bound_name_count(view) == candidates.length()
@@ -318,9 +378,18 @@ func test_graph_local_names_span_wide_source_indexes_and_clear() -> Bool:
 
 private pure func graph_binding_log_preserves_interleaved_admission_order_result() -> Option[Bool]:
 	scope ?= definition_backed_type_fixture([
-		{ module_path = "app/main", type_names = [] },
-		{ module_path = "dep/first", type_names = ["Token"] },
-		{ module_path = "dep/second", type_names = [] },
+		{
+			module_path = "app/main",
+			type_names = []
+		},
+		{
+			module_path = "dep/first",
+			type_names = ["Token"]
+		},
+		{
+			module_path = "dep/second",
+			type_names = []
+		},
 	])
 	table = prepared_module_scope_module_table(scope)
 	current_id = prepared_module_scope_id(scope)
@@ -328,20 +397,34 @@ private pure func graph_binding_log_preserves_interleaved_admission_order_result
 	second_id ?= module_id_fixture_find(scope, "dep/second")
 	definition_index = prepared_module_scope_definition_index(scope)
 	definition_table = definition_backed_type_fixture_definition_table(scope)
-	raw_id ?= definition_index_find_type_definition_id(
-		definition_index, table, first_id, "Token",
-	)
+	raw_id ?= definition_index_find_type_definition_id(definition_index, table, first_id, "Token")
 	definition_id ?= definition_table_definition_id(definition_table, raw_id)
-	initial = module_view_for_graph(graph_module_name_scope(
-		graph_source_name_table(table, ["Second", "Selected", "First", "Method"]),
-		current_id,
-	))
+	initial = module_view_for_graph(
+		graph_module_name_scope(
+			graph_source_name_table(
+				table,
+				["Second", "Selected", "First", "Method", "Token", "method"],
+			),
+			current_id,
+		),
+	)
+
 	first = match module_view_register_module_alias_target(
-		initial, table, current_id, "First", "dep/first", table, first_id,
+		initial,
+		table,
+		current_id,
+		"First",
+		"dep/first",
+		table,
+		first_id,
 	):
-		ModuleAliasAdded(view): Some(view)
-		_: None
+		ModuleAliasAdded(view):
+			Some(view)
+		_:
+			None
+
 	first_view ?= first
+
 	selected = match module_view_register_selective_name_for_graph(
 		first_view,
 		current_id,
@@ -353,15 +436,29 @@ private pure func graph_binding_log_preserves_interleaved_admission_order_result
 		first_id,
 		[definition_id],
 	):
-		SelectiveNameAdded(view): Some(view)
-		_: None
+		SelectiveNameAdded(view):
+			Some(view)
+		_:
+			None
+
 	selected_view ?= selected
+
 	second = match module_view_register_module_alias_target(
-		selected_view, table, current_id, "Second", "dep/second", table, second_id,
+		selected_view,
+		table,
+		current_id,
+		"Second",
+		"dep/second",
+		table,
+		second_id,
 	):
-		ModuleAliasAdded(view): Some(view)
-		_: None
+		ModuleAliasAdded(view):
+			Some(view)
+		_:
+			None
+
 	second_view ?= second
+
 	method = match module_view_register_graph_selective_trait_method(
 		second_view,
 		current_id,
@@ -373,60 +470,104 @@ private pure func graph_binding_log_preserves_interleaved_admission_order_result
 		first_id,
 		[],
 	):
-		SelectiveNameAdded(view): Some(view)
-		_: None
+		SelectiveNameAdded(view):
+			Some(view)
+		_:
+			None
+
 	method_view ?= method
 	bindings = module_view_import_bindings(method_view)
+
 	first_matches = match bindings.get(0):
 		Some(GraphQualifiedModuleBinding(name, module_id)):
 			name == "First" and module_ids_equal(module_id, first_id)
 		_:
 			False
+
 	selected_matches = match bindings.get(1):
 		Some(GraphSelectiveDefinitionBinding(name, module_id, ids)):
 			name == "Selected" and module_ids_equal(module_id, first_id) and ids.length() == 1
 		_:
 			False
+
 	second_matches = match bindings.get(2):
 		Some(GraphQualifiedModuleBinding(name, module_id)):
 			name == "Second" and module_ids_equal(module_id, second_id)
 		_:
 			False
+
 	method_matches = match bindings.get(3):
 		Some(GraphSelectiveTraitMethodBinding(name, module_id, source_name, ids)):
-			name == "Method" and module_ids_equal(module_id, first_id) and source_name == "method" and ids.is_empty()
+			(
+				name == "Method"
+				and module_ids_equal(module_id, first_id)
+				and source_name == "method"
+				and ids.is_empty()
+			)
 		_:
 			False
+
 	selected_names = module_view_imported_names(selected_view)
 	second_names = module_view_imported_names(second_view)
 	method_names = module_view_imported_names(method_view)
-	Some(
-		module_view_import_bindings(initial).is_empty()
-		and module_view_imported_names(initial).is_empty()
-		and module_view_import_bindings(first_view).length() == 1
-		and module_view_imported_names(first_view).is_empty()
-		and module_view_import_bindings(selected_view).length() == 2
-		and selected_names.length() == 1
-		and selected_names.get(0).map(func(item):
-			item.local_name == "Selected" and item.module_path == "dep/first" and item.original_name == "Token"
-		).get_or(False)
-		and module_view_import_bindings(second_view).length() == 3
-		and bindings.length() == 4
-		and second_names.length() == 1
-		and second_names.get(0).map(func(item):
-			item.local_name == "Selected" and item.module_path == "dep/first" and item.original_name == "Token"
-		).get_or(False)
-		and method_names.length() == 2
-		and method_names.get(0).map(func(item):
-			item.local_name == "Selected" and item.module_path == "dep/first" and item.original_name == "Token"
-		).get_or(False)
-		and method_names.get(1).map(func(item):
-			item.local_name == "Method" and item.module_path == "dep/first" and item.original_name == "method"
-		).get_or(False)
-		and first_matches and selected_matches and second_matches and method_matches
-		and module_view_find_graph_module_alias(second_view, "First") == Some(first_id)
-		and module_view_find_graph_module_alias(second_view, "Second") == Some(second_id)
-	)
+	Some((
+			module_view_import_bindings(initial).is_empty()
+			and module_view_imported_names(initial).is_empty()
+			and module_view_import_bindings(first_view).length() == 1
+			and module_view_imported_names(first_view).is_empty()
+			and module_view_import_bindings(selected_view).length() == 2
+			and selected_names.length() == 1
+			and selected_names
+				.get(0)
+				.map(func(item):
+					(
+						item.local_name == "Selected"
+						and item.module_path == "dep/first"
+						and item.original_name == "Token"
+					)
+				)
+				.get_or(False)
+			and module_view_import_bindings(second_view).length() == 3
+			and bindings.length() == 4
+			and second_names.length() == 1
+			and second_names
+				.get(0)
+				.map(func(item):
+					(
+						item.local_name == "Selected"
+						and item.module_path == "dep/first"
+						and item.original_name == "Token"
+					)
+				)
+				.get_or(False)
+			and method_names.length() == 2
+			and method_names
+				.get(0)
+				.map(func(item):
+					(
+						item.local_name == "Selected"
+						and item.module_path == "dep/first"
+						and item.original_name == "Token"
+					)
+				)
+				.get_or(False)
+			and method_names
+				.get(1)
+				.map(func(item):
+					(
+						item.local_name == "Method"
+						and item.module_path == "dep/first"
+						and item.original_name == "method"
+					)
+				)
+				.get_or(False)
+			and first_matches
+			and selected_matches
+			and second_matches
+			and method_matches
+			and module_view_find_graph_module_alias(second_view, "First") == Some(first_id)
+			and module_view_find_graph_module_alias(second_view, "Second") == Some(second_id)
+		))
 
 
 func test_graph_binding_log_preserves_interleaved_admission_order() -> Bool:
@@ -435,39 +576,88 @@ func test_graph_binding_log_preserves_interleaved_admission_order() -> Bool:
 
 private pure func qualified_alias_resolution_requires_exact_view_owner_result() -> Option[Bool]:
 	scope ?= definition_backed_type_fixture([
-		{ module_path = "app/main", type_names = [] },
-		{ module_path = "dep/target", type_names = [] },
+		{
+			module_path = "app/main",
+			type_names = []
+		},
+		{
+			module_path = "dep/target",
+			type_names = []
+		},
 	])
 	table = prepared_module_scope_module_table(scope)
 	current_id = prepared_module_scope_id(scope)
 	target_id ?= module_id_fixture_find(scope, "dep/target")
-	view = module_view_for_graph(graph_module_name_scope(
-		graph_source_name_table(table, ["Target"]),
-		current_id,
-	))
+	graph_names = graph_source_name_table(table, ["Target"])
+	name_scope = graph_module_name_scope(graph_names, current_id)
+	view = module_view_for_graph(name_scope)
+
 	with_alias = match module_view_register_module_alias_target(
-		view, table, current_id, "Target", "dep/target", table, target_id,
+		view,
+		table,
+		current_id,
+		"Target",
+		"dep/target",
+		table,
+		target_id,
 	):
-		ModuleAliasAdded(next): Some(next)
-		_: None
+		ModuleAliasAdded(next):
+			Some(next)
+		_:
+			None
+
 	alias_view ?= with_alias
 	foreign_scope ?= definition_backed_type_fixture([
-		{ module_path = "app/main", type_names = [] },
-		{ module_path = "dep/target", type_names = [] },
+		{
+			module_path = "app/main",
+			type_names = []
+		},
+		{
+			module_path = "dep/target",
+			type_names = []
+		},
 	])
 	foreign_table = prepared_module_scope_module_table(foreign_scope)
 	source_type: SemanticType = SemanticNamedType("Target.Token", [])
-	valid = resolve_graph_qualified_type_names(Some(table), Some(current_id), alias_view, source_type)
-	sibling = resolve_graph_qualified_type_names(Some(table), Some(target_id), alias_view, source_type)
-	foreign_resolution = resolve_graph_qualified_type_names(
-		Some(foreign_table), Some(prepared_module_scope_id(foreign_scope)), alias_view, source_type,
+	valid = resolve_graph_qualified_type_names(
+		Some(graph_names),
+		Some(current_id),
+		alias_view,
+		source_type,
 	)
+	sibling = resolve_graph_qualified_type_names(
+		Some(graph_names),
+		Some(target_id),
+		alias_view,
+		source_type,
+	)
+	foreign_resolution = resolve_graph_qualified_type_names(
+		Some(prepared_module_scope_graph_source_name_table(foreign_scope)),
+		Some(prepared_module_scope_id(foreign_scope)),
+		alias_view,
+		source_type,
+	)
+	reminted_resolution = resolve_graph_qualified_type_names(
+		Some(graph_source_name_table(table, ["Target"])),
+		Some(current_id),
+		alias_view,
+		source_type,
+	)
+
 	valid_matches = match valid:
 		SemanticNamedType(name, args):
 			name == canonical_module_type_name("dep/target", "Token") and args.is_empty()
 		_:
 			False
-	Some(valid_matches and sibling == source_type and foreign_resolution == source_type)
+
+	Some(
+		(
+			valid_matches
+			and sibling == source_type
+			and foreign_resolution == source_type
+			and reminted_resolution == source_type
+		),
+	)
 
 
 func test_qualified_alias_resolution_requires_exact_view_owner() -> Bool:
@@ -475,33 +665,55 @@ func test_qualified_alias_resolution_requires_exact_view_owner() -> Bool:
 
 
 func test_initial_graph_local_batch_publishes_one_immutable_view() -> Bool:
-	match definition_backed_type_fixture([{
-		module_path = "app/main",
-		type_names = []
-	}]):
+	match (
+		definition_backed_type_fixture(
+			[
+				{
+					module_path = "app/main",
+					type_names = []
+				},
+			],
+		)
+	):
 		None:
 			False
 		Some(scope):
 			var source_names: List[String] = []
 			var local_names: List[(String, TopLevelNameKind)] = []
+
 			for index in 0..40:
 				name = "Local_" + index.to_string()
 				source_names = source_names.append(name)
 				local_names = local_names.append((name, TopLevelFunction))
+
 			local_names = local_names.append(("Local_31", TopLevelType))
 			table = prepared_module_scope_module_table(scope)
 			module_id = prepared_module_scope_id(scope)
-			initial = module_view_for_graph(graph_module_name_scope(
-				graph_source_name_table(table, source_names),
+			initial = module_view_for_graph(
+				graph_module_name_scope(
+					graph_source_name_table(table, source_names),
+					module_id,
+				),
+			)
+
+			match module_view_bind_initial_graph_local_names(
+				initial,
+				table,
 				module_id,
-			))
-			match module_view_bind_initial_graph_local_names(initial, table, module_id, local_names):
+				local_names,
+			):
 				Some(published):
 					(
 						module_view_graph_bound_name_count(initial) == 0
 						and module_view_graph_bound_name_count(published) == 40
-						and module_view_find_local_name(published, "Local_31") == Some(TopLevelFunction)
-						and module_view_find_local_name(published, "Local_32") == Some(TopLevelFunction)
+						and module_view_find_local_name(
+							published,
+							"Local_31",
+						) == Some(TopLevelFunction)
+						and module_view_find_local_name(
+							published,
+							"Local_32",
+						) == Some(TopLevelFunction)
 						and module_view_bind_initial_graph_local_names(
 							published,
 							table,
@@ -521,10 +733,14 @@ func test_initial_graph_local_batch_publishes_one_immutable_view() -> Bool:
 
 
 private pure func graph_selective_then_alias_share_one_row_result() -> Option[Bool]:
-	scope ?= definition_backed_type_fixture([{
-		module_path = "dep",
-		type_names = ["Token"]
-	}])
+	scope ?= definition_backed_type_fixture(
+		[
+			{
+				module_path = "dep",
+				type_names = ["Token"]
+			},
+		],
+	)
 	module_table = prepared_module_scope_module_table(scope)
 	module_id = prepared_module_scope_id(scope)
 	definition_index = prepared_module_scope_definition_index(scope)
@@ -562,6 +778,8 @@ private pure func graph_selective_then_alias_share_one_row_result() -> Option[Bo
 				ModuleAliasAdded(with_both):
 					cleared = module_view_without_unqualified_names(with_both)
 					bindings = module_view_import_bindings(with_both)
+					cleared_candidates = module_view_bound_candidates(cleared)
+
 					selective_first = match bindings.get(0):
 						Some(GraphSelectiveDefinitionBinding(name, target, ids)):
 							matches_id = match ids.get(0):
@@ -569,21 +787,44 @@ private pure func graph_selective_then_alias_share_one_row_result() -> Option[Bo
 									definition_ids_equal(id, definition_id)
 								None:
 									False
-							name == "Token" and module_ids_equal(target, module_id) and ids.length() == 1 and matches_id
+
+							(
+								name == "Token"
+								and module_ids_equal(target, module_id)
+								and ids.length() == 1
+								and matches_id
+							)
 						_:
 							False
+
 					qualified_second = match bindings.get(1):
 						Some(GraphQualifiedModuleBinding(name, target)):
 							name == "Token" and module_ids_equal(target, module_id)
 						_:
 							False
+
+					qualified_keeps_issued_row = match cleared_candidates.get(0):
+						Some(BoundQualifiedImportAcceptedCandidate(row_id, name, target)):
+							(
+								bound_candidate_row_index(row_id) == 1
+								and name == "Token"
+								and module_ids_equal(target, module_id)
+							)
+						_:
+							False
+
 					(
 						module_view_graph_bound_name_count(with_both) == 1
-						and module_view_find_graph_module_alias(with_both, "Token") == Some(module_id)
+						and module_view_find_graph_module_alias(
+							with_both,
+							"Token",
+						) == Some(module_id)
 						and module_view_has_selective_binding(with_both, "Token", "dep", "Token")
 						and bindings.length() == 2
 						and selective_first
 						and qualified_second
+						and cleared_candidates.length() == 1
+						and qualified_keeps_issued_row
 						and module_view_graph_bound_name_count(cleared) == 1
 						and module_view_find_graph_module_alias(cleared, "Token") == Some(module_id)
 						and module_view_find_imported_name(cleared, "Token").is_none()
@@ -600,11 +841,648 @@ func test_graph_selective_then_alias_share_one_row() -> Bool:
 	graph_selective_then_alias_share_one_row_result().get_or(False)
 
 
-private pure func graph_alias_then_selective_share_one_row_result() -> Option[Bool]:
-	scope ?= definition_backed_type_fixture([{
+private pure func graph_import_admission_publishes_once_result() -> Option[Bool]:
+	scope ?= definition_backed_type_fixture(
+		[
+			{
+				module_path = "dep",
+				type_names = ["Token"]
+			},
+		],
+	)
+	module_table = prepared_module_scope_module_table(scope)
+	module_id = prepared_module_scope_id(scope)
+	definition_index = prepared_module_scope_definition_index(scope)
+	definition_table = definition_backed_type_fixture_definition_table(scope)
+	raw_id ?= definition_index_find_type_definition_id(
+		definition_index,
+		module_table,
+		module_id,
+		"Token",
+	)
+	definition_id ?= definition_table_definition_id(definition_table, raw_id)
+	initial = module_view_for_graph(prepared_module_scope_graph_module_name_scope(scope))
+	admission ?= graph_import_admission_begin(initial, module_table, module_id)
+
+	selected = match graph_import_admission_register_selective_definition(
+		admission,
+		module_id,
+		definition_table,
+		definition_table,
+		"Token",
+		"dep",
+		"Token",
+		module_id,
+		[definition_id],
+	):
+		GraphSelectiveAdded(next):
+			Some(next)
+		_:
+			None
+
+	with_selective ?= selected
+
+	aliased = match graph_import_admission_register_alias(
+		with_selective,
+		module_table,
+		module_id,
+		"Token",
+		"dep",
+		module_table,
+		module_id,
+	):
+		GraphModuleAliasAdded(next):
+			Some(next)
+		_:
+			None
+
+	with_both ?= aliased
+
+	duplicate_alias = match graph_import_admission_register_alias(
+		with_both,
+		module_table,
+		module_id,
+		"Token",
+		"dep",
+		module_table,
+		module_id,
+	):
+		GraphModuleAliasAlreadyPresent(_):
+			True
+		_:
+			False
+
+	duplicate_selective = match graph_import_admission_register_selective_definition(
+		with_both,
+		module_id,
+		definition_table,
+		definition_table,
+		"Token",
+		"dep",
+		"Token",
+		module_id,
+		[definition_id],
+	):
+		GraphSelectiveConflictsWithImportedName(_, _):
+			True
+		_:
+			False
+
+	published = graph_import_admission_finish(with_both)
+	bindings = module_view_import_bindings(published)
+
+	first_is_selective = match bindings.get(0):
+		Some(GraphSelectiveDefinitionBinding(name, target, _)):
+			name == "Token" and module_ids_equal(target, module_id)
+		_:
+			False
+
+	second_is_alias = match bindings.get(1):
+		Some(GraphQualifiedModuleBinding(name, target)):
+			name == "Token" and module_ids_equal(target, module_id)
+		_:
+			False
+
+	Some(
+		(
+			module_view_graph_bound_name_count(initial) == 0
+			and module_view_import_bindings(initial).is_empty()
+			and module_view_graph_bound_name_count(published) == 1
+			and module_view_has_selective_binding(published, "Token", "dep", "Token")
+			and module_view_find_graph_module_alias(published, "Token") == Some(module_id)
+			and bindings.length() == 2
+			and first_is_selective
+			and second_is_alias
+			and duplicate_alias
+			and duplicate_selective
+		),
+	)
+
+
+func test_graph_import_admission_publishes_once() -> Bool:
+	graph_import_admission_publishes_once_result().get_or(False)
+
+
+private pure func graph_candidate_log_owns_order_and_outcomes_result() -> Option[Bool]:
+	scope ?= definition_backed_type_fixture(
+		[
+			{
+				module_path = "dep",
+				type_names = ["Token"]
+			},
+		],
+	)
+	module_table = prepared_module_scope_module_table(scope)
+	module_id = prepared_module_scope_id(scope)
+	definition_index = prepared_module_scope_definition_index(scope)
+	definition_table = definition_backed_type_fixture_definition_table(scope)
+	raw_id ?= definition_index_find_type_definition_id(
+		definition_index,
+		module_table,
+		module_id,
+		"Token",
+	)
+	definition_id ?= definition_table_definition_id(definition_table, raw_id)
+	initial = module_view_for_graph(
+		graph_module_name_scope(
+			graph_source_name_table(
+				module_table,
+				["Local", "Token"],
+			),
+			module_id,
+		),
+	)
+	with_locals ?= module_view_bind_initial_graph_local_names(
+		initial,
+		module_table,
+		module_id,
+		[("Local", TopLevelFunction), ("Local", TopLevelType)],
+	)
+	admission ?= graph_import_admission_begin(with_locals, module_table, module_id)
+
+	with_selective ?= match graph_import_admission_register_selective_definition(
+		admission,
+		module_id,
+		definition_table,
+		definition_table,
+		"Token",
+		"dep",
+		"Token",
+		module_id,
+		[definition_id],
+	):
+		GraphSelectiveAdded(next):
+			Some(next)
+		_:
+			None
+
+	with_alias ?= match graph_import_admission_register_alias(
+		with_selective,
+		module_table,
+		module_id,
+		"Token",
+		"dep",
+		module_table,
+		module_id,
+	):
+		GraphModuleAliasAdded(next):
+			Some(next)
+		_:
+			None
+
+	with_duplicate_alias ?= match graph_import_admission_register_alias(
+		with_alias,
+		module_table,
+		module_id,
+		"Token",
+		"dep",
+		module_table,
+		module_id,
+	):
+		GraphModuleAliasAlreadyPresent(next):
+			Some(next)
+		_:
+			None
+
+	with_duplicate_selective ?= match graph_import_admission_register_selective_definition(
+		with_duplicate_alias,
+		module_id,
+		definition_table,
+		definition_table,
+		"Token",
+		"dep",
+		"Token",
+		module_id,
+		[definition_id],
+	):
+		GraphSelectiveConflictsWithImportedName(next, _):
+			Some(next)
+		_:
+			None
+
+	published = graph_import_admission_finish(with_duplicate_selective)
+	candidates = module_view_bound_candidates(published)
+
+	local_first = match candidates.get(0):
+		Some(BoundLocalNameAcceptedCandidate(row_id, "Local", TopLevelFunction)):
+			bound_candidate_row_index(row_id) == 0
+		_:
+			False
+
+	local_duplicate = match candidates.get(1):
+		Some(BoundLocalNameAlreadyPresentCandidate(row_id, "Local", TopLevelType, winner_id)):
+			bound_candidate_row_index(row_id) == 1 and bound_candidate_row_index(winner_id) == 0
+		_:
+			False
+
+	selective_accepted = match candidates.get(2):
+		Some(BoundSelectiveDefinitionAcceptedCandidate(row_id, "Token", _, _)):
+			bound_candidate_row_index(row_id) == 2
+		_:
+			False
+
+	alias_accepted = match candidates.get(3):
+		Some(BoundQualifiedImportAcceptedCandidate(row_id, "Token", _)):
+			bound_candidate_row_index(row_id) == 3
+		_:
+			False
+
+	alias_duplicate = match candidates.get(4):
+		Some(BoundQualifiedImportAlreadyPresentCandidate(row_id, "Token", _, winner_id)):
+			bound_candidate_row_index(row_id) == 4 and bound_candidate_row_index(winner_id) == 3
+		_:
+			False
+
+	selective_conflict = match candidates.get(5):
+		Some(BoundSelectiveDefinitionSelectiveConflictCandidate(row_id, "Token", _, _, winner_id)):
+			bound_candidate_row_index(row_id) == 5 and bound_candidate_row_index(winner_id) == 2
+		_:
+			False
+
+	Some(
+		(
+			candidates.length() == 6
+			and module_view_import_bindings(published).length() == 2
+			and local_first
+			and local_duplicate
+			and selective_accepted
+			and alias_accepted
+			and alias_duplicate
+			and selective_conflict
+		),
+	)
+
+
+func test_graph_candidate_log_owns_order_and_outcomes() -> Bool:
+	graph_candidate_log_owns_order_and_outcomes_result().get_or(False)
+
+
+-- This low-level fixture uses a real constructor ID; the full source-level
+-- and accepted-union join is also covered by the declaration suite.
+private pure func graph_constructor_annotation_requires_admitted_name_result() -> Option[Bool]:
+	scope ?= definition_backed_source_fixture("dep", "union Choice:\n\tDone")
+	module_table = prepared_module_scope_module_table(scope)
+	module_id = prepared_module_scope_id(scope)
+	definition_index = prepared_module_scope_definition_index(scope)
+	definition_table = definition_backed_type_fixture_definition_table(scope)
+	constructor_ids ?= definition_index_constructor_definition_ids_for_export(
+		definition_index,
+		module_table,
+		module_id,
+		"Done",
+		"Choice",
+	)
+	initial = module_view_for_graph(prepared_module_scope_graph_module_name_scope(scope))
+	admission ?= graph_import_admission_begin(initial, module_table, module_id)
+	binding: ImportedConstructorBinding = {
+		local_name = "Done",
 		module_path = "dep",
-		type_names = ["Token"]
-	}])
+		parent_local_name = "Choice",
+		parent_name = "Choice",
+		original_name = "Done"
+	}
+	invalid_before_admission = graph_import_admission_record_constructor(
+		admission,
+		binding,
+	).is_none()
+	invalid_scalar_before_admission = module_view_record_imported_constructor(
+		initial,
+		binding,
+	).is_none()
+
+	wrong_constructor_target = match graph_import_admission_register_constructor(
+		admission,
+		module_id,
+		definition_table,
+		definition_table,
+		{ binding | module_path = "other" },
+		module_id,
+		constructor_ids,
+	):
+		GraphSelectiveInvalidTarget(_):
+			True
+		_:
+			False
+
+	trait_selected = match graph_import_admission_register_selective_trait_method(
+		admission,
+		module_id,
+		definition_table,
+		definition_table,
+		"Done",
+		"dep",
+		"Done",
+		module_id,
+		[],
+	):
+		GraphSelectiveAdded(next):
+			Some(next)
+		_:
+			None
+
+	trait_admission ?= trait_selected
+	trait_annotation_rejected = graph_import_admission_record_constructor(
+		trait_admission,
+		binding,
+	).is_none()
+
+	selected = match graph_import_admission_register_selective_definition(
+		admission,
+		module_id,
+		definition_table,
+		definition_table,
+		"Done",
+		"dep",
+		"Done",
+		module_id,
+		constructor_ids,
+	):
+		GraphSelectiveAdded(next):
+			Some(next)
+		_:
+			None
+
+	with_selective ?= selected
+	annotated ?= graph_import_admission_record_constructor(with_selective, binding)
+
+	with_alias = match graph_import_admission_register_alias(
+		annotated,
+		module_table,
+		module_id,
+		"Done",
+		"dep",
+		module_table,
+		module_id,
+	):
+		GraphModuleAliasAdded(next):
+			Some(next)
+		_:
+			None
+
+	aliased ?= with_alias
+	published = graph_import_admission_finish(aliased)
+	qualified_only = module_view_without_unqualified_names(published)
+	projected ?= module_view_imported_constructors(published).get(0)
+	exact_constructor ?= module_view_accepted_constructor_bindings(published).get(0)
+	exact_constructor_id ?= exact_constructor.definition_ids.get(0)
+	expected_constructor_id ?= constructor_ids.get(0)
+
+	first_alias = match graph_import_admission_register_alias(
+		admission,
+		module_table,
+		module_id,
+		"Done",
+		"dep",
+		module_table,
+		module_id,
+	):
+		GraphModuleAliasAdded(next):
+			Some(next)
+		_:
+			None
+
+	alias_admission ?= first_alias
+
+	second_selective = match graph_import_admission_register_constructor(
+		alias_admission,
+		module_id,
+		definition_table,
+		definition_table,
+		binding,
+		module_id,
+		constructor_ids,
+	):
+		GraphSelectiveAdded(next):
+			Some(next)
+		_:
+			None
+
+	alias_then_constructor ?= second_selective
+
+	duplicate_constructor_rejected = match graph_import_admission_register_constructor(
+		alias_then_constructor,
+		module_id,
+		definition_table,
+		definition_table,
+		binding,
+		module_id,
+		constructor_ids,
+	):
+		GraphSelectiveConflictsWithImportedName(_, _):
+			True
+		_:
+			False
+
+	alias_first_view = graph_import_admission_finish(alias_then_constructor)
+	alias_first_projected ?= module_view_imported_constructors(alias_first_view).get(0)
+	Some(
+		(
+			invalid_before_admission
+			and invalid_scalar_before_admission
+			and wrong_constructor_target
+			and duplicate_constructor_rejected
+			and trait_annotation_rejected
+			and module_view_imported_constructors(alias_first_view).length() == 1
+			and alias_first_projected.parent_name == binding.parent_name
+			and alias_first_projected.original_name == binding.original_name
+			and module_view_imported_constructors(initial).is_empty()
+			and module_view_imported_constructors(published).length() == 1
+			and module_view_accepted_constructor_bindings(published).length() == 1
+			and module_view_accepted_constructor_bindings(qualified_only).is_empty()
+			and bound_candidate_row_index(exact_constructor.candidate_row_id) == 0
+			and exact_constructor.local_name == binding.local_name
+			and exact_constructor.parent_local_name == binding.parent_local_name
+			and module_ids_equal(exact_constructor.module_id, module_id)
+			and definition_ids_equal(exact_constructor_id, expected_constructor_id)
+			and module_view_imported_constructors(qualified_only).is_empty()
+			and module_view_find_graph_module_alias(published, "Done") == Some(module_id)
+			and projected.local_name == binding.local_name
+			and projected.module_path == binding.module_path
+			and projected.parent_local_name == binding.parent_local_name
+			and projected.parent_name == binding.parent_name
+			and projected.original_name == binding.original_name
+		),
+	)
+
+
+func test_graph_constructor_annotation_requires_admitted_name() -> Bool:
+	graph_constructor_annotation_requires_admitted_name_result().get_or(False)
+
+
+private pure func graph_import_admission_rejects_invalid_candidates_result() -> Option[Bool]:
+	scope ?= definition_backed_type_fixture([
+		{
+			module_path = "dep",
+			type_names = ["Token"]
+		},
+		{
+			module_path = "other",
+			type_names = ["Token"]
+		},
+	])
+	foreign_scope ?= definition_backed_type_fixture([
+		{
+			module_path = "dep",
+			type_names = ["Token"]
+		},
+		{
+			module_path = "other",
+			type_names = ["Token"]
+		},
+	])
+	module_table = prepared_module_scope_module_table(scope)
+	current_id = prepared_module_scope_id(scope)
+	other_id ?= module_id_fixture_find(scope, "other")
+	definition_index = prepared_module_scope_definition_index(scope)
+	definition_table = definition_backed_type_fixture_definition_table(scope)
+	other_raw_id ?= definition_index_find_type_definition_id(
+		definition_index,
+		module_table,
+		other_id,
+		"Token",
+	)
+	other_definition_id ?= definition_table_definition_id(definition_table, other_raw_id)
+	view = module_view_for_graph(prepared_module_scope_graph_module_name_scope(scope))
+	initial ?= graph_import_admission_begin(view, module_table, current_id)
+
+	with_alias = match graph_import_admission_register_alias(
+		initial,
+		module_table,
+		current_id,
+		"Token",
+		"dep",
+		module_table,
+		current_id,
+	):
+		GraphModuleAliasAdded(next):
+			Some(next)
+		_:
+			None
+
+	admission ?= with_alias
+
+	after_other_target_conflict ?= match graph_import_admission_register_selective_definition(
+		admission,
+		current_id,
+		definition_table,
+		definition_table,
+		"Token",
+		"other",
+		"Token",
+		other_id,
+		[other_definition_id],
+	):
+		GraphSelectiveConflictsWithAlias(next, _):
+			Some(next)
+		_:
+			None
+
+	after_uncataloged ?= match graph_import_admission_register_selective_definition(
+		after_other_target_conflict,
+		current_id,
+		definition_table,
+		definition_table,
+		"Missing",
+		"other",
+		"Token",
+		other_id,
+		[other_definition_id],
+	):
+		GraphSelectiveInvalidSourceName(next):
+			Some(next)
+		_:
+			None
+
+	after_wrong_path ?= match graph_import_admission_register_selective_definition(
+		after_uncataloged,
+		current_id,
+		definition_table,
+		definition_table,
+		"Token",
+		"wrong/path",
+		"Token",
+		other_id,
+		[other_definition_id],
+	):
+		GraphSelectiveInvalidTarget(next):
+			Some(next)
+		_:
+			None
+
+	foreign_table = definition_backed_type_fixture_definition_table(foreign_scope)
+
+	after_foreign_provenance ?= match graph_import_admission_register_selective_definition(
+		after_wrong_path,
+		current_id,
+		definition_table,
+		foreign_table,
+		"Token",
+		"other",
+		"Token",
+		other_id,
+		[other_definition_id],
+	):
+		GraphSelectiveInvalidTarget(next):
+			Some(next)
+		_:
+			None
+
+	published = graph_import_admission_finish(after_foreign_provenance)
+	candidates = module_view_bound_candidates(published)
+
+	alias_conflict = match candidates.get(1):
+		Some(BoundSelectiveDefinitionAliasConflictCandidate(row_id, "Token", _, _, winner_id)):
+			bound_candidate_row_index(row_id) == 1 and bound_candidate_row_index(winner_id) == 0
+		_:
+			False
+
+	invalid_source = match candidates.get(2):
+		Some(BoundSelectiveDefinitionInvalidSourceCandidate(row_id, "Missing", _, _)):
+			bound_candidate_row_index(row_id) == 2
+		_:
+			False
+
+	invalid_path = match candidates.get(3):
+		Some(BoundSelectiveDefinitionInvalidTargetCandidate(row_id, "Token", _, _)):
+			bound_candidate_row_index(row_id) == 3
+		_:
+			False
+
+	invalid_provenance = match candidates.get(4):
+		Some(BoundSelectiveDefinitionInvalidTargetCandidate(row_id, "Token", _, _)):
+			bound_candidate_row_index(row_id) == 4
+		_:
+			False
+
+	Some(
+		(
+			module_view_graph_bound_name_count(view) == 0
+			and module_view_graph_bound_name_count(published) == 1
+			and module_view_import_bindings(published).length() == 1
+			and candidates.length() == 5
+			and alias_conflict
+			and invalid_source
+			and invalid_path
+			and invalid_provenance
+			and module_view_find_graph_module_alias(published, "Token") == Some(current_id)
+			and module_view_find_imported_name(published, "Token").is_none()
+		),
+	)
+
+
+func test_graph_import_admission_rejects_invalid_candidates() -> Bool:
+	graph_import_admission_rejects_invalid_candidates_result().get_or(False)
+
+
+private pure func graph_alias_then_selective_share_one_row_result() -> Option[Bool]:
+	scope ?= definition_backed_type_fixture(
+		[
+			{
+				module_path = "dep",
+				type_names = ["Token"]
+			},
+		],
+	)
 	module_table = prepared_module_scope_module_table(scope)
 	module_id = prepared_module_scope_id(scope)
 	definition_index = prepared_module_scope_definition_index(scope)
@@ -641,19 +1519,29 @@ private pure func graph_alias_then_selective_share_one_row_result() -> Option[Bo
 			):
 				SelectiveNameAdded(with_both):
 					bindings = module_view_import_bindings(with_both)
+
 					qualified_first = match bindings.get(0):
 						Some(GraphQualifiedModuleBinding(name, target)):
 							name == "Token" and module_ids_equal(target, module_id)
 						_:
 							False
+
 					selective_second = match bindings.get(1):
 						Some(GraphSelectiveDefinitionBinding(name, target, ids)):
-							name == "Token" and module_ids_equal(target, module_id) and ids.length() == 1
+							(
+								name == "Token"
+								and module_ids_equal(target, module_id)
+								and ids.length() == 1
+							)
 						_:
 							False
+
 					(
 						module_view_graph_bound_name_count(with_both) == 1
-						and module_view_find_graph_module_alias(with_both, "Token") == Some(module_id)
+						and module_view_find_graph_module_alias(
+							with_both,
+							"Token",
+						) == Some(module_id)
 						and module_view_has_selective_binding(with_both, "Token", "dep", "Token")
 						and bindings.length() == 2
 						and qualified_first
@@ -691,6 +1579,7 @@ private pure func graph_view_rejects_equal_layout_foreign_table_result() -> Opti
 			module_view_graph_bound_name_count(view) == 0
 		_:
 			False
+
 	Some(result)
 
 
@@ -705,8 +1594,15 @@ private pure func graph_conflicts_leave_bound_rows_unchanged_result() -> Option[
 	second_id ?= module_id_fixture_find(scope, "second")
 	definition_table = definition_backed_type_fixture_definition_table(scope)
 	view = module_view_for_graph(
-		graph_module_name_scope(graph_source_name_table(table, ["Shared"]), first_id),
+		graph_module_name_scope(
+			graph_source_name_table(
+				table,
+				["Shared", "Trait"],
+			),
+			first_id,
+		),
 	)
+
 	wrong_owner_selective = match module_view_register_graph_selective_trait_method(
 		view,
 		second_id,
@@ -724,27 +1620,49 @@ private pure func graph_conflicts_leave_bound_rows_unchanged_result() -> Option[
 			False
 
 	with_alias = match module_view_register_module_alias_target(
-		view, table, first_id, "Shared", "first", table, first_id,
+		view,
+		table,
+		first_id,
+		"Shared",
+		"first",
+		table,
+		first_id,
 	):
 		ModuleAliasAdded(next):
 			Some(next)
 		_:
 			None
+
 	alias_view ?= with_alias
+
 	alias_duplicate = match module_view_register_module_alias_target(
-		alias_view, table, first_id, "Shared", "first", table, first_id,
+		alias_view,
+		table,
+		first_id,
+		"Shared",
+		"first",
+		table,
+		first_id,
 	):
 		ModuleAliasAlreadyPresent:
 			True
 		_:
 			False
+
 	alias_conflict = match module_view_register_module_alias_target(
-		alias_view, table, first_id, "Shared", "second", table, second_id,
+		alias_view,
+		table,
+		first_id,
+		"Shared",
+		"second",
+		table,
+		second_id,
 	):
 		ModuleAliasConflictsWithAlias(path):
 			path == "first"
 		_:
 			False
+
 	selective_conflict = match module_view_register_graph_selective_trait_method(
 		alias_view,
 		first_id,
@@ -760,8 +1678,13 @@ private pure func graph_conflicts_leave_bound_rows_unchanged_result() -> Option[
 			path == "first"
 		_:
 			False
+
 	local_conflict = match module_view_register_local_name_for_graph(
-		alias_view, table, first_id, "Shared", TopLevelFunction,
+		alias_view,
+		table,
+		first_id,
+		"Shared",
+		TopLevelFunction,
 	):
 		LocalNameConflictsWithAlias(path):
 			path == "first"
@@ -783,7 +1706,9 @@ private pure func graph_conflicts_leave_bound_rows_unchanged_result() -> Option[
 			Some(next)
 		_:
 			None
+
 	selective_view ?= with_selective
+
 	selective_duplicate = match module_view_register_graph_selective_trait_method(
 		selective_view,
 		first_id,
@@ -799,8 +1724,15 @@ private pure func graph_conflicts_leave_bound_rows_unchanged_result() -> Option[
 			binding.module_path == "first" and binding.original_name == "Trait"
 		_:
 			False
+
 	selective_alias_conflict = match module_view_register_module_alias_target(
-		selective_view, table, first_id, "Shared", "second", table, second_id,
+		selective_view,
+		table,
+		first_id,
+		"Shared",
+		"second",
+		table,
+		second_id,
 	):
 		ModuleAliasConflictsWithImportedName(binding):
 			binding.module_path == "first"
@@ -808,17 +1740,19 @@ private pure func graph_conflicts_leave_bound_rows_unchanged_result() -> Option[
 			False
 
 	Some(
-		wrong_owner_selective
-		and alias_duplicate
-		and alias_conflict
-		and selective_conflict
-		and local_conflict
-		and selective_duplicate
-		and selective_alias_conflict
-		and module_view_graph_bound_name_count(alias_view) == 1
-		and module_view_import_bindings(alias_view).length() == 1
-		and module_view_graph_bound_name_count(selective_view) == 1
-		and module_view_import_bindings(selective_view).length() == 1
+		(
+			wrong_owner_selective
+			and alias_duplicate
+			and alias_conflict
+			and selective_conflict
+			and local_conflict
+			and selective_duplicate
+			and selective_alias_conflict
+			and module_view_graph_bound_name_count(alias_view) == 1
+			and module_view_import_bindings(alias_view).length() == 1
+			and module_view_graph_bound_name_count(selective_view) == 1
+			and module_view_import_bindings(selective_view).length() == 1
+		),
 	)
 
 
@@ -861,6 +1795,47 @@ private pure func without_unqualified_names_keeps_canonical_alias_authority_resu
 
 func test_without_unqualified_names_keeps_canonical_alias_authority() -> Bool:
 	without_unqualified_names_keeps_canonical_alias_authority_result().get_or(False)
+
+
+private pure func graph_import_admission_rejects_accepted_view_result() -> Option[Bool]:
+	scope ?= definition_backed_source_fixture("app/main", "func Imported() -> Int: 1")
+	module_table = prepared_module_scope_module_table(scope)
+	module_id = prepared_module_scope_id(scope)
+	definition_table ?= empty_definition_table()
+	table ?= accepted_alias_table({
+		definition_table = definition_table,
+		type_identities = [],
+		transparent_aliases = [],
+		opaque_aliases = [],
+	})
+	authority = accepted_alias_authority(table, accepted_alias_empty_module_view())
+	view = module_view_with_accepted_alias_authority(
+		module_view_for_graph(prepared_module_scope_graph_module_name_scope(scope)),
+		authority,
+	)
+
+	Some(
+		(
+			graph_import_admission_begin(view, module_table, module_id).is_none()
+			and match module_view_register_module_alias_target(
+				view,
+				module_table,
+				module_id,
+				"Imported",
+				"app/main",
+				module_table,
+				module_id,
+			):
+				ModuleAliasInvalidTarget:
+					True
+				_:
+					False
+		),
+	)
+
+
+func test_graph_import_admission_rejects_accepted_view() -> Bool:
+	graph_import_admission_rejects_accepted_view_result().get_or(False)
 
 
 private pure func without_unqualified_names_keeps_canonical_record_authority_result(
@@ -1182,14 +2157,21 @@ tests: TestSuite = {
 			"initial graph local batch publishes one immutable view",
 			test_initial_graph_local_batch_publishes_one_immutable_view,
 		),
+		("graph selective then alias share one row", test_graph_selective_then_alias_share_one_row),
+		("graph import admission publishes once", test_graph_import_admission_publishes_once),
 		(
-			"graph selective then alias share one row",
-			test_graph_selective_then_alias_share_one_row,
+			"graph candidate log owns source order and outcomes",
+			test_graph_candidate_log_owns_order_and_outcomes,
 		),
 		(
-			"graph alias then selective share one row",
-			test_graph_alias_then_selective_share_one_row,
+			"graph constructor annotation requires an admitted name",
+			test_graph_constructor_annotation_requires_admitted_name,
 		),
+		(
+			"graph import admission rejects invalid candidates",
+			test_graph_import_admission_rejects_invalid_candidates,
+		),
+		("graph alias then selective share one row", test_graph_alias_then_selective_share_one_row),
 		(
 			"graph view rejects equal-layout foreign table",
 			test_graph_view_rejects_equal_layout_foreign_table,
@@ -1201,6 +2183,10 @@ tests: TestSuite = {
 		(
 			"clearing unqualified names keeps canonical alias authority",
 			test_without_unqualified_names_keeps_canonical_alias_authority,
+		),
+		(
+			"graph import admission rejects accepted view",
+			test_graph_import_admission_rejects_accepted_view,
 		),
 		(
 			"clearing unqualified names keeps canonical record authority",

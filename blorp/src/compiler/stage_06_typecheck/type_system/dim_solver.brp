@@ -9,18 +9,40 @@ import:
 		SemanticDimOp(SemanticDimAdd, SemanticDimDivide, SemanticDimMultiply, SemanticDimSubtract),
 		SemanticType(SemanticConstIntType, SemanticDimOpType, SemanticMetaType, SemanticTypeVar),
 		is_dim_var_name,
-		type_to_string,
+		types_equal,
+
+
+-- Ordinary named factors stay on the existing String sort path. Metas and
+-- opaque expressions carry their semantic identity instead of borrowing a
+-- spelling that a type variable could also have.
+private union DimSpecialFactor:
+	DimMetaFactor(Int)
+	DimOpaqueDivisionFactor(DimCanonical, DimCanonical)
+	DimOpaqueTypeFactor(SemanticType)
 
 
 private record DimMonomial {
 	coeff: Int,
-	vars: List[String]
+	vars: List[String],
+	specials: List[DimSpecialFactor]
 }
 
 
 private record DimCanonical {
 	const_value: Int,
 	terms: List[DimMonomial]
+}
+
+
+private record DimMetaCandidate {
+	meta_id: Int,
+	term: DimMonomial
+}
+
+
+private record DimNamedCandidate {
+	name: String,
+	term: DimMonomial
 }
 
 
@@ -32,10 +54,15 @@ union DimSolveResult:
 	DimStuck
 
 
-private pure func dim_monomial(coeff: Int, vars: List[String]) -> DimMonomial:
+private pure func dim_monomial(
+	coeff: Int,
+	vars: List[String],
+	specials: List[DimSpecialFactor],
+) -> DimMonomial:
 	{
 		coeff = coeff,
-		vars = vars
+		vars = vars,
+		specials = specials
 	}
 
 
@@ -49,21 +76,15 @@ private pure func dim_const(value: Int) -> DimCanonical:
 private pure func dim_var(name: String) -> DimCanonical:
 	{
 		const_value = 0,
-		terms = [dim_monomial(1, [name])]
+		terms = [dim_monomial(1, [name], [])]
 	}
 
 
-private pure func dim_type_var(name: String) -> SemanticType:
-	if dim_is_meta_name(name):
-		id_text: String = name.substring(2, name.length() - 2)
-
-		match id_text.parse_int():
-			Some(meta_id):
-				SemanticMetaType(meta_id)
-			None:
-				SemanticTypeVar(name)
-	else:
-		SemanticTypeVar(name)
+private pure func dim_special(factor: DimSpecialFactor) -> DimCanonical:
+	{
+		const_value = 0,
+		terms = [dim_monomial(1, [], [factor])]
+	}
 
 
 private pure func dim_compare_strings(left: String, right: String) -> Int:
@@ -104,6 +125,73 @@ private pure func dim_compare_var_lists(left: List[String], right: List[String])
 
 private pure func dim_var_lists_equal(left: List[String], right: List[String]) -> Bool:
 	dim_compare_var_lists(left, right) == 0
+
+
+private pure func dim_special_equal(left: DimSpecialFactor, right: DimSpecialFactor) -> Bool:
+	match left:
+		DimMetaFactor(left_id):
+			match right:
+				DimMetaFactor(right_id):
+					left_id == right_id
+				_:
+					False
+		DimOpaqueDivisionFactor(left_num, left_den):
+			match right:
+				DimOpaqueDivisionFactor(right_num, right_den):
+					(
+						dim_canonical_equal(left_num, right_num)
+						and dim_canonical_equal(left_den, right_den)
+					)
+				_:
+					False
+		DimOpaqueTypeFactor(left_type):
+			match right:
+				DimOpaqueTypeFactor(right_type):
+					types_equal(left_type, right_type)
+				_:
+					False
+
+
+private pure func dim_special_lists_equal(
+	left: List[DimSpecialFactor],
+	right: List[DimSpecialFactor],
+) -> Bool:
+	if left.length() != right.length():
+		False
+	else if left.length() == 1:
+		match (left.get(0), right.get(0)):
+			(Some(left_factor), Some(right_factor)):
+				dim_special_equal(left_factor, right_factor)
+			_:
+				False
+	else:
+		-- Special factors are uncommon. Counting equal factors avoids a
+		-- display-string ordering and does not allocate a sorted copy.
+		var equal: Bool = True
+
+		for candidate in left:
+			if equal:
+				var left_count: Int = 0
+				var right_count: Int = 0
+
+				for factor in left:
+					if dim_special_equal(candidate, factor):
+						left_count += 1
+
+				for factor in right:
+					if dim_special_equal(candidate, factor):
+						right_count += 1
+
+				equal = left_count == right_count
+
+		equal
+
+
+private pure func dim_monomial_key_equal(left: DimMonomial, right: DimMonomial) -> Bool:
+	(
+		dim_var_lists_equal(left.vars, right.vars)
+		and dim_special_lists_equal(left.specials, right.specials)
+	)
 
 
 private pure func dim_insert_sorted_monomial(
@@ -148,11 +236,12 @@ private pure func dim_append_nonzero(
 private pure func dim_negate_monomial(term: DimMonomial) -> DimMonomial:
 	{
 		coeff = 0 - term.coeff,
-		vars = term.vars
+		vars = term.vars,
+		specials = term.specials
 	}
 
 
-private pure func dim_merge_terms(terms: List[DimMonomial]) -> List[DimMonomial]:
+private pure func dim_merge_plain_terms(terms: List[DimMonomial]) -> List[DimMonomial]:
 	sorted: List[DimMonomial] = dim_sort_terms(terms)
 	var result: List[DimMonomial] = []
 	var current: Option[DimMonomial] = None
@@ -175,6 +264,66 @@ private pure func dim_merge_terms(terms: List[DimMonomial]) -> List[DimMonomial]
 			void
 
 	result
+
+
+private pure func dim_merge_special_terms_general(terms: List[DimMonomial]) -> List[DimMonomial]:
+	-- There is no display-string ordering for exceptional factors. Preserve
+	-- encounter order when rebuilding a symbolic binding, but coalesce terms
+	-- by semantic identity; canonical equality below is order-independent.
+	var pending: List[DimMonomial] = terms
+	var result: List[DimMonomial] = []
+
+	while pending.length() > 0:
+		match pending.get(0):
+			Some(first):
+				var combined: DimMonomial = first
+				var remaining: List[DimMonomial] = []
+				var index: Int = 0
+
+				for term in pending:
+					if index > 0:
+						if dim_monomial_key_equal(first, term):
+							combined = { combined | coeff = combined.coeff + term.coeff }
+						else:
+							remaining = remaining.append(term)
+
+					index += 1
+
+				result = dim_append_nonzero(result, combined)
+				pending = remaining
+			None:
+				break
+
+	result
+
+
+private pure func dim_merge_special_terms(terms: List[DimMonomial]) -> List[DimMonomial]:
+	if terms.length() == 1:
+		match terms.get(0):
+			Some(term):
+				dim_append_nonzero([], term)
+			None:
+				[]
+	else:
+		dim_merge_special_terms_general(terms)
+
+
+private pure func dim_terms_have_specials(terms: List[DimMonomial]) -> Bool:
+	var found: Bool = False
+
+	for term in terms:
+		if term.specials.length() > 0:
+			found = True
+			break
+
+	found
+
+
+private pure func dim_merge_terms(terms: List[DimMonomial]) -> List[DimMonomial]:
+	if dim_terms_have_specials(terms):
+		dim_merge_special_terms(terms)
+	else:
+		dim_merge_plain_terms(terms)
 
 
 private pure func dim_negate(canonical: DimCanonical) -> DimCanonical:
@@ -211,10 +360,19 @@ private pure func dim_multiply(left: DimCanonical, right: DimCanonical) -> DimCa
 			product_vars: List[String] = left_term.vars
 				.concat(right_term.vars)
 				.sort()
+
+			product_specials: List[DimSpecialFactor] = if left_term.specials.length() == 0:
+				right_term.specials
+			else if right_term.specials.length() == 0:
+				left_term.specials
+			else:
+				left_term.specials.concat(right_term.specials)
+
 			cross_terms = cross_terms.append(
 				dim_monomial(
 					left_term.coeff * right_term.coeff,
 					product_vars,
+					product_specials,
 				),
 			)
 
@@ -247,41 +405,14 @@ private pure func dim_try_div_const(canonical: DimCanonical, divisor: Int) -> Op
 
 
 private pure func dim_lookup_meta(
-	meta_bindings: List[(Int, SemanticType)],
+	meta_bindings: List[Option[SemanticType]],
 	meta_id: Int,
 ) -> Option[SemanticType]:
-	var result: Option[SemanticType] = None
-
-	for entry in meta_bindings:
-		if entry[0] == meta_id:
-			result = Some(entry[1])
-			break
-
-	result
-
-
-private pure func dim_canonical_to_debug(canonical: DimCanonical) -> String:
-	var parts: List[String] = []
-
-	if canonical.const_value != 0:
-		parts = parts.append(canonical.const_value.to_string())
-
-	for term in canonical.terms:
-		vars_text: String = term.vars.join("*")
-
-		if term.coeff == 1:
-			parts = parts.append(vars_text)
-		else:
-			parts = parts.append(term.coeff.to_string() + "*" + vars_text)
-
-	if parts.length() == 0:
-		"0"
-	else:
-		parts.join("+")
+	meta_bindings.get_or(meta_id, None)
 
 
 private pure func dim_divide_to_canonical(
-	meta_bindings: List[(Int, SemanticType)],
+	meta_bindings: List[Option[SemanticType]],
 	left: SemanticType,
 	right: SemanticType,
 ) -> DimCanonical:
@@ -293,21 +424,13 @@ private pure func dim_divide_to_canonical(
 			Some(divided):
 				divided
 			None:
-				dim_var(
-					"__div(" + dim_canonical_to_debug(
-						left_canonical,
-					) + "," + right_canonical.const_value.to_string() + ")",
-				)
+				dim_special(DimOpaqueDivisionFactor(left_canonical, right_canonical))
 	else:
-		dim_var(
-			"__div(" + dim_canonical_to_debug(
-				left_canonical,
-			) + "," + dim_canonical_to_debug(right_canonical) + ")",
-		)
+		dim_special(DimOpaqueDivisionFactor(left_canonical, right_canonical))
 
 
 private pure func dim_to_canonical(
-	meta_bindings: List[(Int, SemanticType)],
+	meta_bindings: List[Option[SemanticType]],
 	typ: SemanticType,
 ) -> DimCanonical:
 	match typ:
@@ -320,7 +443,7 @@ private pure func dim_to_canonical(
 				Some(binding):
 					dim_to_canonical(meta_bindings, binding)
 				None:
-					dim_var("?m" + meta_id.to_string())
+					dim_special(DimMetaFactor(meta_id))
 		SemanticDimOpType(op, left, right):
 			match op:
 				SemanticDimAdd:
@@ -341,21 +464,43 @@ private pure func dim_to_canonical(
 				SemanticDimDivide:
 					dim_divide_to_canonical(meta_bindings, left, right)
 		_:
-			dim_var("__opaque(" + type_to_string(typ) + ")")
+			dim_special(DimOpaqueTypeFactor(typ))
+
+
+private pure func dim_special_to_type(factor: DimSpecialFactor) -> SemanticType:
+	match factor:
+		DimMetaFactor(meta_id):
+			SemanticMetaType(meta_id)
+		DimOpaqueDivisionFactor(numerator, denominator):
+			SemanticDimOpType(
+				SemanticDimDivide,
+				dim_from_canonical(numerator),
+				dim_from_canonical(denominator),
+			)
+		DimOpaqueTypeFactor(typ):
+			typ
 
 
 private pure func dim_term_to_type(term: DimMonomial) -> SemanticType:
-	if term.vars.length() == 0:
+	var factors: List[SemanticType] = []
+
+	for name in term.vars:
+		factors = factors.append(SemanticTypeVar(name))
+
+	for special in term.specials:
+		factors = factors.append(dim_special_to_type(special))
+
+	if factors.length() == 0:
 		SemanticConstIntType(term.coeff)
 	else:
-		var result: SemanticType = dim_type_var(term.vars.get_or(0, ""))
+		var result: SemanticType = factors.get_or(0, SemanticConstIntType(0))
 		var index: Int = 1
 
-		while index < term.vars.length():
+		while index < factors.length():
 			result = SemanticDimOpType(
 				SemanticDimMultiply,
 				result,
-				dim_type_var(term.vars.get_or(index, "")),
+				factors.get_or(index, SemanticConstIntType(0)),
 			)
 			index += 1
 
@@ -392,7 +537,45 @@ private pure func dim_from_canonical(canonical: DimCanonical) -> SemanticType:
 
 
 private pure func dim_monomial_equal(left: DimMonomial, right: DimMonomial) -> Bool:
-	left.coeff == right.coeff and dim_var_lists_equal(left.vars, right.vars)
+	left.coeff == right.coeff and dim_monomial_key_equal(left, right)
+
+
+private pure func dim_special_monomial_lists_equal_general(
+	left: List[DimMonomial],
+	right: List[DimMonomial],
+) -> Bool:
+	var equal: Bool = True
+
+	for candidate in left:
+		if equal:
+			var left_count: Int = 0
+			var right_count: Int = 0
+
+			for term in left:
+				if dim_monomial_equal(candidate, term):
+					left_count += 1
+
+			for term in right:
+				if dim_monomial_equal(candidate, term):
+					right_count += 1
+
+			equal = left_count == right_count
+
+	equal
+
+
+private pure func dim_special_monomial_lists_equal(
+	left: List[DimMonomial],
+	right: List[DimMonomial],
+) -> Bool:
+	if left.length() == 1:
+		match (left.get(0), right.get(0)):
+			(Some(left_term), Some(right_term)):
+				dim_monomial_equal(left_term, right_term)
+			_:
+				False
+	else:
+		dim_special_monomial_lists_equal_general(left, right)
 
 
 private pure func dim_monomial_lists_equal(
@@ -401,6 +584,8 @@ private pure func dim_monomial_lists_equal(
 ) -> Bool:
 	if left.length() != right.length():
 		False
+	else if dim_terms_have_specials(left) or dim_terms_have_specials(right):
+		dim_special_monomial_lists_equal(left, right)
 	else:
 		var index: Int = 0
 		var equal: Bool = True
@@ -421,25 +606,8 @@ private pure func dim_canonical_equal(left: DimCanonical, right: DimCanonical) -
 	left.const_value == right.const_value and dim_monomial_lists_equal(left.terms, right.terms)
 
 
-private pure func dim_is_meta_name(name: String) -> Bool:
-	name.length() > 2 and name.get_or(0, ' ') == '?' and name.get_or(1, ' ') == 'm'
-
-
-private pure func dim_meta_id_from_name(name: String) -> Option[Int]:
-	if dim_is_meta_name(name):
-		name
-			.substring(2, name.length() - 2)
-			.parse_int()
-	else:
-		None
-
-
-private pure func dim_is_solvable_name(name: String) -> Bool:
-	dim_is_meta_name(name) or is_dim_var_name(name)
-
-
 private pure func dim_is_solvable_type(
-	meta_bindings: List[(Int, SemanticType)],
+	meta_bindings: List[Option[SemanticType]],
 	typ: SemanticType,
 ) -> Bool:
 	match typ:
@@ -451,14 +619,6 @@ private pure func dim_is_solvable_type(
 			False
 
 
-private pure func dim_bind_name(name: String, value: SemanticType) -> DimSolveResult:
-	match dim_meta_id_from_name(name):
-		Some(meta_id):
-			DimBindMeta(meta_id, value)
-		None:
-			DimBindVar(name, value)
-
-
 private pure func dim_bind_type(variable: SemanticType, value: SemanticType) -> DimSolveResult:
 	match variable:
 		SemanticMetaType(meta_id):
@@ -467,6 +627,24 @@ private pure func dim_bind_type(variable: SemanticType, value: SemanticType) -> 
 			DimBindVar(name, value)
 		_:
 			DimStuck
+
+
+private pure func dim_solvable_monomial_factor(term: DimMonomial) -> Option[SemanticType]:
+	if term.vars.length() == 1 and term.specials.length() == 0:
+		name: String = term.vars.get_or(0, "")
+
+		if is_dim_var_name(name):
+			Some(SemanticTypeVar(name))
+		else:
+			None
+	else if term.vars.length() == 0 and term.specials.length() == 1:
+		match term.specials.get(0):
+			Some(DimMetaFactor(meta_id)):
+				Some(SemanticMetaType(meta_id))
+			_:
+				None
+	else:
+		None
 
 
 private pure func dim_rest_terms(
@@ -487,56 +665,92 @@ private pure func dim_try_isolate(
 	candidate: DimMonomial,
 	rest_terms: List[DimMonomial],
 ) -> Option[DimSolveResult]:
-	if candidate.vars.length() != 1 or candidate.coeff == 0:
+	if candidate.coeff == 0:
 		None
 	else:
-		single_var: String = candidate.vars.get_or(0, "")
+		match dim_solvable_monomial_factor(candidate):
+			Some(variable):
+				rest_canonical: DimCanonical = {
+					const_value = diff_const,
+					terms = rest_terms
+				}
 
-		if not dim_is_solvable_name(single_var):
-			None
-		else:
-			rest_canonical: DimCanonical = {
-				const_value = diff_const,
-				terms = rest_terms
-			}
+				match dim_try_div_const(dim_negate(rest_canonical), candidate.coeff):
+					Some(value):
+						Some(dim_bind_type(variable, dim_from_canonical(value)))
+					None:
+						None
+			None:
+				None
 
-			match dim_try_div_const(dim_negate(rest_canonical), candidate.coeff):
-				Some(value):
-					Some(dim_bind_name(single_var, dim_from_canonical(value)))
-				None:
+
+private pure func dim_monomial_single_meta_id(term: DimMonomial) -> Option[Int]:
+	if term.vars.length() != 0 or term.specials.length() != 1:
+		None
+	else:
+		match term.specials.get(0):
+			Some(DimMetaFactor(meta_id)):
+				Some(meta_id)
+			_:
+				None
+
+
+private pure func dim_monomial_single_dim_name(term: DimMonomial) -> Option[String]:
+	if term.vars.length() != 1 or term.specials.length() != 0:
+		None
+	else:
+		match term.vars.get(0):
+			Some(name):
+				if is_dim_var_name(name):
+					Some(name)
+				else:
 					None
-
-
-private pure func dim_monomial_has_meta(term: DimMonomial) -> Bool:
-	var found: Bool = False
-
-	for var_name in term.vars:
-		if dim_is_meta_name(var_name):
-			found = True
-			break
-
-	found
+			None:
+				None
 
 
 private pure func dim_solve_multiple_terms(diff: DimCanonical) -> DimSolveResult:
-	var meta_terms: List[DimMonomial] = []
-	var other_terms: List[DimMonomial] = []
+	var meta_candidates: List[DimMetaCandidate] = []
+	var named_candidates: List[DimNamedCandidate] = []
 
 	for term in diff.terms:
-		if dim_monomial_has_meta(term):
-			meta_terms = meta_terms.append(term)
-		else:
-			other_terms = other_terms.append(term)
+		match dim_monomial_single_meta_id(term):
+			Some(meta_id):
+				meta_candidates = meta_candidates.append({
+					meta_id = meta_id,
+					term = term,
+				})
+			None:
+				match dim_monomial_single_dim_name(term):
+					Some(name):
+						named_candidates = named_candidates.append({
+							name = name,
+							term = term,
+						})
+					None:
+						void
 
-	candidates: List[DimMonomial] = meta_terms.concat(other_terms)
 	var result: Option[DimSolveResult] = None
 
-	for candidate in candidates:
+	-- Once special factors are typed, their source order is no longer a
+	-- lexical key. Try isolatable lower-numbered metas first, as the old
+	-- ?mN sort did; products containing metas cannot be isolated here.
+	for candidate in meta_candidates.sort_by(func(entry): entry.meta_id):
 		if result.is_none():
 			result = dim_try_isolate(
 				diff.const_value,
-				candidate,
-				dim_rest_terms(diff.terms, candidate),
+				candidate.term,
+				dim_rest_terms(diff.terms, candidate.term),
+			)
+
+	-- Named dimension variables retain their lexical binding priority even
+	-- when an opaque term makes the reconstructed sum encounter-ordered.
+	for candidate in named_candidates.sort_by(func(entry): entry.name):
+		if result.is_none():
+			result = dim_try_isolate(
+				diff.const_value,
+				candidate.term,
+				dim_rest_terms(diff.terms, candidate.term),
 			)
 
 	match result:
@@ -547,27 +761,24 @@ private pure func dim_solve_multiple_terms(diff: DimCanonical) -> DimSolveResult
 
 
 private pure func dim_solve_single_term(diff_const: Int, term: DimMonomial) -> DimSolveResult:
-	if term.vars.length() != 1:
-		DimStuck
-	else:
-		single_var: String = term.vars.get_or(0, "")
-
-		if not dim_is_solvable_name(single_var):
-			DimStuck
-		else if term.coeff == 0:
-			if diff_const == 0:
-				DimSolved
-			else:
-				DimContradiction
-		else if diff_const % term.coeff != 0:
-			DimStuck
-		else:
-			value: Int = (0 - diff_const) / term.coeff
-
-			if value <= 0:
+	match dim_solvable_monomial_factor(term):
+		Some(variable):
+			if term.coeff == 0:
+				if diff_const == 0:
+					DimSolved
+				else:
+					DimContradiction
+			else if diff_const % term.coeff != 0:
 				DimStuck
 			else:
-				dim_bind_name(single_var, SemanticConstIntType(value))
+				value: Int = (0 - diff_const) / term.coeff
+
+				if value <= 0:
+					DimStuck
+				else:
+					dim_bind_type(variable, SemanticConstIntType(value))
+		None:
+			DimStuck
 
 
 private pure func dim_solve_diff(diff: DimCanonical) -> DimSolveResult:
@@ -581,7 +792,7 @@ private pure func dim_solve_diff(diff: DimCanonical) -> DimSolveResult:
 			diff.const_value,
 			diff.terms.get_or(
 				0,
-				dim_monomial(0, []),
+				dim_monomial(0, [], []),
 			),
 		)
 	else:
@@ -589,7 +800,7 @@ private pure func dim_solve_diff(diff: DimCanonical) -> DimSolveResult:
 
 
 private pure func dim_try_divisor_var_case(
-	meta_bindings: List[(Int, SemanticType)],
+	meta_bindings: List[Option[SemanticType]],
 	dividend: SemanticType,
 	divisor: SemanticType,
 	rhs_expr: SemanticType,
@@ -619,7 +830,7 @@ private pure func dim_try_divisor_var_case(
 
 
 private pure func dim_try_dividend_var_case(
-	meta_bindings: List[(Int, SemanticType)],
+	meta_bindings: List[Option[SemanticType]],
 	dividend: SemanticType,
 	divisor: SemanticType,
 	rhs_expr: SemanticType,
@@ -639,7 +850,7 @@ private pure func dim_try_dividend_var_case(
 
 
 private pure func dim_check_division_special(
-	meta_bindings: List[(Int, SemanticType)],
+	meta_bindings: List[Option[SemanticType]],
 	dividend: SemanticType,
 	divisor: SemanticType,
 	rhs_expr: SemanticType,
@@ -652,7 +863,7 @@ private pure func dim_check_division_special(
 
 
 private pure func dim_try_division_special(
-	meta_bindings: List[(Int, SemanticType)],
+	meta_bindings: List[Option[SemanticType]],
 	left: SemanticType,
 	right: SemanticType,
 ) -> Option[DimSolveResult]:
@@ -674,7 +885,7 @@ private pure func dim_try_division_special(
 
 
 pure func dim_solve(
-	meta_bindings: List[(Int, SemanticType)],
+	meta_bindings: List[Option[SemanticType]],
 	left: SemanticType,
 	right: SemanticType,
 ) -> DimSolveResult:

@@ -20,12 +20,14 @@ import:
 		GraphSourceNameTable,
 		SourceNameId,
 		graph_module_name_scope_graph_names,
+		graph_module_name_scope_matches_catalog,
 		graph_module_name_scope_module_id,
 		graph_source_name_table_module_table,
 		graph_source_name_table_source_names,
 		source_name_id_table_index,
 		source_name_table_find_id,
 		source_name_table_id_at,
+		source_name_table_spelling,
 	../type_system/accepted_alias_authority:
 		AcceptedAliasAuthority,
 		accepted_alias_authority_without_visible_names,
@@ -53,6 +55,7 @@ import:
 			StandaloneSelectiveDefinitionBinding,
 		),
 		MODULE_IMPORT_TARGET_INVALID_LABEL,
+	list: list
 
 
 record ImportedNameBinding {
@@ -71,6 +74,23 @@ record ImportedConstructorBinding {
 }
 
 
+record BoundAcceptedConstructorBinding {
+	candidate_row_id: BoundCandidateRowId,
+	local_name: String,
+	parent_local_name: String,
+	module_id: ModuleId,
+	definition_ids: List[DefinitionId]
+}
+
+
+record BoundAcceptedDefinitionBinding {
+	candidate_row_id: BoundCandidateRowId,
+	local_name: String,
+	module_id: ModuleId,
+	definition_ids: List[DefinitionId]
+}
+
+
 enum TopLevelNameKind:
 	TopLevelType
 	TopLevelConstructor
@@ -79,10 +99,115 @@ enum TopLevelNameKind:
 	TopLevelTrait
 
 
+-- Candidate row IDs are meaningful only under the graph scope retained by
+-- their ModuleView. They are never constructed from a source-name index.
+opaque type BoundCandidateRowId = Int
+
+
+-- Each legal request/outcome is one row allocation. Keeping request and
+-- outcome as nested unions would allocate two extra objects per candidate and
+-- materially regress wide import blocks.
+union BoundCandidate:
+	BoundLocalNameAcceptedCandidate(BoundCandidateRowId, String, TopLevelNameKind)
+	BoundLocalNameAlreadyPresentCandidate(BoundCandidateRowId, String, TopLevelNameKind, BoundCandidateRowId)
+	BoundQualifiedImportAcceptedCandidate(BoundCandidateRowId, String, ModuleId)
+	BoundQualifiedImportAlreadyPresentCandidate(BoundCandidateRowId, String, ModuleId, BoundCandidateRowId)
+	BoundQualifiedImportAliasConflictCandidate(BoundCandidateRowId, String, ModuleId, BoundCandidateRowId)
+	BoundQualifiedImportSelectiveConflictCandidate(BoundCandidateRowId, String, ModuleId, BoundCandidateRowId)
+	BoundQualifiedImportLocalConflictCandidate(BoundCandidateRowId, String, ModuleId, BoundCandidateRowId)
+	BoundQualifiedImportInvalidSourceCandidate(BoundCandidateRowId, String, ModuleId)
+	BoundQualifiedImportInvalidTargetCandidate(BoundCandidateRowId, String, ModuleId)
+	BoundSelectiveDefinitionAcceptedCandidate(BoundCandidateRowId, String, ModuleId, List[DefinitionId])
+	BoundSelectiveDefinitionAliasConflictCandidate(BoundCandidateRowId, String, ModuleId, List[DefinitionId], BoundCandidateRowId)
+	BoundSelectiveDefinitionSelectiveConflictCandidate(BoundCandidateRowId, String, ModuleId, List[DefinitionId], BoundCandidateRowId)
+	BoundSelectiveDefinitionLocalConflictCandidate(BoundCandidateRowId, String, ModuleId, List[DefinitionId], BoundCandidateRowId)
+	BoundSelectiveDefinitionInvalidSourceCandidate(BoundCandidateRowId, String, ModuleId, List[DefinitionId])
+	BoundSelectiveDefinitionInvalidTargetCandidate(BoundCandidateRowId, String, ModuleId, List[DefinitionId])
+	BoundSelectiveTraitMethodAcceptedCandidate(BoundCandidateRowId, String, ModuleId, String, List[DefinitionId])
+	BoundSelectiveTraitMethodAliasConflictCandidate(BoundCandidateRowId, String, ModuleId, String, List[DefinitionId], BoundCandidateRowId)
+	BoundSelectiveTraitMethodSelectiveConflictCandidate(BoundCandidateRowId, String, ModuleId, String, List[DefinitionId], BoundCandidateRowId)
+	BoundSelectiveTraitMethodLocalConflictCandidate(BoundCandidateRowId, String, ModuleId, String, List[DefinitionId], BoundCandidateRowId)
+	BoundSelectiveTraitMethodInvalidSourceCandidate(BoundCandidateRowId, String, ModuleId, String, List[DefinitionId])
+	BoundSelectiveTraitMethodInvalidTargetCandidate(BoundCandidateRowId, String, ModuleId, String, List[DefinitionId])
+
+
+private enum BoundCandidateOutcomeTag:
+	BoundAcceptedOutcome
+	BoundAlreadyPresentOutcome
+	BoundAliasConflictOutcome
+	BoundSelectiveConflictOutcome
+	BoundLocalConflictOutcome
+	BoundInvalidSourceOutcome
+	BoundInvalidTargetOutcome
+
+
+-- Accepted graph requests retain semantic IDs and graph-catalog indexes only.
+-- The optional spellings exist solely for rejected direct-API calls whose
+-- names were never admitted to the graph catalog, so diagnostics can still
+-- reproduce the invalid request without putting strings on the normal path.
+private union BoundImportRequest:
+	BoundQualifiedImportRequest(Int, ModuleId, Option[String])
+	BoundSelectiveDefinitionRequest(Int, ModuleId, List[DefinitionId], Option[String])
+	BoundSelectiveTraitMethodRequest(Int, ModuleId, Int, List[DefinitionId], Option[String], Option[String])
+
+
+-- Import admission is append-only in source order. A newest-first persistent
+-- log gives each public admission call O(1) work; publication walks it once in
+-- source order and writes directly into the compact retained columns.
+private union BoundCandidateLog:
+	EmptyBoundCandidateLog
+	BoundImportCandidateLogNode(BoundImportRequest, BoundCandidateOutcomeTag, Int, BoundCandidateLog)
+
+
+private struct BoundAcceptedLocalCandidateRow {
+	issued_order: Int,
+	source_name_index: Int
+}
+
+
+private struct BoundRejectedLocalCandidateRow {
+	issued_order: Int,
+	source_name_index: Int,
+	local_kind: TopLevelNameKind,
+	related_row_index: Int
+}
+
+
+private struct BoundRejectedImportRow {
+	issued_order: Int,
+	request_payload_index: Int,
+	outcome_tag: BoundCandidateOutcomeTag,
+	related_row_index: Int
+}
+
+
+-- Accepted imports retain their issued row IDs in a parallel scalar column.
+-- This makes exact accepted joins linear in accepted imports instead of
+-- repeatedly reconstructing positions from sparse rejected/local rows.
+private record BoundCandidateTable {
+	rejected_local_rows: List[BoundRejectedLocalCandidateRow],
+	accepted_import_row_ids: List[BoundCandidateRowId],
+	accepted_imports: List[BoundImportRequest],
+	rejected_rows: List[BoundRejectedImportRow],
+	rejected_imports: List[BoundImportRequest],
+	candidate_count: Int
+}
+
+
+private BOUND_CANDIDATE_NO_RELATED_ROW: Int = -1
+
+private BOUND_CANDIDATE_NO_SOURCE_NAME: Int = -1
+
+
 private enum ImportBindingDomain:
 	NoImportBindings
 	GraphImportBindings
 	StandaloneImportBindings
+
+
+private enum GraphSelectiveBindingKind:
+	DefinitionGraphSelectiveBinding
+	TraitMethodGraphSelectiveBinding
 
 
 private union LocalNameStorage:
@@ -90,20 +215,39 @@ private union LocalNameStorage:
 	StandaloneLocalNameStorage
 
 
+private struct BoundImportedNamePayload {
+	module_id: ModuleId,
+	original_source_name_index: Int
+}
+
+
+private struct BoundConstructorPayload {
+	imported_name: BoundImportedNamePayload,
+	parent_local_name_index: Int,
+	parent_source_name_index: Int
+}
+
+
 -- One current-occupancy row per graph spelling. Alias and selective import
 -- may coexist only when they target the same module; local names are exclusive.
 private union BoundNameOccupancy:
-	BoundModuleAlias(ModuleId)
-	BoundSelectiveName(ImportedNameBinding)
-	BoundAliasAndSelectiveName(ModuleId, ImportedNameBinding)
-	BoundLocalName(TopLevelNameKind)
+	BoundModuleAlias(BoundCandidateRowId, ModuleId)
+	BoundSelectiveName(BoundCandidateRowId, ModuleId, Int)
+	BoundConstructorName(BoundCandidateRowId, ModuleId, Int, Int, Int)
+	BoundAliasAndSelectiveName(BoundCandidateRowId, ModuleId, BoundCandidateRowId, ModuleId, Int)
+	BoundAliasAndConstructorName(BoundCandidateRowId, ModuleId, BoundCandidateRowId, ModuleId, Int, Int, Int)
+	BoundLocalName(BoundCandidateRowId, TopLevelNameKind)
 
 
 private record BoundVisibility {
 	issuer: GraphModuleNameScope,
-	-- Occupancy is one row per cataloged name; binding order belongs to the
-	-- ordered import inventory, never to dictionary iteration order.
-	rows_by_source_name_index: Dict[Int, BoundNameOccupancy]
+	rows_by_source_name_index: Dict[Int, BoundNameOccupancy],
+	candidate_rejected_local_rows: List[BoundRejectedLocalCandidateRow],
+	candidate_accepted_import_row_ids: List[BoundCandidateRowId],
+	candidate_accepted_imports: List[BoundImportRequest],
+	candidate_rejected_rows: List[BoundRejectedImportRow],
+	candidate_rejected_imports: List[BoundImportRequest],
+	candidate_count: Int
 }
 
 
@@ -111,12 +255,10 @@ private record ModuleViewRep {
 	graph_visibility: Option[BoundVisibility],
 	standalone_module_aliases_by_local_name: Dict[String, String],
 	import_binding_domain: ImportBindingDomain,
-	-- Graph selective names live in bound occupancy and the ordered binding
-	-- log. Only standalone compatibility keeps this second source-facing list.
 	imported_names: List[ImportedNameBinding],
 	standalone_imported_names_by_local_name: Dict[String, ImportedNameBinding],
 	imported_constructors: List[ImportedConstructorBinding],
-	import_bindings: List[ImportBinding],
+	standalone_import_bindings: List[ImportBinding],
 	standalone_local_names_by_local_name: Dict[String, TopLevelNameKind],
 	accepted_alias_authority: Option[AcceptedAliasAuthority],
 	accepted_record_authority: Option[AcceptedRecordAuthority],
@@ -128,6 +270,40 @@ private record ModuleViewRep {
 
 
 opaque type ModuleView = ModuleViewRep
+
+
+-- Imports update these scope-local collections while the binder walks source
+-- order. The published ModuleView remains unchanged until the whole import
+-- block has been admitted; rejected candidates never mutate either collection.
+private record GraphImportAdmissionRep {
+	initial_view: ModuleView,
+	rows_by_source_name_index: Dict[Int, BoundNameOccupancy],
+	candidate_initial_table: BoundCandidateTable,
+	candidate_newest_first: BoundCandidateLog,
+	candidate_count: Int,
+	candidate_rejected_import_count: Int
+}
+
+
+opaque type GraphImportAdmission = GraphImportAdmissionRep
+
+
+union GraphModuleAliasAdmission:
+	GraphModuleAliasAdded(GraphImportAdmission)
+	GraphModuleAliasAlreadyPresent(GraphImportAdmission)
+	GraphModuleAliasConflictsWithAlias(GraphImportAdmission, String)
+	GraphModuleAliasConflictsWithImportedName(GraphImportAdmission, ImportedNameBinding)
+	GraphModuleAliasConflictsWithLocalName(GraphImportAdmission, TopLevelNameKind)
+	GraphModuleAliasInvalidTarget(GraphImportAdmission)
+
+
+union GraphSelectiveAdmission:
+	GraphSelectiveAdded(GraphImportAdmission)
+	GraphSelectiveConflictsWithAlias(GraphImportAdmission, String)
+	GraphSelectiveConflictsWithImportedName(GraphImportAdmission, ImportedNameBinding)
+	GraphSelectiveConflictsWithLocalName(GraphImportAdmission, TopLevelNameKind)
+	GraphSelectiveInvalidSourceName(GraphImportAdmission)
+	GraphSelectiveInvalidTarget(GraphImportAdmission)
 
 
 union ModuleAliasRegistration:
@@ -171,7 +347,7 @@ COMPILER_MODULE_VIEW_EMPTY: ModuleView = module_view_from_rep({
 	imported_names = [],
 	standalone_imported_names_by_local_name = {},
 	imported_constructors = [],
-	import_bindings = [],
+	standalone_import_bindings = [],
 	standalone_local_names_by_local_name = {},
 	accepted_alias_authority = None,
 	accepted_record_authority = None,
@@ -189,13 +365,900 @@ pure func module_view_for_graph(issuer: GraphModuleNameScope) -> ModuleView:
 	representation = module_view_rep(COMPILER_MODULE_VIEW_EMPTY)
 	visibility: BoundVisibility = {
 		issuer = issuer,
-		rows_by_source_name_index = {}
+		rows_by_source_name_index = {},
+		candidate_rejected_local_rows = [],
+		candidate_accepted_import_row_ids = [],
+		candidate_accepted_imports = [],
+		candidate_rejected_rows = [],
+		candidate_rejected_imports = [],
+		candidate_count = 0
 	}
 	module_view_from_rep({ representation | graph_visibility = Some(visibility) })
 
 
+private pure func bound_visibility_candidate_table(
+	visibility: BoundVisibility,
+) -> BoundCandidateTable:
+	{
+		rejected_local_rows = visibility.candidate_rejected_local_rows,
+		accepted_import_row_ids = visibility.candidate_accepted_import_row_ids,
+		accepted_imports = visibility.candidate_accepted_imports,
+		rejected_rows = visibility.candidate_rejected_rows,
+		rejected_imports = visibility.candidate_rejected_imports,
+		candidate_count = visibility.candidate_count
+	}
+
+
+private pure func bound_visibility_with_candidate_table(
+	visibility: BoundVisibility,
+	table: BoundCandidateTable,
+) -> BoundVisibility:
+	{ visibility |
+		candidate_rejected_local_rows = table.rejected_local_rows,
+		candidate_accepted_import_row_ids = table.accepted_import_row_ids,
+		candidate_accepted_imports = table.accepted_imports,
+		candidate_rejected_rows = table.rejected_rows,
+		candidate_rejected_imports = table.rejected_imports,
+		candidate_count = table.candidate_count
+	}
+
+
+private pure func bound_candidate_row_id(index: Int) -> BoundCandidateRowId:
+	into_opaque BoundCandidateRowId(index)
+
+
+pure func bound_candidate_row_index(id: BoundCandidateRowId) -> Int:
+	from_opaque BoundCandidateRowId(id)
+
+
+private pure func bound_candidate_related_index(related: Option[BoundCandidateRowId]) -> Int:
+	match related:
+		Some(id):
+			bound_candidate_row_index(id)
+		None:
+			BOUND_CANDIDATE_NO_RELATED_ROW
+
+
+private pure func bound_candidate_table_append_local(
+	table: BoundCandidateTable,
+	source_name_index: Int,
+	kind: TopLevelNameKind,
+	outcome: BoundCandidateOutcomeTag,
+	related: Option[BoundCandidateRowId],
+) -> BoundCandidateTable:
+	if outcome == BoundAcceptedOutcome:
+		{ table | candidate_count = table.candidate_count + 1 }
+	else:
+		{ table |
+			rejected_local_rows = table.rejected_local_rows.append({
+				issued_order = table.candidate_count,
+				source_name_index = source_name_index,
+				local_kind = kind,
+				related_row_index = bound_candidate_related_index(related),
+			}),
+			candidate_count = table.candidate_count + 1
+		}
+
+
+private pure func bound_candidate_table_append_accepted_import(
+	table: BoundCandidateTable,
+	request: BoundImportRequest,
+) -> BoundCandidateTable:
+	{ table |
+		accepted_import_row_ids = table.accepted_import_row_ids.append(
+			bound_candidate_row_id(table.candidate_count),
+		),
+		accepted_imports = table.accepted_imports.append(request),
+		candidate_count = table.candidate_count + 1
+	}
+
+
+private pure func bound_qualified_import_request(
+	local_name_index: Option[Int],
+	local_name: String,
+	module_id: ModuleId,
+) -> BoundImportRequest:
+	uncataloged_local_name = if local_name_index.is_none():
+		Some(local_name)
+	else:
+		None
+
+	BoundQualifiedImportRequest(
+		local_name_index.get_or(BOUND_CANDIDATE_NO_SOURCE_NAME),
+		module_id,
+		uncataloged_local_name,
+	)
+
+
+private pure func graph_import_admission_rep_append_import(
+	build: GraphImportAdmissionRep,
+	request: BoundImportRequest,
+	outcome: BoundCandidateOutcomeTag,
+	related: Option[BoundCandidateRowId],
+) -> GraphImportAdmissionRep:
+	rejected_increment = if outcome == BoundAcceptedOutcome:
+		0
+	else:
+		1
+
+	{ build |
+		candidate_newest_first = BoundImportCandidateLogNode(
+			request,
+			outcome,
+			bound_candidate_related_index(related),
+			build.candidate_newest_first,
+		),
+		candidate_count = build.candidate_count + 1,
+		candidate_rejected_import_count = build.candidate_rejected_import_count + rejected_increment
+	}
+
+
+private pure func graph_import_admission_append_import(
+	build: GraphImportAdmissionRep,
+	request: BoundImportRequest,
+	outcome: BoundCandidateOutcomeTag,
+	related: Option[BoundCandidateRowId],
+) -> GraphImportAdmission:
+	next = graph_import_admission_rep_append_import(build, request, outcome, related)
+	graph_import_admission_from_rep(next)
+
+
+private pure func bound_import_request_local_name(
+	visibility: BoundVisibility,
+	request: BoundImportRequest,
+) -> Option[String]:
+	name_table = graph_source_name_table_source_names(
+		graph_module_name_scope_graph_names(visibility.issuer),
+	)
+
+	(local_source_name_index, uncataloged_local_name) = match request:
+		BoundQualifiedImportRequest(index, _, uncataloged) | BoundSelectiveDefinitionRequest(index, _, _, uncataloged) | BoundSelectiveTraitMethodRequest(index, _, _, _, uncataloged, _):
+			(index, uncataloged)
+
+	-- ImportBinding is a source-oriented compatibility value with an independent
+	-- lifetime. Copy the spelling only at this projection boundary; retained
+	-- normalized rows continue to own only the catalog index.
+	match source_name_table_id_at(name_table, local_source_name_index):
+		Some(name_id):
+			source_name_table_spelling(
+				name_table,
+				name_id,
+			).map(
+				func(name): name.substring(0, name.length()),
+			)
+		None:
+			uncataloged_local_name
+
+
+-- Accepted rows remain under the same graph scope as the source-name table,
+-- so their record can retain the catalog spelling directly. Source-oriented
+-- ImportBinding projections use the copying helper above because they escape
+-- this owner as independent compatibility values.
+private pure func bound_import_request_catalog_local_name(
+	visibility: BoundVisibility,
+	request: BoundImportRequest,
+) -> Option[String]:
+	name_table = graph_source_name_table_source_names(
+		graph_module_name_scope_graph_names(visibility.issuer),
+	)
+
+	local_source_name_index = match request:
+		BoundQualifiedImportRequest(index, _, _) | BoundSelectiveDefinitionRequest(index, _, _, _) | BoundSelectiveTraitMethodRequest(index, _, _, _, _, _):
+			index
+
+	name_id ?= source_name_table_id_at(name_table, local_source_name_index)
+	source_name_table_spelling(name_table, name_id)
+
+
+private pure func bound_import_request_trait_source_name(
+	visibility: BoundVisibility,
+	request: BoundImportRequest,
+) -> Option[String]:
+	name_table = graph_source_name_table_source_names(
+		graph_module_name_scope_graph_names(visibility.issuer),
+	)
+
+	match request:
+		BoundSelectiveTraitMethodRequest(_, _, source_name_index, _, _, uncataloged):
+			match source_name_table_id_at(name_table, source_name_index):
+				Some(name_id):
+					source_name_table_spelling(
+						name_table,
+						name_id,
+					).map(
+						func(name): name.substring(0, name.length()),
+					)
+				None:
+					uncataloged
+		_:
+			None
+
+
+private pure func bound_import_request_definition_ids(
+	request: BoundImportRequest,
+) -> List[DefinitionId]:
+	match request:
+		BoundSelectiveDefinitionRequest(_, _, definition_ids, _) | BoundSelectiveTraitMethodRequest(_, _, _, definition_ids, _, _):
+			definition_ids
+		_:
+			[]
+
+
+private pure func bound_import_request_local_source_name_index(request: BoundImportRequest) -> Int:
+	match request:
+		BoundQualifiedImportRequest(index, _, _) | BoundSelectiveDefinitionRequest(index, _, _, _) | BoundSelectiveTraitMethodRequest(index, _, _, _, _, _):
+			index
+
+
+private pure func bound_import_request_module_id(request: BoundImportRequest) -> ModuleId:
+	match request:
+		BoundQualifiedImportRequest(_, module_id, _) | BoundSelectiveDefinitionRequest(_, module_id, _, _) | BoundSelectiveTraitMethodRequest(_, module_id, _, _, _, _):
+			module_id
+
+
+private pure func bound_import_request_is_definition(request: BoundImportRequest) -> Bool:
+	match request:
+		BoundSelectiveDefinitionRequest(_, _, _, _):
+			True
+		_:
+			False
+
+
+private pure func bound_import_request_is_selective(request: BoundImportRequest) -> Bool:
+	match request:
+		BoundQualifiedImportRequest(_, _, _):
+			False
+		_:
+			True
+
+
+private pure func bound_import_binding(
+	visibility: BoundVisibility,
+	request: BoundImportRequest,
+) -> Option[ImportBinding]:
+	local_name ?= bound_import_request_local_name(visibility, request)
+
+	match request:
+		BoundQualifiedImportRequest(_, module_id, _):
+			Some(GraphQualifiedModuleBinding(local_name, module_id))
+		BoundSelectiveDefinitionRequest(_, module_id, _, _):
+			Some(
+				GraphSelectiveDefinitionBinding(
+					local_name,
+					module_id,
+					bound_import_request_definition_ids(request),
+				),
+			)
+		BoundSelectiveTraitMethodRequest(_, module_id, _, _, _, _):
+			source_name ?= bound_import_request_trait_source_name(visibility, request)
+			Some(
+				GraphSelectiveTraitMethodBinding(
+					local_name,
+					module_id,
+					source_name,
+					bound_import_request_definition_ids(request),
+				),
+			)
+
+
+private pure func bound_import_candidate(
+	visibility: BoundVisibility,
+	row_id: BoundCandidateRowId,
+	request: BoundImportRequest,
+	outcome: BoundCandidateOutcomeTag,
+	related_row_index: Int,
+) -> Option[BoundCandidate]:
+	binding ?= bound_import_binding(visibility, request)
+
+	match binding:
+		GraphQualifiedModuleBinding(local_name, module_id):
+			Some(
+				match outcome:
+					BoundAcceptedOutcome:
+						BoundQualifiedImportAcceptedCandidate(row_id, local_name, module_id)
+					BoundAlreadyPresentOutcome:
+						BoundQualifiedImportAlreadyPresentCandidate(
+							row_id,
+							local_name,
+							module_id,
+							bound_candidate_row_id(related_row_index),
+						)
+					BoundAliasConflictOutcome:
+						BoundQualifiedImportAliasConflictCandidate(
+							row_id,
+							local_name,
+							module_id,
+							bound_candidate_row_id(related_row_index),
+						)
+					BoundSelectiveConflictOutcome:
+						BoundQualifiedImportSelectiveConflictCandidate(
+							row_id,
+							local_name,
+							module_id,
+							bound_candidate_row_id(related_row_index),
+						)
+					BoundLocalConflictOutcome:
+						BoundQualifiedImportLocalConflictCandidate(
+							row_id,
+							local_name,
+							module_id,
+							bound_candidate_row_id(related_row_index),
+						)
+					BoundInvalidSourceOutcome:
+						BoundQualifiedImportInvalidSourceCandidate(row_id, local_name, module_id)
+					BoundInvalidTargetOutcome:
+						BoundQualifiedImportInvalidTargetCandidate(row_id, local_name, module_id)
+			)
+		GraphSelectiveDefinitionBinding(local_name, module_id, definition_ids):
+			Some(
+				match outcome:
+					BoundAcceptedOutcome:
+						BoundSelectiveDefinitionAcceptedCandidate(
+							row_id,
+							local_name,
+							module_id,
+							definition_ids,
+						)
+					BoundAliasConflictOutcome:
+						BoundSelectiveDefinitionAliasConflictCandidate(
+							row_id,
+							local_name,
+							module_id,
+							definition_ids,
+							bound_candidate_row_id(related_row_index),
+						)
+					BoundSelectiveConflictOutcome | BoundAlreadyPresentOutcome:
+						BoundSelectiveDefinitionSelectiveConflictCandidate(
+							row_id,
+							local_name,
+							module_id,
+							definition_ids,
+							bound_candidate_row_id(related_row_index),
+						)
+					BoundLocalConflictOutcome:
+						BoundSelectiveDefinitionLocalConflictCandidate(
+							row_id,
+							local_name,
+							module_id,
+							definition_ids,
+							bound_candidate_row_id(related_row_index),
+						)
+					BoundInvalidSourceOutcome:
+						BoundSelectiveDefinitionInvalidSourceCandidate(
+							row_id,
+							local_name,
+							module_id,
+							definition_ids,
+						)
+					BoundInvalidTargetOutcome:
+						BoundSelectiveDefinitionInvalidTargetCandidate(
+							row_id,
+							local_name,
+							module_id,
+							definition_ids,
+						)
+			)
+		GraphSelectiveTraitMethodBinding(local_name, module_id, source_name, definition_ids):
+			Some(
+				match outcome:
+					BoundAcceptedOutcome:
+						BoundSelectiveTraitMethodAcceptedCandidate(
+							row_id,
+							local_name,
+							module_id,
+							source_name,
+							definition_ids,
+						)
+					BoundAliasConflictOutcome:
+						BoundSelectiveTraitMethodAliasConflictCandidate(
+							row_id,
+							local_name,
+							module_id,
+							source_name,
+							definition_ids,
+							bound_candidate_row_id(related_row_index),
+						)
+					BoundSelectiveConflictOutcome | BoundAlreadyPresentOutcome:
+						BoundSelectiveTraitMethodSelectiveConflictCandidate(
+							row_id,
+							local_name,
+							module_id,
+							source_name,
+							definition_ids,
+							bound_candidate_row_id(related_row_index),
+						)
+					BoundLocalConflictOutcome:
+						BoundSelectiveTraitMethodLocalConflictCandidate(
+							row_id,
+							local_name,
+							module_id,
+							source_name,
+							definition_ids,
+							bound_candidate_row_id(related_row_index),
+						)
+					BoundInvalidSourceOutcome:
+						BoundSelectiveTraitMethodInvalidSourceCandidate(
+							row_id,
+							local_name,
+							module_id,
+							source_name,
+							definition_ids,
+						)
+					BoundInvalidTargetOutcome:
+						BoundSelectiveTraitMethodInvalidTargetCandidate(
+							row_id,
+							local_name,
+							module_id,
+							source_name,
+							definition_ids,
+						)
+			)
+		_:
+			None
+
+
+private pure func bound_accepted_local_candidate_rows(
+	visibility: BoundVisibility,
+) -> List[BoundAcceptedLocalCandidateRow]:
+	var rows: List[BoundAcceptedLocalCandidateRow] = []
+
+	for (source_name_index, occupancy) in visibility.rows_by_source_name_index:
+		match occupancy:
+			BoundLocalName(row_id, _):
+				rows = rows.append({
+					issued_order = bound_candidate_row_index(row_id),
+					source_name_index = source_name_index,
+				})
+			_:
+				void
+
+	rows.sort_by(func(row): row.issued_order)
+
+
+private pure func bound_candidates_from_visibility(
+	visibility: BoundVisibility,
+) -> List[BoundCandidate]:
+	name_table = graph_source_name_table_source_names(
+		graph_module_name_scope_graph_names(visibility.issuer),
+	)
+	var candidates: List[BoundCandidate] = []
+	var accepted_local_index: Int = 0
+	var rejected_local_index: Int = 0
+	var accepted_index: Int = 0
+	var rejected_index: Int = 0
+	accepted_local_rows = bound_accepted_local_candidate_rows(visibility)
+
+	for issued_order in 0..visibility.candidate_count:
+		accepted_local_row = accepted_local_rows.get(accepted_local_index)
+
+		if (
+			accepted_local_row
+				.map(func(row): row.issued_order == issued_order)
+				.get_or(False)
+		):
+			match accepted_local_row:
+				Some(row):
+					match (
+						source_name_table_id_at(name_table, row.source_name_index),
+						visibility.rows_by_source_name_index.get(row.source_name_index),
+					):
+						(Some(name_id), Some(BoundLocalName(_, kind))):
+							match source_name_table_spelling(name_table, name_id):
+								Some(local_name):
+									candidates = candidates.append(
+										BoundLocalNameAcceptedCandidate(
+											bound_candidate_row_id(issued_order),
+											local_name,
+											kind,
+										),
+									)
+								None:
+									void
+						_:
+							void
+				None:
+					void
+
+			accepted_local_index += 1
+		else:
+			rejected_local_row = visibility.candidate_rejected_local_rows.get(rejected_local_index)
+
+			if (
+				rejected_local_row
+					.map(func(row): row.issued_order == issued_order)
+					.get_or(False)
+			):
+				match rejected_local_row:
+					Some(row):
+						match source_name_table_id_at(name_table, row.source_name_index):
+							Some(name_id):
+								match source_name_table_spelling(name_table, name_id):
+									Some(local_name):
+										candidates = candidates.append(
+											BoundLocalNameAlreadyPresentCandidate(
+												bound_candidate_row_id(issued_order),
+												local_name,
+												row.local_kind,
+												bound_candidate_row_id(row.related_row_index),
+											),
+										)
+									None:
+										void
+							None:
+								void
+					None:
+						void
+
+				rejected_local_index += 1
+			else:
+				rejected_row = visibility.candidate_rejected_rows.get(rejected_index)
+
+				if (
+					rejected_row
+						.map(func(row): row.issued_order == issued_order)
+						.get_or(False)
+				):
+					match rejected_row:
+						Some(row):
+							match visibility.candidate_rejected_imports.get(
+								row.request_payload_index,
+							):
+								Some(request):
+									match bound_import_candidate(
+										visibility,
+										bound_candidate_row_id(issued_order),
+										request,
+										row.outcome_tag,
+										row.related_row_index,
+									):
+										Some(candidate):
+											candidates = candidates.append(candidate)
+										None:
+											void
+								None:
+									void
+						None:
+							void
+
+					rejected_index += 1
+				else:
+					accepted_row_id = visibility.candidate_accepted_import_row_ids.get(
+						accepted_index,
+					)
+
+					if (
+						accepted_row_id
+							.map(func(row_id): bound_candidate_row_index(row_id) == issued_order)
+							.get_or(False)
+					):
+						match visibility.candidate_accepted_imports.get(accepted_index):
+							Some(request):
+								match bound_import_candidate(
+									visibility,
+									bound_candidate_row_id(issued_order),
+									request,
+									BoundAcceptedOutcome,
+									BOUND_CANDIDATE_NO_RELATED_ROW,
+								):
+									Some(candidate):
+										candidates = candidates.append(candidate)
+									None:
+										void
+							None:
+								void
+
+						accepted_index += 1
+
+	candidates
+
+
+pure func module_view_bound_candidates(view: ModuleView) -> List[BoundCandidate]:
+	match module_view_rep(view).graph_visibility:
+		Some(visibility):
+			bound_candidates_from_visibility(visibility)
+		None:
+			[]
+
+
+private pure func bound_candidates_have_accepted_import(candidates: BoundCandidateTable) -> Bool:
+	not candidates.accepted_imports.is_empty()
+
+
 pure func module_view_has_graph_source_names(view: ModuleView) -> Bool:
 	module_view_rep(view).graph_visibility.is_some()
+
+
+private pure func graph_import_admission_rep(
+	admission: GraphImportAdmission,
+) -> GraphImportAdmissionRep:
+	from_opaque GraphImportAdmission(admission)
+
+
+private pure func graph_import_admission_from_rep(
+	representation: GraphImportAdmissionRep,
+) -> GraphImportAdmission:
+	into_opaque GraphImportAdmission(representation)
+
+
+-- Walk the O(1)-prepend construction log once, then publish the fresh columns
+-- directly when the admission began from the production binder's empty import
+-- prefix. Scalar compatibility wrappers may reopen a view, in which case one
+-- bounded concat preserves its prior rows.
+private pure func bound_candidate_builder_finish(
+	build: GraphImportAdmissionRep,
+) -> BoundCandidateTable:
+	new_candidate_count = build.candidate_count - build.candidate_initial_table.candidate_count
+	accepted_count = new_candidate_count - build.candidate_rejected_import_count
+	var newest_accepted_import_row_ids: List[BoundCandidateRowId] = list(accepted_count)
+	var newest_accepted_imports: List[BoundImportRequest] = list(accepted_count)
+	var newest_rejected_rows: List[BoundRejectedImportRow] = list(
+		build.candidate_rejected_import_count,
+	)
+	var newest_rejected_imports: List[BoundImportRequest] = list(
+		build.candidate_rejected_import_count,
+	)
+	var reverse_rejected_index: Int = 0
+	var issued_order: Int = build.candidate_count - 1
+	var remaining = build.candidate_newest_first
+	var complete = False
+
+	while not complete:
+		match remaining:
+			EmptyBoundCandidateLog:
+				complete = True
+			BoundImportCandidateLogNode(request, outcome, related_row_index, tail):
+				remaining = tail
+
+				if outcome == BoundAcceptedOutcome:
+					newest_accepted_import_row_ids = newest_accepted_import_row_ids.append(
+						bound_candidate_row_id(issued_order),
+					)
+					newest_accepted_imports = newest_accepted_imports.append(request)
+				else:
+					payload_index = build.candidate_initial_table.rejected_imports.length() + build.candidate_rejected_import_count - reverse_rejected_index - 1
+					newest_rejected_rows = newest_rejected_rows.append({
+						issued_order = issued_order,
+						request_payload_index = payload_index,
+						outcome_tag = outcome,
+						related_row_index = related_row_index,
+					})
+					newest_rejected_imports = newest_rejected_imports.append(request)
+					reverse_rejected_index += 1
+
+				issued_order -= 1
+
+	new_accepted_import_row_ids = newest_accepted_import_row_ids.reverse()
+	new_accepted_imports = newest_accepted_imports.reverse()
+	new_rejected_rows = newest_rejected_rows.reverse()
+	new_rejected_imports = newest_rejected_imports.reverse()
+	initial = build.candidate_initial_table
+
+	accepted_import_row_ids = if initial.accepted_import_row_ids.is_empty():
+		new_accepted_import_row_ids
+	else:
+		initial.accepted_import_row_ids.concat(new_accepted_import_row_ids)
+
+	accepted_imports = if initial.accepted_imports.is_empty():
+		new_accepted_imports
+	else:
+		initial.accepted_imports.concat(new_accepted_imports)
+
+	rejected_rows = if initial.rejected_rows.is_empty():
+		new_rejected_rows
+	else:
+		initial.rejected_rows.concat(new_rejected_rows)
+
+	rejected_imports = if initial.rejected_imports.is_empty():
+		new_rejected_imports
+	else:
+		initial.rejected_imports.concat(new_rejected_imports)
+
+	{ initial |
+		accepted_import_row_ids = accepted_import_row_ids,
+		accepted_imports = accepted_imports,
+		rejected_rows = rejected_rows,
+		rejected_imports = rejected_imports,
+		candidate_count = build.candidate_count
+	}
+
+
+private pure func module_view_rep_has_accepted_authority(representation: ModuleViewRep) -> Bool:
+	(
+		representation.accepted_alias_authority.is_some()
+		or representation.accepted_record_authority.is_some()
+		or representation.accepted_union_authority.is_some()
+		or representation.accepted_global_authority.is_some()
+		or representation.accepted_callable_authority.is_some()
+		or representation.accepted_trait_implementation_authority.is_some()
+	)
+
+
+pure func graph_import_admission_begin(
+	view: ModuleView,
+	module_table: ModuleTable,
+	current_module_id: ModuleId,
+) -> Option[GraphImportAdmission]:
+	representation = module_view_rep(view)
+
+	if (
+		module_view_graph_has_owner(view, module_table, current_module_id)
+		and not module_view_has_standalone_import_bindings(view)
+		and not module_view_rep_has_accepted_authority(representation)
+	):
+		match representation.graph_visibility:
+			Some(visibility):
+				table = bound_visibility_candidate_table(visibility)
+				Some(graph_import_admission_from_rep({
+					initial_view = view,
+					rows_by_source_name_index = visibility.rows_by_source_name_index,
+					candidate_initial_table = table,
+					candidate_newest_first = EmptyBoundCandidateLog,
+					candidate_count = table.candidate_count,
+					candidate_rejected_import_count = 0,
+				}))
+			None:
+				None
+	else:
+		None
+
+
+pure func graph_import_admission_finish(admission: GraphImportAdmission) -> ModuleView:
+	build = graph_import_admission_rep(admission)
+	representation = module_view_rep(build.initial_view)
+
+	match representation.graph_visibility:
+		Some(visibility):
+			candidates = bound_candidate_builder_finish(build)
+
+			domain = if not bound_candidates_have_accepted_import(candidates):
+				representation.import_binding_domain
+			else:
+				GraphImportBindings
+
+			next_visibility = bound_visibility_with_candidate_table(
+				{ visibility | rows_by_source_name_index = build.rows_by_source_name_index },
+				candidates,
+			)
+			module_view_from_rep({ representation |
+					graph_visibility = Some(next_visibility),
+					import_binding_domain = domain
+				})
+		None:
+			build.initial_view
+
+
+pure func graph_import_admission_record_constructor(
+	admission: GraphImportAdmission,
+	binding: ImportedConstructorBinding,
+) -> Option[GraphImportAdmission]:
+	build = graph_import_admission_rep(admission)
+	representation = module_view_rep(build.initial_view)
+	name_index ?= module_view_graph_source_name_index(representation, binding.local_name)
+	occupancy ?= build.rows_by_source_name_index.get(name_index)
+
+	next = if graph_import_admission_latest_binding_is_definition(build, binding.local_name):
+		match occupancy:
+			BoundSelectiveName(row_id, module_id, original_source_name_index):
+				bound_constructor_payload_for_binding(
+					representation,
+					name_index,
+					module_id,
+					original_source_name_index,
+					binding,
+				).map(
+					func(
+						payload,
+					): BoundConstructorName(
+						row_id,
+						payload.imported_name.module_id,
+						payload.imported_name.original_source_name_index,
+						payload.parent_local_name_index,
+						payload.parent_source_name_index,
+					),
+				)
+			BoundAliasAndSelectiveName(alias_row_id, alias_module_id, selective_row_id, imported_module_id, original_source_name_index):
+				bound_constructor_payload_for_binding(
+					representation,
+					name_index,
+					imported_module_id,
+					original_source_name_index,
+					binding,
+				).map(
+					func(
+						payload,
+					): BoundAliasAndConstructorName(
+						alias_row_id,
+						alias_module_id,
+						selective_row_id,
+						payload.imported_name.module_id,
+						payload.imported_name.original_source_name_index,
+						payload.parent_local_name_index,
+						payload.parent_source_name_index,
+					),
+				)
+			_:
+				None
+	else:
+		None
+
+	next_occupancy ?= next
+	Some(
+		graph_import_admission_from_rep(
+			{ build |
+				rows_by_source_name_index = build.rows_by_source_name_index.set(
+					name_index,
+					next_occupancy,
+				)
+			},
+		),
+	)
+
+
+-- Constructor validation in TypecheckState calls this immediately after the
+-- selective definition admission. Checking the newest request prevents a
+-- trait-method row from being reinterpreted as a constructor.
+private pure func graph_import_admission_latest_binding_is_definition(
+	build: GraphImportAdmissionRep,
+	local_name: String,
+) -> Bool:
+	representation = module_view_rep(build.initial_view)
+	expected_index = module_view_graph_source_name_index(representation, local_name)
+
+	match build.candidate_newest_first:
+		BoundImportCandidateLogNode(request, BoundAcceptedOutcome, _, _):
+			latest_source_name_index = match request:
+				BoundSelectiveDefinitionRequest(source_name_index, _, _, _):
+					source_name_index
+				_:
+					BOUND_CANDIDATE_NO_SOURCE_NAME
+
+			(
+				bound_import_request_is_definition(request)
+				and expected_index == Some(latest_source_name_index)
+			)
+		_:
+			False
+
+
+private pure func bound_constructor_payload_for_binding(
+	representation: ModuleViewRep,
+	local_source_name_index: Int,
+	module_id: ModuleId,
+	original_source_name_index: Int,
+	constructor: ImportedConstructorBinding,
+) -> Option[BoundConstructorPayload]:
+	visibility ?= representation.graph_visibility
+	imported_payload: BoundImportedNamePayload = {
+		module_id = module_id,
+		original_source_name_index = original_source_name_index
+	}
+	imported ?= bound_imported_name_from_payload(
+		visibility,
+		local_source_name_index,
+		imported_payload,
+	)
+	parent_local_name_index ?= module_view_graph_source_name_index(
+		representation,
+		constructor.parent_local_name,
+	)
+	parent_source_name_index ?= module_view_graph_source_name_index(
+		representation,
+		constructor.parent_name,
+	)
+	matches = (
+		imported.local_name == constructor.local_name
+		and imported.module_path == constructor.module_path
+		and imported.original_name == constructor.original_name
+	)
+
+	if matches:
+		Some({
+			imported_name = imported_payload,
+			parent_local_name_index = parent_local_name_index,
+			parent_source_name_index = parent_source_name_index,
+		})
+	else:
+		None
 
 
 pure func module_view_graph_bound_name_count(view: ModuleView) -> Int:
@@ -220,22 +1283,19 @@ pure func module_view_bind_initial_graph_local_names(
 		None
 	else:
 		representation = module_view_rep(view)
+
 		match representation.graph_visibility:
 			None:
 				None
 			Some(visibility):
 				if (
 					not visibility.rows_by_source_name_index.is_empty()
+					or visibility.candidate_count > 0
 					or representation.import_binding_domain != NoImportBindings
 					or not representation.imported_names.is_empty()
 					or not representation.imported_constructors.is_empty()
-					or not representation.import_bindings.is_empty()
-					or representation.accepted_alias_authority.is_some()
-					or representation.accepted_record_authority.is_some()
-					or representation.accepted_union_authority.is_some()
-					or representation.accepted_global_authority.is_some()
-					or representation.accepted_callable_authority.is_some()
-					or representation.accepted_trait_implementation_authority.is_some()
+					or not representation.standalone_import_bindings.is_empty()
+					or module_view_rep_has_accepted_authority(representation)
 				):
 					None
 				else if local_names.is_empty():
@@ -245,6 +1305,9 @@ pure func module_view_bind_initial_graph_local_names(
 						graph_module_name_scope_graph_names(visibility.issuer),
 					)
 					var rows_by_source_name_index: Dict[Int, BoundNameOccupancy] = {}
+					initial_candidates = bound_visibility_candidate_table(visibility)
+					var rejected_local_rows = initial_candidates.rejected_local_rows
+					var candidate_count = initial_candidates.candidate_count
 					var all_cataloged = True
 
 					for candidate in local_names:
@@ -253,20 +1316,51 @@ pure func module_view_bind_initial_graph_local_names(
 								all_cataloged = False
 							Some(source_name_id):
 								source_name_index = source_name_id_table_index(source_name_id)
-								if not rows_by_source_name_index.contains(source_name_index):
-									rows_by_source_name_index = rows_by_source_name_index.set(
-										source_name_index,
-										BoundLocalName(candidate[1]),
-									)
+
+								match rows_by_source_name_index.get(source_name_index):
+									Some(existing):
+										match bound_name_local_row_id(existing):
+											Some(winner):
+												rejected_local_rows = rejected_local_rows.append({
+													issued_order = candidate_count,
+													source_name_index = source_name_index,
+													local_kind = candidate[1],
+													related_row_index = bound_candidate_row_index(
+														winner,
+													),
+												})
+												candidate_count += 1
+											None:
+												all_cataloged = False
+									None:
+										row_id = bound_candidate_row_id(candidate_count)
+										candidate_count += 1
+										rows_by_source_name_index = rows_by_source_name_index.set(
+											source_name_index,
+											BoundLocalName(row_id, candidate[1]),
+										)
 
 					if not all_cataloged:
 						None
 					else:
-						Some(module_view_from_rep({ representation |
-							graph_visibility = Some({ visibility |
-								rows_by_source_name_index = rows_by_source_name_index
-							})
-						}))
+						candidates = { initial_candidates |
+							rejected_local_rows = rejected_local_rows,
+							candidate_count = candidate_count
+						}
+						Some(
+							module_view_from_rep(
+								{ representation |
+									graph_visibility = Some(
+										bound_visibility_with_candidate_table(
+											{ visibility |
+												rows_by_source_name_index = rows_by_source_name_index
+											},
+											candidates,
+										),
+									)
+								},
+							),
+						)
 
 
 pure func module_view_graph_has_owner(
@@ -288,6 +1382,18 @@ pure func module_view_graph_has_owner(
 					module_id,
 				)
 			)
+		None:
+			False
+
+
+pure func module_view_graph_has_exact_catalog(
+	view: ModuleView,
+	graph_names: GraphSourceNameTable,
+	module_id: ModuleId,
+) -> Bool:
+	match module_view_rep(view).graph_visibility:
+		Some(visibility):
+			graph_module_name_scope_matches_catalog(visibility.issuer, graph_names, module_id)
 		None:
 			False
 
@@ -356,12 +1462,14 @@ pure func module_view_module_alias_count(view: ModuleView) -> Int:
 	match representation.import_binding_domain:
 		GraphImportBindings:
 			var count: Int = 0
-			for binding in representation.import_bindings:
+
+			for binding in module_view_import_bindings(view):
 				match binding:
 					GraphQualifiedModuleBinding(_, _):
 						count += 1
 					_:
 						void
+
 			count
 		StandaloneImportBindings:
 			representation.standalone_module_aliases_by_local_name.length()
@@ -376,6 +1484,7 @@ private pure func graph_imported_names_from_bindings(
 	bindings: List[ImportBinding],
 ) -> List[ImportedNameBinding]:
 	var names: List[ImportedNameBinding] = []
+
 	for binding in bindings:
 		match binding:
 			GraphSelectiveDefinitionBinding(local_name, _, _) | GraphSelectiveTraitMethodBinding(local_name, _, _, _):
@@ -386,36 +1495,310 @@ private pure func graph_imported_names_from_bindings(
 						void
 			_:
 				void
+
 	names
 
 
 pure func module_view_imported_names(view: ModuleView) -> List[ImportedNameBinding]:
 	representation = module_view_rep(view)
+
 	match representation.graph_visibility:
-		Some(_):
-			graph_imported_names_from_bindings(view, representation.import_bindings)
+		Some(visibility):
+			graph_imported_names_from_bindings(view, module_view_import_bindings(view))
 		None:
 			representation.imported_names
 
 
 pure func module_view_imported_constructors(view: ModuleView) -> List[ImportedConstructorBinding]:
-	module_view_rep(view).imported_constructors
+	representation = module_view_rep(view)
+
+	match representation.graph_visibility:
+		None:
+			representation.imported_constructors
+		Some(visibility):
+			var constructors: List[ImportedConstructorBinding] = []
+
+			for binding in module_view_import_bindings(view):
+				match binding:
+					GraphSelectiveDefinitionBinding(local_name, _, _):
+						match module_view_graph_source_name_index(representation, local_name):
+							Some(name_index):
+								match module_view_graph_occupancy(representation, name_index):
+									Some(occupancy):
+										match bound_name_constructor(
+											visibility,
+											name_index,
+											occupancy,
+										):
+											Some(constructor):
+												constructors = constructors.append(constructor)
+											None:
+												void
+									None:
+										void
+							None:
+								void
+					_:
+						void
+
+			constructors
+
+
+private pure func bound_constructor_payload_for_candidate(
+	occupancy: BoundNameOccupancy,
+	candidate_row_id: BoundCandidateRowId,
+) -> Option[BoundConstructorPayload]:
+	expected_row_index = bound_candidate_row_index(candidate_row_id)
+
+	match occupancy:
+		BoundConstructorName(row_id, module_id, original_index, parent_local_index, parent_index) | BoundAliasAndConstructorName(_, _, row_id, module_id, original_index, parent_local_index, parent_index):
+			if bound_candidate_row_index(row_id) == expected_row_index:
+				Some({
+					imported_name = {
+						module_id = module_id,
+						original_source_name_index = original_index
+					},
+					parent_local_name_index = parent_local_index,
+					parent_source_name_index = parent_index,
+				})
+			else:
+				None
+		_:
+			None
+
+
+pure func module_view_accepted_definition_bindings(
+	view: ModuleView,
+) -> List[BoundAcceptedDefinitionBinding]:
+	match module_view_rep(view).graph_visibility:
+		None:
+			[]
+		Some(visibility):
+			var bindings: List[BoundAcceptedDefinitionBinding] = list(
+				visibility.candidate_accepted_imports.length(),
+			)
+			accepted_row_ids = visibility.candidate_accepted_import_row_ids
+
+			for index in 0..visibility.candidate_accepted_imports.length():
+				match (
+					accepted_row_ids.get(index),
+					visibility.candidate_accepted_imports.get(index),
+				):
+					(Some(row_id), Some(request)):
+						if bound_import_request_is_definition(request):
+							match bound_import_request_catalog_local_name(visibility, request):
+								Some(local_name):
+									bindings = bindings.append({
+										candidate_row_id = row_id,
+										local_name = local_name,
+										module_id = bound_import_request_module_id(request),
+										definition_ids = bound_import_request_definition_ids(
+											request,
+										),
+									})
+								None:
+									void
+					_:
+						void
+
+			bindings
+
+
+pure func module_view_accepted_constructor_bindings(
+	view: ModuleView,
+) -> List[BoundAcceptedConstructorBinding]:
+	representation = module_view_rep(view)
+
+	match representation.graph_visibility:
+		None:
+			[]
+		Some(visibility):
+			var constructors: List[BoundAcceptedConstructorBinding] = []
+			name_table = graph_source_name_table_source_names(
+				graph_module_name_scope_graph_names(visibility.issuer),
+			)
+			accepted_row_ids = visibility.candidate_accepted_import_row_ids
+
+			for index in 0..visibility.candidate_accepted_imports.length():
+				match (
+					accepted_row_ids.get(index),
+					visibility.candidate_accepted_imports.get(index),
+				):
+					(Some(row_id), Some(request)):
+						if bound_import_request_is_definition(request):
+							match bound_import_binding(visibility, request):
+								Some(GraphSelectiveDefinitionBinding(local_name, module_id, definition_ids)):
+									occupancy = visibility.rows_by_source_name_index.get(
+										bound_import_request_local_source_name_index(request),
+									)
+									constructor = occupancy.and_then(
+										func(
+											found,
+										): bound_constructor_payload_for_candidate(found, row_id),
+									)
+
+									match constructor:
+										Some(constructor):
+											match source_name_table_id_at(
+												name_table,
+												constructor.parent_local_name_index,
+											).and_then(
+												func(
+													id,
+												): source_name_table_spelling(name_table, id),
+											):
+												Some(parent_local_name):
+													constructors = constructors.append({
+														candidate_row_id = row_id,
+														local_name = local_name,
+														parent_local_name = parent_local_name.substring(
+															0,
+															parent_local_name.length(),
+														),
+														module_id = module_id,
+														definition_ids = definition_ids,
+													})
+												None:
+													void
+										None:
+											void
+								_:
+									void
+					_:
+						void
+
+			constructors
+
+
+private pure func bound_name_constructor(
+	visibility: BoundVisibility,
+	local_source_name_index: Int,
+	occupancy: BoundNameOccupancy,
+) -> Option[ImportedConstructorBinding]:
+	match occupancy:
+		BoundConstructorName(_, module_id, original_index, parent_local_index, parent_index) | BoundAliasAndConstructorName(_, _, _, module_id, original_index, parent_local_index, parent_index):
+			payload: BoundConstructorPayload = {
+				imported_name = {
+					module_id = module_id,
+					original_source_name_index = original_index
+				},
+				parent_local_name_index = parent_local_index,
+				parent_source_name_index = parent_index
+			}
+			imported ?= bound_imported_name_from_payload(
+				visibility,
+				local_source_name_index,
+				payload.imported_name,
+			)
+			name_table = graph_source_name_table_source_names(
+				graph_module_name_scope_graph_names(visibility.issuer),
+			)
+			parent_local_id ?= source_name_table_id_at(name_table, payload.parent_local_name_index)
+			parent_id ?= source_name_table_id_at(name_table, payload.parent_source_name_index)
+			parent_local_name ?= source_name_table_spelling(name_table, parent_local_id)
+			parent_name ?= source_name_table_spelling(name_table, parent_id)
+			Some({
+				local_name = imported.local_name,
+				module_path = imported.module_path,
+				parent_local_name = parent_local_name,
+				parent_name = parent_name,
+				original_name = imported.original_name,
+			})
+		_:
+			None
 
 
 pure func module_view_record_imported_constructor(
 	view: ModuleView,
 	binding: ImportedConstructorBinding,
-) -> ModuleView:
+) -> Option[ModuleView]:
 	representation = module_view_rep(view)
-	module_view_from_rep(
-		{ representation |
-			imported_constructors = representation.imported_constructors.append(binding)
-		},
-	)
+
+	match representation.graph_visibility:
+		None:
+			Some(
+				module_view_from_rep(
+					{ representation |
+						imported_constructors = representation.imported_constructors.append(binding)
+					},
+				),
+			)
+		Some(visibility):
+			-- Scalar graph registration is a compatibility path. Reuse the same
+			-- admission validation so arbitrary metadata cannot enter the view.
+			match graph_import_admission_begin(
+				view,
+				graph_source_name_table_module_table(
+					graph_module_name_scope_graph_names(visibility.issuer),
+				),
+				graph_module_name_scope_module_id(visibility.issuer),
+			):
+				Some(admission):
+					match graph_import_admission_record_constructor(admission, binding):
+						Some(next):
+							Some(graph_import_admission_finish(next))
+						None:
+							None
+				None:
+					None
+
+
+private pure func graph_import_bindings_from_candidates(
+	visibility: BoundVisibility,
+) -> List[ImportBinding]:
+	var bindings: List[ImportBinding] = list(visibility.candidate_accepted_imports.length())
+
+	for request in visibility.candidate_accepted_imports:
+		match bound_import_binding(visibility, request):
+			Some(binding):
+				bindings = bindings.append(binding)
+			None:
+				void
+
+	bindings
 
 
 pure func module_view_import_bindings(view: ModuleView) -> List[ImportBinding]:
-	module_view_rep(view).import_bindings
+	representation = module_view_rep(view)
+
+	match representation.graph_visibility:
+		Some(visibility):
+			graph_import_bindings_from_candidates(visibility)
+		None:
+			representation.standalone_import_bindings
+
+
+pure func module_view_import_binding_count(view: ModuleView) -> Int:
+	representation = module_view_rep(view)
+
+	match representation.graph_visibility:
+		None:
+			representation.standalone_import_bindings.length()
+		Some(visibility):
+			visibility.candidate_accepted_imports.length()
+
+
+-- Standalone views have no graph-issued definition identities, so their
+-- source-facing binding list remains the deliberate compatibility authority.
+-- Graph callers use the exact accepted-definition projection instead.
+pure func module_view_standalone_imported_type_alias_names(
+	view: ModuleView,
+	module_path: String,
+	original_name: String,
+) -> List[String]:
+	representation = module_view_rep(view)
+	var names: List[String] = []
+
+	if representation.graph_visibility.is_none():
+		for binding in representation.standalone_import_bindings:
+			match binding:
+				StandaloneSelectiveDefinitionBinding(local_name, imported_path, source_name):
+					if imported_path == module_path and source_name == original_name:
+						names = names.append(local_name)
+				_:
+					void
+
+	names
 
 
 pure func module_view_accepted_alias_authority(view: ModuleView) -> Option[AcceptedAliasAuthority]:
@@ -527,66 +1910,85 @@ private pure func module_view_graph_occupancy(
 	bound_visibility_occupancy(visibility, source_name_index)
 
 
-private pure func module_view_with_graph_occupancy(
-	representation: ModuleViewRep,
-	source_name_index: Int,
-	occupancy: BoundNameOccupancy,
-) -> ModuleViewRep:
-	match representation.graph_visibility:
-		None:
-			representation
-		Some(visibility):
-			match visibility.rows_by_source_name_index.get(source_name_index):
-				Some(_):
-					next = { visibility |
-						rows_by_source_name_index = visibility.rows_by_source_name_index.set(
-							source_name_index,
-							occupancy,
-						)
-					}
-					{ representation | graph_visibility = Some(next) }
-				None:
-					table = graph_source_name_table_source_names(
-						graph_module_name_scope_graph_names(visibility.issuer),
-					)
-					match source_name_table_id_at(table, source_name_index):
-						Some(_):
-							next = { visibility |
-								rows_by_source_name_index = visibility.rows_by_source_name_index.set(
-									source_name_index,
-									occupancy,
-								)
-							}
-							{ representation | graph_visibility = Some(next) }
-						None:
-							representation
-
-
-private pure func bound_name_module_alias(
-	occupancy: BoundNameOccupancy,
-) -> Option[ModuleId]:
+private pure func bound_name_module_alias(occupancy: BoundNameOccupancy) -> Option[ModuleId]:
 	match occupancy:
-		BoundModuleAlias(module_id) | BoundAliasAndSelectiveName(module_id, _):
+		BoundModuleAlias(_, module_id) | BoundAliasAndSelectiveName(_, module_id, _, _, _) | BoundAliasAndConstructorName(_, module_id, _, _, _, _, _):
 			Some(module_id)
 		_:
 			None
 
 
-private pure func bound_name_imported_name(
+private pure func bound_name_alias_row_id(
 	occupancy: BoundNameOccupancy,
-) -> Option[ImportedNameBinding]:
+) -> Option[BoundCandidateRowId]:
 	match occupancy:
-		BoundSelectiveName(binding) | BoundAliasAndSelectiveName(_, binding):
-			Some(binding)
+		BoundModuleAlias(row_id, _) | BoundAliasAndSelectiveName(row_id, _, _, _, _) | BoundAliasAndConstructorName(row_id, _, _, _, _, _, _):
+			Some(row_id)
 		_:
 			None
 
 
-private pure func bound_name_local_kind(
+private pure func bound_name_selective_row_id(
 	occupancy: BoundNameOccupancy,
-) -> Option[TopLevelNameKind]:
+) -> Option[BoundCandidateRowId]:
 	match occupancy:
-		BoundLocalName(kind):
+		BoundSelectiveName(row_id, _, _) | BoundConstructorName(row_id, _, _, _, _) | BoundAliasAndSelectiveName(_, _, row_id, _, _) | BoundAliasAndConstructorName(_, _, row_id, _, _, _, _):
+			Some(row_id)
+		_:
+			None
+
+
+private pure func bound_name_local_row_id(
+	occupancy: BoundNameOccupancy,
+) -> Option[BoundCandidateRowId]:
+	match occupancy:
+		BoundLocalName(row_id, _):
+			Some(row_id)
+		_:
+			None
+
+
+private pure func bound_imported_name_from_payload(
+	visibility: BoundVisibility,
+	local_source_name_index: Int,
+	payload: BoundImportedNamePayload,
+) -> Option[ImportedNameBinding]:
+	graph_names = graph_module_name_scope_graph_names(visibility.issuer)
+	name_table = graph_source_name_table_source_names(graph_names)
+	module_table = graph_source_name_table_module_table(graph_names)
+	local_id ?= source_name_table_id_at(name_table, local_source_name_index)
+	original_id ?= source_name_table_id_at(name_table, payload.original_source_name_index)
+	local_name ?= source_name_table_spelling(name_table, local_id)
+	original_name ?= source_name_table_spelling(name_table, original_id)
+	module_path ?= module_table_canonical_path(module_table, payload.module_id)
+	Some({
+		local_name = local_name,
+		module_path = module_path,
+		original_name = original_name,
+	})
+
+
+private pure func bound_name_imported_payload(
+	occupancy: BoundNameOccupancy,
+) -> Option[BoundImportedNamePayload]:
+	match occupancy:
+		BoundSelectiveName(_, module_id, original_index) | BoundConstructorName(_, module_id, original_index, _, _):
+			Some({
+				module_id = module_id,
+				original_source_name_index = original_index,
+			})
+		BoundAliasAndSelectiveName(_, _, _, module_id, original_index) | BoundAliasAndConstructorName(_, _, _, module_id, original_index, _, _):
+			Some({
+				module_id = module_id,
+				original_source_name_index = original_index,
+			})
+		_:
+			None
+
+
+private pure func bound_name_local_kind(occupancy: BoundNameOccupancy) -> Option[TopLevelNameKind]:
+	match occupancy:
+		BoundLocalName(_, kind):
 			Some(kind)
 		_:
 			None
@@ -596,8 +1998,19 @@ private pure func module_view_graph_imported_name_at(
 	representation: ModuleViewRep,
 	source_name_index: Int,
 ) -> Option[ImportedNameBinding]:
+	visibility ?= representation.graph_visibility
 	occupancy ?= module_view_graph_occupancy(representation, source_name_index)
-	bound_name_imported_name(occupancy)
+	payload ?= bound_name_imported_payload(occupancy)
+	bound_imported_name_from_payload(visibility, source_name_index, payload)
+
+
+private pure func graph_import_admission_imported_name(
+	build: GraphImportAdmissionRep,
+	source_name_index: Int,
+	payload: BoundImportedNamePayload,
+) -> Option[ImportedNameBinding]:
+	visibility ?= module_view_rep(build.initial_view).graph_visibility
+	bound_imported_name_from_payload(visibility, source_name_index, payload)
 
 
 private pure func module_view_graph_local_kind_at(
@@ -664,10 +2077,11 @@ private pure func module_view_rep_find_imported_name(
 	local_name: String,
 ) -> Option[ImportedNameBinding]:
 	match representation.graph_visibility:
-		Some(_):
+		Some(visibility):
 			name_index ?= module_view_graph_source_name_index(representation, local_name)
 			occupancy ?= module_view_graph_occupancy(representation, name_index)
-			bound_name_imported_name(occupancy)
+			payload ?= bound_name_imported_payload(occupancy)
+			bound_imported_name_from_payload(visibility, name_index, payload)
 		None:
 			representation.standalone_imported_names_by_local_name.get(local_name)
 
@@ -710,94 +2124,6 @@ pure func module_view_has_selective_binding(
 			binding.module_path == module_path and binding.original_name == source_name
 		None:
 			False
-
-
-private pure func module_view_register_graph_module_alias(
-	view: ModuleView,
-	module_table: ModuleTable,
-	local_name: String,
-	module_id: ModuleId,
-) -> ModuleAliasRegistration:
-	representation = module_view_rep(view)
-	name_index = module_view_graph_source_name_index(representation, local_name)
-
-	match name_index:
-		None:
-			ModuleAliasInvalidTarget
-		Some(source_name_index):
-			module_view_register_graph_module_alias_by_name_index(
-				representation,
-				module_table,
-				local_name,
-				source_name_index,
-				module_id,
-			)
-
-
-private pure func module_view_register_graph_module_alias_by_name_index(
-	representation: ModuleViewRep,
-	module_table: ModuleTable,
-	local_name: String,
-	source_name_index: Int,
-	module_id: ModuleId,
-) -> ModuleAliasRegistration:
-	match module_view_graph_occupancy(representation, source_name_index):
-		Some(BoundModuleAlias(existing_module_id)) | Some(BoundAliasAndSelectiveName(existing_module_id, _)):
-			if module_ids_equal(existing_module_id, module_id):
-				ModuleAliasAlreadyPresent
-			else:
-				ModuleAliasConflictsWithAlias(
-					module_view_graph_alias_label(
-						Some(module_table),
-						existing_module_id,
-					),
-				)
-		Some(BoundSelectiveName(existing_binding)):
-			if not module_view_graph_target_matches_path(
-				Some(module_table),
-				module_id,
-				existing_binding.module_path,
-			):
-				ModuleAliasConflictsWithImportedName(existing_binding)
-			else:
-				module_view_add_graph_module_alias(
-					representation,
-					local_name,
-					source_name_index,
-					module_id,
-				)
-		Some(BoundLocalName(existing_kind)):
-			ModuleAliasConflictsWithLocalName(existing_kind)
-		None:
-			module_view_add_graph_module_alias(
-				representation,
-				local_name,
-				source_name_index,
-				module_id,
-			)
-
-
-private pure func module_view_add_graph_module_alias(
-	representation: ModuleViewRep,
-	local_name: String,
-	source_name_index: Int,
-	module_id: ModuleId,
-) -> ModuleAliasRegistration:
-	occupancy = match module_view_graph_occupancy(representation, source_name_index):
-		Some(BoundSelectiveName(binding)):
-			BoundAliasAndSelectiveName(module_id, binding)
-		_:
-			BoundModuleAlias(module_id)
-	next = module_view_with_graph_occupancy(representation, source_name_index, occupancy)
-	ModuleAliasAdded(module_view_from_rep({ next |
-				import_binding_domain = GraphImportBindings,
-				import_bindings = next.import_bindings.append(
-					GraphQualifiedModuleBinding(
-						local_name,
-						module_id,
-					),
-				)
-			}))
 
 
 private pure func module_view_register_standalone_module_alias_unchecked(
@@ -868,7 +2194,7 @@ private pure func module_view_add_standalone_module_alias(
 					local_name,
 					module_path,
 				),
-				import_bindings = representation.import_bindings.append(
+				standalone_import_bindings = representation.standalone_import_bindings.append(
 					StandaloneQualifiedModuleBinding(
 						local_name,
 						module_path,
@@ -886,16 +2212,249 @@ pure func module_view_register_module_alias_target(
 	issuing_table: ModuleTable,
 	module_id: ModuleId,
 ) -> ModuleAliasRegistration:
+	match graph_import_admission_begin(view, current_table, current_module_id):
+		None:
+			ModuleAliasInvalidTarget
+		Some(admission):
+			match graph_import_admission_register_alias(
+				admission,
+				current_table,
+				current_module_id,
+				local_name,
+				expected_module_path,
+				issuing_table,
+				module_id,
+			):
+				GraphModuleAliasAdded(next):
+					ModuleAliasAdded(graph_import_admission_finish(next))
+				GraphModuleAliasAlreadyPresent(_):
+					ModuleAliasAlreadyPresent
+				GraphModuleAliasConflictsWithAlias(_, existing):
+					ModuleAliasConflictsWithAlias(existing)
+				GraphModuleAliasConflictsWithImportedName(_, existing):
+					ModuleAliasConflictsWithImportedName(existing)
+				GraphModuleAliasConflictsWithLocalName(_, existing):
+					ModuleAliasConflictsWithLocalName(existing)
+				GraphModuleAliasInvalidTarget(_):
+					ModuleAliasInvalidTarget
+
+
+pure func graph_import_admission_register_alias(
+	admission: GraphImportAdmission,
+	current_table: ModuleTable,
+	current_module_id: ModuleId,
+	local_name: String,
+	expected_module_path: String,
+	issuing_table: ModuleTable,
+	module_id: ModuleId,
+) -> GraphModuleAliasAdmission:
+	build = graph_import_admission_rep(admission)
+	representation = module_view_rep(build.initial_view)
+	name_index = module_view_graph_source_name_index(representation, local_name)
+	request = bound_qualified_import_request(name_index, local_name, module_id)
+
 	if (
-		module_view_graph_has_owner(view, current_table, current_module_id)
-		and
-		module_tables_are_compatible(current_table, issuing_table)
-		and module_table_canonical_path(issuing_table, module_id) == Some(expected_module_path)
-		and not module_view_has_standalone_import_bindings(view)
+		not module_view_graph_has_owner(build.initial_view, current_table, current_module_id)
+		or not module_tables_are_compatible(current_table, issuing_table)
+		or module_table_canonical_path(issuing_table, module_id) != Some(expected_module_path)
 	):
-		module_view_register_graph_module_alias(view, current_table, local_name, module_id)
+		GraphModuleAliasInvalidTarget(
+			graph_import_admission_append_import(
+				build,
+				request,
+				BoundInvalidTargetOutcome,
+				None,
+			),
+		)
 	else:
-		ModuleAliasInvalidTarget
+		match name_index:
+			None:
+				GraphModuleAliasInvalidTarget(
+					graph_import_admission_append_import(
+						build,
+						request,
+						BoundInvalidSourceOutcome,
+						None,
+					),
+				)
+			Some(source_name_index):
+				match build.rows_by_source_name_index.get(source_name_index):
+					Some(BoundModuleAlias(existing_row_id, existing_id)) | Some(BoundAliasAndSelectiveName(existing_row_id, existing_id, _, _, _)) | Some(BoundAliasAndConstructorName(existing_row_id, existing_id, _, _, _, _, _)):
+						if module_ids_equal(existing_id, module_id):
+							GraphModuleAliasAlreadyPresent(
+								graph_import_admission_append_import(
+									build,
+									request,
+									BoundAlreadyPresentOutcome,
+									Some(existing_row_id),
+								),
+							)
+						else:
+							GraphModuleAliasConflictsWithAlias(
+								graph_import_admission_append_import(
+									build,
+									request,
+									BoundAliasConflictOutcome,
+									Some(existing_row_id),
+								),
+								module_view_graph_alias_label(Some(current_table), existing_id),
+							)
+					Some(BoundSelectiveName(existing_row_id, imported_module_id, original_index)):
+						binding: BoundImportedNamePayload = {
+							module_id = imported_module_id,
+							original_source_name_index = original_index
+						}
+
+						if not module_ids_equal(imported_module_id, module_id):
+							match graph_import_admission_imported_name(
+								build,
+								source_name_index,
+								binding,
+							):
+								Some(existing_name):
+									GraphModuleAliasConflictsWithImportedName(
+										graph_import_admission_append_import(
+											build,
+											request,
+											BoundSelectiveConflictOutcome,
+											Some(existing_row_id),
+										),
+										existing_name,
+									)
+								None:
+									GraphModuleAliasInvalidTarget(
+										graph_import_admission_append_import(
+											build,
+											request,
+											BoundInvalidSourceOutcome,
+											None,
+										),
+									)
+						else:
+							graph_import_admission_add_alias(
+								build,
+								source_name_index,
+								request,
+								module_id,
+								Some(
+									BoundSelectiveName(
+										existing_row_id,
+										imported_module_id,
+										original_index,
+									),
+								),
+							)
+					Some(BoundConstructorName(existing_row_id, imported_module_id, original_index, parent_local_index, parent_index)):
+						binding: BoundImportedNamePayload = {
+							module_id = imported_module_id,
+							original_source_name_index = original_index
+						}
+
+						if not module_ids_equal(imported_module_id, module_id):
+							match graph_import_admission_imported_name(
+								build,
+								source_name_index,
+								binding,
+							):
+								Some(existing_name):
+									GraphModuleAliasConflictsWithImportedName(
+										graph_import_admission_append_import(
+											build,
+											request,
+											BoundSelectiveConflictOutcome,
+											Some(existing_row_id),
+										),
+										existing_name,
+									)
+								None:
+									GraphModuleAliasInvalidTarget(
+										graph_import_admission_append_import(
+											build,
+											request,
+											BoundInvalidSourceOutcome,
+											None,
+										),
+									)
+						else:
+							graph_import_admission_add_alias(
+								build,
+								source_name_index,
+								request,
+								module_id,
+								Some(
+									BoundConstructorName(
+										existing_row_id,
+										imported_module_id,
+										original_index,
+										parent_local_index,
+										parent_index,
+									),
+								),
+							)
+					Some(BoundLocalName(existing_row_id, kind)):
+						GraphModuleAliasConflictsWithLocalName(
+							graph_import_admission_append_import(
+								build,
+								request,
+								BoundLocalConflictOutcome,
+								Some(existing_row_id),
+							),
+							kind,
+						)
+					None:
+						graph_import_admission_add_alias(
+							build,
+							source_name_index,
+							request,
+							module_id,
+							None,
+						)
+
+
+private pure func graph_import_admission_add_alias(
+	build: GraphImportAdmissionRep,
+	source_name_index: Int,
+	request: BoundImportRequest,
+	module_id: ModuleId,
+	existing: Option[BoundNameOccupancy],
+) -> GraphModuleAliasAdmission:
+	appended = graph_import_admission_rep_append_import(build, request, BoundAcceptedOutcome, None)
+	alias_row_id = bound_candidate_row_id(build.candidate_count)
+
+	occupancy = match existing:
+		Some(BoundSelectiveName(selective_row_id, imported_module_id, original_index)):
+			BoundAliasAndSelectiveName(
+				alias_row_id,
+				module_id,
+				selective_row_id,
+				imported_module_id,
+				original_index,
+			)
+		Some(BoundConstructorName(selective_row_id, imported_module_id, original_index, parent_local_index, parent_index)):
+			BoundAliasAndConstructorName(
+				alias_row_id,
+				module_id,
+				selective_row_id,
+				imported_module_id,
+				original_index,
+				parent_local_index,
+				parent_index,
+			)
+		None:
+			BoundModuleAlias(alias_row_id, module_id)
+		_:
+			BoundModuleAlias(alias_row_id, module_id)
+
+	GraphModuleAliasAdded(
+		graph_import_admission_from_rep(
+			{ appended |
+				rows_by_source_name_index = build.rows_by_source_name_index.set(
+					source_name_index,
+					occupancy,
+				)
+			},
+		),
+	)
 
 
 private pure func module_view_finish_add_selective_name(
@@ -909,33 +2468,14 @@ private pure func module_view_finish_add_selective_name(
 			representation.imported_names.append(binding)
 		GraphImportBindings | NoImportBindings:
 			representation.imported_names
+
 	SelectiveNameAdded(module_view_from_rep({ representation |
 				import_binding_domain = domain,
 				imported_names = standalone_imported_names,
-				import_bindings = representation.import_bindings.append(import_binding)
+				standalone_import_bindings = representation.standalone_import_bindings.append(
+					import_binding,
+				)
 			}))
-
-
-private pure func module_view_add_graph_selective_name(
-	representation: ModuleViewRep,
-	source_name_index: Int,
-	local_name: String,
-	module_path: String,
-	source_name: String,
-	import_binding: ImportBinding,
-) -> SelectiveNameRegistration:
-	binding: ImportedNameBinding = {
-		local_name = local_name,
-		module_path = module_path,
-		original_name = source_name
-	}
-	occupancy = match module_view_graph_occupancy(representation, source_name_index):
-		Some(BoundModuleAlias(module_id)):
-			BoundAliasAndSelectiveName(module_id, binding)
-		_:
-			BoundSelectiveName(binding)
-	next = module_view_with_graph_occupancy(representation, source_name_index, occupancy)
-	module_view_finish_add_selective_name(next, binding, import_binding, GraphImportBindings)
 
 
 private pure func module_view_add_standalone_selective_name(
@@ -957,45 +2497,6 @@ private pure func module_view_add_standalone_selective_name(
 		)
 	}
 	module_view_finish_add_selective_name(next, binding, import_binding, StandaloneImportBindings)
-
-
-private pure func module_view_register_graph_selective_name(
-	representation: ModuleViewRep,
-	module_table: ModuleTable,
-	source_name_index: Int,
-	local_name: String,
-	module_path: String,
-	source_name: String,
-	import_binding: ImportBinding,
-) -> SelectiveNameRegistration:
-	match module_view_graph_occupancy(representation, source_name_index):
-		Some(BoundSelectiveName(existing_binding)) | Some(BoundAliasAndSelectiveName(_, existing_binding)):
-			SelectiveNameConflictsWithImportedName(existing_binding)
-		Some(BoundModuleAlias(existing_module_id)):
-			if module_table_canonical_path(module_table, existing_module_id) == Some(module_path):
-				module_view_add_graph_selective_name(
-					representation,
-					source_name_index,
-					local_name,
-					module_path,
-					source_name,
-					import_binding,
-				)
-			else:
-				SelectiveNameConflictsWithAlias(
-					module_view_graph_alias_label(Some(module_table), existing_module_id),
-				)
-		Some(BoundLocalName(existing_kind)):
-			SelectiveNameConflictsWithLocalName(existing_kind)
-		None:
-			module_view_add_graph_selective_name(
-				representation,
-				source_name_index,
-				local_name,
-				module_path,
-				source_name,
-				import_binding,
-			)
 
 
 private pure func module_view_register_standalone_selective_name(
@@ -1035,6 +2536,24 @@ private pure func module_view_register_standalone_selective_name(
 							)
 
 
+private pure func graph_selective_admission_to_registration(
+	admission: GraphSelectiveAdmission,
+) -> SelectiveNameRegistration:
+	match admission:
+		GraphSelectiveAdded(next):
+			SelectiveNameAdded(graph_import_admission_finish(next))
+		GraphSelectiveConflictsWithAlias(_, existing):
+			SelectiveNameConflictsWithAlias(existing)
+		GraphSelectiveConflictsWithImportedName(_, existing):
+			SelectiveNameConflictsWithImportedName(existing)
+		GraphSelectiveConflictsWithLocalName(_, existing):
+			SelectiveNameConflictsWithLocalName(existing)
+		GraphSelectiveInvalidSourceName(_):
+			SelectiveNameInvalidSourceName
+		GraphSelectiveInvalidTarget(_):
+			SelectiveNameInvalidTarget
+
+
 pure func module_view_register_selective_name_for_graph(
 	view: ModuleView,
 	current_module_id: ModuleId,
@@ -1046,44 +2565,27 @@ pure func module_view_register_selective_name_for_graph(
 	module_id: ModuleId,
 	definition_ids: List[DefinitionId],
 ) -> SelectiveNameRegistration:
-	representation = module_view_rep(view)
-	module_table = definition_table_module_table(issuing_definition_table)
-	name_index = module_view_graph_source_name_index(representation, local_name)
-
-	match name_index:
+	match graph_import_admission_begin(
+		view,
+		definition_table_module_table(active_definition_table),
+		current_module_id,
+	):
 		None:
-			SelectiveNameInvalidSourceName
-		Some(source_name_index):
-			if (
-				module_view_graph_has_owner(
-					view,
-					definition_table_module_table(active_definition_table),
+			SelectiveNameInvalidTarget
+		Some(admission):
+			graph_selective_admission_to_registration(
+				graph_import_admission_register_selective_definition(
+					admission,
 					current_module_id,
-				)
-				and
-				definition_tables_share_provenance(
 					active_definition_table,
 					issuing_definition_table,
-				)
-				and not module_view_has_standalone_import_bindings(view)
-				and module_table_canonical_path(module_table, module_id) == Some(module_path)
-				and definition_table_selective_definition_name(
-					issuing_definition_table,
-					module_id,
-					definition_ids,
-				) == Some(source_name)
-			):
-				module_view_register_graph_selective_name(
-					representation,
-					module_table,
-					source_name_index,
 					local_name,
 					module_path,
 					source_name,
-					GraphSelectiveDefinitionBinding(local_name, module_id, definition_ids),
-				)
-			else:
-				SelectiveNameInvalidTarget
+					module_id,
+					definition_ids,
+				),
+			)
 
 
 -- TraitMethodId is issued after this binding boundary. Preserve the public
@@ -1101,17 +2603,197 @@ pure func module_view_register_graph_selective_trait_method(
 	module_id: ModuleId,
 	definition_ids: List[DefinitionId],
 ) -> SelectiveNameRegistration:
-	representation = module_view_rep(view)
-	module_table = definition_table_module_table(issuing_definition_table)
-	name_index = module_view_graph_source_name_index(representation, local_name)
-
-	match name_index:
+	match graph_import_admission_begin(
+		view,
+		definition_table_module_table(active_definition_table),
+		current_module_id,
+	):
 		None:
-			SelectiveNameInvalidSourceName
-		Some(source_name_index):
+			SelectiveNameInvalidTarget
+		Some(admission):
+			graph_selective_admission_to_registration(
+				graph_import_admission_register_selective_trait_method(
+					admission,
+					current_module_id,
+					active_definition_table,
+					issuing_definition_table,
+					local_name,
+					module_path,
+					source_name,
+					module_id,
+					definition_ids,
+				),
+			)
+
+
+pure func graph_import_admission_register_selective_definition(
+	admission: GraphImportAdmission,
+	current_module_id: ModuleId,
+	active_definition_table: DefinitionTable,
+	issuing_definition_table: DefinitionTable,
+	local_name: String,
+	module_path: String,
+	source_name: String,
+	module_id: ModuleId,
+	definition_ids: List[DefinitionId],
+) -> GraphSelectiveAdmission:
+	graph_import_admission_register_selective(
+		admission,
+		current_module_id,
+		active_definition_table,
+		issuing_definition_table,
+		local_name,
+		module_path,
+		source_name,
+		module_id,
+		definition_ids,
+		DefinitionGraphSelectiveBinding,
+		None,
+	)
+
+
+-- Register a validated constructor selection in one occupancy write. The
+-- caller has already checked the parent/constructor export pair against the
+-- active definition index; the shared admission boundary checks provenance,
+-- source spelling, and conflicts before publishing the row.
+pure func graph_import_admission_register_constructor(
+	admission: GraphImportAdmission,
+	current_module_id: ModuleId,
+	active_definition_table: DefinitionTable,
+	issuing_definition_table: DefinitionTable,
+	binding: ImportedConstructorBinding,
+	module_id: ModuleId,
+	definition_ids: List[DefinitionId],
+) -> GraphSelectiveAdmission:
+	graph_import_admission_register_selective(
+		admission,
+		current_module_id,
+		active_definition_table,
+		issuing_definition_table,
+		binding.local_name,
+		binding.module_path,
+		binding.original_name,
+		module_id,
+		definition_ids,
+		DefinitionGraphSelectiveBinding,
+		Some((binding.parent_local_name, binding.parent_name)),
+	)
+
+
+pure func graph_import_admission_register_selective_trait_method(
+	admission: GraphImportAdmission,
+	current_module_id: ModuleId,
+	active_definition_table: DefinitionTable,
+	issuing_definition_table: DefinitionTable,
+	local_name: String,
+	module_path: String,
+	source_name: String,
+	module_id: ModuleId,
+	definition_ids: List[DefinitionId],
+) -> GraphSelectiveAdmission:
+	graph_import_admission_register_selective(
+		admission,
+		current_module_id,
+		active_definition_table,
+		issuing_definition_table,
+		local_name,
+		module_path,
+		source_name,
+		module_id,
+		definition_ids,
+		TraitMethodGraphSelectiveBinding,
+		None,
+	)
+
+
+-- Ordinary definition/trait wrappers pass no parent; only the constructor
+-- wrapper passes parent names after TypecheckState validates the export IDs.
+-- Reject a trait-method/parent pair here so a future caller cannot create a
+-- constructor occupancy invisible to the definition-binding projection.
+private pure func graph_import_admission_register_selective(
+	admission: GraphImportAdmission,
+	current_module_id: ModuleId,
+	active_definition_table: DefinitionTable,
+	issuing_definition_table: DefinitionTable,
+	local_name: String,
+	module_path: String,
+	source_name: String,
+	module_id: ModuleId,
+	definition_ids: List[DefinitionId],
+	binding_kind: GraphSelectiveBindingKind,
+	constructor_parent: Option[(String, String)],
+) -> GraphSelectiveAdmission:
+	build = graph_import_admission_rep(admission)
+	representation = module_view_rep(build.initial_view)
+	source_name_index = module_view_graph_source_name_index(representation, local_name)
+	original_name_index = module_view_graph_source_name_index(representation, source_name)
+	module_table = definition_table_module_table(issuing_definition_table)
+
+	target_is_valid = match binding_kind:
+		DefinitionGraphSelectiveBinding:
+			definition_table_selective_definition_name(
+				issuing_definition_table,
+				module_id,
+				definition_ids,
+			) == Some(source_name)
+		TraitMethodGraphSelectiveBinding:
+			(
+				constructor_parent.is_none()
+				and ((
+					definition_ids.is_empty()
+					or definition_table_selective_definition_name(
+						issuing_definition_table,
+						module_id,
+						definition_ids,
+					) == Some(source_name)
+				))
+			)
+
+	-- Validate against the issuing table before publishing the retained
+	-- request, so later code can rely on its semantic IDs without reopening
+	-- source-facing target resolution.
+	uncataloged_local_name = if source_name_index.is_none():
+		Some(local_name)
+	else:
+		None
+
+	request = match binding_kind:
+		DefinitionGraphSelectiveBinding:
+			BoundSelectiveDefinitionRequest(
+				source_name_index.get_or(BOUND_CANDIDATE_NO_SOURCE_NAME),
+				module_id,
+				definition_ids,
+				uncataloged_local_name,
+			)
+		TraitMethodGraphSelectiveBinding:
+			uncataloged_source_name = if original_name_index.is_none():
+				Some(source_name)
+			else:
+				None
+
+			BoundSelectiveTraitMethodRequest(
+				source_name_index.get_or(BOUND_CANDIDATE_NO_SOURCE_NAME),
+				module_id,
+				original_name_index.get_or(BOUND_CANDIDATE_NO_SOURCE_NAME),
+				definition_ids,
+				uncataloged_local_name,
+				uncataloged_source_name,
+			)
+
+	match source_name_index:
+		None:
+			GraphSelectiveInvalidSourceName(
+				graph_import_admission_append_import(
+					build,
+					request,
+					BoundInvalidSourceOutcome,
+					None,
+				),
+			)
+		Some(name_index):
 			if (
 				not module_view_graph_has_owner(
-					view,
+					build.initial_view,
 					definition_table_module_table(active_definition_table),
 					current_module_id,
 				)
@@ -1120,32 +2802,201 @@ pure func module_view_register_graph_selective_trait_method(
 					issuing_definition_table,
 				)
 				or module_table_canonical_path(module_table, module_id) != Some(module_path)
-				or module_view_has_standalone_import_bindings(view)
-				or (
-					not definition_ids.is_empty()
-					and definition_table_selective_definition_name(
-						issuing_definition_table,
-						module_id,
-						definition_ids,
-					) != Some(source_name)
-				)
+				or not target_is_valid
+				or original_name_index.is_none()
+				or constructor_parent
+					.map(func(parent):
+						(
+							module_view_graph_source_name_index(representation, parent[0]).is_none()
+							or module_view_graph_source_name_index(
+								representation,
+								parent[1],
+							).is_none()
+						)
+					)
+					.get_or(False)
 			):
-				SelectiveNameInvalidTarget
-			else:
-				module_view_register_graph_selective_name(
-					representation,
-					module_table,
-					source_name_index,
-					local_name,
-					module_path,
-					source_name,
-					GraphSelectiveTraitMethodBinding(
-						local_name,
-						module_id,
-						source_name,
-						definition_ids,
+				GraphSelectiveInvalidTarget(
+					graph_import_admission_append_import(
+						build,
+						request,
+						BoundInvalidTargetOutcome,
+						None,
 					),
 				)
+			else:
+				match build.rows_by_source_name_index.get(name_index):
+					Some(BoundSelectiveName(existing_row_id, existing_module_id, original_index)) | Some(BoundAliasAndSelectiveName(_, _, existing_row_id, existing_module_id, original_index)):
+						existing: BoundImportedNamePayload = {
+							module_id = existing_module_id,
+							original_source_name_index = original_index
+						}
+
+						match graph_import_admission_imported_name(build, name_index, existing):
+							Some(existing_name):
+								GraphSelectiveConflictsWithImportedName(
+									graph_import_admission_append_import(
+										build,
+										request,
+										BoundSelectiveConflictOutcome,
+										Some(existing_row_id),
+									),
+									existing_name,
+								)
+							None:
+								GraphSelectiveInvalidSourceName(
+									graph_import_admission_append_import(
+										build,
+										request,
+										BoundInvalidSourceOutcome,
+										None,
+									),
+								)
+					Some(BoundConstructorName(existing_row_id, existing_module_id, original_index, _, _)) | Some(BoundAliasAndConstructorName(_, _, existing_row_id, existing_module_id, original_index, _, _)):
+						existing: BoundImportedNamePayload = {
+							module_id = existing_module_id,
+							original_source_name_index = original_index
+						}
+
+						match graph_import_admission_imported_name(build, name_index, existing):
+							Some(existing_name):
+								GraphSelectiveConflictsWithImportedName(
+									graph_import_admission_append_import(
+										build,
+										request,
+										BoundSelectiveConflictOutcome,
+										Some(existing_row_id),
+									),
+									existing_name,
+								)
+							None:
+								GraphSelectiveInvalidSourceName(
+									graph_import_admission_append_import(
+										build,
+										request,
+										BoundInvalidSourceOutcome,
+										None,
+									),
+								)
+					Some(BoundModuleAlias(alias_row_id, existing_id)):
+						if module_table_canonical_path(
+							module_table,
+							existing_id,
+						) == Some(module_path):
+							graph_import_admission_add_selective(
+								build,
+								name_index,
+								source_name,
+								module_id,
+								request,
+								constructor_parent,
+								Some((alias_row_id, existing_id)),
+							)
+						else:
+							GraphSelectiveConflictsWithAlias(
+								graph_import_admission_append_import(
+									build,
+									request,
+									BoundAliasConflictOutcome,
+									Some(alias_row_id),
+								),
+								module_view_graph_alias_label(Some(module_table), existing_id),
+							)
+					Some(BoundLocalName(local_row_id, kind)):
+						GraphSelectiveConflictsWithLocalName(
+							graph_import_admission_append_import(
+								build,
+								request,
+								BoundLocalConflictOutcome,
+								Some(local_row_id),
+							),
+							kind,
+						)
+					None:
+						graph_import_admission_add_selective(
+							build,
+							name_index,
+							source_name,
+							module_id,
+							request,
+							constructor_parent,
+							None,
+						)
+
+
+private pure func graph_import_admission_add_selective(
+	build: GraphImportAdmissionRep,
+	source_name_index: Int,
+	source_name: String,
+	module_id: ModuleId,
+	request: BoundImportRequest,
+	constructor_parent: Option[(String, String)],
+	existing_alias: Option[(BoundCandidateRowId, ModuleId)],
+) -> GraphSelectiveAdmission:
+	appended = graph_import_admission_rep_append_import(build, request, BoundAcceptedOutcome, None)
+	selective_row_id = bound_candidate_row_id(build.candidate_count)
+	representation = module_view_rep(build.initial_view)
+	original_source_name_index = module_view_graph_source_name_index(
+		representation,
+		source_name,
+	).get_or(BOUND_CANDIDATE_NO_SOURCE_NAME)
+
+	occupancy = match existing_alias:
+		Some((alias_row_id, alias_module_id)):
+			match constructor_parent:
+				Some(parent):
+					BoundAliasAndConstructorName(
+						alias_row_id,
+						alias_module_id,
+						selective_row_id,
+						module_id,
+						original_source_name_index,
+						module_view_graph_source_name_index(
+							representation,
+							parent[0],
+						).get_or(BOUND_CANDIDATE_NO_SOURCE_NAME),
+						module_view_graph_source_name_index(
+							representation,
+							parent[1],
+						).get_or(BOUND_CANDIDATE_NO_SOURCE_NAME),
+					)
+				None:
+					BoundAliasAndSelectiveName(
+						alias_row_id,
+						alias_module_id,
+						selective_row_id,
+						module_id,
+						original_source_name_index,
+					)
+		None:
+			match constructor_parent:
+				Some(parent):
+					BoundConstructorName(
+						selective_row_id,
+						module_id,
+						original_source_name_index,
+						module_view_graph_source_name_index(
+							representation,
+							parent[0],
+						).get_or(BOUND_CANDIDATE_NO_SOURCE_NAME),
+						module_view_graph_source_name_index(
+							representation,
+							parent[1],
+						).get_or(BOUND_CANDIDATE_NO_SOURCE_NAME),
+					)
+				None:
+					BoundSelectiveName(selective_row_id, module_id, original_source_name_index)
+
+	GraphSelectiveAdded(
+		graph_import_admission_from_rep(
+			{ appended |
+				rows_by_source_name_index = build.rows_by_source_name_index.set(
+					source_name_index,
+					occupancy,
+				)
+			},
+		),
+	)
 
 
 pure func module_view_register_selective_name(
@@ -1177,11 +3028,29 @@ private pure func module_view_add_local_name(
 ) -> LocalNameRegistration:
 	next = match storage:
 		GraphLocalNameStorage(source_name_index):
-			module_view_with_graph_occupancy(
-				representation,
-				source_name_index,
-				BoundLocalName(kind),
-			)
+			match representation.graph_visibility:
+				Some(visibility):
+					table = bound_visibility_candidate_table(visibility)
+					row_id = bound_candidate_row_id(table.candidate_count)
+					candidates = bound_candidate_table_append_local(
+						table,
+						source_name_index,
+						kind,
+						BoundAcceptedOutcome,
+						None,
+					)
+					next_visibility = bound_visibility_with_candidate_table(
+						{ visibility |
+							rows_by_source_name_index = visibility.rows_by_source_name_index.set(
+								source_name_index,
+								BoundLocalName(row_id, kind),
+							)
+						},
+						candidates,
+					)
+					{ representation | graph_visibility = Some(next_visibility) }
+				None:
+					representation
 		StandaloneLocalNameStorage:
 			{ representation |
 				standalone_local_names_by_local_name = representation.standalone_local_names_by_local_name.set(
@@ -1233,10 +3102,7 @@ private pure func module_view_register_local_name_with_storage(
 		None:
 			match storage:
 				GraphLocalNameStorage(source_name_index):
-					match module_view_graph_module_alias_at(
-						representation,
-						source_name_index,
-					):
+					match module_view_graph_module_alias_at(representation, source_name_index):
 						Some(existing_module_id):
 							LocalNameConflictsWithAlias(
 								module_view_graph_alias_label(
@@ -1310,34 +3176,57 @@ private pure func bound_visibility_without_unqualified_names(
 	visibility: BoundVisibility,
 ) -> BoundVisibility:
 	var retained_rows: Dict[Int, BoundNameOccupancy] = {}
+	var retained_row_ids: List[BoundCandidateRowId] = []
+	var retained_imports: List[BoundImportRequest] = []
 
-	for entry in visibility.rows_by_source_name_index.entries():
-		module_alias_id = match entry[1]:
-			BoundModuleAlias(module_id) | BoundAliasAndSelectiveName(module_id, _):
-				Some(module_id)
+	for index in 0..visibility.candidate_accepted_imports.length():
+		match (
+			visibility.candidate_accepted_import_row_ids.get(index),
+			visibility.candidate_accepted_imports.get(index),
+		):
+			(Some(row_id), Some(request)):
+				match request:
+					BoundQualifiedImportRequest(source_name_index, module_id, _):
+						retained_row_ids = retained_row_ids.append(row_id)
+						retained_imports = retained_imports.append(request)
+						retained_rows = retained_rows.set(
+							source_name_index,
+							BoundModuleAlias(row_id, module_id),
+						)
+					_:
+						void
 			_:
-				None
-
-		match module_alias_id:
-			Some(module_id):
-				retained_rows = retained_rows.set(entry[0], BoundModuleAlias(module_id))
-			None:
 				void
 
-	{ visibility |
-		rows_by_source_name_index = retained_rows
+	retained_candidates: BoundCandidateTable = {
+		rejected_local_rows = [],
+		accepted_import_row_ids = retained_row_ids,
+		accepted_imports = retained_imports,
+		rejected_rows = [],
+		rejected_imports = [],
+		candidate_count = visibility.candidate_count
 	}
+
+	bound_visibility_with_candidate_table(
+		{ visibility | rows_by_source_name_index = retained_rows },
+		retained_candidates,
+	)
 
 
 pure func module_view_without_unqualified_names(view: ModuleView) -> ModuleView:
 	representation = module_view_rep(view)
-	qualified_bindings = representation.import_bindings.filter(func(binding):
-		match binding:
-			GraphQualifiedModuleBinding(_, _) | StandaloneQualifiedModuleBinding(_, _):
-				True
-			GraphSelectiveDefinitionBinding(_, _, _) | GraphSelectiveTraitMethodBinding(_, _, _, _) | StandaloneSelectiveDefinitionBinding(_, _, _):
-				False
-	)
+
+	qualified_bindings = if representation.graph_visibility.is_some():
+		representation.standalone_import_bindings
+	else:
+		representation.standalone_import_bindings.filter(func(binding):
+			match binding:
+				GraphQualifiedModuleBinding(_, _) | StandaloneQualifiedModuleBinding(_, _):
+					True
+				GraphSelectiveDefinitionBinding(_, _, _) | GraphSelectiveTraitMethodBinding(_, _, _, _) | StandaloneSelectiveDefinitionBinding(_, _, _):
+					False
+		)
+
 	module_view_from_rep({ representation |
 			imported_names = [],
 			graph_visibility = representation.graph_visibility.map(
@@ -1345,7 +3234,7 @@ pure func module_view_without_unqualified_names(view: ModuleView) -> ModuleView:
 			),
 			standalone_imported_names_by_local_name = {},
 			imported_constructors = [],
-			import_bindings = qualified_bindings,
+			standalone_import_bindings = qualified_bindings,
 			standalone_local_names_by_local_name = {},
 			accepted_alias_authority = representation.accepted_alias_authority.map(
 				accepted_alias_authority_without_visible_names,

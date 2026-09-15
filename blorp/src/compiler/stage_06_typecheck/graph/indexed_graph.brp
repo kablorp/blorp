@@ -5,7 +5,10 @@
 -- modules backed by one validated loaded-module set and definition index.
 import:
 	../../stage_01_generated_inputs/embedded_std: embedded_std_contains_module
-	../../stage_03_parse/parsed_ast: ParsedProgram
+	../../stage_03_parse/parsed_ast:
+		ParsedDecl(ImportBlockParsedDecl, PrivateParsedDecl),
+		ParsedImportDecl,
+		ParsedProgram,
 	../../stage_03_parse/parsed_ast_json: parsed_programs_are_equal
 	../../stage_04_modules/loaded_module:
 		LoadedModule,
@@ -49,8 +52,11 @@ import:
 	../type_system/env: ENV_EMPTY
 	definition_index:
 		DefinitionIndex,
+		ExportedDefinitionNameDemand,
 		definition_index_for_loaded_modules,
 		definition_index_initial_seed,
+		exported_definition_name_demand_add,
+		exported_definition_name_demand_empty,
 	source_name_table:
 		GraphModuleNameScope,
 		GraphSourceNameTable,
@@ -59,6 +65,7 @@ import:
 		graph_source_name_table,
 		graph_source_name_table_source_names,
 		source_name_candidates_for_decl,
+	list: repeat
 
 
 opaque type PreparedModule = LoadedModule
@@ -106,7 +113,9 @@ private record IndexedGraphRep {
 	prepared_modules: List[PreparedModule],
 	target_id: ModuleId,
 	definition_index: DefinitionIndex,
-	graph_source_names: GraphSourceNameTable
+	graph_source_names: GraphSourceNameTable,
+	selective_export_names_by_module: List[ExportedDefinitionNameDemand],
+	conservative_selective_export_names: ExportedDefinitionNameDemand
 }
 
 
@@ -186,6 +195,221 @@ private pure func source_name_candidates_for_module(
 	result
 
 
+private record GraphSelectiveExportDemand {
+	names_by_module: List[ExportedDefinitionNameDemand],
+	conservative_names: ExportedDefinitionNameDemand
+}
+
+
+private record GraphSelectiveExportScatter {
+	next_write_by_module: List[Int],
+	ordered_names: List[String]
+}
+
+
+-- Count and scatter traverse the same declarations, so every retained slot is
+-- overwritten before publication. Naming the initializer keeps that private
+-- construction invariant explicit; it is never used as a lookup sentinel.
+private UNFILLED_SELECTIVE_EXPORT_NAME: String = ""
+
+
+private pure func selective_export_request_module_index(
+	module_table: ModuleTable,
+	conservative_module_index: Int,
+	import_decl: ParsedImportDecl,
+) -> Int:
+	match module_table_find_id_by_canonical_path(module_table, import_decl.module_path):
+		Some(module_id):
+			module_id_table_index(module_id)
+		None:
+			-- Finalized programs normally carry canonical import paths. Preserve
+			-- correctness for recovery or direct compiler fixtures by applying an
+			-- unresolved request conservatively instead of guessing an identity.
+			conservative_module_index
+
+
+private pure func selective_export_request_counts_for_import(
+	request_count_by_module: List[Int],
+	module_table: ModuleTable,
+	conservative_module_index: Int,
+	import_decl: ParsedImportDecl,
+) -> List[Int]:
+	match import_decl.symbols:
+		None:
+			request_count_by_module
+		Some(symbols):
+			module_index = selective_export_request_module_index(
+				module_table,
+				conservative_module_index,
+				import_decl,
+			)
+			request_count_by_module.set(
+				module_index,
+				request_count_by_module.get_or(module_index, 0) + symbols.length(),
+			)
+
+
+private pure func selective_export_request_counts_for_decl(
+	request_count_by_module: List[Int],
+	module_table: ModuleTable,
+	conservative_module_index: Int,
+	decl: ParsedDecl,
+) -> List[Int]:
+	match decl:
+		ImportBlockParsedDecl(imports, _):
+			var counts = request_count_by_module
+
+			for import_decl in imports:
+				counts = selective_export_request_counts_for_import(
+					counts,
+					module_table,
+					conservative_module_index,
+					import_decl,
+				)
+
+			counts
+		PrivateParsedDecl(inner, _):
+			selective_export_request_counts_for_decl(
+				request_count_by_module,
+				module_table,
+				conservative_module_index,
+				inner,
+			)
+		_:
+			request_count_by_module
+
+
+private pure func selective_export_scatter_import(
+	scatter: GraphSelectiveExportScatter,
+	module_table: ModuleTable,
+	conservative_module_index: Int,
+	import_decl: ParsedImportDecl,
+) -> GraphSelectiveExportScatter:
+	match import_decl.symbols:
+		None:
+			scatter
+		Some(symbols):
+			module_index = selective_export_request_module_index(
+				module_table,
+				conservative_module_index,
+				import_decl,
+			)
+			var next = scatter
+
+			for symbol in symbols:
+				write_index = next.next_write_by_module.get_or(module_index, 0)
+				next = {
+					next |
+					next_write_by_module = next.next_write_by_module.set(
+						module_index,
+						write_index + 1,
+					),
+					ordered_names = next.ordered_names.set(
+						write_index,
+						symbol.name.text,
+					)
+				}
+
+			next
+
+
+private pure func selective_export_scatter_decl(
+	scatter: GraphSelectiveExportScatter,
+	module_table: ModuleTable,
+	conservative_module_index: Int,
+	decl: ParsedDecl,
+) -> GraphSelectiveExportScatter:
+	match decl:
+		ImportBlockParsedDecl(imports, _):
+			var next = scatter
+
+			for import_decl in imports:
+				next = selective_export_scatter_import(
+					next,
+						module_table,
+						conservative_module_index,
+						import_decl,
+					)
+
+			next
+		PrivateParsedDecl(inner, _):
+			selective_export_scatter_decl(
+				scatter,
+				module_table,
+				conservative_module_index,
+				inner,
+			)
+		_:
+			scatter
+
+
+private pure func selective_export_name_demand(
+	module_table: ModuleTable,
+	modules: List[PreparedModule],
+) -> GraphSelectiveExportDemand:
+	conservative_module_index = modules.length()
+	bucket_count = conservative_module_index + 1
+	var request_count_by_module: List[Int] = 0.repeat(bucket_count)
+
+	for module in modules:
+		for decl in prepared_module_program(module).decls:
+			request_count_by_module = selective_export_request_counts_for_decl(
+				request_count_by_module,
+				module_table,
+				conservative_module_index,
+				decl,
+			)
+
+	var bucket_start_by_module: List[Int] = []
+	var next_bucket_start: Int = 0
+
+	for request_count in request_count_by_module:
+		bucket_start_by_module = bucket_start_by_module.append(next_bucket_start)
+		next_bucket_start += request_count
+
+	var scatter: GraphSelectiveExportScatter = {
+		next_write_by_module = bucket_start_by_module,
+		ordered_names = repeat(UNFILLED_SELECTIVE_EXPORT_NAME, next_bucket_start)
+	}
+
+	for module in modules:
+		for decl in prepared_module_program(module).decls:
+			scatter = selective_export_scatter_decl(
+				scatter,
+				module_table,
+				conservative_module_index,
+				decl,
+			)
+
+	var names_by_module: List[ExportedDefinitionNameDemand] = []
+	var conservative_names = exported_definition_name_demand_empty()
+
+	-- Count/offset/scatter groups requests in linear work without a sort. Each
+	-- demand bucket remains uniquely owned while it grows and is published only
+	-- after completion, avoiding a retained Set copy for every later name.
+	for module_index in 0..bucket_count:
+		start = bucket_start_by_module.get_or(module_index, 0)
+		end = start + request_count_by_module.get_or(module_index, 0)
+		var module_demand = exported_definition_name_demand_empty()
+
+		for request_index in start..end:
+			match scatter.ordered_names.get(request_index):
+				Some(name):
+					module_demand = exported_definition_name_demand_add(module_demand, name)
+				None:
+					void
+
+		if module_index == conservative_module_index:
+			conservative_names = module_demand
+		else:
+			names_by_module = names_by_module.append(module_demand)
+
+	{
+		names_by_module = names_by_module,
+		conservative_names = conservative_names
+	}
+
+
 private pure func indexed_graph_from_loaded_modules(
 	module_table: ModuleTable,
 	loaded_modules: LoadedModuleSet,
@@ -221,13 +445,17 @@ private pure func indexed_graph_from_loaded_modules(
 	for module in prepared_modules:
 		source_name_candidates = source_name_candidates_for_module(source_name_candidates, module)
 
+	selective_export_names = selective_export_name_demand(module_table, prepared_modules)
+
 	representation: IndexedGraphRep = {
 		target = target,
 		module_table = module_table,
 		prepared_modules = prepared_modules,
 		target_id = target_id,
 		definition_index = definition_index,
-		graph_source_names = graph_source_name_table(module_table, source_name_candidates)
+		graph_source_names = graph_source_name_table(module_table, source_name_candidates),
+		selective_export_names_by_module = selective_export_names.names_by_module,
+		conservative_selective_export_names = selective_export_names.conservative_names
 	}
 	Some(into_opaque IndexedGraph(representation))
 
@@ -441,6 +669,32 @@ pure func indexed_graph_module_table(graph: IndexedGraph) -> ModuleTable:
 
 pure func indexed_graph_source_name_table(graph: IndexedGraph) -> SourceNameTable:
 	graph_source_name_table_source_names(from_opaque IndexedGraph(graph).graph_source_names)
+
+
+-- Selective export demand is normalized once at graph construction, after
+-- import-path finalization and ModuleId assignment. Repeated admission reads
+-- the dense row through its graph-issued scope instead of accepting a raw ID.
+pure func prepared_module_scope_selective_export_names(
+	scope: PreparedModuleScope,
+) -> ExportedDefinitionNameDemand:
+	scope_representation: PreparedModuleScopeRep = from_opaque PreparedModuleScope(scope)
+	graph_representation: IndexedGraphRep = from_opaque IndexedGraph(scope_representation.graph)
+
+	match graph_representation.selective_export_names_by_module.get(
+		module_id_table_index(scope_representation.module_id),
+	):
+		Some(found_demand):
+			found_demand
+		None:
+			exported_definition_name_demand_empty()
+
+
+pure func prepared_module_scope_conservative_selective_export_names(
+	scope: PreparedModuleScope,
+) -> ExportedDefinitionNameDemand:
+	scope_representation: PreparedModuleScopeRep = from_opaque PreparedModuleScope(scope)
+	graph_representation: IndexedGraphRep = from_opaque IndexedGraph(scope_representation.graph)
+	graph_representation.conservative_selective_export_names
 
 
 pure func indexed_graph_graph_source_name_table(graph: IndexedGraph) -> GraphSourceNameTable:

@@ -1,0 +1,160 @@
+-- A compiler-host capability for one compilation invocation. Session IDs
+-- cannot be safely minted by copying a pure value-state counter; the later
+-- solver migration must assign explicit work-item keys within this run.
+import:
+	../graph/definition_table_storage: DefinitionTable, definition_tables_share_provenance
+
+
+private record CompilationRunTokenRep {
+	allocation_anchor: Int
+}
+
+
+opaque type CompilationRunToken = CompilationRunTokenRep
+
+
+-- Selective CTFE can abandon a checked body and check it again through eager
+-- fallback. Those are separate fresh solvers even for the same callable.
+-- A repeated check within one purpose needs a distinct explicit invocation.
+enum BodyMetaSessionPurpose:
+	NormalBodyMetaSession
+	CtfeSelectiveBodyMetaSession
+	CtfeEagerBodyMetaSession
+
+
+-- The dense index lives in different table domains for modules and definitions.
+-- Keep the distinction inside the opaque session even when the two indices
+-- happen to have the same integer value.
+private enum MetaSessionKind:
+	ModulePreparationMetaSession
+	GlobalInitializerMetaSession
+	NormalBodyMetaSessionKind
+	CtfeSelectiveBodyMetaSessionKind
+	CtfeEagerBodyMetaSessionKind
+
+
+private record MetaSessionIdRep {
+	run: CompilationRunToken,
+	definition_table: DefinitionTable,
+	owner_index: Int,
+	kind: MetaSessionKind,
+	invocation: Int
+}
+
+
+opaque type MetaSessionId = MetaSessionIdRep
+
+
+foreign(include: "meta_identity_ffi.h"):
+	private pure func compilation_run_tokens_are_same_allocation(
+		left: CompilationRunToken,
+		right: CompilationRunToken,
+	) -> Bool = "blorp_compiler_run_tokens_are_same_allocation"
+	private pure func meta_sessions_are_same_allocation(
+		left: MetaSessionId,
+		right: MetaSessionId,
+	) -> Bool = "blorp_compiler_meta_sessions_are_same_allocation"
+
+
+-- This is deliberately impure: run issuance must not happen inside a pure
+-- same-input graph or solver constructor. The compiler host must call it once
+-- per compilation and pass the retained capability into pure phases.
+func new_compilation_run_token() -> CompilationRunToken:
+	into_opaque CompilationRunToken({allocation_anchor = 0})
+
+
+pure func compilation_run_tokens_equal(
+	left: CompilationRunToken,
+	right: CompilationRunToken,
+) -> Bool:
+	compilation_run_tokens_are_same_allocation(left, right)
+
+
+private pure func meta_session_for_key(
+	run: CompilationRunToken,
+	definition_table: DefinitionTable,
+	owner_index: Int,
+	kind: MetaSessionKind,
+	invocation: Int,
+) -> Option[MetaSessionId]:
+	if owner_index < 0 or invocation < 0:
+		None
+	else:
+		Some(into_opaque MetaSessionId({
+					definition_table = definition_table,
+					owner_index = owner_index,
+					invocation = invocation,
+					kind = kind,
+					run = run
+				}))
+
+
+-- Low-level mappers receive only already-validated table-local indices.
+-- Production callers must project them through the checked owner boundary.
+pure func meta_module_session(
+	run: CompilationRunToken,
+	definition_table: DefinitionTable,
+	module_index: Int,
+	invocation: Int,
+) -> Option[MetaSessionId]:
+	meta_session_for_key(
+		run,
+		definition_table,
+		module_index,
+		ModulePreparationMetaSession,
+		invocation,
+	)
+
+
+pure func meta_global_session(
+	run: CompilationRunToken,
+	definition_table: DefinitionTable,
+	definition_index: Int,
+	invocation: Int,
+) -> Option[MetaSessionId]:
+	meta_session_for_key(
+		run,
+		definition_table,
+		definition_index,
+		GlobalInitializerMetaSession,
+		invocation,
+	)
+
+
+pure func meta_body_session(
+	run: CompilationRunToken,
+	definition_table: DefinitionTable,
+	definition_index: Int,
+	purpose: BodyMetaSessionPurpose,
+	invocation: Int,
+) -> Option[MetaSessionId]:
+	kind = match purpose:
+		NormalBodyMetaSession:
+			NormalBodyMetaSessionKind
+		CtfeSelectiveBodyMetaSession:
+			CtfeSelectiveBodyMetaSessionKind
+		CtfeEagerBodyMetaSession:
+			CtfeEagerBodyMetaSessionKind
+
+	meta_session_for_key(run, definition_table, definition_index, kind, invocation)
+
+
+pure func meta_session_ids_equal(left: MetaSessionId, right: MetaSessionId) -> Bool:
+	-- The hot solver path carries copies of one issued session. Keep the
+	-- exact-key comparison for separately reconstructed but equal sessions.
+	if meta_sessions_are_same_allocation(left, right):
+		True
+	else:
+		left_representation = from_opaque MetaSessionId(left)
+		right_representation = from_opaque MetaSessionId(right)
+
+		(
+			compilation_run_tokens_equal(left_representation.run, right_representation.run)
+			and definition_tables_share_provenance(
+				left_representation.definition_table,
+				right_representation.definition_table,
+			)
+			and left_representation.owner_index == right_representation.owner_index
+			and left_representation.kind == right_representation.kind
+			and left_representation.invocation == right_representation.invocation
+		)
