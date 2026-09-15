@@ -1277,6 +1277,31 @@ and a checksum of the complete production result. Compare only matching rows
 from baseline and candidate builds. The accepted result and paired samples are
 in the [`retained result`](results/compiler_core_pattern_membership_2026-09-15.md).
 
+### Inference Constructor Coverage Profile
+
+`compiler_infer_constructor_coverage_profile` calls the production
+`infer_expr` match path and varies case count, alternatives per `or`, unique
+outer constructors, and consecutive duplicate stride independently. Fixture
+construction, warmup, and diagnostic observation stay outside the measured
+window. Every valid fixture covers all generated constructors except one
+declaration-last sentinel, so the benchmark verifies the exact diagnostic and
+the number of typed match cases.
+
+```bash
+benchmarks/compiler_infer_constructor_coverage_profile plain 50 16 64 128 4
+benchmarks/compiler_infer_constructor_coverage_profile plain 10000 1 2 2 1
+benchmarks/compiler_infer_constructor_coverage_profile profile 1 16 64 128 4 \
+  2>/tmp/compiler-infer-constructor-coverage-profile.txt
+```
+
+Arguments are `iterations`, `cases`, `options`, `unique`, and
+`duplicate-stride`. The first row is a duplicate-heavy wide workload; the
+second is the two-constructor control. Each row reports modeled outer-pattern
+visits, allocator counters, elapsed time, exact diagnostic checksum, typed case
+count, and validity. The accepted membership-index result and paired samples
+are in the
+[`retained result`](results/compiler_infer_constructor_coverage_2026-09-15.md).
+
 ### Consume Candidate Index Profile
 
 `compiler_consume_candidate_index_profile` isolates `consume_specialize` by

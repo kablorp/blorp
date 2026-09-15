@@ -1362,6 +1362,86 @@ pure func state_with_option_int_value() -> TypecheckState:
 		) }
 
 
+pure func state_with_nested_union_value() -> TypecheckState:
+	state = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
+	with_inner = env_add_type(
+		state.env,
+		"InnerChoice",
+		[],
+		[
+			{
+				name = "OuterLater",
+				fields = [TYPE_INT],
+				tag = 0
+			},
+			{
+				name = "InnerRight",
+				fields = [TYPE_INT],
+				tag = 1
+			},
+		],
+		TypeUnion,
+		False,
+		True,
+	)
+	with_outer = env_add_type(
+		with_inner,
+		"OuterChoice",
+		[],
+		[
+			{
+				name = "OuterWrap",
+				fields = [SemanticNamedType("InnerChoice", [])],
+				tag = 0
+			},
+			{
+				name = "OuterSkip",
+				fields = [],
+				tag = 1
+			},
+			{
+				name = "OuterLater",
+				fields = [],
+				tag = 2
+			},
+			{
+				name = "OuterLast",
+				fields = [],
+				tag = 3
+			},
+		],
+		TypeUnion,
+		False,
+		True,
+	)
+	with_value = { state | env = env_add_var_with_details(
+			with_outer,
+			"outer_choice",
+			SemanticNamedType("OuterChoice", []),
+			Some(SemanticNamedType("OuterChoice", [])),
+			ImmutableBinding,
+			LetBinding,
+			UNREFINED_BINDING,
+		) }
+	with_outer_alias = typecheck_state_register_standalone_module_alias(
+		with_value,
+		"OC",
+		"outer_choice",
+	)
+	with_inner_alias = typecheck_state_register_standalone_module_alias(
+		with_outer_alias,
+		"IC",
+		"inner_choice",
+	)
+	with_outer_home = typecheck_state_record_type_home(
+		with_inner_alias,
+		"OuterChoice",
+		"outer_choice",
+		True,
+	)
+	typecheck_state_record_type_home(with_outer_home, "InnerChoice", "inner_choice", True)
+
+
 pure func state_with_generic_option_type_param() -> TypecheckState:
 	state = state_with_option_int_value()
 	{ state | env = env_set_type_param_bounds(state.env, [make_bound_type_param("T", [])]) }
@@ -10319,10 +10399,64 @@ func test_match_constructor_exhaustiveness_reports_missing_variants() -> Bool:
 
 	(
 		result.context.state.errors.length() == 1
-		and result.context.state.errors
-			.get_or(0, "")
-			.contains("Non-exhaustive match on Option: missing None")
+		and result.context.state.errors.get_or(
+			0,
+			"",
+		) == "Non-exhaustive match on Option: missing None"
 	)
+
+
+func test_match_constructor_exhaustiveness_uses_outer_names_and_declaration_order() -> Bool:
+	span = fixture_source_span()
+	result = infer_expr(
+		infer_context(state_with_nested_union_value()),
+		ParsedMatchExpr(
+			ParsedNameExpr(ident("outer_choice")),
+			[
+				match_case(
+					ParsedOrPattern(
+						[
+							ParsedQualifiedConstructorPattern(
+								ident("OC"),
+								ident("OuterSkip"),
+								[],
+								span,
+							),
+							ParsedOrPattern(
+								[
+									ParsedConstructorPattern(
+										ident("OuterWrap"),
+										[
+											ParsedQualifiedConstructorPattern(
+												ident("IC"),
+												ident("OuterLater"),
+												[ParsedWildcardPattern(span)],
+												span,
+											),
+										],
+										span,
+									),
+									ParsedConstructorPattern(ident("OuterSkip"), [], span),
+								],
+								span,
+							),
+						],
+						span,
+					),
+					int_expr("1"),
+				),
+				match_case(
+					ParsedConstructorPattern(ident("OuterSkip"), [], span),
+					int_expr("2"),
+				),
+			],
+			span,
+		),
+	)
+
+	result.context.state.errors == [
+		"Non-exhaustive match on OuterChoice: missing OuterLater, OuterLast",
+	]
 
 
 func test_match_list_exhaustiveness() -> Bool:
@@ -11961,6 +12095,10 @@ tests: TestSuite = {
 		(
 			"match constructor exhaustiveness reports missing variants",
 			test_match_constructor_exhaustiveness_reports_missing_variants,
+		),
+		(
+			"match constructor exhaustiveness uses outer names and declaration order",
+			test_match_constructor_exhaustiveness_uses_outer_names_and_declaration_order,
 		),
 		("match list exhaustiveness", test_match_list_exhaustiveness),
 		("match open scalar requires catch all", test_match_open_scalar_requires_catch_all),

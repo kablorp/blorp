@@ -63,7 +63,6 @@ current-state and next-action summary.
 - [CTFE environment lookup, measurement gated](compiler-performance/67-index-remaining-ctfe-environment-lookup.md)
 - [Step 2e visibility convergence](compiler-performance/94-step2e-visibility-convergence.md)
 - [Step 2e width-probe resource gate](compiler-performance/97-bound-visibility-width-probe.md)
-- [Inference pattern-constructor coverage index](compiler-performance/114-inference-pattern-constructor-accumulation.md)
 - [Inference capture-name filtering](compiler-performance/115-inference-capture-name-filtering.md)
 - [CTFE flat-map result accumulation](compiler-performance/116-ctfe-result-list-accumulation.md)
 - [Global initializer dependency admission](compiler-performance/117-typecheck-graph-edge-accumulation.md)

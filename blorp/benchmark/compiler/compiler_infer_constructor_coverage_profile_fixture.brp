@@ -1,0 +1,264 @@
+-- Deterministic fixture for the production constructor-exhaustiveness path.
+-- Construction and observation stay outside the measured window.
+import:
+	../../src/compiler/stage_03_parse/parsed_ast:
+		ParsedExpr(ParsedIntLiteralExpr, ParsedMatchExpr, ParsedNameExpr),
+		ParsedIdentifier,
+		ParsedMatchCase,
+		ParsedPattern(ParsedConstructorPattern, ParsedOrPattern),
+		parsed_identifier,
+	../../src/compiler/stage_06_typecheck/infer:
+		TypedExpr(TypedMatchExpr),
+		infer_context,
+		infer_expr,
+	../../src/compiler/stage_06_typecheck/state:
+		TYPECHECK_USER_ORIGIN,
+		TypecheckState,
+		typecheck_state_for_origin,
+	../../src/compiler/stage_06_typecheck/type_system/env:
+		TypeKind(TypeUnion),
+		VarMutability(ImmutableBinding),
+		VarOrigin(LetBinding),
+		VariantDef,
+		env_add_type,
+		env_add_var_with_details,
+	../../src/compiler/stage_06_typecheck/type_system/refinement: UNREFINED_BINDING
+	../../src/compiler/stage_06_typecheck/type_system/semantic_type: SemanticType(SemanticNamedType)
+	../../src/lib/source: Cursor, SourceFile, SourceSpan, source_cursor_at, source_file, source_span
+	bytes: get as get_byte
+	list: list
+
+
+PROFILE_TYPE_NAME: String = "ConstructorCoverageProfile"
+
+PROFILE_VALUE_NAME: String = "constructor_coverage_value"
+
+PROFILE_MISSING_NAME: String = "ConstructorCoverageMissing"
+
+
+record ConstructorCoverageProfileConfig {
+	iterations: Int,
+	case_count: Int,
+	options_per_case: Int,
+	unique_constructor_count: Int,
+	duplicate_stride: Int
+}
+
+
+record ConstructorCoverageProfileFixture {
+	config: ConstructorCoverageProfileConfig,
+	state: TypecheckState,
+	expr: ParsedExpr,
+	expected_pattern_visits: Int
+}
+
+
+record ConstructorCoverageProfileExecution {
+	errors: List[String],
+	typed_case_count: Int,
+	iterations: Int
+}
+
+
+record ConstructorCoverageProfileResult {
+	error_count: Int,
+	error_checksum: Int,
+	typed_case_count: Int,
+	expected_pattern_visits: Int,
+	workload_valid: Bool
+}
+
+
+private pure func fixture_span() -> SourceSpan:
+	src: SourceFile = source_file(
+		"constructor_coverage_profile.brp",
+		"constructor_coverage_profile",
+		"profile",
+	)
+	cursor: Cursor = source_cursor_at(src, 0)
+	source_span(src, cursor, cursor)
+
+
+private pure func identifier(name: String, span: SourceSpan) -> ParsedIdentifier:
+	parsed_identifier(name, span)
+
+
+private pure func constructor_name(index: Int) -> String:
+	"ConstructorCoverage${index}"
+
+
+private pure func profile_variants(count: Int) -> List[VariantDef]:
+	var variants: List[VariantDef] = list(count + 1)
+	var index: Int = 0
+
+	while index < count:
+		variants = variants.append({
+			name = constructor_name(index),
+			fields = [],
+			tag = index,
+		})
+		index += 1
+
+	variants.append({
+		name = PROFILE_MISSING_NAME,
+		fields = [],
+		tag = count,
+	})
+
+
+private pure func profile_state(unique_constructor_count: Int) -> TypecheckState:
+	state = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
+	with_type = env_add_type(
+		state.env,
+		PROFILE_TYPE_NAME,
+		[],
+		profile_variants(unique_constructor_count),
+		TypeUnion,
+		False,
+		True,
+	)
+	profile_type = SemanticNamedType(PROFILE_TYPE_NAME, [])
+	{ state |
+		env = env_add_var_with_details(
+			with_type,
+			PROFILE_VALUE_NAME,
+			profile_type,
+			Some(profile_type),
+			ImmutableBinding,
+			LetBinding,
+			UNREFINED_BINDING,
+		)
+	}
+
+
+private pure func selected_constructor_index(
+	linear_index: Int,
+	config: ConstructorCoverageProfileConfig,
+) -> Int:
+	linear_index / config.duplicate_stride % config.unique_constructor_count
+
+
+private pure func profile_case(
+	case_index: Int,
+	config: ConstructorCoverageProfileConfig,
+	span: SourceSpan,
+) -> ParsedMatchCase:
+	var options: List[ParsedPattern] = list(config.options_per_case)
+	var option_index: Int = 0
+
+	while option_index < config.options_per_case:
+		linear_index: Int = case_index * config.options_per_case + option_index
+		selected_index: Int = selected_constructor_index(linear_index, config)
+		options = options.append(
+			ParsedConstructorPattern(
+				identifier(constructor_name(selected_index), span),
+				[],
+				span,
+			),
+		)
+		option_index += 1
+
+	pattern: ParsedPattern = if options.length() == 1:
+		options.get_or(
+			0,
+			ParsedConstructorPattern(
+				identifier(constructor_name(0), span),
+				[],
+				span,
+			),
+		)
+	else:
+		ParsedOrPattern(options, span)
+
+	{
+		pattern = pattern,
+		body = ParsedIntLiteralExpr("1", span),
+		span = span
+	}
+
+
+private pure func profile_expr(config: ConstructorCoverageProfileConfig) -> ParsedExpr:
+	span = fixture_span()
+	var cases: List[ParsedMatchCase] = list(config.case_count)
+	var case_index: Int = 0
+
+	while case_index < config.case_count:
+		cases = cases.append(profile_case(case_index, config, span))
+		case_index += 1
+
+	ParsedMatchExpr(ParsedNameExpr(identifier(PROFILE_VALUE_NAME, span)), cases, span)
+
+
+pure func constructor_coverage_profile_fixture(
+	config: ConstructorCoverageProfileConfig,
+) -> ConstructorCoverageProfileFixture:
+	patterns_per_case = if config.options_per_case == 1:
+		1
+	else:
+		config.options_per_case + 1
+
+	{
+		config = config,
+		state = profile_state(config.unique_constructor_count),
+		expr = profile_expr(config),
+		expected_pattern_visits = config.case_count * patterns_per_case
+	}
+
+
+pure func constructor_coverage_profile_execute(
+	fixture: ConstructorCoverageProfileFixture,
+	iterations: Int,
+) -> ConstructorCoverageProfileExecution:
+	var errors: List[String] = []
+	var typed_case_count: Int = -1
+	var index: Int = 0
+
+	while index < iterations:
+		result = infer_expr(infer_context(fixture.state), fixture.expr)
+		errors = result.context.state.errors
+
+		typed_case_count = match result.expr:
+			TypedMatchExpr(_, cases, _, _):
+				cases.length()
+			_:
+				-1
+
+		index += 1
+
+	{
+		errors = errors,
+		typed_case_count = typed_case_count,
+		iterations = iterations
+	}
+
+
+private pure func checksum_text(value: String) -> Int:
+	bytes = value.to_bytes()
+	var checksum: Int = 0
+	var index: Int = 0
+
+	while index < bytes.length():
+		checksum = checksum * 131 + get_byte(bytes, index).get_or(0)
+		index += 1
+
+	checksum
+
+
+pure func constructor_coverage_profile_observe(
+	fixture: ConstructorCoverageProfileFixture,
+	execution: ConstructorCoverageProfileExecution,
+) -> ConstructorCoverageProfileResult:
+	error_text: String = execution.errors.join("|")
+
+	{
+		error_count = execution.errors.length(),
+		error_checksum = checksum_text(error_text),
+		typed_case_count = execution.typed_case_count,
+		expected_pattern_visits = fixture.expected_pattern_visits * execution.iterations,
+		workload_valid = (
+			execution.iterations > 0
+			and execution.typed_case_count == fixture.config.case_count
+			and execution.errors.length() == 1
+			and error_text == "Non-exhaustive match on " + PROFILE_TYPE_NAME + ": missing " + PROFILE_MISSING_NAME
+		)
+	}
