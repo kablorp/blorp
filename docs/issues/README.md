@@ -66,7 +66,6 @@ current-state and next-action summary.
 - [Accepted-alias cycle membership](compiler-performance/99-index-accepted-alias-cycle-membership.md)
 - [Cancellation-plan child-result batching](compiler-performance/100-batch-cancellation-plan-child-results.md)
 - [Meta-resolution cycle membership](compiler-performance/102-index-meta-resolution-cycle-membership.md)
-- [Environment symbol collection](compiler-performance/103-batch-environment-symbol-collection.md)
 - [Resource-reference deduplication](compiler-performance/104-index-resource-reference-deduplication.md)
 - [Consumed-argument membership](compiler-performance/105-index-consumed-argument-membership.md)
 - [Standard-inline rename copying](compiler-performance/109-reduce-std-inline-rename-copying.md)
