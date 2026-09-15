@@ -1,0 +1,115 @@
+-- Isolated profile for Core layout alias-cycle membership.
+import:
+	compiler_core_layout_alias_cycle_profile_fixture:
+		CoreLayoutAliasCycleProfileConfig,
+		CoreLayoutAliasCycleProfileInput,
+		CoreLayoutAliasCycleProfileResult,
+		CoreLayoutAliasCycleProfileStrategy(
+			IndexedPathAliasCycleProfile,
+			ListPathAliasCycleProfile,
+		),
+		compiler_core_layout_alias_cycle_profile_input,
+		compiler_core_layout_alias_cycle_profile_with_input,
+	instrumentation: begin_function_profile_window, end_function_profile_window
+	memory: MemStats, get_mem_stats, reset_mem_stats
+	string: parse_int
+	system: now_microseconds
+
+
+private pure func positive_argument(args: List[String], index: Int, default: Int) -> Int:
+	match args.get(index):
+		Some(text):
+			match parse_int(text):
+				Some(value):
+					if value > 0:
+						value
+					else:
+						default
+				None:
+					default
+		None:
+			default
+
+
+private pure func bool_argument(args: List[String], index: Int, default: Bool) -> Bool:
+	match args.get(index):
+		Some("1") | Some("true") | Some("reuse"):
+			True
+		Some("0") | Some("false") | Some("distinct"):
+			False
+		_:
+			default
+
+
+private pure func strategy_argument(args: List[String]) -> CoreLayoutAliasCycleProfileStrategy:
+	match args.get(1):
+		Some("indexed"):
+			IndexedPathAliasCycleProfile
+		_:
+			ListPathAliasCycleProfile
+
+
+private pure func strategy_name(strategy: CoreLayoutAliasCycleProfileStrategy) -> String:
+	match strategy:
+		ListPathAliasCycleProfile:
+			"list"
+		IndexedPathAliasCycleProfile:
+			"indexed"
+
+
+private pure func memory_summary(prefix: String, stats: MemStats) -> String:
+	" " + prefix + "_total_allocations=" + stats.total_allocations.to_string() + " " + prefix + "_total_releases=" + stats.total_releases.to_string() + " " + prefix + "_retained_objects=" + stats.current_objects.to_string() + " " + prefix + "_allocated_bytes=" + stats.bytes_allocated.to_string()
+
+
+func main(args: List[String]) -> Int:
+	strategy = strategy_argument(args)
+	config: CoreLayoutAliasCycleProfileConfig = {
+		iterations = positive_argument(args, 2, 100),
+		root_type_count = positive_argument(args, 3, 256),
+		alias_chain_depth = positive_argument(args, 4, 16),
+		generic_arg_width = positive_argument(args, 5, 4),
+		reuse_alias_chain = bool_argument(args, 6, True)
+	}
+
+	setup_started: Int = now_microseconds()
+	input: CoreLayoutAliasCycleProfileInput = compiler_core_layout_alias_cycle_profile_input(config)
+	setup_microseconds: Int = now_microseconds() - setup_started
+	setup_checksum: Int = input.expected_checksum + input.alias_decl_count
+
+	warmup: CoreLayoutAliasCycleProfileResult = compiler_core_layout_alias_cycle_profile_with_input(
+		config,
+		strategy,
+		input,
+	)
+
+	reset_mem_stats()
+	begin_function_profile_window()
+	started: Int = now_microseconds()
+	result: CoreLayoutAliasCycleProfileResult = compiler_core_layout_alias_cycle_profile_with_input(
+		config,
+		strategy,
+		input,
+	)
+	elapsed_microseconds: Int = now_microseconds() - started
+	end_function_profile_window()
+	stats: MemStats = get_mem_stats()
+	workload_valid: Bool = (
+		warmup.workload_valid
+		and result.workload_valid
+		and warmup.checksum == result.checksum
+		and result.checksum == result.expected_checksum
+	)
+
+	print(
+		"CORE_LAYOUT_ALIAS_CYCLE_PROFILE" + " strategy=" + strategy_name(
+			strategy,
+		) + " iterations=" + result.iterations.to_string() + " root_type_count=" + result.root_type_count.to_string() + " alias_chain_depth=" + result.alias_chain_depth.to_string() + " generic_arg_width=" + result.generic_arg_width.to_string() + " reuse_alias_chain=" + result.reuse_alias_chain.to_string() + " alias_decl_count=" + result.alias_decl_count.to_string() + " alias_membership_requests=" + result.alias_membership_requests.to_string() + " names_compared=" + result.names_compared.to_string() + " recursive_resolutions=" + result.recursive_resolutions.to_string() + " checksum=" + result.checksum.to_string() + " expected_checksum=" + result.expected_checksum.to_string() + " setup_checksum=" + setup_checksum.to_string() + " setup_microseconds=" + setup_microseconds.to_string() + " elapsed_microseconds=" + elapsed_microseconds.to_string() + memory_summary(
+			"measure",
+			stats,
+		) + " workload_valid=" + workload_valid.to_string(),
+	)
+
+	if workload_valid:
+		0
+	else:
+		1

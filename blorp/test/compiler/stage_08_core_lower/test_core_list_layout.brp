@@ -4,6 +4,7 @@ import:
 		build_layout_type_index,
 		list_element_needs_release_with_index,
 		list_layout_for_type_with_index,
+		resolve_layout_type_with_index,
 	../../../src/compiler/stage_09_core/ir:
 		CoreBoxKind(PointerBox, StructBox),
 		CoreDecl(
@@ -45,6 +46,7 @@ import:
 			VoidType,
 		),
 		CoreVar,
+		core_type_equal,
 	test: TestSuite
 
 
@@ -54,6 +56,17 @@ pure func named_type(name: String) -> CoreType:
 
 pure func list_type(element_type: CoreType) -> CoreType:
 	NamedType("List", [element_type])
+
+
+pure func type_alias(name: String, params: List[String], target: CoreType) -> CoreDecl:
+	TypeAliasDecl({
+		abi_type = None,
+		name = name,
+		type_params = params,
+		target = target,
+		is_opaque = False,
+		loc = SyntheticSourceLoc,
+	})
 
 
 pure func core_var(name: String) -> CoreVar:
@@ -314,35 +327,16 @@ pure func test_classifies_declared_enum_and_value_record() -> Bool:
 
 
 pure func test_expands_aliases() -> Bool:
-	program: CoreProgram = empty_program([TypeAliasDecl({
-			abi_type = None,
-			name = "Count",
-			type_params = [],
-			target = named_type("Int"),
-			is_opaque = False,
-			loc = SyntheticSourceLoc,
-		}), TypeAliasDecl({
-			abi_type = None,
-			name = "Bag",
-			type_params = ["T"],
-			target = NamedType("List", [TypeParameterType("T")]),
-			is_opaque = False,
-			loc = SyntheticSourceLoc,
-		}), TypeAliasDecl({
-			abi_type = None,
-			name = "CycleA",
-			type_params = [],
-			target = named_type("CycleB"),
-			is_opaque = False,
-			loc = SyntheticSourceLoc,
-		}), TypeAliasDecl({
-			abi_type = None,
-			name = "CycleB",
-			type_params = [],
-			target = named_type("CycleA"),
-			is_opaque = False,
-			loc = SyntheticSourceLoc,
-		})])
+	program: CoreProgram = empty_program([
+		type_alias("Count", [], named_type("Int")),
+		type_alias(
+			"Bag",
+			["T"],
+			NamedType("List", [TypeParameterType("T")]),
+		),
+		type_alias("CycleA", [], named_type("CycleB")),
+		type_alias("CycleB", [], named_type("CycleA")),
+	])
 	index = build_layout_type_index(program)
 
 	is_inline_layout(
@@ -357,6 +351,65 @@ pure func test_expands_aliases() -> Bool:
 	) and is_pointer_layout(list_layout_for_type_with_index(index, list_type(named_type("CycleA"))))
 
 
+pure func test_resolves_deep_alias_chain_to_canonical_type() -> Bool:
+	program: CoreProgram = empty_program([
+		type_alias("Alias0", [], named_type("Int")),
+		type_alias("Alias1", [], named_type("Alias0")),
+		type_alias("Alias2", [], named_type("Alias1")),
+		type_alias("Alias3", [], named_type("Alias2")),
+		type_alias("Alias4", [], named_type("Alias3")),
+	])
+	index = build_layout_type_index(program)
+
+	core_type_equal(
+		resolve_layout_type_with_index(index, named_type("Alias4")),
+		named_type("Int"),
+	)
+
+
+pure func test_self_cycle_stops_at_alias_name() -> Bool:
+	program: CoreProgram = empty_program([type_alias("Cycle", [], named_type("Cycle"))])
+	index = build_layout_type_index(program)
+
+	core_type_equal(
+		resolve_layout_type_with_index(index, named_type("Cycle")),
+		named_type("Cycle"),
+	)
+
+
+pure func test_mutual_cycle_stops_at_reentered_alias_name() -> Bool:
+	program: CoreProgram = empty_program([
+		type_alias("CycleA", [], named_type("CycleB")),
+		type_alias("CycleB", [], named_type("CycleA")),
+	])
+	index = build_layout_type_index(program)
+
+	core_type_equal(
+		resolve_layout_type_with_index(index, named_type("CycleA")),
+		named_type("CycleA"),
+	)
+
+
+pure func test_alias_cycle_membership_is_branch_local() -> Bool:
+	program: CoreProgram = empty_program([
+		type_alias(
+			"Loop",
+			[],
+			NamedType("Box", [named_type("Loop")]),
+		),
+		type_alias("Pair", [], TupleType([named_type("Loop"), named_type("Loop")])),
+	])
+	index = build_layout_type_index(program)
+
+	core_type_equal(
+		resolve_layout_type_with_index(index, named_type("Pair")),
+		TupleType([
+			NamedType("Box", [named_type("Loop")]),
+			NamedType("Box", [named_type("Loop")]),
+		]),
+	)
+
+
 pure func test_alias_substitution_preserves_nominal_identity() -> Bool:
 	program: CoreProgram = empty_program([ValueRecordDecl({
 			abi_type = None,
@@ -364,14 +417,11 @@ pure func test_alias_substitution_preserves_nominal_identity() -> Bool:
 			type_params = [],
 			fields = [],
 			loc = SyntheticSourceLoc,
-		}), TypeAliasDecl({
-			abi_type = None,
-			name = "NominalBag",
-			type_params = ["T"],
-			target = NamedType("List", [NamedType("T", [])]),
-			is_opaque = False,
-			loc = SyntheticSourceLoc,
-		})])
+		}), type_alias(
+			"NominalBag",
+			["T"],
+			NamedType("List", [NamedType("T", [])]),
+		)])
 	index = build_layout_type_index(program)
 
 	is_inline_struct_layout(
@@ -453,20 +503,16 @@ pure func test_classifies_pointer_release_policy() -> Bool:
 
 
 pure func test_indexed_layout_queries_reuse_declaration_facts() -> Bool:
-	program: CoreProgram = empty_program([TypeAliasDecl({
-			abi_type = None,
-			name = "OwnedAlias",
-			type_params = [],
-			target = named_type("Owned"),
-			is_opaque = False,
-			loc = SyntheticSourceLoc,
-		}), HeapRecordDecl({
+	program: CoreProgram = empty_program([
+		type_alias("OwnedAlias", [], named_type("Owned")),
+		HeapRecordDecl({
 			abi_type = None,
 			name = "Owned",
 			type_params = [],
 			fields = [],
 			loc = SyntheticSourceLoc,
-		})])
+		}),
+	])
 	index = build_layout_type_index(program)
 	alias_type = named_type("OwnedAlias")
 
@@ -636,24 +682,21 @@ pure func test_repairs_aliased_heap_record_element_release_metadata() -> Bool:
 	record_type: CoreType = HeapRecordType("SourceFile")
 	alias_type: CoreType = named_type("SourceAlias")
 	source_list: CoreType = list_type(alias_type)
-	annotated = annotate_list_layouts(empty_program([TypeAliasDecl({
-			abi_type = None,
-			name = "SourceAlias",
-			type_params = [],
-			target = named_type("SourceFile"),
-			is_opaque = False,
-			loc = SyntheticSourceLoc,
-		}), HeapRecordDecl({
+	annotated = annotate_list_layouts(empty_program([
+		type_alias("SourceAlias", [], named_type("SourceFile")),
+		HeapRecordDecl({
 			abi_type = None,
 			name = "SourceFile",
 			type_params = [],
 			fields = [],
 			loc = SyntheticSourceLoc,
-		}), function_decl(
+		}),
+		function_decl(
 			"make_aliased_sources",
 			7,
 			stale_heap_record_list_construct(source_list, record_type),
-		)]))
+		),
+	]))
 
 	match annotated.decls:
 		[TypeAliasDecl(_), HeapRecordDecl(_), FunctionDecl(function_info)]:
@@ -731,6 +774,16 @@ tests: TestSuite = {
 			test_classifies_declared_enum_and_value_record,
 		),
 		("expands aliases", test_expands_aliases),
+		(
+			"resolves deep alias chain to canonical type",
+			test_resolves_deep_alias_chain_to_canonical_type,
+		),
+		("self cycle stops at alias name", test_self_cycle_stops_at_alias_name),
+		(
+			"mutual cycle stops at reentered alias name",
+			test_mutual_cycle_stops_at_reentered_alias_name,
+		),
+		("alias cycle membership is branch-local", test_alias_cycle_membership_is_branch_local),
 		(
 			"alias substitution preserves nominal identity",
 			test_alias_substitution_preserves_nominal_identity,

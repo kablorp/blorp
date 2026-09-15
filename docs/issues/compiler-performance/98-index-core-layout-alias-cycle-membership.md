@@ -1,19 +1,22 @@
 # Index Core Layout Alias-Cycle Membership
 
-**Status:** Proposed, measurement-gated
+**Status:** Rejected after measurement
 
 **Current state:** `resolve_types` walks every type and delegates to
 `resolve_type`, which scans the path-local `seen_aliases: List[String]` before
 following an alias. It ran 2,510,797 times in the retained self-compile.
-**Next action:** Add a focused depth/width probe and measure alias-membership
-comparisons before changing the recursion state.
+**Decision:** Keep the ordered path list. The retained depth/width probe showed
+that a path-local keyed membership companion removes scan work but increases
+allocations and does not improve elapsed time, including on deep alias chains.
+See
+[`compiler_core_layout_alias_cycle_membership_2026-09-14.md`](../../../benchmarks/results/compiler_core_layout_alias_cycle_membership_2026-09-14.md).
+**Retained benchmark:**
+`benchmarks/compiler_core_layout_alias_cycle_profile plain list 50 256 24 4 reuse`
+and the same command with `indexed`.
 **Read first:** `blorp/src/compiler/stage_08_core_lower/list_layout.brp`,
-`blorp/test/compiler/stage_08_core_lower/test_core_list_layout.brp`, and the
-[call-count screen](../../../benchmarks/results/compiler_complexity_call_counts_2026-09-14.md).
-**Fast loop:** `bin/blorp test blorp/test/compiler/stage_08_core_lower/test_core_list_layout.brp` plus the proposed focused probe described below.
-**Decision:** Implement only if alias-path membership is material at realistic
-depths; ask for guidance before changing `CoreLayoutTypeIndex` or alias-cycle
-diagnostics.
+`blorp/test/compiler/stage_08_core_lower/test_core_list_layout.brp`, the
+[call-count screen](../../../benchmarks/results/compiler_complexity_call_counts_2026-09-14.md),
+and the measurement result linked above.
 
 ## Objective
 

@@ -1,0 +1,679 @@
+-- Deterministic Core layout alias-cycle membership workload.
+import:
+	../../src/compiler/stage_08_core_lower/list_layout: CoreLayoutTypeIndex, build_layout_type_index
+	../../src/compiler/stage_09_core/ir:
+		CoreDecl(TypeAliasDecl),
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(
+			BoxedResultType,
+			FunctionType,
+			NamedType,
+			SelfType,
+			StackResultType,
+			TensorType,
+			TupleType,
+			TypeParameterType,
+		),
+		CoreTypeAliasDecl,
+		core_type_equal,
+
+
+union CoreLayoutAliasCycleProfileStrategy:
+	ListPathAliasCycleProfile
+	IndexedPathAliasCycleProfile
+
+
+record CoreLayoutAliasCycleProfileConfig {
+	iterations: Int,
+	root_type_count: Int,
+	alias_chain_depth: Int,
+	generic_arg_width: Int,
+	reuse_alias_chain: Bool
+}
+
+
+record CoreLayoutAliasCycleProfileInput {
+	index: CoreLayoutTypeIndex,
+	root_types: List[CoreType],
+	expected_types: List[CoreType],
+	root_type_count: Int,
+	alias_decl_count: Int,
+	expected_checksum: Int
+}
+
+
+record CoreLayoutAliasCycleProfileStats {
+	alias_membership_requests: Int,
+	names_compared: Int,
+	recursive_resolutions: Int
+}
+
+
+record CoreLayoutAliasCycleProfileResult {
+	iterations: Int,
+	root_type_count: Int,
+	alias_chain_depth: Int,
+	generic_arg_width: Int,
+	reuse_alias_chain: Bool,
+	alias_decl_count: Int,
+	alias_membership_requests: Int,
+	names_compared: Int,
+	recursive_resolutions: Int,
+	checksum: Int,
+	expected_checksum: Int,
+	workload_valid: Bool
+}
+
+
+private record ProfileResolvedType {
+	typ: CoreType,
+	stats: CoreLayoutAliasCycleProfileStats
+}
+
+
+private record AliasCyclePathIndex {
+	names: List[String],
+	membership: Dict[String, Bool]
+}
+
+
+private pure func empty_stats() -> CoreLayoutAliasCycleProfileStats:
+	{
+		alias_membership_requests = 0,
+		names_compared = 0,
+		recursive_resolutions = 0
+	}
+
+
+private pure func combine_stats(
+	left: CoreLayoutAliasCycleProfileStats,
+	right: CoreLayoutAliasCycleProfileStats,
+) -> CoreLayoutAliasCycleProfileStats:
+	{
+		alias_membership_requests = left.alias_membership_requests + right.alias_membership_requests,
+		names_compared = left.names_compared + right.names_compared,
+		recursive_resolutions = left.recursive_resolutions + right.recursive_resolutions
+	}
+
+
+private pure func count_resolution(
+	stats: CoreLayoutAliasCycleProfileStats,
+) -> CoreLayoutAliasCycleProfileStats:
+	{ stats | recursive_resolutions = stats.recursive_resolutions + 1 }
+
+
+private pure func count_list_membership_request(
+	stats: CoreLayoutAliasCycleProfileStats,
+	seen_aliases: List[String],
+	name: String,
+) -> CoreLayoutAliasCycleProfileStats:
+	var compared: Int = 0
+	var found: Bool = False
+
+	for seen in seen_aliases:
+		if not found:
+			compared += 1
+
+			if seen == name:
+				found = True
+
+	{
+		alias_membership_requests = stats.alias_membership_requests + 1,
+		names_compared = stats.names_compared + compared,
+		recursive_resolutions = stats.recursive_resolutions
+	}
+
+
+private pure func count_indexed_membership_request(
+	stats: CoreLayoutAliasCycleProfileStats,
+) -> CoreLayoutAliasCycleProfileStats:
+	{
+		alias_membership_requests = stats.alias_membership_requests + 1,
+		names_compared = stats.names_compared + 1,
+		recursive_resolutions = stats.recursive_resolutions
+	}
+
+
+private pure func alias_name(root_index: Int, alias_index: Int) -> String:
+	"LayoutAlias" + root_index.to_string() + "_" + alias_index.to_string()
+
+
+private pure func type_param_name(index: Int) -> String:
+	"T" + index.to_string()
+
+
+private pure func type_params(width: Int) -> List[String]:
+	var result: List[String] = []
+
+	for index in 0..width:
+		result = result.append(type_param_name(index))
+
+	result
+
+
+private pure func type_param_refs(width: Int) -> List[CoreType]:
+	var result: List[CoreType] = []
+
+	for index in 0..width:
+		result = result.append(TypeParameterType(type_param_name(index)))
+
+	result
+
+
+private pure func concrete_type_arg(index: Int) -> CoreType:
+	if index % 4 == 0:
+		NamedType("Int", [])
+	else if index % 4 == 1:
+		NamedType("Bool", [])
+	else if index % 4 == 2:
+		NamedType("String", [])
+	else:
+		NamedType("Float", [])
+
+
+private pure func concrete_type_args(width: Int) -> List[CoreType]:
+	var result: List[CoreType] = []
+
+	for index in 0..width:
+		result = result.append(concrete_type_arg(index))
+
+	result
+
+
+private pure func leaf_target(width: Int) -> CoreType:
+	match type_param_refs(width):
+		[only]:
+			only
+		params:
+			TupleType(params)
+
+
+private pure func expected_type(width: Int) -> CoreType:
+	match concrete_type_args(width):
+		[only]:
+			only
+		args:
+			TupleType(args)
+
+
+private pure func alias_decl(name: String, params: List[String], target: CoreType) -> CoreDecl:
+	TypeAliasDecl({
+		abi_type = None,
+		name = name,
+		type_params = params,
+		target = target,
+		is_opaque = False,
+		loc = SyntheticSourceLoc,
+	})
+
+
+private pure func alias_chain_decls(
+	root_index: Int,
+	alias_chain_depth: Int,
+	generic_arg_width: Int,
+) -> List[CoreDecl]:
+	params: List[String] = type_params(generic_arg_width)
+	param_refs: List[CoreType] = type_param_refs(generic_arg_width)
+	var result: List[CoreDecl] = []
+
+	for alias_index in 0..alias_chain_depth:
+		target: CoreType = if alias_index == 0:
+			leaf_target(generic_arg_width)
+		else:
+			NamedType(
+				alias_name(root_index, alias_index - 1),
+				param_refs,
+			)
+
+		result = result.append(alias_decl(alias_name(root_index, alias_index), params, target))
+
+	result
+
+
+private pure func root_alias_index(
+	config: CoreLayoutAliasCycleProfileConfig,
+	root_index: Int,
+) -> Int:
+	if config.reuse_alias_chain:
+		0
+	else:
+		root_index
+
+
+private pure func root_type_for(
+	config: CoreLayoutAliasCycleProfileConfig,
+	root_index: Int,
+) -> CoreType:
+	NamedType(
+		alias_name(
+			root_alias_index(config, root_index),
+			config.alias_chain_depth - 1,
+		),
+		concrete_type_args(config.generic_arg_width),
+	)
+
+
+pure func compiler_core_layout_alias_cycle_profile_input(
+	config: CoreLayoutAliasCycleProfileConfig,
+) -> CoreLayoutAliasCycleProfileInput:
+	var decls: List[CoreDecl] = []
+
+	chain_count: Int = if config.reuse_alias_chain:
+		1
+	else:
+		config.root_type_count
+
+	for root_index in 0..chain_count:
+		decls = decls.concat(
+			alias_chain_decls(
+				root_index,
+				config.alias_chain_depth,
+				config.generic_arg_width,
+			),
+		)
+
+	program: CoreProgram = {
+		decls = decls,
+		foreign_includes = []
+	}
+	index: CoreLayoutTypeIndex = build_layout_type_index(program)
+	expected: CoreType = expected_type(config.generic_arg_width)
+	var root_types: List[CoreType] = []
+	var expected_types: List[CoreType] = []
+	var checksum: Int = 0
+
+	for root_index in 0..config.root_type_count:
+		root_types = root_types.append(root_type_for(config, root_index))
+		expected_types = expected_types.append(expected)
+		checksum += core_type_checksum(expected)
+
+	{
+		index = index,
+		root_types = root_types,
+		expected_types = expected_types,
+		root_type_count = config.root_type_count,
+		alias_decl_count = decls.length(),
+		expected_checksum = checksum
+	}
+
+
+private pure func alias_type_argument(
+	params: List[String],
+	args: List[CoreType],
+	name: String,
+) -> Option[CoreType]:
+	var result: Option[CoreType] = None
+	var index: Int = 0
+
+	while index < params.length() and result.is_none():
+		match (params.get(index), args.get(index)):
+			(Some(param), Some(arg)):
+				if param == name:
+					result = Some(arg)
+			_:
+				void
+
+		index += 1
+
+	result
+
+
+private pure func substitute_alias_type(
+	typ: CoreType,
+	params: List[String],
+	args: List[CoreType],
+) -> CoreType:
+	match typ:
+		TypeParameterType(name):
+			alias_type_argument(params, args, name).get_or(typ)
+		NamedType(name, nested_args):
+			NamedType(
+				name,
+				nested_args.map(func(arg): substitute_alias_type(arg, params, args)),
+			)
+		StackResultType(ok_type, err_type):
+			StackResultType(
+				substitute_alias_type(ok_type, params, args),
+				substitute_alias_type(err_type, params, args),
+			)
+		BoxedResultType(ok_type, err_type):
+			BoxedResultType(
+				substitute_alias_type(ok_type, params, args),
+				substitute_alias_type(err_type, params, args),
+			)
+		FunctionType(is_pure, function_params, return_type):
+			FunctionType(
+				is_pure,
+				function_params.map(func(param): substitute_alias_type(param, params, args)),
+				substitute_alias_type(return_type, params, args),
+			)
+		TensorType(info):
+			TensorType(
+				{ info | element_type = substitute_alias_type(info.element_type, params, args) },
+			)
+		TupleType(items):
+			TupleType(items.map(
+				func(item): substitute_alias_type(item, params, args),
+			))
+		SelfType:
+			typ
+		_:
+			typ
+
+
+private pure func resolve_list_profile_types(
+	index: CoreLayoutTypeIndex,
+	types: List[CoreType],
+	seen_aliases: List[String],
+) -> ProfileResolvedType:
+	var resolved: List[CoreType] = []
+	var stats: CoreLayoutAliasCycleProfileStats = empty_stats()
+
+	for typ in types:
+		item: ProfileResolvedType = resolve_list_profile_type(index, typ, seen_aliases)
+		resolved = resolved.append(item.typ)
+		stats = combine_stats(stats, item.stats)
+
+	{
+		typ = TupleType(resolved),
+		stats = stats
+	}
+
+
+private pure func resolved_items(result: ProfileResolvedType) -> List[CoreType]:
+	match result.typ:
+		TupleType(items):
+			items
+		_:
+			[]
+
+
+private pure func resolve_list_profile_type(
+	index: CoreLayoutTypeIndex,
+	typ: CoreType,
+	seen_aliases: List[String],
+) -> ProfileResolvedType:
+	var stats: CoreLayoutAliasCycleProfileStats = count_resolution(empty_stats())
+
+	match typ:
+		NamedType(name, args):
+			args_result: ProfileResolvedType = resolve_list_profile_types(index, args, seen_aliases)
+			resolved_args: List[CoreType] = resolved_items(args_result)
+			stats = combine_stats(stats, args_result.stats)
+			stats = count_list_membership_request(stats, seen_aliases, name)
+
+			if seen_aliases.contains(name):
+				{
+					typ = NamedType(name, resolved_args),
+					stats = stats
+				}
+			else:
+				match index.aliases.get(name):
+					Some(alias_decl):
+						if alias_decl.type_params.length() == resolved_args.length():
+							target = substitute_alias_type(
+								alias_decl.target,
+								alias_decl.type_params,
+								resolved_args,
+							)
+							target_result = resolve_list_profile_type(
+								index,
+								target,
+								seen_aliases.append(name),
+							)
+							{
+								typ = target_result.typ,
+								stats = combine_stats(stats, target_result.stats)
+							}
+						else:
+							{
+								typ = NamedType(name, resolved_args),
+								stats = stats
+							}
+					None:
+						{
+							typ = NamedType(name, resolved_args),
+							stats = stats
+						}
+		FunctionType(is_pure, params, return_type):
+			params_result: ProfileResolvedType = resolve_list_profile_types(
+				index,
+				params,
+				seen_aliases,
+			)
+			return_result: ProfileResolvedType = resolve_list_profile_type(
+				index,
+				return_type,
+				seen_aliases,
+			)
+			{
+				typ = FunctionType(is_pure, resolved_items(params_result), return_result.typ),
+				stats = combine_stats(
+					stats,
+					combine_stats(params_result.stats, return_result.stats),
+				)
+			}
+		TupleType(items):
+			items_result: ProfileResolvedType = resolve_list_profile_types(
+				index,
+				items,
+				seen_aliases,
+			)
+			{
+				typ = TupleType(resolved_items(items_result)),
+				stats = combine_stats(stats, items_result.stats)
+			}
+		_:
+			{
+				typ = typ,
+				stats = stats
+			}
+
+
+private pure func empty_alias_cycle_path_index() -> AliasCyclePathIndex:
+	{
+		names = [],
+		membership = {}
+	}
+
+
+private pure func push_alias_cycle_path_index(
+	path: AliasCyclePathIndex,
+	name: String,
+) -> AliasCyclePathIndex:
+	{
+		names = path.names.append(name),
+		membership = path.membership.set(name, True)
+	}
+
+
+private pure func resolve_indexed_profile_types(
+	index: CoreLayoutTypeIndex,
+	types: List[CoreType],
+	path: AliasCyclePathIndex,
+) -> ProfileResolvedType:
+	var resolved: List[CoreType] = []
+	var stats: CoreLayoutAliasCycleProfileStats = empty_stats()
+
+	for typ in types:
+		item: ProfileResolvedType = resolve_indexed_profile_type(index, typ, path)
+		resolved = resolved.append(item.typ)
+		stats = combine_stats(stats, item.stats)
+
+	{
+		typ = TupleType(resolved),
+		stats = stats
+	}
+
+
+private pure func resolve_indexed_profile_type(
+	index: CoreLayoutTypeIndex,
+	typ: CoreType,
+	path: AliasCyclePathIndex,
+) -> ProfileResolvedType:
+	var stats: CoreLayoutAliasCycleProfileStats = count_resolution(empty_stats())
+
+	match typ:
+		NamedType(name, args):
+			args_result: ProfileResolvedType = resolve_indexed_profile_types(index, args, path)
+			resolved_args: List[CoreType] = resolved_items(args_result)
+			stats = combine_stats(stats, args_result.stats)
+			stats = count_indexed_membership_request(stats)
+
+			if path.membership.contains(name):
+				{
+					typ = NamedType(name, resolved_args),
+					stats = stats
+				}
+			else:
+				match index.aliases.get(name):
+					Some(alias_decl):
+						if alias_decl.type_params.length() == resolved_args.length():
+							target = substitute_alias_type(
+								alias_decl.target,
+								alias_decl.type_params,
+								resolved_args,
+							)
+							target_result = resolve_indexed_profile_type(
+								index,
+								target,
+								push_alias_cycle_path_index(path, name),
+							)
+							{
+								typ = target_result.typ,
+								stats = combine_stats(stats, target_result.stats)
+							}
+						else:
+							{
+								typ = NamedType(name, resolved_args),
+								stats = stats
+							}
+					None:
+						{
+							typ = NamedType(name, resolved_args),
+							stats = stats
+						}
+		FunctionType(is_pure, params, return_type):
+			params_result: ProfileResolvedType = resolve_indexed_profile_types(index, params, path)
+			return_result: ProfileResolvedType = resolve_indexed_profile_type(
+				index,
+				return_type,
+				path,
+			)
+			{
+				typ = FunctionType(is_pure, resolved_items(params_result), return_result.typ),
+				stats = combine_stats(
+					stats,
+					combine_stats(params_result.stats, return_result.stats),
+				)
+			}
+		TupleType(items):
+			items_result: ProfileResolvedType = resolve_indexed_profile_types(index, items, path)
+			{
+				typ = TupleType(resolved_items(items_result)),
+				stats = combine_stats(stats, items_result.stats)
+			}
+		_:
+			{
+				typ = typ,
+				stats = stats
+			}
+
+
+private pure func core_type_list_checksum(types: List[CoreType]) -> Int:
+	var result: Int = 0
+
+	for typ in types:
+		result = result * 131 + core_type_checksum(typ)
+
+	result
+
+
+private pure func core_type_checksum(typ: CoreType) -> Int:
+	match typ:
+		NamedType(name, args):
+			17 + name.length() * 31 + core_type_list_checksum(args)
+		TypeParameterType(name):
+			19 + name.length() * 37
+		StackResultType(ok_type, err_type):
+			23 + core_type_checksum(ok_type) * 41 + core_type_checksum(err_type)
+		BoxedResultType(ok_type, err_type):
+			29 + core_type_checksum(ok_type) * 43 + core_type_checksum(err_type)
+		FunctionType(is_pure, params, return_type):
+			purity: Int = if is_pure:
+				1
+			else:
+				0
+
+			31 + purity + core_type_list_checksum(params) * 47 + core_type_checksum(return_type)
+		TupleType(items):
+			37 + core_type_list_checksum(items)
+		_:
+			11
+
+
+private pure func profile_strategy_type(
+	strategy: CoreLayoutAliasCycleProfileStrategy,
+	input: CoreLayoutAliasCycleProfileInput,
+	typ: CoreType,
+) -> ProfileResolvedType:
+	match strategy:
+		ListPathAliasCycleProfile:
+			resolve_list_profile_type(input.index, typ, [])
+		IndexedPathAliasCycleProfile:
+			resolve_indexed_profile_type(input.index, typ, empty_alias_cycle_path_index())
+
+
+pure func compiler_core_layout_alias_cycle_profile_with_input(
+	config: CoreLayoutAliasCycleProfileConfig,
+	strategy: CoreLayoutAliasCycleProfileStrategy,
+	input: CoreLayoutAliasCycleProfileInput,
+) -> CoreLayoutAliasCycleProfileResult:
+	var stats: CoreLayoutAliasCycleProfileStats = empty_stats()
+	var checksum: Int = 0
+	var workload_valid: Bool = (
+		config.iterations > 0
+		and config.root_type_count > 0
+		and config.alias_chain_depth > 0
+		and config.generic_arg_width > 0
+	)
+
+	for _ in 0..config.iterations:
+		var index: Int = 0
+
+		for typ in input.root_types:
+			result: ProfileResolvedType = profile_strategy_type(strategy, input, typ)
+			expected: CoreType = input.expected_types
+				.get(index)
+				.get_or(NamedType("Invalid", []))
+
+			if not core_type_equal(result.typ, expected):
+				workload_valid = False
+
+			checksum += core_type_checksum(result.typ)
+			stats = combine_stats(stats, result.stats)
+			index += 1
+
+	{
+		iterations = config.iterations,
+		root_type_count = config.root_type_count,
+		alias_chain_depth = config.alias_chain_depth,
+		generic_arg_width = config.generic_arg_width,
+		reuse_alias_chain = config.reuse_alias_chain,
+		alias_decl_count = input.alias_decl_count,
+		alias_membership_requests = stats.alias_membership_requests,
+		names_compared = stats.names_compared,
+		recursive_resolutions = stats.recursive_resolutions,
+		checksum = checksum,
+		expected_checksum = input.expected_checksum * config.iterations,
+		workload_valid = workload_valid and checksum == input.expected_checksum * config.iterations
+	}
+
+
+pure func compiler_core_layout_alias_cycle_profile(
+	config: CoreLayoutAliasCycleProfileConfig,
+	strategy: CoreLayoutAliasCycleProfileStrategy,
+) -> CoreLayoutAliasCycleProfileResult:
+	input = compiler_core_layout_alias_cycle_profile_input(config)
+	compiler_core_layout_alias_cycle_profile_with_input(config, strategy, input)
