@@ -48,19 +48,21 @@ compiler=/Users/keithphilpott/CLionProjects/blorp/bin/blorp
 harness=blorp/benchmark/compiler/compiler_source_ast_finalize_diagnostics_profile.brp
 
 cp "$cand_dir/$harness" "$base_dir/$harness"
-(cd "$base_dir" && "$compiler" compile -o /tmp/blorp-issue106-baseline.c "$harness")
-(cd "$cand_dir" && "$compiler" compile -o /tmp/blorp-issue106-candidate.c "$harness")
-cc -O2 /tmp/blorp-issue106-baseline.c -o /tmp/blorp-issue106-baseline
-cc -O2 /tmp/blorp-issue106-candidate.c -o /tmp/blorp-issue106-candidate
+(cd "$base_dir" && "$compiler" compile -o /tmp/blorp-issue106-validation-baseline.c "$harness")
+(cd "$cand_dir" && "$compiler" compile -o /tmp/blorp-issue106-validation-candidate.c "$harness")
+cc -O2 /tmp/blorp-issue106-validation-baseline.c \
+  -o /tmp/blorp-issue106-validation-baseline
+cc -O2 /tmp/blorp-issue106-validation-candidate.c \
+  -o /tmp/blorp-issue106-validation-candidate
 
 for variant in baseline candidate; do
-  exe="/tmp/blorp-issue106-${variant}"
+  exe="/tmp/blorp-issue106-validation-${variant}"
   for n in 1 2 3 4 5; do
-    "$exe" 5 1024 2 4 1 > "/tmp/blorp-issue106-${variant}-dense-${n}.out"
-    "$exe" 5 1024 0 1 1 > "/tmp/blorp-issue106-${variant}-clean-${n}.out"
+    "$exe" 5 1024 2 4 1 > "/tmp/blorp-issue106-validation-${variant}-dense-${n}.out"
+    "$exe" 5 1024 0 1 1 > "/tmp/blorp-issue106-validation-${variant}-clean-${n}.out"
   done
   for n in 1 2 3; do
-    "$exe" 2 4096 3 8 1 > "/tmp/blorp-issue106-${variant}-heavy-${n}.out"
+    "$exe" 2 4096 3 8 1 > "/tmp/blorp-issue106-validation-${variant}-heavy-${n}.out"
   done
 done
 ```
