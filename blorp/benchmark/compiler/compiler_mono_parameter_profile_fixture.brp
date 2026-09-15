@@ -1,0 +1,607 @@
+-- Deterministic workload for Core type-parameter membership queries.
+--
+-- The fixture mirrors the recursive membership walk with explicit work
+-- counters, then compares those observations with the public production
+-- `core_type_contains_parameter` result.
+import:
+	../../src/compiler/stage_09_core/ir:
+		CoreDimOp(DimAdd),
+		CoreTensorDim(TensorDimOperation, TensorRuntimeDim, TensorStaticDim, TensorVariadicDim),
+		CoreType(
+			BoxedResultType,
+			EnumType,
+			FunctionType,
+			HeapRecordType,
+			NamedType,
+			RangeType,
+			SelfType,
+			StackResultType,
+			TensorType,
+			TupleType,
+			TypeParameterType,
+			UnionType,
+			ValueRecordType,
+			VoidType,
+		),
+	../../src/compiler/stage_09_core/mono: core_type_contains_parameter
+	set as Sets
+
+
+private PROFILE_CHECKSUM_MULTIPLIER: Int = 16777619
+
+
+struct CompilerMonoParameterProfileConfig {
+	parameter_count: Int,
+	queries_per_shape: Int,
+	nesting_depth: Int,
+	hit_position: Int
+}
+
+
+record CompilerMonoParameterProfileFixture {
+	config: CompilerMonoParameterProfileConfig,
+	type_params: List[String],
+	query_types: List[CoreType],
+	query_type_count: Int,
+	top_level_queries: Int
+}
+
+
+struct CompilerMonoParameterContainsObservation {
+	contains: Bool,
+	type_nodes: Int,
+	parameter_leaves: Int,
+	names_compared: Int,
+	membership_queries: Int
+}
+
+
+struct CompilerMonoParameterProfileResult {
+	parameter_count: Int,
+	queries_per_shape: Int,
+	nesting_depth: Int,
+	hit_position: Int,
+	query_type_count: Int,
+	top_level_queries: Int,
+	legacy_true_count: Int,
+	indexed_true_count: Int,
+	production_true_count: Int,
+	legacy_checksum: Int,
+	indexed_checksum: Int,
+	production_checksum: Int,
+	legacy_type_nodes: Int,
+	legacy_parameter_leaves: Int,
+	legacy_names_compared: Int,
+	indexed_type_nodes: Int,
+	indexed_parameter_leaves: Int,
+	indexed_membership_queries: Int,
+	index_build_work: Int,
+	workload_valid: Bool
+}
+
+
+private pure func positive_config_value(value: Int, fallback: Int) -> Int:
+	if value > 0:
+		value
+	else:
+		fallback
+
+
+private pure func normalized_config(
+	config: CompilerMonoParameterProfileConfig,
+) -> CompilerMonoParameterProfileConfig:
+	{
+		parameter_count = positive_config_value(config.parameter_count, 1),
+		queries_per_shape = positive_config_value(config.queries_per_shape, 1),
+		nesting_depth = positive_config_value(config.nesting_depth, 1),
+		hit_position = config.hit_position
+	}
+
+
+private pure func parameter_name(index: Int) -> String:
+	"T" + index.to_string()
+
+
+private pure func type_parameters(count: Int) -> List[String]:
+	var names: List[String] = []
+
+	for index in 0..count:
+		names = names.append(parameter_name(index))
+
+	names
+
+
+private pure func selected_query_name(config: CompilerMonoParameterProfileConfig) -> String:
+	if config.hit_position >= 0 and config.hit_position < config.parameter_count:
+		parameter_name(config.hit_position)
+	else:
+		"MissingTypeParameter"
+
+
+private pure func nested_parameter_type(name: String, depth: Int) -> CoreType:
+	var current: CoreType = TypeParameterType(name)
+
+	for index in 0..depth:
+		current = NamedType("Layer" + index.to_string(), [current])
+
+	current
+
+
+private pure func query_shapes(name: String, nesting_depth: Int) -> List[CoreType]:
+	nested: CoreType = nested_parameter_type(name, nesting_depth)
+	missing_leaf: CoreType = TypeParameterType("DefinitelyMissingTypeParameter")
+
+	[
+		TypeParameterType(name),
+		NamedType("Box", [nested]),
+		FunctionType(
+			True,
+			[NamedType("Arg", [missing_leaf]), nested],
+			nested,
+		),
+		StackResultType(
+			nested,
+			NamedType("Error", []),
+		),
+		BoxedResultType(
+			NamedType("Ok", []),
+			nested,
+		),
+		TensorType({
+			element_type = NamedType("TensorBox", [nested]),
+			dims = [
+				TensorRuntimeDim(name),
+				TensorDimOperation(DimAdd, TensorStaticDim(1), TensorVariadicDim(name)),
+			],
+		}),
+		TupleType([
+			VoidType,
+			RangeType,
+			EnumType("Enum"),
+			ValueRecordType("ValueRecord"),
+			HeapRecordType("HeapRecord"),
+			UnionType("Union"),
+			nested,
+		]),
+		SelfType,
+		VoidType,
+	]
+
+
+private pure func query_types(config: CompilerMonoParameterProfileConfig) -> List[CoreType]:
+	var queries: List[CoreType] = []
+	name: String = selected_query_name(config)
+
+	for _ in 0..config.queries_per_shape:
+		for typ in query_shapes(name, config.nesting_depth):
+			queries = queries.append(typ)
+
+	queries
+
+
+pure func compiler_mono_parameter_profile_fixture(
+	config: CompilerMonoParameterProfileConfig,
+) -> CompilerMonoParameterProfileFixture:
+	normalized: CompilerMonoParameterProfileConfig = normalized_config(config)
+	queries: List[CoreType] = query_types(normalized)
+
+	{
+		config = normalized,
+		type_params = type_parameters(normalized.parameter_count),
+		query_types = queries,
+		query_type_count = queries.length(),
+		top_level_queries = queries.length()
+	}
+
+
+private pure func empty_observation() -> CompilerMonoParameterContainsObservation:
+	{
+		contains = False,
+		type_nodes = 0,
+		parameter_leaves = 0,
+		names_compared = 0,
+		membership_queries = 0
+	}
+
+
+private pure func type_node_observation(contains: Bool) -> CompilerMonoParameterContainsObservation:
+	{
+		contains = contains,
+		type_nodes = 1,
+		parameter_leaves = 0,
+		names_compared = 0,
+		membership_queries = 0
+	}
+
+
+private pure func add_observation(
+	left: CompilerMonoParameterContainsObservation,
+	right: CompilerMonoParameterContainsObservation,
+) -> CompilerMonoParameterContainsObservation:
+	{
+		contains = left.contains or right.contains,
+		type_nodes = left.type_nodes + right.type_nodes,
+		parameter_leaves = left.parameter_leaves + right.parameter_leaves,
+		names_compared = left.names_compared + right.names_compared,
+		membership_queries = left.membership_queries + right.membership_queries
+	}
+
+
+private pure func list_membership_observation(
+	type_params: List[String],
+	name: String,
+) -> CompilerMonoParameterContainsObservation:
+	var found: Bool = False
+	var comparisons: Int = 0
+
+	for candidate in type_params:
+		comparisons += 1
+
+		if candidate == name:
+			found = True
+			break
+
+	{
+		contains = found,
+		type_nodes = 1,
+		parameter_leaves = 1,
+		names_compared = comparisons,
+		membership_queries = 1
+	}
+
+
+private pure func legacy_dim_contains_parameter(
+	type_params: List[String],
+	dim: CoreTensorDim,
+) -> CompilerMonoParameterContainsObservation:
+	match dim:
+		TensorRuntimeDim(name) | TensorVariadicDim(name):
+			leaf = list_membership_observation(type_params, name)
+			{ leaf | type_nodes = 0 }
+		TensorDimOperation(_, left, right):
+			left_observation = legacy_dim_contains_parameter(type_params, left)
+
+			if left_observation.contains:
+				left_observation
+			else:
+				add_observation(
+					left_observation,
+					legacy_dim_contains_parameter(type_params, right),
+				)
+		TensorStaticDim(_):
+			empty_observation()
+
+
+private pure func legacy_dims_contain_parameter(
+	type_params: List[String],
+	dims: List[CoreTensorDim],
+) -> CompilerMonoParameterContainsObservation:
+	var result: CompilerMonoParameterContainsObservation = empty_observation()
+
+	for dim in dims:
+		result = add_observation(
+			result,
+			legacy_dim_contains_parameter(type_params, dim),
+		)
+
+		if result.contains:
+			break
+
+	result
+
+
+private pure func legacy_types_contain_parameter(
+	type_params: List[String],
+	types: List[CoreType],
+) -> CompilerMonoParameterContainsObservation:
+	var result: CompilerMonoParameterContainsObservation = empty_observation()
+
+	for typ in types:
+		result = add_observation(
+			result,
+			legacy_type_contains_parameter(type_params, typ),
+		)
+
+		if result.contains:
+			break
+
+	result
+
+
+private pure func legacy_type_contains_parameter(
+	type_params: List[String],
+	typ: CoreType,
+) -> CompilerMonoParameterContainsObservation:
+	match typ:
+		NamedType(_, args):
+			add_observation(
+				type_node_observation(False),
+				legacy_types_contain_parameter(type_params, args),
+			)
+		TypeParameterType(name):
+			list_membership_observation(type_params, name)
+		SelfType:
+			type_node_observation(True)
+		FunctionType(_, params, return_type):
+			params_observation = legacy_types_contain_parameter(type_params, params)
+			base = add_observation(
+				type_node_observation(params_observation.contains),
+				params_observation,
+			)
+
+			if params_observation.contains:
+				base
+			else:
+				add_observation(
+					base,
+					legacy_type_contains_parameter(type_params, return_type),
+				)
+		StackResultType(value_type, error_type) | BoxedResultType(value_type, error_type):
+			value_observation = legacy_type_contains_parameter(type_params, value_type)
+			base = add_observation(
+				type_node_observation(value_observation.contains),
+				value_observation,
+			)
+
+			if value_observation.contains:
+				base
+			else:
+				add_observation(
+					base,
+					legacy_type_contains_parameter(type_params, error_type),
+				)
+		TensorType(info):
+			element_observation = legacy_type_contains_parameter(type_params, info.element_type)
+			base = add_observation(
+				type_node_observation(element_observation.contains),
+				element_observation,
+			)
+
+			if element_observation.contains:
+				base
+			else:
+				add_observation(
+					base,
+					legacy_dims_contain_parameter(type_params, info.dims),
+				)
+		TupleType(items):
+			add_observation(
+				type_node_observation(False),
+				legacy_types_contain_parameter(type_params, items),
+			)
+		VoidType | EnumType(_) | ValueRecordType(_) | HeapRecordType(_) | UnionType(_) | RangeType:
+			type_node_observation(False)
+
+
+private pure func parameter_index(type_params: List[String]) -> Set[String]:
+	var result: Set[String] = Sets.set()
+
+	for name in type_params:
+		result = Sets.add(result, name)
+
+	result
+
+
+private pure func indexed_membership_observation(
+	index: Set[String],
+	name: String,
+) -> CompilerMonoParameterContainsObservation:
+	{
+		contains = Sets.contains(index, name),
+		type_nodes = 1,
+		parameter_leaves = 1,
+		names_compared = 0,
+		membership_queries = 1
+	}
+
+
+private pure func indexed_dim_contains_parameter(
+	index: Set[String],
+	dim: CoreTensorDim,
+) -> CompilerMonoParameterContainsObservation:
+	match dim:
+		TensorRuntimeDim(name) | TensorVariadicDim(name):
+			leaf = indexed_membership_observation(index, name)
+			{ leaf | type_nodes = 0 }
+		TensorDimOperation(_, left, right):
+			left_observation = indexed_dim_contains_parameter(index, left)
+
+			if left_observation.contains:
+				left_observation
+			else:
+				add_observation(
+					left_observation,
+					indexed_dim_contains_parameter(index, right),
+				)
+		TensorStaticDim(_):
+			empty_observation()
+
+
+private pure func indexed_dims_contain_parameter(
+	index: Set[String],
+	dims: List[CoreTensorDim],
+) -> CompilerMonoParameterContainsObservation:
+	var result: CompilerMonoParameterContainsObservation = empty_observation()
+
+	for dim in dims:
+		result = add_observation(
+			result,
+			indexed_dim_contains_parameter(index, dim),
+		)
+
+		if result.contains:
+			break
+
+	result
+
+
+private pure func indexed_types_contain_parameter(
+	index: Set[String],
+	types: List[CoreType],
+) -> CompilerMonoParameterContainsObservation:
+	var result: CompilerMonoParameterContainsObservation = empty_observation()
+
+	for typ in types:
+		result = add_observation(
+			result,
+			indexed_type_contains_parameter(index, typ),
+		)
+
+		if result.contains:
+			break
+
+	result
+
+
+private pure func indexed_type_contains_parameter(
+	index: Set[String],
+	typ: CoreType,
+) -> CompilerMonoParameterContainsObservation:
+	match typ:
+		NamedType(_, args):
+			add_observation(
+				type_node_observation(False),
+				indexed_types_contain_parameter(index, args),
+			)
+		TypeParameterType(name):
+			indexed_membership_observation(index, name)
+		SelfType:
+			type_node_observation(True)
+		FunctionType(_, params, return_type):
+			params_observation = indexed_types_contain_parameter(index, params)
+			base = add_observation(
+				type_node_observation(params_observation.contains),
+				params_observation,
+			)
+
+			if params_observation.contains:
+				base
+			else:
+				add_observation(
+					base,
+					indexed_type_contains_parameter(index, return_type),
+				)
+		StackResultType(value_type, error_type) | BoxedResultType(value_type, error_type):
+			value_observation = indexed_type_contains_parameter(index, value_type)
+			base = add_observation(
+				type_node_observation(value_observation.contains),
+				value_observation,
+			)
+
+			if value_observation.contains:
+				base
+			else:
+				add_observation(
+					base,
+					indexed_type_contains_parameter(index, error_type),
+				)
+		TensorType(info):
+			element_observation = indexed_type_contains_parameter(index, info.element_type)
+			base = add_observation(
+				type_node_observation(element_observation.contains),
+				element_observation,
+			)
+
+			if element_observation.contains:
+				base
+			else:
+				add_observation(
+					base,
+					indexed_dims_contain_parameter(index, info.dims),
+				)
+		TupleType(items):
+			add_observation(
+				type_node_observation(False),
+				indexed_types_contain_parameter(index, items),
+			)
+		VoidType | EnumType(_) | ValueRecordType(_) | HeapRecordType(_) | UnionType(_) | RangeType:
+			type_node_observation(False)
+
+
+private pure func membership_checksum(seed: Int, query_index: Int, contains: Bool) -> Int:
+	contains_value: Int = if contains:
+		1
+	else:
+		0
+
+	seed * PROFILE_CHECKSUM_MULTIPLIER + query_index * 17 + contains_value
+
+
+pure func compiler_mono_parameter_profile_execute(
+	config: CompilerMonoParameterProfileConfig,
+) -> CompilerMonoParameterProfileResult:
+	fixture = compiler_mono_parameter_profile_fixture(config)
+	index = parameter_index(fixture.type_params)
+	var legacy_true_count: Int = 0
+	var indexed_true_count: Int = 0
+	var production_true_count: Int = 0
+	var legacy_checksum: Int = 0
+	var indexed_checksum: Int = 0
+	var production_checksum: Int = 0
+	var legacy_type_nodes: Int = 0
+	var legacy_parameter_leaves: Int = 0
+	var legacy_names_compared: Int = 0
+	var indexed_type_nodes: Int = 0
+	var indexed_parameter_leaves: Int = 0
+	var indexed_membership_queries: Int = 0
+	var query_index: Int = 0
+
+	for typ in fixture.query_types:
+		legacy = legacy_type_contains_parameter(fixture.type_params, typ)
+		indexed = indexed_type_contains_parameter(index, typ)
+		production_contains = core_type_contains_parameter(fixture.type_params, typ)
+
+		if legacy.contains:
+			legacy_true_count += 1
+
+		if indexed.contains:
+			indexed_true_count += 1
+
+		if production_contains:
+			production_true_count += 1
+
+		legacy_checksum = membership_checksum(legacy_checksum, query_index, legacy.contains)
+		indexed_checksum = membership_checksum(indexed_checksum, query_index, indexed.contains)
+		production_checksum = membership_checksum(
+			production_checksum,
+			query_index,
+			production_contains,
+		)
+		legacy_type_nodes += legacy.type_nodes
+		legacy_parameter_leaves += legacy.parameter_leaves
+		legacy_names_compared += legacy.names_compared
+		indexed_type_nodes += indexed.type_nodes
+		indexed_parameter_leaves += indexed.parameter_leaves
+		indexed_membership_queries += indexed.membership_queries
+		query_index += 1
+
+	{
+		parameter_count = fixture.config.parameter_count,
+		queries_per_shape = fixture.config.queries_per_shape,
+		nesting_depth = fixture.config.nesting_depth,
+		hit_position = fixture.config.hit_position,
+		query_type_count = fixture.query_type_count,
+		top_level_queries = fixture.top_level_queries,
+		legacy_true_count = legacy_true_count,
+		indexed_true_count = indexed_true_count,
+		production_true_count = production_true_count,
+		legacy_checksum = legacy_checksum,
+		indexed_checksum = indexed_checksum,
+		production_checksum = production_checksum,
+		legacy_type_nodes = legacy_type_nodes,
+		legacy_parameter_leaves = legacy_parameter_leaves,
+		legacy_names_compared = legacy_names_compared,
+		indexed_type_nodes = indexed_type_nodes,
+		indexed_parameter_leaves = indexed_parameter_leaves,
+		indexed_membership_queries = indexed_membership_queries,
+		index_build_work = fixture.type_params.length(),
+		workload_valid = (
+			query_index == fixture.top_level_queries
+			and legacy_true_count == indexed_true_count
+			and legacy_true_count == production_true_count
+			and legacy_checksum == indexed_checksum
+			and legacy_checksum == production_checksum
+			and legacy_type_nodes == indexed_type_nodes
+			and legacy_parameter_leaves == indexed_parameter_leaves
+		)
+	}
