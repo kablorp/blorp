@@ -437,6 +437,29 @@ them as disjoint wall time. Request construction is excluded from
 use the `compiler_typecheck_benchmark_with_request` subtree when comparing the
 typecheck workload itself.
 
+### Global initializer dependency admission
+
+`compiler_global_header_dependency_profile` constructs a real callable-header
+graph before the measured window, then repeatedly invokes
+`global_header_completion_plan_build`. Initializer count, references per
+initializer, duplicate percentage, module count, and fan-in are independent
+controls. Every module defines the same dependency spellings, so the checksum
+also detects accidental name-based identity across modules.
+
+```bash
+benchmarks/compiler_global_header_dependency_profile plain
+benchmarks/compiler_global_header_dependency_profile plain 5 64 512 1 4 512
+benchmarks/compiler_global_header_dependency_profile profile 1 16 128 75 4 128
+```
+
+The summary reports reference visits, modeled growing-list comparisons,
+modeled dictionary probes, accepted dependency edges, ordered output checksum,
+managed allocation counters, and elapsed time. Setup, warmup, and observation
+are outside the measured window. Use `compiler_pass_compare` with already
+built content-addressed executables for speed claims. The accepted issue 117
+measurements are retained in
+`results/compiler_global_header_dependency_admission_2026-09-15.md`.
+
 ### Paired Production-Pass Comparison
 
 `compiler_pass_compare` is a small shared comparison driver for production-pass

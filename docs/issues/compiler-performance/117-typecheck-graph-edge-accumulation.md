@@ -1,19 +1,23 @@
 # Index Global Initializer Dependency Admission
 
-**Status:** Proposed; bounded graph-construction refactor
+**Status:** Completed; accepted hybrid dependency admission
 
 **Current state:** `global_initializer_dependencies` scans its growing ordered
 dependency-row list for every resolved free reference. The retained self-compile
 observed 1,053 invocations.
-**Next action:** Add duplicate and cross-module identity tests, then maintain a
-local header-row membership dictionary beside the ordered result.
+**Outcome:** Initializers with at least 16 free references now maintain a local
+header-row membership dictionary beside the ordered result. Narrow
+initializers retain the allocation-free linear path. Exact row identity,
+first-reference order, diagnostics, and graph output are unchanged.
+**Next action:** None for this issue. Revisit the threshold only with a changed
+collection representation or retained production evidence.
 **Read first:**
 `blorp/src/compiler/stage_06_typecheck/headers/global_header_completion.brp`
 and `blorp/test/compiler/pipeline/test_global_header_completion.brp`.
 **Fast loop:** Run that owning suite plus the proposed repeated-reference mode
 of the typecheck phase profile.
-**Decision:** The dictionary is invocation-local and header-row keyed; ask for
-guidance before changing dependency identity, order, or graph representation.
+**Decision:** Accepted. The dictionary is invocation-local and header-row
+keyed; dependency identity, order, and graph representation did not change.
 
 ## Objective
 
@@ -64,3 +68,18 @@ reference case improves instructions or allocations by at least 10%, a small
 initializer remains within 3%, and dependency/diagnostic output is identical.
 Reject if the index is rebuilt per reference, row identity is weakened, or
 equivalent work moves into another graph phase.
+
+## Result
+
+The wide one-percent-duplicate workload reduced modeled membership work from
+8,178,304 list comparisons to 32,768 dictionary probes (-99.60%) and median
+retired instructions by 10.75%. The all-unique wide workload reduced retired
+instructions by 11.05% and elapsed time by 13.45%. The four-reference control
+used the original path, allocated exactly the same number of objects, and
+changed retired instructions by +0.07%.
+
+Focused semantic coverage includes repeated-reference order and same-named
+globals from different modules. Benchmark ownership coverage validates the
+work model and graph observations. Full provenance and reproduction details
+are in
+`benchmarks/results/compiler_global_header_dependency_admission_2026-09-15.md`.

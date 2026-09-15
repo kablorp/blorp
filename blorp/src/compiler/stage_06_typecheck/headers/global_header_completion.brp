@@ -50,6 +50,11 @@ private type alias GlobalDependenciesByHeaderRow = List[List[Int]]
 
 private GLOBAL_HEADER_MODULE_INDEX_MISSING: Int = -1
 
+-- Below this width, linear admission avoids the fixed allocation cost of a
+-- call-local dictionary. The indexed path wins once initializer references
+-- are wide enough to amortize that setup.
+private GLOBAL_DEPENDENCY_INDEX_MINIMUM_REFERENCES: Int = 16
+
 
 private record GlobalHeaderCompletionPlanRep {
 	definition_table: DefinitionTable,
@@ -225,6 +230,27 @@ private pure func append_unique_global_row(rows: List[Int], row: Int) -> List[In
 		rows.append(row)
 
 
+private pure func indexed_global_initializer_dependencies(
+	bound_graph: BoundModuleGraph,
+	index: GlobalHeaderIndex,
+	module: BoundModule,
+	references: List[IdentifierReference],
+) -> List[Int]:
+	var dependencies: List[Int] = []
+	var seen_dependencies: Dict[Int, Bool] = {}
+
+	for reference in references:
+		match resolved_global_reference(bound_graph, index, module, reference):
+			Some(dependency_row):
+				if not seen_dependencies.contains(dependency_row):
+					seen_dependencies = seen_dependencies.set(dependency_row, True)
+					dependencies = dependencies.append(dependency_row)
+			None:
+				void
+
+	dependencies
+
+
 private pure func global_initializer_dependencies(
 	bound_graph: BoundModuleGraph,
 	index: GlobalHeaderIndex,
@@ -250,17 +276,27 @@ private pure func global_initializer_dependencies(
 
 			match owner_module:
 				Some(module):
-					for reference in parsed_expr_free_identifier_references(
+					references = parsed_expr_free_identifier_references(
 						global_header_source(header).value,
-					):
-						match resolved_global_reference(bound_graph, index, module, reference):
-							Some(dependency_row):
-								dependencies = append_unique_global_row(
-									dependencies,
-									dependency_row,
-								)
-							None:
-								void
+					)
+
+					if references.length() >= GLOBAL_DEPENDENCY_INDEX_MINIMUM_REFERENCES:
+						dependencies = indexed_global_initializer_dependencies(
+							bound_graph,
+							index,
+							module,
+							references,
+						)
+					else:
+						for reference in references:
+							match resolved_global_reference(bound_graph, index, module, reference):
+								Some(dependency_row):
+									dependencies = append_unique_global_row(
+										dependencies,
+										dependency_row,
+									)
+								None:
+									void
 				None:
 					void
 

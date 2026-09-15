@@ -1,0 +1,354 @@
+-- Deterministic global-initializer dependency workload.
+import:
+	../../src/compiler/stage_04_modules/loaded_module:
+		ModuleLoadCandidate,
+		ModuleOrigin(UserModule),
+		module_load_candidate,
+		resolved_module_identity_from_resolver,
+	../../src/compiler/stage_06_typecheck/graph/indexed_graph:
+		PreparedModuleScope,
+		indexed_graph_build,
+		prepared_module_program,
+		prepared_module_scope_module,
+	../../src/compiler/stage_06_typecheck/headers/callable_headers:
+		CallableHeaderGraph,
+		GlobalHeader,
+		callable_header_graph_build,
+		global_header_id,
+	../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
+		GlobalId,
+		declaration_skeleton_graph_build,
+		global_id_definition_id,
+	../../src/compiler/stage_06_typecheck/headers/global_header_completion:
+		GlobalHeaderCompletionPlan,
+		GlobalHeaderCompletionPlanBuild(
+			GlobalHeaderCompletionPlanBlocked,
+			GlobalHeaderCompletionPlanReady,
+		),
+		global_header_completion_plan_annotated,
+		global_header_completion_plan_annotated_dependencies,
+		global_header_completion_plan_build,
+		global_header_completion_plan_pending,
+		global_header_completion_plan_pending_dependencies,
+	../../src/compiler/stage_06_typecheck/headers/trait_headers: trait_topology_graph_build
+	../../src/compiler/stage_06_typecheck/headers/type_header_dependencies:
+		type_alias_dependency_graph_validate,
+	../../src/compiler/stage_06_typecheck/headers/type_header_graph: type_header_graph_build
+	../../src/compiler/stage_06_typecheck/headers/type_parameter_headers:
+		resolved_type_parameter_graph_build,
+	../../src/compiler/stage_06_typecheck/modules/bound_module_graph:
+		BoundModuleViewBinding(BoundModuleViewReady),
+		COMPILER_BOUND_MODULE_VISIBILITY_EMPTY,
+		bound_module_graph_build,
+	../../src/compiler/stage_06_typecheck/modules/module_view: COMPILER_MODULE_VIEW_EMPTY
+	parsed_program_fixture as ParsedProgramFixture
+
+
+struct CompilerGlobalHeaderDependencyProfileConfig {
+	initializer_count: Int,
+	references_per_initializer: Int,
+	duplicate_percent: Int,
+	module_count: Int,
+	fan_in: Int
+}
+
+
+record CompilerGlobalHeaderDependencyProfileFixture {
+	graph: CallableHeaderGraph,
+	initializer_count: Int,
+	references_per_initializer: Int,
+	effective_unique_references: Int,
+	module_count: Int,
+	fan_in: Int,
+	reference_visits: Int,
+	modeled_list_comparisons: Int,
+	modeled_dictionary_probes: Int,
+	expected_dependency_edges: Int
+}
+
+
+struct CompilerGlobalHeaderDependencyProfileObservation {
+	pending_initializers: Int,
+	annotated_dependencies: Int,
+	dependency_edges: Int,
+	checksum: Int,
+	plan_ready: Bool,
+	workload_valid: Bool
+}
+
+
+private pure func bounded_percent(value: Int) -> Int:
+	if value < 0:
+		0
+	else if value > 100:
+		100
+	else:
+		value
+
+
+pure func compiler_global_header_dependency_effective_unique_references(
+	config: CompilerGlobalHeaderDependencyProfileConfig,
+) -> Int:
+	nonduplicate_references = config.references_per_initializer * (100 - bounded_percent(
+		config.duplicate_percent,
+	)) / 100
+
+	at_least_one: Int = if nonduplicate_references > 0:
+		nonduplicate_references
+	else:
+		1
+
+	bounded_by_references: Int = if at_least_one < config.references_per_initializer:
+		at_least_one
+	else:
+		config.references_per_initializer
+
+	if bounded_by_references < config.fan_in:
+		bounded_by_references
+	else:
+		config.fan_in
+
+
+private pure func dependency_name(index: Int) -> String:
+	"dependency_${index}"
+
+
+private pure func dependency_reference_index(reference_index: Int, unique_count: Int) -> Int:
+	if reference_index < unique_count:
+		reference_index
+	else:
+		reference_index % unique_count
+
+
+private pure func initializer_source(
+	initializer_index: Int,
+	references_per_initializer: Int,
+	unique_count: Int,
+) -> String:
+	var references: List[String] = []
+
+	for reference_index in 0..references_per_initializer:
+		references = references.append(
+			dependency_name(dependency_reference_index(reference_index, unique_count)),
+		)
+
+	"initializer_${initializer_index} = [" + references.join(", ") + "]"
+
+
+private pure func module_source(
+	module_index: Int,
+	config: CompilerGlobalHeaderDependencyProfileConfig,
+	unique_count: Int,
+) -> String:
+	var declarations: List[String] = []
+
+	for dependency_index in 0..config.fan_in:
+		declarations = declarations.append(
+			dependency_name(dependency_index) + ": Int = " + dependency_index.to_string(),
+		)
+
+	for initializer_index in 0..config.initializer_count:
+		if initializer_index % config.module_count == module_index:
+			declarations = declarations.append(
+				initializer_source(
+					initializer_index,
+					config.references_per_initializer,
+					unique_count,
+				),
+			)
+
+	declarations.join("\n") + "\n"
+
+
+private pure func module_name(index: Int) -> String:
+	"bench/global_header_dependency_${index}"
+
+
+private pure func module_candidate(
+	module_index: Int,
+	config: CompilerGlobalHeaderDependencyProfileConfig,
+	unique_count: Int,
+) -> ModuleLoadCandidate:
+	name = module_name(module_index)
+	module_load_candidate(
+		resolved_module_identity_from_resolver(name, UserModule),
+		ParsedProgramFixture.finalized_typecheck_program_fixture(
+			"/bench/global_header_dependency_${module_index}.brp",
+			name,
+			module_source(module_index, config, unique_count),
+		),
+	)
+
+
+private pure func accept_empty_view(scope: PreparedModuleScope) -> BoundModuleViewBinding:
+	BoundModuleViewReady(
+		COMPILER_MODULE_VIEW_EMPTY,
+		prepared_module_program(prepared_module_scope_module(scope)),
+		COMPILER_BOUND_MODULE_VISIBILITY_EMPTY,
+		[],
+	)
+
+
+private pure func modeled_list_comparisons_per_initializer(
+	references_per_initializer: Int,
+	unique_count: Int,
+) -> Int:
+	var comparisons: Int = 0
+	var admitted: Int = 0
+
+	for reference_index in 0..references_per_initializer:
+		candidate = dependency_reference_index(reference_index, unique_count)
+
+		if reference_index < unique_count:
+			comparisons += admitted
+			admitted += 1
+		else:
+			comparisons += candidate + 1
+
+	comparisons
+
+
+pure func compiler_global_header_dependency_profile_fixture(
+	config: CompilerGlobalHeaderDependencyProfileConfig,
+) -> Option[CompilerGlobalHeaderDependencyProfileFixture]:
+	if (
+		config.initializer_count <= 0
+		or config.references_per_initializer <= 0
+		or config.module_count <= 0
+		or config.fan_in <= 0
+	):
+		None
+	else:
+		unique_count = compiler_global_header_dependency_effective_unique_references(config)
+		var candidates: List[ModuleLoadCandidate] = []
+		var module_targets: List[String] = []
+
+		for module_index in 0..config.module_count:
+			candidates = candidates.append(module_candidate(module_index, config, unique_count))
+			module_targets = module_targets.append(module_name(module_index))
+
+		target = module_load_candidate(
+			resolved_module_identity_from_resolver(
+				"bench/global_header_dependency_main",
+				UserModule,
+			),
+			ParsedProgramFixture.finalized_typecheck_program_fixture(
+				"/bench/global_header_dependency_main.brp",
+				"bench/global_header_dependency_main",
+				"",
+			),
+		)
+		indexed ?= indexed_graph_build(target, candidates).to_option()
+		bound ?= bound_module_graph_build(indexed, module_targets, accept_empty_view).to_option()
+		skeletons ?= declaration_skeleton_graph_build(bound).to_option()
+		aliases ?= type_alias_dependency_graph_validate(skeletons).to_option()
+		parameters ?= resolved_type_parameter_graph_build(aliases).to_option()
+		types ?= type_header_graph_build(parameters).to_option()
+		traits ?= trait_topology_graph_build(types).to_option()
+		graph ?= callable_header_graph_build(traits).to_option()
+		reference_visits = config.initializer_count * config.references_per_initializer
+
+		Some({
+			graph = graph,
+			initializer_count = config.initializer_count,
+			references_per_initializer = config.references_per_initializer,
+			effective_unique_references = unique_count,
+			module_count = config.module_count,
+			fan_in = config.fan_in,
+			reference_visits = reference_visits,
+			modeled_list_comparisons = config.initializer_count * modeled_list_comparisons_per_initializer(
+				config.references_per_initializer,
+				unique_count,
+			),
+			modeled_dictionary_probes = reference_visits,
+			expected_dependency_edges = config.initializer_count * unique_count,
+		})
+
+
+pure func compiler_global_header_dependency_profile_execute(
+	fixture: CompilerGlobalHeaderDependencyProfileFixture,
+	iterations: Int,
+) -> GlobalHeaderCompletionPlanBuild:
+	var result = global_header_completion_plan_build(fixture.graph)
+	var iteration: Int = 1
+
+	while iteration < iterations:
+		result = global_header_completion_plan_build(fixture.graph)
+		iteration += 1
+
+	result
+
+
+private pure func checksum_add(checksum: Int, value: Int) -> Int:
+	checksum * 31 + value
+
+
+private pure func checksum_header_rows(
+	checksum: Int,
+	headers: List[GlobalHeader],
+	dependencies: List[List[GlobalId]],
+) -> (Int, Int):
+	var next = checksum
+	var edge_count: Int = 0
+
+	for index in 0..headers.length():
+		match (headers.get(index), dependencies.get(index)):
+			(Some(header), Some(rows)):
+				next = checksum_add(next, global_id_definition_id(global_header_id(header)))
+				next = checksum_add(next, rows.length())
+
+				for dependency in rows:
+					next = checksum_add(next, global_id_definition_id(dependency))
+					edge_count += 1
+			_:
+				void
+
+	(next, edge_count)
+
+
+private pure func observe_ready_plan(
+	fixture: CompilerGlobalHeaderDependencyProfileFixture,
+	plan: GlobalHeaderCompletionPlan,
+) -> CompilerGlobalHeaderDependencyProfileObservation:
+	pending = global_header_completion_plan_pending(plan)
+	pending_dependencies = global_header_completion_plan_pending_dependencies(plan)
+	annotated = global_header_completion_plan_annotated(plan)
+	annotated_dependencies = global_header_completion_plan_annotated_dependencies(plan)
+	(pending_checksum, pending_edges) = checksum_header_rows(17, pending, pending_dependencies)
+	(checksum, annotated_edges) = checksum_header_rows(
+		pending_checksum,
+		annotated,
+		annotated_dependencies,
+	)
+	edges = pending_edges + annotated_edges
+
+	{
+		pending_initializers = pending.length(),
+		annotated_dependencies = annotated.length(),
+		dependency_edges = edges,
+		checksum = checksum,
+		plan_ready = True,
+		workload_valid = (
+			pending.length() == fixture.initializer_count
+			and annotated.length() == fixture.module_count * fixture.fan_in
+			and edges == fixture.expected_dependency_edges
+		)
+	}
+
+
+pure func compiler_global_header_dependency_profile_observe(
+	fixture: CompilerGlobalHeaderDependencyProfileFixture,
+	result: GlobalHeaderCompletionPlanBuild,
+) -> CompilerGlobalHeaderDependencyProfileObservation:
+	match result:
+		GlobalHeaderCompletionPlanReady(plan):
+			observe_ready_plan(fixture, plan)
+		GlobalHeaderCompletionPlanBlocked(_, _, _):
+			{
+				pending_initializers = 0,
+				annotated_dependencies = 0,
+				dependency_edges = 0,
+				checksum = 0,
+				plan_ready = False,
+				workload_valid = False
+			}
