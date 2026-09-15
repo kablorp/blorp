@@ -1568,3 +1568,16 @@ the same profile window. Function times are inclusive and must not be summed.
 BLORP_COMPILER_BENCHMARK_SKIP_BUILD=1 \
   benchmarks/compiler_callable_header_profile 5 8 128 4 2 fallback
 ```
+
+### Variable-dimension resolution profile
+
+`compiler_var_dims_resolution_profile` isolates the production inference path
+that expands variable-dimension substitutions into nested semantic types. Its
+controls vary iteration count, root dimension count, expansion width, and
+recursive depth; the result reports exact output checksums, substitution and
+output work, the modeled old concat-prefix copies, allocations/releases, and
+elapsed time.
+
+```bash
+benchmarks/compiler_var_dims_resolution_profile 500 64 16 2
+```

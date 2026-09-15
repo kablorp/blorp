@@ -65,7 +65,6 @@ current-state and next-action summary.
 - [Step 2e width-probe resource gate](compiler-performance/97-bound-visibility-width-probe.md)
 - [Accepted-alias cycle membership](compiler-performance/99-index-accepted-alias-cycle-membership.md)
 - [Cancellation-plan child-result batching](compiler-performance/100-batch-cancellation-plan-child-results.md)
-- [Variable-dimension list flattening](compiler-performance/101-flatten-var-dims-list-resolution.md)
 - [Meta-resolution cycle membership](compiler-performance/102-index-meta-resolution-cycle-membership.md)
 - [Environment symbol collection](compiler-performance/103-batch-environment-symbol-collection.md)
 - [Resource-reference deduplication](compiler-performance/104-index-resource-reference-deduplication.md)
