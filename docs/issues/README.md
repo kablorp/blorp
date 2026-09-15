@@ -67,7 +67,6 @@ current-state and next-action summary.
 - [Cancellation-plan child-result batching](compiler-performance/100-batch-cancellation-plan-child-results.md)
 - [Meta-resolution cycle membership](compiler-performance/102-index-meta-resolution-cycle-membership.md)
 - [Resource-reference deduplication](compiler-performance/104-index-resource-reference-deduplication.md)
-- [Consumed-argument membership](compiler-performance/105-index-consumed-argument-membership.md)
 - [Standard-inline rename copying](compiler-performance/109-reduce-std-inline-rename-copying.md)
 - [Match-bound name deduplication](compiler-performance/110-deduplicate-match-bound-names-once.md)
 - [Call-signature name allocation](compiler-performance/111-index-call-signature-name-allocation.md)
