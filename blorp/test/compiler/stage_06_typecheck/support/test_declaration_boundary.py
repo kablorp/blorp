@@ -1030,7 +1030,61 @@ class DeclarationBoundaryTests(unittest.TestCase):
         self.assertIn("materialize_complete_from_validated_seed(", success_path)
         completion = source.split("private pure func materialize_complete_from_validated_seed(", 1)[1]
         completion = completion.split("\n\npure func body_check_registry_materialize_complete_with_seed_table(", 1)[0]
-        self.assertIn("materialize_program_from_body_table(", completion)
+        self.assertNotIn("complete_body_outcome_table_for_contexts(", completion)
+        self.assertIn("complete_body_outcome_table_from_source_order(", completion)
+        self.assertIn("materialize_program_from_complete_body_table(", completion)
+
+    def test_complete_body_outcome_table_is_required_for_full_materialization(self) -> None:
+        source = DECL.read_text(encoding="utf-8")
+        representation = re.search(
+            r"private record CompleteBodyOutcomeTableRep \{.*?\n\}",
+            source,
+            re.DOTALL,
+        )
+        complete_materializer = re.search(
+            r"private pure func materialize_program_from_complete_body_table\(.*?"
+            r"(?=\n\nprivate pure func rejected_body_table_result)",
+            source,
+            re.DOTALL,
+        )
+        direct_checker = re.search(
+            r"private pure func check_complete_body_table_in_order\(.*?"
+            r"(?=\n\nprivate pure func body_context_failure_label)",
+            source,
+            re.DOTALL,
+        )
+
+        self.assertIsNotNone(representation)
+        self.assertIsNotNone(complete_materializer)
+        self.assertIsNotNone(direct_checker)
+        self.assertIn("table: BodyOutcomeTable", representation.group(0))
+        self.assertIn("source_order: List[CallableId]", representation.group(0))
+        self.assertIn(
+            "complete_table: CompleteBodyOutcomeTable",
+            complete_materializer.group(0),
+        )
+        self.assertIn("ReuseCompleteFunctionBodies(", complete_materializer.group(0))
+        self.assertNotIn("ReuseSelectedFunctionBodies(", complete_materializer.group(0))
+        self.assertIn("var rows: Dict[Int, BodyCheckOutcome]", direct_checker.group(0))
+        self.assertNotIn("List[BodyCheckOutcome]", direct_checker.group(0))
+        self.assertNotIn("materialize_program_from_body_table(", source)
+
+    def test_ctfe_typed_functions_follow_checked_row_order(self) -> None:
+        declaration = DECL.read_text(encoding="utf-8")
+        bridge = (ROOT / "blorp/src/compiler/stage_06_typecheck/bridge.brp").read_text(
+            encoding="utf-8"
+        )
+        projection = bridge.split(
+            "private pure func ctfe_checked_body_groups_typed_functions(", 1
+        )[1].split("\n\n-- An empty chain", 1)[0]
+        selective = bridge.split(
+            "private pure func prepare_selective_ctfe_dependencies_for_roots(", 1
+        )[1].split("\n\nprivate pure func prepare_selective_ctfe_dependencies(", 1)[0]
+
+        self.assertNotIn("body_outcome_table_typed_functions", declaration)
+        self.assertNotIn("body_outcome_table_typed_functions", bridge)
+        self.assertIn("representation.next_row_index.get(index)", projection)
+        self.assertIn("ctfe_checked_body_groups_typed_functions(", selective)
 
     def test_selective_ctfe_body_outcomes_have_one_module_grouped_carrier(self) -> None:
         bridge = (ROOT / "blorp/src/compiler/stage_06_typecheck/bridge.brp").read_text(

@@ -1,8 +1,8 @@
 # Normalized Semantic Compilation
 
 **Status:** Active. The accepted semantic catalog, Step 2e visibility
-convergence, and initial exact-identity cutovers are in production.
-Body-outcome and later product completion remain sequenced below.
+convergence, Step 3 body-outcome completion, and initial exact-identity
+cutovers are in production. Later product completion remains sequenced below.
 
 **Current state:** The compilation has graph-local `ModuleId`, `DefinitionId`,
 category-safe accepted tables, and an `AcceptedSemanticCatalog` with checked
@@ -10,7 +10,8 @@ provenance. `ModuleView` has one scope-issued bound occupancy/candidate owner;
 accepted imports share its exact `ModuleId`/`DefinitionId` payload column and
 accepted alias/union construction no longer regroups by path or spelling. A validated `BodyOutcomeTable`
 survives CTFE handoff, including empty partial tables for bodyless dependencies;
-it does not yet publish complete source-ordered coverage. The broad
+ordinary materialization requires a `CompleteBodyOutcomeTable` with exact
+coverage, compatible `main` validation policy, and explicit source order. The broad
 `TypecheckedGraph`, some rebuilt semantic/CTFE typed programs, and late Core
 name projection remain. Graph import binding now batches admission under one
 scope-local builder and publishes explicit accepted/rejected candidate rows.
@@ -21,9 +22,11 @@ name unions and path-to-surface joins.
 
 **Next actions:** Step 2e is complete; use its
 [completion screen](../../../benchmarks/results/compiler_step2e_visibility_completion_2026-09-14.md)
-as the visibility baseline. Finish Step 3's direct body-row publication,
-source order, and complete-coverage proof, then continue the Phase 8/9 product
-boundary.
+as the visibility baseline. Step 3 is also complete; use its
+[completion screen](../../../benchmarks/results/compiler_step3_body_outcome_completion_2026-09-15.md)
+and [implementation packet](145-step3-complete-body-outcome-publication.md)
+as the body-product baseline. Continue the Phase 8/9 product boundary without
+reconstructing body collections or source order.
 
 **Read first:** [Compiler Architecture](../../ARCHITECTURE.md#frontend),
 [Compiler Priorities](../../COMPILER_PRIORITIES.md#1-finish-the-typechecking-product-boundaries),
@@ -54,7 +57,7 @@ the Step 2e issue, and the Phase 8–10 issues under `docs/issues/typechecking/`
 | Cut | First production consumer and exit condition |
 | --- | --- |
 | 2e visibility, complete | One phase-correct ordered candidate/accepted relation serves graph lookup. The [resource gate](94-step2e-visibility-convergence.md) is complete; displaced name dictionaries, the successful-only graph inventory, and accepted alias/union reconstruction paths are deleted. |
-| 3 body outcomes, start now | CTFE and ordinary compilation read the same exact row. Publish direct rows, explicit source order, and complete-body coverage; remove remaining transient lists and scans without losing bodyless-module behavior. |
+| 3 body outcomes, complete | CTFE and ordinary compilation read the same exact row. Direct ordinary rows, explicit source order, complete-body coverage, linear seed admission, and bodyless-module behavior are protected by the [completion packet](145-step3-complete-body-outcome-publication.md). |
 | 4A solved/validated bodies | [Phases 8 and 9](../../COMPILER_PRIORITIES.md#phase-8-constraint-solving-and-type-finalization) publish meta-free solved and accepted validated facts. Measure and remove repeated finalization walks. Optional semantic-type interning is a separate experiment, never a prerequisite. |
 | 7A keyed CTFE | Attach evaluated initializer replacements by exact identity instead of retaining a second complete typed program. |
 | 7B codegen-ready | Audit the exact facts Core needs, construct a narrow opaque accepted input, and release compile-only recovery/analysis state before Core. [Phase 10](../typechecking/phase-10-checked-codegen-graphs.md) owns admission; the [last-use and release issue](137-codegen-input-last-use-and-release.md) owns the proof and lifetime measurements. |
@@ -73,23 +76,28 @@ not reorder the semantic critical path above. Its retained profile reports
 zero reconstructed Core nodes; the opaque plan's compiler-checked payload owns
 only symbol metadata and canonical-list rows, not a second Core root.
 
-## Immediate Step 3 Contract
+## Completed Step 3 Contract
 
-The existing table is validated and may be partial for a CTFE request; its
-type alone does not claim all bodies have been checked. The next cut must
-publish one `CallableId`-keyed accepted/rejected outcome for each required
-source body, with source order separate from scheduling order. Preserve plan
-provenance, module ownership, duplicate checks, and valid empty tables for
-bodyless dependencies. Avoid a retained COW alias during row insertion:
-inspect generated C for the local writer. A complete-body producer, not a
-partial table constructor, must establish coverage before codegen admission.
+The validated `BodyOutcomeTable` may be partial for a CTFE request; its type
+alone does not claim all bodies have been checked. Ordinary compilation now
+publishes one `CallableId`-keyed accepted/rejected outcome for each required
+source body and refines it to `CompleteBodyOutcomeTable`, with source order
+separate from scheduling order. Plan provenance, module ownership, duplicate
+checks, `main` validation-policy compatibility, and valid empty tables for
+bodyless dependencies remain enforced.
+Generated C has one local row writer and publishes the table only after
+insertion, avoiding a retained COW alias.
 
-Start with bodyless, duplicate, missing, wrong-kind, recursive, method,
-default-method, foreign, graphless, and shuffled-order fixtures. Compare exact
-body fingerprints, CTFE reuse/check counts, diagnostics, allocations, peak
-memory, and retained bytes. Step 3 is complete only when CTFE and ordinary
-materialization share the row without a per-module outcome-list copy or
-recheck, and no scheduling choice changes public order or IDs.
+Bodyless, duplicate, missing, wrong-kind, recursive, method, default-method,
+foreign, graphless, and shuffled-order fixtures protect the boundary. CTFE and
+ordinary materialization share the row without a per-module outcome-list copy
+or source-body recheck, and no scheduling choice changes public order or IDs.
+The accepted resource screen characterizes the final slice as neutral: a
+single exact-source point sample was favorable, but repeated nearby samples
+did not reproduce a material instruction win. Allocations, peak, RSS, and
+code-size changes remain below their guards. The slice is accepted because it
+deletes the ordinary outcome-list replay and dictionary-order projection,
+makes seed admission linear, and gives those products immediate consumers.
 
 ## Measurement And Acceptance
 

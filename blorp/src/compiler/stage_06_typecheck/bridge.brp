@@ -139,6 +139,7 @@ import:
 		),
 		TypecheckProgramResult,
 		TypedDecl(TypedFunctionDecl, TypedGlobalVarDecl, TypedImplDecl, TypedPrivateDecl),
+		TypedFunctionInfo,
 		TypedProgram,
 		accepted_ctfe_artifact_typecheck_module,
 		accepted_graph_typecheck_module,
@@ -146,12 +147,12 @@ import:
 		accepted_typecheck_graph_declaration_skeleton_count,
 		accepted_typecheck_graph_import_modules,
 		accepted_typecheck_module_body_registry,
+		body_check_outcome_typed_function,
 		body_check_registry_context_for_definition_id,
 		body_check_registry_materialize_complete_with_seed_table,
 		body_check_registry_materialize_subset_from_table,
 		body_check_registry_outcome_table_from_indexed_rows,
 		body_outcome_table_count,
-		body_outcome_table_typed_functions,
 		body_subset_program_decls,
 		body_subset_program_import_bindings,
 		complete_typecheck_graph,
@@ -531,6 +532,54 @@ private pure func ctfe_checked_body_groups_count(
 		.get(module_id_table_index(module_id))
 		.map(func(chain): chain.body_count)
 		.get_or(0)
+
+
+private pure func ctfe_checked_body_groups_typed_functions(
+	groups: CtfeCheckedBodyGroups,
+	module_id: ModuleId,
+) -> Option[List[TypedFunctionInfo]]:
+	representation = from_opaque CtfeCheckedBodyGroups(groups)
+
+	match representation.chain_by_module_id.get(module_id_table_index(module_id)):
+		None:
+			Some([])
+		Some(chain):
+			var functions: List[TypedFunctionInfo] = []
+			var current_row_index: Option[Int] = Some(chain.first_row_index)
+			var scanned_count: Int = 0
+			var valid: Bool = True
+
+			while (
+				current_row_index.is_some()
+				and scanned_count < chain.body_count
+				and valid
+			):
+				match current_row_index:
+					Some(index):
+						match representation.rows.get(index):
+							Some(body):
+								if module_ids_equal(body.module_id, module_id):
+									functions = functions.append(
+										body_check_outcome_typed_function(body.outcome),
+									)
+								else:
+									valid = False
+							None:
+								valid = False
+
+						current_row_index = representation.next_row_index.get(index)
+						scanned_count += 1
+					None:
+						valid = False
+
+			if (
+				valid
+				and scanned_count == chain.body_count
+				and current_row_index.is_none()
+			):
+				Some(functions)
+			else:
+				None
 
 
 -- An empty chain still publishes a valid partial table for a bodyless module.
@@ -2460,7 +2509,11 @@ private pure func prepare_selective_ctfe_dependencies_for_roots(
 											BodySubsetProgramRejected(_):
 												failed = True
 											BodySubsetProgramReady(subset):
-												match ctfe_import_bindings_for_module_table(
+												typed_functions = ctfe_checked_body_groups_typed_functions(
+													groups,
+													module_id,
+												)
+												import_bindings = ctfe_import_bindings_for_module_table(
 													prepared_module_scope_module_table(
 														target_scope,
 													),
@@ -2470,10 +2523,10 @@ private pure func prepare_selective_ctfe_dependencies_for_roots(
 														),
 													),
 													body_subset_program_import_bindings(subset),
-												):
-													None:
-														failed = True
-													Some(import_bindings):
+												)
+
+												match (typed_functions, import_bindings):
+													(Some(functions), Some(bindings)):
 														prepared = prepared.append({
 															module_id = module_id,
 															program = SelectiveCtfeProgram(
@@ -2487,16 +2540,16 @@ private pure func prepare_selective_ctfe_dependencies_for_roots(
 																	body_subset_program_decls(
 																		subset,
 																	),
-																	body_outcome_table_typed_functions(
-																		validated,
-																	),
-																	import_bindings,
+																	functions,
+																	bindings,
 																),
 															),
 															body_checks = body_outcome_table_count(
 																validated,
 															),
 														})
+													_:
+														failed = True
 									_:
 										failed = True
 

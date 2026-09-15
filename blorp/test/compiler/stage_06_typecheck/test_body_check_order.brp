@@ -12,7 +12,11 @@ import:
 		BodyImplementationPlanningFailure,
 		BodyOutcomeTableBuild(BodyOutcomeTableAccepted, BodyOutcomeTableRejected),
 		BodySubsetProgramBuild(BodySubsetProgramReady, BodySubsetProgramRejected),
-		MainValidationPolicy(IgnoreMainName),
+		CompleteBodyOutcomeTableBuild(
+			CompleteBodyOutcomeTableAccepted,
+			CompleteBodyOutcomeTableRejected,
+		),
+		MainValidationPolicy(IgnoreMainName, ValidateProgramMain),
 		TypedDecl(TypedImplDecl),
 		accepted_typecheck_module_body_context,
 		accepted_typecheck_module_body_plan,
@@ -25,6 +29,8 @@ import:
 		body_check_outcome_diagnostics,
 		body_check_outcome_errors,
 		body_check_outcome_typed_function,
+		body_check_registry_complete_outcome_table_from_table,
+		body_check_registry_context_for_definition_id,
 		body_check_registry_materialize_complete_with_seed,
 		body_check_registry_materialize_complete_with_seed_table,
 		body_check_registry_materialize_subset,
@@ -35,6 +41,8 @@ import:
 		body_subset_program_decls,
 		check_body_context,
 		checked_body_artifact_validated_body,
+		complete_body_outcome_table_count,
+		complete_body_outcome_table_source_order,
 		definition_meta_run_for_table,
 		new_definition_meta_run,
 		typecheck_program_with_type_header_module_in_body_order,
@@ -1220,6 +1228,188 @@ pure func test_indexed_body_table_admission_preserves_validation() -> Bool:
 	indexed_body_table_admission_preserves_validation().get_or(False)
 
 
+private pure func complete_body_table_proves_source_order_and_coverage() -> Option[Bool]:
+	input ?= accepted_module(
+		"complete_rows",
+		"func first() -> Int: 1\nfunc second() -> Int: 2\nfunc third() -> Bool: 3",
+	).to_option()
+	ids ?= accepted_typecheck_module_callable_body_ids(input)
+	first_id ?= ids.get(0)
+	second_id ?= ids.get(1)
+	third_id ?= ids.get(2)
+
+	first = match body_context(input, first_id):
+		BodyContextReady(context):
+			Some(context)
+		BodyContextRejected(_):
+			None
+
+	second = match body_context(input, second_id):
+		BodyContextReady(context):
+			Some(context)
+		BodyContextRejected(_):
+			None
+
+	third = match body_context(input, third_id):
+		BodyContextReady(context):
+			Some(context)
+		BodyContextRejected(_):
+			None
+
+	first_context ?= first
+	second_context ?= second
+	third_context ?= third
+	registry = accepted_typecheck_module_body_registry(input)
+
+	shuffled_table = match (
+		body_check_registry_outcome_table(
+			registry,
+			[
+				check_body_context(second_context),
+				check_body_context(third_context),
+				check_body_context(first_context),
+			],
+		)
+	):
+		BodyOutcomeTableAccepted(table):
+			Some(table)
+		BodyOutcomeTableRejected(_):
+			None
+
+	table ?= shuffled_table
+	complete = body_check_registry_complete_outcome_table_from_table(
+		registry,
+		table,
+		IgnoreMainName,
+	)
+
+	partial_table = match body_check_registry_outcome_table(
+		registry,
+		[check_body_context(first_context)],
+	):
+		BodyOutcomeTableAccepted(partial):
+			Some(partial)
+		BodyOutcomeTableRejected(_):
+			None
+
+	partial ?= partial_table
+
+	partial_rejected = match body_check_registry_complete_outcome_table_from_table(
+		registry,
+		partial,
+		IgnoreMainName,
+	):
+		CompleteBodyOutcomeTableRejected(errors):
+			errors.any(func(error): error.contains("missing body outcome for definition"))
+		CompleteBodyOutcomeTableAccepted(_):
+			False
+
+	Some(
+		match complete:
+			CompleteBodyOutcomeTableAccepted(complete_table):
+				source_order = complete_body_outcome_table_source_order(complete_table)
+
+				(
+					complete_body_outcome_table_count(complete_table) == 3
+					and source_order.length() == 3
+					and source_order
+						.get(0)
+						.map(func(id): callable_ids_equal(id, first_id))
+						.get_or(False)
+					and source_order
+						.get(1)
+						.map(func(id): callable_ids_equal(id, second_id))
+						.get_or(False)
+					and source_order
+						.get(2)
+						.map(func(id): callable_ids_equal(id, third_id))
+						.get_or(False)
+					and partial_rejected
+				)
+			CompleteBodyOutcomeTableRejected(_):
+				False
+	)
+
+
+pure func test_complete_body_table_proves_source_order_and_coverage() -> Bool:
+	complete_body_table_proves_source_order_and_coverage().get_or(False)
+
+
+private pure func complete_body_table_rejects_main_policy_mismatch() -> Option[Bool]:
+	input ?= accepted_module("complete_main_policy", "func main() -> Int: 1").to_option()
+	ids ?= accepted_typecheck_module_callable_body_ids(input)
+	id ?= ids.get(0)
+	registry = accepted_typecheck_module_body_registry(input)
+	context_build ?= body_check_registry_context_for_definition_id(
+		registry,
+		callable_id_definition_id(id),
+	)
+
+	context = match context_build:
+		BodyContextReady(ready):
+			Some(ready)
+		BodyContextRejected(_):
+			None
+
+	ready ?= context
+
+	table = match body_check_registry_outcome_table(registry, [check_body_context(ready)]):
+		BodyOutcomeTableAccepted(outcomes):
+			Some(outcomes)
+		BodyOutcomeTableRejected(_):
+			None
+
+	outcomes ?= table
+
+	Some(
+		match body_check_registry_complete_outcome_table_from_table(
+			registry,
+			outcomes,
+			ValidateProgramMain,
+		):
+			CompleteBodyOutcomeTableRejected(errors):
+				errors.any(func(error): error.contains("main validation policy"))
+			CompleteBodyOutcomeTableAccepted(_):
+				False
+	)
+
+
+pure func test_complete_body_table_rejects_main_policy_mismatch() -> Bool:
+	complete_body_table_rejects_main_policy_mismatch().get_or(False)
+
+
+private pure func bodyless_complete_body_table_is_valid() -> Option[Bool]:
+	input ?= accepted_module("bodyless_complete_rows", "union Wrapped:\n\tValue(Int)").to_option()
+	registry = accepted_typecheck_module_body_registry(input)
+
+	empty_table = match body_check_registry_outcome_table(registry, []):
+		BodyOutcomeTableAccepted(table):
+			Some(table)
+		BodyOutcomeTableRejected(_):
+			None
+
+	table ?= empty_table
+
+	valid = match body_check_registry_complete_outcome_table_from_table(
+		registry,
+		table,
+		IgnoreMainName,
+	):
+		CompleteBodyOutcomeTableAccepted(complete):
+			(
+				complete_body_outcome_table_count(complete) == 0
+				and complete_body_outcome_table_source_order(complete).is_empty()
+			)
+		CompleteBodyOutcomeTableRejected(_):
+			False
+
+	Some(valid)
+
+
+pure func test_bodyless_complete_body_table_is_valid() -> Bool:
+	bodyless_complete_body_table_is_valid().get_or(False)
+
+
 private pure func subset_materialization_rejects_duplicate_body_outcome() -> Option[Bool]:
 	input ?= accepted_module("duplicate_body", "func value() -> Int: 1").to_option()
 	ids ?= accepted_typecheck_module_callable_body_ids(input)
@@ -1357,6 +1547,15 @@ tests: TestSuite = {
 			"indexed body table admission preserves validation",
 			test_indexed_body_table_admission_preserves_validation,
 		),
+		(
+			"complete body table proves source order and coverage",
+			test_complete_body_table_proves_source_order_and_coverage,
+		),
+		(
+			"complete body table rejects a mismatched main validation policy",
+			test_complete_body_table_rejects_main_policy_mismatch,
+		),
+		("bodyless complete body table is valid", test_bodyless_complete_body_table_is_valid),
 		(
 			"subset materialization rejects a duplicate body outcome",
 			test_subset_materialization_rejects_duplicate_body_outcome,
