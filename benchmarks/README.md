@@ -1329,6 +1329,31 @@ count, and validity. The accepted membership-index result and paired samples
 are in the
 [`retained result`](results/compiler_infer_constructor_coverage_2026-09-15.md).
 
+### Inference Capture-Name Profile
+
+`compiler_inference_capture_name_profile` calls the production `infer_expr`
+lambda path with an ordered list of captured bindings. Fixture construction,
+warmup, and exact diagnostic observation stay outside the measured window.
+Capture width controls the number of distinct free names; qualifying percent
+controls how many of those bindings are mutable and therefore selected by the
+last of the four capture filters.
+
+```bash
+benchmarks/compiler_inference_capture_name_profile plain 50 512 100
+benchmarks/compiler_inference_capture_name_profile plain 10000 2 100
+benchmarks/compiler_inference_capture_name_profile profile 1 512 100 \
+  2>/tmp/compiler-inference-capture-name-profile.txt
+```
+
+Arguments are `iterations`, `capture-width`, and `qualifying-percent`. Each row
+reports the ordered-unique producer width, total capture-filter input visits,
+qualifying names, the number of redundant comparisons the former consumer
+deduplication would perform, allocator counters, the exact diagnostic
+checksum, and validity. The comparison-opportunity field describes the fixed
+workload; use exact function-profile call counts to verify whether an
+implementation actually performs those admissions. Compare only identical
+workloads and fixture hashes across compiler builds.
+
 ### Consume Candidate Index Profile
 
 `compiler_consume_candidate_index_profile` isolates `consume_specialize` by

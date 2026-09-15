@@ -1,0 +1,237 @@
+-- Deterministic fixture for the production inference capture-filter path.
+-- Construction and observation stay outside the measured window.
+import:
+	../../src/compiler/stage_03_parse/parsed_ast:
+		ParsedExpr(ParsedBlockExpr, ParsedIntLiteralExpr, ParsedLambdaExpr, ParsedNameExpr),
+		ParsedIdentifier,
+		parsed_identifier,
+	../../src/compiler/stage_06_typecheck/infer:
+		TypedExpr(TypedBlockExpr, TypedLambdaExpr),
+		infer_context,
+		infer_expr,
+	../../src/compiler/stage_06_typecheck/state:
+		TYPECHECK_USER_ORIGIN,
+		TypecheckState,
+		typecheck_state_for_origin,
+	../../src/compiler/stage_06_typecheck/type_system/env:
+		VarMutability(ImmutableBinding, MutableBinding),
+		VarOrigin(LetBinding),
+		env_add_var_with_details,
+	../../src/compiler/stage_06_typecheck/type_system/refinement: UNREFINED_BINDING
+	../../src/compiler/stage_06_typecheck/type_system/semantic_type: TYPE_INT
+	../../src/lib/source: Cursor, SourceFile, SourceSpan, source_cursor_at, source_file, source_span
+	bytes: get as get_byte
+	list: list
+
+
+record InferenceCaptureNameProfileConfig {
+	iterations: Int,
+	capture_width: Int,
+	qualifying_percent: Int
+}
+
+
+record InferenceCaptureNameProfileFixture {
+	config: InferenceCaptureNameProfileConfig,
+	state: TypecheckState,
+	expr: ParsedExpr,
+	qualifying_name_count: Int
+}
+
+
+record InferenceCaptureNameProfileExecution {
+	errors: List[String],
+	typed_body_item_count: Int,
+	iterations: Int
+}
+
+
+record InferenceCaptureNameProfileResult {
+	error_count: Int,
+	output_checksum: Int,
+	typed_body_item_count: Int,
+	producer_unique_name_count: Int,
+	capture_filter_input_visits: Int,
+	qualifying_name_count: Int,
+	redundant_comparison_opportunities: Int,
+	workload_valid: Bool
+}
+
+
+private pure func fixture_span() -> SourceSpan:
+	src: SourceFile = source_file(
+		"inference_capture_name_profile.brp",
+		"inference_capture_name_profile",
+		"profile",
+	)
+	cursor: Cursor = source_cursor_at(src, 0)
+	source_span(src, cursor, cursor)
+
+
+private pure func capture_name(index: Int) -> String:
+	"capture_${index}"
+
+
+private pure func qualifying_name_count(width: Int, percent: Int) -> Int:
+	clamped_percent: Int = if percent < 0:
+		0
+	else if percent > 100:
+		100
+	else:
+		percent
+
+	(width * clamped_percent + 99) / 100
+
+
+private pure func profile_state(width: Int, qualifying_count: Int) -> TypecheckState:
+	state = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
+	var env = state.env
+	var index: Int = 0
+
+	while index < width:
+		mutability = if index < qualifying_count:
+			MutableBinding
+		else:
+			ImmutableBinding
+
+		env = env_add_var_with_details(
+			env,
+			capture_name(index),
+			TYPE_INT,
+			Some(TYPE_INT),
+			mutability,
+			LetBinding,
+			UNREFINED_BINDING,
+		)
+		index += 1
+
+	{ state | env = env }
+
+
+private pure func profile_expr(width: Int) -> ParsedExpr:
+	span = fixture_span()
+	var body_items: List[ParsedExpr] = list(width + 1)
+	var index: Int = 0
+
+	while index < width:
+		body_items = body_items.append(
+			ParsedNameExpr(parsed_identifier(capture_name(index), span)),
+		)
+		index += 1
+
+	body_items = body_items.append(ParsedIntLiteralExpr("0", span))
+
+	ParsedLambdaExpr(
+		False,
+		[],
+		None,
+		ParsedBlockExpr(body_items, span),
+		span,
+	)
+
+
+pure func inference_capture_name_profile_fixture(
+	config: InferenceCaptureNameProfileConfig,
+) -> InferenceCaptureNameProfileFixture:
+	qualifying_count = qualifying_name_count(
+		config.capture_width,
+		config.qualifying_percent,
+	)
+
+	{
+		config = config,
+		state = profile_state(config.capture_width, qualifying_count),
+		expr = profile_expr(config.capture_width),
+		qualifying_name_count = qualifying_count
+	}
+
+
+pure func inference_capture_name_profile_execute(
+	fixture: InferenceCaptureNameProfileFixture,
+	iterations: Int,
+) -> InferenceCaptureNameProfileExecution:
+	var errors: List[String] = []
+	var typed_body_item_count: Int = -1
+	var index: Int = 0
+
+	while index < iterations:
+		result = infer_expr(infer_context(fixture.state), fixture.expr)
+		errors = result.context.state.errors
+		typed_body_item_count = match result.expr:
+			TypedLambdaExpr(_, _, _, body, _, _):
+				match body:
+					TypedBlockExpr(items, _, _):
+						items.length()
+					_:
+						-1
+			_:
+				-1
+
+		index += 1
+
+	{
+		errors = errors,
+		typed_body_item_count = typed_body_item_count,
+		iterations = iterations
+	}
+
+
+private pure func expected_error(fixture: InferenceCaptureNameProfileFixture) -> List[String]:
+	if fixture.qualifying_name_count == 0:
+		[]
+	else:
+		var names: List[String] = list(fixture.qualifying_name_count)
+		var index: Int = 0
+
+		while index < fixture.qualifying_name_count:
+			names = names.append(capture_name(index))
+			index += 1
+
+		plural = if fixture.qualifying_name_count == 1:
+			""
+		else:
+			"s"
+
+		[
+			"Closure cannot capture mutable variable" + plural + ": " + names.join(
+				", ",
+			) + ". Use explicit state threading instead.",
+		]
+
+
+private pure func checksum_text(value: String) -> Int:
+	bytes = value.to_bytes()
+	var checksum: Int = 0
+	var index: Int = 0
+
+	while index < bytes.length():
+		checksum = checksum * 131 + get_byte(bytes, index).get_or(0)
+		index += 1
+
+	checksum
+
+
+pure func inference_capture_name_profile_observe(
+	fixture: InferenceCaptureNameProfileFixture,
+	execution: InferenceCaptureNameProfileExecution,
+) -> InferenceCaptureNameProfileResult:
+	expected = expected_error(fixture)
+	qualifying_count = fixture.qualifying_name_count
+	iterations = execution.iterations
+
+	{
+		error_count = execution.errors.length(),
+		output_checksum = checksum_text(execution.errors.join("|")),
+		typed_body_item_count = execution.typed_body_item_count,
+		producer_unique_name_count = fixture.config.capture_width * iterations,
+		capture_filter_input_visits = fixture.config.capture_width * 4 * iterations,
+		qualifying_name_count = qualifying_count * iterations,
+		redundant_comparison_opportunities = (
+			qualifying_count * (qualifying_count - 1) / 2 * iterations
+		),
+		workload_valid = (
+			iterations > 0
+			and execution.typed_body_item_count == fixture.config.capture_width + 1
+			and execution.errors == expected
+		)
+	}

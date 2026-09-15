@@ -3481,6 +3481,17 @@ private pure func append_resource_refs(refs: List[String], extra: List[String]) 
 	result
 
 
+-- Capture filters consume only the two recursive collectors that preserve the
+-- first occurrence of each name. Keep that promise at this opaque boundary so
+-- those filters cannot accidentally accept an arbitrary list and then depend
+-- on redundant per-filter deduplication for correctness.
+private opaque type OrderedUniqueNames = List[String]
+
+
+private pure func ordered_unique_name_values(names: OrderedUniqueNames) -> List[String]:
+	from_opaque OrderedUniqueNames(names)
+
+
 private pure func resource_result_breaks_dependency(policy: ResourceResultPolicy) -> Bool:
 	match policy:
 		ResourceResultOrdinary:
@@ -3704,6 +3715,13 @@ private pure func typed_expr_resource_dependency_refs(
 			typed_interpolation_parts_resource_dependency_refs(context, parts)
 		_:
 			[]
+
+
+private pure func ordered_unique_resource_dependency_refs(
+	context: InferContext,
+	expr: TypedExpr,
+) -> OrderedUniqueNames:
+	into_opaque OrderedUniqueNames(typed_expr_resource_dependency_refs(context, expr))
 
 
 private pure func binding_origin_for_initializer(
@@ -12067,16 +12085,27 @@ private pure func free_var_refs_in_expr(
 			[]
 
 
-private pure func mutable_capture_names(session: InferSession, refs: List[String]) -> List[String]:
+private pure func ordered_unique_free_var_refs_in_expr(
+	env: FreeVarFacts,
+	bound: List[String],
+	expr: ParsedExpr,
+) -> OrderedUniqueNames:
+	into_opaque OrderedUniqueNames(free_var_refs_in_expr(env, bound, expr))
+
+
+private pure func mutable_capture_names(
+	session: InferSession,
+	refs: OrderedUniqueNames,
+) -> List[String]:
 	var result: List[String] = []
 
-	for name in refs:
+	for name in ordered_unique_name_values(refs):
 		match env_lookup(session.env, name):
 			Some(symbol):
 				match symbol.kind:
 					VarSymbolKind(var_symbol):
 						if var_mutability_is_mutable(var_symbol.mutability):
-							result = name_list_add_unique(result, name)
+							result = result.append(name)
 						else:
 							void
 					_:
@@ -12085,35 +12114,38 @@ private pure func mutable_capture_names(session: InferSession, refs: List[String
 				match infer_session_accepted_global(session, name):
 					Some(binding):
 						if binding.is_mutable:
-							result = name_list_add_unique(result, name)
+							result = result.append(name)
 					None:
 						void
 
 	result
 
 
-private pure func scoped_resource_capture_names(env: Env, refs: List[String]) -> List[String]:
+private pure func scoped_resource_capture_names(
+	env: Env,
+	refs: OrderedUniqueNames,
+) -> List[String]:
 	var result: List[String] = []
 
-	for name in refs:
+	for name in ordered_unique_name_values(refs):
 		if (
 			env_is_scoped_resource_var(env, name)
 			or env_scoped_resource_unavailable_owner(env, name).is_some()
 		):
-			result = name_list_add_unique(result, name)
+			result = result.append(name)
 
 	result
 
 
 private pure func scoped_resource_derived_capture_names(
 	env: Env,
-	refs: List[String],
+	refs: OrderedUniqueNames,
 ) -> List[String]:
 	var result: List[String] = []
 
-	for name in refs:
+	for name in ordered_unique_name_values(refs):
 		if env_is_scoped_resource_derived_var(env, name):
-			result = name_list_add_unique(result, name)
+			result = result.append(name)
 
 	result
 
@@ -13111,7 +13143,7 @@ private pure func check_resource_source_copy_from_existing(
 	value: ParsedExpr,
 ) -> InferContext:
 	if type_is_resource_capability_target(resource_type_facts(context), ResourceSourceShape, typ):
-		free_refs = free_var_refs_in_expr(free_var_facts(context), [], value)
+		free_refs = ordered_unique_free_var_refs_in_expr(free_var_facts(context), [], value)
 		resource_capabilities = resource_capability_capture_names(
 			resource_type_facts(context),
 			free_refs,
@@ -13211,12 +13243,12 @@ private pure func check_resource_capability_storage(
 
 private pure func resource_capability_capture_names(
 	facts: ResourceTypeFacts,
-	refs: List[String],
+	refs: OrderedUniqueNames,
 ) -> ResourceCapabilityCaptureNames:
 	var one_shot_streams: List[String] = []
 	var resource_sources: List[String] = []
 
-	for name in refs:
+	for name in ordered_unique_name_values(refs):
 		typ = match env_get_var_type(resource_type_facts_env(facts), name):
 			Some(found):
 				Some(found)
@@ -13233,10 +13265,10 @@ private pure func resource_capability_capture_names(
 				presence = type_resource_capability_presence(facts, typ)
 
 				if presence.contains_one_shot_stream:
-					one_shot_streams = name_list_add_unique(one_shot_streams, name)
+					one_shot_streams = one_shot_streams.append(name)
 
 				if presence.contains_resource_source:
-					resource_sources = name_list_add_unique(resource_sources, name)
+					resource_sources = resource_sources.append(name)
 			None:
 				void
 
@@ -13266,7 +13298,7 @@ private pure func check_lambda_captures(
 	params: List[ParsedLambdaParam],
 	body: ParsedExpr,
 ) -> InferContext:
-	free_refs = free_var_refs_in_expr(
+	free_refs = ordered_unique_free_var_refs_in_expr(
 		free_var_facts(context),
 		lambda_param_bound_names(params),
 		body,
@@ -20534,7 +20566,7 @@ private pure func check_task_captures(
 	bound: List[String],
 	body: ParsedExpr,
 ) -> InferContext:
-	free_refs = free_var_refs_in_expr(free_var_facts(context), bound, body)
+	free_refs = ordered_unique_free_var_refs_in_expr(free_var_facts(context), bound, body)
 	resource_captures = scoped_resource_capture_names(context.state.env, free_refs)
 	resource_capabilities = resource_capability_capture_names(
 		resource_type_facts(context),
@@ -20977,8 +21009,10 @@ private pure func unavailable_parent_resource_names(
 ) -> List[String]:
 	var result: List[String] = []
 
-	for name in typed_expr_resource_dependency_refs(context, acquisition):
-		if env_is_scoped_resource_var(context.state.env, name) and not result.contains(name):
+	for name in ordered_unique_name_values(
+		ordered_unique_resource_dependency_refs(context, acquisition),
+	):
+		if env_is_scoped_resource_var(context.state.env, name):
 			result = result.append(name)
 
 	result
