@@ -11,7 +11,12 @@ import:
 		CoreLiteral(IntLiteral),
 		CoreParam,
 		CorePattern(
+			ConstructorPattern,
+			ListPattern,
+			LiteralPattern,
 			NamePattern,
+			OrPattern,
+			QualifiedConstructorPattern,
 			TuplePattern,
 			WildcardPattern,
 		),
@@ -36,6 +41,8 @@ record MatchBoundNamesProfileConfig {
 }
 
 
+-- Structural work counters describe one rewrite iteration. The measured time
+-- and memory counters in the executable cover all iterations.
 record MatchBoundNamesProfileResult {
 	iterations: Int,
 	incoming_bound_width: Int,
@@ -184,7 +191,9 @@ private pure func case_pattern_names(case_index: Int, binder_count: Int) -> List
 		3:
 			["outer_0"].concat(binder_names(case_index, binder_count))
 		_:
-			["outer_1"].concat(binder_names(case_index, binder_count))
+			["outer_1"]
+				.concat(binder_names(case_index, binder_count))
+				.append("spread")
 
 
 private pure func duplicate_target_pattern(case_index: Int, binder_count: Int) -> CorePattern:
@@ -209,15 +218,22 @@ private pure func nested_pattern(case_index: Int, binder_count: Int) -> CorePatt
 private pure func profile_pattern(case_index: Int, binder_count: Int) -> CorePattern:
 	match case_index % 5:
 		0:
-			WildcardPattern
+			OrPattern([WildcardPattern, LiteralPattern(IntLiteral(case_index))])
 		1:
 			all_new_pattern(case_index, binder_count)
 		2:
-			duplicate_target_pattern(case_index, binder_count)
+			ConstructorPattern("Pair", [duplicate_target_pattern(case_index, binder_count)])
 		3:
-			outer_collision_pattern(case_index, binder_count)
+			QualifiedConstructorPattern(
+				"fixture",
+				"Pair",
+				[outer_collision_pattern(case_index, binder_count)],
+			)
 		_:
-			nested_pattern(case_index, binder_count)
+			ListPattern(
+				[OrPattern([nested_pattern(case_index, binder_count)])],
+				Some(NamePattern("spread")),
+			)
 
 
 private pure func var_expr(name: String, def_id: Option[Int]) -> CoreExpr:
@@ -251,7 +267,7 @@ private pure func case_body(case_index: Int) -> CoreExpr:
 		3:
 			seq(var_expr("outer_0", None), var_expr("target", None))
 		_:
-			nested_raw_match_body(case_index)
+			seq(var_expr("spread", None), nested_raw_match_body(case_index))
 
 
 private pure func profile_case(case_index: Int, binder_count: Int) -> CoreRawMatchCase:
@@ -298,6 +314,7 @@ private pure func profile_program(config: MatchBoundNamesProfileConfig) -> CoreP
 			global_decl("target", 990001),
 			global_decl("shadowed", 990002),
 			global_decl("outer_0", 990003),
+			global_decl("spread", 990004),
 			FunctionDecl(profile_function(config)),
 		],
 		foreign_includes = []
@@ -329,6 +346,7 @@ private pure func observe_program(program: CoreProgram) -> MatchBoundNamesObserv
 	target_name: String = core_module_member_name(MATCH_BOUND_PROFILE_MODULE, "target")
 	shadowed_name: String = core_module_member_name(MATCH_BOUND_PROFILE_MODULE, "shadowed")
 	outer_name: String = core_module_member_name(MATCH_BOUND_PROFILE_MODULE, "outer_0")
+	spread_name: String = core_module_member_name(MATCH_BOUND_PROFILE_MODULE, "spread")
 	var observation: MatchBoundNamesObservation = {
 		raw_match_nodes = 0,
 		raw_match_cases = 0,
@@ -377,7 +395,9 @@ private pure func observe_program(program: CoreProgram) -> MatchBoundNamesObserv
 						local_shadowed: Bool = variable.name == "shadowed"
 						local_outer: Bool = variable.name == "outer_0"
 						unexpected_global_shadow: Bool = (
-							variable.name == shadowed_name or variable.name == outer_name
+							variable.name == shadowed_name
+							or variable.name == outer_name
+							or variable.name == spread_name
 						)
 						global_target_increment: Int = if global_target:
 							1
@@ -572,7 +592,7 @@ pure func match_bound_names_profile_observe(
 	observation: MatchBoundNamesObservation = observe_program(program)
 	expected_modes: Int = mode_count(normalized.cases, 0)
 	workload_valid: Bool = (
-		program.decls.length() == 4
+		program.decls.length() == 5
 		and observation.raw_match_nodes == expected_raw_match_nodes(normalized.cases)
 		and observation.raw_match_cases == expected_raw_match_cases(normalized.cases)
 		and observation.global_target_reads == expected_global_target_reads(normalized.cases)
