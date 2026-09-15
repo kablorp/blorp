@@ -14,13 +14,13 @@ growing prefix. The final implementation remains one pass and performs one
 substitution lookup per variable-dimension root; the rejected capacity
 prepass is not part of the accepted change.
 
-Retired instructions are unavailable on the macOS host, and total allocations
-improve by 0.06% to 5.56%, not the proposed 10%. The candidate is accepted
-because the isolated production path removes 100% of the modeled old prefix
-recopy work, paired elapsed medians improve 9.78% to 11.95% across widths
-1/4/16/64, width one does not regress, and exact resolved-type and generated-C
-output identity hold. The direct eliminated-work model is the operation the
-issue targets; timing is supporting evidence rather than the sole basis.
+The wide workload reduces retired instructions by 8.52% and total allocations
+by 0.06%, not the proposed 10%. The candidate is accepted with an explicit
+evidence substitution because the isolated production path removes 100% of
+the modeled old prefix recopy work, paired elapsed medians improve 9.78% to
+11.95% across widths 1/4/16/64, width one improves, and exact resolved-type and
+generated-C output identity hold. The direct eliminated-work model is the
+operation the issue targets; timing corroborates that mechanism.
 
 ## Measurement
 
@@ -53,6 +53,22 @@ sample table is retained as
 and raw outputs remain under
 `/private/tmp/blorp-var-dims-interleaved-714f/`. Their hash manifest has SHA-256
 `3a61ca90ecd5168802651449accd7dafa4b73cb5790bf49906e0b4e6593f9f02`.
+
+Seven additional alternating pairs under `/usr/bin/time -lp` produced these
+process-level counters:
+
+| Expansion width | Baseline median retired instructions | Candidate median retired instructions | Change |
+| ---: | ---: | ---: | ---: |
+| 1 | 438,018,452 | 397,380,199 | -9.28% |
+| 64 | 2,613,372,896 | 2,390,841,565 | -8.52% |
+
+Those samples are retained as
+`benchmarks/results/compiler_var_dims_resolution_instructions_2026-09-14.tsv`,
+SHA-256 `858c8745acbc9a3de3c8c2cf48c22afedb6086fa8c89c12ccf7b0394261c653d`.
+The 28 corresponding raw counter files are covered by
+`/private/tmp/blorp-var-dims-interleaved-714f/retained-instructions-sha256.txt`,
+whose SHA-256 is
+`7ba6370da14e41be9d260ea5bac2e33c82e3116fbc63abd7db726bdeb2004459`.
 
 Three alternating self-compiles were also recorded in
 `/private/tmp/blorp-var-dims-one-pass-self-714f/times.tsv`: baseline times were
