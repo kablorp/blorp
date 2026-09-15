@@ -132,6 +132,7 @@ class CompilerTypecheckWorkerTests(unittest.TestCase):
             ROOT,
             Path("/tmp/output"),
             None,
+            include_dirs=self.backend.WORKER_INCLUDE_DIRS,
             env_name=self.backend.BACKEND_WORKER_ENV,
             source_path=self.backend.WORKER_SOURCE,
             worker_name=self.backend.WORKER_NAME,
