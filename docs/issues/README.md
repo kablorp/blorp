@@ -63,7 +63,6 @@ current-state and next-action summary.
 - [CTFE environment lookup, measurement gated](compiler-performance/67-index-remaining-ctfe-environment-lookup.md)
 - [Step 2e visibility convergence](compiler-performance/94-step2e-visibility-convergence.md)
 - [Step 2e width-probe resource gate](compiler-performance/97-bound-visibility-width-probe.md)
-- [Core layout alias-cycle membership](compiler-performance/98-index-core-layout-alias-cycle-membership.md)
 - [Accepted-alias cycle membership](compiler-performance/99-index-accepted-alias-cycle-membership.md)
 - [Cancellation-plan child-result batching](compiler-performance/100-batch-cancellation-plan-child-results.md)
 - [Variable-dimension list flattening](compiler-performance/101-flatten-var-dims-list-resolution.md)
