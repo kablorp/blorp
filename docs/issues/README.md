@@ -71,7 +71,6 @@ current-state and next-action summary.
 - [Resource-reference deduplication](compiler-performance/104-index-resource-reference-deduplication.md)
 - [Consumed-argument membership](compiler-performance/105-index-consumed-argument-membership.md)
 - [Parser-finalization diagnostics](compiler-performance/106-batch-parser-finalization-diagnostics.md)
-- [Monomorphization type-parameter membership](compiler-performance/107-index-monomorphization-type-parameter-membership.md)
 - [Implementation-obligation traversal](compiler-performance/108-bound-implementation-obligation-traversal.md)
 - [Standard-inline rename copying](compiler-performance/109-reduce-std-inline-rename-copying.md)
 - [Match-bound name deduplication](compiler-performance/110-deduplicate-match-bound-names-once.md)
