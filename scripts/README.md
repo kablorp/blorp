@@ -112,6 +112,146 @@ The remaining roots compile and run together in one runtime test invocation.
 required build and need to preserve that exact toolchain through validation.
 Without it, `scripts/test` installs the current compiler before running gates.
 
+## Complexity Candidate Analysis
+
+`scripts/complexity-check` compiles a Blorp entrypoint through the Core
+`dce` stage, without emitting or compiling C, and reports conservative
+super-linear work candidates. Analyzing after dead-code elimination keeps
+unreachable test, observation, and compatibility helpers out of the normal
+source-input report:
+
+```bash
+scripts/compiler-build-status
+scripts/complexity-check blorp/src/main.brp \
+  --module-prefix blorp/src/compiler/
+scripts/complexity-check example.brp --json
+scripts/complexity-check example.brp --minimum-degree 3
+```
+
+The `nested-traversal` rule detects a dynamic traversal nested inside another
+dynamic traversal. It preserves distinct size dimensions, reporting `O(modules
+* declarations)` rather than assuming that both collections have the same
+size, and reports repeated traversal of the same value as `O(items^2)`.
+Projection through an outer binder is treated as an aggregate child collection,
+whether the child is traversed directly or scanned by a known linear operation:
+`for module in modules; for declaration in module.declarations` is
+`O(total(module.declarations))`, not a super-linear candidate. A full unrelated
+scan inside that child traversal is still reported, for example
+`O(total(module.declarations) * all_names)`. This folding is based only on an
+explicit Core field or tuple projection, not names or source formatting.
+
+The known-operation catalog recognizes linear `List` operations inside dynamic
+traversals: `all`, `any`, `contains`, `count`, `filter`, `filter_map`, `find`,
+`fold_left`, `fold_right`, `for_each`, `map`, `map_indexed`, and `reverse`.
+For example, `for item in items: seen.contains(item)` is reported by
+`linear-scan-in-traversal` as `O(items * seen)`. `concat` reports one additive
+linear-cost candidate for each dynamic input, rather than incorrectly
+multiplying the two input lengths. Set and dictionary membership are not
+classified as linear scans. The operation table is deliberately explicit
+rather than guessing complexity from arbitrary function names.
+
+Stable `List.sort`, `sort_by`, and `sort_desc_by` contribute `n log n` work.
+They are reported only when another dynamic factor raises the polynomial
+degree to the requested minimum, for example `O(rounds * items * log(items))`;
+a top-level sort is not a quadratic candidate. `Dict.contains_value` is a
+linear value scan. Dynamic `String.contains`, `String.raw_index_of`, and
+`StringSlice.contains` searches contribute both haystack and needle dimensions,
+matching their synthesized nested comparison loops. Ordinary dictionary/set
+key membership remains excluded.
+Literal haystacks and needles are fixed-size costs: a literal needle leaves
+only the haystack dimension, while a literal haystack caps the entire search.
+
+`List.unique` has a known quadratic implementation and is reported by
+`known-quadratic-operation` even without an enclosing traversal:
+
+```blorp
+names.unique()  -- O(names^2)
+```
+
+One-hop parameter summaries expose linear or quadratic operations hidden by a
+small helper. If a function directly scans one of its parameters, calls to that
+function use `summarized-operation-cost` with the actual argument dimension:
+
+```blorp
+private pure func append_unique(seen: List[String], item: String) -> List[String]:
+    if seen.contains(item):
+        seen
+    else:
+        seen.append(item)
+
+for item in items:
+    seen = append_unique(seen, item)  -- O(items * seen)
+```
+
+Summaries are derived from Core parameter identities and function IDs, not
+helper names. They intentionally stop at traversal and lambda boundaries, stop
+after one hop, and do not propagate through another wrapper or recursive call.
+The traversal boundary avoids dropping an enclosing parameter dimension from
+the summary.
+
+When the scanned collection is assigned an append result in the same loop,
+`growing-accumulator-scan` adds a growth-term candidate using the dimensions
+that grow it:
+
+```blorp
+var seen: List[String] = []
+for item in items:
+    if not seen.contains(item):
+        seen = seen.append(item)
+-- O(items * seen) plus the growth term O(items^2)
+```
+
+At the DCE boundary, append is expanded into Core operations. The analyzer
+requires a connected dataflow from the input list through ensure-capacity, a
+unit length increment, and the returned updated list before treating that
+expansion as growth. Capacity reservation, a discarded append result, or an
+unrelated length update is not enough. The original accumulator dimension is
+retained as a separate term because the accumulator may be non-empty before
+the loop. `concat` growth is not inferred yet because its per-iteration growth
+can itself be dynamic. Plain `List.append` is not classified as a linear scan
+because uniquely owned append is amortized constant-time.
+
+Constant range and collection-literal bounds do not increase the reported
+degree. Concurrent loops contribute to total work like sequential loops; the
+report does not estimate their parallel span.
+
+Results rank an exact repeated Core dimension first, independent dimensions
+next, and an inner traversal that directly references an outer binder last.
+The JSON `relationship` field exposes this classification as
+`repeated-dimension`, `independent-dimensions`, or `dependent-inner`.
+
+The result is a structural worst-case work estimate and an optimization lead,
+not a proof of a function's complete asymptotic complexity. The analyzer does
+not yet propagate summaries transitively, model recursion or arbitrary `while`
+bounds, model COW uniqueness, or estimate concurrent span. A growth result is a
+worst-case bound: conditional appends may make typical work smaller.
+Aggregate-child folding assumes the projected values should be measured by
+their total logical input size; shared immutable child collections can make the
+physical work larger. The analyzer also does not propagate size identity
+through ordinary aliases, so repeated-dimension classification is a ranking
+signal rather than a proof. Confirm material candidates with a retained scaling
+benchmark and function profile.
+
+For a fast analyzer-only loop, retain a Core dump and skip compilation on
+subsequent runs:
+
+```bash
+bin/blorp compile --no-format \
+  --dump-core-after=dce \
+  --stop-after=dce \
+  --dump-core-file=/tmp/blorp-dce.core \
+  blorp/src/main.brp
+scripts/complexity-check --core-file /tmp/blorp-dce.core --json
+```
+
+Annotated retained dumps preserve their stage in the JSON report. If a dump
+contains multiple stages, the analyzer selects the `dce` object when present;
+otherwise it selects the last stage. A raw JSON Core file has `"stage":
+"unknown"`; use a `dce` dump when reachability filtering matters.
+
+Use `--fail-on-findings` only for a deliberately curated policy check. Findings
+do not fail the command by default because nested traversals can be intentional.
+
 ## Validation Evidence Packets
 
 Use `scripts/record-validation` when a reviewer needs a reproducible packet for

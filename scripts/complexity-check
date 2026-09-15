@@ -1,0 +1,1141 @@
+#!/usr/bin/env python3
+"""Find conservative super-linear work patterns in Blorp Core IR."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+import tempfile
+from collections import Counter
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Iterable
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_COMPILER = ROOT / "bin" / "blorp"
+CORE_STAGE = "dce"
+
+# These Core nodes execute their body once per element in a finite or
+# input-delimited source. Concurrent traversals contribute the same total work
+# multiplier; their wall-clock span needs a separate model.
+WRAPPED_TRAVERSALS = {
+	"concurrently_loop": "concurrently_loop",
+	"for_channel": "for_channel",
+	"for_dict": "for_dict",
+	"for_list": "for_list",
+	"for_resource_source": "for_resource_source",
+	"for_set": "for_set",
+	"for_stream": "for_stream",
+	"for_string": "for_string",
+	"for_tensor": "for_tensor",
+	"pre_closure_concurrently_loop": "pre_closure_concurrently_loop",
+}
+
+CONCURRENT_TRAVERSALS = {"concurrently_loop", "pre_closure_concurrently_loop"}
+
+FIXED_SIZE_VALUE_KINDS = {
+	"dict",
+	"dict_construct",
+	"list_construct",
+	"tensor_literal",
+	"tensor_boxed_literal",
+	"tensor_packed_literal",
+	"tuple",
+	"tuple_construct",
+	"vector",
+}
+
+# These standard-library operations have known collection-size costs. Keep the
+# catalog explicit: inferring complexity from arbitrary function names would
+# make the report depend on a naming heuristic.
+LINEAR_LIST_OPERATIONS = {
+	"all",
+	"any",
+	"contains",
+	"count",
+	"filter",
+	"filter_map",
+	"find",
+	"fold_left",
+	"fold_right",
+	"for_each",
+	"map",
+	"map_indexed",
+	"reverse",
+}
+ADDITIVE_LINEAR_LIST_OPERATIONS = {"concat": (0, 1)}
+QUADRATIC_LIST_OPERATIONS = {"unique"}
+N_LOG_N_LIST_OPERATIONS = {"sort", "sort_by", "sort_desc_by"}
+LINEAR_NON_LIST_OPERATIONS = {"dict__contains_value": 0}
+TWO_DIMENSION_SEARCH_OPERATIONS = {
+	"slice__contains": (0, 1),
+	"string__contains": (0, 1),
+	"string__raw_index_of": (0, 1),
+}
+
+
+class ComplexityCheckError(Exception):
+	pass
+
+
+@dataclass(frozen=True)
+class Dimension:
+	identity: str
+	label: str
+
+
+@dataclass(frozen=True)
+class TraversalBound:
+	dimension: Dimension
+	kind: str
+	location: dict[str, object]
+	binder_identity: str | None
+	depends_on_outer: bool
+	grown_accumulator_identities: frozenset[str]
+
+
+@dataclass(frozen=True)
+class OperationCost:
+	factors: tuple[object, ...]
+	log_factor_positions: tuple[int, ...]
+	operation: str
+	rule: str
+	confidence: str
+
+
+@dataclass(frozen=True)
+class FunctionCostSummary:
+	parameter_indices: tuple[int, ...]
+	log_factor_positions: tuple[int, ...]
+	operation: str
+
+
+@dataclass(frozen=True)
+class Finding:
+	rule: str
+	function: str
+	module: str
+	degree: int
+	complexity: str
+	dimensions: list[str]
+	confidence: str
+	metric: str
+	relationship: str
+	location: dict[str, object]
+	evidence: str
+
+
+def known_location(value: object, fallback: object = None) -> dict[str, object]:
+	for candidate in (value, fallback):
+		if not isinstance(candidate, dict):
+			continue
+		loc = candidate.get("loc", candidate)
+		if (
+			isinstance(loc, dict)
+			and loc.get("kind") == "known"
+			and isinstance(loc.get("file"), str)
+			and isinstance(loc.get("line"), int)
+		):
+			return {"file": loc["file"], "line": loc["line"]}
+	return {"file": "<synthetic>", "line": 0}
+
+
+def literal_is_fixed(value: object) -> bool:
+	return isinstance(value, dict) and value.get("kind") == "literal"
+
+
+def fixed_size_value(value: object) -> bool:
+	return isinstance(value, dict) and value.get("kind") in FIXED_SIZE_VALUE_KINDS
+
+
+def fixed_cost_factor(value: object) -> bool:
+	return literal_is_fixed(value) or fixed_size_value(value)
+
+
+def short_call_name(name: str) -> str:
+	base = name.split("__mono", 1)[0]
+	return base.rsplit("__", 1)[-1]
+
+
+def core_var_identity(variable: object) -> str | None:
+	if not isinstance(variable, dict) or not isinstance(variable.get("name"), str):
+		return None
+	return f"var:{variable['name']}:{variable.get('uniq', 0)}:{variable.get('def_id')}"
+
+
+def required_core_var_identity(variable: object, context: str) -> str:
+	if (
+		not isinstance(variable, dict)
+		or not isinstance(variable.get("name"), str)
+		or not isinstance(variable.get("uniq"), int)
+	):
+		raise ComplexityCheckError(f"{context} is missing a valid Core loop variable")
+	return core_var_identity(variable) or ""
+
+
+def raw_location_identity(value: dict[str, Any]) -> str:
+	loc = value.get("loc")
+	if not isinstance(loc, dict) or loc.get("kind") != "known":
+		return "synthetic"
+	return ":".join(
+		str(loc.get(field, ""))
+		for field in ("file", "line", "column", "end_line", "end_column")
+	)
+
+
+def expression_dimension(value: object) -> Dimension:
+	if not isinstance(value, dict):
+		return Dimension("unknown", "input")
+	kind = value.get("kind")
+	if kind == "var":
+		variable = value.get("var")
+		if isinstance(variable, dict) and isinstance(variable.get("name"), str):
+			name = variable["name"]
+			uniq = variable.get("uniq", 0)
+			label = name if not isinstance(uniq, int) or uniq == 0 else f"{name}#{uniq}"
+			return Dimension(core_var_identity(variable) or f"var:{name}", label)
+	if kind == "literal":
+		literal = value.get("literal")
+		if isinstance(literal, dict) and "value" in literal:
+			literal_value = str(literal["value"])
+			return Dimension(f"literal:{literal.get('kind')}:{literal_value}", literal_value)
+	if kind == "field":
+		base = expression_dimension(value.get("expr"))
+		field = value.get("field")
+		if isinstance(field, str):
+			return Dimension(f"{base.identity}.field:{field}", f"{base.label}.{field}")
+	if kind == "tuple_field":
+		base = expression_dimension(value.get("expr"))
+		index = value.get("index")
+		if isinstance(index, int):
+			return Dimension(f"{base.identity}.tuple:{index}", f"{base.label}.{index}")
+	if kind == "call":
+		call_kind = value.get("call_kind")
+		if isinstance(call_kind, dict) and isinstance(call_kind.get("name"), str):
+			name = short_call_name(call_kind["name"])
+			return Dimension(
+				f"call:{call_kind.get('def_id')}:{raw_location_identity(value)}",
+				f"result({name})",
+			)
+	loc = known_location(value)
+	if loc["line"]:
+		label = f"input@{loc['file']}:{loc['line']}"
+		return Dimension(label, label)
+	return Dimension("unknown", "input")
+
+
+def projection_root_identity(value: object) -> str | None:
+	if not isinstance(value, dict):
+		return None
+	if value.get("kind") == "var":
+		return core_var_identity(value.get("var"))
+	if value.get("kind") in {"field", "tuple_field"}:
+		return projection_root_identity(value.get("expr"))
+	return None
+
+
+def projection_parent_index(
+	value: object,
+	active: list[TraversalBound],
+) -> int | None:
+	root_identity = projection_root_identity(value)
+	return next(
+		(
+			index
+			for index in range(len(active) - 1, -1, -1)
+			if active[index].binder_identity == root_identity
+		),
+		None,
+	)
+
+
+def aggregate_dimension(dimension: Dimension) -> Dimension:
+	return Dimension(
+		f"aggregate:{dimension.identity}",
+		f"total({dimension.label})",
+	)
+
+
+def call_name(value: object) -> str | None:
+	if not isinstance(value, dict) or value.get("kind") != "call":
+		return None
+	call_kind = value.get("call_kind")
+	if not isinstance(call_kind, dict) or not isinstance(call_kind.get("name"), str):
+		return None
+	return call_kind["name"].split("__mono", 1)[0]
+
+
+def list_operation_name(value: dict[str, Any]) -> str | None:
+	name = call_name(value)
+	if name is None or not name.startswith("list__"):
+		return None
+	return name[len("list__") :].split("__", 1)[0]
+
+
+def required_call_args(value: dict[str, Any], operation: str, count: int) -> list[object]:
+	args = value.get("args")
+	if (
+		not isinstance(args, list)
+		or len(args) < count
+		or any(not isinstance(arg, dict) for arg in args[:count])
+	):
+		raise ComplexityCheckError(f"{operation} is missing a required Core argument")
+	return args
+
+
+def direct_operation_costs(value: dict[str, Any]) -> list[OperationCost]:
+	name = call_name(value)
+	if name in LINEAR_NON_LIST_OPERATIONS:
+		index = LINEAR_NON_LIST_OPERATIONS[str(name)]
+		args = required_call_args(value, str(name), index + 1)
+		return [
+			OperationCost(
+				factors=(args[index],),
+				log_factor_positions=(),
+				operation=str(name),
+				rule="linear-scan-in-traversal",
+				confidence="known-operation-cost",
+			)
+		]
+	if name in TWO_DIMENSION_SEARCH_OPERATIONS:
+		indices = TWO_DIMENSION_SEARCH_OPERATIONS[str(name)]
+		args = required_call_args(value, str(name), max(indices) + 1)
+		haystack = args[indices[0]]
+		needle = args[indices[1]]
+		# A fixed haystack caps both the number of candidate positions and the
+		# number of characters that can be compared. A fixed needle leaves one
+		# linear haystack factor.
+		if fixed_cost_factor(haystack):
+			return []
+		factors = (haystack,) if fixed_cost_factor(needle) else (haystack, needle)
+		return [
+			OperationCost(
+				factors=factors,
+				log_factor_positions=(),
+				operation=str(name),
+				rule=(
+					"linear-scan-in-traversal"
+					if len(factors) == 1
+					else "known-quadratic-operation"
+				),
+				confidence="known-operation-cost",
+			)
+		]
+	operation = list_operation_name(value)
+	if operation in LINEAR_LIST_OPERATIONS:
+		args = required_call_args(value, f"list__{operation}", 1)
+		return [
+			OperationCost(
+				factors=(args[0],),
+				log_factor_positions=(),
+				operation=f"list__{operation}",
+				rule="linear-scan-in-traversal",
+				confidence="known-operation-cost",
+			)
+		]
+	if operation in ADDITIVE_LINEAR_LIST_OPERATIONS:
+		indices = ADDITIVE_LINEAR_LIST_OPERATIONS[str(operation)]
+		args = required_call_args(value, f"list__{operation}", max(indices) + 1)
+		return [
+			OperationCost(
+				factors=(args[index],),
+				log_factor_positions=(),
+				operation=f"list__{operation}[arg{index}]",
+				rule="linear-scan-in-traversal",
+				confidence="known-operation-cost",
+			)
+			for index in indices
+		]
+	if operation in QUADRATIC_LIST_OPERATIONS:
+		args = required_call_args(value, f"list__{operation}", 1)
+		return [
+			OperationCost(
+				factors=(args[0], args[0]),
+				log_factor_positions=(),
+				operation=f"list__{operation}",
+				rule="known-quadratic-operation",
+				confidence="known-operation-cost",
+			)
+		]
+	if operation in N_LOG_N_LIST_OPERATIONS:
+		args = required_call_args(value, f"list__{operation}", 1)
+		return [
+			OperationCost(
+				factors=(args[0],),
+				log_factor_positions=(0,),
+				operation=f"list__{operation}",
+				rule="n-log-n-operation-in-traversal",
+				confidence="known-operation-cost",
+			)
+		]
+	return []
+
+
+def callable_summary_keys(value: dict[str, Any]) -> list[tuple[str, object]]:
+	if value.get("kind") == "call":
+		identity = value.get("call_kind")
+	else:
+		identity = value
+	if not isinstance(identity, dict):
+		return []
+	if isinstance(identity.get("def_id"), int):
+		return [("def_id", identity["def_id"])]
+	return []
+
+
+def direct_costs_in_body(value: object) -> Iterable[OperationCost]:
+	if isinstance(value, list):
+		for item in value:
+			yield from direct_costs_in_body(item)
+		return
+	kind = value.get("kind") if isinstance(value, dict) else None
+	if (
+		not isinstance(value, dict)
+		or kind == "lambda"
+		or kind == "for_range"
+		or (isinstance(kind, str) and kind in WRAPPED_TRAVERSALS)
+	):
+		return
+	yield from direct_operation_costs(value)
+	for child in value.values():
+		yield from direct_costs_in_body(child)
+
+
+def build_function_cost_summaries(
+	declarations: list[object],
+) -> dict[tuple[str, object], list[FunctionCostSummary]]:
+	result: dict[tuple[str, object], list[FunctionCostSummary]] = {}
+	for declaration in declarations:
+		if not isinstance(declaration, dict) or declaration.get("kind") != "function":
+			continue
+		params = declaration.get("params")
+		body = declaration.get("body")
+		if not isinstance(params, list) or not isinstance(body, dict):
+			continue
+		parameter_indices: dict[str, int] = {}
+		for index, param in enumerate(params):
+			if isinstance(param, dict):
+				identity = core_var_identity(param.get("name"))
+				if identity is not None:
+					parameter_indices[identity] = index
+
+		summaries: list[FunctionCostSummary] = []
+		for cost in direct_costs_in_body(body):
+			indices: list[int] = []
+			for factor in cost.factors:
+				identity = core_var_identity(factor.get("var")) if isinstance(factor, dict) else None
+				if identity not in parameter_indices:
+					break
+				indices.append(parameter_indices[identity])
+			else:
+				summary = FunctionCostSummary(
+					tuple(indices),
+					cost.log_factor_positions,
+					cost.operation,
+				)
+				if summary not in summaries:
+					summaries.append(summary)
+
+		for key in callable_summary_keys(declaration):
+			if summaries:
+				result[key] = summaries
+	return result
+
+
+def operation_costs(
+	value: dict[str, Any],
+	summaries: dict[tuple[str, object], list[FunctionCostSummary]],
+	current_function: dict[str, Any],
+) -> list[OperationCost]:
+	if value.get("kind") != "call":
+		return []
+	direct = direct_operation_costs(value)
+	if direct:
+		return direct
+	if set(callable_summary_keys(value)) & set(callable_summary_keys(current_function)):
+		return []
+	matched: list[FunctionCostSummary] = []
+	for key in callable_summary_keys(value):
+		if key in summaries:
+			matched = summaries[key]
+			break
+	if not matched:
+		return []
+	args = value.get("args")
+	if not isinstance(args, list):
+		raise ComplexityCheckError("summarized call is missing its Core arguments")
+	result: list[OperationCost] = []
+	for summary in matched:
+		if any(index >= len(args) for index in summary.parameter_indices):
+			raise ComplexityCheckError("summarized call has fewer arguments than its declaration")
+		if any(not isinstance(args[index], dict) for index in summary.parameter_indices):
+			raise ComplexityCheckError("summarized call has an invalid Core argument")
+		result.append(
+			OperationCost(
+				factors=tuple(args[index] for index in summary.parameter_indices),
+				log_factor_positions=summary.log_factor_positions,
+				operation=f"summary({summary.operation})",
+				rule="summarized-operation-cost",
+				confidence="derived-one-hop-summary",
+			)
+		)
+	return result
+
+
+def traversal_parts(
+	value: dict[str, Any],
+) -> tuple[object, object, Dimension, list[object], str] | None:
+	kind = value.get("kind")
+	if kind == "for_range":
+		start = value.get("start")
+		end = value.get("end")
+		body = value.get("body")
+		if not isinstance(start, dict) or not isinstance(end, dict):
+			raise ComplexityCheckError("for_range is missing Core expression bounds")
+		if not isinstance(body, dict):
+			raise ComplexityCheckError("for_range is missing a Core expression body")
+		binder = value.get("binder")
+		if not isinstance(binder, dict):
+			raise ComplexityCheckError("for_range is missing a Core loop binder")
+		binder_identity = required_core_var_identity(binder.get("var"), "for_range binder")
+		direction = binder.get("range_direction")
+		if not isinstance(direction, str):
+			raise ComplexityCheckError("for_range binder is missing a range direction")
+		if literal_is_fixed(start) and literal_is_fixed(end):
+			return body, None, Dimension("constant", "constant range"), [start, end], binder_identity
+		start_dimension = expression_dimension(start)
+		end_dimension = expression_dimension(end)
+		dimension = Dimension(
+			f"range:{start_dimension.identity}:{end_dimension.identity}:{direction}",
+			f"range({start_dimension.label}..{end_dimension.label})",
+		)
+		return body, end, dimension, [start, end], binder_identity
+	if not isinstance(kind, str) or kind not in WRAPPED_TRAVERSALS:
+		return None
+	wrapper = value.get(WRAPPED_TRAVERSALS[kind])
+	if not isinstance(wrapper, dict):
+		raise ComplexityCheckError(f"{kind} is missing its Core traversal record")
+	iterable = wrapper.get("iterable")
+	body = wrapper.get("body")
+	if not isinstance(iterable, dict):
+		raise ComplexityCheckError(f"{kind} is missing a Core expression iterable")
+	if not isinstance(body, dict):
+		raise ComplexityCheckError(f"{kind} is missing a Core expression body")
+	if kind in CONCURRENT_TRAVERSALS:
+		binder_identity = required_core_var_identity(wrapper.get("var"), f"{kind} binder")
+	else:
+		binder = wrapper.get("binder")
+		if not isinstance(binder, dict):
+			raise ComplexityCheckError(f"{kind} is missing a Core loop binder")
+		binder_identity = required_core_var_identity(binder.get("var"), f"{kind} binder")
+	inputs = [iterable]
+	if kind in CONCURRENT_TRAVERSALS:
+		inputs.extend([wrapper.get("timeout"), wrapper.get("limit")])
+	if fixed_size_value(iterable):
+		return body, None, Dimension("constant", "constant collection"), inputs, binder_identity
+	return body, iterable, expression_dimension(iterable), inputs, binder_identity
+
+
+def referenced_var_identities(value: object) -> set[str]:
+	if isinstance(value, list):
+		result: set[str] = set()
+		for item in value:
+			result.update(referenced_var_identities(item))
+		return result
+	if not isinstance(value, dict):
+		return set()
+	if value.get("kind") == "var":
+		identity = core_var_identity(value.get("var"))
+		return {identity} if identity is not None else set()
+	result = set()
+	for child in value.values():
+		result.update(referenced_var_identities(child))
+	return result
+
+
+def call_argument_identity(value: object, index: int) -> str | None:
+	if not isinstance(value, dict):
+		return None
+	args = value.get("args")
+	if not isinstance(args, list) or index >= len(args) or not isinstance(args[index], dict):
+		return None
+	argument = args[index]
+	return core_var_identity(argument.get("var")) if argument.get("kind") == "var" else None
+
+
+def positive_unit_increment(value: object, length_identities: set[str]) -> str | None:
+	if not isinstance(value, dict) or value.get("kind") != "binary" or value.get("op") != "add":
+		return None
+	for variable_side, literal_side in (
+		(value.get("left"), value.get("right")),
+		(value.get("right"), value.get("left")),
+	):
+		identity = (
+			core_var_identity(variable_side.get("var"))
+			if isinstance(variable_side, dict) and variable_side.get("kind") == "var"
+			else None
+		)
+		literal = literal_side.get("literal") if isinstance(literal_side, dict) else None
+		if (
+			identity in length_identities
+			and isinstance(literal, dict)
+			and literal.get("kind") == "int"
+			and literal.get("value") == "1"
+		):
+			return identity
+	return None
+
+
+def expression_returns_identity(value: object, identity: str) -> bool:
+	if not isinstance(value, dict):
+		return False
+	if value.get("kind") == "var":
+		return core_var_identity(value.get("var")) == identity
+	if value.get("kind") == "seq":
+		return expression_returns_identity(value.get("second"), identity)
+	if value.get("kind") in {"let", "borrow_let"}:
+		return expression_returns_identity(value.get("body"), identity)
+	return False
+
+
+def contains_matching_length_update(
+	value: object,
+	result_identity: str,
+	length_identity: str,
+) -> bool:
+	if isinstance(value, list):
+		return any(
+			contains_matching_length_update(item, result_identity, length_identity)
+			for item in value
+		)
+	if not isinstance(value, dict) or value.get("kind") == "lambda":
+		return False
+	if (
+		call_name(value) == "list_set_len"
+		and call_argument_identity(value, 0) == result_identity
+	):
+		args = value.get("args")
+		if isinstance(args, list) and len(args) >= 2:
+			return positive_unit_increment(args[1], {length_identity}) == length_identity
+	return any(
+		contains_matching_length_update(child, result_identity, length_identity)
+		for child in value.values()
+	)
+
+
+def contains_dce_append_growth(
+	value: object,
+	target_identity: str,
+	length_identities: set[str],
+) -> bool:
+	if isinstance(value, list):
+		return any(
+			contains_dce_append_growth(item, target_identity, length_identities)
+			for item in value
+		)
+	if not isinstance(value, dict) or value.get("kind") == "lambda":
+		return False
+
+	kind = value.get("kind")
+	if isinstance(kind, str) and kind in {"let", "borrow_let"}:
+		bound_identity = core_var_identity(value.get("name"))
+		rhs = value.get("rhs")
+		body = value.get("body")
+		nested_lengths = set(length_identities)
+		if (
+			bound_identity is not None
+			and call_name(rhs) == "list_len"
+			and call_argument_identity(rhs, 0) == target_identity
+		):
+			nested_lengths.add(bound_identity)
+		if (
+			bound_identity is not None
+			and call_name(rhs) == "list_ensure_capacity"
+			and call_argument_identity(rhs, 0) == target_identity
+			and isinstance(rhs, dict)
+		):
+			args = rhs.get("args")
+			length_identity = (
+				positive_unit_increment(args[1], nested_lengths)
+				if isinstance(args, list) and len(args) >= 2
+				else None
+			)
+			if (
+				length_identity is not None
+				and expression_returns_identity(body, bound_identity)
+				and contains_matching_length_update(body, bound_identity, length_identity)
+			):
+				return True
+		return contains_dce_append_growth(body, target_identity, nested_lengths)
+
+	return any(
+		contains_dce_append_growth(child, target_identity, length_identities)
+		for child in value.values()
+	)
+
+
+def expression_grows_variable(value: object, identity: str) -> bool:
+	if isinstance(value, dict):
+		# Before inlining, append is a single returned expression. Concat can add
+		# a dynamic number of elements, so it needs a richer growth model before
+		# it can safely use the unit-growth rule.
+		if (
+			list_operation_name(value) == "append"
+			and call_argument_identity(value, 0) == identity
+		):
+			return True
+	return contains_dce_append_growth(value, identity, set())
+
+
+def growing_accumulator_identities(value: object) -> set[str]:
+	if isinstance(value, list):
+		result: set[str] = set()
+		for item in value:
+			result.update(growing_accumulator_identities(item))
+		return result
+	if not isinstance(value, dict) or value.get("kind") == "lambda":
+		return set()
+	result: set[str] = set()
+	if value.get("kind") == "assign":
+		identity = core_var_identity(value.get("var"))
+		if identity is not None and expression_grows_variable(value.get("rhs"), identity):
+			result.add(identity)
+	for child in value.values():
+		result.update(growing_accumulator_identities(child))
+	return result
+
+
+def format_complexity(
+	dimensions: Iterable[Dimension],
+	logarithmic_labels: Iterable[str] = (),
+) -> str:
+	ordered = list(dimensions)
+	counts = Counter(dimension.identity for dimension in ordered)
+	terms: list[str] = []
+	seen: set[str] = set()
+	for dimension in ordered:
+		if dimension.identity in seen:
+			continue
+		seen.add(dimension.identity)
+		exponent = counts[dimension.identity]
+		terms.append(dimension.label if exponent == 1 else f"{dimension.label}^{exponent}")
+	terms.extend(f"log({label})" for label in logarithmic_labels)
+	return "O(" + " * ".join(terms) + ")"
+
+
+def operation_dimension_expansion(
+	cost: OperationCost,
+	active: list[TraversalBound],
+	replace_growing_accumulators: bool,
+) -> tuple[list[Dimension], list[str], bool, bool, int]:
+	dynamic_factors = [
+		(index, factor)
+		for index, factor in enumerate(cost.factors)
+		if not fixed_cost_factor(factor)
+	]
+	removed_active_indices: set[int] = set()
+	cost_dimensions: list[Dimension] = []
+	logarithmic_labels: list[str] = []
+	depends_on_outer = False
+	growth_applied = False
+	for factor_index, factor in dynamic_factors:
+		factor_dimension = expression_dimension(factor)
+		factor_identity = factor_dimension.identity
+		growth_bounds = [
+			bound
+			for bound in active
+			if factor_identity in bound.grown_accumulator_identities
+		]
+		if replace_growing_accumulators and growth_bounds:
+			growth_dimensions = [bound.dimension for bound in growth_bounds]
+			cost_dimensions.extend(growth_dimensions)
+			if factor_index in cost.log_factor_positions:
+				logarithmic_labels.append(
+					" * ".join(dimension.label for dimension in growth_dimensions)
+				)
+			growth_applied = True
+			continue
+		aggregate_parent_index = projection_parent_index(factor, active)
+		if aggregate_parent_index is not None:
+			removed_active_indices.add(aggregate_parent_index)
+			aggregate = aggregate_dimension(factor_dimension)
+			cost_dimensions.append(aggregate)
+			if factor_index in cost.log_factor_positions:
+				logarithmic_labels.append(aggregate.label)
+			continue
+		cost_dimensions.append(factor_dimension)
+		if factor_index in cost.log_factor_positions:
+			logarithmic_labels.append(factor_dimension.label)
+		depends_on_outer = depends_on_outer or any(
+			bound.binder_identity in referenced_var_identities(factor)
+			for bound in active
+			if bound.binder_identity is not None
+		)
+
+	dimensions = [
+		bound.dimension
+		for index, bound in enumerate(active)
+		if index not in removed_active_indices
+	] + cost_dimensions
+	return (
+		dimensions,
+		logarithmic_labels,
+		depends_on_outer,
+		growth_applied,
+		len(dynamic_factors),
+	)
+
+
+def analyze_value(
+	value: object,
+	function: dict[str, Any],
+	active: list[TraversalBound],
+	minimum_degree: int,
+	findings: list[Finding],
+	summaries: dict[tuple[str, object], list[FunctionCostSummary]],
+) -> None:
+	if isinstance(value, list):
+		for item in value:
+			analyze_value(item, function, active, minimum_degree, findings, summaries)
+		return
+	if not isinstance(value, dict):
+		return
+	if value.get("kind") == "lambda":
+		body = value.get("body")
+		if isinstance(body, dict):
+			lambda_function = dict(function)
+			lambda_loc = known_location(value, function)
+			lambda_function["name"] = (
+				f"{function.get('name', '<anonymous>')}::<lambda@{lambda_loc['line']}>"
+			)
+			analyze_value(body, lambda_function, [], minimum_degree, findings, summaries)
+		return
+
+	for cost in operation_costs(value, summaries, function):
+		for replace_growth in (False, True):
+			(
+				dimensions,
+				logarithmic_labels,
+				depends_on_outer,
+				growth_applied,
+				dynamic_factor_count,
+			) = operation_dimension_expansion(cost, active, replace_growth)
+			if replace_growth and not growth_applied:
+				continue
+			if not dynamic_factor_count or len(dimensions) < minimum_degree:
+				continue
+			dimension_counts = Counter(item.identity for item in dimensions)
+			if any(count > 1 for count in dimension_counts.values()):
+				relationship = "repeated-dimension"
+			elif depends_on_outer:
+				relationship = "dependent-inner"
+			else:
+				relationship = "independent-dimensions"
+			rule = "growing-accumulator-scan" if growth_applied else cost.rule
+			confidence = "monotone-growth-pattern" if growth_applied else cost.confidence
+			findings.append(
+				Finding(
+					rule=rule,
+					function=str(function.get("name", "<anonymous>")),
+					module=str(
+						function.get("module", function.get("source_module", "")) or ""
+					),
+					degree=len(dimensions),
+					complexity=format_complexity(dimensions, logarithmic_labels),
+					dimensions=[item.label for item in dimensions],
+					confidence=confidence,
+					metric="worst-case work",
+					relationship=relationship,
+					location=known_location(value, function),
+					evidence=(
+						f"{cost.operation} contributes {dynamic_factor_count} collection-size "
+						f"factor(s) inside {len(active)} input-sized traversal(s)"
+					),
+				)
+			)
+
+	parts = traversal_parts(value)
+	if parts is None:
+		for child in value.values():
+			analyze_value(child, function, active, minimum_degree, findings, summaries)
+		return
+
+	body, iterable, dimension, inputs, binder_identity = parts
+	for input_value in inputs:
+		analyze_value(input_value, function, active, minimum_degree, findings, summaries)
+
+	if iterable is None:
+		analyze_value(body, function, active, minimum_degree, findings, summaries)
+		return
+
+	aggregate_parent_index = projection_parent_index(iterable, active)
+	if aggregate_parent_index is not None:
+		dimension = aggregate_dimension(dimension)
+	bound = TraversalBound(
+		dimension=dimension,
+		kind=str(value.get("kind")),
+		location=known_location(value, function),
+		binder_identity=binder_identity,
+		depends_on_outer=aggregate_parent_index is None and any(
+			item.binder_identity
+			in referenced_var_identities(inputs if value.get("kind") == "for_range" else iterable)
+			for item in active
+			if item.binder_identity is not None
+		),
+		grown_accumulator_identities=frozenset(growing_accumulator_identities(body)),
+	)
+	if aggregate_parent_index is None:
+		nested = [*active, bound]
+	else:
+		nested = [
+			*active[:aggregate_parent_index],
+			*active[aggregate_parent_index + 1 :],
+			bound,
+		]
+	if len(nested) >= minimum_degree:
+		dimensions = [item.dimension for item in nested]
+		dimension_counts = Counter(item.identity for item in dimensions)
+		if any(count > 1 for count in dimension_counts.values()):
+			relationship = "repeated-dimension"
+		elif bound.depends_on_outer:
+			relationship = "dependent-inner"
+		else:
+			relationship = "independent-dimensions"
+		findings.append(
+			Finding(
+				rule="nested-traversal",
+				function=str(function.get("name", "<anonymous>")),
+				module=str(function.get("module", function.get("source_module", "")) or ""),
+				degree=len(nested),
+				complexity=format_complexity(dimensions),
+				dimensions=[item.label for item in dimensions],
+				confidence="structural-candidate",
+				metric="worst-case work",
+				relationship=relationship,
+				location=bound.location,
+				evidence=(
+					f"{bound.kind} over {bound.dimension.label} executes inside "
+					f"{len(active)} input-sized traversal(s)"
+				),
+			)
+		)
+	analyze_value(body, function, nested, minimum_degree, findings, summaries)
+
+
+def analyze_program(
+	program: dict[str, Any],
+	minimum_degree: int,
+	module_prefixes: list[str],
+) -> list[Finding]:
+	if program.get("kind") != "program" or not isinstance(program.get("decls"), list):
+		raise ComplexityCheckError("Core JSON root is not a program")
+	findings: list[Finding] = []
+	summaries = build_function_cost_summaries(program["decls"])
+	for declaration in program["decls"]:
+		if not isinstance(declaration, dict) or declaration.get("kind") != "function":
+			continue
+		module = str(declaration.get("module", declaration.get("source_module", "")) or "")
+		if module_prefixes and not any(module.startswith(prefix) for prefix in module_prefixes):
+			continue
+		body = declaration.get("body")
+		if body is not None:
+			analyze_value(body, declaration, [], minimum_degree, findings, summaries)
+	unique_findings: dict[tuple[object, ...], Finding] = {}
+	for finding in findings:
+		key = (
+			finding.function,
+			finding.module,
+			finding.degree,
+			finding.complexity,
+			tuple(finding.dimensions),
+			finding.metric,
+			finding.relationship,
+			finding.location.get("file"),
+			finding.location.get("line"),
+		)
+		unique_findings.setdefault(key, finding)
+	return sorted(
+		unique_findings.values(),
+		key=lambda finding: (
+			{
+				"repeated-dimension": 0,
+				"independent-dimensions": 1,
+				"dependent-inner": 2,
+			}.get(finding.relationship, 3),
+			-finding.degree,
+			finding.module,
+			finding.function,
+			str(finding.location["file"]),
+			int(finding.location["line"]),
+		),
+	)
+
+
+def parse_core_document(text: str) -> tuple[dict[str, Any], str]:
+	stage = "unknown"
+	try:
+		value = json.loads(text)
+	except json.JSONDecodeError:
+		markers = list(re.finditer(r"^===== after ([^=\n]+) =====$", text, re.MULTILINE))
+		selected_index: int | None = None
+		for index in range(len(markers) - 1, -1, -1):
+			if markers[index].group(1) == CORE_STAGE:
+				selected_index = index
+				break
+		if selected_index is None and markers:
+			selected_index = len(markers) - 1
+
+		if selected_index is None:
+			search_from = 0
+			search_until = len(text)
+		else:
+			stage = markers[selected_index].group(1)
+			search_from = markers[selected_index].end()
+			search_until = (
+				markers[selected_index + 1].start()
+				if selected_index + 1 < len(markers)
+				else len(text)
+			)
+
+		json_offset = text.find("{", search_from, search_until)
+		if json_offset < 0:
+			raise ComplexityCheckError("could not parse Core JSON: no JSON object found")
+		try:
+			value, _ = json.JSONDecoder().raw_decode(text[json_offset:])
+		except json.JSONDecodeError as error:
+			raise ComplexityCheckError(f"could not parse Core JSON: {error.msg}") from error
+	if not isinstance(value, dict):
+		raise ComplexityCheckError("Core JSON root is not an object")
+	return value, stage
+
+
+def compile_core(source: Path, compiler: Path) -> str:
+	if not source.is_file():
+		raise ComplexityCheckError(f"source file does not exist: {source}")
+	if not compiler.is_file():
+		raise ComplexityCheckError(f"compiler does not exist: {compiler}")
+	with tempfile.TemporaryDirectory(prefix="blorp-complexity-") as tempdir:
+		core_path = Path(tempdir) / "program.core"
+		command = [
+			str(compiler),
+			"compile",
+			"--no-format",
+			f"--dump-core-after={CORE_STAGE}",
+			f"--stop-after={CORE_STAGE}",
+			f"--dump-core-file={core_path}",
+			str(source),
+		]
+		result = subprocess.run(
+			command,
+			text=True,
+			stdout=subprocess.PIPE,
+			stderr=subprocess.PIPE,
+			check=False,
+		)
+		if result.returncode != 0:
+			detail = result.stderr.strip() or result.stdout.strip() or "compiler failed without output"
+			raise ComplexityCheckError(f"could not produce Core IR: {detail}")
+		if not core_path.is_file():
+			raise ComplexityCheckError("compiler succeeded without writing the requested Core dump")
+		return core_path.read_text(encoding="utf-8")
+
+
+def render_text(findings: list[Finding]) -> str:
+	if not findings:
+		return "No super-linear work candidates met the requested degree.\n"
+	lines = [f"Found {len(findings)} possible super-linear function site(s):"]
+	for finding in findings:
+		location = finding.location
+		lines.extend(
+			[
+				"",
+				f"{finding.complexity}  {finding.function}",
+				f"  {location['file']}:{location['line']}",
+				f"  {finding.evidence}",
+			]
+		)
+	return "\n".join(lines) + "\n"
+
+
+def positive_degree(value: str) -> int:
+	try:
+		degree = int(value)
+	except ValueError as error:
+		raise argparse.ArgumentTypeError("must be an integer") from error
+	if degree < 2:
+		raise argparse.ArgumentTypeError("must be at least 2")
+	return degree
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+	parser = argparse.ArgumentParser(
+		description="Find conservative super-linear work patterns in Blorp Core IR.",
+	)
+	inputs = parser.add_mutually_exclusive_group(required=True)
+	inputs.add_argument("source", nargs="?", type=Path, help="Blorp source file to compile and analyze")
+	inputs.add_argument("--core-file", type=Path, help="existing JSON or annotated Core dump")
+	parser.add_argument(
+		"--compiler",
+		type=Path,
+		default=DEFAULT_COMPILER,
+		help="compiler used for source input (default: repository bin/blorp)",
+	)
+	parser.add_argument(
+		"--minimum-degree",
+		type=positive_degree,
+		default=2,
+		help="minimum polynomial factor degree to report (default: 2)",
+	)
+	parser.add_argument(
+		"--module-prefix",
+		action="append",
+		default=[],
+		help="include only modules with this prefix; may be repeated",
+	)
+	parser.add_argument("--json", action="store_true", help="emit a machine-readable report")
+	parser.add_argument(
+		"--fail-on-findings",
+		action="store_true",
+		help="exit 1 when a matching finding is present",
+	)
+	return parser.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+	args = parse_args(argv)
+	try:
+		if args.core_file is not None:
+			text = args.core_file.read_text(encoding="utf-8")
+		else:
+			text = compile_core(args.source, args.compiler)
+		program, parsed_stage = parse_core_document(text)
+		stage = CORE_STAGE if args.core_file is None else parsed_stage
+		findings = analyze_program(program, args.minimum_degree, args.module_prefix)
+	except (ComplexityCheckError, OSError) as error:
+		print(f"complexity-check: error: {error}", file=sys.stderr)
+		return 2
+
+	if args.json:
+		print(
+			json.dumps(
+				{
+					"schema_version": 2,
+					"stage": stage,
+					"metric": "worst-case work",
+					"finding_count": len(findings),
+					"findings": [asdict(finding) for finding in findings],
+				},
+				sort_keys=True,
+			)
+		)
+	else:
+		sys.stdout.write(render_text(findings))
+	return 1 if args.fail_on_findings and findings else 0
+
+
+if __name__ == "__main__":
+	raise SystemExit(main(sys.argv[1:]))
