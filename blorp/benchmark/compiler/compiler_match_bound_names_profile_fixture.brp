@@ -1,0 +1,610 @@
+-- Deterministic workload for raw-match bound-name rewrite measurement.
+import:
+	../../src/compiler/stage_08_core_lower/flatten: prefix_module_names_with_aliases
+	../../src/compiler/stage_08_core_lower/identity: core_module_member_name
+	../../src/compiler/stage_09_core/ir:
+		CoreDecl(FunctionDecl, GlobalDecl),
+		CoreExpr(LiteralExpr, RawMatchExpr, SeqExpr, VarExpr),
+		CoreFunction,
+		CoreFunctionKind(UserFunction),
+		CoreGlobal,
+		CoreLiteral(IntLiteral),
+		CoreParam,
+		CorePattern(
+			NamePattern,
+			TuplePattern,
+			WildcardPattern,
+		),
+		CoreProgram,
+		CoreRawMatchCase,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(NamedType),
+		CoreVar,
+	../../src/compiler/stage_09_core/traverse: immediate_core_expr_children
+
+
+MATCH_BOUND_PROFILE_MODULE: String = "bench/match_bound_names"
+
+MATCH_BOUND_PROFILE_DISTINCT_TARGET_DEF_ID: Int = 990100
+
+
+record MatchBoundNamesProfileConfig {
+	iterations: Int,
+	incoming_bound_width: Int,
+	cases: Int,
+	pattern_binders: Int
+}
+
+
+record MatchBoundNamesProfileResult {
+	iterations: Int,
+	incoming_bound_width: Int,
+	cases: Int,
+	pattern_binders: Int,
+	mode_count: Int,
+	raw_match_nodes: Int,
+	raw_match_cases: Int,
+	global_target_reads: Int,
+	local_target_reads: Int,
+	distinct_local_target_reads: Int,
+	local_shadowed_reads: Int,
+	local_outer_reads: Int,
+	unexpected_global_shadow_reads: Int,
+	pattern_names_visited: Int,
+	naive_concat_elements: Int,
+	naive_unique_membership_checks: Int,
+	optimized_membership_checks: Int,
+	semantic_checksum: Int,
+	workload_valid: Bool
+}
+
+
+private record MatchBoundNamesObservation {
+	raw_match_nodes: Int,
+	raw_match_cases: Int,
+	global_target_reads: Int,
+	local_target_reads: Int,
+	distinct_local_target_reads: Int,
+	local_shadowed_reads: Int,
+	local_outer_reads: Int,
+	unexpected_global_shadow_reads: Int,
+	semantic_checksum: Int
+}
+
+
+private record MembershipProbe {
+	comparisons: Int,
+	found: Bool
+}
+
+
+private pure func positive_value(value: Int, default: Int) -> Int:
+	if value > 0:
+		value
+	else:
+		default
+
+
+private pure func normalized_config(config: MatchBoundNamesProfileConfig) -> MatchBoundNamesProfileConfig:
+	{
+		iterations = positive_value(config.iterations, 1),
+		incoming_bound_width = positive_value(config.incoming_bound_width, 1),
+		cases = positive_value(config.cases, 1),
+		pattern_binders = positive_value(config.pattern_binders, 1)
+	}
+
+
+private pure func int_type() -> CoreType:
+	NamedType("Int", [])
+
+
+private pure func profile_var(name: String, def_id: Option[Int]) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = def_id
+	}
+
+
+private pure func int_literal(value: Int) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), int_type(), SyntheticSourceLoc)
+
+
+private pure func global_decl(name: String, def_id: Int) -> CoreDecl:
+	GlobalDecl({
+		name = profile_var(name, Some(def_id)),
+		source_module = None,
+		typ = int_type(),
+		init = int_literal(def_id),
+		is_mutable = False,
+		is_const = True,
+		is_private = False,
+		def_id = def_id,
+		loc = SyntheticSourceLoc
+	})
+
+
+private pure func profile_param(name: String) -> CoreParam:
+	{
+		name = profile_var(name, None),
+		typ = int_type(),
+		loc = SyntheticSourceLoc
+	}
+
+
+private pure func profile_params(width: Int) -> List[CoreParam]:
+	var params: List[CoreParam] = []
+	var index: Int = 0
+
+	while index < width:
+		params = params.append(profile_param("outer_${index}"))
+		index += 1
+
+	params
+
+
+private pure func binder_name(case_index: Int, binder_index: Int) -> String:
+	"case_${case_index}_binder_${binder_index}"
+
+
+private pure func pattern_tail(case_index: Int, count: Int) -> List[CorePattern]:
+	var patterns: List[CorePattern] = []
+	var index: Int = 0
+
+	while index < count:
+		patterns = patterns.append(NamePattern(binder_name(case_index, index)))
+		index += 1
+
+	patterns
+
+
+private pure func binder_names(case_index: Int, count: Int) -> List[String]:
+	var names: List[String] = []
+	var index: Int = 0
+
+	while index < count:
+		names = names.append(binder_name(case_index, index))
+		index += 1
+
+	names
+
+
+private pure func duplicate_target_names(case_index: Int, binder_count: Int) -> List[String]:
+	["target", "target"].concat(binder_names(case_index, binder_count))
+
+
+private pure func case_pattern_names(case_index: Int, binder_count: Int) -> List[String]:
+	match case_index % 5:
+		0:
+			[]
+		1:
+			["shadowed"].concat(binder_names(case_index, binder_count))
+		2:
+			duplicate_target_names(case_index, binder_count)
+		3:
+			["outer_0"].concat(binder_names(case_index, binder_count))
+		_:
+			["outer_1"].concat(binder_names(case_index, binder_count))
+
+
+private pure func duplicate_target_pattern(case_index: Int, binder_count: Int) -> CorePattern:
+	TuplePattern(
+		[NamePattern("target"), NamePattern("target")]
+			.concat(pattern_tail(case_index, binder_count)),
+	)
+
+
+private pure func all_new_pattern(case_index: Int, binder_count: Int) -> CorePattern:
+	TuplePattern([NamePattern("shadowed")].concat(pattern_tail(case_index, binder_count)))
+
+
+private pure func outer_collision_pattern(case_index: Int, binder_count: Int) -> CorePattern:
+	TuplePattern([NamePattern("outer_0")].concat(pattern_tail(case_index, binder_count)))
+
+
+private pure func nested_pattern(case_index: Int, binder_count: Int) -> CorePattern:
+	TuplePattern([NamePattern("outer_1")].concat(pattern_tail(case_index, binder_count)))
+
+
+private pure func profile_pattern(case_index: Int, binder_count: Int) -> CorePattern:
+	match case_index % 5:
+		0:
+			WildcardPattern
+		1:
+			all_new_pattern(case_index, binder_count)
+		2:
+			duplicate_target_pattern(case_index, binder_count)
+		3:
+			outer_collision_pattern(case_index, binder_count)
+		_:
+			nested_pattern(case_index, binder_count)
+
+
+private pure func var_expr(name: String, def_id: Option[Int]) -> CoreExpr:
+	VarExpr(profile_var(name, def_id), int_type(), SyntheticSourceLoc)
+
+
+private pure func seq(left: CoreExpr, right: CoreExpr) -> CoreExpr:
+	SeqExpr(left, right)
+
+
+private pure func nested_raw_match_body(case_index: Int) -> CoreExpr:
+	RawMatchExpr(
+		var_expr("target", None),
+		[{
+			pattern = duplicate_target_pattern(case_index, 1),
+			body = seq(var_expr("target", None), var_expr("target", Some(MATCH_BOUND_PROFILE_DISTINCT_TARGET_DEF_ID)))
+		}],
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+
+private pure func case_body(case_index: Int) -> CoreExpr:
+	match case_index % 5:
+		0:
+			seq(var_expr("target", None), int_literal(case_index))
+		1:
+			seq(var_expr("shadowed", None), var_expr("target", None))
+		2:
+			seq(var_expr("target", None), var_expr("target", Some(MATCH_BOUND_PROFILE_DISTINCT_TARGET_DEF_ID)))
+		3:
+			seq(var_expr("outer_0", None), var_expr("target", None))
+		_:
+			nested_raw_match_body(case_index)
+
+
+private pure func profile_case(case_index: Int, binder_count: Int) -> CoreRawMatchCase:
+	{
+		pattern = profile_pattern(case_index, binder_count),
+		body = case_body(case_index)
+	}
+
+
+private pure func profile_cases(count: Int, binder_count: Int) -> List[CoreRawMatchCase]:
+	var cases: List[CoreRawMatchCase] = []
+	var index: Int = 0
+
+	while index < count:
+		cases = cases.append(profile_case(index, binder_count))
+		index += 1
+
+	cases
+
+
+private pure func profile_function(config: MatchBoundNamesProfileConfig) -> CoreFunction:
+	{
+		name = "profile_match_bound_names",
+		source_module = None,
+		type_params = [],
+		params = profile_params(config.incoming_bound_width),
+		return_type = int_type(),
+		body = Some(RawMatchExpr(
+			var_expr("target", None),
+			profile_cases(config.cases, config.pattern_binders),
+			int_type(),
+			SyntheticSourceLoc,
+		)),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 991000,
+		loc = SyntheticSourceLoc
+	}
+
+
+private pure func profile_program(config: MatchBoundNamesProfileConfig) -> CoreProgram:
+	{
+		decls = [
+			global_decl("target", 990001),
+			global_decl("shadowed", 990002),
+			global_decl("outer_0", 990003),
+			FunctionDecl(profile_function(config)),
+		],
+		foreign_includes = []
+	}
+
+
+pure func match_bound_names_profile_execute(config: MatchBoundNamesProfileConfig) -> CoreProgram:
+	normalized: MatchBoundNamesProfileConfig = normalized_config(config)
+	var result: CoreProgram = profile_program(normalized)
+	var index: Int = 0
+
+	while index < normalized.iterations:
+		match prefix_module_names_with_aliases(MATCH_BOUND_PROFILE_MODULE, profile_program(normalized)):
+			Ok(prefixed):
+				result = prefixed.program
+			Err(_):
+				result = { decls = [], foreign_includes = [] }
+
+		index += 1
+
+	result
+
+
+private pure func checksum_var(seed: Int, variable: CoreVar) -> Int:
+	seed * 131 + variable.name.length() + variable.def_id.get_or(0)
+
+
+private pure func observe_program(program: CoreProgram) -> MatchBoundNamesObservation:
+	target_name: String = core_module_member_name(MATCH_BOUND_PROFILE_MODULE, "target")
+	shadowed_name: String = core_module_member_name(MATCH_BOUND_PROFILE_MODULE, "shadowed")
+	outer_name: String = core_module_member_name(MATCH_BOUND_PROFILE_MODULE, "outer_0")
+	var observation: MatchBoundNamesObservation = {
+		raw_match_nodes = 0,
+		raw_match_cases = 0,
+		global_target_reads = 0,
+		local_target_reads = 0,
+		distinct_local_target_reads = 0,
+		local_shadowed_reads = 0,
+		local_outer_reads = 0,
+		unexpected_global_shadow_reads = 0,
+		semantic_checksum = 0
+	}
+	var pending: List[CoreExpr] = []
+
+	for decl in program.decls:
+		match decl:
+			GlobalDecl(global):
+				observation = { observation |
+					semantic_checksum = checksum_var(observation.semantic_checksum, global.name)
+				}
+			FunctionDecl(function_info):
+				match function_info.body:
+					Some(body):
+						pending = pending.append(body)
+					None:
+						void
+			_:
+				void
+
+	var index: Int = 0
+	while index < pending.length():
+		match pending.get(index):
+			Some(expr):
+				match expr:
+					RawMatchExpr(_, cases, _, _):
+						observation = { observation |
+							raw_match_nodes = observation.raw_match_nodes + 1,
+							raw_match_cases = observation.raw_match_cases + cases.length()
+						}
+					VarExpr(variable, _, _):
+						global_target: Bool = variable.name == target_name
+						local_target: Bool = variable.name == "target" and variable.def_id.is_none()
+						distinct_local_target: Bool = (
+							variable.name == "target"
+							and variable.def_id == Some(MATCH_BOUND_PROFILE_DISTINCT_TARGET_DEF_ID)
+						)
+						local_shadowed: Bool = variable.name == "shadowed"
+						local_outer: Bool = variable.name == "outer_0"
+						unexpected_global_shadow: Bool = (
+							variable.name == shadowed_name or variable.name == outer_name
+						)
+						global_target_increment: Int = if global_target:
+							1
+						else:
+							0
+						local_target_increment: Int = if local_target:
+							1
+						else:
+							0
+						distinct_local_target_increment: Int = if distinct_local_target:
+							1
+						else:
+							0
+						local_shadowed_increment: Int = if local_shadowed:
+							1
+						else:
+							0
+						local_outer_increment: Int = if local_outer:
+							1
+						else:
+							0
+						unexpected_global_shadow_increment: Int = if unexpected_global_shadow:
+							1
+						else:
+							0
+
+						observation = { observation |
+							global_target_reads = observation.global_target_reads + global_target_increment,
+							local_target_reads = observation.local_target_reads + local_target_increment,
+							distinct_local_target_reads = observation.distinct_local_target_reads
+								+ distinct_local_target_increment,
+							local_shadowed_reads = observation.local_shadowed_reads
+								+ local_shadowed_increment,
+							local_outer_reads = observation.local_outer_reads + local_outer_increment,
+							unexpected_global_shadow_reads = observation.unexpected_global_shadow_reads
+								+ unexpected_global_shadow_increment,
+							semantic_checksum = checksum_var(observation.semantic_checksum, variable)
+						}
+					_:
+						void
+
+				pending = pending.concat(immediate_core_expr_children(expr))
+			None:
+				void
+
+		index += 1
+
+	observation
+
+
+private pure func mode_count(cases: Int, mode: Int) -> Int:
+	(cases + 4 - mode) / 5
+
+
+private pure func incoming_bound_names(width: Int) -> List[String]:
+	var names: List[String] = []
+	var index: Int = 0
+
+	while index < width:
+		names = names.append("outer_${index}")
+		index += 1
+
+	names
+
+
+private pure func membership_probe(names: List[String], target: String) -> MembershipProbe:
+	var comparisons: Int = 0
+	var found: Bool = False
+
+	for name in names:
+		comparisons += 1
+		if name == target:
+			found = True
+			break
+
+	{
+		comparisons = comparisons,
+		found = found
+	}
+
+
+private pure func admit_names(bound: List[String], names: List[String]) -> List[String]:
+	var result: List[String] = bound
+
+	for name in names:
+		probe: MembershipProbe = membership_probe(result, name)
+
+		if not probe.found:
+			result = result.append(name)
+
+	result
+
+
+private pure func admission_membership_checks(
+	initial: List[String],
+	names: List[String],
+) -> Int:
+	var result: List[String] = initial
+	var comparisons: Int = 0
+
+	for name in names:
+		probe: MembershipProbe = membership_probe(result, name)
+		comparisons += probe.comparisons
+
+		if not probe.found:
+			result = result.append(name)
+
+	comparisons
+
+
+private pure func modeled_pattern_names(config: MatchBoundNamesProfileConfig) -> Int:
+	normalized: MatchBoundNamesProfileConfig = normalized_config(config)
+	var count: Int = 0
+	var index: Int = 0
+
+	while index < normalized.cases:
+		count += case_pattern_names(index, normalized.pattern_binders).length()
+
+		if index % 5 == 4:
+			count += duplicate_target_names(index, 1).length()
+
+		index += 1
+
+	count
+
+
+private pure func expected_raw_match_nodes(cases: Int) -> Int:
+	1 + mode_count(cases, 4)
+
+
+private pure func expected_raw_match_cases(cases: Int) -> Int:
+	cases + mode_count(cases, 4)
+
+
+private pure func expected_global_target_reads(cases: Int) -> Int:
+	1 + mode_count(cases, 0) + mode_count(cases, 1) + mode_count(cases, 3) + mode_count(cases, 4)
+
+
+private pure func expected_local_target_reads(cases: Int) -> Int:
+	mode_count(cases, 2) + mode_count(cases, 4)
+
+
+private pure func expected_distinct_local_target_reads(cases: Int) -> Int:
+	mode_count(cases, 2) + mode_count(cases, 4)
+
+
+private pure func modeled_naive_membership_checks(config: MatchBoundNamesProfileConfig) -> Int:
+	normalized: MatchBoundNamesProfileConfig = normalized_config(config)
+	incoming: List[String] = incoming_bound_names(normalized.incoming_bound_width)
+	var checks: Int = 0
+	var index: Int = 0
+
+	while index < normalized.cases:
+		names: List[String] = case_pattern_names(index, normalized.pattern_binders)
+		checks += admission_membership_checks([], incoming.concat(names))
+
+		if index % 5 == 4:
+			nested_bound: List[String] = admit_names(incoming, names)
+			nested_names: List[String] = duplicate_target_names(index, 1)
+			checks += admission_membership_checks([], nested_bound.concat(nested_names))
+
+		index += 1
+
+	checks
+
+
+private pure func modeled_optimized_membership_checks(config: MatchBoundNamesProfileConfig) -> Int:
+	normalized: MatchBoundNamesProfileConfig = normalized_config(config)
+	incoming: List[String] = incoming_bound_names(normalized.incoming_bound_width)
+	var checks: Int = 0
+	var index: Int = 0
+
+	while index < normalized.cases:
+		names: List[String] = case_pattern_names(index, normalized.pattern_binders)
+		checks += admission_membership_checks(incoming, names)
+
+		if index % 5 == 4:
+			nested_bound: List[String] = admit_names(incoming, names)
+			nested_names: List[String] = duplicate_target_names(index, 1)
+			checks += admission_membership_checks(nested_bound, nested_names)
+
+		index += 1
+
+	checks
+
+
+pure func match_bound_names_profile_observe(
+	config: MatchBoundNamesProfileConfig,
+	program: CoreProgram,
+) -> MatchBoundNamesProfileResult:
+	normalized: MatchBoundNamesProfileConfig = normalized_config(config)
+	observation: MatchBoundNamesObservation = observe_program(program)
+	expected_modes: Int = mode_count(normalized.cases, 0)
+	workload_valid: Bool = (
+		program.decls.length() == 4
+		and observation.raw_match_nodes == expected_raw_match_nodes(normalized.cases)
+		and observation.raw_match_cases == expected_raw_match_cases(normalized.cases)
+		and observation.global_target_reads == expected_global_target_reads(normalized.cases)
+		and observation.local_target_reads == expected_local_target_reads(normalized.cases)
+		and observation.distinct_local_target_reads == expected_distinct_local_target_reads(
+			normalized.cases,
+		)
+		and observation.local_shadowed_reads == mode_count(normalized.cases, 1)
+		and observation.local_outer_reads == mode_count(normalized.cases, 3)
+		and observation.unexpected_global_shadow_reads == 0
+		and observation.semantic_checksum != 0
+	)
+
+	{
+		iterations = normalized.iterations,
+		incoming_bound_width = normalized.incoming_bound_width,
+		cases = normalized.cases,
+		pattern_binders = normalized.pattern_binders,
+		mode_count = expected_modes,
+		raw_match_nodes = observation.raw_match_nodes,
+		raw_match_cases = observation.raw_match_cases,
+		global_target_reads = observation.global_target_reads,
+		local_target_reads = observation.local_target_reads,
+		distinct_local_target_reads = observation.distinct_local_target_reads,
+		local_shadowed_reads = observation.local_shadowed_reads,
+		local_outer_reads = observation.local_outer_reads,
+		unexpected_global_shadow_reads = observation.unexpected_global_shadow_reads,
+		pattern_names_visited = modeled_pattern_names(normalized),
+		naive_concat_elements = expected_raw_match_cases(normalized.cases) * normalized.incoming_bound_width
+			+ modeled_pattern_names(normalized),
+		naive_unique_membership_checks = modeled_naive_membership_checks(normalized),
+		optimized_membership_checks = modeled_optimized_membership_checks(normalized),
+		semantic_checksum = observation.semantic_checksum,
+		workload_valid = workload_valid
+	}
