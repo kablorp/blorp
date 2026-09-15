@@ -6,7 +6,8 @@ Accepted with an explicit evidence substitution for one proposed gate.
 `finalize_exprs` now appends each child diagnostic into its uniquely owned
 result rather than concatenating every child list into the growing prefix.
 Exact AST and diagnostic checksums match the baseline. In seven paired,
-alternating samples, clean, dense, and heavy workloads improved elapsed time;
+alternating samples after an unmeasured production-path warmup, clean, dense,
+and heavy workloads improved elapsed time;
 the clean path also removed 28.48% of measured allocations.
 
 Retired instructions were unavailable on the macOS measurement host, and the
@@ -14,8 +15,8 @@ dense and heavy fixtures improved total allocations by only 0.80% and 0.42%.
 They therefore do not literally meet the proposed "10% retired instructions
 or allocations" gate. We accept the narrower change because its direct work
 counter removes 100% of the old growing-prefix recopying (3,924,480 dense and
-44,018,688 heavy element copies), while paired elapsed medians improve 16.62%
-and 48.95%, the clean path improves both time and allocations by more than
+44,018,688 heavy element copies), while paired elapsed medians improve 17.63%
+and 48.66%, the clean path improves both time and allocations by more than
 10%, and exact output identity holds. This is a deliberate replacement of an
 unavailable/diluted proxy with the operation the issue was intended to remove,
 not an inference from timing alone.
@@ -27,7 +28,7 @@ not an inference from timing alone.
 - Common fresh compiler SHA-256:
   `efd7bff50fc7d1effe12e61ad969521ffe113406350428908b2d857b9b55073e`
 - Benchmark harness SHA-256:
-  `6f5ad169bc434a20843b075238bb0081acb53cbfa5a20b14b0a1e266cbf7e58a`
+  `4eb54d794e469ea9ae457a062054761bc1659999e4b5cf8164e4155cead7dfe7`
 - Baseline owner-source SHA-256:
   `10f159143ca761577cba53e4643a209d854782505498874b2dc8c099ee02135d`
 - Candidate owner-source SHA-256:
@@ -35,15 +36,17 @@ not an inference from timing alone.
 - Focused test SHA-256:
   `417097c1a27f73d8b8d6a91dea8a30da2a624395b141300923915ef674c8435d`
 - Baseline/candidate benchmark binary SHA-256:
-  `82e28cd056baa06c1b35e968b641873f68bef42ebeca3f22c4a8e4b029874077` /
-  `029dec4660a227a42538054ee2c708714c0f3ecb221ba7918e2a0989eb13f46e`
+  `70dd7601f4df51d75c0487b89613a5c1c8f73a90e50e71068881557e0ffeac2a` /
+  `8bf5d2e5c28ba37cab0a7d921d8804a0d8754f73b4a617f98281c71e28a0bd15`
 - Retained paired samples:
   `benchmarks/results/compiler_source_ast_finalize_diagnostics_2026-09-14.tsv`
-  (SHA-256 `1c66746b380a621570776b55e3d76b3f95b0935100830099c5392f0e4e23490b`
+  (SHA-256 `34817b874dc16fb51d1995e11b97980e5998bfdef214b9744cc78824c1a7c215`
   including its header).
-- Raw outputs: `/private/tmp/blorp-issue106-interleaved-valid/{variant}-{workload}-{N}.out`.
+- Raw outputs:
+  `/private/tmp/blorp-issue106-warm-results.VdywWI/{variant}-{workload}-{N}.out`.
 - Raw hash manifest:
-  `/private/tmp/blorp-issue106-interleaved-valid/sha256.txt`.
+  `/private/tmp/blorp-issue106-warm-results.VdywWI/sha256.txt`, SHA-256
+  `bce577c84d46a138040dbde2baa4b0425db5fba9418e1579225957e0b089acf1`.
 
 The benchmark did not exist at the baseline revision. The identical candidate
 harness was copied into an archive of the baseline source before both variants
@@ -52,20 +55,25 @@ were emitted with the common compiler and compiled with `cc -O2`.
 ## Reproduction
 
 ```bash
-base_dir=/tmp/blorp-issue106-base.ldBe2u
-cand_dir=/tmp/blorp-issue106-candidate.uY42pp
+base_dir=$(mktemp -d /tmp/blorp-issue106-base.XXXXXX)
+cand_dir=$(mktemp -d /tmp/blorp-issue106-candidate.XXXXXX)
+out=$(mktemp -d /tmp/blorp-issue106-results.XXXXXX)
 compiler=/Users/keithphilpott/CLionProjects/blorp/bin/blorp
 harness=blorp/benchmark/compiler/compiler_source_ast_finalize_diagnostics_profile.brp
 
-cp "$cand_dir/$harness" "$base_dir/$harness"
-(cd "$base_dir" && "$compiler" compile -o /tmp/blorp-issue106-validation-baseline.c "$harness")
-(cd "$cand_dir" && "$compiler" compile -o /tmp/blorp-issue106-validation-candidate.c "$harness")
-cc -O2 /tmp/blorp-issue106-validation-baseline.c \
-  -o /tmp/blorp-issue106-validation-baseline
-cc -O2 /tmp/blorp-issue106-validation-candidate.c \
-  -o /tmp/blorp-issue106-validation-candidate
+git archive 9ecb72e934c42f730fe15b5f3f05ee62a76db5f6 | tar -x -C "$base_dir"
+git archive 51f3fd8fd7a8151afd7eab644883720fbbe823de | tar -x -C "$cand_dir"
+cp "$harness" "$base_dir/$harness"
+cp "$harness" "$cand_dir/$harness"
+(cd "$base_dir" && "$compiler" compile --no-format -o "$out/baseline.c" "$harness")
+(cd "$cand_dir" && "$compiler" compile --no-format -o "$out/candidate.c" "$harness")
+cc -O2 "$out/baseline.c" -o "$out/baseline"
+cc -O2 "$out/candidate.c" -o "$out/candidate"
 
-out=/private/tmp/blorp-issue106-interleaved-valid
+printf 'workload\tsample\tvariant\telapsed_microseconds\ttotal_allocations\t' \
+  > "$out/samples.tsv"
+printf 'total_releases\tretained_objects\tast_checksum\tdiagnostic_checksum\n' \
+  >> "$out/samples.tsv"
 run_one() {
   variant=$1 workload=$2 sample=$3
   case "$workload" in
@@ -73,8 +81,15 @@ run_one() {
     dense) args=(5 1024 2 4 1) ;;
     heavy) args=(2 4096 3 8 1) ;;
   esac
-  "/tmp/blorp-issue106-validation-${variant}" "${args[@]}" \
-    > "$out/${variant}-${workload}-${sample}.out"
+  raw="$out/${variant}-${workload}-${sample}.out"
+  "$out/$variant" "${args[@]}" > "$raw"
+  line=$(cat "$raw")
+  field() { printf '%s\n' "$line" | sed -E "s/.* $1=([^ ]+).*/\\1/"; }
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$workload" "$sample" "$variant" "$(field elapsed_microseconds)" \
+    "$(field total_allocations)" "$(field total_releases)" \
+    "$(field retained_objects)" "$(field ast_checksum)" \
+    "$(field diagnostic_checksum)" >> "$out/samples.tsv"
 }
 for workload in clean dense heavy; do
   for n in 1 2 3 4 5 6 7; do
@@ -88,15 +103,17 @@ for workload in clean dense heavy; do
     done
   done
 done
+shasum -a 256 "$out"/*.out "$out"/*.c "$out/baseline" "$out/candidate" \
+  > "$out/sha256.txt"
 ```
 
 ## Results
 
 | Workload | Paired samples | Baseline median µs | Candidate median µs | Change | Baseline allocations | Candidate allocations | Change |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| clean | 7 | 3,548 | 2,505 | -29.40% | 35,950 | 25,710 | -28.48% |
-| dense | 7 | 107,431 | 89,574 | -16.62% | 792,430 | 786,080 | -0.80% |
-| heavy | 7 | 477,824 | 243,908 | -48.95% | 2,171,952 | 2,162,762 | -0.42% |
+| clean | 7 | 2,099 | 1,639 | -21.92% | 35,950 | 25,710 | -28.48% |
+| dense | 7 | 64,147 | 52,840 | -17.63% | 792,430 | 786,080 | -0.80% |
+| heavy | 7 | 284,940 | 146,275 | -48.66% | 2,171,952 | 2,162,762 | -0.42% |
 
 Every sample reported `workload_valid=True`. Allocations minus releases and
 retained objects were identical between variants: 2,055 clean, 5,127 dense,
