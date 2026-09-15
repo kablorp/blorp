@@ -14,6 +14,12 @@
 -- each target import module, exercising real import admission at the accepted
 -- graph boundary. It is effective only for a fully type-bearing graph.
 import:
+	../../src/compiler/stage_06_typecheck/graph/source_name_table:
+		register_source_name_catalog_work_counters,
+	compiler_source_name_catalog_profile_fixture:
+		CompilerSourceNameCatalogBenchmarkConfig,
+		compiler_source_name_catalog_profile_fixture,
+		compiler_source_name_catalog_workload,
 	compiler_type_header_mixed_profile_fixture:
 		CompilerMixedTypeHeaderBenchmarkConfig,
 		compiler_mixed_type_header_phase_profile_fixture,
@@ -38,10 +44,14 @@ import:
 			CompilerProfileTraitTopology,
 			CompilerProfileTypeHeaders,
 		),
+		compiler_typecheck_phase_profile_build_source_names,
 		compiler_typecheck_phase_profile_execute,
 		compiler_typecheck_phase_profile_observe,
+		compiler_typecheck_phase_profile_observe_built_source_names,
 		compiler_typecheck_phase_profile_observe_constructor_lookup_work,
+		compiler_typecheck_phase_profile_observe_source_names,
 		compiler_typecheck_phase_profile_plan,
+		compiler_typecheck_phase_profile_source_name_input,
 		compiler_typecheck_phase_profile_stage_name,
 	instrumentation: begin_function_profile_window, end_function_profile_window
 	memory: get_mem_stats, reset_mem_stats
@@ -117,11 +127,15 @@ private func run_phase_profile(args: List[String], stage: CompilerTypecheckProfi
 		.get(7)
 		.get_or("") == "memory"
 	type_bearing_percent = integer_argument(args, 8, 100)
-	selective_target_imports = args.get(9).get_or("") == "selective"
+	selective_target_imports = args
+		.get(9)
+		.get_or("") == "selective"
+
 	target_import_kind = if selective_target_imports and type_bearing_percent == 100:
 		"selective"
 	else:
 		"qualified"
+
 	config: CompilerMixedTypeHeaderBenchmarkConfig = {
 		iterations = 1,
 		module_count = positive_argument(args, 3, 8),
@@ -191,13 +205,82 @@ private func run_phase_profile(args: List[String], stage: CompilerTypecheckProfi
 					0
 
 
+private func run_source_name_catalog_profile(args: List[String]) -> Int:
+	iterations = positive_argument(args, 2, 10)
+	config: CompilerSourceNameCatalogBenchmarkConfig = {
+		module_count = integer_argument(args, 3, 32),
+		unique_names_per_module = integer_argument(args, 4, 32),
+		shared_names_per_module = integer_argument(args, 5, 8),
+		import_count = integer_argument(args, 6, 8),
+		symbols_per_import = integer_argument(args, 7, 4),
+		constructors_per_symbol = integer_argument(args, 8, 4)
+	}
+	measure_memory = args
+		.get(9)
+		.get_or("") == "memory"
+	workload = compiler_source_name_catalog_workload(config)
+	setup_started = now_microseconds()
+	fixture_result = compiler_source_name_catalog_profile_fixture(config)
+	setup_microseconds = now_microseconds() - setup_started
+
+	match fixture_result:
+		Err(errors):
+			print("source-name catalog profile fixture failed: " + errors.join("; "))
+			1
+		Ok(fixture):
+			expected_names = compiler_typecheck_phase_profile_observe_source_names(fixture)
+			input = compiler_typecheck_phase_profile_source_name_input(fixture)
+
+			if measure_memory:
+				reset_mem_stats()
+
+			started = now_microseconds()
+			begin_function_profile_window()
+
+			debug:
+				register_source_name_catalog_work_counters()
+
+			var built_names = compiler_typecheck_phase_profile_build_source_names(input)
+			var iteration: Int = 1
+
+			while iteration < iterations:
+				built_names = compiler_typecheck_phase_profile_build_source_names(input)
+				iteration += 1
+
+			end_function_profile_window()
+			window_elapsed_microseconds = now_microseconds() - started
+			actual_names = compiler_typecheck_phase_profile_observe_built_source_names(built_names)
+
+			memory_summary = if measure_memory:
+				memory = get_mem_stats()
+				" total_allocations=${memory.total_allocations} total_releases=${memory.total_releases} retained_objects=${memory.current_objects} allocated_bytes=${memory.bytes_allocated}"
+			else:
+				" memory_measurement=disabled"
+
+			workload_valid = (
+				expected_names.order_is_total
+				and actual_names.order_is_total
+				and expected_names.name_count == workload.unique_candidates
+				and actual_names.name_count == expected_names.name_count
+				and actual_names.ordered_checksum == expected_names.ordered_checksum
+			)
+
+			print(
+				"SOURCE_NAME_CATALOG_PROFILE iterations=${iterations} modules=${config.module_count} unique_names_per_module=${config.unique_names_per_module} shared_names_per_module=${config.shared_names_per_module} requested_imports=${config.import_count} effective_imports=${workload.effective_import_count} symbols_per_import=${config.symbols_per_import} constructors_per_symbol=${config.constructors_per_symbol} candidates=${workload.total_candidates} unique_candidates=${workload.unique_candidates} duplicate_candidates=${workload.duplicate_candidates} actual_names=${actual_names.name_count} ordered_checksum=${actual_names.ordered_checksum} order_is_total=${actual_names.order_is_total} workload_valid=${workload_valid} setup_microseconds=${setup_microseconds} window_elapsed_microseconds=${window_elapsed_microseconds}${memory_summary}",
+			)
+
+			if workload_valid:
+				0
+			else:
+				1
+
+
 private func print_usage() -> Int:
 	print((
-			"usage: compiler_typecheck_phase_profile indexed|importable|bound|skeleton|aliase"
-			+ "s|parameters|headers|topology|callables|implementations|accepted|bodies "
-			+ "[iterations] [modules] [shapes] [probes] [fanout] [memory] [type-bearing-"
-			+ "percent] [selective]"
-		))
+			"usage: compiler_typecheck_phase_profile source-names|indexed|importable|bound|sk"
+			+ "eleton|aliases|parameters|headers|topology|callables|implementations|accepted|bo"
+			+ "dies [iterations] [modules] [shapes] [probes] [fanout] [memory] "
+		) + "[type-bearing-percent] [selective]\nsource-names controls: [iterations] [modules] " + "[unique-names] [shared-names] [imports] [symbols] [constructors] [memory]")
 	2
 
 
@@ -206,8 +289,11 @@ func main(args: List[String]) -> Int:
 		None:
 			print_usage()
 		Some(text):
-			match profile_stage_argument(text):
-				None:
-					print_usage()
-				Some(stage):
-					run_phase_profile(args, stage)
+			if text == "source-names":
+				run_source_name_catalog_profile(args)
+			else:
+				match profile_stage_argument(text):
+					None:
+						print_usage()
+					Some(stage):
+						run_phase_profile(args, stage)

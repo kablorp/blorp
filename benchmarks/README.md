@@ -646,6 +646,8 @@ the function-profile window.
 
 ```bash
 benchmarks/compiler_typecheck_phase_profile indexed
+benchmarks/compiler_typecheck_phase_profile source-names 10 32 32 0 8 4 4 memory
+benchmarks/compiler_typecheck_phase_profile source-names 10 32 0 32 8 4 4 memory
 benchmarks/compiler_typecheck_phase_profile importable 20 8 32 64 4
 benchmarks/compiler_typecheck_phase_profile skeleton 20 8 32 64 4
 benchmarks/compiler_typecheck_phase_profile headers 20 8 32 64 4
@@ -660,6 +662,31 @@ parsed AST. Focused phase tests remain the semantic authority.
 `window_elapsed_microseconds` includes the begin/end transition so timing calls
 remain outside the function-profile window. Use the same fixture dimensions
 and iteration count for before/after comparisons.
+
+The `source-names` workload prepares and validates the complete indexed graph,
+then measures only production source-name catalog construction over the ordered
+prepared programs. Its positional controls are iterations,
+module count, unique declarations per module, declarations shared by every
+module, requested imported module count, selected symbols per import,
+constructors per selected symbol, and optional `memory`. The reported effective
+import count is bounded by the module count. The first example is duplicate-light;
+the second is duplicate-heavy at the same declaration width. The summary
+reports candidate, unique, and duplicate counts plus the exact ordered catalog
+checksum. In profile output, subtract the registration call
+from each `source_name_catalog_work_*` row. Use the collection-copy summary's
+dictionary counters to detect builder COW; allocation and native-instruction
+comparisons require matched optimized binaries because exact function profiling
+emits unoptimized C.
+
+Set the wrapper to `plain` and disable debug markers for optimized allocation
+and elapsed-time measurements:
+
+```bash
+BLORP_COMPILER_BENCHMARK_INSTRUMENTATION=plain \
+BLORP_COMPILER_BENCHMARK_DEBUG=0 \
+benchmarks/compiler_typecheck_phase_profile \
+  source-names 10 32 96 0 8 4 4 memory
+```
 
 ### Known-Type Membership Profile
 

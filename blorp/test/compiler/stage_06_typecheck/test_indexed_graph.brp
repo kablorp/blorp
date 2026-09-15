@@ -56,6 +56,9 @@ import:
 		prepared_module_scope_selective_export_names,
 		prepared_module_scopes_are_compatible,
 	../../../src/compiler/stage_06_typecheck/graph/source_name_table:
+		SourceNameTable,
+		source_name_default_module_alias,
+		source_name_id_table_index,
 		source_name_ids_equal,
 		source_name_table,
 		source_name_table_count,
@@ -139,6 +142,35 @@ private pure func first_error_message(errors: List[IndexedGraphError]) -> Option
 	errors
 		.get(0)
 		.map(indexed_graph_error_message)
+
+
+private pure func source_name_table_matches_order(
+	table: SourceNameTable,
+	expected_spellings: List[String],
+) -> Bool:
+	if source_name_table_count(table) != expected_spellings.length():
+		False
+	else:
+		var index: Int = 0
+		var matches: Bool = True
+
+		while matches and index < expected_spellings.length():
+			match expected_spellings.get(index):
+				Some(spelling):
+					match source_name_table_find_id(table, spelling):
+						Some(id):
+							matches = (
+								source_name_id_table_index(id) == index
+								and source_name_table_spelling(table, id) == Some(spelling)
+							)
+						None:
+							matches = False
+				None:
+					matches = False
+
+			index += 1
+
+		matches
 
 
 private func module_meta_sessions_require_issuing_definition_table() -> Option[Bool]:
@@ -313,6 +345,135 @@ pure func test_source_name_table_issues_stable_dense_ids() -> Bool:
 			False
 
 
+pure func test_source_name_default_module_alias_strips_source_extension() -> Bool:
+	(
+		source_name_default_module_alias("pkg/text.brp") == "text"
+		and source_name_default_module_alias("pkg/text") == "text"
+	)
+
+
+pure func test_indexed_graph_source_name_catalog_preserves_exact_traversal_order() -> Bool:
+	target_source: String =
+		|import:
+		|	pkg/dep as Dep: Event(Start, Stop) as Signal, helper as run
+		|	pkg/text
+		|
+		|record Box {value: Int}
+		|
+		|union Local:
+		|	Ready
+		|
+		|trait Named:
+		|	pure func name(value: Self) -> String
+		|
+		|foreign:
+		|	pure func native_floor(value: Float) -> Float = "floor"
+		|
+		|pure func run() -> Int:
+		|	0
+		|
+		|private pure func hidden() -> Int:
+		|	0
+		|
+		|func main(args: List[String]) -> Int:
+		|	0
+	target = fixture_module_load_candidate("src/main.brp", "app/main", target_source)
+	dependency_source: String =
+		|union Event:
+		|	Start
+		|	Stop
+		|
+		|record Box {value: Int}
+		|
+		|pure func helper() -> Int:
+		|	1
+	dependency = fixture_module_load_candidate("src/dep.brp", "pkg/dep", dependency_source)
+	text = fixture_module_load_candidate(
+		"src/text.brp",
+		"pkg/text",
+		"pure func empty() -> String:\n\t\"\"",
+	)
+
+	match (
+		indexed_graph_build(
+			target,
+			[dependency, text],
+		)
+	):
+		Ok(graph):
+			source_name_table_matches_order(
+				indexed_graph_source_name_table(graph),
+				[
+					"Dep",
+					"Signal",
+					"Start",
+					"Stop",
+					"run",
+					"text",
+					"Box",
+					"Local",
+					"Ready",
+					"Named",
+					"name",
+					"native_floor",
+					"hidden",
+					"main",
+					"Event",
+					"helper",
+					"empty",
+				],
+			)
+		Err(_):
+			False
+
+
+pure func test_indexed_graph_source_name_catalog_handles_empty_program() -> Bool:
+	target = fixture_module_load_candidate("src/empty.brp", "app/empty", "")
+
+	match indexed_graph_build(target, []):
+		Ok(graph):
+			source_name_table_matches_order(indexed_graph_source_name_table(graph), [])
+		Err(_):
+			False
+
+
+pure func test_indexed_graph_source_name_catalog_follows_module_table_order() -> Bool:
+	target = fixture_module_load_candidate("src/empty.brp", "app/empty", "")
+	alpha = fixture_module_load_candidate(
+		"src/alpha.brp",
+		"pkg/alpha",
+		"pure func alpha() -> Int:\n\t1",
+	)
+	beta = fixture_module_load_candidate(
+		"src/beta.brp",
+		"pkg/beta",
+		"pure func beta() -> Int:\n\t2",
+	)
+
+	match (
+		(
+			indexed_graph_build(
+				target,
+				[alpha, beta],
+			),
+			indexed_graph_build(
+				target,
+				[beta, alpha],
+			),
+		)
+	):
+		(Ok(alpha_first), Ok(beta_first)):
+			source_name_table_matches_order(
+				indexed_graph_source_name_table(alpha_first),
+				["alpha", "beta"],
+			) and source_name_table_matches_order(
+				indexed_graph_source_name_table(beta_first),
+				["beta", "alpha"],
+			)
+		_:
+			False
+
+
 pure func test_indexed_graph_catalogs_trait_method_source_names() -> Bool:
 	target = fixture_module_load_candidate(
 		"src/main.brp",
@@ -411,6 +572,29 @@ pure func test_indexed_graph_catalogs_every_module_local_name_kind() -> Bool:
 				source_name_table_count(table) == expected_names.length()
 				and expected_names.all(func(name): source_name_table_find_id(table, name).is_some())
 				and source_name_table_find_id(table, "value").is_none()
+			)
+		Err(_):
+			False
+
+
+pure func test_indexed_graph_source_name_catalog_excludes_implementation_bodies() -> Bool:
+	target_source: String =
+		|record Box {value: Int}
+		|
+		|implements Stringable for Box:
+		|	pure func to_string(value: Box) -> String:
+		|		impl_body_only = "box"
+		|		impl_body_only
+		|
+		|func main(args: List[String]) -> Int:
+		|	0
+	target = fixture_module_load_candidate("src/main.brp", "app/main", target_source)
+
+	match indexed_graph_build(target, []):
+		Ok(graph):
+			source_name_table_matches_order(
+				indexed_graph_source_name_table(graph),
+				["Box", "main"],
 			)
 		Err(_):
 			False
@@ -1105,6 +1289,22 @@ tests: TestSuite = {
 			test_source_name_table_issues_stable_dense_ids,
 		),
 		(
+			"source-name default alias strips source extension",
+			test_source_name_default_module_alias_strips_source_extension,
+		),
+		(
+			"source-name catalog preserves exact traversal order",
+			test_indexed_graph_source_name_catalog_preserves_exact_traversal_order,
+		),
+		(
+			"source-name catalog handles an empty program",
+			test_indexed_graph_source_name_catalog_handles_empty_program,
+		),
+		(
+			"source-name catalog follows module table order",
+			test_indexed_graph_source_name_catalog_follows_module_table_order,
+		),
+		(
 			"catalogs trait method source names",
 			test_indexed_graph_catalogs_trait_method_source_names,
 		),
@@ -1115,6 +1315,10 @@ tests: TestSuite = {
 		(
 			"catalogs every module-local name kind",
 			test_indexed_graph_catalogs_every_module_local_name_kind,
+		),
+		(
+			"source-name catalog excludes implementation bodies",
+			test_indexed_graph_source_name_catalog_excludes_implementation_bodies,
 		),
 		(
 			"owns canonical modules and definition index",

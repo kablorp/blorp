@@ -4,11 +4,6 @@
 -- repeated String keys while a compilation graph is active. Resolved products
 -- must carry DefinitionId, ModuleId, or another semantic entity ID instead.
 import:
-	../../stage_04_modules/module_table:
-		ModuleId,
-		ModuleTable,
-		module_ids_equal,
-		module_tables_are_compatible,
 	../../stage_03_parse/parsed_ast:
 		ParsedDecl(
 			BuiltinTypeParsedDecl,
@@ -25,6 +20,14 @@ import:
 			VarParsedDecl,
 		),
 		ParsedImportDecl,
+		ParsedImportSymbol,
+		ParsedProgram,
+	../../stage_04_modules/module_table:
+		ModuleId,
+		ModuleTable,
+		module_ids_equal,
+		module_tables_are_compatible,
+	instrumentation: black_box_int
 
 
 opaque type SourceNameId = Int
@@ -37,6 +40,56 @@ private record SourceNameTableRep {
 
 
 opaque type SourceNameTable = SourceNameTableRep
+
+-- Dict iteration preserves insertion order, so one dictionary is sufficient
+-- construction state. Finalization materializes the ordered key list once;
+-- retaining a list beside the dictionary while building would either allocate
+-- an aggregate wrapper or repeatedly trigger COW through borrowed fields.
+private type alias SourceNameTableBuilder = Dict[String, Int]
+
+
+-- Debug/profile builds expose deterministic construction work through the
+-- ordinary function profiler. Release builds erase these markers.
+private @debug_only pure func source_name_catalog_work_candidate_probes() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func source_name_catalog_work_unique_insertions() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func source_name_catalog_work_duplicate_probes() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func source_name_catalog_work_finalizations() -> Int:
+	black_box_int(0)
+
+
+-- Register zero-valued markers in a measured profile window. Consumers
+-- subtract this single registration call from each reported function count.
+@debug_only
+pure func register_source_name_catalog_work_counters() -> Int:
+	debug:
+		source_name_catalog_work_candidate_probes()
+		source_name_catalog_work_unique_insertions()
+		source_name_catalog_work_duplicate_probes()
+		source_name_catalog_work_finalizations()
+
+	0
+
+
+private pure func source_name_table_builder_insert(
+	builder: SourceNameTableBuilder,
+	spelling: String,
+) -> SourceNameTableBuilder:
+	debug:
+		source_name_catalog_work_unique_insertions()
+
+	-- Compute the ID before the consuming set so the builder remains uniquely
+	-- owned and Dict can update in place.
+	next_id = builder.length()
+	builder.set(spelling, next_id)
 
 
 foreign(include: "source_name_table_ffi.h"):
@@ -57,14 +110,21 @@ private record GraphSourceNameTableRep {
 opaque type GraphSourceNameTable = GraphSourceNameTableRep
 
 
+private pure func graph_source_name_table_from_source_names(
+	module_table: ModuleTable,
+	source_names: SourceNameTable,
+) -> GraphSourceNameTable:
+	into_opaque GraphSourceNameTable({
+			source_names = source_names,
+			module_table = module_table
+		})
+
+
 pure func graph_source_name_table(
 	module_table: ModuleTable,
 	candidates: List[String],
 ) -> GraphSourceNameTable:
-	into_opaque GraphSourceNameTable({
-		source_names = source_name_table(candidates),
-		module_table = module_table
-	})
+	graph_source_name_table_from_source_names(module_table, source_name_table(candidates))
 
 
 pure func graph_source_name_table_source_names(table: GraphSourceNameTable) -> SourceNameTable:
@@ -92,9 +152,9 @@ pure func graph_module_name_scope(
 	module_id: ModuleId,
 ) -> GraphModuleNameScope:
 	into_opaque GraphModuleNameScope({
-		graph_names = graph_names,
-		module_id = module_id
-	})
+			graph_names = graph_names,
+			module_id = module_id
+		})
 
 
 pure func graph_module_name_scope_graph_names(scope: GraphModuleNameScope) -> GraphSourceNameTable:
@@ -114,6 +174,7 @@ pure func graph_module_name_scope_matches_catalog(
 	module_id: ModuleId,
 ) -> Bool:
 	issued_graph_names = graph_module_name_scope_graph_names(scope)
+
 	(
 		module_ids_equal(graph_module_name_scope_module_id(scope), module_id)
 		and module_tables_are_compatible(
@@ -167,37 +228,84 @@ pure func source_name_default_module_alias(module_path: String) -> String:
 		raw_name
 
 
-private pure func source_name_candidates_for_import(
-	candidates: List[String],
-	import_decl: ParsedImportDecl,
-) -> List[String]:
-	var result = match import_decl.module_alias:
+private pure func source_name_table_builder_add(
+	builder: SourceNameTableBuilder,
+	spelling: String,
+) -> SourceNameTableBuilder:
+	debug:
+		source_name_catalog_work_candidate_probes()
+
+	if builder.contains(spelling):
+		debug:
+			source_name_catalog_work_duplicate_probes()
+
+		builder
+	else:
+		source_name_table_builder_insert(builder, spelling)
+
+
+private pure func source_name_table_builder_add_import_symbol(
+	builder: SourceNameTableBuilder,
+	symbol: ParsedImportSymbol,
+) -> SourceNameTableBuilder:
+	var result = match symbol.symbol_alias:
 		Some(alias_name):
-			candidates.append(alias_name.text)
+			source_name_table_builder_add(builder, alias_name.text)
 		None:
-			candidates
+			source_name_table_builder_add(builder, symbol.name.text)
 
-	match import_decl.symbols:
-		Some(symbols):
-			for symbol in symbols:
-				local_name = match symbol.symbol_alias:
-					Some(alias_name):
-						alias_name.text
+	for constructor in symbol.constructors:
+		result = source_name_table_builder_add(result, constructor.text)
+
+	result
+
+
+private pure func source_name_table_builder_add_import_symbols(
+	builder: SourceNameTableBuilder,
+	symbols: List[ParsedImportSymbol],
+) -> SourceNameTableBuilder:
+	match symbols.get(0):
+		None:
+			builder
+		Some(first_symbol):
+			var result = source_name_table_builder_add_import_symbol(builder, first_symbol)
+			var index: Int = 1
+
+			while index < symbols.length():
+				match symbols.get(index):
+					Some(symbol):
+						result = source_name_table_builder_add_import_symbol(result, symbol)
 					None:
-						symbol.name.text
+						void
 
-				result = result.append(local_name)
-
-				for constructor in symbol.constructors:
-					result = result.append(constructor.text)
+				index += 1
 
 			result
-		None:
-			match import_decl.module_alias:
-				Some(_):
-					result
+
+
+private pure func source_name_table_builder_add_import(
+	builder: SourceNameTableBuilder,
+	import_decl: ParsedImportDecl,
+) -> SourceNameTableBuilder:
+	match import_decl.module_alias:
+		Some(alias_name):
+			match import_decl.symbols:
+				Some(symbols):
+					source_name_table_builder_add_import_symbols(
+						source_name_table_builder_add(builder, alias_name.text),
+						symbols,
+					)
 				None:
-					result.append(source_name_default_module_alias(import_decl.module_path))
+					source_name_table_builder_add(builder, alias_name.text)
+		None:
+			match import_decl.symbols:
+				Some(symbols):
+					source_name_table_builder_add_import_symbols(builder, symbols)
+				None:
+					source_name_table_builder_add(
+						builder,
+						source_name_default_module_alias(import_decl.module_path),
+					)
 
 
 -- Catalog exactly the source-visible names admitted to migrated ModuleView
@@ -205,68 +313,115 @@ private pure func source_name_candidates_for_import(
 -- methods do not enter local-declaration visibility. Declared trait methods do:
 -- they can be called bare in their owner module, while selected imported methods
 -- are cataloged from their import declarations rather than from impl bodies.
-pure func source_name_candidates_for_decl(
-	candidates: List[String],
+private pure func source_name_table_builder_add_decl(
+	builder: SourceNameTableBuilder,
 	decl: ParsedDecl,
-) -> List[String]:
+) -> SourceNameTableBuilder:
 	match decl:
 		RecordParsedDecl(record_decl):
-			candidates.append(record_decl.name.text)
+			source_name_table_builder_add(builder, record_decl.name.text)
 		UnionParsedDecl(union_decl):
-			var result = candidates.append(union_decl.name.text)
+			var result = source_name_table_builder_add(builder, union_decl.name.text)
 
 			for variant in union_decl.variants:
-				result = result.append(variant.name.text)
+				result = source_name_table_builder_add(result, variant.name.text)
 
 			result
 		BuiltinTypeParsedDecl(type_decl):
-			candidates.append(type_decl.name.text)
+			source_name_table_builder_add(builder, type_decl.name.text)
 		TypeAliasParsedDecl(alias_decl):
-			candidates.append(alias_decl.name.text)
+			source_name_table_builder_add(builder, alias_decl.name.text)
 		FunctionParsedDecl(function_decl):
-			candidates.append(function_decl.name.text)
+			source_name_table_builder_add(builder, function_decl.name.text)
 		VarParsedDecl(var_decl):
-			candidates.append(var_decl.name.text)
+			source_name_table_builder_add(builder, var_decl.name.text)
 		TraitParsedDecl(trait_decl):
-			var result = candidates.append(trait_decl.name.text)
+			var result = source_name_table_builder_add(builder, trait_decl.name.text)
 
 			for method in trait_decl.methods:
-				result = result.append(method.name.text)
+				result = source_name_table_builder_add(result, method.name.text)
 
 			result
 		ForeignBlockParsedDecl(_, functions, _):
-			var result = candidates
+			match functions.get(0):
+				None:
+					builder
+				Some(first_function):
+					var result = source_name_table_builder_add(builder, first_function.name.text)
+					var index: Int = 1
 
-			for function_decl in functions:
-				result = result.append(function_decl.name.text)
+					while index < functions.length():
+						match functions.get(index):
+							Some(function_decl):
+								result = source_name_table_builder_add(
+									result,
+									function_decl.name.text,
+								)
+							None:
+								void
 
-			result
+						index += 1
+
+					result
 		ImportBlockParsedDecl(imports, _):
-			var result = candidates
+			match imports.get(0):
+				None:
+					builder
+				Some(first_import):
+					var result = source_name_table_builder_add_import(builder, first_import)
+					var index: Int = 1
 
-			for import_decl in imports:
-				result = source_name_candidates_for_import(result, import_decl)
+					while index < imports.length():
+						match imports.get(index):
+							Some(import_decl):
+								result = source_name_table_builder_add_import(result, import_decl)
+							None:
+								void
 
-			result
+						index += 1
+
+					result
 		PrivateParsedDecl(inner, _):
-			source_name_candidates_for_decl(candidates, inner)
+			source_name_table_builder_add_decl(builder, inner)
 		ImplParsedDecl(_) | ParsedErrorDecl(_):
-			candidates
+			builder
+
+
+private pure func source_name_table_from_builder(
+	builder: SourceNameTableBuilder,
+) -> SourceNameTable:
+	debug:
+		source_name_catalog_work_finalizations()
+
+	into_opaque SourceNameTable({
+			spellings = builder.keys(),
+			id_by_spelling = builder
+		})
 
 
 pure func source_name_table(candidates: List[String]) -> SourceNameTable:
-	var spellings: List[String] = []
-	var id_by_spelling: Dict[String, Int] = {}
+	var builder: SourceNameTableBuilder = {}
 
 	for candidate in candidates:
-		if not id_by_spelling.contains(candidate):
-			id_by_spelling = id_by_spelling.set(candidate, spellings.length())
-			spellings = spellings.append(candidate)
+		builder = source_name_table_builder_add(builder, candidate)
 
-	into_opaque SourceNameTable({
-			spellings = spellings,
-			id_by_spelling = id_by_spelling
-		})
+	source_name_table_from_builder(builder)
+
+
+-- Indexed graph construction owns the program order. Cataloging directly from
+-- that ordered input avoids retaining every candidate spelling and traversing
+-- it a second time before the graph can be published.
+pure func graph_source_name_table_for_programs(
+	module_table: ModuleTable,
+	programs: List[ParsedProgram],
+) -> GraphSourceNameTable:
+	var builder: SourceNameTableBuilder = {}
+
+	for program in programs:
+		for decl in program.decls:
+			builder = source_name_table_builder_add_decl(builder, decl)
+
+	graph_source_name_table_from_source_names(module_table, source_name_table_from_builder(builder))
 
 
 pure func source_name_table_count(table: SourceNameTable) -> Int:

@@ -1,0 +1,278 @@
+-- Source-name workload with independent declaration, duplicate, import,
+-- selected-symbol, and constructor widths. Full typechecking happens during
+-- setup; the retained phase benchmark rebuilds only the source-name catalog
+-- over the prepared programs.
+import:
+	../../src/compiler/stage_04_modules/loaded_module:
+		ModuleLoadCandidate,
+		ModuleOrigin(UserModule),
+		module_load_candidate,
+		resolved_module_identity_from_resolver,
+	compiler_typecheck_phase_profile_fixture:
+		CompilerTypecheckPhaseProfileFixture,
+		compiler_typecheck_phase_profile_fixture,
+	parsed_program_fixture: finalized_typecheck_program_fixture
+
+
+struct CompilerSourceNameCatalogBenchmarkConfig {
+	module_count: Int,
+	unique_names_per_module: Int,
+	shared_names_per_module: Int,
+	import_count: Int,
+	symbols_per_import: Int,
+	constructors_per_symbol: Int
+}
+
+
+struct CompilerSourceNameCatalogWorkload {
+	total_candidates: Int,
+	unique_candidates: Int,
+	duplicate_candidates: Int,
+	effective_import_count: Int
+}
+
+
+private pure func non_negative(value: Int) -> Int:
+	if value > 0:
+		value
+	else:
+		0
+
+
+private pure func bounded_import_count(config: CompilerSourceNameCatalogBenchmarkConfig) -> Int:
+	requested = non_negative(config.import_count)
+	modules = non_negative(config.module_count)
+
+	if requested < modules:
+		requested
+	else:
+		modules
+
+
+private pure func catalog_module_path(module_index: Int) -> String:
+	"bench/source_names_${module_index}"
+
+
+private pure func catalog_module_file(module_index: Int) -> String:
+	"/bench/source_names_${module_index}.brp"
+
+
+private pure func catalog_symbol_name(module_index: Int, symbol_index: Int) -> String:
+	"CatalogM${module_index}Symbol${symbol_index}"
+
+
+private pure func catalog_constructor_name(
+	module_index: Int,
+	symbol_index: Int,
+	constructor_index: Int,
+) -> String:
+	"CatalogM${module_index}Symbol${symbol_index}Ctor${constructor_index}"
+
+
+private pure func catalog_symbol_source(
+	module_index: Int,
+	symbol_index: Int,
+	constructor_count: Int,
+) -> String:
+	symbol_name = catalog_symbol_name(module_index, symbol_index)
+
+	if constructor_count == 0:
+		"record ${symbol_name} {value: Int}"
+	else:
+		var constructors: List[String] = []
+
+		for constructor_index in 0..constructor_count:
+			constructors = constructors.append(
+				"\t${catalog_constructor_name(module_index, symbol_index, constructor_index)}",
+			)
+
+		"union ${symbol_name}:\n${constructors.join("\n")}"
+
+
+private pure func catalog_module_source(
+	module_index: Int,
+	config: CompilerSourceNameCatalogBenchmarkConfig,
+) -> String:
+	var declarations: List[String] = []
+
+	for name_index in 0..non_negative(config.unique_names_per_module):
+		declarations = declarations.append(
+			"pure func catalog_m${module_index}_unique_${name_index}() -> Int:\n\t${name_index}",
+		)
+
+	for name_index in 0..non_negative(config.shared_names_per_module):
+		declarations = declarations.append(
+			"pure func catalog_shared_${name_index}() -> Int:\n\t${name_index}",
+		)
+
+	for symbol_index in 0..non_negative(config.symbols_per_import):
+		declarations = declarations.append(
+			catalog_symbol_source(
+				module_index,
+				symbol_index,
+				non_negative(config.constructors_per_symbol),
+			),
+		)
+
+	declarations.join("\n\n")
+
+
+private pure func catalog_import_symbol(
+	module_index: Int,
+	symbol_index: Int,
+	constructor_count: Int,
+) -> String:
+	symbol_name = catalog_symbol_name(module_index, symbol_index)
+
+	if constructor_count == 0:
+		symbol_name
+	else:
+		var constructors: List[String] = []
+
+		for constructor_index in 0..constructor_count:
+			constructors = constructors.append(
+				catalog_constructor_name(
+					module_index,
+					symbol_index,
+					constructor_index,
+				),
+			)
+
+		"${symbol_name}(${constructors.join(", ")})"
+
+
+private pure func catalog_import_line(
+	module_index: Int,
+	config: CompilerSourceNameCatalogBenchmarkConfig,
+) -> String:
+	symbol_count = non_negative(config.symbols_per_import)
+
+	if symbol_count == 0:
+		"\t${catalog_module_path(module_index)} as CatalogModule${module_index}"
+	else:
+		var symbols: List[String] = []
+
+		for symbol_index in 0..symbol_count:
+			symbols = symbols.append(
+				catalog_import_symbol(
+					module_index,
+					symbol_index,
+					non_negative(config.constructors_per_symbol),
+				),
+			)
+
+		"\t${catalog_module_path(module_index)}: ${symbols.join(", ")}"
+
+
+private pure func catalog_target_source(config: CompilerSourceNameCatalogBenchmarkConfig) -> String:
+	var imports: List[String] = []
+
+	for module_index in 0..bounded_import_count(config):
+		imports = imports.append(catalog_import_line(module_index, config))
+
+	main_source = "func main(args: List[String]) -> Int:\n\t0"
+
+	if imports.is_empty():
+		main_source
+	else:
+		"import:\n${imports.join("\n")}\n\n${main_source}"
+
+
+private pure func catalog_module_candidate(
+	module_index: Int,
+	config: CompilerSourceNameCatalogBenchmarkConfig,
+) -> ModuleLoadCandidate:
+	module_path = catalog_module_path(module_index)
+	module_load_candidate(
+		resolved_module_identity_from_resolver(module_path, UserModule),
+		finalized_typecheck_program_fixture(
+			catalog_module_file(module_index),
+			module_path,
+			catalog_module_source(module_index, config),
+		),
+	)
+
+
+private pure func source_name_catalog_config_is_valid(
+	config: CompilerSourceNameCatalogBenchmarkConfig,
+) -> Bool:
+	(
+		config.module_count >= 0
+		and config.unique_names_per_module >= 0
+		and config.shared_names_per_module >= 0
+		and config.import_count >= 0
+		and config.symbols_per_import >= 0
+		and config.constructors_per_symbol >= 0
+	)
+
+
+private pure func validated_source_name_catalog_profile_fixture(
+	config: CompilerSourceNameCatalogBenchmarkConfig,
+) -> Result[CompilerTypecheckPhaseProfileFixture, List[String]]:
+	module_count = non_negative(config.module_count)
+	var module_candidates: List[ModuleLoadCandidate] = []
+	var module_paths: List[String] = []
+
+	for module_index in 0..module_count:
+		module_candidates = module_candidates.append(catalog_module_candidate(module_index, config))
+		module_paths = module_paths.append(catalog_module_path(module_index))
+
+	target_path = "/bench/source_names_main.brp"
+	target_module = "bench/source_names_main"
+	target = module_load_candidate(
+		resolved_module_identity_from_resolver(target_module, UserModule),
+		finalized_typecheck_program_fixture(
+			target_path,
+			target_module,
+			catalog_target_source(config),
+		),
+	)
+
+	compiler_typecheck_phase_profile_fixture(target, module_candidates, module_paths)
+
+
+pure func compiler_source_name_catalog_profile_fixture(
+	config: CompilerSourceNameCatalogBenchmarkConfig,
+) -> Result[CompilerTypecheckPhaseProfileFixture, List[String]]:
+	if source_name_catalog_config_is_valid(config):
+		validated_source_name_catalog_profile_fixture(config)
+	else:
+		Err(["source-name benchmark dimensions must be non-negative"])
+
+
+pure func compiler_source_name_catalog_workload(
+	config: CompilerSourceNameCatalogBenchmarkConfig,
+) -> CompilerSourceNameCatalogWorkload:
+	module_count = non_negative(config.module_count)
+	import_count = bounded_import_count(config)
+	unique_names = non_negative(config.unique_names_per_module)
+	shared_names = non_negative(config.shared_names_per_module)
+	symbols = non_negative(config.symbols_per_import)
+	constructors = non_negative(config.constructors_per_symbol)
+	symbol_width = symbols * (constructors + 1)
+
+	import_width = if symbols == 0:
+		1
+	else:
+		symbol_width
+
+	shared_unique_names = if module_count > 0:
+		shared_names
+	else:
+		0
+
+	qualified_alias_names = if symbols == 0:
+		import_count
+	else:
+		0
+
+	total_candidates = 1 + import_count * import_width + module_count * (unique_names + shared_names + symbol_width)
+
+	unique_candidates = 1 + module_count * unique_names + shared_unique_names + module_count * symbol_width + qualified_alias_names
+
+	{
+		total_candidates = total_candidates,
+		unique_candidates = unique_candidates,
+		duplicate_candidates = total_candidates - unique_candidates,
+		effective_import_count = import_count
+	}

@@ -4,12 +4,16 @@
 -- plan then replays exactly one constructor from its immediate accepted input,
 -- making setup and measured work explicit and preventing stage/input mismatch.
 import:
-	../../src/compiler/stage_03_parse/parsed_ast: ParsedImportDecl, ParsedImportSymbol
+	../../src/compiler/stage_03_parse/parsed_ast:
+		ParsedImportDecl,
+		ParsedImportSymbol,
+		ParsedProgram,
 	../../src/compiler/stage_04_modules/loaded_module: ModuleLoadCandidate
 	../../src/compiler/stage_04_modules/module_table:
 		ModuleTable,
 		module_id_table_index,
 		module_table_canonical_path,
+		module_table_count,
 	../../src/compiler/stage_06_typecheck/decl:
 		AcceptedTypecheckGraph,
 		BodyCheckOrder(SourceBodyOrder),
@@ -69,12 +73,25 @@ import:
 		indexed_graph_error_message,
 		indexed_graph_module_table,
 		indexed_graph_modules,
+		indexed_graph_source_name_table,
 		indexed_graph_target,
+		indexed_graph_target_scope,
 		prepared_module_canonical_path,
 		prepared_module_program,
 		prepared_module_scope_canonical_path,
+		prepared_module_scope_id,
 		prepared_module_scope_module,
 		prepared_module_scope_module_table,
+	../../src/compiler/stage_06_typecheck/graph/source_name_table:
+		GraphSourceNameTable,
+		SourceNameTable,
+		graph_source_name_table_for_programs,
+		graph_source_name_table_source_names,
+		source_name_id_table_index,
+		source_name_table_count,
+		source_name_table_find_id,
+		source_name_table_id_at,
+		source_name_table_spelling,
 	../../src/compiler/stage_06_typecheck/graph/type_identity: TypeId, type_id_definition_id
 	../../src/compiler/stage_06_typecheck/headers/callable_headers:
 		CallableHeaderGraph,
@@ -249,8 +266,8 @@ import:
 		importable_module_path,
 		importable_module_signature_decls,
 	../../src/compiler/stage_06_typecheck/modules/module_view:
-		module_view_imported_names,
 		module_view_import_bindings,
+		module_view_imported_names,
 	../../src/compiler/stage_06_typecheck/state: typecheck_state_for_prepared_module_scope
 	../../src/compiler/stage_06_typecheck/type_system/accepted_semantic_catalog:
 		accepted_constructor_table_entry_count,
@@ -303,6 +320,19 @@ struct CompilerConstructorLookupWorkObservation {
 	constructor_graph_wide_projections: Int,
 	constructor_projection_skeletons_visited: Int,
 	checksum: Int
+}
+
+
+struct CompilerSourceNameCatalogObservation {
+	name_count: Int,
+	ordered_checksum: Int,
+	order_is_total: Bool
+}
+
+
+record CompilerSourceNameCatalogProfileInput {
+	module_table: ModuleTable,
+	programs: List[ParsedProgram]
 }
 
 
@@ -674,6 +704,93 @@ private pure func fingerprint_add_text(fingerprint: Int, text: String) -> Int:
 
 private pure func fingerprint_add_int(fingerprint: Int, value: Int) -> Int:
 	hash_combine(fingerprint, value)
+
+
+private pure func source_name_catalog_observation(
+	table: SourceNameTable,
+) -> CompilerSourceNameCatalogObservation:
+	name_count = source_name_table_count(table)
+	var ordered_checksum: Int = 0
+	var order_is_total: Bool = True
+	var index: Int = 0
+
+	while order_is_total and index < name_count:
+		match source_name_table_id_at(table, index):
+			Some(id):
+				match source_name_table_spelling(table, id):
+					Some(spelling):
+						match source_name_table_find_id(table, spelling):
+							Some(found_id):
+								if source_name_id_table_index(found_id) == index:
+									ordered_checksum = ordered_checksum
+										.fingerprint_add_int(index)
+										.fingerprint_add_text(spelling)
+								else:
+									order_is_total = False
+							None:
+								order_is_total = False
+					None:
+						order_is_total = False
+			None:
+				order_is_total = False
+
+		index += 1
+
+	{
+		name_count = name_count,
+		ordered_checksum = ordered_checksum,
+		order_is_total = order_is_total
+	}
+
+
+pure func compiler_typecheck_phase_profile_source_name_input(
+	fixture: CompilerTypecheckPhaseProfileFixture,
+) -> CompilerSourceNameCatalogProfileInput:
+	graph = profile_fixture_rep(fixture).indexed_graph
+	module_table = indexed_graph_module_table(graph)
+	target = indexed_graph_target(graph)
+	target_index = module_id_table_index(
+		prepared_module_scope_id(indexed_graph_target_scope(graph)),
+	)
+	dependencies = indexed_graph_modules(graph)
+	var programs: List[ParsedProgram] = []
+	var dependency_index: Int = 0
+
+	for module_index in 0..module_table_count(module_table):
+		if module_index == target_index:
+			programs = programs.append(prepared_module_program(target))
+		else:
+			match dependencies.get(dependency_index):
+				Some(module):
+					programs = programs.append(prepared_module_program(module))
+					dependency_index += 1
+				None:
+					void
+
+	{
+		module_table = module_table,
+		programs = programs
+	}
+
+
+pure func compiler_typecheck_phase_profile_build_source_names(
+	input: CompilerSourceNameCatalogProfileInput,
+) -> GraphSourceNameTable:
+	graph_source_name_table_for_programs(input.module_table, input.programs)
+
+
+pure func compiler_typecheck_phase_profile_observe_built_source_names(
+	table: GraphSourceNameTable,
+) -> CompilerSourceNameCatalogObservation:
+	source_name_catalog_observation(graph_source_name_table_source_names(table))
+
+
+pure func compiler_typecheck_phase_profile_observe_source_names(
+	fixture: CompilerTypecheckPhaseProfileFixture,
+) -> CompilerSourceNameCatalogObservation:
+	source_name_catalog_observation(
+		indexed_graph_source_name_table(profile_fixture_rep(fixture).indexed_graph),
+	)
 
 
 private pure func fingerprint_add_bool(fingerprint: Int, value: Bool) -> Int:
@@ -1147,6 +1264,7 @@ private pure func indexed_output_summary(
 ) -> CompilerTypecheckPhaseOutputSummary:
 	index = indexed_graph_definition_index(graph)
 	module_table = indexed_graph_module_table(graph)
+	source_names = source_name_catalog_observation(indexed_graph_source_name_table(graph))
 	var fingerprint = fingerprint_add_text(
 		0,
 		prepared_module_canonical_path(indexed_graph_target(graph)),
@@ -1171,8 +1289,12 @@ private pure func indexed_output_summary(
 
 	callable_count = definition_index_func_callable_id_count(index)
 	source_count = definition_index_source_definition_id_count(index)
-	fingerprint = fingerprint_add_int(fingerprint, callable_count)
-	fingerprint = fingerprint_add_int(fingerprint, source_count)
+	fingerprint = fingerprint
+		.fingerprint_add_int(callable_count)
+		.fingerprint_add_int(source_count)
+		.fingerprint_add_int(source_names.name_count)
+		.fingerprint_add_int(source_names.ordered_checksum)
+		.fingerprint_add_bool(source_names.order_is_total)
 	{
 		primary_count = indexed_graph_modules(graph).length() + 1,
 		secondary_count = callable_count + source_count,
