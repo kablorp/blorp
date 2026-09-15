@@ -1,0 +1,130 @@
+-- Isolated profile for env_symbols_named across wide, shadowed scopes.
+import:
+	compiler_env_symbols_named_profile_fixture:
+		CompilerEnvSymbolsNamedProfileConfig,
+		CompilerEnvSymbolsNamedProfileRequest,
+		CompilerEnvSymbolsNamedProfileResult,
+		compiler_env_symbols_named_profile_request,
+		compiler_env_symbols_named_profile_with_request,
+	instrumentation: begin_function_profile_window, end_function_profile_window
+	memory: get_mem_stats, reset_mem_stats
+	string: parse_int
+	system: now_microseconds
+
+
+private TIMED_SAMPLE_COUNT: Int = 5
+
+
+struct EnvSymbolsNamedTimedSample {
+	result: CompilerEnvSymbolsNamedProfileResult,
+	elapsed_microseconds: Int,
+	allocations: Int,
+	releases: Int,
+	retained_objects: Int,
+	allocator_bytes: Int
+}
+
+
+private pure func positive_argument(args: List[String], index: Int, default: Int) -> Int:
+	match args.get(index):
+		Some(text):
+			match parse_int(text):
+				Some(value):
+					if value > 0:
+						value
+					else:
+						default
+				None:
+					default
+		None:
+			default
+
+
+private pure func non_negative_argument(args: List[String], index: Int, default: Int) -> Int:
+	match args.get(index):
+		Some(text):
+			match parse_int(text):
+				Some(value):
+					if value >= 0:
+						value
+					else:
+						default
+				None:
+					default
+		None:
+			default
+
+
+private pure func sample_at_or_zero(samples: List[Int], index: Int) -> Int:
+	match samples.get(index):
+		Some(sample):
+			sample
+		None:
+			0
+
+
+private func timed_profile_sample(
+	config: CompilerEnvSymbolsNamedProfileConfig,
+	request: CompilerEnvSymbolsNamedProfileRequest,
+) -> EnvSymbolsNamedTimedSample:
+	reset_mem_stats()
+	begin_function_profile_window()
+	started = now_microseconds()
+	result = compiler_env_symbols_named_profile_with_request(config, request)
+	elapsed_microseconds = now_microseconds() - started
+	end_function_profile_window()
+	stats = get_mem_stats()
+	{
+		result = result,
+		elapsed_microseconds = elapsed_microseconds,
+		allocations = stats.total_allocations,
+		releases = stats.total_releases,
+		retained_objects = stats.current_objects,
+		allocator_bytes = stats.bytes_allocated
+	}
+
+
+func main(args: List[String]) -> Int:
+	config: CompilerEnvSymbolsNamedProfileConfig = {
+		iterations = positive_argument(args, 1, 1000),
+		scope_count = positive_argument(args, 2, 128),
+		matches_per_scope = non_negative_argument(args, 3, 2),
+		overloads_per_scope = non_negative_argument(args, 4, 1),
+		empty_scope_stride = positive_argument(args, 5, 5),
+		noise_per_scope = non_negative_argument(args, 6, 1)
+	}
+	setup_started = now_microseconds()
+	request = compiler_env_symbols_named_profile_request(config)
+	setup_microseconds = now_microseconds() - setup_started
+	var elapsed_samples: List[Int] = []
+	var result: CompilerEnvSymbolsNamedProfileResult = compiler_env_symbols_named_profile_with_request(
+		config,
+		request,
+	)
+	var allocations: Int = 0
+	var releases: Int = 0
+	var retained_objects: Int = 0
+	var allocator_bytes: Int = 0
+
+	for _ in 0..TIMED_SAMPLE_COUNT:
+		sample = timed_profile_sample(config, request)
+		result = sample.result
+		allocations = sample.allocations
+		releases = sample.releases
+		retained_objects = sample.retained_objects
+		allocator_bytes = sample.allocator_bytes
+		elapsed_samples = elapsed_samples.append(sample.elapsed_microseconds)
+
+	sorted_samples = elapsed_samples.sort()
+	minimum_microseconds = sample_at_or_zero(sorted_samples, 0)
+	median_microseconds = sample_at_or_zero(sorted_samples, TIMED_SAMPLE_COUNT / 2)
+	maximum_microseconds = sample_at_or_zero(sorted_samples, TIMED_SAMPLE_COUNT - 1)
+
+	print(
+		"ENV_SYMBOLS_NAMED_PROFILE" + " iterations=" + config.iterations.to_string() + " scope_count=" + config.scope_count.to_string() + " matches_per_scope=" + config.matches_per_scope.to_string() + " overloads_per_scope=" + config.overloads_per_scope.to_string() + " empty_scope_stride=" + config.empty_scope_stride.to_string() + " noise_per_scope=" + config.noise_per_scope.to_string() + " sample_count=" + TIMED_SAMPLE_COUNT.to_string() + " scope_visits=" + result.scope_visits.to_string() + " matches_per_query=" + result.matches_per_query.to_string() + " matching_symbols_returned=" + result.matching_symbols_returned.to_string() + " absent_symbols_returned=" + result.absent_symbols_returned.to_string() + " prefix_elements_recopied=" + result.prefix_elements_recopied.to_string() + " checksum=" + result.checksum.to_string() + " expected_checksum=" + result.expected_checksum.to_string() + " first_identity=" + result.first_identity.to_string() + " last_identity=" + result.last_identity.to_string() + " setup_microseconds=" + setup_microseconds.to_string() + " minimum_microseconds=" + minimum_microseconds.to_string() + " median_microseconds=" + median_microseconds.to_string() + " maximum_microseconds=" + maximum_microseconds.to_string() + " allocations=" + allocations.to_string() + " releases=" + releases.to_string() + " retained_objects=" + retained_objects.to_string() + " allocator_bytes=" + allocator_bytes.to_string() + " workload_valid=" + result.workload_valid.to_string(),
+	)
+
+	if result.workload_valid:
+		0
+	else:
+		1

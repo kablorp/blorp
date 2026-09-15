@@ -575,6 +575,27 @@ microseconds, allocation/release counts, live-object count, allocated bytes,
 and `workload_valid=True` only when constructor lookup and complete history
 match the fixture.
 
+### Environment symbol history profile
+
+`compiler_env_symbols_named_profile` isolates ordered symbol-history collection
+across shadowed type-environment scopes. It builds the environment outside the
+timed window, then repeatedly queries one duplicated name and one absent name.
+The result reports scope visits, matching symbols returned, modeled prefix
+elements recopied by the old concat-across-scopes shape, allocation counters,
+five elapsed samples, and an ordered identity checksum.
+
+```bash
+benchmarks/compiler_env_symbols_named_profile 1000 128 2 1 5 1
+benchmarks/compiler_env_symbols_named_profile 1000 512 2 1 5 1
+benchmarks/compiler_env_symbols_named_profile 2000 8 2 1 5 1
+```
+
+The positional controls are iterations, scope count, matching variables per
+nonempty scope, overloads per nonempty scope, empty-scope stride, and unrelated
+symbols per nonempty scope. Set
+`BLORP_ENV_SYMBOLS_NAMED_PROFILE_FUNCTIONS=1` for `--profile` function rows;
+use the default optimized executable for elapsed-time comparisons.
+
 ### Infer session reconstruction profile
 
 `compiler_infer_session_reconstruction_profile` compares the current private

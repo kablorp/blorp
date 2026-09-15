@@ -1,0 +1,344 @@
+-- Deterministic workload for env_symbols_named collection order and width.
+import:
+	../../src/compiler/stage_06_typecheck/type_system/env:
+		ENV_EMPTY,
+		Env,
+		FuncOrigin(UserDefinedFunc),
+		Purity(Pure),
+		ResourceArgPolicy(RejectResourceArgs),
+		Symbol,
+		SymbolKind(FuncSymbolKind, VarSymbolKind),
+		VarMutability(ImmutableBinding),
+		VarOrigin(LetBinding),
+		env_add_func_with_info,
+		env_add_var,
+		env_add_var_with_module_details,
+		env_push_scope,
+		env_symbols_named,
+		func_symbol,
+	../../src/compiler/stage_06_typecheck/type_system/refinement: UNREFINED_BINDING
+	../../src/compiler/stage_06_typecheck/type_system/semantic_type:
+		SemanticType(SemanticFunctionType),
+		TYPE_INT,
+		TYPE_STRING
+
+
+private TARGET_NAME: String = "env_symbol_profile_target"
+
+private ABSENT_NAME: String = "env_symbol_profile_absent"
+
+private FUNC_ID_BASE: Int = 1000000
+
+private ID_SCOPE_STRIDE: Int = 1000
+
+private CHECKSUM_MULTIPLIER: Int = 131
+
+
+struct CompilerEnvSymbolsNamedProfileConfig {
+	iterations: Int,
+	scope_count: Int,
+	matches_per_scope: Int,
+	overloads_per_scope: Int,
+	empty_scope_stride: Int,
+	noise_per_scope: Int
+}
+
+
+record CompilerEnvSymbolsNamedProfileRequest {
+	env: Env,
+	matches_per_query: Int,
+	prefix_elements_recopied_per_query: Int,
+	expected_checksum: Int,
+	first_identity: Int,
+	last_identity: Int
+}
+
+
+struct CompilerEnvSymbolsNamedProfileResult {
+	scope_visits: Int,
+	matching_symbols_returned: Int,
+	absent_symbols_returned: Int,
+	prefix_elements_recopied: Int,
+	checksum: Int,
+	expected_checksum: Int,
+	first_identity: Int,
+	last_identity: Int,
+	matches_per_query: Int,
+	workload_valid: Bool
+}
+
+
+private pure func profile_var_id(scope_index: Int, match_index: Int) -> Int:
+	scope_index * ID_SCOPE_STRIDE + match_index + 1
+
+
+private pure func profile_func_id(scope_index: Int, overload_index: Int) -> Int:
+	FUNC_ID_BASE + scope_index * ID_SCOPE_STRIDE + overload_index
+
+
+private pure func scope_is_empty(scope_index: Int, empty_scope_stride: Int) -> Bool:
+	empty_scope_stride > 0 and (scope_index + 1) % empty_scope_stride == 0
+
+
+private pure func scope_match_count(
+	config: CompilerEnvSymbolsNamedProfileConfig,
+	scope_index: Int,
+) -> Int:
+	if scope_is_empty(scope_index, config.empty_scope_stride):
+		0
+	else:
+		config.matches_per_scope + config.overloads_per_scope
+
+
+private pure func checksum_step(checksum: Int, identity: Int, position: Int) -> Int:
+	checksum * CHECKSUM_MULTIPLIER + identity * 17 + position
+
+
+private pure func expected_ordered_checksum(config: CompilerEnvSymbolsNamedProfileConfig) -> Int:
+	var checksum: Int = 0
+	var position: Int = 0
+	var scope_index: Int = config.scope_count
+
+	while scope_index > 0:
+		scope_index -= 1
+
+		if not scope_is_empty(scope_index, config.empty_scope_stride):
+			var overload_index: Int = config.overloads_per_scope
+
+			while overload_index > 0:
+				overload_index -= 1
+				checksum = checksum_step(
+					checksum,
+					profile_func_id(scope_index, overload_index),
+					position,
+				)
+				position += 1
+
+			var match_index: Int = config.matches_per_scope
+
+			while match_index > 0:
+				match_index -= 1
+				checksum = checksum_step(
+					checksum,
+					profile_var_id(scope_index, match_index),
+					position,
+				)
+				position += 1
+
+	checksum
+
+
+private pure func expected_first_identity(config: CompilerEnvSymbolsNamedProfileConfig) -> Int:
+	var first: Int = -1
+	var scope_index: Int = config.scope_count
+
+	while scope_index > 0 and first == -1:
+		scope_index -= 1
+
+		if not scope_is_empty(scope_index, config.empty_scope_stride):
+			if config.overloads_per_scope > 0:
+				first = profile_func_id(scope_index, config.overloads_per_scope - 1)
+			else if config.matches_per_scope > 0:
+				first = profile_var_id(scope_index, config.matches_per_scope - 1)
+
+	first
+
+
+private pure func expected_last_identity(config: CompilerEnvSymbolsNamedProfileConfig) -> Int:
+	var last: Int = -1
+	var scope_index: Int = 0
+
+	while scope_index < config.scope_count and last == -1:
+		if not scope_is_empty(scope_index, config.empty_scope_stride):
+			if config.matches_per_scope > 0:
+				last = profile_var_id(scope_index, 0)
+			else if config.overloads_per_scope > 0:
+				last = profile_func_id(scope_index, 0)
+
+		scope_index += 1
+
+	last
+
+
+private pure func expected_matches_per_query(config: CompilerEnvSymbolsNamedProfileConfig) -> Int:
+	var count: Int = 0
+
+	for scope_index in 0..config.scope_count:
+		count += scope_match_count(config, scope_index)
+
+	count
+
+
+private pure func expected_prefix_elements_recopied_per_query(
+	config: CompilerEnvSymbolsNamedProfileConfig,
+) -> Int:
+	var copied: Int = 0
+	var prefix_count: Int = 0
+	var scope_index: Int = config.scope_count
+
+	while scope_index > 0:
+		scope_index -= 1
+		copied += prefix_count
+		prefix_count += scope_match_count(config, scope_index)
+
+	copied
+
+
+private pure func symbol_identity(symbol: Symbol) -> Int:
+	match symbol.kind:
+		VarSymbolKind(var_symbol):
+			var_symbol.definition_id.get_or(-1)
+		FuncSymbolKind(func_symbol):
+			func_symbol.callable_id
+		_:
+			-1
+
+
+private pure func actual_ordered_checksum(symbols: List[Symbol]) -> Int:
+	var checksum: Int = 0
+	var position: Int = 0
+
+	for symbol in symbols:
+		checksum = checksum_step(checksum, symbol_identity(symbol), position)
+		position += 1
+
+	checksum
+
+
+private pure func add_scope_symbols(
+	env: Env,
+	config: CompilerEnvSymbolsNamedProfileConfig,
+	scope_index: Int,
+) -> Env:
+	if scope_is_empty(scope_index, config.empty_scope_stride):
+		env
+	else:
+		var next_env = env
+
+		for noise_index in 0..config.noise_per_scope:
+			next_env = env_add_var(
+				next_env,
+				"env_symbol_profile_noise_" + scope_index.to_string() + "_" + noise_index.to_string(),
+				TYPE_STRING,
+			)
+
+		for match_index in 0..config.matches_per_scope:
+			next_env = env_add_var_with_module_details(
+				next_env,
+				TARGET_NAME,
+				TYPE_INT,
+				None,
+				ImmutableBinding,
+				LetBinding,
+				UNREFINED_BINDING,
+				Some("scope_" + scope_index.to_string()),
+				Some(profile_var_id(scope_index, match_index)),
+			)
+
+		for overload_index in 0..config.overloads_per_scope:
+			next_env = env_add_func_with_info(
+				next_env,
+				TARGET_NAME,
+				func_symbol(
+					profile_func_id(scope_index, overload_index),
+					SemanticFunctionType(True, [TYPE_INT], TYPE_INT),
+					[],
+					[Some("value")],
+					Pure,
+					UserDefinedFunc,
+					RejectResourceArgs,
+					None,
+					[],
+					None,
+					False,
+				),
+			)
+
+		next_env
+
+
+private pure func profile_env(config: CompilerEnvSymbolsNamedProfileConfig) -> Env:
+	var env: Env = ENV_EMPTY
+
+	for scope_index in 0..config.scope_count:
+		if scope_index > 0:
+			env = env_push_scope(env)
+
+		env = add_scope_symbols(env, config, scope_index)
+
+	env
+
+
+pure func compiler_env_symbols_named_profile_request(
+	config: CompilerEnvSymbolsNamedProfileConfig,
+) -> CompilerEnvSymbolsNamedProfileRequest:
+	{
+		env = profile_env(config),
+		matches_per_query = expected_matches_per_query(config),
+		prefix_elements_recopied_per_query = expected_prefix_elements_recopied_per_query(config),
+		expected_checksum = expected_ordered_checksum(config),
+		first_identity = expected_first_identity(config),
+		last_identity = expected_last_identity(config)
+	}
+
+
+pure func compiler_env_symbols_named_profile_with_request(
+	config: CompilerEnvSymbolsNamedProfileConfig,
+	request: CompilerEnvSymbolsNamedProfileRequest,
+) -> CompilerEnvSymbolsNamedProfileResult:
+	var matching_symbols_returned: Int = 0
+	var absent_symbols_returned: Int = 0
+	var checksum: Int = 0
+	var first_identity: Int = -1
+	var last_identity: Int = -1
+	var workload_valid: Bool = config.iterations > 0
+
+	for iteration in 0..config.iterations:
+		symbols = env_symbols_named(request.env, TARGET_NAME)
+		absent_symbols = env_symbols_named(request.env, ABSENT_NAME)
+		symbol_checksum = actual_ordered_checksum(symbols)
+		matching_symbols_returned += symbols.length()
+		absent_symbols_returned += absent_symbols.length()
+		checksum += symbol_checksum
+		workload_valid = (
+			workload_valid
+			and symbols.length() == request.matches_per_query
+			and absent_symbols.length() == 0
+			and symbol_checksum == request.expected_checksum
+		)
+
+		if iteration == 0:
+			match (symbols.get(0), symbols.get(symbols.length() - 1)):
+				(Some(first), Some(last)):
+					first_identity = symbol_identity(first)
+					last_identity = symbol_identity(last)
+				_:
+					void
+
+	workload_valid = (
+		workload_valid
+		and first_identity == request.first_identity
+		and last_identity == request.last_identity
+	)
+
+	{
+		scope_visits = config.scope_count * config.iterations,
+		matching_symbols_returned = matching_symbols_returned,
+		absent_symbols_returned = absent_symbols_returned,
+		prefix_elements_recopied = request.prefix_elements_recopied_per_query * config.iterations,
+		checksum = checksum,
+		expected_checksum = request.expected_checksum * config.iterations,
+		first_identity = first_identity,
+		last_identity = last_identity,
+		matches_per_query = request.matches_per_query,
+		workload_valid = workload_valid and checksum == request.expected_checksum * config.iterations
+	}
+
+
+pure func compiler_env_symbols_named_profile(
+	config: CompilerEnvSymbolsNamedProfileConfig,
+) -> CompilerEnvSymbolsNamedProfileResult:
+	compiler_env_symbols_named_profile_with_request(
+		config,
+		compiler_env_symbols_named_profile_request(config),
+	)
