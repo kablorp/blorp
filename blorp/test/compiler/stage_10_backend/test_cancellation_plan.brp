@@ -70,6 +70,7 @@ import:
 		CancellationOwnerIdentity(BackendTemporaryCancellationOwner),
 		CancellationProtectionEvent(TrackCancellationOwner, UntrackCancellationOwner),
 		CancellationProtectionPlan,
+		CancellationProgramSummary,
 		CancellationReason(
 			BuiltinCancellationPoint,
 			ClosureCallBoundary,
@@ -167,6 +168,24 @@ pure func summary_for(
 			def_id = def_id
 		},
 	)
+
+
+pure func ordered_summary_matches(
+	program_summary: CancellationProgramSummary,
+	index: Int,
+	name: String,
+	def_id: Int,
+	reasons: List[CancellationReason],
+) -> Bool:
+	match program_summary.functions.get(index):
+		Some(function_summary):
+			(
+				function_summary.identity.name == name
+				and function_summary.identity.def_id == def_id
+				and function_summary.summary.reasons == reasons
+			)
+		None:
+			False
 
 
 pure func call_may_cancel(kind: CoreCallKind) -> Bool:
@@ -933,6 +952,104 @@ pure func recursive_call_effects_converge() -> Bool:
 	)
 
 
+pure func cancellation_propagation_preserves_graph_order_and_fixed_points() -> Bool:
+	no_edge = analyze_program_cancellation(program_with([
+		function_decl("safe", 1, VOID_EXPR),
+	]))
+	chain = analyze_program_cancellation(program_with([
+		function_decl("chain_root", 10, call_expr(UserCall("chain_middle", Some(11), []))),
+		function_decl("chain_middle", 11, call_expr(UserCall("chain_leaf", Some(12), []))),
+		function_decl("chain_leaf", 12, CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc)),
+	]))
+	fan_in = analyze_program_cancellation(program_with([
+		function_decl("fan_caller", 20, call_expr(UserCall("fan_leaf", Some(23), []))),
+		function_decl("fan_caller", 21, call_expr(UserCall("fan_leaf", Some(23), []))),
+		function_decl("fan_caller", 22, call_expr(UserCall("fan_leaf", Some(23), []))),
+		function_decl("fan_leaf", 23, CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc)),
+	]))
+	diamond = analyze_program_cancellation(program_with([
+		function_decl(
+			"diamond_root",
+			30,
+			SeqExpr(
+				call_expr(UserCall("diamond_left", Some(31), [])),
+				call_expr(UserCall("diamond_right", Some(32), [])),
+			),
+		),
+		function_decl("diamond_left", 31, call_expr(UserCall("diamond_leaf", Some(33), []))),
+		function_decl("diamond_right", 32, call_expr(UserCall("diamond_leaf", Some(33), []))),
+		function_decl("diamond_leaf", 33, CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc)),
+	]))
+	self_cycle = analyze_program_cancellation(program_with([
+		function_decl(
+			"self_cycle",
+			40,
+			SeqExpr(
+				CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc),
+				call_expr(UserCall("self_cycle", Some(40), [])),
+			),
+		),
+	]))
+	mutual_cycle = analyze_program_cancellation(program_with([
+		function_decl("cycle_a", 50, call_expr(UserCall("cycle_b", Some(51), []))),
+		function_decl(
+			"cycle_b",
+			51,
+			SeqExpr(
+				CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc),
+				call_expr(UserCall("cycle_a", Some(50), [])),
+			),
+		),
+	]))
+	disconnected = analyze_program_cancellation(program_with([
+		function_decl("isolated_before", 60, VOID_EXPR),
+		function_decl("disconnected_root", 61, call_expr(UserCall("disconnected_leaf", Some(63), []))),
+		function_decl("isolated_after", 62, VOID_EXPR),
+		function_decl("disconnected_leaf", 63, CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc)),
+	]))
+
+	(
+		ordered_summary_matches(no_edge, 0, "safe", 1, [])
+		and no_edge.functions.length() == 1
+		and ordered_summary_matches(chain, 0, "chain_root", 10, [TransitiveCallBoundary])
+		and ordered_summary_matches(chain, 1, "chain_middle", 11, [TransitiveCallBoundary])
+		and ordered_summary_matches(chain, 2, "chain_leaf", 12, [ExplicitCancellationCheckpoint])
+		and chain.functions.length() == 3
+		and ordered_summary_matches(fan_in, 0, "fan_caller", 20, [TransitiveCallBoundary])
+		and ordered_summary_matches(fan_in, 1, "fan_caller", 21, [TransitiveCallBoundary])
+		and ordered_summary_matches(fan_in, 2, "fan_caller", 22, [TransitiveCallBoundary])
+		and ordered_summary_matches(fan_in, 3, "fan_leaf", 23, [ExplicitCancellationCheckpoint])
+		and fan_in.functions.length() == 4
+		and ordered_summary_matches(diamond, 0, "diamond_root", 30, [TransitiveCallBoundary])
+		and ordered_summary_matches(diamond, 1, "diamond_left", 31, [TransitiveCallBoundary])
+		and ordered_summary_matches(diamond, 2, "diamond_right", 32, [TransitiveCallBoundary])
+		and ordered_summary_matches(diamond, 3, "diamond_leaf", 33, [ExplicitCancellationCheckpoint])
+		and diamond.functions.length() == 4
+		and ordered_summary_matches(
+			self_cycle,
+			0,
+			"self_cycle",
+			40,
+			[ExplicitCancellationCheckpoint, TransitiveCallBoundary],
+		)
+		and self_cycle.functions.length() == 1
+		and ordered_summary_matches(mutual_cycle, 0, "cycle_a", 50, [TransitiveCallBoundary])
+		and ordered_summary_matches(
+			mutual_cycle,
+			1,
+			"cycle_b",
+			51,
+			[ExplicitCancellationCheckpoint, TransitiveCallBoundary],
+		)
+		and mutual_cycle.functions.length() == 2
+		and ordered_summary_matches(disconnected, 0, "isolated_before", 60, [])
+		and ordered_summary_matches(disconnected, 1, "disconnected_root", 61, [TransitiveCallBoundary])
+		and ordered_summary_matches(disconnected, 2, "isolated_after", 62, [])
+		and ordered_summary_matches(disconnected, 3, "disconnected_leaf", 63, [ExplicitCancellationCheckpoint])
+		and disconnected.functions.length() == 4
+	)
+
+
 pure func unresolved_calls_fail_closed() -> Bool:
 	summary: CancellationSummary = summary_for(
 		program_with([function_decl("unknown", 1, call_expr(UnknownCall))]),
@@ -1197,6 +1314,10 @@ tests: TestSuite = {
 		),
 		("user-call effects propagate transitively", user_call_effects_propagate_transitively),
 		("recursive call effects converge", recursive_call_effects_converge),
+		(
+			"cancellation propagation preserves graph order and fixed points",
+			cancellation_propagation_preserves_graph_order_and_fixed_points,
+		),
 		("unresolved calls fail closed", unresolved_calls_fail_closed),
 		("dynamic global initializers are summarized", dynamic_global_initializers_are_summarized),
 		(

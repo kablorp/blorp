@@ -79,7 +79,6 @@ current-state and next-action summary.
 - [Value-layout consumer admission](compiler-performance/128-value-layout-consumer-admission.md)
 - [Implementation-method skeleton buckets](compiler-performance/129-implementation-method-skeleton-buckets.md)
 - [Perceus consumed-parameter membership](compiler-performance/130-perceus-consumed-parameter-membership.md)
-- [Cancellation propagation worklist](compiler-performance/131-cancellation-propagation-worklist.md)
 - [Source-name catalog construction](compiler-performance/132-source-name-catalog-construction.md)
 - [DCE reachability fact application](compiler-performance/133-dce-reachability-fact-application.md)
 - [Core invariant scan consolidation](compiler-performance/134-core-invariant-scan-consolidation.md)

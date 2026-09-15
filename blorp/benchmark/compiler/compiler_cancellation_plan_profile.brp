@@ -4,14 +4,16 @@
 -- cancellation-summary setup are excluded from each measured planning window.
 import:
 	../../../blorp/src/compiler/stage_09_core/ir:
-		CoreCallKind(BuiltinCall),
+		CoreCallKind(BuiltinCall, UserCall),
 		CoreConstructorMatchFallback(ConstructorMatchFallbackBody),
 		CoreDecl(FunctionDecl),
 		CoreExpr(
 			CallExpr,
+			CooperativeCheckpointExpr,
 			ConstructorMatchExpr,
 			LetExpr,
 			LiteralExpr,
+			SeqExpr,
 			TupleExpr,
 			VarExpr,
 			VoidExpr,
@@ -42,6 +44,19 @@ import:
 			UntrackCancellationOwner,
 		),
 		CancellationProtectionPlan,
+		CancellationReason(
+			BuiltinCancellationPoint,
+			ClosureCallBoundary,
+			DeferredTraitCallBoundary,
+			DetachedTaskBoundary,
+			ExplicitCancellationCheckpoint,
+			ForeignCallBoundary,
+			RuntimeBridgeBoundary,
+			StructuredCancellationBoundary,
+			TransitiveCallBoundary,
+			UnknownCallBoundary,
+			UnknownRuntimeCallBoundary,
+		),
 		analyze_program_cancellation,
 		build_current_behavior_cancellation_plan,
 		build_region_sensitive_cancellation_plan,
@@ -51,7 +66,7 @@ import:
 		resource_cleanup_identity_value,
 		runtime_cleanup_identity_value,
 	bytes: get as get_byte
-	instrumentation: begin_function_profile_window, end_function_profile_window
+	instrumentation: begin_function_profile_window, black_box_int, end_function_profile_window
 	memory: get_mem_stats, reset_mem_stats
 	string: parse_int
 	system: now_microseconds
@@ -69,6 +84,25 @@ private record CancellationPlanProfileFixture {
 	body: CoreExpr,
 	use_region_plan: Bool,
 	expected_planned_owners: Int
+}
+
+
+private enum CancellationPropagationShape:
+	NoEdgePropagation
+	ChainPropagation
+	FanInPropagation
+	RingPropagation
+
+
+private record CancellationPropagationFixture {
+	shape: CancellationPropagationShape,
+	program: CoreProgram,
+	function_count: Int,
+	call_edges: Int,
+	summary_transitions: Int,
+	enqueues: Int,
+	dequeues: Int,
+	modeled_baseline_prefix_elements_copied: Int
 }
 
 
@@ -370,6 +404,346 @@ private pure func plan_shape_valid(
 	)
 
 
+private pure func propagation_shape_name(shape: CancellationPropagationShape) -> String:
+	match shape:
+		NoEdgePropagation:
+			"no_edge"
+		ChainPropagation:
+			"chain"
+		FanInPropagation:
+			"fan_in"
+		RingPropagation:
+			"ring"
+
+
+private pure func propagation_shape(text: String) -> Option[CancellationPropagationShape]:
+	match text:
+		"no_edge":
+			Some(NoEdgePropagation)
+		"chain":
+			Some(ChainPropagation)
+		"fan_in":
+			Some(FanInPropagation)
+		"ring":
+			Some(RingPropagation)
+		_:
+			None
+
+
+private pure func propagation_function_name(index: Int) -> String:
+	"propagation_" + index.to_string()
+
+
+private pure func propagation_body(
+	callee_index: Option[Int],
+	has_local_checkpoint: Bool,
+) -> CoreExpr:
+	call: CoreExpr = match callee_index:
+		Some(index):
+			CallExpr(
+				UserCall(propagation_function_name(index), Some(1000 + index), []),
+				void_expr(),
+				[],
+				VoidType,
+				SyntheticSourceLoc,
+			)
+		None:
+			void_expr()
+
+	if has_local_checkpoint:
+		match callee_index:
+			Some(_):
+				SeqExpr(
+					CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc),
+					call,
+				)
+			None:
+				CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc)
+	else:
+		call
+
+
+private pure func propagation_function_count(
+	shape: CancellationPropagationShape,
+	requested_count: Int,
+) -> Int:
+	match shape:
+		ChainPropagation | FanInPropagation:
+			if requested_count < 3:
+				3
+			else:
+				requested_count
+		_:
+			requested_count
+
+
+private pure func propagation_fixture(
+	shape: CancellationPropagationShape,
+	requested_count: Int,
+) -> CancellationPropagationFixture:
+	function_count: Int = propagation_function_count(shape, requested_count)
+	var declarations: List[CoreDecl] = []
+	var index: Int = 0
+
+	while index < function_count:
+		var callee_index: Option[Int] = None
+		var has_local_checkpoint: Bool = False
+
+		match shape:
+			NoEdgePropagation:
+				callee_index = None
+			ChainPropagation:
+				if index + 1 < function_count:
+					callee_index = Some(index + 1)
+				else:
+					has_local_checkpoint = True
+			FanInPropagation:
+				hub_index: Int = function_count - 2
+				seed_index: Int = function_count - 1
+
+				if index < hub_index:
+					callee_index = Some(hub_index)
+				else if index == hub_index:
+					callee_index = Some(seed_index)
+				else:
+					has_local_checkpoint = True
+			RingPropagation:
+				callee_index = Some((index + 1) % function_count)
+				has_local_checkpoint = index + 1 == function_count
+
+		declarations = declarations.append(function_decl(
+			propagation_function_name(index),
+			1000 + index,
+			propagation_body(callee_index, has_local_checkpoint),
+		))
+		index += 1
+
+	call_edges: Int = match shape:
+		NoEdgePropagation:
+			0
+		ChainPropagation | FanInPropagation:
+			function_count - 1
+		RingPropagation:
+			function_count
+
+	summary_transitions: Int = call_edges
+	enqueues: Int = match shape:
+		NoEdgePropagation:
+			0
+		ChainPropagation | FanInPropagation:
+			function_count - 2
+		RingPropagation:
+			function_count
+
+	modeled_prefix: Int = match shape:
+		NoEdgePropagation:
+			0
+		ChainPropagation:
+			(function_count - 1) * (3 * function_count - 2) / 2
+		FanInPropagation:
+			width: Int = function_count - 2
+			2 * width * width + 3 * width + 2
+		RingPropagation:
+			function_count * (3 * function_count - 1) / 2
+
+	{
+		shape = shape,
+		program = {
+			decls = declarations,
+			foreign_includes = []
+		},
+		function_count = function_count,
+		call_edges = call_edges,
+		summary_transitions = summary_transitions,
+		enqueues = enqueues,
+		dequeues = function_count + enqueues,
+		modeled_baseline_prefix_elements_copied = modeled_prefix
+	}
+
+
+private pure func cancellation_reason_checksum(
+	seed: Int,
+	reason: CancellationReason,
+) -> Int:
+	match reason:
+		ExplicitCancellationCheckpoint:
+			mix(seed, 1)
+		BuiltinCancellationPoint(name):
+			checksum_text(mix(seed, 2), name)
+		TransitiveCallBoundary:
+			mix(seed, 3)
+		StructuredCancellationBoundary:
+			mix(seed, 4)
+		UnknownCallBoundary:
+			mix(seed, 5)
+		ForeignCallBoundary:
+			mix(seed, 6)
+		ClosureCallBoundary:
+			mix(seed, 7)
+		DeferredTraitCallBoundary:
+			mix(seed, 8)
+		UnknownRuntimeCallBoundary(name):
+			checksum_text(mix(seed, 9), name)
+		RuntimeBridgeBoundary:
+			mix(seed, 10)
+		DetachedTaskBoundary:
+			mix(seed, 11)
+
+
+private pure func cancellation_summary_checksum(summary: CancellationProgramSummary) -> Int:
+	var checksum: Int = 17
+
+	for function_summary in summary.functions:
+		checksum = checksum_text(checksum, function_summary.identity.name)
+		checksum = mix(checksum, function_summary.identity.def_id)
+
+		for reason in function_summary.summary.reasons:
+			checksum = cancellation_reason_checksum(checksum, reason)
+
+		checksum = mix(checksum, function_summary.summary.reasons.length())
+
+	checksum
+
+
+private pure func cancellation_global_summary_checksum(
+	summary: CancellationProgramSummary,
+) -> Int:
+	var checksum: Int = 17
+
+	for global_summary in summary.global_initializers:
+		checksum = checksum_text(checksum, global_summary.identity.name)
+		checksum = mix(checksum, global_summary.identity.def_id)
+
+		for reason in global_summary.summary.reasons:
+			checksum = cancellation_reason_checksum(checksum, reason)
+
+		checksum = mix(checksum, global_summary.summary.reasons.length())
+
+	checksum
+
+
+private pure func expected_propagation_reasons(
+	shape: CancellationPropagationShape,
+	index: Int,
+	function_count: Int,
+) -> List[CancellationReason]:
+	match shape:
+		NoEdgePropagation:
+			[]
+		RingPropagation:
+			if index + 1 == function_count:
+				[ExplicitCancellationCheckpoint, TransitiveCallBoundary]
+			else:
+				[TransitiveCallBoundary]
+		_:
+			if index + 1 == function_count:
+				[ExplicitCancellationCheckpoint]
+			else:
+				[TransitiveCallBoundary]
+
+
+private pure func propagation_summary_valid(
+	fixture: CancellationPropagationFixture,
+	summary: CancellationProgramSummary,
+) -> Bool:
+	if summary.functions.length() != fixture.function_count:
+		False
+	else:
+		var valid: Bool = True
+		var index: Int = 0
+
+		while index < fixture.function_count and valid:
+			match summary.functions.get(index):
+				Some(function_summary):
+					valid = (
+						function_summary.identity.name == propagation_function_name(index)
+						and function_summary.identity.def_id == 1000 + index
+						and function_summary.summary.reasons == expected_propagation_reasons(
+							fixture.shape,
+							index,
+							fixture.function_count,
+						)
+					)
+				None:
+					valid = False
+
+			index += 1
+
+		valid
+
+
+private pure func propagation_plan_checksum(
+	fixture: CancellationPropagationFixture,
+	summary: CancellationProgramSummary,
+) -> Int:
+	var checksum: Int = 17
+
+	for declaration in fixture.program.decls:
+		match declaration:
+			FunctionDecl(function_info):
+				match function_info.body:
+					Some(body):
+						plan = build_region_sensitive_cancellation_plan(
+							FunctionCancellationActivation({
+								name = function_info.name,
+								def_id = function_info.def_id,
+							}),
+							body,
+							summary,
+						)
+						checksum = mix(checksum, plan_checksum(plan))
+					None:
+						checksum = mix(checksum, 0)
+			_:
+				checksum = checksum
+
+	checksum
+
+
+private func measure_propagation_fixture(
+	shape: CancellationPropagationShape,
+	iterations: Int,
+	function_count: Int,
+) -> Bool:
+	fixture: CancellationPropagationFixture = propagation_fixture(shape, function_count)
+	warmup: CancellationProgramSummary = analyze_program_cancellation(fixture.program)
+	var last_summary: CancellationProgramSummary = warmup
+	var observed_function_count: Int = warmup.functions.length()
+
+	reset_mem_stats()
+	begin_function_profile_window()
+	started: Int = now_microseconds()
+
+	var iteration: Int = 0
+
+	while iteration < iterations:
+		last_summary = analyze_program_cancellation(fixture.program)
+		observed_function_count = black_box_int(last_summary.functions.length())
+		iteration += 1
+
+	elapsed_microseconds: Int = now_microseconds() - started
+	end_function_profile_window()
+	stats = get_mem_stats()
+	function_checksum: Int = cancellation_summary_checksum(last_summary)
+	global_checksum: Int = cancellation_global_summary_checksum(last_summary)
+	generated_plan_checksum: Int = propagation_plan_checksum(fixture, last_summary)
+	modeled_candidate_elements_copied: Int = if fixture.enqueues > 0:
+		fixture.function_count
+	else:
+		0
+	workload_valid: Bool = (
+		iterations > 0
+		and observed_function_count == fixture.function_count
+		and propagation_summary_valid(fixture, last_summary)
+	)
+
+	print(
+		"CANCELLATION_PROPAGATION_PROFILE" + " shape=" + propagation_shape_name(shape) + " iterations=" + iterations.to_string() + " functions=" + fixture.function_count.to_string() + " call_edges=" + fixture.call_edges.to_string() + " caller_bucket_entries=" + fixture.call_edges.to_string() + " summary_transitions=" + fixture.summary_transitions.to_string() + " enqueues=" + fixture.enqueues.to_string() + " dequeues=" + fixture.dequeues.to_string() + " modeled_baseline_prefix_elements_copied=" + fixture.modeled_baseline_prefix_elements_copied.to_string() + " modeled_candidate_elements_copied=" + modeled_candidate_elements_copied.to_string() + " function_summary_checksum=" + function_checksum.to_string() + " global_summary_checksum=" + global_checksum.to_string() + " generated_plan_checksum=" + generated_plan_checksum.to_string() + " elapsed_microseconds=" + elapsed_microseconds.to_string() + " total_allocations=" + stats.total_allocations.to_string() + " total_releases=" + stats.total_releases.to_string() + " current_objects=" + stats.current_objects.to_string() + " bytes_allocated=" + stats.bytes_allocated.to_string() + " workload_valid=" + workload_valid.to_string(),
+	)
+
+	workload_valid
+
+
 private func measure_fixture(fixture: CancellationPlanProfileFixture, iterations: Int) -> Bool:
 	program: CoreProgram = program_with_body(fixture.body)
 	summary: CancellationProgramSummary = analyze_program_cancellation(program)
@@ -420,7 +794,7 @@ private func measure_fixture(fixture: CancellationPlanProfileFixture, iterations
 	workload_valid
 
 
-func main(args: List[String]) -> Int:
+private func measure_plan_fixtures(args: List[String]) -> Int:
 	config: CancellationPlanProfileConfig = {
 		iterations = positive_argument(args, 1, 10),
 		depth = positive_argument(args, 2, 256),
@@ -473,3 +847,31 @@ func main(args: List[String]) -> Int:
 		0
 	else:
 		1
+
+
+private func print_propagation_usage() -> Int:
+	print("usage: compiler_cancellation_plan_profile propagation <no_edge|chain|fan_in|ring> [iterations] [functions]")
+	2
+
+
+func main(args: List[String]) -> Int:
+	match args.get(1):
+		Some("propagation"):
+			match args.get(2):
+				Some(shape_text):
+					match propagation_shape(shape_text):
+						Some(shape):
+							if measure_propagation_fixture(
+								shape,
+								positive_argument(args, 3, 20),
+								positive_argument(args, 4, 512),
+							):
+								0
+							else:
+								1
+						None:
+							print_propagation_usage()
+				None:
+					print_propagation_usage()
+		_:
+			measure_plan_fixtures(args)
