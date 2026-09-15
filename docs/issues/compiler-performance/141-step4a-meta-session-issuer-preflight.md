@@ -202,7 +202,7 @@ Fast feedback for this boundary is:
 bin/blorp test blorp/test/compiler/stage_06_typecheck/type_system/test_context.brp
 bin/blorp test --leak-check blorp/test/compiler/stage_06_typecheck/type_system/test_context.brp
 bin/blorp run --release --no-format \
-  blorp/test/compiler/stage_06_typecheck/type_system/meta_identity_release_probe.brp
+  blorp/test/compiler/stage_06_typecheck/type_system/fixtures/meta_identity_release_probe.brp
 scripts/compiler-check --changed
 ```
 
