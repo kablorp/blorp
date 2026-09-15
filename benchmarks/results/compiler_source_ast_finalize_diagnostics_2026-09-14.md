@@ -2,7 +2,8 @@
 
 ## Decision
 
-Accepted with an explicit evidence substitution for one proposed gate.
+Accepted. The heavy diagnostic workload reduced retired instructions by
+27.25%, directly satisfying the proposed diagnostic-heavy gate.
 `finalize_exprs` now appends each child diagnostic into its uniquely owned
 result rather than concatenating every child list into the growing prefix.
 Exact AST and diagnostic checksums match the baseline. In seven paired,
@@ -10,16 +11,12 @@ alternating samples after an unmeasured production-path warmup, clean, dense,
 and heavy workloads improved elapsed time;
 the clean path also removed 28.48% of measured allocations.
 
-Retired instructions were unavailable on the macOS measurement host, and the
-dense and heavy fixtures improved total allocations by only 0.80% and 0.42%.
-They therefore do not literally meet the proposed "10% retired instructions
-or allocations" gate. We accept the narrower change because its direct work
-counter removes 100% of the old growing-prefix recopying (3,924,480 dense and
-44,018,688 heavy element copies), while paired elapsed medians improve 17.63%
-and 48.66%, the clean path improves both time and allocations by more than
-10%, and exact output identity holds. This is a deliberate replacement of an
-unavailable/diluted proxy with the operation the issue was intended to remove,
-not an inference from timing alone.
+The dense and heavy fixtures improve total allocations by only 0.80% and
+0.42%, because diagnostic construction dominates that process-level count.
+The operation-specific model nevertheless removes 100% of the old
+growing-prefix recopying (3,924,480 dense and 44,018,688 heavy element copies),
+paired elapsed medians improve 17.63% and 48.66%, the clean path improves both
+time and allocations by more than 10%, and exact output identity holds.
 
 ## Provenance
 
@@ -42,6 +39,9 @@ not an inference from timing alone.
   `benchmarks/results/compiler_source_ast_finalize_diagnostics_2026-09-14.tsv`
   (SHA-256 `34817b874dc16fb51d1995e11b97980e5998bfdef214b9744cc78824c1a7c215`
   including its header).
+- Retained retired-instruction samples:
+  `benchmarks/results/compiler_source_ast_finalize_diagnostics_instructions_2026-09-14.tsv`,
+  SHA-256 `6c97a5586536099dfafb8c2ccd6b6959edb20b6db452b894c4c02fff2b612069`.
 - Raw outputs:
   `/private/tmp/blorp-issue106-warm-results.VdywWI/{variant}-{workload}-{N}.out`.
 - Raw hash manifest:
@@ -105,6 +105,12 @@ for workload in clean dense heavy; do
 done
 shasum -a 256 "$out"/*.out "$out"/*.c "$out/baseline" "$out/candidate" \
   > "$out/sha256.txt"
+
+# Run a second seven-pair alternating matrix for dense and heavy under the
+# macOS process counter. Parse "instructions retired" from stderr into the
+# retained instruction TSV.
+/usr/bin/time -lp "$out/baseline" 2 4096 3 8 1 >/dev/null \
+  2> "$out/baseline-heavy-1.instructions"
 ```
 
 ## Results
@@ -114,6 +120,11 @@ shasum -a 256 "$out"/*.out "$out"/*.c "$out/baseline" "$out/candidate" \
 | clean | 7 | 2,099 | 1,639 | -21.92% | 35,950 | 25,710 | -28.48% |
 | dense | 7 | 64,147 | 52,840 | -17.63% | 792,430 | 786,080 | -0.80% |
 | heavy | 7 | 284,940 | 146,275 | -48.66% | 2,171,952 | 2,162,762 | -0.42% |
+
+| Diagnostic workload | Baseline median retired instructions | Candidate median retired instructions | Change |
+| --- | ---: | ---: | ---: |
+| dense | 1,839,092,089 | 1,663,024,598 | -9.57% |
+| heavy | 8,608,494,007 | 6,262,844,707 | -27.25% |
 
 Every sample reported `workload_valid=True`. Allocations minus releases and
 retained objects were identical between variants: 2,055 clean, 5,127 dense,
