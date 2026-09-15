@@ -64,7 +64,6 @@ current-state and next-action summary.
 - [Step 2e visibility convergence](compiler-performance/94-step2e-visibility-convergence.md)
 - [Step 2e width-probe resource gate](compiler-performance/97-bound-visibility-width-probe.md)
 - [Meta-resolution cycle membership](compiler-performance/102-index-meta-resolution-cycle-membership.md)
-- [Resource-reference deduplication](compiler-performance/104-index-resource-reference-deduplication.md)
 - [Normalized semantic compilation roadmap](compiler-performance/NORMALIZED_SEMANTIC_COMPILATION_ROADMAP.md)
 - [Perceus ownership roadmap](compiler-performance/PERCEUS_OWNERSHIP_OPTIMIZATION_ROADMAP.md)
 - [Nested record allocation folding prototype](compiler-performance/NESTED_RECORD_FOLDING_PROTOTYPE_ROADMAP.md)
