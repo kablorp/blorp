@@ -506,66 +506,138 @@ private pure func semantic_binding(
 	}
 
 
-private pure func collect_pattern_bindings(
+private union PatternBindingSequence:
+	NoPatternBindings
+	PatternBindingThen(CoreSemanticMatchBinding, PatternBindingSequence)
+
+
+private pure func prepend_pattern_bindings(
+	bindings: PatternBindingSequence,
 	accessor: CoreSemanticMatchAccessor,
 	pattern: CorePattern,
-) -> List[CoreSemanticMatchBinding]:
+) -> PatternBindingSequence:
 	match pattern:
 		NamePattern(name):
-			[semantic_binding(name, accessor)]
+			PatternBindingThen(semantic_binding(name, accessor), bindings)
 		ConstructorPattern(constructor, patterns) | QualifiedConstructorPattern(_, constructor, patterns):
-			var bindings: List[CoreSemanticMatchBinding] = []
-			var index: Int = 0
+			var result: PatternBindingSequence = bindings
+			var index: Int = patterns.length()
 
-			for nested_pattern in patterns:
-				bindings = bindings.concat(
-					collect_pattern_bindings(
-						VariantFieldSemanticMatchAccessor(accessor, constructor, index),
-						nested_pattern,
-					),
-				)
-				index += 1
+			while index > 0:
+				index -= 1
 
-			bindings
+				match patterns.get(index):
+					Some(nested_pattern):
+						result = prepend_pattern_bindings(
+							result,
+							VariantFieldSemanticMatchAccessor(accessor, constructor, index),
+							nested_pattern,
+						)
+					None:
+						void
+
+			result
 		TuplePattern(patterns):
-			var bindings: List[CoreSemanticMatchBinding] = []
-			var index: Int = 0
+			var result: PatternBindingSequence = bindings
+			var index: Int = patterns.length()
 
-			for nested_pattern in patterns:
-				bindings = bindings.concat(
-					collect_pattern_bindings(
-						TupleFieldSemanticMatchAccessor(accessor, index),
-						nested_pattern,
-					),
-				)
-				index += 1
+			while index > 0:
+				index -= 1
 
-			bindings
+				match patterns.get(index):
+					Some(nested_pattern):
+						result = prepend_pattern_bindings(
+							result,
+							TupleFieldSemanticMatchAccessor(accessor, index),
+							nested_pattern,
+						)
+					None:
+						void
+
+			result
 		ListPattern(patterns, spread):
-			var bindings: List[CoreSemanticMatchBinding] = []
-			var index: Int = 0
-
-			for nested_pattern in patterns:
-				bindings = bindings.concat(
-					collect_pattern_bindings(
-						ListElementSemanticMatchAccessor(accessor, index),
-						nested_pattern,
-					),
-				)
-				index += 1
-
-			match spread:
+			var result: PatternBindingSequence = match spread:
 				Some(NamePattern(name)):
-					bindings.append(
+					PatternBindingThen(
 						semantic_binding(
 							name,
 							ListSpreadSemanticMatchAccessor(accessor, patterns.length()),
 						),
+						bindings,
 					)
 				_:
 					bindings
+
+			var index: Int = patterns.length()
+
+			while index > 0:
+				index -= 1
+
+				match patterns.get(index):
+					Some(nested_pattern):
+						result = prepend_pattern_bindings(
+							result,
+							ListElementSemanticMatchAccessor(accessor, index),
+							nested_pattern,
+						)
+					None:
+						void
+
+			result
 		WildcardPattern | LiteralPattern(_) | OrPattern(_):
-			[]
+			bindings
+
+
+private pure func pattern_binding_sequence_to_list(
+	sequence: PatternBindingSequence,
+) -> List[CoreSemanticMatchBinding]:
+	var bindings: List[CoreSemanticMatchBinding] = []
+	var remaining: PatternBindingSequence = sequence
+	var done: Bool = False
+
+	while not done:
+		match remaining:
+			NoPatternBindings:
+				done = True
+			PatternBindingThen(binding, rest):
+				bindings = bindings.append(binding)
+				remaining = rest
+
+	bindings
+
+
+private pure func collect_pattern_bindings(
+	accessor: CoreSemanticMatchAccessor,
+	pattern: CorePattern,
+) -> List[CoreSemanticMatchBinding]:
+	pattern_binding_sequence_to_list(
+		prepend_pattern_bindings(NoPatternBindings, accessor, pattern),
+	)
+
+
+private pure func prepend_constructor_pattern_bindings(
+	bindings: PatternBindingSequence,
+	base: CoreSemanticMatchAccessor,
+	constructor: String,
+	patterns: List[CorePattern],
+) -> PatternBindingSequence:
+	var result: PatternBindingSequence = bindings
+	var index: Int = patterns.length()
+
+	while index > 0:
+		index -= 1
+
+		match patterns.get(index):
+			Some(pattern):
+				result = prepend_pattern_bindings(
+					result,
+					VariantFieldSemanticMatchAccessor(base, constructor, index),
+					pattern,
+				)
+			None:
+				void
+
+	result
 
 
 private pure func constructor_pattern_bindings(
@@ -573,19 +645,14 @@ private pure func constructor_pattern_bindings(
 	constructor: String,
 	patterns: List[CorePattern],
 ) -> List[CoreSemanticMatchBinding]:
-	var bindings: List[CoreSemanticMatchBinding] = []
-	var index: Int = 0
-
-	for pattern in patterns:
-		bindings = bindings.concat(
-			collect_pattern_bindings(
-				VariantFieldSemanticMatchAccessor(base, constructor, index),
-				pattern,
-			),
-		)
-		index += 1
-
-	bindings
+	pattern_binding_sequence_to_list(
+		prepend_constructor_pattern_bindings(
+			NoPatternBindings,
+			base,
+			constructor,
+			patterns,
+		),
+	)
 
 
 private pure func semantic_accessors_equal(
@@ -1492,19 +1559,23 @@ private pure func pattern_matrix_bindings(
 	base: CoreSemanticMatchAccessor,
 	patterns: List[CorePattern],
 ) -> List[CoreSemanticMatchBinding]:
-	var bindings: List[CoreSemanticMatchBinding] = []
-	var index: Int = 0
+	var sequence: PatternBindingSequence = NoPatternBindings
+	var index: Int = patterns.length()
 
-	for pattern in patterns:
-		bindings = bindings.concat(
-			collect_pattern_bindings(
-				pattern_matrix_accessor(kind, base, index),
-				pattern,
-			),
-		)
-		index += 1
+	while index > 0:
+		index -= 1
 
-	bindings
+		match patterns.get(index):
+			Some(pattern):
+				sequence = prepend_pattern_bindings(
+					sequence,
+					pattern_matrix_accessor(kind, base, index),
+					pattern,
+				)
+			None:
+				void
+
+	pattern_binding_sequence_to_list(sequence)
 
 
 private pure func pattern_matrix_split_index(arms: List[PatternMatrixArm]) -> Option[Int]:
@@ -1615,19 +1686,14 @@ private pure func constructor_pattern_bindings_at(
 	constructor: String,
 	patterns: List[CorePattern],
 ) -> List[CoreSemanticMatchBinding]:
-	var bindings: List[CoreSemanticMatchBinding] = []
-	var index: Int = 0
-
-	for pattern in patterns:
-		bindings = bindings.concat(
-			collect_pattern_bindings(
-				VariantFieldSemanticMatchAccessor(accessor, constructor, index),
-				pattern,
-			),
-		)
-		index += 1
-
-	bindings
+	pattern_binding_sequence_to_list(
+		prepend_constructor_pattern_bindings(
+			NoPatternBindings,
+			accessor,
+			constructor,
+			patterns,
+		),
+	)
 
 
 private pure func pattern_matrix_arms_for_constructor(
@@ -2488,8 +2554,7 @@ private pure func core_name_may_occur_free(name: String, root: CoreExpr) -> Bool
 								target_shadowed = (
 									item.target_shadowed
 									or CoreTraverse
-										.core_pattern_bound_names(match_case.pattern)
-										.contains(name)
+										.core_pattern_binds_name(match_case.pattern, name)
 								),
 							})
 					_:

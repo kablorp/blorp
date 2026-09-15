@@ -6,12 +6,14 @@ import:
 		CoreFunction,
 		CoreFunctionKind(UserFunction),
 		CoreLiteral(IntLiteral),
+		CoreMatchBindingMode(MatchBorrowBindingMode, MatchOwnBindingMode),
 		CorePattern(
 			ConstructorPattern,
 			ListPattern,
 			LiteralPattern,
 			NamePattern,
 			OrPattern,
+			QualifiedConstructorPattern,
 			TuplePattern,
 			WildcardPattern,
 		),
@@ -194,6 +196,98 @@ private pure func tree_has_list_spread_binding(tree: CoreSemanticMatchTree, name
 			found
 		SemanticMatchFail:
 			False
+
+
+private pure func leaf_has_all_pattern_binding_order(tree: CoreSemanticMatchTree) -> Bool:
+	match tree:
+		SemanticMatchLeaf(bindings, _):
+			first_matches: Bool = match bindings.get(0):
+				Some(first):
+					match first.accessor:
+						VariantFieldSemanticMatchAccessor(RootSemanticMatchAccessor, "Outer", 0):
+							first.variable.name == "first" and first.mode == MatchBorrowBindingMode
+						_:
+							False
+				None:
+					False
+			second_matches: Bool = match bindings.get(4):
+				Some(second):
+					match second.accessor:
+						VariantFieldSemanticMatchAccessor(VariantFieldSemanticMatchAccessor(RootSemanticMatchAccessor, "Outer", 1), "Inner", 0):
+							second.variable.name == "second" and second.mode == MatchBorrowBindingMode
+						_:
+							False
+				None:
+					False
+			third_matches: Bool = match bindings.get(1):
+				Some(third):
+					match third.accessor:
+						TupleFieldSemanticMatchAccessor(VariantFieldSemanticMatchAccessor(RootSemanticMatchAccessor, "Outer", 2), 0):
+							third.variable.name == "third" and third.mode == MatchBorrowBindingMode
+						_:
+							False
+				None:
+					False
+			fourth_matches: Bool = match bindings.get(2):
+				Some(fourth):
+					match fourth.accessor:
+						ListElementSemanticMatchAccessor(VariantFieldSemanticMatchAccessor(RootSemanticMatchAccessor, "Outer", 3), 0):
+							fourth.variable.name == "fourth" and fourth.mode == MatchBorrowBindingMode
+						_:
+							False
+				None:
+					False
+			rest_matches: Bool = match bindings.get(3):
+				Some(rest):
+					match rest.accessor:
+						ListSpreadSemanticMatchAccessor(VariantFieldSemanticMatchAccessor(RootSemanticMatchAccessor, "Outer", 3), 1):
+							rest.variable.name == "rest" and rest.mode == MatchOwnBindingMode
+						_:
+							False
+				None:
+					False
+
+			(
+				bindings.length() == 5
+				and bindings.map(func(binding): binding.variable.name) == [
+					"first",
+					"third",
+					"fourth",
+					"rest",
+					"second",
+				]
+				and first_matches
+				and second_matches
+				and third_matches
+				and fourth_matches
+				and rest_matches
+			)
+		SemanticMatchFail:
+			False
+		SemanticConstructorMatch(_, cases, fallback):
+			var found: Bool = cases.any(func(match_case): leaf_has_all_pattern_binding_order(match_case.body))
+
+			match fallback:
+				Some(fallback_tree):
+					found or leaf_has_all_pattern_binding_order(fallback_tree)
+				None:
+					found
+		SemanticLiteralMatch(_, cases, fallback):
+			cases.any(func(match_case): leaf_has_all_pattern_binding_order(match_case.body)) or leaf_has_all_pattern_binding_order(fallback)
+		SemanticLengthMatch(_, cases, geq, fallback):
+			var found: Bool = cases.any(func(match_case): leaf_has_all_pattern_binding_order(match_case.body))
+
+			match geq:
+				Some(geq_case):
+					found = found or leaf_has_all_pattern_binding_order(geq_case.body)
+				None:
+					void
+
+			match fallback:
+				Some(fallback_tree):
+					found or leaf_has_all_pattern_binding_order(fallback_tree)
+				None:
+					found
 
 
 private pure func exact_prefix_list_pattern(length: Int) -> CorePattern:
@@ -701,6 +795,38 @@ pure func test_compiles_simple_tuple_bindings() -> Bool:
 			False
 
 
+pure func test_preserves_all_pattern_binding_order_and_modes() -> Bool:
+	result = compile_match_cases(
+		collect_match_constructor_names(empty_program()),
+		[raw_match_case(
+			ConstructorPattern("Outer", [
+				NamePattern("first"),
+				QualifiedConstructorPattern(
+					"profile",
+					"Inner",
+					[NamePattern("second")],
+				),
+				TuplePattern([
+					NamePattern("third"),
+					WildcardPattern,
+					LiteralPattern(IntLiteral(3)),
+				]),
+				ListPattern(
+					[NamePattern("fourth")],
+					Some(NamePattern("rest")),
+				),
+			]),
+			variable_expr("rest", list_int_type()),
+		)],
+	)
+
+	match result:
+		Some(tree):
+			leaf_has_all_pattern_binding_order(tree)
+		None:
+			False
+
+
 pure func test_compiles_tuple_literal_columns() -> Bool:
 	result = compile_match_cases(
 		collect_match_constructor_names(empty_program()),
@@ -1120,6 +1246,10 @@ tests: TestSuite = {
 		),
 		("compiles constructor tuple payload", test_compiles_constructor_tuple_payload),
 		("compiles simple tuple bindings", test_compiles_simple_tuple_bindings),
+		(
+			"preserves all-pattern binding order and modes",
+			test_preserves_all_pattern_binding_order_and_modes,
+		),
 		("compiles tuple literal columns", test_compiles_tuple_literal_columns),
 		("compiles tuple constructor columns", test_compiles_tuple_constructor_columns),
 		(

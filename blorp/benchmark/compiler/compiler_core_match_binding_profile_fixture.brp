@@ -1,0 +1,445 @@
+-- Deterministic production-boundary fixture for Core match-binding accumulation.
+-- Fixture construction and semantic observation stay outside the measured window.
+import:
+	../../src/compiler/stage_09_core/ir:
+		CoreExpr(LiteralExpr),
+		CoreLiteral(IntLiteral),
+		CoreMatchBindingMode(MatchBorrowBindingMode, MatchOwnBindingMode),
+		CorePattern(ConstructorPattern, ListPattern, NamePattern, TuplePattern, WildcardPattern),
+		CoreRawMatchCase,
+		CoreSemanticMatchAccessor(
+			ListElementSemanticMatchAccessor,
+			ListSpreadSemanticMatchAccessor,
+			RootSemanticMatchAccessor,
+			TupleFieldSemanticMatchAccessor,
+			VariantFieldSemanticMatchAccessor,
+		),
+		CoreSemanticMatchTree(
+			SemanticConstructorMatch,
+			SemanticLengthMatch,
+			SemanticLiteralMatch,
+			SemanticMatchFail,
+			SemanticMatchLeaf,
+		),
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(NamedType),
+		core_semantic_match_tree_to_json,
+	../../src/compiler/stage_09_core/match_lowering: compile_match_cases
+	bytes: get as get_byte
+	set as Sets
+
+
+enum CoreMatchBindingProfileShape:
+	ProfileRecursiveChildren
+	ProfileRetainedPrefixEarly
+	ProfileRetainedPrefixLate
+
+
+record CoreMatchBindingProfileConfig {
+	shape: CoreMatchBindingProfileShape,
+	iterations: Int,
+	binding_width: Int,
+	nesting_depth: Int,
+	constructor_columns: Int
+}
+
+
+record CoreMatchBindingProfileFixture {
+	config: CoreMatchBindingProfileConfig,
+	cases: List[CoreRawMatchCase],
+	input_bindings: Int,
+	modeled_recursive_concat_elements: Int,
+	modeled_arm_prefix_concat_elements: Int
+}
+
+
+record CoreMatchBindingProfileExecution {
+	tree: Option[CoreSemanticMatchTree],
+	iterations: Int
+}
+
+
+record CoreMatchBindingProfileObservation {
+	iterations: Int,
+	input_bindings: Int,
+	output_bindings: Int,
+	leaf_count: Int,
+	owned_spread_bindings: Int,
+	modeled_recursive_concat_elements: Int,
+	modeled_arm_prefix_concat_elements: Int,
+	semantic_checksum: Int,
+	semantic_json_checksum: Int,
+	semantic_json_bytes: Int,
+	workload_valid: Bool
+}
+
+
+private record CoreMatchTreeObservation {
+	output_bindings: Int,
+	leaf_count: Int,
+	owned_spread_bindings: Int,
+	semantic_checksum: Int
+}
+
+
+private pure func positive_value(value: Int, default: Int) -> Int:
+	if value > 0:
+		value
+	else:
+		default
+
+
+private pure func nonnegative_value(value: Int) -> Int:
+	if value >= 0:
+		value
+	else:
+		0
+
+
+private pure func normalized_config(
+	config: CoreMatchBindingProfileConfig,
+) -> CoreMatchBindingProfileConfig:
+	{
+		shape = config.shape,
+		iterations = positive_value(config.iterations, 1),
+		binding_width = positive_value(config.binding_width, 1),
+		nesting_depth = nonnegative_value(config.nesting_depth),
+		constructor_columns = positive_value(config.constructor_columns, 1)
+	}
+
+
+private pure func int_type() -> CoreType:
+	NamedType("Int", [])
+
+
+private pure func body() -> CoreExpr:
+	LiteralExpr(IntLiteral(112), int_type(), SyntheticSourceLoc)
+
+
+private pure func binding_name(column: Int, index: Int) -> String:
+	"binding_${column}_${index}"
+
+
+private pure func binding_patterns(column: Int, count: Int) -> List[CorePattern]:
+	var patterns: List[CorePattern] = []
+	var index: Int = 0
+
+	while index < count:
+		patterns = patterns.append(NamePattern(binding_name(column, index)))
+		index += 1
+
+	patterns
+
+
+private pure func nested_binding_pattern(width: Int, depth: Int) -> CorePattern:
+	var pattern: CorePattern = TuplePattern(binding_patterns(0, width))
+	var index: Int = 0
+
+	while index < depth:
+		pattern = TuplePattern([pattern])
+		index += 1
+
+	pattern
+
+
+private pure func recursive_pattern(width: Int, depth: Int) -> CorePattern:
+	ConstructorPattern("ProfileRoot", [nested_binding_pattern(width, depth)])
+
+
+private pure func prefix_column_pattern(column: Int, width: Int) -> CorePattern:
+	ConstructorPattern("ProfileColumn", [TuplePattern(binding_patterns(column, width))])
+
+
+private pure func prefix_pattern(
+	wide_width: Int,
+	column_count: Int,
+	wide_first: Bool,
+) -> CorePattern:
+	var patterns: List[CorePattern] = []
+	var index: Int = 0
+
+	while index < column_count:
+		wide: Bool = if wide_first:
+			index == 0
+		else:
+			index == column_count - 1
+
+		column_width: Int = if wide:
+			wide_width
+		else:
+			1
+
+		patterns = patterns.append(prefix_column_pattern(index, column_width))
+		index += 1
+
+	TuplePattern(patterns)
+
+
+private pure func recursive_concat_elements(width: Int, depth: Int) -> Int:
+	-- The innermost tuple repeatedly concatenates its growing left prefix with
+	-- one returned binding; every unary wrapper and the constructor payload
+	-- wrapper then transfers the complete child list once more.
+	width * (width + 1) / 2 + width * (depth + 1)
+
+
+private pure func prefix_input_bindings(width: Int, columns: Int) -> Int:
+	width + columns - 1
+
+
+private pure func prefix_recursive_concat_elements(width: Int, columns: Int) -> Int:
+	-- Each constructor payload has one tuple. The wide tuple contributes the
+	-- triangular term; each one-binding tuple and each constructor wrapper
+	-- transfers its payload once.
+	width * (width + 1) / 2 + width + (columns - 1) * 2
+
+
+private pure func arm_prefix_concat_elements(
+	wide_width: Int,
+	columns: Int,
+	wide_first: Bool,
+) -> Int:
+	var transferred: Int = 0
+	var prefix: Int = 0
+	var index: Int = 0
+
+	while index < columns:
+		wide: Bool = if wide_first:
+			index == 0
+		else:
+			index == columns - 1
+
+		added: Int = if wide:
+			wide_width
+		else:
+			1
+		transferred += prefix + added
+		prefix += added
+		index += 1
+
+	transferred
+
+
+pure func core_match_binding_profile_fixture(
+	config: CoreMatchBindingProfileConfig,
+) -> CoreMatchBindingProfileFixture:
+	normalized: CoreMatchBindingProfileConfig = normalized_config(config)
+
+	match normalized.shape:
+		ProfileRecursiveChildren:
+			{
+				config = normalized,
+				cases = [{ pattern = recursive_pattern(
+						normalized.binding_width,
+						normalized.nesting_depth,
+					), body = body() }],
+				input_bindings = normalized.binding_width,
+				modeled_recursive_concat_elements = recursive_concat_elements(
+					normalized.binding_width,
+					normalized.nesting_depth,
+				),
+				modeled_arm_prefix_concat_elements = normalized.binding_width
+			}
+		ProfileRetainedPrefixEarly | ProfileRetainedPrefixLate:
+			wide_first: Bool = match normalized.shape:
+				ProfileRetainedPrefixEarly:
+					True
+				_:
+					False
+
+			{
+				config = normalized,
+				cases = [{ pattern = prefix_pattern(
+						normalized.binding_width,
+						normalized.constructor_columns,
+						wide_first,
+					), body = body() }],
+				input_bindings = prefix_input_bindings(
+					normalized.binding_width,
+					normalized.constructor_columns,
+				),
+				modeled_recursive_concat_elements = prefix_recursive_concat_elements(
+					normalized.binding_width,
+					normalized.constructor_columns,
+				),
+				modeled_arm_prefix_concat_elements = arm_prefix_concat_elements(
+					normalized.binding_width,
+					normalized.constructor_columns,
+					wide_first,
+				)
+			}
+
+
+pure func core_match_binding_profile_execute(
+	fixture: CoreMatchBindingProfileFixture,
+	iterations: Int,
+) -> CoreMatchBindingProfileExecution:
+	var tree: Option[CoreSemanticMatchTree] = None
+	var index: Int = 0
+
+	while index < iterations:
+		tree = compile_match_cases(Sets.set(), fixture.cases)
+		index += 1
+
+	{
+		tree = tree,
+		iterations = iterations
+	}
+
+
+private pure func checksum_text(seed: Int, value: String) -> Int:
+	bytes = value.to_bytes()
+	var checksum: Int = seed
+	var index: Int = 0
+
+	while index < bytes.length():
+		checksum = checksum * 131 + get_byte(bytes, index).get_or(0)
+		index += 1
+
+	checksum
+
+
+private pure func checksum_accessor(seed: Int, accessor: CoreSemanticMatchAccessor) -> Int:
+	match accessor:
+		RootSemanticMatchAccessor:
+			seed * 131 + 1
+		VariantFieldSemanticMatchAccessor(parent, constructor, index):
+			checksum_text(checksum_accessor(seed * 131 + 2, parent), constructor) * 131 + index
+		TupleFieldSemanticMatchAccessor(parent, index):
+			checksum_accessor(seed * 131 + 3, parent) * 131 + index
+		ListElementSemanticMatchAccessor(parent, index):
+			checksum_accessor(seed * 131 + 4, parent) * 131 + index
+		ListSpreadSemanticMatchAccessor(parent, index):
+			checksum_accessor(seed * 131 + 5, parent) * 131 + index
+
+
+private pure func empty_tree_observation() -> CoreMatchTreeObservation:
+	{
+		output_bindings = 0,
+		leaf_count = 0,
+		owned_spread_bindings = 0,
+		semantic_checksum = 0
+	}
+
+
+private pure func observe_tree(tree: CoreSemanticMatchTree) -> CoreMatchTreeObservation:
+	var observation: CoreMatchTreeObservation = empty_tree_observation()
+	var pending: List[CoreSemanticMatchTree] = [tree]
+	var pending_index: Int = 0
+
+	while pending_index < pending.length():
+		match pending.get(pending_index):
+			Some(current):
+				match current:
+					SemanticMatchLeaf(bindings, _):
+						observation = { observation | leaf_count = observation.leaf_count + 1 }
+
+						for binding in bindings:
+							mode_tag: Int = match binding.mode:
+								MatchBorrowBindingMode:
+									7
+								MatchOwnBindingMode:
+									11
+
+							owned_increment: Int = if mode_tag == 11:
+								1
+							else:
+								0
+
+							observation = { observation |
+								output_bindings = observation.output_bindings + 1,
+								owned_spread_bindings = observation.owned_spread_bindings + owned_increment,
+								semantic_checksum = checksum_accessor(
+									checksum_text(
+										observation.semantic_checksum * 131 + mode_tag,
+										binding.variable.name,
+									),
+									binding.accessor,
+								)
+							}
+					SemanticMatchFail:
+						observation = { observation | semantic_checksum = observation.semantic_checksum * 131 + 13 }
+					SemanticConstructorMatch(accessor, cases, fallback):
+						observation = { observation | semantic_checksum = checksum_accessor(
+							observation.semantic_checksum * 131 + 17,
+							accessor,
+						) }
+
+						for match_case in cases:
+							observation = { observation | semantic_checksum = checksum_text(
+								observation.semantic_checksum,
+								match_case.constructor,
+							) }
+							pending = pending.append(match_case.body)
+
+						match fallback:
+							Some(found):
+								pending = pending.append(found)
+							None:
+								void
+					SemanticLiteralMatch(accessor, cases, fallback):
+						observation = { observation | semantic_checksum = checksum_accessor(
+							observation.semantic_checksum * 131 + 19 + cases.length(),
+							accessor,
+						) }
+						pending = pending.append(fallback)
+					SemanticLengthMatch(accessor, cases, geq, fallback):
+						observation = { observation | semantic_checksum = checksum_accessor(
+							observation.semantic_checksum * 131 + 23,
+							accessor,
+						) }
+
+						for match_case in cases:
+							pending = pending.append(match_case.body)
+
+						match geq:
+							Some(found):
+								pending = pending.append(found.body)
+							None:
+								void
+
+						match fallback:
+							Some(found):
+								pending = pending.append(found)
+							None:
+								void
+			None:
+				void
+
+		pending_index += 1
+
+	observation
+
+
+pure func core_match_binding_profile_observe(
+	fixture: CoreMatchBindingProfileFixture,
+	execution: CoreMatchBindingProfileExecution,
+) -> CoreMatchBindingProfileObservation:
+	observation: CoreMatchTreeObservation = match execution.tree:
+		Some(tree):
+			observe_tree(tree)
+		None:
+			empty_tree_observation()
+	semantic_json: String = match execution.tree:
+		Some(tree):
+			core_semantic_match_tree_to_json(tree).to_string()
+		None:
+			""
+
+	{
+		iterations = execution.iterations,
+		input_bindings = fixture.input_bindings,
+		output_bindings = observation.output_bindings,
+		leaf_count = observation.leaf_count,
+		owned_spread_bindings = observation.owned_spread_bindings,
+		modeled_recursive_concat_elements = fixture.modeled_recursive_concat_elements,
+		modeled_arm_prefix_concat_elements = fixture.modeled_arm_prefix_concat_elements,
+		semantic_checksum = observation.semantic_checksum,
+		semantic_json_checksum = checksum_text(0, semantic_json),
+		semantic_json_bytes = semantic_json.length(),
+		workload_valid = (
+			execution.iterations > 0
+			and execution.tree.is_some()
+			and observation.output_bindings == fixture.input_bindings
+			and observation.leaf_count == 1
+		)
+	}

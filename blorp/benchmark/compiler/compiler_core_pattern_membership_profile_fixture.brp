@@ -1,0 +1,319 @@
+-- Deterministic fixtures that reach both production boolean-membership users.
+-- Construction and semantic observation stay outside the measured window.
+import:
+	../../src/compiler/stage_09_core/closure: convert_program
+	../../src/compiler/stage_09_core/ir:
+		CoreDecl(FunctionDecl),
+		CoreExpr(
+			LiteralExpr,
+			PreClosureDetachExpr,
+			RawMatchExpr,
+			SeqExpr,
+			VarExpr,
+			VoidExpr,
+		),
+		CoreFunction,
+		CoreFunctionKind(UserFunction),
+		CoreLiteral(IntLiteral),
+		CoreParam,
+		CorePattern(ListPattern, NamePattern, TuplePattern),
+		CoreProgram,
+		CoreRawMatchCase,
+		CoreSemanticMatchTree,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(NamedType, VoidType),
+		CoreVar,
+		core_program_to_json,
+		core_semantic_match_tree_to_json,
+	../../src/compiler/stage_09_core/match_lowering: compile_match_cases
+	bytes: get as get_byte
+	set as Sets
+
+
+TARGET_NAME: String = "profile_target"
+
+
+enum CorePatternMembershipProfileConsumer:
+	MembershipMatchConsumer
+	MembershipClosureConsumer
+
+
+enum CorePatternMembershipProfilePosition:
+	MembershipEarly
+	MembershipLate
+	MembershipMiss
+
+
+record CorePatternMembershipProfileConfig {
+	consumer: CorePatternMembershipProfileConsumer,
+	position: CorePatternMembershipProfilePosition,
+	iterations: Int,
+	width: Int,
+	cases: Int
+}
+
+
+record CorePatternMembershipProfileFixture {
+	config: CorePatternMembershipProfileConfig,
+	match_cases: List[CoreRawMatchCase],
+	closure_program: CoreProgram,
+	expected_comparisons: Int
+}
+
+
+record CorePatternMembershipProfileExecution {
+	match_tree: Option[CoreSemanticMatchTree],
+	closure_program: Option[CoreProgram],
+	iterations: Int
+}
+
+
+record CorePatternMembershipProfileResult {
+	consumer: String,
+	position: String,
+	iterations: Int,
+	width: Int,
+	cases: Int,
+	expected_comparisons: Int,
+	semantic_checksum: Int,
+	semantic_bytes: Int,
+	workload_valid: Bool
+}
+
+
+private pure func int_type() -> CoreType:
+	NamedType("Int", [])
+
+
+private pure func string_type() -> CoreType:
+	NamedType("String", [])
+
+
+private pure func profile_var(name: String) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = None
+	}
+
+
+private pure func profile_param(name: String, typ: CoreType) -> CoreParam:
+	{
+		name = profile_var(name),
+		typ = typ,
+		loc = SyntheticSourceLoc
+	}
+
+
+private pure func int_literal(value: Int) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), int_type(), SyntheticSourceLoc)
+
+
+private pure func binder_name(case_index: Int, binder_index: Int) -> String:
+	"membership_${case_index}_${binder_index}"
+
+
+private pure func profile_pattern(
+	case_index: Int,
+	width: Int,
+	position: CorePatternMembershipProfilePosition,
+) -> CorePattern:
+	var items: List[CorePattern] = []
+	var index: Int = 0
+
+	while index < width:
+		is_target: Bool = match position:
+			MembershipEarly:
+				index == 0
+			MembershipLate:
+				index == width - 1
+			MembershipMiss:
+				False
+		name: String = if is_target:
+			TARGET_NAME
+		else:
+			binder_name(case_index, index)
+		items = items.append(NamePattern(name))
+		index += 1
+
+	TuplePattern(items)
+
+
+private pure func profile_cases(
+	count: Int,
+	width: Int,
+	position: CorePatternMembershipProfilePosition,
+) -> List[CoreRawMatchCase]:
+	var cases: List[CoreRawMatchCase] = []
+	var index: Int = 0
+
+	while index < count:
+		cases = cases.append({
+			pattern = profile_pattern(index, width, position),
+			body = VoidExpr(VoidType, SyntheticSourceLoc)
+		})
+		index += 1
+
+	cases
+
+
+private pure func nested_raw_match(
+	count: Int,
+	width: Int,
+	position: CorePatternMembershipProfilePosition,
+) -> CoreExpr:
+	RawMatchExpr(
+		int_literal(0),
+		profile_cases(count, width, position),
+		VoidType,
+		SyntheticSourceLoc,
+	)
+
+
+private pure func match_consumer_cases(
+	count: Int,
+	width: Int,
+	position: CorePatternMembershipProfilePosition,
+) -> List[CoreRawMatchCase]:
+	[{
+		pattern = ListPattern([], Some(NamePattern(TARGET_NAME))),
+		body = nested_raw_match(count, width, position)
+	}]
+
+
+private pure func closure_consumer_program(
+	count: Int,
+	width: Int,
+	position: CorePatternMembershipProfilePosition,
+) -> CoreProgram:
+	target_param: CoreParam = profile_param(TARGET_NAME, string_type())
+	function: CoreFunction = {
+		name = "profile_pattern_membership_closure",
+		source_module = None,
+		type_params = [],
+		params = [target_param],
+		return_type = VoidType,
+		body = Some(PreClosureDetachExpr(
+			SeqExpr(
+				VarExpr(target_param.name, string_type(), SyntheticSourceLoc),
+				nested_raw_match(count, width, position),
+			),
+			VoidType,
+			SyntheticSourceLoc,
+		)),
+		is_pure = False,
+		function_kind = UserFunction,
+		def_id = 113000,
+		loc = SyntheticSourceLoc
+	}
+
+	{
+		decls = [FunctionDecl(function)],
+		foreign_includes = []
+	}
+
+
+private pure func expected_comparisons(
+	config: CorePatternMembershipProfileConfig,
+) -> Int:
+	per_case: Int = match config.position:
+		MembershipEarly:
+			1
+		MembershipLate | MembershipMiss:
+			config.width
+	config.iterations * config.cases * per_case
+
+
+pure func core_pattern_membership_profile_fixture(
+	config: CorePatternMembershipProfileConfig,
+) -> CorePatternMembershipProfileFixture:
+	{
+		config = config,
+		match_cases = match_consumer_cases(config.cases, config.width, config.position),
+		closure_program = closure_consumer_program(config.cases, config.width, config.position),
+		expected_comparisons = expected_comparisons(config)
+	}
+
+
+pure func core_pattern_membership_profile_execute(
+	fixture: CorePatternMembershipProfileFixture,
+	iterations: Int,
+) -> CorePatternMembershipProfileExecution:
+	var match_tree: Option[CoreSemanticMatchTree] = None
+	var closure_program: Option[CoreProgram] = None
+	var index: Int = 0
+
+	while index < iterations:
+		match fixture.config.consumer:
+			MembershipMatchConsumer:
+				match_tree = compile_match_cases(Sets.set(), fixture.match_cases)
+			MembershipClosureConsumer:
+				closure_program = Some(convert_program(fixture.closure_program))
+		index += 1
+
+	{
+		match_tree = match_tree,
+		closure_program = closure_program,
+		iterations = iterations
+	}
+
+
+private pure func checksum_text(value: String) -> Int:
+	bytes = value.to_bytes()
+	var checksum: Int = 0
+	var index: Int = 0
+
+	while index < bytes.length():
+		checksum = checksum * 131 + get_byte(bytes, index).get_or(0)
+		index += 1
+
+	checksum
+
+
+private pure func consumer_name(consumer: CorePatternMembershipProfileConsumer) -> String:
+	match consumer:
+		MembershipMatchConsumer:
+			"match"
+		MembershipClosureConsumer:
+			"closure"
+
+
+private pure func position_name(position: CorePatternMembershipProfilePosition) -> String:
+	match position:
+		MembershipEarly:
+			"early"
+		MembershipLate:
+			"late"
+		MembershipMiss:
+			"miss"
+
+
+pure func core_pattern_membership_profile_observe(
+	fixture: CorePatternMembershipProfileFixture,
+	execution: CorePatternMembershipProfileExecution,
+) -> CorePatternMembershipProfileResult:
+	semantic_json: String = match fixture.config.consumer:
+		MembershipMatchConsumer:
+			match execution.match_tree:
+				Some(tree):
+					core_semantic_match_tree_to_json(tree).to_string()
+				None:
+					""
+		MembershipClosureConsumer:
+			match execution.closure_program:
+				Some(program):
+					core_program_to_json(program).to_string()
+				None:
+					""
+
+	{
+		consumer = consumer_name(fixture.config.consumer),
+		position = position_name(fixture.config.position),
+		iterations = execution.iterations,
+		width = fixture.config.width,
+		cases = fixture.config.cases,
+		expected_comparisons = fixture.expected_comparisons,
+		semantic_checksum = checksum_text(semantic_json),
+		semantic_bytes = semantic_json.length(),
+		workload_valid = semantic_json.length() > 0 and execution.iterations > 0
+	}

@@ -1203,6 +1203,56 @@ stats, elapsed microseconds, and deterministic checksums. Use these rows before
 choosing a production Core optimization; do not extrapolate synthetic wins
 without a production self-compilation replay.
 
+### Core Match Binding Profile
+
+`compiler_core_match_binding_profile` calls the production
+`compile_match_cases` boundary with fixture construction, warmup, and semantic
+observation outside the measured window. The recursive shape varies binding
+width and nesting depth. The prefix pair uses the same payload widths and moves
+the wide payload from the first constructor column to the last, isolating work
+that depends on the already-retained arm prefix without comparing the two
+different semantic checksums to each other.
+
+```bash
+benchmarks/compiler_core_match_binding_profile plain recursive 100 128 8 1
+benchmarks/compiler_core_match_binding_profile plain prefix-early 100 128 0 16
+benchmarks/compiler_core_match_binding_profile plain prefix-late 100 128 0 16
+benchmarks/compiler_core_match_binding_profile plain recursive 1000 2 0 1
+
+benchmarks/compiler_core_match_binding_profile profile recursive 100 128 8 1 \
+  2>/tmp/compiler-core-match-binding-profile.txt
+```
+
+Each row reports input and emitted bindings, leaf and owned-spread counts,
+modeled elements transferred by the original recursive and retained-prefix
+`concat` shapes, allocator counters, elapsed microseconds, and an ordered
+name/accessor/mode checksum. Compare each shape only with the same shape from
+another compiler build. The profile form additionally exposes production
+binding-list `concat` call counts and runtime collection-copy counters.
+The accepted reverse-sequence result and paired raw samples are in the
+[`retained result`](results/compiler_core_match_binding_accumulation_2026-09-15.md).
+
+### Core Pattern Membership Profile
+
+`compiler_core_pattern_membership_profile` reaches the two production boolean
+pattern-binding queries through their public owners: `compile_match_cases` for
+free-name shadowing and `convert_program` for closure consumption analysis.
+Fixture construction, warmup, and serialized output checks stay outside the
+measurement window.
+
+```bash
+benchmarks/compiler_core_pattern_membership_profile plain match early 10 512 64
+benchmarks/compiler_core_pattern_membership_profile plain match miss 10 512 64
+benchmarks/compiler_core_pattern_membership_profile plain closure late 5 512 64
+benchmarks/compiler_core_pattern_membership_profile plain closure early 500 2 1
+```
+
+Vary `early`, `late`, and `miss` to distinguish short-circuit behavior. Each
+row reports the expected name comparisons, allocator counters, elapsed time,
+and a checksum of the complete production result. Compare only matching rows
+from baseline and candidate builds. The accepted result and paired samples are
+in the [`retained result`](results/compiler_core_pattern_membership_2026-09-15.md).
+
 ### Consume Candidate Index Profile
 
 `compiler_consume_candidate_index_profile` isolates `consume_specialize` by
