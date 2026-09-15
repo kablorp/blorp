@@ -1166,12 +1166,12 @@ generated-C and host-C effects of internal callable naming:
 
 ```bash
 benchmarks/compiler_c_symbol_projection --samples 1
-benchmarks/compiler_c_symbol_projection --samples 10 --skip-build --json
+benchmarks/compiler_c_symbol_projection --samples 3 --skip-build --json
 benchmarks/compiler_c_symbol_projection \
   --compiler bin/blorp --compiler-root . \
   --baseline-compiler /path/to/baseline/blorp \
   --baseline-compiler-root /path/to/baseline \
-  --samples 10 --skip-build --json
+  --samples 3 --skip-build --json
 ```
 
 The result includes compiler and fixture hashes, generated-C bytes and lines,
@@ -1189,12 +1189,14 @@ projection, and validation from the rest of compilation:
 
 ```bash
 BLORP_COMPILER_BENCHMARK_SKIP_BUILD=1 \
-  benchmarks/compiler_c_symbol_projection_profile calls 10 256 96 1
+  benchmarks/compiler_c_symbol_projection_profile calls 3 256 96 16
 ```
 
 It verifies every projected definition and call against the callable's compact
 artifact-local definition ID. Retained hash-baseline and compact-ID profile
-results are in `results/compiler_c_symbol_projection_profile_2026-08-23.md`.
+results are in `results/compiler_c_symbol_projection_profile_2026-08-23.md`;
+the zero-copy emission-plan result is in
+`results/compiler_c_symbol_zero_copy_2026-09-15.md`.
 
 ### Core Pipeline Work Profile
 
@@ -1357,6 +1359,21 @@ benchmarks/compiler_backend_memory "$request" --timeout 60
 
 The fixture emits the same backend bridge envelope as a production capture and
 keeps function count, tree shape, and generated C stable across layout changes.
+
+For callable-symbol emission work, generate the bounded 256-function,
+16-calls-per-function request used by the retained projection profile:
+
+```bash
+request=$(mktemp "${TMPDIR:-/tmp}/blorp-c-symbol-projection.XXXXXX.json")
+bin/blorp run --no-format \
+  blorp/benchmark/compiler/compiler_c_symbol_projection_request.brp >"$request"
+benchmarks/compiler_backend_memory "$request" --timeout 60 --json
+```
+
+The generator fixes logical names at 96 bytes and emits a schema-1
+`emit_core_c` envelope. Its request hash and the backend response hash must
+match across alternating baseline/candidate runs; three pairs are the default
+for this focused comparison.
 
 Requests larger than 16 MiB are refused by default. Use
 `--allow-large-request` only when the replay process is already inside an

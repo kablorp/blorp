@@ -22,6 +22,9 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[4]
 SCRIPT = ROOT / "benchmarks" / "compiler_backend_memory"
+SYMBOL_PROJECTION_REQUEST = (
+    ROOT / "blorp/benchmark/compiler/compiler_c_symbol_projection_request.brp"
+)
 
 
 def load_benchmark_module():
@@ -177,6 +180,48 @@ class CompilerBackendMemoryBenchmarkTests(unittest.TestCase):
                 return
             time.sleep(0.01)
         self.fail(f"process {pid} is still running")
+
+    def test_symbol_projection_request_generator_emits_bounded_backend_contract(
+        self,
+    ) -> None:
+        completed = subprocess.run(
+            [
+                str(ROOT / "bin/blorp"),
+                "run",
+                "--no-format",
+                str(SYMBOL_PROJECTION_REQUEST),
+            ],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        request = json.loads(completed.stdout)
+        self.assertEqual(request["schema"], 1)
+        self.assertEqual(request["domain"], "compiler")
+        self.assertEqual(request["action"], "emit_core_c")
+        self.assertFalse(request["payload"]["profile"])
+        self.assertEqual(request["payload"]["core"]["kind"], "program")
+        declarations = request["payload"]["core"]["decls"]
+        self.assertEqual(len(declarations), 256)
+        self.assertTrue(all(len(declaration["name"]) == 96 for declaration in declarations))
+        for expected_id, declaration in enumerate(declarations, start=1):
+            body = declaration["body"]
+            call_count = 0
+            while body["kind"] == "seq":
+                call = body["first"]
+                self.assertEqual(call["kind"], "call")
+                self.assertEqual(call["call_kind"]["kind"], "user")
+                self.assertEqual(call["call_kind"]["def_id"], expected_id)
+                self.assertEqual(call["call_kind"]["name"], declaration["name"])
+                call_count += 1
+                body = body["second"]
+            self.assertEqual(call_count, 16)
+            self.assertEqual(body["kind"], "literal")
 
     def test_replay_reports_provenance_and_validates_output(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:

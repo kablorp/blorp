@@ -16,7 +16,6 @@ import:
 			UnknownCall,
 			UserCall,
 		),
-		CoreConcurrentBinding,
 		CoreDecl(
 			EnumDecl,
 			FunctionDecl,
@@ -154,10 +153,10 @@ union CSymbolProjectionError:
 	CanonicalEmptyListSymbolCollision(String)
 
 
-private record CProjectedProgramRep {
-	program: CoreProgram,
-	original_name_by_projected_name: Dict[String, String],
-	canonical_empty_lists: List[CanonicalEmptyList]
+private record CEmissionSymbolPlanRep {
+	callables: CCallableSymbolPlan,
+	canonical_empty_lists: List[CanonicalEmptyList],
+	preserved_symbol_count: Int
 }
 
 
@@ -167,7 +166,7 @@ private record CProjectionValidation {
 }
 
 
-opaque type CProjectedProgram = CProjectedProgramRep
+opaque type CEmissionSymbolPlan = CEmissionSymbolPlanRep
 
 private BASE62_ALPHABET: String = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
@@ -371,6 +370,52 @@ private pure func projected_callback_name(
 	plan.by_original_c_spelling
 		.get(c_identifier(original_name))
 		.map(func(symbol): symbol.projected_name)
+
+
+private pure func c_emission_callable_plan(plan: CEmissionSymbolPlan) -> CCallableSymbolPlan:
+	representation: CEmissionSymbolPlanRep = from_opaque CEmissionSymbolPlan(plan)
+	representation.callables
+
+
+pure func planned_emitted_callable_name(
+	plan: CEmissionSymbolPlan,
+	qualified_name: String,
+	def_id: Int,
+) -> Option[String]:
+	projected_callable_name(c_emission_callable_plan(plan), qualified_name, def_id)
+
+
+pure func planned_emitted_callback_name(
+	plan: CEmissionSymbolPlan,
+	original_name: String,
+) -> Option[String]:
+	projected_callback_name(c_emission_callable_plan(plan), original_name)
+
+
+pure func emitted_callable_name(
+	plan: CEmissionSymbolPlan,
+	qualified_name: String,
+	def_id: Int,
+) -> String:
+	projected_callable_name_after_validation(c_emission_callable_plan(plan), qualified_name, def_id)
+
+
+pure func emitted_callback_name(plan: CEmissionSymbolPlan, original_name: String) -> String:
+	projected_callback_name_after_validation(c_emission_callable_plan(plan), original_name)
+
+
+pure func c_emission_canonical_empty_lists(plan: CEmissionSymbolPlan) -> List[CanonicalEmptyList]:
+	representation: CEmissionSymbolPlanRep = from_opaque CEmissionSymbolPlan(plan)
+	representation.canonical_empty_lists
+
+
+pure func c_emission_symbol_plan_entry_count(plan: CEmissionSymbolPlan) -> Int:
+	c_emission_callable_plan(plan).by_definition_id.length()
+
+
+pure func c_emission_preserved_symbol_count(plan: CEmissionSymbolPlan) -> Int:
+	representation: CEmissionSymbolPlanRep = from_opaque CEmissionSymbolPlan(plan)
+	representation.preserved_symbol_count
 
 
 private pure func projected_callable_name_after_validation(
@@ -873,159 +918,9 @@ private pure func canonical_empty_list_symbol_collision(
 	collision
 
 
-private pure func project_constructor(
-	plan: CCallableSymbolPlan,
-	constructor: CoreHashContainerConstructor,
-) -> CoreHashContainerConstructor:
-	match constructor:
-		CustomHashContainerConstructor(hash_name, equals_name, needs_release):
-			CustomHashContainerConstructor(
-				projected_callback_name_after_validation(plan, hash_name),
-				projected_callback_name_after_validation(plan, equals_name),
-				needs_release,
-			)
-		_:
-			constructor
-
-
-private pure func project_task(plan: CCallableSymbolPlan, task: CoreTaskClosure) -> CoreTaskClosure:
-	projected: String = projected_callable_name_after_validation(
-		plan,
-		task.function_name,
-		task.def_id,
-	)
-	{ task |
-		c_name = projected,
-		static_name = static_closure_name(projected)
-	}
-
-
-private pure func project_expr(plan: CCallableSymbolPlan, expr: CoreExpr) -> CoreExpr:
-	children_projected: CoreExpr = match expr:
-		SeqExpr(_, _):
-			CoreTraverse.map_core_sequence_items(expr, func(item): project_expr(plan, item))
-		_:
-			CoreTraverse.map_core_expr_children(expr, func(child): project_expr(plan, child))
-
-	match children_projected:
-		CallExpr(UserCall(name, Some(def_id), consumed_args), callee, args, typ, loc):
-			CallExpr(
-				UserCall(
-					projected_callable_name_after_validation(plan, name, def_id),
-					Some(def_id),
-					consumed_args,
-				),
-				callee,
-				args,
-				typ,
-				loc,
-			)
-		CallExpr(ListToStringCall(callback_name), callee, args, typ, loc):
-			CallExpr(
-				ListToStringCall(projected_callback_name_after_validation(plan, callback_name)),
-				callee,
-				args,
-				typ,
-				loc,
-			)
-		CallExpr(DictWithCapacityCall(constructor), callee, args, typ, loc):
-			CallExpr(
-				DictWithCapacityCall(project_constructor(plan, constructor)),
-				callee,
-				args,
-				typ,
-				loc,
-			)
-		DictConstructExpr(construct, typ, loc):
-			DictConstructExpr(
-				{ construct | constructor = project_constructor(plan, construct.constructor) },
-				typ,
-				loc,
-			)
-		SetAllocExpr(constructor, typ, loc):
-			SetAllocExpr(
-				project_constructor(plan, constructor),
-				typ,
-				loc,
-			)
-		ClosureCreateExpr(closure, typ, loc):
-			projected: String = projected_callable_name_after_validation(
-				plan,
-				closure.function_name,
-				closure.def_id,
-			)
-			ClosureCreateExpr(
-				{ closure |
-					c_name = projected,
-					static_name = static_closure_name(projected)
-				},
-				typ,
-				loc,
-			)
-		DetachExpr(task, typ, loc):
-			DetachExpr(
-				project_task(plan, task),
-				typ,
-				loc,
-			)
-		ConcurrentlyLoopExpr(loop, typ, loc):
-			ConcurrentlyLoopExpr({ loop | task = project_task(plan, loop.task) }, typ, loc)
-		ConcurrentExpr(block, typ, loc):
-			bindings: List[CoreConcurrentBinding] = block.bindings.map(
-				func(binding): { binding | task = project_task(plan, binding.task) },
-			)
-			ConcurrentExpr({ block | bindings = bindings }, typ, loc)
-		_:
-			children_projected
-
-
-private pure func project_function(
-	plan: CCallableSymbolPlan,
-	function_info: CoreFunction,
-) -> CoreFunction:
-	projected_body = function_info.body.map(func(body): project_expr(plan, body))
-
-	if function_info.body.is_none():
-		{ function_info | body = projected_body }
-	else:
-		match function_info.function_kind:
-			UserFunction:
-				projected_name: String = projected_callable_name_after_validation(
-					plan,
-					function_info.name,
-					function_info.def_id,
-				)
-				{ function_info |
-					name = projected_name,
-					body = projected_body
-				}
-			ClosureBodyFunction(abi):
-				projected_name: String = projected_callable_name_after_validation(
-					plan,
-					function_info.name,
-					function_info.def_id,
-				)
-				{ function_info |
-					body = projected_body,
-					function_kind = ClosureBodyFunction({ abi | c_name = projected_name })
-				}
-			_:
-				{ function_info | body = projected_body }
-
-
-private pure func project_decl(plan: CCallableSymbolPlan, decl: CoreDecl) -> CoreDecl:
-	match decl:
-		FunctionDecl(function_info):
-			FunctionDecl(project_function(plan, function_info))
-		GlobalDecl(global):
-			GlobalDecl({ global | init = project_expr(plan, global.init) })
-		_:
-			decl
-
-
-pure func project_core_program_callables(
+pure func prepare_c_emission_symbols(
 	program: CoreProgram,
-) -> Result[CProjectedProgram, CSymbolProjectionError]:
+) -> Result[CEmissionSymbolPlan, CSymbolProjectionError]:
 	match check_definition_id_uniqueness(program):
 		[violation, ..._]:
 			Err(InvalidCoreDefinitionIdentity(core_late_invariant_message(violation)))
@@ -1065,51 +960,11 @@ pure func project_core_program_callables(
 										Err(error):
 											Err(error)
 										Ok(plan):
-											projected: CoreProgram = {
-												decls = program.decls.map(
-													func(decl): project_decl(plan, decl),
-												),
-												foreign_includes = program.foreign_includes
-											}
-											var original_names: Dict[String, String] = {}
-
-											for candidate in inventory.candidates:
-												match projected_callable_name(
-													plan,
-													candidate.qualified_name,
-													candidate.def_id,
-												):
-													Some(projected_name):
-														original_names = original_names.set(
-															projected_name,
-															candidate.qualified_name,
-														)
-													None:
-														void
-
-											Ok(into_opaque CProjectedProgram({
-														program = projected,
-														original_name_by_projected_name = original_names,
-														canonical_empty_lists = validation.canonical_empty_lists
+											Ok(into_opaque CEmissionSymbolPlan({
+														callables = plan,
+														canonical_empty_lists = validation.canonical_empty_lists,
+														preserved_symbol_count = preserved_names.length()
 													}))
-
-
-pure func projected_core_program_value(projected: CProjectedProgram) -> CoreProgram:
-	representation: CProjectedProgramRep = from_opaque CProjectedProgram(projected)
-	representation.program
-
-
-pure func projected_canonical_empty_lists(projected: CProjectedProgram) -> List[CanonicalEmptyList]:
-	representation: CProjectedProgramRep = from_opaque CProjectedProgram(projected)
-	representation.canonical_empty_lists
-
-
-pure func projected_original_callable_name(
-	projected: CProjectedProgram,
-	projected_name: String,
-) -> String:
-	representation: CProjectedProgramRep = from_opaque CProjectedProgram(projected)
-	representation.original_name_by_projected_name.get_or(projected_name, projected_name)
 
 
 pure func symbol_projection_error_text(error: CSymbolProjectionError) -> String:

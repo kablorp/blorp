@@ -1,20 +1,23 @@
 # Emit Compact Callable Symbols Without Rebuilding Core
 
-**Status:** Ready for immediate execution.
+**Status:** Complete (2026-09-15).
 
-**Current state:** Final C-symbol projection validates the prepared
-`CoreProgram`, builds a deterministic callable symbol plan, then recursively
-rebuilds every function/global expression into a second `CoreProgram` with the
-projected spellings. C emission reads that rebuilt program. The projection also
-retains a projected-name-to-display-name dictionary so comments and failures
-can recover logical names. The emitted callable spellings are already compact;
-this issue removes the duplicate late-Core owner without changing a byte of C.
+**Current state:** Final C-symbol preparation validates the original prepared
+`CoreProgram` and publishes an immutable `CEmissionSymbolPlan`. C emission
+traverses that original Core and selects compact spellings only at callable use
+sites. The projected-program copy, recursive rewriter, and reverse display-name
+dictionary have been deleted.
 
-**Next action:** Extend the retained projection profile with a rebuilt-node
-counter and add a deterministic `emit_core_c` request generator using its
-scaling fixture. Prove the current path rebuilds Core nodes, then replace
-`CProjectedProgram` with an immutable emission plan read by the emitter while
-it traverses the original prepared Core.
+**Result:** The baseline profile counted 37,632 rebuilt Core expressions. The
+candidate makes that reconstruction structurally impossible: its opaque result
+contains only symbol-plan metadata and canonical-list rows, so its
+schema-compatible rebuild fields are zero by representation rather than by a
+runtime traversal counter. Managed allocations fell by 74.4% and retained
+objects by 98.3% while preserving the exact symbol checksum. Deterministic
+backend response, generated C, native objects, and runtime output are
+byte-identical. See the
+[retained result](../../../benchmarks/results/compiler_c_symbol_zero_copy_2026-09-15.md)
+and [raw paired production data](../../../benchmarks/results/compiler_c_symbol_zero_copy_2026-09-15.json).
 
 **Read first:**
 `blorp/src/compiler/stage_10_backend/c_symbol_projection.brp`,
@@ -137,9 +140,10 @@ Add benchmark-only or profile metrics for:
 - emitted C bytes.
 
 The baseline must demonstrate nonzero rebuild work on the focused scaling
-fixtures. The candidate must report zero rebuilt Core expressions and
-declarations. Keep validation visits separate: correctness validation is not
-the work being removed.
+fixtures. The candidate must report schema-compatible zeros and document that
+they follow from the compiler-checked plan-only result type, not from an
+observed traversal counter. Keep validation visits separate: correctness
+validation is not the work being removed.
 
 ### 2. Separate Plan Construction From Rewriting
 
@@ -272,7 +276,8 @@ wall-time-only claim.
 - The emitter traverses the original prepared `CoreProgram` with an immutable
   `CEmissionSymbolPlan`.
 - The plan contains no Core AST/program owner.
-- Projection rebuild counters are zero on the focused scaling workloads.
+- The baseline projection rebuild counters are nonzero; the candidate reports
+  schema-compatible zeros justified by its compiler-checked plan-only payload.
 - `CProjectedProgram` and its recursive rewrite helpers are deleted.
 - The reverse projected-to-display-name dictionary is deleted.
 - The deterministic backend response is byte-identical by SHA; paired

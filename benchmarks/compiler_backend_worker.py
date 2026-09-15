@@ -13,6 +13,15 @@ BACKEND_COUNTER_WORKER_ENV = "BLORP_BACKEND_COUNTER_BENCHMARK_WORKER"
 WORKER_SOURCE = Path("blorp/benchmark/compiler/compiler_backend_worker.brp")
 WORKER_NAME = "compiler_backend_worker"
 WORKER_MAIN_SYMBOL = "__blorp_backend_benchmark_worker_main"
+# Generated backend-worker C includes the table identity helpers pulled in by
+# final-Core validation. Keep this list aligned with the production compiler's
+# FFI-owning module directories so the replay worker exercises the real path.
+WORKER_INCLUDE_DIRS = (
+    Path("blorp/src/compiler/stage_04_modules"),
+    Path("blorp/src/compiler/stage_06_typecheck/graph"),
+    Path("blorp/src/compiler/stage_06_typecheck/type_system"),
+    Path("blorp/src/lib"),
+)
 
 
 def prepare_backend_worker(
@@ -32,4 +41,10 @@ def prepare_backend_worker(
     }
     if debug_profile:
         worker_options["debug_profile"] = True
-    return prepare_benchmark_worker(root, out_dir, explicit, **worker_options)
+    return prepare_benchmark_worker(
+        root,
+        out_dir,
+        explicit,
+        include_dirs=WORKER_INCLUDE_DIRS,
+        **worker_options,
+    )

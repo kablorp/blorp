@@ -23,11 +23,13 @@ import:
 		CoreType(FunctionType, NamedType, VoidType),
 	../../src/compiler/stage_09_core/traverse as CoreTraverse
 	../../src/compiler/stage_10_backend/c_symbol_projection:
-		CProjectedProgram,
+		CEmissionSymbolPlan,
 		CSymbolProjectionError(UnsupportedPreparedCallKind),
-		project_core_program_callables,
+		c_emission_preserved_symbol_count,
+		c_emission_symbol_plan_entry_count,
+		planned_emitted_callable_name,
+		prepare_c_emission_symbols,
 		projected_callable_base_symbol,
-		projected_core_program_value,
 	bytes: get as get_byte
 	instrumentation: begin_function_profile_window, end_function_profile_window
 	memory: get_mem_stats, reset_mem_stats
@@ -50,12 +52,14 @@ struct CProjectionProfileObservation {
 	projected_definitions: Int,
 	projected_calls: Int,
 	projected_name_bytes: Int,
+	plan_entries: Int,
+	preserved_symbols: Int,
 	symbol_checksum: Int
 }
 
 
 record CProjectionProfileExecution {
-	projected_programs: List[CProjectedProgram],
+	plans: List[CEmissionSymbolPlan],
 	succeeded: Bool,
 	errors_consistent: Bool,
 	selected_error: Option[String]
@@ -477,66 +481,99 @@ private pure func symbol_checksum(seed: Int, name: String) -> Int:
 	result
 
 
-private pure func observe_projected_programs(
-	projected_programs: List[CProjectedProgram],
+private pure func observe_emission_plans(
+	programs: List[CoreProgram],
+	plans: List[CEmissionSymbolPlan],
 ) -> CProjectionProfileObservation:
 	var definitions: Int = 0
 	var calls: Int = 0
 	var name_bytes: Int = 0
+	var plan_entries: Int = 0
+	var preserved_symbols: Int = 0
 	var checksum: Int = 0
+	var program_index: Int = 0
 
-	for projected in projected_programs:
-		for decl in projected_core_program_value(projected).decls:
-			match decl:
-				FunctionDecl(function_info):
-					if function_info.name == projected_callable_base_symbol(function_info.def_id):
-						definitions += 1
-						name_bytes += function_info.name.length()
-						checksum = symbol_checksum(checksum, function_info.name)
-					else:
-						void
+	while program_index < programs.length():
+		match (programs.get(program_index), plans.get(program_index)):
+			(Some(program), Some(plan)):
+				plan_entries += c_emission_symbol_plan_entry_count(plan)
+				preserved_symbols += c_emission_preserved_symbol_count(plan)
 
-					match function_info.body:
-						Some(body):
-							var current_frontier: List[CoreExpr] = [body]
-							var next_frontier: List[CoreExpr] = []
-							var current_index: Int = 0
+				for decl in program.decls:
+					match decl:
+						FunctionDecl(function_info):
+							match planned_emitted_callable_name(
+								plan,
+								function_info.name,
+								function_info.def_id,
+							):
+								Some(emitted_name):
+									if emitted_name == projected_callable_base_symbol(
+										function_info.def_id,
+									):
+										definitions += 1
+										name_bytes += emitted_name.length()
+										checksum = symbol_checksum(checksum, emitted_name)
+									else:
+										void
+								None:
+									void
 
-							while current_frontier.length() > 0:
-								while current_index < current_frontier.length():
-									match current_frontier.get(current_index):
-										Some(expr):
-											match expr:
-												CallExpr(UserCall(name, _, _), _, _, _, _):
-													if name == function_info.name:
-														calls += 1
-														checksum = symbol_checksum(checksum, name)
-													else:
-														void
-												_:
+							match function_info.body:
+								Some(body):
+									var current_frontier: List[CoreExpr] = [body]
+									var next_frontier: List[CoreExpr] = []
+									var current_index: Int = 0
+
+									while current_frontier.length() > 0:
+										while current_index < current_frontier.length():
+											match current_frontier.get(current_index):
+												Some(expr):
+													match expr:
+														CallExpr(UserCall(name, Some(def_id), _), _, _, _, _):
+															match planned_emitted_callable_name(
+																plan,
+																name,
+																def_id,
+															):
+																Some(emitted_name):
+																	calls += 1
+																	checksum = symbol_checksum(
+																		checksum,
+																		emitted_name,
+																	)
+																None:
+																	void
+														_:
+															void
+
+													for child in CoreTraverse.immediate_core_expr_children(
+														expr,
+													):
+														next_frontier = next_frontier.append(child)
+												None:
 													void
 
-											for child in CoreTraverse.immediate_core_expr_children(
-												expr,
-											):
-												next_frontier = next_frontier.append(child)
-										None:
-											void
+											current_index += 1
 
-									current_index += 1
-
-								current_frontier = next_frontier
-								next_frontier = []
-								current_index = 0
-						None:
+										current_frontier = next_frontier
+										next_frontier = []
+										current_index = 0
+								None:
+									void
+						_:
 							void
-				_:
-					void
+			_:
+				void
+
+		program_index += 1
 
 	{
 		projected_definitions = definitions,
 		projected_calls = calls,
 		projected_name_bytes = name_bytes,
+		plan_entries = plan_entries,
+		preserved_symbols = preserved_symbols,
 		symbol_checksum = checksum
 	}
 
@@ -564,18 +601,18 @@ private pure func execute_projection_profile(
 	programs: List[CoreProgram],
 	iterations: Int,
 ) -> CProjectionProfileExecution:
-	var final_projected_programs: List[CProjectedProgram] = []
+	var final_plans: List[CEmissionSymbolPlan] = []
 	var succeeded: Bool = iterations > 0
 	var errors_consistent: Bool = True
 	var selected_error: Option[String] = None
 
 	for _ in 0..iterations:
-		var iteration_projected_programs: List[CProjectedProgram] = []
+		var iteration_plans: List[CEmissionSymbolPlan] = []
 
 		for program in programs:
-			match project_core_program_callables(program):
-				Ok(projected):
-					iteration_projected_programs = iteration_projected_programs.append(projected)
+			match prepare_c_emission_symbols(program):
+				Ok(plan):
+					iteration_plans = iteration_plans.append(plan)
 				Err(error):
 					error_name: String = projection_error_name(error)
 
@@ -590,10 +627,10 @@ private pure func execute_projection_profile(
 
 					succeeded = False
 
-		final_projected_programs = iteration_projected_programs
+		final_plans = iteration_plans
 
 	{
-		projected_programs = final_projected_programs,
+		plans = final_plans,
 		succeeded = succeeded,
 		errors_consistent = errors_consistent,
 		selected_error = selected_error
@@ -633,7 +670,7 @@ private func run_profile(
 	)
 
 	warmup = execute_projection_profile(workload.programs, 1)
-	warmup_observation = observe_projected_programs(warmup.projected_programs)
+	warmup_observation = observe_emission_plans(workload.programs, warmup.plans)
 	warmup_valid: Bool = (
 		execution_matches_expected_error(warmup, workload.expected_error)
 		and warmup_observation.projected_definitions == workload.expected_projected_definitions
@@ -655,12 +692,14 @@ private func run_profile(
 		memory_stats = get_mem_stats()
 		end_function_profile_window()
 		window_microseconds: Int = stopped - started
-		observation = observe_projected_programs(execution.projected_programs)
+		observation = observe_emission_plans(workload.programs, execution.plans)
 		workload_valid: Bool = (
 			execution_matches_expected_error(execution, workload.expected_error)
 			and observation.projected_definitions == warmup_observation.projected_definitions
 			and observation.projected_calls == warmup_observation.projected_calls
 			and observation.projected_name_bytes == warmup_observation.projected_name_bytes
+			and observation.plan_entries == warmup_observation.plan_entries
+			and observation.preserved_symbols == warmup_observation.preserved_symbols
 			and observation.symbol_checksum == warmup_observation.symbol_checksum
 		)
 
@@ -668,11 +707,16 @@ private func run_profile(
 		fixture_validation_enqueues: Int = workload.expected_validation_enqueues * iterations
 		fixture_validation_dequeues: Int = workload.expected_validation_dequeues * iterations
 
+		-- The candidate boundary returns only CEmissionSymbolPlan metadata; unlike
+		-- the baseline, there is no projected Core value whose nodes can be counted.
+		rebuilt_core_expressions: Int = 0
+		rebuilt_core_declarations: Int = 0
+
 		workload_summary: String = "C_SYMBOL_PROJECTION_PROFILE mode=" + profile_mode_name(
 			mode,
 		) + " iterations=" + iterations.to_string() + " artifacts=" + workload.programs
 			.length()
-			.to_string() + " nodes=" + node_count.to_string() + " requested_name_length=" + requested_name_length.to_string() + " calls_per_function=" + calls_per_function.to_string() + " projected_definitions=" + observation.projected_definitions.to_string() + " projected_calls=" + observation.projected_calls.to_string() + " projected_name_bytes=" + observation.projected_name_bytes.to_string()
+			.to_string() + " nodes=" + node_count.to_string() + " requested_name_length=" + requested_name_length.to_string() + " calls_per_function=" + calls_per_function.to_string() + " projected_definitions=" + observation.projected_definitions.to_string() + " projected_calls=" + observation.projected_calls.to_string() + " projected_name_bytes=" + observation.projected_name_bytes.to_string() + " rebuilt_core_expressions=" + rebuilt_core_expressions.to_string() + " rebuilt_core_declarations=" + rebuilt_core_declarations.to_string() + " plan_entries=" + observation.plan_entries.to_string() + " preserved_symbols=" + observation.preserved_symbols.to_string()
 
 		fixture_summary: String = " fixture_validation_node_visits=" + fixture_validation_node_visits.to_string() + " fixture_validation_enqueues=" + fixture_validation_enqueues.to_string() + " fixture_validation_dequeues=" + fixture_validation_dequeues.to_string() + " fixture_peak_frontier_width=" + workload.expected_peak_frontier_width.to_string() + " selected_error=" + execution.selected_error.get_or(
 			"none",

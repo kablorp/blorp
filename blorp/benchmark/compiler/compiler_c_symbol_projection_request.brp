@@ -1,0 +1,119 @@
+-- Deterministic schema-1 backend request for callable-symbol emission profiling.
+-- The shape matches the retained call-heavy projection workload:
+-- 256 self-recursive callables, 16 calls per callable, and 96-byte logical names.
+import:
+	../../src/compiler/stage_09_core/ir:
+		CoreCallKind(UserCall),
+		CoreDecl(FunctionDecl),
+		CoreExpr(CallExpr, LiteralExpr, SeqExpr, VarExpr),
+		CoreFunction,
+		CoreFunctionKind(UserFunction),
+		CoreLiteral(IntLiteral),
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(FunctionType, NamedType),
+		core_program_to_json,
+	io: print
+	json: JsonValue(JsonBool, JsonNumber, JsonObject, JsonString)
+
+
+CALLABLE_COUNT: Int = 256
+
+CALLS_PER_FUNCTION: Int = 16
+
+CALLABLE_NAME_LENGTH: Int = 96
+
+
+private pure func int_type() -> CoreType:
+	NamedType("Int", [])
+
+
+private pure func function_type() -> CoreType:
+	FunctionType(True, [], int_type())
+
+
+private pure func callable_name(index: Int) -> String:
+	suffix: String = "_${index}"
+	prefix: String = "projection_profile_callable_"
+	padding_length: Int = CALLABLE_NAME_LENGTH - prefix.length() - suffix.length()
+
+	if padding_length > 0:
+		prefix + "x".repeat(padding_length) + suffix
+	else:
+		prefix + suffix
+
+
+private pure func fixture_function(index: Int) -> CoreFunction:
+	name: String = callable_name(index)
+	def_id: Int = index + 1
+	var body: CoreExpr = LiteralExpr(IntLiteral(index), int_type(), SyntheticSourceLoc)
+	var call_index: Int = 0
+
+	while call_index < CALLS_PER_FUNCTION:
+		body = SeqExpr(
+			CallExpr(
+				UserCall(
+					name,
+					Some(def_id),
+					[],
+				),
+				VarExpr(
+					{
+						name = name,
+						uniq = 0,
+						def_id = Some(def_id)
+					},
+					function_type(),
+					SyntheticSourceLoc,
+				),
+				[],
+				int_type(),
+				SyntheticSourceLoc,
+			),
+			body,
+		)
+		call_index += 1
+
+	{
+		name = name,
+		source_module = Some("bench/c_symbol_projection"),
+		type_params = [],
+		params = [],
+		return_type = int_type(),
+		body = Some(body),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = def_id,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func c_symbol_projection_fixture_program() -> CoreProgram:
+	var decls: List[CoreDecl] = []
+	var index: Int = 0
+
+	while index < CALLABLE_COUNT:
+		decls = decls.append(FunctionDecl(fixture_function(index)))
+		index += 1
+
+	{
+		decls = decls,
+		foreign_includes = []
+	}
+
+
+pure func c_symbol_projection_request() -> JsonValue:
+	JsonObject([
+		("schema", JsonNumber(1.0)),
+		("domain", JsonString("compiler")),
+		("action", JsonString("emit_core_c")),
+		("payload", JsonObject([
+			("core", core_program_to_json(c_symbol_projection_fixture_program())),
+			("profile", JsonBool(False)),
+		])),
+	])
+
+
+func main(args: List[String]) -> Int:
+	print(c_symbol_projection_request().to_string())
+	0

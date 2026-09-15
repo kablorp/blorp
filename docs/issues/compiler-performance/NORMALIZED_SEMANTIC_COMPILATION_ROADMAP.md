@@ -67,9 +67,11 @@ fact. A cut cannot merge a public empty table and promise a consumer later:
 it must name the first production reader and the old path it deletes.
 
 The [zero-copy callable-emission issue](136-zero-copy-callable-symbol-emission.md)
-is an independent immediate backend-memory packet: it removes a duplicate
-final-Core owner without changing semantic products or generated C. It does
-not reorder the semantic critical path above.
+is complete. That independent backend-memory packet removed the duplicate
+final-Core owner without changing semantic products or generated C, and did
+not reorder the semantic critical path above. Its retained profile reports
+zero reconstructed Core nodes; the opaque plan's compiler-checked payload owns
+only symbol metadata and canonical-list rows, not a second Core root.
 
 ## Immediate Step 3 Contract
 

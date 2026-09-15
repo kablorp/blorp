@@ -475,13 +475,13 @@ import:
 		union_instance_name,
 		union_reuse_name,
 	c_symbol_projection:
-		CProjectedProgram,
+		CEmissionSymbolPlan,
 		CSymbolProjectionError,
+		c_emission_canonical_empty_lists,
 		canonical_empty_lists_for_unprojected_program,
-		project_core_program_callables,
-		projected_canonical_empty_lists,
-		projected_core_program_value,
-		projected_original_callable_name,
+		emitted_callable_name,
+		emitted_callback_name,
+		prepare_c_emission_symbols,
 		symbol_projection_error_text,
 	cancellation_plan:
 		BackendCleanupTemporaryRole(
@@ -969,10 +969,116 @@ private record FunctionBodyC {
 }
 
 
+private union CEmissionSymbolAuthority:
+	ValidatedCEmissionSymbols(CEmissionSymbolPlan)
+	UnprojectedCEmissionSymbolsForTests
+
+
 private record FunctionEmissionContext {
 	cleanup_plan: CancellationProtectionPlan,
-	profile_function_id: Option[ProfileFunctionId]
+	profile_function_id: Option[ProfileFunctionId],
+	symbol_authority: CEmissionSymbolAuthority
 }
+
+
+private pure func selected_callable_name(
+	authority: CEmissionSymbolAuthority,
+	qualified_name: String,
+	def_id: Int,
+) -> String:
+	match authority:
+		ValidatedCEmissionSymbols(plan):
+			emitted_callable_name(plan, qualified_name, def_id)
+		UnprojectedCEmissionSymbolsForTests:
+			qualified_name
+
+
+private pure func selected_callable_c_spelling(
+	authority: CEmissionSymbolAuthority,
+	qualified_name: String,
+	def_id: Int,
+	original_c_spelling: String,
+) -> String:
+	match authority:
+		ValidatedCEmissionSymbols(plan):
+			emitted_callable_name(plan, qualified_name, def_id)
+		UnprojectedCEmissionSymbolsForTests:
+			original_c_spelling
+
+
+private pure func selected_callback_name(
+	authority: CEmissionSymbolAuthority,
+	original_name: String,
+) -> String:
+	match authority:
+		ValidatedCEmissionSymbols(plan):
+			emitted_callback_name(plan, original_name)
+		UnprojectedCEmissionSymbolsForTests:
+			original_name
+
+
+private pure func selected_hash_container_constructor(
+	authority: CEmissionSymbolAuthority,
+	constructor: CoreHashContainerConstructor,
+) -> CoreHashContainerConstructor:
+	match constructor:
+		CustomHashContainerConstructor(hash_name, equals_name, needs_release):
+			CustomHashContainerConstructor(
+				selected_callback_name(authority, hash_name),
+				selected_callback_name(authority, equals_name),
+				needs_release,
+			)
+		_:
+			constructor
+
+
+private pure func selected_call_kind(
+	authority: CEmissionSymbolAuthority,
+	kind: CoreCallKind,
+) -> CoreCallKind:
+	match kind:
+		UserCall(name, Some(def_id), consumed_args):
+			UserCall(
+				selected_callable_name(authority, name, def_id),
+				Some(def_id),
+				consumed_args,
+			)
+		ListToStringCall(callback_name):
+			ListToStringCall(selected_callback_name(authority, callback_name))
+		DictWithCapacityCall(constructor):
+			DictWithCapacityCall(selected_hash_container_constructor(authority, constructor))
+		_:
+			kind
+
+
+private pure func selected_closure_create(
+	authority: CEmissionSymbolAuthority,
+	closure: CoreClosureCreate,
+) -> CoreClosureCreate:
+	match authority:
+		ValidatedCEmissionSymbols(plan):
+			name: String = emitted_callable_name(plan, closure.function_name, closure.def_id)
+			{ closure |
+				c_name = name,
+				static_name = static_closure_name(name)
+			}
+		UnprojectedCEmissionSymbolsForTests:
+			closure
+
+
+private pure func selected_task_closure(
+	authority: CEmissionSymbolAuthority,
+	task: CoreTaskClosure,
+) -> CoreTaskClosure:
+	match authority:
+		ValidatedCEmissionSymbols(plan):
+			name: String = emitted_callable_name(plan, task.function_name, task.def_id)
+			{ task |
+				c_name = name,
+				static_name = static_closure_name(name)
+			}
+		UnprojectedCEmissionSymbolsForTests:
+			task
 
 
 private pure func activation_requires_local_owner_protection(
@@ -986,6 +1092,7 @@ private pure func function_emission_context(
 	body: CoreExpr,
 	program_summary: CancellationProgramSummary,
 	profile_function_id: Option[ProfileFunctionId],
+	symbol_authority: CEmissionSymbolAuthority,
 ) -> FunctionEmissionContext:
 	identity: CoreDefinitionIdentity = {
 		name = func_info.name,
@@ -1004,13 +1111,15 @@ private pure func function_emission_context(
 
 	{
 		cleanup_plan = plan,
-		profile_function_id = profile_function_id
+		profile_function_id = profile_function_id,
+		symbol_authority = symbol_authority
 	}
 
 
 private pure func global_emission_context(
 	global: CoreGlobal,
 	program_summary: CancellationProgramSummary,
+	symbol_authority: CEmissionSymbolAuthority,
 ) -> FunctionEmissionContext:
 	identity: CoreDefinitionIdentity = {
 		name = global.name.name,
@@ -1029,7 +1138,8 @@ private pure func global_emission_context(
 
 	{
 		cleanup_plan = plan,
-		profile_function_id = None
+		profile_function_id = None,
+		symbol_authority = symbol_authority
 	}
 
 
@@ -1039,7 +1149,8 @@ private pure func diagnostic_emission_context(expr: CoreExpr) -> FunctionEmissio
 				name = "__backend_diagnostic",
 				def_id = -1,
 			}), expr),
-		profile_function_id = None
+		profile_function_id = None,
+		symbol_authority = UnprojectedCEmissionSymbolsForTests
 	}
 
 
@@ -1291,11 +1402,27 @@ private pure func c_return_type(func_info: CoreFunction) -> String:
 		TypeLayout.c_type_name(func_info.return_type)
 
 
-private pure func c_function_name(func_info: CoreFunction) -> String:
+private pure func c_function_name(
+	func_info: CoreFunction,
+	symbol_authority: CEmissionSymbolAuthority,
+) -> String:
 	if func_info.function_kind == ProgramEntrypointFunction:
 		ENTRYPOINT_FUNCTION_NAME
 	else:
-		c_identifier(func_info.name)
+		match func_info.function_kind:
+			UserFunction | ClosureBodyFunction(_):
+				if func_info.body.is_some():
+					c_identifier(
+						selected_callable_name(
+							symbol_authority,
+							func_info.name,
+							func_info.def_id,
+						),
+					)
+				else:
+					c_identifier(func_info.name)
+			_:
+				c_identifier(func_info.name)
 
 
 private pure func profile_function_is_eligible(func_info: CoreFunction) -> Bool:
@@ -1310,7 +1437,7 @@ private pure func profile_function_is_eligible(func_info: CoreFunction) -> Bool:
 
 private pure func described_profile_functions(
 	decls: List[CoreDecl],
-	projected: Option[CProjectedProgram],
+	symbol_authority: CEmissionSymbolAuthority,
 ) -> List[ProfileFunctionMetadata]:
 	var functions: List[ProfileFunctionMetadata] = []
 
@@ -1319,8 +1446,8 @@ private pure func described_profile_functions(
 			FunctionDecl(func_info):
 				if profile_function_is_eligible(func_info):
 					functions = functions.append({
-						logical_name = emitted_function_display_name(projected, func_info.name),
-						c_symbol = c_function_name(func_info),
+						logical_name = func_info.name,
+						c_symbol = c_function_name(func_info, symbol_authority),
 						module_path = func_info.source_module,
 						definition_id = func_info.def_id,
 					})
@@ -1433,14 +1560,17 @@ private pure func select_profile_functions(
 
 private pure func profile_emission_plan(
 	decls: List[CoreDecl],
-	projected: Option[CProjectedProgram],
+	symbol_authority: CEmissionSymbolAuthority,
 	configuration: FunctionProfileConfiguration,
 ) -> Result[Option[ProfileEmissionPlan], CoreEmitError]:
 	match configuration:
 		FunctionProfileOff:
 			Ok(None)
 		FunctionProfileCalls(_) | FunctionProfileExact(_):
-			described: List[ProfileFunctionMetadata] = described_profile_functions(decls, projected)
+			described: List[ProfileFunctionMetadata] = described_profile_functions(
+				decls,
+				symbol_authority,
+			)
 			selectors: List[FunctionProfileSelector] = function_profile_selectors(configuration)
 			selected ?= select_profile_functions(described, selectors)
 
@@ -1497,13 +1627,21 @@ private pure func emit_profile_metadata(plan: Option[ProfileEmissionPlan]) -> St
 			""
 
 
-private pure func c_function_signature(func_info: CoreFunction) -> String:
+private pure func c_function_signature(
+	func_info: CoreFunction,
+	symbol_authority: CEmissionSymbolAuthority,
+) -> String:
 	if entrypoint_has_source_args(func_info):
-		c_return_type(func_info) + " " + c_function_name(func_info) + "(int argc, char** argv)"
+		c_return_type(
+			func_info,
+		) + " " + c_function_name(func_info, symbol_authority) + "(int argc, char** argv)"
 	else:
 		c_return_type(
 			func_info,
-		) + " " + c_function_name(func_info) + "(" + c_param_list(func_info.params) + ")"
+		) + " " + c_function_name(
+			func_info,
+			symbol_authority,
+		) + "(" + c_param_list(func_info.params) + ")"
 
 
 private pure func c_var_name(variable: CoreVar) -> String:
@@ -2463,8 +2601,11 @@ private pure func cleanup_frame_name(variable: CoreVar) -> String:
 	"__blorp_cleanup_" + c_var_name(variable)
 
 
-private pure func cleanup_release_fn(kind: CoreCallKind) -> Option[String]:
-	match kind:
+private pure func cleanup_release_fn(
+	kind: CoreCallKind,
+	symbol_authority: CEmissionSymbolAuthority,
+) -> Option[String]:
+	match selected_call_kind(symbol_authority, kind):
 		UnknownCall | DeferredTraitCall(_, _) | SelectedTraitCall(_, _, _, _):
 			None
 		SelectedDirectCall(def_id):
@@ -2493,10 +2634,13 @@ private pure func cleanup_release_fn(kind: CoreCallKind) -> Option[String]:
 			None
 
 
-private pure func resource_cleanup_hook(cleanup: CoreExpr) -> Option[ResourceCleanupHook]:
+private pure func resource_cleanup_hook(
+	cleanup: CoreExpr,
+	symbol_authority: CEmissionSymbolAuthority,
+) -> Option[ResourceCleanupHook]:
 	match cleanup:
 		CallExpr(kind, callee, args, typ, loc):
-			resource_cleanup_hook_for_args(kind, args)
+			resource_cleanup_hook_for_args(kind, args, symbol_authority)
 		LiteralExpr(literal, typ, loc):
 			None
 		StaticStringLiteralExpr(id, value, typ, loc):
@@ -2678,10 +2822,11 @@ private pure func resource_cleanup_hook(cleanup: CoreExpr) -> Option[ResourceCle
 private pure func resource_cleanup_hook_for_args(
 	kind: CoreCallKind,
 	args: List[CoreExpr],
+	symbol_authority: CEmissionSymbolAuthority,
 ) -> Option[ResourceCleanupHook]:
 	match args:
 		[VarExpr(variable, var_type, var_loc)]:
-			release_fn ?= cleanup_release_fn(kind)
+			release_fn ?= cleanup_release_fn(kind, symbol_authority)
 			Some({
 				variable = variable,
 				release_fn = release_fn,
@@ -2694,8 +2839,11 @@ private pure func resource_cleanup_hook_for_args(
 			None
 
 
-private pure func resource_cleanup_push_statement(scope: CoreResourceScope) -> Option[String]:
-	hook ?= resource_cleanup_hook(scope.cleanup)
+private pure func resource_cleanup_push_statement(
+	scope: CoreResourceScope,
+	symbol_authority: CEmissionSymbolAuthority,
+) -> Option[String]:
+	hook ?= resource_cleanup_hook(scope.cleanup, symbol_authority)
 
 	if core_vars_equal(hook.variable, scope.variable):
 		frame_name: String = cleanup_frame_name(scope.variable)
@@ -3549,7 +3697,9 @@ private pure func c_unary_expr(op: CoreUnaryOp, expr_value: CoreExpr, value_c: S
 			match core_expr_type(expr_value):
 				NamedType(name, args):
 					if args.is_empty() and (name == "Int8" or name == "Int16"):
-						"((" + TypeLayout.c_type_name(core_expr_type(expr_value)) + ")" + raw_negation + ")"
+						"((" + TypeLayout.c_type_name(
+							core_expr_type(expr_value),
+						) + ")" + raw_negation + ")"
 					else:
 						raw_negation
 				_:
@@ -12030,9 +12180,9 @@ private pure func closure_env_prelude(
 		Some("  void** __e = (void**)__env;\n" + capture_decls)
 
 
-private pure func closure_body_suffix(abi: CoreClosureAbi) -> String:
+private pure func closure_body_suffix(abi: CoreClosureAbi, emitted_name: String) -> String:
 	if abi.captures.length() == 0:
-		emit_static_closure_definition(abi)
+		emit_static_closure_definition(emitted_name)
 	else:
 		""
 
@@ -12075,7 +12225,11 @@ private pure func closure_body_return_type(abi: CoreClosureAbi, return_type: Cor
 		"void*"
 
 
-private pure func closure_body_signature(return_type: CoreType, abi: CoreClosureAbi) -> String:
+private pure func closure_body_signature(
+	return_type: CoreType,
+	abi: CoreClosureAbi,
+	emitted_name: String,
+) -> String:
 	var params: String = "void* __env"
 	var index: Int = 0
 
@@ -12083,12 +12237,15 @@ private pure func closure_body_signature(return_type: CoreType, abi: CoreClosure
 		params += ", void* __arg" + index.to_string()
 		index += 1
 
-	closure_body_return_type(abi, return_type) + " " + c_identifier(abi.c_name) + "(" + params + ")"
+	closure_body_return_type(
+		abi,
+		return_type,
+	) + " " + c_identifier(emitted_name) + "(" + params + ")"
 
 
-private pure func emit_static_closure_definition(abi: CoreClosureAbi) -> String:
-	static_name: String = static_closure_name(abi.c_name)
-	function_name: String = c_identifier(abi.c_name)
+private pure func emit_static_closure_definition(emitted_name: String) -> String:
+	static_name: String = static_closure_name(emitted_name)
+	function_name: String = c_identifier(emitted_name)
 
 	"static blorp_Closure " + static_name + " = { { BLORP_IMMORTAL_REFCOUNT, BLORP_ALLOC_CLASS_DIRECT, 0 }, (void*)" + function_name + ", NULL, 0, 0 };\n"
 
@@ -12097,14 +12254,22 @@ private pure func emit_closure_body_function(
 	func_info: CoreFunction,
 	abi: CoreClosureAbi,
 	program_summary: CancellationProgramSummary,
+	symbol_authority: CEmissionSymbolAuthority,
 ) -> Option[String]:
 	match func_info.body:
 		Some(body):
+			emitted_name: String = selected_callable_c_spelling(
+				symbol_authority,
+				func_info.name,
+				func_info.def_id,
+				abi.c_name,
+			)
 			emission_context: FunctionEmissionContext = function_emission_context(
 				func_info,
 				body,
 				program_summary,
 				None,
+				symbol_authority,
 			)
 			param_decls ?= closure_param_decls(abi.params)
 			env_prelude ?= closure_env_prelude(abi, emission_context)
@@ -12112,8 +12277,9 @@ private pure func emit_closure_body_function(
 			prefix: String = closure_body_signature(
 				func_info.return_type,
 				abi,
+				emitted_name,
 			) + " {\n" + env_prelude + param_decls
-			suffix: String = closure_body_suffix(abi)
+			suffix: String = closure_body_suffix(abi, emitted_name)
 
 			if TypeLayout.is_void_type(func_info.return_type):
 				if abi.task_abi:
@@ -12830,13 +12996,15 @@ private pure func emit_simple_expr(
 		CooperativeCheckpointExpr(typ, loc):
 			None
 		CallExpr(kind, callee, args, typ, loc):
+			emitted_kind: CoreCallKind = selected_call_kind(emission_context.symbol_authority, kind)
+
 			if (
-				call_transfer_cleanup_pop_statements(kind, args, emission_context) != ""
+				call_transfer_cleanup_pop_statements(emitted_kind, args, emission_context) != ""
 				or simple_call_args_require_ordering(args)
 			):
 				None
 			else:
-				match kind:
+				match emitted_kind:
 					IntrinsicCall(name):
 						match emit_raw_scalar_tensor_get_unchecked(
 							name,
@@ -12867,7 +13035,7 @@ private pure func emit_simple_expr(
 						None
 					ListToStringCall(callback_name):
 						arg_values ?= emit_simple_expr_arg_values(args, emission_context)
-						emit_call_value_from_args(kind, arg_values, typ)
+						emit_call_value_from_args(emitted_kind, arg_values, typ)
 					BuiltinCall(name):
 						match emit_typed_builtin_tensor_call(name, args, typ, emission_context):
 							Some(rendered):
@@ -12913,7 +13081,7 @@ private pure func emit_simple_expr(
 															Some(rendered)
 														None:
 															emit_call_value_from_args(
-																kind,
+																emitted_kind,
 																arg_values,
 																typ,
 															)
@@ -12933,20 +13101,20 @@ private pure func emit_simple_expr(
 									Some(rendered):
 										Some(rendered)
 									None:
-										emit_call_value_from_args(kind, arg_values, typ)
+										emit_call_value_from_args(emitted_kind, arg_values, typ)
 					TensorParallelCall(name, layout):
 						arg_values ?= emit_simple_expr_arg_values(args, emission_context)
-						emit_call_value_from_args(kind, arg_values, typ)
+						emit_call_value_from_args(emitted_kind, arg_values, typ)
 					DictWithCapacityCall(constructor):
 						arg_values ?= emit_simple_expr_arg_values(args, emission_context)
-						emit_call_value_from_args(kind, arg_values, typ)
+						emit_call_value_from_args(emitted_kind, arg_values, typ)
 					OperationResultCall(bridge):
 						None
 					FallibleStreamTerminalCall(bridge):
 						None
 					ListToStringCall(callback_name):
 						arg_values ?= emit_simple_expr_arg_values(args, emission_context)
-						emit_call_value_from_args(kind, arg_values, typ)
+						emit_call_value_from_args(emitted_kind, arg_values, typ)
 					ClosureCall:
 						emit_closure_call(callee, args, typ, emission_context)
 					UnknownCall | DeferredTraitCall(_, _) | SelectedTraitCall(_, _, _, _):
@@ -12987,7 +13155,7 @@ private pure func emit_simple_expr(
 		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
 			None
 		ClosureCreateExpr(closure, typ, loc):
-			emit_closure_create(closure)
+			emit_closure_create(selected_closure_create(emission_context.symbol_authority, closure))
 		ListConstructExpr(construct, typ, loc):
 			emit_list_construct(construct, emission_context)
 		ListAllocExpr(alloc, typ, loc):
@@ -13025,11 +13193,26 @@ private pure func emit_simple_expr(
 			body_c ?= emit_simple_expr(body, emission_context)
 			Some(statement_expr(decl + ";", body_c))
 		DictConstructExpr(construct, typ, loc):
-			emit_dict_construct(construct, emission_context)
+			emit_dict_construct(
+				{ construct |
+					constructor = selected_hash_container_constructor(
+						emission_context.symbol_authority,
+						construct.constructor,
+					)
+				},
+				emission_context,
+			)
 		DictExpr(entries, typ, loc):
 			None
 		SetAllocExpr(alloc, typ, loc):
-			Some(emit_set_constructor(alloc))
+			Some(
+				emit_set_constructor(
+					selected_hash_container_constructor(
+						emission_context.symbol_authority,
+						alloc,
+					),
+				),
+			)
 		ListRetainExpr(retain, typ, loc):
 			emit_list_retain(retain, emission_context)
 		ListSetExpr(set, typ, loc):
@@ -14798,9 +14981,10 @@ private pure func emit_copy_concurrent_task_closure(
 	task: CoreTaskClosure,
 	base_temp: Int,
 	binding_index: Int,
+	symbol_authority: CEmissionSymbolAuthority,
 ) -> Option[String]:
 	fn_name: String = concurrent_task_function_name(base_temp, binding_index)
-	closure ?= task_as_copy_closure_create(task)
+	closure ?= task_as_copy_closure_create(selected_task_closure(symbol_authority, task))
 	closure_value ?= emit_closure_create(closure)
 
 	Some("  blorp_Closure* " + fn_name + " = (blorp_Closure*)" + closure_value + ";\n")
@@ -14900,16 +15084,26 @@ private pure func emit_task_closure_create(task: CoreTaskClosure) -> Option[Stri
 private pure func emit_resource_concurrent_task_closure(
 	task: CoreTaskClosure,
 	base_temp: Int,
+	symbol_authority: CEmissionSymbolAuthority,
 ) -> Option[String]:
 	fn_name: String = concurrent_task_function_name(base_temp, 0)
-	closure_value ?= emit_task_closure_create(task)
+	closure_value ?= emit_task_closure_create(selected_task_closure(symbol_authority, task))
 
 	Some("  blorp_Closure* " + fn_name + " = (blorp_Closure*)" + closure_value + ";\n")
 
 
-private pure func emit_detach(task: CoreTaskClosure, next_temp: Int) -> Option[FunctionBodyC]:
+private pure func emit_detach(
+	task: CoreTaskClosure,
+	next_temp: Int,
+	emission_context: FunctionEmissionContext,
+) -> Option[FunctionBodyC]:
 	fn_name: String = concurrent_task_function_name(next_temp, 0)
-	closure_statement ?= emit_copy_concurrent_task_closure(task, next_temp, 0)
+	closure_statement ?= emit_copy_concurrent_task_closure(
+		task,
+		next_temp,
+		0,
+		emission_context.symbol_authority,
+	)
 
 	Some({
 		statements = closure_statement + "  blorp_detach(" + fn_name + ");\n",
@@ -14925,8 +15119,14 @@ private pure func emit_concurrent_spawn(
 	base_temp: Int,
 	binding_index: Int,
 	window_name: String,
+	symbol_authority: CEmissionSymbolAuthority,
 ) -> Option[String]:
-	closure_statement ?= emit_copy_concurrent_task_closure(binding.task, base_temp, binding_index)
+	closure_statement ?= emit_copy_concurrent_task_closure(
+		binding.task,
+		base_temp,
+		binding_index,
+		symbol_authority,
+	)
 
 	spawn_helper: String = if TypeLayout.boxed_value_needs_release_type(binding.task.return_type):
 		"blorp_concurrent_task_window_spawn_owned_rc"
@@ -14996,6 +15196,7 @@ private pure func emit_concurrent_chunk(
 	base_temp: Int,
 	window_name: String,
 	deadline: Option[String],
+	symbol_authority: CEmissionSymbolAuthority,
 ) -> Option[String]:
 	var statements: String = ""
 	var failed: Bool = False
@@ -15003,7 +15204,14 @@ private pure func emit_concurrent_chunk(
 
 	for binding in chunk:
 		if not failed:
-			match emit_concurrent_spawn(binding, slot, base_temp, start_index + slot, window_name):
+			match emit_concurrent_spawn(
+				binding,
+				slot,
+				base_temp,
+				start_index + slot,
+				window_name,
+				symbol_authority,
+			):
 				Some(spawn):
 					statements += spawn
 				None:
@@ -15044,6 +15252,7 @@ private pure func emit_concurrent_chunks(
 	base_temp: Int,
 	window_name: String,
 	deadline: Option[String],
+	symbol_authority: CEmissionSymbolAuthority,
 ) -> Option[String]:
 	var statements: String = ""
 	var chunk: List[CoreConcurrentBinding] = []
@@ -15056,7 +15265,14 @@ private pure func emit_concurrent_chunks(
 			chunk = chunk.append(binding)
 
 			if chunk.length() == capacity:
-				match emit_concurrent_chunk(chunk, chunk_start, base_temp, window_name, deadline):
+				match emit_concurrent_chunk(
+					chunk,
+					chunk_start,
+					base_temp,
+					window_name,
+					deadline,
+					symbol_authority,
+				):
 					Some(chunk_statements):
 						statements += chunk_statements
 					None:
@@ -15069,7 +15285,14 @@ private pure func emit_concurrent_chunks(
 		current_index += 1
 
 	if not failed and chunk.length() > 0:
-		match emit_concurrent_chunk(chunk, chunk_start, base_temp, window_name, deadline):
+		match emit_concurrent_chunk(
+			chunk,
+			chunk_start,
+			base_temp,
+			window_name,
+			deadline,
+			symbol_authority,
+		):
 			Some(chunk_statements):
 				statements += chunk_statements
 			None:
@@ -15139,6 +15362,7 @@ private pure func emit_concurrent_block(
 		base_temp,
 		window_name,
 		timeout_setup.deadline,
+		emission_context.symbol_authority,
 	)
 	body_c ?= emit_function_body(block.body, current_temp, emission_context)
 
@@ -15191,9 +15415,15 @@ private pure func emit_concurrently_loop_spawn(
 	slot_name: String,
 	index_name: String,
 	list_name: String,
+	symbol_authority: CEmissionSymbolAuthority,
 ) -> Option[String]:
 	item_binding ?= emit_concurrently_loop_item_binding(loop, list_name, index_name)
-	closure_statement ?= emit_copy_concurrent_task_closure(loop.task, base_temp, 0)
+	closure_statement ?= emit_copy_concurrent_task_closure(
+		loop.task,
+		base_temp,
+		0,
+		symbol_authority,
+	)
 
 	spawn_helper: String = if TypeLayout.boxed_value_needs_release_type(loop.task.return_type):
 		"blorp_concurrent_task_window_spawn_owned_rc"
@@ -15271,6 +15501,7 @@ private pure func emit_concurrently_copy_item_loop(
 		slot_name,
 		index_name,
 		list_name,
+		emission_context.symbol_authority,
 	)
 	timeout_arg: String = concurrent_timeout_arg(timeout_setup.deadline, base_temp, 0)
 	timeout_arg_statements: String = concurrent_timeout_arg_statements(
@@ -15371,8 +15602,9 @@ private pure func emit_concurrently_resource_source_spawn(
 	base_temp: Int,
 	window_name: String,
 	slot_name: String,
+	symbol_authority: CEmissionSymbolAuthority,
 ) -> Option[String]:
-	closure_statement ?= emit_resource_concurrent_task_closure(task, base_temp)
+	closure_statement ?= emit_resource_concurrent_task_closure(task, base_temp, symbol_authority)
 
 	spawn_helper: String = if TypeLayout.boxed_value_needs_release_type(task.return_type):
 		"blorp_concurrent_task_window_spawn_owned_rc"
@@ -15437,6 +15669,7 @@ private pure func emit_concurrently_resource_source_loop(
 				base_temp,
 				window_name,
 				slot_name,
+				emission_context.symbol_authority,
 			)
 			join_statement: String = "  blorp_release((blorp_Object*)(" + concurrently_loop_join_call(
 				window_name,
@@ -19837,7 +20070,7 @@ private pure func emit_resource_cleanups(
 
 	for cleanup in cleanups:
 		if not failed:
-			match resource_cleanup_hook(cleanup):
+			match resource_cleanup_hook(cleanup, emission_context.symbol_authority):
 				Some(hook):
 					statements += cancellation_cleanup_pop_statement(hook.variable)
 				None:
@@ -19892,7 +20125,7 @@ private pure func emit_resource_scope(
 	emission_context: FunctionEmissionContext,
 ) -> Option[FunctionBodyC]:
 	acquire_c ?= emit_simple_expr(scope.acquire, emission_context)
-	push_statement ?= resource_cleanup_push_statement(scope)
+	push_statement ?= resource_cleanup_push_statement(scope, emission_context.symbol_authority)
 	resource_declaration: String = "  " + TypeLayout.c_type_name(
 		scope.typ,
 	) + " " + c_var_name(scope.variable) + " = " + acquire_c + ";\n"
@@ -20085,7 +20318,13 @@ private pure func emit_simple_or_call_body(
 		Some(value):
 			Some(body_value(value, next_temp))
 		None:
-			emit_call_body(kind, args, typ, next_temp, emission_context)
+			emit_call_body(
+				selected_call_kind(emission_context.symbol_authority, kind),
+				args,
+				typ,
+				next_temp,
+				emission_context,
+			)
 
 
 private pure func emit_dispatched_call_body(
@@ -20097,6 +20336,8 @@ private pure func emit_dispatched_call_body(
 	next_temp: Int,
 	emission_context: FunctionEmissionContext,
 ) -> Option[FunctionBodyC]:
+	-- The simple emitter selects callable symbols itself. Defer selection until
+	-- its fallback so the common direct-call path performs one plan lookup.
 	match kind:
 		OperationResultCall(bridge):
 			emit_operation_result_bridge_body(bridge, args, typ, next_temp, emission_context)
@@ -20112,7 +20353,13 @@ private pure func emit_dispatched_call_body(
 			if call_transfer_cleanup_pop_statements(kind, args, emission_context) == "":
 				emit_simple_or_call_body(expr, kind, args, typ, next_temp, emission_context)
 			else:
-				emit_call_body(kind, args, typ, next_temp, emission_context)
+				emit_call_body(
+					selected_call_kind(emission_context.symbol_authority, kind),
+					args,
+					typ,
+					next_temp,
+					emission_context,
+				)
 		IntrinsicCall(name):
 			if (
 				name == "list_retain_for"
@@ -20552,7 +20799,7 @@ private pure func emit_function_body(
 		PreClosureDetachExpr(detached, typ, loc):
 			None
 		DetachExpr(detached, typ, loc):
-			emit_detach(detached, next_temp)
+			emit_detach(detached, next_temp, emission_context)
 		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
 			None
 		ConcurrentlyLoopExpr(loop, typ, loc):
@@ -20926,8 +21173,9 @@ private pure func emit_channel_recv_attempt_value(
 private pure func emit_channel_attempt_return_function(
 	func_info: CoreFunction,
 	value: String,
+	symbol_authority: CEmissionSymbolAuthority,
 ) -> String:
-	c_function_signature(func_info) + " {\n  return " + value + ";\n}\n"
+	c_function_signature(func_info, symbol_authority) + " {\n  return " + value + ";\n}\n"
 
 
 private pure func emit_channel_send_timeout_attempt_for_values(
@@ -20936,6 +21184,7 @@ private pure func emit_channel_send_timeout_attempt_for_values(
 	temp_seed: String,
 	value_expr: CoreExpr,
 	arg_values: List[String],
+	symbol_authority: CEmissionSymbolAuthority,
 ) -> Option[String]:
 	match arg_values:
 		[channel, value, timeout]:
@@ -20949,7 +21198,7 @@ private pure func emit_channel_send_timeout_attempt_for_values(
 				send_constructors,
 				boxed_expr_temp_needs_release(value_expr),
 			)
-			Some(emit_channel_attempt_return_function(func_info, rendered))
+			Some(emit_channel_attempt_return_function(func_info, rendered, symbol_authority))
 		[]:
 			None
 		[first]:
@@ -20966,6 +21215,7 @@ private pure func emit_channel_try_send_attempt_for_values(
 	temp_seed: String,
 	value_expr: CoreExpr,
 	arg_values: List[String],
+	symbol_authority: CEmissionSymbolAuthority,
 ) -> Option[String]:
 	match arg_values:
 		[channel, value]:
@@ -20979,7 +21229,7 @@ private pure func emit_channel_try_send_attempt_for_values(
 				send_constructors,
 				boxed_expr_temp_needs_release(value_expr),
 			)
-			Some(emit_channel_attempt_return_function(func_info, rendered))
+			Some(emit_channel_attempt_return_function(func_info, rendered, symbol_authority))
 		[]:
 			None
 		[first]:
@@ -20994,6 +21244,7 @@ private pure func emit_channel_recv_timeout_attempt_for_values(
 	temp_seed: String,
 	channel_expr: CoreExpr,
 	arg_values: List[String],
+	symbol_authority: CEmissionSymbolAuthority,
 ) -> Option[String]:
 	match arg_values:
 		[channel, timeout]:
@@ -21019,7 +21270,7 @@ private pure func emit_channel_recv_timeout_attempt_for_values(
 				recv_constructors,
 				constructors.recv_value_uses_release_mask,
 			)
-			Some(emit_channel_attempt_return_function(func_info, rendered))
+			Some(emit_channel_attempt_return_function(func_info, rendered, symbol_authority))
 		[]:
 			None
 		[first]:
@@ -21034,6 +21285,7 @@ private pure func emit_channel_try_recv_attempt_for_values(
 	temp_seed: String,
 	channel_expr: CoreExpr,
 	arg_values: List[String],
+	symbol_authority: CEmissionSymbolAuthority,
 ) -> Option[String]:
 	match arg_values:
 		[channel]:
@@ -21059,7 +21311,7 @@ private pure func emit_channel_try_recv_attempt_for_values(
 				recv_constructors,
 				constructors.recv_value_uses_release_mask,
 			)
-			Some(emit_channel_attempt_return_function(func_info, rendered))
+			Some(emit_channel_attempt_return_function(func_info, rendered, symbol_authority))
 		[]:
 			None
 		[first, second, ...rest]:
@@ -21094,6 +21346,7 @@ private pure func emit_channel_attempt_user_function(
 							temp_seed,
 							value_expr,
 							arg_values,
+							emission_context.symbol_authority,
 						)
 					[]:
 						None
@@ -21112,6 +21365,7 @@ private pure func emit_channel_attempt_user_function(
 							temp_seed,
 							value_expr,
 							arg_values,
+							emission_context.symbol_authority,
 						)
 					[]:
 						None
@@ -21128,6 +21382,7 @@ private pure func emit_channel_attempt_user_function(
 							temp_seed,
 							channel_expr,
 							arg_values,
+							emission_context.symbol_authority,
 						)
 					[]:
 						None
@@ -21144,6 +21399,7 @@ private pure func emit_channel_attempt_user_function(
 							temp_seed,
 							channel_expr,
 							arg_values,
+							emission_context.symbol_authority,
 						)
 					[]:
 						None
@@ -21333,6 +21589,7 @@ private pure func emit_supported_user_function(
 	profile_plan: Option[ProfileEmissionPlan],
 	profile_function_id: Option[ProfileFunctionId],
 	program_summary: CancellationProgramSummary,
+	symbol_authority: CEmissionSymbolAuthority,
 ) -> Option[String]:
 	match func_info.body:
 		Some(body):
@@ -21341,6 +21598,7 @@ private pure func emit_supported_user_function(
 				body,
 				program_summary,
 				profile_function_id,
+				symbol_authority,
 			)
 
 			if profile_function_id.is_some():
@@ -21375,7 +21633,10 @@ private pure func emit_general_supported_user_function(
 		Some(body):
 			match emit_function_body(body, 0, emission_context):
 				Some(body_c):
-					prefix: String = c_function_signature(func_info) + " {\n"
+					prefix: String = c_function_signature(
+						func_info,
+						emission_context.symbol_authority,
+					) + " {\n"
 					body_prelude: String = entrypoint_arg_prelude(func_info)
 					body_cleanup: String = entrypoint_arg_cleanup(func_info)
 					is_entrypoint_function: Bool = func_info.function_kind == ProgramEntrypointFunction
@@ -21455,6 +21716,7 @@ private pure func emit_function(
 	display_name: String,
 	internal_linkage: Bool,
 	program_summary: CancellationProgramSummary,
+	symbol_authority: CEmissionSymbolAuthority,
 ) -> String:
 	rendered: String = match func_info.function_kind:
 		UserFunction:
@@ -21466,6 +21728,7 @@ private pure func emit_function(
 						profile_plan,
 						profile_function_id,
 						program_summary,
+						symbol_authority,
 					):
 						Some(c_code):
 							c_code
@@ -21482,6 +21745,7 @@ private pure func emit_function(
 						profile_plan,
 						profile_function_id,
 						program_summary,
+						symbol_authority,
 					):
 						Some(c_code):
 							c_code
@@ -21496,7 +21760,7 @@ private pure func emit_function(
 		ForeignFunction(_):
 			emit_function_inventory(func_info, display_name)
 		ClosureBodyFunction(abi):
-			match emit_closure_body_function(func_info, abi, program_summary):
+			match emit_closure_body_function(func_info, abi, program_summary, symbol_authority):
 				Some(c_code):
 					c_code
 				None:
@@ -21526,12 +21790,13 @@ private pure func function_kind_is_closure_body(kind: CoreFunctionKind) -> Bool:
 private pure func emit_function_forward_decl(
 	func_info: CoreFunction,
 	internal_linkage: Bool,
+	symbol_authority: CEmissionSymbolAuthority,
 ) -> String:
 	rendered: String = match func_info.function_kind:
 		UserFunction:
 			match func_info.body:
 				Some(body):
-					c_function_signature(func_info) + ";\n"
+					c_function_signature(func_info, symbol_authority) + ";\n"
 				None:
 					""
 		ProgramEntrypointFunction:
@@ -21545,7 +21810,16 @@ private pure func emit_function_forward_decl(
 		ClosureBodyFunction(abi):
 			match func_info.body:
 				Some(body):
-					closure_body_signature(func_info.return_type, abi) + ";\n"
+					closure_body_signature(
+						func_info.return_type,
+						abi,
+						selected_callable_c_spelling(
+							symbol_authority,
+							func_info.name,
+							func_info.def_id,
+							abi.c_name,
+						),
+					) + ";\n"
 				None:
 					""
 
@@ -21555,11 +21829,21 @@ private pure func emit_function_forward_decl(
 		rendered
 
 
-private pure func emit_static_closure_forward_decl(function_kind: CoreFunctionKind) -> String:
-	match function_kind:
+private pure func emit_static_closure_forward_decl(
+	func_info: CoreFunction,
+	symbol_authority: CEmissionSymbolAuthority,
+) -> String:
+	match func_info.function_kind:
 		ClosureBodyFunction(abi):
 			if abi.captures.length() == 0:
-				"static blorp_Closure " + static_closure_name(abi.c_name) + ";\n"
+				"static blorp_Closure " + static_closure_name(
+					selected_callable_c_spelling(
+						symbol_authority,
+						func_info.name,
+						func_info.def_id,
+						abi.c_name,
+					),
+				) + ";\n"
 			else:
 				""
 		UserFunction:
@@ -23394,8 +23678,13 @@ private pure func emit_global_runtime_init_body(
 	global: CoreGlobal,
 	next_temp: Int,
 	program_summary: CancellationProgramSummary,
+	symbol_authority: CEmissionSymbolAuthority,
 ) -> Option[FunctionBodyC]:
-	emission_context: FunctionEmissionContext = global_emission_context(global, program_summary)
+	emission_context: FunctionEmissionContext = global_emission_context(
+		global,
+		program_summary,
+		symbol_authority,
+	)
 	init_body ?= emit_function_body(global.init, next_temp, emission_context)
 
 	if init_body.returns:
@@ -24370,6 +24659,7 @@ private pure func emit_global_cleanup_statements(decls: List[CoreDecl]) -> Strin
 private pure func emit_global_init_function(
 	decls: List[CoreDecl],
 	program_summary: CancellationProgramSummary,
+	symbol_authority: CEmissionSymbolAuthority,
 ) -> Result[String, CoreEmitError]:
 	var statements: String = make_string(0)
 	var error: Option[CoreEmitError] = None
@@ -24387,6 +24677,7 @@ private pure func emit_global_init_function(
 								global,
 								temp_index,
 								program_summary,
+								symbol_authority,
 							):
 								Some(init_body):
 									statements = append_emitted_c(statements, init_body.statements)
@@ -24433,17 +24724,6 @@ private pure func emit_global_init_function(
 			)
 
 
-private pure func emitted_function_display_name(
-	projected: Option[CProjectedProgram],
-	emitted_name: String,
-) -> String:
-	match projected:
-		Some(program):
-			projected_original_callable_name(program, emitted_name)
-		None:
-			emitted_name
-
-
 private pure func profile_metadata_matches_function(
 	metadata: ProfileFunctionMetadata,
 	func_info: CoreFunction,
@@ -24476,7 +24756,7 @@ private pure func profile_function_id_at_cursor(
 private pure func emit_function_decls(
 	decls: List[CoreDecl],
 	profile_plan: Option[ProfileEmissionPlan],
-	projected: Option[CProjectedProgram],
+	symbol_authority: CEmissionSymbolAuthority,
 	internal_linkage: Bool,
 	program_summary: CancellationProgramSummary,
 ) -> String:
@@ -24504,9 +24784,10 @@ private pure func emit_function_decls(
 						func_info,
 						profile_plan,
 						profile_function_id,
-						emitted_function_display_name(projected, func_info.name),
+						func_info.name,
 						internal_linkage,
 						program_summary,
+						symbol_authority,
 					),
 				)
 			EnumDecl(enum_decl):
@@ -24532,6 +24813,7 @@ private pure func emit_function_decls(
 private pure func emit_function_forward_decls(
 	decls: List[CoreDecl],
 	internal_linkage: Bool,
+	symbol_authority: CEmissionSymbolAuthority,
 ) -> String:
 	var c_code: String = make_string(0)
 
@@ -24540,7 +24822,7 @@ private pure func emit_function_forward_decls(
 			FunctionDecl(func_info):
 				c_code = append_emitted_c(
 					c_code,
-					emit_function_forward_decl(func_info, internal_linkage),
+					emit_function_forward_decl(func_info, internal_linkage, symbol_authority),
 				)
 			EnumDecl(enum_decl):
 				void
@@ -24565,7 +24847,10 @@ private pure func emit_function_forward_decls(
 		c_code + "\n"
 
 
-private pure func emit_static_closure_forward_decls(decls: List[CoreDecl]) -> String:
+private pure func emit_static_closure_forward_decls(
+	decls: List[CoreDecl],
+	symbol_authority: CEmissionSymbolAuthority,
+) -> String:
 	var c_code: String = make_string(0)
 
 	for decl in decls:
@@ -24573,7 +24858,7 @@ private pure func emit_static_closure_forward_decls(decls: List[CoreDecl]) -> St
 			FunctionDecl(func_info):
 				c_code = append_emitted_c(
 					c_code,
-					emit_static_closure_forward_decl(func_info.function_kind),
+					emit_static_closure_forward_decl(func_info, symbol_authority),
 				)
 			EnumDecl(enum_decl):
 				void
@@ -24601,7 +24886,7 @@ private pure func emit_static_closure_forward_decls(decls: List[CoreDecl]) -> St
 private pure func emit_decls(
 	program: CoreProgram,
 	profile_configuration: FunctionProfileConfiguration,
-	projected: Option[CProjectedProgram],
+	symbol_authority: CEmissionSymbolAuthority,
 	canonical_empty_lists: List[CanonicalEmptyList],
 	internal_linkage: Bool,
 ) -> Result[String, CoreEmitError]:
@@ -24613,9 +24898,9 @@ private pure func emit_decls(
 	).map_err(
 		func(error): InvalidStaticStringLiteralPool(error),
 	)
-	global_init ?= emit_global_init_function(decls, cancellation_summary)
+	global_init ?= emit_global_init_function(decls, cancellation_summary, symbol_authority)
 
-	profile_plan ?= profile_emission_plan(decls, projected, profile_configuration)
+	profile_plan ?= profile_emission_plan(decls, symbol_authority, profile_configuration)
 
 	var c_code: String = make_string(0)
 	c_code = append_emitted_c(c_code, emit_heap_record_and_union_forward_decls(decls))
@@ -24635,17 +24920,26 @@ private pure func emit_decls(
 		c_code,
 		emit_static_string_literal_definitions(static_string_literals),
 	)
-	c_code = append_emitted_c(c_code, emit_static_closure_forward_decls(decls))
 	c_code = append_emitted_c(
 		c_code,
-		emit_function_forward_decls(decls, internal_linkage),
+		emit_static_closure_forward_decls(decls, symbol_authority),
+	)
+	c_code = append_emitted_c(
+		c_code,
+		emit_function_forward_decls(decls, internal_linkage, symbol_authority),
 	)
 	c_code = append_emitted_c(c_code, emit_global_decls(decls))
 	c_code = append_emitted_c(c_code, global_init)
 	c_code = append_emitted_c(c_code, emit_profile_metadata(profile_plan))
 	c_code = append_emitted_c(
 		c_code,
-		emit_function_decls(decls, profile_plan, projected, internal_linkage, cancellation_summary),
+		emit_function_decls(
+			decls,
+			profile_plan,
+			symbol_authority,
+			internal_linkage,
+			cancellation_summary,
+		),
 	)
 	Ok(c_code)
 
@@ -24666,21 +24960,20 @@ pure func try_emit_prepared_core_program_c_artifact_with_profile(
 ) -> Result[CArtifact, CoreEmitError]:
 	program: CoreProgram = prepared_core_program_value(prepared)
 
-	match project_core_program_callables(program):
+	match prepare_c_emission_symbols(program):
 		Err(error):
 			Err(CallableSymbolProjectionFailed(error))
-		Ok(projected):
-			projected_program: CoreProgram = projected_core_program_value(projected)
+		Ok(symbol_plan):
 			decls_c ?= emit_decls(
-				projected_program,
+				program,
 				profile_configuration,
-				Some(projected),
-				projected_canonical_empty_lists(projected),
+				ValidatedCEmissionSymbols(symbol_plan),
+				c_emission_canonical_empty_lists(symbol_plan),
 				True,
 			)
 			Ok({
 				c_code = C_ARTIFACT_HEADER + emit_foreign_includes(
-					projected_program.foreign_includes,
+					program.foreign_includes,
 				) + decls_c,
 				link_flags = [],
 				include_dirs = [],
@@ -24698,7 +24991,13 @@ pure func try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
 		func(error): CallableSymbolProjectionFailed(error),
 	)
 
-	decls_c ?= emit_decls(program, profile_configuration, None, canonical_empty_lists, False)
+	decls_c ?= emit_decls(
+		program,
+		profile_configuration,
+		UnprojectedCEmissionSymbolsForTests,
+		canonical_empty_lists,
+		False,
+	)
 	Ok({
 		c_code = C_ARTIFACT_HEADER + emit_foreign_includes(program.foreign_includes) + decls_c,
 		link_flags = [],

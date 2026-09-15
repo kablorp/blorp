@@ -48,9 +48,9 @@ uniquely writable.
 ## Feedback Loop
 
 Add a proposed fixture varying nesting depth, branch width, and construct kind
-around the actual `project_core_program_callables` boundary. Record nodes,
+around the actual `prepare_c_emission_symbols` boundary. Record nodes,
 names, modeled recursive transfers, allocations/releases, retired instructions,
-elapsed time, ordered name checksum, and projected-program checksum. Existing
+elapsed time, ordered name checksum, and emitted-C checksum. Existing
 symbol-projection benchmark modes do not isolate nested static globals.
 
 ```bash

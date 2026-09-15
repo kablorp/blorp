@@ -16,7 +16,9 @@ import:
 			ConcurrentlyLoopExpr,
 			DetachExpr,
 			DictConstructExpr,
+			ListConstructExpr,
 			LiteralExpr,
+			ResourceScopeExpr,
 			SetAllocExpr,
 			SeqExpr,
 			VarExpr,
@@ -25,11 +27,14 @@ import:
 		CoreFunction,
 		CoreFunctionKind(ClosureBodyFunction, UserFunction),
 		CoreHashContainerConstructor(CustomHashContainerConstructor),
+		CoreListStorageLayout(PointerListStorage),
 		CoreLiteral(IntLiteral),
 		CoreProgram,
 		CoreSourceLoc(SyntheticSourceLoc),
 		CoreTaskClosure,
 		CoreType(FunctionType, NamedType, VoidType),
+		CoreVar,
+	../../../src/compiler/stage_09_core/pipeline: prepared_core_program
 	../../../src/compiler/stage_10_backend/c_naming: static_closure_name
 	../../../src/compiler/stage_10_backend/c_symbol_projection:
 		CCallableSymbolCandidate,
@@ -46,11 +51,15 @@ import:
 			UnprojectedCallableValue,
 		),
 		build_callable_symbol_plan,
-		project_core_program_callables,
+		planned_emitted_callable_name,
+		planned_emitted_callback_name,
+		prepare_c_emission_symbols,
 		projected_callable_base_symbol,
 		projected_callable_name,
-		projected_core_program_value,
-		projected_original_callable_name,
+	../../../src/compiler/stage_10_backend/emit:
+		core_emit_error_message,
+		try_emit_prepared_core_program_c_artifact_with_profile,
+	../../../src/lib/function_profile: FunctionProfileConfiguration(FunctionProfileOff)
 	test: TestSuite
 
 
@@ -472,7 +481,7 @@ private pure func list_to_string_callback_program() -> CoreProgram:
 				function_type(),
 				SyntheticSourceLoc,
 			),
-			[],
+			[VoidExpr(VoidType, SyntheticSourceLoc)],
 			int_type(),
 			SyntheticSourceLoc,
 		),
@@ -533,7 +542,7 @@ private pure func custom_callback_call_program() -> CoreProgram:
 				VoidType,
 				SyntheticSourceLoc,
 			),
-			[],
+			[LiteralExpr(IntLiteral(4), int_type(), SyntheticSourceLoc)],
 			NamedType(
 				"Dict",
 				[int_type(), int_type()],
@@ -578,6 +587,45 @@ private pure func custom_callback_dict_construct_program() -> CoreProgram:
 	)
 	{
 		decls = [FunctionDecl(hash_function), FunctionDecl(equals_function), FunctionDecl(host)],
+		foreign_includes = []
+	}
+
+
+private pure func resource_cleanup_program() -> CoreProgram:
+	cleanup_name: String = "fixture_close_resource"
+	cleanup: CoreFunction = { user_function(
+		cleanup_name,
+		35,
+		VoidExpr(VoidType, SyntheticSourceLoc),
+	) | return_type = VoidType }
+	resource_variable: CoreVar = {
+		name = "resource",
+		uniq = 0,
+		def_id = None
+	}
+	host = user_function(
+		"fixture_resource_host",
+		36,
+		ResourceScopeExpr(
+			{
+				variable = resource_variable,
+				typ = int_type(),
+				acquire = LiteralExpr(IntLiteral(7), int_type(), SyntheticSourceLoc),
+				body = LiteralExpr(IntLiteral(11), int_type(), SyntheticSourceLoc),
+				cleanup = CallExpr(
+					UserCall(cleanup_name, Some(35), []),
+					VoidExpr(VoidType, SyntheticSourceLoc),
+					[VarExpr(resource_variable, int_type(), SyntheticSourceLoc)],
+					VoidType,
+					SyntheticSourceLoc,
+				)
+			},
+			int_type(),
+			SyntheticSourceLoc,
+		),
+	)
+	{
+		decls = [FunctionDecl(cleanup), FunctionDecl(host)],
 		foreign_includes = []
 	}
 
@@ -737,7 +785,7 @@ pure func test_projection_boundary_rejects_duplicate_final_definition_id() -> Bo
 		foreign_includes = []
 	}
 
-	match project_core_program_callables(program):
+	match prepare_c_emission_symbols(program):
 		Err(InvalidCoreDefinitionIdentity(detail)):
 			detail.contains("definition ID 42")
 		Ok(_):
@@ -750,27 +798,26 @@ pure func test_projects_user_definition_and_exact_direct_call_together() -> Bool
 	callee_name: String = "fixture_long_identity_function"
 	caller_name: String = "fixture_long_caller_function"
 
-	match project_core_program_callables(direct_call_program(Some(2))):
-		Ok(projected):
-			match projected_core_program_value(projected).decls:
-				[FunctionDecl(callee), FunctionDecl(caller)]:
-					match caller.body:
-						Some(CallExpr(UserCall(call_name, Some(2), _), _, _, _, _)):
-							(
-								callee.name == projected_callable_base_symbol(2)
-								and caller.name == projected_callable_base_symbol(3)
-								and call_name == callee.name
-							)
-						_:
-							False
-				_:
-					False
+	match prepare_c_emission_symbols(direct_call_program(Some(2))):
+		Ok(plan):
+			(
+				planned_emitted_callable_name(
+					plan,
+					callee_name,
+					2,
+				) == Some(projected_callable_base_symbol(2))
+				and planned_emitted_callable_name(
+					plan,
+					caller_name,
+					3,
+				) == Some(projected_callable_base_symbol(3))
+			)
 		Err(_):
 			False
 
 
 pure func test_rejects_user_call_without_exact_definition_identity() -> Bool:
-	match project_core_program_callables(direct_call_program(Some(99))):
+	match prepare_c_emission_symbols(direct_call_program(Some(99))):
 		Err(MissingProjectedCallable(name, def_id)):
 			name == "fixture_long_identity_function" and def_id == 99
 		_:
@@ -778,7 +825,7 @@ pure func test_rejects_user_call_without_exact_definition_identity() -> Bool:
 
 
 pure func test_rejects_unresolved_final_call_kind() -> Bool:
-	match project_core_program_callables(unresolved_call_program()):
+	match prepare_c_emission_symbols(unresolved_call_program()):
 		Err(UnsupportedPreparedCallKind(kind)):
 			kind == "unknown"
 		_:
@@ -786,7 +833,7 @@ pure func test_rejects_unresolved_final_call_kind() -> Bool:
 
 
 pure func test_rejects_top_level_function_value_without_closure_conversion() -> Bool:
-	match project_core_program_callables(unprojected_function_value_program()):
+	match prepare_c_emission_symbols(unprojected_function_value_program()):
 		Err(UnprojectedCallableValue(name, def_id)):
 			name == "fixture_function_value_target" and def_id == 19
 		_:
@@ -794,7 +841,7 @@ pure func test_rejects_top_level_function_value_without_closure_conversion() -> 
 
 
 pure func test_projection_preserves_breadth_first_first_error_selection() -> Bool:
-	match project_core_program_callables(breadth_first_error_program()):
+	match prepare_c_emission_symbols(breadth_first_error_program()):
 		Err(UnprojectedCallableValue(name, def_id)):
 			name == "fixture_breadth_first_target" and def_id == 28
 		_:
@@ -802,7 +849,7 @@ pure func test_projection_preserves_breadth_first_first_error_selection() -> Boo
 
 
 pure func test_projection_validates_closure_callee_before_arguments() -> Bool:
-	match project_core_program_callables(closure_callee_error_program()):
+	match prepare_c_emission_symbols(closure_callee_error_program()):
 		Err(UnprojectedCallableValue(name, def_id)):
 			name == "fixture_closure_callee_target" and def_id == 30
 		_:
@@ -810,7 +857,7 @@ pure func test_projection_validates_closure_callee_before_arguments() -> Bool:
 
 
 pure func test_projection_rejects_malformed_global_initializer() -> Bool:
-	match project_core_program_callables(malformed_global_initializer_program()):
+	match prepare_c_emission_symbols(malformed_global_initializer_program()):
 		Err(UnprojectedCallableValue(name, def_id)):
 			name == "fixture_global_initializer_target" and def_id == 32
 		_:
@@ -818,33 +865,22 @@ pure func test_projection_rejects_malformed_global_initializer() -> Bool:
 
 
 pure func test_projects_closure_body_create_and_static_object_together() -> Bool:
+	semantic_name: String = "fixture_long_closure"
 	original_c_name: String = "fixture_long_closure_body"
 
-	match project_core_program_callables(
-		closure_create_program(static_closure_name(original_c_name)),
-	):
-		Ok(projected):
-			match projected_core_program_value(projected).decls:
-				[FunctionDecl(body_function), FunctionDecl(host_function)]:
-					match (body_function.function_kind, host_function.body):
-						(ClosureBodyFunction(abi), Some(ClosureCreateExpr(create, _, _))):
-							expected: String = projected_callable_base_symbol(4)
-
-							(
-								abi.c_name == expected
-								and create.c_name == expected
-								and create.static_name == static_closure_name(expected)
-							)
-						_:
-							False
-				_:
-					False
+	match prepare_c_emission_symbols(closure_create_program(static_closure_name(original_c_name))):
+		Ok(plan):
+			planned_emitted_callable_name(
+				plan,
+				semantic_name,
+				4,
+			) == Some(projected_callable_base_symbol(4))
 		Err(_):
 			False
 
 
 pure func test_rejects_stale_closure_static_name() -> Bool:
-	match project_core_program_callables(closure_create_program("stale_static_name")):
+	match prepare_c_emission_symbols(closure_create_program("stale_static_name")):
 		Err(CallableCNameMismatch(expected, actual)):
 			expected == "__sc_fixture_long_closure_body" and actual == "stale_static_name"
 		_:
@@ -852,73 +888,37 @@ pure func test_rejects_stale_closure_static_name() -> Bool:
 
 
 pure func test_projects_detached_task_closure() -> Bool:
-	match project_core_program_callables(task_program()):
-		Ok(projected):
-			match projected_core_program_value(projected).decls:
-				[FunctionDecl(body_function), FunctionDecl(host_function)]:
-					match (body_function.function_kind, host_function.body):
-						(ClosureBodyFunction(abi), Some(DetachExpr(task, _, _))):
-							expected: String = projected_callable_base_symbol(6)
-
-							(
-								abi.c_name == expected
-								and task.c_name == expected
-								and task.static_name == static_closure_name(expected)
-							)
-						_:
-							False
-				_:
-					False
+	match prepare_c_emission_symbols(task_program()):
+		Ok(plan):
+			planned_emitted_callable_name(
+				plan,
+				"fixture_long_task",
+				6,
+			) == Some(projected_callable_base_symbol(6))
 		Err(_):
 			False
 
 
 pure func test_projects_concurrently_loop_task_closure() -> Bool:
-	match project_core_program_callables(concurrently_loop_program()):
-		Ok(projected):
-			match projected_core_program_value(projected).decls:
-				[FunctionDecl(body_function), FunctionDecl(host_function)]:
-					match (body_function.function_kind, host_function.body):
-						(ClosureBodyFunction(abi), Some(ConcurrentlyLoopExpr(loop, _, _))):
-							expected: String = projected_callable_base_symbol(11)
-
-							(
-								abi.c_name == expected
-								and loop.task.c_name == expected
-								and loop.task.static_name == static_closure_name(expected)
-							)
-						_:
-							False
-				_:
-					False
+	match prepare_c_emission_symbols(concurrently_loop_program()):
+		Ok(plan):
+			planned_emitted_callable_name(
+				plan,
+				"fixture_long_concurrently_loop_task",
+				11,
+			) == Some(projected_callable_base_symbol(11))
 		Err(_):
 			False
 
 
 pure func test_projects_concurrent_block_task_closure() -> Bool:
-	match project_core_program_callables(concurrent_block_program()):
-		Ok(projected):
-			match projected_core_program_value(projected).decls:
-				[FunctionDecl(body_function), FunctionDecl(host_function)]:
-					match (body_function.function_kind, host_function.body):
-						(ClosureBodyFunction(abi), Some(ConcurrentExpr(block, _, _))):
-							match block.bindings:
-								[binding]:
-									expected: String = projected_callable_base_symbol(13)
-
-									(
-										abi.c_name == expected
-										and binding.task.c_name == expected
-										and binding.task.static_name == static_closure_name(
-											expected,
-										)
-									)
-								_:
-									False
-						_:
-							False
-				_:
-					False
+	match prepare_c_emission_symbols(concurrent_block_program()):
+		Ok(plan):
+			planned_emitted_callable_name(
+				plan,
+				"fixture_long_concurrent_block_task",
+				13,
+			) == Some(projected_callable_base_symbol(13))
 		Err(_):
 			False
 
@@ -926,93 +926,70 @@ pure func test_projects_concurrent_block_task_closure() -> Bool:
 pure func test_projects_list_to_string_callback() -> Bool:
 	callback_name: String = "fixture_long_list_item_to_string"
 
-	match project_core_program_callables(list_to_string_callback_program()):
-		Ok(projected):
-			match projected_core_program_value(projected).decls:
-				[FunctionDecl(callback), FunctionDecl(host_function)]:
-					match host_function.body:
-						Some(CallExpr(ListToStringCall(projected_name), _, _, _, _)):
-							(
-								callback.name == projected_callable_base_symbol(15)
-								and projected_name == callback.name
-								and projected_original_callable_name(
-									projected,
-									callback.name,
-								) == callback_name
-							)
-						_:
-							False
-				_:
-					False
+	match prepare_c_emission_symbols(list_to_string_callback_program()):
+		Ok(plan):
+			(
+				planned_emitted_callable_name(
+					plan,
+					callback_name,
+					15,
+				) == Some(projected_callable_base_symbol(15))
+				and planned_emitted_callback_name(
+					plan,
+					callback_name,
+				) == Some(projected_callable_base_symbol(15))
+			)
 		Err(_):
 			False
 
 
 pure func test_projects_custom_collection_callbacks() -> Bool:
-	match project_core_program_callables(custom_callback_program()):
-		Ok(projected):
-			match projected_core_program_value(projected).decls:
-				[_, _, FunctionDecl(host_function)]:
-					match host_function.body:
-						Some(SetAllocExpr(constructor, _, _)):
-							match constructor:
-								CustomHashContainerConstructor(hash_name, equals_name, False):
-									(
-										hash_name == projected_callable_base_symbol(8)
-										and equals_name == projected_callable_base_symbol(9)
-									)
-								_:
-									False
-						_:
-							False
-				_:
-					False
+	match prepare_c_emission_symbols(custom_callback_program()):
+		Ok(plan):
+			(
+				planned_emitted_callback_name(
+					plan,
+					"fixture_custom_hash",
+				) == Some(projected_callable_base_symbol(8))
+				and planned_emitted_callback_name(
+					plan,
+					"fixture_custom_equals",
+				) == Some(projected_callable_base_symbol(9))
+			)
 		Err(_):
 			False
 
 
 pure func test_projects_dict_with_capacity_callbacks() -> Bool:
-	match project_core_program_callables(custom_callback_call_program()):
-		Ok(projected):
-			match projected_core_program_value(projected).decls:
-				[_, _, FunctionDecl(host_function)]:
-					match host_function.body:
-						Some(CallExpr(DictWithCapacityCall(constructor), _, _, _, _)):
-							match constructor:
-								CustomHashContainerConstructor(hash_name, equals_name, False):
-									(
-										hash_name == projected_callable_base_symbol(21)
-										and equals_name == projected_callable_base_symbol(22)
-									)
-								_:
-									False
-						_:
-							False
-				_:
-					False
+	match prepare_c_emission_symbols(custom_callback_call_program()):
+		Ok(plan):
+			(
+				planned_emitted_callback_name(
+					plan,
+					"fixture_call_custom_hash",
+				) == Some(projected_callable_base_symbol(21))
+				and planned_emitted_callback_name(
+					plan,
+					"fixture_call_custom_equals",
+				) == Some(projected_callable_base_symbol(22))
+			)
 		Err(_):
 			False
 
 
 pure func test_projects_dict_construct_callbacks() -> Bool:
-	match project_core_program_callables(custom_callback_dict_construct_program()):
-		Ok(projected):
-			match projected_core_program_value(projected).decls:
-				[_, _, FunctionDecl(host_function)]:
-					match host_function.body:
-						Some(DictConstructExpr(construct, _, _)):
-							match construct.constructor:
-								CustomHashContainerConstructor(hash_name, equals_name, False):
-									(
-										hash_name == projected_callable_base_symbol(24)
-										and equals_name == projected_callable_base_symbol(25)
-									)
-								_:
-									False
-						_:
-							False
-				_:
-					False
+	match prepare_c_emission_symbols(custom_callback_dict_construct_program()):
+		Ok(plan):
+			(
+				planned_emitted_callback_name(
+					plan,
+					"fixture_construct_custom_hash",
+				) == Some(projected_callable_base_symbol(24))
+				and planned_emitted_callback_name(
+					plan,
+					"fixture_construct_custom_equals",
+				) == Some(projected_callable_base_symbol(25))
+			)
 		Err(_):
 			False
 
@@ -1039,10 +1016,219 @@ pure func test_rejects_missing_custom_collection_callback() -> Bool:
 		foreign_includes = []
 	}
 
-	match project_core_program_callables(program):
+	match prepare_c_emission_symbols(program):
 		Err(UnresolvedCallbackTarget(name)):
 			name == "fixture_missing_hash"
 		_:
+			False
+
+
+pure func test_production_emits_direct_call_from_original_core() -> Bool:
+	callee: String = projected_callable_base_symbol(2)
+	caller: String = projected_callable_base_symbol(3)
+
+	match try_emit_prepared_core_program_c_artifact_with_profile(
+		prepared_core_program(direct_call_program(Some(2))),
+		FunctionProfileOff,
+	):
+		Ok(artifact):
+			(
+				artifact.c_code.contains("static long ${callee}(void);")
+				and artifact.c_code.contains("static long ${caller}(void);")
+				and artifact.c_code.contains("return ${callee}();")
+				and not artifact.c_code.contains("fixture_long_identity_function(")
+			)
+		Err(_):
+			False
+
+
+pure func test_production_emits_closure_and_task_helpers_from_original_core() -> Bool:
+	closure_name: String = projected_callable_base_symbol(4)
+	closure_static: String = static_closure_name(closure_name)
+	task_name: String = projected_callable_base_symbol(6)
+	task_static: String = static_closure_name(task_name)
+
+	closure_ok: Bool = match try_emit_prepared_core_program_c_artifact_with_profile(
+		prepared_core_program(
+			closure_create_program(static_closure_name("fixture_long_closure_body")),
+		),
+		FunctionProfileOff,
+	):
+		Ok(artifact):
+			(
+				artifact.c_code.contains("static void ${closure_name}(void* __env);")
+				and artifact.c_code.contains("static blorp_Closure ${closure_static}")
+				and artifact.c_code.contains("((void*)&${closure_static})")
+			)
+		Err(_):
+			False
+
+	task_ok: Bool = match try_emit_prepared_core_program_c_artifact_with_profile(
+		prepared_core_program(task_program()),
+		FunctionProfileOff,
+	):
+		Ok(artifact):
+			(
+				artifact.c_code.contains("static void* ${task_name}(void* __env);")
+				and artifact.c_code.contains("static blorp_Closure ${task_static}")
+				and artifact.c_code.contains("((void*)&${task_static})")
+			)
+		Err(_):
+			False
+
+	closure_ok and task_ok
+
+
+pure func test_production_emits_concurrent_task_helpers_from_original_core() -> Bool:
+	loop_task_name: String = projected_callable_base_symbol(11)
+	block_task_name: String = projected_callable_base_symbol(13)
+
+	loop_task_ok: Bool = match try_emit_prepared_core_program_c_artifact_with_profile(
+		prepared_core_program(concurrently_loop_program()),
+		FunctionProfileOff,
+	):
+		Ok(artifact):
+			(
+				artifact.c_code.contains(loop_task_name)
+				and not artifact.c_code.contains("fixture_long_concurrently_loop_task_body")
+			)
+		Err(_):
+			False
+
+	block_task_ok: Bool = match try_emit_prepared_core_program_c_artifact_with_profile(
+		prepared_core_program(concurrent_block_program()),
+		FunctionProfileOff,
+	):
+		Ok(artifact):
+			(
+				artifact.c_code.contains(block_task_name)
+				and not artifact.c_code.contains("fixture_long_concurrent_block_task_body")
+			)
+		Err(_):
+			False
+
+	loop_task_ok and block_task_ok
+
+
+pure func test_production_emits_custom_callbacks_from_original_core() -> Bool:
+	hash_name: String = projected_callable_base_symbol(8)
+	equals_name: String = projected_callable_base_symbol(9)
+
+	match try_emit_prepared_core_program_c_artifact_with_profile(
+		prepared_core_program(custom_callback_program()),
+		FunctionProfileOff,
+	):
+		Ok(artifact):
+			artifact.c_code.contains(
+				"blorp_set_new_custom((unsigned long (*)(void*))${hash_name}, " + "(bool (*)(void*, void*))${equals_name}, NULL)",
+			)
+		Err(_):
+			False
+
+
+pure func test_production_emits_dict_construct_callbacks_from_original_core() -> Bool:
+	hash_name: String = projected_callable_base_symbol(24)
+	equals_name: String = projected_callable_base_symbol(25)
+
+	match try_emit_prepared_core_program_c_artifact_with_profile(
+		prepared_core_program(custom_callback_dict_construct_program()),
+		FunctionProfileOff,
+	):
+		Ok(artifact):
+			artifact.c_code.contains(
+				"blorp_dict_new_custom((unsigned long (*)(void*))${hash_name}, " + "(bool (*)(void*, void*))${equals_name}, NULL)",
+			)
+		Err(_):
+			False
+
+
+pure func test_production_emits_list_callback_from_original_core() -> Bool:
+	list_callback: String = projected_callable_base_symbol(15)
+
+	match try_emit_prepared_core_program_c_artifact_with_profile(
+		prepared_core_program(list_to_string_callback_program()),
+		FunctionProfileOff,
+	):
+		Ok(artifact):
+			artifact.c_code.contains("(blorp_String* (*)(void*))${list_callback}")
+		Err(_):
+			False
+
+
+pure func test_production_emits_capacity_callbacks_from_original_core() -> Bool:
+	capacity_hash: String = projected_callable_base_symbol(21)
+	capacity_equals: String = projected_callable_base_symbol(22)
+
+	match try_emit_prepared_core_program_c_artifact_with_profile(
+		prepared_core_program(custom_callback_call_program()),
+		FunctionProfileOff,
+	):
+		Ok(artifact):
+			(
+				artifact.c_code.contains("(unsigned long (*)(void*))${capacity_hash}")
+				and artifact.c_code.contains("(bool (*)(void*, void*))${capacity_equals}")
+			)
+		Err(_):
+			False
+
+
+pure func test_production_projection_failure_returns_no_artifact() -> Bool:
+	match try_emit_prepared_core_program_c_artifact_with_profile(
+		prepared_core_program(direct_call_program(Some(99))),
+		FunctionProfileOff,
+	):
+		Ok(_):
+			False
+		Err(error):
+			core_emit_error_message(
+				error,
+			) == "missing projected callable `fixture_long_identity_function` (99)"
+
+
+pure func test_production_projects_resource_cleanup_function_pointer() -> Bool:
+	cleanup_name: String = projected_callable_base_symbol(35)
+
+	match try_emit_prepared_core_program_c_artifact_with_profile(
+		prepared_core_program(resource_cleanup_program()),
+		FunctionProfileOff,
+	):
+		Ok(artifact):
+			artifact.c_code.contains("(blorp_CancelCleanupFn)${cleanup_name}")
+		Err(_):
+			False
+
+
+pure func test_production_emits_canonical_empty_list_from_plan() -> Bool:
+	list_type: CoreType = NamedType("List", [int_type()])
+	function_info: CoreFunction = { user_function(
+		"fixture_empty_list",
+		34,
+		ListConstructExpr(
+			{
+				layout = PointerListStorage,
+				elements = [],
+				elem_needs_release = False
+			},
+			list_type,
+			SyntheticSourceLoc,
+		),
+	) | return_type = list_type }
+	program: CoreProgram = {
+		decls = [FunctionDecl(function_info)],
+		foreign_includes = []
+	}
+	symbol_name: String = "__blorp_canonical_empty_list_pointer_plain"
+
+	match try_emit_prepared_core_program_c_artifact_with_profile(
+		prepared_core_program(program),
+		FunctionProfileOff,
+	):
+		Ok(artifact):
+			(
+				artifact.c_code.contains("void* data[1]; } ${symbol_name} = {")
+				and artifact.c_code.contains("return (blorp_List*)&${symbol_name};")
+			)
+		Err(_):
 			False
 
 
@@ -1127,6 +1313,46 @@ tests: TestSuite = {
 		(
 			"rejects missing custom collection callback",
 			test_rejects_missing_custom_collection_callback,
+		),
+		(
+			"production emits direct call from original Core",
+			test_production_emits_direct_call_from_original_core,
+		),
+		(
+			"production emits closure and task helpers from original Core",
+			test_production_emits_closure_and_task_helpers_from_original_core,
+		),
+		(
+			"production emits concurrent task helpers from original Core",
+			test_production_emits_concurrent_task_helpers_from_original_core,
+		),
+		(
+			"production emits custom callbacks from original Core",
+			test_production_emits_custom_callbacks_from_original_core,
+		),
+		(
+			"production emits dict construct callbacks from original Core",
+			test_production_emits_dict_construct_callbacks_from_original_core,
+		),
+		(
+			"production emits list callback from original Core",
+			test_production_emits_list_callback_from_original_core,
+		),
+		(
+			"production emits capacity callbacks from original Core",
+			test_production_emits_capacity_callbacks_from_original_core,
+		),
+		(
+			"production projection failure returns no artifact",
+			test_production_projection_failure_returns_no_artifact,
+		),
+		(
+			"production projects resource cleanup function pointer",
+			test_production_projects_resource_cleanup_function_pointer,
+		),
+		(
+			"production emits canonical empty list from plan",
+			test_production_emits_canonical_empty_list_from_plan,
 		),
 	]
 }
