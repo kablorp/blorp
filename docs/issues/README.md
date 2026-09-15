@@ -67,7 +67,6 @@ current-state and next-action summary.
 - [Meta-resolution cycle membership](compiler-performance/102-index-meta-resolution-cycle-membership.md)
 - [Resource-reference deduplication](compiler-performance/104-index-resource-reference-deduplication.md)
 - [Standard-inline rename copying](compiler-performance/109-reduce-std-inline-rename-copying.md)
-- [Match-bound name deduplication](compiler-performance/110-deduplicate-match-bound-names-once.md)
 - [Call-signature name allocation](compiler-performance/111-index-call-signature-name-allocation.md)
 - [Normalized semantic compilation roadmap](compiler-performance/NORMALIZED_SEMANTIC_COMPILATION_ROADMAP.md)
 - [Perceus ownership roadmap](compiler-performance/PERCEUS_OWNERSHIP_OPTIMIZATION_ROADMAP.md)
