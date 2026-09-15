@@ -42,6 +42,9 @@ time and allocations by more than 10%, and exact output identity holds.
 - Retained retired-instruction samples:
   `benchmarks/results/compiler_source_ast_finalize_diagnostics_instructions_2026-09-14.tsv`,
   SHA-256 `6c97a5586536099dfafb8c2ccd6b6959edb20b6db452b894c4c02fff2b612069`.
+- Instruction raw-file manifest:
+  `/private/tmp/blorp-issue106-warm-results.VdywWI/instructions-sha256.txt`,
+  SHA-256 `1b46f2d2828717a99bceae359c923e961826e7d41f32516b2e2a98848967a6f5`.
 - Raw outputs:
   `/private/tmp/blorp-issue106-warm-results.VdywWI/{variant}-{workload}-{N}.out`.
 - Raw hash manifest:
@@ -107,10 +110,38 @@ shasum -a 256 "$out"/*.out "$out"/*.c "$out/baseline" "$out/candidate" \
   > "$out/sha256.txt"
 
 # Run a second seven-pair alternating matrix for dense and heavy under the
-# macOS process counter. Parse "instructions retired" from stderr into the
-# retained instruction TSV.
-/usr/bin/time -lp "$out/baseline" 2 4096 3 8 1 >/dev/null \
-  2> "$out/baseline-heavy-1.instructions"
+# macOS process counter. LC_ALL=C fixes the field labels parsed below.
+printf 'workload\tsample\tvariant\tinstructions_retired\tpeak_memory_bytes\n' \
+  > "$out/instructions.tsv"
+run_counter() {
+  variant=$1 workload=$2 sample=$3
+  case "$workload" in
+    dense) args=(5 1024 2 4 1) ;;
+    heavy) args=(2 4096 3 8 1) ;;
+  esac
+  raw="$out/${variant}-${workload}-${sample}.instructions"
+  LC_ALL=C /usr/bin/time -lp "$out/$variant" "${args[@]}" \
+    >/dev/null 2> "$raw"
+  instructions=$(sed -nE \
+    's/^[[:space:]]*([0-9]+)[[:space:]]+instructions retired$/\1/p' "$raw")
+  peak_memory=$(sed -nE \
+    's/^[[:space:]]*([0-9]+)[[:space:]]+maximum resident set size$/\1/p' "$raw")
+  printf '%s\t%s\t%s\t%s\t%s\n' "$workload" "$sample" "$variant" \
+    "$instructions" "$peak_memory" >> "$out/instructions.tsv"
+}
+for workload in dense heavy; do
+  for n in 1 2 3 4 5 6 7; do
+    if (( n % 2 )); then
+      order=(baseline candidate)
+    else
+      order=(candidate baseline)
+    fi
+    for variant in "${order[@]}"; do
+      run_counter "$variant" "$workload" "$n"
+    done
+  done
+done
+shasum -a 256 "$out"/*.instructions > "$out/instructions-sha256.txt"
 ```
 
 ## Results
