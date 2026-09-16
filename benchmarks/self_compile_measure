@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+"""Standard self-compile measurement for compiler performance work.
+
+Measures one compiler executable compiling a frozen input snapshot to C and
+reports, per compiler phase, allocation counts (deterministic) and, per run,
+retired instructions, wall time, and peak RSS. Every worker and every
+baseline/candidate comparison uses this script so numbers are comparable.
+
+Subcommands:
+
+  measure   Run the measurement (default when no subcommand is given).
+  freeze    Create the frozen input snapshot for a revision and print its path.
+  lock      Run an arbitrary command under the global measurement lock.
+
+The global lock serializes measurements and multi-process gates across
+worktrees so they do not perturb each other or overwhelm macOS syspolicyd.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import fcntl
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import statistics
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+TMP_BASE = Path(os.environ.get("TMPDIR", "/tmp"))
+LOCK_PATH = TMP_BASE / "blorp-perf-measure.lock"
+INPUT_BASE = TMP_BASE / "blorp-perf-input"
+CHECKPOINT_RE = re.compile(r"^BLORP_COMPILER_MEMORY_CHECKPOINT\s+(.*)$")
+PHASE_ROW_RE = re.compile(r"^([a-z_]+)\t([0-9.]+) ms$")
+INSTRUCTIONS_RE = re.compile(r"^\s*(\d+)\s+instructions retired")
+RSS_RE = re.compile(r"^\s*(\d+)\s+maximum resident set size")
+REAL_RE = re.compile(r"^\s*([0-9.]+)\s+real\s+([0-9.]+)\s+user\s+([0-9.]+)\s+sys")
+SMALL_PROGRAM = SCRIPT_DIR / "self_compile" / "small.brp"
+SCHEMA_VERSION = 1
+
+
+class MeasureError(Exception):
+    pass
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def git(args: list[str], cwd: Path) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def freeze_input(rev: str) -> Path:
+    """Materialize blorp/ and standard_library/ from `rev` into a shared dir."""
+    full = git(["rev-parse", "--verify", f"{rev}^{{commit}}"], REPO_ROOT)
+    target = INPUT_BASE / full
+    marker = target / ".complete"
+    embedded_std = target / "blorp" / "src" / "compiler" / "stage_01_generated_inputs" / "embedded_std.brp"
+    if marker.exists() and embedded_std.exists():
+        return target
+    generator = REPO_ROOT / "blorp" / "build" / "_build" / "build-tools" / "generate-build-sources"
+    if not generator.exists():
+        raise MeasureError(f"build source generator missing at {generator}; run make first")
+    if target.exists():
+        shutil.rmtree(target)
+    target.mkdir(parents=True)
+    archive = subprocess.run(
+        ["git", "archive", full, "blorp", "standard_library"],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+    ).stdout
+    subprocess.run(["tar", "-x", "-C", str(target)], input=archive, check=True)
+    # embedded_std.brp is a gitignored build product; regenerate it from the
+    # frozen standard library so the input is complete and self-consistent.
+    embedded_std.parent.mkdir(parents=True, exist_ok=True)
+    with embedded_std.open("wb") as handle:
+        subprocess.run(
+            [str(generator), "embedded-std", str(target / "standard_library" / "src")],
+            check=True,
+            stdout=handle,
+        )
+    marker.write_text(full + "\n")
+    return target
+
+
+class GlobalLock:
+    def __init__(self) -> None:
+        LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        self.handle = LOCK_PATH.open("a+")
+
+    def __enter__(self) -> "GlobalLock":
+        fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+        self.handle.close()
+
+
+def compiler_repo_root(compiler: Path) -> Path | None:
+    candidate = compiler.resolve().parent.parent
+    if (candidate / "scripts" / "compiler-build-status").exists():
+        return candidate
+    return None
+
+
+def check_build_fresh(compiler: Path) -> str:
+    root = compiler_repo_root(compiler)
+    if root is None:
+        return "unknown (compiler not inside a repo checkout)"
+    result = subprocess.run(
+        [str(root / "scripts" / "compiler-build-status"), "--quiet"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        return "FRESH"
+    if result.returncode == 1:
+        raise MeasureError(
+            f"bin/blorp in {root} is STALE relative to its sources; run make first"
+        )
+    return "UNKNOWN"
+
+
+def run_compile(
+    compiler: Path,
+    input_dir: Path,
+    program: Path,
+    output_c: Path,
+    env_extra: dict[str, str],
+    with_time: bool,
+) -> tuple[str, dict]:
+    args = [
+        str(compiler),
+        "compile",
+        "--no-format",
+        "--no-embed-runtime",
+        "--time-phases",
+        "--std-dir",
+        str(input_dir / "standard_library" / "src"),
+        "-o",
+        str(output_c),
+        str(program),
+    ]
+    if with_time:
+        args = ["/usr/bin/time", "-l", *args]
+    env = dict(os.environ)
+    env.pop("BLORP_COMPILER_MEMORY_PROFILE", None)
+    env.pop("BLORP_ALLOCATOR_STATS", None)
+    env.update(env_extra)
+    result = subprocess.run(args, capture_output=True, text=True, env=env)
+    if result.returncode != 0:
+        raise MeasureError(
+            f"compile failed (exit {result.returncode}):\n{result.stderr[-4000:]}"
+        )
+    stderr = result.stderr
+    parsed: dict = {"phases_ms": {}, "checkpoints": []}
+    for line in stderr.splitlines():
+        row = PHASE_ROW_RE.match(line)
+        if row:
+            parsed["phases_ms"][row.group(1)] = float(row.group(2))
+            continue
+        checkpoint = CHECKPOINT_RE.match(line)
+        if checkpoint:
+            fields = dict(
+                item.split("=", 1) for item in checkpoint.group(1).split() if "=" in item
+            )
+            parsed["checkpoints"].append(fields)
+            continue
+        instructions = INSTRUCTIONS_RE.match(line)
+        if instructions:
+            parsed["instructions_retired"] = int(instructions.group(1))
+            continue
+        rss = RSS_RE.match(line)
+        if rss:
+            parsed["peak_rss_bytes"] = int(rss.group(1))
+            continue
+        real = REAL_RE.match(line)
+        if real:
+            parsed["wall_seconds"] = float(real.group(1))
+            parsed["user_seconds"] = float(real.group(2))
+    return sha256_file(output_c), parsed
+
+
+def checkpoint_deltas(checkpoints: list[dict]) -> list[dict]:
+    rows = []
+    previous_total = 0
+    previous_bytes = 0
+    for fields in checkpoints:
+        name = fields.get("phase", "?")
+        total = int(fields.get("total_allocations", 0))
+        allocator_bytes = int(fields.get("allocator_bytes", 0))
+        rows.append(
+            {
+                "name": name,
+                "total_allocations": total,
+                "delta_allocations": total - previous_total,
+                "current_objects": int(fields.get("current_objects", 0)),
+                "allocator_bytes": allocator_bytes,
+                "delta_allocator_bytes": allocator_bytes - previous_bytes,
+                "rss_bytes": int(fields.get("rss_bytes", 0)),
+            }
+        )
+        previous_total = total
+        previous_bytes = allocator_bytes
+    return rows
+
+
+def measure(args: argparse.Namespace) -> dict:
+    compiler = Path(args.compiler).resolve()
+    if not compiler.exists():
+        raise MeasureError(f"compiler not found: {compiler}")
+    freshness = "skipped" if args.skip_build_check else check_build_fresh(compiler)
+    if args.input_dir:
+        input_dir = Path(args.input_dir).resolve()
+        input_rev = (input_dir / ".complete").read_text().strip() if (input_dir / ".complete").exists() else "unknown"
+    else:
+        input_rev = git(["rev-parse", "--verify", f"{args.input_rev}^{{commit}}"], REPO_ROOT)
+        input_dir = freeze_input(input_rev)
+    if args.program == "self":
+        program = input_dir / "blorp" / "src" / "main.brp"
+    else:
+        program = SMALL_PROGRAM.resolve()
+    if not program.exists():
+        raise MeasureError(f"program not found: {program}")
+
+    root = compiler_repo_root(compiler)
+    compiler_rev = git(["rev-parse", "HEAD"], root) if root else "unknown"
+    compiler_dirty = bool(git(["status", "--porcelain", "--untracked-files=no"], root)) if root else None
+
+    record: dict = {
+        "schema": SCHEMA_VERSION,
+        "label": args.label,
+        "timestamp": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
+        "host": platform.node(),
+        "machine": platform.machine(),
+        "compiler_path": str(compiler),
+        "compiler_sha256": sha256_file(compiler),
+        "compiler_rev": compiler_rev,
+        "compiler_dirty": compiler_dirty,
+        "compiler_build_status": freshness,
+        "c_optimization": os.environ.get("BLORP_CLI_C_OPTIMIZATION", "-O0 (default)"),
+        "input_rev": input_rev,
+        "input_dir": str(input_dir),
+        "program": args.program,
+        "samples": args.samples,
+    }
+
+    with GlobalLock(), tempfile.TemporaryDirectory(prefix="blorp-measure.") as tmp:
+        tmp_dir = Path(tmp)
+        alloc_c = tmp_dir / "alloc.c"
+        output_sha, alloc_run = run_compile(
+            compiler, input_dir, program, alloc_c,
+            {"BLORP_COMPILER_MEMORY_PROFILE": "1"}, with_time=False,
+        )
+        record["output_sha256"] = output_sha
+        record["output_bytes"] = alloc_c.stat().st_size
+        record["checkpoints"] = checkpoint_deltas(alloc_run["checkpoints"])
+        record["total_allocations"] = (
+            record["checkpoints"][-1]["total_allocations"] if record["checkpoints"] else None
+        )
+        if args.keep_output:
+            shutil.copyfile(alloc_c, Path(args.keep_output))
+
+        instructions: list[int] = []
+        walls: list[float] = []
+        rss: list[int] = []
+        phase_samples: dict[str, list[float]] = {}
+        for index in range(args.samples):
+            sample_c = tmp_dir / f"sample{index}.c"
+            sample_sha, run = run_compile(
+                compiler, input_dir, program, sample_c, {}, with_time=True
+            )
+            if sample_sha != output_sha:
+                raise MeasureError("generated C differed between runs of the same compiler")
+            sample_c.unlink()
+            instructions.append(run.get("instructions_retired", 0))
+            walls.append(run.get("wall_seconds", 0.0))
+            rss.append(run.get("peak_rss_bytes", 0))
+            for name, ms in run["phases_ms"].items():
+                phase_samples.setdefault(name, []).append(ms)
+
+    record["instructions_retired"] = {
+        "min": min(instructions) if instructions else None,
+        "median": statistics.median(instructions) if instructions else None,
+        "samples": instructions,
+    }
+    record["wall_seconds"] = {
+        "min": min(walls) if walls else None,
+        "median": statistics.median(walls) if walls else None,
+        "samples": walls,
+    }
+    record["peak_rss_bytes"] = max(rss) if rss else None
+    record["phases_ms"] = {
+        name: statistics.median(values) for name, values in phase_samples.items()
+    }
+    return record
+
+
+def pct(baseline: float | None, candidate: float | None) -> str:
+    if not baseline or candidate is None:
+        return "n/a"
+    return f"{100.0 * (candidate - baseline) / baseline:+.2f}%"
+
+
+def fmt(value) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, float):
+        return f"{value:,.1f}"
+    return f"{value:,}"
+
+
+def compare(baseline: dict, candidate: dict) -> bool:
+    identical = baseline.get("output_sha256") == candidate.get("output_sha256")
+    print()
+    print(f"baseline : {baseline.get('label')} @ {baseline.get('compiler_rev', '?')[:12]}")
+    print(f"candidate: {candidate.get('label')} @ {candidate.get('compiler_rev', '?')[:12]}")
+    print(f"input    : {candidate.get('input_rev', '?')[:12]}  program={candidate.get('program')}")
+    print(f"output C : {'IDENTICAL' if identical else 'DIFFERENT'} "
+          f"({baseline.get('output_bytes')} vs {candidate.get('output_bytes')} bytes)")
+    print()
+    header = f"{'metric':<44} {'baseline':>16} {'candidate':>16} {'delta':>9}"
+    print(header)
+    print("-" * len(header))
+    base_cp = {row["name"]: row for row in baseline.get("checkpoints", [])}
+    cand_cp = {row["name"]: row for row in candidate.get("checkpoints", [])}
+    for name in list(base_cp) + [n for n in cand_cp if n not in base_cp]:
+        b = base_cp.get(name, {}).get("delta_allocations")
+        c = cand_cp.get(name, {}).get("delta_allocations")
+        print(f"{'allocs ' + name:<44} {fmt(b):>16} {fmt(c):>16} {pct(b, c):>9}")
+    b = baseline.get("total_allocations"); c = candidate.get("total_allocations")
+    print(f"{'allocs TOTAL':<44} {fmt(b):>16} {fmt(c):>16} {pct(b, c):>9}")
+    b = baseline.get("instructions_retired", {}).get("min")
+    c = candidate.get("instructions_retired", {}).get("min")
+    print(f"{'instructions retired (min)':<44} {fmt(b):>16} {fmt(c):>16} {pct(b, c):>9}")
+    for name in list(baseline.get("phases_ms", {})) + [
+        n for n in candidate.get("phases_ms", {}) if n not in baseline.get("phases_ms", {})
+    ]:
+        b = baseline.get("phases_ms", {}).get(name)
+        c = candidate.get("phases_ms", {}).get(name)
+        print(f"{'ms ' + name + ' (median)':<44} {fmt(b):>16} {fmt(c):>16} {pct(b, c):>9}")
+    b = baseline.get("wall_seconds", {}).get("min"); c = candidate.get("wall_seconds", {}).get("min")
+    print(f"{'wall seconds (min)':<44} {fmt(b):>16} {fmt(c):>16} {pct(b, c):>9}")
+    b = baseline.get("peak_rss_bytes"); c = candidate.get("peak_rss_bytes")
+    print(f"{'peak RSS bytes':<44} {fmt(b):>16} {fmt(c):>16} {pct(b, c):>9}")
+    print()
+    return identical
+
+
+def cmd_measure(args: argparse.Namespace) -> int:
+    record = measure(args)
+    if args.output:
+        Path(args.output).write_text(json.dumps(record, indent=2) + "\n")
+        print(f"wrote {args.output}")
+    if args.baseline:
+        baseline = json.loads(Path(args.baseline).read_text())
+        identical = compare(baseline, record)
+        if args.require_identical and not identical:
+            print("generated C differs from baseline", file=sys.stderr)
+            return 3
+    else:
+        print(json.dumps({k: v for k, v in record.items() if k != "checkpoints"}, indent=2))
+        for row in record["checkpoints"]:
+            print(f"  {row['name']:<36} allocs +{row['delta_allocations']:>12,}")
+    return 0
+
+
+def cmd_freeze(args: argparse.Namespace) -> int:
+    print(freeze_input(args.rev))
+    return 0
+
+
+def cmd_lock(args: argparse.Namespace) -> int:
+    if not args.command:
+        raise MeasureError("lock requires a command after --")
+    with GlobalLock():
+        return subprocess.call(args.command)
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command_name")
+
+    measure_parser = sub.add_parser("measure", help="measure a compiler (default)")
+    for p in (parser, measure_parser):
+        p.add_argument("--compiler", default=str(REPO_ROOT / "bin" / "blorp"))
+        p.add_argument("--input-rev", default="HEAD", help="revision to freeze as the input snapshot")
+        p.add_argument("--input-dir", help="use an existing frozen input directory")
+        p.add_argument("--program", choices=["self", "small"], default="self")
+        p.add_argument("--label", default="unlabeled")
+        p.add_argument("--samples", type=int, default=2, help="uninstrumented timing samples")
+        p.add_argument("--baseline", help="baseline JSON to compare against")
+        p.add_argument("--output", help="write the measurement JSON here")
+        p.add_argument("--keep-output", help="copy the generated C here")
+        p.add_argument("--require-identical", action="store_true", help="exit 3 if generated C differs from baseline")
+        p.add_argument("--skip-build-check", action="store_true")
+
+    freeze_parser = sub.add_parser("freeze", help="materialize the frozen input for a revision")
+    freeze_parser.add_argument("--rev", default="HEAD")
+
+    lock_parser = sub.add_parser("lock", help="run a command under the global measurement lock")
+    lock_parser.add_argument("command", nargs=argparse.REMAINDER)
+
+    args = parser.parse_args(argv)
+    try:
+        if args.command_name == "freeze":
+            return cmd_freeze(args)
+        if args.command_name == "lock":
+            command = list(args.command)
+            if command and command[0] == "--":
+                command = command[1:]
+            args.command = command
+            return cmd_lock(args)
+        return cmd_measure(args)
+    except MeasureError as error:
+        print(f"self_compile_measure: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

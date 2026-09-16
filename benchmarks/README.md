@@ -1726,6 +1726,73 @@ sampled runs for allocator detail. Requests, responses, emitted C, and
 measurement files live in a temporary directory and are removed after each
 run.
 
+## Self-Compile Measurement Protocol
+
+`benchmarks/self_compile_measure` is the one standard measurement for
+compiler-performance work. Every worker, baseline, and acceptance decision
+uses it so numbers are comparable across branches, worktrees, and people.
+
+It compiles a **frozen input snapshot** (the compiler's own `blorp/src` and
+`standard_library/src` at one recorded revision) to C with one compiler
+executable and reports:
+
+- allocations per compiler phase, from the runtime's memory checkpoints
+  (deterministic; the primary signal while iterating);
+- retired instructions per run, from `/usr/bin/time -l` (stable to about
+  0.1% on Apple Silicon; the primary acceptance signal);
+- per-phase wall time, total wall time, and peak RSS (secondary; host noise);
+- the SHA-256 of the generated C (the correctness gate: a
+  representation-only change must produce **identical** C).
+
+```bash
+# One-time per checkout: build, then confirm the executable is fresh.
+make
+scripts/compiler-build-status
+
+# Candidate measurement against the shared baseline (self-compile).
+benchmarks/self_compile_measure \
+  --label issue-147-step2 \
+  --input-rev <input_rev from the baseline JSON> \
+  --baseline benchmarks/results/self_compile_baseline_O0_2026-09-16.json \
+  --output /tmp/issue-147-step2.json --require-identical
+
+# Small-program guard (must not regress materially).
+benchmarks/self_compile_measure --program small \
+  --label issue-147-step2-small \
+  --input-rev <input_rev> \
+  --baseline benchmarks/results/self_compile_small_baseline_O0_2026-09-16.json \
+  --output /tmp/issue-147-step2-small.json --require-identical
+
+# Run a multi-process gate without overlapping another worker's measurement.
+benchmarks/self_compile_measure lock -- scripts/compiler-check --changed
+```
+
+Rules:
+
+1. The `--input-rev` must equal the baseline's `input_rev`. The harness
+   freezes that revision under `$TMPDIR/blorp-perf-input/<sha>` once and
+   reuses it; workers never compile their own changed sources as the input.
+2. The compiler under test must be `FRESH` per `scripts/compiler-build-status`;
+   the harness refuses a stale executable.
+3. Compare like with like: a `-O0` build (the `make` default) against the
+   `-O0` baseline while iterating; the coordinator's acceptance run uses the
+   `-O2` build against the `-O2` baseline. For an `-O2` build export
+   `BLORP_CLI_C_OPTIMIZATION=-O2` for `make`, `scripts/compiler-build-status`,
+   and the harness alike, since the build identity includes that level. The
+   JSON records the level as `c_optimization`. Report which one you used.
+4. The harness takes a global lock in `$TMPDIR/blorp-perf-measure.lock`.
+   Wrap any command that spawns many compiled binaries
+   (`scripts/compiler-check`, `scripts/test`) in
+   `benchmarks/self_compile_measure lock -- <cmd>` so concurrent worktrees
+   neither perturb each other nor overwhelm macOS `syspolicyd`.
+5. Report the comparison table verbatim: allocations per phase, total
+   allocations, minimum retired instructions, phase medians, and the
+   IDENTICAL/DIFFERENT output line. Wall time alone is never evidence.
+
+Retained baselines live in `benchmarks/results/self_compile_baseline_*.json`
+and `self_compile_small_baseline_*.json`; a new baseline is recorded only when
+the input revision or host changes.
+
 ## Timing Model
 
 `bench.sh` first compiles all compiled-language binaries for the selected
