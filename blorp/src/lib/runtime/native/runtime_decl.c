@@ -2346,6 +2346,11 @@ void blorp_typecheck_body_metric_record_c(
     long source_lines,
     long is_dependency
 );
+void blorp_typecheck_phase_metric_record_c(
+    const char* phase,
+    long microseconds,
+    long allocations
+);
 void blorp_typecheck_body_metrics_report_c(void);
 void blorp_print_live_object_summary(void);
 blorp_SchedulerStats blorp_get_scheduler_stats(void);

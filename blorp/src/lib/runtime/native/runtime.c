@@ -1093,6 +1093,28 @@ static int __blorp_typecheck_body_metric_compare(const void* left, const void* r
     return strcmp(first->callable ? first->callable : "", second->callable ? second->callable : "");
 }
 
+// Graph-construction phases recorded in the order the typed frontend runs
+// them, alongside the per-body rows and flushed with them.
+typedef struct {
+    char* phase;
+    long microseconds;
+    long allocations;
+} __blorp_TypecheckPhaseMetric;
+
+static __blorp_TypecheckPhaseMetric* __blorp_typecheck_phase_metrics = NULL;
+static size_t __blorp_typecheck_phase_metric_count = 0;
+static size_t __blorp_typecheck_phase_metric_capacity = 0;
+
+static void __blorp_typecheck_phase_metrics_release(void) {
+    for (size_t index = 0; index < __blorp_typecheck_phase_metric_count; index++) {
+        free(__blorp_typecheck_phase_metrics[index].phase);
+    }
+    free(__blorp_typecheck_phase_metrics);
+    __blorp_typecheck_phase_metrics = NULL;
+    __blorp_typecheck_phase_metric_count = 0;
+    __blorp_typecheck_phase_metric_capacity = 0;
+}
+
 static void __blorp_typecheck_body_metrics_release(void) {
     for (size_t index = 0; index < __blorp_typecheck_body_metric_count; index++) {
         free(__blorp_typecheck_body_metrics[index].module_path);
@@ -1831,8 +1853,49 @@ void blorp_typecheck_body_metric_record_c(
     __blorp_typecheck_body_metric_count++;
 }
 
+void blorp_typecheck_phase_metric_record_c(
+    const char* phase,
+    long microseconds,
+    long allocations
+) {
+    if (!__blorp_typecheck_body_metrics_enabled) return;
+    if (__blorp_typecheck_phase_metric_count == __blorp_typecheck_phase_metric_capacity) {
+        size_t grown = __blorp_typecheck_phase_metric_capacity
+            ? __blorp_typecheck_phase_metric_capacity * 2
+            : 64;
+        __blorp_TypecheckPhaseMetric* rows = (__blorp_TypecheckPhaseMetric*)realloc(
+            __blorp_typecheck_phase_metrics,
+            grown * sizeof(__blorp_TypecheckPhaseMetric)
+        );
+        if (!rows) return;
+        __blorp_typecheck_phase_metrics = rows;
+        __blorp_typecheck_phase_metric_capacity = grown;
+    }
+    __blorp_TypecheckPhaseMetric* row =
+        &__blorp_typecheck_phase_metrics[__blorp_typecheck_phase_metric_count];
+    row->phase = __blorp_typecheck_body_metric_text(phase);
+    row->microseconds = microseconds;
+    row->allocations = allocations;
+    __blorp_typecheck_phase_metric_count++;
+}
+
 void blorp_typecheck_body_metrics_report_c(void) {
     if (!__blorp_typecheck_body_metrics_enabled) return;
+    if (__blorp_typecheck_body_metric_count == 0
+        && __blorp_typecheck_phase_metric_count == 0) {
+        return;
+    }
+    for (size_t index = 0; index < __blorp_typecheck_phase_metric_count; index++) {
+        const __blorp_TypecheckPhaseMetric* row = &__blorp_typecheck_phase_metrics[index];
+        fprintf(
+            stderr,
+            "BLORP_TYPECHECK_PHASE phase=%s microseconds=%ld allocations=%ld\n",
+            row->phase ? row->phase : "",
+            row->microseconds,
+            row->allocations
+        );
+    }
+    __blorp_typecheck_phase_metrics_release();
     if (__blorp_typecheck_body_metric_count == 0) return;
     qsort(
         __blorp_typecheck_body_metrics,

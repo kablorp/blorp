@@ -8728,7 +8728,11 @@ private pure func complete_typecheck_graph_for_meta_run(
 	target_scope = indexed_graph_target_scope(indexed_graph)
 
 	if importable_module_graph_matches_scope(importable_graph, target_scope):
-		match accepted_alias_graph_build(type_headers, bound_graph):
+		alias_mark = typecheck_phase_mark()
+		alias_build = accepted_alias_graph_build(type_headers, bound_graph)
+		record_typecheck_phase("accepted_aliases", alias_mark)
+
+		match alias_build:
 			Err(errors):
 				TypecheckGraphCompletionRejected(errors.map(
 					func(
@@ -8737,8 +8741,11 @@ private pure func complete_typecheck_graph_for_meta_run(
 				))
 			Ok(accepted_alias_graph):
 				accepted_alias_table = accepted_alias_graph_table(accepted_alias_graph)
+				record_mark = typecheck_phase_mark()
+				record_build = accepted_record_graph_build(type_headers, bound_graph)
+				record_typecheck_phase("accepted_records", record_mark)
 
-				match accepted_record_graph_build(type_headers, bound_graph):
+				match record_build:
 					Err(errors):
 						TypecheckGraphCompletionRejected(errors.map(
 							func(
@@ -8747,14 +8754,17 @@ private pure func complete_typecheck_graph_for_meta_run(
 						))
 					Ok(accepted_record_graph):
 						accepted_record_table = accepted_record_graph_table(accepted_record_graph)
-
-						match accepted_union_graph_build(
+						union_mark = typecheck_phase_mark()
+						union_build = accepted_union_graph_build(
 							type_headers,
 							bound_graph,
 							accepted_alias_table,
 							builtin_env,
 							BUILTIN_UNION_TYPE_NAMES,
-						):
+						)
+						record_typecheck_phase("accepted_unions", union_mark)
+
+						match union_build:
 							Err(errors):
 								TypecheckGraphCompletionRejected(errors.map(
 									func(
@@ -8766,16 +8776,21 @@ private pure func complete_typecheck_graph_for_meta_run(
 									accepted_union_graph,
 								)
 
-								match accepted_global_table_build(
+								global_mark = typecheck_phase_mark()
+								global_build = accepted_global_table_build(
 									type_headers,
 									callable_headers,
 									bound_graph,
-								):
+								)
+								record_typecheck_phase("accepted_globals", global_mark)
+
+								match global_build:
 									Err(errors):
 										TypecheckGraphCompletionRejected(errors.map(
 											func(message): "internal typecheck error: " + message,
 										))
 									Ok(initial_global_table):
+										completion_mark = typecheck_phase_mark()
 										completion = complete_global_header_graph(
 											implementation_headers,
 											initial_global_table,
@@ -8785,7 +8800,12 @@ private pure func complete_typecheck_graph_for_meta_run(
 											allow_debug_only_calls,
 											meta_run,
 										)
-										finish_typecheck_graph_completion(
+										record_typecheck_phase(
+											"global_header_completion",
+											completion_mark,
+										)
+										finish_mark = typecheck_phase_mark()
+										finished = finish_typecheck_graph_completion(
 											implementation_headers,
 											importable_graph,
 											accepted_alias_graph,
@@ -8796,6 +8816,8 @@ private pure func complete_typecheck_graph_for_meta_run(
 											completion,
 											meta_run,
 										)
+										record_typecheck_phase("accepted_graph", finish_mark)
+										finished
 	else:
 		TypecheckGraphCompletionRejected(
 			[
@@ -11076,6 +11098,47 @@ foreign:
 		source_lines: Int,
 		is_dependency: Int,
 	) -> Void = "blorp_typecheck_body_metric_record_c"
+	pure func typecheck_phase_metric_record(
+		phase: String,
+		microseconds: Int,
+		allocations: Int,
+	) -> Void = "blorp_typecheck_phase_metric_record_c"
+
+
+-- Graph-construction cost attribution under the same variable: one mark per
+-- phase boundary. With the variable unset a mark is one probe call and the
+-- phase list stays empty.
+record TypecheckPhaseMark {
+	enabled: Bool,
+	started: Int,
+	allocations: Int
+}
+
+
+pure func typecheck_phase_mark() -> TypecheckPhaseMark:
+	if typecheck_body_metrics_enabled() == 0:
+		{
+			enabled = False,
+			started = 0,
+			allocations = 0
+		}
+	else:
+		{
+			enabled = True,
+			started = typecheck_body_metrics_now(),
+			allocations = typecheck_body_metrics_allocations()
+		}
+
+
+pure func record_typecheck_phase(phase: String, mark: TypecheckPhaseMark) -> Void:
+	if mark.enabled:
+		typecheck_phase_metric_record(
+			phase,
+			typecheck_body_metrics_now() - mark.started,
+			typecheck_body_metrics_allocations() - mark.allocations,
+		)
+	else:
+		void
 
 
 private record BodyMetricsScope {
@@ -11140,6 +11203,21 @@ private pure func check_body_context_recording_metrics(
 		dependency_flag,
 	)
 	outcome
+
+
+-- CTFE checks reachable bodies through its own worklist rather than the
+-- module body loop, so it takes the same attribution path by registry.
+pure func check_registry_body_context_with_metrics(
+	registry: BodyCheckRegistry,
+	context: BodyCheckContext,
+) -> BodyCheckOutcome:
+	if typecheck_body_metrics_enabled() == 0:
+		check_body_context(context)
+	else:
+		check_body_context_recording_metrics(
+			context,
+			body_metrics_scope_for_base(from_opaque BodyCheckRegistry(registry).base),
+		)
 
 
 pure func check_body_context(context: BodyCheckContext) -> BodyCheckOutcome:

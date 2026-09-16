@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Contract test for opt-in per-body typecheck cost attribution.
+"""Contract test for opt-in typecheck cost attribution.
 
-`BLORP_TYPECHECK_BODY_METRICS=1` prints one row per checked body plus project
-and dependency totals. With the variable unset the compiler must print nothing
-and produce the same C.
+`BLORP_TYPECHECK_BODY_METRICS=1` prints one row per graph-construction phase and
+one row per checked body, plus project and dependency totals. With the variable
+unset the compiler must print nothing and produce the same C.
 """
 
 from __future__ import annotations
@@ -39,6 +39,9 @@ PROGRAM = textwrap.dedent(
 ROW = re.compile(
     r"^BLORP_TYPECHECK_BODY scope=(project|dependency) microseconds=(\d+) "
     r"allocations=(\d+) source_lines=(-?\d+) module=(\S+) callable=(\S*)$"
+)
+PHASE = re.compile(
+    r"^BLORP_TYPECHECK_PHASE phase=(\S+) microseconds=(\d+) allocations=(\d+)$"
 )
 TOTAL = re.compile(
     r"^BLORP_TYPECHECK_BODY_TOTAL scope=(project|dependency|all) bodies=(\d+) "
@@ -81,7 +84,7 @@ class TypecheckBodyMetricsTests(unittest.TestCase):
             metrics_output = temp / "metrics.c"
 
             quiet = self.compile_program(source, quiet_output, metrics=False)
-            self.assertNotIn("BLORP_TYPECHECK_BODY", quiet.stderr)
+            self.assertNotIn("BLORP_TYPECHECK", quiet.stderr)
 
             loud = self.compile_program(source, metrics_output, metrics=True)
             self.assertEqual(
@@ -90,10 +93,15 @@ class TypecheckBodyMetricsTests(unittest.TestCase):
                 "per-body metrics must not change the generated C",
             )
 
+            phases = []
             rows = []
             totals = {}
             previous_microseconds = None
             for line in loud.stderr.splitlines():
+                phase = PHASE.match(line)
+                if phase:
+                    phases.append(phase.group(1))
+                    continue
                 row = ROW.match(line)
                 if row:
                     microseconds = int(row.group(2))
@@ -123,6 +131,22 @@ class TypecheckBodyMetricsTests(unittest.TestCase):
                     }
 
             self.assertTrue(rows, "expected one row per checked body")
+            for expected in (
+                "indexed_graph",
+                "bound_modules",
+                "declaration_skeletons",
+                "type_headers",
+                "callable_headers",
+                "implementation_headers",
+                "global_header_completion",
+                "module_bodies",
+            ):
+                self.assertIn(expected, phases, "expected a row for every phase")
+            self.assertLess(
+                phases.index("bound_modules"),
+                phases.index("module_bodies"),
+                "phase rows are printed in the order the frontend runs them",
+            )
             self.assertEqual({"project", "dependency", "all"}, set(totals))
 
             project_rows = [row for row in rows if row["scope"] == "project"]
