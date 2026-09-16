@@ -68,9 +68,9 @@ import:
 			RuntimeOwnedCancellationOwner,
 		),
 		CancellationOwnerIdentity(BackendTemporaryCancellationOwner),
+		CancellationProgramSummary,
 		CancellationProtectionEvent(TrackCancellationOwner, UntrackCancellationOwner),
 		CancellationProtectionPlan,
-		CancellationProgramSummary,
 		CancellationReason(
 			BuiltinCancellationPoint,
 			ClosureCallBoundary,
@@ -736,6 +736,75 @@ pure func region_plan_distinguishes_disjoint_owner_lifetimes() -> Bool:
 			False
 
 
+-- The let-protection index narrows by `uniq`, which repeats across distinct
+-- Core variables. These pin that name and def_id still select the owner's own
+-- decision rather than the first decision sharing its `uniq`.
+pure func region_plan_separates_shared_uniq_distinct_names() -> Bool:
+	first: CoreVar = local_var("shared_uniq_first", 21)
+	second: CoreVar = local_var("shared_uniq_second", 21)
+	absent: CoreVar = local_var("shared_uniq_absent", 21)
+	body: CoreExpr = SeqExpr(
+		LetExpr(first, False, STRING_TYPE, owned_string(), VOID_EXPR),
+		LetExpr(
+			second,
+			False,
+			STRING_TYPE,
+			owned_string(),
+			CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc),
+		),
+	)
+	plan = region_plan(body)
+
+	match (cancellation_let_protection(plan, first), cancellation_let_protection(plan, second)):
+		(Some(first_protection), Some(second_protection)):
+			(
+				not first_protection.tracks_cleanup
+				and second_protection.tracks_cleanup
+				and cancellation_let_protection(plan, absent).is_none()
+			)
+		_:
+			False
+
+
+pure func region_plan_separates_shared_uniq_distinct_def_ids() -> Bool:
+	first: CoreVar = {
+		name = "shared_def_owner",
+		uniq = 22,
+		def_id = Some(901)
+	}
+	second: CoreVar = {
+		name = "shared_def_owner",
+		uniq = 22,
+		def_id = Some(902)
+	}
+	absent: CoreVar = {
+		name = "shared_def_owner",
+		uniq = 22,
+		def_id = Some(903)
+	}
+	body: CoreExpr = SeqExpr(
+		LetExpr(first, False, STRING_TYPE, owned_string(), VOID_EXPR),
+		LetExpr(
+			second,
+			False,
+			STRING_TYPE,
+			owned_string(),
+			CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc),
+		),
+	)
+	plan = region_plan(body)
+
+	match (cancellation_let_protection(plan, first), cancellation_let_protection(plan, second)):
+		(Some(first_protection), Some(second_protection)):
+			(
+				not first_protection.tracks_cleanup
+				and second_protection.tracks_cleanup
+				and cancellation_let_protection(plan, absent).is_none()
+			)
+		_:
+			False
+
+
 pure func region_plan_protects_branch_and_loop_lifetimes() -> Bool:
 	branch_owner: CoreVar = local_var("branch_owner", 7)
 	loop_owner: CoreVar = local_var("loop_owner", 8)
@@ -953,19 +1022,25 @@ pure func recursive_call_effects_converge() -> Bool:
 
 
 pure func cancellation_propagation_preserves_graph_order_and_fixed_points() -> Bool:
-	no_edge = analyze_program_cancellation(program_with([
-		function_decl("safe", 1, VOID_EXPR),
-	]))
+	no_edge = analyze_program_cancellation(program_with([function_decl("safe", 1, VOID_EXPR)]))
 	chain = analyze_program_cancellation(program_with([
 		function_decl("chain_root", 10, call_expr(UserCall("chain_middle", Some(11), []))),
 		function_decl("chain_middle", 11, call_expr(UserCall("chain_leaf", Some(12), []))),
-		function_decl("chain_leaf", 12, CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc)),
+		function_decl(
+			"chain_leaf",
+			12,
+			CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc),
+		),
 	]))
 	fan_in = analyze_program_cancellation(program_with([
 		function_decl("fan_caller", 20, call_expr(UserCall("fan_leaf", Some(23), []))),
 		function_decl("fan_caller", 21, call_expr(UserCall("fan_leaf", Some(23), []))),
 		function_decl("fan_caller", 22, call_expr(UserCall("fan_leaf", Some(23), []))),
-		function_decl("fan_leaf", 23, CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc)),
+		function_decl(
+			"fan_leaf",
+			23,
+			CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc),
+		),
 	]))
 	diamond = analyze_program_cancellation(program_with([
 		function_decl(
@@ -978,18 +1053,20 @@ pure func cancellation_propagation_preserves_graph_order_and_fixed_points() -> B
 		),
 		function_decl("diamond_left", 31, call_expr(UserCall("diamond_leaf", Some(33), []))),
 		function_decl("diamond_right", 32, call_expr(UserCall("diamond_leaf", Some(33), []))),
-		function_decl("diamond_leaf", 33, CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc)),
-	]))
-	self_cycle = analyze_program_cancellation(program_with([
 		function_decl(
-			"self_cycle",
-			40,
-			SeqExpr(
-				CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc),
-				call_expr(UserCall("self_cycle", Some(40), [])),
-			),
+			"diamond_leaf",
+			33,
+			CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc),
 		),
 	]))
+	self_cycle = analyze_program_cancellation(program_with([function_decl(
+					"self_cycle",
+					40,
+					SeqExpr(
+						CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc),
+						call_expr(UserCall("self_cycle", Some(40), [])),
+					),
+				)]))
 	mutual_cycle = analyze_program_cancellation(program_with([
 		function_decl("cycle_a", 50, call_expr(UserCall("cycle_b", Some(51), []))),
 		function_decl(
@@ -1003,9 +1080,17 @@ pure func cancellation_propagation_preserves_graph_order_and_fixed_points() -> B
 	]))
 	disconnected = analyze_program_cancellation(program_with([
 		function_decl("isolated_before", 60, VOID_EXPR),
-		function_decl("disconnected_root", 61, call_expr(UserCall("disconnected_leaf", Some(63), []))),
+		function_decl(
+			"disconnected_root",
+			61,
+			call_expr(UserCall("disconnected_leaf", Some(63), [])),
+		),
 		function_decl("isolated_after", 62, VOID_EXPR),
-		function_decl("disconnected_leaf", 63, CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc)),
+		function_decl(
+			"disconnected_leaf",
+			63,
+			CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc),
+		),
 	]))
 
 	(
@@ -1023,7 +1108,13 @@ pure func cancellation_propagation_preserves_graph_order_and_fixed_points() -> B
 		and ordered_summary_matches(diamond, 0, "diamond_root", 30, [TransitiveCallBoundary])
 		and ordered_summary_matches(diamond, 1, "diamond_left", 31, [TransitiveCallBoundary])
 		and ordered_summary_matches(diamond, 2, "diamond_right", 32, [TransitiveCallBoundary])
-		and ordered_summary_matches(diamond, 3, "diamond_leaf", 33, [ExplicitCancellationCheckpoint])
+		and ordered_summary_matches(
+			diamond,
+			3,
+			"diamond_leaf",
+			33,
+			[ExplicitCancellationCheckpoint],
+		)
 		and diamond.functions.length() == 4
 		and ordered_summary_matches(
 			self_cycle,
@@ -1043,9 +1134,21 @@ pure func cancellation_propagation_preserves_graph_order_and_fixed_points() -> B
 		)
 		and mutual_cycle.functions.length() == 2
 		and ordered_summary_matches(disconnected, 0, "isolated_before", 60, [])
-		and ordered_summary_matches(disconnected, 1, "disconnected_root", 61, [TransitiveCallBoundary])
+		and ordered_summary_matches(
+			disconnected,
+			1,
+			"disconnected_root",
+			61,
+			[TransitiveCallBoundary],
+		)
 		and ordered_summary_matches(disconnected, 2, "isolated_after", 62, [])
-		and ordered_summary_matches(disconnected, 3, "disconnected_leaf", 63, [ExplicitCancellationCheckpoint])
+		and ordered_summary_matches(
+			disconnected,
+			3,
+			"disconnected_leaf",
+			63,
+			[ExplicitCancellationCheckpoint],
+		)
 		and disconnected.functions.length() == 4
 	)
 
@@ -1287,6 +1390,14 @@ tests: TestSuite = {
 		(
 			"region plans distinguish disjoint owner lifetimes",
 			region_plan_distinguishes_disjoint_owner_lifetimes,
+		),
+		(
+			"region plans separate shared uniq with distinct names",
+			region_plan_separates_shared_uniq_distinct_names,
+		),
+		(
+			"region plans separate shared uniq with distinct def ids",
+			region_plan_separates_shared_uniq_distinct_def_ids,
 		),
 		(
 			"region plans protect branch and loop lifetimes",
