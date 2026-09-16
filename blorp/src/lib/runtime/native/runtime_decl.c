@@ -1182,6 +1182,13 @@ static inline bool blorp_is_unique(void* obj) {
 #endif
 }
 
+// Allocation identity, not value equality: true only when both operands name
+// the same managed allocation (two NULLs count as the same object). Compiler
+// passes use it to prove that a mapped subtree is the untouched original.
+static inline bool blorp_same_object(const void* left, const void* right) {
+    return left == right;
+}
+
 
 static inline void* blorp_list_get_inline(blorp_List* list, long index) {
     if (__builtin_expect(!list || index < 0 || index >= list->len, 0)) return NULL;
