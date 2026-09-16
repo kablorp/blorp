@@ -43,6 +43,13 @@ allocations fall, and the small program does not regress more than 1%.
 Consult the coordinator if an index would change first-match order or if a
 cut needs a new field on a Core declaration.
 
+## Objective
+
+Replace the remaining name-keyed and `Option[Int]`-keyed linear scans in the
+Core passes with exact indexes that preserve first-match order, so the
+self-compile retires materially fewer instructions without changing a single
+byte of generated C.
+
 ## Cuts
 
 ### A. Constructor contracts by definition ID (perceus.brp)
@@ -117,6 +124,31 @@ result to `core_module_member_name` callers, or memoize through the lowering
 context that already flows to those callers. Skip this cut if the
 after-measurement of A to D shows it below 0.3% of retired instructions;
 say so in the handoff.
+
+**Decision (cut E, open):** the work is material but was not removed.
+`sanitize_core_module_name` is idempotent, so calling it twice keeps the
+generated C byte-identical while doubling exactly the work in question:
+that probe cost 8,664,614,073 extra instructions and 477,100 extra
+allocations after cut D, so the existing calls are about 1.76% of the
+self-compile — well above the 0.3% skip threshold. Two in-module rewrites
+were measured and rejected, both with IDENTICAL C:
+
+| Variant | Instructions | vs cut D |
+| --- | ---: | ---: |
+| cut D | 491,798,875,862 | — |
+| `replace("/", "_").replace(".", "_")` | 500,038,064,142 | +1.68% |
+| separator probe before the character loop | 491,895,465,609 | +0.02% |
+
+The cost is per call, not per character: one `raw_index_of` costs about as
+much as the whole character loop, so no rewrite inside `identity.brp` can
+win. Only calling the function fewer times helps, and its callers live in
+`stage_09_core/resolve.brp`, `synth.brp`, `synth_name.brp`, `std_inline.brp`,
+`mono_impl.brp`, `mono_option.brp`, `mono_specialize.brp` and
+`stage_10_backend/emit.brp` as well as the lowering passes, so the
+precompute or memoize mechanism needs an owner for those files.
+`test_core_lower.brp` now pins the sanitization behavior for whoever takes
+it. Repro: `/tmp/issue-149-cutE-probe.json`, `/tmp/issue-149-cutE.json`,
+`/tmp/issue-149-cutE2.json`.
 
 ## Invariants And Tests
 
