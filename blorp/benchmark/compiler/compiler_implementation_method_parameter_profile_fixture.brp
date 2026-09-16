@@ -1,0 +1,399 @@
+-- Deterministic implementation-method type-parameter admission workload.
+import:
+	../../src/compiler/stage_04_modules/loaded_module:
+		ModuleLoadCandidate,
+		ModuleOrigin(UserModule),
+		module_load_candidate,
+		resolved_module_identity_from_resolver,
+	../../src/compiler/stage_06_typecheck/graph/indexed_graph:
+		PreparedModuleScope,
+		indexed_graph_build,
+		prepared_module_program,
+		prepared_module_scope_module,
+	../../src/compiler/stage_06_typecheck/headers/callable_headers:
+		CallableHeaderGraph,
+		callable_header_graph_build,
+	../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
+		declaration_skeleton_graph_build,
+	../../src/compiler/stage_06_typecheck/headers/implementation_headers:
+		ImplementationHeaderGraph,
+		ImplementationHeaderGraphError,
+		explicit_implementation_method_dimension_constraints,
+		explicit_implementation_method_parameters,
+		implementation_header_graph_build,
+		implementation_header_graph_headers,
+		implementation_header_methods,
+		implementation_method_header_name,
+		resolved_implementation_method_type_parameter_bounds,
+		resolved_implementation_method_type_parameter_id,
+	../../src/compiler/stage_06_typecheck/headers/trait_headers: trait_topology_graph_build
+	../../src/compiler/stage_06_typecheck/headers/type_header_dependencies:
+		type_alias_dependency_graph_validate,
+	../../src/compiler/stage_06_typecheck/headers/type_header_graph:
+		callable_type_parameter_id_index,
+		callable_type_parameter_id_name,
+		type_header_graph_build,
+	../../src/compiler/stage_06_typecheck/headers/type_parameter_headers:
+		resolved_type_parameter_graph_build,
+	../../src/compiler/stage_06_typecheck/modules/bound_module_graph:
+		BoundModuleViewBinding(BoundModuleViewReady),
+		COMPILER_BOUND_MODULE_VISIBILITY_EMPTY,
+		bound_module_graph_build,
+	../../src/compiler/stage_06_typecheck/modules/module_view: COMPILER_MODULE_VIEW_EMPTY
+	hash: crc32, hash_combine
+	parsed_program_fixture as ParsedProgramFixture
+
+
+struct CompilerImplementationMethodParameterProfileConfig {
+	method_parameter_count: Int,
+	occurrences_per_type: Int,
+	return_type_occurrences: Int,
+	constraint_count: Int,
+	duplicate_percent: Int
+}
+
+
+record CompilerImplementationMethodParameterProfileFixture {
+	callable_headers: CallableHeaderGraph,
+	method_parameter_count: Int,
+	occurrences_per_type: Int,
+	return_type_occurrences: Int,
+	constraint_count: Int,
+	duplicate_percent: Int,
+	discovery_batches: Int,
+	candidates_discovered: Int,
+	admission_probes: Int,
+	unique_admissions: Int,
+	duplicate_candidates: Int,
+	expected_effective_parameters: Int,
+	expected_parameter_names: List[String]
+}
+
+
+struct CompilerImplementationMethodParameterProfileObservation {
+	header_count: Int,
+	method_count: Int,
+	effective_parameters: Int,
+	resolved_constraints: Int,
+	ordered_header_checksum: Int,
+	graph_ready: Bool,
+	workload_valid: Bool
+}
+
+
+private pure func bounded_percent(value: Int) -> Int:
+	if value < 0:
+		0
+	else if value > 100:
+		100
+	else:
+		value
+
+
+private pure func effective_unique_candidates(total: Int, duplicate_percent: Int) -> Int:
+	if total <= 0:
+		0
+	else:
+		nonduplicate = total * (100 - bounded_percent(duplicate_percent)) / 100
+
+		if nonduplicate > 0:
+			nonduplicate
+		else:
+			1
+
+
+private pure func candidate_index(occurrence: Int, unique_count: Int) -> Int:
+	if occurrence < unique_count:
+		occurrence
+	else:
+		occurrence % unique_count
+
+
+private pure func type_candidate_name(occurrence: Int, unique_count: Int) -> String:
+	"TypeParameter" + candidate_index(occurrence, unique_count).to_string()
+
+
+private pure func dimension_candidate_name(occurrence: Int, unique_count: Int) -> String:
+	"#Dimension" + candidate_index(occurrence, unique_count).to_string()
+
+
+private pure func type_expression_source(
+	start: Int,
+	count: Int,
+	unique_count: Int,
+) -> String:
+	var names: List[String] = []
+
+	for offset in 0..count:
+		names = names.append(type_candidate_name(start + offset, unique_count))
+
+	if names.length() == 1:
+		names.get_or(0, "Int")
+	else:
+		"(" + names.join(", ") + ")"
+
+
+private pure func dimension_expression_source(
+	start: Int,
+	count: Int,
+	unique_count: Int,
+) -> String:
+	var names: List[String] = []
+
+	for offset in 0..count:
+		names = names.append(dimension_candidate_name(start + offset, unique_count))
+
+	names.join(" + ")
+
+
+private pure func profile_method_source(
+	config: CompilerImplementationMethodParameterProfileConfig,
+	type_unique_count: Int,
+	dimension_unique_count: Int,
+) -> String:
+	var parameters: List[String] = []
+
+	for parameter_index in 0..config.method_parameter_count:
+		parameters = parameters.append(
+			"value" + parameter_index.to_string() + ": " + type_expression_source(
+				parameter_index * config.occurrences_per_type,
+				config.occurrences_per_type,
+				type_unique_count,
+			),
+		)
+
+	type_parameter_occurrences = config.method_parameter_count * config.occurrences_per_type
+	return_source = if config.return_type_occurrences > 0:
+		" -> " + type_expression_source(
+			type_parameter_occurrences,
+			config.return_type_occurrences,
+			type_unique_count,
+		)
+	else:
+		""
+	var constraints: List[String] = []
+
+	for constraint_index in 0..config.constraint_count:
+		left_start = constraint_index * 2 * config.occurrences_per_type
+		right_start = left_start + config.occurrences_per_type
+		constraints = constraints.append(
+			dimension_expression_source(
+				left_start,
+				config.occurrences_per_type,
+				dimension_unique_count,
+			) + " == " + dimension_expression_source(
+				right_start,
+				config.occurrences_per_type,
+				dimension_unique_count,
+			),
+		)
+
+	where_source = if constraints.is_empty():
+		""
+	else:
+		" where " + constraints.join(", ")
+
+	"\tpure func profile[Explicit](" + parameters.join(", ") + ")" + return_source + where_source + ":\n\t\t0"
+
+
+private pure func profile_source(
+	config: CompilerImplementationMethodParameterProfileConfig,
+	type_unique_count: Int,
+	dimension_unique_count: Int,
+) -> String:
+	[
+		"record ProfileOwner[Owner] {value: Owner}",
+		"trait ProfileTrait:\n\tpure func required(value: Self) -> Int",
+		"implements ProfileTrait for ProfileOwner[Owner]:\n\tpure func required(value: ProfileOwner[Owner]) -> Int:\n\t\t0\n" + profile_method_source(
+			config,
+			type_unique_count,
+			dimension_unique_count,
+		),
+	].join("\n\n") + "\n"
+
+
+private pure func profile_candidate(
+	config: CompilerImplementationMethodParameterProfileConfig,
+	type_unique_count: Int,
+	dimension_unique_count: Int,
+) -> ModuleLoadCandidate:
+	module_name = "bench/implementation_method_parameter_profile"
+	module_load_candidate(
+		resolved_module_identity_from_resolver(module_name, UserModule),
+		ParsedProgramFixture.finalized_typecheck_program_fixture(
+			"/bench/implementation_method_parameter_profile.brp",
+			module_name,
+			profile_source(config, type_unique_count, dimension_unique_count),
+		),
+	)
+
+
+private pure func accept_empty_view(scope: PreparedModuleScope) -> BoundModuleViewBinding:
+	BoundModuleViewReady(
+		COMPILER_MODULE_VIEW_EMPTY,
+		prepared_module_program(prepared_module_scope_module(scope)),
+		COMPILER_BOUND_MODULE_VISIBILITY_EMPTY,
+		[],
+	)
+
+
+private pure func expected_parameter_names(
+	type_unique_count: Int,
+	dimension_unique_count: Int,
+) -> List[String]:
+	var names: List[String] = ["Explicit"]
+
+	for index in 0..type_unique_count:
+		names = names.append(type_candidate_name(index, type_unique_count))
+
+	for index in 0..dimension_unique_count:
+		names = names.append(dimension_candidate_name(index, dimension_unique_count))
+
+	names
+
+
+pure func compiler_implementation_method_parameter_profile_fixture(
+	config: CompilerImplementationMethodParameterProfileConfig,
+) -> Option[CompilerImplementationMethodParameterProfileFixture]:
+	if (
+		config.method_parameter_count <= 0
+		or config.occurrences_per_type <= 0
+		or config.return_type_occurrences < 0
+		or config.constraint_count < 0
+	):
+		None
+	else:
+		type_candidates = (
+			config.method_parameter_count * config.occurrences_per_type
+			+ config.return_type_occurrences
+		)
+		dimension_candidates = config.constraint_count * 2 * config.occurrences_per_type
+		type_unique_count = effective_unique_candidates(type_candidates, config.duplicate_percent)
+		dimension_unique_count = effective_unique_candidates(
+			dimension_candidates,
+			config.duplicate_percent,
+		)
+		candidate = profile_candidate(config, type_unique_count, dimension_unique_count)
+		indexed ?= indexed_graph_build(candidate, []).to_option()
+		bound ?= bound_module_graph_build(indexed, [], accept_empty_view).to_option()
+		skeletons ?= declaration_skeleton_graph_build(bound).to_option()
+		aliases ?= type_alias_dependency_graph_validate(skeletons).to_option()
+		parameters ?= resolved_type_parameter_graph_build(aliases).to_option()
+		types ?= type_header_graph_build(parameters).to_option()
+		traits ?= trait_topology_graph_build(types).to_option()
+		callable_headers ?= callable_header_graph_build(traits).to_option()
+		unique_admissions = type_unique_count + dimension_unique_count
+		candidates_discovered = type_candidates + dimension_candidates
+		return_batch_count: Int = if config.return_type_occurrences > 0:
+			1
+		else:
+			0
+
+		Some({
+			callable_headers = callable_headers,
+			method_parameter_count = config.method_parameter_count,
+			occurrences_per_type = config.occurrences_per_type,
+			return_type_occurrences = config.return_type_occurrences,
+			constraint_count = config.constraint_count,
+			duplicate_percent = bounded_percent(config.duplicate_percent),
+			discovery_batches = (
+				config.method_parameter_count
+				+ return_batch_count
+				+ config.constraint_count * 2
+			),
+			candidates_discovered = candidates_discovered,
+			admission_probes = candidates_discovered,
+			unique_admissions = unique_admissions,
+			duplicate_candidates = candidates_discovered - unique_admissions,
+			expected_effective_parameters = unique_admissions + 1,
+			expected_parameter_names = expected_parameter_names(
+				type_unique_count,
+				dimension_unique_count,
+			),
+		})
+
+
+pure func compiler_implementation_method_parameter_profile_execute(
+	fixture: CompilerImplementationMethodParameterProfileFixture,
+	iterations: Int,
+) -> Result[ImplementationHeaderGraph, List[ImplementationHeaderGraphError]]:
+	var result = implementation_header_graph_build(fixture.callable_headers)
+	var iteration: Int = 1
+
+	while iteration < iterations:
+		result = implementation_header_graph_build(fixture.callable_headers)
+		iteration += 1
+
+	result
+
+
+private pure func invalid_observation() -> CompilerImplementationMethodParameterProfileObservation:
+	{
+		header_count = 0,
+		method_count = 0,
+		effective_parameters = 0,
+		resolved_constraints = 0,
+		ordered_header_checksum = 0,
+		graph_ready = False,
+		workload_valid = False
+	}
+
+
+pure func compiler_implementation_method_parameter_profile_observe(
+	fixture: CompilerImplementationMethodParameterProfileFixture,
+	result: Result[ImplementationHeaderGraph, List[ImplementationHeaderGraphError]],
+) -> CompilerImplementationMethodParameterProfileObservation:
+	match result:
+		Err(_):
+			invalid_observation()
+		Ok(graph):
+			headers = implementation_header_graph_headers(graph)
+			var method_count: Int = 0
+			var effective_parameters: Int = 0
+			var resolved_constraints: Int = 0
+			var checksum: Int = 17
+			var observed_names: List[String] = []
+			var found_profile: Bool = False
+
+			for header in headers:
+				for method in implementation_header_methods(header):
+					method_count += 1
+					checksum = hash_combine(checksum, crc32(implementation_method_header_name(method)))
+
+					if implementation_method_header_name(method) == "profile":
+						found_profile = True
+						parameters = explicit_implementation_method_parameters(method)
+						effective_parameters = parameters.length()
+						resolved_constraints = explicit_implementation_method_dimension_constraints(
+							method,
+						).length()
+
+						for parameter in parameters:
+							id = resolved_implementation_method_type_parameter_id(parameter)
+							name = callable_type_parameter_id_name(id)
+							observed_names = observed_names.append(name)
+							checksum = hash_combine(checksum, crc32(name))
+							checksum = hash_combine(checksum, callable_type_parameter_id_index(id))
+							checksum = hash_combine(
+								checksum,
+								resolved_implementation_method_type_parameter_bounds(parameter).length(),
+							)
+
+			checksum = hash_combine(checksum, resolved_constraints)
+
+			{
+				header_count = headers.length(),
+				method_count = method_count,
+				effective_parameters = effective_parameters,
+				resolved_constraints = resolved_constraints,
+				ordered_header_checksum = checksum,
+				graph_ready = True,
+				workload_valid = (
+					headers.length() == 1
+					and method_count == 2
+					and found_profile
+					and effective_parameters == fixture.expected_effective_parameters
+					and resolved_constraints == fixture.constraint_count
+					and observed_names == fixture.expected_parameter_names
+				)
+			}

@@ -1787,3 +1787,18 @@ the same profile window. Function times are inclusive and must not be summed.
 BLORP_COMPILER_BENCHMARK_SKIP_BUILD=1 \
   benchmarks/compiler_callable_header_profile 5 8 128 4 2 fallback
 ```
+
+### Implementation-method parameter admission profile
+
+`compiler_implementation_method_parameter_profile` constructs predecessor
+graphs before the measurement window, then repeatedly runs production
+`implementation_header_graph_build`. Its controls vary method parameters,
+implicit-name occurrences per type, return occurrences, dimension
+constraints, and duplicate percentage. The reported aggregate-item count is a
+fixed legacy-workload model; retained function profiles establish whether the
+production aggregate concatenations actually disappear.
+
+```bash
+benchmarks/compiler_implementation_method_parameter_profile plain 50 1024 1 1 0 99
+benchmarks/compiler_implementation_method_parameter_profile plain 10000 1 1 0 0 0
+```

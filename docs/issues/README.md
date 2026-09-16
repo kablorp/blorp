@@ -65,7 +65,6 @@ current-state and next-action summary.
 - [Step 2e width-probe resource gate](compiler-performance/97-bound-visibility-width-probe.md)
 - [CTFE flat-map result accumulation](compiler-performance/116-ctfe-result-list-accumulation.md)
 - [Global initializer dependency admission](compiler-performance/117-typecheck-graph-edge-accumulation.md)
-- [Effective method type-parameter admission](compiler-performance/118-implementation-header-local-indexes.md)
 - [Record-update staging accumulation](compiler-performance/119-record-update-staging-accumulation.md)
 - [Perceus borrowed temporary-call bindings](compiler-performance/120-perceus-local-list-work.md)
 - [Record-field query sort hoisting](compiler-performance/121-record-field-query-sort-hoisting.md)
