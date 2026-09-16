@@ -2335,6 +2335,18 @@ bool blorp_setenv(const blorp_String* name, const blorp_String* value);
 blorp_MemStats blorp_get_mem_stats(void);
 void blorp_reset_mem_stats(void);
 void blorp_compiler_memory_checkpoint_c(const char* phase);
+long blorp_runtime_total_allocations_c(void);
+long blorp_runtime_monotonic_microseconds_c(void);
+long blorp_typecheck_body_metrics_enabled_c(void);
+void blorp_typecheck_body_metric_record_c(
+    const char* module_path,
+    const char* callable,
+    long microseconds,
+    long allocations,
+    long source_lines,
+    long is_dependency
+);
+void blorp_typecheck_body_metrics_report_c(void);
 void blorp_print_live_object_summary(void);
 blorp_SchedulerStats blorp_get_scheduler_stats(void);
 void blorp_reset_scheduler_stats(void);

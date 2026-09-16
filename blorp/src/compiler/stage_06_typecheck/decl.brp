@@ -113,7 +113,10 @@ import:
 		parsed_function_body_is_builtin,
 		parsed_function_body_kind,
 	../stage_03_parse/parsed_ast_traverse: map_parsed_expr_children
-	../stage_04_modules/loaded_module: ModuleIdentity, resolved_module_identities_equal
+	../stage_04_modules/loaded_module:
+		ModuleIdentity,
+		ModuleOrigin(UserModule),
+		resolved_module_identities_equal,
 	../stage_04_modules/module_table:
 		ModuleId,
 		ModuleTable,
@@ -11058,6 +11061,87 @@ private pure func check_function_body_artifact(
 					}))
 
 
+-- Per-body cost attribution, opt-in through BLORP_TYPECHECK_BODY_METRICS=1.
+-- The probes are instrumentation, not semantics: with the variable unset the
+-- scope is resolved once per module and each body pays one branch.
+foreign:
+	pure func typecheck_body_metrics_enabled() -> Int = "blorp_typecheck_body_metrics_enabled_c"
+	pure func typecheck_body_metrics_now() -> Int = "blorp_runtime_monotonic_microseconds_c"
+	pure func typecheck_body_metrics_allocations() -> Int = "blorp_runtime_total_allocations_c"
+	pure func typecheck_body_metric_record(
+		module_path: String,
+		callable: String,
+		microseconds: Int,
+		allocations: Int,
+		source_lines: Int,
+		is_dependency: Int,
+	) -> Void = "blorp_typecheck_body_metric_record_c"
+
+
+private record BodyMetricsScope {
+	enabled: Bool,
+	module_path: String,
+	is_dependency: Bool
+}
+
+
+private pure func module_origin_is_dependency(origin: ModuleOrigin) -> Bool:
+	match origin:
+		UserModule:
+			False
+		_:
+			True
+
+
+private pure func disabled_body_metrics_scope() -> BodyMetricsScope:
+	{
+		enabled = False,
+		module_path = "",
+		is_dependency = False
+	}
+
+
+private pure func body_metrics_scope_for_base(base: AcceptedBodyModuleBase) -> BodyMetricsScope:
+	if typecheck_body_metrics_enabled() == 0:
+		disabled_body_metrics_scope()
+	else:
+		scope = bound_module_scope(base.representation.bound_module)
+		{
+			enabled = True,
+			module_path = prepared_module_scope_canonical_path(scope),
+			is_dependency = module_origin_is_dependency(prepared_module_scope_origin(scope))
+		}
+
+
+-- Callers branch on `scope.enabled` so a compile without the variable never
+-- carries the scope into the body loop; this path always records a row.
+private pure func check_body_context_recording_metrics(
+	context: BodyCheckContext,
+	scope: BodyMetricsScope,
+) -> BodyCheckOutcome:
+	started = typecheck_body_metrics_now()
+	allocations_before = typecheck_body_metrics_allocations()
+	outcome = check_body_context(context)
+	elapsed = typecheck_body_metrics_now() - started
+	allocations = typecheck_body_metrics_allocations() - allocations_before
+	source = from_opaque BodyCheckContext(context).source
+
+	dependency_flag = if scope.is_dependency:
+		1
+	else:
+		0
+
+	typecheck_body_metric_record(
+		scope.module_path,
+		source.name.text,
+		elapsed,
+		allocations,
+		source.span.end_line - source.span.start_line + 1,
+		dependency_flag,
+	)
+	outcome
+
+
 pure func check_body_context(context: BodyCheckContext) -> BodyCheckOutcome:
 	representation = from_opaque BodyCheckContext(context)
 	check_function_body_artifact(
@@ -11106,12 +11190,17 @@ private pure func check_complete_body_table_in_order(
 			})
 	else:
 		contexts = ordered_body_contexts(draft.contexts, order)
+		metrics_scope = body_metrics_scope_for_base(base)
 		var rows: Dict[Int, BodyCheckOutcome] = {}
 		var checked_order: List[CallableId] = []
 		var duplicate_errors: List[String] = []
 
 		for context in contexts:
-			outcome = check_body_context(context)
+			outcome = if metrics_scope.enabled:
+				check_body_context_recording_metrics(context, metrics_scope)
+			else:
+				check_body_context(context)
+
 			id = body_check_outcome_callable_id(outcome)
 			definition_id = callable_id_definition_id(id)
 			checked_order = checked_order.append(id)
@@ -11696,13 +11785,13 @@ private pure func body_check_outcome_reusable_for_context(
 		True
 
 
-private pure func body_outcome_table_with_checked_context(
+private pure func body_outcome_table_with_checked_outcome(
 	table: BodyOutcomeTable,
-	context: BodyCheckContext,
+	outcome: BodyCheckOutcome,
 ) -> BodyOutcomeTable:
-	-- The context came from this module's accepted body plan. Rechecking it
-	-- produces the sole replacement row without readmitting all seed outcomes.
-	outcome = check_body_context(context)
+	-- The outcome came from this module's accepted body plan. Rechecking one
+	-- context produces the sole replacement row without readmitting all seed
+	-- outcomes.
 	representation = from_opaque BodyOutcomeTable(table)
 	definition_id = callable_id_definition_id(body_check_outcome_callable_id(outcome))
 	into_opaque BodyOutcomeTable(
@@ -11718,6 +11807,7 @@ private pure func materialize_complete_from_validated_seed(
 	seed_table: BodyOutcomeTable,
 	main_policy: MainValidationPolicy,
 ) -> SeededBodyCheckRun:
+	metrics_scope = body_metrics_scope_for_base(base)
 	var table = seed_table
 	var checked_bodies: Int = 0
 	var reused_bodies: Int = 0
@@ -11730,10 +11820,20 @@ private pure func materialize_complete_from_validated_seed(
 				if body_check_outcome_reusable_for_context(outcome, context):
 					reused_bodies += 1
 				else:
-					table = body_outcome_table_with_checked_context(table, context)
+					checked = if metrics_scope.enabled:
+						check_body_context_recording_metrics(context, metrics_scope)
+					else:
+						check_body_context(context)
+
+					table = body_outcome_table_with_checked_outcome(table, checked)
 					checked_bodies += 1
 			None:
-				table = body_outcome_table_with_checked_context(table, context)
+				checked = if metrics_scope.enabled:
+					check_body_context_recording_metrics(context, metrics_scope)
+				else:
+					check_body_context(context)
+
+				table = body_outcome_table_with_checked_outcome(table, checked)
 				checked_bodies += 1
 
 	-- Admission already rejected every seed row outside this plan, and the loop
