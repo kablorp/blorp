@@ -2,6 +2,7 @@
 -- each supported chain to one runtime parallel call. Unsupported shapes remain
 -- unchanged so the synthesized std wrapper stays the correctness fallback.
 import:
+	../stage_08_core_lower/identity: core_module_member_prefix
 	ir:
 		CoreCallKind(BuiltinCall, ClosureCall, IntrinsicCall, UserCall),
 		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
@@ -16,7 +17,7 @@ import:
 		core_expr_type,
 		core_var_equal,
 	mono: core_mono_type_equal
-	synth_name: synthesis_source_name
+	synth_name: synthesis_source_name_with_prefix
 	traverse: map_core_expr_children
 
 
@@ -169,10 +170,11 @@ private pure func matrix_shape(typ: CoreType) -> Option[CoreMatrixShape]:
 
 
 private pure func classify_std_function(
+	module_prefix: String,
 	function_info: CoreFunction,
 ) -> Option[CoreParallelStdCallKind]:
 	module_name ?= function_info.source_module
-	source_name ?= synthesis_source_name(function_info)
+	source_name ?= synthesis_source_name_with_prefix(module_prefix, function_info)
 
 	match (module_name, source_name):
 		("vector", "parallel"):
@@ -196,18 +198,38 @@ private pure func classify_std_function(
 
 
 private pure func collect_std_calls(program: CoreProgram) -> List[CoreParallelStdCall]:
-	program.decls.filter_map(pure func(decl: CoreDecl):
+	var calls: List[CoreParallelStdCall] = []
+	-- Sanitize each source module once; every function of that module then
+	-- classifies through the precomputed prefix.
+	var module_prefixes: Dict[String, String] = {}
+
+	for decl in program.decls:
 		match decl:
 			FunctionDecl(function_info):
-				classify_std_function(function_info).map(pure func(kind: CoreParallelStdCallKind):
-					{
-						def_id = function_info.def_id,
-						kind = kind
-					}
-				)
+				match function_info.source_module:
+					Some(module_name):
+						module_prefix: String = match module_prefixes.get(module_name):
+							Some(existing):
+								existing
+							None:
+								core_module_member_prefix(module_name)
+
+						module_prefixes = module_prefixes.set(module_name, module_prefix)
+
+						match classify_std_function(module_prefix, function_info):
+							Some(kind):
+								calls = calls.append({
+									def_id = function_info.def_id,
+									kind = kind,
+								})
+							None:
+								void
+					None:
+						void
 			_:
-				None
-	)
+				void
+
+	calls
 
 
 private pure func std_call_kind(

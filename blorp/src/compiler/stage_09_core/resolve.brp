@@ -7,11 +7,13 @@
 import:
 	../stage_08_core_lower/identity:
 		core_module_member_name,
+		core_module_member_name_from_prefix,
+		core_module_member_prefix,
 		core_pure_overload_function_name,
+		core_pure_overload_function_name_from_prefix,
 		core_ufcs_function_name,
 		core_ufcs_source_name_for_module,
 		is_core_ufcs_function_name,
-		sanitize_core_module_name,
 	builtin_registry:
 		core_bitwise_intrinsic_name,
 		core_builtin_name,
@@ -226,6 +228,7 @@ private record CoreCallResolveEnv {
 	constructor_targets_by_id: Dict[Int, CoreConstructorTarget],
 	import_bindings: Dict[String, CoreResolveImportBinding],
 	module_imports: Dict[String, Dict[String, CoreResolveImportBinding]],
+	module_member_prefixes: Dict[String, String],
 	module_paths: List[String]
 }
 
@@ -322,6 +325,35 @@ private pure func module_function_key(module_path: String, source_name: String) 
 	module_path + "\n" + source_name
 
 
+-- `module_member_prefixes` holds the `core_module_member_prefix` of every
+-- module path the environment knows, computed once so call resolution spells
+-- module members without re-sanitizing the module per call. A module first
+-- met at a call site falls back to the per-member authority, so the spelling
+-- is the same either way.
+private pure func env_module_member_name(
+	env: CoreCallResolveEnv,
+	module_path: String,
+	source_name: String,
+) -> String:
+	match env.module_member_prefixes.get(module_path):
+		Some(prefix):
+			core_module_member_name_from_prefix(prefix, source_name)
+		None:
+			core_module_member_name(module_path, source_name)
+
+
+private pure func env_pure_overload_function_name(
+	env: CoreCallResolveEnv,
+	module_path: String,
+	source_name: String,
+) -> String:
+	match env.module_member_prefixes.get(module_path):
+		Some(prefix):
+			core_pure_overload_function_name_from_prefix(prefix, source_name)
+		None:
+			core_pure_overload_function_name(module_path, source_name)
+
+
 private pure func strip_mono_suffix(name: String) -> String:
 	index: Int = name.raw_index_of("__mono_")
 
@@ -331,13 +363,16 @@ private pure func strip_mono_suffix(name: String) -> String:
 		name.substring(0, index)
 
 
-private pure func source_name_for_function(function_info: CoreFunction) -> String:
+-- `module_prefix` is the precomputed member prefix of the function's source
+-- module (None when it has none), so this never re-sanitizes per function.
+private pure func source_name_for_function(
+	module_prefix: Option[String],
+	function_info: CoreFunction,
+) -> String:
 	var source_name: String = strip_mono_suffix(function_info.name)
 
-	match function_info.source_module:
-		Some(module_path):
-			prefix: String = core_module_member_name(module_path, "")
-
+	match module_prefix:
+		Some(prefix):
 			if source_name.starts_with(prefix):
 				source_name = source_name.substring(
 					prefix.length(),
@@ -369,10 +404,11 @@ private pure func callable_target(
 
 
 private pure func materialized_function_disposition(
+	module_prefix: Option[String],
 	function_info: CoreFunction,
 ) -> CoreCallResolveFunctionDisposition:
 	module_path: String = function_info.source_module.get_or("")
-	source_name: String = source_name_for_function(function_info)
+	source_name: String = source_name_for_function(module_prefix, function_info)
 
 	match core_builtin_name(module_path, source_name):
 		Some(runtime_name):
@@ -392,6 +428,7 @@ private pure func materialized_function_disposition(
 
 
 private pure func call_resolve_function_disposition(
+	module_prefix: Option[String],
 	function_info: CoreFunction,
 ) -> CoreCallResolveFunctionDisposition:
 	match function_info.function_kind:
@@ -404,7 +441,7 @@ private pure func call_resolve_function_disposition(
 			CallResolveRememberBuiltinFunction(runtime_name)
 		UnresolvedBuiltinFunction:
 			module_path: String = function_info.source_module.get_or("")
-			source_name: String = source_name_for_function(function_info)
+			source_name: String = source_name_for_function(module_prefix, function_info)
 
 			match core_builtin_name(module_path, source_name):
 				Some(runtime_name):
@@ -424,7 +461,7 @@ private pure func call_resolve_function_disposition(
 				-- Lowering can materialize an exact runtime forward. Synthesis
 				-- records registry ownership as BuiltinFunction before this pass;
 				-- unknown body-bearing functions remain users.
-				materialized_function_disposition(function_info)
+				materialized_function_disposition(module_prefix, function_info)
 
 
 private pure func import_index(
@@ -459,6 +496,7 @@ private pure func collect_call_resolve_env(
 	var indexed_module_imports: Dict[String, Dict[String, CoreResolveImportBinding]] = {}
 	var module_path_set: Set[String] = Sets.set()
 	var module_paths: List[String] = []
+	var module_member_prefixes: Dict[String, String] = {}
 
 	for module in module_imports:
 		if not Sets.contains(module_path_set, module.module_name):
@@ -486,7 +524,24 @@ private pure func collect_call_resolve_env(
 	for decl in program.decls:
 		match decl:
 			FunctionDecl(function_info):
-				match call_resolve_function_disposition(function_info):
+				var module_prefix: Option[String] = None
+
+				match function_info.source_module:
+					Some(module_path):
+						match module_member_prefixes.get(module_path):
+							Some(existing):
+								module_prefix = Some(existing)
+							None:
+								computed: String = core_module_member_prefix(module_path)
+								module_member_prefixes = module_member_prefixes.set(
+									module_path,
+									computed,
+								)
+								module_prefix = Some(computed)
+					None:
+						void
+
+				match call_resolve_function_disposition(module_prefix, function_info):
 					CallResolveRememberForeignFunction(foreign_target):
 						target = callable_target(
 							function_info,
@@ -541,7 +596,10 @@ private pure func collect_call_resolve_env(
 								else:
 									void
 
-								source_name: String = source_name_for_function(function_info)
+								source_name: String = source_name_for_function(
+									module_prefix,
+									function_info,
+								)
 
 								if function_info.name != source_name:
 									builtin_functions = builtin_functions.set(
@@ -589,7 +647,10 @@ private pure func collect_call_resolve_env(
 								else:
 									void
 
-								source_name: String = source_name_for_function(function_info)
+								source_name: String = source_name_for_function(
+									module_prefix,
+									function_info,
+								)
 								module_functions = module_functions.set(
 									module_function_key(
 										module_path,
@@ -746,6 +807,17 @@ private pure func collect_call_resolve_env(
 			_:
 				void
 
+	-- Call sites spell members of imported modules through the same table, so
+	-- give every module path the environment knows a prefix exactly once.
+	for module_path in module_paths:
+		if not module_member_prefixes.contains(module_path):
+			module_member_prefixes = module_member_prefixes.set(
+				module_path,
+				core_module_member_prefix(module_path),
+			)
+		else:
+			void
+
 	{
 		user_functions = user_functions,
 		callable_targets_by_id = callable_targets_by_id,
@@ -759,6 +831,7 @@ private pure func collect_call_resolve_env(
 		constructor_targets_by_id = constructor_targets_by_id,
 		import_bindings = indexed_import_bindings,
 		module_imports = indexed_module_imports,
+		module_member_prefixes = module_member_prefixes,
 		module_paths = module_paths
 	}
 
@@ -1427,7 +1500,8 @@ private pure func module_call(
 												),
 											)
 										None:
-											prefixed: String = core_module_member_name(
+											prefixed: String = env_module_member_name(
+												env,
 												module_path,
 												source_name,
 											)
@@ -1438,7 +1512,8 @@ private pure func module_call(
 												None:
 													user_call_by_name(
 														env,
-														core_pure_overload_function_name(
+														env_pure_overload_function_name(
+															env,
 															module_path,
 															source_name,
 														),
@@ -2242,7 +2317,7 @@ private pure func descriptive_imported_variable_target(
 	if core_builtin_name("", name).is_some():
 		None
 	else if not is_function_type(typ):
-		prefixed: String = core_module_member_name(imported_module_path, original_name)
+		prefixed: String = env_module_member_name(env, imported_module_path, original_name)
 
 		if env.global_types.contains(prefixed):
 			Some({
@@ -2263,7 +2338,7 @@ private pure func descriptive_imported_variable_target(
 					def_id = Some(target.def_id),
 				})
 			None:
-				prefixed: String = core_module_member_name(imported_module_path, original_name)
+				prefixed: String = env_module_member_name(env, imported_module_path, original_name)
 
 				if env.global_types.contains(prefixed) or env.foreign_functions.contains(prefixed):
 					Some({
@@ -2347,7 +2422,7 @@ private pure func resolve_qualified_value(
 				else:
 					match qualified_module_path(env, resolutions.module_path, variable.name):
 						Some(module_path):
-							prefixed: String = core_module_member_name(module_path, field)
+							prefixed: String = env_module_member_name(env, module_path, field)
 
 							if (
 								env.global_types.contains(prefixed)

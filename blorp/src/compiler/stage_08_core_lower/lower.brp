@@ -390,7 +390,10 @@ import:
 		CoreValueRecordField,
 		CoreVar,
 	../stage_09_core/type_policy as CoreTypePolicy
-	identity: core_ufcs_function_name, flatten_canonical_core_type_name, is_core_ufcs_function_name
+	identity:
+		core_ufcs_function_name,
+		flatten_canonical_core_type_name_with_prefixes,
+		is_core_ufcs_function_name,
 	list_layout: tensor_for_element_storage_for_canonical_type
 
 
@@ -466,7 +469,8 @@ record CoreLowerContext {
 	source_module: Option[String],
 	definition_table: Option[DefinitionTable],
 	module_id: Option[ModuleId],
-	callable_names: CoreLowerCallableNameRegistry
+	callable_names: CoreLowerCallableNameRegistry,
+	module_member_prefixes: Dict[String, String]
 }
 
 
@@ -551,7 +555,8 @@ pure func core_lower_context(next_def_id: Int, source_module: Option[String]) ->
 		source_module = source_module,
 		definition_table = None,
 		module_id = None,
-		callable_names = CoreLowerDefaultCallableNames
+		callable_names = CoreLowerDefaultCallableNames,
+		module_member_prefixes = {}
 	}
 
 
@@ -567,8 +572,19 @@ pure func core_lower_context_with_callable_names(
 		source_module = source_module,
 		definition_table = Some(definition_table),
 		module_id = Some(module_id),
-		callable_names = callable_names
+		callable_names = callable_names,
+		module_member_prefixes = {}
 	}
+
+
+-- Attach the program-wide `core_module_member_prefix` table (one entry per
+-- module being lowered) so type lowering spells nominal `module::Type` names
+-- through one sanitized identity per module.
+pure func core_lower_context_with_module_member_prefixes(
+	context: CoreLowerContext,
+	module_member_prefixes: Dict[String, String],
+) -> CoreLowerContext:
+	{ context | module_member_prefixes = module_member_prefixes }
 
 
 private pure func mint_def_id(context: CoreLowerContext) -> (CoreLowerContext, Int):
@@ -922,6 +938,7 @@ private pure func core_tensor_dims(
 
 
 private pure func core_lower_type_list(
+	module_member_prefixes: Dict[String, String],
 	types: List[SemanticType],
 ) -> Result[List[CoreType], CoreLowerError]:
 	var lowered: List[CoreType] = []
@@ -929,7 +946,7 @@ private pure func core_lower_type_list(
 
 	for typ in types:
 		if failure.is_none():
-			match core_lower_type(typ):
+			match core_lower_type_with_prefixes(module_member_prefixes, typ):
 				Ok(lowered_type):
 					lowered = lowered.append(lowered_type)
 				Err(error):
@@ -943,10 +960,11 @@ private pure func core_lower_type_list(
 
 
 private pure func core_lower_tensor_type(
+	module_member_prefixes: Dict[String, String],
 	element: SemanticType,
 	dims: List[SemanticType],
 ) -> Result[CoreType, CoreLowerError]:
-	element_type ?= core_lower_value_type(element)
+	element_type ?= core_lower_value_type(module_member_prefixes, element)
 	core_dims ?= core_tensor_dims(dims)
 
 	Ok(TensorType({
@@ -967,6 +985,7 @@ private pure func malformed_parallel_tensor_type(
 
 
 private pure func core_lower_value_type_list(
+	module_member_prefixes: Dict[String, String],
 	types: List[SemanticType],
 ) -> Result[List[CoreType], CoreLowerError]:
 	var lowered: List[CoreType] = []
@@ -974,7 +993,7 @@ private pure func core_lower_value_type_list(
 
 	for typ in types:
 		if failure.is_none():
-			match core_lower_value_type(typ):
+			match core_lower_value_type(module_member_prefixes, typ):
 				Ok(lowered_type):
 					lowered = lowered.append(lowered_type)
 				Err(error):
@@ -988,9 +1007,20 @@ private pure func core_lower_value_type_list(
 
 
 pure func core_lower_type(typ: SemanticType) -> Result[CoreType, CoreLowerError]:
+	core_lower_type_with_prefixes({}, typ)
+
+
+-- `module_member_prefixes` is the lowering context's precomputed
+-- `core_module_member_prefix` table (see `core_module_member_prefix_table`),
+-- so nominal `module::Type` names flatten through one sanitized identity per
+-- module instead of re-sanitizing per type occurrence.
+private pure func core_lower_type_with_prefixes(
+	module_member_prefixes: Dict[String, String],
+	typ: SemanticType,
+) -> Result[CoreType, CoreLowerError]:
 	match array_type_parts(typ):
 		Some((element, dims)):
-			core_lower_tensor_type(element, dims)
+			core_lower_tensor_type(module_member_prefixes, element, dims)
 		None:
 			match typ:
 				SemanticNamedType(name, args):
@@ -998,7 +1028,10 @@ pure func core_lower_type(typ: SemanticType) -> Result[CoreType, CoreLowerError]
 					-- representation-sensitive Core passes. The staged replacement is
 					-- documented under "Core loses nominal type identity" in
 					-- docs/OWNERSHIP_MODEL.md.
-					normalized: String = flatten_canonical_core_type_name(normalize_type_name(name))
+					normalized: String = flatten_canonical_core_type_name_with_prefixes(
+						module_member_prefixes,
+						normalize_type_name(name),
+					)
 
 					if normalized == TYPE_NAME_VOID and args.length() == 0:
 						Ok(VoidType)
@@ -1008,7 +1041,7 @@ pure func core_lower_type(typ: SemanticType) -> Result[CoreType, CoreLowerError]
 					):
 						match args:
 							[element, dim]:
-								core_lower_tensor_type(element, [dim])
+								core_lower_tensor_type(module_member_prefixes, element, [dim])
 							_:
 								malformed_parallel_tensor_type(
 									typ,
@@ -1021,6 +1054,7 @@ pure func core_lower_type(typ: SemanticType) -> Result[CoreType, CoreLowerError]
 						match args:
 							[element, rows, columns]:
 								core_lower_tensor_type(
+									module_member_prefixes,
 									element,
 									[rows, columns],
 								)
@@ -1042,7 +1076,7 @@ pure func core_lower_type(typ: SemanticType) -> Result[CoreType, CoreLowerError]
 							),
 						)
 					else:
-						match core_lower_value_type_list(args):
+						match core_lower_value_type_list(module_member_prefixes, args):
 							Ok(lowered_args):
 								Ok(NamedType(normalized, lowered_args))
 							Err(CoreLowerInvalidType(message)):
@@ -1056,7 +1090,7 @@ pure func core_lower_type(typ: SemanticType) -> Result[CoreType, CoreLowerError]
 							Err(error):
 								Err(error)
 				SemanticTupleType(elements):
-					lowered_elements ?= core_lower_value_type_list(elements)
+					lowered_elements ?= core_lower_value_type_list(module_member_prefixes, elements)
 					Ok(TupleType(lowered_elements))
 				SemanticRangeType(_):
 					Ok(RangeType)
@@ -1073,8 +1107,8 @@ pure func core_lower_type(typ: SemanticType) -> Result[CoreType, CoreLowerError]
 						),
 					)
 				SemanticFunctionType(is_pure, params, return_type):
-					lowered_params ?= core_lower_value_type_list(params)
-					lowered_return ?= core_lower_value_type(return_type)
+					lowered_params ?= core_lower_value_type_list(module_member_prefixes, params)
+					lowered_return ?= core_lower_value_type(module_member_prefixes, return_type)
 					Ok(FunctionType(is_pure, lowered_params, lowered_return))
 				SemanticArrayType(_, _):
 					Err(
@@ -1106,12 +1140,15 @@ pure func core_lower_type(typ: SemanticType) -> Result[CoreType, CoreLowerError]
 					)
 
 
-private pure func core_lower_value_type(typ: SemanticType) -> Result[CoreType, CoreLowerError]:
+private pure func core_lower_value_type(
+	module_member_prefixes: Dict[String, String],
+	typ: SemanticType,
+) -> Result[CoreType, CoreLowerError]:
 	match typ:
 		SemanticConstIntType(_):
 			Ok(NamedType("Int", []))
 		_:
-			core_lower_type(typ)
+			core_lower_type_with_prefixes(module_member_prefixes, typ)
 
 
 private CORE_INT_TYPE: CoreType = NamedType("Int", [])
@@ -1824,7 +1861,10 @@ private pure func lower_typed_list_items(
 		if failure.is_none():
 			match lower_typed_expr_with_context(context, item):
 				Ok(lowered_expr):
-					match core_lower_value_type(typed_expr_value_type(item)):
+					match core_lower_value_type(
+						context.module_member_prefixes,
+						typed_expr_value_type(item),
+					):
 						Ok(item_type):
 							lowered = lowered.append(
 								core_boxed_storage_value_for_expr(
@@ -1905,7 +1945,7 @@ private pure func lower_record_update_field(
 	base_ref: CoreExpr,
 	loc: CoreSourceLoc,
 ) -> Result[CoreRecordFieldValue, CoreLowerError]:
-	field_type ?= core_lower_type(field.field_type)
+	field_type ?= core_lower_type_with_prefixes(context.module_member_prefixes, field.field_type)
 
 	match updates.find(func(update): update.name == field.name):
 		Some(update):
@@ -2029,7 +2069,10 @@ private pure func lower_string_interpolation_part(
 			Ok(LiteralExpr(StringLiteral(text), CORE_STRING_TYPE, loc))
 		TypedInterpolationExpr(expr):
 			lowered ?= lower_typed_expr_with_context(context, expr)
-			expr_type ?= core_lower_value_type(typed_expr_value_type(expr))
+			expr_type ?= core_lower_value_type(
+				context.module_member_prefixes,
+				typed_expr_value_type(expr),
+			)
 
 			match interpolation_to_string_function(expr_type):
 				Some(function_name):
@@ -2089,7 +2132,10 @@ private pure func lower_typed_field_access(
 	loc: CoreSourceLoc,
 ) -> Result[CoreExpr, CoreLowerError]:
 	lowered_receiver ?= lower_typed_expr_with_context(context, receiver)
-	receiver_type ?= core_lower_value_type(typed_expr_value_type(receiver))
+	receiver_type ?= core_lower_value_type(
+		context.module_member_prefixes,
+		typed_expr_value_type(receiver),
+	)
 
 	match receiver_type:
 		TupleType(items):
@@ -2162,7 +2208,10 @@ private pure func lower_typed_concurrent_binding(
 	context: CoreLowerContext,
 	binding: TypedConcurrentBinding,
 ) -> Result[CorePreClosureConcurrentBinding, CoreLowerError]:
-	typ ?= core_lower_value_type(typed_expr_info_value_type(binding.info))
+	typ ?= core_lower_value_type(
+		context.module_member_prefixes,
+		typed_expr_info_value_type(binding.info),
+	)
 	rhs ?= lower_typed_expr_with_context(context, binding.value)
 
 	Ok({
@@ -2222,7 +2271,7 @@ private pure func lower_typed_timeout_expr(
 	if core_timeout_is_int(timeout_type):
 		lower_typed_expr_with_context(context, timeout)
 	else if core_timeout_is_duration(timeout_type):
-		duration_type ?= core_lower_value_type(timeout_type)
+		duration_type ?= core_lower_value_type(context.module_member_prefixes, timeout_type)
 		lowered_duration ?= lower_typed_expr_with_context(context, timeout)
 		Ok(
 			lower_duration_timeout_milliseconds(
@@ -2410,7 +2459,7 @@ private pure func lower_typed_select_arm_kind(
 ) -> Result[CoreSelectArmKind, CoreLowerError]:
 	match kind:
 		TypedSelectReceiveArm(name, element_type, channel):
-			elem_type ?= core_lower_type(element_type)
+			elem_type ?= core_lower_type_with_prefixes(context.module_member_prefixes, element_type)
 			lowered_channel ?= lower_typed_expr_with_context(context, channel)
 			recv: CoreSelectRecvArm = {
 				binder = core_var(name.text, None),
@@ -2471,7 +2520,7 @@ private pure func lower_typed_lambda_params(
 
 	for param in params:
 		if failure.is_none():
-			match core_lower_type(param.param_type):
+			match core_lower_type_with_prefixes(context.module_member_prefixes, param.param_type):
 				Ok(param_type):
 					lowered = lowered.append({
 						name = core_var(param.name.text, None),
@@ -2501,7 +2550,7 @@ private pure func lower_for_name_binder(
 ) -> Result[CoreLoopBinder, CoreLowerError]:
 	match binder:
 		ParsedForNameBinder(name):
-			typ ?= core_lower_value_type(element_type)
+			typ ?= core_lower_value_type(context.module_member_prefixes, element_type)
 			Ok({
 				variable = core_var(name.text, None),
 				typ = typ,
@@ -2536,7 +2585,10 @@ private pure func lower_typed_for_binding(
 							),
 						)
 					else:
-						field_types ?= core_lower_type_list(element_types)
+						field_types ?= core_lower_type_list(
+							context.module_member_prefixes,
+							element_types,
+						)
 						tuple_type: CoreType = TupleType(field_types)
 						tuple_var = core_var(tuple_destruct_name(span), None)
 						tuple_ref = VarExpr(
@@ -2608,7 +2660,10 @@ private pure func lower_typed_for_parts(
 	body: TypedExpr,
 ) -> Result[CoreLowerForParts, CoreLowerError]:
 	iterable_type: SemanticType = typed_expr_value_type(iterable)
-	iterable_core_type ?= core_lower_type(iterable_type)
+	iterable_core_type ?= core_lower_type_with_prefixes(
+		context.module_member_prefixes,
+		iterable_type,
+	)
 	lowered_binding ?= lower_typed_for_binding(context, binder, element_type, body)
 	lowered_iterable ?= lower_typed_expr_with_context(context, iterable)
 
@@ -2633,7 +2688,10 @@ private pure func lower_typed_range_value_for(
 	lowered_binder ?= lower_for_name_binder(context, binder, TYPE_INT)
 	lowered_iterable ?= lower_typed_expr_with_context(context, iterable)
 	lowered_body ?= lower_typed_expr_with_context(context, body)
-	range_type ?= core_lower_type(typed_expr_value_type(iterable))
+	range_type ?= core_lower_type_with_prefixes(
+		context.module_member_prefixes,
+		typed_expr_value_type(iterable),
+	)
 	range_var = core_var(
 		loop_view_internal_name("range_source", for_binder_span(binder)),
 		None,
@@ -2863,8 +2921,14 @@ private pure func lower_typed_windows_for(
 				Err(CoreLowerInvalidType("windows loop requires a name binder"))
 			ParsedForNameBinder(window_name):
 				source ?= typed_loop_view_source(iterable, "windows")
-				source_type ?= core_lower_type(typed_expr_value_type(source))
-				window_type ?= core_lower_type(window_source_type)
+				source_type ?= core_lower_type_with_prefixes(
+					context.module_member_prefixes,
+					typed_expr_value_type(source),
+				)
+				window_type ?= core_lower_type_with_prefixes(
+					context.module_member_prefixes,
+					window_source_type,
+				)
 				lowered_source ?= lower_typed_expr_with_context(context, source)
 				lowered_body ?= lower_typed_expr_with_context(context, body)
 				span: SourceSpan = for_binder_span(binder)
@@ -3121,10 +3185,16 @@ private pure func lower_typed_tensor_enumerate_for(
 
 	index_name: String = loop_view_binder_name(binder, 0, "enumerate_index", span)
 
-	index_type ?= core_lower_type(index_source_type)
-	element_type ?= core_lower_type(element_source_type)
+	index_type ?= core_lower_type_with_prefixes(context.module_member_prefixes, index_source_type)
+	element_type ?= core_lower_type_with_prefixes(
+		context.module_member_prefixes,
+		element_source_type,
+	)
 	lowered_source ?= lower_typed_expr_with_context(context, source)
-	lowered_source_type ?= core_lower_type(source_type)
+	lowered_source_type ?= core_lower_type_with_prefixes(
+		context.module_member_prefixes,
+		source_type,
+	)
 	source_var = core_var(
 		loop_view_internal_name("enumerate_source", span),
 		None,
@@ -3335,11 +3405,17 @@ private pure func lower_typed_2d_enumerate2_for(
 	span: SourceSpan = for_binder_span(binder)
 	row_name: String = loop_view_binder_name(binder, 0, "enumerate2_row", span)
 	column_name: String = loop_view_binder_name(binder, 1, "enumerate2_column", span)
-	row_type ?= core_lower_type(row_source_type)
-	column_type ?= core_lower_type(column_source_type)
-	element_type ?= core_lower_type(element_source_type)
+	row_type ?= core_lower_type_with_prefixes(context.module_member_prefixes, row_source_type)
+	column_type ?= core_lower_type_with_prefixes(context.module_member_prefixes, column_source_type)
+	element_type ?= core_lower_type_with_prefixes(
+		context.module_member_prefixes,
+		element_source_type,
+	)
 	lowered_source ?= lower_typed_expr_with_context(context, source)
-	lowered_source_type ?= core_lower_type(source_type)
+	lowered_source_type ?= core_lower_type_with_prefixes(
+		context.module_member_prefixes,
+		source_type,
+	)
 	source_var = core_var(
 		loop_view_internal_name("enumerate2_source", span),
 		None,
@@ -3577,7 +3653,10 @@ private pure func lower_typed_tensor_for(
 			Err(CoreLowerInvalidType("tensor for loop source has no dimensions"))
 		[_]:
 			parts ?= lower_typed_for_parts(context, binder, element_type, iterable, body)
-			lowered_element_type ?= core_lower_type(element_type)
+			lowered_element_type ?= core_lower_type_with_prefixes(
+				context.module_member_prefixes,
+				element_type,
+			)
 			for_tensor: CoreForTensor = {
 				binder = parts.binder,
 				element_storage = tensor_for_element_storage_for_canonical_type(
@@ -3679,6 +3758,7 @@ private pure func lower_typed_for(
 
 
 private pure func concurrent_for_item(
+	module_member_prefixes: Dict[String, String],
 	iterable_type: SemanticType,
 ) -> Result[CoreLowerConcurrentForItem, CoreLowerError]:
 	match iterable_type:
@@ -3688,7 +3768,10 @@ private pure func concurrent_for_item(
 			if normalized_name == "List":
 				match args:
 					[element_type]:
-						item_type ?= core_lower_type(element_type)
+						item_type ?= core_lower_type_with_prefixes(
+							module_member_prefixes,
+							element_type,
+						)
 						Ok({
 							item_type = item_type,
 							item_mode = ConcurrentlyLoopCopyItem,
@@ -3698,8 +3781,14 @@ private pure func concurrent_for_item(
 			else if is_resource_source_type_name(name):
 				match args:
 					[resource_source_type, error_source_type]:
-						resource_type ?= core_lower_type(resource_source_type)
-						error_type ?= core_lower_type(error_source_type)
+						resource_type ?= core_lower_type_with_prefixes(
+							module_member_prefixes,
+							resource_source_type,
+						)
+						error_type ?= core_lower_type_with_prefixes(
+							module_member_prefixes,
+							error_source_type,
+						)
 						move_item: CoreConcurrentlyLoopMoveResourceItem = {
 							resource_type = resource_type,
 							error_type = error_type
@@ -3801,10 +3890,10 @@ private pure func lower_typed_concurrent_for(
 	loc: CoreSourceLoc,
 ) -> Result[CoreExpr, CoreLowerError]:
 	iterable_type = typed_expr_value_type(iterable)
-	item ?= concurrent_for_item(iterable_type)
+	item ?= concurrent_for_item(context.module_member_prefixes, iterable_type)
 	lowered_iterable ?= lower_typed_expr_with_context(context, iterable)
 	lowered_body ?= lower_typed_expr_with_context(context, body)
-	body_type ?= core_lower_value_type(typed_expr_value_type(body))
+	body_type ?= core_lower_value_type(context.module_member_prefixes, typed_expr_value_type(body))
 	lowered_params ?= lower_typed_concurrent_for_params(context, params, loc)
 	loop: CorePreClosureConcurrentlyLoop = {
 		variable = core_var(name.text, None),
@@ -4088,7 +4177,10 @@ private pure func lower_typed_question_bind(
 	else:
 		block_kind ?= core_carrier_kind(block_type)
 		lowered_rhs ?= lower_typed_expr_with_context(context, rhs)
-		rhs_type ?= core_lower_value_type(typed_expr_value_type(rhs))
+		rhs_type ?= core_lower_value_type(
+			context.module_member_prefixes,
+			typed_expr_value_type(rhs),
+		)
 		rhs_kind ?= core_carrier_kind(rhs_type)
 
 		if block_kind != rhs_kind:
@@ -4271,7 +4363,10 @@ private pure func lower_typed_with(
 	loc: CoreSourceLoc,
 ) -> Result[CoreExpr, CoreLowerError]:
 	acquisition ?= lower_typed_expr_with_context(context, binding.value)
-	acquisition_type ?= core_lower_value_type(typed_expr_value_type(binding.value))
+	acquisition_type ?= core_lower_value_type(
+		context.module_member_prefixes,
+		typed_expr_value_type(binding.value),
+	)
 	is_try = typed_with_binding_is_try(binding)
 	resource_type ?= with_resource_type(is_try, clone_core_type(acquisition_type))
 	lowered_body ?= lower_typed_expr_with_context(context, body)
@@ -4393,7 +4488,10 @@ private pure func lower_typed_tuple_destruct(
 	loc: CoreSourceLoc,
 ) -> Result[CoreExpr, CoreLowerError]:
 	lowered_value ?= lower_typed_expr_with_context(context, value)
-	value_type ?= core_lower_value_type(typed_expr_value_type(value))
+	value_type ?= core_lower_value_type(
+		context.module_member_prefixes,
+		typed_expr_value_type(value),
+	)
 
 	field_types ?= match value_type:
 		TupleType(items):
@@ -4443,7 +4541,10 @@ private pure func lower_typed_block_expr(
 					-- Typechecking has already validated any source annotation.
 					-- The initializer's value type carries the resolved module
 					-- identity and widening decision that Core must preserve.
-					bind_type ?= core_lower_value_type(typed_expr_value_type(payload.initializer))
+					bind_type ?= core_lower_value_type(
+						context.module_member_prefixes,
+						typed_expr_value_type(payload.initializer),
+					)
 					body ?= lower_typed_block_expr(
 						context,
 						rest,
@@ -4492,7 +4593,7 @@ private pure func lower_typed_expr_with_context(
 	context: CoreLowerContext,
 	expr: TypedExpr,
 ) -> Result[CoreExpr, CoreLowerError]:
-	typ ?= core_lower_value_type(typed_expr_value_type(expr))
+	typ ?= core_lower_value_type(context.module_member_prefixes, typed_expr_value_type(expr))
 
 	lower_typed_expr_as_type(context, expr, typ)
 
@@ -4613,7 +4714,10 @@ private pure func lower_typed_expr_as_type(
 			Ok(SelectExpr(lowered_arms, typ, loc))
 		TypedLambdaExpr(is_pure, params, _, body, _, _):
 			lowered_params ?= lower_typed_lambda_params(context, params)
-			lowered_return_type ?= core_lower_value_type(typed_expr_value_type(body))
+			lowered_return_type ?= core_lower_value_type(
+				context.module_member_prefixes,
+				typed_expr_value_type(body),
+			)
 			lowered_body ?= lower_typed_expr_with_context(context, body)
 			Ok(LambdaExpr(lowered_params, lowered_return_type, lowered_body, is_pure, typ, loc))
 		TypedBlockExpr(items, _, _):
@@ -4654,11 +4758,12 @@ private pure func core_type_param_names(params: List[ParsedTypeParamDecl]) -> Li
 
 
 private pure func core_lower_param(
+	module_member_prefixes: Dict[String, String],
 	param: ParsedParam,
 	param_type: SemanticType,
 	index: Int,
 ) -> Result[CoreLowerParamResult, CoreLowerError]:
-	typ ?= core_lower_value_type(param_type)
+	typ ?= core_lower_value_type(module_member_prefixes, param_type)
 
 	match param.binder:
 		ParsedParamNameBinder(name):
@@ -4718,6 +4823,7 @@ private pure func core_lower_param(
 
 
 private pure func core_lower_params(
+	module_member_prefixes: Dict[String, String],
 	params: List[ParsedParam],
 	param_types: List[SemanticType],
 ) -> Result[CoreLowerParams, CoreLowerError]:
@@ -4736,7 +4842,7 @@ private pure func core_lower_params(
 		while index < params.length() and failure.is_none():
 			match (params.get(index), param_types.get(index)):
 				(Some(param), Some(param_type)):
-					match core_lower_param(param, param_type, index):
+					match core_lower_param(module_member_prefixes, param, param_type, index):
 						Ok(lowered_param):
 							lowered = lowered.append(lowered_param.param)
 
@@ -4889,8 +4995,8 @@ private pure func lower_typed_function_info(
 	context: CoreLowerContext,
 	info: TypedFunctionInfo,
 ) -> Result[CoreLowerFunctionResult, CoreLowerError]:
-	params ?= core_lower_params(info.decl.params, info.param_types)
-	return_type ?= core_lower_value_type(info.semantic_return_type)
+	params ?= core_lower_params(context.module_member_prefixes, info.decl.params, info.param_types)
+	return_type ?= core_lower_value_type(context.module_member_prefixes, info.semantic_return_type)
 	lowered_function_body ?= lower_typed_function_body(
 		context,
 		info,
@@ -4956,8 +5062,8 @@ private pure func lower_typed_foreign_function(
 	context: CoreLowerContext,
 	info: TypedForeignFunctionInfo,
 ) -> Result[CoreLowerDeclResult, CoreLowerError]:
-	params ?= core_lower_params(info.decl.params, info.param_types)
-	return_type ?= core_lower_value_type(info.semantic_return_type)
+	params ?= core_lower_params(context.module_member_prefixes, info.decl.params, info.param_types)
+	return_type ?= core_lower_value_type(context.module_member_prefixes, info.semantic_return_type)
 
 	(next_context, def_id) = match info.callable_id:
 		Some(callable_id):
@@ -5011,7 +5117,7 @@ private pure func lower_typed_global(
 			mint_def_id(context)
 
 	init ?= lower_typed_expr_with_context(context, info.value)
-	typ ?= core_lower_value_type(info.binding_type)
+	typ ?= core_lower_value_type(context.module_member_prefixes, info.binding_type)
 
 	Ok({
 		context = next_context,
@@ -5030,9 +5136,10 @@ private pure func lower_typed_global(
 
 
 private pure func lower_value_record_field(
+	module_member_prefixes: Dict[String, String],
 	field: TypedRecordFieldInfo,
 ) -> Result[CoreValueRecordField, CoreLowerError]:
-	typ ?= core_lower_type(field.semantic_type)
+	typ ?= core_lower_type_with_prefixes(module_member_prefixes, field.semantic_type)
 	Ok({
 		name = field.name,
 		typ = typ,
@@ -5040,6 +5147,7 @@ private pure func lower_value_record_field(
 
 
 private pure func lower_value_record_fields(
+	module_member_prefixes: Dict[String, String],
 	fields: List[TypedRecordFieldInfo],
 ) -> Result[List[CoreValueRecordField], CoreLowerError]:
 	var lowered: List[CoreValueRecordField] = []
@@ -5047,7 +5155,7 @@ private pure func lower_value_record_fields(
 
 	for field in fields:
 		if failure.is_none():
-			match lower_value_record_field(field):
+			match lower_value_record_field(module_member_prefixes, field):
 				Ok(lowered_field):
 					lowered = lowered.append(lowered_field)
 				Err(error):
@@ -5061,9 +5169,10 @@ private pure func lower_value_record_fields(
 
 
 private pure func lower_heap_record_field(
+	module_member_prefixes: Dict[String, String],
 	field: TypedRecordFieldInfo,
 ) -> Result[CoreHeapRecordField, CoreLowerError]:
-	typ ?= core_lower_type(field.semantic_type)
+	typ ?= core_lower_type_with_prefixes(module_member_prefixes, field.semantic_type)
 	Ok({
 		name = field.name,
 		typ = typ,
@@ -5072,6 +5181,7 @@ private pure func lower_heap_record_field(
 
 
 private pure func lower_heap_record_fields(
+	module_member_prefixes: Dict[String, String],
 	fields: List[TypedRecordFieldInfo],
 ) -> Result[List[CoreHeapRecordField], CoreLowerError]:
 	var lowered: List[CoreHeapRecordField] = []
@@ -5079,7 +5189,7 @@ private pure func lower_heap_record_fields(
 
 	for field in fields:
 		if failure.is_none():
-			match lower_heap_record_field(field):
+			match lower_heap_record_field(module_member_prefixes, field):
 				Ok(lowered_field):
 					lowered = lowered.append(lowered_field)
 				Err(error):
@@ -5097,7 +5207,7 @@ private pure func lower_typed_record(
 	info: TypedRecordInfo,
 ) -> Result[CoreLowerDeclResult, CoreLowerError]:
 	if info.decl.is_struct:
-		fields ?= lower_value_record_fields(info.fields)
+		fields ?= lower_value_record_fields(context.module_member_prefixes, info.fields)
 		Ok({
 			context = context,
 			decl = ValueRecordDecl({
@@ -5109,7 +5219,7 @@ private pure func lower_typed_record(
 			}),
 		})
 	else:
-		fields ?= lower_heap_record_fields(info.fields)
+		fields ?= lower_heap_record_fields(context.module_member_prefixes, info.fields)
 		Ok({
 			context = context,
 			decl = HeapRecordDecl({
@@ -5212,8 +5322,11 @@ private pure func lower_enum_variants(
 			Ok(lowered)
 
 
-private pure func lower_union_field(typ: SemanticType) -> Result[CoreUnionField, CoreLowerError]:
-	core_type ?= core_lower_type(typ)
+private pure func lower_union_field(
+	module_member_prefixes: Dict[String, String],
+	typ: SemanticType,
+) -> Result[CoreUnionField, CoreLowerError]:
+	core_type ?= core_lower_type_with_prefixes(module_member_prefixes, typ)
 
 	Ok({
 		typ = core_type,
@@ -5222,6 +5335,7 @@ private pure func lower_union_field(typ: SemanticType) -> Result[CoreUnionField,
 
 
 private pure func lower_union_fields(
+	module_member_prefixes: Dict[String, String],
 	fields: List[SemanticType],
 ) -> Result[List[CoreUnionField], CoreLowerError]:
 	var lowered: List[CoreUnionField] = []
@@ -5229,7 +5343,7 @@ private pure func lower_union_fields(
 
 	for field in fields:
 		if failure.is_none():
-			match lower_union_field(field):
+			match lower_union_field(module_member_prefixes, field):
 				Ok(lowered_field):
 					lowered = lowered.append(lowered_field)
 				Err(error):
@@ -5243,10 +5357,11 @@ private pure func lower_union_fields(
 
 
 private pure func lower_union_variant(
+	module_member_prefixes: Dict[String, String],
 	type_name: String,
 	variant: TypedUnionVariantInfo,
 ) -> Result[CoreUnionVariant, CoreLowerError]:
-	fields ?= lower_union_fields(variant.fields)
+	fields ?= lower_union_fields(module_member_prefixes, variant.fields)
 
 	Ok({
 		name = variant.name,
@@ -5259,6 +5374,7 @@ private pure func lower_union_variant(
 
 
 private pure func lower_union_variants(
+	module_member_prefixes: Dict[String, String],
 	type_name: String,
 	variants: List[TypedUnionVariantInfo],
 ) -> Result[List[CoreUnionVariant], CoreLowerError]:
@@ -5267,7 +5383,7 @@ private pure func lower_union_variants(
 
 	for variant in variants:
 		if failure.is_none():
-			match lower_union_variant(type_name, variant):
+			match lower_union_variant(module_member_prefixes, type_name, variant):
 				Ok(lowered_variant):
 					lowered = lowered.append(lowered_variant)
 				Err(error):
@@ -5298,7 +5414,11 @@ private pure func lower_typed_union(
 		})
 	else:
 		storage = lower_union_payload_storage(info)
-		variants ?= lower_union_variants(info.decl.name.text, info.variants)
+		variants ?= lower_union_variants(
+			context.module_member_prefixes,
+			info.decl.name.text,
+			info.variants,
+		)
 		Ok({
 			context = context,
 			decl = UnionDecl({
@@ -5316,7 +5436,10 @@ private pure func lower_typed_type_alias(
 	context: CoreLowerContext,
 	info: TypedTypeAliasInfo,
 ) -> Result[CoreLowerDeclResult, CoreLowerError]:
-	target ?= core_lower_type(info.semantic_target_type)
+	target ?= core_lower_type_with_prefixes(
+		context.module_member_prefixes,
+		info.semantic_target_type,
+	)
 
 	Ok({
 		context = context,
@@ -5332,10 +5455,11 @@ private pure func lower_typed_type_alias(
 
 
 private pure func lower_typed_trait_method(
+	module_member_prefixes: Dict[String, String],
 	method: TypedTraitMethodInfo,
 ) -> Result[CoreTraitMethod, CoreLowerError]:
-	params ?= core_lower_params(method.decl.params, method.param_types)
-	return_type ?= core_lower_value_type(method.semantic_return_type)
+	params ?= core_lower_params(module_member_prefixes, method.decl.params, method.param_types)
+	return_type ?= core_lower_value_type(module_member_prefixes, method.semantic_return_type)
 
 	Ok({
 		name = method.decl.name.text,
@@ -5347,14 +5471,15 @@ private pure func lower_typed_trait_method(
 
 
 private pure func lower_typed_trait_methods(
+	module_member_prefixes: Dict[String, String],
 	methods: List[TypedTraitMethodInfo],
 ) -> Result[List[CoreTraitMethod], CoreLowerError]:
 	match methods:
 		[]:
 			Ok([])
 		[method, ...rest]:
-			lowered ?= lower_typed_trait_method(method)
-			lowered_rest ?= lower_typed_trait_methods(rest)
+			lowered ?= lower_typed_trait_method(module_member_prefixes, method)
+			lowered_rest ?= lower_typed_trait_methods(module_member_prefixes, rest)
 			Ok([lowered].concat(lowered_rest))
 
 
@@ -5362,7 +5487,7 @@ private pure func lower_typed_trait(
 	context: CoreLowerContext,
 	info: TypedTraitInfo,
 ) -> Result[CoreLowerDeclResult, CoreLowerError]:
-	methods ?= lower_typed_trait_methods(info.methods)
+	methods ?= lower_typed_trait_methods(context.module_member_prefixes, info.methods)
 
 	Ok({
 		context = context,
@@ -5399,7 +5524,7 @@ private pure func lower_typed_impl(
 	context: CoreLowerContext,
 	info: TypedImplInfo,
 ) -> Result[CoreLowerDeclResult, CoreLowerError]:
-	for_type ?= core_lower_type(info.for_type)
+	for_type ?= core_lower_type_with_prefixes(context.module_member_prefixes, info.for_type)
 	lowered_methods ?= lower_typed_impl_methods_at(context, info.methods, 0, [])
 	(next_context, methods) = lowered_methods
 

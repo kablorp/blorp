@@ -6,7 +6,7 @@
 -- spellings alone never authorize expansion.
 import:
 	../stage_01_generated_inputs/embedded_std: embedded_std_contains_module
-	../stage_08_core_lower/identity: sanitize_core_module_name
+	../stage_08_core_lower/identity: core_module_member_prefix
 	ir:
 		CoreBoxedStorageValue,
 		CoreCallKind(UserCall),
@@ -276,19 +276,18 @@ private pure func strip_mono_suffix(name: String) -> String:
 		name.substring(0, index)
 
 
-private pure func source_name(function_info: CoreFunction) -> String:
+-- `module_prefix` is the precomputed `core_module_member_prefix` of the
+-- function's source module, spelled once per module by the caller.
+private pure func source_name(module_prefix: String, function_info: CoreFunction) -> String:
 	without_mono: String = strip_mono_suffix(function_info.name)
 
-	without_module: String = match function_info.source_module:
-		Some(module_name):
-			prefix: String = sanitize_core_module_name(module_name) + "__"
-
-			if without_mono.starts_with(prefix):
-				without_mono.substring(prefix.length(), without_mono.length() - prefix.length())
-			else:
-				without_mono
-		None:
-			without_mono
+	without_module: String = if without_mono.starts_with(module_prefix):
+		without_mono.substring(
+			module_prefix.length(),
+			without_mono.length() - module_prefix.length(),
+		)
+	else:
+		without_mono
 
 	if without_module.ends_with("__pure"):
 		without_module.substring(0, without_module.length() - "__pure".length())
@@ -335,14 +334,37 @@ private pure func tensor_bindings(
 		None
 
 
-private pure func target_bindings(function_info: CoreFunction) -> Option[List[StdInlineArgBinding]]:
+private record StdInlineModulePrefixes {
+	list: String,
+	tensor: String
+}
+
+
+-- The two inlinable std modules, sanitized once per target collection.
+private pure func std_inline_module_prefixes() -> StdInlineModulePrefixes:
+	{
+		list = core_module_member_prefix("list"),
+		tensor = core_module_member_prefix("tensor")
+	}
+
+
+private pure func target_bindings(
+	prefixes: StdInlineModulePrefixes,
+	function_info: CoreFunction,
+) -> Option[List[StdInlineArgBinding]]:
 	match function_info.source_module:
 		Some(module_name):
 			match module_name:
 				"list":
-					list_bindings(source_name(function_info), function_info.params)
+					list_bindings(
+						source_name(prefixes.list, function_info),
+						function_info.params,
+					)
 				"tensor":
-					tensor_bindings(source_name(function_info), function_info.params)
+					tensor_bindings(
+						source_name(prefixes.tensor, function_info),
+						function_info.params,
+					)
 				_:
 					None
 		_:
@@ -362,11 +384,12 @@ private pure func add_std_inline_target(
 
 private pure func collect_targets(program: CoreProgram) -> StdInlineTargets:
 	var targets: StdInlineTargets = {by_name = {}}
+	prefixes: StdInlineModulePrefixes = std_inline_module_prefixes()
 
 	for decl in program.decls:
 		match decl:
 			FunctionDecl(function_info):
-				match (function_info.body, target_bindings(function_info)):
+				match (function_info.body, target_bindings(prefixes, function_info)):
 					(Some(body), Some(arg_bindings)):
 						if function_info.type_params.is_empty():
 							targets = add_std_inline_target(

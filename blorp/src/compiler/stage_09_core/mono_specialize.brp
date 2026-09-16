@@ -5,8 +5,9 @@
 -- separate concerns and remain outside this module.
 import:
 	../stage_08_core_lower/identity:
-		core_module_member_name,
-		core_pure_overload_function_name,
+		core_module_member_name_from_prefix,
+		core_module_member_prefix,
+		core_pure_overload_function_name_from_prefix,
 		core_ufcs_source_name_for_module,
 	ir:
 		CoreCallKind(SelectedDirectCall, UnknownCall),
@@ -104,10 +105,14 @@ private record CoreMonoFunctionRequest {
 
 -- Store each large CoreFunction value once. Valid Core has globally unique IDs,
 -- so the collision map remains empty outside malformed-input boundaries.
+-- `module_member_prefixes` carries the `core_module_member_prefix` of every
+-- source module an indexed function came from, computed once per module so
+-- callee identity checks spell module members without re-sanitizing.
 private record CoreGenericFunctionIndex {
 	functions: List[CoreFunction],
 	function_index_by_id: Dict[Int, Int],
-	function_collision_indices_by_id: Dict[Int, List[Int]]
+	function_collision_indices_by_id: Dict[Int, List[Int]],
+	module_member_prefixes: Dict[String, String]
 }
 
 
@@ -403,10 +408,23 @@ private pure func index_generic_function(
 ) -> CoreGenericFunctionIndex:
 	function_index: Int = index.functions.length()
 
+	module_member_prefixes: Dict[String, String] = match function.source_module:
+		Some(module_name):
+			if index.module_member_prefixes.contains(module_name):
+				index.module_member_prefixes
+			else:
+				index.module_member_prefixes.set(
+					module_name,
+					core_module_member_prefix(module_name),
+				)
+		None:
+			index.module_member_prefixes
+
 	match index.function_index_by_id.get(function.def_id):
 		Some(existing_index):
 			{ index |
 				functions = index.functions.append(function),
+				module_member_prefixes = module_member_prefixes,
 				function_collision_indices_by_id = index.function_collision_indices_by_id.set(
 					function.def_id,
 					index.function_collision_indices_by_id
@@ -417,6 +435,7 @@ private pure func index_generic_function(
 		None:
 			{ index |
 				functions = index.functions.append(function),
+				module_member_prefixes = module_member_prefixes,
 				function_index_by_id = index.function_index_by_id.set(
 					function.def_id,
 					function_index,
@@ -428,7 +447,8 @@ private pure func collect_generic_functions(program: CoreProgram) -> CoreGeneric
 	var generic_functions: CoreGenericFunctionIndex = {
 		functions = [],
 		function_index_by_id = {},
-		function_collision_indices_by_id = {}
+		function_collision_indices_by_id = {},
+		module_member_prefixes = {}
 	}
 
 	for decl in program.decls:
@@ -485,6 +505,7 @@ private pure func find_requested_generic_function(
 
 
 private pure func function_matches_callee_identity(
+	module_member_prefixes: Dict[String, String],
 	function: CoreFunction,
 	callee_name: String,
 ) -> Bool:
@@ -495,9 +516,16 @@ private pure func function_matches_callee_identity(
 			Some(module_name):
 				match core_ufcs_source_name_for_module(module_name, callee_name):
 					Some(source_name):
-						canonical_name: String = core_module_member_name(module_name, source_name)
-						pure_overload_name: String = core_pure_overload_function_name(
+						module_prefix: String = module_member_prefixes.get_or_else(
 							module_name,
+							func(): core_module_member_prefix(module_name),
+						)
+						canonical_name: String = core_module_member_name_from_prefix(
+							module_prefix,
+							source_name,
+						)
+						pure_overload_name: String = core_pure_overload_function_name_from_prefix(
+							module_prefix,
 							source_name,
 						)
 
@@ -563,7 +591,11 @@ private pure func find_generic_function_for_call(
 				match generic_functions.functions.get(function_index):
 					Some(function):
 						if (
-							function_matches_callee_identity(function, callee_name)
+							function_matches_callee_identity(
+								generic_functions.module_member_prefixes,
+								function,
+								callee_name,
+							)
 							and call_signature_compatible(function, args, result_type)
 						):
 							match found:
@@ -585,7 +617,11 @@ private pure func find_generic_function_for_call(
 					match generic_functions.functions.get(function_index):
 						Some(function):
 							if (
-								function_matches_callee_identity(function, callee_name)
+								function_matches_callee_identity(
+									generic_functions.module_member_prefixes,
+									function,
+									callee_name,
+								)
 								and call_signature_compatible(function, args, result_type)
 							):
 								Some(function)
@@ -695,6 +731,7 @@ private pure func request_for_call(
 							match mangle_specialization_name(function.name, substitution):
 								Some(mangled_name):
 									option_target: Option[CoreMonoOptionFusionTarget] = match core_option_fusion_target(
+										generic_functions.module_member_prefixes,
 										function,
 									):
 										Some(target):
@@ -932,7 +969,11 @@ private pure func indexed_function_matches_call(
 	match generic_functions.functions.get(function_index):
 		Some(function):
 			(
-				function_matches_callee_identity(function, callee_name)
+				function_matches_callee_identity(
+					generic_functions.module_member_prefixes,
+					function,
+					callee_name,
+				)
 				and call_signature_compatible(function, args, result_type)
 			)
 		None:

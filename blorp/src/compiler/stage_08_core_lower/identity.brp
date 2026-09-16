@@ -26,8 +26,35 @@ pure func sanitize_core_module_name(module_name: String) -> String:
 	result
 
 
+-- Sanitizing a module name costs about as much as spelling a whole member
+-- name, so callers that spell many members of one module compute this prefix
+-- once and join each member through `core_module_member_name_from_prefix`.
+-- `core_module_member_name` composes the same two halves; it stays the single
+-- spelling authority and the prefix pair is only its factored form.
+pure func core_module_member_prefix(module_name: String) -> String:
+	sanitize_core_module_name(module_name) + CORE_MODULE_NAME_SEPARATOR
+
+
+pure func core_module_member_name_from_prefix(prefix: String, source_name: String) -> String:
+	prefix + source_name
+
+
 pure func core_module_member_name(module_name: String, source_name: String) -> String:
-	sanitize_core_module_name(module_name) + CORE_MODULE_NAME_SEPARATOR + source_name
+	core_module_member_name_from_prefix(core_module_member_prefix(module_name), source_name)
+
+
+-- One prefix per distinct module name, for passes that spell members of many
+-- modules and want to sanitize each module exactly once up front.
+pure func core_module_member_prefix_table(module_names: List[String]) -> Dict[String, String]:
+	var table: Dict[String, String] = {}
+
+	for module_name in module_names:
+		if not table.contains(module_name):
+			table = table.set(module_name, core_module_member_prefix(module_name))
+		else:
+			void
+
+	table
 
 
 -- Keep the escaped module identity separate from the source name so callers
@@ -47,8 +74,21 @@ pure func core_ufcs_function_name(module_name: String, source_name: String) -> S
 	core_ufcs_name_from_prefix(core_ufcs_module_prefix(module_name), source_name)
 
 
+private CORE_PURE_OVERLOAD_SUFFIX: String = "__pure"
+
+
+pure func core_pure_overload_function_name_from_prefix(
+	prefix: String,
+	source_name: String,
+) -> String:
+	core_module_member_name_from_prefix(prefix, source_name + CORE_PURE_OVERLOAD_SUFFIX)
+
+
 pure func core_pure_overload_function_name(module_name: String, source_name: String) -> String:
-	core_module_member_name(module_name, source_name + "__pure")
+	core_pure_overload_function_name_from_prefix(
+		core_module_member_prefix(module_name),
+		source_name,
+	)
 
 
 pure func is_core_ufcs_function_name(name: String) -> Bool:
@@ -78,3 +118,25 @@ pure func flatten_canonical_core_type_name(name: String) -> String:
 		module_name = name.substring(0, separator_index)
 		type_name = name.substring(separator_index + 2, name.length() - separator_index - 2)
 		core_module_member_name(module_name, type_name)
+
+
+-- Same flattening through a precomputed prefix table (see
+-- `core_module_member_prefix_table`); a module missing from the table falls
+-- back to the per-member authority, so the spelling never depends on the table.
+pure func flatten_canonical_core_type_name_with_prefixes(
+	module_member_prefixes: Dict[String, String],
+	name: String,
+) -> String:
+	separator_index: Int = name.raw_index_of("::")
+
+	if separator_index < 0:
+		name
+	else:
+		module_name = name.substring(0, separator_index)
+		type_name = name.substring(separator_index + 2, name.length() - separator_index - 2)
+
+		match module_member_prefixes.get(module_name):
+			Some(prefix):
+				core_module_member_name_from_prefix(prefix, type_name)
+			None:
+				core_module_member_name(module_name, type_name)
