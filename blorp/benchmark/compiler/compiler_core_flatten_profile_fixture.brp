@@ -31,10 +31,21 @@ enum CoreFlattenProfileStage:
 	ProfileAliasRewrite
 
 
+-- `deduplicate_functions` costs are order-sensitive: an implementation placed
+-- before its duplicate forward declarations lets every duplicate short-circuit
+-- immediately, while forward declarations placed before the implementation
+-- force the pre-index algorithm to rescan all declarations for each one.
+enum CoreFlattenProfileDeclarationOrder:
+	ImplementationFirstOrder
+	ForwardDeclarationFirstOrder
+
+
 struct CoreFlattenProfileConfig {
 	iterations: Int,
 	callable_count: Int,
-	calls_per_callable: Int
+	calls_per_callable: Int,
+	declaration_order: CoreFlattenProfileDeclarationOrder,
+	forward_declarations_per_callable: Int
 }
 
 
@@ -95,8 +106,12 @@ private pure func implementation_def_id(index: Int) -> Int:
 	index * 2 + 1
 
 
-private pure func forward_def_id(index: Int) -> Int:
-	implementation_def_id(index) + 1
+-- `duplicate` distinguishes multiple bodyless forward declarations sharing one
+-- logical callable name; `duplicate=0` is the id referenced by real calls so
+-- the alias plan has a stable target regardless of how many extra duplicates
+-- are added to stress `deduplicate_functions`.
+private pure func forward_def_id(index: Int, duplicate: Int) -> Int:
+	implementation_def_id(index) + 1 + duplicate
 
 
 private pure func selected_call(name: String, def_id: Int) -> CoreExpr:
@@ -115,7 +130,7 @@ private pure func selected_call(name: String, def_id: Int) -> CoreExpr:
 
 private pure func callable_body(index: Int, calls_per_callable: Int) -> CoreExpr:
 	name: String = callable_name(index)
-	alias_def_id: Int = forward_def_id(index)
+	alias_def_id: Int = forward_def_id(index, 0)
 	var body: CoreExpr = LiteralExpr(IntLiteral(index), int_type(), SyntheticSourceLoc)
 	var call_index: Int = 0
 
@@ -148,23 +163,55 @@ private pure func fixture_function(
 	}
 
 
+private pure func duplicate_forward_declarations(
+	config: CoreFlattenProfileConfig,
+	index: Int,
+) -> List[CoreDecl]:
+	name: String = callable_name(index)
+	var decls: List[CoreDecl] = []
+	var duplicate: Int = 0
+
+	while duplicate < config.forward_declarations_per_callable:
+		decls = decls.append(
+			FunctionDecl(fixture_function(name, forward_def_id(index, duplicate), None)),
+		)
+		duplicate += 1
+
+	decls
+
+
+-- Duplicate placement is the axis that separates the short-circuiting shape
+-- (implementation first, so every duplicate is already `seen`) from the
+-- pre-index worst case (forward declarations first, so the pre-index
+-- algorithm rescans all declarations once per duplicate before it ever sees
+-- the implementation).
+private pure func callable_declarations(
+	config: CoreFlattenProfileConfig,
+	index: Int,
+) -> List[CoreDecl]:
+	name: String = callable_name(index)
+	implementation: CoreDecl = FunctionDecl(
+		fixture_function(
+			name,
+			implementation_def_id(index),
+			Some(callable_body(index, config.calls_per_callable)),
+		),
+	)
+	forward_declarations: List[CoreDecl] = duplicate_forward_declarations(config, index)
+
+	match config.declaration_order:
+		ImplementationFirstOrder:
+			[implementation].concat(forward_declarations)
+		ForwardDeclarationFirstOrder:
+			forward_declarations.append(implementation)
+
+
 private pure func source_program(config: CoreFlattenProfileConfig) -> CoreProgram:
 	var decls: List[CoreDecl] = []
 	var index: Int = 0
 
 	while index < config.callable_count:
-		name: String = callable_name(index)
-		decls = decls
-			.append(
-				FunctionDecl(
-					fixture_function(
-						name,
-						implementation_def_id(index),
-						Some(callable_body(index, config.calls_per_callable)),
-					),
-				),
-			)
-			.append(FunctionDecl(fixture_function(name, forward_def_id(index), None)))
+		decls = decls.concat(callable_declarations(config, index))
 		index += 1
 
 	{
@@ -201,17 +248,26 @@ private pure func alias_target_program(aliases: List[CoreCallableAlias]) -> Core
 
 
 private pure func expected_aliases(config: CoreFlattenProfileConfig) -> List[CoreCallableAlias]:
+	-- One alias is produced per non-implementation declaration (every
+	-- duplicate forward declaration gets its own source `def_id`), in the
+	-- same relative order `collect_callable_rewrites` visits them: ascending
+	-- duplicate index, regardless of where the implementation sits among them.
 	var aliases: List[CoreCallableAlias] = []
 	var index: Int = 0
 
 	while index < config.callable_count:
 		name: String = callable_name(index)
-		aliases = aliases.append({
-			source_name = core_ufcs_function_name(PROFILE_MODULE_NAME, name),
-			source_def_id = forward_def_id(index),
-			target_name = core_module_member_name(PROFILE_MODULE_NAME, name),
-			target_def_id = implementation_def_id(index),
-		})
+		var duplicate: Int = 0
+
+		while duplicate < config.forward_declarations_per_callable:
+			aliases = aliases.append({
+				source_name = core_ufcs_function_name(PROFILE_MODULE_NAME, name),
+				source_def_id = forward_def_id(index, duplicate),
+				target_name = core_module_member_name(PROFILE_MODULE_NAME, name),
+				target_def_id = implementation_def_id(index),
+			})
+			duplicate += 1
+
 		index += 1
 
 	aliases
@@ -385,7 +441,9 @@ pure func core_flatten_profile_observe(
 		ProfileModulePrefix:
 			fixture.config.callable_count * fixture.config.calls_per_callable
 		ProfileAliasRewrite:
-			fixture.config.callable_count
+			fixture.config.callable_count * fixture.config.forward_declarations_per_callable
+
+	expected_alias_count: Int = fixture.config.callable_count * fixture.config.forward_declarations_per_callable
 
 	{
 		stage = stage,
@@ -397,7 +455,7 @@ pure func core_flatten_profile_observe(
 		checksum = observed.checksum,
 		workload_valid = (
 			execution.succeeded
-			and execution.aliases.length() == fixture.config.callable_count
+			and execution.aliases.length() == expected_alias_count
 			and aliases_match(execution.aliases, fixture.aliases)
 			and observed.output_callables == expected_output_callables
 			and observed.rewritten_calls == expected_calls

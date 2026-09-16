@@ -1,6 +1,7 @@
 import:
 	../../../benchmark/compiler/compiler_core_flatten_profile_fixture:
 		CoreFlattenProfileConfig,
+		CoreFlattenProfileDeclarationOrder(ImplementationFirstOrder),
 		CoreFlattenProfileStage(ProfileAliasRewrite, ProfileModulePrefix),
 		core_flatten_profile_execute,
 		core_flatten_profile_fixture,
@@ -260,6 +261,12 @@ pure func function_at(program_value: CoreProgram, index: Int) -> Option[CoreFunc
 	program_value.decls
 		.get(index)
 		.and_then(function_from_decl)
+
+
+pure func function_named(program_value: CoreProgram, name: String) -> Option[CoreFunction]:
+	program_value.decls
+		.filter_map(function_from_decl)
+		.find(func(function_info): function_info.name == name)
 
 
 pure func selected_call_kind(kind: CoreCallKind) -> Bool:
@@ -641,6 +648,150 @@ func test_preserves_builtin_overload_selected_over_forward_declaration() -> Bool
 		.get_or(False)
 
 	flattened.decls.length() == 3 and impure_map_ok and pure_map_ok and caller_ok
+
+
+func test_deduplicates_same_name_by_declaration_order_not_def_id() -> Bool:
+	-- Neither declaration implements `stub` anywhere, so no module-member
+	-- name is ever registered for it (only names with a real implementation
+	-- get a callable rewrite) and admission takes the "first declaration
+	-- wins" branch without `has_callable_implementation` ever being true.
+	-- The second declaration's `def_id` is deliberately lower than the
+	-- first so the survivor can only be explained by encounter order, never
+	-- by comparing `def_id` or any other nominal identity.
+	flattened = prefix_module_names("dedup_identity", program([
+			function_decl("stub", 95, True, UserFunction, None),
+			function_decl("stub", 12, True, UserFunction, None),
+		]))
+
+	survivor_ok: Bool = function_at(flattened, 0)
+		.map(func(stub): stub.def_id == 95 and stub.name == "stub")
+		.get_or(False)
+
+	flattened.decls.length() == 1 and survivor_ok
+
+
+func test_preserves_implementation_and_order_with_duplicates_before_and_after() -> Bool:
+	-- Forward declarations appear both before and after the implementation.
+	-- Every duplicate must be dropped regardless of which side of the
+	-- implementation it falls on, and the surrounding unrelated declarations
+	-- must keep their exact relative order.
+	flattened = prefix_module_names("dedup_placement", program([
+			function_decl("before_marker", 200, True, UserFunction, Some(int_literal(200))),
+			function_decl("widget", 201, True, UserFunction, None),
+			function_decl("widget", 202, True, UserFunction, None),
+			function_decl("widget", 203, True, UserFunction, Some(int_literal(1))),
+			function_decl("widget", 204, True, UserFunction, None),
+			function_decl("after_marker", 205, True, UserFunction, Some(int_literal(205))),
+		]))
+
+	before_ok: Bool = function_at(flattened, 0)
+		.map(func(marker): marker.def_id == 200)
+		.get_or(False)
+	widget_ok: Bool = function_at(flattened, 1)
+		.map(func(widget): widget.def_id == 203 and widget.body.is_some())
+		.get_or(False)
+	after_ok: Bool = function_at(flattened, 2)
+		.map(func(marker): marker.def_id == 205)
+		.get_or(False)
+
+	flattened.decls.length() == 3 and before_ok and widget_ok and after_ok
+
+
+func test_preserves_non_function_declarations_while_deduplicating_functions() -> Bool:
+	-- Modules, globals, traits, records, and impls interleave with duplicate
+	-- function declarations sharing one name. Deduplication must not touch
+	-- any non-function declaration, and `ImplDecl` must pass through with its
+	-- methods untouched -- method count is not an axis for this function.
+	method: CoreFunction = core_function("method", 320, True, UserFunction, Some(int_literal(1)))
+
+	flattened = prefix_module_names("dedup_mixed", program([GlobalDecl({
+				name = core_var("total", Some(300)),
+				source_module = None,
+				typ = int_type(),
+				init = int_literal(0),
+				is_mutable = False,
+				is_const = True,
+				is_private = False,
+				def_id = 300,
+				loc = SyntheticSourceLoc,
+			}), function_decl("shared", 301, True, UserFunction, None), TraitDecl({
+				name = "Shared",
+				type_params = [],
+				supertraits = [],
+				methods = [],
+				loc = SyntheticSourceLoc,
+			}), function_decl("shared", 302, True, UserFunction, Some(int_literal(2))), EnumDecl({
+				abi_type = None,
+				name = "Shape",
+				type_params = [],
+				variants = [],
+				loc = SyntheticSourceLoc,
+			}), ValueRecordDecl({
+				abi_type = None,
+				name = "Point",
+				type_params = [],
+				fields = [],
+				loc = SyntheticSourceLoc,
+			}), function_decl("shared", 303, True, UserFunction, None), ImplDecl({
+				trait_name = "Shared",
+				for_type = int_type(),
+				type_params = [],
+				methods = [method],
+				loc = SyntheticSourceLoc,
+			})]))
+
+	kinds_ok: Bool = match flattened.decls:
+		[GlobalDecl(_), TraitDecl(_), FunctionDecl(shared), EnumDecl(_), ValueRecordDecl(_), ImplDecl(preserved_impl)]:
+			(
+				shared.def_id == 302
+				and shared.body.is_some()
+				and preserved_impl.trait_name == "Shared"
+				and preserved_impl.methods.length() == 1
+				and preserved_impl.methods
+					.get(0)
+					.map(func(preserved_method):
+						preserved_method.name == "method" and preserved_method.def_id == 320
+					)
+					.get_or(False)
+			)
+		_:
+			False
+
+	flattened.decls.length() == 6 and kinds_ok
+
+
+func test_deduplicates_empty_program() -> Bool:
+	prefix_module_names("dedup_empty", program([])).decls.is_empty()
+
+
+func test_deduplicates_many_interleaved_duplicate_names() -> Bool:
+	-- Three logical callables, each with multiple bodyless duplicates,
+	-- interleaved with each other and with each other's implementations, at
+	-- a scale meant for correctness rather than the benchmark harness's
+	-- performance-scale fixture.
+	flattened = prefix_module_names("dedup_wide", program([
+			function_decl("alpha", 400, True, UserFunction, None),
+			function_decl("beta", 410, True, UserFunction, None),
+			function_decl("alpha", 401, True, UserFunction, None),
+			function_decl("gamma", 420, True, UserFunction, Some(int_literal(1))),
+			function_decl("beta", 411, True, UserFunction, Some(int_literal(2))),
+			function_decl("alpha", 402, True, UserFunction, Some(int_literal(3))),
+			function_decl("gamma", 421, True, UserFunction, None),
+			function_decl("beta", 412, True, UserFunction, None),
+			function_decl("alpha", 403, True, UserFunction, None),
+		]))
+
+	alpha_ok: Bool = function_named(flattened, "dedup_wide__alpha")
+		.map(func(info): info.def_id == 402)
+		.get_or(False)
+	beta_ok: Bool = function_named(flattened, "dedup_wide__beta")
+		.map(func(info): info.def_id == 411)
+		.get_or(False)
+	gamma_ok: Bool = function_named(flattened, "dedup_wide__gamma")
+		.map(func(info): info.def_id == 420)
+		.get_or(False)
+
+	flattened.decls.length() == 3 and alpha_ok and beta_ok and gamma_ok
 
 
 func test_preserves_trait_signatures() -> Bool:
@@ -1131,7 +1282,9 @@ pure func test_profile_fixture_exercises_prefix_and_alias_rewrite() -> Bool:
 	config: CoreFlattenProfileConfig = {
 		iterations = 2,
 		callable_count = 4,
-		calls_per_callable = 3
+		calls_per_callable = 3,
+		declaration_order = ImplementationFirstOrder,
+		forward_declarations_per_callable = 1
 	}
 	fixture = core_flatten_profile_fixture(config)
 	prefix = core_flatten_profile_observe(
@@ -1223,6 +1376,23 @@ tests: TestSuite = {
 		(
 			"preserves builtin overload selected over forward declaration",
 			test_preserves_builtin_overload_selected_over_forward_declaration,
+		),
+		(
+			"deduplicates same name by declaration order not def_id",
+			test_deduplicates_same_name_by_declaration_order_not_def_id,
+		),
+		(
+			"preserves implementation and order with duplicates before and after",
+			test_preserves_implementation_and_order_with_duplicates_before_and_after,
+		),
+		(
+			"preserves non-function declarations while deduplicating functions",
+			test_preserves_non_function_declarations_while_deduplicating_functions,
+		),
+		("deduplicates empty program", test_deduplicates_empty_program),
+		(
+			"deduplicates many interleaved duplicate names",
+			test_deduplicates_many_interleaved_duplicate_names,
 		),
 		("preserves trait signatures", test_preserves_trait_signatures),
 		(
