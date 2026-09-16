@@ -137,6 +137,7 @@ import:
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
 		CoreSemanticConstructorMatchCase,
 		CoreSemanticLengthMatchCase,
+		CoreSemanticLengthMatchGeq,
 		CoreSemanticLiteralMatchCase,
 		CoreSemanticMatchAccessor(RootSemanticMatchAccessor, TupleFieldSemanticMatchAccessor),
 		CoreSemanticMatchBinding,
@@ -163,6 +164,17 @@ import:
 private COMPILER_LOCAL_PREFIX: String = "$blorp$tuple_sroa$"
 
 
+-- Allocation identity for the reuse rule this pass follows: a rewritten child
+-- that is the same allocation as its input proves that the input node can be
+-- handed back as is, so the walk allocates only along the spine to the tuple
+-- shapes it actually scalar-replaced. Core is immutable value data, so sharing
+-- subtrees between input and output is safe. Bound straight to the runtime
+-- primitive for the same bootstrap reason as the matching block in
+-- traverse.brp; delete the blocks together and import `memory: same_object`.
+foreign:
+	private pure func same_core_expr(left: CoreExpr, right: CoreExpr) -> Bool = "blorp_same_object"
+
+
 private record TupleSroaFreshVar {
 	variable: CoreVar,
 	next_fresh: Int
@@ -177,7 +189,8 @@ private record TupleSroaRewrite {
 
 private record TupleSroaExprsRewrite {
 	items: List[CoreExpr],
-	next_fresh: Int
+	next_fresh: Int,
+	changed: Bool
 }
 
 
@@ -2572,67 +2585,83 @@ private pure func scalar_replace_tuple_node(
 
 private record TupleSroaTreeRewrite {
 	tree: CoreSemanticMatchTree,
-	next_fresh: Int
+	next_fresh: Int,
+	changed: Bool
 }
 
 
+-- Container results carry `changed`: False means the container is the
+-- caller's own input allocation and every child came back unchanged, so the
+-- enclosing node can be handed back as is. Lists copy their untouched prefix
+-- only once a child actually changes.
 private record TupleSroaBoxedValuesRewrite {
 	items: List[CoreBoxedStorageValue],
-	next_fresh: Int
+	next_fresh: Int,
+	changed: Bool
 }
 
 
 private record TupleSroaDictEntriesRewrite {
 	items: List[CoreDictLiteralEntry],
-	next_fresh: Int
+	next_fresh: Int,
+	changed: Bool
 }
 
 
 private record TupleSroaRecordFieldsRewrite {
 	items: List[CoreRecordFieldValue],
-	next_fresh: Int
+	next_fresh: Int,
+	changed: Bool
 }
 
 
 private record TupleSroaRecordCowFieldsRewrite {
 	items: List[CoreRecordCowField],
-	next_fresh: Int
+	next_fresh: Int,
+	changed: Bool
 }
 
 
 private record TupleSroaRawCasesRewrite {
 	items: List[CoreRawMatchCase],
-	next_fresh: Int
+	next_fresh: Int,
+	changed: Bool
 }
 
 
 private record TupleSroaPreBindingsRewrite {
 	items: List[CorePreClosureConcurrentBinding],
-	next_fresh: Int
+	next_fresh: Int,
+	changed: Bool
 }
 
 
 private record TupleSroaConcurrentBindingsRewrite {
 	items: List[CoreConcurrentBinding],
-	next_fresh: Int
+	next_fresh: Int,
+	changed: Bool
 }
 
 
 private record TupleSroaOptionalRewrite {
 	value: Option[CoreExpr],
-	next_fresh: Int
+	next_fresh: Int,
+	changed: Bool
 }
 
 
 private record TupleSroaSelectArmsRewrite {
 	items: List[CoreSelectArm],
-	next_fresh: Int
+	next_fresh: Int,
+	changed: Bool
 }
 
 
+-- Long `and`/`or` chains are rewritten iteratively. The rebuild task carries
+-- the source node so an unchanged pair of sides hands that node back.
 private union TupleSroaLogicalTask:
 	RewriteTupleSroaLogicalTask(CoreExpr)
-	RebuildTupleSroaLogicalTask(CoreLogicalOp, CoreType, CoreSourceLoc)
+	RebuildTupleSroaLogicalTask(CoreExpr)
 
 
 private pure func rewrite_tuple_sroa_exprs(
@@ -2640,17 +2669,29 @@ private pure func rewrite_tuple_sroa_exprs(
 	items: List[CoreExpr],
 	next_fresh: Int,
 ) -> TupleSroaExprsRewrite:
-	var rewritten: List[CoreExpr] = []
+	var rewritten: List[CoreExpr] = items
 	var current: Int = next_fresh
+	var changed: Bool = False
+	var index: Int = 0
 
 	for item in items:
 		result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, item, current)
-		rewritten = rewritten.append(result.expr)
 		current = result.next_fresh
+
+		if changed:
+			rewritten = rewritten.append(result.expr)
+		else if not same_core_expr(result.expr, item):
+			rewritten = items
+				.take(index)
+				.append(result.expr)
+			changed = True
+
+		index += 1
 
 	{
 		items = rewritten,
-		next_fresh = current
+		next_fresh = current,
+		changed = changed
 	}
 
 
@@ -2659,17 +2700,35 @@ private pure func rewrite_tuple_sroa_boxed_values(
 	items: List[CoreBoxedStorageValue],
 	next_fresh: Int,
 ) -> TupleSroaBoxedValuesRewrite:
-	var rewritten: List[CoreBoxedStorageValue] = []
+	var rewritten: List[CoreBoxedStorageValue] = items
 	var current: Int = next_fresh
+	var changed: Bool = False
+	var index: Int = 0
 
 	for item in items:
 		result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, item.value, current)
-		rewritten = rewritten.append({ item | value = result.expr })
 		current = result.next_fresh
+		item_changed: Bool = not same_core_expr(result.expr, item.value)
+
+		rewritten_item: CoreBoxedStorageValue = if item_changed:
+			{ item | value = result.expr }
+		else:
+			item
+
+		if changed:
+			rewritten = rewritten.append(rewritten_item)
+		else if item_changed:
+			rewritten = items
+				.take(index)
+				.append(rewritten_item)
+			changed = True
+
+		index += 1
 
 	{
 		items = rewritten,
-		next_fresh = current
+		next_fresh = current,
+		changed = changed
 	}
 
 
@@ -2678,8 +2737,10 @@ private pure func rewrite_tuple_sroa_dict_entries(
 	items: List[CoreDictLiteralEntry],
 	next_fresh: Int,
 ) -> TupleSroaDictEntriesRewrite:
-	var rewritten: List[CoreDictLiteralEntry] = []
+	var rewritten: List[CoreDictLiteralEntry] = items
 	var current: Int = next_fresh
+	var changed: Bool = False
+	var index: Int = 0
 
 	for item in items:
 		key_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, item.key, current)
@@ -2688,15 +2749,34 @@ private pure func rewrite_tuple_sroa_dict_entries(
 			item.value,
 			key_result.next_fresh,
 		)
-		rewritten = rewritten.append({
-			key = key_result.expr,
-			value = value_result.expr,
-		})
 		current = value_result.next_fresh
+		item_changed: Bool = (
+			not same_core_expr(key_result.expr, item.key)
+			or not same_core_expr(value_result.expr, item.value)
+		)
+
+		rewritten_item: CoreDictLiteralEntry = if item_changed:
+			{
+				key = key_result.expr,
+				value = value_result.expr
+			}
+		else:
+			item
+
+		if changed:
+			rewritten = rewritten.append(rewritten_item)
+		else if item_changed:
+			rewritten = items
+				.take(index)
+				.append(rewritten_item)
+			changed = True
+
+		index += 1
 
 	{
 		items = rewritten,
-		next_fresh = current
+		next_fresh = current,
+		changed = changed
 	}
 
 
@@ -2705,17 +2785,35 @@ private pure func rewrite_tuple_sroa_record_fields(
 	items: List[CoreRecordFieldValue],
 	next_fresh: Int,
 ) -> TupleSroaRecordFieldsRewrite:
-	var rewritten: List[CoreRecordFieldValue] = []
+	var rewritten: List[CoreRecordFieldValue] = items
 	var current: Int = next_fresh
+	var changed: Bool = False
+	var index: Int = 0
 
 	for item in items:
 		result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, item.value, current)
-		rewritten = rewritten.append({ item | value = result.expr })
 		current = result.next_fresh
+		item_changed: Bool = not same_core_expr(result.expr, item.value)
+
+		rewritten_item: CoreRecordFieldValue = if item_changed:
+			{ item | value = result.expr }
+		else:
+			item
+
+		if changed:
+			rewritten = rewritten.append(rewritten_item)
+		else if item_changed:
+			rewritten = items
+				.take(index)
+				.append(rewritten_item)
+			changed = True
+
+		index += 1
 
 	{
 		items = rewritten,
-		next_fresh = current
+		next_fresh = current,
+		changed = changed
 	}
 
 
@@ -2724,8 +2822,10 @@ private pure func rewrite_tuple_sroa_record_cow_fields(
 	items: List[CoreRecordCowField],
 	next_fresh: Int,
 ) -> TupleSroaRecordCowFieldsRewrite:
-	var rewritten: List[CoreRecordCowField] = []
+	var rewritten: List[CoreRecordCowField] = items
 	var current: Int = next_fresh
+	var changed: Bool = False
+	var index: Int = 0
 
 	for item in items:
 		match item.replacement:
@@ -2735,14 +2835,33 @@ private pure func rewrite_tuple_sroa_record_cow_fields(
 					replacement,
 					current,
 				)
-				rewritten = rewritten.append({ item | replacement = Some(result.expr) })
 				current = result.next_fresh
+				item_changed: Bool = not same_core_expr(result.expr, replacement)
+
+				rewritten_item: CoreRecordCowField = if item_changed:
+					{ item | replacement = Some(result.expr) }
+				else:
+					item
+
+				if changed:
+					rewritten = rewritten.append(rewritten_item)
+				else if item_changed:
+					rewritten = items
+						.take(index)
+						.append(rewritten_item)
+					changed = True
 			None:
-				rewritten = rewritten.append(item)
+				if changed:
+					rewritten = rewritten.append(item)
+				else:
+					void
+
+		index += 1
 
 	{
 		items = rewritten,
-		next_fresh = current
+		next_fresh = current,
+		changed = changed
 	}
 
 
@@ -2751,17 +2870,35 @@ private pure func rewrite_tuple_sroa_raw_cases(
 	items: List[CoreRawMatchCase],
 	next_fresh: Int,
 ) -> TupleSroaRawCasesRewrite:
-	var rewritten: List[CoreRawMatchCase] = []
+	var rewritten: List[CoreRawMatchCase] = items
 	var current: Int = next_fresh
+	var changed: Bool = False
+	var index: Int = 0
 
 	for item in items:
 		result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, item.body, current)
-		rewritten = rewritten.append({ item | body = result.expr })
 		current = result.next_fresh
+		item_changed: Bool = not same_core_expr(result.expr, item.body)
+
+		rewritten_item: CoreRawMatchCase = if item_changed:
+			{ item | body = result.expr }
+		else:
+			item
+
+		if changed:
+			rewritten = rewritten.append(rewritten_item)
+		else if item_changed:
+			rewritten = items
+				.take(index)
+				.append(rewritten_item)
+			changed = True
+
+		index += 1
 
 	{
 		items = rewritten,
-		next_fresh = current
+		next_fresh = current,
+		changed = changed
 	}
 
 
@@ -2770,17 +2907,35 @@ private pure func rewrite_tuple_sroa_pre_bindings(
 	items: List[CorePreClosureConcurrentBinding],
 	next_fresh: Int,
 ) -> TupleSroaPreBindingsRewrite:
-	var rewritten: List[CorePreClosureConcurrentBinding] = []
+	var rewritten: List[CorePreClosureConcurrentBinding] = items
 	var current: Int = next_fresh
+	var changed: Bool = False
+	var index: Int = 0
 
 	for item in items:
 		result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, item.rhs, current)
-		rewritten = rewritten.append({ item | rhs = result.expr })
 		current = result.next_fresh
+		item_changed: Bool = not same_core_expr(result.expr, item.rhs)
+
+		rewritten_item: CorePreClosureConcurrentBinding = if item_changed:
+			{ item | rhs = result.expr }
+		else:
+			item
+
+		if changed:
+			rewritten = rewritten.append(rewritten_item)
+		else if item_changed:
+			rewritten = items
+				.take(index)
+				.append(rewritten_item)
+			changed = True
+
+		index += 1
 
 	{
 		items = rewritten,
-		next_fresh = current
+		next_fresh = current,
+		changed = changed
 	}
 
 
@@ -2789,17 +2944,35 @@ private pure func rewrite_tuple_sroa_concurrent_bindings(
 	items: List[CoreConcurrentBinding],
 	next_fresh: Int,
 ) -> TupleSroaConcurrentBindingsRewrite:
-	var rewritten: List[CoreConcurrentBinding] = []
+	var rewritten: List[CoreConcurrentBinding] = items
 	var current: Int = next_fresh
+	var changed: Bool = False
+	var index: Int = 0
 
 	for item in items:
 		result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, item.rhs, current)
-		rewritten = rewritten.append({ item | rhs = result.expr })
 		current = result.next_fresh
+		item_changed: Bool = not same_core_expr(result.expr, item.rhs)
+
+		rewritten_item: CoreConcurrentBinding = if item_changed:
+			{ item | rhs = result.expr }
+		else:
+			item
+
+		if changed:
+			rewritten = rewritten.append(rewritten_item)
+		else if item_changed:
+			rewritten = items
+				.take(index)
+				.append(rewritten_item)
+			changed = True
+
+		index += 1
 
 	{
 		items = rewritten,
-		next_fresh = current
+		next_fresh = current,
+		changed = changed
 	}
 
 
@@ -2811,15 +2984,58 @@ private pure func rewrite_tuple_sroa_optional(
 	match value:
 		Some(expr):
 			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, expr, next_fresh)
-			{
-				value = Some(result.expr),
-				next_fresh = result.next_fresh
-			}
+
+			if same_core_expr(result.expr, expr):
+				{
+					value = value,
+					next_fresh = result.next_fresh,
+					changed = False
+				}
+			else:
+				{
+					value = Some(result.expr),
+					next_fresh = result.next_fresh,
+					changed = True
+				}
 		None:
 			{
 				value = None,
-				next_fresh = next_fresh
+				next_fresh = next_fresh,
+				changed = False
 			}
+
+
+private pure func rewrite_tuple_sroa_select_arm_kind(
+	context: TupleSroaContext,
+	kind: CoreSelectArmKind,
+	next_fresh: Int,
+) -> (CoreSelectArmKind, Int, Bool):
+	match kind:
+		SelectRecvArm(recv):
+			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				recv.channel,
+				next_fresh,
+			)
+
+			if same_core_expr(result.expr, recv.channel):
+				(kind, result.next_fresh, False)
+			else:
+				(SelectRecvArm({ recv | channel = result.expr }), result.next_fresh, True)
+		SelectSealedArm(channel):
+			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, channel, next_fresh)
+
+			if same_core_expr(result.expr, channel):
+				(kind, result.next_fresh, False)
+			else:
+				(SelectSealedArm(result.expr), result.next_fresh, True)
+		SelectAfterArm(timeout):
+			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, timeout, next_fresh)
+
+			if same_core_expr(result.expr, timeout):
+				(kind, result.next_fresh, False)
+			else:
+				(SelectAfterArm(result.expr), result.next_fresh, True)
 
 
 private pure func rewrite_tuple_sroa_select_arms(
@@ -2827,64 +3043,173 @@ private pure func rewrite_tuple_sroa_select_arms(
 	arms: List[CoreSelectArm],
 	next_fresh: Int,
 ) -> TupleSroaSelectArmsRewrite:
-	var rewritten: List[CoreSelectArm] = []
+	var rewritten: List[CoreSelectArm] = arms
 	var current: Int = next_fresh
+	var changed: Bool = False
+	var index: Int = 0
 
 	for arm in arms:
-		match arm.kind:
-			SelectRecvArm(recv):
-				channel_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
-					context,
-					recv.channel,
-					current,
-				)
-				body_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
-					context,
-					arm.body,
-					channel_result.next_fresh,
-				)
-				rewritten = rewritten.append({ arm |
-						kind = SelectRecvArm({ recv | channel = channel_result.expr }),
-						body = body_result.expr
-					})
-				current = body_result.next_fresh
-			SelectSealedArm(channel):
-				channel_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
-					context,
-					channel,
-					current,
-				)
-				body_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
-					context,
-					arm.body,
-					channel_result.next_fresh,
-				)
-				rewritten = rewritten.append({ arm |
-						kind = SelectSealedArm(channel_result.expr),
-						body = body_result.expr
-					})
-				current = body_result.next_fresh
-			SelectAfterArm(timeout):
-				timeout_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
-					context,
-					timeout,
-					current,
-				)
-				body_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
-					context,
-					arm.body,
-					timeout_result.next_fresh,
-				)
-				rewritten = rewritten.append({ arm |
-						kind = SelectAfterArm(timeout_result.expr),
-						body = body_result.expr
-					})
-				current = body_result.next_fresh
+		(kind, kind_fresh, kind_changed) = rewrite_tuple_sroa_select_arm_kind(
+			context,
+			arm.kind,
+			current,
+		)
+		body_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, arm.body, kind_fresh)
+		current = body_result.next_fresh
+		arm_changed: Bool = kind_changed or not same_core_expr(body_result.expr, arm.body)
+
+		rewritten_arm: CoreSelectArm = if arm_changed:
+			{ arm |
+				kind = kind,
+				body = body_result.expr
+			}
+		else:
+			arm
+
+		if changed:
+			rewritten = rewritten.append(rewritten_arm)
+		else if arm_changed:
+			rewritten = arms
+				.take(index)
+				.append(rewritten_arm)
+			changed = True
+
+		index += 1
 
 	{
 		items = rewritten,
-		next_fresh = current
+		next_fresh = current,
+		changed = changed
 	}
+
+
+private pure func rewrite_tuple_sroa_semantic_constructor_cases(
+	context: TupleSroaContext,
+	cases: List[CoreSemanticConstructorMatchCase],
+	next_fresh: Int,
+) -> (List[CoreSemanticConstructorMatchCase], Int, Bool):
+	var rewritten: List[CoreSemanticConstructorMatchCase] = cases
+	var current: Int = next_fresh
+	var changed: Bool = False
+	var index: Int = 0
+
+	for match_case in cases:
+		result: TupleSroaTreeRewrite = rewrite_tuple_sroa_semantic_tree(
+			context,
+			match_case.body,
+			current,
+		)
+		current = result.next_fresh
+
+		rewritten_case: CoreSemanticConstructorMatchCase = if result.changed:
+			{ match_case | body = result.tree }
+		else:
+			match_case
+
+		if changed:
+			rewritten = rewritten.append(rewritten_case)
+		else if result.changed:
+			rewritten = cases
+				.take(index)
+				.append(rewritten_case)
+			changed = True
+
+		index += 1
+
+	(rewritten, current, changed)
+
+
+private pure func rewrite_tuple_sroa_semantic_literal_cases(
+	context: TupleSroaContext,
+	cases: List[CoreSemanticLiteralMatchCase],
+	next_fresh: Int,
+) -> (List[CoreSemanticLiteralMatchCase], Int, Bool):
+	var rewritten: List[CoreSemanticLiteralMatchCase] = cases
+	var current: Int = next_fresh
+	var changed: Bool = False
+	var index: Int = 0
+
+	for match_case in cases:
+		result: TupleSroaTreeRewrite = rewrite_tuple_sroa_semantic_tree(
+			context,
+			match_case.body,
+			current,
+		)
+		current = result.next_fresh
+
+		rewritten_case: CoreSemanticLiteralMatchCase = if result.changed:
+			{ match_case | body = result.tree }
+		else:
+			match_case
+
+		if changed:
+			rewritten = rewritten.append(rewritten_case)
+		else if result.changed:
+			rewritten = cases
+				.take(index)
+				.append(rewritten_case)
+			changed = True
+
+		index += 1
+
+	(rewritten, current, changed)
+
+
+private pure func rewrite_tuple_sroa_semantic_length_cases(
+	context: TupleSroaContext,
+	cases: List[CoreSemanticLengthMatchCase],
+	next_fresh: Int,
+) -> (List[CoreSemanticLengthMatchCase], Int, Bool):
+	var rewritten: List[CoreSemanticLengthMatchCase] = cases
+	var current: Int = next_fresh
+	var changed: Bool = False
+	var index: Int = 0
+
+	for match_case in cases:
+		result: TupleSroaTreeRewrite = rewrite_tuple_sroa_semantic_tree(
+			context,
+			match_case.body,
+			current,
+		)
+		current = result.next_fresh
+
+		rewritten_case: CoreSemanticLengthMatchCase = if result.changed:
+			{ match_case | body = result.tree }
+		else:
+			match_case
+
+		if changed:
+			rewritten = rewritten.append(rewritten_case)
+		else if result.changed:
+			rewritten = cases
+				.take(index)
+				.append(rewritten_case)
+			changed = True
+
+		index += 1
+
+	(rewritten, current, changed)
+
+
+private pure func rewrite_tuple_sroa_optional_semantic_tree(
+	context: TupleSroaContext,
+	tree: Option[CoreSemanticMatchTree],
+	next_fresh: Int,
+) -> (Option[CoreSemanticMatchTree], Int, Bool):
+	match tree:
+		Some(fallback_tree):
+			result: TupleSroaTreeRewrite = rewrite_tuple_sroa_semantic_tree(
+				context,
+				fallback_tree,
+				next_fresh,
+			)
+
+			if result.changed:
+				(Some(result.tree), result.next_fresh, True)
+			else:
+				(tree, result.next_fresh, False)
+		None:
+			(None, next_fresh, False)
 
 
 private pure func rewrite_tuple_sroa_semantic_tree(
@@ -2895,117 +3220,129 @@ private pure func rewrite_tuple_sroa_semantic_tree(
 	match tree:
 		SemanticMatchLeaf(bindings, body):
 			body_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, body, next_fresh)
-			{
-				tree = SemanticMatchLeaf(bindings, body_result.expr),
-				next_fresh = body_result.next_fresh
-			}
+
+			if same_core_expr(body_result.expr, body):
+				{
+					tree = tree,
+					next_fresh = body_result.next_fresh,
+					changed = False
+				}
+			else:
+				{
+					tree = SemanticMatchLeaf(bindings, body_result.expr),
+					next_fresh = body_result.next_fresh,
+					changed = True
+				}
 		SemanticMatchFail:
 			{
 				tree = tree,
-				next_fresh = next_fresh
+				next_fresh = next_fresh,
+				changed = False
 			}
 		SemanticConstructorMatch(accessor, cases, fallback):
-			var rewritten_cases: List[CoreSemanticConstructorMatchCase] = []
-			var current: Int = next_fresh
+			(rewritten_cases, cases_fresh, cases_changed) = rewrite_tuple_sroa_semantic_constructor_cases(
+				context,
+				cases,
+				next_fresh,
+			)
+			(rewritten_fallback, fallback_fresh, fallback_changed) = rewrite_tuple_sroa_optional_semantic_tree(
+				context,
+				fallback,
+				cases_fresh,
+			)
 
-			for match_case in cases:
-				case_result: TupleSroaTreeRewrite = rewrite_tuple_sroa_semantic_tree(
-					context,
-					match_case.body,
-					current,
-				)
-				rewritten_cases = rewritten_cases.append({ match_case | body = case_result.tree })
-				current = case_result.next_fresh
-
-			rewritten_fallback: Option[CoreSemanticMatchTree] = match fallback:
-				Some(fallback_tree):
-					fallback_result: TupleSroaTreeRewrite = rewrite_tuple_sroa_semantic_tree(
-						context,
-						fallback_tree,
-						current,
-					)
-					current = fallback_result.next_fresh
-					Some(fallback_result.tree)
-				None:
-					None
-
-			{
-				tree = SemanticConstructorMatch(accessor, rewritten_cases, rewritten_fallback),
-				next_fresh = current
-			}
+			if cases_changed or fallback_changed:
+				{
+					tree = SemanticConstructorMatch(accessor, rewritten_cases, rewritten_fallback),
+					next_fresh = fallback_fresh,
+					changed = True
+				}
+			else:
+				{
+					tree = tree,
+					next_fresh = fallback_fresh,
+					changed = False
+				}
 		SemanticLiteralMatch(accessor, cases, fallback):
-			var rewritten_cases: List[CoreSemanticLiteralMatchCase] = []
-			var current: Int = next_fresh
-
-			for match_case in cases:
-				case_result: TupleSroaTreeRewrite = rewrite_tuple_sroa_semantic_tree(
-					context,
-					match_case.body,
-					current,
-				)
-				rewritten_cases = rewritten_cases.append({ match_case | body = case_result.tree })
-				current = case_result.next_fresh
-
+			(rewritten_cases, cases_fresh, cases_changed) = rewrite_tuple_sroa_semantic_literal_cases(
+				context,
+				cases,
+				next_fresh,
+			)
 			fallback_result: TupleSroaTreeRewrite = rewrite_tuple_sroa_semantic_tree(
 				context,
 				fallback,
-				current,
+				cases_fresh,
 			)
-			{
-				tree = SemanticLiteralMatch(accessor, rewritten_cases, fallback_result.tree),
-				next_fresh = fallback_result.next_fresh
-			}
+
+			if cases_changed or fallback_result.changed:
+				{
+					tree = SemanticLiteralMatch(accessor, rewritten_cases, fallback_result.tree),
+					next_fresh = fallback_result.next_fresh,
+					changed = True
+				}
+			else:
+				{
+					tree = tree,
+					next_fresh = fallback_result.next_fresh,
+					changed = False
+				}
 		SemanticLengthMatch(accessor, cases, geq, fallback):
-			var rewritten_cases: List[CoreSemanticLengthMatchCase] = []
-			var current: Int = next_fresh
+			(rewritten_cases, cases_fresh, cases_changed) = rewrite_tuple_sroa_semantic_length_cases(
+				context,
+				cases,
+				next_fresh,
+			)
 
-			for match_case in cases:
-				case_result: TupleSroaTreeRewrite = rewrite_tuple_sroa_semantic_tree(
-					context,
-					match_case.body,
-					current,
-				)
-				rewritten_cases = rewritten_cases.append({ match_case | body = case_result.tree })
-				current = case_result.next_fresh
+			var geq_fresh: Int = cases_fresh
+			var geq_changed: Bool = False
 
-			rewritten_geq = match geq:
+			rewritten_geq: Option[CoreSemanticLengthMatchGeq] = match geq:
 				Some(geq_case):
 					geq_result: TupleSroaTreeRewrite = rewrite_tuple_sroa_semantic_tree(
 						context,
 						geq_case.body,
-						current,
+						cases_fresh,
 					)
-					current = geq_result.next_fresh
-					Some({ geq_case | body = geq_result.tree })
+					geq_fresh = geq_result.next_fresh
+					geq_changed = geq_result.changed
+
+					if geq_result.changed:
+						Some({ geq_case | body = geq_result.tree })
+					else:
+						geq
 				None:
 					None
 
-			rewritten_fallback: Option[CoreSemanticMatchTree] = match fallback:
-				Some(fallback_tree):
-					fallback_result: TupleSroaTreeRewrite = rewrite_tuple_sroa_semantic_tree(
-						context,
-						fallback_tree,
-						current,
-					)
-					current = fallback_result.next_fresh
-					Some(fallback_result.tree)
-				None:
-					None
+			(rewritten_fallback, fallback_fresh, fallback_changed) = rewrite_tuple_sroa_optional_semantic_tree(
+				context,
+				fallback,
+				geq_fresh,
+			)
 
-			{
-				tree = SemanticLengthMatch(
-					accessor,
-					rewritten_cases,
-					rewritten_geq,
-					rewritten_fallback,
-				),
-				next_fresh = current
-			}
+			if (
+				cases_changed
+				or geq_changed
+				or fallback_changed
+			):
+				{
+					tree = SemanticLengthMatch(
+						accessor,
+						rewritten_cases,
+						rewritten_geq,
+						rewritten_fallback,
+					),
+					next_fresh = fallback_fresh,
+					changed = True
+				}
+			else:
+				{
+					tree = tree,
+					next_fresh = fallback_fresh,
+					changed = False
+				}
 
 
--- Source-level `and` and `or` chains become deep logical trees. This pass has
--- a large generated C frame, so recurse only at non-logical boundaries and
--- keep the logical subtree itself on an explicit work stack.
 private pure func rewrite_tuple_sroa_logical_expr(
 	context: TupleSroaContext,
 	expr: CoreExpr,
@@ -3028,9 +3365,7 @@ private pure func rewrite_tuple_sroa_logical_expr(
 						match current_expr:
 							LogicalExpr(op, left, right, typ, loc):
 								rebuild_task: TupleSroaLogicalTask = RebuildTupleSroaLogicalTask(
-									op,
-									typ,
-									loc,
+									current_expr,
 								)
 
 								tasks = if task_count < tasks.length():
@@ -3073,17 +3408,32 @@ private pure func rewrite_tuple_sroa_logical_expr(
 
 								rewritten_count += 1
 								current = result.next_fresh
-					RebuildTupleSroaLogicalTask(op, typ, loc):
-						match (
-							rewritten.get(rewritten_count - 2),
-							rewritten.get(rewritten_count - 1),
-						):
-							(Some(left), Some(right)):
-								rewritten = rewritten.set(
-									rewritten_count - 2,
-									LogicalExpr(op, left, right, typ, loc),
-								)
-								rewritten_count -= 1
+					RebuildTupleSroaLogicalTask(source_expr):
+						match source_expr:
+							LogicalExpr(op, left, right, typ, loc):
+								match (
+									rewritten.get(rewritten_count - 2),
+									rewritten.get(rewritten_count - 1),
+								):
+									(Some(rewritten_left), Some(rewritten_right)):
+										rebuilt: CoreExpr = if (
+											same_core_expr(rewritten_left, left)
+											and same_core_expr(rewritten_right, right)
+										):
+											source_expr
+										else:
+											LogicalExpr(
+												op,
+												rewritten_left,
+												rewritten_right,
+												typ,
+												loc,
+											)
+
+										rewritten = rewritten.set(rewritten_count - 2, rebuilt)
+										rewritten_count -= 1
+									_:
+										valid = False
 							_:
 								valid = False
 			None:
@@ -3108,33 +3458,78 @@ private pure func rewrite_tuple_sroa_logical_expr(
 		}
 
 
-private pure func rewrite_tuple_sroa_expr_from(
+-- Hands `expr` back unchanged with the fresh-variable counter untouched.
+private pure func unchanged_tuple_sroa(expr: CoreExpr, next_fresh: Int) -> TupleSroaRewrite:
+	{
+		expr = expr,
+		next_fresh = next_fresh
+	}
+
+
+-- One rewritten child whose node is rebuilt only when that child changed.
+private pure func tuple_sroa_with_child(
+	result: TupleSroaRewrite,
+	child: CoreExpr,
+	expr: CoreExpr,
+	rebuilt: CoreExpr,
+) -> TupleSroaRewrite:
+	if same_core_expr(result.expr, child):
+		{
+			expr = expr,
+			next_fresh = result.next_fresh
+		}
+	else:
+		{
+			expr = rebuilt,
+			next_fresh = result.next_fresh
+		}
+
+
+-- Rewrites the children of `expr`, threading the fresh-variable counter in
+-- source order, and answers `expr` itself when every rewritten child and child
+-- container came back as the same allocation. Constructors this early pass
+-- never meets (late-Core storage, match projections, hoisted tasks) fall
+-- through unchanged, exactly as before.
+--
+-- This dispatcher binds nothing and forwards to one small arm group, so a deep
+-- Core tree costs a shallow native frame per level: one match over every
+-- constructor would reserve stack for all of its arms' locals at once and
+-- overflow the default stack at -O0 on large generated suites.
+private pure func rewrite_tuple_sroa_children(
 	context: TupleSroaContext,
 	expr: CoreExpr,
 	next_fresh: Int,
 ) -> TupleSroaRewrite:
-	children: TupleSroaRewrite = match expr:
+	match expr:
+		DebugBlockExpr(_, _, _) | BinaryExpr(_, _, _, _, _) | UnaryExpr(_, _, _, _) | LogicalExpr(_, _, _, _, _) | AssignExpr(_, _, _, _) | CastExpr(_, _, _) | BoxExpr(_, _, _) | UnboxExpr(_, _, _, _) | FieldExpr(_, _, _, _) | TupleFieldExpr(_, _, _, _) | PreClosureDetachExpr(_, _, _) | DupExpr(_, _, _, _, _, _) | DropExpr(_, _, _, _, _, _) | LetExpr(_, _, _, _, _) | BorrowLetExpr(_, _, _, _) | SeqExpr(_, _) | WhileExpr(_, _, _, _) | RangeExpr(_, _, _, _) | IfExpr(_, _, _, _, _):
+			rewrite_tuple_sroa_operator_children(context, expr, next_fresh)
+		CallExpr(_, _, _, _, _) | TupleExpr(_, _, _) | VectorExpr(_, _, _) | ListConstructExpr(_, _, _) | DictExpr(_, _, _) | RecordExpr(_, _, _) | RecordUpdateExpr(_, _, _, _) | RecordReuseExpr(_, _, _, _) | RecordCowUpdateExpr(_, _, _, _) | RecordConstructExpr(_, _, _, _) | UnionConstructExpr(_, _, _) | UnionReuseConstructExpr(_, _, _) | SelectExpr(_, _, _):
+			rewrite_tuple_sroa_aggregate_children(context, expr, next_fresh)
+		ListAllocExpr(_, _, _) | ListGetExpr(_, _, _) | ListHandoffExpr(_, _, _) | ListHandoffSetOwnedExpr(_, _, _) | ListHandoffSetSourceSlotExpr(_, _, _) | TensorLiteralExpr(_, _, _) | TensorBoxedLiteralExpr(_, _, _) | TensorPackedLiteralExpr(_, _, _) | TensorRawFillExpr(_, _, _) | TensorRawReadExpr(_, _, _) | TensorRawWriteExpr(_, _, _) | TensorRawViewLetExpr(_, _, _, _):
+			rewrite_tuple_sroa_storage_children(context, expr, next_fresh)
+		LambdaExpr(_, _, _, _, _, _) | TailrecLoopExpr(_, _, _, _) | TailrecRecurExpr(_, _, _) | TailrecListSpreadLoopExpr(_, _) | TailrecListSpreadRecurExpr(_, _, _, _) | ForRangeExpr(_, _, _, _, _, _) | ForChannelExpr(_, _, _) | ForListExpr(_, _, _) | ForStringExpr(_, _, _) | ForDictExpr(_, _, _) | ForSetExpr(_, _, _) | ForStreamExpr(_, _, _) | ForResourceSourceExpr(_, _, _) | ForTensorExpr(_, _, _) | ResourceScopeExpr(_, _, _) | ResourceCleanupExitExpr(_, _, _):
+			rewrite_tuple_sroa_loop_children(context, expr, next_fresh)
+		PreClosureConcurrentlyLoopExpr(_, _, _) | PreClosureConcurrentExpr(_, _, _) | ConcurrentExpr(_, _, _) | RawMatchExpr(_, _, _, _) | SemanticMatchExpr(_, _, _, _):
+			rewrite_tuple_sroa_concurrency_match_children(context, expr, next_fresh)
+		_:
+			unchanged_tuple_sroa(expr, next_fresh)
+
+
+-- Operators, casts, field reads, and the simple binding and control forms.
+private pure func rewrite_tuple_sroa_operator_children(
+	context: TupleSroaContext,
+	expr: CoreExpr,
+	next_fresh: Int,
+) -> TupleSroaRewrite:
+	match expr:
 		DebugBlockExpr(body, typ, loc):
 			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, body, next_fresh)
-			{
-				expr = DebugBlockExpr(result.expr, typ, loc),
-				next_fresh = result.next_fresh
-			}
-		CallExpr(kind, callee, args, typ, loc):
-			callee_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
-				context,
-				callee,
-				next_fresh,
+			tuple_sroa_with_child(
+				result,
+				body,
+				expr,
+				DebugBlockExpr(result.expr, typ, loc),
 			)
-			args_result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
-				context,
-				args,
-				callee_result.next_fresh,
-			)
-			{
-				expr = CallExpr(kind, callee_result.expr, args_result.items, typ, loc),
-				next_fresh = args_result.next_fresh
-			}
 		BinaryExpr(op, left, right, typ, loc):
 			left_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, left, next_fresh)
 			right_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
@@ -3142,429 +3537,96 @@ private pure func rewrite_tuple_sroa_expr_from(
 				right,
 				left_result.next_fresh,
 			)
-			{
-				expr = BinaryExpr(op, left_result.expr, right_result.expr, typ, loc),
-				next_fresh = right_result.next_fresh
-			}
+
+			if same_core_expr(left_result.expr, left) and same_core_expr(right_result.expr, right):
+				unchanged_tuple_sroa(expr, right_result.next_fresh)
+			else:
+				{
+					expr = BinaryExpr(op, left_result.expr, right_result.expr, typ, loc),
+					next_fresh = right_result.next_fresh
+				}
 		UnaryExpr(op, value, typ, loc):
 			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, value, next_fresh)
-			{
-				expr = UnaryExpr(op, result.expr, typ, loc),
-				next_fresh = result.next_fresh
-			}
-		LogicalExpr(_, _, _, _, _):
+			tuple_sroa_with_child(
+				result,
+				value,
+				expr,
+				UnaryExpr(op, result.expr, typ, loc),
+			)
+		LogicalExpr(op, left, right, typ, loc):
 			rewrite_tuple_sroa_logical_expr(context, expr, next_fresh)
-		AssignExpr(variable_name, rhs, typ, loc):
-			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, rhs, next_fresh)
-			{
-				expr = AssignExpr(variable_name, result.expr, typ, loc),
-				next_fresh = result.next_fresh
-			}
+		AssignExpr(variable_name, value, typ, loc):
+			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, value, next_fresh)
+			tuple_sroa_with_child(
+				result,
+				value,
+				expr,
+				AssignExpr(variable_name, result.expr, typ, loc),
+			)
 		CastExpr(value, typ, loc):
 			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, value, next_fresh)
-			{
-				expr = CastExpr(result.expr, typ, loc),
-				next_fresh = result.next_fresh
-			}
+			tuple_sroa_with_child(
+				result,
+				value,
+				expr,
+				CastExpr(result.expr, typ, loc),
+			)
 		BoxExpr(box, typ, loc):
 			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, box.value, next_fresh)
-			{
-				expr = BoxExpr({ box | value = result.expr }, typ, loc),
-				next_fresh = result.next_fresh
-			}
+			tuple_sroa_with_child(
+				result,
+				box.value,
+				expr,
+				BoxExpr({ box | value = result.expr }, typ, loc),
+			)
 		UnboxExpr(kind, value, typ, loc):
 			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, value, next_fresh)
-			{
-				expr = UnboxExpr(kind, result.expr, typ, loc),
-				next_fresh = result.next_fresh
-			}
+			tuple_sroa_with_child(
+				result,
+				value,
+				expr,
+				UnboxExpr(kind, result.expr, typ, loc),
+			)
 		FieldExpr(value, field_name, typ, loc):
 			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, value, next_fresh)
-			{
-				expr = FieldExpr(result.expr, field_name, typ, loc),
-				next_fresh = result.next_fresh
-			}
+			tuple_sroa_with_child(
+				result,
+				value,
+				expr,
+				FieldExpr(result.expr, field_name, typ, loc),
+			)
 		TupleFieldExpr(value, field_index, typ, loc):
 			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, value, next_fresh)
-			{
-				expr = TupleFieldExpr(result.expr, field_index, typ, loc),
-				next_fresh = result.next_fresh
-			}
-		TupleExpr(items, typ, loc):
-			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(context, items, next_fresh)
-			{
-				expr = TupleExpr(result.items, typ, loc),
-				next_fresh = result.next_fresh
-			}
-		VectorExpr(items, typ, loc):
-			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(context, items, next_fresh)
-			{
-				expr = VectorExpr(result.items, typ, loc),
-				next_fresh = result.next_fresh
-			}
-		LambdaExpr(params, return_type, body, is_pure, typ, loc):
-			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, body, next_fresh)
-			{
-				expr = LambdaExpr(params, return_type, result.expr, is_pure, typ, loc),
-				next_fresh = result.next_fresh
-			}
-		ListConstructExpr(construct, typ, loc):
-			result: TupleSroaBoxedValuesRewrite = rewrite_tuple_sroa_boxed_values(
-				context,
-				construct.elements,
-				next_fresh,
+			tuple_sroa_with_child(
+				result,
+				value,
+				expr,
+				TupleFieldExpr(result.expr, field_index, typ, loc),
 			)
-			{
-				expr = ListConstructExpr({ construct | elements = result.items }, typ, loc),
-				next_fresh = result.next_fresh
-			}
-		ListAllocExpr(alloc, typ, loc):
-			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
-				context,
-				alloc.capacity,
-				next_fresh,
-			)
-			{
-				expr = ListAllocExpr({ alloc | capacity = result.expr }, typ, loc),
-				next_fresh = result.next_fresh
-			}
-		ListGetExpr(get, typ, loc):
-			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
-				context,
-				[get.list, get.index],
-				next_fresh,
-			)
-
-			match result.items:
-				[rewritten_list, rewritten_index]:
-					{
-						expr = ListGetExpr(
-							{ get |
-								list = rewritten_list,
-								index = rewritten_index
-							},
-							typ,
-							loc,
-						),
-						next_fresh = result.next_fresh
-					}
-				_:
-					{
-						expr = expr,
-						next_fresh = next_fresh
-					}
-		ListHandoffExpr(handoff, typ, loc):
-			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
-				context,
-				[handoff.source, handoff.capacity, handoff.body],
-				next_fresh,
-			)
-
-			match result.items:
-				[source, capacity, body]:
-					{
-						expr = ListHandoffExpr(
-							{ handoff |
-								source = source,
-								capacity = capacity,
-								body = body
-							},
-							typ,
-							loc,
-						),
-						next_fresh = result.next_fresh
-					}
-				_:
-					{
-						expr = expr,
-						next_fresh = next_fresh
-					}
-		ListHandoffSetOwnedExpr(set, typ, loc):
-			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
-				context,
-				[set.list, set.index, set.value.value],
-				next_fresh,
-			)
-
-			match result.items:
-				[list, index, value]:
-					{
-						expr = ListHandoffSetOwnedExpr(
-							{ set |
-								list = list,
-								index = index,
-								value = { set.value | value = value }
-							},
-							typ,
-							loc,
-						),
-						next_fresh = result.next_fresh
-					}
-				_:
-					{
-						expr = expr,
-						next_fresh = next_fresh
-					}
-		ListHandoffSetSourceSlotExpr(slot, typ, loc):
-			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
-				context,
-				[slot.result, slot.out_index, slot.source, slot.source_index],
-				next_fresh,
-			)
-
-			match result.items:
-				[result_expr, out_index, source, source_index]:
-					{
-						expr = ListHandoffSetSourceSlotExpr(
-							{ slot |
-								result = result_expr,
-								out_index = out_index,
-								source = source,
-								source_index = source_index
-							},
-							typ,
-							loc,
-						),
-						next_fresh = result.next_fresh
-					}
-				_:
-					{
-						expr = expr,
-						next_fresh = next_fresh
-					}
-		TensorLiteralExpr(literal, typ, loc):
-			payload_result: TupleSroaExprsRewrite = match literal.payload:
-				TensorRawLiteralPayload(raw):
-					rewrite_tuple_sroa_exprs(context, raw.elements, next_fresh)
-				TensorInlineStructLiteralPayload(inline_struct):
-					rewrite_tuple_sroa_exprs(context, inline_struct.elements, next_fresh)
-
-			payload: CoreTensorLiteralPayload = match literal.payload:
-				TensorRawLiteralPayload(raw):
-					TensorRawLiteralPayload({ raw | elements = payload_result.items })
-				TensorInlineStructLiteralPayload(inline_struct):
-					TensorInlineStructLiteralPayload(
-						{ inline_struct | elements = payload_result.items },
-					)
-
-			{
-				expr = TensorLiteralExpr({ literal | payload = payload }, typ, loc),
-				next_fresh = payload_result.next_fresh
-			}
-		TensorBoxedLiteralExpr(literal, typ, loc):
-			result: TupleSroaBoxedValuesRewrite = rewrite_tuple_sroa_boxed_values(
-				context,
-				literal.elements,
-				next_fresh,
-			)
-			{
-				expr = TensorBoxedLiteralExpr({ literal | elements = result.items }, typ, loc),
-				next_fresh = result.next_fresh
-			}
-		TensorPackedLiteralExpr(literal, typ, loc):
-			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
-				context,
-				literal.elements,
-				next_fresh,
-			)
-			{
-				expr = TensorPackedLiteralExpr({ literal | elements = result.items }, typ, loc),
-				next_fresh = result.next_fresh
-			}
-		TensorRawFillExpr(fill, typ, loc):
-			value_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
-				context,
-				fill.value,
-				next_fresh,
-			)
-			dims_result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
-				context,
-				fill.dims,
-				value_result.next_fresh,
-			)
-			{
-				expr = TensorRawFillExpr(
-					{ fill |
-						value = value_result.expr,
-						dims = dims_result.items
-					},
-					typ,
-					loc,
-				),
-				next_fresh = dims_result.next_fresh
-			}
-		TensorRawReadExpr(read, typ, loc):
-			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, read.index, next_fresh)
-			{
-				expr = TensorRawReadExpr({ read | index = result.expr }, typ, loc),
-				next_fresh = result.next_fresh
-			}
-		TensorRawWriteExpr(write, typ, loc):
-			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
-				context,
-				[write.index, write.value],
-				next_fresh,
-			)
-
-			match result.items:
-				[index, value]:
-					{
-						expr = TensorRawWriteExpr(
-							{ write |
-								index = index,
-								value = value
-							},
-							typ,
-							loc,
-						),
-						next_fresh = result.next_fresh
-					}
-				_:
-					{
-						expr = expr,
-						next_fresh = next_fresh
-					}
-		TensorRawViewLetExpr(binding, body, typ, loc):
-			source_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
-				context,
-				binding.source,
-				next_fresh,
-			)
-			body_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
-				context,
-				body,
-				source_result.next_fresh,
-			)
-			{
-				expr = TensorRawViewLetExpr(
-					{ binding | source = source_result.expr },
-					body_result.expr,
-					typ,
-					loc,
-				),
-				next_fresh = body_result.next_fresh
-			}
-		DictExpr(entries, typ, loc):
-			result: TupleSroaDictEntriesRewrite = rewrite_tuple_sroa_dict_entries(
-				context,
-				entries,
-				next_fresh,
-			)
-			{
-				expr = DictExpr(result.items, typ, loc),
-				next_fresh = result.next_fresh
-			}
-		RecordExpr(fields, typ, loc):
-			result: TupleSroaRecordFieldsRewrite = rewrite_tuple_sroa_record_fields(
-				context,
-				fields,
-				next_fresh,
-			)
-			{
-				expr = RecordExpr(result.items, typ, loc),
-				next_fresh = result.next_fresh
-			}
-		RecordUpdateExpr(base, fields, typ, loc):
-			base_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, base, next_fresh)
-			fields_result: TupleSroaRecordFieldsRewrite = rewrite_tuple_sroa_record_fields(
-				context,
-				fields,
-				base_result.next_fresh,
-			)
-			{
-				expr = RecordUpdateExpr(base_result.expr, fields_result.items, typ, loc),
-				next_fresh = fields_result.next_fresh
-			}
-		RecordReuseExpr(source, fields, typ, loc):
-			source_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
-				context,
-				source,
-				next_fresh,
-			)
-			fields_result: TupleSroaRecordFieldsRewrite = rewrite_tuple_sroa_record_fields(
-				context,
-				fields,
-				source_result.next_fresh,
-			)
-			{
-				expr = RecordReuseExpr(source_result.expr, fields_result.items, typ, loc),
-				next_fresh = fields_result.next_fresh
-			}
-		RecordCowUpdateExpr(source, fields, typ, loc):
-			fields_result: TupleSroaRecordCowFieldsRewrite = rewrite_tuple_sroa_record_cow_fields(
-				context,
-				fields,
-				next_fresh,
-			)
-			source_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
-				context,
-				source,
-				fields_result.next_fresh,
-			)
-			{
-				expr = RecordCowUpdateExpr(source_result.expr, fields_result.items, typ, loc),
-				next_fresh = source_result.next_fresh
-			}
-		RecordConstructExpr(type_name, fields, typ, loc):
-			result: TupleSroaRecordFieldsRewrite = rewrite_tuple_sroa_record_fields(
-				context,
-				fields,
-				next_fresh,
-			)
-			{
-				expr = RecordConstructExpr(type_name, result.items, typ, loc),
-				next_fresh = result.next_fresh
-			}
-		UnionConstructExpr(construct, typ, loc):
-			result: TupleSroaBoxedValuesRewrite = rewrite_tuple_sroa_boxed_values(
-				context,
-				construct.args,
-				next_fresh,
-			)
-			{
-				expr = UnionConstructExpr({ construct | args = result.items }, typ, loc),
-				next_fresh = result.next_fresh
-			}
-		UnionReuseConstructExpr(construct, typ, loc):
-			source_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
-				context,
-				construct.source,
-				next_fresh,
-			)
-			args_result: TupleSroaBoxedValuesRewrite = rewrite_tuple_sroa_boxed_values(
-				context,
-				construct.args,
-				source_result.next_fresh,
-			)
-			{
-				expr = UnionReuseConstructExpr(
-					{ construct |
-						source = source_result.expr,
-						args = args_result.items
-					},
-					typ,
-					loc,
-				),
-				next_fresh = args_result.next_fresh
-			}
 		PreClosureDetachExpr(body, typ, loc):
 			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, body, next_fresh)
-			{
-				expr = PreClosureDetachExpr(result.expr, typ, loc),
-				next_fresh = result.next_fresh
-			}
+			tuple_sroa_with_child(
+				result,
+				body,
+				expr,
+				PreClosureDetachExpr(result.expr, typ, loc),
+			)
 		DupExpr(variable_name, value_type, policy, body, typ, loc):
 			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, body, next_fresh)
-			{
-				expr = DupExpr(variable_name, value_type, policy, result.expr, typ, loc),
-				next_fresh = result.next_fresh
-			}
+			tuple_sroa_with_child(
+				result,
+				body,
+				expr,
+				DupExpr(variable_name, value_type, policy, result.expr, typ, loc),
+			)
 		DropExpr(variable_name, value_type, policy, body, typ, loc):
 			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, body, next_fresh)
-			{
-				expr = DropExpr(variable_name, value_type, policy, result.expr, typ, loc),
-				next_fresh = result.next_fresh
-			}
+			tuple_sroa_with_child(
+				result,
+				body,
+				expr,
+				DropExpr(variable_name, value_type, policy, result.expr, typ, loc),
+			)
 		LetExpr(variable_name, is_mutable, typ, rhs, body):
 			rhs_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, rhs, next_fresh)
 			body_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
@@ -3572,10 +3634,20 @@ private pure func rewrite_tuple_sroa_expr_from(
 				body,
 				rhs_result.next_fresh,
 			)
-			{
-				expr = LetExpr(variable_name, is_mutable, typ, rhs_result.expr, body_result.expr),
-				next_fresh = body_result.next_fresh
-			}
+
+			if same_core_expr(rhs_result.expr, rhs) and same_core_expr(body_result.expr, body):
+				unchanged_tuple_sroa(expr, body_result.next_fresh)
+			else:
+				{
+					expr = LetExpr(
+						variable_name,
+						is_mutable,
+						typ,
+						rhs_result.expr,
+						body_result.expr,
+					),
+					next_fresh = body_result.next_fresh
+				}
 		BorrowLetExpr(variable_name, typ, rhs, body):
 			rhs_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, rhs, next_fresh)
 			body_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
@@ -3583,10 +3655,14 @@ private pure func rewrite_tuple_sroa_expr_from(
 				body,
 				rhs_result.next_fresh,
 			)
-			{
-				expr = BorrowLetExpr(variable_name, typ, rhs_result.expr, body_result.expr),
-				next_fresh = body_result.next_fresh
-			}
+
+			if same_core_expr(rhs_result.expr, rhs) and same_core_expr(body_result.expr, body):
+				unchanged_tuple_sroa(expr, body_result.next_fresh)
+			else:
+				{
+					expr = BorrowLetExpr(variable_name, typ, rhs_result.expr, body_result.expr),
+					next_fresh = body_result.next_fresh
+				}
 		SeqExpr(first, second):
 			first_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
 				context,
@@ -3598,10 +3674,17 @@ private pure func rewrite_tuple_sroa_expr_from(
 				second,
 				first_result.next_fresh,
 			)
-			{
-				expr = SeqExpr(first_result.expr, second_result.expr),
-				next_fresh = second_result.next_fresh
-			}
+
+			if (
+				same_core_expr(first_result.expr, first)
+				and same_core_expr(second_result.expr, second)
+			):
+				unchanged_tuple_sroa(expr, second_result.next_fresh)
+			else:
+				{
+					expr = SeqExpr(first_result.expr, second_result.expr),
+					next_fresh = second_result.next_fresh
+				}
 		WhileExpr(cond, body, typ, loc):
 			cond_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, cond, next_fresh)
 			body_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
@@ -3609,10 +3692,929 @@ private pure func rewrite_tuple_sroa_expr_from(
 				body,
 				cond_result.next_fresh,
 			)
-			{
-				expr = WhileExpr(cond_result.expr, body_result.expr, typ, loc),
-				next_fresh = body_result.next_fresh
-			}
+
+			if same_core_expr(cond_result.expr, cond) and same_core_expr(body_result.expr, body):
+				unchanged_tuple_sroa(expr, body_result.next_fresh)
+			else:
+				{
+					expr = WhileExpr(cond_result.expr, body_result.expr, typ, loc),
+					next_fresh = body_result.next_fresh
+				}
+		RangeExpr(start, end_value, typ, loc):
+			start_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				start,
+				next_fresh,
+			)
+			end_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				end_value,
+				start_result.next_fresh,
+			)
+
+			if (
+				same_core_expr(start_result.expr, start)
+				and same_core_expr(end_result.expr, end_value)
+			):
+				unchanged_tuple_sroa(expr, end_result.next_fresh)
+			else:
+				{
+					expr = RangeExpr(start_result.expr, end_result.expr, typ, loc),
+					next_fresh = end_result.next_fresh
+				}
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			cond_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, cond, next_fresh)
+			then_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				then_expr,
+				cond_result.next_fresh,
+			)
+			else_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				else_expr,
+				then_result.next_fresh,
+			)
+
+			if (
+				same_core_expr(cond_result.expr, cond)
+				and same_core_expr(then_result.expr, then_expr)
+				and same_core_expr(else_result.expr, else_expr)
+			):
+				unchanged_tuple_sroa(expr, else_result.next_fresh)
+			else:
+				{
+					expr = IfExpr(cond_result.expr, then_result.expr, else_result.expr, typ, loc),
+					next_fresh = else_result.next_fresh
+				}
+		_:
+			unchanged_tuple_sroa(expr, next_fresh)
+
+
+-- Calls and the literal, record, union, and select aggregates.
+private pure func rewrite_tuple_sroa_aggregate_children(
+	context: TupleSroaContext,
+	expr: CoreExpr,
+	next_fresh: Int,
+) -> TupleSroaRewrite:
+	match expr:
+		CallExpr(kind, callee, args, typ, loc):
+			callee_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				callee,
+				next_fresh,
+			)
+			args_result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
+				context,
+				args,
+				callee_result.next_fresh,
+			)
+
+			if same_core_expr(callee_result.expr, callee) and not args_result.changed:
+				unchanged_tuple_sroa(expr, args_result.next_fresh)
+			else:
+				{
+					expr = CallExpr(kind, callee_result.expr, args_result.items, typ, loc),
+					next_fresh = args_result.next_fresh
+				}
+		TupleExpr(items, typ, loc):
+			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(context, items, next_fresh)
+
+			if result.changed:
+				{
+					expr = TupleExpr(result.items, typ, loc),
+					next_fresh = result.next_fresh
+				}
+			else:
+				unchanged_tuple_sroa(expr, result.next_fresh)
+		VectorExpr(items, typ, loc):
+			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(context, items, next_fresh)
+
+			if result.changed:
+				{
+					expr = VectorExpr(result.items, typ, loc),
+					next_fresh = result.next_fresh
+				}
+			else:
+				unchanged_tuple_sroa(expr, result.next_fresh)
+		ListConstructExpr(construct, typ, loc):
+			result: TupleSroaBoxedValuesRewrite = rewrite_tuple_sroa_boxed_values(
+				context,
+				construct.elements,
+				next_fresh,
+			)
+
+			if result.changed:
+				{
+					expr = ListConstructExpr({ construct | elements = result.items }, typ, loc),
+					next_fresh = result.next_fresh
+				}
+			else:
+				unchanged_tuple_sroa(expr, result.next_fresh)
+		DictExpr(entries, typ, loc):
+			result: TupleSroaDictEntriesRewrite = rewrite_tuple_sroa_dict_entries(
+				context,
+				entries,
+				next_fresh,
+			)
+
+			if result.changed:
+				{
+					expr = DictExpr(result.items, typ, loc),
+					next_fresh = result.next_fresh
+				}
+			else:
+				unchanged_tuple_sroa(expr, result.next_fresh)
+		RecordExpr(fields, typ, loc):
+			result: TupleSroaRecordFieldsRewrite = rewrite_tuple_sroa_record_fields(
+				context,
+				fields,
+				next_fresh,
+			)
+
+			if result.changed:
+				{
+					expr = RecordExpr(result.items, typ, loc),
+					next_fresh = result.next_fresh
+				}
+			else:
+				unchanged_tuple_sroa(expr, result.next_fresh)
+		RecordUpdateExpr(base, fields, typ, loc):
+			base_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, base, next_fresh)
+			fields_result: TupleSroaRecordFieldsRewrite = rewrite_tuple_sroa_record_fields(
+				context,
+				fields,
+				base_result.next_fresh,
+			)
+
+			if same_core_expr(base_result.expr, base) and not fields_result.changed:
+				unchanged_tuple_sroa(expr, fields_result.next_fresh)
+			else:
+				{
+					expr = RecordUpdateExpr(base_result.expr, fields_result.items, typ, loc),
+					next_fresh = fields_result.next_fresh
+				}
+		RecordReuseExpr(source, fields, typ, loc):
+			source_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				source,
+				next_fresh,
+			)
+			fields_result: TupleSroaRecordFieldsRewrite = rewrite_tuple_sroa_record_fields(
+				context,
+				fields,
+				source_result.next_fresh,
+			)
+
+			if same_core_expr(source_result.expr, source) and not fields_result.changed:
+				unchanged_tuple_sroa(expr, fields_result.next_fresh)
+			else:
+				{
+					expr = RecordReuseExpr(source_result.expr, fields_result.items, typ, loc),
+					next_fresh = fields_result.next_fresh
+				}
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			-- Fields rewrite before the source so fresh names keep their order.
+			fields_result: TupleSroaRecordCowFieldsRewrite = rewrite_tuple_sroa_record_cow_fields(
+				context,
+				fields,
+				next_fresh,
+			)
+			source_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				source,
+				fields_result.next_fresh,
+			)
+
+			if same_core_expr(source_result.expr, source) and not fields_result.changed:
+				unchanged_tuple_sroa(expr, source_result.next_fresh)
+			else:
+				{
+					expr = RecordCowUpdateExpr(source_result.expr, fields_result.items, typ, loc),
+					next_fresh = source_result.next_fresh
+				}
+		RecordConstructExpr(type_name, fields, typ, loc):
+			result: TupleSroaRecordFieldsRewrite = rewrite_tuple_sroa_record_fields(
+				context,
+				fields,
+				next_fresh,
+			)
+
+			if result.changed:
+				{
+					expr = RecordConstructExpr(type_name, result.items, typ, loc),
+					next_fresh = result.next_fresh
+				}
+			else:
+				unchanged_tuple_sroa(expr, result.next_fresh)
+		UnionConstructExpr(construct, typ, loc):
+			result: TupleSroaBoxedValuesRewrite = rewrite_tuple_sroa_boxed_values(
+				context,
+				construct.args,
+				next_fresh,
+			)
+
+			if result.changed:
+				{
+					expr = UnionConstructExpr({ construct | args = result.items }, typ, loc),
+					next_fresh = result.next_fresh
+				}
+			else:
+				unchanged_tuple_sroa(expr, result.next_fresh)
+		UnionReuseConstructExpr(construct, typ, loc):
+			source_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				construct.source,
+				next_fresh,
+			)
+			args_result: TupleSroaBoxedValuesRewrite = rewrite_tuple_sroa_boxed_values(
+				context,
+				construct.args,
+				source_result.next_fresh,
+			)
+
+			if same_core_expr(source_result.expr, construct.source) and not args_result.changed:
+				unchanged_tuple_sroa(expr, args_result.next_fresh)
+			else:
+				{
+					expr = UnionReuseConstructExpr(
+						{ construct |
+							source = source_result.expr,
+							args = args_result.items
+						},
+						typ,
+						loc,
+					),
+					next_fresh = args_result.next_fresh
+				}
+		SelectExpr(arms, typ, loc):
+			result: TupleSroaSelectArmsRewrite = rewrite_tuple_sroa_select_arms(
+				context,
+				arms,
+				next_fresh,
+			)
+
+			if result.changed:
+				{
+					expr = SelectExpr(result.items, typ, loc),
+					next_fresh = result.next_fresh
+				}
+			else:
+				unchanged_tuple_sroa(expr, result.next_fresh)
+		_:
+			unchanged_tuple_sroa(expr, next_fresh)
+
+
+-- List and tensor storage operations whose children live in one payload
+-- record. Children rewrite in field order, threading the counter directly
+-- instead of through a temporary list.
+private pure func rewrite_tuple_sroa_storage_children(
+	context: TupleSroaContext,
+	expr: CoreExpr,
+	next_fresh: Int,
+) -> TupleSroaRewrite:
+	match expr:
+		ListAllocExpr(alloc, typ, loc):
+			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				alloc.capacity,
+				next_fresh,
+			)
+			tuple_sroa_with_child(
+				result,
+				alloc.capacity,
+				expr,
+				ListAllocExpr({ alloc | capacity = result.expr }, typ, loc),
+			)
+		ListGetExpr(get, typ, loc):
+			list_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				get.list,
+				next_fresh,
+			)
+			index_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				get.index,
+				list_result.next_fresh,
+			)
+
+			if (
+				same_core_expr(list_result.expr, get.list)
+				and same_core_expr(index_result.expr, get.index)
+			):
+				unchanged_tuple_sroa(expr, index_result.next_fresh)
+			else:
+				{
+					expr = ListGetExpr(
+						{ get |
+							list = list_result.expr,
+							index = index_result.expr
+						},
+						typ,
+						loc,
+					),
+					next_fresh = index_result.next_fresh
+				}
+		ListHandoffExpr(handoff, typ, loc):
+			source_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				handoff.source,
+				next_fresh,
+			)
+			capacity_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				handoff.capacity,
+				source_result.next_fresh,
+			)
+			body_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				handoff.body,
+				capacity_result.next_fresh,
+			)
+
+			if (
+				same_core_expr(source_result.expr, handoff.source)
+				and same_core_expr(capacity_result.expr, handoff.capacity)
+				and same_core_expr(body_result.expr, handoff.body)
+			):
+				unchanged_tuple_sroa(expr, body_result.next_fresh)
+			else:
+				{
+					expr = ListHandoffExpr(
+						{ handoff |
+							source = source_result.expr,
+							capacity = capacity_result.expr,
+							body = body_result.expr
+						},
+						typ,
+						loc,
+					),
+					next_fresh = body_result.next_fresh
+				}
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			list_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				set.list,
+				next_fresh,
+			)
+			index_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				set.index,
+				list_result.next_fresh,
+			)
+			value_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				set.value.value,
+				index_result.next_fresh,
+			)
+
+			if (
+				same_core_expr(list_result.expr, set.list)
+				and same_core_expr(index_result.expr, set.index)
+				and same_core_expr(value_result.expr, set.value.value)
+			):
+				unchanged_tuple_sroa(expr, value_result.next_fresh)
+			else:
+				{
+					expr = ListHandoffSetOwnedExpr(
+						{ set |
+							list = list_result.expr,
+							index = index_result.expr,
+							value = { set.value | value = value_result.expr }
+						},
+						typ,
+						loc,
+					),
+					next_fresh = value_result.next_fresh
+				}
+		ListHandoffSetSourceSlotExpr(slot, typ, loc):
+			result_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				slot.result,
+				next_fresh,
+			)
+			out_index_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				slot.out_index,
+				result_result.next_fresh,
+			)
+			source_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				slot.source,
+				out_index_result.next_fresh,
+			)
+			source_index_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				slot.source_index,
+				source_result.next_fresh,
+			)
+
+			if (
+				same_core_expr(result_result.expr, slot.result)
+				and same_core_expr(out_index_result.expr, slot.out_index)
+				and same_core_expr(source_result.expr, slot.source)
+				and same_core_expr(source_index_result.expr, slot.source_index)
+			):
+				unchanged_tuple_sroa(expr, source_index_result.next_fresh)
+			else:
+				{
+					expr = ListHandoffSetSourceSlotExpr(
+						{ slot |
+							result = result_result.expr,
+							out_index = out_index_result.expr,
+							source = source_result.expr,
+							source_index = source_index_result.expr
+						},
+						typ,
+						loc,
+					),
+					next_fresh = source_index_result.next_fresh
+				}
+		TensorLiteralExpr(literal, typ, loc):
+			match literal.payload:
+				TensorRawLiteralPayload(raw):
+					result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
+						context,
+						raw.elements,
+						next_fresh,
+					)
+
+					if result.changed:
+						{
+							expr = TensorLiteralExpr(
+								{ literal |
+									payload = TensorRawLiteralPayload(
+										{ raw | elements = result.items },
+									)
+								},
+								typ,
+								loc,
+							),
+							next_fresh = result.next_fresh
+						}
+					else:
+						unchanged_tuple_sroa(expr, result.next_fresh)
+				TensorInlineStructLiteralPayload(inline_struct):
+					result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
+						context,
+						inline_struct.elements,
+						next_fresh,
+					)
+
+					if result.changed:
+						{
+							expr = TensorLiteralExpr(
+								{ literal |
+									payload = TensorInlineStructLiteralPayload(
+										{ inline_struct | elements = result.items },
+									)
+								},
+								typ,
+								loc,
+							),
+							next_fresh = result.next_fresh
+						}
+					else:
+						unchanged_tuple_sroa(expr, result.next_fresh)
+		TensorBoxedLiteralExpr(literal, typ, loc):
+			result: TupleSroaBoxedValuesRewrite = rewrite_tuple_sroa_boxed_values(
+				context,
+				literal.elements,
+				next_fresh,
+			)
+
+			if result.changed:
+				{
+					expr = TensorBoxedLiteralExpr({ literal | elements = result.items }, typ, loc),
+					next_fresh = result.next_fresh
+				}
+			else:
+				unchanged_tuple_sroa(expr, result.next_fresh)
+		TensorPackedLiteralExpr(literal, typ, loc):
+			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
+				context,
+				literal.elements,
+				next_fresh,
+			)
+
+			if result.changed:
+				{
+					expr = TensorPackedLiteralExpr({ literal | elements = result.items }, typ, loc),
+					next_fresh = result.next_fresh
+				}
+			else:
+				unchanged_tuple_sroa(expr, result.next_fresh)
+		TensorRawFillExpr(fill, typ, loc):
+			value_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				fill.value,
+				next_fresh,
+			)
+			dims_result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
+				context,
+				fill.dims,
+				value_result.next_fresh,
+			)
+
+			if same_core_expr(value_result.expr, fill.value) and not dims_result.changed:
+				unchanged_tuple_sroa(expr, dims_result.next_fresh)
+			else:
+				{
+					expr = TensorRawFillExpr(
+						{ fill |
+							value = value_result.expr,
+							dims = dims_result.items
+						},
+						typ,
+						loc,
+					),
+					next_fresh = dims_result.next_fresh
+				}
+		TensorRawReadExpr(read, typ, loc):
+			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, read.index, next_fresh)
+			tuple_sroa_with_child(
+				result,
+				read.index,
+				expr,
+				TensorRawReadExpr({ read | index = result.expr }, typ, loc),
+			)
+		TensorRawWriteExpr(write, typ, loc):
+			index_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				write.index,
+				next_fresh,
+			)
+			value_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				write.value,
+				index_result.next_fresh,
+			)
+
+			if (
+				same_core_expr(index_result.expr, write.index)
+				and same_core_expr(value_result.expr, write.value)
+			):
+				unchanged_tuple_sroa(expr, value_result.next_fresh)
+			else:
+				{
+					expr = TensorRawWriteExpr(
+						{ write |
+							index = index_result.expr,
+							value = value_result.expr
+						},
+						typ,
+						loc,
+					),
+					next_fresh = value_result.next_fresh
+				}
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			source_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				binding.source,
+				next_fresh,
+			)
+			body_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				body,
+				source_result.next_fresh,
+			)
+
+			if (
+				same_core_expr(source_result.expr, binding.source)
+				and same_core_expr(body_result.expr, body)
+			):
+				unchanged_tuple_sroa(expr, body_result.next_fresh)
+			else:
+				{
+					expr = TensorRawViewLetExpr(
+						{ binding | source = source_result.expr },
+						body_result.expr,
+						typ,
+						loc,
+					),
+					next_fresh = body_result.next_fresh
+				}
+		_:
+			unchanged_tuple_sroa(expr, next_fresh)
+
+
+-- Rebuilds a `for` loop node only when its iterable or body changed. The
+-- iterable rewrites before the body, as the temporary child list used to.
+private pure func rewritten_tuple_sroa_for_loop(
+	context: TupleSroaContext,
+	iterable: CoreExpr,
+	body: CoreExpr,
+	next_fresh: Int,
+) -> (Option[(CoreExpr, CoreExpr)], Int):
+	iterable_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, iterable, next_fresh)
+	body_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+		context,
+		body,
+		iterable_result.next_fresh,
+	)
+
+	if same_core_expr(iterable_result.expr, iterable) and same_core_expr(body_result.expr, body):
+		(None, body_result.next_fresh)
+	else:
+		(Some((iterable_result.expr, body_result.expr)), body_result.next_fresh)
+
+
+-- Lambdas, tail-recursive loops, `for` loops, and resource scopes.
+private pure func rewrite_tuple_sroa_loop_children(
+	context: TupleSroaContext,
+	expr: CoreExpr,
+	next_fresh: Int,
+) -> TupleSroaRewrite:
+	match expr:
+		LambdaExpr(params, return_type, body, is_pure, typ, loc):
+			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, body, next_fresh)
+			tuple_sroa_with_child(
+				result,
+				body,
+				expr,
+				LambdaExpr(params, return_type, result.expr, is_pure, typ, loc),
+			)
+		TailrecLoopExpr(params, return_type, body, loc):
+			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, body, next_fresh)
+			tuple_sroa_with_child(
+				result,
+				body,
+				expr,
+				TailrecLoopExpr(params, return_type, result.expr, loc),
+			)
+		TailrecRecurExpr(args, typ, loc):
+			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(context, args, next_fresh)
+
+			if result.changed:
+				{
+					expr = TailrecRecurExpr(result.items, typ, loc),
+					next_fresh = result.next_fresh
+				}
+			else:
+				unchanged_tuple_sroa(expr, result.next_fresh)
+		TailrecListSpreadLoopExpr(loop, loc):
+			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, loop.body, next_fresh)
+			tuple_sroa_with_child(
+				result,
+				loop.body,
+				expr,
+				TailrecListSpreadLoopExpr({ loop | body = result.expr }, loc),
+			)
+		TailrecListSpreadRecurExpr(rebinds, cursor_advance, typ, loc):
+			var rewritten: List[CoreTailrecListSpreadRebind] = rebinds
+			var current: Int = next_fresh
+			var changed: Bool = False
+			var index: Int = 0
+
+			for rebind in rebinds:
+				result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+					context,
+					rebind.value,
+					current,
+				)
+				current = result.next_fresh
+				rebind_changed: Bool = not same_core_expr(result.expr, rebind.value)
+
+				rewritten_rebind: CoreTailrecListSpreadRebind = if rebind_changed:
+					{ rebind | value = result.expr }
+				else:
+					rebind
+
+				if changed:
+					rewritten = rewritten.append(rewritten_rebind)
+				else if rebind_changed:
+					rewritten = rebinds
+						.take(index)
+						.append(rewritten_rebind)
+					changed = True
+
+				index += 1
+
+			if changed:
+				{
+					expr = TailrecListSpreadRecurExpr(rewritten, cursor_advance, typ, loc),
+					next_fresh = current
+				}
+			else:
+				unchanged_tuple_sroa(expr, current)
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			start_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				start,
+				next_fresh,
+			)
+			end_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				end_value,
+				start_result.next_fresh,
+			)
+			body_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				body,
+				end_result.next_fresh,
+			)
+
+			if (
+				same_core_expr(start_result.expr, start)
+				and same_core_expr(end_result.expr, end_value)
+				and same_core_expr(body_result.expr, body)
+			):
+				unchanged_tuple_sroa(expr, body_result.next_fresh)
+			else:
+				{
+					expr = ForRangeExpr(
+						binder,
+						start_result.expr,
+						end_result.expr,
+						body_result.expr,
+						typ,
+						loc,
+					),
+					next_fresh = body_result.next_fresh
+				}
+		ForChannelExpr(loop, typ, loc):
+			(children, fresh) = rewritten_tuple_sroa_for_loop(
+				context,
+				loop.iterable,
+				loop.body,
+				next_fresh,
+			)
+
+			match children:
+				Some((iterable, body)):
+					{
+						expr = ForChannelExpr(
+							{ loop |
+								iterable = iterable,
+								body = body
+							},
+							typ,
+							loc,
+						),
+						next_fresh = fresh
+					}
+				None:
+					unchanged_tuple_sroa(expr, fresh)
+		ForListExpr(loop, typ, loc):
+			(children, fresh) = rewritten_tuple_sroa_for_loop(
+				context,
+				loop.iterable,
+				loop.body,
+				next_fresh,
+			)
+
+			match children:
+				Some((iterable, body)):
+					{
+						expr = ForListExpr(
+							{ loop |
+								iterable = iterable,
+								body = body
+							},
+							typ,
+							loc,
+						),
+						next_fresh = fresh
+					}
+				None:
+					unchanged_tuple_sroa(expr, fresh)
+		ForStringExpr(loop, typ, loc):
+			(children, fresh) = rewritten_tuple_sroa_for_loop(
+				context,
+				loop.iterable,
+				loop.body,
+				next_fresh,
+			)
+
+			match children:
+				Some((iterable, body)):
+					{
+						expr = ForStringExpr(
+							{ loop |
+								iterable = iterable,
+								body = body
+							},
+							typ,
+							loc,
+						),
+						next_fresh = fresh
+					}
+				None:
+					unchanged_tuple_sroa(expr, fresh)
+		ForDictExpr(loop, typ, loc):
+			(children, fresh) = rewritten_tuple_sroa_for_loop(
+				context,
+				loop.iterable,
+				loop.body,
+				next_fresh,
+			)
+
+			match children:
+				Some((iterable, body)):
+					{
+						expr = ForDictExpr(
+							{ loop |
+								iterable = iterable,
+								body = body
+							},
+							typ,
+							loc,
+						),
+						next_fresh = fresh
+					}
+				None:
+					unchanged_tuple_sroa(expr, fresh)
+		ForSetExpr(loop, typ, loc):
+			(children, fresh) = rewritten_tuple_sroa_for_loop(
+				context,
+				loop.iterable,
+				loop.body,
+				next_fresh,
+			)
+
+			match children:
+				Some((iterable, body)):
+					{
+						expr = ForSetExpr(
+							{ loop |
+								iterable = iterable,
+								body = body
+							},
+							typ,
+							loc,
+						),
+						next_fresh = fresh
+					}
+				None:
+					unchanged_tuple_sroa(expr, fresh)
+		ForStreamExpr(loop, typ, loc):
+			(children, fresh) = rewritten_tuple_sroa_for_loop(
+				context,
+				loop.iterable,
+				loop.body,
+				next_fresh,
+			)
+
+			match children:
+				Some((iterable, body)):
+					{
+						expr = ForStreamExpr(
+							{ loop |
+								iterable = iterable,
+								body = body
+							},
+							typ,
+							loc,
+						),
+						next_fresh = fresh
+					}
+				None:
+					unchanged_tuple_sroa(expr, fresh)
+		ForResourceSourceExpr(loop, typ, loc):
+			(children, fresh) = rewritten_tuple_sroa_for_loop(
+				context,
+				loop.iterable,
+				loop.body,
+				next_fresh,
+			)
+
+			match children:
+				Some((iterable, body)):
+					{
+						expr = ForResourceSourceExpr(
+							{ loop |
+								iterable = iterable,
+								body = body
+							},
+							typ,
+							loc,
+						),
+						next_fresh = fresh
+					}
+				None:
+					unchanged_tuple_sroa(expr, fresh)
+		ForTensorExpr(loop, typ, loc):
+			(children, fresh) = rewritten_tuple_sroa_for_loop(
+				context,
+				loop.iterable,
+				loop.body,
+				next_fresh,
+			)
+
+			match children:
+				Some((iterable, body)):
+					{
+						expr = ForTensorExpr(
+							{ loop |
+								iterable = iterable,
+								body = body
+							},
+							typ,
+							loc,
+						),
+						next_fresh = fresh
+					}
+				None:
+					unchanged_tuple_sroa(expr, fresh)
 		ResourceScopeExpr(scope, typ, loc):
 			acquire_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
 				context,
@@ -3629,292 +4631,56 @@ private pure func rewrite_tuple_sroa_expr_from(
 				scope.cleanup,
 				body_result.next_fresh,
 			)
-			{
-				expr = ResourceScopeExpr(
-					{ scope |
-						acquire = acquire_result.expr,
-						body = body_result.expr,
-						cleanup = cleanup_result.expr
-					},
-					typ,
-					loc,
-				),
-				next_fresh = cleanup_result.next_fresh
-			}
+
+			if (
+				same_core_expr(acquire_result.expr, scope.acquire)
+				and same_core_expr(body_result.expr, scope.body)
+				and same_core_expr(cleanup_result.expr, scope.cleanup)
+			):
+				unchanged_tuple_sroa(expr, cleanup_result.next_fresh)
+			else:
+				{
+					expr = ResourceScopeExpr(
+						{ scope |
+							acquire = acquire_result.expr,
+							body = body_result.expr,
+							cleanup = cleanup_result.expr
+						},
+						typ,
+						loc,
+					),
+					next_fresh = cleanup_result.next_fresh
+				}
 		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
 			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
 				context,
 				cleanup_exit.cleanups,
 				next_fresh,
 			)
-			{
-				expr = ResourceCleanupExitExpr(
-					{ cleanup_exit | cleanups = result.items },
-					typ,
-					loc,
-				),
-				next_fresh = result.next_fresh
-			}
-		TailrecLoopExpr(params, return_type, body, loc):
-			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, body, next_fresh)
-			{
-				expr = TailrecLoopExpr(params, return_type, result.expr, loc),
-				next_fresh = result.next_fresh
-			}
-		TailrecRecurExpr(args, typ, loc):
-			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(context, args, next_fresh)
-			{
-				expr = TailrecRecurExpr(result.items, typ, loc),
-				next_fresh = result.next_fresh
-			}
-		TailrecListSpreadLoopExpr(loop, loc):
-			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, loop.body, next_fresh)
-			{
-				expr = TailrecListSpreadLoopExpr({ loop | body = result.expr }, loc),
-				next_fresh = result.next_fresh
-			}
-		TailrecListSpreadRecurExpr(rebinds, cursor_advance, typ, loc):
-			var rewritten: List[CoreTailrecListSpreadRebind] = []
-			var current: Int = next_fresh
 
-			for rebind in rebinds:
-				result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
-					context,
-					rebind.value,
-					current,
-				)
-				rewritten = rewritten.append({ rebind | value = result.expr })
-				current = result.next_fresh
+			if result.changed:
+				{
+					expr = ResourceCleanupExitExpr(
+						{ cleanup_exit | cleanups = result.items },
+						typ,
+						loc,
+					),
+					next_fresh = result.next_fresh
+				}
+			else:
+				unchanged_tuple_sroa(expr, result.next_fresh)
+		_:
+			unchanged_tuple_sroa(expr, next_fresh)
 
-			{
-				expr = TailrecListSpreadRecurExpr(rewritten, cursor_advance, typ, loc),
-				next_fresh = current
-			}
-		ForRangeExpr(binder, start, end_value, body, typ, loc):
-			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
-				context,
-				[start, end_value, body],
-				next_fresh,
-			)
 
-			match result.items:
-				[rewritten_start, rewritten_end, rewritten_body]:
-					{
-						expr = ForRangeExpr(
-							binder,
-							rewritten_start,
-							rewritten_end,
-							rewritten_body,
-							typ,
-							loc,
-						),
-						next_fresh = result.next_fresh
-					}
-				_:
-					{
-						expr = expr,
-						next_fresh = next_fresh
-					}
-		ForChannelExpr(loop, typ, loc):
-			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
-				context,
-				[loop.iterable, loop.body],
-				next_fresh,
-			)
-
-			match result.items:
-				[iterable, body]:
-					{
-						expr = ForChannelExpr(
-							{ loop |
-								iterable = iterable,
-								body = body
-							},
-							typ,
-							loc,
-						),
-						next_fresh = result.next_fresh
-					}
-				_:
-					{
-						expr = expr,
-						next_fresh = next_fresh
-					}
-		ForListExpr(loop, typ, loc):
-			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
-				context,
-				[loop.iterable, loop.body],
-				next_fresh,
-			)
-
-			match result.items:
-				[iterable, body]:
-					{
-						expr = ForListExpr(
-							{ loop |
-								iterable = iterable,
-								body = body
-							},
-							typ,
-							loc,
-						),
-						next_fresh = result.next_fresh
-					}
-				_:
-					{
-						expr = expr,
-						next_fresh = next_fresh
-					}
-		ForStringExpr(loop, typ, loc):
-			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
-				context,
-				[loop.iterable, loop.body],
-				next_fresh,
-			)
-
-			match result.items:
-				[iterable, body]:
-					{
-						expr = ForStringExpr(
-							{ loop |
-								iterable = iterable,
-								body = body
-							},
-							typ,
-							loc,
-						),
-						next_fresh = result.next_fresh
-					}
-				_:
-					{
-						expr = expr,
-						next_fresh = next_fresh
-					}
-		ForDictExpr(loop, typ, loc):
-			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
-				context,
-				[loop.iterable, loop.body],
-				next_fresh,
-			)
-
-			match result.items:
-				[iterable, body]:
-					{
-						expr = ForDictExpr(
-							{ loop |
-								iterable = iterable,
-								body = body
-							},
-							typ,
-							loc,
-						),
-						next_fresh = result.next_fresh
-					}
-				_:
-					{
-						expr = expr,
-						next_fresh = next_fresh
-					}
-		ForSetExpr(loop, typ, loc):
-			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
-				context,
-				[loop.iterable, loop.body],
-				next_fresh,
-			)
-
-			match result.items:
-				[iterable, body]:
-					{
-						expr = ForSetExpr(
-							{ loop |
-								iterable = iterable,
-								body = body
-							},
-							typ,
-							loc,
-						),
-						next_fresh = result.next_fresh
-					}
-				_:
-					{
-						expr = expr,
-						next_fresh = next_fresh
-					}
-		ForStreamExpr(loop, typ, loc):
-			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
-				context,
-				[loop.iterable, loop.body],
-				next_fresh,
-			)
-
-			match result.items:
-				[iterable, body]:
-					{
-						expr = ForStreamExpr(
-							{ loop |
-								iterable = iterable,
-								body = body
-							},
-							typ,
-							loc,
-						),
-						next_fresh = result.next_fresh
-					}
-				_:
-					{
-						expr = expr,
-						next_fresh = next_fresh
-					}
-		ForResourceSourceExpr(loop, typ, loc):
-			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
-				context,
-				[loop.iterable, loop.body],
-				next_fresh,
-			)
-
-			match result.items:
-				[iterable, body]:
-					{
-						expr = ForResourceSourceExpr(
-							{ loop |
-								iterable = iterable,
-								body = body
-							},
-							typ,
-							loc,
-						),
-						next_fresh = result.next_fresh
-					}
-				_:
-					{
-						expr = expr,
-						next_fresh = next_fresh
-					}
-		ForTensorExpr(loop, typ, loc):
-			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
-				context,
-				[loop.iterable, loop.body],
-				next_fresh,
-			)
-
-			match result.items:
-				[iterable, body]:
-					{
-						expr = ForTensorExpr(
-							{ loop |
-								iterable = iterable,
-								body = body
-							},
-							typ,
-							loc,
-						),
-						next_fresh = result.next_fresh
-					}
-				_:
-					{
-						expr = expr,
-						next_fresh = next_fresh
-					}
+-- Pre-closure concurrency blocks and loops, and the raw and semantic matches
+-- this early pass still sees.
+private pure func rewrite_tuple_sroa_concurrency_match_children(
+	context: TupleSroaContext,
+	expr: CoreExpr,
+	next_fresh: Int,
+) -> TupleSroaRewrite:
+	match expr:
 		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
 			iterable_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
 				context,
@@ -3936,19 +4702,28 @@ private pure func rewrite_tuple_sroa_expr_from(
 				loop.limit,
 				timeout_result.next_fresh,
 			)
-			{
-				expr = PreClosureConcurrentlyLoopExpr(
-					{ loop |
-						iterable = iterable_result.expr,
-						body = body_result.expr,
-						timeout = timeout_result.value,
-						limit = limit_result.expr
-					},
-					typ,
-					loc,
-				),
-				next_fresh = limit_result.next_fresh
-			}
+
+			if (
+				same_core_expr(iterable_result.expr, loop.iterable)
+				and same_core_expr(body_result.expr, loop.body)
+				and not timeout_result.changed
+				and same_core_expr(limit_result.expr, loop.limit)
+			):
+				unchanged_tuple_sroa(expr, limit_result.next_fresh)
+			else:
+				{
+					expr = PreClosureConcurrentlyLoopExpr(
+						{ loop |
+							iterable = iterable_result.expr,
+							body = body_result.expr,
+							timeout = timeout_result.value,
+							limit = limit_result.expr
+						},
+						typ,
+						loc,
+					),
+					next_fresh = limit_result.next_fresh
+				}
 		PreClosureConcurrentExpr(block, typ, loc):
 			bindings_result: TupleSroaPreBindingsRewrite = rewrite_tuple_sroa_pre_bindings(
 				context,
@@ -3965,18 +4740,26 @@ private pure func rewrite_tuple_sroa_expr_from(
 				block.timeout,
 				body_result.next_fresh,
 			)
-			{
-				expr = PreClosureConcurrentExpr(
-					{ block |
-						bindings = bindings_result.items,
-						body = body_result.expr,
-						timeout = timeout_result.value
-					},
-					typ,
-					loc,
-				),
-				next_fresh = timeout_result.next_fresh
-			}
+
+			if (
+				not bindings_result.changed
+				and same_core_expr(body_result.expr, block.body)
+				and not timeout_result.changed
+			):
+				unchanged_tuple_sroa(expr, timeout_result.next_fresh)
+			else:
+				{
+					expr = PreClosureConcurrentExpr(
+						{ block |
+							bindings = bindings_result.items,
+							body = body_result.expr,
+							timeout = timeout_result.value
+						},
+						typ,
+						loc,
+					),
+					next_fresh = timeout_result.next_fresh
+				}
 		ConcurrentExpr(block, typ, loc):
 			bindings_result: TupleSroaConcurrentBindingsRewrite = rewrite_tuple_sroa_concurrent_bindings(
 				context,
@@ -3993,46 +4776,26 @@ private pure func rewrite_tuple_sroa_expr_from(
 				block.timeout,
 				body_result.next_fresh,
 			)
-			{
-				expr = ConcurrentExpr(
-					{ block |
-						bindings = bindings_result.items,
-						body = body_result.expr,
-						timeout = timeout_result.value
-					},
-					typ,
-					loc,
-				),
-				next_fresh = timeout_result.next_fresh
-			}
-		SelectExpr(arms, typ, loc):
-			result: TupleSroaSelectArmsRewrite = rewrite_tuple_sroa_select_arms(
-				context,
-				arms,
-				next_fresh,
-			)
-			{
-				expr = SelectExpr(result.items, typ, loc),
-				next_fresh = result.next_fresh
-			}
-		RangeExpr(start, end_value, typ, loc):
-			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
-				context,
-				[start, end_value],
-				next_fresh,
-			)
 
-			match result.items:
-				[rewritten_start, rewritten_end]:
-					{
-						expr = RangeExpr(rewritten_start, rewritten_end, typ, loc),
-						next_fresh = result.next_fresh
-					}
-				_:
-					{
-						expr = expr,
-						next_fresh = next_fresh
-					}
+			if (
+				not bindings_result.changed
+				and same_core_expr(body_result.expr, block.body)
+				and not timeout_result.changed
+			):
+				unchanged_tuple_sroa(expr, timeout_result.next_fresh)
+			else:
+				{
+					expr = ConcurrentExpr(
+						{ block |
+							bindings = bindings_result.items,
+							body = body_result.expr,
+							timeout = timeout_result.value
+						},
+						typ,
+						loc,
+					),
+					next_fresh = timeout_result.next_fresh
+				}
 		RawMatchExpr(scrutinee, cases, typ, loc):
 			scrutinee_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
 				context,
@@ -4044,10 +4807,14 @@ private pure func rewrite_tuple_sroa_expr_from(
 				cases,
 				scrutinee_result.next_fresh,
 			)
-			{
-				expr = RawMatchExpr(scrutinee_result.expr, cases_result.items, typ, loc),
-				next_fresh = cases_result.next_fresh
-			}
+
+			if same_core_expr(scrutinee_result.expr, scrutinee) and not cases_result.changed:
+				unchanged_tuple_sroa(expr, cases_result.next_fresh)
+			else:
+				{
+					expr = RawMatchExpr(scrutinee_result.expr, cases_result.items, typ, loc),
+					next_fresh = cases_result.next_fresh
+				}
 		SemanticMatchExpr(scrutinee, tree, typ, loc):
 			scrutinee_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
 				context,
@@ -4059,31 +4826,24 @@ private pure func rewrite_tuple_sroa_expr_from(
 				tree,
 				scrutinee_result.next_fresh,
 			)
-			{
-				expr = SemanticMatchExpr(scrutinee_result.expr, tree_result.tree, typ, loc),
-				next_fresh = tree_result.next_fresh
-			}
-		IfExpr(cond, then_expr, else_expr, typ, loc):
-			cond_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, cond, next_fresh)
-			then_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
-				context,
-				then_expr,
-				cond_result.next_fresh,
-			)
-			else_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
-				context,
-				else_expr,
-				then_result.next_fresh,
-			)
-			{
-				expr = IfExpr(cond_result.expr, then_result.expr, else_result.expr, typ, loc),
-				next_fresh = else_result.next_fresh
-			}
+
+			if same_core_expr(scrutinee_result.expr, scrutinee) and not tree_result.changed:
+				unchanged_tuple_sroa(expr, tree_result.next_fresh)
+			else:
+				{
+					expr = SemanticMatchExpr(scrutinee_result.expr, tree_result.tree, typ, loc),
+					next_fresh = tree_result.next_fresh
+				}
 		_:
-			{
-				expr = expr,
-				next_fresh = next_fresh
-			}
+			unchanged_tuple_sroa(expr, next_fresh)
+
+
+private pure func rewrite_tuple_sroa_expr_from(
+	context: TupleSroaContext,
+	expr: CoreExpr,
+	next_fresh: Int,
+) -> TupleSroaRewrite:
+	children: TupleSroaRewrite = rewrite_tuple_sroa_children(context, expr, next_fresh)
 
 	scalar_replace_tuple_node(context, children.expr, children.next_fresh)
 
@@ -4108,10 +4868,17 @@ private pure func rewrite_tuple_sroa_function(
 		match function_info.body:
 			Some(body):
 				result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, body, next_fresh)
-				{
-					function_info = { function_info | body = Some(result.expr) },
-					next_fresh = result.next_fresh
-				}
+
+				if same_core_expr(result.expr, body):
+					{
+						function_info = function_info,
+						next_fresh = result.next_fresh
+					}
+				else:
+					{
+						function_info = { function_info | body = Some(result.expr) },
+						next_fresh = result.next_fresh
+					}
 			None:
 				{
 					function_info = function_info,

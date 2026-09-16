@@ -5,7 +5,6 @@
 -- constructs such as record literals and primitive tuple literals itself.
 import:
 	../stage_08_core_lower/list_layout: tensor_for_element_storage_for_canonical_type
-	clone: clone_core_literal, clone_core_source_loc, clone_core_type, clone_core_var
 	ir:
 		CoreBoxKind(
 			Float16Box,
@@ -198,6 +197,8 @@ import:
 		),
 		CoreLogicalOp,
 		CoreProgram,
+		CoreRawMatchCase,
+		CoreRecordCowField,
 		CoreRecordFieldValue,
 		CoreReleasePolicy(
 			ArcReleaseOnlyPolicy,
@@ -279,6 +280,112 @@ import:
 	specialize_layout: generic_hash_container_type_name
 	traverse as CoreTraverse
 	type_policy: is_stack_result_type
+
+
+-- Allocation identity for the reuse rule this pass follows: a prepared child
+-- that is the same allocation as its input proves that the input node can be
+-- handed back as is, so preparation allocates only along the spine to nodes it
+-- actually changed. Core is immutable value data, so sharing subtrees between
+-- input and output is safe. These bind straight to the runtime primitive for
+-- the same bootstrap reason as the matching block in traverse.brp; delete the
+-- blocks together and import `memory: same_object` instead.
+foreign:
+	private pure func same_core_expr(left: CoreExpr, right: CoreExpr) -> Bool = "blorp_same_object"
+	private pure func same_core_exprs(
+		left: List[CoreExpr],
+		right: List[CoreExpr],
+	) -> Bool = "blorp_same_object"
+	private pure func same_core_record_field(
+		left: CoreRecordFieldValue,
+		right: CoreRecordFieldValue,
+	) -> Bool = "blorp_same_object"
+
+
+private pure func same_optional_core_expr(left: Option[CoreExpr], right: Option[CoreExpr]) -> Bool:
+	match left:
+		Some(left_expr):
+			match right:
+				Some(right_expr):
+					same_core_expr(left_expr, right_expr)
+				None:
+					False
+		None:
+			right.is_none()
+
+
+-- Payload helpers below answer `None` for "this value came back unchanged", so
+-- a caller keeps its own input instead of allocating an equal copy first. This
+-- maps a list with such a helper and answers `None` itself when no item
+-- changed, copying the untouched prefix only once an item actually changes.
+private pure func prepare_list_items[T](
+	items: List[T],
+	prepare_item: pure (T) -> Option[T],
+) -> Option[List[T]]:
+	var prepared: List[T] = []
+	var changed: Bool = False
+	var index: Int = 0
+
+	for item in items:
+		match prepare_item(item):
+			Some(prepared_item):
+				prepared = if changed:
+					prepared.append(prepared_item)
+				else:
+					items
+						.take(index)
+						.append(prepared_item)
+
+				changed = True
+			None:
+				if changed:
+					prepared = prepared.append(item)
+				else:
+					void
+
+		index += 1
+
+	if changed:
+		Some(prepared)
+	else:
+		None
+
+
+-- `==` on a payload-carrying union is allocation identity, not structure, so
+-- box kinds compare arm by arm.
+private pure func box_kinds_equal(left: CoreBoxKind, right: CoreBoxKind) -> Bool:
+	match (left, right):
+		(PrimBox, PrimBox):
+			True
+		(PointerBox, PointerBox):
+			True
+		(VoidBox, VoidBox):
+			True
+		(FloatBox, FloatBox):
+			True
+		(Float32Box, Float32Box):
+			True
+		(Float16Box, Float16Box):
+			True
+		(Int128Box, Int128Box):
+			True
+		(UInt128Box, UInt128Box):
+			True
+		(StructBox(left_c_type), StructBox(right_c_type)):
+			left_c_type == right_c_type
+		_:
+			False
+
+
+private pure func same_boxed_storage_value(
+	left: CoreBoxedStorageValue,
+	right: CoreBoxedStorageValue,
+) -> Bool:
+	(
+		same_core_expr(left.value, right.value)
+		and box_kinds_equal(left.kind, right.kind)
+		and left.needs_release == right.needs_release
+		and left.transfers_ownership == right.transfers_ownership
+	)
 
 
 record PreparedTupleLiteral {
@@ -533,26 +640,25 @@ private pure func prepare_exprs(decls: PrepareDecls, exprs: List[CoreExpr]) -> L
 private pure func prepare_tailrec_list_spread_rebind(
 	decls: PrepareDecls,
 	rebind: CoreTailrecListSpreadRebind,
-) -> CoreTailrecListSpreadRebind:
-	{
-		param_index = rebind.param_index,
-		value = prepare_expr(decls, rebind.value)
-	}
+) -> Option[CoreTailrecListSpreadRebind]:
+	prepared_value: CoreExpr = prepare_expr(decls, rebind.value)
+
+	if same_core_expr(prepared_value, rebind.value):
+		None
+	else:
+		Some({ rebind | value = prepared_value })
 
 
 private pure func prepare_tailrec_list_spread_loop(
 	decls: PrepareDecls,
 	loop: CoreTailrecListSpreadLoop,
-) -> CoreTailrecListSpreadLoop:
-	{
-		params = loop.params,
-		return_type = loop.return_type,
-		list_index = loop.list_index,
-		list_param = loop.list_param,
-		cursor = loop.cursor,
-		layout = loop.layout,
-		body = prepare_expr(decls, loop.body)
-	}
+) -> Option[CoreTailrecListSpreadLoop]:
+	prepared_body: CoreExpr = prepare_expr(decls, loop.body)
+
+	if same_core_expr(prepared_body, loop.body):
+		None
+	else:
+		Some({ loop | body = prepared_body })
 
 
 private pure func expr_type(expr: CoreExpr) -> CoreType:
@@ -960,38 +1066,77 @@ private pure func boxed_storage_values_for_exprs(
 	exprs.map(boxed_storage_value_for_expr)
 
 
+private pure func prepare_tuple_element(
+	decls: PrepareDecls,
+	element: CoreTupleElement,
+) -> Option[CoreTupleElement]:
+	match element:
+		TuplePrimElement(value):
+			prepared: CoreExpr = prepare_expr(decls, value)
+
+			if same_core_expr(prepared, value):
+				None
+			else:
+				Some(TuplePrimElement(prepared))
+		TuplePointerElement(value):
+			prepared: CoreExpr = prepare_expr(decls, value)
+
+			if same_core_expr(prepared, value):
+				None
+			else:
+				Some(TuplePointerElement(prepared))
+		TupleStructElement(value, c_type):
+			prepared: CoreExpr = prepare_expr(decls, value)
+
+			if same_core_expr(prepared, value):
+				None
+			else:
+				Some(TupleStructElement(prepared, c_type))
+		TupleStackResultElement(value):
+			prepared: CoreExpr = prepare_expr(decls, value)
+
+			if same_core_expr(prepared, value):
+				None
+			else:
+				Some(TupleStackResultElement(prepared))
+		TupleVoidElement:
+			None
+		TupleFloatElement(value):
+			prepared: CoreExpr = prepare_expr(decls, value)
+
+			if same_core_expr(prepared, value):
+				None
+			else:
+				Some(TupleFloatElement(prepared))
+		TupleFloat32Element(value):
+			prepared: CoreExpr = prepare_expr(decls, value)
+
+			if same_core_expr(prepared, value):
+				None
+			else:
+				Some(TupleFloat32Element(prepared))
+		TupleFloat16Element(value):
+			prepared: CoreExpr = prepare_expr(decls, value)
+
+			if same_core_expr(prepared, value):
+				None
+			else:
+				Some(TupleFloat16Element(prepared))
+
+
 private pure func prepare_tuple_elements(
 	decls: PrepareDecls,
 	elements: List[CoreTupleElement],
-) -> List[CoreTupleElement]:
-	var prepared: List[CoreTupleElement] = []
-
-	for element in elements:
-		match element:
-			TuplePrimElement(value):
-				prepared = prepared.append(TuplePrimElement(prepare_expr(decls, value)))
-			TuplePointerElement(value):
-				prepared = prepared.append(TuplePointerElement(prepare_expr(decls, value)))
-			TupleStructElement(value, c_type):
-				prepared = prepared.append(TupleStructElement(prepare_expr(decls, value), c_type))
-			TupleStackResultElement(value):
-				prepared = prepared.append(TupleStackResultElement(prepare_expr(decls, value)))
-			TupleVoidElement:
-				prepared = prepared.append(TupleVoidElement)
-			TupleFloatElement(value):
-				prepared = prepared.append(TupleFloatElement(prepare_expr(decls, value)))
-			TupleFloat32Element(value):
-				prepared = prepared.append(TupleFloat32Element(prepare_expr(decls, value)))
-			TupleFloat16Element(value):
-				prepared = prepared.append(TupleFloat16Element(prepare_expr(decls, value)))
-
-	prepared
+) -> Option[List[CoreTupleElement]]:
+	prepare_list_items(elements, func(element): prepare_tuple_element(decls, element))
 
 
+-- Recomputes the box kind and release flag from the prepared value exactly as
+-- before; the input is kept only when those come out equal as well.
 private pure func prepare_boxed_storage_value(
 	decls: PrepareDecls,
 	value: CoreBoxedStorageValue,
-) -> CoreBoxedStorageValue:
+) -> Option[CoreBoxedStorageValue]:
 	prepared_value: CoreExpr = prepare_expr(decls, value.value)
 	kind: CoreBoxKind = boxed_kind_for_expr(prepared_value)
 
@@ -1000,27 +1145,35 @@ private pure func prepare_boxed_storage_value(
 	else:
 		value.needs_release
 
-	{
-		kind = kind,
-		value = prepared_value,
-		needs_release = needs_release,
-		transfers_ownership = value.transfers_ownership
-	}
+	if (
+		same_core_expr(prepared_value, value.value)
+		and box_kinds_equal(kind, value.kind)
+		and needs_release == value.needs_release
+	):
+		None
+	else:
+		Some({
+			kind = kind,
+			value = prepared_value,
+			needs_release = needs_release,
+			transfers_ownership = value.transfers_ownership,
+		})
 
 
-private pure func prepare_box_op(decls: PrepareDecls, box: CoreBoxOp) -> CoreBoxOp:
-	{
-		kind = box.kind,
-		value = prepare_expr(decls, box.value),
-		source_type = box.source_type
-	}
+private pure func prepare_box_op(decls: PrepareDecls, box: CoreBoxOp) -> Option[CoreBoxOp]:
+	prepared_value: CoreExpr = prepare_expr(decls, box.value)
+
+	if same_core_expr(prepared_value, box.value):
+		None
+	else:
+		Some({ box | value = prepared_value })
 
 
 private pure func prepare_boxed_storage_values(
 	decls: PrepareDecls,
 	values: List[CoreBoxedStorageValue],
-) -> List[CoreBoxedStorageValue]:
-	values.map(func(value): prepare_boxed_storage_value(decls, value))
+) -> Option[List[CoreBoxedStorageValue]]:
+	prepare_list_items(values, func(value): prepare_boxed_storage_value(decls, value))
 
 
 private pure func is_stack_result_value_type(typ: CoreType) -> Bool:
@@ -1067,269 +1220,403 @@ private pure func prepare_list_storage_value(
 				value
 
 
-private pure func prepare_dict_entry(decls: PrepareDecls, entry: CoreDictEntry) -> CoreDictEntry:
-	{
-		key = prepare_boxed_storage_value(decls, entry.key),
-		value = prepare_boxed_storage_value(decls, entry.value)
-	}
+private pure func prepare_dict_entry(
+	decls: PrepareDecls,
+	entry: CoreDictEntry,
+) -> Option[CoreDictEntry]:
+	prepared_key: Option[CoreBoxedStorageValue] = prepare_boxed_storage_value(decls, entry.key)
+	prepared_value: Option[CoreBoxedStorageValue] = prepare_boxed_storage_value(decls, entry.value)
+
+	if prepared_key.is_none() and prepared_value.is_none():
+		None
+	else:
+		Some({
+			key = prepared_key.get_or(entry.key),
+			value = prepared_value.get_or(entry.value),
+		})
 
 
 private pure func prepare_dict_construct(
 	decls: PrepareDecls,
 	construct: CoreDictConstruct,
-) -> CoreDictConstruct:
-	{
-		constructor = construct.constructor,
-		entries = construct.entries.map(func(entry): prepare_dict_entry(decls, entry)),
-		value_needs_release = construct.value_needs_release
-	}
+) -> Option[CoreDictConstruct]:
+	match prepare_list_items(construct.entries, func(entry): prepare_dict_entry(decls, entry)):
+		Some(entries):
+			Some({ construct | entries = entries })
+		None:
+			None
+
+
+-- Element preparation and storage-layout normalization used to run as two
+-- full list rebuilds. Folding them per element keeps an element that comes
+-- out field-for-field equal to its input instead of replacing it with a copy.
+private pure func prepare_list_construct_element(
+	decls: PrepareDecls,
+	layout: CoreListStorageLayout,
+	value: CoreBoxedStorageValue,
+) -> Option[CoreBoxedStorageValue]:
+	prepared: CoreBoxedStorageValue = prepare_boxed_storage_value(decls, value).get_or(value)
+	stored: CoreBoxedStorageValue = prepare_list_storage_value(layout, prepared)
+
+	if same_boxed_storage_value(stored, value):
+		None
+	else:
+		Some(stored)
 
 
 private pure func prepare_list_construct(
 	decls: PrepareDecls,
 	construct: CoreListConstruct,
-) -> CoreListConstruct:
-	prepared_elements: List[CoreBoxedStorageValue] = prepare_boxed_storage_values(
-		decls,
+) -> Option[CoreListConstruct]:
+	match prepare_list_items(
 		construct.elements,
-	)
-
-	{
-		layout = construct.layout,
-		elements = prepared_elements.map(
-			func(value): prepare_list_storage_value(construct.layout, value),
-		),
-		elem_needs_release = construct.elem_needs_release
-	}
+		func(value): prepare_list_construct_element(decls, construct.layout, value),
+	):
+		Some(elements):
+			Some({ construct | elements = elements })
+		None:
+			None
 
 
-private pure func prepare_list_alloc(decls: PrepareDecls, alloc: CoreListAlloc) -> CoreListAlloc:
-	{
-		layout = alloc.layout,
-		capacity = prepare_expr(decls, alloc.capacity),
-		elem_needs_release = alloc.elem_needs_release
-	}
+private pure func prepare_list_alloc(
+	decls: PrepareDecls,
+	alloc: CoreListAlloc,
+) -> Option[CoreListAlloc]:
+	prepared_capacity: CoreExpr = prepare_expr(decls, alloc.capacity)
+
+	if same_core_expr(prepared_capacity, alloc.capacity):
+		None
+	else:
+		Some({ alloc | capacity = prepared_capacity })
 
 
-private pure func prepare_list_get(decls: PrepareDecls, get: CoreListGet) -> CoreListGet:
-	{
-		layout = get.layout,
-		list = prepare_expr(decls, get.list),
-		index = prepare_expr(decls, get.index),
-		bounds = get.bounds
-	}
+private pure func prepare_list_get(decls: PrepareDecls, get: CoreListGet) -> Option[CoreListGet]:
+	prepared_list: CoreExpr = prepare_expr(decls, get.list)
+	prepared_index: CoreExpr = prepare_expr(decls, get.index)
+
+	if same_core_expr(prepared_list, get.list) and same_core_expr(prepared_index, get.index):
+		None
+	else:
+		Some({ get |
+				list = prepared_list,
+				index = prepared_index
+			})
 
 
 private pure func prepare_list_handoff(
 	decls: PrepareDecls,
 	handoff: CoreListHandoff,
-) -> CoreListHandoff:
-	{
-		mode = handoff.mode,
-		layout = handoff.layout,
-		elem_needs_release = handoff.elem_needs_release,
-		source = prepare_expr(decls, handoff.source),
-		source_var = handoff.source_var,
-		source_type = handoff.source_type,
-		result_type = handoff.result_type,
-		capacity = prepare_expr(decls, handoff.capacity),
-		result_var = handoff.result_var,
-		len_var = handoff.len_var,
-		out_var = handoff.out_var,
-		body = prepare_expr(decls, handoff.body),
-		write_order = handoff.write_order
-	}
+) -> Option[CoreListHandoff]:
+	prepared_source: CoreExpr = prepare_expr(decls, handoff.source)
+	prepared_capacity: CoreExpr = prepare_expr(decls, handoff.capacity)
+	prepared_body: CoreExpr = prepare_expr(decls, handoff.body)
+
+	if (
+		same_core_expr(prepared_source, handoff.source)
+		and same_core_expr(prepared_capacity, handoff.capacity)
+		and same_core_expr(prepared_body, handoff.body)
+	):
+		None
+	else:
+		Some({ handoff |
+				source = prepared_source,
+				capacity = prepared_capacity,
+				body = prepared_body
+			})
 
 
 private pure func prepare_list_handoff_set_source_slot(
 	decls: PrepareDecls,
 	slot: CoreListHandoffSetSourceSlot,
-) -> CoreListHandoffSetSourceSlot:
-	{
-		result = prepare_expr(decls, slot.result),
-		out_index = prepare_expr(decls, slot.out_index),
-		source = prepare_expr(decls, slot.source),
-		source_index = prepare_expr(decls, slot.source_index)
-	}
+) -> Option[CoreListHandoffSetSourceSlot]:
+	prepared_result: CoreExpr = prepare_expr(decls, slot.result)
+	prepared_out_index: CoreExpr = prepare_expr(decls, slot.out_index)
+	prepared_source: CoreExpr = prepare_expr(decls, slot.source)
+	prepared_source_index: CoreExpr = prepare_expr(decls, slot.source_index)
+
+	if (
+		same_core_expr(prepared_result, slot.result)
+		and same_core_expr(prepared_out_index, slot.out_index)
+		and same_core_expr(prepared_source, slot.source)
+		and same_core_expr(prepared_source_index, slot.source_index)
+	):
+		None
+	else:
+		Some({
+			result = prepared_result,
+			out_index = prepared_out_index,
+			source = prepared_source,
+			source_index = prepared_source_index,
+		})
 
 
 private pure func prepare_string_byte_read(
 	decls: PrepareDecls,
 	read: CoreStringByteRead,
-) -> CoreStringByteRead:
-	{
-		source = prepare_expr(decls, read.source),
-		index = prepare_expr(decls, read.index)
-	}
+) -> Option[CoreStringByteRead]:
+	prepared_source: CoreExpr = prepare_expr(decls, read.source)
+	prepared_index: CoreExpr = prepare_expr(decls, read.index)
+
+	if same_core_expr(prepared_source, read.source) and same_core_expr(prepared_index, read.index):
+		None
+	else:
+		Some({
+			source = prepared_source,
+			index = prepared_index,
+		})
 
 
 private pure func prepare_string_byte_write(
 	decls: PrepareDecls,
 	write: CoreStringByteWrite,
-) -> CoreStringByteWrite:
-	{
-		target = prepare_expr(decls, write.target),
-		index = prepare_expr(decls, write.index),
-		byte = prepare_expr(decls, write.byte)
-	}
+) -> Option[CoreStringByteWrite]:
+	prepared_target: CoreExpr = prepare_expr(decls, write.target)
+	prepared_index: CoreExpr = prepare_expr(decls, write.index)
+	prepared_byte: CoreExpr = prepare_expr(decls, write.byte)
+
+	if (
+		same_core_expr(prepared_target, write.target)
+		and same_core_expr(prepared_index, write.index)
+		and same_core_expr(prepared_byte, write.byte)
+	):
+		None
+	else:
+		Some({
+			target = prepared_target,
+			index = prepared_index,
+			byte = prepared_byte,
+		})
 
 
 private pure func prepare_string_byte_copy(
 	decls: PrepareDecls,
 	copy: CoreStringByteCopy,
-) -> CoreStringByteCopy:
-	{
-		dst = prepare_expr(decls, copy.dst),
-		dst_pos = prepare_expr(decls, copy.dst_pos),
-		src = prepare_expr(decls, copy.src),
-		src_pos = prepare_expr(decls, copy.src_pos),
-		len = prepare_expr(decls, copy.len)
-	}
+) -> Option[CoreStringByteCopy]:
+	prepared_dst: CoreExpr = prepare_expr(decls, copy.dst)
+	prepared_dst_pos: CoreExpr = prepare_expr(decls, copy.dst_pos)
+	prepared_src: CoreExpr = prepare_expr(decls, copy.src)
+	prepared_src_pos: CoreExpr = prepare_expr(decls, copy.src_pos)
+	prepared_len: CoreExpr = prepare_expr(decls, copy.len)
+
+	if (
+		same_core_expr(prepared_dst, copy.dst)
+		and same_core_expr(prepared_dst_pos, copy.dst_pos)
+		and same_core_expr(prepared_src, copy.src)
+		and same_core_expr(prepared_src_pos, copy.src_pos)
+		and same_core_expr(prepared_len, copy.len)
+	):
+		None
+	else:
+		Some({
+			dst = prepared_dst,
+			dst_pos = prepared_dst_pos,
+			src = prepared_src,
+			src_pos = prepared_src_pos,
+			len = prepared_len,
+		})
 
 
 private pure func prepare_tensor_raw_read(
 	decls: PrepareDecls,
 	read: CoreTensorRawRead,
-) -> CoreTensorRawRead:
-	{
-		view = read.view,
-		kind = read.kind,
-		index = prepare_expr(decls, read.index)
-	}
+) -> Option[CoreTensorRawRead]:
+	prepared_index: CoreExpr = prepare_expr(decls, read.index)
+
+	if same_core_expr(prepared_index, read.index):
+		None
+	else:
+		Some({ read | index = prepared_index })
 
 
 private pure func prepare_tensor_raw_write(
 	decls: PrepareDecls,
 	write: CoreTensorRawWrite,
-) -> CoreTensorRawWrite:
-	{
-		view = write.view,
-		kind = write.kind,
-		index = prepare_expr(decls, write.index),
-		value = prepare_expr(decls, write.value)
-	}
+) -> Option[CoreTensorRawWrite]:
+	prepared_index: CoreExpr = prepare_expr(decls, write.index)
+	prepared_value: CoreExpr = prepare_expr(decls, write.value)
+
+	if same_core_expr(prepared_index, write.index) and same_core_expr(prepared_value, write.value):
+		None
+	else:
+		Some({ write |
+				index = prepared_index,
+				value = prepared_value
+			})
 
 
 private pure func prepare_tensor_literal(
 	decls: PrepareDecls,
 	literal: CoreTensorLiteral,
-) -> CoreTensorLiteral:
-	{
-		shape = literal.shape,
-		payload = prepare_tensor_literal_payload(decls, literal.payload)
-	}
+) -> Option[CoreTensorLiteral]:
+	match prepare_tensor_literal_payload(decls, literal.payload):
+		Some(payload):
+			Some({ literal | payload = payload })
+		None:
+			None
 
 
 private pure func prepare_tensor_literal_payload(
 	decls: PrepareDecls,
 	payload: CoreTensorLiteralPayload,
-) -> CoreTensorLiteralPayload:
+) -> Option[CoreTensorLiteralPayload]:
 	match payload:
 		TensorRawLiteralPayload(raw):
-			TensorRawLiteralPayload({
-				raw_kind = raw.raw_kind,
-				elements = prepare_exprs(decls, raw.elements),
-			})
+			prepared_elements: List[CoreExpr] = prepare_exprs(decls, raw.elements)
+
+			if same_core_exprs(prepared_elements, raw.elements):
+				None
+			else:
+				Some(TensorRawLiteralPayload({ raw | elements = prepared_elements }))
 		TensorInlineStructLiteralPayload(inline_struct):
-			TensorInlineStructLiteralPayload({
-				struct_c_type = inline_struct.struct_c_type,
-				elements = prepare_exprs(decls, inline_struct.elements),
-			})
+			prepared_elements: List[CoreExpr] = prepare_exprs(decls, inline_struct.elements)
+
+			if same_core_exprs(prepared_elements, inline_struct.elements):
+				None
+			else:
+				Some(
+					TensorInlineStructLiteralPayload(
+						{ inline_struct | elements = prepared_elements },
+					),
+				)
 
 
 private pure func prepare_tensor_boxed_literal(
 	decls: PrepareDecls,
 	literal: CoreTensorBoxedLiteral,
-) -> CoreTensorBoxedLiteral:
-	{
-		shape = literal.shape,
-		elements = prepare_boxed_storage_values(decls, literal.elements),
-		elem_needs_release = literal.elem_needs_release
-	}
+) -> Option[CoreTensorBoxedLiteral]:
+	match prepare_boxed_storage_values(decls, literal.elements):
+		Some(elements):
+			Some({ literal | elements = elements })
+		None:
+			None
 
 
 private pure func prepare_tensor_packed_literal(
 	decls: PrepareDecls,
 	literal: CoreTensorPackedLiteral,
-) -> CoreTensorPackedLiteral:
-	{
-		shape = literal.shape,
-		elem_size = literal.elem_size,
-		elements = prepare_exprs(decls, literal.elements)
-	}
+) -> Option[CoreTensorPackedLiteral]:
+	prepared_elements: List[CoreExpr] = prepare_exprs(decls, literal.elements)
+
+	if same_core_exprs(prepared_elements, literal.elements):
+		None
+	else:
+		Some({ literal | elements = prepared_elements })
 
 
 private pure func prepare_tensor_raw_fill(
 	decls: PrepareDecls,
 	fill: CoreTensorRawFill,
-) -> CoreTensorRawFill:
-	{
-		raw_kind = fill.raw_kind,
-		value = prepare_expr(decls, fill.value),
-		dims = prepare_exprs(decls, fill.dims)
-	}
+) -> Option[CoreTensorRawFill]:
+	prepared_value: CoreExpr = prepare_expr(decls, fill.value)
+	prepared_dims: List[CoreExpr] = prepare_exprs(decls, fill.dims)
+
+	if same_core_expr(prepared_value, fill.value) and same_core_exprs(prepared_dims, fill.dims):
+		None
+	else:
+		Some({ fill |
+				value = prepared_value,
+				dims = prepared_dims
+			})
 
 
 private pure func prepare_tensor_raw_view_binding(
 	decls: PrepareDecls,
 	binding: CoreTensorRawViewBinding,
-) -> CoreTensorRawViewBinding:
-	{
-		variable = binding.variable,
-		kind = binding.kind,
-		source = prepare_expr(decls, binding.source)
-	}
+) -> Option[CoreTensorRawViewBinding]:
+	prepared_source: CoreExpr = prepare_expr(decls, binding.source)
+
+	if same_core_expr(prepared_source, binding.source):
+		None
+	else:
+		Some({ binding | source = prepared_source })
 
 
 private pure func prepare_string_set_len(
 	decls: PrepareDecls,
 	set_len: CoreStringSetLen,
-) -> CoreStringSetLen:
-	{
-		target = prepare_expr(decls, set_len.target),
-		len = prepare_expr(decls, set_len.len)
-	}
+) -> Option[CoreStringSetLen]:
+	prepared_target: CoreExpr = prepare_expr(decls, set_len.target)
+	prepared_len: CoreExpr = prepare_expr(decls, set_len.len)
+
+	if (
+		same_core_expr(prepared_target, set_len.target)
+		and same_core_expr(prepared_len, set_len.len)
+	):
+		None
+	else:
+		Some({
+			target = prepared_target,
+			len = prepared_len,
+		})
 
 
-private pure func prepare_list_set(decls: PrepareDecls, set: CoreListSet) -> CoreListSet:
-	{
-		layout = set.layout,
-		list = prepare_expr(decls, set.list),
-		index = prepare_expr(decls, set.index),
-		value = prepare_boxed_storage_value(decls, set.value),
-		value_is_stack_result = set.value_is_stack_result
-	}
+private pure func prepare_list_set(decls: PrepareDecls, set: CoreListSet) -> Option[CoreListSet]:
+	prepared_list: CoreExpr = prepare_expr(decls, set.list)
+	prepared_index: CoreExpr = prepare_expr(decls, set.index)
+	prepared_value: Option[CoreBoxedStorageValue] = prepare_boxed_storage_value(decls, set.value)
+
+	if (
+		same_core_expr(prepared_list, set.list)
+		and same_core_expr(prepared_index, set.index)
+		and prepared_value.is_none()
+	):
+		None
+	else:
+		Some({ set |
+				list = prepared_list,
+				index = prepared_index,
+				value = prepared_value.get_or(set.value)
+			})
 
 
-private pure func prepare_list_swap(decls: PrepareDecls, swap: CoreListSwap) -> CoreListSwap:
-	{
-		layout = swap.layout,
-		list = prepare_expr(decls, swap.list),
-		left_index = prepare_expr(decls, swap.left_index),
-		right_index = prepare_expr(decls, swap.right_index)
-	}
+private pure func prepare_list_swap(
+	decls: PrepareDecls,
+	swap: CoreListSwap,
+) -> Option[CoreListSwap]:
+	prepared_list: CoreExpr = prepare_expr(decls, swap.list)
+	prepared_left_index: CoreExpr = prepare_expr(decls, swap.left_index)
+	prepared_right_index: CoreExpr = prepare_expr(decls, swap.right_index)
+
+	if (
+		same_core_expr(prepared_list, swap.list)
+		and same_core_expr(prepared_left_index, swap.left_index)
+		and same_core_expr(prepared_right_index, swap.right_index)
+	):
+		None
+	else:
+		Some({ swap |
+				list = prepared_list,
+				left_index = prepared_left_index,
+				right_index = prepared_right_index
+			})
 
 
 private pure func prepare_list_retain(
 	decls: PrepareDecls,
 	retain: CoreListRetain,
-) -> CoreListRetain:
-	{
-		list = prepare_expr(decls, retain.list),
-		value = prepare_boxed_storage_value(decls, retain.value)
-	}
+) -> Option[CoreListRetain]:
+	prepared_list: CoreExpr = prepare_expr(decls, retain.list)
+	prepared_value: Option[CoreBoxedStorageValue] = prepare_boxed_storage_value(decls, retain.value)
+
+	if same_core_expr(prepared_list, retain.list) and prepared_value.is_none():
+		None
+	else:
+		Some({
+			list = prepared_list,
+			value = prepared_value.get_or(retain.value),
+		})
 
 
 private pure func prepare_concurrent_binding(
 	decls: PrepareDecls,
 	binding: CoreConcurrentBinding,
-) -> CoreConcurrentBinding:
-	{
-		variable = binding.variable,
-		typ = binding.typ,
-		rhs = prepare_expr(decls, binding.rhs),
-		task = binding.task
-	}
+) -> Option[CoreConcurrentBinding]:
+	prepared_rhs: CoreExpr = prepare_expr(decls, binding.rhs)
+
+	if same_core_expr(prepared_rhs, binding.rhs):
+		None
+	else:
+		Some({ binding | rhs = prepared_rhs })
 
 
 private pure func prepare_optional_expr(
@@ -1342,62 +1629,106 @@ private pure func prepare_optional_expr(
 private pure func prepare_concurrently_loop(
 	decls: PrepareDecls,
 	loop: CoreConcurrentlyLoop,
-) -> CoreConcurrentlyLoop:
-	{
-		variable = loop.variable,
-		item_type = loop.item_type,
-		item_mode = loop.item_mode,
-		iterable = prepare_expr(decls, loop.iterable),
-		body = prepare_expr(decls, loop.body),
-		timeout = prepare_optional_expr(decls, loop.timeout),
-		limit = prepare_expr(decls, loop.limit),
-		output = loop.output,
-		task = loop.task
-	}
+) -> Option[CoreConcurrentlyLoop]:
+	prepared_iterable: CoreExpr = prepare_expr(decls, loop.iterable)
+	prepared_body: CoreExpr = prepare_expr(decls, loop.body)
+	prepared_timeout: Option[CoreExpr] = prepare_optional_expr(decls, loop.timeout)
+	prepared_limit: CoreExpr = prepare_expr(decls, loop.limit)
+
+	if (
+		same_core_expr(prepared_iterable, loop.iterable)
+		and same_core_expr(prepared_body, loop.body)
+		and same_optional_core_expr(prepared_timeout, loop.timeout)
+		and same_core_expr(prepared_limit, loop.limit)
+	):
+		None
+	else:
+		Some({ loop |
+				iterable = prepared_iterable,
+				body = prepared_body,
+				timeout = prepared_timeout,
+				limit = prepared_limit
+			})
 
 
 private pure func prepare_concurrent_block(
 	decls: PrepareDecls,
 	block: CoreConcurrentBlock,
-) -> CoreConcurrentBlock:
-	{
-		bindings = block.bindings.map(func(binding): prepare_concurrent_binding(decls, binding)),
-		body = prepare_expr(decls, block.body),
-		timeout = prepare_optional_expr(decls, block.timeout),
-		max_threads = block.max_threads
-	}
+) -> Option[CoreConcurrentBlock]:
+	prepared_bindings: Option[List[CoreConcurrentBinding]] = prepare_list_items(
+		block.bindings,
+		func(binding): prepare_concurrent_binding(decls, binding),
+	)
+	prepared_body: CoreExpr = prepare_expr(decls, block.body)
+	prepared_timeout: Option[CoreExpr] = prepare_optional_expr(decls, block.timeout)
+
+	if (
+		prepared_bindings.is_none()
+		and same_core_expr(prepared_body, block.body)
+		and same_optional_core_expr(prepared_timeout, block.timeout)
+	):
+		None
+	else:
+		Some({ block |
+				bindings = prepared_bindings.get_or(block.bindings),
+				body = prepared_body,
+				timeout = prepared_timeout
+			})
 
 
 private pure func prepare_select_recv_arm(
 	decls: PrepareDecls,
 	recv: CoreSelectRecvArm,
-) -> CoreSelectRecvArm:
-	{
-		binder = recv.binder,
-		elem_type = recv.elem_type,
-		channel = prepare_expr(decls, recv.channel)
-	}
+) -> Option[CoreSelectRecvArm]:
+	prepared_channel: CoreExpr = prepare_expr(decls, recv.channel)
+
+	if same_core_expr(prepared_channel, recv.channel):
+		None
+	else:
+		Some({ recv | channel = prepared_channel })
 
 
 private pure func prepare_select_arm_kind(
 	decls: PrepareDecls,
 	kind: CoreSelectArmKind,
-) -> CoreSelectArmKind:
+) -> Option[CoreSelectArmKind]:
 	match kind:
 		SelectRecvArm(recv):
-			SelectRecvArm(prepare_select_recv_arm(decls, recv))
+			match prepare_select_recv_arm(decls, recv):
+				Some(prepared_recv):
+					Some(SelectRecvArm(prepared_recv))
+				None:
+					None
 		SelectSealedArm(channel):
-			SelectSealedArm(prepare_expr(decls, channel))
+			prepared_channel: CoreExpr = prepare_expr(decls, channel)
+
+			if same_core_expr(prepared_channel, channel):
+				None
+			else:
+				Some(SelectSealedArm(prepared_channel))
 		SelectAfterArm(timeout):
-			SelectAfterArm(prepare_expr(decls, timeout))
+			prepared_timeout: CoreExpr = prepare_expr(decls, timeout)
+
+			if same_core_expr(prepared_timeout, timeout):
+				None
+			else:
+				Some(SelectAfterArm(prepared_timeout))
 
 
-private pure func prepare_select_arm(decls: PrepareDecls, arm: CoreSelectArm) -> CoreSelectArm:
-	{
-		kind = prepare_select_arm_kind(decls, arm.kind),
-		body = prepare_expr(decls, arm.body),
-		loc = arm.loc
-	}
+private pure func prepare_select_arm(
+	decls: PrepareDecls,
+	arm: CoreSelectArm,
+) -> Option[CoreSelectArm]:
+	prepared_kind: Option[CoreSelectArmKind] = prepare_select_arm_kind(decls, arm.kind)
+	prepared_body: CoreExpr = prepare_expr(decls, arm.body)
+
+	if prepared_kind.is_none() and same_core_expr(prepared_body, arm.body):
+		None
+	else:
+		Some({ arm |
+				kind = prepared_kind.get_or(arm.kind),
+				body = prepared_body
+			})
 
 
 pure func is_primitive_tuple_slot_type(typ: CoreType) -> Bool:
@@ -1876,6 +2207,33 @@ private pure func tensor_for_element_storage_after_raw_proof(
 			)
 
 
+-- Rebinds `variable` for the body's storage environment and hands `expr` back
+-- when neither the right-hand side nor the body was rewritten.
+private pure func annotate_tensor_storage_let_expr(
+	env: List[TensorStorageBinding],
+	expr: CoreExpr,
+	variable: CoreVar,
+	is_mutable: Bool,
+	value_type: CoreType,
+	rhs: CoreExpr,
+	annotated_rhs: CoreExpr,
+	body: CoreExpr,
+) -> CoreExpr:
+	next_env: List[TensorStorageBinding] = tensor_storage_env_after_binding(
+		env,
+		variable,
+		is_mutable,
+		value_type,
+		annotated_rhs,
+	)
+	annotated_body: CoreExpr = annotate_tensor_storage_expr(next_env, body)
+
+	if same_core_expr(annotated_rhs, rhs) and same_core_expr(annotated_body, body):
+		expr
+	else:
+		LetExpr(variable, is_mutable, value_type, annotated_rhs, annotated_body)
+
+
 private pure func annotate_tensor_storage_expr(
 	env: List[TensorStorageBinding],
 	expr: CoreExpr,
@@ -1894,49 +2252,37 @@ private pure func annotate_tensor_storage_expr(
 							):
 								annotate_tensor_storage_expr(env, then_expr)
 							else:
-								next_env: List[TensorStorageBinding] = tensor_storage_env_after_binding(
+								annotate_tensor_storage_let_expr(
 									env,
+									expr,
 									variable,
 									is_mutable,
 									value_type,
+									rhs,
 									annotated_rhs,
-								)
-								LetExpr(
-									variable,
-									is_mutable,
-									value_type,
-									annotated_rhs,
-									annotate_tensor_storage_expr(next_env, body),
+									body,
 								)
 						_:
-							next_env: List[TensorStorageBinding] = tensor_storage_env_after_binding(
+							annotate_tensor_storage_let_expr(
 								env,
+								expr,
 								variable,
 								is_mutable,
 								value_type,
+								rhs,
 								annotated_rhs,
-							)
-							LetExpr(
-								variable,
-								is_mutable,
-								value_type,
-								annotated_rhs,
-								annotate_tensor_storage_expr(next_env, body),
+								body,
 							)
 				_:
-					next_env: List[TensorStorageBinding] = tensor_storage_env_after_binding(
+					annotate_tensor_storage_let_expr(
 						env,
+						expr,
 						variable,
 						is_mutable,
 						value_type,
+						rhs,
 						annotated_rhs,
-					)
-					LetExpr(
-						variable,
-						is_mutable,
-						value_type,
-						annotated_rhs,
-						annotate_tensor_storage_expr(next_env, body),
+						body,
 					)
 		BorrowLetExpr(variable, value_type, rhs, body):
 			annotated_rhs: CoreExpr = annotate_tensor_storage_expr(env, rhs)
@@ -1947,64 +2293,73 @@ private pure func annotate_tensor_storage_expr(
 				value_type,
 				annotated_rhs,
 			)
-			BorrowLetExpr(
-				variable,
-				value_type,
-				annotated_rhs,
-				annotate_tensor_storage_expr(next_env, body),
-			)
+			annotated_body: CoreExpr = annotate_tensor_storage_expr(next_env, body)
+
+			if same_core_expr(annotated_rhs, rhs) and same_core_expr(annotated_body, body):
+				expr
+			else:
+				BorrowLetExpr(variable, value_type, annotated_rhs, annotated_body)
 		DropExpr(variable, value_type, release_policy, body, typ, loc):
-			DropExpr(
-				variable,
-				value_type,
-				release_policy,
-				annotate_tensor_storage_expr(
-					tensor_storage_env_without(env, variable),
-					body,
-				),
-				typ,
-				loc,
+			annotated_body: CoreExpr = annotate_tensor_storage_expr(
+				tensor_storage_env_without(env, variable),
+				body,
 			)
+
+			if same_core_expr(annotated_body, body):
+				expr
+			else:
+				DropExpr(variable, value_type, release_policy, annotated_body, typ, loc)
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
-			DupExpr(
-				variable,
-				value_type,
-				retain_policy,
-				annotate_tensor_storage_expr(env, body),
-				typ,
-				loc,
-			)
+			annotated_body: CoreExpr = annotate_tensor_storage_expr(env, body)
+
+			if same_core_expr(annotated_body, body):
+				expr
+			else:
+				DupExpr(variable, value_type, retain_policy, annotated_body, typ, loc)
 		SeqExpr(first, second):
-			SeqExpr(
-				annotate_tensor_storage_expr(env, first),
-				annotate_tensor_storage_expr(env, second),
-			)
+			annotated_first: CoreExpr = annotate_tensor_storage_expr(env, first)
+			annotated_second: CoreExpr = annotate_tensor_storage_expr(env, second)
+
+			if same_core_expr(annotated_first, first) and same_core_expr(annotated_second, second):
+				expr
+			else:
+				SeqExpr(annotated_first, annotated_second)
 		IfExpr(cond, then_expr, else_expr, typ, loc):
 			annotated_cond: CoreExpr = annotate_tensor_storage_expr(env, cond)
 
 			if tensor_storage_guard_proven(env, annotated_cond):
 				annotate_tensor_storage_expr(env, then_expr)
 			else:
-				IfExpr(
-					annotated_cond,
-					annotate_tensor_storage_expr(env, then_expr),
-					annotate_tensor_storage_expr(env, else_expr),
-					typ,
-					loc,
-				)
+				annotated_then: CoreExpr = annotate_tensor_storage_expr(env, then_expr)
+				annotated_else: CoreExpr = annotate_tensor_storage_expr(env, else_expr)
+
+				if (
+					same_core_expr(annotated_cond, cond)
+					and same_core_expr(annotated_then, then_expr)
+					and same_core_expr(annotated_else, else_expr)
+				):
+					expr
+				else:
+					IfExpr(annotated_cond, annotated_then, annotated_else, typ, loc)
 		ForRangeExpr(binder, start, end_value, body, typ, loc):
-			ForRangeExpr(
-				binder,
-				annotate_tensor_storage_expr(env, start),
-				annotate_tensor_storage_expr(env, end_value),
-				annotate_tensor_storage_expr(
-					tensor_storage_env_without(env, binder.variable),
-					body,
-				),
-				typ,
-				loc,
+			annotated_start: CoreExpr = annotate_tensor_storage_expr(env, start)
+			annotated_end: CoreExpr = annotate_tensor_storage_expr(env, end_value)
+			annotated_body: CoreExpr = annotate_tensor_storage_expr(
+				tensor_storage_env_without(env, binder.variable),
+				body,
 			)
+
+			if (
+				same_core_expr(annotated_start, start)
+				and same_core_expr(annotated_end, end_value)
+				and same_core_expr(annotated_body, body)
+			):
+				expr
+			else:
+				ForRangeExpr(binder, annotated_start, annotated_end, annotated_body, typ, loc)
 		ForTensorExpr(for_tensor, typ, loc):
+			-- The element storage is re-derived from the loop's proof state, so
+			-- this node is always rebuilt.
 			annotated_iterable: CoreExpr = annotate_tensor_storage_expr(env, for_tensor.iterable)
 			element_storage: CoreTensorForElementStorage = tensor_for_element_storage_after_raw_proof(
 				env,
@@ -2028,26 +2383,32 @@ private pure func annotate_tensor_storage_expr(
 				loc,
 			)
 		TensorRawViewLetExpr(binding, body, typ, loc):
-			TensorRawViewLetExpr(
-				{
-					variable = binding.variable,
-					kind = binding.kind,
-					source = annotate_tensor_storage_expr(env, binding.source)
-				},
-				annotate_tensor_storage_expr(
-					tensor_storage_env_without(env, binding.variable),
-					body,
-				),
-				typ,
-				loc,
+			annotated_source: CoreExpr = annotate_tensor_storage_expr(env, binding.source)
+			annotated_body: CoreExpr = annotate_tensor_storage_expr(
+				tensor_storage_env_without(env, binding.variable),
+				body,
 			)
+
+			if (
+				same_core_expr(annotated_source, binding.source)
+				and same_core_expr(annotated_body, body)
+			):
+				expr
+			else:
+				TensorRawViewLetExpr(
+					{ binding | source = annotated_source },
+					annotated_body,
+					typ,
+					loc,
+				)
 		WhileExpr(cond, body, typ, loc):
-			WhileExpr(
-				annotate_tensor_storage_expr(env, cond),
-				annotate_tensor_storage_expr(env, body),
-				typ,
-				loc,
-			)
+			annotated_cond: CoreExpr = annotate_tensor_storage_expr(env, cond)
+			annotated_body: CoreExpr = annotate_tensor_storage_expr(env, body)
+
+			if same_core_expr(annotated_cond, cond) and same_core_expr(annotated_body, body):
+				expr
+			else:
+				WhileExpr(annotated_cond, annotated_body, typ, loc)
 		_:
 			expr
 
@@ -2376,51 +2737,35 @@ private pure func prepared_tuple_literal(
 
 private pure func prepare_tuple_expr(
 	decls: PrepareDecls,
+	expr: CoreExpr,
 	items: List[CoreExpr],
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> CoreExpr:
 	prepared_items: List[CoreExpr] = prepare_exprs(decls, items)
 
-	match typ:
+	prepared_literal: Option[PreparedTupleLiteral] = match typ:
 		TupleType(item_types):
-			match prepared_tuple_literal(prepared_items, item_types):
-				Some(prepared):
-					TupleConstructExpr(
-						{
-							elements = prepared.elements,
-							release_mask = prepared.release_mask,
-							retain_mask = prepared.retain_mask
-						},
-						clone_core_type(typ),
-						clone_core_source_loc(loc),
-					)
-				None:
-					TupleExpr(prepared_items, clone_core_type(typ), clone_core_source_loc(loc))
-		NamedType(name, args):
-			TupleExpr(prepared_items, typ, loc)
-		TypeParameterType(_) | SelfType:
-			TupleExpr(prepared_items, typ, loc)
-		StackResultType(ok_type, err_type):
-			TupleExpr(prepared_items, typ, loc)
-		BoxedResultType(ok_type, err_type):
-			TupleExpr(prepared_items, typ, loc)
-		FunctionType(_, _, _):
-			TupleExpr(prepared_items, typ, loc)
-		EnumType(name):
-			TupleExpr(prepared_items, typ, loc)
-		ValueRecordType(name):
-			TupleExpr(prepared_items, typ, loc)
-		HeapRecordType(name):
-			TupleExpr(prepared_items, typ, loc)
-		UnionType(name):
-			TupleExpr(prepared_items, typ, loc)
-		RangeType:
-			TupleExpr(prepared_items, typ, loc)
-		TensorType(info):
-			TupleExpr(prepared_items, typ, loc)
-		VoidType:
-			TupleExpr(prepared_items, typ, loc)
+			prepared_tuple_literal(prepared_items, item_types)
+		_:
+			None
+
+	match prepared_literal:
+		Some(prepared):
+			TupleConstructExpr(
+				{
+					elements = prepared.elements,
+					release_mask = prepared.release_mask,
+					retain_mask = prepared.retain_mask
+				},
+				typ,
+				loc,
+			)
+		None:
+			if same_core_exprs(prepared_items, items):
+				expr
+			else:
+				TupleExpr(prepared_items, typ, loc)
 
 
 private pure func vector_element_type(typ: CoreType) -> Option[CoreType]:
@@ -2636,6 +2981,7 @@ private pure func flatten_vector_literal_items(items: List[CoreExpr]) -> Flatten
 
 private pure func prepare_vector_expr(
 	decls: PrepareDecls,
+	expr: CoreExpr,
 	items: List[CoreExpr],
 	typ: CoreType,
 	loc: CoreSourceLoc,
@@ -2711,7 +3057,10 @@ private pure func prepare_vector_expr(
 								loc,
 							)
 		None:
-			VectorExpr(prepared_items, typ, loc)
+			if same_core_exprs(prepared_items, items):
+				expr
+			else:
+				VectorExpr(prepared_items, typ, loc)
 
 
 private record DictKeyValueTypes {
@@ -2797,171 +3146,230 @@ private pure func box_dict_literal_entry(entry: CoreDictLiteralEntry) -> CoreDic
 	}
 
 
-private pure func lower_dict_literal_expr(
+private pure func dict_literal_construct_expr(
 	decls: PrepareDecls,
 	entries: List[CoreDictLiteralEntry],
+	types: DictKeyValueTypes,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	value_kind: CoreBoxKind = boxed_kind_for_type(types.value_type)
+	DictConstructExpr(
+		{
+			constructor = hash_container_constructor_for_key_type(decls, types.key_type),
+			entries = entries.map(box_dict_literal_entry),
+			value_needs_release = boxed_storage_type_needs_release(types.value_type, value_kind)
+		},
+		typ,
+		loc,
+	)
+
+
+-- Lowers the dict literal `expr` whose entries were already prepared.
+-- `prepared_entries` is `None` when every entry came back unchanged, so a
+-- literal whose type cannot be lowered yet is handed back as `expr` itself.
+private pure func lower_dict_literal_expr(
+	decls: PrepareDecls,
+	expr: CoreExpr,
+	entries: List[CoreDictLiteralEntry],
+	prepared_entries: Option[List[CoreDictLiteralEntry]],
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> CoreExpr:
 	match dict_key_value_types(typ):
 		Some(types):
-			value_kind: CoreBoxKind = boxed_kind_for_type(types.value_type)
-			DictConstructExpr(
-				{
-					constructor = hash_container_constructor_for_key_type(decls, types.key_type),
-					entries = entries.map(box_dict_literal_entry),
-					value_needs_release = boxed_storage_type_needs_release(
-						types.value_type,
-						value_kind,
-					)
-				},
+			dict_literal_construct_expr(
+				decls,
+				prepared_entries.get_or(entries),
+				types,
 				typ,
 				loc,
 			)
 		None:
-			DictExpr(entries, typ, loc)
+			match prepared_entries:
+				Some(changed_entries):
+					DictExpr(changed_entries, typ, loc)
+				None:
+					expr
 
 
 private pure func prepare_dict_literal_entry(
 	decls: PrepareDecls,
 	entry: CoreDictLiteralEntry,
-) -> CoreDictLiteralEntry:
-	{
-		key = prepare_expr(decls, entry.key),
-		value = prepare_expr(decls, entry.value)
-	}
+) -> Option[CoreDictLiteralEntry]:
+	prepared_key: CoreExpr = prepare_expr(decls, entry.key)
+	prepared_value: CoreExpr = prepare_expr(decls, entry.value)
+
+	if same_core_expr(prepared_key, entry.key) and same_core_expr(prepared_value, entry.value):
+		None
+	else:
+		Some({
+			key = prepared_key,
+			value = prepared_value,
+		})
 
 
 private pure func prepare_dict_expr(
 	decls: PrepareDecls,
+	expr: CoreExpr,
 	entries: List[CoreDictLiteralEntry],
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> CoreExpr:
-	prepared_entries: List[CoreDictLiteralEntry] = entries.map(
-		func(entry): prepare_dict_literal_entry(decls, entry),
+	lower_dict_literal_expr(
+		decls,
+		expr,
+		entries,
+		prepare_list_items(entries, func(entry): prepare_dict_literal_entry(decls, entry)),
+		typ,
+		loc,
 	)
 
-	lower_dict_literal_expr(decls, prepared_entries, typ, loc)
+
+private pure func prepare_record_field(
+	decls: PrepareDecls,
+	field: CoreRecordFieldValue,
+) -> Option[CoreRecordFieldValue]:
+	prepared_value: CoreExpr = prepare_expr(decls, field.value)
+
+	if same_core_expr(prepared_value, field.value):
+		None
+	else:
+		Some({ field | value = prepared_value })
 
 
 private pure func prepare_record_fields(
 	decls: PrepareDecls,
 	fields: List[CoreRecordFieldValue],
-) -> List[CoreRecordFieldValue]:
-	fields.map(func(field):
-		{
-			name = field.name,
-			value = prepare_expr(decls, field.value)
-		}
-	)
+) -> Option[List[CoreRecordFieldValue]]:
+	prepare_list_items(fields, func(field): prepare_record_field(decls, field))
 
 
-private pure func prepare_record_expr(
+private pure func prepare_record_cow_field(
 	decls: PrepareDecls,
-	fields: List[CoreRecordFieldValue],
-	typ: CoreType,
-	loc: CoreSourceLoc,
-) -> CoreExpr:
-	prepared_fields: List[CoreRecordFieldValue] = prepare_record_fields(decls, fields)
+	field: CoreRecordCowField,
+) -> Option[CoreRecordCowField]:
+	match field.replacement:
+		Some(replacement):
+			prepared_replacement: CoreExpr = prepare_expr(decls, replacement)
 
+			if same_core_expr(prepared_replacement, replacement):
+				None
+			else:
+				Some({ field | replacement = Some(prepared_replacement) })
+		None:
+			None
+
+
+-- The declaration-ordered fields of a record literal whose type names a
+-- declared value or heap record, paired with that record's name. `None` when
+-- the type is not such a record or the literal does not cover its fields.
+private pure func declaration_ordered_record_fields(
+	decls: PrepareDecls,
+	typ: CoreType,
+	fields: List[CoreRecordFieldValue],
+) -> Option[(String, List[CoreRecordFieldValue])]:
 	match typ:
 		ValueRecordType(name):
 			match find_value_record_decl(decls, name):
 				Some(record_decl):
-					match order_value_record_fields(record_decl, prepared_fields):
+					match order_value_record_fields(record_decl, fields):
 						Some(ordered_fields):
-							RecordConstructExpr(name, ordered_fields, typ, loc)
+							Some((name, ordered_fields))
 						None:
-							RecordExpr(prepared_fields, typ, loc)
+							None
 				None:
-					RecordExpr(prepared_fields, typ, loc)
-		NamedType(name, args):
-			RecordExpr(prepared_fields, typ, loc)
-		TypeParameterType(_) | SelfType:
-			RecordExpr(prepared_fields, typ, loc)
-		StackResultType(ok_type, err_type):
-			RecordExpr(prepared_fields, typ, loc)
-		BoxedResultType(ok_type, err_type):
-			RecordExpr(prepared_fields, typ, loc)
-		FunctionType(_, _, _):
-			RecordExpr(prepared_fields, typ, loc)
+					None
 		HeapRecordType(name):
 			match find_heap_record_decl(decls, name):
 				Some(record_decl):
-					match order_heap_record_fields(record_decl, prepared_fields):
+					match order_heap_record_fields(record_decl, fields):
 						Some(ordered_fields):
-							RecordConstructExpr(name, ordered_fields, typ, loc)
+							Some((name, ordered_fields))
 						None:
-							RecordExpr(prepared_fields, typ, loc)
+							None
 				None:
-					RecordExpr(prepared_fields, typ, loc)
-		EnumType(name):
-			RecordExpr(prepared_fields, typ, loc)
-		UnionType(name):
-			RecordExpr(prepared_fields, typ, loc)
-		RangeType:
-			RecordExpr(prepared_fields, typ, loc)
-		TensorType(info):
-			RecordExpr(prepared_fields, typ, loc)
-		VoidType:
-			RecordExpr(prepared_fields, typ, loc)
-		TupleType(items):
-			RecordExpr(prepared_fields, typ, loc)
+					None
+		_:
+			None
+
+
+-- True when `ordered` lists exactly the allocations of `fields` in the same
+-- order. Ordering always builds a fresh list, so this is what lets a construct
+-- whose fields already follow declaration order keep its own field list.
+private pure func same_record_field_order(
+	ordered: List[CoreRecordFieldValue],
+	fields: List[CoreRecordFieldValue],
+) -> Bool:
+	var same: Bool = ordered.length() == fields.length()
+	var index: Int = 0
+
+	for field in fields:
+		if not same:
+			break
+
+		match ordered.get(index):
+			Some(ordered_field):
+				if not same_core_record_field(ordered_field, field):
+					same = False
+			None:
+				same = False
+
+		index += 1
+
+	same
+
+
+private pure func prepare_record_expr(
+	decls: PrepareDecls,
+	expr: CoreExpr,
+	fields: List[CoreRecordFieldValue],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	prepared_fields: Option[List[CoreRecordFieldValue]] = prepare_record_fields(decls, fields)
+
+	match declaration_ordered_record_fields(
+		decls,
+		typ,
+		prepared_fields.get_or(fields),
+	):
+		Some((name, ordered_fields)):
+			RecordConstructExpr(name, ordered_fields, typ, loc)
+		None:
+			match prepared_fields:
+				Some(changed_fields):
+					RecordExpr(changed_fields, typ, loc)
+				None:
+					expr
 
 
 private pure func prepare_record_construct_expr(
 	decls: PrepareDecls,
+	expr: CoreExpr,
 	type_name: String,
 	fields: List[CoreRecordFieldValue],
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> CoreExpr:
-	prepared_fields: List[CoreRecordFieldValue] = prepare_record_fields(decls, fields)
+	prepared_fields: Option[List[CoreRecordFieldValue]] = prepare_record_fields(decls, fields)
 
-	match typ:
-		ValueRecordType(name):
-			match find_value_record_decl(decls, name):
-				Some(record_decl):
-					match order_value_record_fields(record_decl, prepared_fields):
-						Some(ordered_fields):
-							RecordConstructExpr(type_name, ordered_fields, typ, loc)
-						None:
-							RecordConstructExpr(type_name, prepared_fields, typ, loc)
+	match declaration_ordered_record_fields(
+		decls,
+		typ,
+		prepared_fields.get_or(fields),
+	):
+		Some((_, ordered_fields)):
+			if prepared_fields.is_none() and same_record_field_order(ordered_fields, fields):
+				expr
+			else:
+				RecordConstructExpr(type_name, ordered_fields, typ, loc)
+		None:
+			match prepared_fields:
+				Some(changed_fields):
+					RecordConstructExpr(type_name, changed_fields, typ, loc)
 				None:
-					RecordConstructExpr(type_name, prepared_fields, typ, loc)
-		HeapRecordType(name):
-			match find_heap_record_decl(decls, name):
-				Some(record_decl):
-					match order_heap_record_fields(record_decl, prepared_fields):
-						Some(ordered_fields):
-							RecordConstructExpr(type_name, ordered_fields, typ, loc)
-						None:
-							RecordConstructExpr(type_name, prepared_fields, typ, loc)
-				None:
-					RecordConstructExpr(type_name, prepared_fields, typ, loc)
-		NamedType(name, args):
-			RecordConstructExpr(type_name, prepared_fields, typ, loc)
-		TypeParameterType(_) | SelfType:
-			RecordConstructExpr(type_name, prepared_fields, typ, loc)
-		StackResultType(ok_type, err_type):
-			RecordConstructExpr(type_name, prepared_fields, typ, loc)
-		BoxedResultType(ok_type, err_type):
-			RecordConstructExpr(type_name, prepared_fields, typ, loc)
-		FunctionType(_, _, _):
-			RecordConstructExpr(type_name, prepared_fields, typ, loc)
-		EnumType(name):
-			RecordConstructExpr(type_name, prepared_fields, typ, loc)
-		UnionType(name):
-			RecordConstructExpr(type_name, prepared_fields, typ, loc)
-		RangeType:
-			RecordConstructExpr(type_name, prepared_fields, typ, loc)
-		TensorType(info):
-			RecordConstructExpr(type_name, prepared_fields, typ, loc)
-		VoidType:
-			RecordConstructExpr(type_name, prepared_fields, typ, loc)
-		TupleType(items):
-			RecordConstructExpr(type_name, prepared_fields, typ, loc)
+					expr
 
 
 private pure func stack_option_c_type(payload: CoreType) -> Option[String]:
@@ -3670,69 +4078,104 @@ private pure func prepare_union_construct(
 			None
 
 
+private pure func prepare_literal_match_case(
+	decls: PrepareDecls,
+	match_case: CoreLiteralMatchCase,
+) -> Option[CoreLiteralMatchCase]:
+	prepared_body: CoreExpr = prepare_expr(decls, match_case.body)
+
+	if same_core_expr(prepared_body, match_case.body):
+		None
+	else:
+		Some({ match_case | body = prepared_body })
+
+
 private pure func prepare_literal_match_cases(
 	decls: PrepareDecls,
 	cases: List[CoreLiteralMatchCase],
-) -> List[CoreLiteralMatchCase]:
-	cases.map(func(match_case):
-		{
-			literal = match_case.literal,
-			bindings = match_case.bindings,
-			body = prepare_expr(decls, match_case.body)
-		}
-	)
+) -> Option[List[CoreLiteralMatchCase]]:
+	prepare_list_items(cases, func(match_case): prepare_literal_match_case(decls, match_case))
 
 
 private pure func prepare_literal_match_fallback(
 	decls: PrepareDecls,
 	fallback: CoreLiteralMatchFallback,
-) -> CoreLiteralMatchFallback:
+) -> Option[CoreLiteralMatchFallback]:
 	match fallback:
 		LiteralMatchFallbackBody(body):
-			LiteralMatchFallbackBody(prepare_expr(decls, body))
+			prepared_body: CoreExpr = prepare_expr(decls, body)
+
+			if same_core_expr(prepared_body, body):
+				None
+			else:
+				Some(LiteralMatchFallbackBody(prepared_body))
 		LiteralMatchFallbackBindings(bindings, body):
-			LiteralMatchFallbackBindings(
-				bindings,
-				prepare_expr(decls, body),
-			)
+			prepared_body: CoreExpr = prepare_expr(decls, body)
+
+			if same_core_expr(prepared_body, body):
+				None
+			else:
+				Some(LiteralMatchFallbackBindings(bindings, prepared_body))
 		LiteralMatchFallbackFail:
-			LiteralMatchFallbackFail
+			None
 
 
 private pure func prepare_constructor_literal_match(
 	decls: PrepareDecls,
 	match_expr: CoreConstructorLiteralMatch,
-) -> CoreConstructorLiteralMatch:
-	{
-		accessor = match_expr.accessor,
-		scrutinee_type = match_expr.scrutinee_type,
-		cases = prepare_literal_match_cases(decls, match_expr.cases),
-		fallback = prepare_literal_match_fallback(decls, match_expr.fallback),
-		result_type = match_expr.result_type,
-		loc = match_expr.loc
-	}
+) -> Option[CoreConstructorLiteralMatch]:
+	prepared_cases: Option[List[CoreLiteralMatchCase]] = prepare_literal_match_cases(
+		decls,
+		match_expr.cases,
+	)
+	prepared_fallback: Option[CoreLiteralMatchFallback] = prepare_literal_match_fallback(
+		decls,
+		match_expr.fallback,
+	)
+
+	if prepared_cases.is_none() and prepared_fallback.is_none():
+		None
+	else:
+		Some({ match_expr |
+				cases = prepared_cases.get_or(match_expr.cases),
+				fallback = prepared_fallback.get_or(match_expr.fallback)
+			})
 
 
 private pure func prepare_constructor_length_match_branch(
 	decls: PrepareDecls,
 	branch: CoreConstructorLengthMatchBranch,
-) -> CoreConstructorLengthMatchBranch:
-	{
-		bindings = branch.bindings,
-		body = prepare_constructor_match_body(decls, branch.body)
-	}
+) -> Option[CoreConstructorLengthMatchBranch]:
+	match prepare_constructor_match_body(decls, branch.body):
+		Some(body):
+			Some({ branch | body = body })
+		None:
+			None
 
 
+private pure func prepare_constructor_length_match_case(
+	decls: PrepareDecls,
+	match_case: CoreConstructorLengthMatchCase,
+) -> Option[CoreConstructorLengthMatchCase]:
+	match prepare_constructor_length_match_branch(decls, match_case.branch):
+		Some(branch):
+			Some({ match_case | branch = branch })
+		None:
+			None
+
+
+-- `None` also covers an absent case, so the caller keeps its input either way.
 private pure func prepare_constructor_length_match_geq(
 	decls: PrepareDecls,
 	geq_case: Option[CoreConstructorLengthMatchGeq],
 ) -> Option[CoreConstructorLengthMatchGeq]:
 	match geq_case:
 		Some(existing_case):
-			Some({
-				minimum_length = existing_case.minimum_length,
-				branch = prepare_constructor_length_match_branch(decls, existing_case.branch),
-			})
+			match prepare_constructor_length_match_branch(decls, existing_case.branch):
+				Some(branch):
+					Some({ existing_case | branch = branch })
+				None:
+					None
 		None:
 			None
 
@@ -3743,7 +4186,7 @@ private pure func prepare_constructor_length_match_fallback(
 ) -> Option[CoreConstructorLengthMatchBranch]:
 	match fallback:
 		Some(branch):
-			Some(prepare_constructor_length_match_branch(decls, branch))
+			prepare_constructor_length_match_branch(decls, branch)
 		None:
 			None
 
@@ -3751,77 +4194,131 @@ private pure func prepare_constructor_length_match_fallback(
 private pure func prepare_constructor_length_match(
 	decls: PrepareDecls,
 	match_expr: CoreConstructorLengthMatch,
-) -> CoreConstructorLengthMatch:
-	{
-		accessor = match_expr.accessor,
-		cases = match_expr.cases.map(func(match_case): {
-				length = match_case.length,
-				branch = prepare_constructor_length_match_branch(decls, match_case.branch)
-			}),
-		geq = prepare_constructor_length_match_geq(decls, match_expr.geq),
-		fallback = prepare_constructor_length_match_fallback(decls, match_expr.fallback),
-		result_type = match_expr.result_type,
-		loc = match_expr.loc
-	}
+) -> Option[CoreConstructorLengthMatch]:
+	prepared_cases: Option[List[CoreConstructorLengthMatchCase]] = prepare_list_items(
+		match_expr.cases,
+		func(match_case): prepare_constructor_length_match_case(decls, match_case),
+	)
+	prepared_geq: Option[CoreConstructorLengthMatchGeq] = prepare_constructor_length_match_geq(
+		decls,
+		match_expr.geq,
+	)
+	prepared_fallback: Option[CoreConstructorLengthMatchBranch] = prepare_constructor_length_match_fallback(
+		decls,
+		match_expr.fallback,
+	)
+
+	if (
+		prepared_cases.is_none()
+		and prepared_geq.is_none()
+		and prepared_fallback.is_none()
+	):
+		None
+	else:
+		geq: Option[CoreConstructorLengthMatchGeq] = if prepared_geq.is_some():
+			prepared_geq
+		else:
+			match_expr.geq
+
+		fallback: Option[CoreConstructorLengthMatchBranch] = if prepared_fallback.is_some():
+			prepared_fallback
+		else:
+			match_expr.fallback
+
+		Some({ match_expr |
+				cases = prepared_cases.get_or(match_expr.cases),
+				geq = geq,
+				fallback = fallback
+			})
 
 
 private pure func prepare_constructor_match_body(
 	decls: PrepareDecls,
 	body: CoreConstructorMatchBody,
-) -> CoreConstructorMatchBody:
+) -> Option[CoreConstructorMatchBody]:
 	match body:
 		ConstructorMatchBodyExpr(expr):
-			ConstructorMatchBodyExpr(prepare_expr(decls, expr))
+			prepared: CoreExpr = prepare_expr(decls, expr)
+
+			if same_core_expr(prepared, expr):
+				None
+			else:
+				Some(ConstructorMatchBodyExpr(prepared))
 		ConstructorMatchBodyLiteral(match_expr):
-			ConstructorMatchBodyLiteral(prepare_constructor_literal_match(decls, match_expr))
+			match prepare_constructor_literal_match(decls, match_expr):
+				Some(prepared):
+					Some(ConstructorMatchBodyLiteral(prepared))
+				None:
+					None
 		ConstructorMatchBodyLength(match_expr):
-			ConstructorMatchBodyLength(prepare_constructor_length_match(decls, match_expr))
+			match prepare_constructor_length_match(decls, match_expr):
+				Some(prepared):
+					Some(ConstructorMatchBodyLength(prepared))
+				None:
+					None
+
+
+private pure func prepare_constructor_match_case(
+	decls: PrepareDecls,
+	match_case: CoreConstructorMatchCase,
+) -> Option[CoreConstructorMatchCase]:
+	match prepare_constructor_match_body(decls, match_case.body):
+		Some(body):
+			Some({ match_case | body = body })
+		None:
+			None
 
 
 private pure func prepare_constructor_match_cases(
 	decls: PrepareDecls,
 	cases: List[CoreConstructorMatchCase],
-) -> List[CoreConstructorMatchCase]:
-	cases.map(func(match_case):
-		{
-			constructor = match_case.constructor,
-			accessor = match_case.accessor,
-			test = match_case.test,
-			bindings = match_case.bindings,
-			body = prepare_constructor_match_body(decls, match_case.body)
-		}
-	)
+) -> Option[List[CoreConstructorMatchCase]]:
+	prepare_list_items(cases, func(match_case): prepare_constructor_match_case(decls, match_case))
 
 
 private pure func prepare_constructor_match_fallback(
 	decls: PrepareDecls,
 	fallback: CoreConstructorMatchFallback,
-) -> CoreConstructorMatchFallback:
+) -> Option[CoreConstructorMatchFallback]:
 	match fallback:
 		ConstructorMatchFallbackBody(body):
-			ConstructorMatchFallbackBody(prepare_expr(decls, body))
+			prepared_body: CoreExpr = prepare_expr(decls, body)
+
+			if same_core_expr(prepared_body, body):
+				None
+			else:
+				Some(ConstructorMatchFallbackBody(prepared_body))
 		ConstructorMatchFallbackBindings(bindings, body):
-			ConstructorMatchFallbackBindings(
-				bindings,
-				prepare_expr(decls, body),
-			)
+			prepared_body: CoreExpr = prepare_expr(decls, body)
+
+			if same_core_expr(prepared_body, body):
+				None
+			else:
+				Some(ConstructorMatchFallbackBindings(bindings, prepared_body))
 		ConstructorMatchFallbackFail:
-			ConstructorMatchFallbackFail
+			None
 
 
-private pure func clone_core_var_expr(
-	variable: CoreVar,
-	typ: CoreType,
-	loc: CoreSourceLoc,
-) -> CoreExpr:
-	VarExpr(clone_core_var(variable), clone_core_type(typ), clone_core_source_loc(loc))
+private pure func prepare_raw_match_case(
+	decls: PrepareDecls,
+	match_case: CoreRawMatchCase,
+) -> Option[CoreRawMatchCase]:
+	prepared_body: CoreExpr = prepare_expr(decls, match_case.body)
+
+	if same_core_expr(prepared_body, match_case.body):
+		None
+	else:
+		Some({ match_case | body = prepared_body })
 
 
 private union PrepareLogicalTask:
 	PrepareLogicalNode(CoreExpr)
-	RebuildPreparedLogicalNode(CoreLogicalOp, CoreType, CoreSourceLoc)
+	RebuildPreparedLogicalNode(CoreExpr)
 
 
+-- Long `and`/`or` chains form deep Core trees; walk them iteratively. The
+-- rebuild task carries the source node so an unchanged pair of sides hands
+-- that node back instead of an equal copy.
 private pure func prepare_logical_expr(decls: PrepareDecls, expr: CoreExpr) -> CoreExpr:
 	var tasks: List[PrepareLogicalTask] = [PrepareLogicalNode(expr)]
 	var task_count: Int = 1
@@ -3839,9 +4336,7 @@ private pure func prepare_logical_expr(decls: PrepareDecls, expr: CoreExpr) -> C
 						match current_expr:
 							LogicalExpr(op, left, right, typ, loc):
 								rebuild_task: PrepareLogicalTask = RebuildPreparedLogicalNode(
-									op,
-									typ,
-									loc,
+									current_expr,
 								)
 
 								tasks = if task_count < tasks.length():
@@ -3877,14 +4372,26 @@ private pure func prepare_logical_expr(decls: PrepareDecls, expr: CoreExpr) -> C
 									prepared.append(prepared_expr)
 
 								prepared_count += 1
-					RebuildPreparedLogicalNode(op, typ, loc):
-						match (prepared.get(prepared_count - 2), prepared.get(prepared_count - 1)):
-							(Some(left), Some(right)):
-								prepared = prepared.set(
-									prepared_count - 2,
-									LogicalExpr(op, left, right, typ, loc),
-								)
-								prepared_count -= 1
+					RebuildPreparedLogicalNode(source_expr):
+						match source_expr:
+							LogicalExpr(op, left, right, typ, loc):
+								match (
+									prepared.get(prepared_count - 2),
+									prepared.get(prepared_count - 1),
+								):
+									(Some(prepared_left), Some(prepared_right)):
+										rebuilt: CoreExpr = if (
+											same_core_expr(prepared_left, left)
+											and same_core_expr(prepared_right, right)
+										):
+											source_expr
+										else:
+											LogicalExpr(op, prepared_left, prepared_right, typ, loc)
+
+										prepared = prepared.set(prepared_count - 2, rebuilt)
+										prepared_count -= 1
+									_:
+										valid = False
 							_:
 								valid = False
 			None:
@@ -3896,661 +4403,909 @@ private pure func prepare_logical_expr(decls: PrepareDecls, expr: CoreExpr) -> C
 		expr
 
 
+-- Every arm prepares its children exactly as it always has and answers `expr`
+-- itself when every prepared child and child container came back as the same
+-- allocation; only genuine shape changes (constructor calls, record and tuple
+-- literals, dict literals, stack Option `None`) build new nodes.
+--
+-- This dispatcher binds nothing and forwards to one small arm group, so a deep
+-- Core tree costs a shallow native frame per level: one match over every
+-- constructor would reserve stack for all of its arms' locals at once and
+-- overflow the default stack at -O0 on large generated suites.
 private pure func prepare_expr(decls: PrepareDecls, expr: CoreExpr) -> CoreExpr:
 	match expr:
-		LiteralExpr(literal, typ, loc):
-			LiteralExpr(
-				clone_core_literal(literal),
-				clone_core_type(typ),
-				clone_core_source_loc(loc),
-			)
-		StaticStringLiteralExpr(id, value, typ, loc):
-			StaticStringLiteralExpr(
-				id,
-				"" + value,
-				clone_core_type(typ),
-				clone_core_source_loc(loc),
-			)
+		LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _) | VarExpr(_, _, _) | VoidExpr(_, _) | CooperativeCheckpointExpr(_, _) | BreakExpr(_, _) | ContinueExpr(_, _) | SetAllocExpr(_, _, _) | ClosureCreateExpr(_, _, _) | DetachExpr(_, _, _):
+			prepare_leaf_expr(decls, expr)
+		DebugBlockExpr(_, _, _) | BinaryExpr(_, _, _, _, _) | UnaryExpr(_, _, _, _) | LogicalExpr(_, _, _, _, _) | AssignExpr(_, _, _, _) | CastExpr(_, _, _) | UnboxExpr(_, _, _, _) | FieldExpr(_, _, _, _) | TupleFieldExpr(_, _, _, _) | BoxExpr(_, _, _) | PreClosureDetachExpr(_, _, _) | DupExpr(_, _, _, _, _, _) | DropExpr(_, _, _, _, _, _) | LetExpr(_, _, _, _, _) | BorrowLetExpr(_, _, _, _) | SeqExpr(_, _) | WhileExpr(_, _, _, _) | RangeExpr(_, _, _, _) | IfExpr(_, _, _, _, _):
+			prepare_operator_expr(decls, expr)
+		CallExpr(_, _, _, _, _) | TupleExpr(_, _, _) | TupleConstructExpr(_, _, _) | VectorExpr(_, _, _) | ListConstructExpr(_, _, _) | DictExpr(_, _, _) | DictConstructExpr(_, _, _) | RecordExpr(_, _, _) | RecordUpdateExpr(_, _, _, _) | RecordReuseExpr(_, _, _, _) | RecordCowUpdateExpr(_, _, _, _) | RecordConstructExpr(_, _, _, _) | UnionConstructExpr(_, _, _) | UnionReuseConstructExpr(_, _, _) | SelectExpr(_, _, _):
+			prepare_aggregate_expr(decls, expr)
+		ListAllocExpr(_, _, _) | ListGetExpr(_, _, _) | ListHandoffExpr(_, _, _) | ListHandoffSetOwnedExpr(_, _, _) | ListHandoffSetSourceSlotExpr(_, _, _) | ListRetainExpr(_, _, _) | ListSetExpr(_, _, _) | ListSwapExpr(_, _, _) | StringByteReadExpr(_, _, _) | StringByteWriteExpr(_, _, _) | StringByteCopyExpr(_, _, _) | StringSetLenExpr(_, _, _) | TensorLiteralExpr(_, _, _) | TensorBoxedLiteralExpr(_, _, _) | TensorPackedLiteralExpr(_, _, _) | TensorRawFillExpr(_, _, _) | TensorRawReadExpr(_, _, _) | TensorRawWriteExpr(_, _, _) | TensorRawViewLetExpr(_, _, _, _):
+			prepare_storage_expr(decls, expr)
+		LambdaExpr(_, _, _, _, _, _) | TailrecLoopExpr(_, _, _, _) | TailrecRecurExpr(_, _, _) | TailrecListSpreadLoopExpr(_, _) | TailrecListSpreadRecurExpr(_, _, _, _) | ForRangeExpr(_, _, _, _, _, _) | ForChannelExpr(_, _, _) | ForListExpr(_, _, _) | ForStringExpr(_, _, _) | ForDictExpr(_, _, _) | ForSetExpr(_, _, _) | ForStreamExpr(_, _, _) | ForResourceSourceExpr(_, _, _) | ForTensorExpr(_, _, _) | ResourceScopeExpr(_, _, _) | ResourceCleanupExitExpr(_, _, _):
+			prepare_loop_expr(decls, expr)
+		PreClosureConcurrentlyLoopExpr(_, _, _) | ConcurrentlyLoopExpr(_, _, _) | PreClosureConcurrentExpr(_, _, _) | ConcurrentExpr(_, _, _):
+			prepare_concurrency_expr(decls, expr)
+		RawMatchExpr(_, _, _, _) | SemanticMatchExpr(_, _, _, _) | LiteralMatchExpr(_, _, _, _, _) | AccessorLiteralMatchExpr(_, _, _, _, _) | LengthMatchExpr(_, _, _, _, _) | ConstructorMatchExpr(_, _, _, _, _, _):
+			prepare_match_expr(decls, expr)
+
+
+-- A bare `None` reference to a stack-represented Option becomes an explicit
+-- construct; every other variable reference is handed back as is.
+private pure func prepare_var_expr(
+	decls: PrepareDecls,
+	expr: CoreExpr,
+	variable: CoreVar,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	match typ:
+		NamedType(name, type_args):
+			if name == "Option":
+				match type_args:
+					[payload]:
+						if variable_is_union_constructor(decls, "Option", variable):
+							match prepare_stack_option_construct(
+								decls,
+								UserCall("None", variable.def_id, []),
+								[],
+								payload,
+							):
+								Some(construct):
+									UnionConstructExpr(construct, typ, loc)
+								None:
+									expr
+						else:
+							expr
+					_:
+						expr
+			else:
+				expr
+		_:
+			expr
+
+
+-- Leaves and nodes preparation never looks inside.
+private pure func prepare_leaf_expr(decls: PrepareDecls, expr: CoreExpr) -> CoreExpr:
+	match expr:
 		VarExpr(variable, typ, loc):
-			match typ:
-				NamedType(name, type_args):
-					if name == "Option":
-						match type_args:
-							[payload]:
-								if variable_is_union_constructor(decls, "Option", variable):
-									match prepare_stack_option_construct(
-										decls,
-										UserCall("None", variable.def_id, []),
-										[],
-										payload,
-									):
-										Some(construct):
-											UnionConstructExpr(
-												construct,
-												clone_core_type(typ),
-												clone_core_source_loc(loc),
-											)
-										None:
-											clone_core_var_expr(variable, typ, loc)
-								else:
-									clone_core_var_expr(variable, typ, loc)
-							[]:
-								clone_core_var_expr(variable, typ, loc)
-							[first, second, ...rest]:
-								clone_core_var_expr(variable, typ, loc)
-					else:
-						clone_core_var_expr(variable, typ, loc)
-				_:
-					clone_core_var_expr(variable, typ, loc)
-		VoidExpr(typ, loc):
-			VoidExpr(clone_core_type(typ), clone_core_source_loc(loc))
+			prepare_var_expr(decls, expr, variable, typ, loc)
+		_:
+			expr
+
+
+-- Operators, casts, field reads, and the simple binding and control forms.
+private pure func prepare_operator_expr(decls: PrepareDecls, expr: CoreExpr) -> CoreExpr:
+	match expr:
 		DebugBlockExpr(body, typ, loc):
-			DebugBlockExpr(
-				prepare_expr(decls, body),
-				clone_core_type(typ),
-				clone_core_source_loc(loc),
-			)
-		CooperativeCheckpointExpr(typ, loc):
-			CooperativeCheckpointExpr(clone_core_type(typ), clone_core_source_loc(loc))
+			prepared_body: CoreExpr = prepare_expr(decls, body)
+
+			if same_core_expr(prepared_body, body):
+				expr
+			else:
+				DebugBlockExpr(prepared_body, typ, loc)
+		BinaryExpr(op, left, right, typ, loc):
+			prepared_left: CoreExpr = prepare_expr(decls, left)
+			prepared_right: CoreExpr = prepare_expr(decls, right)
+
+			if same_core_expr(prepared_left, left) and same_core_expr(prepared_right, right):
+				expr
+			else:
+				BinaryExpr(op, prepared_left, prepared_right, typ, loc)
+		UnaryExpr(op, expr_value, typ, loc):
+			prepared_value: CoreExpr = prepare_expr(decls, expr_value)
+
+			if same_core_expr(prepared_value, expr_value):
+				expr
+			else:
+				UnaryExpr(op, prepared_value, typ, loc)
+		LogicalExpr(op, left, right, typ, loc):
+			prepare_logical_expr(decls, expr)
+		AssignExpr(variable, rhs, typ, loc):
+			prepared_rhs: CoreExpr = prepare_expr(decls, rhs)
+
+			if same_core_expr(prepared_rhs, rhs):
+				expr
+			else:
+				AssignExpr(variable, prepared_rhs, typ, loc)
+		CastExpr(expr_value, typ, loc):
+			prepared_value: CoreExpr = prepare_expr(decls, expr_value)
+
+			if same_core_expr(prepared_value, expr_value):
+				expr
+			else:
+				CastExpr(prepared_value, typ, loc)
+		UnboxExpr(unbox_kind, expr_value, typ, loc):
+			prepared_value: CoreExpr = prepare_expr(decls, expr_value)
+
+			if same_core_expr(prepared_value, expr_value):
+				expr
+			else:
+				UnboxExpr(unbox_kind, prepared_value, typ, loc)
+		FieldExpr(expr_value, field_name, typ, loc):
+			prepared_value: CoreExpr = prepare_expr(decls, expr_value)
+
+			if same_core_expr(prepared_value, expr_value):
+				expr
+			else:
+				FieldExpr(prepared_value, field_name, typ, loc)
+		TupleFieldExpr(expr_value, field_index, typ, loc):
+			prepared_value: CoreExpr = prepare_expr(decls, expr_value)
+
+			if same_core_expr(prepared_value, expr_value):
+				expr
+			else:
+				TupleFieldExpr(prepared_value, field_index, typ, loc)
+		BoxExpr(box, typ, loc):
+			match prepare_box_op(decls, box):
+				Some(prepared_box):
+					BoxExpr(prepared_box, typ, loc)
+				None:
+					expr
+		PreClosureDetachExpr(detached, typ, loc):
+			prepared_detached: CoreExpr = prepare_expr(decls, detached)
+
+			if same_core_expr(prepared_detached, detached):
+				expr
+			else:
+				PreClosureDetachExpr(prepared_detached, typ, loc)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			prepared_body: CoreExpr = prepare_expr(decls, body)
+
+			if same_core_expr(prepared_body, body):
+				expr
+			else:
+				DupExpr(variable, value_type, retain_policy, prepared_body, typ, loc)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			prepared_body: CoreExpr = prepare_expr(decls, body)
+
+			if same_core_expr(prepared_body, body):
+				expr
+			else:
+				DropExpr(variable, value_type, release_policy, prepared_body, typ, loc)
+		LetExpr(name, is_mutable, typ, rhs, body):
+			prepared_rhs: CoreExpr = prepare_expr(decls, rhs)
+			prepared_body: CoreExpr = prepare_expr(decls, body)
+
+			if same_core_expr(prepared_rhs, rhs) and same_core_expr(prepared_body, body):
+				expr
+			else:
+				LetExpr(name, is_mutable, typ, prepared_rhs, prepared_body)
+		BorrowLetExpr(name, typ, rhs, body):
+			prepared_rhs: CoreExpr = prepare_expr(decls, rhs)
+			prepared_body: CoreExpr = prepare_expr(decls, body)
+
+			if same_core_expr(prepared_rhs, rhs) and same_core_expr(prepared_body, body):
+				expr
+			else:
+				BorrowLetExpr(name, typ, prepared_rhs, prepared_body)
+		SeqExpr(first, second):
+			prepared_first: CoreExpr = prepare_expr(decls, first)
+			prepared_second: CoreExpr = prepare_expr(decls, second)
+
+			if same_core_expr(prepared_first, first) and same_core_expr(prepared_second, second):
+				expr
+			else:
+				SeqExpr(prepared_first, prepared_second)
+		WhileExpr(cond, body, typ, loc):
+			prepared_cond: CoreExpr = prepare_expr(decls, cond)
+			prepared_body: CoreExpr = prepare_expr(decls, body)
+
+			if same_core_expr(prepared_cond, cond) and same_core_expr(prepared_body, body):
+				expr
+			else:
+				WhileExpr(prepared_cond, prepared_body, typ, loc)
+		RangeExpr(start, end_value, typ, loc):
+			prepared_start: CoreExpr = prepare_expr(decls, start)
+			prepared_end: CoreExpr = prepare_expr(decls, end_value)
+
+			if same_core_expr(prepared_start, start) and same_core_expr(prepared_end, end_value):
+				expr
+			else:
+				RangeExpr(prepared_start, prepared_end, typ, loc)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			prepared_cond: CoreExpr = prepare_expr(decls, cond)
+			prepared_then: CoreExpr = prepare_expr(decls, then_expr)
+			prepared_else: CoreExpr = prepare_expr(decls, else_expr)
+
+			if (
+				same_core_expr(prepared_cond, cond)
+				and same_core_expr(prepared_then, then_expr)
+				and same_core_expr(prepared_else, else_expr)
+			):
+				expr
+			else:
+				IfExpr(prepared_cond, prepared_then, prepared_else, typ, loc)
+		_:
+			expr
+
+
+-- Calls and the literal, record, union, and select aggregates.
+private pure func prepare_aggregate_expr(decls: PrepareDecls, expr: CoreExpr) -> CoreExpr:
+	match expr:
 		CallExpr(kind, callee, args, typ, loc):
 			prepared_callee: CoreExpr = prepare_expr(decls, callee)
 			prepared_args: List[CoreExpr] = prepare_exprs(decls, args)
 
 			match prepare_union_construct(decls, kind, prepared_args, typ):
 				Some(construct):
-					UnionConstructExpr(construct, clone_core_type(typ), clone_core_source_loc(loc))
+					UnionConstructExpr(construct, typ, loc)
 				None:
-					CallExpr(kind, prepared_callee, prepared_args, typ, loc)
-		BinaryExpr(op, left, right, typ, loc):
-			BinaryExpr(
-				op,
-				prepare_expr(decls, left),
-				prepare_expr(decls, right),
-				typ,
-				loc,
-			)
-		UnaryExpr(op, expr_value, typ, loc):
-			UnaryExpr(
-				op,
-				prepare_expr(decls, expr_value),
-				typ,
-				loc,
-			)
-		LogicalExpr(op, left, right, typ, loc):
-			prepare_logical_expr(decls, expr)
-		AssignExpr(variable, rhs, typ, loc):
-			AssignExpr(
-				variable,
-				prepare_expr(decls, rhs),
-				typ,
-				loc,
-			)
-		CastExpr(expr_value, typ, loc):
-			CastExpr(
-				prepare_expr(decls, expr_value),
-				typ,
-				loc,
-			)
-		BoxExpr(box, typ, loc):
-			BoxExpr(
-				prepare_box_op(decls, box),
-				typ,
-				loc,
-			)
-		UnboxExpr(unbox_kind, expr_value, typ, loc):
-			UnboxExpr(
-				unbox_kind,
-				prepare_expr(decls, expr_value),
-				typ,
-				loc,
-			)
-		FieldExpr(expr_value, field_name, typ, loc):
-			FieldExpr(
-				prepare_expr(decls, expr_value),
-				field_name,
-				typ,
-				loc,
-			)
-		TupleFieldExpr(expr_value, field_index, typ, loc):
-			TupleFieldExpr(
-				prepare_expr(decls, expr_value),
-				field_index,
-				typ,
-				loc,
-			)
+					if (
+						same_core_expr(prepared_callee, callee)
+						and same_core_exprs(prepared_args, args)
+					):
+						expr
+					else:
+						CallExpr(kind, prepared_callee, prepared_args, typ, loc)
 		TupleExpr(items, typ, loc):
-			prepare_tuple_expr(decls, items, typ, loc)
+			prepare_tuple_expr(decls, expr, items, typ, loc)
 		TupleConstructExpr(tuple_construct, typ, loc):
-			TupleConstructExpr(
-				{
-					elements = prepare_tuple_elements(decls, tuple_construct.elements),
-					release_mask = tuple_construct.release_mask,
-					retain_mask = tuple_construct.retain_mask
-				},
-				typ,
-				loc,
-			)
+			match prepare_tuple_elements(decls, tuple_construct.elements):
+				Some(elements):
+					TupleConstructExpr({ tuple_construct | elements = elements }, typ, loc)
+				None:
+					expr
 		VectorExpr(items, typ, loc):
-			prepare_vector_expr(decls, items, typ, loc)
-		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
-			LambdaExpr(
-				lambda_params,
-				lambda_return_type,
-				prepare_expr(decls, lambda_body),
-				lambda_is_pure,
-				typ,
-				loc,
-			)
-		ClosureCreateExpr(closure, typ, loc):
-			ClosureCreateExpr(closure, typ, loc)
+			prepare_vector_expr(decls, expr, items, typ, loc)
 		ListConstructExpr(construct, typ, loc):
-			ListConstructExpr(
-				prepare_list_construct(decls, construct),
-				typ,
-				loc,
-			)
-		ListAllocExpr(alloc, typ, loc):
-			ListAllocExpr(
-				prepare_list_alloc(decls, alloc),
-				typ,
-				loc,
-			)
-		ListGetExpr(get, typ, loc):
-			ListGetExpr(
-				prepare_list_get(decls, get),
-				typ,
-				loc,
-			)
-		ListHandoffExpr(handoff, typ, loc):
-			ListHandoffExpr(
-				prepare_list_handoff(decls, handoff),
-				typ,
-				loc,
-			)
-		ListHandoffSetOwnedExpr(set, typ, loc):
-			ListHandoffSetOwnedExpr(
-				prepare_list_set(decls, set),
-				typ,
-				loc,
-			)
-		ListHandoffSetSourceSlotExpr(slot, typ, loc):
-			ListHandoffSetSourceSlotExpr(
-				prepare_list_handoff_set_source_slot(decls, slot),
-				typ,
-				loc,
-			)
-		StringByteReadExpr(read, typ, loc):
-			StringByteReadExpr(
-				prepare_string_byte_read(decls, read),
-				typ,
-				loc,
-			)
-		StringByteWriteExpr(write, typ, loc):
-			StringByteWriteExpr(
-				prepare_string_byte_write(decls, write),
-				typ,
-				loc,
-			)
-		StringByteCopyExpr(copy, typ, loc):
-			StringByteCopyExpr(
-				prepare_string_byte_copy(decls, copy),
-				typ,
-				loc,
-			)
-		StringSetLenExpr(set_len, typ, loc):
-			StringSetLenExpr(
-				prepare_string_set_len(decls, set_len),
-				typ,
-				loc,
-			)
-		TensorLiteralExpr(literal, typ, loc):
-			TensorLiteralExpr(
-				prepare_tensor_literal(decls, literal),
-				typ,
-				loc,
-			)
-		TensorBoxedLiteralExpr(literal, typ, loc):
-			TensorBoxedLiteralExpr(
-				prepare_tensor_boxed_literal(decls, literal),
-				typ,
-				loc,
-			)
-		TensorPackedLiteralExpr(literal, typ, loc):
-			TensorPackedLiteralExpr(
-				prepare_tensor_packed_literal(decls, literal),
-				typ,
-				loc,
-			)
-		TensorRawFillExpr(fill, typ, loc):
-			TensorRawFillExpr(
-				prepare_tensor_raw_fill(decls, fill),
-				typ,
-				loc,
-			)
-		TensorRawReadExpr(read, typ, loc):
-			TensorRawReadExpr(
-				prepare_tensor_raw_read(decls, read),
-				typ,
-				loc,
-			)
-		TensorRawWriteExpr(write, typ, loc):
-			TensorRawWriteExpr(
-				prepare_tensor_raw_write(decls, write),
-				typ,
-				loc,
-			)
-		TensorRawViewLetExpr(binding, body, typ, loc):
-			TensorRawViewLetExpr(
-				prepare_tensor_raw_view_binding(decls, binding),
-				prepare_expr(decls, body),
-				typ,
-				loc,
-			)
+			match prepare_list_construct(decls, construct):
+				Some(prepared_construct):
+					ListConstructExpr(prepared_construct, typ, loc)
+				None:
+					expr
 		DictExpr(entries, typ, loc):
-			prepare_dict_expr(decls, entries, typ, loc)
+			prepare_dict_expr(decls, expr, entries, typ, loc)
 		DictConstructExpr(construct, typ, loc):
-			DictConstructExpr(
-				prepare_dict_construct(decls, construct),
-				typ,
-				loc,
-			)
-		SetAllocExpr(alloc, typ, loc):
-			expr
-		ListRetainExpr(retain, typ, loc):
-			ListRetainExpr(
-				prepare_list_retain(decls, retain),
-				typ,
-				loc,
-			)
-		ListSetExpr(set, typ, loc):
-			ListSetExpr(
-				prepare_list_set(decls, set),
-				typ,
-				loc,
-			)
-		ListSwapExpr(swap, typ, loc):
-			ListSwapExpr(
-				prepare_list_swap(decls, swap),
-				typ,
-				loc,
-			)
+			match prepare_dict_construct(decls, construct):
+				Some(prepared_construct):
+					DictConstructExpr(prepared_construct, typ, loc)
+				None:
+					expr
 		RecordExpr(fields, typ, loc):
-			prepare_record_expr(decls, fields, typ, loc)
+			prepare_record_expr(decls, expr, fields, typ, loc)
 		RecordUpdateExpr(base, fields, typ, loc):
-			RecordUpdateExpr(
-				prepare_expr(decls, base),
-				prepare_record_fields(decls, fields),
-				typ,
-				loc,
+			prepared_base: CoreExpr = prepare_expr(decls, base)
+			prepared_fields: Option[List[CoreRecordFieldValue]] = prepare_record_fields(
+				decls,
+				fields,
 			)
+
+			if same_core_expr(prepared_base, base) and prepared_fields.is_none():
+				expr
+			else:
+				RecordUpdateExpr(
+					prepared_base,
+					prepared_fields.get_or(fields),
+					typ,
+					loc,
+				)
 		RecordReuseExpr(source, fields, typ, loc):
-			RecordReuseExpr(
-				prepare_expr(decls, source),
-				prepare_record_fields(decls, fields),
-				typ,
-				loc,
+			prepared_source: CoreExpr = prepare_expr(decls, source)
+			prepared_fields: Option[List[CoreRecordFieldValue]] = prepare_record_fields(
+				decls,
+				fields,
 			)
+
+			if same_core_expr(prepared_source, source) and prepared_fields.is_none():
+				expr
+			else:
+				RecordReuseExpr(
+					prepared_source,
+					prepared_fields.get_or(fields),
+					typ,
+					loc,
+				)
 		RecordCowUpdateExpr(source, fields, typ, loc):
-			RecordCowUpdateExpr(
-				prepare_expr(decls, source),
-				CoreTraverse.map_core_record_cow_fields(
-					fields,
-					func(replacement): prepare_expr(decls, replacement),
-				),
-				typ,
-				loc,
+			prepared_source: CoreExpr = prepare_expr(decls, source)
+			prepared_fields: Option[List[CoreRecordCowField]] = prepare_list_items(
+				fields,
+				func(field): prepare_record_cow_field(decls, field),
 			)
+
+			if same_core_expr(prepared_source, source) and prepared_fields.is_none():
+				expr
+			else:
+				RecordCowUpdateExpr(
+					prepared_source,
+					prepared_fields.get_or(fields),
+					typ,
+					loc,
+				)
 		RecordConstructExpr(type_name, fields, typ, loc):
-			prepare_record_construct_expr(decls, type_name, fields, typ, loc)
+			prepare_record_construct_expr(decls, expr, type_name, fields, typ, loc)
 		UnionConstructExpr(construct, typ, loc):
-			UnionConstructExpr(
-				{
-					type_name = construct.type_name,
-					constructor_name = construct.constructor_name,
-					constructor_c_name = construct.constructor_c_name,
-					representation = construct.representation,
-					payload_storage = construct.payload_storage,
-					uses_release_mask = construct.uses_release_mask,
-					release_mask = construct.release_mask,
-					args = prepare_boxed_storage_values(decls, construct.args)
-				},
-				typ,
-				loc,
-			)
+			match prepare_boxed_storage_values(decls, construct.args):
+				Some(args):
+					UnionConstructExpr({ construct | args = args }, typ, loc)
+				None:
+					expr
 		UnionReuseConstructExpr(construct, typ, loc):
-			UnionReuseConstructExpr(
-				{
-					source = prepare_expr(decls, construct.source),
-					type_name = construct.type_name,
-					constructor_name = construct.constructor_name,
-					constructor_c_name = construct.constructor_c_name,
-					reuse_constructor_c_name = construct.reuse_constructor_c_name,
-					representation = construct.representation,
-					payload_storage = construct.payload_storage,
-					uses_release_mask = construct.uses_release_mask,
-					release_mask = construct.release_mask,
-					args = prepare_boxed_storage_values(decls, construct.args)
-				},
-				typ,
-				loc,
+			prepared_source: CoreExpr = prepare_expr(decls, construct.source)
+			prepared_args: Option[List[CoreBoxedStorageValue]] = prepare_boxed_storage_values(
+				decls,
+				construct.args,
 			)
-		DupExpr(variable, value_type, retain_policy, body, typ, loc):
-			DupExpr(
-				variable,
-				value_type,
-				retain_policy,
-				prepare_expr(decls, body),
-				typ,
-				loc,
-			)
-		DropExpr(variable, value_type, release_policy, body, typ, loc):
-			DropExpr(
-				variable,
-				value_type,
-				release_policy,
-				prepare_expr(decls, body),
-				typ,
-				loc,
-			)
-		LetExpr(name, is_mutable, typ, rhs, body):
-			LetExpr(
-				name,
-				is_mutable,
-				typ,
-				prepare_expr(decls, rhs),
-				prepare_expr(decls, body),
-			)
-		BorrowLetExpr(name, typ, rhs, body):
-			BorrowLetExpr(
-				name,
-				typ,
-				prepare_expr(decls, rhs),
-				prepare_expr(decls, body),
-			)
-		SeqExpr(first, second):
-			SeqExpr(
-				prepare_expr(decls, first),
-				prepare_expr(decls, second),
-			)
-		WhileExpr(cond, body, typ, loc):
-			WhileExpr(
-				prepare_expr(decls, cond),
-				prepare_expr(decls, body),
-				typ,
-				loc,
-			)
-		BreakExpr(typ, loc):
-			BreakExpr(clone_core_type(typ), clone_core_source_loc(loc))
-		ContinueExpr(typ, loc):
-			ContinueExpr(clone_core_type(typ), clone_core_source_loc(loc))
-		ResourceScopeExpr(scope, typ, loc):
-			ResourceScopeExpr(
-				{
-					variable = scope.variable,
-					typ = scope.typ,
-					acquire = prepare_expr(decls, scope.acquire),
-					body = prepare_expr(decls, scope.body),
-					cleanup = prepare_expr(decls, scope.cleanup)
-				},
-				typ,
-				loc,
-			)
-		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
-			ResourceCleanupExitExpr(
-				{
-					cleanups = prepare_exprs(decls, cleanup_exit.cleanups),
-					exit = cleanup_exit.exit
-				},
-				typ,
-				loc,
-			)
-		TailrecLoopExpr(params, return_type, body, loc):
-			TailrecLoopExpr(
-				params,
-				return_type,
-				prepare_expr(decls, body),
-				loc,
-			)
-		TailrecRecurExpr(args, typ, loc):
-			TailrecRecurExpr(
-				prepare_exprs(decls, args),
-				typ,
-				loc,
-			)
-		TailrecListSpreadLoopExpr(loop, loc):
-			TailrecListSpreadLoopExpr(
-				prepare_tailrec_list_spread_loop(decls, loop),
-				loc,
-			)
-		TailrecListSpreadRecurExpr(rebinds, cursor_advance, typ, loc):
-			TailrecListSpreadRecurExpr(
-				rebinds.map(func(rebind): prepare_tailrec_list_spread_rebind(decls, rebind)),
-				cursor_advance,
-				typ,
-				loc,
-			)
-		ForRangeExpr(binder, start, end_value, body, typ, loc):
-			ForRangeExpr(
-				binder,
-				prepare_expr(decls, start),
-				prepare_expr(decls, end_value),
-				prepare_expr(decls, body),
-				typ,
-				loc,
-			)
-		ForChannelExpr(for_channel, typ, loc):
-			ForChannelExpr(
-				{
-					binder = for_channel.binder,
-					iterable = prepare_expr(decls, for_channel.iterable),
-					body = prepare_expr(decls, for_channel.body)
-				},
-				typ,
-				loc,
-			)
-		ForListExpr(for_list, typ, loc):
-			ForListExpr(
-				{
-					binder = for_list.binder,
-					layout = for_list.layout,
-					iterable = prepare_expr(decls, for_list.iterable),
-					iterable_release_policy = for_list.iterable_release_policy,
-					body = prepare_expr(decls, for_list.body)
-				},
-				typ,
-				loc,
-			)
-		ForStringExpr(for_string, typ, loc):
-			ForStringExpr(
-				{
-					binder = for_string.binder,
-					iterable = prepare_expr(decls, for_string.iterable),
-					iterable_release_policy = for_string.iterable_release_policy,
-					body = prepare_expr(decls, for_string.body)
-				},
-				typ,
-				loc,
-			)
-		ForDictExpr(for_dict, typ, loc):
-			ForDictExpr(
-				{
-					binder = for_dict.binder,
-					iterable = prepare_expr(decls, for_dict.iterable),
-					iterable_release_policy = for_dict.iterable_release_policy,
-					body = prepare_expr(decls, for_dict.body)
-				},
-				typ,
-				loc,
-			)
-		ForSetExpr(for_set, typ, loc):
-			ForSetExpr(
-				{
-					binder = for_set.binder,
-					iterable = prepare_expr(decls, for_set.iterable),
-					iterable_release_policy = for_set.iterable_release_policy,
-					body = prepare_expr(decls, for_set.body)
-				},
-				typ,
-				loc,
-			)
-		ForResourceSourceExpr(for_resource_source, typ, loc):
-			ForResourceSourceExpr(
-				{
-					binder = for_resource_source.binder,
-					iterable = prepare_expr(decls, for_resource_source.iterable),
-					iterable_release_policy = for_resource_source.iterable_release_policy,
-					body = prepare_expr(decls, for_resource_source.body)
-				},
-				typ,
-				loc,
-			)
-		ForStreamExpr(for_stream, typ, loc):
-			ForStreamExpr(
-				{
-					binder = for_stream.binder,
-					iterable = prepare_expr(decls, for_stream.iterable),
-					iterable_release_policy = for_stream.iterable_release_policy,
-					body = prepare_expr(decls, for_stream.body)
-				},
-				typ,
-				loc,
-			)
-		ForTensorExpr(for_tensor, typ, loc):
-			ForTensorExpr(
-				{
-					binder = for_tensor.binder,
-					element_storage = clone_tensor_for_element_storage(for_tensor.element_storage),
-					iterable = prepare_expr(decls, for_tensor.iterable),
-					iterable_release_policy = for_tensor.iterable_release_policy,
-					body = prepare_expr(decls, for_tensor.body)
-				},
-				typ,
-				loc,
-			)
-		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
-			PreClosureConcurrentlyLoopExpr(
-				{
-					variable = loop.variable,
-					item_type = loop.item_type,
-					item_mode = loop.item_mode,
-					iterable = prepare_expr(decls, loop.iterable),
-					body = prepare_expr(decls, loop.body),
-					timeout = prepare_optional_expr(decls, loop.timeout),
-					limit = prepare_expr(decls, loop.limit),
-					output = loop.output
-				},
-				typ,
-				loc,
-			)
-		PreClosureDetachExpr(detached, typ, loc):
-			PreClosureDetachExpr(
-				prepare_expr(decls, detached),
-				typ,
-				loc,
-			)
-		DetachExpr(detached, typ, loc):
-			expr
-		ConcurrentlyLoopExpr(loop, typ, loc):
-			ConcurrentlyLoopExpr(
-				prepare_concurrently_loop(decls, loop),
-				typ,
-				loc,
-			)
-		PreClosureConcurrentExpr(block, typ, loc):
-			PreClosureConcurrentExpr(
-				{
-					bindings = block.bindings,
-					body = prepare_expr(decls, block.body),
-					timeout = prepare_optional_expr(decls, block.timeout),
-					max_threads = block.max_threads
-				},
-				typ,
-				loc,
-			)
-		ConcurrentExpr(block, typ, loc):
-			ConcurrentExpr(
-				prepare_concurrent_block(decls, block),
-				typ,
-				loc,
-			)
+
+			if same_core_expr(prepared_source, construct.source) and prepared_args.is_none():
+				expr
+			else:
+				UnionReuseConstructExpr(
+					{ construct |
+						source = prepared_source,
+						args = prepared_args.get_or(construct.args)
+					},
+					typ,
+					loc,
+				)
 		SelectExpr(select_expr, typ, loc):
-			SelectExpr(
-				select_expr.map(func(arm): prepare_select_arm(decls, arm)),
-				typ,
-				loc,
+			match prepare_list_items(select_expr, func(arm): prepare_select_arm(decls, arm)):
+				Some(arms):
+					SelectExpr(arms, typ, loc)
+				None:
+					expr
+		_:
+			expr
+
+
+-- List, string, and tensor storage operations whose children live in one
+-- payload record.
+private pure func prepare_storage_expr(decls: PrepareDecls, expr: CoreExpr) -> CoreExpr:
+	match expr:
+		ListAllocExpr(alloc, typ, loc):
+			match prepare_list_alloc(decls, alloc):
+				Some(prepared):
+					ListAllocExpr(prepared, typ, loc)
+				None:
+					expr
+		ListGetExpr(get, typ, loc):
+			match prepare_list_get(decls, get):
+				Some(prepared):
+					ListGetExpr(prepared, typ, loc)
+				None:
+					expr
+		ListHandoffExpr(handoff, typ, loc):
+			match prepare_list_handoff(decls, handoff):
+				Some(prepared):
+					ListHandoffExpr(prepared, typ, loc)
+				None:
+					expr
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			match prepare_list_set(decls, set):
+				Some(prepared):
+					ListHandoffSetOwnedExpr(prepared, typ, loc)
+				None:
+					expr
+		ListHandoffSetSourceSlotExpr(slot, typ, loc):
+			match prepare_list_handoff_set_source_slot(decls, slot):
+				Some(prepared):
+					ListHandoffSetSourceSlotExpr(prepared, typ, loc)
+				None:
+					expr
+		ListRetainExpr(retain, typ, loc):
+			match prepare_list_retain(decls, retain):
+				Some(prepared):
+					ListRetainExpr(prepared, typ, loc)
+				None:
+					expr
+		ListSetExpr(set, typ, loc):
+			match prepare_list_set(decls, set):
+				Some(prepared):
+					ListSetExpr(prepared, typ, loc)
+				None:
+					expr
+		ListSwapExpr(swap, typ, loc):
+			match prepare_list_swap(decls, swap):
+				Some(prepared):
+					ListSwapExpr(prepared, typ, loc)
+				None:
+					expr
+		StringByteReadExpr(read, typ, loc):
+			match prepare_string_byte_read(decls, read):
+				Some(prepared):
+					StringByteReadExpr(prepared, typ, loc)
+				None:
+					expr
+		StringByteWriteExpr(write, typ, loc):
+			match prepare_string_byte_write(decls, write):
+				Some(prepared):
+					StringByteWriteExpr(prepared, typ, loc)
+				None:
+					expr
+		StringByteCopyExpr(copy, typ, loc):
+			match prepare_string_byte_copy(decls, copy):
+				Some(prepared):
+					StringByteCopyExpr(prepared, typ, loc)
+				None:
+					expr
+		StringSetLenExpr(set_len, typ, loc):
+			match prepare_string_set_len(decls, set_len):
+				Some(prepared):
+					StringSetLenExpr(prepared, typ, loc)
+				None:
+					expr
+		TensorLiteralExpr(literal, typ, loc):
+			match prepare_tensor_literal(decls, literal):
+				Some(prepared):
+					TensorLiteralExpr(prepared, typ, loc)
+				None:
+					expr
+		TensorBoxedLiteralExpr(literal, typ, loc):
+			match prepare_tensor_boxed_literal(decls, literal):
+				Some(prepared):
+					TensorBoxedLiteralExpr(prepared, typ, loc)
+				None:
+					expr
+		TensorPackedLiteralExpr(literal, typ, loc):
+			match prepare_tensor_packed_literal(decls, literal):
+				Some(prepared):
+					TensorPackedLiteralExpr(prepared, typ, loc)
+				None:
+					expr
+		TensorRawFillExpr(fill, typ, loc):
+			match prepare_tensor_raw_fill(decls, fill):
+				Some(prepared):
+					TensorRawFillExpr(prepared, typ, loc)
+				None:
+					expr
+		TensorRawReadExpr(read, typ, loc):
+			match prepare_tensor_raw_read(decls, read):
+				Some(prepared):
+					TensorRawReadExpr(prepared, typ, loc)
+				None:
+					expr
+		TensorRawWriteExpr(write, typ, loc):
+			match prepare_tensor_raw_write(decls, write):
+				Some(prepared):
+					TensorRawWriteExpr(prepared, typ, loc)
+				None:
+					expr
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			prepared_binding: Option[CoreTensorRawViewBinding] = prepare_tensor_raw_view_binding(
+				decls,
+				binding,
 			)
-		RangeExpr(start, end_value, typ, loc):
-			RangeExpr(
-				prepare_expr(decls, start),
-				prepare_expr(decls, end_value),
-				typ,
-				loc,
-			)
-		AccessorLiteralMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc):
-			AccessorLiteralMatchExpr(
-				prepare_expr(decls, scrutinee),
-				scrutinee_release_policy,
-				prepare_constructor_literal_match(decls, match_expr),
-				typ,
-				loc,
-			)
-		LengthMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc):
-			LengthMatchExpr(
-				prepare_expr(decls, scrutinee),
-				scrutinee_release_policy,
-				prepare_constructor_length_match(decls, match_expr),
-				typ,
-				loc,
-			)
-		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
-			LiteralMatchExpr(
-				prepare_expr(decls, scrutinee),
-				prepare_literal_match_cases(decls, cases),
-				prepare_literal_match_fallback(decls, fallback),
-				typ,
-				loc,
-			)
+			prepared_body: CoreExpr = prepare_expr(decls, body)
+
+			if prepared_binding.is_none() and same_core_expr(prepared_body, body):
+				expr
+			else:
+				TensorRawViewLetExpr(
+					prepared_binding.get_or(binding),
+					prepared_body,
+					typ,
+					loc,
+				)
+		_:
+			expr
+
+
+-- Lambdas, tail-recursive loops, `for` loops, and resource scopes.
+private pure func prepare_loop_expr(decls: PrepareDecls, expr: CoreExpr) -> CoreExpr:
+	match expr:
+		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
+			prepared_body: CoreExpr = prepare_expr(decls, lambda_body)
+
+			if same_core_expr(prepared_body, lambda_body):
+				expr
+			else:
+				LambdaExpr(
+					lambda_params,
+					lambda_return_type,
+					prepared_body,
+					lambda_is_pure,
+					typ,
+					loc,
+				)
+		TailrecLoopExpr(params, return_type, body, loc):
+			prepared_body: CoreExpr = prepare_expr(decls, body)
+
+			if same_core_expr(prepared_body, body):
+				expr
+			else:
+				TailrecLoopExpr(params, return_type, prepared_body, loc)
+		TailrecRecurExpr(args, typ, loc):
+			prepared_args: List[CoreExpr] = prepare_exprs(decls, args)
+
+			if same_core_exprs(prepared_args, args):
+				expr
+			else:
+				TailrecRecurExpr(prepared_args, typ, loc)
+		TailrecListSpreadLoopExpr(loop, loc):
+			match prepare_tailrec_list_spread_loop(decls, loop):
+				Some(prepared_loop):
+					TailrecListSpreadLoopExpr(prepared_loop, loc)
+				None:
+					expr
+		TailrecListSpreadRecurExpr(rebinds, cursor_advance, typ, loc):
+			match prepare_list_items(
+				rebinds,
+				func(rebind): prepare_tailrec_list_spread_rebind(decls, rebind),
+			):
+				Some(prepared_rebinds):
+					TailrecListSpreadRecurExpr(prepared_rebinds, cursor_advance, typ, loc)
+				None:
+					expr
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			prepared_start: CoreExpr = prepare_expr(decls, start)
+			prepared_end: CoreExpr = prepare_expr(decls, end_value)
+			prepared_body: CoreExpr = prepare_expr(decls, body)
+
+			if (
+				same_core_expr(prepared_start, start)
+				and same_core_expr(prepared_end, end_value)
+				and same_core_expr(prepared_body, body)
+			):
+				expr
+			else:
+				ForRangeExpr(binder, prepared_start, prepared_end, prepared_body, typ, loc)
+		ForChannelExpr(for_channel, typ, loc):
+			prepared_iterable: CoreExpr = prepare_expr(decls, for_channel.iterable)
+			prepared_body: CoreExpr = prepare_expr(decls, for_channel.body)
+
+			if (
+				same_core_expr(prepared_iterable, for_channel.iterable)
+				and same_core_expr(prepared_body, for_channel.body)
+			):
+				expr
+			else:
+				ForChannelExpr(
+					{ for_channel |
+						iterable = prepared_iterable,
+						body = prepared_body
+					},
+					typ,
+					loc,
+				)
+		ForListExpr(for_list, typ, loc):
+			prepared_iterable: CoreExpr = prepare_expr(decls, for_list.iterable)
+			prepared_body: CoreExpr = prepare_expr(decls, for_list.body)
+
+			if (
+				same_core_expr(prepared_iterable, for_list.iterable)
+				and same_core_expr(prepared_body, for_list.body)
+			):
+				expr
+			else:
+				ForListExpr(
+					{ for_list |
+						iterable = prepared_iterable,
+						body = prepared_body
+					},
+					typ,
+					loc,
+				)
+		ForStringExpr(for_string, typ, loc):
+			prepared_iterable: CoreExpr = prepare_expr(decls, for_string.iterable)
+			prepared_body: CoreExpr = prepare_expr(decls, for_string.body)
+
+			if (
+				same_core_expr(prepared_iterable, for_string.iterable)
+				and same_core_expr(prepared_body, for_string.body)
+			):
+				expr
+			else:
+				ForStringExpr(
+					{ for_string |
+						iterable = prepared_iterable,
+						body = prepared_body
+					},
+					typ,
+					loc,
+				)
+		ForDictExpr(for_dict, typ, loc):
+			prepared_iterable: CoreExpr = prepare_expr(decls, for_dict.iterable)
+			prepared_body: CoreExpr = prepare_expr(decls, for_dict.body)
+
+			if (
+				same_core_expr(prepared_iterable, for_dict.iterable)
+				and same_core_expr(prepared_body, for_dict.body)
+			):
+				expr
+			else:
+				ForDictExpr(
+					{ for_dict |
+						iterable = prepared_iterable,
+						body = prepared_body
+					},
+					typ,
+					loc,
+				)
+		ForSetExpr(for_set, typ, loc):
+			prepared_iterable: CoreExpr = prepare_expr(decls, for_set.iterable)
+			prepared_body: CoreExpr = prepare_expr(decls, for_set.body)
+
+			if (
+				same_core_expr(prepared_iterable, for_set.iterable)
+				and same_core_expr(prepared_body, for_set.body)
+			):
+				expr
+			else:
+				ForSetExpr(
+					{ for_set |
+						iterable = prepared_iterable,
+						body = prepared_body
+					},
+					typ,
+					loc,
+				)
+		ForResourceSourceExpr(for_resource_source, typ, loc):
+			prepared_iterable: CoreExpr = prepare_expr(decls, for_resource_source.iterable)
+			prepared_body: CoreExpr = prepare_expr(decls, for_resource_source.body)
+
+			if (
+				same_core_expr(prepared_iterable, for_resource_source.iterable)
+				and same_core_expr(prepared_body, for_resource_source.body)
+			):
+				expr
+			else:
+				ForResourceSourceExpr(
+					{ for_resource_source |
+						iterable = prepared_iterable,
+						body = prepared_body
+					},
+					typ,
+					loc,
+				)
+		ForStreamExpr(for_stream, typ, loc):
+			prepared_iterable: CoreExpr = prepare_expr(decls, for_stream.iterable)
+			prepared_body: CoreExpr = prepare_expr(decls, for_stream.body)
+
+			if (
+				same_core_expr(prepared_iterable, for_stream.iterable)
+				and same_core_expr(prepared_body, for_stream.body)
+			):
+				expr
+			else:
+				ForStreamExpr(
+					{ for_stream |
+						iterable = prepared_iterable,
+						body = prepared_body
+					},
+					typ,
+					loc,
+				)
+		ForTensorExpr(for_tensor, typ, loc):
+			prepared_iterable: CoreExpr = prepare_expr(decls, for_tensor.iterable)
+			prepared_body: CoreExpr = prepare_expr(decls, for_tensor.body)
+
+			if (
+				same_core_expr(prepared_iterable, for_tensor.iterable)
+				and same_core_expr(prepared_body, for_tensor.body)
+			):
+				expr
+			else:
+				ForTensorExpr(
+					{ for_tensor |
+						iterable = prepared_iterable,
+						body = prepared_body
+					},
+					typ,
+					loc,
+				)
+		ResourceScopeExpr(scope, typ, loc):
+			prepared_acquire: CoreExpr = prepare_expr(decls, scope.acquire)
+			prepared_body: CoreExpr = prepare_expr(decls, scope.body)
+			prepared_cleanup: CoreExpr = prepare_expr(decls, scope.cleanup)
+
+			if (
+				same_core_expr(prepared_acquire, scope.acquire)
+				and same_core_expr(prepared_body, scope.body)
+				and same_core_expr(prepared_cleanup, scope.cleanup)
+			):
+				expr
+			else:
+				ResourceScopeExpr(
+					{ scope |
+						acquire = prepared_acquire,
+						body = prepared_body,
+						cleanup = prepared_cleanup
+					},
+					typ,
+					loc,
+				)
+		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
+			prepared_cleanups: List[CoreExpr] = prepare_exprs(decls, cleanup_exit.cleanups)
+
+			if same_core_exprs(prepared_cleanups, cleanup_exit.cleanups):
+				expr
+			else:
+				ResourceCleanupExitExpr({ cleanup_exit | cleanups = prepared_cleanups }, typ, loc)
+		_:
+			expr
+
+
+-- Structured-concurrency blocks and loops, before and after closure formation.
+private pure func prepare_concurrency_expr(decls: PrepareDecls, expr: CoreExpr) -> CoreExpr:
+	match expr:
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			prepared_iterable: CoreExpr = prepare_expr(decls, loop.iterable)
+			prepared_body: CoreExpr = prepare_expr(decls, loop.body)
+			prepared_timeout: Option[CoreExpr] = prepare_optional_expr(decls, loop.timeout)
+			prepared_limit: CoreExpr = prepare_expr(decls, loop.limit)
+
+			if (
+				same_core_expr(prepared_iterable, loop.iterable)
+				and same_core_expr(prepared_body, loop.body)
+				and same_optional_core_expr(prepared_timeout, loop.timeout)
+				and same_core_expr(prepared_limit, loop.limit)
+			):
+				expr
+			else:
+				PreClosureConcurrentlyLoopExpr(
+					{ loop |
+						iterable = prepared_iterable,
+						body = prepared_body,
+						timeout = prepared_timeout,
+						limit = prepared_limit
+					},
+					typ,
+					loc,
+				)
+		ConcurrentlyLoopExpr(loop, typ, loc):
+			match prepare_concurrently_loop(decls, loop):
+				Some(prepared_loop):
+					ConcurrentlyLoopExpr(prepared_loop, typ, loc)
+				None:
+					expr
+		PreClosureConcurrentExpr(block, typ, loc):
+			prepared_body: CoreExpr = prepare_expr(decls, block.body)
+			prepared_timeout: Option[CoreExpr] = prepare_optional_expr(decls, block.timeout)
+
+			if (
+				same_core_expr(prepared_body, block.body)
+				and same_optional_core_expr(prepared_timeout, block.timeout)
+			):
+				expr
+			else:
+				PreClosureConcurrentExpr(
+					{ block |
+						body = prepared_body,
+						timeout = prepared_timeout
+					},
+					typ,
+					loc,
+				)
+		ConcurrentExpr(block, typ, loc):
+			match prepare_concurrent_block(decls, block):
+				Some(prepared_block):
+					ConcurrentExpr(prepared_block, typ, loc)
+				None:
+					expr
+		_:
+			expr
+
+
+-- The match forms. Semantic matches already go through the shared traversal,
+-- which applies the same reuse rule.
+private pure func prepare_match_expr(decls: PrepareDecls, expr: CoreExpr) -> CoreExpr:
+	match expr:
 		RawMatchExpr(scrutinee, cases, typ, loc):
-			RawMatchExpr(
-				prepare_expr(decls, scrutinee),
-				cases.map(func(case): { case | body = prepare_expr(decls, case.body) }),
-				typ,
-				loc,
+			prepared_scrutinee: CoreExpr = prepare_expr(decls, scrutinee)
+			prepared_cases: Option[List[CoreRawMatchCase]] = prepare_list_items(
+				cases,
+				func(match_case): prepare_raw_match_case(decls, match_case),
 			)
+
+			if same_core_expr(prepared_scrutinee, scrutinee) and prepared_cases.is_none():
+				expr
+			else:
+				RawMatchExpr(
+					prepared_scrutinee,
+					prepared_cases.get_or(cases),
+					typ,
+					loc,
+				)
 		SemanticMatchExpr(scrutinee, tree, typ, loc):
 			CoreTraverse.map_core_expr_children_with_context(expr, decls, prepare_expr)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			prepared_scrutinee: CoreExpr = prepare_expr(decls, scrutinee)
+			prepared_cases: Option[List[CoreLiteralMatchCase]] = prepare_literal_match_cases(
+				decls,
+				cases,
+			)
+			prepared_fallback: Option[CoreLiteralMatchFallback] = prepare_literal_match_fallback(
+				decls,
+				fallback,
+			)
+
+			if (
+				same_core_expr(prepared_scrutinee, scrutinee)
+				and prepared_cases.is_none()
+				and prepared_fallback.is_none()
+			):
+				expr
+			else:
+				LiteralMatchExpr(
+					prepared_scrutinee,
+					prepared_cases.get_or(cases),
+					prepared_fallback.get_or(fallback),
+					typ,
+					loc,
+				)
+		AccessorLiteralMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc):
+			prepared_scrutinee: CoreExpr = prepare_expr(decls, scrutinee)
+			prepared_match: Option[CoreConstructorLiteralMatch] = prepare_constructor_literal_match(
+				decls,
+				match_expr,
+			)
+
+			if same_core_expr(prepared_scrutinee, scrutinee) and prepared_match.is_none():
+				expr
+			else:
+				AccessorLiteralMatchExpr(
+					prepared_scrutinee,
+					scrutinee_release_policy,
+					prepared_match.get_or(match_expr),
+					typ,
+					loc,
+				)
+		LengthMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc):
+			prepared_scrutinee: CoreExpr = prepare_expr(decls, scrutinee)
+			prepared_match: Option[CoreConstructorLengthMatch] = prepare_constructor_length_match(
+				decls,
+				match_expr,
+			)
+
+			if same_core_expr(prepared_scrutinee, scrutinee) and prepared_match.is_none():
+				expr
+			else:
+				LengthMatchExpr(
+					prepared_scrutinee,
+					scrutinee_release_policy,
+					prepared_match.get_or(match_expr),
+					typ,
+					loc,
+				)
 		ConstructorMatchExpr(scrutinee, scrutinee_release_policy, cases, fallback, typ, loc):
-			ConstructorMatchExpr(
-				prepare_expr(decls, scrutinee),
-				scrutinee_release_policy,
-				prepare_constructor_match_cases(decls, cases),
-				prepare_constructor_match_fallback(decls, fallback),
-				typ,
-				loc,
+			prepared_scrutinee: CoreExpr = prepare_expr(decls, scrutinee)
+			prepared_cases: Option[List[CoreConstructorMatchCase]] = prepare_constructor_match_cases(
+				decls,
+				cases,
 			)
-		IfExpr(cond, then_expr, else_expr, typ, loc):
-			IfExpr(
-				prepare_expr(decls, cond),
-				prepare_expr(decls, then_expr),
-				prepare_expr(decls, else_expr),
-				typ,
-				loc,
+			prepared_fallback: Option[CoreConstructorMatchFallback] = prepare_constructor_match_fallback(
+				decls,
+				fallback,
 			)
+
+			if (
+				same_core_expr(prepared_scrutinee, scrutinee)
+				and prepared_cases.is_none()
+				and prepared_fallback.is_none()
+			):
+				expr
+			else:
+				ConstructorMatchExpr(
+					prepared_scrutinee,
+					scrutinee_release_policy,
+					prepared_cases.get_or(cases),
+					prepared_fallback.get_or(fallback),
+					typ,
+					loc,
+				)
+		_:
+			expr
 
 
 private pure func prepare_dict_literal_entry_for_ownership(
 	decls: PrepareDecls,
 	entry: CoreDictLiteralEntry,
-) -> CoreDictLiteralEntry:
-	{
-		key = prepare_dict_literals_for_ownership_expr(decls, entry.key),
-		value = prepare_dict_literals_for_ownership_expr(decls, entry.value)
-	}
+) -> Option[CoreDictLiteralEntry]:
+	prepared_key: CoreExpr = prepare_dict_literals_for_ownership_expr(decls, entry.key)
+	prepared_value: CoreExpr = prepare_dict_literals_for_ownership_expr(decls, entry.value)
+
+	if same_core_expr(prepared_key, entry.key) and same_core_expr(prepared_value, entry.value):
+		None
+	else:
+		Some({
+			key = prepared_key,
+			value = prepared_value,
+		})
 
 
 private union PrepareDictOwnershipLogicalTask:
 	PrepareDictOwnershipLogicalNode(CoreExpr)
-	RebuildPreparedDictOwnershipLogicalNode(CoreLogicalOp, CoreType, CoreSourceLoc)
+	RebuildPreparedDictOwnershipLogicalNode(CoreExpr)
 
 
 private pure func prepare_dict_literals_for_ownership_expr(
@@ -4559,11 +5314,17 @@ private pure func prepare_dict_literals_for_ownership_expr(
 ) -> CoreExpr:
 	match expr:
 		DictExpr(entries, typ, loc):
-			prepared_entries: List[CoreDictLiteralEntry] = entries.map(
-				func(entry): prepare_dict_literal_entry_for_ownership(decls, entry),
+			lower_dict_literal_expr(
+				decls,
+				expr,
+				entries,
+				prepare_list_items(
+					entries,
+					func(entry): prepare_dict_literal_entry_for_ownership(decls, entry),
+				),
+				typ,
+				loc,
 			)
-
-			lower_dict_literal_expr(decls, prepared_entries, typ, loc)
 		LogicalExpr(_, _, _, _, _):
 			prepare_dict_literals_for_ownership_logical_expr(decls, expr)
 		_:
@@ -4594,9 +5355,7 @@ private pure func prepare_dict_literals_for_ownership_logical_expr(
 						match current_expr:
 							LogicalExpr(op, left, right, typ, loc):
 								rebuild_task: PrepareDictOwnershipLogicalTask = RebuildPreparedDictOwnershipLogicalNode(
-									op,
-									typ,
-									loc,
+									current_expr,
 								)
 
 								tasks = if task_count < tasks.length():
@@ -4639,14 +5398,26 @@ private pure func prepare_dict_literals_for_ownership_logical_expr(
 									prepared.append(prepared_expr)
 
 								prepared_count += 1
-					RebuildPreparedDictOwnershipLogicalNode(op, typ, loc):
-						match (prepared.get(prepared_count - 2), prepared.get(prepared_count - 1)):
-							(Some(left), Some(right)):
-								prepared = prepared.set(
-									prepared_count - 2,
-									LogicalExpr(op, left, right, typ, loc),
-								)
-								prepared_count -= 1
+					RebuildPreparedDictOwnershipLogicalNode(source_expr):
+						match source_expr:
+							LogicalExpr(op, left, right, typ, loc):
+								match (
+									prepared.get(prepared_count - 2),
+									prepared.get(prepared_count - 1),
+								):
+									(Some(prepared_left), Some(prepared_right)):
+										rebuilt: CoreExpr = if (
+											same_core_expr(prepared_left, left)
+											and same_core_expr(prepared_right, right)
+										):
+											source_expr
+										else:
+											LogicalExpr(op, prepared_left, prepared_right, typ, loc)
+
+										prepared = prepared.set(prepared_count - 2, rebuilt)
+										prepared_count -= 1
+									_:
+										valid = False
 							_:
 								valid = False
 			None:
@@ -4705,15 +5476,29 @@ pure func prepare_dict_literals_for_ownership(program: CoreProgram) -> CoreProgr
 private pure func prepare_function(decls: PrepareDecls, func_info: CoreFunction) -> CoreFunction:
 	match func_info.body:
 		Some(body):
-			prepared_body: CoreExpr = prepare_expr(decls, body)
-			{ func_info | body = Some(annotate_tensor_storage_expr([], prepared_body)) }
+			prepared_body: CoreExpr = annotate_tensor_storage_expr(
+				[],
+				prepare_expr(decls, body),
+			)
+
+			if same_core_expr(prepared_body, body):
+				func_info
+			else:
+				{ func_info | body = Some(prepared_body) }
 		None:
 			func_info
 
 
 private pure func prepare_global(decls: PrepareDecls, global: CoreGlobal) -> CoreGlobal:
-	prepared_init: CoreExpr = prepare_expr(decls, global.init)
-	{ global | init = annotate_tensor_storage_expr([], prepared_init) }
+	prepared_init: CoreExpr = annotate_tensor_storage_expr(
+		[],
+		prepare_expr(decls, global.init),
+	)
+
+	if same_core_expr(prepared_init, global.init):
+		global
+	else:
+		{ global | init = prepared_init }
 
 
 private pure func prepare_decl(decls: PrepareDecls, decl: CoreDecl) -> CoreDecl:

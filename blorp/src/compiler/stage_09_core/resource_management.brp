@@ -149,6 +149,8 @@ import:
 		),
 		CoreLogicalOp,
 		CoreProgram,
+		CoreRawMatchCase,
+		CoreRecordCowField,
 		CoreRecordFieldValue,
 		CoreReleasePolicy(NoReleasePolicy),
 		CoreResourceExit(ResourceBreakExit, ResourceContinueExit),
@@ -182,14 +184,73 @@ import:
 		),
 		CoreType,
 		CoreVar,
-		clone_tensor_for_element_storage,
 		core_var_equal,
 	traverse as CoreTraverse
 
 
-private union ResourceLogicalTask:
-	RewriteResourceLogicalNode(CoreExpr)
-	RebuildResourceLogicalNode(CoreLogicalOp, CoreType, CoreSourceLoc)
+-- Allocation identity for the reuse rule this pass follows: a rewritten child
+-- that is the same allocation as its input proves that the input node can be
+-- handed back as is, so the rewrite allocates only along the spine to the
+-- break or continue it actually replaced with a cleanup exit. Core is
+-- immutable value data, so sharing subtrees between input and output is safe.
+-- Bound straight to the runtime primitive for the same bootstrap reason as the
+-- matching block in traverse.brp; delete the blocks together and import
+-- `memory: same_object` instead.
+foreign:
+	private pure func same_core_expr(left: CoreExpr, right: CoreExpr) -> Bool = "blorp_same_object"
+	private pure func same_core_exprs(
+		left: List[CoreExpr],
+		right: List[CoreExpr],
+	) -> Bool = "blorp_same_object"
+
+
+private pure func same_optional_core_expr(left: Option[CoreExpr], right: Option[CoreExpr]) -> Bool:
+	match left:
+		Some(left_expr):
+			match right:
+				Some(right_expr):
+					same_core_expr(left_expr, right_expr)
+				None:
+					False
+		None:
+			right.is_none()
+
+
+-- Payload helpers below answer `None` for "this value came back unchanged", so
+-- a caller keeps its own input instead of allocating an equal copy first. This
+-- maps a list with such a helper and answers `None` itself when no item
+-- changed, copying the untouched prefix only once an item actually changes.
+private pure func rewrite_list_items[T](
+	items: List[T],
+	rewrite_item: pure (T) -> Option[T],
+) -> Option[List[T]]:
+	var rewritten: List[T] = []
+	var changed: Bool = False
+	var index: Int = 0
+
+	for item in items:
+		match rewrite_item(item):
+			Some(rewritten_item):
+				rewritten = if changed:
+					rewritten.append(rewritten_item)
+				else:
+					items
+						.take(index)
+						.append(rewritten_item)
+
+				changed = True
+			None:
+				if changed:
+					rewritten = rewritten.append(item)
+				else:
+					void
+
+		index += 1
+
+	if changed:
+		Some(rewritten)
+	else:
+		None
 
 
 private pure func prepend_cleanup(cleanup: CoreExpr, cleanups: List[CoreExpr]) -> List[CoreExpr]:
@@ -279,13 +340,15 @@ private pure func match_branch_cleanups(
 				cleanups
 
 
+-- A break or continue with no active cleanup is the input node itself.
 private pure func break_or_cleanup_exit(
+	expr: CoreExpr,
 	cleanups: List[CoreExpr],
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> CoreExpr:
 	if cleanups.length() == 0:
-		BreakExpr(typ, loc)
+		expr
 	else:
 		ResourceCleanupExitExpr(
 			{
@@ -298,12 +361,13 @@ private pure func break_or_cleanup_exit(
 
 
 private pure func continue_or_cleanup_exit(
+	expr: CoreExpr,
 	cleanups: List[CoreExpr],
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> CoreExpr:
 	if cleanups.length() == 0:
-		ContinueExpr(typ, loc)
+		expr
 	else:
 		ResourceCleanupExitExpr(
 			{
@@ -325,393 +389,617 @@ private pure func rewrite_resource_expr_list_with_cleanups(
 	)
 
 
+private pure func rewrite_tuple_element_with_cleanups(
+	element: CoreTupleElement,
+	cleanups: List[CoreExpr],
+) -> Option[CoreTupleElement]:
+	match element:
+		TuplePrimElement(value):
+			rewritten: CoreExpr = rewrite_resource_expr_with_cleanups(value, cleanups)
+
+			if same_core_expr(rewritten, value):
+				None
+			else:
+				Some(TuplePrimElement(rewritten))
+		TuplePointerElement(value):
+			rewritten: CoreExpr = rewrite_resource_expr_with_cleanups(value, cleanups)
+
+			if same_core_expr(rewritten, value):
+				None
+			else:
+				Some(TuplePointerElement(rewritten))
+		TupleStructElement(value, c_type):
+			rewritten: CoreExpr = rewrite_resource_expr_with_cleanups(value, cleanups)
+
+			if same_core_expr(rewritten, value):
+				None
+			else:
+				Some(TupleStructElement(rewritten, c_type))
+		TupleStackResultElement(value):
+			rewritten: CoreExpr = rewrite_resource_expr_with_cleanups(value, cleanups)
+
+			if same_core_expr(rewritten, value):
+				None
+			else:
+				Some(TupleStackResultElement(rewritten))
+		TupleVoidElement:
+			None
+		TupleFloatElement(value):
+			rewritten: CoreExpr = rewrite_resource_expr_with_cleanups(value, cleanups)
+
+			if same_core_expr(rewritten, value):
+				None
+			else:
+				Some(TupleFloatElement(rewritten))
+		TupleFloat32Element(value):
+			rewritten: CoreExpr = rewrite_resource_expr_with_cleanups(value, cleanups)
+
+			if same_core_expr(rewritten, value):
+				None
+			else:
+				Some(TupleFloat32Element(rewritten))
+		TupleFloat16Element(value):
+			rewritten: CoreExpr = rewrite_resource_expr_with_cleanups(value, cleanups)
+
+			if same_core_expr(rewritten, value):
+				None
+			else:
+				Some(TupleFloat16Element(rewritten))
+
+
 private pure func rewrite_tuple_elements_with_cleanups(
 	elements: List[CoreTupleElement],
 	cleanups: List[CoreExpr],
-) -> List[CoreTupleElement]:
-	var result: List[CoreTupleElement] = []
-
-	for element in elements:
-		match element:
-			TuplePrimElement(value):
-				result = result.append(
-					TuplePrimElement(rewrite_resource_expr_with_cleanups(value, cleanups)),
-				)
-			TuplePointerElement(value):
-				result = result.append(
-					TuplePointerElement(rewrite_resource_expr_with_cleanups(value, cleanups)),
-				)
-			TupleStructElement(value, c_type):
-				result = result.append(
-					TupleStructElement(
-						rewrite_resource_expr_with_cleanups(value, cleanups),
-						c_type,
-					),
-				)
-			TupleStackResultElement(value):
-				result = result.append(
-					TupleStackResultElement(rewrite_resource_expr_with_cleanups(value, cleanups)),
-				)
-			TupleVoidElement:
-				result = result.append(TupleVoidElement)
-			TupleFloatElement(value):
-				result = result.append(
-					TupleFloatElement(rewrite_resource_expr_with_cleanups(value, cleanups)),
-				)
-			TupleFloat32Element(value):
-				result = result.append(
-					TupleFloat32Element(rewrite_resource_expr_with_cleanups(value, cleanups)),
-				)
-			TupleFloat16Element(value):
-				result = result.append(
-					TupleFloat16Element(rewrite_resource_expr_with_cleanups(value, cleanups)),
-				)
-
-	result
+) -> Option[List[CoreTupleElement]]:
+	rewrite_list_items(
+		elements,
+		func(element): rewrite_tuple_element_with_cleanups(element, cleanups),
+	)
 
 
 private pure func rewrite_tailrec_list_spread_rebind_with_cleanups(
 	rebind: CoreTailrecListSpreadRebind,
 	cleanups: List[CoreExpr],
-) -> CoreTailrecListSpreadRebind:
-	{
-		param_index = rebind.param_index,
-		value = rewrite_resource_expr_with_cleanups(rebind.value, cleanups)
-	}
+) -> Option[CoreTailrecListSpreadRebind]:
+	rewritten_value: CoreExpr = rewrite_resource_expr_with_cleanups(rebind.value, cleanups)
+
+	if same_core_expr(rewritten_value, rebind.value):
+		None
+	else:
+		Some({ rebind | value = rewritten_value })
 
 
 private pure func rewrite_tailrec_list_spread_loop_with_cleanups(
 	loop: CoreTailrecListSpreadLoop,
-) -> CoreTailrecListSpreadLoop:
-	{
-		params = loop.params,
-		return_type = loop.return_type,
-		list_index = loop.list_index,
-		list_param = loop.list_param,
-		cursor = loop.cursor,
-		layout = loop.layout,
-		body = rewrite_resource_expr_with_cleanups(loop.body, [])
-	}
+) -> Option[CoreTailrecListSpreadLoop]:
+	rewritten_body: CoreExpr = rewrite_resource_expr_with_cleanups(loop.body, [])
+
+	if same_core_expr(rewritten_body, loop.body):
+		None
+	else:
+		Some({ loop | body = rewritten_body })
 
 
 private pure func rewrite_boxed_storage_value_with_cleanups(
 	value: CoreBoxedStorageValue,
 	cleanups: List[CoreExpr],
-) -> CoreBoxedStorageValue:
-	{
-		kind = value.kind,
-		value = rewrite_resource_expr_with_cleanups(value.value, cleanups),
-		needs_release = value.needs_release,
-		transfers_ownership = value.transfers_ownership
-	}
+) -> Option[CoreBoxedStorageValue]:
+	rewritten_value: CoreExpr = rewrite_resource_expr_with_cleanups(value.value, cleanups)
+
+	if same_core_expr(rewritten_value, value.value):
+		None
+	else:
+		Some({ value | value = rewritten_value })
 
 
 private pure func rewrite_box_op_with_cleanups(
 	box: CoreBoxOp,
 	cleanups: List[CoreExpr],
-) -> CoreBoxOp:
-	{
-		kind = box.kind,
-		value = rewrite_resource_expr_with_cleanups(box.value, cleanups),
-		source_type = box.source_type
-	}
+) -> Option[CoreBoxOp]:
+	rewritten_value: CoreExpr = rewrite_resource_expr_with_cleanups(box.value, cleanups)
+
+	if same_core_expr(rewritten_value, box.value):
+		None
+	else:
+		Some({ box | value = rewritten_value })
 
 
 private pure func rewrite_boxed_storage_values_with_cleanups(
 	values: List[CoreBoxedStorageValue],
 	cleanups: List[CoreExpr],
-) -> List[CoreBoxedStorageValue]:
-	values.map(func(value): rewrite_boxed_storage_value_with_cleanups(value, cleanups))
+) -> Option[List[CoreBoxedStorageValue]]:
+	rewrite_list_items(
+		values,
+		func(value): rewrite_boxed_storage_value_with_cleanups(value, cleanups),
+	)
 
 
 private pure func rewrite_dict_entry_with_cleanups(
 	entry: CoreDictEntry,
 	cleanups: List[CoreExpr],
-) -> CoreDictEntry:
-	{
-		key = rewrite_boxed_storage_value_with_cleanups(entry.key, cleanups),
-		value = rewrite_boxed_storage_value_with_cleanups(entry.value, cleanups)
-	}
+) -> Option[CoreDictEntry]:
+	rewritten_key: Option[CoreBoxedStorageValue] = rewrite_boxed_storage_value_with_cleanups(
+		entry.key,
+		cleanups,
+	)
+	rewritten_value: Option[CoreBoxedStorageValue] = rewrite_boxed_storage_value_with_cleanups(
+		entry.value,
+		cleanups,
+	)
+
+	if rewritten_key.is_none() and rewritten_value.is_none():
+		None
+	else:
+		Some({
+			key = rewritten_key.get_or(entry.key),
+			value = rewritten_value.get_or(entry.value),
+		})
 
 
 private pure func rewrite_dict_construct_with_cleanups(
 	construct: CoreDictConstruct,
 	cleanups: List[CoreExpr],
-) -> CoreDictConstruct:
-	{
-		constructor = construct.constructor,
-		entries = construct.entries.map(
-			func(entry): rewrite_dict_entry_with_cleanups(entry, cleanups),
-		),
-		value_needs_release = construct.value_needs_release
-	}
+) -> Option[CoreDictConstruct]:
+	match rewrite_list_items(
+		construct.entries,
+		func(entry): rewrite_dict_entry_with_cleanups(entry, cleanups),
+	):
+		Some(entries):
+			Some({ construct | entries = entries })
+		None:
+			None
 
 
 private pure func rewrite_list_construct_with_cleanups(
 	construct: CoreListConstruct,
 	cleanups: List[CoreExpr],
-) -> CoreListConstruct:
-	{
-		layout = construct.layout,
-		elements = rewrite_boxed_storage_values_with_cleanups(construct.elements, cleanups),
-		elem_needs_release = construct.elem_needs_release
-	}
+) -> Option[CoreListConstruct]:
+	match rewrite_boxed_storage_values_with_cleanups(construct.elements, cleanups):
+		Some(elements):
+			Some({ construct | elements = elements })
+		None:
+			None
 
 
 private pure func rewrite_list_alloc_with_cleanups(
 	alloc: CoreListAlloc,
 	cleanups: List[CoreExpr],
-) -> CoreListAlloc:
-	{
-		layout = alloc.layout,
-		capacity = rewrite_resource_expr_with_cleanups(alloc.capacity, cleanups),
-		elem_needs_release = alloc.elem_needs_release
-	}
+) -> Option[CoreListAlloc]:
+	rewritten_capacity: CoreExpr = rewrite_resource_expr_with_cleanups(alloc.capacity, cleanups)
+
+	if same_core_expr(rewritten_capacity, alloc.capacity):
+		None
+	else:
+		Some({ alloc | capacity = rewritten_capacity })
 
 
 private pure func rewrite_list_get_with_cleanups(
 	get: CoreListGet,
 	cleanups: List[CoreExpr],
-) -> CoreListGet:
-	{
-		layout = get.layout,
-		list = rewrite_resource_expr_with_cleanups(get.list, cleanups),
-		index = rewrite_resource_expr_with_cleanups(get.index, cleanups),
-		bounds = get.bounds
-	}
+) -> Option[CoreListGet]:
+	rewritten_list: CoreExpr = rewrite_resource_expr_with_cleanups(get.list, cleanups)
+	rewritten_index: CoreExpr = rewrite_resource_expr_with_cleanups(get.index, cleanups)
+
+	if same_core_expr(rewritten_list, get.list) and same_core_expr(rewritten_index, get.index):
+		None
+	else:
+		Some({ get |
+				list = rewritten_list,
+				index = rewritten_index
+			})
 
 
 private pure func rewrite_list_handoff_with_cleanups(
 	handoff: CoreListHandoff,
 	cleanups: List[CoreExpr],
-) -> CoreListHandoff:
-	{
-		mode = handoff.mode,
-		layout = handoff.layout,
-		elem_needs_release = handoff.elem_needs_release,
-		source = rewrite_resource_expr_with_cleanups(handoff.source, cleanups),
-		source_var = handoff.source_var,
-		source_type = handoff.source_type,
-		result_type = handoff.result_type,
-		capacity = rewrite_resource_expr_with_cleanups(handoff.capacity, cleanups),
-		result_var = handoff.result_var,
-		len_var = handoff.len_var,
-		out_var = handoff.out_var,
-		body = rewrite_resource_expr_with_cleanups(handoff.body, cleanups),
-		write_order = handoff.write_order
-	}
+) -> Option[CoreListHandoff]:
+	rewritten_source: CoreExpr = rewrite_resource_expr_with_cleanups(handoff.source, cleanups)
+	rewritten_capacity: CoreExpr = rewrite_resource_expr_with_cleanups(handoff.capacity, cleanups)
+	rewritten_body: CoreExpr = rewrite_resource_expr_with_cleanups(handoff.body, cleanups)
+
+	if (
+		same_core_expr(rewritten_source, handoff.source)
+		and same_core_expr(rewritten_capacity, handoff.capacity)
+		and same_core_expr(rewritten_body, handoff.body)
+	):
+		None
+	else:
+		Some({ handoff |
+				source = rewritten_source,
+				capacity = rewritten_capacity,
+				body = rewritten_body
+			})
 
 
 private pure func rewrite_list_handoff_set_source_slot_with_cleanups(
 	slot: CoreListHandoffSetSourceSlot,
 	cleanups: List[CoreExpr],
-) -> CoreListHandoffSetSourceSlot:
-	{
-		result = rewrite_resource_expr_with_cleanups(slot.result, cleanups),
-		out_index = rewrite_resource_expr_with_cleanups(slot.out_index, cleanups),
-		source = rewrite_resource_expr_with_cleanups(slot.source, cleanups),
-		source_index = rewrite_resource_expr_with_cleanups(slot.source_index, cleanups)
-	}
+) -> Option[CoreListHandoffSetSourceSlot]:
+	rewritten_result: CoreExpr = rewrite_resource_expr_with_cleanups(slot.result, cleanups)
+	rewritten_out_index: CoreExpr = rewrite_resource_expr_with_cleanups(slot.out_index, cleanups)
+	rewritten_source: CoreExpr = rewrite_resource_expr_with_cleanups(slot.source, cleanups)
+	rewritten_source_index: CoreExpr = rewrite_resource_expr_with_cleanups(
+		slot.source_index,
+		cleanups,
+	)
+
+	if (
+		same_core_expr(rewritten_result, slot.result)
+		and same_core_expr(rewritten_out_index, slot.out_index)
+		and same_core_expr(rewritten_source, slot.source)
+		and same_core_expr(rewritten_source_index, slot.source_index)
+	):
+		None
+	else:
+		Some({
+			result = rewritten_result,
+			out_index = rewritten_out_index,
+			source = rewritten_source,
+			source_index = rewritten_source_index,
+		})
 
 
 private pure func rewrite_string_byte_read_with_cleanups(
 	read: CoreStringByteRead,
 	cleanups: List[CoreExpr],
-) -> CoreStringByteRead:
-	{
-		source = rewrite_resource_expr_with_cleanups(read.source, cleanups),
-		index = rewrite_resource_expr_with_cleanups(read.index, cleanups)
-	}
+) -> Option[CoreStringByteRead]:
+	rewritten_source: CoreExpr = rewrite_resource_expr_with_cleanups(read.source, cleanups)
+	rewritten_index: CoreExpr = rewrite_resource_expr_with_cleanups(read.index, cleanups)
+
+	if (
+		same_core_expr(rewritten_source, read.source)
+		and same_core_expr(rewritten_index, read.index)
+	):
+		None
+	else:
+		Some({
+			source = rewritten_source,
+			index = rewritten_index,
+		})
 
 
 private pure func rewrite_string_byte_write_with_cleanups(
 	write: CoreStringByteWrite,
 	cleanups: List[CoreExpr],
-) -> CoreStringByteWrite:
-	{
-		target = rewrite_resource_expr_with_cleanups(write.target, cleanups),
-		index = rewrite_resource_expr_with_cleanups(write.index, cleanups),
-		byte = rewrite_resource_expr_with_cleanups(write.byte, cleanups)
-	}
+) -> Option[CoreStringByteWrite]:
+	rewritten_target: CoreExpr = rewrite_resource_expr_with_cleanups(write.target, cleanups)
+	rewritten_index: CoreExpr = rewrite_resource_expr_with_cleanups(write.index, cleanups)
+	rewritten_byte: CoreExpr = rewrite_resource_expr_with_cleanups(write.byte, cleanups)
+
+	if (
+		same_core_expr(rewritten_target, write.target)
+		and same_core_expr(rewritten_index, write.index)
+		and same_core_expr(rewritten_byte, write.byte)
+	):
+		None
+	else:
+		Some({
+			target = rewritten_target,
+			index = rewritten_index,
+			byte = rewritten_byte,
+		})
 
 
 private pure func rewrite_string_byte_copy_with_cleanups(
 	copy: CoreStringByteCopy,
 	cleanups: List[CoreExpr],
-) -> CoreStringByteCopy:
-	{
-		dst = rewrite_resource_expr_with_cleanups(copy.dst, cleanups),
-		dst_pos = rewrite_resource_expr_with_cleanups(copy.dst_pos, cleanups),
-		src = rewrite_resource_expr_with_cleanups(copy.src, cleanups),
-		src_pos = rewrite_resource_expr_with_cleanups(copy.src_pos, cleanups),
-		len = rewrite_resource_expr_with_cleanups(copy.len, cleanups)
-	}
+) -> Option[CoreStringByteCopy]:
+	rewritten_dst: CoreExpr = rewrite_resource_expr_with_cleanups(copy.dst, cleanups)
+	rewritten_dst_pos: CoreExpr = rewrite_resource_expr_with_cleanups(copy.dst_pos, cleanups)
+	rewritten_src: CoreExpr = rewrite_resource_expr_with_cleanups(copy.src, cleanups)
+	rewritten_src_pos: CoreExpr = rewrite_resource_expr_with_cleanups(copy.src_pos, cleanups)
+	rewritten_len: CoreExpr = rewrite_resource_expr_with_cleanups(copy.len, cleanups)
+
+	if (
+		same_core_expr(rewritten_dst, copy.dst)
+		and same_core_expr(rewritten_dst_pos, copy.dst_pos)
+		and same_core_expr(rewritten_src, copy.src)
+		and same_core_expr(rewritten_src_pos, copy.src_pos)
+		and same_core_expr(rewritten_len, copy.len)
+	):
+		None
+	else:
+		Some({
+			dst = rewritten_dst,
+			dst_pos = rewritten_dst_pos,
+			src = rewritten_src,
+			src_pos = rewritten_src_pos,
+			len = rewritten_len,
+		})
 
 
 private pure func rewrite_tensor_raw_read_with_cleanups(
 	read: CoreTensorRawRead,
 	cleanups: List[CoreExpr],
-) -> CoreTensorRawRead:
-	{
-		view = read.view,
-		kind = read.kind,
-		index = rewrite_resource_expr_with_cleanups(read.index, cleanups)
-	}
+) -> Option[CoreTensorRawRead]:
+	rewritten_index: CoreExpr = rewrite_resource_expr_with_cleanups(read.index, cleanups)
+
+	if same_core_expr(rewritten_index, read.index):
+		None
+	else:
+		Some({ read | index = rewritten_index })
 
 
 private pure func rewrite_tensor_raw_write_with_cleanups(
 	write: CoreTensorRawWrite,
 	cleanups: List[CoreExpr],
-) -> CoreTensorRawWrite:
-	{
-		view = write.view,
-		kind = write.kind,
-		index = rewrite_resource_expr_with_cleanups(write.index, cleanups),
-		value = rewrite_resource_expr_with_cleanups(write.value, cleanups)
-	}
+) -> Option[CoreTensorRawWrite]:
+	rewritten_index: CoreExpr = rewrite_resource_expr_with_cleanups(write.index, cleanups)
+	rewritten_value: CoreExpr = rewrite_resource_expr_with_cleanups(write.value, cleanups)
+
+	if (
+		same_core_expr(rewritten_index, write.index)
+		and same_core_expr(rewritten_value, write.value)
+	):
+		None
+	else:
+		Some({ write |
+				index = rewritten_index,
+				value = rewritten_value
+			})
 
 
 private pure func rewrite_tensor_raw_view_binding_with_cleanups(
 	binding: CoreTensorRawViewBinding,
 	cleanups: List[CoreExpr],
-) -> CoreTensorRawViewBinding:
-	{
-		variable = binding.variable,
-		kind = binding.kind,
-		source = rewrite_resource_expr_with_cleanups(binding.source, cleanups)
-	}
+) -> Option[CoreTensorRawViewBinding]:
+	rewritten_source: CoreExpr = rewrite_resource_expr_with_cleanups(binding.source, cleanups)
+
+	if same_core_expr(rewritten_source, binding.source):
+		None
+	else:
+		Some({ binding | source = rewritten_source })
 
 
 private pure func rewrite_tensor_literal_with_cleanups(
 	literal: CoreTensorLiteral,
 	cleanups: List[CoreExpr],
-) -> CoreTensorLiteral:
-	{
-		shape = literal.shape,
-		payload = rewrite_tensor_literal_payload_with_cleanups(literal.payload, cleanups)
-	}
+) -> Option[CoreTensorLiteral]:
+	match rewrite_tensor_literal_payload_with_cleanups(literal.payload, cleanups):
+		Some(payload):
+			Some({ literal | payload = payload })
+		None:
+			None
 
 
 private pure func rewrite_tensor_literal_payload_with_cleanups(
 	payload: CoreTensorLiteralPayload,
 	cleanups: List[CoreExpr],
-) -> CoreTensorLiteralPayload:
+) -> Option[CoreTensorLiteralPayload]:
 	match payload:
 		TensorRawLiteralPayload(raw):
-			TensorRawLiteralPayload({
-				raw_kind = raw.raw_kind,
-				elements = rewrite_resource_expr_list_with_cleanups(raw.elements, cleanups),
-			})
+			rewritten_elements: List[CoreExpr] = rewrite_resource_expr_list_with_cleanups(
+				raw.elements,
+				cleanups,
+			)
+
+			if same_core_exprs(rewritten_elements, raw.elements):
+				None
+			else:
+				Some(TensorRawLiteralPayload({ raw | elements = rewritten_elements }))
 		TensorInlineStructLiteralPayload(inline_struct):
-			TensorInlineStructLiteralPayload({
-				struct_c_type = inline_struct.struct_c_type,
-				elements = rewrite_resource_expr_list_with_cleanups(
-					inline_struct.elements,
-					cleanups,
-				),
-			})
+			rewritten_elements: List[CoreExpr] = rewrite_resource_expr_list_with_cleanups(
+				inline_struct.elements,
+				cleanups,
+			)
+
+			if same_core_exprs(rewritten_elements, inline_struct.elements):
+				None
+			else:
+				Some(
+					TensorInlineStructLiteralPayload(
+						{ inline_struct | elements = rewritten_elements },
+					),
+				)
 
 
 private pure func rewrite_tensor_boxed_literal_with_cleanups(
 	literal: CoreTensorBoxedLiteral,
 	cleanups: List[CoreExpr],
-) -> CoreTensorBoxedLiteral:
-	{
-		shape = literal.shape,
-		elements = rewrite_boxed_storage_values_with_cleanups(literal.elements, cleanups),
-		elem_needs_release = literal.elem_needs_release
-	}
+) -> Option[CoreTensorBoxedLiteral]:
+	match rewrite_boxed_storage_values_with_cleanups(literal.elements, cleanups):
+		Some(elements):
+			Some({ literal | elements = elements })
+		None:
+			None
 
 
 private pure func rewrite_tensor_packed_literal_with_cleanups(
 	literal: CoreTensorPackedLiteral,
 	cleanups: List[CoreExpr],
-) -> CoreTensorPackedLiteral:
-	{
-		shape = literal.shape,
-		elem_size = literal.elem_size,
-		elements = rewrite_resource_expr_list_with_cleanups(literal.elements, cleanups)
-	}
+) -> Option[CoreTensorPackedLiteral]:
+	rewritten_elements: List[CoreExpr] = rewrite_resource_expr_list_with_cleanups(
+		literal.elements,
+		cleanups,
+	)
+
+	if same_core_exprs(rewritten_elements, literal.elements):
+		None
+	else:
+		Some({ literal | elements = rewritten_elements })
 
 
 private pure func rewrite_tensor_raw_fill_with_cleanups(
 	fill: CoreTensorRawFill,
 	cleanups: List[CoreExpr],
-) -> CoreTensorRawFill:
-	{
-		raw_kind = fill.raw_kind,
-		value = rewrite_resource_expr_with_cleanups(fill.value, cleanups),
-		dims = rewrite_resource_expr_list_with_cleanups(fill.dims, cleanups)
-	}
+) -> Option[CoreTensorRawFill]:
+	rewritten_value: CoreExpr = rewrite_resource_expr_with_cleanups(fill.value, cleanups)
+	rewritten_dims: List[CoreExpr] = rewrite_resource_expr_list_with_cleanups(fill.dims, cleanups)
+
+	if same_core_expr(rewritten_value, fill.value) and same_core_exprs(rewritten_dims, fill.dims):
+		None
+	else:
+		Some({ fill |
+				value = rewritten_value,
+				dims = rewritten_dims
+			})
 
 
 private pure func rewrite_string_set_len_with_cleanups(
 	set_len: CoreStringSetLen,
 	cleanups: List[CoreExpr],
-) -> CoreStringSetLen:
-	{
-		target = rewrite_resource_expr_with_cleanups(set_len.target, cleanups),
-		len = rewrite_resource_expr_with_cleanups(set_len.len, cleanups)
-	}
+) -> Option[CoreStringSetLen]:
+	rewritten_target: CoreExpr = rewrite_resource_expr_with_cleanups(set_len.target, cleanups)
+	rewritten_len: CoreExpr = rewrite_resource_expr_with_cleanups(set_len.len, cleanups)
+
+	if (
+		same_core_expr(rewritten_target, set_len.target)
+		and same_core_expr(rewritten_len, set_len.len)
+	):
+		None
+	else:
+		Some({
+			target = rewritten_target,
+			len = rewritten_len,
+		})
 
 
 private pure func rewrite_list_set_with_cleanups(
 	set: CoreListSet,
 	cleanups: List[CoreExpr],
-) -> CoreListSet:
-	{
-		layout = set.layout,
-		list = rewrite_resource_expr_with_cleanups(set.list, cleanups),
-		index = rewrite_resource_expr_with_cleanups(set.index, cleanups),
-		value = rewrite_boxed_storage_value_with_cleanups(set.value, cleanups),
-		value_is_stack_result = set.value_is_stack_result
-	}
+) -> Option[CoreListSet]:
+	rewritten_list: CoreExpr = rewrite_resource_expr_with_cleanups(set.list, cleanups)
+	rewritten_index: CoreExpr = rewrite_resource_expr_with_cleanups(set.index, cleanups)
+	rewritten_value: Option[CoreBoxedStorageValue] = rewrite_boxed_storage_value_with_cleanups(
+		set.value,
+		cleanups,
+	)
+
+	if (
+		same_core_expr(rewritten_list, set.list)
+		and same_core_expr(rewritten_index, set.index)
+		and rewritten_value.is_none()
+	):
+		None
+	else:
+		Some({ set |
+				list = rewritten_list,
+				index = rewritten_index,
+				value = rewritten_value.get_or(set.value)
+			})
 
 
 private pure func rewrite_list_swap_with_cleanups(
 	swap: CoreListSwap,
 	cleanups: List[CoreExpr],
-) -> CoreListSwap:
-	{
-		layout = swap.layout,
-		list = rewrite_resource_expr_with_cleanups(swap.list, cleanups),
-		left_index = rewrite_resource_expr_with_cleanups(swap.left_index, cleanups),
-		right_index = rewrite_resource_expr_with_cleanups(swap.right_index, cleanups)
-	}
+) -> Option[CoreListSwap]:
+	rewritten_list: CoreExpr = rewrite_resource_expr_with_cleanups(swap.list, cleanups)
+	rewritten_left_index: CoreExpr = rewrite_resource_expr_with_cleanups(swap.left_index, cleanups)
+	rewritten_right_index: CoreExpr = rewrite_resource_expr_with_cleanups(
+		swap.right_index,
+		cleanups,
+	)
+
+	if (
+		same_core_expr(rewritten_list, swap.list)
+		and same_core_expr(rewritten_left_index, swap.left_index)
+		and same_core_expr(rewritten_right_index, swap.right_index)
+	):
+		None
+	else:
+		Some({ swap |
+				list = rewritten_list,
+				left_index = rewritten_left_index,
+				right_index = rewritten_right_index
+			})
 
 
 private pure func rewrite_list_retain_with_cleanups(
 	retain: CoreListRetain,
 	cleanups: List[CoreExpr],
-) -> CoreListRetain:
-	{
-		list = rewrite_resource_expr_with_cleanups(retain.list, cleanups),
-		value = rewrite_boxed_storage_value_with_cleanups(retain.value, cleanups)
-	}
+) -> Option[CoreListRetain]:
+	rewritten_list: CoreExpr = rewrite_resource_expr_with_cleanups(retain.list, cleanups)
+	rewritten_value: Option[CoreBoxedStorageValue] = rewrite_boxed_storage_value_with_cleanups(
+		retain.value,
+		cleanups,
+	)
+
+	if same_core_expr(rewritten_list, retain.list) and rewritten_value.is_none():
+		None
+	else:
+		Some({
+			list = rewritten_list,
+			value = rewritten_value.get_or(retain.value),
+		})
+
+
+private pure func rewrite_record_field_with_cleanups(
+	field: CoreRecordFieldValue,
+	cleanups: List[CoreExpr],
+) -> Option[CoreRecordFieldValue]:
+	rewritten_value: CoreExpr = rewrite_resource_expr_with_cleanups(field.value, cleanups)
+
+	if same_core_expr(rewritten_value, field.value):
+		None
+	else:
+		Some({ field | value = rewritten_value })
 
 
 private pure func rewrite_record_fields_with_cleanups(
 	fields: List[CoreRecordFieldValue],
 	cleanups: List[CoreExpr],
-) -> List[CoreRecordFieldValue]:
-	fields.map(func(field):
-		{
-			name = field.name,
-			value = rewrite_resource_expr_with_cleanups(field.value, cleanups)
-		}
-	)
+) -> Option[List[CoreRecordFieldValue]]:
+	rewrite_list_items(fields, func(field): rewrite_record_field_with_cleanups(field, cleanups))
 
 
+private pure func rewrite_record_cow_field_with_cleanups(
+	field: CoreRecordCowField,
+	cleanups: List[CoreExpr],
+) -> Option[CoreRecordCowField]:
+	match field.replacement:
+		Some(replacement):
+			rewritten_replacement: CoreExpr = rewrite_resource_expr_with_cleanups(
+				replacement,
+				cleanups,
+			)
+
+			if same_core_expr(rewritten_replacement, replacement):
+				None
+			else:
+				Some({ field | replacement = Some(rewritten_replacement) })
+		None:
+			None
+
+
+private pure func rewrite_dict_literal_entry_with_cleanups(
+	entry: CoreDictLiteralEntry,
+	cleanups: List[CoreExpr],
+) -> Option[CoreDictLiteralEntry]:
+	rewritten_key: CoreExpr = rewrite_resource_expr_with_cleanups(entry.key, cleanups)
+	rewritten_value: CoreExpr = rewrite_resource_expr_with_cleanups(entry.value, cleanups)
+
+	if same_core_expr(rewritten_key, entry.key) and same_core_expr(rewritten_value, entry.value):
+		None
+	else:
+		Some({
+			key = rewritten_key,
+			value = rewritten_value,
+		})
+
+
+private pure func rewrite_raw_match_case_with_cleanups(
+	match_case: CoreRawMatchCase,
+	cleanups: List[CoreExpr],
+) -> Option[CoreRawMatchCase]:
+	rewritten_body: CoreExpr = rewrite_resource_expr_with_cleanups(match_case.body, cleanups)
+
+	if same_core_expr(rewritten_body, match_case.body):
+		None
+	else:
+		Some({ match_case | body = rewritten_body })
+
+
+-- A concurrent binding's right-hand side runs as its own task, so it never
+-- inherits the enclosing cleanup stack.
 private pure func rewrite_concurrent_binding_with_cleanups(
 	binding: CoreConcurrentBinding,
-	cleanups: List[CoreExpr],
-) -> CoreConcurrentBinding:
-	{
-		variable = binding.variable,
-		typ = binding.typ,
-		rhs = rewrite_resource_expr_with_cleanups(binding.rhs, []),
-		task = binding.task
-	}
+) -> Option[CoreConcurrentBinding]:
+	rewritten_rhs: CoreExpr = rewrite_resource_expr_with_cleanups(binding.rhs, [])
+
+	if same_core_expr(rewritten_rhs, binding.rhs):
+		None
+	else:
+		Some({ binding | rhs = rewritten_rhs })
 
 
 private pure func rewrite_optional_expr_with_cleanups(
@@ -727,161 +1015,223 @@ private pure func rewrite_optional_expr_with_cleanups(
 private pure func rewrite_concurrently_loop_with_cleanups(
 	loop: CoreConcurrentlyLoop,
 	cleanups: List[CoreExpr],
-) -> CoreConcurrentlyLoop:
-	{
-		variable = loop.variable,
-		item_type = loop.item_type,
-		item_mode = loop.item_mode,
-		iterable = rewrite_resource_expr_with_cleanups(loop.iterable, cleanups),
-		body = rewrite_resource_expr_with_cleanups(loop.body, []),
-		timeout = rewrite_optional_expr_with_cleanups(loop.timeout, cleanups),
-		limit = rewrite_resource_expr_with_cleanups(loop.limit, cleanups),
-		output = loop.output,
-		task = loop.task
-	}
+) -> Option[CoreConcurrentlyLoop]:
+	rewritten_iterable: CoreExpr = rewrite_resource_expr_with_cleanups(loop.iterable, cleanups)
+	rewritten_body: CoreExpr = rewrite_resource_expr_with_cleanups(loop.body, [])
+	rewritten_timeout: Option[CoreExpr] = rewrite_optional_expr_with_cleanups(
+		loop.timeout,
+		cleanups,
+	)
+	rewritten_limit: CoreExpr = rewrite_resource_expr_with_cleanups(loop.limit, cleanups)
+
+	if (
+		same_core_expr(rewritten_iterable, loop.iterable)
+		and same_core_expr(rewritten_body, loop.body)
+		and same_optional_core_expr(rewritten_timeout, loop.timeout)
+		and same_core_expr(rewritten_limit, loop.limit)
+	):
+		None
+	else:
+		Some({ loop |
+				iterable = rewritten_iterable,
+				body = rewritten_body,
+				timeout = rewritten_timeout,
+				limit = rewritten_limit
+			})
 
 
 private pure func rewrite_concurrent_with_cleanups(
 	block: CoreConcurrentBlock,
 	cleanups: List[CoreExpr],
-) -> CoreConcurrentBlock:
-	{
-		bindings = block.bindings.map(
-			func(binding): rewrite_concurrent_binding_with_cleanups(binding, cleanups),
-		),
-		body = rewrite_resource_expr_with_cleanups(block.body, cleanups),
-		timeout = rewrite_optional_expr_with_cleanups(block.timeout, cleanups),
-		max_threads = block.max_threads
-	}
+) -> Option[CoreConcurrentBlock]:
+	rewritten_bindings: Option[List[CoreConcurrentBinding]] = rewrite_list_items(
+		block.bindings,
+		rewrite_concurrent_binding_with_cleanups,
+	)
+	rewritten_body: CoreExpr = rewrite_resource_expr_with_cleanups(block.body, cleanups)
+	rewritten_timeout: Option[CoreExpr] = rewrite_optional_expr_with_cleanups(
+		block.timeout,
+		cleanups,
+	)
+
+	if (
+		rewritten_bindings.is_none()
+		and same_core_expr(rewritten_body, block.body)
+		and same_optional_core_expr(rewritten_timeout, block.timeout)
+	):
+		None
+	else:
+		Some({ block |
+				bindings = rewritten_bindings.get_or(block.bindings),
+				body = rewritten_body,
+				timeout = rewritten_timeout
+			})
 
 
 private pure func rewrite_select_recv_arm_with_cleanups(
 	recv: CoreSelectRecvArm,
 	cleanups: List[CoreExpr],
-) -> CoreSelectRecvArm:
-	{
-		binder = recv.binder,
-		elem_type = recv.elem_type,
-		channel = rewrite_resource_expr_with_cleanups(recv.channel, cleanups)
-	}
+) -> Option[CoreSelectRecvArm]:
+	rewritten_channel: CoreExpr = rewrite_resource_expr_with_cleanups(recv.channel, cleanups)
+
+	if same_core_expr(rewritten_channel, recv.channel):
+		None
+	else:
+		Some({ recv | channel = rewritten_channel })
 
 
 private pure func rewrite_select_arm_kind_with_cleanups(
 	kind: CoreSelectArmKind,
 	cleanups: List[CoreExpr],
-) -> CoreSelectArmKind:
+) -> Option[CoreSelectArmKind]:
 	match kind:
 		SelectRecvArm(recv):
-			SelectRecvArm(rewrite_select_recv_arm_with_cleanups(recv, cleanups))
+			match rewrite_select_recv_arm_with_cleanups(recv, cleanups):
+				Some(rewritten_recv):
+					Some(SelectRecvArm(rewritten_recv))
+				None:
+					None
 		SelectSealedArm(channel):
-			SelectSealedArm(rewrite_resource_expr_with_cleanups(channel, cleanups))
+			rewritten_channel: CoreExpr = rewrite_resource_expr_with_cleanups(channel, cleanups)
+
+			if same_core_expr(rewritten_channel, channel):
+				None
+			else:
+				Some(SelectSealedArm(rewritten_channel))
 		SelectAfterArm(timeout):
-			SelectAfterArm(rewrite_resource_expr_with_cleanups(timeout, cleanups))
+			rewritten_timeout: CoreExpr = rewrite_resource_expr_with_cleanups(timeout, cleanups)
+
+			if same_core_expr(rewritten_timeout, timeout):
+				None
+			else:
+				Some(SelectAfterArm(rewritten_timeout))
 
 
+-- A select arm body is its own break/continue target and starts a fresh
+-- cleanup stack.
 private pure func rewrite_select_arm_with_cleanups(
 	arm: CoreSelectArm,
 	cleanups: List[CoreExpr],
-) -> CoreSelectArm:
-	{
-		kind = rewrite_select_arm_kind_with_cleanups(arm.kind, cleanups),
-		body = rewrite_resource_expr_with_cleanups(arm.body, []),
-		loc = arm.loc
-	}
+) -> Option[CoreSelectArm]:
+	rewritten_kind: Option[CoreSelectArmKind] = rewrite_select_arm_kind_with_cleanups(
+		arm.kind,
+		cleanups,
+	)
+	rewritten_body: CoreExpr = rewrite_resource_expr_with_cleanups(arm.body, [])
+
+	if rewritten_kind.is_none() and same_core_expr(rewritten_body, arm.body):
+		None
+	else:
+		Some({ arm |
+				kind = rewritten_kind.get_or(arm.kind),
+				body = rewritten_body
+			})
+
+
+private pure func rewrite_literal_match_case_with_cleanups(
+	match_case: CoreLiteralMatchCase,
+	cleanups: List[CoreExpr],
+) -> Option[CoreLiteralMatchCase]:
+	rewritten_body: CoreExpr = rewrite_resource_expr_with_cleanups(match_case.body, cleanups)
+
+	if same_core_expr(rewritten_body, match_case.body):
+		None
+	else:
+		Some({ match_case | body = rewritten_body })
 
 
 private pure func rewrite_literal_match_cases_with_cleanups(
 	cases: List[CoreLiteralMatchCase],
 	cleanups: List[CoreExpr],
-) -> List[CoreLiteralMatchCase]:
-	cases.map(func(match_case):
-		{
-			literal = match_case.literal,
-			bindings = match_case.bindings,
-			body = rewrite_resource_expr_with_cleanups(match_case.body, cleanups)
-		}
+) -> Option[List[CoreLiteralMatchCase]]:
+	rewrite_list_items(
+		cases,
+		func(match_case): rewrite_literal_match_case_with_cleanups(match_case, cleanups),
 	)
 
 
 private pure func rewrite_literal_match_fallback_with_cleanups(
 	fallback: CoreLiteralMatchFallback,
 	cleanups: List[CoreExpr],
-) -> CoreLiteralMatchFallback:
+) -> Option[CoreLiteralMatchFallback]:
 	match fallback:
 		LiteralMatchFallbackBody(body):
-			LiteralMatchFallbackBody(rewrite_resource_expr_with_cleanups(body, cleanups))
+			rewritten_body: CoreExpr = rewrite_resource_expr_with_cleanups(body, cleanups)
+
+			if same_core_expr(rewritten_body, body):
+				None
+			else:
+				Some(LiteralMatchFallbackBody(rewritten_body))
 		LiteralMatchFallbackBindings(bindings, body):
-			LiteralMatchFallbackBindings(
-				bindings,
-				rewrite_resource_expr_with_cleanups(body, cleanups),
-			)
+			rewritten_body: CoreExpr = rewrite_resource_expr_with_cleanups(body, cleanups)
+
+			if same_core_expr(rewritten_body, body):
+				None
+			else:
+				Some(LiteralMatchFallbackBindings(bindings, rewritten_body))
 		LiteralMatchFallbackFail:
-			LiteralMatchFallbackFail
+			None
 
 
 private pure func rewrite_constructor_literal_match_with_cleanups(
 	match_expr: CoreConstructorLiteralMatch,
 	cleanups: List[CoreExpr],
-) -> CoreConstructorLiteralMatch:
-	-- Keep cleanup-sharing calls sequenced while the pinned compiler still emits simple
-	-- record fields inline. The current emitter fixes this generally for the next stage.
-	rewritten_cases: List[CoreLiteralMatchCase] = rewrite_literal_match_cases_with_cleanups(
+) -> Option[CoreConstructorLiteralMatch]:
+	rewritten_cases: Option[List[CoreLiteralMatchCase]] = rewrite_literal_match_cases_with_cleanups(
 		match_expr.cases,
 		cleanups,
 	)
-	rewritten_fallback: CoreLiteralMatchFallback = rewrite_literal_match_fallback_with_cleanups(
+	rewritten_fallback: Option[CoreLiteralMatchFallback] = rewrite_literal_match_fallback_with_cleanups(
 		match_expr.fallback,
 		cleanups,
 	)
 
-	{
-		accessor = match_expr.accessor,
-		scrutinee_type = match_expr.scrutinee_type,
-		cases = rewritten_cases,
-		fallback = rewritten_fallback,
-		result_type = match_expr.result_type,
-		loc = match_expr.loc
-	}
+	if rewritten_cases.is_none() and rewritten_fallback.is_none():
+		None
+	else:
+		Some({ match_expr |
+				cases = rewritten_cases.get_or(match_expr.cases),
+				fallback = rewritten_fallback.get_or(match_expr.fallback)
+			})
 
 
 private pure func rewrite_constructor_length_match_branch_with_cleanups(
 	branch: CoreConstructorLengthMatchBranch,
 	cleanups: List[CoreExpr],
-) -> CoreConstructorLengthMatchBranch:
-	{
-		bindings = branch.bindings,
-		body = rewrite_constructor_match_body_with_cleanups(branch.body, cleanups)
-	}
+) -> Option[CoreConstructorLengthMatchBranch]:
+	match rewrite_constructor_match_body_with_cleanups(branch.body, cleanups):
+		Some(body):
+			Some({ branch | body = body })
+		None:
+			None
 
 
-private pure func rewrite_constructor_length_match_cases_with_cleanups(
-	cases: List[CoreConstructorLengthMatchCase],
+private pure func rewrite_constructor_length_match_case_with_cleanups(
+	match_case: CoreConstructorLengthMatchCase,
 	cleanups: List[CoreExpr],
-) -> List[CoreConstructorLengthMatchCase]:
-	cases.map(func(match_case):
-		{
-			length = match_case.length,
-			branch = rewrite_constructor_length_match_branch_with_cleanups(
-				match_case.branch,
-				cleanups,
-			)
-		}
-	)
+) -> Option[CoreConstructorLengthMatchCase]:
+	match rewrite_constructor_length_match_branch_with_cleanups(match_case.branch, cleanups):
+		Some(branch):
+			Some({ match_case | branch = branch })
+		None:
+			None
 
 
+-- `None` also covers an absent case, so the caller keeps its input either way.
 private pure func rewrite_constructor_length_match_geq_with_cleanups(
 	geq_case: Option[CoreConstructorLengthMatchGeq],
 	cleanups: List[CoreExpr],
 ) -> Option[CoreConstructorLengthMatchGeq]:
 	match geq_case:
 		Some(existing_case):
-			Some({
-				minimum_length = existing_case.minimum_length,
-				branch = rewrite_constructor_length_match_branch_with_cleanups(
-					existing_case.branch,
-					cleanups,
-				),
-			})
+			match rewrite_constructor_length_match_branch_with_cleanups(
+				existing_case.branch,
+				cleanups,
+			):
+				Some(branch):
+					Some({ existing_case | branch = branch })
+				None:
+					None
 		None:
 			None
 
@@ -892,7 +1242,7 @@ private pure func rewrite_constructor_length_match_fallback_with_cleanups(
 ) -> Option[CoreConstructorLengthMatchBranch]:
 	match fallback:
 		Some(branch):
-			Some(rewrite_constructor_length_match_branch_with_cleanups(branch, cleanups))
+			rewrite_constructor_length_match_branch_with_cleanups(branch, cleanups)
 		None:
 			None
 
@@ -900,11 +1250,12 @@ private pure func rewrite_constructor_length_match_fallback_with_cleanups(
 private pure func rewrite_constructor_length_match_with_cleanups(
 	match_expr: CoreConstructorLengthMatch,
 	cleanups: List[CoreExpr],
-) -> CoreConstructorLengthMatch:
-	-- These locals are also a one-generation bootstrap bridge for record field ordering.
-	rewritten_cases: List[CoreConstructorLengthMatchCase] = rewrite_constructor_length_match_cases_with_cleanups(
+) -> Option[CoreConstructorLengthMatch]:
+	rewritten_cases: Option[List[CoreConstructorLengthMatchCase]] = rewrite_list_items(
 		match_expr.cases,
-		cleanups,
+		func(
+			match_case,
+		): rewrite_constructor_length_match_case_with_cleanups(match_case, cleanups),
 	)
 	rewritten_geq: Option[CoreConstructorLengthMatchGeq] = rewrite_constructor_length_match_geq_with_cleanups(
 		match_expr.geq,
@@ -915,70 +1266,108 @@ private pure func rewrite_constructor_length_match_with_cleanups(
 		cleanups,
 	)
 
-	{
-		accessor = match_expr.accessor,
-		cases = rewritten_cases,
-		geq = rewritten_geq,
-		fallback = rewritten_fallback,
-		result_type = match_expr.result_type,
-		loc = match_expr.loc
-	}
+	if (
+		rewritten_cases.is_none()
+		and rewritten_geq.is_none()
+		and rewritten_fallback.is_none()
+	):
+		None
+	else:
+		geq: Option[CoreConstructorLengthMatchGeq] = if rewritten_geq.is_some():
+			rewritten_geq
+		else:
+			match_expr.geq
+
+		fallback: Option[CoreConstructorLengthMatchBranch] = if rewritten_fallback.is_some():
+			rewritten_fallback
+		else:
+			match_expr.fallback
+
+		Some({ match_expr |
+				cases = rewritten_cases.get_or(match_expr.cases),
+				geq = geq,
+				fallback = fallback
+			})
 
 
 private pure func rewrite_constructor_match_body_with_cleanups(
 	body: CoreConstructorMatchBody,
 	cleanups: List[CoreExpr],
-) -> CoreConstructorMatchBody:
+) -> Option[CoreConstructorMatchBody]:
 	match body:
 		ConstructorMatchBodyExpr(expr):
-			ConstructorMatchBodyExpr(rewrite_resource_expr_with_cleanups(expr, cleanups))
+			rewritten: CoreExpr = rewrite_resource_expr_with_cleanups(expr, cleanups)
+
+			if same_core_expr(rewritten, expr):
+				None
+			else:
+				Some(ConstructorMatchBodyExpr(rewritten))
 		ConstructorMatchBodyLiteral(match_expr):
-			ConstructorMatchBodyLiteral(
-				rewrite_constructor_literal_match_with_cleanups(
-					match_expr,
-					cleanups,
-				),
-			)
+			match rewrite_constructor_literal_match_with_cleanups(match_expr, cleanups):
+				Some(rewritten):
+					Some(ConstructorMatchBodyLiteral(rewritten))
+				None:
+					None
 		ConstructorMatchBodyLength(match_expr):
-			ConstructorMatchBodyLength(
-				rewrite_constructor_length_match_with_cleanups(
-					match_expr,
-					cleanups,
-				),
-			)
+			match rewrite_constructor_length_match_with_cleanups(match_expr, cleanups):
+				Some(rewritten):
+					Some(ConstructorMatchBodyLength(rewritten))
+				None:
+					None
+
+
+private pure func rewrite_constructor_match_case_with_cleanups(
+	match_case: CoreConstructorMatchCase,
+	cleanups: List[CoreExpr],
+) -> Option[CoreConstructorMatchCase]:
+	match rewrite_constructor_match_body_with_cleanups(match_case.body, cleanups):
+		Some(body):
+			Some({ match_case | body = body })
+		None:
+			None
 
 
 private pure func rewrite_constructor_match_cases_with_cleanups(
 	cases: List[CoreConstructorMatchCase],
 	cleanups: List[CoreExpr],
-) -> List[CoreConstructorMatchCase]:
-	cases.map(func(match_case):
-		{
-			constructor = match_case.constructor,
-			accessor = match_case.accessor,
-			test = match_case.test,
-			bindings = match_case.bindings,
-			body = rewrite_constructor_match_body_with_cleanups(match_case.body, cleanups)
-		}
+) -> Option[List[CoreConstructorMatchCase]]:
+	rewrite_list_items(
+		cases,
+		func(match_case): rewrite_constructor_match_case_with_cleanups(match_case, cleanups),
 	)
 
 
 private pure func rewrite_constructor_match_fallback_with_cleanups(
 	fallback: CoreConstructorMatchFallback,
 	cleanups: List[CoreExpr],
-) -> CoreConstructorMatchFallback:
+) -> Option[CoreConstructorMatchFallback]:
 	match fallback:
 		ConstructorMatchFallbackBody(body):
-			ConstructorMatchFallbackBody(rewrite_resource_expr_with_cleanups(body, cleanups))
+			rewritten_body: CoreExpr = rewrite_resource_expr_with_cleanups(body, cleanups)
+
+			if same_core_expr(rewritten_body, body):
+				None
+			else:
+				Some(ConstructorMatchFallbackBody(rewritten_body))
 		ConstructorMatchFallbackBindings(bindings, body):
-			ConstructorMatchFallbackBindings(
-				bindings,
-				rewrite_resource_expr_with_cleanups(body, cleanups),
-			)
+			rewritten_body: CoreExpr = rewrite_resource_expr_with_cleanups(body, cleanups)
+
+			if same_core_expr(rewritten_body, body):
+				None
+			else:
+				Some(ConstructorMatchFallbackBindings(bindings, rewritten_body))
 		ConstructorMatchFallbackFail:
-			ConstructorMatchFallbackFail
+			None
 
 
+private union ResourceLogicalTask:
+	RewriteResourceLogicalNode(CoreExpr)
+	RebuildResourceLogicalNode(CoreExpr)
+
+
+-- Long `and`/`or` chains form deep Core trees; walk them iteratively. The
+-- rebuild task carries the source node so an unchanged pair of sides hands
+-- that node back instead of an equal copy.
 private pure func rewrite_resource_logical_expr_with_cleanups(
 	expr: CoreExpr,
 	cleanups: List[CoreExpr],
@@ -999,9 +1388,7 @@ private pure func rewrite_resource_logical_expr_with_cleanups(
 						match current_expr:
 							LogicalExpr(op, left, right, typ, loc):
 								rebuild_task: ResourceLogicalTask = RebuildResourceLogicalNode(
-									op,
-									typ,
-									loc,
+									current_expr,
 								)
 
 								tasks = if task_count < tasks.length():
@@ -1040,17 +1427,32 @@ private pure func rewrite_resource_logical_expr_with_cleanups(
 									rewritten.append(rewritten_expr)
 
 								rewritten_count += 1
-					RebuildResourceLogicalNode(op, typ, loc):
-						match (
-							rewritten.get(rewritten_count - 2),
-							rewritten.get(rewritten_count - 1),
-						):
-							(Some(left), Some(right)):
-								rewritten = rewritten.set(
-									rewritten_count - 2,
-									LogicalExpr(op, left, right, typ, loc),
-								)
-								rewritten_count -= 1
+					RebuildResourceLogicalNode(source_expr):
+						match source_expr:
+							LogicalExpr(op, left, right, typ, loc):
+								match (
+									rewritten.get(rewritten_count - 2),
+									rewritten.get(rewritten_count - 1),
+								):
+									(Some(rewritten_left), Some(rewritten_right)):
+										rebuilt: CoreExpr = if (
+											same_core_expr(rewritten_left, left)
+											and same_core_expr(rewritten_right, right)
+										):
+											source_expr
+										else:
+											LogicalExpr(
+												op,
+												rewritten_left,
+												rewritten_right,
+												typ,
+												loc,
+											)
+
+										rewritten = rewritten.set(rewritten_count - 2, rebuilt)
+										rewritten_count -= 1
+									_:
+										valid = False
 							_:
 								valid = False
 			None:
@@ -1062,700 +1464,945 @@ private pure func rewrite_resource_logical_expr_with_cleanups(
 		expr
 
 
+-- Every arm rewrites its children exactly as it always has and answers `expr`
+-- itself when every rewritten child and child container came back as the same
+-- allocation; only a break or continue that gains a cleanup exit builds new
+-- nodes, and only along the spine above it.
+--
+-- This dispatcher binds nothing and forwards to one small arm group, so a deep
+-- Core tree costs a shallow native frame per level: one match over every
+-- constructor would reserve stack for all of its arms' locals at once and
+-- overflow the default stack at -O0 on large generated suites.
 private pure func rewrite_resource_expr_with_cleanups(
 	expr: CoreExpr,
 	cleanups: List[CoreExpr],
 ) -> CoreExpr:
 	match expr:
-		DebugBlockExpr(body, typ, loc):
-			DebugBlockExpr(
-				rewrite_resource_expr_with_cleanups(body, cleanups),
-				typ,
-				loc,
-			)
+		LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _) | VarExpr(_, _, _) | VoidExpr(_, _) | CooperativeCheckpointExpr(_, _) | BreakExpr(_, _) | ContinueExpr(_, _) | SetAllocExpr(_, _, _) | ClosureCreateExpr(_, _, _) | DetachExpr(_, _, _):
+			rewrite_resource_leaf_with_cleanups(expr, cleanups)
+		DebugBlockExpr(_, _, _) | BinaryExpr(_, _, _, _, _) | UnaryExpr(_, _, _, _) | LogicalExpr(_, _, _, _, _) | AssignExpr(_, _, _, _) | CastExpr(_, _, _) | UnboxExpr(_, _, _, _) | FieldExpr(_, _, _, _) | TupleFieldExpr(_, _, _, _) | BoxExpr(_, _, _) | PreClosureDetachExpr(_, _, _) | DupExpr(_, _, _, _, _, _) | DropExpr(_, _, _, _, _, _) | LetExpr(_, _, _, _, _) | BorrowLetExpr(_, _, _, _) | SeqExpr(_, _) | WhileExpr(_, _, _, _) | RangeExpr(_, _, _, _) | IfExpr(_, _, _, _, _):
+			rewrite_resource_operator_with_cleanups(expr, cleanups)
+		CallExpr(_, _, _, _, _) | TupleExpr(_, _, _) | TupleConstructExpr(_, _, _) | VectorExpr(_, _, _) | ListConstructExpr(_, _, _) | DictExpr(_, _, _) | DictConstructExpr(_, _, _) | RecordExpr(_, _, _) | RecordUpdateExpr(_, _, _, _) | RecordReuseExpr(_, _, _, _) | RecordCowUpdateExpr(_, _, _, _) | RecordConstructExpr(_, _, _, _) | UnionConstructExpr(_, _, _) | UnionReuseConstructExpr(_, _, _) | SelectExpr(_, _, _):
+			rewrite_resource_aggregate_with_cleanups(expr, cleanups)
+		ListAllocExpr(_, _, _) | ListGetExpr(_, _, _) | ListHandoffExpr(_, _, _) | ListHandoffSetOwnedExpr(_, _, _) | ListHandoffSetSourceSlotExpr(_, _, _) | ListRetainExpr(_, _, _) | ListSetExpr(_, _, _) | ListSwapExpr(_, _, _) | StringByteReadExpr(_, _, _) | StringByteWriteExpr(_, _, _) | StringByteCopyExpr(_, _, _) | StringSetLenExpr(_, _, _) | TensorLiteralExpr(_, _, _) | TensorBoxedLiteralExpr(_, _, _) | TensorPackedLiteralExpr(_, _, _) | TensorRawFillExpr(_, _, _) | TensorRawReadExpr(_, _, _) | TensorRawWriteExpr(_, _, _) | TensorRawViewLetExpr(_, _, _, _):
+			rewrite_resource_storage_with_cleanups(expr, cleanups)
+		LambdaExpr(_, _, _, _, _, _) | TailrecLoopExpr(_, _, _, _) | TailrecRecurExpr(_, _, _) | TailrecListSpreadLoopExpr(_, _) | TailrecListSpreadRecurExpr(_, _, _, _) | ForRangeExpr(_, _, _, _, _, _) | ForChannelExpr(_, _, _) | ForListExpr(_, _, _) | ForStringExpr(_, _, _) | ForDictExpr(_, _, _) | ForSetExpr(_, _, _) | ForStreamExpr(_, _, _) | ForResourceSourceExpr(_, _, _) | ForTensorExpr(_, _, _) | ResourceScopeExpr(_, _, _) | ResourceCleanupExitExpr(_, _, _):
+			rewrite_resource_loop_with_cleanups(expr, cleanups)
+		PreClosureConcurrentlyLoopExpr(_, _, _) | ConcurrentlyLoopExpr(_, _, _) | PreClosureConcurrentExpr(_, _, _) | ConcurrentExpr(_, _, _):
+			rewrite_resource_concurrency_with_cleanups(expr, cleanups)
+		RawMatchExpr(_, _, _, _) | SemanticMatchExpr(_, _, _, _) | LiteralMatchExpr(_, _, _, _, _) | AccessorLiteralMatchExpr(_, _, _, _, _) | LengthMatchExpr(_, _, _, _, _) | ConstructorMatchExpr(_, _, _, _, _, _):
+			rewrite_resource_match_with_cleanups(expr, cleanups)
+
+
+-- Leaves. A break or continue under an active cleanup becomes a cleanup exit;
+-- everything else is handed back as is.
+private pure func rewrite_resource_leaf_with_cleanups(
+	expr: CoreExpr,
+	cleanups: List[CoreExpr],
+) -> CoreExpr:
+	match expr:
 		BreakExpr(typ, loc):
-			break_or_cleanup_exit(cleanups, typ, loc)
+			break_or_cleanup_exit(expr, cleanups, typ, loc)
 		ContinueExpr(typ, loc):
-			continue_or_cleanup_exit(cleanups, typ, loc)
-		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
+			continue_or_cleanup_exit(expr, cleanups, typ, loc)
+		_:
 			expr
-		ResourceScopeExpr(scope, typ, loc):
-			active_cleanups: List[CoreExpr] = prepend_cleanup(scope.cleanup, cleanups)
-			ResourceScopeExpr(
-				{
-					variable = scope.variable,
-					typ = scope.typ,
-					acquire = rewrite_resource_expr_with_cleanups(scope.acquire, cleanups),
-					body = rewrite_resource_expr_with_cleanups(scope.body, active_cleanups),
-					cleanup = rewrite_resource_expr_with_cleanups(scope.cleanup, cleanups)
-				},
-				typ,
-				loc,
-			)
-		WhileExpr(cond, body, typ, loc):
-			WhileExpr(
-				rewrite_resource_expr_with_cleanups(cond, cleanups),
-				rewrite_resource_expr_with_cleanups(body, []),
-				typ,
-				loc,
-			)
-		ForRangeExpr(binder, start, end_value, body, typ, loc):
-			ForRangeExpr(
-				binder,
-				rewrite_resource_expr_with_cleanups(start, cleanups),
-				rewrite_resource_expr_with_cleanups(end_value, cleanups),
-				rewrite_resource_expr_with_cleanups(body, []),
-				typ,
-				loc,
-			)
-		ForChannelExpr(for_channel, typ, loc):
-			ForChannelExpr(
-				{
-					binder = for_channel.binder,
-					iterable = rewrite_resource_expr_with_cleanups(for_channel.iterable, cleanups),
-					body = rewrite_resource_expr_with_cleanups(for_channel.body, [])
-				},
-				typ,
-				loc,
-			)
-		ForListExpr(for_list, typ, loc):
-			ForListExpr(
-				{
-					binder = for_list.binder,
-					layout = for_list.layout,
-					iterable = rewrite_resource_expr_with_cleanups(for_list.iterable, cleanups),
-					iterable_release_policy = for_list.iterable_release_policy,
-					body = rewrite_resource_expr_with_cleanups(for_list.body, [])
-				},
-				typ,
-				loc,
-			)
-		ForStringExpr(for_string, typ, loc):
-			ForStringExpr(
-				{
-					binder = for_string.binder,
-					iterable = rewrite_resource_expr_with_cleanups(for_string.iterable, cleanups),
-					iterable_release_policy = for_string.iterable_release_policy,
-					body = rewrite_resource_expr_with_cleanups(for_string.body, [])
-				},
-				typ,
-				loc,
-			)
-		ForDictExpr(for_dict, typ, loc):
-			ForDictExpr(
-				{
-					binder = for_dict.binder,
-					iterable = rewrite_resource_expr_with_cleanups(for_dict.iterable, cleanups),
-					iterable_release_policy = for_dict.iterable_release_policy,
-					body = rewrite_resource_expr_with_cleanups(for_dict.body, [])
-				},
-				typ,
-				loc,
-			)
-		ForSetExpr(for_set, typ, loc):
-			ForSetExpr(
-				{
-					binder = for_set.binder,
-					iterable = rewrite_resource_expr_with_cleanups(for_set.iterable, cleanups),
-					iterable_release_policy = for_set.iterable_release_policy,
-					body = rewrite_resource_expr_with_cleanups(for_set.body, [])
-				},
-				typ,
-				loc,
-			)
-		ForResourceSourceExpr(for_resource_source, typ, loc):
-			ForResourceSourceExpr(
-				{
-					binder = for_resource_source.binder,
-					iterable = rewrite_resource_expr_with_cleanups(
-						for_resource_source.iterable,
-						cleanups,
-					),
-					iterable_release_policy = for_resource_source.iterable_release_policy,
-					body = rewrite_resource_expr_with_cleanups(for_resource_source.body, [])
-				},
-				typ,
-				loc,
-			)
-		ForStreamExpr(for_stream, typ, loc):
-			ForStreamExpr(
-				{
-					binder = for_stream.binder,
-					iterable = rewrite_resource_expr_with_cleanups(for_stream.iterable, cleanups),
-					iterable_release_policy = for_stream.iterable_release_policy,
-					body = rewrite_resource_expr_with_cleanups(for_stream.body, [])
-				},
-				typ,
-				loc,
-			)
-		ForTensorExpr(for_tensor, typ, loc):
-			ForTensorExpr(
-				{
-					binder = for_tensor.binder,
-					element_storage = clone_tensor_for_element_storage(for_tensor.element_storage),
-					iterable = rewrite_resource_expr_with_cleanups(for_tensor.iterable, cleanups),
-					iterable_release_policy = for_tensor.iterable_release_policy,
-					body = rewrite_resource_expr_with_cleanups(for_tensor.body, [])
-				},
-				typ,
-				loc,
-			)
-		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
-			PreClosureConcurrentlyLoopExpr(
-				{
-					variable = loop.variable,
-					item_type = loop.item_type,
-					item_mode = loop.item_mode,
-					iterable = rewrite_resource_expr_with_cleanups(loop.iterable, cleanups),
-					body = rewrite_resource_expr_with_cleanups(loop.body, []),
-					timeout = rewrite_optional_expr_with_cleanups(loop.timeout, cleanups),
-					limit = rewrite_resource_expr_with_cleanups(loop.limit, cleanups),
-					output = loop.output
-				},
-				typ,
-				loc,
-			)
-		DetachExpr(detached, typ, loc):
-			expr
-		ConcurrentlyLoopExpr(loop, typ, loc):
-			ConcurrentlyLoopExpr(
-				rewrite_concurrently_loop_with_cleanups(loop, cleanups),
-				typ,
-				loc,
-			)
-		PreClosureConcurrentExpr(block, typ, loc):
-			PreClosureConcurrentExpr(
-				{
-					bindings = block.bindings,
-					body = rewrite_resource_expr_with_cleanups(block.body, cleanups),
-					timeout = rewrite_optional_expr_with_cleanups(block.timeout, cleanups),
-					max_threads = block.max_threads
-				},
-				typ,
-				loc,
-			)
-		ConcurrentExpr(block, typ, loc):
-			ConcurrentExpr(
-				rewrite_concurrent_with_cleanups(block, cleanups),
-				typ,
-				loc,
-			)
-		SelectExpr(select_expr, typ, loc):
-			SelectExpr(
-				select_expr.map(func(arm): rewrite_select_arm_with_cleanups(arm, cleanups)),
-				typ,
-				loc,
-			)
-		TailrecLoopExpr(params, return_type, body, loc):
-			TailrecLoopExpr(
-				params,
-				return_type,
-				rewrite_resource_expr_with_cleanups(body, []),
-				loc,
-			)
-		TailrecListSpreadLoopExpr(loop, loc):
-			TailrecListSpreadLoopExpr(rewrite_tailrec_list_spread_loop_with_cleanups(loop), loc)
-		CallExpr(kind, callee, args, typ, loc):
-			CallExpr(
-				kind,
-				rewrite_resource_expr_with_cleanups(callee, cleanups),
-				rewrite_resource_expr_list_with_cleanups(args, cleanups),
-				typ,
-				loc,
-			)
+
+
+-- Operators, casts, field reads, and the simple binding and control forms.
+-- Bindings whose canonical post-body drop a break would bypass add that drop to
+-- the cleanup stack of the expression it guards.
+private pure func rewrite_resource_operator_with_cleanups(
+	expr: CoreExpr,
+	cleanups: List[CoreExpr],
+) -> CoreExpr:
+	match expr:
+		DebugBlockExpr(body, typ, loc):
+			rewritten_body: CoreExpr = rewrite_resource_expr_with_cleanups(body, cleanups)
+
+			if same_core_expr(rewritten_body, body):
+				expr
+			else:
+				DebugBlockExpr(rewritten_body, typ, loc)
 		BinaryExpr(op, left, right, typ, loc):
-			BinaryExpr(
-				op,
-				rewrite_resource_expr_with_cleanups(left, cleanups),
-				rewrite_resource_expr_with_cleanups(right, cleanups),
-				typ,
-				loc,
-			)
+			rewritten_left: CoreExpr = rewrite_resource_expr_with_cleanups(left, cleanups)
+			rewritten_right: CoreExpr = rewrite_resource_expr_with_cleanups(right, cleanups)
+
+			if same_core_expr(rewritten_left, left) and same_core_expr(rewritten_right, right):
+				expr
+			else:
+				BinaryExpr(op, rewritten_left, rewritten_right, typ, loc)
 		UnaryExpr(op, expr_value, typ, loc):
-			UnaryExpr(
-				op,
-				rewrite_resource_expr_with_cleanups(expr_value, cleanups),
-				typ,
-				loc,
-			)
+			rewritten_value: CoreExpr = rewrite_resource_expr_with_cleanups(expr_value, cleanups)
+
+			if same_core_expr(rewritten_value, expr_value):
+				expr
+			else:
+				UnaryExpr(op, rewritten_value, typ, loc)
 		LogicalExpr(op, left, right, typ, loc):
 			rewrite_resource_logical_expr_with_cleanups(expr, cleanups)
 		AssignExpr(variable, rhs, typ, loc):
-			AssignExpr(
-				variable,
-				rewrite_resource_expr_with_cleanups(rhs, cleanups),
-				typ,
-				loc,
-			)
+			rewritten_rhs: CoreExpr = rewrite_resource_expr_with_cleanups(rhs, cleanups)
+
+			if same_core_expr(rewritten_rhs, rhs):
+				expr
+			else:
+				AssignExpr(variable, rewritten_rhs, typ, loc)
 		CastExpr(expr_value, typ, loc):
-			CastExpr(
-				rewrite_resource_expr_with_cleanups(expr_value, cleanups),
-				typ,
-				loc,
-			)
-		BoxExpr(box, typ, loc):
-			BoxExpr(
-				rewrite_box_op_with_cleanups(box, cleanups),
-				typ,
-				loc,
-			)
+			rewritten_value: CoreExpr = rewrite_resource_expr_with_cleanups(expr_value, cleanups)
+
+			if same_core_expr(rewritten_value, expr_value):
+				expr
+			else:
+				CastExpr(rewritten_value, typ, loc)
 		UnboxExpr(unbox_kind, expr_value, typ, loc):
-			UnboxExpr(
-				unbox_kind,
-				rewrite_resource_expr_with_cleanups(expr_value, cleanups),
-				typ,
-				loc,
-			)
+			rewritten_value: CoreExpr = rewrite_resource_expr_with_cleanups(expr_value, cleanups)
+
+			if same_core_expr(rewritten_value, expr_value):
+				expr
+			else:
+				UnboxExpr(unbox_kind, rewritten_value, typ, loc)
 		FieldExpr(expr_value, field_name, typ, loc):
-			FieldExpr(
-				rewrite_resource_expr_with_cleanups(expr_value, cleanups),
-				field_name,
-				typ,
-				loc,
-			)
+			rewritten_value: CoreExpr = rewrite_resource_expr_with_cleanups(expr_value, cleanups)
+
+			if same_core_expr(rewritten_value, expr_value):
+				expr
+			else:
+				FieldExpr(rewritten_value, field_name, typ, loc)
 		TupleFieldExpr(expr_value, field_index, typ, loc):
-			TupleFieldExpr(
-				rewrite_resource_expr_with_cleanups(expr_value, cleanups),
-				field_index,
-				typ,
-				loc,
-			)
-		TupleExpr(items, typ, loc):
-			TupleExpr(
-				rewrite_resource_expr_list_with_cleanups(items, cleanups),
-				typ,
-				loc,
-			)
-		VectorExpr(items, typ, loc):
-			VectorExpr(
-				rewrite_resource_expr_list_with_cleanups(items, cleanups),
-				typ,
-				loc,
-			)
-		TupleConstructExpr(tuple_construct, typ, loc):
-			TupleConstructExpr(
-				{
-					elements = rewrite_tuple_elements_with_cleanups(
-						tuple_construct.elements,
-						cleanups,
-					),
-					release_mask = tuple_construct.release_mask,
-					retain_mask = tuple_construct.retain_mask
-				},
-				typ,
-				loc,
-			)
-		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
-			LambdaExpr(
-				lambda_params,
-				lambda_return_type,
-				rewrite_resource_expr_with_cleanups(lambda_body, []),
-				lambda_is_pure,
-				typ,
-				loc,
-			)
-		ClosureCreateExpr(closure, typ, loc):
-			ClosureCreateExpr(closure, typ, loc)
-		ListConstructExpr(construct, typ, loc):
-			ListConstructExpr(
-				rewrite_list_construct_with_cleanups(construct, cleanups),
-				typ,
-				loc,
-			)
-		ListAllocExpr(alloc, typ, loc):
-			ListAllocExpr(
-				rewrite_list_alloc_with_cleanups(alloc, cleanups),
-				typ,
-				loc,
-			)
-		ListGetExpr(get, typ, loc):
-			ListGetExpr(
-				rewrite_list_get_with_cleanups(get, cleanups),
-				typ,
-				loc,
-			)
-		ListHandoffExpr(handoff, typ, loc):
-			ListHandoffExpr(
-				rewrite_list_handoff_with_cleanups(handoff, cleanups),
-				typ,
-				loc,
-			)
-		ListHandoffSetOwnedExpr(set, typ, loc):
-			ListHandoffSetOwnedExpr(
-				rewrite_list_set_with_cleanups(set, cleanups),
-				typ,
-				loc,
-			)
-		ListHandoffSetSourceSlotExpr(slot, typ, loc):
-			ListHandoffSetSourceSlotExpr(
-				rewrite_list_handoff_set_source_slot_with_cleanups(slot, cleanups),
-				typ,
-				loc,
-			)
-		StringByteReadExpr(read, typ, loc):
-			StringByteReadExpr(
-				rewrite_string_byte_read_with_cleanups(read, cleanups),
-				typ,
-				loc,
-			)
-		StringByteWriteExpr(write, typ, loc):
-			StringByteWriteExpr(
-				rewrite_string_byte_write_with_cleanups(write, cleanups),
-				typ,
-				loc,
-			)
-		StringByteCopyExpr(copy, typ, loc):
-			StringByteCopyExpr(
-				rewrite_string_byte_copy_with_cleanups(copy, cleanups),
-				typ,
-				loc,
-			)
-		StringSetLenExpr(set_len, typ, loc):
-			StringSetLenExpr(
-				rewrite_string_set_len_with_cleanups(set_len, cleanups),
-				typ,
-				loc,
-			)
-		TensorLiteralExpr(literal, typ, loc):
-			TensorLiteralExpr(
-				rewrite_tensor_literal_with_cleanups(literal, cleanups),
-				typ,
-				loc,
-			)
-		TensorBoxedLiteralExpr(literal, typ, loc):
-			TensorBoxedLiteralExpr(
-				rewrite_tensor_boxed_literal_with_cleanups(literal, cleanups),
-				typ,
-				loc,
-			)
-		TensorPackedLiteralExpr(literal, typ, loc):
-			TensorPackedLiteralExpr(
-				rewrite_tensor_packed_literal_with_cleanups(literal, cleanups),
-				typ,
-				loc,
-			)
-		TensorRawFillExpr(fill, typ, loc):
-			TensorRawFillExpr(
-				rewrite_tensor_raw_fill_with_cleanups(fill, cleanups),
-				typ,
-				loc,
-			)
-		TensorRawReadExpr(read, typ, loc):
-			TensorRawReadExpr(
-				rewrite_tensor_raw_read_with_cleanups(read, cleanups),
-				typ,
-				loc,
-			)
-		TensorRawWriteExpr(write, typ, loc):
-			TensorRawWriteExpr(
-				rewrite_tensor_raw_write_with_cleanups(write, cleanups),
-				typ,
-				loc,
-			)
-		TensorRawViewLetExpr(binding, body, typ, loc):
-			TensorRawViewLetExpr(
-				rewrite_tensor_raw_view_binding_with_cleanups(binding, cleanups),
-				rewrite_resource_expr_with_cleanups(body, cleanups),
-				typ,
-				loc,
-			)
-		DictExpr(entries, typ, loc):
-			DictExpr(
-				CoreTraverse.map_core_dict_literal_entries(
-					entries,
-					func(expr): rewrite_resource_expr_with_cleanups(expr, cleanups),
-				),
-				typ,
-				loc,
-			)
-		DictConstructExpr(construct, typ, loc):
-			DictConstructExpr(
-				rewrite_dict_construct_with_cleanups(construct, cleanups),
-				typ,
-				loc,
-			)
-		SetAllocExpr(alloc, typ, loc):
-			expr
-		ListRetainExpr(retain, typ, loc):
-			ListRetainExpr(
-				rewrite_list_retain_with_cleanups(retain, cleanups),
-				typ,
-				loc,
-			)
-		ListSetExpr(set, typ, loc):
-			ListSetExpr(
-				rewrite_list_set_with_cleanups(set, cleanups),
-				typ,
-				loc,
-			)
-		ListSwapExpr(swap, typ, loc):
-			ListSwapExpr(
-				rewrite_list_swap_with_cleanups(swap, cleanups),
-				typ,
-				loc,
-			)
-		RecordExpr(fields, typ, loc):
-			RecordExpr(
-				rewrite_record_fields_with_cleanups(fields, cleanups),
-				typ,
-				loc,
-			)
-		RecordUpdateExpr(base, fields, typ, loc):
-			RecordUpdateExpr(
-				rewrite_resource_expr_with_cleanups(base, cleanups),
-				rewrite_record_fields_with_cleanups(fields, cleanups),
-				typ,
-				loc,
-			)
-		RecordReuseExpr(source, fields, typ, loc):
-			RecordReuseExpr(
-				rewrite_resource_expr_with_cleanups(source, cleanups),
-				rewrite_record_fields_with_cleanups(fields, cleanups),
-				typ,
-				loc,
-			)
-		RecordCowUpdateExpr(source, fields, typ, loc):
-			RecordCowUpdateExpr(
-				rewrite_resource_expr_with_cleanups(source, cleanups),
-				CoreTraverse.map_core_record_cow_fields(
-					fields,
-					func(replacement): rewrite_resource_expr_with_cleanups(replacement, cleanups),
-				),
-				typ,
-				loc,
-			)
-		RecordConstructExpr(type_name, fields, typ, loc):
-			RecordConstructExpr(
-				type_name,
-				rewrite_record_fields_with_cleanups(fields, cleanups),
-				typ,
-				loc,
-			)
-		UnionConstructExpr(construct, typ, loc):
-			UnionConstructExpr(
-				{
-					type_name = construct.type_name,
-					constructor_name = construct.constructor_name,
-					constructor_c_name = construct.constructor_c_name,
-					representation = construct.representation,
-					payload_storage = construct.payload_storage,
-					uses_release_mask = construct.uses_release_mask,
-					release_mask = construct.release_mask,
-					args = rewrite_boxed_storage_values_with_cleanups(construct.args, cleanups)
-				},
-				typ,
-				loc,
-			)
-		UnionReuseConstructExpr(construct, typ, loc):
-			UnionReuseConstructExpr(
-				{
-					source = rewrite_resource_expr_with_cleanups(construct.source, cleanups),
-					type_name = construct.type_name,
-					constructor_name = construct.constructor_name,
-					constructor_c_name = construct.constructor_c_name,
-					reuse_constructor_c_name = construct.reuse_constructor_c_name,
-					representation = construct.representation,
-					payload_storage = construct.payload_storage,
-					uses_release_mask = construct.uses_release_mask,
-					release_mask = construct.release_mask,
-					args = rewrite_boxed_storage_values_with_cleanups(construct.args, cleanups)
-				},
-				typ,
-				loc,
-			)
+			rewritten_value: CoreExpr = rewrite_resource_expr_with_cleanups(expr_value, cleanups)
+
+			if same_core_expr(rewritten_value, expr_value):
+				expr
+			else:
+				TupleFieldExpr(rewritten_value, field_index, typ, loc)
+		BoxExpr(box, typ, loc):
+			match rewrite_box_op_with_cleanups(box, cleanups):
+				Some(rewritten_box):
+					BoxExpr(rewritten_box, typ, loc)
+				None:
+					expr
 		PreClosureDetachExpr(detached, typ, loc):
-			PreClosureDetachExpr(
-				rewrite_resource_expr_with_cleanups(detached, []),
-				typ,
-				loc,
-			)
-		DetachExpr(detached, typ, loc):
-			expr
+			rewritten_detached: CoreExpr = rewrite_resource_expr_with_cleanups(detached, [])
+
+			if same_core_expr(rewritten_detached, detached):
+				expr
+			else:
+				PreClosureDetachExpr(rewritten_detached, typ, loc)
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
-			DupExpr(
-				variable,
-				value_type,
-				retain_policy,
-				rewrite_resource_expr_with_cleanups(body, cleanups),
-				typ,
-				loc,
-			)
+			rewritten_body: CoreExpr = rewrite_resource_expr_with_cleanups(body, cleanups)
+
+			if same_core_expr(rewritten_body, body):
+				expr
+			else:
+				DupExpr(variable, value_type, retain_policy, rewritten_body, typ, loc)
 		DropExpr(variable, value_type, release_policy, body, typ, loc):
-			DropExpr(
-				variable,
-				value_type,
-				release_policy,
-				rewrite_resource_expr_with_cleanups(body, cleanups),
-				typ,
-				loc,
-			)
+			rewritten_body: CoreExpr = rewrite_resource_expr_with_cleanups(body, cleanups)
+
+			if same_core_expr(rewritten_body, body):
+				expr
+			else:
+				DropExpr(variable, value_type, release_policy, rewritten_body, typ, loc)
 		LetExpr(name, is_mutable, typ, rhs, body):
-			match post_result_drop_cleanup(body, name):
+			rhs_cleanups: List[CoreExpr] = match post_result_drop_cleanup(body, name):
 				Some(cleanup):
-					LetExpr(
-						name,
-						is_mutable,
-						typ,
-						rewrite_resource_expr_with_cleanups(
-							rhs,
-							prepend_cleanup(cleanup, cleanups),
-						),
-						rewrite_resource_expr_with_cleanups(body, cleanups),
-					)
+					prepend_cleanup(cleanup, cleanups)
 				None:
-					LetExpr(
-						name,
-						is_mutable,
-						typ,
-						rewrite_resource_expr_with_cleanups(rhs, cleanups),
-						rewrite_resource_expr_with_cleanups(body, cleanups),
-					)
+					cleanups
+
+			rewritten_rhs: CoreExpr = rewrite_resource_expr_with_cleanups(rhs, rhs_cleanups)
+			rewritten_body: CoreExpr = rewrite_resource_expr_with_cleanups(body, cleanups)
+
+			if same_core_expr(rewritten_rhs, rhs) and same_core_expr(rewritten_body, body):
+				expr
+			else:
+				LetExpr(name, is_mutable, typ, rewritten_rhs, rewritten_body)
 		BorrowLetExpr(name, typ, rhs, body):
-			BorrowLetExpr(
-				name,
-				typ,
-				rewrite_resource_expr_with_cleanups(rhs, cleanups),
-				rewrite_resource_expr_with_cleanups(body, cleanups),
-			)
+			rewritten_rhs: CoreExpr = rewrite_resource_expr_with_cleanups(rhs, cleanups)
+			rewritten_body: CoreExpr = rewrite_resource_expr_with_cleanups(body, cleanups)
+
+			if same_core_expr(rewritten_rhs, rhs) and same_core_expr(rewritten_body, body):
+				expr
+			else:
+				BorrowLetExpr(name, typ, rewritten_rhs, rewritten_body)
 		SeqExpr(first, second):
-			match post_body_drop_cleanup(second):
+			first_cleanups: List[CoreExpr] = match post_body_drop_cleanup(second):
 				Some(cleanup):
-					SeqExpr(
-						rewrite_resource_expr_with_cleanups(
-							first,
-							prepend_cleanup(cleanup, cleanups),
-						),
-						rewrite_resource_expr_with_cleanups(second, cleanups),
+					prepend_cleanup(cleanup, cleanups)
+				None:
+					cleanups
+
+			rewritten_first: CoreExpr = rewrite_resource_expr_with_cleanups(first, first_cleanups)
+			rewritten_second: CoreExpr = rewrite_resource_expr_with_cleanups(second, cleanups)
+
+			if same_core_expr(rewritten_first, first) and same_core_expr(rewritten_second, second):
+				expr
+			else:
+				SeqExpr(rewritten_first, rewritten_second)
+		WhileExpr(cond, body, typ, loc):
+			rewritten_cond: CoreExpr = rewrite_resource_expr_with_cleanups(cond, cleanups)
+			rewritten_body: CoreExpr = rewrite_resource_expr_with_cleanups(body, [])
+
+			if same_core_expr(rewritten_cond, cond) and same_core_expr(rewritten_body, body):
+				expr
+			else:
+				WhileExpr(rewritten_cond, rewritten_body, typ, loc)
+		RangeExpr(start, end_value, typ, loc):
+			rewritten_start: CoreExpr = rewrite_resource_expr_with_cleanups(start, cleanups)
+			rewritten_end: CoreExpr = rewrite_resource_expr_with_cleanups(end_value, cleanups)
+
+			if same_core_expr(rewritten_start, start) and same_core_expr(rewritten_end, end_value):
+				expr
+			else:
+				RangeExpr(rewritten_start, rewritten_end, typ, loc)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			rewritten_cond: CoreExpr = rewrite_resource_expr_with_cleanups(cond, cleanups)
+			rewritten_then: CoreExpr = rewrite_resource_expr_with_cleanups(then_expr, cleanups)
+			rewritten_else: CoreExpr = rewrite_resource_expr_with_cleanups(else_expr, cleanups)
+
+			if (
+				same_core_expr(rewritten_cond, cond)
+				and same_core_expr(rewritten_then, then_expr)
+				and same_core_expr(rewritten_else, else_expr)
+			):
+				expr
+			else:
+				IfExpr(rewritten_cond, rewritten_then, rewritten_else, typ, loc)
+		_:
+			expr
+
+
+-- Calls and the literal, record, union, and select aggregates.
+private pure func rewrite_resource_aggregate_with_cleanups(
+	expr: CoreExpr,
+	cleanups: List[CoreExpr],
+) -> CoreExpr:
+	match expr:
+		CallExpr(kind, callee, args, typ, loc):
+			rewritten_callee: CoreExpr = rewrite_resource_expr_with_cleanups(callee, cleanups)
+			rewritten_args: List[CoreExpr] = rewrite_resource_expr_list_with_cleanups(
+				args,
+				cleanups,
+			)
+
+			if same_core_expr(rewritten_callee, callee) and same_core_exprs(rewritten_args, args):
+				expr
+			else:
+				CallExpr(kind, rewritten_callee, rewritten_args, typ, loc)
+		TupleExpr(items, typ, loc):
+			rewritten_items: List[CoreExpr] = rewrite_resource_expr_list_with_cleanups(
+				items,
+				cleanups,
+			)
+
+			if same_core_exprs(rewritten_items, items):
+				expr
+			else:
+				TupleExpr(rewritten_items, typ, loc)
+		TupleConstructExpr(tuple_construct, typ, loc):
+			match rewrite_tuple_elements_with_cleanups(tuple_construct.elements, cleanups):
+				Some(elements):
+					TupleConstructExpr({ tuple_construct | elements = elements }, typ, loc)
+				None:
+					expr
+		VectorExpr(items, typ, loc):
+			rewritten_items: List[CoreExpr] = rewrite_resource_expr_list_with_cleanups(
+				items,
+				cleanups,
+			)
+
+			if same_core_exprs(rewritten_items, items):
+				expr
+			else:
+				VectorExpr(rewritten_items, typ, loc)
+		ListConstructExpr(construct, typ, loc):
+			match rewrite_list_construct_with_cleanups(construct, cleanups):
+				Some(rewritten_construct):
+					ListConstructExpr(rewritten_construct, typ, loc)
+				None:
+					expr
+		DictExpr(entries, typ, loc):
+			match rewrite_list_items(
+				entries,
+				func(entry): rewrite_dict_literal_entry_with_cleanups(entry, cleanups),
+			):
+				Some(rewritten_entries):
+					DictExpr(rewritten_entries, typ, loc)
+				None:
+					expr
+		DictConstructExpr(construct, typ, loc):
+			match rewrite_dict_construct_with_cleanups(construct, cleanups):
+				Some(rewritten_construct):
+					DictConstructExpr(rewritten_construct, typ, loc)
+				None:
+					expr
+		RecordExpr(fields, typ, loc):
+			match rewrite_record_fields_with_cleanups(fields, cleanups):
+				Some(rewritten_fields):
+					RecordExpr(rewritten_fields, typ, loc)
+				None:
+					expr
+		RecordUpdateExpr(base, fields, typ, loc):
+			rewritten_base: CoreExpr = rewrite_resource_expr_with_cleanups(base, cleanups)
+			rewritten_fields: Option[List[CoreRecordFieldValue]] = rewrite_record_fields_with_cleanups(
+				fields,
+				cleanups,
+			)
+
+			if same_core_expr(rewritten_base, base) and rewritten_fields.is_none():
+				expr
+			else:
+				RecordUpdateExpr(
+					rewritten_base,
+					rewritten_fields.get_or(fields),
+					typ,
+					loc,
+				)
+		RecordReuseExpr(source, fields, typ, loc):
+			rewritten_source: CoreExpr = rewrite_resource_expr_with_cleanups(source, cleanups)
+			rewritten_fields: Option[List[CoreRecordFieldValue]] = rewrite_record_fields_with_cleanups(
+				fields,
+				cleanups,
+			)
+
+			if same_core_expr(rewritten_source, source) and rewritten_fields.is_none():
+				expr
+			else:
+				RecordReuseExpr(
+					rewritten_source,
+					rewritten_fields.get_or(fields),
+					typ,
+					loc,
+				)
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			rewritten_source: CoreExpr = rewrite_resource_expr_with_cleanups(source, cleanups)
+			rewritten_fields: Option[List[CoreRecordCowField]] = rewrite_list_items(
+				fields,
+				func(field): rewrite_record_cow_field_with_cleanups(field, cleanups),
+			)
+
+			if same_core_expr(rewritten_source, source) and rewritten_fields.is_none():
+				expr
+			else:
+				RecordCowUpdateExpr(
+					rewritten_source,
+					rewritten_fields.get_or(fields),
+					typ,
+					loc,
+				)
+		RecordConstructExpr(type_name, fields, typ, loc):
+			match rewrite_record_fields_with_cleanups(fields, cleanups):
+				Some(rewritten_fields):
+					RecordConstructExpr(type_name, rewritten_fields, typ, loc)
+				None:
+					expr
+		UnionConstructExpr(construct, typ, loc):
+			match rewrite_boxed_storage_values_with_cleanups(construct.args, cleanups):
+				Some(args):
+					UnionConstructExpr({ construct | args = args }, typ, loc)
+				None:
+					expr
+		UnionReuseConstructExpr(construct, typ, loc):
+			rewritten_source: CoreExpr = rewrite_resource_expr_with_cleanups(
+				construct.source,
+				cleanups,
+			)
+			rewritten_args: Option[List[CoreBoxedStorageValue]] = rewrite_boxed_storage_values_with_cleanups(
+				construct.args,
+				cleanups,
+			)
+
+			if same_core_expr(rewritten_source, construct.source) and rewritten_args.is_none():
+				expr
+			else:
+				UnionReuseConstructExpr(
+					{ construct |
+						source = rewritten_source,
+						args = rewritten_args.get_or(construct.args)
+					},
+					typ,
+					loc,
+				)
+		SelectExpr(select_expr, typ, loc):
+			match rewrite_list_items(
+				select_expr,
+				func(arm): rewrite_select_arm_with_cleanups(arm, cleanups),
+			):
+				Some(arms):
+					SelectExpr(arms, typ, loc)
+				None:
+					expr
+		_:
+			expr
+
+
+-- List, string, and tensor storage operations whose children live in one
+-- payload record.
+private pure func rewrite_resource_storage_with_cleanups(
+	expr: CoreExpr,
+	cleanups: List[CoreExpr],
+) -> CoreExpr:
+	match expr:
+		ListAllocExpr(alloc, typ, loc):
+			match rewrite_list_alloc_with_cleanups(alloc, cleanups):
+				Some(rewritten):
+					ListAllocExpr(rewritten, typ, loc)
+				None:
+					expr
+		ListGetExpr(get, typ, loc):
+			match rewrite_list_get_with_cleanups(get, cleanups):
+				Some(rewritten):
+					ListGetExpr(rewritten, typ, loc)
+				None:
+					expr
+		ListHandoffExpr(handoff, typ, loc):
+			match rewrite_list_handoff_with_cleanups(handoff, cleanups):
+				Some(rewritten):
+					ListHandoffExpr(rewritten, typ, loc)
+				None:
+					expr
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			match rewrite_list_set_with_cleanups(set, cleanups):
+				Some(rewritten):
+					ListHandoffSetOwnedExpr(rewritten, typ, loc)
+				None:
+					expr
+		ListHandoffSetSourceSlotExpr(slot, typ, loc):
+			match rewrite_list_handoff_set_source_slot_with_cleanups(slot, cleanups):
+				Some(rewritten):
+					ListHandoffSetSourceSlotExpr(rewritten, typ, loc)
+				None:
+					expr
+		ListRetainExpr(retain, typ, loc):
+			match rewrite_list_retain_with_cleanups(retain, cleanups):
+				Some(rewritten):
+					ListRetainExpr(rewritten, typ, loc)
+				None:
+					expr
+		ListSetExpr(set, typ, loc):
+			match rewrite_list_set_with_cleanups(set, cleanups):
+				Some(rewritten):
+					ListSetExpr(rewritten, typ, loc)
+				None:
+					expr
+		ListSwapExpr(swap, typ, loc):
+			match rewrite_list_swap_with_cleanups(swap, cleanups):
+				Some(rewritten):
+					ListSwapExpr(rewritten, typ, loc)
+				None:
+					expr
+		StringByteReadExpr(read, typ, loc):
+			match rewrite_string_byte_read_with_cleanups(read, cleanups):
+				Some(rewritten):
+					StringByteReadExpr(rewritten, typ, loc)
+				None:
+					expr
+		StringByteWriteExpr(write, typ, loc):
+			match rewrite_string_byte_write_with_cleanups(write, cleanups):
+				Some(rewritten):
+					StringByteWriteExpr(rewritten, typ, loc)
+				None:
+					expr
+		StringByteCopyExpr(copy, typ, loc):
+			match rewrite_string_byte_copy_with_cleanups(copy, cleanups):
+				Some(rewritten):
+					StringByteCopyExpr(rewritten, typ, loc)
+				None:
+					expr
+		StringSetLenExpr(set_len, typ, loc):
+			match rewrite_string_set_len_with_cleanups(set_len, cleanups):
+				Some(rewritten):
+					StringSetLenExpr(rewritten, typ, loc)
+				None:
+					expr
+		TensorLiteralExpr(literal, typ, loc):
+			match rewrite_tensor_literal_with_cleanups(literal, cleanups):
+				Some(rewritten):
+					TensorLiteralExpr(rewritten, typ, loc)
+				None:
+					expr
+		TensorBoxedLiteralExpr(literal, typ, loc):
+			match rewrite_tensor_boxed_literal_with_cleanups(literal, cleanups):
+				Some(rewritten):
+					TensorBoxedLiteralExpr(rewritten, typ, loc)
+				None:
+					expr
+		TensorPackedLiteralExpr(literal, typ, loc):
+			match rewrite_tensor_packed_literal_with_cleanups(literal, cleanups):
+				Some(rewritten):
+					TensorPackedLiteralExpr(rewritten, typ, loc)
+				None:
+					expr
+		TensorRawFillExpr(fill, typ, loc):
+			match rewrite_tensor_raw_fill_with_cleanups(fill, cleanups):
+				Some(rewritten):
+					TensorRawFillExpr(rewritten, typ, loc)
+				None:
+					expr
+		TensorRawReadExpr(read, typ, loc):
+			match rewrite_tensor_raw_read_with_cleanups(read, cleanups):
+				Some(rewritten):
+					TensorRawReadExpr(rewritten, typ, loc)
+				None:
+					expr
+		TensorRawWriteExpr(write, typ, loc):
+			match rewrite_tensor_raw_write_with_cleanups(write, cleanups):
+				Some(rewritten):
+					TensorRawWriteExpr(rewritten, typ, loc)
+				None:
+					expr
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			rewritten_binding: Option[CoreTensorRawViewBinding] = rewrite_tensor_raw_view_binding_with_cleanups(
+				binding,
+				cleanups,
+			)
+			rewritten_body: CoreExpr = rewrite_resource_expr_with_cleanups(body, cleanups)
+
+			if rewritten_binding.is_none() and same_core_expr(rewritten_body, body):
+				expr
+			else:
+				TensorRawViewLetExpr(
+					rewritten_binding.get_or(binding),
+					rewritten_body,
+					typ,
+					loc,
+				)
+		_:
+			expr
+
+
+-- Rebuilds a `for` loop's payload record only when its iterable or body
+-- changed. Loop bodies are their own break/continue targets and start a fresh
+-- cleanup stack. Every `for` payload shares these two field names.
+private pure func rewritten_for_loop_children(
+	iterable: CoreExpr,
+	body: CoreExpr,
+	cleanups: List[CoreExpr],
+) -> Option[(CoreExpr, CoreExpr)]:
+	rewritten_iterable: CoreExpr = rewrite_resource_expr_with_cleanups(iterable, cleanups)
+	rewritten_body: CoreExpr = rewrite_resource_expr_with_cleanups(body, [])
+
+	if same_core_expr(rewritten_iterable, iterable) and same_core_expr(rewritten_body, body):
+		None
+	else:
+		Some((rewritten_iterable, rewritten_body))
+
+
+-- Lambdas, tail-recursive loops, `for` loops, and resource scopes. A scope's
+-- cleanup joins the stack for its body; an already rewritten cleanup exit is
+-- left alone.
+private pure func rewrite_resource_loop_with_cleanups(
+	expr: CoreExpr,
+	cleanups: List[CoreExpr],
+) -> CoreExpr:
+	match expr:
+		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
+			rewritten_body: CoreExpr = rewrite_resource_expr_with_cleanups(lambda_body, [])
+
+			if same_core_expr(rewritten_body, lambda_body):
+				expr
+			else:
+				LambdaExpr(
+					lambda_params,
+					lambda_return_type,
+					rewritten_body,
+					lambda_is_pure,
+					typ,
+					loc,
+				)
+		TailrecLoopExpr(params, return_type, body, loc):
+			rewritten_body: CoreExpr = rewrite_resource_expr_with_cleanups(body, [])
+
+			if same_core_expr(rewritten_body, body):
+				expr
+			else:
+				TailrecLoopExpr(params, return_type, rewritten_body, loc)
+		TailrecRecurExpr(args, typ, loc):
+			rewritten_args: List[CoreExpr] = rewrite_resource_expr_list_with_cleanups(
+				args,
+				cleanups,
+			)
+
+			if same_core_exprs(rewritten_args, args):
+				expr
+			else:
+				TailrecRecurExpr(rewritten_args, typ, loc)
+		TailrecListSpreadLoopExpr(loop, loc):
+			match rewrite_tailrec_list_spread_loop_with_cleanups(loop):
+				Some(rewritten_loop):
+					TailrecListSpreadLoopExpr(rewritten_loop, loc)
+				None:
+					expr
+		TailrecListSpreadRecurExpr(rebinds, cursor_advance, typ, loc):
+			match rewrite_list_items(
+				rebinds,
+				func(rebind): rewrite_tailrec_list_spread_rebind_with_cleanups(rebind, cleanups),
+			):
+				Some(rewritten_rebinds):
+					TailrecListSpreadRecurExpr(rewritten_rebinds, cursor_advance, typ, loc)
+				None:
+					expr
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			rewritten_start: CoreExpr = rewrite_resource_expr_with_cleanups(start, cleanups)
+			rewritten_end: CoreExpr = rewrite_resource_expr_with_cleanups(end_value, cleanups)
+			rewritten_body: CoreExpr = rewrite_resource_expr_with_cleanups(body, [])
+
+			if (
+				same_core_expr(rewritten_start, start)
+				and same_core_expr(rewritten_end, end_value)
+				and same_core_expr(rewritten_body, body)
+			):
+				expr
+			else:
+				ForRangeExpr(binder, rewritten_start, rewritten_end, rewritten_body, typ, loc)
+		ForChannelExpr(for_channel, typ, loc):
+			match rewritten_for_loop_children(for_channel.iterable, for_channel.body, cleanups):
+				Some((iterable, body)):
+					ForChannelExpr(
+						{ for_channel |
+							iterable = iterable,
+							body = body
+						},
+						typ,
+						loc,
 					)
 				None:
-					SeqExpr(
-						rewrite_resource_expr_with_cleanups(first, cleanups),
-						rewrite_resource_expr_with_cleanups(second, cleanups),
+					expr
+		ForListExpr(for_list, typ, loc):
+			match rewritten_for_loop_children(for_list.iterable, for_list.body, cleanups):
+				Some((iterable, body)):
+					ForListExpr(
+						{ for_list |
+							iterable = iterable,
+							body = body
+						},
+						typ,
+						loc,
 					)
+				None:
+					expr
+		ForStringExpr(for_string, typ, loc):
+			match rewritten_for_loop_children(for_string.iterable, for_string.body, cleanups):
+				Some((iterable, body)):
+					ForStringExpr(
+						{ for_string |
+							iterable = iterable,
+							body = body
+						},
+						typ,
+						loc,
+					)
+				None:
+					expr
+		ForDictExpr(for_dict, typ, loc):
+			match rewritten_for_loop_children(for_dict.iterable, for_dict.body, cleanups):
+				Some((iterable, body)):
+					ForDictExpr(
+						{ for_dict |
+							iterable = iterable,
+							body = body
+						},
+						typ,
+						loc,
+					)
+				None:
+					expr
+		ForSetExpr(for_set, typ, loc):
+			match rewritten_for_loop_children(for_set.iterable, for_set.body, cleanups):
+				Some((iterable, body)):
+					ForSetExpr(
+						{ for_set |
+							iterable = iterable,
+							body = body
+						},
+						typ,
+						loc,
+					)
+				None:
+					expr
+		ForResourceSourceExpr(for_resource_source, typ, loc):
+			match rewritten_for_loop_children(
+				for_resource_source.iterable,
+				for_resource_source.body,
+				cleanups,
+			):
+				Some((iterable, body)):
+					ForResourceSourceExpr(
+						{ for_resource_source |
+							iterable = iterable,
+							body = body
+						},
+						typ,
+						loc,
+					)
+				None:
+					expr
+		ForStreamExpr(for_stream, typ, loc):
+			match rewritten_for_loop_children(for_stream.iterable, for_stream.body, cleanups):
+				Some((iterable, body)):
+					ForStreamExpr(
+						{ for_stream |
+							iterable = iterable,
+							body = body
+						},
+						typ,
+						loc,
+					)
+				None:
+					expr
+		ForTensorExpr(for_tensor, typ, loc):
+			match rewritten_for_loop_children(for_tensor.iterable, for_tensor.body, cleanups):
+				Some((iterable, body)):
+					ForTensorExpr(
+						{ for_tensor |
+							iterable = iterable,
+							body = body
+						},
+						typ,
+						loc,
+					)
+				None:
+					expr
+		ResourceScopeExpr(scope, typ, loc):
+			active_cleanups: List[CoreExpr] = prepend_cleanup(scope.cleanup, cleanups)
+			rewritten_acquire: CoreExpr = rewrite_resource_expr_with_cleanups(
+				scope.acquire,
+				cleanups,
+			)
+			rewritten_body: CoreExpr = rewrite_resource_expr_with_cleanups(
+				scope.body,
+				active_cleanups,
+			)
+			rewritten_cleanup: CoreExpr = rewrite_resource_expr_with_cleanups(
+				scope.cleanup,
+				cleanups,
+			)
+
+			if (
+				same_core_expr(rewritten_acquire, scope.acquire)
+				and same_core_expr(rewritten_body, scope.body)
+				and same_core_expr(rewritten_cleanup, scope.cleanup)
+			):
+				expr
+			else:
+				ResourceScopeExpr(
+					{ scope |
+						acquire = rewritten_acquire,
+						body = rewritten_body,
+						cleanup = rewritten_cleanup
+					},
+					typ,
+					loc,
+				)
+		_:
+			expr
+
+
+-- Structured-concurrency blocks and loops, before and after closure formation.
+-- Task bodies never inherit the enclosing cleanup stack.
+private pure func rewrite_resource_concurrency_with_cleanups(
+	expr: CoreExpr,
+	cleanups: List[CoreExpr],
+) -> CoreExpr:
+	match expr:
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			rewritten_iterable: CoreExpr = rewrite_resource_expr_with_cleanups(
+				loop.iterable,
+				cleanups,
+			)
+			rewritten_body: CoreExpr = rewrite_resource_expr_with_cleanups(loop.body, [])
+			rewritten_timeout: Option[CoreExpr] = rewrite_optional_expr_with_cleanups(
+				loop.timeout,
+				cleanups,
+			)
+			rewritten_limit: CoreExpr = rewrite_resource_expr_with_cleanups(loop.limit, cleanups)
+
+			if (
+				same_core_expr(rewritten_iterable, loop.iterable)
+				and same_core_expr(rewritten_body, loop.body)
+				and same_optional_core_expr(rewritten_timeout, loop.timeout)
+				and same_core_expr(rewritten_limit, loop.limit)
+			):
+				expr
+			else:
+				PreClosureConcurrentlyLoopExpr(
+					{ loop |
+						iterable = rewritten_iterable,
+						body = rewritten_body,
+						timeout = rewritten_timeout,
+						limit = rewritten_limit
+					},
+					typ,
+					loc,
+				)
+		ConcurrentlyLoopExpr(loop, typ, loc):
+			match rewrite_concurrently_loop_with_cleanups(loop, cleanups):
+				Some(rewritten_loop):
+					ConcurrentlyLoopExpr(rewritten_loop, typ, loc)
+				None:
+					expr
+		PreClosureConcurrentExpr(block, typ, loc):
+			rewritten_body: CoreExpr = rewrite_resource_expr_with_cleanups(block.body, cleanups)
+			rewritten_timeout: Option[CoreExpr] = rewrite_optional_expr_with_cleanups(
+				block.timeout,
+				cleanups,
+			)
+
+			if (
+				same_core_expr(rewritten_body, block.body)
+				and same_optional_core_expr(rewritten_timeout, block.timeout)
+			):
+				expr
+			else:
+				PreClosureConcurrentExpr(
+					{ block |
+						body = rewritten_body,
+						timeout = rewritten_timeout
+					},
+					typ,
+					loc,
+				)
+		ConcurrentExpr(block, typ, loc):
+			match rewrite_concurrent_with_cleanups(block, cleanups):
+				Some(rewritten_block):
+					ConcurrentExpr(rewritten_block, typ, loc)
+				None:
+					expr
+		_:
+			expr
+
+
+-- The match forms. A releasing scrutinee's drop joins the cleanup stack for
+-- the branches; semantic matches go through the shared traversal, which
+-- applies the same reuse rule.
+private pure func rewrite_resource_match_with_cleanups(
+	expr: CoreExpr,
+	cleanups: List[CoreExpr],
+) -> CoreExpr:
+	match expr:
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			rewritten_scrutinee: CoreExpr = rewrite_resource_expr_with_cleanups(scrutinee, cleanups)
+			rewritten_cases: Option[List[CoreRawMatchCase]] = rewrite_list_items(
+				cases,
+				func(match_case): rewrite_raw_match_case_with_cleanups(match_case, cleanups),
+			)
+
+			if same_core_expr(rewritten_scrutinee, scrutinee) and rewritten_cases.is_none():
+				expr
+			else:
+				RawMatchExpr(
+					rewritten_scrutinee,
+					rewritten_cases.get_or(cases),
+					typ,
+					loc,
+				)
+		SemanticMatchExpr(scrutinee, tree, typ, loc):
+			CoreTraverse.map_core_expr_children(
+				expr,
+				func(child): rewrite_resource_expr_with_cleanups(child, cleanups),
+			)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			rewritten_scrutinee: CoreExpr = rewrite_resource_expr_with_cleanups(scrutinee, cleanups)
+			rewritten_cases: Option[List[CoreLiteralMatchCase]] = rewrite_literal_match_cases_with_cleanups(
+				cases,
+				cleanups,
+			)
+			rewritten_fallback: Option[CoreLiteralMatchFallback] = rewrite_literal_match_fallback_with_cleanups(
+				fallback,
+				cleanups,
+			)
+
+			if (
+				same_core_expr(rewritten_scrutinee, scrutinee)
+				and rewritten_cases.is_none()
+				and rewritten_fallback.is_none()
+			):
+				expr
+			else:
+				LiteralMatchExpr(
+					rewritten_scrutinee,
+					rewritten_cases.get_or(cases),
+					rewritten_fallback.get_or(fallback),
+					typ,
+					loc,
+				)
 		AccessorLiteralMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc):
 			branch_cleanups: List[CoreExpr] = match_branch_cleanups(
 				scrutinee,
 				scrutinee_release_policy,
 				cleanups,
 			)
-			AccessorLiteralMatchExpr(
-				rewrite_resource_expr_with_cleanups(scrutinee, cleanups),
-				scrutinee_release_policy,
-				rewrite_constructor_literal_match_with_cleanups(match_expr, branch_cleanups),
-				typ,
-				loc,
+			rewritten_scrutinee: CoreExpr = rewrite_resource_expr_with_cleanups(scrutinee, cleanups)
+			rewritten_match: Option[CoreConstructorLiteralMatch] = rewrite_constructor_literal_match_with_cleanups(
+				match_expr,
+				branch_cleanups,
 			)
+
+			if same_core_expr(rewritten_scrutinee, scrutinee) and rewritten_match.is_none():
+				expr
+			else:
+				AccessorLiteralMatchExpr(
+					rewritten_scrutinee,
+					scrutinee_release_policy,
+					rewritten_match.get_or(match_expr),
+					typ,
+					loc,
+				)
 		LengthMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc):
 			branch_cleanups: List[CoreExpr] = match_branch_cleanups(
 				scrutinee,
 				scrutinee_release_policy,
 				cleanups,
 			)
-			LengthMatchExpr(
-				rewrite_resource_expr_with_cleanups(scrutinee, cleanups),
-				scrutinee_release_policy,
-				rewrite_constructor_length_match_with_cleanups(match_expr, branch_cleanups),
-				typ,
-				loc,
-			)
-		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
-			-- This is another bootstrap-sensitive constructor: the fallback can consume
-			-- the cleanup owner while the case mapper still needs to borrow it.
 			rewritten_scrutinee: CoreExpr = rewrite_resource_expr_with_cleanups(scrutinee, cleanups)
-			rewritten_cases: List[CoreLiteralMatchCase] = rewrite_literal_match_cases_with_cleanups(
-				cases,
-				cleanups,
-			)
-			rewritten_fallback: CoreLiteralMatchFallback = rewrite_literal_match_fallback_with_cleanups(
-				fallback,
-				cleanups,
+			rewritten_match: Option[CoreConstructorLengthMatch] = rewrite_constructor_length_match_with_cleanups(
+				match_expr,
+				branch_cleanups,
 			)
 
-			LiteralMatchExpr(rewritten_scrutinee, rewritten_cases, rewritten_fallback, typ, loc)
-		RawMatchExpr(scrutinee, cases, typ, loc):
-			RawMatchExpr(
-				rewrite_resource_expr_with_cleanups(scrutinee, cleanups),
-				cases.map(
-					func(
-						case,
-					): { case | body = rewrite_resource_expr_with_cleanups(case.body, cleanups) },
-				),
-				typ,
-				loc,
-			)
-		SemanticMatchExpr(scrutinee, tree, typ, loc):
-			CoreTraverse.map_core_expr_children(
-				expr,
-				func(child): rewrite_resource_expr_with_cleanups(child, cleanups),
-			)
+			if same_core_expr(rewritten_scrutinee, scrutinee) and rewritten_match.is_none():
+				expr
+			else:
+				LengthMatchExpr(
+					rewritten_scrutinee,
+					scrutinee_release_policy,
+					rewritten_match.get_or(match_expr),
+					typ,
+					loc,
+				)
 		ConstructorMatchExpr(scrutinee, scrutinee_release_policy, cases, fallback, typ, loc):
 			branch_cleanups: List[CoreExpr] = match_branch_cleanups(
 				scrutinee,
 				scrutinee_release_policy,
 				cleanups,
 			)
-			-- Keep these calls sequenced while bootstrapping with an emitter that may leave simple
-			-- constructor arguments inline. The fixed emitter materializes union payloads in order.
 			rewritten_scrutinee: CoreExpr = rewrite_resource_expr_with_cleanups(scrutinee, cleanups)
-			rewritten_cases: List[CoreConstructorMatchCase] = rewrite_constructor_match_cases_with_cleanups(
+			rewritten_cases: Option[List[CoreConstructorMatchCase]] = rewrite_constructor_match_cases_with_cleanups(
 				cases,
 				branch_cleanups,
 			)
-			rewritten_fallback: CoreConstructorMatchFallback = rewrite_constructor_match_fallback_with_cleanups(
+			rewritten_fallback: Option[CoreConstructorMatchFallback] = rewrite_constructor_match_fallback_with_cleanups(
 				fallback,
 				branch_cleanups,
 			)
 
-			ConstructorMatchExpr(
-				rewritten_scrutinee,
-				scrutinee_release_policy,
-				rewritten_cases,
-				rewritten_fallback,
-				typ,
-				loc,
-			)
-		RangeExpr(start, end_value, typ, loc):
-			RangeExpr(
-				rewrite_resource_expr_with_cleanups(start, cleanups),
-				rewrite_resource_expr_with_cleanups(end_value, cleanups),
-				typ,
-				loc,
-			)
-		IfExpr(cond, then_expr, else_expr, typ, loc):
-			IfExpr(
-				rewrite_resource_expr_with_cleanups(cond, cleanups),
-				rewrite_resource_expr_with_cleanups(then_expr, cleanups),
-				rewrite_resource_expr_with_cleanups(else_expr, cleanups),
-				typ,
-				loc,
-			)
-		LiteralExpr(literal, typ, loc):
+			if (
+				same_core_expr(rewritten_scrutinee, scrutinee)
+				and rewritten_cases.is_none()
+				and rewritten_fallback.is_none()
+			):
+				expr
+			else:
+				ConstructorMatchExpr(
+					rewritten_scrutinee,
+					scrutinee_release_policy,
+					rewritten_cases.get_or(cases),
+					rewritten_fallback.get_or(fallback),
+					typ,
+					loc,
+				)
+		_:
 			expr
-		StaticStringLiteralExpr(id, value, typ, loc):
-			expr
-		VarExpr(variable, typ, loc):
-			expr
-		VoidExpr(typ, loc):
-			expr
-		CooperativeCheckpointExpr(typ, loc):
-			expr
-		TailrecRecurExpr(args, typ, loc):
-			TailrecRecurExpr(
-				rewrite_resource_expr_list_with_cleanups(args, cleanups),
-				typ,
-				loc,
-			)
-		TailrecListSpreadRecurExpr(rebinds, cursor_advance, typ, loc):
-			TailrecListSpreadRecurExpr(
-				rebinds.map(
-					func(
-						rebind,
-					): rewrite_tailrec_list_spread_rebind_with_cleanups(rebind, cleanups),
-				),
-				cursor_advance,
-				typ,
-				loc,
-			)
 
 
 pure func rewrite_resource_expr(expr: CoreExpr) -> CoreExpr:
@@ -1765,13 +2412,23 @@ pure func rewrite_resource_expr(expr: CoreExpr) -> CoreExpr:
 pure func rewrite_resource_function(func_info: CoreFunction) -> CoreFunction:
 	match func_info.body:
 		Some(body):
-			{ func_info | body = Some(rewrite_resource_expr(body)) }
+			rewritten_body: CoreExpr = rewrite_resource_expr(body)
+
+			if same_core_expr(rewritten_body, body):
+				func_info
+			else:
+				{ func_info | body = Some(rewritten_body) }
 		None:
 			func_info
 
 
 pure func rewrite_resource_global(global: CoreGlobal) -> CoreGlobal:
-	{ global | init = rewrite_resource_expr(global.init) }
+	rewritten_init: CoreExpr = rewrite_resource_expr(global.init)
+
+	if same_core_expr(rewritten_init, global.init):
+		global
+	else:
+		{ global | init = rewritten_init }
 
 
 pure func rewrite_resource_decl(decl: CoreDecl) -> CoreDecl:

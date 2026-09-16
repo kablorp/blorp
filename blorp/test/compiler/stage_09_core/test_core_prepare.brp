@@ -1,10 +1,12 @@
 import:
 	../../../src/compiler/stage_09_core/ir:
+		CoreBinaryOp(AddOp),
 		CoreBoxKind(PointerBox, PrimBox, StructBox),
 		CoreBoxedStorageValue,
 		CoreCallKind(BuiltinCall, IntrinsicCall, UserCall),
 		CoreDecl(FunctionDecl, HeapRecordDecl, UnionDecl, ValueRecordDecl),
 		CoreExpr(
+			BinaryExpr,
 			BoxExpr,
 			CallExpr,
 			CastExpr,
@@ -19,6 +21,7 @@ import:
 			LiteralExpr,
 			RecordExpr,
 			RecordConstructExpr,
+			SeqExpr,
 			TensorLiteralExpr,
 			TupleConstructExpr,
 			TupleExpr,
@@ -88,6 +91,7 @@ import:
 		CoreVar,
 		core_program_to_json,
 	../../../src/compiler/stage_09_core/prepare: is_primitive_tuple_slot_type, prepare_program
+	memory: same_object
 	test: TestSuite
 
 
@@ -2477,6 +2481,98 @@ pure func test_primitive_tuple_slot_type_is_narrow() -> Bool:
 	)
 
 
+pure func prepared_function_body(program: CoreProgram) -> Option[CoreExpr]:
+	var result: Option[CoreExpr] = None
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				result = function_info.body
+			_:
+				void
+
+	result
+
+
+pure func test_prepare_reuses_unchanged_function_body() -> Bool:
+	-- Nothing here needs preparation: a let over an Int add, then an if that
+	-- reads the binding.
+	body: CoreExpr = LetExpr(
+		named_var("total"),
+		False,
+		int_type(),
+		BinaryExpr(AddOp, int_literal(1), int_literal(2), int_type(), SyntheticSourceLoc),
+		IfExpr(
+			VarExpr(named_var("flag"), bool_type(), SyntheticSourceLoc),
+			VarExpr(named_var("total"), int_type(), SyntheticSourceLoc),
+			int_literal(0),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+	)
+	prepared: CoreProgram = prepare_program(program_with_body(body, int_type()))
+
+	match prepared_function_body(prepared):
+		Some(prepared_body):
+			same_object(prepared_body, body)
+		None:
+			False
+
+
+pure func test_prepare_rebuilds_only_the_spine_to_a_changed_node() -> Bool:
+	untouched: CoreExpr = int_literal(7)
+	tuple_literal: CoreExpr = primitive_tuple_literal()
+	let_body: CoreExpr = VarExpr(named_var("pair"), int_pair_type(), SyntheticSourceLoc)
+	body: CoreExpr = SeqExpr(
+		untouched,
+		LetExpr(named_var("pair"), False, int_pair_type(), tuple_literal, let_body),
+	)
+	prepared: CoreProgram = prepare_program(program_with_body(body, int_pair_type()))
+	expected: CoreProgram = program_with_body(
+		SeqExpr(
+			untouched,
+			LetExpr(
+				named_var("pair"),
+				False,
+				int_pair_type(),
+				prepared_primitive_tuple_literal(),
+				let_body,
+			),
+		),
+		int_pair_type(),
+	)
+
+	match prepared_function_body(prepared):
+		Some(SeqExpr(prepared_first, LetExpr(_, _, _, prepared_rhs, prepared_let_body))):
+			(
+				programs_equal(prepared, expected)
+				and same_object(prepared_first, untouched)
+				and same_object(prepared_let_body, let_body)
+				and not same_object(prepared_rhs, tuple_literal)
+			)
+		_:
+			False
+
+
+pure func test_prepare_reuses_already_prepared_output() -> Bool:
+	-- The first run rewrites the tuple literal and orders the record fields;
+	-- the second run must hand the whole body back untouched.
+	once: CoreProgram = prepare_program(
+		program_with_point_body(SeqExpr(primitive_tuple_literal(), out_of_order_point_literal())),
+	)
+	twice: CoreProgram = prepare_program(once)
+
+	match (prepared_function_body(once), prepared_function_body(twice)):
+		(Some(SeqExpr(TupleConstructExpr(_, _, _), RecordConstructExpr(_, _, _, _))), Some(second_body)):
+			match prepared_function_body(once):
+				Some(first_body):
+					same_object(second_body, first_body)
+				None:
+					False
+		_:
+			False
+
+
 tests: TestSuite = {
 	description = "Blorp compiler Core prepare",
 	tests = [
@@ -2616,5 +2712,11 @@ tests: TestSuite = {
 			test_prepare_reboxes_stack_result_in_erased_list_storage,
 		),
 		("primitive tuple slot type is narrow", test_primitive_tuple_slot_type_is_narrow),
+		("prepare reuses an unchanged function body", test_prepare_reuses_unchanged_function_body),
+		(
+			"prepare rebuilds only the spine to a changed node",
+			test_prepare_rebuilds_only_the_spine_to_a_changed_node,
+		),
+		("prepare reuses already prepared output", test_prepare_reuses_already_prepared_output),
 	]
 }

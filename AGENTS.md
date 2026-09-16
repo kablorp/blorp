@@ -262,27 +262,32 @@ or before/after error message comparison. "It compiles" is not proof. For error 
 the error message content — a `should_fail` test that doesn't check the message is incomplete.
 For codegen changes, read the generated C.
 
-**11. Get it reviewed.** Every change gets reviewed before commit. Use the code-reviewer and
+**11. Keep commit messages short.** A one-line subject and a body of a few
+lines at most: what was wrong, what changed, and one or two headline numbers.
+No issue numbers or names, no pasted tables or gate lists; that detail lives
+in `benchmarks/results/` and the issue docs.
+
+**12. Get it reviewed.** Every change gets reviewed before commit. Use the code-reviewer and
 test-runner agents. No exceptions for "trivial" changes — trivial changes have trivial reviews.
 
-**12. Update docs with the code.** If your change is user-facing (syntax, API, error message),
+**13. Update docs with the code.** If your change is user-facing (syntax, API, error message),
 update `docs/GUIDE.md` and `docs/GRAMMAR.md` in the same commit. Documentation drift is a bug.
 The formal grammar must stay in sync with the parser.
 
-**13. Prefer coherent pre-0.1 behavior over backwards compatibility.** Blorp is pre-0.1.0, so
+**14. Prefer coherent pre-0.1 behavior over backwards compatibility.** Blorp is pre-0.1.0, so
 do not preserve old syntax, APIs, or compatibility shims merely to avoid breaking users. If the
 new behavior is clearer, safer, or simpler, remove the old form and make the current language
 coherent. Breaking changes still require updating all call sites in standard_library/, tests/, examples/, docs,
 and formatter expectations in the same change. Add migration-style error messages only when they
 meaningfully improve first-time user experience or prevent confusing parser/typechecker failures.
 
-**14. Focus on quality.** If your code is not ready to pass a review for production, then your
+**15. Focus on quality.** If your code is not ready to pass a review for production, then your
 work is incomplete. Do not settle for ad-hoc hacks or incoherent architecture.
 
-**15. Document the "Why"s.** When your code is read in the future, readers need to understand why
+**16. Document the "Why"s.** When your code is read in the future, readers need to understand why
 any non-obvious solutions exist.
 
-**16. Surface rough edges promptly.** Fast iteration depends on making friction visible. If you run
+**17. Surface rough edges promptly.** Fast iteration depends on making friction visible. If you run
 into an obstacle, confusing boundary, unreliable tool, missing probe, or likely compiler bug,
 report it while the context is fresh. Explain its effect on the current task and suggest a bounded
 solution when one is apparent. Do not silently route around recurring friction or spend a long time

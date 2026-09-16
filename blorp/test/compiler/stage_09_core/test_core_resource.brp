@@ -37,6 +37,7 @@ import:
 		CoreVar,
 		core_expr_to_json,
 	../../../src/compiler/stage_09_core/resource_management: rewrite_resource_expr
+	memory: same_object
 	test: TestSuite
 
 
@@ -546,6 +547,50 @@ pure func test_select_arm_owns_independent_cleanup_scope() -> Bool:
 	)
 
 
+pure func test_reuses_expression_without_cleanup_exits() -> Bool:
+	-- A loop-local break has no active cleanup, so nothing is rewritten and the
+	-- whole tree comes back as the same allocation.
+	expr: CoreExpr = SeqExpr(
+		bool_literal(True),
+		WhileExpr(
+			bool_literal(True),
+			BreakExpr(VoidType, SyntheticSourceLoc),
+			VoidType,
+			SyntheticSourceLoc,
+		),
+	)
+
+	same_object(rewrite_resource_expr(expr), expr)
+
+
+pure func test_rebuilds_only_the_spine_to_a_cleanup_exit() -> Bool:
+	untouched: CoreExpr = bool_literal(False)
+	inner_untouched: CoreExpr = bool_literal(True)
+	scope: CoreExpr = resource_scope(
+		"handle",
+		SeqExpr(
+			inner_untouched,
+			BreakExpr(VoidType, SyntheticSourceLoc),
+		),
+	)
+	expr: CoreExpr = SeqExpr(untouched, scope)
+
+	match (scope, rewrite_resource_expr(expr)):
+		(ResourceScopeExpr(source_scope, _, _), SeqExpr(rewritten_first, ResourceScopeExpr(rewritten_scope, _, _))):
+			match rewritten_scope.body:
+				SeqExpr(rewritten_inner, ResourceCleanupExitExpr(_, _, _)):
+					(
+						same_object(rewritten_first, untouched)
+						and same_object(rewritten_inner, inner_untouched)
+						and same_object(rewritten_scope.acquire, source_scope.acquire)
+						and same_object(rewritten_scope.cleanup, source_scope.cleanup)
+					)
+				_:
+					False
+		_:
+			False
+
+
 tests: TestSuite = {
 	description = "Blorp compiler Core resource",
 	tests = [
@@ -598,6 +643,11 @@ tests: TestSuite = {
 		(
 			"select arm owns independent cleanup scope",
 			test_select_arm_owns_independent_cleanup_scope,
+		),
+		("reuses expression without cleanup exits", test_reuses_expression_without_cleanup_exits),
+		(
+			"rebuilds only the spine to a cleanup exit",
+			test_rebuilds_only_the_spine_to_a_cleanup_exit,
 		),
 	]
 }

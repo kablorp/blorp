@@ -1,5 +1,5 @@
 import:
-	../../../src/compiler/stage_09_core/closure: convert_program
+	../../../src/compiler/stage_09_core/closure: adapt_function_refs_program, convert_program
 	../../../src/compiler/stage_09_core/ir:
 		CoreAccessor(RootAccessor),
 		CoreBinaryOp(AddOp),
@@ -68,6 +68,7 @@ import:
 			VoidType,
 		),
 		CoreVar,
+	memory: same_object
 	test: TestSuite
 
 
@@ -1012,6 +1013,99 @@ pure func test_pre_closure_resource_loop_captures_moved_item_not_callee_alias() 
 			False
 
 
+pure func closure_free_program(body: CoreExpr) -> CoreProgram:
+	function: CoreFunction = {
+		name = "closure_free",
+		source_module = None,
+		type_params = [],
+		params = [local_param("base", int_type())],
+		return_type = int_type(),
+		body = Some(body),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 60,
+		loc = SyntheticSourceLoc
+	}
+
+	{
+		decls = [FunctionDecl(function)],
+		foreign_includes = []
+	}
+
+
+pure func first_function_body(program: CoreProgram) -> Option[CoreExpr]:
+	match program.decls:
+		[FunctionDecl(function), ...rest]:
+			function.body
+		_:
+			None
+
+
+pure func test_conversion_reuses_body_without_closures() -> Bool:
+	-- Nothing here is a lambda, task, or bare function reference, so both
+	-- closure passes must hand the body back as the same allocation.
+	body: CoreExpr = LetExpr(
+		local_var("total"),
+		False,
+		int_type(),
+		BinaryExpr(
+			AddOp,
+			VarExpr(local_var("base"), int_type(), SyntheticSourceLoc),
+			LiteralExpr(IntLiteral(1), int_type(), SyntheticSourceLoc),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		SeqExpr(
+			LiteralExpr(IntLiteral(2), int_type(), SyntheticSourceLoc),
+			VarExpr(local_var("total"), int_type(), SyntheticSourceLoc),
+		),
+	)
+	program: CoreProgram = closure_free_program(body)
+
+	match (
+		first_function_body(convert_program(program)),
+		first_function_body(adapt_function_refs_program(program)),
+	):
+		(Some(converted_body), Some(adapted_body)):
+			same_object(converted_body, body) and same_object(adapted_body, body)
+		_:
+			False
+
+
+pure func test_conversion_rebuilds_only_the_spine_to_a_hoisted_lambda() -> Bool:
+	untouched: CoreExpr = LiteralExpr(IntLiteral(7), int_type(), SyntheticSourceLoc)
+	lambda_expr: CoreExpr = LambdaExpr(
+		[local_param("x", int_type())],
+		int_type(),
+		BinaryExpr(
+			AddOp,
+			VarExpr(local_var("base"), int_type(), SyntheticSourceLoc),
+			VarExpr(local_var("x"), int_type(), SyntheticSourceLoc),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		True,
+		closure_type(),
+		SyntheticSourceLoc,
+	)
+	let_body: CoreExpr = VarExpr(local_var("f"), closure_type(), SyntheticSourceLoc)
+	body: CoreExpr = SeqExpr(
+		untouched,
+		LetExpr(local_var("f"), False, closure_type(), lambda_expr, let_body),
+	)
+	converted: CoreProgram = convert_program(closure_free_program(body))
+
+	match (converted.decls, first_function_body(converted)):
+		([FunctionDecl(_), FunctionDecl(hoisted)], Some(SeqExpr(converted_first, LetExpr(_, _, _, ClosureCreateExpr(closure, _, _), converted_let_body)))):
+			(
+				closure.function_name == hoisted.name
+				and same_object(converted_first, untouched)
+				and same_object(converted_let_body, let_body)
+			)
+		_:
+			False
+
+
 tests: TestSuite = {
 	description = "Blorp compiler Core closure conversion",
 	tests = [
@@ -1040,6 +1134,11 @@ tests: TestSuite = {
 		(
 			"deep control flow conversion is stack bounded",
 			test_deep_control_flow_conversion_is_stack_bounded,
+		),
+		("conversion reuses a body without closures", test_conversion_reuses_body_without_closures),
+		(
+			"conversion rebuilds only the spine to a hoisted lambda",
+			test_conversion_rebuilds_only_the_spine_to_a_hoisted_lambda,
 		),
 	]
 }
