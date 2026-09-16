@@ -83,7 +83,6 @@ current-state and next-action summary.
 - [Zero-copy callable symbol emission](compiler-performance/136-zero-copy-callable-symbol-emission.md)
 - [Codegen-input last-use and frontend release](compiler-performance/137-codegen-input-last-use-and-release.md)
 - [Unchanged Core node reuse in the shared traversal](compiler-performance/147-reuse-unchanged-core-nodes-in-traversal.md)
-- [Perceus single-pass ownership summaries](compiler-performance/148-perceus-single-pass-ownership-summaries.md)
 - [Core pass linear-scan indexes](compiler-performance/149-index-core-pass-linear-scans.md)
 - [Normalized semantic compilation roadmap](compiler-performance/NORMALIZED_SEMANTIC_COMPILATION_ROADMAP.md)
 - [Perceus ownership roadmap](compiler-performance/PERCEUS_OWNERSHIP_OPTIMIZATION_ROADMAP.md)
