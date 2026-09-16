@@ -56,12 +56,27 @@ class CompilerToolFixtureRunnerTests(unittest.TestCase):
                     command = sys.argv[1]
                     path = Path(sys.argv[-1])
                     if command == "format":
-                        if path.name == "unformatted.brp":
-                            print("needs formatting")
-                            raise SystemExit(1)
                         if path.name == "broken.brp":
                             print("error: broken syntax")
                             raise SystemExit(1)
+                        source = path.read_text(encoding="utf-8")
+                        unformatted = "func main( args:List[String] )->Int:0"
+                        needs_formatting = (
+                            path.name == "unformatted.brp" and unformatted in source
+                        )
+                        if "--check" in sys.argv or "--diff" in sys.argv:
+                            if needs_formatting:
+                                print("needs formatting")
+                                raise SystemExit(1)
+                            raise SystemExit(0)
+                        if needs_formatting:
+                            path.write_text(
+                                source.replace(
+                                    unformatted,
+                                    "func main(args: List[String]) -> Int: 0",
+                                ),
+                                encoding="utf-8",
+                            )
                         raise SystemExit(0)
                     if command == "purify":
                         if "--dry-run" in sys.argv:
