@@ -1,5 +1,6 @@
--- Pure orchestration for early Core stages. Stage state, diagnostics,
--- observations, and stops remain explicit so every pass has one owner.
+-- The ordered early-Core pass list. Stage state, diagnostics, observations,
+-- and stops belong to the shared runner in `pass_runner`; this module owns only
+-- the order and the invariant each pass must leave behind.
 import:
 	collection_pipeline: fuse_collection_program
 	early_invariants:
@@ -11,26 +12,35 @@ import:
 		check_resolve_invariants,
 		check_std_inline_invariants,
 		check_synth_invariants,
-		core_early_invariant_hint,
-		core_early_invariant_message,
 	early_stages as CoreEarlyStages
-	ir: CoreProgram, core_program_to_json
+	ir: CoreProgram
 	match_lowering: compile_program
-	mono_specialize: CoreMonoDiagnostic, core_mono_diagnostic_hint, core_mono_diagnostic_message
 	monomorphize: monomorphize_program
 	parallel_tensor_pipeline: fuse_parallel_tensor_program
+	pass_runner:
+		CorePass,
+		CorePassControl,
+		CorePassDiagnostic(
+			CoreEarlyInvariantDiagnostic,
+			CoreEarlyMonoDiagnostic,
+			CoreEarlySynthDiagnostic,
+			CoreEarlyTraitResolveDiagnostic,
+		),
+		CorePassObservation,
+		CorePassRun(CorePassesCompleted, CorePassesFailed, CorePassesStopped),
+		CorePassState,
+		CorePassTiming,
+		core_pass,
+		core_pass_state,
+		core_program_pass,
+		run_core_passes,
 	resolve: CoreResolveImportBinding, CoreResolveModuleImports, resolve_core_program
 	std_inline: inline_std_wrappers
 	string_pipeline: fuse_string_program
 	synth: synthesize_program
-	synth_error: CoreSynthError, core_synth_error_hint, core_synth_error_message
 	tailrec: lower_tailrec_program
 	tensor_fusion: fuse_tensor_update_program
-	trait_resolve:
-		CoreTraitResolveDiagnostic,
-		core_trait_resolve_diagnostic_hint,
-		core_trait_resolve_diagnostic_message,
-		resolve_core_traits,
+	trait_resolve: resolve_core_traits
 	tuple_sroa: rewrite_tuple_sroa_program
 
 
@@ -48,6 +58,41 @@ enum CoreEarlyPipelineStage:
 	CoreEarlyFusionStage
 
 
+LOWER_PASS: String = "lower"
+
+DEBUG_PASS: String = "debug"
+
+DESUGAR_PASS: String = "desugar"
+
+MONO_PASS: String = "mono"
+
+SYNTH_PASS: String = "synth"
+
+MATCH_PASS: String = "match"
+
+TRAIT_RESOLVE_PASS: String = "trait_resolve"
+
+RESOLVE_PASS: String = "resolve"
+
+STD_INLINE_PASS: String = "std_inline"
+
+TAILREC_PASS: String = "tailrec"
+
+FUSE_STRING_PASS: String = "fuse_string"
+
+FUSE_COLLECTION_PASS: String = "fuse_collection"
+
+FUSE_PARALLEL_TENSOR_PASS: String = "fuse_parallel_tensor"
+
+FUSE_TENSOR_UPDATE_PASS: String = "fuse_tensor_update"
+
+-- Generic templates are projected out between tensor fusion and tuple SROA, so
+-- the user-visible `fusion` snapshot is the one taken after tuple SROA.
+TUPLE_SROA_PASS: String = "tuple_sroa"
+
+FUSION_STAGE: String = "fusion"
+
+
 record CoreEarlyPipelineConfiguration {
 	debug: Bool,
 	check_invariants: Bool,
@@ -63,7 +108,7 @@ record CoreEarlyPipelineInput {
 
 
 record CoreEarlyPipelineObservation {
-	stage: CoreEarlyPipelineStage,
+	stage_name: String,
 	rendered: String
 }
 
@@ -71,86 +116,58 @@ record CoreEarlyPipelineObservation {
 record CoreEarlyPipelineOutput {
 	program: CoreProgram,
 	next_def_id: Int,
-	observations: List[CoreEarlyPipelineObservation]
+	observations: List[CoreEarlyPipelineObservation],
+	pass_timings: List[CorePassTiming]
 }
-
-
-union CoreEarlyPipelineDiagnostic:
-	CoreEarlyInvariantDiagnostic(CoreEarlyInvariantViolation)
-	CoreEarlyMonoDiagnostic(CoreMonoDiagnostic)
-	CoreEarlySynthDiagnostic(CoreSynthError)
-	CoreEarlyTraitResolveDiagnostic(CoreTraitResolveDiagnostic)
-
-
-pure func core_early_pipeline_diagnostic_message(diagnostic: CoreEarlyPipelineDiagnostic) -> String:
-	match diagnostic:
-		CoreEarlyInvariantDiagnostic(violation):
-			core_early_invariant_message(violation)
-		CoreEarlyMonoDiagnostic(mono_diagnostic):
-			core_mono_diagnostic_message(mono_diagnostic)
-		CoreEarlySynthDiagnostic(synth_error):
-			core_synth_error_message(synth_error)
-		CoreEarlyTraitResolveDiagnostic(trait_diagnostic):
-			core_trait_resolve_diagnostic_message(trait_diagnostic)
-
-
-pure func core_early_pipeline_diagnostic_hint(
-	diagnostic: CoreEarlyPipelineDiagnostic,
-) -> Option[String]:
-	match diagnostic:
-		CoreEarlyInvariantDiagnostic(violation):
-			core_early_invariant_hint(violation)
-		CoreEarlyMonoDiagnostic(mono_diagnostic):
-			core_mono_diagnostic_hint(mono_diagnostic)
-		CoreEarlySynthDiagnostic(synth_error):
-			core_synth_error_hint(synth_error)
-		CoreEarlyTraitResolveDiagnostic(trait_diagnostic):
-			Some(core_trait_resolve_diagnostic_hint(trait_diagnostic))
 
 
 union CoreEarlyPipelineExecution:
 	CoreEarlyPipelineCompleted(CoreEarlyPipelineOutput)
-	CoreEarlyPipelineStopped(CoreEarlyPipelineStage, String, List[CoreEarlyPipelineObservation])
-	CoreEarlyPipelineFailed(CoreEarlyPipelineDiagnostic)
-
-
-private record CoreEarlyPipelineState {
-	program: CoreProgram,
-	next_def_id: Int,
-	observations: List[CoreEarlyPipelineObservation]
-}
-
-
-private union CoreEarlyStageExecution:
-	CoreEarlyStageContinues(CoreEarlyPipelineState)
-	CoreEarlyStageStops(CoreEarlyPipelineStage, String, List[CoreEarlyPipelineObservation])
-	CoreEarlyStageFails(CoreEarlyInvariantViolation)
+	CoreEarlyPipelineStopped(String, String, List[CoreEarlyPipelineObservation], List[CorePassTiming])
+	CoreEarlyPipelineFailed(CorePassDiagnostic)
 
 
 pure func core_early_pipeline_stage_name(stage: CoreEarlyPipelineStage) -> String:
 	match stage:
 		CoreEarlyLowerStage:
-			"lower"
+			LOWER_PASS
 		CoreEarlyDebugStage:
-			"debug"
+			DEBUG_PASS
 		CoreEarlyDesugarStage:
-			"desugar"
+			DESUGAR_PASS
 		CoreEarlyMonoStage:
-			"mono"
+			MONO_PASS
 		CoreEarlySynthStage:
-			"synth"
+			SYNTH_PASS
 		CoreEarlyMatchStage:
-			"match"
+			MATCH_PASS
 		CoreEarlyTraitResolveStage:
-			"trait_resolve"
+			TRAIT_RESOLVE_PASS
 		CoreEarlyResolveStage:
-			"resolve"
+			RESOLVE_PASS
 		CoreEarlyStdInlineStage:
-			"std_inline"
+			STD_INLINE_PASS
 		CoreEarlyTailrecStage:
-			"tailrec"
+			TAILREC_PASS
 		CoreEarlyFusionStage:
-			"fusion"
+			FUSION_STAGE
+
+
+-- User-visible stage names are aliases for the pass they end at. Only `fusion`
+-- differs from its pass, because it names the post-tuple-SROA program.
+pure func early_core_pass_name(stage: CoreEarlyPipelineStage) -> String:
+	match stage:
+		CoreEarlyFusionStage:
+			TUPLE_SROA_PASS
+		_:
+			core_early_pipeline_stage_name(stage)
+
+
+pure func early_core_pass_stage_name(pass_name: String) -> String:
+	if pass_name == TUPLE_SROA_PASS:
+		FUSION_STAGE
+	else:
+		pass_name
 
 
 pure func parse_core_early_pipeline_stage(name: String) -> Option[CoreEarlyPipelineStage]:
@@ -181,389 +198,289 @@ pure func parse_core_early_pipeline_stage(name: String) -> Option[CoreEarlyPipel
 			None
 
 
-pure func core_early_pipeline_stages_equal(
-	left: CoreEarlyPipelineStage,
-	right: CoreEarlyPipelineStage,
-) -> Bool:
-	match left:
-		CoreEarlyLowerStage:
-			match right:
-				CoreEarlyLowerStage:
-					True
-				_:
-					False
-		CoreEarlyDebugStage:
-			match right:
-				CoreEarlyDebugStage:
-					True
-				_:
-					False
-		CoreEarlyDesugarStage:
-			match right:
-				CoreEarlyDesugarStage:
-					True
-				_:
-					False
-		CoreEarlyMonoStage:
-			match right:
-				CoreEarlyMonoStage:
-					True
-				_:
-					False
-		CoreEarlySynthStage:
-			match right:
-				CoreEarlySynthStage:
-					True
-				_:
-					False
-		CoreEarlyMatchStage:
-			match right:
-				CoreEarlyMatchStage:
-					True
-				_:
-					False
-		CoreEarlyTraitResolveStage:
-			match right:
-				CoreEarlyTraitResolveStage:
-					True
-				_:
-					False
-		CoreEarlyResolveStage:
-			match right:
-				CoreEarlyResolveStage:
-					True
-				_:
-					False
-		CoreEarlyStdInlineStage:
-			match right:
-				CoreEarlyStdInlineStage:
-					True
-				_:
-					False
-		CoreEarlyTailrecStage:
-			match right:
-				CoreEarlyTailrecStage:
-					True
-				_:
-					False
-		CoreEarlyFusionStage:
-			match right:
-				CoreEarlyFusionStage:
-					True
-				_:
-					False
+private pure func first_early_violation(
+	violations: List[CoreEarlyInvariantViolation],
+) -> Option[CorePassDiagnostic]:
+	match violations:
+		[violation, ..._]:
+			Some(CoreEarlyInvariantDiagnostic(violation))
+		[]:
+			None
 
 
-private pure func stops_after_stage(
-	stop_after: Option[CoreEarlyPipelineStage],
-	stage: CoreEarlyPipelineStage,
-) -> Bool:
-	match stop_after:
-		Some(target):
-			core_early_pipeline_stages_equal(target, stage)
-		None:
-			False
+private pure func debug_invariant(program: CoreProgram) -> Option[CorePassDiagnostic]:
+	first_early_violation(check_debug_invariants(program))
 
 
-private pure func stage_invariant_violations(
-	stage: CoreEarlyPipelineStage,
-	program: CoreProgram,
-) -> List[CoreEarlyInvariantViolation]:
-	match stage:
-		CoreEarlyLowerStage:
-			[]
-		CoreEarlyDebugStage:
-			check_debug_invariants(program)
-		CoreEarlyDesugarStage:
-			check_desugar_invariants(program)
-		CoreEarlyMonoStage:
-			check_mono_invariants(program)
-		CoreEarlySynthStage:
-			check_synth_invariants(program)
-		CoreEarlyMatchStage:
-			check_match_invariants(program)
-		CoreEarlyTraitResolveStage:
-			check_match_invariants(program)
-		CoreEarlyResolveStage:
-			check_resolve_invariants(program)
-		CoreEarlyStdInlineStage:
-			check_resolve_invariants(program).concat(check_std_inline_invariants(program))
-		CoreEarlyTailrecStage:
-			check_resolve_invariants(program).concat(check_std_inline_invariants(program))
-		CoreEarlyFusionStage:
-			check_resolve_invariants(program).concat(check_std_inline_invariants(program))
+private pure func desugar_invariant(program: CoreProgram) -> Option[CorePassDiagnostic]:
+	first_early_violation(check_desugar_invariants(program))
 
 
-private pure func finish_stage(
-	stage: CoreEarlyPipelineStage,
-	state: CoreEarlyPipelineState,
-	configuration: CoreEarlyPipelineConfiguration,
-) -> CoreEarlyStageExecution:
-	violations: List[CoreEarlyInvariantViolation] = if configuration.check_invariants:
-		stage_invariant_violations(stage, state.program)
-	else:
-		match stage:
-			CoreEarlyResolveStage:
-				check_resolve_invariants(state.program)
-			CoreEarlyStdInlineStage:
-				check_resolve_invariants(
-					state.program,
-				).concat(check_std_inline_invariants(state.program))
-			CoreEarlyTailrecStage:
-				check_resolve_invariants(
-					state.program,
-				).concat(check_std_inline_invariants(state.program))
-			CoreEarlyFusionStage:
-				check_resolve_invariants(
-					state.program,
-				).concat(check_std_inline_invariants(state.program))
-			_:
-				[]
-
-	match violations.get(0):
-		Some(violation):
-			CoreEarlyStageFails(violation)
-		None:
-			observed: Bool = configuration.observations.any(
-				pure func(observation): core_early_pipeline_stages_equal(observation, stage),
-			)
-			stopped: Bool = stops_after_stage(configuration.stop_after, stage)
-
-			if observed or stopped:
-				rendered: String = core_program_to_json(state.program).to_string()
-
-				updated_observations: List[CoreEarlyPipelineObservation] = if observed:
-					state.observations.append({
-						stage = stage,
-						rendered = rendered,
-					})
-				else:
-					state.observations
-
-				if stopped:
-					CoreEarlyStageStops(stage, rendered, updated_observations)
-				else:
-					CoreEarlyStageContinues({ state | observations = updated_observations })
-			else:
-				CoreEarlyStageContinues(state)
+private pure func mono_invariant(program: CoreProgram) -> Option[CorePassDiagnostic]:
+	first_early_violation(check_mono_invariants(program))
 
 
-private pure func run_mono_stage(
-	state: CoreEarlyPipelineState,
-	configuration: CoreEarlyPipelineConfiguration,
-) -> CoreEarlyPipelineExecution:
+private pure func synth_invariant(program: CoreProgram) -> Option[CorePassDiagnostic]:
+	first_early_violation(check_synth_invariants(program))
+
+
+private pure func match_invariant(program: CoreProgram) -> Option[CorePassDiagnostic]:
+	first_early_violation(check_match_invariants(program))
+
+
+-- Resolution invariants run on every compile, so they stay in `invariant` and
+-- leave `checked_invariant` empty rather than walking the program twice under
+-- `--check-invariants`.
+private pure func resolve_invariant(program: CoreProgram) -> Option[CorePassDiagnostic]:
+	first_early_violation(check_resolve_invariants(program))
+
+
+private pure func std_inline_invariant(program: CoreProgram) -> Option[CorePassDiagnostic]:
+	first_early_violation(
+		check_resolve_invariants(program).concat(check_std_inline_invariants(program)),
+	)
+
+
+private pure func checked_early_pass(
+	name: String,
+	rewrite: pure (CoreProgram) -> CoreProgram,
+	checked: pure (CoreProgram) -> Option[CorePassDiagnostic],
+) -> CorePass:
+	{ core_program_pass(name, rewrite) | checked_invariant = checked }
+
+
+private pure func required_early_pass(
+	name: String,
+	rewrite: pure (CoreProgram) -> CoreProgram,
+	required: pure (CoreProgram) -> Option[CorePassDiagnostic],
+) -> CorePass:
+	{ core_program_pass(name, rewrite) | invariant = required }
+
+
+-- Lowering hands the pipeline a program that no early pass has touched yet;
+-- `lower` exists so that program is observable under its own stage name.
+private pure func keep_program(program: CoreProgram) -> CoreProgram:
+	program
+
+
+private pure func run_desugar_pass(program: CoreProgram) -> CoreProgram:
+	CoreEarlyStages.run_desugar_stage(program)
+
+
+private pure func run_match_pass(program: CoreProgram) -> CoreProgram:
+	compile_program(program)
+
+
+private pure func run_std_inline_pass(program: CoreProgram) -> CoreProgram:
+	inline_std_wrappers(program)
+
+
+private pure func run_tailrec_pass(program: CoreProgram) -> CoreProgram:
+	lower_tailrec_program(program)
+
+
+private pure func run_fuse_string_pass(program: CoreProgram) -> CoreProgram:
+	fuse_string_program(program)
+
+
+private pure func run_fuse_collection_pass(program: CoreProgram) -> CoreProgram:
+	fuse_collection_program(program)
+
+
+private pure func run_fuse_parallel_tensor_pass(program: CoreProgram) -> CoreProgram:
+	fuse_parallel_tensor_program(program)
+
+
+private pure func run_fuse_tensor_update_pass(program: CoreProgram) -> CoreProgram:
+	fuse_tensor_update_program(program)
+
+
+private pure func run_tuple_sroa_pass(program: CoreProgram) -> CoreProgram:
+	rewrite_tuple_sroa_program(program)
+
+
+-- Monomorphization mints declarations, so it is the one pass that advances
+-- `next_def_id`. List layout runs with it so the `mono` snapshot shows the
+-- laid-out program, exactly as the nested stage chain did.
+private pure func run_mono_pass(state: CorePassState) -> Result[CorePassState, CorePassDiagnostic]:
 	match monomorphize_program(state.program, state.next_def_id):
 		Err(diagnostic):
-			CoreEarlyPipelineFailed(CoreEarlyMonoDiagnostic(diagnostic))
+			Err(CoreEarlyMonoDiagnostic(diagnostic))
 		Ok(specialized):
-			mono_state: CoreEarlyPipelineState = {
-				program = CoreEarlyStages.run_list_layout_stage(specialized.program),
-				next_def_id = specialized.next_def_id,
-				observations = state.observations
-			}
-
-			match finish_stage(CoreEarlyMonoStage, mono_state, configuration):
-				CoreEarlyStageContinues(completed):
-					match synthesize_program(completed.program):
-						Err(error):
-							CoreEarlyPipelineFailed(CoreEarlySynthDiagnostic(error))
-						Ok(synthesized):
-							match finish_stage(
-								CoreEarlySynthStage,
-								{ completed | program = synthesized },
-								configuration,
-							):
-								CoreEarlyStageContinues(finished):
-									run_match_stage(finished, configuration)
-								CoreEarlyStageStops(stage, rendered, observations):
-									CoreEarlyPipelineStopped(stage, rendered, observations)
-								CoreEarlyStageFails(violation):
-									CoreEarlyPipelineFailed(CoreEarlyInvariantDiagnostic(violation))
-				CoreEarlyStageStops(stage, rendered, observations):
-					CoreEarlyPipelineStopped(stage, rendered, observations)
-				CoreEarlyStageFails(violation):
-					CoreEarlyPipelineFailed(CoreEarlyInvariantDiagnostic(violation))
+			Ok(
+				core_pass_state(
+					CoreEarlyStages.run_list_layout_stage(specialized.program),
+					specialized.next_def_id,
+				),
+			)
 
 
-private pure func run_match_stage(
-	state: CoreEarlyPipelineState,
-	configuration: CoreEarlyPipelineConfiguration,
-) -> CoreEarlyPipelineExecution:
-	match finish_stage(
-		CoreEarlyMatchStage,
-		{ state | program = compile_program(state.program) },
-		configuration,
-	):
-		CoreEarlyStageContinues(finished):
-			run_trait_resolve_stage(finished, configuration)
-		CoreEarlyStageStops(stage, rendered, observations):
-			CoreEarlyPipelineStopped(stage, rendered, observations)
-		CoreEarlyStageFails(violation):
-			CoreEarlyPipelineFailed(CoreEarlyInvariantDiagnostic(violation))
+private pure func run_synth_pass(state: CorePassState) -> Result[CorePassState, CorePassDiagnostic]:
+	match synthesize_program(state.program):
+		Err(error):
+			Err(CoreEarlySynthDiagnostic(error))
+		Ok(synthesized):
+			Ok({ state | program = synthesized })
 
 
-private pure func run_trait_resolve_stage(
-	state: CoreEarlyPipelineState,
-	configuration: CoreEarlyPipelineConfiguration,
-) -> CoreEarlyPipelineExecution:
+private pure func run_trait_resolve_pass(
+	state: CorePassState,
+) -> Result[CorePassState, CorePassDiagnostic]:
 	match resolve_core_traits(state.program):
 		Err(diagnostic):
-			CoreEarlyPipelineFailed(CoreEarlyTraitResolveDiagnostic(diagnostic))
+			Err(CoreEarlyTraitResolveDiagnostic(diagnostic))
 		Ok(resolved):
-			match finish_stage(
-				CoreEarlyTraitResolveStage,
-				{ state | program = resolved },
-				configuration,
-			):
-				CoreEarlyStageContinues(finished):
-					CoreEarlyPipelineCompleted({
-						program = finished.program,
-						next_def_id = finished.next_def_id,
-						observations = finished.observations,
-					})
-				CoreEarlyStageStops(stage, rendered, observations):
-					CoreEarlyPipelineStopped(stage, rendered, observations)
-				CoreEarlyStageFails(violation):
-					CoreEarlyPipelineFailed(CoreEarlyInvariantDiagnostic(violation))
+			Ok({ state | program = resolved })
 
 
-private pure func run_desugar_stage(
-	state: CoreEarlyPipelineState,
+-- The first half of the list: everything that runs before the compiler knows
+-- which imports resolve to which definitions.
+pure func early_core_lowering_passes(
 	configuration: CoreEarlyPipelineConfiguration,
-) -> CoreEarlyPipelineExecution:
-	desugar: CoreEarlyStageExecution = finish_stage(
-		CoreEarlyDesugarStage,
-		{ state | program = CoreEarlyStages.run_desugar_stage(state.program) },
-		configuration,
-	)
+) -> List[CorePass]:
+	lower_debug_blocks: pure (CoreProgram) -> CoreProgram = func(program):
+		CoreEarlyStages.run_debug_stage(program, configuration.debug)
 
-	match desugar:
-		CoreEarlyStageContinues(next_state):
-			run_mono_stage(next_state, configuration)
-		CoreEarlyStageStops(stage, rendered, observations):
-			CoreEarlyPipelineStopped(stage, rendered, observations)
-		CoreEarlyStageFails(violation):
-			CoreEarlyPipelineFailed(CoreEarlyInvariantDiagnostic(violation))
-
-
-private pure func run_debug_stage(
-	state: CoreEarlyPipelineState,
-	configuration: CoreEarlyPipelineConfiguration,
-) -> CoreEarlyPipelineExecution:
-	debug_execution: CoreEarlyStageExecution = finish_stage(
-		CoreEarlyDebugStage,
-		{ state | program = CoreEarlyStages.run_debug_stage(state.program, configuration.debug) },
-		configuration,
-	)
-
-	match debug_execution:
-		CoreEarlyStageContinues(next_state):
-			run_desugar_stage(next_state, configuration)
-		CoreEarlyStageStops(stage, rendered, observations):
-			CoreEarlyPipelineStopped(stage, rendered, observations)
-		CoreEarlyStageFails(violation):
-			CoreEarlyPipelineFailed(CoreEarlyInvariantDiagnostic(violation))
-
-
-pure func run_early_core_pipeline(
-	input: CoreEarlyPipelineInput,
-	configuration: CoreEarlyPipelineConfiguration,
-) -> CoreEarlyPipelineExecution:
-	lower: CoreEarlyStageExecution = finish_stage(
-		CoreEarlyLowerStage,
-		{
-			program = input.program,
-			next_def_id = input.next_def_id,
-			observations = []
+	[
+		core_program_pass(LOWER_PASS, keep_program),
+		checked_early_pass(DEBUG_PASS, lower_debug_blocks, debug_invariant),
+		checked_early_pass(DESUGAR_PASS, run_desugar_pass, desugar_invariant),
+		{ core_pass(MONO_PASS, run_mono_pass) | checked_invariant = mono_invariant },
+		{ core_pass(SYNTH_PASS, run_synth_pass) | checked_invariant = synth_invariant },
+		checked_early_pass(MATCH_PASS, run_match_pass, match_invariant),
+		{ core_pass(TRAIT_RESOLVE_PASS, run_trait_resolve_pass) |
+			checked_invariant = match_invariant
 		},
-		configuration,
-	)
-
-	match lower:
-		CoreEarlyStageContinues(state):
-			run_debug_stage(state, configuration)
-		CoreEarlyStageStops(stage, rendered, observations):
-			CoreEarlyPipelineStopped(stage, rendered, observations)
-		CoreEarlyStageFails(violation):
-			CoreEarlyPipelineFailed(CoreEarlyInvariantDiagnostic(violation))
+	]
 
 
--- Generic templates are projected out between tensor fusion and tuple SROA.
--- Keeping this continuation explicit prevents the user-visible Fusion snapshot
--- from observing a different declaration set than later Core stages receive.
-pure func finish_early_core_pipeline_after_projection(
-	output: CoreEarlyPipelineOutput,
+-- The second half: import resolution and the fusion set. Only `resolve`,
+-- `std_inline`, and `tailrec` are user-visible stages; the fusion rewrites are
+-- named so they get their own timing and allocation rows.
+pure func early_core_resolution_passes(
+	import_bindings: List[CoreResolveImportBinding],
+	module_imports: List[CoreResolveModuleImports],
+) -> List[CorePass]:
+	resolve_imports: pure (CoreProgram) -> CoreProgram = func(program):
+		resolve_core_program(program, import_bindings, module_imports)
+
+	[
+		required_early_pass(RESOLVE_PASS, resolve_imports, resolve_invariant),
+		required_early_pass(STD_INLINE_PASS, run_std_inline_pass, std_inline_invariant),
+		required_early_pass(TAILREC_PASS, run_tailrec_pass, std_inline_invariant),
+		core_program_pass(FUSE_STRING_PASS, run_fuse_string_pass),
+		core_program_pass(FUSE_COLLECTION_PASS, run_fuse_collection_pass),
+		core_program_pass(FUSE_PARALLEL_TENSOR_PASS, run_fuse_parallel_tensor_pass),
+		core_program_pass(FUSE_TENSOR_UPDATE_PASS, run_fuse_tensor_update_pass),
+	]
+
+
+-- Tuple SROA runs after the caller projects generic templates out, so it is its
+-- own list segment rather than a tail of the one above.
+pure func early_core_projection_passes() -> List[CorePass]:
+	[required_early_pass(TUPLE_SROA_PASS, run_tuple_sroa_pass, std_inline_invariant)]
+
+
+private pure func early_pass_control(
 	configuration: CoreEarlyPipelineConfiguration,
-) -> CoreEarlyPipelineExecution:
-	state: CoreEarlyPipelineState = {
-		program = rewrite_tuple_sroa_program(output.program),
-		next_def_id = output.next_def_id,
-		observations = output.observations
+	record_timings: Bool,
+) -> CorePassControl:
+	{
+		observe = configuration.observations.map(early_core_pass_name),
+		stop_after = configuration.stop_after.map(early_core_pass_name),
+		check_invariants = configuration.check_invariants,
+		record_timings = record_timings
 	}
 
-	match finish_stage(CoreEarlyFusionStage, state, configuration):
-		CoreEarlyStageContinues(completed):
+
+private pure func early_observations(
+	observations: List[CoreEarlyPipelineObservation],
+	pass_observations: List[CorePassObservation],
+) -> List[CoreEarlyPipelineObservation]:
+	var rendered: List[CoreEarlyPipelineObservation] = observations
+
+	for observation in pass_observations:
+		rendered = rendered.append({
+			stage_name = early_core_pass_stage_name(observation.name),
+			rendered = observation.rendered,
+		})
+
+	rendered
+
+
+private func run_early_pass_segment(
+	passes: List[CorePass],
+	state: CorePassState,
+	observations: List[CoreEarlyPipelineObservation],
+	configuration: CoreEarlyPipelineConfiguration,
+	record_timings: Bool,
+) -> CoreEarlyPipelineExecution:
+	match run_core_passes(
+		passes,
+		state,
+		early_pass_control(configuration, record_timings),
+	):
+		CorePassesCompleted(completed, pass_observations, pass_timings):
 			CoreEarlyPipelineCompleted({
 				program = completed.program,
 				next_def_id = completed.next_def_id,
-				observations = completed.observations,
+				observations = early_observations(observations, pass_observations),
+				pass_timings = pass_timings,
 			})
-		CoreEarlyStageStops(stage, rendered, observations):
-			CoreEarlyPipelineStopped(stage, rendered, observations)
-		CoreEarlyStageFails(violation):
-			CoreEarlyPipelineFailed(CoreEarlyInvariantDiagnostic(violation))
+		CorePassesStopped(pass_name, rendered, pass_observations, pass_timings):
+			CoreEarlyPipelineStopped(
+				early_core_pass_stage_name(pass_name),
+				rendered,
+				early_observations(observations, pass_observations),
+				pass_timings,
+			)
+		CorePassesFailed(_, diagnostic, _):
+			CoreEarlyPipelineFailed(diagnostic)
 
 
-pure func run_early_core_pipeline_to_runtime_projection(
+func run_early_core_pipeline(
+	input: CoreEarlyPipelineInput,
+	configuration: CoreEarlyPipelineConfiguration,
+	record_timings: Bool,
+) -> CoreEarlyPipelineExecution:
+	run_early_pass_segment(
+		early_core_lowering_passes(configuration),
+		core_pass_state(input.program, input.next_def_id),
+		[],
+		configuration,
+		record_timings,
+	)
+
+
+func run_early_core_pipeline_to_runtime_projection(
 	input: CoreEarlyPipelineInput,
 	configuration: CoreEarlyPipelineConfiguration,
 	import_bindings: List[CoreResolveImportBinding],
 	module_imports: List[CoreResolveModuleImports],
+	record_timings: Bool,
 ) -> CoreEarlyPipelineExecution:
-	match run_early_core_pipeline(input, configuration):
-		CoreEarlyPipelineCompleted(output):
-			state: CoreEarlyPipelineState = {
-				program = resolve_core_program(output.program, import_bindings, module_imports),
-				next_def_id = output.next_def_id,
-				observations = output.observations
-			}
+	passes: List[CorePass] = early_core_lowering_passes(
+		configuration,
+	).concat(early_core_resolution_passes(import_bindings, module_imports))
 
-			match finish_stage(CoreEarlyResolveStage, state, configuration):
-				CoreEarlyStageContinues(finished):
-					match finish_stage(
-						CoreEarlyStdInlineStage,
-						{ finished | program = inline_std_wrappers(finished.program) },
-						configuration,
-					):
-						CoreEarlyStageContinues(inlined):
-							match finish_stage(
-								CoreEarlyTailrecStage,
-								{ inlined | program = lower_tailrec_program(inlined.program) },
-								configuration,
-							):
-								CoreEarlyStageContinues(completed):
-									CoreEarlyPipelineCompleted({
-										program = completed.program
-											.fuse_string_program()
-											.fuse_collection_program()
-											.fuse_parallel_tensor_program()
-											.fuse_tensor_update_program(),
-										next_def_id = completed.next_def_id,
-										observations = completed.observations,
-									})
-								CoreEarlyStageStops(stage, rendered, observations):
-									CoreEarlyPipelineStopped(stage, rendered, observations)
-								CoreEarlyStageFails(violation):
-									CoreEarlyPipelineFailed(CoreEarlyInvariantDiagnostic(violation))
-						CoreEarlyStageStops(stage, rendered, observations):
-							CoreEarlyPipelineStopped(stage, rendered, observations)
-						CoreEarlyStageFails(violation):
-							CoreEarlyPipelineFailed(CoreEarlyInvariantDiagnostic(violation))
-				CoreEarlyStageStops(stage, rendered, observations):
-					CoreEarlyPipelineStopped(stage, rendered, observations)
-				CoreEarlyStageFails(violation):
-					CoreEarlyPipelineFailed(CoreEarlyInvariantDiagnostic(violation))
-		CoreEarlyPipelineStopped(stage, rendered, observations):
-			CoreEarlyPipelineStopped(stage, rendered, observations)
-		CoreEarlyPipelineFailed(diagnostic):
-			CoreEarlyPipelineFailed(diagnostic)
+	run_early_pass_segment(
+		passes,
+		core_pass_state(input.program, input.next_def_id),
+		[],
+		configuration,
+		record_timings,
+	)
+
+
+func finish_early_core_pipeline_after_projection(
+	output: CoreEarlyPipelineOutput,
+	configuration: CoreEarlyPipelineConfiguration,
+	record_timings: Bool,
+) -> CoreEarlyPipelineExecution:
+	run_early_pass_segment(
+		early_core_projection_passes(),
+		core_pass_state(output.program, output.next_def_id),
+		output.observations,
+		configuration,
+		record_timings,
+	)

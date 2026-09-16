@@ -79,7 +79,6 @@ import:
 		prepare_core_graph_with_ctfe_replacements,
 	stage_09_core/early_pipeline:
 		CoreEarlyPipelineConfiguration,
-		CoreEarlyPipelineDiagnostic,
 		CoreEarlyPipelineExecution(
 			CoreEarlyPipelineCompleted,
 			CoreEarlyPipelineFailed,
@@ -89,9 +88,6 @@ import:
 		CoreEarlyPipelineObservation,
 		CoreEarlyPipelineOutput,
 		CoreEarlyPipelineStage,
-		core_early_pipeline_diagnostic_hint,
-		core_early_pipeline_diagnostic_message,
-		core_early_pipeline_stage_name,
 		finish_early_core_pipeline_after_projection,
 		run_early_core_pipeline_to_runtime_projection,
 	stage_09_core/ir:
@@ -101,9 +97,11 @@ import:
 		core_program_to_json,
 	stage_09_core/pass_runner:
 		CorePassControl,
+		CorePassDiagnostic,
 		CorePassObservation,
 		CorePassRun(CorePassesCompleted, CorePassesFailed, CorePassesStopped),
 		CorePassTiming,
+		core_pass_diagnostic_hint,
 		core_pass_diagnostic_message,
 		core_pass_state,
 		run_core_passes,
@@ -449,14 +447,14 @@ union LateCoreExecution:
 
 
 union EarlyCorePhaseExecution:
-	EarlyCorePhaseReady(EarlyCoreCompilation)
-	EarlyCorePhaseStopped(String, String, String, List[CoreObservation])
+	EarlyCorePhaseReady(EarlyCoreCompilation, List[CorePassTiming])
+	EarlyCorePhaseStopped(String, String, String, List[CoreObservation], List[CorePassTiming])
 	EarlyCorePhaseFailed(List[String])
 
 
 union RuntimeProjectionPhaseExecution:
-	RuntimeProjectionPhaseReady(RuntimeProjectedCompilation)
-	RuntimeProjectionPhaseStopped(String, String, String, List[CoreObservation])
+	RuntimeProjectionPhaseReady(RuntimeProjectedCompilation, List[CorePassTiming])
+	RuntimeProjectionPhaseStopped(String, String, String, List[CoreObservation], List[CorePassTiming])
 	RuntimeProjectionPhaseFailed(List[String])
 
 
@@ -862,32 +860,32 @@ func compile_frontend_graph_with_typed_validation(
 	request ?= prepare_core_lowering_request(typed)
 	lowered ?= lower_prepared_core_request(request)
 
-	match run_early_core_compilation(lowered):
+	match run_early_core_compilation(lowered, False):
 		EarlyCorePhaseFailed(errors):
 			Err(errors)
-		EarlyCorePhaseStopped(target_path, stage_name, rendered, observations):
+		EarlyCorePhaseStopped(target_path, stage_name, rendered, observations, _):
 			Ok(CompiledTypedGraphStopped(target_path, stage_name, rendered, observations))
-		EarlyCorePhaseReady(early):
-			match project_runtime_compilation(early):
+		EarlyCorePhaseReady(early, _):
+			match project_runtime_compilation(early, False):
 				RuntimeProjectionPhaseFailed(errors):
 					Err(errors)
-				RuntimeProjectionPhaseStopped(target_path, stage_name, rendered, observations):
+				RuntimeProjectionPhaseStopped(target_path, stage_name, rendered, observations, _):
 					Ok(CompiledTypedGraphStopped(target_path, stage_name, rendered, observations))
-				RuntimeProjectionPhaseReady(projected):
+				RuntimeProjectionPhaseReady(projected, _):
 					Ok(compiled_typed_graph_ready(projected))
 
 
 private pure func early_observation(observation: CoreEarlyPipelineObservation) -> CoreObservation:
 	{
-		stage_name = core_early_pipeline_stage_name(observation.stage),
+		stage_name = observation.stage_name,
 		rendered = observation.rendered
 	}
 
 
-private pure func early_pipeline_error(diagnostic: CoreEarlyPipelineDiagnostic) -> String:
-	message: String = core_early_pipeline_diagnostic_message(diagnostic)
+private pure func early_pipeline_error(diagnostic: CorePassDiagnostic) -> String:
+	message: String = core_pass_diagnostic_message(diagnostic)
 
-	match core_early_pipeline_diagnostic_hint(diagnostic):
+	match core_pass_diagnostic_hint(diagnostic):
 		Some(hint):
 			"${message}\nhelp: ${hint}"
 		None:
@@ -1004,7 +1002,10 @@ pure func lower_prepared_core_request(
 			}))
 
 
-pure func run_early_core_compilation(lowered: LoweredCoreCompilation) -> EarlyCorePhaseExecution:
+func run_early_core_compilation(
+	lowered: LoweredCoreCompilation,
+	record_timings: Bool,
+) -> EarlyCorePhaseExecution:
 	representation: LoweredCoreCompilationRep = from_opaque LoweredCoreCompilation(lowered)
 
 	match run_early_core_pipeline_to_runtime_projection(
@@ -1012,18 +1013,21 @@ pure func run_early_core_compilation(lowered: LoweredCoreCompilation) -> EarlyCo
 		representation.early_configuration,
 		representation.target_import_bindings,
 		representation.module_imports,
+		record_timings,
 	):
 		CoreEarlyPipelineFailed(diagnostic):
 			EarlyCorePhaseFailed([early_pipeline_error(diagnostic)])
-		CoreEarlyPipelineStopped(stage, rendered, completed_observations):
+		CoreEarlyPipelineStopped(stage_name, rendered, completed_observations, pass_timings):
 			EarlyCorePhaseStopped(
 				representation.target_path,
-				core_early_pipeline_stage_name(stage),
+				stage_name,
 				rendered,
 				completed_observations.map(early_observation),
+				pass_timings,
 			)
 		CoreEarlyPipelineCompleted(output):
-			EarlyCorePhaseReady(into_opaque EarlyCoreCompilation({
+			EarlyCorePhaseReady(
+				into_opaque EarlyCoreCompilation({
 						target_path = representation.target_path,
 						target_module_name = representation.target_module_name,
 						include_dirs = representation.include_dirs,
@@ -1032,11 +1036,14 @@ pure func run_early_core_compilation(lowered: LoweredCoreCompilation) -> EarlyCo
 						check_invariants = representation.check_invariants,
 						early_configuration = representation.early_configuration,
 						output = output
-					}))
+					}),
+				output.pass_timings,
+			)
 
 
-pure func project_runtime_compilation(
+func project_runtime_compilation(
 	early: EarlyCoreCompilation,
+	record_timings: Bool,
 ) -> RuntimeProjectionPhaseExecution:
 	representation: EarlyCoreCompilationRep = from_opaque EarlyCoreCompilation(early)
 
@@ -1047,15 +1054,17 @@ pure func project_runtime_compilation(
 			match finish_early_core_pipeline_after_projection(
 				{ representation.output | program = projected_program },
 				representation.early_configuration,
+				record_timings,
 			):
 				CoreEarlyPipelineFailed(diagnostic):
 					RuntimeProjectionPhaseFailed([early_pipeline_error(diagnostic)])
-				CoreEarlyPipelineStopped(stage, rendered, completed_observations):
+				CoreEarlyPipelineStopped(stage_name, rendered, completed_observations, pass_timings):
 					RuntimeProjectionPhaseStopped(
 						representation.target_path,
-						core_early_pipeline_stage_name(stage),
+						stage_name,
 						rendered,
 						completed_observations.map(early_observation),
+						pass_timings,
 					)
 				CoreEarlyPipelineCompleted(completed):
 					if (
@@ -1066,7 +1075,8 @@ pure func project_runtime_compilation(
 							[missing_main_error(representation.target_path)],
 						)
 					else:
-						RuntimeProjectionPhaseReady(into_opaque RuntimeProjectedCompilation({
+						RuntimeProjectionPhaseReady(
+							into_opaque RuntimeProjectedCompilation({
 									target_path = representation.target_path,
 									target_module_name = representation.target_module_name,
 									include_dirs = representation.include_dirs,
@@ -1074,7 +1084,9 @@ pure func project_runtime_compilation(
 									check_invariants = representation.check_invariants,
 									program = completed.program,
 									observations = completed.observations.map(early_observation)
-								}))
+								}),
+							completed.pass_timings,
+						)
 
 
 pure func runtime_projected_core_compilation(
@@ -1124,7 +1136,7 @@ pure func compiled_typed_graph_ready(projected: RuntimeProjectedCompilation) -> 
 	)
 
 
-pure func compile_typechecked_graph(
+func compile_typechecked_graph(
 	typechecked: TypecheckedGraph,
 	policy: CoreCompilePolicy,
 	typed_summary: Option[String],
@@ -1145,18 +1157,18 @@ pure func compile_typechecked_graph(
 	request ?= prepare_core_lowering_request(typed)
 	lowered ?= lower_prepared_core_request(request)
 
-	match run_early_core_compilation(lowered):
+	match run_early_core_compilation(lowered, False):
 		EarlyCorePhaseFailed(errors):
 			Err(errors)
-		EarlyCorePhaseStopped(target_path, stage_name, rendered, observations):
+		EarlyCorePhaseStopped(target_path, stage_name, rendered, observations, _):
 			Ok(CompiledTypedGraphStopped(target_path, stage_name, rendered, observations))
-		EarlyCorePhaseReady(early):
-			match project_runtime_compilation(early):
+		EarlyCorePhaseReady(early, _):
+			match project_runtime_compilation(early, False):
 				RuntimeProjectionPhaseFailed(errors):
 					Err(errors)
-				RuntimeProjectionPhaseStopped(target_path, stage_name, rendered, observations):
+				RuntimeProjectionPhaseStopped(target_path, stage_name, rendered, observations, _):
 					Ok(CompiledTypedGraphStopped(target_path, stage_name, rendered, observations))
-				RuntimeProjectionPhaseReady(projected):
+				RuntimeProjectionPhaseReady(projected, _):
 					Ok(compiled_typed_graph_ready(projected))
 
 

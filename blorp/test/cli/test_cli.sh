@@ -1388,6 +1388,14 @@ if grep -qF $'phase_total\t' <<<"$RUN_OUTPUT" && grep -qF $'outer_total\t' <<<"$
 else
 	record_fail "compile time phases reports phase and outer totals" "$RUN_OUTPUT"
 fi
+expect_output_contains "compile time phases reports one row per early Core pass" 0 \
+	$'  mono\t' \
+	"$BLORP_BIN" compile --no-format --no-embed-runtime --time-phases \
+		-o "$timed_phase_c" "$valid_prog"
+expect_output_contains "compile time phases reports the tuple SROA pass row" 0 \
+	$'  tuple_sroa\t' \
+	"$BLORP_BIN" compile --no-format --no-embed-runtime --time-phases \
+		-o "$timed_phase_c" "$valid_prog"
 expect_output_contains "compile time phases reports one row per late Core pass" 0 \
 	$'  perceus\t' \
 	"$BLORP_BIN" compile --no-format --no-embed-runtime --time-phases \
@@ -1425,6 +1433,10 @@ expect_memory_checkpoint_labels "compiler memory checkpoints use phase labels" \
 	"source_discovery_start,source_discovery_complete,typed_frontend_start,typed_frontend_complete,core_lowering_input_ready,core_lowering_complete,early_core_complete,runtime_projection_complete,late_core_complete,backend_emission_complete,artifact_construction_complete" \
 	env BLORP_COMPILER_MEMORY_PROFILE=1 "$BLORP_BIN" compile --no-format \
 		--no-embed-runtime --time-phases -o "$timed_memory_c" "$valid_prog"
+expect_output_contains "compiler memory checkpoints name every early Core pass" 0 \
+	"phase=pass_mono_complete" \
+	env BLORP_COMPILER_MEMORY_PROFILE=1 "$BLORP_BIN" compile --no-format \
+		--no-embed-runtime -o "$timed_memory_c" "$valid_prog"
 expect_output_contains "compiler memory checkpoints name every late Core pass" 0 \
 	"phase=pass_perceus_complete" \
 	env BLORP_COMPILER_MEMORY_PROFILE=1 "$BLORP_BIN" compile --no-format \
