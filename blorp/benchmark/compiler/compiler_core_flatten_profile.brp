@@ -5,14 +5,18 @@
 -- Usage:
 --   benchmarks/compiler_core_flatten_profile prefix 10 128 4
 --   benchmarks/compiler_core_flatten_profile aliases 10 128 4
+--   benchmarks/compiler_core_flatten_profile prefix 10 128 4 fwd-first 8
+--   benchmarks/compiler_core_flatten_profile prefix 10 128 4 impl-first 8
 import:
 	compiler_core_flatten_profile_fixture:
 		CoreFlattenProfileConfig,
+		CoreFlattenProfileDeclarationOrder(ForwardDeclarationFirstOrder, ImplementationFirstOrder),
 		CoreFlattenProfileStage(ProfileAliasRewrite, ProfileModulePrefix),
 		core_flatten_profile_execute,
 		core_flatten_profile_fixture,
 		core_flatten_profile_observe,
 	instrumentation: begin_function_profile_window, end_function_profile_window
+	memory: get_mem_stats, mem_delta, reset_mem_stats
 	string: parse_int
 	system: now_microseconds
 
@@ -23,6 +27,21 @@ private pure func positive_argument(args: List[String], index: Int, default: Int
 			match parse_int(text):
 				Some(value):
 					if value > 0:
+						value
+					else:
+						default
+				None:
+					default
+		None:
+			default
+
+
+private pure func non_negative_argument(args: List[String], index: Int, default: Int) -> Int:
+	match args.get(index):
+		Some(text):
+			match parse_int(text):
+				Some(value):
+					if value >= 0:
 						value
 					else:
 						default
@@ -50,6 +69,35 @@ private pure func profile_stage_name(stage: CoreFlattenProfileStage) -> String:
 			"aliases"
 
 
+private pure func declaration_order(text: String) -> Option[CoreFlattenProfileDeclarationOrder]:
+	match text:
+		"impl-first":
+			Some(ImplementationFirstOrder)
+		"fwd-first":
+			Some(ForwardDeclarationFirstOrder)
+		_:
+			None
+
+
+private pure func declaration_order_name(order: CoreFlattenProfileDeclarationOrder) -> String:
+	match order:
+		ImplementationFirstOrder:
+			"impl-first"
+		ForwardDeclarationFirstOrder:
+			"fwd-first"
+
+
+private pure func positional_declaration_order(
+	args: List[String],
+	index: Int,
+) -> CoreFlattenProfileDeclarationOrder:
+	match args.get(index):
+		Some(text):
+			declaration_order(text).get_or(ImplementationFirstOrder)
+		None:
+			ImplementationFirstOrder
+
+
 private func run_profile(stage: CoreFlattenProfileStage, config: CoreFlattenProfileConfig) -> Int:
 	setup_started: Int = now_microseconds()
 	fixture = core_flatten_profile_fixture(config)
@@ -66,20 +114,27 @@ private func run_profile(stage: CoreFlattenProfileStage, config: CoreFlattenProf
 		1
 	else:
 		begin_function_profile_window()
+		mem_before = get_mem_stats()
 		started: Int = now_microseconds()
 		execution = core_flatten_profile_execute(fixture, stage, config.iterations)
 		window_microseconds: Int = now_microseconds() - started
+		mem_after = get_mem_stats()
 		end_function_profile_window()
+		mem_used = mem_delta(mem_before, mem_after)
 		observation = core_flatten_profile_observe(fixture, stage, execution)
 		workload_valid: Bool = (
 			observation.workload_valid
 			and observation.checksum == warmup_observation.checksum
 		)
 
+		source_declarations: Int = config.callable_count * (1 + config.forward_declarations_per_callable)
+
 		print(
 			"CORE_FLATTEN_PROFILE" + " stage=" + profile_stage_name(
 				stage,
-			) + " iterations=" + config.iterations.to_string() + " source_declarations=" + (config.callable_count * 2).to_string() + " callables=" + config.callable_count.to_string() + " calls_per_callable=" + config.calls_per_callable.to_string() + " aliases=" + observation.alias_count.to_string() + " output_callables=" + observation.output_callables.to_string() + " rewritten_calls=" + observation.rewritten_calls.to_string() + " callable_plan_function_visits=" + observation.callable_plan_function_visits.to_string() + " checksum=" + observation.checksum.to_string() + " setup_microseconds=" + setup_microseconds.to_string() + " window_microseconds=" + window_microseconds.to_string() + " workload_valid=" + workload_valid.to_string(),
+			) + " iterations=" + config.iterations.to_string() + " declaration_order=" + declaration_order_name(
+				config.declaration_order,
+			) + " forward_declarations_per_callable=" + config.forward_declarations_per_callable.to_string() + " source_declarations=" + source_declarations.to_string() + " callables=" + config.callable_count.to_string() + " calls_per_callable=" + config.calls_per_callable.to_string() + " aliases=" + observation.alias_count.to_string() + " output_callables=" + observation.output_callables.to_string() + " rewritten_calls=" + observation.rewritten_calls.to_string() + " callable_plan_function_visits=" + observation.callable_plan_function_visits.to_string() + " checksum=" + observation.checksum.to_string() + " setup_microseconds=" + setup_microseconds.to_string() + " window_microseconds=" + window_microseconds.to_string() + " new_allocations=" + mem_used.total_allocations.to_string() + " new_releases=" + mem_used.total_releases.to_string() + " workload_valid=" + workload_valid.to_string(),
 		)
 
 		if workload_valid:
@@ -91,7 +146,7 @@ private func run_profile(stage: CoreFlattenProfileStage, config: CoreFlattenProf
 private func print_usage() -> Int:
 	print((
 			"usage: compiler_core_flatten_profile prefix|aliases [iterations] [callables] "
-			+ "[calls_per_callable]"
+			+ "[calls_per_callable] [impl-first|fwd-first] [forward_declarations_per_callable]"
 		))
 	2
 
@@ -110,6 +165,8 @@ func main(args: List[String]) -> Int:
 						{
 							iterations = positive_argument(args, 2, 10),
 							callable_count = positive_argument(args, 3, 128),
-							calls_per_callable = positive_argument(args, 4, 4)
+							calls_per_callable = positive_argument(args, 4, 4),
+							declaration_order = positional_declaration_order(args, 5),
+							forward_declarations_per_callable = non_negative_argument(args, 6, 1)
 						},
 					)

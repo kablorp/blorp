@@ -550,32 +550,50 @@ refuses a speed claim if the structural checksums diverge.
 ### Core module flattening profile
 
 `compiler_core_flatten_profile` isolates the callable-heavy module-flattening
-work performed immediately after typed AST to Core lowering. The synthetic
-fixture pairs one implementation with one forward declaration for each logical
-callable, so every logical callable produces a real alias and every call must
-be rewritten to the retained implementation.
+work performed immediately after typed AST to Core lowering. By default the
+synthetic fixture pairs one implementation with one forward declaration for
+each logical callable, so every logical callable produces a real alias and
+every call must be rewritten to the retained implementation.
 
 ```bash
 benchmarks/compiler_core_flatten_profile prefix 10 128 4
 benchmarks/compiler_core_flatten_profile aliases 10 128 4
+benchmarks/compiler_core_flatten_profile prefix 10 128 4 fwd-first 8
+benchmarks/compiler_core_flatten_profile prefix 10 128 4 impl-first 8
 ```
 
-The positional controls are stage, iterations, logical callable count, and
-calls per implementation. `prefix` measures
-`prefix_module_names_with_aliases`, including rewrite-plan construction,
-declaration and expression renaming, type rewriting, and deduplication.
-`aliases` measures `rewrite_program_callable_aliases` against a prebuilt target
-program. Fixture construction, warmup, output traversal, and checksum
-validation remain outside the profile window.
+The positional controls are stage, iterations, logical callable count, calls
+per implementation, declaration order (`impl-first` or `fwd-first`, default
+`impl-first`), and forward declarations per logical callable (default `1`).
+`prefix` measures `prefix_module_names_with_aliases`, including rewrite-plan
+construction, declaration and expression renaming, type rewriting, and
+deduplication. `aliases` measures `rewrite_program_callable_aliases` against a
+prebuilt target program. Fixture construction, warmup, output traversal, and
+checksum validation remain outside the profile window.
+
+Declaration order and forward-declaration count isolate
+`flatten.deduplicate_functions` cost shapes. `impl-first` places each
+implementation before its duplicate forward declarations, so every duplicate
+is already admitted and a pre-index algorithm's full-declaration rescan never
+runs. `fwd-first` places every duplicate before its implementation, forcing a
+pre-index algorithm to rescan all declarations once per duplicate before it
+ever reaches the implementation -- the quadratic worst case. Raising forward
+declarations per callable widens the duplicate ratio under either order.
 
 Stdout contains one `CORE_FLATTEN_PROFILE` row with structural counters,
-elapsed profile-window time, and `workload_valid=True` only when all declarations
-and calls have the expected rewritten identities. Raw function and `FLAME:`
-rows are written to stderr. Function times are inclusive, so compare identical
-rows and call counts across sizes or revisions; do not add row percentages.
-The first invocation compiles and caches an instrumented benchmark binary.
-Set `BLORP_COMPILER_BENCHMARK_SKIP_BUILD=1` when the workspace compiler is
-already current.
+elapsed profile-window time, managed allocation/release deltas
+(`new_allocations`/`new_releases`, from `memory.get_mem_stats()` snapshots
+taken immediately inside the profile window), and `workload_valid=True` only
+when all declarations and calls have the expected rewritten identities. Raw
+function and `FLAME:` rows are written to stderr; grep them for
+`function_decl_has_implementation_named` or the current pre-index build
+function to see full-declaration-rescan call counts directly. Function times
+are inclusive, so compare identical rows and call counts across sizes or
+revisions; do not add row percentages. The first invocation compiles and
+caches an instrumented benchmark binary. Set
+`BLORP_COMPILER_BENCHMARK_SKIP_BUILD=1` when the workspace compiler is already
+current. The accepted issue 122 measurements are retained in
+`results/compiler_core_lowering_function_deduplication_2026-09-16.md`.
 
 ### Scope construction profile
 
