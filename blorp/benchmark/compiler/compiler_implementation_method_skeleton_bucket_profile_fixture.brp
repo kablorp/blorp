@@ -1,0 +1,273 @@
+-- Deterministic implementation-method skeleton scanning workload.
+--
+-- Unlike compiler_implementation_method_parameter_profile_fixture (which
+-- widens a single method's own type-parameter admission), this fixture
+-- widens the number of implementations, the unrelated callable population,
+-- and default-method skeletons that `implementation_methods` must select
+-- among. It isolates the callable-skeleton scan/bucket mechanism in
+-- `implementation_header_graph_build`, not per-method admission.
+import:
+	../../src/compiler/stage_04_modules/loaded_module:
+		ModuleLoadCandidate,
+		ModuleOrigin(UserModule),
+		module_load_candidate,
+		resolved_module_identity_from_resolver,
+	../../src/compiler/stage_06_typecheck/graph/indexed_graph:
+		PreparedModuleScope,
+		indexed_graph_build,
+		prepared_module_program,
+		prepared_module_scope_module,
+	../../src/compiler/stage_06_typecheck/headers/callable_headers:
+		CallableHeaderGraph,
+		callable_header_graph_build,
+	../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
+		declaration_skeleton_graph_build,
+	../../src/compiler/stage_06_typecheck/headers/implementation_headers:
+		ImplementationHeaderGraph,
+		ImplementationHeaderGraphError,
+		explicit_implementation_method_signature,
+		implementation_header_graph_build,
+		implementation_header_graph_headers,
+		implementation_header_methods,
+		implementation_method_header_name,
+	../../src/compiler/stage_06_typecheck/headers/trait_headers: trait_topology_graph_build
+	../../src/compiler/stage_06_typecheck/headers/type_header_dependencies:
+		type_alias_dependency_graph_validate,
+	../../src/compiler/stage_06_typecheck/headers/type_header_graph: type_header_graph_build
+	../../src/compiler/stage_06_typecheck/headers/type_parameter_headers:
+		resolved_type_parameter_graph_build,
+	../../src/compiler/stage_06_typecheck/modules/bound_module_graph:
+		BoundModuleViewBinding(BoundModuleViewReady),
+		COMPILER_BOUND_MODULE_VISIBILITY_EMPTY,
+		bound_module_graph_build,
+	../../src/compiler/stage_06_typecheck/modules/module_view: COMPILER_MODULE_VIEW_EMPTY
+	hash: crc32, hash_combine
+	parsed_program_fixture as ParsedProgramFixture
+
+
+struct CompilerImplementationMethodSkeletonBucketProfileConfig {
+	implementation_count: Int,
+	methods_per_implementation: Int,
+	default_methods_per_implementation: Int,
+	unrelated_callable_count: Int
+}
+
+
+record CompilerImplementationMethodSkeletonBucketProfileFixture {
+	callable_headers: CallableHeaderGraph,
+	implementation_count: Int,
+	methods_per_implementation: Int,
+	default_methods_per_implementation: Int,
+	unrelated_callable_count: Int,
+	expected_methods_per_header: Int,
+	expected_explicit_methods: Int,
+	expected_default_methods: Int
+}
+
+
+struct CompilerImplementationMethodSkeletonBucketProfileObservation {
+	header_count: Int,
+	method_count: Int,
+	explicit_method_count: Int,
+	default_method_count: Int,
+	ordered_header_checksum: Int,
+	graph_ready: Bool,
+	workload_valid: Bool
+}
+
+
+private pure func owner_name(index: Int) -> String:
+	"BucketOwner" + index.to_string()
+
+
+private pure func trait_source(config: CompilerImplementationMethodSkeletonBucketProfileConfig) -> String:
+	var lines: List[String] = [
+		"trait BucketTrait:",
+		"\tpure func required(value: Self) -> Int",
+	]
+
+	for default_index in 0..config.default_methods_per_implementation:
+		lines = lines.append(
+			"\tpure func default" + default_index.to_string() + "(value: Self) -> Int: 0",
+		)
+
+	lines.join("\n")
+
+
+private pure func unrelated_source(config: CompilerImplementationMethodSkeletonBucketProfileConfig) -> String:
+	var blocks: List[String] = []
+
+	for index in 0..config.unrelated_callable_count:
+		blocks = blocks.append(
+			"func unrelated" + index.to_string() + "() -> Int:\n\t" + index.to_string(),
+		)
+
+	blocks.join("\n\n")
+
+
+private pure func implementation_source(
+	config: CompilerImplementationMethodSkeletonBucketProfileConfig,
+	index: Int,
+) -> String:
+	name = owner_name(index)
+	var lines: List[String] = [
+		"record " + name + " {value: Int}",
+		"",
+		"implements BucketTrait for " + name + ":",
+		"\tpure func required(value: " + name + ") -> Int:",
+		"\t\t0",
+	]
+
+	for method_index in 0..config.methods_per_implementation:
+		lines = lines.concat([
+			"\tpure func extra" + index.to_string() + "_" + method_index.to_string() + "(value: " + name + ") -> Int:",
+			"\t\t0",
+		])
+
+	lines.join("\n")
+
+
+private pure func profile_source(config: CompilerImplementationMethodSkeletonBucketProfileConfig) -> String:
+	var sections: List[String] = [trait_source(config)]
+
+	if config.unrelated_callable_count > 0:
+		sections = sections.append(unrelated_source(config))
+
+	for index in 0..config.implementation_count:
+		sections = sections.append(implementation_source(config, index))
+
+	sections.join("\n\n") + "\n"
+
+
+private pure func profile_candidate(
+	config: CompilerImplementationMethodSkeletonBucketProfileConfig,
+) -> ModuleLoadCandidate:
+	module_name = "bench/implementation_method_skeleton_bucket_profile"
+	module_load_candidate(
+		resolved_module_identity_from_resolver(module_name, UserModule),
+		ParsedProgramFixture.finalized_typecheck_program_fixture(
+			"/bench/implementation_method_skeleton_bucket_profile.brp",
+			module_name,
+			profile_source(config),
+		),
+	)
+
+
+private pure func accept_empty_view(scope: PreparedModuleScope) -> BoundModuleViewBinding:
+	BoundModuleViewReady(
+		COMPILER_MODULE_VIEW_EMPTY,
+		prepared_module_program(prepared_module_scope_module(scope)),
+		COMPILER_BOUND_MODULE_VISIBILITY_EMPTY,
+		[],
+	)
+
+
+pure func compiler_implementation_method_skeleton_bucket_profile_fixture(
+	config: CompilerImplementationMethodSkeletonBucketProfileConfig,
+) -> Option[CompilerImplementationMethodSkeletonBucketProfileFixture]:
+	if (
+		config.implementation_count <= 0
+		or config.methods_per_implementation < 0
+		or config.default_methods_per_implementation < 0
+		or config.unrelated_callable_count < 0
+	):
+		None
+	else:
+		candidate = profile_candidate(config)
+		indexed ?= indexed_graph_build(candidate, []).to_option()
+		bound ?= bound_module_graph_build(indexed, [], accept_empty_view).to_option()
+		skeletons ?= declaration_skeleton_graph_build(bound).to_option()
+		aliases ?= type_alias_dependency_graph_validate(skeletons).to_option()
+		parameters ?= resolved_type_parameter_graph_build(aliases).to_option()
+		types ?= type_header_graph_build(parameters).to_option()
+		traits ?= trait_topology_graph_build(types).to_option()
+		callable_headers ?= callable_header_graph_build(traits).to_option()
+
+		Some({
+			callable_headers = callable_headers,
+			implementation_count = config.implementation_count,
+			methods_per_implementation = config.methods_per_implementation,
+			default_methods_per_implementation = config.default_methods_per_implementation,
+			unrelated_callable_count = config.unrelated_callable_count,
+			expected_methods_per_header = (
+				1 + config.methods_per_implementation + config.default_methods_per_implementation
+			),
+			expected_explicit_methods = config.implementation_count * (1 + config.methods_per_implementation),
+			expected_default_methods = config.implementation_count * config.default_methods_per_implementation,
+		})
+
+
+pure func compiler_implementation_method_skeleton_bucket_profile_execute(
+	fixture: CompilerImplementationMethodSkeletonBucketProfileFixture,
+	iterations: Int,
+) -> Result[ImplementationHeaderGraph, List[ImplementationHeaderGraphError]]:
+	var result = implementation_header_graph_build(fixture.callable_headers)
+	var iteration: Int = 1
+
+	while iteration < iterations:
+		result = implementation_header_graph_build(fixture.callable_headers)
+		iteration += 1
+
+	result
+
+
+private pure func invalid_observation() -> CompilerImplementationMethodSkeletonBucketProfileObservation:
+	{
+		header_count = 0,
+		method_count = 0,
+		explicit_method_count = 0,
+		default_method_count = 0,
+		ordered_header_checksum = 0,
+		graph_ready = False,
+		workload_valid = False
+	}
+
+
+pure func compiler_implementation_method_skeleton_bucket_profile_observe(
+	fixture: CompilerImplementationMethodSkeletonBucketProfileFixture,
+	result: Result[ImplementationHeaderGraph, List[ImplementationHeaderGraphError]],
+) -> CompilerImplementationMethodSkeletonBucketProfileObservation:
+	match result:
+		Err(_):
+			invalid_observation()
+		Ok(graph):
+			headers = implementation_header_graph_headers(graph)
+			var method_count: Int = 0
+			var explicit_method_count: Int = 0
+			var default_method_count: Int = 0
+			var checksum: Int = 17
+			var headers_valid: Bool = True
+
+			for header in headers:
+				methods = implementation_header_methods(header)
+				method_count += methods.length()
+
+				if methods.length() != fixture.expected_methods_per_header:
+					headers_valid = False
+
+				for method in methods:
+					name = implementation_method_header_name(method)
+					checksum = hash_combine(checksum, crc32(name))
+
+					match explicit_implementation_method_signature(method):
+						Some(_):
+							explicit_method_count += 1
+							checksum = hash_combine(checksum, 1)
+						None:
+							default_method_count += 1
+							checksum = hash_combine(checksum, 2)
+
+			{
+				header_count = headers.length(),
+				method_count = method_count,
+				explicit_method_count = explicit_method_count,
+				default_method_count = default_method_count,
+				ordered_header_checksum = checksum,
+				graph_ready = True,
+				workload_valid = (
+					headers_valid
+					and headers.length() == fixture.implementation_count
+					and explicit_method_count == fixture.expected_explicit_methods
+					and default_method_count == fixture.expected_default_methods
+				)
+			}
