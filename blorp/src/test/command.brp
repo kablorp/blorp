@@ -190,10 +190,76 @@ private TEST_WARMUP_OPTIONS: CliRunArgs = {
 }
 
 
-private func test_session_counters_requested() -> Bool:
+--- `BLORP_TEST_TIMINGS=1` enables both the aggregate session counter line and
+--- the per-artifact `BLORP_TEST_TIMING` phase lines below; `scripts/test
+--- --timings` sets it, and keeps it unset for the `cli` gate so its output
+--- assertions on a plain `blorp test` invocation stay unaffected.
+private func blorp_test_timing_enabled() -> Bool:
 	getenv("BLORP_TEST_TIMINGS")
 		.map(func(value): value.trim() == "1")
 		.get_or(False)
+
+
+private func test_session_counters_requested() -> Bool:
+	blorp_test_timing_enabled()
+
+
+private func no_op_test_phase_recorder(phase: String, duration_ms: Int) -> Void:
+	void
+
+
+--- One `BLORP_TEST_TIMING` line per phase per test artifact, on stderr, in the
+--- exact format `scripts/test` and `scripts/bench-blorp-test-session` grep for.
+private func emit_blorp_test_timing_line(
+	phase: String,
+	group: String,
+	suites: Int,
+	sources: Int,
+	duration_ms: Int,
+) -> Void:
+	print_error(
+		"BLORP_TEST_TIMING phase=" + phase + " group=" + group + " suites=" + suites.to_string() + " sources=" + sources.to_string() + " duration_ms=" + duration_ms.to_string(),
+	)
+
+
+private pure func test_artifact_suite_count(plan: CliBlorpTestSuitePlan) -> Int:
+	match plan.kind:
+		CliBlorpTestSuiteArtifact:
+			plan.progress_source_paths.length()
+		CliBlorpDoctestArtifact:
+			0
+		CliBlorpTestProgramArtifact:
+			0
+
+
+--- Builds the per-artifact phase recorder used for `pipeline`/`host_c`/
+--- `execution` timing, and reports `frontend_graph` immediately since that
+--- phase (building this artifact's harness graph) is already measured by the
+--- caller before the plan exists. Returns a no-op recorder when timing is
+--- disabled so the timed and untimed routes share one code path.
+private func blorp_test_artifact_phase_recorder(
+	plan: CliBlorpTestSuitePlan,
+	frontend_graph_duration_ms: Int,
+) -> (String, Int) -> Void:
+	if blorp_test_timing_enabled():
+		group: String = test_artifact_kind_label(plan.kind)
+		suites: Int = test_artifact_suite_count(plan)
+		sources: Int = plan.progress_source_paths.length()
+
+		emit_blorp_test_timing_line(
+			"frontend_graph",
+			group,
+			suites,
+			sources,
+			frontend_graph_duration_ms,
+		)
+
+		func(
+			phase: String,
+			duration_ms: Int,
+		): emit_blorp_test_timing_line(phase, group, suites, sources, duration_ms)
+	else:
+		no_op_test_phase_recorder
 
 
 private pure func test_batch_retained_source_bytes(batch: CliBlorpTestBatchPlan) -> Int:
@@ -413,23 +479,37 @@ private func report_test_artifact_end(plan: CliBlorpTestSuitePlan, started_at: I
 		)
 
 
+--- `materialize` builds this artifact's harness graph (source discovery already
+--- happened for the batch; this is the per-artifact retained-graph slice plus
+--- generated harness module). Taking it as a closure lets this function time
+--- that work as the `frontend_graph` phase instead of the caller having timed
+--- it outside the artifact boundary.
 private func run_blorp_test_artifact(
-	materialized: Result[CliBlorpTestSuitePlan, String],
+	materialize: () -> Result[CliBlorpTestSuitePlan, String],
 	configuration: CliRunEffectConfiguration,
 	runtime: HostRuntimeInput,
 	interrupt_requested: () -> Option[Int],
 ) -> CliTestCandidateProgress:
+	frontend_graph_started_at: Int = now_microseconds()
+	materialized: Result[CliBlorpTestSuitePlan, String] = materialize()
+	frontend_graph_duration_ms: Int = (now_microseconds() - frontend_graph_started_at) / 1000
+
 	match materialized:
 		Err(message):
 			print_error(message)
 			CliTestCandidateStop(1)
 		Ok(plan):
+			record_phase: (String, Int) -> Void = blorp_test_artifact_phase_recorder(
+				plan,
+				frontend_graph_duration_ms,
+			)
 			started_at: Int = report_test_artifact_start(plan)
 			execution: CliBlorpTestCandidateExecution = execute_blorp_test_suite_with_runtime_until(
 				plan,
 				configuration,
 				runtime,
 				interrupt_requested,
+				record_phase,
 			)
 			report_test_artifact_end(plan, started_at)
 
@@ -465,11 +545,13 @@ private func run_blorp_test_batch_until(
 
 	for source in batch.sources:
 		if source.is_leak_baseline_program:
-			match run_blorp_test_artifact(
-				materialize_blorp_test_program(plan, batch, source),
-				configuration,
-				runtime,
-				interrupt_requested,
+			match (
+				run_blorp_test_artifact(
+					func(): materialize_blorp_test_program(plan, batch, source),
+					configuration,
+					runtime,
+					interrupt_requested,
+				)
 			):
 				CliTestCandidateContinue(artifact_result):
 					passed += artifact_result.passed
@@ -491,11 +573,15 @@ private func run_blorp_test_batch_until(
 			break
 
 	if suite_sources.length() > 0 and terminal.is_none():
-		match run_blorp_test_artifact(
-			materialize_blorp_test_suites(plan, batch, suite_sources),
-			configuration,
-			runtime,
-			interrupt_requested,
+		planned_suite_sources: List[CliBlorpTestSourcePlan] = suite_sources
+
+		match (
+			run_blorp_test_artifact(
+				func(): materialize_blorp_test_suites(plan, batch, planned_suite_sources),
+				configuration,
+				runtime,
+				interrupt_requested,
+			)
 		):
 			CliTestCandidateContinue(artifact_result):
 				passed += artifact_result.passed
@@ -505,11 +591,15 @@ private func run_blorp_test_batch_until(
 				terminal = Some(exit_status)
 
 	if doctest_sources.length() > 0 and terminal.is_none():
-		match run_blorp_test_artifact(
-			materialize_blorp_doctest_batch(plan, batch, doctest_sources),
-			configuration,
-			runtime,
-			interrupt_requested,
+		planned_doctest_sources: List[CliBlorpTestSourcePlan] = doctest_sources
+
+		match (
+			run_blorp_test_artifact(
+				func(): materialize_blorp_doctest_batch(plan, batch, planned_doctest_sources),
+				configuration,
+				runtime,
+				interrupt_requested,
+			)
 		):
 			CliTestCandidateContinue(artifact_result):
 				passed += artifact_result.passed

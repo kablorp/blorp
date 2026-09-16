@@ -1569,7 +1569,7 @@ fi
 
 expect_output_excludes "test success omits disabled session counters" 0 \
 	"BLORP_TEST_SESSION_COUNTER " \
-	"$BLORP_BIN" test --timeout 5 \
+	"${BLORP_DIRECT_TEST_ENV[@]}" "$BLORP_BIN" test --timeout 5 \
 	blorp/test/runtime/types/test_bool.brp
 expect_exit "test failure" 1 "$BLORP_BIN" test --timeout 5 "$failing_test"
 expect_test_session_counters "suite counters are stable across repeat" "[PASS]" 1 1 1 1 1 0 \
