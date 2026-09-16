@@ -1,15 +1,26 @@
 import:
 	../../../src/compiler/stage_09_core/ir:
+		CoreCallKind(BuiltinCall),
+		CoreDictLiteralEntry,
 		CoreExpr(
+			CallExpr,
+			DictExpr,
+			IfExpr,
 			LiteralExpr,
+			LiteralMatchExpr,
+			LogicalExpr,
 			PreClosureDetachExpr,
 			RecordCowUpdateExpr,
+			RecordExpr,
 			SelectExpr,
 			SemanticMatchExpr,
 			SeqExpr,
 			VarExpr,
 		),
 		CoreLiteral(IntLiteral),
+		CoreLiteralMatchCase,
+		CoreLiteralMatchFallback(LiteralMatchFallbackBody),
+		CoreLogicalOp(AndOp),
 		CorePattern(
 			ConstructorPattern,
 			ListPattern,
@@ -21,6 +32,7 @@ import:
 			WildcardPattern,
 		),
 		CoreRecordCowField,
+		CoreRecordFieldValue,
 		CoreReleasePolicy(NoReleasePolicy),
 		CoreSelectArm,
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm),
@@ -36,8 +48,11 @@ import:
 		map_core_expr_children,
 		map_core_expr_children_and_types_with_context,
 		map_core_expr_children_with_context,
+		map_core_logical_tree,
+		map_core_sequence_items,
 		rebuild_core_sequence,
 		split_core_sequence,
+	memory: same_object
 	test: TestSuite
 
 
@@ -289,22 +304,219 @@ pure func test_splits_and_rebuilds_sequence_spine() -> Bool:
 	)
 
 
+pure func identity_expr(expr: CoreExpr) -> CoreExpr:
+	expr
+
+
+pure func replace_middle_var(expr: CoreExpr) -> CoreExpr:
+	match expr:
+		VarExpr(variable, _, _):
+			if variable.name == "middle":
+				replacement_expr()
+			else:
+				expr
+		_:
+			expr
+
+
+-- One expression per traversal family: a leaf, a plain child-and-type node, an
+-- expression list, a dictionary-entry list, a record-field list, a COW-field
+-- list, a literal-match case list with a fallback, a select-arm list, and a
+-- semantic match tree.
+pure func reusable_expr_shapes() -> List[CoreExpr]:
+	dict_entry: CoreDictLiteralEntry = {
+		key = var_expr("key"),
+		value = var_expr("value")
+	}
+	record_field: CoreRecordFieldValue = {
+		name = "field",
+		value = var_expr("field_value")
+	}
+	cow_field: CoreRecordCowField = {
+		field = {
+			name = "changed",
+			typ = int_type(),
+			release_policy = NoReleasePolicy
+		},
+		replacement = Some(var_expr("replacement"))
+	}
+	match_case: CoreLiteralMatchCase = {
+		literal = IntLiteral(1),
+		bindings = [],
+		body = var_expr("case_body")
+	}
+	select_arm: CoreSelectArm = {
+		kind = SelectAfterArm(var_expr("timeout")),
+		body = var_expr("after_body"),
+		loc = SyntheticSourceLoc
+	}
+
+	[
+		var_expr("leaf"),
+		LiteralExpr(IntLiteral(7), int_type(), SyntheticSourceLoc),
+		SeqExpr(var_expr("first"), var_expr("second")),
+		IfExpr(
+			var_expr("cond"),
+			var_expr("then_branch"),
+			var_expr("else_branch"),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		CallExpr(
+			BuiltinCall("blorp_print"),
+			var_expr("callee"),
+			[var_expr("first_arg"), var_expr("second_arg")],
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		DictExpr([dict_entry], int_type(), SyntheticSourceLoc),
+		RecordExpr([record_field], HeapRecordType("Pair"), SyntheticSourceLoc),
+		RecordCowUpdateExpr(
+			var_expr("source"),
+			[cow_field],
+			HeapRecordType("Pair"),
+			SyntheticSourceLoc,
+		),
+		LiteralMatchExpr(
+			var_expr("scrutinee"),
+			[match_case],
+			LiteralMatchFallbackBody(var_expr("fallback_body")),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		SelectExpr([select_arm], VoidType, SyntheticSourceLoc),
+		SemanticMatchExpr(
+			var_expr("scrutinee"),
+			SemanticLiteralMatch(
+				RootSemanticMatchAccessor,
+				[
+					{
+						literal = IntLiteral(1),
+						body = SemanticMatchLeaf([], var_expr("case_body"))
+					},
+				],
+				SemanticMatchFail,
+			),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		PreClosureDetachExpr(var_expr("captured"), VoidType, SyntheticSourceLoc),
+	]
+
+
+pure func test_identity_mapper_reuses_every_node_shape() -> Bool:
+	var reused: Int = 0
+	shapes: List[CoreExpr] = reusable_expr_shapes()
+
+	for shape in shapes:
+		if same_object(
+			map_core_expr_children(shape, identity_expr),
+			shape,
+		):
+			reused += 1
+
+	reused == shapes.length()
+
+
+pure func test_identity_mapper_reuses_logical_tree_and_sequence() -> Bool:
+	logical: CoreExpr = LogicalExpr(
+		AndOp,
+		LogicalExpr(AndOp, var_expr("a"), var_expr("b"), int_type(), SyntheticSourceLoc),
+		var_expr("c"),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	sequence: CoreExpr = SeqExpr(
+		var_expr("first"),
+		SeqExpr(var_expr("second"), var_expr("final")),
+	)
+
+	same_object(
+		map_core_logical_tree(logical, identity_expr),
+		logical,
+	) and same_object(
+		map_core_sequence_items(sequence, identity_expr),
+		sequence,
+	)
+
+
+pure func test_changed_leaf_rebuilds_only_the_spine() -> Bool:
+	first_arg: CoreExpr = var_expr("first")
+	middle_arg: CoreExpr = var_expr("middle")
+	last_arg: CoreExpr = var_expr("last")
+	callee: CoreExpr = var_expr("callee")
+	call: CoreExpr = CallExpr(
+		BuiltinCall("blorp_print"),
+		callee,
+		[first_arg, middle_arg, last_arg],
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	outer: CoreExpr = SeqExpr(var_expr("untouched"), call)
+	mapped_outer: CoreExpr = map_core_expr_children(
+		outer,
+		pure func(child: CoreExpr): map_core_expr_children(child, replace_middle_var),
+	)
+
+	match mapped_outer:
+		SeqExpr(mapped_first, mapped_call):
+			match outer:
+				SeqExpr(original_first, _):
+					match mapped_call:
+						CallExpr(_, mapped_callee, mapped_args, _, _):
+							(
+								not same_object(mapped_outer, outer)
+								and not same_object(mapped_call, call)
+								and same_object(mapped_first, original_first)
+								and same_object(mapped_callee, callee)
+								and same_object(
+									mapped_args.get_or(0, callee),
+									first_arg,
+								)
+								and not same_object(
+									mapped_args.get_or(1, callee),
+									middle_arg,
+								)
+								and same_object(
+									mapped_args.get_or(2, callee),
+									last_arg,
+								)
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
 pure func test_pattern_binding_membership_matches_ordered_projection() -> Bool:
 	patterns = [
 		NamePattern("direct"),
-		ConstructorPattern("Outer", [
-			NamePattern("early"),
-			QualifiedConstructorPattern("module", "Inner", [
-				TuplePattern([
-					NamePattern("duplicate"),
-					ListPattern(
-						[WildcardPattern, LiteralPattern(IntLiteral(1)), NamePattern("late")],
-						Some(NamePattern("spread")),
-					),
-				]),
-			]),
-			NamePattern("duplicate"),
-		]),
+		ConstructorPattern(
+			"Outer",
+			[
+				NamePattern("early"),
+				QualifiedConstructorPattern(
+					"module",
+					"Inner",
+					[
+						TuplePattern([
+							NamePattern("duplicate"),
+							ListPattern(
+								[
+									WildcardPattern,
+									LiteralPattern(IntLiteral(1)),
+									NamePattern("late"),
+								],
+								Some(NamePattern("spread")),
+							),
+						]),
+					],
+				),
+				NamePattern("duplicate"),
+			],
+		),
 		OrPattern([NamePattern("left"), NamePattern("right")]),
 		ListPattern([], Some(ConstructorPattern("Spread", [NamePattern("nested_spread")]))),
 		WildcardPattern,
@@ -325,10 +537,10 @@ pure func test_pattern_binding_membership_matches_ordered_projection() -> Bool:
 
 	for pattern in patterns:
 		for target in targets:
-			if (
-				core_pattern_binds_name(pattern, target)
-				!= core_pattern_bound_names(pattern).contains(target)
-			):
+			if core_pattern_binds_name(
+				pattern,
+				target,
+			) != core_pattern_bound_names(pattern).contains(target):
 				equivalent = False
 
 	equivalent
@@ -353,6 +565,12 @@ tests: TestSuite = {
 			test_maps_semantic_match_scrutinee_and_tree_bodies,
 		),
 		("splits and rebuilds sequence spine", test_splits_and_rebuilds_sequence_spine),
+		("identity mapper reuses every node shape", test_identity_mapper_reuses_every_node_shape),
+		(
+			"identity mapper reuses logical tree and sequence",
+			test_identity_mapper_reuses_logical_tree_and_sequence,
+		),
+		("changed leaf rebuilds only the spine", test_changed_leaf_rebuilds_only_the_spine),
 		(
 			"pattern binding membership matches ordered projection",
 			test_pattern_binding_membership_matches_ordered_projection,
