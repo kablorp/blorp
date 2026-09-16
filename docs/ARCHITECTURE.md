@@ -236,19 +236,19 @@ owning table or prepared payload. Other durable declaration IDs, typed
 programs, semantic occurrences, diagnostics, and external projections still
 retain or project `ModuleIdentity`; Issue 57 migrates those graph-backed owners.
 
-Compilation computes a private `CoreLoweringInput` from a successful
-typechecked graph. That input contains only typed programs, exact import
-bindings, source include directories, identity allocation state, and requested
-summaries. This is a narrower read boundary, but it is not yet a proven
-lifetime boundary: `lower_typed_frontend_compilation` keeps the opaque
-`TypedFrontendCompilation` representation in scope while `prepare_core_graph`
-runs and reads policy from it afterward. The command-level `CliCompilePlan`
-also owns its source graph until command completion. The
+Compilation computes an opaque `PreparedCoreLoweringRequest` from a successful
+typechecked graph. It contains only source-text-free typed programs, keyed CTFE
+replacements, exact import bindings, source include directories, identity
+allocation state, requested summaries, and early-Core policy. The top-level
+CLI and compile command transition to corresponding prepared variants before
+Core starts, so neither `CliCompilePlan` nor `TypecheckedGraph` remains
+reachable on the normal compile path. The `core_lowering_input_ready` memory
+checkpoint directly measures this lifetime boundary. The
 [last-use issue](issues/compiler-performance/137-codegen-input-last-use-and-release.md)
-owns the direct measurement and first release cut; Phase 10 owns the final
-codegen-ready product. Adding a typecheck field to the projection requires a
-specific Core consumer; it is not a general escape hatch for retaining the
-typed graph.
+owns the measurement and release cut; Phase 10 owns replacement of the
+remaining raw typed-tree payloads. Adding a typecheck field to the projection
+requires a specific Core consumer; it is not a general escape hatch for
+retaining the typed graph.
 
 Remaining typechecking decomposition is tracked in
 [COMPILER_PRIORITIES.md](COMPILER_PRIORITIES.md). Production behavior belongs

@@ -27,6 +27,7 @@ import:
 		LateCoreExecution(LateCoreCompleted, LateCoreFailed, LateCoreStopped),
 		LateCoreStageRequest,
 		LoweredCoreCompilation,
+		PreparedCoreLoweringRequest,
 		RuntimeProjectedCompilation,
 		RuntimeProjectionPhaseExecution(
 			RuntimeProjectionPhaseFailed,
@@ -40,7 +41,8 @@ import:
 		emit_backend_c,
 		execute_late_core_stages,
 		finish_compiler_pipeline,
-		lower_typed_frontend_compilation,
+		lower_prepared_core_request,
+		prepare_core_lowering_request,
 		project_runtime_compilation,
 		run_early_core_compilation,
 		run_typed_frontend_compilation,
@@ -54,6 +56,7 @@ import:
 		BuildArtifact,
 		BuildArtifactConfiguration,
 		BuildCompatibility,
+		BuildNativeFeature,
 		BuildOptimization(BuildFast, BuildRelease),
 		BuildRuntimeRequirement(BuildEmbeddedRuntime, BuildExternalRuntime),
 		BuildSanitizer(BuildAddressUndefinedSanitizer, BuildNoSanitizer, BuildUndefinedSanitizer),
@@ -145,30 +148,41 @@ union CompilePreparation:
 
 
 record TypedCompilePreparation {
-	plan: CliCompilePlan,
-	stage_requests: CompileStageRequests,
+	continuation: CompileContinuation,
 	typed: TypedFrontendCompilation
 }
 
 
+record PreparedCoreCompilePreparation {
+	continuation: CompileContinuation,
+	request: PreparedCoreLoweringRequest
+}
+
+
 record LoweredCompilePreparation {
-	plan: CliCompilePlan,
-	stage_requests: CompileStageRequests,
+	continuation: CompileContinuation,
 	lowered: LoweredCoreCompilation
 }
 
 
 record EarlyCoreCompilePreparation {
-	plan: CliCompilePlan,
-	stage_requests: CompileStageRequests,
+	continuation: CompileContinuation,
 	early: EarlyCoreCompilation
 }
 
 
 record RuntimeProjectedCompilePreparation {
-	plan: CliCompilePlan,
-	stage_requests: CompileStageRequests,
+	continuation: CompileContinuation,
 	projected: RuntimeProjectedCompilation
+}
+
+
+record CompileContinuation {
+	runtime_requirement: BuildRuntimeRequirement,
+	native_features: List[BuildNativeFeature],
+	profile: FunctionProfileConfiguration,
+	compatibility: BuildCompatibility,
+	late_stages: List[LateCoreStageRequest]
 }
 
 
@@ -245,7 +259,7 @@ pure func run_compatibility(options: CliRunArgs) -> BuildCompatibility:
 
 private pure func artifact_configuration(
 	compilation: CoreCompilation,
-	graph: FrontendCompilationGraph,
+	native_features: List[BuildNativeFeature],
 	include_dirs: List[String],
 	runtime_requirement: BuildRuntimeRequirement,
 	profile: FunctionProfileConfiguration,
@@ -253,7 +267,7 @@ private pure func artifact_configuration(
 ) -> BuildArtifactConfiguration:
 	{
 		runtime_requirement = runtime_requirement,
-		native_features = graph_native_features(graph.graph),
+		native_features = native_features,
 		include_dirs = include_dirs,
 		source = {
 			path = compilation.target_path,
@@ -368,7 +382,7 @@ private pure func compile_preparation_from_frontend(
 				compilation = compilation,
 				configuration = artifact_configuration(
 					compilation,
-					plan.graph,
+					graph_native_features(plan.graph.graph),
 					include_dirs,
 					compile_runtime_requirement(plan.options),
 					plan.options.profile,
@@ -422,6 +436,19 @@ private pure func compile_plan_frontend_policy(plan: CliCompilePlan) -> Frontend
 	}
 
 
+private pure func compile_continuation(
+	plan: CliCompilePlan,
+	stage_requests: CompileStageRequests,
+) -> CompileContinuation:
+	{
+		runtime_requirement = compile_runtime_requirement(plan.options),
+		native_features = graph_native_features(plan.graph.graph),
+		profile = plan.options.profile,
+		compatibility = compile_compatibility(plan.options),
+		late_stages = stage_requests.late_stages
+	}
+
+
 func typed_compile_preparation(
 	plan: CliCompilePlan,
 ) -> Result[TypedCompilePreparation, List[String]]:
@@ -441,20 +468,36 @@ func typed_compile_preparation(
 	)
 
 	Ok({
-		plan = plan,
-		stage_requests = stage_requests,
+		continuation = compile_continuation(plan, stage_requests),
 		typed = typed,
 	})
 
 
-pure func lower_compile_preparation(
+pure func prepare_core_compile_preparation(
 	typed: TypedCompilePreparation,
-) -> Result[LoweredCompilePreparation, List[String]]:
-	lowered ?= lower_typed_frontend_compilation(typed.typed)
+) -> Result[PreparedCoreCompilePreparation, List[String]]:
+	request ?= prepare_core_lowering_request(typed.typed)
 
 	Ok({
-		plan = typed.plan,
-		stage_requests = typed.stage_requests,
+		continuation = typed.continuation,
+		request = request
+	})
+
+
+func prepare_core_compile_plan(
+	plan: CliCompilePlan,
+) -> Result[PreparedCoreCompilePreparation, List[String]]:
+	typed ?= typed_compile_preparation(plan)
+	prepare_core_compile_preparation(typed)
+
+
+pure func lower_compile_preparation(
+	prepared: PreparedCoreCompilePreparation,
+) -> Result[LoweredCompilePreparation, List[String]]:
+	lowered ?= lower_prepared_core_request(prepared.request)
+
+	Ok({
+		continuation = prepared.continuation,
 		lowered = lowered,
 	})
 
@@ -470,8 +513,7 @@ pure func early_core_compile_preparation_ready(
 	early: EarlyCoreCompilation,
 ) -> EarlyCoreCompilePreparation:
 	{
-		plan = lowered.plan,
-		stage_requests = lowered.stage_requests,
+		continuation = lowered.continuation,
 		early = early
 	}
 
@@ -487,8 +529,7 @@ pure func runtime_projected_compile_preparation_ready(
 	projected: RuntimeProjectedCompilation,
 ) -> RuntimeProjectedCompilePreparation:
 	{
-		plan = early.plan,
-		stage_requests = early.stage_requests,
+		continuation = early.continuation,
 		projected = projected
 	}
 
@@ -502,13 +543,13 @@ pure func prepared_compile_execution_from_projected(
 		compilation = compilation,
 		configuration = artifact_configuration(
 			compilation,
-			projected.plan.graph,
+			projected.continuation.native_features,
 			runtime_projected_include_dirs(projected.projected),
-			compile_runtime_requirement(projected.plan.options),
-			projected.plan.options.profile,
-			compile_compatibility(projected.plan.options),
+			projected.continuation.runtime_requirement,
+			projected.continuation.profile,
+			projected.continuation.compatibility,
 		),
-		late_stages = projected.stage_requests.late_stages,
+		late_stages = projected.continuation.late_stages,
 		typed_program_summary = runtime_projected_typed_summary(projected.projected),
 		early_observations = runtime_projected_observations(projected.projected)
 	}
@@ -516,7 +557,8 @@ pure func prepared_compile_execution_from_projected(
 
 func prepare_compile_plan(plan: CliCompilePlan) -> Result[CompilePreparation, List[String]]:
 	typed ?= typed_compile_preparation(plan)
-	lowered ?= lower_compile_preparation(typed)
+	prepared_core ?= prepare_core_compile_preparation(typed)
+	lowered ?= lower_compile_preparation(prepared_core)
 
 	match run_early_core_compile_preparation(lowered):
 		EarlyCorePhaseFailed(errors):
@@ -570,7 +612,7 @@ func prepare_run_plan(plan: CliRunSourcePlan) -> Result[CompilePreparation, List
 				compilation = compilation,
 				configuration = artifact_configuration(
 					compilation,
-					plan.graph,
+					graph_native_features(plan.graph.graph),
 					include_dirs,
 					BuildExternalRuntime,
 					plan.options.profile,

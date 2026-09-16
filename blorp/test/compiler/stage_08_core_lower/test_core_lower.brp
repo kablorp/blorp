@@ -64,7 +64,7 @@ import:
 		TypedUnionInfo,
 		TypedUnionVariantInfo,
 	../../../src/compiler/stage_06_typecheck/graph/definition_identity:
-		SourceDefinitionKind(ConstructorDefinition, TraitDefinition),
+		SourceDefinitionKind(ConstructorDefinition, GlobalDefinition, TraitDefinition),
 		func_callable_key,
 		source_definition_key,
 	../../../src/compiler/stage_06_typecheck/graph/definition_index:
@@ -195,6 +195,12 @@ import:
 	../../../src/compiler/stage_06_typecheck/type_system/type_widening:
 		TypeWideningReason(MutableBindingWidening),
 		ValueSlot(KeptValueSlot, WidenedValueSlot),
+	../../../src/compiler/stage_07_ctfe/globals:
+		ctfe_global_replacements_empty,
+		ctfe_global_replacements_for_definition_table,
+		ctfe_rewrite_program_global_replacements,
+	../../../src/compiler/stage_07_ctfe/context: ctfe_context_empty
+	../../../src/compiler/stage_07_ctfe/env: CTFE_ENV_EMPTY
 	../../../src/compiler/stage_08_core_lower/flatten:
 		CoreFlattenError(CoreFlattenCallableTargetNameCollision),
 	../../../src/compiler/stage_08_core_lower/graph_prepare:
@@ -207,6 +213,7 @@ import:
 		core_graph_modules,
 		core_graph_prepare_error_to_string,
 		prepare_core_graph,
+		prepare_core_graph_with_ctfe_replacements,
 	../../../src/compiler/stage_08_core_lower/identity:
 		core_ufcs_function_name,
 		core_ufcs_module_prefix,
@@ -428,6 +435,28 @@ private pure func insert_core_test_constructor(
 			ConstructorDefinition,
 			name,
 			Some(owner),
+			fixture_source_span(),
+		),
+		definition_id,
+	).to_option()
+	Some((updated, definition_id))
+
+
+private pure func insert_core_test_global(
+	index: DefinitionIndex,
+	table: ModuleTable,
+	module_id: ModuleId,
+	name: String,
+) -> Option[(DefinitionIndex, Int)]:
+	definition_id = definition_index_next_def_id(index)
+	updated ?= definition_index_insert_source_definition_id(
+		index,
+		table,
+		source_definition_key(
+			module_id,
+			GlobalDefinition,
+			name,
+			None,
 			fixture_source_span(),
 		),
 		definition_id,
@@ -5670,7 +5699,8 @@ private func prepares_module_graph_at_core_boundary(
 	}
 	module_unit: CoreGraphUnit = {
 		module_id = dependency_module_id,
-		typed_program = module_program
+		typed_program = module_program,
+		ctfe_replacements = ctfe_global_replacements_empty()
 	}
 
 	definitions = empty_core_definition_table(module_table)
@@ -5749,7 +5779,8 @@ func test_core_graph_rejects_module_id_outside_table() -> Bool:
 						[
 							{
 								module_id = foreign_id,
-								typed_program = foreign_program
+								typed_program = foreign_program,
+								ctfe_replacements = ctfe_global_replacements_empty()
 							},
 						],
 					),
@@ -5792,6 +5823,108 @@ func test_core_graph_rejects_duplicate_definition_authority() -> Bool:
 			False
 
 
+func test_core_graph_rejects_foreign_ctfe_replacement_authority() -> Bool:
+	match core_graph_test_module_domain(["target"]):
+		Some((module_table, [target_id])):
+			definitions = empty_core_definition_table(module_table)
+			foreign_definitions = empty_core_definition_table(module_table)
+			program: TypedProgram = {
+				source = fixture_source_file(),
+				decls = [],
+				diagnostics = [],
+				type_definitions = [],
+				type_references = []
+			}
+
+			match prepare_core_graph_with_ctfe_replacements(
+				definitions,
+				target_id,
+				program,
+				ctfe_global_replacements_for_definition_table(foreign_definitions),
+				core_graph_modules(definitions, []),
+				10,
+			):
+				Err(CoreGraphModuleTableError(message)):
+					message == "Core graph CTFE replacements use an incompatible definition table"
+				_:
+					False
+		_:
+			False
+
+
+private func core_graph_consumes_keyed_ctfe_replacement_without_rewriting_source(
+	module_table: ModuleTable,
+	target_id: ModuleId,
+) -> Option[Bool]:
+	initial = definition_index_empty(definition_index_initial_seed(ENV_EMPTY), module_table)
+	inserted ?= insert_core_test_global(initial, module_table, target_id, "answer")
+	definitions = definition_index_definition_table(inserted[0])
+	definition_id = inserted[1]
+	source_value = TypedBinaryExpr(
+		ParsedAddOp,
+		int_expr("40"),
+		int_expr("2"),
+		fixture_source_span(),
+		expr_info(int_type()),
+	)
+	info: TypedGlobalVarInfo = {
+		decl = parsed_var_decl(),
+		definition_id = Some(definition_id),
+		binding_type = int_type(),
+		source_type = Some(int_type()),
+		value = source_value
+	}
+	program: TypedProgram = {
+		source = fixture_source_file(),
+		decls = [TypedGlobalVarDecl(info)],
+		diagnostics = [],
+		type_definitions = [],
+		type_references = []
+	}
+
+	replacements ?= ctfe_rewrite_program_global_replacements(
+		ctfe_context_empty(definitions, target_id),
+		CTFE_ENV_EMPTY,
+		program,
+	).to_option()
+	prepared ?= prepare_core_graph_with_ctfe_replacements(
+		definitions,
+		target_id,
+		program,
+		replacements,
+		core_graph_modules(definitions, []),
+		definition_index_next_def_id(inserted[0]),
+	).to_option()
+
+	match (program.decls, prepared.program.decls):
+		([TypedGlobalVarDecl(source_info)], [GlobalDecl(core_info)]):
+			match source_info.value:
+				TypedBinaryExpr(_, _, _, _, _):
+					Some(core_exprs_equal(
+						core_info.init,
+						LiteralExpr(
+							IntLiteral(42),
+							core_int_type(),
+							core_source_loc(fixture_source_span()),
+						),
+					))
+				_:
+					Some(False)
+		_:
+			Some(False)
+
+
+func test_core_graph_consumes_keyed_ctfe_replacement_without_rewriting_source() -> Bool:
+	match core_graph_test_module_domain(["target"]):
+		Some((module_table, [target_id])):
+			core_graph_consumes_keyed_ctfe_replacement_without_rewriting_source(
+				module_table,
+				target_id,
+			).get_or(False)
+		_:
+			False
+
+
 private func prepared_graph_resolves_repeated_imports(
 	module_table: ModuleTable,
 	target_module_id: ModuleId,
@@ -5827,6 +5960,7 @@ private func prepared_graph_resolves_repeated_imports(
 	}
 	first_module: CoreGraphUnit = {
 		module_id = first_module_id,
+		ctfe_replacements = ctfe_global_replacements_empty(),
 		typed_program = {
 			source = fixture_source_file(),
 			decls = [TypedFunctionDecl(first_module_function)],
@@ -5837,6 +5971,7 @@ private func prepared_graph_resolves_repeated_imports(
 	}
 	second_module: CoreGraphUnit = {
 		module_id = second_module_id,
+		ctfe_replacements = ctfe_global_replacements_empty(),
 		typed_program = {
 			source = fixture_source_file(),
 			decls = [TypedFunctionDecl(second_module_function)],
@@ -6005,7 +6140,8 @@ private func prepared_graph_duplicate_callable_ids_use_later_name(
 					[
 						{
 							module_id = dependency_module_id,
-							typed_program = dependency_program
+							typed_program = dependency_program,
+							ctfe_replacements = ctfe_global_replacements_empty()
 						},
 					],
 				),
@@ -6578,6 +6714,14 @@ tests: TestSuite = {
 		(
 			"Core graph rejects duplicate definition authority",
 			test_core_graph_rejects_duplicate_definition_authority,
+		),
+		(
+			"Core graph rejects foreign CTFE replacement authority",
+			test_core_graph_rejects_foreign_ctfe_replacement_authority,
+		),
+		(
+			"Core graph consumes keyed CTFE replacement without rewriting source",
+			test_core_graph_consumes_keyed_ctfe_replacement_without_rewriting_source,
 		),
 		(
 			"reports Core graph flatten errors with module context",

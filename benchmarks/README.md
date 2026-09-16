@@ -1183,7 +1183,8 @@ For compile-execution memory profiles, set
 `BLORP_COMPILER_MEMORY_PROFILE=1`. The compiler writes schema-1
 `BLORP_COMPILER_MEMORY_CHECKPOINT` rows to stderr at
 `typed_frontend_start`, then at the completed compiler phase checkpoints:
-`typed_frontend_complete`, `core_lowering_complete`, `early_core_complete`,
+`typed_frontend_complete`, `core_lowering_input_ready`,
+`core_lowering_complete`, `early_core_complete`,
 `runtime_projection_complete`, `late_core_complete`,
 `backend_emission_complete`, and `artifact_construction_complete`. If a
 compilation fails or stops, the final checkpoint uses the active phase label
@@ -1201,6 +1202,13 @@ managed live-object count. Command planning and source loading happen before
 `artifact_construction_complete`, so these rows intentionally measure execution
 of an already constructed compile plan rather than process startup or the
 entire CLI command.
+
+`core_lowering_input_ready` is the ownership boundary between the rich
+frontend result and the opaque input accepted by Core. It is emitted after
+command policy and Core input projection, when the broad source/typecheck graph
+is no longer reachable, and before Core allocation begins. Compare it with
+`typed_frontend_complete` to measure the release itself and with
+`core_lowering_complete` to measure its effect on the Core high-water mark.
 
 On macOS, regular RSS sampling invokes `ps` every 20 ms and observes only the
 helper leader process. This is appropriate for the current single-process

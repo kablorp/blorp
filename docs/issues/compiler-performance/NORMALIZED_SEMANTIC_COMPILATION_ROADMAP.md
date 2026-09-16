@@ -1,8 +1,9 @@
 # Normalized Semantic Compilation
 
 **Status:** Active. The accepted semantic catalog, Step 2e visibility
-convergence, Step 3 body-outcome completion, and Step 4A solved-body/session
-boundary are in production. Later product completion remains sequenced below.
+convergence, Step 3 body-outcome completion, Step 4A solved-body/session
+boundary, and Steps 7A–7B are in production. Later product completion remains
+sequenced below.
 
 **Current state:** The compilation has graph-local `ModuleId`, `DefinitionId`,
 category-safe accepted tables, and an `AcceptedSemanticCatalog` with checked
@@ -12,8 +13,11 @@ accepted alias/union construction no longer regroups by path or spelling. A vali
 survives CTFE handoff, including empty partial tables for bodyless dependencies;
 ordinary materialization requires a `CompleteBodyOutcomeTable` with exact
 coverage, compatible `main` validation policy, and explicit source order. The broad
-`TypecheckedGraph`, some rebuilt semantic/CTFE typed programs, and late Core
-name projection remain. Graph import binding now batches admission under one
+`TypecheckedGraph` and late Core name projection remain. Each
+`TypecheckedModule` now owns one source-faithful `TypedProgram` plus sparse
+parsed/typed initializer replacements keyed by graph-issued definition ID;
+Core consumes those rows directly without constructing or retaining a second
+complete program. Graph import binding now batches admission under one
 scope-local builder and publishes explicit accepted/rejected candidate rows.
 `IndexedGraph` now owns compact
 module-scoped selective export demand, and downstream import/type-fact paths
@@ -27,8 +31,13 @@ as the visibility baseline. Step 3 is also complete; use its
 and [implementation packet](145-step3-complete-body-outcome-publication.md)
 as the body-product baseline. Step 4A is complete via the
 [session-owned meta completion packet](141-step4a-meta-session-issuer-preflight.md).
-Proceed to Step 7A: attach evaluated initializer replacements by exact identity
-without retaining a second complete typed program.
+Step 7A is complete via the
+[keyed CTFE replacement completion packet](146-step7a-keyed-ctfe-replacements.md).
+Step 7B is complete via the
+[last-use and release packet](137-codegen-input-last-use-and-release.md): the
+compile command now drops its rich frontend owner before Core and the retained
+measurement shows a 17.0 MB net allocator release before Core begins.
+Proceed to Step 9's compact Core and C identities.
 
 **Read first:** [Compiler Architecture](../../ARCHITECTURE.md#frontend),
 [Compiler Priorities](../../COMPILER_PRIORITIES.md#1-finish-the-typechecking-product-boundaries),
@@ -61,8 +70,8 @@ the Step 2e issue, and the Phase 8–10 issues under `docs/issues/typechecking/`
 | 2e visibility, complete | One phase-correct ordered candidate/accepted relation serves graph lookup. The [resource gate](94-step2e-visibility-convergence.md) is complete; displaced name dictionaries, the successful-only graph inventory, and accepted alias/union reconstruction paths are deleted. |
 | 3 body outcomes, complete | CTFE and ordinary compilation read the same exact row. Direct ordinary rows, explicit source order, complete-body coverage, linear seed admission, and bodyless-module behavior are protected by the [completion packet](145-step3-complete-body-outcome-publication.md). |
 | 4A solved/validated bodies, complete | [Phases 8 and 9](../../COMPILER_PRIORITIES.md#phase-8-constraint-solving-and-type-finalization) publish meta-free solved and accepted validated facts. Accepted bodies retain exact session-owned solver identity through validation; raw cross-session slots and unscoped meta issuance are rejected. Optional semantic-type interning remains a separate experiment. |
-| 7A keyed CTFE | Attach evaluated initializer replacements by exact identity instead of retaining a second complete typed program. |
-| 7B codegen-ready | Audit the exact facts Core needs, construct a narrow opaque accepted input, and release compile-only recovery/analysis state before Core. [Phase 10](../typechecking/phase-10-checked-codegen-graphs.md) owns admission; the [last-use and release issue](137-codegen-input-last-use-and-release.md) owns the proof and lifetime measurements. |
+| 7A keyed CTFE, complete | One source-faithful typed program owns semantic bodies. Sparse initializer payloads are keyed by exact definition ID and consumed directly by Core; full evaluated programs exist only as transient presentation projections. See the [completion packet](146-step7a-keyed-ctfe-replacements.md). |
+| 7B codegen-ready, complete | The compile command constructs an opaque accepted input and releases compile-only recovery/analysis state before Core. [Phase 10](../typechecking/phase-10-checked-codegen-graphs.md) owns the remaining raw typed-tree replacement; the [last-use and release issue](137-codegen-input-last-use-and-release.md) owns the proof and retained measurement. |
 | 9 Core identities | Preserve IDs into one measured Core declaration/relation pass cluster at a time after 7B; do not wait for all tooling queries. This includes classifying ABI exposure, assigning exact nominal type/specialization IDs, and deriving compact internal C type/helper spellings from those IDs. |
 | 5–6, 8, 7C analysis/final retirement | Add accepted call/dependency edges and required diagnostic ownership; publish source occurrences and optional explanations only for named tool consumers. Move check/lint/LSP queries, then delete the remaining broad graph. |
 
