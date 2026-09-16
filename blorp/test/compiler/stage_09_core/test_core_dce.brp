@@ -1,5 +1,8 @@
 import:
-	../../../src/compiler/stage_09_core/dce: prune_program, resolved_value_occurrences, value_references
+	../../../src/compiler/stage_09_core/dce:
+		prune_program,
+		resolved_value_occurrences,
+		value_references,
 	../../../src/compiler/stage_09_core/ir:
 		CoreCallKind(UnknownCall, UserCall),
 		CoreClosureCreate,
@@ -692,6 +695,82 @@ func test_retains_alias_target_type_dependencies() -> Bool:
 	value_record_names(prune_program(input_program)) == ["Outer", "Inner"]
 
 
+func mixed_fact_program() -> CoreProgram:
+	program([
+		function_decl(
+			"main",
+			1,
+			SeqExpr(
+				user_call("helper", Some(2)),
+				SeqExpr(
+					user_call("helper", Some(2)),
+					user_call("other", Some(3)),
+				),
+			),
+		),
+		function_decl(
+			"helper",
+			2,
+			SeqExpr(
+				user_call("Ok", Some(7)),
+				SeqExpr(
+					VarExpr(
+						named_var("scratch", Some(10)),
+						int_type(),
+						SyntheticSourceLoc,
+					),
+					user_call("leaf", Some(4)),
+				),
+			),
+		),
+		function_decl(
+			"other",
+			3,
+			SeqExpr(
+				user_call("helper", Some(2)),
+				user_call("tail", Some(5)),
+			),
+		),
+		function_decl("leaf", 4, int_literal(0)),
+		function_decl("tail", 5, int_literal(0)),
+		function_decl("dead", 6, int_literal(0)),
+		private_global_decl("scratch", 10, int_literal(42)),
+		private_global_decl("dead_scratch", 11, int_literal(43)),
+		constructor_union_decl("Result", "Ok", 7),
+		constructor_union_decl("Dead", "Unused", 8),
+	])
+
+
+func test_repeated_facts_stay_idempotent_without_hiding_new_ones() -> Bool:
+	pruned = prune_program(mixed_fact_program())
+
+	-- Duplicate call identities are absorbed once; every distinct identity
+	-- reached through them still survives, and only the unreached one dies.
+
+	(
+		function_names(pruned) == ["main", "helper", "other", "leaf", "tail"]
+		and global_names(pruned) == ["scratch"]
+		and union_names(pruned) == ["Result"]
+	)
+
+
+func test_fact_application_is_order_independent() -> Bool:
+	-- Applying the same facts through a differently ordered declaration list
+	-- must reach the same declarations.
+	forward = prune_program(mixed_fact_program())
+	reversed_input: CoreProgram = { mixed_fact_program() |
+		decls = mixed_fact_program().decls.reverse()
+	}
+	backward = prune_program(reversed_input)
+
+	(
+		function_names(forward) == ["main", "helper", "other", "leaf", "tail"]
+		and function_names(backward) == ["tail", "leaf", "other", "helper", "main"]
+		and global_names(backward) == ["scratch"]
+		and union_names(backward) == ["Result"]
+	)
+
+
 func test_retains_trait_signatures() -> Bool:
 	input_program = program([
 		function_decl("main", 1, int_literal(0)),
@@ -764,6 +843,11 @@ tests: TestSuite = {
 			test_retains_constructor_parent_for_reachable_call_identity,
 		),
 		("retains alias target type dependencies", test_retains_alias_target_type_dependencies),
+		(
+			"repeated facts stay idempotent without hiding new ones",
+			test_repeated_facts_stay_idempotent_without_hiding_new_ones,
+		),
+		("fact application is order independent", test_fact_application_is_order_independent),
 		("retains trait signatures", test_retains_trait_signatures),
 	]
 }

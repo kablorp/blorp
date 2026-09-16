@@ -21,9 +21,10 @@ first-match order, one helper per commit, measuring after each.
 `prepare.prepare_program` and `prepare_decl`; `dce.close_reachability`;
 `mono_data` where `templates` is collected; the focused suites
 `test_core_perceus.brp`, `test_core_prepare.brp`, `test_core_dce.brp`,
-`test_core_mono*.brp`; [issue 133](133-dce-reachability-fact-application.md),
-which this issue supersedes, as it did the deleted
-`late-core-latency/02-index-core-preparation-declarations.md`; the
+`test_core_mono*.brp`; the deleted
+`compiler-performance/133-dce-reachability-fact-application.md` and
+`late-core-latency/02-index-core-preparation-declarations.md`, which this
+issue supersedes; the
 [measurement protocol](../../../benchmarks/README.md#self-compile-measurement-protocol).
 
 **Fast loop:**
@@ -87,6 +88,19 @@ moved out of the consumed `state` before mutation (destructure once, rebuild
 once), and return the input state unchanged when every fact list is empty.
 Preserve first-encounter order and `fail_closed` exactly as in issue 133;
 delete issue 133 in the same commit and carry its invariants here.
+
+**Decision (cut C, landed):** clearing the collections out of a consumed
+state record did not help, because the record update keeps the old record
+alive to the end of its block, so the collections still had two owners.
+`DceClosureState` and `apply_reachability_facts` were removed instead: the
+six collections are now locals of `close_reachability` for the whole
+fixpoint, so each is copied at most once, on its first append, and an empty
+fact set costs nothing. The self-compile fell from 519,274,731,917 to
+496,730,342,483 retired instructions (-4.34%) with byte-identical C and
+late-Core allocations down 28,383. Issue 133's invariants (root order,
+first-encounter order, exact constructor `def_id` checks, idempotent
+duplicate facts, conservative `fail_closed`) are the ones listed under
+"Invariants And Tests" above and are covered by the two new DCE tests.
 
 ### D. Template index in mono_data (mono_data.brp)
 
