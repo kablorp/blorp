@@ -58,7 +58,7 @@ to the Perceus module, and record the counts of every `summarize_*`,
 ```bash
 boot=$(scripts/blorp-compiler-bootstrap --print-path)
 input=$(benchmarks/self_compile_measure freeze --rev <baseline input_rev>)
-$boot compile --profile-mode calls --profile-module compiler/stage_09_core/perceus \
+$boot compile --profile-mode calls --profile-module blorp/src/compiler/stage_09_core/perceus \
   --std-dir standard_library/src --no-format -o /tmp/blorp-perceus-calls.c blorp/src/main.brp
 cc -O0 -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
   -Iblorp/src/compiler/stage_01_generated_inputs -Iblorp/src/compiler/stage_04_modules \
