@@ -26,7 +26,7 @@ from run_blorp_check_fixtures import expectation_failures, parse_expectations
 
 DEFAULT_FIXTURE_ROOT = Path("blorp/test")
 DEFAULT_STDLIB_CASE = Path("standard_library/src/crypto_random.brp")
-EXPECTED_TOOL_FIXTURE_COUNT = 110
+EXPECTED_TOOL_FIXTURE_COUNT = 111
 
 
 class FixtureKind(Enum):
