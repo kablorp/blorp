@@ -317,6 +317,10 @@ for line in lines:
         if "\t" not in line:
             break
         label = line.split("\t", 1)[0]
+        # Per-pass rows are indented under their phase row; this helper asserts
+        # the phase rows only.
+        if label.startswith(" "):
+            continue
         if label not in {"phase_total", "outer_total"}:
             labels.append(label)
 
@@ -367,7 +371,12 @@ for line in lines:
         for part in line.split()
         if "=" in part
     )
-    labels.append(fields.get("phase", ""))
+    phase = fields.get("phase", "")
+    # Per-pass checkpoints sit inside a phase; this helper asserts the phase
+    # checkpoints only.
+    if phase.startswith("pass_"):
+        continue
+    labels.append(phase)
 
 if labels != expected:
     print(f"expected checkpoint labels {expected}, got {labels}", file=sys.stderr)
@@ -1379,6 +1388,14 @@ if grep -qF $'phase_total\t' <<<"$RUN_OUTPUT" && grep -qF $'outer_total\t' <<<"$
 else
 	record_fail "compile time phases reports phase and outer totals" "$RUN_OUTPUT"
 fi
+expect_output_contains "compile time phases reports one row per late Core pass" 0 \
+	$'  perceus\t' \
+	"$BLORP_BIN" compile --no-format --no-embed-runtime --time-phases \
+		-o "$timed_phase_c" "$valid_prog"
+expect_output_contains "compile time phases reports the first late Core pass row" 0 \
+	$'  adapt_function_refs\t' \
+	"$BLORP_BIN" compile --no-format --no-embed-runtime --time-phases \
+		-o "$timed_phase_c" "$valid_prog"
 expect_output_excludes "compile without time phases has no timing table" 0 \
 	"Compiler phase timings" \
 	"$BLORP_BIN" compile --no-format --no-embed-runtime \
@@ -1408,6 +1425,10 @@ expect_memory_checkpoint_labels "compiler memory checkpoints use phase labels" \
 	"source_discovery_start,source_discovery_complete,typed_frontend_start,typed_frontend_complete,core_lowering_input_ready,core_lowering_complete,early_core_complete,runtime_projection_complete,late_core_complete,backend_emission_complete,artifact_construction_complete" \
 	env BLORP_COMPILER_MEMORY_PROFILE=1 "$BLORP_BIN" compile --no-format \
 		--no-embed-runtime --time-phases -o "$timed_memory_c" "$valid_prog"
+expect_output_contains "compiler memory checkpoints name every late Core pass" 0 \
+	"phase=pass_perceus_complete" \
+	env BLORP_COMPILER_MEMORY_PROFILE=1 "$BLORP_BIN" compile --no-format \
+		--no-embed-runtime -o "$timed_memory_c" "$valid_prog"
 expect_memory_checkpoint_labels "compiler memory checkpoints report typed frontend failure" \
 	1 \
 	"source_discovery_start,source_discovery_complete,typed_frontend_start,typed_frontend_failed" \
