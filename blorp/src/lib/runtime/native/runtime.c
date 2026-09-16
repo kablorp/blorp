@@ -4068,6 +4068,15 @@ inline bool blorp_is_unique(void* obj) {
 #endif
 }
 
+// Allocation identity, not value equality: true only when both operands name
+// the same managed allocation (two NULLs count as the same object). Compiler
+// passes use it to prove that a mapped subtree is the untouched original.
+// Kept byte-identical to the runtime_decl.c copy: generated compiler C embeds
+// this file, while generated user programs get the declarations copy instead.
+static inline bool blorp_same_object(const void* left, const void* right) {
+    return left == right;
+}
+
 // Caller-side move: decrement refcount without freeing.
 // Used for x = f(x, ...) patterns where the function's entry retain
 // will immediately bring the refcount back, enabling in-place COW.
