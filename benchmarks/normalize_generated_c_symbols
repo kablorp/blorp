@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """Canonicalize generated symbol names in compiler C output and hash the result.
 
-The backend spells anonymous top-level functions and static closures as
-`brp_<suffix>` and `__sc_brp_<suffix>`, where the suffix is derived from the
-definition ID the Core pipeline assigned. A change that legitimately prunes or
-reorders declarations before monomorphization shifts those IDs, so the names
-shift too even though the emitted program is the same. `--require-identical`
-compares raw bytes and reports that as DIFFERENT.
+Four things in the output carry the definition ID the Core pipeline assigned:
+anonymous functions and static closures (`brp_<suffix>`, `__sc_brp_<suffix>`),
+the singleton of a nullary union variant (`__def_<id>_<Name>`, which also
+appears embedded in longer mangled names), generated local variable suffixes
+(`__v<n>`), and the `def_id=<n>` echoed in generated comments. A change that
+legitimately prunes or reorders declarations before monomorphization shifts
+those IDs, so all four shift even though the emitted program is the same, and
+the file size can move by a few bytes when an id changes digit count.
+`--require-identical` compares raw bytes and reports that as DIFFERENT.
 
-This script replaces every such name with `brp_$<n>` / `__sc_brp_$<n>`, numbered
-by first occurrence in the file, and prints a SHA-256 of the rewritten text.
+This script renumbers each family by first occurrence in the file, keeping
+everything else -- including the variant name in `__def_$<n>_<Name>` -- and
+prints a SHA-256 of the rewritten text.
 Two files with the same normalized hash differ only in the spelling of those
 generated symbols: the renaming is one-to-one and occurrence order is preserved,
 so any difference in structure, ordering, or in any other identifier survives
@@ -33,20 +37,39 @@ import re
 import sys
 from pathlib import Path
 
-# Both families share the `brp_` stem; the longer alternative has to come first
-# so the static-closure prefix is not split by the shorter match.
-GENERATED_SYMBOL_RE = re.compile(r"\b(__sc_brp_|brp_)([A-Za-z0-9]+)\b")
+# `brp_<suffix>` and `__sc_brp_<suffix>` name anonymous functions and static
+# closures; the longer alternative comes first so the static-closure prefix is
+# not split by the shorter match. `__def_<id>_<Name>` names the singleton of a
+# nullary union variant, where only the numeric id is definition-derived and the
+# trailing name is meaningful, so the id alone is renumbered.
+# Four families carry a definition ID. `__def_` is matched without a word
+# boundary because it also appears embedded in longer mangled names, preceded by
+# an underscore; the prefix is distinctive enough to be unambiguous on its own.
+GENERATED_SYMBOL_RE = re.compile(
+    r"\b(__sc_brp_|brp_)([A-Za-z0-9]+)\b"  # anonymous functions, static closures
+    r"|__def_(\d+)_"  # nullary union variant singletons
+    r"|(__v)(\d+)\b"  # generated local variable suffixes
+    r"|(def_id=)(\d+)\b"  # the id echoed in generated comments
+)
 
 
 def normalize(text: str) -> str:
     """Rewrite generated symbol names to their first-occurrence index."""
     numbering: dict[str, int] = {}
 
-    def replace(match: re.Match[str]) -> str:
-        symbol = match.group(0)
+    def index_of(symbol: str) -> int:
         if symbol not in numbering:
             numbering[symbol] = len(numbering)
-        return f"{match.group(1)}${numbering[symbol]}"
+        return numbering[symbol]
+
+    def replace(match: re.Match[str]) -> str:
+        if match.group(3) is not None:
+            return f"__def_${index_of(match.group(0))}_"
+        if match.group(4) is not None:
+            return f"__v${index_of(match.group(0))}"
+        if match.group(6) is not None:
+            return f"def_id=${index_of(match.group(0))}"
+        return f"{match.group(1)}${index_of(match.group(0))}"
 
     return GENERATED_SYMBOL_RE.sub(replace, text)
 

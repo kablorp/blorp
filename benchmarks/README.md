@@ -1795,14 +1795,16 @@ Rules:
 
 When a change legitimately reorders definition IDs, the raw-bytes check is the
 wrong oracle and `benchmarks/normalize_generated_c_symbols` is the right one.
-The backend spells anonymous functions and static closures as `brp_<suffix>` and
-`__sc_brp_<suffix>`, where the suffix comes from the definition ID the Core
-pipeline assigned, so pruning or reordering declarations before monomorphization
-renames them even though the emitted program is unchanged and
-`--require-identical` reports DIFFERENT. Run the script over the baseline and
-candidate C (keep them with `--keep-output`); it renumbers both symbol families
-by first occurrence and prints a SHA-256, exiting nonzero when the hashes
-disagree. Equal hashes mean the two files differ only in the spelling of those
+Four things in the output carry the definition ID the Core pipeline assigned:
+anonymous functions and static closures (`brp_<suffix>`, `__sc_brp_<suffix>`),
+nullary union variant singletons (`__def_<id>_<Name>`, which also appear
+embedded in longer mangled names), generated local variable suffixes (`__v<n>`),
+and the `def_id=<n>` echoed in generated comments. Pruning or reordering
+declarations before monomorphization shifts all four even though the emitted
+program is unchanged, so `--require-identical` reports DIFFERENT and the file
+size can move by a few bytes when an id changes digit count. Run the script over the baseline and
+candidate C (keep them with `--keep-output`); it renumbers each family by first
+occurrence and prints a SHA-256, exiting nonzero when the hashes disagree. Equal hashes mean the two files differ only in the spelling of those
 generated symbols: the renumbering is one-to-one and occurrence order is
 preserved, so a reordering, an added or removed declaration, or a change to any
 other identifier still changes the hash. Report the raw rename count alongside
