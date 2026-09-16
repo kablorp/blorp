@@ -25,6 +25,7 @@ import:
 		implementation_header_graph_build,
 		implementation_header_graph_definition_table,
 		implementation_header_graph_error_message,
+		implementation_header_graph_error_span,
 		implementation_header_graph_headers,
 		implementation_header_method_ids,
 		implementation_header_methods,
@@ -368,6 +369,115 @@ pure func test_implementation_method_type_parameters_preserve_bounds_and_exclude
 	implementation_method_type_parameters_preserve_bounds_and_exclude_owner().get_or(False)
 
 
+private pure func implementation_headers_bucket_methods_by_exact_implementation() -> Option[Bool]:
+	source: String =
+		|trait Measure:
+		|	pure func measure(value: Self) -> Int
+		|	pure func doubled(value: Self) -> Int: measure(value) * 2
+		|
+		|func unrelated_before() -> Int: 1
+		|
+		|record First {value: Int}
+		|record Second {value: Int}
+		|
+		|implements Measure for First:
+		|	pure func measure(value: First) -> Int: value.value
+		|	pure func extra(value: First) -> Int: value.value + 1
+		|
+		|func unrelated_between() -> Int: 2
+		|
+		|implements Measure for Second:
+		|	pure func measure(value: Second) -> Int: value.value * 2
+		|
+		|func unrelated_after() -> Int: 3
+	graph ?= implementation_graph(source)
+	first ?= implementation_header_graph_headers(graph).get(0)
+	second ?= implementation_header_graph_headers(graph).get(1)
+	first_methods = implementation_header_methods(first)
+	second_methods = implementation_header_methods(second)
+	first_explicit_names = first_methods
+		.filter(func(method): explicit_implementation_method_signature(method).is_some())
+		.map(implementation_method_header_name)
+	second_explicit_names = second_methods
+		.filter(func(method): explicit_implementation_method_signature(method).is_some())
+		.map(implementation_method_header_name)
+	first_default_names = first_methods
+		.filter(func(method): explicit_implementation_method_signature(method).is_none())
+		.map(implementation_method_header_name)
+	second_default_names = second_methods
+		.filter(func(method): explicit_implementation_method_signature(method).is_none())
+		.map(implementation_method_header_name)
+
+	Some(
+		implementation_header_graph_headers(graph).length() == 2
+		and first_methods.length() == 3
+		and second_methods.length() == 2
+		and first_explicit_names == ["measure", "extra"]
+		and second_explicit_names == ["measure"]
+		and first_default_names == ["doubled"]
+		and second_default_names == ["doubled"]
+	)
+
+
+pure func test_implementation_headers_bucket_methods_by_exact_implementation() -> Bool:
+	implementation_headers_bucket_methods_by_exact_implementation().get_or(False)
+
+
+private pure func implementation_headers_preserve_error_order_across_implementations() -> Option[Bool]:
+	source: String =
+		|trait Renderable:
+		|	pure func render(value: Self) -> String
+		|
+		|record First[T] {value: T}
+		|record Second[T] {value: T}
+		|
+		|implements Renderable for First[T]:
+		|	pure func render[T](value: First[T]) -> String:
+		|		"first"
+		|
+		|implements Renderable for Second[T]:
+		|	pure func render[T](value: Second[T]) -> String:
+		|		"second"
+	indexed ?= indexed_graph_build(fixture_module_load_candidate(source), []).to_option()
+	bound ?= bound_module_graph_build(indexed, [], accept_empty_view).to_option()
+	skeletons ?= declaration_skeleton_graph_build(bound).to_option()
+	aliases ?= type_alias_dependency_graph_validate(skeletons).to_option()
+	parameters ?= resolved_type_parameter_graph_build(aliases).to_option()
+	type_headers ?= type_header_graph_build(parameters).to_option()
+	topology ?= trait_topology_graph_build(type_headers).to_option()
+	callables ?= callable_header_graph_build(topology).to_option()
+
+	shadow_message: String = (
+		"implementation method 'render' redeclares implementation type parameter 'T'; "
+		+ "remove it from the method's type parameter list because implementation "
+		+ "parameters are already in scope"
+	)
+	missing_message: String = "implementation of 'Renderable' is missing required method 'render'"
+
+	match implementation_header_graph_build(callables):
+		Ok(_):
+			Some(False)
+		Err(errors):
+			messages = errors.map(implementation_header_graph_error_message)
+
+			match (errors.get(0), errors.get(2)):
+				(Some(first_shadow_error), Some(second_shadow_error)):
+					Some(
+						errors.length() == 4
+						and messages == [shadow_message, missing_message, shadow_message, missing_message]
+						and (
+							implementation_header_graph_error_span(first_shadow_error).start_line
+							< implementation_header_graph_error_span(second_shadow_error).start_line
+						)
+					)
+				_:
+					Some(False)
+
+
+pure func test_implementation_headers_preserve_error_order_across_implementations() -> Bool:
+	implementation_headers_preserve_error_order_across_implementations().get_or(False)
+
+
 tests: TestSuite = {
 	description = "Compiler implementation headers",
 	tests = [
@@ -394,6 +504,14 @@ tests: TestSuite = {
 		(
 			"method type parameters preserve first discovery order",
 			test_implementation_method_type_parameter_names_preserve_discovery_order,
+		),
+		(
+			"bucket methods by exact implementation identity",
+			test_implementation_headers_bucket_methods_by_exact_implementation,
+		),
+		(
+			"preserve error order across implementations",
+			test_implementation_headers_preserve_error_order_across_implementations,
 		),
 		(
 			"method type parameters preserve bounds and exclude owner parameters",
