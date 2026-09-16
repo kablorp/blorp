@@ -1,7 +1,10 @@
 import:
 	check/capture: capture_check_typecheck_request
 	check/command: execute_check_plan
-	compiler/command: execute_compile_command
+	compiler/command:
+		CompileCommandPreparation,
+		execute_prepared_compile_command,
+		prepare_compile_command,
 	compiler/runtime_source_provider: load_compiler_runtime_sources
 	compiler/stage_01_generated_inputs/compiler_build_info: VERSION_DESCRIPTION
 	format/command: FormatCommandResult, run_format_command
@@ -879,6 +882,54 @@ private func execute_internal_synthetic_build(host_args: List[String]) -> Option
 			None
 
 
+private union PreparedCliExecution:
+	PreparedCompileExecution(CompileCommandPreparation)
+	PreparedNonCompileExecution(CliRunPlan)
+
+
+private func prepare_cli_execution(plan: CliRunPlan) -> PreparedCliExecution:
+	match plan:
+		CliRunCompile(compile_plan):
+			PreparedCompileExecution(prepare_compile_command(compile_plan))
+		_:
+			PreparedNonCompileExecution(plan)
+
+
+private func execute_non_compile_plan(plan: CliRunPlan) -> Int:
+	match plan:
+		CliRunCheck(check_plan):
+			match check_plan.options.capture_typecheck_request:
+				Some(path):
+					run_handled_result(capture_check_typecheck_request(check_plan, path))
+				None:
+					run_handled_result(execute_check_plan(check_plan))
+		CliRunHandled(result):
+			run_handled_result(result)
+		CliRunCompile(_):
+			run_handled_result({
+				status = 1,
+				stdout = "",
+				stderr = "internal error: compile plan crossed the prepared command boundary"
+			})
+		CliRunSource(run_plan):
+			match run_effect_configuration(run_plan_uses_raylib(run_plan)):
+				Err(message):
+					print_error(message)
+					1
+				Ok(configuration):
+					run_handled_result(execute_run_command(run_plan, configuration))
+		CliRunTest(test_plan):
+			execute_test_command(test_plan, load_compiler_runtime_sources)
+		CliRunPurify(purify_plan):
+			run_handled_result(execute_purify_plan(purify_plan))
+		CliRunLint(lint_plan):
+			run_handled_result(execute_lint_plan(lint_plan))
+		CliRunLsp:
+			run_native_lsp_server()
+		CliRunPackage(package_plan):
+			run_handled_result(execute_package_plan(package_plan))
+
+
 func main(args: List[String]) -> Int:
 	host_args: List[String] = args.drop(1)
 
@@ -886,36 +937,13 @@ func main(args: List[String]) -> Int:
 		Some(status):
 			status
 		None:
-			match run_cli(host_args):
-				CliRunCheck(check_plan):
-					match check_plan.options.capture_typecheck_request:
-						Some(path):
-							run_handled_result(capture_check_typecheck_request(check_plan, path))
-						None:
-							run_handled_result(execute_check_plan(check_plan))
-				CliRunHandled(result):
-					run_handled_result(result)
-				CliRunCompile(compile_plan):
+			match prepare_cli_execution(run_cli(host_args)):
+				PreparedCompileExecution(preparation):
 					run_handled_result(
-						execute_compile_command(
-							compile_plan,
+						execute_prepared_compile_command(
+							preparation,
 							load_compiler_runtime_sources(),
 						),
 					)
-				CliRunSource(run_plan):
-					match run_effect_configuration(run_plan_uses_raylib(run_plan)):
-						Err(message):
-							print_error(message)
-							1
-						Ok(configuration):
-							run_handled_result(execute_run_command(run_plan, configuration))
-				CliRunTest(test_plan):
-					execute_test_command(test_plan, load_compiler_runtime_sources)
-				CliRunPurify(purify_plan):
-					run_handled_result(execute_purify_plan(purify_plan))
-				CliRunLint(lint_plan):
-					run_handled_result(execute_lint_plan(lint_plan))
-				CliRunLsp:
-					run_native_lsp_server()
-				CliRunPackage(package_plan):
-					run_handled_result(execute_package_plan(package_plan))
+				PreparedNonCompileExecution(plan):
+					execute_non_compile_plan(plan)

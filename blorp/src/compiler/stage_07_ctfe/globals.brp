@@ -3,6 +3,7 @@
 -- Immutable top-level initializers are evaluated in source order into the
 -- CTFE global environment. Mutable top-level `var` bindings run at runtime.
 import:
+	../stage_03_parse/parsed_ast: ParsedExpr
 	../stage_04_modules/module_table:
 		ModuleId,
 		ModuleTable,
@@ -18,6 +19,7 @@ import:
 		definition_table_module_table,
 		definition_table_selective_definition_name,
 		definition_tables_share_provenance,
+	../stage_06_typecheck/infer: TypedExpr
 	context:
 		CtfeContext,
 		CtfeImportBinding(
@@ -102,6 +104,23 @@ private record CtfeGlobalGraphEvaluationState {
 
 
 opaque type CtfeEvaluatedGlobalGraph = CtfeEvaluatedGlobalGraphRep
+
+
+record CtfeGlobalInitializerReplacement {
+	parsed_value: ParsedExpr,
+	typed_value: TypedExpr
+}
+
+
+private record CtfeGlobalReplacementsRep {
+	definition_table: Option[DefinitionTable],
+	by_definition_id: Dict[Int, CtfeGlobalInitializerReplacement]
+}
+
+
+-- CTFE changes only immutable global initializers. Retain those changes by the
+-- graph-issued definition identity instead of retaining a second TypedProgram.
+opaque type CtfeGlobalReplacements = CtfeGlobalReplacementsRep
 
 
 private record CtfeRewriteDeclResult {
@@ -428,6 +447,46 @@ pure func ctfe_evaluated_global_graph_metrics(
 	graph: CtfeEvaluatedGlobalGraph,
 ) -> CtfeEvaluatedGlobalGraphMetrics:
 	from_opaque CtfeEvaluatedGlobalGraph(graph).metrics
+
+
+pure func ctfe_global_replacements_empty() -> CtfeGlobalReplacements:
+	into_opaque CtfeGlobalReplacements({
+		definition_table = None,
+		by_definition_id = {}
+	})
+
+
+pure func ctfe_global_replacements_for_definition_table(
+	definition_table: DefinitionTable,
+) -> CtfeGlobalReplacements:
+	into_opaque CtfeGlobalReplacements({
+		definition_table = Some(definition_table),
+		by_definition_id = {}
+	})
+
+
+pure func ctfe_global_replacements_are_compatible(
+	replacements: CtfeGlobalReplacements,
+	definition_table: DefinitionTable,
+) -> Bool:
+	rep = from_opaque CtfeGlobalReplacements(replacements)
+
+	match rep.definition_table:
+		Some(owner):
+			definition_tables_share_provenance(owner, definition_table)
+		None:
+			rep.by_definition_id.is_empty()
+
+
+pure func ctfe_global_replacements_count(replacements: CtfeGlobalReplacements) -> Int:
+	from_opaque CtfeGlobalReplacements(replacements).by_definition_id.length()
+
+
+pure func ctfe_global_replacements_find(
+	replacements: CtfeGlobalReplacements,
+	definition_id: Int,
+) -> Option[CtfeGlobalInitializerReplacement]:
+	from_opaque CtfeGlobalReplacements(replacements).by_definition_id.get(definition_id)
 
 
 private pure func ctfe_rejected_global_graph_state(
@@ -911,6 +970,42 @@ pure func ctfe_rewrite_program_globals_with_evaluated_dependencies(
 			ctfe_rewrite_program_globals_with_import_bindings(context, import_bindings, program)
 
 
+pure func ctfe_rewrite_program_global_replacements_with_evaluated_dependencies(
+	graph: CtfeEvaluatedGlobalGraph,
+	target_module_id: ModuleId,
+	program: TypedProgram,
+	imported_program_set: CtfeImportedProgramSet,
+	import_bindings: List[CtfeImportBinding],
+) -> Result[CtfeGlobalReplacements, CtfeEvalError]:
+	rep = from_opaque CtfeEvaluatedGlobalGraph(graph)
+	imported_programs = ctfe_imported_program_set_programs(imported_program_set)
+
+	match ctfe_context_from_program(
+		rep.definition_table,
+		target_module_id,
+		program,
+		import_bindings,
+		imported_program_set,
+	):
+		None:
+			Err(
+				CtfeEvalInvalid(
+					"CTFE inputs do not belong to one definition and module identity domain",
+				),
+			)
+		Some(base_context):
+			context ?= ctfe_context_with_evaluated_dependency_globals(
+				base_context,
+				graph,
+				imported_programs,
+			)
+			ctfe_rewrite_program_global_replacements_with_import_bindings(
+				context,
+				import_bindings,
+				program,
+			)
+
+
 pure func ctfe_eval_imported_program_global_envs(
 	context: CtfeContext,
 	imported_program_set: CtfeImportedProgramSet,
@@ -1031,12 +1126,135 @@ pure func ctfe_rewrite_program_globals(
 			Ok({ program | decls = decls })
 
 
+private pure func ctfe_replacement_info_from_decl(decl: TypedDecl) -> Option[TypedGlobalVarInfo]:
+	match decl:
+		TypedGlobalVarDecl(info):
+			Some(info)
+		TypedPrivateDecl(inner):
+			ctfe_replacement_info_from_decl(inner)
+		_:
+			None
+
+
+private pure func ctfe_insert_global_replacement(
+	replacements: CtfeGlobalReplacements,
+	info: TypedGlobalVarInfo,
+) -> Result[CtfeGlobalReplacements, CtfeEvalError]:
+	match info.definition_id:
+		None:
+			Err(
+				CtfeEvalInvalid(
+					"compile-time global replacement is missing its definition identity",
+				),
+			)
+		Some(definition_id):
+			rep = from_opaque CtfeGlobalReplacements(replacements)
+			Ok(into_opaque CtfeGlobalReplacements({
+				definition_table = rep.definition_table,
+				by_definition_id = rep.by_definition_id.set(definition_id, {
+					parsed_value = info.decl.value,
+					typed_value = info.value
+				})
+			}))
+
+
+pure func ctfe_rewrite_program_global_replacements(
+	context: CtfeContext,
+	base_env: CtfeEnv,
+	program: TypedProgram,
+) -> Result[CtfeGlobalReplacements, CtfeEvalError]:
+	var env = ctfe_bind_unavailable_program_globals(base_env, program)
+	var replacements = ctfe_global_replacements_for_definition_table(context.definition_table)
+	var failure: Option[CtfeEvalError] = None
+
+	for decl in program.decls:
+		if failure.is_none():
+			match ctfe_rewrite_decl_globals(context, env, decl):
+				Err(error):
+					failure = Some(error)
+				Ok(result):
+					env = result.env
+
+					match ctfe_global_decl_from_typed_decl(decl):
+						Some(global_decl):
+							if not ctfe_global_initializer_runs_at_runtime(global_decl.info):
+								match ctfe_replacement_info_from_decl(result.decl):
+									Some(info):
+										match ctfe_insert_global_replacement(replacements, info):
+											Ok(updated):
+												replacements = updated
+											Err(error):
+												failure = Some(error)
+									None:
+										failure = Some(CtfeEvalInvalid(
+											"compile-time global replacement lost its declaration",
+										))
+						None:
+							void
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(replacements)
+
+
+private pure func ctfe_apply_global_replacement_to_decl(
+	decl: TypedDecl,
+	replacements: CtfeGlobalReplacements,
+) -> TypedDecl:
+	match decl:
+		TypedGlobalVarDecl(info):
+			match info.definition_id:
+				None:
+					decl
+				Some(definition_id):
+					match ctfe_global_replacements_find(replacements, definition_id):
+						Some(replacement):
+							TypedGlobalVarDecl({ info |
+								decl = { info.decl | value = replacement.parsed_value },
+								value = replacement.typed_value
+							})
+						None:
+							decl
+		TypedPrivateDecl(inner):
+			TypedPrivateDecl(ctfe_apply_global_replacement_to_decl(inner, replacements))
+		_:
+			decl
+
+
+pure func ctfe_apply_global_replacements(
+	program: TypedProgram,
+	replacements: CtfeGlobalReplacements,
+) -> TypedProgram:
+	if ctfe_global_replacements_count(replacements) == 0:
+		program
+	else:
+		{ program |
+			decls = program.decls.map(
+				func(decl): ctfe_apply_global_replacement_to_decl(decl, replacements),
+			)
+		}
+
+
 pure func ctfe_rewrite_program_globals_with_import_bindings(
 	context: CtfeContext,
 	import_bindings: List[CtfeImportBinding],
 	program: TypedProgram,
 ) -> Result[TypedProgram, CtfeEvalError]:
 	ctfe_rewrite_program_globals(
+		context,
+		ctfe_imported_global_env(context, import_bindings),
+		program,
+	)
+
+
+pure func ctfe_rewrite_program_global_replacements_with_import_bindings(
+	context: CtfeContext,
+	import_bindings: List[CtfeImportBinding],
+	program: TypedProgram,
+) -> Result[CtfeGlobalReplacements, CtfeEvalError]:
+	ctfe_rewrite_program_global_replacements(
 		context,
 		ctfe_imported_global_env(context, import_bindings),
 		program,
@@ -1056,6 +1274,27 @@ pure func ctfe_evaluate_program_globals(
 		imported_program_set,
 	)
 	ctfe_rewrite_program_globals_with_evaluated_dependencies(
+		graph,
+		target_module_id,
+		program,
+		imported_program_set,
+		import_bindings,
+	)
+
+
+pure func ctfe_evaluate_program_global_replacements(
+	definition_table: DefinitionTable,
+	target_module_id: ModuleId,
+	program: TypedProgram,
+	imported_program_set: CtfeImportedProgramSet,
+	import_bindings: List[CtfeImportBinding],
+) -> Result[CtfeGlobalReplacements, CtfeEvalError]:
+	graph ?= ctfe_evaluate_dependency_global_graph(
+		definition_table,
+		target_module_id,
+		imported_program_set,
+	)
+	ctfe_rewrite_program_global_replacements_with_evaluated_dependencies(
 		graph,
 		target_module_id,
 		program,

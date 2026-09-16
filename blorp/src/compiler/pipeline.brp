@@ -52,6 +52,7 @@ import:
 		typecheck_graph,
 		typechecked_module_name,
 		typechecked_module_path,
+		typechecked_module_program_with_ctfe_replacements,
 	stage_06_typecheck/decl: TypedDecl(TypedForeignFunctionDecl, TypedPrivateDecl), TypedProgram
 	stage_06_typecheck/frontend_graph_typecheck:
 		FrontendTypecheckRequestError,
@@ -69,12 +70,13 @@ import:
 			StandaloneQualifiedModuleBinding,
 			StandaloneSelectiveDefinitionBinding,
 		),
+	stage_07_ctfe/globals: CtfeGlobalReplacements
 	stage_08_core_lower/graph_prepare:
 		CoreGraphModules,
 		CoreGraphUnit,
 		core_graph_modules,
 		core_graph_prepare_error_to_string,
-		prepare_core_graph,
+		prepare_core_graph_with_ctfe_replacements,
 	stage_09_core/early_pipeline:
 		CoreEarlyPipelineConfiguration,
 		CoreEarlyPipelineDiagnostic,
@@ -473,6 +475,7 @@ private record CoreLoweringInput {
 	definition_table: DefinitionTable,
 	target_module_id: ModuleId,
 	target_program: TypedProgram,
+	target_ctfe_replacements: CtfeGlobalReplacements,
 	modules: CoreGraphModules,
 	target_import_bindings: List[CoreResolveImportBinding],
 	module_imports: List[CoreResolveModuleImports],
@@ -480,6 +483,20 @@ private record CoreLoweringInput {
 	typed_summary: Option[String],
 	next_def_id: Int
 }
+
+
+private record PreparedCoreLoweringRequestRep {
+	input: CoreLoweringInput,
+	require_main: Bool,
+	check_invariants: Bool,
+	early_configuration: CoreEarlyPipelineConfiguration
+}
+
+
+-- The accepted input to Core lowering deliberately cannot reach the broad
+-- TypecheckedGraph. Constructing this value is the successful compile path's
+-- last use of frontend-only recovery and analysis state.
+opaque type PreparedCoreLoweringRequest = PreparedCoreLoweringRequestRep
 
 
 private pure func core_resolve_import_binding(
@@ -540,8 +557,16 @@ private pure func core_resolve_import_bindings(
 private pure func core_graph_unit(module: TypecheckedModule) -> CoreGraphUnit:
 	{
 		module_id = module.module_id,
-		typed_program = module.typed_program
+		typed_program = codegen_typed_program(module.typed_program),
+		ctfe_replacements = module.ctfe_replacements
 	}
+
+
+-- Source text is a frontend/diagnostic owner. Core consumes the typed tree,
+-- canonical module name, and compact SourceSpan coordinates, but never reads
+-- TypedProgram.source.text. Clear that last broad string at codegen admission.
+private pure func codegen_typed_program(program: TypedProgram) -> TypedProgram:
+	{ program | source = { program.source | text = "" } }
 
 
 private pure func core_resolve_module_imports(
@@ -778,7 +803,9 @@ func run_typed_frontend_compilation(
 							Err(validation_errors)
 						else:
 							typed_summary: Option[String] = if policy.include_typed_summary:
-								Some(typed_program_summary(typechecked.target.typed_program))
+								Some(typed_program_summary(
+									typechecked_module_program_with_ctfe_replacements(typechecked.target),
+								))
 							else:
 								None
 
@@ -819,7 +846,8 @@ func compile_frontend_graph_with_typed_validation(
 		early_observations,
 		early_stop,
 	)
-	lowered ?= lower_typed_frontend_compilation(typed)
+	request ?= prepare_core_lowering_request(typed)
+	lowered ?= lower_prepared_core_request(request)
 
 	match run_early_core_compilation(lowered):
 		EarlyCorePhaseFailed(errors):
@@ -885,7 +913,8 @@ private pure func core_lowering_input(
 		target_module_name = typechecked_module_name(typechecked.target),
 		definition_table = typechecked.definition_table,
 		target_module_id = typechecked.target.module_id,
-		target_program = typechecked.target.typed_program,
+		target_program = codegen_typed_program(typechecked.target.typed_program),
+		target_ctfe_replacements = typechecked.target.ctfe_replacements,
 		modules = core_graph_modules(
 			typechecked.definition_table,
 			typechecked.modules.map(core_graph_unit),
@@ -898,18 +927,41 @@ private pure func core_lowering_input(
 	})
 
 
-pure func lower_typed_frontend_compilation(
+pure func prepare_core_lowering_request(
 	typed: TypedFrontendCompilation,
-) -> Result[LoweredCoreCompilation, List[String]]:
+) -> Result[PreparedCoreLoweringRequest, List[String]]:
 	representation: TypedFrontendCompilationRep = from_opaque TypedFrontendCompilation(typed)
 	input ?= core_lowering_input(
 		representation.typechecked,
 		representation.typed_summary,
 	).to_result(["internal compiler error: qualified import target is outside its ModuleTable"])
-	prepared = prepare_core_graph(
+	early_configuration: CoreEarlyPipelineConfiguration = {
+		debug = representation.policy.retain_debug_blocks,
+		check_invariants = representation.check_invariants,
+		observations = representation.early_observations,
+		stop_after = representation.early_stop
+	}
+
+	Ok(into_opaque PreparedCoreLoweringRequest({
+			input = input,
+			require_main = representation.require_main,
+			check_invariants = representation.check_invariants,
+			early_configuration = early_configuration
+		}))
+
+
+pure func lower_prepared_core_request(
+	request: PreparedCoreLoweringRequest,
+) -> Result[LoweredCoreCompilation, List[String]]:
+	representation: PreparedCoreLoweringRequestRep = from_opaque PreparedCoreLoweringRequest(
+		request
+	)
+	input = representation.input
+	prepared = prepare_core_graph_with_ctfe_replacements(
 		input.definition_table,
 		input.target_module_id,
 		input.target_program,
+		input.target_ctfe_replacements,
 		input.modules,
 		input.next_def_id,
 	)
@@ -920,12 +972,6 @@ pure func lower_typed_frontend_compilation(
 		Err(error):
 			Err([core_graph_prepare_error_to_string(error)])
 
-	early_configuration: CoreEarlyPipelineConfiguration = {
-		debug = representation.policy.retain_debug_blocks,
-		check_invariants = representation.check_invariants,
-		observations = representation.early_observations,
-		stop_after = representation.early_stop
-	}
 	early_input: CoreEarlyPipelineInput = {
 		program = prepared_graph.program,
 		next_def_id = prepared_graph.next_def_id
@@ -940,7 +986,7 @@ pure func lower_typed_frontend_compilation(
 				typed_summary = input.typed_summary,
 				require_main = representation.require_main,
 				check_invariants = representation.check_invariants,
-				early_configuration = early_configuration,
+				early_configuration = representation.early_configuration,
 				early_input = early_input
 			}))
 
@@ -1081,9 +1127,10 @@ pure func compile_typechecked_graph(
 			require_main = require_main,
 			check_invariants = check_invariants,
 			early_observations = early_observations,
-			early_stop = early_stop
-		})
-	lowered ?= lower_typed_frontend_compilation(typed)
+		early_stop = early_stop
+	})
+	request ?= prepare_core_lowering_request(typed)
+	lowered ?= lower_prepared_core_request(request)
 
 	match run_early_core_compilation(lowered):
 		EarlyCorePhaseFailed(errors):

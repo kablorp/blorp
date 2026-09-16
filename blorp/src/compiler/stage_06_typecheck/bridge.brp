@@ -117,10 +117,15 @@ import:
 	../stage_07_ctfe/eval: CtfeEvalError, ctfe_eval_error_message
 	../stage_07_ctfe/globals:
 		CtfeEvaluatedGlobalGraph,
+		CtfeGlobalReplacements,
+		ctfe_apply_global_replacements,
 		ctfe_evaluate_dependency_global_graph,
-		ctfe_evaluate_program_globals,
+		ctfe_evaluate_program_global_replacements,
 		ctfe_evaluated_global_graph_metrics,
-		ctfe_rewrite_program_globals_with_evaluated_dependencies,
+		ctfe_global_replacements_count,
+		ctfe_global_replacements_empty,
+		ctfe_global_replacements_for_definition_table,
+		ctfe_rewrite_program_global_replacements_with_evaluated_dependencies,
 	decl:
 		AcceptedTypecheckGraph,
 		AcceptedTypecheckModule,
@@ -1003,8 +1008,8 @@ record TypecheckedModule {
 	module_id: ModuleId,
 	parsed_program: ParsedProgram,
 	module_surface: ModuleSurface,
-	semantic_program: TypedProgram,
 	typed_program: TypedProgram,
+	ctfe_replacements: CtfeGlobalReplacements,
 	errors: List[String],
 	diagnostics: List[TypecheckDiagnostic],
 	import_bindings: List[ImportBinding],
@@ -1018,6 +1023,15 @@ pure func typechecked_module_path(module: TypecheckedModule) -> String:
 
 pure func typechecked_module_name(module: TypecheckedModule) -> String:
 	module.parsed_program.source.module_name
+
+
+-- Materialize the historical evaluated view only for consumers that require a
+-- complete program (for example JSON output). Core consumes the sparse table
+-- directly and does not retain this projection.
+pure func typechecked_module_program_with_ctfe_replacements(
+	module: TypecheckedModule,
+) -> TypedProgram:
+	ctfe_apply_global_replacements(module.typed_program, module.ctfe_replacements)
 
 
 pure func typechecked_module_identity(
@@ -1094,8 +1108,8 @@ private enum TypecheckCtfeStatus:
 
 
 private record TypecheckCtfeArtifact {
-	semantic_program: TypedProgram,
 	program: TypedProgram,
+	replacements: CtfeGlobalReplacements,
 	errors: List[String],
 	diagnostics: List[TypecheckDiagnostic],
 	import_bindings: List[ImportBinding],
@@ -3044,8 +3058,8 @@ private pure func evaluated_typecheck_artifact(
 ) -> TypecheckCtfeArtifact:
 	if errors.length() != 0:
 		{
-			semantic_program = program,
 			program = program,
+			replacements = ctfe_global_replacements_for_definition_table(definition_table),
 			errors = errors,
 			diagnostics = diagnostics,
 			import_bindings = import_bindings,
@@ -3053,8 +3067,8 @@ private pure func evaluated_typecheck_artifact(
 		}
 	else if not typed_program_has_ctfe_globals(program):
 		{
-			semantic_program = program,
 			program = program,
+			replacements = ctfe_global_replacements_for_definition_table(definition_table),
 			errors = errors,
 			diagnostics = diagnostics,
 			import_bindings = import_bindings,
@@ -3077,7 +3091,7 @@ private pure func evaluated_typecheck_artifact(
 			(Some(program_set), Some(ctfe_import_bindings)):
 				evaluation = match evaluated_globals:
 					Some(graph):
-						ctfe_rewrite_program_globals_with_evaluated_dependencies(
+						ctfe_rewrite_program_global_replacements_with_evaluated_dependencies(
 							graph,
 							target_module_id,
 							program,
@@ -3085,7 +3099,7 @@ private pure func evaluated_typecheck_artifact(
 							ctfe_import_bindings,
 						)
 					None:
-						ctfe_evaluate_program_globals(
+						ctfe_evaluate_program_global_replacements(
 							definition_table,
 							target_module_id,
 							program,
@@ -3094,10 +3108,10 @@ private pure func evaluated_typecheck_artifact(
 						)
 
 				match evaluation:
-					Ok(evaluated_program):
+					Ok(replacements):
 						{
-							semantic_program = program,
-							program = evaluated_program,
+							program = program,
+							replacements = replacements,
 							errors = errors,
 							diagnostics = diagnostics,
 							import_bindings = import_bindings,
@@ -3106,8 +3120,10 @@ private pure func evaluated_typecheck_artifact(
 					Err(error):
 						message = ctfe_eval_error_message(error)
 						{
-							semantic_program = program,
 							program = program,
+							replacements = ctfe_global_replacements_for_definition_table(
+								definition_table,
+							),
 							status = TypecheckCtfeNotRun,
 							errors = errors.append(message),
 							diagnostics = diagnostics.append(typecheck_diagnostic(message, None)),
@@ -3116,8 +3132,10 @@ private pure func evaluated_typecheck_artifact(
 			_:
 				message = "compile-time evaluation could not resolve all imported modules"
 				{
-					semantic_program = program,
 					program = program,
+					replacements = ctfe_global_replacements_for_definition_table(
+						definition_table,
+					),
 					errors = errors.append(message),
 					diagnostics = diagnostics.append(typecheck_diagnostic(message, None)),
 					import_bindings = import_bindings,
@@ -3153,8 +3171,8 @@ private pure func typechecked_module_from_ctfe_artifact(
 		module_id = prepared_module_scope_id(scope),
 		parsed_program = prepared_module_program(prepared),
 		module_surface = module_surface,
-		semantic_program = ctfe_artifact.semantic_program,
 		typed_program = ctfe_artifact.program,
+		ctfe_replacements = ctfe_artifact.replacements,
 		errors = ctfe_artifact.errors,
 		diagnostics = ctfe_artifact.diagnostics,
 		import_bindings = ctfe_artifact.import_bindings,
@@ -3462,11 +3480,12 @@ private pure func typechecked_module_artifact(
 	definition_table: DefinitionTable,
 	include_comments: Bool,
 ) -> JsonValue:
+	codegen_program = typechecked_module_program_with_ctfe_replacements(module)
 	typed_program_json = typed_program_to_json_in_graph(
 		module.module_id,
 		module_table,
 		definition_table,
-		module.typed_program,
+		codegen_program,
 	)
 
 	var fields: List[(String, JsonValue)] = [
@@ -3571,6 +3590,7 @@ private func emit_typechecked_module_artifact_chunks(
 	include_comments: Bool,
 	emit: (String) -> Void,
 ) -> Void:
+	codegen_program = typechecked_module_program_with_ctfe_replacements(module)
 	emit("{\"path\":")
 	emit_json_chunks(JsonString(module.parsed_program.source.path), emit)
 	emit(",\"module\":")
@@ -3582,7 +3602,7 @@ private func emit_typechecked_module_artifact_chunks(
 		module.module_id,
 		module_table,
 		definition_table,
-		module.typed_program,
+		codegen_program,
 		emit,
 	)
 	emit(",\"ctfe_status\":")
@@ -3623,8 +3643,8 @@ private pure func typechecked_rejected_module_with_id(
 		module_id = module_id,
 		parsed_program = program,
 		module_surface = module_surface_for_program(program),
-		semantic_program = typed_program,
 		typed_program = typed_program,
+		ctfe_replacements = ctfe_global_replacements_empty(),
 		errors = diagnostics.map(func(diagnostic): diagnostic.message),
 		diagnostics = diagnostics,
 		import_bindings = [],
@@ -4864,7 +4884,9 @@ private func emit_typechecked_graph_module_response(
 			"artifact",
 			"module=" + typecheck_inventory_field(
 				module_path,
-			) + " source_bytes=" + counts.source_bytes.to_string() + " typed_decls=" + counts.typed_decls.to_string() + " typed_expr_nodes=" + counts.typed_expr_nodes.to_string() + " retained_ctfe_dependencies=" + prepared.context.ctfe_dependencies
+			) + " source_bytes=" + counts.source_bytes.to_string() + " typed_decls=" + counts.typed_decls.to_string() + " typed_expr_nodes=" + counts.typed_expr_nodes.to_string() + " ctfe_replacements=" + ctfe_global_replacements_count(
+				typechecked.ctfe_replacements,
+			).to_string() + " retained_ctfe_dependencies=" + prepared.context.ctfe_dependencies
 				.length()
 				.to_string() + " duplicates_retained_ctfe=" + duplicates_retained_ctfe.to_string() + " reuses_retained_ctfe=" + reuses_retained_ctfe.to_string(),
 		)

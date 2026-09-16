@@ -20,22 +20,30 @@ The frontend serves commands with different correctness and recovery needs:
 - Core lowering requires only accepted typed declarations, exact import
   bindings, includes, identity allocation state, and selected summaries.
 
-Current production behavior, verified on 2026-09-15:
+Current production behavior, verified on 2026-09-15 after Roadmap Step 7B:
 
 - `TypecheckedModule` in `stage_06_typecheck/bridge.brp` stores parsed source,
-  module surface, `semantic_program`, CTFE-rewritten `typed_program`, errors,
-  diagnostics, import bindings, and `ctfe_evaluated: Bool`.
+  module surface, one source-faithful `typed_program`, sparse CTFE initializer
+  replacements keyed by definition ID, errors, diagnostics, import bindings,
+  and `ctfe_evaluated: Bool`.
 - `TypecheckedGraph` stores target/modules, `next_def_id`, and optional analysis
   context.
-- lint and LSP consume `semantic_program`; compilation consumes
-  `typed_program`.
-- private `core_lowering_input` projects a successful rich graph into
-  `CoreLoweringInput`, but `lower_typed_frontend_compilation` retains the
-  `TypedFrontendCompilation` representation while `prepare_core_graph` runs
-  and reads its policy afterward. The narrower read shape exists; early
-  release of the rich owner is not yet proved.
-- `CoreGraphUnit` and `prepare_core_graph` still accept raw `TypedProgram`
-  values, so the Core boundary does not encode semantic acceptance.
+- lint and LSP consume the source-faithful `typed_program`; compilation passes
+  that program and its replacement table to Core lowering. Typed JSON and
+  summary output materialize the historical evaluated view only on demand.
+- `prepare_core_lowering_request` is the last reader of the rich
+  `TypedFrontendCompilation` and returns opaque `PreparedCoreLoweringRequest`.
+  The command and top-level CLI also transition to narrow preparation variants,
+  so no caller frame retains `CliCompilePlan` or `TypecheckedGraph` while Core
+  runs. `core_lowering_input_ready` measures that production release boundary.
+- codegen admission clears `TypedProgram.source.text`; Core retains the
+  canonical module name, paths and compact span coordinates but cannot reach
+  the source file contents. Check, lint and LSP keep their separate
+  source-oriented products.
+- `CoreGraphUnit` and the production
+  `prepare_core_graph_with_ctfe_replacements` path still accept raw
+  `TypedProgram` values, so the Core boundary does not encode semantic
+  acceptance even though it no longer needs a second complete program.
 - `TypedParsedDecl(ParsedDecl)` is a broad catch-all. Core intentionally treats
   only import blocks and builtin type declarations as compile-time-only and
   rejects other parsed declarations.
@@ -83,7 +91,7 @@ This causes:
 
 1. Core accepting a raw typed program without a type-enforced acceptance proof;
 2. tools and compilation retaining fields they do not need;
-3. duplicated full typed programs after CTFE;
+3. ~~duplicated full typed programs after CTFE;~~ completed by Step 7A;
 4. status fields whose valid combinations are conventional rather than
    representable by variants;
 5. bridge code owning semantic assembly and reconstruction; and
@@ -105,11 +113,11 @@ This causes:
 ## Expected Performance And Cleanup Impact
 
 This phase is expected to deliver its largest benefit in **peak memory and
-retained object count**, not raw type inference speed. The current
-`TypecheckedModule` structurally retains both a source-faithful
-`semantic_program` and a CTFE-rewritten `typed_program`, plus parsed/module,
-diagnostic, import, and status data. The amount of structural sharing between
-those programs varies, so no fixed “two times” memory claim is justified.
+retained object count**, not raw type inference speed. Before Step 7A,
+`TypecheckedModule` structurally retained both a source-faithful
+`semantic_program` and a CTFE-rewritten `typed_program`. Step 7A deleted that
+dual owner. The remaining opportunity is releasing parsed/module, diagnostic,
+import, status, and other recovery-only data before Core.
 
 The direct optimization mechanisms are:
 
@@ -137,8 +145,8 @@ This phase enables:
 - stable sparse CTFE replacement caches; and
 - Core/backend execution without retaining frontend recovery structures.
 
-Expected cleanup includes dual complete typed programs, `ctfe_evaluated` and
-coupled status/options, broad graph accessors, repeated completeness scans, raw
+Step 7A completed the dual-program cleanup. Remaining cleanup includes
+`ctfe_evaluated` and coupled status/options, broad graph accessors, repeated completeness scans, raw
 `TypedProgram` Core entry points, and semantic fallback through parsed
 declarations. Success requires before/after retained typed-node/object counts
 at each compiler memory checkpoint, no overlapping old/new graph peak, fewer
@@ -211,7 +219,7 @@ parser-recovery declarations.
 Trace every construction and consumer of:
 
 - `TypecheckedModule` and `TypecheckedGraph`;
-- `semantic_program` and `typed_program`;
+- the source-faithful `typed_program` and sparse CTFE replacement table;
 - CTFE status/error fields;
 - `CoreGraphUnit` and `prepare_core_graph`;
 - CLI graph validation and projection;
@@ -254,16 +262,16 @@ Required invariants:
 - source provenance is retained without being rematched for semantic facts; and
 - rejected artifacts cannot be projected as accepted by convenience accessors.
 
-### 5. Replace Parallel Complete Typed Programs
+### 5. Replace Parallel Complete Typed Programs — Complete
 
-Keep one authoritative source-faithful body artifact. Attach CTFE results by
-exact global/definition identity and apply them while building the codegen
-projection, or store a sparse replacement map consumed by Core lowering.
-
-Measure this design against the current `semantic_program` plus
-CTFE-rewritten `typed_program` representation. Do not retain both complete
-programs unless data shows the sparse/projection approach is worse enough to
-justify the memory and complexity.
+Production now keeps one authoritative source-faithful typed program and a
+sparse map whose rows contain only parsed and typed initializer payloads keyed
+by exact definition ID. Core lowering consumes a row while lowering its owning
+global and never materializes another `TypedProgram`. JSON and summary adapters
+may construct a transient evaluated projection because their output contract
+requires the complete view. See the
+[Step 7A completion packet](../compiler-performance/146-step7a-keyed-ctfe-replacements.md)
+for tests and measurements.
 
 ### 6. Refine To `CodegenReadyGraph`
 

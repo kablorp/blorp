@@ -181,6 +181,10 @@ import:
 		typed_expr_info_value_type,
 		typed_expr_value_type,
 		typed_with_binding_is_try,
+	../stage_07_ctfe/globals:
+		CtfeGlobalReplacements,
+		ctfe_global_replacements_empty,
+		ctfe_global_replacements_find,
 	../stage_06_typecheck/type_system/language_surface_manifest: DeclaredAbiType, declared_abi_type
 	../stage_06_typecheck/type_system/semantic_type:
 		SemanticDimOp(SemanticDimAdd, SemanticDimDivide, SemanticDimMultiply, SemanticDimSubtract),
@@ -5418,6 +5422,7 @@ private pure func lower_typed_decl_with_visibility(
 	context: CoreLowerContext,
 	decl: TypedDecl,
 	is_private: Bool,
+	ctfe_replacements: CtfeGlobalReplacements,
 ) -> Result[CoreLowerDeclResult, CoreLowerError]:
 	match decl:
 		TypedFunctionDecl(info):
@@ -5425,9 +5430,18 @@ private pure func lower_typed_decl_with_visibility(
 		TypedForeignFunctionDecl(info):
 			lower_typed_foreign_function(context, info)
 		TypedGlobalVarDecl(info):
-			lower_typed_global(context, info, is_private)
+			lowered_info = match info.definition_id:
+				Some(definition_id):
+					match ctfe_global_replacements_find(ctfe_replacements, definition_id):
+						Some(replacement):
+							{ info | value = replacement.typed_value }
+						None:
+							info
+				None:
+					info
+			lower_typed_global(context, lowered_info, is_private)
 		TypedPrivateDecl(inner):
-			lower_typed_decl_with_visibility(context, inner, True)
+			lower_typed_decl_with_visibility(context, inner, True, ctfe_replacements)
 		TypedRecordDecl(info):
 			lower_typed_record(context, info)
 		TypedUnionDecl(info):
@@ -5446,7 +5460,7 @@ pure func lower_typed_decl(
 	context: CoreLowerContext,
 	decl: TypedDecl,
 ) -> Result[CoreLowerDeclResult, CoreLowerError]:
-	lower_typed_decl_with_visibility(context, decl, False)
+	lower_typed_decl_with_visibility(context, decl, False, ctfe_global_replacements_empty())
 
 
 -- Imports have already become explicit graph/import-table metadata, while
@@ -5471,9 +5485,10 @@ private pure func typed_decl_is_compile_time_only(decl: TypedDecl) -> Bool:
 			False
 
 
-pure func lower_typed_program(
+pure func lower_typed_program_with_ctfe_replacements(
 	context: CoreLowerContext,
 	program: TypedProgram,
+	ctfe_replacements: CtfeGlobalReplacements,
 ) -> Result[CoreLowerProgramResult, CoreLowerError]:
 	var current: CoreLowerContext = context
 	var decls: List[CoreDecl] = []
@@ -5493,7 +5508,7 @@ pure func lower_typed_program(
 					_:
 						void
 
-				match lower_typed_decl(current, decl):
+				match lower_typed_decl_with_visibility(current, decl, False, ctfe_replacements):
 					Ok(result):
 						current = result.context
 						decls = decls.append(result.decl)
@@ -5511,3 +5526,14 @@ pure func lower_typed_program(
 					foreign_includes = foreign_includes
 				},
 			})
+
+
+pure func lower_typed_program(
+	context: CoreLowerContext,
+	program: TypedProgram,
+) -> Result[CoreLowerProgramResult, CoreLowerError]:
+	lower_typed_program_with_ctfe_replacements(
+		context,
+		program,
+		ctfe_global_replacements_empty(),
+	)
