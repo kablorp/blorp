@@ -124,6 +124,7 @@ import:
 		CorePreClosureConcurrentBinding,
 		CoreProgram,
 		CoreRawMatchCase,
+		CoreRecordCowField,
 		CoreRecordFieldValue,
 		CoreSelectArm,
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
@@ -246,12 +247,65 @@ private record CoreTypeRewriteContext {
 }
 
 
+-- Allocation identity for the reuse rule the type rewrites below follow: a
+-- mapped child that is the same allocation as its input proves the input node
+-- can be handed back as is, so a module whose types need no rewriting stops
+-- reallocating its whole body behind itself. Core is immutable value data, so
+-- sharing subtrees between input and output is safe. Bound straight to the
+-- runtime primitive for the same bootstrap reason as the matching block in
+-- traverse.brp; delete the blocks together and import `memory: same_object`
+-- instead.
+foreign:
+	private pure func same_core_expr(left: CoreExpr, right: CoreExpr) -> Bool = "blorp_same_object"
+	private pure func same_core_record_cow_fields(
+		left: List[CoreRecordCowField],
+		right: List[CoreRecordCowField],
+	) -> Bool = "blorp_same_object"
+
+
+-- The type rewrites below answer `None` for "this value came back unchanged",
+-- so a caller keeps its own input instead of allocating an equal copy first.
+-- This maps a list with such a helper and answers `None` itself when no item
+-- changed, copying the untouched prefix only once an item actually changes.
+private pure func rewrite_list_items[T](
+	items: List[T],
+	rewrite_item: pure (T) -> Option[T],
+) -> Option[List[T]]:
+	var rewritten: List[T] = []
+	var changed: Bool = False
+	var index: Int = 0
+
+	for item in items:
+		match rewrite_item(item):
+			Some(rewritten_item):
+				rewritten = if changed:
+					rewritten.append(rewritten_item)
+				else:
+					items
+						.take(index)
+						.append(rewritten_item)
+
+				changed = True
+			None:
+				if changed:
+					rewritten = rewritten.append(item)
+				else:
+					void
+
+		index += 1
+
+	if changed:
+		Some(rewritten)
+	else:
+		None
+
+
 private union CoreTypeRewriteBindingFrame:
-	CoreTypeRewriteAssignFrame(CoreVar, CoreType, CoreSourceLoc)
-	CoreTypeRewriteLetRhsFrame(CoreVar, Bool, CoreType, CoreExpr)
-	CoreTypeRewriteLetBodyFrame(CoreVar, Bool, CoreType, CoreExpr)
-	CoreTypeRewriteBorrowLetRhsFrame(CoreVar, CoreType, CoreExpr)
-	CoreTypeRewriteBorrowLetBodyFrame(CoreVar, CoreType, CoreExpr)
+	CoreTypeRewriteAssignFrame(CoreExpr)
+	CoreTypeRewriteLetRhsFrame(CoreExpr)
+	CoreTypeRewriteLetBodyFrame(CoreExpr, CoreExpr)
+	CoreTypeRewriteBorrowLetRhsFrame(CoreExpr)
+	CoreTypeRewriteBorrowLetBodyFrame(CoreExpr, CoreExpr)
 
 
 private union CoreTypeRewriteBindingFrameStack:
@@ -265,8 +319,8 @@ private union CoreTypeRewriteBindingAction:
 
 
 private union CoreTypeRewriteLogicalFrame:
-	CoreTypeRewriteLogicalVisitRightFrame(CoreLogicalOp, CoreExpr, CoreType, CoreSourceLoc)
-	CoreTypeRewriteLogicalRebuildParentFrame(CoreLogicalOp, CoreExpr, CoreType, CoreSourceLoc)
+	CoreTypeRewriteLogicalVisitRightFrame(CoreExpr)
+	CoreTypeRewriteLogicalRebuildParentFrame(CoreExpr, CoreExpr)
 
 
 private union CoreTypeRewriteLogicalFrameStack:
@@ -280,11 +334,11 @@ private union CoreTypeRewriteLogicalAction:
 
 
 private union FlattenRewriteBindingFrame:
-	FlattenRewriteAssignFrame(CoreVar, CoreType, CoreSourceLoc)
-	FlattenRewriteLetRhsFrame(CoreVar, Bool, CoreType, CoreExpr, List[String])
-	FlattenRewriteLetBodyFrame(CoreVar, Bool, CoreType, CoreExpr)
-	FlattenRewriteBorrowLetRhsFrame(CoreVar, CoreType, CoreExpr, List[String])
-	FlattenRewriteBorrowLetBodyFrame(CoreVar, CoreType, CoreExpr)
+	FlattenRewriteAssignFrame(CoreExpr, Option[CoreVar])
+	FlattenRewriteLetRhsFrame(CoreExpr, List[String])
+	FlattenRewriteLetBodyFrame(CoreExpr, CoreExpr)
+	FlattenRewriteBorrowLetRhsFrame(CoreExpr, List[String])
+	FlattenRewriteBorrowLetBodyFrame(CoreExpr, CoreExpr)
 
 
 private union FlattenRewriteBindingFrameStack:
@@ -656,48 +710,50 @@ private pure func rewritten_global_name(
 	target
 
 
+-- `None` means this reference keeps the name and id it arrived with, which is
+-- the common case: only the module's own callables and globals are renamed.
 private pure func rewrite_var(
 	callable_rewrites: List[CallableRewrite],
 	global_rewrites: List[GlobalRewrite],
 	bound: List[String],
 	variable: CoreVar,
-) -> CoreVar:
+) -> Option[CoreVar]:
 	match variable.def_id:
 		Some(def_id):
-			rewritten: CoreVar = rewrite_var_with_id(callable_rewrites, variable, def_id)
+			rewritten: Option[CoreVar] = rewrite_var_with_id(callable_rewrites, variable, def_id)
 
-			if rewritten.name != variable.name or bound.contains(variable.name):
+			if rewritten.is_some() or bound.contains(variable.name):
 				rewritten
 			else:
 				rewrite_global_var(global_rewrites, variable)
 		None:
 			if bound.contains(variable.name):
-				variable
+				None
 			else:
 				rewrite_global_var(global_rewrites, variable)
 
 
-private pure func rewrite_global_var(rewrites: List[GlobalRewrite], variable: CoreVar) -> CoreVar:
-	match rewritten_global_name(rewrites, variable.name):
-		Some(target_name):
-			{ variable | name = target_name }
-		None:
-			variable
+private pure func rewrite_global_var(
+	rewrites: List[GlobalRewrite],
+	variable: CoreVar,
+) -> Option[CoreVar]:
+	rewritten_global_name(
+		rewrites,
+		variable.name,
+	).map(
+		func(target_name): { variable | name = target_name },
+	)
 
 
 private pure func rewrite_var_with_id(
 	rewrites: List[CallableRewrite],
 	variable: CoreVar,
 	def_id: Int,
-) -> CoreVar:
-	match find_callable_rewrite(rewrites, variable.name, def_id):
-		Some(rewrite):
-			{ variable |
-				name = rewrite.target_name,
-				def_id = Some(rewrite.target_def_id)
-			}
-		None:
-			variable
+) -> Option[CoreVar]:
+	find_callable_rewrite(rewrites, variable.name, def_id).map(func(rewrite): { variable |
+			name = rewrite.target_name,
+			def_id = Some(rewrite.target_def_id)
+		})
 
 
 private pure func rewrite_call_kind(
@@ -1185,14 +1241,14 @@ private pure func rewrite_non_binding_expr(
 		LiteralExpr(_, _, _):
 			expr
 		VarExpr(variable, typ, loc):
-			VarExpr(
-				rewrite_var(callable_rewrites, global_rewrites, bound, variable),
-				typ,
-				loc,
-			)
+			match rewrite_var(callable_rewrites, global_rewrites, bound, variable):
+				Some(rewritten):
+					VarExpr(rewritten, typ, loc)
+				None:
+					expr
 		AssignExpr(variable, rhs, typ, loc):
 			AssignExpr(
-				rewrite_var(callable_rewrites, global_rewrites, bound, variable),
+				rewrite_var(callable_rewrites, global_rewrites, bound, variable).get_or(variable),
 				rewrite_expr(callable_rewrites, global_rewrites, bound, rhs),
 				typ,
 				loc,
@@ -1208,11 +1264,11 @@ private pure func rewrite_non_binding_expr(
 		CallExpr(kind, callee, args, typ, loc):
 			rewritten_callee: CoreExpr = match (kind, callee):
 				(SelectedDirectCall(def_id), VarExpr(variable, callee_type, callee_loc)):
-					VarExpr(
-						rewrite_var_with_id(callable_rewrites, variable, def_id),
-						callee_type,
-						callee_loc,
-					)
+					match rewrite_var_with_id(callable_rewrites, variable, def_id):
+						Some(rewritten):
+							VarExpr(rewritten, callee_type, callee_loc)
+						None:
+							callee
 				_:
 					rewrite_expr(callable_rewrites, global_rewrites, bound, callee)
 
@@ -1670,39 +1726,33 @@ private pure func rewrite_expr(
 		match action:
 			FlattenRewriteVisitBindingExpr(current_bound, current):
 				match current:
-					AssignExpr(variable, rhs, typ, loc):
+					AssignExpr(variable, rhs, _, _):
 						frames = FlattenRewriteMoreBindingFrames(
 							FlattenRewriteAssignFrame(
+								current,
 								rewrite_var(
 									callable_rewrites,
 									global_rewrites,
 									current_bound,
 									variable,
 								),
-								typ,
-								loc,
 							),
 							frames,
 						)
 						action = FlattenRewriteVisitBindingExpr(current_bound, rhs)
-					LetExpr(variable, is_mutable, typ, rhs, body):
+					LetExpr(variable, _, _, rhs, _):
 						frames = FlattenRewriteMoreBindingFrames(
 							FlattenRewriteLetRhsFrame(
-								variable,
-								is_mutable,
-								typ,
-								body,
+								current,
 								bound_with_var(current_bound, variable),
 							),
 							frames,
 						)
 						action = FlattenRewriteVisitBindingExpr(current_bound, rhs)
-					BorrowLetExpr(variable, typ, rhs, body):
+					BorrowLetExpr(variable, _, rhs, _):
 						frames = FlattenRewriteMoreBindingFrames(
 							FlattenRewriteBorrowLetRhsFrame(
-								variable,
-								typ,
-								body,
+								current,
 								bound_with_var(current_bound, variable),
 							),
 							frames,
@@ -1726,53 +1776,102 @@ private pure func rewrite_expr(
 						frames = remaining
 
 						match frame:
-							FlattenRewriteAssignFrame(variable, typ, loc):
+							FlattenRewriteAssignFrame(original, rewritten_variable):
 								action = FlattenRewriteRebuildBindingExpr(
-									AssignExpr(
-										variable,
-										rewritten,
-										typ,
-										loc,
-									),
-								)
-							FlattenRewriteLetRhsFrame(variable, is_mutable, typ, body, body_bound):
-								frames = FlattenRewriteMoreBindingFrames(
-									FlattenRewriteLetBodyFrame(
-										variable,
-										is_mutable,
-										typ,
+									rebuilt_assign_names(
+										original,
+										rewritten_variable,
 										rewritten,
 									),
-									frames,
 								)
-								action = FlattenRewriteVisitBindingExpr(body_bound, body)
-							FlattenRewriteLetBodyFrame(variable, is_mutable, typ, rewritten_rhs):
+							FlattenRewriteLetRhsFrame(original, body_bound):
+								match original:
+									LetExpr(_, _, _, _, body):
+										frames = FlattenRewriteMoreBindingFrames(
+											FlattenRewriteLetBodyFrame(original, rewritten),
+											frames,
+										)
+										action = FlattenRewriteVisitBindingExpr(body_bound, body)
+									_:
+										action = FlattenRewriteRebuildBindingExpr(rewritten)
+							FlattenRewriteLetBodyFrame(original, rewritten_rhs):
 								action = FlattenRewriteRebuildBindingExpr(
-									LetExpr(
-										variable,
-										is_mutable,
-										typ,
+									rebuilt_let_names(
+										original,
 										rewritten_rhs,
 										rewritten,
 									),
 								)
-							FlattenRewriteBorrowLetRhsFrame(variable, typ, body, body_bound):
-								frames = FlattenRewriteMoreBindingFrames(
-									FlattenRewriteBorrowLetBodyFrame(variable, typ, rewritten),
-									frames,
-								)
-								action = FlattenRewriteVisitBindingExpr(body_bound, body)
-							FlattenRewriteBorrowLetBodyFrame(variable, typ, rewritten_rhs):
+							FlattenRewriteBorrowLetRhsFrame(original, body_bound):
+								match original:
+									BorrowLetExpr(_, _, _, body):
+										frames = FlattenRewriteMoreBindingFrames(
+											FlattenRewriteBorrowLetBodyFrame(original, rewritten),
+											frames,
+										)
+										action = FlattenRewriteVisitBindingExpr(body_bound, body)
+									_:
+										action = FlattenRewriteRebuildBindingExpr(rewritten)
+							FlattenRewriteBorrowLetBodyFrame(original, rewritten_rhs):
 								action = FlattenRewriteRebuildBindingExpr(
-									BorrowLetExpr(
-										variable,
-										typ,
+									rebuilt_borrow_let_names(
+										original,
 										rewritten_rhs,
 										rewritten,
 									),
 								)
 
 	result
+
+
+private pure func rebuilt_assign_names(
+	original: CoreExpr,
+	rewritten_variable: Option[CoreVar],
+	rewritten_rhs: CoreExpr,
+) -> CoreExpr:
+	match original:
+		AssignExpr(variable, rhs, typ, loc):
+			if rewritten_variable.is_none() and same_core_expr(rewritten_rhs, rhs):
+				original
+			else:
+				AssignExpr(
+					rewritten_variable.get_or(variable),
+					rewritten_rhs,
+					typ,
+					loc,
+				)
+		_:
+			original
+
+
+private pure func rebuilt_let_names(
+	original: CoreExpr,
+	rewritten_rhs: CoreExpr,
+	rewritten_body: CoreExpr,
+) -> CoreExpr:
+	match original:
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			if same_core_expr(rewritten_rhs, rhs) and same_core_expr(rewritten_body, body):
+				original
+			else:
+				LetExpr(variable, is_mutable, typ, rewritten_rhs, rewritten_body)
+		_:
+			original
+
+
+private pure func rebuilt_borrow_let_names(
+	original: CoreExpr,
+	rewritten_rhs: CoreExpr,
+	rewritten_body: CoreExpr,
+) -> CoreExpr:
+	match original:
+		BorrowLetExpr(variable, typ, rhs, body):
+			if same_core_expr(rewritten_rhs, rhs) and same_core_expr(rewritten_body, body):
+				original
+			else:
+				BorrowLetExpr(variable, typ, rewritten_rhs, rewritten_body)
+		_:
+			original
 
 
 private pure func rewrite_function_body(
@@ -1818,7 +1917,7 @@ private pure func rewrite_global(
 ) -> CoreGlobal:
 	{ global |
 		source_module = Some(module_name),
-		name = rewrite_global_var(global_rewrites, global.name),
+		name = rewrite_global_var(global_rewrites, global.name).get_or(global.name),
 		init = rewrite_expr(callable_rewrites, global_rewrites, [], global.init)
 	}
 
@@ -1882,426 +1981,606 @@ private pure func collect_local_type_rewrites(
 	)
 
 
-private pure func rewritten_type_name(context: CoreTypeRewriteContext, name: String) -> String:
+-- `None` means the name is already spelled the way Core wants it, which is the
+-- overwhelming majority: the canonical form only differs for a `module::Type`
+-- identity, and the rewrite table only covers types this module renames.
+private pure func rewritten_type_name(
+	context: CoreTypeRewriteContext,
+	name: String,
+) -> Option[String]:
 	canonical_name: String = flatten_canonical_core_type_name(name)
 
 	if canonical_name != name:
-		canonical_name
+		Some(canonical_name)
 	else:
-		var target_name: String = name
+		var target_name: Option[String] = None
 
 		for rewrite in context.rewrites:
 			if rewrite.source_name == name:
-				target_name = rewrite.target_name
+				target_name = Some(rewrite.target_name)
 				break
 
 		target_name
 
 
-private pure func rewrite_core_type(context: CoreTypeRewriteContext, typ: CoreType) -> CoreType:
+private pure func rewrite_core_type(
+	context: CoreTypeRewriteContext,
+	typ: CoreType,
+) -> Option[CoreType]:
 	match typ:
 		VoidType | SelfType | RangeType:
-			typ
+			None
 		NamedType(name, args):
-			NamedType(
-				rewritten_type_name(context, name),
-				args.map(func(arg): rewrite_core_type(context, arg)),
+			rewritten_name: Option[String] = rewritten_type_name(context, name)
+			rewritten_args: Option[List[CoreType]] = rewrite_list_items(
+				args,
+				func(arg): rewrite_core_type(context, arg),
 			)
-		TypeParameterType(name):
-			TypeParameterType(name)
+
+			if rewritten_name.is_none() and rewritten_args.is_none():
+				None
+			else:
+				Some(NamedType(rewritten_name.get_or(name), rewritten_args.get_or(args)))
+		TypeParameterType(_):
+			None
 		FunctionType(is_pure, params, return_type):
-			FunctionType(
-				is_pure,
-				params.map(func(param): rewrite_core_type(context, param)),
-				rewrite_core_type(context, return_type),
+			rewritten_params: Option[List[CoreType]] = rewrite_list_items(
+				params,
+				func(param): rewrite_core_type(context, param),
 			)
+			rewritten_return: Option[CoreType] = rewrite_core_type(context, return_type)
+
+			if rewritten_params.is_none() and rewritten_return.is_none():
+				None
+			else:
+				Some(
+					FunctionType(
+						is_pure,
+						rewritten_params.get_or(params),
+						rewritten_return.get_or(return_type),
+					),
+				)
 		StackResultType(value_type, error_type):
-			StackResultType(
-				rewrite_core_type(context, value_type),
-				rewrite_core_type(context, error_type),
-			)
+			rewritten_value: Option[CoreType] = rewrite_core_type(context, value_type)
+			rewritten_error: Option[CoreType] = rewrite_core_type(context, error_type)
+
+			if rewritten_value.is_none() and rewritten_error.is_none():
+				None
+			else:
+				Some(
+					StackResultType(
+						rewritten_value.get_or(value_type),
+						rewritten_error.get_or(error_type),
+					),
+				)
 		BoxedResultType(value_type, error_type):
-			BoxedResultType(
-				rewrite_core_type(context, value_type),
-				rewrite_core_type(context, error_type),
-			)
+			rewritten_value: Option[CoreType] = rewrite_core_type(context, value_type)
+			rewritten_error: Option[CoreType] = rewrite_core_type(context, error_type)
+
+			if rewritten_value.is_none() and rewritten_error.is_none():
+				None
+			else:
+				Some(
+					BoxedResultType(
+						rewritten_value.get_or(value_type),
+						rewritten_error.get_or(error_type),
+					),
+				)
 		EnumType(name):
-			EnumType(rewritten_type_name(context, name))
+			rewritten_type_name(context, name).map(func(rewritten): EnumType(rewritten))
 		ValueRecordType(name):
-			ValueRecordType(rewritten_type_name(context, name))
+			rewritten_type_name(context, name).map(func(rewritten): ValueRecordType(rewritten))
 		HeapRecordType(name):
-			HeapRecordType(rewritten_type_name(context, name))
+			rewritten_type_name(context, name).map(func(rewritten): HeapRecordType(rewritten))
 		UnionType(name):
-			UnionType(rewritten_type_name(context, name))
+			rewritten_type_name(context, name).map(func(rewritten): UnionType(rewritten))
 		TensorType(info):
-			TensorType({ info | element_type = rewrite_core_type(context, info.element_type) })
+			rewrite_core_type(
+				context,
+				info.element_type,
+			).map(
+				func(rewritten): TensorType({ info | element_type = rewritten }),
+			)
 		TupleType(elements):
-			TupleType(elements.map(
-				func(element): rewrite_core_type(context, element),
-			))
+			rewrite_list_items(
+				elements,
+				func(
+					element,
+				): rewrite_core_type(context, element),
+			).map(
+				func(rewritten): TupleType(rewritten),
+			)
 
 
 private pure func rewrite_param_type(
 	context: CoreTypeRewriteContext,
 	param: CoreParam,
-) -> CoreParam:
-	{ param | typ = rewrite_core_type(context, param.typ) }
+) -> Option[CoreParam]:
+	rewrite_core_type(context, param.typ).map(func(rewritten): { param | typ = rewritten })
 
 
 private pure func rewrite_loop_binder_type(
 	context: CoreTypeRewriteContext,
 	binder: CoreLoopBinder,
-) -> CoreLoopBinder:
-	{ binder | typ = rewrite_core_type(context, binder.typ) }
+) -> Option[CoreLoopBinder]:
+	rewrite_core_type(context, binder.typ).map(func(rewritten): { binder | typ = rewritten })
 
 
 private pure func rewrite_select_arm_types(
 	context: CoreTypeRewriteContext,
 	arm: CoreSelectArm,
-) -> CoreSelectArm:
+) -> Option[CoreSelectArm]:
 	match arm.kind:
 		SelectRecvArm(recv):
-			{ arm |
-				kind = SelectRecvArm(
-					{ recv | elem_type = rewrite_core_type(context, recv.elem_type) },
-				)
-			}
+			rewrite_core_type(
+				context,
+				recv.elem_type,
+			).map(
+				func(rewritten): { arm | kind = SelectRecvArm({ recv | elem_type = rewritten }) },
+			)
 		_:
-			arm
+			None
 
 
 private pure func rewrite_concurrent_item_mode_types(
 	context: CoreTypeRewriteContext,
 	mode: CoreConcurrentlyLoopItemMode,
-) -> CoreConcurrentlyLoopItemMode:
+) -> Option[CoreConcurrentlyLoopItemMode]:
 	match mode:
 		ConcurrentlyLoopMoveResourceItem(item):
-			ConcurrentlyLoopMoveResourceItem({
-				resource_type = rewrite_core_type(context, item.resource_type),
-				error_type = rewrite_core_type(context, item.error_type),
-			})
+			rewritten_resource: Option[CoreType] = rewrite_core_type(context, item.resource_type)
+			rewritten_error: Option[CoreType] = rewrite_core_type(context, item.error_type)
+
+			if rewritten_resource.is_none() and rewritten_error.is_none():
+				None
+			else:
+				Some(ConcurrentlyLoopMoveResourceItem({
+					resource_type = rewritten_resource.get_or(item.resource_type),
+					error_type = rewritten_error.get_or(item.error_type),
+				}))
 		_:
-			mode
+			None
 
 
+-- Answers `None` when no type on this node changed, so the caller keeps the
+-- node it already has. Children are not this function's business: the callers
+-- below map those first and hand the mapped node in.
+--
+-- The arms are grouped into the three functions below rather than written as
+-- one exhaustive match, because a match over every CoreExpr variant emits a C
+-- frame holding the temporaries of every arm at once, and the arms here each
+-- need a local for the mapped type. This dispatcher itself binds nothing.
 private pure func rewrite_expr_node_types(
 	context: CoreTypeRewriteContext,
 	rewritten: CoreExpr,
-) -> CoreExpr:
+) -> Option[CoreExpr]:
+	match rewritten:
+		LiteralExpr(_, _, _) | VarExpr(_, _, _) | VoidExpr(_, _) | BreakExpr(_, _) | ContinueExpr(_, _) | CallExpr(_, _, _, _, _) | BinaryExpr(_, _, _, _, _) | UnaryExpr(_, _, _, _) | LogicalExpr(_, _, _, _, _) | AssignExpr(_, _, _, _) | FieldExpr(_, _, _, _) | TupleFieldExpr(_, _, _, _) | LetExpr(_, _, _, _, _) | BorrowLetExpr(_, _, _, _) | PreClosureDetachExpr(_, _, _) | RangeExpr(_, _, _, _) | IfExpr(_, _, _, _, _) | WhileExpr(_, _, _, _):
+			rewrite_operator_node_types(context, rewritten)
+		TupleExpr(_, _, _) | VectorExpr(_, _, _) | ListConstructExpr(_, _, _) | DictExpr(_, _, _) | RecordExpr(_, _, _) | RecordUpdateExpr(_, _, _, _) | RecordReuseExpr(_, _, _, _) | TensorRawViewLetExpr(_, _, _, _) | RawMatchExpr(_, _, _, _) | LiteralMatchExpr(_, _, _, _, _) | ConstructorMatchExpr(_, _, _, _, _, _):
+			rewrite_aggregate_node_types(context, rewritten)
+		RecordCowUpdateExpr(_, _, _, _) | LambdaExpr(_, _, _, _, _, _) | ResourceScopeExpr(_, _, _) | ForRangeExpr(_, _, _, _, _, _) | ForChannelExpr(_, _, _) | ForListExpr(_, _, _) | ForStringExpr(_, _, _) | ForDictExpr(_, _, _) | ForSetExpr(_, _, _) | ForStreamExpr(_, _, _) | ForResourceSourceExpr(_, _, _) | ForTensorExpr(_, _, _) | PreClosureConcurrentlyLoopExpr(_, _, _) | PreClosureConcurrentExpr(_, _, _) | SelectExpr(_, _, _):
+			rewrite_binder_node_types(context, rewritten)
+		_:
+			None
+
+
+-- Variants whose only type-bearing field is the node's own result type.
+private pure func rewrite_operator_node_types(
+	context: CoreTypeRewriteContext,
+	rewritten: CoreExpr,
+) -> Option[CoreExpr]:
 	match rewritten:
 		LiteralExpr(literal, typ, loc):
-			LiteralExpr(
-				literal,
-				rewrite_core_type(context, typ),
-				loc,
-			)
+			rewritten_type ?= rewrite_core_type(context, typ)
+			Some(LiteralExpr(literal, rewritten_type, loc))
 		VarExpr(variable, typ, loc):
-			VarExpr(
-				variable,
-				rewrite_core_type(context, typ),
-				loc,
-			)
+			rewritten_type ?= rewrite_core_type(context, typ)
+			Some(VarExpr(variable, rewritten_type, loc))
 		VoidExpr(typ, loc):
-			VoidExpr(
-				rewrite_core_type(context, typ),
-				loc,
-			)
+			rewritten_type ?= rewrite_core_type(context, typ)
+			Some(VoidExpr(rewritten_type, loc))
 		BreakExpr(typ, loc):
-			BreakExpr(
-				rewrite_core_type(context, typ),
-				loc,
-			)
+			rewritten_type ?= rewrite_core_type(context, typ)
+			Some(BreakExpr(rewritten_type, loc))
 		ContinueExpr(typ, loc):
-			ContinueExpr(
-				rewrite_core_type(context, typ),
-				loc,
-			)
+			rewritten_type ?= rewrite_core_type(context, typ)
+			Some(ContinueExpr(rewritten_type, loc))
 		CallExpr(kind, callee, args, typ, loc):
-			CallExpr(
-				kind,
-				callee,
-				args,
-				rewrite_core_type(context, typ),
-				loc,
-			)
+			rewritten_type ?= rewrite_core_type(context, typ)
+			Some(CallExpr(kind, callee, args, rewritten_type, loc))
 		BinaryExpr(op, left, right, typ, loc):
-			BinaryExpr(
-				op,
-				left,
-				right,
-				rewrite_core_type(context, typ),
-				loc,
-			)
+			rewritten_type ?= rewrite_core_type(context, typ)
+			Some(BinaryExpr(op, left, right, rewritten_type, loc))
 		UnaryExpr(op, value, typ, loc):
-			UnaryExpr(
-				op,
-				value,
-				rewrite_core_type(context, typ),
-				loc,
-			)
+			rewritten_type ?= rewrite_core_type(context, typ)
+			Some(UnaryExpr(op, value, rewritten_type, loc))
 		LogicalExpr(op, left, right, typ, loc):
-			LogicalExpr(
-				op,
-				left,
-				right,
-				rewrite_core_type(context, typ),
-				loc,
-			)
+			rewritten_type ?= rewrite_core_type(context, typ)
+			Some(LogicalExpr(op, left, right, rewritten_type, loc))
 		AssignExpr(variable, rhs, typ, loc):
-			AssignExpr(
-				variable,
-				rhs,
-				rewrite_core_type(context, typ),
-				loc,
-			)
+			rewritten_type ?= rewrite_core_type(context, typ)
+			Some(AssignExpr(variable, rhs, rewritten_type, loc))
 		FieldExpr(value, field_name, typ, loc):
-			FieldExpr(
-				value,
-				field_name,
-				rewrite_core_type(context, typ),
-				loc,
-			)
+			rewritten_type ?= rewrite_core_type(context, typ)
+			Some(FieldExpr(value, field_name, rewritten_type, loc))
 		TupleFieldExpr(value, field_index, typ, loc):
-			TupleFieldExpr(
-				value,
-				field_index,
-				rewrite_core_type(context, typ),
-				loc,
-			)
-		TupleExpr(items, typ, loc):
-			TupleExpr(
-				items,
-				rewrite_core_type(context, typ),
-				loc,
-			)
-		VectorExpr(items, typ, loc):
-			VectorExpr(
-				items,
-				rewrite_core_type(context, typ),
-				loc,
-			)
-		ListConstructExpr(construct, typ, loc):
-			ListConstructExpr(
-				construct,
-				rewrite_core_type(context, typ),
-				loc,
-			)
-		DictExpr(entries, typ, loc):
-			DictExpr(
-				entries,
-				rewrite_core_type(context, typ),
-				loc,
-			)
-		RecordExpr(fields, typ, loc):
-			RecordExpr(
-				fields,
-				rewrite_core_type(context, typ),
-				loc,
-			)
-		RecordUpdateExpr(base, fields, typ, loc):
-			RecordUpdateExpr(
-				base,
-				fields,
-				rewrite_core_type(context, typ),
-				loc,
-			)
-		RecordReuseExpr(source, fields, typ, loc):
-			RecordReuseExpr(
-				source,
-				fields,
-				rewrite_core_type(context, typ),
-				loc,
-			)
-		RecordCowUpdateExpr(source, fields, typ, loc):
-			RecordCowUpdateExpr(
-				source,
-				CoreTraverse.map_core_record_cow_fields_with_types(
-					fields,
-					func(replacement): replacement,
-					func(field_type): rewrite_core_type(context, field_type),
-				),
-				rewrite_core_type(
-					context,
-					typ,
-				),
-				loc,
-			)
+			rewritten_type ?= rewrite_core_type(context, typ)
+			Some(TupleFieldExpr(value, field_index, rewritten_type, loc))
 		LetExpr(variable, is_mutable, typ, rhs, body):
-			LetExpr(
-				variable,
-				is_mutable,
-				rewrite_core_type(context, typ),
-				rhs,
-				body,
-			)
+			rewritten_type ?= rewrite_core_type(context, typ)
+			Some(LetExpr(variable, is_mutable, rewritten_type, rhs, body))
 		BorrowLetExpr(variable, typ, rhs, body):
-			BorrowLetExpr(
-				variable,
-				rewrite_core_type(context, typ),
-				rhs,
-				body,
-			)
-		LambdaExpr(params, return_type, body, is_pure, typ, loc):
-			LambdaExpr(
-				params.map(func(param): rewrite_param_type(context, param)),
-				rewrite_core_type(context, return_type),
-				body,
-				is_pure,
-				rewrite_core_type(context, typ),
-				loc,
-			)
-		TensorRawViewLetExpr(binding, body, typ, loc):
-			TensorRawViewLetExpr(
-				binding,
-				body,
-				rewrite_core_type(context, typ),
-				loc,
-			)
-		ResourceScopeExpr(scope, typ, loc):
-			ResourceScopeExpr(
-				{ scope | typ = rewrite_core_type(context, scope.typ) },
-				rewrite_core_type(context, typ),
-				loc,
-			)
-		ForRangeExpr(binder, start, end_value, body, typ, loc):
-			ForRangeExpr(
-				rewrite_loop_binder_type(context, binder),
-				start,
-				end_value,
-				body,
-				rewrite_core_type(context, typ),
-				loc,
-			)
-		ForChannelExpr(loop, typ, loc):
-			ForChannelExpr(
-				{ loop | binder = rewrite_loop_binder_type(context, loop.binder) },
-				rewrite_core_type(context, typ),
-				loc,
-			)
-		ForListExpr(loop, typ, loc):
-			ForListExpr(
-				{ loop | binder = rewrite_loop_binder_type(context, loop.binder) },
-				rewrite_core_type(context, typ),
-				loc,
-			)
-		ForStringExpr(loop, typ, loc):
-			ForStringExpr(
-				{ loop | binder = rewrite_loop_binder_type(context, loop.binder) },
-				rewrite_core_type(context, typ),
-				loc,
-			)
-		ForDictExpr(loop, typ, loc):
-			ForDictExpr(
-				{ loop | binder = rewrite_loop_binder_type(context, loop.binder) },
-				rewrite_core_type(context, typ),
-				loc,
-			)
-		ForSetExpr(loop, typ, loc):
-			ForSetExpr(
-				{ loop | binder = rewrite_loop_binder_type(context, loop.binder) },
-				rewrite_core_type(context, typ),
-				loc,
-			)
-		ForStreamExpr(loop, typ, loc):
-			ForStreamExpr(
-				{ loop | binder = rewrite_loop_binder_type(context, loop.binder) },
-				rewrite_core_type(context, typ),
-				loc,
-			)
-		ForResourceSourceExpr(loop, typ, loc):
-			ForResourceSourceExpr(
-				{ loop | binder = rewrite_loop_binder_type(context, loop.binder) },
-				rewrite_core_type(context, typ),
-				loc,
-			)
-		ForTensorExpr(loop, typ, loc):
-			ForTensorExpr(
-				{ loop | binder = rewrite_loop_binder_type(context, loop.binder) },
-				rewrite_core_type(context, typ),
-				loc,
-			)
-		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
-			PreClosureConcurrentlyLoopExpr(
-				{ loop |
-					item_type = rewrite_core_type(context, loop.item_type),
-					item_mode = rewrite_concurrent_item_mode_types(context, loop.item_mode)
-				},
-				rewrite_core_type(
-					context,
-					typ,
-				),
-				loc,
-			)
-		PreClosureConcurrentExpr(block, typ, loc):
-			PreClosureConcurrentExpr(
-				{ block |
-					bindings = block.bindings.map(
-						func(binding): { binding | typ = rewrite_core_type(context, binding.typ) },
-					)
-				},
-				rewrite_core_type(context, typ),
-				loc,
-			)
+			rewritten_type ?= rewrite_core_type(context, typ)
+			Some(BorrowLetExpr(variable, rewritten_type, rhs, body))
 		PreClosureDetachExpr(detached, typ, loc):
-			PreClosureDetachExpr(
-				detached,
-				rewrite_core_type(context, typ),
-				loc,
-			)
-		SelectExpr(select_expr, typ, loc):
-			SelectExpr(
-				select_expr.map(func(arm): rewrite_select_arm_types(context, arm)),
-				rewrite_core_type(context, typ),
-				loc,
-			)
+			rewritten_type ?= rewrite_core_type(context, typ)
+			Some(PreClosureDetachExpr(detached, rewritten_type, loc))
 		RangeExpr(start, end_value, typ, loc):
-			RangeExpr(
-				start,
-				end_value,
-				rewrite_core_type(context, typ),
-				loc,
-			)
-		RawMatchExpr(scrutinee, cases, typ, loc):
-			RawMatchExpr(
-				scrutinee,
-				cases,
-				rewrite_core_type(context, typ),
-				loc,
-			)
-		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
-			LiteralMatchExpr(
-				scrutinee,
-				cases,
-				fallback,
-				rewrite_core_type(context, typ),
-				loc,
-			)
-		ConstructorMatchExpr(scrutinee, policy, cases, fallback, typ, loc):
-			ConstructorMatchExpr(
-				scrutinee,
-				policy,
-				cases,
-				fallback,
-				rewrite_core_type(context, typ),
-				loc,
-			)
+			rewritten_type ?= rewrite_core_type(context, typ)
+			Some(RangeExpr(start, end_value, rewritten_type, loc))
 		IfExpr(cond, then_expr, else_expr, typ, loc):
-			IfExpr(
-				cond,
-				then_expr,
-				else_expr,
-				rewrite_core_type(context, typ),
-				loc,
-			)
+			rewritten_type ?= rewrite_core_type(context, typ)
+			Some(IfExpr(cond, then_expr, else_expr, rewritten_type, loc))
 		WhileExpr(cond, body, typ, loc):
-			WhileExpr(
-				cond,
-				body,
-				rewrite_core_type(context, typ),
-				loc,
-			)
+			rewritten_type ?= rewrite_core_type(context, typ)
+			Some(WhileExpr(cond, body, rewritten_type, loc))
 		_:
-			rewritten
+			None
+
+
+-- Aggregates and match forms; their payloads carry expressions, which the
+-- caller has already mapped, so again only the node's own type is at stake.
+private pure func rewrite_aggregate_node_types(
+	context: CoreTypeRewriteContext,
+	rewritten: CoreExpr,
+) -> Option[CoreExpr]:
+	match rewritten:
+		TupleExpr(items, typ, loc):
+			rewritten_type ?= rewrite_core_type(context, typ)
+			Some(TupleExpr(items, rewritten_type, loc))
+		VectorExpr(items, typ, loc):
+			rewritten_type ?= rewrite_core_type(context, typ)
+			Some(VectorExpr(items, rewritten_type, loc))
+		ListConstructExpr(construct, typ, loc):
+			rewritten_type ?= rewrite_core_type(context, typ)
+			Some(ListConstructExpr(construct, rewritten_type, loc))
+		DictExpr(entries, typ, loc):
+			rewritten_type ?= rewrite_core_type(context, typ)
+			Some(DictExpr(entries, rewritten_type, loc))
+		RecordExpr(fields, typ, loc):
+			rewritten_type ?= rewrite_core_type(context, typ)
+			Some(RecordExpr(fields, rewritten_type, loc))
+		RecordUpdateExpr(base, fields, typ, loc):
+			rewritten_type ?= rewrite_core_type(context, typ)
+			Some(RecordUpdateExpr(base, fields, rewritten_type, loc))
+		RecordReuseExpr(source, fields, typ, loc):
+			rewritten_type ?= rewrite_core_type(context, typ)
+			Some(RecordReuseExpr(source, fields, rewritten_type, loc))
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			rewritten_type ?= rewrite_core_type(context, typ)
+			Some(TensorRawViewLetExpr(binding, body, rewritten_type, loc))
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			rewritten_type ?= rewrite_core_type(context, typ)
+			Some(RawMatchExpr(scrutinee, cases, rewritten_type, loc))
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			rewritten_type ?= rewrite_core_type(context, typ)
+			Some(LiteralMatchExpr(scrutinee, cases, fallback, rewritten_type, loc))
+		ConstructorMatchExpr(scrutinee, policy, cases, fallback, typ, loc):
+			rewritten_type ?= rewrite_core_type(context, typ)
+			Some(ConstructorMatchExpr(scrutinee, policy, cases, fallback, rewritten_type, loc))
+		_:
+			None
+
+
+-- Variants that carry type-bearing payload of their own: loop binders, lambda
+-- parameters, resource-scope and concurrency types, select element types, and
+-- copy-on-write field types. Each answers `None` only when neither the payload
+-- nor the node's own type changed.
+private pure func rewrite_binder_node_types(
+	context: CoreTypeRewriteContext,
+	rewritten: CoreExpr,
+) -> Option[CoreExpr]:
+	match rewritten:
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			rewritten_fields: List[CoreRecordCowField] = CoreTraverse.map_core_record_cow_fields_with_types(
+				fields,
+				func(replacement): replacement,
+				func(field_type): rewrite_core_type(context, field_type).get_or(field_type),
+			)
+			rewritten_type: Option[CoreType] = rewrite_core_type(context, typ)
+
+			if same_core_record_cow_fields(rewritten_fields, fields) and rewritten_type.is_none():
+				None
+			else:
+				Some(RecordCowUpdateExpr(source, rewritten_fields, rewritten_type.get_or(typ), loc))
+		LambdaExpr(params, return_type, body, is_pure, typ, loc):
+			rewritten_params: Option[List[CoreParam]] = rewrite_list_items(
+				params,
+				func(param): rewrite_param_type(context, param),
+			)
+			rewritten_return: Option[CoreType] = rewrite_core_type(context, return_type)
+			rewritten_type: Option[CoreType] = rewrite_core_type(context, typ)
+
+			if (
+				rewritten_params.is_none()
+				and rewritten_return.is_none()
+				and rewritten_type.is_none()
+			):
+				None
+			else:
+				Some(
+					LambdaExpr(
+						rewritten_params.get_or(params),
+						rewritten_return.get_or(return_type),
+						body,
+						is_pure,
+						rewritten_type.get_or(typ),
+						loc,
+					),
+				)
+		ResourceScopeExpr(scope, typ, loc):
+			rewritten_scope_type: Option[CoreType] = rewrite_core_type(context, scope.typ)
+			rewritten_type: Option[CoreType] = rewrite_core_type(context, typ)
+
+			if rewritten_scope_type.is_none() and rewritten_type.is_none():
+				None
+			else:
+				Some(
+					ResourceScopeExpr(
+						rewritten_scope_type
+							.map(func(scope_type): { scope | typ = scope_type })
+							.get_or(scope),
+						rewritten_type.get_or(typ),
+						loc,
+					),
+				)
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			rewritten_binder: Option[CoreLoopBinder] = rewrite_loop_binder_type(context, binder)
+			rewritten_type: Option[CoreType] = rewrite_core_type(context, typ)
+
+			if rewritten_binder.is_none() and rewritten_type.is_none():
+				None
+			else:
+				Some(
+					ForRangeExpr(
+						rewritten_binder.get_or(binder),
+						start,
+						end_value,
+						body,
+						rewritten_type.get_or(typ),
+						loc,
+					),
+				)
+		ForChannelExpr(_, _, _) | ForListExpr(_, _, _) | ForStringExpr(_, _, _) | ForDictExpr(_, _, _) | ForSetExpr(_, _, _) | ForStreamExpr(_, _, _) | ForResourceSourceExpr(_, _, _) | ForTensorExpr(_, _, _):
+			rewrite_iterable_loop_node_types(context, rewritten)
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			rewritten_item_type: Option[CoreType] = rewrite_core_type(context, loop.item_type)
+			rewritten_item_mode: Option[CoreConcurrentlyLoopItemMode] = rewrite_concurrent_item_mode_types(
+				context,
+				loop.item_mode,
+			)
+			rewritten_type: Option[CoreType] = rewrite_core_type(context, typ)
+
+			if (
+				rewritten_item_type.is_none()
+				and rewritten_item_mode.is_none()
+				and rewritten_type.is_none()
+			):
+				None
+			else:
+				Some(
+					PreClosureConcurrentlyLoopExpr(
+						{ loop |
+							item_type = rewritten_item_type.get_or(loop.item_type),
+							item_mode = rewritten_item_mode.get_or(loop.item_mode)
+						},
+						rewritten_type.get_or(typ),
+						loc,
+					),
+				)
+		PreClosureConcurrentExpr(block, typ, loc):
+			rewritten_bindings: Option[List[CorePreClosureConcurrentBinding]] = rewrite_list_items(
+				block.bindings,
+				func(
+					binding,
+				): rewrite_core_type(
+					context,
+					binding.typ,
+				).map(
+					func(binding_type): { binding | typ = binding_type },
+				),
+			)
+			rewritten_type: Option[CoreType] = rewrite_core_type(context, typ)
+
+			if rewritten_bindings.is_none() and rewritten_type.is_none():
+				None
+			else:
+				Some(
+					PreClosureConcurrentExpr(
+						rewritten_bindings
+							.map(func(bindings): { block | bindings = bindings })
+							.get_or(block),
+						rewritten_type.get_or(typ),
+						loc,
+					),
+				)
+		SelectExpr(arms, typ, loc):
+			rewritten_arms: Option[List[CoreSelectArm]] = rewrite_list_items(
+				arms,
+				func(arm): rewrite_select_arm_types(context, arm),
+			)
+			rewritten_type: Option[CoreType] = rewrite_core_type(context, typ)
+
+			if rewritten_arms.is_none() and rewritten_type.is_none():
+				None
+			else:
+				Some(SelectExpr(rewritten_arms.get_or(arms), rewritten_type.get_or(typ), loc))
+		_:
+			None
+
+
+-- The eight iterable loops share one shape: a binder type and the loop's own
+-- result type.
+private pure func rewrite_iterable_loop_node_types(
+	context: CoreTypeRewriteContext,
+	rewritten: CoreExpr,
+) -> Option[CoreExpr]:
+	match rewritten:
+		ForChannelExpr(loop, typ, loc):
+			rewritten_binder: Option[CoreLoopBinder] = rewrite_loop_binder_type(
+				context,
+				loop.binder,
+			)
+			rewritten_type: Option[CoreType] = rewrite_core_type(context, typ)
+
+			if rewritten_binder.is_none() and rewritten_type.is_none():
+				None
+			else:
+				Some(
+					ForChannelExpr(
+						rewritten_binder
+							.map(func(binder): { loop | binder = binder })
+							.get_or(loop),
+						rewritten_type.get_or(typ),
+						loc,
+					),
+				)
+		ForListExpr(loop, typ, loc):
+			rewritten_binder: Option[CoreLoopBinder] = rewrite_loop_binder_type(
+				context,
+				loop.binder,
+			)
+			rewritten_type: Option[CoreType] = rewrite_core_type(context, typ)
+
+			if rewritten_binder.is_none() and rewritten_type.is_none():
+				None
+			else:
+				Some(
+					ForListExpr(
+						rewritten_binder
+							.map(func(binder): { loop | binder = binder })
+							.get_or(loop),
+						rewritten_type.get_or(typ),
+						loc,
+					),
+				)
+		ForStringExpr(loop, typ, loc):
+			rewritten_binder: Option[CoreLoopBinder] = rewrite_loop_binder_type(
+				context,
+				loop.binder,
+			)
+			rewritten_type: Option[CoreType] = rewrite_core_type(context, typ)
+
+			if rewritten_binder.is_none() and rewritten_type.is_none():
+				None
+			else:
+				Some(
+					ForStringExpr(
+						rewritten_binder
+							.map(func(binder): { loop | binder = binder })
+							.get_or(loop),
+						rewritten_type.get_or(typ),
+						loc,
+					),
+				)
+		ForDictExpr(loop, typ, loc):
+			rewritten_binder: Option[CoreLoopBinder] = rewrite_loop_binder_type(
+				context,
+				loop.binder,
+			)
+			rewritten_type: Option[CoreType] = rewrite_core_type(context, typ)
+
+			if rewritten_binder.is_none() and rewritten_type.is_none():
+				None
+			else:
+				Some(
+					ForDictExpr(
+						rewritten_binder
+							.map(func(binder): { loop | binder = binder })
+							.get_or(loop),
+						rewritten_type.get_or(typ),
+						loc,
+					),
+				)
+		ForSetExpr(loop, typ, loc):
+			rewritten_binder: Option[CoreLoopBinder] = rewrite_loop_binder_type(
+				context,
+				loop.binder,
+			)
+			rewritten_type: Option[CoreType] = rewrite_core_type(context, typ)
+
+			if rewritten_binder.is_none() and rewritten_type.is_none():
+				None
+			else:
+				Some(
+					ForSetExpr(
+						rewritten_binder
+							.map(func(binder): { loop | binder = binder })
+							.get_or(loop),
+						rewritten_type.get_or(typ),
+						loc,
+					),
+				)
+		ForStreamExpr(loop, typ, loc):
+			rewritten_binder: Option[CoreLoopBinder] = rewrite_loop_binder_type(
+				context,
+				loop.binder,
+			)
+			rewritten_type: Option[CoreType] = rewrite_core_type(context, typ)
+
+			if rewritten_binder.is_none() and rewritten_type.is_none():
+				None
+			else:
+				Some(
+					ForStreamExpr(
+						rewritten_binder
+							.map(func(binder): { loop | binder = binder })
+							.get_or(loop),
+						rewritten_type.get_or(typ),
+						loc,
+					),
+				)
+		ForResourceSourceExpr(loop, typ, loc):
+			rewritten_binder: Option[CoreLoopBinder] = rewrite_loop_binder_type(
+				context,
+				loop.binder,
+			)
+			rewritten_type: Option[CoreType] = rewrite_core_type(context, typ)
+
+			if rewritten_binder.is_none() and rewritten_type.is_none():
+				None
+			else:
+				Some(
+					ForResourceSourceExpr(
+						rewritten_binder
+							.map(func(binder): { loop | binder = binder })
+							.get_or(loop),
+						rewritten_type.get_or(typ),
+						loc,
+					),
+				)
+		ForTensorExpr(loop, typ, loc):
+			rewritten_binder: Option[CoreLoopBinder] = rewrite_loop_binder_type(
+				context,
+				loop.binder,
+			)
+			rewritten_type: Option[CoreType] = rewrite_core_type(context, typ)
+
+			if rewritten_binder.is_none() and rewritten_type.is_none():
+				None
+			else:
+				Some(
+					ForTensorExpr(
+						rewritten_binder
+							.map(func(binder): { loop | binder = binder })
+							.get_or(loop),
+						rewritten_type.get_or(typ),
+						loc,
+					),
+				)
+		_:
+			None
 
 
 private pure func rewrite_non_binding_expr_types(
@@ -2317,10 +2596,20 @@ private pure func rewrite_non_binding_expr_types(
 		LogicalExpr(_, _, _, _, _):
 			rewrite_logical_expr_types(context, expr)
 		_:
-			rewrite_expr_node_types(
+			-- The child mapper already answers the same allocation when no child
+			-- changed, so an unchanged node here means nothing below it moved
+			-- either and the input can be handed straight back.
+			mapped_children: CoreExpr = CoreTraverse.map_core_expr_children_with_context(
+				expr,
 				context,
-				CoreTraverse.map_core_expr_children_with_context(expr, context, rewrite_expr_types),
+				rewrite_expr_types,
 			)
+
+			match rewrite_expr_node_types(context, mapped_children):
+				Some(rewritten):
+					rewritten
+				None:
+					mapped_children
 
 
 private pure func rewrite_logical_expr_types(
@@ -2339,9 +2628,9 @@ private pure func rewrite_logical_expr_types(
 		match action:
 			CoreTypeRewriteLogicalVisitExpr(current):
 				match current:
-					LogicalExpr(op, left, right, typ, loc):
+					LogicalExpr(_, left, _, _, _):
 						frames = CoreTypeRewriteLogicalMoreFrames(
-							CoreTypeRewriteLogicalVisitRightFrame(op, right, typ, loc),
+							CoreTypeRewriteLogicalVisitRightFrame(current),
 							frames,
 						)
 						action = CoreTypeRewriteLogicalVisitExpr(left)
@@ -2361,25 +2650,26 @@ private pure func rewrite_logical_expr_types(
 						frames = remaining
 
 						match frame:
-							CoreTypeRewriteLogicalVisitRightFrame(op, right, typ, loc):
-								frames = CoreTypeRewriteLogicalMoreFrames(
-									CoreTypeRewriteLogicalRebuildParentFrame(
-										op,
-										rewritten,
-										typ,
-										loc,
-									),
-									frames,
-								)
-								action = CoreTypeRewriteLogicalVisitExpr(right)
-							CoreTypeRewriteLogicalRebuildParentFrame(op, left, typ, loc):
+							CoreTypeRewriteLogicalVisitRightFrame(original):
+								match original:
+									LogicalExpr(_, _, right, _, _):
+										frames = CoreTypeRewriteLogicalMoreFrames(
+											CoreTypeRewriteLogicalRebuildParentFrame(
+												original,
+												rewritten,
+											),
+											frames,
+										)
+										action = CoreTypeRewriteLogicalVisitExpr(right)
+									_:
+										action = CoreTypeRewriteLogicalRebuildExpr(rewritten)
+							CoreTypeRewriteLogicalRebuildParentFrame(original, rewritten_left):
 								action = CoreTypeRewriteLogicalRebuildExpr(
-									LogicalExpr(
-										op,
-										left,
+									rebuilt_logical_types(
+										context,
+										original,
+										rewritten_left,
 										rewritten,
-										rewrite_core_type(context, typ),
-										loc,
 									),
 								)
 
@@ -2399,21 +2689,21 @@ private pure func rewrite_expr_types(context: CoreTypeRewriteContext, expr: Core
 		match action:
 			CoreTypeRewriteVisitBindingExpr(current):
 				match current:
-					AssignExpr(variable, rhs, typ, loc):
+					AssignExpr(_, rhs, _, _):
 						frames = CoreTypeRewriteMoreBindingFrames(
-							CoreTypeRewriteAssignFrame(variable, typ, loc),
+							CoreTypeRewriteAssignFrame(current),
 							frames,
 						)
 						action = CoreTypeRewriteVisitBindingExpr(rhs)
-					LetExpr(variable, is_mutable, typ, rhs, body):
+					LetExpr(_, _, _, rhs, _):
 						frames = CoreTypeRewriteMoreBindingFrames(
-							CoreTypeRewriteLetRhsFrame(variable, is_mutable, typ, body),
+							CoreTypeRewriteLetRhsFrame(current),
 							frames,
 						)
 						action = CoreTypeRewriteVisitBindingExpr(rhs)
-					BorrowLetExpr(variable, typ, rhs, body):
+					BorrowLetExpr(_, _, rhs, _):
 						frames = CoreTypeRewriteMoreBindingFrames(
-							CoreTypeRewriteBorrowLetRhsFrame(variable, typ, body),
+							CoreTypeRewriteBorrowLetRhsFrame(current),
 							frames,
 						)
 						action = CoreTypeRewriteVisitBindingExpr(rhs)
@@ -2433,47 +2723,48 @@ private pure func rewrite_expr_types(context: CoreTypeRewriteContext, expr: Core
 						frames = remaining
 
 						match frame:
-							CoreTypeRewriteAssignFrame(variable, typ, loc):
+							CoreTypeRewriteAssignFrame(original):
 								action = CoreTypeRewriteRebuildBindingExpr(
-									AssignExpr(
-										variable,
-										rewritten,
-										rewrite_core_type(context, typ),
-										loc,
-									),
-								)
-							CoreTypeRewriteLetRhsFrame(variable, is_mutable, typ, body):
-								frames = CoreTypeRewriteMoreBindingFrames(
-									CoreTypeRewriteLetBodyFrame(
-										variable,
-										is_mutable,
-										typ,
+									rebuilt_assign_types(
+										context,
+										original,
 										rewritten,
 									),
-									frames,
 								)
-								action = CoreTypeRewriteVisitBindingExpr(body)
-							CoreTypeRewriteLetBodyFrame(variable, is_mutable, typ, rewritten_rhs):
+							CoreTypeRewriteLetRhsFrame(original):
+								match original:
+									LetExpr(_, _, _, _, body):
+										frames = CoreTypeRewriteMoreBindingFrames(
+											CoreTypeRewriteLetBodyFrame(original, rewritten),
+											frames,
+										)
+										action = CoreTypeRewriteVisitBindingExpr(body)
+									_:
+										action = CoreTypeRewriteRebuildBindingExpr(rewritten)
+							CoreTypeRewriteLetBodyFrame(original, rewritten_rhs):
 								action = CoreTypeRewriteRebuildBindingExpr(
-									LetExpr(
-										variable,
-										is_mutable,
-										rewrite_core_type(context, typ),
+									rebuilt_let_types(
+										context,
+										original,
 										rewritten_rhs,
 										rewritten,
 									),
 								)
-							CoreTypeRewriteBorrowLetRhsFrame(variable, typ, body):
-								frames = CoreTypeRewriteMoreBindingFrames(
-									CoreTypeRewriteBorrowLetBodyFrame(variable, typ, rewritten),
-									frames,
-								)
-								action = CoreTypeRewriteVisitBindingExpr(body)
-							CoreTypeRewriteBorrowLetBodyFrame(variable, typ, rewritten_rhs):
+							CoreTypeRewriteBorrowLetRhsFrame(original):
+								match original:
+									BorrowLetExpr(_, _, _, body):
+										frames = CoreTypeRewriteMoreBindingFrames(
+											CoreTypeRewriteBorrowLetBodyFrame(original, rewritten),
+											frames,
+										)
+										action = CoreTypeRewriteVisitBindingExpr(body)
+									_:
+										action = CoreTypeRewriteRebuildBindingExpr(rewritten)
+							CoreTypeRewriteBorrowLetBodyFrame(original, rewritten_rhs):
 								action = CoreTypeRewriteRebuildBindingExpr(
-									BorrowLetExpr(
-										variable,
-										rewrite_core_type(context, typ),
+									rebuilt_borrow_let_types(
+										context,
+										original,
 										rewritten_rhs,
 										rewritten,
 									),
@@ -2482,13 +2773,124 @@ private pure func rewrite_expr_types(context: CoreTypeRewriteContext, expr: Core
 	result
 
 
+private pure func rebuilt_logical_types(
+	context: CoreTypeRewriteContext,
+	original: CoreExpr,
+	rewritten_left: CoreExpr,
+	rewritten_right: CoreExpr,
+) -> CoreExpr:
+	match original:
+		LogicalExpr(op, left, right, typ, loc):
+			rewritten_type: Option[CoreType] = rewrite_core_type(context, typ)
+
+			if (
+				same_core_expr(rewritten_left, left)
+				and same_core_expr(rewritten_right, right)
+				and rewritten_type.is_none()
+			):
+				original
+			else:
+				LogicalExpr(
+					op,
+					rewritten_left,
+					rewritten_right,
+					rewritten_type.get_or(typ),
+					loc,
+				)
+		_:
+			original
+
+
+private pure func rebuilt_assign_types(
+	context: CoreTypeRewriteContext,
+	original: CoreExpr,
+	rewritten_rhs: CoreExpr,
+) -> CoreExpr:
+	match original:
+		AssignExpr(variable, rhs, typ, loc):
+			rewritten_type: Option[CoreType] = rewrite_core_type(context, typ)
+
+			if same_core_expr(rewritten_rhs, rhs) and rewritten_type.is_none():
+				original
+			else:
+				AssignExpr(
+					variable,
+					rewritten_rhs,
+					rewritten_type.get_or(typ),
+					loc,
+				)
+		_:
+			original
+
+
+private pure func rebuilt_let_types(
+	context: CoreTypeRewriteContext,
+	original: CoreExpr,
+	rewritten_rhs: CoreExpr,
+	rewritten_body: CoreExpr,
+) -> CoreExpr:
+	match original:
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			rewritten_type: Option[CoreType] = rewrite_core_type(context, typ)
+
+			if (
+				same_core_expr(rewritten_rhs, rhs)
+				and same_core_expr(rewritten_body, body)
+				and rewritten_type.is_none()
+			):
+				original
+			else:
+				LetExpr(
+					variable,
+					is_mutable,
+					rewritten_type.get_or(typ),
+					rewritten_rhs,
+					rewritten_body,
+				)
+		_:
+			original
+
+
+private pure func rebuilt_borrow_let_types(
+	context: CoreTypeRewriteContext,
+	original: CoreExpr,
+	rewritten_rhs: CoreExpr,
+	rewritten_body: CoreExpr,
+) -> CoreExpr:
+	match original:
+		BorrowLetExpr(variable, typ, rhs, body):
+			rewritten_type: Option[CoreType] = rewrite_core_type(context, typ)
+
+			if (
+				same_core_expr(rewritten_rhs, rhs)
+				and same_core_expr(rewritten_body, body)
+				and rewritten_type.is_none()
+			):
+				original
+			else:
+				BorrowLetExpr(
+					variable,
+					rewritten_type.get_or(typ),
+					rewritten_rhs,
+					rewritten_body,
+				)
+		_:
+			original
+
+
 private pure func rewrite_function_types(
 	context: CoreTypeRewriteContext,
 	function_info: CoreFunction,
 ) -> CoreFunction:
 	{ function_info |
-		params = function_info.params.map(func(param): rewrite_param_type(context, param)),
-		return_type = rewrite_core_type(context, function_info.return_type),
+		params = rewrite_list_items(
+			function_info.params,
+			func(param): rewrite_param_type(context, param),
+		).get_or(function_info.params),
+		return_type = rewrite_core_type(
+			context,
+			function_info.return_type,
+		).get_or(function_info.return_type),
 		body = function_info.body.map(func(body): rewrite_expr_types(context, body))
 	}
 
@@ -2498,8 +2900,11 @@ private pure func rewrite_trait_method_types(
 	method: CoreTraitMethod,
 ) -> CoreTraitMethod:
 	{ method |
-		params = method.params.map(func(param): rewrite_param_type(context, param)),
-		return_type = rewrite_core_type(context, method.return_type)
+		params = rewrite_list_items(
+			method.params,
+			func(param): rewrite_param_type(context, param),
+		).get_or(method.params),
+		return_type = rewrite_core_type(context, method.return_type).get_or(method.return_type)
 	}
 
 
@@ -2509,7 +2914,7 @@ private pure func rewrite_decl_types(context: CoreTypeRewriteContext, decl: Core
 			FunctionDecl(rewrite_function_types(context, function_info))
 		GlobalDecl(global):
 			GlobalDecl({ global |
-					typ = rewrite_core_type(context, global.typ),
+					typ = rewrite_core_type(context, global.typ).get_or(global.typ),
 					init = rewrite_expr_types(context, global.init)
 				})
 		EnumDecl(_):
@@ -2524,7 +2929,9 @@ private pure func rewrite_decl_types(context: CoreTypeRewriteContext, decl: Core
 							fields = variant.fields.map(
 								func(
 									field,
-								): { field | typ = rewrite_core_type(context, field.typ) },
+								): { field |
+									typ = rewrite_core_type(context, field.typ).get_or(field.typ)
+								},
 							)
 						},
 					)
@@ -2534,7 +2941,11 @@ private pure func rewrite_decl_types(context: CoreTypeRewriteContext, decl: Core
 			ValueRecordDecl(
 				{ record_decl |
 					fields = record_decl.fields.map(
-						func(field): { field | typ = rewrite_core_type(context, field.typ) },
+						func(
+							field,
+						): { field |
+							typ = rewrite_core_type(context, field.typ).get_or(field.typ)
+						},
 					)
 				},
 			)
@@ -2542,12 +2953,20 @@ private pure func rewrite_decl_types(context: CoreTypeRewriteContext, decl: Core
 			HeapRecordDecl(
 				{ record_decl |
 					fields = record_decl.fields.map(
-						func(field): { field | typ = rewrite_core_type(context, field.typ) },
+						func(
+							field,
+						): { field |
+							typ = rewrite_core_type(context, field.typ).get_or(field.typ)
+						},
 					)
 				},
 			)
 		TypeAliasDecl(alias_decl):
-			TypeAliasDecl({ alias_decl | target = rewrite_core_type(context, alias_decl.target) })
+			TypeAliasDecl(
+				{ alias_decl |
+					target = rewrite_core_type(context, alias_decl.target).get_or(alias_decl.target)
+				},
+			)
 		TraitDecl(trait_decl):
 			TraitDecl(
 				{ trait_decl |
@@ -2558,7 +2977,10 @@ private pure func rewrite_decl_types(context: CoreTypeRewriteContext, decl: Core
 			)
 		ImplDecl(impl_decl):
 			ImplDecl({ impl_decl |
-					for_type = rewrite_core_type(context, impl_decl.for_type),
+					for_type = rewrite_core_type(
+						context,
+						impl_decl.for_type,
+					).get_or(impl_decl.for_type),
 					methods = impl_decl.methods.map(
 						func(method): rewrite_function_types(context, method),
 					)
