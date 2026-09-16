@@ -99,17 +99,19 @@ import:
 		CoreFunctionKind(ProgramEntrypointFunction),
 		CoreProgram,
 		core_program_to_json,
-	stage_09_core/late_invariants:
-		check_definition_id_uniqueness,
-		check_late_core_invariants,
-		core_late_invariant_message,
 	stage_09_core/pipeline:
+		CorePassControl,
+		CorePassObservation,
+		CorePassRun(CorePassesCompleted, CorePassesFailed, CorePassesStopped),
+		CorePassTiming,
 		PreparedCoreProgram,
+		late_core_pass_name,
+		late_core_pass_stage_name,
+		late_core_passes,
+		prepared_core_program,
 		prepared_core_program_value,
-		run_core_pipeline_stage,
-		run_pre_dce_tail,
-	stage_09_core/pipeline_stage: CorePipelineStage(FinalStage)
-	stage_09_core/record_update: record_update_carrier_survives
+		run_core_passes,
+	stage_09_core/pipeline_stage: CorePipelineStage
 	stage_09_core/resolve:
 		CoreResolveImportBinding(
 			CoreExactSelectiveDefinitionImport,
@@ -438,9 +440,9 @@ record LateCoreStageRequest {
 
 
 union LateCoreExecution:
-	LateCoreCompleted(PreparedCoreProgram, List[CoreObservation])
-	LateCoreStopped(String, String, List[CoreObservation])
-	LateCoreFailed(String, String)
+	LateCoreCompleted(PreparedCoreProgram, List[CoreObservation], List[CorePassTiming])
+	LateCoreStopped(String, String, List[CoreObservation], List[CorePassTiming])
+	LateCoreFailed(String, String, List[CorePassTiming])
 
 
 union EarlyCorePhaseExecution:
@@ -1175,81 +1177,73 @@ private pure func stops_at_late_stage(action: LateCoreStageAction) -> Bool:
 			False
 
 
-pure func late_core_invariant(stage: CorePipelineStage, program: CoreProgram) -> Option[String]:
-	match check_late_core_invariants(stage, program):
-		[violation, ..._]:
-			Some(core_late_invariant_message(violation))
-		[]:
-			None
+private pure func observed_late_pass_names(stages: List[LateCoreStageRequest]) -> List[String]:
+	var names: List[String] = []
+
+	for stage in stages:
+		if observes_late_stage(stage.action):
+			names = names.append(late_core_pass_name(stage.stage))
+
+	names
 
 
-private pure func required_final_invariant(program: CoreProgram) -> Option[String]:
-	if record_update_carrier_survives(program):
-		Some("record update survived ownership normalization")
-	else:
-		match check_definition_id_uniqueness(program):
-			[violation, ..._]:
-				Some(core_late_invariant_message(violation))
-			[]:
-				None
+private pure func late_stop_pass_name(stages: List[LateCoreStageRequest]) -> Option[String]:
+	var stop: Option[String] = None
+
+	for stage in stages:
+		if stop.is_none() and stops_at_late_stage(stage.action):
+			stop = Some(late_core_pass_name(stage.stage))
+
+	stop
 
 
-pure func execute_late_core_stages(
+private pure func late_core_observations(
+	observations: List[CoreObservation],
+	pass_observations: List[CorePassObservation],
+) -> List[CoreObservation]:
+	var rendered: List[CoreObservation] = observations
+
+	for observation in pass_observations:
+		rendered = rendered.append({
+			stage_name = late_core_pass_stage_name(observation.name),
+			rendered = observation.rendered,
+		})
+
+	rendered
+
+
+-- One walk of the late-Core pass list. Requested snapshots name a pass, so a
+-- compile that asks for several no longer replays the prefix for each one.
+func execute_late_core_stages(
 	pre_dce_core: CoreProgram,
 	observations: List[CoreObservation],
 	stages: List[LateCoreStageRequest],
 	check_invariants: Bool,
+	record_timings: Bool,
 ) -> LateCoreExecution:
-	match stages:
-		[]:
-			completed: PreparedCoreProgram = run_pre_dce_tail(pre_dce_core)
-			program: CoreProgram = prepared_core_program_value(completed)
+	control: CorePassControl = {
+		observe = observed_late_pass_names(stages),
+		stop_after = late_stop_pass_name(stages),
+		check_invariants = check_invariants,
+		record_timings = record_timings
+	}
 
-			-- Keep the fast ownership and identity checks on every compile. The
-			-- broader expression-tree audit remains opt-in through adapter policy.
-			final_invariant_error: Option[String] = if check_invariants:
-				late_core_invariant(FinalStage, program)
-			else:
-				required_final_invariant(program)
-
-			match final_invariant_error:
-				Some(detail):
-					LateCoreFailed("final", detail)
-				None:
-					LateCoreCompleted(completed, observations)
-		[stage, ...remaining]:
-			transformed: CoreProgram = run_core_pipeline_stage(stage.stage, pre_dce_core)
-
-			invariant_error: Option[String] = if check_invariants:
-				late_core_invariant(stage.stage, transformed)
-			else:
-				None
-
-			match invariant_error:
-				Some(detail):
-					LateCoreFailed(stage.name, detail)
-				None:
-					rendered: String = core_program_to_json(transformed).to_string()
-
-					updated_observations: List[CoreObservation] = if observes_late_stage(
-						stage.action,
-					):
-						observations.append({
-							stage_name = stage.name,
-							rendered = rendered,
-						})
-					else:
-						observations
-
-					if stops_at_late_stage(stage.action):
-						LateCoreStopped(stage.name, rendered, updated_observations)
-					else:
-						execute_late_core_stages(
-							transformed,
-							updated_observations,
-							remaining,
-							check_invariants,
-						)
+	match run_core_passes(late_core_passes(), pre_dce_core, control):
+		CorePassesCompleted(program, pass_observations, timings):
+			LateCoreCompleted(
+				prepared_core_program(program),
+				late_core_observations(observations, pass_observations),
+				timings,
+			)
+		CorePassesStopped(pass_name, rendered, pass_observations, timings):
+			LateCoreStopped(
+				late_core_pass_stage_name(pass_name),
+				rendered,
+				late_core_observations(observations, pass_observations),
+				timings,
+			)
+		CorePassesFailed(pass_name, detail, timings):
+			LateCoreFailed(late_core_pass_stage_name(pass_name), detail, timings)
 
 
 private pure func build_artifact_error_message(error: BuildArtifactError) -> String:
@@ -1258,9 +1252,10 @@ private pure func build_artifact_error_message(error: BuildArtifactError) -> Str
 			"invalid foreign link arguments in semantic Core: `${arguments}`"
 
 
-pure func run_late_core_compilation(
+func run_late_core_compilation(
 	projected: RuntimeProjectedCompilation,
 	stages: List[LateCoreStageRequest],
+	record_timings: Bool,
 ) -> LateCoreExecution:
 	representation: RuntimeProjectedCompilationRep = from_opaque RuntimeProjectedCompilation(
 		projected
@@ -1270,6 +1265,7 @@ pure func run_late_core_compilation(
 		representation.observations,
 		stages,
 		representation.check_invariants,
+		record_timings,
 	)
 
 
@@ -1304,15 +1300,15 @@ pure func construct_backend_artifact(
 			ArtifactConstructionPhaseFailed(build_artifact_error_message(error))
 
 
-pure func finish_compiler_pipeline(
+func finish_compiler_pipeline(
 	pre_dce_core: CoreProgram,
 	observations: List[CoreObservation],
 	stages: List[LateCoreStageRequest],
 	check_invariants: Bool,
 	configuration: BuildArtifactConfiguration,
 ) -> FinishedCompilerPipeline:
-	match execute_late_core_stages(pre_dce_core, observations, stages, check_invariants):
-		LateCoreCompleted(completed_core, completed_observations):
+	match execute_late_core_stages(pre_dce_core, observations, stages, check_invariants, False):
+		LateCoreCompleted(completed_core, completed_observations, _):
 			match emit_backend_c(completed_core, configuration):
 				BackendEmissionPhaseReady(emission):
 					match construct_backend_artifact(emission):
@@ -1322,7 +1318,7 @@ pure func finish_compiler_pipeline(
 							CompilerPipelineArtifactFailed(message)
 				BackendEmissionPhaseFailed(message):
 					CompilerPipelineEmitFailed(message)
-		LateCoreStopped(stage_name, rendered, stopped_observations):
+		LateCoreStopped(stage_name, rendered, stopped_observations, _):
 			CompilerPipelineStopped(stage_name, rendered, stopped_observations)
-		LateCoreFailed(stage_name, detail):
+		LateCoreFailed(stage_name, detail, _):
 			CompilerPipelineInvariantFailed(stage_name, detail)

@@ -10,6 +10,10 @@ import:
 	early_stages as CoreEarlyStages
 	fairness: insert_cooperative_checkpoints
 	ir: CoreProgram, core_program_to_json
+	late_invariants:
+		check_definition_id_uniqueness,
+		check_late_core_invariants,
+		core_late_invariant_message,
 	match_projection as CoreMatchProjection
 	perceus as CorePerceus
 	pipeline_stage:
@@ -30,6 +34,9 @@ import:
 			SpecializeStage,
 			StaticStringLiteralsStage,
 		),
+		DESUGAR_STAGE,
+		FINAL_STAGE,
+		LIST_LAYOUT_STAGE,
 	prepare as CorePrepare
 	record_update as CoreRecordUpdate
 	resolve as CoreResolve
@@ -191,122 +198,287 @@ pure func prepared_core_program_value(prepared: PreparedCoreProgram) -> CoreProg
 	from_opaque PreparedCoreProgram(prepared)
 
 
-pure func run_reuse_stage(program: CoreProgram) -> CoreProgram:
+ADAPT_FUNCTION_REFS_PASS: String = "adapt_function_refs"
+
+TENSOR_SPECIALIZE_PASS: String = "tensor_specialize"
+
+SPECIALIZE_PASS: String = "specialize"
+
+RESOLVE_CALLABLES_PASS: String = "resolve_callables"
+
+BACKEND_PROJECTION_PASS: String = "backend_projection"
+
+MATCH_PROJECTION_PASS: String = "match_projection"
+
+DCE_PASS: String = "dce"
+
+CONSUME_SPECIALIZE_PASS: String = "consume_specialize"
+
+STATIC_STRING_LITERALS_PASS: String = "static_string_literals"
+
+RECORD_UPDATE_OWNERSHIP_PASS: String = "record_update_ownership"
+
+DICT_LITERAL_OWNERSHIP_PASS: String = "dict_literal_ownership"
+
+PERCEUS_PASS: String = "perceus"
+
+REUSE_PASS: String = "reuse"
+
+CLOSURE_PASS: String = "closure"
+
+RESOURCE_MANAGEMENT_PASS: String = "resource_management"
+
+FAIRNESS_PASS: String = "fairness"
+
+PREPARE_PASS: String = "prepare"
+
+PREPARED_REUSE_PASS: String = "prepared_reuse"
+
+
+-- Invariants that run on every compile. Keep these O(1) or near it; the full
+-- structural walks belong in `checked_invariant`.
+pure func required_final_invariant(program: CoreProgram) -> Option[String]:
+	if CoreRecordUpdate.record_update_carrier_survives(program):
+		Some("record update survived ownership normalization")
+	else:
+		match check_definition_id_uniqueness(program):
+			[violation, ..._]:
+				Some(core_late_invariant_message(violation))
+			[]:
+				None
+
+
+pure func late_core_invariant(stage: CorePipelineStage, program: CoreProgram) -> Option[String]:
+	match check_late_core_invariants(stage, program):
+		[violation, ..._]:
+			Some(core_late_invariant_message(violation))
+		[]:
+			None
+
+
+private pure func checked_late_core_pass(
+	name: String,
+	run: pure (CoreProgram) -> CoreProgram,
+	stage: CorePipelineStage,
+) -> CorePass:
+	walk: pure (CoreProgram) -> Option[String] = func(program):
+		late_core_invariant(stage, program)
+
+	{ core_pass(name, run) | checked_invariant = walk }
+
+
+pure func run_adapt_function_refs_pass(program: CoreProgram) -> CoreProgram:
+	CoreClosure.adapt_function_refs_program(program)
+
+
+pure func run_tensor_specialize_pass(program: CoreProgram) -> CoreProgram:
+	CoreTensorSpecialize.specialize_program(program)
+
+
+pure func run_specialize_pass(program: CoreProgram) -> CoreProgram:
+	CoreSpecialize.specialize_program(program)
+
+
+pure func run_resolve_callables_pass(program: CoreProgram) -> CoreProgram:
+	CoreResolve.resolve_callable_id_calls(program)
+
+
+pure func run_backend_projection_pass(program: CoreProgram) -> CoreProgram:
+	CoreBackendProjection.project_backend_calls(program)
+
+
+pure func run_match_projection_pass(program: CoreProgram) -> CoreProgram:
+	CoreMatchProjection.project_backend_matches(program)
+
+
+pure func run_dce_pass(program: CoreProgram) -> CoreProgram:
+	CoreDce.prune_program(program)
+
+
+pure func run_consume_specialize_pass(program: CoreProgram) -> CoreProgram:
+	CoreConsumeSpecialize.rewrite_program(program)
+
+
+pure func run_static_string_literals_pass(program: CoreProgram) -> CoreProgram:
+	CoreStaticStringLiterals.rewrite_static_string_literals(program)
+
+
+pure func run_record_update_ownership_pass(program: CoreProgram) -> CoreProgram:
+	CoreRecordUpdate.lower_record_updates_for_ownership(program)
+
+
+pure func run_dict_literal_ownership_pass(program: CoreProgram) -> CoreProgram:
+	CorePrepare.prepare_dict_literals_for_ownership(program)
+
+
+pure func run_perceus_pass(program: CoreProgram) -> CoreProgram:
+	CorePerceus.insert_drops_program(program)
+
+
+pure func run_reuse_pass(program: CoreProgram) -> CoreProgram:
 	CoreReuse.rewrite_post_perceus_program(program)
+
+
+pure func run_closure_pass(program: CoreProgram) -> CoreProgram:
+	CoreClosure.convert_program(program)
+
+
+pure func run_resource_management_pass(program: CoreProgram) -> CoreProgram:
+	rewrite_resource_program(program)
+
+
+pure func run_fairness_pass(program: CoreProgram) -> CoreProgram:
+	insert_cooperative_checkpoints(program)
+
+
+pure func run_prepare_pass(program: CoreProgram) -> CoreProgram:
+	CorePrepare.prepare_program(program)
+
+
+pure func run_prepared_reuse_pass(program: CoreProgram) -> CoreProgram:
+	CoreReuse.rewrite_prepared_program(program)
+
+
+private pure func final_checked_invariant(program: CoreProgram) -> Option[String]:
+	late_core_invariant(FinalStage, program)
+
+
+-- The last pass carries the only production invariant: the fast ownership and
+-- identity checks that no compile may skip.
+private pure func final_late_core_pass() -> CorePass:
+	{
+		name = PREPARED_REUSE_PASS,
+		run = run_prepared_reuse_pass,
+		invariant = required_final_invariant,
+		checked_invariant = final_checked_invariant
+	}
+
+
+-- The one ordered late-Core pass list. Every consumer -- production compiles,
+-- `--dump-core-after`, `--stop-after`, the work profiler, and the backend
+-- bridge -- derives its ordering from this list. ABI specialization stays last
+-- in the projection prefix: earlier normalizers rebuild expression trees and
+-- must not reintroduce unboxed erased-runtime arguments.
+pure func late_core_passes() -> List[CorePass]:
+	[
+		core_pass(ADAPT_FUNCTION_REFS_PASS, run_adapt_function_refs_pass),
+		core_pass(TENSOR_SPECIALIZE_PASS, run_tensor_specialize_pass),
+		checked_late_core_pass(SPECIALIZE_PASS, run_specialize_pass, SpecializeStage),
+		core_pass(RESOLVE_CALLABLES_PASS, run_resolve_callables_pass),
+		core_pass(BACKEND_PROJECTION_PASS, run_backend_projection_pass),
+		core_pass(MATCH_PROJECTION_PASS, run_match_projection_pass),
+		checked_late_core_pass(DCE_PASS, run_dce_pass, DceStage),
+		checked_late_core_pass(
+			CONSUME_SPECIALIZE_PASS,
+			run_consume_specialize_pass,
+			ConsumeSpecializeStage,
+		),
+		checked_late_core_pass(
+			STATIC_STRING_LITERALS_PASS,
+			run_static_string_literals_pass,
+			StaticStringLiteralsStage,
+		),
+		core_pass(RECORD_UPDATE_OWNERSHIP_PASS, run_record_update_ownership_pass),
+		core_pass(DICT_LITERAL_OWNERSHIP_PASS, run_dict_literal_ownership_pass),
+		checked_late_core_pass(PERCEUS_PASS, run_perceus_pass, PerceusStage),
+		checked_late_core_pass(REUSE_PASS, run_reuse_pass, ReuseStage),
+		checked_late_core_pass(CLOSURE_PASS, run_closure_pass, ClosureStage),
+		core_pass(RESOURCE_MANAGEMENT_PASS, run_resource_management_pass),
+		core_pass(FAIRNESS_PASS, run_fairness_pass),
+		core_pass(PREPARE_PASS, run_prepare_pass),
+		final_late_core_pass(),
+	]
+
+
+-- User-visible stage names are aliases for the pass they end at. The tail
+-- stage names all name the end of the list.
+pure func late_core_pass_name(stage: CorePipelineStage) -> String:
+	match stage:
+		DesugarStage:
+			DESUGAR_STAGE
+		ListLayoutStage:
+			LIST_LAYOUT_STAGE
+		SpecializeStage:
+			SPECIALIZE_PASS
+		DceStage:
+			DCE_PASS
+		ConsumeSpecializeStage:
+			CONSUME_SPECIALIZE_PASS
+		StaticStringLiteralsStage:
+			STATIC_STRING_LITERALS_PASS
+		PerceusStage:
+			PERCEUS_PASS
+		ReuseStage:
+			REUSE_PASS
+		ClosureStage:
+			CLOSURE_PASS
+		PreDceTailStage:
+			PREPARED_REUSE_PASS
+		PostDceTailStage:
+			PREPARED_REUSE_PASS
+		PostPerceusTailStage:
+			PREPARED_REUSE_PASS
+		PreClosureTailStage:
+			PREPARED_REUSE_PASS
+		PostClosureTailStage:
+			PREPARED_REUSE_PASS
+		FinalStage:
+			PREPARED_REUSE_PASS
+
+
+-- Pure evaluation of a contiguous span of the list, for snapshot tests, the
+-- work profiler, and the backend bridge. Production compiles go through
+-- `run_core_passes`, which also times, observes, stops, and checks invariants.
+pure func run_late_core_span(
+	from_pass: Option[String],
+	through_pass: Option[String],
+	program: CoreProgram,
+) -> CoreProgram:
+	var current: CoreProgram = program
+	var running: Bool = from_pass.is_none()
+	var done: Bool = False
+
+	for pass in late_core_passes():
+		if not done:
+			if not running and core_pass_stops(from_pass, pass.name):
+				running = True
+
+			if running:
+				current = pass.run(current)
+
+				if core_pass_stops(through_pass, pass.name):
+					done = True
+
+	current
 
 
 pure func run_list_layout_stage(program: CoreProgram) -> CoreProgram:
 	CoreEarlyStages.run_list_layout_stage(program)
 
 
-pure func run_closure_stage(program: CoreProgram) -> CoreProgram:
-	CoreClosure.convert_program(run_reuse_stage(program))
-
-
-pure func run_post_closure_tail(program: CoreProgram) -> CoreProgram:
-	resource_program: CoreProgram = rewrite_resource_program(program)
-	checked_program: CoreProgram = insert_cooperative_checkpoints(resource_program)
-	prepared_program: CoreProgram = CorePrepare.prepare_program(checked_program)
-
-	CoreReuse.rewrite_prepared_program(prepared_program)
-
-
-pure func run_pre_closure_tail(program: CoreProgram) -> CoreProgram:
-	run_post_closure_tail(CoreClosure.convert_program(program))
-
-
-pure func run_post_perceus_tail(program: CoreProgram) -> CoreProgram:
-	run_pre_closure_tail(run_reuse_stage(program))
-
-
-pure func run_consume_specialize_stage(program: CoreProgram) -> CoreProgram:
-	CoreConsumeSpecialize.rewrite_program(program)
-
-
-pure func run_static_string_literals_stage(program: CoreProgram) -> CoreProgram:
-	CoreStaticStringLiterals.rewrite_static_string_literals(program)
-
-
-pure func run_dce_stage(program: CoreProgram) -> CoreProgram:
-	CoreDce.prune_program(program)
-
-
 pure func run_specialize_stage(program: CoreProgram) -> CoreProgram:
-	function_refs_adapted: CoreProgram = CoreClosure.adapt_function_refs_program(program)
-	tensor_specialized: CoreProgram = CoreTensorSpecialize.specialize_program(function_refs_adapted)
-
-	-- Keep ABI specialization last: earlier normalizers rebuild expression
-	-- trees and must not reintroduce unboxed erased-runtime arguments.
-	CoreSpecialize.specialize_program(tensor_specialized)
-
-
-pure func run_projected_dce_stage(program: CoreProgram) -> CoreProgram:
-	function_refs_adapted: CoreProgram = run_specialize_stage(program)
-	resolved_program: CoreProgram = CoreResolve.resolve_callable_id_calls(function_refs_adapted)
-	backend_projected: CoreProgram = CoreBackendProjection.project_backend_calls(resolved_program)
-	match_projected: CoreProgram = CoreMatchProjection.project_backend_matches(backend_projected)
-
-	run_dce_stage(match_projected)
+	run_late_core_span(None, Some(SPECIALIZE_PASS), program)
 
 
 pure func prepare_perceus_input(program: CoreProgram) -> CoreProgram:
-	consumed_program: CoreProgram = run_consume_specialize_stage(program)
-	static_literals_program: CoreProgram = run_static_string_literals_stage(consumed_program)
-	materialized_program: CoreProgram = CoreRecordUpdate.lower_record_updates_for_ownership(
-		static_literals_program,
-	)
-	CorePrepare.prepare_dict_literals_for_ownership(materialized_program)
+	run_late_core_span(Some(CONSUME_SPECIALIZE_PASS), Some(DICT_LITERAL_OWNERSHIP_PASS), program)
 
 
 pure func run_perceus_stage(program: CoreProgram) -> CoreProgram:
-	CorePerceus.insert_drops_program(prepare_perceus_input(program))
+	run_late_core_span(Some(CONSUME_SPECIALIZE_PASS), Some(PERCEUS_PASS), program)
 
 
-pure func run_post_dce_tail(program: CoreProgram) -> CoreProgram:
-	run_post_perceus_tail(run_perceus_stage(program))
+pure func run_post_perceus_tail(program: CoreProgram) -> CoreProgram:
+	run_late_core_span(Some(REUSE_PASS), None, program)
 
 
 pure func run_pre_dce_tail(program: CoreProgram) -> PreparedCoreProgram:
-	prepared_core_program(run_post_dce_tail(run_projected_dce_stage(program)))
+	prepared_core_program(run_late_core_span(None, None, program))
 
 
-pure func run_core_pipeline_stage(stage: CorePipelineStage, program: CoreProgram) -> CoreProgram:
-	match stage:
-		DesugarStage:
-			CoreEarlyStages.run_desugar_stage(program)
-		ListLayoutStage:
-			run_list_layout_stage(program)
-		SpecializeStage:
-			run_specialize_stage(program)
-		PreDceTailStage:
-			prepared_core_program_value(run_pre_dce_tail(program))
-		PostDceTailStage:
-			run_post_dce_tail(run_projected_dce_stage(program))
-		PostPerceusTailStage:
-			run_post_perceus_tail(run_perceus_stage(run_projected_dce_stage(program)))
-		PreClosureTailStage:
-			run_pre_closure_tail(
-				run_reuse_stage(run_perceus_stage(run_projected_dce_stage(program))),
-			)
-		PostClosureTailStage:
-			run_post_closure_tail(
-				CoreClosure.convert_program(
-					run_reuse_stage(run_perceus_stage(run_projected_dce_stage(program))),
-				),
-			)
-		ConsumeSpecializeStage:
-			run_consume_specialize_stage(run_projected_dce_stage(program))
-		StaticStringLiteralsStage:
-			run_static_string_literals_stage(
-				run_consume_specialize_stage(run_projected_dce_stage(program)),
-			)
-		DceStage:
-			run_projected_dce_stage(program)
-		PerceusStage:
-			run_perceus_stage(run_projected_dce_stage(program))
-		ReuseStage:
-			run_reuse_stage(run_perceus_stage(run_projected_dce_stage(program)))
-		ClosureStage:
-			run_closure_stage(run_perceus_stage(run_projected_dce_stage(program)))
-		FinalStage:
-			prepared_core_program_value(run_pre_dce_tail(program))
+-- Failure and stop reporting uses the user-visible stage name for the pass.
+pure func late_core_pass_stage_name(pass_name: String) -> String:
+	if pass_name == PREPARED_REUSE_PASS:
+		FINAL_STAGE
+	else:
+		pass_name
