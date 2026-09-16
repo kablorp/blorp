@@ -109,6 +109,30 @@ def rewrite_expectation_failures(original: Path, rewritten: str) -> list[str]:
     return failures
 
 
+def formatted_fixpoint_failures(compiler: Path, fixture: Path, timeout: int) -> list[str]:
+    """Format a copy of a should_fail fixture and require the result to be a fixpoint.
+
+    The formatter must accept its own output unchanged; otherwise `format --check`
+    cannot serve as a gate over freshly formatted trees.
+    """
+    with tempfile.TemporaryDirectory(prefix="blorp-format-fixpoint-") as temp_dir:
+        formatted_path = Path(temp_dir) / fixture.name
+        shutil.copyfile(fixture, formatted_path)
+        write = run_command([str(compiler), "format", str(formatted_path)], timeout)
+        if write.returncode != 0:
+            return ["formatter failed to rewrite the source"] + output_details(
+                write, "formatter"
+            )
+        recheck = run_command(
+            [str(compiler), "format", "--diff", str(formatted_path)], timeout
+        )
+    if recheck.returncode == 0:
+        return []
+    return ["formatted output is not a fixpoint"] + output_details(
+        recheck, "formatter recheck"
+    )
+
+
 def run_fixture(compiler: Path, fixture: Fixture, timeout: int) -> list[str]:
     if fixture.kind in {
         FixtureKind.FORMAT_PASS,
@@ -127,7 +151,7 @@ def run_fixture(compiler: Path, fixture: Fixture, timeout: int) -> list[str]:
         if result.returncode != 1:
             return output_details(result, "formatter")
         if fixture.kind is FixtureKind.FORMAT_FAIL:
-            return []
+            return formatted_fixpoint_failures(compiler, fixture.path, timeout)
         failures = expectation_failures(
             parse_expectations(fixture.path.read_text(encoding="utf-8")),
             result.output,
