@@ -169,6 +169,28 @@ import:
 	test: TestSuite
 
 
+OTHER_SLOT_ASSIGNMENT_OWNERSHIP_EVENT_SIGNATURE: String = (
+	"root.rhs.dup=dup:source;root.body.first.rhs.dup=dup:other_source;root.body."
+	+ "first.body.first.first.rhs.dup=dup:xs;root.body.first.body.first.first.body."
+	+ "first.drop=drop:other;root.body.first.body.first.second.body.first.drop=drop:xs;"
+	+ "root.body.first.body.second.drop=drop:other;root.body.second.drop=drop:xs;"
+)
+
+LET_SPINE_OWNERSHIP_EVENT_SIGNATURE: String = (
+	"root.rhs.dup=dup:source;root.body.body.body.body.body.body.body.cases[0].body."
+	+ "expr.then.body.drop=drop:xs;"
+)
+
+SEQ_SPINE_OWNERSHIP_EVENT_SIGNATURE: String = (
+	"root.rhs.dup=dup:source;root.body.second.second.second.second.second.second."
+	+ "cases[0].body.expr.then.body.drop=drop:xs;"
+)
+
+NESTED_SPINE_OWNERSHIP_EVENT_SIGNATURE: String = (
+	"root.rhs.dup=dup:source;root.body.body.body.body.body.body.body.second.second."
+	+ "second.second.second.second.cases[0].body.expr.then.body.drop=drop:xs;"
+)
+
 DEEP_MANAGED_BINDING_COUNT: Int = 2048
 
 DEEP_MANAGED_BINDING_DEF_ID_BASE: Int = 20000
@@ -4127,7 +4149,10 @@ pure func test_simple_multi_parameter_balance_rejects_borrowed_call_argument() -
 		name: String = "value_${index}"
 		params = [core_param(name, string_type())].concat(params)
 		consumed_params = [index].concat(consumed_params)
-		body = SeqExpr(var_expr(name, string_type()), body)
+		body = SeqExpr(
+			var_expr(name, string_type()),
+			body,
+		)
 		index -= 1
 
 	body = SeqExpr(
@@ -4161,7 +4186,10 @@ pure func test_simple_multi_parameter_balance_accepts_unmanaged_cast_wrapper() -
 		name: String = "value_${index}"
 		params = [core_param(name, string_type())].concat(params)
 		consumed_params = [index].concat(consumed_params)
-		body = SeqExpr(var_expr(name, string_type()), body)
+		body = SeqExpr(
+			var_expr(name, string_type()),
+			body,
+		)
 		index -= 1
 
 	body = CastExpr(body, int_type(), SyntheticSourceLoc)
@@ -4188,11 +4216,18 @@ pure func test_simple_multi_parameter_balance_rejects_managed_cast() -> Bool:
 		name: String = "value_${index}"
 		params = [core_param(name, string_type())].concat(params)
 		consumed_params = [index].concat(consumed_params)
-		body = SeqExpr(var_expr(name, string_type()), body)
+		body = SeqExpr(
+			var_expr(name, string_type()),
+			body,
+		)
 		index -= 1
 
 	body = SeqExpr(
-		CastExpr(var_expr("value_0", string_type()), string_type(), SyntheticSourceLoc),
+		CastExpr(
+			var_expr("value_0", string_type()),
+			string_type(),
+			SyntheticSourceLoc,
+		),
 		body,
 	)
 	decl: CoreDecl = function_decl("managed_cast", 8975, params, int_type(), body)
@@ -16361,6 +16396,190 @@ pure func test_many_borrowed_constructor_cases_preserve_ownership() -> Bool:
 			False
 
 
+-- The branch-aware balancer walks a block spine one level at a time and needs
+-- each level's ownership summary. These characterization tests pin the exact
+-- ordered ownership events for a long Let spine and a long Seq spine that both
+-- end in a divergent constructor match, so a change to how those spine
+-- summaries are computed cannot move, add, or drop an ownership operation.
+SPINE_BALANCE_PREFIX_DEPTH: Int = 6
+
+
+pure func spine_prefix_lets(depth: Int, inner: CoreExpr) -> CoreExpr:
+	var result: CoreExpr = inner
+	var index: Int = depth
+
+	while index > 0:
+		result = LetExpr(
+			named_var("spine_prefix_${index}"),
+			False,
+			int_type(),
+			int_expr(index),
+			result,
+		)
+		index -= 1
+
+	result
+
+
+pure func spine_prefix_seq(depth: Int, inner: CoreExpr) -> CoreExpr:
+	var result: CoreExpr = inner
+	var index: Int = depth
+
+	while index > 0:
+		result = SeqExpr(int_expr(index), result)
+		index -= 1
+
+	result
+
+
+pure func ownership_event_path_signature(events: List[OwnershipEvent]) -> String:
+	var signature: String = ""
+
+	for event in events:
+		kind: String = match event.operation:
+			OwnershipRetainEvent(policy):
+				"dup"
+			OwnershipReleaseEvent(policy):
+				"drop"
+
+		signature += "${event.path}=${kind}:${event.variable.name};"
+
+	signature
+
+
+func ownership_event_signature_matches(expr: CoreExpr, expected: String) -> Bool:
+	match checked_ownership_events(expr):
+		None:
+			False
+		Some(events):
+			actual: String = ownership_event_path_signature(events)
+
+			if actual != expected:
+				print_error("ownership event signature: ${actual}")
+				False
+			else:
+				True
+
+
+pure func divergent_owner_match_body() -> CoreExpr:
+	borrow: CoreExpr = intrinsic_expr("list_len", [var_expr("xs", list_int_type())], int_type())
+	consume: CoreExpr = intrinsic_expr(
+		"list_ensure_unique",
+		[var_expr("xs", list_int_type())],
+		list_int_type(),
+	)
+	case_body: CoreExpr = IfExpr(
+		bool_expr(True),
+		borrow,
+		SeqExpr(consume, int_expr(1)),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+	constructor_match_expr(
+		[constructor_case("Some", [], case_body)],
+		SeqExpr(consume, int_expr(0)),
+		int_type(),
+	)
+
+
+pure func managed_owner_binding(body: CoreExpr) -> CoreExpr:
+	LetExpr(
+		named_var("xs"),
+		False,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		body,
+	)
+
+
+func test_branch_balance_preserves_ownership_events_on_long_let_spine() -> Bool:
+	expr: CoreExpr = managed_owner_binding(
+		spine_prefix_lets(
+			SPINE_BALANCE_PREFIX_DEPTH,
+			divergent_owner_match_body(),
+		),
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		expr,
+	)
+
+	ownership_event_signature_matches(rewritten, LET_SPINE_OWNERSHIP_EVENT_SIGNATURE)
+
+
+func test_branch_balance_preserves_ownership_events_on_long_seq_spine() -> Bool:
+	expr: CoreExpr = managed_owner_binding(
+		spine_prefix_seq(
+			SPINE_BALANCE_PREFIX_DEPTH,
+			divergent_owner_match_body(),
+		),
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		expr,
+	)
+
+	ownership_event_signature_matches(rewritten, SEQ_SPINE_OWNERSHIP_EVENT_SIGNATURE)
+
+
+func test_branch_balance_preserves_ownership_events_on_nested_let_seq_spine() -> Bool:
+	expr: CoreExpr = managed_owner_binding(
+		spine_prefix_lets(
+			SPINE_BALANCE_PREFIX_DEPTH,
+			spine_prefix_seq(SPINE_BALANCE_PREFIX_DEPTH, divergent_owner_match_body()),
+		),
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		expr,
+	)
+
+	ownership_event_signature_matches(rewritten, NESTED_SPINE_OWNERSHIP_EVENT_SIGNATURE)
+
+
+-- Rewriting a mutable region visits every assignment it contains, including
+-- assignments that install into some other slot. Only the install for the
+-- region's own target reads the summary of the stabilized RHS, so this pins
+-- the full ownership-event signature for a region whose body assigns to a
+-- different slot from an expression that consumes the region's owner.
+func test_assignment_to_other_slot_preserves_owner_events_in_mutable_region() -> Bool:
+	consume: CoreExpr = intrinsic_expr(
+		"list_ensure_unique",
+		[var_expr("xs", list_int_type())],
+		list_int_type(),
+	)
+	body: CoreExpr = SeqExpr(
+		AssignExpr(named_var("other"), consume, void_type(), SyntheticSourceLoc),
+		AssignExpr(
+			named_var("xs"),
+			call_expr("blorp_list_new", [int_expr(0)], list_int_type()),
+			void_type(),
+			SyntheticSourceLoc,
+		),
+	)
+	inner: CoreExpr = LetExpr(
+		named_var("other"),
+		True,
+		list_int_type(),
+		var_expr("other_source", list_int_type()),
+		body,
+	)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		True,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		inner,
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		expr,
+	)
+
+	ownership_event_signature_matches(rewritten, OTHER_SLOT_ASSIGNMENT_OWNERSHIP_EVENT_SIGNATURE)
+
+
 tests: TestSuite = {
 	description = "Blorp compiler Core Perceus",
 	tests = [
@@ -17671,6 +17890,22 @@ tests: TestSuite = {
 		(
 			"many borrowed constructor cases preserve ownership",
 			test_many_borrowed_constructor_cases_preserve_ownership,
+		),
+		(
+			"branch balance preserves ownership events on long let spine",
+			test_branch_balance_preserves_ownership_events_on_long_let_spine,
+		),
+		(
+			"branch balance preserves ownership events on long seq spine",
+			test_branch_balance_preserves_ownership_events_on_long_seq_spine,
+		),
+		(
+			"branch balance preserves ownership events on nested let seq spine",
+			test_branch_balance_preserves_ownership_events_on_nested_let_seq_spine,
+		),
+		(
+			"assignment to other slot preserves owner events in mutable region",
+			test_assignment_to_other_slot_preserves_owner_events_in_mutable_region,
 		),
 	]
 }

@@ -2489,22 +2489,23 @@ private pure func summarize_call_args(
 	modes: List[OwnershipArgMode],
 	args: List[CoreExpr],
 ) -> List[OwnershipUseSummary]:
-	match modes:
-		[]:
-			[]
-		[mode, ...mode_tail]:
-			match args:
-				[]:
-					[]
-				[arg, ...arg_tail]:
-					var summaries: List[OwnershipUseSummary] = [
-						summarize_linear_call_arg(env, name, mode, arg),
-					]
+	-- One summary per argument that the contract describes a mode for, in
+	-- argument order. Peeling both lists one head at a time rebuilt a tail
+	-- pair and a result list at every position, so a call with n arguments
+	-- allocated O(n^2) lists to produce n summaries.
+	var summaries: List[OwnershipUseSummary] = []
+	var index: Int = 0
 
-					for summary in summarize_call_args(env, name, mode_tail, arg_tail):
-						summaries = summaries.append(summary)
+	for arg in args:
+		match modes.get(index):
+			Some(mode):
+				summaries = summaries.append(summarize_linear_call_arg(env, name, mode, arg))
+			None:
+				void
 
-					summaries
+		index += 1
+
+	summaries
 
 
 private pure func call_result_aliases_from_borrowed_args(
@@ -6103,11 +6104,6 @@ private pure func balance_nested_branch_body(
 				variable.name,
 				first,
 			)
-			second_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
-				env,
-				variable.name,
-				second,
-			)
 			first_has_divergent_branches: Bool = balanced_path_has_divergent_constructor_match(
 				env,
 				variable.name,
@@ -6115,6 +6111,16 @@ private pure func balance_nested_branch_body(
 			)
 
 			if first_has_divergent_branches:
+				-- Only a divergent head splits this level into two balanced
+				-- regions. The continuation summary is the whole remaining
+				-- spine, so summarizing it before the head is classified walks
+				-- every suffix once per level.
+				second_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
+					env,
+					variable.name,
+					second,
+				)
+
 				if not second_uses.touched:
 					Some(
 						SeqExpr(
@@ -6165,13 +6171,18 @@ private pure func balance_nested_branch_body(
 					variable.name,
 					rhs,
 				)
-				body_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
-					env,
-					variable.name,
-					inner_body,
-				)
 
 				if balanced_path_has_divergent_constructor_match(env, variable.name, rhs):
+					-- Only a divergent RHS splits this binding into two balanced
+					-- regions. The continuation summary is the whole remaining
+					-- spine, so summarizing it before the RHS is classified walks
+					-- every suffix once per level.
+					body_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
+						env,
+						variable.name,
+						inner_body,
+					)
+
 					if not body_uses.touched:
 						-- The normal binding rewrite has already placed the owner's final
 						-- release in this continuation. Balance only the RHS branches or
@@ -6313,147 +6324,162 @@ private pure func balance_nested_branch_body(
 				),
 			)
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
-			scrutinee_aliases_owner: Bool = borrow_expr_aliases_target(
-				env,
-				variable.name,
-				scrutinee,
-			)
+			-- Only branch-aware balancing can rebuild this match, and the
+			-- scrutinee alias test walks the scrutinee. Ask the cheap strategy
+			-- question first so the linear strategy never pays for that walk.
+			if uses_branch_aware_balance(env):
+				scrutinee_aliases_owner: Bool = borrow_expr_aliases_target(
+					env,
+					variable.name,
+					scrutinee,
+				)
 
-			if (
-				uses_branch_aware_balance(env)
-				and literal_match_cases_can_balance(
-					env,
-					variable.name,
-					scrutinee_aliases_owner,
-					cases,
-				)
-				and literal_match_fallback_can_balance(
-					env,
-					variable.name,
-					scrutinee_aliases_owner,
-					fallback,
-				)
-			):
-				scrutinee_uses: OwnershipUseSummary = if scrutinee_aliases_owner:
-					summarize_linear_borrow(env, variable.name, scrutinee)
+				if (
+					literal_match_cases_can_balance(
+						env,
+						variable.name,
+						scrutinee_aliases_owner,
+						cases,
+					)
+					and literal_match_fallback_can_balance(
+						env,
+						variable.name,
+						scrutinee_aliases_owner,
+						fallback,
+					)
+				):
+					scrutinee_uses: OwnershipUseSummary = if scrutinee_aliases_owner:
+						summarize_linear_borrow(env, variable.name, scrutinee)
+					else:
+						summarize_linear_ownership_uses(env, variable.name, scrutinee)
+
+					available_after_scrutinee: Int = max_int(
+						0,
+						available_refs - scrutinee_uses.consumed_refs,
+					)
+
+					Some(
+						LiteralMatchExpr(
+							scrutinee,
+							balance_literal_match_cases(
+								env,
+								variable,
+								value_type,
+								available_after_scrutinee,
+								cases,
+							),
+							balance_literal_match_fallback(
+								env,
+								variable,
+								value_type,
+								available_after_scrutinee,
+								fallback,
+							),
+							typ,
+							loc,
+						),
+					)
 				else:
-					summarize_linear_ownership_uses(env, variable.name, scrutinee)
-
-				available_after_scrutinee: Int = max_int(
-					0,
-					available_refs - scrutinee_uses.consumed_refs,
-				)
-
-				Some(
-					LiteralMatchExpr(
-						scrutinee,
-						balance_literal_match_cases(
-							env,
-							variable,
-							value_type,
-							available_after_scrutinee,
-							cases,
-						),
-						balance_literal_match_fallback(
-							env,
-							variable,
-							value_type,
-							available_after_scrutinee,
-							fallback,
-						),
-						typ,
-						loc,
-					),
-				)
+					None
 			else:
 				None
 		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
-			scrutinee_aliases_owner: Bool = borrow_expr_aliases_target(
-				env,
-				variable.name,
-				scrutinee,
-			)
-
-			if (
-				uses_branch_aware_balance(env)
-				and constructor_literal_match_can_balance(
+			-- Only branch-aware balancing can rebuild this match, and the
+			-- scrutinee alias test walks the scrutinee. Ask the cheap strategy
+			-- question first so the linear strategy never pays for that walk.
+			if uses_branch_aware_balance(env):
+				scrutinee_aliases_owner: Bool = borrow_expr_aliases_target(
 					env,
 					variable.name,
-					scrutinee_aliases_owner,
-					match_expr,
-				)
-				and not (scrutinee_aliases_owner and release_policy != NoReleasePolicy)
-			):
-				scrutinee_uses: OwnershipUseSummary = if scrutinee_aliases_owner:
-					summarize_linear_borrow(env, variable.name, scrutinee)
-				else:
-					summarize_linear_ownership_uses(env, variable.name, scrutinee)
-
-				available_after_scrutinee: Int = max_int(
-					0,
-					available_refs - scrutinee_uses.consumed_refs,
+					scrutinee,
 				)
 
-				Some(
-					AccessorLiteralMatchExpr(
-						scrutinee,
-						release_policy,
-						balance_constructor_literal_match(
-							env,
-							variable,
-							value_type,
-							available_after_scrutinee,
-							match_expr,
+				if (
+					constructor_literal_match_can_balance(
+						env,
+						variable.name,
+						scrutinee_aliases_owner,
+						match_expr,
+					)
+					and not (scrutinee_aliases_owner and release_policy != NoReleasePolicy)
+				):
+					scrutinee_uses: OwnershipUseSummary = if scrutinee_aliases_owner:
+						summarize_linear_borrow(env, variable.name, scrutinee)
+					else:
+						summarize_linear_ownership_uses(env, variable.name, scrutinee)
+
+					available_after_scrutinee: Int = max_int(
+						0,
+						available_refs - scrutinee_uses.consumed_refs,
+					)
+
+					Some(
+						AccessorLiteralMatchExpr(
+							scrutinee,
+							release_policy,
+							balance_constructor_literal_match(
+								env,
+								variable,
+								value_type,
+								available_after_scrutinee,
+								match_expr,
+							),
+							typ,
+							loc,
 						),
-						typ,
-						loc,
-					),
-				)
+					)
+				else:
+					None
 			else:
 				None
 		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
-			scrutinee_aliases_owner: Bool = borrow_expr_aliases_target(
-				env,
-				variable.name,
-				scrutinee,
-			)
-
-			if (
-				uses_branch_aware_balance(env)
-				and constructor_length_match_can_balance(
+			-- Only branch-aware balancing can rebuild this match, and the
+			-- scrutinee alias test walks the scrutinee. Ask the cheap strategy
+			-- question first so the linear strategy never pays for that walk.
+			if uses_branch_aware_balance(env):
+				scrutinee_aliases_owner: Bool = borrow_expr_aliases_target(
 					env,
 					variable.name,
-					scrutinee_aliases_owner,
-					match_expr,
-				)
-				and not (scrutinee_aliases_owner and release_policy != NoReleasePolicy)
-			):
-				scrutinee_uses: OwnershipUseSummary = if scrutinee_aliases_owner:
-					summarize_linear_borrow(env, variable.name, scrutinee)
-				else:
-					summarize_linear_ownership_uses(env, variable.name, scrutinee)
-
-				available_after_scrutinee: Int = max_int(
-					0,
-					available_refs - scrutinee_uses.consumed_refs,
+					scrutinee,
 				)
 
-				Some(
-					LengthMatchExpr(
-						scrutinee,
-						release_policy,
-						balance_constructor_length_match(
-							env,
-							variable,
-							value_type,
-							available_after_scrutinee,
-							scrutinee_aliases_owner,
-							match_expr,
+				if (
+					constructor_length_match_can_balance(
+						env,
+						variable.name,
+						scrutinee_aliases_owner,
+						match_expr,
+					)
+					and not (scrutinee_aliases_owner and release_policy != NoReleasePolicy)
+				):
+					scrutinee_uses: OwnershipUseSummary = if scrutinee_aliases_owner:
+						summarize_linear_borrow(env, variable.name, scrutinee)
+					else:
+						summarize_linear_ownership_uses(env, variable.name, scrutinee)
+
+					available_after_scrutinee: Int = max_int(
+						0,
+						available_refs - scrutinee_uses.consumed_refs,
+					)
+
+					Some(
+						LengthMatchExpr(
+							scrutinee,
+							release_policy,
+							balance_constructor_length_match(
+								env,
+								variable,
+								value_type,
+								available_after_scrutinee,
+								scrutinee_aliases_owner,
+								match_expr,
+							),
+							typ,
+							loc,
 						),
-						typ,
-						loc,
-					),
-				)
+					)
+				else:
+					None
 			else:
 				None
 		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
@@ -11111,15 +11137,6 @@ private pure func rewrite_mutable_assignment_node(
 	else:
 		rhs
 
-	-- Recursive rewriting adds cleanup drops for assignments nested in
-	-- the RHS. The outer install must use the source expression's
-	-- ownership behavior rather than treating those synthetic drops as
-	-- consumption of the value that the nested assignment installed.
-	original_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
-		env,
-		target.name,
-		rhs_with_stable_target,
-	)
 	rhs_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
 		env,
 		target,
@@ -11130,6 +11147,18 @@ private pure func rewrite_mutable_assignment_node(
 	)
 
 	if variable.name == target.name:
+		-- Recursive rewriting adds cleanup drops for assignments nested in
+		-- the RHS. The outer install must use the source expression's
+		-- ownership behavior rather than treating those synthetic drops as
+		-- consumption of the value that the nested assignment installed.
+		-- Only this install reads the summary, so an assignment to a
+		-- different slot must not pay for a walk of the stabilized RHS.
+		original_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
+			env,
+			target.name,
+			rhs_with_stable_target,
+		)
+
 		rewrite_direct_mutable_assignment_with_uses(
 			env,
 			target,
