@@ -21,9 +21,9 @@ first-match order, one helper per commit, measuring after each.
 `prepare.prepare_program` and `prepare_decl`; `dce.close_reachability`;
 `mono_data` where `templates` is collected; the focused suites
 `test_core_perceus.brp`, `test_core_prepare.brp`, `test_core_dce.brp`,
-`test_core_mono*.brp`; [issue 133](133-dce-reachability-fact-application.md)
-and [late-core-latency/02](../late-core-latency/02-index-core-preparation-declarations.md),
-which this issue supersedes; the
+`test_core_mono*.brp`; [issue 133](133-dce-reachability-fact-application.md),
+which this issue supersedes, as it did the deleted
+`late-core-latency/02-index-core-preparation-declarations.md`; the
 [measurement protocol](../../../benchmarks/README.md#self-compile-measurement-protocol).
 
 **Fast loop:**
@@ -68,6 +68,15 @@ this issue's acceptance is instructions and allocations on the self-compile
 with the small-program guard, so the query density argument is now explicit.
 Delete late-core-latency/02 in the same commit and note the decision in the
 handoff.
+
+**Decision (cut B, landed):** a union-name index built once per public
+preparation call cut the self-compile from 532,809,411,705 to
+519,274,731,917 retired instructions (-2.54% on top of cut A) with
+byte-identical C and total allocations up by four. The small program moved
++0.07%, inside its 1% guard. The earlier paired-latency rejection in
+late-core-latency/02 measured a synthetic workload whose query density did
+not match the compiler's; that document is deleted. Record and enum lookups
+stayed as first-match scans.
 
 ### C. Fact application without state copies (dce.brp)
 

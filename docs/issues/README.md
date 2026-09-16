@@ -116,7 +116,6 @@ current-state and next-action summary.
 
 - [COW-capable list concatenation](cow-capable-list-concat.md)
 - [Flat ordered set storage](runtime-performance/02-flat-ordered-set-storage.md)
-- [Core-preparation declaration indexes](late-core-latency/02-index-core-preparation-declarations.md)
 - [Consume-specialization candidate index](late-core-latency/03-index-consume-specialization-candidates.md)
 - [First-match loop cleanup](compiler-first-match-loop-cleanup.md)
 - [Global constant materialization limitations](compiler-global-constant-materialization.md)
