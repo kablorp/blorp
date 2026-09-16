@@ -80,23 +80,61 @@ private pure func increment_entry_occurrences(
 			entries
 
 
+---
+The `ids_by_value` half of `catalog_add_literal`, split out so the record
+update below reads `catalog.ids_by_value` exactly once. `catalog.entries` is
+never read here; the next id comes from `ids_by_value.length()` instead of
+`entries.length()`, since the two collections always grow together.
+---
+private pure func next_ids_by_value(
+	ids_by_value: Dict[String, Int],
+	value: String,
+) -> Dict[String, Int]:
+	match ids_by_value.get(value):
+		Some(_):
+			ids_by_value
+		None:
+			ids_by_value.set(value, ids_by_value.length())
+
+
+---
+The `entries` half of `catalog_add_literal`, split out so the record update
+below reads `catalog.entries` exactly once. Reading `catalog.ids_by_value`
+here is fine: it is a plain lookup (never the field being replaced), so it
+does not defeat the reuse below.
+---
+private pure func next_entries(
+	ids_by_value: Dict[String, Int],
+	entries: List[StaticStringLiteralEntry],
+	value: String,
+) -> List[StaticStringLiteralEntry]:
+	match ids_by_value.get(value):
+		Some(existing_id):
+			increment_entry_occurrences(entries, existing_id)
+		None:
+			entries.append({
+				id = static_string_literal_id(ids_by_value.length()),
+				value = value,
+				occurrences = 1,
+			})
+
+
+---
+A bare, unconditional record update: both field values come from helpers
+that read `catalog`'s two fields exactly once between them, so the
+post-Perceus reuse rewrite can move `entries` out of a unique `catalog`
+instead of retaining it before every insert. Branching here (a `match` on
+`catalog.ids_by_value.get(value)` around the whole record) would hide the
+update from that rewrite, which does not look inside match arms.
+---
 private pure func catalog_add_literal(
 	catalog: StaticStringLiteralCatalog,
 	value: String,
 ) -> StaticStringLiteralCatalog:
-	match catalog.ids_by_value.get(value):
-		Some(existing_id):
-			{ catalog | entries = increment_entry_occurrences(catalog.entries, existing_id) }
-		None:
-			id_value: Int = catalog.entries.length()
-			{
-				ids_by_value = catalog.ids_by_value.set(value, id_value),
-				entries = catalog.entries.append({
-					id = static_string_literal_id(id_value),
-					value = value,
-					occurrences = 1,
-				})
-			}
+	{ catalog |
+		ids_by_value = next_ids_by_value(catalog.ids_by_value, value),
+		entries = next_entries(catalog.ids_by_value, catalog.entries, value)
+	}
 
 
 private pure func collect_expr_literals(
