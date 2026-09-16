@@ -32,7 +32,6 @@ import:
 			UnionDecl,
 			ValueRecordDecl,
 		),
-		CoreDictLiteralEntry,
 		CoreExpr(
 			AssignExpr,
 			BinaryExpr,
@@ -125,7 +124,6 @@ import:
 		CoreProgram,
 		CoreRawMatchCase,
 		CoreRecordCowField,
-		CoreRecordFieldValue,
 		CoreSelectArm,
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
 		CoreSourceLoc,
@@ -257,6 +255,14 @@ private record CoreTypeRewriteContext {
 -- instead.
 foreign:
 	private pure func same_core_expr(left: CoreExpr, right: CoreExpr) -> Bool = "blorp_same_object"
+	private pure func same_core_exprs(
+		left: List[CoreExpr],
+		right: List[CoreExpr],
+	) -> Bool = "blorp_same_object"
+	private pure func same_core_call_kind(
+		left: CoreCallKind,
+		right: CoreCallKind,
+	) -> Bool = "blorp_same_object"
 	private pure func same_core_record_cow_fields(
 		left: List[CoreRecordCowField],
 		right: List[CoreRecordCowField],
@@ -267,6 +273,18 @@ foreign:
 -- so a caller keeps its own input instead of allocating an equal copy first.
 -- This maps a list with such a helper and answers `None` itself when no item
 -- changed, copying the untouched prefix only once an item actually changes.
+private pure func same_optional_core_expr(left: Option[CoreExpr], right: Option[CoreExpr]) -> Bool:
+	match left:
+		Some(left_expr):
+			match right:
+				Some(right_expr):
+					same_core_expr(left_expr, right_expr)
+				None:
+					False
+		None:
+			right.is_none()
+
+
 private pure func rewrite_list_items[T](
 	items: List[T],
 	rewrite_item: pure (T) -> Option[T],
@@ -774,6 +792,7 @@ private pure func rewrite_call_kind(
 
 private pure func rewrite_closure_reference(
 	rewrites: List[CallableRewrite],
+	expr: CoreExpr,
 	closure: CoreClosureCreate,
 	typ: CoreType,
 	loc: CoreSourceLoc,
@@ -789,7 +808,7 @@ private pure func rewrite_closure_reference(
 				loc,
 			)
 		None:
-			ClosureCreateExpr(closure, typ, loc)
+			expr
 
 
 private pure func bound_with_name(bound: List[String], name: String) -> List[String]:
@@ -866,11 +885,19 @@ private pure func rewrite_literal_match_case(
 	global_rewrites: List[GlobalRewrite],
 	bound: List[String],
 	match_case: CoreLiteralMatchCase,
-) -> CoreLiteralMatchCase:
+) -> Option[CoreLiteralMatchCase]:
 	case_bound = bound_with_match_bindings(bound, match_case.bindings)
-	{ match_case |
-		body = rewrite_expr(callable_rewrites, global_rewrites, case_bound, match_case.body)
-	}
+	rewritten_body: CoreExpr = rewrite_expr(
+		callable_rewrites,
+		global_rewrites,
+		case_bound,
+		match_case.body,
+	)
+
+	if same_core_expr(rewritten_body, match_case.body):
+		None
+	else:
+		Some({ match_case | body = rewritten_body })
 
 
 private pure func rewrite_literal_match_fallback(
@@ -878,22 +905,29 @@ private pure func rewrite_literal_match_fallback(
 	global_rewrites: List[GlobalRewrite],
 	bound: List[String],
 	fallback: CoreLiteralMatchFallback,
-) -> CoreLiteralMatchFallback:
+) -> Option[CoreLiteralMatchFallback]:
 	match fallback:
 		LiteralMatchFallbackBody(body):
-			LiteralMatchFallbackBody(rewrite_expr(callable_rewrites, global_rewrites, bound, body))
+			rewritten_body: CoreExpr = rewrite_expr(callable_rewrites, global_rewrites, bound, body)
+
+			if same_core_expr(rewritten_body, body):
+				None
+			else:
+				Some(LiteralMatchFallbackBody(rewritten_body))
 		LiteralMatchFallbackBindings(bindings, body):
-			LiteralMatchFallbackBindings(
-				bindings,
-				rewrite_expr(
-					callable_rewrites,
-					global_rewrites,
-					bound_with_match_bindings(bound, bindings),
-					body,
-				),
+			rewritten_body: CoreExpr = rewrite_expr(
+				callable_rewrites,
+				global_rewrites,
+				bound_with_match_bindings(bound, bindings),
+				body,
 			)
+
+			if same_core_expr(rewritten_body, body):
+				None
+			else:
+				Some(LiteralMatchFallbackBindings(bindings, rewritten_body))
 		LiteralMatchFallbackFail:
-			LiteralMatchFallbackFail
+			None
 
 
 private pure func rewrite_constructor_match_case(
@@ -901,23 +935,24 @@ private pure func rewrite_constructor_match_case(
 	global_rewrites: List[GlobalRewrite],
 	bound: List[String],
 	match_case: CoreConstructorMatchCase,
-) -> CoreConstructorMatchCase:
+) -> Option[CoreConstructorMatchCase]:
 	case_bound = bound_with_match_bindings(bound, match_case.bindings)
 
 	match match_case.body:
 		ConstructorMatchBodyExpr(body):
-			{ match_case |
-				body = ConstructorMatchBodyExpr(
-					rewrite_expr(
-						callable_rewrites,
-						global_rewrites,
-						case_bound,
-						body,
-					),
-				)
-			}
+			rewritten_body: CoreExpr = rewrite_expr(
+				callable_rewrites,
+				global_rewrites,
+				case_bound,
+				body,
+			)
+
+			if same_core_expr(rewritten_body, body):
+				None
+			else:
+				Some({ match_case | body = ConstructorMatchBodyExpr(rewritten_body) })
 		_:
-			match_case
+			None
 
 
 private pure func rewrite_constructor_match_fallback(
@@ -925,29 +960,29 @@ private pure func rewrite_constructor_match_fallback(
 	global_rewrites: List[GlobalRewrite],
 	bound: List[String],
 	fallback: CoreConstructorMatchFallback,
-) -> CoreConstructorMatchFallback:
+) -> Option[CoreConstructorMatchFallback]:
 	match fallback:
 		ConstructorMatchFallbackBody(body):
-			ConstructorMatchFallbackBody(
-				rewrite_expr(
-					callable_rewrites,
-					global_rewrites,
-					bound,
-					body,
-				),
-			)
+			rewritten_body: CoreExpr = rewrite_expr(callable_rewrites, global_rewrites, bound, body)
+
+			if same_core_expr(rewritten_body, body):
+				None
+			else:
+				Some(ConstructorMatchFallbackBody(rewritten_body))
 		ConstructorMatchFallbackBindings(bindings, body):
-			ConstructorMatchFallbackBindings(
-				bindings,
-				rewrite_expr(
-					callable_rewrites,
-					global_rewrites,
-					bound_with_match_bindings(bound, bindings),
-					body,
-				),
+			rewritten_body: CoreExpr = rewrite_expr(
+				callable_rewrites,
+				global_rewrites,
+				bound_with_match_bindings(bound, bindings),
+				body,
 			)
+
+			if same_core_expr(rewritten_body, body):
+				None
+			else:
+				Some(ConstructorMatchFallbackBindings(bindings, rewritten_body))
 		ConstructorMatchFallbackFail:
-			ConstructorMatchFallbackFail
+			None
 
 
 private pure func rewrite_loop_body(
@@ -970,11 +1005,31 @@ private pure func rewrite_for_channel(
 	global_rewrites: List[GlobalRewrite],
 	bound: List[String],
 	loop: CoreForChannel,
-) -> CoreForChannel:
-	{ loop |
-		iterable = rewrite_expr(callable_rewrites, global_rewrites, bound, loop.iterable),
-		body = rewrite_loop_body(callable_rewrites, global_rewrites, bound, loop.binder, loop.body)
-	}
+) -> Option[CoreForChannel]:
+	rewritten_iterable: CoreExpr = rewrite_expr(
+		callable_rewrites,
+		global_rewrites,
+		bound,
+		loop.iterable,
+	)
+	rewritten_body: CoreExpr = rewrite_loop_body(
+		callable_rewrites,
+		global_rewrites,
+		bound,
+		loop.binder,
+		loop.body,
+	)
+
+	if (
+		same_core_expr(rewritten_iterable, loop.iterable)
+		and same_core_expr(rewritten_body, loop.body)
+	):
+		None
+	else:
+		Some({ loop |
+				iterable = rewritten_iterable,
+				body = rewritten_body
+			})
 
 
 private pure func rewrite_for_list(
@@ -982,11 +1037,31 @@ private pure func rewrite_for_list(
 	global_rewrites: List[GlobalRewrite],
 	bound: List[String],
 	loop: CoreForList,
-) -> CoreForList:
-	{ loop |
-		iterable = rewrite_expr(callable_rewrites, global_rewrites, bound, loop.iterable),
-		body = rewrite_loop_body(callable_rewrites, global_rewrites, bound, loop.binder, loop.body)
-	}
+) -> Option[CoreForList]:
+	rewritten_iterable: CoreExpr = rewrite_expr(
+		callable_rewrites,
+		global_rewrites,
+		bound,
+		loop.iterable,
+	)
+	rewritten_body: CoreExpr = rewrite_loop_body(
+		callable_rewrites,
+		global_rewrites,
+		bound,
+		loop.binder,
+		loop.body,
+	)
+
+	if (
+		same_core_expr(rewritten_iterable, loop.iterable)
+		and same_core_expr(rewritten_body, loop.body)
+	):
+		None
+	else:
+		Some({ loop |
+				iterable = rewritten_iterable,
+				body = rewritten_body
+			})
 
 
 private pure func rewrite_for_string(
@@ -994,11 +1069,31 @@ private pure func rewrite_for_string(
 	global_rewrites: List[GlobalRewrite],
 	bound: List[String],
 	loop: CoreForString,
-) -> CoreForString:
-	{ loop |
-		iterable = rewrite_expr(callable_rewrites, global_rewrites, bound, loop.iterable),
-		body = rewrite_loop_body(callable_rewrites, global_rewrites, bound, loop.binder, loop.body)
-	}
+) -> Option[CoreForString]:
+	rewritten_iterable: CoreExpr = rewrite_expr(
+		callable_rewrites,
+		global_rewrites,
+		bound,
+		loop.iterable,
+	)
+	rewritten_body: CoreExpr = rewrite_loop_body(
+		callable_rewrites,
+		global_rewrites,
+		bound,
+		loop.binder,
+		loop.body,
+	)
+
+	if (
+		same_core_expr(rewritten_iterable, loop.iterable)
+		and same_core_expr(rewritten_body, loop.body)
+	):
+		None
+	else:
+		Some({ loop |
+				iterable = rewritten_iterable,
+				body = rewritten_body
+			})
 
 
 private pure func rewrite_for_dict(
@@ -1006,11 +1101,31 @@ private pure func rewrite_for_dict(
 	global_rewrites: List[GlobalRewrite],
 	bound: List[String],
 	loop: CoreForDict,
-) -> CoreForDict:
-	{ loop |
-		iterable = rewrite_expr(callable_rewrites, global_rewrites, bound, loop.iterable),
-		body = rewrite_loop_body(callable_rewrites, global_rewrites, bound, loop.binder, loop.body)
-	}
+) -> Option[CoreForDict]:
+	rewritten_iterable: CoreExpr = rewrite_expr(
+		callable_rewrites,
+		global_rewrites,
+		bound,
+		loop.iterable,
+	)
+	rewritten_body: CoreExpr = rewrite_loop_body(
+		callable_rewrites,
+		global_rewrites,
+		bound,
+		loop.binder,
+		loop.body,
+	)
+
+	if (
+		same_core_expr(rewritten_iterable, loop.iterable)
+		and same_core_expr(rewritten_body, loop.body)
+	):
+		None
+	else:
+		Some({ loop |
+				iterable = rewritten_iterable,
+				body = rewritten_body
+			})
 
 
 private pure func rewrite_for_set(
@@ -1018,11 +1133,31 @@ private pure func rewrite_for_set(
 	global_rewrites: List[GlobalRewrite],
 	bound: List[String],
 	loop: CoreForSet,
-) -> CoreForSet:
-	{ loop |
-		iterable = rewrite_expr(callable_rewrites, global_rewrites, bound, loop.iterable),
-		body = rewrite_loop_body(callable_rewrites, global_rewrites, bound, loop.binder, loop.body)
-	}
+) -> Option[CoreForSet]:
+	rewritten_iterable: CoreExpr = rewrite_expr(
+		callable_rewrites,
+		global_rewrites,
+		bound,
+		loop.iterable,
+	)
+	rewritten_body: CoreExpr = rewrite_loop_body(
+		callable_rewrites,
+		global_rewrites,
+		bound,
+		loop.binder,
+		loop.body,
+	)
+
+	if (
+		same_core_expr(rewritten_iterable, loop.iterable)
+		and same_core_expr(rewritten_body, loop.body)
+	):
+		None
+	else:
+		Some({ loop |
+				iterable = rewritten_iterable,
+				body = rewritten_body
+			})
 
 
 private pure func rewrite_for_stream(
@@ -1030,11 +1165,31 @@ private pure func rewrite_for_stream(
 	global_rewrites: List[GlobalRewrite],
 	bound: List[String],
 	loop: CoreForStream,
-) -> CoreForStream:
-	{ loop |
-		iterable = rewrite_expr(callable_rewrites, global_rewrites, bound, loop.iterable),
-		body = rewrite_loop_body(callable_rewrites, global_rewrites, bound, loop.binder, loop.body)
-	}
+) -> Option[CoreForStream]:
+	rewritten_iterable: CoreExpr = rewrite_expr(
+		callable_rewrites,
+		global_rewrites,
+		bound,
+		loop.iterable,
+	)
+	rewritten_body: CoreExpr = rewrite_loop_body(
+		callable_rewrites,
+		global_rewrites,
+		bound,
+		loop.binder,
+		loop.body,
+	)
+
+	if (
+		same_core_expr(rewritten_iterable, loop.iterable)
+		and same_core_expr(rewritten_body, loop.body)
+	):
+		None
+	else:
+		Some({ loop |
+				iterable = rewritten_iterable,
+				body = rewritten_body
+			})
 
 
 private pure func rewrite_for_resource_source(
@@ -1042,11 +1197,31 @@ private pure func rewrite_for_resource_source(
 	global_rewrites: List[GlobalRewrite],
 	bound: List[String],
 	loop: CoreForResourceSource,
-) -> CoreForResourceSource:
-	{ loop |
-		iterable = rewrite_expr(callable_rewrites, global_rewrites, bound, loop.iterable),
-		body = rewrite_loop_body(callable_rewrites, global_rewrites, bound, loop.binder, loop.body)
-	}
+) -> Option[CoreForResourceSource]:
+	rewritten_iterable: CoreExpr = rewrite_expr(
+		callable_rewrites,
+		global_rewrites,
+		bound,
+		loop.iterable,
+	)
+	rewritten_body: CoreExpr = rewrite_loop_body(
+		callable_rewrites,
+		global_rewrites,
+		bound,
+		loop.binder,
+		loop.body,
+	)
+
+	if (
+		same_core_expr(rewritten_iterable, loop.iterable)
+		and same_core_expr(rewritten_body, loop.body)
+	):
+		None
+	else:
+		Some({ loop |
+				iterable = rewritten_iterable,
+				body = rewritten_body
+			})
 
 
 private pure func rewrite_for_tensor(
@@ -1054,11 +1229,31 @@ private pure func rewrite_for_tensor(
 	global_rewrites: List[GlobalRewrite],
 	bound: List[String],
 	loop: CoreForTensor,
-) -> CoreForTensor:
-	{ loop |
-		iterable = rewrite_expr(callable_rewrites, global_rewrites, bound, loop.iterable),
-		body = rewrite_loop_body(callable_rewrites, global_rewrites, bound, loop.binder, loop.body)
-	}
+) -> Option[CoreForTensor]:
+	rewritten_iterable: CoreExpr = rewrite_expr(
+		callable_rewrites,
+		global_rewrites,
+		bound,
+		loop.iterable,
+	)
+	rewritten_body: CoreExpr = rewrite_loop_body(
+		callable_rewrites,
+		global_rewrites,
+		bound,
+		loop.binder,
+		loop.body,
+	)
+
+	if (
+		same_core_expr(rewritten_iterable, loop.iterable)
+		and same_core_expr(rewritten_body, loop.body)
+	):
+		None
+	else:
+		Some({ loop |
+				iterable = rewritten_iterable,
+				body = rewritten_body
+			})
 
 
 private pure func bound_with_concurrent_bindings(
@@ -1078,11 +1273,19 @@ private pure func rewrite_raw_match_case(
 	global_rewrites: List[GlobalRewrite],
 	bound: List[String],
 	match_case: CoreRawMatchCase,
-) -> CoreRawMatchCase:
+) -> Option[CoreRawMatchCase]:
 	case_bound = bound_with_pattern(bound, match_case.pattern)
-	{ match_case |
-		body = rewrite_expr(callable_rewrites, global_rewrites, case_bound, match_case.body)
-	}
+	rewritten_body: CoreExpr = rewrite_expr(
+		callable_rewrites,
+		global_rewrites,
+		case_bound,
+		match_case.body,
+	)
+
+	if same_core_expr(rewritten_body, match_case.body):
+		None
+	else:
+		Some({ match_case | body = rewritten_body })
 
 
 private pure func rewrite_select_arm(
@@ -1090,72 +1293,80 @@ private pure func rewrite_select_arm(
 	global_rewrites: List[GlobalRewrite],
 	bound: List[String],
 	arm: CoreSelectArm,
-) -> CoreSelectArm:
+) -> Option[CoreSelectArm]:
 	match arm.kind:
 		SelectRecvArm(recv):
-			{ arm |
-				kind = SelectRecvArm(
-					{ recv |
-						channel = rewrite_expr(
-							callable_rewrites,
-							global_rewrites,
-							bound,
-							recv.channel,
-						)
-					},
-				),
-				body = rewrite_expr(
-					callable_rewrites,
-					global_rewrites,
-					bound_with_var(bound, recv.binder),
-					arm.body,
-				)
-			}
+			rewritten_channel: CoreExpr = rewrite_expr(
+				callable_rewrites,
+				global_rewrites,
+				bound,
+				recv.channel,
+			)
+			rewritten_body: CoreExpr = rewrite_expr(
+				callable_rewrites,
+				global_rewrites,
+				bound_with_var(bound, recv.binder),
+				arm.body,
+			)
+
+			if (
+				same_core_expr(rewritten_channel, recv.channel)
+				and same_core_expr(rewritten_body, arm.body)
+			):
+				None
+			else:
+				Some({ arm |
+						kind = SelectRecvArm({ recv | channel = rewritten_channel }),
+						body = rewritten_body
+					})
 		SelectSealedArm(channel):
-			{ arm |
-				kind = SelectSealedArm(
-					rewrite_expr(
-						callable_rewrites,
-						global_rewrites,
-						bound,
-						channel,
-					),
-				),
-				body = rewrite_expr(callable_rewrites, global_rewrites, bound, arm.body)
-			}
+			rewritten_channel: CoreExpr = rewrite_expr(
+				callable_rewrites,
+				global_rewrites,
+				bound,
+				channel,
+			)
+			rewritten_body: CoreExpr = rewrite_expr(
+				callable_rewrites,
+				global_rewrites,
+				bound,
+				arm.body,
+			)
+
+			if (
+				same_core_expr(rewritten_channel, channel)
+				and same_core_expr(rewritten_body, arm.body)
+			):
+				None
+			else:
+				Some({ arm |
+						kind = SelectSealedArm(rewritten_channel),
+						body = rewritten_body
+					})
 		SelectAfterArm(timeout):
-			{ arm |
-				kind = SelectAfterArm(
-					rewrite_expr(
-						callable_rewrites,
-						global_rewrites,
-						bound,
-						timeout,
-					),
-				),
-				body = rewrite_expr(callable_rewrites, global_rewrites, bound, arm.body)
-			}
+			rewritten_timeout: CoreExpr = rewrite_expr(
+				callable_rewrites,
+				global_rewrites,
+				bound,
+				timeout,
+			)
+			rewritten_body: CoreExpr = rewrite_expr(
+				callable_rewrites,
+				global_rewrites,
+				bound,
+				arm.body,
+			)
 
-
-private pure func rewrite_dict_literal_entry(
-	callable_rewrites: List[CallableRewrite],
-	global_rewrites: List[GlobalRewrite],
-	bound: List[String],
-	entry: CoreDictLiteralEntry,
-) -> CoreDictLiteralEntry:
-	{
-		key = rewrite_expr(callable_rewrites, global_rewrites, bound, entry.key),
-		value = rewrite_expr(callable_rewrites, global_rewrites, bound, entry.value)
-	}
-
-
-private pure func rewrite_record_field_value(
-	callable_rewrites: List[CallableRewrite],
-	global_rewrites: List[GlobalRewrite],
-	bound: List[String],
-	field: CoreRecordFieldValue,
-) -> CoreRecordFieldValue:
-	{ field | value = rewrite_expr(callable_rewrites, global_rewrites, bound, field.value) }
+			if (
+				same_core_expr(rewritten_timeout, timeout)
+				and same_core_expr(rewritten_body, arm.body)
+			):
+				None
+			else:
+				Some({ arm |
+						kind = SelectAfterArm(rewritten_timeout),
+						body = rewritten_body
+					})
 
 
 private pure func rewrite_logical_expr(
@@ -1231,6 +1442,28 @@ private pure func rewrite_logical_expr(
 	result
 
 
+-- Scope threaded to the shared child traversal for the variants that neither
+-- bind a name nor carry one of their own.
+private record FlattenNameScope {
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	bound: List[String]
+}
+
+
+private pure func rewrite_scoped_child(scope: FlattenNameScope, child: CoreExpr) -> CoreExpr:
+	rewrite_expr(scope.callable_rewrites, scope.global_rewrites, scope.bound, child)
+
+
+-- Bindings never arrive here: the only caller is the `_` branch of the binding
+-- frame machine in `rewrite_expr`, which has already taken the assignment and
+-- the two let forms.
+--
+-- Only two kinds of node need their own arm: the ones that carry a name this
+-- pass rewrites, and the ones that bind a name and so change the scope their
+-- children see. Everything else maps its children under the unchanged scope,
+-- which is exactly what the shared traversal does, and it already answers the
+-- same allocation when no child moved.
 private pure func rewrite_non_binding_expr(
 	callable_rewrites: List[CallableRewrite],
 	global_rewrites: List[GlobalRewrite],
@@ -1238,29 +1471,50 @@ private pure func rewrite_non_binding_expr(
 	expr: CoreExpr,
 ) -> CoreExpr:
 	match expr:
-		LiteralExpr(_, _, _):
-			expr
 		VarExpr(variable, typ, loc):
 			match rewrite_var(callable_rewrites, global_rewrites, bound, variable):
 				Some(rewritten):
 					VarExpr(rewritten, typ, loc)
 				None:
 					expr
-		AssignExpr(variable, rhs, typ, loc):
-			AssignExpr(
-				rewrite_var(callable_rewrites, global_rewrites, bound, variable).get_or(variable),
-				rewrite_expr(callable_rewrites, global_rewrites, bound, rhs),
-				typ,
-				loc,
-			)
 		ClosureCreateExpr(closure, typ, loc):
-			rewrite_closure_reference(callable_rewrites, closure, typ, loc)
-		VoidExpr(_, _):
-			expr
-		BreakExpr(_, _):
-			expr
-		ContinueExpr(_, _):
-			expr
+			rewrite_closure_reference(callable_rewrites, expr, closure, typ, loc)
+		CallExpr(_, _, _, _, _):
+			rewrite_call_expr(callable_rewrites, global_rewrites, bound, expr)
+		LogicalExpr(_, _, _, _, _):
+			rewrite_logical_expr(callable_rewrites, global_rewrites, bound, expr)
+		SeqExpr(_, _):
+			CoreTraverse.map_core_sequence_items(
+				expr,
+				pure func(item): rewrite_expr(callable_rewrites, global_rewrites, bound, item),
+			)
+		LambdaExpr(_, _, _, _, _, _) | TensorRawViewLetExpr(_, _, _, _) | ResourceScopeExpr(_, _, _) | ForRangeExpr(_, _, _, _, _, _) | PreClosureConcurrentlyLoopExpr(_, _, _) | PreClosureConcurrentExpr(_, _, _):
+			rewrite_binder_expr(callable_rewrites, global_rewrites, bound, expr)
+		ForChannelExpr(_, _, _) | ForListExpr(_, _, _) | ForStringExpr(_, _, _) | ForDictExpr(_, _, _) | ForSetExpr(_, _, _) | ForStreamExpr(_, _, _) | ForResourceSourceExpr(_, _, _) | ForTensorExpr(_, _, _):
+			rewrite_iterable_loop_expr(callable_rewrites, global_rewrites, bound, expr)
+		SelectExpr(_, _, _) | RawMatchExpr(_, _, _, _) | LiteralMatchExpr(_, _, _, _, _) | ConstructorMatchExpr(_, _, _, _, _, _):
+			rewrite_case_expr(callable_rewrites, global_rewrites, bound, expr)
+		_:
+			CoreTraverse.map_core_expr_children_with_context(
+				expr,
+				{
+					callable_rewrites = callable_rewrites,
+					global_rewrites = global_rewrites,
+					bound = bound
+				},
+				rewrite_scoped_child,
+			)
+
+
+-- A selected direct call names its target in the call kind and again in the
+-- callee, and neither goes through the ordinary variable path.
+private pure func rewrite_call_expr(
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	bound: List[String],
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
 		CallExpr(kind, callee, args, typ, loc):
 			rewritten_callee: CoreExpr = match (kind, callee):
 				(SelectedDirectCall(def_id), VarExpr(variable, callee_type, callee_loc)):
@@ -1272,438 +1526,397 @@ private pure func rewrite_non_binding_expr(
 				_:
 					rewrite_expr(callable_rewrites, global_rewrites, bound, callee)
 
-			CallExpr(
-				rewrite_call_kind(callable_rewrites, kind, callee),
-				rewritten_callee,
-				args.map(func(arg): rewrite_expr(callable_rewrites, global_rewrites, bound, arg)),
-				typ,
-				loc,
+			rewritten_kind: CoreCallKind = rewrite_call_kind(callable_rewrites, kind, callee)
+			rewritten_args: List[CoreExpr] = CoreTraverse.map_core_exprs(
+				args,
+				func(arg): rewrite_expr(callable_rewrites, global_rewrites, bound, arg),
 			)
-		BinaryExpr(op, left, right, typ, loc):
-			BinaryExpr(
-				op,
-				rewrite_expr(callable_rewrites, global_rewrites, bound, left),
-				rewrite_expr(callable_rewrites, global_rewrites, bound, right),
-				typ,
-				loc,
-			)
-		UnaryExpr(op, value, typ, loc):
-			UnaryExpr(
-				op,
-				rewrite_expr(callable_rewrites, global_rewrites, bound, value),
-				typ,
-				loc,
-			)
-		LogicalExpr(op, left, right, typ, loc):
-			rewrite_logical_expr(callable_rewrites, global_rewrites, bound, expr)
-		FieldExpr(value, field_name, typ, loc):
-			FieldExpr(
-				rewrite_expr(callable_rewrites, global_rewrites, bound, value),
-				field_name,
-				typ,
-				loc,
-			)
-		TupleFieldExpr(value, field_index, typ, loc):
-			TupleFieldExpr(
-				rewrite_expr(callable_rewrites, global_rewrites, bound, value),
-				field_index,
-				typ,
-				loc,
-			)
-		TupleExpr(items, typ, loc):
-			TupleExpr(
-				items.map(
-					func(item): rewrite_expr(callable_rewrites, global_rewrites, bound, item),
-				),
-				typ,
-				loc,
-			)
-		VectorExpr(items, typ, loc):
-			VectorExpr(
-				items.map(
-					func(item): rewrite_expr(callable_rewrites, global_rewrites, bound, item),
-				),
-				typ,
-				loc,
-			)
-		ListConstructExpr(construct, typ, loc):
-			ListConstructExpr(
-				{ construct |
-					elements = construct.elements.map(
-						func(
-							item,
-						): { item |
-							value = rewrite_expr(
-								callable_rewrites,
-								global_rewrites,
-								bound,
-								item.value,
-							)
-						},
-					)
-				},
-				typ,
-				loc,
-			)
-		DictExpr(entries, typ, loc):
-			DictExpr(
-				entries.map(
-					func(
-						entry,
-					): rewrite_dict_literal_entry(
-						callable_rewrites,
-						global_rewrites,
-						bound,
-						entry,
-					),
-				),
-				typ,
-				loc,
-			)
-		RecordExpr(fields, typ, loc):
-			RecordExpr(
-				fields.map(
-					func(
-						field,
-					): rewrite_record_field_value(
-						callable_rewrites,
-						global_rewrites,
-						bound,
-						field,
-					),
-				),
-				typ,
-				loc,
-			)
-		RecordUpdateExpr(base, fields, typ, loc):
-			RecordUpdateExpr(
-				rewrite_expr(callable_rewrites, global_rewrites, bound, base),
-				fields.map(
-					func(
-						field,
-					): rewrite_record_field_value(
-						callable_rewrites,
-						global_rewrites,
-						bound,
-						field,
-					),
-				),
-				typ,
-				loc,
-			)
-		RecordReuseExpr(source, fields, typ, loc):
-			RecordReuseExpr(
-				rewrite_expr(callable_rewrites, global_rewrites, bound, source),
-				fields.map(
-					func(
-						field,
-					): rewrite_record_field_value(
-						callable_rewrites,
-						global_rewrites,
-						bound,
-						field,
-					),
-				),
-				typ,
-				loc,
-			)
-		RecordCowUpdateExpr(source, fields, typ, loc):
-			RecordCowUpdateExpr(
-				rewrite_expr(callable_rewrites, global_rewrites, bound, source),
-				CoreTraverse.map_core_record_cow_fields(
-					fields,
-					func(
-						replacement,
-					): rewrite_expr(callable_rewrites, global_rewrites, bound, replacement),
-				),
-				typ,
-				loc,
-			)
-		LetExpr(variable, is_mutable, typ, rhs, body):
-			LetExpr(
-				variable,
-				is_mutable,
-				typ,
-				rewrite_expr(callable_rewrites, global_rewrites, bound, rhs),
-				rewrite_expr(
-					callable_rewrites,
-					global_rewrites,
-					bound_with_var(bound, variable),
-					body,
-				),
-			)
-		BorrowLetExpr(variable, typ, rhs, body):
-			BorrowLetExpr(
-				variable,
-				typ,
-				rewrite_expr(callable_rewrites, global_rewrites, bound, rhs),
-				rewrite_expr(
-					callable_rewrites,
-					global_rewrites,
-					bound_with_var(bound, variable),
-					body,
-				),
-			)
+
+			if (
+				same_core_call_kind(rewritten_kind, kind)
+				and same_core_expr(rewritten_callee, callee)
+				and same_core_exprs(rewritten_args, args)
+			):
+				expr
+			else:
+				CallExpr(rewritten_kind, rewritten_callee, rewritten_args, typ, loc)
+		_:
+			expr
+
+
+-- Forms that bind a name of their own, so their bodies see a wider scope than
+-- the node itself does.
+private pure func rewrite_binder_expr(
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	bound: List[String],
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
 		LambdaExpr(params, return_type, body, is_pure, typ, loc):
-			LambdaExpr(
-				params,
-				return_type,
-				rewrite_expr(
-					callable_rewrites,
-					global_rewrites,
-					bound_with_params(bound, params),
-					body,
-				),
-				is_pure,
-				typ,
-				loc,
+			rewritten_body: CoreExpr = rewrite_expr(
+				callable_rewrites,
+				global_rewrites,
+				bound_with_params(bound, params),
+				body,
 			)
+
+			if same_core_expr(rewritten_body, body):
+				expr
+			else:
+				LambdaExpr(params, return_type, rewritten_body, is_pure, typ, loc)
 		TensorRawViewLetExpr(binding, body, typ, loc):
-			TensorRawViewLetExpr(
-				{ binding |
-					source = rewrite_expr(callable_rewrites, global_rewrites, bound, binding.source)
-				},
-				rewrite_expr(
-					callable_rewrites,
-					global_rewrites,
-					bound_with_var(bound, binding.variable),
-					body,
-				),
-				typ,
-				loc,
+			rewritten_source: CoreExpr = rewrite_expr(
+				callable_rewrites,
+				global_rewrites,
+				bound,
+				binding.source,
 			)
+			rewritten_body: CoreExpr = rewrite_expr(
+				callable_rewrites,
+				global_rewrites,
+				bound_with_var(bound, binding.variable),
+				body,
+			)
+
+			if (
+				same_core_expr(rewritten_source, binding.source)
+				and same_core_expr(rewritten_body, body)
+			):
+				expr
+			else:
+				TensorRawViewLetExpr(
+					{ binding | source = rewritten_source },
+					rewritten_body,
+					typ,
+					loc,
+				)
 		ResourceScopeExpr(scope, typ, loc):
 			inner_bound = bound_with_var(bound, scope.variable)
-			ResourceScopeExpr(
-				{ scope |
-					acquire = rewrite_expr(
-						callable_rewrites,
-						global_rewrites,
-						bound,
-						scope.acquire,
-					),
-					body = rewrite_expr(
-						callable_rewrites,
-						global_rewrites,
-						inner_bound,
-						scope.body,
-					),
-					cleanup = rewrite_expr(
-						callable_rewrites,
-						global_rewrites,
-						inner_bound,
-						scope.cleanup,
-					)
-				},
-				typ,
-				loc,
+			rewritten_acquire: CoreExpr = rewrite_expr(
+				callable_rewrites,
+				global_rewrites,
+				bound,
+				scope.acquire,
 			)
+			rewritten_body: CoreExpr = rewrite_expr(
+				callable_rewrites,
+				global_rewrites,
+				inner_bound,
+				scope.body,
+			)
+			rewritten_cleanup: CoreExpr = rewrite_expr(
+				callable_rewrites,
+				global_rewrites,
+				inner_bound,
+				scope.cleanup,
+			)
+
+			if (
+				same_core_expr(rewritten_acquire, scope.acquire)
+				and same_core_expr(rewritten_body, scope.body)
+				and same_core_expr(rewritten_cleanup, scope.cleanup)
+			):
+				expr
+			else:
+				ResourceScopeExpr(
+					{ scope |
+						acquire = rewritten_acquire,
+						body = rewritten_body,
+						cleanup = rewritten_cleanup
+					},
+					typ,
+					loc,
+				)
 		ForRangeExpr(binder, start, end_value, body, typ, loc):
-			ForRangeExpr(
+			rewritten_start: CoreExpr = rewrite_expr(
+				callable_rewrites,
+				global_rewrites,
+				bound,
+				start,
+			)
+			rewritten_end: CoreExpr = rewrite_expr(
+				callable_rewrites,
+				global_rewrites,
+				bound,
+				end_value,
+			)
+			rewritten_body: CoreExpr = rewrite_loop_body(
+				callable_rewrites,
+				global_rewrites,
+				bound,
 				binder,
-				rewrite_expr(callable_rewrites, global_rewrites, bound, start),
-				rewrite_expr(callable_rewrites, global_rewrites, bound, end_value),
-				rewrite_loop_body(callable_rewrites, global_rewrites, bound, binder, body),
-				typ,
-				loc,
+				body,
 			)
-		ForChannelExpr(loop, typ, loc):
-			ForChannelExpr(
-				rewrite_for_channel(callable_rewrites, global_rewrites, bound, loop),
-				typ,
-				loc,
-			)
-		ForListExpr(loop, typ, loc):
-			ForListExpr(
-				rewrite_for_list(callable_rewrites, global_rewrites, bound, loop),
-				typ,
-				loc,
-			)
-		ForStringExpr(loop, typ, loc):
-			ForStringExpr(
-				rewrite_for_string(callable_rewrites, global_rewrites, bound, loop),
-				typ,
-				loc,
-			)
-		ForDictExpr(loop, typ, loc):
-			ForDictExpr(
-				rewrite_for_dict(callable_rewrites, global_rewrites, bound, loop),
-				typ,
-				loc,
-			)
-		ForSetExpr(loop, typ, loc):
-			ForSetExpr(
-				rewrite_for_set(callable_rewrites, global_rewrites, bound, loop),
-				typ,
-				loc,
-			)
-		ForStreamExpr(loop, typ, loc):
-			ForStreamExpr(
-				rewrite_for_stream(callable_rewrites, global_rewrites, bound, loop),
-				typ,
-				loc,
-			)
-		ForResourceSourceExpr(loop, typ, loc):
-			ForResourceSourceExpr(
-				rewrite_for_resource_source(callable_rewrites, global_rewrites, bound, loop),
-				typ,
-				loc,
-			)
-		ForTensorExpr(loop, typ, loc):
-			ForTensorExpr(
-				rewrite_for_tensor(callable_rewrites, global_rewrites, bound, loop),
-				typ,
-				loc,
-			)
+
+			if (
+				same_core_expr(rewritten_start, start)
+				and same_core_expr(rewritten_end, end_value)
+				and same_core_expr(rewritten_body, body)
+			):
+				expr
+			else:
+				ForRangeExpr(binder, rewritten_start, rewritten_end, rewritten_body, typ, loc)
 		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
 			loop_bound = bound_with_var(bound, loop.variable)
-			PreClosureConcurrentlyLoopExpr(
-				{ loop |
-					iterable = rewrite_expr(
-						callable_rewrites,
-						global_rewrites,
-						bound,
-						loop.iterable,
-					),
-					body = rewrite_expr(callable_rewrites, global_rewrites, loop_bound, loop.body),
-					timeout = loop.timeout.map(
-						func(
-							value,
-						): rewrite_expr(callable_rewrites, global_rewrites, bound, value),
-					),
-					limit = rewrite_expr(callable_rewrites, global_rewrites, bound, loop.limit)
-				},
-				typ,
-				loc,
+			rewritten_iterable: CoreExpr = rewrite_expr(
+				callable_rewrites,
+				global_rewrites,
+				bound,
+				loop.iterable,
 			)
+			rewritten_body: CoreExpr = rewrite_expr(
+				callable_rewrites,
+				global_rewrites,
+				loop_bound,
+				loop.body,
+			)
+			rewritten_timeout: Option[CoreExpr] = loop.timeout.map(
+				func(value): rewrite_expr(callable_rewrites, global_rewrites, bound, value),
+			)
+			rewritten_limit: CoreExpr = rewrite_expr(
+				callable_rewrites,
+				global_rewrites,
+				bound,
+				loop.limit,
+			)
+
+			if (
+				same_core_expr(rewritten_iterable, loop.iterable)
+				and same_core_expr(rewritten_body, loop.body)
+				and same_optional_core_expr(rewritten_timeout, loop.timeout)
+				and same_core_expr(rewritten_limit, loop.limit)
+			):
+				expr
+			else:
+				PreClosureConcurrentlyLoopExpr(
+					{ loop |
+						iterable = rewritten_iterable,
+						body = rewritten_body,
+						timeout = rewritten_timeout,
+						limit = rewritten_limit
+					},
+					typ,
+					loc,
+				)
 		PreClosureConcurrentExpr(block, typ, loc):
 			block_bound: List[String] = bound_with_concurrent_bindings(bound, block.bindings)
-			PreClosureConcurrentExpr(
-				{ block |
-					bindings = block.bindings.map(
-						func(
-							binding,
-						): { binding |
-							rhs = rewrite_expr(
-								callable_rewrites,
-								global_rewrites,
-								bound,
-								binding.rhs,
-							)
-						},
-					),
-					body = rewrite_expr(
-						callable_rewrites,
-						global_rewrites,
-						block_bound,
-						block.body,
-					),
-					timeout = block.timeout.map(
-						func(
-							value,
-						): rewrite_expr(callable_rewrites, global_rewrites, bound, value),
-					)
-				},
-				typ,
-				loc,
-			)
-		SelectExpr(select_expr, typ, loc):
-			SelectExpr(
-				select_expr.map(
-					func(arm): rewrite_select_arm(callable_rewrites, global_rewrites, bound, arm),
-				),
-				typ,
-				loc,
-			)
-		RawMatchExpr(scrutinee, cases, typ, loc):
-			RawMatchExpr(
-				rewrite_expr(callable_rewrites, global_rewrites, bound, scrutinee),
-				cases.map(
-					func(
-						match_case,
-					): rewrite_raw_match_case(
-						callable_rewrites,
-						global_rewrites,
-						bound,
-						match_case,
-					),
-				),
-				typ,
-				loc,
-			)
-		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
-			LiteralMatchExpr(
-				rewrite_expr(callable_rewrites, global_rewrites, bound, scrutinee),
-				cases.map(
-					func(
-						match_case,
-					): rewrite_literal_match_case(
-						callable_rewrites,
-						global_rewrites,
-						bound,
-						match_case,
-					),
-				),
-				rewrite_literal_match_fallback(callable_rewrites, global_rewrites, bound, fallback),
-				typ,
-				loc,
-			)
-		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
-			ConstructorMatchExpr(
-				rewrite_expr(callable_rewrites, global_rewrites, bound, scrutinee),
-				release_policy,
-				cases.map(
-					func(
-						match_case,
-					): rewrite_constructor_match_case(
-						callable_rewrites,
-						global_rewrites,
-						bound,
-						match_case,
-					),
-				),
-				rewrite_constructor_match_fallback(
+			rewritten_bindings: Option[List[CorePreClosureConcurrentBinding]] = rewrite_list_items(
+				block.bindings,
+				func(
+					binding,
+				): rewrite_concurrent_binding_rhs(
 					callable_rewrites,
 					global_rewrites,
 					bound,
-					fallback,
+					binding,
 				),
-				typ,
-				loc,
 			)
-		PreClosureDetachExpr(detached, typ, loc):
-			PreClosureDetachExpr(
-				rewrite_expr(callable_rewrites, global_rewrites, bound, detached),
-				typ,
-				loc,
+			rewritten_body: CoreExpr = rewrite_expr(
+				callable_rewrites,
+				global_rewrites,
+				block_bound,
+				block.body,
 			)
-		RangeExpr(start, end_value, typ, loc):
-			RangeExpr(
-				rewrite_expr(callable_rewrites, global_rewrites, bound, start),
-				rewrite_expr(callable_rewrites, global_rewrites, bound, end_value),
-				typ,
-				loc,
+			rewritten_timeout: Option[CoreExpr] = block.timeout.map(
+				func(value): rewrite_expr(callable_rewrites, global_rewrites, bound, value),
 			)
-		IfExpr(cond, then_expr, else_expr, typ, loc):
-			IfExpr(
-				rewrite_expr(callable_rewrites, global_rewrites, bound, cond),
-				rewrite_expr(callable_rewrites, global_rewrites, bound, then_expr),
-				rewrite_expr(callable_rewrites, global_rewrites, bound, else_expr),
-				typ,
-				loc,
+
+			if (
+				rewritten_bindings.is_none()
+				and same_core_expr(rewritten_body, block.body)
+				and same_optional_core_expr(rewritten_timeout, block.timeout)
+			):
+				expr
+			else:
+				PreClosureConcurrentExpr(
+					{ block |
+						bindings = rewritten_bindings.get_or(block.bindings),
+						body = rewritten_body,
+						timeout = rewritten_timeout
+					},
+					typ,
+					loc,
+				)
+		_:
+			expr
+
+
+private pure func rewrite_concurrent_binding_rhs(
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	bound: List[String],
+	binding: CorePreClosureConcurrentBinding,
+) -> Option[CorePreClosureConcurrentBinding]:
+	rewritten_rhs: CoreExpr = rewrite_expr(callable_rewrites, global_rewrites, bound, binding.rhs)
+
+	if same_core_expr(rewritten_rhs, binding.rhs):
+		None
+	else:
+		Some({ binding | rhs = rewritten_rhs })
+
+
+-- The eight iterable loops bind their element and carry the loop record.
+private pure func rewrite_iterable_loop_expr(
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	bound: List[String],
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		ForChannelExpr(loop, typ, loc):
+			rewrite_for_channel(callable_rewrites, global_rewrites, bound, loop)
+				.map(func(rewritten): ForChannelExpr(rewritten, typ, loc))
+				.get_or(expr)
+		ForListExpr(loop, typ, loc):
+			rewrite_for_list(callable_rewrites, global_rewrites, bound, loop)
+				.map(func(rewritten): ForListExpr(rewritten, typ, loc))
+				.get_or(expr)
+		ForStringExpr(loop, typ, loc):
+			rewrite_for_string(callable_rewrites, global_rewrites, bound, loop)
+				.map(func(rewritten): ForStringExpr(rewritten, typ, loc))
+				.get_or(expr)
+		ForDictExpr(loop, typ, loc):
+			rewrite_for_dict(callable_rewrites, global_rewrites, bound, loop)
+				.map(func(rewritten): ForDictExpr(rewritten, typ, loc))
+				.get_or(expr)
+		ForSetExpr(loop, typ, loc):
+			rewrite_for_set(callable_rewrites, global_rewrites, bound, loop)
+				.map(func(rewritten): ForSetExpr(rewritten, typ, loc))
+				.get_or(expr)
+		ForStreamExpr(loop, typ, loc):
+			rewrite_for_stream(callable_rewrites, global_rewrites, bound, loop)
+				.map(func(rewritten): ForStreamExpr(rewritten, typ, loc))
+				.get_or(expr)
+		ForResourceSourceExpr(loop, typ, loc):
+			rewrite_for_resource_source(callable_rewrites, global_rewrites, bound, loop)
+				.map(func(rewritten): ForResourceSourceExpr(rewritten, typ, loc))
+				.get_or(expr)
+		ForTensorExpr(loop, typ, loc):
+			rewrite_for_tensor(callable_rewrites, global_rewrites, bound, loop)
+				.map(func(rewritten): ForTensorExpr(rewritten, typ, loc))
+				.get_or(expr)
+		_:
+			expr
+
+
+-- Select arms and match cases bind the names their bodies see.
+private pure func rewrite_case_expr(
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	bound: List[String],
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		SelectExpr(arms, typ, loc):
+			rewrite_list_items(
+				arms,
+				func(arm): rewrite_select_arm(callable_rewrites, global_rewrites, bound, arm),
 			)
-		WhileExpr(cond, body, typ, loc):
-			WhileExpr(
-				rewrite_expr(callable_rewrites, global_rewrites, bound, cond),
-				rewrite_expr(callable_rewrites, global_rewrites, bound, body),
-				typ,
-				loc,
+				.map(func(rewritten): SelectExpr(rewritten, typ, loc))
+				.get_or(expr)
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			rewritten_scrutinee: CoreExpr = rewrite_expr(
+				callable_rewrites,
+				global_rewrites,
+				bound,
+				scrutinee,
 			)
-		SeqExpr(_, _):
-			CoreTraverse.map_core_sequence_items(
-				expr,
-				pure func(item): rewrite_expr(callable_rewrites, global_rewrites, bound, item),
+			rewritten_cases: Option[List[CoreRawMatchCase]] = rewrite_list_items(
+				cases,
+				func(
+					match_case,
+				): rewrite_raw_match_case(callable_rewrites, global_rewrites, bound, match_case),
 			)
+
+			if same_core_expr(rewritten_scrutinee, scrutinee) and rewritten_cases.is_none():
+				expr
+			else:
+				RawMatchExpr(
+					rewritten_scrutinee,
+					rewritten_cases.get_or(cases),
+					typ,
+					loc,
+				)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			rewritten_scrutinee: CoreExpr = rewrite_expr(
+				callable_rewrites,
+				global_rewrites,
+				bound,
+				scrutinee,
+			)
+			rewritten_cases: Option[List[CoreLiteralMatchCase]] = rewrite_list_items(
+				cases,
+				func(
+					match_case,
+				): rewrite_literal_match_case(
+					callable_rewrites,
+					global_rewrites,
+					bound,
+					match_case,
+				),
+			)
+			rewritten_fallback: Option[CoreLiteralMatchFallback] = rewrite_literal_match_fallback(
+				callable_rewrites,
+				global_rewrites,
+				bound,
+				fallback,
+			)
+
+			if (
+				same_core_expr(rewritten_scrutinee, scrutinee)
+				and rewritten_cases.is_none()
+				and rewritten_fallback.is_none()
+			):
+				expr
+			else:
+				LiteralMatchExpr(
+					rewritten_scrutinee,
+					rewritten_cases.get_or(cases),
+					rewritten_fallback.get_or(fallback),
+					typ,
+					loc,
+				)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			rewritten_scrutinee: CoreExpr = rewrite_expr(
+				callable_rewrites,
+				global_rewrites,
+				bound,
+				scrutinee,
+			)
+			rewritten_cases: Option[List[CoreConstructorMatchCase]] = rewrite_list_items(
+				cases,
+				func(
+					match_case,
+				): rewrite_constructor_match_case(
+					callable_rewrites,
+					global_rewrites,
+					bound,
+					match_case,
+				),
+			)
+			rewritten_fallback: Option[CoreConstructorMatchFallback] = rewrite_constructor_match_fallback(
+				callable_rewrites,
+				global_rewrites,
+				bound,
+				fallback,
+			)
+
+			if (
+				same_core_expr(rewritten_scrutinee, scrutinee)
+				and rewritten_cases.is_none()
+				and rewritten_fallback.is_none()
+			):
+				expr
+			else:
+				ConstructorMatchExpr(
+					rewritten_scrutinee,
+					release_policy,
+					rewritten_cases.get_or(cases),
+					rewritten_fallback.get_or(fallback),
+					typ,
+					loc,
+				)
 		_:
 			expr
 
