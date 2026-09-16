@@ -35,6 +35,7 @@ import:
 		callable_signature_parameters,
 		callable_signature_return_type,
 	declaration_skeleton:
+		CallableDeclarationSkeletonInfo,
 		CallableDeclarationSource(
 			DefaultImplementationMethodCallableSource,
 			ForeignCallableSource,
@@ -50,6 +51,7 @@ import:
 		callable_ids_equal,
 		declaration_skeleton_graph_callable_skeletons,
 		declaration_skeleton_graph_implementation_skeletons,
+		impl_id_definition_id,
 		impl_id_module_id,
 		impl_ids_equal,
 		trait_ids_equal,
@@ -906,6 +908,68 @@ private pure func implementation_default_signature(
 	)
 
 
+-- ImplId-keyed buckets of the callable skeletons that belong to each
+-- implementation (explicit and unrealized-default methods alike). Built once
+-- per `implementation_header_graph_build` call from a single catalog pass so
+-- `implementation_methods` no longer rescans every callable skeleton (types,
+-- traits, and unrelated free functions included) once per implementation.
+-- Keyed by exact ImplId/definition identity: the Int key is the fast lookup,
+-- and `implementation_method_skeletons_for_owner` re-checks identity with
+-- `impl_ids_equal` the same way `method_skeletons_for_owner` does in
+-- trait_headers.brp, so a definition-id collision cannot leak a method into
+-- the wrong implementation's header. The map is local to graph construction:
+-- it is never stored on `ImplementationHeaderGraph` or otherwise returned.
+private type alias ImplementationMethodSkeletonBuckets = Dict[Int, List[CallableDeclarationSkeletonInfo]]
+
+
+private pure func implementation_method_skeleton_owner(
+	skeleton: CallableDeclarationSkeletonInfo,
+) -> Option[ImplId]:
+	match skeleton.source:
+		ImplementationMethodCallableSource(owner, _):
+			Some(owner)
+		DefaultImplementationMethodCallableSource(owner, _, _):
+			Some(owner)
+		FunctionCallableSource(_) | ForeignCallableSource(_):
+			None
+
+
+private pure func implementation_method_skeleton_buckets(
+	callable_skeletons: List[CallableDeclarationSkeletonInfo],
+) -> ImplementationMethodSkeletonBuckets:
+	var buckets: ImplementationMethodSkeletonBuckets = {}
+
+	for skeleton in callable_skeletons:
+		match implementation_method_skeleton_owner(skeleton):
+			Some(owner):
+				key = impl_id_definition_id(owner)
+				buckets = buckets.set(key, buckets.get_or(key, []).append(skeleton))
+			None:
+				void
+
+	buckets
+
+
+private pure func implementation_method_skeleton_matches_owner(
+	skeleton: CallableDeclarationSkeletonInfo,
+	owner: ImplId,
+) -> Bool:
+	match implementation_method_skeleton_owner(skeleton):
+		Some(candidate_owner):
+			impl_ids_equal(candidate_owner, owner)
+		None:
+			False
+
+
+private pure func implementation_method_skeletons_for_owner(
+	buckets: ImplementationMethodSkeletonBuckets,
+	owner: ImplId,
+) -> List[CallableDeclarationSkeletonInfo]:
+	buckets
+		.get_or(impl_id_definition_id(owner), [])
+		.filter(func(skeleton): implementation_method_skeleton_matches_owner(skeleton, owner))
+
+
 private pure func implementation_methods(
 	topology: TraitTopologyGraph,
 	module: BoundModule,
@@ -913,70 +977,68 @@ private pure func implementation_methods(
 	trait_id: TraitId,
 	implementation_parameters: List[ResolvedImplementationTypeParameter],
 	receiver: ResolvedTypeShape,
+	candidate_skeletons: List[CallableDeclarationSkeletonInfo],
 ) -> ImplementationMethodsResolution:
 	type_headers = trait_topology_graph_type_headers(topology)
-	declaration_graph = type_header_graph_declaration_graph(type_headers)
 	var methods: List[ImplementationMethodHeader] = []
 	var errors: List[ImplementationHeaderGraphError] = []
 
-	for skeleton in declaration_skeleton_graph_callable_skeletons(declaration_graph):
+	for skeleton in candidate_skeletons:
 		match skeleton.source:
-			ImplementationMethodCallableSource(owner, decl):
-				if impl_ids_equal(owner, implementation_id):
-					parameter_resolution = resolve_method_type_parameters(
-						type_headers,
-						module,
-						skeleton.id,
-						implementation_parameters,
-						decl,
-					)
-					signature_resolution = resolve_method_signature(
-						type_headers,
-						bound_module_scope(module),
-						implementation_id,
-						implementation_parameters,
-						skeleton.id,
-						parameter_resolution.parameters,
-						receiver,
-						decl,
-					)
-					all_errors = parameter_resolution.errors.concat(signature_resolution.errors)
+			ImplementationMethodCallableSource(_, decl):
+				parameter_resolution = resolve_method_type_parameters(
+					type_headers,
+					module,
+					skeleton.id,
+					implementation_parameters,
+					decl,
+				)
+				signature_resolution = resolve_method_signature(
+					type_headers,
+					bound_module_scope(module),
+					implementation_id,
+					implementation_parameters,
+					skeleton.id,
+					parameter_resolution.parameters,
+					receiver,
+					decl,
+				)
+				all_errors = parameter_resolution.errors.concat(signature_resolution.errors)
 
-					if all_errors.is_empty():
-						explicit: ExplicitImplementationMethodHeader = into_opaque ExplicitImplementationMethodHeader(
+				if all_errors.is_empty():
+					explicit: ExplicitImplementationMethodHeader = into_opaque ExplicitImplementationMethodHeader(
+						{
+							id = skeleton.id,
+							source = decl,
+							parameters = parameter_resolution.parameters,
+							signature = signature_resolution.signature,
+							dimension_constraints = signature_resolution.dimension_constraints
+						}
+					)
+					methods = methods.append(ExplicitImplementationMethodHeaderValue(explicit))
+				else:
+					errors = errors.concat(all_errors)
+			DefaultImplementationMethodCallableSource(_, method_name, impl_decl):
+				match find_default_trait_method(topology, trait_id, method_name):
+					Some(trait_method):
+						default_method: DefaultImplementationMethodHeader = into_opaque DefaultImplementationMethodHeader(
 							{
 								id = skeleton.id,
-								source = decl,
-								parameters = parameter_resolution.parameters,
-								signature = signature_resolution.signature,
-								dimension_constraints = signature_resolution.dimension_constraints
+								owner = implementation_id,
+								trait_method = trait_method
 							}
 						)
-						methods = methods.append(ExplicitImplementationMethodHeaderValue(explicit))
-					else:
-						errors = errors.concat(all_errors)
-			DefaultImplementationMethodCallableSource(owner, method_name, impl_decl):
-				if impl_ids_equal(owner, implementation_id):
-					match find_default_trait_method(topology, trait_id, method_name):
-						Some(trait_method):
-							default_method: DefaultImplementationMethodHeader = into_opaque DefaultImplementationMethodHeader(
-								{
-									id = skeleton.id,
-									owner = implementation_id,
-									trait_method = trait_method
-								}
-							)
-							methods = methods.append(
-								DefaultImplementationMethodHeaderValue(default_method),
-							)
-						None:
-							errors = errors.append(
-								ImplementationDefaultMethodMissing(
-									impl_decl.trait_name.text,
-									method_name,
-									impl_decl.span,
-								),
-							)
+						methods = methods.append(
+							DefaultImplementationMethodHeaderValue(default_method),
+						)
+					None:
+						errors = errors.append(
+							ImplementationDefaultMethodMissing(
+								impl_decl.trait_name.text,
+								method_name,
+								impl_decl.span,
+							),
+						)
 			FunctionCallableSource(_) | ForeignCallableSource(_):
 				void
 
@@ -1038,6 +1100,9 @@ pure func implementation_header_graph_build(
 	definition_table = callable_header_graph_definition_table(callable_headers)
 	declaration_graph = type_header_graph_declaration_graph(type_headers)
 	bound_graph = type_header_graph_bound_graph(type_headers)
+	method_skeleton_buckets = implementation_method_skeleton_buckets(
+		declaration_skeleton_graph_callable_skeletons(declaration_graph),
+	)
 	var state: ImplementationHeaderBuildState = {
 		headers = [],
 		errors = []
@@ -1117,6 +1182,10 @@ pure func implementation_header_graph_build(
 									trait_id,
 									parameter_resolution.parameters,
 									receiver,
+									implementation_method_skeletons_for_owner(
+										method_skeleton_buckets,
+										skeleton.id,
+									),
 								)
 								all_errors = parameter_resolution.errors
 									.concat(method_resolution.errors)
