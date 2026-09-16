@@ -48,6 +48,10 @@ fall by at least 20% at `-O2` (the coordinator measures `-O2`; report your
 `-O0` numbers). Consult the coordinator before changing `Cursor`, `SourceSpan`,
 or any token kind.
 
+## Objective
+
+Make source discovery a measurable compiler phase and cut the lexer's per-character call and allocation work without changing any token, span, trivia, or diagnostic.
+
 ## Step 1: `source_discovery` Phase Row
 
 Add a `SourceDiscoveryPhase` variant before `TypedFrontendPhase`, label it

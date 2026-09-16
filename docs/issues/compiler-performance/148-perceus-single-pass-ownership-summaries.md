@@ -45,6 +45,10 @@ sanitizer suites pass. Consult the coordinator before changing the order of
 `DupExpr`/`DropExpr` insertion, any ownership contract, or the meaning of an
 `OwnershipUseSummary` field.
 
+## Objective
+
+Remove Perceus's repeated per-binding and per-call subtree re-summarization by computing each ownership-use summary once bottom-up and threading it to its consumer, with byte-identical generated C.
+
 ## Step 0: Attribute
 
 Build a call-count profile of the compiler compiling the frozen input, limited

@@ -49,6 +49,10 @@ focused Core suites plus `scripts/compiler-check --changed` pass. Ask the
 coordinator before touching any pass, any ownership contract, or the
 builtin's semantics beyond what is written here.
 
+## Objective
+
+Stop reallocating Core nodes that a pass did not change, so sparse passes allocate only along the spine to changed nodes and the whole pipeline's allocation count falls without editing any pass.
+
 ## Step 1: Allocation-Identity Primitive
 
 Add a compiler-internal way to ask whether two managed values are the same
@@ -61,7 +65,7 @@ user-facing equality and must not be documented as one.
    matching forward declaration where `blorp_is_unique` is forward-declared in
    `runtime.c` if the runtime object needs it.
 2. Standard library: in `memory.brp`, next to `is_unique`, add
-   `pure func same_object[T](left: T, right: T) -> Bool` with body
+   `pure func same_object` generic over `T`, taking `left: T, right: T` and returning `Bool`, with body
    `builtin("blorp_same_object")`. Document: true only when both values are
    the same managed allocation; stack types (Int, Bool, structs) always
    return False; immortal literals are unspecified. `scripts/check-std-builtins`

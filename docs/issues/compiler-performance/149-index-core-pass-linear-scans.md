@@ -42,6 +42,10 @@ allocations fall, and the small program does not regress more than 1%.
 Consult the coordinator if an index would change first-match order or if a
 cut needs a new field on a Core declaration.
 
+## Objective
+
+Replace five measured linear scans in Core passes with exact first-match-preserving indexes so retired instructions and allocations fall on the self-compile without changing any selected declaration or contract.
+
 ## Cuts
 
 ### A. Constructor contracts by definition ID (perceus.brp)

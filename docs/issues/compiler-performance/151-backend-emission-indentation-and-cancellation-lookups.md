@@ -46,6 +46,10 @@ codegen-audit checks pass. Consult the coordinator before threading an
 indentation depth through emitter signatures or changing any cancellation
 protection decision.
 
+## Objective
+
+Cut backend emission string copying and cancellation-plan lookup work so backend_emission allocations and retired instructions fall with byte-identical generated C.
+
 ## Cuts
 
 ### A. Single-pass `indent_statements` (emit.brp)
