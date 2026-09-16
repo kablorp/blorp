@@ -20,7 +20,7 @@ routes the maintained references.
 | CLI/LSP | `blorp/src/main.brp` or `blorp/src/lsp/` | `scripts/test cli` or `scripts/test lsp` |
 | Build/bootstrap/release | `blorp/build/bootstrap.env`, [`RELEASES`](docs/RELEASES.md), [`scripts`](scripts/README.md) | `make` and focused build checks; not `compiler-check --changed` |
 | Performance | Production function, [`profiling guide`](docs/DEVELOPMENT.md#function-profiling-and-flame-graphs), retained benchmark | Direct same-boundary baseline/candidate measurement; output identity |
-| Docs-only | Owning reference and [`issue rules`](docs/issues/README.md) | Link/path examples and `git diff --check`; no automatic full gate |
+| Docs-only | Owning reference document | Link/path examples and `git diff --check`; no automatic full gate |
 
 These are starting points, not substitute gates. `scripts/compiler-check`
 selects manifest-owned compiler checks, builds once when checks are selected,

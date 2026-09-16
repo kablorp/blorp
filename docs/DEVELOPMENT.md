@@ -102,8 +102,8 @@ format check. This keeps formatting work out of the behavior or timing window.
 Use progressive disclosure: start with the task's owning source, one nearby
 test, and the relevant contract. Read more when a concrete uncertainty or
 failure calls for it. `AGENTS.md` carries binding rules and routes tasks here;
-this guide carries detailed commands. An active issue is a next-action handoff,
-not a requirement to read every roadmap under `docs/issues/`.
+this guide carries detailed commands. Planned work lives in GitHub issues; a
+handoff names the one boundary to read, not every reference document.
 
 Several compiler files are large. Search for a symbol and read a bounded
 region before loading an entire file. Exclude generated embedded inputs when

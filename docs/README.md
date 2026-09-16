@@ -40,19 +40,16 @@ module inventory lives in
 
 - [Compiler Priorities](COMPILER_PRIORITIES.md) is the short cross-cutting
   outcomes map.
-- [Active Engineering Issues](issues/README.md) lists every retained handoff.
-- [Normalized Semantic Compilation](issues/compiler-performance/NORMALIZED_SEMANTIC_COMPILATION_ROADMAP.md)
-  sequences the next table-backed semantic products and performance gates.
+- [Self-Compile Measurement Protocol](../benchmarks/README.md#self-compile-measurement-protocol)
+  is the standard compiler-performance measurement and its retained baselines.
 
 ## Maintenance Rules
 
 - Reference docs describe current behavior, not migration history.
 - Active implementation status, assignees, and discussion belong in GitHub
-  issues. Versioned handoff specifications may live under `docs/issues/` when
-  they define architectural dependencies, implementation boundaries, and
-  durable acceptance criteria; they must not become a second status tracker.
-  The [active engineering issue index](issues/README.md) defines the retention
-  and size rules. Delete resolved issue documents instead of archiving them.
+  issues. This tree holds no issue documents; a handoff that needs durable
+  acceptance criteria records them in the GitHub issue and its measurement in
+  `benchmarks/results/`.
 - Put raw performance evidence in `benchmarks/results/` and link it from the
   issue or change that uses it.
 - Prefer generated inventories and `--help` output over copied file, command,

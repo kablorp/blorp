@@ -244,9 +244,8 @@ CLI and compile command transition to corresponding prepared variants before
 Core starts, so neither `CliCompilePlan` nor `TypecheckedGraph` remains
 reachable on the normal compile path. The `core_lowering_input_ready` memory
 checkpoint directly measures this lifetime boundary. The
-[last-use issue](issues/compiler-performance/137-codegen-input-last-use-and-release.md)
-owns the measurement and release cut; Phase 10 owns replacement of the
-remaining raw typed-tree payloads. Adding a typecheck field to the projection
+`core_lowering_input_ready` checkpoint owns the measurement of that release
+cut; replacing the remaining raw typed-tree payloads is future work. Adding a typecheck field to the projection
 requires a specific Core consumer; it is not a general escape hatch for
 retaining the typed graph.
 
