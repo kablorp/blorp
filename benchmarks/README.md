@@ -1793,6 +1793,22 @@ Rules:
    allocations, minimum retired instructions, phase medians, and the
    IDENTICAL/DIFFERENT output line. Wall time alone is never evidence.
 
+When a change legitimately reorders definition IDs, the raw-bytes check is the
+wrong oracle and `benchmarks/normalize_generated_c_symbols` is the right one.
+The backend spells anonymous functions and static closures as `brp_<suffix>` and
+`__sc_brp_<suffix>`, where the suffix comes from the definition ID the Core
+pipeline assigned, so pruning or reordering declarations before monomorphization
+renames them even though the emitted program is unchanged and
+`--require-identical` reports DIFFERENT. Run the script over the baseline and
+candidate C (keep them with `--keep-output`); it renumbers both symbol families
+by first occurrence and prints a SHA-256, exiting nonzero when the hashes
+disagree. Equal hashes mean the two files differ only in the spelling of those
+generated symbols: the renumbering is one-to-one and occurrence order is
+preserved, so a reordering, an added or removed declaration, or a change to any
+other identifier still changes the hash. Report the raw rename count alongside
+the normalized hash, and say explicitly that the normalized oracle was used;
+a change that needs it also needs a new baseline.
+
 Retained baselines live in `benchmarks/results/self_compile_baseline_*.json`
 and `self_compile_small_baseline_*.json`; a new baseline is recorded only when
 the input revision or host changes.
