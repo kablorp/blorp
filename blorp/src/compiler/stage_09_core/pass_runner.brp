@@ -77,11 +77,14 @@ pure func core_pass_diagnostic_hint(diagnostic: CorePassDiagnostic) -> Option[St
 -- One whole-program Core pass. `invariant` runs on every compile and must stay
 -- cheap; `checked_invariant` runs only under `--check-invariants`, and is left
 -- empty when the production invariant already covers the same walk.
+--
+-- Both are `None` for the passes that guard nothing, so a pass without an
+-- invariant costs no call at all rather than a call that returns `None`.
 record CorePass {
 	name: String,
 	run: pure (CorePassState) -> Result[CorePassState, CorePassDiagnostic],
-	invariant: pure (CoreProgram) -> Option[CorePassDiagnostic],
-	checked_invariant: pure (CoreProgram) -> Option[CorePassDiagnostic]
+	invariant: Option[pure (CoreProgram) -> Option[CorePassDiagnostic]],
+	checked_invariant: Option[pure (CoreProgram) -> Option[CorePassDiagnostic]]
 }
 
 
@@ -111,10 +114,6 @@ union CorePassRun:
 	CorePassesFailed(String, CorePassDiagnostic, List[CorePassTiming])
 
 
-pure func no_core_pass_invariant(program: CoreProgram) -> Option[CorePassDiagnostic]:
-	None
-
-
 pure func core_pass_state(program: CoreProgram, next_def_id: Int) -> CorePassState:
 	{
 		program = program,
@@ -129,8 +128,8 @@ pure func core_pass(
 	{
 		name = name,
 		run = run,
-		invariant = no_core_pass_invariant,
-		checked_invariant = no_core_pass_invariant
+		invariant = None,
+		checked_invariant = None
 	}
 
 
@@ -144,6 +143,17 @@ pure func core_program_pass(
 		Ok({ state | program = rewrite(state.program) })
 
 	core_pass(name, run)
+
+
+private pure func run_pass_invariant(
+	invariant: Option[pure (CoreProgram) -> Option[CorePassDiagnostic]],
+	program: CoreProgram,
+) -> Option[CorePassDiagnostic]:
+	match invariant:
+		Some(check):
+			check(program)
+		None:
+			None
 
 
 private func core_pass_time(enabled: Bool) -> Int:
@@ -191,12 +201,15 @@ func run_core_passes(
 							microseconds = now_microseconds() - started,
 						})
 
-					violation: Option[CorePassDiagnostic] = match pass.invariant(current.program):
+					violation: Option[CorePassDiagnostic] = match run_pass_invariant(
+						pass.invariant,
+						current.program,
+					):
 						Some(diagnostic):
 							Some(diagnostic)
 						None:
 							if control.check_invariants:
-								pass.checked_invariant(current.program)
+								run_pass_invariant(pass.checked_invariant, current.program)
 							else:
 								None
 
