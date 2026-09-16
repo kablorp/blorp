@@ -132,6 +132,17 @@ import:
 	traverse as CoreTraverse
 
 
+-- Allocation identity for the reuse rule the rewrites below follow: a mapped
+-- child that is the same allocation as its input proves the input node can be
+-- handed back as is, so a body with no mutable local stops being reallocated
+-- to change nothing. Core is immutable value data, so sharing subtrees between
+-- input and output is safe. Bound straight to the runtime primitive for the
+-- same bootstrap reason as the matching block in traverse.brp; delete the
+-- blocks together and import `memory: same_object` instead.
+foreign:
+	private pure func same_core_expr(left: CoreExpr, right: CoreExpr) -> Bool = "blorp_same_object"
+
+
 enum CoreAssignmentShape:
 	NoAssignment
 	StraightLineAssignment
@@ -1775,14 +1786,135 @@ private pure func rewrite_logical_expr_from(
 -- before SSA recurse explicitly; leaf forms and forms introduced only by
 -- later passes return unchanged. Adding a Core variant must update this
 -- boundary instead of silently bypassing mutable-local lowering.
+-- Arms move into grouped functions behind this dispatcher one group at a time;
+-- whatever has not moved yet stays in `rewrite_remaining_expr_from` below. The
+-- dispatcher binds nothing, so its generated C frame does not carry the
+-- temporaries of every CoreExpr variant at once.
 private pure func rewrite_expr_from(expr: CoreExpr, next_version: Int) -> CoreSsaExprRewrite:
+	match expr:
+		DebugBlockExpr(_, _, _) | UnaryExpr(_, _, _, _) | AssignExpr(_, _, _, _) | FieldExpr(_, _, _, _) | TupleFieldExpr(_, _, _, _) | PreClosureDetachExpr(_, _, _) | WhileExpr(_, _, _, _) | RangeExpr(_, _, _, _) | IfExpr(_, _, _, _, _):
+			rewrite_operator_expr_from(expr, next_version)
+		_:
+			rewrite_remaining_expr_from(expr, next_version)
+
+
+-- Operators and the simple control forms: map children, hand the input node
+-- back when none of them moved.
+private pure func rewrite_operator_expr_from(
+	expr: CoreExpr,
+	next_version: Int,
+) -> CoreSsaExprRewrite:
 	match expr:
 		DebugBlockExpr(body, typ, loc):
 			body_result = rewrite_expr_from(body, next_version)
-			{
-				expr = DebugBlockExpr(body_result.expr, typ, loc),
-				next_version = body_result.next_version
-			}
+
+			if same_core_expr(body_result.expr, body):
+				unchanged_rewrite(expr, body_result.next_version)
+			else:
+				{
+					expr = DebugBlockExpr(body_result.expr, typ, loc),
+					next_version = body_result.next_version
+				}
+		UnaryExpr(op, value, typ, loc):
+			value_result = rewrite_expr_from(value, next_version)
+
+			if same_core_expr(value_result.expr, value):
+				unchanged_rewrite(expr, value_result.next_version)
+			else:
+				{
+					expr = UnaryExpr(op, value_result.expr, typ, loc),
+					next_version = value_result.next_version
+				}
+		AssignExpr(variable, rhs, typ, loc):
+			rhs_result = rewrite_expr_from(rhs, next_version)
+
+			if same_core_expr(rhs_result.expr, rhs):
+				unchanged_rewrite(expr, rhs_result.next_version)
+			else:
+				{
+					expr = AssignExpr(variable, rhs_result.expr, typ, loc),
+					next_version = rhs_result.next_version
+				}
+		FieldExpr(value, field_name, typ, loc):
+			value_result = rewrite_expr_from(value, next_version)
+
+			if same_core_expr(value_result.expr, value):
+				unchanged_rewrite(expr, value_result.next_version)
+			else:
+				{
+					expr = FieldExpr(value_result.expr, field_name, typ, loc),
+					next_version = value_result.next_version
+				}
+		TupleFieldExpr(value, field_index, typ, loc):
+			value_result = rewrite_expr_from(value, next_version)
+
+			if same_core_expr(value_result.expr, value):
+				unchanged_rewrite(expr, value_result.next_version)
+			else:
+				{
+					expr = TupleFieldExpr(value_result.expr, field_index, typ, loc),
+					next_version = value_result.next_version
+				}
+		PreClosureDetachExpr(body, typ, loc):
+			body_result = rewrite_expr_from(body, next_version)
+
+			if same_core_expr(body_result.expr, body):
+				unchanged_rewrite(expr, body_result.next_version)
+			else:
+				{
+					expr = PreClosureDetachExpr(body_result.expr, typ, loc),
+					next_version = body_result.next_version
+				}
+		WhileExpr(cond, body, typ, loc):
+			cond_result = rewrite_expr_from(cond, next_version)
+			body_result = rewrite_expr_from(body, cond_result.next_version)
+
+			if same_core_expr(cond_result.expr, cond) and same_core_expr(body_result.expr, body):
+				unchanged_rewrite(expr, body_result.next_version)
+			else:
+				{
+					expr = WhileExpr(cond_result.expr, body_result.expr, typ, loc),
+					next_version = body_result.next_version
+				}
+		RangeExpr(start, end_value, typ, loc):
+			start_result = rewrite_expr_from(start, next_version)
+			end_result = rewrite_expr_from(end_value, start_result.next_version)
+
+			if (
+				same_core_expr(start_result.expr, start)
+				and same_core_expr(end_result.expr, end_value)
+			):
+				unchanged_rewrite(expr, end_result.next_version)
+			else:
+				{
+					expr = RangeExpr(start_result.expr, end_result.expr, typ, loc),
+					next_version = end_result.next_version
+				}
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			cond_result = rewrite_expr_from(cond, next_version)
+			then_result = rewrite_expr_from(then_expr, cond_result.next_version)
+			else_result = rewrite_expr_from(else_expr, then_result.next_version)
+
+			if (
+				same_core_expr(cond_result.expr, cond)
+				and same_core_expr(then_result.expr, then_expr)
+				and same_core_expr(else_result.expr, else_expr)
+			):
+				unchanged_rewrite(expr, else_result.next_version)
+			else:
+				{
+					expr = IfExpr(cond_result.expr, then_result.expr, else_result.expr, typ, loc),
+					next_version = else_result.next_version
+				}
+		_:
+			unchanged_rewrite(expr, next_version)
+
+
+private pure func rewrite_remaining_expr_from(
+	expr: CoreExpr,
+	next_version: Int,
+) -> CoreSsaExprRewrite:
+	match expr:
 		CallExpr(kind, callee, args, typ, loc):
 			callee_result = rewrite_expr_from(callee, next_version)
 			args_result = rewrite_exprs(args, callee_result.next_version)
@@ -1792,32 +1924,8 @@ private pure func rewrite_expr_from(expr: CoreExpr, next_version: Int) -> CoreSs
 			}
 		BinaryExpr(_, _, _, _, _):
 			rewrite_binary_spine_from(expr, next_version)
-		UnaryExpr(op, value, typ, loc):
-			value_result = rewrite_expr_from(value, next_version)
-			{
-				expr = UnaryExpr(op, value_result.expr, typ, loc),
-				next_version = value_result.next_version
-			}
 		LogicalExpr(op, left, right, typ, loc):
 			rewrite_logical_expr_from(expr, next_version)
-		AssignExpr(variable, rhs, typ, loc):
-			rhs_result = rewrite_expr_from(rhs, next_version)
-			{
-				expr = AssignExpr(variable, rhs_result.expr, typ, loc),
-				next_version = rhs_result.next_version
-			}
-		FieldExpr(value, field_name, typ, loc):
-			value_result = rewrite_expr_from(value, next_version)
-			{
-				expr = FieldExpr(value_result.expr, field_name, typ, loc),
-				next_version = value_result.next_version
-			}
-		TupleFieldExpr(value, field_index, typ, loc):
-			value_result = rewrite_expr_from(value, next_version)
-			{
-				expr = TupleFieldExpr(value_result.expr, field_index, typ, loc),
-				next_version = value_result.next_version
-			}
 		TupleExpr(items, typ, loc):
 			items_result = rewrite_exprs(items, next_version)
 			{
@@ -1875,12 +1983,6 @@ private pure func rewrite_expr_from(expr: CoreExpr, next_version: Int) -> CoreSs
 				expr = RecordCowUpdateExpr(source_result.expr, fields_result.items, typ, loc),
 				next_version = source_result.next_version
 			}
-		PreClosureDetachExpr(body, typ, loc):
-			body_result = rewrite_expr_from(body, next_version)
-			{
-				expr = PreClosureDetachExpr(body_result.expr, typ, loc),
-				next_version = body_result.next_version
-			}
 		LetExpr(variable, is_mutable, typ, rhs, body):
 			rhs_result = rewrite_expr_from(rhs, next_version)
 			body_result = rewrite_expr_from(body, rhs_result.next_version)
@@ -1901,13 +2003,6 @@ private pure func rewrite_expr_from(expr: CoreExpr, next_version: Int) -> CoreSs
 			}
 		SeqExpr(_, _):
 			rewrite_sequence(expr, next_version)
-		WhileExpr(cond, body, typ, loc):
-			cond_result = rewrite_expr_from(cond, next_version)
-			body_result = rewrite_expr_from(body, cond_result.next_version)
-			{
-				expr = WhileExpr(cond_result.expr, body_result.expr, typ, loc),
-				next_version = body_result.next_version
-			}
 		ResourceScopeExpr(scope, typ, loc):
 			acquire_result = rewrite_expr_from(scope.acquire, next_version)
 			body_result = rewrite_expr_from(scope.body, acquire_result.next_version)
@@ -2125,13 +2220,6 @@ private pure func rewrite_expr_from(expr: CoreExpr, next_version: Int) -> CoreSs
 				expr = SelectExpr(arms_result.items, typ, loc),
 				next_version = arms_result.next_version
 			}
-		RangeExpr(start, end_value, typ, loc):
-			start_result = rewrite_expr_from(start, next_version)
-			end_result = rewrite_expr_from(end_value, start_result.next_version)
-			{
-				expr = RangeExpr(start_result.expr, end_result.expr, typ, loc),
-				next_version = end_result.next_version
-			}
 		RawMatchExpr(scrutinee, cases, typ, loc):
 			scrutinee_result = rewrite_expr_from(scrutinee, next_version)
 			cases_result = rewrite_raw_match_cases(cases, scrutinee_result.next_version)
@@ -2156,14 +2244,6 @@ private pure func rewrite_expr_from(expr: CoreExpr, next_version: Int) -> CoreSs
 					loc,
 				),
 				next_version = fallback_result.next_version
-			}
-		IfExpr(cond, then_expr, else_expr, typ, loc):
-			cond_result = rewrite_expr_from(cond, next_version)
-			then_result = rewrite_expr_from(then_expr, cond_result.next_version)
-			else_result = rewrite_expr_from(else_expr, then_result.next_version)
-			{
-				expr = IfExpr(cond_result.expr, then_result.expr, else_result.expr, typ, loc),
-				next_version = else_result.next_version
 			}
 		LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _) | VarExpr(_, _, _) | VoidExpr(_, _):
 			unchanged_rewrite(expr, next_version)
@@ -2204,6 +2284,8 @@ private pure func rewrite_expr_from(expr: CoreExpr, next_version: Int) -> CoreSs
 		LengthMatchExpr(_, _, _, _, _):
 			unchanged_rewrite(expr, next_version)
 		SemanticMatchExpr(_, _, _, _):
+			unchanged_rewrite(expr, next_version)
+		_:
 			unchanged_rewrite(expr, next_version)
 
 
