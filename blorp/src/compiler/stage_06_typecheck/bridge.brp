@@ -359,6 +359,7 @@ foreign:
 		selective_modules: Int,
 		eager_modules: Int,
 		worklist_checked_bodies: Int,
+		bodies_outside_plan: Int,
 	) -> Void = "blorp_typecheck_ctfe_metric_record_c"
 
 
@@ -645,9 +646,13 @@ private pure func ctfe_validated_body_table_for_registration(
 			Some(table)
 
 
--- Validated module tables are the retained CTFE-to-ordinary handoff.
+-- Validated module tables are the retained CTFE-to-ordinary handoff. A table
+-- covers the bodies CTFE reached in a prepared dependency; definitions the
+-- worklist found outside the dependency plan are named here rather than left
+-- out, so a partial handoff says which bodies it did not check.
 private record CtfeValidatedBodyTablesRep {
-	by_module_id: Dict[Int, BodyOutcomeTable]
+	by_module_id: Dict[Int, BodyOutcomeTable],
+	definitions_outside_plan: List[Int]
 }
 
 
@@ -657,6 +662,7 @@ opaque type CtfeValidatedBodyTables = CtfeValidatedBodyTablesRep
 private pure func ctfe_validated_body_tables(
 	groups: CtfeCheckedBodyGroups,
 	registries: List[CtfeBodyModuleRegistry],
+	definitions_outside_plan: List[Int],
 ) -> Option[CtfeValidatedBodyTables]:
 	var by_module_id: Dict[Int, BodyOutcomeTable] = {}
 	var failed: Bool = False
@@ -675,7 +681,17 @@ private pure func ctfe_validated_body_tables(
 	if failed:
 		None
 	else:
-		Some(into_opaque CtfeValidatedBodyTables({by_module_id = by_module_id}))
+		Some(into_opaque CtfeValidatedBodyTables({
+					by_module_id = by_module_id,
+					definitions_outside_plan = definitions_outside_plan
+				}))
+
+
+-- How many bodies this handoff explicitly did not check for CTFE.
+private pure func ctfe_validated_body_tables_outside_plan_count(
+	tables: CtfeValidatedBodyTables,
+) -> Int:
+	from_opaque CtfeValidatedBodyTables(tables).definitions_outside_plan.length()
 
 
 private pure func ctfe_validated_body_tables_find(
@@ -2689,6 +2705,7 @@ private pure func record_ctfe_preparation_decision(
 	selective_modules: Int,
 	eager_modules: Int,
 	worklist_checked_bodies: Int,
+	bodies_outside_plan: Int,
 ) -> Void:
 	if typecheck_metrics_are_enabled():
 		typecheck_ctfe_metric_record(
@@ -2699,6 +2716,7 @@ private pure func record_ctfe_preparation_decision(
 			selective_modules,
 			eager_modules,
 			worklist_checked_bodies,
+			bodies_outside_plan,
 		)
 	else:
 		void
@@ -2846,6 +2864,7 @@ private pure func prepare_selective_ctfe_dependencies_for_roots(
 				0,
 				dependencies.length(),
 				0,
+				0,
 			)
 			SelectiveCtfeDependenciesRequireEager(CtfePreparationFailureFallback, 0, 0)
 		Some(registries):
@@ -2869,17 +2888,18 @@ private pure func prepare_selective_ctfe_dependencies_for_roots(
 						0,
 						dependencies.length(),
 						metrics.checked_bodies,
+						0,
 					)
 					SelectiveCtfeDependenciesRequireEager(
 						ctfe_eager_fallback_for_worklist(fallback),
 						attempted.dependency_checks,
 						attempted.target_checks,
 					)
-				CtfeBodyWorklistReady(checked, metrics):
+				CtfeBodyWorklistReady(checked, definitions_outside_plan, metrics):
 					groups = ctfe_checked_body_groups(checked)
 					target_checks = ctfe_checked_body_groups_count(groups, target_module_id)
 
-					match ctfe_validated_body_tables(groups, registries):
+					match ctfe_validated_body_tables(groups, registries, definitions_outside_plan):
 						None:
 							record_ctfe_preparation_decision(
 								"preparation_failure",
@@ -2889,6 +2909,7 @@ private pure func prepare_selective_ctfe_dependencies_for_roots(
 								0,
 								dependencies.length(),
 								metrics.checked_bodies,
+								0,
 							)
 							SelectiveCtfeDependenciesRequireEager(
 								CtfePreparationFailureFallback,
@@ -2980,6 +3001,7 @@ private pure func prepare_selective_ctfe_dependencies_for_roots(
 									prepared.length(),
 									0,
 									metrics.checked_bodies,
+									ctfe_validated_body_tables_outside_plan_count(tables),
 								)
 								SelectiveCtfeDependenciesReady(prepared, tables, target_checks)
 
@@ -3000,6 +3022,7 @@ private pure func prepare_selective_ctfe_dependencies(
 			dependencies.length(),
 			0,
 			dependencies.length(),
+			0,
 			0,
 		)
 		SelectiveCtfeDependenciesRequireEager(CtfeNoCallableRootsFallback, 0, 0)

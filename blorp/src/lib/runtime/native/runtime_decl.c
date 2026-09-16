@@ -2358,7 +2358,8 @@ void blorp_typecheck_ctfe_metric_record_c(
     long dependency_modules,
     long selective_modules,
     long eager_modules,
-    long worklist_checked_bodies
+    long worklist_checked_bodies,
+    long bodies_outside_plan
 );
 void blorp_typecheck_body_metrics_report_c(void);
 void blorp_print_live_object_summary(void);

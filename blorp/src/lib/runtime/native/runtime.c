@@ -1887,6 +1887,7 @@ typedef struct {
     long selective_modules;
     long eager_modules;
     long worklist_checked_bodies;
+    long bodies_outside_plan;
 } __blorp_TypecheckCtfeMetric;
 
 static __blorp_TypecheckCtfeMetric* __blorp_typecheck_ctfe_metrics = NULL;
@@ -1911,7 +1912,8 @@ void blorp_typecheck_ctfe_metric_record_c(
     long dependency_modules,
     long selective_modules,
     long eager_modules,
-    long worklist_checked_bodies
+    long worklist_checked_bodies,
+    long bodies_outside_plan
 ) {
     if (!__blorp_typecheck_body_metrics_enabled) return;
     if (__blorp_typecheck_ctfe_metric_count == __blorp_typecheck_ctfe_metric_capacity) {
@@ -1935,6 +1937,7 @@ void blorp_typecheck_ctfe_metric_record_c(
     row->selective_modules = selective_modules;
     row->eager_modules = eager_modules;
     row->worklist_checked_bodies = worklist_checked_bodies;
+    row->bodies_outside_plan = bodies_outside_plan;
     __blorp_typecheck_ctfe_metric_count++;
 }
 
@@ -1951,14 +1954,16 @@ void blorp_typecheck_body_metrics_report_c(void) {
             stderr,
             "BLORP_TYPECHECK_CTFE fallback=%s fallback_definition_id=%ld "
             "fallback_callable=%s dependency_modules=%ld "
-            "selective_modules=%ld eager_modules=%ld worklist_checked_bodies=%ld\n",
+            "selective_modules=%ld eager_modules=%ld worklist_checked_bodies=%ld "
+            "bodies_outside_plan=%ld\n",
             row->fallback ? row->fallback : "",
             row->fallback_definition_id,
             row->fallback_callable ? row->fallback_callable : "",
             row->dependency_modules,
             row->selective_modules,
             row->eager_modules,
-            row->worklist_checked_bodies
+            row->worklist_checked_bodies,
+            row->bodies_outside_plan
         );
     }
     __blorp_typecheck_ctfe_metrics_release();
