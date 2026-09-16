@@ -324,16 +324,41 @@ private pure func kind_counts_as_line_token(kind: TokenKind) -> Bool:
 			True
 
 
-private pure func emit_token(state: LexerState, kind: TokenKind, span: SourceSpan) -> LexerStep:
+---
+The single record update a token emission performs. Callers that scanned the
+token by walking a `Cursor` hand back the cursor and the new group depth here
+instead of rebuilding `LexerState` once per scanning step.
+---
+private pure func emitted_token_state(
+	state: LexerState,
+	kind: TokenKind,
+	end_cursor: Cursor,
+	group_depth: Int,
+) -> LexerState:
+	{ state |
+		cursor = end_cursor,
+		group_depth = group_depth,
+		pending_trivia = [],
+		line_has_token = state.line_has_token or kind_counts_as_line_token(kind),
+		last_token_kind = Some(kind)
+	}
+
+
+private pure func emit_token_at(
+	state: LexerState,
+	kind: TokenKind,
+	span: SourceSpan,
+	end_cursor: Cursor,
+) -> LexerStep:
 	emitted: Token = token_with_trivia(kind, span, state.pending_trivia, [])
 	LexerTokenStep(
-		{ state |
-			pending_trivia = [],
-			line_has_token = state.line_has_token or kind_counts_as_line_token(kind),
-			last_token_kind = Some(kind)
-		},
+		emitted_token_state(state, kind, end_cursor, state.group_depth),
 		emitted,
 	)
+
+
+private pure func emit_token(state: LexerState, kind: TokenKind, span: SourceSpan) -> LexerStep:
+	emit_token_at(state, kind, span, state.cursor)
 
 
 private pure func emit_structural_token(
@@ -383,15 +408,19 @@ private pure func starts_with(state: LexerState, expected: String) -> Bool:
 		matches
 
 
-private pure func advance_n(state: LexerState, width: Int) -> LexerState:
-	var st: LexerState = state
+private pure func cursor_advanced(source: SourceFile, cursor: Cursor, width: Int) -> Cursor:
+	var moved: Cursor = cursor
 	var remaining: Int = width
 
 	while remaining > 0:
-		st = advance(st)
+		moved = source_advance(source, moved)
 		remaining -= 1
 
-	st
+	moved
+
+
+private pure func advance_n(state: LexerState, width: Int) -> LexerState:
+	{ state | cursor = cursor_advanced(state.source, state.cursor, width) }
 
 
 private pure func line_ends_after_optional_space(state: LexerState, offset: Int) -> Bool:
@@ -1399,9 +1428,9 @@ private pure func scan_identifier(state: LexerState) -> LexerStep:
 
 	match keyword_for(text):
 		Some(keyword):
-			emit_token({ state | cursor = end_cursor }, KeywordToken(keyword), span)
+			emit_token_at(state, KeywordToken(keyword), span, end_cursor)
 		None:
-			emit_token({ state | cursor = end_cursor }, IdentifierToken(text), span)
+			emit_token_at(state, IdentifierToken(text), span, end_cursor)
 
 
 private pure func first_significant_decimal_digit(text: String) -> Int:
@@ -1480,19 +1509,19 @@ private pure func scan_number(state: LexerState) -> LexerStep:
 		line = start_cursor.line,
 		column = start_cursor.column + offset - start_cursor.offset
 	}
-	st: LexerState = { state | cursor = end_cursor }
-	span: SourceSpan = span_from(st, start_cursor, end_cursor)
-	text: String = source_span_text(st.source, span)
+	span: SourceSpan = span_from(state, start_cursor, end_cursor)
+	text: String = source_span_text(state.source, span)
 
 	if saw_dot:
-		emit_token(st, FloatLiteralToken(text), span)
+		emit_token_at(state, FloatLiteralToken(text), span, end_cursor)
 	else if decimal_literal_leq(text, INT128_MAX_DECIMAL):
-		emit_token(st, IntLiteralToken(text), span)
+		emit_token_at(state, IntLiteralToken(text), span, end_cursor)
 	else:
-		emit_token(
-			add_error_at_span(st, span, "Integer literal '" + text + "' exceeds Int128 range"),
+		emit_token_at(
+			add_error_at_span(state, span, "Integer literal '" + text + "' exceeds Int128 range"),
 			IntLiteralToken(text),
 			span,
+			end_cursor,
 		)
 
 
@@ -1525,13 +1554,18 @@ private pure func group_depth_after_symbol(depth: Int, symbol: Symbol) -> Int:
 
 private pure func emit_symbol(state: LexerState, symbol: Symbol, width: Int) -> LexerStep:
 	start_cursor: Cursor = state.cursor
-	st: LexerState = advance_n(state, width)
-
-	span: SourceSpan = span_from(st, start_cursor, st.cursor)
-	emit_token(
-		{ st | group_depth = group_depth_after_symbol(st.group_depth, symbol) },
-		SymbolToken(symbol),
-		span,
+	end_cursor: Cursor = cursor_advanced(state.source, start_cursor, width)
+	span: SourceSpan = span_from(state, start_cursor, end_cursor)
+	kind: TokenKind = SymbolToken(symbol)
+	emitted: Token = token_with_trivia(kind, span, state.pending_trivia, [])
+	LexerTokenStep(
+		emitted_token_state(
+			state,
+			kind,
+			end_cursor,
+			group_depth_after_symbol(state.group_depth, symbol),
+		),
+		emitted,
 	)
 
 
