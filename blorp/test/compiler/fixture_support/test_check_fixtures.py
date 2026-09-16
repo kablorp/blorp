@@ -116,6 +116,42 @@ class BlorpCheckFixtureRunnerTests(unittest.TestCase):
             self.assertIn("missing exact diagnostic: error: wanted", result.stdout)
             self.assertIn("status=FAIL passed=0 failed=1 tests=1", result.stdout)
 
+    def test_matches_exact_diagnostic_behind_source_label(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fail_dir = root / "should_fail"
+            fail_dir.mkdir()
+            (fail_dir / "fails.brp").write_text(
+                "-- EXPECT: error: wanted\n-- RUN-BLORP-CHECK\n",
+                encoding="utf-8",
+            )
+            compiler = root / "bin" / "blorp"
+            compiler.parent.mkdir(parents=True, exist_ok=True)
+            compiler.write_text(
+                "#!/bin/sh\nprintf '%s\\n' 'error: fails.brp:2:5: error: wanted'\nexit 1\n",
+                encoding="utf-8",
+            )
+            compiler.chmod(0o755)
+
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(RUNNER),
+                    "--blorp-bin",
+                    str(compiler),
+                    "--root",
+                    str(root),
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertIn("status=PASS passed=1 failed=0 tests=1", result.stdout)
+
     def test_rejects_infrastructure_exit_for_should_fail_fixture(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

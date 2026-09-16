@@ -104,8 +104,9 @@ per-gate timing, total wall-clock time, and setup timing; failures print focused
 excerpts and can save full logs with `--log-dir`.
 The default gate exercises the production-owned compiler implementation through
 `compiler-blorp`.
-The `compiler-blorp` gate also runs the 57 fixtures explicitly marked
-`RUN-BLORP-CHECK` through a small Blorp-only runner after the generated suite.
+The `compiler-blorp` gate also runs every fixture explicitly marked
+`RUN-BLORP-CHECK` through a small Blorp-only runner after the generated suite;
+the expected fixture count is pinned in `scripts/test` and in the runner.
 Runtime sources owned by the leak gate are excluded from the normal runtime corpus.
 The remaining roots compile and run together in one runtime test invocation.
 `--no-build` is for controlled CI or local workflows that have already run the

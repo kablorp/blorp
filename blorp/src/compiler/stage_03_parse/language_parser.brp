@@ -103,6 +103,7 @@ import:
 			StringLiteralToken,
 			SymbolToken,
 		),
+		keyword_text,
 		symbol_text,
 		token,
 	parsed_ast:
@@ -812,12 +813,21 @@ private pure func token_kind_is_symbol(kind: TokenKind, expected: Symbol) -> Boo
 			False
 
 
+---
+Whether a token can name one element of a tuple destructuring target.
+
+A reserved keyword counts as a binder name here so `(alias, rest) = pair`
+reaches the binder parser and reports the reserved-keyword rule instead of
+failing as a tuple expression.
+---
 private pure func token_kind_is_tuple_binder_name(kind: TokenKind) -> Bool:
 	match kind:
 		IdentifierToken(_):
 			True
 		SymbolToken(UnderscoreSymbol):
 			True
+		KeywordToken(keyword):
+			keyword_is_reserved_name(keyword)
 		_:
 			False
 
@@ -1009,6 +1019,52 @@ private pure func soft_keyword_identifier_text(keyword: Keyword) -> Option[Strin
 			None
 
 
+---
+Whether a keyword is reserved in every name position: bindings, parameters,
+patterns, fields, and declarations. Only keywords with a soft identifier
+spelling may be used as names.
+---
+private pure func keyword_is_reserved_name(keyword: Keyword) -> Bool:
+	soft_keyword_identifier_text(keyword).is_none()
+
+
+---
+The single diagnostic text for a reserved keyword written where a name belongs.
+It names the keyword and suggests a replacement identifier.
+---
+private pure func reserved_keyword_name_message(keyword: Keyword) -> String:
+	text: String = keyword_text(keyword)
+	suggestion: String = "choose another identifier such as `${text}_name`"
+
+	"`${text}` is a reserved keyword and cannot be used as a name; ${suggestion}"
+
+
+---
+One rule for every reserved keyword written where a name belongs.
+
+The keyword is consumed as if it were the name so the rest of the binding,
+parameter list, or match case still parses and no bare "expected expression"
+cascade follows the reserved-keyword error.
+---
+private pure func parse_reserved_keyword_as_name(
+	state: ParserState,
+	keyword: Keyword,
+	span: SourceSpan,
+) -> ParseIdentifierStep:
+	next_state: ParserState = add_expected_error(
+		state,
+		span,
+		reserved_keyword_name_message(keyword),
+		[],
+		None,
+	)
+
+	{
+		state = advance_parser(next_state),
+		value = parsed_identifier(keyword_text(keyword), span)
+	}
+
+
 private pure func parse_identifier_expected(
 	state: ParserState,
 	expected: String,
@@ -1064,6 +1120,31 @@ private pure func parse_identifier_expected(
 				state = recovery_state,
 				value = parsed_identifier("", token.span)
 			}
+
+
+---
+Parse an identifier that introduces a new name: a binding, parameter, pattern,
+field, or declaration name.
+
+A reserved keyword here is reported as a misuse of that keyword. Reference
+positions such as module paths, field access, and constructor names keep
+`parse_identifier_expected`, because a keyword there usually means the
+reference is missing rather than that the keyword was meant as a name.
+---
+private pure func parse_declared_name_expected(
+	state: ParserState,
+	expected: String,
+) -> ParseIdentifierStep:
+	token: Token = current_token(state)
+
+	match token.kind:
+		KeywordToken(keyword):
+			if keyword_is_reserved_name(keyword):
+				parse_reserved_keyword_as_name(state, keyword, token.span)
+			else:
+				parse_identifier_expected(state, expected)
+		_:
+			parse_identifier_expected(state, expected)
 
 
 private pure func parse_type_identifier_expected(
@@ -1826,7 +1907,7 @@ private pure func parse_named_or_wildcard_param(state: ParserState) -> ParsePara
 				}
 			}
 		_:
-			name_step: ParseIdentifierStep = parse_identifier_expected(
+			name_step: ParseIdentifierStep = parse_declared_name_expected(
 				state,
 				EXPECTED_PARAMETER_NAME,
 			)
@@ -2037,7 +2118,7 @@ private pure func parse_type_param_decl(state: ParserState) -> ParseTypeParamSte
 	name_step: ParseIdentifierStep = if current_is_symbol(state, HashSymbol):
 		parse_hash_identifier_expected(state, "dimension parameter")
 	else:
-		parse_identifier_expected(state, "type parameter")
+		parse_declared_name_expected(state, "type parameter")
 
 	var st: ParserState = name_step.state
 	var bounds: List[ParsedIdentifier] = []
@@ -2139,7 +2220,7 @@ private pure func parse_binder_identifier_expected(
 				value = parsed_identifier("_", token.span)
 			}
 		_:
-			parse_identifier_expected(state, expected)
+			parse_declared_name_expected(state, expected)
 
 
 private pure func parse_select_receive_identifier_expected(
@@ -2170,7 +2251,7 @@ private pure func parse_select_receive_identifier_expected(
 				value = parsed_identifier("from", token.span)
 			}
 		_:
-			parse_identifier_expected(state, expected)
+			parse_declared_name_expected(state, expected)
 
 
 private pure func current_infix_info(state: ParserState) -> Option[ParsedInfixInfo]:
@@ -2874,22 +2955,15 @@ private pure func parse_simple_pattern(state: ParserState) -> ParsePatternStep:
 						value = ParsedNamePattern(parsed_identifier(text, token.span))
 					}
 				None:
-					next_state: ParserState = add_expected_error(
+					name_step: ParseIdentifierStep = parse_reserved_keyword_as_name(
 						state,
+						keyword,
 						token.span,
-						"expected pattern",
-						["pattern"],
-						None,
 					)
 
-					recovery_state: ParserState = if current_is_soft_boundary(next_state):
-						next_state
-					else:
-						advance_parser(next_state)
-
 					{
-						state = recovery_state,
-						value = ParsedMissingPattern(token.span)
+						state = name_step.state,
+						value = ParsedNamePattern(name_step.value)
 					}
 		SymbolToken(LeftParenSymbol):
 			parse_tuple_pattern_after_left_paren(advance_parser(state), token.span)
@@ -3672,7 +3746,7 @@ private pure func parse_tuple_binder_identifier_expected(
 ) -> ParseIdentifierStep:
 	match mode:
 		TupleBinderNamesOnly:
-			parse_identifier_expected(state, expected)
+			parse_declared_name_expected(state, expected)
 		TupleBinderNamesOrUnderscore:
 			parse_binder_identifier_expected(state, expected)
 
@@ -4159,6 +4233,33 @@ private pure func parse_assignment_after_expression(expr_step: ParseExprStep) ->
 		expr_step
 
 
+---
+Whether the current token is a reserved keyword followed by a binding tail
+(`: Type =`, `=`, `?=`, or a compound assignment).
+
+Such a keyword sits in a name position rather than starting a keyword construct
+such as `if` or `match`. Routing it to the binder parser reports the
+reserved-keyword rule once and keeps the rest of the statement parsing.
+---
+private pure func current_reserved_keyword_starts_binding(state: ParserState) -> Bool:
+	match current_token(state).kind:
+		KeywordToken(keyword):
+			if keyword_is_reserved_name(keyword):
+				after_name: ParserState = advance_parser(state)
+
+				(
+					current_can_start_assignment_tail(after_name)
+					or (
+						current_is_symbol(after_name, ColonSymbol)
+						and colon_starts_typed_assignment(after_name)
+					)
+				)
+			else:
+				False
+		_:
+			False
+
+
 private pure func current_token_can_start_named_statement(state: ParserState) -> Bool:
 	match current_token(state).kind:
 		IdentifierToken(_):
@@ -4168,7 +4269,7 @@ private pure func current_token_can_start_named_statement(state: ParserState) ->
 				Some(_):
 					True
 				None:
-					False
+					current_reserved_keyword_starts_binding(state)
 		_:
 			False
 
@@ -5249,7 +5350,7 @@ private pure func parse_function_decl_value(
 ) -> ParseFunctionStep:
 	func_span: SourceSpan = current_span(state)
 	var st: ParserState = advance_parser(state)
-	name_step: ParseIdentifierStep = parse_identifier_expected(st, EXPECTED_FUNCTION_NAME)
+	name_step: ParseIdentifierStep = parse_declared_name_expected(st, EXPECTED_FUNCTION_NAME)
 	st = name_step.state
 	type_params_step: ParseTypeParamListStep = parse_type_params_opt(st)
 	st = type_params_step.state
@@ -5420,7 +5521,7 @@ private pure func parse_import_symbol(state: ParserState) -> ParseImportSymbolSt
 			end_span = right_step.span
 
 	if current_is_keyword(st, AsKeyword):
-		alias_step: ParseIdentifierStep = parse_identifier_expected(
+		alias_step: ParseIdentifierStep = parse_declared_name_expected(
 			advance_parser(st),
 			"import symbol alias",
 		)
@@ -5544,7 +5645,7 @@ private pure func parse_import_item(state: ParserState) -> ParseImportItemStep:
 	var end_span: SourceSpan = path_step.span
 
 	if current_is_keyword(st, AsKeyword):
-		alias_step: ParseIdentifierStep = parse_identifier_expected(
+		alias_step: ParseIdentifierStep = parse_declared_name_expected(
 			advance_parser(st),
 			"module alias",
 		)
@@ -5773,7 +5874,7 @@ private pure func parse_foreign_function_decl(state: ParserState) -> ParseForeig
 		st = advance_parser(st)
 
 	st = expect_keyword(st, FuncKeyword, "func", "expected `func` in foreign block item")
-	name_step: ParseIdentifierStep = parse_identifier_expected(st, EXPECTED_FUNCTION_NAME)
+	name_step: ParseIdentifierStep = parse_declared_name_expected(st, EXPECTED_FUNCTION_NAME)
 	st = name_step.state
 	left_step: ParseSymbolStep = expect_symbol(
 		st,
@@ -5931,7 +6032,7 @@ private pure func parse_foreign_block_decl(
 
 
 private pure func parse_field_decl(state: ParserState) -> ParseFieldStep:
-	name_step: ParseIdentifierStep = parse_identifier_expected(state, "field name")
+	name_step: ParseIdentifierStep = parse_declared_name_expected(state, "field name")
 	colon_step: ParseSymbolStep = expect_symbol(
 		name_step.state,
 		ColonSymbol,
@@ -5995,7 +6096,7 @@ private pure func parse_record_decl(
 		"expected `}` after struct fields"
 	else:
 		"expected `}` after record fields"
-	name_step: ParseIdentifierStep = parse_identifier_expected(st, name_expected)
+	name_step: ParseIdentifierStep = parse_declared_name_expected(st, name_expected)
 	st = name_step.state
 
 	type_params_step: ParseTypeParamListStep = if is_struct:
@@ -6047,7 +6148,7 @@ private pure func parse_variant_identifier_expected(state: ParserState) -> Parse
 				value = parsed_identifier("False", token.span)
 			}
 		_:
-			parse_identifier_expected(state, "variant name")
+			parse_declared_name_expected(state, "variant name")
 
 
 private pure func parse_variant_decl(state: ParserState) -> ParseVariantStep:
@@ -6109,7 +6210,7 @@ private pure func parse_union_decl(
 	start_span: SourceSpan,
 ) -> ParseDeclStep:
 	var st: ParserState = advance_parser(state)
-	name_step: ParseIdentifierStep = parse_identifier_expected(st, "type name")
+	name_step: ParseIdentifierStep = parse_declared_name_expected(st, "type name")
 	st = name_step.state
 
 	type_params_step: ParseTypeParamListStep = if is_enum:
@@ -6183,7 +6284,7 @@ private pure func parse_builtin_type_decl(
 		state
 
 	st = expect_keyword(st, TypeKeyword, "type", "expected `type` in builtin type declaration")
-	name_step: ParseIdentifierStep = parse_identifier_expected(st, "type name")
+	name_step: ParseIdentifierStep = parse_declared_name_expected(st, "type name")
 	st = name_step.state
 	type_params_step: ParseTypeParamListStep = parse_type_params_opt(st)
 	st = type_params_step.state
@@ -6259,7 +6360,7 @@ private pure func parse_type_alias_decl(
 	else:
 		st = expect_keyword(st, AliasKeyword, "alias", "expected `alias` after `type`")
 
-	name_step: ParseIdentifierStep = parse_identifier_expected(st, "type alias name")
+	name_step: ParseIdentifierStep = parse_declared_name_expected(st, "type alias name")
 	st = name_step.state
 	type_params_step: ParseTypeParamListStep = parse_type_params_opt(st)
 	st = type_params_step.state
@@ -6293,7 +6394,7 @@ private pure func parse_trait_method(state: ParserState) -> ParseTraitMethodStep
 		st = advance_parser(st)
 
 	st = expect_keyword(st, FuncKeyword, "func", "expected `func` before trait method")
-	name_step: ParseIdentifierStep = parse_identifier_expected(st, "trait method name")
+	name_step: ParseIdentifierStep = parse_declared_name_expected(st, "trait method name")
 	st = name_step.state
 	left_step: ParseSymbolStep = expect_symbol(
 		st,
@@ -6376,7 +6477,7 @@ private pure func parse_trait_decl(
 	start_span: SourceSpan,
 ) -> ParseDeclStep:
 	var st: ParserState = advance_parser(state)
-	name_step: ParseIdentifierStep = parse_identifier_expected(st, "trait name")
+	name_step: ParseIdentifierStep = parse_declared_name_expected(st, "trait name")
 	st = name_step.state
 	type_params_step: ParseTypeParamListStep = parse_type_params_opt(st)
 	st = type_params_step.state
@@ -6624,6 +6725,11 @@ private pure func parse_private_decl(
 		match current_token(st).kind:
 			IdentifierToken(_):
 				parse_top_level_var_decl(st, False, inner_start_span)
+			KeywordToken(_):
+				if current_reserved_keyword_starts_binding(st):
+					parse_top_level_var_decl(st, False, inner_start_span)
+				else:
+					parse_error_decl(st)
 			_:
 				parse_error_decl(st)
 
@@ -6711,6 +6817,11 @@ private pure func parse_decl(state: ParserState) -> ParseDeclStep:
 		match current_token(st).kind:
 			IdentifierToken(_):
 				parse_top_level_var_decl(st, False, start_span)
+			KeywordToken(_):
+				if current_reserved_keyword_starts_binding(st):
+					parse_top_level_var_decl(st, False, start_span)
+				else:
+					parse_error_decl(st)
 			_:
 				parse_error_decl(st)
 

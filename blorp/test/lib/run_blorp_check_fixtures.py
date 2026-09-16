@@ -12,7 +12,7 @@ from process_supervisor import CAPTURE_LIMIT_EXIT, PROCESS_TIMEOUT_EXIT, run_com
 
 
 MARKER = "-- RUN-BLORP-CHECK"
-PRODUCTION_FIXTURE_COUNT = 58
+PRODUCTION_FIXTURE_COUNT = 63
 
 
 @dataclass
@@ -45,14 +45,27 @@ def parse_expectations(source: str) -> Expectations:
     return blorp if blorp.has_checks() else generic
 
 
+SEVERITY_MARKERS = ((": error: ", "error: "), (": warning: ", "warning: "))
+
+
+def strip_source_label(diagnostic: str) -> str:
+    """Drop a `path:line:col:` label so that "error: path:1:2: error: message"
+    (the CLI's parser diagnostic shape) and "path:1:2: error: message" both
+    normalize to "error: message" for exact expectations."""
+    for marker, prefix in SEVERITY_MARKERS:
+        if marker in diagnostic:
+            return prefix + diagnostic.split(marker, 1)[1]
+    return diagnostic
+
+
 def normalized_diagnostics(output: str) -> list[str]:
     diagnostics: list[str] = []
     for line in output.splitlines():
         stripped = line.strip()
         if stripped.startswith(("error: ", "warning: ")):
-            diagnostics.append(stripped)
+            diagnostics.append(strip_source_label(stripped))
             continue
-        for marker, prefix in ((": error: ", "error: "), (": warning: ", "warning: ")):
+        for marker, prefix in SEVERITY_MARKERS:
             if marker in stripped:
                 diagnostics.append(prefix + stripped.split(marker, 1)[1])
                 break

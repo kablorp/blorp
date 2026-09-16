@@ -44,6 +44,16 @@ select     from         after         sealed         into_opaque   from_opaque
 True   False
 ```
 
+Keywords are reserved. Writing one where a name belongs, whether a binding,
+parameter, pattern, field, or declaration name, is a parse error that names
+the keyword and suggests an alternative:
+
+```
+error: `alias` is a reserved keyword and cannot be used as a name; choose another identifier such as `alias_name`
+```
+
+The soft keywords listed under [Names](#names) are the only exceptions.
+
 Declarations are public by default; `private` hides a declaration from
 importers. There is no `export` keyword.
 `try` remains reserved only so the parser can diagnose removed `try:` blocks;
@@ -549,13 +559,13 @@ lambda_body = or_expr | NEWLINE INDENT stmt_list DEDENT ;
 
 ### Names
 
-Certain keywords can be used as identifiers in field/function name position:
+A few keywords have a soft identifier spelling and may be used in field,
+function, parameter, and binding name position. Every other keyword is
+reserved (see [Keywords](#keywords)):
 
 ```ebnf
-name = IDENT | "debug" | "and" | "or" | "not" | "type" | "opaque" | "match" | "if" | "else"
-     | "True" | "False" | "in" | "for" | "while" | "with" | "foreign"
-     | "resource" | "concurrent" | "on"
-     | "select" | "after" | "sealed" ;
+name = IDENT | "debug" | "with" | "concurrent" | "concurrently" | "select"
+     | "after" | "sealed" | "on" ;
 ```
 
 ## Operator Precedence (lowest to highest)
