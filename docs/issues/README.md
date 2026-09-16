@@ -81,7 +81,6 @@ current-state and next-action summary.
 - [Core traversal and Perceus reuse](compiler-performance/135-core-traversal-perceus-reuse.md)
 - [Zero-copy callable symbol emission](compiler-performance/136-zero-copy-callable-symbol-emission.md)
 - [Codegen-input last-use and frontend release](compiler-performance/137-codegen-input-last-use-and-release.md)
-- [Unchanged Core node reuse in the shared traversal](compiler-performance/147-reuse-unchanged-core-nodes-in-traversal.md)
 - [Normalized semantic compilation roadmap](compiler-performance/NORMALIZED_SEMANTIC_COMPILATION_ROADMAP.md)
 - [Perceus ownership roadmap](compiler-performance/PERCEUS_OWNERSHIP_OPTIMIZATION_ROADMAP.md)
 - [Nested record allocation folding prototype](compiler-performance/NESTED_RECORD_FOLDING_PROTOTYPE_ROADMAP.md)
