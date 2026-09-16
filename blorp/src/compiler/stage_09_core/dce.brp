@@ -1518,132 +1518,111 @@ record DceClosure {
 }
 
 
-private record DceClosureState {
-	reachable: List[Int],
-	reachable_set: Set[Int],
-	reachable_globals: List[String],
-	reachable_global_set: Set[String],
-	reachable_types: List[String],
-	reachable_type_set: Set[String],
-	fail_closed: Bool
-}
-
-
-private pure func apply_reachability_facts(
-	index: DceReachabilityIndex,
-	state: DceClosureState,
-	facts: DceFacts,
-) -> DceClosureState:
-	if facts.fail_closed:
-		{ state | fail_closed = True }
-	else:
-		var reachable = state.reachable
-		var reachable_set = state.reachable_set
-		var reachable_globals = state.reachable_globals
-		var reachable_global_set = state.reachable_global_set
-		var reachable_types = state.reachable_types
-		var reachable_type_set = state.reachable_type_set
-
-		for def_id in facts.function_ids:
-			if not Sets.contains(reachable_set, def_id):
-				reachable = reachable.append(def_id)
-				reachable_set = Sets.add(reachable_set, def_id)
-
-		for name in facts.function_names:
-			for def_id in index.function_ids_by_name.get_or(name, []):
-				if not Sets.contains(reachable_set, def_id):
-					reachable = reachable.append(def_id)
-					reachable_set = Sets.add(reachable_set, def_id)
-
-		for reference in facts.constructor_references:
-			for constructor in index.constructors_by_name.get_or(reference.name, []):
-				if (
-					constructor.def_id == reference.def_id
-					and not Sets.contains(reachable_type_set, constructor.parent_type_name)
-				):
-					reachable_types = reachable_types.append(constructor.parent_type_name)
-					reachable_type_set = Sets.add(reachable_type_set, constructor.parent_type_name)
-				else:
-					void
-
-		for name in facts.global_names:
-			if (
-				index.globals_by_name.contains(name)
-				and not Sets.contains(reachable_global_set, name)
-			):
-				reachable_globals = reachable_globals.append(name)
-				reachable_global_set = Sets.add(reachable_global_set, name)
-
-		for name in facts.type_names:
-			if not Sets.contains(reachable_type_set, name):
-				reachable_types = reachable_types.append(name)
-				reachable_type_set = Sets.add(reachable_type_set, name)
-
-		{
-			reachable = reachable,
-			reachable_set = reachable_set,
-			reachable_globals = reachable_globals,
-			reachable_global_set = reachable_global_set,
-			reachable_types = reachable_types,
-			reachable_type_set = reachable_type_set,
-			fail_closed = False
-		}
-
-
 private pure func close_reachability(index: DceReachabilityIndex, roots: DceRoots) -> DceClosure:
-	var state: DceClosureState = {
-		reachable = roots.reachable,
-		reachable_set = roots.reachable_set,
-		reachable_globals = roots.reachable_globals,
-		reachable_global_set = roots.reachable_global_set,
-		reachable_types = [],
-		reachable_type_set = Sets.set(),
-		fail_closed = False
-	}
+	-- The six closure collections stay as locals for the whole fixpoint instead
+	-- of being carried through a state record. A record owner would give every
+	-- collection a second reference, so each append would copy the whole
+	-- collection once per worklist step rather than extend it in place. Each
+	-- collection is copied at most once here, on its first append.
+	var reachable: List[Int] = roots.reachable
+	var reachable_set: Set[Int] = roots.reachable_set
+	var reachable_globals: List[String] = roots.reachable_globals
+	var reachable_global_set: Set[String] = roots.reachable_global_set
+	var reachable_types: List[String] = []
+	var reachable_type_set: Set[String] = Sets.set()
+	var fail_closed: Bool = False
 	var next_function_index: Int = 0
 	var next_global_index: Int = 0
 
 	while (
-		not state.fail_closed
+		not fail_closed
 		and ((
-			next_function_index < state.reachable.length()
-			or next_global_index < state.reachable_globals.length()
+			next_function_index < reachable.length()
+			or next_global_index < reachable_globals.length()
 		))
 	):
-		if next_function_index < state.reachable.length():
-			match state.reachable.get(next_function_index):
+		var pending: Option[DceFacts] = None
+
+		if next_function_index < reachable.length():
+			match reachable.get(next_function_index):
 				Some(def_id):
 					next_function_index += 1
-
-					match function_facts_for_id(index, def_id):
-						Some(facts):
-							state = apply_reachability_facts(index, state, facts)
-						None:
-							void
+					pending = function_facts_for_id(index, def_id)
 				None:
 					next_function_index += 1
 		else:
-			match state.reachable_globals.get(next_global_index):
+			match reachable_globals.get(next_global_index):
 				Some(name):
 					next_global_index += 1
 
 					match index.globals_by_name.get(name):
 						Some(global):
-							facts: DceFacts = collect_expr(
-								empty_dce_facts(CollectReachabilityFacts),
-								global.init,
+							pending = Some(
+								collect_expr(
+									empty_dce_facts(CollectReachabilityFacts),
+									global.init,
+								),
 							)
-							state = apply_reachability_facts(index, state, facts)
 						None:
 							void
 				None:
 					next_global_index += 1
 
+		match pending:
+			Some(facts):
+				if facts.fail_closed:
+					fail_closed = True
+				else:
+					for def_id in facts.function_ids:
+						if not Sets.contains(reachable_set, def_id):
+							reachable = reachable.append(def_id)
+							reachable_set = Sets.add(reachable_set, def_id)
+
+					for name in facts.function_names:
+						for def_id in index.function_ids_by_name.get_or(name, []):
+							if not Sets.contains(reachable_set, def_id):
+								reachable = reachable.append(def_id)
+								reachable_set = Sets.add(reachable_set, def_id)
+
+					for reference in facts.constructor_references:
+						for constructor in index.constructors_by_name.get_or(reference.name, []):
+							if (
+								constructor.def_id == reference.def_id
+								and not Sets.contains(
+									reachable_type_set,
+									constructor.parent_type_name,
+								)
+							):
+								reachable_types = reachable_types.append(
+									constructor.parent_type_name,
+								)
+								reachable_type_set = Sets.add(
+									reachable_type_set,
+									constructor.parent_type_name,
+								)
+							else:
+								void
+
+					for name in facts.global_names:
+						if (
+							index.globals_by_name.contains(name)
+							and not Sets.contains(reachable_global_set, name)
+						):
+							reachable_globals = reachable_globals.append(name)
+							reachable_global_set = Sets.add(reachable_global_set, name)
+
+					for name in facts.type_names:
+						if not Sets.contains(reachable_type_set, name):
+							reachable_types = reachable_types.append(name)
+							reachable_type_set = Sets.add(reachable_type_set, name)
+			None:
+				void
+
 	{
-		reachable = state.reachable,
-		reachable_globals = state.reachable_globals,
-		reachable_types = state.reachable_types,
-		fail_closed = state.fail_closed
+		reachable = reachable,
+		reachable_globals = reachable_globals,
+		reachable_types = reachable_types,
+		fail_closed = fail_closed
 	}
 
 

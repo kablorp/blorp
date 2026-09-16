@@ -78,7 +78,6 @@ current-state and next-action summary.
 - [Implementation-method skeleton buckets](compiler-performance/129-implementation-method-skeleton-buckets.md)
 - [Perceus consumed-parameter membership](compiler-performance/130-perceus-consumed-parameter-membership.md)
 - [Source-name catalog construction](compiler-performance/132-source-name-catalog-construction.md)
-- [DCE reachability fact application](compiler-performance/133-dce-reachability-fact-application.md)
 - [Core traversal and Perceus reuse](compiler-performance/135-core-traversal-perceus-reuse.md)
 - [Zero-copy callable symbol emission](compiler-performance/136-zero-copy-callable-symbol-emission.md)
 - [Codegen-input last-use and frontend release](compiler-performance/137-codegen-input-last-use-and-release.md)
@@ -113,7 +112,6 @@ current-state and next-action summary.
 
 - [COW-capable list concatenation](cow-capable-list-concat.md)
 - [Flat ordered set storage](runtime-performance/02-flat-ordered-set-storage.md)
-- [Core-preparation declaration indexes](late-core-latency/02-index-core-preparation-declarations.md)
 - [Consume-specialization candidate index](late-core-latency/03-index-consume-specialization-candidates.md)
 - [First-match loop cleanup](compiler-first-match-loop-cleanup.md)
 - [Global constant materialization limitations](compiler-global-constant-materialization.md)

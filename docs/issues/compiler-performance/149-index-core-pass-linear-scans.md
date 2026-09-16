@@ -21,9 +21,10 @@ first-match order, one helper per commit, measuring after each.
 `prepare.prepare_program` and `prepare_decl`; `dce.close_reachability`;
 `mono_data` where `templates` is collected; the focused suites
 `test_core_perceus.brp`, `test_core_prepare.brp`, `test_core_dce.brp`,
-`test_core_mono*.brp`; [issue 133](133-dce-reachability-fact-application.md)
-and [late-core-latency/02](../late-core-latency/02-index-core-preparation-declarations.md),
-which this issue supersedes; the
+`test_core_mono*.brp`; the deleted
+`compiler-performance/133-dce-reachability-fact-application.md` and
+`late-core-latency/02-index-core-preparation-declarations.md`, which this
+issue supersedes; the
 [measurement protocol](../../../benchmarks/README.md#self-compile-measurement-protocol).
 
 **Fast loop:**
@@ -44,7 +45,10 @@ cut needs a new field on a Core declaration.
 
 ## Objective
 
-Replace five measured linear scans in Core passes with exact first-match-preserving indexes so retired instructions and allocations fall on the self-compile without changing any selected declaration or contract.
+Replace the remaining name-keyed and `Option[Int]`-keyed linear scans in the
+Core passes with exact indexes that preserve first-match order, so the
+self-compile retires materially fewer instructions without changing a single
+byte of generated C.
 
 ## Cuts
 
@@ -73,6 +77,15 @@ with the small-program guard, so the query density argument is now explicit.
 Delete late-core-latency/02 in the same commit and note the decision in the
 handoff.
 
+**Decision (cut B, landed):** a union-name index built once per public
+preparation call cut the self-compile from 532,809,411,705 to
+519,274,731,917 retired instructions (-2.54% on top of cut A) with
+byte-identical C and total allocations up by four. The small program moved
++0.07%, inside its 1% guard. The earlier paired-latency rejection in
+late-core-latency/02 measured a synthetic workload whose query density did
+not match the compiler's; that document is deleted. Record and enum lookups
+stayed as first-match scans.
+
 ### C. Fact application without state copies (dce.brp)
 
 `apply_reachability_facts` binds `var reachable = state.reachable` and the
@@ -82,6 +95,19 @@ moved out of the consumed `state` before mutation (destructure once, rebuild
 once), and return the input state unchanged when every fact list is empty.
 Preserve first-encounter order and `fail_closed` exactly as in issue 133;
 delete issue 133 in the same commit and carry its invariants here.
+
+**Decision (cut C, landed):** clearing the collections out of a consumed
+state record did not help, because the record update keeps the old record
+alive to the end of its block, so the collections still had two owners.
+`DceClosureState` and `apply_reachability_facts` were removed instead: the
+six collections are now locals of `close_reachability` for the whole
+fixpoint, so each is copied at most once, on its first append, and an empty
+fact set costs nothing. The self-compile fell from 519,274,731,917 to
+496,730,342,483 retired instructions (-4.34%) with byte-identical C and
+late-Core allocations down 28,383. Issue 133's invariants (root order,
+first-encounter order, exact constructor `def_id` checks, idempotent
+duplicate facts, conservative `fail_closed`) are the ones listed under
+"Invariants And Tests" above and are covered by the two new DCE tests.
 
 ### D. Template index in mono_data (mono_data.brp)
 
@@ -98,6 +124,31 @@ result to `core_module_member_name` callers, or memoize through the lowering
 context that already flows to those callers. Skip this cut if the
 after-measurement of A to D shows it below 0.3% of retired instructions;
 say so in the handoff.
+
+**Decision (cut E, open):** the work is material but was not removed.
+`sanitize_core_module_name` is idempotent, so calling it twice keeps the
+generated C byte-identical while doubling exactly the work in question:
+that probe cost 8,664,614,073 extra instructions and 477,100 extra
+allocations after cut D, so the existing calls are about 1.76% of the
+self-compile — well above the 0.3% skip threshold. Two in-module rewrites
+were measured and rejected, both with IDENTICAL C:
+
+| Variant | Instructions | vs cut D |
+| --- | ---: | ---: |
+| cut D | 491,798,875,862 | — |
+| `replace("/", "_").replace(".", "_")` | 500,038,064,142 | +1.68% |
+| separator probe before the character loop | 491,895,465,609 | +0.02% |
+
+The cost is per call, not per character: one `raw_index_of` costs about as
+much as the whole character loop, so no rewrite inside `identity.brp` can
+win. Only calling the function fewer times helps, and its callers live in
+`stage_09_core/resolve.brp`, `synth.brp`, `synth_name.brp`, `std_inline.brp`,
+`mono_impl.brp`, `mono_option.brp`, `mono_specialize.brp` and
+`stage_10_backend/emit.brp` as well as the lowering passes, so the
+precompute or memoize mechanism needs an owner for those files.
+`test_core_lower.brp` now pins the sanitization behavior for whoever takes
+it. Repro: `/tmp/issue-149-cutE-probe.json`, `/tmp/issue-149-cutE.json`,
+`/tmp/issue-149-cutE2.json`.
 
 ## Invariants And Tests
 
