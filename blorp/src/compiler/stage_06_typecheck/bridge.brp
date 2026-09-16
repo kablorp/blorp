@@ -177,6 +177,7 @@ import:
 		rejected_typecheck_program_with_diagnostics,
 		typecheck_bind_program_module_view,
 		typecheck_bind_standalone_program_module_view,
+		typecheck_metrics_are_enabled,
 		typecheck_phase_mark,
 		typecheck_program_with_type_header_module,
 		typecheck_program_with_type_header_module_and_trace,
@@ -348,6 +349,13 @@ foreign:
 	-- Flushes the phase rows and the per-body rows collected under
 	-- BLORP_TYPECHECK_BODY_METRICS=1; a no-op when the variable is unset.
 	func typecheck_body_metrics_report() -> Void = "blorp_typecheck_body_metrics_report_c"
+	pure func typecheck_ctfe_metric_record(
+		fallback: String,
+		dependency_modules: Int,
+		selective_modules: Int,
+		eager_modules: Int,
+		worklist_checked_bodies: Int,
+	) -> Void = "blorp_typecheck_ctfe_metric_record_c"
 
 
 private union TypecheckBridgeDispatchError:
@@ -2666,6 +2674,52 @@ private struct CtfeAttemptedBodyChecks {
 }
 
 
+-- Attribution only: says whether CTFE preparation ran its demand-driven path
+-- or fell back to preparing every dependency module, and how many bodies the
+-- worklist had checked when it decided.
+private pure func record_ctfe_preparation_decision(
+	fallback: String,
+	dependency_modules: Int,
+	selective_modules: Int,
+	eager_modules: Int,
+	worklist_checked_bodies: Int,
+) -> Void:
+	if typecheck_metrics_are_enabled():
+		typecheck_ctfe_metric_record(
+			fallback,
+			dependency_modules,
+			selective_modules,
+			eager_modules,
+			worklist_checked_bodies,
+		)
+	else:
+		void
+
+
+private pure func ctfe_eager_fallback_name(fallback: CtfeEagerFallbackKind) -> String:
+	match fallback:
+		CtfeNoEagerFallback:
+			"none"
+		CtfeNoCallableRootsFallback:
+			"no_callable_roots"
+		CtfeMissingCheckedBodyFallback:
+			"missing_checked_body"
+		CtfeUnresolvedTraitDispatchFallback:
+			"unresolved_trait_dispatch"
+		CtfeMissingBodyRegistryFallback:
+			"missing_body_registry"
+		CtfeRejectedBodyFallback:
+			"rejected_body"
+		CtfeQueueInvariantFallback:
+			"queue_invariant"
+		CtfePreparationFailureFallback:
+			"preparation_failure"
+		CtfeRecoverableGraphFallback:
+			"recoverable_graph"
+		CtfeTracedGraphFallback:
+			"traced_graph"
+
+
 private pure func ctfe_eager_fallback_for_worklist(
 	fallback: CtfeBodyWorklistFallback,
 ) -> CtfeEagerFallbackKind:
@@ -2908,6 +2962,13 @@ private pure func prepare_ctfe_dependencies(
 					graph,
 				):
 					SelectiveCtfeDependenciesReady(prepared, tables, target_checks):
+						record_ctfe_preparation_decision(
+							"none",
+							dependencies.length(),
+							prepared.length(),
+							0,
+							target_checks,
+						)
 						{
 							modules = prepared,
 							validated_body_tables = Some(tables),
@@ -2915,6 +2976,13 @@ private pure func prepare_ctfe_dependencies(
 							eager_fallback = CtfeNoEagerFallback
 						}
 					SelectiveCtfeDependenciesRequireEager(fallback, attempted_dependency_checks, attempted_target_checks):
+						record_ctfe_preparation_decision(
+							ctfe_eager_fallback_name(fallback),
+							dependencies.length(),
+							0,
+							dependencies.length(),
+							attempted_dependency_checks + attempted_target_checks,
+						)
 						reusable_artifact_ids = prepared_reusable_artifact_id_membership(
 							target_scope,
 							artifact_modules,

@@ -1879,12 +1879,79 @@ void blorp_typecheck_phase_metric_record_c(
     __blorp_typecheck_phase_metric_count++;
 }
 
+typedef struct {
+    char* fallback;
+    long dependency_modules;
+    long selective_modules;
+    long eager_modules;
+    long worklist_checked_bodies;
+} __blorp_TypecheckCtfeMetric;
+
+static __blorp_TypecheckCtfeMetric* __blorp_typecheck_ctfe_metrics = NULL;
+static size_t __blorp_typecheck_ctfe_metric_count = 0;
+static size_t __blorp_typecheck_ctfe_metric_capacity = 0;
+
+static void __blorp_typecheck_ctfe_metrics_release(void) {
+    for (size_t index = 0; index < __blorp_typecheck_ctfe_metric_count; index++) {
+        free(__blorp_typecheck_ctfe_metrics[index].fallback);
+    }
+    free(__blorp_typecheck_ctfe_metrics);
+    __blorp_typecheck_ctfe_metrics = NULL;
+    __blorp_typecheck_ctfe_metric_count = 0;
+    __blorp_typecheck_ctfe_metric_capacity = 0;
+}
+
+void blorp_typecheck_ctfe_metric_record_c(
+    const char* fallback,
+    long dependency_modules,
+    long selective_modules,
+    long eager_modules,
+    long worklist_checked_bodies
+) {
+    if (!__blorp_typecheck_body_metrics_enabled) return;
+    if (__blorp_typecheck_ctfe_metric_count == __blorp_typecheck_ctfe_metric_capacity) {
+        size_t grown = __blorp_typecheck_ctfe_metric_capacity
+            ? __blorp_typecheck_ctfe_metric_capacity * 2
+            : 16;
+        __blorp_TypecheckCtfeMetric* rows = (__blorp_TypecheckCtfeMetric*)realloc(
+            __blorp_typecheck_ctfe_metrics,
+            grown * sizeof(__blorp_TypecheckCtfeMetric)
+        );
+        if (!rows) return;
+        __blorp_typecheck_ctfe_metrics = rows;
+        __blorp_typecheck_ctfe_metric_capacity = grown;
+    }
+    __blorp_TypecheckCtfeMetric* row =
+        &__blorp_typecheck_ctfe_metrics[__blorp_typecheck_ctfe_metric_count];
+    row->fallback = __blorp_typecheck_body_metric_text(fallback);
+    row->dependency_modules = dependency_modules;
+    row->selective_modules = selective_modules;
+    row->eager_modules = eager_modules;
+    row->worklist_checked_bodies = worklist_checked_bodies;
+    __blorp_typecheck_ctfe_metric_count++;
+}
+
 void blorp_typecheck_body_metrics_report_c(void) {
     if (!__blorp_typecheck_body_metrics_enabled) return;
     if (__blorp_typecheck_body_metric_count == 0
-        && __blorp_typecheck_phase_metric_count == 0) {
+        && __blorp_typecheck_phase_metric_count == 0
+        && __blorp_typecheck_ctfe_metric_count == 0) {
         return;
     }
+    for (size_t index = 0; index < __blorp_typecheck_ctfe_metric_count; index++) {
+        const __blorp_TypecheckCtfeMetric* row = &__blorp_typecheck_ctfe_metrics[index];
+        fprintf(
+            stderr,
+            "BLORP_TYPECHECK_CTFE fallback=%s dependency_modules=%ld "
+            "selective_modules=%ld eager_modules=%ld worklist_checked_bodies=%ld\n",
+            row->fallback ? row->fallback : "",
+            row->dependency_modules,
+            row->selective_modules,
+            row->eager_modules,
+            row->worklist_checked_bodies
+        );
+    }
+    __blorp_typecheck_ctfe_metrics_release();
     for (size_t index = 0; index < __blorp_typecheck_phase_metric_count; index++) {
         const __blorp_TypecheckPhaseMetric* row = &__blorp_typecheck_phase_metrics[index];
         fprintf(

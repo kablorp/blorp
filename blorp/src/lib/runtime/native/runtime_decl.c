@@ -2351,6 +2351,13 @@ void blorp_typecheck_phase_metric_record_c(
     long microseconds,
     long allocations
 );
+void blorp_typecheck_ctfe_metric_record_c(
+    const char* fallback,
+    long dependency_modules,
+    long selective_modules,
+    long eager_modules,
+    long worklist_checked_bodies
+);
 void blorp_typecheck_body_metrics_report_c(void);
 void blorp_print_live_object_summary(void);
 blorp_SchedulerStats blorp_get_scheduler_stats(void);
