@@ -5,6 +5,7 @@
 -- handled before type unification decides whether two dimensions are
 -- compatible.
 import:
+	meta_identity: MetaSessionId, meta_session_ids_equal
 	semantic_type:
 		SemanticDimOp(SemanticDimAdd, SemanticDimDivide, SemanticDimMultiply, SemanticDimSubtract),
 		SemanticType(SemanticConstIntType, SemanticDimOpType, SemanticMetaType, SemanticTypeVar),
@@ -16,7 +17,7 @@ import:
 -- opaque expressions carry their semantic identity instead of borrowing a
 -- spelling that a type variable could also have.
 private union DimSpecialFactor:
-	DimMetaFactor(Int)
+	DimMetaFactor(MetaSessionId, Int)
 	DimOpaqueDivisionFactor(DimCanonical, DimCanonical)
 	DimOpaqueTypeFactor(SemanticType)
 
@@ -35,7 +36,8 @@ private record DimCanonical {
 
 
 private record DimMetaCandidate {
-	meta_id: Int,
+	meta_session: MetaSessionId,
+	meta_slot: Int,
 	term: DimMonomial
 }
 
@@ -48,7 +50,7 @@ private record DimNamedCandidate {
 
 union DimSolveResult:
 	DimSolved
-	DimBindMeta(Int, SemanticType)
+	DimBindMeta(MetaSessionId, Int, SemanticType)
 	DimBindVar(String, SemanticType)
 	DimContradiction
 	DimStuck
@@ -129,10 +131,13 @@ private pure func dim_var_lists_equal(left: List[String], right: List[String]) -
 
 private pure func dim_special_equal(left: DimSpecialFactor, right: DimSpecialFactor) -> Bool:
 	match left:
-		DimMetaFactor(left_id):
+		DimMetaFactor(left_session, left_slot):
 			match right:
-				DimMetaFactor(right_id):
-					left_id == right_id
+				DimMetaFactor(right_session, right_slot):
+					(
+						left_slot == right_slot
+						and meta_session_ids_equal(left_session, right_session)
+					)
 				_:
 					False
 		DimOpaqueDivisionFactor(left_num, left_den):
@@ -406,18 +411,28 @@ private pure func dim_try_div_const(canonical: DimCanonical, divisor: Int) -> Op
 
 private pure func dim_lookup_meta(
 	meta_bindings: List[Option[SemanticType]],
-	meta_id: Int,
+	solver_session: Option[MetaSessionId],
+	meta_session: MetaSessionId,
+	meta_slot: Int,
 ) -> Option[SemanticType]:
-	meta_bindings.get_or(meta_id, None)
+	match solver_session:
+		Some(issued_session):
+			if meta_session_ids_equal(issued_session, meta_session):
+				meta_bindings.get_or(meta_slot, None)
+			else:
+				None
+		None:
+			None
 
 
 private pure func dim_divide_to_canonical(
 	meta_bindings: List[Option[SemanticType]],
+	solver_session: Option[MetaSessionId],
 	left: SemanticType,
 	right: SemanticType,
 ) -> DimCanonical:
-	left_canonical: DimCanonical = dim_to_canonical(meta_bindings, left)
-	right_canonical: DimCanonical = dim_to_canonical(meta_bindings, right)
+	left_canonical: DimCanonical = dim_to_canonical(meta_bindings, solver_session, left)
+	right_canonical: DimCanonical = dim_to_canonical(meta_bindings, solver_session, right)
 
 	if right_canonical.terms.length() == 0 and right_canonical.const_value > 0:
 		match dim_try_div_const(left_canonical, right_canonical.const_value):
@@ -431,6 +446,7 @@ private pure func dim_divide_to_canonical(
 
 private pure func dim_to_canonical(
 	meta_bindings: List[Option[SemanticType]],
+	solver_session: Option[MetaSessionId],
 	typ: SemanticType,
 ) -> DimCanonical:
 	match typ:
@@ -438,39 +454,46 @@ private pure func dim_to_canonical(
 			dim_const(value)
 		SemanticTypeVar(name):
 			dim_var(name)
-		SemanticMetaType(meta_id):
-			match dim_lookup_meta(meta_bindings, meta_id):
+		SemanticMetaType(meta_session, meta_slot):
+			match dim_lookup_meta(meta_bindings, solver_session, meta_session, meta_slot):
 				Some(binding):
-					dim_to_canonical(meta_bindings, binding)
+					dim_to_canonical(meta_bindings, solver_session, binding)
 				None:
-					dim_special(DimMetaFactor(meta_id))
+					match solver_session:
+						Some(issued_session):
+							if meta_session_ids_equal(issued_session, meta_session):
+								dim_special(DimMetaFactor(meta_session, meta_slot))
+							else:
+								dim_special(DimOpaqueTypeFactor(typ))
+						None:
+							dim_special(DimOpaqueTypeFactor(typ))
 		SemanticDimOpType(op, left, right):
 			match op:
 				SemanticDimAdd:
 					dim_add(
-						dim_to_canonical(meta_bindings, left),
-						dim_to_canonical(meta_bindings, right),
+					dim_to_canonical(meta_bindings, solver_session, left),
+					dim_to_canonical(meta_bindings, solver_session, right),
 					)
 				SemanticDimSubtract:
 					dim_subtract(
-						dim_to_canonical(meta_bindings, left),
-						dim_to_canonical(meta_bindings, right),
+					dim_to_canonical(meta_bindings, solver_session, left),
+					dim_to_canonical(meta_bindings, solver_session, right),
 					)
 				SemanticDimMultiply:
 					dim_multiply(
-						dim_to_canonical(meta_bindings, left),
-						dim_to_canonical(meta_bindings, right),
+					dim_to_canonical(meta_bindings, solver_session, left),
+					dim_to_canonical(meta_bindings, solver_session, right),
 					)
 				SemanticDimDivide:
-					dim_divide_to_canonical(meta_bindings, left, right)
+					dim_divide_to_canonical(meta_bindings, solver_session, left, right)
 		_:
 			dim_special(DimOpaqueTypeFactor(typ))
 
 
 private pure func dim_special_to_type(factor: DimSpecialFactor) -> SemanticType:
 	match factor:
-		DimMetaFactor(meta_id):
-			SemanticMetaType(meta_id)
+		DimMetaFactor(meta_session, meta_slot):
+			SemanticMetaType(meta_session, meta_slot)
 		DimOpaqueDivisionFactor(numerator, denominator):
 			SemanticDimOpType(
 				SemanticDimDivide,
@@ -608,11 +631,24 @@ private pure func dim_canonical_equal(left: DimCanonical, right: DimCanonical) -
 
 private pure func dim_is_solvable_type(
 	meta_bindings: List[Option[SemanticType]],
+	solver_session: Option[MetaSessionId],
 	typ: SemanticType,
 ) -> Bool:
 	match typ:
-		SemanticMetaType(meta_id):
-			dim_lookup_meta(meta_bindings, meta_id).is_none()
+		SemanticMetaType(meta_session, meta_slot):
+			match solver_session:
+				Some(issued_session):
+					(
+						meta_session_ids_equal(issued_session, meta_session)
+						and dim_lookup_meta(
+							meta_bindings,
+							solver_session,
+							meta_session,
+							meta_slot,
+						).is_none()
+					)
+				None:
+					False
 		SemanticTypeVar(name):
 			is_dim_var_name(name)
 		_:
@@ -621,8 +657,8 @@ private pure func dim_is_solvable_type(
 
 private pure func dim_bind_type(variable: SemanticType, value: SemanticType) -> DimSolveResult:
 	match variable:
-		SemanticMetaType(meta_id):
-			DimBindMeta(meta_id, value)
+		SemanticMetaType(meta_session, meta_slot):
+			DimBindMeta(meta_session, meta_slot, value)
 		SemanticTypeVar(name):
 			DimBindVar(name, value)
 		_:
@@ -639,8 +675,8 @@ private pure func dim_solvable_monomial_factor(term: DimMonomial) -> Option[Sema
 			None
 	else if term.vars.length() == 0 and term.specials.length() == 1:
 		match term.specials.get(0):
-			Some(DimMetaFactor(meta_id)):
-				Some(SemanticMetaType(meta_id))
+			Some(DimMetaFactor(meta_session, meta_slot)):
+				Some(SemanticMetaType(meta_session, meta_slot))
 			_:
 				None
 	else:
@@ -684,17 +720,6 @@ private pure func dim_try_isolate(
 				None
 
 
-private pure func dim_monomial_single_meta_id(term: DimMonomial) -> Option[Int]:
-	if term.vars.length() != 0 or term.specials.length() != 1:
-		None
-	else:
-		match term.specials.get(0):
-			Some(DimMetaFactor(meta_id)):
-				Some(meta_id)
-			_:
-				None
-
-
 private pure func dim_monomial_single_dim_name(term: DimMonomial) -> Option[String]:
 	if term.vars.length() != 1 or term.specials.length() != 0:
 		None
@@ -714,28 +739,36 @@ private pure func dim_solve_multiple_terms(diff: DimCanonical) -> DimSolveResult
 	var named_candidates: List[DimNamedCandidate] = []
 
 	for term in diff.terms:
-		match dim_monomial_single_meta_id(term):
-			Some(meta_id):
-				meta_candidates = meta_candidates.append({
-					meta_id = meta_id,
-					term = term,
-				})
-			None:
-				match dim_monomial_single_dim_name(term):
-					Some(name):
-						named_candidates = named_candidates.append({
-							name = name,
-							term = term,
-						})
-					None:
-						void
+		var added_meta: Bool = False
+
+		if term.vars.length() == 0 and term.specials.length() == 1:
+			match term.specials.get(0):
+				Some(DimMetaFactor(meta_session, meta_slot)):
+					added_meta = True
+					meta_candidates = meta_candidates.append({
+						meta_session = meta_session,
+						meta_slot = meta_slot,
+						term = term,
+					})
+				_:
+					void
+
+		if not added_meta:
+			match dim_monomial_single_dim_name(term):
+				Some(name):
+					named_candidates = named_candidates.append({
+						name = name,
+						term = term,
+					})
+				None:
+					void
 
 	var result: Option[DimSolveResult] = None
 
 	-- Once special factors are typed, their source order is no longer a
 	-- lexical key. Try isolatable lower-numbered metas first, as the old
 	-- ?mN sort did; products containing metas cannot be isolated here.
-	for candidate in meta_candidates.sort_by(func(entry): entry.meta_id):
+	for candidate in meta_candidates.sort_by(func(entry): entry.meta_slot):
 		if result.is_none():
 			result = dim_try_isolate(
 				diff.const_value,
@@ -801,15 +834,16 @@ private pure func dim_solve_diff(diff: DimCanonical) -> DimSolveResult:
 
 private pure func dim_try_divisor_var_case(
 	meta_bindings: List[Option[SemanticType]],
+	solver_session: Option[MetaSessionId],
 	dividend: SemanticType,
 	divisor: SemanticType,
 	rhs_expr: SemanticType,
 ) -> Option[DimSolveResult]:
-	if not dim_is_solvable_type(meta_bindings, divisor):
+	if not dim_is_solvable_type(meta_bindings, solver_session, divisor):
 		None
 	else:
-		dividend_canonical: DimCanonical = dim_to_canonical(meta_bindings, dividend)
-		rhs_canonical: DimCanonical = dim_to_canonical(meta_bindings, rhs_expr)
+		dividend_canonical: DimCanonical = dim_to_canonical(meta_bindings, solver_session, dividend)
+		rhs_canonical: DimCanonical = dim_to_canonical(meta_bindings, solver_session, rhs_expr)
 
 		if (
 			dividend_canonical.terms.length() == 0
@@ -831,6 +865,7 @@ private pure func dim_try_divisor_var_case(
 
 private pure func dim_try_dividend_var_case(
 	meta_bindings: List[Option[SemanticType]],
+	solver_session: Option[MetaSessionId],
 	dividend: SemanticType,
 	divisor: SemanticType,
 	rhs_expr: SemanticType,
@@ -840,9 +875,9 @@ private pure func dim_try_dividend_var_case(
 			if divisor_value <= 0:
 				None
 			else:
-				rhs_canonical: DimCanonical = dim_to_canonical(meta_bindings, rhs_expr)
+				rhs_canonical: DimCanonical = dim_to_canonical(meta_bindings, solver_session, rhs_expr)
 				product: DimCanonical = dim_multiply(rhs_canonical, dim_const(divisor_value))
-				dividend_canonical: DimCanonical = dim_to_canonical(meta_bindings, dividend)
+				dividend_canonical: DimCanonical = dim_to_canonical(meta_bindings, solver_session, dividend)
 
 				Some(dim_solve_diff(dim_subtract(dividend_canonical, product)))
 		_:
@@ -851,33 +886,35 @@ private pure func dim_try_dividend_var_case(
 
 private pure func dim_check_division_special(
 	meta_bindings: List[Option[SemanticType]],
+	solver_session: Option[MetaSessionId],
 	dividend: SemanticType,
 	divisor: SemanticType,
 	rhs_expr: SemanticType,
 ) -> Option[DimSolveResult]:
-	match dim_try_divisor_var_case(meta_bindings, dividend, divisor, rhs_expr):
+	match dim_try_divisor_var_case(meta_bindings, solver_session, dividend, divisor, rhs_expr):
 		Some(result):
 			Some(result)
 		None:
-			dim_try_dividend_var_case(meta_bindings, dividend, divisor, rhs_expr)
+			dim_try_dividend_var_case(meta_bindings, solver_session, dividend, divisor, rhs_expr)
 
 
 private pure func dim_try_division_special(
 	meta_bindings: List[Option[SemanticType]],
+	solver_session: Option[MetaSessionId],
 	left: SemanticType,
 	right: SemanticType,
 ) -> Option[DimSolveResult]:
 	match left:
 		SemanticDimOpType(left_op, dividend, divisor):
 			if left_op == SemanticDimDivide:
-				dim_check_division_special(meta_bindings, dividend, divisor, right)
+				dim_check_division_special(meta_bindings, solver_session, dividend, divisor, right)
 			else:
 				None
 		_:
 			match right:
 				SemanticDimOpType(right_op, dividend, divisor):
 					if right_op == SemanticDimDivide:
-						dim_check_division_special(meta_bindings, dividend, divisor, left)
+						dim_check_division_special(meta_bindings, solver_session, dividend, divisor, left)
 					else:
 						None
 				_:
@@ -885,16 +922,17 @@ private pure func dim_try_division_special(
 
 
 pure func dim_solve(
+	solver_session: Option[MetaSessionId],
 	meta_bindings: List[Option[SemanticType]],
 	left: SemanticType,
 	right: SemanticType,
 ) -> DimSolveResult:
-	match dim_try_division_special(meta_bindings, left, right):
+	match dim_try_division_special(meta_bindings, solver_session, left, right):
 		Some(result):
 			result
 		None:
-			left_canonical: DimCanonical = dim_to_canonical(meta_bindings, left)
-			right_canonical: DimCanonical = dim_to_canonical(meta_bindings, right)
+			left_canonical: DimCanonical = dim_to_canonical(meta_bindings, solver_session, left)
+			right_canonical: DimCanonical = dim_to_canonical(meta_bindings, solver_session, right)
 
 			if dim_canonical_equal(left_canonical, right_canonical):
 				DimSolved

@@ -111,7 +111,8 @@ def unchecked_meta_session_sources(source_root: Path, allowed_owners: set[Path])
         source = path.read_text(encoding="utf-8")
         code = re.sub(r"(?m)--[^\n]*", "", source)
         if re.search(
-            r"\b(?:meta_body_session|meta_global_session|meta_module_session|new_compilation_run_token)\s*\(",
+            r"\b(?:meta_body_session_from_validated_key|meta_body_session|"
+            r"meta_global_session|meta_module_session|new_compilation_run_token)\s*\(",
             code,
         ):
             unchecked.append(str(path.relative_to(ROOT)))
@@ -158,6 +159,16 @@ class DeclarationBoundaryTests(unittest.TestCase):
             decl_code,
             re.DOTALL,
         )
+        body_projection = re.search(
+            r"private pure func checked_body_meta_session\(.*?(?=\n\n(?:private )?(?:(?:pure )?func|record|union|enum)\b)",
+            decl_code,
+            re.DOTALL,
+        )
+        issued_body = re.search(
+            r"pure func body_check_context_issued_meta_session\(.*?(?=\n\n(?:private )?(?:(?:pure )?func|record|union|enum)\b)",
+            decl_code,
+            re.DOTALL,
+        )
         checked_module = re.search(
             r"pure func prepared_module_scope_meta_session\(.*?(?=\n\n(?:private )?(?:(?:pure )?func|record|union|enum)\b)",
             decl_code,
@@ -170,15 +181,23 @@ class DeclarationBoundaryTests(unittest.TestCase):
         )
         self.assertIsNotNone(bound_run)
         self.assertIsNotNone(checked_body)
+        self.assertIsNotNone(body_projection)
+        self.assertIsNotNone(issued_body)
         self.assertIsNotNone(checked_module)
         self.assertIsNotNone(checked_global)
         self.assertEqual(len(re.findall(r"\bnew_compilation_run_token\s*\(", decl_code)), 1)
         self.assertEqual(len(re.findall(r"\bmeta_body_session\s*\(", decl_code)), 1)
+        self.assertEqual(
+            len(re.findall(r"\bmeta_body_session_from_validated_key\s*\(", decl_code)),
+            1,
+        )
         self.assertEqual(len(re.findall(r"\bmeta_module_session\s*\(", decl_code)), 1)
         self.assertEqual(len(re.findall(r"\bmeta_global_session\s*\(", decl_code)), 1)
         self.assertIn("new_compilation_run_token()", bound_run.group(0))
-        self.assertIn("definition_tables_share_provenance(", checked_body.group(0))
-        self.assertIn("meta_body_session(", checked_body.group(0))
+        self.assertIn("checked_body_meta_session(", checked_body.group(0))
+        self.assertIn("definition_tables_share_provenance(", body_projection.group(0))
+        self.assertIn("meta_body_session(", body_projection.group(0))
+        self.assertIn("meta_body_session_from_validated_key(", issued_body.group(0))
         self.assertIn("definition_tables_share_provenance(", checked_module.group(0))
         self.assertIn("meta_module_session(", checked_module.group(0))
         self.assertIn("definition_tables_share_provenance(", checked_global.group(0))
@@ -284,7 +303,10 @@ class DeclarationBoundaryTests(unittest.TestCase):
         resolution_source = TYPE_RESOLUTION.read_text(encoding="utf-8")
 
         self.assertIn("opaque type GraphSourceNameTable", name_source)
-        self.assertIn("source_names = source_name_table(candidates)", name_source)
+        self.assertIn(
+            "graph_source_name_table_from_source_names(module_table, source_name_table(candidates))",
+            name_source,
+        )
         self.assertIn("opaque type GraphModuleNameScope", name_source)
         self.assertIn("issuer: GraphModuleNameScope", view_source)
         self.assertIn(

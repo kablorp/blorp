@@ -2,6 +2,9 @@ import:
 	../../../../src/compiler/stage_06_typecheck/type_system/dim_solver:
 		DimSolveResult(DimBindMeta, DimBindVar, DimContradiction, DimSolved, DimStuck),
 		dim_solve,
+	../../../../src/compiler/stage_06_typecheck/type_system/context:
+		Context,
+		meta_solver_session,
 	../../../../src/compiler/stage_06_typecheck/type_system/semantic_type:
 		SemanticDimOp(SemanticDimAdd, SemanticDimDivide, SemanticDimMultiply),
 		SemanticType(
@@ -13,6 +16,7 @@ import:
 		),
 		type_to_string,
 		types_equal,
+	meta_test_support: test_meta, test_meta_context
 	test: TestSuite
 
 
@@ -36,7 +40,17 @@ pure func dim_const(value: Int) -> SemanticType:
 	SemanticConstIntType(value)
 
 
+pure func test_dim_solve(
+	context: Context,
+	bindings: List[Option[SemanticType]],
+	left: SemanticType,
+	right: SemanticType,
+) -> DimSolveResult:
+	dim_solve(meta_solver_session(context), bindings, left, right)
+
+
 func test_equivalent_sum_products_solve() -> Bool:
+	context = test_meta_context()
 	left: SemanticType = dim_mul(
 		dim_const(2),
 		dim_add(dim_var("#N"), dim_const(3)),
@@ -46,7 +60,7 @@ func test_equivalent_sum_products_solve() -> Bool:
 		dim_const(6),
 	)
 
-	match dim_solve([], left, right):
+	match test_dim_solve(context, [], left, right):
 		DimSolved:
 			True
 		_:
@@ -54,13 +68,14 @@ func test_equivalent_sum_products_solve() -> Bool:
 
 
 func test_exact_constant_division_solves() -> Bool:
+	context = test_meta_context()
 	left: SemanticType = dim_div(
 		dim_mul(dim_const(8), dim_var("#N")),
 		dim_const(4),
 	)
 	right: SemanticType = dim_mul(dim_const(2), dim_var("#N"))
 
-	match dim_solve([], left, right):
+	match test_dim_solve(context, [], left, right):
 		DimSolved:
 			True
 		_:
@@ -68,7 +83,8 @@ func test_exact_constant_division_solves() -> Bool:
 
 
 func test_single_dim_variable_binding() -> Bool:
-	match dim_solve(
+	context = test_meta_context()
+	match test_dim_solve(context,
 		[],
 		dim_add(dim_var("#N"), dim_const(1)),
 		dim_const(5),
@@ -80,21 +96,23 @@ func test_single_dim_variable_binding() -> Bool:
 
 
 func test_single_meta_binding() -> Bool:
-	match dim_solve(
+	context = test_meta_context()
+	match test_dim_solve(context,
 		[],
-		dim_add(SemanticMetaType(0), dim_const(2)),
+		dim_add(test_meta(context, 0), dim_const(2)),
 		dim_const(5),
 	):
-		DimBindMeta(meta_id, value):
+		DimBindMeta(_, meta_id, value):
 			meta_id == 0 and types_equal(value, dim_const(3))
 		_:
 			False
 
 
 func test_uses_meta_bindings() -> Bool:
-	match dim_solve(
+	context = test_meta_context()
+	match test_dim_solve(context,
 		[Some(dim_const(3))],
-		dim_add(SemanticMetaType(0), dim_const(2)),
+		dim_add(test_meta(context, 0), dim_const(2)),
 		dim_const(5),
 	):
 		DimSolved:
@@ -103,14 +121,28 @@ func test_uses_meta_bindings() -> Bool:
 			False
 
 
+func test_foreign_session_meta_does_not_read_same_slot_binding() -> Bool:
+	context = test_meta_context()
+	foreign_context = test_meta_context()
+	foreign_meta = test_meta(foreign_context, 0)
+	expression = dim_add(foreign_meta, dim_const(2))
+
+	match test_dim_solve(context, [Some(dim_const(3))], expression, dim_const(5)):
+		DimStuck:
+			True
+		_:
+			False
+
+
 func test_contradiction_and_stuck_are_distinct() -> Bool:
-	contradiction_ok: Bool = match dim_solve([], dim_const(3), dim_const(5)):
+	context = test_meta_context()
+	contradiction_ok: Bool = match test_dim_solve(context, [], dim_const(3), dim_const(5)):
 		DimContradiction:
 			True
 		_:
 			False
 
-	stuck_ok: Bool = match dim_solve(
+	stuck_ok: Bool = match test_dim_solve(context,
 		[],
 		dim_mul(dim_var("#N"), dim_var("#M")),
 		dim_const(5),
@@ -124,28 +156,30 @@ func test_contradiction_and_stuck_are_distinct() -> Bool:
 
 
 func test_linear_binding_can_keep_symbolic_remainder() -> Bool:
-	match dim_solve(
+	context = test_meta_context()
+	match test_dim_solve(context,
 		[],
-		dim_add(SemanticMetaType(4), dim_const(1)),
+		dim_add(test_meta(context, 4), dim_const(1)),
 		dim_add(dim_var("#N"), dim_const(2)),
 	):
-		DimBindMeta(meta_id, value):
+		DimBindMeta(_, meta_id, value):
 			meta_id == 4 and type_to_string(value) == "#1 + #N"
 		_:
 			False
 
 
 func test_opaque_division_distinguishes_meta_from_type_var_spelling() -> Bool:
+	context = test_meta_context()
 	left = dim_add(
 		dim_const(1),
-		dim_div(SemanticMetaType(1), dim_const(3)),
+		dim_div(test_meta(context, 1), dim_const(3)),
 	)
 	right = dim_add(
 		dim_const(1),
 		dim_div(dim_var("?m1"), dim_const(3)),
 	)
 
-	match dim_solve([], left, right):
+	match test_dim_solve(context, [], left, right):
 		DimStuck:
 			True
 		_:
@@ -153,24 +187,25 @@ func test_opaque_division_distinguishes_meta_from_type_var_spelling() -> Bool:
 
 
 func test_special_factor_permutation_and_multiplicity() -> Bool:
+	context = test_meta_context()
 	left = dim_mul(
-		dim_mul(SemanticMetaType(1), dim_var("#N")),
-		SemanticMetaType(2),
+		dim_mul(test_meta(context, 1), dim_var("#N")),
+		test_meta(context, 2),
 	)
 	right = dim_mul(
-		SemanticMetaType(2),
-		dim_mul(dim_var("#N"), SemanticMetaType(1)),
+		test_meta(context, 2),
+		dim_mul(dim_var("#N"), test_meta(context, 1)),
 	)
-	unequal = dim_mul(SemanticMetaType(1), SemanticMetaType(1))
-	other = dim_mul(SemanticMetaType(1), SemanticMetaType(2))
+	unequal = dim_mul(test_meta(context, 1), test_meta(context, 1))
+	other = dim_mul(test_meta(context, 1), test_meta(context, 2))
 
-	permutation_ok: Bool = match dim_solve([], left, right):
+	permutation_ok: Bool = match test_dim_solve(context, [], left, right):
 		DimSolved:
 			True
 		_:
 			False
 
-	multiplicity_ok: Bool = match dim_solve([], unequal, other):
+	multiplicity_ok: Bool = match test_dim_solve(context, [], unequal, other):
 		DimStuck:
 			True
 		_:
@@ -180,6 +215,7 @@ func test_special_factor_permutation_and_multiplicity() -> Bool:
 
 
 func test_opaque_division_equivalent_after_operand_normalization() -> Bool:
+	context = test_meta_context()
 	left = dim_add(
 		dim_const(1),
 		dim_div(
@@ -195,7 +231,7 @@ func test_opaque_division_equivalent_after_operand_normalization() -> Bool:
 		),
 	)
 
-	match dim_solve([], left, right):
+	match test_dim_solve(context, [], left, right):
 		DimSolved:
 			True
 		_:
@@ -203,13 +239,14 @@ func test_opaque_division_equivalent_after_operand_normalization() -> Bool:
 
 
 func test_opaque_type_distinguishes_type_var_display_spelling() -> Bool:
+	context = test_meta_context()
 	left = dim_add(
 		dim_const(1),
 		SemanticNamedType("Foo", []),
 	)
 	right = dim_add(dim_const(1), dim_var("Foo"))
 
-	match dim_solve([], left, right):
+	match test_dim_solve(context, [], left, right):
 		DimStuck:
 			True
 		_:
@@ -217,18 +254,19 @@ func test_opaque_type_distinguishes_type_var_display_spelling() -> Bool:
 
 
 func test_symbolic_meta_binding_reconstructs_opaque_division() -> Bool:
+	context = test_meta_context()
 	division = dim_div(dim_var("#N"), dim_const(3))
 
-	match dim_solve(
+	match test_dim_solve(context,
 		[],
-		dim_add(SemanticMetaType(2), division),
+		dim_add(test_meta(context, 2), division),
 		dim_const(5),
 	):
-		DimBindMeta(meta_id, value):
+		DimBindMeta(_, meta_id, value):
 			if meta_id != 2:
 				False
 			else:
-				match dim_solve(
+				match test_dim_solve(context,
 					[],
 					dim_add(value, division),
 					dim_const(5),
@@ -242,10 +280,11 @@ func test_symbolic_meta_binding_reconstructs_opaque_division() -> Bool:
 
 
 func test_special_terms_commute_and_distribute() -> Bool:
+	context = test_meta_context()
 	first = dim_div(dim_var("#N"), dim_const(3))
 	second = dim_div(dim_var("#M"), dim_const(3))
 
-	commuted: Bool = match dim_solve(
+	commuted: Bool = match test_dim_solve(context,
 		[],
 		dim_add(first, second),
 		dim_add(second, first),
@@ -256,15 +295,15 @@ func test_special_terms_commute_and_distribute() -> Bool:
 			False
 
 	left = dim_mul(
-		SemanticMetaType(1),
-		dim_add(SemanticMetaType(2), SemanticMetaType(3)),
+		test_meta(context, 1),
+		dim_add(test_meta(context, 2), test_meta(context, 3)),
 	)
 	right = dim_add(
-		dim_mul(SemanticMetaType(1), SemanticMetaType(2)),
-		dim_mul(SemanticMetaType(1), SemanticMetaType(3)),
+		dim_mul(test_meta(context, 1), test_meta(context, 2)),
+		dim_mul(test_meta(context, 1), test_meta(context, 3)),
 	)
 
-	distributed: Bool = match dim_solve([], left, right):
+	distributed: Bool = match test_dim_solve(context, [], left, right):
 		DimSolved:
 			True
 		_:
@@ -274,17 +313,18 @@ func test_special_terms_commute_and_distribute() -> Bool:
 
 
 func test_meta_binding_choice_is_independent_of_sum_order() -> Bool:
-	forward = dim_add(SemanticMetaType(1), SemanticMetaType(2))
-	reversed = dim_add(SemanticMetaType(2), SemanticMetaType(1))
+	context = test_meta_context()
+	forward = dim_add(test_meta(context, 1), test_meta(context, 2))
+	reversed = dim_add(test_meta(context, 2), test_meta(context, 1))
 
-	forward_choice: Bool = match dim_solve([], forward, dim_const(5)):
-		DimBindMeta(meta_id, _):
+	forward_choice: Bool = match test_dim_solve(context, [], forward, dim_const(5)):
+		DimBindMeta(_, meta_id, _):
 			meta_id == 1
 		_:
 			False
 
-	reverse_choice: Bool = match dim_solve([], reversed, dim_const(5)):
-		DimBindMeta(meta_id, _):
+	reverse_choice: Bool = match test_dim_solve(context, [], reversed, dim_const(5)):
+		DimBindMeta(_, meta_id, _):
 			meta_id == 1
 		_:
 			False
@@ -293,12 +333,13 @@ func test_meta_binding_choice_is_independent_of_sum_order() -> Bool:
 
 
 func test_nested_opaque_division_preserves_meta_identity() -> Bool:
+	context = test_meta_context()
 	left = dim_add(
 		dim_const(1),
 		dim_div(
 			dim_add(
 				dim_const(1),
-				dim_div(SemanticMetaType(1), dim_const(3)),
+				dim_div(test_meta(context, 1), dim_const(3)),
 			),
 			dim_const(5),
 		),
@@ -314,7 +355,7 @@ func test_nested_opaque_division_preserves_meta_identity() -> Bool:
 		),
 	)
 
-	match dim_solve([], left, right):
+	match test_dim_solve(context, [], left, right):
 		DimStuck:
 			True
 		_:
@@ -322,23 +363,24 @@ func test_nested_opaque_division_preserves_meta_identity() -> Bool:
 
 
 func test_symbolic_binding_values_are_equivalent_across_opaque_term_order() -> Bool:
+	context = test_meta_context()
 	first = dim_div(dim_var("#N"), dim_const(3))
 	second = dim_div(dim_var("#M"), dim_const(5))
 	forward = dim_add(
-		SemanticMetaType(1),
+		test_meta(context, 1),
 		dim_add(first, second),
 	)
 	reversed = dim_add(
-		SemanticMetaType(1),
+		test_meta(context, 1),
 		dim_add(second, first),
 	)
 
-	match (dim_solve([], forward, dim_const(7)), dim_solve([], reversed, dim_const(7))):
-		(DimBindMeta(first_id, first_value), DimBindMeta(second_id, second_value)):
+	match (test_dim_solve(context, [], forward, dim_const(7)), test_dim_solve(context, [], reversed, dim_const(7))):
+		(DimBindMeta(_, first_id, first_value), DimBindMeta(_, second_id, second_value)):
 			if first_id != 1 or second_id != 1:
 				False
 			else:
-				match dim_solve([], first_value, second_value):
+				match test_dim_solve(context, [], first_value, second_value):
 					DimSolved:
 						True
 					_:
@@ -348,6 +390,7 @@ func test_symbolic_binding_values_are_equivalent_across_opaque_term_order() -> B
 
 
 func test_named_binding_choice_is_independent_of_opaque_term_order() -> Bool:
+	context = test_meta_context()
 	opaque_term = dim_div(dim_var("#Q"), dim_const(3))
 	forward = dim_add(
 		dim_add(dim_var("#N"), opaque_term),
@@ -358,13 +401,13 @@ func test_named_binding_choice_is_independent_of_opaque_term_order() -> Bool:
 		dim_var("#N"),
 	)
 
-	forward_choice: Bool = match dim_solve([], forward, dim_const(7)):
+	forward_choice: Bool = match test_dim_solve(context, [], forward, dim_const(7)):
 		DimBindVar(name, _):
 			name == "#M"
 		_:
 			False
 
-	reverse_choice: Bool = match dim_solve([], reversed, dim_const(7)):
+	reverse_choice: Bool = match test_dim_solve(context, [], reversed, dim_const(7)):
 		DimBindVar(name, _):
 			name == "#M"
 		_:
@@ -381,6 +424,10 @@ tests: TestSuite = {
 		("single dim variable binding", test_single_dim_variable_binding),
 		("single meta binding", test_single_meta_binding),
 		("uses meta bindings", test_uses_meta_bindings),
+		(
+			"foreign-session meta does not read same-slot binding",
+			test_foreign_session_meta_does_not_read_same_slot_binding,
+		),
 		("contradiction and stuck are distinct", test_contradiction_and_stuck_are_distinct),
 		(
 			"linear binding can keep symbolic remainder",

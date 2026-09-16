@@ -143,6 +143,7 @@ import:
 		TypedProgram,
 		accepted_ctfe_artifact_typecheck_module,
 		accepted_graph_typecheck_module,
+		accepted_graph_typecheck_module_for_body_attempt,
 		accepted_typecheck_graph_completed_globals,
 		accepted_typecheck_graph_declaration_skeleton_count,
 		accepted_typecheck_graph_import_modules,
@@ -160,6 +161,7 @@ import:
 		completed_global_header_typed,
 		recoverable_ctfe_artifact_typecheck_module,
 		recoverable_graph_typecheck_module,
+		recoverable_graph_typecheck_module_for_body_attempt,
 		recoverable_typecheck_graph_declaration_skeleton_count,
 		recoverable_typecheck_graph_diagnostics,
 		recoverable_typecheck_graph_diagnostics_for_module,
@@ -322,6 +324,8 @@ import:
 			TypedArtifactScopeComplete,
 		),
 	type_system/env: ENV_EMPTY
+	type_system/meta_identity:
+		BodyMetaSessionPurpose(CtfeEagerBodyMetaSession, CtfeSelectiveBodyMetaSession),
 	typed_ast_json:
 		emit_compiler_typed_program_json_chunks,
 		emit_compiler_typed_program_json_chunks_in_graph,
@@ -1874,6 +1878,32 @@ private pure func body_graph_typecheck_module(
 			recoverable_graph_typecheck_module(recoverable, scope, allow_debug_only_calls)
 
 
+private pure func body_graph_typecheck_module_for_body_attempt(
+	graph: BodyTypecheckGraph,
+	scope: PreparedModuleScope,
+	allow_debug_only_calls: Bool,
+	purpose: BodyMetaSessionPurpose,
+	invocation: Int,
+) -> Option[AcceptedTypecheckModule]:
+	match graph:
+		AcceptedBodyTypecheckGraph(accepted):
+			accepted_graph_typecheck_module_for_body_attempt(
+				accepted,
+				scope,
+				allow_debug_only_calls,
+				purpose,
+				invocation,
+			)
+		RecoverableBodyTypecheckGraph(recoverable):
+			recoverable_graph_typecheck_module_for_body_attempt(
+				recoverable,
+				scope,
+				allow_debug_only_calls,
+				purpose,
+				invocation,
+			)
+
+
 private pure func body_graph_ctfe_artifact_typecheck_module(
 	graph: BodyTypecheckGraph,
 	scope: PreparedModuleScope,
@@ -1913,15 +1943,38 @@ private pure func body_graph_completion_diagnostics(
 			recoverable_typecheck_graph_diagnostics_for_module(recoverable, module_identity)
 
 
+-- Eager bound checking may be the only attempt or may follow a failed
+-- artifact-backed attempt. Keep that scheduling distinction typed at the
+-- handoff so callers cannot pass an unexplained raw invocation number.
+enum CtfeEagerBoundAttempt:
+	DirectEagerBoundAttempt
+	EagerBoundAfterArtifactAttempt
+
+
+pure func ctfe_eager_bound_attempt_invocation(attempt: CtfeEagerBoundAttempt) -> Int:
+	match attempt:
+		DirectEagerBoundAttempt:
+			0
+		EagerBoundAfterArtifactAttempt:
+			1
+
+
 private pure func ctfe_imported_program_from_bound(
 	bound_module: BoundModule,
 	allow_debug_only_calls: Bool,
 	typecheck_graph: BodyTypecheckGraph,
+	attempt: CtfeEagerBoundAttempt,
 ) -> CtfeImportedProgramBuild:
 	scope = bound_module_scope(bound_module)
 	state = graph_typecheck_state(scope, allow_debug_only_calls)
 
-	match body_graph_typecheck_module(typecheck_graph, scope, allow_debug_only_calls):
+	match body_graph_typecheck_module_for_body_attempt(
+		typecheck_graph,
+		scope,
+		allow_debug_only_calls,
+		CtfeEagerBodyMetaSession,
+		ctfe_eager_bound_attempt_invocation(attempt),
+	):
 		Some(header_module):
 			ctfe_imported_program_from_accepted_module(scope, header_module)
 		None:
@@ -2304,6 +2357,7 @@ private pure func prepare_ctfe_dependency_program(
 							dependency,
 							allow_debug_only_calls,
 							accepted_graph,
+							EagerBoundAfterArtifactAttempt,
 						)
 						{
 							program = ctfe_only_program_from_imported(fallback_build.program),
@@ -2314,6 +2368,7 @@ private pure func prepare_ctfe_dependency_program(
 					dependency,
 					allow_debug_only_calls,
 					accepted_graph,
+					DirectEagerBoundAttempt,
 				)
 				{
 					program = ctfe_only_program_from_imported(build.program),
@@ -2346,7 +2401,13 @@ private pure func ctfe_body_module_registries(
 	var registries: List[CtfeBodyModuleRegistry] = []
 	var failed: Bool = False
 
-	match accepted_graph_typecheck_module(graph, target_scope, allow_debug_only_calls):
+	match accepted_graph_typecheck_module_for_body_attempt(
+		graph,
+		target_scope,
+		allow_debug_only_calls,
+		CtfeSelectiveBodyMetaSession,
+		0,
+	):
 		Some(module):
 			registries = registries.append({
 				module_id = prepared_module_scope_id(target_scope),
@@ -2357,10 +2418,12 @@ private pure func ctfe_body_module_registries(
 
 	for dependency in dependencies:
 		if not failed:
-			match accepted_graph_typecheck_module(
+			match accepted_graph_typecheck_module_for_body_attempt(
 				graph,
 				bound_module_scope(dependency),
 				allow_debug_only_calls,
+				CtfeSelectiveBodyMetaSession,
+				0,
 			):
 				Some(module):
 					registries = registries.append({
@@ -3607,7 +3670,7 @@ private pure func rejected_typechecked_graph(
 	}
 
 
-private pure func typed_source_artifact(
+private func typed_source_artifact(
 	path: String,
 	module_name: String,
 	text: String,
@@ -3992,7 +4055,7 @@ private pure func prepare_typecheck_graph_from_completed_headers(
 					})
 
 
-private pure func prepare_bound_typecheck_graph(
+private func prepare_bound_typecheck_graph(
 	indexed_graph: IndexedGraph,
 	importable_graph: ImportableModuleGraph,
 	bound_graph: BoundModuleGraph,
@@ -4051,7 +4114,7 @@ private pure func prepare_bound_typecheck_graph(
 					)
 
 
-private pure func prepare_indexed_typecheck_graph(
+private func prepare_indexed_typecheck_graph(
 	indexed_graph: IndexedGraph,
 	module_targets: List[String],
 	allow_debug_only_calls: Bool,
@@ -4094,7 +4157,7 @@ private pure func prepare_indexed_typecheck_graph(
 					)
 
 
-private pure func prepare_indexed_typecheck_graph_by_id(
+private func prepare_indexed_typecheck_graph_by_id(
 	indexed_graph: IndexedGraph,
 	module_table: ModuleTable,
 	module_target_ids: List[ModuleId],
@@ -4140,7 +4203,7 @@ private pure func prepare_indexed_typecheck_graph_by_id(
 					)
 
 
-private pure func prepare_typecheck_graph(
+private func prepare_typecheck_graph(
 	request: TypecheckGraphRequest,
 ) -> PreparedTypecheckGraphResult:
 	import_path_rewrites = finalized_import_path_rewrites(request.resolved_imports)
@@ -4546,7 +4609,7 @@ private pure func ctfe_materialization_metrics(
 	}
 
 
-pure func typecheck_graph_with_metrics(request: TypecheckGraphRequest) -> TypecheckGraphRun:
+func typecheck_graph_with_metrics(request: TypecheckGraphRequest) -> TypecheckGraphRun:
 	match prepare_typecheck_graph(request):
 		PreparedTypecheckGraphRejected(target, diagnostics):
 			{
@@ -4612,7 +4675,7 @@ pure func typecheck_graph_with_metrics(request: TypecheckGraphRequest) -> Typech
 			}
 
 
-private pure func typecheck_frontend_graph_ids_for_table(
+private func typecheck_frontend_graph_ids_for_table(
 	graph: FrontendGraph,
 	root_id: ModuleId,
 	module_target_ids: List[ModuleId],
@@ -4641,7 +4704,7 @@ private pure func typecheck_frontend_graph_ids_for_table(
 	Some(typechecked_graph_from_prepared(prepared, allow_debug_only_calls))
 
 
-pure func typecheck_frontend_graph_ids(
+func typecheck_frontend_graph_ids(
 	graph: FrontendGraph,
 	issuing_table: ModuleTable,
 	root_id: ModuleId,
@@ -4697,7 +4760,7 @@ private pure func typechecked_graph_from_prepared(
 			}
 
 
-pure func typecheck_graph(request: TypecheckGraphRequest) -> TypecheckedGraph:
+func typecheck_graph(request: TypecheckGraphRequest) -> TypecheckedGraph:
 	typechecked_graph_from_prepared(
 		prepare_typecheck_graph(request),
 		request.allow_debug_only_calls,
@@ -4865,7 +4928,7 @@ private func emit_typechecked_rejected_module_response(
 	trace(EmitComplete, TYPECHECK_TRACE_UNINDEXED, module_path)
 
 
-private pure func handle_typecheck_source(
+private func handle_typecheck_source(
 	body: JsonValue,
 ) -> Result[JsonValue, TypecheckBridgeDispatchError]:
 	path ?= string_field(body, "path")
@@ -5080,7 +5143,7 @@ func stream_typecheck_graph_request_chunks_with_inventory(
 	stream_typecheck_graph_request_chunks_impl(root, emit, trace, True, inventory)
 
 
-private pure func handle_envelope(
+private func handle_envelope(
 	envelope: BridgeEnvelope,
 ) -> Result[JsonValue, TypecheckBridgeDispatchError]:
 	body: JsonValue = envelope.payload
@@ -5092,7 +5155,7 @@ private pure func handle_envelope(
 			Err(UnsupportedBridgeAction(envelope.action))
 
 
-pure func handle_request_value(root: JsonValue) -> JsonValue:
+func handle_request_value(root: JsonValue) -> JsonValue:
 	match decode_bridge_envelope_value(root):
 		Ok(envelope):
 			handle_envelope(envelope).get_or_else(dispatch_error_json)
@@ -5100,7 +5163,7 @@ pure func handle_request_value(root: JsonValue) -> JsonValue:
 			bridge_error_json(error)
 
 
-pure func handle_request(source: String) -> String:
+func handle_request(source: String) -> String:
 	parse_json(source)
 		.map(func(root): handle_request_value(root).to_string())
 		.get_or_else(func(message): bridge_error_json(InvalidJson(message)).to_string())

@@ -5,6 +5,10 @@
 -- InferSession and immediately converts it back to TypecheckState; the direct
 -- path constructs the same TypecheckState from the immutable seed facts.
 import:
+	../../src/compiler/stage_04_modules/loaded_module:
+		ModuleOrigin(UserModule),
+		resolved_module_identity_from_resolver,
+	../../src/compiler/stage_04_modules/module_table: singleton_module_table
 	../../src/compiler/stage_03_parse/parsed_ast: ParsedProgram
 	../../src/compiler/stage_03_parse/source_ast_finalize:
 		FinalizedTypecheckProgram,
@@ -13,6 +17,10 @@ import:
 	../../src/compiler/stage_06_typecheck/graph/definition_identity:
 		FuncCallableKey,
 		func_callable_key,
+	../../src/compiler/stage_06_typecheck/graph/definition_index:
+		definition_index_definition_table,
+		definition_index_empty,
+		definition_index_initial_seed,
 	../../src/compiler/stage_06_typecheck/modules/module_view:
 		module_view_import_bindings,
 		module_view_imported_names,
@@ -42,12 +50,18 @@ import:
 		typecheck_state_with_scoped_trait_functions,
 	../../src/compiler/stage_06_typecheck/type_system/context:
 		Context,
+		context_for_meta_session,
 		context_for_fresh_infer_session,
 		fresh_meta_with_origin,
 		meta_solver_allocated_count,
 		meta_solver_bound_count,
+		meta_solver_session,
 		meta_solver_states_equal,
-	../../src/compiler/stage_06_typecheck/type_system/env: Env
+	../../src/compiler/stage_06_typecheck/type_system/env: ENV_EMPTY, Env
+	../../src/compiler/stage_06_typecheck/type_system/meta_identity:
+		MetaSessionId,
+		meta_module_session,
+		new_compilation_run_token,
 	../../src/compiler/stage_06_typecheck/type_system/semantic_type: TYPE_INT
 	../../src/lib/source: SourceSpan, source_cursor_at, source_file, source_span
 	memory: MemStats, get_mem_stats, reset_mem_stats
@@ -58,6 +72,7 @@ import:
 
 private record CompilerInferSessionReconstructionSeed {
 	context_facts: Context,
+	meta_session: Option[MetaSessionId],
 	env_facts: Env,
 	module_facts: InferModuleFacts
 }
@@ -103,6 +118,7 @@ private pure func compiler_infer_session_reconstruction_seed(
 ) -> CompilerInferSessionReconstructionSeed:
 	{
 		context_facts = state.context,
+		meta_session = meta_solver_session(state.context),
 		env_facts = state.env,
 		module_facts = infer_module_facts_from_typecheck_state(state)
 	}
@@ -161,8 +177,13 @@ private pure func claim_observable_callable_id(state: TypecheckState) -> Typeche
 private pure func baseline_fresh_body_state(
 	seed: CompilerInferSessionReconstructionSeed,
 ) -> TypecheckState:
+	context = match seed.meta_session:
+		Some(meta_session):
+			context_for_fresh_infer_session(seed.context_facts, meta_session)
+		None:
+			seed.context_facts
 	session: InferSession = {
-		context = context_for_fresh_infer_session(seed.context_facts),
+		context = context,
 		env = seed.env_facts,
 		errors = [],
 		diagnostics = [],
@@ -175,8 +196,13 @@ private pure func baseline_fresh_body_state(
 private pure func direct_fresh_body_state(
 	seed: CompilerInferSessionReconstructionSeed,
 ) -> TypecheckState:
+	context = match seed.meta_session:
+		Some(meta_session):
+			context_for_fresh_infer_session(seed.context_facts, meta_session)
+		None:
+			seed.context_facts
 	{
-		context = context_for_fresh_infer_session(seed.context_facts),
+		context = context,
 		env = seed.env_facts,
 		errors = [],
 		diagnostics = [],
@@ -282,7 +308,7 @@ private pure func fresh_body_states_equivalent(left: TypecheckState, right: Type
 			False
 
 
-private pure func enriched_seed_state() -> TypecheckState:
+private func enriched_seed_state() -> TypecheckState:
 	base = typecheck_state_record_type_home(
 		typecheck_state_with_scoped_trait_functions(
 			typecheck_state_add_known_resource_type_name(
@@ -303,9 +329,33 @@ private pure func enriched_seed_state() -> TypecheckState:
 		"bench/widget",
 		True,
 	)
-	issued = fresh_meta_with_origin(base.context, "stale")
+	module_table = singleton_module_table(
+		resolved_module_identity_from_resolver("infer_session_profile", UserModule),
+	)
+	definition_table = definition_index_definition_table(
+		definition_index_empty(
+			definition_index_initial_seed(ENV_EMPTY),
+			module_table[0],
+		),
+	)
+	prepared_context = match meta_module_session(
+		new_compilation_run_token(),
+		definition_table,
+		0,
+		0,
+	):
+		Some(session):
+			context_for_meta_session(base.context, session)
+		None:
+			base.context
+	issued = fresh_meta_with_origin(prepared_context, "stale")
+	issued_context = match issued:
+		Some(step):
+			step.context
+		None:
+			prepared_context
 	{ base |
-		context = { issued.context |
+		context = { issued_context |
 			lower_param_counter = 3
 		},
 		errors = ["stale error"],

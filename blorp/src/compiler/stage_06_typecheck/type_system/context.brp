@@ -8,6 +8,11 @@ import:
 	dim_solver:
 		DimSolveResult(DimBindMeta, DimBindVar, DimContradiction, DimSolved, DimStuck),
 		dim_solve,
+	meta_identity:
+		MetaSessionId,
+		meta_session_ids_equal,
+		meta_session_is_issued,
+		unissued_meta_session,
 	semantic_type:
 		SemanticType(
 			SemanticArrayType,
@@ -66,6 +71,7 @@ record Context {
 	package_roots: List[String],
 	source_packages: List[SourcePackage],
 	resource_cleanups: List[ResourceCleanupEntry],
+	meta_session: MetaSessionId,
 	solver: MetaSolverState,
 	def_id_counter: Int,
 	lower_destruct_counter: Int,
@@ -115,40 +121,55 @@ private enum MetaReferenceCheck:
 	ValidateIssuedReferences
 
 
--- ValidateIssuedReferences has no target. Use an out-of-range value only for
--- that private mode; the check never compares a meta to this value.
-private META_REFERENCE_NO_TARGET: Int = -1
+private pure func context_with_resources_and_meta_session(
+	resource_cleanups: List[ResourceCleanupEntry],
+	meta_session: MetaSessionId,
+) -> Context:
+	{
+		package_roots = [],
+		source_packages = [],
+		resource_cleanups = resource_cleanups,
+		meta_session = meta_session,
+		solver = META_SOLVER_EMPTY,
+		def_id_counter = 0,
+		lower_destruct_counter = 0,
+		lower_param_counter = 0,
+		lower_question_bind_counter = 0,
+		lower_resource_counter = 0,
+		lower_task_scope_counter = 1,
+		lower_current_task_scope_id = 0,
+		desugar_counter = 0,
+		ssa_mut_counter = 0
+	}
 
-CONTEXT_EMPTY: Context = {
-	package_roots = [],
-	source_packages = [],
-	resource_cleanups = [],
-	solver = META_SOLVER_EMPTY,
-	def_id_counter = 0,
-	lower_destruct_counter = 0,
-	lower_param_counter = 0,
-	lower_question_bind_counter = 0,
-	lower_resource_counter = 0,
-	lower_task_scope_counter = 1,
-	lower_current_task_scope_id = 0,
-	desugar_counter = 0,
-	ssa_mut_counter = 0
-}
+
+pure func context_empty() -> Context:
+	context_with_resources_and_meta_session([], unissued_meta_session())
 
 
 -- A body owns its solver state. Module-level cleanup and package facts are
 -- immutable inputs, while metas and their allocation order must never leak
 -- from one independently checked body into another.
-pure func context_for_fresh_infer_session(context: Context) -> Context:
-	{ context | solver = META_SOLVER_EMPTY }
+pure func context_for_meta_session(context: Context, session: MetaSessionId) -> Context:
+	{ context |
+		meta_session = session,
+		solver = META_SOLVER_EMPTY
+	}
+
+
+pure func context_for_fresh_infer_session(context: Context, session: MetaSessionId) -> Context:
+	context_for_meta_session(context, session)
 
 
 pure func prepared_infer_context_facts(context: Context) -> PreparedInferContextFacts:
 	into_opaque PreparedInferContextFacts(context.resource_cleanups)
 
 
-pure func context_from_prepared_infer_facts(facts: PreparedInferContextFacts) -> Context:
-	{ CONTEXT_EMPTY | resource_cleanups = from_opaque PreparedInferContextFacts(facts) }
+pure func context_from_prepared_infer_facts(
+	facts: PreparedInferContextFacts,
+	session: MetaSessionId,
+) -> Context:
+	context_with_resources_and_meta_session(from_opaque PreparedInferContextFacts(facts), session)
 
 
 pure func source_package_origin(name: String) -> Option[ModuleOrigin]:
@@ -270,20 +291,48 @@ pure func find_resource_cleanup(context: Context, type_name: String) -> Option[S
 	result
 
 
-pure func meta_origin_name(context: Context, meta_id: Int) -> String:
-	match from_opaque MetaSolverState(context.solver).origins.get(meta_id):
-		Some(origin):
-			origin
-		None:
-			"?m" + meta_id.to_string()
+private pure func meta_session_belongs_to_context(context: Context, session: MetaSessionId) -> Bool:
+	(
+		meta_session_is_issued(context.meta_session)
+		and meta_session_ids_equal(context.meta_session, session)
+	)
 
 
-pure func lookup_meta(context: Context, meta_id: Int) -> Option[SemanticType]:
-	from_opaque MetaSolverState(context.solver).bindings.get_or(meta_id, None)
+pure func meta_origin_name(context: Context, session: MetaSessionId, slot: Int) -> String:
+	solver = from_opaque MetaSolverState(context.solver)
+
+	if not meta_session_belongs_to_context(context, session):
+		"?m" + slot.to_string()
+	else:
+		match solver.origins.get(slot):
+			Some(origin):
+				origin
+			None:
+				"?m" + slot.to_string()
+
+
+pure func lookup_meta(context: Context, session: MetaSessionId, slot: Int) -> Option[SemanticType]:
+	solver = from_opaque MetaSolverState(context.solver)
+
+	if meta_session_belongs_to_context(context, session):
+		solver.bindings.get_or(slot, None)
+	else:
+		None
 
 
 pure func meta_solver_allocated_count(context: Context) -> Int:
 	from_opaque MetaSolverState(context.solver).origins.length()
+
+
+-- Exposes the opaque capability retained by this solver without exposing its
+-- representation. Diagnostics and focused solver tests can use it to preserve
+-- identity while constructing references; allocation still belongs to
+-- fresh_meta.
+pure func meta_solver_session(context: Context) -> Option[MetaSessionId]:
+	if meta_session_is_issued(context.meta_session):
+		Some(context.meta_session)
+	else:
+		None
 
 
 pure func meta_solver_bound_count(context: Context) -> Int:
@@ -299,25 +348,37 @@ pure func meta_solver_bound_count(context: Context) -> Int:
 pure func meta_solver_states_equal(left: Context, right: Context) -> Bool:
 	left_solver = from_opaque MetaSolverState(left.solver)
 	right_solver = from_opaque MetaSolverState(right.solver)
-	left_solver.origins == right_solver.origins and left_solver.bindings == right_solver.bindings
+	sessions_equal = meta_session_ids_equal(left.meta_session, right.meta_session)
+
+	(
+		sessions_equal
+		and left_solver.origins == right_solver.origins
+		and left_solver.bindings == right_solver.bindings
+	)
 
 
 -- A solver may bind only metas issued by this session. An out-of-range ID
 -- fails closed instead of growing a sparse table or silently inventing a meta.
-pure func bind_meta(context: Context, meta_id: Int, typ: SemanticType) -> Option[Context]:
+pure func bind_meta(
+	context: Context,
+	session: MetaSessionId,
+	slot: Int,
+	typ: SemanticType,
+) -> Option[Context]:
 	solver = from_opaque MetaSolverState(context.solver)
 
 	if (
-		meta_id < 0
-		or meta_id >= solver.bindings.length()
-		or meta_reference_conflicts(context, meta_id, typ, ValidateBindingGraph)
+		not meta_session_belongs_to_context(context, session)
+		or slot < 0
+		or slot >= solver.bindings.length()
+		or meta_reference_conflicts(context, Some(session), slot, typ, ValidateBindingGraph)
 	):
 		None
 	else:
 		Some(
 			{ context |
 				solver = into_opaque MetaSolverState(
-					{ solver | bindings = solver.bindings.set(meta_id, Some(typ)) }
+					{ solver | bindings = solver.bindings.set(slot, Some(typ)) }
 				)
 			},
 		)
@@ -331,8 +392,8 @@ pure func head_resolve(context: Context, typ: SemanticType) -> SemanticType:
 
 	while searching:
 		match resolved:
-			SemanticMetaType(meta_id):
-				match lookup_meta(context, meta_id):
+			SemanticMetaType(meta_session, meta_slot):
+				match lookup_meta(context, meta_session, meta_slot):
 					Some(binding):
 						resolved = binding
 					None:
@@ -345,14 +406,15 @@ pure func head_resolve(context: Context, typ: SemanticType) -> SemanticType:
 
 private pure func meta_reference_conflicts_in_list(
 	context: Context,
-	target_meta_id: Int,
+	target_session: Option[MetaSessionId],
+	target_slot: Int,
 	types: List[SemanticType],
 	check: MetaReferenceCheck,
 ) -> Bool:
 	var result: Bool = False
 
 	for typ in types:
-		if meta_reference_conflicts(context, target_meta_id, typ, check):
+		if meta_reference_conflicts(context, target_session, target_slot, typ, check):
 			result = True
 			break
 
@@ -361,27 +423,50 @@ private pure func meta_reference_conflicts_in_list(
 
 private pure func meta_reference_conflicts(
 	context: Context,
-	target_meta_id: Int,
+	target_session: Option[MetaSessionId],
+	target_slot: Int,
 	typ: SemanticType,
 	check: MetaReferenceCheck,
 ) -> Bool:
 	-- bind_meta is the sole binding writer and rejects self/transitive cycles.
 	-- Following existing bindings therefore needs no per-path visited-ID list.
 	match typ:
-		SemanticMetaType(meta_id):
+		SemanticMetaType(meta_session, meta_slot):
 			unissued = match check:
 				FindTargetMeta:
-					False
+					not meta_session_belongs_to_context(context, meta_session)
 				ValidateBindingGraph:
-					meta_id < 0 or meta_id >= meta_solver_allocated_count(context)
+					(
+						not meta_session_belongs_to_context(context, meta_session)
+						or meta_slot < 0
+						or meta_slot >= meta_solver_allocated_count(context)
+					)
 				ValidateIssuedReferences:
-					meta_id < 0 or meta_id >= meta_solver_allocated_count(context)
+					(
+						not meta_session_belongs_to_context(context, meta_session)
+						or meta_slot < 0
+						or meta_slot >= meta_solver_allocated_count(context)
+					)
 
 			target_matches = match check:
 				FindTargetMeta:
-					meta_id == target_meta_id
+					match target_session:
+						Some(target):
+							(
+								meta_slot == target_slot
+								and meta_session_ids_equal(meta_session, target)
+							)
+						None:
+							False
 				ValidateBindingGraph:
-					meta_id == target_meta_id
+					match target_session:
+						Some(target):
+							(
+								meta_slot == target_slot
+								and meta_session_ids_equal(meta_session, target)
+							)
+						None:
+							False
 				ValidateIssuedReferences:
 					False
 
@@ -390,42 +475,71 @@ private pure func meta_reference_conflicts(
 			else if unissued:
 				True
 			else:
-				match lookup_meta(context, meta_id):
+				match lookup_meta(context, meta_session, meta_slot):
 					Some(binding):
-						meta_reference_conflicts(context, target_meta_id, binding, check)
+						meta_reference_conflicts(
+							context,
+							target_session,
+							target_slot,
+							binding,
+							check,
+						)
 					None:
 						False
 		SemanticNamedType(_, args):
-			meta_reference_conflicts_in_list(context, target_meta_id, args, check)
+			meta_reference_conflicts_in_list(context, target_session, target_slot, args, check)
 		SemanticArrayType(element, dims):
 			(
-				meta_reference_conflicts(context, target_meta_id, element, check)
-				or meta_reference_conflicts_in_list(context, target_meta_id, dims, check)
+				meta_reference_conflicts(context, target_session, target_slot, element, check)
+				or meta_reference_conflicts_in_list(
+					context,
+					target_session,
+					target_slot,
+					dims,
+					check,
+				)
 			)
 		SemanticFunctionType(_, params, return_type):
 			(
-				meta_reference_conflicts_in_list(context, target_meta_id, params, check)
-				or meta_reference_conflicts(context, target_meta_id, return_type, check)
+				meta_reference_conflicts_in_list(
+					context,
+					target_session,
+					target_slot,
+					params,
+					check,
+				)
+				or meta_reference_conflicts(
+					context,
+					target_session,
+					target_slot,
+					return_type,
+					check,
+				)
 			)
 		SemanticTupleType(elements):
-			meta_reference_conflicts_in_list(context, target_meta_id, elements, check)
+			meta_reference_conflicts_in_list(context, target_session, target_slot, elements, check)
 		SemanticRangeType(inner):
-			meta_reference_conflicts(context, target_meta_id, inner, check)
+			meta_reference_conflicts(context, target_session, target_slot, inner, check)
 		SemanticDimOpType(_, left, right):
 			(
-				meta_reference_conflicts(context, target_meta_id, left, check)
-				or meta_reference_conflicts(context, target_meta_id, right, check)
+				meta_reference_conflicts(context, target_session, target_slot, left, check)
+				or meta_reference_conflicts(context, target_session, target_slot, right, check)
 			)
 		_:
 			False
 
 
-pure func occurs_meta(context: Context, target_meta_id: Int, typ: SemanticType) -> Bool:
-	meta_reference_conflicts(context, target_meta_id, typ, FindTargetMeta)
+pure func occurs_meta(
+	context: Context,
+	target_session: MetaSessionId,
+	target_slot: Int,
+	typ: SemanticType,
+) -> Bool:
+	meta_reference_conflicts(context, Some(target_session), target_slot, typ, FindTargetMeta)
 
 
 private pure func meta_references_are_issued(context: Context, typ: SemanticType) -> Bool:
-	not meta_reference_conflicts(context, META_REFERENCE_NO_TARGET, typ, ValidateIssuedReferences)
+	not meta_reference_conflicts(context, None, -1, typ, ValidateIssuedReferences)
 
 
 -- None means this subtree is unchanged, not that an unbound meta failed to
@@ -457,13 +571,21 @@ private pure func resolve_type_meta_list_if_changed(
 
 private pure func unbound_meta_type_if_changed(
 	context: Context,
-	meta_id: Int,
+	session: MetaSessionId,
+	slot: Int,
 	finalize_unbound: Bool,
 ) -> Option[SemanticType]:
+	solver = from_opaque MetaSolverState(context.solver)
+
 	if finalize_unbound:
 		-- An issued but unbound meta becomes its generic origin. An unissued
 		-- index must remain a meta so the solved-body guard can reject it.
-		match from_opaque MetaSolverState(context.solver).origins.get(meta_id):
+		origin = if meta_session_belongs_to_context(context, session):
+			solver.origins.get(slot)
+		else:
+			None
+
+		match origin:
 			Some(origin):
 				Some(SemanticTypeVar(origin))
 			None:
@@ -478,14 +600,14 @@ private pure func resolve_type_metas_if_changed(
 	finalize_unbound: Bool,
 ) -> Option[SemanticType]:
 	match typ:
-		SemanticMetaType(meta_id):
+		SemanticMetaType(meta_session, meta_slot):
 			-- bind_meta is the sole binding constructor and rejects transitive
 			-- cycles, so full resolution needs no per-hop visited-ID list.
-			match lookup_meta(context, meta_id):
+			match lookup_meta(context, meta_session, meta_slot):
 				Some(binding):
 					Some(resolve_type_metas_recursive(context, binding, finalize_unbound))
 				None:
-					unbound_meta_type_if_changed(context, meta_id, finalize_unbound)
+					unbound_meta_type_if_changed(context, meta_session, meta_slot, finalize_unbound)
 		SemanticNamedType(name, args):
 			match resolve_type_meta_list_if_changed(context, args, finalize_unbound):
 				Some(resolved_args):
@@ -672,10 +794,11 @@ private pure func unify_try_bind(
 
 private pure func unify_bind_meta(
 	step: UnifyStep,
-	meta_id: Int,
+	meta_session: MetaSessionId,
+	meta_slot: Int,
 	typ: SemanticType,
 ) -> Option[UnifyStep]:
-	match bind_meta(step.context, meta_id, typ):
+	match bind_meta(step.context, meta_session, meta_slot, typ):
 		Some(bound_context):
 			Some({ step | context = bound_context })
 		None:
@@ -881,11 +1004,13 @@ private pure func unify_dim_arithmetic(
 	left: SemanticType,
 	right: SemanticType,
 ) -> Option[UnifyStep]:
-	match dim_solve(from_opaque MetaSolverState(step.context.solver).bindings, left, right):
+	solver = from_opaque MetaSolverState(step.context.solver)
+
+	match dim_solve(Some(step.context.meta_session), solver.bindings, left, right):
 		DimSolved:
 			Some(step)
-		DimBindMeta(meta_id, value):
-			unify_bind_meta(step, meta_id, value)
+		DimBindMeta(meta_session, meta_slot, value):
+			unify_bind_meta(step, meta_session, meta_slot, value)
 		DimBindVar(name, value):
 			unify_try_bind(step, name, value)
 		DimContradiction:
@@ -1031,8 +1156,8 @@ private pure func unify_right_or_structural(
 	right: SemanticType,
 ) -> Option[UnifyStep]:
 	match right:
-		SemanticMetaType(meta_id):
-			unify_bind_meta(step, meta_id, left)
+		SemanticMetaType(meta_session, meta_slot):
+			unify_bind_meta(step, meta_session, meta_slot, left)
 		SemanticTypeVar(name):
 			if unify_name_is_rigid(options, name):
 				if is_dim_var_name(name) and unify_is_int_type(left):
@@ -1058,12 +1183,7 @@ private pure func unify_go(
 	right: SemanticType = head_resolve(step.context, raw_right)
 
 	if types_equal(left, right):
-		if meta_reference_conflicts(
-			step.context,
-			META_REFERENCE_NO_TARGET,
-			left,
-			ValidateIssuedReferences,
-		):
+		if meta_reference_conflicts(step.context, None, -1, left, ValidateIssuedReferences):
 			None
 		else:
 			Some(step)
@@ -1102,8 +1222,8 @@ private pure func unify_go(
 			None
 	else:
 		match left:
-			SemanticMetaType(meta_id):
-				unify_bind_meta(step, meta_id, right)
+			SemanticMetaType(meta_session, meta_slot):
+				unify_bind_meta(step, meta_session, meta_slot, right)
 			SemanticTypeVar(name):
 				if unify_name_is_rigid(options, name):
 					if is_dim_var_name(name) and unify_is_int_type(right):
@@ -1255,30 +1375,34 @@ pure func mint_def_id(context: Context) -> DefIdStep:
 	}
 
 
-pure func fresh_meta_with_origin(context: Context, origin: String) -> FreshMetaStep:
-	solver = from_opaque MetaSolverState(context.solver)
-	meta_id: Int = solver.origins.length()
-
-	meta_origin: String = if origin.length() == 0:
-		"?"
+pure func fresh_meta_with_origin(context: Context, origin: String) -> Option[FreshMetaStep]:
+	if not meta_session_is_issued(context.meta_session):
+		None
 	else:
-		origin
+		solver = from_opaque MetaSolverState(context.solver)
+		session = context.meta_session
+		slot: Int = solver.origins.length()
 
-	{
-		context = { context | solver = into_opaque MetaSolverState({ solver |
-					origins = solver.origins.append(meta_origin),
-					bindings = solver.bindings.append(None)
-				}) },
-		meta_type = SemanticMetaType(meta_id)
-	}
+		meta_origin: String = if origin.length() == 0:
+			"?"
+		else:
+			origin
+
+		Some({
+			context = { context | solver = into_opaque MetaSolverState({ solver |
+						origins = solver.origins.append(meta_origin),
+						bindings = solver.bindings.append(None)
+					}) },
+			meta_type = SemanticMetaType(session, slot),
+		})
 
 
-pure func fresh_meta(context: Context) -> FreshMetaStep:
+pure func fresh_meta(context: Context) -> Option[FreshMetaStep]:
 	fresh_meta_with_origin(context, "?")
 
 
-pure func reset_meta(context: Context) -> Context:
-	{ context | solver = META_SOLVER_EMPTY }
+pure func reset_meta(context: Context, session: MetaSessionId) -> Context:
+	context_for_meta_session(context, session)
 
 
 pure func reset_core_counters(context: Context) -> Context:

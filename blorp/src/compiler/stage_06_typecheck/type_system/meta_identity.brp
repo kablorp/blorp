@@ -33,16 +33,20 @@ private enum MetaSessionKind:
 	CtfeEagerBodyMetaSessionKind
 
 
-private record MetaSessionIdRep {
-	run: CompilationRunToken,
-	definition_table: DefinitionTable,
-	owner_index: Int,
-	kind: MetaSessionKind,
-	invocation: Int
-}
+private union MetaSessionIdRep:
+	UnissuedMetaSessionId(Int)
+	IssuedMetaSessionId(CompilationRunToken, DefinitionTable, Int, MetaSessionKind, Int)
 
 
 opaque type MetaSessionId = MetaSessionIdRep
+
+private UNISSUED_META_SESSION_REP: MetaSessionIdRep = UnissuedMetaSessionId(0)
+
+
+-- Contexts used before inference carry this non-issuing sentinel. A real
+-- scheduling boundary replaces it before minting metas.
+pure func unissued_meta_session() -> MetaSessionId:
+	into_opaque MetaSessionId(UNISSUED_META_SESSION_REP)
 
 
 foreign(include: "meta_identity_ffi.h"):
@@ -70,6 +74,23 @@ pure func compilation_run_tokens_equal(
 	compilation_run_tokens_are_same_allocation(left, right)
 
 
+private pure func meta_session_from_validated_key(
+	run: CompilationRunToken,
+	definition_table: DefinitionTable,
+	owner_index: Int,
+	kind: MetaSessionKind,
+	invocation: Int,
+) -> MetaSessionId:
+	representation: MetaSessionIdRep = IssuedMetaSessionId(
+		run,
+		definition_table,
+		owner_index,
+		kind,
+		invocation,
+	)
+	into_opaque MetaSessionId(representation)
+
+
 private pure func meta_session_for_key(
 	run: CompilationRunToken,
 	definition_table: DefinitionTable,
@@ -80,13 +101,7 @@ private pure func meta_session_for_key(
 	if owner_index < 0 or invocation < 0:
 		None
 	else:
-		Some(into_opaque MetaSessionId({
-					definition_table = definition_table,
-					owner_index = owner_index,
-					invocation = invocation,
-					kind = kind,
-					run = run
-				}))
+		Some(meta_session_from_validated_key(run, definition_table, owner_index, kind, invocation))
 
 
 -- Low-level mappers receive only already-validated table-local indices.
@@ -139,22 +154,51 @@ pure func meta_body_session(
 	meta_session_for_key(run, definition_table, definition_index, kind, invocation)
 
 
+-- Body planning validates the table owner and non-negative key without
+-- allocating a session for every candidate body. Its single checked consumer
+-- uses this constructor only when the body actually enters inference.
+pure func meta_body_session_from_validated_key(
+	run: CompilationRunToken,
+	definition_table: DefinitionTable,
+	definition_index: Int,
+	purpose: BodyMetaSessionPurpose,
+	invocation: Int,
+) -> MetaSessionId:
+	kind = match purpose:
+		NormalBodyMetaSession:
+			NormalBodyMetaSessionKind
+		CtfeSelectiveBodyMetaSession:
+			CtfeSelectiveBodyMetaSessionKind
+		CtfeEagerBodyMetaSession:
+			CtfeEagerBodyMetaSessionKind
+
+	meta_session_from_validated_key(run, definition_table, definition_index, kind, invocation)
+
+
 pure func meta_session_ids_equal(left: MetaSessionId, right: MetaSessionId) -> Bool:
 	-- The hot solver path carries copies of one issued session. Keep the
 	-- exact-key comparison for separately reconstructed but equal sessions.
 	if meta_sessions_are_same_allocation(left, right):
 		True
 	else:
-		left_representation = from_opaque MetaSessionId(left)
-		right_representation = from_opaque MetaSessionId(right)
+		match (from_opaque MetaSessionId(left), from_opaque MetaSessionId(right)):
+			(IssuedMetaSessionId(left_run, left_table, left_owner, left_kind, left_invocation), IssuedMetaSessionId(right_run, right_table, right_owner, right_kind, right_invocation)):
+				(
+					compilation_run_tokens_equal(left_run, right_run)
+					and definition_tables_share_provenance(left_table, right_table)
+					and left_owner == right_owner
+					and left_kind == right_kind
+					and left_invocation == right_invocation
+				)
+			(UnissuedMetaSessionId(_), UnissuedMetaSessionId(_)):
+				True
+			_:
+				False
 
-		(
-			compilation_run_tokens_equal(left_representation.run, right_representation.run)
-			and definition_tables_share_provenance(
-				left_representation.definition_table,
-				right_representation.definition_table,
-			)
-			and left_representation.owner_index == right_representation.owner_index
-			and left_representation.kind == right_representation.kind
-			and left_representation.invocation == right_representation.invocation
-		)
+
+pure func meta_session_is_issued(session: MetaSessionId) -> Bool:
+	match from_opaque MetaSessionId(session):
+		IssuedMetaSessionId(_, _, _, _, _):
+			True
+		UnissuedMetaSessionId(_):
+			False

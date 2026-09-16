@@ -3,13 +3,17 @@
 -- code. It is not a substitute for comparing two production compiler workers.
 import:
 	../../src/compiler/stage_06_typecheck/type_system/context:
-		CONTEXT_EMPTY,
+		Context,
 		bind_meta,
-		fresh_meta_with_origin,
+		fresh_meta,
 		lookup_meta,
+		meta_solver_session,
+		reset_meta,
+	../../src/compiler/stage_06_typecheck/type_system/meta_identity: MetaSessionId
 	../../src/compiler/stage_06_typecheck/type_system/semantic_type:
 		SemanticType(SemanticConstIntType),
 	memory: get_mem_stats, reset_mem_stats
+	meta_profile_support: profile_meta_context
 	string: parse_int
 	system: now_microseconds
 
@@ -110,27 +114,36 @@ private func linear_profile(width: Int, iterations: Int) -> WidthProfileMetrics:
 	}
 
 
-private func solver_profile(width: Int, iterations: Int) -> WidthProfileMetrics:
+private func solver_profile_for_session(
+	seed_context: Context,
+	session: MetaSessionId,
+	width: Int,
+	iterations: Int,
+) -> WidthProfileMetrics:
 	reset_mem_stats()
 	started = now_microseconds()
 	var checksum: Int = 0
 	var valid: Bool = True
 
 	for _ in 0..iterations:
-		var context = CONTEXT_EMPTY
+		var context = reset_meta(seed_context, session)
 
 		for _ in 0..width:
-			context = fresh_meta_with_origin(context, "?").context
+			match fresh_meta(context):
+				Some(step):
+					context = step.context
+				None:
+					valid = False
 
 		for index in 0..width:
-			match bind_meta(context, index, SemanticConstIntType(index)):
+			match bind_meta(context, session, index, SemanticConstIntType(index)):
 				Some(bound):
 					context = bound
 				None:
 					valid = False
 
 		for index in 0..width:
-			match lookup_meta(context, index):
+			match lookup_meta(context, session, index):
 				Some(SemanticConstIntType(value)):
 					if value == index:
 						checksum += value
@@ -152,6 +165,24 @@ private func solver_profile(width: Int, iterations: Int) -> WidthProfileMetrics:
 		checksum = checksum,
 		valid = valid
 	}
+
+
+private func solver_profile(width: Int, iterations: Int) -> WidthProfileMetrics:
+	seed_context: Context = profile_meta_context()
+
+	match meta_solver_session(seed_context):
+		Some(session):
+			solver_profile_for_session(seed_context, session, width, iterations)
+		None:
+			{
+				elapsed_microseconds = 0,
+				allocations = 0,
+				releases = 0,
+				retained_objects = 0,
+				retained_bytes = 0,
+				checksum = 0,
+				valid = False
+			}
 
 
 private pure func positive_argument(args: List[String], index: Int, default: Int) -> Int:
@@ -178,7 +209,11 @@ func main(args: List[String]) -> Int:
 		"META_BINDING_WIDTH width=${width.to_string()} iterations=${iterations.to_string()} linear_us=${linear.elapsed_microseconds.to_string()} solver_us=${solver.elapsed_microseconds.to_string()} linear_allocations=${linear.allocations.to_string()} solver_allocations=${solver.allocations.to_string()} linear_releases=${linear.releases.to_string()} solver_releases=${solver.releases.to_string()} linear_retained_objects=${linear.retained_objects.to_string()} solver_retained_objects=${solver.retained_objects.to_string()} linear_retained_bytes=${linear.retained_bytes.to_string()} solver_retained_bytes=${solver.retained_bytes.to_string()} linear_checksum=${linear.checksum.to_string()} solver_checksum=${solver.checksum.to_string()} linear_valid=${linear.valid.to_string()} solver_valid=${solver.valid.to_string()}",
 	)
 
-	if linear.valid and solver.valid and linear.checksum == solver.checksum:
+	if (
+		linear.valid
+		and solver.valid
+		and linear.checksum == solver.checksum
+	):
 		0
 	else:
 		1

@@ -1,8 +1,8 @@
 # Normalized Semantic Compilation
 
 **Status:** Active. The accepted semantic catalog, Step 2e visibility
-convergence, Step 3 body-outcome completion, and initial exact-identity
-cutovers are in production. Later product completion remains sequenced below.
+convergence, Step 3 body-outcome completion, and Step 4A solved-body/session
+boundary are in production. Later product completion remains sequenced below.
 
 **Current state:** The compilation has graph-local `ModuleId`, `DefinitionId`,
 category-safe accepted tables, and an `AcceptedSemanticCatalog` with checked
@@ -25,8 +25,10 @@ name unions and path-to-surface joins.
 as the visibility baseline. Step 3 is also complete; use its
 [completion screen](../../../benchmarks/results/compiler_step3_body_outcome_completion_2026-09-15.md)
 and [implementation packet](145-step3-complete-body-outcome-publication.md)
-as the body-product baseline. Continue the Phase 8/9 product boundary without
-reconstructing body collections or source order.
+as the body-product baseline. Step 4A is complete via the
+[session-owned meta completion packet](141-step4a-meta-session-issuer-preflight.md).
+Proceed to Step 7A: attach evaluated initializer replacements by exact identity
+without retaining a second complete typed program.
 
 **Read first:** [Compiler Architecture](../../ARCHITECTURE.md#frontend),
 [Compiler Priorities](../../COMPILER_PRIORITIES.md#1-finish-the-typechecking-product-boundaries),
@@ -58,7 +60,7 @@ the Step 2e issue, and the Phase 8–10 issues under `docs/issues/typechecking/`
 | --- | --- |
 | 2e visibility, complete | One phase-correct ordered candidate/accepted relation serves graph lookup. The [resource gate](94-step2e-visibility-convergence.md) is complete; displaced name dictionaries, the successful-only graph inventory, and accepted alias/union reconstruction paths are deleted. |
 | 3 body outcomes, complete | CTFE and ordinary compilation read the same exact row. Direct ordinary rows, explicit source order, complete-body coverage, linear seed admission, and bodyless-module behavior are protected by the [completion packet](145-step3-complete-body-outcome-publication.md). |
-| 4A solved/validated bodies | [Phases 8 and 9](../../COMPILER_PRIORITIES.md#phase-8-constraint-solving-and-type-finalization) publish meta-free solved and accepted validated facts. Measure and remove repeated finalization walks. Optional semantic-type interning is a separate experiment, never a prerequisite. |
+| 4A solved/validated bodies, complete | [Phases 8 and 9](../../COMPILER_PRIORITIES.md#phase-8-constraint-solving-and-type-finalization) publish meta-free solved and accepted validated facts. Accepted bodies retain exact session-owned solver identity through validation; raw cross-session slots and unscoped meta issuance are rejected. Optional semantic-type interning remains a separate experiment. |
 | 7A keyed CTFE | Attach evaluated initializer replacements by exact identity instead of retaining a second complete typed program. |
 | 7B codegen-ready | Audit the exact facts Core needs, construct a narrow opaque accepted input, and release compile-only recovery/analysis state before Core. [Phase 10](../typechecking/phase-10-checked-codegen-graphs.md) owns admission; the [last-use and release issue](137-codegen-input-last-use-and-release.md) owns the proof and lifetime measurements. |
 | 9 Core identities | Preserve IDs into one measured Core declaration/relation pass cluster at a time after 7B; do not wait for all tooling queries. This includes classifying ABI exposure, assigning exact nominal type/specialization IDs, and deriving compact internal C type/helper spellings from those IDs. |
@@ -98,6 +100,31 @@ did not reproduce a material instruction win. Allocations, peak, RSS, and
 code-size changes remain below their guards. The slice is accepted because it
 deletes the ordinary outcome-list replay and dictionary-order projection,
 makes seed admission linear, and gives those products immediate consumers.
+
+## Completed Step 4A Contract
+
+One host-issued compilation run owns every solver session for an accepted
+typecheck graph. Module, global, ordinary-body, selective-CTFE, and eager-CTFE
+work project checked table-local owners into explicit session keys; eager
+artifact-to-bound retry uses a distinct invocation. Semantic and dimension
+metas carry the flat session-plus-slot payload, and solver operations reject a
+foreign session before positional binding access. Accepted body, CTFE, and
+Core products remain protected by meta-free finalization/validation.
+
+The completion packet records focused identity, body-order, inference,
+dimension, sanitizer, and retained-resource evidence. Its 1,024-body selected
+CTFE scaling screen stayed within the allocation guard (+0.3715%) and retained
+exactly one 64-byte object, matching the prior retention result. Step 7A may
+therefore consume the validated body products without reconstructing solver
+identity or preserving a raw-index compatibility path.
+
+The optimized compiler worker is the explicit exception: it grew 2.14%, above
+the 1% investigation guard. The completion investigation found diffuse text
+growth from carrying and validating exact session identity, while the standard
+screen improved retired instructions about 0.14%, kept allocation growth to
+0.127%, and held peak-memory growth below 1%. This correctness trade is
+accepted for 4A; subsequent size cleanup should deduplicate session-purpose
+mapping and parallel body-attempt wrappers, then measure worker text directly.
 
 ## Measurement And Acceptance
 

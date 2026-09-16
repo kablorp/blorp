@@ -6725,6 +6725,7 @@ private pure func constructor_return_type(
 		Some(typ):
 			checked_type(context, typ)
 		None:
+			var next_context = context
 			var type_context: Context = context.state.context
 			var args: List[SemanticType] = []
 
@@ -6732,13 +6733,20 @@ private pure func constructor_return_type(
 				if field_types.any(func(field_type): occurs_in(param, field_type)):
 					args = args.append(SemanticTypeVar(param))
 				else:
-					step = fresh_meta_with_origin(type_context, param)
-					type_context = step.context
-					args = args.append(step.meta_type)
+					match fresh_meta_with_origin(type_context, param):
+						Some(step):
+							type_context = step.context
+							args = args.append(step.meta_type)
+						None:
+							next_context = infer_error(
+								next_context,
+								"internal typecheck error: inference meta requested outside an issued session",
+							)
+							args = args.append(SemanticTypeVar(param))
 
-			next_state = { context.state | context = type_context }
+			next_state = { next_context.state | context = type_context }
 			checked_type(
-				infer_context_with_state(context, next_state),
+				infer_context_with_state(next_context, next_state),
 				SemanticNamedType(parent_type, args),
 			)
 
@@ -8446,10 +8454,16 @@ private pure func complete_call_type_subst(
 
 	for param in bound_params:
 		if param.bounds.length() == 0 and find_type_subst(next_subst, param.name).is_none():
-			step = fresh_meta_with_origin(next_context.state.context, param.name)
-			next_state = { next_context.state | context = step.context }
-			next_context = infer_context_with_state(next_context, next_state)
-			next_subst = next_subst.append(type_subst_entry(param.name, step.meta_type))
+			match fresh_meta_with_origin(next_context.state.context, param.name):
+				Some(step):
+					next_state = { next_context.state | context = step.context }
+					next_context = infer_context_with_state(next_context, next_state)
+					next_subst = next_subst.append(type_subst_entry(param.name, step.meta_type))
+				None:
+					next_context = infer_error(
+						next_context,
+						"internal typecheck error: inference meta requested outside an issued session",
+					)
 
 	bind_type_subst_result(next_context, next_subst)
 
@@ -9634,7 +9648,7 @@ private pure func dim_constraint_solved(result: DimSolveResult) -> Bool:
 	match result:
 		DimSolved:
 			True
-		DimBindMeta(_, _):
+		DimBindMeta(_, _, _):
 			False
 		DimBindVar(_, _):
 			False
@@ -9659,7 +9673,7 @@ private pure func check_call_dim_constraints(
 				resolved_lhs = apply_subst(subst, lhs)
 				resolved_rhs = apply_subst(subst, rhs)
 
-				if not dim_constraint_solved(dim_solve([], resolved_lhs, resolved_rhs)):
+				if not dim_constraint_solved(dim_solve(None, [], resolved_lhs, resolved_rhs)):
 					next = dim_constraint_error(
 						next,
 						call.callee_name,

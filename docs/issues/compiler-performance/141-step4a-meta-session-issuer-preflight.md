@@ -1,8 +1,9 @@
 # Step 4A: Meta-Session Issuer Preflight
 
-**Status:** Issuer preflight and checked body/module/global-session projections complete.
-This packet also records the focused benchmark and issuance contract. It does
-**not** migrate solver metas to `MetaId` or change compiler semantics.
+**Status:** Implemented; this packet completes Step 4A.
+`SemanticMetaType` and dimension-meta facts now carry a flat retained session
+plus dense slot, and every production solver receives a checked session from
+one host-issued compilation run. No source-language behavior changes.
 
 ## Why a session key cannot be guessed
 
@@ -675,3 +676,61 @@ aggregate allocation.
    resource pairs. Accept 4A only when no unresolved meta reaches accepted
    body/CTFE/Core products and no material allocation, instruction, memory,
    or worker-size regression remains.
+
+## Completion result
+
+The coordinated migration above is complete:
+
+- `complete_typecheck_graph` is the impure host boundary. It issues one run
+  token and delegates to a pure run-aware worker; accepted and recoverable
+  graph products retain that run only through body validation.
+- Module preparation, planned global initializers, ordinary bodies, selective
+  CTFE, eager artifact checks, and eager bound fallback all receive checked
+  sessions projected from the graph's exact `DefinitionTable`.
+- Selective CTFE uses its own purpose. Eager artifact work uses invocation
+  zero and the bound fallback uses invocation one, so retrying the same body
+  cannot reuse a fresh solver identity.
+- `SemanticMetaType`, dimension canonical factors, `DimBindMeta`, lookup,
+  binding, occurs checks, unification, and zonking all carry and validate the
+  flat `(MetaSessionId, slot)` identity. Foreign same-slot metas stay opaque.
+- `context_empty()` cannot issue a meta. Direct inference fixtures and retained
+  profiles must opt into an explicit test/profile session, matching the
+  production invariant instead of preserving a raw-index compatibility path.
+
+The final focused loops passed 37/37 context tests, 18/18 dimension tests,
+32/32 body-order/session tests, 315/315 inference tests, and 13/13 definition
+identity tests. `scripts/compiler-check --changed` passed 19 production
+sources, 39 suites, and six special checks, including the Core sanitizer,
+declaration boundary, CLI, LSP, and package gates.
+
+The 1,024-body selected CTFE scaling guard preserved checksum 1,033, zero
+errors, one dependency body check, one reused body, and one retained object /
+64 B. It recorded 309,645 allocations and 309,644 releases versus the prior
+308,499 / 308,498 point (+1,146 calls, 0.3715%, below the 0.5% investigation
+guard). The first direct-session design exceeded that guard because it
+allocated an `Option[MetaSessionId]` and an otherwise-empty solver record for
+every checked body. `Context` now carries the issued session directly and
+reuses the shared empty solver, leaving only the necessary issued-session
+allocation. The single elapsed sample is not latency evidence. The
+4,096-iteration dimension meta-bind probe exactly preserved its
+704,512 allocations/releases after candidate collection was kept flat instead
+of returning an allocating session/slot tuple. The retained binding-width,
+binding-chain, resolution, and meta-free probes all completed with balanced
+allocations/releases and zero retained objects. After extracting the session
+once outside its measured loop, the 128-by-16 binding-width probe recorded
+20,496 allocations/releases versus 20,480 before the migration (+0.078%).
+Earlier matched representation and comparison screens in this packet provide
+the retired-instruction and peak-memory evidence.
+
+The final standard selected screen (`1 24 32 retained selected`) preserved
+checksum 846 and recorded 257,042 / 257,041 allocations/releases versus
+256,715 / 256,714 (+0.1274%). An alternating B-A-A-B screen measured retired
+instructions about 0.13–0.15% lower and peak memory 0.22–0.66% higher. The
+optimized worker grew from 6,400,576 to 6,537,664 bytes (+2.1418%), including
+`__text` growth from 5,013,052 to 5,117,080 (+2.075%). That exceeds the 1%
+investigation guard and is explicitly accepted as the one completion trade:
+symbol inspection found diffuse session-aware semantic-type, context, and API
+surface growth, not an accidental retained table or isolated duplicate. A
+73-KB reduction would be needed to cross the guard, which is not a bounded
+cleanup. Purpose-mapping and body-attempt wrapper deduplication remain valid
+post-completion size work, but are not expected to recover that amount.

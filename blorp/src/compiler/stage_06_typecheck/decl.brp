@@ -609,6 +609,7 @@ import:
 		prelude_traits_module_matches,
 	type_system/context:
 		PreparedInferContextFacts,
+		context_for_meta_session,
 		context_from_prepared_infer_facts,
 		prepared_infer_context_facts,
 	type_system/env:
@@ -694,6 +695,7 @@ import:
 		CompilationRunToken,
 		MetaSessionId,
 		meta_body_session,
+		meta_body_session_from_validated_key,
 		meta_global_session,
 		meta_module_session,
 		new_compilation_run_token,
@@ -1099,7 +1101,11 @@ record SeededBodyCheckRun {
 
 private record BodyPlanProvenanceRep {
 	module_scope: PreparedModuleScope,
-	allow_debug_only_calls: Bool
+	allow_debug_only_calls: Bool,
+	meta_run_token: CompilationRunToken,
+	meta_definition_table: DefinitionTable,
+	meta_purpose: BodyMetaSessionPurpose,
+	meta_invocation: Int
 }
 
 
@@ -3947,8 +3953,8 @@ private pure func impl_parameterize_receiver_type(
 			SemanticSelfType
 		SemanticVarDimsType(name):
 			SemanticVarDimsType(name)
-		SemanticMetaType(id):
-			SemanticMetaType(id)
+		SemanticMetaType(session, slot):
+			SemanticMetaType(session, slot)
 
 
 private pure func impl_normalize_receiver_type(
@@ -7411,7 +7417,8 @@ private record PreparedModuleEnvironmentCollection {
 private record InitializerCheckContext {
 	module_environment: PreparedCanonicalModuleEnvironment,
 	definition_table: DefinitionTable,
-	completed_dependencies: List[CompletedGlobalHeader]
+	completed_dependencies: List[CompletedGlobalHeader],
+	meta_session: MetaSessionId
 }
 
 
@@ -7889,10 +7896,11 @@ private pure func prepared_module_environments(
 
 private pure func typecheck_session_for_prepared_module(
 	environment: PreparedCanonicalModuleEnvironment,
+	meta_session: MetaSessionId,
 ) -> TypecheckState:
 	facts = environment.module_facts
 	{
-		context = context_from_prepared_infer_facts(environment.context_facts),
+		context = context_from_prepared_infer_facts(environment.context_facts, meta_session),
 		env = env_from_prepared_module_declarations(environment.declaration_env),
 		errors = [],
 		diagnostics = [],
@@ -7910,7 +7918,7 @@ private pure func typecheck_session_for_prepared_module(
 
 private pure func initializer_check_state(context: InitializerCheckContext) -> TypecheckState:
 	module_environment = context.module_environment
-	base_state = typecheck_session_for_prepared_module(module_environment)
+	base_state = typecheck_session_for_prepared_module(module_environment, context.meta_session)
 
 	match module_view_accepted_global_authority(base_state.module_view):
 		Some(authority):
@@ -8019,6 +8027,7 @@ private pure func complete_one_global_header(
 	planned_dependencies: List[GlobalId],
 	completed: List[CompletedGlobalHeader],
 	header: GlobalHeader,
+	meta_session: MetaSessionId,
 ) -> Result[CompletedGlobalHeader, List[TypecheckDiagnostic]]:
 	id = global_header_id(header)
 	definition_table = callable_header_graph_definition_table(
@@ -8070,6 +8079,7 @@ private pure func complete_one_global_header(
 				module_environment = module_environment,
 				definition_table = definition_table,
 				completed_dependencies = completed_dependencies,
+				meta_session = meta_session,
 			})
 			initial_diagnostic_count = state.diagnostics.length()
 			result = typecheck_materialize_global_var_body_with_identity(
@@ -8225,6 +8235,7 @@ private pure func complete_planned_global_headers(
 	accepted_record_table: AcceptedRecordTable,
 	accepted_union_table: AcceptedUnionTable,
 	allow_debug_only_calls: Bool,
+	meta_run: DefinitionMetaRun,
 ) -> GlobalHeaderCompletionOutcome:
 	prepared_modules = prepared_module_environments(
 		implementation_headers,
@@ -8314,15 +8325,32 @@ private pure func complete_planned_global_headers(
 
 		requested_global_definition_ids = requested_global_definition_ids.set(definition_id, True)
 
-		match complete_one_global_header(
-			implementation_headers,
-			bound_graph,
-			prepared_environments,
-			prepared_environment_positions_by_module_id,
-			planned_dependencies_by_header.get_or(header_index, []),
-			completed,
-			header,
-		):
+		meta_session = global_header_completion_plan_meta_session_at(
+			plan,
+			meta_run,
+			header_index,
+			0,
+		)
+
+		completion_result = match meta_session:
+			Some(session):
+				complete_one_global_header(
+					implementation_headers,
+					bound_graph,
+					prepared_environments,
+					prepared_environment_positions_by_module_id,
+					planned_dependencies_by_header.get_or(header_index, []),
+					completed,
+					header,
+					session,
+				)
+			None:
+				Err([typecheck_diagnostic(
+							"internal typecheck error: global initializer meta session projection failed",
+							global_id_source_span(definition_table, header_id),
+						)])
+
+		match completion_result:
 			Ok(found):
 				completed_index_by_global_definition_id = completed_index_by_global_definition_id.set(
 					definition_id,
@@ -8369,6 +8397,7 @@ private pure func complete_global_header_graph(
 	accepted_record_table: AcceptedRecordTable,
 	accepted_union_table: AcceptedUnionTable,
 	allow_debug_only_calls: Bool,
+	meta_run: DefinitionMetaRun,
 ) -> GlobalHeaderCompletionOutcome:
 	callable_headers = implementation_header_graph_callable_headers(implementation_headers)
 
@@ -8384,6 +8413,7 @@ private pure func complete_global_header_graph(
 				accepted_record_table,
 				accepted_union_table,
 				allow_debug_only_calls,
+				meta_run,
 			)
 		GlobalHeaderCompletionPlanBlocked(plan, cyclic_components, blocked):
 			complete_planned_global_headers(
@@ -8396,6 +8426,7 @@ private pure func complete_global_header_graph(
 				accepted_record_table,
 				accepted_union_table,
 				allow_debug_only_calls,
+				meta_run,
 			)
 
 
@@ -8416,6 +8447,31 @@ private pure func typecheck_diagnostics_equal(
 -- the body-bearing import inventory needed to materialize declarations. Its
 -- sole constructor verifies both products came from compatible indexed graphs,
 -- so the complete inventory cannot be paired with unrelated headers.
+-- One host-issued compilation token is retained by the accepted graph and
+-- projected into owner-specific solver sessions at scheduling boundaries.
+private record DefinitionMetaRunRep {
+	definition_table: DefinitionTable,
+	token: CompilationRunToken
+}
+
+
+opaque type DefinitionMetaRun = DefinitionMetaRunRep
+
+
+pure func definition_meta_run_for_table(
+	definition_table: DefinitionTable,
+	token: CompilationRunToken,
+) -> DefinitionMetaRun:
+	into_opaque DefinitionMetaRun({
+			definition_table = definition_table,
+			token = token
+		})
+
+
+func new_definition_meta_run(definition_table: DefinitionTable) -> DefinitionMetaRun:
+	definition_meta_run_for_table(definition_table, new_compilation_run_token())
+
+
 private record TypecheckGraphFacts {
 	implementation_headers: ImplementationHeaderGraph,
 	importable_graph: ImportableModuleGraph,
@@ -8428,7 +8484,8 @@ private record TypecheckGraphFacts {
 
 private record AcceptedTypecheckGraphRep {
 	facts: TypecheckGraphFacts,
-	semantic_catalog: AcceptedSemanticCatalog
+	semantic_catalog: AcceptedSemanticCatalog,
+	meta_run: DefinitionMetaRun
 }
 
 
@@ -8445,7 +8502,8 @@ private record RecoverableSemanticTables {
 private record RecoverableTypecheckGraphRep {
 	facts: TypecheckGraphFacts,
 	semantic_tables: RecoverableSemanticTables,
-	global_completion_failures: List[GlobalHeaderCompletionFailure]
+	global_completion_failures: List[GlobalHeaderCompletionFailure],
+	meta_run: DefinitionMetaRun
 }
 
 
@@ -8499,6 +8557,7 @@ private pure func finish_typecheck_graph_completion(
 	expected_prepared_module_count: Int,
 	expected_module_table_count: Int,
 	completion: GlobalHeaderCompletionOutcome,
+	meta_run: DefinitionMetaRun,
 ) -> TypecheckGraphCompletion:
 	accepted_alias_table = accepted_alias_graph_table(accepted_alias_graph)
 	accepted_record_table = accepted_record_graph_table(accepted_record_graph)
@@ -8619,7 +8678,8 @@ private pure func finish_typecheck_graph_completion(
 						Some(semantic_catalog):
 							TypecheckGraphAccepted(into_opaque AcceptedTypecheckGraph({
 										facts = facts,
-										semantic_catalog = semantic_catalog
+										semantic_catalog = semantic_catalog,
+										meta_run = meta_run
 									}))
 				else:
 					TypecheckGraphRecoverable(into_opaque RecoverableTypecheckGraph({
@@ -8632,14 +8692,16 @@ private pure func finish_typecheck_graph_completion(
 									globals = accepted_global_table,
 									traits_and_implementations = accepted_trait_implementation_table
 								},
-								global_completion_failures = completion.failures
+								global_completion_failures = completion.failures,
+								meta_run = meta_run
 							}))
 
 
-pure func complete_typecheck_graph(
+private pure func complete_typecheck_graph_for_meta_run(
 	implementation_headers: ImplementationHeaderGraph,
 	importable_graph: ImportableModuleGraph,
 	allow_debug_only_calls: Bool,
+	meta_run: DefinitionMetaRun,
 ) -> TypecheckGraphCompletion:
 	callable_headers = implementation_header_graph_callable_headers(implementation_headers)
 	trait_topology = callable_header_graph_trait_topology(callable_headers)
@@ -8705,6 +8767,7 @@ pure func complete_typecheck_graph(
 											accepted_record_table,
 											accepted_union_table,
 											allow_debug_only_calls,
+											meta_run,
 										)
 										finish_typecheck_graph_completion(
 											implementation_headers,
@@ -8715,6 +8778,7 @@ pure func complete_typecheck_graph(
 											1 + bound_module_graph_modules(bound_graph).length(),
 											indexed_graph_module_count(indexed_graph),
 											completion,
+											meta_run,
 										)
 	else:
 		TypecheckGraphCompletionRejected(
@@ -8725,6 +8789,23 @@ pure func complete_typecheck_graph(
 				),
 			],
 		)
+
+
+func complete_typecheck_graph(
+	implementation_headers: ImplementationHeaderGraph,
+	importable_graph: ImportableModuleGraph,
+	allow_debug_only_calls: Bool,
+) -> TypecheckGraphCompletion:
+	callable_headers = implementation_header_graph_callable_headers(implementation_headers)
+	trait_topology = callable_header_graph_trait_topology(callable_headers)
+	type_headers = trait_topology_graph_type_headers(trait_topology)
+	meta_run = new_definition_meta_run(type_header_graph_definition_table(type_headers))
+	complete_typecheck_graph_for_meta_run(
+		implementation_headers,
+		importable_graph,
+		allow_debug_only_calls,
+		meta_run,
+	)
 
 
 private pure func accepted_typecheck_graph_rep(
@@ -9256,6 +9337,7 @@ private enum AcceptedTypecheckImportScope:
 -- tied to the exact graph acceptance that produced it.
 private record PreparedAcceptedBodyModule {
 	session_seed: BodyInferSessionSeed,
+	meta_session: MetaSessionId,
 	errors: List[String],
 	diagnostics: List[TypecheckDiagnostic],
 	import_modules: List[ImportableModule]
@@ -9318,8 +9400,9 @@ private pure func prepare_canonical_body_module(
 	graph: TypecheckGraphFacts,
 	accepted_global_table: AcceptedGlobalTable,
 	environment: PreparedCanonicalModuleEnvironment,
+	meta_session: MetaSessionId,
 ) -> Option[PreparedAcceptedBodyModule]:
-	base_state = typecheck_session_for_prepared_module(environment)
+	base_state = typecheck_session_for_prepared_module(environment, meta_session)
 	module_id = prepared_module_scope_id(bound_module_scope(environment.bound_module))
 	direct_module_ids = bound_module_direct_import_modules(
 		environment.bound_module,
@@ -9352,6 +9435,7 @@ private pure func prepare_canonical_body_module(
 
 	Some({
 		session_seed = session_seed,
+		meta_session = meta_session,
 		errors = with_completed_globals.errors,
 		diagnostics = with_completed_globals.diagnostics,
 		import_modules = importable_module_graph_all(graph.importable_graph),
@@ -9361,7 +9445,10 @@ private pure func prepare_canonical_body_module(
 private record AcceptedTypecheckModuleRep {
 	graph_facts: TypecheckGraphFacts,
 	bound_module: BoundModule,
-	prepared_body: PreparedAcceptedBodyModule
+	prepared_body: PreparedAcceptedBodyModule,
+	meta_run: DefinitionMetaRun,
+	body_meta_purpose: BodyMetaSessionPurpose,
+	body_meta_invocation: Int
 }
 
 
@@ -9469,8 +9556,11 @@ private pure func prepare_union_type_authority(
 private pure func graph_facts_typecheck_module(
 	graph_facts: TypecheckGraphFacts,
 	accepted_global_table: AcceptedGlobalTable,
+	meta_run: DefinitionMetaRun,
 	request_scope: PreparedModuleScope,
 	allow_debug_only_calls: Bool,
+	body_meta_purpose: BodyMetaSessionPurpose,
+	body_meta_invocation: Int,
 ) -> Option[AcceptedTypecheckModule]:
 	prepared_environment ?= prepared_module_environment_find_for_scope(graph_facts, request_scope)
 	bound_module = prepared_environment.bound_module
@@ -9480,15 +9570,24 @@ private pure func graph_facts_typecheck_module(
 		request_scope,
 		allow_debug_only_calls,
 	):
+		meta_session ?= prepared_module_scope_meta_session(
+			request_scope,
+			meta_run,
+			body_meta_invocation,
+		)
 		prepared_body ?= prepare_canonical_body_module(
 			graph_facts,
 			accepted_global_table,
 			prepared_environment,
+			meta_session,
 		)
 		Some(into_opaque AcceptedTypecheckModule({
 					graph_facts = graph_facts,
 					bound_module = bound_module,
-					prepared_body = prepared_body
+					prepared_body = prepared_body,
+					meta_run = meta_run,
+					body_meta_purpose = body_meta_purpose,
+					body_meta_invocation = body_meta_invocation
 				}))
 	else:
 		None
@@ -9503,8 +9602,30 @@ pure func accepted_graph_typecheck_module(
 	graph_facts_typecheck_module(
 		representation.facts,
 		accepted_semantic_catalog_global_table(representation.semantic_catalog),
+		representation.meta_run,
 		scope,
 		allow_debug_only_calls,
+		NormalBodyMetaSession,
+		0,
+	)
+
+
+pure func accepted_graph_typecheck_module_for_body_attempt(
+	graph: AcceptedTypecheckGraph,
+	scope: PreparedModuleScope,
+	allow_debug_only_calls: Bool,
+	purpose: BodyMetaSessionPurpose,
+	invocation: Int,
+) -> Option[AcceptedTypecheckModule]:
+	representation = accepted_typecheck_graph_rep(graph)
+	graph_facts_typecheck_module(
+		representation.facts,
+		accepted_semantic_catalog_global_table(representation.semantic_catalog),
+		representation.meta_run,
+		scope,
+		allow_debug_only_calls,
+		purpose,
+		invocation,
 	)
 
 
@@ -9535,8 +9656,35 @@ pure func recoverable_graph_typecheck_module(
 		graph_facts_typecheck_module(
 			representation.facts,
 			representation.semantic_tables.globals,
+			representation.meta_run,
 			scope,
 			allow_debug_only_calls,
+			NormalBodyMetaSession,
+			0,
+		)
+
+
+pure func recoverable_graph_typecheck_module_for_body_attempt(
+	graph: RecoverableTypecheckGraph,
+	scope: PreparedModuleScope,
+	allow_debug_only_calls: Bool,
+	purpose: BodyMetaSessionPurpose,
+	invocation: Int,
+) -> Option[AcceptedTypecheckModule]:
+	representation = recoverable_typecheck_graph_rep(graph)
+	module_id = prepared_module_scope_id(scope)
+
+	if completion_failed_for_module(representation.global_completion_failures, module_id):
+		None
+	else:
+		graph_facts_typecheck_module(
+			representation.facts,
+			representation.semantic_tables.globals,
+			representation.meta_run,
+			scope,
+			allow_debug_only_calls,
+			purpose,
+			invocation,
 		)
 
 
@@ -9551,6 +9699,7 @@ private pure func graph_facts_ctfe_artifact_typecheck_module(
 	accepted_callable_table: AcceptedCallableTable,
 	accepted_global_table: AcceptedGlobalTable,
 	accepted_trait_implementation_table: AcceptedTraitImplementationTable,
+	meta_run: DefinitionMetaRun,
 	scope: PreparedModuleScope,
 	state: TypecheckState,
 ) -> Option[AcceptedTypecheckModule]:
@@ -9565,13 +9714,15 @@ private pure func graph_facts_ctfe_artifact_typecheck_module(
 		and importable_module_graph_accepts_scope(graph_facts.importable_graph, scope)
 		and typecheck_state_is_reserved_for_scope(state, scope)
 	):
+		meta_session ?= prepared_module_scope_meta_session(scope, meta_run, 0)
+		prepared_state = { state | context = context_for_meta_session(state.context, meta_session) }
 		artifact_index = importable_module_graph_dependency_index(graph_facts.importable_graph)
 		bound_module ?= bound_module_build(
 			scope,
 			func(
 				binding_scope,
 			): typecheck_bind_program_module_view(
-				state,
+				prepared_state,
 				prepared_module_program(prepared_module_scope_module(binding_scope)),
 				artifact_index,
 				binding_scope,
@@ -9581,7 +9732,7 @@ private pure func graph_facts_ctfe_artifact_typecheck_module(
 			accepted_alias_table,
 			type_headers,
 			bound_module,
-			state,
+			prepared_state,
 		)
 		record_type_authority = prepare_record_type_authority(
 			accepted_record_table,
@@ -9602,6 +9753,7 @@ private pure func graph_facts_ctfe_artifact_typecheck_module(
 			accepted_trait_implementation_table,
 			bound_module,
 			union_type_authority.state,
+			meta_session,
 			type_alias_authority.authority,
 			record_type_authority.authority,
 			union_type_authority.authority,
@@ -9610,7 +9762,10 @@ private pure func graph_facts_ctfe_artifact_typecheck_module(
 		Some(into_opaque AcceptedTypecheckModule({
 					graph_facts = graph_facts,
 					bound_module = bound_module,
-					prepared_body = prepared_body
+					prepared_body = prepared_body,
+					meta_run = meta_run,
+					body_meta_purpose = CtfeEagerBodyMetaSession,
+					body_meta_invocation = 0
 				}))
 	else:
 		None
@@ -9631,6 +9786,7 @@ pure func accepted_ctfe_artifact_typecheck_module(
 		accepted_semantic_catalog_callable_table(catalog),
 		accepted_semantic_catalog_global_table(catalog),
 		accepted_semantic_catalog_trait_implementation_table(catalog),
+		representation.meta_run,
 		scope,
 		state,
 	)
@@ -9656,6 +9812,7 @@ pure func recoverable_ctfe_artifact_typecheck_module(
 			tables.callables,
 			tables.globals,
 			tables.traits_and_implementations,
+			representation.meta_run,
 			scope,
 			state,
 		)
@@ -9682,10 +9839,18 @@ private record AcceptedBodyModuleBase {
 private pure func body_plan_provenance(
 	local_module: BoundModule,
 	allow_debug_only_calls: Bool,
+	meta_run_token: CompilationRunToken,
+	meta_definition_table: DefinitionTable,
+	meta_purpose: BodyMetaSessionPurpose,
+	meta_invocation: Int,
 ) -> BodyPlanProvenance:
 	into_opaque BodyPlanProvenance({
 			module_scope = bound_module_scope(local_module),
-			allow_debug_only_calls = allow_debug_only_calls
+			allow_debug_only_calls = allow_debug_only_calls,
+			meta_run_token = meta_run_token,
+			meta_definition_table = meta_definition_table,
+			meta_purpose = meta_purpose,
+			meta_invocation = meta_invocation
 		})
 
 
@@ -9723,6 +9888,7 @@ private pure func prepare_ctfe_artifact_body_module(
 	accepted_trait_implementation_table: AcceptedTraitImplementationTable,
 	bound_module: BoundModule,
 	state: TypecheckState,
+	meta_session: MetaSessionId,
 	accepted_alias_authority: AcceptedAliasAuthority,
 	accepted_record_authority: AcceptedRecordAuthority,
 	accepted_union_authority: AcceptedUnionAuthority,
@@ -9798,6 +9964,7 @@ private pure func prepare_ctfe_artifact_body_module(
 
 	Some({
 		session_seed = session_seed,
+		meta_session = meta_session,
 		errors = base_state.errors,
 		diagnostics = base_state.diagnostics,
 		import_modules = importable_module_graph_dependencies(graph.importable_graph),
@@ -9827,6 +9994,7 @@ private pure func accepted_body_module_preparation_semantic_observation(
 private pure func observe_accepted_body_module_preparation(
 	graph: TypecheckGraphFacts,
 	semantic_catalog: AcceptedSemanticCatalog,
+	meta_run: DefinitionMetaRun,
 	bound_module: BoundModule,
 	state: TypecheckState,
 	import_scope: AcceptedTypecheckImportScope,
@@ -9836,22 +10004,29 @@ private pure func observe_accepted_body_module_preparation(
 		graph,
 		prepared_module_scope_id(bound_module_scope(bound_module)),
 	)
+	meta_session = prepared_module_scope_meta_session(bound_module_scope(bound_module), meta_run, 2)
 
-	prepared: Option[PreparedAcceptedBodyModule] = match (import_scope, prepared_environment):
-		(CanonicalTypecheckImports, Some(environment)):
+	prepared: Option[PreparedAcceptedBodyModule] = match (
+		import_scope,
+		prepared_environment,
+		meta_session,
+	):
+		(CanonicalTypecheckImports, Some(environment), Some(session)):
 			prepare_canonical_body_module(
 				graph,
 				accepted_semantic_catalog_global_table(semantic_catalog),
 				environment,
+				session,
 			)
-		(CanonicalTypecheckImports, None):
+		(CanonicalTypecheckImports, _, _):
 			None
-		(CtfeArtifactTypecheckImports, _):
+		(CtfeArtifactTypecheckImports, _, Some(session)):
+			prepared_state = { state | context = context_for_meta_session(state.context, session) }
 			type_alias_authority = prepare_type_alias_authority(
 				accepted_semantic_catalog_alias_table(semantic_catalog),
 				type_headers,
 				bound_module,
-				state,
+				prepared_state,
 			)
 			record_type_authority = prepare_record_type_authority(
 				accepted_semantic_catalog_record_table(semantic_catalog),
@@ -9872,10 +10047,13 @@ private pure func observe_accepted_body_module_preparation(
 				accepted_semantic_catalog_trait_implementation_table(semantic_catalog),
 				bound_module,
 				union_type_authority.state,
+				session,
 				type_alias_authority.authority,
 				record_type_authority.authority,
 				union_type_authority.authority,
 			)
+		(CtfeArtifactTypecheckImports, _, None):
+			None
 
 	match prepared:
 		None:
@@ -9903,7 +10081,10 @@ private pure func observe_accepted_body_module_preparation(
 					representation: AcceptedTypecheckModuleRep = {
 						graph_facts = graph,
 						bound_module = bound_module,
-						prepared_body = prepared
+						prepared_body = prepared,
+						meta_run = meta_run,
+						body_meta_purpose = NormalBodyMetaSession,
+						body_meta_invocation = 0
 					}
 					body_contexts_from_base(
 						accepted_body_module_base(
@@ -9959,6 +10140,7 @@ pure func accepted_typecheck_graph_declaration_preparation_observation(
 			observe_accepted_body_module_preparation(
 				facts,
 				representation.semantic_catalog,
+				representation.meta_run,
 				module,
 				state,
 				CanonicalTypecheckImports,
@@ -10002,14 +10184,20 @@ pure func accepted_typecheck_graph_initializer_preparation_observation(
 			facts,
 			prepared_module_scope_id(bound_module_scope(module)),
 		)
-		base_state = environment
-			.map(typecheck_session_for_prepared_module)
-			.get_or(
+		meta_session = prepared_module_scope_meta_session(
+			bound_module_scope(module),
+			representation.meta_run,
+			3,
+		)
+
+		base_state = match (environment, meta_session):
+			(Some(found), Some(session)):
+				typecheck_session_for_prepared_module(found, session)
+			_:
 				typecheck_state_add_error(
 					typecheck_state_for_prepared_module_scope(bound_module_scope(module), False),
-					"internal typecheck error: accepted module has no prepared environment",
-				),
-			)
+					"internal typecheck error: accepted module has no prepared meta session",
+				)
 
 		installed_state = match environment:
 			Some(found):
@@ -10060,6 +10248,7 @@ pure func accepted_typecheck_graph_ctfe_artifact_preparation_observation(
 			accepted_semantic_catalog_callable_table(catalog),
 			accepted_semantic_catalog_global_table(catalog),
 			accepted_semantic_catalog_trait_implementation_table(catalog),
+			graph_representation.meta_run,
 			bound_module_scope(module),
 			state,
 		):
@@ -10087,8 +10276,12 @@ private pure func accepted_body_module_base(
 	input: AcceptedTypecheckModule,
 ) -> AcceptedBodyModuleBase:
 	representation = accepted_typecheck_module_rep(input)
+	meta_run = from_opaque DefinitionMetaRun(representation.meta_run)
 	import_modules = representation.prepared_body.import_modules
-	fresh_state = fresh_body_infer_session(representation.prepared_body.session_seed)
+	fresh_state = fresh_body_infer_session(
+		representation.prepared_body.session_seed,
+		representation.prepared_body.meta_session,
+	)
 	state = { fresh_state |
 		errors = representation.prepared_body.errors,
 		diagnostics = representation.prepared_body.diagnostics
@@ -10100,6 +10293,10 @@ private pure func accepted_body_module_base(
 		plan_provenance = body_plan_provenance(
 			representation.bound_module,
 			state.allow_debug_only_calls,
+			meta_run.token,
+			meta_run.definition_table,
+			representation.body_meta_purpose,
+			representation.body_meta_invocation,
 		)
 	}
 
@@ -10116,32 +10313,6 @@ private record BodyCheckContextRep {
 
 
 opaque type BodyCheckContext = BodyCheckContextRep
-
-
--- A host-issued token can be bound to a definition table after pure graph
--- preparation. MetaSessionId also retains this exact table provenance, so
--- binding one token to two graphs cannot alias same-numbered owners.
-private record DefinitionMetaRunRep {
-	definition_table: DefinitionTable,
-	token: CompilationRunToken
-}
-
-
-opaque type DefinitionMetaRun = DefinitionMetaRunRep
-
-
-pure func definition_meta_run_for_table(
-	definition_table: DefinitionTable,
-	token: CompilationRunToken,
-) -> DefinitionMetaRun:
-	into_opaque DefinitionMetaRun({
-			definition_table = definition_table,
-			token = token
-		})
-
-
-func new_definition_meta_run(definition_table: DefinitionTable) -> DefinitionMetaRun:
-	definition_meta_run_for_table(definition_table, new_compilation_run_token())
 
 
 -- The plan retains both its issuing definition table and the exact ordered
@@ -10216,9 +10387,12 @@ private pure func body_infer_session_seed(state: TypecheckState) -> Option[BodyI
 	})
 
 
-private pure func fresh_body_infer_session(seed: BodyInferSessionSeed) -> TypecheckState:
+private pure func fresh_body_infer_session(
+	seed: BodyInferSessionSeed,
+	meta_session: MetaSessionId,
+) -> TypecheckState:
 	{
-		context = context_from_prepared_infer_facts(seed.context_facts),
+		context = context_from_prepared_infer_facts(seed.context_facts, meta_session),
 		env = env_from_prepared_infer_session(seed.env_facts),
 		errors = [],
 		diagnostics = [],
@@ -10236,6 +10410,20 @@ private pure func fresh_body_infer_session(seed: BodyInferSessionSeed) -> Typech
 
 pure func body_check_context_callable_id(context: BodyCheckContext) -> CallableId:
 	from_opaque BodyCheckContext(context).id
+
+
+-- Materialize the validated plan identity for scheduling-boundary tests and
+-- inference; callers cannot construct or mutate the opaque session.
+pure func body_check_context_issued_meta_session(context: BodyCheckContext) -> MetaSessionId:
+	representation = from_opaque BodyCheckContext(context)
+	provenance = from_opaque BodyPlanProvenance(representation.plan_provenance)
+	meta_body_session_from_validated_key(
+		provenance.meta_run_token,
+		provenance.meta_definition_table,
+		callable_id_definition_id(representation.id),
+		provenance.meta_purpose,
+		provenance.meta_invocation,
+	)
 
 
 -- Module preparation occurs before there is an accepted body plan. Its
@@ -10275,6 +10463,33 @@ pure func prepared_module_scope_meta_session(
 
 
 -- The low-level session representation stores a dense definition index.
+-- Keep the raw projection behind one checked owner so body planning and
+-- diagnostic reconstruction cannot drift into separate admission rules.
+private pure func checked_body_meta_session(
+	definition_table: DefinitionTable,
+	owner: ModuleId,
+	id: CallableId,
+	run: DefinitionMetaRun,
+	purpose: BodyMetaSessionPurpose,
+	invocation: Int,
+) -> Option[MetaSessionId]:
+	run_representation = from_opaque DefinitionMetaRun(run)
+
+	if (
+		definition_tables_share_provenance(definition_table, run_representation.definition_table)
+		and callable_id_module_id(run_representation.definition_table, id) == Some(owner)
+	):
+		meta_body_session(
+			run_representation.token,
+			run_representation.definition_table,
+			callable_id_definition_id(id),
+			purpose,
+			invocation,
+		)
+	else:
+		None
+
+
 -- Only the accepted table retained by this body plan may project its
 -- CallableId into that index; a same-numbered ID from another table is not
 -- the same body, even if both graphs contain identical source text.
@@ -10286,31 +10501,17 @@ pure func body_check_context_meta_session(
 ) -> Option[MetaSessionId]:
 	representation = from_opaque BodyCheckContext(context)
 	provenance = from_opaque BodyPlanProvenance(representation.plan_provenance)
-	run_representation = from_opaque DefinitionMetaRun(run)
-	plan_definition_table = definition_index_definition_table(
+	definition_table = definition_index_definition_table(
 		prepared_module_scope_definition_index(provenance.module_scope),
 	)
-	owner = prepared_module_scope_id(provenance.module_scope)
-
-	if (
-		definition_tables_share_provenance(
-			plan_definition_table,
-			run_representation.definition_table,
-		)
-		and callable_id_module_id(
-			run_representation.definition_table,
-			representation.id,
-		) == Some(owner)
-	):
-		meta_body_session(
-			run_representation.token,
-			run_representation.definition_table,
-			callable_id_definition_id(representation.id),
-			purpose,
-			invocation,
-		)
-	else:
-		None
+	checked_body_meta_session(
+		definition_table,
+		prepared_module_scope_id(provenance.module_scope),
+		representation.id,
+		run,
+		purpose,
+		invocation,
+	)
 
 
 private pure func accepted_callable_body_ids(
@@ -10540,8 +10741,12 @@ private pure func implementation_method_body_context_from_base(
 						None:
 							BodyContextRejected(BodyContextInvalidPreparedEnvironment)
 						Some(session_seed):
+							id = implementation_method_header_id(method_header)
+
+							-- The accepted module proved the run/table and invocation;
+							-- this method was selected from its owned graph above.
 							BodyContextReady(into_opaque BodyCheckContext({
-										id = implementation_method_header_id(method_header),
+										id = id,
 										plan_provenance = base.plan_provenance,
 										session_seed = session_seed,
 										source = source,
@@ -10629,8 +10834,12 @@ private pure func body_check_context_build_from_base(
 								None:
 									BodyContextRejected(BodyContextMissingAcceptedSignature)
 								Some(signature):
+									body_id = callable_header_id(header)
+
+									-- The outer owner check selected this header from the
+									-- accepted module's exact definition table.
 									BodyContextReady(into_opaque BodyCheckContext({
-												id = callable_header_id(header),
+												id = body_id,
 												plan_provenance = base.plan_provenance,
 												session_seed = representation.prepared_body.session_seed,
 												source = source,
@@ -10798,13 +11007,14 @@ pure func accepted_typecheck_module_definition_table(
 
 private pure func check_function_body_artifact(
 	session_seed: BodyInferSessionSeed,
+	meta_session: MetaSessionId,
 	id: CallableId,
 	plan_provenance: BodyPlanProvenance,
 	source: ParsedFunctionDecl,
 	signature: FunctionBodySignature,
 	main_policy: MainValidationPolicy,
 ) -> BodyCheckOutcome:
-	state = fresh_body_infer_session(session_seed)
+	state = fresh_body_infer_session(session_seed, meta_session)
 	inferred = inferred_body_from_materialized(
 		typecheck_materialize_function_body_with_signature(
 			state,
@@ -10839,6 +11049,7 @@ pure func check_body_context(context: BodyCheckContext) -> BodyCheckOutcome:
 	representation = from_opaque BodyCheckContext(context)
 	check_function_body_artifact(
 		representation.session_seed,
+		body_check_context_issued_meta_session(context),
 		representation.id,
 		representation.plan_provenance,
 		representation.source,

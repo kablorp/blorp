@@ -7,7 +7,11 @@ import:
 	../../src/compiler/stage_06_typecheck/type_system/semantic_type:
 		SemanticDimOp(SemanticDimAdd, SemanticDimDivide, SemanticDimMultiply),
 		SemanticType(SemanticConstIntType, SemanticDimOpType, SemanticMetaType, SemanticTypeVar),
+	../../src/compiler/stage_06_typecheck/type_system/meta_identity:
+		MetaSessionId,
+		meta_session_ids_equal,
 	memory: get_mem_stats, reset_mem_stats
+	meta_profile_support: profile_meta, profile_meta_context, profile_meta_session
 	string: parse_int
 	system: now_microseconds
 
@@ -45,6 +49,7 @@ private pure func nested_opaque(product: SemanticType) -> SemanticType:
 
 private pure func expected_result_count(
 	mode: String,
+	session: Option[MetaSessionId],
 	left: SemanticType,
 	right: SemanticType,
 	iterations: Int,
@@ -53,15 +58,15 @@ private pure func expected_result_count(
 
 	if mode == "meta-bind":
 		for _ in 0..iterations:
-			match dim_solve([], left, right):
-				DimBindMeta(meta_id, _):
+			match dim_solve(session, [], left, right):
+				DimBindMeta(_, meta_id, _):
 					if meta_id == 1:
 						matched += 1
 				_:
 					void
 	else if mode == "named-bind":
 		for _ in 0..iterations:
-			match dim_solve([], left, right):
+			match dim_solve(session, [], left, right):
 				DimBindVar(name, _):
 					if name == "#P":
 						matched += 1
@@ -69,14 +74,14 @@ private pure func expected_result_count(
 					void
 	else if mode == "stuck":
 		for _ in 0..iterations:
-			match dim_solve([], left, right):
+			match dim_solve(session, [], left, right):
 				DimStuck:
 					matched += 1
 				_:
 					void
 	else:
 		for _ in 0..iterations:
-			match dim_solve([], left, right):
+			match dim_solve(session, [], left, right):
 				DimSolved:
 					matched += 1
 				_:
@@ -86,11 +91,13 @@ private pure func expected_result_count(
 
 
 private pure func binding_solves_equation(
+	session: Option[MetaSessionId],
 	value: SemanticType,
 	remainder: SemanticType,
 	right: SemanticType,
 ) -> Bool:
 	match dim_solve(
+		session,
 		[],
 		SemanticDimOpType(SemanticDimAdd, value, remainder),
 		right,
@@ -103,26 +110,28 @@ private pure func binding_solves_equation(
 
 private pure func binding_payload_is_valid(
 	mode: String,
+	session: Option[MetaSessionId],
 	left: SemanticType,
 	right: SemanticType,
 ) -> Bool:
 	if mode == "meta-bind":
-		match (left, dim_solve([], left, right)):
-			(SemanticDimOpType(SemanticDimAdd, SemanticMetaType(source_meta_id), remainder), DimBindMeta(meta_id, value)):
+		match (left, dim_solve(session, [], left, right)):
+			(SemanticDimOpType(SemanticDimAdd, SemanticMetaType(source_session, source_meta_id), remainder), DimBindMeta(meta_session, meta_id, value)):
 				(
 					meta_id == 1
 					and source_meta_id == meta_id
-					and binding_solves_equation(value, remainder, right)
+					and meta_session_ids_equal(source_session, meta_session)
+					and binding_solves_equation(session, value, remainder, right)
 				)
 			_:
 				False
 	else if mode == "named-bind":
-		match (left, dim_solve([], left, right)):
+		match (left, dim_solve(session, [], left, right)):
 			(SemanticDimOpType(SemanticDimAdd, SemanticTypeVar(source_name), remainder), DimBindVar(name, value)):
 				(
 					name == "#P"
 					and source_name == name
-					and binding_solves_equation(value, remainder, right)
+					and binding_solves_equation(session, value, remainder, right)
 				)
 			_:
 				False
@@ -134,6 +143,8 @@ func main(args: List[String]) -> Int:
 	width = positive_argument(args, 1, 8)
 	iterations = positive_argument(args, 2, 4096)
 	mode = args.get_or(3, "plain")
+	meta_context = profile_meta_context()
+	meta_session = profile_meta_session(meta_context)
 	var left = SemanticConstIntType(1)
 	var right = SemanticConstIntType(1)
 
@@ -168,13 +179,13 @@ func main(args: List[String]) -> Int:
 			SemanticDimOpType(SemanticDimDivide, right, SemanticConstIntType(3)),
 		)
 	else if mode == "mixed":
-		left = SemanticDimOpType(SemanticDimMultiply, left, SemanticMetaType(1))
-		right = SemanticDimOpType(SemanticDimMultiply, SemanticMetaType(1), right)
+		left = SemanticDimOpType(SemanticDimMultiply, left, profile_meta(meta_context, 1))
+		right = SemanticDimOpType(SemanticDimMultiply, profile_meta(meta_context, 1), right)
 	else if mode == "nested":
 		left = nested_opaque(left)
 		right = nested_opaque(right)
 	else if mode == "meta-bind":
-		left = SemanticDimOpType(SemanticDimAdd, SemanticMetaType(1), left)
+		left = SemanticDimOpType(SemanticDimAdd, profile_meta(meta_context, 1), left)
 		right = SemanticConstIntType(7)
 	else if mode == "named-bind":
 		left = SemanticDimOpType(
@@ -191,10 +202,10 @@ func main(args: List[String]) -> Int:
 		)
 		right = SemanticConstIntType(7)
 
-	binding_payload_valid = binding_payload_is_valid(mode, left, right)
+	binding_payload_valid = binding_payload_is_valid(mode, meta_session, left, right)
 	reset_mem_stats()
 	started = now_microseconds()
-	matched = expected_result_count(mode, left, right, iterations)
+	matched = expected_result_count(mode, meta_session, left, right, iterations)
 
 	elapsed = now_microseconds() - started
 	memory = get_mem_stats()
