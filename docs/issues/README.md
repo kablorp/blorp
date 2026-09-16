@@ -86,7 +86,6 @@ current-state and next-action summary.
 - [Perceus single-pass ownership summaries](compiler-performance/148-perceus-single-pass-ownership-summaries.md)
 - [Core pass linear-scan indexes](compiler-performance/149-index-core-pass-linear-scans.md)
 - [Frontend discovery phase and lexer scanning](compiler-performance/150-frontend-discovery-phase-and-lexer-scanning.md)
-- [Backend emission indentation and cancellation lookups](compiler-performance/151-backend-emission-indentation-and-cancellation-lookups.md)
 - [Normalized semantic compilation roadmap](compiler-performance/NORMALIZED_SEMANTIC_COMPILATION_ROADMAP.md)
 - [Perceus ownership roadmap](compiler-performance/PERCEUS_OWNERSHIP_OPTIMIZATION_ROADMAP.md)
 - [Nested record allocation folding prototype](compiler-performance/NESTED_RECORD_FOLDING_PROTOTYPE_ROADMAP.md)
