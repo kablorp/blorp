@@ -240,8 +240,12 @@ private record CoreTypeNameRewrite {
 }
 
 
+-- Keyed by source name: every type-bearing node asks this table, so a linear
+-- scan over the module's declarations costs one comparison per declaration per
+-- name. The list it is built from is in declaration order and the first entry
+-- for a name wins, which the build below preserves.
 private record CoreTypeRewriteContext {
-	rewrites: List[CoreTypeNameRewrite]
+	rewrites: Dict[String, String]
 }
 
 
@@ -2194,6 +2198,25 @@ private pure func collect_local_type_rewrites(
 	)
 
 
+-- Declaration order decides ties, so keep the first entry for a name and drop
+-- any later one, exactly as the scan this replaces did when it stopped at its
+-- first match.
+private pure func type_rewrite_index(rewrites: List[CoreTypeNameRewrite]) -> Dict[String, String]:
+	var index: Dict[String, String] = {}
+
+	for rewrite in rewrites:
+		if (
+			index
+				.get(rewrite.source_name)
+				.is_some()
+		):
+			void
+		else:
+			index = index.set(rewrite.source_name, rewrite.target_name)
+
+	index
+
+
 -- `None` means the name is already spelled the way Core wants it, which is the
 -- overwhelming majority: the canonical form only differs for a `module::Type`
 -- identity, and the rewrite table only covers types this module renames.
@@ -2206,14 +2229,7 @@ private pure func rewritten_type_name(
 	if canonical_name != name:
 		Some(canonical_name)
 	else:
-		var target_name: Option[String] = None
-
-		for rewrite in context.rewrites:
-			if rewrite.source_name == name:
-				target_name = Some(rewrite.target_name)
-				break
-
-		target_name
+		context.rewrites.get(name)
 
 
 private pure func rewrite_core_type(
@@ -3349,7 +3365,12 @@ pure func prefix_module_names_with_aliases(
 		materialized_program,
 	)
 	type_context: CoreTypeRewriteContext = {
-		rewrites = collect_local_type_rewrites(module_prefix, materialized_program),
+		rewrites = type_rewrite_index(
+			collect_local_type_rewrites(
+				module_prefix,
+				materialized_program,
+			),
+		),
 	}
 	named_decls: List[CoreDecl] = materialized_program.decls.map(
 		func(
