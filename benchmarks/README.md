@@ -1200,7 +1200,8 @@ epoch.
 For compile-execution memory profiles, set
 `BLORP_COMPILER_MEMORY_PROFILE=1`. The compiler writes schema-1
 `BLORP_COMPILER_MEMORY_CHECKPOINT` rows to stderr at
-`typed_frontend_start`, then at the completed compiler phase checkpoints:
+`source_discovery_start`, then at the completed compiler phase checkpoints:
+`source_discovery_complete`, `typed_frontend_start`,
 `typed_frontend_complete`, `core_lowering_input_ready`,
 `core_lowering_complete`, `early_core_complete`,
 `runtime_projection_complete`, `late_core_complete`,
@@ -1215,11 +1216,14 @@ monotonic timestamp, managed allocation/release/current-object counters,
 allocator bytes, current RSS, and process peak RSS. Unsupported platform
 measurements are `-1`; do not infer missing values. Compare checkpoint deltas
 and global peak RSS together because allocator retention can keep RSS above the
-managed live-object count. Command planning and source loading happen before
-`typed_frontend_start`, and final artifact file publication happens after
-`artifact_construction_complete`, so these rows intentionally measure execution
-of an already constructed compile plan rather than process startup or the
-entire CLI command.
+managed live-object count. Source discovery — reading, lexing, and parsing the root module and
+everything it imports, plus module-graph construction — runs between
+`source_discovery_start` and `source_discovery_complete`, before the compile
+plan exists. Command planning happens before `source_discovery_start`, and
+final artifact file publication happens after `artifact_construction_complete`,
+so these rows intentionally measure source discovery and execution of an
+already constructed compile plan rather than process startup or the entire CLI
+command.
 
 `core_lowering_input_ready` is the ownership boundary between the rich
 frontend result and the opaque input accepted by Core. It is emitted after
