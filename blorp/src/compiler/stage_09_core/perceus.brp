@@ -9397,70 +9397,6 @@ private pure func install_mutable_assignment_in_match(
 			None
 
 
-private pure func install_mutable_assignment_in_mixed_consumption_branches(
-	env: PerceusEnv,
-	target: CoreVar,
-	target_type: CoreType,
-	cond: CoreExpr,
-	then_expr: CoreExpr,
-	else_expr: CoreExpr,
-	typ: CoreType,
-	loc: CoreSourceLoc,
-	rhs_loc: CoreSourceLoc,
-	temp_index: Int,
-) -> Option[MutableAssignmentRewrite]:
-	-- A consuming predicate changes which owner reaches both branches, so it
-	-- has no branch-local installation. Answering that from the condition alone
-	-- keeps the branch summaries off the path that cannot use them.
-	if summarize_linear_ownership_uses(env, target.name, cond).consumed_refs != 0:
-		None
-	else:
-		then_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
-			env,
-			target.name,
-			then_expr,
-		)
-		else_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
-			env,
-			target.name,
-			else_expr,
-		)
-
-		if then_uses.consumed_refs == else_uses.consumed_refs:
-			None
-		else:
-			-- Install branch results locally so a consuming path transfers the old
-			-- slot while a borrowing path still releases it. A single summary keeps
-			-- only the maximum branch consumption and cannot make that distinction.
-			then_result: MutableAssignmentRewrite = rewrite_direct_mutable_assignment_with_uses(
-				env,
-				target,
-				target_type,
-				then_expr,
-				then_uses,
-				typ,
-				loc,
-				temp_index,
-				False,
-			)
-			else_result: MutableAssignmentRewrite = rewrite_direct_mutable_assignment_with_uses(
-				env,
-				target,
-				target_type,
-				else_expr,
-				else_uses,
-				typ,
-				loc,
-				then_result.next_temp,
-				False,
-			)
-
-			Some({
-				expr = IfExpr(cond, then_result.expr, else_result.expr, typ, rhs_loc),
-				next_temp = else_result.next_temp,
-			})
-
-
 private pure func rewrite_non_match_direct_mutable_assignment_with_uses(
 	env: PerceusEnv,
 	target: CoreVar,
@@ -9472,35 +9408,71 @@ private pure func rewrite_non_match_direct_mutable_assignment_with_uses(
 	temp_index: Int,
 	skip_old_release: Bool,
 ) -> MutableAssignmentRewrite:
-	branch_local: Option[MutableAssignmentRewrite] = match rhs:
+	match rhs:
 		IfExpr(cond, then_expr, else_expr, rhs_type, rhs_loc):
-			if skip_old_release:
-				-- A skipped release has no old owner to split between the branches,
-				-- so the branch summaries would never be read.
-				None
-			else:
-				install_mutable_assignment_in_mixed_consumption_branches(
+			cond_uses: OwnershipUseSummary = summarize_linear_ownership_uses(env, target.name, cond)
+			then_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
+				env,
+				target.name,
+				then_expr,
+			)
+			else_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
+				env,
+				target.name,
+				else_expr,
+			)
+
+			if (
+				not skip_old_release
+				and cond_uses.consumed_refs == 0
+				and then_uses.consumed_refs != else_uses.consumed_refs
+			):
+				-- Install branch results locally so a consuming path transfers the old
+				-- slot while a borrowing path still releases it. A single summary keeps
+				-- only the maximum branch consumption and cannot make that distinction.
+				then_result: MutableAssignmentRewrite = rewrite_direct_mutable_assignment_with_uses(
 					env,
 					target,
 					target_type,
-					cond,
 					then_expr,
-					else_expr,
+					then_uses,
 					typ,
 					loc,
-					rhs_loc,
 					temp_index,
+					False,
+				)
+				else_result: MutableAssignmentRewrite = rewrite_direct_mutable_assignment_with_uses(
+					env,
+					target,
+					target_type,
+					else_expr,
+					else_uses,
+					typ,
+					loc,
+					then_result.next_temp,
+					False,
+				)
+				{
+					expr = IfExpr(cond, then_result.expr, else_result.expr, typ, rhs_loc),
+					next_temp = else_result.next_temp
+				}
+			else:
+				-- A consuming predicate changes which owner reaches both branches.
+				-- Match-like RHS forms also need binding-aware branch installation;
+				-- keep both on the established stabilization path until covered by a
+				-- concrete mixed-consumption regression.
+				rewrite_uniform_mutable_assignment_with_uses(
+					env,
+					target,
+					target_type,
+					rhs,
+					uses,
+					typ,
+					loc,
+					temp_index,
+					skip_old_release,
 				)
 		_:
-			None
-
-	match branch_local:
-		Some(result):
-			result
-		None:
-			-- Match-like RHS forms also need binding-aware branch installation;
-			-- keep them on the established stabilization path until covered by a
-			-- concrete mixed-consumption regression.
 			rewrite_uniform_mutable_assignment_with_uses(
 				env,
 				target,
