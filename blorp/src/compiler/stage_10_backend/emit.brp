@@ -5668,7 +5668,14 @@ private pure func emit_call_args_body(
 
 	for arg in args:
 		if not failed:
-			match emit_function_body(arg, temp_index, emission_context):
+			-- A void argument is discarded as a statement at this depth; every other
+			-- argument is materialized inside a block one level in.
+			arg_context: FunctionEmissionContext = if TypeLayout.is_void_type(core_expr_type(arg)):
+				emission_context
+			else:
+				nested_emission_context(emission_context)
+
+			match emit_function_body(arg, temp_index, arg_context):
 				Some(arg_body):
 					if arg_body.returns:
 						failed = True
@@ -5809,7 +5816,14 @@ private pure func materialized_call_arg_value(
 			returns = False
 		}
 	else:
-		scoped_body_value(indent, "call_arg", core_expr_type(arg), body)
+		-- The cleanup decision above depends on the emitted body, so this caller
+		-- cannot pick the argument depth before emitting; shift it here instead.
+		scoped_body_value(
+			indent,
+			"call_arg",
+			core_expr_type(arg),
+			{ body | statements = prefixed_statements(BASE_INDENT, body.statements) },
+		)
 
 
 private pure func emit_direct_runtime_call_args_body(
@@ -6268,6 +6282,8 @@ private pure func emit_foreign_call_body(
 		})
 
 
+-- `body` is rendered by its caller at `indent + "  "`, the depth of the block
+-- this opens.
 private pure func scoped_c_value(
 	indent: String,
 	prefix: String,
@@ -6279,9 +6295,7 @@ private pure func scoped_c_value(
 	else:
 		result_name: String = temp_name(prefix, body.next_temp)
 		{
-			statements = indent + c_type + " " + result_name + ";\n" + indent + "{\n" + indent_statements(
-				body.statements + indent + result_name + " = " + body.value + ";\n",
-			) + indent + "}\n",
+			statements = indent + c_type + " " + result_name + ";\n" + indent + "{\n" + body.statements + indent + "  " + result_name + " = " + body.value + ";\n" + indent + "}\n",
 			value = result_name,
 			next_temp = body.next_temp + 1,
 			returns = False
@@ -6342,7 +6356,7 @@ private pure func emit_scoped_expr_value(
 	next_temp: Int,
 	emission_context: FunctionEmissionContext,
 ) -> Option[FunctionBodyC]:
-	body ?= emit_function_body(expr, next_temp, emission_context)
+	body ?= emit_function_body(expr, next_temp, nested_emission_context(emission_context))
 
 	if body.returns:
 		None
@@ -7852,7 +7866,11 @@ private pure func render_list_construct_append_body(
 	next_temp: Int,
 	emission_context: FunctionEmissionContext,
 ) -> Option[FunctionBodyC]:
-	value_body ?= emit_boxed_pointer_body(value, next_temp, emission_context)
+	value_body ?= emit_boxed_pointer_body(
+		value,
+		next_temp,
+		nested_emission_context(emission_context),
+	)
 	scoped_value: FunctionBodyC = scoped_c_value(
 		emission_context.indent,
 		"list_elem",
@@ -8943,21 +8961,22 @@ private pure func emit_string_byte_write_body(
 	next_temp: Int,
 	emission_context: FunctionEmissionContext,
 ) -> Option[FunctionBodyC]:
-	target_body ?= emit_function_body(write.target, next_temp, emission_context)
+	inner_context: FunctionEmissionContext = nested_emission_context(emission_context)
+	target_body ?= emit_function_body(write.target, next_temp, inner_context)
 	prepared_target: FunctionBodyC = materialized_body_value(
 		emission_context.indent,
 		"string_write_target",
 		core_expr_type(write.target),
 		target_body,
 	)
-	index_body ?= emit_function_body(write.index, prepared_target.next_temp, emission_context)
+	index_body ?= emit_function_body(write.index, prepared_target.next_temp, inner_context)
 	prepared_index: FunctionBodyC = materialized_body_value(
 		emission_context.indent,
 		"string_write_index",
 		core_expr_type(write.index),
 		index_body,
 	)
-	byte_body ?= emit_function_body(write.byte, prepared_index.next_temp, emission_context)
+	byte_body ?= emit_function_body(write.byte, prepared_index.next_temp, inner_context)
 	prepared_byte: FunctionBodyC = materialized_body_value(
 		emission_context.indent,
 		"string_write_byte",
@@ -9082,14 +9101,15 @@ private pure func emit_tensor_raw_write_body(
 	if not tensor_raw_scalar_supported(write.kind):
 		None
 	else:
-		index_body ?= emit_function_body(write.index, next_temp, emission_context)
+		inner_context: FunctionEmissionContext = nested_emission_context(emission_context)
+		index_body ?= emit_function_body(write.index, next_temp, inner_context)
 		prepared_index: FunctionBodyC = materialized_body_value(
 			emission_context.indent,
 			"tensor_raw_write_index",
 			core_expr_type(write.index),
 			index_body,
 		)
-		value_body ?= emit_function_body(write.value, prepared_index.next_temp, emission_context)
+		value_body ?= emit_function_body(write.value, prepared_index.next_temp, inner_context)
 		prepared_value: FunctionBodyC = materialized_body_value(
 			emission_context.indent,
 			"tensor_raw_write_value",
@@ -10334,7 +10354,11 @@ private pure func emit_record_construct_args_body(
 
 	for field in fields:
 		if not failed:
-			match emit_function_body(field.value, temp_index, emission_context):
+			match emit_function_body(
+				field.value,
+				temp_index,
+				nested_emission_context(emission_context),
+			):
 				Some(field_body):
 					if field_body.returns:
 						failed = True
@@ -10491,7 +10515,11 @@ private pure func emit_record_cow_update_body(
 				if not failed:
 					match field.replacement:
 						Some(replacement):
-							match emit_function_body(replacement, temp_index, emission_context):
+							match emit_function_body(
+								replacement,
+								temp_index,
+								nested_emission_context(emission_context),
+							):
 								Some(replacement_body):
 									if replacement_body.returns:
 										failed = True
@@ -10649,7 +10677,11 @@ private pure func emit_union_payload_arg_body(
 ) -> Option[FunctionBodyC]:
 	match payload_storage:
 		TypedUnionPayloadStorage:
-			body ?= emit_function_body(arg.value, next_temp, emission_context)
+			body ?= emit_function_body(
+				arg.value,
+				next_temp,
+				nested_emission_context(emission_context),
+			)
 
 			if body.returns:
 				None
@@ -10663,7 +10695,11 @@ private pure func emit_union_payload_arg_body(
 					),
 				)
 		ErasedUnionPayloadStorage:
-			body ?= emit_boxed_pointer_body(arg, next_temp, emission_context)
+			body ?= emit_boxed_pointer_body(
+				arg,
+				next_temp,
+				nested_emission_context(emission_context),
+			)
 
 			if body.returns:
 				None
@@ -12098,7 +12134,7 @@ private pure func emit_closure_call_body(
 	next_temp: Int,
 	emission_context: FunctionEmissionContext,
 ) -> Option[FunctionBodyC]:
-	callee_body ?= emit_function_body(callee, next_temp, emission_context)
+	callee_body ?= emit_function_body(callee, next_temp, nested_emission_context(emission_context))
 	callee_value ?= required_body_value(callee_body)
 	prepared_callee: FunctionBodyC = materialized_body_value(
 		emission_context.indent,
