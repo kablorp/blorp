@@ -126,6 +126,17 @@ private record StdInlineTargets {
 }
 
 
+-- Allocation identity for the reuse rule below: a mapped child that is the
+-- same allocation as its input proves the input node can be handed back as is,
+-- so a program with no inlinable call stops being reallocated wholesale. Core
+-- is immutable value data, so sharing subtrees between input and output is
+-- safe. Bound straight to the runtime primitive for the same bootstrap reason
+-- as the matching block in traverse.brp; delete the blocks together and import
+-- `memory: same_object` instead.
+foreign:
+	private pure func same_core_expr(left: CoreExpr, right: CoreExpr) -> Bool = "blorp_same_object"
+
+
 private record StdInlineRename {
 	original: CoreVar,
 	replacement: CoreVar
@@ -154,7 +165,8 @@ private record StdInlineExprResult {
 
 private record StdInlineExprsResult {
 	next_id: Int,
-	exprs: List[CoreExpr]
+	exprs: List[CoreExpr],
+	changed: Bool
 }
 
 
@@ -481,16 +493,28 @@ private pure func rewrite_exprs(
 	exprs: List[CoreExpr],
 ) -> StdInlineExprsResult:
 	var current_id: Int = next_id
-	var rewritten: List[CoreExpr] = []
+	var rewritten: List[CoreExpr] = exprs
+	var changed: Bool = False
+	var index: Int = 0
 
 	for expr in exprs:
 		result: StdInlineExprResult = rewrite_expr(targets, current_id, expr)
 		current_id = result.next_id
-		rewritten = rewritten.append(result.expr)
+
+		if changed:
+			rewritten = rewritten.append(result.expr)
+		else if not same_core_expr(result.expr, expr):
+			rewritten = exprs
+				.take(index)
+				.append(result.expr)
+			changed = True
+
+		index += 1
 
 	{
 		next_id = current_id,
-		exprs = rewritten
+		exprs = rewritten,
+		changed = changed
 	}
 
 
@@ -525,16 +549,28 @@ private pure func clone_exprs(
 	exprs: List[CoreExpr],
 ) -> StdInlineExprsResult:
 	var current_id: Int = next_id
-	var cloned: List[CoreExpr] = []
+	var cloned: List[CoreExpr] = exprs
+	var changed: Bool = False
+	var index: Int = 0
 
 	for expr in exprs:
 		result: StdInlineExprResult = clone_expr(current_id, renames, expr)
 		current_id = result.next_id
-		cloned = cloned.append(result.expr)
+
+		if changed:
+			cloned = cloned.append(result.expr)
+		else if not same_core_expr(result.expr, expr):
+			cloned = exprs
+				.take(index)
+				.append(result.expr)
+			changed = True
+
+		index += 1
 
 	{
 		next_id = current_id,
-		exprs = cloned
+		exprs = cloned,
+		changed = changed
 	}
 
 
@@ -2277,17 +2313,23 @@ private pure func rewrite_expr(
 				[first, second],
 			)
 
-			match children.exprs:
-				[rewritten_first, rewritten_second]:
-					{
-						next_id = children.next_id,
-						expr = SeqExpr(rewritten_first, rewritten_second)
-					}
-				_:
-					{
-						next_id = children.next_id,
-						expr = expr
-					}
+			if not children.changed:
+				{
+					next_id = children.next_id,
+					expr = expr
+				}
+			else:
+				match children.exprs:
+					[rewritten_first, rewritten_second]:
+						{
+							next_id = children.next_id,
+							expr = SeqExpr(rewritten_first, rewritten_second)
+						}
+					_:
+						{
+							next_id = children.next_id,
+							expr = expr
+						}
 		IfExpr(cond, then_expr, else_expr, typ, loc):
 			children: StdInlineExprsResult = rewrite_exprs(
 				targets,
@@ -2295,17 +2337,23 @@ private pure func rewrite_expr(
 				[cond, then_expr, else_expr],
 			)
 
-			match children.exprs:
-				[rewritten_cond, rewritten_then, rewritten_else]:
-					{
-						next_id = children.next_id,
-						expr = IfExpr(rewritten_cond, rewritten_then, rewritten_else, typ, loc)
-					}
-				_:
-					{
-						next_id = children.next_id,
-						expr = expr
-					}
+			if not children.changed:
+				{
+					next_id = children.next_id,
+					expr = expr
+				}
+			else:
+				match children.exprs:
+					[rewritten_cond, rewritten_then, rewritten_else]:
+						{
+							next_id = children.next_id,
+							expr = IfExpr(rewritten_cond, rewritten_then, rewritten_else, typ, loc)
+						}
+					_:
+						{
+							next_id = children.next_id,
+							expr = expr
+						}
 		LetExpr(variable, is_mutable, typ, rhs, body):
 			children: StdInlineExprsResult = rewrite_exprs(
 				targets,
@@ -2313,17 +2361,23 @@ private pure func rewrite_expr(
 				[rhs, body],
 			)
 
-			match children.exprs:
-				[rewritten_rhs, rewritten_body]:
-					{
-						next_id = children.next_id,
-						expr = LetExpr(variable, is_mutable, typ, rewritten_rhs, rewritten_body)
-					}
-				_:
-					{
-						next_id = children.next_id,
-						expr = expr
-					}
+			if not children.changed:
+				{
+					next_id = children.next_id,
+					expr = expr
+				}
+			else:
+				match children.exprs:
+					[rewritten_rhs, rewritten_body]:
+						{
+							next_id = children.next_id,
+							expr = LetExpr(variable, is_mutable, typ, rewritten_rhs, rewritten_body)
+						}
+					_:
+						{
+							next_id = children.next_id,
+							expr = expr
+						}
 		BorrowLetExpr(variable, typ, rhs, body):
 			children: StdInlineExprsResult = rewrite_exprs(
 				targets,
@@ -2331,17 +2385,23 @@ private pure func rewrite_expr(
 				[rhs, body],
 			)
 
-			match children.exprs:
-				[rewritten_rhs, rewritten_body]:
-					{
-						next_id = children.next_id,
-						expr = BorrowLetExpr(variable, typ, rewritten_rhs, rewritten_body)
-					}
-				_:
-					{
-						next_id = children.next_id,
-						expr = expr
-					}
+			if not children.changed:
+				{
+					next_id = children.next_id,
+					expr = expr
+				}
+			else:
+				match children.exprs:
+					[rewritten_rhs, rewritten_body]:
+						{
+							next_id = children.next_id,
+							expr = BorrowLetExpr(variable, typ, rewritten_rhs, rewritten_body)
+						}
+					_:
+						{
+							next_id = children.next_id,
+							expr = expr
+						}
 		ResourceScopeExpr(scope, typ, loc):
 			children: StdInlineExprsResult = rewrite_exprs(
 				targets,
@@ -2349,37 +2409,57 @@ private pure func rewrite_expr(
 				[scope.acquire, scope.body, scope.cleanup],
 			)
 
-			match children.exprs:
-				[acquire, body, cleanup]:
-					{
-						next_id = children.next_id,
-						expr = ResourceScopeExpr(
-							{ scope |
-								acquire = acquire,
-								body = body,
-								cleanup = cleanup
-							},
-							typ,
-							loc,
-						)
-					}
-				_:
-					{
-						next_id = children.next_id,
-						expr = expr
-					}
+			if not children.changed:
+				{
+					next_id = children.next_id,
+					expr = expr
+				}
+			else:
+				match children.exprs:
+					[acquire, body, cleanup]:
+						{
+							next_id = children.next_id,
+							expr = ResourceScopeExpr(
+								{ scope |
+									acquire = acquire,
+									body = body,
+									cleanup = cleanup
+								},
+								typ,
+								loc,
+							)
+						}
+					_:
+						{
+							next_id = children.next_id,
+							expr = expr
+						}
 		TupleExpr(items, typ, loc):
 			children: StdInlineExprsResult = rewrite_exprs(targets, next_id, items)
-			{
-				next_id = children.next_id,
-				expr = TupleExpr(children.exprs, typ, loc)
-			}
+
+			if not children.changed:
+				{
+					next_id = children.next_id,
+					expr = expr
+				}
+			else:
+				{
+					next_id = children.next_id,
+					expr = TupleExpr(children.exprs, typ, loc)
+				}
 		VectorExpr(items, typ, loc):
 			children: StdInlineExprsResult = rewrite_exprs(targets, next_id, items)
-			{
-				next_id = children.next_id,
-				expr = VectorExpr(children.exprs, typ, loc)
-			}
+
+			if not children.changed:
+				{
+					next_id = children.next_id,
+					expr = expr
+				}
+			else:
+				{
+					next_id = children.next_id,
+					expr = VectorExpr(children.exprs, typ, loc)
+				}
 		ListConstructExpr(construct, typ, loc):
 			elements: StdInlineBoxedValuesResult = rewrite_boxed_values(
 				targets,
@@ -2473,17 +2553,23 @@ private pure func rewrite_expr(
 				[cond, body],
 			)
 
-			match children.exprs:
-				[rewritten_cond, rewritten_body]:
-					{
-						next_id = children.next_id,
-						expr = WhileExpr(rewritten_cond, rewritten_body, typ, loc)
-					}
-				_:
-					{
-						next_id = children.next_id,
-						expr = expr
-					}
+			if not children.changed:
+				{
+					next_id = children.next_id,
+					expr = expr
+				}
+			else:
+				match children.exprs:
+					[rewritten_cond, rewritten_body]:
+						{
+							next_id = children.next_id,
+							expr = WhileExpr(rewritten_cond, rewritten_body, typ, loc)
+						}
+					_:
+						{
+							next_id = children.next_id,
+							expr = expr
+						}
 		RangeExpr(start, end_value, typ, loc):
 			children: StdInlineExprsResult = rewrite_exprs(
 				targets,
@@ -2491,17 +2577,23 @@ private pure func rewrite_expr(
 				[start, end_value],
 			)
 
-			match children.exprs:
-				[rewritten_start, rewritten_end]:
-					{
-						next_id = children.next_id,
-						expr = RangeExpr(rewritten_start, rewritten_end, typ, loc)
-					}
-				_:
-					{
-						next_id = children.next_id,
-						expr = expr
-					}
+			if not children.changed:
+				{
+					next_id = children.next_id,
+					expr = expr
+				}
+			else:
+				match children.exprs:
+					[rewritten_start, rewritten_end]:
+						{
+							next_id = children.next_id,
+							expr = RangeExpr(rewritten_start, rewritten_end, typ, loc)
+						}
+					_:
+						{
+							next_id = children.next_id,
+							expr = expr
+						}
 		ForRangeExpr(binder, start, end_value, body, typ, loc):
 			children: StdInlineExprsResult = rewrite_exprs(
 				targets,
@@ -2509,24 +2601,30 @@ private pure func rewrite_expr(
 				[start, end_value, body],
 			)
 
-			match children.exprs:
-				[rewritten_start, rewritten_end, rewritten_body]:
-					{
-						next_id = children.next_id,
-						expr = ForRangeExpr(
-							binder,
-							rewritten_start,
-							rewritten_end,
-							rewritten_body,
-							typ,
-							loc,
-						)
-					}
-				_:
-					{
-						next_id = children.next_id,
-						expr = expr
-					}
+			if not children.changed:
+				{
+					next_id = children.next_id,
+					expr = expr
+				}
+			else:
+				match children.exprs:
+					[rewritten_start, rewritten_end, rewritten_body]:
+						{
+							next_id = children.next_id,
+							expr = ForRangeExpr(
+								binder,
+								rewritten_start,
+								rewritten_end,
+								rewritten_body,
+								typ,
+								loc,
+							)
+						}
+					_:
+						{
+							next_id = children.next_id,
+							expr = expr
+						}
 		ForChannelExpr(loop, _, _):
 			rewrite_iterable_loop(targets, next_id, expr, loop.iterable, loop.body)
 		ForListExpr(loop, _, _):
@@ -2602,22 +2700,28 @@ private pure func rewrite_expr(
 				[binding.source, body],
 			)
 
-			match children.exprs:
-				[source, rewritten_body]:
-					{
-						next_id = children.next_id,
-						expr = TensorRawViewLetExpr(
-							{ binding | source = source },
-							rewritten_body,
-							typ,
-							loc,
-						)
-					}
-				_:
-					{
-						next_id = children.next_id,
-						expr = expr
-					}
+			if not children.changed:
+				{
+					next_id = children.next_id,
+					expr = expr
+				}
+			else:
+				match children.exprs:
+					[source, rewritten_body]:
+						{
+							next_id = children.next_id,
+							expr = TensorRawViewLetExpr(
+								{ binding | source = source },
+								rewritten_body,
+								typ,
+								loc,
+							)
+						}
+					_:
+						{
+							next_id = children.next_id,
+							expr = expr
+						}
 		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
 			rewritten_scrutinee: StdInlineExprResult = rewrite_expr(targets, next_id, scrutinee)
 			rewritten_cases: StdInlineConstructorCasesResult = rewrite_constructor_cases(
@@ -2660,17 +2764,23 @@ private pure func rewrite_expr(
 				[callee].concat(args),
 			)
 
-			match children.exprs:
-				[]:
-					{
-						next_id = children.next_id,
-						expr = expr
-					}
-				[rewritten_callee, ...rewritten_args]:
-					{
-						next_id = children.next_id,
-						expr = CallExpr(kind, rewritten_callee, rewritten_args, typ, loc)
-					}
+			if not children.changed:
+				{
+					next_id = children.next_id,
+					expr = expr
+				}
+			else:
+				match children.exprs:
+					[]:
+						{
+							next_id = children.next_id,
+							expr = expr
+						}
+					[rewritten_callee, ...rewritten_args]:
+						{
+							next_id = children.next_id,
+							expr = CallExpr(kind, rewritten_callee, rewritten_args, typ, loc)
+						}
 		_:
 			match immediate_core_expr_children(expr):
 				[child]:
