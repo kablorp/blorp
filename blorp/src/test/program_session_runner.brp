@@ -46,6 +46,7 @@ import:
 		),
 		run_session_command,
 		run_session_command_until,
+	system: now_microseconds
 	units: DataSize, Duration
 
 
@@ -141,9 +142,15 @@ func run_prepared_host_c_with_session(
 			Err(ProgramHostCompilationFailed(HostCProcessFailed(error)))
 
 
+--- `record_phase` receives `("host_c", duration_ms)` around native compilation
+--- and `("execution", duration_ms)` around running the compiled artifact, so
+--- callers that need a per-stage breakdown (`blorp test --timings`) can record
+--- it without another pass over this boundary. Callers that do not need
+--- timing pass a no-op recorder.
 private func run_captured_build_artifact_with_session(
 	request: ProgramRunRequest,
 	interrupt_requested: () -> Option[Int],
+	record_phase: (String, Int) -> Void,
 ) -> Result[ProgramRunResult, ProgramRunError]:
 	with compilation_directory ?= temporary_directory(
 		request.temporary_root,
@@ -158,7 +165,10 @@ private func run_captured_build_artifact_with_session(
 		).map_err(
 			func(error): ProgramHostPreparationFailed(error),
 		)
-		compiled_path ?= run_prepared_host_c_with_session(prepared, interrupt_requested)
+		host_c_started_at: Int = now_microseconds()
+		compiled_path_result = run_prepared_host_c_with_session(prepared, interrupt_requested)
+		record_phase("host_c", (now_microseconds() - host_c_started_at) / 1000)
+		compiled_path ?= compiled_path_result
 		program = prepare_program_command(
 			compiled_path,
 			request.user_arguments,
@@ -168,7 +178,12 @@ private func run_captured_build_artifact_with_session(
 			request.mode,
 		)
 
-		match run_session_command_until(program, interrupt_requested):
+		execution_started_at: Int = now_microseconds()
+
+		execution: Result[ProgramRunResult, ProgramRunError] = match run_session_command_until(
+			program,
+			interrupt_requested,
+		):
 			SessionCommandCompleted(result):
 				Ok({
 					exit = result.exit,
@@ -181,14 +196,18 @@ private func run_captured_build_artifact_with_session(
 			SessionCommandFailed(error):
 				Err(ProgramProcessFailed(error))
 
+		record_phase("execution", (now_microseconds() - execution_started_at) / 1000)
+		execution
+
 
 func run_build_artifact_with_session(
 	request: ProgramRunRequest,
 	interrupt_requested: () -> Option[Int],
+	record_phase: (String, Int) -> Void,
 ) -> Result[ProgramRunResult, ProgramRunError]:
 	match request.mode:
 		CapturedProgramRun(_, _):
-			run_captured_build_artifact_with_session(request, interrupt_requested)
+			run_captured_build_artifact_with_session(request, interrupt_requested, record_phase)
 		InteractiveProgramRun:
 			Err(
 				ProgramProcessFailed(

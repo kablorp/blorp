@@ -429,8 +429,19 @@ Use `scripts/test --timings` when compilation of test artifacts is the concern:
 scripts/test --timings --log-dir logs runtime
 ```
 
-The timing record separates frontend, typecheck, Core, host-C, and execution
-time for generated test artifacts.
+`--timings` exports `BLORP_TEST_TIMINGS=1` for gates that run `bin/blorp
+test` (it is deliberately kept out of the `cli` gate's environment so its
+disabled-by-default output checks stay meaningful). Under that variable,
+`blorp test` writes one `BLORP_TEST_TIMING phase=<name> group=<kind>
+suites=<n> sources=<n> duration_ms=<n>` line per phase to stderr for every
+generated test artifact (a suite batch, a doctest batch, or a program).
+`group` is the artifact kind (`suite`, `doctest`, or `program`); `suites` and
+`sources` are that artifact's counts. The phases are `frontend_graph`
+(building this artifact's retained module graph and harness), `pipeline`
+(compiling Blorp sources to C), `host_c` (native compilation), and
+`execution` (running the compiled artifact). `scripts/test` sums these across
+every artifact and gate and prints a "Generated TestSuite phase totals:"
+block after the run.
 
 ## Function Profiling And Flame Graphs
 
