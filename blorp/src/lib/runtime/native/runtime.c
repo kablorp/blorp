@@ -1881,6 +1881,8 @@ void blorp_typecheck_phase_metric_record_c(
 
 typedef struct {
     char* fallback;
+    char* fallback_callable;
+    long fallback_definition_id;
     long dependency_modules;
     long selective_modules;
     long eager_modules;
@@ -1894,6 +1896,7 @@ static size_t __blorp_typecheck_ctfe_metric_capacity = 0;
 static void __blorp_typecheck_ctfe_metrics_release(void) {
     for (size_t index = 0; index < __blorp_typecheck_ctfe_metric_count; index++) {
         free(__blorp_typecheck_ctfe_metrics[index].fallback);
+        free(__blorp_typecheck_ctfe_metrics[index].fallback_callable);
     }
     free(__blorp_typecheck_ctfe_metrics);
     __blorp_typecheck_ctfe_metrics = NULL;
@@ -1903,6 +1906,8 @@ static void __blorp_typecheck_ctfe_metrics_release(void) {
 
 void blorp_typecheck_ctfe_metric_record_c(
     const char* fallback,
+    const char* fallback_callable,
+    long fallback_definition_id,
     long dependency_modules,
     long selective_modules,
     long eager_modules,
@@ -1924,6 +1929,8 @@ void blorp_typecheck_ctfe_metric_record_c(
     __blorp_TypecheckCtfeMetric* row =
         &__blorp_typecheck_ctfe_metrics[__blorp_typecheck_ctfe_metric_count];
     row->fallback = __blorp_typecheck_body_metric_text(fallback);
+    row->fallback_callable = __blorp_typecheck_body_metric_text(fallback_callable);
+    row->fallback_definition_id = fallback_definition_id;
     row->dependency_modules = dependency_modules;
     row->selective_modules = selective_modules;
     row->eager_modules = eager_modules;
@@ -1942,9 +1949,12 @@ void blorp_typecheck_body_metrics_report_c(void) {
         const __blorp_TypecheckCtfeMetric* row = &__blorp_typecheck_ctfe_metrics[index];
         fprintf(
             stderr,
-            "BLORP_TYPECHECK_CTFE fallback=%s dependency_modules=%ld "
+            "BLORP_TYPECHECK_CTFE fallback=%s fallback_definition_id=%ld "
+            "fallback_callable=%s dependency_modules=%ld "
             "selective_modules=%ld eager_modules=%ld worklist_checked_bodies=%ld\n",
             row->fallback ? row->fallback : "",
+            row->fallback_definition_id,
+            row->fallback_callable ? row->fallback_callable : "",
             row->dependency_modules,
             row->selective_modules,
             row->eager_modules,

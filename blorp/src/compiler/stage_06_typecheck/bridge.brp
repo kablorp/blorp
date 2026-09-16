@@ -195,7 +195,9 @@ import:
 		definition_index_next_def_id,
 		definition_index_seed_next_def_id,
 		definition_index_source_definition_id_count,
+		definition_table_definition_id,
 		definition_table_module_table,
+		definition_table_row,
 		definition_table_selective_definition_name,
 	graph/indexed_graph:
 		IndexedGraph,
@@ -351,6 +353,8 @@ foreign:
 	func typecheck_body_metrics_report() -> Void = "blorp_typecheck_body_metrics_report_c"
 	pure func typecheck_ctfe_metric_record(
 		fallback: String,
+		fallback_callable: String,
+		fallback_definition_id: Int,
 		dependency_modules: Int,
 		selective_modules: Int,
 		eager_modules: Int,
@@ -2679,6 +2683,8 @@ private struct CtfeAttemptedBodyChecks {
 -- worklist had checked when it decided.
 private pure func record_ctfe_preparation_decision(
 	fallback: String,
+	fallback_callable: String,
+	fallback_definition_id: Int,
 	dependency_modules: Int,
 	selective_modules: Int,
 	eager_modules: Int,
@@ -2687,6 +2693,8 @@ private pure func record_ctfe_preparation_decision(
 	if typecheck_metrics_are_enabled():
 		typecheck_ctfe_metric_record(
 			fallback,
+			fallback_callable,
+			fallback_definition_id,
 			dependency_modules,
 			selective_modules,
 			eager_modules,
@@ -2694,6 +2702,42 @@ private pure func record_ctfe_preparation_decision(
 		)
 	else:
 		void
+
+
+-- The worklist fallbacks that name a definition say which one; the others do
+-- not, and report -1.
+private pure func ctfe_worklist_fallback_definition_id(fallback: CtfeBodyWorklistFallback) -> Int:
+	match fallback:
+		CtfeMissingBodyRegistry(definition_id):
+			definition_id
+		CtfeRejectedBody(definition_id):
+			definition_id
+		CtfeDependencyFallback(_):
+			-1
+		CtfeQueueInvariantViolation(_):
+			-1
+
+
+private pure func ctfe_fallback_callable_description(
+	target_scope: PreparedModuleScope,
+	runtime_definition_id: Int,
+) -> String:
+	if runtime_definition_id < 0:
+		""
+	else:
+		table = definition_index_definition_table(
+			prepared_module_scope_definition_index(target_scope),
+		)
+
+		match definition_table_definition_id(table, runtime_definition_id):
+			None:
+				"unknown"
+			Some(id):
+				match definition_table_row(table, id):
+					None:
+						"unknown"
+					Some(row):
+						row.span.path + "::" + row.name
 
 
 private pure func ctfe_eager_fallback_name(fallback: CtfeEagerFallbackKind) -> String:
@@ -2794,6 +2838,15 @@ private pure func prepare_selective_ctfe_dependencies_for_roots(
 ) -> SelectiveCtfeDependencyPreparation:
 	match ctfe_body_module_registries(target_scope, dependencies, allow_debug_only_calls, graph):
 		None:
+			record_ctfe_preparation_decision(
+				"preparation_failure",
+				"",
+				-1,
+				dependencies.length(),
+				0,
+				dependencies.length(),
+				0,
+			)
 			SelectiveCtfeDependenciesRequireEager(CtfePreparationFailureFallback, 0, 0)
 		Some(registries):
 			target_module_id = prepared_module_scope_id(target_scope)
@@ -2807,6 +2860,16 @@ private pure func prepare_selective_ctfe_dependencies_for_roots(
 						fallback,
 						metrics.checked_bodies,
 					)
+					fallback_definition_id = ctfe_worklist_fallback_definition_id(fallback)
+					record_ctfe_preparation_decision(
+						ctfe_eager_fallback_name(ctfe_eager_fallback_for_worklist(fallback)),
+						ctfe_fallback_callable_description(target_scope, fallback_definition_id),
+						fallback_definition_id,
+						dependencies.length(),
+						0,
+						dependencies.length(),
+						metrics.checked_bodies,
+					)
 					SelectiveCtfeDependenciesRequireEager(
 						ctfe_eager_fallback_for_worklist(fallback),
 						attempted.dependency_checks,
@@ -2818,6 +2881,15 @@ private pure func prepare_selective_ctfe_dependencies_for_roots(
 
 					match ctfe_validated_body_tables(groups, registries):
 						None:
+							record_ctfe_preparation_decision(
+								"preparation_failure",
+								"",
+								-1,
+								dependencies.length(),
+								0,
+								dependencies.length(),
+								metrics.checked_bodies,
+							)
 							SelectiveCtfeDependenciesRequireEager(
 								CtfePreparationFailureFallback,
 								metrics.checked_bodies - target_checks,
@@ -2900,6 +2972,15 @@ private pure func prepare_selective_ctfe_dependencies_for_roots(
 									target_checks,
 								)
 							else:
+								record_ctfe_preparation_decision(
+									"none",
+									"",
+									-1,
+									dependencies.length(),
+									prepared.length(),
+									0,
+									metrics.checked_bodies,
+								)
 								SelectiveCtfeDependenciesReady(prepared, tables, target_checks)
 
 
@@ -2912,6 +2993,15 @@ private pure func prepare_selective_ctfe_dependencies(
 	root_definition_ids = accepted_ctfe_root_definition_ids(graph)
 
 	if root_definition_ids.is_empty():
+		record_ctfe_preparation_decision(
+			"no_callable_roots",
+			"",
+			-1,
+			dependencies.length(),
+			0,
+			dependencies.length(),
+			0,
+		)
 		SelectiveCtfeDependenciesRequireEager(CtfeNoCallableRootsFallback, 0, 0)
 	else:
 		prepare_selective_ctfe_dependencies_for_roots(
@@ -2962,13 +3052,6 @@ private pure func prepare_ctfe_dependencies(
 					graph,
 				):
 					SelectiveCtfeDependenciesReady(prepared, tables, target_checks):
-						record_ctfe_preparation_decision(
-							"none",
-							dependencies.length(),
-							prepared.length(),
-							0,
-							target_checks,
-						)
 						{
 							modules = prepared,
 							validated_body_tables = Some(tables),
@@ -2976,13 +3059,6 @@ private pure func prepare_ctfe_dependencies(
 							eager_fallback = CtfeNoEagerFallback
 						}
 					SelectiveCtfeDependenciesRequireEager(fallback, attempted_dependency_checks, attempted_target_checks):
-						record_ctfe_preparation_decision(
-							ctfe_eager_fallback_name(fallback),
-							dependencies.length(),
-							0,
-							dependencies.length(),
-							attempted_dependency_checks + attempted_target_checks,
-						)
 						reusable_artifact_ids = prepared_reusable_artifact_id_membership(
 							target_scope,
 							artifact_modules,

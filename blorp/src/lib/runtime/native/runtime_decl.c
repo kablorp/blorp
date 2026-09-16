@@ -2353,6 +2353,8 @@ void blorp_typecheck_phase_metric_record_c(
 );
 void blorp_typecheck_ctfe_metric_record_c(
     const char* fallback,
+    const char* fallback_callable,
+    long fallback_definition_id,
     long dependency_modules,
     long selective_modules,
     long eager_modules,
