@@ -4,7 +4,7 @@ import:
 		resolved_value_occurrences,
 		value_references,
 	../../../src/compiler/stage_09_core/ir:
-		CoreCallKind(UnknownCall, UserCall),
+		CoreCallKind(DeferredTraitCall, SelectedTraitCall, UnknownCall, UserCall),
 		CoreClosureCreate,
 		CoreDecl(
 			FunctionDecl,
@@ -156,6 +156,36 @@ pure func impl_method(
 -- everything their methods reference. Mirrors the shape early Core still
 -- carries when the prune runs before impls are projected away.
 pure func impl_decl(trait_name: String, methods: List[CoreFunction]) -> CoreDecl:
+	ImplDecl({
+		trait_name = trait_name,
+		for_type = int_type(),
+		type_params = [],
+		methods = methods,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func deferred_trait_call(trait_name: String, method_name: String) -> CoreExpr:
+	CallExpr(
+		DeferredTraitCall(trait_name, method_name),
+		VoidExpr(VoidType, SyntheticSourceLoc),
+		[],
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+
+pure func selected_trait_call(trait_name: String, method_name: String, def_id: Int) -> CoreExpr:
+	CallExpr(
+		SelectedTraitCall(trait_name, method_name, "", def_id),
+		VoidExpr(VoidType, SyntheticSourceLoc),
+		[],
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+
+pure func named_impl_decl(trait_name: String, methods: List[CoreFunction]) -> CoreDecl:
 	ImplDecl({
 		trait_name = trait_name,
 		for_type = int_type(),
@@ -872,6 +902,81 @@ func test_retains_trait_signatures() -> Bool:
 			False
 
 
+-- Trait dispatch that survives into DCE names its targets through the trait and
+-- method rather than a def_id. Rooting every matching implementation is the
+-- conservative answer; failing closed on it would keep the whole program.
+func test_deferred_trait_call_roots_every_implementation() -> Bool:
+	input_program = program([
+		function_decl(
+			"main",
+			1,
+			deferred_trait_call("Displayable", "render"),
+		),
+		named_impl_decl("Displayable", [impl_method(
+					"render",
+					2,
+					int_type(),
+					VoidExpr(ValueRecordType("FirstImplOnly"), SyntheticSourceLoc),
+				)]),
+		named_impl_decl("Displayable", [impl_method(
+					"render",
+					3,
+					int_type(),
+					VoidExpr(ValueRecordType("SecondImplOnly"), SyntheticSourceLoc),
+				)]),
+		value_record_decl("FirstImplOnly", int_type()),
+		value_record_decl("SecondImplOnly", int_type()),
+		value_record_decl("Dead", int_type()),
+		function_decl("dead_helper", 4, int_literal(4)),
+	])
+	pruned = prune_program(input_program)
+
+	(
+		value_record_names(pruned) == ["FirstImplOnly", "SecondImplOnly"]
+		and function_names(pruned) == ["main"]
+	)
+
+
+func test_selected_trait_call_roots_its_target() -> Bool:
+	input_program = program([
+		function_decl(
+			"main",
+			1,
+			selected_trait_call("Displayable", "render", 5),
+		),
+		function_decl_with_return_type(
+			"trait_target",
+			5,
+			ValueRecordType("TargetOnly"),
+			int_literal(0),
+		),
+		value_record_decl("TargetOnly", int_type()),
+		value_record_decl("Dead", int_type()),
+		function_decl("dead_helper", 4, int_literal(4)),
+	])
+	pruned = prune_program(input_program)
+
+	(
+		function_names(pruned) == ["main", "trait_target"]
+		and value_record_names(pruned) == ["TargetOnly"]
+	)
+
+
+-- A trait method with no implementation has no body anywhere in Core, so the
+-- call target is genuinely unknown and the whole program has to survive.
+func test_trait_call_without_candidates_fails_closed() -> Bool:
+	input_program = program([
+		function_decl(
+			"main",
+			1,
+			deferred_trait_call("Missing", "absent"),
+		),
+		function_decl("dead_helper", 4, int_literal(4)),
+	])
+
+	function_names(prune_program(input_program)) == ["main", "dead_helper"]
+
+
 tests: TestSuite = {
 	description = "Compiler Core DCE",
 	tests = [
@@ -948,6 +1053,15 @@ tests: TestSuite = {
 		(
 			"retains functions called only from impl method body",
 			test_retains_functions_called_only_from_impl_method_body,
+		),
+		(
+			"deferred trait call roots every implementation",
+			test_deferred_trait_call_roots_every_implementation,
+		),
+		("selected trait call roots its target", test_selected_trait_call_roots_its_target),
+		(
+			"trait call without candidates fails closed",
+			test_trait_call_without_candidates_fails_closed,
 		),
 	]
 }
