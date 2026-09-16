@@ -19,7 +19,7 @@ states what differs.
 
 **Measurement.** Use `benchmarks/self_compile_measure` exactly as described in
 [the protocol](../benchmarks/README.md#self-compile-measurement-protocol).
-Baselines are the `*_2026-09-16_r2.json` files; the input revision is in the
+Baselines are the newest `self_compile_*_baseline_*.json` files (r3 as of this writing); the input revision is in the
 JSON. Run both `--program self` and `--program small` with
 `--require-identical` unless the task says the C may change. Primary metrics
 are retired instructions and per-phase allocations; wall time is confirmation
@@ -80,9 +80,9 @@ Tasks in the same row are sequential.
 | Row | Tasks | Files owned |
 | --- | --- | --- |
 | 1 | P1 then P2 | `stage_09_core/pipeline.brp`, `pipeline_stage.brp`, `early_pipeline.brp`, `early_stages.brp`, `stage_manifest.brp`, `compiler/pipeline.brp` (late-core section), `lib/compile_plan_execute.brp` |
-| 2 | C1, C2 (in flight), then C3 | `stage_09_core/prepare.brp`, `closure.brp`, then `resource_management.brp`, `fairness.brp`, `tuple_sroa.brp` |
+| 2 | C3 (C1 and C2 landed) | `stage_09_core/prepare.brp`, `closure.brp`, then `resource_management.brp`, `fairness.brp`, `tuple_sroa.brp` |
 | 3 | C4 | `stage_09_core/dce.brp` (entry point only), `early_pipeline.brp` (one call; coordinate with P1) |
-| 4 | O1 (in flight) then O2 then O3 | `stage_09_core/perceus.brp` |
+| 4 | O2 then O3 (O1 landed) | `stage_09_core/perceus.brp` |
 | 5 | F1 then F2 | `stage_06_typecheck/decl.brp` body loop, `bridge.brp`, typecheck metrics |
 | 6 | B1 then B2 | `stage_10_backend/emit.brp`, `cancellation_plan.brp` |
 | 7 | D1 | `stage_02_lex/*`, `lib/source.brp`, `stage_03_parse/language_parser.brp` |
@@ -241,7 +241,7 @@ module (`stage_09_core/node_identity.brp`) in the first task that needs them
 outside `traverse.brp`. Lists use the prefix-copy-on-first-change helper
 already in `traverse.brp` (`map_context_exprs`); export it.
 
-### C1. `prepare_expr` reuse (in flight as a chip)
+### C1. `prepare_expr` reuse (landed 2026-09-16, `4741dce9`)
 
 **Context.** `stage_09_core/prepare.brp` `prepare_expr` has 89 arms, 2 of
 which return the input; it also deep-copies payloads through 37 `clone_core_*`
@@ -258,7 +258,7 @@ identity through `same_core_expr` on the body).
 **Acceptance.** Identical C; late_core allocations down at least 10% from the
 r2 baseline; small program not up; prepare and Perceus suites green.
 
-### C2. Closure conversion reuse (in flight as a chip)
+### C2. Closure conversion reuse (landed 2026-09-16, `4741dce9`)
 
 **Context.** `stage_09_core/closure.brp` `convert_non_spine_expr` (about
 1,100 lines, 89 arms) threads `ClosureState` and rebuilds every node; both
@@ -334,7 +334,7 @@ see before `resolve`, ask before moving the early prune later than desugar.
 
 ## Track O: Perceus
 
-### O1. `contract_for_call` (in flight as a chip)
+### O1. `contract_for_call` (landed 2026-09-16, `8660e6b1`)
 
 **Context.** After 148, `contract_for_call` is about 21% of Perceus self time
 (2.66M calls, ~0.8 µs each). It resolves an ownership contract per call site

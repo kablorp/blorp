@@ -1757,14 +1757,14 @@ scripts/compiler-build-status
 benchmarks/self_compile_measure \
   --label issue-147-step2 \
   --input-rev <input_rev from the baseline JSON> \
-  --baseline benchmarks/results/self_compile_baseline_O0_2026-09-16_r2.json \
+  --baseline benchmarks/results/self_compile_baseline_O0_2026-09-16_r3.json \
   --output /tmp/issue-147-step2.json --require-identical
 
 # Small-program guard (must not regress materially).
 benchmarks/self_compile_measure --program small \
   --label issue-147-step2-small \
   --input-rev <input_rev> \
-  --baseline benchmarks/results/self_compile_small_baseline_O0_2026-09-16_r2.json \
+  --baseline benchmarks/results/self_compile_small_baseline_O0_2026-09-16_r3.json \
   --output /tmp/issue-147-step2-small.json --require-identical
 
 # Run a multi-process gate without overlapping another worker's measurement.
