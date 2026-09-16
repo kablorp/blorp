@@ -2270,8 +2270,12 @@ private pure func required_body_value(body: FunctionBodyC) -> Option[String]:
 		Some(body.value)
 
 
-private pure func statement_expression(statements: String, value: String) -> String:
-	"({\n" + indent_statements(statements) + "  " + value + ";\n})"
+private pure func outer_indent(indent: String) -> String:
+	indent.drop_right(2)
+
+
+private pure func statement_expression(indent: String, statements: String, value: String) -> String:
+	"({\n" + indent_statements(statements) + indent + value + ";\n" + outer_indent(indent) + "})"
 
 
 private pure func emit_condition(
@@ -2303,6 +2307,14 @@ private pure func emit_condition(
 -- straight into an accumulator sized from the input keeps the same line shape
 -- with one allocation per line and no growth reallocations.
 private pure func indent_statements(statements: String) -> String:
+	prefixed_statements(BASE_INDENT, statements)
+
+
+-- Renders a block of relative-depth statement text at its final indentation by
+-- prefixing every non-empty line once. Nested emitters call this with their own
+-- indent, so a body is copied once where it is placed instead of once per
+-- enclosing brace.
+private pure func prefixed_statements(prefix: String, statements: String) -> String:
 	if statements == "":
 		""
 	else:
@@ -2311,7 +2323,7 @@ private pure func indent_statements(statements: String) -> String:
 
 		for line in statements.split("\n"):
 			if line.length() > 0:
-				result += "  "
+				result += prefix
 				result += line
 				result += "\n"
 
@@ -2363,7 +2375,7 @@ private pure func emit_scoped_operand_body(
 				prefix,
 				core_expr_type(expr),
 				"",
-				statement_expression(body.statements, value),
+				statement_expression(emission_context.indent, body.statements, value),
 				body.next_temp,
 			),
 		)
@@ -7881,7 +7893,7 @@ private pure func emit_allocated_list_construct(
 ) -> Option[String]:
 	list_name: String = "__lst"
 	len: Int = construct.elements.length()
-	var statements: String = "({\n  blorp_List* " + list_name + " = " + list_construct_alloc(
+	var statements: String = "({\n" + emission_context.indent + "blorp_List* " + list_name + " = " + list_construct_alloc(
 		construct.layout,
 		len,
 	) + ";\n"
@@ -7890,7 +7902,7 @@ private pure func emit_allocated_list_construct(
 	var temp_index: Int = 0
 
 	if construct.elem_needs_release:
-		statements += "  blorp_list_init_elem_release(" + list_name + ", blorp_elem_release_fn);\n"
+		statements += emission_context.indent + "blorp_list_init_elem_release(" + list_name + ", blorp_elem_release_fn);\n"
 
 	match construct.layout:
 		InlineStructListStorage(c_type):
@@ -7944,7 +7956,9 @@ private pure func emit_allocated_list_construct(
 	if failed:
 		None
 	else:
-		statements += "  " + list_name + "->len = " + len.to_string() + ";\n  " + list_name + ";\n})"
+		statements += emission_context.indent + list_name + "->len = " + len.to_string() + ";\n" + emission_context.indent + list_name + ";\n" + outer_indent(
+			emission_context.indent,
+		) + "})"
 		Some(statements)
 
 
@@ -8893,7 +8907,10 @@ private pure func emit_list_handoff(
 				mode,
 				source_c,
 				capacity_c,
-			) + "\n" + body_statements + list_handoff_suffix(handoff, mode),
+			) + "\n" + body_statements + offset_continuation_lines(
+				outer_indent(emission_context.indent),
+				outer_indent(emission_context.indent) + list_handoff_suffix(handoff, mode),
+			),
 		)
 	else:
 		None
@@ -13090,11 +13107,45 @@ private pure func emit_dup_statement(
 			) + "); }" + duplicate_cleanup + "\n"
 
 
-private pure func statement_expr(statement: String, value: String) -> String:
+-- A statement expression splices an already-rendered statement block into a
+-- value position: its first line continues the current line, so only the lines
+-- after it carry the enclosing indentation.
+private pure func offset_continuation_lines(offset: String, text: String) -> String:
+	if offset == "":
+		text
+	else:
+		var result: String = "".reserve(text.length() + 16)
+		var first: Bool = True
+
+		for line in text.split("\n"):
+			if first:
+				result += line
+				first = False
+			else:
+				result += "\n"
+
+				if line.length() > 0:
+					result += offset
+
+				result += line
+
+		result
+
+
+-- A single rendered statement may splice a multi-line value into its line. Only
+-- the statement itself starts at `indent`; the value's continuation lines keep
+-- the depth the value was rendered at.
+private pure func prefixed_statement(indent: String, statement: String) -> String:
+	indent + offset_continuation_lines(BASE_INDENT, statement)
+
+
+private pure func statement_expr(indent: String, statement: String, value: String) -> String:
 	if statement.length() == 0:
 		value
 	else:
-		"({ " + statement + " " + value + "; })"
+		offset: String = outer_indent(indent)
+
+		"({ " + offset_continuation_lines(offset, statement) + offset + " " + value + "; })"
 
 
 private pure func emit_simple_logical_expr(
@@ -13392,7 +13443,7 @@ private pure func emit_simple_expr(
 		TensorRawViewLetExpr(binding, body, typ, loc):
 			decl ?= tensor_raw_view_decl(binding, emission_context)
 			body_c ?= emit_simple_expr(body, emission_context)
-			Some(statement_expr(decl + ";", body_c))
+			Some(statement_expr(emission_context.indent, decl + ";", body_c))
 		DictConstructExpr(construct, typ, loc):
 			emit_dict_construct(
 				{ construct |
@@ -13438,7 +13489,12 @@ private pure func emit_simple_expr(
 			body_c ?= emit_simple_expr(body, emission_context)
 			Some(
 				statement_expr(
-					emit_dup_statement(variable, retain_policy, emission_context),
+					emission_context.indent,
+					emit_dup_statement(
+						variable,
+						retain_policy,
+						base_emission_context(emission_context),
+					),
 					body_c,
 				),
 			)
@@ -13446,7 +13502,12 @@ private pure func emit_simple_expr(
 			body_c ?= emit_simple_expr(body, emission_context)
 			Some(
 				statement_expr(
-					emit_drop_statement(variable, release_policy, emission_context),
+					emission_context.indent,
+					emit_drop_statement(
+						variable,
+						release_policy,
+						base_emission_context(emission_context),
+					),
 					body_c,
 				),
 			)
@@ -15015,7 +15076,9 @@ private pure func emit_for_range(
 ) -> Option[FunctionBodyC]:
 	start_c ?= emit_simple_expr(start, emission_context)
 	end_c ?= emit_simple_expr(end_value, emission_context)
-	body_c ?= emit_function_body(body, next_temp + 1, emission_context)
+	inner_context: FunctionEmissionContext = nested_emission_context(emission_context)
+	inner_indent: String = inner_context.indent
+	body_c ?= emit_function_body(body, next_temp + 1, inner_context)
 	start_tmp: String = temp_name("range_start", next_temp)
 	end_tmp: String = temp_name("range_end", next_temp)
 	step_tmp: String = temp_name("range_step", next_temp)
@@ -15030,12 +15093,10 @@ private pure func emit_for_range(
 				binder.variable,
 			) + " < " + end_tmp + "; " + c_var_name(
 				binder.variable,
-			) + "++) {\n" + indent_statements(
-				statement_body(
-					emission_context.indent,
-					body,
-					body_c,
-				),
+			) + "++) {\n" + statement_body(
+				inner_indent,
+				body,
+				body_c,
 			) + emission_context.indent + "}\n",
 			value = "",
 			next_temp = body_c.next_temp,
@@ -15049,12 +15110,10 @@ private pure func emit_for_range(
 				binder.variable,
 			) + " != " + end_tmp + "; " + c_var_name(
 				binder.variable,
-			) + " += " + step_tmp + ") {\n" + indent_statements(
-				statement_body(
-					emission_context.indent,
-					body,
-					body_c,
-				),
+			) + " += " + step_tmp + ") {\n" + statement_body(
+				inner_indent,
+				body,
+				body_c,
 			) + emission_context.indent + "}\n",
 			value = "",
 			next_temp = body_c.next_temp,
@@ -16454,9 +16513,11 @@ private pure func emit_for_channel(
 	temp_index: Int = iterable_body.next_temp
 	iter_tmp: String = temp_name("chan_iter", temp_index)
 	raw_tmp: String = temp_name("chan_val", temp_index)
-	body_c ?= emit_function_body(for_channel.body, temp_index + 1, emission_context)
+	inner_context: FunctionEmissionContext = nested_emission_context(emission_context)
+	inner_indent: String = inner_context.indent
+	body_c ?= emit_function_body(for_channel.body, temp_index + 1, inner_context)
 	loop_binding ?= owned_erased_value_unbox_decl(for_channel.binder, raw_tmp)
-	loop_release: String = channel_loop_value_release(emission_context.indent, for_channel.binder)
+	loop_release: String = channel_loop_value_release(inner_indent, for_channel.binder)
 	header: String = render_prepared_backend_op(BackendChannelIterHeader({
 		channel = iter_tmp,
 		source = iterable_c,
@@ -16464,15 +16525,17 @@ private pure func emit_for_channel(
 	}))
 
 	Some({
-		statements = iterable_body.statements + indent_statements(
+		statements = iterable_body.statements + prefixed_statements(
+			emission_context.indent,
 			header,
-		) + indent_statements(
-			loop_binding + statement_body(
-				emission_context.indent,
-				for_channel.body,
-				body_c,
-			) + loop_release,
-		) + emission_context.indent + "}\n",
+		) + prefixed_statements(
+			emission_context.indent,
+			loop_binding,
+		) + statement_body(
+			inner_indent,
+			for_channel.body,
+			body_c,
+		) + loop_release + emission_context.indent + "}\n",
 		value = "",
 		next_temp = body_c.next_temp,
 		returns = False,
@@ -16484,6 +16547,9 @@ private pure func emit_for_list(
 	next_temp: Int,
 	emission_context: FunctionEmissionContext,
 ) -> Option[FunctionBodyC]:
+	inner_context: FunctionEmissionContext = nested_emission_context(emission_context)
+	inner_indent: String = inner_context.indent
+
 	match for_list.layout:
 		PointerListStorage:
 			iterable_body ?= emit_scoped_expr_value(
@@ -16497,7 +16563,7 @@ private pure func emit_for_list(
 			iter_tmp: String = temp_name("iter", temp_index)
 			len_tmp: String = temp_name("len", temp_index)
 			index_tmp: String = temp_name("i", temp_index)
-			body_c ?= emit_function_body(for_list.body, temp_index + 1, emission_context)
+			body_c ?= emit_function_body(for_list.body, temp_index + 1, inner_context)
 			source_binding: String = render_prepared_backend_op(BackendFlatIterSourceBinding({
 				iter_c_type = "blorp_List*",
 				iter = iter_tmp,
@@ -16509,13 +16575,12 @@ private pure func emit_for_list(
 				index = index_tmp,
 			}))
 			loop_binding ?= pointer_list_loop_binding(for_list.binder, iter_tmp, index_tmp)
-			loop_body: String = loop_binding + statement_body(
+			loop_body: String = prefixed_statements(
 				emission_context.indent,
-				for_list.body,
-				body_c,
-			)
+				loop_binding,
+			) + statement_body(inner_indent, for_list.body, body_c)
 			cleanup_push: String = planned_owned_temp_cleanup_push_statement(
-				emission_context,
+				inner_context,
 				temp_index,
 				IterableTemporary,
 				iter_tmp,
@@ -16535,11 +16600,13 @@ private pure func emit_for_list(
 			)
 
 			Some({
-				statements = iterable_body.statements + indent_statements(
-					source_binding + "\n" + cleanup_push + loop_header,
-				) + indent_statements(
-					loop_body,
-				) + emission_context.indent + "}\n" + cleanup_pop + iterable_release,
+				statements = iterable_body.statements + prefixed_statement(
+					emission_context.indent,
+					source_binding + "\n",
+				) + cleanup_push + prefixed_statements(
+					emission_context.indent,
+					loop_header + "\n",
+				) + loop_body + emission_context.indent + "}\n" + cleanup_pop + iterable_release,
 				value = "",
 				next_temp = body_c.next_temp,
 				returns = False,
@@ -16556,7 +16623,7 @@ private pure func emit_for_list(
 			iter_tmp: String = temp_name("iter", temp_index)
 			len_tmp: String = temp_name("len", temp_index)
 			index_tmp: String = temp_name("i", temp_index)
-			body_c ?= emit_function_body(for_list.body, temp_index + 1, emission_context)
+			body_c ?= emit_function_body(for_list.body, temp_index + 1, inner_context)
 			source_binding: String = render_prepared_backend_op(BackendFlatIterSourceBinding({
 				iter_c_type = "blorp_List*",
 				iter = iter_tmp,
@@ -16574,13 +16641,12 @@ private pure func emit_for_list(
 				width_bytes,
 				temp_index,
 			)
-			loop_body: String = loop_binding + statement_body(
+			loop_body: String = prefixed_statements(
 				emission_context.indent,
-				for_list.body,
-				body_c,
-			)
+				loop_binding,
+			) + statement_body(inner_indent, for_list.body, body_c)
 			cleanup_push: String = planned_owned_temp_cleanup_push_statement(
-				emission_context,
+				inner_context,
 				temp_index,
 				IterableTemporary,
 				iter_tmp,
@@ -16600,11 +16666,13 @@ private pure func emit_for_list(
 			)
 
 			Some({
-				statements = iterable_body.statements + indent_statements(
-					source_binding + "\n" + cleanup_push + loop_header,
-				) + indent_statements(
-					loop_body,
-				) + emission_context.indent + "}\n" + cleanup_pop + iterable_release,
+				statements = iterable_body.statements + prefixed_statement(
+					emission_context.indent,
+					source_binding + "\n",
+				) + cleanup_push + prefixed_statements(
+					emission_context.indent,
+					loop_header + "\n",
+				) + loop_body + emission_context.indent + "}\n" + cleanup_pop + iterable_release,
 				value = "",
 				next_temp = body_c.next_temp,
 				returns = False,
@@ -16621,7 +16689,7 @@ private pure func emit_for_list(
 			iter_tmp: String = temp_name("iter", temp_index)
 			len_tmp: String = temp_name("len", temp_index)
 			index_tmp: String = temp_name("i", temp_index)
-			body_c ?= emit_function_body(for_list.body, temp_index + 1, emission_context)
+			body_c ?= emit_function_body(for_list.body, temp_index + 1, inner_context)
 			source_binding: String = render_prepared_backend_op(BackendFlatIterSourceBinding({
 				iter_c_type = "blorp_List*",
 				iter = iter_tmp,
@@ -16632,15 +16700,18 @@ private pure func emit_for_list(
 				iter = iter_tmp,
 				index = index_tmp,
 			}))
-			loop_body: String = inline_struct_list_loop_binding(
-				for_list.binder,
-				iter_tmp,
-				index_tmp,
-				temp_index.to_string(),
-				c_type,
-			) + statement_body(emission_context.indent, for_list.body, body_c)
+			loop_body: String = prefixed_statements(
+				emission_context.indent,
+				inline_struct_list_loop_binding(
+					for_list.binder,
+					iter_tmp,
+					index_tmp,
+					temp_index.to_string(),
+					c_type,
+				),
+			) + statement_body(inner_indent, for_list.body, body_c)
 			cleanup_push: String = planned_owned_temp_cleanup_push_statement(
-				emission_context,
+				inner_context,
 				temp_index,
 				IterableTemporary,
 				iter_tmp,
@@ -16660,11 +16731,13 @@ private pure func emit_for_list(
 			)
 
 			Some({
-				statements = iterable_body.statements + indent_statements(
-					source_binding + "\n" + cleanup_push + loop_header,
-				) + indent_statements(
-					loop_body,
-				) + emission_context.indent + "}\n" + cleanup_pop + iterable_release,
+				statements = iterable_body.statements + prefixed_statement(
+					emission_context.indent,
+					source_binding + "\n",
+				) + cleanup_push + prefixed_statements(
+					emission_context.indent,
+					loop_header + "\n",
+				) + loop_body + emission_context.indent + "}\n" + cleanup_pop + iterable_release,
 				value = "",
 				next_temp = body_c.next_temp,
 				returns = False,
@@ -16686,7 +16759,9 @@ private pure func emit_for_string(
 	temp_index: Int = iterable_body.next_temp
 	iter_tmp: String = temp_name("str_iter", temp_index)
 	index_tmp: String = temp_name("si", temp_index)
-	body_c ?= emit_function_body(for_string.body, temp_index + 1, emission_context)
+	inner_context: FunctionEmissionContext = nested_emission_context(emission_context)
+	inner_indent: String = inner_context.indent
+	body_c ?= emit_function_body(for_string.body, temp_index + 1, inner_context)
 	source_binding: String = render_prepared_backend_op(BackendStringIterSourceBinding({
 		iter = iter_tmp,
 		source = iterable_c,
@@ -16701,7 +16776,7 @@ private pure func emit_for_string(
 		index = index_tmp,
 	}))
 	cleanup_push: String = planned_owned_temp_cleanup_push_statement(
-		emission_context,
+		inner_context,
 		temp_index,
 		IterableTemporary,
 		iter_tmp,
@@ -16721,14 +16796,19 @@ private pure func emit_for_string(
 	)
 
 	Some({
-		statements = iterable_body.statements + indent_statements(
-			source_binding + "\n" + cleanup_push + loop_header,
-		) + indent_statements(
-			loop_binding + "\n" + statement_body(
-				emission_context.indent,
-				for_string.body,
-				body_c,
-			),
+		statements = iterable_body.statements + prefixed_statements(
+			emission_context.indent,
+			source_binding + "\n",
+		) + cleanup_push + prefixed_statements(
+			emission_context.indent,
+			loop_header + "\n",
+		) + prefixed_statements(
+			emission_context.indent,
+			loop_binding + "\n",
+		) + statement_body(
+			inner_indent,
+			for_string.body,
+			body_c,
 		) + emission_context.indent + "}\n" + cleanup_pop + iterable_release,
 		value = "",
 		next_temp = body_c.next_temp,
@@ -16846,7 +16926,9 @@ private pure func emit_for_dict(
 	iter_tmp: String = temp_name("dict_iter", temp_index)
 	index_tmp: String = temp_name("di", temp_index)
 	slot_tmp: String = temp_name("dslot", temp_index)
-	body_c ?= emit_function_body(for_dict.body, temp_index + 1, emission_context)
+	inner_context: FunctionEmissionContext = nested_emission_context(emission_context)
+	inner_indent: String = inner_context.indent
+	body_c ?= emit_function_body(for_dict.body, temp_index + 1, inner_context)
 	source_binding: String = render_prepared_backend_op(BackendDictIterSourceBinding({
 		dict = iter_tmp,
 		source = iterable_c,
@@ -16864,9 +16946,9 @@ private pure func emit_for_dict(
 		BackendDictIterDeletedSlotGuard(slot_tmp),
 	)
 	loop_binding ?= dict_loop_binding(for_dict, iter_tmp, slot_tmp)
-	loop_release: String = dict_loop_binding_release(emission_context.indent, for_dict)
+	loop_release: String = dict_loop_binding_release(inner_indent, for_dict)
 	cleanup_push: String = planned_owned_temp_cleanup_push_statement(
-		emission_context,
+		inner_context,
 		temp_index,
 		IterableTemporary,
 		iter_tmp,
@@ -16886,15 +16968,20 @@ private pure func emit_for_dict(
 	)
 
 	Some({
-		statements = iterable_body.statements + indent_statements(
-			source_binding + "\n" + cleanup_push + loop_header,
-		) + indent_statements(
-			slot_binding + "\n" + deleted_slot_guard + "\n" + loop_binding + statement_body(
-				emission_context.indent,
-				for_dict.body,
-				body_c,
-			) + loop_release,
-		) + emission_context.indent + "}\n" + cleanup_pop + iterable_release,
+		statements = iterable_body.statements + prefixed_statements(
+			emission_context.indent,
+			source_binding + "\n",
+		) + cleanup_push + prefixed_statements(
+			emission_context.indent,
+			loop_header + "\n",
+		) + prefixed_statements(
+			emission_context.indent,
+			slot_binding + "\n" + deleted_slot_guard + "\n" + loop_binding,
+		) + statement_body(
+			inner_indent,
+			for_dict.body,
+			body_c,
+		) + loop_release + emission_context.indent + "}\n" + cleanup_pop + iterable_release,
 		value = "",
 		next_temp = body_c.next_temp,
 		returns = False,
@@ -16916,7 +17003,9 @@ private pure func emit_for_set(
 	temp_index: Int = iterable_body.next_temp
 	iter_tmp: String = temp_name("set_iter", temp_index)
 	entry_tmp: String = temp_name("set_entry", temp_index)
-	body_c ?= emit_function_body(for_set.body, temp_index + 1, emission_context)
+	inner_context: FunctionEmissionContext = nested_emission_context(emission_context)
+	inner_indent: String = inner_context.indent
+	body_c ?= emit_function_body(for_set.body, temp_index + 1, inner_context)
 	source_binding: String = render_prepared_backend_op(BackendSetIterSourceBinding({
 		set = iter_tmp,
 		source = iterable_c,
@@ -16930,7 +17019,7 @@ private pure func emit_for_set(
 	loop_binding ?= borrowed_erased_value_unbox_decl(for_set.binder, raw_key)
 	iter_retain_release: String = render_prepared_backend_op(BackendSetIterRelease(iter_tmp)) + "\n"
 	cleanup_push: String = planned_owned_temp_cleanup_push_statement(
-		emission_context,
+		inner_context,
 		temp_index,
 		IterableTemporary,
 		iter_tmp,
@@ -16950,15 +17039,21 @@ private pure func emit_for_set(
 	)
 
 	Some({
-		statements = iterable_body.statements + indent_statements(
-			source_binding + "\n" + cleanup_push + retain_iterable + "\n" + loop_header,
-		) + indent_statements(
-			loop_binding + statement_body(
-				emission_context.indent,
-				for_set.body,
-				body_c,
-			),
-		) + emission_context.indent + "}\n" + indent_statements(
+		statements = iterable_body.statements + prefixed_statements(
+			emission_context.indent,
+			source_binding + "\n",
+		) + cleanup_push + prefixed_statements(
+			emission_context.indent,
+			retain_iterable + "\n" + loop_header + "\n",
+		) + prefixed_statements(
+			emission_context.indent,
+			loop_binding,
+		) + statement_body(
+			inner_indent,
+			for_set.body,
+			body_c,
+		) + emission_context.indent + "}\n" + prefixed_statements(
+			emission_context.indent,
 			iter_retain_release,
 		) + cleanup_pop + iterable_release,
 		value = "",
@@ -17000,7 +17095,9 @@ private pure func emit_for_resource_source(
 	temp_index: Int = iterable_body.next_temp
 	iter_tmp: String = temp_name("resource_source_iter", temp_index)
 	raw_tmp: String = temp_name("resource_source_value", temp_index)
-	body_c ?= emit_function_body(for_resource_source.body, temp_index + 1, emission_context)
+	inner_context: FunctionEmissionContext = nested_emission_context(emission_context)
+	inner_indent: String = inner_context.indent
+	body_c ?= emit_function_body(for_resource_source.body, temp_index + 1, inner_context)
 	loop_binding: String = resource_source_loop_binding(for_resource_source.binder, raw_tmp)
 	cleanup_push: String = planned_owned_temp_cleanup_push_statement(
 		emission_context,
@@ -17023,12 +17120,13 @@ private pure func emit_for_resource_source(
 	)
 
 	Some({
-		statements = iterable_body.statements + emission_context.indent + "blorp_ResourceSource* " + iter_tmp + " = " + iterable_c + ";\n" + cleanup_push + emission_context.indent + "void* " + raw_tmp + " = NULL;\n" + emission_context.indent + "while (blorp_resource_source_next_raw(" + iter_tmp + ", &" + raw_tmp + ")) {\n" + indent_statements(
-			loop_binding + statement_body(
-				emission_context.indent,
-				for_resource_source.body,
-				body_c,
-			),
+		statements = iterable_body.statements + emission_context.indent + "blorp_ResourceSource* " + iter_tmp + " = " + iterable_c + ";\n" + cleanup_push + emission_context.indent + "void* " + raw_tmp + " = NULL;\n" + emission_context.indent + "while (blorp_resource_source_next_raw(" + iter_tmp + ", &" + raw_tmp + ")) {\n" + prefixed_statements(
+			emission_context.indent,
+			loop_binding,
+		) + statement_body(
+			inner_indent,
+			for_resource_source.body,
+			body_c,
 		) + emission_context.indent + "}\n" + emission_context.indent + raw_tmp + " = NULL;\n" + cleanup_pop + iterable_release,
 		value = "",
 		next_temp = body_c.next_temp,
@@ -17051,7 +17149,9 @@ private pure func emit_for_stream(
 	temp_index: Int = iterable_body.next_temp
 	iter_tmp: String = temp_name("stream_iter", temp_index)
 	value_tmp: String = temp_name("stream_value", temp_index)
-	body_c ?= emit_function_body(for_stream.body, temp_index + 1, emission_context)
+	inner_context: FunctionEmissionContext = nested_emission_context(emission_context)
+	inner_indent: String = inner_context.indent
+	body_c ?= emit_function_body(for_stream.body, temp_index + 1, inner_context)
 	loop_binding ?= stream_loop_binding(for_stream.binder, value_tmp)
 	cleanup_push: String = planned_owned_temp_cleanup_push_statement(
 		emission_context,
@@ -17074,12 +17174,13 @@ private pure func emit_for_stream(
 	)
 
 	Some({
-		statements = iterable_body.statements + emission_context.indent + "blorp_Stream* " + iter_tmp + " = (blorp_Stream*)" + iterable_c + ";\n" + cleanup_push + emission_context.indent + "void* " + value_tmp + " = NULL;\n" + emission_context.indent + "for (; blorp_stream_next_raw(" + iter_tmp + ", &" + value_tmp + "); blorp_stream_release_pulled_if_owned(" + iter_tmp + ", " + value_tmp + "), " + value_tmp + " = NULL) {\n" + indent_statements(
-			loop_binding + statement_body(
-				emission_context.indent,
-				for_stream.body,
-				body_c,
-			),
+		statements = iterable_body.statements + emission_context.indent + "blorp_Stream* " + iter_tmp + " = (blorp_Stream*)" + iterable_c + ";\n" + cleanup_push + emission_context.indent + "void* " + value_tmp + " = NULL;\n" + emission_context.indent + "for (; blorp_stream_next_raw(" + iter_tmp + ", &" + value_tmp + "); blorp_stream_release_pulled_if_owned(" + iter_tmp + ", " + value_tmp + "), " + value_tmp + " = NULL) {\n" + prefixed_statements(
+			emission_context.indent,
+			loop_binding,
+		) + statement_body(
+			inner_indent,
+			for_stream.body,
+			body_c,
 		) + emission_context.indent + "}\n" + emission_context.indent + "if (" + value_tmp + " != NULL) blorp_stream_release_pulled_if_owned(" + iter_tmp + ", " + value_tmp + ");\n" + cleanup_pop + iterable_release,
 		value = "",
 		next_temp = body_c.next_temp,
@@ -17096,7 +17197,9 @@ private pure func emit_for_tensor(
 	iter_tmp: String = temp_name("iter", next_temp)
 	len_tmp: String = temp_name("len", next_temp)
 	index_tmp: String = temp_name("i", next_temp)
-	body_c ?= emit_function_body(for_tensor.body, next_temp + 1, emission_context)
+	inner_context: FunctionEmissionContext = nested_emission_context(emission_context)
+	inner_indent: String = inner_context.indent
+	body_c ?= emit_function_body(for_tensor.body, next_temp + 1, inner_context)
 	source_binding: String = render_prepared_backend_op(BackendFlatIterSourceBinding({
 		iter_c_type = "blorp_Vector*",
 		iter = iter_tmp,
@@ -17108,7 +17211,7 @@ private pure func emit_for_tensor(
 		index = index_tmp,
 	}))
 	cleanup_push: String = planned_owned_temp_cleanup_push_statement(
-		emission_context,
+		inner_context,
 		next_temp,
 		IterableTemporary,
 		iter_tmp,
@@ -17136,18 +17239,19 @@ private pure func emit_for_tensor(
 				temp_seed = next_temp.to_string(),
 				struct_ty = c_type,
 			}))
-			loop_body: String = element_decl + "\n" + statement_body(
+			loop_body: String = prefixed_statements(
 				emission_context.indent,
-				for_tensor.body,
-				body_c,
-			)
+				element_decl + "\n",
+			) + statement_body(inner_indent, for_tensor.body, body_c)
 
 			Some({
-				statements = indent_statements(
-					source_binding + "\n" + cleanup_push + loop_header,
-				) + indent_statements(
-					loop_body,
-				) + emission_context.indent + "}\n" + cleanup_pop + iterable_release,
+				statements = prefixed_statements(
+					emission_context.indent,
+					source_binding + "\n",
+				) + cleanup_push + prefixed_statements(
+					emission_context.indent,
+					loop_header + "\n",
+				) + loop_body + emission_context.indent + "}\n" + cleanup_pop + iterable_release,
 				value = "",
 				next_temp = body_c.next_temp,
 				returns = False,
@@ -17165,18 +17269,19 @@ private pure func emit_for_tensor(
 				raw = raw_tmp,
 				index = index_tmp,
 			}))
-			loop_body: String = element_decl + "\n" + statement_body(
+			loop_body: String = prefixed_statements(
 				emission_context.indent,
-				for_tensor.body,
-				body_c,
-			)
+				element_decl + "\n",
+			) + statement_body(inner_indent, for_tensor.body, body_c)
 
 			Some({
-				statements = indent_statements(
-					source_binding + "\n" + cleanup_push + raw_binding + "\n" + loop_header,
-				) + indent_statements(
-					loop_body,
-				) + emission_context.indent + "}\n" + cleanup_pop + iterable_release,
+				statements = prefixed_statements(
+					emission_context.indent,
+					source_binding + "\n",
+				) + cleanup_push + prefixed_statements(
+					emission_context.indent,
+					raw_binding + "\n" + loop_header + "\n",
+				) + loop_body + emission_context.indent + "}\n" + cleanup_pop + iterable_release,
 				value = "",
 				next_temp = body_c.next_temp,
 				returns = False,
@@ -17187,18 +17292,19 @@ private pure func emit_for_tensor(
 			) + " = (" + runtime_read.value_c_type + ")" + tensor_runtime_read_helper_name(
 				runtime_read.helper,
 			) + "(" + iter_tmp + ", " + index_tmp + ");"
-			loop_body: String = element_decl + "\n" + statement_body(
+			loop_body: String = prefixed_statements(
 				emission_context.indent,
-				for_tensor.body,
-				body_c,
-			)
+				element_decl + "\n",
+			) + statement_body(inner_indent, for_tensor.body, body_c)
 
 			Some({
-				statements = indent_statements(
-					source_binding + "\n" + cleanup_push + loop_header,
-				) + indent_statements(
-					loop_body,
-				) + emission_context.indent + "}\n" + cleanup_pop + iterable_release,
+				statements = prefixed_statements(
+					emission_context.indent,
+					source_binding + "\n",
+				) + cleanup_push + prefixed_statements(
+					emission_context.indent,
+					loop_header + "\n",
+				) + loop_body + emission_context.indent + "}\n" + cleanup_pop + iterable_release,
 				value = "",
 				next_temp = body_c.next_temp,
 				returns = False,
@@ -17207,18 +17313,19 @@ private pure func emit_for_tensor(
 			element_decl: String = value_c_type + " " + c_var_name(
 				for_tensor.binder.variable,
 			) + " = (" + value_c_type + ")" + iter_tmp + "->data[" + index_tmp + "];"
-			loop_body: String = element_decl + "\n" + statement_body(
+			loop_body: String = prefixed_statements(
 				emission_context.indent,
-				for_tensor.body,
-				body_c,
-			)
+				element_decl + "\n",
+			) + statement_body(inner_indent, for_tensor.body, body_c)
 
 			Some({
-				statements = indent_statements(
-					source_binding + "\n" + cleanup_push + loop_header,
-				) + indent_statements(
-					loop_body,
-				) + emission_context.indent + "}\n" + cleanup_pop + iterable_release,
+				statements = prefixed_statements(
+					emission_context.indent,
+					source_binding + "\n",
+				) + cleanup_push + prefixed_statements(
+					emission_context.indent,
+					loop_header + "\n",
+				) + loop_body + emission_context.indent + "}\n" + cleanup_pop + iterable_release,
 				value = "",
 				next_temp = body_c.next_temp,
 				returns = False,
@@ -17239,18 +17346,23 @@ private pure func emit_for_tensor(
 				row_slice.result_first_dim
 
 			element_decl: String = binding_type + " " + binding_name + " = (" + binding_type + ")blorp_tensor_slice_row(" + iter_tmp + ", " + index_tmp + ", " + row_size + ", " + result_first_dim + ");"
-			loop_body: String = element_decl + "\n" + statement_body(
+			loop_body: String = prefixed_statements(
 				emission_context.indent,
+				element_decl + "\n",
+			) + statement_body(
+				inner_indent,
 				for_tensor.body,
 				body_c,
-			) + "blorp_release(" + binding_name + ");\n"
+			) + emission_context.indent + "blorp_release(" + binding_name + ");\n"
 
 			Some({
-				statements = indent_statements(
-					source_binding + "\n" + cleanup_push + loop_header,
-				) + indent_statements(
-					loop_body,
-				) + emission_context.indent + "}\n" + cleanup_pop + iterable_release,
+				statements = prefixed_statements(
+					emission_context.indent,
+					source_binding + "\n",
+				) + cleanup_push + prefixed_statements(
+					emission_context.indent,
+					loop_header + "\n",
+				) + loop_body + emission_context.indent + "}\n" + cleanup_pop + iterable_release,
 				value = "",
 				next_temp = body_c.next_temp,
 				returns = False,
@@ -17593,7 +17705,7 @@ private pure func emit_string_literal_dispatch_branches(
 	if first:
 		fallback_statements
 	else:
-		"${statements}  } else {\n${indent_statements(fallback_statements)}  }\n"
+		"${statements}${indent}} else {\n${indent_statements(fallback_statements)}${indent}}\n"
 
 
 private pure func emit_literal_match_branch_body(
@@ -20770,7 +20882,7 @@ private pure func emit_let_body(
 					is_mutable,
 					typ,
 					rhs,
-					statement_expression(rhs_body.statements, rhs_value),
+					statement_expression(emission_context.indent, rhs_body.statements, rhs_value),
 					body,
 					rhs_body.next_temp,
 					emission_context,
@@ -20817,7 +20929,7 @@ private pure func emit_borrow_let_body(
 				emit_bound_borrow_let_body(
 					name,
 					typ,
-					statement_expression(rhs_body.statements, rhs_value),
+					statement_expression(emission_context.indent, rhs_body.statements, rhs_value),
 					body,
 					rhs_body.next_temp,
 					emission_context,
@@ -20898,30 +21010,49 @@ private pure func emit_dispatched_call_body(
 			None
 
 
+private pure func base_emission_context(
+	emission_context: FunctionEmissionContext,
+) -> FunctionEmissionContext:
+	{ emission_context | indent = BASE_INDENT }
+
+
+private pure func nested_emission_context(
+	emission_context: FunctionEmissionContext,
+) -> FunctionEmissionContext:
+	{ emission_context | indent = emission_context.indent + "  " }
+
+
 private pure func emit_while_body(
 	cond: CoreExpr,
 	body: CoreExpr,
 	next_temp: Int,
 	emission_context: FunctionEmissionContext,
 ) -> Option[FunctionBodyC]:
-	condition ?= emit_condition(cond, next_temp, emission_context)
-	body_c ?= emit_function_body(body, condition.next_temp, emission_context)
-	rendered_body: String = statement_body(emission_context.indent, body, body_c)
+	inner_context: FunctionEmissionContext = nested_emission_context(emission_context)
+	inner_indent: String = inner_context.indent
+	outer_condition ?= emit_condition(cond, next_temp, emission_context)
+
+	-- A condition with statements is re-evaluated inside the loop, so it is
+	-- rendered one level deeper than a condition that fits the `while (...)`
+	-- header.
+	condition ?= if outer_condition.statements == "":
+		Some(outer_condition)
+	else:
+		emit_condition(cond, next_temp, inner_context)
+
+	body_c ?= emit_function_body(body, condition.next_temp, inner_context)
+	rendered_body: String = statement_body(inner_indent, body, body_c)
 
 	if condition.statements == "":
 		Some({
-			statements = emission_context.indent + "while (" + condition.value + ") {\n" + indent_statements(
-				rendered_body,
-			) + emission_context.indent + "}\n",
+			statements = emission_context.indent + "while (" + condition.value + ") {\n" + rendered_body + emission_context.indent + "}\n",
 			value = "",
 			next_temp = body_c.next_temp,
 			returns = False,
 		})
 	else:
 		Some({
-			statements = emission_context.indent + "while (1) {\n" + indent_statements(
-				condition.statements + emission_context.indent + "if (!(" + condition.value + ")) {\n" + emission_context.indent + "  " + "break;\n" + emission_context.indent + "}\n" + rendered_body,
-			) + emission_context.indent + "}\n",
+			statements = emission_context.indent + "while (1) {\n" + condition.statements + inner_indent + "if (!(" + condition.value + ")) {\n" + inner_indent + "  break;\n" + inner_indent + "}\n" + rendered_body + emission_context.indent + "}\n",
 			value = "",
 			next_temp = body_c.next_temp,
 			returns = False,
@@ -20945,20 +21076,20 @@ private pure func emit_if_body(
 			Some(body_value(value, next_temp))
 		None:
 			condition ?= emit_condition(cond, next_temp, emission_context)
+			inner_context: FunctionEmissionContext = nested_emission_context(emission_context)
+			inner_indent: String = inner_context.indent
 
 			if TypeLayout.is_void_type(typ):
-				then_c ?= emit_function_body(then_expr, condition.next_temp, emission_context)
-				else_c ?= emit_function_body(else_expr, then_c.next_temp, emission_context)
-				else_statements: String = statement_body(emission_context.indent, else_expr, else_c)
+				then_c ?= emit_function_body(then_expr, condition.next_temp, inner_context)
+				else_c ?= emit_function_body(else_expr, then_c.next_temp, inner_context)
+				else_statements: String = statement_body(inner_indent, else_expr, else_c)
 
 				if else_statements == "":
 					Some({
-						statements = condition.statements + emission_context.indent + "if (" + condition.value + ") {\n" + indent_statements(
-							statement_body(
-								emission_context.indent,
-								then_expr,
-								then_c,
-							),
+						statements = condition.statements + emission_context.indent + "if (" + condition.value + ") {\n" + statement_body(
+							inner_indent,
+							then_expr,
+							then_c,
 						) + emission_context.indent + "}\n",
 						value = "",
 						next_temp = else_c.next_temp,
@@ -20966,21 +21097,21 @@ private pure func emit_if_body(
 					})
 				else:
 					Some({
-						statements = condition.statements + emission_context.indent + "if (" + condition.value + ") {\n" + indent_statements(
-							statement_body(
-								emission_context.indent,
-								then_expr,
-								then_c,
-							),
-						) + emission_context.indent + "} else {\n" + indent_statements(
-							else_statements,
-						) + emission_context.indent + "}\n",
+						statements = condition.statements + emission_context.indent + "if (" + condition.value + ") {\n" + statement_body(
+							inner_indent,
+							then_expr,
+							then_c,
+						) + emission_context.indent + "} else {\n" + else_statements + emission_context.indent + "}\n",
 						value = "",
 						next_temp = else_c.next_temp,
 						returns = False,
 					})
 			else:
 				temp: String = temp_name("if_result", condition.next_temp)
+
+				-- A value-producing branch is spliced into the assignment line, so
+				-- its statements are rendered at the outer depth and shifted one
+				-- level here while the value keeps the depth it was rendered at.
 				then_c ?= emit_function_body(then_expr, condition.next_temp + 1, emission_context)
 				else_c ?= emit_function_body(else_expr, then_c.next_temp, emission_context)
 				then_value ?= required_body_value(then_c)
@@ -20988,11 +21119,13 @@ private pure func emit_if_body(
 				Some({
 					statements = emission_context.indent + TypeLayout.c_type_name(
 						typ,
-					) + " " + temp + ";\n" + condition.statements + emission_context.indent + "if (" + condition.value + ") {\n" + indent_statements(
+					) + " " + temp + ";\n" + condition.statements + emission_context.indent + "if (" + condition.value + ") {\n" + prefixed_statements(
+						BASE_INDENT,
 						then_c.statements,
-					) + emission_context.indent + "  " + temp + " = " + then_value + ";\n" + emission_context.indent + "} else {\n" + indent_statements(
+					) + inner_indent + temp + " = " + then_value + ";\n" + emission_context.indent + "} else {\n" + prefixed_statements(
+						BASE_INDENT,
 						else_c.statements,
-					) + emission_context.indent + "  " + temp + " = " + else_value + ";\n" + emission_context.indent + "}\n",
+					) + inner_indent + temp + " = " + else_value + ";\n" + emission_context.indent + "}\n",
 					value = temp,
 					next_temp = else_c.next_temp,
 					returns = False,
