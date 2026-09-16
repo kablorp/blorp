@@ -113,7 +113,10 @@ import:
 		parsed_function_body_is_builtin,
 		parsed_function_body_kind,
 	../stage_03_parse/parsed_ast_traverse: map_parsed_expr_children
-	../stage_04_modules/loaded_module: ModuleIdentity, resolved_module_identities_equal
+	../stage_04_modules/loaded_module:
+		ModuleIdentity,
+		ModuleOrigin(UserModule),
+		resolved_module_identities_equal,
 	../stage_04_modules/module_table:
 		ModuleId,
 		ModuleTable,
@@ -8725,7 +8728,11 @@ private pure func complete_typecheck_graph_for_meta_run(
 	target_scope = indexed_graph_target_scope(indexed_graph)
 
 	if importable_module_graph_matches_scope(importable_graph, target_scope):
-		match accepted_alias_graph_build(type_headers, bound_graph):
+		alias_mark = typecheck_phase_mark()
+		alias_build = accepted_alias_graph_build(type_headers, bound_graph)
+		record_typecheck_phase("accepted_aliases", alias_mark)
+
+		match alias_build:
 			Err(errors):
 				TypecheckGraphCompletionRejected(errors.map(
 					func(
@@ -8734,8 +8741,11 @@ private pure func complete_typecheck_graph_for_meta_run(
 				))
 			Ok(accepted_alias_graph):
 				accepted_alias_table = accepted_alias_graph_table(accepted_alias_graph)
+				record_mark = typecheck_phase_mark()
+				record_build = accepted_record_graph_build(type_headers, bound_graph)
+				record_typecheck_phase("accepted_records", record_mark)
 
-				match accepted_record_graph_build(type_headers, bound_graph):
+				match record_build:
 					Err(errors):
 						TypecheckGraphCompletionRejected(errors.map(
 							func(
@@ -8744,14 +8754,17 @@ private pure func complete_typecheck_graph_for_meta_run(
 						))
 					Ok(accepted_record_graph):
 						accepted_record_table = accepted_record_graph_table(accepted_record_graph)
-
-						match accepted_union_graph_build(
+						union_mark = typecheck_phase_mark()
+						union_build = accepted_union_graph_build(
 							type_headers,
 							bound_graph,
 							accepted_alias_table,
 							builtin_env,
 							BUILTIN_UNION_TYPE_NAMES,
-						):
+						)
+						record_typecheck_phase("accepted_unions", union_mark)
+
+						match union_build:
 							Err(errors):
 								TypecheckGraphCompletionRejected(errors.map(
 									func(
@@ -8763,16 +8776,21 @@ private pure func complete_typecheck_graph_for_meta_run(
 									accepted_union_graph,
 								)
 
-								match accepted_global_table_build(
+								global_mark = typecheck_phase_mark()
+								global_build = accepted_global_table_build(
 									type_headers,
 									callable_headers,
 									bound_graph,
-								):
+								)
+								record_typecheck_phase("accepted_globals", global_mark)
+
+								match global_build:
 									Err(errors):
 										TypecheckGraphCompletionRejected(errors.map(
 											func(message): "internal typecheck error: " + message,
 										))
 									Ok(initial_global_table):
+										completion_mark = typecheck_phase_mark()
 										completion = complete_global_header_graph(
 											implementation_headers,
 											initial_global_table,
@@ -8782,7 +8800,12 @@ private pure func complete_typecheck_graph_for_meta_run(
 											allow_debug_only_calls,
 											meta_run,
 										)
-										finish_typecheck_graph_completion(
+										record_typecheck_phase(
+											"global_header_completion",
+											completion_mark,
+										)
+										finish_mark = typecheck_phase_mark()
+										finished = finish_typecheck_graph_completion(
 											implementation_headers,
 											importable_graph,
 											accepted_alias_graph,
@@ -8793,6 +8816,8 @@ private pure func complete_typecheck_graph_for_meta_run(
 											completion,
 											meta_run,
 										)
+										record_typecheck_phase("accepted_graph", finish_mark)
+										finished
 	else:
 		TypecheckGraphCompletionRejected(
 			[
@@ -11058,6 +11083,147 @@ private pure func check_function_body_artifact(
 					}))
 
 
+-- Per-body cost attribution, opt-in through BLORP_TYPECHECK_BODY_METRICS=1.
+-- The probes are instrumentation, not semantics: with the variable unset the
+-- scope is resolved once per module and each body pays one branch.
+foreign:
+	pure func typecheck_body_metrics_enabled() -> Int = "blorp_typecheck_body_metrics_enabled_c"
+	pure func typecheck_body_metrics_now() -> Int = "blorp_runtime_monotonic_microseconds_c"
+	pure func typecheck_body_metrics_allocations() -> Int = "blorp_runtime_total_allocations_c"
+	pure func typecheck_body_metric_record(
+		module_path: String,
+		callable: String,
+		microseconds: Int,
+		allocations: Int,
+		source_lines: Int,
+		is_dependency: Int,
+	) -> Void = "blorp_typecheck_body_metric_record_c"
+	pure func typecheck_phase_metric_record(
+		phase: String,
+		microseconds: Int,
+		allocations: Int,
+	) -> Void = "blorp_typecheck_phase_metric_record_c"
+
+
+-- Graph-construction cost attribution under the same variable: one mark per
+-- phase boundary. With the variable unset a mark is one probe call and the
+-- phase list stays empty.
+record TypecheckPhaseMark {
+	enabled: Bool,
+	started: Int,
+	allocations: Int
+}
+
+
+pure func typecheck_metrics_are_enabled() -> Bool:
+	typecheck_body_metrics_enabled() != 0
+
+
+pure func typecheck_phase_mark() -> TypecheckPhaseMark:
+	if typecheck_body_metrics_enabled() == 0:
+		{
+			enabled = False,
+			started = 0,
+			allocations = 0
+		}
+	else:
+		{
+			enabled = True,
+			started = typecheck_body_metrics_now(),
+			allocations = typecheck_body_metrics_allocations()
+		}
+
+
+pure func record_typecheck_phase(phase: String, mark: TypecheckPhaseMark) -> Void:
+	if mark.enabled:
+		typecheck_phase_metric_record(
+			phase,
+			typecheck_body_metrics_now() - mark.started,
+			typecheck_body_metrics_allocations() - mark.allocations,
+		)
+	else:
+		void
+
+
+private record BodyMetricsScope {
+	enabled: Bool,
+	module_path: String,
+	is_dependency: Bool
+}
+
+
+private pure func module_origin_is_dependency(origin: ModuleOrigin) -> Bool:
+	match origin:
+		UserModule:
+			False
+		_:
+			True
+
+
+private pure func disabled_body_metrics_scope() -> BodyMetricsScope:
+	{
+		enabled = False,
+		module_path = "",
+		is_dependency = False
+	}
+
+
+private pure func body_metrics_scope_for_base(base: AcceptedBodyModuleBase) -> BodyMetricsScope:
+	if typecheck_body_metrics_enabled() == 0:
+		disabled_body_metrics_scope()
+	else:
+		scope = bound_module_scope(base.representation.bound_module)
+		{
+			enabled = True,
+			module_path = prepared_module_scope_canonical_path(scope),
+			is_dependency = module_origin_is_dependency(prepared_module_scope_origin(scope))
+		}
+
+
+-- Callers branch on `scope.enabled` so a compile without the variable never
+-- carries the scope into the body loop; this path always records a row.
+private pure func check_body_context_recording_metrics(
+	context: BodyCheckContext,
+	scope: BodyMetricsScope,
+) -> BodyCheckOutcome:
+	started = typecheck_body_metrics_now()
+	allocations_before = typecheck_body_metrics_allocations()
+	outcome = check_body_context(context)
+	elapsed = typecheck_body_metrics_now() - started
+	allocations = typecheck_body_metrics_allocations() - allocations_before
+	source = from_opaque BodyCheckContext(context).source
+
+	dependency_flag = if scope.is_dependency:
+		1
+	else:
+		0
+
+	typecheck_body_metric_record(
+		scope.module_path,
+		source.name.text,
+		elapsed,
+		allocations,
+		source.span.end_line - source.span.start_line + 1,
+		dependency_flag,
+	)
+	outcome
+
+
+-- CTFE checks reachable bodies through its own worklist rather than the
+-- module body loop, so it takes the same attribution path by registry.
+pure func check_registry_body_context_with_metrics(
+	registry: BodyCheckRegistry,
+	context: BodyCheckContext,
+) -> BodyCheckOutcome:
+	if typecheck_body_metrics_enabled() == 0:
+		check_body_context(context)
+	else:
+		check_body_context_recording_metrics(
+			context,
+			body_metrics_scope_for_base(from_opaque BodyCheckRegistry(registry).base),
+		)
+
+
 pure func check_body_context(context: BodyCheckContext) -> BodyCheckOutcome:
 	representation = from_opaque BodyCheckContext(context)
 	check_function_body_artifact(
@@ -11106,12 +11272,17 @@ private pure func check_complete_body_table_in_order(
 			})
 	else:
 		contexts = ordered_body_contexts(draft.contexts, order)
+		metrics_scope = body_metrics_scope_for_base(base)
 		var rows: Dict[Int, BodyCheckOutcome] = {}
 		var checked_order: List[CallableId] = []
 		var duplicate_errors: List[String] = []
 
 		for context in contexts:
-			outcome = check_body_context(context)
+			outcome = if metrics_scope.enabled:
+				check_body_context_recording_metrics(context, metrics_scope)
+			else:
+				check_body_context(context)
+
 			id = body_check_outcome_callable_id(outcome)
 			definition_id = callable_id_definition_id(id)
 			checked_order = checked_order.append(id)
@@ -11696,13 +11867,13 @@ private pure func body_check_outcome_reusable_for_context(
 		True
 
 
-private pure func body_outcome_table_with_checked_context(
+private pure func body_outcome_table_with_checked_outcome(
 	table: BodyOutcomeTable,
-	context: BodyCheckContext,
+	outcome: BodyCheckOutcome,
 ) -> BodyOutcomeTable:
-	-- The context came from this module's accepted body plan. Rechecking it
-	-- produces the sole replacement row without readmitting all seed outcomes.
-	outcome = check_body_context(context)
+	-- The outcome came from this module's accepted body plan. Rechecking one
+	-- context produces the sole replacement row without readmitting all seed
+	-- outcomes.
 	representation = from_opaque BodyOutcomeTable(table)
 	definition_id = callable_id_definition_id(body_check_outcome_callable_id(outcome))
 	into_opaque BodyOutcomeTable(
@@ -11718,6 +11889,7 @@ private pure func materialize_complete_from_validated_seed(
 	seed_table: BodyOutcomeTable,
 	main_policy: MainValidationPolicy,
 ) -> SeededBodyCheckRun:
+	metrics_scope = body_metrics_scope_for_base(base)
 	var table = seed_table
 	var checked_bodies: Int = 0
 	var reused_bodies: Int = 0
@@ -11730,10 +11902,20 @@ private pure func materialize_complete_from_validated_seed(
 				if body_check_outcome_reusable_for_context(outcome, context):
 					reused_bodies += 1
 				else:
-					table = body_outcome_table_with_checked_context(table, context)
+					checked = if metrics_scope.enabled:
+						check_body_context_recording_metrics(context, metrics_scope)
+					else:
+						check_body_context(context)
+
+					table = body_outcome_table_with_checked_outcome(table, checked)
 					checked_bodies += 1
 			None:
-				table = body_outcome_table_with_checked_context(table, context)
+				checked = if metrics_scope.enabled:
+					check_body_context_recording_metrics(context, metrics_scope)
+				else:
+					check_body_context(context)
+
+				table = body_outcome_table_with_checked_outcome(table, checked)
 				checked_bodies += 1
 
 	-- Admission already rejected every seed row outside this plan, and the loop
