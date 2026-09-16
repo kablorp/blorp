@@ -85,7 +85,6 @@ current-state and next-action summary.
 - [Unchanged Core node reuse in the shared traversal](compiler-performance/147-reuse-unchanged-core-nodes-in-traversal.md)
 - [Perceus single-pass ownership summaries](compiler-performance/148-perceus-single-pass-ownership-summaries.md)
 - [Core pass linear-scan indexes](compiler-performance/149-index-core-pass-linear-scans.md)
-- [Frontend discovery phase and lexer scanning](compiler-performance/150-frontend-discovery-phase-and-lexer-scanning.md)
 - [Normalized semantic compilation roadmap](compiler-performance/NORMALIZED_SEMANTIC_COMPILATION_ROADMAP.md)
 - [Perceus ownership roadmap](compiler-performance/PERCEUS_OWNERSHIP_OPTIMIZATION_ROADMAP.md)
 - [Nested record allocation folding prototype](compiler-performance/NESTED_RECORD_FOLDING_PROTOTYPE_ROADMAP.md)
