@@ -1,0 +1,215 @@
+-- Characterizes which shapes of "rebuild a record whose field is a growing
+-- collection" keep the collection uniquely owned, and which do not.
+--
+-- A fused record update (`{ state | items = state.items.append(i) }`) moves the
+-- field out of a unique source (`CowFieldTakeRetainPolicy`), so `append` sees a
+-- unique list and grows it in place: allocations are the amortized vector
+-- growth steps, independent of the loop trip count.
+--
+-- Hoisting the same append into a preceding binding loses that: the field read
+-- is outside the record update, so it is retained with a plain `blorp_retain`,
+-- the list has two owners across `append`, and every iteration copies. The
+-- `hoisted_*` expectations below record today's behavior, not desired
+-- behavior; a fix that extends the field take to a hoisted read is expected to
+-- fail them and should replace them with the fused expectations.
+import:
+	memory: MemStats, get_mem_stats, reset_mem_stats
+	test: TestSuite
+
+
+record State {
+	items: List[Int],
+	count: Int
+}
+
+
+private ROUNDS: Int = 1000
+
+-- Amortized doubling from an empty list needs ~log2(ROUNDS) reallocations.
+private GROWTH_ALLOCATION_CEILING: Int = 32
+
+
+private func fused_update(n: Int) -> State:
+	var state: State = {
+		items = [],
+		count = 0
+	}
+	var i: Int = 0
+
+	while i < n:
+		state = { state |
+			items = state.items.append(i),
+			count = state.count + 1
+		}
+		i += 1
+
+	state
+
+
+private func hoisted_then_rebuild(n: Int) -> State:
+	var state: State = {
+		items = [],
+		count = 0
+	}
+	var i: Int = 0
+
+	while i < n:
+		items: List[Int] = state.items.append(i)
+		next_count: Int = state.count + 1
+		state = {
+			items = items,
+			count = next_count
+		}
+		i += 1
+
+	state
+
+
+private func hoisted_then_update(n: Int) -> State:
+	var state: State = {
+		items = [],
+		count = 0
+	}
+	var i: Int = 0
+
+	while i < n:
+		items: List[Int] = state.items.append(i)
+		state = { state |
+			items = items,
+			count = state.count + 1
+		}
+		i += 1
+
+	state
+
+
+func test_fused_record_update_grows_the_field_in_place() -> Bool:
+	reset_mem_stats()
+	state: State = fused_update(ROUNDS)
+	stats: MemStats = get_mem_stats()
+
+	(
+		state.count == ROUNDS
+		and state.items.length() == ROUNDS
+		and stats.total_allocations <= GROWTH_ALLOCATION_CEILING
+	)
+
+
+func test_hoisted_append_then_rebuild_copies_every_iteration() -> Bool:
+	reset_mem_stats()
+	state: State = hoisted_then_rebuild(ROUNDS)
+	stats: MemStats = get_mem_stats()
+
+	-- One list copy plus one fresh record per iteration.
+	(
+		state.count == ROUNDS
+		and state.items.length() == ROUNDS
+		and stats.total_allocations >= 2 * ROUNDS
+	)
+
+
+func test_hoisted_append_then_update_reuses_the_record_but_copies_the_list() -> Bool:
+	reset_mem_stats()
+	state: State = hoisted_then_update(ROUNDS)
+	stats: MemStats = get_mem_stats()
+
+	-- The record is reused in place, so only the list copy remains.
+	(
+		state.count == ROUNDS
+		and state.items.length() == ROUNDS
+		and stats.total_allocations >= ROUNDS
+		and stats.total_allocations < 2 * ROUNDS
+	)
+
+
+-- The record crosses a function boundary. `state = step_*(state, i)` leaves the
+-- caller's binding dead at the call, so the consumed-parameter specialization
+-- hands the callee a unique record; only the fused body exploits it.
+pure func step_fused(state: State, i: Int) -> State:
+	{ state |
+		items = state.items.append(i),
+		count = state.count + 1
+	}
+
+
+pure func step_hoisted(state: State, i: Int) -> State:
+	items: List[Int] = state.items.append(i)
+	{ state |
+		items = items,
+		count = state.count + 1
+	}
+
+
+private func fill_param_fused(n: Int) -> State:
+	var state: State = {
+		items = [],
+		count = 0
+	}
+	var i: Int = 0
+
+	while i < n:
+		state = step_fused(state, i)
+		i += 1
+
+	state
+
+
+private func fill_param_hoisted(n: Int) -> State:
+	var state: State = {
+		items = [],
+		count = 0
+	}
+	var i: Int = 0
+
+	while i < n:
+		state = step_hoisted(state, i)
+		i += 1
+
+	state
+
+
+func test_consumed_parameter_with_fused_update_grows_in_place() -> Bool:
+	reset_mem_stats()
+	state: State = fill_param_fused(ROUNDS)
+	stats: MemStats = get_mem_stats()
+
+	(
+		state.count == ROUNDS
+		and state.items.length() == ROUNDS
+		and stats.total_allocations <= GROWTH_ALLOCATION_CEILING
+	)
+
+
+func test_consumed_parameter_with_hoisted_append_copies_every_iteration() -> Bool:
+	reset_mem_stats()
+	state: State = fill_param_hoisted(ROUNDS)
+	stats: MemStats = get_mem_stats()
+
+	state.count == ROUNDS and state.items.length() == ROUNDS and stats.total_allocations >= ROUNDS
+
+
+tests: TestSuite = {
+	description = "Record Update Field Take Ownership",
+	tests = [
+		(
+			"fused record update grows the field in place",
+			test_fused_record_update_grows_the_field_in_place,
+		),
+		(
+			"hoisted append then rebuild copies every iteration",
+			test_hoisted_append_then_rebuild_copies_every_iteration,
+		),
+		(
+			"hoisted append then update reuses the record but copies the list",
+			test_hoisted_append_then_update_reuses_the_record_but_copies_the_list,
+		),
+		(
+			"consumed parameter with fused update grows in place",
+			test_consumed_parameter_with_fused_update_grows_in_place,
+		),
+		(
+			"consumed parameter with hoisted append copies every iteration",
+			test_consumed_parameter_with_hoisted_append_copies_every_iteration,
+		),
+	]
+}
