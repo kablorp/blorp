@@ -1784,7 +1784,7 @@ Rules:
    `BLORP_CLI_C_OPTIMIZATION=-O2` for `make`, `scripts/compiler-build-status`,
    and the harness alike, since the build identity includes that level. The
    JSON records the level as `c_optimization`. Report which one you used.
-4. The harness takes a global lock in `$TMPDIR/blorp-perf-measure.lock`.
+4. The harness takes a shared lock in `$TMPDIR/blorp-perf-measure.lock` for measurements (they are single-process) and an exclusive lock for `lock --` commands.
    Wrap any command that spawns many compiled binaries
    (`scripts/compiler-check`, `scripts/test`) in
    `benchmarks/self_compile_measure lock -- <cmd>` so concurrent worktrees
