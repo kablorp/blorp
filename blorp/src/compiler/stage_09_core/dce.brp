@@ -1389,26 +1389,18 @@ private pure func build_reachability_index(program_value: CoreProgram) -> DceRea
 	var globals_by_name: Dict[String, CoreGlobal] = {}
 	var type_decls_by_name: Dict[String, List[CoreDecl]] = {}
 
+	-- Top-level functions and impl methods are indexed identically, so the decl
+	-- walk only gathers them and the indexing loop below owns the collision
+	-- bookkeeping once.
+	var indexed_functions: List[CoreFunction] = []
+
 	for decl in program_value.decls:
 		match decl:
 			FunctionDecl(function_info):
-				match functions_by_id.get(function_info.def_id):
-					Some(existing):
-						function_collisions_by_id = function_collisions_by_id.set(
-							function_info.def_id,
-							function_collisions_by_id
-								.get_or(function_info.def_id, [existing])
-								.append(function_info),
-						)
-					None:
-						functions_by_id = functions_by_id.set(function_info.def_id, function_info)
-
-				function_ids_by_name = function_ids_by_name.set(
-					function_info.name,
-					function_ids_by_name
-						.get_or(function_info.name, [])
-						.append(function_info.def_id),
-				)
+				indexed_functions = indexed_functions.append(function_info)
+			ImplDecl(impl_info):
+				for method in impl_info.methods:
+					indexed_functions = indexed_functions.append(method)
 			GlobalDecl(global):
 				-- Preserve the original first-declaration lookup behavior.
 				if not globals_by_name.contains(global.name.name):
@@ -1444,6 +1436,25 @@ private pure func build_reachability_index(program_value: CoreProgram) -> DceRea
 			_:
 				type_decls_by_name = add_type_decl(type_decls_by_name, decl)
 
+	for function_info in indexed_functions:
+		match functions_by_id.get(function_info.def_id):
+			Some(existing):
+				function_collisions_by_id = function_collisions_by_id.set(
+					function_info.def_id,
+					function_collisions_by_id
+						.get_or(function_info.def_id, [existing])
+						.append(function_info),
+				)
+			None:
+				functions_by_id = functions_by_id.set(function_info.def_id, function_info)
+
+		function_ids_by_name = function_ids_by_name.set(
+			function_info.name,
+			function_ids_by_name
+				.get_or(function_info.name, [])
+				.append(function_info.def_id),
+		)
+
 	{
 		functions_by_id = functions_by_id,
 		function_collisions_by_id = function_collisions_by_id,
@@ -1475,11 +1486,15 @@ private pure func collect_roots(
 	var fail_closed: Bool = False
 	var saw_main: Bool = False
 	var globals: List[CoreGlobal] = []
+	var impl_methods: List[CoreFunction] = []
 
 	for decl in program_value.decls:
 		match decl:
 			GlobalDecl(global):
 				globals = globals.append(global)
+			ImplDecl(impl_info):
+				for method in impl_info.methods:
+					impl_methods = impl_methods.append(method)
 			_:
 				void
 
@@ -1494,6 +1509,13 @@ private pure func collect_roots(
 			if not Sets.contains(reachable_set, function_info.def_id):
 				reachable = reachable.append(function_info.def_id)
 				reachable_set = Sets.add(reachable_set, function_info.def_id)
+
+	-- `keep_decl` retains every impl declaration, so each surviving method is a
+	-- root: whatever its body calls or names must survive with it.
+	for method in impl_methods:
+		if not Sets.contains(reachable_set, method.def_id):
+			reachable = reachable.append(method.def_id)
+			reachable_set = Sets.add(reachable_set, method.def_id)
 
 	for global in globals:
 		if not global.is_private and not Sets.contains(reachable_global_set, global.name.name):
@@ -1652,6 +1674,16 @@ private pure func collect_type_root_facts(
 			GlobalDecl(global):
 				if not global.is_private or Sets.contains(reachable_globals, global.name.name):
 					facts = collect_type(facts, global.typ)
+			ImplDecl(impl_info):
+				-- Impl declarations are never pruned, so the implemented type and
+				-- every method signature keep their types alive.
+				facts = collect_type(facts, impl_info.for_type)
+
+				for method in impl_info.methods:
+					facts = collect_type(facts, method.return_type)
+
+					for param in method.params:
+						facts = collect_type(facts, param.typ)
 			_:
 				void
 

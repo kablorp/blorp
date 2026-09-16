@@ -6,7 +6,15 @@ import:
 	../../../src/compiler/stage_09_core/ir:
 		CoreCallKind(UnknownCall, UserCall),
 		CoreClosureCreate,
-		CoreDecl(FunctionDecl, GlobalDecl, TraitDecl, TypeAliasDecl, UnionDecl, ValueRecordDecl),
+		CoreDecl(
+			FunctionDecl,
+			GlobalDecl,
+			ImplDecl,
+			TraitDecl,
+			TypeAliasDecl,
+			UnionDecl,
+			ValueRecordDecl,
+		),
 		CoreExpr(
 			AssignExpr,
 			CallExpr,
@@ -24,6 +32,7 @@ import:
 			VarExpr,
 			VoidExpr,
 		),
+		CoreFunction,
 		CoreFunctionKind(ProgramEntrypointFunction, UserFunction),
 		CoreHashContainerConstructor(CustomHashContainerConstructor),
 		CoreLiteral(BoolLiteral, IntLiteral),
@@ -119,6 +128,39 @@ pure func function_decl_with_return_type(
 		is_pure = True,
 		function_kind = function_kind_for_name(name),
 		def_id = def_id,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func impl_method(
+	name: String,
+	def_id: Int,
+	return_type: CoreType,
+	body: CoreExpr,
+) -> CoreFunction:
+	{
+		name = name,
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = return_type,
+		body = Some(body),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = def_id,
+		loc = SyntheticSourceLoc
+	}
+
+
+-- Impl declarations survive pruning unconditionally, so they must keep
+-- everything their methods reference. Mirrors the shape early Core still
+-- carries when the prune runs before impls are projected away.
+pure func impl_decl(trait_name: String, methods: List[CoreFunction]) -> CoreDecl:
+	ImplDecl({
+		trait_name = trait_name,
+		for_type = int_type(),
+		type_params = [],
+		methods = methods,
 		loc = SyntheticSourceLoc,
 	})
 
@@ -771,6 +813,52 @@ func test_fact_application_is_order_independent() -> Bool:
 	)
 
 
+func test_retains_types_referenced_only_by_impl_method_body() -> Bool:
+	input_program = program([
+		function_decl("main", 1, int_literal(0)),
+		impl_decl("Displayable", [impl_method(
+					"to_display",
+					2,
+					int_type(),
+					VoidExpr(ValueRecordType("ImplOnly"), SyntheticSourceLoc),
+				)]),
+		value_record_decl("ImplOnly", int_type()),
+		value_record_decl("Dead", int_type()),
+	])
+
+	value_record_names(prune_program(input_program)) == ["ImplOnly"]
+
+
+func test_retains_types_referenced_only_by_impl_method_signature() -> Bool:
+	input_program = program([
+		function_decl("main", 1, int_literal(0)),
+		impl_decl(
+			"Displayable",
+			[impl_method("to_display", 2, ValueRecordType("SignatureOnly"), int_literal(0))],
+		),
+		value_record_decl("SignatureOnly", int_type()),
+		value_record_decl("Dead", int_type()),
+	])
+
+	value_record_names(prune_program(input_program)) == ["SignatureOnly"]
+
+
+func test_retains_functions_called_only_from_impl_method_body() -> Bool:
+	input_program = program([
+		function_decl("main", 1, int_literal(0)),
+		impl_decl("Displayable", [impl_method(
+					"to_display",
+					3,
+					int_type(),
+					user_call("helper", Some(2)),
+				)]),
+		function_decl("helper", 2, int_literal(2)),
+		function_decl("dead", 4, int_literal(4)),
+	])
+
+	function_names(prune_program(input_program)) == ["main", "helper"]
+
+
 func test_retains_trait_signatures() -> Bool:
 	input_program = program([
 		function_decl("main", 1, int_literal(0)),
@@ -849,5 +937,17 @@ tests: TestSuite = {
 		),
 		("fact application is order independent", test_fact_application_is_order_independent),
 		("retains trait signatures", test_retains_trait_signatures),
+		(
+			"retains types referenced only by impl method body",
+			test_retains_types_referenced_only_by_impl_method_body,
+		),
+		(
+			"retains types referenced only by impl method signature",
+			test_retains_types_referenced_only_by_impl_method_signature,
+		),
+		(
+			"retains functions called only from impl method body",
+			test_retains_functions_called_only_from_impl_method_body,
+		),
 	]
 }
