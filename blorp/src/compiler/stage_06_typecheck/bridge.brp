@@ -108,6 +108,7 @@ import:
 	../stage_07_ctfe/context:
 		CtfeImportBinding,
 		CtfeImportedProgram,
+		CtfeImportedProgramSet,
 		complete_ctfe_imported_program,
 		ctfe_import_bindings_for_module_table,
 		ctfe_imported_program_decls,
@@ -228,6 +229,7 @@ import:
 		callable_header_graph_error_message,
 		callable_header_graph_error_span,
 	headers/declaration_skeleton:
+		DeclarationSkeletonGraph,
 		DeclarationSkeletonGraphError,
 		callable_id_definition_id,
 		declaration_skeleton_graph_build,
@@ -254,6 +256,7 @@ import:
 		type_header_error_span,
 		type_header_graph_build,
 	headers/type_parameter_headers:
+		ResolvedTypeParameterGraph,
 		ResolvedTypeParameterGraphError,
 		resolved_type_parameter_graph_build,
 		resolved_type_parameter_graph_error_message,
@@ -820,21 +823,212 @@ private pure func bound_module_graph_error_messages(
 	errors.map(bound_module_graph_error_message)
 
 
+-- One helper per graph-construction phase: the mark brackets the builder call
+-- and the result stays in tail position, so a compile without
+-- BLORP_TYPECHECK_BODY_METRICS pays one probe call per phase and no more.
+private pure func timed_indexed_graph(
+	module_table: ModuleTable,
+	module_candidates: List[ModuleLoadCandidate],
+	target_candidate: ModuleLoadCandidate,
+) -> Result[IndexedGraph, List[IndexedGraphError]]:
+	mark = typecheck_phase_mark()
+	built = indexed_graph_build_for_module_table(module_table, module_candidates, target_candidate)
+	record_typecheck_phase("indexed_graph", mark)
+	built
+
+
+private pure func timed_importable_module_graph(
+	indexed_graph: IndexedGraph,
+) -> ImportableModuleGraph:
+	mark = typecheck_phase_mark()
+	built = importable_module_graph(indexed_graph)
+	record_typecheck_phase("importable_modules", mark)
+	built
+
+
+private pure func timed_module_scopes(
+	indexed_graph: IndexedGraph,
+	module_table: ModuleTable,
+	module_ids: List[ModuleId],
+) -> Result[List[PreparedModuleScope], List[IndexedGraphError]]:
+	mark = typecheck_phase_mark()
+	selected = indexed_graph_module_scopes_for_frontend_ids(indexed_graph, module_table, module_ids)
+	record_typecheck_phase("module_scopes", mark)
+	selected
+
+
+private pure func timed_importable_module_index(
+	importable_graph: ImportableModuleGraph,
+) -> ImportableModuleIndex:
+	mark = typecheck_phase_mark()
+	index = importable_module_graph_all_index(importable_graph)
+	record_typecheck_phase("importable_index", mark)
+	index
+
+
+private pure func timed_bound_modules(
+	indexed_graph: IndexedGraph,
+	selected_scopes: List[PreparedModuleScope],
+	importable_index: ImportableModuleIndex,
+	allow_debug_only_calls: Bool,
+) -> Result[BoundModuleGraph, List[BoundModuleGraphError]]:
+	mark = typecheck_phase_mark()
+	bound = bind_all_typecheck_graph(
+		indexed_graph,
+		selected_scopes,
+		importable_index,
+		allow_debug_only_calls,
+	)
+	record_typecheck_phase("bound_modules", mark)
+	bound
+
+
+private pure func timed_declaration_skeletons(
+	bound_graph: BoundModuleGraph,
+) -> Result[DeclarationSkeletonGraph, List[DeclarationSkeletonGraphError]]:
+	mark = typecheck_phase_mark()
+	skeletons = declaration_skeleton_graph_build(bound_graph)
+	record_typecheck_phase("declaration_skeletons", mark)
+	skeletons
+
+
+private pure func timed_alias_dependencies(
+	skeletons: DeclarationSkeletonGraph,
+) -> Result[AcyclicTypeAliasDependencyGraph, List[String]]:
+	mark = typecheck_phase_mark()
+	validated = type_alias_dependency_graph_validate(skeletons)
+	record_typecheck_phase("alias_dependencies", mark)
+	validated
+
+
+private pure func timed_resolved_type_parameters(
+	alias_dependencies: AcyclicTypeAliasDependencyGraph,
+) -> Result[ResolvedTypeParameterGraph, List[ResolvedTypeParameterGraphError]]:
+	mark = typecheck_phase_mark()
+	parameters = resolved_type_parameter_graph_build(alias_dependencies)
+	record_typecheck_phase("resolved_type_parameters", mark)
+	parameters
+
+
+private pure func timed_type_headers(
+	parameters: ResolvedTypeParameterGraph,
+) -> Result[TypeHeaderGraph, List[TypeHeaderError]]:
+	mark = typecheck_phase_mark()
+	headers = type_header_graph_build(parameters)
+	record_typecheck_phase("type_headers", mark)
+	headers
+
+
+private pure func timed_trait_topology(
+	type_headers: TypeHeaderGraph,
+) -> Result[TraitTopologyGraph, List[TraitTopologyGraphError]]:
+	mark = typecheck_phase_mark()
+	topology = trait_topology_graph_build(type_headers)
+	record_typecheck_phase("trait_topology", mark)
+	topology
+
+
+private pure func timed_callable_headers(
+	topology: TraitTopologyGraph,
+) -> Result[CallableHeaderGraph, List[CallableHeaderGraphError]]:
+	mark = typecheck_phase_mark()
+	headers = callable_header_graph_build(topology)
+	record_typecheck_phase("callable_headers", mark)
+	headers
+
+
+private pure func timed_implementation_headers(
+	callable_headers: CallableHeaderGraph,
+) -> Result[ImplementationHeaderGraph, List[ImplementationHeaderGraphError]]:
+	mark = typecheck_phase_mark()
+	headers = implementation_header_graph_build(callable_headers)
+	record_typecheck_phase("implementation_headers", mark)
+	headers
+
+
+private func timed_graph_completion(
+	implementation_headers: ImplementationHeaderGraph,
+	importable_graph: ImportableModuleGraph,
+	allow_debug_only_calls: Bool,
+) -> TypecheckGraphCompletion:
+	mark = typecheck_phase_mark()
+	completion = complete_typecheck_graph(
+		implementation_headers,
+		importable_graph,
+		allow_debug_only_calls,
+	)
+	record_typecheck_phase("graph_completion", mark)
+	completion
+
+
+private pure func timed_ctfe_dependency_plan(
+	module_table: ModuleTable,
+	target: PreparedModule,
+	modules: List[PreparedModule],
+	selected_modules: List[PreparedModule],
+) -> List[PreparedModule]:
+	mark = typecheck_phase_mark()
+	plan = ctfe_dependencies_for_graph(module_table, target, modules, selected_modules)
+	record_typecheck_phase("ctfe_dependency_plan", mark)
+	plan
+
+
+private pure func timed_ctfe_dependencies(
+	target_scope: PreparedModuleScope,
+	bound_graph: BoundModuleGraph,
+	dependency_plan: List[PreparedModule],
+	artifact_modules: List[PreparedModule],
+	reusable_artifact_paths: List[String],
+	allow_debug_only_calls: Bool,
+	accepted_graph: BodyTypecheckGraph,
+) -> Result[PreparedCtfeDependencies, List[BoundModuleGraphError]]:
+	mark = typecheck_phase_mark()
+	prepared = prepare_ctfe_dependencies_from_bound_graph(
+		target_scope,
+		bound_graph,
+		dependency_plan,
+		artifact_modules,
+		reusable_artifact_paths,
+		allow_debug_only_calls,
+		accepted_graph,
+	)
+	record_typecheck_phase("ctfe_dependencies", mark)
+	prepared
+
+
+private pure func timed_ctfe_global_graph(
+	definition_table: DefinitionTable,
+	target_module_id: ModuleId,
+	program_set: CtfeImportedProgramSet,
+) -> Result[CtfeEvaluatedGlobalGraph, CtfeEvalError]:
+	mark = typecheck_phase_mark()
+	evaluated = ctfe_evaluate_dependency_global_graph(
+		definition_table,
+		target_module_id,
+		program_set,
+	)
+	record_typecheck_phase("ctfe_globals", mark)
+	evaluated
+
+
+private func timed_module_bodies(
+	prepared: PreparedTypecheckGraphResult,
+	allow_debug_only_calls: Bool,
+) -> TypecheckedGraph:
+	mark = typecheck_phase_mark()
+	typechecked = typechecked_graph_from_prepared(prepared, allow_debug_only_calls)
+	record_typecheck_phase("module_bodies", mark)
+	typechecked
+
+
 private pure func validated_type_alias_dependencies(
 	bound_graph: BoundModuleGraph,
 ) -> Result[AcyclicTypeAliasDependencyGraph, List[String]]:
-	skeleton_mark = typecheck_phase_mark()
-	skeletons = declaration_skeleton_graph_build(bound_graph)
-	record_typecheck_phase("declaration_skeletons", skeleton_mark)
-
-	match skeletons:
+	match timed_declaration_skeletons(bound_graph):
 		Err(errors):
 			Err(errors.map(declaration_skeleton_graph_error_message))
 		Ok(graph):
-			alias_mark = typecheck_phase_mark()
-			validated = type_alias_dependency_graph_validate(graph)
-			record_typecheck_phase("alias_dependencies", alias_mark)
-			validated
+			timed_alias_dependencies(graph)
 
 
 private pure func typecheck_diagnostics_from_messages(
@@ -850,11 +1044,7 @@ private pure func validated_type_headers(
 		Err(errors):
 			Err(typecheck_diagnostics_from_messages(errors))
 		Ok(alias_dependencies):
-			parameter_mark = typecheck_phase_mark()
-			parameter_graph = resolved_type_parameter_graph_build(alias_dependencies)
-			record_typecheck_phase("resolved_type_parameters", parameter_mark)
-
-			match parameter_graph:
+			match timed_resolved_type_parameters(alias_dependencies):
 				Err(errors):
 					Err(
 						typecheck_diagnostics_from_messages(
@@ -862,11 +1052,7 @@ private pure func validated_type_headers(
 						),
 					)
 				Ok(parameters):
-					header_mark = typecheck_phase_mark()
-					header_graph = type_header_graph_build(parameters)
-					record_typecheck_phase("type_headers", header_mark)
-
-					match header_graph:
+					match timed_type_headers(parameters):
 						Err(errors):
 							definition_table = definition_index_definition_table(
 								indexed_graph_definition_index(
@@ -892,11 +1078,7 @@ private pure func validated_trait_topology(
 		Err(errors):
 			Err(errors)
 		Ok(type_headers):
-			topology_mark = typecheck_phase_mark()
-			topology_graph = trait_topology_graph_build(type_headers)
-			record_typecheck_phase("trait_topology", topology_mark)
-
-			match topology_graph:
+			match timed_trait_topology(type_headers):
 				Err(errors):
 					Err(
 						errors.map(func(error):
@@ -917,11 +1099,7 @@ private pure func validated_callable_headers(
 		Err(errors):
 			Err(errors)
 		Ok(topology):
-			callable_mark = typecheck_phase_mark()
-			callable_graph = callable_header_graph_build(topology)
-			record_typecheck_phase("callable_headers", callable_mark)
-
-			match callable_graph:
+			match timed_callable_headers(topology):
 				Err(errors):
 					Err(
 						errors.map(func(error):
@@ -942,11 +1120,7 @@ private pure func validated_implementation_headers(
 		Err(errors):
 			Err(errors)
 		Ok(callable_headers):
-			implementation_mark = typecheck_phase_mark()
-			implementation_graph = implementation_header_graph_build(callable_headers)
-			record_typecheck_phase("implementation_headers", implementation_mark)
-
-			match implementation_graph:
+			match timed_implementation_headers(callable_headers):
 				Err(errors):
 					Err(
 						errors.map(func(error):
@@ -3038,11 +3212,9 @@ private pure func evaluated_ctfe_globals_for_graph(
 	target_module_id: ModuleId,
 	ctfe_dependencies: List[PreparedCtfeDependency],
 ) -> Result[Option[CtfeEvaluatedGlobalGraph], CtfeEvalError]:
-	mark = typecheck_phase_mark()
 	programs = available_ctfe_imported_programs_from_dependencies(ctfe_dependencies)
 	program_set = ctfe_imported_program_set(definition_table, programs)
-	graph ?= ctfe_evaluate_dependency_global_graph(definition_table, target_module_id, program_set)
-	record_typecheck_phase("ctfe_globals", mark)
+	graph ?= timed_ctfe_global_graph(definition_table, target_module_id, program_set)
 	Ok(Some(graph))
 
 
@@ -4057,8 +4229,8 @@ private pure func prepare_typecheck_graph_from_completed_headers(
 	typecheck_graph: BodyTypecheckGraph,
 ) -> PreparedTypecheckGraphResult:
 	bound_target = bound_module_graph_target(bound_graph)
-	ctfe_mark = typecheck_phase_mark()
-	ctfe_result = prepare_ctfe_dependencies_from_bound_graph(
+
+	match timed_ctfe_dependencies(
 		target_scope,
 		bound_graph,
 		ctfe_dependency_plan,
@@ -4066,10 +4238,7 @@ private pure func prepare_typecheck_graph_from_completed_headers(
 		selected_modules.map(func(module): prepared_module_canonical_path(module)),
 		allow_debug_only_calls,
 		typecheck_graph,
-	)
-	record_typecheck_phase("ctfe_dependencies", ctfe_mark)
-
-	match ctfe_result:
+	):
 		Err(errors):
 			PreparedTypecheckGraphRejected(
 				RejectedPreparedTarget(target),
@@ -4121,28 +4290,22 @@ private func prepare_bound_typecheck_graph(
 	target = prepared_module_scope_module(target_scope)
 	modules = indexed_graph_modules(indexed_graph)
 	selected_modules = selected_scopes.map(prepared_module_scope_module)
-	ctfe_plan_mark = typecheck_phase_mark()
-	ctfe_dependency_plan = ctfe_dependencies_for_graph(
+	ctfe_dependency_plan = timed_ctfe_dependency_plan(
 		indexed_graph_module_table(indexed_graph),
 		target,
 		modules,
 		selected_modules,
 	)
-	record_typecheck_phase("ctfe_dependency_plan", ctfe_plan_mark)
 
 	match validated_implementation_headers(bound_graph):
 		Err(errors):
 			PreparedTypecheckGraphRejected(RejectedPreparedTarget(target), errors)
 		Ok(implementation_headers):
-			completion_mark = typecheck_phase_mark()
-			completion = complete_typecheck_graph(
+			match timed_graph_completion(
 				implementation_headers,
 				importable_graph,
 				allow_debug_only_calls,
-			)
-			record_typecheck_phase("graph_completion", completion_mark)
-
-			match completion:
+			):
 				TypecheckGraphCompletionRejected(completion_errors):
 					PreparedTypecheckGraphRejected(
 						RejectedPreparedTarget(target),
@@ -4224,37 +4387,23 @@ private func prepare_indexed_typecheck_graph_by_id(
 	allow_debug_only_calls: Bool,
 ) -> PreparedTypecheckGraphResult:
 	target = indexed_graph_target(indexed_graph)
-	importable_mark = typecheck_phase_mark()
-	importable_graph = importable_module_graph(indexed_graph)
-	record_typecheck_phase("importable_modules", importable_mark)
-	scope_mark = typecheck_phase_mark()
-	selection = indexed_graph_module_scopes_for_frontend_ids(
-		indexed_graph,
-		module_table,
-		module_target_ids,
-	)
-	record_typecheck_phase("module_scopes", scope_mark)
+	importable_graph = timed_importable_module_graph(indexed_graph)
 
-	match selection:
+	match timed_module_scopes(indexed_graph, module_table, module_target_ids):
 		Err(errors):
 			PreparedTypecheckGraphRejected(
 				RejectedPreparedTarget(target),
 				typecheck_diagnostics_from_messages(indexed_graph_error_messages(errors)),
 			)
 		Ok(selected_scopes):
-			index_mark = typecheck_phase_mark()
-			importable_index = importable_module_graph_all_index(importable_graph)
-			record_typecheck_phase("importable_index", index_mark)
-			bound_mark = typecheck_phase_mark()
-			bound_result = bind_all_typecheck_graph(
+			importable_index = timed_importable_module_index(importable_graph)
+
+			match timed_bound_modules(
 				indexed_graph,
 				selected_scopes,
 				importable_index,
 				allow_debug_only_calls,
-			)
-			record_typecheck_phase("bound_modules", bound_mark)
-
-			match bound_result:
+			):
 				Err(errors):
 					PreparedTypecheckGraphRejected(
 						RejectedPreparedTarget(target),
@@ -4753,15 +4902,11 @@ private func typecheck_frontend_graph_ids_for_table(
 ) -> Option[TypecheckedGraph]:
 	input ?= frontend_typecheck_input(graph, root_id, module_target_ids)
 
-	indexed_mark = typecheck_phase_mark()
-	indexed_build = indexed_graph_build_for_module_table(
+	prepared = match timed_indexed_graph(
 		frontend_graph_module_table(graph),
 		input.module_candidates,
 		input.target,
-	)
-	record_typecheck_phase("indexed_graph", indexed_mark)
-
-	prepared = match indexed_build:
+	):
 		Err(errors):
 			PreparedTypecheckGraphRejected(
 				RejectedCandidateTarget(input.target),
@@ -4775,9 +4920,7 @@ private func typecheck_frontend_graph_ids_for_table(
 				allow_debug_only_calls,
 			)
 
-	bodies_mark = typecheck_phase_mark()
-	typechecked = typechecked_graph_from_prepared(prepared, allow_debug_only_calls)
-	record_typecheck_phase("module_bodies", bodies_mark)
+	typechecked = timed_module_bodies(prepared, allow_debug_only_calls)
 	typecheck_body_metrics_report()
 	Some(typechecked)
 
