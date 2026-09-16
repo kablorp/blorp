@@ -672,9 +672,24 @@ union OwnershipCallableContractSource:
 	ExplicitCallSiteContract
 
 
+-- Callable entries keyed by definition ID. A bucket holds every entry that
+-- shares the definition ID in declaration order, so `lookup_ownership_callable_id`
+-- keeps the first declaration that also matches the requested name without
+-- hashing the name.
 record OwnershipCallableIndex {
 	entries_by_id: List[OwnershipCallableEntry],
-	candidate_ids_by_name: Dict[String, List[OwnershipCallableId]]
+	candidate_ids_by_def_id: Dict[Int, List[OwnershipCallableId]]
+}
+
+
+-- Inferred user-call contracts by callable ID together with the argument
+-- modes each denotes for the callable's declared parameter count. Build one
+-- through `user_call_contract_table` so an `arg_modes_by_callable_id` entry
+-- always equals the list `consumed_arg_modes` builds on demand for that
+-- callable's own arity; a missing entry means "build on demand".
+record UserCallContractTable {
+	consumed_args_by_callable_id: List[List[Int]],
+	arg_modes_by_callable_id: List[List[OwnershipArgMode]]
 }
 
 
@@ -698,7 +713,7 @@ record PerceusEnv {
 	constructor_definitions: List[CoreDefinitionIdentity],
 	nullary_constructor_definitions: List[CoreDefinitionIdentity],
 	callables: OwnershipCallableIndex,
-	user_call_contracts_by_callable_id: List[List[Int]],
+	user_call_contracts: UserCallContractTable,
 	infer_unresolved_user_calls_as_borrow: Bool,
 	balance_strategy: PerceusBalanceStrategy,
 	transferable_result_vars: List[CoreVar]
@@ -1078,9 +1093,9 @@ pure func perceus_env_for_managed_types(managed_type_names: List[String]) -> Per
 		nullary_constructor_definitions = [],
 		callables = {
 			entries_by_id = [],
-			candidate_ids_by_name = {}
+			candidate_ids_by_def_id = {}
 		},
-		user_call_contracts_by_callable_id = [],
+		user_call_contracts = empty_user_call_contract_table(),
 		infer_unresolved_user_calls_as_borrow = False,
 		balance_strategy = LinearOwnershipBalance,
 		transferable_result_vars = []
@@ -1135,12 +1150,12 @@ private pure func consumed_user_call_contract(
 		})
 
 
-private pure func user_call_contract_from_consumed_args(
-	env: PerceusEnv,
+-- Argument modes for a call with `arg_count` arguments whose consumed
+-- parameter indices are `consumed_args`.
+private pure func consumed_arg_modes(
 	consumed_args: List[Int],
 	arg_count: Int,
-	return_type: CoreType,
-) -> OwnershipCallContract:
+) -> List[OwnershipArgMode]:
 	var args: List[OwnershipArgMode] = []
 	var index: Int = 0
 
@@ -1151,6 +1166,76 @@ private pure func user_call_contract_from_consumed_args(
 			args = args.append(BorrowArg)
 
 		index += 1
+
+	args
+
+
+private pure func empty_user_call_contract_table() -> UserCallContractTable:
+	{
+		consumed_args_by_callable_id = [],
+		arg_modes_by_callable_id = []
+	}
+
+
+private pure func user_call_contract_table(
+	callables: OwnershipCallableIndex,
+	consumed_args_by_callable_id: List[List[Int]],
+) -> UserCallContractTable:
+	var arg_modes_by_callable_id: List[List[OwnershipArgMode]] = []
+	var callable_id: OwnershipCallableId = 0
+
+	for consumed_args in consumed_args_by_callable_id:
+		parameter_count: Int = match callables.entries_by_id.get(callable_id):
+			Some(entry):
+				entry.parameter_count
+			None:
+				0
+
+		arg_modes_by_callable_id = arg_modes_by_callable_id.append(
+			consumed_arg_modes(
+				consumed_args,
+				parameter_count,
+			),
+		)
+		callable_id += 1
+
+	{
+		consumed_args_by_callable_id = consumed_args_by_callable_id,
+		arg_modes_by_callable_id = arg_modes_by_callable_id
+	}
+
+
+private pure func user_call_contract_from_consumed_args(
+	env: PerceusEnv,
+	consumed_args: List[Int],
+	arg_count: Int,
+	return_type: CoreType,
+) -> OwnershipCallContract:
+	{
+		args = consumed_arg_modes(consumed_args, arg_count),
+		result = result_mode_for_type(env, return_type)
+	}
+
+
+-- The inferred contract of `callable_id`, reusing the table's precomputed
+-- argument modes when the call arity is the callable's own.
+private pure func inferred_user_call_contract(
+	env: PerceusEnv,
+	callable_id: OwnershipCallableId,
+	consumed_args: List[Int],
+	arg_count: Int,
+	return_type: CoreType,
+) -> OwnershipCallContract:
+	args: List[OwnershipArgMode] = match env.user_call_contracts.arg_modes_by_callable_id.get(
+		callable_id,
+	):
+		Some(modes):
+			if modes.length() == arg_count:
+				modes
+			else:
+				consumed_arg_modes(consumed_args, arg_count)
+		None:
+			consumed_arg_modes(consumed_args, arg_count)
 
 	{
 		args = args,
@@ -1239,10 +1324,12 @@ private pure func lookup_ownership_callable_id(
 		Some(expected_def_id):
 			var found: Option[OwnershipCallableId] = None
 
-			for candidate_id in index.candidate_ids_by_name.get_or(name, []):
+			-- The bucket is keyed by the definition ID, so only the name still
+			-- needs checking.
+			for candidate_id in index.candidate_ids_by_def_id.get_or(expected_def_id, []):
 				match index.entries_by_id.get(candidate_id):
 					Some(entry):
-						if entry.identity.name == name and entry.identity.def_id == expected_def_id:
+						if entry.identity.name == name:
 							found = Some(candidate_id)
 							break
 						else:
@@ -1263,12 +1350,43 @@ private pure func callable_consumed_args(
 		Some(entry):
 			match entry.contract_source:
 				InferredCallableContract:
-					env.user_call_contracts_by_callable_id.get(callable_id)
+					env.user_call_contracts.consumed_args_by_callable_id.get(callable_id)
 				FixedCallableContract(consumed_args):
 					Some(consumed_args)
 				ExplicitCallSiteContract:
 					None
 		None:
+			None
+
+
+-- The contract `callable_id` carries from its own contract source: the solver
+-- table for inferred callables, the fixed list for closure bodies, and none
+-- for callables whose call sites carry explicit contracts.
+private pure func callable_user_call_contract(
+	env: PerceusEnv,
+	callable_id: OwnershipCallableId,
+	entry: OwnershipCallableEntry,
+	arg_count: Int,
+	return_type: CoreType,
+) -> Option[OwnershipCallContract]:
+	match entry.contract_source:
+		InferredCallableContract:
+			match env.user_call_contracts.consumed_args_by_callable_id.get(callable_id):
+				Some(consumed_args):
+					Some(
+						inferred_user_call_contract(
+							env,
+							callable_id,
+							consumed_args,
+							arg_count,
+							return_type,
+						),
+					)
+				None:
+					None
+		FixedCallableContract(consumed_args):
+			Some(user_call_contract_from_consumed_args(env, consumed_args, arg_count, return_type))
+		ExplicitCallSiteContract:
 			None
 
 
@@ -1281,9 +1399,46 @@ private pure func lookup_user_call_contract(
 ) -> Option[OwnershipCallContract]:
 	match lookup_ownership_callable_id(env.callables, name, def_id):
 		Some(callable_id):
-			match callable_consumed_args(env, callable_id):
-				Some(args):
-					Some(user_call_contract_from_consumed_args(env, args, arg_count, return_type))
+			match env.callables.entries_by_id.get(callable_id):
+				Some(entry):
+					callable_user_call_contract(env, callable_id, entry, arg_count, return_type)
+				None:
+					None
+		None:
+			None
+
+
+-- Resolves the callable once for both the direct builtin-wrapper contract and
+-- the callable's own contract, in that historical order.
+private pure func resolved_user_call_contract(
+	env: PerceusEnv,
+	name: String,
+	def_id: Option[Int],
+	arg_count: Int,
+	return_type: CoreType,
+) -> Option[OwnershipCallContract]:
+	match lookup_ownership_callable_id(env.callables, name, def_id):
+		Some(callable_id):
+			match env.callables.entries_by_id.get(callable_id):
+				Some(entry):
+					match entry.direct_consumed_args:
+						Some(consumed_args):
+							Some(
+								user_call_contract_from_consumed_args(
+									env,
+									consumed_args,
+									arg_count,
+									return_type,
+								),
+							)
+						None:
+							callable_user_call_contract(
+								env,
+								callable_id,
+								entry,
+								arg_count,
+								return_type,
+							)
 				None:
 					None
 		None:
@@ -1344,7 +1499,7 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 	var constructor_contracts_by_def_id: Dict[Int, List[ConstructorCallContract]] = {}
 	var constructor_contracts_by_parent_name: Dict[String, List[ConstructorCallContract]] = {}
 	var callable_entries: List[OwnershipCallableEntry] = []
-	var callable_candidate_ids_by_name: Dict[String, List[OwnershipCallableId]] = {}
+	var callable_candidate_ids_by_def_id: Dict[Int, List[OwnershipCallableId]] = {}
 	var function_definitions: List[CoreDefinitionIdentity] = []
 	var constructor_definitions: List[CoreDefinitionIdentity] = []
 	var global_values: List[PerceusGlobal] = []
@@ -1460,10 +1615,10 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 					),
 					contract_source = contract_source,
 				})
-				callable_candidate_ids_by_name = callable_candidate_ids_by_name.set(
-					func_info.name,
-					callable_candidate_ids_by_name
-						.get_or(func_info.name, [])
+				callable_candidate_ids_by_def_id = callable_candidate_ids_by_def_id.set(
+					func_info.def_id,
+					callable_candidate_ids_by_def_id
+						.get_or(func_info.def_id, [])
 						.append(callable_id),
 				)
 				function_definitions = function_definitions.append(identity)
@@ -1535,9 +1690,9 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 		nullary_constructor_definitions = nullary_constructor_definitions,
 		callables = {
 			entries_by_id = callable_entries,
-			candidate_ids_by_name = callable_candidate_ids_by_name
+			candidate_ids_by_def_id = callable_candidate_ids_by_def_id
 		},
-		user_call_contracts_by_callable_id = [],
+		user_call_contracts = empty_user_call_contract_table(),
 		infer_unresolved_user_calls_as_borrow = False,
 		balance_strategy = LinearOwnershipBalance,
 		transferable_result_vars = []
@@ -1777,20 +1932,19 @@ private pure func unresolved_user_call_contract(
 	if return_type_has_known_constructor_parent(env, return_type):
 		projected_or_unresolved_user_call_contract(env, consumed_args, arg_count, return_type)
 	else:
+		-- `contract_for_call` reaches this point only after the callable's own
+		-- contract lookup returned `None`, so repeating that lookup here (as the
+		-- historical code did) can never find a contract.
 		match lookup_constructor_call_contract(env, name, def_id, arg_count):
 			Some(contract):
 				Some(contract)
 			None:
-				match lookup_user_call_contract(env, name, def_id, arg_count, return_type):
-					Some(contract):
-						Some(contract)
-					None:
-						projected_or_unresolved_user_call_contract(
-							env,
-							consumed_args,
-							arg_count,
-							return_type,
-						)
+				projected_or_unresolved_user_call_contract(
+					env,
+					consumed_args,
+					arg_count,
+					return_type,
+				)
 
 
 pure func contract_for_call(
@@ -1825,34 +1979,18 @@ pure func contract_for_call(
 				Some(contract):
 					Some(contract)
 				None:
-					match lookup_direct_user_call_contract(
-						env,
-						name,
-						def_id,
-						arg_count,
-						return_type,
-					):
+					match resolved_user_call_contract(env, name, def_id, arg_count, return_type):
 						Some(contract):
 							Some(contract)
 						None:
-							match lookup_user_call_contract(
+							unresolved_user_call_contract(
 								env,
 								name,
 								def_id,
+								consumed_args,
 								arg_count,
 								return_type,
-							):
-								Some(contract):
-									Some(contract)
-								None:
-									unresolved_user_call_contract(
-										env,
-										name,
-										def_id,
-										consumed_args,
-										arg_count,
-										return_type,
-									)
+							)
 		ForeignCall(name, arg_passing):
 			Some(borrow_contract_for_signature(env, arg_count, return_type))
 		ClosureCall:
@@ -20323,7 +20461,7 @@ private pure func solve_user_call_contracts(
 		-- visible at the start of this wave. This preserves historical ordering
 		-- while keeping the normal graph path free of Core-expression rescans.
 		fallback_env: PerceusEnv = { env |
-			user_call_contracts_by_callable_id = wave_contracts,
+			user_call_contracts = user_call_contract_table(env.callables, wave_contracts),
 			infer_unresolved_user_calls_as_borrow = True
 		}
 
@@ -20395,7 +20533,10 @@ private pure func solve_user_call_contracts(
 private pure func infer_user_call_contracts(program: CoreProgram, env: PerceusEnv) -> PerceusEnv:
 	graph: OwnershipContractGraph = build_ownership_contract_graph(program, env)
 	{ env |
-		user_call_contracts_by_callable_id = solve_user_call_contracts(program, env, graph),
+		user_call_contracts = user_call_contract_table(
+			env.callables,
+			solve_user_call_contracts(program, env, graph),
+		),
 		infer_unresolved_user_calls_as_borrow = False
 	}
 
@@ -24922,7 +25063,7 @@ private pure func rewrite_function(env: PerceusEnv, func_info: CoreFunction) -> 
 				Some(def_id),
 			):
 				Some(callable_id):
-					env.user_call_contracts_by_callable_id.get_or(callable_id, [])
+					env.user_call_contracts.consumed_args_by_callable_id.get_or(callable_id, [])
 				None:
 					[]
 
