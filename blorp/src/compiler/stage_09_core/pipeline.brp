@@ -9,7 +9,7 @@ import:
 	dce as CoreDce
 	early_stages as CoreEarlyStages
 	fairness: insert_cooperative_checkpoints
-	ir: CoreProgram
+	ir: CoreProgram, core_program_to_json
 	match_projection as CoreMatchProjection
 	perceus as CorePerceus
 	pipeline_stage:
@@ -37,10 +37,150 @@ import:
 	reuse as CoreReuse
 	specialize as CoreSpecialize
 	static_string_literals as CoreStaticStringLiterals
+	system: now_microseconds
 	tensor_specialize as CoreTensorSpecialize
 
 
+-- The runtime prints allocation and RSS counters for a named checkpoint when
+-- BLORP_COMPILER_MEMORY_PROFILE is set, and is a no-op otherwise.
+foreign:
+	@no_copy func record_compile_memory_checkpoint(
+		phase: String,
+	) -> Void = "blorp_compiler_memory_checkpoint_c"
+
+
 opaque type PreparedCoreProgram = CoreProgram
+
+
+-- One whole-program Core pass. `invariant` runs on every compile and must stay
+-- cheap; `checked_invariant` runs only under `--check-invariants`.
+record CorePass {
+	name: String,
+	run: pure (CoreProgram) -> CoreProgram,
+	invariant: pure (CoreProgram) -> Option[String],
+	checked_invariant: pure (CoreProgram) -> Option[String]
+}
+
+
+record CorePassControl {
+	observe: List[String],
+	stop_after: Option[String],
+	check_invariants: Bool,
+	record_timings: Bool
+}
+
+
+record CorePassObservation {
+	name: String,
+	rendered: String
+}
+
+
+record CorePassTiming {
+	name: String,
+	microseconds: Int
+}
+
+
+union CorePassRun:
+	CorePassesCompleted(CoreProgram, List[CorePassObservation], List[CorePassTiming])
+	CorePassesStopped(String, String, List[CorePassObservation], List[CorePassTiming])
+	CorePassesFailed(String, String, List[CorePassTiming])
+
+
+pure func no_core_pass_invariant(program: CoreProgram) -> Option[String]:
+	None
+
+
+pure func core_pass(
+	name: String,
+	run: pure (CoreProgram) -> CoreProgram,
+) -> CorePass:
+	{
+		name = name,
+		run = run,
+		invariant = no_core_pass_invariant,
+		checked_invariant = no_core_pass_invariant
+	}
+
+
+private func core_pass_time(enabled: Bool) -> Int:
+	if enabled:
+		now_microseconds()
+	else:
+		0
+
+
+private pure func core_pass_stops(stop_after: Option[String], name: String) -> Bool:
+	match stop_after:
+		Some(target):
+			target == name
+		None:
+			False
+
+
+-- The single pass runner. It walks the list once, so a compile that requests
+-- several snapshots pays for each pass exactly once.
+func run_core_passes(
+	passes: List[CorePass],
+	program: CoreProgram,
+	control: CorePassControl,
+) -> CorePassRun:
+	var current: CoreProgram = program
+	var observations: List[CorePassObservation] = []
+	var timings: List[CorePassTiming] = []
+	var stop: Option[(String, String)] = None
+	var failure: Option[(String, String)] = None
+
+	for pass in passes:
+		if stop.is_none() and failure.is_none():
+			started: Int = core_pass_time(control.record_timings)
+			current = pass.run(current)
+			record_compile_memory_checkpoint("pass_${pass.name}_complete")
+
+			if control.record_timings:
+				timings = timings.append({
+					name = pass.name,
+					microseconds = now_microseconds() - started,
+				})
+
+			violation: Option[String] = match pass.invariant(current):
+				Some(detail):
+					Some(detail)
+				None:
+					if control.check_invariants:
+						pass.checked_invariant(current)
+					else:
+						None
+
+			match violation:
+				Some(detail):
+					failure = Some((pass.name, detail))
+				None:
+					observed: Bool = control.observe.contains(pass.name)
+					stopped: Bool = core_pass_stops(control.stop_after, pass.name)
+
+					if observed or stopped:
+						rendered: String = core_program_to_json(current).to_string()
+
+						if observed:
+							observations = observations.append({
+								name = pass.name,
+								rendered = rendered,
+							})
+
+						if stopped:
+							stop = Some((pass.name, rendered))
+
+	match failure:
+		Some((failed_name, detail)):
+			CorePassesFailed(failed_name, detail, timings)
+		None:
+			match stop:
+				Some((stopped_name, rendered)):
+					CorePassesStopped(stopped_name, rendered, observations, timings)
+				None:
+					CorePassesCompleted(current, observations, timings)
 
 
 pure func prepared_core_program(program: CoreProgram) -> PreparedCoreProgram:
