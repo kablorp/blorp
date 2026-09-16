@@ -625,6 +625,48 @@ private pure func append_source_segment(
 		text
 
 
+-- A literal body never spans a line, so a run inside one is scanned by offset
+-- with only tabs moving the column by more than one.
+private pure func run_end_state(state: LexerState, end_offset: Int, end_column: Int) -> LexerState:
+	if end_offset == state.cursor.offset:
+		state
+	else:
+		{ state | cursor = {
+				offset = end_offset,
+				line = state.cursor.line,
+				column = end_column
+			} }
+
+
+-- Skip the run of string-body characters that are copied verbatim, stopping at
+-- the closing quote, a newline, an escape, or an interpolation marker.
+private pure func skip_plain_string_run(state: LexerState) -> LexerState:
+	text: String = state.source.text
+	var offset: Int = state.cursor.offset
+	var column: Int = state.cursor.column
+
+	while True:
+		match text.get(offset):
+			Some('\"'):
+				break
+			Some('\n'):
+				break
+			Some('\\'):
+				break
+			Some('$'):
+				break
+			Some('\t'):
+				column += tab_advance(column)
+				offset += 1
+			Some(_):
+				column += 1
+				offset += 1
+			None:
+				break
+
+	run_end_state(state, offset, column)
+
+
 private pure func consume_until_single_quote(state: LexerState) -> LexerState:
 	var st: LexerState = state
 
@@ -670,17 +712,25 @@ private pure func scan_spaces(state: LexerState) -> LexerState:
 
 private pure func scan_line_comment(state: LexerState) -> LexerStep:
 	start_cursor: Cursor = state.cursor
-	var st: LexerState = advance(advance(state))
+	after_marker: LexerState = advance(advance(state))
+	text: String = after_marker.source.text
+	var offset: Int = after_marker.cursor.offset
+	var column: Int = after_marker.cursor.column
 
 	while True:
-		match peek(st):
+		match text.get(offset):
 			Some('\n'):
 				break
+			Some('\t'):
+				column += tab_advance(column)
+				offset += 1
 			Some(_):
-				st = advance(st)
+				column += 1
+				offset += 1
 			None:
 				break
 
+	st: LexerState = run_end_state(after_marker, offset, column)
 	comment_span: SourceSpan = span_from(st, start_cursor, st.cursor)
 	trivia: Trivia = trivia(
 		CommentTrivia,
@@ -744,6 +794,8 @@ private pure func scan_string_literal(state: LexerState) -> LexerStep:
 	var is_interpolated: Bool = False
 
 	while True:
+		st = skip_plain_string_run(st)
+
 		match peek(st):
 			Some('\"'):
 				text = append_source_segment(text, st, segment_start, st.cursor)
