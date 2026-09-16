@@ -40,6 +40,8 @@ module inventory lives in
 
 - [Compiler Priorities](COMPILER_PRIORITIES.md) is the short cross-cutting
   outcomes map.
+- [Compiler Speed Roadmap](COMPILER_SPEED_ROADMAP.md) is the task-level
+  plan for the next rounds of compiler speed work.
 - [Self-Compile Measurement Protocol](../benchmarks/README.md#self-compile-measurement-protocol)
   is the standard compiler-performance measurement and its retained baselines.
 

@@ -26,6 +26,8 @@ fifth of instructions and allocations; the remaining hand-rolled rebuilders
 in preparation and closure conversion, the Perceus call-contract lookup, and
 per-identity module-name sanitization are the next measured targets.
 
+The task-level plan is [Compiler Speed Roadmap](COMPILER_SPEED_ROADMAP.md).
+
 ## Rules For The Next Round
 
 - One change per change, with byte-identical C unless the change is a
