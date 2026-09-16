@@ -667,6 +667,64 @@ private pure func skip_plain_string_run(state: LexerState) -> LexerState:
 	run_end_state(state, offset, column)
 
 
+-- Skip the run of interpolated-tail characters that are copied verbatim,
+-- stopping at any character that changes brace depth, quoting, or escaping.
+private pure func skip_plain_interpolation_run(state: LexerState) -> LexerState:
+	text: String = state.source.text
+	var offset: Int = state.cursor.offset
+	var column: Int = state.cursor.column
+
+	while True:
+		match text.get(offset):
+			Some('\"'):
+				break
+			Some('$'):
+				break
+			Some('{'):
+				break
+			Some('}'):
+				break
+			Some('\\'):
+				break
+			Some('\n'):
+				break
+			Some('\t'):
+				column += tab_advance(column)
+				offset += 1
+			Some(_):
+				column += 1
+				offset += 1
+			None:
+				break
+
+	run_end_state(state, offset, column)
+
+
+-- Skip the run of pipe-line characters that are copied verbatim, stopping at
+-- the end of the line or at an interpolation marker.
+private pure func skip_plain_pipe_run(state: LexerState) -> LexerState:
+	text: String = state.source.text
+	var offset: Int = state.cursor.offset
+	var column: Int = state.cursor.column
+
+	while True:
+		match text.get(offset):
+			Some('\n'):
+				break
+			Some('$'):
+				break
+			Some('\t'):
+				column += tab_advance(column)
+				offset += 1
+			Some(_):
+				column += 1
+				offset += 1
+			None:
+				break
+
+	run_end_state(state, offset, column)
+
+
 private pure func consume_until_single_quote(state: LexerState) -> LexerState:
 	var st: LexerState = state
 
@@ -875,26 +933,40 @@ private pure func scan_string_literal(state: LexerState) -> LexerStep:
 private pure func scan_raw_string_literal(state: LexerState) -> LexerStep:
 	start_cursor: Cursor = state.cursor
 	var st: LexerState = advance_n(state, 4)
-	var text: String = string(32)
-	var has_error: Bool = False
+	body_start: Cursor = st.cursor
+	source_text: String = st.source.text
+	var offset: Int = st.cursor.offset
+	var column: Int = st.cursor.column
 
 	while True:
-		match peek(st):
+		match source_text.get(offset):
 			Some('\"'):
-				st = advance(st)
 				break
 			Some('\n'):
-				has_error = True
-				st = add_error(st, "Raw string cannot span multiple lines")
-				st = advance(st)
 				break
-			Some(c):
-				text = text.append_char(c)
-				st = advance(st)
+			Some('\t'):
+				column += tab_advance(column)
+				offset += 1
+			Some(_):
+				column += 1
+				offset += 1
 			None:
-				has_error = True
-				st = add_error(st, "Unterminated raw string literal: missing closing '\"'")
 				break
+
+	st = run_end_state(st, offset, column)
+	text: String = append_source_segment(string(32), st, body_start, st.cursor)
+	var has_error: Bool = False
+
+	match peek(st):
+		Some('\"'):
+			st = advance(st)
+		Some('\n'):
+			has_error = True
+			st = add_error(st, "Raw string cannot span multiple lines")
+			st = advance(st)
+		_:
+			has_error = True
+			st = add_error(st, "Unterminated raw string literal: missing closing '\"'")
 
 	if has_error:
 		LexerStateStep(st)
@@ -919,6 +991,10 @@ private pure func scan_interpolated_string_tail(
 	var has_error: Bool = False
 
 	while not has_error:
+		run_state: LexerState = skip_plain_interpolation_run(st)
+		text = append_source_segment(text, st, st.cursor, run_state.cursor)
+		st = run_state
+
 		match peek(st):
 			Some('\"'):
 				if brace_depth > 0:
@@ -1011,6 +1087,10 @@ private pure func read_pipe_line_content(
 	var ended_with_newline: Bool = False
 
 	while True:
+		run_state: LexerState = skip_plain_pipe_run(st)
+		text = append_source_segment(text, st, st.cursor, run_state.cursor)
+		st = run_state
+
 		match peek(st):
 			Some('\n'):
 				st = advance(st)
