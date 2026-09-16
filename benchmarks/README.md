@@ -1797,6 +1797,22 @@ Retained baselines live in `benchmarks/results/self_compile_baseline_*.json`
 and `self_compile_small_baseline_*.json`; a new baseline is recorded only when
 the input revision or host changes.
 
+Indentation of the generated C is not part of the identity contract. The
+backend indents its output for readability; nothing reads it back, and the C
+compiler does not care. A change that moves a construct from re-indenting its
+nested body to emitting that body at its final depth therefore shifts leading
+whitespace on lines it does not otherwise touch, and `--require-identical`
+reports that as DIFFERENT. For such a change, use
+`benchmarks/normalize_generated_c_whitespace old.c new.c` as the identity
+oracle: it strips leading whitespace from every line and compares SHA-256, so
+line order, line contents after the indent, and interior spacing all still have
+to match exactly. Pair it with the emitter suite and the codegen audit, which
+stay exact. A landed indentation change obliges a re-baseline, because the
+recorded `output_sha256` no longer matches and every later `--require-identical`
+run would fail against the stale baseline. The sibling
+`benchmarks/normalize_generated_c_symbols` plays the same role for generated
+symbol names that move when definition IDs are renumbered.
+
 ## Timing Model
 
 `bench.sh` first compiles all compiled-language binaries for the selected
