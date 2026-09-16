@@ -72,6 +72,26 @@ Run `make` after a coherent compiler source edit, then use
 file can pass with an older executable while the new compiler fails to build
 itself, so the local binary's recorded content identity must be fresh.
 
+### Compiler optimization level: edit loop vs. full gates
+
+`make` builds `bin/blorp` at `-O0` by default (`BLORP_CLI_C_OPTIMIZATION`),
+which keeps the everyday edit loop's link step fast. Full gate runs build at
+`-O2` instead, since the installed compiler itself runs measurably faster
+(compiler-blorp test artifact compile time is roughly halved) and that time
+dominates gates like `scripts/test compiler-blorp`. Pass
+`BLORP_CLI_C_OPTIMIZATION=-O2` to `make` directly, or use
+`scripts/test --release-compiler`; `scripts/premerge-gate` and
+`scripts/docker-gate` already build at `-O2` by default (use
+`scripts/premerge-gate --no-release-compiler` to opt back to `-O0`).
+
+Caveat: the generated C build-input hash includes this value, so alternating
+between `-O0` and `-O2` across runs forces a full re-link of the generated C
+(minutes, not seconds) each time you switch. Don't interleave `-O0` edit-loop
+runs with `-O2` gate runs in the same working tree without expecting that
+cost; `scripts/compiler-build-status` reports `STALE` when the installed
+binary was built at a different optimization level than the one currently in
+the environment.
+
 ## Daily Development Loop
 
 Use the one-boundary loop from [`AGENTS.md`](../AGENTS.md): establish a failing
