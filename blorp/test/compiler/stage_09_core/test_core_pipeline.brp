@@ -75,15 +75,19 @@ import:
 		),
 		CoreVar,
 		core_program_to_json,
-	../../../src/compiler/stage_09_core/pipeline:
+	../../../src/compiler/stage_09_core/pass_runner:
 		CorePass,
 		CorePassControl,
+		CorePassDiagnostic(CorePassMessage),
 		CorePassRun(CorePassesCompleted, CorePassesFailed, CorePassesStopped),
+		CorePassState,
+		core_pass_state,
+		core_program_pass,
+		run_core_passes,
+	../../../src/compiler/stage_09_core/pipeline:
 		DCE_PASS,
 		PERCEUS_PASS,
-		core_pass,
 		prepared_core_program_value,
-		run_core_passes,
 		run_late_core_span,
 		run_list_layout_stage,
 		run_pre_dce_tail,
@@ -2369,11 +2373,14 @@ pure func test_record_update_normalization_handles_long_sequence_spines() -> Boo
 	not record_update_carrier_survives(lower_record_updates_for_ownership(program))
 
 
-private pure func marker_program() -> CoreProgram:
-	{
-		decls = [],
-		foreign_includes = []
-	}
+private pure func marker_state() -> CorePassState:
+	core_pass_state(
+		{
+			decls = [],
+			foreign_includes = []
+		},
+		0,
+	)
 
 
 private pure func marker_decl_names(program: CoreProgram) -> List[String]:
@@ -2401,7 +2408,7 @@ private pure func marker_pass(name: String) -> CorePass:
 	append_marker: pure (CoreProgram) -> CoreProgram = func(program):
 		{ program | decls = program.decls.append(marker_decl(name)) }
 
-	core_pass(name, append_marker)
+	core_program_pass(name, append_marker)
 
 
 private pure func marker_passes() -> List[CorePass]:
@@ -2418,10 +2425,10 @@ private pure func marker_control() -> CorePassControl:
 
 
 func test_core_pass_runner_runs_passes_in_list_order() -> Bool:
-	match run_core_passes(marker_passes(), marker_program(), marker_control()):
-		CorePassesCompleted(program, observations, timings):
+	match run_core_passes(marker_passes(), marker_state(), marker_control()):
+		CorePassesCompleted(completed, observations, timings):
 			(
-				marker_decl_names(program) == ["first", "second", "third"]
+				marker_decl_names(completed.program) == ["first", "second", "third"]
 				and observations.length() == 0
 				and timings.length() == 0
 			)
@@ -2432,7 +2439,7 @@ func test_core_pass_runner_runs_passes_in_list_order() -> Bool:
 func test_core_pass_runner_stops_after_named_pass() -> Bool:
 	control: CorePassControl = { marker_control() | stop_after = Some("second") }
 
-	match run_core_passes(marker_passes(), marker_program(), control):
+	match run_core_passes(marker_passes(), marker_state(), control):
 		CorePassesStopped(name, rendered, observations, _):
 			(
 				name == "second"
@@ -2448,14 +2455,14 @@ func test_core_pass_runner_stops_after_named_pass() -> Bool:
 func test_core_pass_runner_records_requested_observations() -> Bool:
 	control: CorePassControl = { marker_control() | observe = ["first", "third"] }
 
-	match run_core_passes(marker_passes(), marker_program(), control):
-		CorePassesCompleted(program, observations, _):
+	match run_core_passes(marker_passes(), marker_state(), control):
+		CorePassesCompleted(completed, observations, _):
 			observed_names: List[String] = observations.map(
 				pure func(observation): observation.name,
 			)
 
 			(
-				marker_decl_names(program) == ["first", "second", "third"]
+				marker_decl_names(completed.program) == ["first", "second", "third"]
 				and observed_names == ["first", "third"]
 			)
 		_:
@@ -2465,7 +2472,7 @@ func test_core_pass_runner_records_requested_observations() -> Bool:
 func test_core_pass_runner_times_every_pass() -> Bool:
 	control: CorePassControl = { marker_control() | record_timings = True }
 
-	match run_core_passes(marker_passes(), marker_program(), control):
+	match run_core_passes(marker_passes(), marker_state(), control):
 		CorePassesCompleted(_, _, timings):
 			timed_names: List[String] = timings.map(pure func(timing): timing.name)
 
@@ -2478,27 +2485,27 @@ func test_core_pass_runner_times_every_pass() -> Bool:
 
 
 func test_core_pass_runner_stops_at_failing_invariant() -> Bool:
-	fails: pure (CoreProgram) -> Option[String] = func(program):
-		Some("marker invariant failed")
+	fails: pure (CoreProgram) -> Option[CorePassDiagnostic] = func(program):
+		Some(CorePassMessage("marker invariant failed"))
 
 	failing: CorePass = { marker_pass("second") | invariant = fails }
 	passes: List[CorePass] = [marker_pass("first"), failing, marker_pass("third")]
 
-	match run_core_passes(passes, marker_program(), marker_control()):
-		CorePassesFailed(name, detail, _):
+	match run_core_passes(passes, marker_state(), marker_control()):
+		CorePassesFailed(name, CorePassMessage(detail), _):
 			name == "second" and detail == "marker invariant failed"
 		_:
 			False
 
 
 func test_core_pass_runner_defers_checked_invariants() -> Bool:
-	fails: pure (CoreProgram) -> Option[String] = func(program):
-		Some("checked invariant failed")
+	fails: pure (CoreProgram) -> Option[CorePassDiagnostic] = func(program):
+		Some(CorePassMessage("checked invariant failed"))
 
 	checked: CorePass = { marker_pass("second") | checked_invariant = fails }
 	passes: List[CorePass] = [marker_pass("first"), checked, marker_pass("third")]
 
-	production: Bool = match run_core_passes(passes, marker_program(), marker_control()):
+	production: Bool = match run_core_passes(passes, marker_state(), marker_control()):
 		CorePassesCompleted(_, _, _):
 			True
 		_:
@@ -2506,8 +2513,8 @@ func test_core_pass_runner_defers_checked_invariants() -> Bool:
 
 	checked_control: CorePassControl = { marker_control() | check_invariants = True }
 
-	checked_failure: Bool = match run_core_passes(passes, marker_program(), checked_control):
-		CorePassesFailed(name, detail, _):
+	checked_failure: Bool = match run_core_passes(passes, marker_state(), checked_control):
+		CorePassesFailed(name, CorePassMessage(detail), _):
 			name == "second" and detail == "checked invariant failed"
 		_:
 			False

@@ -15,6 +15,16 @@ import:
 		check_late_core_invariants,
 		core_late_invariant_message,
 	match_projection as CoreMatchProjection
+	pass_runner:
+		CorePass,
+		CorePassControl,
+		CorePassDiagnostic(CorePassMessage),
+		CorePassRun(CorePassesCompleted, CorePassesFailed, CorePassesStopped),
+		CorePassState,
+		core_pass_matches,
+		core_pass_state,
+		core_program_pass,
+		run_core_passes,
 	perceus as CorePerceus
 	pipeline_stage:
 		CorePipelineStage(
@@ -44,150 +54,10 @@ import:
 	reuse as CoreReuse
 	specialize as CoreSpecialize
 	static_string_literals as CoreStaticStringLiterals
-	system: now_microseconds
 	tensor_specialize as CoreTensorSpecialize
 
 
--- The runtime prints allocation and RSS counters for a named checkpoint when
--- BLORP_COMPILER_MEMORY_PROFILE is set, and is a no-op otherwise.
-foreign:
-	@no_copy func record_compile_memory_checkpoint(
-		phase: String,
-	) -> Void = "blorp_compiler_memory_checkpoint_c"
-
-
 opaque type PreparedCoreProgram = CoreProgram
-
-
--- One whole-program Core pass. `invariant` runs on every compile and must stay
--- cheap; `checked_invariant` runs only under `--check-invariants`.
-record CorePass {
-	name: String,
-	run: pure (CoreProgram) -> CoreProgram,
-	invariant: pure (CoreProgram) -> Option[String],
-	checked_invariant: pure (CoreProgram) -> Option[String]
-}
-
-
-record CorePassControl {
-	observe: List[String],
-	stop_after: Option[String],
-	check_invariants: Bool,
-	record_timings: Bool
-}
-
-
-record CorePassObservation {
-	name: String,
-	rendered: String
-}
-
-
-record CorePassTiming {
-	name: String,
-	microseconds: Int
-}
-
-
-union CorePassRun:
-	CorePassesCompleted(CoreProgram, List[CorePassObservation], List[CorePassTiming])
-	CorePassesStopped(String, String, List[CorePassObservation], List[CorePassTiming])
-	CorePassesFailed(String, String, List[CorePassTiming])
-
-
-pure func no_core_pass_invariant(program: CoreProgram) -> Option[String]:
-	None
-
-
-pure func core_pass(
-	name: String,
-	run: pure (CoreProgram) -> CoreProgram,
-) -> CorePass:
-	{
-		name = name,
-		run = run,
-		invariant = no_core_pass_invariant,
-		checked_invariant = no_core_pass_invariant
-	}
-
-
-private func core_pass_time(enabled: Bool) -> Int:
-	if enabled:
-		now_microseconds()
-	else:
-		0
-
-
-private pure func core_pass_stops(stop_after: Option[String], name: String) -> Bool:
-	match stop_after:
-		Some(target):
-			target == name
-		None:
-			False
-
-
--- The single pass runner. It walks the list once, so a compile that requests
--- several snapshots pays for each pass exactly once.
-func run_core_passes(
-	passes: List[CorePass],
-	program: CoreProgram,
-	control: CorePassControl,
-) -> CorePassRun:
-	var current: CoreProgram = program
-	var observations: List[CorePassObservation] = []
-	var timings: List[CorePassTiming] = []
-	var stop: Option[(String, String)] = None
-	var failure: Option[(String, String)] = None
-
-	for pass in passes:
-		if stop.is_none() and failure.is_none():
-			started: Int = core_pass_time(control.record_timings)
-			current = pass.run(current)
-			record_compile_memory_checkpoint("pass_${pass.name}_complete")
-
-			if control.record_timings:
-				timings = timings.append({
-					name = pass.name,
-					microseconds = now_microseconds() - started,
-				})
-
-			violation: Option[String] = match pass.invariant(current):
-				Some(detail):
-					Some(detail)
-				None:
-					if control.check_invariants:
-						pass.checked_invariant(current)
-					else:
-						None
-
-			match violation:
-				Some(detail):
-					failure = Some((pass.name, detail))
-				None:
-					observed: Bool = control.observe.contains(pass.name)
-					stopped: Bool = core_pass_stops(control.stop_after, pass.name)
-
-					if observed or stopped:
-						rendered: String = core_program_to_json(current).to_string()
-
-						if observed:
-							observations = observations.append({
-								name = pass.name,
-								rendered = rendered,
-							})
-
-						if stopped:
-							stop = Some((pass.name, rendered))
-
-	match failure:
-		Some((failed_name, detail)):
-			CorePassesFailed(failed_name, detail, timings)
-		None:
-			match stop:
-				Some((stopped_name, rendered)):
-					CorePassesStopped(stopped_name, rendered, observations, timings)
-				None:
-					CorePassesCompleted(current, observations, timings)
 
 
 pure func prepared_core_program(program: CoreProgram) -> PreparedCoreProgram:
@@ -237,21 +107,24 @@ PREPARED_REUSE_PASS: String = "prepared_reuse"
 
 -- Invariants that run on every compile. Keep these O(1) or near it; the full
 -- structural walks belong in `checked_invariant`.
-pure func required_final_invariant(program: CoreProgram) -> Option[String]:
+pure func required_final_invariant(program: CoreProgram) -> Option[CorePassDiagnostic]:
 	if CoreRecordUpdate.record_update_carrier_survives(program):
-		Some("record update survived ownership normalization")
+		Some(CorePassMessage("record update survived ownership normalization"))
 	else:
 		match check_definition_id_uniqueness(program):
 			[violation, ..._]:
-				Some(core_late_invariant_message(violation))
+				Some(CorePassMessage(core_late_invariant_message(violation)))
 			[]:
 				None
 
 
-pure func late_core_invariant(stage: CorePipelineStage, program: CoreProgram) -> Option[String]:
+pure func late_core_invariant(
+	stage: CorePipelineStage,
+	program: CoreProgram,
+) -> Option[CorePassDiagnostic]:
 	match check_late_core_invariants(stage, program):
 		[violation, ..._]:
-			Some(core_late_invariant_message(violation))
+			Some(CorePassMessage(core_late_invariant_message(violation)))
 		[]:
 			None
 
@@ -261,10 +134,10 @@ private pure func checked_late_core_pass(
 	run: pure (CoreProgram) -> CoreProgram,
 	stage: CorePipelineStage,
 ) -> CorePass:
-	walk: pure (CoreProgram) -> Option[String] = func(program):
+	walk: pure (CoreProgram) -> Option[CorePassDiagnostic] = func(program):
 		late_core_invariant(stage, program)
 
-	{ core_pass(name, run) | checked_invariant = walk }
+	{ core_program_pass(name, run) | checked_invariant = walk }
 
 
 pure func run_adapt_function_refs_pass(program: CoreProgram) -> CoreProgram:
@@ -339,16 +212,14 @@ pure func run_prepared_reuse_pass(program: CoreProgram) -> CoreProgram:
 	CoreReuse.rewrite_prepared_program(program)
 
 
-private pure func final_checked_invariant(program: CoreProgram) -> Option[String]:
+private pure func final_checked_invariant(program: CoreProgram) -> Option[CorePassDiagnostic]:
 	late_core_invariant(FinalStage, program)
 
 
 -- The last pass carries the only production invariant: the fast ownership and
 -- identity checks that no compile may skip.
 private pure func final_late_core_pass() -> CorePass:
-	{
-		name = PREPARED_REUSE_PASS,
-		run = run_prepared_reuse_pass,
+	{ core_program_pass(PREPARED_REUSE_PASS, run_prepared_reuse_pass) |
 		invariant = required_final_invariant,
 		checked_invariant = final_checked_invariant
 	}
@@ -361,12 +232,12 @@ private pure func final_late_core_pass() -> CorePass:
 -- must not reintroduce unboxed erased-runtime arguments.
 pure func late_core_passes() -> List[CorePass]:
 	[
-		core_pass(ADAPT_FUNCTION_REFS_PASS, run_adapt_function_refs_pass),
-		core_pass(TENSOR_SPECIALIZE_PASS, run_tensor_specialize_pass),
+		core_program_pass(ADAPT_FUNCTION_REFS_PASS, run_adapt_function_refs_pass),
+		core_program_pass(TENSOR_SPECIALIZE_PASS, run_tensor_specialize_pass),
 		checked_late_core_pass(SPECIALIZE_PASS, run_specialize_pass, SpecializeStage),
-		core_pass(RESOLVE_CALLABLES_PASS, run_resolve_callables_pass),
-		core_pass(BACKEND_PROJECTION_PASS, run_backend_projection_pass),
-		core_pass(MATCH_PROJECTION_PASS, run_match_projection_pass),
+		core_program_pass(RESOLVE_CALLABLES_PASS, run_resolve_callables_pass),
+		core_program_pass(BACKEND_PROJECTION_PASS, run_backend_projection_pass),
+		core_program_pass(MATCH_PROJECTION_PASS, run_match_projection_pass),
 		checked_late_core_pass(DCE_PASS, run_dce_pass, DceStage),
 		checked_late_core_pass(
 			CONSUME_SPECIALIZE_PASS,
@@ -378,14 +249,14 @@ pure func late_core_passes() -> List[CorePass]:
 			run_static_string_literals_pass,
 			StaticStringLiteralsStage,
 		),
-		core_pass(RECORD_UPDATE_OWNERSHIP_PASS, run_record_update_ownership_pass),
-		core_pass(DICT_LITERAL_OWNERSHIP_PASS, run_dict_literal_ownership_pass),
+		core_program_pass(RECORD_UPDATE_OWNERSHIP_PASS, run_record_update_ownership_pass),
+		core_program_pass(DICT_LITERAL_OWNERSHIP_PASS, run_dict_literal_ownership_pass),
 		checked_late_core_pass(PERCEUS_PASS, run_perceus_pass, PerceusStage),
 		checked_late_core_pass(REUSE_PASS, run_reuse_pass, ReuseStage),
 		checked_late_core_pass(CLOSURE_PASS, run_closure_pass, ClosureStage),
-		core_pass(RESOURCE_MANAGEMENT_PASS, run_resource_management_pass),
-		core_pass(FAIRNESS_PASS, run_fairness_pass),
-		core_pass(PREPARE_PASS, run_prepare_pass),
+		core_program_pass(RESOURCE_MANAGEMENT_PASS, run_resource_management_pass),
+		core_program_pass(FAIRNESS_PASS, run_fairness_pass),
+		core_program_pass(PREPARE_PASS, run_prepare_pass),
 		final_late_core_pass(),
 	]
 
@@ -434,22 +305,28 @@ pure func run_late_core_span(
 	through_pass: Option[String],
 	program: CoreProgram,
 ) -> CoreProgram:
-	var current: CoreProgram = program
+	var current: CorePassState = core_pass_state(program, 0)
 	var running: Bool = from_pass.is_none()
 	var done: Bool = False
 
 	for pass in late_core_passes():
 		if not done:
-			if not running and core_pass_stops(from_pass, pass.name):
+			if not running and core_pass_matches(from_pass, pass.name):
 				running = True
 
 			if running:
-				current = pass.run(current)
+				-- Late passes never fail in `run`; only their invariants report,
+				-- and this span helper deliberately runs none.
+				match pass.run(current):
+					Ok(advanced):
+						current = advanced
+					Err(_):
+						done = True
 
-				if core_pass_stops(through_pass, pass.name):
+				if core_pass_matches(through_pass, pass.name):
 					done = True
 
-	current
+	current.program
 
 
 pure func run_list_layout_stage(program: CoreProgram) -> CoreProgram:

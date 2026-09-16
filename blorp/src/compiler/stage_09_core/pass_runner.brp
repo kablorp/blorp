@@ -1,0 +1,230 @@
+-- One Core pass record and one runner, shared by the early and late Core
+-- pass lists.
+--
+-- This module deliberately holds no pass ordering and no registry: the ordered
+-- lists live with the stages they sequence (`early_pipeline`, `pipeline`), and
+-- this module only walks a list it is handed.
+import:
+	early_invariants:
+		CoreEarlyInvariantViolation,
+		core_early_invariant_hint,
+		core_early_invariant_message,
+	ir: CoreProgram, core_program_to_json
+	mono_specialize: CoreMonoDiagnostic, core_mono_diagnostic_hint, core_mono_diagnostic_message
+	synth_error: CoreSynthError, core_synth_error_hint, core_synth_error_message
+	system: now_microseconds
+	trait_resolve:
+		CoreTraitResolveDiagnostic,
+		core_trait_resolve_diagnostic_hint,
+		core_trait_resolve_diagnostic_message,
+
+
+-- The runtime prints allocation and RSS counters for a named checkpoint when
+-- BLORP_COMPILER_MEMORY_PROFILE is set, and is a no-op otherwise.
+foreign:
+	@no_copy func record_compile_memory_checkpoint(
+		phase: String,
+	) -> Void = "blorp_compiler_memory_checkpoint_c"
+
+
+-- Everything a pass may read or advance. `next_def_id` is threaded because
+-- monomorphization mints declarations; passes that do not mint pass it through.
+record CorePassState {
+	program: CoreProgram,
+	next_def_id: Int
+}
+
+
+-- Structured failures a pass or its invariant can report. Late Core reports
+-- rendered invariant messages; the early stages carry their own diagnostics so
+-- callers can still match on the specific failure.
+union CorePassDiagnostic:
+	CorePassMessage(String)
+	CoreEarlyInvariantDiagnostic(CoreEarlyInvariantViolation)
+	CoreEarlyMonoDiagnostic(CoreMonoDiagnostic)
+	CoreEarlySynthDiagnostic(CoreSynthError)
+	CoreEarlyTraitResolveDiagnostic(CoreTraitResolveDiagnostic)
+
+
+pure func core_pass_diagnostic_message(diagnostic: CorePassDiagnostic) -> String:
+	match diagnostic:
+		CorePassMessage(message):
+			message
+		CoreEarlyInvariantDiagnostic(violation):
+			core_early_invariant_message(violation)
+		CoreEarlyMonoDiagnostic(mono_diagnostic):
+			core_mono_diagnostic_message(mono_diagnostic)
+		CoreEarlySynthDiagnostic(synth_error):
+			core_synth_error_message(synth_error)
+		CoreEarlyTraitResolveDiagnostic(trait_diagnostic):
+			core_trait_resolve_diagnostic_message(trait_diagnostic)
+
+
+pure func core_pass_diagnostic_hint(diagnostic: CorePassDiagnostic) -> Option[String]:
+	match diagnostic:
+		CorePassMessage(_):
+			None
+		CoreEarlyInvariantDiagnostic(violation):
+			core_early_invariant_hint(violation)
+		CoreEarlyMonoDiagnostic(mono_diagnostic):
+			core_mono_diagnostic_hint(mono_diagnostic)
+		CoreEarlySynthDiagnostic(synth_error):
+			core_synth_error_hint(synth_error)
+		CoreEarlyTraitResolveDiagnostic(trait_diagnostic):
+			Some(core_trait_resolve_diagnostic_hint(trait_diagnostic))
+
+
+-- One whole-program Core pass. `invariant` runs on every compile and must stay
+-- cheap; `checked_invariant` runs only under `--check-invariants`, and is left
+-- empty when the production invariant already covers the same walk.
+record CorePass {
+	name: String,
+	run: pure (CorePassState) -> Result[CorePassState, CorePassDiagnostic],
+	invariant: pure (CoreProgram) -> Option[CorePassDiagnostic],
+	checked_invariant: pure (CoreProgram) -> Option[CorePassDiagnostic]
+}
+
+
+record CorePassControl {
+	observe: List[String],
+	stop_after: Option[String],
+	check_invariants: Bool,
+	record_timings: Bool
+}
+
+
+record CorePassObservation {
+	name: String,
+	rendered: String
+}
+
+
+record CorePassTiming {
+	name: String,
+	microseconds: Int
+}
+
+
+union CorePassRun:
+	CorePassesCompleted(CorePassState, List[CorePassObservation], List[CorePassTiming])
+	CorePassesStopped(String, String, List[CorePassObservation], List[CorePassTiming])
+	CorePassesFailed(String, CorePassDiagnostic, List[CorePassTiming])
+
+
+pure func no_core_pass_invariant(program: CoreProgram) -> Option[CorePassDiagnostic]:
+	None
+
+
+pure func core_pass_state(program: CoreProgram, next_def_id: Int) -> CorePassState:
+	{
+		program = program,
+		next_def_id = next_def_id
+	}
+
+
+pure func core_pass(
+	name: String,
+	run: pure (CorePassState) -> Result[CorePassState, CorePassDiagnostic],
+) -> CorePass:
+	{
+		name = name,
+		run = run,
+		invariant = no_core_pass_invariant,
+		checked_invariant = no_core_pass_invariant
+	}
+
+
+-- Most passes only rewrite the program. This adapts one to the pass signature
+-- so a list entry stays a single line.
+pure func core_program_pass(
+	name: String,
+	rewrite: pure (CoreProgram) -> CoreProgram,
+) -> CorePass:
+	run: pure (CorePassState) -> Result[CorePassState, CorePassDiagnostic] = func(state):
+		Ok({ state | program = rewrite(state.program) })
+
+	core_pass(name, run)
+
+
+private func core_pass_time(enabled: Bool) -> Int:
+	if enabled:
+		now_microseconds()
+	else:
+		0
+
+
+pure func core_pass_matches(target: Option[String], name: String) -> Bool:
+	match target:
+		Some(wanted):
+			wanted == name
+		None:
+			False
+
+
+-- The single pass runner. It walks the list once, so a compile that requests
+-- several snapshots pays for each pass exactly once.
+func run_core_passes(
+	passes: List[CorePass],
+	state: CorePassState,
+	control: CorePassControl,
+) -> CorePassRun:
+	var current: CorePassState = state
+	var observations: List[CorePassObservation] = []
+	var timings: List[CorePassTiming] = []
+	var stop: Option[(String, String)] = None
+	var failure: Option[(String, CorePassDiagnostic)] = None
+
+	for pass in passes:
+		if stop.is_none() and failure.is_none():
+			started: Int = core_pass_time(control.record_timings)
+
+			match pass.run(current):
+				Err(diagnostic):
+					failure = Some((pass.name, diagnostic))
+				Ok(advanced):
+					current = advanced
+					record_compile_memory_checkpoint("pass_${pass.name}_complete")
+
+					if control.record_timings:
+						timings = timings.append({
+							name = pass.name,
+							microseconds = now_microseconds() - started,
+						})
+
+					violation: Option[CorePassDiagnostic] = match pass.invariant(current.program):
+						Some(diagnostic):
+							Some(diagnostic)
+						None:
+							if control.check_invariants:
+								pass.checked_invariant(current.program)
+							else:
+								None
+
+					match violation:
+						Some(diagnostic):
+							failure = Some((pass.name, diagnostic))
+						None:
+							observed: Bool = control.observe.contains(pass.name)
+							stopped: Bool = core_pass_matches(control.stop_after, pass.name)
+
+							if observed or stopped:
+								rendered: String = core_program_to_json(current.program).to_string()
+
+								if observed:
+									observations = observations.append({
+										name = pass.name,
+										rendered = rendered,
+									})
+
+								if stopped:
+									stop = Some((pass.name, rendered))
+
+	match failure:
+		Some((failed_name, diagnostic)):
+			CorePassesFailed(failed_name, diagnostic, timings)
+		None:
+			match stop:
+				Some((stopped_name, rendered)):
+					CorePassesStopped(stopped_name, rendered, observations, timings)
+				None:
+					CorePassesCompleted(current, observations, timings)
