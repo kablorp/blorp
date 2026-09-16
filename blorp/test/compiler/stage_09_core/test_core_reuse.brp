@@ -133,6 +133,7 @@ import:
 		CoreFunctionKind(UserFunction),
 		CoreGlobal,
 		CoreHashContainerConstructor(GenericHashContainerConstructor),
+		CoreHeapRecordField,
 		CoreListHandoffMode(BorrowFreshHandoff, ConsumeReuseHandoff),
 		CoreListHandoffWriteOrder(ForwardCompactingHandoff),
 		CoreListStorageLayout(InlineListStorage, PointerListStorage),
@@ -143,8 +144,10 @@ import:
 		CoreMatchBindingMode(MatchBorrowBindingMode, MatchOwnBindingMode),
 		CoreProgram,
 		CoreRawMatchCase,
+		CoreRecordCowField,
 		CoreRecordFieldValue,
 		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy),
+		CoreRetainPolicy(ArcRetainPolicy, CowFieldTakeRetainPolicy),
 		CoreSemanticMatchTree(
 			SemanticConstructorMatch,
 			SemanticLengthMatch,
@@ -153,7 +156,7 @@ import:
 			SemanticMatchLeaf,
 		),
 		CoreSourceLoc(SyntheticSourceLoc),
-		CoreType(HeapRecordType, NamedType, UnionType, VoidType),
+		CoreType(HeapRecordType, NamedType, StackResultType, UnionType, VoidType),
 		CoreUnionDecl,
 		CoreUnionField,
 		CoreUnionPayloadStorage(ErasedUnionPayloadStorage),
@@ -2244,9 +2247,378 @@ pure func test_rejects_dead_record_allocation_that_assigns_source() -> Bool:
 	top_record_reuse_source(rewritten) == None
 
 
+pure func state_type() -> CoreType:
+	heap_record_type("State")
+
+
+pure func state_var() -> CoreVar:
+	unique_var("s", 3)
+
+
+pure func state_var_expr() -> CoreExpr:
+	VarExpr(state_var(), state_type(), SyntheticSourceLoc)
+
+
+pure func state_field_read(field_name: String, typ: CoreType) -> CoreExpr:
+	FieldExpr(state_var_expr(), field_name, typ, SyntheticSourceLoc)
+
+
+-- Perceus's owned-alias shape for a field read passed to a consuming call.
+pure func owned_items_read(policy: CoreRetainPolicy) -> CoreExpr:
+	temp: CoreVar = named_var("owned_result")
+
+	BorrowLetExpr(
+		temp,
+		list_int_type(),
+		state_field_read("items", list_int_type()),
+		DupExpr(
+			temp,
+			list_int_type(),
+			policy,
+			VarExpr(temp, list_int_type(), SyntheticSourceLoc),
+			list_int_type(),
+			SyntheticSourceLoc,
+		),
+	)
+
+
+pure func consuming_append(args: List[CoreExpr]) -> CoreExpr:
+	CallExpr(
+		UnknownCall,
+		VarExpr(named_var("append"), VoidType, SyntheticSourceLoc),
+		args,
+		list_int_type(),
+		SyntheticSourceLoc,
+	)
+
+
+pure func inlined_append(receiver: CoreExpr) -> CoreExpr:
+	self_var: CoreVar = named_var("__std_inline_self")
+
+	LetExpr(
+		self_var,
+		False,
+		list_int_type(),
+		consuming_append([receiver, int_expr(1)]),
+		VarExpr(self_var, list_int_type(), SyntheticSourceLoc),
+	)
+
+
+pure func items_cow_field(replacement: Option[CoreExpr]) -> CoreRecordCowField:
+	{
+		field = {
+			name = "items",
+			typ = list_int_type(),
+			release_policy = ArcReleasePolicy
+		},
+		replacement = replacement
+	}
+
+
+pure func top_cow_field(replacement: Option[CoreExpr]) -> CoreRecordCowField:
+	{
+		field = {
+			name = "top",
+			typ = int_type(),
+			release_policy = NoReleasePolicy
+		},
+		replacement = replacement
+	}
+
+
+pure func state_cow_update(source: CoreExpr, fields: List[CoreRecordCowField]) -> CoreExpr:
+	RecordCowUpdateExpr(source, fields, state_type(), SyntheticSourceLoc)
+
+
+pure func first_dup_policy(expr: CoreExpr) -> Option[CoreRetainPolicy]:
+	match expr:
+		DupExpr(_, _, policy, _, _, _):
+			Some(policy)
+		BorrowLetExpr(_, _, _, body):
+			first_dup_policy(body)
+		LetExpr(_, _, _, rhs, _):
+			first_dup_policy(rhs)
+		CallExpr(_, _, args, _, _):
+			match args.get(0):
+				Some(arg):
+					first_dup_policy(arg)
+				None:
+					None
+		IfExpr(_, then_expr, _, _, _):
+			first_dup_policy(then_expr)
+		_:
+			None
+
+
+pure func first_replacement_policy(expr: CoreExpr) -> Option[CoreRetainPolicy]:
+	match expr:
+		RecordCowUpdateExpr(_, fields, _, _):
+			match fields.get(0):
+				Some(field):
+					match field.replacement:
+						Some(replacement):
+							first_dup_policy(replacement)
+						None:
+							None
+				None:
+					None
+		RecordReuseExpr(_, fields, _, _):
+			match fields.get(0):
+				Some(field):
+					first_dup_policy(field.value)
+				None:
+					None
+		_:
+			None
+
+
+pure func takes_items_from_state(policy: Option[CoreRetainPolicy]) -> Bool:
+	match policy:
+		Some(CowFieldTakeRetainPolicy(record_var, field_name)):
+			(
+				record_var.name == state_var().name
+				and record_var.uniq == state_var().uniq
+				and field_name == "items"
+			)
+		_:
+			False
+
+
+pure func keeps_arc_retain(policy: Option[CoreRetainPolicy]) -> Bool:
+	match policy:
+		Some(ArcRetainPolicy):
+			True
+		_:
+			False
+
+
+pure func test_takes_self_consumed_cow_field() -> Bool:
+	rewritten: CoreExpr = rewrite_post_perceus_expr(
+		state_cow_update(
+			state_var_expr(),
+			[
+				items_cow_field(Some(inlined_append(owned_items_read(ArcRetainPolicy)))),
+				top_cow_field(Some(int_expr(1))),
+			],
+		),
+	)
+
+	takes_items_from_state(first_replacement_policy(rewritten))
+
+
+pure func test_takes_cow_field_beside_other_field_read() -> Bool:
+	rewritten: CoreExpr = rewrite_post_perceus_expr(
+		state_cow_update(
+			state_var_expr(),
+			[
+				items_cow_field(Some(inlined_append(owned_items_read(ArcRetainPolicy)))),
+				top_cow_field(Some(state_field_read("top", int_type()))),
+			],
+		),
+	)
+
+	takes_items_from_state(first_replacement_policy(rewritten))
+
+
+pure func test_takes_self_consumed_cow_field_in_assignment() -> Bool:
+	rewritten: CoreExpr = rewrite_post_perceus_expr(
+		AssignExpr(
+			state_var(),
+			state_cow_update(
+				state_var_expr(),
+				[
+					items_cow_field(Some(inlined_append(owned_items_read(ArcRetainPolicy)))),
+					top_cow_field(None),
+				],
+			),
+			VoidType,
+			SyntheticSourceLoc,
+		),
+	)
+
+	match rewritten:
+		AssignExpr(_, rhs, _, _):
+			takes_items_from_state(first_replacement_policy(rhs))
+		_:
+			False
+
+
+pure func test_takes_self_consumed_record_reuse_field() -> Bool:
+	rewritten: CoreExpr = rewrite_post_perceus_expr(
+		RecordReuseExpr(
+			state_var_expr(),
+			[
+				{
+					name = "items",
+					value = inlined_append(owned_items_read(ArcRetainPolicy))
+				},
+				{
+					name = "top",
+					value = int_expr(1)
+				},
+			],
+			state_type(),
+			SyntheticSourceLoc,
+		),
+	)
+
+	takes_items_from_state(first_replacement_policy(rewritten))
+
+
+pure func test_keeps_retain_when_sibling_reads_same_field() -> Bool:
+	rewritten: CoreExpr = rewrite_post_perceus_expr(
+		state_cow_update(
+			state_var_expr(),
+			[
+				items_cow_field(Some(inlined_append(owned_items_read(ArcRetainPolicy)))),
+				top_cow_field(
+					Some(
+						CallExpr(
+							UnknownCall,
+							VarExpr(named_var("length"), VoidType, SyntheticSourceLoc),
+							[state_field_read("items", list_int_type())],
+							int_type(),
+							SyntheticSourceLoc,
+						),
+					),
+				),
+			],
+		),
+	)
+
+	keeps_arc_retain(first_replacement_policy(rewritten))
+
+
+pure func test_keeps_retain_when_replacement_reads_whole_source() -> Bool:
+	rewritten: CoreExpr = rewrite_post_perceus_expr(
+		state_cow_update(
+			state_var_expr(),
+			[
+				items_cow_field(
+					Some(
+						inlined_append(
+							consuming_append(
+								[owned_items_read(ArcRetainPolicy), state_var_expr()],
+							),
+						),
+					),
+				),
+				top_cow_field(None),
+			],
+		),
+	)
+
+	keeps_arc_retain(first_replacement_policy(rewritten))
+
+
+pure func test_keeps_retain_when_source_is_not_a_bare_variable() -> Bool:
+	rewritten: CoreExpr = rewrite_post_perceus_expr(
+		state_cow_update(
+			DupExpr(
+				state_var(),
+				state_type(),
+				ArcRetainPolicy,
+				state_var_expr(),
+				state_type(),
+				SyntheticSourceLoc,
+			),
+			[
+				items_cow_field(Some(inlined_append(owned_items_read(ArcRetainPolicy)))),
+				top_cow_field(None),
+			],
+		),
+	)
+
+	keeps_arc_retain(first_replacement_policy(rewritten))
+
+
+pure func test_keeps_retain_for_inline_managed_field() -> Bool:
+	temp: CoreVar = named_var("owned_result")
+	result_type: CoreType = StackResultType(int_type(), string_type())
+	owned_read: CoreExpr = BorrowLetExpr(
+		temp,
+		result_type,
+		state_field_read("outcome", result_type),
+		DupExpr(
+			temp,
+			result_type,
+			ArcRetainPolicy,
+			VarExpr(temp, result_type, SyntheticSourceLoc),
+			result_type,
+			SyntheticSourceLoc,
+		),
+	)
+	rewritten: CoreExpr = rewrite_post_perceus_expr(
+		state_cow_update(
+			state_var_expr(),
+			[
+				{
+					field = {
+						name = "outcome",
+						typ = result_type,
+						release_policy = ArcReleasePolicy
+					},
+					replacement = Some(consuming_append([owned_read]))
+				},
+				top_cow_field(None),
+			],
+		),
+	)
+
+	keeps_arc_retain(first_replacement_policy(rewritten))
+
+
+pure func test_keeps_retain_when_field_read_is_conditional() -> Bool:
+	rewritten: CoreExpr = rewrite_post_perceus_expr(
+		state_cow_update(
+			state_var_expr(),
+			[
+				items_cow_field(
+					Some(
+						IfExpr(
+							bool_expr(True),
+							inlined_append(owned_items_read(ArcRetainPolicy)),
+							int_expr(0),
+							list_int_type(),
+							SyntheticSourceLoc,
+						),
+					),
+				),
+				top_cow_field(None),
+			],
+		),
+	)
+
+	keeps_arc_retain(first_replacement_policy(rewritten))
+
+
 tests: TestSuite = {
 	description = "Blorp compiler Core reuse",
 	tests = [
+		("takes self-consumed cow field", test_takes_self_consumed_cow_field),
+		("takes cow field beside another field read", test_takes_cow_field_beside_other_field_read),
+		(
+			"takes self-consumed cow field in assignment",
+			test_takes_self_consumed_cow_field_in_assignment,
+		),
+		("takes self-consumed record reuse field", test_takes_self_consumed_record_reuse_field),
+		(
+			"keeps retain when sibling reads same field",
+			test_keeps_retain_when_sibling_reads_same_field,
+		),
+		(
+			"keeps retain when replacement reads whole source",
+			test_keeps_retain_when_replacement_reads_whole_source,
+		),
+		(
+			"keeps retain when source is not a bare variable",
+			test_keeps_retain_when_source_is_not_a_bare_variable,
+		),
+		(
+			"keeps retain when field read is conditional",
+			test_keeps_retain_when_field_read_is_conditional,
+		),
+		("keeps retain for inline managed field", test_keeps_retain_for_inline_managed_field),
 		("rewrites dead list allocation", test_rewrites_dead_list_allocation),
 		("rewrites dead set allocation", test_rewrites_dead_set_allocation),
 		("rewrites dead dict allocation", test_rewrites_dead_dict_allocation),

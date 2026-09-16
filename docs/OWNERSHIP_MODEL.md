@@ -195,6 +195,25 @@ every declared field exactly once in declaration order. Its ownership-refined
 form must distinguish inherited fields from replacements explicitly rather than
 recovering that distinction from expression shape or field names.
 
+A replacement that consumes the field it replaces, such as
+`items = s.items.append(x)`, reads the field through Perceus's owned-alias
+shape, `BorrowLetExpr(temp, s.items, DupExpr(temp, ...))`. The ordinary
+`ArcRetainPolicy` there makes the callee observe a shared value while the
+source still holds the field. After Perceus, the reuse pass may replace that
+retain policy with `CowFieldTakeRetainPolicy(source, field)` when the update's
+source is a bare consumed variable, the field is stored as one heap pointer
+under `ArcReleasePolicy` (heap records and the pointer collections; never an
+inline managed value such as a stack result), and that alias is the only read
+of the source that could observe the field slot across every replacement (a
+direct read of a different field does not count; a lambda, closure, or
+assignment of the source disqualifies). The policy emits a runtime test on the source: a
+unique source gives up its slot (left null) so the alias is the sole owner; a
+shared source retains as before. The emptied slot is never observable because
+the source is read only after every replacement, the unique path overwrites
+the slot, and field release is null-safe on every path including cancellation
+cleanup. The rewrite must stay after Perceus and must not descend into any
+position that can evaluate more than once or conditionally.
+
 ## Producer And Fusion Handoffs
 
 Collection and tensor fusion can transfer an accumulator or source buffer

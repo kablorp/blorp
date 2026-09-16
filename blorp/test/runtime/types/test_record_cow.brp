@@ -230,9 +230,99 @@ func test_sparse_update_swaps_managed_fields_without_stale_owners() -> Bool:
 	)
 
 
+-- Reading a list field to compute its own replacement must not force a copy
+-- when the record is unique: the update moves the field out instead.
+func test_self_consumed_list_field_updates_remain_allocation_bounded() -> Bool:
+	var state: ManagedState = {
+		primary = "current",
+		backup = "fallback",
+		history = [],
+		count = 0
+	}
+	reset_mem_stats()
+	var i: Int = 0
+
+	while i < 1000:
+		state = { state |
+			history = state.history.append("step"),
+			count = state.count + 1
+		}
+		i += 1
+
+	stats: MemStats = get_mem_stats()
+	state.history.length() == 1000 and state.count == 1000 and stats.total_allocations < 64
+
+
+func grow_history(start: ManagedState, steps: Int) -> ManagedState:
+	var state: ManagedState = start
+	var i: Int = 0
+
+	while i < steps:
+		state = { state |
+			history = state.history.append("step"),
+			count = state.count + 1
+		}
+		i += 1
+
+	state
+
+
+-- A shared record must keep its list for every other owner while the update
+-- continues on its own copy, including snapshots taken mid-loop.
+func test_self_consumed_list_field_update_preserves_aliases() -> Bool:
+	base: ManagedState = {
+		primary = "current",
+		backup = "fallback",
+		history = ["created"],
+		count = 0
+	}
+	kept: ManagedState = base
+	grown: ManagedState = grow_history(base, 3)
+	snapshot: ManagedState = grown
+	more: ManagedState = grow_history(grown, 2)
+	var working: ManagedState = base
+	working = { working |
+		history = working.history.append("one"),
+		count = 1
+	}
+	middle: ManagedState = working
+	working = { working |
+		history = working.history.append("two"),
+		count = 2
+	}
+
+	(
+		kept.history.length() == 1
+		and kept.count == 0
+		and base.history.length() == 1
+		and grown.history.length() == 4
+		and grown.count == 3
+		and snapshot.history.length() == 4
+		and more.history.length() == 6
+		and more.count == 5
+		and middle.history.length() == 2
+		and middle.history
+			.get(1)
+			.get_or("") == "one"
+		and working.history.length() == 3
+		and working.history
+			.get(2)
+			.get_or("") == "two"
+		and working.count == 2
+	)
+
+
 tests: TestSuite = {
 	description = "Record COW",
 	tests = [
+		(
+			"self-consumed list field updates remain allocation bounded",
+			test_self_consumed_list_field_updates_remain_allocation_bounded,
+		),
+		(
+			"self-consumed list field update preserves aliases",
+			test_self_consumed_list_field_update_preserves_aliases,
+		),
 		("self update", test_self_update),
 		("alias independence", test_alias_independence),
 		("multiple aliases", test_multiple_aliases),

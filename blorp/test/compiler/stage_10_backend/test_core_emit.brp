@@ -229,7 +229,12 @@ import:
 			StackResultReleasePolicy,
 		),
 		CoreResourceExit(ResourceBreakExit),
-		CoreRetainPolicy(ArcRetainPolicy, NoRetainPolicy, StackResultRetainPolicy),
+		CoreRetainPolicy(
+			ArcRetainPolicy,
+			CowFieldTakeRetainPolicy,
+			NoRetainPolicy,
+			StackResultRetainPolicy,
+		),
 		CoreSelectArm,
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
 		CoreSourceLoc(SyntheticSourceLoc),
@@ -14186,6 +14191,121 @@ pure func test_emit_heap_record_reuse_with_unique_and_fresh_paths() -> Bool:
 	)
 
 
+pure func box_record_take_label_function() -> CoreFunction:
+	box_var: CoreVar = {
+		name = "box",
+		uniq = 0,
+		def_id = None
+	}
+	owned_label: CoreVar = {
+		name = "owned_label",
+		uniq = 0,
+		def_id = None
+	}
+
+	{
+		name = "take_box_label",
+		source_module = None,
+		type_params = [],
+		params = [
+			{
+				name = box_var,
+				typ = box_type(),
+				loc = SyntheticSourceLoc
+			},
+		],
+		return_type = box_type(),
+		body = Some(
+			RecordCowUpdateExpr(
+				VarExpr(
+					box_var,
+					box_type(),
+					SyntheticSourceLoc,
+				),
+				[
+					{
+						field = {
+							name = "count",
+							typ = int_type(),
+							release_policy = NoReleasePolicy
+						},
+						replacement = None
+					},
+					{
+						field = {
+							name = "label",
+							typ = string_type(),
+							release_policy = ArcReleasePolicy
+						},
+						replacement = Some(
+							BorrowLetExpr(
+								owned_label,
+								string_type(),
+								FieldExpr(
+									VarExpr(box_var, box_type(), SyntheticSourceLoc),
+									"label",
+									string_type(),
+									SyntheticSourceLoc,
+								),
+								DupExpr(
+									owned_label,
+									string_type(),
+									CowFieldTakeRetainPolicy(box_var, "label"),
+									VarExpr(owned_label, string_type(), SyntheticSourceLoc),
+									string_type(),
+									SyntheticSourceLoc,
+								),
+							),
+						)
+					},
+				],
+				box_type(),
+				SyntheticSourceLoc,
+			),
+		),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 342,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func test_emit_cow_field_take_empties_unique_source_slot() -> Bool:
+	program: CoreProgram = {
+		decls = [
+			HeapRecordDecl(box_heap_record_decl()),
+			FunctionDecl(box_record_take_label_function()),
+		],
+		foreign_includes = []
+	}
+	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	function_start: Int = artifact.c_code
+		.index_of("Box* take_box_label(Box* box) {")
+		.get_or(0)
+	function_c: String = artifact.c_code.substring(
+		function_start,
+		artifact.c_code.length() - function_start,
+	)
+	take_index: Option[Int] = function_c.index_of((
+			"if (blorp_is_unique(box)) { box->label = NULL; } else { "
+			+ "blorp_retain(owned_label); }"
+		))
+	source_test_index: Option[Int] = function_c.index_of("if (blorp_is_unique(__record_cow_source_")
+
+	take_precedes_source_test: Bool = match (take_index, source_test_index):
+		(Some(take_pos), Some(source_pos)):
+			take_pos < source_pos
+		_:
+			False
+
+	(
+		function_start > 0
+		and take_precedes_source_test
+		and function_c.count("blorp_is_unique(box)") == 1
+		and function_c.contains("->label);")
+	)
+
+
 pure func test_emit_sparse_heap_record_update_mutates_only_replacement_fields() -> Bool:
 	program: CoreProgram = {
 		decls = [
@@ -25788,6 +25908,10 @@ tests: TestSuite = {
 		(
 			"indent statements preserves interior spacing",
 			test_indent_statements_preserves_interior_spacing,
+		),
+		(
+			"emit cow field take empties unique source slot",
+			test_emit_cow_field_take_empties_unique_source_slot,
 		),
 	]
 }

@@ -369,6 +369,8 @@ private ARC_RETAIN_POLICY_TAG: String = "arc"
 
 private STACK_RESULT_RETAIN_POLICY_TAG: String = "stack_result"
 
+private COW_FIELD_TAKE_RETAIN_POLICY_TAG: String = "cow_field_take"
+
 private TUPLE_PRIM_ELEMENT_TAG: String = "prim"
 
 private TUPLE_POINTER_ELEMENT_TAG: String = "pointer"
@@ -1069,10 +1071,20 @@ enum CoreReleasePolicy:
 	StackResultReleasePolicy
 
 
-enum CoreRetainPolicy:
+---
+How a `DupExpr` acquires its owner.
+
+`CowFieldTakeRetainPolicy(record, field)` retains a field alias read from the
+named record variable only when that record is shared at runtime; a unique
+record instead gives up its field slot (left null) so the alias becomes the
+sole owner. The reuse pass proves the record is consumed by the enclosing
+record update and that the field is read nowhere else before then.
+---
+union CoreRetainPolicy:
 	NoRetainPolicy
 	ArcRetainPolicy
 	StackResultRetainPolicy
+	CowFieldTakeRetainPolicy(CoreVar, String)
 
 
 record CoreLoopBinder {
@@ -6143,6 +6155,8 @@ pure func core_retain_policy_to_string(policy: CoreRetainPolicy) -> String:
 			ARC_RETAIN_POLICY_TAG
 		StackResultRetainPolicy:
 			STACK_RESULT_RETAIN_POLICY_TAG
+		CowFieldTakeRetainPolicy(_, _):
+			COW_FIELD_TAKE_RETAIN_POLICY_TAG
 
 
 pure func parse_core_retain_policy(
@@ -6157,6 +6171,48 @@ pure func parse_core_retain_policy(
 		Ok(StackResultRetainPolicy)
 	else:
 		Err(CoreUnsupportedTag(path, tag))
+
+
+---
+JSON fields that encode a retain policy inside a dup object: the
+"retain_policy" tag, plus "take_record" and "take_field" for a field take.
+---
+pure func retain_policy_json_fields(policy: CoreRetainPolicy) -> List[(String, JsonValue)]:
+	tag: (String, JsonValue) = ("retain_policy", JsonString(core_retain_policy_to_string(policy)))
+
+	match policy:
+		CowFieldTakeRetainPolicy(record_var, field_name):
+			[
+				tag,
+				("take_record", core_var_to_json(record_var)),
+				("take_field", JsonString(field_name)),
+			]
+		_:
+			[tag]
+
+
+---
+Decode the retain policy of a dup object written by `retain_policy_json_fields`.
+---
+pure func decode_core_retain_policy_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreRetainPolicy, CoreJsonError]:
+	tag ?= string_field(value, path, "retain_policy")
+
+	if tag == COW_FIELD_TAKE_RETAIN_POLICY_TAG:
+		record_json ?= object_field(value, path, "take_record")
+		record_var ?= decode_core_var_json(
+			record_json,
+			path_field(path, "take_record"),
+		)
+		field_name ?= string_field(value, path, "take_field")
+		Ok(CowFieldTakeRetainPolicy(record_var, field_name))
+	else:
+		parse_core_retain_policy(
+			tag,
+			path_field(path, "retain_policy"),
+		)
 
 
 pure func core_loop_binder_to_json(binder: CoreLoopBinder) -> JsonValue:
@@ -9419,11 +9475,13 @@ private pure func core_expr_dup_to_json(
 		(KIND_FIELD, JsonString(DUP_EXPR_TAG)),
 		("var", core_var_to_json(variable)),
 		("value_type", core_type_to_json(value_type)),
-		("retain_policy", JsonString(core_retain_policy_to_string(retain_policy))),
-		("body", core_expr_to_json(body)),
-		("type", core_type_to_json(typ)),
-		("loc", source_loc_to_json(loc)),
-	])
+	]
+		.concat(retain_policy_json_fields(retain_policy))
+		.concat([
+			("body", core_expr_to_json(body)),
+			("type", core_type_to_json(typ)),
+			("loc", source_loc_to_json(loc)),
+		]))
 
 
 private pure func core_expr_drop_to_json(
@@ -11733,11 +11791,7 @@ private pure func decode_core_expr_dup_from_json(
 		value_type_json,
 		path_field(path, "value_type"),
 	)
-	retain_policy_tag ?= string_field(value, path, "retain_policy")
-	retain_policy ?= parse_core_retain_policy(
-		retain_policy_tag,
-		path_field(path, "retain_policy"),
-	)
+	retain_policy ?= decode_core_retain_policy_json(value, path)
 	body_json ?= object_field(value, path, "body")
 	body ?= decode_core_expr_json(
 		body_json,

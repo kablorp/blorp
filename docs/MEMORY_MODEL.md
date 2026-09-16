@@ -110,6 +110,30 @@ For hot builders, keep one mutable local owner and rebind each update. Creating
 an extra alias before the mutation sequence can force copies because the
 runtime must preserve both logical values.
 
+A collection field updated through its own record keeps the fast path only in
+the record-update form, where the field's replacement is the one place the
+update reads that field:
+
+```blorp
+record Batch { items: List[Int], count: Int }
+
+var b: Batch = { items = [], count = 0 }
+for value in values:
+	-- Fast path kept: a unique `b` hands `b.items` to `append` as its sole
+	-- owner, and the update writes the result back into the same record.
+	b = { b | items = b.items.append(value), count = b.count + 1 }
+```
+
+The compiler proves this case only for `{ b | ... }` with `b` a plain local
+that is consumed by the update, and only when no other replacement in the
+same update reads `b.items` or passes `b` itself anywhere. Every other shape
+still evaluates the field as a second alias and copies the list on each
+iteration, including a fresh record literal that reads the old one
+(`b = { items = b.items.append(value), count = b.count + 1 }`), a replacement
+that reads the field twice, and any replacement that captures or calls with
+the whole record. For those, hoist the collection into its own local owner,
+run the loop, and fold it back into the record once.
+
 Empty list literals may share immortal, layout-specific backing storage. They
 therefore require no managed allocation when evaluated. The first operation
 that adds an element observes the immortal object as nonunique and allocates an

@@ -183,6 +183,7 @@ import:
 			NoReleasePolicy,
 			StackResultReleasePolicy,
 		),
+		CoreRetainPolicy(ArcRetainPolicy, CowFieldTakeRetainPolicy),
 		CoreSourceLoc(SyntheticSourceLoc),
 		CoreTensorDim(TensorDimOperation, TensorRuntimeDim, TensorStaticDim, TensorVariadicDim),
 		CoreTensorTypeInfo,
@@ -1896,6 +1897,283 @@ private pure func is_arc_release_policy(release_policy: CoreReleasePolicy) -> Bo
 			False
 
 
+---
+Let a record-reuse field that consumes itself move the field out of a unique
+source instead of retaining it.
+
+A replacement such as `items = s.items.append(x)` reads the field it replaces
+through Perceus's owned-alias shape, `BorrowLetExpr(temp, s.items,
+DupExpr(temp, ...))`, which retains the field while the source record still
+holds it, so the consuming callee observes a shared value and copies. When the
+source is a bare consumed variable and that alias is the only read that could
+observe the field slot across every replacement, the dup's policy becomes
+`CowFieldTakeRetainPolicy`, which keeps the runtime uniqueness test and the
+ordinary retain for shared sources. The source is read only after every
+replacement, so nothing can observe the emptied slot before the update writes
+it back.
+---
+private pure func take_self_consumed_record_fields(
+	source: CoreExpr,
+	fields: List[CoreRecordFieldValue],
+) -> List[CoreRecordFieldValue]:
+	match source:
+		VarExpr(source_var, _, _):
+			fields.map(pure func(field) -> CoreRecordFieldValue:
+				var touches: Int = 0
+
+				for other in fields:
+					touches += var_touch_count(source_var, field.name, other.value)
+
+				if touches == 1:
+					match take_field_alias(source_var, field.name, field.value):
+						Some(taken):
+							{ field | value = taken }
+						None:
+							field
+				else:
+					field
+			)
+		_:
+			fields
+
+
+---
+The `RecordCowUpdateExpr` counterpart of `take_self_consumed_record_fields`;
+inherited fields have no replacement and are never read or taken.
+---
+private pure func take_self_consumed_cow_fields(
+	source: CoreExpr,
+	fields: List[CoreRecordCowField],
+) -> List[CoreRecordCowField]:
+	match source:
+		VarExpr(source_var, _, _):
+			fields.map(pure func(field) -> CoreRecordCowField:
+				match field.replacement:
+					Some(replacement):
+						var touches: Int = 0
+
+						for other in fields:
+							match other.replacement:
+								Some(other_replacement):
+									touches += var_touch_count(
+										source_var,
+										field.field.name,
+										other_replacement,
+									)
+								None:
+									void
+
+						if touches == 1 and is_arc_release_policy(field.field.release_policy):
+							match take_field_alias(source_var, field.field.name, replacement):
+								Some(taken):
+									{ field | replacement = Some(taken) }
+								None:
+									field
+						else:
+							field
+					None:
+						field
+			)
+		_:
+			fields
+
+
+---
+Count reads of `target` in `expr` that could observe an emptied `field_name`
+slot.
+
+A direct read of a different field counts zero. A lambda, closure, or
+assignment of the target counts two, so a caller can never prove a single
+read through something that captures the target for later or rebinds it.
+---
+private pure func var_touch_count(target: CoreVar, field_name: String, expr: CoreExpr) -> Int:
+	match expr:
+		VarExpr(variable, _, _):
+			if core_var_equal(variable, target):
+				1
+			else:
+				0
+		FieldExpr(VarExpr(variable, _, _), read_field, _, _):
+			if core_var_equal(variable, target) and read_field != field_name:
+				0
+			else:
+				var_touch_count(
+					target,
+					field_name,
+					VarExpr(variable, VoidType, SyntheticSourceLoc),
+				)
+		LambdaExpr(_, _, _, _, _, _) | ClosureCreateExpr(_, _, _):
+			2
+		AssignExpr(variable, rhs, _, _):
+			if core_var_equal(variable, target):
+				2
+			else:
+				var_touch_count(target, field_name, rhs)
+		_:
+			var total: Int = 0
+
+			for child in CoreTraverse.immediate_core_expr_children(expr):
+				total += var_touch_count(target, field_name, child)
+
+			total
+
+
+---
+Whether a field of this type is stored as one heap pointer that a take may
+leave null; inline managed values such as stack results are excluded.
+---
+private pure func field_take_type_allowed(typ: CoreType) -> Bool:
+	match typ:
+		HeapRecordType(_):
+			True
+		NamedType(name, args):
+			(
+				core_type_is_list(typ)
+				or core_type_is_dict(typ)
+				or core_type_is_set(typ)
+				or name == "String" and args.length() == 0
+			)
+		_:
+			False
+
+
+---
+Rewrite the owned-alias read of `source_var.field_name` in `expr` to the
+field-take retain policy, or return `None` when the read is not on the
+straight-line evaluation spine or the field is not a single heap pointer.
+
+Descends only through positions that evaluate exactly once, in order, before
+the enclosing record update consumes its source; a read under a branch, loop,
+or lambda is left alone.
+---
+private pure func take_field_alias(
+	source_var: CoreVar,
+	field_name: String,
+	expr: CoreExpr,
+) -> Option[CoreExpr]:
+	match expr:
+		BorrowLetExpr(temp, temp_type, FieldExpr(VarExpr(owner, owner_type, owner_loc), read_field, read_type, read_loc), DupExpr(dup_var, dup_type, ArcRetainPolicy, VarExpr(body_var, body_type, body_loc), result_type, dup_loc)):
+			if (
+				core_var_equal(owner, source_var)
+				and read_field == field_name
+				and core_var_equal(dup_var, temp)
+				and core_var_equal(body_var, temp)
+				and field_take_type_allowed(temp_type)
+				and field_take_type_allowed(dup_type)
+			):
+				Some(
+					BorrowLetExpr(
+						temp,
+						temp_type,
+						FieldExpr(
+							VarExpr(owner, owner_type, owner_loc),
+							read_field,
+							read_type,
+							read_loc,
+						),
+						DupExpr(
+							dup_var,
+							dup_type,
+							CowFieldTakeRetainPolicy(source_var, field_name),
+							VarExpr(body_var, body_type, body_loc),
+							result_type,
+							dup_loc,
+						),
+					),
+				)
+			else:
+				None
+		BorrowLetExpr(variable, value_type, rhs, body):
+			match take_field_alias(source_var, field_name, rhs):
+				Some(taken):
+					Some(BorrowLetExpr(variable, value_type, taken, body))
+				None:
+					take_field_alias(
+						source_var,
+						field_name,
+						body,
+					).map(
+						func(taken): BorrowLetExpr(variable, value_type, rhs, taken),
+					)
+		LetExpr(variable, is_mutable, value_type, rhs, body):
+			match take_field_alias(source_var, field_name, rhs):
+				Some(taken):
+					Some(LetExpr(variable, is_mutable, value_type, taken, body))
+				None:
+					take_field_alias(
+						source_var,
+						field_name,
+						body,
+					).map(
+						func(taken): LetExpr(variable, is_mutable, value_type, rhs, taken),
+					)
+		SeqExpr(first, second):
+			match take_field_alias(source_var, field_name, first):
+				Some(taken):
+					Some(SeqExpr(taken, second))
+				None:
+					take_field_alias(
+						source_var,
+						field_name,
+						second,
+					).map(
+						func(taken): SeqExpr(first, taken),
+					)
+		CallExpr(kind, callee, args, typ, loc):
+			var taken_args: List[CoreExpr] = []
+			var found: Bool = False
+
+			for arg in args:
+				if found:
+					taken_args = taken_args.append(arg)
+				else:
+					match take_field_alias(source_var, field_name, arg):
+						Some(taken):
+							found = True
+							taken_args = taken_args.append(taken)
+						None:
+							taken_args = taken_args.append(arg)
+
+			if found:
+				Some(CallExpr(kind, callee, taken_args, typ, loc))
+			else:
+				None
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			take_field_alias(
+				source_var,
+				field_name,
+				body,
+			).map(
+				func(taken): DupExpr(variable, value_type, retain_policy, taken, typ, loc),
+			)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			take_field_alias(
+				source_var,
+				field_name,
+				body,
+			).map(
+				func(taken): DropExpr(variable, value_type, release_policy, taken, typ, loc),
+			)
+		CastExpr(inner, typ, loc):
+			take_field_alias(
+				source_var,
+				field_name,
+				inner,
+			).map(
+				func(taken): CastExpr(taken, typ, loc),
+			)
+		UnboxExpr(kind, inner, typ, loc):
+			take_field_alias(
+				source_var,
+				field_name,
+				inner,
+			).map(
+				func(taken): UnboxExpr(kind, taken, typ, loc),
+			)
+		_:
+			None
+
+
 -- This rewrite runs after Perceus, so the adjacent DropExpr proves that the
 -- source owner survives every field evaluation and dies with the fresh result.
 -- RecordReuseExpr preserves that order: fields first, source consumption last.
@@ -2809,7 +3087,7 @@ pure func rewrite_post_perceus_expr(expr: CoreExpr) -> CoreExpr:
 		LogicalExpr(op, left, right, typ, loc):
 			expr
 		AssignExpr(variable, rhs, typ, loc):
-			expr
+			AssignExpr(variable, rewrite_post_perceus_expr(rhs), typ, loc)
 		CastExpr(inner, typ, loc):
 			expr
 		BoxExpr(box, typ, loc):
@@ -2881,9 +3159,19 @@ pure func rewrite_post_perceus_expr(expr: CoreExpr) -> CoreExpr:
 		RecordUpdateExpr(base, fields, typ, loc):
 			expr
 		RecordReuseExpr(source, fields, typ, loc):
-			expr
+			RecordReuseExpr(
+				source,
+				take_self_consumed_record_fields(source, fields),
+				typ,
+				loc,
+			)
 		RecordCowUpdateExpr(source, fields, typ, loc):
-			expr
+			RecordCowUpdateExpr(
+				source,
+				take_self_consumed_cow_fields(source, fields),
+				typ,
+				loc,
+			)
 		RecordConstructExpr(type_name, fields, typ, loc):
 			expr
 		UnionConstructExpr(construct, typ, loc):
