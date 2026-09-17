@@ -828,11 +828,38 @@ profile_window_bin="$TMPDIR_CLI/profile_window"
 resolved_identity_prog="$TMPDIR_CLI/resolved_identity.brp"
 late_core_dump="$TMPDIR_CLI/late-core.dump"
 late_stopped_c="$TMPDIR_CLI/late-stopped.c"
+hyphen_project_dir="$TMPDIR_CLI/has-hyphen.project/nested"
+hyphen_project_lib="$hyphen_project_dir/lib.brp"
+hyphen_project_main="$hyphen_project_dir/main.brp"
 check_dir_ok="$TMPDIR_CLI/check_dir_ok"
 check_dir_bad="$TMPDIR_CLI/check_dir_bad"
 check_dir_empty="$TMPDIR_CLI/check_dir_empty"
 
 mkdir -p "$check_dir_ok/nested" "$check_dir_bad/nested" "$check_dir_empty"
+mkdir -p "$hyphen_project_dir"
+cat > "$hyphen_project_lib" <<'BRP'
+VALUE: Int = 1
+
+
+record Point {
+	x: Int,
+	y: Int
+}
+
+
+pure func doubled(value: Int) -> Int:
+	value * 2
+BRP
+cat > "$hyphen_project_main" <<'BRP'
+import:
+	./lib: VALUE, Point, doubled
+
+
+func main(args: List[String]) -> Int:
+	point: Point = {x = VALUE, y = 3.doubled()}
+	print("hyphen path ${point.x} ${point.y}")
+	0
+BRP
 mkdir -p "$multi_suite_test_dir"
 cp blorp/test/runtime/types/test_bool.brp "$multi_suite_test_dir/a_bool.brp"
 cp blorp/test/runtime/types/test_char.brp "$multi_suite_test_dir/b_char.brp"
@@ -1591,6 +1618,14 @@ expect_output_contains "run reports configured host discovery failure" 1 \
 	env CC="$TMPDIR_CLI/missing-cc" \
 	"$BLORP_BIN" run --no-format --timeout 5 "$valid_prog"
 
+# A module name is the module's host path, and Core flattens it into a C
+# identifier. A project directory holding a character C rejects in an
+# identifier must not reach the C compiler; only a cross-module member is
+# spelled through the module path, so this needs two modules.
+expect_output_contains "run cross-module program from a non-identifier path" 0 \
+	"hyphen path 1 6" \
+	"$BLORP_BIN" run --no-format --timeout 60 "$hyphen_project_main"
+
 if $run_deep_checks; then
 	expect_output_contains "compile parse failure" 1 'expected `)` after function parameters' \
 		"$BLORP_BIN" compile --no-format -o "$TMPDIR_CLI/parse_invalid.c" "$parse_invalid_prog"
@@ -1602,7 +1637,7 @@ fi
 
 expect_output_excludes "test success omits disabled session counters" 0 \
 	"BLORP_TEST_SESSION_COUNTER " \
-	"$BLORP_BIN" test --timeout 5 \
+	"${BLORP_DIRECT_TEST_ENV[@]}" "$BLORP_BIN" test --timeout 5 \
 	blorp/test/runtime/types/test_bool.brp
 expect_exit "test failure" 1 "$BLORP_BIN" test --timeout 5 "$failing_test"
 expect_test_session_counters "suite counters are stable across repeat" "[PASS]" 1 1 1 1 1 0 \

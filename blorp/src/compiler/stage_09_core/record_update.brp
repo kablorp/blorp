@@ -22,10 +22,12 @@ import:
 		CoreDecl(FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl),
 		CoreExpr(
 			AssignExpr,
+			ClosureCreateExpr,
 			ConstructorMatchExpr,
 			DropExpr,
 			FieldExpr,
 			IfExpr,
+			LambdaExpr,
 			LetExpr,
 			LogicalExpr,
 			RecordExpr,
@@ -185,6 +187,39 @@ private pure func expr_touches_var(expr: CoreExpr, target: CoreVar) -> Bool:
 			CoreTraverse
 				.immediate_core_expr_children(expr)
 				.any(func(child): expr_touches_var(child, target))
+
+
+---
+Whether `expr` may be evaluated before a record update consumes `target`.
+
+The update reuses `target`'s allocation, so nothing evaluated earlier may keep
+a way to observe the record once the update starts writing its fields. Reading
+a field is fine: it yields the field's value, which Perceus owns independently
+of the slot it came from. A bare mention hands the record itself to something
+that can outlive the update, a lambda or closure defers its reads past the
+update, and an assignment rebinds the name the update still has to consume.
+---
+private pure func expr_reads_target_fields_only(expr: CoreExpr, target: CoreVar) -> Bool:
+	match expr:
+		VarExpr(variable, typ, loc):
+			not core_var_equal(variable, target)
+		FieldExpr(VarExpr(owner, owner_type, owner_loc), field_name, typ, loc):
+			True
+		LambdaExpr(_, _, _, _, _, _) | ClosureCreateExpr(_, _, _):
+			not expr_touches_var(expr, target)
+		AssignExpr(variable, rhs, typ, loc):
+			not core_var_equal(variable, target) and expr_reads_target_fields_only(rhs, target)
+		SeqExpr(_, _):
+			spine = CoreTraverse.split_core_sequence(expr)
+
+			(
+				spine.preceding_items.all(func(item): expr_reads_target_fields_only(item, target))
+				and expr_reads_target_fields_only(spine.final_item, target)
+			)
+		_:
+			CoreTraverse
+				.immediate_core_expr_children(expr)
+				.all(func(child): expr_reads_target_fields_only(child, target))
 
 
 private pure func declared_heap_record_decls(
@@ -1070,7 +1105,10 @@ private pure func prepare_immutable_let_reuse_value(
 		Some(prepared):
 			Some(prepared)
 		None:
-			if core_var_equal(variable, target) or expr_touches_var(initial, target):
+			if (
+				core_var_equal(variable, target)
+				or not expr_reads_target_fields_only(initial, target)
+			):
 				None
 			else:
 				prepare_record_reuse_value(

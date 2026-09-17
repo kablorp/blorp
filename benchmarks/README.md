@@ -1784,7 +1784,7 @@ Rules:
    `BLORP_CLI_C_OPTIMIZATION=-O2` for `make`, `scripts/compiler-build-status`,
    and the harness alike, since the build identity includes that level. The
    JSON records the level as `c_optimization`. Report which one you used.
-4. The harness takes a shared lock in `$TMPDIR/blorp-perf-measure.lock` for measurements (they are single-process) and an exclusive lock for `lock --` commands.
+4. Measurements take no lock (they are single-process and their primary metrics tolerate concurrency); `lock --` commands take an exclusive lock in `$TMPDIR/blorp-perf-measure.lock` so gates never overlap.
    Wrap any command that spawns many compiled binaries
    (`scripts/compiler-check`, `scripts/test`) in
    `benchmarks/self_compile_measure lock -- <cmd>` so concurrent worktrees
@@ -1796,6 +1796,39 @@ Rules:
 Retained baselines live in `benchmarks/results/self_compile_baseline_*.json`
 and `self_compile_small_baseline_*.json`; a new baseline is recorded only when
 the input revision or host changes.
+
+### Typecheck Cost Attribution
+
+`BLORP_TYPECHECK_BODY_METRICS=1` makes any compile print where the typed
+frontend spent its time, to stderr, once per typechecked graph. It also turns on
+the runtime's lightweight allocation counter, so no other variable is needed.
+With the variable unset nothing is printed and the generated C, the phase
+allocations, and the retired instructions are unchanged.
+
+Two row kinds, both flushed together:
+
+```text
+BLORP_TYPECHECK_PHASE phase=bound_modules microseconds=18256 allocations=117768
+BLORP_TYPECHECK_BODY scope=dependency microseconds=1970 allocations=6555 source_lines=29 module=bytes callable=write_int32_be
+BLORP_TYPECHECK_BODY_TOTAL scope=dependency bodies=598 microseconds=54233 allocations=335086
+```
+
+Phase rows come first, in the order the frontend runs them: `indexed_graph`,
+`importable_modules`, `module_scopes`, `importable_index`, `bound_modules`,
+`ctfe_dependency_plan`, `declaration_skeletons`, `alias_dependencies`,
+`resolved_type_parameters`, `type_headers`, `trait_topology`,
+`callable_headers`, `implementation_headers`, `graph_completion`,
+`ctfe_dependencies`, `ctfe_globals`, `module_bodies`. Two of them are parents of
+rows printed before them: `graph_completion` contains `accepted_aliases`,
+`accepted_records`, `accepted_unions`, `accepted_globals`,
+`global_header_completion` and `accepted_graph`; `module_bodies` contains every
+`BLORP_TYPECHECK_BODY` row. Do not add a parent and its children together.
+
+Body rows follow, sorted by elapsed time, one per checked body, then three
+`BLORP_TYPECHECK_BODY_TOTAL` rows for `project`, `dependency` and `all`.
+`scope` is the module's origin: a standard-library or package module is a
+`dependency`, a module of the program under compilation is `project`. Run it
+with `--time-phases` to relate the rows to the `typed_frontend` phase total.
 
 ## Timing Model
 

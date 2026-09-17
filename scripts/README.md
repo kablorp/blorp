@@ -97,6 +97,7 @@ scripts/test --verbose          # stream child-runner output
 scripts/test --log-dir logs     # keep complete gate logs
 scripts/test --no-build         # test the existing installed toolchain
 scripts/test --timings          # print generated TestSuite phase timings
+scripts/test --release-compiler # build bin/blorp at -O2 for full gate runs
 ```
 
 `scripts/test` is quiet by default. Successful runs print a gate summary with
@@ -112,6 +113,10 @@ The remaining roots compile and run together in one runtime test invocation.
 `--no-build` is for controlled CI or local workflows that have already run the
 required build and need to preserve that exact toolchain through validation.
 Without it, `scripts/test` installs the current compiler before running gates.
+`--release-compiler` exports `BLORP_CLI_C_OPTIMIZATION=-O2` for that install,
+trading a slower build for a faster compiler in the gates that follow; see
+"Compiler optimization level" in `docs/DEVELOPMENT.md` for the -O0/-O2 split
+and the re-link cost of switching levels between runs.
 
 ## Complexity Candidate Analysis
 
@@ -347,9 +352,9 @@ Timeouts:
 `scripts/premerge-gate` is the broader local validation gate before merging or
 cutting preview builds. It composes:
 
-- clean build
+- clean build at `-O2` (`BLORP_CLI_C_OPTIMIZATION=-O2`; use `--no-release-compiler` for `-O0`)
 - `make quality`
-- `scripts/test --serial compiler-blorp compiler-tools std-check runtime leak doctest cli-deep lsp`
+- `scripts/test --serial --release-compiler compiler-blorp compiler-tools std-check runtime leak doctest cli-deep lsp`
 - the direct generated-C audit in `blorp/test/compiler/pipeline/codegen_audit/`
 - preview CLI/runtime smoke
 - example checks and selected example runs
@@ -377,7 +382,8 @@ rewrites the working tree.
 
 ## Docker Gate
 
-`scripts/docker-gate` runs validation inside an Ubuntu 24.04 container.
+`scripts/docker-gate` runs validation inside an Ubuntu 24.04 container. Like
+`scripts/premerge-gate`, it builds `bin/blorp` at `-O2` by default.
 
 ```bash
 scripts/docker-gate

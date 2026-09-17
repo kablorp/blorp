@@ -843,6 +843,7 @@ static inline void __blorp_scheduler_stat_lock(
 static bool __blorp_stats_enabled = false;
 static bool __blorp_lightweight_stats_enabled = false;
 static bool __blorp_compiler_memory_profile_enabled = false;
+static bool __blorp_typecheck_body_metrics_enabled = false;
 static bool __blorp_trace_allocs = false;
 
 // Memory watch: periodic snapshots to stderr for leak detection in long-running programs.
@@ -1055,6 +1056,76 @@ static void __blorp_compiler_memory_checkpoint(
     );
 }
 
+// Per-body typecheck attribution (BLORP_TYPECHECK_BODY_METRICS=1). The typed
+// frontend records one row per checked body; the report prints once per flush
+// and the buffer is released with it, so nothing outlives the compile.
+typedef struct {
+    char* module_path;
+    char* callable;
+    long microseconds;
+    long allocations;
+    long source_lines;
+    long is_dependency;
+} __blorp_TypecheckBodyMetric;
+
+static __blorp_TypecheckBodyMetric* __blorp_typecheck_body_metrics = NULL;
+static size_t __blorp_typecheck_body_metric_count = 0;
+static size_t __blorp_typecheck_body_metric_capacity = 0;
+
+static char* __blorp_typecheck_body_metric_text(const char* text) {
+    const char* source = text ? text : "";
+    size_t length = strlen(source);
+    char* copy = (char*)malloc(length + 1);
+    if (!copy) return NULL;
+    memcpy(copy, source, length + 1);
+    return copy;
+}
+
+static int __blorp_typecheck_body_metric_compare(const void* left, const void* right) {
+    const __blorp_TypecheckBodyMetric* first = (const __blorp_TypecheckBodyMetric*)left;
+    const __blorp_TypecheckBodyMetric* second = (const __blorp_TypecheckBodyMetric*)right;
+    if (first->microseconds != second->microseconds) {
+        return first->microseconds < second->microseconds ? 1 : -1;
+    }
+    if (first->allocations != second->allocations) {
+        return first->allocations < second->allocations ? 1 : -1;
+    }
+    return strcmp(first->callable ? first->callable : "", second->callable ? second->callable : "");
+}
+
+// Graph-construction phases recorded in the order the typed frontend runs
+// them, alongside the per-body rows and flushed with them.
+typedef struct {
+    char* phase;
+    long microseconds;
+    long allocations;
+} __blorp_TypecheckPhaseMetric;
+
+static __blorp_TypecheckPhaseMetric* __blorp_typecheck_phase_metrics = NULL;
+static size_t __blorp_typecheck_phase_metric_count = 0;
+static size_t __blorp_typecheck_phase_metric_capacity = 0;
+
+static void __blorp_typecheck_phase_metrics_release(void) {
+    for (size_t index = 0; index < __blorp_typecheck_phase_metric_count; index++) {
+        free(__blorp_typecheck_phase_metrics[index].phase);
+    }
+    free(__blorp_typecheck_phase_metrics);
+    __blorp_typecheck_phase_metrics = NULL;
+    __blorp_typecheck_phase_metric_count = 0;
+    __blorp_typecheck_phase_metric_capacity = 0;
+}
+
+static void __blorp_typecheck_body_metrics_release(void) {
+    for (size_t index = 0; index < __blorp_typecheck_body_metric_count; index++) {
+        free(__blorp_typecheck_body_metrics[index].module_path);
+        free(__blorp_typecheck_body_metrics[index].callable);
+    }
+    free(__blorp_typecheck_body_metrics);
+    __blorp_typecheck_body_metrics = NULL;
+    __blorp_typecheck_body_metric_count = 0;
+    __blorp_typecheck_body_metric_capacity = 0;
+}
+
 static inline size_t __alloc_meta_slot(const blorp_Object* obj) {
     return (((uintptr_t)obj) >> 4) & (BLORP_ALLOC_META_SLOTS - 1);
 }
@@ -1204,9 +1275,12 @@ static void __blorp_init_stats_flag(void) {
     const char* mem_watch_env = getenv("BLORP_MEM_WATCH");
     __blorp_compiler_memory_profile_enabled =
         getenv("BLORP_COMPILER_MEMORY_PROFILE") != NULL;
+    __blorp_typecheck_body_metrics_enabled =
+        getenv("BLORP_TYPECHECK_BODY_METRICS") != NULL;
     __blorp_lightweight_stats_enabled =
         getenv("BLORP_ALLOCATOR_STATS") != NULL ||
-        __blorp_compiler_memory_profile_enabled;
+        __blorp_compiler_memory_profile_enabled ||
+        __blorp_typecheck_body_metrics_enabled;
     __blorp_stats_enabled = (getenv("BLORP_LEAK_CHECK") != NULL) ||
                             (getenv("BLORP_TRACK_STATS") != NULL) ||
                             (getenv("BLORP_TRACE_ALLOCS") != NULL) ||
@@ -1730,6 +1804,243 @@ typedef struct { blorp_Object header; long len; long capacity; char data[]; } bl
 void blorp_compiler_memory_checkpoint_c(const char* phase) {
     const char* rendered_phase = phase ? phase : "unknown";
     __blorp_compiler_memory_checkpoint(rendered_phase, strlen(rendered_phase));
+}
+
+long blorp_runtime_total_allocations_c(void) {
+    return atomic_load_explicit(&global_mem_stats.total_allocations, memory_order_relaxed);
+}
+
+long blorp_runtime_monotonic_microseconds_c(void) {
+    struct timespec timestamp = {0};
+    clock_gettime(CLOCK_MONOTONIC, &timestamp);
+    if (timestamp.tv_sec > LONG_MAX / 1000000L) return LONG_MAX;
+    return timestamp.tv_sec * 1000000L + timestamp.tv_nsec / 1000L;
+}
+
+long blorp_typecheck_body_metrics_enabled_c(void) {
+    return __blorp_typecheck_body_metrics_enabled ? 1 : 0;
+}
+
+void blorp_typecheck_body_metric_record_c(
+    const char* module_path,
+    const char* callable,
+    long microseconds,
+    long allocations,
+    long source_lines,
+    long is_dependency
+) {
+    if (!__blorp_typecheck_body_metrics_enabled) return;
+    if (__blorp_typecheck_body_metric_count == __blorp_typecheck_body_metric_capacity) {
+        size_t grown = __blorp_typecheck_body_metric_capacity
+            ? __blorp_typecheck_body_metric_capacity * 2
+            : 1024;
+        __blorp_TypecheckBodyMetric* rows = (__blorp_TypecheckBodyMetric*)realloc(
+            __blorp_typecheck_body_metrics,
+            grown * sizeof(__blorp_TypecheckBodyMetric)
+        );
+        if (!rows) return;
+        __blorp_typecheck_body_metrics = rows;
+        __blorp_typecheck_body_metric_capacity = grown;
+    }
+    __blorp_TypecheckBodyMetric* row =
+        &__blorp_typecheck_body_metrics[__blorp_typecheck_body_metric_count];
+    row->module_path = __blorp_typecheck_body_metric_text(module_path);
+    row->callable = __blorp_typecheck_body_metric_text(callable);
+    row->microseconds = microseconds;
+    row->allocations = allocations;
+    row->source_lines = source_lines;
+    row->is_dependency = is_dependency ? 1 : 0;
+    __blorp_typecheck_body_metric_count++;
+}
+
+void blorp_typecheck_phase_metric_record_c(
+    const char* phase,
+    long microseconds,
+    long allocations
+) {
+    if (!__blorp_typecheck_body_metrics_enabled) return;
+    if (__blorp_typecheck_phase_metric_count == __blorp_typecheck_phase_metric_capacity) {
+        size_t grown = __blorp_typecheck_phase_metric_capacity
+            ? __blorp_typecheck_phase_metric_capacity * 2
+            : 64;
+        __blorp_TypecheckPhaseMetric* rows = (__blorp_TypecheckPhaseMetric*)realloc(
+            __blorp_typecheck_phase_metrics,
+            grown * sizeof(__blorp_TypecheckPhaseMetric)
+        );
+        if (!rows) return;
+        __blorp_typecheck_phase_metrics = rows;
+        __blorp_typecheck_phase_metric_capacity = grown;
+    }
+    __blorp_TypecheckPhaseMetric* row =
+        &__blorp_typecheck_phase_metrics[__blorp_typecheck_phase_metric_count];
+    row->phase = __blorp_typecheck_body_metric_text(phase);
+    row->microseconds = microseconds;
+    row->allocations = allocations;
+    __blorp_typecheck_phase_metric_count++;
+}
+
+typedef struct {
+    char* fallback;
+    char* fallback_callable;
+    long fallback_definition_id;
+    long dependency_modules;
+    long selective_modules;
+    long eager_modules;
+    long worklist_checked_bodies;
+    long bodies_outside_plan;
+} __blorp_TypecheckCtfeMetric;
+
+static __blorp_TypecheckCtfeMetric* __blorp_typecheck_ctfe_metrics = NULL;
+static size_t __blorp_typecheck_ctfe_metric_count = 0;
+static size_t __blorp_typecheck_ctfe_metric_capacity = 0;
+
+static void __blorp_typecheck_ctfe_metrics_release(void) {
+    for (size_t index = 0; index < __blorp_typecheck_ctfe_metric_count; index++) {
+        free(__blorp_typecheck_ctfe_metrics[index].fallback);
+        free(__blorp_typecheck_ctfe_metrics[index].fallback_callable);
+    }
+    free(__blorp_typecheck_ctfe_metrics);
+    __blorp_typecheck_ctfe_metrics = NULL;
+    __blorp_typecheck_ctfe_metric_count = 0;
+    __blorp_typecheck_ctfe_metric_capacity = 0;
+}
+
+void blorp_typecheck_ctfe_metric_record_c(
+    const char* fallback,
+    const char* fallback_callable,
+    long fallback_definition_id,
+    long dependency_modules,
+    long selective_modules,
+    long eager_modules,
+    long worklist_checked_bodies,
+    long bodies_outside_plan
+) {
+    if (!__blorp_typecheck_body_metrics_enabled) return;
+    if (__blorp_typecheck_ctfe_metric_count == __blorp_typecheck_ctfe_metric_capacity) {
+        size_t grown = __blorp_typecheck_ctfe_metric_capacity
+            ? __blorp_typecheck_ctfe_metric_capacity * 2
+            : 16;
+        __blorp_TypecheckCtfeMetric* rows = (__blorp_TypecheckCtfeMetric*)realloc(
+            __blorp_typecheck_ctfe_metrics,
+            grown * sizeof(__blorp_TypecheckCtfeMetric)
+        );
+        if (!rows) return;
+        __blorp_typecheck_ctfe_metrics = rows;
+        __blorp_typecheck_ctfe_metric_capacity = grown;
+    }
+    __blorp_TypecheckCtfeMetric* row =
+        &__blorp_typecheck_ctfe_metrics[__blorp_typecheck_ctfe_metric_count];
+    row->fallback = __blorp_typecheck_body_metric_text(fallback);
+    row->fallback_callable = __blorp_typecheck_body_metric_text(fallback_callable);
+    row->fallback_definition_id = fallback_definition_id;
+    row->dependency_modules = dependency_modules;
+    row->selective_modules = selective_modules;
+    row->eager_modules = eager_modules;
+    row->worklist_checked_bodies = worklist_checked_bodies;
+    row->bodies_outside_plan = bodies_outside_plan;
+    __blorp_typecheck_ctfe_metric_count++;
+}
+
+void blorp_typecheck_body_metrics_report_c(void) {
+    if (!__blorp_typecheck_body_metrics_enabled) return;
+    if (__blorp_typecheck_body_metric_count == 0
+        && __blorp_typecheck_phase_metric_count == 0
+        && __blorp_typecheck_ctfe_metric_count == 0) {
+        return;
+    }
+    for (size_t index = 0; index < __blorp_typecheck_ctfe_metric_count; index++) {
+        const __blorp_TypecheckCtfeMetric* row = &__blorp_typecheck_ctfe_metrics[index];
+        fprintf(
+            stderr,
+            "BLORP_TYPECHECK_CTFE fallback=%s fallback_definition_id=%ld "
+            "fallback_callable=%s dependency_modules=%ld "
+            "selective_modules=%ld eager_modules=%ld worklist_checked_bodies=%ld "
+            "bodies_outside_plan=%ld\n",
+            row->fallback ? row->fallback : "",
+            row->fallback_definition_id,
+            row->fallback_callable ? row->fallback_callable : "",
+            row->dependency_modules,
+            row->selective_modules,
+            row->eager_modules,
+            row->worklist_checked_bodies,
+            row->bodies_outside_plan
+        );
+    }
+    __blorp_typecheck_ctfe_metrics_release();
+    for (size_t index = 0; index < __blorp_typecheck_phase_metric_count; index++) {
+        const __blorp_TypecheckPhaseMetric* row = &__blorp_typecheck_phase_metrics[index];
+        fprintf(
+            stderr,
+            "BLORP_TYPECHECK_PHASE phase=%s microseconds=%ld allocations=%ld\n",
+            row->phase ? row->phase : "",
+            row->microseconds,
+            row->allocations
+        );
+    }
+    __blorp_typecheck_phase_metrics_release();
+    if (__blorp_typecheck_body_metric_count == 0) return;
+    qsort(
+        __blorp_typecheck_body_metrics,
+        __blorp_typecheck_body_metric_count,
+        sizeof(__blorp_TypecheckBodyMetric),
+        __blorp_typecheck_body_metric_compare
+    );
+    fprintf(
+        stderr,
+        "BLORP_TYPECHECK_BODY_METRICS schema=1 bodies=%zu\n",
+        __blorp_typecheck_body_metric_count
+    );
+    long project_bodies = 0;
+    long project_microseconds = 0;
+    long project_allocations = 0;
+    long dependency_bodies = 0;
+    long dependency_microseconds = 0;
+    long dependency_allocations = 0;
+    for (size_t index = 0; index < __blorp_typecheck_body_metric_count; index++) {
+        const __blorp_TypecheckBodyMetric* row = &__blorp_typecheck_body_metrics[index];
+        if (row->is_dependency) {
+            dependency_bodies++;
+            dependency_microseconds += row->microseconds;
+            dependency_allocations += row->allocations;
+        } else {
+            project_bodies++;
+            project_microseconds += row->microseconds;
+            project_allocations += row->allocations;
+        }
+        fprintf(
+            stderr,
+            "BLORP_TYPECHECK_BODY scope=%s microseconds=%ld allocations=%ld "
+            "source_lines=%ld module=%s callable=%s\n",
+            row->is_dependency ? "dependency" : "project",
+            row->microseconds,
+            row->allocations,
+            row->source_lines,
+            row->module_path ? row->module_path : "",
+            row->callable ? row->callable : ""
+        );
+    }
+    fprintf(
+        stderr,
+        "BLORP_TYPECHECK_BODY_TOTAL scope=project bodies=%ld microseconds=%ld allocations=%ld\n",
+        project_bodies,
+        project_microseconds,
+        project_allocations
+    );
+    fprintf(
+        stderr,
+        "BLORP_TYPECHECK_BODY_TOTAL scope=dependency bodies=%ld microseconds=%ld allocations=%ld\n",
+        dependency_bodies,
+        dependency_microseconds,
+        dependency_allocations
+    );
+    fprintf(
+        stderr,
+        "BLORP_TYPECHECK_BODY_TOTAL scope=all bodies=%ld microseconds=%ld allocations=%ld\n",
+        project_bodies + dependency_bodies,
+        project_microseconds + dependency_microseconds,
+        project_allocations + dependency_allocations
+    );
+    __blorp_typecheck_body_metrics_release();
 }
 
 #define BLORP_LIST_STORAGE_POINTER 0

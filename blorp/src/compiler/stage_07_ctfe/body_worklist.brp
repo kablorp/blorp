@@ -7,7 +7,7 @@ import:
 		BodyCheckOutcome(BodyCheckAccepted, BodyCheckRejected),
 		BodyCheckRegistry,
 		body_check_registry_context_for_definition_id,
-		check_body_context,
+		check_registry_body_context_with_metrics,
 		checked_body_artifact_validated_body,
 		validated_body_typed_function,
 	body_dependencies:
@@ -35,7 +35,8 @@ struct CtfeBodyWorklistMetrics {
 	checked_bodies: Int,
 	accepted_bodies: Int,
 	rejected_bodies: Int,
-	duplicate_requests: Int
+	duplicate_requests: Int,
+	bodies_outside_plan: Int
 }
 
 
@@ -43,6 +44,7 @@ enum CtfeBodyWorkState:
 	CtfeBodyQueued
 	CtfeBodyChecking
 	CtfeBodyHasNoSourceBody
+	CtfeBodyOutsideDependencyPlan
 	CtfeBodyAccepted
 	CtfeBodyRejected
 
@@ -55,12 +57,13 @@ union CtfeBodyWorklistFallback:
 
 
 union CtfeBodyWorklistResult:
-	CtfeBodyWorklistReady(List[CtfeCheckedBody], CtfeBodyWorklistMetrics)
+	CtfeBodyWorklistReady(List[CtfeCheckedBody], List[Int], CtfeBodyWorklistMetrics)
 	CtfeBodyWorklistRequiresEager(CtfeBodyWorklistFallback, List[CtfeCheckedBody], CtfeBodyWorklistMetrics)
 
 
 private record CtfeBodyContextLookup {
 	module_id: ModuleId,
+	registry: BodyCheckRegistry,
 	context: BodyCheckContextBuild
 }
 
@@ -87,6 +90,7 @@ private pure func ctfe_body_context_lookup(
 				Some(context):
 					result = Some({
 						module_id = registration.module_id,
+						registry = registration.registry,
 						context = context,
 					})
 				None:
@@ -125,7 +129,8 @@ pure func ctfe_check_reachable_bodies(
 			checked_bodies = 0,
 			accepted_bodies = 0,
 			rejected_bodies = 0,
-			duplicate_requests = 0
+			duplicate_requests = 0,
+			bodies_outside_plan = 0
 		}
 	}
 
@@ -134,6 +139,7 @@ pure func ctfe_check_reachable_bodies(
 
 	var pending_index: Int = 0
 	var checked: List[CtfeCheckedBody] = []
+	var outside_plan: List[Int] = []
 	var fallback: Option[CtfeBodyWorklistFallback] = None
 
 	while pending_index < queue.pending.length() and fallback.is_none():
@@ -146,7 +152,18 @@ pure func ctfe_check_reachable_bodies(
 
 				match ctfe_body_context_lookup(registries, definition_id):
 					None:
-						fallback = Some(CtfeMissingBodyRegistry(definition_id))
+						-- No prepared dependency owns this definition, so its module
+						-- is not in the CTFE dependency plan. Preparation cannot
+						-- supply that body on any path, eager included, and the
+						-- globals this run evaluates all live in plan modules, so
+						-- record the state and keep walking the rest of the queue.
+						queue = { queue |
+							states = queue.states.set(definition_id, CtfeBodyOutsideDependencyPlan),
+							metrics = { queue.metrics |
+								bodies_outside_plan = queue.metrics.bodies_outside_plan + 1
+							}
+						}
+						outside_plan = outside_plan.append(definition_id)
 					Some(lookup):
 						match lookup.context:
 							BodyContextRejected(reason):
@@ -161,7 +178,10 @@ pure func ctfe_check_reachable_bodies(
 									_:
 										fallback = Some(CtfeMissingBodyRegistry(definition_id))
 							BodyContextReady(context):
-								outcome = check_body_context(context)
+								outcome = check_registry_body_context_with_metrics(
+									lookup.registry,
+									context,
+								)
 								queue = { queue |
 									metrics = { queue.metrics |
 										checked_bodies = queue.metrics.checked_bodies + 1
@@ -213,4 +233,4 @@ pure func ctfe_check_reachable_bodies(
 		Some(reason):
 			CtfeBodyWorklistRequiresEager(reason, checked, queue.metrics)
 		None:
-			CtfeBodyWorklistReady(checked, queue.metrics)
+			CtfeBodyWorklistReady(checked, outside_plan, queue.metrics)

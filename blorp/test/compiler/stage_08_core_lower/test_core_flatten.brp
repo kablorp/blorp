@@ -49,6 +49,7 @@ import:
 		CoreType(NamedType),
 		CoreVar,
 	../../../src/compiler/stage_09_core/traverse as CoreTraverse
+	memory: same_object
 	test: TestSuite
 
 
@@ -1010,6 +1011,117 @@ func test_preserves_only_explicit_std_abi_type_declarations() -> Bool:
 	user_prefixed and stdlib_preserved and spoof_prefixed
 
 
+-- A module that renames nothing a body mentions must hand the body back as the
+-- allocation it arrived as, so a pass that touches a handful of references
+-- stops reallocating every module it walks.
+pure func test_reuses_function_body_that_needs_no_rewriting() -> Bool:
+	body: CoreExpr = LetExpr(
+		core_var("value", None),
+		False,
+		int_type(),
+		int_literal(7),
+		VarExpr(
+			core_var("value", None),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+	)
+	flattened = prefix_module_names(
+		"reuse",
+		program([FunctionDecl(core_function("keep", 90, True, UserFunction, Some(body)))]),
+	)
+
+	match flattened.decls:
+		[FunctionDecl(function_info)]:
+			function_info.body
+				.map(func(rewritten): same_object(rewritten, body))
+				.get_or(False)
+		_:
+			False
+
+
+-- One renamed reference rebuilds the spine that reaches it and nothing else:
+-- the binding's right-hand side is still the allocation it came in as.
+pure func test_rebuilds_only_the_spine_to_a_rewritten_reference() -> Bool:
+	untouched_rhs: CoreExpr = int_literal(7)
+	body: CoreExpr = LetExpr(
+		core_var("value", None),
+		False,
+		int_type(),
+		untouched_rhs,
+		VarExpr(
+			core_var("helper", Some(91)),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+	)
+	flattened = prefix_module_names("reuse", program([
+			FunctionDecl(core_function("helper", 91, True, UserFunction, Some(int_literal(1)))),
+			FunctionDecl(core_function("keep", 90, True, UserFunction, Some(body))),
+		]))
+
+	match flattened.decls:
+		[FunctionDecl(_), FunctionDecl(function_info)]:
+			match function_info.body:
+				Some(LetExpr(_, _, _, rewritten_rhs, rewritten_body)):
+					renamed: Bool = match rewritten_body:
+						VarExpr(variable, _, _):
+							variable.name == "reuse__helper"
+						_:
+							False
+
+					renamed and same_object(rewritten_rhs, untouched_rhs)
+				_:
+					False
+		_:
+			False
+
+
+-- Two declarations of one type name: the rewrite table is keyed by source name
+-- now, so pin the tie-break the scan it replaced had, where the first
+-- declaration won and later ones were never reached.
+func test_first_declaration_of_a_repeated_type_name_wins() -> Bool:
+	flattened = prefix_module_names("dup", program([EnumDecl({
+				abi_type = None,
+				name = "Shape",
+				type_params = [],
+				variants = [],
+				loc = SyntheticSourceLoc,
+			}), ValueRecordDecl({
+				abi_type = Some(DeclaredAbiDirectoryEntry),
+				name = "Shape",
+				type_params = [],
+				fields = [],
+				loc = SyntheticSourceLoc,
+			}), FunctionDecl(
+				{ core_function(
+					"use",
+					95,
+					True,
+					UserFunction,
+					Some(
+						VarExpr(
+							core_var("value", None),
+							NamedType("Shape", []),
+							SyntheticSourceLoc,
+						),
+					),
+				) |
+					return_type = NamedType("Shape", [])
+				},
+			)]))
+
+	match flattened.decls:
+		[_, _, FunctionDecl(function_info)]:
+			match function_info.return_type:
+				NamedType(name, _):
+					name == "dup__Shape"
+				_:
+					False
+		_:
+			False
+
+
 func test_rewrites_module_local_type_references_with_declaration() -> Bool:
 	entry_kind_type: CoreType = directory_entry_kind_type()
 	param: CoreParam = {
@@ -1418,6 +1530,18 @@ tests: TestSuite = {
 		(
 			"rewrites module-local type references with declaration",
 			test_rewrites_module_local_type_references_with_declaration,
+		),
+		(
+			"first declaration of a repeated type name wins",
+			test_first_declaration_of_a_repeated_type_name_wins,
+		),
+		(
+			"reuses function body that needs no rewriting",
+			test_reuses_function_body_that_needs_no_rewriting,
+		),
+		(
+			"rebuilds only the spine to a rewritten reference",
+			test_rebuilds_only_the_spine_to_a_rewritten_reference,
 		),
 		(
 			"rewrites deep sequence types without recursive spine walk",

@@ -158,14 +158,10 @@ private record LexerState {
 	pending_newline: Bool,
 	at_line_start: Bool,
 	line_has_token: Bool,
-	last_token_kind: Option[TokenKind]
+	last_token_kind: Option[TokenKind],
+	emitted_token: Option[Token],
+	emitted_trivia: Option[Trivia]
 }
-
-
-private union LexerStep:
-	LexerStateStep(LexerState)
-	LexerTokenStep(LexerState, Token)
-	LexerTrailingTriviaStep(LexerState, Trivia)
 
 
 pure func lex_ok(result: LexResult) -> Bool:
@@ -184,7 +180,9 @@ private pure func initial_state(source: SourceFile) -> LexerState:
 		pending_newline = False,
 		at_line_start = True,
 		line_has_token = False,
-		last_token_kind = None
+		last_token_kind = None,
+		emitted_token = None,
+		emitted_trivia = None
 	}
 
 
@@ -324,16 +322,63 @@ private pure func kind_counts_as_line_token(kind: TokenKind) -> Bool:
 			True
 
 
-private pure func emit_token(state: LexerState, kind: TokenKind, span: SourceSpan) -> LexerStep:
+---
+The single record update a token emission performs. Callers that scanned the
+token by walking a `Cursor` hand back the cursor and the new group depth here
+instead of rebuilding `LexerState` once per scanning step.
+---
+private pure func emitted_token_state(
+	state: LexerState,
+	kind: TokenKind,
+	end_cursor: Cursor,
+	group_depth: Int,
+	emitted: Token,
+) -> LexerState:
+	{ state |
+		cursor = end_cursor,
+		group_depth = group_depth,
+		pending_trivia = [],
+		line_has_token = state.line_has_token or kind_counts_as_line_token(kind),
+		last_token_kind = Some(kind),
+		emitted_token = Some(emitted),
+		emitted_trivia = None
+	}
+
+
+---
+The exit for a step that produced trailing trivia rather than a token.
+---
+private pure func trailing_trivia_state(state: LexerState, trivia: Trivia) -> LexerState:
+	{ state |
+		emitted_token = None,
+		emitted_trivia = Some(trivia)
+	}
+
+
+---
+The exit for a step that produced neither a token nor trailing trivia. Every
+state handed back to the `lex` loop passes through one of these three, which
+is what keeps the two emission slots mutually exclusive and never stale.
+---
+private pure func stepped_state(state: LexerState) -> LexerState:
+	{ state |
+		emitted_token = None,
+		emitted_trivia = None
+	}
+
+
+private pure func emit_token_at(
+	state: LexerState,
+	kind: TokenKind,
+	span: SourceSpan,
+	end_cursor: Cursor,
+) -> LexerState:
 	emitted: Token = token_with_trivia(kind, span, state.pending_trivia, [])
-	LexerTokenStep(
-		{ state |
-			pending_trivia = [],
-			line_has_token = state.line_has_token or kind_counts_as_line_token(kind),
-			last_token_kind = Some(kind)
-		},
-		emitted,
-	)
+	emitted_token_state(state, kind, end_cursor, state.group_depth, emitted)
+
+
+private pure func emit_token(state: LexerState, kind: TokenKind, span: SourceSpan) -> LexerState:
+	emit_token_at(state, kind, span, state.cursor)
 
 
 private pure func emit_structural_token(
@@ -355,11 +400,15 @@ private pure func add_trailing_trivia(tokens: List[Token], trivia: Trivia) -> Li
 			tokens
 
 
-private pure func append_trivia(state: LexerState, trivia: Trivia) -> LexerStep:
+private pure func append_trivia(state: LexerState, trivia: Trivia) -> LexerState:
 	if state.line_has_token:
-		LexerTrailingTriviaStep(state, trivia)
+		trailing_trivia_state(state, trivia)
 	else:
-		LexerStateStep({ state | pending_trivia = state.pending_trivia.append(trivia) })
+		{ state |
+			pending_trivia = state.pending_trivia.append(trivia),
+			emitted_token = None,
+			emitted_trivia = None
+		}
 
 
 private pure func starts_with(state: LexerState, expected: String) -> Bool:
@@ -383,15 +432,19 @@ private pure func starts_with(state: LexerState, expected: String) -> Bool:
 		matches
 
 
-private pure func advance_n(state: LexerState, width: Int) -> LexerState:
-	var st: LexerState = state
+private pure func cursor_advanced(source: SourceFile, cursor: Cursor, width: Int) -> Cursor:
+	var moved: Cursor = cursor
 	var remaining: Int = width
 
 	while remaining > 0:
-		st = advance(st)
+		moved = source_advance(source, moved)
 		remaining -= 1
 
-	st
+	moved
+
+
+private pure func advance_n(state: LexerState, width: Int) -> LexerState:
+	{ state | cursor = cursor_advanced(state.source, state.cursor, width) }
 
 
 private pure func line_ends_after_optional_space(state: LexerState, offset: Int) -> Bool:
@@ -768,7 +821,7 @@ private pure func scan_spaces(state: LexerState) -> LexerState:
 		} }
 
 
-private pure func scan_line_comment(state: LexerState) -> LexerStep:
+private pure func scan_line_comment(state: LexerState) -> LexerState:
 	start_cursor: Cursor = state.cursor
 	after_marker: LexerState = advance(advance(state))
 	text: String = after_marker.source.text
@@ -798,7 +851,7 @@ private pure func scan_line_comment(state: LexerState) -> LexerStep:
 	append_trivia(st, trivia)
 
 
-private pure func scan_docstring(state: LexerState) -> LexerStep:
+private pure func scan_docstring(state: LexerState) -> LexerState:
 	start_cursor: Cursor = state.cursor
 	var st: LexerState = consume_line(state)
 	var text: String = string(128)
@@ -826,24 +879,23 @@ private pure func scan_docstring(state: LexerState) -> LexerStep:
 					st = next_state
 
 	if has_error:
-		LexerStateStep(st)
+		stepped_state(st)
 	else:
 		span: SourceSpan = span_from(st, start_cursor, st.cursor)
 		kind: TokenKind = DocStringToken(text)
 		emitted: Token = token_with_trivia(kind, span, st.pending_trivia, [])
-		LexerTokenStep(
-			{ st |
-				pending_trivia = [],
-				pending_newline = False,
-				at_line_start = True,
-				line_has_token = False,
-				last_token_kind = Some(kind)
-			},
-			emitted,
-		)
+		{ st |
+			pending_trivia = [],
+			pending_newline = False,
+			at_line_start = True,
+			line_has_token = False,
+			last_token_kind = Some(kind),
+			emitted_token = Some(emitted),
+			emitted_trivia = None
+		}
 
 
-private pure func scan_string_literal(state: LexerState) -> LexerStep:
+private pure func scan_string_literal(state: LexerState) -> LexerState:
 	start_cursor: Cursor = state.cursor
 	var st: LexerState = advance(state)
 	var segment_start: Cursor = st.cursor
@@ -918,7 +970,7 @@ private pure func scan_string_literal(state: LexerState) -> LexerStep:
 				break
 
 	if has_error:
-		LexerStateStep(st)
+		stepped_state(st)
 	else if is_interpolated:
 		scan_interpolated_string_tail(st, start_cursor, text)
 	else:
@@ -930,7 +982,7 @@ private pure func scan_string_literal(state: LexerState) -> LexerStep:
 		)
 
 
-private pure func scan_raw_string_literal(state: LexerState) -> LexerStep:
+private pure func scan_raw_string_literal(state: LexerState) -> LexerState:
 	start_cursor: Cursor = state.cursor
 	var st: LexerState = advance_n(state, 4)
 	body_start: Cursor = st.cursor
@@ -969,7 +1021,7 @@ private pure func scan_raw_string_literal(state: LexerState) -> LexerStep:
 			st = add_error(st, "Unterminated raw string literal: missing closing '\"'")
 
 	if has_error:
-		LexerStateStep(st)
+		stepped_state(st)
 	else:
 		span: SourceSpan = span_from(st, start_cursor, st.cursor)
 		emit_token(
@@ -983,7 +1035,7 @@ private pure func scan_interpolated_string_tail(
 	state: LexerState,
 	span_start: Cursor,
 	prefix: String,
-) -> LexerStep:
+) -> LexerState:
 	var st: LexerState = state
 	var text: String = prefix + "{"
 	var brace_depth: Int = 1
@@ -1067,7 +1119,7 @@ private pure func scan_interpolated_string_tail(
 				st = add_error(st, "Unterminated interpolated string: missing closing '\"'")
 
 	if has_error:
-		LexerStateStep(st)
+		stepped_state(st)
 	else:
 		span: SourceSpan = span_from(st, span_start, st.cursor)
 		emit_token(
@@ -1118,7 +1170,7 @@ private pure func scan_pipe_block(
 	span_start: Cursor,
 	margin_column: Int,
 	raw: Bool,
-) -> LexerStep:
+) -> LexerState:
 	var st: LexerState = state
 	var text: String = string(128)
 	var saw_interp: Bool = False
@@ -1167,7 +1219,7 @@ private pure func scan_pipe_block(
 				break
 
 	if has_error:
-		LexerStateStep(st)
+		stepped_state(st)
 	else:
 		span: SourceSpan = span_from(st, span_start, st.cursor)
 
@@ -1183,7 +1235,9 @@ private pure func scan_pipe_block(
 		var next_state: LexerState = { st |
 			pending_trivia = [],
 			line_has_token = True,
-			last_token_kind = Some(kind)
+			last_token_kind = Some(kind),
+			emitted_token = Some(emitted),
+			emitted_trivia = None
 		}
 
 		if ended_with_newline:
@@ -1193,10 +1247,10 @@ private pure func scan_pipe_block(
 				line_has_token = False
 			}
 
-		LexerTokenStep(next_state, emitted)
+		next_state
 
 
-private pure func scan_char_literal(state: LexerState) -> LexerStep:
+private pure func scan_char_literal(state: LexerState) -> LexerState:
 	start_cursor: Cursor = state.cursor
 	var st: LexerState = advance(state)
 	var codepoint: Int = 0
@@ -1262,7 +1316,7 @@ private pure func scan_char_literal(state: LexerState) -> LexerStep:
 				)
 
 	if has_error or not has_value:
-		LexerStateStep(consume_until_single_quote(st))
+		stepped_state(consume_until_single_quote(st))
 	else:
 		span: SourceSpan = span_from(st, start_cursor, st.cursor)
 		emit_token(st, CharLiteralToken(codepoint), span)
@@ -1391,7 +1445,7 @@ private pure func keyword_for(text: String) -> Option[Keyword]:
 			None
 
 
-private pure func scan_identifier(state: LexerState) -> LexerStep:
+private pure func scan_identifier(state: LexerState) -> LexerState:
 	start_cursor: Cursor = state.cursor
 	end_cursor: Cursor = identifier_end_cursor(state.source, start_cursor)
 	span: SourceSpan = span_from(state, start_cursor, end_cursor)
@@ -1399,9 +1453,9 @@ private pure func scan_identifier(state: LexerState) -> LexerStep:
 
 	match keyword_for(text):
 		Some(keyword):
-			emit_token({ state | cursor = end_cursor }, KeywordToken(keyword), span)
+			emit_token_at(state, KeywordToken(keyword), span, end_cursor)
 		None:
-			emit_token({ state | cursor = end_cursor }, IdentifierToken(text), span)
+			emit_token_at(state, IdentifierToken(text), span, end_cursor)
 
 
 private pure func first_significant_decimal_digit(text: String) -> Int:
@@ -1449,7 +1503,7 @@ private pure func decimal_literal_leq(left: String, right: String) -> Bool:
 
 -- Digits and the single fraction dot are never newlines or tabs, so the run is
 -- scanned by offset and the end cursor is computed once.
-private pure func scan_number(state: LexerState) -> LexerStep:
+private pure func scan_number(state: LexerState) -> LexerState:
 	start_cursor: Cursor = state.cursor
 	text: String = state.source.text
 	var offset: Int = start_cursor.offset
@@ -1480,19 +1534,19 @@ private pure func scan_number(state: LexerState) -> LexerStep:
 		line = start_cursor.line,
 		column = start_cursor.column + offset - start_cursor.offset
 	}
-	st: LexerState = { state | cursor = end_cursor }
-	span: SourceSpan = span_from(st, start_cursor, end_cursor)
-	text: String = source_span_text(st.source, span)
+	span: SourceSpan = span_from(state, start_cursor, end_cursor)
+	text: String = source_span_text(state.source, span)
 
 	if saw_dot:
-		emit_token(st, FloatLiteralToken(text), span)
+		emit_token_at(state, FloatLiteralToken(text), span, end_cursor)
 	else if decimal_literal_leq(text, INT128_MAX_DECIMAL):
-		emit_token(st, IntLiteralToken(text), span)
+		emit_token_at(state, IntLiteralToken(text), span, end_cursor)
 	else:
-		emit_token(
-			add_error_at_span(st, span, "Integer literal '" + text + "' exceeds Int128 range"),
+		emit_token_at(
+			add_error_at_span(state, span, "Integer literal '" + text + "' exceeds Int128 range"),
 			IntLiteralToken(text),
 			span,
+			end_cursor,
 		)
 
 
@@ -1523,15 +1577,18 @@ private pure func group_depth_after_symbol(depth: Int, symbol: Symbol) -> Int:
 			depth
 
 
-private pure func emit_symbol(state: LexerState, symbol: Symbol, width: Int) -> LexerStep:
+private pure func emit_symbol(state: LexerState, symbol: Symbol, width: Int) -> LexerState:
 	start_cursor: Cursor = state.cursor
-	st: LexerState = advance_n(state, width)
-
-	span: SourceSpan = span_from(st, start_cursor, st.cursor)
-	emit_token(
-		{ st | group_depth = group_depth_after_symbol(st.group_depth, symbol) },
-		SymbolToken(symbol),
-		span,
+	end_cursor: Cursor = cursor_advanced(state.source, start_cursor, width)
+	span: SourceSpan = span_from(state, start_cursor, end_cursor)
+	kind: TokenKind = SymbolToken(symbol)
+	emitted: Token = token_with_trivia(kind, span, state.pending_trivia, [])
+	emitted_token_state(
+		state,
+		kind,
+		end_cursor,
+		group_depth_after_symbol(state.group_depth, symbol),
+		emitted,
 	)
 
 
@@ -1539,7 +1596,7 @@ private pure func scan_unexpected_character(state: LexerState, c: Char) -> Lexer
 	advance(add_error(state, "unexpected character '" + c.to_string() + "'"))
 
 
-private pure func scan_symbol_or_error(state: LexerState) -> LexerStep:
+private pure func scan_symbol_or_error(state: LexerState) -> LexerState:
 	match peek(state):
 		Some('-'):
 			next = peek_next(state)
@@ -1579,14 +1636,14 @@ private pure func scan_symbol_or_error(state: LexerState) -> LexerStep:
 			if next == Some('='):
 				emit_symbol(state, NotEqualSymbol, 2)
 			else:
-				LexerStateStep(scan_unexpected_character(state, '!'))
+				stepped_state(scan_unexpected_character(state, '!'))
 		Some('?'):
 			next = peek_next(state)
 
 			if next == Some('='):
 				emit_symbol(state, QuestionEqualsSymbol, 2)
 			else:
-				LexerStateStep(scan_unexpected_character(state, '?'))
+				stepped_state(scan_unexpected_character(state, '?'))
 		Some('.'):
 			next = peek_next(state)
 
@@ -1644,11 +1701,11 @@ private pure func scan_symbol_or_error(state: LexerState) -> LexerStep:
 		Some('|'):
 			emit_symbol(state, PipeSymbol, 1)
 		Some(';'):
-			LexerStateStep(scan_unexpected_character(state, ';'))
+			stepped_state(scan_unexpected_character(state, ';'))
 		Some(c):
-			LexerStateStep(scan_unexpected_character(state, c))
+			stepped_state(scan_unexpected_character(state, c))
 		None:
-			LexerStateStep(state)
+			stepped_state(state)
 
 
 private pure func emit_pending_newline(
@@ -1858,13 +1915,13 @@ private pure func scan_newline(state: LexerState) -> LexerState:
 		}
 
 
-private pure func scan_one(state: LexerState) -> LexerStep:
+private pure func scan_one(state: LexerState) -> LexerState:
 	match peek(state):
 		Some('\n'):
-			LexerStateStep(scan_newline(state))
+			stepped_state(scan_newline(state))
 		Some(c):
 			if is_space(c):
-				LexerStateStep(scan_spaces(state))
+				stepped_state(scan_spaces(state))
 			else if c == '-' and starts_docstring_delimiter(state):
 				scan_docstring(state)
 			else if c == '-' and starts_with(state, "--"):
@@ -1897,7 +1954,7 @@ private pure func scan_one(state: LexerState) -> LexerStep:
 			else:
 				scan_symbol_or_error(state)
 		None:
-			LexerStateStep(state)
+			stepped_state(state)
 
 
 private pure func finalize_lexer(state: LexerState) -> (LexerState, List[Token]):
@@ -1919,15 +1976,17 @@ pure func lex(source: SourceFile) -> LexResult:
 
 		match peek(state):
 			Some(_):
-				match scan_one(state):
-					LexerStateStep(next_state):
-						state = next_state
-					LexerTokenStep(next_state, emitted):
-						state = next_state
+				state = scan_one(state)
+
+				match state.emitted_token:
+					Some(emitted):
 						tokens = tokens.append(emitted)
-					LexerTrailingTriviaStep(next_state, trivia):
-						state = next_state
-						tokens = add_trailing_trivia(tokens, trivia)
+					None:
+						match state.emitted_trivia:
+							Some(trivia):
+								tokens = add_trailing_trivia(tokens, trivia)
+							None:
+								void
 			None:
 				break
 
@@ -1936,10 +1995,10 @@ pure func lex(source: SourceFile) -> LexResult:
 	for final_token in final_tokens:
 		tokens = tokens.append(final_token)
 
-	match emit_token(final_state, EndOfFileToken, empty_span(final_state)):
-		LexerTokenStep(_, end_of_file):
+	match emit_token(final_state, EndOfFileToken, empty_span(final_state)).emitted_token:
+		Some(end_of_file):
 			tokens = tokens.append(end_of_file)
-		_:
+		None:
 			void
 
 	{

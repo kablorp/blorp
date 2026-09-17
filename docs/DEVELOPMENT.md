@@ -72,6 +72,26 @@ Run `make` after a coherent compiler source edit, then use
 file can pass with an older executable while the new compiler fails to build
 itself, so the local binary's recorded content identity must be fresh.
 
+### Compiler optimization level: edit loop vs. full gates
+
+`make` builds `bin/blorp` at `-O0` by default (`BLORP_CLI_C_OPTIMIZATION`),
+which keeps the everyday edit loop's link step fast. Full gate runs build at
+`-O2` instead, since the installed compiler itself runs measurably faster
+(compiler-blorp test artifact compile time is roughly halved) and that time
+dominates gates like `scripts/test compiler-blorp`. Pass
+`BLORP_CLI_C_OPTIMIZATION=-O2` to `make` directly, or use
+`scripts/test --release-compiler`; `scripts/premerge-gate` and
+`scripts/docker-gate` already build at `-O2` by default (use
+`scripts/premerge-gate --no-release-compiler` to opt back to `-O0`).
+
+Caveat: the generated C build-input hash includes this value, so alternating
+between `-O0` and `-O2` across runs forces a full re-link of the generated C
+(minutes, not seconds) each time you switch. Don't interleave `-O0` edit-loop
+runs with `-O2` gate runs in the same working tree without expecting that
+cost; `scripts/compiler-build-status` reports `STALE` when the installed
+binary was built at a different optimization level than the one currently in
+the environment.
+
 ## Daily Development Loop
 
 Use the one-boundary loop from [`AGENTS.md`](../AGENTS.md): establish a failing
@@ -429,8 +449,19 @@ Use `scripts/test --timings` when compilation of test artifacts is the concern:
 scripts/test --timings --log-dir logs runtime
 ```
 
-The timing record separates frontend, typecheck, Core, host-C, and execution
-time for generated test artifacts.
+`--timings` exports `BLORP_TEST_TIMINGS=1` for gates that run `bin/blorp
+test` (it is deliberately kept out of the `cli` gate's environment so its
+disabled-by-default output checks stay meaningful). Under that variable,
+`blorp test` writes one `BLORP_TEST_TIMING phase=<name> group=<kind>
+suites=<n> sources=<n> duration_ms=<n>` line per phase to stderr for every
+generated test artifact (a suite batch, a doctest batch, or a program).
+`group` is the artifact kind (`suite`, `doctest`, or `program`); `suites` and
+`sources` are that artifact's counts. The phases are `frontend_graph`
+(building this artifact's retained module graph and harness), `pipeline`
+(compiling Blorp sources to C), `host_c` (native compilation), and
+`execution` (running the compiled artifact). `scripts/test` sums these across
+every artifact and gate and prints a "Generated TestSuite phase totals:"
+block after the run.
 
 ## Function Profiling And Flame Graphs
 

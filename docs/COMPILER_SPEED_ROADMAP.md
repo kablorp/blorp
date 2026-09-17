@@ -270,7 +270,7 @@ Add a test that converts a closure-free function and asserts body identity.
 
 **Acceptance.** As C1, measured on the two closure passes.
 
-### C3. Resource, fairness, and tuple SROA reuse
+### C3. Resource, fairness, and tuple SROA reuse (landed in `4741dce9`; the slot was redirected to C5, the early-Core rebuilders: flatten, std_inline, ssa)
 
 **Context.** `resource_management.brp` `rewrite_resource_expr_with_cleanups`
 (89 arms), `fairness.brp` `insert_cooperative_checkpoints_expr` (89 arms, 10
@@ -546,7 +546,7 @@ allocations down at least 40% and instructions down at least 20%.
 
 ## Track R: Value-Semantics Costs In The Compiler's Own Code
 
-### R1. Record update keeps the old record alive
+### R1. Record update keeps the old record alive (probe landed 2026-09-16; see benchmarks/results/record_update_liveness_probe_2026-09-16.md; follow-up R2 in flight)
 
 **Context.** Issue 149 found that `{ state | field = ... }` inside a loop
 keeps the previous `state` alive until block end, so collections held by the
