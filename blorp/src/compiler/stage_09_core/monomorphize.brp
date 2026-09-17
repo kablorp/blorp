@@ -5,36 +5,63 @@
 -- expose another generic function call. Generic data runs only after both
 -- callable worklists settle.
 import:
-	ir: CoreProgram
+	ir: CoreImplDecl, CoreProgram
 	mono_data: CoreMonoDataSpecialization, specialize_generic_data
-	mono_impl: specialize_generic_impls
+	mono_impl: generic_impls, specialize_generic_impls_with_templates
 	mono_specialize:
+		CoreGenericFunctionIndex,
 		CoreMonoDiagnostic,
+		CoreMonoFunctionSpecializationStep,
 		CoreMonoProgramSpecialization,
-		specialize_selected_generic_calls,
+		collect_generic_functions,
+		specialize_selected_generic_calls_from,
 		validate_selected_generic_calls,
 
 
+-- The generic function index and the generic impl template list are facts
+-- about the input program: specialization only ever appends decls whose
+-- `type_params` is empty, so neither fact changes as the outer fixpoint
+-- grows the program. Both are built once here, from `program`, and reused
+-- on every iteration instead of being rescanned from the ever-growing
+-- program each time.
+--
+-- `rewritten_decl_count` is the other half of that: it tracks how many
+-- leading decls of the growing program have already had their generic
+-- calls scanned for requests and rewritten to concrete calls. A decl's own
+-- body never changes once appended, and the generic function index is
+-- fixed for the whole fixpoint, so re-running that scan and rewrite over
+-- decls seen on an earlier iteration can only ever reproduce what already
+-- happened. Threading the cursor through `specialize_selected_generic_calls_from`
+-- keeps that pass down to the decls actually added since the last
+-- iteration instead of the whole program.
 private pure func specialize_generic_callables(
 	program: CoreProgram,
 	next_def_id: Int,
 ) -> CoreMonoProgramSpecialization:
+	generic_functions: CoreGenericFunctionIndex = collect_generic_functions(program)
+	generic_impl_templates: List[CoreImplDecl] = generic_impls(program)
+
 	var current_program: CoreProgram = program
 	var current_def_id: Int = next_def_id
+	var rewritten_decl_count: Int = 0
 
 	while True:
 		start_decl_count: Int = current_program.decls.length()
 		start_def_id: Int = current_def_id
-		functions: CoreMonoProgramSpecialization = specialize_selected_generic_calls(
+		functions: CoreMonoFunctionSpecializationStep = specialize_selected_generic_calls_from(
 			current_program,
 			current_def_id,
+			generic_functions,
+			rewritten_decl_count,
 		)
-		impls: CoreMonoProgramSpecialization = specialize_generic_impls(
+		impls: CoreMonoProgramSpecialization = specialize_generic_impls_with_templates(
 			functions.program,
 			functions.next_def_id,
+			generic_impl_templates,
 		)
 		current_program = impls.program
 		current_def_id = impls.next_def_id
+		rewritten_decl_count = functions.rewritten_decl_count
 
 		if current_program.decls.length() == start_decl_count and current_def_id == start_def_id:
 			break

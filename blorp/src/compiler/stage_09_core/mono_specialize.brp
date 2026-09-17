@@ -60,6 +60,18 @@ record CoreMonoProgramSpecialization {
 }
 
 
+-- Result of `specialize_selected_generic_calls_from`: like
+-- `CoreMonoProgramSpecialization`, but also reports how many leading decls
+-- of `program.decls` have now had their calls scanned and rewritten, so the
+-- outer callable fixpoint can pass that boundary back in on the next call
+-- instead of rescanning decls that cannot yield anything new.
+record CoreMonoFunctionSpecializationStep {
+	program: CoreProgram,
+	next_def_id: Int,
+	rewritten_decl_count: Int
+}
+
+
 union CoreMonoDiagnostic:
 	CoreMonoConflictingTypeArguments(String, CoreSourceLoc)
 	CoreMonoCannotInferTypeArgument(String, CoreSourceLoc)
@@ -108,7 +120,14 @@ private record CoreMonoFunctionRequest {
 -- `module_member_prefixes` carries the `core_module_member_prefix` of every
 -- source module an indexed function came from, computed once per module so
 -- callee identity checks spell module members without re-sanitizing.
-private record CoreGenericFunctionIndex {
+--
+-- Exported (not `private`) so `monomorphize.brp` can build this index once
+-- from the input program and hold it across the outer callable fixpoint:
+-- generic function declarations are never removed, reordered, or turned
+-- into new generic templates by specialization (every specialized copy
+-- carries `type_params = []`), so the index computed from the original
+-- program is identical to one recomputed after any amount of specialization.
+record CoreGenericFunctionIndex {
 	functions: List[CoreFunction],
 	function_index_by_id: Dict[Int, Int],
 	function_collision_indices_by_id: Dict[Int, List[Int]],
@@ -443,7 +462,7 @@ private pure func index_generic_function(
 			}
 
 
-private pure func collect_generic_functions(program: CoreProgram) -> CoreGenericFunctionIndex:
+pure func collect_generic_functions(program: CoreProgram) -> CoreGenericFunctionIndex:
 	var generic_functions: CoreGenericFunctionIndex = {
 		functions = [],
 		function_index_by_id = {},
@@ -929,11 +948,11 @@ private pure func collect_function_requests(
 
 private pure func collect_program_requests(
 	generic_functions: CoreGenericFunctionIndex,
-	program: CoreProgram,
+	decls: List[CoreDecl],
 ) -> List[CoreMonoFunctionRequest]:
 	var requests: List[CoreMonoFunctionRequest] = []
 
-	for decl in program.decls:
+	for decl in decls:
 		match decl:
 			FunctionDecl(function):
 				requests = collect_function_requests(generic_functions, requests, function)
@@ -1466,33 +1485,79 @@ private pure func rewrite_decl_calls(
 			decl
 
 
-private pure func rewrite_program_calls(
+private pure func rewrite_decl_list_calls(
 	generic_functions: CoreGenericFunctionIndex,
-	program: CoreProgram,
-) -> CoreProgram:
-	var decls: List[CoreDecl] = []
+	decls: List[CoreDecl],
+) -> List[CoreDecl]:
+	var rewritten: List[CoreDecl] = []
 
-	for decl in program.decls:
-		decls = decls.append(rewrite_decl_calls(generic_functions, decl))
+	for decl in decls:
+		rewritten = rewritten.append(rewrite_decl_calls(generic_functions, decl))
 
-	{ program | decls = decls }
+	rewritten
 
 
 pure func specialize_selected_generic_calls(
 	program: CoreProgram,
 	next_def_id: Int,
 ) -> CoreMonoProgramSpecialization:
-	generic_functions: CoreGenericFunctionIndex = collect_generic_functions(program)
+	specialize_selected_generic_calls_with_index(
+		program,
+		next_def_id,
+		collect_generic_functions(program),
+	)
 
+
+-- Same as `specialize_selected_generic_calls`, but takes an already-built
+-- generic function index instead of recomputing it from `program`. The
+-- caller (the outer callable fixpoint in `monomorphize.brp`) builds the
+-- index once from the original program and reuses it across iterations,
+-- since generic templates are stable under specialization.
+pure func specialize_selected_generic_calls_with_index(
+	program: CoreProgram,
+	next_def_id: Int,
+	generic_functions: CoreGenericFunctionIndex,
+) -> CoreMonoProgramSpecialization:
+	step: CoreMonoFunctionSpecializationStep = specialize_selected_generic_calls_from(
+		program,
+		next_def_id,
+		generic_functions,
+		0,
+	)
+
+	{
+		program = step.program,
+		next_def_id = step.next_def_id
+	}
+
+
+-- Same as `specialize_selected_generic_calls_with_index`, but only scans and
+-- rewrites the decls at index `rewritten_decl_count` and beyond: decls
+-- before that index were already scanned for requests and had their calls
+-- rewritten by an earlier call (in the outer callable fixpoint in
+-- `monomorphize.brp`), and neither result can change on a later call, since
+-- a decl's own body never changes once appended and `generic_functions` is
+-- fixed for the whole fixpoint. This is what keeps the fixpoint from
+-- rescanning and rebuilding the whole (ever-growing) program every
+-- iteration. Returns the new decl count that has been rewritten, i.e. the
+-- boundary to pass as `rewritten_decl_count` on the next call.
+pure func specialize_selected_generic_calls_from(
+	program: CoreProgram,
+	next_def_id: Int,
+	generic_functions: CoreGenericFunctionIndex,
+	rewritten_decl_count: Int,
+) -> CoreMonoFunctionSpecializationStep:
 	if generic_functions.functions.is_empty():
 		{
 			program = program,
-			next_def_id = next_def_id
+			next_def_id = next_def_id,
+			rewritten_decl_count = program.decls.length()
 		}
 	else:
+		unprocessed_decls: List[CoreDecl] = program.decls.drop(rewritten_decl_count)
 		var requests: List[CoreMonoFunctionRequest] = collect_program_requests(
 			generic_functions,
-			program,
+			unprocessed_decls,
 		)
 		var specialized_decls: List[CoreDecl] = []
 		var request_index: Int = 0
@@ -1526,9 +1591,17 @@ pure func specialize_selected_generic_calls(
 
 			request_index += 1
 
-		combined: CoreProgram = { program | decls = program.decls.concat(specialized_decls) }
+		combined_decls: List[CoreDecl] = program.decls.concat(specialized_decls)
+		rewritten_tail: List[CoreDecl] = rewrite_decl_list_calls(
+			generic_functions,
+			combined_decls.drop(rewritten_decl_count),
+		)
+		final_decls: List[CoreDecl] = combined_decls
+			.take(rewritten_decl_count)
+			.concat(rewritten_tail)
 
 		{
-			program = rewrite_program_calls(generic_functions, combined),
-			next_def_id = current_def_id
+			program = { program | decls = final_decls },
+			next_def_id = current_def_id,
+			rewritten_decl_count = final_decls.length()
 		}
