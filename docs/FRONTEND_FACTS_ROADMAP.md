@@ -384,6 +384,44 @@ invalidated, and what T4's `ModuleFacts` needs to look like so that a
 cached header product can be loaded in place of recomputation. Written
 after T4 lands, by whoever did T4.
 
+## Facts inventory and propagation map (audit of 2026-09-17)
+
+A read-only audit of every `Dict[String, ...]` and hot name comparison from
+stage_06 through stage_10 (373 sites; one 60 s sample of 29,727 frames on
+the frozen input) collapsed the candidates into the facts below. Sample
+shares: `blorp_string_eq` 2.5%, `blorp_dict_hash_string` 2.1%,
+`blorp_dict_copy` 1.9%, `memcmp` 0.9%, `blorp_dict_get_nullable` 0.8%,
+`blorp_string_concat` 0.3%: about 8.5% of the compile is string and
+dictionary work in total, which bounds what propagation can remove.
+
+| fact to publish | published by | shape | retires | vetted realistic gain | effort |
+| --- | --- | --- | --- | ---: | ---: |
+| F7 DCE keyed by the `def_id` already on `CoreVar` | none needed | consumer fix in `dce.brp:238-358, 330, 407, 451` | the `Dict[String, Dict[Int, Dict[Int, Bool]]]` read and invalidation indexes | 0.5 to 1% | 1 day |
+| F2 definition and callable table (T5) | typecheck, threaded onto Core | `DefinitionId -> {name id, module id, kind, type, span, arity, purity}` plus use-site resolution | `dce.brp:1358-1489` five name indexes; `resolve.brp:219-499` nine tables; Perceus `build_env` callable index; `closure.brp` `functions_by_name`; the name half of `flatten.brp:762` `find_callable_rewrite` | 1.5 to 2% | 3 to 4 days |
+| F3 sanitized C identifier table | backend, once per definition | `DefinitionId -> C identifier` (make, destroy, reuse, enum helper, local spellings) | every concat-on-call helper in `c_naming.brp:80-130` (64 call sites), `c_symbol_projection.brp:130-272` `by_original_c_spelling`; backend concatenation is 7.8% of the backend's 19.7% | 1 to 1.5% | 2 to 3 days |
+| F1 interned source names (T3) | lexer | `SourceNameId -> String`, append-only | `Scope.symbols_by_name`; the four `accepted_*_authority.brp` name tables (about 53 sites); `declaration_skeleton.brp` `latest_skeleton_index_by_name`; `type_header_dependencies.brp` vertex index | 1.5 to 2.5% | 4 to 5 days |
+| F6 module prefix by `ModuleId` (T6) | core lowering (already built once) | `ModuleId -> C prefix` | `module_member_prefixes` threaded through 19 signatures in `lower.brp` plus copies in `resolve.brp`, `mono_specialize.brp`, `mono_option.brp`, `parallel_tensor_pipeline.brp` | 0.5 to 1% | 1 to 2 days |
+| F5 type name and layout table (T6) | core lowering, once | `TypeId -> {alias target, declared type, list layout}` | `CoreLayoutTypeIndex` (built twice); `mono_data.brp` `templates` and `transparent_aliases` (threaded through ~20 signatures); `record_update.brp` `record_decls` (~25 signatures); `emit_record_layout.brp` three tables; `flatten.brp` `type_rewrite_index` | 0.5 to 1% | 3 days |
+| F4 type-home table by definition id (T4, in flight) | typecheck header install | `DefinitionId -> TypeHomeEntry` | `TypeHomeIndex`, the per-importer reinstall | 3 to 5% | in progress |
+| F8 cacheable per-module header product (T8, design) | typecheck | per-`ModuleId` completed headers keyed by content hash | the whole-program `global_header_completion` rebuild for the editor case | 0% cold, per-edit latency otherwise | design 1 day |
+
+Vetted total for F1 to F7: 5 to 7% of the compile, plus F4's 3 to 5%,
+about 1.5 to 2 s of the 17 s stage-2 self-compile. The architectural gain is
+larger than the instruction gain: F1, F2, F4, and F8 are the tables a
+language server queries and invalidates, and F2 and F5 delete four callable
+index rebuilds and two 20-signature threaded dictionaries.
+
+Not worth a task: `FIXED_BUILTIN_GROUP_BY_NAME`, `INTRINSICS_DICT` (small
+static tables); `stage_07_ctfe/context.brp:688` (new information at CTFE);
+`emit.brp` dump-path membership sets (behind CLI flags);
+`module_binding.brp` path tables (tooling fallback only after T1);
+`type_header_dependencies.brp` (tens of entries per module); trait and
+match-lowering name tables (small, fold into F2/F5); Perceus name tables
+(2.6% of its own subtree is string equality; its lever is ownership).
+
+Order by gain over effort: F7, F2, F3, F1 (after T4 leaves the typecheck
+files), then F6 and F5 together.
+
 ## Results
 
 | task | outcome | commit | phase row | notes |
