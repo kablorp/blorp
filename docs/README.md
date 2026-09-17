@@ -42,6 +42,9 @@ module inventory lives in
   outcomes map.
 - [Compiler Speed Roadmap](COMPILER_SPEED_ROADMAP.md) is the task-level
   plan for the next rounds of compiler speed work.
+- [Per-Node Codegen Roadmap](PER_NODE_CODEGEN_ROADMAP.md) is the task-level
+  plan for cutting the per-node cost of generated C (reference counting,
+  cleanup frames, runtime calls), with the stage-2 measurement rule.
 - [Self-Compile Measurement Protocol](../benchmarks/README.md#self-compile-measurement-protocol)
   is the standard compiler-performance measurement and its retained baselines.
 

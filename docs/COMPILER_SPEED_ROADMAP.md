@@ -640,6 +640,15 @@ task. No compiler change in this task.
 
 ## Round Three: Instructions Per Node
 
+The G tasks below (per-node codegen) are specified in detail, with the
+stage-2 measurement rule and the Perceus attribution that sizes them, in
+[`PER_NODE_CODEGEN_ROADMAP.md`](PER_NODE_CODEGEN_ROADMAP.md). The S tasks
+for the lexer literal forms, closure conversion, monomorphization, and the
+Perceus walks landed on 2026-09-17 (main `fbd2cde37`): mono -2.3% and
+Perceus -2.4% instructions at -O2, the other two neutral; the Perceus
+sampling profile showed allocation is under a tenth of that pass's cost, so
+further state-threading conversions are not a lever.
+
 Round two's structural cuts each bought one or two percent because the
 remaining cost is per node, not per algorithm: late Core spends on the
 order of 5,000 instructions per node per pass, where a hand-written C
