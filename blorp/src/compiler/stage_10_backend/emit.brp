@@ -456,13 +456,10 @@ import:
 		BUILTIN_STACK_OPTION_INT128_OPTION_C_TYPE,
 		BUILTIN_STACK_OPTION_RANGE_OPTION_C_TYPE,
 		BUILTIN_STACK_OPTION_UINT128_OPTION_C_TYPE,
+		BackendTypeNaming,
+		backend_type_naming,
 		c_identifier,
 		c_local_name,
-		enum_to_string_name,
-		enum_vector_to_string_name,
-		record_destroy_name,
-		record_make_name,
-		record_reuse_name,
 		static_child_path,
 		static_closure_name,
 		static_list_child_path,
@@ -472,10 +469,6 @@ import:
 		static_tuple_storage_name,
 		static_union_child_path,
 		static_union_storage_name,
-		union_destroy_fields_name,
-		union_destroy_name,
-		union_destroy_release_child_name,
-		union_destroy_stack_push_name,
 		union_init_name,
 		union_instance_name,
 		union_reuse_name,
@@ -483,6 +476,7 @@ import:
 		CEmissionSymbolPlan,
 		CSymbolProjectionError,
 		c_emission_canonical_empty_lists,
+		c_emission_type_naming,
 		canonical_empty_lists_for_unprojected_program,
 		emitted_callable_name,
 		emitted_callback_name,
@@ -1001,6 +995,22 @@ private pure func selected_callable_name(
 			emitted_callable_name(plan, qualified_name, def_id)
 		UnprojectedCEmissionSymbolsForTests:
 			qualified_name
+
+
+---
+A declared type's C spellings, read from the once-built plan when one is
+available; test callers with no plan derive it directly (the same
+computation `program_symbol_inventory` ran during planning).
+---
+private pure func selected_type_naming(
+	authority: CEmissionSymbolAuthority,
+	type_name: String,
+) -> BackendTypeNaming:
+	match authority:
+		ValidatedCEmissionSymbols(plan):
+			c_emission_type_naming(plan, type_name)
+		UnprojectedCEmissionSymbolsForTests:
+			backend_type_naming(type_name)
 
 
 private pure func selected_callable_c_spelling(
@@ -10435,7 +10445,10 @@ private pure func emit_record_reuse_body(
 										"record_reuse_result",
 										typ,
 										args_body.statements,
-										record_reuse_name(type_name) + "(" + [source_c]
+										selected_type_naming(
+											emission_context.symbol_authority,
+											type_name,
+										).reuse_name + "(" + [source_c]
 											.concat(args_body.args)
 											.join(", ") + ")",
 										args_body.next_temp,
@@ -10587,9 +10600,10 @@ private pure func emit_record_cow_update_body(
 				statements += emission_context.indent + "  " + result_slot + " = " + source_slot + ";\n"
 				statements += emission_context.indent + "} else {\n"
 				statements += shared_body
-				statements += emission_context.indent + "  " + result_slot + " = " + record_make_name(
+				statements += emission_context.indent + "  " + result_slot + " = " + selected_type_naming(
+					emission_context.symbol_authority,
 					type_name,
-				) + "(" + constructor_args.join(", ") + ");\n"
+				).make_name + "(" + constructor_args.join(", ") + ");\n"
 				statements += emission_context.indent + "  " + "blorp_release(" + source_slot + ");\n"
 				statements += emission_context.indent + "}\n"
 
@@ -22489,9 +22503,11 @@ private pure func emit_enum_to_string_case(variant: CoreEnumVariant) -> String:
 	) + ");\n"
 
 
-private pure func emit_enum_to_string_function(enum_decl: CoreEnumDecl) -> String:
-	function_name: String = enum_to_string_name(enum_decl.name)
-	var c_code: String = "static blorp_String* " + function_name + "(long v) {\n"
+private pure func emit_enum_to_string_function(
+	enum_decl: CoreEnumDecl,
+	naming: BackendTypeNaming,
+) -> String:
+	var c_code: String = "static blorp_String* " + naming.enum_to_string_name + "(long v) {\n"
 	c_code += "    switch (v) {\n"
 
 	for variant in enum_decl.variants:
@@ -22503,20 +22519,25 @@ private pure func emit_enum_to_string_function(enum_decl: CoreEnumDecl) -> Strin
 	c_code
 
 
-private pure func emit_enum_vector_to_string_function(enum_decl: CoreEnumDecl) -> String:
-	function_name: String = enum_vector_to_string_name(enum_decl.name)
-	element_to_string_name: String = enum_to_string_name(enum_decl.name)
-	"blorp_String* " + function_name + "(blorp_Vector* v) {\n" + "    return blorp_vector_to_string_packed_enum(v, " + element_to_string_name + ");\n" + "}\n"
+private pure func emit_enum_vector_to_string_function(
+	enum_decl: CoreEnumDecl,
+	naming: BackendTypeNaming,
+) -> String:
+	"blorp_String* " + naming.enum_vector_to_string_name + "(blorp_Vector* v) {\n" + "    return blorp_vector_to_string_packed_enum(v, " + naming.enum_to_string_name + ");\n" + "}\n"
 
 
-private pure func emit_enum_decl(enum_decl: CoreEnumDecl) -> String:
+private pure func emit_enum_decl(
+	enum_decl: CoreEnumDecl,
+	authority: CEmissionSymbolAuthority,
+) -> String:
 	var c_code: String = ""
+	naming: BackendTypeNaming = selected_type_naming(authority, enum_decl.name)
 
 	for variant in enum_decl.variants:
 		c_code += "#define " + variant.c_name + " " + variant.tag.to_string() + "L\n"
 
-	c_code += emit_enum_to_string_function(enum_decl)
-	c_code += emit_enum_vector_to_string_function(enum_decl)
+	c_code += emit_enum_to_string_function(enum_decl, naming)
+	c_code += emit_enum_vector_to_string_function(enum_decl, naming)
 	c_code += "\n"
 
 	c_code
@@ -24354,6 +24375,7 @@ private pure func value_record_field_at_is_boolean(
 private pure func emit_value_record_decl(
 	record_decl: CoreValueRecordDecl,
 	layout: CRecordLayout,
+	authority: CEmissionSymbolAuthority,
 ) -> String:
 	var source_order_fields_c: String = ""
 	var internal_non_boolean_fields_c: String = ""
@@ -24413,9 +24435,10 @@ private pure func emit_value_record_decl(
 	else:
 		"typedef struct { " + fields_c + "} " + record_c_type + ";\n"
 
-	type_decl + "static inline " + record_c_type + " " + record_make_name(
+	type_decl + "static inline " + record_c_type + " " + selected_type_naming(
+		authority,
 		record_decl.name,
-	) + "(" + param_c + ") { " + record_c_type + " __r = { " + init_fields.join(
+	).make_name + "(" + param_c + ") { " + record_c_type + " __r = { " + init_fields.join(
 		", ",
 	) + " }; return __r; }\n\n"
 
@@ -24491,21 +24514,25 @@ private pure func heap_record_has_destructor(record_decl: CoreHeapRecordDecl) ->
 	has_destructor
 
 
-private pure func emit_heap_record_destructor(record_decl: CoreHeapRecordDecl) -> String:
+private pure func emit_heap_record_destructor(
+	record_decl: CoreHeapRecordDecl,
+	naming: BackendTypeNaming,
+) -> String:
 	if heap_record_has_destructor(record_decl):
 		var releases: String = ""
 
 		for field in record_decl.fields:
 			releases += heap_record_field_release_statement(field)
 
-		"static void " + record_destroy_name(
-			record_decl.name,
-		) + "(void* obj) {\n" + "  " + record_decl.name + "* __rec = (" + record_decl.name + "*)obj;\n" + releases + "}\n\n"
+		"static void " + naming.destroy_name + "(void* obj) {\n" + "  " + record_decl.name + "* __rec = (" + record_decl.name + "*)obj;\n" + releases + "}\n\n"
 	else:
 		""
 
 
-private pure func emit_heap_record_reuse(record_decl: CoreHeapRecordDecl) -> String:
+private pure func emit_heap_record_reuse(
+	record_decl: CoreHeapRecordDecl,
+	naming: BackendTypeNaming,
+) -> String:
 	record_c_type: String = TypeLayout.c_type_name(HeapRecordType(record_decl.name))
 	var params: List[String] = [record_c_type + " __old"]
 	var field_names: List[String] = []
@@ -24518,17 +24545,13 @@ private pure func emit_heap_record_reuse(record_decl: CoreHeapRecordDecl) -> Str
 		assignments += "    __old->" + field_name + " = " + field_name + ";\n"
 
 	destroy_old_fields: String = if heap_record_has_destructor(record_decl):
-		"    " + record_destroy_name(record_decl.name) + "(__old);\n"
+		"    " + naming.destroy_name + "(__old);\n"
 	else:
 		""
 
-	"static inline " + record_c_type + " " + record_reuse_name(
-		record_decl.name,
-	) + "(" + params.join(
+	"static inline " + record_c_type + " " + naming.reuse_name + "(" + params.join(
 		", ",
-	) + ") {\n" + "  if (__old && blorp_is_unique(__old)) {\n" + destroy_old_fields + assignments + "    return __old;\n" + "  }\n" + "  " + record_c_type + " __fresh = " + record_make_name(
-		record_decl.name,
-	) + "(" + call_args_text(
+	) + ") {\n" + "  if (__old && blorp_is_unique(__old)) {\n" + destroy_old_fields + assignments + "    return __old;\n" + "  }\n" + "  " + record_c_type + " __fresh = " + naming.make_name + "(" + call_args_text(
 		field_names,
 		False,
 		0,
@@ -24539,6 +24562,7 @@ private pure func emit_heap_record_decl(
 	record_decl: CoreHeapRecordDecl,
 	layouts: CRecordLayoutRegistry,
 	layout: CRecordLayout,
+	authority: CEmissionSymbolAuthority,
 ) -> String:
 	var source_order_fields_c: String = ""
 	var internal_non_boolean_fields_c: String = ""
@@ -24546,6 +24570,7 @@ private pure func emit_heap_record_decl(
 	var params: List[String] = []
 	var assignments: String = ""
 	record_c_type: String = TypeLayout.c_type_name(HeapRecordType(record_decl.name))
+	naming: BackendTypeNaming = selected_type_naming(authority, record_decl.name)
 
 	reorder_internal_boolean_fields: Bool = match layout:
 		InternalLayout:
@@ -24593,16 +24618,15 @@ private pure func emit_heap_record_decl(
 		params.join(", ")
 
 	destructor_init: String = if heap_record_has_destructor(record_decl):
-		"  BLORP_SET_DESTRUCTOR(__rec, " + record_destroy_name(record_decl.name) + ");\n"
+		"  BLORP_SET_DESTRUCTOR(__rec, " + naming.destroy_name + ");\n"
 	else:
 		""
 
 	record_decl_c: String = "typedef struct " + record_decl.name + " {\n" + "  blorp_Object header;\n" + fields_c + "} " + record_decl.name + ";\n\n" + emit_heap_record_destructor(
 		record_decl,
-	) + record_c_type + " " + record_make_name(
-		record_decl.name,
-	) + "(" + param_c + ") {\n" + "  " + record_decl.name + "* __rec = (" + record_decl.name + "*)blorp_alloc(sizeof(" + record_decl.name + "));\n" + "  BLORP_TAG(__rec, \"" + record_decl.name + "\");\n" + destructor_init + assignments + "  return (" + record_c_type + ")__rec;\n}\n\n"
-	record_decl_c + emit_heap_record_reuse(record_decl)
+		naming,
+	) + record_c_type + " " + naming.make_name + "(" + param_c + ") {\n" + "  " + record_decl.name + "* __rec = (" + record_decl.name + "*)blorp_alloc(sizeof(" + record_decl.name + "));\n" + "  BLORP_TAG(__rec, \"" + record_decl.name + "\");\n" + destructor_init + assignments + "  return (" + record_c_type + ")__rec;\n}\n\n"
+	record_decl_c + emit_heap_record_reuse(record_decl, naming)
 
 
 private pure func release_policy_requires_release(policy: CoreReleasePolicy) -> Bool:
@@ -24777,10 +24801,9 @@ private pure func iterative_union_field_release_statement(
 	union_decl: CoreUnionDecl,
 	index: Int,
 	field_c: String,
+	naming: BackendTypeNaming,
 ) -> String:
-	release_call: String = union_destroy_release_child_name(
-		union_decl.name,
-	) + "(__destroy_stack, __destroy_count, __destroy_capacity, (" + union_decl.name + "*)" + field_c + ");\n"
+	release_call: String = naming.union_destroy_release_child_name + "(__destroy_stack, __destroy_count, __destroy_capacity, (" + union_decl.name + "*)" + field_c + ");\n"
 
 	match union_decl.payload_storage:
 		TypedUnionPayloadStorage:
@@ -24795,6 +24818,7 @@ private pure func union_field_release_statement(
 	variant: CoreUnionVariant,
 	field: CoreUnionField,
 	index: Int,
+	naming: BackendTypeNaming,
 ) -> String:
 	if not release_policy_requires_release(field.release_policy):
 		""
@@ -24802,7 +24826,7 @@ private pure func union_field_release_statement(
 		field_c: String = "self->data." + variant.name + ".field" + index.to_string()
 
 		if union_field_uses_iterative_release(union_decl, field):
-			iterative_union_field_release_statement(union_decl, index, field_c)
+			iterative_union_field_release_statement(union_decl, index, field_c, naming)
 		else:
 			match union_decl.payload_storage:
 				TypedUnionPayloadStorage:
@@ -24811,7 +24835,10 @@ private pure func union_field_release_statement(
 					erased_union_field_release_statement(index, field_c)
 
 
-private pure func emit_union_destructor_cases(union_decl: CoreUnionDecl) -> String:
+private pure func emit_union_destructor_cases(
+	union_decl: CoreUnionDecl,
+	naming: BackendTypeNaming,
+) -> String:
 	var cases_c: String = ""
 
 	for variant in union_decl.variants:
@@ -24820,7 +24847,13 @@ private pure func emit_union_destructor_cases(union_decl: CoreUnionDecl) -> Stri
 			var index: Int = 0
 
 			for field in variant.fields:
-				releases_c += union_field_release_statement(union_decl, variant, field, index)
+				releases_c += union_field_release_statement(
+					union_decl,
+					variant,
+					field,
+					index,
+					naming,
+				)
 				index += 1
 
 			cases_c += "    case " + variant.tag_c_name + ":\n" + releases_c + "      break;\n"
@@ -24828,39 +24861,47 @@ private pure func emit_union_destructor_cases(union_decl: CoreUnionDecl) -> Stri
 	cases_c
 
 
-private pure func emit_simple_union_destructor(union_decl: CoreUnionDecl) -> String:
-	"static void " + union_destroy_name(
-		union_decl.name,
-	) + "(void* obj) {\n" + "  " + union_decl.name + "* self = (" + union_decl.name + "*)obj;\n" + "  switch (self->tag) {\n" + emit_union_destructor_cases(
+private pure func emit_simple_union_destructor(
+	union_decl: CoreUnionDecl,
+	naming: BackendTypeNaming,
+) -> String:
+	"static void " + naming.destroy_name + "(void* obj) {\n" + "  " + union_decl.name + "* self = (" + union_decl.name + "*)obj;\n" + "  switch (self->tag) {\n" + emit_union_destructor_cases(
 		union_decl,
+		naming,
 	) + "    default:\n" + "      break;\n" + "  }\n" + "}\n\n"
 
 
-private pure func emit_iterative_union_destructor(union_decl: CoreUnionDecl) -> String:
+private pure func emit_iterative_union_destructor(
+	union_decl: CoreUnionDecl,
+	naming: BackendTypeNaming,
+) -> String:
 	type_name: String = union_decl.name
-	stack_push_name: String = union_destroy_stack_push_name(union_decl.name)
-	release_child_name: String = union_destroy_release_child_name(union_decl.name)
-	destroy_fields_name: String = union_destroy_fields_name(union_decl.name)
+	stack_push_name: String = naming.union_destroy_stack_push_name
+	release_child_name: String = naming.union_destroy_release_child_name
+	destroy_fields_name: String = naming.union_destroy_fields_name
 
 	"static void " + stack_push_name + "(" + type_name + "*** stack, long* count, long* capacity, " + type_name + "* value) {\n" + "  if (*count >= *capacity) {\n" + "    long next_capacity = (*capacity == 0) ? 64 : (*capacity * 2);\n" + "    " + type_name + "** grown = (" + type_name + "**)realloc(*stack, sizeof(" + type_name + "*) * (size_t)next_capacity);\n" + "    if (!grown) { fprintf(stderr, \"blorp: out of memory (" + type_name + " destroy stack)\\n\"); abort(); }\n" + "    *stack = grown;\n" + "    *capacity = next_capacity;\n" + "  }\n" + "  (*stack)[*count] = value;\n" + "  *count += 1;\n" + "}\n\n" + "static void " + release_child_name + "(" + type_name + "*** stack, long* count, long* capacity, " + type_name + "* value) {\n" + "  if (!value) return;\n" + "  blorp_Object* header = (blorp_Object*)value;\n" + "  if (BLORP_RC_LOAD(header->refcount) == BLORP_IMMORTAL_REFCOUNT) return;\n" + "  long previous_refcount = BLORP_RC_DEC_PREV(header->refcount);\n" + "  if (previous_refcount == 1) " + stack_push_name + "(stack, count, capacity, value);\n" + "}\n\n" + "static void " + destroy_fields_name + "(" + type_name + "* self, " + type_name + "*** __destroy_stack, long* __destroy_count, long* __destroy_capacity) {\n" + "  switch (self->tag) {\n" + emit_union_destructor_cases(
 		union_decl,
-	) + "    default:\n" + "      break;\n" + "  }\n" + "}\n\n" + "static void " + union_destroy_name(
-		type_name,
-	) + "(void* obj) {\n" + "  " + type_name + "** __destroy_stack = NULL;\n" + "  long __destroy_count = 0;\n" + "  long __destroy_capacity = 0;\n" + "  " + destroy_fields_name + "((" + type_name + "*)obj, &__destroy_stack, &__destroy_count, &__destroy_capacity);\n" + "  while (__destroy_count > 0) {\n" + "    " + type_name + "* self = __destroy_stack[--__destroy_count];\n" + "    " + destroy_fields_name + "(self, &__destroy_stack, &__destroy_count, &__destroy_capacity);\n" + "    blorp_release_arc_only_slow_extern(self);\n" + "  }\n" + "  free(__destroy_stack);\n" + "}\n\n"
+		naming,
+	) + "    default:\n" + "      break;\n" + "  }\n" + "}\n\n" + "static void " + naming.destroy_name + "(void* obj) {\n" + "  " + type_name + "** __destroy_stack = NULL;\n" + "  long __destroy_count = 0;\n" + "  long __destroy_capacity = 0;\n" + "  " + destroy_fields_name + "((" + type_name + "*)obj, &__destroy_stack, &__destroy_count, &__destroy_capacity);\n" + "  while (__destroy_count > 0) {\n" + "    " + type_name + "* self = __destroy_stack[--__destroy_count];\n" + "    " + destroy_fields_name + "(self, &__destroy_stack, &__destroy_count, &__destroy_capacity);\n" + "    blorp_release_arc_only_slow_extern(self);\n" + "  }\n" + "  free(__destroy_stack);\n" + "}\n\n"
 
 
-private pure func emit_union_destructor(union_decl: CoreUnionDecl) -> String:
+private pure func emit_union_destructor(
+	union_decl: CoreUnionDecl,
+	naming: BackendTypeNaming,
+) -> String:
 	if not union_decl_has_destructor(union_decl):
 		""
 	else if union_decl_uses_iterative_destructor(union_decl):
-		emit_iterative_union_destructor(union_decl)
+		emit_iterative_union_destructor(union_decl, naming)
 	else:
-		emit_simple_union_destructor(union_decl)
+		emit_simple_union_destructor(union_decl, naming)
 
 
 private pure func emit_union_constructor(
 	union_decl: CoreUnionDecl,
 	variant: CoreUnionVariant,
+	naming: BackendTypeNaming,
 ) -> String:
 	if variant.fields.length() == 0:
 		instance_name: String = union_instance_name(variant.c_name)
@@ -24892,7 +24933,7 @@ private pure func emit_union_constructor(
 			params = params.append("unsigned long release_mask")
 
 		destructor_init: String = if union_decl_has_destructor(union_decl):
-			"  BLORP_SET_DESTRUCTOR(__vc, " + union_destroy_name(union_decl.name) + ");\n"
+			"  BLORP_SET_DESTRUCTOR(__vc, " + naming.destroy_name + ");\n"
 		else:
 			""
 
@@ -24911,6 +24952,7 @@ private pure func emit_union_constructor(
 private pure func emit_union_reuse_constructor(
 	union_decl: CoreUnionDecl,
 	variant: CoreUnionVariant,
+	naming: BackendTypeNaming,
 ) -> String:
 	if variant.fields.length() == 0:
 		""
@@ -24944,7 +24986,7 @@ private pure func emit_union_reuse_constructor(
 			fresh_args = fresh_args.append("release_mask")
 
 		destroy_old_fields: String = if union_decl_has_destructor(union_decl):
-			"    " + union_destroy_name(union_decl.name) + "(__old);\n"
+			"    " + naming.destroy_name + "(__old);\n"
 		else:
 			""
 
@@ -24969,11 +25011,15 @@ private pure func append_emitted_c(accumulator: String, suffix: String) -> Strin
 	builtin("blorp_string_append")
 
 
-private pure func emit_union_decl(union_decl: CoreUnionDecl) -> String:
+private pure func emit_union_decl(
+	union_decl: CoreUnionDecl,
+	authority: CEmissionSymbolAuthority,
+) -> String:
 	var storage_c: String = make_string(0)
 	var tags_c: String = make_string(0)
 	var constructors_c: String = make_string(0)
 	var reuse_constructors_c: String = make_string(0)
+	naming: BackendTypeNaming = selected_type_naming(authority, union_decl.name)
 
 	release_mask_field: String = if union_decl_has_release_mask(union_decl):
 		"  unsigned long release_mask;\n"
@@ -24991,15 +25037,16 @@ private pure func emit_union_decl(union_decl: CoreUnionDecl) -> String:
 		)
 		constructors_c = append_emitted_c(
 			constructors_c,
-			emit_union_constructor(union_decl, variant),
+			emit_union_constructor(union_decl, variant, naming),
 		)
 		reuse_constructors_c = append_emitted_c(
 			reuse_constructors_c,
-			emit_union_reuse_constructor(union_decl, variant),
+			emit_union_reuse_constructor(union_decl, variant, naming),
 		)
 
 	"typedef struct " + union_decl.name + " {\n" + "  blorp_Object header;\n" + "  int tag;\n" + release_mask_field + "  union {\n" + storage_c + "  } data;\n" + "} " + union_decl.name + ";\n\n" + tags_c + "\n" + emit_union_destructor(
 		union_decl,
+		naming,
 	) + constructors_c + reuse_constructors_c
 
 
@@ -25108,6 +25155,7 @@ private pure func value_record_decls_in_dependency_order(
 private pure func emit_value_record_decls(
 	decls: List[CoreDecl],
 	layouts: CRecordLayoutRegistry,
+	authority: CEmissionSymbolAuthority,
 ) -> String:
 	var c_code: String = make_string(0)
 
@@ -25117,6 +25165,7 @@ private pure func emit_value_record_decls(
 			emit_value_record_decl(
 				record_decl,
 				c_record_layout(layouts, record_decl.name),
+				authority,
 			),
 		)
 
@@ -25162,6 +25211,7 @@ private pure func emit_heap_record_and_union_forward_decls(decls: List[CoreDecl]
 private pure func emit_heap_record_decls(
 	decls: List[CoreDecl],
 	layouts: CRecordLayoutRegistry,
+	authority: CEmissionSymbolAuthority,
 ) -> String:
 	var c_code: String = make_string(0)
 
@@ -25174,6 +25224,7 @@ private pure func emit_heap_record_decls(
 						record_decl,
 						layouts,
 						c_heap_record_layout(layouts, record_decl.name),
+						authority,
 					),
 				)
 			ValueRecordDecl(record_decl):
@@ -25196,13 +25247,19 @@ private pure func emit_heap_record_decls(
 	c_code
 
 
-private pure func emit_union_decls(decls: List[CoreDecl]) -> String:
+private pure func emit_union_decls(
+	decls: List[CoreDecl],
+	authority: CEmissionSymbolAuthority,
+) -> String:
 	var c_code: String = make_string(0)
 
 	for decl in decls:
 		match decl:
 			UnionDecl(union_decl):
-				c_code = append_emitted_c(c_code, emit_union_decl(union_decl))
+				c_code = append_emitted_c(
+					c_code,
+					emit_union_decl(union_decl, authority),
+				)
 			HeapRecordDecl(record_decl):
 				void
 			ValueRecordDecl(record_decl):
@@ -25223,13 +25280,19 @@ private pure func emit_union_decls(decls: List[CoreDecl]) -> String:
 	c_code
 
 
-private pure func emit_enum_decls(decls: List[CoreDecl]) -> String:
+private pure func emit_enum_decls(
+	decls: List[CoreDecl],
+	authority: CEmissionSymbolAuthority,
+) -> String:
 	var c_code: String = make_string(0)
 
 	for decl in decls:
 		match decl:
 			EnumDecl(enum_decl):
-				c_code = append_emitted_c(c_code, emit_enum_decl(enum_decl))
+				c_code = append_emitted_c(
+					c_code,
+					emit_enum_decl(enum_decl, authority),
+				)
 			HeapRecordDecl(record_decl):
 				void
 			ValueRecordDecl(record_decl):
@@ -25619,14 +25682,20 @@ private pure func emit_decls(
 	c_code = append_emitted_c(c_code, emit_heap_record_and_union_forward_decls(decls))
 	c_code = append_emitted_c(
 		c_code,
-		emit_value_record_decls(decls, layouts),
+		emit_value_record_decls(decls, layouts, symbol_authority),
 	)
-	c_code = append_emitted_c(c_code, emit_enum_decls(decls))
-	c_code = append_emitted_c(c_code, emit_generated_stack_option_typedefs(decls))
-	c_code = append_emitted_c(c_code, emit_union_decls(decls))
 	c_code = append_emitted_c(
 		c_code,
-		emit_heap_record_decls(decls, layouts),
+		emit_enum_decls(decls, symbol_authority),
+	)
+	c_code = append_emitted_c(c_code, emit_generated_stack_option_typedefs(decls))
+	c_code = append_emitted_c(
+		c_code,
+		emit_union_decls(decls, symbol_authority),
+	)
+	c_code = append_emitted_c(
+		c_code,
+		emit_heap_record_decls(decls, layouts, symbol_authority),
 	)
 	c_code = append_emitted_c(c_code, emit_canonical_empty_list_definitions(canonical_empty_lists))
 	c_code = append_emitted_c(

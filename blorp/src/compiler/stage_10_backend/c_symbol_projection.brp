@@ -71,13 +71,10 @@ import:
 		BUILTIN_STACK_OPTION_INT128_OPTION_C_TYPE,
 		BUILTIN_STACK_OPTION_RANGE_OPTION_C_TYPE,
 		BUILTIN_STACK_OPTION_UINT128_OPTION_C_TYPE,
+		BackendTypeNaming,
+		backend_type_naming,
 		c_identifier,
 		c_local_name,
-		enum_to_string_name,
-		enum_vector_to_string_name,
-		record_destroy_name,
-		record_make_name,
-		record_reuse_name,
 		static_child_path,
 		static_closure_name,
 		static_list_child_path,
@@ -87,10 +84,6 @@ import:
 		static_tuple_storage_name,
 		static_union_child_path,
 		static_union_storage_name,
-		union_destroy_fields_name,
-		union_destroy_name,
-		union_destroy_release_child_name,
-		union_destroy_stack_push_name,
 		union_init_name,
 		union_instance_name,
 		union_reuse_name,
@@ -133,7 +126,8 @@ record CCallableSymbolPlan {
 
 private record CProgramSymbolInventory {
 	candidates: List[CCallableSymbolCandidate],
-	preserved_names: List[String]
+	preserved_names: List[String],
+	type_naming: Dict[String, BackendTypeNaming]
 }
 
 
@@ -156,7 +150,8 @@ union CSymbolProjectionError:
 private record CEmissionSymbolPlanRep {
 	callables: CCallableSymbolPlan,
 	canonical_empty_lists: List[CanonicalEmptyList],
-	preserved_symbol_count: Int
+	preserved_symbol_count: Int,
+	type_naming: Dict[String, BackendTypeNaming]
 }
 
 
@@ -418,6 +413,22 @@ pure func c_emission_preserved_symbol_count(plan: CEmissionSymbolPlan) -> Int:
 	representation.preserved_symbol_count
 
 
+---
+The declared type's precomputed C spellings (make/destroy/reuse/enum/union
+helper names), or a freshly derived value when a type name is absent from
+the plan (unreachable once `program_symbol_inventory` has walked every
+declaration; kept only so a caller cannot crash on a stale plan).
+---
+pure func c_emission_type_naming(plan: CEmissionSymbolPlan, type_name: String) -> BackendTypeNaming:
+	representation: CEmissionSymbolPlanRep = from_opaque CEmissionSymbolPlan(plan)
+
+	match representation.type_naming.get(type_name):
+		Some(facts):
+			facts
+		None:
+			backend_type_naming(type_name)
+
+
 private pure func projected_callable_name_after_validation(
 	plan: CCallableSymbolPlan,
 	qualified_name: String,
@@ -550,6 +561,7 @@ private pure func static_storage_names(path: String, expr: CoreExpr) -> List[Str
 private pure func program_symbol_inventory(program: CoreProgram) -> CProgramSymbolInventory:
 	var candidates: List[CCallableSymbolCandidate] = []
 	var names: List[String] = ["main", "__blorp_init_globals", "__blorp_drop_globals"]
+	var type_naming: Dict[String, BackendTypeNaming] = {}
 
 	names = names.append(BUILTIN_STACK_OPTION_INT128_OPTION_C_TYPE)
 	names = names.append(BUILTIN_STACK_OPTION_UINT128_OPTION_C_TYPE)
@@ -576,9 +588,11 @@ private pure func program_symbol_inventory(program: CoreProgram) -> CProgramSymb
 				names = names.append(global_name)
 				names = names.concat(static_storage_names(global_name, global.init))
 			EnumDecl(enum_decl):
-				names = names.append(c_identifier(enum_decl.name))
-				names = names.append(enum_to_string_name(enum_decl.name))
-				names = names.append(enum_vector_to_string_name(enum_decl.name))
+				facts: BackendTypeNaming = backend_type_naming(enum_decl.name)
+				type_naming = type_naming.set(enum_decl.name, facts)
+				names = names.append(facts.c_name)
+				names = names.append(facts.enum_to_string_name)
+				names = names.append(facts.enum_vector_to_string_name)
 
 				if not TypeLayout.runtime_owned_stack_option_payload_name(enum_decl.name):
 					names = names.append(
@@ -590,11 +604,13 @@ private pure func program_symbol_inventory(program: CoreProgram) -> CProgramSymb
 				for variant in enum_decl.variants:
 					names = names.append(c_identifier(variant.c_name))
 			UnionDecl(union_decl):
-				names = names.append(c_identifier(union_decl.name))
-				names = names.append(union_destroy_name(union_decl.name))
-				names = names.append(union_destroy_stack_push_name(union_decl.name))
-				names = names.append(union_destroy_release_child_name(union_decl.name))
-				names = names.append(union_destroy_fields_name(union_decl.name))
+				facts: BackendTypeNaming = backend_type_naming(union_decl.name)
+				type_naming = type_naming.set(union_decl.name, facts)
+				names = names.append(facts.c_name)
+				names = names.append(facts.destroy_name)
+				names = names.append(facts.union_destroy_stack_push_name)
+				names = names.append(facts.union_destroy_release_child_name)
+				names = names.append(facts.union_destroy_fields_name)
 
 				for variant in union_decl.variants:
 					names = names.append(c_identifier(variant.c_name))
@@ -603,8 +619,10 @@ private pure func program_symbol_inventory(program: CoreProgram) -> CProgramSymb
 					names = names.append(union_init_name(variant.c_name))
 					names = names.append(union_reuse_name(union_decl.name, variant.c_name))
 			ValueRecordDecl(record_decl):
-				names = names.append(c_identifier(record_decl.name))
-				names = names.append(record_make_name(record_decl.name))
+				facts: BackendTypeNaming = backend_type_naming(record_decl.name)
+				type_naming = type_naming.set(record_decl.name, facts)
+				names = names.append(facts.c_name)
+				names = names.append(facts.make_name)
 
 				if not TypeLayout.runtime_owned_stack_option_payload_name(record_decl.name):
 					names = names.append(
@@ -613,10 +631,12 @@ private pure func program_symbol_inventory(program: CoreProgram) -> CProgramSymb
 				else:
 					void
 			HeapRecordDecl(record_decl):
-				names = names.append(c_identifier(record_decl.name))
-				names = names.append(record_make_name(record_decl.name))
-				names = names.append(record_destroy_name(record_decl.name))
-				names = names.append(record_reuse_name(record_decl.name))
+				facts: BackendTypeNaming = backend_type_naming(record_decl.name)
+				type_naming = type_naming.set(record_decl.name, facts)
+				names = names.append(facts.c_name)
+				names = names.append(facts.make_name)
+				names = names.append(facts.destroy_name)
+				names = names.append(facts.reuse_name)
 			TypeAliasDecl(alias_decl):
 				names = names.append(c_identifier(alias_decl.name))
 			TraitDecl(trait_decl):
@@ -626,7 +646,8 @@ private pure func program_symbol_inventory(program: CoreProgram) -> CProgramSymb
 
 	{
 		candidates = candidates,
-		preserved_names = names
+		preserved_names = names,
+		type_naming = type_naming
 	}
 
 
@@ -963,7 +984,8 @@ pure func prepare_c_emission_symbols(
 											Ok(into_opaque CEmissionSymbolPlan({
 														callables = plan,
 														canonical_empty_lists = validation.canonical_empty_lists,
-														preserved_symbol_count = preserved_names.length()
+														preserved_symbol_count = preserved_names.length(),
+														type_naming = inventory.type_naming
 													}))
 
 
