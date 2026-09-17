@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""Attribute a macOS `sample` call graph to one pass's subtree.
+
+Parses the indentation-based call graph that `sample -file <path>` writes,
+finds the topmost occurrence(s) of a chosen pass (a subtree can be entered
+from more than one call site), and reports where its samples went: which
+runtime symbols it spent time in, and which of the roadmap's cost categories
+(generated code, reference counting, cleanup frames, allocation, list ops,
+string/dict lookups, other) those samples belong to.
+
+Usage:
+
+    benchmarks/attribute_sample <sample.txt> --pass <symbol-or-name> [--map <metadata.c>]
+
+`<symbol-or-name>` matches directly against the raw symbols in the sample
+(for example `brp_3I`, or a runtime symbol like `blorp_cooperative_checkpoint`),
+and, when `--map` is given, against the blorp function name or module path in
+that map (substring match), which `--map` translates back to `brp_NNN` ids.
+
+Build the map from a `--profile-mode calls` generation and take the sample
+from a plain generation with the same flags (ids are stable across profiling
+flags but not across a differently-configured build) -- see
+benchmarks/README.md, "Sampling A Pass".
+
+`_tlv_get_addr` (the macOS thread-local-read thunk) is charged back to
+whichever function called it before the category table is built, since it is
+never itself a meaningful category, only the cost of a caller's threadlocal
+read (see docs/PER_NODE_CODEGEN_ROADMAP.md, Pattern D).
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+PREFIX_RE = re.compile(r"^([ +!:|]*)(\d+)\s+(.*)$")
+FRAME_RE = re.compile(r"^(?P<symbol>.+?)\s+\(in [^)]*\)")
+METADATA_ROW_RE = re.compile(
+    r'\{\s*"(?P<name>(?:[^"\\]|\\.)*)"\s*,\s*"(?P<id>(?:[^"\\]|\\.)*)"\s*,\s*'
+    r'(?:"(?P<module>(?:[^"\\]|\\.)*)"|NULL)\s*,'
+)
+
+CATEGORY_ORDER = [
+    "reference counting",
+    "cleanup frames",
+    "allocation",
+    "list ops",
+    "string dict lookups",
+]
+CATEGORY_PREFIXES = {
+    "cleanup frames": (
+        "blorp_task_cleanup_", "blorp_cooperative_checkpoint",
+        "blorp_cleanup_release_", "BLORP_TASK_CLEANUP",
+    ),
+    "allocation": (
+        "blorp_alloc", "blorp_free", "blorp_pool_",
+        "malloc", "free", "calloc", "realloc", "xzm_", "nanov2_",
+        "szone_", "tiny_", "small_", "huge_", "large_", "malloc_zone_",
+    ),
+    "list ops": ("blorp_list_",),
+    "string dict lookups": ("blorp_dict_", "blorp_string_", "blorp_hash_"),
+    # Destructors and object-header bookkeeping are the "slow finish,
+    # destructors" half of the roadmap's reference-counting category: the
+    # compiler emits one *_destroy_fields / *_destroy_release_child per
+    # record or union type, named after the type rather than brp_NNN.
+    "reference counting": ("blorp_release_slow_extern", "blorp_elem_release_fn"),
+}
+CATEGORY_EXACT = {
+    "reference counting": {"blorp_retain", "blorp_release", "blorp_release_slow_finish", "blorp_is_unique"},
+    "allocation": {"posix_memalign", "blorp_init_object_header", "blorp_set_type_tag"},
+    "string dict lookups": {"strcmp", "strncmp", "memcmp", "strlen"},
+}
+CATEGORY_SUBSTRINGS = {
+    "reference counting": ("_destroy_fields", "_destroy_release_child", "get_destructor_id"),
+}
+GENERATED_ID_RE = re.compile(r"^brp_[0-9A-Za-z]+$")
+
+
+def _delib(symbol: str) -> str:
+    """macOS Mach-O symbols for libc/libSystem frames often show up in
+    `sample` with a leading underscore (`_malloc_zone_malloc`); strip it only
+    for matching so blorp's own (unprefixed) names are unaffected."""
+    return symbol[1:] if symbol.startswith("_") and not symbol.startswith("_tlv") else symbol
+
+
+class SampleError(Exception):
+    pass
+
+
+class Node:
+    __slots__ = ("depth", "count", "symbol", "children")
+
+    def __init__(self, depth: int, count: int, symbol: str) -> None:
+        self.depth = depth
+        self.count = count
+        self.symbol = symbol
+        self.children: list["Node"] = []
+
+
+def parse_symbol(rest: str) -> str:
+    match = FRAME_RE.match(rest)
+    if match:
+        return match.group("symbol").strip()
+    # Thread roots and unresolved frames: take the first whitespace-delimited token.
+    return rest.split()[0] if rest.split() else rest.strip()
+
+
+def parse_call_graph(text: str) -> list[Node]:
+    lines = text.splitlines()
+    try:
+        start = lines.index("Call graph:")
+    except ValueError as error:
+        raise SampleError("no 'Call graph:' section found in the sample file") from error
+
+    roots: list[Node] = []
+    stack: list[Node] = []  # top has the greatest depth
+    for line in lines[start + 1:]:
+        if not line.strip():
+            break
+        match = PREFIX_RE.match(line)
+        if not match:
+            continue
+        prefix, count_text, rest = match.groups()
+        if len(prefix) % 2 != 0:
+            raise SampleError(f"unrecognized call graph indentation: {line!r}")
+        depth = len(prefix) // 2
+        node = Node(depth, int(count_text), parse_symbol(rest))
+        while stack and stack[-1].depth >= depth:
+            stack.pop()
+        if stack:
+            stack[-1].children.append(node)
+        else:
+            roots.append(node)
+        stack.append(node)
+    if not roots:
+        raise SampleError("call graph section is empty")
+    return roots
+
+
+def load_name_map(path: Path) -> list[tuple[str, str, str | None]]:
+    """Return (blorp_name, brp_id, module) rows from a --profile-mode calls C file."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    rows = []
+    for match in METADATA_ROW_RE.finditer(text):
+        rows.append((match.group("name"), match.group("id"), match.group("module")))
+    if not rows:
+        raise SampleError(f"no __blorp_profile_functions rows found in {path}")
+    return rows
+
+
+def resolve_pass_ids(pass_arg: str, name_map: list[tuple[str, str, str | None]]) -> set[str]:
+    ids = set()
+    for name, brp_id, module in name_map:
+        if pass_arg == name or pass_arg in name:
+            ids.add(brp_id)
+        elif module and (pass_arg == module or pass_arg in module):
+            ids.add(brp_id)
+    return ids
+
+
+def make_matcher(pass_arg: str, name_map: list[tuple[str, str, str | None]] | None):
+    resolved_ids = resolve_pass_ids(pass_arg, name_map) if name_map else set()
+
+    def matches(symbol: str) -> bool:
+        if symbol == pass_arg or pass_arg in symbol:
+            return True
+        return symbol in resolved_ids
+
+    return matches
+
+
+def find_subtree_roots(roots: list[Node], matches) -> list[Node]:
+    """Topmost matching nodes: a match nested under another match is not
+    reported separately (it is already inside the outer subtree). A sibling
+    elsewhere in the tree (the pass called from a different call site) is
+    still reported, so descent continues past a match."""
+    found: list[Node] = []
+    stack: list[tuple[Node, bool]] = [(root, False) for root in reversed(roots)]
+    while stack:
+        node, inside_match = stack.pop()
+        is_match = matches(node.symbol)
+        if is_match and not inside_match:
+            found.append(node)
+        for child in reversed(node.children):
+            stack.append((child, inside_match or is_match))
+    return found
+
+
+def categorize(symbol: str) -> str:
+    if symbol == "_tlv_get_addr":
+        return "cleanup frames"  # only reached if charge-back had nowhere to send it
+    if GENERATED_ID_RE.match(symbol) or symbol in ("main", "$blorp$program"):
+        return "generated code"
+    matched = _delib(symbol)
+    for category in CATEGORY_ORDER:
+        if symbol in CATEGORY_EXACT.get(category, ()) or matched in CATEGORY_EXACT.get(category, ()):
+            return category
+        if any(matched.startswith(prefix) for prefix in CATEGORY_PREFIXES.get(category, ())):
+            return category
+        if any(sub in symbol for sub in CATEGORY_SUBSTRINGS.get(category, ())):
+            return category
+    return "other"
+
+
+def attribute(subtree_roots: list[Node]) -> tuple[dict[str, int], dict[str, int], int]:
+    """Returns (runtime_symbol_inclusive, category_self, total_samples)."""
+    runtime_symbol_inclusive: dict[str, int] = {}
+    category_self: dict[str, int] = {}
+    total_samples = 0
+
+    for root in subtree_roots:
+        total_samples += root.count
+        # Walk the subtree once, iteratively (stack of (node, parent)) so
+        # depth is not bounded by Python's recursion limit; the compiler's
+        # own call graph runs 500+ frames deep under -O2 inlining.
+        stack: list[tuple[Node, Node | None]] = [(root, None)]
+        while stack:
+            node, parent = stack.pop()
+            self_count = node.count - sum(child.count for child in node.children)
+
+            # Runtime-symbol inclusive table. None of the runtime primitives
+            # tracked here (retain/release/alloc/list/dict) call themselves,
+            # so every occurrence is counted without an ancestor-symbol check.
+            category = categorize(node.symbol)
+            if category not in ("generated code", "other") and node.symbol != "_tlv_get_addr":
+                runtime_symbol_inclusive[node.symbol] = (
+                    runtime_symbol_inclusive.get(node.symbol, 0) + node.count
+                )
+
+            # Self samples, with _tlv_get_addr charged back to its caller
+            # (Pattern D: it is only ever the cost of a caller's threadlocal
+            # read, never a category of its own).
+            if node.symbol == "_tlv_get_addr" and parent is not None:
+                target_category = categorize(parent.symbol)
+            else:
+                target_category = category
+            category_self[target_category] = category_self.get(target_category, 0) + self_count
+
+            for child in node.children:
+                stack.append((child, node))
+
+    return runtime_symbol_inclusive, category_self, total_samples
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("sample_file", help="path to a `sample -file <path>` report")
+    parser.add_argument("--pass", dest="pass_arg", required=True, help="symbol (e.g. brp_3I) or name to attribute")
+    parser.add_argument("--map", help="metadata C file from a --profile-mode calls generation, to translate names/modules to brp_NNN ids")
+    args = parser.parse_args(argv)
+
+    try:
+        text = Path(args.sample_file).read_text(encoding="utf-8", errors="replace")
+        roots = parse_call_graph(text)
+        name_map = load_name_map(Path(args.map)) if args.map else None
+        matcher = make_matcher(args.pass_arg, name_map)
+        subtree_roots = find_subtree_roots(roots, matcher)
+        if not subtree_roots:
+            print(f"attribute_sample: no node matched --pass {args.pass_arg!r}", file=sys.stderr)
+            return 1
+        runtime_symbol_inclusive, category_self, total_samples = attribute(subtree_roots)
+    except SampleError as error:
+        print(f"attribute_sample: {error}", file=sys.stderr)
+        return 1
+
+    print(f"pass          : {args.pass_arg}")
+    print(f"matched roots : {len(subtree_roots)}  (symbols: {', '.join(sorted({n.symbol for n in subtree_roots}))})")
+    print(f"total samples : {total_samples}")
+    print()
+    print("Runtime symbols by inclusive samples under the subtree")
+    print(f"{'symbol':<40} {'samples':>10} {'share':>7}")
+    for symbol, samples in sorted(runtime_symbol_inclusive.items(), key=lambda kv: -kv[1]):
+        share = 100.0 * samples / total_samples if total_samples else 0.0
+        print(f"{symbol:<40} {samples:>10} {share:>6.1f}%")
+    print()
+    print("Category (self samples, _tlv_get_addr charged to its caller)")
+    print(f"{'category':<24} {'samples':>10} {'share':>7}")
+    category_order = ["generated code", *CATEGORY_ORDER, "other"]
+    for category in category_order:
+        samples = category_self.get(category, 0)
+        share = 100.0 * samples / total_samples if total_samples else 0.0
+        print(f"{category:<24} {samples:>10} {share:>6.1f}%")
+    accounted = sum(category_self.values())
+    if accounted != total_samples:
+        print(f"note: category self samples ({accounted}) != subtree total ({total_samples}); "
+              "expected only when a matched root itself is missing from the tree root list", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

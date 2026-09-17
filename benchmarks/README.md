@@ -1797,6 +1797,35 @@ Retained baselines live in `benchmarks/results/self_compile_baseline_*.json`
 and `self_compile_small_baseline_*.json`; a new baseline is recorded only when
 the input revision or host changes.
 
+### The Stage-2 Rule
+
+`bin/blorp` is linked by the pinned bootstrap compiler, so a change to the
+backend or the runtime in this worktree never shows up in what `bin/blorp`
+itself runs. Any task that touches codegen or the runtime must instead
+measure a **stage-2 compiler**: `blorp/src/main.brp` compiled by `bin/blorp`
+and linked with the Makefile's own "Compiling Blorp CLI" recipe, so it
+carries this checkout's codegen and runtime.
+
+```bash
+# Build bin/blorp-stage2 directly (prints the generated C's byte count and sha256).
+benchmarks/build_stage2_compiler bin/blorp-stage2
+
+# Or let the harness build and measure it in one step.
+benchmarks/self_compile_measure --stage2 \
+  --label candidate --input-rev <input_rev> \
+  --baseline benchmarks/results/self_compile_stage2_baseline_O2_2026-09-17_s1.json \
+  --output /tmp/candidate.json --require-identical
+```
+
+`--stage2` builds `bin/blorp-stage2` via `benchmarks/build_stage2_compiler`
+and measures it exactly as `--compiler bin/blorp-stage2 --skip-build-check`
+would, and records which `bin/blorp` (by sha256) built it. The comparison
+table prints `output bytes` next to the instructions-retired row, since the
+compiler's own generated-C size is a tracked metric for codegen work. Both
+scripts respect `BLORP_CLI_C_OPTIMIZATION` the same way `make` does; export it
+before building, checking freshness, and measuring so all three agree on the
+optimization level.
+
 ### Sampling A Pass
 
 Allocation counters and the exact function profile say how often a pass runs
@@ -1842,6 +1871,23 @@ sample $! 70 1 -file /tmp/sample.txt
 The `-O0` module code against an `-O2` runtime matches how `make` links
 `bin/blorp`, so the runtime-versus-generated split is the one the harness
 measures. `valgrind` and `callgrind` are not available on macOS.
+
+Attribute the resulting `sample.txt` with `benchmarks/attribute_sample`:
+
+```bash
+benchmarks/attribute_sample /tmp/sample.txt --pass blorp/src/compiler/stage_09_core/perceus --map /tmp/map.c
+```
+
+`--pass` matches a raw symbol in the sample directly (a `brp_NNN` id, or a
+runtime symbol like `blorp_cooperative_checkpoint`), and, with `--map`
+(the metadata table a `--profile-mode calls` generation embeds), also against
+the blorp function name or module path there. It finds the topmost matching
+node(s) (a pass can be entered from more than one call site), sums their
+inclusive samples, and prints the runtime symbols underneath by inclusive
+sample count and the same cost categories the roadmap tables use (generated
+code, reference counting, cleanup frames, allocation, list ops, string/dict
+lookups, other), charging `_tlv_get_addr` back to whichever function called
+it.
 
 ### Typecheck Cost Attribution
 

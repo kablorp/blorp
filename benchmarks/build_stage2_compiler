@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""Build a stage-2 Blorp compiler.
+
+`bin/blorp` (stage 1) is linked by the pinned bootstrap compiler, so its own
+codegen never reflects a change to the backend or the runtime in this
+worktree. A stage-2 compiler is `blorp/src/main.brp` compiled *by* `bin/blorp`
+and linked with the Makefile's own "Compiling Blorp CLI" recipe, so it is
+built with whatever the backend in this checkout emits. See
+docs/PER_NODE_CODEGEN_ROADMAP.md, "The stage-2 rule".
+
+This script never touches the Makefile's own hash files or `bin/blorp`; it
+reads the Makefile's `generate-blorp-cli-c` and "Compiling Blorp CLI" recipes
+through `make -n` so the exact compile and link commands (the `-I` list
+included) stay in sync with the Makefile without being copied by hand.
+
+Usage:
+
+    benchmarks/build_stage2_compiler <output-binary>
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import re
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+MAKEFILE = REPO_ROOT / "Makefile"
+INSTALLED_BIN = REPO_ROOT / "bin" / "blorp"
+BUILD_STATUS = REPO_ROOT / "scripts" / "compiler-build-status"
+
+# Unique markers inside the printed recipes that sit immediately before the
+# command we want, so a `make -n` dump of an unrelated prerequisite recipe
+# (the build-source-generator's own bootstrap compile, the runtime object
+# compile) can never be mistaken for the one we are extracting.
+GENERATE_MARKER = 'echo "Generating Blorp CLI C"'
+LINK_MARKER = 'echo "Compiling Blorp CLI"'
+
+GENERATE_RE = re.compile(
+    r'"\s+compile(?P<flags>.*?)-o "\$tmp_c" "(?P<source>[^"]*)"', re.DOTALL
+)
+LINK_RE = re.compile(
+    r'cc "(?P<opt>[^"]*)"(?P<flags>.*?)'
+    r'"(?P<c_file>[^"]*blorp_cli_main\.c)" '
+    r'"(?P<runtime_obj>[^"]*)" "(?P<runtime_sources>[^"]*)" "(?P<lsp_native>[^"]*)" '
+    r'(?P<libs>[^\n]*?) -o "\$tmp_bin"',
+    re.DOTALL,
+)
+VAR_RE_TEMPLATE = r'^{name} :?= (.*)$'
+
+
+class BuildError(Exception):
+    pass
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def make_var(name: str) -> str:
+    """Read one Makefile variable's fully expanded value via `make -pn`."""
+    result = subprocess.run(
+        ["make", "-pn", "-f", str(MAKEFILE)],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    match = re.search(VAR_RE_TEMPLATE.format(name=re.escape(name)), result.stdout, re.MULTILINE)
+    if not match:
+        raise BuildError(
+            f"could not read Makefile variable {name} from `make -pn`; "
+            "the Makefile's variable layout changed, resync this script"
+        )
+    return match.group(1).strip()
+
+
+def make_recipe(target: str) -> str:
+    result = subprocess.run(
+        ["make", "-n", target], cwd=REPO_ROOT, capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        raise BuildError(f"`make -n {target}` failed:\n{result.stderr}")
+    return result.stdout
+
+
+def tokens_from_flags(raw: str) -> list[str]:
+    return shlex.split(raw.replace("\\\n", " "))
+
+
+def extract_generate_command(recipe_text: str, compiler: Path, output_c: Path) -> list[str]:
+    if GENERATE_MARKER not in recipe_text:
+        raise BuildError(
+            "could not find the Blorp CLI C generation step in "
+            "`make -n generate-blorp-cli-c`; the Makefile recipe changed, resync this script"
+        )
+    tail = recipe_text[recipe_text.index(GENERATE_MARKER):]
+    match = GENERATE_RE.search(tail)
+    if not match:
+        raise BuildError(
+            "could not parse the compile command out of `make -n generate-blorp-cli-c`; "
+            "the Makefile recipe changed, resync this script"
+        )
+    flags = tokens_from_flags(match.group("flags"))
+    source = match.group("source")
+    return [str(compiler), "compile", *flags, "-o", str(output_c), source]
+
+
+def extract_link_command(recipe_text: str, input_c: Path, output_bin: Path) -> list[str]:
+    if LINK_MARKER not in recipe_text:
+        raise BuildError(
+            "could not find the Compiling Blorp CLI step in "
+            "`make -n compile-prepared-blorp-cli`; the Makefile recipe changed, resync this script"
+        )
+    tail = recipe_text[recipe_text.index(LINK_MARKER):]
+    match = LINK_RE.search(tail)
+    if not match:
+        raise BuildError(
+            "could not parse the cc link command out of `make -n compile-prepared-blorp-cli`; "
+            "the Makefile recipe changed, resync this script"
+        )
+    flags = tokens_from_flags(match.group("flags"))
+    libs = tokens_from_flags(match.group("libs"))
+    for key, label in (
+        ("runtime_obj", "runtime object"),
+        ("runtime_sources", "runtime sources C"),
+        ("lsp_native", "LSP native runtime"),
+    ):
+        candidate = REPO_ROOT / match.group(key)
+        if not candidate.is_file():
+            raise BuildError(
+                f"{label} is missing: {candidate}; run `make` first "
+                "(the stage-2 link reuses stage 1's runtime build)"
+            )
+    return [
+        "cc",
+        match.group("opt"),
+        *flags,
+        str(input_c),
+        match.group("runtime_obj"),
+        match.group("runtime_sources"),
+        match.group("lsp_native"),
+        *libs,
+        "-o",
+        str(output_bin),
+    ]
+
+
+def check_bin_blorp_fresh() -> None:
+    if not INSTALLED_BIN.is_file():
+        raise BuildError(f"{INSTALLED_BIN} does not exist; run `make` first")
+    quiet = subprocess.run([str(BUILD_STATUS), "--quiet"], cwd=REPO_ROOT)
+    if quiet.returncode == 0:
+        return
+    verbose = subprocess.run(
+        [str(BUILD_STATUS)], cwd=REPO_ROOT, capture_output=True, text=True
+    )
+    sys.stderr.write(verbose.stdout)
+    sys.stderr.write(verbose.stderr)
+    raise BuildError(
+        "bin/blorp is not FRESH per scripts/compiler-build-status; "
+        "a stage-2 compiler built from a stale bin/blorp measures the wrong backend"
+    )
+
+
+def run(cmd: list[str], what: str) -> None:
+    result = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise BuildError(
+            f"{what} failed (exit {result.returncode}):\n{result.stderr[-4000:]}"
+        )
+
+
+def build(output: Path) -> int:
+    if output.resolve() == INSTALLED_BIN.resolve():
+        raise BuildError("refusing to overwrite bin/blorp; choose a different output path")
+
+    check_bin_blorp_fresh()
+
+    build_dir = REPO_ROOT / make_var("BLORP_CLI_BUILD_DIR")
+    build_dir.mkdir(parents=True, exist_ok=True)
+    stage2_c = build_dir / "stage2_main.c"
+
+    tmp_c = stage2_c.with_name(stage2_c.name + ".tmp")
+    generate_cmd = extract_generate_command(
+        make_recipe("generate-blorp-cli-c"), INSTALLED_BIN, tmp_c
+    )
+    run(generate_cmd, "bin/blorp compile (stage-2 generation)")
+    if not tmp_c.is_file() or tmp_c.stat().st_size == 0:
+        raise BuildError(f"generated C is missing or empty: {tmp_c}")
+    tmp_c.replace(stage2_c)
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    tmp_bin = output.with_name(output.name + ".tmp")
+    link_cmd = extract_link_command(
+        make_recipe("compile-prepared-blorp-cli"), stage2_c, tmp_bin
+    )
+    run(link_cmd, "cc (stage-2 link)")
+    tmp_bin.chmod(0o755)
+    tmp_bin.replace(output)
+
+    size = stage2_c.stat().st_size
+    digest = sha256_file(stage2_c)
+    print(f"stage2 generated C  : {stage2_c}")
+    print(f"stage2 generated C bytes : {size}")
+    print(f"stage2 generated C sha256: {digest}")
+    print(f"stage2 binary        : {output}")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("output", help="path to write the stage-2 compiler binary to")
+    args = parser.parse_args(argv)
+    try:
+        return build(Path(args.output).resolve())
+    except BuildError as error:
+        print(f"build_stage2_compiler: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

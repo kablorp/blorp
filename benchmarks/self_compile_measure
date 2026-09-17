@@ -44,6 +44,8 @@ INSTRUCTIONS_RE = re.compile(r"^\s*(\d+)\s+instructions retired")
 RSS_RE = re.compile(r"^\s*(\d+)\s+maximum resident set size")
 REAL_RE = re.compile(r"^\s*([0-9.]+)\s+real\s+([0-9.]+)\s+user\s+([0-9.]+)\s+sys")
 SMALL_PROGRAM = SCRIPT_DIR / "self_compile" / "small.brp"
+STAGE2_BUILD_SCRIPT = SCRIPT_DIR / "build_stage2_compiler"
+STAGE2_DEFAULT_BIN = REPO_ROOT / "bin" / "blorp-stage2"
 SCHEMA_VERSION = 1
 
 
@@ -227,7 +229,32 @@ def checkpoint_deltas(checkpoints: list[dict]) -> list[dict]:
     return rows
 
 
+def build_stage2_compiler() -> tuple[Path, str]:
+    """Build bin/blorp-stage2 via benchmarks/build_stage2_compiler and return
+    its path along with the sha256 of the bin/blorp that built it (the
+    stage-2 rule: bin/blorp-stage2 is blorp/src/main.brp compiled by
+    bin/blorp, not by the pinned bootstrap that built bin/blorp itself)."""
+    stage1 = (REPO_ROOT / "bin" / "blorp")
+    if not stage1.is_file():
+        raise MeasureError("bin/blorp is missing; run `make` first (needed to build the stage-2 compiler)")
+    stage1_sha256 = sha256_file(stage1)
+    result = subprocess.run(
+        [str(STAGE2_BUILD_SCRIPT), str(STAGE2_DEFAULT_BIN)],
+        cwd=REPO_ROOT, capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise MeasureError(
+            f"benchmarks/build_stage2_compiler failed:\n{result.stdout}{result.stderr}"
+        )
+    return STAGE2_DEFAULT_BIN, stage1_sha256
+
+
 def measure(args: argparse.Namespace) -> dict:
+    stage2_built_by_sha256 = None
+    if args.stage2:
+        stage2_bin, stage2_built_by_sha256 = build_stage2_compiler()
+        args.compiler = str(stage2_bin)
+        args.skip_build_check = True
     compiler = Path(args.compiler).resolve()
     if not compiler.exists():
         raise MeasureError(f"compiler not found: {compiler}")
@@ -260,6 +287,8 @@ def measure(args: argparse.Namespace) -> dict:
         "compiler_rev": compiler_rev,
         "compiler_dirty": compiler_dirty,
         "compiler_build_status": freshness,
+        "compiler_stage": 2 if args.stage2 else 1,
+        "stage2_built_by_bin_blorp_sha256": stage2_built_by_sha256,
         "c_optimization": os.environ.get("BLORP_CLI_C_OPTIMIZATION", "-O0 (default)"),
         "input_rev": input_rev,
         "input_dir": str(input_dir),
@@ -358,6 +387,8 @@ def compare(baseline: dict, candidate: dict) -> bool:
     b = baseline.get("instructions_retired", {}).get("min")
     c = candidate.get("instructions_retired", {}).get("min")
     print(f"{'instructions retired (min)':<44} {fmt(b):>16} {fmt(c):>16} {pct(b, c):>9}")
+    b = baseline.get("output_bytes"); c = candidate.get("output_bytes")
+    print(f"{'output bytes':<44} {fmt(b):>16} {fmt(c):>16} {pct(b, c):>9}")
     for name in list(baseline.get("phases_ms", {})) + [
         n for n in candidate.get("phases_ms", {}) if n not in baseline.get("phases_ms", {})
     ]:
@@ -419,6 +450,12 @@ def main(argv: list[str]) -> int:
         p.add_argument("--keep-output", help="copy the generated C here")
         p.add_argument("--require-identical", action="store_true", help="exit 3 if generated C differs from baseline")
         p.add_argument("--skip-build-check", action="store_true")
+        p.add_argument(
+            "--stage2", action="store_true",
+            help="build bin/blorp-stage2 via benchmarks/build_stage2_compiler and measure it "
+                 "(equivalent to --compiler bin/blorp-stage2 --skip-build-check); "
+                 "overrides --compiler and --skip-build-check",
+        )
 
     freeze_parser = sub.add_parser("freeze", help="materialize the frozen input for a revision")
     freeze_parser.add_argument("--rev", default="HEAD")
