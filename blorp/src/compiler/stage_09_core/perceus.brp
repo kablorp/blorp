@@ -1019,46 +1019,34 @@ private union PerceusOwnershipNormalization:
 	ChangedPerceusOwnershipNormalization(CoreExpr)
 
 
-private union PerceusInsertBindingFrame:
-	PerceusInsertManagedLetRhsFrame(PerceusManagedLetPlan)
-	PerceusInsertManagedLetBodyFrame(PerceusManagedLetPlan, PerceusInsertedExpr)
-	PerceusInsertLetRhsFrame(CoreExpr, CoreVar, Bool, CoreType, CoreExpr)
-	PerceusInsertLetBodyFrame(CoreExpr, CoreVar, Bool, CoreType, PerceusInsertedExpr)
-	PerceusInsertBorrowLetRhsFrame(CoreExpr, CoreVar, CoreType, CoreExpr)
-	PerceusInsertBorrowLetBodyFrame(CoreExpr, CoreVar, CoreType, PerceusInsertedExpr)
-	PerceusInsertSequenceFirstFrame(CoreExpr, CoreExpr)
-	PerceusInsertSequenceSecondFrame(CoreExpr, PerceusInsertedExpr)
-	PerceusInsertAssignRhsFrame(CoreVar, CoreType, CoreSourceLoc)
-
-
+--- The insertion walk's explicit stack of bindings it has descended through.
+--- Each frame carries the rest of the stack as its last field rather than
+--- sitting inside a separate cons cell, so a push costs one allocation.
 private union PerceusInsertBindingFrameStack:
 	PerceusInsertNoBindingFrame
-	PerceusInsertMoreBindingFrames(PerceusInsertBindingFrame, PerceusInsertBindingFrameStack)
+	PerceusInsertManagedLetRhsFrame(PerceusManagedLetPlan, PerceusInsertBindingFrameStack)
+	PerceusInsertManagedLetBodyFrame(PerceusManagedLetPlan, PerceusInsertedExpr, PerceusInsertBindingFrameStack)
+	PerceusInsertLetRhsFrame(CoreExpr, CoreVar, Bool, CoreType, CoreExpr, PerceusInsertBindingFrameStack)
+	PerceusInsertLetBodyFrame(CoreExpr, CoreVar, Bool, CoreType, PerceusInsertedExpr, PerceusInsertBindingFrameStack)
+	PerceusInsertBorrowLetRhsFrame(CoreExpr, CoreVar, CoreType, CoreExpr, PerceusInsertBindingFrameStack)
+	PerceusInsertBorrowLetBodyFrame(CoreExpr, CoreVar, CoreType, PerceusInsertedExpr, PerceusInsertBindingFrameStack)
+	PerceusInsertSequenceFirstFrame(CoreExpr, CoreExpr, PerceusInsertBindingFrameStack)
+	PerceusInsertSequenceSecondFrame(CoreExpr, PerceusInsertedExpr, PerceusInsertBindingFrameStack)
+	PerceusInsertAssignRhsFrame(CoreVar, CoreType, CoreSourceLoc, PerceusInsertBindingFrameStack)
 
 
-private union PerceusInsertBindingAction:
-	PerceusInsertVisitBindingExpr(CoreExpr)
-	PerceusInsertRebuildBindingExpr(PerceusInsertedExpr)
-
-
-private union PerceusLambdaNormalizeFrame:
-	PerceusLambdaNormalizeLetRhsFrame(CoreVar, Bool, CoreType, CoreExpr)
-	PerceusLambdaNormalizeLetBodyFrame(CoreVar, Bool, CoreType, CoreExpr)
-	PerceusLambdaNormalizeBorrowLetRhsFrame(CoreVar, CoreType, CoreExpr)
-	PerceusLambdaNormalizeBorrowLetBodyFrame(CoreVar, CoreType, CoreExpr)
-	PerceusLambdaNormalizeSequenceFirstFrame(CoreExpr)
-	PerceusLambdaNormalizeSequenceSecondFrame(CoreExpr)
-	PerceusLambdaNormalizeAssignRhsFrame(CoreVar, CoreType, CoreSourceLoc)
-
-
+--- The lambda-result normalization walk's explicit stack. Each frame carries
+--- the rest of the stack as its last field rather than sitting inside a
+--- separate cons cell, so a push costs one allocation.
 private union PerceusLambdaNormalizeFrameStack:
 	PerceusLambdaNormalizeNoFrame
-	PerceusLambdaNormalizeMoreFrames(PerceusLambdaNormalizeFrame, PerceusLambdaNormalizeFrameStack)
-
-
-private union PerceusLambdaNormalizeAction:
-	PerceusLambdaNormalizeVisitExpr(CoreExpr)
-	PerceusLambdaNormalizeRebuildExpr(CoreExpr)
+	PerceusLambdaNormalizeLetRhsFrame(CoreVar, Bool, CoreType, CoreExpr, PerceusLambdaNormalizeFrameStack)
+	PerceusLambdaNormalizeLetBodyFrame(CoreVar, Bool, CoreType, CoreExpr, PerceusLambdaNormalizeFrameStack)
+	PerceusLambdaNormalizeBorrowLetRhsFrame(CoreVar, CoreType, CoreExpr, PerceusLambdaNormalizeFrameStack)
+	PerceusLambdaNormalizeBorrowLetBodyFrame(CoreVar, CoreType, CoreExpr, PerceusLambdaNormalizeFrameStack)
+	PerceusLambdaNormalizeSequenceFirstFrame(CoreExpr, PerceusLambdaNormalizeFrameStack)
+	PerceusLambdaNormalizeSequenceSecondFrame(CoreExpr, PerceusLambdaNormalizeFrameStack)
+	PerceusLambdaNormalizeAssignRhsFrame(CoreVar, CoreType, CoreSourceLoc, PerceusLambdaNormalizeFrameStack)
 
 
 --- The summary walk's explicit stack of what is left to do above the node it is
@@ -17399,283 +17387,212 @@ private pure func insert_drops_expr_inner_result(
 	-- post-order pass, so retain the exact RHS-before-body order in explicit
 	-- frames instead of consuming one C stack frame per source binding.
 	var frames: PerceusInsertBindingFrameStack = PerceusInsertNoBindingFrame
-	var action: PerceusInsertBindingAction = PerceusInsertVisitBindingExpr(expr)
+	var visiting: Bool = True
+	var current_expr: CoreExpr = expr
+	-- The loop can exit only from the rebuild branch. This seed keeps the
+	-- function total if that state-machine invariant ever changes.
+	var pending: PerceusInsertedExpr = inserted_expr(expr, True)
 	var resolved_values: PerceusResolvedValueIndex = {occurrences_by_def_id_by_uniq_by_name = {}}
 	var managed_binding_frame_count: Int = 0
 	var complete: Bool = False
 
 	while not complete:
-		match action:
-			PerceusInsertVisitBindingExpr(current):
-				debug:
-					perceus_work_insert_node_visits()
+		if visiting:
+			current: CoreExpr = current_expr
 
-				match current:
-					LetExpr(variable, is_mutable, bind_type, rhs, body):
-						if is_managed_type(env, bind_type):
-							debug:
-								perceus_work_insert_managed_let_visits()
+			debug:
+				perceus_work_insert_node_visits()
 
-							plan: PerceusManagedLetPlan = plan_managed_let(
-								env,
-								current,
-								variable,
-								is_mutable,
-								bind_type,
-								rhs,
-								body,
-							)
-							frames = PerceusInsertMoreBindingFrames(
-								PerceusInsertManagedLetRhsFrame(plan),
-								frames,
-							)
-							managed_binding_frame_count += 1
-							action = PerceusInsertVisitBindingExpr(plan.owned_rhs)
-						else:
-							frames = PerceusInsertMoreBindingFrames(
-								PerceusInsertLetRhsFrame(
-									current,
-									variable,
-									is_mutable,
-									bind_type,
-									body,
-								),
-								frames,
-							)
-							action = PerceusInsertVisitBindingExpr(rhs)
-					BorrowLetExpr(variable, bind_type, rhs, body):
-						frames = PerceusInsertMoreBindingFrames(
-							PerceusInsertBorrowLetRhsFrame(current, variable, bind_type, body),
-							frames,
-						)
-						action = PerceusInsertVisitBindingExpr(rhs)
-					SeqExpr(first, second):
-						frames = PerceusInsertMoreBindingFrames(
-							PerceusInsertSequenceFirstFrame(current, second),
-							frames,
-						)
-						action = PerceusInsertVisitBindingExpr(first)
-					AssignExpr(variable, rhs, typ, loc):
-						frames = PerceusInsertMoreBindingFrames(
-							PerceusInsertAssignRhsFrame(variable, typ, loc),
-							frames,
-						)
-						action = PerceusInsertVisitBindingExpr(rhs)
-					_:
-						-- A root non-binding expression has no outer binding decision to
-						-- inform. Skipping its reference scan also prevents recursive child
-						-- rewrites from duplicating whole-subtree collection.
-						if managed_binding_frame_count > 0:
-							resolved_values = add_resolved_value_occurrences(
-								resolved_values,
-								current,
-							)
-						else:
-							void
+			match current:
+				LetExpr(variable, is_mutable, bind_type, rhs, body):
+					if is_managed_type(env, bind_type):
+						debug:
+							perceus_work_insert_managed_let_visits()
 
-						action = PerceusInsertRebuildBindingExpr(
-							insert_drops_non_binding_expr(
-								env,
-								current,
-							),
+						plan: PerceusManagedLetPlan = plan_managed_let(
+							env,
+							current,
+							variable,
+							is_mutable,
+							bind_type,
+							rhs,
+							body,
 						)
-			PerceusInsertRebuildBindingExpr(rewritten):
-				debug:
-					perceus_work_insert_rebuild_actions()
-
-					if rewritten.reuses_source:
-						perceus_work_insert_original_nodes_reused()
+						frames = PerceusInsertManagedLetRhsFrame(plan, frames)
+						managed_binding_frame_count += 1
+						visiting = True
+						current_expr = plan.owned_rhs
 					else:
-						perceus_work_insert_node_reconstructions()
+						frames = PerceusInsertLetRhsFrame(
+							current,
+							variable,
+							is_mutable,
+							bind_type,
+							body,
+							frames,
+						)
+						visiting = True
+						current_expr = rhs
+				BorrowLetExpr(variable, bind_type, rhs, body):
+					frames = PerceusInsertBorrowLetRhsFrame(
+						current,
+						variable,
+						bind_type,
+						body,
+						frames,
+					)
+					visiting = True
+					current_expr = rhs
+				SeqExpr(first, second):
+					frames = PerceusInsertSequenceFirstFrame(current, second, frames)
+					visiting = True
+					current_expr = first
+				AssignExpr(variable, rhs, typ, loc):
+					frames = PerceusInsertAssignRhsFrame(variable, typ, loc, frames)
+					visiting = True
+					current_expr = rhs
+				_:
+					-- A root non-binding expression has no outer binding decision to
+					-- inform. Skipping its reference scan also prevents recursive child
+					-- rewrites from duplicating whole-subtree collection.
+					if managed_binding_frame_count > 0:
+						resolved_values = add_resolved_value_occurrences(resolved_values, current)
+					else:
+						void
 
-				match frames:
-					PerceusInsertNoBindingFrame:
-						complete = True
-					PerceusInsertMoreBindingFrames(frame, remaining):
-						frames = remaining
+					visiting = False
+					pending = insert_drops_non_binding_expr(env, current)
+		else:
+			rewritten: PerceusInsertedExpr = pending
 
-						match frame:
-							PerceusInsertManagedLetRhsFrame(plan):
-								frames = PerceusInsertMoreBindingFrames(
-									PerceusInsertManagedLetBodyFrame(plan, rewritten),
-									frames,
-								)
-								action = PerceusInsertVisitBindingExpr(plan.branch_safe_body)
-							PerceusInsertManagedLetBodyFrame(plan, rewritten_rhs):
-								proven_unused: Bool = managed_let_is_proven_unused(
-									env,
-									plan,
-									resolved_values,
-								)
-								direct_consume: Bool = managed_let_has_single_direct_consume(
-									env,
-									plan,
-									rewritten,
-									resolved_values,
-								)
-								ownership_neutral: Bool = (
-									direct_consume
-									or (
-										not plan.is_mutable
-										and is_immortal_value_expr(env, plan.owned_rhs)
-									)
-								)
+			debug:
+				perceus_work_insert_rebuild_actions()
 
-								reuses_source: Bool = (
-									not proven_unused
-									and ownership_neutral
-									and managed_let_reuses_source(plan, rewritten_rhs, rewritten)
-								)
+				if rewritten.reuses_source:
+					perceus_work_insert_original_nodes_reused()
+				else:
+					perceus_work_insert_node_reconstructions()
 
-								rebuilt: CoreExpr = if proven_unused:
-									rebuild_proven_unused_managed_let(
-										plan,
-										rewritten_rhs.expr,
-										rewritten.expr,
-									)
-								else if reuses_source:
-									plan.source
-								else if direct_consume:
-									LetExpr(
-										plan.variable,
-										False,
-										plan.bind_type,
-										rewritten_rhs.expr,
-										rewritten.expr,
-									)
-								else:
-									rebuild_managed_let(
-										env,
-										plan,
-										rewritten_rhs.expr,
-										rewritten.expr,
-									)
+			match frames:
+				PerceusInsertNoBindingFrame:
+					complete = True
+				PerceusInsertManagedLetRhsFrame(plan, remaining):
+					frames = PerceusInsertManagedLetBodyFrame(plan, rewritten, remaining)
+					visiting = True
+					current_expr = plan.branch_safe_body
+				PerceusInsertManagedLetBodyFrame(plan, rewritten_rhs, remaining):
+					frames = remaining
+					proven_unused: Bool = managed_let_is_proven_unused(env, plan, resolved_values)
+					direct_consume: Bool = managed_let_has_single_direct_consume(
+						env,
+						plan,
+						rewritten,
+						resolved_values,
+					)
+					ownership_neutral: Bool = (
+						direct_consume
+						or not plan.is_mutable and is_immortal_value_expr(env, plan.owned_rhs)
+					)
 
-								debug:
-									if reuses_source:
-										perceus_work_insert_managed_let_original_nodes_reused()
-									else:
-										perceus_work_insert_managed_let_reconstructions()
+					reuses_source: Bool = (
+						not proven_unused
+						and ownership_neutral
+						and managed_let_reuses_source(plan, rewritten_rhs, rewritten)
+					)
 
-								resolved_values = without_bound_value(
-									resolved_values,
-									plan.variable,
-								)
-								managed_binding_frame_count -= 1
-								action = PerceusInsertRebuildBindingExpr(
-									inserted_binding_expr(
-										rebuilt,
-										plan.variable,
-										rewritten,
-										reuses_source,
-									),
-								)
-							PerceusInsertLetRhsFrame(source, variable, is_mutable, bind_type, body):
-								frames = PerceusInsertMoreBindingFrames(
-									PerceusInsertLetBodyFrame(
-										source,
-										variable,
-										is_mutable,
-										bind_type,
-										rewritten,
-									),
-									frames,
-								)
-								action = PerceusInsertVisitBindingExpr(body)
-							PerceusInsertLetBodyFrame(source, variable, is_mutable, bind_type, rewritten_rhs):
-								resolved_values = without_bound_value(resolved_values, variable)
-								reuses_source: Bool = (
-									rewritten_rhs.reuses_source
-									and rewritten.reuses_source
-								)
+					rebuilt: CoreExpr = if proven_unused:
+						rebuild_proven_unused_managed_let(plan, rewritten_rhs.expr, rewritten.expr)
+					else if reuses_source:
+						plan.source
+					else if direct_consume:
+						LetExpr(
+							plan.variable,
+							False,
+							plan.bind_type,
+							rewritten_rhs.expr,
+							rewritten.expr,
+						)
+					else:
+						rebuild_managed_let(env, plan, rewritten_rhs.expr, rewritten.expr)
 
-								rebuilt: CoreExpr = if reuses_source:
-									source
-								else:
-									LetExpr(
-										variable,
-										is_mutable,
-										bind_type,
-										rewritten_rhs.expr,
-										rewritten.expr,
-									)
+					debug:
+						if reuses_source:
+							perceus_work_insert_managed_let_original_nodes_reused()
+						else:
+							perceus_work_insert_managed_let_reconstructions()
 
-								action = PerceusInsertRebuildBindingExpr(
-									inserted_binding_expr(
-										rebuilt,
-										variable,
-										rewritten,
-										reuses_source,
-									),
-								)
-							PerceusInsertBorrowLetRhsFrame(source, variable, bind_type, body):
-								frames = PerceusInsertMoreBindingFrames(
-									PerceusInsertBorrowLetBodyFrame(
-										source,
-										variable,
-										bind_type,
-										rewritten,
-									),
-									frames,
-								)
-								action = PerceusInsertVisitBindingExpr(body)
-							PerceusInsertBorrowLetBodyFrame(source, variable, bind_type, rewritten_rhs):
-								resolved_values = without_bound_value(resolved_values, variable)
-								reuses_source: Bool = (
-									rewritten_rhs.reuses_source
-									and rewritten.reuses_source
-								)
+					resolved_values = without_bound_value(resolved_values, plan.variable)
+					managed_binding_frame_count -= 1
+					visiting = False
+					pending = inserted_binding_expr(
+						rebuilt,
+						plan.variable,
+						rewritten,
+						reuses_source,
+					)
+				PerceusInsertLetRhsFrame(source, variable, is_mutable, bind_type, body, remaining):
+					frames = PerceusInsertLetBodyFrame(
+						source,
+						variable,
+						is_mutable,
+						bind_type,
+						rewritten,
+						remaining,
+					)
+					visiting = True
+					current_expr = body
+				PerceusInsertLetBodyFrame(source, variable, is_mutable, bind_type, rewritten_rhs, remaining):
+					frames = remaining
+					resolved_values = without_bound_value(resolved_values, variable)
+					reuses_source: Bool = rewritten_rhs.reuses_source and rewritten.reuses_source
 
-								rebuilt: CoreExpr = if reuses_source:
-									source
-								else:
-									BorrowLetExpr(
-										variable,
-										bind_type,
-										rewritten_rhs.expr,
-										rewritten.expr,
-									)
+					rebuilt: CoreExpr = if reuses_source:
+						source
+					else:
+						LetExpr(variable, is_mutable, bind_type, rewritten_rhs.expr, rewritten.expr)
 
-								action = PerceusInsertRebuildBindingExpr(
-									inserted_binding_expr(
-										rebuilt,
-										variable,
-										rewritten,
-										reuses_source,
-									),
-								)
-							PerceusInsertSequenceFirstFrame(source, second):
-								frames = PerceusInsertMoreBindingFrames(
-									PerceusInsertSequenceSecondFrame(source, rewritten),
-									frames,
-								)
-								action = PerceusInsertVisitBindingExpr(second)
-							PerceusInsertSequenceSecondFrame(source, rewritten_first):
-								action = PerceusInsertRebuildBindingExpr(
-									inserted_sequence(
-										source,
-										rewritten_first,
-										rewritten,
-									),
-								)
-							PerceusInsertAssignRhsFrame(variable, typ, loc):
-								resolved_values = add_resolved_value(resolved_values, variable)
-								action = PerceusInsertRebuildBindingExpr(
-									inserted_expr(
-										rebuild_assignment(env, variable, rewritten.expr, typ, loc),
-										False,
-									),
-								)
+					visiting = False
+					pending = inserted_binding_expr(rebuilt, variable, rewritten, reuses_source)
+				PerceusInsertBorrowLetRhsFrame(source, variable, bind_type, body, remaining):
+					frames = PerceusInsertBorrowLetBodyFrame(
+						source,
+						variable,
+						bind_type,
+						rewritten,
+						remaining,
+					)
+					visiting = True
+					current_expr = body
+				PerceusInsertBorrowLetBodyFrame(source, variable, bind_type, rewritten_rhs, remaining):
+					frames = remaining
+					resolved_values = without_bound_value(resolved_values, variable)
+					reuses_source: Bool = rewritten_rhs.reuses_source and rewritten.reuses_source
 
-	-- Completion leaves the final result in the action itself. Reading it here
-	-- avoids allocating a placeholder PerceusInsertedExpr before every walk.
-	match action:
-		PerceusInsertRebuildBindingExpr(rewritten):
-			rewritten
-		PerceusInsertVisitBindingExpr(current):
-			-- The loop can exit only from the rebuild arm. Preserve a total,
-			-- non-panicking function if that state-machine invariant changes.
-			inserted_expr(current, True)
+					rebuilt: CoreExpr = if reuses_source:
+						source
+					else:
+						BorrowLetExpr(variable, bind_type, rewritten_rhs.expr, rewritten.expr)
+
+					visiting = False
+					pending = inserted_binding_expr(rebuilt, variable, rewritten, reuses_source)
+				PerceusInsertSequenceFirstFrame(source, second, remaining):
+					frames = PerceusInsertSequenceSecondFrame(source, rewritten, remaining)
+					visiting = True
+					current_expr = second
+				PerceusInsertSequenceSecondFrame(source, rewritten_first, remaining):
+					frames = remaining
+					visiting = False
+					pending = inserted_sequence(source, rewritten_first, rewritten)
+				PerceusInsertAssignRhsFrame(variable, typ, loc, remaining):
+					frames = remaining
+					resolved_values = add_resolved_value(resolved_values, variable)
+					visiting = False
+					pending = inserted_expr(
+						rebuild_assignment(env, variable, rewritten.expr, typ, loc),
+						False,
+					)
+
+	pending
 
 
 private pure func insert_drops_expr_inner(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
@@ -24847,116 +24764,88 @@ private pure func normalize_lambda_result_aliases_non_binding(
 
 private pure func normalize_lambda_result_aliases(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
 	var frames: PerceusLambdaNormalizeFrameStack = PerceusLambdaNormalizeNoFrame
-	var action: PerceusLambdaNormalizeAction = PerceusLambdaNormalizeVisitExpr(expr)
+	var visiting: Bool = True
+	var current_expr: CoreExpr = expr
+	var pending: CoreExpr = expr
 	var result: CoreExpr = expr
 	var complete: Bool = False
 
 	while not complete:
-		match action:
-			PerceusLambdaNormalizeVisitExpr(current):
-				match current:
-					LetExpr(variable, is_mutable, typ, rhs, body):
-						frames = PerceusLambdaNormalizeMoreFrames(
-							PerceusLambdaNormalizeLetRhsFrame(variable, is_mutable, typ, body),
-							frames,
-						)
-						action = PerceusLambdaNormalizeVisitExpr(rhs)
-					BorrowLetExpr(variable, typ, rhs, body):
-						frames = PerceusLambdaNormalizeMoreFrames(
-							PerceusLambdaNormalizeBorrowLetRhsFrame(variable, typ, body),
-							frames,
-						)
-						action = PerceusLambdaNormalizeVisitExpr(rhs)
-					SeqExpr(first, second):
-						frames = PerceusLambdaNormalizeMoreFrames(
-							PerceusLambdaNormalizeSequenceFirstFrame(second),
-							frames,
-						)
-						action = PerceusLambdaNormalizeVisitExpr(first)
-					AssignExpr(variable, rhs, typ, loc):
-						frames = PerceusLambdaNormalizeMoreFrames(
-							PerceusLambdaNormalizeAssignRhsFrame(variable, typ, loc),
-							frames,
-						)
-						action = PerceusLambdaNormalizeVisitExpr(rhs)
-					_:
-						action = PerceusLambdaNormalizeRebuildExpr(
-							normalize_lambda_result_aliases_non_binding(
-								env,
-								current,
-							),
-						)
-			PerceusLambdaNormalizeRebuildExpr(normalized):
-				match frames:
-					PerceusLambdaNormalizeNoFrame:
-						result = normalized
-						complete = True
-					PerceusLambdaNormalizeMoreFrames(frame, remaining):
-						frames = remaining
+		if visiting:
+			current: CoreExpr = current_expr
 
-						match frame:
-							PerceusLambdaNormalizeLetRhsFrame(variable, is_mutable, typ, body):
-								frames = PerceusLambdaNormalizeMoreFrames(
-									PerceusLambdaNormalizeLetBodyFrame(
-										variable,
-										is_mutable,
-										typ,
-										normalized,
-									),
-									frames,
-								)
-								action = PerceusLambdaNormalizeVisitExpr(body)
-							PerceusLambdaNormalizeLetBodyFrame(variable, is_mutable, typ, normalized_rhs):
-								action = PerceusLambdaNormalizeRebuildExpr(
-									LetExpr(
-										variable,
-										is_mutable,
-										typ,
-										normalized_rhs,
-										normalized,
-									),
-								)
-							PerceusLambdaNormalizeBorrowLetRhsFrame(variable, typ, body):
-								frames = PerceusLambdaNormalizeMoreFrames(
-									PerceusLambdaNormalizeBorrowLetBodyFrame(
-										variable,
-										typ,
-										normalized,
-									),
-									frames,
-								)
-								action = PerceusLambdaNormalizeVisitExpr(body)
-							PerceusLambdaNormalizeBorrowLetBodyFrame(variable, typ, normalized_rhs):
-								action = PerceusLambdaNormalizeRebuildExpr(
-									BorrowLetExpr(
-										variable,
-										typ,
-										normalized_rhs,
-										normalized,
-									),
-								)
-							PerceusLambdaNormalizeSequenceFirstFrame(second):
-								frames = PerceusLambdaNormalizeMoreFrames(
-									PerceusLambdaNormalizeSequenceSecondFrame(normalized),
-									frames,
-								)
-								action = PerceusLambdaNormalizeVisitExpr(second)
-							PerceusLambdaNormalizeSequenceSecondFrame(normalized_first):
-								action = PerceusLambdaNormalizeRebuildExpr(
-									SeqExpr(
-										normalized_first,
-										normalized,
-									),
-								)
-							PerceusLambdaNormalizeAssignRhsFrame(variable, typ, loc):
-								action = PerceusLambdaNormalizeRebuildExpr(
-									AssignExpr(
-										variable,
-										normalized,
-										typ,
-										loc,
-									),
-								)
+			match current:
+				LetExpr(variable, is_mutable, typ, rhs, body):
+					frames = PerceusLambdaNormalizeLetRhsFrame(
+						variable,
+						is_mutable,
+						typ,
+						body,
+						frames,
+					)
+					visiting = True
+					current_expr = rhs
+				BorrowLetExpr(variable, typ, rhs, body):
+					frames = PerceusLambdaNormalizeBorrowLetRhsFrame(variable, typ, body, frames)
+					visiting = True
+					current_expr = rhs
+				SeqExpr(first, second):
+					frames = PerceusLambdaNormalizeSequenceFirstFrame(second, frames)
+					visiting = True
+					current_expr = first
+				AssignExpr(variable, rhs, typ, loc):
+					frames = PerceusLambdaNormalizeAssignRhsFrame(variable, typ, loc, frames)
+					visiting = True
+					current_expr = rhs
+				_:
+					visiting = False
+					pending = normalize_lambda_result_aliases_non_binding(env, current)
+		else:
+			normalized: CoreExpr = pending
+
+			match frames:
+				PerceusLambdaNormalizeNoFrame:
+					result = normalized
+					complete = True
+				PerceusLambdaNormalizeLetRhsFrame(variable, is_mutable, typ, body, remaining):
+					frames = PerceusLambdaNormalizeLetBodyFrame(
+						variable,
+						is_mutable,
+						typ,
+						normalized,
+						remaining,
+					)
+					visiting = True
+					current_expr = body
+				PerceusLambdaNormalizeLetBodyFrame(variable, is_mutable, typ, normalized_rhs, remaining):
+					frames = remaining
+					visiting = False
+					pending = LetExpr(variable, is_mutable, typ, normalized_rhs, normalized)
+				PerceusLambdaNormalizeBorrowLetRhsFrame(variable, typ, body, remaining):
+					frames = PerceusLambdaNormalizeBorrowLetBodyFrame(
+						variable,
+						typ,
+						normalized,
+						remaining,
+					)
+					visiting = True
+					current_expr = body
+				PerceusLambdaNormalizeBorrowLetBodyFrame(variable, typ, normalized_rhs, remaining):
+					frames = remaining
+					visiting = False
+					pending = BorrowLetExpr(variable, typ, normalized_rhs, normalized)
+				PerceusLambdaNormalizeSequenceFirstFrame(second, remaining):
+					frames = PerceusLambdaNormalizeSequenceSecondFrame(normalized, remaining)
+					visiting = True
+					current_expr = second
+				PerceusLambdaNormalizeSequenceSecondFrame(normalized_first, remaining):
+					frames = remaining
+					visiting = False
+					pending = SeqExpr(normalized_first, normalized)
+				PerceusLambdaNormalizeAssignRhsFrame(variable, typ, loc, remaining):
+					frames = remaining
+					visiting = False
+					pending = AssignExpr(variable, normalized, typ, loc)
 
 	result
 
