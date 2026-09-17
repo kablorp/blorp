@@ -25575,58 +25575,128 @@ private pure func balance_consumed_param_bodies(
 		result
 
 
+--- A reused depth-first worklist. Growing a pending list by concatenation
+--- copies every entry already on it, which is quadratic in the node count, and
+--- the largest generated body in a self-compile holds more than two hundred
+--- thousand nodes. Overwrite the slot the pop just freed instead, exactly as
+--- the logical-tree mapper does, so one allocation serves the whole walk.
+private record ShortCircuitScanStack {
+	nodes: List[CoreExpr],
+	operand_flags: List[Bool],
+	count: Int
+}
+
+
+private pure func push_short_circuit_scan(
+	stack: ShortCircuitScanStack,
+	node: CoreExpr,
+	inside_operand: Bool,
+) -> ShortCircuitScanStack:
+	nodes: List[CoreExpr] = if stack.count < stack.nodes.length():
+		stack.nodes.set(stack.count, node)
+	else:
+		stack.nodes.append(node)
+	operand_flags: List[Bool] = if stack.count < stack.operand_flags.length():
+		stack.operand_flags.set(stack.count, inside_operand)
+	else:
+		stack.operand_flags.append(inside_operand)
+
+	{ stack |
+		nodes = nodes,
+		operand_flags = operand_flags,
+		count = stack.count + 1
+	}
+
+
+private pure func push_short_circuit_scan_children(
+	stack: ShortCircuitScanStack,
+	node: CoreExpr,
+	inside_operand: Bool,
+) -> ShortCircuitScanStack:
+	var result: ShortCircuitScanStack = stack
+
+	for child in CoreTraverse.immediate_core_expr_children(node):
+		result = push_short_circuit_scan(result, child, inside_operand)
+
+	result
+
+
 --- A logical operator only evaluates its right operand when the left operand
 --- does not already decide the result, so that operand is a branch with no
 --- expression to carry the other path. An ownership transfer inside it is
 --- therefore unbalanceable: the enclosing region would count the transfer on
 --- every path, and the short-circuited path would keep the reference alive
---- forever. Scan for the only shape that can transfer, a call under a right
---- operand, before paying for the rewrite walk.
+--- forever. Look for the only shape that can transfer, a call under a right
+--- operand, before paying for the rewrite walk. Each pushed node carries
+--- whether it already sits under a right operand, so a nested operator
+--- inherits the answer instead of rescanning its subtree.
 private pure func has_short_circuit_operand_call(expr: CoreExpr) -> Bool:
-	var pending: List[CoreExpr] = [expr]
-	var index: Int = 0
+	var stack: ShortCircuitScanStack = push_short_circuit_scan(
+		{
+			nodes = [],
+			operand_flags = [],
+			count = 0
+		},
+		expr,
+		False,
+	)
 	var found: Bool = False
 
-	while not found and index < pending.length():
-		match pending.get(index):
-			Some(node):
+	while not found and stack.count > 0:
+		index: Int = stack.count - 1
+		stack = { stack | count = index }
+
+		match (stack.nodes.get(index), stack.operand_flags.get(index)):
+			(Some(node), Some(inside_operand)):
 				match node:
 					LogicalExpr(op, left, right, typ, loc):
-						if subtree_contains_call(right):
+						stack = push_short_circuit_scan(stack, left, inside_operand)
+						stack = push_short_circuit_scan(stack, right, True)
+					CallExpr(kind, callee, args, typ, loc):
+						if inside_operand:
 							found = True
 						else:
-							pending = pending.concat(
-								CoreTraverse.immediate_core_expr_children(node),
-							)
+							stack = push_short_circuit_scan_children(stack, node, inside_operand)
 					_:
-						pending = pending.concat(CoreTraverse.immediate_core_expr_children(node))
-			None:
+						stack = push_short_circuit_scan_children(stack, node, inside_operand)
+			_:
 				void
-
-		index += 1
 
 	found
 
 
-private pure func subtree_contains_call(expr: CoreExpr) -> Bool:
-	var pending: List[CoreExpr] = [expr]
-	var index: Int = 0
-	var found: Bool = False
+--- Every name the expression reads, collected in one walk. The owner loop
+--- otherwise asks `count_uses` per owner, and owners accumulate with every
+--- enclosing immutable binding, so that walks the operand once per owner.
+private pure func short_circuit_operand_read_names(expr: CoreExpr) -> Dict[String, Bool]:
+	var stack: ShortCircuitScanStack = push_short_circuit_scan(
+		{
+			nodes = [],
+			operand_flags = [],
+			count = 0
+		},
+		expr,
+		False,
+	)
+	var names: Dict[String, Bool] = {}
 
-	while not found and index < pending.length():
-		match pending.get(index):
+	while stack.count > 0:
+		index: Int = stack.count - 1
+		stack = { stack | count = index }
+
+		match stack.nodes.get(index):
 			Some(node):
 				match node:
-					CallExpr(kind, callee, args, typ, loc):
-						found = True
+					VarExpr(variable, typ, loc):
+						names = names.set(variable.name, True)
 					_:
-						pending = pending.concat(CoreTraverse.immediate_core_expr_children(node))
+						void
+
+				stack = push_short_circuit_scan_children(stack, node, False)
 			None:
 				void
 
-		index += 1
-
-	found
+	names
 
 
 --- The owners a short-circuit operand may take a reference from: the enclosing
@@ -25649,9 +25719,12 @@ private pure func own_short_circuit_operand(
 	operand: CoreExpr,
 ) -> CoreExpr:
 	var result: CoreExpr = operand
+	read_names: Dict[String, Bool] = short_circuit_operand_read_names(operand)
 
 	for owner in context.owners:
-		if count_uses(owner.name.name, operand) > 0:
+		-- A name the operand never reads cannot transfer it. The summary stays
+		-- the authority for the ones it does read.
+		if read_names.contains(owner.name.name):
 			consumed_refs: Int = summarize_linear_ownership_uses(
 				context.env,
 				owner.name.name,
