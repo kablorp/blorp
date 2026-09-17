@@ -5,19 +5,23 @@
 -- The installation target carries importer-local naming separately, so parsed
 -- declarations are not replayed at this boundary.
 import:
-	../../stage_04_modules/module_table: ModuleId, module_ids_equal
+	../../stage_04_modules/module_table: ModuleId, module_id_table_index, module_ids_equal
 	../graph/indexed_graph: PreparedModuleScope, prepared_module_scope_id
 	../modules/module_view:
 		module_view_accepted_alias_authority,
 		module_view_accepted_record_authority,
 		module_view_accepted_union_authority,
 	../state:
+		KnownTypeIndex,
+		TypeHomeIndex,
 		TypecheckState,
+		known_type_index_empty,
+		known_type_index_record_resource,
+		known_type_index_record_type,
+		type_home_index_empty,
+		type_home_index_record,
 		typecheck_state_add_error,
-		typecheck_state_add_known_resource_type_name,
-		typecheck_state_add_known_type_name,
 		typecheck_state_allows_builtin,
-		typecheck_state_record_type_home,
 	../type_system/accepted_alias_authority: accepted_alias_contains
 	../type_system/accepted_record_authority: accepted_record_contains
 	../type_system/context: register_resource_cleanup
@@ -31,7 +35,6 @@ import:
 		env_add_accepted_opaque_alias,
 		env_add_accepted_record,
 		env_add_accepted_type,
-		env_add_accepted_type_containment,
 		env_add_accepted_type_with_constructor_ids,
 	../type_system/language_surface_manifest: prelude_type_name
 	../type_system/semantic_type:
@@ -97,13 +100,11 @@ import:
 		TypeHeaderVariant,
 		UnionLayout(FieldlessEnum, TaggedUnion),
 		alias_type_header_containment_facts,
-		alias_type_header_id,
 		alias_type_header_layout,
 		alias_type_header_parameters,
 		alias_type_header_source_name,
 		alias_type_header_target,
 		builtin_type_header_containment_facts,
-		builtin_type_header_id,
 		builtin_type_header_layout,
 		builtin_type_header_parameters,
 		builtin_type_header_source_name,
@@ -113,7 +114,6 @@ import:
 		record_type_header_containment_facts,
 		record_type_header_contains_resource,
 		record_type_header_fields,
-		record_type_header_id,
 		record_type_header_layout,
 		record_type_header_parameters,
 		record_type_header_source_name,
@@ -131,7 +131,6 @@ import:
 		type_header_graph_public_union_headers_for_scope,
 		union_type_header_containment_facts,
 		union_type_header_contains_resource,
-		union_type_header_id,
 		union_type_header_layout,
 		union_type_header_parameters,
 		union_type_header_source_name,
@@ -140,9 +139,11 @@ import:
 	type_resolution: add_imported_accepted_type_aliases
 
 
-private union BuiltinHeaderInstallation:
-	LocalBuiltinInstallation(String)
-	ImportedBuiltinInstallation(String)
+private enum HeaderInstallCategory:
+	BuiltinHeaderCategory
+	RecordHeaderCategory
+	UnionHeaderCategory
+	AliasHeaderCategory
 
 
 private union TypeHeaderInstallation:
@@ -172,72 +173,6 @@ private pure func type_header_installation_scope(
 			scope
 		ImportedTypeHeaderInstallation(scope, _):
 			scope
-
-
-private pure func type_header_installation_path(installation: TypeHeaderInstallation) -> String:
-	match installation:
-		LocalTypeHeaderInstallation(_, path):
-			path
-		ImportedTypeHeaderInstallation(_, path):
-			path
-
-
-private pure func installed_type_name(
-	source_name: String,
-	installation: TypeHeaderInstallation,
-) -> String:
-	match installation:
-		LocalTypeHeaderInstallation(_, _):
-			source_name
-		ImportedTypeHeaderInstallation(_, path):
-			canonical_module_type_name(path, source_name)
-
-
-private pure func record_installed_type_home(
-	state: TypecheckState,
-	type_name: String,
-	installation: TypeHeaderInstallation,
-) -> TypecheckState:
-	module_path = type_header_installation_path(installation)
-
-	match installation:
-		LocalTypeHeaderInstallation(_, _):
-			typecheck_state_record_type_home(state, type_name, module_path, False)
-		ImportedTypeHeaderInstallation(_, _):
-			typecheck_state_record_type_home(state, type_name, module_path, True)
-
-
-private pure func finalize_installed_type(
-	state: TypecheckState,
-	source_name: String,
-	type_name: String,
-	type_parameters: List[String],
-	installation: TypeHeaderInstallation,
-) -> TypecheckState:
-	module_path = type_header_installation_path(installation)
-	-- Read what `module_view` tells us before consuming `state` below. Reading
-	-- `state.module_view` after `record_installed_type_home(state, ...)` (the
-	-- original order) uses `state` twice, which keeps it live/borrowed across
-	-- that call and forces the type-home dict to copy instead of update in
-	-- place; reading it first leaves the call below as `state`'s only
-	-- remaining use.
-	has_alias_authority = module_view_accepted_alias_authority(state.module_view).is_some()
-	with_home = record_installed_type_home(state, type_name, installation)
-
-	if has_alias_authority:
-		with_home
-	else:
-		match installation:
-			LocalTypeHeaderInstallation(_, _):
-				with_home
-			ImportedTypeHeaderInstallation(_, _):
-				add_imported_accepted_type_aliases(
-					with_home,
-					module_path,
-					source_name,
-					type_name,
-					type_parameters,
-				)
 
 
 private pure func resolved_declared_type_name(
@@ -579,63 +514,108 @@ private pure func env_containment_summary(facts: TypeContainmentFacts) -> TypeCo
 	}
 
 
-private pure func install_builtin_header(
-	state: TypecheckState,
+-- Per-module header facts, built once per module and read by every importer.
+-- Everything here is a projection of the imported module's own headers: the
+-- installed spelling, its type parameters, and the layout-derived kind. None
+-- of it depends on the importing module, so the per-edge install reads these
+-- instead of recomputing a canonical name and a parameter-name list for every
+-- (importer, imported) pair.
+record InstalledBuiltinHeaderFacts {
+	accepted_header: AcceptedBuiltinHeader,
+	source_name: String,
+	type_name: String,
+	type_parameters: List[String],
+	type_kind: TypeKind,
+	is_resource: Bool,
+	cleanup: Option[String],
+	containment: TypeContainmentSummary
+}
+
+
+record InstalledRecordHeaderFacts {
+	accepted_header: AcceptedRecordHeader,
+	source_name: String,
+	type_name: String,
+	type_parameters: List[String]
+}
+
+
+record InstalledUnionHeaderFacts {
+	accepted_header: AcceptedUnionHeader,
+	source_name: String,
+	type_name: String,
+	type_parameters: List[String]
+}
+
+
+record InstalledAliasHeaderFacts {
+	accepted_header: AcceptedAliasHeader,
+	source_name: String,
+	type_name: String,
+	type_parameters: List[String],
+	layout: AliasLayout
+}
+
+
+-- One module's header product for one installation side. `imported` selects
+-- both the header set (public versus local) and the installed spelling, and
+-- is also the gate the per-edge install consults for imported-alias bindings.
+record ModuleHeaderSection {
+	module_scope: PreparedModuleScope,
+	module_path: String,
+	imported: Bool,
+	builtins: List[InstalledBuiltinHeaderFacts],
+	records: List[InstalledRecordHeaderFacts],
+	unions: List[InstalledUnionHeaderFacts],
+	aliases: List[InstalledAliasHeaderFacts]
+}
+
+
+record ModuleHeaderProduct {
+	local: Option[ModuleHeaderSection],
+	imported: Option[ModuleHeaderSection]
+}
+
+
+opaque type ModuleHeaderProductTable = List[ModuleHeaderProduct]
+
+private EMPTY_MODULE_HEADER_PRODUCT: ModuleHeaderProduct = {
+	local = None,
+	imported = None
+}
+
+
+private pure func section_installation(section: ModuleHeaderSection) -> TypeHeaderInstallation:
+	if section.imported:
+		ImportedTypeHeaderInstallation(section.module_scope, section.module_path)
+	else:
+		LocalTypeHeaderInstallation(section.module_scope, section.module_path)
+
+
+private pure func installed_header_name(
+	source_name: String,
+	module_path: String,
+	imported: Bool,
+) -> String:
+	if imported:
+		canonical_module_type_name(module_path, source_name)
+	else:
+		source_name
+
+
+private pure func builtin_header_facts(
 	header: AcceptedBuiltinHeader,
-	installation: BuiltinHeaderInstallation,
-) -> TypecheckState:
+	module_path: String,
+	imported: Bool,
+) -> InstalledBuiltinHeaderFacts:
 	source_name = builtin_type_header_source_name(header)
-
-	module_path = match installation:
-		LocalBuiltinInstallation(path):
-			path
-		ImportedBuiltinInstallation(path):
-			path
-
-	type_name = match installation:
-		LocalBuiltinInstallation(_):
-			source_name
-		ImportedBuiltinInstallation(path):
-			canonical_module_type_name(path, source_name)
-
 	layout = builtin_type_header_layout(header)
-	type_parameters = builtin_type_header_parameters(
-		header,
-	).map(
-		func(parameter): type_parameter_id_name(parameter.id),
-	)
 
 	is_resource = match layout:
 		ScalarBuiltin | ManagedBuiltin | NoValueBuiltin | UnclassifiedBuiltin:
 			False
 		ResourceBuiltin(_):
 			True
-
-	var next = match installation:
-		LocalBuiltinInstallation(_):
-			if typecheck_state_allows_builtin(state):
-				state
-			else:
-				prefix = if is_resource:
-					"resource type "
-				else:
-					"type "
-
-				typecheck_state_add_error(
-					state,
-					"'" + prefix + source_name + " = builtin' can only be used in the standard library",
-				)
-		ImportedBuiltinInstallation(_):
-			state
-
-	next = if is_resource:
-		typecheck_state_add_known_resource_type_name(next, type_name)
-	else:
-		match installation:
-			LocalBuiltinInstallation(_):
-				typecheck_state_add_known_type_name(next, type_name)
-			ImportedBuiltinInstallation(_):
-				next
 
 	type_kind = match layout:
 		ScalarBuiltin:
@@ -645,51 +625,229 @@ private pure func install_builtin_header(
 		ManagedBuiltin | NoValueBuiltin | UnclassifiedBuiltin:
 			TypeBuiltin
 
-	env: Env = env_add_accepted_type(
-		next.env,
-		type_name,
-		type_parameters,
-		[],
-		type_kind,
-		is_resource,
-		False,
-		env_containment_summary(builtin_type_header_containment_facts(header)),
-	)
-	with_env = { next | env = env }
-
-	with_cleanup = match layout:
-		ResourceBuiltin(ResourceWithCleanup(cleanup)):
-			{ with_env | context = register_resource_cleanup(with_env.context, type_name, cleanup) }
+	cleanup = match layout:
+		ResourceBuiltin(ResourceWithCleanup(cleanup_function)):
+			Some(cleanup_function)
 		ResourceBuiltin(ResourceWithoutCleanup):
-			with_env
+			None
 		ScalarBuiltin | ManagedBuiltin | NoValueBuiltin | UnclassifiedBuiltin:
-			with_env
+			None
 
-	with_home = match installation:
-		LocalBuiltinInstallation(_):
-			typecheck_state_record_type_home(with_cleanup, type_name, module_path, False)
-		ImportedBuiltinInstallation(_):
-			typecheck_state_record_type_home(with_cleanup, type_name, module_path, True)
+	{
+		accepted_header = header,
+		source_name = source_name,
+		type_name = installed_header_name(source_name, module_path, imported),
+		type_parameters = builtin_type_header_parameters(
+			header,
+		).map(
+			func(parameter): type_parameter_id_name(parameter.id),
+		),
+		type_kind = type_kind,
+		is_resource = is_resource,
+		cleanup = cleanup,
+		containment = env_containment_summary(builtin_type_header_containment_facts(header))
+	}
 
-	match module_view_accepted_alias_authority(state.module_view):
-		Some(_):
-			with_home
+
+private pure func record_header_facts(
+	header: AcceptedRecordHeader,
+	module_path: String,
+	imported: Bool,
+) -> InstalledRecordHeaderFacts:
+	source_name = record_type_header_source_name(header)
+	{
+		accepted_header = header,
+		source_name = source_name,
+		type_name = installed_header_name(source_name, module_path, imported),
+		type_parameters = record_type_header_parameters(
+			header,
+		).map(
+			func(parameter): type_parameter_id_name(parameter.id),
+		)
+	}
+
+
+private pure func union_header_facts(
+	header: AcceptedUnionHeader,
+	module_path: String,
+	imported: Bool,
+) -> InstalledUnionHeaderFacts:
+	source_name = union_type_header_source_name(header)
+	{
+		accepted_header = header,
+		source_name = source_name,
+		type_name = installed_header_name(source_name, module_path, imported),
+		type_parameters = union_type_header_parameters(
+			header,
+		).map(
+			func(parameter): type_parameter_id_name(parameter.id),
+		)
+	}
+
+
+private pure func alias_header_facts(
+	header: AcceptedAliasHeader,
+	module_path: String,
+	imported: Bool,
+) -> InstalledAliasHeaderFacts:
+	source_name = alias_type_header_source_name(header)
+	{
+		accepted_header = header,
+		source_name = source_name,
+		type_name = installed_header_name(source_name, module_path, imported),
+		type_parameters = alias_type_header_parameters(
+			header,
+		).map(
+			func(parameter): type_parameter_id_name(parameter.id),
+		),
+		layout = alias_type_header_layout(header)
+	}
+
+
+-- The header product builder: local `var` accumulators, one published
+-- immutable section. Category order here is the install order every importer
+-- replays, so diagnostics keep the order they had when each category re-ran
+-- its own loop.
+pure func module_header_section_build(
+	graph: TypeHeaderGraph,
+	module_scope: PreparedModuleScope,
+	module_path: String,
+	imported: Bool,
+) -> ModuleHeaderSection:
+	var builtins: List[InstalledBuiltinHeaderFacts] = []
+	var records: List[InstalledRecordHeaderFacts] = []
+	var unions: List[InstalledUnionHeaderFacts] = []
+	var aliases: List[InstalledAliasHeaderFacts] = []
+
+	builtin_headers = if imported:
+		type_header_graph_public_builtin_headers_for_scope(graph, module_scope)
+	else:
+		type_header_graph_local_builtin_headers_for_scope(graph, module_scope)
+
+	for header in builtin_headers:
+		builtins = builtins.append(builtin_header_facts(header, module_path, imported))
+
+	record_headers = if imported:
+		type_header_graph_public_record_headers_for_scope(graph, module_scope)
+	else:
+		type_header_graph_local_record_headers_for_scope(graph, module_scope)
+
+	for header in record_headers:
+		records = records.append(record_header_facts(header, module_path, imported))
+
+	union_headers = if imported:
+		type_header_graph_public_union_headers_for_scope(graph, module_scope)
+	else:
+		type_header_graph_local_union_headers_for_scope(graph, module_scope)
+
+	for header in union_headers:
+		unions = unions.append(union_header_facts(header, module_path, imported))
+
+	alias_headers = if imported:
+		type_header_graph_public_alias_headers_for_scope(graph, module_scope)
+	else:
+		type_header_graph_local_alias_headers_for_scope(graph, module_scope)
+
+	for header in alias_headers:
+		aliases = aliases.append(alias_header_facts(header, module_path, imported))
+
+	{
+		module_scope = module_scope,
+		module_path = module_path,
+		imported = imported,
+		builtins = builtins,
+		records = records,
+		unions = unions,
+		aliases = aliases
+	}
+
+
+pure func module_header_product_table_empty(module_count: Int) -> ModuleHeaderProductTable:
+	into_opaque ModuleHeaderProductTable(EMPTY_MODULE_HEADER_PRODUCT.repeat(module_count))
+
+
+private pure func module_header_product_at(
+	table: ModuleHeaderProductTable,
+	module_scope: PreparedModuleScope,
+) -> Option[ModuleHeaderProduct]:
+	products = from_opaque ModuleHeaderProductTable(table)
+	products.get(module_id_table_index(prepared_module_scope_id(module_scope)))
+
+
+private pure func module_header_section_matches(
+	section: ModuleHeaderSection,
+	module_path: String,
+	imported: Bool,
+) -> Bool:
+	section.imported == imported and section.module_path == module_path
+
+
+-- Memoization is a whole-table rebuild on a miss and a read on a hit; misses
+-- happen once per module, hits once per importer edge.
+pure func module_header_product_table_ensure(
+	table: ModuleHeaderProductTable,
+	graph: TypeHeaderGraph,
+	module_scope: PreparedModuleScope,
+	module_path: String,
+	imported: Bool,
+) -> ModuleHeaderProductTable:
+	index = module_id_table_index(prepared_module_scope_id(module_scope))
+	products = from_opaque ModuleHeaderProductTable(table)
+
+	current = match products.get(index):
+		Some(product):
+			product
 		None:
-			match installation:
-				LocalBuiltinInstallation(_):
-					with_home
-				ImportedBuiltinInstallation(_):
-					add_imported_accepted_type_aliases(
-						with_home,
-						module_path,
-						source_name,
-						type_name,
-						type_parameters,
-					)
+			EMPTY_MODULE_HEADER_PRODUCT
+
+	existing = if imported:
+		current.imported
+	else:
+		current.local
+
+	already_present = match existing:
+		Some(section):
+			module_header_section_matches(section, module_path, imported)
+		None:
+			False
+
+	if already_present:
+		into_opaque ModuleHeaderProductTable(products)
+	else:
+		section = module_header_section_build(graph, module_scope, module_path, imported)
+
+		next_product = if imported:
+			{ current | imported = Some(section) }
+		else:
+			{ current | local = Some(section) }
+
+		into_opaque ModuleHeaderProductTable(products.set(index, next_product))
 
 
-private pure func record_header_type_parameters(header: AcceptedRecordHeader) -> List[String]:
-	record_type_header_parameters(header).map(func(parameter): type_parameter_id_name(parameter.id))
+pure func module_header_product_table_section(
+	table: ModuleHeaderProductTable,
+	graph: TypeHeaderGraph,
+	module_scope: PreparedModuleScope,
+	module_path: String,
+	imported: Bool,
+) -> ModuleHeaderSection:
+	cached = match module_header_product_at(table, module_scope):
+		Some(product):
+			if imported:
+				product.imported
+			else:
+				product.local
+		None:
+			None
+
+	match cached:
+		Some(section):
+			if module_header_section_matches(section, module_path, imported):
+				section
+			else:
+				module_header_section_build(graph, module_scope, module_path, imported)
+		None:
+			module_header_section_build(graph, module_scope, module_path, imported)
 
 
 private pure func record_header_fields(
@@ -728,66 +886,6 @@ pure func imported_record_header_fields(
 		header,
 		ImportedTypeHeaderInstallation(module_scope, module_path),
 	)
-
-
-private pure func install_record_header(
-	state: TypecheckState,
-	graph: TypeHeaderGraph,
-	header: AcceptedRecordHeader,
-	installation: TypeHeaderInstallation,
-) -> TypecheckState:
-	source_name = record_type_header_source_name(header)
-	type_name = installed_type_name(source_name, installation)
-	type_parameters = record_header_type_parameters(header)
-
-	match module_view_accepted_record_authority(state.module_view):
-		Some(authority):
-			if accepted_record_contains(authority, type_name):
-				finalize_installed_type(
-					state,
-					source_name,
-					type_name,
-					type_parameters,
-					installation,
-				)
-			else:
-				typecheck_state_add_error(
-					state,
-					"internal typecheck error: accepted record authority is missing '" + type_name + "'",
-				)
-		None:
-			containment = env_containment_summary(record_type_header_containment_facts(header))
-
-			match record_header_fields(graph, header, installation):
-				None:
-					typecheck_state_add_error(
-						state,
-						"internal typecheck error: accepted record header '" + type_name + "' refers to a module absent from its type-header graph",
-					)
-				Some(fields):
-					is_value = match record_type_header_layout(header):
-						HeapRecord:
-							False
-						ValueStruct:
-							True
-
-					env = env_add_accepted_record(
-						state.env,
-						type_name,
-						type_parameters,
-						fields,
-						is_value,
-						record_type_header_contains_resource(header),
-						containment,
-					)
-
-					finalize_installed_type(
-						{ state | env = env },
-						source_name,
-						type_name,
-						type_parameters,
-						installation,
-					)
 
 
 private pure func installed_union_variant(
@@ -860,179 +958,353 @@ pure func imported_union_header_variants(
 	)
 
 
-private pure func install_union_header(
+-- The header installer: one builder over a published section, with the
+-- session state as a single `var` accumulator that every write updates in
+-- place. Helpers above compute values; none of them takes or returns the
+-- session, which is what keeps the type-home and known-type dictionaries and
+-- the environment uniquely owned across the whole section instead of copying
+-- once per inserted name.
+pure func typecheck_install_module_header_section(
 	state: TypecheckState,
 	graph: TypeHeaderGraph,
-	header: AcceptedUnionHeader,
-	installation: TypeHeaderInstallation,
+	section: ModuleHeaderSection,
 ) -> TypecheckState:
-	source_name = union_type_header_source_name(header)
-	type_name = installed_type_name(source_name, installation)
+	module_path = section.module_path
+	imported = section.imported
+	installation = section_installation(section)
+	record_authority = module_view_accepted_record_authority(state.module_view)
+	union_authority = module_view_accepted_union_authority(state.module_view)
+	alias_authority = module_view_accepted_alias_authority(state.module_view)
+	has_alias_authority = alias_authority.is_some()
+	binds_imported_aliases = imported and not has_alias_authority
+	allows_builtin = typecheck_state_allows_builtin(state)
+	var acc = state
+	-- The two fact tables this builder writes are hoisted into their own
+	-- local owners and folded back once at the end, the pattern
+	-- `docs/MEMORY_MODEL.md` prescribes for a collection field updated in a
+	-- loop. Left on the session they are reachable from two places at every
+	-- insert, and the opaque unwrap inside the index helper retains its
+	-- borrowed argument, so `Dict.set` copied the whole table on every
+	-- installed name.
+	var type_homes: TypeHomeIndex = acc.type_homes
+	var known_types: KnownTypeIndex = acc.known_type_index
+	acc = { acc |
+		type_homes = type_home_index_empty(),
+		known_type_index = known_type_index_empty()
+	}
 
-	match module_view_accepted_union_authority(state.module_view):
-		Some(_):
-			-- Graph completion constructed this authority from these exact headers.
-			-- Accepted installation retains only spelling provenance; union payload,
-			-- constructors, and containment remain authority-owned.
-			record_installed_type_home(state, type_name, installation)
-		None:
-			type_parameters = union_type_header_parameters(
-				header,
-			).map(
-				func(parameter): type_parameter_id_name(parameter.id),
-			)
-			containment = env_containment_summary(union_type_header_containment_facts(header))
-
-			match installed_union_variants(graph, header, installation):
-				None:
-					typecheck_state_add_error(
-						state,
-						"internal typecheck error: accepted union header '" + type_name + "' refers to a module absent from its type-header graph",
-					)
-				Some(installed_variants):
-					type_kind = match union_type_header_layout(header):
-						TaggedUnion:
-							TypeUnion
-						FieldlessEnum:
-							TypeEnum
-
-					env = env_add_accepted_type_with_constructor_ids(
-						state.env,
-						type_name,
-						type_parameters,
-						installed_variants.map(func(variant): variant.definition),
-						type_kind,
-						union_type_header_contains_resource(header),
-						True,
-						installed_variants.map(func(variant): Some(variant.constructor_id)),
-						containment,
-					)
-					finalize_installed_type(
-						{ state | env = env },
-						source_name,
-						type_name,
-						type_parameters,
-						installation,
-					)
-
-
-private pure func finalize_provisional_alias(
-	state: TypecheckState,
-	source_name: String,
-	type_name: String,
-	type_parameters: List[String],
-	layout: AliasLayout,
-	installation: TypeHeaderInstallation,
-) -> TypecheckState:
-	module_path = type_header_installation_path(installation)
-
-	with_home = match layout:
-		TransparentAlias:
-			state
-		OpaqueAlias:
-			match installation:
-				LocalTypeHeaderInstallation(_, _):
-					typecheck_state_record_type_home(state, type_name, module_path, False)
-				ImportedTypeHeaderInstallation(_, _):
-					typecheck_state_record_type_home(state, type_name, module_path, True)
-
-	match installation:
-		LocalTypeHeaderInstallation(_, _):
-			with_home
-		ImportedTypeHeaderInstallation(_, _):
-			add_imported_accepted_type_aliases(
-				with_home,
-				module_path,
-				source_name,
-				type_name,
-				type_parameters,
-			)
-
-
-private pure func project_accepted_alias_session_facts(
-	state: TypecheckState,
-	type_name: String,
-	layout: AliasLayout,
-	installation: TypeHeaderInstallation,
-) -> TypecheckState:
-	with_known_type = typecheck_state_add_known_type_name(state, type_name)
-
-	match layout:
-		TransparentAlias:
-			with_known_type
-		OpaqueAlias:
-			record_installed_type_home(with_known_type, type_name, installation)
-
-
-private pure func install_alias_header(
-	state: TypecheckState,
-	graph: TypeHeaderGraph,
-	header: AcceptedAliasHeader,
-	installation: TypeHeaderInstallation,
-) -> TypecheckState:
-	source_name = alias_type_header_source_name(header)
-	type_name = installed_type_name(source_name, installation)
-	layout = alias_type_header_layout(header)
-
-	match module_view_accepted_alias_authority(state.module_view):
-		Some(authority):
-			if accepted_alias_contains(authority, type_name):
-				project_accepted_alias_session_facts(state, type_name, layout, installation)
+	for facts in section.builtins:
+		if not imported and not allows_builtin:
+			prefix = if facts.is_resource:
+				"resource type "
 			else:
-				typecheck_state_add_error(
-					state,
-					"internal typecheck error: accepted alias authority is missing '" + type_name + "'",
-				)
-		None:
-			type_parameters = alias_type_header_parameters(
-				header,
-			).map(
-				func(parameter): type_parameter_id_name(parameter.id),
+				"type "
+
+			acc = typecheck_state_add_error(
+				acc,
+				"'" + prefix + facts.source_name + " = builtin' can only be used in the standard library",
 			)
 
-			match semantic_type_from_resolved_shape(
-				graph,
-				alias_type_header_target(header),
-				installation,
-			):
-				None:
-					typecheck_state_add_error(
-						state,
-						"internal typecheck error: accepted alias header '" + type_name + "' refers to a module absent from its type-header graph",
-					)
-				Some(target):
-					containment = alias_type_header_containment_facts(header)
-					env_summary = env_containment_summary(containment)
+		if facts.is_resource:
+			known_types = known_type_index_record_resource(known_types, facts.type_name)
+		else:
+			if not imported:
+				known_types = known_type_index_record_type(known_types, facts.type_name)
 
-					env = match layout:
+		acc = { acc |
+			env = env_add_accepted_type(
+				acc.env,
+				facts.type_name,
+				facts.type_parameters,
+				[],
+				facts.type_kind,
+				facts.is_resource,
+				False,
+				facts.containment,
+			)
+		}
+
+		match facts.cleanup:
+			Some(cleanup_function):
+				acc = { acc |
+					context = register_resource_cleanup(
+						acc.context,
+						facts.type_name,
+						cleanup_function,
+					)
+				}
+			None:
+				void
+
+		type_homes = type_home_index_record(type_homes, facts.type_name, module_path, imported)
+
+		if binds_imported_aliases:
+			acc = add_imported_accepted_type_aliases(
+				acc,
+				module_path,
+				facts.source_name,
+				facts.type_name,
+				facts.type_parameters,
+			)
+
+	for facts in section.records:
+		match record_authority:
+			Some(authority):
+				if accepted_record_contains(authority, facts.type_name):
+					type_homes = type_home_index_record(
+						type_homes,
+						facts.type_name,
+						module_path,
+						imported,
+					)
+
+					if binds_imported_aliases:
+						acc = add_imported_accepted_type_aliases(
+							acc,
+							module_path,
+							facts.source_name,
+							facts.type_name,
+							facts.type_parameters,
+						)
+				else:
+					acc = typecheck_state_add_error(
+						acc,
+						"internal typecheck error: accepted record authority is missing '" + facts.type_name + "'",
+					)
+			None:
+				match record_header_fields(graph, facts.accepted_header, installation):
+					None:
+						acc = typecheck_state_add_error(
+							acc,
+							"internal typecheck error: accepted record header '" + facts.type_name + "' refers to a module absent from its type-header graph",
+						)
+					Some(fields):
+						is_value = match record_type_header_layout(facts.accepted_header):
+							HeapRecord:
+								False
+							ValueStruct:
+								True
+
+						acc = { acc |
+							env = env_add_accepted_record(
+								acc.env,
+								facts.type_name,
+								facts.type_parameters,
+								fields,
+								is_value,
+								record_type_header_contains_resource(facts.accepted_header),
+								env_containment_summary(
+									record_type_header_containment_facts(facts.accepted_header),
+								),
+							)
+						}
+						type_homes = type_home_index_record(
+							type_homes,
+							facts.type_name,
+							module_path,
+							imported,
+						)
+
+						if binds_imported_aliases:
+							acc = add_imported_accepted_type_aliases(
+								acc,
+								module_path,
+								facts.source_name,
+								facts.type_name,
+								facts.type_parameters,
+							)
+
+	for facts in section.unions:
+		match union_authority:
+			Some(_):
+				-- Graph completion constructed this authority from these exact headers.
+				-- Accepted installation retains only spelling provenance; union payload,
+				-- constructors, and containment remain authority-owned.
+				type_homes = type_home_index_record(
+					type_homes,
+					facts.type_name,
+					module_path,
+					imported,
+				)
+			None:
+				match installed_union_variants(graph, facts.accepted_header, installation):
+					None:
+						acc = typecheck_state_add_error(
+							acc,
+							"internal typecheck error: accepted union header '" + facts.type_name + "' refers to a module absent from its type-header graph",
+						)
+					Some(installed_variants):
+						type_kind = match union_type_header_layout(facts.accepted_header):
+							TaggedUnion:
+								TypeUnion
+							FieldlessEnum:
+								TypeEnum
+
+						acc = { acc | env = env_add_accepted_type_with_constructor_ids(
+								acc.env,
+								facts.type_name,
+								facts.type_parameters,
+								installed_variants.map(func(variant): variant.definition),
+								type_kind,
+								union_type_header_contains_resource(facts.accepted_header),
+								True,
+								installed_variants.map(func(variant): Some(variant.constructor_id)),
+								env_containment_summary(
+									union_type_header_containment_facts(facts.accepted_header),
+								),
+							) }
+						type_homes = type_home_index_record(
+							type_homes,
+							facts.type_name,
+							module_path,
+							imported,
+						)
+
+						if binds_imported_aliases:
+							acc = add_imported_accepted_type_aliases(
+								acc,
+								module_path,
+								facts.source_name,
+								facts.type_name,
+								facts.type_parameters,
+							)
+
+	for facts in section.aliases:
+		match alias_authority:
+			Some(authority):
+				if accepted_alias_contains(authority, facts.type_name):
+					known_types = known_type_index_record_type(known_types, facts.type_name)
+
+					match facts.layout:
 						TransparentAlias:
-							env_add_accepted_alias_with_containment(
-								state.env,
-								type_name,
-								type_parameters,
-								target,
-								containment.contains_resource,
-								env_summary,
-							)
+							void
 						OpaqueAlias:
-							env_add_accepted_opaque_alias(
-								state.env,
-								type_name,
-								type_parameters,
-								target,
-								Some(type_header_installation_path(installation)),
-								containment.contains_resource,
-								env_summary,
+							type_homes = type_home_index_record(
+								type_homes,
+								facts.type_name,
+								module_path,
+								imported,
+							)
+				else:
+					acc = typecheck_state_add_error(
+						acc,
+						"internal typecheck error: accepted alias authority is missing '" + facts.type_name + "'",
+					)
+			None:
+				match semantic_type_from_resolved_shape(
+					graph,
+					alias_type_header_target(facts.accepted_header),
+					installation,
+				):
+					None:
+						acc = typecheck_state_add_error(
+							acc,
+							"internal typecheck error: accepted alias header '" + facts.type_name + "' refers to a module absent from its type-header graph",
+						)
+					Some(target):
+						containment = alias_type_header_containment_facts(facts.accepted_header)
+						env_summary = env_containment_summary(containment)
+
+						-- Cold path: only reached when this importer has no accepted
+						-- alias authority, so the extra environment read here costs
+						-- nothing on the graph-backed install.
+						next_env: Env = match facts.layout:
+							TransparentAlias:
+								env_add_accepted_alias_with_containment(
+									acc.env,
+									facts.type_name,
+									facts.type_parameters,
+									target,
+									containment.contains_resource,
+									env_summary,
+								)
+							OpaqueAlias:
+								env_add_accepted_opaque_alias(
+									acc.env,
+									facts.type_name,
+									facts.type_parameters,
+									target,
+									Some(module_path),
+									containment.contains_resource,
+									env_summary,
+								)
+
+						acc = { acc | env = next_env }
+						known_types = known_type_index_record_type(known_types, facts.type_name)
+
+						match facts.layout:
+							TransparentAlias:
+								void
+							OpaqueAlias:
+								type_homes = type_home_index_record(
+									type_homes,
+									facts.type_name,
+									module_path,
+									imported,
+								)
+
+						if imported:
+							acc = add_imported_accepted_type_aliases(
+								acc,
+								module_path,
+								facts.source_name,
+								facts.type_name,
+								facts.type_parameters,
 							)
 
-					finalize_provisional_alias(
-						{ typecheck_state_add_known_type_name(state, type_name) | env = env },
-						source_name,
-						type_name,
-						type_parameters,
-						layout,
-						installation,
-					)
+	-- Publish the fact tables this builder wrote, once, as the result. The
+	-- update is also what makes `acc` the builder's own owner of the session:
+	-- `stage_09_core/consume_specialize.brp`'s `result_aliases_var` reports a
+	-- bare `acc` return (bound from `state`) as aliasing argument 0 and
+	-- refuses the consuming clone, so every importer edge would hand this
+	-- function a borrowed session and copy the type-home dictionary on its
+	-- first insert. A record update result is reported as non-aliasing, the
+	-- clone is generated, and `acc` stays uniquely owned across the whole
+	-- section.
+	{ acc |
+		known_type_index = known_types,
+		type_homes = type_homes
+	}
+
+
+private pure func single_category_section(
+	base: ModuleHeaderSection,
+	builtins: List[InstalledBuiltinHeaderFacts],
+	records: List[InstalledRecordHeaderFacts],
+	unions: List[InstalledUnionHeaderFacts],
+	aliases: List[InstalledAliasHeaderFacts],
+) -> ModuleHeaderSection:
+	{ base |
+		builtins = builtins,
+		records = records,
+		unions = unions,
+		aliases = aliases
+	}
+
+
+-- Category entry points. Tools and tests install one category at a time; the
+-- graph driver installs a whole section. Both run the same builder.
+private pure func typecheck_install_header_category(
+	state: TypecheckState,
+	graph: TypeHeaderGraph,
+	module_scope: PreparedModuleScope,
+	module_path: String,
+	imported: Bool,
+	category: HeaderInstallCategory,
+) -> TypecheckState:
+	section = module_header_section_build(graph, module_scope, module_path, imported)
+
+	selected = match category:
+		BuiltinHeaderCategory:
+			single_category_section(section, section.builtins, [], [], [])
+		RecordHeaderCategory:
+			single_category_section(section, [], section.records, [], [])
+		UnionHeaderCategory:
+			single_category_section(section, [], [], section.unions, [])
+		AliasHeaderCategory:
+			single_category_section(section, [], [], [], section.aliases)
+
+	typecheck_install_module_header_section(state, graph, selected)
 
 
 pure func typecheck_install_local_builtin_headers(
@@ -1041,12 +1313,14 @@ pure func typecheck_install_local_builtin_headers(
 	module_scope: PreparedModuleScope,
 	module_path: String,
 ) -> TypecheckState:
-	var next = state
-
-	for header in type_header_graph_local_builtin_headers_for_scope(graph, module_scope):
-		next = install_builtin_header(next, header, LocalBuiltinInstallation(module_path))
-
-	next
+	typecheck_install_header_category(
+		state,
+		graph,
+		module_scope,
+		module_path,
+		False,
+		BuiltinHeaderCategory,
+	)
 
 
 pure func typecheck_install_imported_builtin_headers(
@@ -1055,12 +1329,14 @@ pure func typecheck_install_imported_builtin_headers(
 	module_scope: PreparedModuleScope,
 	module_path: String,
 ) -> TypecheckState:
-	var next = state
-
-	for header in type_header_graph_public_builtin_headers_for_scope(graph, module_scope):
-		next = install_builtin_header(next, header, ImportedBuiltinInstallation(module_path))
-
-	next
+	typecheck_install_header_category(
+		state,
+		graph,
+		module_scope,
+		module_path,
+		True,
+		BuiltinHeaderCategory,
+	)
 
 
 pure func typecheck_install_local_record_headers(
@@ -1069,17 +1345,14 @@ pure func typecheck_install_local_record_headers(
 	module_scope: PreparedModuleScope,
 	module_path: String,
 ) -> TypecheckState:
-	var next = state
-
-	for header in type_header_graph_local_record_headers_for_scope(graph, module_scope):
-		next = install_record_header(
-			next,
-			graph,
-			header,
-			LocalTypeHeaderInstallation(module_scope, module_path),
-		)
-
-	next
+	typecheck_install_header_category(
+		state,
+		graph,
+		module_scope,
+		module_path,
+		False,
+		RecordHeaderCategory,
+	)
 
 
 pure func typecheck_install_imported_record_headers(
@@ -1088,17 +1361,14 @@ pure func typecheck_install_imported_record_headers(
 	module_scope: PreparedModuleScope,
 	module_path: String,
 ) -> TypecheckState:
-	var next = state
-
-	for header in type_header_graph_public_record_headers_for_scope(graph, module_scope):
-		next = install_record_header(
-			next,
-			graph,
-			header,
-			ImportedTypeHeaderInstallation(module_scope, module_path),
-		)
-
-	next
+	typecheck_install_header_category(
+		state,
+		graph,
+		module_scope,
+		module_path,
+		True,
+		RecordHeaderCategory,
+	)
 
 
 pure func typecheck_install_local_union_headers(
@@ -1107,17 +1377,14 @@ pure func typecheck_install_local_union_headers(
 	module_scope: PreparedModuleScope,
 	module_path: String,
 ) -> TypecheckState:
-	var next = state
-
-	for header in type_header_graph_local_union_headers_for_scope(graph, module_scope):
-		next = install_union_header(
-			next,
-			graph,
-			header,
-			LocalTypeHeaderInstallation(module_scope, module_path),
-		)
-
-	next
+	typecheck_install_header_category(
+		state,
+		graph,
+		module_scope,
+		module_path,
+		False,
+		UnionHeaderCategory,
+	)
 
 
 pure func typecheck_install_imported_union_headers(
@@ -1126,17 +1393,14 @@ pure func typecheck_install_imported_union_headers(
 	module_scope: PreparedModuleScope,
 	module_path: String,
 ) -> TypecheckState:
-	var next = state
-
-	for header in type_header_graph_public_union_headers_for_scope(graph, module_scope):
-		next = install_union_header(
-			next,
-			graph,
-			header,
-			ImportedTypeHeaderInstallation(module_scope, module_path),
-		)
-
-	next
+	typecheck_install_header_category(
+		state,
+		graph,
+		module_scope,
+		module_path,
+		True,
+		UnionHeaderCategory,
+	)
 
 
 pure func typecheck_install_local_alias_headers(
@@ -1145,17 +1409,14 @@ pure func typecheck_install_local_alias_headers(
 	module_scope: PreparedModuleScope,
 	module_path: String,
 ) -> TypecheckState:
-	var next = state
-
-	for header in type_header_graph_local_alias_headers_for_scope(graph, module_scope):
-		next = install_alias_header(
-			next,
-			graph,
-			header,
-			LocalTypeHeaderInstallation(module_scope, module_path),
-		)
-
-	next
+	typecheck_install_header_category(
+		state,
+		graph,
+		module_scope,
+		module_path,
+		False,
+		AliasHeaderCategory,
+	)
 
 
 pure func typecheck_install_imported_alias_headers(
@@ -1164,14 +1425,11 @@ pure func typecheck_install_imported_alias_headers(
 	module_scope: PreparedModuleScope,
 	module_path: String,
 ) -> TypecheckState:
-	var next = state
-
-	for header in type_header_graph_public_alias_headers_for_scope(graph, module_scope):
-		next = install_alias_header(
-			next,
-			graph,
-			header,
-			ImportedTypeHeaderInstallation(module_scope, module_path),
-		)
-
-	next
+	typecheck_install_header_category(
+		state,
+		graph,
+		module_scope,
+		module_path,
+		True,
+		AliasHeaderCategory,
+	)

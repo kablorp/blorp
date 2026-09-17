@@ -250,6 +250,10 @@ pure func type_home_index_empty() -> TypeHomeIndex:
 	TYPE_HOME_INDEX_EMPTY
 
 
+pure func known_type_index_empty() -> KnownTypeIndex:
+	KNOWN_TYPE_INDEX_EMPTY
+
+
 private pure func type_home_index_entry(
 	index: TypeHomeIndex,
 	type_name: String,
@@ -304,7 +308,7 @@ pure func type_home_index_is_empty(index: TypeHomeIndex) -> Bool:
 -- the value passed to `set` varying, keeps this function reachable through
 -- the header-install loops' consuming calling convention so `entries.set`
 -- can mutate in place when the dict is uniquely owned.
-private pure func type_home_index_upsert(
+pure func type_home_index_record(
 	index: TypeHomeIndex,
 	type_name: String,
 	module_path: String,
@@ -330,22 +334,10 @@ private pure func type_home_index_upsert(
 	into_opaque TypeHomeIndex(entries.set(type_name, next_entry))
 
 
-pure func type_home_index_record(
-	index: TypeHomeIndex,
-	type_name: String,
-	module_path: String,
-	imported: Bool,
-) -> TypeHomeIndex:
-	type_home_index_upsert(index, type_name, module_path, imported)
-
-
--- Same shape as `type_home_index_upsert` above: always calls `entries.set`,
+-- Same shape as `type_home_index_record` above: always calls `entries.set`,
 -- keeping whichever `KnownTypeKind` was already recorded rather than
 -- returning `index` unchanged, so this stays consume-specializable.
-private pure func known_type_index_upsert_type(
-	index: KnownTypeIndex,
-	name: String,
-) -> KnownTypeIndex:
+pure func known_type_index_record_type(index: KnownTypeIndex, name: String) -> KnownTypeIndex:
 	entries = from_opaque KnownTypeIndex(index)
 
 	next_kind = match entries.get(name):
@@ -357,10 +349,7 @@ private pure func known_type_index_upsert_type(
 	into_opaque KnownTypeIndex(entries.set(name, next_kind))
 
 
-private pure func known_type_index_add_resource(
-	index: KnownTypeIndex,
-	name: String,
-) -> KnownTypeIndex:
+pure func known_type_index_record_resource(index: KnownTypeIndex, name: String) -> KnownTypeIndex:
 	entries = from_opaque KnownTypeIndex(index)
 	updated = entries.set(name, KnownResourceType)
 	into_opaque KnownTypeIndex(updated)
@@ -1579,7 +1568,7 @@ pure func typecheck_state_register_graph_imported_constructor(
 		registration_result
 
 
--- `state.type_homes`'s sibling: `known_type_index_upsert_type` always
+-- `state.type_homes`'s sibling: `known_type_index_record_type` always
 -- constructs and this update reads `state.known_type_index` exactly once,
 -- in the field's own replacement expression, which is what lets the
 -- record-update reuse this record's storage in place (see
@@ -1590,14 +1579,14 @@ pure func typecheck_state_add_known_type_name(
 	state: TypecheckState,
 	name: String,
 ) -> TypecheckState:
-	{ state | known_type_index = known_type_index_upsert_type(state.known_type_index, name) }
+	{ state | known_type_index = known_type_index_record_type(state.known_type_index, name) }
 
 
 pure func typecheck_state_add_known_resource_type_name(
 	state: TypecheckState,
 	name: String,
 ) -> TypecheckState:
-	{ state | known_type_index = known_type_index_add_resource(state.known_type_index, name) }
+	{ state | known_type_index = known_type_index_record_resource(state.known_type_index, name) }
 
 
 pure func typecheck_state_has_known_type_name(state: TypecheckState, name: String) -> Bool:
@@ -1633,7 +1622,7 @@ pure func typecheck_state_type_home_matches(
 
 
 -- The "imported name that already has a home is a no-op" precedence rule
--- lives inside `type_home_index_upsert`, not here, and it never returns
+-- lives inside `type_home_index_record`, not here, and it never returns
 -- `state.type_homes` (or `state`) unchanged from a bare-identifier arm --
 -- it always finishes with `entries.set`. That matters for two independent
 -- reasons documented at length here because both were tried and measured
@@ -1660,7 +1649,7 @@ pure func typecheck_state_type_home_matches(
 --    every other shape, including one "that reads the field twice",
 --    still copies.
 --
--- Folding the precedence check into `type_home_index_upsert` satisfies
+-- Folding the precedence check into `type_home_index_record` satisfies
 -- both: this function reads `state.type_homes` exactly once, in the
 -- update's own field-replacement expression, and reaches an insert
 -- helper that always constructs. After this change `state` (argument 0)
@@ -1676,7 +1665,7 @@ pure func typecheck_state_record_type_home(
 	imported: Bool,
 ) -> TypecheckState:
 	{ state |
-		type_homes = type_home_index_upsert(state.type_homes, type_name, module_path, imported)
+		type_homes = type_home_index_record(state.type_homes, type_name, module_path, imported)
 	}
 
 
@@ -1980,11 +1969,14 @@ pure func typecheck_state_is_reserved_for_exact_scope(
 			False
 
 
-pure func typecheck_state_restore_definition_scope(
+-- Restores a saved definition scope without holding the whole state it came
+-- from: an import edge saves only `state.module_scope` so the session record
+-- it was read from stays uniquely owned through the header install.
+pure func typecheck_state_restore_module_scope(
 	state: TypecheckState,
-	target_scope: TypecheckState,
+	target_scope: TypecheckModuleScope,
 ) -> TypecheckState:
-	target_representation = typecheck_module_scope_rep(target_scope.module_scope)
+	target_representation = typecheck_module_scope_rep(target_scope)
 
 	match target_representation:
 		UnscopedModuleScope(_, _):
@@ -1993,7 +1985,7 @@ pure func typecheck_state_restore_definition_scope(
 				"internal typecheck error: cannot restore an unscoped definition context",
 			)
 		ExtensibleModuleScope(_, _, _, _):
-			{ state | module_scope = target_scope.module_scope }
+			{ state | module_scope = target_scope }
 		ReservedModuleScope(prepared_scope):
 			current_representation = typecheck_module_scope_rep(state.module_scope)
 			canonical_path = prepared_module_scope_canonical_path(prepared_scope)

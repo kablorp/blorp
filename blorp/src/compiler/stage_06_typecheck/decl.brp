@@ -322,16 +322,18 @@ import:
 		type_header_graph_local_union_headers_for_scope,
 		union_type_header_id,
 	headers/type_header_install:
+		ModuleHeaderProductTable,
+		ModuleHeaderSection,
 		imported_semantic_type_from_resolved_shape,
 		local_semantic_type_from_resolved_shape,
-		typecheck_install_imported_alias_headers,
-		typecheck_install_imported_builtin_headers,
-		typecheck_install_imported_record_headers,
-		typecheck_install_imported_union_headers,
+		module_header_product_table_empty,
+		module_header_product_table_ensure,
+		module_header_product_table_section,
 		typecheck_install_local_alias_headers,
 		typecheck_install_local_builtin_headers,
 		typecheck_install_local_record_headers,
 		typecheck_install_local_union_headers,
+		typecheck_install_module_header_section,
 	headers/type_resolution:
 		canonical_annotation_type,
 		canonical_function_annotation_type,
@@ -495,7 +497,7 @@ import:
 		typecheck_state_module_path_matches,
 		typecheck_state_remember_top_level_name,
 		typecheck_state_reset_type_shape_memo,
-		typecheck_state_restore_definition_scope,
+		typecheck_state_restore_module_scope,
 		typecheck_state_scope_to_imported_module,
 		typecheck_state_scope_to_program,
 		typecheck_state_type_home_matches,
@@ -4616,52 +4618,11 @@ pure func typecheck_register_program_impl_decls(
 	)
 
 
-private pure func typecheck_register_import_module_types(
-	state: TypecheckState,
-	module: ImportableModule,
-	type_headers: TypeHeaderGraph,
-) -> TypecheckState:
-	target_scope = state
-	module_state = typecheck_state_scope_to_imported_module(
-		state,
-		importable_module_prepared_scope(module),
-	)
-
-	if module_state.errors.length() > state.errors.length():
-		module_state
-	else:
-		with_builtin_headers = typecheck_install_imported_builtin_headers(
-			module_state,
-			type_headers,
-			importable_module_prepared_scope(module),
-			importable_module_path(module),
-		)
-		with_record_headers = typecheck_install_imported_record_headers(
-			with_builtin_headers,
-			type_headers,
-			importable_module_prepared_scope(module),
-			importable_module_path(module),
-		)
-		with_union_headers = typecheck_install_imported_union_headers(
-			with_record_headers,
-			type_headers,
-			importable_module_prepared_scope(module),
-			importable_module_path(module),
-		)
-		with_types = typecheck_install_imported_alias_headers(
-			with_union_headers,
-			type_headers,
-			importable_module_prepared_scope(module),
-			importable_module_path(module),
-		)
-
-		typecheck_state_restore_definition_scope(with_types, target_scope)
-
-
 private pure func typecheck_register_import_modules_from(
 	state: TypecheckState,
 	all_modules: List[ImportableModule],
 	type_headers: TypeHeaderGraph,
+	header_products: ModuleHeaderProductTable,
 ) -> TypecheckState:
 	var next = state
 	var compatible_modules: List[ImportableModule] = []
@@ -4679,8 +4640,30 @@ private pure func typecheck_register_import_modules_from(
 	-- introduce a bare source name; aliases are created only for actual import
 	-- selective bindings in the module view. This lets a direct dependency expose a
 	-- record/union from one of its dependencies without leaking unrelated values.
+	-- The importer-dependent half of an import edge, inline: select the
+	-- imported module's definition scope, install its published header
+	-- section, and restore this module's scope. It stays inline so `next` is
+	-- handed to the installer at an assignment site and stays uniquely owned
+	-- across every edge; a helper here would borrow the session once per edge
+	-- and copy its dictionaries.
 	for module in compatible_modules:
-		next = typecheck_register_import_module_types(next, module, type_headers)
+		section = module_header_product_table_section(
+			header_products,
+			type_headers,
+			importable_module_prepared_scope(module),
+			importable_module_path(module),
+			True,
+		)
+		target_scope = next.module_scope
+		error_count = next.errors.length()
+		next = typecheck_state_scope_to_imported_module(
+			next,
+			importable_module_prepared_scope(module),
+		)
+
+		if next.errors.length() == error_count:
+			next = typecheck_install_module_header_section(next, type_headers, section)
+			next = typecheck_state_restore_module_scope(next, target_scope)
 
 	next
 
@@ -7448,6 +7431,7 @@ private pure func prepared_module_environment_base_state(
 	accepted_record_table: AcceptedRecordTable,
 	accepted_union_table: AcceptedUnionTable,
 	allow_debug_only_calls: Bool,
+	header_products: ModuleHeaderProductTable,
 ) -> TypecheckState:
 	program = bound_module_program(bound_module)
 	view = bound_module_view(bound_module)
@@ -7500,36 +7484,21 @@ private pure func prepared_module_environment_base_state(
 			typecheck_state_add_error(with_type_authority, "internal typecheck error: " + message)
 
 	with_import_type_facts = register_module_view_type_facts(with_global_authority)
-	with_import_decls = typecheck_register_import_modules_from(
+	canonical_path = bound_module_canonical_path(bound_module)
+	local_section = module_header_product_table_section(
+		header_products,
+		type_headers,
+		bound_module_scope(bound_module),
+		canonical_path,
+		False,
+	)
+	var with_types = typecheck_register_import_modules_from(
 		with_import_type_facts,
 		visible_import_modules,
 		type_headers,
+		header_products,
 	)
-	canonical_path = bound_module_canonical_path(bound_module)
-	with_builtin_headers = typecheck_install_local_builtin_headers(
-		with_import_decls,
-		type_headers,
-		bound_module_scope(bound_module),
-		canonical_path,
-	)
-	with_record_headers = typecheck_install_local_record_headers(
-		with_builtin_headers,
-		type_headers,
-		bound_module_scope(bound_module),
-		canonical_path,
-	)
-	with_union_headers = typecheck_install_local_union_headers(
-		with_record_headers,
-		type_headers,
-		bound_module_scope(bound_module),
-		canonical_path,
-	)
-	with_types = typecheck_install_local_alias_headers(
-		with_union_headers,
-		type_headers,
-		bound_module_scope(bound_module),
-		canonical_path,
-	)
+	with_types = typecheck_install_module_header_section(with_types, type_headers, local_section)
 	with_types
 
 
@@ -7597,6 +7566,31 @@ private pure func prepared_module_environments(
 	var implementation_records: List[AcceptedImplementationTableRecord] = []
 	var trait_implementation_owner_missing: Bool = False
 
+	var header_products = module_header_product_table_empty(
+		indexed_graph_module_count(bound_module_graph_indexed_graph(bound_graph)),
+	)
+
+	-- One header product per module, in the order the modules are prepared.
+	-- Every importer edge below reads these sections instead of re-deriving a
+	-- module's installed names once per importer.
+	for bound_module in modules:
+		header_products = module_header_product_table_ensure(
+			header_products,
+			type_headers,
+			bound_module_scope(bound_module),
+			bound_module_canonical_path(bound_module),
+			False,
+		)
+
+		for import_module in bound_module_visible_import_modules(bound_module):
+			header_products = module_header_product_table_ensure(
+				header_products,
+				type_headers,
+				importable_module_prepared_scope(import_module),
+				importable_module_path(import_module),
+				True,
+			)
+
 	for bound_module in modules:
 		base_state = prepared_module_environment_base_state(
 			bound_module,
@@ -7606,6 +7600,7 @@ private pure func prepared_module_environments(
 			accepted_record_table,
 			accepted_union_table,
 			allow_debug_only_calls,
+			header_products,
 		)
 		base_positions_by_module_id = base_positions_by_module_id.set(
 			module_id_table_index(prepared_module_scope_id(bound_module_scope(bound_module))),
@@ -9975,10 +9970,14 @@ private pure func prepare_ctfe_artifact_body_module(
 		with_view = typecheck_state_add_diagnostic(with_view, diagnostic)
 
 	with_import_type_facts = register_module_view_type_facts(with_view)
+	-- The CTFE artifact path prepares one module at a time and has no
+	-- graph-wide product table to share, so each import edge builds its
+	-- section on the spot through the same lookup the graph driver uses.
 	with_import_decls = typecheck_register_import_modules_from(
 		with_import_type_facts,
 		visible_import_modules,
 		type_headers,
+		module_header_product_table_empty(0),
 	)
 
 	var base_state = typecheck_state_after_accepted_definition_id_replay(
