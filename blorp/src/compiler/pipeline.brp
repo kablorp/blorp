@@ -79,7 +79,6 @@ import:
 		prepare_core_graph_with_ctfe_replacements,
 	stage_09_core/early_pipeline:
 		CoreEarlyPipelineConfiguration,
-		CoreEarlyPipelineDiagnostic,
 		CoreEarlyPipelineExecution(
 			CoreEarlyPipelineCompleted,
 			CoreEarlyPipelineFailed,
@@ -89,9 +88,6 @@ import:
 		CoreEarlyPipelineObservation,
 		CoreEarlyPipelineOutput,
 		CoreEarlyPipelineStage,
-		core_early_pipeline_diagnostic_hint,
-		core_early_pipeline_diagnostic_message,
-		core_early_pipeline_stage_name,
 		finish_early_core_pipeline_after_projection,
 		run_early_core_pipeline_to_runtime_projection,
 	stage_09_core/ir:
@@ -99,17 +95,24 @@ import:
 		CoreFunctionKind(ProgramEntrypointFunction),
 		CoreProgram,
 		core_program_to_json,
-	stage_09_core/late_invariants:
-		check_definition_id_uniqueness,
-		check_late_core_invariants,
-		core_late_invariant_message,
+	stage_09_core/pass_runner:
+		CorePassControl,
+		CorePassDiagnostic,
+		CorePassObservation,
+		CorePassRun(CorePassesCompleted, CorePassesFailed, CorePassesStopped),
+		CorePassTiming,
+		core_pass_diagnostic_hint,
+		core_pass_diagnostic_message,
+		core_pass_state,
+		run_core_passes,
 	stage_09_core/pipeline:
 		PreparedCoreProgram,
+		late_core_pass_name,
+		late_core_pass_stage_name,
+		late_core_passes,
+		prepared_core_program,
 		prepared_core_program_value,
-		run_core_pipeline_stage,
-		run_pre_dce_tail,
-	stage_09_core/pipeline_stage: CorePipelineStage(FinalStage)
-	stage_09_core/record_update: record_update_carrier_survives
+	stage_09_core/pipeline_stage: CorePipelineStage
 	stage_09_core/resolve:
 		CoreResolveImportBinding(
 			CoreExactSelectiveDefinitionImport,
@@ -438,20 +441,20 @@ record LateCoreStageRequest {
 
 
 union LateCoreExecution:
-	LateCoreCompleted(PreparedCoreProgram, List[CoreObservation])
-	LateCoreStopped(String, String, List[CoreObservation])
-	LateCoreFailed(String, String)
+	LateCoreCompleted(PreparedCoreProgram, List[CoreObservation], List[CorePassTiming])
+	LateCoreStopped(String, String, List[CoreObservation], List[CorePassTiming])
+	LateCoreFailed(String, String, List[CorePassTiming])
 
 
 union EarlyCorePhaseExecution:
-	EarlyCorePhaseReady(EarlyCoreCompilation)
-	EarlyCorePhaseStopped(String, String, String, List[CoreObservation])
+	EarlyCorePhaseReady(EarlyCoreCompilation, List[CorePassTiming])
+	EarlyCorePhaseStopped(String, String, String, List[CoreObservation], List[CorePassTiming])
 	EarlyCorePhaseFailed(List[String])
 
 
 union RuntimeProjectionPhaseExecution:
-	RuntimeProjectionPhaseReady(RuntimeProjectedCompilation)
-	RuntimeProjectionPhaseStopped(String, String, String, List[CoreObservation])
+	RuntimeProjectionPhaseReady(RuntimeProjectedCompilation, List[CorePassTiming])
+	RuntimeProjectionPhaseStopped(String, String, String, List[CoreObservation], List[CorePassTiming])
 	RuntimeProjectionPhaseFailed(List[String])
 
 
@@ -857,32 +860,32 @@ func compile_frontend_graph_with_typed_validation(
 	request ?= prepare_core_lowering_request(typed)
 	lowered ?= lower_prepared_core_request(request)
 
-	match run_early_core_compilation(lowered):
+	match run_early_core_compilation(lowered, False):
 		EarlyCorePhaseFailed(errors):
 			Err(errors)
-		EarlyCorePhaseStopped(target_path, stage_name, rendered, observations):
+		EarlyCorePhaseStopped(target_path, stage_name, rendered, observations, _):
 			Ok(CompiledTypedGraphStopped(target_path, stage_name, rendered, observations))
-		EarlyCorePhaseReady(early):
-			match project_runtime_compilation(early):
+		EarlyCorePhaseReady(early, _):
+			match project_runtime_compilation(early, False):
 				RuntimeProjectionPhaseFailed(errors):
 					Err(errors)
-				RuntimeProjectionPhaseStopped(target_path, stage_name, rendered, observations):
+				RuntimeProjectionPhaseStopped(target_path, stage_name, rendered, observations, _):
 					Ok(CompiledTypedGraphStopped(target_path, stage_name, rendered, observations))
-				RuntimeProjectionPhaseReady(projected):
+				RuntimeProjectionPhaseReady(projected, _):
 					Ok(compiled_typed_graph_ready(projected))
 
 
 private pure func early_observation(observation: CoreEarlyPipelineObservation) -> CoreObservation:
 	{
-		stage_name = core_early_pipeline_stage_name(observation.stage),
+		stage_name = observation.stage_name,
 		rendered = observation.rendered
 	}
 
 
-private pure func early_pipeline_error(diagnostic: CoreEarlyPipelineDiagnostic) -> String:
-	message: String = core_early_pipeline_diagnostic_message(diagnostic)
+private pure func early_pipeline_error(diagnostic: CorePassDiagnostic) -> String:
+	message: String = core_pass_diagnostic_message(diagnostic)
 
-	match core_early_pipeline_diagnostic_hint(diagnostic):
+	match core_pass_diagnostic_hint(diagnostic):
 		Some(hint):
 			"${message}\nhelp: ${hint}"
 		None:
@@ -999,7 +1002,10 @@ pure func lower_prepared_core_request(
 			}))
 
 
-pure func run_early_core_compilation(lowered: LoweredCoreCompilation) -> EarlyCorePhaseExecution:
+func run_early_core_compilation(
+	lowered: LoweredCoreCompilation,
+	record_timings: Bool,
+) -> EarlyCorePhaseExecution:
 	representation: LoweredCoreCompilationRep = from_opaque LoweredCoreCompilation(lowered)
 
 	match run_early_core_pipeline_to_runtime_projection(
@@ -1007,18 +1013,21 @@ pure func run_early_core_compilation(lowered: LoweredCoreCompilation) -> EarlyCo
 		representation.early_configuration,
 		representation.target_import_bindings,
 		representation.module_imports,
+		record_timings,
 	):
 		CoreEarlyPipelineFailed(diagnostic):
 			EarlyCorePhaseFailed([early_pipeline_error(diagnostic)])
-		CoreEarlyPipelineStopped(stage, rendered, completed_observations):
+		CoreEarlyPipelineStopped(stage_name, rendered, completed_observations, pass_timings):
 			EarlyCorePhaseStopped(
 				representation.target_path,
-				core_early_pipeline_stage_name(stage),
+				stage_name,
 				rendered,
 				completed_observations.map(early_observation),
+				pass_timings,
 			)
 		CoreEarlyPipelineCompleted(output):
-			EarlyCorePhaseReady(into_opaque EarlyCoreCompilation({
+			EarlyCorePhaseReady(
+				into_opaque EarlyCoreCompilation({
 						target_path = representation.target_path,
 						target_module_name = representation.target_module_name,
 						include_dirs = representation.include_dirs,
@@ -1027,11 +1036,14 @@ pure func run_early_core_compilation(lowered: LoweredCoreCompilation) -> EarlyCo
 						check_invariants = representation.check_invariants,
 						early_configuration = representation.early_configuration,
 						output = output
-					}))
+					}),
+				output.pass_timings,
+			)
 
 
-pure func project_runtime_compilation(
+func project_runtime_compilation(
 	early: EarlyCoreCompilation,
+	record_timings: Bool,
 ) -> RuntimeProjectionPhaseExecution:
 	representation: EarlyCoreCompilationRep = from_opaque EarlyCoreCompilation(early)
 
@@ -1042,15 +1054,17 @@ pure func project_runtime_compilation(
 			match finish_early_core_pipeline_after_projection(
 				{ representation.output | program = projected_program },
 				representation.early_configuration,
+				record_timings,
 			):
 				CoreEarlyPipelineFailed(diagnostic):
 					RuntimeProjectionPhaseFailed([early_pipeline_error(diagnostic)])
-				CoreEarlyPipelineStopped(stage, rendered, completed_observations):
+				CoreEarlyPipelineStopped(stage_name, rendered, completed_observations, pass_timings):
 					RuntimeProjectionPhaseStopped(
 						representation.target_path,
-						core_early_pipeline_stage_name(stage),
+						stage_name,
 						rendered,
 						completed_observations.map(early_observation),
+						pass_timings,
 					)
 				CoreEarlyPipelineCompleted(completed):
 					if (
@@ -1061,7 +1075,8 @@ pure func project_runtime_compilation(
 							[missing_main_error(representation.target_path)],
 						)
 					else:
-						RuntimeProjectionPhaseReady(into_opaque RuntimeProjectedCompilation({
+						RuntimeProjectionPhaseReady(
+							into_opaque RuntimeProjectedCompilation({
 									target_path = representation.target_path,
 									target_module_name = representation.target_module_name,
 									include_dirs = representation.include_dirs,
@@ -1069,7 +1084,9 @@ pure func project_runtime_compilation(
 									check_invariants = representation.check_invariants,
 									program = completed.program,
 									observations = completed.observations.map(early_observation)
-								}))
+								}),
+							completed.pass_timings,
+						)
 
 
 pure func runtime_projected_core_compilation(
@@ -1119,7 +1136,7 @@ pure func compiled_typed_graph_ready(projected: RuntimeProjectedCompilation) -> 
 	)
 
 
-pure func compile_typechecked_graph(
+func compile_typechecked_graph(
 	typechecked: TypecheckedGraph,
 	policy: CoreCompilePolicy,
 	typed_summary: Option[String],
@@ -1140,18 +1157,18 @@ pure func compile_typechecked_graph(
 	request ?= prepare_core_lowering_request(typed)
 	lowered ?= lower_prepared_core_request(request)
 
-	match run_early_core_compilation(lowered):
+	match run_early_core_compilation(lowered, False):
 		EarlyCorePhaseFailed(errors):
 			Err(errors)
-		EarlyCorePhaseStopped(target_path, stage_name, rendered, observations):
+		EarlyCorePhaseStopped(target_path, stage_name, rendered, observations, _):
 			Ok(CompiledTypedGraphStopped(target_path, stage_name, rendered, observations))
-		EarlyCorePhaseReady(early):
-			match project_runtime_compilation(early):
+		EarlyCorePhaseReady(early, _):
+			match project_runtime_compilation(early, False):
 				RuntimeProjectionPhaseFailed(errors):
 					Err(errors)
-				RuntimeProjectionPhaseStopped(target_path, stage_name, rendered, observations):
+				RuntimeProjectionPhaseStopped(target_path, stage_name, rendered, observations, _):
 					Ok(CompiledTypedGraphStopped(target_path, stage_name, rendered, observations))
-				RuntimeProjectionPhaseReady(projected):
+				RuntimeProjectionPhaseReady(projected, _):
 					Ok(compiled_typed_graph_ready(projected))
 
 
@@ -1175,81 +1192,81 @@ private pure func stops_at_late_stage(action: LateCoreStageAction) -> Bool:
 			False
 
 
-pure func late_core_invariant(stage: CorePipelineStage, program: CoreProgram) -> Option[String]:
-	match check_late_core_invariants(stage, program):
-		[violation, ..._]:
-			Some(core_late_invariant_message(violation))
-		[]:
-			None
+private pure func observed_late_pass_names(stages: List[LateCoreStageRequest]) -> List[String]:
+	var names: List[String] = []
+
+	for stage in stages:
+		if observes_late_stage(stage.action):
+			names = names.append(late_core_pass_name(stage.stage))
+
+	names
 
 
-private pure func required_final_invariant(program: CoreProgram) -> Option[String]:
-	if record_update_carrier_survives(program):
-		Some("record update survived ownership normalization")
-	else:
-		match check_definition_id_uniqueness(program):
-			[violation, ..._]:
-				Some(core_late_invariant_message(violation))
-			[]:
-				None
+private pure func late_stop_pass_name(stages: List[LateCoreStageRequest]) -> Option[String]:
+	var stop: Option[String] = None
+
+	for stage in stages:
+		if stop.is_none() and stops_at_late_stage(stage.action):
+			stop = Some(late_core_pass_name(stage.stage))
+
+	stop
 
 
-pure func execute_late_core_stages(
+private pure func late_core_observations(
+	observations: List[CoreObservation],
+	pass_observations: List[CorePassObservation],
+) -> List[CoreObservation]:
+	var rendered: List[CoreObservation] = observations
+
+	for observation in pass_observations:
+		rendered = rendered.append({
+			stage_name = late_core_pass_stage_name(observation.name),
+			rendered = observation.rendered,
+		})
+
+	rendered
+
+
+-- One walk of the late-Core pass list. Requested snapshots name a pass, so a
+-- compile that asks for several no longer replays the prefix for each one.
+func execute_late_core_stages(
 	pre_dce_core: CoreProgram,
 	observations: List[CoreObservation],
 	stages: List[LateCoreStageRequest],
 	check_invariants: Bool,
+	record_timings: Bool,
 ) -> LateCoreExecution:
-	match stages:
-		[]:
-			completed: PreparedCoreProgram = run_pre_dce_tail(pre_dce_core)
-			program: CoreProgram = prepared_core_program_value(completed)
+	control: CorePassControl = {
+		observe = observed_late_pass_names(stages),
+		stop_after = late_stop_pass_name(stages),
+		check_invariants = check_invariants,
+		record_timings = record_timings
+	}
 
-			-- Keep the fast ownership and identity checks on every compile. The
-			-- broader expression-tree audit remains opt-in through adapter policy.
-			final_invariant_error: Option[String] = if check_invariants:
-				late_core_invariant(FinalStage, program)
-			else:
-				required_final_invariant(program)
-
-			match final_invariant_error:
-				Some(detail):
-					LateCoreFailed("final", detail)
-				None:
-					LateCoreCompleted(completed, observations)
-		[stage, ...remaining]:
-			transformed: CoreProgram = run_core_pipeline_stage(stage.stage, pre_dce_core)
-
-			invariant_error: Option[String] = if check_invariants:
-				late_core_invariant(stage.stage, transformed)
-			else:
-				None
-
-			match invariant_error:
-				Some(detail):
-					LateCoreFailed(stage.name, detail)
-				None:
-					rendered: String = core_program_to_json(transformed).to_string()
-
-					updated_observations: List[CoreObservation] = if observes_late_stage(
-						stage.action,
-					):
-						observations.append({
-							stage_name = stage.name,
-							rendered = rendered,
-						})
-					else:
-						observations
-
-					if stops_at_late_stage(stage.action):
-						LateCoreStopped(stage.name, rendered, updated_observations)
-					else:
-						execute_late_core_stages(
-							transformed,
-							updated_observations,
-							remaining,
-							check_invariants,
-						)
+	match run_core_passes(
+		late_core_passes(),
+		core_pass_state(pre_dce_core, 0),
+		control,
+	):
+		CorePassesCompleted(completed, pass_observations, timings):
+			LateCoreCompleted(
+				prepared_core_program(completed.program),
+				late_core_observations(observations, pass_observations),
+				timings,
+			)
+		CorePassesStopped(pass_name, rendered, pass_observations, timings):
+			LateCoreStopped(
+				late_core_pass_stage_name(pass_name),
+				rendered,
+				late_core_observations(observations, pass_observations),
+				timings,
+			)
+		CorePassesFailed(pass_name, diagnostic, timings):
+			LateCoreFailed(
+				late_core_pass_stage_name(pass_name),
+				core_pass_diagnostic_message(diagnostic),
+				timings,
+			)
 
 
 private pure func build_artifact_error_message(error: BuildArtifactError) -> String:
@@ -1258,9 +1275,10 @@ private pure func build_artifact_error_message(error: BuildArtifactError) -> Str
 			"invalid foreign link arguments in semantic Core: `${arguments}`"
 
 
-pure func run_late_core_compilation(
+func run_late_core_compilation(
 	projected: RuntimeProjectedCompilation,
 	stages: List[LateCoreStageRequest],
+	record_timings: Bool,
 ) -> LateCoreExecution:
 	representation: RuntimeProjectedCompilationRep = from_opaque RuntimeProjectedCompilation(
 		projected
@@ -1270,6 +1288,7 @@ pure func run_late_core_compilation(
 		representation.observations,
 		stages,
 		representation.check_invariants,
+		record_timings,
 	)
 
 
@@ -1304,15 +1323,15 @@ pure func construct_backend_artifact(
 			ArtifactConstructionPhaseFailed(build_artifact_error_message(error))
 
 
-pure func finish_compiler_pipeline(
+func finish_compiler_pipeline(
 	pre_dce_core: CoreProgram,
 	observations: List[CoreObservation],
 	stages: List[LateCoreStageRequest],
 	check_invariants: Bool,
 	configuration: BuildArtifactConfiguration,
 ) -> FinishedCompilerPipeline:
-	match execute_late_core_stages(pre_dce_core, observations, stages, check_invariants):
-		LateCoreCompleted(completed_core, completed_observations):
+	match execute_late_core_stages(pre_dce_core, observations, stages, check_invariants, False):
+		LateCoreCompleted(completed_core, completed_observations, _):
 			match emit_backend_c(completed_core, configuration):
 				BackendEmissionPhaseReady(emission):
 					match construct_backend_artifact(emission):
@@ -1322,7 +1341,7 @@ pure func finish_compiler_pipeline(
 							CompilerPipelineArtifactFailed(message)
 				BackendEmissionPhaseFailed(message):
 					CompilerPipelineEmitFailed(message)
-		LateCoreStopped(stage_name, rendered, stopped_observations):
+		LateCoreStopped(stage_name, rendered, stopped_observations, _):
 			CompilerPipelineStopped(stage_name, rendered, stopped_observations)
-		LateCoreFailed(stage_name, detail):
+		LateCoreFailed(stage_name, detail, _):
 			CompilerPipelineInvariantFailed(stage_name, detail)
