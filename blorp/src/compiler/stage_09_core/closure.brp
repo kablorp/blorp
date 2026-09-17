@@ -291,18 +291,32 @@ private pure func call_kind_uses_runtime_callee(kind: CoreCallKind) -> Bool:
 			False
 
 
-record ClosureState {
+-- Read-only facts about the program being closure-converted: the pass mode,
+-- the enclosing module for freshly hoisted functions, and the lookup tables
+-- built once from the whole program. Built by `closure_facts` via local
+-- mutation, then borrowed through the walk -- it never changes during a
+-- single function body's conversion, so it never needs to be copied into the
+-- per-node results below.
+record ClosureFacts {
 	mode: ClosurePassMode,
-	next_eta_index: Int,
-	next_lambda_index: Int,
-	next_task_index: Int,
-	next_def_id: Int,
 	current_module: Option[String],
 	functions_by_id: Dict[Int, CoreFunction],
 	function_collisions_by_id: Dict[Int, List[CoreFunction]],
 	functions_by_name: Dict[String, List[CoreFunction]],
 	function_definitions: List[CoreDefinitionIdentity],
-	constructor_definitions: List[CoreDefinitionIdentity],
+	constructor_definitions: List[CoreDefinitionIdentity]
+}
+
+
+-- Mutable accumulators that only grow across the walk: the fresh-name
+-- counters and the hoisted functions collected so far. Threaded through the
+-- node walk (unlike `ClosureFacts`, this does change), but carries none of
+-- the read-only lookup tables anymore.
+record ClosureState {
+	next_eta_index: Int,
+	next_lambda_index: Int,
+	next_task_index: Int,
+	next_def_id: Int,
 	hoisted: List[CoreDecl]
 }
 
@@ -1363,7 +1377,7 @@ private pure func merge_free_vars(left: List[FreeVar], right: List[FreeVar]) -> 
 
 
 private pure func free_vars_exprs(
-	state: ClosureState,
+	facts: ClosureFacts,
 	bound: List[String],
 	exprs: List[CoreExpr],
 ) -> List[FreeVar]:
@@ -1372,22 +1386,22 @@ private pure func free_vars_exprs(
 	for expr in exprs:
 		result = merge_free_vars(
 			result,
-			free_vars_expr(state, bound, expr),
+			free_vars_expr(facts, bound, expr),
 		)
 
 	result
 
 
 private pure func free_vars_boxed_storage_value(
-	state: ClosureState,
+	facts: ClosureFacts,
 	bound: List[String],
 	value: CoreBoxedStorageValue,
 ) -> List[FreeVar]:
-	free_vars_expr(state, bound, value.value)
+	free_vars_expr(facts, bound, value.value)
 
 
 private pure func free_vars_boxed_storage_values(
-	state: ClosureState,
+	facts: ClosureFacts,
 	bound: List[String],
 	values: List[CoreBoxedStorageValue],
 ) -> List[FreeVar]:
@@ -1396,38 +1410,38 @@ private pure func free_vars_boxed_storage_values(
 	for value in values:
 		result = merge_free_vars(
 			result,
-			free_vars_boxed_storage_value(state, bound, value),
+			free_vars_boxed_storage_value(facts, bound, value),
 		)
 
 	result
 
 
 private pure func free_vars_tuple_element(
-	state: ClosureState,
+	facts: ClosureFacts,
 	bound: List[String],
 	element: CoreTupleElement,
 ) -> List[FreeVar]:
 	match element:
 		TuplePrimElement(expr):
-			free_vars_expr(state, bound, expr)
+			free_vars_expr(facts, bound, expr)
 		TuplePointerElement(expr):
-			free_vars_expr(state, bound, expr)
+			free_vars_expr(facts, bound, expr)
 		TupleStructElement(expr, c_type):
-			free_vars_expr(state, bound, expr)
+			free_vars_expr(facts, bound, expr)
 		TupleStackResultElement(expr):
-			free_vars_expr(state, bound, expr)
+			free_vars_expr(facts, bound, expr)
 		TupleVoidElement:
 			[]
 		TupleFloatElement(expr):
-			free_vars_expr(state, bound, expr)
+			free_vars_expr(facts, bound, expr)
 		TupleFloat32Element(expr):
-			free_vars_expr(state, bound, expr)
+			free_vars_expr(facts, bound, expr)
 		TupleFloat16Element(expr):
-			free_vars_expr(state, bound, expr)
+			free_vars_expr(facts, bound, expr)
 
 
 private pure func free_vars_tuple_elements(
-	state: ClosureState,
+	facts: ClosureFacts,
 	bound: List[String],
 	elements: List[CoreTupleElement],
 ) -> List[FreeVar]:
@@ -1436,14 +1450,14 @@ private pure func free_vars_tuple_elements(
 	for element in elements:
 		result = merge_free_vars(
 			result,
-			free_vars_tuple_element(state, bound, element),
+			free_vars_tuple_element(facts, bound, element),
 		)
 
 	result
 
 
 private pure func free_vars_record_fields(
-	state: ClosureState,
+	facts: ClosureFacts,
 	bound: List[String],
 	fields: List[CoreRecordFieldValue],
 ) -> List[FreeVar]:
@@ -1452,14 +1466,14 @@ private pure func free_vars_record_fields(
 	for field in fields:
 		result = merge_free_vars(
 			result,
-			free_vars_expr(state, bound, field.value),
+			free_vars_expr(facts, bound, field.value),
 		)
 
 	result
 
 
 private pure func free_vars_record_cow_fields(
-	state: ClosureState,
+	facts: ClosureFacts,
 	bound: List[String],
 	fields: List[CoreRecordCowField],
 ) -> List[FreeVar]:
@@ -1470,7 +1484,7 @@ private pure func free_vars_record_cow_fields(
 			Some(replacement):
 				result = merge_free_vars(
 					result,
-					free_vars_expr(state, bound, replacement),
+					free_vars_expr(facts, bound, replacement),
 				)
 			None:
 				void
@@ -1479,7 +1493,7 @@ private pure func free_vars_record_cow_fields(
 
 
 private pure func free_vars_dict_entries(
-	state: ClosureState,
+	facts: ClosureFacts,
 	bound: List[String],
 	entries: List[CoreDictEntry],
 ) -> List[FreeVar]:
@@ -1488,18 +1502,18 @@ private pure func free_vars_dict_entries(
 	for entry in entries:
 		result = merge_free_vars(
 			result,
-			free_vars_boxed_storage_value(state, bound, entry.key),
+			free_vars_boxed_storage_value(facts, bound, entry.key),
 		)
 		result = merge_free_vars(
 			result,
-			free_vars_boxed_storage_value(state, bound, entry.value),
+			free_vars_boxed_storage_value(facts, bound, entry.value),
 		)
 
 	result
 
 
 private pure func free_vars_dict_literal_entries(
-	state: ClosureState,
+	facts: ClosureFacts,
 	bound: List[String],
 	entries: List[CoreDictLiteralEntry],
 ) -> List[FreeVar]:
@@ -1508,42 +1522,42 @@ private pure func free_vars_dict_literal_entries(
 	for entry in entries:
 		result = merge_free_vars(
 			result,
-			free_vars_expr(state, bound, entry.key),
+			free_vars_expr(facts, bound, entry.key),
 		)
 		result = merge_free_vars(
 			result,
-			free_vars_expr(state, bound, entry.value),
+			free_vars_expr(facts, bound, entry.value),
 		)
 
 	result
 
 
 private pure func free_vars_tensor_payload(
-	state: ClosureState,
+	facts: ClosureFacts,
 	bound: List[String],
 	payload: CoreTensorLiteralPayload,
 ) -> List[FreeVar]:
 	match payload:
 		TensorRawLiteralPayload(raw):
-			free_vars_exprs(state, bound, raw.elements)
+			free_vars_exprs(facts, bound, raw.elements)
 		TensorInlineStructLiteralPayload(inline_struct):
-			free_vars_exprs(state, bound, inline_struct.elements)
+			free_vars_exprs(facts, bound, inline_struct.elements)
 
 
 private pure func free_vars_optional_expr(
-	state: ClosureState,
+	facts: ClosureFacts,
 	bound: List[String],
 	expr: Option[CoreExpr],
 ) -> List[FreeVar]:
 	match expr:
 		Some(found):
-			free_vars_expr(state, bound, found)
+			free_vars_expr(facts, bound, found)
 		None:
 			[]
 
 
 private pure func free_vars_literal_match_cases(
-	state: ClosureState,
+	facts: ClosureFacts,
 	bound: List[String],
 	cases: List[CoreLiteralMatchCase],
 ) -> List[FreeVar]:
@@ -1553,23 +1567,23 @@ private pure func free_vars_literal_match_cases(
 		case_bound: List[String] = add_bound_match_bindings(bound, match_case.bindings)
 		result = merge_free_vars(
 			result,
-			free_vars_expr(state, case_bound, match_case.body),
+			free_vars_expr(facts, case_bound, match_case.body),
 		)
 
 	result
 
 
 private pure func free_vars_literal_match_fallback(
-	state: ClosureState,
+	facts: ClosureFacts,
 	bound: List[String],
 	fallback: CoreLiteralMatchFallback,
 ) -> List[FreeVar]:
 	match fallback:
 		LiteralMatchFallbackBody(body):
-			free_vars_expr(state, bound, body)
+			free_vars_expr(facts, bound, body)
 		LiteralMatchFallbackBindings(bindings, body):
 			free_vars_expr(
-				state,
+				facts,
 				add_bound_match_bindings(bound, bindings),
 				body,
 			)
@@ -1578,21 +1592,21 @@ private pure func free_vars_literal_match_fallback(
 
 
 private pure func free_vars_constructor_match_body(
-	state: ClosureState,
+	facts: ClosureFacts,
 	bound: List[String],
 	body: CoreConstructorMatchBody,
 ) -> List[FreeVar]:
 	match body:
 		ConstructorMatchBodyExpr(expr):
-			free_vars_expr(state, bound, expr)
+			free_vars_expr(facts, bound, expr)
 		ConstructorMatchBodyLiteral(literal_match):
-			free_vars_constructor_literal_match(state, bound, literal_match)
+			free_vars_constructor_literal_match(facts, bound, literal_match)
 		ConstructorMatchBodyLength(length_match):
-			free_vars_constructor_length_match(state, bound, length_match)
+			free_vars_constructor_length_match(facts, bound, length_match)
 
 
 private pure func free_vars_constructor_match_cases(
-	state: ClosureState,
+	facts: ClosureFacts,
 	bound: List[String],
 	cases: List[CoreConstructorMatchCase],
 ) -> List[FreeVar]:
@@ -1602,23 +1616,23 @@ private pure func free_vars_constructor_match_cases(
 		case_bound: List[String] = add_bound_match_bindings(bound, match_case.bindings)
 		result = merge_free_vars(
 			result,
-			free_vars_constructor_match_body(state, case_bound, match_case.body),
+			free_vars_constructor_match_body(facts, case_bound, match_case.body),
 		)
 
 	result
 
 
 private pure func free_vars_constructor_match_fallback(
-	state: ClosureState,
+	facts: ClosureFacts,
 	bound: List[String],
 	fallback: CoreConstructorMatchFallback,
 ) -> List[FreeVar]:
 	match fallback:
 		ConstructorMatchFallbackBody(body):
-			free_vars_expr(state, bound, body)
+			free_vars_expr(facts, bound, body)
 		ConstructorMatchFallbackBindings(bindings, body):
 			free_vars_expr(
-				state,
+				facts,
 				add_bound_match_bindings(bound, bindings),
 				body,
 			)
@@ -1627,31 +1641,31 @@ private pure func free_vars_constructor_match_fallback(
 
 
 private pure func free_vars_constructor_literal_match(
-	state: ClosureState,
+	facts: ClosureFacts,
 	bound: List[String],
 	match_expr: CoreConstructorLiteralMatch,
 ) -> List[FreeVar]:
-	var result: List[FreeVar] = free_vars_literal_match_cases(state, bound, match_expr.cases)
+	var result: List[FreeVar] = free_vars_literal_match_cases(facts, bound, match_expr.cases)
 	merge_free_vars(
 		result,
-		free_vars_literal_match_fallback(state, bound, match_expr.fallback),
+		free_vars_literal_match_fallback(facts, bound, match_expr.fallback),
 	)
 
 
 private pure func free_vars_constructor_length_branch(
-	state: ClosureState,
+	facts: ClosureFacts,
 	bound: List[String],
 	branch: CoreConstructorLengthMatchBranch,
 ) -> List[FreeVar]:
 	free_vars_constructor_match_body(
-		state,
+		facts,
 		add_bound_match_bindings(bound, branch.bindings),
 		branch.body,
 	)
 
 
 private pure func free_vars_constructor_length_cases(
-	state: ClosureState,
+	facts: ClosureFacts,
 	bound: List[String],
 	cases: List[CoreConstructorLengthMatchCase],
 ) -> List[FreeVar]:
@@ -1660,68 +1674,68 @@ private pure func free_vars_constructor_length_cases(
 	for match_case in cases:
 		result = merge_free_vars(
 			result,
-			free_vars_constructor_length_branch(state, bound, match_case.branch),
+			free_vars_constructor_length_branch(facts, bound, match_case.branch),
 		)
 
 	result
 
 
 private pure func free_vars_constructor_length_geq(
-	state: ClosureState,
+	facts: ClosureFacts,
 	bound: List[String],
 	geq: Option[CoreConstructorLengthMatchGeq],
 ) -> List[FreeVar]:
 	match geq:
 		Some(found):
-			free_vars_constructor_length_branch(state, bound, found.branch)
+			free_vars_constructor_length_branch(facts, bound, found.branch)
 		None:
 			[]
 
 
 private pure func free_vars_constructor_length_fallback(
-	state: ClosureState,
+	facts: ClosureFacts,
 	bound: List[String],
 	fallback: Option[CoreConstructorLengthMatchBranch],
 ) -> List[FreeVar]:
 	match fallback:
 		Some(branch):
-			free_vars_constructor_length_branch(state, bound, branch)
+			free_vars_constructor_length_branch(facts, bound, branch)
 		None:
 			[]
 
 
 private pure func free_vars_constructor_length_match(
-	state: ClosureState,
+	facts: ClosureFacts,
 	bound: List[String],
 	match_expr: CoreConstructorLengthMatch,
 ) -> List[FreeVar]:
-	var result: List[FreeVar] = free_vars_constructor_length_cases(state, bound, match_expr.cases)
+	var result: List[FreeVar] = free_vars_constructor_length_cases(facts, bound, match_expr.cases)
 	result = merge_free_vars(
 		result,
-		free_vars_constructor_length_geq(state, bound, match_expr.geq),
+		free_vars_constructor_length_geq(facts, bound, match_expr.geq),
 	)
 	merge_free_vars(
 		result,
-		free_vars_constructor_length_fallback(state, bound, match_expr.fallback),
+		free_vars_constructor_length_fallback(facts, bound, match_expr.fallback),
 	)
 
 
 private pure func free_vars_select_arm_kind(
-	state: ClosureState,
+	facts: ClosureFacts,
 	bound: List[String],
 	kind: CoreSelectArmKind,
 ) -> List[FreeVar]:
 	match kind:
 		SelectRecvArm(recv):
-			free_vars_expr(state, bound, recv.channel)
+			free_vars_expr(facts, bound, recv.channel)
 		SelectSealedArm(channel):
-			free_vars_expr(state, bound, channel)
+			free_vars_expr(facts, bound, channel)
 		SelectAfterArm(timeout):
-			free_vars_expr(state, bound, timeout)
+			free_vars_expr(facts, bound, timeout)
 
 
 private pure func free_vars_select_arm(
-	state: ClosureState,
+	facts: ClosureFacts,
 	bound: List[String],
 	arm: CoreSelectArm,
 ) -> List[FreeVar]:
@@ -1734,13 +1748,13 @@ private pure func free_vars_select_arm(
 			bound
 
 	merge_free_vars(
-		free_vars_select_arm_kind(state, bound, arm.kind),
-		free_vars_expr(state, arm_bound, arm.body),
+		free_vars_select_arm_kind(facts, bound, arm.kind),
+		free_vars_expr(facts, arm_bound, arm.body),
 	)
 
 
 private pure func free_vars_select_arms(
-	state: ClosureState,
+	facts: ClosureFacts,
 	bound: List[String],
 	arms: List[CoreSelectArm],
 ) -> List[FreeVar]:
@@ -1749,14 +1763,14 @@ private pure func free_vars_select_arms(
 	for arm in arms:
 		result = merge_free_vars(
 			result,
-			free_vars_select_arm(state, bound, arm),
+			free_vars_select_arm(facts, bound, arm),
 		)
 
 	result
 
 
 private pure func free_vars_sequence(
-	state: ClosureState,
+	facts: ClosureFacts,
 	bound: List[String],
 	expr: CoreExpr,
 ) -> List[FreeVar]:
@@ -1768,7 +1782,7 @@ private pure func free_vars_sequence(
 			SeqExpr(first, second):
 				result = merge_free_vars(
 					result,
-					free_vars_expr(state, bound, first),
+					free_vars_expr(facts, bound, first),
 				)
 				final_item = second
 			_:
@@ -1776,12 +1790,12 @@ private pure func free_vars_sequence(
 
 	merge_free_vars(
 		result,
-		free_vars_expr(state, bound, final_item),
+		free_vars_expr(facts, bound, final_item),
 	)
 
 
 private pure func free_vars_expr(
-	state: ClosureState,
+	facts: ClosureFacts,
 	bound: List[String],
 	expr: CoreExpr,
 ) -> List[FreeVar]:
@@ -1789,9 +1803,9 @@ private pure func free_vars_expr(
 		VarExpr(variable, typ, loc):
 			if bound.contains(variable.name):
 				[]
-			else if variable_references_definition(variable, state.constructor_definitions):
+			else if variable_references_definition(variable, facts.constructor_definitions):
 				[]
-			else if variable_references_definition(variable, state.function_definitions):
+			else if variable_references_definition(variable, facts.function_definitions):
 				[]
 			else:
 				free_var: FreeVar = {
@@ -1806,52 +1820,52 @@ private pure func free_vars_expr(
 		VoidExpr(typ, loc):
 			[]
 		DebugBlockExpr(body, typ, loc):
-			free_vars_expr(state, bound, body)
+			free_vars_expr(facts, bound, body)
 		CooperativeCheckpointExpr(typ, loc):
 			[]
 		CallExpr(kind, callee, args, typ, loc):
 			callee_free_vars: List[FreeVar] = if call_kind_uses_runtime_callee(kind):
-				free_vars_expr(state, bound, callee)
+				free_vars_expr(facts, bound, callee)
 			else:
 				[]
 
 			merge_free_vars(
 				callee_free_vars,
-				free_vars_exprs(state, bound, args),
+				free_vars_exprs(facts, bound, args),
 			)
 		BinaryExpr(op, left, right, typ, loc):
 			merge_free_vars(
-				free_vars_expr(state, bound, left),
-				free_vars_expr(state, bound, right),
+				free_vars_expr(facts, bound, left),
+				free_vars_expr(facts, bound, right),
 			)
 		UnaryExpr(op, expr_value, typ, loc):
-			free_vars_expr(state, bound, expr_value)
+			free_vars_expr(facts, bound, expr_value)
 		LogicalExpr(op, left, right, typ, loc):
 			merge_free_vars(
-				free_vars_expr(state, bound, left),
-				free_vars_expr(state, bound, right),
+				free_vars_expr(facts, bound, left),
+				free_vars_expr(facts, bound, right),
 			)
 		AssignExpr(variable, rhs, typ, loc):
-			free_vars_expr(state, bound, rhs)
+			free_vars_expr(facts, bound, rhs)
 		CastExpr(expr_value, typ, loc):
-			free_vars_expr(state, bound, expr_value)
+			free_vars_expr(facts, bound, expr_value)
 		BoxExpr(box, typ, loc):
-			free_vars_expr(state, bound, box.value)
+			free_vars_expr(facts, bound, box.value)
 		UnboxExpr(unbox_kind, expr_value, typ, loc):
-			free_vars_expr(state, bound, expr_value)
+			free_vars_expr(facts, bound, expr_value)
 		FieldExpr(expr_value, field_name, typ, loc):
-			free_vars_expr(state, bound, expr_value)
+			free_vars_expr(facts, bound, expr_value)
 		TupleFieldExpr(expr_value, field_index, typ, loc):
-			free_vars_expr(state, bound, expr_value)
+			free_vars_expr(facts, bound, expr_value)
 		TupleExpr(items, typ, loc):
-			free_vars_exprs(state, bound, items)
+			free_vars_exprs(facts, bound, items)
 		TupleConstructExpr(tuple_construct, typ, loc):
-			free_vars_tuple_elements(state, bound, tuple_construct.elements)
+			free_vars_tuple_elements(facts, bound, tuple_construct.elements)
 		VectorExpr(items, typ, loc):
-			free_vars_exprs(state, bound, items)
+			free_vars_exprs(facts, bound, items)
 		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
 			free_vars_expr(
-				state,
+				facts,
 				add_bound_params(bound, lambda_params),
 				lambda_body,
 			)
@@ -1866,19 +1880,19 @@ private pure func free_vars_expr(
 
 			result
 		ListConstructExpr(construct, typ, loc):
-			free_vars_boxed_storage_values(state, bound, construct.elements)
+			free_vars_boxed_storage_values(facts, bound, construct.elements)
 		ListAllocExpr(alloc, typ, loc):
-			free_vars_expr(state, bound, alloc.capacity)
+			free_vars_expr(facts, bound, alloc.capacity)
 		ListGetExpr(get, typ, loc):
 			merge_free_vars(
-				free_vars_expr(state, bound, get.list),
-				free_vars_expr(state, bound, get.index),
+				free_vars_expr(facts, bound, get.list),
+				free_vars_expr(facts, bound, get.index),
 			)
 		ListHandoffExpr(handoff, typ, loc):
-			var result: List[FreeVar] = free_vars_expr(state, bound, handoff.source)
+			var result: List[FreeVar] = free_vars_expr(facts, bound, handoff.source)
 			result = merge_free_vars(
 				result,
-				free_vars_expr(state, bound, handoff.capacity),
+				free_vars_expr(facts, bound, handoff.capacity),
 			)
 			inner_bound: List[String] = bound
 				.add_bound_var(handoff.source_var)
@@ -1887,159 +1901,159 @@ private pure func free_vars_expr(
 				.add_bound_var(handoff.out_var)
 			merge_free_vars(
 				result,
-				free_vars_expr(state, inner_bound, handoff.body),
+				free_vars_expr(facts, inner_bound, handoff.body),
 			)
 		ListHandoffSetOwnedExpr(set, typ, loc):
-			var result: List[FreeVar] = free_vars_expr(state, bound, set.list)
+			var result: List[FreeVar] = free_vars_expr(facts, bound, set.list)
 			result = merge_free_vars(
 				result,
-				free_vars_expr(state, bound, set.index),
+				free_vars_expr(facts, bound, set.index),
 			)
 			merge_free_vars(
 				result,
-				free_vars_boxed_storage_value(state, bound, set.value),
+				free_vars_boxed_storage_value(facts, bound, set.value),
 			)
 		ListHandoffSetSourceSlotExpr(slot, typ, loc):
-			var result: List[FreeVar] = free_vars_expr(state, bound, slot.result)
+			var result: List[FreeVar] = free_vars_expr(facts, bound, slot.result)
 			result = merge_free_vars(
 				result,
-				free_vars_expr(state, bound, slot.out_index),
+				free_vars_expr(facts, bound, slot.out_index),
 			)
 			result = merge_free_vars(
 				result,
-				free_vars_expr(state, bound, slot.source),
+				free_vars_expr(facts, bound, slot.source),
 			)
 			merge_free_vars(
 				result,
-				free_vars_expr(state, bound, slot.source_index),
+				free_vars_expr(facts, bound, slot.source_index),
 			)
 		StringByteReadExpr(read, typ, loc):
 			merge_free_vars(
-				free_vars_expr(state, bound, read.source),
-				free_vars_expr(state, bound, read.index),
+				free_vars_expr(facts, bound, read.source),
+				free_vars_expr(facts, bound, read.index),
 			)
 		StringByteWriteExpr(write, typ, loc):
-			var result: List[FreeVar] = free_vars_expr(state, bound, write.target)
+			var result: List[FreeVar] = free_vars_expr(facts, bound, write.target)
 			result = merge_free_vars(
 				result,
-				free_vars_expr(state, bound, write.index),
+				free_vars_expr(facts, bound, write.index),
 			)
 			merge_free_vars(
 				result,
-				free_vars_expr(state, bound, write.byte),
+				free_vars_expr(facts, bound, write.byte),
 			)
 		StringByteCopyExpr(copy, typ, loc):
-			var result: List[FreeVar] = free_vars_expr(state, bound, copy.dst)
+			var result: List[FreeVar] = free_vars_expr(facts, bound, copy.dst)
 			result = merge_free_vars(
 				result,
-				free_vars_expr(state, bound, copy.dst_pos),
+				free_vars_expr(facts, bound, copy.dst_pos),
 			)
 			result = merge_free_vars(
 				result,
-				free_vars_expr(state, bound, copy.src),
+				free_vars_expr(facts, bound, copy.src),
 			)
 			result = merge_free_vars(
 				result,
-				free_vars_expr(state, bound, copy.src_pos),
+				free_vars_expr(facts, bound, copy.src_pos),
 			)
 			merge_free_vars(
 				result,
-				free_vars_expr(state, bound, copy.len),
+				free_vars_expr(facts, bound, copy.len),
 			)
 		StringSetLenExpr(set_len, typ, loc):
 			merge_free_vars(
-				free_vars_expr(state, bound, set_len.target),
-				free_vars_expr(state, bound, set_len.len),
+				free_vars_expr(facts, bound, set_len.target),
+				free_vars_expr(facts, bound, set_len.len),
 			)
 		TensorLiteralExpr(literal, typ, loc):
-			free_vars_tensor_payload(state, bound, literal.payload)
+			free_vars_tensor_payload(facts, bound, literal.payload)
 		TensorBoxedLiteralExpr(literal, typ, loc):
-			free_vars_boxed_storage_values(state, bound, literal.elements)
+			free_vars_boxed_storage_values(facts, bound, literal.elements)
 		TensorPackedLiteralExpr(literal, typ, loc):
 			[]
 		TensorRawFillExpr(fill, typ, loc):
 			merge_free_vars(
-				free_vars_expr(state, bound, fill.value),
-				free_vars_exprs(state, bound, fill.dims),
+				free_vars_expr(facts, bound, fill.value),
+				free_vars_exprs(facts, bound, fill.dims),
 			)
 		TensorRawReadExpr(read, typ, loc):
-			free_vars_expr(state, bound, read.index)
+			free_vars_expr(facts, bound, read.index)
 		TensorRawWriteExpr(write, typ, loc):
 			merge_free_vars(
-				free_vars_expr(state, bound, write.index),
-				free_vars_expr(state, bound, write.value),
+				free_vars_expr(facts, bound, write.index),
+				free_vars_expr(facts, bound, write.value),
 			)
 		TensorRawViewLetExpr(binding, body, typ, loc):
-			var result: List[FreeVar] = free_vars_expr(state, bound, binding.source)
+			var result: List[FreeVar] = free_vars_expr(facts, bound, binding.source)
 			merge_free_vars(
 				result,
 				free_vars_expr(
-					state,
+					facts,
 					add_bound_var(bound, binding.variable),
 					body,
 				),
 			)
 		DictExpr(entries, typ, loc):
-			free_vars_dict_literal_entries(state, bound, entries)
+			free_vars_dict_literal_entries(facts, bound, entries)
 		DictConstructExpr(construct, typ, loc):
-			free_vars_dict_entries(state, bound, construct.entries)
+			free_vars_dict_entries(facts, bound, construct.entries)
 		SetAllocExpr(alloc, typ, loc):
 			[]
 		ListRetainExpr(retain, typ, loc):
-			var result: List[FreeVar] = free_vars_expr(state, bound, retain.list)
+			var result: List[FreeVar] = free_vars_expr(facts, bound, retain.list)
 			merge_free_vars(
 				result,
-				free_vars_boxed_storage_value(state, bound, retain.value),
+				free_vars_boxed_storage_value(facts, bound, retain.value),
 			)
 		ListSetExpr(set, typ, loc):
-			var result: List[FreeVar] = free_vars_expr(state, bound, set.list)
+			var result: List[FreeVar] = free_vars_expr(facts, bound, set.list)
 			result = merge_free_vars(
 				result,
-				free_vars_expr(state, bound, set.index),
+				free_vars_expr(facts, bound, set.index),
 			)
 			merge_free_vars(
 				result,
-				free_vars_boxed_storage_value(state, bound, set.value),
+				free_vars_boxed_storage_value(facts, bound, set.value),
 			)
 		ListSwapExpr(swap, typ, loc):
-			var result: List[FreeVar] = free_vars_expr(state, bound, swap.list)
+			var result: List[FreeVar] = free_vars_expr(facts, bound, swap.list)
 			result = merge_free_vars(
 				result,
-				free_vars_expr(state, bound, swap.left_index),
+				free_vars_expr(facts, bound, swap.left_index),
 			)
 			merge_free_vars(
 				result,
-				free_vars_expr(state, bound, swap.right_index),
+				free_vars_expr(facts, bound, swap.right_index),
 			)
 		RecordExpr(fields, typ, loc):
-			free_vars_record_fields(state, bound, fields)
+			free_vars_record_fields(facts, bound, fields)
 		RecordUpdateExpr(base, fields, typ, loc):
 			merge_free_vars(
-				free_vars_expr(state, bound, base),
-				free_vars_record_fields(state, bound, fields),
+				free_vars_expr(facts, bound, base),
+				free_vars_record_fields(facts, bound, fields),
 			)
 		RecordReuseExpr(source, fields, typ, loc):
 			merge_free_vars(
-				free_vars_expr(state, bound, source),
-				free_vars_record_fields(state, bound, fields),
+				free_vars_expr(facts, bound, source),
+				free_vars_record_fields(facts, bound, fields),
 			)
 		RecordCowUpdateExpr(source, fields, typ, loc):
 			merge_free_vars(
-				free_vars_record_cow_fields(state, bound, fields),
-				free_vars_expr(state, bound, source),
+				free_vars_record_cow_fields(facts, bound, fields),
+				free_vars_expr(facts, bound, source),
 			)
 		RecordConstructExpr(type_name, fields, typ, loc):
-			free_vars_record_fields(state, bound, fields)
+			free_vars_record_fields(facts, bound, fields)
 		UnionConstructExpr(construct, typ, loc):
-			free_vars_boxed_storage_values(state, bound, construct.args)
+			free_vars_boxed_storage_values(facts, bound, construct.args)
 		UnionReuseConstructExpr(construct, typ, loc):
-			var result: List[FreeVar] = free_vars_expr(state, bound, construct.source)
+			var result: List[FreeVar] = free_vars_expr(facts, bound, construct.source)
 			merge_free_vars(
 				result,
-				free_vars_boxed_storage_values(state, bound, construct.args),
+				free_vars_boxed_storage_values(facts, bound, construct.args),
 			)
 		PreClosureDetachExpr(detached, typ, loc):
-			free_vars_expr(state, bound, detached)
+			free_vars_expr(facts, bound, detached)
 		DetachExpr(detached, typ, loc):
 			var result: List[FreeVar] = []
 
@@ -2051,199 +2065,199 @@ private pure func free_vars_expr(
 
 			result
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
-			free_vars_expr(state, bound, body)
+			free_vars_expr(facts, bound, body)
 		DropExpr(variable, value_type, release_policy, body, typ, loc):
-			free_vars_expr(state, bound, body)
+			free_vars_expr(facts, bound, body)
 		LetExpr(variable, is_mutable, value_type, rhs, body):
-			var result: List[FreeVar] = free_vars_expr(state, bound, rhs)
+			var result: List[FreeVar] = free_vars_expr(facts, bound, rhs)
 			merge_free_vars(
 				result,
 				free_vars_expr(
-					state,
+					facts,
 					add_bound_var(bound, variable),
 					body,
 				),
 			)
 		BorrowLetExpr(variable, value_type, rhs, body):
-			var result: List[FreeVar] = free_vars_expr(state, bound, rhs)
+			var result: List[FreeVar] = free_vars_expr(facts, bound, rhs)
 			merge_free_vars(
 				result,
 				free_vars_expr(
-					state,
+					facts,
 					add_bound_var(bound, variable),
 					body,
 				),
 			)
 		SeqExpr(first, second):
-			free_vars_sequence(state, bound, expr)
+			free_vars_sequence(facts, bound, expr)
 		WhileExpr(cond, body, typ, loc):
 			merge_free_vars(
-				free_vars_expr(state, bound, cond),
-				free_vars_expr(state, bound, body),
+				free_vars_expr(facts, bound, cond),
+				free_vars_expr(facts, bound, body),
 			)
 		BreakExpr(typ, loc):
 			[]
 		ContinueExpr(typ, loc):
 			[]
 		ResourceScopeExpr(scope, typ, loc):
-			var result: List[FreeVar] = free_vars_expr(state, bound, scope.acquire)
+			var result: List[FreeVar] = free_vars_expr(facts, bound, scope.acquire)
 			scoped_bound: List[String] = add_bound_var(bound, scope.variable)
 			result = merge_free_vars(
 				result,
-				free_vars_expr(state, scoped_bound, scope.body),
+				free_vars_expr(facts, scoped_bound, scope.body),
 			)
 			merge_free_vars(
 				result,
-				free_vars_expr(state, scoped_bound, scope.cleanup),
+				free_vars_expr(facts, scoped_bound, scope.cleanup),
 			)
 		ResourceCleanupExitExpr(exit, typ, loc):
-			free_vars_exprs(state, bound, exit.cleanups)
+			free_vars_exprs(facts, bound, exit.cleanups)
 		TailrecLoopExpr(params, return_type, body, loc):
 			free_vars_expr(
-				state,
+				facts,
 				add_bound_params(bound, params),
 				body,
 			)
 		TailrecRecurExpr(args, typ, loc):
-			free_vars_exprs(state, bound, args)
+			free_vars_exprs(facts, bound, args)
 		TailrecListSpreadLoopExpr(loop, loc):
 			loop_bound: List[String] = bound
 				.add_bound_param(loop.list_param)
 				.add_bound_var(loop.cursor)
-			free_vars_expr(state, loop_bound, loop.body)
+			free_vars_expr(facts, loop_bound, loop.body)
 		TailrecListSpreadRecurExpr(rebinds, cursor_advance, typ, loc):
 			var result: List[FreeVar] = []
 
 			for rebind in rebinds:
 				result = merge_free_vars(
 					result,
-					free_vars_expr(state, bound, rebind.value),
+					free_vars_expr(facts, bound, rebind.value),
 				)
 
 			result
 		ForRangeExpr(binder, start, end_value, body, typ, loc):
-			var result: List[FreeVar] = free_vars_expr(state, bound, start)
+			var result: List[FreeVar] = free_vars_expr(facts, bound, start)
 			result = merge_free_vars(
 				result,
-				free_vars_expr(state, bound, end_value),
+				free_vars_expr(facts, bound, end_value),
 			)
 			merge_free_vars(
 				result,
 				free_vars_expr(
-					state,
+					facts,
 					add_bound_var(bound, binder.variable),
 					body,
 				),
 			)
 		ForChannelExpr(for_channel, typ, loc):
-			var result: List[FreeVar] = free_vars_expr(state, bound, for_channel.iterable)
+			var result: List[FreeVar] = free_vars_expr(facts, bound, for_channel.iterable)
 			merge_free_vars(
 				result,
 				free_vars_expr(
-					state,
+					facts,
 					add_bound_var(bound, for_channel.binder.variable),
 					for_channel.body,
 				),
 			)
 		ForListExpr(for_list, typ, loc):
-			var result: List[FreeVar] = free_vars_expr(state, bound, for_list.iterable)
+			var result: List[FreeVar] = free_vars_expr(facts, bound, for_list.iterable)
 			merge_free_vars(
 				result,
 				free_vars_expr(
-					state,
+					facts,
 					add_bound_var(bound, for_list.binder.variable),
 					for_list.body,
 				),
 			)
 		ForStringExpr(for_string, typ, loc):
-			var result: List[FreeVar] = free_vars_expr(state, bound, for_string.iterable)
+			var result: List[FreeVar] = free_vars_expr(facts, bound, for_string.iterable)
 			merge_free_vars(
 				result,
 				free_vars_expr(
-					state,
+					facts,
 					add_bound_var(bound, for_string.binder.variable),
 					for_string.body,
 				),
 			)
 		ForDictExpr(for_dict, typ, loc):
-			var result: List[FreeVar] = free_vars_expr(state, bound, for_dict.iterable)
+			var result: List[FreeVar] = free_vars_expr(facts, bound, for_dict.iterable)
 			merge_free_vars(
 				result,
 				free_vars_expr(
-					state,
+					facts,
 					add_bound_var(bound, for_dict.binder.variable),
 					for_dict.body,
 				),
 			)
 		ForSetExpr(for_set, typ, loc):
-			var result: List[FreeVar] = free_vars_expr(state, bound, for_set.iterable)
+			var result: List[FreeVar] = free_vars_expr(facts, bound, for_set.iterable)
 			merge_free_vars(
 				result,
 				free_vars_expr(
-					state,
+					facts,
 					add_bound_var(bound, for_set.binder.variable),
 					for_set.body,
 				),
 			)
 		ForStreamExpr(for_stream, typ, loc):
-			var result: List[FreeVar] = free_vars_expr(state, bound, for_stream.iterable)
+			var result: List[FreeVar] = free_vars_expr(facts, bound, for_stream.iterable)
 			merge_free_vars(
 				result,
 				free_vars_expr(
-					state,
+					facts,
 					add_bound_var(bound, for_stream.binder.variable),
 					for_stream.body,
 				),
 			)
 		ForResourceSourceExpr(for_resource_source, typ, loc):
-			var result: List[FreeVar] = free_vars_expr(state, bound, for_resource_source.iterable)
+			var result: List[FreeVar] = free_vars_expr(facts, bound, for_resource_source.iterable)
 			merge_free_vars(
 				result,
 				free_vars_expr(
-					state,
+					facts,
 					add_bound_var(bound, for_resource_source.binder.variable),
 					for_resource_source.body,
 				),
 			)
 		ForTensorExpr(for_tensor, typ, loc):
-			var result: List[FreeVar] = free_vars_expr(state, bound, for_tensor.iterable)
+			var result: List[FreeVar] = free_vars_expr(facts, bound, for_tensor.iterable)
 			merge_free_vars(
 				result,
 				free_vars_expr(
-					state,
+					facts,
 					add_bound_var(bound, for_tensor.binder.variable),
 					for_tensor.body,
 				),
 			)
 		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
-			var result: List[FreeVar] = free_vars_expr(state, bound, loop.iterable)
+			var result: List[FreeVar] = free_vars_expr(facts, bound, loop.iterable)
 			body_bound: List[String] = add_bound_var(bound, loop.variable)
 			result = merge_free_vars(
 				result,
-				free_vars_expr(state, body_bound, loop.body),
+				free_vars_expr(facts, body_bound, loop.body),
 			)
 			result = merge_free_vars(
 				result,
-				free_vars_optional_expr(state, bound, loop.timeout),
+				free_vars_optional_expr(facts, bound, loop.timeout),
 			)
 			merge_free_vars(
 				result,
-				free_vars_expr(state, bound, loop.limit),
+				free_vars_expr(facts, bound, loop.limit),
 			)
 		ConcurrentlyLoopExpr(loop, typ, loc):
-			var result: List[FreeVar] = free_vars_expr(state, bound, loop.iterable)
+			var result: List[FreeVar] = free_vars_expr(facts, bound, loop.iterable)
 			body_bound: List[String] = add_bound_var(bound, loop.variable)
 			result = merge_free_vars(
 				result,
-				free_vars_expr(state, body_bound, loop.body),
+				free_vars_expr(facts, body_bound, loop.body),
 			)
 			result = merge_free_vars(
 				result,
-				free_vars_optional_expr(state, bound, loop.timeout),
+				free_vars_optional_expr(facts, bound, loop.timeout),
 			)
 			merge_free_vars(
 				result,
-				free_vars_expr(state, bound, loop.limit),
+				free_vars_expr(facts, bound, loop.limit),
 			)
 		PreClosureConcurrentExpr(block, typ, loc):
 			var result: List[FreeVar] = []
@@ -2251,7 +2265,7 @@ private pure func free_vars_expr(
 			for binding in block.bindings:
 				result = merge_free_vars(
 					result,
-					free_vars_expr(state, bound, binding.rhs),
+					free_vars_expr(facts, bound, binding.rhs),
 				)
 
 			var body_bound: List[String] = bound
@@ -2261,11 +2275,11 @@ private pure func free_vars_expr(
 
 			result = merge_free_vars(
 				result,
-				free_vars_expr(state, body_bound, block.body),
+				free_vars_expr(facts, body_bound, block.body),
 			)
 			merge_free_vars(
 				result,
-				free_vars_optional_expr(state, bound, block.timeout),
+				free_vars_optional_expr(facts, bound, block.timeout),
 			)
 		ConcurrentExpr(block, typ, loc):
 			var result: List[FreeVar] = []
@@ -2273,7 +2287,7 @@ private pure func free_vars_expr(
 			for binding in block.bindings:
 				result = merge_free_vars(
 					result,
-					free_vars_expr(state, bound, binding.rhs),
+					free_vars_expr(facts, bound, binding.rhs),
 				)
 
 			var body_bound: List[String] = bound
@@ -2283,31 +2297,31 @@ private pure func free_vars_expr(
 
 			result = merge_free_vars(
 				result,
-				free_vars_expr(state, body_bound, block.body),
+				free_vars_expr(facts, body_bound, block.body),
 			)
 			merge_free_vars(
 				result,
-				free_vars_optional_expr(state, bound, block.timeout),
+				free_vars_optional_expr(facts, bound, block.timeout),
 			)
 		SelectExpr(select_expr, typ, loc):
-			free_vars_select_arms(state, bound, select_expr)
+			free_vars_select_arms(facts, bound, select_expr)
 		RangeExpr(start, end_value, typ, loc):
 			merge_free_vars(
-				free_vars_expr(state, bound, start),
-				free_vars_expr(state, bound, end_value),
+				free_vars_expr(facts, bound, start),
+				free_vars_expr(facts, bound, end_value),
 			)
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
-			var result: List[FreeVar] = free_vars_expr(state, bound, scrutinee)
+			var result: List[FreeVar] = free_vars_expr(facts, bound, scrutinee)
 			result = merge_free_vars(
 				result,
-				free_vars_literal_match_cases(state, bound, cases),
+				free_vars_literal_match_cases(facts, bound, cases),
 			)
 			merge_free_vars(
 				result,
-				free_vars_literal_match_fallback(state, bound, fallback),
+				free_vars_literal_match_fallback(facts, bound, fallback),
 			)
 		RawMatchExpr(scrutinee, cases, typ, loc):
-			var result: List[FreeVar] = free_vars_expr(state, bound, scrutinee)
+			var result: List[FreeVar] = free_vars_expr(facts, bound, scrutinee)
 
 			for case in cases:
 				case_bound: List[String] = bound
@@ -2315,43 +2329,43 @@ private pure func free_vars_expr(
 					.unique()
 				result = merge_free_vars(
 					result,
-					free_vars_expr(state, case_bound, case.body),
+					free_vars_expr(facts, case_bound, case.body),
 				)
 
 			result
 		SemanticMatchExpr(scrutinee, tree, typ, loc):
-			free_vars_exprs(state, bound, immediate_core_expr_children(expr))
+			free_vars_exprs(facts, bound, immediate_core_expr_children(expr))
 		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
-			var result: List[FreeVar] = free_vars_expr(state, bound, scrutinee)
+			var result: List[FreeVar] = free_vars_expr(facts, bound, scrutinee)
 			merge_free_vars(
 				result,
-				free_vars_constructor_literal_match(state, bound, match_expr),
+				free_vars_constructor_literal_match(facts, bound, match_expr),
 			)
 		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
-			var result: List[FreeVar] = free_vars_expr(state, bound, scrutinee)
+			var result: List[FreeVar] = free_vars_expr(facts, bound, scrutinee)
 			merge_free_vars(
 				result,
-				free_vars_constructor_length_match(state, bound, match_expr),
+				free_vars_constructor_length_match(facts, bound, match_expr),
 			)
 		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
-			var result: List[FreeVar] = free_vars_expr(state, bound, scrutinee)
+			var result: List[FreeVar] = free_vars_expr(facts, bound, scrutinee)
 			result = merge_free_vars(
 				result,
-				free_vars_constructor_match_cases(state, bound, cases),
+				free_vars_constructor_match_cases(facts, bound, cases),
 			)
 			merge_free_vars(
 				result,
-				free_vars_constructor_match_fallback(state, bound, fallback),
+				free_vars_constructor_match_fallback(facts, bound, fallback),
 			)
 		IfExpr(cond, then_expr, else_expr, typ, loc):
-			var result: List[FreeVar] = free_vars_expr(state, bound, cond)
+			var result: List[FreeVar] = free_vars_expr(facts, bound, cond)
 			result = merge_free_vars(
 				result,
-				free_vars_expr(state, bound, then_expr),
+				free_vars_expr(facts, bound, then_expr),
 			)
 			merge_free_vars(
 				result,
-				free_vars_expr(state, bound, else_expr),
+				free_vars_expr(facts, bound, else_expr),
 			)
 
 
@@ -2407,13 +2421,13 @@ private pure func next_task_name(state: ClosureState) -> FreshHoistedName:
 
 
 private pure func captures_from_body(
-	state: ClosureState,
+	facts: ClosureFacts,
 	local_bound: List[String],
 	body: CoreExpr,
 ) -> List[FreeVar]:
 	var result: List[FreeVar] = []
 
-	for free_var in free_vars_expr(state, local_bound, body):
+	for free_var in free_vars_expr(facts, local_bound, body):
 		result = add_free_var(result, free_var.name, free_var.typ)
 
 	result
@@ -2425,22 +2439,17 @@ pure func lambda_runtime_captures(
 	params: List[CoreParam],
 	body: CoreExpr,
 ) -> List[CoreClosureCapture]:
-	state: ClosureState = {
+	facts: ClosureFacts = {
 		mode = ConvertClosures,
-		next_eta_index = 0,
-		next_lambda_index = 0,
-		next_task_index = 0,
-		next_def_id = 0,
 		current_module = None,
 		functions_by_id = {},
 		function_collisions_by_id = {},
 		functions_by_name = {},
 		function_definitions = function_definitions,
-		constructor_definitions = constructor_definitions,
-		hoisted = []
+		constructor_definitions = constructor_definitions
 	}
 
-	closure_captures_from_free_vars(captures_from_body(state, add_bound_params([], params), body))
+	closure_captures_from_free_vars(captures_from_body(facts, add_bound_params([], params), body))
 
 
 pure func lambda_has_runtime_captures(
@@ -3904,10 +3913,10 @@ private pure func add_hoisted_function(
 
 
 private pure func function_target_for_var(
-	state: ClosureState,
+	facts: ClosureFacts,
 	variable: CoreVar,
 ) -> Option[CoreFunction]:
-	by_name: Option[CoreFunction] = match state.functions_by_name.get_or(variable.name, []):
+	by_name: Option[CoreFunction] = match facts.functions_by_name.get_or(variable.name, []):
 		[only]:
 			Some(only)
 		_:
@@ -3915,7 +3924,7 @@ private pure func function_target_for_var(
 
 	match variable.def_id:
 		Some(def_id):
-			match state.function_collisions_by_id.get(def_id):
+			match facts.function_collisions_by_id.get(def_id):
 				Some(candidates):
 					var exact: Option[CoreFunction] = None
 
@@ -3931,7 +3940,7 @@ private pure func function_target_for_var(
 						None:
 							by_name
 				None:
-					match state.functions_by_id.get(def_id):
+					match facts.functions_by_id.get(def_id):
 						Some(target):
 							Some(target)
 						None:
@@ -3959,6 +3968,7 @@ private pure func function_ref_call_kind(target: CoreFunction) -> Option[CoreCal
 
 
 private pure func adapt_var_expr(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	expr: CoreExpr,
@@ -3967,17 +3977,17 @@ private pure func adapt_var_expr(
 	loc: CoreSourceLoc,
 ) -> ConvertedExpr:
 	if (
-		state.mode == ConvertClosures
+		facts.mode == ConvertClosures
 		or not is_closure_value_type(typ)
 		or bound.contains(variable.name)
-		or variable_references_definition(variable, state.constructor_definitions)
+		or variable_references_definition(variable, facts.constructor_definitions)
 	):
 		{
 			state = state,
 			expr = expr
 		}
 	else:
-		match function_target_for_var(state, variable):
+		match function_target_for_var(facts, variable):
 			Some(target):
 				match function_ref_call_kind(target):
 					Some(call_kind):
@@ -4017,7 +4027,7 @@ private pure func adapt_var_expr(
 						)
 						adapter: CoreFunction = {
 							name = fresh.name,
-							source_module = fresh.state.current_module,
+							source_module = facts.current_module,
 							type_params = [],
 							params = params,
 							return_type = signature.return_type,
@@ -4063,6 +4073,7 @@ private pure func adapt_var_expr(
 
 
 private pure func hoist_lambda(
+	facts: ClosureFacts,
 	state: ClosureState,
 	capturable: List[String],
 	params: List[CoreParam],
@@ -4072,7 +4083,7 @@ private pure func hoist_lambda(
 	loc: CoreSourceLoc,
 ) -> HoistedClosureCreate:
 	free_vars: List[FreeVar] = captures_from_body(
-		state,
+		facts,
 		add_bound_params([], params),
 		body,
 	)
@@ -4087,7 +4098,7 @@ private pure func hoist_lambda(
 	}
 	func_info: CoreFunction = {
 		name = fresh.name,
-		source_module = fresh.state.current_module,
+		source_module = facts.current_module,
 		type_params = [],
 		params = [],
 		return_type = return_type,
@@ -4111,6 +4122,7 @@ private pure func hoist_lambda(
 
 
 private pure func hoist_task(
+	facts: ClosureFacts,
 	state: ClosureState,
 	capturable: List[String],
 	local_bound: List[String],
@@ -4137,7 +4149,7 @@ private pure func hoist_task(
 	}
 	func_info: CoreFunction = {
 		name = fresh.name,
-		source_module = fresh.state.current_module,
+		source_module = facts.current_module,
 		type_params = [],
 		params = [],
 		return_type = return_type,
@@ -4162,6 +4174,7 @@ private pure func hoist_task(
 
 
 private pure func hoist_copy_task(
+	facts: ClosureFacts,
 	state: ClosureState,
 	capturable: List[String],
 	local_bound: List[String],
@@ -4169,14 +4182,15 @@ private pure func hoist_copy_task(
 	return_type: CoreType,
 	loc: CoreSourceLoc,
 ) -> HoistedTaskClosure:
-	free_vars: List[FreeVar] = captures_from_body(state, local_bound, body)
+	free_vars: List[FreeVar] = captures_from_body(facts, local_bound, body)
 	captures: List[CoreTaskCapture] = free_vars.map(
 		func(free_var): task_capture_from_free_var(free_var, TaskCopyCapture),
 	)
-	hoist_task(state, capturable, local_bound, body, return_type, captures, loc)
+	hoist_task(facts, state, capturable, local_bound, body, return_type, captures, loc)
 
 
 private pure func hoist_loop_task(
+	facts: ClosureFacts,
 	state: ClosureState,
 	capturable: List[String],
 	local_bound: List[String],
@@ -4186,19 +4200,20 @@ private pure func hoist_loop_task(
 	return_type: CoreType,
 	loc: CoreSourceLoc,
 ) -> HoistedTaskClosure:
-	free_vars: List[FreeVar] = captures_from_body(state, local_bound, body)
+	free_vars: List[FreeVar] = captures_from_body(facts, local_bound, body)
 	captures: List[CoreTaskCapture] = task_captures_for_loop(free_vars, loop_variable, item_mode)
-	hoist_task(state, capturable, local_bound, body, return_type, captures, loc)
+	hoist_task(facts, state, capturable, local_bound, body, return_type, captures, loc)
 
 
 private pure func convert_optional_expr(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	expr: Option[CoreExpr],
 ) -> ConvertedOptionalExpr:
 	match expr:
 		Some(found):
-			converted: ConvertedExpr = convert_expr(state, bound, found)
+			converted: ConvertedExpr = convert_expr(facts, state, bound, found)
 
 			if same_core_expr(converted.expr, found):
 				{
@@ -4221,6 +4236,7 @@ private pure func convert_optional_expr(
 
 
 private pure func convert_exprs(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	exprs: List[CoreExpr],
@@ -4231,7 +4247,7 @@ private pure func convert_exprs(
 	var index: Int = 0
 
 	for expr in exprs:
-		converted: ConvertedExpr = convert_expr(current, bound, expr)
+		converted: ConvertedExpr = convert_expr(facts, current, bound, expr)
 		current = converted.state
 
 		if changed:
@@ -4252,11 +4268,12 @@ private pure func convert_exprs(
 
 
 private pure func convert_boxed_storage_value(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	value: CoreBoxedStorageValue,
 ) -> ConvertedBoxedStorageValue:
-	converted: ConvertedExpr = convert_expr(state, bound, value.value)
+	converted: ConvertedExpr = convert_expr(facts, state, bound, value.value)
 
 	if same_core_expr(converted.expr, value.value):
 		{
@@ -4273,6 +4290,7 @@ private pure func convert_boxed_storage_value(
 
 
 private pure func convert_boxed_storage_values(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	values: List[CoreBoxedStorageValue],
@@ -4283,7 +4301,12 @@ private pure func convert_boxed_storage_values(
 	var index: Int = 0
 
 	for value in values:
-		converted: ConvertedBoxedStorageValue = convert_boxed_storage_value(current, bound, value)
+		converted: ConvertedBoxedStorageValue = convert_boxed_storage_value(
+			facts,
+			current,
+			bound,
+			value,
+		)
 		current = converted.state
 
 		if changed:
@@ -4324,19 +4347,20 @@ private pure func converted_tuple_element(
 
 
 private pure func convert_tuple_element(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	element: CoreTupleElement,
 ) -> ConvertedTupleElement:
 	match element:
 		TuplePrimElement(expr):
-			converted: ConvertedExpr = convert_expr(state, bound, expr)
+			converted: ConvertedExpr = convert_expr(facts, state, bound, expr)
 			converted_tuple_element(converted, expr, element, TuplePrimElement(converted.expr))
 		TuplePointerElement(expr):
-			converted: ConvertedExpr = convert_expr(state, bound, expr)
+			converted: ConvertedExpr = convert_expr(facts, state, bound, expr)
 			converted_tuple_element(converted, expr, element, TuplePointerElement(converted.expr))
 		TupleStructElement(expr, c_type):
-			converted: ConvertedExpr = convert_expr(state, bound, expr)
+			converted: ConvertedExpr = convert_expr(facts, state, bound, expr)
 			converted_tuple_element(
 				converted,
 				expr,
@@ -4344,7 +4368,7 @@ private pure func convert_tuple_element(
 				TupleStructElement(converted.expr, c_type),
 			)
 		TupleStackResultElement(expr):
-			converted: ConvertedExpr = convert_expr(state, bound, expr)
+			converted: ConvertedExpr = convert_expr(facts, state, bound, expr)
 			converted_tuple_element(
 				converted,
 				expr,
@@ -4358,17 +4382,18 @@ private pure func convert_tuple_element(
 				changed = False
 			}
 		TupleFloatElement(expr):
-			converted: ConvertedExpr = convert_expr(state, bound, expr)
+			converted: ConvertedExpr = convert_expr(facts, state, bound, expr)
 			converted_tuple_element(converted, expr, element, TupleFloatElement(converted.expr))
 		TupleFloat32Element(expr):
-			converted: ConvertedExpr = convert_expr(state, bound, expr)
+			converted: ConvertedExpr = convert_expr(facts, state, bound, expr)
 			converted_tuple_element(converted, expr, element, TupleFloat32Element(converted.expr))
 		TupleFloat16Element(expr):
-			converted: ConvertedExpr = convert_expr(state, bound, expr)
+			converted: ConvertedExpr = convert_expr(facts, state, bound, expr)
 			converted_tuple_element(converted, expr, element, TupleFloat16Element(converted.expr))
 
 
 private pure func convert_tuple_elements(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	elements: List[CoreTupleElement],
@@ -4379,7 +4404,7 @@ private pure func convert_tuple_elements(
 	var index: Int = 0
 
 	for element in elements:
-		converted: ConvertedTupleElement = convert_tuple_element(current, bound, element)
+		converted: ConvertedTupleElement = convert_tuple_element(facts, current, bound, element)
 		current = converted.state
 
 		if changed:
@@ -4400,6 +4425,7 @@ private pure func convert_tuple_elements(
 
 
 private pure func convert_record_fields(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	fields: List[CoreRecordFieldValue],
@@ -4410,7 +4436,7 @@ private pure func convert_record_fields(
 	var index: Int = 0
 
 	for field in fields:
-		converted: ConvertedExpr = convert_expr(current, bound, field.value)
+		converted: ConvertedExpr = convert_expr(facts, current, bound, field.value)
 		current = converted.state
 		field_changed: Bool = not same_core_expr(converted.expr, field.value)
 
@@ -4437,6 +4463,7 @@ private pure func convert_record_fields(
 
 
 private pure func convert_record_cow_fields(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	fields: List[CoreRecordCowField],
@@ -4449,7 +4476,7 @@ private pure func convert_record_cow_fields(
 	for field in fields:
 		match field.replacement:
 			Some(replacement):
-				converted: ConvertedExpr = convert_expr(current, bound, replacement)
+				converted: ConvertedExpr = convert_expr(facts, current, bound, replacement)
 				current = converted.state
 				field_changed: Bool = not same_core_expr(converted.expr, replacement)
 
@@ -4481,6 +4508,7 @@ private pure func convert_record_cow_fields(
 
 
 private pure func convert_dict_entries(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	entries: List[CoreDictEntry],
@@ -4491,8 +4519,14 @@ private pure func convert_dict_entries(
 	var index: Int = 0
 
 	for entry in entries:
-		key: ConvertedBoxedStorageValue = convert_boxed_storage_value(current, bound, entry.key)
+		key: ConvertedBoxedStorageValue = convert_boxed_storage_value(
+			facts,
+			current,
+			bound,
+			entry.key,
+		)
 		value: ConvertedBoxedStorageValue = convert_boxed_storage_value(
+			facts,
 			key.state,
 			bound,
 			entry.value,
@@ -4526,6 +4560,7 @@ private pure func convert_dict_entries(
 
 
 private pure func convert_dict_literal_entries(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	entries: List[CoreDictLiteralEntry],
@@ -4536,8 +4571,8 @@ private pure func convert_dict_literal_entries(
 	var index: Int = 0
 
 	for entry in entries:
-		key: ConvertedExpr = convert_expr(current, bound, entry.key)
-		value: ConvertedExpr = convert_expr(key.state, bound, entry.value)
+		key: ConvertedExpr = convert_expr(facts, current, bound, entry.key)
+		value: ConvertedExpr = convert_expr(facts, key.state, bound, entry.value)
 		current = value.state
 		entry_changed: Bool = (
 			not same_core_expr(key.expr, entry.key)
@@ -4570,6 +4605,7 @@ private pure func convert_dict_literal_entries(
 
 
 private pure func convert_literal_match_cases(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	cases: List[CoreLiteralMatchCase],
@@ -4581,7 +4617,7 @@ private pure func convert_literal_match_cases(
 
 	for match_case in cases:
 		case_bound: List[String] = add_bound_match_bindings(bound, match_case.bindings)
-		converted: ConvertedExpr = convert_expr(current, case_bound, match_case.body)
+		converted: ConvertedExpr = convert_expr(facts, current, case_bound, match_case.body)
 		current = converted.state
 		case_changed: Bool = not same_core_expr(converted.expr, match_case.body)
 
@@ -4608,13 +4644,14 @@ private pure func convert_literal_match_cases(
 
 
 private pure func convert_literal_match_fallback(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	fallback: CoreLiteralMatchFallback,
 ) -> ConvertedLiteralMatchFallback:
 	match fallback:
 		LiteralMatchFallbackBody(body):
-			converted: ConvertedExpr = convert_expr(state, bound, body)
+			converted: ConvertedExpr = convert_expr(facts, state, bound, body)
 
 			if same_core_expr(converted.expr, body):
 				{
@@ -4630,6 +4667,7 @@ private pure func convert_literal_match_fallback(
 				}
 		LiteralMatchFallbackBindings(bindings, body):
 			converted: ConvertedExpr = convert_expr(
+				facts,
 				state,
 				add_bound_match_bindings(bound, bindings),
 				body,
@@ -4656,13 +4694,14 @@ private pure func convert_literal_match_fallback(
 
 
 private pure func convert_constructor_match_body(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	body: CoreConstructorMatchBody,
 ) -> ConvertedConstructorMatchBody:
 	match body:
 		ConstructorMatchBodyExpr(expr):
-			converted: ConvertedExpr = convert_expr(state, bound, expr)
+			converted: ConvertedExpr = convert_expr(facts, state, bound, expr)
 
 			if same_core_expr(converted.expr, expr):
 				{
@@ -4678,6 +4717,7 @@ private pure func convert_constructor_match_body(
 				}
 		ConstructorMatchBodyLiteral(match_expr):
 			converted: ConvertedConstructorLiteralMatch = convert_constructor_literal_match(
+				facts,
 				state,
 				bound,
 				match_expr,
@@ -4697,6 +4737,7 @@ private pure func convert_constructor_match_body(
 				}
 		ConstructorMatchBodyLength(match_expr):
 			converted: ConvertedConstructorLengthMatch = convert_constructor_length_match(
+				facts,
 				state,
 				bound,
 				match_expr,
@@ -4731,6 +4772,7 @@ record ConvertedConstructorLengthMatch {
 
 
 private pure func convert_constructor_match_cases(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	cases: List[CoreConstructorMatchCase],
@@ -4743,6 +4785,7 @@ private pure func convert_constructor_match_cases(
 	for match_case in cases:
 		case_bound: List[String] = add_bound_match_bindings(bound, match_case.bindings)
 		converted: ConvertedConstructorMatchBody = convert_constructor_match_body(
+			facts,
 			current,
 			case_bound,
 			match_case.body,
@@ -4772,13 +4815,14 @@ private pure func convert_constructor_match_cases(
 
 
 private pure func convert_constructor_match_fallback(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	fallback: CoreConstructorMatchFallback,
 ) -> ConvertedConstructorMatchFallback:
 	match fallback:
 		ConstructorMatchFallbackBody(body):
-			converted: ConvertedExpr = convert_expr(state, bound, body)
+			converted: ConvertedExpr = convert_expr(facts, state, bound, body)
 
 			if same_core_expr(converted.expr, body):
 				{
@@ -4794,6 +4838,7 @@ private pure func convert_constructor_match_fallback(
 				}
 		ConstructorMatchFallbackBindings(bindings, body):
 			converted: ConvertedExpr = convert_expr(
+				facts,
 				state,
 				add_bound_match_bindings(bound, bindings),
 				body,
@@ -4820,12 +4865,19 @@ private pure func convert_constructor_match_fallback(
 
 
 private pure func convert_constructor_literal_match(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	match_expr: CoreConstructorLiteralMatch,
 ) -> ConvertedConstructorLiteralMatch:
-	cases: ConvertedLiteralMatchCases = convert_literal_match_cases(state, bound, match_expr.cases)
+	cases: ConvertedLiteralMatchCases = convert_literal_match_cases(
+		facts,
+		state,
+		bound,
+		match_expr.cases,
+	)
 	fallback: ConvertedLiteralMatchFallback = convert_literal_match_fallback(
+		facts,
 		cases.state,
 		bound,
 		match_expr.fallback,
@@ -4849,12 +4901,14 @@ private pure func convert_constructor_literal_match(
 
 
 private pure func convert_constructor_length_branch(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	branch: CoreConstructorLengthMatchBranch,
 ) -> ConvertedConstructorLengthBranch:
 	branch_bound: List[String] = add_bound_match_bindings(bound, branch.bindings)
 	converted: ConvertedConstructorMatchBody = convert_constructor_match_body(
+		facts,
 		state,
 		branch_bound,
 		branch.body,
@@ -4875,6 +4929,7 @@ private pure func convert_constructor_length_branch(
 
 
 private pure func convert_constructor_length_cases(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	cases: List[CoreConstructorLengthMatchCase],
@@ -4886,6 +4941,7 @@ private pure func convert_constructor_length_cases(
 
 	for match_case in cases:
 		converted: ConvertedConstructorLengthBranch = convert_constructor_length_branch(
+			facts,
 			current,
 			bound,
 			match_case.branch,
@@ -4915,6 +4971,7 @@ private pure func convert_constructor_length_cases(
 
 
 private pure func convert_constructor_length_geq(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	geq: Option[CoreConstructorLengthMatchGeq],
@@ -4922,6 +4979,7 @@ private pure func convert_constructor_length_geq(
 	match geq:
 		Some(found):
 			converted: ConvertedConstructorLengthBranch = convert_constructor_length_branch(
+				facts,
 				state,
 				bound,
 				found.branch,
@@ -4948,6 +5006,7 @@ private pure func convert_constructor_length_geq(
 
 
 private pure func convert_constructor_length_fallback(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	fallback: Option[CoreConstructorLengthMatchBranch],
@@ -4955,6 +5014,7 @@ private pure func convert_constructor_length_fallback(
 	match fallback:
 		Some(branch):
 			converted: ConvertedConstructorLengthBranch = convert_constructor_length_branch(
+				facts,
 				state,
 				bound,
 				branch,
@@ -4981,21 +5041,25 @@ private pure func convert_constructor_length_fallback(
 
 
 private pure func convert_constructor_length_match(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	match_expr: CoreConstructorLengthMatch,
 ) -> ConvertedConstructorLengthMatch:
 	cases: ConvertedConstructorLengthCases = convert_constructor_length_cases(
+		facts,
 		state,
 		bound,
 		match_expr.cases,
 	)
 	geq: ConvertedConstructorLengthGeq = convert_constructor_length_geq(
+		facts,
 		cases.state,
 		bound,
 		match_expr.geq,
 	)
 	fallback: ConvertedConstructorLengthFallback = convert_constructor_length_fallback(
+		facts,
 		geq.state,
 		bound,
 		match_expr.fallback,
@@ -5024,13 +5088,14 @@ private pure func convert_constructor_length_match(
 
 
 private pure func convert_select_arm_kind(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	kind: CoreSelectArmKind,
 ) -> ConvertedSelectArmKind:
 	match kind:
 		SelectRecvArm(recv):
-			converted: ConvertedExpr = convert_expr(state, bound, recv.channel)
+			converted: ConvertedExpr = convert_expr(facts, state, bound, recv.channel)
 
 			if same_core_expr(converted.expr, recv.channel):
 				{
@@ -5045,7 +5110,7 @@ private pure func convert_select_arm_kind(
 					changed = True
 				}
 		SelectSealedArm(channel):
-			converted: ConvertedExpr = convert_expr(state, bound, channel)
+			converted: ConvertedExpr = convert_expr(facts, state, bound, channel)
 
 			if same_core_expr(converted.expr, channel):
 				{
@@ -5060,7 +5125,7 @@ private pure func convert_select_arm_kind(
 					changed = True
 				}
 		SelectAfterArm(timeout):
-			converted: ConvertedExpr = convert_expr(state, bound, timeout)
+			converted: ConvertedExpr = convert_expr(facts, state, bound, timeout)
 
 			if same_core_expr(converted.expr, timeout):
 				{
@@ -5077,6 +5142,7 @@ private pure func convert_select_arm_kind(
 
 
 private pure func convert_select_arms(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	arms: List[CoreSelectArm],
@@ -5087,8 +5153,8 @@ private pure func convert_select_arms(
 	var index: Int = 0
 
 	for arm in arms:
-		kind: ConvertedSelectArmKind = convert_select_arm_kind(current, bound, arm.kind)
-		body: ConvertedExpr = convert_expr(kind.state, bound, arm.body)
+		kind: ConvertedSelectArmKind = convert_select_arm_kind(facts, current, bound, arm.kind)
+		body: ConvertedExpr = convert_expr(facts, kind.state, bound, arm.body)
 		current = body.state
 		arm_changed: Bool = kind.changed or not same_core_expr(body.expr, arm.body)
 
@@ -5124,6 +5190,7 @@ private pure func convert_select_arms(
 -- spine is rebuilt from the tail up and every SeqExpr whose item and tail came
 -- back unchanged is the original node.
 private pure func convert_sequence_expr(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	expr: CoreExpr,
@@ -5145,11 +5212,11 @@ private pure func convert_sequence_expr(
 	var converted_items: List[CoreExpr] = []
 
 	for item in preceding_items:
-		converted: ConvertedExpr = convert_expr(current, bound, item)
+		converted: ConvertedExpr = convert_expr(facts, current, bound, item)
 		current = converted.state
 		converted_items = converted_items.append(converted.expr)
 
-	final_converted: ConvertedExpr = convert_expr(current, bound, final_item)
+	final_converted: ConvertedExpr = convert_expr(facts, current, bound, final_item)
 	var converted_expr: CoreExpr = final_converted.expr
 	var index: Int = converted_items.length() - 1
 
@@ -5179,6 +5246,7 @@ private pure func convert_sequence_expr(
 
 
 private pure func convert_call_expr(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	expr: CoreExpr,
@@ -5189,7 +5257,7 @@ private pure func convert_call_expr(
 	loc: CoreSourceLoc,
 ) -> ConvertedExpr:
 	callee_converted: ConvertedExpr = if (
-		state.mode == AdaptFunctionRefs
+		facts.mode == AdaptFunctionRefs
 		and not call_kind_uses_runtime_callee(kind)
 	):
 		{
@@ -5197,9 +5265,9 @@ private pure func convert_call_expr(
 			expr = callee
 		}
 	else:
-		convert_expr(state, bound, callee)
+		convert_expr(facts, state, bound, callee)
 
-	args_converted: ConvertedExprs = convert_exprs(callee_converted.state, bound, args)
+	args_converted: ConvertedExprs = convert_exprs(facts, callee_converted.state, bound, args)
 
 	if same_core_expr(callee_converted.expr, callee) and not args_converted.changed:
 		{
@@ -5214,6 +5282,7 @@ private pure func convert_call_expr(
 
 
 private pure func convert_logical_expr(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	expr: CoreExpr,
@@ -5255,6 +5324,7 @@ private pure func convert_logical_expr(
 								task_count += 1
 							_:
 								converted_expr: ConvertedExpr = convert_expr(
+									facts,
 									current,
 									bound,
 									current_expr,
@@ -5330,6 +5400,7 @@ private pure func convert_logical_expr(
 
 
 private pure func convert_let_expr(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	expr: CoreExpr,
@@ -5339,9 +5410,9 @@ private pure func convert_let_expr(
 	rhs: CoreExpr,
 	body: CoreExpr,
 ) -> ConvertedExpr:
-	rhs_converted: ConvertedExpr = convert_expr(state, bound, rhs)
+	rhs_converted: ConvertedExpr = convert_expr(facts, state, bound, rhs)
 	body_bound: List[String] = add_bound_var(bound, variable)
-	body_converted: ConvertedExpr = convert_expr(rhs_converted.state, body_bound, body)
+	body_converted: ConvertedExpr = convert_expr(facts, rhs_converted.state, body_bound, body)
 
 	if same_core_expr(rhs_converted.expr, rhs) and same_core_expr(body_converted.expr, body):
 		{
@@ -5356,6 +5427,7 @@ private pure func convert_let_expr(
 
 
 private pure func convert_borrow_let_expr(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	expr: CoreExpr,
@@ -5364,9 +5436,9 @@ private pure func convert_borrow_let_expr(
 	rhs: CoreExpr,
 	body: CoreExpr,
 ) -> ConvertedExpr:
-	rhs_converted: ConvertedExpr = convert_expr(state, bound, rhs)
+	rhs_converted: ConvertedExpr = convert_expr(facts, state, bound, rhs)
 	body_bound: List[String] = add_bound_var(bound, variable)
-	body_converted: ConvertedExpr = convert_expr(rhs_converted.state, body_bound, body)
+	body_converted: ConvertedExpr = convert_expr(facts, rhs_converted.state, body_bound, body)
 
 	if same_core_expr(rhs_converted.expr, rhs) and same_core_expr(body_converted.expr, body):
 		{
@@ -5381,6 +5453,7 @@ private pure func convert_borrow_let_expr(
 
 
 private pure func convert_literal_match_expr(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	expr: CoreExpr,
@@ -5390,13 +5463,15 @@ private pure func convert_literal_match_expr(
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> ConvertedExpr:
-	scrutinee_converted: ConvertedExpr = convert_expr(state, bound, scrutinee)
+	scrutinee_converted: ConvertedExpr = convert_expr(facts, state, bound, scrutinee)
 	cases_converted: ConvertedLiteralMatchCases = convert_literal_match_cases(
+		facts,
 		scrutinee_converted.state,
 		bound,
 		cases,
 	)
 	fallback_converted: ConvertedLiteralMatchFallback = convert_literal_match_fallback(
+		facts,
 		cases_converted.state,
 		bound,
 		fallback,
@@ -5425,6 +5500,7 @@ private pure func convert_literal_match_expr(
 
 
 private pure func convert_raw_match_cases(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	cases: List[CoreRawMatchCase],
@@ -5438,7 +5514,7 @@ private pure func convert_raw_match_cases(
 		case_bound: List[String] = bound
 			.concat(core_pattern_bound_names(case.pattern))
 			.unique()
-		converted: ConvertedExpr = convert_expr(current, case_bound, case.body)
+		converted: ConvertedExpr = convert_expr(facts, current, case_bound, case.body)
 		current = converted.state
 		case_changed: Bool = not same_core_expr(converted.expr, case.body)
 
@@ -5465,6 +5541,7 @@ private pure func convert_raw_match_cases(
 
 
 private pure func convert_raw_match_expr(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	expr: CoreExpr,
@@ -5473,8 +5550,9 @@ private pure func convert_raw_match_expr(
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> ConvertedExpr:
-	scrutinee_converted: ConvertedExpr = convert_expr(state, bound, scrutinee)
+	scrutinee_converted: ConvertedExpr = convert_expr(facts, state, bound, scrutinee)
 	cases_converted: ConvertedRawMatchCases = convert_raw_match_cases(
+		facts,
 		scrutinee_converted.state,
 		bound,
 		cases,
@@ -5493,6 +5571,7 @@ private pure func convert_raw_match_expr(
 
 
 private pure func convert_accessor_literal_match_expr(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	expr: CoreExpr,
@@ -5502,8 +5581,9 @@ private pure func convert_accessor_literal_match_expr(
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> ConvertedExpr:
-	scrutinee_converted: ConvertedExpr = convert_expr(state, bound, scrutinee)
+	scrutinee_converted: ConvertedExpr = convert_expr(facts, state, bound, scrutinee)
 	match_converted: ConvertedConstructorLiteralMatch = convert_constructor_literal_match(
+		facts,
 		scrutinee_converted.state,
 		bound,
 		match_expr,
@@ -5540,13 +5620,19 @@ private pure func add_bound_semantic_match_bindings(
 
 
 private pure func convert_optional_semantic_match_tree(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	tree: Option[CoreSemanticMatchTree],
 ) -> ConvertedOptionalSemanticMatchTree:
 	match tree:
 		Some(value):
-			converted: ConvertedSemanticMatchTree = convert_semantic_match_tree(state, bound, value)
+			converted: ConvertedSemanticMatchTree = convert_semantic_match_tree(
+				facts,
+				state,
+				bound,
+				value,
+			)
 
 			if converted.changed:
 				{
@@ -5569,6 +5655,7 @@ private pure func convert_optional_semantic_match_tree(
 
 
 private pure func convert_semantic_constructor_cases(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	cases: List[CoreSemanticConstructorMatchCase],
@@ -5580,6 +5667,7 @@ private pure func convert_semantic_constructor_cases(
 
 	for match_case in cases:
 		converted: ConvertedSemanticMatchTree = convert_semantic_match_tree(
+			facts,
 			current,
 			bound,
 			match_case.body,
@@ -5605,6 +5693,7 @@ private pure func convert_semantic_constructor_cases(
 
 
 private pure func convert_semantic_literal_cases(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	cases: List[CoreSemanticLiteralMatchCase],
@@ -5616,6 +5705,7 @@ private pure func convert_semantic_literal_cases(
 
 	for match_case in cases:
 		converted: ConvertedSemanticMatchTree = convert_semantic_match_tree(
+			facts,
 			current,
 			bound,
 			match_case.body,
@@ -5641,6 +5731,7 @@ private pure func convert_semantic_literal_cases(
 
 
 private pure func convert_semantic_length_cases(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	cases: List[CoreSemanticLengthMatchCase],
@@ -5652,6 +5743,7 @@ private pure func convert_semantic_length_cases(
 
 	for match_case in cases:
 		converted: ConvertedSemanticMatchTree = convert_semantic_match_tree(
+			facts,
 			current,
 			bound,
 			match_case.body,
@@ -5677,6 +5769,7 @@ private pure func convert_semantic_length_cases(
 
 
 private pure func convert_optional_semantic_length_geq(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	geq: Option[CoreSemanticLengthMatchGeq],
@@ -5684,6 +5777,7 @@ private pure func convert_optional_semantic_length_geq(
 	match geq:
 		Some(value):
 			converted: ConvertedSemanticMatchTree = convert_semantic_match_tree(
+				facts,
 				state,
 				bound,
 				value.body,
@@ -5710,6 +5804,7 @@ private pure func convert_optional_semantic_length_geq(
 
 
 private pure func convert_semantic_match_tree(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	tree: CoreSemanticMatchTree,
@@ -5717,6 +5812,7 @@ private pure func convert_semantic_match_tree(
 	match tree:
 		SemanticMatchLeaf(bindings, body):
 			converted: ConvertedExpr = convert_expr(
+				facts,
 				state,
 				add_bound_semantic_match_bindings(bound, bindings),
 				body,
@@ -5742,11 +5838,13 @@ private pure func convert_semantic_match_tree(
 			}
 		SemanticConstructorMatch(accessor, cases, fallback):
 			(cases_state, converted_cases, cases_changed) = convert_semantic_constructor_cases(
+				facts,
 				state,
 				bound,
 				cases,
 			)
 			converted_fallback: ConvertedOptionalSemanticMatchTree = convert_optional_semantic_match_tree(
+				facts,
 				cases_state,
 				bound,
 				fallback,
@@ -5770,11 +5868,13 @@ private pure func convert_semantic_match_tree(
 				}
 		SemanticLiteralMatch(accessor, cases, fallback):
 			(cases_state, converted_cases, cases_changed) = convert_semantic_literal_cases(
+				facts,
 				state,
 				bound,
 				cases,
 			)
 			converted_fallback: ConvertedSemanticMatchTree = convert_semantic_match_tree(
+				facts,
 				cases_state,
 				bound,
 				fallback,
@@ -5794,16 +5894,19 @@ private pure func convert_semantic_match_tree(
 				}
 		SemanticLengthMatch(accessor, cases, geq, fallback):
 			(cases_state, converted_cases, cases_changed) = convert_semantic_length_cases(
+				facts,
 				state,
 				bound,
 				cases,
 			)
 			converted_geq: ConvertedOptionalSemanticLengthGeq = convert_optional_semantic_length_geq(
+				facts,
 				cases_state,
 				bound,
 				geq,
 			)
 			converted_fallback: ConvertedOptionalSemanticMatchTree = convert_optional_semantic_match_tree(
+				facts,
 				converted_geq.state,
 				bound,
 				fallback,
@@ -5833,6 +5936,7 @@ private pure func convert_semantic_match_tree(
 
 
 private pure func convert_semantic_match_expr(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	expr: CoreExpr,
@@ -5841,8 +5945,9 @@ private pure func convert_semantic_match_expr(
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> ConvertedExpr:
-	scrutinee_converted: ConvertedExpr = convert_expr(state, bound, scrutinee)
+	scrutinee_converted: ConvertedExpr = convert_expr(facts, state, bound, scrutinee)
 	tree_converted: ConvertedSemanticMatchTree = convert_semantic_match_tree(
+		facts,
 		scrutinee_converted.state,
 		bound,
 		tree,
@@ -5861,6 +5966,7 @@ private pure func convert_semantic_match_expr(
 
 
 private pure func convert_length_match_expr(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	expr: CoreExpr,
@@ -5870,8 +5976,9 @@ private pure func convert_length_match_expr(
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> ConvertedExpr:
-	scrutinee_converted: ConvertedExpr = convert_expr(state, bound, scrutinee)
+	scrutinee_converted: ConvertedExpr = convert_expr(facts, state, bound, scrutinee)
 	match_converted: ConvertedConstructorLengthMatch = convert_constructor_length_match(
+		facts,
 		scrutinee_converted.state,
 		bound,
 		match_expr,
@@ -5896,6 +6003,7 @@ private pure func convert_length_match_expr(
 
 
 private pure func convert_constructor_match_expr(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	expr: CoreExpr,
@@ -5906,13 +6014,15 @@ private pure func convert_constructor_match_expr(
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> ConvertedExpr:
-	scrutinee_converted: ConvertedExpr = convert_expr(state, bound, scrutinee)
+	scrutinee_converted: ConvertedExpr = convert_expr(facts, state, bound, scrutinee)
 	cases_converted: ConvertedConstructorMatchCases = convert_constructor_match_cases(
+		facts,
 		scrutinee_converted.state,
 		bound,
 		cases,
 	)
 	fallback_converted: ConvertedConstructorMatchFallback = convert_constructor_match_fallback(
+		facts,
 		cases_converted.state,
 		bound,
 		fallback,
@@ -5942,6 +6052,7 @@ private pure func convert_constructor_match_expr(
 
 
 private pure func convert_if_expr(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	expr: CoreExpr,
@@ -5951,9 +6062,9 @@ private pure func convert_if_expr(
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> ConvertedExpr:
-	cond_converted: ConvertedExpr = convert_expr(state, bound, cond)
-	then_converted: ConvertedExpr = convert_expr(cond_converted.state, bound, then_expr)
-	else_converted: ConvertedExpr = convert_expr(then_converted.state, bound, else_expr)
+	cond_converted: ConvertedExpr = convert_expr(facts, state, bound, cond)
+	then_converted: ConvertedExpr = convert_expr(facts, cond_converted.state, bound, then_expr)
+	else_converted: ConvertedExpr = convert_expr(facts, then_converted.state, bound, else_expr)
 
 	if (
 		same_core_expr(cond_converted.expr, cond)
@@ -5983,25 +6094,26 @@ private pure func convert_if_expr(
 -- sequence, logical, binding, call, match, and `if` spines keep their own
 -- converters so the common recursive shapes stay out of any large frame.
 private pure func convert_expr(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	expr: CoreExpr,
 ) -> ConvertedExpr:
 	match expr:
 		LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _) | VarExpr(_, _, _) | VoidExpr(_, _) | CooperativeCheckpointExpr(_, _) | BreakExpr(_, _) | ContinueExpr(_, _) | SetAllocExpr(_, _, _) | ClosureCreateExpr(_, _, _) | DetachExpr(_, _, _):
-			convert_leaf_expr(state, bound, expr)
+			convert_leaf_expr(facts, state, bound, expr)
 		DebugBlockExpr(_, _, _) | BinaryExpr(_, _, _, _, _) | UnaryExpr(_, _, _, _) | LogicalExpr(_, _, _, _, _) | AssignExpr(_, _, _, _) | CastExpr(_, _, _) | UnboxExpr(_, _, _, _) | FieldExpr(_, _, _, _) | TupleFieldExpr(_, _, _, _) | BoxExpr(_, _, _) | PreClosureDetachExpr(_, _, _) | DupExpr(_, _, _, _, _, _) | DropExpr(_, _, _, _, _, _) | LetExpr(_, _, _, _, _) | BorrowLetExpr(_, _, _, _) | SeqExpr(_, _) | WhileExpr(_, _, _, _) | RangeExpr(_, _, _, _) | IfExpr(_, _, _, _, _):
-			convert_operator_expr(state, bound, expr)
+			convert_operator_expr(facts, state, bound, expr)
 		CallExpr(_, _, _, _, _) | TupleExpr(_, _, _) | TupleConstructExpr(_, _, _) | VectorExpr(_, _, _) | ListConstructExpr(_, _, _) | DictExpr(_, _, _) | DictConstructExpr(_, _, _) | RecordExpr(_, _, _) | RecordUpdateExpr(_, _, _, _) | RecordReuseExpr(_, _, _, _) | RecordCowUpdateExpr(_, _, _, _) | RecordConstructExpr(_, _, _, _) | UnionConstructExpr(_, _, _) | UnionReuseConstructExpr(_, _, _) | SelectExpr(_, _, _):
-			convert_aggregate_expr(state, bound, expr)
+			convert_aggregate_expr(facts, state, bound, expr)
 		ListAllocExpr(_, _, _) | ListGetExpr(_, _, _) | ListHandoffExpr(_, _, _) | ListHandoffSetOwnedExpr(_, _, _) | ListHandoffSetSourceSlotExpr(_, _, _) | ListRetainExpr(_, _, _) | ListSetExpr(_, _, _) | ListSwapExpr(_, _, _) | StringByteReadExpr(_, _, _) | StringByteWriteExpr(_, _, _) | StringByteCopyExpr(_, _, _) | StringSetLenExpr(_, _, _) | TensorLiteralExpr(_, _, _) | TensorBoxedLiteralExpr(_, _, _) | TensorPackedLiteralExpr(_, _, _) | TensorRawFillExpr(_, _, _) | TensorRawReadExpr(_, _, _) | TensorRawWriteExpr(_, _, _) | TensorRawViewLetExpr(_, _, _, _):
-			convert_storage_expr(state, bound, expr)
+			convert_storage_expr(facts, state, bound, expr)
 		LambdaExpr(_, _, _, _, _, _) | TailrecLoopExpr(_, _, _, _) | TailrecRecurExpr(_, _, _) | TailrecListSpreadLoopExpr(_, _) | TailrecListSpreadRecurExpr(_, _, _, _) | ForRangeExpr(_, _, _, _, _, _) | ForChannelExpr(_, _, _) | ForListExpr(_, _, _) | ForStringExpr(_, _, _) | ForDictExpr(_, _, _) | ForSetExpr(_, _, _) | ForStreamExpr(_, _, _) | ForResourceSourceExpr(_, _, _) | ForTensorExpr(_, _, _) | ResourceScopeExpr(_, _, _) | ResourceCleanupExitExpr(_, _, _):
-			convert_loop_expr(state, bound, expr)
+			convert_loop_expr(facts, state, bound, expr)
 		PreClosureConcurrentlyLoopExpr(_, _, _) | ConcurrentlyLoopExpr(_, _, _) | PreClosureConcurrentExpr(_, _, _) | ConcurrentExpr(_, _, _):
-			convert_concurrency_expr(state, bound, expr)
+			convert_concurrency_expr(facts, state, bound, expr)
 		RawMatchExpr(_, _, _, _) | SemanticMatchExpr(_, _, _, _) | LiteralMatchExpr(_, _, _, _, _) | AccessorLiteralMatchExpr(_, _, _, _, _) | LengthMatchExpr(_, _, _, _, _) | ConstructorMatchExpr(_, _, _, _, _, _):
-			convert_match_expr(state, bound, expr)
+			convert_match_expr(facts, state, bound, expr)
 
 
 -- One converted child whose node is rebuilt only when that child changed.
@@ -6026,13 +6138,14 @@ private pure func converted_with_child(
 -- Leaves and nodes conversion never looks inside. A bare function reference
 -- may still become an eta closure.
 private pure func convert_leaf_expr(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	expr: CoreExpr,
 ) -> ConvertedExpr:
 	match expr:
 		VarExpr(variable, typ, loc):
-			adapt_var_expr(state, bound, expr, variable, typ, loc)
+			adapt_var_expr(facts, state, bound, expr, variable, typ, loc)
 		_:
 			{
 				state = state,
@@ -6042,13 +6155,14 @@ private pure func convert_leaf_expr(
 
 -- Operators, casts, field reads, and the simple binding and control forms.
 private pure func convert_operator_expr(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	expr: CoreExpr,
 ) -> ConvertedExpr:
 	match expr:
 		DebugBlockExpr(body, typ, loc):
-			converted: ConvertedExpr = convert_expr(state, bound, body)
+			converted: ConvertedExpr = convert_expr(facts, state, bound, body)
 			converted_with_child(
 				converted,
 				body,
@@ -6056,8 +6170,8 @@ private pure func convert_operator_expr(
 				DebugBlockExpr(converted.expr, typ, loc),
 			)
 		BinaryExpr(op, left, right, typ, loc):
-			left_converted: ConvertedExpr = convert_expr(state, bound, left)
-			right_converted: ConvertedExpr = convert_expr(left_converted.state, bound, right)
+			left_converted: ConvertedExpr = convert_expr(facts, state, bound, left)
+			right_converted: ConvertedExpr = convert_expr(facts, left_converted.state, bound, right)
 
 			if (
 				same_core_expr(left_converted.expr, left)
@@ -6073,7 +6187,7 @@ private pure func convert_operator_expr(
 					expr = BinaryExpr(op, left_converted.expr, right_converted.expr, typ, loc)
 				}
 		UnaryExpr(op, expr_value, typ, loc):
-			converted: ConvertedExpr = convert_expr(state, bound, expr_value)
+			converted: ConvertedExpr = convert_expr(facts, state, bound, expr_value)
 			converted_with_child(
 				converted,
 				expr_value,
@@ -6081,9 +6195,9 @@ private pure func convert_operator_expr(
 				UnaryExpr(op, converted.expr, typ, loc),
 			)
 		LogicalExpr(op, left, right, typ, loc):
-			convert_logical_expr(state, bound, expr)
+			convert_logical_expr(facts, state, bound, expr)
 		AssignExpr(variable, rhs, typ, loc):
-			converted: ConvertedExpr = convert_expr(state, bound, rhs)
+			converted: ConvertedExpr = convert_expr(facts, state, bound, rhs)
 			converted_with_child(
 				converted,
 				rhs,
@@ -6091,7 +6205,7 @@ private pure func convert_operator_expr(
 				AssignExpr(variable, converted.expr, typ, loc),
 			)
 		CastExpr(expr_value, typ, loc):
-			converted: ConvertedExpr = convert_expr(state, bound, expr_value)
+			converted: ConvertedExpr = convert_expr(facts, state, bound, expr_value)
 			converted_with_child(
 				converted,
 				expr_value,
@@ -6099,7 +6213,7 @@ private pure func convert_operator_expr(
 				CastExpr(converted.expr, typ, loc),
 			)
 		UnboxExpr(unbox_kind, expr_value, typ, loc):
-			converted: ConvertedExpr = convert_expr(state, bound, expr_value)
+			converted: ConvertedExpr = convert_expr(facts, state, bound, expr_value)
 			converted_with_child(
 				converted,
 				expr_value,
@@ -6107,7 +6221,7 @@ private pure func convert_operator_expr(
 				UnboxExpr(unbox_kind, converted.expr, typ, loc),
 			)
 		FieldExpr(expr_value, field_name, typ, loc):
-			converted: ConvertedExpr = convert_expr(state, bound, expr_value)
+			converted: ConvertedExpr = convert_expr(facts, state, bound, expr_value)
 			converted_with_child(
 				converted,
 				expr_value,
@@ -6115,7 +6229,7 @@ private pure func convert_operator_expr(
 				FieldExpr(converted.expr, field_name, typ, loc),
 			)
 		TupleFieldExpr(expr_value, field_index, typ, loc):
-			converted: ConvertedExpr = convert_expr(state, bound, expr_value)
+			converted: ConvertedExpr = convert_expr(facts, state, bound, expr_value)
 			converted_with_child(
 				converted,
 				expr_value,
@@ -6123,7 +6237,7 @@ private pure func convert_operator_expr(
 				TupleFieldExpr(converted.expr, field_index, typ, loc),
 			)
 		BoxExpr(box, typ, loc):
-			converted: ConvertedExpr = convert_expr(state, bound, box.value)
+			converted: ConvertedExpr = convert_expr(facts, state, bound, box.value)
 			converted_with_child(
 				converted,
 				box.value,
@@ -6131,9 +6245,9 @@ private pure func convert_operator_expr(
 				BoxExpr({ box | value = converted.expr }, typ, loc),
 			)
 		PreClosureDetachExpr(detached, typ, loc):
-			body: ConvertedExpr = convert_expr(state, bound, detached)
+			body: ConvertedExpr = convert_expr(facts, state, bound, detached)
 
-			if state.mode == AdaptFunctionRefs:
+			if facts.mode == AdaptFunctionRefs:
 				converted_with_child(
 					body,
 					detached,
@@ -6142,6 +6256,7 @@ private pure func convert_operator_expr(
 				)
 			else:
 				task: HoistedTaskClosure = hoist_copy_task(
+					facts,
 					body.state,
 					bound,
 					[],
@@ -6154,7 +6269,7 @@ private pure func convert_operator_expr(
 					expr = DetachExpr(task.task, typ, loc)
 				}
 		DupExpr(variable, var_type, retain_policy, body, typ, loc):
-			body_converted: ConvertedExpr = convert_expr(state, bound, body)
+			body_converted: ConvertedExpr = convert_expr(facts, state, bound, body)
 			converted_with_child(
 				body_converted,
 				body,
@@ -6162,7 +6277,7 @@ private pure func convert_operator_expr(
 				DupExpr(variable, var_type, retain_policy, body_converted.expr, typ, loc),
 			)
 		DropExpr(variable, var_type, release_policy, body, typ, loc):
-			body_converted: ConvertedExpr = convert_expr(state, bound, body)
+			body_converted: ConvertedExpr = convert_expr(facts, state, bound, body)
 			converted_with_child(
 				body_converted,
 				body,
@@ -6170,14 +6285,14 @@ private pure func convert_operator_expr(
 				DropExpr(variable, var_type, release_policy, body_converted.expr, typ, loc),
 			)
 		LetExpr(variable, is_mutable, var_type, rhs, body):
-			convert_let_expr(state, bound, expr, variable, is_mutable, var_type, rhs, body)
+			convert_let_expr(facts, state, bound, expr, variable, is_mutable, var_type, rhs, body)
 		BorrowLetExpr(variable, var_type, rhs, body):
-			convert_borrow_let_expr(state, bound, expr, variable, var_type, rhs, body)
+			convert_borrow_let_expr(facts, state, bound, expr, variable, var_type, rhs, body)
 		SeqExpr(first, second):
-			convert_sequence_expr(state, bound, expr)
+			convert_sequence_expr(facts, state, bound, expr)
 		WhileExpr(cond, body, typ, loc):
-			cond_converted: ConvertedExpr = convert_expr(state, bound, cond)
-			body_converted: ConvertedExpr = convert_expr(cond_converted.state, bound, body)
+			cond_converted: ConvertedExpr = convert_expr(facts, state, bound, cond)
+			body_converted: ConvertedExpr = convert_expr(facts, cond_converted.state, bound, body)
 
 			if (
 				same_core_expr(cond_converted.expr, cond)
@@ -6193,8 +6308,13 @@ private pure func convert_operator_expr(
 					expr = WhileExpr(cond_converted.expr, body_converted.expr, typ, loc)
 				}
 		RangeExpr(start, end_value, typ, loc):
-			start_converted: ConvertedExpr = convert_expr(state, bound, start)
-			end_converted: ConvertedExpr = convert_expr(start_converted.state, bound, end_value)
+			start_converted: ConvertedExpr = convert_expr(facts, state, bound, start)
+			end_converted: ConvertedExpr = convert_expr(
+				facts,
+				start_converted.state,
+				bound,
+				end_value,
+			)
 
 			if (
 				same_core_expr(start_converted.expr, start)
@@ -6210,7 +6330,7 @@ private pure func convert_operator_expr(
 					expr = RangeExpr(start_converted.expr, end_converted.expr, typ, loc)
 				}
 		IfExpr(cond, then_expr, else_expr, typ, loc):
-			convert_if_expr(state, bound, expr, cond, then_expr, else_expr, typ, loc)
+			convert_if_expr(facts, state, bound, expr, cond, then_expr, else_expr, typ, loc)
 		_:
 			{
 				state = state,
@@ -6220,15 +6340,16 @@ private pure func convert_operator_expr(
 
 -- Calls and the literal, record, union, and select aggregates.
 private pure func convert_aggregate_expr(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	expr: CoreExpr,
 ) -> ConvertedExpr:
 	match expr:
 		CallExpr(kind, callee, args, typ, loc):
-			convert_call_expr(state, bound, expr, kind, callee, args, typ, loc)
+			convert_call_expr(facts, state, bound, expr, kind, callee, args, typ, loc)
 		TupleExpr(items, typ, loc):
-			converted: ConvertedExprs = convert_exprs(state, bound, items)
+			converted: ConvertedExprs = convert_exprs(facts, state, bound, items)
 
 			if converted.changed:
 				{
@@ -6242,6 +6363,7 @@ private pure func convert_aggregate_expr(
 				}
 		TupleConstructExpr(tuple_construct, typ, loc):
 			converted: ConvertedTupleElements = convert_tuple_elements(
+				facts,
 				state,
 				bound,
 				tuple_construct.elements,
@@ -6262,7 +6384,7 @@ private pure func convert_aggregate_expr(
 					expr = expr
 				}
 		VectorExpr(items, typ, loc):
-			converted: ConvertedExprs = convert_exprs(state, bound, items)
+			converted: ConvertedExprs = convert_exprs(facts, state, bound, items)
 
 			if converted.changed:
 				{
@@ -6276,6 +6398,7 @@ private pure func convert_aggregate_expr(
 				}
 		ListConstructExpr(construct, typ, loc):
 			converted: ConvertedBoxedStorageValues = convert_boxed_storage_values(
+				facts,
 				state,
 				bound,
 				construct.elements,
@@ -6293,6 +6416,7 @@ private pure func convert_aggregate_expr(
 				}
 		DictExpr(entries, typ, loc):
 			converted: ConvertedDictLiteralEntries = convert_dict_literal_entries(
+				facts,
 				state,
 				bound,
 				entries,
@@ -6309,7 +6433,12 @@ private pure func convert_aggregate_expr(
 					expr = expr
 				}
 		DictConstructExpr(construct, typ, loc):
-			converted: ConvertedDictEntries = convert_dict_entries(state, bound, construct.entries)
+			converted: ConvertedDictEntries = convert_dict_entries(
+				facts,
+				state,
+				bound,
+				construct.entries,
+			)
 
 			if converted.changed:
 				{
@@ -6322,7 +6451,7 @@ private pure func convert_aggregate_expr(
 					expr = expr
 				}
 		RecordExpr(fields, typ, loc):
-			converted: ConvertedRecordFields = convert_record_fields(state, bound, fields)
+			converted: ConvertedRecordFields = convert_record_fields(facts, state, bound, fields)
 
 			if converted.changed:
 				{
@@ -6335,8 +6464,9 @@ private pure func convert_aggregate_expr(
 					expr = expr
 				}
 		RecordUpdateExpr(base, fields, typ, loc):
-			converted_base: ConvertedExpr = convert_expr(state, bound, base)
+			converted_base: ConvertedExpr = convert_expr(facts, state, bound, base)
 			converted: ConvertedRecordFields = convert_record_fields(
+				facts,
 				converted_base.state,
 				bound,
 				fields,
@@ -6353,8 +6483,9 @@ private pure func convert_aggregate_expr(
 					expr = RecordUpdateExpr(converted_base.expr, converted.fields, typ, loc)
 				}
 		RecordReuseExpr(source, fields, typ, loc):
-			converted_source: ConvertedExpr = convert_expr(state, bound, source)
+			converted_source: ConvertedExpr = convert_expr(facts, state, bound, source)
 			converted: ConvertedRecordFields = convert_record_fields(
+				facts,
 				converted_source.state,
 				bound,
 				fields,
@@ -6373,11 +6504,17 @@ private pure func convert_aggregate_expr(
 		RecordCowUpdateExpr(source, fields, typ, loc):
 			-- Fields convert before the source so hoisted names keep their order.
 			converted_fields: ConvertedRecordCowFields = convert_record_cow_fields(
+				facts,
 				state,
 				bound,
 				fields,
 			)
-			converted_source: ConvertedExpr = convert_expr(converted_fields.state, bound, source)
+			converted_source: ConvertedExpr = convert_expr(
+				facts,
+				converted_fields.state,
+				bound,
+				source,
+			)
 
 			if same_core_expr(converted_source.expr, source) and not converted_fields.changed:
 				{
@@ -6395,7 +6532,7 @@ private pure func convert_aggregate_expr(
 					)
 				}
 		RecordConstructExpr(type_name, fields, typ, loc):
-			converted: ConvertedRecordFields = convert_record_fields(state, bound, fields)
+			converted: ConvertedRecordFields = convert_record_fields(facts, state, bound, fields)
 
 			if converted.changed:
 				{
@@ -6409,6 +6546,7 @@ private pure func convert_aggregate_expr(
 				}
 		UnionConstructExpr(construct, typ, loc):
 			converted: ConvertedBoxedStorageValues = convert_boxed_storage_values(
+				facts,
 				state,
 				bound,
 				construct.args,
@@ -6425,8 +6563,9 @@ private pure func convert_aggregate_expr(
 					expr = expr
 				}
 		UnionReuseConstructExpr(construct, typ, loc):
-			source: ConvertedExpr = convert_expr(state, bound, construct.source)
+			source: ConvertedExpr = convert_expr(facts, state, bound, construct.source)
 			args: ConvertedBoxedStorageValues = convert_boxed_storage_values(
+				facts,
 				source.state,
 				bound,
 				construct.args,
@@ -6450,7 +6589,7 @@ private pure func convert_aggregate_expr(
 					)
 				}
 		SelectExpr(select_expr, typ, loc):
-			arms: ConvertedSelectArms = convert_select_arms(state, bound, select_expr)
+			arms: ConvertedSelectArms = convert_select_arms(facts, state, bound, select_expr)
 
 			if arms.changed:
 				{
@@ -6472,13 +6611,14 @@ private pure func convert_aggregate_expr(
 -- List, string, and tensor storage operations whose children live in one
 -- payload record.
 private pure func convert_storage_expr(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	expr: CoreExpr,
 ) -> ConvertedExpr:
 	match expr:
 		ListAllocExpr(alloc, typ, loc):
-			converted: ConvertedExpr = convert_expr(state, bound, alloc.capacity)
+			converted: ConvertedExpr = convert_expr(facts, state, bound, alloc.capacity)
 			converted_with_child(
 				converted,
 				alloc.capacity,
@@ -6486,8 +6626,13 @@ private pure func convert_storage_expr(
 				ListAllocExpr({ alloc | capacity = converted.expr }, typ, loc),
 			)
 		ListGetExpr(get, typ, loc):
-			list_converted: ConvertedExpr = convert_expr(state, bound, get.list)
-			index_converted: ConvertedExpr = convert_expr(list_converted.state, bound, get.index)
+			list_converted: ConvertedExpr = convert_expr(facts, state, bound, get.list)
+			index_converted: ConvertedExpr = convert_expr(
+				facts,
+				list_converted.state,
+				bound,
+				get.index,
+			)
 
 			if (
 				same_core_expr(list_converted.expr, get.list)
@@ -6510,14 +6655,14 @@ private pure func convert_storage_expr(
 					)
 				}
 		ListHandoffExpr(handoff, typ, loc):
-			source: ConvertedExpr = convert_expr(state, bound, handoff.source)
-			capacity: ConvertedExpr = convert_expr(source.state, bound, handoff.capacity)
+			source: ConvertedExpr = convert_expr(facts, state, bound, handoff.source)
+			capacity: ConvertedExpr = convert_expr(facts, source.state, bound, handoff.capacity)
 			body_bound: List[String] = bound
 				.add_bound_var(handoff.source_var)
 				.add_bound_var(handoff.result_var)
 				.add_bound_var(handoff.len_var)
 				.add_bound_var(handoff.out_var)
-			body: ConvertedExpr = convert_expr(capacity.state, body_bound, handoff.body)
+			body: ConvertedExpr = convert_expr(facts, capacity.state, body_bound, handoff.body)
 
 			if (
 				same_core_expr(source.expr, handoff.source)
@@ -6542,9 +6687,10 @@ private pure func convert_storage_expr(
 					)
 				}
 		ListHandoffSetOwnedExpr(set, typ, loc):
-			list: ConvertedExpr = convert_expr(state, bound, set.list)
-			index: ConvertedExpr = convert_expr(list.state, bound, set.index)
+			list: ConvertedExpr = convert_expr(facts, state, bound, set.list)
+			index: ConvertedExpr = convert_expr(facts, list.state, bound, set.index)
 			value: ConvertedBoxedStorageValue = convert_boxed_storage_value(
+				facts,
 				index.state,
 				bound,
 				set.value,
@@ -6573,10 +6719,15 @@ private pure func convert_storage_expr(
 					)
 				}
 		ListHandoffSetSourceSlotExpr(slot, typ, loc):
-			result: ConvertedExpr = convert_expr(state, bound, slot.result)
-			out_index: ConvertedExpr = convert_expr(result.state, bound, slot.out_index)
-			source: ConvertedExpr = convert_expr(out_index.state, bound, slot.source)
-			source_index: ConvertedExpr = convert_expr(source.state, bound, slot.source_index)
+			result: ConvertedExpr = convert_expr(facts, state, bound, slot.result)
+			out_index: ConvertedExpr = convert_expr(facts, result.state, bound, slot.out_index)
+			source: ConvertedExpr = convert_expr(facts, out_index.state, bound, slot.source)
+			source_index: ConvertedExpr = convert_expr(
+				facts,
+				source.state,
+				bound,
+				slot.source_index,
+			)
 
 			if (
 				same_core_expr(result.expr, slot.result)
@@ -6603,8 +6754,8 @@ private pure func convert_storage_expr(
 					)
 				}
 		StringByteReadExpr(read, typ, loc):
-			source: ConvertedExpr = convert_expr(state, bound, read.source)
-			index: ConvertedExpr = convert_expr(source.state, bound, read.index)
+			source: ConvertedExpr = convert_expr(facts, state, bound, read.source)
+			index: ConvertedExpr = convert_expr(facts, source.state, bound, read.index)
 
 			if same_core_expr(source.expr, read.source) and same_core_expr(index.expr, read.index):
 				{
@@ -6624,9 +6775,9 @@ private pure func convert_storage_expr(
 					)
 				}
 		StringByteWriteExpr(write, typ, loc):
-			target: ConvertedExpr = convert_expr(state, bound, write.target)
-			index: ConvertedExpr = convert_expr(target.state, bound, write.index)
-			byte: ConvertedExpr = convert_expr(index.state, bound, write.byte)
+			target: ConvertedExpr = convert_expr(facts, state, bound, write.target)
+			index: ConvertedExpr = convert_expr(facts, target.state, bound, write.index)
+			byte: ConvertedExpr = convert_expr(facts, index.state, bound, write.byte)
 
 			if (
 				same_core_expr(target.expr, write.target)
@@ -6651,11 +6802,11 @@ private pure func convert_storage_expr(
 					)
 				}
 		StringByteCopyExpr(copy, typ, loc):
-			dst: ConvertedExpr = convert_expr(state, bound, copy.dst)
-			dst_pos: ConvertedExpr = convert_expr(dst.state, bound, copy.dst_pos)
-			src: ConvertedExpr = convert_expr(dst_pos.state, bound, copy.src)
-			src_pos: ConvertedExpr = convert_expr(src.state, bound, copy.src_pos)
-			len: ConvertedExpr = convert_expr(src_pos.state, bound, copy.len)
+			dst: ConvertedExpr = convert_expr(facts, state, bound, copy.dst)
+			dst_pos: ConvertedExpr = convert_expr(facts, dst.state, bound, copy.dst_pos)
+			src: ConvertedExpr = convert_expr(facts, dst_pos.state, bound, copy.src)
+			src_pos: ConvertedExpr = convert_expr(facts, src.state, bound, copy.src_pos)
+			len: ConvertedExpr = convert_expr(facts, src_pos.state, bound, copy.len)
 
 			if (
 				same_core_expr(dst.expr, copy.dst)
@@ -6684,8 +6835,8 @@ private pure func convert_storage_expr(
 					)
 				}
 		StringSetLenExpr(set_len, typ, loc):
-			target: ConvertedExpr = convert_expr(state, bound, set_len.target)
-			len: ConvertedExpr = convert_expr(target.state, bound, set_len.len)
+			target: ConvertedExpr = convert_expr(facts, state, bound, set_len.target)
+			len: ConvertedExpr = convert_expr(facts, target.state, bound, set_len.len)
 
 			if (
 				same_core_expr(target.expr, set_len.target)
@@ -6710,7 +6861,7 @@ private pure func convert_storage_expr(
 		TensorLiteralExpr(literal, typ, loc):
 			match literal.payload:
 				TensorRawLiteralPayload(raw):
-					converted: ConvertedExprs = convert_exprs(state, bound, raw.elements)
+					converted: ConvertedExprs = convert_exprs(facts, state, bound, raw.elements)
 
 					if converted.changed:
 						{
@@ -6731,7 +6882,12 @@ private pure func convert_storage_expr(
 							expr = expr
 						}
 				TensorInlineStructLiteralPayload(inline_struct):
-					converted: ConvertedExprs = convert_exprs(state, bound, inline_struct.elements)
+					converted: ConvertedExprs = convert_exprs(
+						facts,
+						state,
+						bound,
+						inline_struct.elements,
+					)
 
 					if converted.changed:
 						{
@@ -6753,6 +6909,7 @@ private pure func convert_storage_expr(
 						}
 		TensorBoxedLiteralExpr(literal, typ, loc):
 			converted: ConvertedBoxedStorageValues = convert_boxed_storage_values(
+				facts,
 				state,
 				bound,
 				literal.elements,
@@ -6773,7 +6930,7 @@ private pure func convert_storage_expr(
 					expr = expr
 				}
 		TensorPackedLiteralExpr(literal, typ, loc):
-			converted: ConvertedExprs = convert_exprs(state, bound, literal.elements)
+			converted: ConvertedExprs = convert_exprs(facts, state, bound, literal.elements)
 
 			if converted.changed:
 				{
@@ -6790,8 +6947,8 @@ private pure func convert_storage_expr(
 					expr = expr
 				}
 		TensorRawFillExpr(fill, typ, loc):
-			value: ConvertedExpr = convert_expr(state, bound, fill.value)
-			dims: ConvertedExprs = convert_exprs(value.state, bound, fill.dims)
+			value: ConvertedExpr = convert_expr(facts, state, bound, fill.value)
+			dims: ConvertedExprs = convert_exprs(facts, value.state, bound, fill.dims)
 
 			if same_core_expr(value.expr, fill.value) and not dims.changed:
 				{
@@ -6811,7 +6968,7 @@ private pure func convert_storage_expr(
 					)
 				}
 		TensorRawReadExpr(read, typ, loc):
-			index: ConvertedExpr = convert_expr(state, bound, read.index)
+			index: ConvertedExpr = convert_expr(facts, state, bound, read.index)
 			converted_with_child(
 				index,
 				read.index,
@@ -6819,8 +6976,8 @@ private pure func convert_storage_expr(
 				TensorRawReadExpr({ read | index = index.expr }, typ, loc),
 			)
 		TensorRawWriteExpr(write, typ, loc):
-			index: ConvertedExpr = convert_expr(state, bound, write.index)
-			value: ConvertedExpr = convert_expr(index.state, bound, write.value)
+			index: ConvertedExpr = convert_expr(facts, state, bound, write.index)
+			value: ConvertedExpr = convert_expr(facts, index.state, bound, write.value)
 
 			if same_core_expr(index.expr, write.index) and same_core_expr(value.expr, write.value):
 				{
@@ -6840,9 +6997,9 @@ private pure func convert_storage_expr(
 					)
 				}
 		TensorRawViewLetExpr(binding, body, typ, loc):
-			source: ConvertedExpr = convert_expr(state, bound, binding.source)
+			source: ConvertedExpr = convert_expr(facts, state, bound, binding.source)
 			body_bound: List[String] = add_bound_var(bound, binding.variable)
-			body_converted: ConvertedExpr = convert_expr(source.state, body_bound, body)
+			body_converted: ConvertedExpr = convert_expr(facts, source.state, body_bound, body)
 
 			if (
 				same_core_expr(source.expr, binding.source)
@@ -6893,6 +7050,7 @@ private pure func converted_for_loop(
 
 -- Lambdas, tail-recursive loops, `for` loops, and resource scopes.
 private pure func convert_loop_expr(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	expr: CoreExpr,
@@ -6900,9 +7058,9 @@ private pure func convert_loop_expr(
 	match expr:
 		LambdaExpr(params, return_type, body, is_pure, typ, loc):
 			body_bound: List[String] = add_bound_params(bound, params)
-			body_converted: ConvertedExpr = convert_expr(state, body_bound, body)
+			body_converted: ConvertedExpr = convert_expr(facts, state, body_bound, body)
 
-			if state.mode == AdaptFunctionRefs:
+			if facts.mode == AdaptFunctionRefs:
 				converted_with_child(
 					body_converted,
 					body,
@@ -6911,6 +7069,7 @@ private pure func convert_loop_expr(
 				)
 			else:
 				hoisted: HoistedClosureCreate = hoist_lambda(
+					facts,
 					body_converted.state,
 					bound,
 					params,
@@ -6925,6 +7084,7 @@ private pure func convert_loop_expr(
 				}
 		TailrecLoopExpr(params, return_type, body, loc):
 			body_converted: ConvertedExpr = convert_expr(
+				facts,
 				state,
 				add_bound_params(bound, params),
 				body,
@@ -6936,7 +7096,7 @@ private pure func convert_loop_expr(
 				TailrecLoopExpr(params, return_type, body_converted.expr, loc),
 			)
 		TailrecRecurExpr(args, typ, loc):
-			converted: ConvertedExprs = convert_exprs(state, bound, args)
+			converted: ConvertedExprs = convert_exprs(facts, state, bound, args)
 
 			if converted.changed:
 				{
@@ -6953,7 +7113,7 @@ private pure func convert_loop_expr(
 				add_bound_var(bound, loop.cursor),
 				loop.params,
 			)
-			body_converted: ConvertedExpr = convert_expr(state, body_bound, loop.body)
+			body_converted: ConvertedExpr = convert_expr(facts, state, body_bound, loop.body)
 			converted_with_child(
 				body_converted,
 				loop.body,
@@ -6967,7 +7127,7 @@ private pure func convert_loop_expr(
 			var index: Int = 0
 
 			for rebind in rebinds:
-				value: ConvertedExpr = convert_expr(current, bound, rebind.value)
+				value: ConvertedExpr = convert_expr(facts, current, bound, rebind.value)
 				current = value.state
 				rebind_changed: Bool = not same_core_expr(value.expr, rebind.value)
 
@@ -6997,9 +7157,15 @@ private pure func convert_loop_expr(
 					expr = expr
 				}
 		ForRangeExpr(binder, start, end_value, body, typ, loc):
-			start_converted: ConvertedExpr = convert_expr(state, bound, start)
-			end_converted: ConvertedExpr = convert_expr(start_converted.state, bound, end_value)
+			start_converted: ConvertedExpr = convert_expr(facts, state, bound, start)
+			end_converted: ConvertedExpr = convert_expr(
+				facts,
+				start_converted.state,
+				bound,
+				end_value,
+			)
 			body_converted: ConvertedExpr = convert_expr(
+				facts,
 				end_converted.state,
 				add_bound_var(bound, binder.variable),
 				body,
@@ -7027,8 +7193,9 @@ private pure func convert_loop_expr(
 					)
 				}
 		ForChannelExpr(for_channel, typ, loc):
-			iterable: ConvertedExpr = convert_expr(state, bound, for_channel.iterable)
+			iterable: ConvertedExpr = convert_expr(facts, state, bound, for_channel.iterable)
 			body: ConvertedExpr = convert_expr(
+				facts,
 				iterable.state,
 				add_bound_var(bound, for_channel.binder.variable),
 				for_channel.body,
@@ -7049,8 +7216,9 @@ private pure func convert_loop_expr(
 				),
 			)
 		ForListExpr(for_list, typ, loc):
-			iterable: ConvertedExpr = convert_expr(state, bound, for_list.iterable)
+			iterable: ConvertedExpr = convert_expr(facts, state, bound, for_list.iterable)
 			body: ConvertedExpr = convert_expr(
+				facts,
 				iterable.state,
 				add_bound_var(bound, for_list.binder.variable),
 				for_list.body,
@@ -7071,8 +7239,9 @@ private pure func convert_loop_expr(
 				),
 			)
 		ForStringExpr(for_string, typ, loc):
-			iterable: ConvertedExpr = convert_expr(state, bound, for_string.iterable)
+			iterable: ConvertedExpr = convert_expr(facts, state, bound, for_string.iterable)
 			body: ConvertedExpr = convert_expr(
+				facts,
 				iterable.state,
 				add_bound_var(bound, for_string.binder.variable),
 				for_string.body,
@@ -7093,8 +7262,9 @@ private pure func convert_loop_expr(
 				),
 			)
 		ForDictExpr(for_dict, typ, loc):
-			iterable: ConvertedExpr = convert_expr(state, bound, for_dict.iterable)
+			iterable: ConvertedExpr = convert_expr(facts, state, bound, for_dict.iterable)
 			body: ConvertedExpr = convert_expr(
+				facts,
 				iterable.state,
 				add_bound_var(bound, for_dict.binder.variable),
 				for_dict.body,
@@ -7115,8 +7285,9 @@ private pure func convert_loop_expr(
 				),
 			)
 		ForSetExpr(for_set, typ, loc):
-			iterable: ConvertedExpr = convert_expr(state, bound, for_set.iterable)
+			iterable: ConvertedExpr = convert_expr(facts, state, bound, for_set.iterable)
 			body: ConvertedExpr = convert_expr(
+				facts,
 				iterable.state,
 				add_bound_var(bound, for_set.binder.variable),
 				for_set.body,
@@ -7137,8 +7308,14 @@ private pure func convert_loop_expr(
 				),
 			)
 		ForResourceSourceExpr(for_resource_source, typ, loc):
-			iterable: ConvertedExpr = convert_expr(state, bound, for_resource_source.iterable)
+			iterable: ConvertedExpr = convert_expr(
+				facts,
+				state,
+				bound,
+				for_resource_source.iterable,
+			)
 			body: ConvertedExpr = convert_expr(
+				facts,
 				iterable.state,
 				add_bound_var(bound, for_resource_source.binder.variable),
 				for_resource_source.body,
@@ -7159,8 +7336,9 @@ private pure func convert_loop_expr(
 				),
 			)
 		ForStreamExpr(for_stream, typ, loc):
-			iterable: ConvertedExpr = convert_expr(state, bound, for_stream.iterable)
+			iterable: ConvertedExpr = convert_expr(facts, state, bound, for_stream.iterable)
 			body: ConvertedExpr = convert_expr(
+				facts,
 				iterable.state,
 				add_bound_var(bound, for_stream.binder.variable),
 				for_stream.body,
@@ -7181,8 +7359,9 @@ private pure func convert_loop_expr(
 				),
 			)
 		ForTensorExpr(for_tensor, typ, loc):
-			iterable: ConvertedExpr = convert_expr(state, bound, for_tensor.iterable)
+			iterable: ConvertedExpr = convert_expr(facts, state, bound, for_tensor.iterable)
 			body: ConvertedExpr = convert_expr(
+				facts,
 				iterable.state,
 				add_bound_var(bound, for_tensor.binder.variable),
 				for_tensor.body,
@@ -7203,10 +7382,10 @@ private pure func convert_loop_expr(
 				),
 			)
 		ResourceScopeExpr(scope, typ, loc):
-			acquire: ConvertedExpr = convert_expr(state, bound, scope.acquire)
+			acquire: ConvertedExpr = convert_expr(facts, state, bound, scope.acquire)
 			scope_bound: List[String] = add_bound_var(bound, scope.variable)
-			body: ConvertedExpr = convert_expr(acquire.state, scope_bound, scope.body)
-			cleanup: ConvertedExpr = convert_expr(body.state, scope_bound, scope.cleanup)
+			body: ConvertedExpr = convert_expr(facts, acquire.state, scope_bound, scope.body)
+			cleanup: ConvertedExpr = convert_expr(facts, body.state, scope_bound, scope.cleanup)
 
 			if (
 				same_core_expr(acquire.expr, scope.acquire)
@@ -7231,7 +7410,7 @@ private pure func convert_loop_expr(
 					)
 				}
 		ResourceCleanupExitExpr(exit, typ, loc):
-			cleanups: ConvertedExprs = convert_exprs(state, bound, exit.cleanups)
+			cleanups: ConvertedExprs = convert_exprs(facts, state, bound, exit.cleanups)
 
 			if cleanups.changed:
 				{
@@ -7252,19 +7431,25 @@ private pure func convert_loop_expr(
 
 -- Structured-concurrency blocks and loops, before and after task hoisting.
 private pure func convert_concurrency_expr(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	expr: CoreExpr,
 ) -> ConvertedExpr:
 	match expr:
 		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
-			iterable: ConvertedExpr = convert_expr(state, bound, loop.iterable)
+			iterable: ConvertedExpr = convert_expr(facts, state, bound, loop.iterable)
 			body_bound: List[String] = add_bound_var(bound, loop.variable)
-			body: ConvertedExpr = convert_expr(iterable.state, body_bound, loop.body)
-			timeout: ConvertedOptionalExpr = convert_optional_expr(body.state, bound, loop.timeout)
-			limit: ConvertedExpr = convert_expr(timeout.state, bound, loop.limit)
+			body: ConvertedExpr = convert_expr(facts, iterable.state, body_bound, loop.body)
+			timeout: ConvertedOptionalExpr = convert_optional_expr(
+				facts,
+				body.state,
+				bound,
+				loop.timeout,
+			)
+			limit: ConvertedExpr = convert_expr(facts, timeout.state, bound, loop.limit)
 
-			if state.mode == AdaptFunctionRefs:
+			if facts.mode == AdaptFunctionRefs:
 				if (
 					same_core_expr(iterable.expr, loop.iterable)
 					and same_core_expr(body.expr, loop.body)
@@ -7291,6 +7476,7 @@ private pure func convert_concurrency_expr(
 					}
 			else:
 				task: HoistedTaskClosure = hoist_loop_task(
+					facts,
 					limit.state,
 					body_bound,
 					[],
@@ -7319,11 +7505,16 @@ private pure func convert_concurrency_expr(
 					)
 				}
 		ConcurrentlyLoopExpr(loop, typ, loc):
-			iterable: ConvertedExpr = convert_expr(state, bound, loop.iterable)
+			iterable: ConvertedExpr = convert_expr(facts, state, bound, loop.iterable)
 			body_bound: List[String] = add_bound_var(bound, loop.variable)
-			body: ConvertedExpr = convert_expr(iterable.state, body_bound, loop.body)
-			timeout: ConvertedOptionalExpr = convert_optional_expr(body.state, bound, loop.timeout)
-			limit: ConvertedExpr = convert_expr(timeout.state, bound, loop.limit)
+			body: ConvertedExpr = convert_expr(facts, iterable.state, body_bound, loop.body)
+			timeout: ConvertedOptionalExpr = convert_optional_expr(
+				facts,
+				body.state,
+				bound,
+				loop.timeout,
+			)
+			limit: ConvertedExpr = convert_expr(facts, timeout.state, bound, loop.limit)
 
 			if (
 				same_core_expr(iterable.expr, loop.iterable)
@@ -7350,14 +7541,14 @@ private pure func convert_concurrency_expr(
 					)
 				}
 		PreClosureConcurrentExpr(block, typ, loc):
-			if state.mode == AdaptFunctionRefs:
+			if facts.mode == AdaptFunctionRefs:
 				var current: ClosureState = state
 				var bindings: List[CorePreClosureConcurrentBinding] = block.bindings
 				var bindings_changed: Bool = False
 				var index: Int = 0
 
 				for binding in block.bindings:
-					rhs: ConvertedExpr = convert_expr(current, bound, binding.rhs)
+					rhs: ConvertedExpr = convert_expr(facts, current, bound, binding.rhs)
 					current = rhs.state
 					binding_changed: Bool = not same_core_expr(rhs.expr, binding.rhs)
 
@@ -7381,8 +7572,9 @@ private pure func convert_concurrency_expr(
 				for binding in block.bindings:
 					body_bound = add_bound_var(body_bound, binding.variable)
 
-				body: ConvertedExpr = convert_expr(current, body_bound, block.body)
+				body: ConvertedExpr = convert_expr(facts, current, body_bound, block.body)
 				timeout: ConvertedOptionalExpr = convert_optional_expr(
+					facts,
 					body.state,
 					bound,
 					block.timeout,
@@ -7415,8 +7607,9 @@ private pure func convert_concurrency_expr(
 				var bindings: List[CoreConcurrentBinding] = []
 
 				for binding in block.bindings:
-					rhs: ConvertedExpr = convert_expr(current, bound, binding.rhs)
+					rhs: ConvertedExpr = convert_expr(facts, current, bound, binding.rhs)
 					task: HoistedTaskClosure = hoist_copy_task(
+						facts,
 						rhs.state,
 						bound,
 						[],
@@ -7437,8 +7630,9 @@ private pure func convert_concurrency_expr(
 				for binding in block.bindings:
 					body_bound = add_bound_var(body_bound, binding.variable)
 
-				body: ConvertedExpr = convert_expr(current, body_bound, block.body)
+				body: ConvertedExpr = convert_expr(facts, current, body_bound, block.body)
 				timeout: ConvertedOptionalExpr = convert_optional_expr(
+					facts,
 					body.state,
 					bound,
 					block.timeout,
@@ -7463,7 +7657,7 @@ private pure func convert_concurrency_expr(
 			var index: Int = 0
 
 			for binding in block.bindings:
-				rhs: ConvertedExpr = convert_expr(current, bound, binding.rhs)
+				rhs: ConvertedExpr = convert_expr(facts, current, bound, binding.rhs)
 				current = rhs.state
 				binding_changed: Bool = not same_core_expr(rhs.expr, binding.rhs)
 
@@ -7487,8 +7681,13 @@ private pure func convert_concurrency_expr(
 			for binding in block.bindings:
 				body_bound = add_bound_var(body_bound, binding.variable)
 
-			body: ConvertedExpr = convert_expr(current, body_bound, block.body)
-			timeout: ConvertedOptionalExpr = convert_optional_expr(body.state, bound, block.timeout)
+			body: ConvertedExpr = convert_expr(facts, current, body_bound, block.body)
+			timeout: ConvertedOptionalExpr = convert_optional_expr(
+				facts,
+				body.state,
+				bound,
+				block.timeout,
+			)
 
 			if (
 				not bindings_changed
@@ -7521,19 +7720,31 @@ private pure func convert_concurrency_expr(
 
 -- The match forms, each with its own spine converter.
 private pure func convert_match_expr(
+	facts: ClosureFacts,
 	state: ClosureState,
 	bound: List[String],
 	expr: CoreExpr,
 ) -> ConvertedExpr:
 	match expr:
 		RawMatchExpr(scrutinee, cases, typ, loc):
-			convert_raw_match_expr(state, bound, expr, scrutinee, cases, typ, loc)
+			convert_raw_match_expr(facts, state, bound, expr, scrutinee, cases, typ, loc)
 		SemanticMatchExpr(scrutinee, tree, typ, loc):
-			convert_semantic_match_expr(state, bound, expr, scrutinee, tree, typ, loc)
+			convert_semantic_match_expr(facts, state, bound, expr, scrutinee, tree, typ, loc)
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
-			convert_literal_match_expr(state, bound, expr, scrutinee, cases, fallback, typ, loc)
+			convert_literal_match_expr(
+				facts,
+				state,
+				bound,
+				expr,
+				scrutinee,
+				cases,
+				fallback,
+				typ,
+				loc,
+			)
 		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
 			convert_accessor_literal_match_expr(
+				facts,
 				state,
 				bound,
 				expr,
@@ -7545,6 +7756,7 @@ private pure func convert_match_expr(
 			)
 		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
 			convert_length_match_expr(
+				facts,
 				state,
 				bound,
 				expr,
@@ -7556,6 +7768,7 @@ private pure func convert_match_expr(
 			)
 		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
 			convert_constructor_match_expr(
+				facts,
 				state,
 				bound,
 				expr,
@@ -7877,44 +8090,54 @@ pure func closure_function_index_diagnostic_snapshot(
 	}
 
 
-private pure func initial_state(program: CoreProgram, mode: ClosurePassMode) -> ClosureState:
+-- Builds the read-only facts about `program` once: the pass mode and the
+-- lookup tables used throughout the walk. Delegates to `index_functions`,
+-- which already follows the local-mutation-then-publish builder shape.
+private pure func closure_facts(program: CoreProgram, mode: ClosurePassMode) -> ClosureFacts:
 	indexes: FunctionIndexes = index_functions(program)
 	{
 		mode = mode,
-		next_eta_index = 0,
-		next_lambda_index = 0,
-		next_task_index = 0,
-		next_def_id = max_program_def_id(program) + 1,
 		current_module = None,
 		functions_by_id = indexes.by_id,
 		function_collisions_by_id = indexes.collisions_by_id,
 		functions_by_name = indexes.by_name,
 		function_definitions = capture_function_definitions(program),
-		constructor_definitions = capture_constructor_definitions(program),
+		constructor_definitions = capture_constructor_definitions(program)
+	}
+
+
+-- The mutable counters and hoisted-function accumulator, seeded once per
+-- program. `hoisted` only ever grows as the walk hoists lambdas/etas/tasks.
+private pure func initial_counters(program: CoreProgram) -> ClosureState:
+	{
+		next_eta_index = 0,
+		next_lambda_index = 0,
+		next_task_index = 0,
+		next_def_id = max_program_def_id(program) + 1,
 		hoisted = []
 	}
 
 
 private pure func convert_function(
+	facts: ClosureFacts,
 	state: ClosureState,
 	decl: CoreDecl,
 	func_info: CoreFunction,
 ) -> ConvertedDecl:
 	match func_info.body:
 		Some(body):
-			state_with_module: ClosureState = { state | current_module = func_info.source_module }
+			facts_with_module: ClosureFacts = { facts | current_module = func_info.source_module }
 			body_bound: List[String] = add_bound_params([], func_info.params)
-			converted: ConvertedExpr = convert_expr(state_with_module, body_bound, body)
-			final_state: ClosureState = { converted.state | current_module = state.current_module }
+			converted: ConvertedExpr = convert_expr(facts_with_module, state, body_bound, body)
 
 			if same_core_expr(converted.expr, body):
 				{
-					state = final_state,
+					state = converted.state,
 					decl = decl
 				}
 			else:
 				{
-					state = final_state,
+					state = converted.state,
 					decl = FunctionDecl({ func_info | body = Some(converted.expr) })
 				}
 		None:
@@ -7925,11 +8148,12 @@ private pure func convert_function(
 
 
 private pure func convert_global(
+	facts: ClosureFacts,
 	state: ClosureState,
 	decl: CoreDecl,
 	global: CoreGlobal,
 ) -> ConvertedDecl:
-	converted: ConvertedExpr = convert_expr(state, [], global.init)
+	converted: ConvertedExpr = convert_expr(facts, state, [], global.init)
 
 	if same_core_expr(converted.expr, global.init):
 		{
@@ -7943,16 +8167,20 @@ private pure func convert_global(
 		}
 
 
-private pure func convert_decl(state: ClosureState, decl: CoreDecl) -> ConvertedOptionalDecl:
+private pure func convert_decl(
+	facts: ClosureFacts,
+	state: ClosureState,
+	decl: CoreDecl,
+) -> ConvertedOptionalDecl:
 	match decl:
 		FunctionDecl(func_info):
 			if func_info.type_params.length() == 0:
-				converted: ConvertedDecl = convert_function(state, decl, func_info)
+				converted: ConvertedDecl = convert_function(facts, state, decl, func_info)
 				{
 					state = converted.state,
 					decl = Some(converted.decl)
 				}
-			else if state.mode == AdaptFunctionRefs:
+			else if facts.mode == AdaptFunctionRefs:
 				{
 					state = state,
 					decl = Some(decl)
@@ -7963,7 +8191,7 @@ private pure func convert_decl(state: ClosureState, decl: CoreDecl) -> Converted
 					decl = None
 				}
 		GlobalDecl(global):
-			converted: ConvertedDecl = convert_global(state, decl, global)
+			converted: ConvertedDecl = convert_global(facts, state, decl, global)
 			{
 				state = converted.state,
 				decl = Some(converted.decl)
@@ -8005,12 +8233,16 @@ private pure func convert_decl(state: ClosureState, decl: CoreDecl) -> Converted
 			}
 
 
-private pure func convert_decls(state: ClosureState, decls: List[CoreDecl]) -> ConvertedDecls:
+private pure func convert_decls(
+	facts: ClosureFacts,
+	state: ClosureState,
+	decls: List[CoreDecl],
+) -> ConvertedDecls:
 	var current: ClosureState = state
 	var converted_decls: List[CoreDecl] = []
 
 	for decl in decls:
-		converted: ConvertedOptionalDecl = convert_decl(current, decl)
+		converted: ConvertedOptionalDecl = convert_decl(facts, current, decl)
 		current = converted.state
 
 		match converted.decl:
@@ -8027,7 +8259,8 @@ private pure func convert_decls(state: ClosureState, decls: List[CoreDecl]) -> C
 
 private pure func run_closure_pass(program: CoreProgram, mode: ClosurePassMode) -> CoreProgram:
 	converted: ConvertedDecls = convert_decls(
-		initial_state(program, mode),
+		closure_facts(program, mode),
+		initial_counters(program),
 		program.decls,
 	)
 	{
