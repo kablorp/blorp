@@ -11,7 +11,7 @@ import:
 		source_start,
 	list: list
 	parse_diagnostic: ParseDiagnostic, parse_error
-	string: string
+	string: string, to_hex
 	token:
 		Keyword(
 			AfterKeyword,
@@ -1378,6 +1378,56 @@ private struct NumberScan {
 }
 
 
+---
+Continuation bytes expected after a UTF-8 lead byte, or -1 when the byte starts
+no sequence: a continuation byte on its own, an overlong lead, or a lead above
+the U+10FFFF range.
+---
+private pure func utf8_continuation_count(lead: Int) -> Int:
+	if lead < 128:
+		0
+	else if lead >= 194 and lead <= 223:
+		1
+	else if lead >= 224 and lead <= 239:
+		2
+	else if lead >= 240 and lead <= 244:
+		3
+	else:
+		-1
+
+
+---
+Width in bytes of the UTF-8 sequence starting at `cursor`, or 0 when the bytes
+there are not a complete sequence.
+---
+private pure func utf8_sequence_width(source: SourceFile, cursor: Cursor, lead: Char) -> Int:
+	continuations: Int = utf8_continuation_count(to_int(lead))
+
+	if continuations < 0:
+		0
+	else:
+		text: String = source.text
+		var index: Int = 1
+		var complete: Bool = True
+
+		while index <= continuations and complete:
+			match text.get(cursor.offset + index):
+				Some(byte):
+					value: Int = to_int(byte)
+
+					if value < 128 or value > 191:
+						complete = False
+					else:
+						index += 1
+				None:
+					complete = False
+
+		if complete:
+			continuations + 1
+		else:
+			0
+
+
 private pure func top_indent(indent_stack: List[Int]) -> Int:
 	indent_stack.get_or(0, 0)
 
@@ -2285,13 +2335,33 @@ pure func lex(source: SourceFile) -> LexResult:
 							group_depth = group_depth_after_symbol(group_depth, found.symbol)
 							cursor = end_cursor
 						None:
-							diagnostics = diagnostics.append(
-								parse_error(
-									source_empty_span(source, cursor),
-									"unexpected character '" + c.to_string() + "'",
-								),
-							)
-							cursor = source_advance(source, cursor)
+							-- Source is scanned by byte, so an unexpected non-ASCII
+							-- byte is one byte of a character. Rendering that byte
+							-- alone re-encodes it as its own codepoint and reports
+							-- one mojibake diagnostic per byte, so quote the whole
+							-- sequence as the single character it is. A byte that
+							-- starts no sequence is reported by value.
+							width: Int = utf8_sequence_width(source, cursor, c)
+
+							if width == 0:
+								diagnostics = diagnostics.append(
+									parse_error(
+										source_empty_span(source, cursor),
+										"unexpected byte 0x" + to_hex(to_int(c)),
+									),
+								)
+								cursor = source_advance(source, cursor)
+							else:
+								diagnostics = diagnostics.append(
+									parse_error(
+										source_empty_span(source, cursor),
+										"unexpected character '" + source.text.substring(
+											cursor.offset,
+											width,
+										) + "'",
+									),
+								)
+								cursor = cursor_advanced(source, cursor, width)
 
 	while top_indent(indent_stack) > 0:
 		tokens = tokens.append(token(DedentToken, source_empty_span(source, cursor)))

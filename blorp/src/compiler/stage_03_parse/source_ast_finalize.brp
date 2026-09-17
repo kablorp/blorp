@@ -482,6 +482,41 @@ private pure func append_lit_part(
 		parts.append(InterpolationLiteralText(literal))
 
 
+-- The token text is a byte-indexed copy of the source, so a verbatim run has to
+-- be copied as bytes. Rebuilding one Char at a time would re-encode every byte
+-- of a multibyte character as its own codepoint and corrupt the text. Both
+-- helpers start past the first byte so a run always advances.
+private pure func plain_literal_run_end(text: String, start: Int) -> Int:
+	var index: Int = start + 1
+
+	while index < text.length():
+		ch: Char = text.get_or(index, '\0')
+
+		if ch == '\\' or ch == '{':
+			break
+
+		index += 1
+
+	index
+
+
+private pure func plain_expr_run_end(text: String, start: Int, in_string: Bool) -> Int:
+	var index: Int = start + 1
+
+	while index < text.length():
+		ch: Char = text.get_or(index, '\0')
+
+		if ch == '\\' or ch == '\"':
+			break
+
+		if not in_string and (ch == '{' or ch == '}'):
+			break
+
+		index += 1
+
+	index
+
+
 pure func split_interpolated_string(
 	span: SourceSpan,
 	text: String,
@@ -556,16 +591,16 @@ pure func split_interpolated_string(
 				current: Char = text.get_or(index, '\0')
 
 				if current == '\\' and index + 1 < text.length():
-					expr_text = expr_text.append_char(current)
-					expr_text = expr_text.append_char(text.get_or(index + 1, '\0'))
+					expr_text += text.substring(index, 2)
 					index += 2
 				else if current == '\"':
 					in_string = not in_string
 					expr_text = expr_text.append_char(current)
 					index += 1
 				else if in_string:
-					expr_text = expr_text.append_char(current)
-					index += 1
+					run_end: Int = plain_expr_run_end(text, index, True)
+					expr_text += text.substring(index, run_end - index)
+					index = run_end
 				else if current == '{':
 					depth += 1
 					expr_text = expr_text.append_char(current)
@@ -578,16 +613,18 @@ pure func split_interpolated_string(
 
 					index += 1
 				else:
-					expr_text = expr_text.append_char(current)
-					index += 1
+					run_end: Int = plain_expr_run_end(text, index, False)
+					expr_text += text.substring(index, run_end - index)
+					index = run_end
 
 			if depth > 0:
 				error = Some(parse_error(span, "Unclosed `" + "$" + "{` in string interpolation"))
 			else:
 				parts = parts.append(InterpolationExprText(expr_text))
 		else:
-			literal = literal.append_char(ch)
-			index += 1
+			run_end: Int = plain_literal_run_end(text, index)
+			literal += text.substring(index, run_end - index)
+			index = run_end
 
 	match error:
 		Some(diagnostic):
