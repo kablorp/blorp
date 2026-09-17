@@ -121,6 +121,23 @@ after; a facts change that keys a hot table by id must move them.
 `benchmarks/attribute_sample --pass <module path> --map <profiled C>` gives
 the per-phase category split (see `benchmarks/README.md`).
 
+The frontend-only loop: `--stop-after=lower` ends the compile after core
+lowering, so a self-compile iteration takes about 5 s instead of 17 s and
+the lowered-Core dump proves identity of every frontend product:
+
+```bash
+BLORP_COMPILER_MEMORY_PROFILE=1 BLORP_TYPECHECK_BODY_METRICS=1 \
+bin/blorp compile --stop-after=lower --dump-core-after=lower --dump-core-file=/tmp/cand.core \
+  --time-phases --no-format --std-dir $input/standard_library/src -o /dev/null $input/blorp/src/main.brp \
+  2>/tmp/cand.txt
+cmp /tmp/base.core /tmp/cand.core     # base.core from the same command on the base build
+```
+
+`cand.txt` carries the phase times, the typecheck metrics rows, and the
+allocation checkpoint rows for the three frontend phases. Use this for
+every intermediate step and the full harness only for the numbers you
+report per cut.
+
 The fast loop is a small program: compile it, dump the phase you touched
 (`--dump-core-after=lower` for lowering; `--typed-summary` or the typed AST
 JSON for typecheck), and diff against the base build. The medium loop is
