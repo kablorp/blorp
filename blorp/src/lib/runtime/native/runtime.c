@@ -21122,7 +21122,10 @@ struct blorp_Fiber {
 
 static _Thread_local blorp_Fiber* __blorp_current_fiber = NULL;
 _Thread_local void* __blorp_current_task = NULL;  // current blorp_Task* (for cancellation checks)
-static _Thread_local long __blorp_cooperative_checkpoint_budget =
+// Not static: runtime_decl.c declares this extern so generated C compiled
+// against a precompiled runtime object can inline the fast-path decrement
+// (see blorp_cooperative_checkpoint below and its runtime_decl.c copy).
+_Thread_local long __blorp_cooperative_checkpoint_budget =
     BLORP_COOPERATIVE_CHECKPOINT_INTERVAL;
 #if defined(BLORP_COOPERATIVE_CHECKPOINT_TESTING)
 typedef struct blorp_CooperativeCheckpointTestStats {
@@ -21152,6 +21155,7 @@ __blorp_cooperative_checkpoint_test_snapshot(void) {
 #define BLORP_COOPERATIVE_CHECKPOINT_TEST_STAT_INC(field) ((void)0)
 #endif
 void blorp_cooperative_checkpoint(void);
+void blorp_cooperative_checkpoint_slow_extern(void);
 static _Atomic int __blorp_scheduler_debug_cache = -1;
 static _Atomic uint64_t __blorp_next_wait_operation_id = 1;
 
@@ -25679,11 +25683,14 @@ void blorp_yield_now(void) {
 // Unlike source-level yield_now(), this is intended for generated checkpoints
 // in CPU-heavy loops. It uses a carrier-thread reduction budget so hot paths do
 // not inspect task or fiber TLS until the budget expires.
-void blorp_cooperative_checkpoint(void) {
-    BLORP_COOPERATIVE_CHECKPOINT_TEST_STAT_INC(checkpoint_calls);
-    __blorp_cooperative_checkpoint_budget--;
-    if (__builtin_expect(__blorp_cooperative_checkpoint_budget > 0, 1)) return;
-
+//
+// The fast path (the budget decrement and branch) is duplicated as a static
+// inline in runtime_decl.c for generated C linked against a precompiled
+// runtime object; that copy calls blorp_cooperative_checkpoint_slow_extern
+// below instead of recursing into this function. Keep the two fast paths
+// identical and keep all counted behavior in the slow path so the test
+// statistics stay exact regardless of which fast path was taken.
+static void blorp_cooperative_checkpoint_slow(void) {
     BLORP_COOPERATIVE_CHECKPOINT_TEST_STAT_INC(checkpoint_slow_path_entries);
     // Reset before cancellation, which may exit this frame through longjmp.
     __blorp_cooperative_checkpoint_budget =
@@ -25695,6 +25702,18 @@ void blorp_cooperative_checkpoint(void) {
     if (!__blorp_current_fiber) return;
     BLORP_COOPERATIVE_CHECKPOINT_TEST_STAT_INC(yield_considerations);
     blorp_yield_now();
+}
+
+// Cross-TU entry point for the runtime_decl.c inline fast path.
+void blorp_cooperative_checkpoint_slow_extern(void) {
+    blorp_cooperative_checkpoint_slow();
+}
+
+void blorp_cooperative_checkpoint(void) {
+    BLORP_COOPERATIVE_CHECKPOINT_TEST_STAT_INC(checkpoint_calls);
+    __blorp_cooperative_checkpoint_budget--;
+    if (__builtin_expect(__blorp_cooperative_checkpoint_budget > 0, 1)) return;
+    blorp_cooperative_checkpoint_slow();
 }
 
 // max_threads() -> Int

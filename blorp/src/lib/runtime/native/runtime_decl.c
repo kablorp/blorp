@@ -991,6 +991,7 @@ static inline void* blorp_call4(blorp_Closure* closure, void* arg1, void* arg2, 
 
 extern void* __blorp_none_singleton_ptr;
 extern _Thread_local void* __blorp_current_task;
+extern _Thread_local long __blorp_cooperative_checkpoint_budget;
 
 // ============================================================================
 // Forward Declarations — All non-static runtime functions
@@ -1007,6 +1008,10 @@ void blorp_set_destructor_id(void* obj, uint32_t id);
 // Release slow path (destructor + free + stats) — defined in runtime.o
 void blorp_release_slow_extern(void* obj);
 void blorp_release_arc_only_slow_extern(void* obj);
+
+// Cooperative checkpoint slow path (budget reset, cancellation poll, yield)
+// — defined in runtime.o
+void blorp_cooperative_checkpoint_slow_extern(void);
 
 // Single-threaded mode: use plain increment/decrement instead of atomics
 #ifdef BLORP_SINGLE_THREADED
@@ -1888,7 +1893,18 @@ long blorp_test_websocket_state_probe(void);
 long blorp_test_process_spawn_fallback_probe(void);
 void blorp_sleep(long ms);
 void blorp_yield_now(void);
-void blorp_cooperative_checkpoint(void);
+// Inline fast path for the compiler-owned cooperative checkpoint (avoids
+// cross-TU call overhead on every loop iteration). Must stay behaviorally
+// identical to the runtime.c copy: decrement the thread-local budget and
+// fall to the out-of-line slow path only when it reaches zero. All counted
+// behavior (test statistics, budget reset, cancellation poll, yield) lives
+// in the slow path so semantics do not depend on which fast path ran.
+static inline void blorp_cooperative_checkpoint(void) {
+    if (__builtin_expect(--__blorp_cooperative_checkpoint_budget > 0, 1)) {
+        return;
+    }
+    blorp_cooperative_checkpoint_slow_extern();
+}
 long blorp_max_threads(void);
 
 // Channels
