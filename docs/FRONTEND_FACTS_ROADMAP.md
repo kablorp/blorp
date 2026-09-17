@@ -294,6 +294,8 @@ shared dictionary field copies it (`blorp_dict_copy` in the profile).
 3.6% of the compile; header completion is another 5.9%. Ceiling for this
 task: 5 to 8% of the compile, plus the header pass becoming cacheable.
 
+**Status (2026-09-17).** Landed as the header-install builder (`6ccd89809`); see the results table. The per-body split already existed (`InferModuleFacts`/`InferSession`). Two generated-C lessons from it: `result_aliases_var` treats a bare `acc` return bound from `state` as aliasing (return a record update instead), and `from_opaque` of a borrowed argument retains, so an opaque-wrapped dictionary updated through a helper copies unless the update is done at an assignment site from a local owner.
+
 **Change.** Split as the closure conversion did: `ModuleFacts` (module
 view, module scope, known-type index, type homes, private impls, admission,
 flag) built once per module and passed by borrow; a per-body builder that
@@ -476,3 +478,6 @@ files), then F6 and F5 together.
 | F3 backend type naming facts and reserved-identifier index | landed | `aff15726a` | instructions -1.52% | the cost was a 54-entry `List[String].contains` per emitted local reference, not concatenation; naming facts flat but single-sourced |
 | typecheck state reuse (type-home and known-type early-outs folded into the update) | landed | `e346793d1` | instructions -0.39%; ~23k fewer typecheck allocations | partial: consume-specialization never clones a helper whose parameter is a `Dict` or `List` (`consume_specialize.brp:448` accepts only records and unions), so container updates through helpers still copy; opened as a codegen task (consume-containers) |
 | T7b parser as a builder with a scalar cursor | landed | `4996e97c9` | `source_discovery_complete` -10.3%; instructions -1.2% | `ParserState` deleted; the parser never backtracks, so no cursor-save machinery was needed; remaining discovery cost is one heap object per token in the lexer and the AST nodes |
+| header install as a per-module builder (T4 as re-scoped) | landed | `6ccd89809` | `typed_frontend_complete` -1.5% | 24,435 per-edge installs became 718 per-module section builds; C and 1,354 diagnostic fixtures identical; the header install was 2.9% of the phase, body checking is 72%, so the next typecheck lever is `Scope.symbols_by_name` and the `env_add_*` tail-call chain |
+| Perceus short-circuit ownership fix (other session) plus coverage | landed | `4cf07d54e` | Perceus allocations +8% (1.4M in the fix, 2.3M more in its worklist follow-up) | fixes a real leak for `flag and f(borrowed)`; the parser stopgap was reverted once the compiler fix covered it; the allocation cost of the extra operand scans is a follow-up for that session |
+| r7 / s3 baselines | recorded | `fdb932b93` | bootstrap -O2 176.3G; stage-2 172.3G; small stage-2 -3.7% vs s2 | generated C changed on main through the C emitter's split layout, so r6 identity is stale; use r7 and s3 |
