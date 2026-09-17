@@ -24,6 +24,7 @@ import:
 		COMPILER_FRONTEND_IMPLICIT_MODULE_PATHS,
 		FrontendDiscoveryError,
 		FrontendSourceCandidate,
+		FrontendSourceLocation,
 		FrontendSourceResolution(FrontendSourceResolved, FrontendSourceUnresolved),
 		frontend_discovery_error_message,
 		frontend_graph_service_error_message,
@@ -81,7 +82,7 @@ import:
 	fs: message, open_read, read_text, walk_files
 	path: dirname, join, normalize, stem
 	path_identity: canonical_existing_path
-	source: source_file
+	source: SourceFile, source_file
 	system: file_exists, getcwd, getenv, is_directory, temp_dir
 
 
@@ -226,16 +227,14 @@ pure func parsed_cli_source_from_program(program: ParsedProgram) -> CliParsedSou
 	}
 
 
-union CliResolvedImportContents:
-	CliFilesystemImport
-	CliEmbeddedImport(String)
-
-
+--- Where an import resolved to, with no text read. `load_source_for_location`
+--- loads the text later, deciding embedded-vs-filesystem the same way this
+--- was resolved: by origin and `FrontendGraphContext.std_dir`, not by
+--- anything carried here.
 record CliResolvedImportSource {
 	path: String,
 	module_name: String,
-	origin: ModuleOrigin,
-	contents: CliResolvedImportContents
+	origin: ModuleOrigin
 }
 
 
@@ -621,22 +620,25 @@ private pure func filesystem_import_source(
 	{
 		path = normalize(path),
 		module_name = module_name,
-		origin = origin,
-		contents = CliFilesystemImport
+		origin = origin
 	}
 
 
+--- Reports whether the embedded standard library carries `module_name`,
+--- without holding onto its text: a location that is later discovered for
+--- the first time re-fetches it from `embedded_std_source`, an in-memory
+--- lookup with no I/O cost either way.
 private pure func embedded_std_import_source(
 	module_name: String,
 ) -> Option[CliResolvedImportSource]:
-	source_text ?= embedded_std_source(module_name)
-
-	Some({
-		path = "<embedded:${module_name}>",
-		module_name = module_name,
-		origin = StdlibModule,
-		contents = CliEmbeddedImport(source_text),
-	})
+	if embedded_std_source(module_name).is_some():
+		Some({
+			path = "<embedded:${module_name}>",
+			module_name = module_name,
+			origin = StdlibModule,
+		})
+	else:
+		None
 
 
 private pure func source_package_layout(package: FrontendSourcePackage) -> SourcePackageLayout:
@@ -797,31 +799,49 @@ private func resolve_frontend_import_lookup(
 			resolve_path_import(path, None, context)
 
 
-private func read_cli_import_source(
-	resolved: CliResolvedImportSource,
-) -> Result[Option[CliSourceFile], String]:
-	match resolved.contents:
-		CliEmbeddedImport(source_text):
-			Ok(Some({
-				path = resolved.path,
-				module_name = resolved.module_name,
-				source_text = source_text,
-			}))
-		CliFilesystemImport:
-			if not file_exists(resolved.path):
-				Ok(None)
-			else:
-				source ?= read_text_file(
-					resolved.path,
-				).map_err(
-					func(err): "failed to read source file `" + resolved.path + "`: " + err,
-				)
+--- Reads the file a resolved location names. Every filesystem lookup already
+--- passed a `file_exists` check on this exact path while it was resolved
+--- (`resolve_path_import`, `resolve_source_package_alias_import`,
+--- `resolve_source_package_internal_import`, `resolve_native_package_import`,
+--- and the `std_dir`-set branch of `resolve_standard_library_import` each
+--- gate their `filesystem_import_source` call on one); a file that vanishes
+--- between that check and this read surfaces as a hard error rather than a
+--- silent `Unresolved`, since discovery does not defend against the
+--- filesystem changing under one compiler run.
+private func read_source_file(location: FrontendSourceLocation) -> Result[SourceFile, String]:
+	text ?= read_text_file(
+		location.path,
+	).map_err(
+		func(err): "failed to read source file `" + location.path + "`: " + err,
+	)
 
-				Ok(Some({
-					path = resolved.path,
-					module_name = resolved.module_name,
-					source_text = source,
-				}))
+	Ok(source_file(location.path, location.module_name, text))
+
+
+--- Loads a located import's text, one call per module identity the
+--- discovery walk has not already seen. Recomputes embedded-vs-filesystem
+--- from the location's origin and `context.std_dir` instead of carrying that
+--- decision from resolve time, so resolving an import never does more than
+--- decide where it lives.
+private func load_source_for_location(
+	context: FrontendGraphContext,
+	location: FrontendSourceLocation,
+) -> Result[SourceFile, String]:
+	match resolved_module_origin(location.identity):
+		StdlibModule:
+			match context.std_dir:
+				Some(_):
+					read_source_file(location)
+				None:
+					match embedded_std_source(location.module_name):
+						Some(text):
+							Ok(source_file(location.path, location.module_name, text))
+						None:
+							Err(
+								"embedded standard library is missing `" + location.module_name + "`",
+							)
+		_:
+			read_source_file(location)
 
 
 private pure func generated_import_binding(
@@ -988,6 +1008,9 @@ private func parsed_source_candidate(
 	}
 
 
+--- Locates an import with no I/O: it stops at path, module name and origin.
+--- `load_source_for_location` fetches the text later, and only for a
+--- location whose identity the discovery walk has not already discovered.
 private func resolve_frontend_source_candidate(
 	context: FrontendGraphContext,
 	importer: FrontendSourceCandidate,
@@ -1003,20 +1026,14 @@ private func resolve_frontend_source_candidate(
 		None:
 			Ok(FrontendSourceUnresolved)
 		Some(source):
-			match read_cli_import_source(source):
-				Err(message):
-					Err(message)
-				Ok(None):
-					Ok(FrontendSourceUnresolved)
-				Ok(Some(import_source)):
-					Ok(
-						FrontendSourceResolved(
-							source_candidate_with_origin(
-								import_source,
-								source.origin,
-							),
-						),
-					)
+			Ok(FrontendSourceResolved({
+				identity = resolved_module_identity_from_resolver(
+					source.module_name,
+					source.origin,
+				),
+				path = source.path,
+				module_name = source.module_name,
+			}))
 
 
 private pure func parsed_source_for_compiler_module(module: FrontendModule) -> CliParsedSourceFile:
@@ -1046,8 +1063,14 @@ private func compiler_frontend_graph_for_roots(
 	seed_candidates = implicit_sources.map(func(source):
 		source_candidate_with_origin(source, StdlibModule)
 	)
-	frontend_graph_discover(root_candidates, seed_candidates, func(importer, requested_path):
-		resolve_frontend_source_candidate(context, importer, requested_path)
+	frontend_graph_discover(
+		root_candidates,
+		seed_candidates,
+		func(
+			importer,
+			requested_path,
+		): resolve_frontend_source_candidate(context, importer, requested_path),
+		func(location): load_source_for_location(context, location),
 	).map_err(frontend_discovery_error_message)
 
 

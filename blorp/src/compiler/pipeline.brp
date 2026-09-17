@@ -11,6 +11,7 @@ import:
 		BuildArtifactConfiguration,
 		BuildArtifactError(InvalidForeignLinkArguments),
 		CArtifact,
+	../lib/source: SourceFile
 	frontend_output: typed_program_summary
 	frontend_request: FrontendCompilationGraph
 	path: dirname
@@ -36,7 +37,9 @@ import:
 			FrontendDiscoveryProviderFailed,
 		),
 		FrontendSourceCandidate,
+		FrontendSourceLocation,
 		FrontendSourceResolution(FrontendSourceResolved, FrontendSourceUnresolved),
+		frontend_source_location,
 		validated_frontend_graph_for_modules,
 	stage_04_modules/loaded_module:
 		ResolvedModuleIdentity,
@@ -148,14 +151,18 @@ private pure func discover_frontend_source(
 	}
 
 
-private pure func same_candidate_source(
-	left: FrontendSourceCandidate,
-	right: FrontendSourceCandidate,
+--- Two locations that share a module identity conflict unless they also
+--- agree on path and module name. Identity alone cannot catch this: two
+--- different files can resolve to the same name and origin, which is exactly
+--- the conflict this check exists to report.
+private pure func same_source_location(
+	left: FrontendSourceLocation,
+	right: FrontendSourceLocation,
 ) -> Bool:
 	(
-		left.source.path == right.source.path
-		and left.source.module_name == right.source.module_name
-		and left.source.text == right.source.text
+		resolved_module_identities_equal(left.identity, right.identity)
+		and left.path == right.path
+		and left.module_name == right.module_name
 	)
 
 
@@ -173,13 +180,19 @@ private pure func discovered_source_index(
 	index
 
 
--- The source provider owns effects and package policy. The compiler pipeline
--- owns the deterministic Stage 03/04 walk, exact edge construction, cycle
--- termination, and final graph validation shared by every compiler client.
+--- The source provider owns effects and package policy. The compiler
+--- pipeline owns the deterministic Stage 03/04 walk, exact edge
+--- construction, cycle termination, and final graph validation shared by
+--- every compiler client. `resolve` locates an import with no I/O; `load`
+--- fetches a located module's text and is called at most once per module
+--- identity, the first time the walk sees it, so a module reached by
+--- several import edges is loaded once regardless of how many edges never
+--- turn out to need it.
 func frontend_graph_discover(
 	roots: List[FrontendSourceCandidate],
 	seed_modules: List[FrontendSourceCandidate],
 	resolve: (FrontendSourceCandidate, String) -> Result[FrontendSourceResolution, String],
+	load: (FrontendSourceLocation) -> Result[SourceFile, String],
 ) -> Result[FrontendGraph, FrontendDiscoveryError]:
 	var discovered = roots
 		.concat(seed_modules)
@@ -214,30 +227,48 @@ func frontend_graph_discover(
 									requested_path = requested_path,
 									resolution = FrontendUnresolvedImport,
 								})
-							Ok(FrontendSourceResolved(target)):
+							Ok(FrontendSourceResolved(target_location)):
 								edges = edges.append({
 									importer = importer.identity,
 									requested_path = requested_path,
-									resolution = FrontendResolvedImport(target.identity),
+									resolution = FrontendResolvedImport(target_location.identity),
 								})
 
-								target_key = resolved_module_identity_storage_key(target.identity)
+								target_key = resolved_module_identity_storage_key(
+									target_location.identity,
+								)
 
 								match discovered_by_identity.get(target_key):
 									None:
-										discovered_target = discover_frontend_source(target)
-										discovered = discovered.append(discovered_target)
-										discovered_by_identity = discovered_by_identity.set(
-											target_key,
-											discovered_target,
-										)
-										pending = pending.append(discovered_target)
+										match load(target_location):
+											Err(message):
+												error = Some(
+													FrontendDiscoveryProviderFailed(
+														importer.identity,
+														requested_path,
+														message,
+													),
+												)
+											Ok(target_source):
+												discovered_target = discover_frontend_source({
+													identity = target_location.identity,
+													source = target_source,
+												})
+												discovered = discovered.append(discovered_target)
+												discovered_by_identity = discovered_by_identity.set(
+													target_key,
+													discovered_target,
+												)
+												pending = pending.append(discovered_target)
 									Some(existing):
-										if not same_candidate_source(existing.candidate, target):
+										if not same_source_location(
+											frontend_source_location(existing.candidate),
+											target_location,
+										):
 											error = Some(
 												FrontendDiscoveryIdentityConflict(
-													existing.candidate,
-													target,
+													frontend_source_location(existing.candidate),
+													target_location,
 												),
 											)
 
