@@ -12,13 +12,16 @@ import:
 		frontend_graph_modules,
 	../../../src/compiler/stage_04_modules/frontend_graph_service:
 		COMPILER_FRONTEND_IMPLICIT_MODULE_PATHS,
+		FrontendDiscoveryError(FrontendDiscoveryIdentityConflict),
 		FrontendGraphServiceError(
 			DuplicateCompilerFrontendImportOutcome,
 			MissingCompilerFrontendImportOutcome,
 			UndeclaredCompilerFrontendImportOutcome,
 		),
 		FrontendSourceCandidate,
+		FrontendSourceLocation,
 		FrontendSourceResolution(FrontendSourceResolved, FrontendSourceUnresolved),
+		frontend_source_location,
 		validated_frontend_graph_for_modules,
 	../../../src/compiler/stage_04_modules/loaded_module:
 		ModuleOrigin(UserModule),
@@ -26,7 +29,7 @@ import:
 		resolved_module_identities_equal,
 		resolved_module_identity_from_resolver,
 	../../../src/compiler/stage_04_modules/module_surface: module_surface_for_program
-	../../../src/lib/source: source_file
+	../../../src/lib/source: SourceFile, source_file
 	test: TestSuite
 
 
@@ -213,17 +216,26 @@ private pure func resolve_cycle_source(
 	requested_path: String,
 ) -> Result[FrontendSourceResolution, String]:
 	if importer.source.module_name == "app" and requested_path == "dep":
-		Ok(FrontendSourceResolved(cycle_source("dep", "app")))
+		Ok(FrontendSourceResolved(frontend_source_location(cycle_source("dep", "app"))))
 	else if importer.source.module_name == "dep" and requested_path == "app":
-		Ok(FrontendSourceResolved(cycle_source("app", "dep")))
+		Ok(FrontendSourceResolved(frontend_source_location(cycle_source("app", "dep"))))
 	else:
 		Ok(FrontendSourceUnresolved)
+
+
+private pure func load_cycle_source(location: FrontendSourceLocation) -> Result[SourceFile, String]:
+	imported_module: String = if location.module_name == "app":
+		"dep"
+	else:
+		"app"
+
+	Ok(cycle_source(location.module_name, imported_module).source)
 
 
 func test_discovery_owns_parsing_resolution_edges_and_cycle_termination() -> Bool:
 	app = cycle_source("app", "dep")
 
-	match frontend_graph_discover([app], [], resolve_cycle_source):
+	match frontend_graph_discover([app], [], resolve_cycle_source, load_cycle_source):
 		Err(_):
 			False
 		Ok(graph):
@@ -231,6 +243,49 @@ func test_discovery_owns_parsing_resolution_edges_and_cycle_termination() -> Boo
 				frontend_graph_import_edges(graph).length() == 2
 				and frontend_graph_modules(graph).length() == 2
 			)
+
+
+private pure func conflicting_dep_location(path: String) -> FrontendSourceResolution:
+	candidate: FrontendSourceCandidate = {
+		identity = identity("dep"),
+		source = source_file(path, "dep", "VALUE = 1\n")
+	}
+	FrontendSourceResolved(frontend_source_location(candidate))
+
+
+private pure func resolve_conflicting_dep(
+	_importer: FrontendSourceCandidate,
+	requested_path: String,
+) -> Result[FrontendSourceResolution, String]:
+	if requested_path == "a":
+		Ok(conflicting_dep_location("/workspace/dep_a.brp"))
+	else if requested_path == "b":
+		Ok(conflicting_dep_location("/workspace/dep_b.brp"))
+	else:
+		Ok(FrontendSourceUnresolved)
+
+
+private pure func load_conflicting_dep(
+	location: FrontendSourceLocation,
+) -> Result[SourceFile, String]:
+	Ok(source_file(location.path, location.module_name, "VALUE = 1\n"))
+
+
+func test_discovery_rejects_identity_conflict_with_different_paths() -> Bool:
+	app: FrontendSourceCandidate = {
+		identity = identity("app"),
+		source = source_file("/workspace/app.brp", "app", "import:\n\ta\n\tb\n\nVALUE = 1\n")
+	}
+
+	match frontend_graph_discover([app], [], resolve_conflicting_dep, load_conflicting_dep):
+		Err(FrontendDiscoveryIdentityConflict(first, second)):
+			(
+				resolved_module_identities_equal(first.identity, identity("dep"))
+				and resolved_module_identities_equal(second.identity, identity("dep"))
+				and first.path != second.path
+			)
+		_:
+			False
 
 
 func test_discovery_retains_exact_module_surface() -> Bool:
@@ -248,6 +303,7 @@ func test_discovery_retains_exact_module_surface() -> Bool:
 			[app],
 			[],
 			func(_importer, _requested): Ok(FrontendSourceUnresolved),
+			func(_location): Err("not reached"),
 		)
 	):
 		Err(_):
@@ -306,6 +362,10 @@ tests: TestSuite = {
 		(
 			"own parsing resolution edges and cycle termination",
 			test_discovery_owns_parsing_resolution_edges_and_cycle_termination,
+		),
+		(
+			"reject identity conflict with different paths",
+			test_discovery_rejects_identity_conflict_with_different_paths,
 		),
 		("retain exact module surface", test_discovery_retains_exact_module_surface),
 		(
