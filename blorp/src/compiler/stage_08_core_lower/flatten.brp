@@ -477,47 +477,98 @@ private pure func build_callable_name_facts(
 	name_facts
 
 
-private pure func materialize_builtin_overload(
-	name_facts: Dict[String, CallableNameFacts],
-	function_info: CoreFunction,
-) -> CoreFunction:
-	match function_info.function_kind:
-		UserFunction:
-			if (
-				function_info.body.is_none()
-				and name_facts
-					.get(function_info.name)
-					.map(func(facts): facts.has_unresolved_builtin)
-					.get_or(False)
-			):
-				-- A bodyless declaration paired with a source `builtin(...)`
-				-- declaration is another purity overload of that implementation.
-				-- Keep its distinct callable ID and signature so calls selected
-				-- during typechecking can be specialized without guessing.
-				{ function_info | function_kind = UnresolvedBuiltinFunction }
-			else:
-				function_info
-		_:
-			function_info
+-- The facts published alongside a module's materialized declarations. Built
+-- once per module in `materialize_builtin_overloads_with_facts` below and
+-- completed (target selection included) before any consumer reads it; no
+-- consumer rebuilds `Dict[String, CallableNameFacts]` from the function list
+-- again.
+private record MaterializedCallableFacts {
+	decls: List[CoreDecl],
+	name_facts: Dict[String, CallableNameFacts]
+}
 
 
-private pure func materialize_builtin_overload_decl(
-	name_facts: Dict[String, CallableNameFacts],
-	decl: CoreDecl,
-) -> CoreDecl:
-	match decl:
-		FunctionDecl(function_info):
-			FunctionDecl(materialize_builtin_overload(name_facts, function_info))
-		_:
-			decl
-
-
-private pure func materialize_builtin_overloads(program: CoreProgram) -> CoreProgram:
+-- Builds the callable name facts exactly once per module (from the
+-- as-lowered function list) and completes them for every bodyless
+-- builtin-paired declaration in the same walk that materializes it, so the
+-- product hitting `decls` below is final. Nothing downstream may rebuild
+-- `Dict[String, CallableNameFacts]` from a function list again; target
+-- selection (`add_callable_target_def_ids`) only adds new fields to this
+-- same table.
+--
+-- The loop below mutates `name_facts` and appends to `decls` directly
+-- instead of routing every declaration through a helper that returns
+-- `(CoreDecl, Dict[String, CallableNameFacts])`: a tuple return would box a
+-- pair on every visited declaration, not only the rare promoted one, which
+-- costs more than the second full-dictionary rebuild this change removes.
+private pure func materialize_builtin_overloads_with_facts(
+	program: CoreProgram,
+) -> MaterializedCallableFacts:
 	functions: List[CoreFunction] = top_level_functions(program)
-	name_facts: Dict[String, CallableNameFacts] = build_callable_name_facts(functions)
+	var name_facts: Dict[String, CallableNameFacts] = build_callable_name_facts(functions)
+	var decls: List[CoreDecl] = []
 
-	{ program |
-		decls = program.decls.map(func(decl): materialize_builtin_overload_decl(name_facts, decl))
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				match function_info.function_kind:
+					UserFunction:
+						if (
+							function_info.body.is_none()
+							and name_facts
+								.get(function_info.name)
+								.map(func(facts): facts.has_unresolved_builtin)
+								.get_or(False)
+						):
+							-- A bodyless declaration paired with a source
+							-- `builtin(...)` declaration is another purity
+							-- overload of that implementation. Keep its distinct
+							-- callable ID and signature so calls selected during
+							-- typechecking can be specialized without guessing.
+							--
+							-- The promotion turns this declaration into an
+							-- implementation (`has_callable_implementation`
+							-- treats a bodyless `UnresolvedBuiltinFunction` as
+							-- one), so fold that fact into `name_facts` here
+							-- instead of rescanning every function afterward: it
+							-- is the only fact a promotion can change, since
+							-- `has_unresolved_builtin` was already true for this
+							-- name and promoting one more declaration to that
+							-- kind cannot make it false anywhere.
+							previous: CallableNameFacts = name_facts.get_or(
+								function_info.name,
+								EMPTY_CALLABLE_NAME_FACTS,
+							)
+							name_facts = name_facts.set(
+								function_info.name,
+								{ previous |
+									has_pure_implementation = (
+										previous.has_pure_implementation
+										or function_info.is_pure
+									),
+									has_impure_implementation = (
+										previous.has_impure_implementation
+										or not function_info.is_pure
+									)
+								},
+							)
+							decls = decls.append(
+								FunctionDecl(
+									{ function_info |
+										function_kind = UnresolvedBuiltinFunction
+									},
+								),
+							)
+						else:
+							decls = decls.append(decl)
+					_:
+						decls = decls.append(decl)
+			_:
+				decls = decls.append(decl)
+
+	{
+		decls = decls,
+		name_facts = name_facts
 	}
 
 
@@ -627,13 +678,18 @@ private pure func register_callable_target_name(
 				Err(CoreFlattenCallableTargetNameCollision(target_name))
 
 
+-- Consumes the facts published by `materialize_builtin_overloads_with_facts`;
+-- it only adds the target-selection fields (`pure_target`, `ordinary_target`)
+-- to that same table, it never rebuilds the base facts from `functions`.
 private pure func collect_callable_rewrites(
 	module_prefix: String,
-	program: CoreProgram,
+	functions: List[CoreFunction],
+	base_name_facts: Dict[String, CallableNameFacts],
 ) -> Result[CallableRewritePlan, CoreFlattenError]:
-	functions: List[CoreFunction] = top_level_functions(program)
-	var name_facts: Dict[String, CallableNameFacts] = build_callable_name_facts(functions)
-	name_facts = add_callable_target_def_ids(functions, name_facts)
+	name_facts: Dict[String, CallableNameFacts] = add_callable_target_def_ids(
+		functions,
+		base_name_facts,
+	)
 	var target_def_ids: Dict[String, Int] = {}
 	var rewrites: List[CallableRewrite] = []
 	var error: Option[CoreFlattenError] = None
@@ -679,7 +735,7 @@ private pure func collect_callable_rewrites(
 		None:
 			Ok({
 				rewrites = rewrites,
-				function_visits = functions.length() * 3,
+				function_visits = functions.length() * 2,
 			})
 
 
@@ -3354,11 +3410,16 @@ pure func prefix_module_names_with_aliases(
 	module_name: String,
 	program: CoreProgram,
 ) -> Result[CorePrefixedModule, CoreFlattenError]:
-	materialized_program: CoreProgram = materialize_builtin_overloads(program)
+	materialized: MaterializedCallableFacts = materialize_builtin_overloads_with_facts(program)
+	materialized_program: CoreProgram = { program | decls = materialized.decls }
 	-- Every member this module owns shares one sanitized module identity, so
 	-- spell it once here and join names through the prefix below.
 	module_prefix: String = core_module_member_prefix(module_name)
-	callable_plan ?= collect_callable_rewrites(module_prefix, materialized_program)
+	callable_plan ?= collect_callable_rewrites(
+		module_prefix,
+		top_level_functions(materialized_program),
+		materialized.name_facts,
+	)
 	callable_rewrites: List[CallableRewrite] = callable_plan.rewrites
 	global_rewrites: List[GlobalRewrite] = collect_global_rewrites(
 		module_prefix,
