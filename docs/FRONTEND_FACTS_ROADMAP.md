@@ -51,6 +51,40 @@ dictionary copy means a shared dictionary was updated, which is the
 threaded-state shape. Phase times on the stage-2 compiler: source_discovery
 0.95 s, typed_frontend 3.65 s, core_lowering 1.1 s of about 17 s.
 
+
+## Attribution (2026-09-17, stage-2 compiler, two samples of ~16,000)
+
+| phase | inclusive share of compile | what dominates |
+| --- | ---: | --- |
+| lex | 1.1% | its own scanning plus one heap object per token; ~77 MB/s |
+| parse | 5.2% | allocation and refcount around AST nodes (`blorp_release_slow_finish` is 50% of the subtree); ~16 MB/s |
+| modules | 0.4% | `module_table_canonical_path` and string equality |
+| typecheck | 21.5% | `blorp_dict_cow`+`blorp_dict_copy` 17% of the subtree; string hash and equality 4.7% |
+| CTFE | 1.2% | `ctfe_lookup_binding` by name |
+| core lowering | 7.9% | type-name construction and lookup by string (`core_lower_type_with_prefixes`, `flatten__find_callable_rewrite`) |
+
+The dictionaries being copied are `TypeHomeIndex = Dict[String, TypeHomeEntry]`
+(`state.brp:219`, written by `typecheck_state_record_type_home` and
+`record_installed_type_home` during header install) and
+`Scope.symbols_by_name: Dict[String, List[Int]]` (`type_system/env.brp`,
+written by `scope_add_symbol`/`env_add_symbol` on every binding inside a
+body). Both sit inside a state record that is threaded by value, so every
+insert into a shared dictionary copies it. A `DefinitionId` already exists
+for every declaration before these tables are populated
+(`graph/definition_index.brp:116`).
+
+Typecheck's own phase rows (`BLORP_TYPECHECK_BODY_METRICS=1`, microseconds,
+one instrumented run): `indexed_graph` 289k, `bound_modules` 177k,
+`callable_headers` 78k, `graph_completion` 941k (of which
+`global_header_completion` 927k), `module_bodies` 2,205k for 12,800 bodies
+(11,987 in the compiler's own source, 813 in the standard library). The
+header completion is a whole-program pass with no incremental path; a
+language server would pay it on every edit. The smallest independently
+checkable unit today is one body, after that pass has run.
+
+Parser: `current_token` is still 6.9% of the parser's self time; the rest
+of its non-scanning cost is `ParsedExpr` node allocation and destruction.
+
 ## How to measure a facts change
 
 None of these tasks changes generated C, so the oracle is byte identity
@@ -128,6 +162,8 @@ has not finished; the point is that the old shape cannot come back.
 | 2 | T4 typecheck as a per-module facts record plus per-body builder | `stage_06_typecheck/state.brp`, `decl.brp`, `bridge.brp` | yes: independently checkable bodies | after the attribution checkpoint |
 | 3 | T5 publish the definition table out of typecheck | `graph/definition_index.brp`, `decl.brp`, then mono, DCE, Perceus index builders | yes: symbol table | after T3, T4 |
 | 3 | T6 key lowering's tables by definition and type id | `stage_08_core_lower/lower.brp`, `list_layout.brp` | no | after T5 |
+| 2 | T7 parser nodes without per-node ownership traffic | `stage_03_parse` | yes: per-keystroke work | T1, T2, T4 |
+| 4 | T8 cacheable header completion (design) | `stage_06_typecheck/decl.brp`, `headers/` | essential | after T4 |
 
 ### T1. Module lookups by `ModuleId`
 
@@ -222,6 +258,10 @@ accumulators together through 328 parameters and returns a new state per
 body (`TypecheckFunctionBodyResult { state, typed }`). Any update to a
 shared dictionary field copies it (`blorp_dict_copy` in the profile).
 
+**Numbers.** Dictionary copies are 17% of the typecheck subtree, about
+3.6% of the compile; header completion is another 5.9%. Ceiling for this
+task: 5 to 8% of the compile, plus the header pass becoming cacheable.
+
 **Change.** Split as the closure conversion did: `ModuleFacts` (module
 view, module scope, known-type index, type homes, private impls, admission,
 flag) built once per module and passed by borrow; a per-body builder that
@@ -272,6 +312,38 @@ per definition id in the published table instead.
 **Acceptance.** Identical C; `core_lowering_complete` allocations down;
 `blorp_string_eq` and `blorp_dict_hash_string` samples down; lowering
 suites and compiler-check green.
+
+### T7. Parser nodes without per-node ownership traffic
+
+**Context.** Parsing is 79% of discovery and runs at 16 MB/s where lexing
+runs at 77 MB/s; half of its cost is allocating, retaining, and destroying
+`ParsedExpr` nodes and their lists, not scanning. `current_token` is still
+re-read at 6.9% of the parser's self time.
+
+**Change.** Measure first with a sample restricted to `stage_03_parse` and
+a per-node-kind allocation count; then the cuts that the numbers pick
+among: build child lists with a single local accumulator and one publish
+per node; keep the current token in a struct local instead of re-reading;
+return small scalar results as structs. The formatter is the oracle
+(`bin/blorp format --check blorp/src standard_library/src`), plus the
+parser suites and identical C.
+
+**Acceptance.** Identical C; `source_discovery_complete` allocations down
+at least 20%; parse throughput reported before and after; formatter clean.
+Serves the LSP directly: parsing is the per-keystroke work.
+
+### T8. Header completion that does not restart from scratch (design)
+
+**Context.** `graph_completion` re-derives every module's accepted record,
+union, alias, and global headers on every compile (927 ms here). For a
+from-scratch compile T4 makes it cheaper; for an editor it must become
+cacheable per module, keyed by a hash of the module's declarations.
+
+**Deliverable.** A design note, not code: what the per-module header
+product is, what it depends on (imports' surfaces), how it is keyed and
+invalidated, and what T4's `ModuleFacts` needs to look like so that a
+cached header product can be loaded in place of recomputation. Written
+after T4 lands, by whoever did T4.
 
 ## Results
 
