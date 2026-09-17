@@ -23,6 +23,8 @@ Measured on the frozen input (`0c2e104331a2`) with the harness at -O2:
 | start of the speed work (2026-09-15) | 333.2G | 329.9M |
 | r4 baselines after round two | 231.0G | 241.0M |
 | after the mono and Perceus builders (2026-09-17, main `fbd2cde37`) | ~223G | ~215M |
+| after the first codegen round (2026-09-17, main `ddb934389`; r5 baselines) | 184.5G | 214.4M |
+| the same compiler built by itself (stage-2, s2 baselines) | 176.6G | 214.4M |
 
 A sampling profile of the Perceus pass (16.9% of the compile) attributed its
 time as follows. The same categories apply to every walk in the compiler;
@@ -637,3 +639,64 @@ The coordinator merges. For each task:
    since the generated C legitimately changed. The bootstrap-built `r4`
    baselines stay valid for non-codegen tasks until the bootstrap is
    re-pinned; re-pin after the round so `bin/blorp` itself gets the wins.
+
+---
+
+## Results of the first round (2026-09-17)
+
+Measured on main `ddb934389`, -O2, three samples, frozen input `0c2e104331a2`.
+Bootstrap-built `bin/blorp` against the r4 baselines; stage-2 against s1.
+
+| task | outcome | commit | instructions |
+| --- | --- | --- | ---: |
+| N0 stage-2 harness, sample attribution, s1 baselines | landed | `7ca248a81` | none |
+| N5 inline cooperative checkpoint | landed | `077c1b82d` | -6.7% self, -2.2% small |
+| N2 direct element reads in `for` loops | landed | `2bf941f73` | -2.1% stage-2 |
+| N1 task pointer once per function | landed | `3b9e28440` | -0.65%, binary -2.2%, C +3.3% |
+| N4 allocator pool: six classes, slab refills, one TLS lookup | landed | `f9f8ef8a2` | -14.4% vs r4; peak RSS +5.3% accepted |
+| N8 frame elision with a runtime completeness guard | landed | `ddb934389` | frames -31%, C -3.8%, -0.44% |
+| N3 one uniqueness test per record update | dropped, flat | branch `perf/record-update-uniqueness` | +0.08% |
+| N6 last-use move | dropped, flat | branch `perf/last-use-move` | 0.0% |
+| N9 non-atomic refcounts while single-threaded | deferred | none | ceiling -2.3% |
+| N7 borrowed iteration | not started | | |
+
+Combined: bootstrap-built 231.0G to 184.5G (-20.1%), stage-2 216.7G to
+176.6G (-18.5%), stage-2 wall time to C 30.3s to 16.2s on the same
+machine, allocations 241.0M to 214.4M, generated C for the compiler
+130.0 MB to 129.2 MB. From the start of the speed work (333.2G) the stage-2
+compiler is at 47% of the original instruction count.
+
+What the round taught, for the next one:
+
+- **The runtime's out-of-line calls dominated, not the emitted patterns.**
+  The checkpoint (one call per loop iteration) and the allocator (a
+  thread-local lookup per operation plus a depth cap that discarded
+  reusable objects) were worth 21 points between them and changed no
+  generated C. Look for the next such call before the next codegen task:
+  candidates are `blorp_list_append`'s copy path, `blorp_string_concat`,
+  and `blorp_release_slow_finish`'s destructor dispatch.
+- **Uniqueness tests are cheap.** A relaxed atomic load and a compare;
+  removing 2,000 static sites did not move a 216G count (N3).
+- **Constructors are calls at Perceus time.** `RecordConstructExpr` and
+  `UnionConstructExpr` do not exist before Perceus; a move into a
+  constructor argument is a move into a `UserCall` argument, and the
+  single-direct-consume machinery already handles that once its
+  owned-result gate is understood (N6 found the gate has no safety reason
+  but also that the shape almost never occurs).
+- **The dup mass is escaping borrows.** Of 51,882 inserted dups on the
+  self-compile, about 40,000 duplicate a `let` or match binding read once
+  as a bare value or return, and only 482 to 678 of the let-bound ones have
+  a matching drop in scope. The rest are required retains for borrowed
+  values that escape (a match binding of a borrowed scrutinee returned to
+  the caller). Reducing those needs an ownership design change (move
+  fields out of a unique scrutinee, or return borrowed results), not a
+  Perceus tweak. That is the next design question for reference counting,
+  which remains the largest category.
+- **Frames cost stack, not guards.** With the compiler running no tasks,
+  every cleanup operation was a predicted branch; the real cost was the
+  protected local pinned to memory. Elision (N8) is the lever; the
+  remaining frames come from `BuiltinCall` names that do not map to one C
+  symbol and from user functions containing loops.
+- **The stage-2 rule is not optional.** The bootstrap-built compiler is
+  3.5% slower than the same source compiled by itself; re-pin the
+  bootstrap so `bin/blorp` gets the codegen wins.
