@@ -812,6 +812,105 @@ pure func consumed_record_result_program() -> CoreProgram:
 	consumed_record_result_program_with_release(ArcReleasePolicy)
 
 
+---
+`consumed_record_result_program` with one immutable binding evaluated before
+the record update, so a test can vary what that binding reads.
+---
+pure func preceding_binding_consumed_record_result_program(initial: CoreExpr) -> CoreProgram:
+	program: CoreProgram = consumed_record_result_program()
+	probe_var: CoreVar = {
+		name = "probe",
+		uniq = 3,
+		def_id = None
+	}
+
+	match program.decls:
+		[record_decl, FunctionDecl(function_info)]:
+			match function_info.body:
+				Some(LetExpr(result_var, False, result_type, update, continuation)):
+					{ program |
+						decls = [
+							record_decl,
+							FunctionDecl(
+								{ function_info |
+									body = Some(
+										LetExpr(
+											result_var,
+											False,
+											result_type,
+											LetExpr(probe_var, False, int_type(), initial, update),
+											continuation,
+										),
+									)
+								},
+							),
+						]
+					}
+				_:
+					program
+		_:
+			program
+
+
+pure func box_var_for_preceding_binding() -> CoreVar:
+	{
+		name = "box",
+		uniq = 0,
+		def_id = None
+	}
+
+
+pure func preceding_binding_lowers_to_cow_update(initial: CoreExpr) -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			preceding_binding_consumed_record_result_program(initial),
+		),
+	).to_string()
+
+	json.contains("\"kind\":\"record_cow_update\"")
+
+
+---
+A binding that only reads a field of the consumed record still lets the update
+take that record's allocation; the read finishes before the update writes.
+---
+pure func test_preceding_field_read_keeps_consumed_record_reuse() -> Bool:
+	preceding_binding_lowers_to_cow_update(
+		FieldExpr(
+			VarExpr(
+				box_var_for_preceding_binding(),
+				HeapRecordType("CounterBox"),
+				SyntheticSourceLoc,
+			),
+			"count",
+			int_type(),
+			SyntheticSourceLoc,
+		),
+	)
+
+
+---
+A binding that hands the record itself to a call can outlive the update, so the
+update must not reuse the record.
+---
+pure func test_preceding_owner_escape_blocks_consumed_record_reuse() -> Bool:
+	not preceding_binding_lowers_to_cow_update(
+		CallExpr(
+			UserCall("measure_box", Some(9), []),
+			VoidExpr(VoidType, SyntheticSourceLoc),
+			[
+				VarExpr(
+					box_var_for_preceding_binding(),
+					HeapRecordType("CounterBox"),
+					SyntheticSourceLoc,
+				),
+			],
+			int_type(),
+			SyntheticSourceLoc,
+		),
+	)
+
+
 pure func malformed_consumed_record_result_program(
 	count_value: CoreExpr,
 	inherited_owner_type: CoreType,
@@ -2394,6 +2493,14 @@ tests: TestSuite = {
 		(
 			"consumed record result requires owning drop",
 			test_consumed_record_result_requires_owning_drop,
+		),
+		(
+			"preceding field read keeps consumed record reuse",
+			test_preceding_field_read_keeps_consumed_record_reuse,
+		),
+		(
+			"preceding owner escape blocks consumed record reuse",
+			test_preceding_owner_escape_blocks_consumed_record_reuse,
 		),
 		(
 			"record reuse rejects malformed field annotations",

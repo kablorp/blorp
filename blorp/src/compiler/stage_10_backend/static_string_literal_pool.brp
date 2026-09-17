@@ -45,57 +45,156 @@ private EMPTY_STATIC_STRING_LITERAL_POOL_STATE: StaticStringLiteralPoolState = {
 }
 
 
+---
+What `add_static_string_literal` decided about one literal, computed before the
+pool record is updated so the update itself can be a single unconditional
+record update.
+---
+private union StaticStringLiteralPoolStep:
+	PoolAlreadyFailed
+	StaticStringLiteralRejected(StaticStringLiteralPoolError)
+	StaticStringLiteralAlreadyPooled
+	StaticStringLiteralInserted
+
+
+---
+Classify one literal against the pool's current contents.
+
+This reads both lookup tables and the existing error, which is why it is a
+separate function: the record update below has to be the first thing that
+touches `state` as a record.
+---
+private pure func classify_static_string_literal(
+	values_by_id: Dict[Int, String],
+	ids_by_value: Dict[String, Int],
+	error: Option[StaticStringLiteralPoolError],
+	id_value: Int,
+	value: String,
+) -> StaticStringLiteralPoolStep:
+	if error.is_some():
+		PoolAlreadyFailed
+	else if id_value < 0:
+		StaticStringLiteralRejected(NegativeStaticStringLiteralId(id_value))
+	else:
+		match values_by_id.get(id_value):
+			Some(existing_value):
+				if existing_value == value:
+					StaticStringLiteralAlreadyPooled
+				else:
+					StaticStringLiteralRejected(
+						StaticStringLiteralIdConflict(
+							id_value,
+							existing_value,
+							value,
+						),
+					)
+			None:
+				match ids_by_value.get(value):
+					Some(existing_id):
+						StaticStringLiteralRejected(
+							StaticStringLiteralValueConflict(
+								value,
+								existing_id,
+								id_value,
+							),
+						)
+					None:
+						StaticStringLiteralInserted
+
+
+---
+The `values_by_id` half of the update, split out so the record update below
+reads `state.values_by_id` exactly once.
+---
+private pure func next_values_by_id(
+	values_by_id: Dict[Int, String],
+	step: StaticStringLiteralPoolStep,
+	id_value: Int,
+	value: String,
+) -> Dict[Int, String]:
+	match step:
+		StaticStringLiteralInserted:
+			values_by_id.set(id_value, value)
+		_:
+			values_by_id
+
+
+---
+The `ids_by_value` half of the update, split out for the same reason as
+[next_values_by_id].
+---
+private pure func next_ids_by_value(
+	ids_by_value: Dict[String, Int],
+	step: StaticStringLiteralPoolStep,
+	id_value: Int,
+	value: String,
+) -> Dict[String, Int]:
+	match step:
+		StaticStringLiteralInserted:
+			ids_by_value.set(value, id_value)
+		_:
+			ids_by_value
+
+
+---
+The highest id the pool has seen; only an insert can raise it.
+---
+private pure func next_max_id(max_id: Int, step: StaticStringLiteralPoolStep, id_value: Int) -> Int:
+	match step:
+		StaticStringLiteralInserted:
+			if id_value > max_id:
+				id_value
+			else:
+				max_id
+		_:
+			max_id
+
+
+---
+The first error the pool hit; once set it is never replaced.
+---
+private pure func next_pool_error(
+	error: Option[StaticStringLiteralPoolError],
+	step: StaticStringLiteralPoolStep,
+) -> Option[StaticStringLiteralPoolError]:
+	match step:
+		StaticStringLiteralRejected(rejection):
+			Some(rejection)
+		_:
+			error
+
+
+---
+Record one literal in the pool.
+
+The body is a bare, unconditional record update whose four field values come
+from helpers that read `state`'s four fields exactly once between them. That is
+what lets the post-Perceus reuse rewrite move each lookup table out of a unique
+`state` instead of retaining it, so an insert mutates the table in place rather
+than copying it. Branching around the record update, or returning `state`
+itself from any path, would hide the update from that rewrite and make every
+insert copy the whole pool.
+---
 private pure func add_static_string_literal(
 	state: StaticStringLiteralPoolState,
 	id: StaticStringLiteralId,
 	value: String,
 ) -> StaticStringLiteralPoolState:
-	if state.error.is_some():
-		state
-	else:
-		id_value: Int = static_string_literal_id_value(id)
+	id_value: Int = static_string_literal_id_value(id)
+	step: StaticStringLiteralPoolStep = classify_static_string_literal(
+		state.values_by_id,
+		state.ids_by_value,
+		state.error,
+		id_value,
+		value,
+	)
 
-		if id_value < 0:
-			{ state | error = Some(NegativeStaticStringLiteralId(id_value)) }
-		else:
-			match state.values_by_id.get(id_value):
-				Some(existing_value):
-					if existing_value == value:
-						state
-					else:
-						{ state |
-							error = Some(
-								StaticStringLiteralIdConflict(
-									id_value,
-									existing_value,
-									value,
-								),
-							)
-						}
-				None:
-					match state.ids_by_value.get(value):
-						Some(existing_id):
-							{ state |
-								error = Some(
-									StaticStringLiteralValueConflict(
-										value,
-										existing_id,
-										id_value,
-									),
-								)
-							}
-						None:
-							max_id: Int = if id_value > state.max_id:
-								id_value
-							else:
-								state.max_id
-
-							{
-								values_by_id = state.values_by_id.set(id_value, value),
-								ids_by_value = state.ids_by_value.set(value, id_value),
-								max_id = max_id,
-								error = None
-							}
+	{ state |
+		values_by_id = next_values_by_id(state.values_by_id, step, id_value, value),
+		ids_by_value = next_ids_by_value(state.ids_by_value, step, id_value, value),
+		max_id = next_max_id(state.max_id, step, id_value),
+		error = next_pool_error(state.error, step)
+	}
 
 
 private pure func collect_expr_static_string_literals(
