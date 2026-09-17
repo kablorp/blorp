@@ -22526,21 +22526,38 @@ private pure func emit_enum_vector_to_string_function(
 	"blorp_String* " + naming.enum_vector_to_string_name + "(blorp_Vector* v) {\n" + "    return blorp_vector_to_string_packed_enum(v, " + naming.enum_to_string_name + ");\n" + "}\n"
 
 
+---
+The tag macros and the enum_to_string/enum_vector_to_string functions an enum
+emits, held apart so a later step can route the macros to a shared header and
+the functions to wherever they are used, without re-parsing the emitted text.
+---
+private record CEnumDeclEmission {
+	type_header: String,
+	functions: List[String]
+}
+
+
+private pure func render_enum_decl_emission(emission: CEnumDeclEmission) -> String:
+	emission.type_header + emission.functions.join("") + "\n"
+
+
 private pure func emit_enum_decl(
 	enum_decl: CoreEnumDecl,
 	authority: CEmissionSymbolAuthority,
-) -> String:
-	var c_code: String = ""
+) -> CEnumDeclEmission:
+	var type_header: String = ""
 	naming: BackendTypeNaming = selected_type_naming(authority, enum_decl.name)
 
 	for variant in enum_decl.variants:
-		c_code += "#define " + variant.c_name + " " + variant.tag.to_string() + "L\n"
+		type_header += "#define " + variant.c_name + " " + variant.tag.to_string() + "L\n"
 
-	c_code += emit_enum_to_string_function(enum_decl, naming)
-	c_code += emit_enum_vector_to_string_function(enum_decl, naming)
-	c_code += "\n"
-
-	c_code
+	{
+		type_header = type_header,
+		functions = [
+			emit_enum_to_string_function(enum_decl, naming),
+			emit_enum_vector_to_string_function(enum_decl, naming)
+		]
+	}
 
 
 private STATIC_LIST_MIN_CAPACITY: Int = 1
@@ -24372,11 +24389,26 @@ private pure func value_record_field_at_is_boolean(
 			False
 
 
+---
+The typedef and the `static inline` constructor a value record emits, held
+apart so a later step can route the typedef to a shared header and the
+constructor to wherever it is used, without re-parsing the emitted text.
+---
+private record CValueRecordDeclEmission {
+	type_header: String,
+	inline_support: String
+}
+
+
+private pure func render_value_record_decl_emission(emission: CValueRecordDeclEmission) -> String:
+	emission.type_header + emission.inline_support
+
+
 private pure func emit_value_record_decl(
 	record_decl: CoreValueRecordDecl,
 	layout: CRecordLayout,
 	authority: CEmissionSymbolAuthority,
-) -> String:
+) -> CValueRecordDeclEmission:
 	var source_order_fields_c: String = ""
 	var internal_non_boolean_fields_c: String = ""
 	var internal_boolean_fields_c: String = ""
@@ -24435,12 +24467,17 @@ private pure func emit_value_record_decl(
 	else:
 		"typedef struct { " + fields_c + "} " + record_c_type + ";\n"
 
-	type_decl + "static inline " + record_c_type + " " + selected_type_naming(
+	inline_support: String = "static inline " + record_c_type + " " + selected_type_naming(
 		authority,
 		record_decl.name,
 	).make_name + "(" + param_c + ") { " + record_c_type + " __r = { " + init_fields.join(
 		", ",
 	) + " }; return __r; }\n\n"
+
+	{
+		type_header = type_decl,
+		inline_support = inline_support
+	}
 
 
 private pure func heap_record_field_decl(
@@ -24558,12 +24595,29 @@ private pure func emit_heap_record_reuse(
 	) + ");\n" + "  if (__old) blorp_release(__old);\n" + "  return __fresh;\n" + "}\n\n"
 
 
+---
+The typedef, the destroy/make functions, and the `static inline` reuse
+constructor a heap record emits, held apart so a later step can route the
+typedef to a shared header and the functions to wherever they are used,
+without re-parsing the emitted text.
+---
+private record CHeapRecordDeclEmission {
+	type_header: String,
+	functions: List[String],
+	inline_support: String
+}
+
+
+private pure func render_heap_record_decl_emission(emission: CHeapRecordDeclEmission) -> String:
+	emission.type_header + emission.functions.join("") + emission.inline_support
+
+
 private pure func emit_heap_record_decl(
 	record_decl: CoreHeapRecordDecl,
 	layouts: CRecordLayoutRegistry,
 	layout: CRecordLayout,
 	authority: CEmissionSymbolAuthority,
-) -> String:
+) -> CHeapRecordDeclEmission:
 	var source_order_fields_c: String = ""
 	var internal_non_boolean_fields_c: String = ""
 	var internal_boolean_fields_c: String = ""
@@ -24622,11 +24676,15 @@ private pure func emit_heap_record_decl(
 	else:
 		""
 
-	record_decl_c: String = "typedef struct " + record_decl.name + " {\n" + "  blorp_Object header;\n" + fields_c + "} " + record_decl.name + ";\n\n" + emit_heap_record_destructor(
-		record_decl,
-		naming,
-	) + record_c_type + " " + naming.make_name + "(" + param_c + ") {\n" + "  " + record_decl.name + "* __rec = (" + record_decl.name + "*)blorp_alloc(sizeof(" + record_decl.name + "));\n" + "  BLORP_TAG(__rec, \"" + record_decl.name + "\");\n" + destructor_init + assignments + "  return (" + record_c_type + ")__rec;\n}\n\n"
-	record_decl_c + emit_heap_record_reuse(record_decl, naming)
+	header: String = "typedef struct " + record_decl.name + " {\n" + "  blorp_Object header;\n" + fields_c + "} " + record_decl.name + ";\n\n"
+	destructor_c: String = emit_heap_record_destructor(record_decl, naming)
+	make_c: String = record_c_type + " " + naming.make_name + "(" + param_c + ") {\n" + "  " + record_decl.name + "* __rec = (" + record_decl.name + "*)blorp_alloc(sizeof(" + record_decl.name + "));\n" + "  BLORP_TAG(__rec, \"" + record_decl.name + "\");\n" + destructor_init + assignments + "  return (" + record_c_type + ")__rec;\n}\n\n"
+
+	{
+		type_header = header,
+		functions = [destructor_c, make_c],
+		inline_support = emit_heap_record_reuse(record_decl, naming)
+	}
 
 
 private pure func release_policy_requires_release(policy: CoreReleasePolicy) -> Bool:
@@ -25011,13 +25069,51 @@ private pure func append_emitted_c(accumulator: String, suffix: String) -> Strin
 	builtin("blorp_string_append")
 
 
+---
+One union variant's constructor text, tagged with whether it is a plain
+out-of-line function (a non-empty variant) or owner data — the static
+instance storage plus the `__attribute__((constructor))` initializer that a
+zero-field variant emits instead. Variants with and without fields interleave
+in declaration order (e.g. `Option`'s `Some` before its empty `None`), so the
+tag lets a later step separate the two kinds by filtering this list instead
+of re-parsing the rendered text, without disturbing today's emission order.
+---
+private record CUnionConstructorPiece {
+	is_owner_data: Bool,
+	text: String
+}
+
+
+---
+The typedef, the destroy function, the per-variant constructors (tagged by
+kind, see `CUnionConstructorPiece`), and the `static inline` reuse
+constructors a union emits, held apart so a later step can route each part
+without re-parsing the emitted text.
+---
+private record CUnionDeclEmission {
+	type_header: String,
+	functions: List[String],
+	constructor_pieces: List[CUnionConstructorPiece],
+	inline_support: String
+}
+
+
+private pure func render_union_decl_emission(emission: CUnionDeclEmission) -> String:
+	var constructors_c: String = make_string(0)
+
+	for piece in emission.constructor_pieces:
+		constructors_c = append_emitted_c(constructors_c, piece.text)
+
+	emission.type_header + emission.functions.join("") + constructors_c + emission.inline_support
+
+
 private pure func emit_union_decl(
 	union_decl: CoreUnionDecl,
 	authority: CEmissionSymbolAuthority,
-) -> String:
+) -> CUnionDeclEmission:
 	var storage_c: String = make_string(0)
 	var tags_c: String = make_string(0)
-	var constructors_c: String = make_string(0)
+	var constructor_pieces: List[CUnionConstructorPiece] = []
 	var reuse_constructors_c: String = make_string(0)
 	naming: BackendTypeNaming = selected_type_naming(authority, union_decl.name)
 
@@ -25035,19 +25131,23 @@ private pure func emit_union_decl(
 			tags_c,
 			"#define " + variant.tag_c_name + " " + variant.tag.to_string() + "\n",
 		)
-		constructors_c = append_emitted_c(
-			constructors_c,
-			emit_union_constructor(union_decl, variant, naming),
-		)
+		constructor_pieces = constructor_pieces.append({
+			is_owner_data = variant.fields.length() == 0,
+			text = emit_union_constructor(union_decl, variant, naming)
+		})
 		reuse_constructors_c = append_emitted_c(
 			reuse_constructors_c,
 			emit_union_reuse_constructor(union_decl, variant, naming),
 		)
 
-	"typedef struct " + union_decl.name + " {\n" + "  blorp_Object header;\n" + "  int tag;\n" + release_mask_field + "  union {\n" + storage_c + "  } data;\n" + "} " + union_decl.name + ";\n\n" + tags_c + "\n" + emit_union_destructor(
-		union_decl,
-		naming,
-	) + constructors_c + reuse_constructors_c
+	header: String = "typedef struct " + union_decl.name + " {\n" + "  blorp_Object header;\n" + "  int tag;\n" + release_mask_field + "  union {\n" + storage_c + "  } data;\n" + "} " + union_decl.name + ";\n\n" + tags_c + "\n"
+
+	{
+		type_header = header,
+		functions = [emit_union_destructor(union_decl, naming)],
+		constructor_pieces = constructor_pieces,
+		inline_support = reuse_constructors_c
+	}
 
 
 private record ValueRecordEmissionOrder {
@@ -25162,10 +25262,12 @@ private pure func emit_value_record_decls(
 	for record_decl in value_record_decls_in_dependency_order(decls):
 		c_code = append_emitted_c(
 			c_code,
-			emit_value_record_decl(
-				record_decl,
-				c_record_layout(layouts, record_decl.name),
-				authority,
+			render_value_record_decl_emission(
+				emit_value_record_decl(
+					record_decl,
+					c_record_layout(layouts, record_decl.name),
+					authority,
+				),
 			),
 		)
 
@@ -25220,11 +25322,13 @@ private pure func emit_heap_record_decls(
 			HeapRecordDecl(record_decl):
 				c_code = append_emitted_c(
 					c_code,
-					emit_heap_record_decl(
-						record_decl,
-						layouts,
-						c_heap_record_layout(layouts, record_decl.name),
-						authority,
+					render_heap_record_decl_emission(
+						emit_heap_record_decl(
+							record_decl,
+							layouts,
+							c_heap_record_layout(layouts, record_decl.name),
+							authority,
+						),
 					),
 				)
 			ValueRecordDecl(record_decl):
@@ -25258,7 +25362,7 @@ private pure func emit_union_decls(
 			UnionDecl(union_decl):
 				c_code = append_emitted_c(
 					c_code,
-					emit_union_decl(union_decl, authority),
+					render_union_decl_emission(emit_union_decl(union_decl, authority)),
 				)
 			HeapRecordDecl(record_decl):
 				void
@@ -25291,7 +25395,7 @@ private pure func emit_enum_decls(
 			EnumDecl(enum_decl):
 				c_code = append_emitted_c(
 					c_code,
-					emit_enum_decl(enum_decl, authority),
+					render_enum_decl_emission(emit_enum_decl(enum_decl, authority)),
 				)
 			HeapRecordDecl(record_decl):
 				void
@@ -25529,14 +25633,34 @@ private pure func profile_function_id_at_cursor(
 			None
 
 
+---
+One function definition's emitted text, tagged with the def_id that
+identifies it, so a later step can bin function definitions across
+translation units without re-parsing the emitted text.
+---
+private record CFunctionEmission {
+	def_id: Int,
+	text: String
+}
+
+
+private pure func render_function_definitions(functions: List[CFunctionEmission]) -> String:
+	var c_code: String = make_string(0)
+
+	for function in functions:
+		c_code = append_emitted_c(c_code, function.text)
+
+	c_code
+
+
 private pure func emit_function_decls(
 	decls: List[CoreDecl],
 	profile_plan: Option[ProfileEmissionPlan],
 	symbol_authority: CEmissionSymbolAuthority,
 	internal_linkage: Bool,
 	program_summary: CancellationProgramSummary,
-) -> String:
-	var c_code: String = make_string(0)
+) -> List[CFunctionEmission]:
+	var functions: List[CFunctionEmission] = []
 	var next_profile_id: Int = 0
 
 	-- Selection preserves declaration order, so one cursor assigns IDs without
@@ -25553,9 +25677,9 @@ private pure func emit_function_decls(
 				if profile_function_id.is_some():
 					next_profile_id += 1
 
-				c_code = append_emitted_c(
-					c_code,
-					emit_function(
+				functions = functions.append({
+					def_id = func_info.def_id,
+					text = emit_function(
 						decls,
 						func_info,
 						profile_plan,
@@ -25564,8 +25688,8 @@ private pure func emit_function_decls(
 						internal_linkage,
 						program_summary,
 						symbol_authority,
-					),
-				)
+					)
+				})
 			EnumDecl(enum_decl):
 				void
 			HeapRecordDecl(record_decl):
@@ -25583,7 +25707,7 @@ private pure func emit_function_decls(
 			ImplDecl(impl_decl):
 				void
 
-	c_code
+	functions
 
 
 private pure func emit_function_forward_decls(
@@ -25659,13 +25783,72 @@ private pure func emit_static_closure_forward_decls(
 		c_code + "\n"
 
 
+---
+The emitted C for one translation unit's worth of declarations, held as the
+named sections `emit_decls` builds them in rather than one concatenated
+string. Field order matches today's fixed emission order exactly, and
+`render_single_translation_unit` joins them in that order, so this step
+changes only where the pieces are held: it does not move, add, or remove a
+single byte of the rendered output.
+
+Splitting further than this — e.g. pulling every type's typedef into one
+program-wide field, ahead of every type's supporting functions — is left to
+a later step, because doing so here would interleave text across
+declarations in a different order than today (a union's destroy function,
+for instance, sits between its typedef and its constructors today; nothing
+here moves it). What this step does add is finer-grained data one level
+down: `emit_value_record_decl`, `emit_heap_record_decl`, `emit_enum_decl`,
+and `emit_union_decl` now each return a small record separating their
+typedef from their supporting functions (see `CValueRecordDeclEmission`,
+`CHeapRecordDeclEmission`, `CEnumDeclEmission`, `CUnionDeclEmission`), and
+`function_definitions` below is kept as a `List[CFunctionEmission]` rather
+than one string. A later step can consume those directly to bin declarations
+across translation units without re-parsing this module's output.
+---
+private record CEmissionSections {
+	heap_record_and_union_forward_decls: String,
+	value_record_decls: String,
+	enum_decls: String,
+	generated_stack_option_typedefs: String,
+	union_decls: String,
+	heap_record_decls: String,
+	canonical_empty_lists: String,
+	static_string_literals: String,
+	static_closure_forward_decls: String,
+	function_forward_decls: String,
+	global_decls: String,
+	global_init: String,
+	profile_metadata: String,
+	function_definitions: List[CFunctionEmission]
+}
+
+
+private pure func render_single_translation_unit(sections: CEmissionSections) -> String:
+	var c_code: String = make_string(0)
+	c_code = append_emitted_c(c_code, sections.heap_record_and_union_forward_decls)
+	c_code = append_emitted_c(c_code, sections.value_record_decls)
+	c_code = append_emitted_c(c_code, sections.enum_decls)
+	c_code = append_emitted_c(c_code, sections.generated_stack_option_typedefs)
+	c_code = append_emitted_c(c_code, sections.union_decls)
+	c_code = append_emitted_c(c_code, sections.heap_record_decls)
+	c_code = append_emitted_c(c_code, sections.canonical_empty_lists)
+	c_code = append_emitted_c(c_code, sections.static_string_literals)
+	c_code = append_emitted_c(c_code, sections.static_closure_forward_decls)
+	c_code = append_emitted_c(c_code, sections.function_forward_decls)
+	c_code = append_emitted_c(c_code, sections.global_decls)
+	c_code = append_emitted_c(c_code, sections.global_init)
+	c_code = append_emitted_c(c_code, sections.profile_metadata)
+	c_code = append_emitted_c(c_code, render_function_definitions(sections.function_definitions))
+	c_code
+
+
 private pure func emit_decls(
 	program: CoreProgram,
 	profile_configuration: FunctionProfileConfiguration,
 	symbol_authority: CEmissionSymbolAuthority,
 	canonical_empty_lists: List[CanonicalEmptyList],
 	internal_linkage: Bool,
-) -> Result[String, CoreEmitError]:
+) -> Result[CEmissionSections, CoreEmitError]:
 	decls: List[CoreDecl] = program.decls
 	cancellation_summary: CancellationProgramSummary = analyze_program_cancellation(program)
 	layouts: CRecordLayoutRegistry = classify_c_record_layouts(program)
@@ -25678,52 +25861,28 @@ private pure func emit_decls(
 
 	profile_plan ?= profile_emission_plan(decls, symbol_authority, profile_configuration)
 
-	var c_code: String = make_string(0)
-	c_code = append_emitted_c(c_code, emit_heap_record_and_union_forward_decls(decls))
-	c_code = append_emitted_c(
-		c_code,
-		emit_value_record_decls(decls, layouts, symbol_authority),
-	)
-	c_code = append_emitted_c(
-		c_code,
-		emit_enum_decls(decls, symbol_authority),
-	)
-	c_code = append_emitted_c(c_code, emit_generated_stack_option_typedefs(decls))
-	c_code = append_emitted_c(
-		c_code,
-		emit_union_decls(decls, symbol_authority),
-	)
-	c_code = append_emitted_c(
-		c_code,
-		emit_heap_record_decls(decls, layouts, symbol_authority),
-	)
-	c_code = append_emitted_c(c_code, emit_canonical_empty_list_definitions(canonical_empty_lists))
-	c_code = append_emitted_c(
-		c_code,
-		emit_static_string_literal_definitions(static_string_literals),
-	)
-	c_code = append_emitted_c(
-		c_code,
-		emit_static_closure_forward_decls(decls, symbol_authority),
-	)
-	c_code = append_emitted_c(
-		c_code,
-		emit_function_forward_decls(decls, internal_linkage, symbol_authority),
-	)
-	c_code = append_emitted_c(c_code, emit_global_decls(decls))
-	c_code = append_emitted_c(c_code, global_init)
-	c_code = append_emitted_c(c_code, emit_profile_metadata(profile_plan))
-	c_code = append_emitted_c(
-		c_code,
-		emit_function_decls(
+	Ok({
+		heap_record_and_union_forward_decls = emit_heap_record_and_union_forward_decls(decls),
+		value_record_decls = emit_value_record_decls(decls, layouts, symbol_authority),
+		enum_decls = emit_enum_decls(decls, symbol_authority),
+		generated_stack_option_typedefs = emit_generated_stack_option_typedefs(decls),
+		union_decls = emit_union_decls(decls, symbol_authority),
+		heap_record_decls = emit_heap_record_decls(decls, layouts, symbol_authority),
+		canonical_empty_lists = emit_canonical_empty_list_definitions(canonical_empty_lists),
+		static_string_literals = emit_static_string_literal_definitions(static_string_literals),
+		static_closure_forward_decls = emit_static_closure_forward_decls(decls, symbol_authority),
+		function_forward_decls = emit_function_forward_decls(decls, internal_linkage, symbol_authority),
+		global_decls = emit_global_decls(decls),
+		global_init = global_init,
+		profile_metadata = emit_profile_metadata(profile_plan),
+		function_definitions = emit_function_decls(
 			decls,
 			profile_plan,
 			symbol_authority,
 			internal_linkage,
 			cancellation_summary,
-		),
-	)
-	Ok(c_code)
+		)
+	})
 
 
 private pure func error_artifact(error: CoreEmitError) -> CArtifact:
@@ -25746,7 +25905,7 @@ pure func try_emit_prepared_core_program_c_artifact_with_profile(
 		Err(error):
 			Err(CallableSymbolProjectionFailed(error))
 		Ok(symbol_plan):
-			decls_c ?= emit_decls(
+			sections ?= emit_decls(
 				program,
 				profile_configuration,
 				ValidatedCEmissionSymbols(symbol_plan),
@@ -25756,7 +25915,7 @@ pure func try_emit_prepared_core_program_c_artifact_with_profile(
 			Ok({
 				c_code = C_ARTIFACT_HEADER + emit_foreign_includes(
 					program.foreign_includes,
-				) + decls_c,
+				) + render_single_translation_unit(sections),
 				link_flags = [],
 				include_dirs = [],
 			})
@@ -25773,7 +25932,7 @@ pure func try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
 		func(error): CallableSymbolProjectionFailed(error),
 	)
 
-	decls_c ?= emit_decls(
+	sections ?= emit_decls(
 		program,
 		profile_configuration,
 		UnprojectedCEmissionSymbolsForTests,
@@ -25781,7 +25940,9 @@ pure func try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
 		False,
 	)
 	Ok({
-		c_code = C_ARTIFACT_HEADER + emit_foreign_includes(program.foreign_includes) + decls_c,
+		c_code = C_ARTIFACT_HEADER + emit_foreign_includes(
+			program.foreign_includes,
+		) + render_single_translation_unit(sections),
 		link_flags = [],
 		include_dirs = [],
 	})
