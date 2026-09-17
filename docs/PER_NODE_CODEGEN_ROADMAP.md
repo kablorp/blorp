@@ -629,9 +629,10 @@ The coordinator merges. For each task:
 2. Gates: the owning suites, `compiler-check --changed --base main`,
    `compiler-core-sanitize leak`, and the full default `scripts/test`, all
    under `benchmarks/self_compile_measure lock --`.
-3. Merge with `--no-ff` and a standalone title, record the measurement JSON
-   under `benchmarks/results/` with a commit "Record the stage-2 self-compile
-   measurement for: <title>", push to `origin main`.
+3. Squash-merge the branch into one commit on main with a standalone title
+   that describes the change; the measurement JSON under
+   `benchmarks/results/` goes into that same commit. One task, one commit.
+   Push to `origin main`.
 4. Record a new stage-2 baseline pair (`_s<N>`) after each codegen merge,
    since the generated C legitimately changed. The bootstrap-built `r4`
    baselines stay valid for non-codegen tasks until the bootstrap is
