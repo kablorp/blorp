@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Strip leading whitespace from compiler C output and hash the result.
+
+The backend indents generated C for readability only; no consumer depends on it,
+and the compiler itself never reads its own output back. A change that moves a
+construct from re-indenting its nested body to emitting that body at its final
+depth therefore shifts leading whitespace on lines it does not otherwise touch,
+and `--require-identical` compares raw bytes and reports that as DIFFERENT.
+
+This script removes leading spaces and tabs from every line and prints a SHA-256
+of the rewritten text. Two files with the same normalized hash differ only in
+indentation: line order, line contents after the indent, and the set of lines all
+survive normalization, so any difference in structure, ordering, spelling, or
+interior spacing changes the hash.
+
+Blank lines normalize to empty, so a line whose only content is whitespace and a
+truly empty line are not distinguished. That is the one thing this check gives
+up relative to a byte comparison.
+
+Usage:
+
+    benchmarks/normalize_generated_c_whitespace a.c         # print hash
+    benchmarks/normalize_generated_c_whitespace a.c b.c     # compare, exit 1 if different
+    benchmarks/normalize_generated_c_whitespace --emit a.c  # print normalized text
+
+Exit status is 0 when the hashes agree, 1 when they do not, and 2 on a usage or
+I/O error.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import re
+import sys
+from pathlib import Path
+
+LEADING_WHITESPACE_RE = re.compile(r"(?m)^[ \t]+")
+
+
+def normalize(text: str) -> str:
+    """Drop the indentation from every line, keeping the lines themselves."""
+    return LEADING_WHITESPACE_RE.sub("", text)
+
+
+def normalized_hash(path: Path) -> str:
+    return hashlib.sha256(normalize(path.read_text()).encode("utf-8")).hexdigest()
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("files", nargs="+", type=Path, help="one file to hash, or two to compare")
+    parser.add_argument(
+        "--emit", action="store_true", help="print the normalized text instead of a hash"
+    )
+    args = parser.parse_args(argv)
+
+    if len(args.files) > 2:
+        print("normalize_generated_c_whitespace: pass one or two files", file=sys.stderr)
+        return 2
+
+    try:
+        if args.emit:
+            if len(args.files) != 1:
+                print("normalize_generated_c_whitespace: --emit takes one file", file=sys.stderr)
+                return 2
+            sys.stdout.write(normalize(args.files[0].read_text()))
+            return 0
+
+        hashes = [(path, normalized_hash(path)) for path in args.files]
+    except OSError as error:
+        print(f"normalize_generated_c_whitespace: {error}", file=sys.stderr)
+        return 2
+
+    for path, digest in hashes:
+        print(f"{digest}  {path}")
+
+    if len(hashes) == 2:
+        identical = hashes[0][1] == hashes[1][1]
+        print("normalized C: IDENTICAL" if identical else "normalized C: DIFFERENT")
+        return 0 if identical else 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
