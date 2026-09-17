@@ -31,12 +31,19 @@ What crosses each boundary today, from reading the code:
   dictionaries) and a `ModuleSurface` whose exports and private names are
   lists of `String`-named symbols. Right shape, wrong keys.
 - **Inside typecheck.** `TypecheckState` (`stage_06_typecheck/state.brp:207`)
-  has 13 fields and is threaded through 328 parameters; every body returns
-  `{state, typed}`. Seven of its fields are per-module facts (module view,
-  module scope, known-type index, type homes, private impls, admission, a
-  flag); the rest are accumulators. Ids already exist in `graph/`
-  (`SourceNameId`, `DefinitionId`, `FieldId`, `ConstructorId`, `TraitId`)
-  but 126 dictionaries are still keyed by `String`, against 138 by `Int`.
+  has 13 fields and is threaded through 328 parameters in `decl.brp` and
+  the header install; every body returns `{state, typed}`. Correction from
+  the T4 audit (2026-09-17): the per-module/per-body split already exists
+  at the body boundary. `InferModuleFacts` (`state.brp:2113`) holds the
+  seven per-module facts and `InferSession` the per-body accumulators, and
+  all of `infer.brp` runs on them. What is still threaded by value is the
+  header-install phase, and it re-runs a module's whole header install once
+  per importer edge (24,435 installs for about 300 modules;
+  `record_installed_type_home` costs 5.8 µs per call over 109,000 calls,
+  the signature of a dictionary copy per insert). Ids already exist in
+  `graph/` (`SourceNameId`, `DefinitionId`, `FieldId`, `ConstructorId`,
+  `TraitId`) but 126 dictionaries are still keyed by `String`, against 138
+  by `Int`.
 - **Typecheck to everything after.** `TypedProgram` per module: a list of
   typed declarations plus two per-module lists (type definitions, type
   references). A tree, not tables. Mono, DCE, and Perceus each rebuild
@@ -162,6 +169,13 @@ Stop with `QUESTION FOR COORDINATOR:` when a change would alter a published
 type that another running task also edits, when identity breaks and you
 believe it benign, or after three hours without a measured result. Never
 end a turn waiting on a build or gate; poll in a foreground loop.
+
+Two rules learned the hard way on 2026-09-17: never use `git stash` in
+these worktrees (the stash list is shared across every worktree of the
+repo and pops race between sessions; snapshot with `git diff > file` or a
+commit), and compare instruction counts only against a baseline built with
+the same C toolchain (an Xcode update moved identical C by 3.8%; the r6
+baselines are the current toolchain).
 
 What "maximal result for every data source change" means in practice:
 when you convert one lookup, convert every lookup on that data source in
@@ -319,7 +333,15 @@ and `pass_perceus_complete` allocations down; no downstream pass walks
 
 **Context.** `lower.brp` has nineteen `Dict[String, String]` tables (name
 renames and prefixes) and `list_layout.brp` keys type aliases, storage
-layouts, and core types by type name.
+layouts, and core types by type name. T2's census also found
+`CoreLayoutTypeIndex` built twice per compile on the same declarations
+(`ffi_boundary.brp:234` and `list_layout.brp:644`, back to back in
+`graph_prepare.brp`), with `annotate_list_layouts` also called from
+`stage_09_core/early_stages.brp`; share one build and pass it in.
+`module_member_prefixes` (`graph_prepare.brp:379`) is built once and
+threaded through 19 signatures; it only needs the id key.
+`CoreLowerCallableNameRegistry` (`graph_prepare.brp:189`) is already
+`Int`-keyed and built once per module: the target shape.
 
 **Change.** With T5's table available, replace each with a list indexed by
 definition id or an interned type id; delete the string builders. Where a
@@ -364,5 +386,7 @@ after T4 lands, by whoever did T4.
 
 ## Results
 
-Filled in as tasks land, one row per task, with the pass row, the
-whole-compile instruction delta, and the string-lookup sample counts.
+| task | outcome | commit | phase row | notes |
+| --- | --- | --- | --- | --- |
+| T1 module lookups by `ModuleId` | landed | `842912c16` | self-compile rows identical | the path-keyed source was only the fallback used by lint, check, purify, and the LSP; the self-compile driver already used ids |
+| T2 callable name facts once per module | landed | `46930b911` | `core_lowering_complete` -0.13% | builder runs 359 times instead of 718; identical lowered Core; `CallableNameFacts` stays name-keyed by design (it aggregates overloads sharing a name) |
