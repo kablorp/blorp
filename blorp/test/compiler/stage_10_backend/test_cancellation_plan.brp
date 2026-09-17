@@ -495,6 +495,116 @@ pure func region_plan(body: CoreExpr) -> CancellationProtectionPlan:
 	)
 
 
+pure func region_plan_with_extra_decls(
+	body: CoreExpr,
+	extra_decls: List[CoreDecl],
+) -> CancellationProtectionPlan:
+	identity = {
+		name = "region_owner_with_callees",
+		def_id = 171
+	}
+	program: CoreProgram = program_with(
+		[function_decl(identity.name, identity.def_id, body)].concat(extra_decls),
+	)
+
+	build_region_sensitive_cancellation_plan(
+		FunctionCancellationActivation(identity),
+		body,
+		analyze_program_cancellation(program),
+	)
+
+
+pure func direct_runtime_call_expr(name: String) -> CoreExpr:
+	call_expr(DirectRuntimeCall({
+		name = name,
+		args = DirectRuntimeArgsAsWritten,
+		result = DirectRuntimeResultAsWritten,
+	}))
+
+
+-- Protects the registry fix itself: a value bound before a call to a runtime
+-- symbol that the completeness registry (not the older name-keyed
+-- `builtin_is_cancellation_point` table) is what flags as a cancellation
+-- point. `blorp_sleep` is exactly that case -- its Blorp source name "sleep"
+-- is what `builtin_is_cancellation_point` recognizes, but `call.name` here is
+-- the C symbol "blorp_sleep", which only the registry catches. If the
+-- registry regresses to empty, this must fail.
+pure func region_plan_protects_owner_across_registry_runtime_cancellation_point() -> Bool:
+	variable: CoreVar = local_var("value", 200)
+	body: CoreExpr = LetExpr(
+		variable,
+		False,
+		STRING_TYPE,
+		owned_string(),
+		direct_runtime_call_expr("blorp_sleep"),
+	)
+	plan = region_plan(body)
+
+	match cancellation_let_protection(plan, variable):
+		Some(protection):
+			(
+				plan.effect == MayCancelCurrentTask
+				and protection.tracks_cleanup
+				and protection.untracks_after_body
+			)
+		None:
+			False
+
+
+-- The elision this task adds: a value bound before a call to a runtime
+-- function that can never reach a cancellation checkpoint (a pure string
+-- operation, not a park, yield, or cleanup slow path) needs no frame.
+pure func region_plan_elides_owner_across_noncancelling_direct_runtime_call() -> Bool:
+	variable: CoreVar = local_var("value", 201)
+	body: CoreExpr = LetExpr(
+		variable,
+		False,
+		STRING_TYPE,
+		owned_string(),
+		direct_runtime_call_expr("blorp_string_concat"),
+	)
+	plan = region_plan(body)
+
+	match cancellation_let_protection(plan, variable):
+		Some(protection):
+			(
+				plan.effect == CannotCancelCurrentTask
+				and not protection.tracks_cleanup
+				and not protection.untracks_after_body
+			)
+		None:
+			False
+
+
+-- A value live across a call to a user function that itself contains a
+-- checkpoint (what every loop body emits) must stay protected: the callee's
+-- checkpoint can longjmp out through this frame.
+pure func region_plan_protects_owner_across_user_call_containing_loop() -> Bool:
+	variable: CoreVar = local_var("value", 202)
+	body: CoreExpr = LetExpr(
+		variable,
+		False,
+		STRING_TYPE,
+		owned_string(),
+		call_expr(UserCall("loop_callee", Some(204), [])),
+	)
+	plan = region_plan_with_extra_decls(body, [function_decl(
+				"loop_callee",
+				204,
+				CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc),
+			)])
+
+	match cancellation_let_protection(plan, variable):
+		Some(protection):
+			(
+				plan.effect == MayCancelCurrentTask
+				and protection.tracks_cleanup
+				and protection.untracks_after_body
+			)
+		None:
+			False
+
+
 pure func region_plan_omits_inert_match_scrutinee_cleanup() -> Bool:
 	scrutinee: CoreVar = local_var("scrutinee", 61)
 	plan = region_plan(releasing_match(scrutinee, VOID_EXPR))
@@ -1374,6 +1484,18 @@ tests: TestSuite = {
 		(
 			"region plans protect owners across cancellation",
 			region_plan_protects_owner_across_cancellation,
+		),
+		(
+			"region plans protect owners across a registry-only runtime cancellation point",
+			region_plan_protects_owner_across_registry_runtime_cancellation_point,
+		),
+		(
+			"region plans elide owners across a noncancelling direct runtime call",
+			region_plan_elides_owner_across_noncancelling_direct_runtime_call,
+		),
+		(
+			"region plans protect owners across a user call containing a loop",
+			region_plan_protects_owner_across_user_call_containing_loop,
 		),
 		(
 			"region plans stop at the first consuming drop",
