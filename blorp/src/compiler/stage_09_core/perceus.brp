@@ -7611,6 +7611,9 @@ private pure func freshen_shadowed_match_bindings_in_constructor_body(
 			ConstructorMatchBodyLength(match_expr)
 
 
+-- Most subtrees contain no binding that shadows the target, so the binding arms
+-- below hand back their source node whenever every child comes back as the same
+-- allocation. The generic `_` arm already preserves identity that way.
 private pure func freshen_shadowed_match_bindings(target: CoreVar, expr: CoreExpr) -> CoreExpr:
 	match expr:
 		LetExpr(variable, is_mutable, typ, rhs, body):
@@ -7619,37 +7622,34 @@ private pure func freshen_shadowed_match_bindings(target: CoreVar, expr: CoreExp
 			else:
 				freshen_shadowed_match_bindings(target, body)
 
-			LetExpr(
-				variable,
-				is_mutable,
-				typ,
-				freshen_shadowed_match_bindings(target, rhs),
-				freshened_body,
-			)
+			freshened_rhs: CoreExpr = freshen_shadowed_match_bindings(target, rhs)
+
+			if same_core_expr(freshened_rhs, rhs) and same_core_expr(freshened_body, body):
+				expr
+			else:
+				LetExpr(variable, is_mutable, typ, freshened_rhs, freshened_body)
 		BorrowLetExpr(variable, typ, rhs, body):
 			freshened_body: CoreExpr = if variable.name == target.name:
 				body
 			else:
 				freshen_shadowed_match_bindings(target, body)
 
-			BorrowLetExpr(
-				variable,
-				typ,
-				freshen_shadowed_match_bindings(target, rhs),
-				freshened_body,
-			)
+			freshened_rhs: CoreExpr = freshen_shadowed_match_bindings(target, rhs)
+
+			if same_core_expr(freshened_rhs, rhs) and same_core_expr(freshened_body, body):
+				expr
+			else:
+				BorrowLetExpr(variable, typ, freshened_rhs, freshened_body)
 		LambdaExpr(params, return_type, body, is_pure, typ, loc):
 			if core_params_shadow(target.name, params):
 				expr
 			else:
-				LambdaExpr(
-					params,
-					return_type,
-					freshen_shadowed_match_bindings(target, body),
-					is_pure,
-					typ,
-					loc,
-				)
+				freshened_body: CoreExpr = freshen_shadowed_match_bindings(target, body)
+
+				if same_core_expr(freshened_body, body):
+					expr
+				else:
+					LambdaExpr(params, return_type, freshened_body, is_pure, typ, loc)
 		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
 			ConstructorMatchExpr(
 				freshen_shadowed_match_bindings(target, scrutinee),
@@ -12891,19 +12891,30 @@ private pure func protect_repeated_exprs(
 	in_repeated_context: Bool,
 ) -> List[CoreExpr]:
 	var protected: List[CoreExpr] = []
+	var changed: Bool = False
 
 	for expr in exprs:
-		protected = protected.append(
-			protect_repeated_consumes(
-				env,
-				target,
-				target_type,
-				expr,
-				in_repeated_context,
-			),
+		protected_expr: CoreExpr = protect_repeated_consumes(
+			env,
+			target,
+			target_type,
+			expr,
+			in_repeated_context,
 		)
 
-	protected
+		if not same_core_expr(protected_expr, expr):
+			changed = True
+		else:
+			void
+
+		protected = protected.append(protected_expr)
+
+	if changed:
+		protected
+	else:
+		-- Hand back the source list so the caller can recognise an untouched
+		-- argument list with one allocation identity check.
+		exprs
 
 
 private pure func protect_repeated_aggregate_value(
@@ -13462,7 +13473,14 @@ private pure func protect_repeated_consumes(
 				args,
 				in_repeated_context,
 			)
-			call: CoreExpr = CallExpr(kind, protected_callee, protected_args, typ, loc)
+
+			call: CoreExpr = if (
+				same_core_expr(protected_callee, callee)
+				and same_core_expr_list(protected_args, args)
+			):
+				expr
+			else:
+				CallExpr(kind, protected_callee, protected_args, typ, loc)
 
 			if in_repeated_context:
 				uses: OwnershipUseSummary = summarize_linear_call(
@@ -13491,7 +13509,14 @@ private pure func protect_repeated_consumes(
 				right,
 				in_repeated_context,
 			)
-			binary: CoreExpr = BinaryExpr(op, protected_left, protected_right, typ, loc)
+
+			binary: CoreExpr = if (
+				same_core_expr(protected_left, left)
+				and same_core_expr(protected_right, right)
+			):
+				expr
+			else:
+				BinaryExpr(op, protected_left, protected_right, typ, loc)
 
 			if in_repeated_context and is_consuming_collection_equality(op, left, right):
 				uses: OwnershipUseSummary = summarize_linear_ownership_uses(
@@ -13503,62 +13528,110 @@ private pure func protect_repeated_consumes(
 			else:
 				binary
 		UnaryExpr(op, inner, typ, loc):
-			UnaryExpr(
-				op,
-				protect_repeated_consumes(env, target, target_type, inner, in_repeated_context),
-				typ,
-				loc,
+			protected_inner: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				inner,
+				in_repeated_context,
 			)
+
+			if same_core_expr(protected_inner, inner):
+				expr
+			else:
+				UnaryExpr(op, protected_inner, typ, loc)
 		LogicalExpr(op, left, right, typ, loc):
-			LogicalExpr(
-				op,
-				protect_repeated_consumes(env, target, target_type, left, in_repeated_context),
-				protect_repeated_consumes(env, target, target_type, right, in_repeated_context),
-				typ,
-				loc,
+			protected_left: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				left,
+				in_repeated_context,
 			)
+			protected_right: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				right,
+				in_repeated_context,
+			)
+
+			if same_core_expr(protected_left, left) and same_core_expr(protected_right, right):
+				expr
+			else:
+				LogicalExpr(op, protected_left, protected_right, typ, loc)
 		CastExpr(inner, typ, loc):
-			CastExpr(
-				protect_repeated_consumes(env, target, target_type, inner, in_repeated_context),
-				typ,
-				loc,
+			protected_inner: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				inner,
+				in_repeated_context,
 			)
+
+			if same_core_expr(protected_inner, inner):
+				expr
+			else:
+				CastExpr(protected_inner, typ, loc)
 		BoxExpr(box, typ, loc):
-			BoxExpr(
-				{ box |
-					value = protect_repeated_consumes(
-						env,
-						target,
-						target_type,
-						box.value,
-						in_repeated_context,
-					),
-					source_type = box.source_type
-				},
-				typ,
-				loc,
+			protected_value: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				box.value,
+				in_repeated_context,
 			)
+
+			if same_core_expr(protected_value, box.value):
+				expr
+			else:
+				BoxExpr(
+					{ box |
+						value = protected_value,
+						source_type = box.source_type
+					},
+					typ,
+					loc,
+				)
 		UnboxExpr(kind, inner, typ, loc):
-			UnboxExpr(
-				kind,
-				protect_repeated_consumes(env, target, target_type, inner, in_repeated_context),
-				typ,
-				loc,
+			protected_inner: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				inner,
+				in_repeated_context,
 			)
+
+			if same_core_expr(protected_inner, inner):
+				expr
+			else:
+				UnboxExpr(kind, protected_inner, typ, loc)
 		FieldExpr(owner, field, typ, loc):
-			FieldExpr(
-				protect_repeated_consumes(env, target, target_type, owner, in_repeated_context),
-				field,
-				typ,
-				loc,
+			protected_owner: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				owner,
+				in_repeated_context,
 			)
+
+			if same_core_expr(protected_owner, owner):
+				expr
+			else:
+				FieldExpr(protected_owner, field, typ, loc)
 		TupleFieldExpr(owner, field_index, typ, loc):
-			TupleFieldExpr(
-				protect_repeated_consumes(env, target, target_type, owner, in_repeated_context),
-				field_index,
-				typ,
-				loc,
+			protected_owner: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				owner,
+				in_repeated_context,
 			)
+
+			if same_core_expr(protected_owner, owner):
+				expr
+			else:
+				TupleFieldExpr(protected_owner, field_index, typ, loc)
 		TupleExpr(items, typ, loc):
 			TupleExpr(
 				protect_repeated_aggregate_exprs(
@@ -13724,38 +13797,87 @@ private pure func protect_repeated_consumes(
 			else:
 				protect_repeated_consumes(env, target, target_type, body, in_repeated_context)
 
-			LetExpr(
-				variable,
-				is_mutable,
-				typ,
-				protect_repeated_consumes(env, target, target_type, rhs, in_repeated_context),
-				protected_body,
+			protected_rhs: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				rhs,
+				in_repeated_context,
 			)
+
+			if same_core_expr(protected_rhs, rhs) and same_core_expr(protected_body, body):
+				expr
+			else:
+				LetExpr(variable, is_mutable, typ, protected_rhs, protected_body)
 		BorrowLetExpr(variable, typ, rhs, body):
 			protected_body: CoreExpr = if variable.name == target.name:
 				body
 			else:
 				protect_repeated_consumes(env, target, target_type, body, in_repeated_context)
 
-			BorrowLetExpr(
-				variable,
-				typ,
-				protect_repeated_consumes(env, target, target_type, rhs, in_repeated_context),
-				protected_body,
+			protected_rhs: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				rhs,
+				in_repeated_context,
 			)
+
+			if same_core_expr(protected_rhs, rhs) and same_core_expr(protected_body, body):
+				expr
+			else:
+				BorrowLetExpr(variable, typ, protected_rhs, protected_body)
 		SeqExpr(first, second):
-			SeqExpr(
-				protect_repeated_consumes(env, target, target_type, first, in_repeated_context),
-				protect_repeated_consumes(env, target, target_type, second, in_repeated_context),
+			protected_first: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				first,
+				in_repeated_context,
 			)
+			protected_second: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				second,
+				in_repeated_context,
+			)
+
+			if same_core_expr(protected_first, first) and same_core_expr(protected_second, second):
+				expr
+			else:
+				SeqExpr(protected_first, protected_second)
 		IfExpr(cond, then_expr, else_expr, typ, loc):
-			IfExpr(
-				protect_repeated_consumes(env, target, target_type, cond, in_repeated_context),
-				protect_repeated_consumes(env, target, target_type, then_expr, in_repeated_context),
-				protect_repeated_consumes(env, target, target_type, else_expr, in_repeated_context),
-				typ,
-				loc,
+			protected_cond: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				cond,
+				in_repeated_context,
 			)
+			protected_then: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				then_expr,
+				in_repeated_context,
+			)
+			protected_else: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				else_expr,
+				in_repeated_context,
+			)
+
+			if (
+				same_core_expr(protected_cond, cond)
+				and same_core_expr(protected_then, then_expr)
+				and same_core_expr(protected_else, else_expr)
+			):
+				expr
+			else:
+				IfExpr(protected_cond, protected_then, protected_else, typ, loc)
 		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
 			ConstructorMatchExpr(
 				protect_repeated_consumes(env, target, target_type, scrutinee, in_repeated_context),
@@ -13778,12 +13900,25 @@ private pure func protect_repeated_consumes(
 				loc,
 			)
 		WhileExpr(cond, body, typ, loc):
-			WhileExpr(
-				protect_repeated_consumes(env, target, target_type, cond, True),
-				protect_repeated_consumes(env, target, target_type, body, True),
-				typ,
-				loc,
+			protected_cond: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				cond,
+				True,
 			)
+			protected_body: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				body,
+				True,
+			)
+
+			if same_core_expr(protected_cond, cond) and same_core_expr(protected_body, body):
+				expr
+			else:
+				WhileExpr(protected_cond, protected_body, typ, loc)
 		ForRangeExpr(binder, start, end_value, body, typ, loc):
 			protected_body: CoreExpr = if binder.variable.name == target.name:
 				body
@@ -15228,6 +15363,24 @@ private pure func owned_result_is_alias(env: PerceusEnv, expr: CoreExpr) -> Bool
 					False
 		_:
 			False
+
+
+-- Allocation identity for Core expressions. Core is immutable value data, so a
+-- rewrite that hands back the same allocation changed nothing, and Perceus can
+-- report the node as reusing its source.
+--
+-- This binds straight to the runtime primitive rather than calling the generic
+-- `memory.same_object`, because the pinned bootstrap compiler
+-- (dev-8341b419d990) cannot project a builtin name it has never seen. Once the
+-- bootstrap pin moves past the commit that introduced `blorp_same_object`,
+-- delete this block and import `memory: same_object` instead. `traverse.brp`
+-- carries the same declaration for the same reason.
+foreign:
+	private pure func same_core_expr(left: CoreExpr, right: CoreExpr) -> Bool = "blorp_same_object"
+	private pure func same_core_expr_list(
+		left: List[CoreExpr],
+		right: List[CoreExpr],
+	) -> Bool = "blorp_same_object"
 
 
 private pure func same_core_var(left: CoreVar, right: CoreVar) -> Bool:
@@ -17877,10 +18030,214 @@ private pure func insert_drops_change_aware_normalized_expr(
 					False,
 				)
 		_:
-			opaque_inserted_non_binding_expr(
+			-- The remaining families rebuild through the generic child map, which
+			-- hands back the source allocation when no child moved. Recognising
+			-- that identity is exact: the same allocation is the same expression,
+			-- so no ownership decision above it can differ.
+			rewritten: CoreExpr = insert_drops_normalized_expr(env, expr)
+
+			if same_core_expr(rewritten, expr):
+				inserted_non_binding_expr(env, expr, True)
+			else:
+				opaque_inserted_non_binding_expr(env, rewritten)
+
+
+-- Every loop arm rebuilds an outer node and an inner loop record on each visit.
+-- Return the source loop instead when the iterable and the rewritten body both
+-- come back as the same allocation: `rewrite_loop_body` already folds in the
+-- binder's retains, so an unchanged body means no dup or drop was inserted for
+-- it and the whole subtree is unchanged.
+private pure func insert_drops_for_loop_expr(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
+	match expr:
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			rewritten_start: CoreExpr = insert_drops_expr_inner(env, start)
+			rewritten_end: CoreExpr = insert_drops_expr_inner(env, end_value)
+			rewritten_body: CoreExpr = rewrite_loop_body(env, binder, body)
+
+			if (
+				same_core_expr(rewritten_start, start)
+				and same_core_expr(rewritten_end, end_value)
+				and same_core_expr(rewritten_body, body)
+			):
+				expr
+			else:
+				ForRangeExpr(binder, rewritten_start, rewritten_end, rewritten_body, typ, loc)
+		ForChannelExpr(loop, typ, loc):
+			rewritten_iterable: CoreExpr = insert_drops_expr_inner(env, loop.iterable)
+			rewritten_body: CoreExpr = rewrite_loop_body(env, loop.binder, loop.body)
+
+			if (
+				same_core_expr(rewritten_iterable, loop.iterable)
+				and same_core_expr(rewritten_body, loop.body)
+			):
+				expr
+			else:
+				ForChannelExpr(
+					{ loop |
+						iterable = rewritten_iterable,
+						body = rewritten_body
+					},
+					typ,
+					loc,
+				)
+		ForListExpr(loop, typ, loc):
+			rewritten_iterable: CoreExpr = rewrite_loop_iterable(
 				env,
-				insert_drops_normalized_expr(env, expr),
+				loop.iterable,
+				loop.iterable_release_policy,
 			)
+			rewritten_body: CoreExpr = rewrite_loop_body(env, loop.binder, loop.body)
+
+			if (
+				same_core_expr(rewritten_iterable, loop.iterable)
+				and same_core_expr(rewritten_body, loop.body)
+			):
+				expr
+			else:
+				ForListExpr(
+					{ loop |
+						iterable = rewritten_iterable,
+						body = rewritten_body
+					},
+					typ,
+					loc,
+				)
+		ForStringExpr(loop, typ, loc):
+			rewritten_iterable: CoreExpr = rewrite_loop_iterable(
+				env,
+				loop.iterable,
+				loop.iterable_release_policy,
+			)
+			rewritten_body: CoreExpr = rewrite_loop_body(env, loop.binder, loop.body)
+
+			if (
+				same_core_expr(rewritten_iterable, loop.iterable)
+				and same_core_expr(rewritten_body, loop.body)
+			):
+				expr
+			else:
+				ForStringExpr(
+					{ loop |
+						iterable = rewritten_iterable,
+						body = rewritten_body
+					},
+					typ,
+					loc,
+				)
+		ForDictExpr(loop, typ, loc):
+			rewritten_iterable: CoreExpr = rewrite_loop_iterable(
+				env,
+				loop.iterable,
+				loop.iterable_release_policy,
+			)
+			rewritten_body: CoreExpr = rewrite_loop_body(env, loop.binder, loop.body)
+
+			if (
+				same_core_expr(rewritten_iterable, loop.iterable)
+				and same_core_expr(rewritten_body, loop.body)
+			):
+				expr
+			else:
+				ForDictExpr(
+					{ loop |
+						iterable = rewritten_iterable,
+						body = rewritten_body
+					},
+					typ,
+					loc,
+				)
+		ForSetExpr(loop, typ, loc):
+			rewritten_iterable: CoreExpr = rewrite_loop_iterable(
+				env,
+				loop.iterable,
+				loop.iterable_release_policy,
+			)
+			rewritten_body: CoreExpr = rewrite_loop_body(env, loop.binder, loop.body)
+
+			if (
+				same_core_expr(rewritten_iterable, loop.iterable)
+				and same_core_expr(rewritten_body, loop.body)
+			):
+				expr
+			else:
+				ForSetExpr(
+					{ loop |
+						iterable = rewritten_iterable,
+						body = rewritten_body
+					},
+					typ,
+					loc,
+				)
+		ForStreamExpr(loop, typ, loc):
+			rewritten_iterable: CoreExpr = rewrite_loop_iterable(
+				env,
+				loop.iterable,
+				loop.iterable_release_policy,
+			)
+			rewritten_body: CoreExpr = rewrite_loop_body(env, loop.binder, loop.body)
+
+			if (
+				same_core_expr(rewritten_iterable, loop.iterable)
+				and same_core_expr(rewritten_body, loop.body)
+			):
+				expr
+			else:
+				ForStreamExpr(
+					{ loop |
+						iterable = rewritten_iterable,
+						body = rewritten_body
+					},
+					typ,
+					loc,
+				)
+		ForResourceSourceExpr(loop, typ, loc):
+			rewritten_iterable: CoreExpr = rewrite_loop_iterable(
+				env,
+				loop.iterable,
+				loop.iterable_release_policy,
+			)
+			rewritten_body: CoreExpr = rewrite_loop_body(env, loop.binder, loop.body)
+
+			if (
+				same_core_expr(rewritten_iterable, loop.iterable)
+				and same_core_expr(rewritten_body, loop.body)
+			):
+				expr
+			else:
+				ForResourceSourceExpr(
+					{ loop |
+						iterable = rewritten_iterable,
+						body = rewritten_body
+					},
+					typ,
+					loc,
+				)
+		ForTensorExpr(loop, typ, loc):
+			rewritten_iterable: CoreExpr = rewrite_loop_iterable(
+				env,
+				loop.iterable,
+				loop.iterable_release_policy,
+			)
+			rewritten_body: CoreExpr = rewrite_loop_body(env, loop.binder, loop.body)
+
+			if (
+				same_core_expr(rewritten_iterable, loop.iterable)
+				and same_core_expr(rewritten_body, loop.body)
+			):
+				expr
+			else:
+				ForTensorExpr(
+					{ loop |
+						iterable = rewritten_iterable,
+						body = rewritten_body
+					},
+					typ,
+					loc,
+				)
+		_:
+			-- The caller dispatches only loop nodes here. Stay total rather than
+			-- assume that stays true.
+			expr
 
 
 private pure func insert_drops_normalized_expr(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
@@ -18019,115 +18376,8 @@ private pure func insert_drops_normalized_expr(env: PerceusEnv, expr: CoreExpr) 
 				typ,
 				loc,
 			)
-		ForRangeExpr(binder, start, end_value, body, typ, loc):
-			ForRangeExpr(
-				binder,
-				insert_drops_expr_inner(env, start),
-				insert_drops_expr_inner(env, end_value),
-				rewrite_loop_body(env, binder, body),
-				typ,
-				loc,
-			)
-		ForChannelExpr(loop, typ, loc):
-			ForChannelExpr(
-				{ loop |
-					iterable = insert_drops_expr_inner(env, loop.iterable),
-					body = rewrite_loop_body(env, loop.binder, loop.body)
-				},
-				typ,
-				loc,
-			)
-		ForListExpr(loop, typ, loc):
-			ForListExpr(
-				{ loop |
-					iterable = rewrite_loop_iterable(
-						env,
-						loop.iterable,
-						loop.iterable_release_policy,
-					),
-					body = rewrite_loop_body(env, loop.binder, loop.body)
-				},
-				typ,
-				loc,
-			)
-		ForStringExpr(loop, typ, loc):
-			ForStringExpr(
-				{ loop |
-					iterable = rewrite_loop_iterable(
-						env,
-						loop.iterable,
-						loop.iterable_release_policy,
-					),
-					body = rewrite_loop_body(env, loop.binder, loop.body)
-				},
-				typ,
-				loc,
-			)
-		ForDictExpr(loop, typ, loc):
-			ForDictExpr(
-				{ loop |
-					iterable = rewrite_loop_iterable(
-						env,
-						loop.iterable,
-						loop.iterable_release_policy,
-					),
-					body = rewrite_loop_body(env, loop.binder, loop.body)
-				},
-				typ,
-				loc,
-			)
-		ForSetExpr(loop, typ, loc):
-			ForSetExpr(
-				{ loop |
-					iterable = rewrite_loop_iterable(
-						env,
-						loop.iterable,
-						loop.iterable_release_policy,
-					),
-					body = rewrite_loop_body(env, loop.binder, loop.body)
-				},
-				typ,
-				loc,
-			)
-		ForStreamExpr(loop, typ, loc):
-			ForStreamExpr(
-				{ loop |
-					iterable = rewrite_loop_iterable(
-						env,
-						loop.iterable,
-						loop.iterable_release_policy,
-					),
-					body = rewrite_loop_body(env, loop.binder, loop.body)
-				},
-				typ,
-				loc,
-			)
-		ForResourceSourceExpr(loop, typ, loc):
-			ForResourceSourceExpr(
-				{ loop |
-					iterable = rewrite_loop_iterable(
-						env,
-						loop.iterable,
-						loop.iterable_release_policy,
-					),
-					body = rewrite_loop_body(env, loop.binder, loop.body)
-				},
-				typ,
-				loc,
-			)
-		ForTensorExpr(loop, typ, loc):
-			ForTensorExpr(
-				{ loop |
-					iterable = rewrite_loop_iterable(
-						env,
-						loop.iterable,
-						loop.iterable_release_policy,
-					),
-					body = rewrite_loop_body(env, loop.binder, loop.body)
-				},
-				typ,
-				loc,
-			)
+		ForRangeExpr(_, _, _, _, _, _) | ForChannelExpr(_, _, _) | ForListExpr(_, _, _) | ForStringExpr(_, _, _) | ForDictExpr(_, _, _) | ForSetExpr(_, _, _) | ForStreamExpr(_, _, _) | ForResourceSourceExpr(_, _, _) | ForTensorExpr(_, _, _):
+			insert_drops_for_loop_expr(env, expr)
 		PreClosureConcurrentExpr(block, typ, loc):
 			rewritten_body: CoreExpr = insert_drops_expr_inner(env, block.body)
 			var balanced_body: CoreExpr = rewritten_body
