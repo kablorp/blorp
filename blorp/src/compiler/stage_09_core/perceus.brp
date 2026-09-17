@@ -17071,30 +17071,32 @@ private record BorrowedLoopContext {
 }
 
 
+--- A binder that is neither borrowable nor shadowing a name already in scope
+--- changes no answer, so it costs no scope entry. A borrowable binder is
+--- recorded only when its value is managed, which is the only way a list or
+--- string loop can read it.
 private pure func borrowed_loop_context_with_name(
 	context: BorrowedLoopContext,
 	name: String,
+	typ: CoreType,
 	borrowable: Bool,
 ) -> BorrowedLoopContext:
-	{ context | scope = context.scope.set(name, borrowable) }
+	record_binding: Bool = if borrowable:
+		is_managed_type(context.env, typ)
+	else:
+		context.scope.contains(name)
 
-
---- Unhandled forms lose the scope. Reuse the caller's record when its scope is
---- already empty so a scope-free subtree costs no allocation per node.
-private pure func borrowed_loop_context_without_scope(
-	context: BorrowedLoopContext,
-) -> BorrowedLoopContext:
-	if context.scope.length() == 0:
+	if not record_binding:
 		context
 	else:
-		{ context | scope = {} }
+		{ context | scope = context.scope.set(name, borrowable) }
 
 
 private pure func borrowed_loop_context_with_binder(
 	context: BorrowedLoopContext,
 	binder: CoreLoopBinder,
 ) -> BorrowedLoopContext:
-	borrowed_loop_context_with_name(context, binder.variable.name, False)
+	borrowed_loop_context_with_name(context, binder.variable.name, binder.typ, False)
 
 
 private pure func borrowed_loop_context_with_bindings(
@@ -17104,7 +17106,7 @@ private pure func borrowed_loop_context_with_bindings(
 	var scoped: BorrowedLoopContext = context
 
 	for binding in bindings:
-		scoped = borrowed_loop_context_with_name(scoped, binding.variable.name, False)
+		scoped = borrowed_loop_context_with_name(scoped, binding.variable.name, binding.typ, False)
 
 	scoped
 
@@ -17229,14 +17231,9 @@ private pure func mark_borrowed_loops_match_result(
 
 
 --- Binding and branch spines are right-associated and can be thousands of
---- nodes deep in generated code, so the walk descends them iteratively and
---- keeps one frame per spine node on the heap instead of the native stack.
-private union BorrowedLoopSpineFrame:
-	BorrowedLoopLetFrame(CoreExpr, CoreVar, Bool, CoreType, CoreExpr, CoreExpr, BorrowedLoopContext)
-	BorrowedLoopBorrowLetFrame(CoreExpr, CoreVar, CoreType, CoreExpr, CoreExpr, BorrowedLoopContext)
-	BorrowedLoopIfFrame(CoreExpr, CoreExpr, CoreExpr, CoreExpr, CoreType, CoreSourceLoc, BorrowedLoopContext)
-
-
+--- nodes deep in generated code, so the walk descends them iteratively. The
+--- stack holds the source node and the scope that was current at it, both of
+--- which already exist, so a spine node costs no new object.
 --- Decide borrowed iteration before ownership insertion runs. Only the loop's
 --- release policy changes; `rewrite_loop_iterable` then leaves a borrowed
 --- iterable as the bare read it already is.
@@ -17244,7 +17241,8 @@ private pure func mark_borrowed_loops_expr(
 	context: BorrowedLoopContext,
 	expr: CoreExpr,
 ) -> CoreExpr:
-	var frames: List[BorrowedLoopSpineFrame] = []
+	var spine: List[CoreExpr] = []
+	var contexts: List[BorrowedLoopContext] = []
 	var current: CoreExpr = expr
 	var current_context: BorrowedLoopContext = context
 	var descending: Bool = True
@@ -17252,93 +17250,99 @@ private pure func mark_borrowed_loops_expr(
 	while descending:
 		match current:
 			LetExpr(variable, is_mutable, typ, rhs, body):
-				frames = frames.append(
-					BorrowedLoopLetFrame(
-						current,
-						variable,
-						is_mutable,
-						typ,
-						rhs,
-						body,
-						current_context,
-					),
-				)
+				spine = spine.append(current)
+				contexts = contexts.append(current_context)
 				current_context = borrowed_loop_context_with_name(
 					current_context,
 					variable.name,
+					typ,
 					not is_mutable,
 				)
 				current = body
 			BorrowLetExpr(variable, typ, rhs, body):
-				frames = frames.append(
-					BorrowedLoopBorrowLetFrame(
-						current,
-						variable,
-						typ,
-						rhs,
-						body,
-						current_context,
-					),
-				)
+				spine = spine.append(current)
+				contexts = contexts.append(current_context)
 				current_context = borrowed_loop_context_with_name(
 					current_context,
 					variable.name,
+					typ,
 					False,
 				)
 				current = body
+			SeqExpr(first, second):
+				spine = spine.append(current)
+				contexts = contexts.append(current_context)
+				current = second
 			IfExpr(cond, then_expr, else_expr, typ, loc):
-				frames = frames.append(
-					BorrowedLoopIfFrame(
-						current,
-						cond,
-						then_expr,
-						else_expr,
-						typ,
-						loc,
-						current_context,
-					),
-				)
+				spine = spine.append(current)
+				contexts = contexts.append(current_context)
 				current = else_expr
 			_:
 				descending = False
 
 	var result: CoreExpr = mark_borrowed_loops_node(current_context, current)
-	var index: Int = frames.length() - 1
+	var index: Int = spine.length() - 1
 
 	while index >= 0:
-		match frames.get(index):
-			Some(BorrowedLoopLetFrame(source, variable, is_mutable, typ, rhs, body, frame_context)):
-				marked_rhs: CoreExpr = mark_borrowed_loops_expr(frame_context, rhs)
-
-				result = if same_core_expr(marked_rhs, rhs) and same_core_expr(result, body):
-					source
-				else:
-					LetExpr(variable, is_mutable, typ, marked_rhs, result)
-			Some(BorrowedLoopBorrowLetFrame(source, variable, typ, rhs, body, frame_context)):
-				marked_rhs: CoreExpr = mark_borrowed_loops_expr(frame_context, rhs)
-
-				result = if same_core_expr(marked_rhs, rhs) and same_core_expr(result, body):
-					source
-				else:
-					BorrowLetExpr(variable, typ, marked_rhs, result)
-			Some(BorrowedLoopIfFrame(source, cond, then_expr, else_expr, typ, loc, frame_context)):
-				marked_cond: CoreExpr = mark_borrowed_loops_expr(frame_context, cond)
-				marked_then: CoreExpr = mark_borrowed_loops_expr(frame_context, then_expr)
-
-				result = if (
-					same_core_expr(marked_cond, cond)
-					and same_core_expr(marked_then, then_expr)
-					and same_core_expr(result, else_expr)
-				):
-					source
-				else:
-					IfExpr(marked_cond, marked_then, result, typ, loc)
+		match spine.get(index):
+			Some(source):
+				match contexts.get(index):
+					Some(frame_context):
+						result = mark_borrowed_loops_spine_node(frame_context, source, result)
+					None:
+						void
 			None:
 				void
 
 		index -= 1
 
 	result
+
+
+--- Rebuild one spine node around its already-marked trailing child, reusing the
+--- source node when nothing under it changed.
+private pure func mark_borrowed_loops_spine_node(
+	context: BorrowedLoopContext,
+	source: CoreExpr,
+	trailing: CoreExpr,
+) -> CoreExpr:
+	match source:
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			marked_rhs: CoreExpr = mark_borrowed_loops_expr(context, rhs)
+
+			if same_core_expr(marked_rhs, rhs) and same_core_expr(trailing, body):
+				source
+			else:
+				LetExpr(variable, is_mutable, typ, marked_rhs, trailing)
+		BorrowLetExpr(variable, typ, rhs, body):
+			marked_rhs: CoreExpr = mark_borrowed_loops_expr(context, rhs)
+
+			if same_core_expr(marked_rhs, rhs) and same_core_expr(trailing, body):
+				source
+			else:
+				BorrowLetExpr(variable, typ, marked_rhs, trailing)
+		SeqExpr(first, second):
+			marked_first: CoreExpr = mark_borrowed_loops_expr(context, first)
+
+			if same_core_expr(marked_first, first) and same_core_expr(trailing, second):
+				source
+			else:
+				SeqExpr(marked_first, trailing)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			marked_cond: CoreExpr = mark_borrowed_loops_expr(context, cond)
+			marked_then: CoreExpr = mark_borrowed_loops_expr(context, then_expr)
+
+			if (
+				same_core_expr(marked_cond, cond)
+				and same_core_expr(marked_then, then_expr)
+				and same_core_expr(trailing, else_expr)
+			):
+				source
+			else:
+				IfExpr(marked_cond, marked_then, trailing, typ, loc)
+		_:
+			-- The descent pushes only the four forms above.
+			source
 
 
 --- Every form the spine descent does not consume. Sequence and logical spines
@@ -17348,11 +17352,6 @@ private pure func mark_borrowed_loops_node(
 	expr: CoreExpr,
 ) -> CoreExpr:
 	match expr:
-		SeqExpr(first, second):
-			CoreTraverse.map_core_sequence_items(
-				expr,
-				pure func(item: CoreExpr) -> CoreExpr: mark_borrowed_loops_expr(context, item),
-			)
 		LogicalExpr(op, left, right, typ, loc):
 			CoreTraverse.map_core_logical_tree_with_context(expr, context, mark_borrowed_loops_expr)
 		WhileExpr(cond, body, typ, loc):
@@ -17462,11 +17461,10 @@ private pure func mark_borrowed_loops_node(
 				mark_borrowed_loops_match_result,
 			)
 		_:
-			CoreTraverse.map_core_expr_children_with_context(
-				expr,
-				borrowed_loop_context_without_scope(context),
-				mark_borrowed_loops_expr,
-			)
+			-- Stop. Every remaining form loses the scope anyway, and descending
+			-- through the generic child mapper costs one closure per node of the
+			-- whole program to reach the few loops nested under one.
+			expr
 
 
 --- Classify every list and string loop in one function body before ownership
