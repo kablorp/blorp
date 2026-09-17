@@ -24955,38 +24955,122 @@ private pure func emit_union_decl(union_decl: CoreUnionDecl) -> String:
 	) + constructors_c + reuse_constructors_c
 
 
+private record ValueRecordEmissionOrder {
+	ordered: List[CoreValueRecordDecl],
+	visited: Dict[String, Bool]
+}
+
+
+---
+The value-record types a struct stores by value.
+
+A field typed as another value record embeds that record's C struct, so its
+typedef has to be written first. Every other field type reaches its record
+through a pointer or a scalar, so it imposes no ordering.
+---
+private pure func value_record_field_dependency_names(
+	record_decl: CoreValueRecordDecl,
+) -> List[String]:
+	var names: List[String] = []
+
+	for field in record_decl.fields:
+		match field.typ:
+			ValueRecordType(name):
+				names = names.append(name)
+			_:
+				void
+
+	names
+
+
+private pure func find_value_record_decl(
+	record_decls: List[CoreValueRecordDecl],
+	name: String,
+) -> Option[CoreValueRecordDecl]:
+	var found: Option[CoreValueRecordDecl] = None
+
+	for record_decl in record_decls:
+		if found.is_none() and record_decl.name == name:
+			found = Some(record_decl)
+
+	found
+
+
+---
+Append one value record after everything it embeds.
+
+The name is marked visited before the dependencies are walked, so a malformed
+program with a cycle terminates instead of recursing forever.
+---
+private pure func append_value_record_in_dependency_order(
+	record_decls: List[CoreValueRecordDecl],
+	record_decl: CoreValueRecordDecl,
+	state: ValueRecordEmissionOrder,
+) -> ValueRecordEmissionOrder:
+	if state.visited.contains(record_decl.name):
+		state
+	else:
+		var next: ValueRecordEmissionOrder = {
+			ordered = state.ordered,
+			visited = state.visited.set(record_decl.name, True)
+		}
+
+		for dependency_name in value_record_field_dependency_names(record_decl):
+			match find_value_record_decl(record_decls, dependency_name):
+				Some(dependency):
+					next = append_value_record_in_dependency_order(record_decls, dependency, next)
+				None:
+					void
+
+		{
+			ordered = next.ordered.append(record_decl),
+			visited = next.visited
+		}
+
+
+---
+Value-record declarations ordered so an embedded record is declared first.
+
+Declarations keep their source order unless a field forces a move, so a program
+whose structs embed no other struct emits exactly the order it came in with.
+---
+private pure func value_record_decls_in_dependency_order(
+	decls: List[CoreDecl],
+) -> List[CoreValueRecordDecl]:
+	var source_order: List[CoreValueRecordDecl] = []
+
+	for decl in decls:
+		match decl:
+			ValueRecordDecl(record_decl):
+				source_order = source_order.append(record_decl)
+			_:
+				void
+
+	var state: ValueRecordEmissionOrder = {
+		ordered = [],
+		visited = {}
+	}
+
+	for record_decl in source_order:
+		state = append_value_record_in_dependency_order(source_order, record_decl, state)
+
+	state.ordered
+
+
 private pure func emit_value_record_decls(
 	decls: List[CoreDecl],
 	layouts: CRecordLayoutRegistry,
 ) -> String:
 	var c_code: String = make_string(0)
 
-	for decl in decls:
-		match decl:
-			ValueRecordDecl(record_decl):
-				c_code = append_emitted_c(
-					c_code,
-					emit_value_record_decl(
-						record_decl,
-						c_record_layout(layouts, record_decl.name),
-					),
-				)
-			HeapRecordDecl(record_decl):
-				void
-			EnumDecl(enum_decl):
-				void
-			UnionDecl(union_decl):
-				void
-			FunctionDecl(func_info):
-				void
-			GlobalDecl(global):
-				void
-			TypeAliasDecl(alias_decl):
-				void
-			TraitDecl(trait_decl):
-				void
-			ImplDecl(impl_decl):
-				void
+	for record_decl in value_record_decls_in_dependency_order(decls):
+		c_code = append_emitted_c(
+			c_code,
+			emit_value_record_decl(
+				record_decl,
+				c_record_layout(layouts, record_decl.name),
+			),
+		)
 
 	c_code
 
