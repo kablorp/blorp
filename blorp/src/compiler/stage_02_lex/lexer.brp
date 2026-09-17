@@ -147,43 +147,8 @@ private struct LambdaBodyLevel {
 }
 
 
-private record LexerState {
-	source: SourceFile,
-	cursor: Cursor,
-	diagnostics: List[ParseDiagnostic],
-	pending_trivia: List[Trivia],
-	indent_stack: List[Int],
-	lambda_body_levels: List[LambdaBodyLevel],
-	group_depth: Int,
-	pending_newline: Bool,
-	at_line_start: Bool,
-	line_has_token: Bool,
-	last_token_kind: Option[TokenKind],
-	emitted_token: Option[Token],
-	emitted_trivia: Option[Trivia]
-}
-
-
 pure func lex_ok(result: LexResult) -> Bool:
 	result.diagnostics.is_empty()
-
-
-private pure func initial_state(source: SourceFile) -> LexerState:
-	{
-		source = source,
-		cursor = source_start(source),
-		diagnostics = [],
-		pending_trivia = [],
-		indent_stack = [0],
-		lambda_body_levels = [],
-		group_depth = 0,
-		pending_newline = False,
-		at_line_start = True,
-		line_has_token = False,
-		last_token_kind = None,
-		emitted_token = None,
-		emitted_trivia = None
-	}
 
 
 private pure func is_digit_char(c: Char) -> Bool:
@@ -217,110 +182,21 @@ private pure func tab_advance(column: Int) -> Int:
 	TAB_WIDTH - (column - 1) % TAB_WIDTH
 
 
-private pure func advance(state: LexerState) -> LexerState:
-	{ state | cursor = source_advance(state.source, state.cursor) }
-
-
-private pure func peek(state: LexerState) -> Option[Char]:
-	source_peek(state.source, state.cursor)
-
-
-private pure func peek_next(state: LexerState) -> Option[Char]:
-	next_cursor: Cursor = source_advance(state.source, state.cursor)
-	source_peek(state.source, next_cursor)
-
-
-private pure func peek_at(state: LexerState, offset: Int) -> Option[Char]:
-	state.source.text.get(state.cursor.offset + offset)
-
-
-private pure func span_from(
-	state: LexerState,
-	start_cursor: Cursor,
+private record LiteralScan {
 	end_cursor: Cursor,
-) -> SourceSpan:
-	source_span(state.source, start_cursor, end_cursor)
-
-
-private pure func empty_span(state: LexerState) -> SourceSpan:
-	source_empty_span(state.source, state.cursor)
-
-
-private pure func add_error(state: LexerState, message: String) -> LexerState:
-	diag: ParseDiagnostic = parse_error(empty_span(state), message)
-	{ state | diagnostics = state.diagnostics.append(diag) }
-
-
-private pure func add_error_at_span(
-	state: LexerState,
+	kind: Option[TokenKind],
 	span: SourceSpan,
-	message: String,
-) -> LexerState:
-	diag: ParseDiagnostic = parse_error(span, message)
-	{ state | diagnostics = state.diagnostics.append(diag) }
+	diagnostics: List[ParseDiagnostic]
+}
 
 
-private pure func kind_counts_as_line_token(kind: TokenKind) -> Bool:
-	match kind:
-		NewlineToken:
-			False
-		IndentToken:
-			False
-		DedentToken:
-			False
-		EndOfFileToken:
-			False
-		_:
-			True
-
-
----
-The single record update a token emission performs. Callers that scanned the
-token by walking a `Cursor` hand back the cursor and the new group depth here
-instead of rebuilding `LexerState` once per scanning step.
----
-private pure func emitted_token_state(
-	state: LexerState,
-	kind: TokenKind,
+private record PipeBlockScan {
 	end_cursor: Cursor,
-	group_depth: Int,
-	emitted: Token,
-) -> LexerState:
-	{ state |
-		cursor = end_cursor,
-		group_depth = group_depth,
-		pending_trivia = [],
-		line_has_token = state.line_has_token or kind_counts_as_line_token(kind),
-		last_token_kind = Some(kind),
-		emitted_token = Some(emitted),
-		emitted_trivia = None
-	}
-
-
----
-The exit for a step that produced neither a token nor trailing trivia. Every
-state handed back to the `lex` loop passes through one of these three, which
-is what keeps the two emission slots mutually exclusive and never stale.
----
-private pure func stepped_state(state: LexerState) -> LexerState:
-	{ state |
-		emitted_token = None,
-		emitted_trivia = None
-	}
-
-
-private pure func emit_token_at(
-	state: LexerState,
-	kind: TokenKind,
+	kind: Option[TokenKind],
 	span: SourceSpan,
-	end_cursor: Cursor,
-) -> LexerState:
-	emitted: Token = token_with_trivia(kind, span, state.pending_trivia, [])
-	emitted_token_state(state, kind, end_cursor, state.group_depth, emitted)
-
-
-private pure func emit_token(state: LexerState, kind: TokenKind, span: SourceSpan) -> LexerState:
-	emit_token_at(state, kind, span, state.cursor)
+	diagnostics: List[ParseDiagnostic],
+	ended_with_newline: Bool
+}
 
 
 private pure func add_trailing_trivia(tokens: List[Token], trivia: Trivia) -> List[Token]:
@@ -331,27 +207,6 @@ private pure func add_trailing_trivia(tokens: List[Token], trivia: Trivia) -> Li
 			tokens.set(last, { token | trailing_trivia = token.trailing_trivia.append(trivia) })
 		None:
 			tokens
-
-
-private pure func starts_with(state: LexerState, expected: String) -> Bool:
-	expected_len: Int = expected.length()
-
-	if state.cursor.offset + expected_len > state.source.text.length():
-		False
-	else:
-		var index: Int = 0
-		var matches: Bool = True
-
-		while matches and index < expected_len:
-			if state.source.text.get_or(
-				state.cursor.offset + index,
-				'\0',
-			) == expected.get_or(index, '\0'):
-				index += 1
-			else:
-				matches = False
-
-		matches
 
 
 private pure func cursor_advanced(source: SourceFile, cursor: Cursor, width: Int) -> Cursor:
@@ -365,80 +220,50 @@ private pure func cursor_advanced(source: SourceFile, cursor: Cursor, width: Int
 	moved
 
 
-private pure func advance_n(state: LexerState, width: Int) -> LexerState:
-	{ state | cursor = cursor_advanced(state.source, state.cursor, width) }
-
-
-private pure func line_ends_after_optional_space(state: LexerState, offset: Int) -> Bool:
-	var i: Int = offset
-	var ok: Bool = False
+private pure func consume_line(source: SourceFile, cursor: Cursor) -> Cursor:
+	var cur: Cursor = cursor
 
 	while True:
-		match peek_at(state, i):
-			Some(' '):
-				i += 1
-			Some('\t'):
-				i += 1
+		match source_peek(source, cur):
 			Some('\n'):
-				ok = True
-				break
-			None:
-				ok = True
-				break
-			_:
-				break
-
-	ok
-
-
-private pure func starts_docstring_delimiter(state: LexerState) -> Bool:
-	starts_with(state, "---") and line_ends_after_optional_space(state, 3)
-
-
-private pure func consume_line(state: LexerState) -> LexerState:
-	var st: LexerState = state
-
-	while True:
-		match peek(st):
-			Some('\n'):
-				st = advance(st)
+				cur = source_advance(source, cur)
 				break
 			Some(_):
-				st = advance(st)
+				cur = source_advance(source, cur)
 			None:
 				break
 
-	st
+	cur
 
 
-private pure func read_line_text(state: LexerState) -> (String, LexerState):
-	var st: LexerState = state
-	start_cursor: Cursor = st.cursor
+private pure func read_line_text(source: SourceFile, cursor: Cursor) -> (String, Cursor):
+	var cur: Cursor = cursor
+	start_cursor: Cursor = cur
 	var text: String = ""
 
 	while True:
-		match peek(st):
+		match source_peek(source, cur):
 			Some('\n'):
-				line_span: SourceSpan = span_from(st, start_cursor, st.cursor)
-				text = source_span_text(st.source, line_span)
-				st = advance(st)
+				line_span: SourceSpan = source_span(source, start_cursor, cur)
+				text = source_span_text(source, line_span)
+				cur = source_advance(source, cur)
 				break
 			Some(_):
-				st = advance(st)
+				cur = source_advance(source, cur)
 			None:
-				line_span: SourceSpan = span_from(st, start_cursor, st.cursor)
-				text = source_span_text(st.source, line_span)
+				line_span: SourceSpan = source_span(source, start_cursor, cur)
+				text = source_span_text(source, line_span)
 				break
 
-	(text, st)
+	(text, cur)
 
 
 -- Leading spaces and tabs never change the line, so the run is scanned by
 -- offset while the indent width and the column are carried forward together.
-private pure func skip_line_spaces_with_indent(state: LexerState) -> (Int, LexerState):
-	text: String = state.source.text
-	var offset: Int = state.cursor.offset
-	var column: Int = state.cursor.column
+private pure func skip_line_spaces_with_indent(source: SourceFile, cursor: Cursor) -> (Int, Cursor):
+	text: String = source.text
+	var offset: Int = cursor.offset
+	var column: Int = cursor.column
 	var indent: Int = 0
 
 	while True:
@@ -454,60 +279,67 @@ private pure func skip_line_spaces_with_indent(state: LexerState) -> (Int, Lexer
 			_:
 				break
 
-	next_state: LexerState = { state | cursor = {
-			offset = offset,
-			line = state.cursor.line,
-			column = column
-		} }
+	next_cursor: Cursor = {
+		offset = offset,
+		line = cursor.line,
+		column = column
+	}
 
-	(indent, next_state)
+	(indent, next_cursor)
 
 
 private pure func pipe_marker_at_margin(
-	state: LexerState,
+	source: SourceFile,
+	cursor: Cursor,
 	margin_column: Int,
-) -> (Bool, LexerState):
-	(indent, marker_state) = skip_line_spaces_with_indent(state)
+) -> (Bool, Cursor):
+	(indent, marker_cursor) = skip_line_spaces_with_indent(source, cursor)
 
 	if indent == margin_column - 1:
-		match peek(marker_state):
+		match source_peek(source, marker_cursor):
 			Some('|'):
-				(True, marker_state)
+				(True, marker_cursor)
 			_:
-				(False, marker_state)
+				(False, marker_cursor)
 	else:
-		(False, marker_state)
+		(False, marker_cursor)
 
 
-private pure func raw_pipe_start_marker(state: LexerState) -> (Bool, Int, LexerState):
-	(indent, marker_state) = skip_line_spaces_with_indent(state)
+private pure func raw_pipe_start_marker(source: SourceFile, cursor: Cursor) -> (Bool, Int, Cursor):
+	(indent, marker_cursor) = skip_line_spaces_with_indent(source, cursor)
 
-	match peek(marker_state):
+	match source_peek(source, marker_cursor):
 		Some('|'):
-			(True, indent + 1, marker_state)
+			(True, indent + 1, marker_cursor)
 		_:
-			(False, indent + 1, marker_state)
+			(False, indent + 1, marker_cursor)
 
 
-private pure func raw_pipe_start_after_raw(state: LexerState) -> Option[(Int, LexerState)]:
-	if not starts_with(state, "raw"):
+private pure func raw_pipe_start_after_raw(
+	source: SourceFile,
+	cursor: Cursor,
+) -> Option[(Int, Cursor)]:
+	if not text_starts_with(source, cursor, "raw"):
 		None
 	else:
-		match peek_at(state, 3):
+		match source.text.get(cursor.offset + 3):
 			Some(c):
 				if is_ident_continue(c):
 					None
 				else:
-					after_raw: LexerState = advance_n(state, 3)
-					(_, after_spaces) = skip_line_spaces_with_indent(after_raw)
+					after_raw: Cursor = cursor_advanced(source, cursor, 3)
+					(_, after_spaces) = skip_line_spaces_with_indent(source, after_raw)
 
-					match peek(after_spaces):
+					match source_peek(source, after_spaces):
 						Some('\n'):
-							after_newline: LexerState = advance(after_spaces)
-							(ok, margin_column, marker_state) = raw_pipe_start_marker(after_newline)
+							after_newline: Cursor = source_advance(source, after_spaces)
+							(ok, margin_column, marker_cursor) = raw_pipe_start_marker(
+								source,
+								after_newline,
+							)
 
 							if ok:
-								Some((margin_column, marker_state))
+								Some((margin_column, marker_cursor))
 							else:
 								None
 						_:
@@ -540,14 +372,18 @@ private pure func escape_char(c: Char) -> Option[Char]:
 			None
 
 
-private pure func scan_unicode_escape(state: LexerState) -> (Option[Int], LexerState):
-	var st: LexerState = advance_n(state, 3)
+private pure func scan_unicode_escape(
+	source: SourceFile,
+	cursor: Cursor,
+) -> (Option[Int], Cursor, List[ParseDiagnostic]):
+	var cur: Cursor = cursor_advanced(source, cursor, 3)
 	var codepoint: Int = 0
 	var digits: Int = 0
 	var has_error: Bool = False
+	var diagnostics: List[ParseDiagnostic] = []
 
 	while not has_error:
-		match peek(st):
+		match source_peek(source, cur):
 			Some('}'):
 				break
 			Some(c):
@@ -560,41 +396,68 @@ private pure func scan_unicode_escape(state: LexerState) -> (Option[Int], LexerS
 
 					if digits > 6:
 						has_error = True
-						st = add_error(st, "Unicode escape \\u{} must contain 1-6 hex digits")
+						diagnostics = diagnostics.append(
+							parse_error(
+								source_empty_span(source, cur),
+								"Unicode escape \\u{} must contain 1-6 hex digits",
+							),
+						)
 					else:
 						codepoint = codepoint * 16 + hex_value(c)
-						st = advance(st)
+						cur = source_advance(source, cur)
 				else:
 					has_error = True
-					st = add_error(st, "Unicode escape \\u{} must contain only hex digits")
+					diagnostics = diagnostics.append(
+						parse_error(
+							source_empty_span(source, cur),
+							"Unicode escape \\u{} must contain only hex digits",
+						),
+					)
 			None:
 				has_error = True
-				st = add_error(st, "unterminated Unicode escape")
+				diagnostics = diagnostics.append(
+					parse_error(
+						source_empty_span(source, cur),
+						"unterminated Unicode escape",
+					),
+				)
 
 	if has_error:
-		(None, st)
+		(None, cur, diagnostics)
 	else if digits == 0:
-		(None, add_error(st, "Unicode escape \\u{} must contain 1-6 hex digits"))
+		final_diagnostics: List[ParseDiagnostic] = diagnostics.append(
+			parse_error(
+				source_empty_span(source, cur),
+				"Unicode escape \\u{} must contain 1-6 hex digits",
+			),
+		)
+		(None, cur, final_diagnostics)
 	else:
-		after_close: LexerState = advance(st)
+		after_close: Cursor = source_advance(source, cur)
 
 		-- Unicode scalar values exclude UTF-16 surrogates and values above U+10FFFF.
 		if codepoint > 1114111 or codepoint >= 55296 and codepoint <= 57343:
-			(None, add_error(after_close, "Unicode codepoint is out of range or a surrogate"))
+			final_diagnostics: List[ParseDiagnostic] = diagnostics.append(
+				parse_error(
+					source_empty_span(source, after_close),
+					"Unicode codepoint is out of range or a surrogate",
+				),
+			)
+			(None, after_close, final_diagnostics)
 		else:
-			(Some(codepoint), after_close)
+			(Some(codepoint), after_close, diagnostics)
 
 
 private pure func append_source_segment(
 	text: String,
-	state: LexerState,
+	source: SourceFile,
 	start_cursor: Cursor,
 	end_cursor: Cursor,
 ) -> String:
 	if end_cursor.offset > start_cursor.offset:
 		text + source_span_text(
-			state.source,
-			source_span(state.source, start_cursor, end_cursor),
+			source,
+			source_span(source, start_cursor, end_cursor),
 		)
 	else:
 		text
@@ -602,23 +465,23 @@ private pure func append_source_segment(
 
 -- A literal body never spans a line, so a run inside one is scanned by offset
 -- with only tabs moving the column by more than one.
-private pure func run_end_state(state: LexerState, end_offset: Int, end_column: Int) -> LexerState:
-	if end_offset == state.cursor.offset:
-		state
+private pure func cursor_after_run(cursor: Cursor, end_offset: Int, end_column: Int) -> Cursor:
+	if end_offset == cursor.offset:
+		cursor
 	else:
-		{ state | cursor = {
-				offset = end_offset,
-				line = state.cursor.line,
-				column = end_column
-			} }
+		{
+			offset = end_offset,
+			line = cursor.line,
+			column = end_column
+		}
 
 
 -- Skip the run of string-body characters that are copied verbatim, stopping at
 -- the closing quote, a newline, an escape, or an interpolation marker.
-private pure func skip_plain_string_run(state: LexerState) -> LexerState:
-	text: String = state.source.text
-	var offset: Int = state.cursor.offset
-	var column: Int = state.cursor.column
+private pure func skip_plain_string_run(source: SourceFile, cursor: Cursor) -> Cursor:
+	text: String = source.text
+	var offset: Int = cursor.offset
+	var column: Int = cursor.column
 
 	while True:
 		match text.get(offset):
@@ -639,15 +502,15 @@ private pure func skip_plain_string_run(state: LexerState) -> LexerState:
 			None:
 				break
 
-	run_end_state(state, offset, column)
+	cursor_after_run(cursor, offset, column)
 
 
 -- Skip the run of interpolated-tail characters that are copied verbatim,
 -- stopping at any character that changes brace depth, quoting, or escaping.
-private pure func skip_plain_interpolation_run(state: LexerState) -> LexerState:
-	text: String = state.source.text
-	var offset: Int = state.cursor.offset
-	var column: Int = state.cursor.column
+private pure func skip_plain_interpolation_run(source: SourceFile, cursor: Cursor) -> Cursor:
+	text: String = source.text
+	var offset: Int = cursor.offset
+	var column: Int = cursor.column
 
 	while True:
 		match text.get(offset):
@@ -672,15 +535,15 @@ private pure func skip_plain_interpolation_run(state: LexerState) -> LexerState:
 			None:
 				break
 
-	run_end_state(state, offset, column)
+	cursor_after_run(cursor, offset, column)
 
 
 -- Skip the run of pipe-line characters that are copied verbatim, stopping at
 -- the end of the line or at an interpolation marker.
-private pure func skip_plain_pipe_run(state: LexerState) -> LexerState:
-	text: String = state.source.text
-	var offset: Int = state.cursor.offset
-	var column: Int = state.cursor.column
+private pure func skip_plain_pipe_run(source: SourceFile, cursor: Cursor) -> Cursor:
+	text: String = source.text
+	var offset: Int = cursor.offset
+	var column: Int = cursor.column
 
 	while True:
 		match text.get(offset):
@@ -697,47 +560,53 @@ private pure func skip_plain_pipe_run(state: LexerState) -> LexerState:
 			None:
 				break
 
-	run_end_state(state, offset, column)
+	cursor_after_run(cursor, offset, column)
 
 
-private pure func consume_until_single_quote(state: LexerState) -> LexerState:
-	var st: LexerState = state
+private pure func consume_until_single_quote(source: SourceFile, cursor: Cursor) -> Cursor:
+	var cur: Cursor = cursor
 
 	while True:
-		match peek(st):
+		match source_peek(source, cur):
 			Some('\''):
-				st = advance(st)
+				cur = source_advance(source, cur)
 				break
 			Some('\n'):
 				break
 			Some(_):
-				st = advance(st)
+				cur = source_advance(source, cur)
 			None:
 				break
 
-	st
+	cur
 
 
 -- Spaces and tabs never change the line, so the run is scanned by offset and
 -- the column is carried forward instead of recomputed per character.
-private pure func scan_docstring(state: LexerState) -> LexerState:
-	start_cursor: Cursor = state.cursor
-	var st: LexerState = consume_line(state)
+private pure func scan_docstring(source: SourceFile, cursor: Cursor) -> LiteralScan:
+	start_cursor: Cursor = cursor
+	var cur: Cursor = consume_line(source, cursor)
 	var text: String = string(128)
 	var first_line: Bool = True
 	var has_error: Bool = False
+	var diagnostics: List[ParseDiagnostic] = []
 
 	while not has_error:
-		if starts_docstring_delimiter(st):
-			st = consume_line(st)
+		if starts_docstring_at(source, cur):
+			cur = consume_line(source, cur)
 			break
 		else:
-			match peek(st):
+			match source_peek(source, cur):
 				None:
 					has_error = True
-					st = add_error(st, "Unterminated docstring: missing closing ---")
+					diagnostics = diagnostics.append(
+						parse_error(
+							source_empty_span(source, cur),
+							"Unterminated docstring: missing closing ---",
+						),
+					)
 				Some(_):
-					(line, next_state) = read_line_text(st)
+					(line, next_cursor) = read_line_text(source, cur)
 
 					if first_line:
 						text = line
@@ -745,119 +614,141 @@ private pure func scan_docstring(state: LexerState) -> LexerState:
 					else:
 						text = text + "\n" + line
 
-					st = next_state
+					cur = next_cursor
 
 	if has_error:
-		stepped_state(st)
+		{
+			end_cursor = cur,
+			kind = None,
+			span = source_span(source, start_cursor, cur),
+			diagnostics = diagnostics
+		}
 	else:
-		span: SourceSpan = span_from(st, start_cursor, st.cursor)
 		kind: TokenKind = DocStringToken(text)
-		emitted: Token = token_with_trivia(kind, span, st.pending_trivia, [])
-		{ st |
-			pending_trivia = [],
-			pending_newline = False,
-			at_line_start = True,
-			line_has_token = False,
-			last_token_kind = Some(kind),
-			emitted_token = Some(emitted),
-			emitted_trivia = None
+		{
+			end_cursor = cur,
+			kind = Some(kind),
+			span = source_span(source, start_cursor, cur),
+			diagnostics = diagnostics
 		}
 
 
-private pure func scan_string_literal(state: LexerState) -> LexerState:
-	start_cursor: Cursor = state.cursor
-	var st: LexerState = advance(state)
-	var segment_start: Cursor = st.cursor
+private pure func scan_string_literal(source: SourceFile, cursor: Cursor) -> LiteralScan:
+	start_cursor: Cursor = cursor
+	var cur: Cursor = source_advance(source, cursor)
+	var segment_start: Cursor = cur
 	var text: String = string(32)
 	var has_error: Bool = False
 	var is_interpolated: Bool = False
+	var diagnostics: List[ParseDiagnostic] = []
 
 	while True:
-		st = skip_plain_string_run(st)
+		cur = skip_plain_string_run(source, cur)
 
-		match peek(st):
+		match source_peek(source, cur):
 			Some('\"'):
-				text = append_source_segment(text, st, segment_start, st.cursor)
-				st = advance(st)
+				text = append_source_segment(text, source, segment_start, cur)
+				cur = source_advance(source, cur)
 				break
 			Some('\n'):
 				has_error = True
-				st = add_error(
-					st,
-					"Unterminated string literal. Use aligned pipe strings for multiline text",
+				diagnostics = diagnostics.append(
+					parse_error(
+						source_empty_span(source, cur),
+						"Unterminated string literal. Use aligned pipe strings for multiline text",
+					),
 				)
-				st = advance(st)
+				cur = source_advance(source, cur)
 				break
 			Some('\\'):
-				text = append_source_segment(text, st, segment_start, st.cursor)
+				text = append_source_segment(text, source, segment_start, cur)
 
-				if starts_with(st, "\\u{"):
-					(codepoint, next_state) = scan_unicode_escape(st)
-					st = next_state
+				if text_starts_with(source, cur, "\\u{"):
+					(codepoint, next_cursor, escape_diagnostics) = scan_unicode_escape(source, cur)
+					cur = next_cursor
+					diagnostics = diagnostics.concat(escape_diagnostics)
 
 					match codepoint:
 						Some(value):
 							text = text.append_char(to_char(value))
-							segment_start = st.cursor
+							segment_start = cur
 						None:
 							has_error = True
 				else:
-					escape_start: LexerState = st
-					st = advance(st)
+					escape_start: Cursor = cur
+					cur = source_advance(source, cur)
 
-					match peek(st):
+					match source_peek(source, cur):
 						Some(escaped):
 							match escape_char(escaped):
 								Some(c):
 									text = text.append_char(c)
-									st = advance(st)
-									segment_start = st.cursor
+									cur = source_advance(source, cur)
+									segment_start = cur
 								None:
 									has_error = True
-									st = add_error(
-										escape_start,
-										"unknown escape sequence '\\" + escaped.to_string() + "'",
+									diagnostics = diagnostics.append(
+										parse_error(
+											source_empty_span(source, escape_start),
+											"unknown escape sequence '\\" + escaped.to_string() + "'",
+										),
 									)
-									st = advance(st)
+									cur = source_advance(source, cur)
 						None:
 							has_error = True
-							st = add_error(escape_start, "unterminated escape sequence")
+							diagnostics = diagnostics.append(
+								parse_error(
+									source_empty_span(source, escape_start),
+									"unterminated escape sequence",
+								),
+							)
 							break
 			Some('$'):
-				if starts_with(st, "$" + "{"):
-					text = append_source_segment(text, st, segment_start, st.cursor)
+				if text_starts_with(source, cur, "$" + "{"):
+					text = append_source_segment(text, source, segment_start, cur)
 					is_interpolated = True
-					st = advance_n(st, 2)
+					cur = cursor_advanced(source, cur, 2)
 					break
 				else:
-					st = advance(st)
+					cur = source_advance(source, cur)
 			Some(_):
-				st = advance(st)
+				cur = source_advance(source, cur)
 			None:
 				has_error = True
-				st = add_error(st, "Unterminated string literal: missing closing '\"'")
+				diagnostics = diagnostics.append(
+					parse_error(
+						source_empty_span(source, cur),
+						"Unterminated string literal: missing closing '\"'",
+					),
+				)
 				break
 
 	if has_error:
-		stepped_state(st)
+		{
+			end_cursor = cur,
+			kind = None,
+			span = source_span(source, start_cursor, cur),
+			diagnostics = diagnostics
+		}
 	else if is_interpolated:
-		scan_interpolated_string_tail(st, start_cursor, text)
+		scan_interpolated_string_tail(source, cur, start_cursor, text)
 	else:
-		span: SourceSpan = span_from(st, start_cursor, st.cursor)
-		emit_token(
-			st,
-			StringLiteralToken(NormalStringLiteral, text),
-			span,
-		)
+		kind: TokenKind = StringLiteralToken(NormalStringLiteral, text)
+		{
+			end_cursor = cur,
+			kind = Some(kind),
+			span = source_span(source, start_cursor, cur),
+			diagnostics = diagnostics
+		}
 
 
-private pure func scan_raw_string_literal(state: LexerState) -> LexerState:
-	start_cursor: Cursor = state.cursor
-	var st: LexerState = advance_n(state, 4)
-	body_start: Cursor = st.cursor
-	source_text: String = st.source.text
-	var offset: Int = st.cursor.offset
-	var column: Int = st.cursor.column
+private pure func scan_raw_string_literal(source: SourceFile, cursor: Cursor) -> LiteralScan:
+	start_cursor: Cursor = cursor
+	var cur: Cursor = cursor_advanced(source, cursor, 4)
+	body_start: Cursor = cur
+	source_text: String = source.text
+	var offset: Int = cur.offset
+	var column: Int = cur.column
 
 	while True:
 		match source_text.get(offset):
@@ -874,59 +765,78 @@ private pure func scan_raw_string_literal(state: LexerState) -> LexerState:
 			None:
 				break
 
-	st = run_end_state(st, offset, column)
-	text: String = append_source_segment(string(32), st, body_start, st.cursor)
+	cur = cursor_after_run(cur, offset, column)
+	text: String = append_source_segment(string(32), source, body_start, cur)
 	var has_error: Bool = False
+	var diagnostics: List[ParseDiagnostic] = []
 
-	match peek(st):
+	match source_peek(source, cur):
 		Some('\"'):
-			st = advance(st)
+			cur = source_advance(source, cur)
 		Some('\n'):
 			has_error = True
-			st = add_error(st, "Raw string cannot span multiple lines")
-			st = advance(st)
+			diagnostics = diagnostics.append(
+				parse_error(
+					source_empty_span(source, cur),
+					"Raw string cannot span multiple lines",
+				),
+			)
+			cur = source_advance(source, cur)
 		_:
 			has_error = True
-			st = add_error(st, "Unterminated raw string literal: missing closing '\"'")
+			diagnostics = diagnostics.append(
+				parse_error(
+					source_empty_span(source, cur),
+					"Unterminated raw string literal: missing closing '\"'",
+				),
+			)
 
 	if has_error:
-		stepped_state(st)
+		{
+			end_cursor = cur,
+			kind = None,
+			span = source_span(source, start_cursor, cur),
+			diagnostics = diagnostics
+		}
 	else:
-		span: SourceSpan = span_from(st, start_cursor, st.cursor)
-		emit_token(
-			st,
-			StringLiteralToken(RawStringLiteral, text),
-			span,
-		)
+		kind: TokenKind = StringLiteralToken(RawStringLiteral, text)
+		{
+			end_cursor = cur,
+			kind = Some(kind),
+			span = source_span(source, start_cursor, cur),
+			diagnostics = diagnostics
+		}
 
 
 private pure func scan_interpolated_string_tail(
-	state: LexerState,
+	source: SourceFile,
+	cursor: Cursor,
 	span_start: Cursor,
 	prefix: String,
-) -> LexerState:
-	var st: LexerState = state
+) -> LiteralScan:
+	var cur: Cursor = cursor
 	var text: String = prefix + "{"
 	var brace_depth: Int = 1
 	var in_string: Bool = False
 	var has_error: Bool = False
+	var diagnostics: List[ParseDiagnostic] = []
 
 	while not has_error:
-		run_state: LexerState = skip_plain_interpolation_run(st)
-		text = append_source_segment(text, st, st.cursor, run_state.cursor)
-		st = run_state
+		run_cursor: Cursor = skip_plain_interpolation_run(source, cur)
+		text = append_source_segment(text, source, cur, run_cursor)
+		cur = run_cursor
 
-		match peek(st):
+		match source_peek(source, cur):
 			Some('\"'):
 				if brace_depth > 0:
 					text = text.append_char('\"')
 					in_string = not in_string
-					st = advance(st)
+					cur = source_advance(source, cur)
 				else:
-					st = advance(st)
+					cur = source_advance(source, cur)
 					break
 			Some('$'):
-				if starts_with(st, "$" + "{"):
+				if text_starts_with(source, cur, "$" + "{"):
 					if in_string:
 						text = text + "$" + "{"
 					else:
@@ -935,13 +845,18 @@ private pure func scan_interpolated_string_tail(
 
 						if brace_depth > MAX_INTERPOLATION_DEPTH:
 							has_error = True
-							st = add_error(st, "string interpolation nested too deeply")
+							diagnostics = diagnostics.append(
+								parse_error(
+									source_empty_span(source, cur),
+									"string interpolation nested too deeply",
+								),
+							)
 
 					if not has_error:
-						st = advance_n(st, 2)
+						cur = cursor_advanced(source, cur, 2)
 				else:
 					text = text.append_char('$')
-					st = advance(st)
+					cur = source_advance(source, cur)
 			Some('{'):
 				if in_string:
 					text = text.append_char('{')
@@ -951,7 +866,7 @@ private pure func scan_interpolated_string_tail(
 				else:
 					text += "\\{"
 
-				st = advance(st)
+				cur = source_advance(source, cur)
 			Some('}'):
 				if in_string:
 					text = text.append_char('}')
@@ -961,126 +876,149 @@ private pure func scan_interpolated_string_tail(
 				else:
 					text += "\\}"
 
-				st = advance(st)
+				cur = source_advance(source, cur)
 			Some('\\'):
 				text = text.append_char('\\')
-				st = advance(st)
+				cur = source_advance(source, cur)
 
-				match peek(st):
+				match source_peek(source, cur):
 					Some(escaped):
 						text = text.append_char(escaped)
-						st = advance(st)
+						cur = source_advance(source, cur)
 					None:
 						has_error = True
-						st = add_error(st, "unterminated interpolated string")
+						diagnostics = diagnostics.append(
+							parse_error(
+								source_empty_span(source, cur),
+								"unterminated interpolated string",
+							),
+						)
 			Some('\n'):
 				has_error = True
-				st = add_error(
-					st,
-					"Unterminated interpolated string. Use aligned pipe strings for multiline text",
+				diagnostics = diagnostics.append(
+					parse_error(
+						source_empty_span(source, cur),
+						"Unterminated interpolated string. Use aligned pipe strings for multiline text",
+					),
 				)
-				st = advance(st)
+				cur = source_advance(source, cur)
 			Some(c):
 				text = text.append_char(c)
-				st = advance(st)
+				cur = source_advance(source, cur)
 			None:
 				has_error = True
-				st = add_error(st, "Unterminated interpolated string: missing closing '\"'")
+				diagnostics = diagnostics.append(
+					parse_error(
+						source_empty_span(source, cur),
+						"Unterminated interpolated string: missing closing '\"'",
+					),
+				)
 
 	if has_error:
-		stepped_state(st)
+		{
+			end_cursor = cur,
+			kind = None,
+			span = source_span(source, span_start, cur),
+			diagnostics = diagnostics
+		}
 	else:
-		span: SourceSpan = span_from(st, span_start, st.cursor)
-		emit_token(
-			st,
-			StringLiteralToken(InterpolatedStringLiteral, text),
-			span,
-		)
+		kind: TokenKind = StringLiteralToken(InterpolatedStringLiteral, text)
+		{
+			end_cursor = cur,
+			kind = Some(kind),
+			span = source_span(source, span_start, cur),
+			diagnostics = diagnostics
+		}
 
 
 private pure func read_pipe_line_content(
-	state: LexerState,
+	source: SourceFile,
+	cursor: Cursor,
 	raw: Bool,
-) -> (String, Bool, LexerState, Bool):
-	var st: LexerState = state
+) -> (String, Bool, Cursor, Bool):
+	var cur: Cursor = cursor
 	var text: String = string(64)
 	var saw_interp: Bool = False
 	var ended_with_newline: Bool = False
 
 	while True:
-		run_state: LexerState = skip_plain_pipe_run(st)
-		text = append_source_segment(text, st, st.cursor, run_state.cursor)
-		st = run_state
+		run_cursor: Cursor = skip_plain_pipe_run(source, cur)
+		text = append_source_segment(text, source, cur, run_cursor)
+		cur = run_cursor
 
-		match peek(st):
+		match source_peek(source, cur):
 			Some('\n'):
-				st = advance(st)
+				cur = source_advance(source, cur)
 				ended_with_newline = True
 				break
 			Some('$'):
-				if not raw and starts_with(st, "$" + "{"):
+				if not raw and text_starts_with(source, cur, "$" + "{"):
 					text = text.append_char('{')
 					saw_interp = True
-					st = advance_n(st, 2)
+					cur = cursor_advanced(source, cur, 2)
 				else:
 					text = text.append_char('$')
-					st = advance(st)
+					cur = source_advance(source, cur)
 			Some(c):
 				text = text.append_char(c)
-				st = advance(st)
+				cur = source_advance(source, cur)
 			None:
 				break
 
-	(text, saw_interp, st, ended_with_newline)
+	(text, saw_interp, cur, ended_with_newline)
 
 
 private pure func scan_pipe_block(
-	state: LexerState,
+	source: SourceFile,
+	cursor: Cursor,
 	span_start: Cursor,
 	margin_column: Int,
 	raw: Bool,
-) -> LexerState:
-	var st: LexerState = state
+) -> PipeBlockScan:
+	var cur: Cursor = cursor
 	var text: String = string(128)
 	var saw_interp: Bool = False
 	var first_line: Bool = True
 	var ended_with_newline: Bool = False
 	var has_error: Bool = False
+	var diagnostics: List[ParseDiagnostic] = []
 
 	while not has_error:
 		if not first_line:
 			text = text.append_char('\n')
 
-		if not raw and starts_with(st, "||"):
+		if not raw and text_starts_with(source, cur, "||"):
 			text = text.append_char('|')
-			st = advance_n(st, 2)
+			cur = cursor_advanced(source, cur, 2)
 		else:
-			match peek(st):
+			match source_peek(source, cur):
 				Some('|'):
-					st = advance(st)
+					cur = source_advance(source, cur)
 				_:
 					has_error = True
-					st = add_error(
-						st,
-						"Expected aligned pipe string marker at column " + margin_column.to_string(),
+					diagnostics = diagnostics.append(
+						parse_error(
+							source_empty_span(source, cur),
+							"Expected aligned pipe string marker at column " + margin_column.to_string(),
+						),
 					)
 
 		if not has_error:
-			line_result: (String, Bool, LexerState, Bool) = read_pipe_line_content(st, raw)
+			line_result: (String, Bool, Cursor, Bool) = read_pipe_line_content(source, cur, raw)
 			line_text: String = line_result[0]
 			line_saw_interp: Bool = line_result[1]
-			next_state: LexerState = line_result[2]
+			next_cursor: Cursor = line_result[2]
 			line_ended_with_newline: Bool = line_result[3]
 			text += line_text
 			saw_interp = saw_interp or line_saw_interp
-			st = next_state
+			cur = next_cursor
 			ended_with_newline = line_ended_with_newline
 
 			if ended_with_newline:
-				(continues, marker_state) = pipe_marker_at_margin(st, margin_column)
+				(continues, marker_cursor) = pipe_marker_at_margin(source, cur, margin_column)
 
 				if continues:
-					st = marker_state
+					cur = marker_cursor
 					first_line = False
 				else:
 					break
@@ -1088,10 +1026,14 @@ private pure func scan_pipe_block(
 				break
 
 	if has_error:
-		stepped_state(st)
+		{
+			end_cursor = cur,
+			kind = None,
+			span = source_span(source, span_start, cur),
+			diagnostics = diagnostics,
+			ended_with_newline = ended_with_newline
+		}
 	else:
-		span: SourceSpan = span_from(st, span_start, st.cursor)
-
 		var string_kind: StringLiteralKind = PipeStringLiteral
 
 		if raw:
@@ -1100,37 +1042,29 @@ private pure func scan_pipe_block(
 			string_kind = InterpolatedPipeStringLiteral
 
 		kind: TokenKind = StringLiteralToken(string_kind, text)
-		emitted: Token = token_with_trivia(kind, span, st.pending_trivia, [])
-		var next_state: LexerState = { st |
-			pending_trivia = [],
-			line_has_token = True,
-			last_token_kind = Some(kind),
-			emitted_token = Some(emitted),
-			emitted_trivia = None
+		{
+			end_cursor = cur,
+			kind = Some(kind),
+			span = source_span(source, span_start, cur),
+			diagnostics = diagnostics,
+			ended_with_newline = ended_with_newline
 		}
 
-		if ended_with_newline:
-			next_state = { next_state |
-				pending_newline = True,
-				at_line_start = True,
-				line_has_token = False
-			}
 
-		next_state
-
-
-private pure func scan_char_literal(state: LexerState) -> LexerState:
-	start_cursor: Cursor = state.cursor
-	var st: LexerState = advance(state)
+private pure func scan_char_literal(source: SourceFile, cursor: Cursor) -> LiteralScan:
+	start_cursor: Cursor = cursor
+	var cur: Cursor = source_advance(source, cursor)
 	var codepoint: Int = 0
 	var has_value: Bool = False
 	var has_error: Bool = False
+	var diagnostics: List[ParseDiagnostic] = []
 
-	match peek(st):
+	match source_peek(source, cur):
 		Some('\\'):
-			if starts_with(st, "\\u{"):
-				(value, next_state) = scan_unicode_escape(st)
-				st = next_state
+			if text_starts_with(source, cur, "\\u{"):
+				(value, next_cursor, escape_diagnostics) = scan_unicode_escape(source, cur)
+				cur = next_cursor
+				diagnostics = diagnostics.concat(escape_diagnostics)
 
 				match value:
 					Some(cp):
@@ -1139,56 +1073,83 @@ private pure func scan_char_literal(state: LexerState) -> LexerState:
 					None:
 						has_error = True
 			else:
-				escape_start: LexerState = st
-				st = advance(st)
+				escape_start: Cursor = cur
+				cur = source_advance(source, cur)
 
-				match peek(st):
+				match source_peek(source, cur):
 					Some(escaped):
 						match escape_char(escaped):
 							Some(c):
 								codepoint = to_int(c)
 								has_value = True
-								st = advance(st)
+								cur = source_advance(source, cur)
 							None:
 								has_error = True
-								st = add_error(
-									escape_start,
-									"unknown escape sequence '\\" + escaped.to_string() + "'",
+								diagnostics = diagnostics.append(
+									parse_error(
+										source_empty_span(source, escape_start),
+										"unknown escape sequence '\\" + escaped.to_string() + "'",
+									),
 								)
-								st = advance(st)
+								cur = source_advance(source, cur)
 					None:
 						has_error = True
-						st = add_error(escape_start, "unterminated character literal")
+						diagnostics = diagnostics.append(
+							parse_error(
+								source_empty_span(source, escape_start),
+								"unterminated character literal",
+							),
+						)
 		Some('\n'):
 			has_error = True
-			st = add_error(
-				st,
-				"Invalid character literal: expected single character between quotes",
+			diagnostics = diagnostics.append(
+				parse_error(
+					source_empty_span(source, cur),
+					"Invalid character literal: expected single character between quotes",
+				),
 			)
 		Some(c):
 			codepoint = to_int(c)
 			has_value = True
-			st = advance(st)
+			cur = source_advance(source, cur)
 		None:
 			has_error = True
-			st = add_error(st, "unterminated character literal")
+			diagnostics = diagnostics.append(
+				parse_error(
+					source_empty_span(source, cur),
+					"unterminated character literal",
+				),
+			)
 
 	if not has_error:
-		match peek(st):
+		match source_peek(source, cur):
 			Some('\''):
-				st = advance(st)
+				cur = source_advance(source, cur)
 			_:
 				has_error = True
-				st = add_error(
-					st,
-					"Invalid character literal: expected single character between quotes",
+				diagnostics = diagnostics.append(
+					parse_error(
+						source_empty_span(source, cur),
+						"Invalid character literal: expected single character between quotes",
+					),
 				)
 
 	if has_error or not has_value:
-		stepped_state(consume_until_single_quote(st))
+		final_cursor: Cursor = consume_until_single_quote(source, cur)
+		{
+			end_cursor = final_cursor,
+			kind = None,
+			span = source_span(source, start_cursor, final_cursor),
+			diagnostics = diagnostics
+		}
 	else:
-		span: SourceSpan = span_from(st, start_cursor, st.cursor)
-		emit_token(st, CharLiteralToken(codepoint), span)
+		kind: TokenKind = CharLiteralToken(codepoint)
+		{
+			end_cursor = cur,
+			kind = Some(kind),
+			span = source_span(source, start_cursor, cur),
+			diagnostics = diagnostics
+		}
 
 
 -- Identifier characters are never newlines or tabs, so the run is scanned by
@@ -1314,17 +1275,23 @@ private pure func keyword_for(text: String) -> Option[Keyword]:
 			None
 
 
-private pure func scan_identifier(state: LexerState) -> LexerState:
-	start_cursor: Cursor = state.cursor
-	end_cursor: Cursor = identifier_end_cursor(state.source, start_cursor)
-	span: SourceSpan = span_from(state, start_cursor, end_cursor)
-	text: String = source_span_text(state.source, span)
+private pure func scan_raw_as_identifier(source: SourceFile, cursor: Cursor) -> LiteralScan:
+	end_cursor: Cursor = identifier_end_cursor(source, cursor)
+	span: SourceSpan = source_span(source, cursor, end_cursor)
+	text: String = source_span_text(source, span)
 
-	match keyword_for(text):
+	kind: TokenKind = match keyword_for(text):
 		Some(keyword):
-			emit_token_at(state, KeywordToken(keyword), span, end_cursor)
+			KeywordToken(keyword)
 		None:
-			emit_token_at(state, IdentifierToken(text), span, end_cursor)
+			IdentifierToken(text)
+
+	{
+		end_cursor = end_cursor,
+		kind = Some(kind),
+		span = span,
+		diagnostics = []
+	}
 
 
 private pure func first_significant_decimal_digit(text: String) -> Int:
@@ -1881,71 +1848,13 @@ private pure func symbol_at(source: SourceFile, cursor: Cursor) -> Option[Symbol
 
 
 ---
-Assemble the `LexerState` the rare literal scanners still expect. Only the
-string, char, docstring and pipe-block forms need it; the builder below scans
-every other token without building a state record at all.
----
-private pure func literal_scan_state(
-	source: SourceFile,
-	cursor: Cursor,
-	diagnostics: List[ParseDiagnostic],
-	pending_trivia: List[Trivia],
-	indent_stack: List[Int],
-	lambda_body_levels: List[LambdaBodyLevel],
-	group_depth: Int,
-	pending_newline: Bool,
-	at_line_start: Bool,
-	line_has_token: Bool,
-	last_token_kind: Option[TokenKind],
-) -> LexerState:
-	{
-		source = source,
-		cursor = cursor,
-		diagnostics = diagnostics,
-		pending_trivia = pending_trivia,
-		indent_stack = indent_stack,
-		lambda_body_levels = lambda_body_levels,
-		group_depth = group_depth,
-		pending_newline = pending_newline,
-		at_line_start = at_line_start,
-		line_has_token = line_has_token,
-		last_token_kind = last_token_kind,
-		emitted_token = None,
-		emitted_trivia = None
-	}
-
-
-private pure func scan_literal_form(state: LexerState) -> LexerState:
-	match peek(state):
-		Some('-'):
-			scan_docstring(state)
-		Some('\"'):
-			scan_string_literal(state)
-		Some('\''):
-			scan_char_literal(state)
-		Some('|'):
-			scan_pipe_block(state, state.cursor, state.cursor.column, False)
-		Some('r'):
-			if starts_with(state, "raw\""):
-				scan_raw_string_literal(state)
-			else:
-				match raw_pipe_start_after_raw(state):
-					Some((margin_column, marker_state)):
-						scan_pipe_block(marker_state, state.cursor, margin_column, True)
-					None:
-						scan_identifier(state)
-		_:
-			stepped_state(state)
-
-
----
 Lex a source file.
 
 This is a builder: every accumulator is a local `var` that the loop mutates in
 place, and the immutable token and diagnostic lists are published once at the
-end. The scanners it calls return only what they found -- an end cursor, a
-symbol, a token kind -- so scanning a token builds no state record. Only the
-rare literal forms still thread `LexerState`, through `scan_literal_form`.
+end. Every scanner it calls, including the rare literal forms, returns only
+what it found -- an end cursor, a token kind, diagnostics -- so scanning a
+token never threads a state record.
 ---
 pure func lex(source: SourceFile) -> LexResult:
 	text: String = source.text
@@ -2107,41 +2016,179 @@ pure func lex(source: SourceFile) -> LexResult:
 					or c == 'r' and starts_raw_word_at(source, cursor)
 					or c == '|' and not line_has_token
 				):
-					scanned: LexerState = scan_literal_form(
-						literal_scan_state(
-							source,
-							cursor,
-							diagnostics,
-							pending_trivia,
-							indent_stack,
-							lambda_body_levels,
-							group_depth,
-							pending_newline,
-							at_line_start,
-							line_has_token,
-							last_token_kind,
-						),
-					)
-					cursor = scanned.cursor
-					diagnostics = scanned.diagnostics
-					pending_trivia = scanned.pending_trivia
-					indent_stack = scanned.indent_stack
-					lambda_body_levels = scanned.lambda_body_levels
-					group_depth = scanned.group_depth
-					pending_newline = scanned.pending_newline
-					at_line_start = scanned.at_line_start
-					line_has_token = scanned.line_has_token
-					last_token_kind = scanned.last_token_kind
+					match c:
+						'-':
+							doc_scan: LiteralScan = scan_docstring(source, cursor)
+							cursor = doc_scan.end_cursor
+							diagnostics = diagnostics.concat(doc_scan.diagnostics)
 
-					match scanned.emitted_token:
-						Some(emitted):
-							tokens = tokens.append(emitted)
-						None:
-							match scanned.emitted_trivia:
-								Some(found):
-									tokens = add_trailing_trivia(tokens, found)
+							match doc_scan.kind:
+								Some(kind):
+									tokens = tokens.append(
+										token_with_trivia(
+											kind,
+											doc_scan.span,
+											pending_trivia,
+											[],
+										),
+									)
+									pending_trivia = []
+									pending_newline = False
+									at_line_start = True
+									line_has_token = False
+									last_token_kind = Some(kind)
 								None:
 									void
+						'|':
+							pipe_scan: PipeBlockScan = scan_pipe_block(
+								source,
+								cursor,
+								cursor,
+								cursor.column,
+								False,
+							)
+							cursor = pipe_scan.end_cursor
+							diagnostics = diagnostics.concat(pipe_scan.diagnostics)
+
+							match pipe_scan.kind:
+								Some(kind):
+									tokens = tokens.append(
+										token_with_trivia(
+											kind,
+											pipe_scan.span,
+											pending_trivia,
+											[],
+										),
+									)
+									pending_trivia = []
+									line_has_token = True
+									last_token_kind = Some(kind)
+
+									if pipe_scan.ended_with_newline:
+										pending_newline = True
+										at_line_start = True
+										line_has_token = False
+								None:
+									void
+						'r':
+							if text_starts_with(source, cursor, "raw\""):
+								raw_literal: LiteralScan = scan_raw_string_literal(source, cursor)
+								cursor = raw_literal.end_cursor
+								diagnostics = diagnostics.concat(raw_literal.diagnostics)
+
+								match raw_literal.kind:
+									Some(kind):
+										tokens = tokens.append(
+											token_with_trivia(
+												kind,
+												raw_literal.span,
+												pending_trivia,
+												[],
+											),
+										)
+										pending_trivia = []
+										line_has_token = True
+										last_token_kind = Some(kind)
+									None:
+										void
+							else:
+								match raw_pipe_start_after_raw(source, cursor):
+									Some((margin_column, marker_cursor)):
+										raw_pipe_scan: PipeBlockScan = scan_pipe_block(
+											source,
+											marker_cursor,
+											cursor,
+											margin_column,
+											True,
+										)
+										cursor = raw_pipe_scan.end_cursor
+										diagnostics = diagnostics.concat(raw_pipe_scan.diagnostics)
+
+										match raw_pipe_scan.kind:
+											Some(kind):
+												tokens = tokens.append(
+													token_with_trivia(
+														kind,
+														raw_pipe_scan.span,
+														pending_trivia,
+														[],
+													),
+												)
+												pending_trivia = []
+												line_has_token = True
+												last_token_kind = Some(kind)
+
+												if raw_pipe_scan.ended_with_newline:
+													pending_newline = True
+													at_line_start = True
+													line_has_token = False
+											None:
+												void
+									None:
+										ident_literal: LiteralScan = scan_raw_as_identifier(
+											source,
+											cursor,
+										)
+										cursor = ident_literal.end_cursor
+										diagnostics = diagnostics.concat(ident_literal.diagnostics)
+
+										match ident_literal.kind:
+											Some(kind):
+												tokens = tokens.append(
+													token_with_trivia(
+														kind,
+														ident_literal.span,
+														pending_trivia,
+														[],
+													),
+												)
+												pending_trivia = []
+												line_has_token = True
+												last_token_kind = Some(kind)
+											None:
+												void
+						'\"':
+							string_literal: LiteralScan = scan_string_literal(source, cursor)
+							cursor = string_literal.end_cursor
+							diagnostics = diagnostics.concat(string_literal.diagnostics)
+
+							match string_literal.kind:
+								Some(kind):
+									tokens = tokens.append(
+										token_with_trivia(
+											kind,
+											string_literal.span,
+											pending_trivia,
+											[],
+										),
+									)
+									pending_trivia = []
+									line_has_token = True
+									last_token_kind = Some(kind)
+								None:
+									void
+						'\'':
+							char_literal: LiteralScan = scan_char_literal(source, cursor)
+							cursor = char_literal.end_cursor
+							diagnostics = diagnostics.concat(char_literal.diagnostics)
+
+							match char_literal.kind:
+								Some(kind):
+									tokens = tokens.append(
+										token_with_trivia(
+											kind,
+											char_literal.span,
+											pending_trivia,
+											[],
+										),
+									)
+									pending_trivia = []
+									line_has_token = True
+									last_token_kind = Some(kind)
+								None:
+									void
+						_:
+							void
 				else if c == '-' and text_starts_with(source, cursor, "--"):
 					comment_end: Cursor = line_comment_end_cursor(source, cursor)
 					comment_span: SourceSpan = source_span(source, cursor, comment_end)
