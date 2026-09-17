@@ -48,6 +48,18 @@ private record CoreMonoImplMaterialization {
 }
 
 
+---
+Result of `specialize_generic_impls_with_templates`. `processed_decl_count`
+is how many leading decls of `program.decls` have had requests collected;
+pass it back in on the next call to skip them.
+---
+record CoreMonoImplSpecializationStep {
+	program: CoreProgram,
+	next_def_id: Int,
+	processed_decl_count: Int
+}
+
+
 private record CoreMonoMethodIdRewrite {
 	source_name: String,
 	source_module: Option[String],
@@ -456,11 +468,11 @@ private pure func collect_impl_requests(
 private pure func collect_program_requests(
 	generic_impls: List[CoreImplDecl],
 	concrete_keys: List[String],
-	program: CoreProgram,
+	decls: List[CoreDecl],
 ) -> List[CoreMonoImplRequest]:
 	var requests: List[CoreMonoImplRequest] = []
 
-	for decl in program.decls:
+	for decl in decls:
 		match decl:
 			FunctionDecl(function):
 				requests = collect_function_requests(
@@ -732,33 +744,58 @@ private pure func materialize_request(
 			}
 
 
+---
+Specializes generic trait impls, collecting the template list from
+`program`. Callers that already hold a template list and a scan cursor
+across a fixpoint should call `specialize_generic_impls_with_templates`
+directly instead.
+---
 pure func specialize_generic_impls(
 	program: CoreProgram,
 	next_def_id: Int,
 ) -> CoreMonoProgramSpecialization:
-	specialize_generic_impls_with_templates(program, next_def_id, generic_impls(program))
+	step: CoreMonoImplSpecializationStep = specialize_generic_impls_with_templates(
+		program,
+		next_def_id,
+		generic_impls(program),
+		0,
+	)
+
+	{
+		program = step.program,
+		next_def_id = step.next_def_id
+	}
 
 
 ---
-Same as `specialize_generic_impls`, but takes an already-collected template
-list instead of recomputing it from `program`; see `generic_impls`.
+Same as `specialize_generic_impls`, but takes an already-built template list
+and only collects requests from decls at `processed_decl_count` on: earlier
+decls already had their requests collected, and that can't change on a
+later call, since a decl's body is immutable once appended and `templates`
+is fixed for the whole fixpoint. `concrete_impl_keys` still scans the whole
+program, since which impls are already concrete keeps changing as the
+fixpoint specializes more of them. Returns the new processed count to pass
+back in on the next call.
 ---
 pure func specialize_generic_impls_with_templates(
 	program: CoreProgram,
 	next_def_id: Int,
 	templates: List[CoreImplDecl],
-) -> CoreMonoProgramSpecialization:
+	processed_decl_count: Int,
+) -> CoreMonoImplSpecializationStep:
 	if templates.is_empty():
 		{
 			program = program,
-			next_def_id = next_def_id
+			next_def_id = next_def_id,
+			processed_decl_count = program.decls.length()
 		}
 	else:
 		concrete_keys: List[String] = concrete_impl_keys(program)
+		unprocessed_decls: List[CoreDecl] = program.decls.drop(processed_decl_count)
 		var requests: List[CoreMonoImplRequest] = collect_program_requests(
 			templates,
 			concrete_keys,
-			program,
+			unprocessed_decls,
 		)
 		var specialized: List[CoreDecl] = []
 		var request_index: Int = 0
@@ -790,7 +827,10 @@ pure func specialize_generic_impls_with_templates(
 
 			request_index += 1
 
+		final_decls: List[CoreDecl] = program.decls.concat(specialized)
+
 		{
-			program = { program | decls = program.decls.concat(specialized) },
-			next_def_id = current_def_id
+			program = { program | decls = final_decls },
+			next_def_id = current_def_id,
+			processed_decl_count = final_decls.length()
 		}
