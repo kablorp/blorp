@@ -690,7 +690,7 @@ leak gate (`benchmarks/self_compile_measure lock -- scripts/test compiler-core-s
 runs after every cut, not just at the end.
 
 **Measurement.** This changes generated C, so the stage-2 rule applies:
-`benchmarks/self_compile_measure --stage2 --input-rev 0c2e104331a224226088519bb0509c00b9ac0b70 --samples 3 --baseline benchmarks/results/self_compile_stage2_baseline_O2_2026-09-17_s2.json --output <json>`
+`benchmarks/self_compile_measure --stage2 --input-rev 0c2e104331a224226088519bb0509c00b9ac0b70 --samples 3 --baseline benchmarks/results/self_compile_stage2_baseline_O2_2026-09-17_s3.json --output <json>`
 and the same with `--program small` and the small s2 baseline, without
 `--require-identical`. Report instructions retired, output_bytes, the two
 grep counts, and the `allocs pass_perceus_complete` row (should not rise).

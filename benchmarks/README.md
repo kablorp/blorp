@@ -1757,14 +1757,14 @@ scripts/compiler-build-status
 benchmarks/self_compile_measure \
   --label issue-147-step2 \
   --input-rev <input_rev from the baseline JSON> \
-  --baseline benchmarks/results/self_compile_baseline_O0_2026-09-17_r5.json \
+  --baseline benchmarks/results/self_compile_baseline_O0_2026-09-17_r7.json \
   --output /tmp/issue-147-step2.json --require-identical
 
 # Small-program guard (must not regress materially).
 benchmarks/self_compile_measure --program small \
   --label issue-147-step2-small \
   --input-rev <input_rev> \
-  --baseline benchmarks/results/self_compile_small_baseline_O0_2026-09-17_r5.json \
+  --baseline benchmarks/results/self_compile_small_baseline_O0_2026-09-17_r7.json \
   --output /tmp/issue-147-step2-small.json --require-identical
 
 # Run a multi-process gate without overlapping another worker's measurement.
@@ -1813,7 +1813,7 @@ benchmarks/build_stage2_compiler bin/blorp-stage2
 # Or let the harness build and measure it in one step.
 benchmarks/self_compile_measure --stage2 \
   --label candidate --input-rev <input_rev> \
-  --baseline benchmarks/results/self_compile_stage2_baseline_O2_2026-09-17_s2.json \
+  --baseline benchmarks/results/self_compile_stage2_baseline_O2_2026-09-17_s3.json \
   --output /tmp/candidate.json --require-identical
 ```
 
