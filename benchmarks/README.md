@@ -1797,6 +1797,52 @@ Retained baselines live in `benchmarks/results/self_compile_baseline_*.json`
 and `self_compile_small_baseline_*.json`; a new baseline is recorded only when
 the input revision or host changes.
 
+### Sampling A Pass
+
+Allocation counters and the exact function profile say how often a pass runs
+its own code; they do not say how much of a pass is runtime work. For that,
+sample the compiler with `sample` and attribute the pass's subtree. Build the
+symbol map and the sampled binary from the *same* generation: `sample` cannot
+resolve the `static` functions in `bin/blorp` by name, and the `brp_NNNN`
+symbol identifiers differ between an embedded-runtime build and a
+`--no-embed-runtime` one, so a map lifted from a differently-configured binary
+points silently into the wrong code (the symptom is a pass with zero samples
+and an unexplained hole in the sampled address range). Generate a profiled C
+only to read its metadata table, which carries
+`{"<blorp name>", "brp_NNNN", "<module>", ...}` rows, then generate and link a
+plain C with identical flags as the target; `--profile-mode calls` does not
+shift the identifiers. Parse `sample`'s call graph by indentation, mark the
+topmost node of each pass subtree, and take self samples per symbol; they sum
+to the subtree's inclusive total. Charge `_tlv_get_addr` to the callers that
+read the thread-local before grouping.
+
+```bash
+boot=$(scripts/blorp-compiler-bootstrap --print-path)
+input=$(benchmarks/self_compile_measure freeze --rev <input_rev>)
+mod=blorp/src/compiler/stage_09_core/perceus
+$boot compile --profile-mode calls --profile-module $mod --no-embed-runtime \
+  --std-dir standard_library/src --no-format -o /tmp/map.c blorp/src/main.brp
+$boot compile --no-embed-runtime --std-dir standard_library/src --no-format \
+  -o /tmp/plain.c blorp/src/main.brp
+cc -O2 -fwrapv -pipe -w -DMINICORO_IMPL -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
+  -include blorp/src/lib/runtime/native/minicoro.h \
+  -c blorp/src/lib/runtime/native/runtime.c -o /tmp/rt.o
+cc -O0 -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
+  -include blorp/src/lib/runtime/native/runtime_decl.c \
+  -Iblorp/src/compiler/stage_01_generated_inputs -Iblorp/src/compiler/stage_04_modules \
+  -Iblorp/src/compiler/stage_06_typecheck/graph -Iblorp/src/compiler/stage_06_typecheck/type_system \
+  -Iblorp/src -Iblorp/src/lib -Iblorp/src/lsp/server -Iblorp/src/test \
+  /tmp/plain.c /tmp/rt.o blorp/build/_build/blorp-cli/runtime_sources.c \
+  blorp/src/lsp/server/native_runtime.c -lm -lpthread -o /tmp/blorp-sampled
+/tmp/blorp-sampled compile --no-format --no-embed-runtime \
+  --std-dir $input/standard_library/src -o /tmp/x.c $input/blorp/src/main.brp &
+sample $! 70 1 -file /tmp/sample.txt
+```
+
+The `-O0` module code against an `-O2` runtime matches how `make` links
+`bin/blorp`, so the runtime-versus-generated split is the one the harness
+measures. `valgrind` and `callgrind` are not available on macOS.
+
 ### Typecheck Cost Attribution
 
 `BLORP_TYPECHECK_BODY_METRICS=1` makes any compile print where the typed
