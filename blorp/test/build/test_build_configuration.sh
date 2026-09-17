@@ -593,10 +593,40 @@ if grep -Fq "printf '%s\\n' Makefile " <<<"$cli_build_plan"; then
 	exit 1
 fi
 if ! grep -Fq \
-	'new_hash=$(printf '\''%s\n%s\n%s\n%s\n%s\n'\'' "$source_hash" "$generated_c_hash" "$recipe_hash" "-O0"' \
+	'new_hash=$(printf '\''%s\n%s\n%s\n%s\n%s\n%s\n%s\n'\'' "$source_hash" "$generated_c_hash" "$recipe_hash" "-O0"' \
 	<<<"$cli_build_plan"
 then
 	echo "FAIL: source, generated C, recipe, optimization, and compiler config must determine the Blorp CLI cache key" >&2
+	exit 1
+fi
+if ! grep -Fq '"$splitter_hash" "8"' <<<"$cli_build_plan"; then
+	echo "FAIL: the splitter script and split count must determine the Blorp CLI cache key" >&2
+	exit 1
+fi
+split_one_build_plan=$(
+	unset BLORP_CLI_C_OPTIMIZATION MAKEFLAGS MFLAGS
+	make -n BLORP_CLI_C_SPLIT=1 compile-prepared-blorp-cli
+)
+if ! grep -Fq '"$splitter_hash" "1"' <<<"$split_one_build_plan"; then
+	echo "FAIL: BLORP_CLI_C_SPLIT must flow into the Blorp CLI cache key" >&2
+	exit 1
+fi
+if ! grep -Fq 'Compiling Blorp CLI (single TU)' <<<"$split_one_build_plan" ||
+	! grep -Fq 'Compiling Blorp CLI (8-way split)' <<<"$cli_build_plan"
+then
+	echo "FAIL: BLORP_CLI_C_SPLIT=1 must be a documented escape hatch to a single translation unit" >&2
+	exit 1
+fi
+if ! grep -Fq 'xargs -P' <<<"$cli_build_plan"; then
+	echo "FAIL: the split Blorp CLI compile must compile translation units in parallel" >&2
+	exit 1
+fi
+if ! grep -Fq 'scripts/split-generated-c' <<<"$cli_build_plan"; then
+	echo "FAIL: the Blorp CLI build must invoke the relocated splitter tool" >&2
+	exit 1
+fi
+if grep -Fq 'benchmarks/split_generated_c.py' <<<"$cli_build_plan" || [ -f benchmarks/split_generated_c.py ]; then
+	echo "FAIL: the build must not depend on benchmarks/ for the generated-C splitter" >&2
 	exit 1
 fi
 

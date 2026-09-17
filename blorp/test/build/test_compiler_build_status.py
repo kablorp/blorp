@@ -80,6 +80,7 @@ class CompilerBuildStatusTests(unittest.TestCase):
 		)
 		make_executable(self.root / "scripts/blorp-compiler-bootstrap", b"bootstrap\n")
 		make_executable(self.root / "scripts/blorp-cli-embedded-manifest", b"manifest\n")
+		make_executable(self.root / "scripts/split-generated-c", b"splitter\n")
 		make_executable(self.root / "bootstrap-blorp", b"bootstrap compiler\n")
 		self.bootstrap_compiler = str((self.root / "bootstrap-blorp").resolve())
 		self.bootstrap_target = self.detect_bootstrap_target()
@@ -204,6 +205,7 @@ class CompilerBuildStatusTests(unittest.TestCase):
 		self,
 		cli_opt: str = "-O0",
 		runtime_opt: str = "-O2",
+		split_n: str = "8",
 	) -> None:
 		c_manifest = input_manifest(self.root, self.generated_c_input_paths())
 		(self.build / "generated-c-build-inputs.sha256").write_bytes(c_manifest)
@@ -234,6 +236,8 @@ class CompilerBuildStatusTests(unittest.TestCase):
 			),
 			cli_opt,
 			self.runtime_config_hash(runtime_opt),
+			sha256_file(self.root / "scripts/split-generated-c"),
+			split_n,
 		)
 		(self.build / "inputs.sha256").write_text(f"{binary_input_hash}\n", encoding="utf-8")
 		(self.build / "blorp.sha256").write_text(
@@ -386,6 +390,34 @@ class CompilerBuildStatusTests(unittest.TestCase):
 
 		self.assert_status(result, 1, "STALE")
 		self.assertIn("BLORP_CLI_C_OPTIMIZATION=-O2", result.stdout)
+
+	def test_split_count_change_reports_stale(self) -> None:
+		result = self.run_status(extra_env={"BLORP_CLI_C_SPLIT": "1"})
+
+		self.assert_status(result, 1, "STALE")
+		self.assertIn("BLORP_CLI_C_SPLIT=1", result.stdout)
+
+	def test_splitter_script_edit_reports_stale(self) -> None:
+		self.write("scripts/split-generated-c", "changed splitter\n")
+
+		result = self.run_status()
+
+		self.assert_status(result, 1, "STALE")
+
+	def test_fresh_reports_split_plan(self) -> None:
+		result = self.run_status()
+
+		self.assert_status(result, 0, "FRESH")
+		self.assertIn("8-way split", result.stdout)
+		self.assertIn("8 per-TU objects", result.stdout)
+
+	def test_fresh_reports_single_tu_escape_hatch(self) -> None:
+		self.write_fresh_manifests(split_n="1")
+
+		result = self.run_status(extra_env={"BLORP_CLI_C_SPLIT": "1"})
+
+		self.assert_status(result, 0, "FRESH")
+		self.assertIn("single translation unit", result.stdout)
 
 	def test_missing_or_corrupt_provenance_reports_unknown(self) -> None:
 		for path in (

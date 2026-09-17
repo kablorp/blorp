@@ -25,6 +25,7 @@ LSP_NATIVE_RUNTIME_C = Path("blorp/src/lsp/server/native_runtime.c")
 STANDARD_LIBRARY_SOURCE_ROOT = Path("standard_library/src")
 BOOTSTRAP_SCRIPT = Path("scripts/blorp-compiler-bootstrap")
 MANIFEST_TOOL = Path("scripts/blorp-cli-embedded-manifest")
+SPLITTER_SCRIPT = Path("scripts/split-generated-c")
 BUILD_SOURCE_GENERATOR_SOURCE = Path("blorp/tool/generate_build_sources.brp")
 BUILD_VERSION = Path("blorp/build/VERSION")
 MINICORO_H = Path("blorp/src/lib/runtime/native/minicoro.h")
@@ -561,6 +562,8 @@ def status(root: Path) -> StatusResult:
 		cli_optimization = os.environ.get("BLORP_CLI_C_OPTIMIZATION", "-O0")
 		runtime_optimization = os.environ.get("BLORP_CLI_RUNTIME_C_OPTIMIZATION", "-O2")
 		runtime_hash = runtime_config_hash(root, runtime_optimization)
+		split_n = os.environ.get("BLORP_CLI_C_SPLIT", "8")
+		splitter_hash = sha256_file(root / SPLITTER_SCRIPT)
 		binary_input_hash = hash_lines(
 			sha256_bytes(build_manifest),
 			sha256_file(root / GENERATED_C),
@@ -571,13 +574,16 @@ def status(root: Path) -> StatusResult:
 			),
 			cli_optimization,
 			runtime_hash,
+			splitter_hash,
+			split_n,
 		)
 		if one_line_digest(root / BUILD_INPUT_HASH) != binary_input_hash:
 			return StatusResult(
 				"STALE",
 				"native compiler build identity changed",
 				f"BLORP_CLI_C_OPTIMIZATION={cli_optimization}; "
-				f"BLORP_CLI_RUNTIME_C_OPTIMIZATION={runtime_optimization}",
+				f"BLORP_CLI_RUNTIME_C_OPTIMIZATION={runtime_optimization}; "
+				f"BLORP_CLI_C_SPLIT={split_n}",
 			)
 		verify_hash_file(
 			root / BUILD_BIN_HASH,
@@ -619,14 +625,23 @@ def status(root: Path) -> StatusResult:
 				f"{INSTALLED_INPUT_MANIFEST} does not match current build identity",
 				"installed provenance changed",
 			)
-		return StatusResult("FRESH", "bin/blorp matches current compiler build inputs")
+		if split_n == "1":
+			split_detail = "single translation unit (BLORP_CLI_C_SPLIT=1)"
+		else:
+			split_detail = f"{split_n}-way split, {split_n} per-TU objects"
+		return StatusResult(
+			"FRESH",
+			"bin/blorp matches current compiler build inputs",
+			split_detail,
+		)
 	except (OSError, UnicodeDecodeError, StatusError) as error:
 		return StatusResult("UNKNOWN", str(error), "unverifiable compiler provenance")
 
 
 def format_result(result: StatusResult) -> str:
 	if result.state == "FRESH":
-		return f"FRESH: {result.reason}\n"
+		detail = f"\nBuild plan: {result.detail}" if result.detail else ""
+		return f"FRESH: {result.reason}{detail}\n"
 	if result.state == "STALE":
 		detail = f"\nDetail: {result.detail}" if result.detail else ""
 		return f"STALE: {result.reason}{detail}\nNext: make\n"

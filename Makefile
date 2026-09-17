@@ -16,6 +16,14 @@ BLORP_CLI_C_HASH := $(BLORP_CLI_BUILD_DIR)/blorp_cli_main.c.sha256
 BLORP_CLI_C_BUILD_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/generated-c-build-inputs.sha256
 BLORP_CLI_C_OPTIMIZATION ?= -O0
 BLORP_CLI_RUNTIME_C_OPTIMIZATION ?= -O2
+# Number of translation units the generated CLI C is split into before the
+# host C compile. 8 is the measured default (see
+# benchmarks/results/split_generated_c_O0_O2_2026-09-17.md and
+# benchmarks/results/split_default_build_2026-09-17.md). BLORP_CLI_C_SPLIT=1
+# is the escape hatch: it reproduces the previous single-TU compile exactly.
+BLORP_CLI_C_SPLIT ?= 8
+BLORP_CLI_SPLITTER := scripts/split-generated-c
+BLORP_CLI_SPLIT_DIR := $(BLORP_CLI_BUILD_DIR)/split-c
 BLORP_CLI_RUNTIME_CONFIG_HASH := $(shell { printf '%s\n' '$(BLORP_CLI_RUNTIME_C_OPTIMIZATION)' '-fwrapv -pipe -w -DMINICORO_IMPL -DBLORP_COMPILER_RUNTIME_SOURCES=1'; shasum -a 256 blorp/src/lib/runtime/native/minicoro.h blorp/src/lib/runtime/native/runtime.c blorp/src/lib/runtime/native/runtime_decl.c; command -v cc; cc --version 2>/dev/null | head -n 1; } | shasum -a 256 | awk '{print $$1}')
 BLORP_CLI_BUILD_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/build-inputs.sha256
 BLORP_CLI_INSTALL_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/install-inputs.sha256
@@ -245,24 +253,64 @@ compile-prepared-blorp-cli: $(BLORP_CLI_RUNTIME_OBJECT)
 	rm -f "$$tmp_bin" "$$tmp_hash" "$$tmp_bin_hash"; \
 	source_hash=$$(shasum -a 256 "$(BLORP_CLI_BUILD_INPUT_MANIFEST)" | awk '{print $$1}'); \
 	generated_c_hash=$$(shasum -a 256 "$(BLORP_CLI_C)" | awk '{print $$1}'); \
+	splitter_hash=$$(shasum -a 256 "$(BLORP_CLI_SPLITTER)" | awk '{print $$1}'); \
 	recipe_hash=$$(sed -n '/^# Compile prepared C inputs/,/^# Preserve the safe all-in-one build path/p' Makefile | shasum -a 256 | awk '{print $$1}'); \
-	new_hash=$$(printf '%s\n%s\n%s\n%s\n%s\n' "$$source_hash" "$$generated_c_hash" "$$recipe_hash" "$(BLORP_CLI_C_OPTIMIZATION)" "$(BLORP_CLI_RUNTIME_CONFIG_HASH)" | shasum -a 256 | awk '{print $$1}'); \
+	new_hash=$$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$$source_hash" "$$generated_c_hash" "$$recipe_hash" "$(BLORP_CLI_C_OPTIMIZATION)" "$(BLORP_CLI_RUNTIME_CONFIG_HASH)" "$$splitter_hash" "$(BLORP_CLI_C_SPLIT)" | shasum -a 256 | awk '{print $$1}'); \
 	old_hash=$$(cat "$(BLORP_CLI_INPUT_HASH)" 2>/dev/null || true); \
 	recorded_bin_hash=$$(cat "$(BLORP_CLI_BIN_HASH)" 2>/dev/null || true); \
 	actual_bin_hash=$$(shasum -a 256 "$(BLORP_CLI_BIN)" 2>/dev/null | awk '{print $$1}'); \
 	if [ "$$new_hash" != "$$old_hash" ] || [ ! -x "$(BLORP_CLI_BIN)" ] || [ -z "$$actual_bin_hash" ] || [ "$$actual_bin_hash" != "$$recorded_bin_hash" ]; then \
-		echo "Compiling Blorp CLI"; \
-		cc "$(BLORP_CLI_C_OPTIMIZATION)" -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
-			-include blorp/src/lib/runtime/native/runtime_decl.c \
-			-Iblorp/src/compiler/stage_01_generated_inputs \
-			-Iblorp/src/compiler/stage_04_modules \
-			-Iblorp/src/compiler/stage_06_typecheck/graph \
-			-Iblorp/src/compiler/stage_06_typecheck/type_system \
-			-Iblorp/src \
-			-Iblorp/src/lib \
-			-Iblorp/src/lsp/server \
-			-Iblorp/src/test \
-			"$(BLORP_CLI_C)" "$(BLORP_CLI_RUNTIME_OBJECT)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" "$(BLORP_LSP_NATIVE_RUNTIME_C)" -lm -lpthread -o "$$tmp_bin"; \
+		if [ "$(BLORP_CLI_C_SPLIT)" -le 1 ]; then \
+			echo "Compiling Blorp CLI (single TU)"; \
+			cc "$(BLORP_CLI_C_OPTIMIZATION)" -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
+				-include blorp/src/lib/runtime/native/runtime_decl.c \
+				-Iblorp/src/compiler/stage_01_generated_inputs \
+				-Iblorp/src/compiler/stage_04_modules \
+				-Iblorp/src/compiler/stage_06_typecheck/graph \
+				-Iblorp/src/compiler/stage_06_typecheck/type_system \
+				-Iblorp/src \
+				-Iblorp/src/lib \
+				-Iblorp/src/lsp/server \
+				-Iblorp/src/test \
+				"$(BLORP_CLI_C)" "$(BLORP_CLI_RUNTIME_OBJECT)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" "$(BLORP_LSP_NATIVE_RUNTIME_C)" -lm -lpthread -o "$$tmp_bin"; \
+		else \
+			echo "Compiling Blorp CLI ($(BLORP_CLI_C_SPLIT)-way split)"; \
+			split_dir="$(BLORP_CLI_SPLIT_DIR)/n$(BLORP_CLI_C_SPLIT)"; \
+			obj_dir="$$split_dir/obj"; \
+			rm -rf "$$split_dir"; \
+			mkdir -p "$(BLORP_CLI_SPLIT_DIR)"; \
+			python3 "$(BLORP_CLI_SPLITTER)" "$(BLORP_CLI_C)" "$(BLORP_CLI_SPLIT_DIR)" -n "$(BLORP_CLI_C_SPLIT)"; \
+			mkdir -p "$$obj_dir"; \
+			jobs=$${BLORP_CLI_C_SPLIT_JOBS:-$$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}; \
+			ls "$$split_dir"/split_body_*.c | LC_ALL=C sort | xargs -P "$$jobs" -n 1 sh -c ' \
+				set -e; \
+				src="$$1"; \
+				base=$$(basename "$$src" .c); \
+				cc "$(BLORP_CLI_C_OPTIMIZATION)" -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
+					-include blorp/src/lib/runtime/native/runtime_decl.c \
+					-Iblorp/src/compiler/stage_01_generated_inputs \
+					-Iblorp/src/compiler/stage_04_modules \
+					-Iblorp/src/compiler/stage_06_typecheck/graph \
+					-Iblorp/src/compiler/stage_06_typecheck/type_system \
+					-Iblorp/src \
+					-Iblorp/src/lib \
+					-Iblorp/src/lsp/server \
+					-Iblorp/src/test \
+					-c "$$src" -o "$(BLORP_CLI_SPLIT_DIR)/n$(BLORP_CLI_C_SPLIT)/obj/$$base.o" \
+			' sh; \
+			obj_files=$$(ls "$$obj_dir"/split_body_*.o | LC_ALL=C sort); \
+			cc "$(BLORP_CLI_C_OPTIMIZATION)" -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
+				-include blorp/src/lib/runtime/native/runtime_decl.c \
+				-Iblorp/src/compiler/stage_01_generated_inputs \
+				-Iblorp/src/compiler/stage_04_modules \
+				-Iblorp/src/compiler/stage_06_typecheck/graph \
+				-Iblorp/src/compiler/stage_06_typecheck/type_system \
+				-Iblorp/src \
+				-Iblorp/src/lib \
+				-Iblorp/src/lsp/server \
+				-Iblorp/src/test \
+				$$obj_files "$(BLORP_CLI_RUNTIME_OBJECT)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" "$(BLORP_LSP_NATIVE_RUNTIME_C)" -lm -lpthread -o "$$tmp_bin"; \
+		fi; \
 		shasum -a 256 "$$tmp_bin" | awk '{print $$1}' > "$$tmp_bin_hash"; \
 		mv "$$tmp_bin" "$(BLORP_CLI_BIN)"; \
 		printf '%s\n' "$$new_hash" > "$$tmp_hash"; \

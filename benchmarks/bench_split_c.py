@@ -2,7 +2,7 @@
 """Benchmark: does splitting the generated Blorp CLI C file into N translation
 units speed up the host C compile, at -O0 and -O2, and what does it cost?
 
-This script drives benchmarks/split_generated_c.py to produce N-way splits,
+This script drives scripts/split-generated-c to produce N-way splits,
 then for each (N, OPT) cell measures, using `/usr/bin/time -l`:
   - per-TU user/sys/wall CPU and peak RSS (each TU compiled alone, serially)
   - total serial CPU (sum of user+sys across all TUs in the cell)
@@ -91,7 +91,7 @@ def median(xs):
 def ensure_splits(source, split_dir, ns):
     need = [n for n in ns if not os.path.isdir(os.path.join(split_dir, f"n{n}"))]
     if need:
-        cmd = [sys.executable, os.path.join(ROOT, "benchmarks", "split_generated_c.py"),
+        cmd = [sys.executable, os.path.join(ROOT, "scripts", "split-generated-c"),
                source, split_dir]
         for n in need:
             cmd += ["-n", str(n)]
