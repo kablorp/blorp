@@ -806,7 +806,7 @@ Bootstrap-built `bin/blorp` against the r4 baselines; stage-2 against s1.
 | N3 one uniqueness test per record update | dropped, flat | branch `perf/record-update-uniqueness` | +0.08% |
 | N6 last-use move | dropped, flat | branch `perf/last-use-move` | 0.0% |
 | N9 non-atomic refcounts while single-threaded | deferred | none | ceiling -2.3% |
-| N7 borrowed iteration | not started | | |
+| N7 borrowed iteration, cut 1 (parameters and immutable lets) | landed | `eec001bc9` | -1.4% self, -1.8% small; C -0.6%; Perceus allocations +3.8% from the classification walk (follow-up in flight). Census: loops are 6% of duplicate-slot sites and 12% of frames, so the 30% bar was mis-sized; field chains (369 loops) measured flat and are parked on `perf/borrowed-iteration-field-chains`; the remaining loop mass is match bindings of borrowed scrutinees |
 
 Combined: bootstrap-built 231.0G to 184.5G (-20.1%), stage-2 216.7G to
 176.6G (-18.5%), stage-2 wall time to C 30.3s to 16.2s on the same
