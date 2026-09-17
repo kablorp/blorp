@@ -526,6 +526,7 @@ import:
 		c_value_record_field_type_is_boolean,
 		classify_c_record_layouts,
 	intrinsic_renderer as Intrinsic
+	list: list
 	prepared_backend_renderer:
 		CapacityCustomCtorArgs,
 		ChannelRecvAttemptConstructors,
@@ -26696,52 +26697,91 @@ private pure func header_inline_support(
 
 
 ---
-A deterministic placeholder for binning `function_definitions` across
-`unit_count` translation units: walk the functions in declaration order,
-accumulating each bin until its share of the total emitted-text length is
-reached, then advance to the next bin. This keeps every function in exactly
-one bin and never reorders them. It is intentionally simple -- a later step
-can replace it with LPT (longest-processing-time) bin-packing without
-touching anything else in this module.
+Bin `functions` across `unit_count` translation units by longest-processing-
+time-first (LPT): sort descending by emitted-text length (`def_id` ascending
+breaks ties, for a deterministic order over equal-length functions), then
+walk that order assigning each function to whichever bin currently holds the
+fewest total bytes, ties going to the lowest bin index. LPT bounds the
+largest bin at at most 4/3 of the optimal partition, and in practice packs
+the small functions around whichever one or two outliers dominate a
+program's size -- something a single declaration-order sweep can't do.
+
+Within each returned bin the functions are re-sorted by `def_id` ascending,
+so emission order inside a translation unit still matches today's relative
+declaration order and the rendered text stays reproducible.
+
+`unit_count` is clamped to `functions.length()` (and to at least 1) so a
+request for more units than there are functions never yields an empty bin;
+the caller is responsible for reporting the real unit count to anything
+downstream that expects `unit_count` bodies.
+
+Both sorts and the bin-selection scan are linear or log-linear in
+`functions.length()`, and the running-minimum scan over bins is linear in
+`unit_count` (small, so a linear scan per function is fine) -- no step here
+re-touches Core IR, since compile time is the metric this binning exists to
+protect.
+
+The one tuning knob this leaves untaken: weighting each function by
+`length ^ alpha` for some `alpha` around 1.2 before packing, which would
+balance -O2 compile *time* per function (superlinear in size) rather than
+raw emitted bytes. No measurement yet justifies a specific alpha, so this
+ships with the linear byte proxy.
 ---
+private pure func assign_translation_units(
+	functions: List[CFunctionEmission],
+	unit_count: Int,
+) -> List[List[CFunctionEmission]]:
+	clamped_by_count: Int = if unit_count > functions.length():
+		functions.length()
+	else:
+		unit_count
+
+	effective_unit_count: Int = if clamped_by_count < 1:
+		1
+	else:
+		clamped_by_count
+
+	sorted_by_def_id: List[CFunctionEmission] = functions.sort_by(
+		func(function: CFunctionEmission): function.def_id,
+	)
+	sorted_largest_first: List[CFunctionEmission] = sorted_by_def_id.sort_desc_by(
+		func(function: CFunctionEmission): function.text.length(),
+	)
+
+	var bins: List[List[CFunctionEmission]] = list(effective_unit_count)
+	var bin_totals: List[Int] = list(effective_unit_count)
+
+	for bin_index in 0..effective_unit_count:
+		bins = bins.append([])
+		bin_totals = bin_totals.append(0)
+
+	for function in sorted_largest_first:
+		var smallest_index: Int = 0
+		var smallest_total: Int = bin_totals.get(0).get_or(0)
+		var scan_index: Int = 1
+
+		while scan_index < effective_unit_count:
+			candidate_total: Int = bin_totals.get(scan_index).get_or(0)
+
+			if candidate_total < smallest_total:
+				smallest_total = candidate_total
+				smallest_index = scan_index
+
+			scan_index += 1
+
+		bins = bins.set(smallest_index, bins.get(smallest_index).get_or([]).append(function))
+		bin_totals = bin_totals.set(smallest_index, smallest_total + function.text.length())
+
+	bins.map(
+		func(bin: List[CFunctionEmission]): bin.sort_by(func(function: CFunctionEmission): function.def_id),
+	)
+
+
 private pure func bin_function_definitions(
 	functions: List[CFunctionEmission],
 	unit_count: Int,
 ) -> List[String]:
-	var total_len: Int = 0
-
-	for function in functions:
-		total_len += function.text.length()
-
-	target: Int = if unit_count <= 1:
-		total_len
-	else:
-		total_len / unit_count
-
-	var bins: List[String] = []
-	var current: String = make_string(0)
-	var current_len: Int = 0
-	var current_has_content: Bool = False
-	var bins_completed: Int = 0
-
-	for function in functions:
-		if bins_completed < unit_count - 1 and current_len >= target and current_has_content:
-			bins = bins.append(current)
-			bins_completed += 1
-			current = make_string(0)
-			current_len = 0
-			current_has_content = False
-
-		current = append_emitted_c(current, function.text)
-		current_len += function.text.length()
-		current_has_content = True
-
-	bins = bins.append(current)
-
-	while bins.length() < unit_count:
-		bins = bins.append(make_string(0))
-
-	bins
+	assign_translation_units(functions, unit_count).map(render_function_definitions)
 
 
 ---

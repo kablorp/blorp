@@ -7,9 +7,10 @@ imported, so this suite stays cheap to build in isolation.
 ---
 import:
 	../../../src/compiler/stage_09_core/ir:
+		CoreBinaryOp(AddOp),
 		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, UnionDecl),
 		CoreEnumDecl,
-		CoreExpr(LiteralExpr, ListConstructExpr),
+		CoreExpr(BinaryExpr, LiteralExpr, ListConstructExpr),
 		CoreFunction,
 		CoreFunctionKind(ProgramEntrypointFunction, UserFunction),
 		CoreGlobal,
@@ -568,6 +569,260 @@ pure func test_single_path_string_literal_macro_is_unchanged() -> Bool:
 	) == previous_static_string_literal_declaration_macro()
 
 
+---
+A nested chain of `AddOp` additions, `remaining` levels deep, so a function's
+body can be made arbitrarily large without adding new declaration shapes --
+LPT-binning tests below use this to build one outsized function among many
+small ones.
+---
+pure func nested_add_chain(remaining: Int) -> CoreExpr:
+	if remaining <= 0:
+		LiteralExpr(IntLiteral(1), int_type(), SyntheticSourceLoc)
+	else:
+		BinaryExpr(
+			AddOp,
+			LiteralExpr(IntLiteral(1), int_type(), SyntheticSourceLoc),
+			nested_add_chain(remaining - 1),
+			int_type(),
+			SyntheticSourceLoc,
+		)
+
+
+---
+A `name() -> Int { return <nested_add_chain(depth)> }` function, so its
+emitted text size is controlled by `depth` alone while its declared shape
+(an `Int`-returning, parameterless function) stays identical to
+`trivial_int_function` -- `trivial_function_signature(def_id)` matches both.
+---
+pure func sized_int_function(def_id: Int, depth: Int) -> CoreFunction:
+	{
+		name = "sized_" + def_id.to_string(),
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = int_type(),
+		body = Some(nested_add_chain(depth)),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = def_id,
+		loc = SyntheticSourceLoc
+	}
+
+
+---
+45 small functions (`depth = 2 * index`, so on the order of 20x smaller
+than the outlier on average and, at `index = 0`, orders of magnitude
+smaller) plus one outlier roughly 20x the average small function's size
+(`depth = 900`), all as program-level roots (no entrypoint, same pattern
+`split_test_program` uses).
+
+A single atomic function can only ever occupy one bin, so no binning
+algorithm can spread it out: the bin holding the outlier is bounded below
+by the outlier's own size, and that bound is achievable (within the 1.35x
+tolerance the balance test below checks) only once the rest of the program
+carries enough total weight to bring the other bins' mean up close to it.
+45 functions is the smallest count, at this depth spacing, for which that
+holds -- fewer, and even perfect packing can't stay under the bound.
+---
+pure func skewed_program() -> CoreProgram:
+	{
+		decls = [FunctionDecl(sized_int_function(900, 900))].concat(
+			skewed_small_function_decls(45, 910),
+		),
+		foreign_includes = []
+	}
+
+
+pure func skewed_small_function_decls(count: Int, start_def_id: Int) -> List[CoreDecl]:
+	var decls: List[CoreDecl] = []
+	var index: Int = 0
+
+	while index < count:
+		def_id: Int = start_def_id + index
+		decls = decls.append(FunctionDecl(sized_int_function(def_id, 2 * index)))
+		index += 1
+
+	decls
+
+
+pure func mean_body_length(bodies: List[String]) -> Int:
+	var total: Int = 0
+
+	for body in bodies:
+		total += body.length()
+
+	if bodies.length() == 0:
+		0
+	else:
+		total / bodies.length()
+
+
+pure func max_body_length(bodies: List[String]) -> Int:
+	var longest: Int = 0
+
+	for body in bodies:
+		if body.length() > longest:
+			longest = body.length()
+
+	longest
+
+
+---
+Test 9: a program with one outlier function, split across 4 units, keeps
+every bin within 1.35x the mean bin size -- the `skewed_program` docstring
+above works through why that bound needs the rest of the program's total
+size to be a couple of times the outlier's, not just "many small
+functions." A single sweep in declaration order (the placeholder this step
+replaces) has no notion of size at all, so it has no way to guarantee this
+regardless of how the program is shaped; this is LPT binning's balance
+guarantee, exercised end to end.
+---
+pure func test_skewed_program_balances_within_bound() -> Bool:
+	match try_emit_prepared_core_program_c_split_artifact_with_profile(
+		run_pre_dce_tail(skewed_program()),
+		FunctionProfileOff,
+		4,
+		"blorp_shared.h",
+	):
+		Ok(result):
+			mean_len: Int = mean_body_length(result.bodies)
+			longest_len: Int = max_body_length(result.bodies)
+
+			-- longest <= 1.35 * mean, in integer arithmetic: longest * 100 <= mean * 135.
+			longest_len * 100 <= mean_len * 135
+		Err(_):
+			False
+
+
+---
+Five differently sized functions with def_ids assigned in an order that
+does not track size (the middle-sized function has the lowest def_id, the
+largest has a middle def_id, and so on), so a bin that merely preserved LPT
+assignment order -- largest function first -- would fail this test. Used by
+the emission-order test below.
+---
+pure func scrambled_size_program() -> CoreProgram:
+	{
+		decls = [
+			FunctionDecl(sized_int_function(522, 90)),
+			FunctionDecl(sized_int_function(520, 10)),
+			FunctionDecl(sized_int_function(524, 70)),
+			FunctionDecl(sized_int_function(521, 30)),
+			FunctionDecl(sized_int_function(523, 50)),
+		],
+		foreign_includes = []
+	}
+
+
+pure func scrambled_size_def_ids() -> List[Int]:
+	[520, 521, 522, 523, 524]
+
+
+---
+Every def_id in `def_ids` that this body defines, paired with the byte
+offset of its definition, so emission order inside the body can be checked
+against def_id order.
+---
+pure func def_id_offsets_in_body(body: String, def_ids: List[Int]) -> List[(Int, Int)]:
+	var pairs: List[(Int, Int)] = []
+
+	for def_id in def_ids:
+		match body.index_of(trivial_function_signature(def_id) + " {"):
+			Some(offset):
+				pairs = pairs.append((offset, def_id))
+			None:
+				void
+
+	pairs
+
+
+pure func def_id_order_is_strictly_increasing(body: String, def_ids: List[Int]) -> Bool:
+	offsets_ascending: List[(Int, Int)] = def_id_offsets_in_body(body, def_ids).sort_by(
+		func(pair: (Int, Int)): pair[0],
+	)
+
+	var ok: Bool = True
+	var previous_def_id: Int = -1
+	var seen_any: Bool = False
+
+	for pair in offsets_ascending:
+		def_id: Int = pair[1]
+
+		if seen_any and def_id <= previous_def_id:
+			ok = False
+
+		previous_def_id = def_id
+		seen_any = True
+
+	ok
+
+
+---
+Test 10: within every body, the def_ids of the functions it defines appear
+in strictly increasing order -- the re-sort step after LPT assignment, not
+whatever order the greedy bin-packing itself produced.
+---
+pure func test_order_within_bin_is_by_def_id() -> Bool:
+	match try_emit_prepared_core_program_c_split_artifact_with_profile(
+		run_pre_dce_tail(scrambled_size_program()),
+		FunctionProfileOff,
+		2,
+		"blorp_shared.h",
+	):
+		Ok(result):
+			var ok: Bool = True
+
+			for body in result.bodies:
+				if not def_id_order_is_strictly_increasing(body, scrambled_size_def_ids()):
+					ok = False
+
+			ok
+		Err(_):
+			False
+
+
+---
+Two functions asked to split across 5 units: `unit_count` exceeds the
+function count, so the split path must clamp to the function count rather
+than padding with empty bodies.
+---
+pure func few_functions_program() -> CoreProgram:
+	{
+		decls = [
+			FunctionDecl(trivial_int_function("only_a", 950, 1)),
+			FunctionDecl(trivial_int_function("only_b", 951, 2)),
+		],
+		foreign_includes = []
+	}
+
+
+---
+Test 11: `unit_count` greater than the function count yields exactly as many
+bodies as there are functions, each non-empty, rather than padding with
+empty bodies up to `unit_count`.
+---
+pure func test_unit_count_exceeding_function_count_has_no_empty_bodies() -> Bool:
+	match try_emit_prepared_core_program_c_split_artifact_with_profile(
+		run_pre_dce_tail(few_functions_program()),
+		FunctionProfileOff,
+		5,
+		"blorp_shared.h",
+	):
+		Ok(result):
+			has_a: Bool = count_occurrences_across(result.bodies, trivial_function_signature(950) + " {") == 1
+			has_b: Bool = count_occurrences_across(result.bodies, trivial_function_signature(951) + " {") == 1
+
+			var no_body_is_empty: Bool = True
+
+			for body in result.bodies:
+				if body.length() == 0:
+					no_body_is_empty = False
+
+			result.bodies.length() == 2 and has_a and has_b and no_body_is_empty
+		Err(_):
+			False
+
+
 tests: TestSuite = {
 	description = "Split, multi-translation-unit C emission",
 	tests = [
@@ -588,6 +843,12 @@ tests: TestSuite = {
 		(
 			"single-path string literal macro is unchanged",
 			test_single_path_string_literal_macro_is_unchanged,
+		),
+		("skewed program balances within bound", test_skewed_program_balances_within_bound),
+		("order within bin is by def_id", test_order_within_bin_is_by_def_id),
+		(
+			"unit count exceeding function count has no empty bodies",
+			test_unit_count_exceeding_function_count_has_no_empty_bodies,
 		),
 	]
 }
