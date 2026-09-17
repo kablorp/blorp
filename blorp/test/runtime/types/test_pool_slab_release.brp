@@ -1,0 +1,56 @@
+import:
+	test: TestSuite
+
+
+-- Regression test for N4 (allocator pool coverage): a full pool class's
+-- release path once called libc free() on an interior slab pointer. Every
+-- object in a covered pool class (runtime.c, BLORP_POOL_CLASSES) is carved
+-- out of a BLORP_POOL_REFILL_COUNT-object slab; only the slab's base
+-- pointer was ever returned by malloc, so an interior object can never be
+-- passed to free(). Allocating and releasing more records than fit in one
+-- slab (BLORP_POOL_REFILL_COUNT is 64) forces at least one refill and
+-- exercises every object's return through the pool-return path, which
+-- previously crashed ("pointer being freed was not allocated") once the
+-- free list hit its old depth cap.
+--
+-- This must pass under three builds: the plain build (pool active, this
+-- file's normal execution through the runtime gate), --leak-check (pool
+-- still active; exercises the slab registry alongside leak accounting),
+-- and --sanitize (AddressSanitizer disables the pool at compile time, so
+-- this also covers the always-malloc/free fallback path for the same
+-- allocation shape).
+record PoolSlabRecord {
+	a: Int,
+	b: Int,
+	c: Int,
+	d: Int
+}
+
+
+func make_pool_slab_record(n: Int) -> PoolSlabRecord:
+	{ a = n, b = n + 1, c = n + 2, d = n + 3 }
+
+
+func test_pool_slab_refill_and_release() -> Bool:
+	var lst: List[PoolSlabRecord] = []
+	for i in 0..500:
+		lst = lst.append(make_pool_slab_record(i))
+	len_ok: Bool = lst.length() == 500
+	first_ok: Bool = match lst.get(0):
+		Some(r): r.a == 0 and r.d == 3
+		None: False
+	last_ok: Bool = match lst.get(499):
+		Some(r): r.a == 499 and r.d == 502
+		None: False
+	-- Drop every reference so all 500 records are released here, well past
+	-- one slab's worth for whichever pool class this record's size lands in.
+	lst = []
+	len_ok and first_ok and last_ok
+
+
+tests: TestSuite = {
+	description = "Pool slab refill and release",
+	tests = [
+		("pool slab refill and release", test_pool_slab_refill_and_release),
+	]
+}
