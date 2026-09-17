@@ -1,0 +1,593 @@
+---
+Tests for the split, multi-translation-unit C emitter: `render_split_translation_units`
+and its public entry point `try_emit_prepared_core_program_c_split_artifact_with_profile`.
+Fixtures are hand-built `CoreProgram` values (the pattern `test_core_emit.brp` and
+`test_canonical_empty_list_emit.brp` use), kept self-contained here rather than
+imported, so this suite stays cheap to build in isolation.
+---
+import:
+	../../../src/compiler/stage_09_core/ir:
+		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, UnionDecl),
+		CoreEnumDecl,
+		CoreExpr(LiteralExpr, ListConstructExpr),
+		CoreFunction,
+		CoreFunctionKind(ProgramEntrypointFunction, UserFunction),
+		CoreGlobal,
+		CoreHeapRecordDecl,
+		CoreListStorageLayout(InlineListStorage, PointerListStorage),
+		CoreLiteral(IntLiteral, StringLiteral),
+		CoreProgram,
+		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy),
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(NamedType),
+		CoreUnionDecl,
+		CoreUnionPayloadStorage(TypedUnionPayloadStorage),
+		CoreVar,
+	../../../src/compiler/stage_09_core/pipeline: run_pre_dce_tail
+	../../../src/compiler/stage_10_backend/c_symbol_projection: projected_callable_base_symbol
+	../../../src/compiler/stage_10_backend/emit:
+		CoreEmitError,
+		CTranslationUnitSet,
+		static_string_literal_macro,
+		try_emit_prepared_core_program_c_artifact_with_profile,
+		try_emit_prepared_core_program_c_split_artifact_with_profile,
+	../../../src/lib/function_profile: FunctionProfileConfiguration(FunctionProfileOff)
+	test: TestSuite
+
+
+pure func int_type() -> CoreType:
+	NamedType("Int", [])
+
+
+pure func string_type() -> CoreType:
+	NamedType("String", [])
+
+
+pure func list_int_type() -> CoreType:
+	NamedType("List", [int_type()])
+
+
+---
+A trivial user function `name() -> Int { return <value> }`, used to populate
+`function_definitions` with several small, distinctly named functions so
+`bin_function_definitions` has more than one function to spread across
+translation units.
+---
+pure func trivial_int_function(name: String, def_id: Int, value: Int) -> CoreFunction:
+	{
+		name = name,
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = int_type(),
+		body = Some(LiteralExpr(IntLiteral(value), int_type(), SyntheticSourceLoc)),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = def_id,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func entrypoint_function() -> CoreFunction:
+	{
+		name = "main",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = int_type(),
+		body = Some(LiteralExpr(IntLiteral(0), int_type(), SyntheticSourceLoc)),
+		is_pure = False,
+		function_kind = ProgramEntrypointFunction,
+		def_id = 1,
+		loc = SyntheticSourceLoc
+	}
+
+
+---
+A heap record with a releasable field, so it emits a destroy function (not
+just a make function) -- the split-only prototype/definition pair this
+suite's prototype-agreement test exercises.
+---
+pure func box_heap_record_decl() -> CoreHeapRecordDecl:
+	{
+		abi_type = None,
+		name = "Box",
+		type_params = [],
+		fields = [
+			{
+				name = "count",
+				typ = int_type(),
+				release_policy = NoReleasePolicy
+			},
+			{
+				name = "label",
+				typ = string_type(),
+				release_policy = ArcReleasePolicy
+			},
+		],
+		loc = SyntheticSourceLoc
+	}
+
+
+---
+A union with both an owner-data (zero-field) variant and a releasable
+non-empty variant, so it exercises the owner-data extern/define split, the
+union destroy function, and a non-empty variant's constructor prototype.
+---
+pure func doc_union_decl() -> CoreUnionDecl:
+	{
+		abi_type = None,
+		name = "Doc",
+		type_params = [],
+		payload_storage = TypedUnionPayloadStorage,
+		variants = [
+			{
+				name = "Nil",
+				c_name = "__def_700_Nil",
+				tag_c_name = "TAG_Doc_Nil",
+				tag = 0,
+				fields = [],
+				def_id = Some(700)
+			},
+			{
+				name = "Text",
+				c_name = "__def_701_Text",
+				tag_c_name = "TAG_Doc_Text",
+				tag = 1,
+				fields = [
+					{
+						typ = string_type(),
+						release_policy = ArcReleasePolicy
+					},
+				],
+				def_id = Some(701)
+			},
+		],
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func color_enum_decl() -> CoreEnumDecl:
+	{
+		abi_type = None,
+		name = "Color",
+		type_params = [],
+		variants = [
+			{
+				name = "Red",
+				c_name = "__def_101_Red",
+				tag = 0,
+				def_id = Some(101)
+			},
+			{
+				name = "Blue",
+				c_name = "__def_102_Blue",
+				tag = 1,
+				def_id = Some(102)
+			},
+		],
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func answer_var() -> CoreVar:
+	{
+		name = "ANSWER",
+		uniq = 0,
+		def_id = Some(70)
+	}
+
+
+pure func answer_global() -> CoreGlobal:
+	{
+		name = answer_var(),
+		source_module = None,
+		typ = int_type(),
+		init = LiteralExpr(IntLiteral(42), int_type(), SyntheticSourceLoc),
+		is_mutable = False,
+		is_const = True,
+		is_private = False,
+		def_id = 70,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func greeting_var() -> CoreVar:
+	{
+		name = "GREETING",
+		uniq = 0,
+		def_id = Some(80)
+	}
+
+
+---
+A `const String` global whose initializer is a plain string literal --
+today's pipeline classifies this into the backend static-string-literal
+pool, so this is what puts at least one literal through the split path's
+`BLORP_EXTERN_STRING` macro.
+---
+pure func greeting_global() -> CoreGlobal:
+	{
+		name = greeting_var(),
+		source_module = None,
+		typ = string_type(),
+		init = LiteralExpr(StringLiteral("hello, split"), string_type(), SyntheticSourceLoc),
+		is_mutable = False,
+		is_const = True,
+		is_private = False,
+		def_id = 80,
+		loc = SyntheticSourceLoc
+	}
+
+
+---
+An empty-list-construct function, so the program has at least one canonical
+empty list -- the split path's named-storage-type rewrite of
+`canonical_empty_list_definition`.
+---
+pure func empty_ints_function() -> CoreFunction:
+	{
+		name = "empty_ints",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = list_int_type(),
+		body = Some(
+			ListConstructExpr(
+				{
+					layout = InlineListStorage(8),
+					elements = [],
+					elem_needs_release = False
+				},
+				list_int_type(),
+				SyntheticSourceLoc,
+			),
+		),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 6,
+		loc = SyntheticSourceLoc
+	}
+
+
+---
+No `ProgramEntrypointFunction` here, deliberately: `run_pre_dce_tail` prunes
+anything unreachable from an entrypoint once one is present, and wiring a
+realistic, resource-correct call chain from `main` down through a heap
+record, a union, and five functions is exactly the fragile hand-IR-building
+this suite wants to avoid. Every decl below is a program-level root when
+there is no entrypoint, so all of them survive to the emitter untouched;
+`entrypoint_only_program` below covers the entrypoint prototype/definition
+case on its own.
+---
+pure func split_test_program() -> CoreProgram:
+	{
+		decls = [
+			HeapRecordDecl(box_heap_record_decl()),
+			UnionDecl(doc_union_decl()),
+			EnumDecl(color_enum_decl()),
+			GlobalDecl(answer_global()),
+			GlobalDecl(greeting_global()),
+			FunctionDecl(empty_ints_function()),
+			FunctionDecl(trivial_int_function("alpha", 10, 1)),
+			FunctionDecl(trivial_int_function("beta", 11, 2)),
+			FunctionDecl(trivial_int_function("gamma", 12, 3)),
+			FunctionDecl(trivial_int_function("delta", 13, 4)),
+		],
+		foreign_includes = []
+	}
+
+
+pure func entrypoint_only_program() -> CoreProgram:
+	{
+		decls = [FunctionDecl(entrypoint_function())],
+		foreign_includes = []
+	}
+
+
+pure func count_occurrences(text: String, needle: String) -> Int:
+	text.split(needle).length() - 1
+
+
+pure func count_occurrences_across(bodies: List[String], needle: String) -> Int:
+	var total: Int = 0
+
+	for body in bodies:
+		total += count_occurrences(body, needle)
+
+	total
+
+
+pure func split_result() -> Result[CTranslationUnitSet, CoreEmitError]:
+	try_emit_prepared_core_program_c_split_artifact_with_profile(
+		run_pre_dce_tail(split_test_program()),
+		FunctionProfileOff,
+		3,
+		"blorp_shared.h",
+	)
+
+
+---
+Test 1: at `unit_count == 1`, the split entry point returns exactly the
+single-file path's output as the sole body, with no header, and adds no
+extra units.
+---
+pure func test_unit_count_one_matches_single_file_path() -> Bool:
+	match (
+		try_emit_prepared_core_program_c_split_artifact_with_profile(
+			run_pre_dce_tail(split_test_program()),
+			FunctionProfileOff,
+			1,
+			"blorp_shared.h",
+		),
+		try_emit_prepared_core_program_c_artifact_with_profile(
+			run_pre_dce_tail(split_test_program()),
+			FunctionProfileOff,
+		),
+	):
+		(Ok(split), Ok(single)):
+			split.shared_header == "" and split.bodies == [single.c_code]
+		_:
+			False
+
+
+---
+Test 2: at `unit_count == 3`, every function definition appears in exactly
+one body and never in the header, every function (entrypoint, destroys,
+enum_to_string included) has exactly one prototype in the header, and no
+body contains a `typedef`.
+---
+pure func trivial_function_signature(def_id: Int) -> String:
+	"long " + projected_callable_base_symbol(def_id) + "(void)"
+
+
+pure func test_header_body_partition_at_three_units() -> Bool:
+	match split_result():
+		Ok(result):
+			function_signatures: List[String] = [
+				trivial_function_signature(10),
+				trivial_function_signature(11),
+				trivial_function_signature(12),
+				trivial_function_signature(13),
+			]
+			destroy_signatures: List[String] = [
+				"void Box_destroy(void* obj)",
+				"void Doc_destroy(void* obj)",
+			]
+
+			var functions_ok: Bool = True
+
+			for signature in function_signatures:
+				definition_count: Int = count_occurrences_across(result.bodies, signature + " {")
+				prototype_count: Int = count_occurrences(result.shared_header, signature + ";")
+
+				if definition_count != 1 or prototype_count != 1:
+					functions_ok = False
+
+			var destroys_ok: Bool = True
+
+			for signature in destroy_signatures:
+				definition_count: Int = count_occurrences_across(result.bodies, signature + " {")
+				prototype_count: Int = count_occurrences(result.shared_header, signature + ";")
+
+				if definition_count != 1 or prototype_count != 1:
+					destroys_ok = False
+
+			var no_body_defines_prototype_text: Bool = True
+
+			for signature in function_signatures:
+				if result.shared_header.contains(signature + " {"):
+					no_body_defines_prototype_text = False
+
+			var no_typedef_in_bodies: Bool = True
+
+			for body in result.bodies:
+				if body.contains("typedef"):
+					no_typedef_in_bodies = False
+
+			(
+				result.bodies.length() == 3
+				and functions_ok
+				and destroys_ok
+				and no_body_defines_prototype_text
+				and no_typedef_in_bodies
+			)
+		Err(_):
+			False
+
+
+---
+Test 3: each `BLORP_EXTERN_STRING(<sym>,` appears exactly once across all
+bodies; each `extern blorp_String <sym>;` appears exactly once in the
+header; `BLORP_STATIC_STRING(` appears zero times anywhere in split output.
+A duplicated or mis-declared literal is a *silent* failure at link time (it
+still links and runs, but breaks `same_object` pointer identity), which is
+exactly why this invariant needs a dedicated test rather than relying on
+the compiler to catch it.
+---
+pure func test_string_literal_defined_once_and_declared_once() -> Bool:
+	match split_result():
+		Ok(result):
+			extern_definition_count: Int = count_occurrences_across(
+				result.bodies,
+				"BLORP_EXTERN_STRING(__blorp_string_literal_0,",
+			)
+			extern_decl_count: Int = count_occurrences(
+				result.shared_header,
+				"extern blorp_String __blorp_string_literal_0;",
+			)
+			static_macro_uses: Int = count_occurrences_across(
+				result.bodies,
+				"BLORP_STATIC_STRING(",
+			) + count_occurrences(result.shared_header, "BLORP_STATIC_STRING(")
+
+			extern_definition_count == 1 and extern_decl_count == 1 and static_macro_uses == 0
+		Err(_):
+			False
+
+
+---
+Test 4: no body other than TU 0 defines the global; no cross-TU global
+definition begins with `static`; the global is defined exactly once across
+bodies.
+---
+pure func test_global_defined_once_by_tu_zero() -> Bool:
+	match split_result():
+		Ok(result):
+			definition_count: Int = count_occurrences_across(result.bodies, "long ANSWER = 42L;")
+			tu_zero_defines_it: Bool = result.bodies.get(0).map(
+				func(body): body.contains("long ANSWER = 42L;"),
+			) == Some(True)
+			no_static_definition: Bool = count_occurrences_across(
+				result.bodies,
+				"static long ANSWER = 42L;",
+			) == 0
+
+			var other_tus_empty_of_it: Bool = True
+			var index: Int = 0
+
+			for body in result.bodies:
+				if index > 0 and body.contains("ANSWER = 42L;"):
+					other_tus_empty_of_it = False
+
+				index += 1
+
+			definition_count == 1 and tu_zero_defines_it and no_static_definition and other_tus_empty_of_it
+		Err(_):
+			False
+
+
+---
+Test 5: every canonical-empty-list symbol has a named
+`typedef struct { ... } <sym>__storage;` in the header (not an anonymous
+struct repeated per TU, which is a distinct incompatible type in every TU
+that declares it), and `extern struct {` -- the anonymous-extern shape this
+step replaces -- appears nowhere in split output.
+---
+pure func test_canonical_empty_list_has_named_storage_type() -> Bool:
+	match split_result():
+		Ok(result):
+			symbol: String = "__blorp_canonical_empty_list_inline_8"
+
+			(
+				result.shared_header.contains("typedef struct { ") and result.shared_header.contains(
+					"} " + symbol + "__storage;",
+				)
+				and result.shared_header.contains("extern " + symbol + "__storage " + symbol + ";")
+				and not result.shared_header.contains("extern struct {")
+				and count_occurrences_across(result.bodies, "extern struct {") == 0
+			)
+		Err(_):
+			False
+
+
+---
+Test 6: rendering the same program twice yields identical header and bodies.
+---
+pure func test_split_rendering_is_deterministic() -> Bool:
+	match (split_result(), split_result()):
+		(Ok(first), Ok(second)):
+			first.shared_header == second.shared_header and first.bodies == second.bodies
+		_:
+			False
+
+
+---
+Test 7: for each function this suite tracks, the header prototype text
+equals the definition's signature text plus ";".
+---
+pure func test_prototype_matches_definition_signature() -> Bool:
+	match split_result():
+		Ok(result):
+			signatures: List[String] = [
+				trivial_function_signature(10),
+				trivial_function_signature(11),
+				"void Box_destroy(void* obj)",
+				"void Doc_destroy(void* obj)",
+			]
+
+			var ok: Bool = True
+
+			for signature in signatures:
+				has_prototype: Bool = result.shared_header.contains(signature + ";")
+				has_definition: Bool = count_occurrences_across(result.bodies, signature + " {") == 1
+
+				if not (has_prototype and has_definition):
+					ok = False
+
+			ok
+		Err(_):
+			False
+
+
+---
+The program entrypoint is the one function `emit_function_forward_decl`
+never prototypes (it always returns `""` for `ProgramEntrypointFunction`,
+single-file path included) -- split adds its prototype via
+`entrypoint_forward_decl_for_split`, so it needs its own check.
+---
+pure func test_entrypoint_has_prototype_and_definition() -> Bool:
+	match try_emit_prepared_core_program_c_split_artifact_with_profile(
+		run_pre_dce_tail(entrypoint_only_program()),
+		FunctionProfileOff,
+		3,
+		"blorp_shared.h",
+	):
+		Ok(result):
+			(
+				result.shared_header.contains("int main(void);")
+				and count_occurrences_across(result.bodies, "int main(void) {") == 1
+			)
+		Err(_):
+			False
+
+
+---
+Test 8: `static_string_literal_macro("BLORP_STATIC_STRING", "static ")` must
+equal the exact text `STATIC_STRING_LITERAL_DECLARATION_MACRO` held before
+this step (embedded here verbatim) -- the single-file emission path is
+never allowed to drift from this text.
+---
+pure func previous_static_string_literal_declaration_macro() -> String:
+	(
+		"#define BLORP_STATIC_STRING(name, length, bytes) \\\n"
+		+ "  _Static_assert(sizeof(bytes) == (length) + 1, \"string literal byte length\"); \\\n"
+		+ "  static blorp_String name = { \\\n"
+		+ "    .header = { BLORP_IMMORTAL_REFCOUNT, BLORP_ALLOC_CLASS_DIRECT, 0 }, \\\n"
+		+ "    .len = (length), \\\n"
+		+ "    .capacity = (length), \\\n"
+		+ "    .data = bytes \\\n"
+		+ "  }"
+	)
+
+
+pure func test_single_path_string_literal_macro_is_unchanged() -> Bool:
+	static_string_literal_macro(
+		"BLORP_STATIC_STRING",
+		"static ",
+	) == previous_static_string_literal_declaration_macro()
+
+
+tests: TestSuite = {
+	description = "Split, multi-translation-unit C emission",
+	tests = [
+		("unit count one matches single-file path", test_unit_count_one_matches_single_file_path),
+		("header/body partition at three units", test_header_body_partition_at_three_units),
+		(
+			"string literal defined once and declared once",
+			test_string_literal_defined_once_and_declared_once,
+		),
+		("global defined once by TU zero", test_global_defined_once_by_tu_zero),
+		(
+			"canonical empty list has named storage type",
+			test_canonical_empty_list_has_named_storage_type,
+		),
+		("split rendering is deterministic", test_split_rendering_is_deterministic),
+		("prototype matches definition signature", test_prototype_matches_definition_signature),
+		("entrypoint has prototype and definition", test_entrypoint_has_prototype_and_definition),
+		(
+			"single-path string literal macro is unchanged",
+			test_single_path_string_literal_macro_is_unchanged,
+		),
+	]
+}
