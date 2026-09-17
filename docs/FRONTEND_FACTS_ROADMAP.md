@@ -194,6 +194,7 @@ has not finished; the point is that the old shape cannot come back.
 | 3 | T5 publish the definition table out of typecheck | `graph/definition_index.brp`, `decl.brp`, then mono, DCE, Perceus index builders | yes: symbol table | after T3, T4 |
 | 3 | T6 key lowering's tables by definition and type id | `stage_08_core_lower/lower.brp`, `list_layout.brp` | no | after T5 |
 | 2 | T7 parser nodes without per-node ownership traffic | `stage_03_parse` | yes: per-keystroke work | T1, T2, T4 |
+| 2 | T7b parser cursor as a scalar (builder conversion) | `stage_03_parse/language_parser.brp` | yes | after T7 |
 | 4 | T8 cacheable header completion (design) | `stage_06_typecheck/decl.brp`, `headers/` | essential | after T4 |
 
 ### T1. Module lookups by `ModuleId`
@@ -371,6 +372,47 @@ parser suites and identical C.
 at least 20%; parse throughput reported before and after; formatter clean.
 Serves the LSP directly: parsing is the per-keystroke work.
 
+
+### T7b. The parser's cursor as a scalar, not a state record (builder conversion)
+
+**Context.** T7 read the generated C of `advance_parser`
+(`language_parser.brp:745`, `{ state | index = state.index + 1 }`): the
+callee retains its `state` parameter before the reuse check, so the update
+is never unique and every token advance allocates a new four-field
+`ParserState` plus three field retains. `ParserState` is threaded through
+about 257 call sites of the recursive-descent grammar (6,885 lines).
+T7's two cuts (token kind without owning the token, infix info as a stack
+struct) landed at -1.3% instructions; this is the remaining, larger
+allocation source in parsing.
+
+**Change.** The parser becomes a builder in the lexer's shape: the token
+list and source are passed by borrow; the cursor is an `Int` passed in and
+returned in a small `struct` result together with what was parsed (a
+struct field may be an Int or a fieldless enum; the parsed node itself is a
+record and travels as the second field of a record result only where the
+struct rule forbids it, so measure which result shapes stay on the stack);
+diagnostics are a local `var` accumulator of the top-level parse function
+(or passed by borrow and appended through a returned list only at the few
+sites that emit them). Do it grammar family by grammar family (expressions,
+patterns, types, declarations), each as a cut with the formatter as the
+oracle.
+
+**Fast loop and oracle.** `bin/blorp format --check blorp/src standard_library/src`
+(400 files, byte-exact), the parser and lexer suites, the stop-after loop
+with an identical lowered-Core dump, then the r6 harness with
+`--require-identical`. Report `source_discovery_complete` allocations and
+parse throughput before and after.
+
+**Pitfalls.** Backtracking: any site that saves a `ParserState` and
+restores it on failure becomes "save the Int cursor"; diagnostics emitted
+during a failed speculative parse must still be discarded the way they are
+today. Error recovery paths that return a partially advanced state must
+return the cursor they reached. The `Step` records the grammar uses to
+return (state, node) pairs are the natural place to become structs.
+
+**Acceptance.** Identical C; `source_discovery_complete` allocations down
+at least 20%; formatter clean; suites and compiler-check green.
+
 ### T8. Header completion that does not restart from scratch (design)
 
 **Context.** `graph_completion` re-derives every module's accepted record,
@@ -428,3 +470,6 @@ files), then F6 and F5 together.
 | --- | --- | --- | --- | --- |
 | T1 module lookups by `ModuleId` | landed | `842912c16` | self-compile rows identical | the path-keyed source was only the fallback used by lint, check, purify, and the LSP; the self-compile driver already used ids |
 | T2 callable name facts once per module | landed | `46930b911` | `core_lowering_complete` -0.13% | builder runs 359 times instead of 718; identical lowered Core; `CallableNameFacts` stays name-keyed by design (it aggregates overloads sharing a name) |
+| F7 DCE reference indexes by `(def_id, uniq)` | landed | `441f568a9` | instructions -0.32%; `pass_perceus_complete` -0.5% | the consumer of those indexes is Perceus, not DCE's own pass; string-equality samples -56% |
+| T7 parser: token kind without owning the token; infix classification as a stack struct | landed | `7619c0035` | instructions -1.3%; `source_discovery_complete` -0.4% | `advance_parser` still rebuilds a `ParserState` record per token: the T7b builder conversion below |
+| T4 typecheck facts | closed, no code | | | `InferModuleFacts`/`InferSession` already exist; the dictionary copies are gate 1 of record reuse (a helper returning its parameter unchanged on one path), now the typecheck state reuse task |
