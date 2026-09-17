@@ -54,6 +54,7 @@ import:
 			FieldExpr,
 			ForRangeExpr,
 			ForListExpr,
+			ForStringExpr,
 			IfExpr,
 			LambdaExpr,
 			LetExpr,
@@ -16921,6 +16922,234 @@ func test_mutable_accumulator_loop_preserves_owner_events() -> Bool:
 	ownership_event_signature_matches(rewritten, MUTABLE_LOOP_OWNERSHIP_EVENT_SIGNATURE)
 
 
+--- Loop iterable release policies in traversal order. Borrowed iteration is
+--- recorded as `NoReleasePolicy` on the loop node, so the policy is the oracle
+--- for whether Perceus took ownership of the iterable.
+pure func loop_iterable_policies(expr: CoreExpr) -> List[CoreReleasePolicy]:
+	match expr:
+		ForListExpr(loop, typ, loc):
+			[loop.iterable_release_policy]
+				.concat(loop_iterable_policies(loop.iterable))
+				.concat(loop_iterable_policies(loop.body))
+		ForStringExpr(loop, typ, loc):
+			[loop.iterable_release_policy]
+				.concat(loop_iterable_policies(loop.iterable))
+				.concat(loop_iterable_policies(loop.body))
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			loop_iterable_policies(rhs).concat(loop_iterable_policies(body))
+		BorrowLetExpr(variable, typ, rhs, body):
+			loop_iterable_policies(rhs).concat(loop_iterable_policies(body))
+		SeqExpr(first, second):
+			loop_iterable_policies(first).concat(loop_iterable_policies(second))
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			loop_iterable_policies(cond)
+				.concat(loop_iterable_policies(then_expr))
+				.concat(loop_iterable_policies(else_expr))
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			loop_iterable_policies(body)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			loop_iterable_policies(body)
+		_:
+			[]
+
+
+pure func loop_function_iterable_policies(
+	params: List[CoreParam],
+	body: CoreExpr,
+) -> List[CoreReleasePolicy]:
+	rewritten: CoreProgram = insert_drops_program({
+		decls = [function_decl("iterate", 9600, params, int_type(), body)],
+		foreign_includes = [],
+	})
+
+	match function_body(rewritten, "iterate"):
+		Some(rewritten_body):
+			loop_iterable_policies(rewritten_body)
+		None:
+			[]
+
+
+pure func borrowed_loop_list_loop(iterable: CoreExpr, body: CoreExpr) -> CoreExpr:
+	ForListExpr(
+		{
+			binder = {
+				variable = named_var("item"),
+				typ = int_type(),
+				range_direction = RangeForwardOnly
+			},
+			layout = PointerListStorage,
+			iterable = iterable,
+			iterable_release_policy = ArcReleasePolicy,
+			body = body
+		},
+		void_type(),
+		SyntheticSourceLoc,
+	)
+
+
+pure func borrowed_loop_function_body(iterable: CoreExpr, body: CoreExpr) -> CoreExpr:
+	SeqExpr(
+		borrowed_loop_list_loop(iterable, body),
+		int_expr(0),
+	)
+
+
+pure func borrowed_loop_binder_use() -> CoreExpr:
+	call_expr("blorp_noop", [var_expr("item", int_type())], void_type())
+
+
+pure func test_loop_over_borrowed_parameter_iterates_borrowed() -> Bool:
+	loop_function_iterable_policies(
+		[core_param("items", list_int_type())],
+		borrowed_loop_function_body(
+			var_expr("items", list_int_type()),
+			borrowed_loop_binder_use(),
+		),
+	) == [NoReleasePolicy]
+
+
+pure func test_loop_over_immutable_let_iterates_borrowed() -> Bool:
+	loop_function_iterable_policies(
+		[core_param("source", list_int_type())],
+		LetExpr(
+			named_var("items"),
+			False,
+			list_int_type(),
+			var_expr("source", list_int_type()),
+			borrowed_loop_function_body(
+				var_expr("items", list_int_type()),
+				borrowed_loop_binder_use(),
+			),
+		),
+	) == [NoReleasePolicy]
+
+
+pure func test_loop_over_string_parameter_iterates_borrowed() -> Bool:
+	loop: CoreExpr = ForStringExpr(
+		{
+			binder = {
+				variable = named_var("code_point"),
+				typ = int_type(),
+				range_direction = RangeForwardOnly
+			},
+			iterable = var_expr("text", string_type()),
+			iterable_release_policy = ArcReleaseOnlyPolicy,
+			body = call_expr("blorp_noop", [var_expr("code_point", int_type())], void_type())
+		},
+		void_type(),
+		SyntheticSourceLoc,
+	)
+
+	loop_function_iterable_policies(
+		[core_param("text", string_type())],
+		SeqExpr(loop, int_expr(0)),
+	) == [NoReleasePolicy]
+
+
+pure func test_loop_over_reassigned_variable_keeps_owned_iterable() -> Bool:
+	loop_function_iterable_policies(
+		[core_param("source", list_int_type())],
+		LetExpr(
+			named_var("items"),
+			True,
+			list_int_type(),
+			var_expr("source", list_int_type()),
+			borrowed_loop_function_body(
+				var_expr("items", list_int_type()),
+				AssignExpr(
+					named_var("items"),
+					call_expr("blorp_list_new", [int_expr(0)], list_int_type()),
+					void_type(),
+					SyntheticSourceLoc,
+				),
+			),
+		),
+	) == [ArcReleasePolicy]
+
+
+pure func test_loop_over_consumed_iterable_keeps_owned_iterable() -> Bool:
+	loop_function_iterable_policies(
+		[core_param("items", list_int_type())],
+		borrowed_loop_function_body(
+			var_expr("items", list_int_type()),
+			user_call_expr(
+				"consume_list",
+				Some(9601),
+				[0],
+				[var_expr("items", list_int_type())],
+				void_type(),
+			),
+		),
+	) == [ArcReleasePolicy]
+
+
+pure func test_loop_over_lambda_captured_iterable_keeps_owned_iterable() -> Bool:
+	loop_function_iterable_policies(
+		[core_param("items", list_int_type())],
+		borrowed_loop_function_body(
+			var_expr("items", list_int_type()),
+			LambdaExpr(
+				[],
+				int_type(),
+				call_expr("blorp_list_len", [var_expr("items", list_int_type())], int_type()),
+				True,
+				closure_type(),
+				SyntheticSourceLoc,
+			),
+		),
+	) == [ArcReleasePolicy]
+
+
+pure func test_loop_over_parameter_field_keeps_owned_iterable() -> Bool:
+	loop_function_iterable_policies(
+		[core_param("holder", HeapRecordType("Holder"))],
+		borrowed_loop_function_body(
+			FieldExpr(
+				var_expr("holder", HeapRecordType("Holder")),
+				"items",
+				list_int_type(),
+				SyntheticSourceLoc,
+			),
+			borrowed_loop_binder_use(),
+		),
+	) == [ArcReleasePolicy]
+
+
+pure func test_loop_over_shadowing_binder_keeps_owned_iterable() -> Bool:
+	outer_loop: CoreExpr = ForListExpr(
+		{
+			binder = {
+				variable = named_var("items"),
+				typ = list_int_type(),
+				range_direction = RangeForwardOnly
+			},
+			layout = PointerListStorage,
+			iterable = var_expr(
+				"groups",
+				NamedType("List", [list_int_type()]),
+			),
+			iterable_release_policy = ArcReleasePolicy,
+			body = borrowed_loop_list_loop(
+				var_expr("items", list_int_type()),
+				borrowed_loop_binder_use(),
+			)
+		},
+		void_type(),
+		SyntheticSourceLoc,
+	)
+
+	loop_function_iterable_policies(
+		[core_param("items", list_int_type()), core_param(
+				"groups",
+				NamedType("List", [list_int_type()]),
+			)],
+		SeqExpr(
+			outer_loop,
+			int_expr(0),
+		),
+	) == [NoReleasePolicy, ArcReleasePolicy]
+
+
 tests: TestSuite = {
 	description = "Blorp compiler Core Perceus",
 	tests = [
@@ -18275,6 +18504,38 @@ tests: TestSuite = {
 		(
 			"mutable accumulator loop preserves owner events",
 			test_mutable_accumulator_loop_preserves_owner_events,
+		),
+		(
+			"loop over borrowed parameter iterates borrowed",
+			test_loop_over_borrowed_parameter_iterates_borrowed,
+		),
+		(
+			"loop over immutable let iterates borrowed",
+			test_loop_over_immutable_let_iterates_borrowed,
+		),
+		(
+			"loop over string parameter iterates borrowed",
+			test_loop_over_string_parameter_iterates_borrowed,
+		),
+		(
+			"loop over reassigned variable keeps owned iterable",
+			test_loop_over_reassigned_variable_keeps_owned_iterable,
+		),
+		(
+			"loop over consumed iterable keeps owned iterable",
+			test_loop_over_consumed_iterable_keeps_owned_iterable,
+		),
+		(
+			"loop over lambda captured iterable keeps owned iterable",
+			test_loop_over_lambda_captured_iterable_keeps_owned_iterable,
+		),
+		(
+			"loop over parameter field keeps owned iterable",
+			test_loop_over_parameter_field_keeps_owned_iterable,
+		),
+		(
+			"loop over shadowing binder keeps owned iterable",
+			test_loop_over_shadowing_binder_keeps_owned_iterable,
 		),
 	]
 }

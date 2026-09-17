@@ -17059,6 +17059,441 @@ private pure func rewrite_loop_iterable(
 			normalize_binding_alias_rhs(env, core_expr_type(rewritten), rewritten)
 
 
+--- Scope carried by the borrowed-iteration walk.
+--- `scope` maps a name to `True` only when its binding provably owns the value
+--- for longer than any loop inside that binding's body: a borrowed parameter or
+--- an immutable `let`. Every other binder maps its name to `False`, and an
+--- expression form the walk does not handle recurses with an empty scope, so a
+--- binder the walk cannot see can never be mistaken for a borrowable source.
+private record BorrowedLoopContext {
+	env: PerceusEnv,
+	scope: Dict[String, Bool]
+}
+
+
+private pure func borrowed_loop_context_with_name(
+	context: BorrowedLoopContext,
+	name: String,
+	borrowable: Bool,
+) -> BorrowedLoopContext:
+	{ context | scope = context.scope.set(name, borrowable) }
+
+
+--- Unhandled forms lose the scope. Reuse the caller's record when its scope is
+--- already empty so a scope-free subtree costs no allocation per node.
+private pure func borrowed_loop_context_without_scope(
+	context: BorrowedLoopContext,
+) -> BorrowedLoopContext:
+	if context.scope.length() == 0:
+		context
+	else:
+		{ context | scope = {} }
+
+
+private pure func borrowed_loop_context_with_binder(
+	context: BorrowedLoopContext,
+	binder: CoreLoopBinder,
+) -> BorrowedLoopContext:
+	borrowed_loop_context_with_name(context, binder.variable.name, False)
+
+
+private pure func borrowed_loop_context_with_bindings(
+	context: BorrowedLoopContext,
+	bindings: List[CoreMatchBinding],
+) -> BorrowedLoopContext:
+	var scoped: BorrowedLoopContext = context
+
+	for binding in bindings:
+		scoped = borrowed_loop_context_with_name(scoped, binding.variable.name, False)
+
+	scoped
+
+
+--- A reassignment of the iterated variable installs a new owner and releases
+--- the old one, which a borrowed loop would still be reading. Look through
+--- every subtree, including lambdas and nested loops.
+private pure func subtree_assigns_name(name: String, expr: CoreExpr) -> Bool:
+	var pending: List[CoreExpr] = [expr]
+	var index: Int = 0
+	var found: Bool = False
+
+	while not found and index < pending.length():
+		match pending.get(index):
+			Some(node):
+				assigns: Bool = match node:
+					AssignExpr(variable, rhs, typ, loc):
+						variable.name == name
+					_:
+						False
+
+				if assigns:
+					found = True
+				else:
+					pending = pending.concat(CoreTraverse.immediate_core_expr_children(node))
+			None:
+				void
+
+		index += 1
+
+	found
+
+
+--- Closure and task environments take their own ownership of a capture after
+--- Perceus. Keep any loop whose body mentions the iterated variable inside a
+--- lambda or closure on the owned path.
+private pure func subtree_captures_name(name: String, expr: CoreExpr) -> Bool:
+	var pending: List[CoreExpr] = [expr]
+	var index: Int = 0
+	var found: Bool = False
+
+	while not found and index < pending.length():
+		match pending.get(index):
+			Some(node):
+				captures: Bool = match node:
+					LambdaExpr(params, return_type, body, is_pure, typ, loc):
+						count_uses(name, body) > 0
+					ClosureCreateExpr(closure, typ, loc):
+						closure.captures.any(pure func(capture: CoreClosureCapture) -> Bool:
+							capture.name == name
+						)
+					_:
+						False
+
+				if captures:
+					found = True
+				else:
+					pending = pending.concat(CoreTraverse.immediate_core_expr_children(node))
+			None:
+				void
+
+		index += 1
+
+	found
+
+
+--- The loop may iterate the source pointer without taking ownership when the
+--- source outlives the loop and nothing in the body can release it.
+private pure func loop_iterable_is_borrowed(
+	context: BorrowedLoopContext,
+	iterable: CoreExpr,
+	body: CoreExpr,
+) -> Bool:
+	env: PerceusEnv = context.env
+
+	match iterable:
+		VarExpr(variable, typ, loc):
+			if not is_managed_type(env, typ):
+				False
+			else if not context.scope.get_or(variable.name, False):
+				False
+			else if is_nullary_constructor_reference(env, variable):
+				False
+			else if exact_global_value(env, variable).is_some():
+				-- A global slot can be reassigned by anything the body calls.
+				False
+			else if subtree_assigns_name(variable.name, body):
+				False
+			else if subtree_captures_name(variable.name, body):
+				False
+			else:
+				summarize_linear_ownership_uses(env, variable.name, body).consumed_refs == 0
+		_:
+			False
+
+
+private pure func borrowed_loop_release_policy(
+	context: BorrowedLoopContext,
+	iterable: CoreExpr,
+	body: CoreExpr,
+	release_policy: CoreReleasePolicy,
+) -> CoreReleasePolicy:
+	match release_policy:
+		NoReleasePolicy:
+			release_policy
+		_:
+			if loop_iterable_is_borrowed(context, iterable, body):
+				NoReleasePolicy
+			else:
+				release_policy
+
+
+private pure func mark_borrowed_loops_match_result(
+	context: BorrowedLoopContext,
+	bindings: List[CoreMatchBinding],
+	result: CoreExpr,
+) -> CoreExpr:
+	mark_borrowed_loops_expr(
+		borrowed_loop_context_with_bindings(context, bindings),
+		result,
+	)
+
+
+--- Binding and branch spines are right-associated and can be thousands of
+--- nodes deep in generated code, so the walk descends them iteratively and
+--- keeps one frame per spine node on the heap instead of the native stack.
+private union BorrowedLoopSpineFrame:
+	BorrowedLoopLetFrame(CoreExpr, CoreVar, Bool, CoreType, CoreExpr, CoreExpr, BorrowedLoopContext)
+	BorrowedLoopBorrowLetFrame(CoreExpr, CoreVar, CoreType, CoreExpr, CoreExpr, BorrowedLoopContext)
+	BorrowedLoopIfFrame(CoreExpr, CoreExpr, CoreExpr, CoreExpr, CoreType, CoreSourceLoc, BorrowedLoopContext)
+
+
+--- Decide borrowed iteration before ownership insertion runs. Only the loop's
+--- release policy changes; `rewrite_loop_iterable` then leaves a borrowed
+--- iterable as the bare read it already is.
+private pure func mark_borrowed_loops_expr(
+	context: BorrowedLoopContext,
+	expr: CoreExpr,
+) -> CoreExpr:
+	var frames: List[BorrowedLoopSpineFrame] = []
+	var current: CoreExpr = expr
+	var current_context: BorrowedLoopContext = context
+	var descending: Bool = True
+
+	while descending:
+		match current:
+			LetExpr(variable, is_mutable, typ, rhs, body):
+				frames = frames.append(
+					BorrowedLoopLetFrame(
+						current,
+						variable,
+						is_mutable,
+						typ,
+						rhs,
+						body,
+						current_context,
+					),
+				)
+				current_context = borrowed_loop_context_with_name(
+					current_context,
+					variable.name,
+					not is_mutable,
+				)
+				current = body
+			BorrowLetExpr(variable, typ, rhs, body):
+				frames = frames.append(
+					BorrowedLoopBorrowLetFrame(
+						current,
+						variable,
+						typ,
+						rhs,
+						body,
+						current_context,
+					),
+				)
+				current_context = borrowed_loop_context_with_name(
+					current_context,
+					variable.name,
+					False,
+				)
+				current = body
+			IfExpr(cond, then_expr, else_expr, typ, loc):
+				frames = frames.append(
+					BorrowedLoopIfFrame(
+						current,
+						cond,
+						then_expr,
+						else_expr,
+						typ,
+						loc,
+						current_context,
+					),
+				)
+				current = else_expr
+			_:
+				descending = False
+
+	var result: CoreExpr = mark_borrowed_loops_node(current_context, current)
+	var index: Int = frames.length() - 1
+
+	while index >= 0:
+		match frames.get(index):
+			Some(BorrowedLoopLetFrame(source, variable, is_mutable, typ, rhs, body, frame_context)):
+				marked_rhs: CoreExpr = mark_borrowed_loops_expr(frame_context, rhs)
+
+				result = if same_core_expr(marked_rhs, rhs) and same_core_expr(result, body):
+					source
+				else:
+					LetExpr(variable, is_mutable, typ, marked_rhs, result)
+			Some(BorrowedLoopBorrowLetFrame(source, variable, typ, rhs, body, frame_context)):
+				marked_rhs: CoreExpr = mark_borrowed_loops_expr(frame_context, rhs)
+
+				result = if same_core_expr(marked_rhs, rhs) and same_core_expr(result, body):
+					source
+				else:
+					BorrowLetExpr(variable, typ, marked_rhs, result)
+			Some(BorrowedLoopIfFrame(source, cond, then_expr, else_expr, typ, loc, frame_context)):
+				marked_cond: CoreExpr = mark_borrowed_loops_expr(frame_context, cond)
+				marked_then: CoreExpr = mark_borrowed_loops_expr(frame_context, then_expr)
+
+				result = if (
+					same_core_expr(marked_cond, cond)
+					and same_core_expr(marked_then, then_expr)
+					and same_core_expr(result, else_expr)
+				):
+					source
+				else:
+					IfExpr(marked_cond, marked_then, result, typ, loc)
+			None:
+				void
+
+		index -= 1
+
+	result
+
+
+--- Every form the spine descent does not consume. Sequence and logical spines
+--- go through the iterative mappers for the same stack reason.
+private pure func mark_borrowed_loops_node(
+	context: BorrowedLoopContext,
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		SeqExpr(first, second):
+			CoreTraverse.map_core_sequence_items(
+				expr,
+				pure func(item: CoreExpr) -> CoreExpr: mark_borrowed_loops_expr(context, item),
+			)
+		LogicalExpr(op, left, right, typ, loc):
+			CoreTraverse.map_core_logical_tree_with_context(expr, context, mark_borrowed_loops_expr)
+		WhileExpr(cond, body, typ, loc):
+			marked_cond: CoreExpr = mark_borrowed_loops_expr(context, cond)
+			marked_body: CoreExpr = mark_borrowed_loops_expr(context, body)
+
+			if same_core_expr(marked_cond, cond) and same_core_expr(marked_body, body):
+				expr
+			else:
+				WhileExpr(marked_cond, marked_body, typ, loc)
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			marked_start: CoreExpr = mark_borrowed_loops_expr(context, start)
+			marked_end: CoreExpr = mark_borrowed_loops_expr(context, end_value)
+			marked_body: CoreExpr = mark_borrowed_loops_expr(
+				borrowed_loop_context_with_binder(context, binder),
+				body,
+			)
+
+			if (
+				same_core_expr(marked_start, start)
+				and same_core_expr(marked_end, end_value)
+				and same_core_expr(marked_body, body)
+			):
+				expr
+			else:
+				ForRangeExpr(binder, marked_start, marked_end, marked_body, typ, loc)
+		ForListExpr(loop, typ, loc):
+			marked_iterable: CoreExpr = mark_borrowed_loops_expr(context, loop.iterable)
+			marked_body: CoreExpr = mark_borrowed_loops_expr(
+				borrowed_loop_context_with_binder(context, loop.binder),
+				loop.body,
+			)
+			policy: CoreReleasePolicy = borrowed_loop_release_policy(
+				context,
+				loop.iterable,
+				loop.body,
+				loop.iterable_release_policy,
+			)
+
+			if (
+				same_core_expr(marked_iterable, loop.iterable)
+				and same_core_expr(marked_body, loop.body)
+				and policy == loop.iterable_release_policy
+			):
+				expr
+			else:
+				ForListExpr(
+					{ loop |
+						iterable = marked_iterable,
+						iterable_release_policy = policy,
+						body = marked_body
+					},
+					typ,
+					loc,
+				)
+		ForStringExpr(loop, typ, loc):
+			marked_iterable: CoreExpr = mark_borrowed_loops_expr(context, loop.iterable)
+			marked_body: CoreExpr = mark_borrowed_loops_expr(
+				borrowed_loop_context_with_binder(context, loop.binder),
+				loop.body,
+			)
+			policy: CoreReleasePolicy = borrowed_loop_release_policy(
+				context,
+				loop.iterable,
+				loop.body,
+				loop.iterable_release_policy,
+			)
+
+			if (
+				same_core_expr(marked_iterable, loop.iterable)
+				and same_core_expr(marked_body, loop.body)
+				and policy == loop.iterable_release_policy
+			):
+				expr
+			else:
+				ForStringExpr(
+					{ loop |
+						iterable = marked_iterable,
+						iterable_release_policy = policy,
+						body = marked_body
+					},
+					typ,
+					loc,
+				)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			CoreTraverse.map_core_match_results_with_context(
+				expr,
+				context,
+				mark_borrowed_loops_match_result,
+			)
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			CoreTraverse.map_core_match_results_with_context(
+				expr,
+				context,
+				mark_borrowed_loops_match_result,
+			)
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			CoreTraverse.map_core_match_results_with_context(
+				expr,
+				context,
+				mark_borrowed_loops_match_result,
+			)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			CoreTraverse.map_core_match_results_with_context(
+				expr,
+				context,
+				mark_borrowed_loops_match_result,
+			)
+		_:
+			CoreTraverse.map_core_expr_children_with_context(
+				expr,
+				borrowed_loop_context_without_scope(context),
+				mark_borrowed_loops_expr,
+			)
+
+
+--- Classify every list and string loop in one function body before ownership
+--- insertion. A consumed parameter is owned by this body and can be
+--- transferred away, so only borrowed parameters seed the scope.
+pure func mark_borrowed_loop_iterables(
+	env: PerceusEnv,
+	params: List[CoreParam],
+	consumed_params: List[Int],
+	body: CoreExpr,
+) -> CoreExpr:
+	var scope: Dict[String, Bool] = {}
+	var index: Int = 0
+
+	for param in params:
+		scope = scope.set(param.name.name, not int_list_contains(consumed_params, index))
+		index += 1
+
+	mark_borrowed_loops_expr(
+		{
+			env = env,
+			scope = scope
+		},
+		body,
+	)
+
+
 private pure func insert_drops_ownership_node(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
 	normalized: CoreExpr = normalize_ownership_node(env, expr)
 	insert_drops_normalized_expr(env, normalized)
@@ -25220,7 +25655,13 @@ private pure func rewrite_function(env: PerceusEnv, func_info: CoreFunction) -> 
 			else:
 				global_safe_body
 
-			rewritten_body: CoreExpr = insert_drops_expr(result_env, owned_result_body)
+			borrowed_loop_body: CoreExpr = mark_borrowed_loop_iterables(
+				result_env,
+				params,
+				consumed_params,
+				owned_result_body,
+			)
+			rewritten_body: CoreExpr = insert_drops_expr(result_env, borrowed_loop_body)
 			balanced_body: CoreExpr = balance_consumed_param_bodies(
 				env,
 				analysis_function,
