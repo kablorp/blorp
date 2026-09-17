@@ -2616,7 +2616,39 @@ private pure func emit_logical_body(
 
 
 private pure func cancellation_cleanup_pop_statement(indent: String, variable: CoreVar) -> String:
-	indent + "blorp_task_cleanup_pop_slot(&" + c_var_name(variable) + ");\n"
+	indent + "blorp_task_cleanup_pop_slot_with_task(&" + c_var_name(variable) + ", __blorp_task);\n"
+
+
+private CURRENT_TASK_LOCAL: String = "__blorp_task"
+
+private CURRENT_TASK_LOCAL_DECLARATION: String = "void* const __blorp_task = __blorp_current_task;\n"
+
+private C_FUNCTION_BODY_OPEN: String = " {\n"
+
+
+---
+Give a rendered C function the current-task local its cleanup operations read.
+
+The current task is fiber-scoped and is rebound on every fiber resume, so it is
+constant for one execution of one function. Every emitted cleanup operation
+therefore names this one local instead of reloading the thread-local, which also
+lets the host C compiler branch once per function rather than once per
+operation. The rendered body is the authority for whether a function performs
+any cleanup: every emitted cleanup form names the local, so a function whose
+text does not is left untouched.
+---
+private pure func with_current_task_local(function_c: String) -> String:
+	if function_c.contains(CURRENT_TASK_LOCAL):
+		match function_c.index_of(C_FUNCTION_BODY_OPEN):
+			Some(open_index):
+				body_start: Int = open_index + C_FUNCTION_BODY_OPEN.length()
+				function_c.take_left(
+					body_start,
+				) + BASE_INDENT + CURRENT_TASK_LOCAL_DECLARATION + function_c.drop_left(body_start)
+			None:
+				function_c
+	else:
+		function_c
 
 
 private pure func cleanup_frame_name(variable: CoreVar) -> String:
@@ -2872,7 +2904,7 @@ private pure func resource_cleanup_push_statement(
 		frame_name: String = cleanup_frame_name(scope.variable)
 		resource_name: String = c_var_name(scope.variable)
 		Some(
-			indent + "blorp_CancelCleanupFrame " + frame_name + ";\n" + indent + "BLORP_TASK_CLEANUP_SCOPE(" + frame_name + ");\n" + indent + "blorp_task_cleanup_push(&" + frame_name + ", &" + resource_name + ", (void*)" + resource_name + ", (blorp_CancelCleanupFn)" + hook.release_fn + ");\n",
+			indent + "blorp_CancelCleanupFrame " + frame_name + ";\n" + indent + "BLORP_TASK_CLEANUP_SCOPE_WITH_TASK(" + frame_name + ", __blorp_task);\n" + indent + "blorp_task_cleanup_push_with_task(&" + frame_name + ", &" + resource_name + ", (void*)" + resource_name + ", (blorp_CancelCleanupFn)" + hook.release_fn + ", __blorp_task);\n",
 		)
 	else:
 		None
@@ -12631,7 +12663,7 @@ private pure func owned_temp_cleanup_push_statement(
 		Some(release_fn):
 			frame_name: String = "__blorp_owned_cleanup_" + slot
 			value_arg: String = owned_temp_cleanup_value_arg(slot, policy)
-			indent + "blorp_CancelCleanupFrame " + frame_name + ";\n" + indent + "BLORP_TASK_CLEANUP_SCOPE(" + frame_name + ");\n" + indent + "blorp_task_cleanup_push(&" + frame_name + ", &" + slot + ", " + value_arg + ", " + release_fn + ");\n"
+			indent + "blorp_CancelCleanupFrame " + frame_name + ";\n" + indent + "BLORP_TASK_CLEANUP_SCOPE_WITH_TASK(" + frame_name + ", __blorp_task);\n" + indent + "blorp_task_cleanup_push_with_task(&" + frame_name + ", &" + slot + ", " + value_arg + ", " + release_fn + ", __blorp_task);\n"
 		None:
 			""
 
@@ -12748,7 +12780,7 @@ private pure func owned_temp_cleanup_pop_statement(
 ) -> String:
 	match owned_temp_cleanup_release_fn(policy):
 		Some(release_fn):
-			indent + "blorp_task_cleanup_pop_slot(&" + slot + ");\n"
+			indent + "blorp_task_cleanup_pop_slot_with_task(&" + slot + ", __blorp_task);\n"
 		None:
 			""
 
@@ -12779,7 +12811,7 @@ private pure func cancellation_cleanup_push_statement(
 			var_name: String = c_var_name(variable)
 			frame_name: String = cleanup_frame_name(variable)
 			value_arg: String = owned_temp_cleanup_value_arg(var_name, policy)
-			indent + "blorp_CancelCleanupFrame " + frame_name + ";\n" + indent + "BLORP_TASK_CLEANUP_SCOPE(" + frame_name + ");\n" + indent + "blorp_task_cleanup_push(&" + frame_name + ", &" + var_name + ", " + value_arg + ", " + release_fn + ");\n"
+			indent + "blorp_CancelCleanupFrame " + frame_name + ";\n" + indent + "BLORP_TASK_CLEANUP_SCOPE_WITH_TASK(" + frame_name + ", __blorp_task);\n" + indent + "blorp_task_cleanup_push_with_task(&" + frame_name + ", &" + var_name + ", " + value_arg + ", " + release_fn + ", __blorp_task);\n"
 		None:
 			""
 
@@ -13077,9 +13109,9 @@ private pure func emit_dup_statement(
 		emission_context.cleanup_plan,
 		variable,
 	):
-		"\n" + emission_context.indent + "blorp_task_cleanup_duplicate_slot(&" + c_var_name(
+		"\n" + emission_context.indent + "blorp_task_cleanup_duplicate_slot_with_task(&" + c_var_name(
 			variable,
-		) + ");"
+		) + ", __blorp_task);"
 	else:
 		""
 
@@ -15709,7 +15741,7 @@ private pure func emit_concurrent_block(
 	var statements: String = emission_context.indent + "blorp_thread_pool_ensure_initialized();\n"
 	statements += emission_context.indent + "blorp_ConcurrentTaskWindow " + window_name + " = {0};\n"
 	statements += emission_context.indent + "blorp_CancelCleanupFrame " + cleanup_name + ";\n"
-	statements += emission_context.indent + "BLORP_TASK_CLEANUP_SCOPE(" + cleanup_name + ");\n"
+	statements += emission_context.indent + "BLORP_TASK_CLEANUP_SCOPE_WITH_TASK(" + cleanup_name + ", __blorp_task);\n"
 	statements += emission_context.indent + "blorp_concurrent_task_window_begin(&" + window_name + ", &" + cleanup_name + ", " + capacity.to_string() + ");\n"
 	var current_temp: Int = next_temp + 1
 	timeout_setup ?= emit_concurrent_timeout_setup(
@@ -15957,7 +15989,7 @@ private pure func emit_concurrently_copy_item_loop(
 	outer_loop: String = emission_context.indent + "for (long " + start_name + " = 0; " + start_name + " < " + len_name + "; " + start_name + " += " + limit_name + ") {\n" + emission_context.indent + "long " + window_end_name + " = " + start_name + " + " + limit_name + ";\n" + emission_context.indent + "if (" + window_end_name + " > " + len_name + ") " + window_end_name + " = " + len_name + ";\n" + spawn_loop + join_loop + emission_context.indent + "}\n"
 
 	Some({
-		statements = limit_setup.statements + emission_context.indent + "blorp_thread_pool_ensure_initialized();\n" + iterable_body.statements + emission_context.indent + "blorp_List* " + list_name + " = (blorp_List*)" + iterable_value + ";\n" + iterable_cleanup_push + emission_context.indent + "long " + len_name + " = " + list_name + "->len;\n" + emission_context.indent + "blorp_ConcurrentTaskWindow " + window_name + " = {0};\n" + emission_context.indent + "blorp_CancelCleanupFrame " + window_cleanup_name + ";\n" + emission_context.indent + "BLORP_TASK_CLEANUP_SCOPE(" + window_cleanup_name + ");\n" + emission_context.indent + "blorp_concurrent_task_window_begin(&" + window_name + ", &" + window_cleanup_name + ", " + limit_name + ");\n" + result_setup + timeout_setup.statements + outer_loop + emission_context.indent + "blorp_concurrent_task_window_end(&" + window_name + ");\n" + result_finish + iterable_cleanup_pop + iterable_release,
+		statements = limit_setup.statements + emission_context.indent + "blorp_thread_pool_ensure_initialized();\n" + iterable_body.statements + emission_context.indent + "blorp_List* " + list_name + " = (blorp_List*)" + iterable_value + ";\n" + iterable_cleanup_push + emission_context.indent + "long " + len_name + " = " + list_name + "->len;\n" + emission_context.indent + "blorp_ConcurrentTaskWindow " + window_name + " = {0};\n" + emission_context.indent + "blorp_CancelCleanupFrame " + window_cleanup_name + ";\n" + emission_context.indent + "BLORP_TASK_CLEANUP_SCOPE_WITH_TASK(" + window_cleanup_name + ", __blorp_task);\n" + emission_context.indent + "blorp_concurrent_task_window_begin(&" + window_name + ", &" + window_cleanup_name + ", " + limit_name + ");\n" + result_setup + timeout_setup.statements + outer_loop + emission_context.indent + "blorp_concurrent_task_window_end(&" + window_name + ");\n" + result_finish + iterable_cleanup_pop + iterable_release,
 		value = result_value,
 		next_temp = timeout_setup.next_temp,
 		returns = False,
@@ -16088,7 +16120,7 @@ private pure func emit_concurrently_resource_source_loop(
 			outer_loop: String = emission_context.indent + "while (!" + done_name + ") {\n" + emission_context.indent + "long " + count_name + " = 0;\n" + pull_loop + join_loop + emission_context.indent + "}\n"
 
 			Some({
-				statements = limit_setup.statements + emission_context.indent + "blorp_thread_pool_ensure_initialized();\n" + iterable_body.statements + emission_context.indent + "blorp_ResourceSource* " + source_name + " = " + iterable_value + ";\n" + iterable_cleanup_push + emission_context.indent + "blorp_ConcurrentTaskWindow " + window_name + " = {0};\n" + emission_context.indent + "blorp_CancelCleanupFrame " + window_cleanup_name + ";\n" + emission_context.indent + "BLORP_TASK_CLEANUP_SCOPE(" + window_cleanup_name + ");\n" + emission_context.indent + "blorp_concurrent_task_window_begin(&" + window_name + ", &" + window_cleanup_name + ", " + limit_name + ");\n" + timeout_setup.statements + emission_context.indent + "bool " + done_name + " = false;\n" + outer_loop + emission_context.indent + "blorp_concurrent_task_window_end(&" + window_name + ");\n" + iterable_cleanup_pop + iterable_release,
+				statements = limit_setup.statements + emission_context.indent + "blorp_thread_pool_ensure_initialized();\n" + iterable_body.statements + emission_context.indent + "blorp_ResourceSource* " + source_name + " = " + iterable_value + ";\n" + iterable_cleanup_push + emission_context.indent + "blorp_ConcurrentTaskWindow " + window_name + " = {0};\n" + emission_context.indent + "blorp_CancelCleanupFrame " + window_cleanup_name + ";\n" + emission_context.indent + "BLORP_TASK_CLEANUP_SCOPE_WITH_TASK(" + window_cleanup_name + ", __blorp_task);\n" + emission_context.indent + "blorp_concurrent_task_window_begin(&" + window_name + ", &" + window_cleanup_name + ", " + limit_name + ");\n" + timeout_setup.statements + emission_context.indent + "bool " + done_name + " = false;\n" + outer_loop + emission_context.indent + "blorp_concurrent_task_window_end(&" + window_name + ");\n" + iterable_cleanup_pop + iterable_release,
 				value = "",
 				next_temp = timeout_setup.next_temp,
 				returns = False,
@@ -22357,6 +22389,8 @@ private pure func emit_function(
 				None:
 					emit_function_inventory(func_info, display_name)
 
+	with_task: String = with_current_task_local(rendered)
+
 	if (
 		internal_linkage
 		and func_info.body.is_some()
@@ -22365,9 +22399,9 @@ private pure func emit_function(
 			or function_kind_is_closure_body(func_info.function_kind)
 		))
 	):
-		"static " + rendered
+		"static " + with_task
 	else:
-		rendered
+		with_task
 
 
 private pure func function_kind_is_closure_body(kind: CoreFunctionKind) -> Bool:
@@ -25387,7 +25421,9 @@ private pure func emit_global_init_function(
 			cleanup_function: String = if cleanup_statements == "":
 				""
 			else:
-				"static void __blorp_drop_globals(void) {\n" + cleanup_statements + "}\n\n"
+				with_current_task_local(
+					"static void __blorp_drop_globals(void) {\n" + cleanup_statements + "}\n\n",
+				)
 
 			cleanup_registration: String = if cleanup_statements == "":
 				""
@@ -25395,7 +25431,9 @@ private pure func emit_global_init_function(
 				"  blorp_register_global_cleanup(__blorp_drop_globals);\n"
 
 			Ok(
-				cleanup_function + "void __blorp_init_globals(void) {\n" + statements + cleanup_registration + "}\n\n",
+				cleanup_function + with_current_task_local(
+					"void __blorp_init_globals(void) {\n" + statements + cleanup_registration + "}\n\n",
+				),
 			)
 
 

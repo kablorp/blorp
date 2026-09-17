@@ -24385,6 +24385,79 @@ static inline void blorp_task_cleanup_scope_exit(
     blorp_CancelCleanupScopeGuard __blorp_scope_guard_##frame \
         __attribute__((cleanup(blorp_task_cleanup_scope_exit))) = { &(frame) }
 
+// The current task is fiber-scoped and is rebound on every fiber resume, so it
+// is constant for one execution of one function, including across yields. A
+// generated function that performs cleanup operations reads the thread-local
+// once into a local and passes it to these variants, which lets the host C
+// compiler branch once per function instead of once per operation. Generated C
+// that embeds the runtime sees these definitions; generated C that links
+// against the declarations sees the matching ones in runtime_decl.c.
+
+static inline void blorp_task_cleanup_push_with_task(
+    blorp_CancelCleanupFrame* frame, const void* slot, void* value,
+    blorp_CancelCleanupFn release_value, void* task
+) {
+#if defined(__clang_analyzer__)
+    (void)frame;
+    (void)slot;
+    (void)value;
+    (void)release_value;
+    (void)task;
+#else
+    if (__builtin_expect(task != NULL, 0)) {
+        __blorp_task_cleanup_push_slow(frame, slot, value, release_value);
+    }
+#endif
+}
+
+static inline void blorp_task_cleanup_duplicate_slot_with_task(
+    const void* slot, void* task
+) {
+#if defined(__clang_analyzer__)
+    (void)slot;
+    (void)task;
+#else
+    if (__builtin_expect(task != NULL, 0)) {
+        __blorp_task_cleanup_duplicate_slot_slow(slot);
+    }
+#endif
+}
+
+static inline void blorp_task_cleanup_pop_slot_with_task(
+    const void* slot, void* task
+) {
+#if defined(__clang_analyzer__)
+    (void)slot;
+    (void)task;
+#else
+    if (__builtin_expect(task != NULL, 0)) {
+        __blorp_task_cleanup_pop_slot_slow(slot);
+    }
+#endif
+}
+
+typedef struct {
+    blorp_CancelCleanupFrame* frame;
+    void* task;
+} blorp_CancelCleanupScopeGuardWithTask;
+
+static inline void blorp_task_cleanup_scope_exit_with_task(
+    blorp_CancelCleanupScopeGuardWithTask* guard
+) {
+#if defined(__clang_analyzer__)
+    (void)guard;
+#else
+    if (__builtin_expect(guard != NULL && guard->task != NULL, 0)) {
+        __blorp_task_cleanup_scope_exit_slow(guard->frame);
+    }
+#endif
+}
+
+#define BLORP_TASK_CLEANUP_SCOPE_WITH_TASK(frame, task) \
+    blorp_CancelCleanupScopeGuardWithTask __blorp_scope_guard_##frame \
+        __attribute__((cleanup(blorp_task_cleanup_scope_exit_with_task))) \
+        = { &(frame), (task) }
+
 static void blorp_task_cleanup_deactivate_frame_keep_link(
     blorp_CancelCleanupFrame* frame
 ) {
