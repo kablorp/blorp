@@ -45,6 +45,9 @@ module inventory lives in
 - [Per-Node Codegen Roadmap](PER_NODE_CODEGEN_ROADMAP.md) is the task-level
   plan for cutting the per-node cost of generated C (reference counting,
   cleanup frames, runtime calls), with the stage-2 measurement rule.
+- [Frontend Facts Roadmap](FRONTEND_FACTS_ROADMAP.md) is the task-level
+  plan for publishing each stage's facts as id-keyed tables (module,
+  name, definition tables) and removing threaded state from typecheck.
 - [Self-Compile Measurement Protocol](../benchmarks/README.md#self-compile-measurement-protocol)
   is the standard compiler-performance measurement and its retained baselines.
 
