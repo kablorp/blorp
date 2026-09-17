@@ -541,30 +541,178 @@ sanitizer gates green; the full default `scripts/test` green at merge.
 
 ## N7. Borrowed iteration
 
-**Context.** Pattern A. Iterating a borrowed collection needs none of the
-retain, duplicate slot, frame, or release, when the loop cannot free it.
+**Goal.** A `for` loop over a list or string that the loop cannot free
+should iterate the borrowed pointer with no retain, no duplicate slot, no
+cleanup frame, and no release. Today every such loop takes ownership of
+its iterable (pattern A). Ceiling 2 to 4% of the compile; the compiler's
+own C has 44,782 `blorp_task_cleanup_duplicate_slot` sites and 29,851
+frames, a large share of them loop iterables.
 
-**Change.** In Perceus, classify a `for` iterable that is a borrowed
-parameter, a field read from a borrowed binding, or an immutable local not
-reassigned in the loop, as a borrow (`BorrowLetExpr` exists in the Core IR;
-use it or its equivalent for the iterable). The backend then emits the loop
-over the borrowed pointer without ownership operations. Keep the owned path
-for iterables that are call results or are reassigned inside the loop.
+**How the ownership is decided today.** Three places, in order:
 
-**Where to look.** The `ForExpr` handling in `perceus.brp`
-(`insert_drops_for_loop_expr`), `BorrowLetExpr` in `stage_09_core/ir.brp`
-and how the backend renders it, and the loop arm in `emit.brp`.
+1. Core lowering sets the loop's release policy from the element type:
+   `stage_08_core_lower/lower.brp:2673`
+   `iterable_release_policy = CoreTypePolicy.cleanup_release_policy_for_type(...)`,
+   so every managed iterable gets `ArcReleasePolicy` regardless of where
+   the value came from.
+2. Perceus (`stage_09_core/perceus.brp`, `insert_drops_for_loop_expr` near
+   line 17951 and `rewrite_loop_iterable` just after it) treats any policy
+   other than `NoReleasePolicy` as "the loop owns a temporary" and wraps the
+   iterable through `normalize_binding_alias_rhs`: a `VarExpr` becomes
+   `DupExpr(variable, ...)` (the retain), a `FieldExpr` of a borrowed owner
+   goes through `retain_alias_as_owned`. That is where the retain and the
+   duplicate slot come from.
+3. The backend (`stage_10_backend/emit.brp`, the `ForListExpr` arm near
+   line 12987 and the emission helpers near 16611 to 16740 that read
+   `for_list.iterable_release_policy`) declares the frame, pushes it,
+   pops it, and releases the iterable temporary on `ArcReleasePolicy`; on
+   `NoReleasePolicy` (used for unmanaged element types) it emits none of
+   that.
 
-**Pitfalls.** The loop body may reassign the variable the iterable came from
-(`items = items.append(x)` inside `for item in items`); the current C
-survives that because `__iter_3` holds its own reference. A borrowed loop
-must fall back to the owned form whenever the iterable's source is
-reassigned or consumed in the body. Cancellation at the checkpoint inside
-the loop must not leave a borrowed value unreleased, which is automatic
-(there is nothing to release) but the fixtures must still pass.
+So the mechanism for a borrowed loop already exists at both ends:
+`NoReleasePolicy` in the IR and a policy-free emission path. What is
+missing is the decision, which belongs to Perceus because it is an
+ownership fact: the iterable is borrowed when its source outlives the loop
+and nothing in the loop can free or replace it.
 
-**Acceptance.** `blorp_task_cleanup_duplicate_slot(` count down by at least
-30%; instructions down on both programs; leak and cancellation gates green.
+**Change.** In Perceus's `ForListExpr`/`ForStringExpr` handling, classify
+the iterable before rewriting it. It is borrowable when it is one of:
+
+- a `VarExpr` of a parameter (parameters are borrowed for the whole body
+  by the ownership model, `docs/OWNERSHIP_MODEL.md`), or of an immutable
+  `let` binding, and the variable is neither reassigned nor consumed
+  (passed in a consuming position, moved, or dropped) anywhere in the loop
+  body, including inside lambdas and nested loops;
+- a `FieldExpr`/`TupleFieldExpr` chain whose root satisfies the same
+  condition and whose owner is not an owned temporary
+  (`is_owned_temporary_expr` is the existing predicate for the opposite
+  case).
+
+For a borrowable iterable: leave the expression as the bare read, set
+`iterable_release_policy = NoReleasePolicy` on the loop node, and skip
+`rewrite_loop_iterable`'s ownership wrapping. Everything else keeps the
+current owned path. The backend needs no change if its `NoReleasePolicy`
+path already omits the frame and release for managed types; read those
+helpers first and, if they special-case by type rather than by policy, make
+the policy authoritative.
+
+```blorp
+-- Perceus, sketch of the decision (names indicative)
+private pure func loop_iterable_is_borrowed(env: PerceusEnv, iterable: CoreExpr, body: CoreExpr) -> Bool:
+	match iterable_root_variable(iterable):          -- VarExpr, or the root of a field chain
+		Some(root):
+			(is_parameter_or_immutable_let(env, root)
+				and not body_reassigns_or_consumes(env, root, body))
+		None:
+			False
+```
+
+The body analysis already exists in pieces: `summarize_linear_ownership_uses`
+reports consumed and required references of a name in a subtree, and the
+mutable-assignment rewriters know reassignment targets; reuse them rather
+than writing a new walk. A `var` source is borrowable only if the body has
+no assignment to it; start without `var` sources and add them as a second
+cut if the first measures well.
+
+**What the C looks like after.** For `count_leaves` in the sample:
+
+```c
+blorp_List* __iter_3 = items;                       /* borrowed, no retain */
+long __len_3 = __iter_3->len;
+for (long __i_3 = 0; __i_3 < __len_3; __i_3++) {
+  Shape* item = ((Shape*)__iter_3->data[__i_3]);
+  blorp_cooperative_checkpoint();
+  total = (total + brp_25(item));
+}
+/* no pop, no release */
+```
+
+Elements read from a borrowed list are themselves borrowed for the
+iteration, exactly as they are today (the loop binder is not retained per
+element now either).
+
+**Pitfalls.**
+
+- *Reassignment in the body.* `for item in items: items = items.append(x)`
+  is legal today because the loop's temporary holds its own reference and
+  iterates the original allocation (`docs/MEMORY_MODEL.md`). With a
+  borrowed iterable, the reassignment would drop the last reference to the
+  list mid-loop. The body analysis must see every assignment to the root
+  variable, including inside nested lambdas, `match` arms, and nested
+  loops; when in doubt, keep the owned path.
+- *Consumption in the body.* Passing the root variable to a call whose
+  contract consumes that argument (`contract_for_call`, `consumed_args`)
+  moves it; treat any consumed reference as disqualifying. Returning it
+  from inside the loop (early return) is fine only if the function is
+  leaving; a `BreakExpr` is fine.
+- *Cancellation.* A borrowed iterable needs no frame because there is
+  nothing to release; but the loop binder's own frame logic and any owned
+  temporaries inside the body are unchanged. Do not touch
+  `cancellation_plan.brp`.
+- *Strings.* `ForStringExpr` iterates code points over a `String` with the
+  same policy field; apply the same rule and test it separately (a string
+  field of a borrowed record is the common case).
+- *Channels and ranges* have no iterable ownership; leave them.
+- *`same_core_expr` reuse.* The loop arms return the original node when
+  nothing changed; setting the policy is a change, so build the new node.
+- *Element release policy.* `NoReleasePolicy` on the iterable must not be
+  confused with the element release policy the loop binder uses; the
+  backend reads both. Read `emit.brp` 16611 to 16740 before assuming.
+
+**Development strategy.** Measure first: add a temporary counter (removed
+before commit) in Perceus that classifies every list and string loop on
+the self-compile by iterable shape (parameter, immutable let, var, field
+of parameter, field of let, call result, other) and by whether the body
+reassigns or consumes the root; report the table. That tells you which
+shape the first cut should cover and what fraction of the 44,782 duplicate
+slots and 29,851 frames it can reach. Then cut 1: parameters and immutable
+lets, direct `VarExpr` only. Cut 2: field chains. Cut 3: `var` sources
+with no body assignment. Each cut is committed separately with its own
+numbers.
+
+**Fast feedback loop.** Compile the roadmap's sample program and one of
+your own, dump Core after Perceus (`--dump-core-after=perceus
+--dump-core-file=<path>`) to see the policy and the absence of `DupExpr` on
+the iterable, and read the loop's C (`--no-format --no-embed-runtime -o
+out.c`). Grep the compiler's own C for the two patterns before and after:
+
+```bash
+bin/blorp compile --std-dir standard_library/src --no-format --no-embed-runtime -o /tmp/self.c blorp/src/main.brp
+grep -c 'blorp_task_cleanup_duplicate_slot(' /tmp/self.c
+grep -c 'BLORP_TASK_CLEANUP_SCOPE' /tmp/self.c
+```
+
+Run the Perceus and reuse suites and the runtime memory tests with
+`--leak-check` after every cut; this change removes releases, so a wrong
+classification is a leak (too many releases) or a use-after-free (too few),
+and only the leak checker and the sanitizer see them. The sanitizer and
+leak gate (`benchmarks/self_compile_measure lock -- scripts/test compiler-core-sanitize leak`)
+runs after every cut, not just at the end.
+
+**Measurement.** This changes generated C, so the stage-2 rule applies:
+`benchmarks/self_compile_measure --stage2 --input-rev 0c2e104331a224226088519bb0509c00b9ac0b70 --samples 3 --baseline benchmarks/results/self_compile_stage2_baseline_O2_2026-09-17_s2.json --output <json>`
+and the same with `--program small` and the small s2 baseline, without
+`--require-identical`. Report instructions retired, output_bytes, the two
+grep counts, and the `allocs pass_perceus_complete` row (should not rise).
+The s2 baselines were built before the Xcode update moved instruction
+counts by 3.8%; build a stage-2 base from your base commit with the current
+toolchain and report the delta against that.
+
+**Protecting tests** (before each cut, in test_core_perceus.brp as ordered
+ownership-event signatures, plus runtime tests under
+blorp/test/runtime/memory with `--leak-check`): a loop over a parameter;
+over an immutable let; over a field of a parameter; over a string field;
+a loop whose body reassigns the iterated variable (must stay owned and
+still see the original elements exactly once); a loop whose body passes
+the iterated variable to a consuming call (must stay owned); a loop with
+a nested lambda that captures the iterable; an early return inside the
+loop; a `break`.
+
+**Acceptance.** `blorp_task_cleanup_duplicate_slot(` count in the
+compiler's C down at least 30% and frames down; instructions down on both
+programs; `pass_perceus_complete` allocations not up; Perceus, reuse,
+late-invariant, and runtime memory suites green; leak and sanitizer gates
+green; the full default `scripts/test` green at merge (coordinator).
 
 ## N8. Cleanup pops on exit paths and frame elision
 
