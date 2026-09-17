@@ -25575,6 +25575,210 @@ private pure func balance_consumed_param_bodies(
 		result
 
 
+--- A logical operator only evaluates its right operand when the left operand
+--- does not already decide the result, so that operand is a branch with no
+--- expression to carry the other path. An ownership transfer inside it is
+--- therefore unbalanceable: the enclosing region would count the transfer on
+--- every path, and the short-circuited path would keep the reference alive
+--- forever. Scan for the only shape that can transfer, a call under a right
+--- operand, before paying for the rewrite walk.
+private pure func has_short_circuit_operand_call(expr: CoreExpr) -> Bool:
+	var pending: List[CoreExpr] = [expr]
+	var index: Int = 0
+	var found: Bool = False
+
+	while not found and index < pending.length():
+		match pending.get(index):
+			Some(node):
+				match node:
+					LogicalExpr(op, left, right, typ, loc):
+						if subtree_contains_call(right):
+							found = True
+						else:
+							pending = pending.concat(
+								CoreTraverse.immediate_core_expr_children(node),
+							)
+					_:
+						pending = pending.concat(CoreTraverse.immediate_core_expr_children(node))
+			None:
+				void
+
+		index += 1
+
+	found
+
+
+private pure func subtree_contains_call(expr: CoreExpr) -> Bool:
+	var pending: List[CoreExpr] = [expr]
+	var index: Int = 0
+	var found: Bool = False
+
+	while not found and index < pending.length():
+		match pending.get(index):
+			Some(node):
+				match node:
+					CallExpr(kind, callee, args, typ, loc):
+						found = True
+					_:
+						pending = pending.concat(CoreTraverse.immediate_core_expr_children(node))
+			None:
+				void
+
+		index += 1
+
+	found
+
+
+--- The owners a short-circuit operand may take a reference from: the enclosing
+--- function's managed parameters and the immutable managed bindings above the
+--- operator. Their ownership belongs to the linear region this pass balances.
+--- Match payloads, borrowed aliases, and referenced globals carry their own
+--- owner normalization and must not receive a second reference here.
+private record ShortCircuitContext {
+	env: PerceusEnv,
+	owners: List[CoreParam]
+}
+
+
+--- Give the operand its own reference for every transfer it performs, so the
+--- operand neither requires nor consumes ownership from the region around the
+--- logical operator. The skipped path then evaluates neither the dup nor the
+--- transfer, and the taken path balances itself.
+private pure func own_short_circuit_operand(
+	context: ShortCircuitContext,
+	operand: CoreExpr,
+) -> CoreExpr:
+	var result: CoreExpr = operand
+
+	for owner in context.owners:
+		if count_uses(owner.name.name, operand) > 0:
+			consumed_refs: Int = summarize_linear_ownership_uses(
+				context.env,
+				owner.name.name,
+				operand,
+			).consumed_refs
+			result = prepend_dups(consumed_refs, owner.name, owner.typ, result)
+		else:
+			void
+
+	result
+
+
+private record ShortCircuitOperandFrame {
+	op: CoreLogicalOp,
+	right: CoreExpr,
+	typ: CoreType,
+	loc: CoreSourceLoc
+}
+
+
+--- Long `and`/`or` chains nest to the left, so walk that spine with a frame
+--- list instead of one native stack frame per operator.
+private pure func normalize_logical_short_circuit(
+	context: ShortCircuitContext,
+	expr: CoreExpr,
+) -> CoreExpr:
+	var frames: List[ShortCircuitOperandFrame] = []
+	var current: CoreExpr = expr
+	var descending: Bool = True
+
+	while descending:
+		match current:
+			LogicalExpr(op, left, right, typ, loc):
+				frames = frames.append({
+					op = op,
+					right = right,
+					typ = typ,
+					loc = loc,
+				})
+				current = left
+			_:
+				descending = False
+
+	var result: CoreExpr = normalize_short_circuit_operands(context, current)
+	var index: Int = frames.length() - 1
+
+	while index >= 0:
+		match frames.get(index):
+			Some(frame):
+				result = LogicalExpr(
+					frame.op,
+					result,
+					own_short_circuit_operand(
+						context,
+						normalize_short_circuit_operands(context, frame.right),
+					),
+					frame.typ,
+					frame.loc,
+				)
+			None:
+				void
+
+		index -= 1
+
+	result
+
+
+private pure func normalize_short_circuit_operands(
+	context: ShortCircuitContext,
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		LogicalExpr(op, left, right, typ, loc):
+			normalize_logical_short_circuit(context, expr)
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			-- An immutable managed binding owns its value for the rest of the
+			-- region, exactly like a consumed parameter, so a transfer out of a
+			-- short-circuit operand below it is unbalanceable in the same way.
+			-- A mutable binding can be reassigned between the dup and the
+			-- transfer, so it keeps the existing reassignment handling.
+			body_context: ShortCircuitContext = if (
+				is_mutable or not is_managed_type(context.env, typ)
+			):
+				context
+			else:
+				{ context |
+					owners = context.owners.append({
+						name = variable,
+						typ = typ,
+						loc = SyntheticSourceLoc,
+					})
+				}
+
+			LetExpr(
+				variable,
+				is_mutable,
+				typ,
+				normalize_short_circuit_operands(context, rhs),
+				normalize_short_circuit_operands(body_context, body),
+			)
+		_:
+			CoreTraverse.map_core_expr_children_with_context(
+				expr,
+				context,
+				normalize_short_circuit_operands,
+			)
+
+
+private pure func balance_short_circuit_operands(
+	env: PerceusEnv,
+	params: List[CoreParam],
+	expr: CoreExpr,
+) -> CoreExpr:
+	var owners: List[CoreParam] = []
+
+	for param in params:
+		if is_managed_type(env, param.typ):
+			owners = owners.append(param)
+		else:
+			void
+
+	if has_short_circuit_operand_call(expr):
+		normalize_short_circuit_operands({ env = env, owners = owners }, expr)
+	else:
+		expr
+
+
 private pure func rewrite_function(env: PerceusEnv, func_info: CoreFunction) -> CoreFunction:
 	debug:
 		perceus_work_functions_rewritten()
@@ -25604,7 +25808,11 @@ private pure func rewrite_function(env: PerceusEnv, func_info: CoreFunction) -> 
 				def_id = def_id,
 				loc = loc
 			}
-			contract_body: CoreExpr = annotate_user_call_contracts(env, body)
+			contract_body: CoreExpr = balance_short_circuit_operands(
+				env,
+				params,
+				annotate_user_call_contracts(env, body),
+			)
 
 			consumed_params: List[Int] = match lookup_ownership_callable_id(
 				env.callables,
