@@ -191,6 +191,15 @@ NESTED_SPINE_OWNERSHIP_EVENT_SIGNATURE: String = (
 	+ "second.second.second.second.cases[0].body.expr.then.body.drop=drop:xs;"
 )
 
+MIXED_BRANCH_OWNERSHIP_EVENT_SIGNATURE: String = (
+	"root.rhs.dup=dup:source;root.body.dup=dup:xs;root.body.body.then.body.drop=drop:"
+	+ "xs;root.body.body.else.drop=drop:xs;root.body.body.else.body.body.drop=drop:xs;"
+)
+
+SHADOWED_OWNER_OWNERSHIP_EVENT_SIGNATURE: String = "root.rhs.dup=dup:source;root.body.body.body.drop=drop:xs;"
+
+MUTABLE_LOOP_OWNERSHIP_EVENT_SIGNATURE: String = "root.rhs.dup=dup:source;root.body.second.drop=drop:xs;"
+
 DEEP_MANAGED_BINDING_COUNT: Int = 2048
 
 DEEP_MANAGED_BINDING_DEF_ID_BASE: Int = 20000
@@ -16829,6 +16838,89 @@ func test_assignment_to_other_slot_preserves_owner_events_in_mutable_region() ->
 	ownership_event_signature_matches(rewritten, OTHER_SLOT_ASSIGNMENT_OWNERSHIP_EVENT_SIGNATURE)
 
 
+-- Every ownership decision in this pass is carried by an `OwnershipUseSummary`
+-- value that the summary walk combines with sequence, branch, and aggregate
+-- rules. These characterization tests pin the exact ordered ownership events
+-- for three shapes where those rules disagree with each other: a name consumed
+-- on one branch and borrowed on the other, a name shadowed by an inner binding
+-- that consumes the outer one, and a mutable accumulator that a loop body
+-- consumes and reinstalls. A change to how summaries are represented or
+-- combined cannot move, add, or drop an ownership operation.
+pure func mixed_branch_owner_body() -> CoreExpr:
+	borrow: CoreExpr = intrinsic_expr("list_len", [var_expr("xs", list_int_type())], int_type())
+	consume: CoreExpr = intrinsic_expr(
+		"list_ensure_unique",
+		[var_expr("xs", list_int_type())],
+		list_int_type(),
+	)
+
+	IfExpr(
+		bool_expr(True),
+		SeqExpr(consume, borrow),
+		borrow,
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+
+func test_mixed_consume_and_borrow_branches_preserve_owner_events() -> Bool:
+	expr: CoreExpr = managed_owner_binding(mixed_branch_owner_body())
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		expr,
+	)
+
+	ownership_event_signature_matches(rewritten, MIXED_BRANCH_OWNERSHIP_EVENT_SIGNATURE)
+
+
+func test_shadowed_owner_binding_preserves_owner_events() -> Bool:
+	inner: CoreExpr = LetExpr(
+		named_var("xs"),
+		False,
+		list_int_type(),
+		intrinsic_expr("list_ensure_unique", [var_expr("xs", list_int_type())], list_int_type()),
+		intrinsic_expr("list_len", [var_expr("xs", list_int_type())], int_type()),
+	)
+	expr: CoreExpr = managed_owner_binding(inner)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		expr,
+	)
+
+	ownership_event_signature_matches(rewritten, SHADOWED_OWNER_OWNERSHIP_EVENT_SIGNATURE)
+
+
+func test_mutable_accumulator_loop_preserves_owner_events() -> Bool:
+	loop_body: CoreExpr = AssignExpr(
+		named_var("xs"),
+		intrinsic_expr("list_ensure_unique", [var_expr("xs", list_int_type())], list_int_type()),
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	loop: CoreExpr = WhileExpr(
+		intrinsic_expr("list_len", [var_expr("xs", list_int_type())], int_type()),
+		loop_body,
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		True,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		SeqExpr(
+			loop,
+			VoidExpr(void_type(), SyntheticSourceLoc),
+		),
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		expr,
+	)
+
+	ownership_event_signature_matches(rewritten, MUTABLE_LOOP_OWNERSHIP_EVENT_SIGNATURE)
+
+
 tests: TestSuite = {
 	description = "Blorp compiler Core Perceus",
 	tests = [
@@ -18171,6 +18263,18 @@ tests: TestSuite = {
 		(
 			"assignment to other slot preserves owner events in mutable region",
 			test_assignment_to_other_slot_preserves_owner_events_in_mutable_region,
+		),
+		(
+			"mixed consume and borrow branches preserve owner events",
+			test_mixed_consume_and_borrow_branches_preserve_owner_events,
+		),
+		(
+			"shadowed owner binding preserves owner events",
+			test_shadowed_owner_binding_preserves_owner_events,
+		),
+		(
+			"mutable accumulator loop preserves owner events",
+			test_mutable_accumulator_loop_preserves_owner_events,
 		),
 	]
 }
