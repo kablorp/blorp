@@ -1076,11 +1076,6 @@ private union PerceusOwnershipSummaryFrameStack:
 	PerceusOwnershipSummaryMoreFrames(PerceusOwnershipSummaryFrame, PerceusOwnershipSummaryFrameStack)
 
 
-private union PerceusOwnershipSummaryAction:
-	PerceusOwnershipSummaryVisitExpr(CoreExpr)
-	PerceusOwnershipSummaryRebuild(OwnershipUseSummary)
-
-
 pure func perceus_env_for_managed_types(managed_type_names: List[String]) -> PerceusEnv:
 	{
 		managed_types = CoreTypePolicy.managed_type_index_from_names(managed_type_names),
@@ -2009,6 +2004,12 @@ pure func contract_for_call(
 			builtin_contract("blorp_list_to_string_cb", arg_count)
 
 
+--- How one name is used by one expression: the peak simultaneous references it
+--- needs, how many of them it consumes, whether it appears at all, and whether
+--- the expression's result aliases it. This stays a `record` even though every
+--- field is scalar: the summary walk's frame stack and its per-argument lists
+--- hold summaries as union and collection payloads, which box a `struct` at
+--- every push, and a measured conversion cost 2% more allocations than it saved.
 record OwnershipUseSummary {
 	required_refs: Int,
 	consumed_refs: Int,
@@ -2211,9 +2212,25 @@ private pure func ownership_uses_with_returns_alias(
 	}
 
 
-private pure func aggregate_ownership_uses(items: List[OwnershipUseSummary]) -> OwnershipUseSummary:
-	var summary: OwnershipUseSummary = NO_OWNERSHIP_USES
-	var returns_alias: Bool = False
+--- Evaluate `second` after `first` and report whether either result aliases
+--- the name. Sequencing with `NO_OWNERSHIP_USES` is the identity, so this is
+--- exactly `aggregate_ownership_uses([first, second])` without the list.
+private pure func aggregate_ownership_uses_pair(
+	first: OwnershipUseSummary,
+	second: OwnershipUseSummary,
+) -> OwnershipUseSummary:
+	ownership_uses_with_returns_alias(
+		seq_ownership_uses(first, second),
+		first.returns_alias or second.returns_alias,
+	)
+
+
+private pure func aggregate_ownership_uses_from(
+	initial: OwnershipUseSummary,
+	items: List[OwnershipUseSummary],
+) -> OwnershipUseSummary:
+	var summary: OwnershipUseSummary = initial
+	var returns_alias: Bool = initial.returns_alias
 
 	for item in items:
 		summary = seq_ownership_uses(summary, item)
@@ -2224,6 +2241,10 @@ private pure func aggregate_ownership_uses(items: List[OwnershipUseSummary]) -> 
 			void
 
 	ownership_uses_with_returns_alias(summary, returns_alias)
+
+
+private pure func aggregate_ownership_uses(items: List[OwnershipUseSummary]) -> OwnershipUseSummary:
+	aggregate_ownership_uses_from(NO_OWNERSHIP_USES, items)
 
 
 private pure func sum_ownership_uses(items: List[OwnershipUseSummary]) -> OwnershipUseSummary:
@@ -2243,6 +2264,21 @@ private pure func sum_ownership_uses(items: List[OwnershipUseSummary]) -> Owners
 		consumed_refs = consumed_refs,
 		touched = touched,
 		returns_alias = returns_alias
+	}
+
+
+--- Take the worse of two mutually exclusive branches. Branch counts start at
+--- zero and are never negative, so this is exactly
+--- `branch_ownership_uses([first, second])` without the list.
+private pure func branch_ownership_uses_pair(
+	first: OwnershipUseSummary,
+	second: OwnershipUseSummary,
+) -> OwnershipUseSummary:
+	{
+		required_refs = max_int(first.required_refs, second.required_refs),
+		consumed_refs = max_int(first.consumed_refs, second.consumed_refs),
+		touched = first.touched or second.touched,
+		returns_alias = first.returns_alias or second.returns_alias
 	}
 
 
@@ -2721,53 +2757,30 @@ private pure func summarize_linear_call(
 				args,
 			)
 
-			summaries: List[OwnershipUseSummary] = match kind:
-				UnknownCall:
-					arg_uses
-				DeferredTraitCall(trait_name, method_name):
-					arg_uses
-				SelectedTraitCall(trait_name, method_name, module_path, def_id):
-					arg_uses
-				SelectedDirectCall(def_id):
-					arg_uses
+			-- A closure call evaluates the borrowed callee before its arguments.
+			-- Every other call kind reaches its callee through the contract, so
+			-- the argument summaries are the whole story.
+			uses: OwnershipUseSummary = match kind:
 				ClosureCall:
-					[summarize_linear_borrow(env, name, callee)].concat(arg_uses)
-				BuiltinCall(call_name):
-					arg_uses
-				IntrinsicCall(call_name):
-					arg_uses
-				UserCall(call_name, def_id, consumed_args):
-					arg_uses
-				ForeignCall(call_name, arg_passing):
-					arg_uses
-				DirectRuntimeCall(call):
-					arg_uses
-				OperationResultCall(bridge):
-					arg_uses
-				FallibleStreamTerminalCall(bridge):
-					arg_uses
-				TensorParallelCall(call_name, layout):
-					arg_uses
-				DictWithCapacityCall(constructor):
-					arg_uses
-				ListToStringCall(call_name):
-					arg_uses
-
-			uses: OwnershipUseSummary = aggregate_ownership_uses(summaries)
+					aggregate_ownership_uses_from(
+						summarize_linear_borrow(env, name, callee),
+						arg_uses,
+					)
+				_:
+					aggregate_ownership_uses(arg_uses)
 
 			ownership_uses_with_returns_alias(
 				uses,
 				call_result_aliases_target(env, name, contract, args, arg_uses),
 			)
 		None:
-			var summaries: List[OwnershipUseSummary] = [
-				summarize_linear_ownership_uses(env, name, callee),
-			]
+			callee_uses: OwnershipUseSummary = summarize_linear_ownership_uses(env, name, callee)
+			var summaries: List[OwnershipUseSummary] = []
 
 			for arg in args:
 				summaries = summaries.append(summarize_linear_ownership_uses(env, name, arg))
 
-			aggregate_ownership_uses(summaries)
+			aggregate_ownership_uses_from(callee_uses, summaries)
 
 
 private pure func summarize_linear_call_arg(
@@ -4527,10 +4540,10 @@ private pure func summarize_linear_ownership_uses_non_binding(
 		IfExpr(cond, then_expr, else_expr, typ, loc):
 			seq_ownership_uses(
 				summarize_linear_ownership_uses(env, name, cond),
-				branch_ownership_uses([
+				branch_ownership_uses_pair(
 					summarize_linear_ownership_uses(env, name, then_expr),
 					summarize_linear_ownership_uses(env, name, else_expr),
-				]),
+				),
 			)
 		WhileExpr(cond, body, typ, loc):
 			cond_uses: OwnershipUseSummary = summarize_linear_ownership_uses(env, name, cond)
@@ -4807,12 +4820,16 @@ private pure func summarize_linear_ownership_uses_non_binding(
 			else:
 				task_capture_ownership_use(name, loop.body)
 
-			aggregate_ownership_uses([
+			var loop_uses: OwnershipUseSummary = aggregate_ownership_uses_pair(
 				summarize_optional_ownership_use(env, name, loop.timeout),
 				iter_uses,
+			)
+			loop_uses = aggregate_ownership_uses_pair(
+				loop_uses,
 				summarize_linear_ownership_uses(env, name, loop.limit),
-				task_uses,
-			])
+			)
+
+			aggregate_ownership_uses_pair(loop_uses, task_uses)
 		ConcurrentlyLoopExpr(loop, typ, loc):
 			iter_uses: OwnershipUseSummary = summarize_linear_borrow(env, name, loop.iterable)
 
@@ -4821,12 +4838,16 @@ private pure func summarize_linear_ownership_uses_non_binding(
 			else:
 				task_capture_ownership_use(name, loop.body)
 
-			aggregate_ownership_uses([
+			var loop_uses: OwnershipUseSummary = aggregate_ownership_uses_pair(
 				summarize_optional_ownership_use(env, name, loop.timeout),
 				iter_uses,
+			)
+			loop_uses = aggregate_ownership_uses_pair(
+				loop_uses,
 				summarize_linear_ownership_uses(env, name, loop.limit),
-				task_uses,
-			])
+			)
+
+			aggregate_ownership_uses_pair(loop_uses, task_uses)
 		SelectExpr(select_expr, typ, loc):
 			var wait_summaries: List[OwnershipUseSummary] = []
 			var branch_summaries: List[OwnershipUseSummary] = []
@@ -4885,167 +4906,156 @@ private pure func summarize_linear_ownership_uses(
 		perceus_work_linear_summary_requests()
 
 	var frames: PerceusOwnershipSummaryFrameStack = PerceusOwnershipSummaryNoFrame
-	var action: PerceusOwnershipSummaryAction = PerceusOwnershipSummaryVisitExpr(expr)
+	var visiting: Bool = True
+	var current_expr: CoreExpr = expr
+	var pending: OwnershipUseSummary = NO_OWNERSHIP_USES
 	var result: OwnershipUseSummary = NO_OWNERSHIP_USES
 	var complete: Bool = False
 
 	while not complete:
-		match action:
-			PerceusOwnershipSummaryVisitExpr(current):
-				debug:
-					perceus_work_linear_summary_node_visits()
+		if visiting:
+			current: CoreExpr = current_expr
 
-				match current:
-					LetExpr(variable, is_mutable, typ, rhs, body):
-						if is_managed_type(env, typ) and direct_aliases_name(name, rhs):
-							rhs_uses: OwnershipUseSummary = summarize_linear_borrow(env, name, rhs)
+			debug:
+				perceus_work_linear_summary_node_visits()
 
-							if variable.name == name:
-								action = PerceusOwnershipSummaryRebuild(
-									seq_ownership_uses(
-										rhs_uses,
-										NO_OWNERSHIP_USES,
-									),
-								)
-							else:
-								frames = PerceusOwnershipSummaryMoreFrames(
-									PerceusOwnershipSummaryCombineBodyFrame(rhs_uses),
-									frames,
-								)
-								action = PerceusOwnershipSummaryVisitExpr(body)
-						else:
-							frames = PerceusOwnershipSummaryMoreFrames(
-								PerceusOwnershipSummaryLetRhsFrame(variable, body),
-								frames,
-							)
-							action = PerceusOwnershipSummaryVisitExpr(rhs)
-					BorrowLetExpr(variable, typ, rhs, body):
+			match current:
+				LetExpr(variable, is_mutable, typ, rhs, body):
+					if is_managed_type(env, typ) and direct_aliases_name(name, rhs):
 						rhs_uses: OwnershipUseSummary = summarize_linear_borrow(env, name, rhs)
 
 						if variable.name == name:
-							action = PerceusOwnershipSummaryRebuild(
-								seq_ownership_uses(
-									rhs_uses,
-									NO_OWNERSHIP_USES,
-								),
-							)
+							visiting = False
+							pending = seq_ownership_uses(rhs_uses, NO_OWNERSHIP_USES)
 						else:
 							frames = PerceusOwnershipSummaryMoreFrames(
 								PerceusOwnershipSummaryCombineBodyFrame(rhs_uses),
 								frames,
 							)
-							action = PerceusOwnershipSummaryVisitExpr(body)
-					SeqExpr(first, second):
+							visiting = True
+							current_expr = body
+					else:
 						frames = PerceusOwnershipSummaryMoreFrames(
-							PerceusOwnershipSummarySequenceFirstFrame(second),
+							PerceusOwnershipSummaryLetRhsFrame(variable, body),
 							frames,
 						)
-						action = PerceusOwnershipSummaryVisitExpr(first)
-					AssignExpr(variable, rhs, typ, loc):
-						if variable.name == name:
-							action = PerceusOwnershipSummaryRebuild(NO_OWNERSHIP_USES)
-						else if assignment_rhs_returns_alias(env, rhs):
-							-- Mutable assignment retains managed aliases before replacing
-							-- the target, so the source remains owned by its scope.
-							action = PerceusOwnershipSummaryRebuild(
-								summarize_linear_borrow(
-									env,
-									name,
-									rhs,
-								),
-							)
-						else:
-							action = PerceusOwnershipSummaryVisitExpr(rhs)
-					DupExpr(variable, value_type, retain_policy, body, typ, loc):
-						frames = PerceusOwnershipSummaryMoreFrames(
-							PerceusOwnershipSummaryDupBodyFrame(variable.name == name),
-							frames,
-						)
-						action = PerceusOwnershipSummaryVisitExpr(body)
-					DropExpr(variable, value_type, release_policy, body, typ, loc):
-						frames = PerceusOwnershipSummaryMoreFrames(
-							PerceusOwnershipSummaryDropBodyFrame(variable.name == name),
-							frames,
-						)
-						action = PerceusOwnershipSummaryVisitExpr(body)
-					DebugBlockExpr(body, typ, loc):
-						frames = PerceusOwnershipSummaryMoreFrames(
-							PerceusOwnershipSummaryPassBodyFrame,
-							frames,
-						)
-						action = PerceusOwnershipSummaryVisitExpr(body)
-					_:
-						action = PerceusOwnershipSummaryRebuild(
-							summarize_linear_ownership_uses_non_binding(
-								env,
-								name,
-								current,
-							),
-						)
-			PerceusOwnershipSummaryRebuild(summary):
-				match frames:
-					PerceusOwnershipSummaryNoFrame:
-						result = summary
-						complete = True
-					PerceusOwnershipSummaryMoreFrames(frame, remaining):
-						frames = remaining
+						visiting = True
+						current_expr = rhs
+				BorrowLetExpr(variable, typ, rhs, body):
+					rhs_uses: OwnershipUseSummary = summarize_linear_borrow(env, name, rhs)
 
-						match frame:
-							PerceusOwnershipSummaryLetRhsFrame(variable, body):
-								if variable.name == name:
-									action = PerceusOwnershipSummaryRebuild(
-										seq_ownership_uses(
-											summary,
-											NO_OWNERSHIP_USES,
-										),
-									)
-								else:
-									frames = PerceusOwnershipSummaryMoreFrames(
-										PerceusOwnershipSummaryCombineBodyFrame(summary),
-										frames,
-									)
-									action = PerceusOwnershipSummaryVisitExpr(body)
-							PerceusOwnershipSummaryCombineBodyFrame(prefix_uses):
-								action = PerceusOwnershipSummaryRebuild(
-									seq_ownership_uses(
-										prefix_uses,
-										summary,
-									),
-								)
-							PerceusOwnershipSummarySequenceFirstFrame(second):
+					if variable.name == name:
+						visiting = False
+						pending = seq_ownership_uses(rhs_uses, NO_OWNERSHIP_USES)
+					else:
+						frames = PerceusOwnershipSummaryMoreFrames(
+							PerceusOwnershipSummaryCombineBodyFrame(rhs_uses),
+							frames,
+						)
+						visiting = True
+						current_expr = body
+				SeqExpr(first, second):
+					frames = PerceusOwnershipSummaryMoreFrames(
+						PerceusOwnershipSummarySequenceFirstFrame(second),
+						frames,
+					)
+					visiting = True
+					current_expr = first
+				AssignExpr(variable, rhs, typ, loc):
+					if variable.name == name:
+						visiting = False
+						pending = NO_OWNERSHIP_USES
+					else if assignment_rhs_returns_alias(env, rhs):
+						-- Mutable assignment retains managed aliases before replacing
+						-- the target, so the source remains owned by its scope.
+						visiting = False
+						pending = summarize_linear_borrow(env, name, rhs)
+					else:
+						visiting = True
+						current_expr = rhs
+				DupExpr(variable, value_type, retain_policy, body, typ, loc):
+					frames = PerceusOwnershipSummaryMoreFrames(
+						PerceusOwnershipSummaryDupBodyFrame(variable.name == name),
+						frames,
+					)
+					visiting = True
+					current_expr = body
+				DropExpr(variable, value_type, release_policy, body, typ, loc):
+					frames = PerceusOwnershipSummaryMoreFrames(
+						PerceusOwnershipSummaryDropBodyFrame(variable.name == name),
+						frames,
+					)
+					visiting = True
+					current_expr = body
+				DebugBlockExpr(body, typ, loc):
+					frames = PerceusOwnershipSummaryMoreFrames(
+						PerceusOwnershipSummaryPassBodyFrame,
+						frames,
+					)
+					visiting = True
+					current_expr = body
+				_:
+					visiting = False
+					pending = summarize_linear_ownership_uses_non_binding(env, name, current)
+		else:
+			summary: OwnershipUseSummary = pending
+
+			match frames:
+				PerceusOwnershipSummaryNoFrame:
+					result = summary
+					complete = True
+				PerceusOwnershipSummaryMoreFrames(frame, remaining):
+					frames = remaining
+
+					match frame:
+						PerceusOwnershipSummaryLetRhsFrame(variable, body):
+							if variable.name == name:
+								visiting = False
+								pending = seq_ownership_uses(summary, NO_OWNERSHIP_USES)
+							else:
 								frames = PerceusOwnershipSummaryMoreFrames(
-									PerceusOwnershipSummarySequenceSecondFrame(summary),
+									PerceusOwnershipSummaryCombineBodyFrame(summary),
 									frames,
 								)
-								action = PerceusOwnershipSummaryVisitExpr(second)
-							PerceusOwnershipSummarySequenceSecondFrame(first_uses):
-								action = PerceusOwnershipSummaryRebuild(
-									seq_ownership_uses(
-										first_uses,
-										summary,
-									),
-								)
-							PerceusOwnershipSummaryDupBodyFrame(matches_target):
-								adjusted: OwnershipUseSummary = if matches_target:
-									{
-										required_refs = max_int(1, summary.required_refs - 1),
-										consumed_refs = max_int(0, summary.consumed_refs - 1),
-										touched = True,
-										returns_alias = summary.returns_alias
-									}
-								else:
-									summary
+								visiting = True
+								current_expr = body
+						PerceusOwnershipSummaryCombineBodyFrame(prefix_uses):
+							visiting = False
+							pending = seq_ownership_uses(prefix_uses, summary)
+						PerceusOwnershipSummarySequenceFirstFrame(second):
+							frames = PerceusOwnershipSummaryMoreFrames(
+								PerceusOwnershipSummarySequenceSecondFrame(summary),
+								frames,
+							)
+							visiting = True
+							current_expr = second
+						PerceusOwnershipSummarySequenceSecondFrame(first_uses):
+							visiting = False
+							pending = seq_ownership_uses(first_uses, summary)
+						PerceusOwnershipSummaryDupBodyFrame(matches_target):
+							adjusted: OwnershipUseSummary = if matches_target:
+								{
+									required_refs = max_int(1, summary.required_refs - 1),
+									consumed_refs = max_int(0, summary.consumed_refs - 1),
+									touched = True,
+									returns_alias = summary.returns_alias
+								}
+							else:
+								summary
 
-								action = PerceusOwnershipSummaryRebuild(adjusted)
-							PerceusOwnershipSummaryDropBodyFrame(matches_target):
-								adjusted: OwnershipUseSummary = if matches_target:
-									seq_ownership_uses(CONSUME_OWNERSHIP_USE, summary)
-								else:
-									summary
+							visiting = False
+							pending = adjusted
+						PerceusOwnershipSummaryDropBodyFrame(matches_target):
+							adjusted: OwnershipUseSummary = if matches_target:
+								seq_ownership_uses(CONSUME_OWNERSHIP_USE, summary)
+							else:
+								summary
 
-								action = PerceusOwnershipSummaryRebuild(adjusted)
-							PerceusOwnershipSummaryPassBodyFrame:
-								action = PerceusOwnershipSummaryRebuild(summary)
+							visiting = False
+							pending = adjusted
+						PerceusOwnershipSummaryPassBodyFrame:
+							visiting = False
+							pending = summary
 
 	result
 
@@ -20193,10 +20203,10 @@ private pure func summarize_function_return_ownership_uses(
 		IfExpr(cond, then_expr, else_expr, typ, loc):
 			seq_ownership_uses(
 				summarize_linear_ownership_uses(env, name, cond),
-				branch_ownership_uses([
+				branch_ownership_uses_pair(
 					summarize_function_return_ownership_uses(env, name, return_type, then_expr),
 					summarize_function_return_ownership_uses(env, name, return_type, else_expr),
-				]),
+				),
 			)
 		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
 			summarize_match_ownership_uses(
