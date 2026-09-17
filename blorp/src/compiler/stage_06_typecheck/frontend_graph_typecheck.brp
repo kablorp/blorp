@@ -13,6 +13,7 @@ import:
 		frontend_graph_dependency_modules,
 		frontend_graph_find_module_id,
 		frontend_graph_import_edges,
+		frontend_graph_module,
 		frontend_graph_module_table,
 		frontend_graph_modules,
 		frontend_graph_root_modules,
@@ -37,22 +38,16 @@ union FrontendTypecheckRequestError:
 	FrontendTypecheckRootMissing(ResolvedModuleIdentity)
 
 
-private pure func frontend_module_index(
-	modules: List[FrontendModule],
-) -> Dict[String, FrontendModule]:
-	var result: Dict[String, FrontendModule] = {}
-
-	for module in modules:
-		result = result.set(resolved_module_identity_storage_key(module.identity), module)
-
-	result
-
-
-private pure func graph_module(
-	modules_by_identity: Dict[String, FrontendModule],
+-- Resolves a module by its identity through the graph's ModuleId table
+-- instead of hashing the canonical path. The id already distinguishes two
+-- modules that share a path but not an origin (module_table_find_id checks
+-- both), so this cannot conflate them the way a path-only key could.
+private pure func graph_module_by_identity(
+	graph: FrontendGraph,
 	identity: ResolvedModuleIdentity,
 ) -> Option[FrontendModule]:
-	modules_by_identity.get(resolved_module_identity_storage_key(identity))
+	id ?= frontend_graph_find_module_id(graph, identity)
+	frontend_graph_module(graph, id)
 
 
 private pure func resolved_import_fact_key(
@@ -125,7 +120,7 @@ private pure func typecheck_module(
 
 
 private pure func accepted_resolved_imports(
-	modules_by_identity: Dict[String, FrontendModule],
+	graph: FrontendGraph,
 	edges: List[FrontendImportEdge],
 ) -> List[TypecheckResolvedImport]:
 	var values: List[TypecheckResolvedImport] = []
@@ -135,7 +130,7 @@ private pure func accepted_resolved_imports(
 			FrontendUnresolvedImport:
 				void
 			FrontendResolvedImport(target):
-				match graph_module(modules_by_identity, edge.importer):
+				match graph_module_by_identity(graph, edge.importer):
 					Some(importer):
 						program = finalized_typecheck_program_ast(importer.program)
 						values = values.append({
@@ -155,7 +150,6 @@ private pure func typecheck_request_for_frontend_module_with_index(
 	graph: FrontendGraph,
 	root: FrontendModule,
 	modules: List[FrontendModule],
-	modules_by_identity: Dict[String, FrontendModule],
 	module_target_identities: List[ResolvedModuleIdentity],
 	include_comments: Bool,
 	allow_debug_only_calls: Bool,
@@ -170,7 +164,7 @@ private pure func typecheck_request_for_frontend_module_with_index(
 		target = typecheck_module(root, resolved_paths),
 		modules = dependencies.map(func(module): typecheck_module(module, resolved_paths)),
 		module_targets = module_target_identities.map(resolved_module_canonical_path),
-		resolved_imports = accepted_resolved_imports(modules_by_identity, edges),
+		resolved_imports = accepted_resolved_imports(graph, edges),
 		include_comments = include_comments,
 		allow_debug_only_calls = allow_debug_only_calls
 	}
@@ -191,7 +185,6 @@ pure func typecheck_request_for_frontend_module(
 		graph,
 		root,
 		modules,
-		frontend_module_index(modules),
 		module_target_identities,
 		include_comments,
 		allow_debug_only_calls,
@@ -206,9 +199,8 @@ pure func typecheck_request_for_frontend_graph(
 	allow_debug_only_calls: Bool,
 ) -> Result[TypecheckGraphRequest, FrontendTypecheckRequestError]:
 	modules = frontend_graph_modules(graph)
-	modules_by_identity = frontend_module_index(modules)
-	root ?= graph_module(
-		modules_by_identity,
+	root ?= graph_module_by_identity(
+		graph,
 		root_identity,
 	).to_result(FrontendTypecheckRootMissing(root_identity))
 	Ok(
@@ -216,7 +208,6 @@ pure func typecheck_request_for_frontend_graph(
 			graph,
 			root,
 			modules,
-			modules_by_identity,
 			module_target_identities,
 			include_comments,
 			allow_debug_only_calls,
