@@ -1,0 +1,172 @@
+import:
+	memory: MemStats, get_mem_stats, reset_mem_stats
+	test: TestSuite
+
+
+-- Protects the N2 change (inline element reads in `for` loops): the loop
+-- renderer now reads pointer-storage elements with a direct indexed access
+-- and inline-struct elements with a direct memcpy, instead of going through
+-- the out-of-line `blorp_list_get`. These tests exercise every storage
+-- shape the loop renderer classifies (`PointerListStorage`,
+-- `InlineListStorage`, `InlineStructListStorage`) and check that iteration
+-- still sees the original elements, in order, exactly once, for a wrong
+-- stride would silently read neighboring elements or garbage rather than
+-- crash outright.
+record ElementRecord {
+	label: String,
+	value: Int
+}
+
+
+union ElementUnion:
+	UnionLeaf(Int)
+	UnionBranch(String)
+
+
+func test_for_loop_reads_list_of_records() -> Bool:
+	items: List[ElementRecord] = [
+		{
+			label = "a",
+			value = 1
+		},
+		{
+			label = "b",
+			value = 2
+		},
+		{
+			label = "c",
+			value = 3
+		},
+	]
+	var labels: String = ""
+	var total: Int = 0
+	var count: Int = 0
+
+	for item in items:
+		labels += item.label
+		total += item.value
+		count += 1
+
+	labels == "abc" and total == 6 and count == 3
+
+
+func test_for_loop_reads_list_of_ints() -> Bool:
+	items: List[Int] = [10, 20, 30, 40]
+	var total: Int = 0
+	var count: Int = 0
+
+	for n in items:
+		total += n
+		count += 1
+
+	total == 100 and count == 4
+
+
+func test_for_loop_reads_list_of_bools() -> Bool:
+	items: List[Bool] = [True, False, True, True]
+	var true_count: Int = 0
+	var count: Int = 0
+
+	for b in items:
+		if b:
+			true_count += 1
+
+		count += 1
+
+	true_count == 3 and count == 4
+
+
+func test_for_loop_reads_list_of_strings() -> Bool:
+	items: List[String] = ["one", "two", "three"]
+	var joined: String = ""
+	var count: Int = 0
+
+	for s in items:
+		joined = joined + s + ","
+		count += 1
+
+	joined == "one,two,three," and count == 3
+
+
+func test_for_loop_reads_list_of_union() -> Bool:
+	items: List[ElementUnion] = [UnionLeaf(1), UnionBranch("x"), UnionLeaf(2)]
+	var leaf_total: Int = 0
+	var branch_count: Int = 0
+	var count: Int = 0
+
+	for item in items:
+		match item:
+			UnionLeaf(n):
+				leaf_total += n
+			UnionBranch(_):
+				branch_count += 1
+
+		count += 1
+
+	leaf_total == 3 and branch_count == 1 and count == 3
+
+
+func test_for_loop_reads_empty_list() -> Bool:
+	items: List[Int] = []
+	var count: Int = 0
+
+	for n in items:
+		count += 1
+
+	count == 0
+
+
+func test_for_loop_over_reassigned_iterable_sees_original_elements() -> Bool:
+	var items: List[Int] = [1, 2, 3]
+	var seen: List[Int] = []
+
+	for item in items:
+		seen = seen.append(item)
+		items = items.append(item * 100)
+
+	-- The loop must see exactly the three original elements once each; the
+	-- appends inside the body extend a separate/rebound `items` value and
+	-- must not be observed by the loop already in flight (MEMORY_MODEL.md:
+	-- the loop's iterator holds its own reference to the original list).
+	seen == [1, 2, 3]
+
+
+func test_for_loop_element_reads_no_leak_records() -> Bool:
+	reset_mem_stats()
+	ok: Bool = test_for_loop_reads_list_of_records()
+	stats: MemStats = get_mem_stats()
+	ok and stats.current_objects == 0
+
+
+func test_for_loop_element_reads_no_leak_union() -> Bool:
+	reset_mem_stats()
+	ok: Bool = test_for_loop_reads_list_of_union()
+	stats: MemStats = get_mem_stats()
+	ok and stats.current_objects == 0
+
+
+func test_for_loop_element_reads_no_leak_reassign() -> Bool:
+	reset_mem_stats()
+	ok: Bool = test_for_loop_over_reassigned_iterable_sees_original_elements()
+	stats: MemStats = get_mem_stats()
+	ok and stats.current_objects == 0
+
+
+tests: TestSuite = {
+	description = "For Loop Inline Element Reads",
+	tests = [
+		("for loop reads list of records", test_for_loop_reads_list_of_records),
+		("for loop reads list of ints", test_for_loop_reads_list_of_ints),
+		("for loop reads list of bools", test_for_loop_reads_list_of_bools),
+		("for loop reads list of strings", test_for_loop_reads_list_of_strings),
+		("for loop reads list of union", test_for_loop_reads_list_of_union),
+		("for loop reads empty list", test_for_loop_reads_empty_list),
+		(
+			"for loop over reassigned iterable sees original elements",
+			test_for_loop_over_reassigned_iterable_sees_original_elements,
+		),
+		("for loop element reads no leak: records", test_for_loop_element_reads_no_leak_records),
+		("for loop element reads no leak: union", test_for_loop_element_reads_no_leak_union),
+		("for loop element reads no leak: reassign", test_for_loop_element_reads_no_leak_reassign),
+	]
+}
