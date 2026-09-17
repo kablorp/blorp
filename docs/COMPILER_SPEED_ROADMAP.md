@@ -61,6 +61,16 @@ cc -O0 -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
 Omit `--profile-module` for the whole compiler (about 5 minutes). The report
 has `=== Function Profile ===` rows (self time, calls) and `FLAME:` rows.
 
+**Reading profiles.** A module-limited exact profile charges uninstrumented
+callee time to the instrumented caller's self row, so a function's share in
+such a profile is an upper bound on what removing its own work can win, and
+in practice the win has been an order of magnitude smaller (13.5% share
+bought 0.8% of instructions). Size a task from allocation counters or a
+whole-compiler profile before promising a number. Single-sample instruction
+readings under load vary by about half a percent; accept or reject only on
+two or three samples, and treat wall time as meaningless while other work
+runs on the machine.
+
 **Quality bar.** One change per commit, named after the cut. A protecting test
 first. Grouped arm functions rather than one giant match when adding locals
 to an 89-arm match (issue 147 overflowed the default 8MB stack at -O0 before
@@ -95,7 +105,7 @@ C4 touches `early_pipeline.brp`; land it before P1 or rebase onto P1.
 
 ## Track P: Pipeline Structure And Per-Pass Measurement
 
-### P1. Make the pass pipeline a list and time every pass
+### P1. Make the pass pipeline a list and time every pass (landed 2026-09-16 for both pipelines: 33 per-pass rows, prefix replay deleted, all 18 stage snapshots identical)
 
 **Context.** Late Core is a 14-variant `CorePipelineStage` enum whose
 `run_core_pipeline_stage` re-lists the pass chain for every variant, and
@@ -243,6 +253,8 @@ already in `traverse.brp` (`map_context_exprs`); export it.
 
 ### C1. `prepare_expr` reuse (landed 2026-09-16, `4741dce9`)
 
+C5 (added 2026-09-16, landed): the same reuse for `flatten` (type and name walks, net -562 lines), `std_inline`, and `ssa`, plus a dictionary for flatten's type-rewrite lookup. Core lowering allocations -11%, instructions -1.2%.
+
 **Context.** `stage_09_core/prepare.brp` `prepare_expr` has 89 arms, 2 of
 which return the input; it also deep-copies payloads through 37 `clone_core_*`
 calls; `prepare_program` runs twice per compile. Late Core still allocates
@@ -287,7 +299,7 @@ where the pass has no special handling.
 after P1, otherwise as late_core and runtime_projection deltas) at least
 50% down for that pass; suites for the three passes green.
 
-### C4. Prune unreachable declarations before early Core
+### C4. Prune unreachable declarations before early Core (landed 2026-09-16: prunes before desugar and after trait resolution, with three DCE root fixes; small program instructions -14.7%, self-compile +0.7% at -O0 because the pre-desugar prune fails closed there; the trait-candidate query was built and rejected because its second index cost more than it saved)
 
 **Context.** DCE runs after specialization in late Core. A two-function
 program lowers 2,054 functions (the whole embedded standard library) and
@@ -349,7 +361,7 @@ so the per-call path is one exact-ID lookup.
 least 50%; late_core instructions down; Perceus, leak, and sanitizer suites
 green.
 
-### O2. Remaining speculative summaries
+### O2. Remaining speculative summaries (measured and rejected 2026-09-16: 9 and 0 hits on the self-compile; the attribution table is in the O2 branch report)
 
 **Context.** Two sites still summarize before knowing whether the result is
 read (`perceus.brp`):
@@ -383,7 +395,7 @@ factor the fallback into a local helper instead).
 **Acceptance.** Identical C; `summarize_linear_ownership_uses` and
 `count_uses` call counts down on the self-compile; Perceus suites green.
 
-### O3. Drop insertion walk
+### O3. Drop insertion walk (landed 2026-09-16: identity reported as reuse in the fallback, loop, shadow-freshening, and repeated-consume walks; late Core allocations -1%, instructions flat at -O2; the mass is in Perceus's helper walks, not the drop insertion)
 
 **Context.** `insert_drops_expr_inner_result` is the largest self-time item
 in Perceus (2.8s instrumented, 650k calls, ~4.3 µs each). It is the pass's
@@ -403,7 +415,7 @@ sanitizer gates green.
 
 ## Track F: Typed Frontend
 
-### F1. Per-body cost attribution
+### F1. Per-body cost attribution (landed 2026-09-16 with per-phase rows; `BLORP_TYPECHECK_BODY_METRICS=1`)
 
 **Context.** The typed frontend is about 4.3s and 45M allocations and no
 first-round task touched it. Its cost is diffuse in the function profile
@@ -428,7 +440,7 @@ self-compile and the small program: what share of frontend time is
 dependency-module bodies, and what the ten most expensive bodies cost. Those
 numbers decide F2's scope.
 
-### F2. Demand-driven body checking for dependency modules
+### F2. Demand-driven body checking for dependency modules (re-scoped and landed 2026-09-16: CTFE dependency preparation no longer forces eager checking of every module; typed frontend allocations -9%, instructions -2%. The remaining 12,800 bodies are checked by the ordinary loop and the self-compile reaches nearly all of them, so a reachable-body order is a small-program lever; per-body inference cost, about 2,000 allocations and 76 per source line, is the self-compile lever)
 
 **Context.** If F1 shows dependency-module bodies dominate the small
 program's frontend (expected: the two-function program spends most of its
@@ -474,7 +486,7 @@ project with a broken dependency body unchanged.
 
 ## Track B: Backend Emission
 
-### B1. Emit nested blocks at depth
+### B1. Emit nested blocks at depth (landed 2026-09-16: all re-indentation deleted; backend allocations -17%, instructions -1%; identity is whitespace-normalized, see `benchmarks/normalize_generated_c_whitespace`)
 
 **Context.** After 151 `indent_statements` no longer allocates per line, but
 every nesting level still re-copies the entire nested body to add two
@@ -513,7 +525,7 @@ cancellation suite green. Small; do only when someone is already in the file.
 
 ## Track D: Source Discovery
 
-### D1. Token and span construction
+### D1. Token and span construction (landed 2026-09-16: lexer state rebuilt once per token and no step union; discovery allocations -15%, peak RSS -9%; the span struct and parser token-binding ideas were measured and rejected)
 
 **Context.** After 150, discovery is 1.26s and 24.9M allocations at -O2 for
 416 files and 1.8M tokens; per-character scanning is gone. The remaining
@@ -591,6 +603,120 @@ allocation curve, the relevant Core and C excerpts, and the scoped follow-up
 task. No compiler change in this task.
 
 ---
+
+## Follow-ups Found In Round Two
+
+- **Record-update codegen** (from the R2 negative result,
+  `benchmarks/results/hoisted_field_take_rejected_2026-09-16.md`): a fused
+  `{ state | ... }` in a hot loop costs 13.7% more instructions than plain
+  locals with no extra allocations. The generated C releases fields the take
+  just nulled, tests uniqueness three times per update, and wraps COW
+  arguments in cancellation cleanup frames. Three cuts are proposed there;
+  owner: emit.brp and reuse.brp after B1 lands.
+- **Union constructors heap-allocate payload-free and scalar-payload
+  variants** (from D1): `SymbolToken(LeftParenSymbol)` is one allocation, and
+  the same holds for every union in the compiler including Core node kinds.
+  A representation decision, not a lexer change.
+- **Per-node child lists in `immediate_core_expr_children`** (from C5): every
+  read-only walker allocates a `List[CoreExpr]` per visited node.
+- **CTFE dependency preparation** (from F1b): 64% of the self-compile's
+  typed frontend; the demand-driven fix is F2 as re-scoped in the branch
+  report. For small programs the levers are dependency bodies (28%) and
+  `global_header_completion` (30%), which is the largest pure-header phase
+  on both programs and deserves its own sub-phase attribution.
+- **Trait candidates for DCE** (from C4): five `Integer` bitwise trait
+  methods have no `ImplDecl`; `trait_resolve` resolves them to native ops or
+  a `FunctionTraitTarget`. Export one "candidate targets for (trait,
+  method)" query from trait_resolve so the pre-desugar prune stops failing
+  closed on the self-compile.
+- **Cross-module function references as values** (from P1): the backend
+  cannot emit `other_module.f` used as a first-class value; P1 needed 18
+  same-module wrappers.
+- **Analysis indexes rebuilt per pass**: `rewrite_tuple_sroa_program` and
+  `lower_tailrec_program` rebuild layout indexes with a full program walk each
+  run; unmeasured.
+- **`embedded_std.brp` is not formatter-clean** even under the bootstrap
+  compiler; regenerate it through the formatter or exclude it deliberately.
+
+## Round Three: Instructions Per Node
+
+Round two's structural cuts each bought one or two percent because the
+remaining cost is per node, not per algorithm: late Core spends on the
+order of 5,000 instructions per node per pass, where a hand-written C
+compiler spends tens. The lexer pilot (2026-09-16) settled how that splits.
+Rewriting the lexer as a builder with local `var` accumulators instead of a
+threaded state record removed 35% of discovery allocations and 1.7% of
+whole-compile instructions from a phase that is 6% of the compile, with
+byte-identical tokens and C, and deleted sixteen functions. What remained
+per token was the language's codegen: three heap constructions, three
+retain/release pairs, and two cancellation cleanup frames, plus a retain and
+a cleanup frame around any managed local even when it never escapes.
+
+### Principle: build immutable facts, then consume them
+
+A pass or phase builds its result inside one function that owns local
+`var` accumulators and mutates them in place (they are unique, so appends
+and sets do not copy), publishes one immutable product, and never updates
+that product again; consumers read it. Do not thread a `State` record
+through recursion and rebuild it per node. Where recursion needs an
+accumulator, use an explicit worklist over locals, as the Perceus
+summarizer already does.
+
+### Tasks
+
+**S1. Audit threaded state.** List every record type threaded through a
+rewrite or analysis recursion (`LexerState` for literal forms, the Perceus
+insertion frames and resolved-value index, `ClosureState`, the SSA rewrite
+state, DCE facts, the typecheck `Context`/`Env`/session, cancellation plan
+analysis) with its rebuild count on the self-compile from a calls profile
+and the per-pass allocation rows. Rank by allocations. Deliverable: the
+table and the top five conversions with expected allocation savings.
+
+**S2. Convert the top consumers, one per task.** Same template as the
+lexer: builder with local accumulators, scanners/visitors that return only
+what they found, one published product. Oracle: identical C (or normalized
+where a task legitimately changes symbols or whitespace), the pass's
+suite, and the pass's allocation and instruction rows. Likely order:
+Perceus insertion walk, typecheck inference context, closure conversion,
+SSA, the lexer's literal forms.
+
+**G1. Per-node codegen study.** On one simple pass, count instructions per
+visited node, read the generated C for its arms, and attribute the cost to
+retain/release, cleanup frames, union/record construction, and helper
+calls. Deliverable: the attribution and the two or three codegen changes
+with the largest multiplier.
+
+**G2. Elide cancellation cleanup frames where they cannot fire.** A pure
+function cannot be cancelled mid-body and a local that never escapes needs
+no frame; the lexer's `symbol_at` opens a frame for a borrowed `source.text`.
+Emit frames only for values that can outlive a cancellation point. Oracle:
+runtime cancellation tests, leak and sanitizer gates, identical behavior on
+every `concurrent:`/resource fixture.
+
+**G3. Borrow non-escaping locals.** A local bound from a field read or a
+parameter, used only as an argument or in a match, and never stored or
+returned needs no retain/release pair. Extend Perceus's borrow inference to
+that shape; measure retain/release counts in generated C before and after.
+
+**G4. Unboxed payload-free and scalar-payload union variants.** Every union
+constructor heap-allocates, including `SymbolToken(LeftParenSymbol)` and
+Core leaf kinds; 1.5M of 1.8M tokens carry such a variant. A representation
+decision for all unions; measure on Core node counts as well as tokens.
+
+**W1. Walk fusion.** With the pass list landed, fuse the sparse late-Core
+rewriters (static string literals, record-update and dict-literal
+ownership, fairness, resource cleanup) into one walk, and the read-only
+analyses (DCE reachability facts, cancellation analysis, production
+invariants) into one read pass. Each fusion must keep the per-pass rows
+meaningful by naming the fused pass and must be identical in C.
+
+**P2. Gate production invariant walks** (unchanged from above; now trivial
+under the pass list).
+
+Sequencing: S1 and G1 are measurement tasks and run first, in parallel.
+S2 conversions and G2/G3/G4 codegen changes then run in disjoint files;
+codegen changes affect every pass, so each is measured on the whole compile
+and on user programs (`benchmarks/bench.sh`) before merging.
 
 ## Deferred
 
