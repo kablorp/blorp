@@ -4,9 +4,17 @@ import:
 		resolved_value_occurrences,
 		value_references,
 	../../../src/compiler/stage_09_core/ir:
-		CoreCallKind(UnknownCall, UserCall),
+		CoreCallKind(DeferredTraitCall, SelectedTraitCall, UnknownCall, UserCall),
 		CoreClosureCreate,
-		CoreDecl(FunctionDecl, GlobalDecl, TraitDecl, TypeAliasDecl, UnionDecl, ValueRecordDecl),
+		CoreDecl(
+			FunctionDecl,
+			GlobalDecl,
+			ImplDecl,
+			TraitDecl,
+			TypeAliasDecl,
+			UnionDecl,
+			ValueRecordDecl,
+		),
 		CoreExpr(
 			AssignExpr,
 			CallExpr,
@@ -24,6 +32,7 @@ import:
 			VarExpr,
 			VoidExpr,
 		),
+		CoreFunction,
 		CoreFunctionKind(ProgramEntrypointFunction, UserFunction),
 		CoreHashContainerConstructor(CustomHashContainerConstructor),
 		CoreLiteral(BoolLiteral, IntLiteral),
@@ -119,6 +128,69 @@ pure func function_decl_with_return_type(
 		is_pure = True,
 		function_kind = function_kind_for_name(name),
 		def_id = def_id,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func impl_method(
+	name: String,
+	def_id: Int,
+	return_type: CoreType,
+	body: CoreExpr,
+) -> CoreFunction:
+	{
+		name = name,
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = return_type,
+		body = Some(body),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = def_id,
+		loc = SyntheticSourceLoc
+	}
+
+
+-- Impl declarations survive pruning unconditionally, so they must keep
+-- everything their methods reference. Mirrors the shape early Core still
+-- carries when the prune runs before impls are projected away.
+pure func impl_decl(trait_name: String, methods: List[CoreFunction]) -> CoreDecl:
+	ImplDecl({
+		trait_name = trait_name,
+		for_type = int_type(),
+		type_params = [],
+		methods = methods,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func deferred_trait_call(trait_name: String, method_name: String) -> CoreExpr:
+	CallExpr(
+		DeferredTraitCall(trait_name, method_name),
+		VoidExpr(VoidType, SyntheticSourceLoc),
+		[],
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+
+pure func selected_trait_call(trait_name: String, method_name: String, def_id: Int) -> CoreExpr:
+	CallExpr(
+		SelectedTraitCall(trait_name, method_name, "", def_id),
+		VoidExpr(VoidType, SyntheticSourceLoc),
+		[],
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+
+pure func named_impl_decl(trait_name: String, methods: List[CoreFunction]) -> CoreDecl:
+	ImplDecl({
+		trait_name = trait_name,
+		for_type = int_type(),
+		type_params = [],
+		methods = methods,
 		loc = SyntheticSourceLoc,
 	})
 
@@ -771,6 +843,52 @@ func test_fact_application_is_order_independent() -> Bool:
 	)
 
 
+func test_retains_types_referenced_only_by_impl_method_body() -> Bool:
+	input_program = program([
+		function_decl("main", 1, int_literal(0)),
+		impl_decl("Displayable", [impl_method(
+					"to_display",
+					2,
+					int_type(),
+					VoidExpr(ValueRecordType("ImplOnly"), SyntheticSourceLoc),
+				)]),
+		value_record_decl("ImplOnly", int_type()),
+		value_record_decl("Dead", int_type()),
+	])
+
+	value_record_names(prune_program(input_program)) == ["ImplOnly"]
+
+
+func test_retains_types_referenced_only_by_impl_method_signature() -> Bool:
+	input_program = program([
+		function_decl("main", 1, int_literal(0)),
+		impl_decl(
+			"Displayable",
+			[impl_method("to_display", 2, ValueRecordType("SignatureOnly"), int_literal(0))],
+		),
+		value_record_decl("SignatureOnly", int_type()),
+		value_record_decl("Dead", int_type()),
+	])
+
+	value_record_names(prune_program(input_program)) == ["SignatureOnly"]
+
+
+func test_retains_functions_called_only_from_impl_method_body() -> Bool:
+	input_program = program([
+		function_decl("main", 1, int_literal(0)),
+		impl_decl("Displayable", [impl_method(
+					"to_display",
+					3,
+					int_type(),
+					user_call("helper", Some(2)),
+				)]),
+		function_decl("helper", 2, int_literal(2)),
+		function_decl("dead", 4, int_literal(4)),
+	])
+
+	function_names(prune_program(input_program)) == ["main", "helper"]
+
+
 func test_retains_trait_signatures() -> Bool:
 	input_program = program([
 		function_decl("main", 1, int_literal(0)),
@@ -782,6 +900,109 @@ func test_retains_trait_signatures() -> Bool:
 			trait_info.name == "Display"
 		_:
 			False
+
+
+-- Trait dispatch that survives into DCE names its targets through the trait and
+-- method rather than a def_id. Rooting every matching implementation is the
+-- conservative answer; failing closed on it would keep the whole program.
+func test_deferred_trait_call_roots_every_implementation() -> Bool:
+	input_program = program([
+		function_decl(
+			"main",
+			1,
+			deferred_trait_call("Displayable", "render"),
+		),
+		named_impl_decl("Displayable", [impl_method(
+					"render",
+					2,
+					int_type(),
+					VoidExpr(ValueRecordType("FirstImplOnly"), SyntheticSourceLoc),
+				)]),
+		named_impl_decl("Displayable", [impl_method(
+					"render",
+					3,
+					int_type(),
+					VoidExpr(ValueRecordType("SecondImplOnly"), SyntheticSourceLoc),
+				)]),
+		value_record_decl("FirstImplOnly", int_type()),
+		value_record_decl("SecondImplOnly", int_type()),
+		value_record_decl("Dead", int_type()),
+		function_decl("dead_helper", 4, int_literal(4)),
+	])
+	pruned = prune_program(input_program)
+
+	(
+		value_record_names(pruned) == ["FirstImplOnly", "SecondImplOnly"]
+		and function_names(pruned) == ["main"]
+	)
+
+
+func test_selected_trait_call_roots_its_target() -> Bool:
+	input_program = program([
+		function_decl(
+			"main",
+			1,
+			selected_trait_call("Displayable", "render", 5),
+		),
+		function_decl_with_return_type(
+			"trait_target",
+			5,
+			ValueRecordType("TargetOnly"),
+			int_literal(0),
+		),
+		value_record_decl("TargetOnly", int_type()),
+		value_record_decl("Dead", int_type()),
+		function_decl("dead_helper", 4, int_literal(4)),
+	])
+	pruned = prune_program(input_program)
+
+	(
+		function_names(pruned) == ["main", "trait_target"]
+		and value_record_names(pruned) == ["TargetOnly"]
+	)
+
+
+-- A trait method with no implementation has no body anywhere in Core, so the
+-- call target is genuinely unknown and the whole program has to survive.
+func test_trait_call_without_candidates_fails_closed() -> Bool:
+	input_program = program([
+		function_decl(
+			"main",
+			1,
+			deferred_trait_call("Missing", "absent"),
+		),
+		function_decl("dead_helper", 4, int_literal(4)),
+	])
+
+	function_names(prune_program(input_program)) == ["main", "dead_helper"]
+
+
+-- Trait resolution rewrites a call it resolved to a top-level function into an
+-- UnknownCall whose callee names the target and carries no def_id. The name is
+-- then the only thing tying the call to its target.
+func test_function_typed_callee_without_def_id_roots_by_name() -> Bool:
+	callee_type: CoreType = FunctionType(True, [], int_type())
+	input_program = program([
+		function_decl(
+			"main",
+			1,
+			CallExpr(
+				UnknownCall,
+				VarExpr(
+					named_var("target_helper", None),
+					callee_type,
+					SyntheticSourceLoc,
+				),
+				[],
+				int_type(),
+				SyntheticSourceLoc,
+			),
+		),
+		function_decl("target_helper", 2, int_literal(2)),
+		function_decl("dead", 3, int_literal(3)),
+	])
+
+	function_names(prune_program(input_program)) == ["main", "target_helper"]
 
 
 tests: TestSuite = {
@@ -849,5 +1070,30 @@ tests: TestSuite = {
 		),
 		("fact application is order independent", test_fact_application_is_order_independent),
 		("retains trait signatures", test_retains_trait_signatures),
+		(
+			"retains types referenced only by impl method body",
+			test_retains_types_referenced_only_by_impl_method_body,
+		),
+		(
+			"retains types referenced only by impl method signature",
+			test_retains_types_referenced_only_by_impl_method_signature,
+		),
+		(
+			"retains functions called only from impl method body",
+			test_retains_functions_called_only_from_impl_method_body,
+		),
+		(
+			"deferred trait call roots every implementation",
+			test_deferred_trait_call_roots_every_implementation,
+		),
+		("selected trait call roots its target", test_selected_trait_call_roots_its_target),
+		(
+			"trait call without candidates fails closed",
+			test_trait_call_without_candidates_fails_closed,
+		),
+		(
+			"function typed callee without def id roots by name",
+			test_function_typed_callee_without_def_id_roots_by_name,
+		),
 	]
 }
