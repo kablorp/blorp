@@ -186,54 +186,6 @@ private pure func initial_state(source: SourceFile) -> LexerState:
 	}
 
 
-private pure func current_indent(state: LexerState) -> Int:
-	state.indent_stack.get_or(0, 0)
-
-
-private pure func current_lambda_body_level(state: LexerState) -> Option[LambdaBodyLevel]:
-	state.lambda_body_levels.get(0)
-
-
-private pure func in_lambda_body(state: LexerState) -> Bool:
-	match current_lambda_body_level(state):
-		Some(level):
-			state.group_depth >= level.group_depth
-		None:
-			False
-
-
-private pure func in_nested_group_in_lambda(state: LexerState) -> Bool:
-	match current_lambda_body_level(state):
-		Some(level):
-			state.group_depth > level.group_depth
-		None:
-			False
-
-
-private pure func last_token_is_colon(state: LexerState) -> Bool:
-	match state.last_token_kind:
-		Some(SymbolToken(ColonSymbol)):
-			True
-		_:
-			False
-
-
-private pure func can_enter_lambda_body(state: LexerState) -> Bool:
-	state.group_depth > 0 and last_token_is_colon(state) and match current_lambda_body_level(state):
-		Some(level):
-			state.group_depth > level.group_depth
-		None:
-			True
-
-
-private pure func enter_lambda_body(state: LexerState) -> LexerState:
-	level: LambdaBodyLevel = {
-		group_depth = state.group_depth,
-		base_indent = current_indent(state)
-	}
-	{ state | lambda_body_levels = [level].concat(state.lambda_body_levels) }
-
-
 private pure func is_digit_char(c: Char) -> Bool:
 	c >= '0' and c <= '9'
 
@@ -346,16 +298,6 @@ private pure func emitted_token_state(
 
 
 ---
-The exit for a step that produced trailing trivia rather than a token.
----
-private pure func trailing_trivia_state(state: LexerState, trivia: Trivia) -> LexerState:
-	{ state |
-		emitted_token = None,
-		emitted_trivia = Some(trivia)
-	}
-
-
----
 The exit for a step that produced neither a token nor trailing trivia. Every
 state handed back to the `lex` loop passes through one of these three, which
 is what keeps the two emission slots mutually exclusive and never stale.
@@ -381,15 +323,6 @@ private pure func emit_token(state: LexerState, kind: TokenKind, span: SourceSpa
 	emit_token_at(state, kind, span, state.cursor)
 
 
-private pure func emit_structural_token(
-	state: LexerState,
-	tokens: List[Token],
-	kind: TokenKind,
-	span: SourceSpan,
-) -> (LexerState, List[Token]):
-	({ state | last_token_kind = Some(kind) }, tokens.append(token(kind, span)))
-
-
 private pure func add_trailing_trivia(tokens: List[Token], trivia: Trivia) -> List[Token]:
 	last: Int = tokens.length() - 1
 
@@ -398,17 +331,6 @@ private pure func add_trailing_trivia(tokens: List[Token], trivia: Trivia) -> Li
 			tokens.set(last, { token | trailing_trivia = token.trailing_trivia.append(trivia) })
 		None:
 			tokens
-
-
-private pure func append_trivia(state: LexerState, trivia: Trivia) -> LexerState:
-	if state.line_has_token:
-		trailing_trivia_state(state, trivia)
-	else:
-		{ state |
-			pending_trivia = state.pending_trivia.append(trivia),
-			emitted_token = None,
-			emitted_trivia = None
-		}
 
 
 private pure func starts_with(state: LexerState, expected: String) -> Bool:
@@ -798,59 +720,6 @@ private pure func consume_until_single_quote(state: LexerState) -> LexerState:
 
 -- Spaces and tabs never change the line, so the run is scanned by offset and
 -- the column is carried forward instead of recomputed per character.
-private pure func scan_spaces(state: LexerState) -> LexerState:
-	text: String = state.source.text
-	var offset: Int = state.cursor.offset
-	var column: Int = state.cursor.column
-
-	while True:
-		match text.get(offset):
-			Some(' '):
-				column += 1
-				offset += 1
-			Some('\t'):
-				column += tab_advance(column)
-				offset += 1
-			_:
-				break
-
-	{ state | cursor = {
-			offset = offset,
-			line = state.cursor.line,
-			column = column
-		} }
-
-
-private pure func scan_line_comment(state: LexerState) -> LexerState:
-	start_cursor: Cursor = state.cursor
-	after_marker: LexerState = advance(advance(state))
-	text: String = after_marker.source.text
-	var offset: Int = after_marker.cursor.offset
-	var column: Int = after_marker.cursor.column
-
-	while True:
-		match text.get(offset):
-			Some('\n'):
-				break
-			Some('\t'):
-				column += tab_advance(column)
-				offset += 1
-			Some(_):
-				column += 1
-				offset += 1
-			None:
-				break
-
-	st: LexerState = run_end_state(after_marker, offset, column)
-	comment_span: SourceSpan = span_from(st, start_cursor, st.cursor)
-	trivia: Trivia = trivia(
-		CommentTrivia,
-		source_span_text(st.source, comment_span),
-		comment_span,
-	)
-	append_trivia(st, trivia)
-
-
 private pure func scan_docstring(state: LexerState) -> LexerState:
 	start_cursor: Cursor = state.cursor
 	var st: LexerState = consume_line(state)
@@ -1503,53 +1372,6 @@ private pure func decimal_literal_leq(left: String, right: String) -> Bool:
 
 -- Digits and the single fraction dot are never newlines or tabs, so the run is
 -- scanned by offset and the end cursor is computed once.
-private pure func scan_number(state: LexerState) -> LexerState:
-	start_cursor: Cursor = state.cursor
-	text: String = state.source.text
-	var offset: Int = start_cursor.offset
-	var saw_dot: Bool = False
-
-	while True:
-		match text.get(offset):
-			Some(c):
-				if is_digit_char(c):
-					offset += 1
-				else if c == '.' and not saw_dot:
-					match text.get(offset + 1):
-						Some(next):
-							if is_digit_char(next):
-								saw_dot = True
-								offset += 1
-							else:
-								break
-						None:
-							break
-				else:
-					break
-			None:
-				break
-
-	end_cursor: Cursor = {
-		offset = offset,
-		line = start_cursor.line,
-		column = start_cursor.column + offset - start_cursor.offset
-	}
-	span: SourceSpan = span_from(state, start_cursor, end_cursor)
-	text: String = source_span_text(state.source, span)
-
-	if saw_dot:
-		emit_token_at(state, FloatLiteralToken(text), span, end_cursor)
-	else if decimal_literal_leq(text, INT128_MAX_DECIMAL):
-		emit_token_at(state, IntLiteralToken(text), span, end_cursor)
-	else:
-		emit_token_at(
-			add_error_at_span(state, span, "Integer literal '" + text + "' exceeds Int128 range"),
-			IntLiteralToken(text),
-			span,
-			end_cursor,
-		)
-
-
 private pure func group_depth_after_symbol(depth: Int, symbol: Symbol) -> Int:
 	match symbol:
 		LeftParenSymbol:
@@ -1577,155 +1399,73 @@ private pure func group_depth_after_symbol(depth: Int, symbol: Symbol) -> Int:
 			depth
 
 
-private pure func emit_symbol(state: LexerState, symbol: Symbol, width: Int) -> LexerState:
-	start_cursor: Cursor = state.cursor
-	end_cursor: Cursor = cursor_advanced(state.source, start_cursor, width)
-	span: SourceSpan = span_from(state, start_cursor, end_cursor)
-	kind: TokenKind = SymbolToken(symbol)
-	emitted: Token = token_with_trivia(kind, span, state.pending_trivia, [])
-	emitted_token_state(
-		state,
-		kind,
-		end_cursor,
-		group_depth_after_symbol(state.group_depth, symbol),
-		emitted,
-	)
+private struct SymbolMatch {
+	symbol: Symbol,
+	width: Int
+}
 
 
-private pure func scan_unexpected_character(state: LexerState, c: Char) -> LexerState:
-	advance(add_error(state, "unexpected character '" + c.to_string() + "'"))
+private struct NumberScan {
+	end_offset: Int,
+	saw_dot: Bool
+}
 
 
-private pure func scan_symbol_or_error(state: LexerState) -> LexerState:
-	match peek(state):
-		Some('-'):
-			next = peek_next(state)
+private pure func top_indent(indent_stack: List[Int]) -> Int:
+	indent_stack.get_or(0, 0)
 
-			if next == Some('>'):
-				emit_symbol(state, ArrowSymbol, 2)
-			else if next == Some('='):
-				emit_symbol(state, MinusEqualSymbol, 2)
-			else:
-				emit_symbol(state, MinusSymbol, 1)
-		Some('='):
-			next = peek_next(state)
 
-			if next == Some('>'):
-				emit_symbol(state, FatArrowSymbol, 2)
-			else if next == Some('='):
-				emit_symbol(state, EqualEqualSymbol, 2)
-			else:
-				emit_symbol(state, EqualSymbol, 1)
-		Some('<'):
-			next = peek_next(state)
+private pure func top_lambda_level(levels: List[LambdaBodyLevel]) -> Option[LambdaBodyLevel]:
+	levels.get(0)
 
-			if next == Some('='):
-				emit_symbol(state, LessEqualSymbol, 2)
-			else:
-				emit_symbol(state, LessSymbol, 1)
-		Some('>'):
-			next = peek_next(state)
 
-			if next == Some('='):
-				emit_symbol(state, GreaterEqualSymbol, 2)
-			else:
-				emit_symbol(state, GreaterSymbol, 1)
-		Some('!'):
-			next = peek_next(state)
-
-			if next == Some('='):
-				emit_symbol(state, NotEqualSymbol, 2)
-			else:
-				stepped_state(scan_unexpected_character(state, '!'))
-		Some('?'):
-			next = peek_next(state)
-
-			if next == Some('='):
-				emit_symbol(state, QuestionEqualsSymbol, 2)
-			else:
-				stepped_state(scan_unexpected_character(state, '?'))
-		Some('.'):
-			next = peek_next(state)
-
-			if next == Some('.') and peek_at(state, 2) == Some('.'):
-				emit_symbol(state, DotDotDotSymbol, 3)
-			else if next == Some('.'):
-				emit_symbol(state, DotDotSymbol, 2)
-			else:
-				emit_symbol(state, DotSymbol, 1)
-		Some('+'):
-			next = peek_next(state)
-
-			if next == Some('='):
-				emit_symbol(state, PlusEqualSymbol, 2)
-			else:
-				emit_symbol(state, PlusSymbol, 1)
-		Some('*'):
-			next = peek_next(state)
-
-			if next == Some('='):
-				emit_symbol(state, StarEqualSymbol, 2)
-			else:
-				emit_symbol(state, StarSymbol, 1)
-		Some('/'):
-			next = peek_next(state)
-
-			if next == Some('='):
-				emit_symbol(state, SlashEqualSymbol, 2)
-			else:
-				emit_symbol(state, SlashSymbol, 1)
-		Some('('):
-			emit_symbol(state, LeftParenSymbol, 1)
-		Some(')'):
-			emit_symbol(state, RightParenSymbol, 1)
-		Some('['):
-			emit_symbol(state, LeftBracketSymbol, 1)
-		Some(']'):
-			emit_symbol(state, RightBracketSymbol, 1)
-		Some('{'):
-			emit_symbol(state, LeftBraceSymbol, 1)
-		Some('}'):
-			emit_symbol(state, RightBraceSymbol, 1)
-		Some(':'):
-			emit_symbol(state, ColonSymbol, 1)
-		Some(','):
-			emit_symbol(state, CommaSymbol, 1)
-		Some('_'):
-			emit_symbol(state, UnderscoreSymbol, 1)
-		Some('%'):
-			emit_symbol(state, PercentSymbol, 1)
-		Some('#'):
-			emit_symbol(state, HashSymbol, 1)
-		Some('@'):
-			emit_symbol(state, AtSymbol, 1)
-		Some('|'):
-			emit_symbol(state, PipeSymbol, 1)
-		Some(';'):
-			stepped_state(scan_unexpected_character(state, ';'))
-		Some(c):
-			stepped_state(scan_unexpected_character(state, c))
+private pure func in_lambda_body_at(levels: List[LambdaBodyLevel], group_depth: Int) -> Bool:
+	match top_lambda_level(levels):
+		Some(level):
+			group_depth >= level.group_depth
 		None:
-			stepped_state(state)
+			False
 
 
-private pure func emit_pending_newline(
-	state: LexerState,
-	tokens: List[Token],
-) -> (LexerState, List[Token]):
-	if state.pending_newline:
-		span: SourceSpan = empty_span(state)
-		(with_token, with_tokens) = emit_structural_token(state, tokens, NewlineToken, span)
-		({ with_token | pending_newline = False }, with_tokens)
-	else:
-		(state, tokens)
+private pure func in_nested_group_in_lambda_at(
+	levels: List[LambdaBodyLevel],
+	group_depth: Int,
+) -> Bool:
+	match top_lambda_level(levels):
+		Some(level):
+			group_depth > level.group_depth
+		None:
+			False
 
 
-private pure func pop_lambda_body_level(state: LexerState) -> LexerState:
+private pure func kind_is_colon_symbol(kind: Option[TokenKind]) -> Bool:
+	match kind:
+		Some(SymbolToken(ColonSymbol)):
+			True
+		_:
+			False
+
+
+private pure func can_enter_lambda_body_at(
+	levels: List[LambdaBodyLevel],
+	group_depth: Int,
+	last_token_kind: Option[TokenKind],
+) -> Bool:
+	group_depth > 0 and kind_is_colon_symbol(last_token_kind) and match top_lambda_level(levels):
+		Some(level):
+			group_depth > level.group_depth
+		None:
+			True
+
+
+private pure func dropped_first_lambda_level(
+	levels: List[LambdaBodyLevel],
+) -> List[LambdaBodyLevel]:
 	var rest: List[LambdaBodyLevel] = []
 	var i: Int = 1
 
-	while i < state.lambda_body_levels.length():
-		match state.lambda_body_levels.get(i):
+	while i < levels.length():
+		match levels.get(i):
 			Some(level):
 				rest = rest.append(level)
 			None:
@@ -1733,36 +1473,39 @@ private pure func pop_lambda_body_level(state: LexerState) -> LexerState:
 
 		i += 1
 
-	{ state | lambda_body_levels = rest }
+	rest
 
 
-private pure func prune_lambda_body_levels(state: LexerState) -> LexerState:
-	var st: LexerState = state
+private pure func pruned_lambda_body_levels(
+	levels: List[LambdaBodyLevel],
+	indent_stack: List[Int],
+) -> List[LambdaBodyLevel]:
+	var remaining: List[LambdaBodyLevel] = levels
 
 	while True:
-		match current_lambda_body_level(st):
+		match top_lambda_level(remaining):
 			Some(level):
-				if current_indent(st) <= level.base_indent:
-					st = pop_lambda_body_level(st)
+				if top_indent(indent_stack) <= level.base_indent:
+					remaining = dropped_first_lambda_level(remaining)
 				else:
 					break
 			None:
 				break
 
-	st
+	remaining
 
 
-private pure func dedent_would_be_inconsistent(state: LexerState, indent: Int) -> Bool:
+private pure func dedent_would_be_inconsistent_at(indent_stack: List[Int], indent: Int) -> Bool:
 	var i: Int = 0
 	var inconsistent: Bool = False
 
-	while i < state.indent_stack.length():
-		match state.indent_stack.get(i):
+	while i < indent_stack.length():
+		match indent_stack.get(i):
 			Some(level):
 				if indent >= level:
 					break
 				else:
-					next_level: Int = state.indent_stack.get_or(i + 1, 0)
+					next_level: Int = indent_stack.get_or(i + 1, 0)
 
 					if indent > next_level:
 						inconsistent = True
@@ -1775,14 +1518,19 @@ private pure func dedent_would_be_inconsistent(state: LexerState, indent: Int) -
 	inconsistent
 
 
-private pure func lambda_body_close_indent(state: LexerState, indent: Int) -> Option[Int]:
-	match current_lambda_body_level(state):
+private pure func lambda_body_close_indent_at(
+	levels: List[LambdaBodyLevel],
+	group_depth: Int,
+	indent_stack: List[Int],
+	indent: Int,
+) -> Option[Int]:
+	match top_lambda_level(levels):
 		Some(level):
 			if (
-				state.group_depth == level.group_depth
+				group_depth == level.group_depth
 				and indent > level.base_indent
-				and indent < current_indent(state)
-				and dedent_would_be_inconsistent(state, indent)
+				and indent < top_indent(indent_stack)
+				and dedent_would_be_inconsistent_at(indent_stack, indent)
 			):
 				Some(level.base_indent)
 			else:
@@ -1791,217 +1539,735 @@ private pure func lambda_body_close_indent(state: LexerState, indent: Int) -> Op
 			None
 
 
-private pure func emit_indent_token(
-	state: LexerState,
-	tokens: List[Token],
-	start_cursor: Cursor,
-	indent: Int,
-) -> (LexerState, List[Token]):
-	(with_newline, with_tokens) = emit_pending_newline(state, tokens)
-	span: SourceSpan = span_from(with_newline, start_cursor, with_newline.cursor)
+private pure func text_starts_with(source: SourceFile, cursor: Cursor, expected: String) -> Bool:
+	expected_len: Int = expected.length()
 
-	emit_structural_token(
-		{ with_newline |
-			indent_stack = [indent].concat(with_newline.indent_stack),
-			at_line_start = False
-		},
-		with_tokens,
-		IndentToken,
-		span,
-	)
-
-
-private pure func emit_dedents_to(
-	state: LexerState,
-	tokens: List[Token],
-	indent: Int,
-) -> (LexerState, List[Token]):
-	var st: LexerState = { state | pending_newline = False }
-	var out_tokens: List[Token] = tokens
-
-	while current_indent(st) > indent:
-		span: SourceSpan = empty_span(st)
-
-		(next_state, next_tokens) = emit_structural_token(
-			{ st | indent_stack = st.indent_stack.tail() },
-			out_tokens,
-			DedentToken,
-			span,
-		)
-		st = next_state
-		out_tokens = next_tokens
-
-	if current_indent(st) != indent:
-		(add_error(st, "inconsistent indentation"), out_tokens)
+	if cursor.offset + expected_len > source.text.length():
+		False
 	else:
-		(prune_lambda_body_levels(st), out_tokens)
+		var index: Int = 0
+		var matches: Bool = True
+
+		while matches and index < expected_len:
+			if source.text.get_or(cursor.offset + index, '\0') == expected.get_or(index, '\0'):
+				index += 1
+			else:
+				matches = False
+
+		matches
 
 
-private pure func handle_line_start(
-	state: LexerState,
-	tokens: List[Token],
-) -> (LexerState, List[Token]):
-	if not state.at_line_start:
-		(state, tokens)
+private pure func line_ends_after_optional_space_at(
+	source: SourceFile,
+	cursor: Cursor,
+	offset: Int,
+) -> Bool:
+	var i: Int = offset
+	var ok: Bool = False
+
+	while True:
+		match source.text.get(cursor.offset + i):
+			Some(' '):
+				i += 1
+			Some('\t'):
+				i += 1
+			Some('\n'):
+				ok = True
+				break
+			None:
+				ok = True
+				break
+			_:
+				break
+
+	ok
+
+
+private pure func starts_docstring_at(source: SourceFile, cursor: Cursor) -> Bool:
+	text_starts_with(source, cursor, "---") and line_ends_after_optional_space_at(source, cursor, 3)
+
+
+---
+Whether the cursor sits on the word `raw` used as a literal introducer rather
+than as the start of a longer identifier. Both raw string and raw pipe forms
+begin this way; which one it is, the rare-literal scanner decides.
+---
+private pure func starts_raw_word_at(source: SourceFile, cursor: Cursor) -> Bool:
+	if not text_starts_with(source, cursor, "raw"):
+		False
 	else:
-		start_cursor: Cursor = state.cursor
-		var st: LexerState = state
-		var indent: Int = 0
+		match source.text.get(cursor.offset + 3):
+			Some(c):
+				not is_ident_continue(c)
+			None:
+				True
 
-		while True:
-			match peek(st):
-				Some(' '):
-					indent += 1
-					st = advance(st)
-				Some('\t'):
-					indent += tab_advance(indent + 1)
-					st = advance(st)
-				_:
-					break
 
-		if st.group_depth > 0 and (not in_lambda_body(st) or in_nested_group_in_lambda(st)):
-			({ st |
-					pending_newline = False,
-					at_line_start = False
-				}, tokens)
-		else:
-			match peek(st):
-				Some('\n'):
-					(st, tokens)
-				Some(_):
-					current: Int = current_indent(st)
+private pure func spaces_end_cursor(source: SourceFile, cursor: Cursor) -> Cursor:
+	text: String = source.text
+	var offset: Int = cursor.offset
+	var column: Int = cursor.column
 
-					match lambda_body_close_indent(st, indent):
-						Some(base_indent):
-							(dedented, dedented_tokens) = emit_dedents_to(st, tokens, base_indent)
-							({ dedented |
-									pending_newline = False,
-									at_line_start = False
-								}, dedented_tokens)
-						None:
-							if indent > current:
-								emit_indent_token(st, tokens, start_cursor, indent)
-							else if indent == current:
-								(with_newline, with_tokens) = emit_pending_newline(st, tokens)
-								({ with_newline | at_line_start = False }, with_tokens)
+	while True:
+		match text.get(offset):
+			Some(' '):
+				column += 1
+				offset += 1
+			Some('\t'):
+				column += tab_advance(column)
+				offset += 1
+			_:
+				break
+
+	{
+		offset = offset,
+		line = cursor.line,
+		column = column
+	}
+
+
+private pure func line_comment_end_cursor(source: SourceFile, cursor: Cursor) -> Cursor:
+	text: String = source.text
+	var offset: Int = cursor.offset + 2
+	var column: Int = cursor.column + 2
+
+	while True:
+		match text.get(offset):
+			Some('\n'):
+				break
+			Some('\t'):
+				column += tab_advance(column)
+				offset += 1
+			Some(_):
+				column += 1
+				offset += 1
+			None:
+				break
+
+	{
+		offset = offset,
+		line = cursor.line,
+		column = column
+	}
+
+
+private pure func number_scan(source: SourceFile, cursor: Cursor) -> NumberScan:
+	text: String = source.text
+	var offset: Int = cursor.offset
+	var saw_dot: Bool = False
+
+	while True:
+		match text.get(offset):
+			Some(c):
+				if is_digit_char(c):
+					offset += 1
+				else if c == '.' and not saw_dot:
+					match text.get(offset + 1):
+						Some(next):
+							if is_digit_char(next):
+								saw_dot = True
+								offset += 1
 							else:
-								(dedented, dedented_tokens) = emit_dedents_to(st, tokens, indent)
-								({ dedented | at_line_start = False }, dedented_tokens)
-				None:
-					(st, tokens)
+								break
+						None:
+							break
+				else:
+					break
+			None:
+				break
+
+	{
+		end_offset = offset,
+		saw_dot = saw_dot
+	}
 
 
-private pure func scan_newline(state: LexerState) -> LexerState:
-	if can_enter_lambda_body(state):
-		{ enter_lambda_body(advance(state)) |
-			pending_newline = True,
-			at_line_start = True,
-			line_has_token = False
-		}
-	else if (
-		state.group_depth > 0
-		and (not in_lambda_body(state) or in_nested_group_in_lambda(state))
-	):
-		{ advance(state) |
-			pending_newline = False,
-			at_line_start = True,
-			line_has_token = False
-		}
-	else:
-		{ advance(state) |
-			pending_newline = state.pending_newline or state.line_has_token,
-			at_line_start = True,
-			line_has_token = False
-		}
+---
+Classify the symbol at the cursor, returning only the symbol and how many
+characters it spans. `None` means the character starts no symbol, which the
+builder reports as an unexpected character.
+---
+private pure func symbol_at(source: SourceFile, cursor: Cursor) -> Option[SymbolMatch]:
+	text: String = source.text
+	next: Option[Char] = text.get(cursor.offset + 1)
+
+	match text.get(cursor.offset):
+		Some('-'):
+			if next == Some('>'):
+				Some({
+					symbol = ArrowSymbol,
+					width = 2,
+				})
+			else if next == Some('='):
+				Some({
+					symbol = MinusEqualSymbol,
+					width = 2,
+				})
+			else:
+				Some({
+					symbol = MinusSymbol,
+					width = 1,
+				})
+		Some('='):
+			if next == Some('>'):
+				Some({
+					symbol = FatArrowSymbol,
+					width = 2,
+				})
+			else if next == Some('='):
+				Some({
+					symbol = EqualEqualSymbol,
+					width = 2,
+				})
+			else:
+				Some({
+					symbol = EqualSymbol,
+					width = 1,
+				})
+		Some('<'):
+			if next == Some('='):
+				Some({
+					symbol = LessEqualSymbol,
+					width = 2,
+				})
+			else:
+				Some({
+					symbol = LessSymbol,
+					width = 1,
+				})
+		Some('>'):
+			if next == Some('='):
+				Some({
+					symbol = GreaterEqualSymbol,
+					width = 2,
+				})
+			else:
+				Some({
+					symbol = GreaterSymbol,
+					width = 1,
+				})
+		Some('!'):
+			if next == Some('='):
+				Some({
+					symbol = NotEqualSymbol,
+					width = 2,
+				})
+			else:
+				None
+		Some('?'):
+			if next == Some('='):
+				Some({
+					symbol = QuestionEqualsSymbol,
+					width = 2,
+				})
+			else:
+				None
+		Some('.'):
+			if next == Some('.') and text.get(cursor.offset + 2) == Some('.'):
+				Some({
+					symbol = DotDotDotSymbol,
+					width = 3,
+				})
+			else if next == Some('.'):
+				Some({
+					symbol = DotDotSymbol,
+					width = 2,
+				})
+			else:
+				Some({
+					symbol = DotSymbol,
+					width = 1,
+				})
+		Some('+'):
+			if next == Some('='):
+				Some({
+					symbol = PlusEqualSymbol,
+					width = 2,
+				})
+			else:
+				Some({
+					symbol = PlusSymbol,
+					width = 1,
+				})
+		Some('*'):
+			if next == Some('='):
+				Some({
+					symbol = StarEqualSymbol,
+					width = 2,
+				})
+			else:
+				Some({
+					symbol = StarSymbol,
+					width = 1,
+				})
+		Some('/'):
+			if next == Some('='):
+				Some({
+					symbol = SlashEqualSymbol,
+					width = 2,
+				})
+			else:
+				Some({
+					symbol = SlashSymbol,
+					width = 1,
+				})
+		Some('('):
+			Some({
+				symbol = LeftParenSymbol,
+				width = 1,
+			})
+		Some(')'):
+			Some({
+				symbol = RightParenSymbol,
+				width = 1,
+			})
+		Some('['):
+			Some({
+				symbol = LeftBracketSymbol,
+				width = 1,
+			})
+		Some(']'):
+			Some({
+				symbol = RightBracketSymbol,
+				width = 1,
+			})
+		Some('{'):
+			Some({
+				symbol = LeftBraceSymbol,
+				width = 1,
+			})
+		Some('}'):
+			Some({
+				symbol = RightBraceSymbol,
+				width = 1,
+			})
+		Some(':'):
+			Some({
+				symbol = ColonSymbol,
+				width = 1,
+			})
+		Some(','):
+			Some({
+				symbol = CommaSymbol,
+				width = 1,
+			})
+		Some('_'):
+			Some({
+				symbol = UnderscoreSymbol,
+				width = 1,
+			})
+		Some('%'):
+			Some({
+				symbol = PercentSymbol,
+				width = 1,
+			})
+		Some('#'):
+			Some({
+				symbol = HashSymbol,
+				width = 1,
+			})
+		Some('@'):
+			Some({
+				symbol = AtSymbol,
+				width = 1,
+			})
+		Some('|'):
+			Some({
+				symbol = PipeSymbol,
+				width = 1,
+			})
+		_:
+			None
 
 
-private pure func scan_one(state: LexerState) -> LexerState:
+---
+Assemble the `LexerState` the rare literal scanners still expect. Only the
+string, char, docstring and pipe-block forms need it; the builder below scans
+every other token without building a state record at all.
+---
+private pure func literal_scan_state(
+	source: SourceFile,
+	cursor: Cursor,
+	diagnostics: List[ParseDiagnostic],
+	pending_trivia: List[Trivia],
+	indent_stack: List[Int],
+	lambda_body_levels: List[LambdaBodyLevel],
+	group_depth: Int,
+	pending_newline: Bool,
+	at_line_start: Bool,
+	line_has_token: Bool,
+	last_token_kind: Option[TokenKind],
+) -> LexerState:
+	{
+		source = source,
+		cursor = cursor,
+		diagnostics = diagnostics,
+		pending_trivia = pending_trivia,
+		indent_stack = indent_stack,
+		lambda_body_levels = lambda_body_levels,
+		group_depth = group_depth,
+		pending_newline = pending_newline,
+		at_line_start = at_line_start,
+		line_has_token = line_has_token,
+		last_token_kind = last_token_kind,
+		emitted_token = None,
+		emitted_trivia = None
+	}
+
+
+private pure func scan_literal_form(state: LexerState) -> LexerState:
 	match peek(state):
-		Some('\n'):
-			stepped_state(scan_newline(state))
-		Some(c):
-			if is_space(c):
-				stepped_state(scan_spaces(state))
-			else if c == '-' and starts_docstring_delimiter(state):
-				scan_docstring(state)
-			else if c == '-' and starts_with(state, "--"):
-				scan_line_comment(state)
-			else if c == 'r' and starts_with(state, "raw\""):
+		Some('-'):
+			scan_docstring(state)
+		Some('\"'):
+			scan_string_literal(state)
+		Some('\''):
+			scan_char_literal(state)
+		Some('|'):
+			scan_pipe_block(state, state.cursor, state.cursor.column, False)
+		Some('r'):
+			if starts_with(state, "raw\""):
 				scan_raw_string_literal(state)
-			else if c == 'r':
+			else:
 				match raw_pipe_start_after_raw(state):
 					Some((margin_column, marker_state)):
 						scan_pipe_block(marker_state, state.cursor, margin_column, True)
 					None:
 						scan_identifier(state)
-			else if c == '\"':
-				scan_string_literal(state)
-			else if c == '\'':
-				scan_char_literal(state)
-			else if c == '|' and not state.line_has_token:
-				scan_pipe_block(state, state.cursor, state.cursor.column, False)
-			else if (
-				c == '_'
-				and not peek_next(state)
-					.map(is_ident_continue)
-					.get_or(False)
-			):
-				emit_symbol(state, UnderscoreSymbol, 1)
-			else if is_ident_start(c):
-				scan_identifier(state)
-			else if is_digit_char(c):
-				scan_number(state)
-			else:
-				scan_symbol_or_error(state)
-		None:
+		_:
 			stepped_state(state)
 
 
-private pure func finalize_lexer(state: LexerState) -> (LexerState, List[Token]):
-	without_newline: LexerState = { state | pending_newline = False }
-	emit_dedents_to(without_newline, [], 0)
+---
+Lex a source file.
 
-
+This is a builder: every accumulator is a local `var` that the loop mutates in
+place, and the immutable token and diagnostic lists are published once at the
+end. The scanners it calls return only what they found -- an end cursor, a
+symbol, a token kind -- so scanning a token builds no state record. Only the
+rare literal forms still thread `LexerState`, through `scan_literal_form`.
+---
 pure func lex(source: SourceFile) -> LexResult:
-	var state: LexerState = initial_state(source)
-	var tokens: List[Token] = list(source.text.length() / 4 + 16)
+	text: String = source.text
+	var cursor: Cursor = source_start(source)
+	var tokens: List[Token] = list(text.length() / 4 + 16)
+	var diagnostics: List[ParseDiagnostic] = []
+	var pending_trivia: List[Trivia] = []
+	var indent_stack: List[Int] = [0]
+	var lambda_body_levels: List[LambdaBodyLevel] = []
+	var group_depth: Int = 0
+	var pending_newline: Bool = False
+	var at_line_start: Bool = True
+	var line_has_token: Bool = False
+	var last_token_kind: Option[TokenKind] = None
+	var scanning: Bool = True
 
-	while True:
-		if state.at_line_start:
-			(line_state, line_tokens) = handle_line_start(state, [])
-			state = line_state
+	while scanning:
+		if at_line_start:
+			line_start_cursor: Cursor = cursor
+			var indent: Int = 0
 
-			for line_token in line_tokens:
-				tokens = tokens.append(line_token)
+			while True:
+				match text.get(cursor.offset):
+					Some(' '):
+						indent += 1
+						cursor = source_advance(source, cursor)
+					Some('\t'):
+						indent += tab_advance(indent + 1)
+						cursor = source_advance(source, cursor)
+					_:
+						break
 
-		match peek(state):
-			Some(_):
-				state = scan_one(state)
-
-				match state.emitted_token:
-					Some(emitted):
-						tokens = tokens.append(emitted)
+			if (
+				group_depth > 0
+				and ((
+					not in_lambda_body_at(lambda_body_levels, group_depth)
+					or in_nested_group_in_lambda_at(lambda_body_levels, group_depth)
+				))
+			):
+				pending_newline = False
+				at_line_start = False
+			else:
+				match text.get(cursor.offset):
+					Some('\n'):
+						void
 					None:
-						match state.emitted_trivia:
-							Some(trivia):
-								tokens = add_trailing_trivia(tokens, trivia)
+						void
+					Some(_):
+						current_column: Int = top_indent(indent_stack)
+						var dedent_target: Int = -1
+
+						match lambda_body_close_indent_at(
+							lambda_body_levels,
+							group_depth,
+							indent_stack,
+							indent,
+						):
+							Some(base_indent):
+								dedent_target = base_indent
 							None:
-								void
+								if indent > current_column:
+									if pending_newline:
+										tokens = tokens.append(
+											token(
+												NewlineToken,
+												source_empty_span(source, cursor),
+											),
+										)
+										last_token_kind = Some(NewlineToken)
+										pending_newline = False
+
+									indent_stack = [indent].concat(indent_stack)
+									tokens = tokens.append(
+										token(
+											IndentToken,
+											source_span(source, line_start_cursor, cursor),
+										),
+									)
+									last_token_kind = Some(IndentToken)
+								else if indent == current_column:
+									if pending_newline:
+										tokens = tokens.append(
+											token(
+												NewlineToken,
+												source_empty_span(source, cursor),
+											),
+										)
+										last_token_kind = Some(NewlineToken)
+										pending_newline = False
+								else:
+									dedent_target = indent
+
+						if dedent_target >= 0:
+							pending_newline = False
+
+							while top_indent(indent_stack) > dedent_target:
+								tokens = tokens.append(
+									token(
+										DedentToken,
+										source_empty_span(source, cursor),
+									),
+								)
+								last_token_kind = Some(DedentToken)
+								indent_stack = indent_stack.tail()
+
+							if top_indent(indent_stack) != dedent_target:
+								diagnostics = diagnostics.append(
+									parse_error(
+										source_empty_span(source, cursor),
+										"inconsistent indentation",
+									),
+								)
+							else:
+								lambda_body_levels = pruned_lambda_body_levels(
+									lambda_body_levels,
+									indent_stack,
+								)
+
+						at_line_start = False
+
+		match text.get(cursor.offset):
 			None:
-				break
+				scanning = False
+			Some(c):
+				if c == '\n':
+					entering: Bool = can_enter_lambda_body_at(
+						lambda_body_levels,
+						group_depth,
+						last_token_kind,
+					)
 
-	(final_state, final_tokens) = finalize_lexer(state)
+					if entering:
+						level: LambdaBodyLevel = {
+							group_depth = group_depth,
+							base_indent = top_indent(indent_stack)
+						}
+						lambda_body_levels = [level].concat(lambda_body_levels)
+						pending_newline = True
+					else if (
+						group_depth > 0
+						and ((
+							not in_lambda_body_at(lambda_body_levels, group_depth)
+							or in_nested_group_in_lambda_at(lambda_body_levels, group_depth)
+						))
+					):
+						pending_newline = False
+					else:
+						pending_newline = pending_newline or line_has_token
 
-	for final_token in final_tokens:
-		tokens = tokens.append(final_token)
+					cursor = source_advance(source, cursor)
+					at_line_start = True
+					line_has_token = False
+				else if is_space(c):
+					cursor = spaces_end_cursor(source, cursor)
+				else if (
+					c == '\"'
+					or c == '\''
+					or c == '-' and starts_docstring_at(source, cursor)
+					or c == 'r' and starts_raw_word_at(source, cursor)
+					or c == '|' and not line_has_token
+				):
+					scanned: LexerState = scan_literal_form(
+						literal_scan_state(
+							source,
+							cursor,
+							diagnostics,
+							pending_trivia,
+							indent_stack,
+							lambda_body_levels,
+							group_depth,
+							pending_newline,
+							at_line_start,
+							line_has_token,
+							last_token_kind,
+						),
+					)
+					cursor = scanned.cursor
+					diagnostics = scanned.diagnostics
+					pending_trivia = scanned.pending_trivia
+					indent_stack = scanned.indent_stack
+					lambda_body_levels = scanned.lambda_body_levels
+					group_depth = scanned.group_depth
+					pending_newline = scanned.pending_newline
+					at_line_start = scanned.at_line_start
+					line_has_token = scanned.line_has_token
+					last_token_kind = scanned.last_token_kind
 
-	match emit_token(final_state, EndOfFileToken, empty_span(final_state)).emitted_token:
-		Some(end_of_file):
-			tokens = tokens.append(end_of_file)
-		None:
-			void
+					match scanned.emitted_token:
+						Some(emitted):
+							tokens = tokens.append(emitted)
+						None:
+							match scanned.emitted_trivia:
+								Some(found):
+									tokens = add_trailing_trivia(tokens, found)
+								None:
+									void
+				else if c == '-' and text_starts_with(source, cursor, "--"):
+					comment_end: Cursor = line_comment_end_cursor(source, cursor)
+					comment_span: SourceSpan = source_span(source, cursor, comment_end)
+					comment: Trivia = trivia(
+						CommentTrivia,
+						source_span_text(source, comment_span),
+						comment_span,
+					)
+					cursor = comment_end
+
+					if line_has_token:
+						tokens = add_trailing_trivia(tokens, comment)
+					else:
+						pending_trivia = pending_trivia.append(comment)
+				else if (
+					c == '_'
+					and not text
+						.get(cursor.offset + 1)
+						.map(is_ident_continue)
+						.get_or(False)
+				):
+					span: SourceSpan = source_span(
+						source,
+						cursor,
+						source_advance(source, cursor),
+					)
+					kind: TokenKind = SymbolToken(UnderscoreSymbol)
+					tokens = tokens.append(token_with_trivia(kind, span, pending_trivia, []))
+					pending_trivia = []
+					line_has_token = True
+					last_token_kind = Some(kind)
+					cursor = source_advance(source, cursor)
+				else if is_ident_start(c):
+					end_cursor: Cursor = identifier_end_cursor(source, cursor)
+					span: SourceSpan = source_span(source, cursor, end_cursor)
+					word: String = source_span_text(source, span)
+
+					kind: TokenKind = match keyword_for(word):
+						Some(keyword):
+							KeywordToken(keyword)
+						None:
+							IdentifierToken(word)
+
+					tokens = tokens.append(token_with_trivia(kind, span, pending_trivia, []))
+					pending_trivia = []
+					line_has_token = True
+					last_token_kind = Some(kind)
+					cursor = end_cursor
+				else if is_digit_char(c):
+					scan: NumberScan = number_scan(source, cursor)
+					end_cursor: Cursor = {
+						offset = scan.end_offset,
+						line = cursor.line,
+						column = cursor.column + scan.end_offset - cursor.offset
+					}
+					span: SourceSpan = source_span(source, cursor, end_cursor)
+					digits: String = source_span_text(source, span)
+
+					if not scan.saw_dot and not decimal_literal_leq(digits, INT128_MAX_DECIMAL):
+						diagnostics = diagnostics.append(
+							parse_error(
+								span,
+								"Integer literal '" + digits + "' exceeds Int128 range",
+							),
+						)
+
+					kind: TokenKind = if scan.saw_dot:
+						FloatLiteralToken(digits)
+					else:
+						IntLiteralToken(digits)
+
+					tokens = tokens.append(token_with_trivia(kind, span, pending_trivia, []))
+					pending_trivia = []
+					line_has_token = True
+					last_token_kind = Some(kind)
+					cursor = end_cursor
+				else:
+					match symbol_at(source, cursor):
+						Some(found):
+							end_cursor: Cursor = cursor_advanced(source, cursor, found.width)
+							span: SourceSpan = source_span(source, cursor, end_cursor)
+							kind: TokenKind = SymbolToken(found.symbol)
+							tokens = tokens.append(
+								token_with_trivia(
+									kind,
+									span,
+									pending_trivia,
+									[],
+								),
+							)
+							pending_trivia = []
+							line_has_token = True
+							last_token_kind = Some(kind)
+							group_depth = group_depth_after_symbol(group_depth, found.symbol)
+							cursor = end_cursor
+						None:
+							diagnostics = diagnostics.append(
+								parse_error(
+									source_empty_span(source, cursor),
+									"unexpected character '" + c.to_string() + "'",
+								),
+							)
+							cursor = source_advance(source, cursor)
+
+	while top_indent(indent_stack) > 0:
+		tokens = tokens.append(token(DedentToken, source_empty_span(source, cursor)))
+		indent_stack = indent_stack.tail()
+
+	if top_indent(indent_stack) != 0:
+		diagnostics = diagnostics.append(
+			parse_error(
+				source_empty_span(source, cursor),
+				"inconsistent indentation",
+			),
+		)
+
+	tokens = tokens.append(
+		token_with_trivia(
+			EndOfFileToken,
+			source_empty_span(source, cursor),
+			pending_trivia,
+			[],
+		),
+	)
 
 	{
 		tokens = tokens,
-		diagnostics = final_state.diagnostics
+		diagnostics = diagnostics
 	}
