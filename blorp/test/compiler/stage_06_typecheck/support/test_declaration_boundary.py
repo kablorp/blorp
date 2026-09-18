@@ -646,22 +646,24 @@ class DeclarationBoundaryTests(unittest.TestCase):
                 )
 
     def test_accepted_alias_projection_skips_provisional_payload_conversion(self) -> None:
+        # Alias header installation was folded into the per-section builder
+        # (`typecheck_install_module_header_section`) instead of a standalone
+        # `install_alias_header` function; the invariant now lives in that
+        # function's `for facts in section.aliases:` loop.
         source = TYPE_HEADER_INSTALL.read_text(encoding="utf-8")
         function = re.search(
-            r"private pure func install_alias_header\(.*?"
-            r"(?=\n\npure func typecheck_install_local_builtin_headers)",
+            r"for facts in section\.aliases:.*?"
+            r"(?=\n\n\t-- Publish the fact tables)",
             source,
             re.DOTALL,
         )
 
         self.assertIsNotNone(function)
         body = function.group(0)
-        authority_branch = body.index(
-            "match module_view_accepted_alias_authority(state.module_view)"
-        )
+        authority_branch = body.index("match alias_authority:")
         provisional_conversion = body.index("semantic_type_from_resolved_shape(")
         self.assertLess(authority_branch, provisional_conversion)
-        self.assertIn("accepted_alias_contains(authority, type_name)", body)
+        self.assertIn("accepted_alias_contains(authority, facts.type_name)", body)
 
     def test_accepted_alias_membership_does_not_materialize_payload(self) -> None:
         source = ALIAS_AUTHORITY.read_text(encoding="utf-8")
