@@ -2,15 +2,21 @@ import:
 	../../../src/compiler/stage_02_lex/token:
 		Keyword(FromOpaqueKeyword, FuncKeyword, IntoOpaqueKeyword),
 		Symbol(LeftParenSymbol),
+		TaggedPayload,
 		Token,
 		TokenKind(EndOfFileToken, IdentifierToken, KeywordToken, SymbolToken),
 		Trivia,
 		TriviaKind(CommentTrivia, WhitespaceTrivia),
+		append_trivia_run,
 		keyword_text,
+		span_of,
 		symbol_text,
-		token,
+		tagged_payload_for,
 		token_kind_name,
-		token_with_trivia,
+		token_kind_of,
+		token_kind_own_text,
+		token_trivia_of,
+		token_with_trivia_range,
 		trivia,
 	../../../src/lib/source:
 		Cursor,
@@ -20,6 +26,7 @@ import:
 		source_file,
 		source_span,
 		source_span_text,
+	dict: dict
 	test: TestSuite
 
 
@@ -42,14 +49,28 @@ func test_keyword_and_symbol_text() -> Bool:
 	)
 
 
+-- `Token` is a scalar-only struct: its span is six scalar fields
+-- (recovered by `span_of` with the source's path/module name) and its
+-- payload/kind view is recovered on demand by `token_kind_of` from the
+-- interned-text table `lex` publishes. `tagged_payload_for` and
+-- `token_with_trivia_range` are the scalar-only builders the lexer calls
+-- directly (no tuple, table, or list return crosses that call).
 func test_token_text_comes_from_span() -> Bool:
 	src: SourceFile = fixture_source_file()
-	token: Token = token(
-		KeywordToken(FuncKeyword),
+	tagged: TaggedPayload = tagged_payload_for(KeywordToken(FuncKeyword), -1)
+	token: Token = token_with_trivia_range(
+		tagged.tag,
+		tagged.id,
 		span_between(src, 0, 4),
+		0,
+		0,
 	)
+	span: SourceSpan = span_of(token, src.path, src.module_name)
 
-	source_span_text(src, token.span) == "func" and token_kind_name(token.kind) == "keyword func"
+	(
+		source_span_text(src, span) == "func"
+		and token_kind_name(token_kind_of([], token)) == "keyword func"
+	)
 
 
 func test_token_trivia_is_explicit() -> Bool:
@@ -64,27 +85,97 @@ func test_token_trivia_is_explicit() -> Bool:
 		"-- doc",
 		span_between(src, 10, 16),
 	)
-	token: Token = token_with_trivia(
-		IdentifierToken("main"),
-		span_between(src, 5, 9),
-		[leading],
+	tagged: TaggedPayload = tagged_payload_for(IdentifierToken("main"), 0)
+	trivia_start: Int = 0
+	trivia_table: List[Trivia] = append_trivia_run(
+		append_trivia_run([], [leading], False),
 		[trailing],
+		True,
 	)
+	token: Token = token_with_trivia_range(
+		tagged.tag,
+		tagged.id,
+		span_between(src, 5, 9),
+		trivia_start,
+		2,
+	)
+	(leading_trivia, trailing_trivia) = token_trivia_of(trivia_table, token)
+	span: SourceSpan = span_of(token, src.path, src.module_name)
 
 	(
-		token.leading_trivia.length() == 1
-		and token.trailing_trivia.length() == 1
-		and source_span_text(src, token.span) == "main"
+		leading_trivia.length() == 1
+		and trailing_trivia.length() == 1
+		and source_span_text(src, span) == "main"
 	)
 
 
 func test_eof_token_has_name() -> Bool:
 	src: SourceFile = fixture_source_file()
-	token: Token = token(
-		EndOfFileToken,
+	tagged: TaggedPayload = tagged_payload_for(EndOfFileToken, -1)
+	token: Token = token_with_trivia_range(
+		tagged.tag,
+		tagged.id,
 		span_between(src, src.text.length(), src.text.length()),
+		0,
+		0,
 	)
-	token_kind_name(token.kind) == "end of file"
+
+	token_kind_name(token_kind_of([], token)) == "end of file"
+
+
+-- Two occurrences of the same text intern to the same id and share one
+-- entry in the published text table -- the identifier/literal text table
+-- is deduplicated, not one heap object per occurrence. This is the exact
+-- lookup-or-insert pattern `lex` runs inline on its own `texts`/`by_text`
+-- locals, at the one site, so both updates land in place.
+func test_intern_text_deduplicates_identical_text() -> Bool:
+	var texts: List[String] = []
+	var by_text: Dict[String, Int] = dict()
+
+	first_id: Int = match by_text.get("alpha"):
+		Some(id):
+			id
+		None:
+			id: Int = texts.length()
+			texts = texts.append("alpha")
+			by_text = by_text.set("alpha", id)
+			id
+
+	second_id: Int = match by_text.get("alpha"):
+		Some(id):
+			id
+		None:
+			id: Int = texts.length()
+			texts = texts.append("alpha")
+			by_text = by_text.set("alpha", id)
+			id
+
+	third_id: Int = match by_text.get("beta"):
+		Some(id):
+			id
+		None:
+			id: Int = texts.length()
+			texts = texts.append("beta")
+			by_text = by_text.set("beta", id)
+			id
+
+	fourth_id: Int = match by_text.get("alpha"):
+		Some(id):
+			id
+		None:
+			id: Int = texts.length()
+			texts = texts.append("alpha")
+			by_text = by_text.set("alpha", id)
+			id
+
+	(
+		first_id == second_id
+		and first_id == fourth_id
+		and third_id != first_id
+		and texts.length() == 2
+		and texts.get(first_id) == Some("alpha")
+		and texts.get(third_id) == Some("beta")
+	)
 
 
 tests: TestSuite = {
@@ -94,5 +185,6 @@ tests: TestSuite = {
 		("token text comes from span", test_token_text_comes_from_span),
 		("token trivia is explicit", test_token_trivia_is_explicit),
 		("eof token has name", test_eof_token_has_name),
+		("intern_text deduplicates identical text", test_intern_text_deduplicates_identical_text),
 	]
 }

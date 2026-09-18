@@ -89,23 +89,28 @@ import:
 			UnderscoreSymbol,
 		),
 		Token,
-		TokenKind(
-			CharLiteralToken,
-			DedentToken,
-			DocStringToken,
-			EndOfFileToken,
-			FloatLiteralToken,
-			IdentifierToken,
-			IndentToken,
-			IntLiteralToken,
-			KeywordToken,
-			NewlineToken,
-			StringLiteralToken,
-			SymbolToken,
+		TokenTag(
+			CharLiteralTag,
+			DedentTag,
+			DocStringTag,
+			EndOfFileTag,
+			FloatLiteralTag,
+			IdentifierTag,
+			IndentTag,
+			IntLiteralTag,
+			KeywordTag,
+			NewlineTag,
+			StringLiteralTag,
+			SymbolTag,
 		),
+		interned_text,
+		keyword_from_ordinal,
 		keyword_text,
+		symbol_from_ordinal,
 		symbol_text,
-		token,
+		unpacked_string_literal_kind,
+		unpacked_string_literal_text_id,
+	list: list
 	parsed_ast:
 		ParsedBinaryOp(
 			ParsedAddOp,
@@ -316,9 +321,26 @@ private pure func parsed_string_literal_form(kind: StringLiteralKind) -> ParsedS
 			ParsedPlainStringLiteral
 
 
+-- Token storage as columns (struct of arrays) instead of a `List[Token]`
+-- (array of structs): reading one field of one token -- the common case,
+-- several times per parse decision -- is one scalar list index instead
+-- of copying all ten fields out of an inline list to reach one of them.
+-- Built once from the lexer's `List[Token]` by `initial_state`.
 private record ParserInput {
 	source: SourceFile,
-	tokens: List[Token]
+	tags: List[TokenTag],
+	payloads: List[Int],
+	start_offsets: List[Int],
+	start_lines: List[Int],
+	start_columns: List[Int],
+	end_offsets: List[Int],
+	end_lines: List[Int],
+	end_columns: List[Int],
+	trivia_starts: List[Int],
+	trivia_counts: List[Int],
+	texts: List[String],
+	path: String,
+	module_name: String
 }
 
 
@@ -694,11 +716,16 @@ private record ParseBodyStep {
 }
 
 
+-- `span` is a `TokenRange`, not yet materialized: most callers only need
+-- `matched`/`index`, and `expect_symbol` is called ~80 times across the
+-- parser, so deferring the `SourceSpan` build to the few call sites that
+-- actually read `.span` avoids constructing one for every call that
+-- doesn't.
 private record ParseSymbolStep {
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 	matched: Bool,
-	span: SourceSpan
+	span: TokenRange
 }
 
 
@@ -735,55 +762,185 @@ private struct ParsedInfixInfo {
 }
 
 
-private pure func initial_state(source: SourceFile, tokens: List[Token]) -> ParserInput:
+-- Builds `ParserInput`'s column storage from the lexer's `List[Token]` in
+-- one linear pass. Splitting into columns here (once, O(token count)) is
+-- what lets every read during parsing -- there are several per token,
+-- and the parser reads the same index more than once per decision -- be
+-- a single scalar list index instead of copying a whole ten-field
+-- struct out of an inline list only to read one of its fields.
+private pure func initial_state(
+	source: SourceFile,
+	tokens: List[Token],
+	texts: List[String],
+	path: String,
+	module_name: String,
+) -> ParserInput:
+	capacity: Int = tokens.length()
+	var tags: List[TokenTag] = list(capacity)
+	var payloads: List[Int] = list(capacity)
+	var start_offsets: List[Int] = list(capacity)
+	var start_lines: List[Int] = list(capacity)
+	var start_columns: List[Int] = list(capacity)
+	var end_offsets: List[Int] = list(capacity)
+	var end_lines: List[Int] = list(capacity)
+	var end_columns: List[Int] = list(capacity)
+	var trivia_starts: List[Int] = list(capacity)
+	var trivia_counts: List[Int] = list(capacity)
+
+	for token in tokens:
+		tags = tags.append(token.kind)
+		payloads = payloads.append(token.payload)
+		start_offsets = start_offsets.append(token.start_offset)
+		start_lines = start_lines.append(token.start_line)
+		start_columns = start_columns.append(token.start_column)
+		end_offsets = end_offsets.append(token.end_offset)
+		end_lines = end_lines.append(token.end_line)
+		end_columns = end_columns.append(token.end_column)
+		trivia_starts = trivia_starts.append(token.trivia_start)
+		trivia_counts = trivia_counts.append(token.trivia_count)
+
 	{
 		source = source,
-		tokens = tokens
+		tags = tags,
+		payloads = payloads,
+		start_offsets = start_offsets,
+		start_lines = start_lines,
+		start_columns = start_columns,
+		end_offsets = end_offsets,
+		end_lines = end_lines,
+		end_columns = end_columns,
+		trivia_starts = trivia_starts,
+		trivia_counts = trivia_counts,
+		texts = texts,
+		path = path,
+		module_name = module_name
 	}
 
 
-private pure func eof_token(source: SourceFile) -> Token:
-	cursor = source_cursor_at(source, source.text.length())
-	token(
-		EndOfFileToken,
-		source_empty_span(source, cursor),
-	)
+private pure func eof_span(state: ParserInput) -> SourceSpan:
+	cursor = source_cursor_at(state.source, state.source.text.length())
+
+	source_empty_span(state.source, cursor)
 
 
-private pure func current_token(state: ParserInput, index: Int) -> Token:
-	match state.tokens.get(index):
-		Some(token):
-			token
+private pure func current_tag(state: ParserInput, index: Int) -> TokenTag:
+	match state.tags.get(index):
+		Some(tag):
+			tag
 		None:
-			eof_token(state.source)
+			EndOfFileTag
 
 
-private pure func token_at(state: ParserInput, index: Int) -> Token:
-	match state.tokens.get(index):
-		Some(token):
-			token
-		None:
-			eof_token(state.source)
+private pure func tag_at(state: ParserInput, index: Int) -> TokenTag:
+	current_tag(state, index)
 
 
-private pure func current_token_kind(state: ParserInput, index: Int) -> TokenKind:
-	match state.tokens.get(index):
-		Some(token):
-			token.kind
-		None:
-			EndOfFileToken
-
-
-private pure func token_kind_at(state: ParserInput, index: Int) -> TokenKind:
-	match state.tokens.get(index):
-		Some(token):
-			token.kind
-		None:
-			EndOfFileToken
+private pure func current_payload(state: ParserInput, index: Int) -> Int:
+	state.payloads.get_or(index, -1)
 
 
 private pure func current_span(state: ParserInput, index: Int) -> SourceSpan:
-	current_token(state, index).span
+	match state.start_offsets.get(index):
+		Some(start_offset):
+			{
+				path = state.path,
+				module_name = state.module_name,
+				start_offset = start_offset,
+				start_line = state.start_lines.get_or(index, 0),
+				start_column = state.start_columns.get_or(index, 0),
+				end_offset = state.end_offsets.get_or(index, 0),
+				end_line = state.end_lines.get_or(index, 0),
+				end_column = state.end_columns.get_or(index, 0)
+			}
+		None:
+			eof_span(state)
+
+
+-- A span not yet materialized: the `[first, last]` token indices it will
+-- cover. Two `Int`s, stack-passed, never a heap allocation -- unlike
+-- `SourceSpan`, threading a `TokenRange` through the recursive descent
+-- (and merging with `token_range_cover`) costs nothing. Call
+-- `materialize_span` exactly once, at the point a real `SourceSpan` is
+-- required: building a `ParsedXxx` node's `span` field or a diagnostic.
+private struct TokenRange {
+	first: Int,
+	last: Int
+}
+
+
+private pure func current_token_range(state: ParserInput, index: Int) -> TokenRange:
+	{
+		first = index,
+		last = index
+	}
+
+
+private pure func token_range_cover(a: TokenRange, b: TokenRange) -> TokenRange:
+	first: Int = if a.first < b.first:
+		a.first
+	else:
+		b.first
+
+	last: Int = if a.last > b.last:
+		a.last
+	else:
+		b.last
+
+	{
+		first = first,
+		last = last
+	}
+
+
+private pure func materialize_span(state: ParserInput, range: TokenRange) -> SourceSpan:
+	start_offset: Int = state.start_offsets.get_or(range.first, 0)
+	start_line: Int = state.start_lines.get_or(range.first, 0)
+	start_column: Int = state.start_columns.get_or(range.first, 0)
+	end_offset: Int = state.end_offsets.get_or(range.last, 0)
+	end_line: Int = state.end_lines.get_or(range.last, 0)
+	end_column: Int = state.end_columns.get_or(range.last, 0)
+
+	{
+		path = state.path,
+		module_name = state.module_name,
+		start_offset = start_offset,
+		start_line = start_line,
+		start_column = start_column,
+		end_offset = end_offset,
+		end_line = end_line,
+		end_column = end_column
+	}
+
+
+-- Text for an identifier / int-literal / float-literal / docstring token:
+-- an indexed read of the interned `texts` table (retains, does not
+-- allocate). Callers only reach this from a match arm that already knows
+-- `current_tag`/`tag_at` picked one of those tags.
+private pure func current_text(state: ParserInput, index: Int) -> String:
+	interned_text(
+		state.texts,
+		current_payload(state, index),
+	)
+
+
+private pure func current_keyword(state: ParserInput, index: Int) -> Keyword:
+	keyword_from_ordinal(current_payload(state, index))
+
+
+private pure func current_symbol(state: ParserInput, index: Int) -> Symbol:
+	symbol_from_ordinal(current_payload(state, index))
+
+
+private pure func current_string_literal_kind(state: ParserInput, index: Int) -> StringLiteralKind:
+	unpacked_string_literal_kind(current_payload(state, index))
+
+
+private pure func current_string_literal_text(state: ParserInput, index: Int) -> String:
+	interned_text(state.texts, unpacked_string_literal_text_id(current_payload(state, index)))
+
+
+private pure func current_char_code_point(state: ParserInput, index: Int) -> Int:
+	current_payload(state, index)
 
 
 private pure func span_cover(start_span: SourceSpan, end_span: SourceSpan) -> SourceSpan:
@@ -810,8 +967,8 @@ private pure func add_expected_error(
 
 
 private pure func current_is_eof(state: ParserInput, index: Int) -> Bool:
-	match current_token_kind(state, index):
-		EndOfFileToken:
+	match current_tag(state, index):
+		EndOfFileTag:
 			True
 		_:
 			False
@@ -825,24 +982,24 @@ private pure func advance_parser(state: ParserInput, index: Int) -> Int:
 
 
 private pure func current_is_newline(state: ParserInput, index: Int) -> Bool:
-	match current_token_kind(state, index):
-		NewlineToken:
+	match current_tag(state, index):
+		NewlineTag:
 			True
 		_:
 			False
 
 
 private pure func current_is_indent(state: ParserInput, index: Int) -> Bool:
-	match current_token_kind(state, index):
-		IndentToken:
+	match current_tag(state, index):
+		IndentTag:
 			True
 		_:
 			False
 
 
 private pure func current_is_dedent(state: ParserInput, index: Int) -> Bool:
-	match current_token_kind(state, index):
-		DedentToken:
+	match current_tag(state, index):
+		DedentTag:
 			True
 		_:
 			False
@@ -858,33 +1015,25 @@ private pure func skip_newlines(state: ParserInput, index: Int) -> Int:
 
 
 private pure func current_is_keyword(state: ParserInput, index: Int, expected: Keyword) -> Bool:
-	match current_token_kind(state, index):
-		KeywordToken(actual):
-			actual == expected
+	match current_tag(state, index):
+		KeywordTag:
+			current_keyword(state, index) == expected
 		_:
 			False
 
 
 private pure func next_is_keyword(state: ParserInput, index: Int, expected: Keyword) -> Bool:
-	match token_kind_at(state, index + 1):
-		KeywordToken(actual):
-			actual == expected
+	match tag_at(state, index + 1):
+		KeywordTag:
+			current_keyword(state, index + 1) == expected
 		_:
 			False
 
 
 private pure func current_is_symbol(state: ParserInput, index: Int, expected: Symbol) -> Bool:
-	match current_token_kind(state, index):
-		SymbolToken(actual):
-			actual == expected
-		_:
-			False
-
-
-private pure func token_kind_is_symbol(kind: TokenKind, expected: Symbol) -> Bool:
-	match kind:
-		SymbolToken(actual):
-			actual == expected
+	match current_tag(state, index):
+		SymbolTag:
+			current_symbol(state, index) == expected
 		_:
 			False
 
@@ -896,14 +1045,14 @@ A reserved keyword counts as a binder name here so `(alias, rest) = pair`
 reaches the binder parser and reports the reserved-keyword rule instead of
 failing as a tuple expression.
 ---
-private pure func token_kind_is_tuple_binder_name(kind: TokenKind) -> Bool:
-	match kind:
-		IdentifierToken(_):
+private pure func token_is_tuple_binder_name_at(state: ParserInput, index: Int) -> Bool:
+	match tag_at(state, index):
+		IdentifierTag:
 			True
-		SymbolToken(UnderscoreSymbol):
-			True
-		KeywordToken(keyword):
-			keyword_is_reserved_name(keyword)
+		SymbolTag:
+			current_symbol(state, index) == UnderscoreSymbol
+		KeywordTag:
+			keyword_is_reserved_name(current_keyword(state, index))
 		_:
 			False
 
@@ -1027,17 +1176,17 @@ private pure func current_is_soft_boundary(state: ParserInput, index: Int) -> Bo
 	):
 		True
 	else:
-		match current_token_kind(state, index):
-			SymbolToken(ColonSymbol):
-				True
-			SymbolToken(CommaSymbol):
-				True
-			SymbolToken(LeftParenSymbol):
-				True
-			SymbolToken(RightBracketSymbol):
-				True
-			SymbolToken(RightParenSymbol):
-				True
+		match current_tag(state, index):
+			SymbolTag:
+				symbol: Symbol = current_symbol(state, index)
+
+				(
+					symbol == ColonSymbol
+					or symbol == CommaSymbol
+					or symbol == LeftParenSymbol
+					or symbol == RightBracketSymbol
+					or symbol == RightParenSymbol
+				)
 			_:
 				False
 
@@ -1049,27 +1198,27 @@ private pure func expect_symbol(
 	symbol: Symbol,
 	message: String,
 ) -> ParseSymbolStep:
-	span: SourceSpan = current_span(state, index)
+	range: TokenRange = current_token_range(state, index)
 
 	if current_is_symbol(state, index, symbol):
 		{
 			index = advance_parser(state, index),
 			diagnostics = diagnostics,
 			matched = True,
-			span = span
+			span = range
 		}
 	else:
 		{
 			index = index,
 			diagnostics = add_expected_error(
 				diagnostics,
-				span,
+				materialize_span(state, range),
 				message,
 				[symbol_text(symbol)],
 				None,
 			),
 			matched = False,
-			span = span
+			span = range
 		}
 
 
@@ -1128,11 +1277,15 @@ private pure func current_is_block_end(state: ParserInput, index: Int) -> Bool:
 
 
 private pure func type_keyword_identifier_text(state: ParserInput, index: Int) -> Option[String]:
-	match current_token_kind(state, index):
-		KeywordToken(SelfKeyword):
-			Some("Self")
-		KeywordToken(VoidKeyword):
-			Some("void")
+	match current_tag(state, index):
+		KeywordTag:
+			match current_keyword(state, index):
+				SelfKeyword:
+					Some("Self")
+				VoidKeyword:
+					Some("void")
+				_:
+					None
 		_:
 			None
 
@@ -1215,28 +1368,33 @@ private pure func parse_identifier_expected(
 	diagnostics: List[ParseDiagnostic],
 	expected: String,
 ) -> ParseIdentifierStep:
-	token: Token = current_token(state, index)
+	span: SourceSpan = current_span(state, index)
 
-	match token.kind:
-		IdentifierToken(text):
+	match current_tag(state, index):
+		IdentifierTag:
 			{
 				index = advance_parser(state, index),
 				diagnostics = diagnostics,
-				value = parsed_identifier(text, token.span)
+				value = parsed_identifier(
+					current_text(state, index),
+					span,
+				)
 			}
-		KeywordToken(keyword):
+		KeywordTag:
+			keyword: Keyword = current_keyword(state, index)
+
 			match soft_keyword_identifier_text(keyword):
 				Some(text):
 					{
 						index = advance_parser(state, index),
 						diagnostics = diagnostics,
-						value = parsed_identifier(text, token.span)
+						value = parsed_identifier(text, span)
 					}
 				None:
 					next_state: Int = index
 					next_state_diag: List[ParseDiagnostic] = add_expected_error(
 						diagnostics,
-						token.span,
+						span,
 						"expected ${expected}",
 						[expected],
 						None,
@@ -1250,13 +1408,13 @@ private pure func parse_identifier_expected(
 					{
 						index = recovery_state,
 						diagnostics = next_state_diag,
-						value = parsed_identifier("", token.span)
+						value = parsed_identifier("", span)
 					}
 		_:
 			next_state: Int = index
 			next_state_diag: List[ParseDiagnostic] = add_expected_error(
 				diagnostics,
-				token.span,
+				span,
 				"expected ${expected}",
 				[expected],
 				None,
@@ -1270,7 +1428,7 @@ private pure func parse_identifier_expected(
 			{
 				index = recovery_state,
 				diagnostics = next_state_diag,
-				value = parsed_identifier("", token.span)
+				value = parsed_identifier("", span)
 			}
 
 
@@ -1289,12 +1447,18 @@ private pure func parse_declared_name_expected(
 	diagnostics: List[ParseDiagnostic],
 	expected: String,
 ) -> ParseIdentifierStep:
-	token: Token = current_token(state, index)
+	match current_tag(state, index):
+		KeywordTag:
+			keyword: Keyword = current_keyword(state, index)
 
-	match token.kind:
-		KeywordToken(keyword):
 			if keyword_is_reserved_name(keyword):
-				parse_reserved_keyword_as_name(state, index, diagnostics, keyword, token.span)
+				parse_reserved_keyword_as_name(
+					state,
+					index,
+					diagnostics,
+					keyword,
+					current_span(state, index),
+				)
 			else:
 				parse_identifier_expected(state, index, diagnostics, expected)
 		_:
@@ -1307,10 +1471,8 @@ private pure func parse_type_identifier_expected(
 	diagnostics: List[ParseDiagnostic],
 	expected: String,
 ) -> ParseIdentifierStep:
-	token: Token = current_token(state, index)
-
-	match token.kind:
-		IdentifierToken(_):
+	match current_tag(state, index):
+		IdentifierTag:
 			parse_identifier_expected(state, index, diagnostics, expected)
 		_:
 			match type_keyword_identifier_text(state, index):
@@ -1318,7 +1480,10 @@ private pure func parse_type_identifier_expected(
 					{
 						index = advance_parser(state, index),
 						diagnostics = diagnostics,
-						value = parsed_identifier(text, token.span)
+						value = parsed_identifier(
+							text,
+							current_span(state, index),
+						)
 					}
 				None:
 					parse_identifier_expected(state, index, diagnostics, expected)
@@ -1428,31 +1593,47 @@ private pure func parse_hash_identifier_expected(
 	st: Int = expect_step.index
 	st_diag: List[ParseDiagnostic] = expect_step.diagnostics
 
-	match current_token_kind(state, st):
-		IdentifierToken(text):
+	match current_tag(state, st):
+		IdentifierTag:
 			{
 				index = advance_parser(state, st),
 				diagnostics = st_diag,
 				value = parsed_identifier(
-					"#" + text,
+					"#" + current_text(state, st),
 					span_cover(
 						start_span,
 						current_span(state, st),
 					),
 				)
 			}
-		SymbolToken(UnderscoreSymbol):
-			{
-				index = advance_parser(state, st),
-				diagnostics = st_diag,
-				value = parsed_identifier(
-					"#_",
-					span_cover(
-						start_span,
-						current_span(state, st),
-					),
+		SymbolTag:
+			if current_symbol(state, st) == UnderscoreSymbol:
+				{
+					index = advance_parser(state, st),
+					diagnostics = st_diag,
+					value = parsed_identifier(
+						"#_",
+						span_cover(
+							start_span,
+							current_span(state, st),
+						),
+					)
+				}
+			else:
+				next_state: Int = st
+				next_state_diag: List[ParseDiagnostic] = add_expected_error(
+					st_diag,
+					current_span(state, st),
+					"expected ${expected}",
+					[expected],
+					None,
 				)
-			}
+
+				{
+					index = next_state,
+					diagnostics = next_state_diag,
+					value = parsed_identifier("#", start_span)
+				}
 		_:
 			next_state: Int = st
 			next_state_diag: List[ParseDiagnostic] = add_expected_error(
@@ -1470,129 +1651,176 @@ private pure func parse_hash_identifier_expected(
 			}
 
 
+private pure func parse_dim_hash_suffix(
+	state: ParserInput,
+	st_in: Int,
+	start_span: SourceSpan,
+	diagnostics: List[ParseDiagnostic],
+) -> ParseTypeStep:
+	match current_tag(state, st_in):
+		IdentifierTag:
+			var st: Int = st_in
+			name: ParsedIdentifier = parsed_identifier(
+				"#" + current_text(state, st),
+				span_cover(
+					start_span,
+					current_span(state, st),
+				),
+			)
+			st = advance_parser(state, st)
+			var is_variadic: Bool = False
+			var end_span: SourceSpan = name.span
+
+			if current_is_symbol(state, st, DotDotDotSymbol):
+				is_variadic = True
+				end_span = current_span(state, st)
+				st = advance_parser(state, st)
+
+			{
+				index = st,
+				diagnostics = diagnostics,
+				value = ParsedDimNameType(
+					name,
+					is_variadic,
+					span_cover(start_span, end_span),
+				)
+			}
+		IntLiteralTag:
+			{
+				index = advance_parser(state, st_in),
+				diagnostics = diagnostics,
+				value = ParsedDimLiteralType(
+					current_text(state, st_in),
+					span_cover(
+						start_span,
+						current_span(state, st_in),
+					),
+				)
+			}
+		SymbolTag:
+			if current_symbol(state, st_in) == UnderscoreSymbol:
+				var st: Int = st_in
+				name: ParsedIdentifier = parsed_identifier(
+					"#_",
+					span_cover(
+						start_span,
+						current_span(state, st),
+					),
+				)
+				st = advance_parser(state, st)
+				var is_variadic: Bool = False
+				var end_span: SourceSpan = name.span
+
+				if current_is_symbol(state, st, DotDotDotSymbol):
+					is_variadic = True
+					end_span = current_span(state, st)
+					st = advance_parser(state, st)
+
+				{
+					index = st,
+					diagnostics = diagnostics,
+					value = ParsedDimNameType(
+						name,
+						is_variadic,
+						span_cover(start_span, end_span),
+					)
+				}
+			else:
+				next_state: Int = st_in
+				next_state_diag: List[ParseDiagnostic] = add_expected_error(
+					diagnostics,
+					current_span(state, st_in),
+					"expected dimension name or literal after `#`",
+					["dimension"],
+					None,
+				)
+
+				{
+					index = next_state,
+					diagnostics = next_state_diag,
+					value = ParsedMissingType(start_span)
+				}
+		_:
+			next_state: Int = st_in
+			next_state_diag: List[ParseDiagnostic] = add_expected_error(
+				diagnostics,
+				current_span(state, st_in),
+				"expected dimension name or literal after `#`",
+				["dimension"],
+				None,
+			)
+
+			{
+				index = next_state,
+				diagnostics = next_state_diag,
+				value = ParsedMissingType(start_span)
+			}
+
+
 private pure func parse_dim_atom(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 ) -> ParseTypeStep:
-	token: Token = current_token(state, index)
+	match current_tag(state, index):
+		SymbolTag:
+			symbol: Symbol = current_symbol(state, index)
 
-	match token.kind:
-		SymbolToken(HashSymbol):
-			start_span: SourceSpan = token.span
-			var st: Int = advance_parser(state, index)
-			var st_diag: List[ParseDiagnostic] = diagnostics
+			if symbol == HashSymbol:
+				parse_dim_hash_suffix(
+					state,
+					advance_parser(state, index),
+					current_span(state, index),
+					diagnostics,
+				)
+			else if symbol == LeftParenSymbol:
+				dim_step: ParseTypeStep = parse_dim_expr(
+					state,
+					advance_parser(state, index),
+					diagnostics,
+				)
+				right_step: ParseSymbolStep = expect_symbol(
+					state,
+					dim_step.index,
+					dim_step.diagnostics,
+					RightParenSymbol,
+					"expected `)` after dimension expression",
+				)
 
-			match current_token_kind(state, st):
-				IdentifierToken(text):
-					name: ParsedIdentifier = parsed_identifier(
-						"#" + text,
-						span_cover(
-							start_span,
-							current_span(state, st),
-						),
-					)
-					st = advance_parser(state, st)
-					var is_variadic: Bool = False
-					var end_span: SourceSpan = name.span
+				{
+					index = right_step.index,
+					diagnostics = right_step.diagnostics,
+					value = dim_step.value
+				}
+			else:
+				next_state: Int = index
+				next_state_diag: List[ParseDiagnostic] = add_expected_error(
+					diagnostics,
+					current_span(state, index),
+					"expected dimension expression",
+					["dimension"],
+					None,
+				)
 
-					if current_is_symbol(state, st, DotDotDotSymbol):
-						is_variadic = True
-						end_span = current_span(state, st)
-						st = advance_parser(state, st)
-
-					{
-						index = st,
-						diagnostics = st_diag,
-						value = ParsedDimNameType(
-							name,
-							is_variadic,
-							span_cover(start_span, end_span),
-						)
-					}
-				IntLiteralToken(text):
-					{
-						index = advance_parser(state, st),
-						diagnostics = st_diag,
-						value = ParsedDimLiteralType(
-							text,
-							span_cover(
-								start_span,
-								current_span(state, st),
-							),
-						)
-					}
-				SymbolToken(UnderscoreSymbol):
-					name: ParsedIdentifier = parsed_identifier(
-						"#_",
-						span_cover(
-							start_span,
-							current_span(state, st),
-						),
-					)
-					st = advance_parser(state, st)
-					var is_variadic: Bool = False
-					var end_span: SourceSpan = name.span
-
-					if current_is_symbol(state, st, DotDotDotSymbol):
-						is_variadic = True
-						end_span = current_span(state, st)
-						st = advance_parser(state, st)
-
-					{
-						index = st,
-						diagnostics = st_diag,
-						value = ParsedDimNameType(
-							name,
-							is_variadic,
-							span_cover(start_span, end_span),
-						)
-					}
-				_:
-					next_state: Int = st
-					next_state_diag: List[ParseDiagnostic] = add_expected_error(
-						st_diag,
-						current_span(state, st),
-						"expected dimension name or literal after `#`",
-						["dimension"],
-						None,
-					)
-
-					{
-						index = next_state,
-						diagnostics = next_state_diag,
-						value = ParsedMissingType(start_span)
-					}
-		IntLiteralToken(text):
+				{
+					index = next_state,
+					diagnostics = next_state_diag,
+					value = ParsedMissingType(current_span(state, index))
+				}
+		IntLiteralTag:
 			{
 				index = advance_parser(state, index),
 				diagnostics = diagnostics,
-				value = ParsedDimLiteralType(text, token.span)
-			}
-		SymbolToken(LeftParenSymbol):
-			dim_step: ParseTypeStep = parse_dim_expr(
-				state,
-				advance_parser(state, index),
-				diagnostics,
-			)
-			right_step: ParseSymbolStep = expect_symbol(
-				state,
-				dim_step.index,
-				dim_step.diagnostics,
-				RightParenSymbol,
-				"expected `)` after dimension expression",
-			)
-
-			{
-				index = right_step.index,
-				diagnostics = right_step.diagnostics,
-				value = dim_step.value
+				value = ParsedDimLiteralType(
+					current_text(state, index),
+					current_span(state, index),
+				)
 			}
 		_:
 			next_state: Int = index
 			next_state_diag: List[ParseDiagnostic] = add_expected_error(
 				diagnostics,
-				token.span,
+				current_span(state, index),
 				"expected dimension expression",
 				["dimension"],
 				None,
@@ -1601,7 +1829,7 @@ private pure func parse_dim_atom(
 			{
 				index = next_state,
 				diagnostics = next_state_diag,
-				value = ParsedMissingType(token.span)
+				value = ParsedMissingType(current_span(state, index))
 			}
 
 
@@ -1771,7 +1999,7 @@ private pure func parse_type_array_suffixes(
 			)
 
 		end_span: SourceSpan = if right_step.matched:
-			right_step.span
+			materialize_span(state, right_step.span)
 		else:
 			last_type_expr_span(dims_step.values, parsed_type_expr_span(value))
 
@@ -1794,8 +2022,8 @@ private pure func parse_named_type_expr_with_bounds(
 	diagnostics: List[ParseDiagnostic],
 	allow_bounds: Bool,
 ) -> ParseTypeStep:
-	can_qualify: Bool = match current_token_kind(state, index):
-		IdentifierToken(_):
+	can_qualify: Bool = match current_tag(state, index):
+		IdentifierTag:
 			True
 		_:
 			False
@@ -1868,7 +2096,7 @@ private pure func parse_named_type_expr_with_bounds(
 			end_span = last_type_expr_span(args, end_span)
 
 			if right_step.matched:
-				end_span = right_step.span
+				end_span = materialize_span(state, right_step.span)
 
 		base_type: ParsedTypeExpr = match qualifier:
 			Some(module_name):
@@ -1929,10 +2157,16 @@ private pure func parse_parenthesized_type_expr(
 		void_type: ParsedTypeExpr = ParsedNamedType(
 			parsed_identifier(
 				"Void",
-				span_cover(start_span, right_step.span),
+				span_cover(
+					start_span,
+					materialize_span(state, right_step.span),
+				),
 			),
 			[],
-			span_cover(start_span, right_step.span),
+			span_cover(
+				start_span,
+				materialize_span(state, right_step.span),
+			),
 		)
 
 		if current_is_symbol(state, st, ArrowSymbol):
@@ -1993,7 +2227,10 @@ private pure func parse_parenthesized_type_expr(
 			if items_step.values.length() > 4:
 				st_diag = add_tuple_arity_error(
 					st_diag,
-					span_cover(start_span, right_step.span),
+					span_cover(
+						start_span,
+						materialize_span(state, right_step.span),
+					),
 				)
 
 			base_type: ParsedTypeExpr = if items_step.values.length() == 1:
@@ -2005,7 +2242,10 @@ private pure func parse_parenthesized_type_expr(
 			else:
 				ParsedTupleType(
 					items_step.values,
-					span_cover(start_span, right_step.span),
+					span_cover(
+						start_span,
+						materialize_span(state, right_step.span),
+					),
 				)
 
 			parse_type_array_suffixes(state, st, st_diag, base_type)
@@ -2099,13 +2339,18 @@ private pure func parse_range_type_expr(
 
 
 private pure func token_index_starts_dim_atom(state: ParserInput, index: Int) -> Bool:
-	match token_kind_at(state, index):
-		SymbolToken(HashSymbol):
+	match tag_at(state, index):
+		SymbolTag:
+			symbol: Symbol = current_symbol(state, index)
+
+			if symbol == HashSymbol:
+				True
+			else if symbol == LeftParenSymbol:
+				token_index_starts_dim_atom(state, index + 1)
+			else:
+				False
+		IntLiteralTag:
 			True
-		IntLiteralToken(_):
-			True
-		SymbolToken(LeftParenSymbol):
-			token_index_starts_dim_atom(state, index + 1)
 		_:
 			False
 
@@ -2117,54 +2362,67 @@ private pure func starts_parenthesized_dim_expr(state: ParserInput, index: Int) 
 	)
 
 
+private pure func parse_type_expr_missing(
+	state: ParserInput,
+	index: Int,
+	diagnostics: List[ParseDiagnostic],
+) -> ParseTypeStep:
+	next_state_diag: List[ParseDiagnostic] = add_expected_error(
+		diagnostics,
+		current_span(state, index),
+		"expected type",
+		[EXPECTED_TYPE],
+		None,
+	)
+
+	recovery_state: Int = if current_is_soft_boundary(state, index):
+		index
+	else:
+		advance_parser(state, index)
+
+	{
+		index = recovery_state,
+		diagnostics = next_state_diag,
+		value = ParsedMissingType(current_span(state, index))
+	}
+
+
 private pure func parse_type_expr_allow_bounds(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 	allow_bounds: Bool,
 ) -> ParseTypeStep:
-	token: Token = current_token(state, index)
+	match current_tag(state, index):
+		IdentifierTag:
+			parse_named_type_expr_with_bounds(state, index, diagnostics, allow_bounds)
+		KeywordTag:
+			keyword: Keyword = current_keyword(state, index)
 
-	match token.kind:
-		IdentifierToken(_):
-			parse_named_type_expr_with_bounds(state, index, diagnostics, allow_bounds)
-		KeywordToken(SelfKeyword):
-			parse_named_type_expr_with_bounds(state, index, diagnostics, allow_bounds)
-		KeywordToken(VoidKeyword):
-			parse_named_type_expr_with_bounds(state, index, diagnostics, allow_bounds)
-		KeywordToken(PureKeyword):
-			parse_pure_function_type_expr(state, index, diagnostics)
-		SymbolToken(HashSymbol):
-			parse_dim_expr(state, index, diagnostics)
-		IntLiteralToken(_):
-			parse_dim_expr(state, index, diagnostics)
-		SymbolToken(DotDotSymbol):
-			parse_range_type_expr(state, index, diagnostics)
-		SymbolToken(LeftParenSymbol):
-			if starts_parenthesized_dim_expr(state, index):
+			if keyword == SelfKeyword or keyword == VoidKeyword:
+				parse_named_type_expr_with_bounds(state, index, diagnostics, allow_bounds)
+			else if keyword == PureKeyword:
+				parse_pure_function_type_expr(state, index, diagnostics)
+			else:
+				parse_type_expr_missing(state, index, diagnostics)
+		SymbolTag:
+			symbol: Symbol = current_symbol(state, index)
+
+			if symbol == HashSymbol:
 				parse_dim_expr(state, index, diagnostics)
+			else if symbol == DotDotSymbol:
+				parse_range_type_expr(state, index, diagnostics)
+			else if symbol == LeftParenSymbol:
+				if starts_parenthesized_dim_expr(state, index):
+					parse_dim_expr(state, index, diagnostics)
+				else:
+					parse_parenthesized_type_expr(state, index, diagnostics)
 			else:
-				parse_parenthesized_type_expr(state, index, diagnostics)
+				parse_type_expr_missing(state, index, diagnostics)
+		IntLiteralTag:
+			parse_dim_expr(state, index, diagnostics)
 		_:
-			next_state: Int = index
-			next_state_diag: List[ParseDiagnostic] = add_expected_error(
-				diagnostics,
-				token.span,
-				"expected type",
-				[EXPECTED_TYPE],
-				None,
-			)
-
-			recovery_state: Int = if current_is_soft_boundary(state, next_state):
-				next_state
-			else:
-				advance_parser(state, next_state)
-
-			{
-				index = recovery_state,
-				diagnostics = next_state_diag,
-				value = ParsedMissingType(token.span)
-			}
+			parse_type_expr_missing(state, index, diagnostics)
 
 
 private pure func parse_type_expr(
@@ -2235,55 +2493,59 @@ private pure func parse_named_or_wildcard_param(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 ) -> ParseParamStep:
-	token: Token = current_token(state, index)
-
-	match token.kind:
-		SymbolToken(UnderscoreSymbol):
-			underscore: ParsedIdentifier = parsed_identifier("_", token.span)
-			type_step: ParseOptionalTypeStep = parse_optional_type_annotation(
-				state,
-				advance_parser(state, index),
-				diagnostics,
-			)
-
-			binder: ParsedParamBinder = match type_step.value:
-				Some(_):
-					ParsedParamNameBinder(underscore)
-				None:
-					ParsedParamWildcardBinder(token.span)
-
-			{
-				index = type_step.index,
-				diagnostics = type_step.diagnostics,
-				value = {
-					binder = binder,
-					type_expr = type_step.value,
-					span = param_span(binder, type_step.value)
-				}
-			}
+	is_underscore: Bool = match current_tag(state, index):
+		SymbolTag:
+			current_symbol(state, index) == UnderscoreSymbol
 		_:
-			name_step: ParseIdentifierStep = parse_declared_name_expected(
-				state,
-				index,
-				diagnostics,
-				EXPECTED_PARAMETER_NAME,
-			)
-			type_step: ParseOptionalTypeStep = parse_optional_type_annotation(
-				state,
-				name_step.index,
-				name_step.diagnostics,
-			)
-			binder: ParsedParamBinder = ParsedParamNameBinder(name_step.value)
+			False
 
-			{
-				index = type_step.index,
-				diagnostics = type_step.diagnostics,
-				value = {
-					binder = binder,
-					type_expr = type_step.value,
-					span = param_span(binder, type_step.value)
-				}
+	if is_underscore:
+		span: SourceSpan = current_span(state, index)
+		underscore: ParsedIdentifier = parsed_identifier("_", span)
+		type_step: ParseOptionalTypeStep = parse_optional_type_annotation(
+			state,
+			advance_parser(state, index),
+			diagnostics,
+		)
+
+		binder: ParsedParamBinder = match type_step.value:
+			Some(_):
+				ParsedParamNameBinder(underscore)
+			None:
+				ParsedParamWildcardBinder(span)
+
+		{
+			index = type_step.index,
+			diagnostics = type_step.diagnostics,
+			value = {
+				binder = binder,
+				type_expr = type_step.value,
+				span = param_span(binder, type_step.value)
 			}
+		}
+	else:
+		name_step: ParseIdentifierStep = parse_declared_name_expected(
+			state,
+			index,
+			diagnostics,
+			EXPECTED_PARAMETER_NAME,
+		)
+		type_step: ParseOptionalTypeStep = parse_optional_type_annotation(
+			state,
+			name_step.index,
+			name_step.diagnostics,
+		)
+		binder: ParsedParamBinder = ParsedParamNameBinder(name_step.value)
+
+		{
+			index = type_step.index,
+			diagnostics = type_step.diagnostics,
+			value = {
+				binder = binder,
+				type_expr = type_step.value,
+				span = param_span(binder, type_step.value)
+			}
+		}
 
 
 private pure func parse_param(
@@ -2643,21 +2905,27 @@ private pure func parse_binder_identifier_expected(
 	diagnostics: List[ParseDiagnostic],
 	expected: String,
 ) -> ParseIdentifierStep:
-	token: Token = current_token(state, index)
+	span: SourceSpan = current_span(state, index)
 
-	match token.kind:
-		IdentifierToken(text):
+	match current_tag(state, index):
+		IdentifierTag:
 			{
 				index = advance_parser(state, index),
 				diagnostics = diagnostics,
-				value = parsed_identifier(text, token.span)
+				value = parsed_identifier(
+					current_text(state, index),
+					span,
+				)
 			}
-		SymbolToken(UnderscoreSymbol):
-			{
-				index = advance_parser(state, index),
-				diagnostics = diagnostics,
-				value = parsed_identifier("_", token.span)
-			}
+		SymbolTag:
+			if current_symbol(state, index) == UnderscoreSymbol:
+				{
+					index = advance_parser(state, index),
+					diagnostics = diagnostics,
+					value = parsed_identifier("_", span)
+				}
+			else:
+				parse_declared_name_expected(state, index, diagnostics, expected)
 		_:
 			parse_declared_name_expected(state, index, diagnostics, expected)
 
@@ -2668,109 +2936,128 @@ private pure func parse_select_receive_identifier_expected(
 	diagnostics: List[ParseDiagnostic],
 	expected: String,
 ) -> ParseIdentifierStep:
-	token: Token = current_token(state, index)
+	span: SourceSpan = current_span(state, index)
 
-	match token.kind:
-		IdentifierToken(text):
+	match current_tag(state, index):
+		IdentifierTag:
 			{
 				index = advance_parser(state, index),
 				diagnostics = diagnostics,
-				value = parsed_identifier(text, token.span)
+				value = parsed_identifier(
+					current_text(state, index),
+					span,
+				)
 			}
-		SymbolToken(UnderscoreSymbol):
-			{
-				index = advance_parser(state, index),
-				diagnostics = diagnostics,
-				value = parsed_identifier("_", token.span)
-			}
-		KeywordToken(AfterKeyword):
-			{
-				index = advance_parser(state, index),
-				diagnostics = diagnostics,
-				value = parsed_identifier("after", token.span)
-			}
-		KeywordToken(FromKeyword):
-			{
-				index = advance_parser(state, index),
-				diagnostics = diagnostics,
-				value = parsed_identifier("from", token.span)
-			}
+		SymbolTag:
+			if current_symbol(state, index) == UnderscoreSymbol:
+				{
+					index = advance_parser(state, index),
+					diagnostics = diagnostics,
+					value = parsed_identifier("_", span)
+				}
+			else:
+				parse_declared_name_expected(state, index, diagnostics, expected)
+		KeywordTag:
+			keyword: Keyword = current_keyword(state, index)
+
+			if keyword == AfterKeyword:
+				{
+					index = advance_parser(state, index),
+					diagnostics = diagnostics,
+					value = parsed_identifier("after", span)
+				}
+			else if keyword == FromKeyword:
+				{
+					index = advance_parser(state, index),
+					diagnostics = diagnostics,
+					value = parsed_identifier("from", span)
+				}
+			else:
+				parse_declared_name_expected(state, index, diagnostics, expected)
 		_:
 			parse_declared_name_expected(state, index, diagnostics, expected)
 
 
 private pure func current_infix_info(state: ParserInput, index: Int) -> Option[ParsedInfixInfo]:
-	match current_token_kind(state, index):
-		KeywordToken(OrKeyword):
-			Some({
-				precedence = PREC_OR,
-				tag = InfixOrOp,
-			})
-		KeywordToken(AndKeyword):
-			Some({
-				precedence = PREC_AND,
-				tag = InfixAndOp,
-			})
-		SymbolToken(EqualEqualSymbol):
-			Some({
-				precedence = PREC_COMPARE,
-				tag = InfixEqualOp,
-			})
-		SymbolToken(NotEqualSymbol):
-			Some({
-				precedence = PREC_COMPARE,
-				tag = InfixNotEqualOp,
-			})
-		SymbolToken(LessSymbol):
-			Some({
-				precedence = PREC_COMPARE,
-				tag = InfixLessOp,
-			})
-		SymbolToken(LessEqualSymbol):
-			Some({
-				precedence = PREC_COMPARE,
-				tag = InfixLessEqualOp,
-			})
-		SymbolToken(GreaterSymbol):
-			Some({
-				precedence = PREC_COMPARE,
-				tag = InfixGreaterOp,
-			})
-		SymbolToken(GreaterEqualSymbol):
-			Some({
-				precedence = PREC_COMPARE,
-				tag = InfixGreaterEqualOp,
-			})
-		SymbolToken(DotDotSymbol):
-			Some({
-				precedence = PREC_RANGE,
-				tag = InfixRangeOp,
-			})
-		SymbolToken(PlusSymbol):
-			Some({
-				precedence = PREC_ADD,
-				tag = InfixAddOp,
-			})
-		SymbolToken(MinusSymbol):
-			Some({
-				precedence = PREC_ADD,
-				tag = InfixSubtractOp,
-			})
-		SymbolToken(StarSymbol):
-			Some({
-				precedence = PREC_MULTIPLY,
-				tag = InfixMultiplyOp,
-			})
-		SymbolToken(SlashSymbol):
-			Some({
-				precedence = PREC_MULTIPLY,
-				tag = InfixDivideOp,
-			})
-		SymbolToken(PercentSymbol):
-			Some({
-				precedence = PREC_MULTIPLY,
-				tag = InfixModuloOp,
-			})
+	match current_tag(state, index):
+		KeywordTag:
+			match current_keyword(state, index):
+				OrKeyword:
+					Some({
+						precedence = PREC_OR,
+						tag = InfixOrOp,
+					})
+				AndKeyword:
+					Some({
+						precedence = PREC_AND,
+						tag = InfixAndOp,
+					})
+				_:
+					None
+		SymbolTag:
+			match current_symbol(state, index):
+				EqualEqualSymbol:
+					Some({
+						precedence = PREC_COMPARE,
+						tag = InfixEqualOp,
+					})
+				NotEqualSymbol:
+					Some({
+						precedence = PREC_COMPARE,
+						tag = InfixNotEqualOp,
+					})
+				LessSymbol:
+					Some({
+						precedence = PREC_COMPARE,
+						tag = InfixLessOp,
+					})
+				LessEqualSymbol:
+					Some({
+						precedence = PREC_COMPARE,
+						tag = InfixLessEqualOp,
+					})
+				GreaterSymbol:
+					Some({
+						precedence = PREC_COMPARE,
+						tag = InfixGreaterOp,
+					})
+				GreaterEqualSymbol:
+					Some({
+						precedence = PREC_COMPARE,
+						tag = InfixGreaterEqualOp,
+					})
+				DotDotSymbol:
+					Some({
+						precedence = PREC_RANGE,
+						tag = InfixRangeOp,
+					})
+				PlusSymbol:
+					Some({
+						precedence = PREC_ADD,
+						tag = InfixAddOp,
+					})
+				MinusSymbol:
+					Some({
+						precedence = PREC_ADD,
+						tag = InfixSubtractOp,
+					})
+				StarSymbol:
+					Some({
+						precedence = PREC_MULTIPLY,
+						tag = InfixMultiplyOp,
+					})
+				SlashSymbol:
+					Some({
+						precedence = PREC_MULTIPLY,
+						tag = InfixDivideOp,
+					})
+				PercentSymbol:
+					Some({
+						precedence = PREC_MULTIPLY,
+						tag = InfixModuloOp,
+					})
+				_:
+					None
 		_:
 			None
 
@@ -2779,15 +3066,19 @@ private pure func current_compound_assign_op(
 	state: ParserInput,
 	index: Int,
 ) -> Option[ParsedCompoundAssignOp]:
-	match current_token_kind(state, index):
-		SymbolToken(PlusEqualSymbol):
-			Some(ParsedAssignAddOp)
-		SymbolToken(MinusEqualSymbol):
-			Some(ParsedAssignSubtractOp)
-		SymbolToken(StarEqualSymbol):
-			Some(ParsedAssignMultiplyOp)
-		SymbolToken(SlashEqualSymbol):
-			Some(ParsedAssignDivideOp)
+	match current_tag(state, index):
+		SymbolTag:
+			match current_symbol(state, index):
+				PlusEqualSymbol:
+					Some(ParsedAssignAddOp)
+				MinusEqualSymbol:
+					Some(ParsedAssignSubtractOp)
+				StarEqualSymbol:
+					Some(ParsedAssignMultiplyOp)
+				SlashEqualSymbol:
+					Some(ParsedAssignDivideOp)
+				_:
+					None
 		_:
 			None
 
@@ -2806,62 +3097,66 @@ private pure func colon_starts_typed_assignment(state: ParserInput, start_index:
 	var found_assignment: Bool = False
 
 	while not found_assignment:
-		token_kind: TokenKind = token_kind_at(state, index)
+		tag: TokenTag = tag_at(state, index)
 
-		match token_kind:
-			EndOfFileToken:
+		match tag:
+			EndOfFileTag:
 				break
-			NewlineToken:
+			NewlineTag:
 				break
-			DedentToken:
+			DedentTag:
 				break
-			SymbolToken(EqualSymbol):
-				if depth == 0:
-					found_assignment = True
-				else:
-					index += 1
-			SymbolToken(QuestionEqualsSymbol):
-				if depth == 0:
-					found_assignment = True
-				else:
-					index += 1
-			SymbolToken(LeftParenSymbol):
-				depth += 1
-				index += 1
-			SymbolToken(LeftBracketSymbol):
-				depth += 1
-				index += 1
-			SymbolToken(LeftBraceSymbol):
-				depth += 1
-				index += 1
-			SymbolToken(RightParenSymbol):
-				if depth == 0:
-					break
-				else:
-					depth -= 1
-					index += 1
-			SymbolToken(RightBracketSymbol):
-				if depth == 0:
-					break
-				else:
-					depth -= 1
-					index += 1
-			SymbolToken(RightBraceSymbol):
-				if depth == 0:
-					break
-				else:
-					depth -= 1
-					index += 1
-			SymbolToken(CommaSymbol):
-				if depth == 0:
-					break
-				else:
-					index += 1
-			SymbolToken(ColonSymbol):
-				if depth == 0:
-					break
-				else:
-					index += 1
+			SymbolTag:
+				match current_symbol(state, index):
+					EqualSymbol:
+						if depth == 0:
+							found_assignment = True
+						else:
+							index += 1
+					QuestionEqualsSymbol:
+						if depth == 0:
+							found_assignment = True
+						else:
+							index += 1
+					LeftParenSymbol:
+						depth += 1
+						index += 1
+					LeftBracketSymbol:
+						depth += 1
+						index += 1
+					LeftBraceSymbol:
+						depth += 1
+						index += 1
+					RightParenSymbol:
+						if depth == 0:
+							break
+						else:
+							depth -= 1
+							index += 1
+					RightBracketSymbol:
+						if depth == 0:
+							break
+						else:
+							depth -= 1
+							index += 1
+					RightBraceSymbol:
+						if depth == 0:
+							break
+						else:
+							depth -= 1
+							index += 1
+					CommaSymbol:
+						if depth == 0:
+							break
+						else:
+							index += 1
+					ColonSymbol:
+						if depth == 0:
+							break
+						else:
+							index += 1
+					_:
+						index += 1
 			_:
 				index += 1
 
@@ -3096,18 +3391,15 @@ private pure func layout_reaches_end_symbol(
 	var index: Int = start_index
 
 	while True:
-		match token_kind_at(state, index):
-			NewlineToken:
+		match tag_at(state, index):
+			NewlineTag:
 				index += 1
-			DedentToken:
+			DedentTag:
 				index += 1
 			_:
 				break
 
-	token_kind_is_symbol(
-		token_kind_at(state, index),
-		end_symbol,
-	)
+	current_is_symbol(state, index, end_symbol)
 
 
 private pure func consume_layout_before_end_symbol(
@@ -3275,7 +3567,7 @@ private pure func parse_tuple_pattern_after_left_paren(
 			Some(last):
 				end_span = parsed_pattern_span(last)
 			None:
-				end_span = comma_step.span
+				end_span = materialize_span(state, comma_step.span)
 
 	right_step: ParseSymbolStep = expect_symbol(
 		state,
@@ -3288,7 +3580,7 @@ private pure func parse_tuple_pattern_after_left_paren(
 	st_diag = right_step.diagnostics
 
 	if right_step.matched:
-		end_span = right_step.span
+		end_span = materialize_span(state, right_step.span)
 
 	if items.length() < 2 or items.length() > 4:
 		st_diag = add_tuple_arity_error(
@@ -3306,51 +3598,66 @@ private pure func parse_tuple_pattern_after_left_paren(
 	}
 
 
+private pure func parse_list_pattern_spread_missing(
+	state: ParserInput,
+	index: Int,
+	diagnostics: List[ParseDiagnostic],
+	start_span: SourceSpan,
+	span: SourceSpan,
+) -> ParseListPatternSpreadStep:
+	next_state_diag: List[ParseDiagnostic] = add_expected_error(
+		diagnostics,
+		span,
+		"expected list pattern spread target",
+		["identifier", "_"],
+		None,
+	)
+
+	recovery_state: Int = if current_is_soft_boundary(state, index):
+		index
+	else:
+		advance_parser(state, index)
+
+	{
+		index = recovery_state,
+		diagnostics = next_state_diag,
+		value = ParsedListSpreadWildcard(span),
+		span = span_cover(start_span, span)
+	}
+
+
 private pure func parse_list_pattern_spread_after_dotdotdot(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 	start_span: SourceSpan,
 ) -> ParseListPatternSpreadStep:
-	token: Token = current_token(state, index)
+	span: SourceSpan = current_span(state, index)
 
-	match token.kind:
-		IdentifierToken(text):
-			name: ParsedIdentifier = parsed_identifier(text, token.span)
+	match current_tag(state, index):
+		IdentifierTag:
+			name: ParsedIdentifier = parsed_identifier(
+				current_text(state, index),
+				span,
+			)
 			{
 				index = advance_parser(state, index),
 				diagnostics = diagnostics,
 				value = ParsedListSpreadName(name),
-				span = span_cover(start_span, token.span)
+				span = span_cover(start_span, span)
 			}
-		SymbolToken(UnderscoreSymbol):
-			{
-				index = advance_parser(state, index),
-				diagnostics = diagnostics,
-				value = ParsedListSpreadWildcard(token.span),
-				span = span_cover(start_span, token.span)
-			}
-		_:
-			next_state: Int = index
-			next_state_diag: List[ParseDiagnostic] = add_expected_error(
-				diagnostics,
-				token.span,
-				"expected list pattern spread target",
-				["identifier", "_"],
-				None,
-			)
-
-			recovery_state: Int = if current_is_soft_boundary(state, next_state):
-				next_state
+		SymbolTag:
+			if current_symbol(state, index) == UnderscoreSymbol:
+				{
+					index = advance_parser(state, index),
+					diagnostics = diagnostics,
+					value = ParsedListSpreadWildcard(span),
+					span = span_cover(start_span, span)
+				}
 			else:
-				advance_parser(state, next_state)
-
-			{
-				index = recovery_state,
-				diagnostics = next_state_diag,
-				value = ParsedListSpreadWildcard(token.span),
-				span = span_cover(start_span, token.span)
-			}
+				parse_list_pattern_spread_missing(state, index, diagnostics, start_span, span)
+		_:
+			parse_list_pattern_spread_missing(state, index, diagnostics, start_span, span)
 
 
 private pure func parse_list_pattern_after_left_bracket(
@@ -3418,7 +3725,7 @@ private pure func parse_list_pattern_after_left_bracket(
 	st_diag = right_step.diagnostics
 
 	if right_step.matched:
-		end_span = right_step.span
+		end_span = materialize_span(state, right_step.span)
 
 	{
 		index = st,
@@ -3436,17 +3743,14 @@ private pure func parse_simple_pattern(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 ) -> ParsePatternStep:
-	token: Token = current_token(state, index)
+	span: SourceSpan = current_span(state, index)
 
-	match token.kind:
-		SymbolToken(UnderscoreSymbol):
-			{
-				index = advance_parser(state, index),
-				diagnostics = diagnostics,
-				value = ParsedWildcardPattern(token.span)
-			}
-		IdentifierToken(text):
-			name: ParsedIdentifier = parsed_identifier(text, token.span)
+	match current_tag(state, index):
+		IdentifierTag:
+			name: ParsedIdentifier = parsed_identifier(
+				current_text(state, index),
+				span,
+			)
 			var st: Int = advance_parser(state, index)
 			var st_diag: List[ParseDiagnostic] = diagnostics
 
@@ -3483,7 +3787,7 @@ private pure func parse_simple_pattern(
 					args = args_step.values
 
 					if right_step.matched:
-						end_span = right_step.span
+						end_span = materialize_span(state, right_step.span)
 
 				result: ParsePatternStep = {
 					index = st,
@@ -3513,7 +3817,7 @@ private pure func parse_simple_pattern(
 				)
 
 				end_span: SourceSpan = if right_step.matched:
-					right_step.span
+					materialize_span(state, right_step.span)
 				else:
 					name.span
 
@@ -3534,126 +3838,170 @@ private pure func parse_simple_pattern(
 					value = ParsedNamePattern(name)
 				}
 				result
-		KeywordToken(TrueKeyword):
-			{
-				index = advance_parser(state, index),
-				diagnostics = diagnostics,
-				value = ParsedBoolPattern(True, token.span)
-			}
-		KeywordToken(FalseKeyword):
-			{
-				index = advance_parser(state, index),
-				diagnostics = diagnostics,
-				value = ParsedBoolPattern(False, token.span)
-			}
-		KeywordToken(keyword):
-			match soft_keyword_identifier_text(keyword):
-				Some(text):
-					{
-						index = advance_parser(state, index),
-						diagnostics = diagnostics,
-						value = ParsedNamePattern(parsed_identifier(text, token.span))
-					}
-				None:
-					name_step: ParseIdentifierStep = parse_reserved_keyword_as_name(
-						state,
-						index,
-						diagnostics,
-						keyword,
-						token.span,
-					)
+		KeywordTag:
+			keyword: Keyword = current_keyword(state, index)
 
-					{
-						index = name_step.index,
-						diagnostics = name_step.diagnostics,
-						value = ParsedNamePattern(name_step.value)
-					}
-		SymbolToken(LeftParenSymbol):
-			parse_tuple_pattern_after_left_paren(
-				state,
-				advance_parser(state, index),
-				diagnostics,
-				token.span,
-			)
-		SymbolToken(LeftBracketSymbol):
-			parse_list_pattern_after_left_bracket(
-				state,
-				advance_parser(state, index),
-				diagnostics,
-				token.span,
-			)
-		IntLiteralToken(text):
-			{
-				index = advance_parser(state, index),
-				diagnostics = diagnostics,
-				value = ParsedIntPattern(text, token.span)
-			}
-		FloatLiteralToken(text):
-			{
-				index = advance_parser(state, index),
-				diagnostics = diagnostics,
-				value = ParsedFloatPattern(text, token.span)
-			}
-		StringLiteralToken(kind, text):
-			{
-				index = advance_parser(state, index),
-				diagnostics = diagnostics,
-				value = ParsedStringPattern(text, parsed_string_literal_form(kind), token.span)
-			}
-		CharLiteralToken(codepoint):
-			{
-				index = advance_parser(state, index),
-				diagnostics = diagnostics,
-				value = ParsedCharPattern(codepoint, token.span)
-			}
-		SymbolToken(MinusSymbol):
-			next_token: Token = token_at(state, index + 1)
-
-			match next_token.kind:
-				IntLiteralToken(text):
-					{
-						index = advance_parser(
+			if keyword == TrueKeyword:
+				{
+					index = advance_parser(state, index),
+					diagnostics = diagnostics,
+					value = ParsedBoolPattern(True, span)
+				}
+			else if keyword == FalseKeyword:
+				{
+					index = advance_parser(state, index),
+					diagnostics = diagnostics,
+					value = ParsedBoolPattern(False, span)
+				}
+			else:
+				match soft_keyword_identifier_text(keyword):
+					Some(text):
+						{
+							index = advance_parser(state, index),
+							diagnostics = diagnostics,
+							value = ParsedNamePattern(parsed_identifier(text, span))
+						}
+					None:
+						name_step: ParseIdentifierStep = parse_reserved_keyword_as_name(
 							state,
-							advance_parser(state, index),
-						),
-						diagnostics = diagnostics,
-						value = ParsedIntPattern(
-							"-" + text,
-							span_cover(token.span, next_token.span),
+							index,
+							diagnostics,
+							keyword,
+							span,
 						)
-					}
-				FloatLiteralToken(text):
-					{
-						index = advance_parser(
-							state,
-							advance_parser(state, index),
-						),
-						diagnostics = diagnostics,
-						value = ParsedFloatPattern(
-							"-" + text,
-							span_cover(token.span, next_token.span),
-						)
-					}
-				_:
-					next_state: Int = index
-					next_state_diag: List[ParseDiagnostic] = add_expected_error(
-						diagnostics,
-						token.span,
-						"expected numeric literal after `-` in pattern",
-						["integer literal", "float literal"],
-						None,
-					)
 
-					{
-						index = advance_parser(state, next_state),
-						diagnostics = next_state_diag,
-						value = ParsedMissingPattern(token.span)
-					}
+						{
+							index = name_step.index,
+							diagnostics = name_step.diagnostics,
+							value = ParsedNamePattern(name_step.value)
+						}
+		SymbolTag:
+			symbol: Symbol = current_symbol(state, index)
+
+			if symbol == UnderscoreSymbol:
+				{
+					index = advance_parser(state, index),
+					diagnostics = diagnostics,
+					value = ParsedWildcardPattern(span)
+				}
+			else if symbol == LeftParenSymbol:
+				parse_tuple_pattern_after_left_paren(
+					state,
+					advance_parser(state, index),
+					diagnostics,
+					span,
+				)
+			else if symbol == LeftBracketSymbol:
+				parse_list_pattern_after_left_bracket(
+					state,
+					advance_parser(state, index),
+					diagnostics,
+					span,
+				)
+			else if symbol == MinusSymbol:
+				next_index: Int = advance_parser(state, index)
+
+				match tag_at(state, next_index):
+					IntLiteralTag:
+						{
+							index = advance_parser(state, next_index),
+							diagnostics = diagnostics,
+							value = ParsedIntPattern(
+								"-" + current_text(state, next_index),
+								span_cover(
+									span,
+									current_span(state, next_index),
+								),
+							)
+						}
+					FloatLiteralTag:
+						{
+							index = advance_parser(state, next_index),
+							diagnostics = diagnostics,
+							value = ParsedFloatPattern(
+								"-" + current_text(state, next_index),
+								span_cover(
+									span,
+									current_span(state, next_index),
+								),
+							)
+						}
+					_:
+						next_state_diag: List[ParseDiagnostic] = add_expected_error(
+							diagnostics,
+							span,
+							"expected numeric literal after `-` in pattern",
+							["integer literal", "float literal"],
+							None,
+						)
+
+						{
+							index = advance_parser(state, index),
+							diagnostics = next_state_diag,
+							value = ParsedMissingPattern(span)
+						}
+			else:
+				next_state: Int = index
+				next_state_diag: List[ParseDiagnostic] = add_expected_error(
+					diagnostics,
+					span,
+					"expected pattern",
+					["pattern"],
+					None,
+				)
+
+				recovery_state: Int = if current_is_soft_boundary(state, next_state):
+					next_state
+				else:
+					advance_parser(state, next_state)
+
+				{
+					index = recovery_state,
+					diagnostics = next_state_diag,
+					value = ParsedMissingPattern(span)
+				}
+		IntLiteralTag:
+			{
+				index = advance_parser(state, index),
+				diagnostics = diagnostics,
+				value = ParsedIntPattern(
+					current_text(state, index),
+					span,
+				)
+			}
+		FloatLiteralTag:
+			{
+				index = advance_parser(state, index),
+				diagnostics = diagnostics,
+				value = ParsedFloatPattern(
+					current_text(state, index),
+					span,
+				)
+			}
+		StringLiteralTag:
+			{
+				index = advance_parser(state, index),
+				diagnostics = diagnostics,
+				value = ParsedStringPattern(
+					current_string_literal_text(state, index),
+					parsed_string_literal_form(current_string_literal_kind(state, index)),
+					span,
+				)
+			}
+		CharLiteralTag:
+			{
+				index = advance_parser(state, index),
+				diagnostics = diagnostics,
+				value = ParsedCharPattern(
+					current_char_code_point(state, index),
+					span,
+				)
+			}
 		_:
 			next_state: Int = index
 			next_state_diag: List[ParseDiagnostic] = add_expected_error(
 				diagnostics,
-				token.span,
+				span,
 				"expected pattern",
 				["pattern"],
 				None,
@@ -3667,7 +4015,7 @@ private pure func parse_simple_pattern(
 			{
 				index = recovery_state,
 				diagnostics = next_state_diag,
-				value = ParsedMissingPattern(token.span)
+				value = ParsedMissingPattern(span)
 			}
 
 
@@ -3731,8 +4079,8 @@ private pure func current_token_is_indented_past(
 	(
 		not current_is_eof(state, index)
 		and not current_is_dedent(state, index)
-		and current_span(state, index).start_line > header_span.start_line
-		and current_span(state, index).start_column > header_span.start_column
+		and state.start_lines.get_or(index, 0) > header_span.start_line
+		and state.start_columns.get_or(index, 0) > header_span.start_column
 	)
 
 
@@ -4813,7 +5161,7 @@ private pure func parse_tuple_binder_after_left_paren(
 	st_diag = right_step.diagnostics
 
 	if right_step.matched:
-		end_span = right_step.span
+		end_span = materialize_span(state, right_step.span)
 
 	if values.length() < 2 or values.length() > 4:
 		st_diag = add_tuple_arity_error(
@@ -5177,38 +5525,37 @@ private pure func current_is_tuple_destruct_assignment_start(
 		var valid: Bool = True
 
 		while valid:
-			token_kind: TokenKind = token_kind_at(state, index)
+			tag: TokenTag = tag_at(state, index)
 
 			if expecting_name:
-				if token_kind_is_tuple_binder_name(token_kind):
+				if token_is_tuple_binder_name_at(state, index):
 					index += 1
 					expecting_name = False
 				else:
 					valid = False
 			else:
-				match token_kind:
-					SymbolToken(CommaSymbol):
-						saw_comma = True
-						index += 1
+				match tag:
+					SymbolTag:
+						symbol: Symbol = current_symbol(state, index)
 
-						if token_kind_is_symbol(
-							token_kind_at(state, index),
-							RightParenSymbol,
-						):
+						if symbol == CommaSymbol:
+							saw_comma = True
+							index += 1
+
+							if current_is_symbol(state, index, RightParenSymbol):
+								saw_close = True
+								break
+							else:
+								expecting_name = True
+						else if symbol == RightParenSymbol:
 							saw_close = True
 							break
 						else:
-							expecting_name = True
-					SymbolToken(RightParenSymbol):
-						saw_close = True
-						break
+							valid = False
 					_:
 						valid = False
 
-		valid and saw_close and saw_comma and token_kind_is_symbol(
-			token_kind_at(state, index + 1),
-			EqualSymbol,
-		)
+		valid and saw_close and saw_comma and current_is_symbol(state, index + 1, EqualSymbol)
 
 
 private pure func parse_tuple_destruct_assignment(
@@ -5253,18 +5600,10 @@ private pure func parse_tuple_destruct_assignment(
 	}
 
 
-private pure func token_index_is_keyword(state: ParserInput, index: Int, expected: Keyword) -> Bool:
-	match token_kind_at(state, index):
-		KeywordToken(actual):
-			actual == expected
-		_:
-			False
-
-
 private pure func func_keyword_starts_nested_function_decl(state: ParserInput, index: Int) -> Bool:
-	token_index_is_keyword(state, index, FuncKeyword) and not token_kind_is_symbol(
-		token_kind_at(state, index + 1),
-		LeftParenSymbol,
+	(
+		current_is_keyword(state, index, FuncKeyword)
+		and not current_is_symbol(state, index + 1, LeftParenSymbol)
 	)
 
 
@@ -5272,9 +5611,9 @@ private pure func current_starts_nested_function_decl(state: ParserInput, index:
 	if current_is_keyword(state, index, FuncKeyword):
 		func_keyword_starts_nested_function_decl(state, index)
 	else if current_is_keyword(state, index, PureKeyword):
-		token_index_is_keyword(state, index + 1, FuncKeyword) and not token_kind_is_symbol(
-			token_kind_at(state, index + 2),
-			LeftParenSymbol,
+		(
+			current_is_keyword(state, index + 1, FuncKeyword)
+			and not current_is_symbol(state, index + 2, LeftParenSymbol)
 		)
 	else:
 		False
@@ -5391,9 +5730,9 @@ such as `if` or `match`. Routing it to the binder parser reports the
 reserved-keyword rule once and keeps the rest of the statement parsing.
 ---
 private pure func current_reserved_keyword_starts_binding(state: ParserInput, index: Int) -> Bool:
-	match current_token_kind(state, index):
-		KeywordToken(keyword):
-			if keyword_is_reserved_name(keyword):
+	match current_tag(state, index):
+		KeywordTag:
+			if keyword_is_reserved_name(current_keyword(state, index)):
 				after_name: Int = advance_parser(state, index)
 
 				(
@@ -5410,11 +5749,11 @@ private pure func current_reserved_keyword_starts_binding(state: ParserInput, in
 
 
 private pure func current_token_can_start_named_statement(state: ParserInput, index: Int) -> Bool:
-	match current_token_kind(state, index):
-		IdentifierToken(_):
+	match current_tag(state, index):
+		IdentifierTag:
 			True
-		KeywordToken(keyword):
-			match soft_keyword_identifier_text(keyword):
+		KeywordTag:
+			match soft_keyword_identifier_text(current_keyword(state, index)):
 				Some(_):
 					True
 				None:
@@ -5455,26 +5794,31 @@ private pure func parse_named_statement_or_expression(
 				parse_expression(state, index, diagnostics, PREC_LOWEST),
 			)
 	else:
-		match current_token_kind(state, index):
-			SymbolToken(UnderscoreSymbol):
-				name_step: ParseIdentifierStep = parse_binder_identifier_expected(
-					state,
-					index,
-					diagnostics,
-					"statement name",
-				)
-				var st: Int = name_step.index
-				var st_diag: List[ParseDiagnostic] = name_step.diagnostics
-
-				if current_can_start_assignment_tail(state, st):
-					parse_named_assignment_tail(state, st, st_diag, name_step.value, None)
-				else:
-					parse_expression(state, index, diagnostics, PREC_LOWEST)
+		is_underscore: Bool = match current_tag(state, index):
+			SymbolTag:
+				current_symbol(state, index) == UnderscoreSymbol
 			_:
-				parse_assignment_after_expression(
-					state,
-					parse_expression(state, index, diagnostics, PREC_LOWEST),
-				)
+				False
+
+		if is_underscore:
+			name_step: ParseIdentifierStep = parse_binder_identifier_expected(
+				state,
+				index,
+				diagnostics,
+				"statement name",
+			)
+			var st: Int = name_step.index
+			var st_diag: List[ParseDiagnostic] = name_step.diagnostics
+
+			if current_can_start_assignment_tail(state, st):
+				parse_named_assignment_tail(state, st, st_diag, name_step.value, None)
+			else:
+				parse_expression(state, index, diagnostics, PREC_LOWEST)
+		else:
+			parse_assignment_after_expression(
+				state,
+				parse_expression(state, index, diagnostics, PREC_LOWEST),
+			)
 
 
 private pure func parse_statement(
@@ -5517,7 +5861,7 @@ private pure func parse_lambda_body(
 	if current_is_newline(state, index):
 		parse_block_after_colon(state, index, diagnostics, block_anchor_span)
 	else if (
-		current_span(state, index).start_line > body_intro_start_line
+		state.start_lines.get_or(index, 0) > body_intro_start_line
 		and current_token_is_indented_past(state, index, block_anchor_span)
 	):
 		parse_indented_block_body(state, index, diagnostics, block_anchor_span)
@@ -5605,7 +5949,7 @@ private pure func parse_lambda_expr_with_header_span(
 		state,
 		colon_step.index,
 		colon_step.diagnostics,
-		colon_step.span.start_line,
+		state.start_lines.get_or(colon_step.span.first, 0),
 		header_span,
 	)
 
@@ -5665,7 +6009,7 @@ private pure func parse_tuple_tail(
 	st_diag = right_step.diagnostics
 
 	end_span: SourceSpan = if right_step.matched:
-		right_step.span
+		materialize_span(state, right_step.span)
 	else:
 		parsed_expr_span(first_item)
 
@@ -5703,7 +6047,7 @@ private pure func parse_parenthesized_or_tuple_expr(
 		{
 			index = right_step.index,
 			diagnostics = right_step.diagnostics,
-			value = ParsedVoidExpr(span_cover(start_span, right_step.span))
+			value = ParsedVoidExpr(span_cover(start_span, materialize_span(state, right_step.span)))
 		}
 	else:
 		expr_step: ParseExprStep = parse_expression_with_header_span(
@@ -5740,7 +6084,10 @@ private pure func parse_parenthesized_or_tuple_expr(
 					diagnostics = right_step.diagnostics,
 					value = parsed_expr_with_span(
 						expr_step.value,
-						span_cover(start_span, right_step.span),
+						span_cover(
+							start_span,
+							materialize_span(state, right_step.span),
+						),
 					)
 				}
 			else:
@@ -5752,20 +6099,20 @@ private pure func parse_parenthesized_or_tuple_expr(
 
 
 private pure func next_is_symbol(state: ParserInput, index: Int, symbol: Symbol) -> Bool:
-	match token_kind_at(state, index + 1):
-		SymbolToken(actual):
-			actual == symbol
+	match tag_at(state, index + 1):
+		SymbolTag:
+			current_symbol(state, index + 1) == symbol
 		_:
 			False
 
 
 private pure func current_can_start_record_expr_field(state: ParserInput, index: Int) -> Bool:
-	match current_token_kind(state, index):
-		IdentifierToken(_):
+	match current_tag(state, index):
+		IdentifierTag:
 			next_is_symbol(state, index, EqualSymbol)
-		KeywordToken(keyword):
+		KeywordTag:
 			(
-				soft_keyword_identifier_text(keyword).is_some()
+				soft_keyword_identifier_text(current_keyword(state, index)).is_some()
 				and next_is_symbol(state, index, EqualSymbol)
 			)
 		_:
@@ -5869,7 +6216,7 @@ private pure func parse_record_literal_expr(
 	)
 
 	end_span: SourceSpan = if right_step.matched:
-		right_step.span
+		materialize_span(state, right_step.span)
 	else:
 		start_span
 
@@ -5961,7 +6308,7 @@ private pure func parse_dict_literal_tail(
 	)
 
 	end_span: SourceSpan = if right_step.matched:
-		right_step.span
+		materialize_span(state, right_step.span)
 	else:
 		parsed_expr_span(first_key)
 
@@ -6010,7 +6357,7 @@ private pure func parse_vector_literal_tail(
 	)
 
 	end_span: SourceSpan = if right_step.matched:
-		right_step.span
+		materialize_span(state, right_step.span)
 	else:
 		parsed_expr_span(first_item)
 
@@ -6053,7 +6400,7 @@ private pure func parse_record_update_tail(
 	)
 
 	end_span: SourceSpan = if right_step.matched:
-		right_step.span
+		materialize_span(state, right_step.span)
 	else:
 		parsed_expr_span(base)
 
@@ -6125,9 +6472,9 @@ private pure func parse_builtin_expr(
 	if current_is_symbol(state, st, LeftParenSymbol):
 		st = advance_parser(state, st)
 
-		match current_token_kind(state, st):
-			StringLiteralToken(_, text):
-				name = Some(text)
+		match current_tag(state, st):
+			StringLiteralTag:
+				name = Some(current_string_literal_text(state, st))
 				end_span = current_span(state, st)
 				st = advance_parser(state, st)
 			_:
@@ -6153,7 +6500,7 @@ private pure func parse_builtin_expr(
 		st_diag = right_step.diagnostics
 
 		if right_step.matched:
-			end_span = right_step.span
+			end_span = materialize_span(state, right_step.span)
 
 	{
 		index = st,
@@ -6199,7 +6546,7 @@ private pure func parse_opaque_conversion_expr(
 	)
 
 	end_span: SourceSpan = if right_step.matched:
-		right_step.span
+		materialize_span(state, right_step.span)
 	else:
 		parsed_expr_span(value_step.value)
 
@@ -6268,230 +6615,231 @@ private pure func reject_removed_opaque_conversion(
 		) }
 
 
+private pure func parse_primary_expr_missing(
+	state: ParserInput,
+	index: Int,
+	diagnostics: List[ParseDiagnostic],
+	span: SourceSpan,
+) -> ParseExprStep:
+	next_state_diag: List[ParseDiagnostic] = add_expected_error(
+		diagnostics,
+		span,
+		"expected expression",
+		[EXPECTED_EXPRESSION],
+		None,
+	)
+
+	recovery_state: Int = if current_is_soft_boundary(state, index):
+		index
+	else:
+		advance_parser(state, index)
+
+	{
+		index = recovery_state,
+		diagnostics = next_state_diag,
+		value = ParsedMissingExpr(span)
+	}
+
+
 private pure func parse_primary_expr(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 ) -> ParseExprStep:
-	token: Token = current_token(state, index)
+	span: SourceSpan = current_span(state, index)
 
-	match token.kind:
-		IdentifierToken(text):
+	match current_tag(state, index):
+		IdentifierTag:
+			text: String = current_text(state, index)
+
 			if text == "into" and starts_removed_opaque_conversion(state, index, diagnostics):
 				reject_removed_opaque_conversion(state, index, diagnostics, True)
 			else:
 				{
 					index = advance_parser(state, index),
 					diagnostics = diagnostics,
-					value = ParsedNameExpr(parsed_identifier(text, token.span))
+					value = ParsedNameExpr(parsed_identifier(text, span))
 				}
-		IntLiteralToken(text):
+		IntLiteralTag:
 			{
 				index = advance_parser(state, index),
 				diagnostics = diagnostics,
-				value = ParsedIntLiteralExpr(text, token.span)
+				value = ParsedIntLiteralExpr(
+					current_text(state, index),
+					span,
+				)
 			}
-		FloatLiteralToken(text):
+		FloatLiteralTag:
 			{
 				index = advance_parser(state, index),
 				diagnostics = diagnostics,
-				value = ParsedFloatLiteralExpr(text, token.span)
+				value = ParsedFloatLiteralExpr(
+					current_text(state, index),
+					span,
+				)
 			}
-		StringLiteralToken(kind, text):
+		StringLiteralTag:
+			kind: StringLiteralKind = current_string_literal_kind(state, index)
+			text: String = current_string_literal_text(state, index)
+
 			expr_value: ParsedExpr = if (
 				kind == InterpolatedStringLiteral
 				or kind == InterpolatedPipeStringLiteral
 			):
-				ParsedStringInterpolationExpr(
-					text,
-					kind == InterpolatedPipeStringLiteral,
-					token.span,
-				)
+				ParsedStringInterpolationExpr(text, kind == InterpolatedPipeStringLiteral, span)
 			else:
-				ParsedStringLiteralExpr(text, parsed_string_literal_form(kind), token.span)
+				ParsedStringLiteralExpr(text, parsed_string_literal_form(kind), span)
 
 			{
 				index = advance_parser(state, index),
 				diagnostics = diagnostics,
 				value = expr_value
 			}
-		CharLiteralToken(codepoint):
+		CharLiteralTag:
 			{
 				index = advance_parser(state, index),
 				diagnostics = diagnostics,
-				value = ParsedCharLiteralExpr(codepoint, token.span)
-			}
-		KeywordToken(TrueKeyword):
-			{
-				index = advance_parser(state, index),
-				diagnostics = diagnostics,
-				value = ParsedBoolLiteralExpr(True, token.span)
-			}
-		KeywordToken(FalseKeyword):
-			{
-				index = advance_parser(state, index),
-				diagnostics = diagnostics,
-				value = ParsedBoolLiteralExpr(False, token.span)
-			}
-		KeywordToken(AfterKeyword):
-			{
-				index = advance_parser(state, index),
-				diagnostics = diagnostics,
-				value = ParsedNameExpr(parsed_identifier("after", token.span))
-			}
-		KeywordToken(SealedKeyword):
-			{
-				index = advance_parser(state, index),
-				diagnostics = diagnostics,
-				value = ParsedNameExpr(parsed_identifier("sealed", token.span))
-			}
-		KeywordToken(BreakKeyword):
-			{
-				index = advance_parser(state, index),
-				diagnostics = diagnostics,
-				value = ParsedBreakExpr(token.span)
-			}
-		KeywordToken(ContinueKeyword):
-			{
-				index = advance_parser(state, index),
-				diagnostics = diagnostics,
-				value = ParsedContinueExpr(token.span)
-			}
-		KeywordToken(VoidKeyword):
-			{
-				index = advance_parser(state, index),
-				diagnostics = diagnostics,
-				value = ParsedVoidExpr(token.span)
-			}
-		KeywordToken(BuiltinKeyword):
-			parse_builtin_expr(state, index, diagnostics)
-		KeywordToken(IntoOpaqueKeyword):
-			parse_opaque_conversion_expr(state, index, diagnostics, True)
-		KeywordToken(FromKeyword):
-			if starts_removed_opaque_conversion(state, index, diagnostics):
-				reject_removed_opaque_conversion(state, index, diagnostics, False)
-			else:
-				{
-					index = advance_parser(state, index),
-					diagnostics = diagnostics,
-					value = ParsedNameExpr(parsed_identifier("from", token.span))
-				}
-		KeywordToken(FromOpaqueKeyword):
-			parse_opaque_conversion_expr(state, index, diagnostics, False)
-		KeywordToken(FuncKeyword):
-			parse_lambda_expr_with_header_span(
-				state,
-				index,
-				diagnostics,
-				current_span(state, index),
-			)
-		KeywordToken(PureKeyword):
-			parse_lambda_expr_with_header_span(
-				state,
-				index,
-				diagnostics,
-				current_span(state, index),
-			)
-		KeywordToken(IfKeyword):
-			parse_if_expr_with_header_span(
-				state,
-				index,
-				diagnostics,
-				current_span(state, index),
-			)
-		KeywordToken(MatchKeyword):
-			parse_match_expr_with_header_span(
-				state,
-				index,
-				diagnostics,
-				current_span(state, index),
-			)
-		KeywordToken(SelectKeyword):
-			parse_select_expr_with_header_span(
-				state,
-				index,
-				diagnostics,
-				current_span(state, index),
-			)
-		KeywordToken(DebugKeyword):
-			if next_is_symbol(state, index, DotSymbol):
-				{
-					index = advance_parser(state, index),
-					diagnostics = diagnostics,
-					value = ParsedNameExpr(parsed_identifier("debug", token.span))
-				}
-			else:
-				parse_debug_block_expr(state, index, diagnostics)
-		KeywordToken(WithKeyword):
-			parse_with_expr(state, index, diagnostics)
-		KeywordToken(ConcurrentKeyword):
-			parse_concurrent_block_expr(state, index, diagnostics)
-		SymbolToken(LeftParenSymbol):
-			parse_parenthesized_or_tuple_expr(
-				state,
-				advance_parser(state, index),
-				diagnostics,
-				token.span,
-			)
-		SymbolToken(LeftBracketSymbol):
-			start_span: SourceSpan = token.span
-			items_step: ParseExprListStep = parse_expr_list_until(
-				state,
-				advance_parser(state, index),
-				diagnostics,
-				RightBracketSymbol,
-				True,
-				start_span,
-			)
-			right_step: ParseSymbolStep = expect_symbol(
-				state,
-				items_step.index,
-				items_step.diagnostics,
-				RightBracketSymbol,
-				"expected `]` after list literal",
-			)
-
-			end_span: SourceSpan = if right_step.matched:
-				right_step.span
-			else:
-				start_span
-
-			{
-				index = right_step.index,
-				diagnostics = right_step.diagnostics,
-				value = ParsedListExpr(
-					items_step.values,
-					span_cover(start_span, end_span),
+				value = ParsedCharLiteralExpr(
+					current_char_code_point(state, index),
+					span,
 				)
 			}
-		SymbolToken(LeftBraceSymbol):
-			parse_braced_expr(state, index, diagnostics, token.span)
-		SymbolToken(UnderscoreSymbol):
-			{
-				index = advance_parser(state, index),
-				diagnostics = diagnostics,
-				value = ParsedVoidExpr(token.span)
-			}
+		KeywordTag:
+			match current_keyword(state, index):
+				TrueKeyword:
+					{
+						index = advance_parser(state, index),
+						diagnostics = diagnostics,
+						value = ParsedBoolLiteralExpr(True, span)
+					}
+				FalseKeyword:
+					{
+						index = advance_parser(state, index),
+						diagnostics = diagnostics,
+						value = ParsedBoolLiteralExpr(False, span)
+					}
+				AfterKeyword:
+					{
+						index = advance_parser(state, index),
+						diagnostics = diagnostics,
+						value = ParsedNameExpr(parsed_identifier("after", span))
+					}
+				SealedKeyword:
+					{
+						index = advance_parser(state, index),
+						diagnostics = diagnostics,
+						value = ParsedNameExpr(parsed_identifier("sealed", span))
+					}
+				BreakKeyword:
+					{
+						index = advance_parser(state, index),
+						diagnostics = diagnostics,
+						value = ParsedBreakExpr(span)
+					}
+				ContinueKeyword:
+					{
+						index = advance_parser(state, index),
+						diagnostics = diagnostics,
+						value = ParsedContinueExpr(span)
+					}
+				VoidKeyword:
+					{
+						index = advance_parser(state, index),
+						diagnostics = diagnostics,
+						value = ParsedVoidExpr(span)
+					}
+				BuiltinKeyword:
+					parse_builtin_expr(state, index, diagnostics)
+				IntoOpaqueKeyword:
+					parse_opaque_conversion_expr(state, index, diagnostics, True)
+				FromKeyword:
+					if starts_removed_opaque_conversion(state, index, diagnostics):
+						reject_removed_opaque_conversion(state, index, diagnostics, False)
+					else:
+						{
+							index = advance_parser(state, index),
+							diagnostics = diagnostics,
+							value = ParsedNameExpr(parsed_identifier("from", span))
+						}
+				FromOpaqueKeyword:
+					parse_opaque_conversion_expr(state, index, diagnostics, False)
+				FuncKeyword:
+					parse_lambda_expr_with_header_span(state, index, diagnostics, span)
+				PureKeyword:
+					parse_lambda_expr_with_header_span(state, index, diagnostics, span)
+				IfKeyword:
+					parse_if_expr_with_header_span(state, index, diagnostics, span)
+				MatchKeyword:
+					parse_match_expr_with_header_span(state, index, diagnostics, span)
+				SelectKeyword:
+					parse_select_expr_with_header_span(state, index, diagnostics, span)
+				DebugKeyword:
+					if next_is_symbol(state, index, DotSymbol):
+						{
+							index = advance_parser(state, index),
+							diagnostics = diagnostics,
+							value = ParsedNameExpr(parsed_identifier("debug", span))
+						}
+					else:
+						parse_debug_block_expr(state, index, diagnostics)
+				WithKeyword:
+					parse_with_expr(state, index, diagnostics)
+				ConcurrentKeyword:
+					parse_concurrent_block_expr(state, index, diagnostics)
+				_:
+					parse_primary_expr_missing(state, index, diagnostics, span)
+		SymbolTag:
+			match current_symbol(state, index):
+				LeftParenSymbol:
+					parse_parenthesized_or_tuple_expr(
+						state,
+						advance_parser(state, index),
+						diagnostics,
+						span,
+					)
+				LeftBracketSymbol:
+					start_span: SourceSpan = span
+					items_step: ParseExprListStep = parse_expr_list_until(
+						state,
+						advance_parser(state, index),
+						diagnostics,
+						RightBracketSymbol,
+						True,
+						start_span,
+					)
+					right_step: ParseSymbolStep = expect_symbol(
+						state,
+						items_step.index,
+						items_step.diagnostics,
+						RightBracketSymbol,
+						"expected `]` after list literal",
+					)
+
+					end_span: SourceSpan = if right_step.matched:
+						materialize_span(state, right_step.span)
+					else:
+						start_span
+
+					{
+						index = right_step.index,
+						diagnostics = right_step.diagnostics,
+						value = ParsedListExpr(
+							items_step.values,
+							span_cover(start_span, end_span),
+						)
+					}
+				LeftBraceSymbol:
+					parse_braced_expr(state, index, diagnostics, span)
+				UnderscoreSymbol:
+					{
+						index = advance_parser(state, index),
+						diagnostics = diagnostics,
+						value = ParsedVoidExpr(span)
+					}
+				_:
+					parse_primary_expr_missing(state, index, diagnostics, span)
 		_:
-			next_state: Int = index
-			next_state_diag: List[ParseDiagnostic] = add_expected_error(
-				diagnostics,
-				token.span,
-				"expected expression",
-				[EXPECTED_EXPRESSION],
-				None,
-			)
-
-			recovery_state: Int = if current_is_soft_boundary(state, next_state):
-				next_state
-			else:
-				advance_parser(state, next_state)
-
-			{
-				index = recovery_state,
-				diagnostics = next_state_diag,
-				value = ParsedMissingExpr(token.span)
-			}
+			parse_primary_expr_missing(state, index, diagnostics, span)
 
 
 private pure func postfix_continuation_after_newline(
@@ -6617,7 +6965,7 @@ private pure func parse_postfix_expr(
 				st_diag = right_step.diagnostics
 
 				end_span: SourceSpan = if right_step.matched:
-					right_step.span
+					materialize_span(state, right_step.span)
 				else:
 					start_span
 
@@ -6647,7 +6995,7 @@ private pure func parse_postfix_expr(
 				st_diag = right_step.diagnostics
 
 				end_span: SourceSpan = if right_step.matched:
-					right_step.span
+					materialize_span(state, right_step.span)
 				else:
 					start_span
 
@@ -6672,68 +7020,91 @@ private pure func parse_prefix_expr_with_header_span(
 	diagnostics: List[ParseDiagnostic],
 	header_span: SourceSpan,
 ) -> ParseExprStep:
-	token: Token = current_token(state, index)
+	match current_tag(state, index):
+		SymbolTag:
+			if current_symbol(state, index) == MinusSymbol:
+				span: SourceSpan = current_span(state, index)
+				operand_step: ParseExprStep = parse_prefix_expr_with_header_span(
+					state,
+					advance_parser(state, index),
+					diagnostics,
+					header_span,
+				)
+				{
+					index = operand_step.index,
+					diagnostics = operand_step.diagnostics,
+					value = ParsedUnaryExpr(
+						ParsedNegateOp,
+						operand_step.value,
+						span_cover(span, parsed_expr_span(operand_step.value)),
+					)
+				}
+			else:
+				primary_step: ParseExprStep = parse_primary_expr(state, index, diagnostics)
+				parse_postfix_expr(
+					state,
+					primary_step.index,
+					primary_step.diagnostics,
+					primary_step.value,
+					header_span,
+				)
+		KeywordTag:
+			keyword: Keyword = current_keyword(state, index)
 
-	match token.kind:
-		SymbolToken(MinusSymbol):
-			operand_step: ParseExprStep = parse_prefix_expr_with_header_span(
-				state,
-				advance_parser(state, index),
-				diagnostics,
-				header_span,
-			)
-			{
-				index = operand_step.index,
-				diagnostics = operand_step.diagnostics,
-				value = ParsedUnaryExpr(
-					ParsedNegateOp,
-					operand_step.value,
-					span_cover(token.span, parsed_expr_span(operand_step.value)),
+			if keyword == NotKeyword:
+				span: SourceSpan = current_span(state, index)
+				operand_step: ParseExprStep = parse_prefix_expr_with_header_span(
+					state,
+					advance_parser(state, index),
+					diagnostics,
+					header_span,
 				)
-			}
-		KeywordToken(NotKeyword):
-			operand_step: ParseExprStep = parse_prefix_expr_with_header_span(
-				state,
-				advance_parser(state, index),
-				diagnostics,
-				header_span,
-			)
-			{
-				index = operand_step.index,
-				diagnostics = operand_step.diagnostics,
-				value = ParsedUnaryExpr(
-					ParsedNotOp,
-					operand_step.value,
-					span_cover(token.span, parsed_expr_span(operand_step.value)),
+				{
+					index = operand_step.index,
+					diagnostics = operand_step.diagnostics,
+					value = ParsedUnaryExpr(
+						ParsedNotOp,
+						operand_step.value,
+						span_cover(span, parsed_expr_span(operand_step.value)),
+					)
+				}
+			else if keyword == DetachKeyword:
+				span: SourceSpan = current_span(state, index)
+				operand_step: ParseExprStep = parse_prefix_expr_with_header_span(
+					state,
+					advance_parser(state, index),
+					diagnostics,
+					header_span,
 				)
-			}
-		KeywordToken(DetachKeyword):
-			operand_step: ParseExprStep = parse_prefix_expr_with_header_span(
-				state,
-				advance_parser(state, index),
-				diagnostics,
-				header_span,
-			)
-			{
-				index = operand_step.index,
-				diagnostics = operand_step.diagnostics,
-				value = ParsedDetachExpr(
-					operand_step.value,
-					span_cover(token.span, parsed_expr_span(operand_step.value)),
+				{
+					index = operand_step.index,
+					diagnostics = operand_step.diagnostics,
+					value = ParsedDetachExpr(
+						operand_step.value,
+						span_cover(span, parsed_expr_span(operand_step.value)),
+					)
+				}
+			else if keyword == FuncKeyword:
+				parse_lambda_expr_with_header_span(state, index, diagnostics, header_span)
+			else if keyword == PureKeyword:
+				parse_lambda_expr_with_header_span(state, index, diagnostics, header_span)
+			else if keyword == IfKeyword:
+				parse_if_expr_with_header_span(state, index, diagnostics, header_span)
+			else if keyword == MatchKeyword:
+				parse_match_expr_with_header_span(state, index, diagnostics, header_span)
+			else if keyword == SelectKeyword:
+				parse_select_expr_with_header_span(state, index, diagnostics, header_span)
+			else if keyword == ForKeyword:
+				parse_for_expr_with_header_span(state, index, diagnostics, header_span)
+			else:
+				primary_step: ParseExprStep = parse_primary_expr(state, index, diagnostics)
+				parse_postfix_expr(
+					state,
+					primary_step.index,
+					primary_step.diagnostics,
+					primary_step.value,
+					header_span,
 				)
-			}
-		KeywordToken(FuncKeyword):
-			parse_lambda_expr_with_header_span(state, index, diagnostics, header_span)
-		KeywordToken(PureKeyword):
-			parse_lambda_expr_with_header_span(state, index, diagnostics, header_span)
-		KeywordToken(IfKeyword):
-			parse_if_expr_with_header_span(state, index, diagnostics, header_span)
-		KeywordToken(MatchKeyword):
-			parse_match_expr_with_header_span(state, index, diagnostics, header_span)
-		KeywordToken(SelectKeyword):
-			parse_select_expr_with_header_span(state, index, diagnostics, header_span)
-		KeywordToken(ForKeyword):
-			parse_for_expr_with_header_span(state, index, diagnostics, header_span)
 		_:
 			primary_step: ParseExprStep = parse_primary_expr(state, index, diagnostics)
 			parse_postfix_expr(
@@ -6988,7 +7359,7 @@ private pure func parse_function_decl_value(
 			}
 		else if (
 			not current_is_newline(state, st)
-			and current_span(state, st).start_line > colon_step.span.start_line
+			and state.start_lines.get_or(st, 0) > state.start_lines.get_or(colon_step.span.first, 0)
 		):
 			{
 				index = st,
@@ -7127,7 +7498,7 @@ private pure func parse_import_symbol(
 		st_diag = right_step.diagnostics
 
 		if right_step.matched:
-			end_span = right_step.span
+			end_span = materialize_span(state, right_step.span)
 
 	if current_is_keyword(state, st, AsKeyword):
 		alias_step: ParseIdentifierStep = parse_declared_name_expected(
@@ -7489,9 +7860,9 @@ private pure func parse_foreign_block_arg(
 	var value: String = ""
 	var end_span: SourceSpan = name_step.value.span
 
-	match current_token_kind(state, st):
-		StringLiteralToken(_, text):
-			value = text
+	match current_tag(state, st):
+		StringLiteralTag:
+			value = current_string_literal_text(state, st)
 			end_span = current_span(state, st)
 			st = advance_parser(state, st)
 		_:
@@ -7665,16 +8036,16 @@ private pure func parse_foreign_function_decl(
 		st_diag = type_step.diagnostics
 		end_span = parsed_type_expr_span(type_step.value)
 	else:
-		end_span = arrow_step.span
+		end_span = materialize_span(state, arrow_step.span)
 
 	var c_name: Option[String] = None
 
 	if current_is_symbol(state, st, EqualSymbol):
 		st = advance_parser(state, st)
 
-		match current_token_kind(state, st):
-			StringLiteralToken(_, text):
-				c_name = Some(text)
+		match current_tag(state, st):
+			StringLiteralTag:
+				c_name = Some(current_string_literal_text(state, st))
 				end_span = current_span(state, st)
 				st = advance_parser(state, st)
 			_:
@@ -7969,7 +8340,10 @@ private pure func parse_record_decl(
 			fields = fields_step.values,
 			is_struct = is_struct,
 			doc = doc,
-			span = span_cover(start_span, right_step.span),
+			span = span_cover(
+				start_span,
+				materialize_span(state, right_step.span),
+			),
 		})
 	}
 
@@ -7979,21 +8353,26 @@ private pure func parse_variant_identifier_expected(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 ) -> ParseIdentifierStep:
-	token: Token = current_token(state, index)
+	span: SourceSpan = current_span(state, index)
 
-	match token.kind:
-		KeywordToken(TrueKeyword):
-			{
-				index = advance_parser(state, index),
-				diagnostics = diagnostics,
-				value = parsed_identifier("True", token.span)
-			}
-		KeywordToken(FalseKeyword):
-			{
-				index = advance_parser(state, index),
-				diagnostics = diagnostics,
-				value = parsed_identifier("False", token.span)
-			}
+	match current_tag(state, index):
+		KeywordTag:
+			keyword: Keyword = current_keyword(state, index)
+
+			if keyword == TrueKeyword:
+				{
+					index = advance_parser(state, index),
+					diagnostics = diagnostics,
+					value = parsed_identifier("True", span)
+				}
+			else if keyword == FalseKeyword:
+				{
+					index = advance_parser(state, index),
+					diagnostics = diagnostics,
+					value = parsed_identifier("False", span)
+				}
+			else:
+				parse_declared_name_expected(state, index, diagnostics, "variant name")
 		_:
 			parse_declared_name_expected(state, index, diagnostics, "variant name")
 
@@ -8029,7 +8408,7 @@ private pure func parse_variant_decl(
 		st_diag = right_step.diagnostics
 
 		if right_step.matched:
-			end_span = right_step.span
+			end_span = materialize_span(state, right_step.span)
 
 	{
 		index = st,
@@ -8229,10 +8608,10 @@ private pure func parse_builtin_type_decl(
 		if is_resource:
 			st = advance_parser(state, st)
 
-			match current_token_kind(state, st):
-				StringLiteralToken(_, text):
+			match current_tag(state, st):
+				StringLiteralTag:
 					cleanup = Some({
-						builtin_name = text,
+						builtin_name = current_string_literal_text(state, st),
 						span = current_span(state, st),
 					})
 					end_span = current_span(state, st)
@@ -8260,7 +8639,7 @@ private pure func parse_builtin_type_decl(
 			st_diag = right_step.diagnostics
 
 			if right_step.matched:
-				end_span = right_step.span
+				end_span = materialize_span(state, right_step.span)
 		else:
 			argument_list_step: ParserStep = consume_builtin_type_argument_list(state, st, st_diag)
 			st = argument_list_step.index
@@ -8435,7 +8814,7 @@ private pure func parse_trait_method(
 			Some(body_expr):
 				end_span = parsed_expr_span(body_expr)
 			None:
-				end_span = colon_step.span
+				end_span = materialize_span(state, colon_step.span)
 
 	{
 		index = st,
@@ -8850,10 +9229,10 @@ private pure func parse_private_decl(
 	else if current_is_keyword(state, st, ImplementsKeyword):
 		parse_impl_decl(state, st, st_diag, doc, inner_start_span)
 	else:
-		match current_token_kind(state, st):
-			IdentifierToken(_):
+		match current_tag(state, st):
+			IdentifierTag:
 				parse_top_level_var_decl(state, st, st_diag, False, inner_start_span)
-			KeywordToken(_):
+			KeywordTag:
 				if current_reserved_keyword_starts_binding(state, st):
 					parse_top_level_var_decl(state, st, st_diag, False, inner_start_span)
 				else:
@@ -8881,9 +9260,9 @@ private pure func parse_decl(
 	var doc: Option[String] = None
 	var start_span: SourceSpan = current_span(state, st)
 
-	match current_token_kind(state, st):
-		DocStringToken(text):
-			doc = Some(text)
+	match current_tag(state, st):
+		DocStringTag:
+			doc = Some(current_text(state, st))
 			start_span = current_span(state, st)
 			st = advance_parser(state, st)
 			st = skip_newlines(state, st)
@@ -8954,10 +9333,10 @@ private pure func parse_decl(
 	else if current_is_keyword(state, st, ImplementsKeyword):
 		parse_impl_decl(state, st, st_diag, doc, start_span)
 	else:
-		match current_token_kind(state, st):
-			IdentifierToken(_):
+		match current_tag(state, st):
+			IdentifierTag:
 				parse_top_level_var_decl(state, st, st_diag, False, start_span)
-			KeywordToken(_):
+			KeywordTag:
 				if current_reserved_keyword_starts_binding(state, st):
 					parse_top_level_var_decl(state, st, st_diag, False, start_span)
 				else:
@@ -8995,7 +9374,13 @@ private pure func parse_error_decl(
 
 pure func parse_compiler_source(source: SourceFile) -> ParsedProgram:
 	lex_result = lex(source)
-	state: ParserInput = initial_state(source, lex_result.tokens)
+	state: ParserInput = initial_state(
+		source,
+		lex_result.tokens,
+		lex_result.texts,
+		lex_result.path,
+		lex_result.module_name,
+	)
 	var index: Int = skip_newlines(state, 0)
 	var diagnostics: List[ParseDiagnostic] = lex_result.diagnostics
 	var decls: List[ParsedDecl] = []
