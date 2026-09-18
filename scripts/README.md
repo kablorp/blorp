@@ -98,6 +98,7 @@ scripts/test --log-dir logs     # keep complete gate logs
 scripts/test --no-build         # test the existing installed toolchain
 scripts/test --timings          # print generated TestSuite phase timings
 scripts/test --release-compiler # build bin/blorp at -O2 for full gate runs
+scripts/test --release-artifacts # compile the test artifacts at -O2
 ```
 
 `scripts/test` is quiet by default. Successful runs print a gate summary with
@@ -113,6 +114,9 @@ The remaining roots compile and run together in one runtime test invocation.
 `--no-build` is for controlled CI or local workflows that have already run the
 required build and need to preserve that exact toolchain through validation.
 Without it, `scripts/test` installs the current compiler before running gates.
+`--release-artifacts` passes `--release` to every `bin/blorp test` invocation,
+so each generated test artifact is compiled at -O2 instead of the gating -O0
+default. It does not change how `bin/blorp` itself is built.
 `--release-compiler` exports `BLORP_CLI_C_OPTIMIZATION=-O2` for that install,
 trading a slower build for a faster compiler in the gates that follow; see
 "Compiler optimization level" in `docs/DEVELOPMENT.md` for the -O0/-O2 split

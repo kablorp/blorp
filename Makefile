@@ -383,6 +383,7 @@ hygiene-check: build-blorp-cli
 	@blorp/test/build/test_build_source_generator.sh
 	@blorp/test/build/test_release_toolchain.sh
 	@blorp/test/build/test_scripts_test_harness.sh
+	@blorp/test/build/test_split_translation_units.sh
 	@artifacts=$$( \
 		find . \
 			\( -path './.git' -o -path './blorp/build/_build' -o -path './_build' -o -path './cmake-build-debug' \) -prune -o \

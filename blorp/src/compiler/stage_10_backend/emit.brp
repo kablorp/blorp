@@ -2655,18 +2655,12 @@ private CURRENT_TASK_LOCAL_DECLARATION: String = "void* const __blorp_task = __b
 
 private C_FUNCTION_BODY_OPEN: String = " {\n"
 
+private GLOBAL_INIT_FUNCTION_NAME: String = "__blorp_init_globals"
 
----
-Give a rendered C function the current-task local its cleanup operations read.
 
-The current task is fiber-scoped and is rebound on every fiber resume, so it is
-constant for one execution of one function. Every emitted cleanup operation
-therefore names this one local instead of reloading the thread-local, which also
-lets the host C compiler branch once per function rather than once per
-operation. The rendered body is the authority for whether a function performs
-any cleanup: every emitted cleanup form names the local, so a function whose
-text does not is left untouched.
----
+--- The generated initializer every program entrypoint calls before its own
+--- body. Split emission defines it in the first translation unit, so the
+--- shared header declares it for whichever unit holds the entrypoint.
 private pure func with_current_task_local(function_c: String) -> String:
 	if function_c.contains(CURRENT_TASK_LOCAL):
 		match function_c.index_of(C_FUNCTION_BODY_OPEN):
@@ -12496,6 +12490,7 @@ private pure func emit_static_closure_definition(
 ) -> String:
 	static_name: String = static_closure_name(emitted_name)
 	function_name: String = c_identifier(emitted_name)
+
 	storage_class: String = if internal_type_linkage:
 		"static "
 	else:
@@ -22306,7 +22301,7 @@ private pure func emit_general_supported_user_function(
 					is_entrypoint_function: Bool = func_info.function_kind == ProgramEntrypointFunction
 
 					global_init: String = if is_entrypoint_function:
-						"  __blorp_init_globals();\n"
+						"  " + GLOBAL_INIT_FUNCTION_NAME + "();\n"
 					else:
 						""
 
@@ -22567,6 +22562,7 @@ private pure func emit_enum_to_string_function(
 		"static "
 	else:
 		""
+
 	var c_code: String = storage_class + enum_to_string_signature(naming) + " {\n"
 	c_code += "    switch (v) {\n"
 
@@ -22616,7 +22612,7 @@ private pure func emit_enum_decl(
 		type_header = type_header,
 		functions = [
 			emit_enum_to_string_function(enum_decl, naming, internal_type_linkage),
-			emit_enum_vector_to_string_function(enum_decl, naming)
+			emit_enum_vector_to_string_function(enum_decl, naming),
 		]
 	}
 
@@ -24147,8 +24143,8 @@ private pure func canonical_empty_list_split_emission(
 ) -> CCanonicalEmptyListSplitEmission:
 	storage_type: String = canonical_empty_list_storage_type_name(item)
 	fields_prefix: String = (
-		"blorp_Object header; long len; long capacity; void "
-		+ "(*elem_release)(void*); int16_t elem_size; uint8_t storage_mode; char __pad["
+		"blorp_Object header; long len; long capacity; void (*elem_release)(void*); "
+		+ "int16_t elem_size; uint8_t storage_mode; char __pad["
 	) + STATIC_LIST_RUNTIME_PADDING_BYTES.to_string() + "]; "
 	init_prefix: String = " = {\n  { BLORP_IMMORTAL_REFCOUNT, BLORP_ALLOC_CLASS_DIRECT, 0 },\n  0L,\n  1L,\n  "
 
@@ -24216,11 +24212,17 @@ private pure func emit_static_string_literal_definitions(
 		""
 	else:
 		STATIC_STRING_LITERAL_DECLARATION_MACRO + "\n\n" + literals
-			.map(func(literal): emit_static_string_literal_definition(literal, "BLORP_STATIC_STRING"))
+			.map(
+				func(
+					literal,
+				): emit_static_string_literal_definition(literal, "BLORP_STATIC_STRING"),
+			)
 			.join("\n") + "\n\n"
 
 
-private pure func emit_static_string_literal_extern_decl(literal: BackendStaticStringLiteral) -> String:
+private pure func emit_static_string_literal_extern_decl(
+	literal: BackendStaticStringLiteral,
+) -> String:
 	"extern blorp_String " + static_string_literal_symbol(literal.id) + ";\n"
 
 
@@ -24248,10 +24250,12 @@ private pure func emit_static_managed_global_decl(
 	else:
 		name_c: String = c_var_name(global.name)
 		init ?= static_value_initializer(name_c, global.typ, global.init)
+
 		storage_class: String = if internal_type_linkage:
 			"static "
 		else:
 			""
+
 		Some(
 			init.definitions + storage_class + TypeLayout.c_type_name(
 				global.typ,
@@ -24470,6 +24474,7 @@ private pure func emit_global_decl(global: CoreGlobal, internal_type_linkage: Bo
 				"static "
 			else:
 				""
+
 			match emit_global_static_init_expr(global.init):
 				Some(init_c):
 					storage_class + TypeLayout.c_type_name(
@@ -24741,7 +24746,10 @@ private pure func emit_heap_record_destructor(
 			"static "
 		else:
 			""
-		storage_class + destroy_function_signature(naming.destroy_name) + " {\n" + "  " + record_decl.name + "* __rec = (" + record_decl.name + "*)obj;\n" + releases + "}\n\n"
+
+		storage_class + destroy_function_signature(
+			naming.destroy_name,
+		) + " {\n" + "  " + record_decl.name + "* __rec = (" + record_decl.name + "*)obj;\n" + releases + "}\n\n"
 	else:
 		""
 
@@ -25109,7 +25117,10 @@ private pure func emit_simple_union_destructor(
 		"static "
 	else:
 		""
-	storage_class + destroy_function_signature(naming.destroy_name) + " {\n" + "  " + union_decl.name + "* self = (" + union_decl.name + "*)obj;\n" + "  switch (self->tag) {\n" + emit_union_destructor_cases(
+
+	storage_class + destroy_function_signature(
+		naming.destroy_name,
+	) + " {\n" + "  " + union_decl.name + "* self = (" + union_decl.name + "*)obj;\n" + "  switch (self->tag) {\n" + emit_union_destructor_cases(
 		union_decl,
 		naming,
 	) + "    default:\n" + "      break;\n" + "  }\n" + "}\n\n"
@@ -25124,6 +25135,7 @@ private pure func emit_iterative_union_destructor(
 	stack_push_name: String = naming.union_destroy_stack_push_name
 	release_child_name: String = naming.union_destroy_release_child_name
 	destroy_fields_name: String = naming.union_destroy_fields_name
+
 	storage_class: String = if internal_type_linkage:
 		"static "
 	else:
@@ -25132,7 +25144,9 @@ private pure func emit_iterative_union_destructor(
 	"static void " + stack_push_name + "(" + type_name + "*** stack, long* count, long* capacity, " + type_name + "* value) {\n" + "  if (*count >= *capacity) {\n" + "    long next_capacity = (*capacity == 0) ? 64 : (*capacity * 2);\n" + "    " + type_name + "** grown = (" + type_name + "**)realloc(*stack, sizeof(" + type_name + "*) * (size_t)next_capacity);\n" + "    if (!grown) { fprintf(stderr, \"blorp: out of memory (" + type_name + " destroy stack)\\n\"); abort(); }\n" + "    *stack = grown;\n" + "    *capacity = next_capacity;\n" + "  }\n" + "  (*stack)[*count] = value;\n" + "  *count += 1;\n" + "}\n\n" + "static void " + release_child_name + "(" + type_name + "*** stack, long* count, long* capacity, " + type_name + "* value) {\n" + "  if (!value) return;\n" + "  blorp_Object* header = (blorp_Object*)value;\n" + "  if (BLORP_RC_LOAD(header->refcount) == BLORP_IMMORTAL_REFCOUNT) return;\n" + "  long previous_refcount = BLORP_RC_DEC_PREV(header->refcount);\n" + "  if (previous_refcount == 1) " + stack_push_name + "(stack, count, capacity, value);\n" + "}\n\n" + "static void " + destroy_fields_name + "(" + type_name + "* self, " + type_name + "*** __destroy_stack, long* __destroy_count, long* __destroy_capacity) {\n" + "  switch (self->tag) {\n" + emit_union_destructor_cases(
 		union_decl,
 		naming,
-	) + "    default:\n" + "      break;\n" + "  }\n" + "}\n\n" + storage_class + destroy_function_signature(naming.destroy_name) + " {\n" + "  " + type_name + "** __destroy_stack = NULL;\n" + "  long __destroy_count = 0;\n" + "  long __destroy_capacity = 0;\n" + "  " + destroy_fields_name + "((" + type_name + "*)obj, &__destroy_stack, &__destroy_count, &__destroy_capacity);\n" + "  while (__destroy_count > 0) {\n" + "    " + type_name + "* self = __destroy_stack[--__destroy_count];\n" + "    " + destroy_fields_name + "(self, &__destroy_stack, &__destroy_count, &__destroy_capacity);\n" + "    blorp_release_arc_only_slow_extern(self);\n" + "  }\n" + "  free(__destroy_stack);\n" + "}\n\n"
+	) + "    default:\n" + "      break;\n" + "  }\n" + "}\n\n" + storage_class + destroy_function_signature(
+		naming.destroy_name,
+	) + " {\n" + "  " + type_name + "** __destroy_stack = NULL;\n" + "  long __destroy_count = 0;\n" + "  long __destroy_capacity = 0;\n" + "  " + destroy_fields_name + "((" + type_name + "*)obj, &__destroy_stack, &__destroy_count, &__destroy_capacity);\n" + "  while (__destroy_count > 0) {\n" + "    " + type_name + "* self = __destroy_stack[--__destroy_count];\n" + "    " + destroy_fields_name + "(self, &__destroy_stack, &__destroy_count, &__destroy_capacity);\n" + "    blorp_release_arc_only_slow_extern(self);\n" + "  }\n" + "  free(__destroy_stack);\n" + "}\n\n"
 
 
 private pure func emit_union_destructor(
@@ -25326,7 +25340,7 @@ private pure func emit_union_decl(
 		)
 		constructor_pieces = constructor_pieces.append({
 			is_owner_data = variant.fields.length() == 0,
-			text = emit_union_constructor(union_decl, variant, naming)
+			text = emit_union_constructor(union_decl, variant, naming),
 		})
 		reuse_constructors_c = append_emitted_c(
 			reuse_constructors_c,
@@ -25559,7 +25573,11 @@ private pure func emit_union_decls(
 				c_code = append_emitted_c(
 					c_code,
 					render_union_decl_emission(
-						emit_union_decl(union_decl, authority, internal_type_linkage),
+						emit_union_decl(
+							union_decl,
+							authority,
+							internal_type_linkage,
+						),
 					),
 				)
 			HeapRecordDecl(record_decl):
@@ -25595,7 +25613,11 @@ private pure func emit_enum_decls(
 				c_code = append_emitted_c(
 					c_code,
 					render_enum_decl_emission(
-						emit_enum_decl(enum_decl, authority, internal_type_linkage),
+						emit_enum_decl(
+							enum_decl,
+							authority,
+							internal_type_linkage,
+						),
 					),
 				)
 			HeapRecordDecl(record_decl):
@@ -25686,7 +25708,10 @@ private pure func emit_global_decls(decls: List[CoreDecl], internal_type_linkage
 	for decl in decls:
 		match decl:
 			GlobalDecl(global):
-				c_code = append_emitted_c(c_code, emit_global_decl(global, internal_type_linkage))
+				c_code = append_emitted_c(
+					c_code,
+					emit_global_decl(global, internal_type_linkage),
+				)
 			EnumDecl(enum_decl):
 				void
 			HeapRecordDecl(record_decl):
@@ -25827,7 +25852,7 @@ private pure func emit_global_init_function(
 
 			Ok(
 				cleanup_function + with_current_task_local(
-					"void __blorp_init_globals(void) {\n" + statements + cleanup_registration + "}\n\n",
+					"void " + GLOBAL_INIT_FUNCTION_NAME + "(void) {\n" + statements + cleanup_registration + "}\n\n",
 				),
 			)
 
@@ -25918,7 +25943,7 @@ private pure func emit_function_decls(
 						program_summary,
 						symbol_authority,
 						internal_type_linkage,
-					)
+					),
 				})
 			EnumDecl(enum_decl):
 				void
@@ -25989,7 +26014,11 @@ private pure func emit_static_closure_forward_decls(
 			FunctionDecl(func_info):
 				c_code = append_emitted_c(
 					c_code,
-					emit_static_closure_forward_decl(func_info, symbol_authority, internal_type_linkage),
+					emit_static_closure_forward_decl(
+						func_info,
+						symbol_authority,
+						internal_type_linkage,
+					),
 				)
 			EnumDecl(enum_decl):
 				void
@@ -26109,7 +26138,12 @@ private pure func emit_decls(
 		enum_decls = emit_enum_decls(decls, symbol_authority, internal_type_linkage),
 		generated_stack_option_typedefs = emit_generated_stack_option_typedefs(decls),
 		union_decls = emit_union_decls(decls, symbol_authority, internal_type_linkage),
-		heap_record_decls = emit_heap_record_decls(decls, layouts, symbol_authority, internal_type_linkage),
+		heap_record_decls = emit_heap_record_decls(
+			decls,
+			layouts,
+			symbol_authority,
+			internal_type_linkage,
+		),
 		canonical_empty_lists = emit_canonical_empty_list_definitions(canonical_empty_lists),
 		static_string_literals = emit_static_string_literal_definitions(static_string_literals),
 		static_closure_forward_decls = emit_static_closure_forward_decls(
@@ -26117,7 +26151,11 @@ private pure func emit_decls(
 			symbol_authority,
 			internal_type_linkage,
 		),
-		function_forward_decls = emit_function_forward_decls(decls, internal_linkage, symbol_authority),
+		function_forward_decls = emit_function_forward_decls(
+			decls,
+			internal_linkage,
+			symbol_authority,
+		),
 		global_decls = emit_global_decls(decls, internal_type_linkage),
 		global_init = global_init,
 		profile_metadata = emit_profile_metadata(profile_plan, internal_type_linkage),
@@ -26128,7 +26166,7 @@ private pure func emit_decls(
 			internal_linkage,
 			cancellation_summary,
 			internal_type_linkage,
-		)
+		),
 	})
 
 
@@ -26137,6 +26175,7 @@ private pure func error_artifact(error: CoreEmitError) -> CArtifact:
 		c_code = C_ARTIFACT_HEADER + "#error " + c_string_literal(
 			core_emit_error_message(error),
 		) + "\n",
+		extra_units = [],
 		link_flags = [],
 		include_dirs = []
 	}
@@ -26164,6 +26203,7 @@ pure func try_emit_prepared_core_program_c_artifact_with_profile(
 				c_code = C_ARTIFACT_HEADER + emit_foreign_includes(
 					program.foreign_includes,
 				) + render_single_translation_unit(sections),
+				extra_units = [],
 				link_flags = [],
 				include_dirs = [],
 			})
@@ -26192,6 +26232,7 @@ pure func try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
 		c_code = C_ARTIFACT_HEADER + emit_foreign_includes(
 			program.foreign_includes,
 		) + render_single_translation_unit(sections),
+		extra_units = [],
 		link_flags = [],
 		include_dirs = [],
 	})
@@ -26229,7 +26270,6 @@ pure func emit_unprojected_core_program_c_artifact_for_tests(program: CoreProgra
 	)
 
 
-
 ---
 `shared_header` (not `header`): a heap record's synthesized `blorp_Object
 header` member collides with a plain field named `header`.
@@ -26260,7 +26300,11 @@ private pure func collect_value_record_decl_emissions(
 
 	for record_decl in value_record_decls_in_dependency_order(decls):
 		result = result.append(
-			emit_value_record_decl(record_decl, c_record_layout(layouts, record_decl.name), authority),
+			emit_value_record_decl(
+				record_decl,
+				c_record_layout(layouts, record_decl.name),
+				authority,
+			),
 		)
 
 	result
@@ -26404,7 +26448,11 @@ private pure func union_constructor_param_list(
 
 	for field in variant.fields:
 		params = params.append(
-			emit_union_constructor_param(union_decl.payload_storage, field, index),
+			emit_union_constructor_param(
+				union_decl.payload_storage,
+				field,
+				index,
+			),
 		)
 		index += 1
 
@@ -26575,7 +26623,10 @@ private pure func type_support_function_prototypes(
 						destroy_function_signature(naming.destroy_name) + ";\n",
 					)
 
-				c_code = append_emitted_c(c_code, heap_record_make_signature(record_decl, naming) + ";\n")
+				c_code = append_emitted_c(
+					c_code,
+					heap_record_make_signature(record_decl, naming) + ";\n",
+				)
 			UnionDecl(union_decl):
 				naming: BackendTypeNaming = selected_type_naming(authority, union_decl.name)
 
@@ -26624,17 +26675,26 @@ private pure func type_support_function_definitions(
 	var c_code: String = make_string(0)
 
 	for emission in heap_record_emissions:
-		c_code = append_emitted_c(c_code, emission.functions.join(""))
+		c_code = append_emitted_c(
+			c_code,
+			emission.functions.join(""),
+		)
 
 	for emission in union_emissions:
-		c_code = append_emitted_c(c_code, emission.functions.join(""))
+		c_code = append_emitted_c(
+			c_code,
+			emission.functions.join(""),
+		)
 
 		for piece in emission.constructor_pieces:
 			if not piece.is_owner_data:
 				c_code = append_emitted_c(c_code, piece.text)
 
 	for emission in enum_emissions:
-		c_code = append_emitted_c(c_code, emission.functions.join(""))
+		c_code = append_emitted_c(
+			c_code,
+			emission.functions.join(""),
+		)
 
 	c_code
 
@@ -26757,11 +26817,15 @@ private pure func assign_translation_units(
 
 	for function in sorted_largest_first:
 		var smallest_index: Int = 0
-		var smallest_total: Int = bin_totals.get(0).get_or(0)
+		var smallest_total: Int = bin_totals
+			.get(0)
+			.get_or(0)
 		var scan_index: Int = 1
 
 		while scan_index < effective_unit_count:
-			candidate_total: Int = bin_totals.get(scan_index).get_or(0)
+			candidate_total: Int = bin_totals
+				.get(scan_index)
+				.get_or(0)
 
 			if candidate_total < smallest_total:
 				smallest_total = candidate_total
@@ -26769,11 +26833,19 @@ private pure func assign_translation_units(
 
 			scan_index += 1
 
-		bins = bins.set(smallest_index, bins.get(smallest_index).get_or([]).append(function))
+		bins = bins.set(
+			smallest_index,
+			bins
+				.get(smallest_index)
+				.get_or([])
+				.append(function),
+		)
 		bin_totals = bin_totals.set(smallest_index, smallest_total + function.text.length())
 
 	bins.map(
-		func(bin: List[CFunctionEmission]): bin.sort_by(func(function: CFunctionEmission): function.def_id),
+		func(
+			bin: List[CFunctionEmission],
+		): bin.sort_by(func(function: CFunctionEmission): function.def_id),
 	)
 
 
@@ -26862,9 +26934,19 @@ private pure func render_split_translation_units(
 			header_canonical_empty_list_externs,
 			piece.header_extern,
 		)
-		tu0_canonical_empty_list_defs = append_emitted_c(tu0_canonical_empty_list_defs, piece.tu0_definition)
+		tu0_canonical_empty_list_defs = append_emitted_c(
+			tu0_canonical_empty_list_defs,
+			piece.tu0_definition,
+		)
 
-	header_string_literal_externs: String = emit_static_string_literal_extern_decls(static_string_literals)
+	-- Unit 0 always defines the initializer, the entrypoint always calls it,
+	-- and LPT is free to bin the entrypoint into any unit, so the header
+	-- prototypes it unconditionally.
+	header_global_init_prototype: String = "void " + GLOBAL_INIT_FUNCTION_NAME + "(void);\n\n"
+
+	header_string_literal_externs: String = emit_static_string_literal_extern_decls(
+		static_string_literals,
+	)
 	header_global_externs: String = emit_global_extern_decls(decls)
 	header_profile_metadata_extern: String = emit_profile_metadata_extern_decl(profile_plan)
 
@@ -26876,7 +26958,7 @@ private pure func render_split_translation_units(
 		enum_emissions,
 		union_emissions,
 		heap_record_emissions,
-	) + header_owner_data + header_literal_macro + header_canonical_empty_list_typedefs + header_canonical_empty_list_externs + header_string_literal_externs + sections.static_closure_forward_decls + header_global_externs + header_profile_metadata_extern + type_support_function_prototypes(
+	) + header_owner_data + header_global_init_prototype + header_literal_macro + header_canonical_empty_list_typedefs + header_canonical_empty_list_externs + header_string_literal_externs + sections.static_closure_forward_decls + header_global_externs + header_profile_metadata_extern + type_support_function_prototypes(
 		decls,
 		authority,
 	) + sections.function_forward_decls + emit_entrypoint_forward_decls(
@@ -26892,7 +26974,11 @@ private pure func render_split_translation_units(
 		""
 	else:
 		static_string_literals
-			.map(func(literal): emit_static_string_literal_definition(literal, "BLORP_EXTERN_STRING"))
+			.map(
+				func(
+					literal,
+				): emit_static_string_literal_definition(literal, "BLORP_EXTERN_STRING"),
+			)
 			.join("\n") + "\n\n"
 
 	var tu0_owner_data: String = make_string(0)
@@ -26906,7 +26992,10 @@ private pure func render_split_translation_units(
 		enum_emissions,
 	)
 
-	function_bins: List[String] = bin_function_definitions(sections.function_definitions, unit_count)
+	function_bins: List[String] = bin_function_definitions(
+		sections.function_definitions,
+		unit_count,
+	)
 
 	header_include: String = "#include \"" + header_name + "\"\n"
 
@@ -26946,10 +27035,13 @@ pure func try_emit_prepared_core_program_c_split_artifact_with_profile(
 	header_name: String,
 ) -> Result[CTranslationUnitSet, CoreEmitError]:
 	if unit_count <= 1:
-		single ?= try_emit_prepared_core_program_c_artifact_with_profile(prepared, profile_configuration)
+		single ?= try_emit_prepared_core_program_c_artifact_with_profile(
+			prepared,
+			profile_configuration,
+		)
 		Ok({
 			shared_header = "",
-			bodies = [single.c_code]
+			bodies = [single.c_code],
 		})
 	else:
 		program: CoreProgram = prepared_core_program_value(prepared)
@@ -26959,14 +27051,20 @@ pure func try_emit_prepared_core_program_c_split_artifact_with_profile(
 				Err(CallableSymbolProjectionFailed(error))
 			Ok(symbol_plan):
 				authority: CEmissionSymbolAuthority = ValidatedCEmissionSymbols(symbol_plan)
-				canonical_empty_lists: List[CanonicalEmptyList] = c_emission_canonical_empty_lists(symbol_plan)
+				canonical_empty_lists: List[CanonicalEmptyList] = c_emission_canonical_empty_lists(
+					symbol_plan,
+				)
 				layouts: CRecordLayoutRegistry = classify_c_record_layouts(program)
 				static_string_literals ?= collect_backend_static_string_literals(
 					program,
 				).map_err(
 					func(error): InvalidStaticStringLiteralPool(error),
 				)
-				profile_plan ?= profile_emission_plan(program.decls, authority, profile_configuration)
+				profile_plan ?= profile_emission_plan(
+					program.decls,
+					authority,
+					profile_configuration,
+				)
 				sections ?= emit_decls(
 					program,
 					profile_configuration,
@@ -26976,15 +27074,17 @@ pure func try_emit_prepared_core_program_c_split_artifact_with_profile(
 					False,
 				)
 
-				Ok(render_split_translation_units(
-					sections,
-					program.decls,
-					layouts,
-					authority,
-					canonical_empty_lists,
-					static_string_literals,
-					profile_plan,
-					program.foreign_includes,
-					unit_count,
-					header_name,
-				))
+				Ok(
+					render_split_translation_units(
+						sections,
+						program.decls,
+						layouts,
+						authority,
+						canonical_empty_lists,
+						static_string_literals,
+						profile_plan,
+						program.foreign_includes,
+						unit_count,
+						header_name,
+					),
+				)

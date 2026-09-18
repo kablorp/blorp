@@ -3,15 +3,17 @@
 -- Runtime source is supplied explicitly by the executable assembly layer. The
 -- writer does not discover installation paths or consult process-global state.
 import:
+	../lib/build_artifact: c_shared_header_name
 	../lib/compilation: CompileArtifactOutput
 	../lib/function_profile: function_profile_runtime_c_prelude
-	fs: IOError, write_text_parts_atomic
-	path: extension
+	fs: IOError, write_text_atomic, write_text_parts_atomic
+	path: extension, stem
 	string: remove_suffix
 
 
 union ArtifactWriteError:
 	MissingEmbeddedRuntime
+	SplitArtifactRequiresExternalRuntime
 	ArtifactWriteIo(IOError)
 
 
@@ -19,6 +21,8 @@ pure func artifact_write_error_message(error: ArtifactWriteError) -> String:
 	match error:
 		MissingEmbeddedRuntime:
 			"embedded compiler runtime source is unavailable"
+		SplitArtifactRequiresExternalRuntime:
+			"multiple C translation units require --no-embed-runtime"
 		ArtifactWriteIo(io_error):
 			io_error.to_string()
 
@@ -35,12 +39,66 @@ pure func compile_output_path(source_path: String, requested: Option[String]) ->
 					source_path + ".c"
 
 
+---
+The file set a split artifact publishes for a requested output path, derived
+from that path alone: `-o build/x.c` with three units yields `build/x.h`,
+`build/x.0.c`, `build/x.1.c`, `build/x.2.c` and the manifest `build/x.units`.
+`x.c` itself is never written in split mode.
+---
+record CSplitOutputPaths {
+	shared_header: String,
+	bodies: List[String],
+	manifest: String
+}
+
+
+--- The manifest extension that lists a split artifact's file set, one path
+--- per line with the shared header first.
+private SPLIT_MANIFEST_EXTENSION: String = ".units"
+
+
+private pure func output_path_without_extension(output_path: String) -> String:
+	match extension(output_path):
+		Some(output_extension):
+			output_path.remove_suffix(output_extension)
+		None:
+			output_path
+
+
+pure func compile_split_output_paths(output_path: String, unit_count: Int) -> CSplitOutputPaths:
+	prefix: String = output_path_without_extension(output_path)
+	var bodies: List[String] = []
+
+	for unit_index in 0..unit_count:
+		bodies = bodies.append(prefix + "." + unit_index.to_string() + ".c")
+
+	-- `prefix` ends with the output file's stem, so dropping it leaves the
+	-- directory the set is written into. The header keeps the exact file name
+	-- the emitted bodies include, which is what makes the set relocatable.
+	directory_prefix: String = prefix.remove_suffix(output_path.stem())
+
+	{
+		shared_header = directory_prefix + c_shared_header_name(output_path),
+		bodies = bodies,
+		manifest = prefix + SPLIT_MANIFEST_EXTENSION
+	}
+
+
+--- The manifest text: the shared header, then every body, one path per line.
+pure func split_manifest_text(paths: CSplitOutputPaths) -> String:
+	[paths.shared_header]
+		.concat(paths.bodies)
+		.join("\n") + "\n"
+
+
 private pure func compile_artifact_source_parts(
 	artifact: CompileArtifactOutput,
 	embedded_runtime_source: String,
 ) -> Result[List[String], ArtifactWriteError]:
 	if artifact.embed_runtime:
-		if embedded_runtime_source.length() == 0:
+		if artifact.extra_units.length() > 0:
+			Err(SplitArtifactRequiresExternalRuntime)
+		else if embedded_runtime_source.length() == 0:
 			Err(MissingEmbeddedRuntime)
 		else:
 			Ok([
@@ -52,15 +110,69 @@ private pure func compile_artifact_source_parts(
 		Ok([artifact.c_code])
 
 
+private func write_split_compile_artifact(
+	artifact: CompileArtifactOutput,
+	output_path: String,
+) -> Result[String, ArtifactWriteError]:
+	if artifact.embed_runtime:
+		Err(SplitArtifactRequiresExternalRuntime)
+	else:
+		paths: CSplitOutputPaths = compile_split_output_paths(
+			output_path,
+			artifact.extra_units.length(),
+		)
+		var failure: Option[IOError] = None
+
+		match write_text_atomic(paths.shared_header, artifact.c_code):
+			Ok(_):
+				void
+			Err(error):
+				failure = Some(error)
+
+		for unit_index in 0..artifact.extra_units.length():
+			if failure.is_none():
+				body_path: String = paths.bodies.get_or(unit_index, "")
+
+				match write_text_atomic(
+					body_path,
+					artifact.extra_units.get_or(unit_index, ""),
+				):
+					Ok(_):
+						void
+					Err(error):
+						failure = Some(error)
+
+		if failure.is_none():
+			match write_text_atomic(paths.manifest, split_manifest_text(paths)):
+				Ok(_):
+					void
+				Err(error):
+					failure = Some(error)
+
+		match failure:
+			Some(error):
+				Err(ArtifactWriteIo(error))
+			None:
+				Ok(paths.manifest)
+
+
+---
+Publish the artifact and return the path a caller should report. Single-file
+artifacts write `output_path` itself; split artifacts write the shared
+header, every body, and the manifest, and report the manifest.
+---
 func write_compile_artifact(
 	artifact: CompileArtifactOutput,
 	output_path: String,
 	embedded_runtime_source: String,
 ) -> Result[String, ArtifactWriteError]:
-	source_parts ?= compile_artifact_source_parts(artifact, embedded_runtime_source)
+	if artifact.extra_units.length() > 0:
+		write_split_compile_artifact(artifact, output_path)
+	else:
+		source_parts ?= compile_artifact_source_parts(artifact, embedded_runtime_source)
 
-	match write_text_parts_atomic(output_path, source_parts):
-		Ok(_):
-			Ok(output_path)
-		Err(error):
-			Err(ArtifactWriteIo(error))
+		match write_text_parts_atomic(output_path, source_parts):
+			Ok(_):
+				Ok(output_path)
+			Err(error):
+				Err(ArtifactWriteIo(error))

@@ -57,7 +57,7 @@ if ! grep -Fq "$expected_default_gates" scripts/test; then
 	echo "FAIL: scripts/test defaults should exercise only Blorp-owned compiler suites"
 	exit 1
 fi
-if ! grep -Fq 'bin/blorp test --doc --std-dir "$std_root"' scripts/test || \
+if ! grep -Fq 'bin/blorp test $blorp_test_artifact_flags --doc --std-dir "$std_root"' scripts/test || \
 	! grep -Fq -- '--timeout "$test_timeout" "$std_root"' scripts/test
 then
 	echo "FAIL: scripts/test doctest must use the explicit production std root"
@@ -401,6 +401,58 @@ if grep -Fq 'blorp/test/runtime/memory' "$TMP_HARNESS/test-command-log.txt" \
 fi
 
 echo "PASS: scripts/test runtime leaves leak-owned sources to the leak gate"
+
+: > "$TMP_HARNESS/test-command-log.txt"
+release_artifacts_output="$TMP_HARNESS/release-artifacts-output.txt"
+write_fake_blorp "$check_log"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_TEST_COMMAND_EXIT=0 \
+		BLORP_TEST_TIMEOUT=30 \
+		BLORP_RUNTIME_TEST_TIMEOUT=60 \
+		bash scripts/test runtime --serial --no-build --release-artifacts
+) > "$release_artifacts_output" 2>&1
+release_artifacts_status=$?
+
+if [ "$release_artifacts_status" -ne 0 ]; then
+	echo "FAIL: scripts/test --release-artifacts should run the selected gate"
+	cat "$release_artifacts_output"
+	exit 1
+fi
+if ! grep -Fxq 'test --release --suite --timeout 60 blorp/test/runtime/types/' \
+	"$TMP_HARNESS/test-command-log.txt"; then
+	echo "FAIL: scripts/test --release-artifacts should pass --release to bin/blorp test"
+	cat "$TMP_HARNESS/test-command-log.txt"
+	exit 1
+fi
+if [ -s "$TMP_HARNESS/make-target-log.txt" ]; then
+	echo "FAIL: scripts/test --release-artifacts must not change how bin/blorp is built"
+	cat "$TMP_HARNESS/make-target-log.txt"
+	exit 1
+fi
+
+echo "PASS: scripts/test --release-artifacts compiles test artifacts at -O2"
+
+: > "$TMP_HARNESS/test-command-log.txt"
+default_artifacts_output="$TMP_HARNESS/default-artifacts-output.txt"
+write_fake_blorp "$check_log"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_TEST_COMMAND_EXIT=0 \
+		BLORP_TEST_TIMEOUT=30 \
+		BLORP_RUNTIME_TEST_TIMEOUT=60 \
+		bash scripts/test runtime --serial --no-build
+) > "$default_artifacts_output" 2>&1
+
+if grep -Fq -- '--release' "$TMP_HARNESS/test-command-log.txt"; then
+	echo "FAIL: scripts/test should keep gating artifacts at -O0 by default"
+	cat "$TMP_HARNESS/test-command-log.txt"
+	exit 1
+fi
+
+echo "PASS: scripts/test leaves gating artifacts at -O0 by default"
 
 varied_root_index=0
 while [ "$varied_root_index" -lt 65 ]; do

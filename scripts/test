@@ -18,6 +18,7 @@
 #   scripts/test compiler-blorp runtime  # Multiple gates
 #   scripts/test --serial           # Run selected gates one at a time
 #   scripts/test --no-build         # Test the existing installed toolchain
+#   scripts/test --release-artifacts # Compile test artifacts at -O2
 #   scripts/test --timings          # Print generated TestSuite phase timings
 #   scripts/test --verbose          # Print every child-runner line
 #   scripts/test --log-dir logs     # Save premerge gate logs
@@ -64,6 +65,9 @@ Options:
                        default (for full gate runs). Switching -O levels
                        between runs re-links the compiler; see
                        docs/DEVELOPMENT.md.
+  --release-artifacts Compile every test artifact at -O2 instead of the -O0
+                       gating default. Does not change how bin/blorp itself
+                       is built; see --release-compiler for that.
   --timings      Print generated TestSuite phase timings.
   --verbose      Stream full child-runner output, including passing tests.
   --quiet        Suppress passing-test output (default).
@@ -75,6 +79,9 @@ EOF
 gates=()
 skip_build=false
 release_compiler=false
+# Extra flags handed to every `bin/blorp test` invocation. Empty by default,
+# so the gating artifacts keep their -O0 build.
+blorp_test_artifact_flags=""
 serial=false
 verbose=false
 timings=false
@@ -85,6 +92,7 @@ while [ $# -gt 0 ]; do
     case "$arg" in
         --no-build) skip_build=true ;;
         --release-compiler) release_compiler=true ;;
+        --release-artifacts) blorp_test_artifact_flags="--release" ;;
         --timings) timings=true ;;
         --serial) serial=true ;;
         --verbose) verbose=true ;;
@@ -851,7 +859,7 @@ run_runtime_gate_commands() {
     fi
 
     capture_stream_append "$output_file" "$live" \
-        env BLORP_GATE_RESULT=runtime bin/blorp test --suite --timeout "$runtime_test_timeout" \
+        env BLORP_GATE_RESULT=runtime bin/blorp test $blorp_test_artifact_flags --suite --timeout "$runtime_test_timeout" \
         "${runtime_roots[@]}"
     suite_status=$?
 
@@ -920,12 +928,12 @@ run_compiler_blorp_tests() {
     if [ "${BLORP_COMPILER_TEST_PROGRESS:-0}" = "1" ]; then
         capture_stream_append_with_artifact_progress "$output_file" "$live" \
             env BLORP_GATE_RESULT="$result_gate" \
-            bin/blorp test --suite \
+            bin/blorp test $blorp_test_artifact_flags --suite \
             --timeout "$compiler_blorp_test_timeout" \
             "${compiler_blorp_test_sources[@]}"
     else
         capture_stream_append "$output_file" "$live" env BLORP_GATE_RESULT="$result_gate" \
-            bin/blorp test --suite \
+            bin/blorp test $blorp_test_artifact_flags --suite \
             --timeout "$compiler_blorp_test_timeout" \
             "${compiler_blorp_test_sources[@]}"
     fi
@@ -986,7 +994,7 @@ run_compiler_core_sanitize_commands() {
     local live="${2:-false}"
 
     capture_stream_append "$output_file" "$live" env BLORP_GATE_RESULT=compiler_core_sanitize \
-        bin/blorp test --sanitize --timeout "$compiler_sanitize_test_timeout" \
+        bin/blorp test $blorp_test_artifact_flags --sanitize --timeout "$compiler_sanitize_test_timeout" \
         "${compiler_core_sanitize_roots[@]}"
 }
 
@@ -995,7 +1003,7 @@ run_compiler_blorp_sanitize_commands() {
     local live="${2:-false}"
 
     capture_stream_append "$output_file" "$live" env BLORP_GATE_RESULT=compiler_blorp_sanitize \
-        bin/blorp test --sanitize --timeout "$compiler_sanitize_test_timeout" blorp/test/compiler/
+        bin/blorp test $blorp_test_artifact_flags --sanitize --timeout "$compiler_sanitize_test_timeout" blorp/test/compiler/
 }
 
 parse_std_check_gate_output() {
@@ -1236,7 +1244,7 @@ run_leak() {
         exit 1
     }
     if $verbose; then
-        env BLORP_GATE_RESULT=leak bin/blorp test --leak-check --suite --timeout "$leak_test_timeout" "${leak_roots[@]}" 2>&1 | tee "$output_file"
+        env BLORP_GATE_RESULT=leak bin/blorp test $blorp_test_artifact_flags --leak-check --suite --timeout "$leak_test_timeout" "${leak_roots[@]}" 2>&1 | tee "$output_file"
         suite_exit=${PIPESTATUS[0]}
         suite_output=$(cat "$output_file")
         blorp/test/runtime/test_leak_report.sh 2>&1 | tee "$diag_output_file"
@@ -1244,7 +1252,7 @@ run_leak() {
         diag_output=$(cat "$diag_output_file")
         cat "$diag_output_file" >> "$output_file"
     else
-        env BLORP_GATE_RESULT=leak bin/blorp test --leak-check --suite --timeout "$leak_test_timeout" "${leak_roots[@]}" > "$output_file" 2>&1
+        env BLORP_GATE_RESULT=leak bin/blorp test $blorp_test_artifact_flags --leak-check --suite --timeout "$leak_test_timeout" "${leak_roots[@]}" > "$output_file" 2>&1
         suite_exit=$?
         suite_output=$(cat "$output_file")
         blorp/test/runtime/test_leak_report.sh > "$diag_output_file" 2>&1
@@ -1283,7 +1291,7 @@ run_doctest() {
     std_root=$(CDPATH= cd -- standard_library/src && pwd -P)
     output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_doctest.XXXXXX") || exit 1
     capture_stream "$output_file" env BLORP_GATE_RESULT=doctest \
-        bin/blorp test --doc --std-dir "$std_root" --timeout "$test_timeout" "$std_root"
+        bin/blorp test $blorp_test_artifact_flags --doc --std-dir "$std_root" --timeout "$test_timeout" "$std_root"
     exit_code=$?
     output=$(cat "$output_file")
     record_gate_log "doctest" "$output_file"
@@ -1487,7 +1495,7 @@ run_gate_to_file() {
             run_runtime_gate_commands "$outfile" false
             ;;
         leak)
-            env BLORP_GATE_RESULT=leak bin/blorp test --leak-check --suite --timeout "$parallel_leak_timeout" "${leak_roots[@]}" >> "$outfile" 2>&1
+            env BLORP_GATE_RESULT=leak bin/blorp test $blorp_test_artifact_flags --leak-check --suite --timeout "$parallel_leak_timeout" "${leak_roots[@]}" >> "$outfile" 2>&1
             leak_suite_exit=$?
             leak_suite_output=$(cat "$outfile")
             leak_diag_outfile="$gate_tmpdir/${gate}_diag_output"
@@ -1504,7 +1512,7 @@ run_gate_to_file() {
             ;;
         doctest)
             std_root=$(CDPATH= cd -- standard_library/src && pwd -P)
-            env BLORP_GATE_RESULT=doctest bin/blorp test --doc \
+            env BLORP_GATE_RESULT=doctest bin/blorp test $blorp_test_artifact_flags --doc \
                 --std-dir "$std_root" --timeout "$test_timeout" "$std_root" \
                 >> "$outfile" 2>&1
             ;;

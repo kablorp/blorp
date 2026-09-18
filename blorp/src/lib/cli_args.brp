@@ -62,6 +62,7 @@ record CliCompileArgs {
 	debug: Bool,
 	no_format: Bool,
 	embed_runtime: Bool,
+	c_translation_units: Int,
 	std_dir: Option[String],
 	output: Option[String],
 	files: List[String]
@@ -74,6 +75,7 @@ record CliRunArgs {
 	sanitizer: Option[CliSanitizerMode],
 	leak_check: Bool,
 	release: Bool,
+	c_translation_units: Int,
 	no_format: Bool,
 	timeout: Option[Int],
 	threads: Option[Int],
@@ -88,6 +90,8 @@ record CliTestArgs {
 	debug: Bool,
 	sanitizer: Option[CliSanitizerMode],
 	leak_check: Bool,
+	release: Bool,
+	c_translation_units: Int,
 	timeout: Option[Int],
 	repeat: Int,
 	mode: CliTestMode,
@@ -280,6 +284,16 @@ private DEFAULT_CHECK_ARGS: CliCheckArgs = {
 	paths = []
 }
 
+--- The flag that chooses how many C translation units emission produces.
+C_TRANSLATION_UNITS_FLAG: String = "--c-translation-units"
+
+--- One translation unit: the single-file emission every user program uses.
+SINGLE_C_TRANSLATION_UNIT: Int = 1
+
+--- `blorp test` compiles its generated artifacts as this many translation
+--- units so the host C compiler can work on them in parallel.
+DEFAULT_TEST_C_TRANSLATION_UNITS: Int = 8
+
 private DEFAULT_COMPILE_ARGS: CliCompileArgs = {
 	ast_only = False,
 	profile = FunctionProfileOff,
@@ -293,6 +307,7 @@ private DEFAULT_COMPILE_ARGS: CliCompileArgs = {
 	debug = False,
 	no_format = False,
 	embed_runtime = True,
+	c_translation_units = SINGLE_C_TRANSLATION_UNIT,
 	std_dir = None,
 	output = None,
 	files = []
@@ -304,6 +319,7 @@ private DEFAULT_RUN_ARGS: CliRunArgs = {
 	sanitizer = None,
 	leak_check = False,
 	release = False,
+	c_translation_units = SINGLE_C_TRANSLATION_UNIT,
 	no_format = False,
 	timeout = None,
 	threads = None,
@@ -317,6 +333,8 @@ private DEFAULT_TEST_ARGS: CliTestArgs = {
 	debug = False,
 	sanitizer = None,
 	leak_check = False,
+	release = False,
+	c_translation_units = DEFAULT_TEST_C_TRANSLATION_UNITS,
 	timeout = None,
 	repeat = DEFAULT_TEST_REPEAT,
 	mode = CliTestAll,
@@ -382,6 +400,48 @@ private pure func parse_eq_arg(arg: String, flag: String) -> Option[String]:
 		Some(arg.remove_prefix(prefix))
 	else:
 		None
+
+
+private record CTranslationUnitsOption {
+	unit_count: Int,
+	consumed_value_argument: Bool
+}
+
+
+---
+Parse `--c-translation-units=N` and `--c-translation-units N`. `None` means
+`arg` names a different option; the value is never read from the environment.
+---
+private pure func parse_c_translation_units_option(
+	arg: String,
+	next: Option[String],
+) -> Option[Result[CTranslationUnitsOption, CliAction]]:
+	match parse_eq_arg(arg, C_TRANSLATION_UNITS_FLAG):
+		Some(value):
+			Some(parse_positive_int_option(C_TRANSLATION_UNITS_FLAG, value).map(
+				pure func(count: Int): {
+					unit_count = count,
+					consumed_value_argument = False
+				},
+			))
+		None:
+			if arg == C_TRANSLATION_UNITS_FLAG:
+				match next:
+					Some(value):
+						Some(parse_positive_int_option(C_TRANSLATION_UNITS_FLAG, value).map(
+							pure func(count: Int): {
+								unit_count = count,
+								consumed_value_argument = True
+							},
+						))
+					None:
+						Some(Err(CliError(option_requires_value(C_TRANSLATION_UNITS_FLAG))))
+			else:
+				None
+
+
+private pure func names_c_translation_units_option(arg: String) -> Bool:
+	arg == C_TRANSLATION_UNITS_FLAG or arg.starts_with(C_TRANSLATION_UNITS_FLAG + "=")
 
 
 private pure func parse_profile_mode(
@@ -608,6 +668,24 @@ private pure func parse_compile_args(args: List[String]) -> CliAction:
 										parsed = { parsed | no_format = True }
 									else if arg == "--no-embed-runtime":
 										parsed = { parsed | embed_runtime = False }
+									else if names_c_translation_units_option(arg):
+										match parse_c_translation_units_option(
+											arg,
+											args.get(index + 1),
+										):
+											Some(parsed_option):
+												match parsed_option:
+													Ok(option):
+														parsed = { parsed |
+															c_translation_units = option.unit_count
+														}
+
+														if option.consumed_value_argument:
+															index += 1
+													Err(action):
+														result = Some(action)
+											None:
+												void
 									else if arg == "--std-dir":
 										match args.get(index + 1):
 											Some(dir):
@@ -639,6 +717,19 @@ private pure func parse_compile_args(args: List[String]) -> CliAction:
 				parsed = { parsed | profile = profile }
 			Err(action):
 				result = Some(action)
+
+	-- Split emission produces a shared header plus N bodies, which has no
+	-- single stream the embedded runtime source could be prepended to.
+	if (
+		result.is_none()
+		and parsed.c_translation_units > SINGLE_C_TRANSLATION_UNIT
+		and parsed.embed_runtime
+	):
+		result = Some(
+			CliError(
+				"Error: " + C_TRANSLATION_UNITS_FLAG + " above 1 requires --no-embed-runtime",
+			),
+		)
 
 	match result:
 		Some(action):
@@ -857,6 +948,24 @@ private pure func parse_test_args(args: List[String]) -> CliAction:
 						result = Some(action)
 			else if arg == "--leak-check":
 				parsed = { parsed | leak_check = True }
+			else if arg == "--release":
+				parsed = { parsed | release = True }
+			else if names_c_translation_units_option(arg):
+				match parse_c_translation_units_option(
+					arg,
+					args.get(index + 1),
+				):
+					Some(parsed_option):
+						match parsed_option:
+							Ok(option):
+								parsed = { parsed | c_translation_units = option.unit_count }
+
+								if option.consumed_value_argument:
+									index += 1
+							Err(action):
+								result = Some(action)
+					None:
+						void
 			else if arg == "--warmup-only":
 				warmup_only = True
 			else if arg == "--doc":

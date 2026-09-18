@@ -7,9 +7,14 @@ import:
 	../lib/host_c:
 		HostCCompileError(HostCProcessFailed),
 		HostCPreparedCompilation,
+		HostCSplitCompilation,
 		HostPrecompiledRuntime,
 		classify_host_c_compilation_result,
+		classify_host_c_process_result,
 		prepare_host_c_compilation,
+		prepare_host_c_split_compilation,
+		run_host_c_translation_units,
+		write_host_c_split_sources,
 	../lib/host_environment: HostEnvironment, current_compiler_host_environment_with_runner
 	../lib/platform:
 		HostPlatformError,
@@ -142,6 +147,75 @@ func run_prepared_host_c_with_session(
 			Err(ProgramHostCompilationFailed(HostCProcessFailed(error)))
 
 
+private func run_single_host_c_with_session(
+	request: ProgramRunRequest,
+	executable_path: String,
+	interrupt_requested: () -> Option[Int],
+) -> Result[String, ProgramRunError]:
+	prepared ?= prepare_host_c_compilation(
+		request.artifact,
+		executable_path,
+		request.host,
+		request.runtime,
+	).map_err(
+		func(error): ProgramHostPreparationFailed(error),
+	)
+	run_prepared_host_c_with_session(prepared, interrupt_requested)
+
+
+---
+Compile a split artifact: write the shared header and every body into the
+run's own scratch directory, compile the bodies concurrently, then link
+their objects under the same process-group supervision the single-file path
+uses. Only the link step is interruptible; the concurrent compiles are short
+and are joined before the interrupt is observed again.
+---
+private func run_split_host_c_with_session(
+	request: ProgramRunRequest,
+	executable_path: String,
+	scratch_directory: String,
+	interrupt_requested: () -> Option[Int],
+) -> Result[String, ProgramRunError]:
+	prepared ?= prepare_host_c_split_compilation(
+		request.artifact,
+		executable_path,
+		request.host,
+		request.runtime,
+		scratch_directory,
+	).map_err(
+		func(error): ProgramHostPreparationFailed(error),
+	)
+	sources_written ?= write_host_c_split_sources(
+		prepared,
+	).map_err(
+		func(error): ProgramTemporaryDirectoryFailed(error),
+	)
+	units_compiled ?= run_host_c_translation_units(
+		prepared,
+	).map_err(
+		func(error): ProgramHostCompilationFailed(error),
+	)
+	run_split_link_with_session(prepared, interrupt_requested)
+
+
+private func run_split_link_with_session(
+	prepared: HostCSplitCompilation,
+	interrupt_requested: () -> Option[Int],
+) -> Result[String, ProgramRunError]:
+	match run_session_command_until(prepared.link_command, interrupt_requested):
+		SessionCommandCompleted(result):
+			classify_host_c_process_result(
+				prepared.output_path,
+				result,
+			).map_err(
+				func(error): ProgramHostCompilationFailed(error),
+			)
+		SessionCommandInterrupted(signal, stdout, stderr):
+			Err(ProgramRunInterrupted(signal, stdout, stderr))
+		SessionCommandFailed(error):
+			Err(ProgramHostCompilationFailed(HostCProcessFailed(error)))
+
+
 --- `record_phase` receives `("host_c", duration_ms)` around native compilation
 --- and `("execution", duration_ms)` around running the compiled artifact, so
 --- callers that need a per-stage breakdown (`blorp test --timings`) can record
@@ -156,17 +230,20 @@ private func run_captured_build_artifact_with_session(
 		request.temporary_root,
 		"blorp_run_",
 	) on error => ProgramTemporaryDirectoryFailed(error):
-		executable_path: String = compilation_directory.resource_path() + "/program.bin"
-		prepared ?= prepare_host_c_compilation(
-			request.artifact,
-			executable_path,
-			request.host,
-			request.runtime,
-		).map_err(
-			func(error): ProgramHostPreparationFailed(error),
-		)
+		scratch_directory: String = compilation_directory.resource_path()
+		executable_path: String = scratch_directory + "/program.bin"
 		host_c_started_at: Int = now_microseconds()
-		compiled_path_result = run_prepared_host_c_with_session(prepared, interrupt_requested)
+
+		compiled_path_result = if request.artifact.extra_units.length() > 0:
+			run_split_host_c_with_session(
+				request,
+				executable_path,
+				scratch_directory,
+				interrupt_requested,
+			)
+		else:
+			run_single_host_c_with_session(request, executable_path, interrupt_requested)
+
 		record_phase("host_c", (now_microseconds() - host_c_started_at) / 1000)
 		compiled_path ?= compiled_path_result
 		program = prepare_program_command(

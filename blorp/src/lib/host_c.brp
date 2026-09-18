@@ -11,7 +11,10 @@ import:
 		BuildRuntimeRequirement(BuildEmbeddedRuntime, BuildExternalRuntime),
 		BuildSanitizer(BuildAddressUndefinedSanitizer, BuildNoSanitizer, BuildUndefinedSanitizer),
 		BuildSourceIdentity,
+		SCRATCH_SHARED_HEADER_NAME,
 		build_c_invocation,
+	channel: ConcurrencyError(Cancelled, TaskFailed, Timeout)
+	fs: IOError, write_text_atomic
 	function_profile: function_profile_runtime_c_prelude
 	process as Process
 	runtime_sources: RuntimeSources
@@ -76,10 +79,12 @@ union HostCPreparationError:
 	HostEmbeddedRuntimeUnavailable
 	HostRuntimeRequirementMismatch
 	HostRuntimeTlsMismatch
+	HostTranslationUnitShapeMismatch
 
 
 union HostCCompileError:
 	HostCProcessFailed(Process.ProcessError)
+	HostCTranslationUnitTaskFailed(String)
 	HostCCompilerRejected(Int, String)
 	HostCCompilerSignaled(Int, String)
 	HostCCompilerTimedOut(String)
@@ -93,12 +98,19 @@ pure func host_c_preparation_error_message(error: HostCPreparationError) -> Stri
 			"build artifact and host runtime inputs are incompatible"
 		HostRuntimeTlsMismatch:
 			"cached runtime TLS configuration does not match the host configuration"
+		HostTranslationUnitShapeMismatch:
+			(
+				"build artifact translation unit count does not match the requested host "
+				+ "compilation"
+			)
 
 
 pure func host_c_compile_error_message(error: HostCCompileError) -> String:
 	match error:
 		HostCProcessFailed(process_error):
 			"cannot start the C compiler: ${process_error.to_string()}"
+		HostCTranslationUnitTaskFailed(detail):
+			"cannot compile a C translation unit: ${detail}"
 		HostCCompilerRejected(code, diagnostics):
 			"C compiler exited with status ${code.to_string()}: ${diagnostics}"
 		HostCCompilerSignaled(signal, diagnostics):
@@ -155,46 +167,54 @@ private pure func host_runtime_policy(
 ) -> Result[HostRuntimePolicy, HostCPreparationError]:
 	runtime_requirement: BuildRuntimeRequirement = artifact.runtime_requirement
 
-	match runtime_requirement:
-		BuildEmbeddedRuntime:
-			match runtime:
-				HostEmbeddedRuntime(sources):
-					if sources.runtime.length() == 0:
-						Err(HostEmbeddedRuntimeUnavailable)
-					else:
-						profile_prelude: String = function_profile_runtime_c_prelude(
-							artifact.compatibility.profile_mode,
-						)
-
-						parts: List[String] = if profile_prelude.length() == 0:
-							[sources.runtime, artifact.c_code]
+	-- A split artifact has no single C source stream to hand the compiler;
+	-- `prepare_host_c_split_compilation` owns that shape instead.
+	if artifact.extra_units.length() > 0:
+		Err(HostTranslationUnitShapeMismatch)
+	else:
+		match runtime_requirement:
+			BuildEmbeddedRuntime:
+				match runtime:
+					HostEmbeddedRuntime(sources):
+						if sources.runtime.length() == 0:
+							Err(HostEmbeddedRuntimeUnavailable)
 						else:
-							[profile_prelude, sources.runtime, artifact.c_code]
+							profile_prelude: String = function_profile_runtime_c_prelude(
+								artifact.compatibility.profile_mode,
+							)
 
-						Ok({
-							c_source_parts = parts,
-							runtime_feature_arguments = configuration.tls.runtime_arguments,
-							link_input_arguments = [],
-						})
-				HostPrecompiledRuntimeInput(_):
-					Err(HostRuntimeRequirementMismatch)
-		BuildExternalRuntime:
-			match runtime:
-				HostEmbeddedRuntime(_):
-					Err(HostRuntimeRequirementMismatch)
-				HostPrecompiledRuntimeInput(precompiled):
-					if not tls_backends_match(precompiled.tls_backend, configuration.tls.backend):
-						Err(HostRuntimeTlsMismatch)
-					else:
-						Ok({
-							c_source_parts = [artifact.c_code],
-							runtime_feature_arguments = [],
-							link_input_arguments = [
-								"-include",
-								precompiled.declarations_path,
-								precompiled.object_path,
-							],
-						})
+							parts: List[String] = if profile_prelude.length() == 0:
+								[sources.runtime, artifact.c_code]
+							else:
+								[profile_prelude, sources.runtime, artifact.c_code]
+
+							Ok({
+								c_source_parts = parts,
+								runtime_feature_arguments = configuration.tls.runtime_arguments,
+								link_input_arguments = [],
+							})
+					HostPrecompiledRuntimeInput(_):
+						Err(HostRuntimeRequirementMismatch)
+			BuildExternalRuntime:
+				match runtime:
+					HostEmbeddedRuntime(_):
+						Err(HostRuntimeRequirementMismatch)
+					HostPrecompiledRuntimeInput(precompiled):
+						if not tls_backends_match(
+							precompiled.tls_backend,
+							configuration.tls.backend,
+						):
+							Err(HostRuntimeTlsMismatch)
+						else:
+							Ok({
+								c_source_parts = [artifact.c_code],
+								runtime_feature_arguments = [],
+								link_input_arguments = [
+									"-include",
+									precompiled.declarations_path,
+									precompiled.object_path,
+								],
+							})
 
 
 pure func host_c_optimization_argument(
@@ -341,8 +361,10 @@ private pure func compilation_diagnostics(stdout: String, stderr: String) -> Str
 		stdout + "\n" + stderr
 
 
-pure func classify_host_c_compilation_result(
-	prepared: HostCPreparedCompilation,
+--- Classify one completed C compiler process, reporting `output_path` as the
+--- file it produced.
+pure func classify_host_c_process_result(
+	output_path: String,
 	result: Process.ProcessResult,
 ) -> Result[String, HostCCompileError]:
 	diagnostics: String = compilation_diagnostics(
@@ -353,13 +375,20 @@ pure func classify_host_c_compilation_result(
 	match result.exit:
 		Process.Exited(code):
 			if code == 0:
-				Ok(prepared.output_path)
+				Ok(output_path)
 			else:
 				Err(HostCCompilerRejected(code, diagnostics))
 		Process.Signaled(signal):
 			Err(HostCCompilerSignaled(signal, diagnostics))
 		Process.TimedOut:
 			Err(HostCCompilerTimedOut(diagnostics))
+
+
+pure func classify_host_c_compilation_result(
+	prepared: HostCPreparedCompilation,
+	result: Process.ProcessResult,
+) -> Result[String, HostCCompileError]:
+	classify_host_c_process_result(prepared.output_path, result)
 
 
 func run_host_c_compilation(
@@ -370,3 +399,267 @@ func run_host_c_compilation(
 			Err(HostCProcessFailed(error))
 		Ok(result):
 			classify_host_c_compilation_result(prepared, result)
+
+
+--- One file of a split artifact as it must exist on disk before the host C
+--- compiler runs: the shared header, or one translation unit body.
+record HostCSplitSourceFile {
+	path: String,
+	contents: String
+}
+
+
+--- One translation unit's compile step, paired with the object file it
+--- produces so a failure can name the file it came from.
+record HostCTranslationUnitCompile {
+	command: Process.ProcessCommand,
+	object_path: String
+}
+
+
+--- A split artifact's host compilation: the files to write, one compile per
+--- translation unit (independent, so they can run concurrently), and the
+--- single link step that turns their objects into the executable.
+record HostCSplitCompilation {
+	sources: List[HostCSplitSourceFile],
+	units: List[HostCTranslationUnitCompile],
+	link_command: Process.ProcessCommand,
+	output_path: String,
+	source: BuildSourceIdentity
+}
+
+
+private pure func split_unit_source_path(directory: String, unit_index: Int) -> String:
+	"${directory}/unit_${unit_index.to_string()}.c"
+
+
+private pure func split_unit_object_path(directory: String, unit_index: Int) -> String:
+	"${directory}/unit_${unit_index.to_string()}.o"
+
+
+private pure func split_source_files(
+	artifact: BuildArtifact,
+	directory: String,
+) -> List[HostCSplitSourceFile]:
+	var files: List[HostCSplitSourceFile] = [
+		{
+			path = "${directory}/${SCRATCH_SHARED_HEADER_NAME}",
+			contents = artifact.c_code
+		},
+	]
+
+	for unit_index in 0..artifact.extra_units.length():
+		files = files.append({
+			path = split_unit_source_path(directory, unit_index),
+			contents = artifact.extra_units.get_or(unit_index, ""),
+		})
+
+	files
+
+
+private pure func split_host_c_command(
+	configuration: HostCConfiguration,
+	arguments: List[String],
+) -> Process.ProcessCommand:
+	{ Process.command(
+		configuration.compiler.program,
+		configuration.compiler.prefix_arguments.concat(arguments),
+	) |
+		timeout = configuration.timeout,
+		capture_limit = Process.BoundedCapture(configuration.capture_limit)
+	}
+
+
+private pure func split_translation_unit_compiles(
+	artifact: BuildArtifact,
+	configuration: HostCConfiguration,
+	precompiled: HostPrecompiledRuntime,
+	include_arguments: List[String],
+	directory: String,
+) -> List[HostCTranslationUnitCompile]:
+	sanitizer: BuildSanitizer = artifact.compatibility.sanitizer
+	shared_arguments: List[String] = ["-fwrapv", "-pipe"]
+		.append(host_c_optimization_argument(artifact.compatibility.optimization, sanitizer))
+		.concat(host_c_warning_arguments(sanitizer))
+		.concat(include_arguments)
+		.concat(host_c_sanitizer_arguments(sanitizer))
+		.concat(["-include", precompiled.declarations_path])
+	var compiles: List[HostCTranslationUnitCompile] = []
+
+	for unit_index in 0..artifact.extra_units.length():
+		object_path: String = split_unit_object_path(directory, unit_index)
+		compiles = compiles.append({
+			command = split_host_c_command(
+				configuration,
+				shared_arguments.concat([
+					"-c",
+					split_unit_source_path(directory, unit_index),
+					"-o",
+					object_path,
+				]),
+			),
+			object_path = object_path,
+		})
+
+	compiles
+
+
+private pure func split_link_command(
+	artifact: BuildArtifact,
+	configuration: HostCConfiguration,
+	precompiled: HostPrecompiledRuntime,
+	link_arguments: List[String],
+	object_paths: List[String],
+	output_path: String,
+) -> Process.ProcessCommand:
+	sanitizer: BuildSanitizer = artifact.compatibility.sanitizer
+	arguments: List[String] = ["-pipe"]
+		.append(host_c_optimization_argument(artifact.compatibility.optimization, sanitizer))
+		.concat(platform_arguments(configuration.platform, configuration.compiler.family))
+		.concat(object_paths)
+		.append(precompiled.object_path)
+		.concat(["-lm", "-lpthread"])
+		.concat(host_c_sanitizer_arguments(sanitizer))
+		.concat(configuration.tls.link_arguments)
+		.concat(native_feature_arguments(artifact, configuration))
+		.concat(link_arguments)
+		.concat(["-o", output_path])
+
+	split_host_c_command(configuration, arguments)
+
+
+---
+Plan the host compilation of a split artifact inside `directory`, a scratch
+directory the caller owns. Only the external-runtime shape is supported: an
+embedded runtime has no single source stream to prepend itself to, and the
+CLI rejects that combination before emission.
+---
+pure func prepare_host_c_split_compilation(
+	artifact: BuildArtifact,
+	output_path: String,
+	configuration: HostCConfiguration,
+	runtime: HostRuntimeInput,
+	directory: String,
+) -> Result[HostCSplitCompilation, HostCPreparationError]:
+	if artifact.extra_units.length() == 0:
+		Err(HostTranslationUnitShapeMismatch)
+	else:
+		match runtime:
+			HostEmbeddedRuntime(_):
+				Err(HostRuntimeRequirementMismatch)
+			HostPrecompiledRuntimeInput(precompiled):
+				match artifact.runtime_requirement:
+					BuildEmbeddedRuntime:
+						Err(HostRuntimeRequirementMismatch)
+					BuildExternalRuntime:
+						if not tls_backends_match(
+							precompiled.tls_backend,
+							configuration.tls.backend,
+						):
+							Err(HostRuntimeTlsMismatch)
+						else:
+							invocation = build_c_invocation(artifact, configuration.platform)
+							units: List[HostCTranslationUnitCompile] = split_translation_unit_compiles(
+								artifact,
+								configuration,
+								precompiled,
+								invocation.include_arguments,
+								directory,
+							)
+
+							Ok({
+								sources = split_source_files(artifact, directory),
+								units = units,
+								link_command = split_link_command(
+									artifact,
+									configuration,
+									precompiled,
+									invocation.link_arguments,
+									units.map(
+										func(unit: HostCTranslationUnitCompile): unit.object_path,
+									),
+									output_path,
+								),
+								output_path = output_path,
+								source = artifact.source,
+							})
+
+
+func write_host_c_split_sources(prepared: HostCSplitCompilation) -> Result[Void, IOError]:
+	var failure: Option[IOError] = None
+
+	for file in prepared.sources:
+		if failure.is_none():
+			match write_text_atomic(file.path, file.contents):
+				Ok(_):
+					void
+				Err(error):
+					failure = Some(error)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
+
+private pure func concurrency_error_detail(error: ConcurrencyError) -> String:
+	match error:
+		Timeout:
+			"the compile task timed out"
+		TaskFailed(detail):
+			detail
+		Cancelled:
+			"the compile task was cancelled"
+
+
+private func run_translation_unit_compile(
+	unit: HostCTranslationUnitCompile,
+) -> Result[String, HostCCompileError]:
+	match Process.run_command(unit.command):
+		Err(error):
+			Err(HostCProcessFailed(error))
+		Ok(result):
+			classify_host_c_process_result(unit.object_path, result)
+
+
+---
+Compile every translation unit concurrently. The units share nothing but the
+header they read, so the host C compiler can work on them independently; the
+first failure is reported and the remaining results are discarded.
+
+The task limit is the unit count, not a core count: each task blocks in
+`run_command` until its compiler exits, so the runtime's worker pool -- sized
+to the host's processors -- is what actually bounds how many compilers run at
+once.
+---
+func run_host_c_translation_units(
+	prepared: HostCSplitCompilation,
+) -> Result[Void, HostCCompileError]:
+	outcomes: List[Result[Result[String, HostCCompileError], ConcurrencyError]] = prepared.units.concurrent(
+		prepared.units.length(),
+		func(unit: HostCTranslationUnitCompile): run_translation_unit_compile(unit),
+	)
+	var failure: Option[HostCCompileError] = None
+
+	for outcome in outcomes:
+		if failure.is_none():
+			match outcome:
+				Ok(unit_result):
+					match unit_result:
+						Ok(_):
+							void
+						Err(error):
+							failure = Some(error)
+				Err(concurrency_error):
+					failure = Some(
+						HostCTranslationUnitTaskFailed(
+							concurrency_error_detail(concurrency_error),
+						),
+					)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)

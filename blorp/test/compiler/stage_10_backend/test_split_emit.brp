@@ -1,10 +1,3 @@
----
-Tests for the split, multi-translation-unit C emitter: `render_split_translation_units`
-and its public entry point `try_emit_prepared_core_program_c_split_artifact_with_profile`.
-Fixtures are hand-built `CoreProgram` values (the pattern `test_core_emit.brp` and
-`test_canonical_empty_list_emit.brp` use), kept self-contained here rather than
-imported, so this suite stays cheap to build in isolation.
----
 import:
 	../../../src/compiler/stage_09_core/ir:
 		CoreBinaryOp(AddOp),
@@ -27,8 +20,8 @@ import:
 	../../../src/compiler/stage_09_core/pipeline: run_pre_dce_tail
 	../../../src/compiler/stage_10_backend/c_symbol_projection: projected_callable_base_symbol
 	../../../src/compiler/stage_10_backend/emit:
-		CoreEmitError,
 		CTranslationUnitSet,
+		CoreEmitError,
 		static_string_literal_macro,
 		try_emit_prepared_core_program_c_artifact_with_profile,
 		try_emit_prepared_core_program_c_split_artifact_with_profile,
@@ -287,7 +280,9 @@ pure func entrypoint_only_program() -> CoreProgram:
 
 
 pure func count_occurrences(text: String, needle: String) -> Int:
-	text.split(needle).length() - 1
+	text
+		.split(needle)
+		.length() - 1
 
 
 pure func count_occurrences_across(bodies: List[String], needle: String) -> Int:
@@ -302,6 +297,15 @@ pure func count_occurrences_across(bodies: List[String], needle: String) -> Int:
 pure func split_result() -> Result[CTranslationUnitSet, CoreEmitError]:
 	try_emit_prepared_core_program_c_split_artifact_with_profile(
 		run_pre_dce_tail(split_test_program()),
+		FunctionProfileOff,
+		3,
+		"blorp_shared.h",
+	)
+
+
+pure func entrypoint_split_result() -> Result[CTranslationUnitSet, CoreEmitError]:
+	try_emit_prepared_core_program_c_split_artifact_with_profile(
+		run_pre_dce_tail(entrypoint_only_program()),
 		FunctionProfileOff,
 		3,
 		"blorp_shared.h",
@@ -436,9 +440,9 @@ pure func test_global_defined_once_by_tu_zero() -> Bool:
 	match split_result():
 		Ok(result):
 			definition_count: Int = count_occurrences_across(result.bodies, "long ANSWER = 42L;")
-			tu_zero_defines_it: Bool = result.bodies.get(0).map(
-				func(body): body.contains("long ANSWER = 42L;"),
-			) == Some(True)
+			tu_zero_defines_it: Bool = result.bodies
+				.get(0)
+				.map(func(body): body.contains("long ANSWER = 42L;")) == Some(True)
 			no_static_definition: Bool = count_occurrences_across(
 				result.bodies,
 				"static long ANSWER = 42L;",
@@ -453,7 +457,12 @@ pure func test_global_defined_once_by_tu_zero() -> Bool:
 
 				index += 1
 
-			definition_count == 1 and tu_zero_defines_it and no_static_definition and other_tus_empty_of_it
+			(
+				definition_count == 1
+				and tu_zero_defines_it
+				and no_static_definition
+				and other_tus_empty_of_it
+			)
 		Err(_):
 			False
 
@@ -471,9 +480,8 @@ pure func test_canonical_empty_list_has_named_storage_type() -> Bool:
 			symbol: String = "__blorp_canonical_empty_list_inline_8"
 
 			(
-				result.shared_header.contains("typedef struct { ") and result.shared_header.contains(
-					"} " + symbol + "__storage;",
-				)
+				result.shared_header.contains("typedef struct { ")
+				and result.shared_header.contains("} " + symbol + "__storage;")
 				and result.shared_header.contains("extern " + symbol + "__storage " + symbol + ";")
 				and not result.shared_header.contains("extern struct {")
 				and count_occurrences_across(result.bodies, "extern struct {") == 0
@@ -511,7 +519,10 @@ pure func test_prototype_matches_definition_signature() -> Bool:
 
 			for signature in signatures:
 				has_prototype: Bool = result.shared_header.contains(signature + ";")
-				has_definition: Bool = count_occurrences_across(result.bodies, signature + " {") == 1
+				has_definition: Bool = count_occurrences_across(
+					result.bodies,
+					signature + " {",
+				) == 1
 
 				if not (has_prototype and has_definition):
 					ok = False
@@ -528,12 +539,7 @@ single-file path included) -- split adds its prototype via
 `entrypoint_forward_decl_for_split`, so it needs its own check.
 ---
 pure func test_entrypoint_has_prototype_and_definition() -> Bool:
-	match try_emit_prepared_core_program_c_split_artifact_with_profile(
-		run_pre_dce_tail(entrypoint_only_program()),
-		FunctionProfileOff,
-		3,
-		"blorp_shared.h",
-	):
+	match entrypoint_split_result():
 		Ok(result):
 			(
 				result.shared_header.contains("int main(void);")
@@ -544,22 +550,41 @@ pure func test_entrypoint_has_prototype_and_definition() -> Bool:
 
 
 ---
+The entrypoint calls `__blorp_init_globals`, whose definition belongs to the
+first unit, and LPT is free to bin the entrypoint into any unit -- so the
+shared header declares it, once, for whichever unit holds the entrypoint.
+Without that declaration the call is an implicit declaration at best, and
+which bin the entrypoint landed in decides whether the artifact builds.
+---
+pure func test_global_initializer_is_declared_once_in_the_header() -> Bool:
+	match (split_result(), entrypoint_split_result()):
+		(Ok(with_globals), Ok(entrypoint_only)):
+			(
+				count_occurrences(
+					with_globals.shared_header,
+					"void __blorp_init_globals(void);",
+				) == 1
+				and count_occurrences_across(
+					with_globals.bodies,
+					"void __blorp_init_globals(void) {",
+				) == 1
+				and count_occurrences(
+					entrypoint_only.shared_header,
+					"void __blorp_init_globals(void);",
+				) == 1
+			)
+		_:
+			False
+
+
+---
 Test 8: `static_string_literal_macro("BLORP_STATIC_STRING", "static ")` must
 equal the exact text `STATIC_STRING_LITERAL_DECLARATION_MACRO` held before
 this step (embedded here verbatim) -- the single-file emission path is
 never allowed to drift from this text.
 ---
 pure func previous_static_string_literal_declaration_macro() -> String:
-	(
-		"#define BLORP_STATIC_STRING(name, length, bytes) \\\n"
-		+ "  _Static_assert(sizeof(bytes) == (length) + 1, \"string literal byte length\"); \\\n"
-		+ "  static blorp_String name = { \\\n"
-		+ "    .header = { BLORP_IMMORTAL_REFCOUNT, BLORP_ALLOC_CLASS_DIRECT, 0 }, \\\n"
-		+ "    .len = (length), \\\n"
-		+ "    .capacity = (length), \\\n"
-		+ "    .data = bytes \\\n"
-		+ "  }"
-	)
+	"#define BLORP_STATIC_STRING(name, length, bytes) \\\n" + "  _Static_assert(sizeof(bytes) == (length) + 1, \"string literal byte length\"); \\\n" + "  static blorp_String name = { \\\n" + "    .header = { BLORP_IMMORTAL_REFCOUNT, BLORP_ALLOC_CLASS_DIRECT, 0 }, \\\n" + "    .len = (length), \\\n" + "    .capacity = (length), \\\n" + "    .data = bytes \\\n" + "  }"
 
 
 pure func test_single_path_string_literal_macro_is_unchanged() -> Bool:
@@ -626,9 +651,14 @@ holds -- fewer, and even perfect packing can't stay under the bound.
 ---
 pure func skewed_program() -> CoreProgram:
 	{
-		decls = [FunctionDecl(sized_int_function(900, 900))].concat(
-			skewed_small_function_decls(45, 910),
-		),
+		decls = [
+			FunctionDecl(
+				sized_int_function(
+					900,
+					900,
+				),
+			),
+		].concat(skewed_small_function_decls(45, 910)),
 		foreign_includes = []
 	}
 
@@ -737,7 +767,10 @@ pure func def_id_offsets_in_body(body: String, def_ids: List[Int]) -> List[(Int,
 
 
 pure func def_id_order_is_strictly_increasing(body: String, def_ids: List[Int]) -> Bool:
-	offsets_ascending: List[(Int, Int)] = def_id_offsets_in_body(body, def_ids).sort_by(
+	offsets_ascending: List[(Int, Int)] = def_id_offsets_in_body(
+		body,
+		def_ids,
+	).sort_by(
 		func(pair: (Int, Int)): pair[0],
 	)
 
@@ -809,8 +842,14 @@ pure func test_unit_count_exceeding_function_count_has_no_empty_bodies() -> Bool
 		"blorp_shared.h",
 	):
 		Ok(result):
-			has_a: Bool = count_occurrences_across(result.bodies, trivial_function_signature(950) + " {") == 1
-			has_b: Bool = count_occurrences_across(result.bodies, trivial_function_signature(951) + " {") == 1
+			has_a: Bool = count_occurrences_across(
+				result.bodies,
+				trivial_function_signature(950) + " {",
+			) == 1
+			has_b: Bool = count_occurrences_across(
+				result.bodies,
+				trivial_function_signature(951) + " {",
+			) == 1
 
 			var no_body_is_empty: Bool = True
 
@@ -840,6 +879,10 @@ tests: TestSuite = {
 		("split rendering is deterministic", test_split_rendering_is_deterministic),
 		("prototype matches definition signature", test_prototype_matches_definition_signature),
 		("entrypoint has prototype and definition", test_entrypoint_has_prototype_and_definition),
+		(
+			"global initializer is declared once in the header",
+			test_global_initializer_is_declared_once_in_the_header,
+		),
 		(
 			"single-path string literal macro is unchanged",
 			test_single_path_string_literal_macro_is_unchanged,
