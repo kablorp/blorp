@@ -710,6 +710,10 @@ pure func reserved_box_type() -> CoreType:
 	HeapRecordType("ReservedBox")
 
 
+pure func runtime_member_box_type() -> CoreType:
+	HeapRecordType("RuntimeMemberBox")
+
+
 pure func bool_type() -> CoreType:
 	NamedType("Bool", [])
 
@@ -2334,6 +2338,47 @@ pure func reserved_box_heap_record_decl() -> CoreHeapRecordDecl:
 				name = "long",
 				typ = int_type(),
 				release_policy = NoReleasePolicy
+			},
+		],
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func runtime_member_box_heap_record_decl() -> CoreHeapRecordDecl:
+	{
+		abi_type = None,
+		name = "RuntimeMemberBox",
+		type_params = [],
+		fields = [
+			{
+				name = "header",
+				typ = int_type(),
+				release_policy = NoReleasePolicy
+			},
+			{
+				name = "__blorp_field_header",
+				typ = int_type(),
+				release_policy = NoReleasePolicy
+			},
+			{
+				name = "label",
+				typ = string_type(),
+				release_policy = ArcReleasePolicy
+			},
+		],
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func runtime_member_value_record_decl() -> CoreValueRecordDecl:
+	{
+		abi_type = None,
+		name = "RuntimeMemberValue",
+		type_params = [],
+		fields = [
+			{
+				name = "header",
+				typ = int_type()
 			},
 		],
 		loc = SyntheticSourceLoc
@@ -23951,6 +23996,38 @@ pure func box_count_function() -> CoreFunction:
 	}
 
 
+pure func runtime_member_box_total_function() -> CoreFunction:
+	box_var: CoreVar = named_var("box")
+	box_expr: CoreExpr = VarExpr(box_var, runtime_member_box_type(), SyntheticSourceLoc)
+
+	{
+		name = "runtime_member_box_total",
+		source_module = None,
+		type_params = [],
+		params = [
+			{
+				name = box_var,
+				typ = runtime_member_box_type(),
+				loc = SyntheticSourceLoc
+			},
+		],
+		return_type = int_type(),
+		body = Some(
+			BinaryExpr(
+				AddOp,
+				FieldExpr(box_expr, "header", int_type(), SyntheticSourceLoc),
+				FieldExpr(box_expr, "__blorp_field_header", int_type(), SyntheticSourceLoc),
+				int_type(),
+				SyntheticSourceLoc,
+			),
+		),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 921,
+		loc = SyntheticSourceLoc
+	}
+
+
 pure func reserved_box_total_function() -> CoreFunction:
 	box_var: CoreVar = named_var("box")
 	box_expr: CoreExpr = VarExpr(box_var, reserved_box_type(), SyntheticSourceLoc)
@@ -24328,6 +24405,48 @@ pure func test_emit_reserved_record_field_names() -> Bool:
 		and artifact.c_code.contains("return (box->short_ + box->long_);")
 		and not artifact.c_code.contains("box->short;")
 		and not artifact.c_code.contains("box->long;")
+	)
+
+
+---
+A heap record's C struct opens with the runtime's `blorp_Object header`, so a
+declared field named `header` used to emit a duplicate member and retarget
+every read, write and constructor assignment of that field at the header.
+Pins the escaped spelling at the declaration, the constructor, the in-place
+reuse path and the field reads, on both heap and value records, and pins that
+the escape stays one-to-one when a source field is already spelled with the
+escape prefix.
+---
+pure func test_emit_runtime_reserved_record_member_names() -> Bool:
+	program: CoreProgram = {
+		decls = [
+			ValueRecordDecl(runtime_member_value_record_decl()),
+			HeapRecordDecl(runtime_member_box_heap_record_decl()),
+			FunctionDecl(runtime_member_box_total_function()),
+		],
+		foreign_includes = []
+	}
+	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+
+	(
+		artifact.c_code.contains(
+			"  blorp_Object header;\n  long __blorp_field_header;\n" + "  long __blorp_field___blorp_field_header;\n  blorp_String* label;",
+		)
+		and artifact.c_code.contains((
+				"RuntimeMemberBox* RuntimeMemberBox_make(long __blorp_field_header, long "
+				+ "__blorp_field___blorp_field_header, blorp_String* label)"
+			))
+		and artifact.c_code.contains("  __rec->__blorp_field_header = __blorp_field_header;")
+		and artifact.c_code.contains("    __old->__blorp_field_header = __blorp_field_header;")
+		and artifact.c_code.contains(
+			"return (box->__blorp_field_header + box->__blorp_field___blorp_field_header);",
+		)
+		and artifact.c_code.contains(
+			"typedef struct { long __blorp_field_header; } RuntimeMemberValue;",
+		)
+		and not artifact.c_code.contains("  long header;")
+		and not artifact.c_code.contains("__rec->header =")
+		and not artifact.c_code.contains("box->header")
 	)
 
 
@@ -25981,6 +26100,10 @@ tests: TestSuite = {
 			test_emit_foreign_heap_record_preserves_field_order,
 		),
 		("emit reserved record field names", test_emit_reserved_record_field_names),
+		(
+			"emit runtime-reserved record member names",
+			test_emit_runtime_reserved_record_member_names,
+		),
 		("emit heap record construct expression", test_emit_heap_record_construct_expression),
 		("emit enum declaration and typed function", test_emit_enum_declaration_and_typed_function),
 		("emit constructor match expression", test_emit_constructor_match_expression),
