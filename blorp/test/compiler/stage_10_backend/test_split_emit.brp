@@ -862,6 +862,78 @@ pure func test_unit_count_exceeding_function_count_has_no_empty_bodies() -> Bool
 			False
 
 
+---
+A heap record with a field literally named `header`, colliding with the
+runtime object header every heap record's C struct opens with. Mirrors
+`test_core_emit.brp`'s `runtime_member_box_heap_record_decl` fixture, but
+exercised through the split path instead of the single-file path.
+---
+pure func header_field_box_heap_record_decl() -> CoreHeapRecordDecl:
+	{
+		abi_type = None,
+		name = "HeaderBox",
+		type_params = [],
+		fields = [
+			{
+				name = "header",
+				typ = int_type(),
+				release_policy = NoReleasePolicy
+			},
+			{
+				name = "label",
+				typ = string_type(),
+				release_policy = ArcReleasePolicy
+			},
+		],
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func runtime_reserved_field_split_program() -> CoreProgram:
+	{
+		decls = [
+			HeapRecordDecl(header_field_box_heap_record_decl()),
+			FunctionDecl(trivial_int_function("alpha", 910, 1)),
+			FunctionDecl(trivial_int_function("beta", 911, 2)),
+		],
+		foreign_includes = []
+	}
+
+
+---
+Test 12: the split path reuses the exact per-declaration emission records
+the single-file path builds (`value_record_emissions` / `heap_record_
+emissions` / `enum_emissions` / `union_emissions` on `CEmissionSections`),
+so a field named `header` must be escaped identically on both paths: the
+typedef routed to the shared header spells the member `__blorp_field_header`,
+the make function's assignment (a type-support definition routed to TU 0)
+assigns through the same escaped name, and the raw collision (an unescaped
+`  long header;` member or `__rec->header =` assignment) never appears in
+the header or any body.
+---
+pure func test_split_path_escapes_runtime_reserved_field_names() -> Bool:
+	match try_emit_prepared_core_program_c_split_artifact_with_profile(
+		run_pre_dce_tail(runtime_reserved_field_split_program()),
+		FunctionProfileOff,
+		2,
+		"blorp_shared.h",
+	):
+		Ok(result):
+			has_escaped_typedef: Bool = result.shared_header.contains(
+				"  blorp_Object header;\n  long __blorp_field_header;\n  blorp_String* label;",
+			)
+			has_escaped_make_assignment: Bool = count_occurrences_across(
+				result.bodies,
+				"  __rec->__blorp_field_header = __blorp_field_header;",
+			) == 1
+			no_raw_field_decl: Bool = not result.shared_header.contains("  long header;\n")
+			no_raw_assignment: Bool = count_occurrences_across(result.bodies, "__rec->header =") == 0
+
+			has_escaped_typedef and has_escaped_make_assignment and no_raw_field_decl and no_raw_assignment
+		Err(_):
+			False
+
+
 tests: TestSuite = {
 	description = "Split, multi-translation-unit C emission",
 	tests = [
@@ -892,6 +964,10 @@ tests: TestSuite = {
 		(
 			"unit count exceeding function count has no empty bodies",
 			test_unit_count_exceeding_function_count_has_no_empty_bodies,
+		),
+		(
+			"split path escapes runtime-reserved field names",
+			test_split_path_escapes_runtime_reserved_field_names,
 		),
 	]
 }
