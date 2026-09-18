@@ -466,6 +466,35 @@ match-lowering name tables (small, fold into F2/F5); Perceus name tables
 Order by gain over effort: F7, F2, F3, F1 (after T4 leaves the typecheck
 files), then F6 and F5 together.
 
+## Body-checking attribution (2026-09-17, exact and calls profiles plus a sample rooted at the body loop)
+
+The two flat typecheck attempts targeted the wrong mass. Scoped to the
+body loop itself (2,168 samples, 7 roots): generated code 30%, reference
+counting 27%, cleanup frames 18.5%, allocation 7.5%, string and dict
+lookups 5%, list ops 4.5%. Dictionary copies and string construction are
+under 1% here; the whole-phase figures that suggested them belonged to
+header install.
+
+The mass is the post-inference zonk: `finalize_infer_result` runs once per
+body (13,749) and unconditionally calls `zonk_typed_expr` on every node
+(565,091 calls), reconstructing a `TypedExpr` and a `TypedExprInfo` (plus
+`ResolvedCallInfo`, `ValueSlot`, `ExprTypeOrigin`) even when the node has
+no unresolved meta, then destroying the pre-zonk tree
+(`TypedExpr_destroy_fields` is 8.3% of the body loop). The type-level zonk
+(`resolve_type_metas_if_changed`) is already diff-aware; the expression
+level is not. Secondary: the id-indirection chain
+(`source_name_id_table_index` 8.8M calls, `definition_id_runtime_value`
+5.6M, `definition_table_rep_row` 2.3M; 258 ms self, shared with header
+completion), scope-chain lookups by name (`scope_lookup` 4.4M,
+`env_lookup` 1.2M, `lookup_bare_value` 0.4M), and the scope-table insert
+(`scope_add_symbol` 200k calls, real but small).
+
+Tasks, ranked: (1) zonk reuses unchanged nodes and skips bodies with no
+metas (task `perf/zonk-reuse`, in flight); (2) resolve each identifier
+occurrence once by definition id instead of re-walking the scope chain by
+name; (3) key the id-indirection chain directly (a facts change shared
+with header completion); (4) the scope insert, only alongside (2).
+
 ## Results
 
 | task | outcome | commit | phase row | notes |
