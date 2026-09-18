@@ -344,7 +344,15 @@ private record ParserInput {
 }
 
 
-private record ParserStep {
+private struct ParserStep {
+	index: Int,
+	matched: Bool
+}
+
+
+-- Recovery helpers always publish a diagnostic list, so unlike the hot
+-- expectation result they intentionally remain records.
+private record ParserRecoveryStep {
 	index: Int,
 	diagnostics: List[ParseDiagnostic]
 }
@@ -597,7 +605,10 @@ private record ParseExprStep {
 }
 
 
-private record ParsePostfixContinuationStep {
+-- This hot-path result carries only scalars, so keep it inline. The parser
+-- calls this helper once per postfix-loop iteration; a record here would turn
+-- an otherwise read-only layout query into one heap allocation per call.
+private struct ParsePostfixContinuationStep {
 	index: Int,
 	opened_indent: Bool
 }
@@ -716,14 +727,12 @@ private record ParseBodyStep {
 }
 
 
--- `span` is a `TokenRange`, not yet materialized: most callers only need
--- `matched`/`index`, and `expect_symbol` is called ~80 times across the
--- parser, so deferring the `SourceSpan` build to the few call sites that
--- actually read `.span` avoids constructing one for every call that
--- doesn't.
-private record ParseSymbolStep {
+-- `span` is a `TokenRange`, not yet materialized. Keeping diagnostics in a
+-- separate result lets this hot success-path value stay inline; diagnostics
+-- build a real `SourceSpan` only after failure, while delimiter consumers
+-- materialize it only when the bound is part of an AST node.
+private struct ParseSymbolStep {
 	index: Int,
-	diagnostics: List[ParseDiagnostic],
 	matched: Bool,
 	span: TokenRange
 }
@@ -1091,7 +1100,7 @@ private pure func consume_annotation_argument_list(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-) -> ParserStep:
+) -> ParserRecoveryStep:
 	var st: Int = index
 	var st_diag: List[ParseDiagnostic] = add_expected_error(
 		diagnostics,
@@ -1154,7 +1163,7 @@ private pure func parse_function_annotations(
 				)
 
 		if current_is_symbol(state, st, LeftParenSymbol):
-			__step_1: ParserStep = consume_annotation_argument_list(state, st, st_diag)
+			__step_1: ParserRecoveryStep = consume_annotation_argument_list(state, st, st_diag)
 			st = __step_1.index
 			st_diag = __step_1.diagnostics
 
@@ -1191,85 +1200,103 @@ private pure func current_is_soft_boundary(state: ParserInput, index: Int) -> Bo
 				False
 
 
-private pure func expect_symbol(
-	state: ParserInput,
-	index: Int,
-	diagnostics: List[ParseDiagnostic],
-	symbol: Symbol,
-	message: String,
-) -> ParseSymbolStep:
+private pure func expect_symbol(state: ParserInput, index: Int, symbol: Symbol) -> ParseSymbolStep:
 	range: TokenRange = current_token_range(state, index)
 
 	if current_is_symbol(state, index, symbol):
 		{
 			index = advance_parser(state, index),
-			diagnostics = diagnostics,
 			matched = True,
 			span = range
 		}
 	else:
 		{
 			index = index,
-			diagnostics = add_expected_error(
-				diagnostics,
-				materialize_span(state, range),
-				message,
-				[symbol_text(symbol)],
-				None,
-			),
 			matched = False,
 			span = range
 		}
 
 
-private pure func expect_newline(
+private pure func expect_symbol_diagnostics(
 	state: ParserInput,
-	index: Int,
 	diagnostics: List[ParseDiagnostic],
+	step: ParseSymbolStep,
+	symbol: Symbol,
 	message: String,
-) -> ParserStep:
+) -> List[ParseDiagnostic]:
+	if step.matched:
+		diagnostics
+	else:
+		add_expected_error(
+			diagnostics,
+			materialize_span(state, step.span),
+			message,
+			[symbol_text(symbol)],
+			None,
+		)
+
+
+private pure func expect_newline(state: ParserInput, index: Int) -> ParserStep:
 	if current_is_newline(state, index):
 		{
 			index = advance_parser(state, index),
-			diagnostics = diagnostics
+			matched = True
 		}
 	else:
 		{
 			index = index,
-			diagnostics = add_expected_error(
-				diagnostics,
-				current_span(state, index),
-				message,
-				["newline"],
-				None,
-			)
+			matched = False
 		}
 
 
-private pure func expect_keyword(
-	state: ParserInput,
-	index: Int,
-	diagnostics: List[ParseDiagnostic],
-	keyword: Keyword,
-	expected: String,
-	message: String,
-) -> ParserStep:
+private pure func expect_keyword(state: ParserInput, index: Int, keyword: Keyword) -> ParserStep:
 	if current_is_keyword(state, index, keyword):
 		{
 			index = advance_parser(state, index),
-			diagnostics = diagnostics
+			matched = True
 		}
 	else:
 		{
 			index = index,
-			diagnostics = add_expected_error(
-				diagnostics,
-				current_span(state, index),
-				message,
-				[expected],
-				None,
-			)
+			matched = False
 		}
+
+
+private pure func expect_newline_diagnostics(
+	state: ParserInput,
+	diagnostics: List[ParseDiagnostic],
+	step: ParserStep,
+	message: String,
+) -> List[ParseDiagnostic]:
+	if step.matched:
+		diagnostics
+	else:
+		add_expected_error(
+			diagnostics,
+			current_span(state, step.index),
+			message,
+			["newline"],
+			None,
+		)
+
+
+private pure func expect_keyword_diagnostics(
+	state: ParserInput,
+	diagnostics: List[ParseDiagnostic],
+	step: ParserStep,
+	expected: String,
+	message: String,
+) -> List[ParseDiagnostic]:
+	if step.matched:
+		diagnostics
+	else:
+		add_expected_error(
+			diagnostics,
+			current_span(state, step.index),
+			message,
+			[expected],
+			None,
+		)
 
 
 private pure func current_is_block_end(state: ParserInput, index: Int) -> Bool:
@@ -1583,15 +1610,16 @@ private pure func parse_hash_identifier_expected(
 	expected: String,
 ) -> ParseIdentifierStep:
 	start_span: SourceSpan = current_span(state, index)
-	expect_step: ParseSymbolStep = expect_symbol(
+	expect_step: ParseSymbolStep = expect_symbol(state, index, HashSymbol)
+	expect_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		index,
 		diagnostics,
+		expect_step,
 		HashSymbol,
 		"expected `#` before ${expected}",
 	)
 	st: Int = expect_step.index
-	st_diag: List[ParseDiagnostic] = expect_step.diagnostics
+	st_diag: List[ParseDiagnostic] = expect_step_diagnostics
 
 	match current_tag(state, st):
 		IdentifierTag:
@@ -1779,17 +1807,18 @@ private pure func parse_dim_atom(
 					advance_parser(state, index),
 					diagnostics,
 				)
-				right_step: ParseSymbolStep = expect_symbol(
+				right_step: ParseSymbolStep = expect_symbol(state, dim_step.index, RightParenSymbol)
+				right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 					state,
-					dim_step.index,
 					dim_step.diagnostics,
+					right_step,
 					RightParenSymbol,
 					"expected `)` after dimension expression",
 				)
 
 				{
 					index = right_step.index,
-					diagnostics = right_step.diagnostics,
+					diagnostics = right_step_diagnostics,
 					value = dim_step.value
 				}
 			else:
@@ -1907,14 +1936,15 @@ private pure func parse_dim_constraint(
 	diagnostics: List[ParseDiagnostic],
 ) -> ParseDimConstraintStep:
 	left_step: ParseTypeStep = parse_dim_expr(state, index, diagnostics)
-	equal_step: ParseSymbolStep = expect_symbol(
+	equal_step: ParseSymbolStep = expect_symbol(state, left_step.index, EqualEqualSymbol)
+	equal_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		left_step.index,
 		left_step.diagnostics,
+		equal_step,
 		EqualEqualSymbol,
 		"expected `==` in dimension constraint",
 	)
-	right_step: ParseTypeStep = parse_dim_expr(state, equal_step.index, equal_step.diagnostics)
+	right_step: ParseTypeStep = parse_dim_expr(state, equal_step.index, equal_step_diagnostics)
 
 	{
 		index = right_step.index,
@@ -1979,15 +2009,16 @@ private pure func parse_type_array_suffixes(
 			RightBracketSymbol,
 			False,
 		)
-		right_step: ParseSymbolStep = expect_symbol(
+		right_step: ParseSymbolStep = expect_symbol(state, dims_step.index, RightBracketSymbol)
+		right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 			state,
-			dims_step.index,
 			dims_step.diagnostics,
+			right_step,
 			RightBracketSymbol,
 			"expected `]` after array dimensions",
 		)
 		st = right_step.index
-		st_diag = right_step.diagnostics
+		st_diag = right_step_diagnostics
 
 		if not parsed_type_exprs_all_dim(dims_step.values):
 			st_diag = add_expected_error(
@@ -2083,15 +2114,16 @@ private pure func parse_named_type_expr_with_bounds(
 				RightBracketSymbol,
 				True,
 			)
-			right_step: ParseSymbolStep = expect_symbol(
+			right_step: ParseSymbolStep = expect_symbol(state, args_step.index, RightBracketSymbol)
+			right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 				state,
-				args_step.index,
 				args_step.diagnostics,
+				right_step,
 				RightBracketSymbol,
 				"expected `]` after type arguments",
 			)
 			st = right_step.index
-			st_diag = right_step.diagnostics
+			st_diag = right_step_diagnostics
 			args = args_step.values
 			end_span = last_type_expr_span(args, end_span)
 
@@ -2145,15 +2177,16 @@ private pure func parse_parenthesized_type_expr(
 	var st_diag: List[ParseDiagnostic] = diagnostics
 
 	if current_is_symbol(state, st, RightParenSymbol):
-		right_step: ParseSymbolStep = expect_symbol(
+		right_step: ParseSymbolStep = expect_symbol(state, st, RightParenSymbol)
+		right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 			state,
-			st,
 			st_diag,
+			right_step,
 			RightParenSymbol,
 			"expected `)` after type",
 		)
 		st = right_step.index
-		st_diag = right_step.diagnostics
+		st_diag = right_step_diagnostics
 		void_type: ParsedTypeExpr = ParsedNamedType(
 			parsed_identifier(
 				"Void",
@@ -2196,15 +2229,16 @@ private pure func parse_parenthesized_type_expr(
 			RightParenSymbol,
 			False,
 		)
-		right_step: ParseSymbolStep = expect_symbol(
+		right_step: ParseSymbolStep = expect_symbol(state, items_step.index, RightParenSymbol)
+		right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 			state,
-			items_step.index,
 			items_step.diagnostics,
+			right_step,
 			RightParenSymbol,
 			"expected `)` after type",
 		)
 		st = right_step.index
-		st_diag = right_step.diagnostics
+		st_diag = right_step_diagnostics
 
 		if current_is_symbol(state, st, ArrowSymbol):
 			return_step: ParseTypeStep = parse_type_expr(
@@ -2259,15 +2293,16 @@ private pure func parse_pure_function_type_expr(
 	start_span: SourceSpan = current_span(state, index)
 	var st: Int = advance_parser(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
-	left_step: ParseSymbolStep = expect_symbol(
+	left_step: ParseSymbolStep = expect_symbol(state, st, LeftParenSymbol)
+	left_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		left_step,
 		LeftParenSymbol,
 		"expected `(` after `pure` in function type",
 	)
 	st = left_step.index
-	st_diag = left_step.diagnostics
+	st_diag = left_step_diagnostics
 	params_step: ParseTypeListStep = parse_type_expr_list_until(
 		state,
 		st,
@@ -2275,23 +2310,25 @@ private pure func parse_pure_function_type_expr(
 		RightParenSymbol,
 		True,
 	)
-	right_step: ParseSymbolStep = expect_symbol(
+	right_step: ParseSymbolStep = expect_symbol(state, params_step.index, RightParenSymbol)
+	right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		params_step.index,
 		params_step.diagnostics,
+		right_step,
 		RightParenSymbol,
 		"expected `)` after function type parameters",
 	)
 	st = right_step.index
-	st_diag = right_step.diagnostics
-	arrow_step: ParseSymbolStep = expect_symbol(
+	st_diag = right_step_diagnostics
+	arrow_step: ParseSymbolStep = expect_symbol(state, st, ArrowSymbol)
+	arrow_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		arrow_step,
 		ArrowSymbol,
 		"expected `->` after function type parameters",
 	)
-	return_step: ParseTypeStep = parse_type_expr(state, arrow_step.index, arrow_step.diagnostics)
+	return_step: ParseTypeStep = parse_type_expr(state, arrow_step.index, arrow_step_diagnostics)
 
 	{
 		index = return_step.index,
@@ -2602,17 +2639,18 @@ private pure func parse_params_after_left_paren(
 		st = advance_parser(state, st)
 		st = skip_newlines(state, st)
 
-	right_step: ParseSymbolStep = expect_symbol(
+	right_step: ParseSymbolStep = expect_symbol(state, st, RightParenSymbol)
+	right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		right_step,
 		RightParenSymbol,
 		"expected `)` after function parameters",
 	)
 
 	{
 		index = right_step.index,
-		diagnostics = right_step.diagnostics,
+		diagnostics = right_step_diagnostics,
 		values = params
 	}
 
@@ -2688,17 +2726,18 @@ private pure func parse_lambda_params_after_left_paren(
 		st = advance_parser(state, st)
 		st = skip_newlines(state, st)
 
-	right_step: ParseSymbolStep = expect_symbol(
+	right_step: ParseSymbolStep = expect_symbol(state, st, RightParenSymbol)
+	right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		right_step,
 		RightParenSymbol,
 		"expected `)` after lambda parameters",
 	)
 
 	{
 		index = right_step.index,
-		diagnostics = right_step.diagnostics,
+		diagnostics = right_step_diagnostics,
 		values = params
 	}
 
@@ -2878,17 +2917,18 @@ private pure func parse_type_params_opt(
 			RightBracketSymbol,
 			True,
 		)
-		right_step: ParseSymbolStep = expect_symbol(
+		right_step: ParseSymbolStep = expect_symbol(state, items_step.index, RightBracketSymbol)
+		right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 			state,
-			items_step.index,
 			items_step.diagnostics,
+			right_step,
 			RightBracketSymbol,
 			"expected `]` after type parameters",
 		)
 
 		{
 			index = right_step.index,
-			diagnostics = right_step.diagnostics,
+			diagnostics = right_step_diagnostics,
 			values = items_step.values
 		}
 	else:
@@ -3541,15 +3581,16 @@ private pure func parse_tuple_pattern_after_left_paren(
 	var items: List[ParsedPattern] = [first_step.value]
 	var end_span: SourceSpan = parsed_pattern_span(first_step.value)
 
-	comma_step: ParseSymbolStep = expect_symbol(
+	comma_step: ParseSymbolStep = expect_symbol(state, st, CommaSymbol)
+	comma_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		comma_step,
 		CommaSymbol,
 		"expected `, ` between tuple pattern items",
 	)
 	st = comma_step.index
-	st_diag = comma_step.diagnostics
+	st_diag = comma_step_diagnostics
 
 	if comma_step.matched:
 		rest_step: ParsePatternListStep = parse_pattern_list_until(
@@ -3569,15 +3610,16 @@ private pure func parse_tuple_pattern_after_left_paren(
 			None:
 				end_span = materialize_span(state, comma_step.span)
 
-	right_step: ParseSymbolStep = expect_symbol(
+	right_step: ParseSymbolStep = expect_symbol(state, st, RightParenSymbol)
+	right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		right_step,
 		RightParenSymbol,
 		"expected `)` after tuple pattern",
 	)
 	st = right_step.index
-	st_diag = right_step.diagnostics
+	st_diag = right_step_diagnostics
 
 	if right_step.matched:
 		end_span = materialize_span(state, right_step.span)
@@ -3714,15 +3756,16 @@ private pure func parse_list_pattern_after_left_bracket(
 				else:
 					parsing_items = False
 
-	right_step: ParseSymbolStep = expect_symbol(
+	right_step: ParseSymbolStep = expect_symbol(state, st, RightBracketSymbol)
+	right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		right_step,
 		RightBracketSymbol,
 		"expected `]` after list pattern",
 	)
 	st = right_step.index
-	st_diag = right_step.diagnostics
+	st_diag = right_step_diagnostics
 
 	if right_step.matched:
 		end_span = materialize_span(state, right_step.span)
@@ -3778,12 +3821,17 @@ private pure func parse_simple_pattern(
 					right_step: ParseSymbolStep = expect_symbol(
 						state,
 						args_step.index,
+						RightParenSymbol,
+					)
+					right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
+						state,
 						args_step.diagnostics,
+						right_step,
 						RightParenSymbol,
 						"expected `)` after constructor pattern",
 					)
 					st = right_step.index
-					st_diag = right_step.diagnostics
+					st_diag = right_step_diagnostics
 					args = args_step.values
 
 					if right_step.matched:
@@ -3811,7 +3859,12 @@ private pure func parse_simple_pattern(
 				right_step: ParseSymbolStep = expect_symbol(
 					state,
 					args_step.index,
+					RightParenSymbol,
+				)
+				right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
+					state,
 					args_step.diagnostics,
+					right_step,
 					RightParenSymbol,
 					"expected `)` after constructor pattern",
 				)
@@ -3823,7 +3876,7 @@ private pure func parse_simple_pattern(
 
 				result: ParsePatternStep = {
 					index = right_step.index,
-					diagnostics = right_step.diagnostics,
+					diagnostics = right_step_diagnostics,
 					value = ParsedConstructorPattern(
 						name,
 						args_step.values,
@@ -4087,7 +4140,6 @@ private pure func current_token_is_indented_past(
 private pure func consume_block_indent(
 	state: ParserInput,
 	index: Int,
-	diagnostics: List[ParseDiagnostic],
 	header_span: SourceSpan,
 ) -> ParserStep:
 	st: Int = skip_newlines(state, index)
@@ -4095,15 +4147,15 @@ private pure func consume_block_indent(
 	if current_is_indent(state, st):
 		{
 			index = advance_parser(state, st),
-			diagnostics = diagnostics
+			matched = True
 		}
 	else if current_token_is_indented_past(state, st, header_span):
 		{
 			index = st,
-			diagnostics = diagnostics
+			matched = True
 		}
 	else:
-		expect_indent(state, st, diagnostics)
+		expect_indent(state, st)
 
 
 private pure func parse_statement_list(
@@ -4146,9 +4198,14 @@ private pure func parse_indented_block_body(
 	diagnostics: List[ParseDiagnostic],
 	start_span: SourceSpan,
 ) -> ParseExprStep:
-	__step_2: ParserStep = consume_block_indent(state, index, diagnostics, start_span)
+	__step_2: ParserStep = consume_block_indent(state, index, start_span)
+	__step_2_diagnostics: List[ParseDiagnostic] = expect_indent_diagnostics(
+		state,
+		diagnostics,
+		__step_2,
+	)
 	var st: Int = __step_2.index
-	var st_diag: List[ParseDiagnostic] = __step_2.diagnostics
+	var st_diag: List[ParseDiagnostic] = __step_2_diagnostics
 	st = skip_newlines(state, st)
 	items_step: ParseExprListStep = parse_statement_list(state, st, st_diag, start_span)
 	st = items_step.index
@@ -4158,9 +4215,14 @@ private pure func parse_indented_block_body(
 	block_end_span: SourceSpan = last_expr_span(items_step.values, block_start_span)
 
 	if current_is_dedent(state, st):
-		__step_3: ParserStep = expect_dedent(state, st, st_diag)
+		__step_3: ParserStep = expect_dedent(state, st)
+		__step_3_diagnostics: List[ParseDiagnostic] = expect_dedent_diagnostics(
+			state,
+			st_diag,
+			__step_3,
+		)
 		st = __step_3.index
-		st_diag = __step_3.diagnostics
+		st_diag = __step_3_diagnostics
 
 	{
 		index = st,
@@ -4178,13 +4240,14 @@ private pure func parse_block_after_colon(
 	diagnostics: List[ParseDiagnostic],
 	start_span: SourceSpan,
 ) -> ParseExprStep:
-	newline_step: ParserStep = expect_newline(
+	newline_step: ParserStep = expect_newline(state, index)
+	newline_step_diagnostics: List[ParseDiagnostic] = expect_newline_diagnostics(
 		state,
-		index,
 		diagnostics,
+		newline_step,
 		"expected newline before indented block",
 	)
-	parse_indented_block_body(state, newline_step.index, newline_step.diagnostics, start_span)
+	parse_indented_block_body(state, newline_step.index, newline_step_diagnostics, start_span)
 
 
 private pure func parse_if_expr_with_header_span(
@@ -4200,17 +4263,18 @@ private pure func parse_if_expr_with_header_span(
 		diagnostics,
 		PREC_LOWEST,
 	)
-	colon_step: ParseSymbolStep = expect_symbol(
+	colon_step: ParseSymbolStep = expect_symbol(state, cond_step.index, ColonSymbol)
+	colon_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		cond_step.index,
 		cond_step.diagnostics,
+		colon_step,
 		ColonSymbol,
 		"expected `:` after if condition",
 	)
 	then_step: ParseExprStep = parse_block_after_colon(
 		state,
 		colon_step.index,
-		colon_step.diagnostics,
+		colon_step_diagnostics,
 		header_span,
 	)
 	var st: Int = then_step.index
@@ -4234,17 +4298,18 @@ private pure func parse_if_expr_with_header_span(
 			st_diag = else_if_step.diagnostics
 			end_span = parsed_expr_span(else_if_step.value)
 		else:
-			else_colon_step: ParseSymbolStep = expect_symbol(
+			else_colon_step: ParseSymbolStep = expect_symbol(state, st, ColonSymbol)
+			else_colon_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 				state,
-				st,
 				st_diag,
+				else_colon_step,
 				ColonSymbol,
 				"expected `:` after else",
 			)
 			else_step: ParseExprStep = parse_block_after_colon(
 				state,
 				else_colon_step.index,
-				else_colon_step.diagnostics,
+				else_colon_step_diagnostics,
 				else_span,
 			)
 			else_branch = Some(else_step.value)
@@ -4270,10 +4335,11 @@ private pure func parse_match_case(
 	diagnostics: List[ParseDiagnostic],
 ) -> ParseMatchCaseStep:
 	pattern_step: ParsePatternStep = parse_pattern(state, index, diagnostics)
-	colon_step: ParseSymbolStep = expect_symbol(
+	colon_step: ParseSymbolStep = expect_symbol(state, pattern_step.index, ColonSymbol)
+	colon_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		pattern_step.index,
 		pattern_step.diagnostics,
+		colon_step,
 		ColonSymbol,
 		"expected `:` after match pattern",
 	)
@@ -4282,25 +4348,25 @@ private pure func parse_match_case(
 		parse_block_after_colon(
 			state,
 			colon_step.index,
-			colon_step.diagnostics,
+			colon_step_diagnostics,
 			parsed_pattern_span(pattern_step.value),
 		)
 	else if current_is_keyword(state, colon_step.index, MatchKeyword):
 		parse_match_expr_with_header_span(
 			state,
 			colon_step.index,
-			colon_step.diagnostics,
+			colon_step_diagnostics,
 			parsed_pattern_span(pattern_step.value),
 		)
 	else if current_is_keyword(state, colon_step.index, IfKeyword):
 		parse_if_expr_with_header_span(
 			state,
 			colon_step.index,
-			colon_step.diagnostics,
+			colon_step_diagnostics,
 			parsed_pattern_span(pattern_step.value),
 		)
 	else:
-		parse_statement(state, colon_step.index, colon_step.diagnostics)
+		parse_statement(state, colon_step.index, colon_step_diagnostics)
 
 	{
 		index = body_step.index,
@@ -4363,24 +4429,31 @@ private pure func parse_match_expr_with_header_span(
 		diagnostics,
 		PREC_LOWEST,
 	)
-	colon_step: ParseSymbolStep = expect_symbol(
+	colon_step: ParseSymbolStep = expect_symbol(state, scrutinee_step.index, ColonSymbol)
+	colon_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		scrutinee_step.index,
 		scrutinee_step.diagnostics,
+		colon_step,
 		ColonSymbol,
 		"expected `:` after match expression",
 	)
-	__step_4: ParserStep = expect_newline(
+	__step_4: ParserStep = expect_newline(state, colon_step.index)
+	__step_4_diagnostics: List[ParseDiagnostic] = expect_newline_diagnostics(
 		state,
-		colon_step.index,
-		colon_step.diagnostics,
+		colon_step_diagnostics,
+		__step_4,
 		"expected newline before match cases",
 	)
 	var st: Int = __step_4.index
-	var st_diag: List[ParseDiagnostic] = __step_4.diagnostics
-	__step_5: ParserStep = consume_block_indent(state, st, st_diag, header_span)
+	var st_diag: List[ParseDiagnostic] = __step_4_diagnostics
+	__step_5: ParserStep = consume_block_indent(state, st, header_span)
+	__step_5_diagnostics: List[ParseDiagnostic] = expect_indent_diagnostics(
+		state,
+		st_diag,
+		__step_5,
+	)
 	st = __step_5.index
-	st_diag = __step_5.diagnostics
+	st_diag = __step_5_diagnostics
 	cases_step: ParseMatchCaseListStep = parse_match_case_list(state, st, st_diag, header_span)
 	st = cases_step.index
 	st_diag = cases_step.diagnostics
@@ -4391,9 +4464,14 @@ private pure func parse_match_expr_with_header_span(
 		start_span
 
 	if current_is_dedent(state, st):
-		__step_6: ParserStep = expect_dedent(state, st, st_diag)
+		__step_6: ParserStep = expect_dedent(state, st)
+		__step_6_diagnostics: List[ParseDiagnostic] = expect_dedent_diagnostics(
+			state,
+			st_diag,
+			__step_6,
+		)
 		st = __step_6.index
-		st_diag = __step_6.diagnostics
+		st_diag = __step_6_diagnostics
 
 	{
 		index = st,
@@ -4418,28 +4496,29 @@ private pure func parse_select_receive_arm(
 		diagnostics,
 		"select receive binding",
 	)
-	__step_7: ParserStep = expect_keyword(
+	__step_7: ParserStep = expect_keyword(state, binder_step.index, FromKeyword)
+	__step_7_diagnostics: List[ParseDiagnostic] = expect_keyword_diagnostics(
 		state,
-		binder_step.index,
 		binder_step.diagnostics,
-		FromKeyword,
+		__step_7,
 		"from",
 		"expected `from` after select receive binding",
 	)
 	var st: Int = __step_7.index
-	var st_diag: List[ParseDiagnostic] = __step_7.diagnostics
+	var st_diag: List[ParseDiagnostic] = __step_7_diagnostics
 	channel_step: ParseExprStep = parse_expression(state, st, st_diag, PREC_LOWEST)
-	colon_step: ParseSymbolStep = expect_symbol(
+	colon_step: ParseSymbolStep = expect_symbol(state, channel_step.index, ColonSymbol)
+	colon_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		channel_step.index,
 		channel_step.diagnostics,
+		colon_step,
 		ColonSymbol,
 		"expected `:` after select receive channel",
 	)
 	body_step: ParseExprStep = parse_block_after_colon(
 		state,
 		colon_step.index,
-		colon_step.diagnostics,
+		colon_step_diagnostics,
 		start_span,
 	)
 
@@ -4466,17 +4545,18 @@ private pure func parse_select_sealed_arm(
 		diagnostics,
 		PREC_LOWEST,
 	)
-	colon_step: ParseSymbolStep = expect_symbol(
+	colon_step: ParseSymbolStep = expect_symbol(state, channel_step.index, ColonSymbol)
+	colon_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		channel_step.index,
 		channel_step.diagnostics,
+		colon_step,
 		ColonSymbol,
 		"expected `:` after sealed select channel",
 	)
 	body_step: ParseExprStep = parse_block_after_colon(
 		state,
 		colon_step.index,
-		colon_step.diagnostics,
+		colon_step_diagnostics,
 		start_span,
 	)
 
@@ -4499,28 +4579,29 @@ private pure func parse_select_after_arm(
 ) -> ParseSelectArmStep:
 	var st: Int = advance_parser(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
-	__step_8: ParserStep = expect_keyword(
+	__step_8: ParserStep = expect_keyword(state, st, AfterKeyword)
+	__step_8_diagnostics: List[ParseDiagnostic] = expect_keyword_diagnostics(
 		state,
-		st,
 		st_diag,
-		AfterKeyword,
+		__step_8,
 		"after",
 		"expected `after` in select timeout arm",
 	)
 	st = __step_8.index
-	st_diag = __step_8.diagnostics
+	st_diag = __step_8_diagnostics
 	timeout_step: ParseExprStep = parse_expression(state, st, st_diag, PREC_LOWEST)
-	colon_step: ParseSymbolStep = expect_symbol(
+	colon_step: ParseSymbolStep = expect_symbol(state, timeout_step.index, ColonSymbol)
+	colon_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		timeout_step.index,
 		timeout_step.diagnostics,
+		colon_step,
 		ColonSymbol,
 		"expected `:` after select timeout",
 	)
 	body_step: ParseExprStep = parse_block_after_colon(
 		state,
 		colon_step.index,
-		colon_step.diagnostics,
+		colon_step_diagnostics,
 		start_span,
 	)
 
@@ -4596,24 +4677,31 @@ private pure func parse_select_expr_with_header_span(
 	start_span: SourceSpan = current_span(state, index)
 	var st: Int = advance_parser(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
-	colon_step: ParseSymbolStep = expect_symbol(
+	colon_step: ParseSymbolStep = expect_symbol(state, st, ColonSymbol)
+	colon_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		colon_step,
 		ColonSymbol,
 		"expected `:` after select",
 	)
-	__step_9: ParserStep = expect_newline(
+	__step_9: ParserStep = expect_newline(state, colon_step.index)
+	__step_9_diagnostics: List[ParseDiagnostic] = expect_newline_diagnostics(
 		state,
-		colon_step.index,
-		colon_step.diagnostics,
+		colon_step_diagnostics,
+		__step_9,
 		"expected newline before select arms",
 	)
 	st = __step_9.index
-	st_diag = __step_9.diagnostics
-	__step_10: ParserStep = consume_block_indent(state, st, st_diag, header_span)
+	st_diag = __step_9_diagnostics
+	__step_10: ParserStep = consume_block_indent(state, st, header_span)
+	__step_10_diagnostics: List[ParseDiagnostic] = expect_indent_diagnostics(
+		state,
+		st_diag,
+		__step_10,
+	)
 	st = __step_10.index
-	st_diag = __step_10.diagnostics
+	st_diag = __step_10_diagnostics
 	arms_step: ParseSelectArmListStep = parse_select_arm_list(state, st, st_diag, header_span)
 	st = arms_step.index
 	st_diag = arms_step.diagnostics
@@ -4624,9 +4712,14 @@ private pure func parse_select_expr_with_header_span(
 		start_span
 
 	if current_is_dedent(state, st):
-		__step_11: ParserStep = expect_dedent(state, st, st_diag)
+		__step_11: ParserStep = expect_dedent(state, st)
+		__step_11_diagnostics: List[ParseDiagnostic] = expect_dedent_diagnostics(
+			state,
+			st_diag,
+			__step_11,
+		)
 		st = __step_11.index
-		st_diag = __step_11.diagnostics
+		st_diag = __step_11_diagnostics
 
 	{
 		index = st,
@@ -4647,14 +4740,19 @@ private pure func parse_debug_block_expr(
 	colon_step: ParseSymbolStep = expect_symbol(
 		state,
 		advance_parser(state, index),
+		ColonSymbol,
+	)
+	colon_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
+		state,
 		diagnostics,
+		colon_step,
 		ColonSymbol,
 		"expected `:` after debug",
 	)
 	body_step: ParseExprStep = parse_block_after_colon(
 		state,
 		colon_step.index,
-		colon_step.diagnostics,
+		colon_step_diagnostics,
 		start_span,
 	)
 
@@ -4684,17 +4782,18 @@ private pure func parse_with_error_map_opt(
 		)
 		st = name_step.index
 		st_diag = name_step.diagnostics
-		fat_arrow_step: ParseSymbolStep = expect_symbol(
+		fat_arrow_step: ParseSymbolStep = expect_symbol(state, st, FatArrowSymbol)
+		fat_arrow_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 			state,
-			st,
 			st_diag,
+			fat_arrow_step,
 			FatArrowSymbol,
 			"expected `=>` after with error name",
 		)
 		value_step: ParseExprStep = parse_expression(
 			state,
 			fat_arrow_step.index,
-			fat_arrow_step.diagnostics,
+			fat_arrow_step_diagnostics,
 			PREC_LOWEST,
 		)
 
@@ -4739,15 +4838,16 @@ private pure func parse_with_binding(
 		kind = ParsedWithTryBinding
 		st = advance_parser(state, st)
 	else:
-		equal_step: ParseSymbolStep = expect_symbol(
+		equal_step: ParseSymbolStep = expect_symbol(state, st, EqualSymbol)
+		equal_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 			state,
-			st,
 			st_diag,
+			equal_step,
 			EqualSymbol,
 			"expected `=` or `?=` after with binding",
 		)
 		st = equal_step.index
-		st_diag = equal_step.diagnostics
+		st_diag = equal_step_diagnostics
 
 	value_step: ParseExprStep = parse_expression(state, st, st_diag, PREC_LOWEST)
 	st = value_step.index
@@ -4828,17 +4928,18 @@ private pure func parse_with_expr(
 		):
 			st = advance_parser(state, st)
 
-	colon_step: ParseSymbolStep = expect_symbol(
+	colon_step: ParseSymbolStep = expect_symbol(state, st, ColonSymbol)
+	colon_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		colon_step,
 		ColonSymbol,
 		"expected `:` after with binding",
 	)
 	body_step: ParseExprStep = parse_block_after_colon(
 		state,
 		colon_step.index,
-		colon_step.diagnostics,
+		colon_step_diagnostics,
 		start_span,
 	)
 
@@ -4878,17 +4979,18 @@ private pure func parse_concurrent_param(
 	)
 	var st: Int = name_step.index
 	var st_diag: List[ParseDiagnostic] = name_step.diagnostics
-	colon_step: ParseSymbolStep = expect_symbol(
+	colon_step: ParseSymbolStep = expect_symbol(state, st, ColonSymbol)
+	colon_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		colon_step,
 		ColonSymbol,
 		"expected `:` after concurrent parameter name",
 	)
 	value_step: ParseExprStep = parse_expression(
 		state,
 		colon_step.index,
-		colon_step.diagnostics,
+		colon_step_diagnostics,
 		PREC_LOWEST,
 	)
 
@@ -4975,27 +5077,29 @@ private pure func parse_concurrent_block_expr(
 			"omit the parentheses for a concurrent block with no parameters",
 		)
 		params = params_step.values
-		right_step: ParseSymbolStep = expect_symbol(
+		right_step: ParseSymbolStep = expect_symbol(state, params_step.index, RightParenSymbol)
+		right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 			state,
-			params_step.index,
 			params_step.diagnostics,
+			right_step,
 			RightParenSymbol,
 			"expected `)` after concurrent parameters",
 		)
 		st = right_step.index
-		st_diag = right_step.diagnostics
+		st_diag = right_step_diagnostics
 
-	colon_step: ParseSymbolStep = expect_symbol(
+	colon_step: ParseSymbolStep = expect_symbol(state, st, ColonSymbol)
+	colon_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		colon_step,
 		ColonSymbol,
 		"expected `:` after concurrent",
 	)
 	body_step: ParseExprStep = parse_block_after_colon(
 		state,
 		colon_step.index,
-		colon_step.diagnostics,
+		colon_step_diagnostics,
 		start_span,
 	)
 
@@ -5031,15 +5135,16 @@ private pure func parse_concurrent_for_tail(
 			"write at least `limit: N` inside concurrently(...)",
 		)
 		params = params_step.values
-		right_step: ParseSymbolStep = expect_symbol(
+		right_step: ParseSymbolStep = expect_symbol(state, params_step.index, RightParenSymbol)
+		right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 			state,
-			params_step.index,
 			params_step.diagnostics,
+			right_step,
 			RightParenSymbol,
 			"expected `)` after concurrently parameters",
 		)
 		st = right_step.index
-		st_diag = right_step.diagnostics
+		st_diag = right_step_diagnostics
 	else:
 		st_diag = add_expected_error(
 			st_diag,
@@ -5049,17 +5154,18 @@ private pure func parse_concurrent_for_tail(
 			Some("write `for x in xs concurrently(limit: N):`"),
 		)
 
-	colon_step: ParseSymbolStep = expect_symbol(
+	colon_step: ParseSymbolStep = expect_symbol(state, st, ColonSymbol)
+	colon_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		colon_step,
 		ColonSymbol,
 		"expected `:` after concurrently parameters",
 	)
 	body_step: ParseExprStep = parse_block_after_colon(
 		state,
 		colon_step.index,
-		colon_step.diagnostics,
+		colon_step_diagnostics,
 		header_span,
 	)
 
@@ -5118,9 +5224,16 @@ private pure func parse_tuple_binder_after_left_paren(
 	st_diag = first_step.diagnostics
 	end_span = first_step.value.span
 
-	comma_step: ParseSymbolStep = expect_symbol(state, st, st_diag, CommaSymbol, comma_message)
+	comma_step: ParseSymbolStep = expect_symbol(state, st, CommaSymbol)
+	comma_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
+		state,
+		st_diag,
+		comma_step,
+		CommaSymbol,
+		comma_message,
+	)
 	st = comma_step.index
-	st_diag = comma_step.diagnostics
+	st_diag = comma_step_diagnostics
 
 	if comma_step.matched:
 		var parsing_values: Bool = True
@@ -5156,9 +5269,16 @@ private pure func parse_tuple_binder_after_left_paren(
 				else:
 					parsing_values = False
 
-	right_step: ParseSymbolStep = expect_symbol(state, st, st_diag, RightParenSymbol, close_message)
+	right_step: ParseSymbolStep = expect_symbol(state, st, RightParenSymbol)
+	right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
+		state,
+		st_diag,
+		right_step,
+		RightParenSymbol,
+		close_message,
+	)
 	st = right_step.index
-	st_diag = right_step.diagnostics
+	st_diag = right_step_diagnostics
 
 	if right_step.matched:
 		end_span = materialize_span(state, right_step.span)
@@ -5241,17 +5361,18 @@ private pure func parse_while_expr(
 		diagnostics,
 		PREC_LOWEST,
 	)
-	colon_step: ParseSymbolStep = expect_symbol(
+	colon_step: ParseSymbolStep = expect_symbol(state, cond_step.index, ColonSymbol)
+	colon_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		cond_step.index,
 		cond_step.diagnostics,
+		colon_step,
 		ColonSymbol,
 		"expected `:` after while condition",
 	)
 	body_step: ParseExprStep = parse_block_after_colon(
 		state,
 		colon_step.index,
-		colon_step.diagnostics,
+		colon_step_diagnostics,
 		start_span,
 	)
 
@@ -5278,16 +5399,16 @@ private pure func parse_for_expr_with_header_span(
 		advance_parser(state, index),
 		diagnostics,
 	)
-	__step_12: ParserStep = expect_keyword(
+	__step_12: ParserStep = expect_keyword(state, binder_step.index, InKeyword)
+	__step_12_diagnostics: List[ParseDiagnostic] = expect_keyword_diagnostics(
 		state,
-		binder_step.index,
 		binder_step.diagnostics,
-		InKeyword,
+		__step_12,
 		"in",
 		"expected `in` after for loop variable",
 	)
 	var st: Int = __step_12.index
-	var st_diag: List[ParseDiagnostic] = __step_12.diagnostics
+	var st_diag: List[ParseDiagnostic] = __step_12_diagnostics
 	iter_step: ParseExprStep = parse_expression(state, st, st_diag, PREC_LOWEST)
 
 	if current_is_keyword(state, iter_step.index, ConcurrentlyKeyword):
@@ -5321,17 +5442,18 @@ private pure func parse_for_expr_with_header_span(
 					header_span,
 				)
 	else:
-		colon_step: ParseSymbolStep = expect_symbol(
+		colon_step: ParseSymbolStep = expect_symbol(state, iter_step.index, ColonSymbol)
+		colon_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 			state,
-			iter_step.index,
 			iter_step.diagnostics,
+			colon_step,
 			ColonSymbol,
 			"expected `:` after for loop iterable",
 		)
 		body_step: ParseExprStep = parse_block_after_colon(
 			state,
 			colon_step.index,
-			colon_step.diagnostics,
+			colon_step_diagnostics,
 			header_span,
 		)
 
@@ -5367,17 +5489,18 @@ private pure func parse_var_decl_statement(
 	var st: Int = type_step.index
 	var st_diag: List[ParseDiagnostic] = type_step.diagnostics
 
-	equal_step: ParseSymbolStep = expect_symbol(
+	equal_step: ParseSymbolStep = expect_symbol(state, st, EqualSymbol)
+	equal_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		equal_step,
 		EqualSymbol,
 		"expected `=` after variable declaration",
 	)
 	value_step: ParseExprStep = parse_assignment_value_expr(
 		state,
 		equal_step.index,
-		equal_step.diagnostics,
+		equal_step_diagnostics,
 		start_span,
 	)
 
@@ -5575,17 +5698,18 @@ private pure func parse_tuple_destruct_assignment(
 		"expected tuple destructuring name after `, `",
 		"expected `)` after tuple destructuring names",
 	)
-	equal_step: ParseSymbolStep = expect_symbol(
+	equal_step: ParseSymbolStep = expect_symbol(state, binder_step.index, EqualSymbol)
+	equal_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		binder_step.index,
 		binder_step.diagnostics,
+		equal_step,
 		EqualSymbol,
 		"expected `=` after tuple destructuring",
 	)
 	value_step: ParseExprStep = parse_assignment_value_expr(
 		state,
 		equal_step.index,
-		equal_step.diagnostics,
+		equal_step_diagnostics,
 		start_span,
 	)
 
@@ -5883,37 +6007,38 @@ private pure func parse_lambda_expr_with_header_span(
 	if current_is_keyword(state, st, PureKeyword):
 		is_pure = True
 		st = advance_parser(state, st)
-		__step_13: ParserStep = expect_keyword(
+		__step_13: ParserStep = expect_keyword(state, st, FuncKeyword)
+		__step_13_diagnostics: List[ParseDiagnostic] = expect_keyword_diagnostics(
 			state,
-			st,
 			st_diag,
-			FuncKeyword,
+			__step_13,
 			"func",
 			"expected `func` after `pure` in lambda expression",
 		)
 		st = __step_13.index
-		st_diag = __step_13.diagnostics
+		st_diag = __step_13_diagnostics
 	else:
-		__step_14: ParserStep = expect_keyword(
+		__step_14: ParserStep = expect_keyword(state, st, FuncKeyword)
+		__step_14_diagnostics: List[ParseDiagnostic] = expect_keyword_diagnostics(
 			state,
-			st,
 			st_diag,
-			FuncKeyword,
+			__step_14,
 			"func",
 			"expected `func` before lambda",
 		)
 		st = __step_14.index
-		st_diag = __step_14.diagnostics
+		st_diag = __step_14_diagnostics
 
-	left_step: ParseSymbolStep = expect_symbol(
+	left_step: ParseSymbolStep = expect_symbol(state, st, LeftParenSymbol)
+	left_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		left_step,
 		LeftParenSymbol,
 		"expected `(` after lambda `func`",
 	)
 	st = left_step.index
-	st_diag = left_step.diagnostics
+	st_diag = left_step_diagnostics
 
 	params_step: ParseLambdaParamsStep = if left_step.matched:
 		parse_lambda_params_after_left_paren(state, st, st_diag)
@@ -5938,17 +6063,18 @@ private pure func parse_lambda_expr_with_header_span(
 		st = type_step.index
 		st_diag = type_step.diagnostics
 
-	colon_step: ParseSymbolStep = expect_symbol(
+	colon_step: ParseSymbolStep = expect_symbol(state, st, ColonSymbol)
+	colon_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		colon_step,
 		ColonSymbol,
 		"expected `:` before lambda body",
 	)
 	body_step: ParseExprStep = parse_lambda_body(
 		state,
 		colon_step.index,
-		colon_step.diagnostics,
+		colon_step_diagnostics,
 		state.start_lines.get_or(colon_step.span.first, 0),
 		header_span,
 	)
@@ -5998,15 +6124,16 @@ private pure func parse_tuple_tail(
 		else:
 			parsing_items = False
 
-	right_step: ParseSymbolStep = expect_symbol(
+	right_step: ParseSymbolStep = expect_symbol(state, st, RightParenSymbol)
+	right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		right_step,
 		RightParenSymbol,
 		"expected `)` after tuple expression",
 	)
 	st = right_step.index
-	st_diag = right_step.diagnostics
+	st_diag = right_step_diagnostics
 
 	end_span: SourceSpan = if right_step.matched:
 		materialize_span(state, right_step.span)
@@ -6036,17 +6163,18 @@ private pure func parse_parenthesized_or_tuple_expr(
 	start_span: SourceSpan,
 ) -> ParseExprStep:
 	if current_is_symbol(state, index, RightParenSymbol):
-		right_step: ParseSymbolStep = expect_symbol(
+		right_step: ParseSymbolStep = expect_symbol(state, index, RightParenSymbol)
+		right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 			state,
-			index,
 			diagnostics,
+			right_step,
 			RightParenSymbol,
 			"expected `)` after void expression",
 		)
 
 		{
 			index = right_step.index,
-			diagnostics = right_step.diagnostics,
+			diagnostics = right_step_diagnostics,
 			value = ParsedVoidExpr(span_cover(start_span, materialize_span(state, right_step.span)))
 		}
 	else:
@@ -6067,10 +6195,11 @@ private pure func parse_parenthesized_or_tuple_expr(
 				start_span,
 			)
 		else:
-			right_step: ParseSymbolStep = expect_symbol(
+			right_step: ParseSymbolStep = expect_symbol(state, expr_step.index, RightParenSymbol)
+			right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 				state,
-				expr_step.index,
 				expr_step.diagnostics,
+				right_step,
 				RightParenSymbol,
 				"expected `)` after expression",
 			)
@@ -6081,7 +6210,7 @@ private pure func parse_parenthesized_or_tuple_expr(
 			if right_step.matched:
 				{
 					index = right_step.index,
-					diagnostics = right_step.diagnostics,
+					diagnostics = right_step_diagnostics,
 					value = parsed_expr_with_span(
 						expr_step.value,
 						span_cover(
@@ -6093,7 +6222,7 @@ private pure func parse_parenthesized_or_tuple_expr(
 			else:
 				{
 					index = right_step.index,
-					diagnostics = right_step.diagnostics,
+					diagnostics = right_step_diagnostics,
 					value = expr_step.value
 				}
 
@@ -6130,17 +6259,18 @@ private pure func parse_record_expr_field(
 		diagnostics,
 		"record field",
 	)
-	equal_step: ParseSymbolStep = expect_symbol(
+	equal_step: ParseSymbolStep = expect_symbol(state, name_step.index, EqualSymbol)
+	equal_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		name_step.index,
 		name_step.diagnostics,
+		equal_step,
 		EqualSymbol,
 		"expected `=` after record field name",
 	)
 	value_step: ParseExprStep = parse_expression(
 		state,
 		equal_step.index,
-		equal_step.diagnostics,
+		equal_step_diagnostics,
 		PREC_LOWEST,
 	)
 
@@ -6207,10 +6337,11 @@ private pure func parse_record_literal_expr(
 		diagnostics,
 		True,
 	)
-	right_step: ParseSymbolStep = expect_symbol(
+	right_step: ParseSymbolStep = expect_symbol(state, fields_step.index, RightBraceSymbol)
+	right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		fields_step.index,
 		fields_step.diagnostics,
+		right_step,
 		RightBraceSymbol,
 		"expected `}` after record literal",
 	)
@@ -6222,7 +6353,7 @@ private pure func parse_record_literal_expr(
 
 	{
 		index = right_step.index,
-		diagnostics = right_step.diagnostics,
+		diagnostics = right_step_diagnostics,
 		value = ParsedRecordExpr(
 			fields_step.values,
 			span_cover(start_span, end_span),
@@ -6236,17 +6367,18 @@ private pure func parse_dict_entry_after_key(
 	diagnostics: List[ParseDiagnostic],
 	key: ParsedExpr,
 ) -> ParseDictEntryStep:
-	arrow_step: ParseSymbolStep = expect_symbol(
+	arrow_step: ParseSymbolStep = expect_symbol(state, index, FatArrowSymbol)
+	arrow_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		index,
 		diagnostics,
+		arrow_step,
 		FatArrowSymbol,
 		"expected `=>` between dict key and value",
 	)
 	value_step: ParseExprStep = parse_expression(
 		state,
 		arrow_step.index,
-		arrow_step.diagnostics,
+		arrow_step_diagnostics,
 		PREC_LOWEST,
 	)
 
@@ -6299,10 +6431,11 @@ private pure func parse_dict_literal_tail(
 		else:
 			parsing_entries = False
 
-	right_step: ParseSymbolStep = expect_symbol(
+	right_step: ParseSymbolStep = expect_symbol(state, st, RightBraceSymbol)
+	right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		right_step,
 		RightBraceSymbol,
 		"expected `}` after dict literal",
 	)
@@ -6314,7 +6447,7 @@ private pure func parse_dict_literal_tail(
 
 	{
 		index = right_step.index,
-		diagnostics = right_step.diagnostics,
+		diagnostics = right_step_diagnostics,
 		value = ParsedDictExpr(
 			entries,
 			span_cover(start_span, end_span),
@@ -6348,10 +6481,11 @@ private pure func parse_vector_literal_tail(
 		else:
 			parsing_items = False
 
-	right_step: ParseSymbolStep = expect_symbol(
+	right_step: ParseSymbolStep = expect_symbol(state, st, RightBraceSymbol)
+	right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		right_step,
 		RightBraceSymbol,
 		"expected `}` after vector literal",
 	)
@@ -6363,7 +6497,7 @@ private pure func parse_vector_literal_tail(
 
 	{
 		index = right_step.index,
-		diagnostics = right_step.diagnostics,
+		diagnostics = right_step_diagnostics,
 		value = ParsedVectorExpr(
 			items,
 			span_cover(start_span, end_span),
@@ -6378,23 +6512,25 @@ private pure func parse_record_update_tail(
 	base: ParsedExpr,
 	start_span: SourceSpan,
 ) -> ParseExprStep:
-	pipe_step: ParseSymbolStep = expect_symbol(
+	pipe_step: ParseSymbolStep = expect_symbol(state, index, PipeSymbol)
+	pipe_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		index,
 		diagnostics,
+		pipe_step,
 		PipeSymbol,
 		"expected `|` before record update fields",
 	)
 	fields_step: ParseRecordExprFieldListStep = parse_record_expr_field_list_until_right_brace(
 		state,
 		pipe_step.index,
-		pipe_step.diagnostics,
+		pipe_step_diagnostics,
 		False,
 	)
-	right_step: ParseSymbolStep = expect_symbol(
+	right_step: ParseSymbolStep = expect_symbol(state, fields_step.index, RightBraceSymbol)
+	right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		fields_step.index,
 		fields_step.diagnostics,
+		right_step,
 		RightBraceSymbol,
 		"expected `}` after record update",
 	)
@@ -6406,7 +6542,7 @@ private pure func parse_record_update_tail(
 
 	{
 		index = right_step.index,
-		diagnostics = right_step.diagnostics,
+		diagnostics = right_step_diagnostics,
 		value = ParsedRecordUpdateExpr(
 			base,
 			fields_step.values,
@@ -6489,15 +6625,16 @@ private pure func parse_builtin_expr(
 				if not current_is_soft_boundary(state, st):
 					st = advance_parser(state, st)
 
-		right_step: ParseSymbolStep = expect_symbol(
+		right_step: ParseSymbolStep = expect_symbol(state, st, RightParenSymbol)
+		right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 			state,
-			st,
 			st_diag,
+			right_step,
 			RightParenSymbol,
 			"expected `)` after builtin name",
 		)
 		st = right_step.index
-		st_diag = right_step.diagnostics
+		st_diag = right_step_diagnostics
 
 		if right_step.matched:
 			end_span = materialize_span(state, right_step.span)
@@ -6524,23 +6661,25 @@ private pure func parse_opaque_conversion_expr(
 		advance_parser(state, index),
 		diagnostics,
 	)
-	left_step: ParseSymbolStep = expect_symbol(
+	left_step: ParseSymbolStep = expect_symbol(state, type_step.index, LeftParenSymbol)
+	left_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		type_step.index,
 		type_step.diagnostics,
+		left_step,
 		LeftParenSymbol,
 		"expected `(` after opaque conversion type",
 	)
 	value_step: ParseExprStep = parse_expression(
 		state,
 		left_step.index,
-		left_step.diagnostics,
+		left_step_diagnostics,
 		PREC_LOWEST,
 	)
-	right_step: ParseSymbolStep = expect_symbol(
+	right_step: ParseSymbolStep = expect_symbol(state, value_step.index, RightParenSymbol)
+	right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		value_step.index,
 		value_step.diagnostics,
+		right_step,
 		RightParenSymbol,
 		"expected `)` after opaque conversion value",
 	)
@@ -6565,7 +6704,7 @@ private pure func parse_opaque_conversion_expr(
 
 	{
 		index = right_step.index,
-		diagnostics = right_step.diagnostics,
+		diagnostics = right_step_diagnostics,
 		value = value
 	}
 
@@ -6810,7 +6949,12 @@ private pure func parse_primary_expr(
 					right_step: ParseSymbolStep = expect_symbol(
 						state,
 						items_step.index,
+						RightBracketSymbol,
+					)
+					right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
+						state,
 						items_step.diagnostics,
+						right_step,
 						RightBracketSymbol,
 						"expected `]` after list literal",
 					)
@@ -6822,7 +6966,7 @@ private pure func parse_primary_expr(
 
 					{
 						index = right_step.index,
-						diagnostics = right_step.diagnostics,
+						diagnostics = right_step_diagnostics,
 						value = ParsedListExpr(
 							items_step.values,
 							span_cover(start_span, end_span),
@@ -6957,12 +7101,17 @@ private pure func parse_postfix_expr(
 				right_step: ParseSymbolStep = expect_symbol(
 					state,
 					args_step.index,
+					RightParenSymbol,
+				)
+				right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
+					state,
 					args_step.diagnostics,
+					right_step,
 					RightParenSymbol,
 					"expected `)` after call arguments",
 				)
 				st = right_step.index
-				st_diag = right_step.diagnostics
+				st_diag = right_step_diagnostics
 
 				end_span: SourceSpan = if right_step.matched:
 					materialize_span(state, right_step.span)
@@ -6987,12 +7136,17 @@ private pure func parse_postfix_expr(
 				right_step: ParseSymbolStep = expect_symbol(
 					state,
 					indices_step.index,
+					RightBracketSymbol,
+				)
+				right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
+					state,
 					indices_step.diagnostics,
+					right_step,
 					RightBracketSymbol,
 					"expected `]` after subscript",
 				)
 				st = right_step.index
-				st_diag = right_step.diagnostics
+				st_diag = right_step_diagnostics
 
 				end_span: SourceSpan = if right_step.matched:
 					materialize_span(state, right_step.span)
@@ -7199,50 +7353,64 @@ private pure func parse_expression(
 	)
 
 
-private pure func expect_indent(
-	state: ParserInput,
-	index: Int,
-	diagnostics: List[ParseDiagnostic],
-) -> ParserStep:
+private pure func expect_indent(state: ParserInput, index: Int) -> ParserStep:
 	if current_is_indent(state, index):
 		{
 			index = advance_parser(state, index),
-			diagnostics = diagnostics
+			matched = True
 		}
 	else:
 		{
 			index = index,
-			diagnostics = add_expected_error(
-				diagnostics,
-				current_span(state, index),
-				"expected indented function body",
-				["indent"],
-				None,
-			)
+			matched = False
 		}
 
 
-private pure func expect_dedent(
-	state: ParserInput,
-	index: Int,
-	diagnostics: List[ParseDiagnostic],
-) -> ParserStep:
+private pure func expect_dedent(state: ParserInput, index: Int) -> ParserStep:
 	if current_is_dedent(state, index):
 		{
 			index = advance_parser(state, index),
-			diagnostics = diagnostics
+			matched = True
 		}
 	else:
 		{
 			index = index,
-			diagnostics = add_expected_error(
-				diagnostics,
-				current_span(state, index),
-				"expected dedent after function body",
-				["dedent"],
-				None,
-			)
+			matched = False
 		}
+
+
+private pure func expect_indent_diagnostics(
+	state: ParserInput,
+	diagnostics: List[ParseDiagnostic],
+	step: ParserStep,
+) -> List[ParseDiagnostic]:
+	if step.matched:
+		diagnostics
+	else:
+		add_expected_error(
+			diagnostics,
+			current_span(state, step.index),
+			"expected indented function body",
+			["indent"],
+			None,
+		)
+
+
+private pure func expect_dedent_diagnostics(
+	state: ParserInput,
+	diagnostics: List[ParseDiagnostic],
+	step: ParserStep,
+) -> List[ParseDiagnostic]:
+	if step.matched:
+		diagnostics
+	else:
+		add_expected_error(
+			diagnostics,
+			current_span(state, step.index),
+			"expected dedent after function body",
+			["dedent"],
+			None,
+		)
 
 
 private pure func parse_function_body(
@@ -7293,15 +7461,16 @@ private pure func parse_function_decl_value(
 	st = type_params_step.index
 	st_diag = type_params_step.diagnostics
 
-	left_step: ParseSymbolStep = expect_symbol(
+	left_step: ParseSymbolStep = expect_symbol(state, st, LeftParenSymbol)
+	left_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		left_step,
 		LeftParenSymbol,
 		"expected `(` after function name",
 	)
 	st = left_step.index
-	st_diag = left_step.diagnostics
+	st_diag = left_step_diagnostics
 
 	params_step: ParseParamsStep = if left_step.matched:
 		parse_params_after_left_paren(state, st, st_diag)
@@ -7332,15 +7501,16 @@ private pure func parse_function_decl_value(
 	end_span = last_dim_constraint_span(dim_constraints_step.values, end_span)
 
 	body_step: ParseBodyStep = if current_is_symbol(state, st, ColonSymbol):
-		colon_step: ParseSymbolStep = expect_symbol(
+		colon_step: ParseSymbolStep = expect_symbol(state, st, ColonSymbol)
+		colon_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 			state,
-			st,
 			st_diag,
+			colon_step,
 			ColonSymbol,
 			"expected `:` before function body",
 		)
 		st = colon_step.index
-		st_diag = colon_step.diagnostics
+		st_diag = colon_step_diagnostics
 
 		if current_is_eof(state, st) or current_is_dedent(state, st):
 			{
@@ -7487,15 +7657,16 @@ private pure func parse_import_symbol(
 				None,
 			)
 
-		right_step: ParseSymbolStep = expect_symbol(
+		right_step: ParseSymbolStep = expect_symbol(state, ctors_state, RightParenSymbol)
+		right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 			state,
-			ctors_state,
 			ctors_state_diag,
+			right_step,
 			RightParenSymbol,
 			"expected `)` after imported constructors",
 		)
 		st = right_step.index
-		st_diag = right_step.diagnostics
+		st_diag = right_step_diagnostics
 
 		if right_step.matched:
 			end_span = materialize_span(state, right_step.span)
@@ -7570,9 +7741,14 @@ private pure func parse_import_symbols_block(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 ) -> ParseImportSymbolListStep:
-	__step_15: ParserStep = expect_indent(state, index, diagnostics)
+	__step_15: ParserStep = expect_indent(state, index)
+	__step_15_diagnostics: List[ParseDiagnostic] = expect_indent_diagnostics(
+		state,
+		diagnostics,
+		__step_15,
+	)
 	var st: Int = __step_15.index
-	var st_diag: List[ParseDiagnostic] = __step_15.diagnostics
+	var st_diag: List[ParseDiagnostic] = __step_15_diagnostics
 	st = skip_newlines(state, st)
 	var symbols: List[ParsedImportSymbol] = []
 
@@ -7778,24 +7954,31 @@ private pure func parse_import_block_decl(
 ) -> ParseDeclStep:
 	var st: Int = advance_parser(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
-	colon_step: ParseSymbolStep = expect_symbol(
+	colon_step: ParseSymbolStep = expect_symbol(state, st, ColonSymbol)
+	colon_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		colon_step,
 		ColonSymbol,
 		"expected `:` after import",
 	)
-	__step_16: ParserStep = expect_newline(
+	__step_16: ParserStep = expect_newline(state, colon_step.index)
+	__step_16_diagnostics: List[ParseDiagnostic] = expect_newline_diagnostics(
 		state,
-		colon_step.index,
-		colon_step.diagnostics,
+		colon_step_diagnostics,
+		__step_16,
 		"expected newline after import header",
 	)
 	st = __step_16.index
-	st_diag = __step_16.diagnostics
-	__step_17: ParserStep = expect_indent(state, st, st_diag)
+	st_diag = __step_16_diagnostics
+	__step_17: ParserStep = expect_indent(state, st)
+	__step_17_diagnostics: List[ParseDiagnostic] = expect_indent_diagnostics(
+		state,
+		st_diag,
+		__step_17,
+	)
 	st = __step_17.index
-	st_diag = __step_17.diagnostics
+	st_diag = __step_17_diagnostics
 	items_step: ParseImportItemListStep = parse_import_item_list(state, st, st_diag)
 	st = items_step.index
 	st_diag = items_step.diagnostics
@@ -7805,9 +7988,14 @@ private pure func parse_import_block_decl(
 	else:
 		start_span
 
-	__step_18: ParserStep = expect_dedent(state, st, st_diag)
+	__step_18: ParserStep = expect_dedent(state, st)
+	__step_18_diagnostics: List[ParseDiagnostic] = expect_dedent_diagnostics(
+		state,
+		st_diag,
+		__step_18,
+	)
 	st = __step_18.index
-	st_diag = __step_18.diagnostics
+	st_diag = __step_18_diagnostics
 
 	{
 		index = st,
@@ -7848,15 +8036,16 @@ private pure func parse_foreign_block_arg(
 	)
 	var st: Int = name_step.index
 	var st_diag: List[ParseDiagnostic] = name_step.diagnostics
-	colon_step: ParseSymbolStep = expect_symbol(
+	colon_step: ParseSymbolStep = expect_symbol(state, st, ColonSymbol)
+	colon_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		colon_step,
 		ColonSymbol,
 		"expected `:` after foreign block argument name",
 	)
 	st = colon_step.index
-	st_diag = colon_step.diagnostics
+	st_diag = colon_step_diagnostics
 	var value: String = ""
 	var end_span: SourceSpan = name_step.value.span
 
@@ -7978,16 +8167,16 @@ private pure func parse_foreign_function_decl(
 		is_pure = True
 		st = advance_parser(state, st)
 
-	__step_19: ParserStep = expect_keyword(
+	__step_19: ParserStep = expect_keyword(state, st, FuncKeyword)
+	__step_19_diagnostics: List[ParseDiagnostic] = expect_keyword_diagnostics(
 		state,
-		st,
 		st_diag,
-		FuncKeyword,
+		__step_19,
 		"func",
 		"expected `func` in foreign block item",
 	)
 	st = __step_19.index
-	st_diag = __step_19.diagnostics
+	st_diag = __step_19_diagnostics
 	name_step: ParseIdentifierStep = parse_declared_name_expected(
 		state,
 		st,
@@ -7996,15 +8185,16 @@ private pure func parse_foreign_function_decl(
 	)
 	st = name_step.index
 	st_diag = name_step.diagnostics
-	left_step: ParseSymbolStep = expect_symbol(
+	left_step: ParseSymbolStep = expect_symbol(state, st, LeftParenSymbol)
+	left_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		left_step,
 		LeftParenSymbol,
 		"expected `(` after foreign function name",
 	)
 	st = left_step.index
-	st_diag = left_step.diagnostics
+	st_diag = left_step_diagnostics
 
 	params_step: ParseParamsStep = if left_step.matched:
 		parse_params_after_left_paren(state, st, st_diag)
@@ -8019,15 +8209,16 @@ private pure func parse_foreign_function_decl(
 	st_diag = params_step.diagnostics
 	var return_type: ParsedTypeExpr = ParsedMissingType(current_span(state, st))
 	var end_span: SourceSpan = name_step.value.span
-	arrow_step: ParseSymbolStep = expect_symbol(
+	arrow_step: ParseSymbolStep = expect_symbol(state, st, ArrowSymbol)
+	arrow_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		arrow_step,
 		ArrowSymbol,
 		"expected `->` before foreign function return type",
 	)
 	st = arrow_step.index
-	st_diag = arrow_step.diagnostics
+	st_diag = arrow_step_diagnostics
 
 	if arrow_step.matched:
 		type_step: ParseTypeStep = parse_type_expr(state, st, st_diag)
@@ -8149,34 +8340,42 @@ private pure func parse_foreign_block_decl(
 				st_diag,
 			)
 			args = args_step.values
-			right_step: ParseSymbolStep = expect_symbol(
+			right_step: ParseSymbolStep = expect_symbol(state, args_step.index, RightParenSymbol)
+			right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 				state,
-				args_step.index,
 				args_step.diagnostics,
+				right_step,
 				RightParenSymbol,
 				"expected `)` after foreign block arguments",
 			)
 			st = right_step.index
-			st_diag = right_step.diagnostics
+			st_diag = right_step_diagnostics
 
-		colon_step: ParseSymbolStep = expect_symbol(
+		colon_step: ParseSymbolStep = expect_symbol(state, st, ColonSymbol)
+		colon_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 			state,
-			st,
 			st_diag,
+			colon_step,
 			ColonSymbol,
 			"expected `:` after foreign",
 		)
-		__step_20: ParserStep = expect_newline(
+		__step_20: ParserStep = expect_newline(state, colon_step.index)
+		__step_20_diagnostics: List[ParseDiagnostic] = expect_newline_diagnostics(
 			state,
-			colon_step.index,
-			colon_step.diagnostics,
+			colon_step_diagnostics,
+			__step_20,
 			"expected newline after foreign header",
 		)
 		st = __step_20.index
-		st_diag = __step_20.diagnostics
-		__step_21: ParserStep = expect_indent(state, st, st_diag)
+		st_diag = __step_20_diagnostics
+		__step_21: ParserStep = expect_indent(state, st)
+		__step_21_diagnostics: List[ParseDiagnostic] = expect_indent_diagnostics(
+			state,
+			st_diag,
+			__step_21,
+		)
 		st = __step_21.index
-		st_diag = __step_21.diagnostics
+		st_diag = __step_21_diagnostics
 		functions_step: ParseForeignFunctionListStep = parse_foreign_function_list(
 			state,
 			st,
@@ -8190,9 +8389,14 @@ private pure func parse_foreign_block_decl(
 		else:
 			start_span
 
-		__step_22: ParserStep = expect_dedent(state, st, st_diag)
+		__step_22: ParserStep = expect_dedent(state, st)
+		__step_22_diagnostics: List[ParseDiagnostic] = expect_dedent_diagnostics(
+			state,
+			st_diag,
+			__step_22,
+		)
 		st = __step_22.index
-		st_diag = __step_22.diagnostics
+		st_diag = __step_22_diagnostics
 
 		{
 			index = st,
@@ -8216,14 +8420,15 @@ private pure func parse_field_decl(
 		diagnostics,
 		"field name",
 	)
-	colon_step: ParseSymbolStep = expect_symbol(
+	colon_step: ParseSymbolStep = expect_symbol(state, name_step.index, ColonSymbol)
+	colon_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		name_step.index,
 		name_step.diagnostics,
+		colon_step,
 		ColonSymbol,
 		"expected `:` after field name",
 	)
-	type_step: ParseTypeStep = parse_type_expr(state, colon_step.index, colon_step.diagnostics)
+	type_step: ParseTypeStep = parse_type_expr(state, colon_step.index, colon_step_diagnostics)
 
 	{
 		index = type_step.index,
@@ -8311,29 +8516,31 @@ private pure func parse_record_decl(
 
 	st = type_params_step.index
 	st_diag = type_params_step.diagnostics
-	left_step: ParseSymbolStep = expect_symbol(
+	left_step: ParseSymbolStep = expect_symbol(state, st, LeftBraceSymbol)
+	left_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		left_step,
 		LeftBraceSymbol,
 		open_fields_message,
 	)
 	fields_step: ParseFieldListStep = parse_field_list_until_right_brace(
 		state,
 		left_step.index,
-		left_step.diagnostics,
+		left_step_diagnostics,
 	)
-	right_step: ParseSymbolStep = expect_symbol(
+	right_step: ParseSymbolStep = expect_symbol(state, fields_step.index, RightBraceSymbol)
+	right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		fields_step.index,
 		fields_step.diagnostics,
+		right_step,
 		RightBraceSymbol,
 		close_fields_message,
 	)
 
 	{
 		index = right_step.index,
-		diagnostics = right_step.diagnostics,
+		diagnostics = right_step_diagnostics,
 		value = RecordParsedDecl({
 			name = name_step.value,
 			type_params = type_params_step.values,
@@ -8397,15 +8604,16 @@ private pure func parse_variant_decl(
 			True,
 		)
 		fields = fields_step.values
-		right_step: ParseSymbolStep = expect_symbol(
+		right_step: ParseSymbolStep = expect_symbol(state, fields_step.index, RightParenSymbol)
+		right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 			state,
-			fields_step.index,
 			fields_step.diagnostics,
+			right_step,
 			RightParenSymbol,
 			"expected `)` after variant fields",
 		)
 		st = right_step.index
-		st_diag = right_step.diagnostics
+		st_diag = right_step_diagnostics
 
 		if right_step.matched:
 			end_span = materialize_span(state, right_step.span)
@@ -8472,24 +8680,31 @@ private pure func parse_union_decl(
 
 	st = type_params_step.index
 	st_diag = type_params_step.diagnostics
-	colon_step: ParseSymbolStep = expect_symbol(
+	colon_step: ParseSymbolStep = expect_symbol(state, st, ColonSymbol)
+	colon_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		colon_step,
 		ColonSymbol,
 		"expected `:` before variants",
 	)
-	__step_23: ParserStep = expect_newline(
+	__step_23: ParserStep = expect_newline(state, colon_step.index)
+	__step_23_diagnostics: List[ParseDiagnostic] = expect_newline_diagnostics(
 		state,
-		colon_step.index,
-		colon_step.diagnostics,
+		colon_step_diagnostics,
+		__step_23,
 		"expected newline before variants",
 	)
 	st = __step_23.index
-	st_diag = __step_23.diagnostics
-	__step_24: ParserStep = expect_indent(state, st, st_diag)
+	st_diag = __step_23_diagnostics
+	__step_24: ParserStep = expect_indent(state, st)
+	__step_24_diagnostics: List[ParseDiagnostic] = expect_indent_diagnostics(
+		state,
+		st_diag,
+		__step_24,
+	)
 	st = __step_24.index
-	st_diag = __step_24.diagnostics
+	st_diag = __step_24_diagnostics
 	variants_step: ParseVariantListStep = parse_variant_list(state, st, st_diag)
 	st = variants_step.index
 	st_diag = variants_step.diagnostics
@@ -8499,9 +8714,14 @@ private pure func parse_union_decl(
 	else:
 		name_step.value.span
 
-	__step_25: ParserStep = expect_dedent(state, st, st_diag)
+	__step_25: ParserStep = expect_dedent(state, st)
+	__step_25_diagnostics: List[ParseDiagnostic] = expect_dedent_diagnostics(
+		state,
+		st_diag,
+		__step_25,
+	)
 	st = __step_25.index
-	st_diag = __step_25.diagnostics
+	st_diag = __step_25_diagnostics
 
 	{
 		index = st,
@@ -8521,7 +8741,7 @@ private pure func consume_builtin_type_argument_list(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-) -> ParserStep:
+) -> ParserRecoveryStep:
 	var st: Int = index
 	var st_diag: List[ParseDiagnostic] = add_expected_error(
 		diagnostics,
@@ -8567,40 +8787,41 @@ private pure func parse_builtin_type_decl(
 
 	var st_diag: List[ParseDiagnostic] = diagnostics
 
-	keyword_step: ParserStep = expect_keyword(
+	keyword_step: ParserStep = expect_keyword(state, st, TypeKeyword)
+	keyword_step_diagnostics: List[ParseDiagnostic] = expect_keyword_diagnostics(
 		state,
-		st,
 		st_diag,
-		TypeKeyword,
+		keyword_step,
 		"type",
 		"expected `type` in builtin type declaration",
 	)
 	st = keyword_step.index
-	st_diag = keyword_step.diagnostics
+	st_diag = keyword_step_diagnostics
 	name_step: ParseIdentifierStep = parse_declared_name_expected(state, st, st_diag, "type name")
 	st = name_step.index
 	st_diag = name_step.diagnostics
 	type_params_step: ParseTypeParamListStep = parse_type_params_opt(state, st, st_diag)
 	st = type_params_step.index
 	st_diag = type_params_step.diagnostics
-	equal_step: ParseSymbolStep = expect_symbol(
+	equal_step: ParseSymbolStep = expect_symbol(state, st, EqualSymbol)
+	equal_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		equal_step,
 		EqualSymbol,
 		"expected `=` before builtin type marker",
 	)
 	builtin_span: SourceSpan = current_span(state, equal_step.index)
-	builtin_keyword_step: ParserStep = expect_keyword(
+	builtin_keyword_step: ParserStep = expect_keyword(state, equal_step.index, BuiltinKeyword)
+	builtin_keyword_step_diagnostics: List[ParseDiagnostic] = expect_keyword_diagnostics(
 		state,
-		equal_step.index,
-		equal_step.diagnostics,
-		BuiltinKeyword,
+		equal_step_diagnostics,
+		builtin_keyword_step,
 		"builtin",
 		"expected `builtin` after `=`",
 	)
 	st = builtin_keyword_step.index
-	st_diag = builtin_keyword_step.diagnostics
+	st_diag = builtin_keyword_step_diagnostics
 	var cleanup: Option[ParsedResourceCleanup] = None
 	var end_span: SourceSpan = builtin_span
 
@@ -8628,20 +8849,25 @@ private pure func parse_builtin_type_decl(
 					if not current_is_soft_boundary(state, st):
 						st = advance_parser(state, st)
 
-			right_step: ParseSymbolStep = expect_symbol(
+			right_step: ParseSymbolStep = expect_symbol(state, st, RightParenSymbol)
+			right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 				state,
-				st,
 				st_diag,
+				right_step,
 				RightParenSymbol,
 				"expected `)` after resource cleanup builtin name",
 			)
 			st = right_step.index
-			st_diag = right_step.diagnostics
+			st_diag = right_step_diagnostics
 
 			if right_step.matched:
 				end_span = materialize_span(state, right_step.span)
 		else:
-			argument_list_step: ParserStep = consume_builtin_type_argument_list(state, st, st_diag)
+			argument_list_step: ParserRecoveryStep = consume_builtin_type_argument_list(
+				state,
+				st,
+				st_diag,
+			)
 			st = argument_list_step.index
 			st_diag = argument_list_step.diagnostics
 
@@ -8671,27 +8897,27 @@ private pure func parse_type_alias_decl(
 	var st_diag: List[ParseDiagnostic] = diagnostics
 
 	if is_opaque:
-		__step_26: ParserStep = expect_keyword(
+		__step_26: ParserStep = expect_keyword(state, st, TypeKeyword)
+		__step_26_diagnostics: List[ParseDiagnostic] = expect_keyword_diagnostics(
 			state,
-			st,
 			st_diag,
-			TypeKeyword,
+			__step_26,
 			"type",
 			"expected `type` after `opaque`",
 		)
 		st = __step_26.index
-		st_diag = __step_26.diagnostics
+		st_diag = __step_26_diagnostics
 	else:
-		__step_27: ParserStep = expect_keyword(
+		__step_27: ParserStep = expect_keyword(state, st, AliasKeyword)
+		__step_27_diagnostics: List[ParseDiagnostic] = expect_keyword_diagnostics(
 			state,
-			st,
 			st_diag,
-			AliasKeyword,
+			__step_27,
 			"alias",
 			"expected `alias` after `type`",
 		)
 		st = __step_27.index
-		st_diag = __step_27.diagnostics
+		st_diag = __step_27_diagnostics
 
 	name_step: ParseIdentifierStep = parse_declared_name_expected(
 		state,
@@ -8704,14 +8930,15 @@ private pure func parse_type_alias_decl(
 	type_params_step: ParseTypeParamListStep = parse_type_params_opt(state, st, st_diag)
 	st = type_params_step.index
 	st_diag = type_params_step.diagnostics
-	equal_step: ParseSymbolStep = expect_symbol(
+	equal_step: ParseSymbolStep = expect_symbol(state, st, EqualSymbol)
+	equal_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		equal_step,
 		EqualSymbol,
 		"expected `=` before type alias target",
 	)
-	target_step: ParseTypeStep = parse_type_expr(state, equal_step.index, equal_step.diagnostics)
+	target_step: ParseTypeStep = parse_type_expr(state, equal_step.index, equal_step_diagnostics)
 
 	{
 		index = target_step.index,
@@ -8741,16 +8968,16 @@ private pure func parse_trait_method(
 		is_pure = True
 		st = advance_parser(state, st)
 
-	__step_28: ParserStep = expect_keyword(
+	__step_28: ParserStep = expect_keyword(state, st, FuncKeyword)
+	__step_28_diagnostics: List[ParseDiagnostic] = expect_keyword_diagnostics(
 		state,
-		st,
 		st_diag,
-		FuncKeyword,
+		__step_28,
 		"func",
 		"expected `func` before trait method",
 	)
 	st = __step_28.index
-	st_diag = __step_28.diagnostics
+	st_diag = __step_28_diagnostics
 	name_step: ParseIdentifierStep = parse_declared_name_expected(
 		state,
 		st,
@@ -8759,15 +8986,16 @@ private pure func parse_trait_method(
 	)
 	st = name_step.index
 	st_diag = name_step.diagnostics
-	left_step: ParseSymbolStep = expect_symbol(
+	left_step: ParseSymbolStep = expect_symbol(state, st, LeftParenSymbol)
+	left_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		left_step,
 		LeftParenSymbol,
 		"expected `(` after trait method name",
 	)
 	st = left_step.index
-	st_diag = left_step.diagnostics
+	st_diag = left_step_diagnostics
 
 	params_step: ParseParamsStep = if left_step.matched:
 		parse_params_after_left_paren(state, st, st_diag)
@@ -8793,17 +9021,18 @@ private pure func parse_trait_method(
 		end_span = parsed_type_expr_span(type_step.value)
 
 	if current_is_symbol(state, st, ColonSymbol):
-		colon_step: ParseSymbolStep = expect_symbol(
+		colon_step: ParseSymbolStep = expect_symbol(state, st, ColonSymbol)
+		colon_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 			state,
-			st,
 			st_diag,
+			colon_step,
 			ColonSymbol,
 			"expected `:` before trait method body",
 		)
 		body_step: ParseBodyStep = parse_function_body(
 			state,
 			colon_step.index,
-			colon_step.diagnostics,
+			colon_step_diagnostics,
 			start_span,
 		)
 		body = body_step.body
@@ -8871,15 +9100,16 @@ private pure func parse_trait_decl(
 	type_params_step: ParseTypeParamListStep = parse_type_params_opt(state, st, st_diag)
 	st = type_params_step.index
 	st_diag = type_params_step.diagnostics
-	colon_step: ParseSymbolStep = expect_symbol(
+	colon_step: ParseSymbolStep = expect_symbol(state, st, ColonSymbol)
+	colon_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		colon_step,
 		ColonSymbol,
 		"expected `:` after trait name",
 	)
 	st = colon_step.index
-	st_diag = colon_step.diagnostics
+	st_diag = colon_step_diagnostics
 	var supertraits: List[ParsedIdentifier] = []
 	var methods: List[ParsedTraitMethodDecl] = []
 	var has_method_block: Bool = False
@@ -8911,29 +9141,36 @@ private pure func parse_trait_decl(
 		end_span = last_identifier_span(supertraits, end_span)
 
 		if current_is_symbol(state, st, ColonSymbol):
-			second_colon_step: ParseSymbolStep = expect_symbol(
+			second_colon_step: ParseSymbolStep = expect_symbol(state, st, ColonSymbol)
+			second_colon_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 				state,
-				st,
 				st_diag,
+				second_colon_step,
 				ColonSymbol,
 				"expected `:` before trait methods",
 			)
 			st = second_colon_step.index
-			st_diag = second_colon_step.diagnostics
+			st_diag = second_colon_step_diagnostics
 			has_method_block = True
 
 	if has_method_block:
-		__step_29: ParserStep = expect_newline(
+		__step_29: ParserStep = expect_newline(state, st)
+		__step_29_diagnostics: List[ParseDiagnostic] = expect_newline_diagnostics(
 			state,
-			st,
 			st_diag,
+			__step_29,
 			"expected newline before trait methods",
 		)
 		st = __step_29.index
-		st_diag = __step_29.diagnostics
-		__step_30: ParserStep = expect_indent(state, st, st_diag)
+		st_diag = __step_29_diagnostics
+		__step_30: ParserStep = expect_indent(state, st)
+		__step_30_diagnostics: List[ParseDiagnostic] = expect_indent_diagnostics(
+			state,
+			st_diag,
+			__step_30,
+		)
 		st = __step_30.index
-		st_diag = __step_30.diagnostics
+		st_diag = __step_30_diagnostics
 		methods_step: ParseTraitMethodListStep = parse_trait_method_list(state, st, st_diag)
 		methods = methods_step.values
 		st = methods_step.index
@@ -8942,9 +9179,14 @@ private pure func parse_trait_decl(
 		if current_is_dedent(state, st):
 			end_span = current_span(state, st)
 
-		__step_31: ParserStep = expect_dedent(state, st, st_diag)
+		__step_31: ParserStep = expect_dedent(state, st)
+		__step_31_diagnostics: List[ParseDiagnostic] = expect_dedent_diagnostics(
+			state,
+			st_diag,
+			__step_31,
+		)
 		st = __step_31.index
-		st_diag = __step_31.diagnostics
+		st_diag = __step_31_diagnostics
 
 	{
 		index = st,
@@ -9046,37 +9288,44 @@ private pure func parse_impl_decl(
 	)
 	st = trait_name_step.index
 	st_diag = trait_name_step.diagnostics
-	__step_32: ParserStep = expect_keyword(
+	__step_32: ParserStep = expect_keyword(state, st, ForKeyword)
+	__step_32_diagnostics: List[ParseDiagnostic] = expect_keyword_diagnostics(
 		state,
-		st,
 		st_diag,
-		ForKeyword,
+		__step_32,
 		"for",
 		"expected `for` after trait name",
 	)
 	st = __step_32.index
-	st_diag = __step_32.diagnostics
+	st_diag = __step_32_diagnostics
 	for_type_step: ParseTypeStep = parse_type_expr(state, st, st_diag)
 	st = for_type_step.index
 	st_diag = for_type_step.diagnostics
-	colon_step: ParseSymbolStep = expect_symbol(
+	colon_step: ParseSymbolStep = expect_symbol(state, st, ColonSymbol)
+	colon_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		colon_step,
 		ColonSymbol,
 		"expected `:` before implementation methods",
 	)
-	__step_33: ParserStep = expect_newline(
+	__step_33: ParserStep = expect_newline(state, colon_step.index)
+	__step_33_diagnostics: List[ParseDiagnostic] = expect_newline_diagnostics(
 		state,
-		colon_step.index,
-		colon_step.diagnostics,
+		colon_step_diagnostics,
+		__step_33,
 		"expected newline before implementation methods",
 	)
 	st = __step_33.index
-	st_diag = __step_33.diagnostics
-	__step_34: ParserStep = expect_indent(state, st, st_diag)
+	st_diag = __step_33_diagnostics
+	__step_34: ParserStep = expect_indent(state, st)
+	__step_34_diagnostics: List[ParseDiagnostic] = expect_indent_diagnostics(
+		state,
+		st_diag,
+		__step_34,
+	)
 	st = __step_34.index
-	st_diag = __step_34.diagnostics
+	st_diag = __step_34_diagnostics
 	methods_step: ParseImplMethodListStep = parse_impl_method_list(state, st, st_diag)
 	st = methods_step.index
 	st_diag = methods_step.diagnostics
@@ -9086,9 +9335,14 @@ private pure func parse_impl_decl(
 	else:
 		parsed_type_expr_span(for_type_step.value)
 
-	__step_35: ParserStep = expect_dedent(state, st, st_diag)
+	__step_35: ParserStep = expect_dedent(state, st)
+	__step_35_diagnostics: List[ParseDiagnostic] = expect_dedent_diagnostics(
+		state,
+		st_diag,
+		__step_35,
+	)
 	st = __step_35.index
-	st_diag = __step_35.diagnostics
+	st_diag = __step_35_diagnostics
 
 	{
 		index = st,
@@ -9131,17 +9385,18 @@ private pure func parse_top_level_var_decl(
 	st = type_step.index
 	st_diag = type_step.diagnostics
 
-	equal_step: ParseSymbolStep = expect_symbol(
+	equal_step: ParseSymbolStep = expect_symbol(state, st, EqualSymbol)
+	equal_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
-		st,
 		st_diag,
+		equal_step,
 		EqualSymbol,
 		"expected `=` after top-level variable declaration",
 	)
 	value_step: ParseExprStep = parse_assignment_value_expr(
 		state,
 		equal_step.index,
-		equal_step.diagnostics,
+		equal_step_diagnostics,
 		start_span,
 	)
 
