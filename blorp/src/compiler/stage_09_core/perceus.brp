@@ -9594,6 +9594,36 @@ private pure func literal_match_cases_assign_mutable_target(
 	)
 
 
+private pure func constructor_match_cases_assign_mutable_target(
+	target: CoreVar,
+	cases: List[CoreConstructorMatchCase],
+) -> Bool:
+	cases.any(
+		func(
+			match_case,
+		): (
+			not match_bindings_shadow(target.name, match_case.bindings)
+			and constructor_match_body_assigns_mutable_target(target, match_case.body)
+		),
+	)
+
+
+private pure func constructor_match_fallback_assigns_mutable_target(
+	target: CoreVar,
+	fallback: CoreConstructorMatchFallback,
+) -> Bool:
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			expr_assigns_mutable_target(target, body)
+		ConstructorMatchFallbackBindings(bindings, body):
+			(
+				not match_bindings_shadow(target.name, bindings)
+				and expr_assigns_mutable_target(target, body)
+			)
+		ConstructorMatchFallbackFail:
+			False
+
+
 private pure func constructor_literal_match_assigns_mutable_target(
 	target: CoreVar,
 	match_expr: CoreConstructorLiteralMatch,
@@ -9788,6 +9818,18 @@ private pure func expr_assigns_mutable_target(target: CoreVar, expr: CoreExpr) -
 			(
 				expr_assigns_mutable_target(target, scrutinee)
 				or constructor_length_match_assigns_mutable_target(target, match_expr)
+			)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			-- This case was missing: every other match kind here (literal,
+			-- accessor-literal, length) recurses into its branches, but a
+			-- `ConstructorMatchExpr` (the common case for a union/Option match)
+			-- fell through to the `_: False` default below. An expression
+			-- containing a `ConstructorMatchExpr` that assigns `target` in one
+			-- branch was therefore reported as not assigning it at all.
+			(
+				expr_assigns_mutable_target(target, scrutinee)
+				or constructor_match_cases_assign_mutable_target(target, cases)
+				or constructor_match_fallback_assigns_mutable_target(target, fallback)
 			)
 		ResourceScopeExpr(scope, typ, loc):
 			(
@@ -13871,6 +13913,35 @@ private pure func protect_repeated_consumes(
 				typ,
 				loc,
 			)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			-- This case was missing: `ConstructorMatchExpr` (above) recurses
+			-- into its branches with the same `in_repeated_context`, so a call
+			-- that consumes `target` inside a union/Option match nested in a
+			-- loop gets its extra protective dup. `LiteralMatchExpr` (matching
+			-- a String/Int/Char scrutinee) fell through to the `_: expr`
+			-- default at the bottom of this match, so `in_repeated_context`
+			-- never reached its case bodies and a consuming call inside one
+			-- arm of a literal match nested in a `while` loop got no dup at
+			-- all -- the double release behind this task's use-after-free.
+			LiteralMatchExpr(
+				protect_repeated_consumes(env, target, target_type, scrutinee, in_repeated_context),
+				protect_repeated_literal_match_cases(
+					env,
+					target,
+					target_type,
+					cases,
+					in_repeated_context,
+				),
+				protect_repeated_literal_match_fallback(
+					env,
+					target,
+					target_type,
+					fallback,
+					in_repeated_context,
+				),
+				typ,
+				loc,
+			)
 		WhileExpr(cond, body, typ, loc):
 			protected_cond: CoreExpr = protect_repeated_consumes(
 				env,
@@ -16963,6 +17034,41 @@ private pure func rewrite_constructor_match_fallback(
 			ConstructorMatchFallbackFail
 
 
+private pure func rewrite_literal_match_case(
+	env: PerceusEnv,
+	match_case: CoreLiteralMatchCase,
+) -> CoreLiteralMatchCase:
+	{ match_case | body = insert_drops_expr_inner(env, match_case.body) }
+
+
+private pure func rewrite_literal_match_cases(
+	env: PerceusEnv,
+	cases: List[CoreLiteralMatchCase],
+) -> List[CoreLiteralMatchCase]:
+	var rewritten: List[CoreLiteralMatchCase] = []
+
+	for match_case in cases:
+		rewritten = rewritten.append(rewrite_literal_match_case(env, match_case))
+
+	rewritten
+
+
+private pure func rewrite_literal_match_fallback(
+	env: PerceusEnv,
+	fallback: CoreLiteralMatchFallback,
+) -> CoreLiteralMatchFallback:
+	match fallback:
+		LiteralMatchFallbackBody(body):
+			LiteralMatchFallbackBody(insert_drops_expr_inner(env, body))
+		LiteralMatchFallbackBindings(bindings, body):
+			LiteralMatchFallbackBindings(
+				bindings,
+				insert_drops_expr_inner(env, body),
+			)
+		LiteralMatchFallbackFail:
+			LiteralMatchFallbackFail
+
+
 private pure func rewrite_boxed_values(
 	env: PerceusEnv,
 	values: List[CoreBoxedStorageValue],
@@ -18596,6 +18702,26 @@ private pure func insert_drops_normalized_expr(env: PerceusEnv, expr: CoreExpr) 
 				release_policy,
 				rewrite_constructor_match_cases(env, cases),
 				rewrite_constructor_match_fallback(env, fallback),
+				typ,
+				loc,
+			)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			-- `ConstructorMatchExpr` gets this same per-case treatment above; a
+			-- `LiteralMatchExpr` (e.g. matching a `String`/`Int`/`Char` scrutinee)
+			-- fell through to the generic child mapper at the bottom of this
+			-- function instead. That mapper processes every branch as an
+			-- unrelated child rather than as one of several mutually exclusive
+			-- arms, so when two or more arms each call a function that consumes
+			-- the same outer `var` (e.g. threading an owned record through a
+			-- `while` loop, one call per arm), nothing marks the shared variable
+			-- as needing a retain before the call: each arm's occurrence looks
+			-- like an uncontested last use in isolation. That produced a bare
+			-- move at the call plus an unconditional drop at the loop's
+			-- `var = ...` reassignment afterward -- a double release.
+			LiteralMatchExpr(
+				insert_drops_expr_inner(env, scrutinee),
+				rewrite_literal_match_cases(env, cases),
+				rewrite_literal_match_fallback(env, fallback),
 				typ,
 				loc,
 			)

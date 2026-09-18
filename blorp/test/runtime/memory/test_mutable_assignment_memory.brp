@@ -955,6 +955,102 @@ func test_matrix_get_option_owns_managed_element() -> Bool:
 	total == 100 and stats.current_objects < 80 and stats.bytes_allocated < 200000
 
 
+-- Regression for the InternTable use-after-free: a record rebuilt from its
+-- own fields (`{ by_text = table.by_text.set(...), texts = table.texts.append(...) }`),
+-- threaded by tuple destructuring through a call chain (`build` -> `tagged`
+-- -> `intern`), consumed inside two or more arms of a `match` on a plain
+-- literal (String here) scrutinee, itself nested in a `while` loop. Before
+-- the `protect_repeated_consumes` fix, a `LiteralMatchExpr` with 2+ arms
+-- fell through that function's `_: expr` default, so a consuming call in one
+-- arm never got the extra retain a repeated (loop) context requires: the
+-- table was released once when the call's clone finished with it and
+-- released again at the loop's `table = next_table` reassignment.
+record InternTableRegressionTable {
+	by_text: Dict[String, Int],
+	texts: List[String]
+}
+
+
+private pure func intern_regression_text(
+	table: InternTableRegressionTable,
+	text: String,
+) -> (InternTableRegressionTable, Int):
+	match D.get(table.by_text, text):
+		Some(id):
+			(table, id)
+		None:
+			id: Int = table.texts.length()
+
+			({
+					by_text = D.set(table.by_text, text, id),
+					texts = L.append(table.texts, text)
+				}, id)
+
+
+private pure func tagged_regression_text(
+	table: InternTableRegressionTable,
+	text: String,
+) -> (InternTableRegressionTable, Int):
+	intern_regression_text(table, text)
+
+
+private pure func build_regression_text(
+	table: InternTableRegressionTable,
+	text: String,
+) -> (InternTableRegressionTable, Int):
+	tagged_regression_text(table, text)
+
+
+func test_literal_match_arms_in_loop_do_not_double_release_consumed_table() -> Bool:
+	reset_mem_stats()
+	var table: InternTableRegressionTable = {
+		by_text = D.dict(),
+		texts = []
+	}
+	items: List[String] = ["a", "b", "a", "c", "b", "a", "d", "c"]
+	var i: Int = 0
+	var sum: Int = 0
+
+	while i < items.length():
+		text: String = items.get_or(i, "")
+		i += 1
+
+		match text:
+			"a":
+				maybe: Option[String] = Some(text)
+
+				match maybe:
+					Some(payload):
+						(next_table, id) = build_regression_text(table, payload)
+						table = next_table
+						sum += id
+					None:
+						void
+			"b":
+				maybe: Option[String] = Some(text)
+
+				match maybe:
+					Some(payload):
+						(next_table, id) = build_regression_text(table, payload)
+						table = next_table
+						sum += id
+					None:
+						void
+			_:
+				maybe: Option[String] = Some(text)
+
+				match maybe:
+					Some(payload):
+						(next_table, id) = build_regression_text(table, payload)
+						table = next_table
+						sum += id
+					None:
+						void
+
+	stats: MemStats = get_mem_stats()
+	table.texts.length() == 4 and sum >= 0 and stats.current_objects < 80
+
+
 func build_mutable_document(parts: List[String]) -> MutableDocument:
 	var result: MutableDocument = EmptyDocument
 
@@ -1113,6 +1209,10 @@ tests: TestSuite = {
 		(
 			"mutable union return after loop stays owned",
 			test_mutable_union_return_after_loop_stays_owned,
+		),
+		(
+			"literal match arms in loop do not double release consumed table",
+			test_literal_match_arms_in_loop_do_not_double_release_consumed_table,
 		),
 	]
 }
