@@ -3,6 +3,7 @@ import:
 	../../../src/compiler/stage_02_lex/parse_diagnostic: parse_diagnostic_to_string
 	../../../src/compiler/stage_02_lex/token:
 		Symbol(ArrowSymbol, CommaSymbol, DotDotDotSymbol, LeftParenSymbol, RightParenSymbol),
+		Token,
 		TokenKind(
 			CharLiteralToken,
 			DedentToken,
@@ -15,9 +16,13 @@ import:
 			NewlineToken,
 			SymbolToken,
 		),
+		TokenTag(DedentTag, IndentTag, NewlineTag),
 		TriviaKind(CommentTrivia),
+		span_of,
 		token_kind_name,
-	../../../src/lib/source: SourceFile, source_file, source_span_text
+		token_kind_of,
+		token_trivia_of,
+	../../../src/lib/source: SourceFile, SourceSpan, source_file, source_span_text
 	string: from_char
 	test: TestSuite
 
@@ -57,7 +62,7 @@ pure func token_signature(kind: TokenKind) -> String:
 pure func token_kind_is(result: LexResult, index: Int, expected: String) -> Bool:
 	match result.tokens.get(index):
 		Some(token):
-			token_signature(token.kind) == expected
+			token_signature(token_kind_of(result.texts, token)) == expected
 		None:
 			False
 
@@ -74,15 +79,17 @@ pure func token_span_is(
 ) -> Bool:
 	match result.tokens.get(index):
 		Some(token):
+			span: SourceSpan = span_of(token, result.path, result.module_name)
+
 			(
-				token.span.path == "lexer.brp"
-				and token.span.module_name == "lexer"
-				and token.span.start_offset == start_offset
-				and token.span.start_line == start_line
-				and token.span.start_column == start_column
-				and token.span.end_offset == end_offset
-				and token.span.end_line == end_line
-				and token.span.end_column == end_column
+				span.path == "lexer.brp"
+				and span.module_name == "lexer"
+				and span.start_offset == start_offset
+				and span.start_line == start_line
+				and span.start_column == start_column
+				and span.end_offset == end_offset
+				and span.end_line == end_line
+				and span.end_column == end_column
 			)
 		None:
 			False
@@ -117,7 +124,10 @@ func test_lex_symbol_emission_spans_and_group_depth() -> Bool:
 			func(
 				token,
 			): token_signature(
-				token.kind,
+				token_kind_of(
+					grouped.texts,
+					token,
+				),
 			),
 		) == [
 			"identifier:f",
@@ -169,7 +179,10 @@ pure func token_source_text_is(
 ) -> Bool:
 	match result.tokens.get(index):
 		Some(token):
-			source_span_text(src, token.span) == expected
+			source_span_text(
+				src,
+				span_of(token, result.path, result.module_name),
+			) == expected
 		None:
 			False
 
@@ -325,13 +338,18 @@ func test_lex_comment_as_trivia() -> Bool:
 
 	match result.tokens.get(0):
 		Some(first):
-			match first.leading_trivia.get(0):
+			(leading, _) = token_trivia_of(result.trivia, first)
+
+			match leading.get(0):
 				Some(trivia):
 					(
 						lex_ok(result)
 						and trivia.kind == CommentTrivia
 						and trivia.text == "-- header"
-						and source_span_text(src, first.span) == "func"
+						and source_span_text(
+							src,
+							span_of(first, result.path, result.module_name),
+						) == "func"
 					)
 				None:
 					False
@@ -345,7 +363,10 @@ func test_lex_distinguishes_trailing_and_leading_comment_trivia() -> Bool:
 
 	match (result.tokens.get(1), result.tokens.get(3)):
 		(Some(main_token), Some(var_token)):
-			match (main_token.trailing_trivia.get(0), var_token.leading_trivia.get(0)):
+			(_, main_trailing) = token_trivia_of(result.trivia, main_token)
+			(var_leading, _) = token_trivia_of(result.trivia, var_token)
+
+			match (main_trailing.get(0), var_leading.get(0)):
 				(Some(trailing), Some(leading)):
 					(
 						lex_ok(result)
@@ -370,10 +391,15 @@ func test_lex_scanning_step_dispatch_routes_tokens_and_trivia() -> Bool:
 	src: SourceFile = source("a b -- tail\n-- own line\nc -- end")
 	result: LexResult = lex(src)
 
-	signatures: List[String] = result.tokens.map(func(token): token_signature(token.kind))
+	signatures: List[String] = result.tokens.map(
+		func(token): token_signature(token_kind_of(result.texts, token)),
+	)
 
 	match (result.tokens.get(1), result.tokens.get(3)):
 		(Some(b_token), Some(c_token)):
+			(b_leading, b_trailing) = token_trivia_of(result.trivia, b_token)
+			(c_leading, c_trailing) = token_trivia_of(result.trivia, c_token)
+
 			(
 				lex_ok(result)
 				and signatures == [
@@ -383,20 +409,20 @@ func test_lex_scanning_step_dispatch_routes_tokens_and_trivia() -> Bool:
 					"identifier:c",
 					"end of file",
 				]
-				and b_token.trailing_trivia.length() == 1
-				and b_token.leading_trivia.length() == 0
-				and match b_token.trailing_trivia.get(0):
+				and b_trailing.length() == 1
+				and b_leading.length() == 0
+				and match b_trailing.get(0):
 					Some(trailing):
 						trailing.text == "-- tail"
 					None:
 						False
-				and c_token.leading_trivia.length() == 1
-				and match c_token.leading_trivia.get(0):
+				and c_leading.length() == 1
+				and match c_leading.get(0):
 					Some(leading):
 						leading.text == "-- own line"
 					None:
 						False
-				and match c_token.trailing_trivia.get(0):
+				and match c_trailing.get(0):
 					Some(tail):
 						tail.text == "-- end"
 					None:
@@ -414,9 +440,9 @@ func test_lex_nested_indentation() -> Bool:
 
 	for token in result.tokens:
 		match token.kind:
-			IndentToken:
+			IndentTag:
 				indents += 1
-			DedentToken:
+			DedentTag:
 				dedents += 1
 			_:
 				void
@@ -550,11 +576,11 @@ func test_lex_suppresses_newlines_inside_grouping() -> Bool:
 
 	for token in result.tokens:
 		match token.kind:
-			NewlineToken:
+			NewlineTag:
 				newlines += 1
-			IndentToken:
+			IndentTag:
 				indents += 1
-			DedentToken:
+			DedentTag:
 				dedents += 1
 			_:
 				void
@@ -580,11 +606,11 @@ func test_lex_preserves_lambda_body_newlines_inside_grouping() -> Bool:
 
 	for token in result.tokens:
 		match token.kind:
-			NewlineToken:
+			NewlineTag:
 				newlines += 1
-			IndentToken:
+			IndentTag:
 				indents += 1
-			DedentToken:
+			DedentTag:
 				dedents += 1
 			_:
 				void
@@ -626,7 +652,7 @@ func test_lex_preserves_newline_across_blank_line() -> Bool:
 
 	for token in result.tokens:
 		match token.kind:
-			NewlineToken:
+			NewlineTag:
 				newlines += 1
 			_:
 				void
@@ -950,6 +976,68 @@ func test_lex_docstring_span_is_precise() -> Bool:
 	)
 
 
+-- A source with no comments at all: every token's leading and trailing
+-- trivia runs are empty, and the flat `result.trivia` table itself is
+-- empty (the `trivia_start`/`trivia_count` sentinel case, not a `None`
+-- special case).
+func test_lex_file_with_no_trivia_produces_empty_runs() -> Bool:
+	src: SourceFile = source("func add(a: Int, b: Int) -> Int:\n\ta + b\n")
+	result: LexResult = lex(src)
+	var all_empty: Bool = True
+
+	for token in result.tokens:
+		(leading, trailing) = token_trivia_of(result.trivia, token)
+
+		if leading.length() != 0 or trailing.length() != 0:
+			all_empty = False
+
+	lex_ok(result) and result.trivia.length() == 0 and all_empty
+
+
+-- A single-token line preceded by an own-line comment and followed by a
+-- trailing comment: that one token (the int literal `1`, the only token
+-- on its line) carries both a leading trivia run and a trailing trivia
+-- run, both recovered from the same flat `result.trivia` table.
+private pure func is_int_literal(texts: List[String], token: Token) -> Bool:
+	match token_kind_of(texts, token):
+		IntLiteralToken(_):
+			True
+		_:
+			False
+
+
+private pure func find_int_literal_token(result: LexResult) -> Option[Token]:
+	result.tokens.find(func(token): is_int_literal(result.texts, token))
+
+
+func test_lex_single_token_has_both_leading_and_trailing_trivia() -> Bool:
+	src: SourceFile = source("func compute() -> Int:\n\t-- comment above\n\t1 -- comment after\n")
+	result: LexResult = lex(src)
+
+	match find_int_literal_token(result):
+		Some(one_token):
+			(leading, trailing) = token_trivia_of(result.trivia, one_token)
+
+			(
+				lex_ok(result)
+				and token_kind_name(token_kind_of(result.texts, one_token)) == "integer literal"
+				and leading.length() == 1
+				and trailing.length() == 1
+				and match leading.get(0):
+					Some(item):
+						item.text == "-- comment above"
+					None:
+						False
+				and match trailing.get(0):
+					Some(item):
+						item.text == "-- comment after"
+					None:
+						False
+			)
+		None:
+			False
+
+
 tests: TestSuite = {
 	description = "Compiler lexer foundation",
 	tests = [
@@ -1083,5 +1171,13 @@ tests: TestSuite = {
 		),
 		("lex char literal span is precise", test_lex_char_literal_span_is_precise),
 		("lex docstring span is precise", test_lex_docstring_span_is_precise),
+		(
+			"lex file with no trivia produces empty runs",
+			test_lex_file_with_no_trivia_produces_empty_runs,
+		),
+		(
+			"lex single token has both leading and trailing trivia",
+			test_lex_single_token_has_both_leading_and_trailing_trivia,
+		),
 	]
 }

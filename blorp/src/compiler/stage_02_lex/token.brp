@@ -103,10 +103,16 @@ enum StringLiteralKind:
 	InterpolatedPipeStringLiteral
 
 
+-- `is_trailing` distinguishes a token's leading run from its trailing run
+-- once both are flattened into `LexResult.trivia`; it is set when `lex`
+-- attaches a trivia item to a token (via `append_trivia_run` or its own
+-- inline trailing-comment update), never by the `trivia` constructor
+-- itself.
 record Trivia {
 	kind: TriviaKind,
 	text: String,
-	span: SourceSpan
+	span: SourceSpan,
+	is_trailing: Bool
 }
 
 
@@ -125,12 +131,686 @@ union TokenKind:
 	EndOfFileToken
 
 
-record Token {
-	kind: TokenKind,
-	span: SourceSpan,
-	leading_trivia: List[Trivia],
-	trailing_trivia: List[Trivia]
+-- Fieldless view of `TokenKind`'s variants, stored inline in `Token` so a
+-- token never allocates a union box just to carry its tag. Non-scalar
+-- payloads (identifier/literal text, the string-literal kind) live in
+-- `LexResult.texts`, the flat table `lex` interns into directly, and are
+-- recovered by `token_kind_of` on demand.
+enum TokenTag:
+	IdentifierTag
+	KeywordTag
+	SymbolTag
+	IntLiteralTag
+	FloatLiteralTag
+	StringLiteralTag
+	CharLiteralTag
+	DocStringTag
+	NewlineTag
+	IndentTag
+	DedentTag
+	EndOfFileTag
+
+
+-- A token, stored inline in `LexResult.tokens` (`InlineStructListStorage`):
+-- no per-token heap object. All fields are scalar so the struct qualifies
+-- for inline list storage; `SourceSpan` (a record with `String` fields) and
+-- `List[Trivia]` cannot be struct fields, so both are represented
+-- out-of-line: the span as its six scalar components (reassembled by
+-- `span_of`/`token_span` with the path and module name published once on
+-- `LexResult`, not per token), and trivia as a `[trivia_start, trivia_start
+-- + trivia_count)` slice into the flat `LexResult.trivia` table (split back
+-- into leading/trailing runs by each item's `is_trailing` flag).
+--
+-- `payload` means different things per `kind`: an id into
+-- `LexResult.texts` for the text-carrying tags, the keyword or symbol
+-- ordinal, the character code point, or -1 when unused.
+struct Token {
+	kind: TokenTag,
+	payload: Int,
+	start_offset: Int,
+	start_line: Int,
+	start_column: Int,
+	end_offset: Int,
+	end_line: Int,
+	end_column: Int,
+	trivia_start: Int,
+	trivia_count: Int
 }
+
+
+pure func span_of(token: Token, path: String, module_name: String) -> SourceSpan:
+	{
+		path = path,
+		module_name = module_name,
+		start_offset = token.start_offset,
+		start_line = token.start_line,
+		start_column = token.start_column,
+		end_offset = token.end_offset,
+		end_line = token.end_line,
+		end_column = token.end_column
+	}
+
+
+-- Builds a payload-free, trivia-free `Token` directly from a `SourceSpan`.
+-- Used for the fallback EOF token and anywhere a `Token` is needed without
+-- going through the intern/trivia tables.
+pure func scalar_token(tag: TokenTag, payload: Int, span: SourceSpan) -> Token:
+	{
+		kind = tag,
+		payload = payload,
+		start_offset = span.start_offset,
+		start_line = span.start_line,
+		start_column = span.start_column,
+		end_offset = span.end_offset,
+		end_line = span.end_line,
+		end_column = span.end_column,
+		trivia_start = 0,
+		trivia_count = 0
+	}
+
+
+private pure func trailing_marked(item: Trivia, is_trailing: Bool) -> Trivia:
+	{
+		kind = item.kind,
+		text = item.text,
+		span = item.span,
+		is_trailing = is_trailing
+	}
+
+
+pure func append_trivia_run(
+	table: List[Trivia],
+	items: List[Trivia],
+	is_trailing: Bool,
+) -> List[Trivia]:
+	var result: List[Trivia] = table
+
+	for item in items:
+		result = result.append(trailing_marked(item, is_trailing))
+
+	result
+
+
+-- Splits a token's `[trivia_start, trivia_start + trivia_count)` slice of
+-- the flat trivia table back into (leading, trailing) runs.
+pure func token_trivia_of(trivia: List[Trivia], token: Token) -> (List[Trivia], List[Trivia]):
+	var leading: List[Trivia] = []
+	var trailing: List[Trivia] = []
+	var i: Int = token.trivia_start
+	end: Int = token.trivia_start + token.trivia_count
+
+	while i < end:
+		match trivia.get(i):
+			Some(item):
+				if item.is_trailing:
+					trailing = trailing.append(item)
+				else:
+					leading = leading.append(item)
+			None:
+				void
+
+		i += 1
+
+	(leading, trailing)
+
+
+pure func interned_text(texts: List[String], id: Int) -> String:
+	match texts.get(id):
+		Some(text):
+			text
+		None:
+			""
+
+
+pure func keyword_ordinal(keyword: Keyword) -> Int:
+	match keyword:
+		FuncKeyword:
+			0
+		PureKeyword:
+			1
+		VarKeyword:
+			2
+		UnionKeyword:
+			3
+		RecordKeyword:
+			4
+		VoidKeyword:
+			5
+		WhileKeyword:
+			6
+		ForKeyword:
+			7
+		InKeyword:
+			8
+		IfKeyword:
+			9
+		ElseKeyword:
+			10
+		AndKeyword:
+			11
+		OrKeyword:
+			12
+		NotKeyword:
+			13
+		OnKeyword:
+			14
+		MatchKeyword:
+			15
+		TrueKeyword:
+			16
+		FalseKeyword:
+			17
+		BreakKeyword:
+			18
+		ContinueKeyword:
+			19
+		DebugKeyword:
+			20
+		StructKeyword:
+			21
+		EnumKeyword:
+			22
+		WithKeyword:
+			23
+		ResourceKeyword:
+			24
+		ForeignKeyword:
+			25
+		PrivateKeyword:
+			26
+		BuiltinKeyword:
+			27
+		ConcurrentKeyword:
+			28
+		ConcurrentlyKeyword:
+			29
+		DetachKeyword:
+			30
+		SelectKeyword:
+			31
+		IntoOpaqueKeyword:
+			32
+		FromKeyword:
+			33
+		FromOpaqueKeyword:
+			34
+		AfterKeyword:
+			35
+		SealedKeyword:
+			36
+		OpaqueKeyword:
+			37
+		TryKeyword:
+			38
+		ImportKeyword:
+			39
+		AsKeyword:
+			40
+		TraitKeyword:
+			41
+		ImplementsKeyword:
+			42
+		SelfKeyword:
+			43
+		TypeKeyword:
+			44
+		AliasKeyword:
+			45
+		WhereKeyword:
+			46
+
+
+pure func keyword_from_ordinal(ordinal: Int) -> Keyword:
+	match ordinal:
+		0:
+			FuncKeyword
+		1:
+			PureKeyword
+		2:
+			VarKeyword
+		3:
+			UnionKeyword
+		4:
+			RecordKeyword
+		5:
+			VoidKeyword
+		6:
+			WhileKeyword
+		7:
+			ForKeyword
+		8:
+			InKeyword
+		9:
+			IfKeyword
+		10:
+			ElseKeyword
+		11:
+			AndKeyword
+		12:
+			OrKeyword
+		13:
+			NotKeyword
+		14:
+			OnKeyword
+		15:
+			MatchKeyword
+		16:
+			TrueKeyword
+		17:
+			FalseKeyword
+		18:
+			BreakKeyword
+		19:
+			ContinueKeyword
+		20:
+			DebugKeyword
+		21:
+			StructKeyword
+		22:
+			EnumKeyword
+		23:
+			WithKeyword
+		24:
+			ResourceKeyword
+		25:
+			ForeignKeyword
+		26:
+			PrivateKeyword
+		27:
+			BuiltinKeyword
+		28:
+			ConcurrentKeyword
+		29:
+			ConcurrentlyKeyword
+		30:
+			DetachKeyword
+		31:
+			SelectKeyword
+		32:
+			IntoOpaqueKeyword
+		33:
+			FromKeyword
+		34:
+			FromOpaqueKeyword
+		35:
+			AfterKeyword
+		36:
+			SealedKeyword
+		37:
+			OpaqueKeyword
+		38:
+			TryKeyword
+		39:
+			ImportKeyword
+		40:
+			AsKeyword
+		41:
+			TraitKeyword
+		42:
+			ImplementsKeyword
+		43:
+			SelfKeyword
+		44:
+			TypeKeyword
+		45:
+			AliasKeyword
+		_:
+			WhereKeyword
+
+
+pure func symbol_ordinal(symbol: Symbol) -> Int:
+	match symbol:
+		LeftParenSymbol:
+			0
+		RightParenSymbol:
+			1
+		LeftBracketSymbol:
+			2
+		RightBracketSymbol:
+			3
+		LeftBraceSymbol:
+			4
+		RightBraceSymbol:
+			5
+		CommaSymbol:
+			6
+		ColonSymbol:
+			7
+		DotSymbol:
+			8
+		DotDotSymbol:
+			9
+		DotDotDotSymbol:
+			10
+		ArrowSymbol:
+			11
+		FatArrowSymbol:
+			12
+		EqualSymbol:
+			13
+		QuestionEqualsSymbol:
+			14
+		PlusSymbol:
+			15
+		MinusSymbol:
+			16
+		StarSymbol:
+			17
+		SlashSymbol:
+			18
+		PlusEqualSymbol:
+			19
+		MinusEqualSymbol:
+			20
+		StarEqualSymbol:
+			21
+		SlashEqualSymbol:
+			22
+		UnderscoreSymbol:
+			23
+		PercentSymbol:
+			24
+		HashSymbol:
+			25
+		AtSymbol:
+			26
+		PipeSymbol:
+			27
+		EqualEqualSymbol:
+			28
+		NotEqualSymbol:
+			29
+		LessSymbol:
+			30
+		LessEqualSymbol:
+			31
+		GreaterSymbol:
+			32
+		GreaterEqualSymbol:
+			33
+
+
+pure func symbol_from_ordinal(ordinal: Int) -> Symbol:
+	match ordinal:
+		0:
+			LeftParenSymbol
+		1:
+			RightParenSymbol
+		2:
+			LeftBracketSymbol
+		3:
+			RightBracketSymbol
+		4:
+			LeftBraceSymbol
+		5:
+			RightBraceSymbol
+		6:
+			CommaSymbol
+		7:
+			ColonSymbol
+		8:
+			DotSymbol
+		9:
+			DotDotSymbol
+		10:
+			DotDotDotSymbol
+		11:
+			ArrowSymbol
+		12:
+			FatArrowSymbol
+		13:
+			EqualSymbol
+		14:
+			QuestionEqualsSymbol
+		15:
+			PlusSymbol
+		16:
+			MinusSymbol
+		17:
+			StarSymbol
+		18:
+			SlashSymbol
+		19:
+			PlusEqualSymbol
+		20:
+			MinusEqualSymbol
+		21:
+			StarEqualSymbol
+		22:
+			SlashEqualSymbol
+		23:
+			UnderscoreSymbol
+		24:
+			PercentSymbol
+		25:
+			HashSymbol
+		26:
+			AtSymbol
+		27:
+			PipeSymbol
+		28:
+			EqualEqualSymbol
+		29:
+			NotEqualSymbol
+		30:
+			LessSymbol
+		31:
+			LessEqualSymbol
+		32:
+			GreaterSymbol
+		_:
+			GreaterEqualSymbol
+
+
+pure func string_literal_kind_ordinal(kind: StringLiteralKind) -> Int:
+	match kind:
+		NormalStringLiteral:
+			0
+		RawStringLiteral:
+			1
+		InterpolatedStringLiteral:
+			2
+		PipeStringLiteral:
+			3
+		RawPipeStringLiteral:
+			4
+		InterpolatedPipeStringLiteral:
+			5
+
+
+pure func string_literal_kind_from_ordinal(ordinal: Int) -> StringLiteralKind:
+	match ordinal:
+		0:
+			NormalStringLiteral
+		1:
+			RawStringLiteral
+		2:
+			InterpolatedStringLiteral
+		3:
+			PipeStringLiteral
+		4:
+			RawPipeStringLiteral
+		_:
+			InterpolatedPipeStringLiteral
+
+
+-- String-literal tokens pack their `StringLiteralKind` (3 bits are enough
+-- for 6 variants) below the interned text id so both fit in one `Int`
+-- payload.
+private STRING_LITERAL_KIND_BITS: Int = 8
+
+
+private pure func pack_string_literal_payload(kind: StringLiteralKind, text_id: Int) -> Int:
+	text_id * STRING_LITERAL_KIND_BITS + string_literal_kind_ordinal(kind)
+
+
+pure func unpacked_string_literal_kind(payload: Int) -> StringLiteralKind:
+	string_literal_kind_from_ordinal(payload % STRING_LITERAL_KIND_BITS)
+
+
+pure func unpacked_string_literal_text_id(payload: Int) -> Int:
+	payload / STRING_LITERAL_KIND_BITS
+
+
+-- Recovers the tag and payload `Int` for building a `Token` from a
+-- `TokenKind` view, interning any text the variant carries.
+-- Tag and payload for building a `Token` from a `TokenKind` view, given
+-- the text-carrying variants' id already interned by the caller (`lex`
+-- interns inline, on its own `texts`/`by_text` locals, before calling
+-- this: see the lexer pilot rule that no tuple or table record should
+-- cross a call boundary per token). Scalar in, scalar out: this never
+-- allocates.
+struct TaggedPayload {
+	tag: TokenTag,
+	id: Int
+}
+
+
+pure func tagged_payload_for(kind: TokenKind, interned_id: Int) -> TaggedPayload:
+	match kind:
+		IdentifierToken(_):
+			{
+				tag = IdentifierTag,
+				id = interned_id
+			}
+		KeywordToken(keyword):
+			{
+				tag = KeywordTag,
+				id = keyword_ordinal(keyword)
+			}
+		SymbolToken(symbol):
+			{
+				tag = SymbolTag,
+				id = symbol_ordinal(symbol)
+			}
+		IntLiteralToken(_):
+			{
+				tag = IntLiteralTag,
+				id = interned_id
+			}
+		FloatLiteralToken(_):
+			{
+				tag = FloatLiteralTag,
+				id = interned_id
+			}
+		StringLiteralToken(kind, _):
+			{
+				tag = StringLiteralTag,
+				id = pack_string_literal_payload(kind, interned_id)
+			}
+		CharLiteralToken(codepoint):
+			{
+				tag = CharLiteralTag,
+				id = codepoint
+			}
+		DocStringToken(_):
+			{
+				tag = DocStringTag,
+				id = interned_id
+			}
+		NewlineToken:
+			{
+				tag = NewlineTag,
+				id = -1
+			}
+		IndentToken:
+			{
+				tag = IndentTag,
+				id = -1
+			}
+		DedentToken:
+			{
+				tag = DedentTag,
+				id = -1
+			}
+		EndOfFileToken:
+			{
+				tag = EndOfFileTag,
+				id = -1
+			}
+
+
+-- The text a `TokenKind` carries, for `lex` to intern inline before
+-- calling `tagged_payload_for`. `None` for every payload-free or
+-- already-scalar (`CharLiteralToken`) variant.
+pure func token_kind_own_text(kind: TokenKind) -> Option[String]:
+	match kind:
+		IdentifierToken(text):
+			Some(text)
+		IntLiteralToken(text):
+			Some(text)
+		FloatLiteralToken(text):
+			Some(text)
+		StringLiteralToken(_, text):
+			Some(text)
+		DocStringToken(text):
+			Some(text)
+		_:
+			None
+
+
+-- Reconstructs the `TokenKind` view of a token on demand. Called only at
+-- the sites that need a payload; symbol/keyword/newline/indent/dedent/eof
+-- tokens never allocated a payload object even before this change.
+pure func token_kind_of(texts: List[String], token: Token) -> TokenKind:
+	match token.kind:
+		IdentifierTag:
+			IdentifierToken(interned_text(texts, token.payload))
+		KeywordTag:
+			KeywordToken(keyword_from_ordinal(token.payload))
+		SymbolTag:
+			SymbolToken(symbol_from_ordinal(token.payload))
+		IntLiteralTag:
+			IntLiteralToken(interned_text(texts, token.payload))
+		FloatLiteralTag:
+			FloatLiteralToken(interned_text(texts, token.payload))
+		StringLiteralTag:
+			StringLiteralToken(
+				unpacked_string_literal_kind(token.payload),
+				interned_text(texts, unpacked_string_literal_text_id(token.payload)),
+			)
+		CharLiteralTag:
+			CharLiteralToken(token.payload)
+		DocStringTag:
+			DocStringToken(interned_text(texts, token.payload))
+		NewlineTag:
+			NewlineToken
+		IndentTag:
+			IndentToken
+		DedentTag:
+			DedentToken
+		EndOfFileTag:
+			EndOfFileToken
+
+
+-- Scalar/interned-text payload readers for a `Token`, used by the parser in
+-- place of `token_kind_of` so a hot-path read never rebuilds a `TokenKind`
+-- union: each of these does at most one scalar decode or one retaining
+-- (non-allocating) `texts` index. Callers pick the accessor that matches the
+-- token's `kind` (checked via a `TokenTag` match) rather than probing all of
+-- them.
+pure func token_text(texts: List[String], token: Token) -> String:
+	interned_text(texts, token.payload)
+
+
+pure func token_keyword(token: Token) -> Keyword:
+	keyword_from_ordinal(token.payload)
+
+
+pure func token_symbol(token: Token) -> Symbol:
+	symbol_from_ordinal(token.payload)
+
+
+pure func token_string_literal_kind(token: Token) -> StringLiteralKind:
+	unpacked_string_literal_kind(token.payload)
+
+
+pure func token_string_literal_text(texts: List[String], token: Token) -> String:
+	interned_text(texts, unpacked_string_literal_text_id(token.payload))
+
+
+pure func token_char_code_point(token: Token) -> Int:
+	token.payload
 
 
 pure func keyword_text(keyword: Keyword) -> String:
@@ -323,30 +1003,54 @@ pure func trivia(kind: TriviaKind, text: String, span: SourceSpan) -> Trivia:
 	{
 		kind = kind,
 		text = text,
-		span = span
-	}
-
-
-pure func token(kind: TokenKind, span: SourceSpan) -> Token:
-	{
-		kind = kind,
 		span = span,
-		leading_trivia = [],
-		trailing_trivia = []
+		is_trailing = False
 	}
 
 
-pure func token_with_trivia(
-	kind: TokenKind,
+-- Builds a `Token` from its already-computed tag/payload, span, and
+-- trivia slice. Every field is a scalar or an already-built `SourceSpan`,
+-- so this never allocates; `lex` calls it directly (no tuple, no table,
+-- no list crosses this call) after interning inline and appending any
+-- trivia into its own `trivia` local.
+pure func token_with_trivia_range(
+	tag: TokenTag,
+	payload: Int,
 	span: SourceSpan,
-	leading_trivia: List[Trivia],
-	trailing_trivia: List[Trivia],
+	trivia_start: Int,
+	trivia_count: Int,
 ) -> Token:
 	{
-		kind = kind,
-		span = span,
-		leading_trivia = leading_trivia,
-		trailing_trivia = trailing_trivia
+		kind = tag,
+		payload = payload,
+		start_offset = span.start_offset,
+		start_line = span.start_line,
+		start_column = span.start_column,
+		end_offset = span.end_offset,
+		end_line = span.end_line,
+		end_column = span.end_column,
+		trivia_start = trivia_start,
+		trivia_count = trivia_count
+	}
+
+
+-- Returns the last token with its `trivia_count` incremented by one, for
+-- attaching a trailing comment `lex` has already appended (as the last
+-- item) to its own `trivia` local. `lex` calls `tokens.set(...)` with
+-- this itself; relies on that trivia item being the last one written,
+-- true for a single-pass lexer.
+pure func token_with_trailing_trivia_added(token: Token) -> Token:
+	{
+		kind = token.kind,
+		payload = token.payload,
+		start_offset = token.start_offset,
+		start_line = token.start_line,
+		start_column = token.start_column,
+		end_offset = token.end_offset,
+		end_line = token.end_line,
+		end_column = token.end_column,
+		trivia_start = token.trivia_start,
+		trivia_count = token.trivia_count + 1
 	}
 
 

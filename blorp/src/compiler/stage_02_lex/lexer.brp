@@ -9,6 +9,7 @@ import:
 		source_span,
 		source_span_text,
 		source_start,
+	dict: dict
 	list: list
 	parse_diagnostic: ParseDiagnostic, parse_error
 	string: string, to_hex
@@ -106,6 +107,7 @@ import:
 			StarSymbol,
 			UnderscoreSymbol,
 		),
+		TaggedPayload,
 		Token,
 		TokenKind(
 			CharLiteralToken,
@@ -123,8 +125,14 @@ import:
 		),
 		Trivia,
 		TriviaKind(CommentTrivia),
-		token,
-		token_with_trivia,
+		append_trivia_run,
+		span_of,
+		tagged_payload_for,
+		token_kind_of,
+		token_kind_own_text,
+		token_trivia_of,
+		token_with_trailing_trivia_added,
+		token_with_trivia_range,
 		trivia,
 
 
@@ -137,8 +145,44 @@ private INT128_MAX_DECIMAL: String = "170141183460469231731687303715884105727"
 
 record LexResult {
 	tokens: List[Token],
+	texts: List[String],
+	trivia: List[Trivia],
+	path: String,
+	module_name: String,
 	diagnostics: List[ParseDiagnostic]
 }
+
+
+-- `Token.span`'s six scalar fields plus the path/module name published once
+-- here (not per token, since a struct field cannot hold the `String`s a
+-- `SourceSpan` record carries).
+pure func token_span(result: LexResult, index: Int) -> SourceSpan:
+	match result.tokens.get(index):
+		Some(token):
+			span_of(token, result.path, result.module_name)
+		None:
+			source_empty_span(
+				{
+					path = result.path,
+					module_name = result.module_name,
+					text = ""
+				},
+				{
+					offset = 0,
+					line = 1,
+					column = 1
+				},
+			)
+
+
+-- (leading, trailing) trivia for one token, split back out of the flat
+-- `LexResult.trivia` table.
+pure func token_trivia(result: LexResult, index: Int) -> (List[Trivia], List[Trivia]):
+	match result.tokens.get(index):
+		Some(token):
+			token_trivia_of(result.trivia, token)
+		None:
+			([], [])
 
 
 private struct LambdaBodyLevel {
@@ -197,16 +241,6 @@ private record PipeBlockScan {
 	diagnostics: List[ParseDiagnostic],
 	ended_with_newline: Bool
 }
-
-
-private pure func add_trailing_trivia(tokens: List[Token], trivia: Trivia) -> List[Token]:
-	last: Int = tokens.length() - 1
-
-	match tokens.get(last):
-		Some(token):
-			tokens.set(last, { token | trailing_trivia = token.trailing_trivia.append(trivia) })
-		None:
-			tokens
 
 
 private pure func cursor_advanced(source: SourceFile, cursor: Cursor, width: Int) -> Cursor:
@@ -1910,6 +1944,9 @@ pure func lex(source: SourceFile) -> LexResult:
 	text: String = source.text
 	var cursor: Cursor = source_start(source)
 	var tokens: List[Token] = list(text.length() / 4 + 16)
+	var texts: List[String] = []
+	var by_text: Dict[String, Int] = dict()
+	var trivia_table: List[Trivia] = []
 	var diagnostics: List[ParseDiagnostic] = []
 	var pending_trivia: List[Trivia] = []
 	var indent_stack: List[Int] = [0]
@@ -1967,31 +2004,46 @@ pure func lex(source: SourceFile) -> LexResult:
 							None:
 								if indent > current_column:
 									if pending_newline:
-										tokens = tokens.append(
-											token(
-												NewlineToken,
-												source_empty_span(source, cursor),
-											),
+										newline_tag: TaggedPayload = tagged_payload_for(
+											NewlineToken,
+											-1,
 										)
+										newline_tok: Token = token_with_trivia_range(
+											newline_tag.tag,
+											newline_tag.id,
+											source_empty_span(source, cursor),
+											trivia_table.length(),
+											0,
+										)
+										tokens = tokens.append(newline_tok)
 										last_token_kind = Some(NewlineToken)
 										pending_newline = False
 
 									indent_stack = [indent].concat(indent_stack)
-									tokens = tokens.append(
-										token(
-											IndentToken,
-											source_span(source, line_start_cursor, cursor),
-										),
+									indent_tag: TaggedPayload = tagged_payload_for(IndentToken, -1)
+									indent_tok: Token = token_with_trivia_range(
+										indent_tag.tag,
+										indent_tag.id,
+										source_span(source, line_start_cursor, cursor),
+										trivia_table.length(),
+										0,
 									)
+									tokens = tokens.append(indent_tok)
 									last_token_kind = Some(IndentToken)
 								else if indent == current_column:
 									if pending_newline:
-										tokens = tokens.append(
-											token(
-												NewlineToken,
-												source_empty_span(source, cursor),
-											),
+										newline_tag: TaggedPayload = tagged_payload_for(
+											NewlineToken,
+											-1,
 										)
+										newline_tok: Token = token_with_trivia_range(
+											newline_tag.tag,
+											newline_tag.id,
+											source_empty_span(source, cursor),
+											trivia_table.length(),
+											0,
+										)
+										tokens = tokens.append(newline_tok)
 										last_token_kind = Some(NewlineToken)
 										pending_newline = False
 								else:
@@ -2001,12 +2053,15 @@ pure func lex(source: SourceFile) -> LexResult:
 							pending_newline = False
 
 							while top_indent(indent_stack) > dedent_target:
-								tokens = tokens.append(
-									token(
-										DedentToken,
-										source_empty_span(source, cursor),
-									),
+								dedent_tag: TaggedPayload = tagged_payload_for(DedentToken, -1)
+								dedent_tok: Token = token_with_trivia_range(
+									dedent_tag.tag,
+									dedent_tag.id,
+									source_empty_span(source, cursor),
+									trivia_table.length(),
+									0,
 								)
+								tokens = tokens.append(dedent_tok)
 								last_token_kind = Some(DedentToken)
 								indent_stack = indent_stack.tail()
 
@@ -2074,14 +2129,34 @@ pure func lex(source: SourceFile) -> LexResult:
 
 							match doc_scan.kind:
 								Some(kind):
-									tokens = tokens.append(
-										token_with_trivia(
-											kind,
-											doc_scan.span,
-											pending_trivia,
-											[],
-										),
+									id: Int = match token_kind_own_text(kind):
+										Some(text):
+											match by_text.get(text):
+												Some(existing):
+													existing
+												None:
+													new_id: Int = texts.length()
+													texts = texts.append(text)
+													by_text = by_text.set(text, new_id)
+													new_id
+										None:
+											-1
+
+									tagged: TaggedPayload = tagged_payload_for(kind, id)
+									trivia_start: Int = trivia_table.length()
+									trivia_table = append_trivia_run(
+										trivia_table,
+										pending_trivia,
+										False,
 									)
+									doc_tok: Token = token_with_trivia_range(
+										tagged.tag,
+										tagged.id,
+										doc_scan.span,
+										trivia_start,
+										pending_trivia.length(),
+									)
+									tokens = tokens.append(doc_tok)
 									pending_trivia = []
 									pending_newline = False
 									at_line_start = True
@@ -2102,14 +2177,34 @@ pure func lex(source: SourceFile) -> LexResult:
 
 							match pipe_scan.kind:
 								Some(kind):
-									tokens = tokens.append(
-										token_with_trivia(
-											kind,
-											pipe_scan.span,
-											pending_trivia,
-											[],
-										),
+									id: Int = match token_kind_own_text(kind):
+										Some(text):
+											match by_text.get(text):
+												Some(existing):
+													existing
+												None:
+													new_id: Int = texts.length()
+													texts = texts.append(text)
+													by_text = by_text.set(text, new_id)
+													new_id
+										None:
+											-1
+
+									tagged: TaggedPayload = tagged_payload_for(kind, id)
+									trivia_start: Int = trivia_table.length()
+									trivia_table = append_trivia_run(
+										trivia_table,
+										pending_trivia,
+										False,
 									)
+									pipe_tok: Token = token_with_trivia_range(
+										tagged.tag,
+										tagged.id,
+										pipe_scan.span,
+										trivia_start,
+										pending_trivia.length(),
+									)
+									tokens = tokens.append(pipe_tok)
 									pending_trivia = []
 									line_has_token = True
 									last_token_kind = Some(kind)
@@ -2128,14 +2223,34 @@ pure func lex(source: SourceFile) -> LexResult:
 
 								match raw_literal.kind:
 									Some(kind):
-										tokens = tokens.append(
-											token_with_trivia(
-												kind,
-												raw_literal.span,
-												pending_trivia,
-												[],
-											),
+										id: Int = match token_kind_own_text(kind):
+											Some(text):
+												match by_text.get(text):
+													Some(existing):
+														existing
+													None:
+														new_id: Int = texts.length()
+														texts = texts.append(text)
+														by_text = by_text.set(text, new_id)
+														new_id
+											None:
+												-1
+
+										tagged: TaggedPayload = tagged_payload_for(kind, id)
+										trivia_start: Int = trivia_table.length()
+										trivia_table = append_trivia_run(
+											trivia_table,
+											pending_trivia,
+											False,
 										)
+										raw_tok: Token = token_with_trivia_range(
+											tagged.tag,
+											tagged.id,
+											raw_literal.span,
+											trivia_start,
+											pending_trivia.length(),
+										)
+										tokens = tokens.append(raw_tok)
 										pending_trivia = []
 										line_has_token = True
 										last_token_kind = Some(kind)
@@ -2156,14 +2271,34 @@ pure func lex(source: SourceFile) -> LexResult:
 
 										match raw_pipe_scan.kind:
 											Some(kind):
-												tokens = tokens.append(
-													token_with_trivia(
-														kind,
-														raw_pipe_scan.span,
-														pending_trivia,
-														[],
-													),
+												id: Int = match token_kind_own_text(kind):
+													Some(text):
+														match by_text.get(text):
+															Some(existing):
+																existing
+															None:
+																new_id: Int = texts.length()
+																texts = texts.append(text)
+																by_text = by_text.set(text, new_id)
+																new_id
+													None:
+														-1
+
+												tagged: TaggedPayload = tagged_payload_for(kind, id)
+												trivia_start: Int = trivia_table.length()
+												trivia_table = append_trivia_run(
+													trivia_table,
+													pending_trivia,
+													False,
 												)
+												raw_pipe_tok: Token = token_with_trivia_range(
+													tagged.tag,
+													tagged.id,
+													raw_pipe_scan.span,
+													trivia_start,
+													pending_trivia.length(),
+												)
+												tokens = tokens.append(raw_pipe_tok)
 												pending_trivia = []
 												line_has_token = True
 												last_token_kind = Some(kind)
@@ -2184,14 +2319,34 @@ pure func lex(source: SourceFile) -> LexResult:
 
 										match ident_literal.kind:
 											Some(kind):
-												tokens = tokens.append(
-													token_with_trivia(
-														kind,
-														ident_literal.span,
-														pending_trivia,
-														[],
-													),
+												id: Int = match token_kind_own_text(kind):
+													Some(text):
+														match by_text.get(text):
+															Some(existing):
+																existing
+															None:
+																new_id: Int = texts.length()
+																texts = texts.append(text)
+																by_text = by_text.set(text, new_id)
+																new_id
+													None:
+														-1
+
+												tagged: TaggedPayload = tagged_payload_for(kind, id)
+												trivia_start: Int = trivia_table.length()
+												trivia_table = append_trivia_run(
+													trivia_table,
+													pending_trivia,
+													False,
 												)
+												ident_lit_tok: Token = token_with_trivia_range(
+													tagged.tag,
+													tagged.id,
+													ident_literal.span,
+													trivia_start,
+													pending_trivia.length(),
+												)
+												tokens = tokens.append(ident_lit_tok)
 												pending_trivia = []
 												line_has_token = True
 												last_token_kind = Some(kind)
@@ -2204,14 +2359,34 @@ pure func lex(source: SourceFile) -> LexResult:
 
 							match string_literal.kind:
 								Some(kind):
-									tokens = tokens.append(
-										token_with_trivia(
-											kind,
-											string_literal.span,
-											pending_trivia,
-											[],
-										),
+									id: Int = match token_kind_own_text(kind):
+										Some(text):
+											match by_text.get(text):
+												Some(existing):
+													existing
+												None:
+													new_id: Int = texts.length()
+													texts = texts.append(text)
+													by_text = by_text.set(text, new_id)
+													new_id
+										None:
+											-1
+
+									tagged: TaggedPayload = tagged_payload_for(kind, id)
+									trivia_start: Int = trivia_table.length()
+									trivia_table = append_trivia_run(
+										trivia_table,
+										pending_trivia,
+										False,
 									)
+									string_lit_tok: Token = token_with_trivia_range(
+										tagged.tag,
+										tagged.id,
+										string_literal.span,
+										trivia_start,
+										pending_trivia.length(),
+									)
+									tokens = tokens.append(string_lit_tok)
 									pending_trivia = []
 									line_has_token = True
 									last_token_kind = Some(kind)
@@ -2224,14 +2399,21 @@ pure func lex(source: SourceFile) -> LexResult:
 
 							match char_literal.kind:
 								Some(kind):
-									tokens = tokens.append(
-										token_with_trivia(
-											kind,
-											char_literal.span,
-											pending_trivia,
-											[],
-										),
+									tagged: TaggedPayload = tagged_payload_for(kind, -1)
+									trivia_start: Int = trivia_table.length()
+									trivia_table = append_trivia_run(
+										trivia_table,
+										pending_trivia,
+										False,
 									)
+									char_lit_tok: Token = token_with_trivia_range(
+										tagged.tag,
+										tagged.id,
+										char_literal.span,
+										trivia_start,
+										pending_trivia.length(),
+									)
+									tokens = tokens.append(char_lit_tok)
 									pending_trivia = []
 									line_has_token = True
 									last_token_kind = Some(kind)
@@ -2250,7 +2432,22 @@ pure func lex(source: SourceFile) -> LexResult:
 					cursor = comment_end
 
 					if line_has_token:
-						tokens = add_trailing_trivia(tokens, comment)
+						last_index: Int = tokens.length() - 1
+
+						match tokens.get(last_index):
+							Some(last_token):
+								tokens = tokens.set(
+									last_index,
+									token_with_trailing_trivia_added(last_token),
+								)
+								trivia_table = trivia_table.append({
+									kind = comment.kind,
+									text = comment.text,
+									span = comment.span,
+									is_trailing = True,
+								})
+							None:
+								void
 					else:
 						pending_trivia = pending_trivia.append(comment)
 				else if (
@@ -2266,7 +2463,17 @@ pure func lex(source: SourceFile) -> LexResult:
 						source_advance(source, cursor),
 					)
 					kind: TokenKind = SymbolToken(UnderscoreSymbol)
-					tokens = tokens.append(token_with_trivia(kind, span, pending_trivia, []))
+					tagged: TaggedPayload = tagged_payload_for(kind, -1)
+					trivia_start: Int = trivia_table.length()
+					trivia_table = append_trivia_run(trivia_table, pending_trivia, False)
+					sym_tok: Token = token_with_trivia_range(
+						tagged.tag,
+						tagged.id,
+						span,
+						trivia_start,
+						pending_trivia.length(),
+					)
+					tokens = tokens.append(sym_tok)
 					pending_trivia = []
 					line_has_token = True
 					last_token_kind = Some(kind)
@@ -2282,7 +2489,30 @@ pure func lex(source: SourceFile) -> LexResult:
 						None:
 							IdentifierToken(word)
 
-					tokens = tokens.append(token_with_trivia(kind, span, pending_trivia, []))
+					id: Int = match token_kind_own_text(kind):
+						Some(text):
+							match by_text.get(text):
+								Some(existing):
+									existing
+								None:
+									new_id: Int = texts.length()
+									texts = texts.append(text)
+									by_text = by_text.set(text, new_id)
+									new_id
+						None:
+							-1
+
+					tagged: TaggedPayload = tagged_payload_for(kind, id)
+					trivia_start: Int = trivia_table.length()
+					trivia_table = append_trivia_run(trivia_table, pending_trivia, False)
+					sym_tok: Token = token_with_trivia_range(
+						tagged.tag,
+						tagged.id,
+						span,
+						trivia_start,
+						pending_trivia.length(),
+					)
+					tokens = tokens.append(sym_tok)
 					pending_trivia = []
 					line_has_token = True
 					last_token_kind = Some(kind)
@@ -2310,7 +2540,30 @@ pure func lex(source: SourceFile) -> LexResult:
 					else:
 						IntLiteralToken(digits)
 
-					tokens = tokens.append(token_with_trivia(kind, span, pending_trivia, []))
+					id: Int = match token_kind_own_text(kind):
+						Some(text):
+							match by_text.get(text):
+								Some(existing):
+									existing
+								None:
+									new_id: Int = texts.length()
+									texts = texts.append(text)
+									by_text = by_text.set(text, new_id)
+									new_id
+						None:
+							-1
+
+					tagged: TaggedPayload = tagged_payload_for(kind, id)
+					trivia_start: Int = trivia_table.length()
+					trivia_table = append_trivia_run(trivia_table, pending_trivia, False)
+					sym_tok: Token = token_with_trivia_range(
+						tagged.tag,
+						tagged.id,
+						span,
+						trivia_start,
+						pending_trivia.length(),
+					)
+					tokens = tokens.append(sym_tok)
 					pending_trivia = []
 					line_has_token = True
 					last_token_kind = Some(kind)
@@ -2321,14 +2574,17 @@ pure func lex(source: SourceFile) -> LexResult:
 							end_cursor: Cursor = cursor_advanced(source, cursor, found.width)
 							span: SourceSpan = source_span(source, cursor, end_cursor)
 							kind: TokenKind = SymbolToken(found.symbol)
-							tokens = tokens.append(
-								token_with_trivia(
-									kind,
-									span,
-									pending_trivia,
-									[],
-								),
+							tagged: TaggedPayload = tagged_payload_for(kind, -1)
+							trivia_start: Int = trivia_table.length()
+							trivia_table = append_trivia_run(trivia_table, pending_trivia, False)
+							found_sym_tok: Token = token_with_trivia_range(
+								tagged.tag,
+								tagged.id,
+								span,
+								trivia_start,
+								pending_trivia.length(),
 							)
+							tokens = tokens.append(found_sym_tok)
 							pending_trivia = []
 							line_has_token = True
 							last_token_kind = Some(kind)
@@ -2364,7 +2620,15 @@ pure func lex(source: SourceFile) -> LexResult:
 								cursor = cursor_advanced(source, cursor, width)
 
 	while top_indent(indent_stack) > 0:
-		tokens = tokens.append(token(DedentToken, source_empty_span(source, cursor)))
+		closing_dedent_tag: TaggedPayload = tagged_payload_for(DedentToken, -1)
+		closing_dedent_tok: Token = token_with_trivia_range(
+			closing_dedent_tag.tag,
+			closing_dedent_tag.id,
+			source_empty_span(source, cursor),
+			trivia_table.length(),
+			0,
+		)
+		tokens = tokens.append(closing_dedent_tok)
 		indent_stack = indent_stack.tail()
 
 	if top_indent(indent_stack) != 0:
@@ -2375,16 +2639,23 @@ pure func lex(source: SourceFile) -> LexResult:
 			),
 		)
 
-	tokens = tokens.append(
-		token_with_trivia(
-			EndOfFileToken,
-			source_empty_span(source, cursor),
-			pending_trivia,
-			[],
-		),
+	eof_tag: TaggedPayload = tagged_payload_for(EndOfFileToken, -1)
+	eof_trivia_start: Int = trivia_table.length()
+	trivia_table = append_trivia_run(trivia_table, pending_trivia, False)
+	eof_tok: Token = token_with_trivia_range(
+		eof_tag.tag,
+		eof_tag.id,
+		source_empty_span(source, cursor),
+		eof_trivia_start,
+		pending_trivia.length(),
 	)
+	tokens = tokens.append(eof_tok)
 
 	{
 		tokens = tokens,
+		texts = texts,
+		trivia = trivia_table,
+		path = source.path,
+		module_name = source.module_name,
 		diagnostics = diagnostics
 	}
