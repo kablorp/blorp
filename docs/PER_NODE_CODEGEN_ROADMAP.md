@@ -805,6 +805,7 @@ Bootstrap-built `bin/blorp` against the r4 baselines; stage-2 against s1.
 | N8 frame elision with a runtime completeness guard | landed | `ddb934389` | frames -31%, C -3.8%, -0.44% |
 | N3 one uniqueness test per record update | dropped, flat | branch `perf/record-update-uniqueness` | +0.08% |
 | N6 last-use move | dropped, flat | branch `perf/last-use-move` | 0.0% |
+| N7 cut 2, match-binding iterables | parked, flat | branch `perf/borrowed-match-loops` at `fcca670da` | within noise; 149 of 195 direct match-binding loops borrowed, `count_leaves` emits the target C, duplicate slots -117 and frames -138, all gates green; ride it with a future Perceus change rather than merge alone |
 | N9 non-atomic refcounts while single-threaded | deferred | none | ceiling -2.3% |
 | N7 borrowed iteration, cut 1 (parameters and immutable lets) | landed | `eec001bc9` | -1.4% self, -1.8% small; C -0.6%; Perceus allocations +3.8% from the classification walk (follow-up in flight). Census: loops are 6% of duplicate-slot sites and 12% of frames, so the 30% bar was mis-sized; field chains (369 loops) measured flat and are parked on `perf/borrowed-iteration-field-chains`; the remaining loop mass is match bindings of borrowed scrutinees |
 
