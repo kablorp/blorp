@@ -1,14 +1,45 @@
 import:
 	../../../src/compiler/stage_09_core/allocation_contracts:
-		AllocationRiskReason(CleanupScratchAllocation, ForeignCallBoundary, HeapBoxAllocation),
+		AllocationCoverage(CoveredAllocationOperation, UnsupportedFinalCoreOperation),
+		AllocationDependency(
+			CleanupAllocationDependency,
+			DirectFunctionAllocationDependency,
+			ForeignAllocationDependency,
+			RuntimeAllocationDependency,
+			UnknownCallAllocationDependency,
+		),
+		AllocationOperationCategory(
+			CallAllocationOperation,
+			ScalarAllocationOperation,
+			UnsupportedAllocationOperation,
+		),
+		AllocationRiskReason(
+			ClosureEnvironmentAllocation,
+			CleanupScratchAllocation,
+			CowFallbackAllocation,
+			ForeignCallBoundary,
+			HeapBoxAllocation,
+			ManagedObjectAllocation,
+			RawBufferAllocation,
+			RuntimeCallbackBoundary,
+			RuntimeOperationAllocation,
+			TupleStorageAllocation,
+			UnknownCallTarget,
+		),
+		CoreAllocationContract,
 		CoreLocalAllocationFacts,
 		UnionCleanupDependency,
-		UnionCleanupPlan(DirectUnionCleanup, IterativeUnionCleanup, NoUnionCleanup),
+		UnionCleanupKind(DirectUnionCleanup, IterativeUnionCleanup, NoUnionCleanup),
+		UnionCleanupPlan,
 		allocation_facts_are_free,
 		allocation_reason_code,
 		box_allocation_facts,
-		union_cleanup_plan
+		core_call_allocation_contract,
+		core_expr_allocation_contract,
+		merge_allocation_facts,
+		union_cleanup_plan,
 	../../../src/compiler/stage_09_core/ir:
+		CoreAccessor(RootAccessor),
 		CoreBoxKind(
 			Float16Box,
 			Float32Box,
@@ -20,18 +51,64 @@ import:
 			UInt128Box,
 			VoidBox,
 		),
+		CoreBoxedStorageValue,
+		CoreCallKind(BuiltinCall, ForeignCall, ListToStringCall, UnknownCall, UserCall),
+		CoreClosureCapture,
+		CoreExpr(
+			AccessorLiteralMatchExpr,
+			ClosureCreateExpr,
+			CooperativeCheckpointExpr,
+			DebugBlockExpr,
+			DropExpr,
+			DictConstructExpr,
+			ForChannelExpr,
+			ForDictExpr,
+			ForListExpr,
+			ForResourceSourceExpr,
+			ForTensorExpr,
+			ListGetExpr,
+			ListConstructExpr,
+			LiteralExpr,
+			RecordConstructExpr,
+			RecordReuseExpr,
+			SelectExpr,
+			TensorBoxedLiteralExpr,
+			TupleConstructExpr,
+			UnionConstructExpr,
+			UnionReuseConstructExpr,
+		),
+		CoreForeignArgPassing(ForeignDefaultArgs),
+		CoreForeignCopyKind(ForeignStringCopy),
+		CoreForeignDefaultArgPolicy(ForeignDefensiveCopy),
+		CoreHashContainerConstructor(CustomHashContainerConstructor),
+		CoreListAccessBounds(CheckedListAccess),
+		CoreListStorageLayout(InlineListStorage, InlineStructListStorage, PointerListStorage),
+		CoreLiteral(IntLiteral),
+		CoreLiteralMatchFallback(LiteralMatchFallbackFail),
+		CoreLoopBinder,
+		CoreLoopRangeDirection(RangeMayRunBackward),
 		CoreReleasePolicy(
 			ArcReleaseOnlyPolicy,
 			ArcReleasePolicy,
 			NoReleasePolicy,
 			StackResultReleasePolicy,
 		),
+		CoreSelectArmKind(SelectRecvArm),
 		CoreSourceLoc(SyntheticSourceLoc),
-		CoreType(NamedType, UnionType),
+		CoreTensorForElementStorage(TensorForRawScalarElement, TensorForRowSliceElement),
+		CoreTensorLiteralShape(TensorVectorLength),
+		CoreTensorRawScalarKind(TensorInt64Elements),
+		CoreTupleElement(TuplePrimElement, TupleStackResultElement, TupleStructElement),
+		CoreType(HeapRecordType, NamedType, TupleType, UnionType, ValueRecordType),
 		CoreUnionDecl,
 		CoreUnionField,
-		CoreUnionPayloadStorage(TypedUnionPayloadStorage),
-		CoreUnionVariant
+		CoreUnionPayloadStorage(ErasedUnionPayloadStorage, TypedUnionPayloadStorage),
+		CoreUnionRepresentation(
+			GenericUnionRepresentation,
+			NullableOptionRepresentation,
+			StackOptionRepresentation,
+		),
+		CoreUnionVariant,
 	test: TestSuite
 
 
@@ -44,6 +121,7 @@ private pure func test_bit_packed_boxes_are_allocation_free() -> Bool:
 
 	for kind in [PrimBox, PointerBox, VoidBox, FloatBox, Float32Box, Float16Box]:
 		facts: CoreLocalAllocationFacts = box_allocation_facts(kind)
+
 		if not facts_are_empty(facts) or not allocation_facts_are_free(facts):
 			valid = False
 		else:
@@ -57,6 +135,7 @@ private pure func test_wide_and_struct_boxes_allocate() -> Bool:
 
 	for kind in [Int128Box, UInt128Box, StructBox("Point")]:
 		facts: CoreLocalAllocationFacts = box_allocation_facts(kind)
+
 		if facts.may_allocate != [HeapBoxAllocation] or not facts.unknown.is_empty():
 			valid = False
 		else:
@@ -65,10 +144,7 @@ private pure func test_wide_and_struct_boxes_allocate() -> Bool:
 	valid
 
 
-private pure func union_field(
-	typ: CoreType,
-	release_policy: CoreReleasePolicy,
-) -> CoreUnionField:
+private pure func union_field(typ: CoreType, release_policy: CoreReleasePolicy) -> CoreUnionField:
 	{
 		typ = typ,
 		release_policy = release_policy
@@ -90,10 +166,7 @@ private pure func union_variant(
 	}
 
 
-private pure func union_decl(
-	name: String,
-	variants: List[CoreUnionVariant],
-) -> CoreUnionDecl:
+private pure func union_decl(name: String, variants: List[CoreUnionVariant]) -> CoreUnionDecl:
 	{
 		abi_type = None,
 		name = name,
@@ -141,25 +214,24 @@ private pure func iterative_cleanup_dependencies_match(
 
 
 private pure func test_union_cleanup_plans_are_explicit() -> Bool:
-	none: CoreUnionDecl = union_decl(
-		"Empty",
-		[union_variant("Empty", 0, [union_field(NamedType("Int", []), NoReleasePolicy)])],
-	)
+	none: CoreUnionDecl = union_decl("Empty", [union_variant("Empty", 0, [union_field(
+						NamedType("Int", []),
+						NoReleasePolicy,
+					)])])
 	direct: CoreUnionDecl = union_decl(
 		"Holder",
 		[
-			union_variant(
-				"Text",
-				0,
-				[union_field(NamedType("String", []), ArcReleaseOnlyPolicy)],
-			),
+			union_variant("Text", 0, [union_field(
+						NamedType("String", []),
+						ArcReleaseOnlyPolicy,
+					)]),
 			union_variant(
 				"Nested",
 				1,
-				[
-					union_field(UnionType("Other"), ArcReleasePolicy),
-					union_field(NamedType("Result", []), StackResultReleasePolicy),
-				],
+				[union_field(UnionType("Other"), ArcReleasePolicy), union_field(
+						NamedType("Result", []),
+						StackResultReleasePolicy,
+					)],
 			),
 		],
 	)
@@ -168,18 +240,21 @@ private pure func test_union_cleanup_plans_are_explicit() -> Bool:
 		[union_variant("Node", 0, [union_field(UnionType("Node"), ArcReleasePolicy)])],
 	)
 
-	match (union_cleanup_plan(none), union_cleanup_plan(direct), union_cleanup_plan(iterative)):
-		(
-			NoUnionCleanup,
-			DirectUnionCleanup(direct_dependencies),
-			IterativeUnionCleanup(facts, iterative_dependencies),
-		):
+	none_plan: UnionCleanupPlan = union_cleanup_plan(none)
+	direct_plan: UnionCleanupPlan = union_cleanup_plan(direct)
+	iterative_plan: UnionCleanupPlan = union_cleanup_plan(iterative)
+
+	match (none_plan.kind, direct_plan.kind, iterative_plan.kind):
+		(NoUnionCleanup, DirectUnionCleanup, IterativeUnionCleanup):
 			(
-				direct_cleanup_dependencies_match(direct_dependencies)
-				and iterative_cleanup_dependencies_match(iterative_dependencies)
-				and facts.may_allocate == [CleanupScratchAllocation]
-				and facts.unknown.is_empty()
-				and not allocation_facts_are_free(facts)
+				none_plan.dependencies.is_empty()
+				and allocation_facts_are_free(none_plan.facts)
+				and direct_cleanup_dependencies_match(direct_plan.dependencies)
+				and allocation_facts_are_free(direct_plan.facts)
+				and iterative_cleanup_dependencies_match(iterative_plan.dependencies)
+				and iterative_plan.facts.may_allocate == [CleanupScratchAllocation]
+				and iterative_plan.facts.unknown.is_empty()
+				and not allocation_facts_are_free(iterative_plan.facts)
 			)
 		_:
 			False
@@ -205,6 +280,836 @@ private pure func test_reason_codes_are_stable() -> Bool:
 	)
 
 
+private pure func int_literal(value: Int) -> CoreExpr:
+	LiteralExpr(
+		IntLiteral(value),
+		NamedType("Int", []),
+		SyntheticSourceLoc,
+	)
+
+
+private pure func test_direct_call_dependencies_use_exact_definition_ids() -> Bool:
+	contract: CoreAllocationContract = core_call_allocation_contract(
+		UserCall(
+			"display name is not identity",
+			Some(73),
+			[],
+		),
+	)
+
+	match contract.dependencies:
+		[DirectFunctionAllocationDependency(def_id)]:
+			(
+				def_id == 73
+				and contract.coverage == CoveredAllocationOperation
+				and contract.category == CallAllocationOperation
+				and allocation_facts_are_free(contract.facts)
+			)
+		_:
+			False
+
+
+private pure func test_unknown_and_named_runtime_calls_fail_closed() -> Bool:
+	unknown: CoreAllocationContract = core_call_allocation_contract(UnknownCall)
+	runtime: CoreAllocationContract = core_call_allocation_contract(
+		BuiltinCall("unregistered_runtime_operation"),
+	)
+
+	match (unknown.dependencies, runtime.dependencies):
+		([UnknownCallAllocationDependency], [RuntimeAllocationDependency]):
+			(
+				unknown.coverage == CoveredAllocationOperation
+				and runtime.coverage == CoveredAllocationOperation
+				and unknown.facts.may_allocate.is_empty()
+				and unknown.facts.unknown == [UnknownCallTarget]
+				and runtime.facts.may_allocate.is_empty()
+				and runtime.facts.unknown == [RuntimeOperationAllocation]
+			)
+		_:
+			False
+
+
+private pure func test_expr_coverage_is_separate_from_semantic_facts() -> Bool:
+	scalar: CoreAllocationContract = core_expr_allocation_contract(int_literal(1))
+	unsupported: CoreAllocationContract = core_expr_allocation_contract(
+		DebugBlockExpr(
+			int_literal(1),
+			NamedType("Int", []),
+			SyntheticSourceLoc,
+		),
+	)
+
+	(
+		scalar.coverage == CoveredAllocationOperation
+		and scalar.category == ScalarAllocationOperation
+		and allocation_facts_are_free(scalar.facts)
+		and unsupported.coverage == UnsupportedFinalCoreOperation
+		and unsupported.category == UnsupportedAllocationOperation
+		and allocation_facts_are_free(unsupported.facts)
+	)
+
+
+private pure func dict_loop(binder_type: CoreType) -> CoreExpr:
+	ForDictExpr(
+		{
+			binder = {
+				variable = {
+					name = "item",
+					uniq = 1,
+					def_id = None
+				},
+				typ = binder_type,
+				range_direction = RangeMayRunBackward
+			},
+			iterable = int_literal(0),
+			iterable_release_policy = NoReleasePolicy,
+			body = int_literal(1)
+		},
+		NamedType(
+			"Int",
+			[],
+		),
+		SyntheticSourceLoc,
+	)
+
+
+private pure func test_dict_iteration_distinguishes_pair_binders() -> Bool:
+	key_only: CoreAllocationContract = core_expr_allocation_contract(
+		dict_loop(NamedType("String", [])),
+	)
+	pair: CoreAllocationContract = core_expr_allocation_contract(
+		dict_loop(TupleType([NamedType("String", []), NamedType("Int", [])])),
+	)
+
+	(
+		allocation_facts_are_free(key_only.facts)
+		and pair.facts.may_allocate == [TupleStorageAllocation]
+		and pair.facts.unknown.is_empty()
+	)
+
+
+private pure func test_foreign_defensive_copy_preserves_may_and_unknown() -> Bool:
+	contract: CoreAllocationContract = core_call_allocation_contract(
+		ForeignCall(
+			"foreign_name_is_not_a_contract",
+			ForeignDefaultArgs([ForeignDefensiveCopy(ForeignStringCopy)]),
+		),
+	)
+
+	match contract.dependencies:
+		[ForeignAllocationDependency]:
+			(
+				contract.facts.may_allocate == [RawBufferAllocation]
+				and contract.facts.unknown == [ForeignCallBoundary]
+			)
+		_:
+			False
+
+
+private pure func closure_create(captures_value: Bool) -> CoreExpr:
+	captures: List[CoreClosureCapture] = if captures_value:
+		[
+			{
+				name = "captured",
+				typ = NamedType("Int", [])
+			},
+		]
+	else:
+		[]
+
+	ClosureCreateExpr(
+		{
+			function_name = "closure_body",
+			def_id = 91,
+			c_name = "closure_body_91",
+			static_name = "closure_static_91",
+			captures = captures
+		},
+		NamedType(
+			"Closure",
+			[],
+		),
+		SyntheticSourceLoc,
+	)
+
+
+private pure func test_closure_creation_distinguishes_capture_environments() -> Bool:
+	static_closure: CoreAllocationContract = core_expr_allocation_contract(closure_create(False))
+	captured_closure: CoreAllocationContract = core_expr_allocation_contract(closure_create(True))
+
+	(
+		allocation_facts_are_free(static_closure.facts)
+		and captured_closure.facts.may_allocate == [ClosureEnvironmentAllocation]
+		and captured_closure.facts.unknown.is_empty()
+	)
+
+
+private pure func test_record_construction_distinguishes_value_and_heap_layouts() -> Bool:
+	value_record: CoreAllocationContract = core_expr_allocation_contract(
+		RecordConstructExpr(
+			"Point",
+			[],
+			ValueRecordType("Point"),
+			SyntheticSourceLoc,
+		),
+	)
+	heap_record: CoreAllocationContract = core_expr_allocation_contract(
+		RecordConstructExpr(
+			"Node",
+			[],
+			HeapRecordType("Node"),
+			SyntheticSourceLoc,
+		),
+	)
+
+	(
+		allocation_facts_are_free(value_record.facts)
+		and heap_record.facts.may_allocate == [ManagedObjectAllocation]
+		and heap_record.facts.unknown.is_empty()
+	)
+
+
+private pure func union_construct(has_payload: Bool) -> CoreExpr:
+	args: List[CoreBoxedStorageValue] = if has_payload:
+		[
+			{
+				kind = PrimBox,
+				value = int_literal(1),
+				needs_release = False,
+				transfers_ownership = False
+			},
+		]
+	else:
+		[]
+
+	constructor_name: String = if has_payload:
+		"Some"
+	else:
+		"None"
+
+	constructor_c_name: String = if has_payload:
+		"maybe_some"
+	else:
+		"maybe_none"
+
+	UnionConstructExpr(
+		{
+			type_name = "MaybeInt",
+			constructor_name = constructor_name,
+			constructor_c_name = constructor_c_name,
+			representation = GenericUnionRepresentation,
+			payload_storage = TypedUnionPayloadStorage,
+			uses_release_mask = False,
+			release_mask = 0,
+			args = args
+		},
+		UnionType("MaybeInt"),
+		SyntheticSourceLoc,
+	)
+
+
+private pure func test_generic_union_construction_distinguishes_nullary_payload() -> Bool:
+	nullary: CoreAllocationContract = core_expr_allocation_contract(union_construct(False))
+	payload: CoreAllocationContract = core_expr_allocation_contract(union_construct(True))
+
+	(
+		allocation_facts_are_free(nullary.facts)
+		and payload.facts.may_allocate == [ManagedObjectAllocation]
+		and payload.facts.unknown.is_empty()
+	)
+
+
+private pure func stack_union_construct(kind: CoreBoxKind) -> CoreExpr:
+	UnionConstructExpr(
+		{
+			type_name = "MaybeValue",
+			constructor_name = "Some",
+			constructor_c_name = "maybe_value_some",
+			representation = StackOptionRepresentation({
+				option_type = "blorp_MaybeValue",
+				tag = 1,
+				none_value = "0",
+			}),
+			payload_storage = TypedUnionPayloadStorage,
+			uses_release_mask = False,
+			release_mask = 0,
+			args = [
+				{
+					kind = kind,
+					value = int_literal(1),
+					needs_release = False,
+					transfers_ownership = False
+				},
+			]
+		},
+		UnionType("MaybeValue"),
+		SyntheticSourceLoc,
+	)
+
+
+private pure func test_stack_union_elides_implicit_boxes() -> Bool:
+	primitive: CoreAllocationContract = core_expr_allocation_contract(
+		stack_union_construct(PrimBox),
+	)
+	wide: CoreAllocationContract = core_expr_allocation_contract(stack_union_construct(Int128Box))
+	structure: CoreAllocationContract = core_expr_allocation_contract(
+		stack_union_construct(StructBox("Point")),
+	)
+
+	(
+		allocation_facts_are_free(primitive.facts)
+		and allocation_facts_are_free(wide.facts)
+		and allocation_facts_are_free(structure.facts)
+	)
+
+
+private pure func generic_struct_union(erased: Bool) -> CoreExpr:
+	payload_storage: CoreUnionPayloadStorage = if erased:
+		ErasedUnionPayloadStorage
+	else:
+		TypedUnionPayloadStorage
+
+	UnionConstructExpr(
+		{
+			type_name = "WrappedPoint",
+			constructor_name = "WrappedPoint",
+			constructor_c_name = "wrapped_point",
+			representation = GenericUnionRepresentation,
+			payload_storage = payload_storage,
+			uses_release_mask = False,
+			release_mask = 0,
+			args = [
+				{
+					kind = StructBox("Point"),
+					value = int_literal(1),
+					needs_release = False,
+					transfers_ownership = False
+				},
+			]
+		},
+		UnionType("WrappedPoint"),
+		SyntheticSourceLoc,
+	)
+
+
+private pure func nullable_struct_union() -> CoreExpr:
+	UnionConstructExpr(
+		{
+			type_name = "MaybePoint",
+			constructor_name = "Some",
+			constructor_c_name = "maybe_point_some",
+			representation = NullableOptionRepresentation,
+			payload_storage = TypedUnionPayloadStorage,
+			uses_release_mask = False,
+			release_mask = 0,
+			args = [
+				{
+					kind = StructBox("Point"),
+					value = int_literal(1),
+					needs_release = False,
+					transfers_ownership = False
+				},
+			]
+		},
+		UnionType("MaybePoint"),
+		SyntheticSourceLoc,
+	)
+
+
+private pure func test_union_box_facts_follow_payload_emission() -> Bool:
+	typed: CoreAllocationContract = core_expr_allocation_contract(generic_struct_union(False))
+	erased: CoreAllocationContract = core_expr_allocation_contract(generic_struct_union(True))
+	nullable: CoreAllocationContract = core_expr_allocation_contract(nullable_struct_union())
+
+	(
+		typed.facts.may_allocate == [ManagedObjectAllocation]
+		and erased.facts.may_allocate == [ManagedObjectAllocation, HeapBoxAllocation]
+		and allocation_facts_are_free(nullable.facts)
+	)
+
+
+private pure func tuple_construct(struct_element: Bool) -> CoreExpr:
+	elements: List[CoreTupleElement] = if struct_element:
+		[TupleStructElement(int_literal(1), "Point")]
+	else:
+		[TuplePrimElement(int_literal(1))]
+
+	TupleConstructExpr(
+		{
+			elements = elements,
+			release_mask = 0,
+			retain_mask = 0
+		},
+		TupleType([NamedType("Int", [])]),
+		SyntheticSourceLoc,
+	)
+
+
+private pure func test_tuple_construction_preserves_storage_and_implicit_box_facts() -> Bool:
+	primitive: CoreAllocationContract = core_expr_allocation_contract(tuple_construct(False))
+	structure: CoreAllocationContract = core_expr_allocation_contract(tuple_construct(True))
+	stack_result: CoreAllocationContract = core_expr_allocation_contract(
+		TupleConstructExpr(
+			{
+				elements = [TupleStackResultElement(int_literal(1))],
+				release_mask = 0,
+				retain_mask = 0
+			},
+			TupleType([NamedType("Result", [])]),
+			SyntheticSourceLoc,
+		),
+	)
+
+	(
+		primitive.facts.may_allocate == [TupleStorageAllocation]
+		and primitive.facts.unknown.is_empty()
+		and structure.facts.may_allocate == [TupleStorageAllocation, HeapBoxAllocation]
+		and structure.facts.unknown.is_empty()
+		and stack_result.facts.may_allocate == [TupleStorageAllocation, HeapBoxAllocation]
+		and stack_result.facts.unknown.is_empty()
+	)
+
+
+private pure func drop_expr(value_type: CoreType, policy: CoreReleasePolicy) -> CoreExpr:
+	DropExpr(
+		{
+			name = "value",
+			uniq = 4,
+			def_id = None
+		},
+		value_type,
+		policy,
+		int_literal(0),
+		NamedType(
+			"Int",
+			[],
+		),
+		SyntheticSourceLoc,
+	)
+
+
+private pure func test_drop_policies_publish_exact_cleanup_dependencies() -> Bool:
+	no_release: CoreAllocationContract = core_expr_allocation_contract(
+		drop_expr(
+			NamedType("Int", []),
+			NoReleasePolicy,
+		),
+	)
+	arc_release_only: CoreAllocationContract = core_expr_allocation_contract(
+		drop_expr(
+			NamedType("String", []),
+			ArcReleaseOnlyPolicy,
+		),
+	)
+	arc: CoreAllocationContract = core_expr_allocation_contract(
+		drop_expr(
+			NamedType("String", []),
+			ArcReleasePolicy,
+		),
+	)
+	stack: CoreAllocationContract = core_expr_allocation_contract(
+		drop_expr(
+			NamedType("Result", []),
+			StackResultReleasePolicy,
+		),
+	)
+
+	match (arc.dependencies, stack.dependencies):
+		([CleanupAllocationDependency(NamedType("String", []), ArcReleasePolicy)], [CleanupAllocationDependency(NamedType("Result", []), StackResultReleasePolicy)]):
+			(
+				allocation_facts_are_free(no_release.facts)
+				and no_release.dependencies.is_empty()
+				and allocation_facts_are_free(arc_release_only.facts)
+				and arc_release_only.dependencies.is_empty()
+				and allocation_facts_are_free(arc.facts)
+				and allocation_facts_are_free(stack.facts)
+			)
+		_:
+			False
+
+
+private pure func list_get(layout: CoreListStorageLayout) -> CoreExpr:
+	ListGetExpr(
+		{
+			layout = layout,
+			list = int_literal(0),
+			index = int_literal(0),
+			bounds = CheckedListAccess
+		},
+		NamedType(
+			"Int",
+			[],
+		),
+		SyntheticSourceLoc,
+	)
+
+
+private pure func test_list_get_layouts_are_locally_allocation_free() -> Bool:
+	(
+		allocation_facts_are_free(core_expr_allocation_contract(list_get(PointerListStorage)).facts)
+		and allocation_facts_are_free(
+			core_expr_allocation_contract(list_get(InlineListStorage(8))).facts,
+		)
+		and allocation_facts_are_free(
+			core_expr_allocation_contract(list_get(InlineStructListStorage("Point"))).facts,
+		)
+	)
+
+
+private pure func test_scheduler_checkpoint_fails_closed() -> Bool:
+	contract: CoreAllocationContract = core_expr_allocation_contract(
+		CooperativeCheckpointExpr(
+			NamedType("Void", []),
+			SyntheticSourceLoc,
+		),
+	)
+
+	match contract.dependencies:
+		[RuntimeAllocationDependency]:
+			contract.facts.unknown == [RuntimeCallbackBoundary]
+		_:
+			False
+
+
+private pure func loop_binder() -> CoreLoopBinder:
+	{
+		variable = {
+			name = "item",
+			uniq = 12,
+			def_id = None
+		},
+		typ = NamedType("Int", []),
+		range_direction = RangeMayRunBackward
+	}
+
+
+private pure func test_loop_contracts_publish_hidden_runtime_and_cleanup() -> Bool:
+	iterable: CoreExpr = LiteralExpr(IntLiteral(0), UnionType("Node"), SyntheticSourceLoc)
+	list_loop: CoreAllocationContract = core_expr_allocation_contract(
+		ForListExpr(
+			{
+				binder = loop_binder(),
+				layout = PointerListStorage,
+				iterable = iterable,
+				iterable_release_policy = ArcReleasePolicy,
+				body = int_literal(0)
+			},
+			NamedType(
+				"Void",
+				[],
+			),
+			SyntheticSourceLoc,
+		),
+	)
+	resource_loop: CoreAllocationContract = core_expr_allocation_contract(
+		ForResourceSourceExpr(
+			{
+				binder = loop_binder(),
+				iterable = iterable,
+				iterable_release_policy = NoReleasePolicy,
+				body = int_literal(0)
+			},
+			NamedType(
+				"Void",
+				[],
+			),
+			SyntheticSourceLoc,
+		),
+	)
+	raw_tensor: CoreAllocationContract = core_expr_allocation_contract(
+		ForTensorExpr(
+			{
+				binder = loop_binder(),
+				element_storage = TensorForRawScalarElement(TensorInt64Elements),
+				iterable = iterable,
+				iterable_release_policy = NoReleasePolicy,
+				body = int_literal(0)
+			},
+			NamedType(
+				"Void",
+				[],
+			),
+			SyntheticSourceLoc,
+		),
+	)
+	row_tensor: CoreAllocationContract = core_expr_allocation_contract(
+		ForTensorExpr(
+			{
+				binder = loop_binder(),
+				element_storage = TensorForRowSliceElement({
+					row_size = "4",
+					result_first_dim = "4",
+					runtime_derived = False,
+				}),
+				iterable = iterable,
+				iterable_release_policy = NoReleasePolicy,
+				body = int_literal(0)
+			},
+			NamedType(
+				"Void",
+				[],
+			),
+			SyntheticSourceLoc,
+		),
+	)
+
+	match (list_loop.dependencies, resource_loop.dependencies):
+		([CleanupAllocationDependency(UnionType("Node"), ArcReleasePolicy)], [RuntimeAllocationDependency]):
+			(
+				resource_loop.facts.unknown == [RuntimeCallbackBoundary]
+				and allocation_facts_are_free(raw_tensor.facts)
+				and row_tensor.facts.may_allocate == [ManagedObjectAllocation]
+			)
+		_:
+			False
+
+
+private pure func test_accessor_match_publishes_scrutinee_cleanup() -> Bool:
+	scrutinee: CoreExpr = LiteralExpr(IntLiteral(0), UnionType("Node"), SyntheticSourceLoc)
+	contract: CoreAllocationContract = core_expr_allocation_contract(
+		AccessorLiteralMatchExpr(
+			scrutinee,
+			ArcReleasePolicy,
+			{
+				accessor = RootAccessor,
+				scrutinee_type = UnionType("Node"),
+				cases = [],
+				fallback = LiteralMatchFallbackFail,
+				result_type = NamedType("Int", []),
+				loc = SyntheticSourceLoc
+			},
+			NamedType(
+				"Int",
+				[],
+			),
+			SyntheticSourceLoc,
+		),
+	)
+
+	match contract.dependencies:
+		[CleanupAllocationDependency(UnionType("Node"), ArcReleasePolicy)]:
+			True
+		_:
+			False
+
+
+private pure func struct_boxed_value() -> CoreBoxedStorageValue:
+	{
+		kind = StructBox("Point"),
+		value = int_literal(1),
+		needs_release = False,
+		transfers_ownership = False
+	}
+
+
+private pure func test_container_construction_preserves_payload_risks() -> Bool:
+	list_contract: CoreAllocationContract = core_expr_allocation_contract(
+		ListConstructExpr(
+			{
+				layout = PointerListStorage,
+				elements = [struct_boxed_value()],
+				elem_needs_release = False
+			},
+			NamedType(
+				"List",
+				[],
+			),
+			SyntheticSourceLoc,
+		),
+	)
+	tensor_contract: CoreAllocationContract = core_expr_allocation_contract(
+		TensorBoxedLiteralExpr(
+			{
+				shape = TensorVectorLength(1),
+				elements = [struct_boxed_value()],
+				elem_needs_release = False
+			},
+			NamedType(
+				"Tensor",
+				[],
+			),
+			SyntheticSourceLoc,
+		),
+	)
+	dict_contract: CoreAllocationContract = core_expr_allocation_contract(
+		DictConstructExpr(
+			{
+				constructor = CustomHashContainerConstructor("hash_point", "equal_point", False),
+				entries = [
+					{
+						key = struct_boxed_value(),
+						value = struct_boxed_value()
+					},
+				],
+				value_needs_release = False
+			},
+			NamedType(
+				"Dict",
+				[],
+			),
+			SyntheticSourceLoc,
+		),
+	)
+
+	match dict_contract.dependencies:
+		[RuntimeAllocationDependency]:
+			(
+				list_contract.facts.may_allocate == [RawBufferAllocation, HeapBoxAllocation]
+				and tensor_contract.facts.may_allocate == [RawBufferAllocation, HeapBoxAllocation]
+				and dict_contract.facts.may_allocate == [ManagedObjectAllocation, HeapBoxAllocation]
+				and dict_contract.facts.unknown == [RuntimeCallbackBoundary]
+			)
+		_:
+			False
+
+
+private pure func test_list_to_string_preserves_known_and_unknown_risks() -> Bool:
+	contract: CoreAllocationContract = core_call_allocation_contract(
+		ListToStringCall("element_to_string"),
+	)
+
+	match contract.dependencies:
+		[RuntimeAllocationDependency]:
+			(
+				contract.facts.may_allocate == [RawBufferAllocation]
+				and contract.facts.unknown == [RuntimeCallbackBoundary]
+			)
+		_:
+			False
+
+
+private pure func test_channel_and_select_publish_received_value_cleanup() -> Bool:
+	channel: CoreAllocationContract = core_expr_allocation_contract(
+		ForChannelExpr(
+			{
+				binder = {
+					variable = {
+						name = "value",
+						uniq = 30,
+						def_id = None
+					},
+					typ = UnionType("Node"),
+					range_direction = RangeMayRunBackward
+				},
+				iterable = int_literal(0),
+				body = int_literal(0)
+			},
+			NamedType(
+				"Void",
+				[],
+			),
+			SyntheticSourceLoc,
+		),
+	)
+	select_contract: CoreAllocationContract = core_expr_allocation_contract(
+		SelectExpr(
+			[
+				{
+					kind = SelectRecvArm({
+						binder = {
+							name = "value",
+							uniq = 31,
+							def_id = None
+						},
+						elem_type = UnionType("Node"),
+						channel = int_literal(0),
+					}),
+					body = int_literal(0),
+					loc = SyntheticSourceLoc
+				},
+			],
+			NamedType(
+				"Void",
+				[],
+			),
+			SyntheticSourceLoc,
+		),
+	)
+
+	match (channel.dependencies, select_contract.dependencies):
+		([RuntimeAllocationDependency, CleanupAllocationDependency(UnionType("Node"), ArcReleasePolicy)], [RuntimeAllocationDependency, CleanupAllocationDependency(UnionType("Node"), ArcReleasePolicy)]):
+			True
+		_:
+			False
+
+
+private pure func test_capture_and_reuse_contracts_preserve_hidden_causes() -> Bool:
+	captured: CoreAllocationContract = core_expr_allocation_contract(
+		ClosureCreateExpr(
+			{
+				function_name = "capture_point",
+				def_id = 101,
+				c_name = "capture_point_101",
+				static_name = "capture_point_static_101",
+				captures = [
+					{
+						name = "point",
+						typ = ValueRecordType("Point")
+					},
+				]
+			},
+			NamedType(
+				"Closure",
+				[],
+			),
+			SyntheticSourceLoc,
+		),
+	)
+	record_reuse: CoreAllocationContract = core_expr_allocation_contract(
+		RecordReuseExpr(
+			int_literal(0),
+			[],
+			HeapRecordType("Node"),
+			SyntheticSourceLoc,
+		),
+	)
+	union_reuse: CoreAllocationContract = core_expr_allocation_contract(
+		UnionReuseConstructExpr(
+			{
+				source = int_literal(0),
+				type_name = "Node",
+				constructor_name = "Next",
+				constructor_c_name = "node_next",
+				reuse_constructor_c_name = "node_next_reuse",
+				representation = GenericUnionRepresentation,
+				payload_storage = ErasedUnionPayloadStorage,
+				uses_release_mask = False,
+				release_mask = 0,
+				args = [struct_boxed_value()]
+			},
+			UnionType("Node"),
+			SyntheticSourceLoc,
+		),
+	)
+
+	match (record_reuse.dependencies, union_reuse.dependencies):
+		([CleanupAllocationDependency(HeapRecordType("Node"), ArcReleasePolicy)], [CleanupAllocationDependency(UnionType("Node"), ArcReleasePolicy)]):
+			(
+				captured.facts.may_allocate == [ClosureEnvironmentAllocation, HeapBoxAllocation]
+				and union_reuse.facts.may_allocate == [CowFallbackAllocation, HeapBoxAllocation]
+			)
+		_:
+			False
+
+
+private pure func test_fact_merging_is_stable_and_deduplicated() -> Bool:
+	merged: CoreLocalAllocationFacts = merge_allocation_facts(
+		{
+			may_allocate = [TupleStorageAllocation, HeapBoxAllocation],
+			unknown = [RuntimeOperationAllocation]
+		},
+		{
+			may_allocate = [HeapBoxAllocation, ManagedObjectAllocation],
+			unknown = [RuntimeOperationAllocation, ForeignCallBoundary]
+		},
+	)
+
+	(
+		merged.may_allocate == [TupleStorageAllocation, HeapBoxAllocation, ManagedObjectAllocation]
+		and merged.unknown == [RuntimeOperationAllocation, ForeignCallBoundary]
+	)
+
+
 tests: TestSuite = {
 	description = "Blorp compiler Core allocation contracts",
 	tests = [
@@ -213,5 +1118,77 @@ tests: TestSuite = {
 		("union cleanup plans are explicit", test_union_cleanup_plans_are_explicit),
 		("mixed risks are preserved", test_mixed_risks_are_preserved),
 		("reason codes are stable", test_reason_codes_are_stable),
+		(
+			"direct call dependencies use exact definition IDs",
+			test_direct_call_dependencies_use_exact_definition_ids,
+		),
+		(
+			"unknown and named runtime calls fail closed",
+			test_unknown_and_named_runtime_calls_fail_closed,
+		),
+		(
+			"expr coverage is separate from semantic facts",
+			test_expr_coverage_is_separate_from_semantic_facts,
+		),
+		(
+			"dict iteration distinguishes pair binders",
+			test_dict_iteration_distinguishes_pair_binders,
+		),
+		(
+			"foreign defensive copy preserves may and unknown",
+			test_foreign_defensive_copy_preserves_may_and_unknown,
+		),
+		(
+			"closure creation distinguishes capture environments",
+			test_closure_creation_distinguishes_capture_environments,
+		),
+		(
+			"record construction distinguishes value and heap layouts",
+			test_record_construction_distinguishes_value_and_heap_layouts,
+		),
+		(
+			"generic union construction distinguishes nullary payload",
+			test_generic_union_construction_distinguishes_nullary_payload,
+		),
+		("stack union elides implicit boxes", test_stack_union_elides_implicit_boxes),
+		("union box facts follow payload emission", test_union_box_facts_follow_payload_emission),
+		(
+			"tuple construction preserves storage and implicit box facts",
+			test_tuple_construction_preserves_storage_and_implicit_box_facts,
+		),
+		(
+			"drop policies publish exact cleanup dependencies",
+			test_drop_policies_publish_exact_cleanup_dependencies,
+		),
+		(
+			"list get layouts are locally allocation-free",
+			test_list_get_layouts_are_locally_allocation_free,
+		),
+		("scheduler checkpoint fails closed", test_scheduler_checkpoint_fails_closed),
+		(
+			"loop contracts publish hidden runtime and cleanup",
+			test_loop_contracts_publish_hidden_runtime_and_cleanup,
+		),
+		(
+			"accessor match publishes scrutinee cleanup",
+			test_accessor_match_publishes_scrutinee_cleanup,
+		),
+		(
+			"container construction preserves payload risks",
+			test_container_construction_preserves_payload_risks,
+		),
+		(
+			"list to string preserves known and unknown risks",
+			test_list_to_string_preserves_known_and_unknown_risks,
+		),
+		(
+			"channel and select publish received value cleanup",
+			test_channel_and_select_publish_received_value_cleanup,
+		),
+		(
+			"capture and reuse contracts preserve hidden causes",
+			test_capture_and_reuse_contracts_preserve_hidden_causes,
+		),
+		("fact merging is stable and deduplicated", test_fact_merging_is_stable_and_deduplicated),
 	]
 }
