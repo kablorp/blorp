@@ -5,7 +5,13 @@
 -- expressions/declarations. Unsupported shapes return explicit errors so the
 -- production handoff cannot silently produce partial Core.
 import:
-	../../lib/source: SourceSpan
+	../../lib/source:
+		SourceLocation,
+		SourceTable,
+		source_location_end_offset,
+		source_location_span,
+		source_location_start_offset,
+		source_table_for_file,
 	../stage_03_parse/parsed_ast:
 		ParsedBinaryOp(
 			ParsedAddOp,
@@ -467,6 +473,7 @@ enum CoreLowerCarrierKind:
 record CoreLowerContext {
 	next_def_id: Int,
 	source_module: Option[String],
+	source_table: Option[SourceTable],
 	definition_table: Option[DefinitionTable],
 	module_id: Option[ModuleId],
 	callable_names: CoreLowerCallableNameRegistry,
@@ -553,6 +560,7 @@ pure func core_lower_context(next_def_id: Int, source_module: Option[String]) ->
 	{
 		next_def_id = next_def_id,
 		source_module = source_module,
+		source_table = None,
 		definition_table = None,
 		module_id = None,
 		callable_names = CoreLowerDefaultCallableNames,
@@ -570,6 +578,7 @@ pure func core_lower_context_with_callable_names(
 	{
 		next_def_id = next_def_id,
 		source_module = source_module,
+		source_table = None,
 		definition_table = Some(definition_table),
 		module_id = Some(module_id),
 		callable_names = callable_names,
@@ -602,8 +611,20 @@ private pure func lowered_declared_abi_type(
 			None
 
 
-pure func core_source_loc(span: SourceSpan) -> CoreSourceLoc:
+pure func core_source_loc(source_table: SourceTable, location: SourceLocation) -> CoreSourceLoc:
+	span = source_location_span(source_table, location)
 	KnownSourceLoc(span.path, span.start_line, span.start_column, span.end_line, span.end_column)
+
+
+private pure func core_source_loc_from_context(
+	context: CoreLowerContext,
+	location: SourceLocation,
+) -> CoreSourceLoc:
+	match context.source_table:
+		Some(source_table):
+			core_source_loc(source_table, location)
+		None:
+			SyntheticSourceLoc
 
 
 private pure func core_var(name: String, def_id: Option[Int]) -> CoreVar:
@@ -1168,19 +1189,25 @@ private pure func core_int_literal(value: Int, loc: CoreSourceLoc) -> CoreExpr:
 	LiteralExpr(IntLiteral(value), CORE_INT_TYPE, loc)
 
 
-private pure func question_bind_name(label: String, span: SourceSpan) -> String:
-	"__qb_" + label + "_" + span.start_line.to_string() + "_" + span.start_column.to_string()
+private pure func question_bind_name(label: String, span: SourceLocation) -> String:
+	"__qb_" + label + "_" + source_location_start_offset(
+		span,
+	).to_string() + "_" + source_location_end_offset(span).to_string()
 
 
-private pure func tuple_destruct_name(span: SourceSpan) -> String:
-	"__td_" + span.start_line.to_string() + "_" + span.start_column.to_string()
+private pure func tuple_destruct_name(span: SourceLocation) -> String:
+	"__td_" + source_location_start_offset(
+		span,
+	).to_string() + "_" + source_location_end_offset(span).to_string()
 
 
-private pure func loop_view_internal_name(label: String, span: SourceSpan) -> String:
-	"__loop_" + label + "_" + span.start_line.to_string() + "_" + span.start_column.to_string()
+private pure func loop_view_internal_name(label: String, span: SourceLocation) -> String:
+	"__loop_" + label + "_" + source_location_start_offset(
+		span,
+	).to_string() + "_" + source_location_end_offset(span).to_string()
 
 
-private pure func for_binder_span(binder: ParsedForBinder) -> SourceSpan:
+private pure func for_binder_span(binder: ParsedForBinder) -> SourceLocation:
 	match binder:
 		ParsedForNameBinder(name):
 			name.span
@@ -1192,7 +1219,7 @@ private pure func loop_view_binder_name(
 	binder: ParsedForBinder,
 	position: Int,
 	label: String,
-	span: SourceSpan,
+	span: SourceLocation,
 ) -> String:
 	match binder:
 		ParsedForTupleBinder(names, _):
@@ -1321,7 +1348,7 @@ private pure func carrier_failure_expr(
 			)
 
 
-private pure func typed_expr_span(expr: TypedExpr) -> SourceSpan:
+private pure func typed_expr_span(expr: TypedExpr) -> SourceLocation:
 	match expr:
 		TypedNameExpr(name, _):
 			name.span
@@ -1978,7 +2005,7 @@ private pure func lower_typed_record_update(
 	receiver: TypedExpr,
 	updates: List[TypedRecordField],
 	record_fields: List[ResolvedRecordField],
-	span: SourceSpan,
+	span: SourceLocation,
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> Result[CoreExpr, CoreLowerError]:
@@ -1989,8 +2016,8 @@ private pure func lower_typed_record_update(
 			lowered_receiver ?= lower_typed_expr_with_context(context, receiver)
 			lowered_updates ?= lower_typed_record_fields(context, updates)
 			temp_var: CoreVar = {
-				name = "__record_update_" + span.start_offset.to_string(),
-				uniq = span.start_offset,
+				name = "__record_update_" + source_location_start_offset(span).to_string(),
+				uniq = source_location_start_offset(span),
 				def_id = None
 			}
 			base_ref = VarExpr(temp_var, typ, loc)
@@ -2374,17 +2401,19 @@ private pure func core_timeout_is_duration(typ: SemanticType) -> Bool:
 			False
 
 
-private pure func timeout_binding_name(label: String, span: SourceSpan) -> String:
-	"__timeout_" + label + "_" + span.start_line.to_string() + "_" + span.start_column.to_string()
+private pure func timeout_binding_name(label: String, span: SourceLocation) -> String:
+	"__timeout_" + label + "_" + source_location_start_offset(
+		span,
+	).to_string() + "_" + source_location_end_offset(span).to_string()
 
 
 private pure func lower_duration_timeout_milliseconds(
 	context: CoreLowerContext,
 	duration: CoreExpr,
 	duration_type: CoreType,
-	span: SourceSpan,
+	span: SourceLocation,
 ) -> CoreExpr:
-	loc = core_source_loc(span)
+	loc = core_source_loc_from_context(context, span)
 	duration_name = timeout_binding_name("duration", span)
 	microseconds_name = timeout_binding_name("microseconds", span)
 	whole_ms_name = timeout_binding_name("whole_ms", span)
@@ -2485,7 +2514,7 @@ private pure func lower_typed_select_arm(
 	Ok({
 		kind = kind,
 		body = body,
-		loc = core_source_loc(arm.span),
+		loc = core_source_loc_from_context(context, arm.span),
 	})
 
 
@@ -2525,7 +2554,7 @@ private pure func lower_typed_lambda_params(
 					lowered = lowered.append({
 						name = core_var(param.name.text, None),
 						typ = param_type,
-						loc = core_source_loc(param.name.span),
+						loc = core_source_loc_from_context(context, param.name.span),
 					})
 				Err(CoreLowerInvalidType(message)):
 					failure = Some(
@@ -2594,7 +2623,7 @@ private pure func lower_typed_for_binding(
 						tuple_ref = VarExpr(
 							clone_core_var(tuple_var),
 							clone_core_type(tuple_type),
-							core_source_loc(span),
+							core_source_loc_from_context(context, span),
 						)
 						body_with_bindings ?= lower_tuple_destruct_bindings(
 							context,
@@ -2603,7 +2632,7 @@ private pure func lower_typed_for_binding(
 							tuple_ref,
 							field_types,
 							lowered_body,
-							core_source_loc(span),
+							core_source_loc_from_context(context, span),
 						)
 						Ok({
 							binder = {
@@ -2931,7 +2960,7 @@ private pure func lower_typed_windows_for(
 				)
 				lowered_source ?= lower_typed_expr_with_context(context, source)
 				lowered_body ?= lower_typed_expr_with_context(context, body)
-				span: SourceSpan = for_binder_span(binder)
+				span: SourceLocation = for_binder_span(binder)
 				source_var = core_var(
 					loop_view_internal_name("windows_source", span),
 					None,
@@ -3030,7 +3059,7 @@ private pure func lower_typed_windows_for(
 private pure func lower_enumerate_loop_body(
 	context: CoreLowerContext,
 	binder: ParsedForBinder,
-	span: SourceSpan,
+	span: SourceLocation,
 	index_var: CoreVar,
 	index_type: CoreType,
 	element_expr: CoreExpr,
@@ -3080,7 +3109,7 @@ private pure func lower_enumerate_loop_body(
 				index_ref = VarExpr(
 					clone_core_var(index_var),
 					clone_core_type(index_type),
-					core_source_loc(span),
+					core_source_loc_from_context(context, span),
 				)
 
 				Ok(
@@ -3094,7 +3123,10 @@ private pure func lower_enumerate_loop_body(
 						TupleExpr(
 							[index_ref, element_expr],
 							clone_core_type(tuple_type),
-							core_source_loc(span),
+							core_source_loc_from_context(
+								context,
+								span,
+							),
 						),
 						lowered_body,
 					),
@@ -3181,7 +3213,7 @@ private pure func lower_typed_tensor_enumerate_for(
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> Result[CoreExpr, CoreLowerError]:
-	span: SourceSpan = for_binder_span(binder)
+	span: SourceLocation = for_binder_span(binder)
 
 	index_name: String = loop_view_binder_name(binder, 0, "enumerate_index", span)
 
@@ -3303,7 +3335,7 @@ private pure func lower_typed_enumerate_for(
 private pure func lower_enumerate2_loop_body(
 	context: CoreLowerContext,
 	binder: ParsedForBinder,
-	span: SourceSpan,
+	span: SourceLocation,
 	row_var: CoreVar,
 	row_type: CoreType,
 	column_var: CoreVar,
@@ -3363,12 +3395,12 @@ private pure func lower_enumerate2_loop_body(
 				row_ref = VarExpr(
 					clone_core_var(row_var),
 					clone_core_type(row_type),
-					core_source_loc(span),
+					core_source_loc_from_context(context, span),
 				)
 				column_ref = VarExpr(
 					clone_core_var(column_var),
 					clone_core_type(column_type),
-					core_source_loc(span),
+					core_source_loc_from_context(context, span),
 				)
 
 				Ok(
@@ -3382,7 +3414,10 @@ private pure func lower_enumerate2_loop_body(
 						TupleExpr(
 							[row_ref, column_ref, element_expr],
 							clone_core_type(tuple_type),
-							core_source_loc(span),
+							core_source_loc_from_context(
+								context,
+								span,
+							),
 						),
 						lowered_body,
 					),
@@ -3402,7 +3437,7 @@ private pure func lower_typed_2d_enumerate2_for(
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> Result[CoreExpr, CoreLowerError]:
-	span: SourceSpan = for_binder_span(binder)
+	span: SourceLocation = for_binder_span(binder)
 	row_name: String = loop_view_binder_name(binder, 0, "enumerate2_row", span)
 	column_name: String = loop_view_binder_name(binder, 1, "enumerate2_column", span)
 	row_type ?= core_lower_type_with_prefixes(context.module_member_prefixes, row_source_type)
@@ -4121,7 +4156,7 @@ private pure func lower_question_bind_failure_case(
 	kind: CoreLowerCarrierKind,
 	rhs_type: CoreType,
 	block_type: CoreType,
-	span: SourceSpan,
+	span: SourceLocation,
 	loc: CoreSourceLoc,
 ) -> Result[CoreRawMatchCase, CoreLowerError]:
 	constructor: String = match kind:
@@ -4167,7 +4202,7 @@ private pure func lower_typed_question_bind(
 	context: CoreLowerContext,
 	name: ParsedIdentifier,
 	rhs: TypedExpr,
-	span: SourceSpan,
+	span: SourceLocation,
 	rest: List[TypedExpr],
 	block_type: CoreType,
 	loc: CoreSourceLoc,
@@ -4482,7 +4517,7 @@ private pure func lower_typed_tuple_destruct(
 	context: CoreLowerContext,
 	names: List[ParsedIdentifier],
 	value: TypedExpr,
-	span: SourceSpan,
+	span: SourceLocation,
 	rest: List[TypedExpr],
 	block_type: CoreType,
 	loc: CoreSourceLoc,
@@ -4533,7 +4568,7 @@ private pure func lower_typed_block_expr(
 			Ok(VoidExpr(typ, loc))
 		Some(first):
 			rest: List[TypedExpr] = items.tail()
-			first_loc: CoreSourceLoc = core_source_loc(typed_expr_span(first))
+			first_loc: CoreSourceLoc = core_source_loc_from_context(context, typed_expr_span(first))
 
 			match first:
 				TypedVarDeclExpr(payload, _):
@@ -4549,7 +4584,7 @@ private pure func lower_typed_block_expr(
 						context,
 						rest,
 						typ,
-						core_source_loc(payload.span),
+						core_source_loc_from_context(context, payload.span),
 					)
 
 					Ok(
@@ -4582,9 +4617,12 @@ private pure func lower_typed_block_expr(
 						Ok(SeqExpr(lowered_first, lowered_rest))
 
 
-pure func lower_typed_expr(expr: TypedExpr) -> Result[CoreExpr, CoreLowerError]:
+pure func lower_typed_expr(
+	source_table: SourceTable,
+	expr: TypedExpr,
+) -> Result[CoreExpr, CoreLowerError]:
 	lower_typed_expr_with_context(
-		core_lower_context(0, None),
+		{ core_lower_context(0, None) | source_table = Some(source_table) },
 		expr,
 	)
 
@@ -4603,7 +4641,7 @@ private pure func lower_typed_expr_as_type(
 	expr: TypedExpr,
 	typ: CoreType,
 ) -> Result[CoreExpr, CoreLowerError]:
-	loc: CoreSourceLoc = core_source_loc(typed_expr_span(expr))
+	loc: CoreSourceLoc = core_source_loc_from_context(context, typed_expr_span(expr))
 
 	match expr:
 		TypedNameExpr(name, info):
@@ -4758,12 +4796,12 @@ private pure func core_type_param_names(params: List[ParsedTypeParamDecl]) -> Li
 
 
 private pure func core_lower_param(
-	module_member_prefixes: Dict[String, String],
+	context: CoreLowerContext,
 	param: ParsedParam,
 	param_type: SemanticType,
 	index: Int,
 ) -> Result[CoreLowerParamResult, CoreLowerError]:
-	typ ?= core_lower_value_type(module_member_prefixes, param_type)
+	typ ?= core_lower_value_type(context.module_member_prefixes, param_type)
 
 	match param.binder:
 		ParsedParamNameBinder(name):
@@ -4771,7 +4809,7 @@ private pure func core_lower_param(
 				param = {
 					name = core_var(name.text, None),
 					typ = typ,
-					loc = core_source_loc(name.span)
+					loc = core_source_loc_from_context(context, name.span)
 				},
 				destructure = None,
 			})
@@ -4779,11 +4817,13 @@ private pure func core_lower_param(
 			Ok({
 				param = {
 					name = core_var(
-						"__pattern_param_${index}_${span.start_line}_${span.start_column}",
+						"__pattern_param_" + index.to_string() + "_" + source_location_start_offset(
+							span,
+						).to_string() + "_" + source_location_end_offset(span).to_string(),
 						None,
 					),
 					typ = typ,
-					loc = core_source_loc(span)
+					loc = core_source_loc_from_context(context, span)
 				},
 				destructure = None,
 			})
@@ -4799,11 +4839,13 @@ private pure func core_lower_param(
 					else:
 						lowered_param: CoreParam = {
 							name = core_var(
-								"__pattern_param_${index}_${span.start_line}_${span.start_column}",
+								"__pattern_param_" + index.to_string() + "_" + source_location_start_offset(
+									span,
+								).to_string() + "_" + source_location_end_offset(span).to_string(),
 								None,
 							),
 							typ = typ,
-							loc = core_source_loc(span)
+							loc = core_source_loc_from_context(context, span)
 						}
 						Ok({
 							param = lowered_param,
@@ -4823,7 +4865,7 @@ private pure func core_lower_param(
 
 
 private pure func core_lower_params(
-	module_member_prefixes: Dict[String, String],
+	context: CoreLowerContext,
 	params: List[ParsedParam],
 	param_types: List[SemanticType],
 ) -> Result[CoreLowerParams, CoreLowerError]:
@@ -4842,7 +4884,7 @@ private pure func core_lower_params(
 		while index < params.length() and failure.is_none():
 			match (params.get(index), param_types.get(index)):
 				(Some(param), Some(param_type)):
-					match core_lower_param(module_member_prefixes, param, param_type, index):
+					match core_lower_param(context, param, param_type, index):
 						Ok(lowered_param):
 							lowered = lowered.append(lowered_param.param)
 
@@ -4985,7 +5027,7 @@ private pure func lower_typed_function_body(
 										builtin_name,
 										params.params.map(core_param_value),
 										return_type,
-										core_source_loc(info.decl.span),
+										core_source_loc_from_context(context, info.decl.span),
 									),
 								),
 							)
@@ -4995,7 +5037,7 @@ private pure func lower_typed_function_info(
 	context: CoreLowerContext,
 	info: TypedFunctionInfo,
 ) -> Result[CoreLowerFunctionResult, CoreLowerError]:
-	params ?= core_lower_params(context.module_member_prefixes, info.decl.params, info.param_types)
+	params ?= core_lower_params(context, info.decl.params, info.param_types)
 	return_type ?= core_lower_value_type(context.module_member_prefixes, info.semantic_return_type)
 	lowered_function_body ?= lower_typed_function_body(
 		context,
@@ -5032,7 +5074,7 @@ private pure func lower_typed_function_info(
 			is_pure = info.decl.is_pure,
 			function_kind = function_kind,
 			def_id = def_id,
-			loc = core_source_loc(info.decl.span)
+			loc = core_source_loc_from_context(context, info.decl.span)
 		},
 	})
 
@@ -5062,7 +5104,7 @@ private pure func lower_typed_foreign_function(
 	context: CoreLowerContext,
 	info: TypedForeignFunctionInfo,
 ) -> Result[CoreLowerDeclResult, CoreLowerError]:
-	params ?= core_lower_params(context.module_member_prefixes, info.decl.params, info.param_types)
+	params ?= core_lower_params(context, info.decl.params, info.param_types)
 	return_type ?= core_lower_value_type(context.module_member_prefixes, info.semantic_return_type)
 
 	(next_context, def_id) = match info.callable_id:
@@ -5100,7 +5142,7 @@ private pure func lower_typed_foreign_function(
 				arg_passing = arg_passing,
 			}),
 			def_id = def_id,
-			loc = core_source_loc(info.decl.span),
+			loc = core_source_loc_from_context(context, info.decl.span),
 		}),
 	})
 
@@ -5130,7 +5172,7 @@ private pure func lower_typed_global(
 			is_const = not info.decl.is_mutable,
 			is_private = is_private,
 			def_id = def_id,
-			loc = core_source_loc(info.decl.span),
+			loc = core_source_loc_from_context(context, info.decl.span),
 		}),
 	})
 
@@ -5215,7 +5257,7 @@ private pure func lower_typed_record(
 				name = info.decl.name.text,
 				type_params = core_type_param_names(info.decl.type_params),
 				fields = fields,
-				loc = core_source_loc(info.decl.span),
+				loc = core_source_loc_from_context(context, info.decl.span),
 			}),
 		})
 	else:
@@ -5227,7 +5269,7 @@ private pure func lower_typed_record(
 				name = info.decl.name.text,
 				type_params = core_type_param_names(info.decl.type_params),
 				fields = fields,
-				loc = core_source_loc(info.decl.span),
+				loc = core_source_loc_from_context(context, info.decl.span),
 			}),
 		})
 
@@ -5409,7 +5451,7 @@ private pure func lower_typed_union(
 				name = info.decl.name.text,
 				type_params = core_type_param_names(info.decl.type_params),
 				variants = variants,
-				loc = core_source_loc(info.decl.span),
+				loc = core_source_loc_from_context(context, info.decl.span),
 			}),
 		})
 	else:
@@ -5427,7 +5469,7 @@ private pure func lower_typed_union(
 				type_params = core_type_param_names(info.decl.type_params),
 				payload_storage = storage,
 				variants = variants,
-				loc = core_source_loc(info.decl.span),
+				loc = core_source_loc_from_context(context, info.decl.span),
 			}),
 		})
 
@@ -5449,37 +5491,40 @@ private pure func lower_typed_type_alias(
 			type_params = core_type_param_names(info.decl.type_params),
 			target = target,
 			is_opaque = info.decl.is_opaque,
-			loc = core_source_loc(info.decl.span),
+			loc = core_source_loc_from_context(context, info.decl.span),
 		}),
 	})
 
 
 private pure func lower_typed_trait_method(
-	module_member_prefixes: Dict[String, String],
+	context: CoreLowerContext,
 	method: TypedTraitMethodInfo,
 ) -> Result[CoreTraitMethod, CoreLowerError]:
-	params ?= core_lower_params(module_member_prefixes, method.decl.params, method.param_types)
-	return_type ?= core_lower_value_type(module_member_prefixes, method.semantic_return_type)
+	params ?= core_lower_params(context, method.decl.params, method.param_types)
+	return_type ?= core_lower_value_type(
+		context.module_member_prefixes,
+		method.semantic_return_type,
+	)
 
 	Ok({
 		name = method.decl.name.text,
 		params = params.params,
 		return_type = return_type,
 		is_pure = method.decl.is_pure,
-		loc = core_source_loc(method.decl.span),
+		loc = core_source_loc_from_context(context, method.decl.span),
 	})
 
 
 private pure func lower_typed_trait_methods(
-	module_member_prefixes: Dict[String, String],
+	context: CoreLowerContext,
 	methods: List[TypedTraitMethodInfo],
 ) -> Result[List[CoreTraitMethod], CoreLowerError]:
 	match methods:
 		[]:
 			Ok([])
 		[method, ...rest]:
-			lowered ?= lower_typed_trait_method(module_member_prefixes, method)
-			lowered_rest ?= lower_typed_trait_methods(module_member_prefixes, rest)
+			lowered ?= lower_typed_trait_method(context, method)
+			lowered_rest ?= lower_typed_trait_methods(context, rest)
 			Ok([lowered].concat(lowered_rest))
 
 
@@ -5487,7 +5532,7 @@ private pure func lower_typed_trait(
 	context: CoreLowerContext,
 	info: TypedTraitInfo,
 ) -> Result[CoreLowerDeclResult, CoreLowerError]:
-	methods ?= lower_typed_trait_methods(context.module_member_prefixes, info.methods)
+	methods ?= lower_typed_trait_methods(context, info.methods)
 
 	Ok({
 		context = context,
@@ -5496,7 +5541,7 @@ private pure func lower_typed_trait(
 			type_params = core_type_param_names(info.decl.type_params),
 			supertraits = info.decl.supertraits.map(func(name): name.text),
 			methods = methods,
-			loc = core_source_loc(info.decl.span),
+			loc = core_source_loc_from_context(context, info.decl.span),
 		}),
 	})
 
@@ -5538,7 +5583,7 @@ private pure func lower_typed_impl(
 					bounds = param.bounds
 				}),
 			methods = methods,
-			loc = core_source_loc(info.decl.span),
+			loc = core_source_loc_from_context(context, info.decl.span),
 		}),
 	})
 
@@ -5584,9 +5629,15 @@ private pure func lower_typed_decl_with_visibility(
 
 pure func lower_typed_decl(
 	context: CoreLowerContext,
+	source_table: SourceTable,
 	decl: TypedDecl,
 ) -> Result[CoreLowerDeclResult, CoreLowerError]:
-	lower_typed_decl_with_visibility(context, decl, False, ctfe_global_replacements_empty())
+	lower_typed_decl_with_visibility(
+		{ context | source_table = Some(source_table) },
+		decl,
+		False,
+		ctfe_global_replacements_empty(),
+	)
 
 
 -- Imports have already become explicit graph/import-table metadata, while
@@ -5616,7 +5667,9 @@ pure func lower_typed_program_with_ctfe_replacements(
 	program: TypedProgram,
 	ctfe_replacements: CtfeGlobalReplacements,
 ) -> Result[CoreLowerProgramResult, CoreLowerError]:
-	var current: CoreLowerContext = context
+	var current: CoreLowerContext = { context |
+		source_table = Some(source_table_for_file(program.source))
+	}
 	var decls: List[CoreDecl] = []
 	var foreign_includes: List[String] = []
 	var failure: Option[CoreLowerError] = None

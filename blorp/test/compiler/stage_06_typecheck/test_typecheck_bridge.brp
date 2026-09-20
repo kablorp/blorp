@@ -93,6 +93,7 @@ import:
 	../../../src/compiler/stage_06_typecheck/type_system/generic_params:
 		BoundTraitIdentity,
 		BoundTraitOwner(GraphBoundTraitOwner),
+	../../../src/lib/source: source_location_span, source_span_text, source_table_for_file
 	../typecheck_test_support as TypecheckTestSupport
 	channel: Channel, channel, recv, seal, send
 	json:
@@ -3432,16 +3433,19 @@ private func typed_graph_retains_trait_topology_diagnostic_spans() -> Option[Boo
 	second ?= graph.target.diagnostics.get(1)
 	first_span ?= first.span
 	second_span ?= second.span
+	source_table = source_table_for_file(graph.target.typed_program.source)
+	first_materialized = source_location_span(source_table, first_span)
+	second_materialized = source_location_span(source_table, second_span)
 	Some(
 		(
 			first.message.contains("unknown supertrait 'MissingParent'")
-			and first_span.path == "main.brp"
-			and first_span.start_line == 1
-			and first_span.start_column == 32
+			and first_materialized.path == "main.brp"
+			and first_materialized.start_line == 1
+			and first_materialized.start_column == 32
 			and second.message.contains("unknown bound 'MissingBound'")
-			and second_span.path == "main.brp"
-			and second_span.start_line == 1
-			and second_span.start_column == 17
+			and second_materialized.path == "main.brp"
+			and second_materialized.start_line == 1
+			and second_materialized.start_column == 17
 		),
 	)
 
@@ -3469,12 +3473,16 @@ private func typed_graph_retains_type_header_diagnostic_span() -> Option[Bool]:
 	})
 	diagnostic ?= graph.target.diagnostics.get(0)
 	span ?= diagnostic.span
+	materialized = source_location_span(
+		source_table_for_file(graph.target.typed_program.source),
+		span,
+	)
 	Some(
 		(
 			diagnostic.message == "Unknown type 'MissingType' while resolving 'Box'"
-			and span.path == "main.brp"
-			and span.start_line == 1
-			and span.start_column > 1
+			and materialized.path == "main.brp"
+			and materialized.start_line == 1
+			and materialized.start_column > 1
 		),
 	)
 
@@ -3508,12 +3516,16 @@ private func typed_graph_cycle_diagnostic_uses_closing_edge_span() -> Option[Boo
 	})
 	diagnostic ?= graph.target.diagnostics.get(0)
 	span ?= diagnostic.span
+	materialized = source_location_span(
+		source_table_for_file(graph.target.typed_program.source),
+		span,
+	)
 	Some(
 		(
 			diagnostic.message == "trait inheritance cycle: Alpha -> Beta -> Gamma -> Alpha"
-			and span.path == "main.brp"
-			and span.start_line == 5
-			and span.start_column == 14
+			and materialized.path == "main.brp"
+			and materialized.start_line == 5
+			and materialized.start_column == 14
 		),
 	)
 
@@ -3577,22 +3589,25 @@ func test_typed_graph_retains_structured_typecheck_diagnostics() -> Bool:
 
 	var found_located_error: Bool = False
 	var found_located_return_error: Bool = False
+	source_table = source_table_for_file(graph.target.typed_program.source)
 
 	for diagnostic in graph.target.diagnostics:
 		match diagnostic.span:
 			Some(span):
+				materialized = source_location_span(source_table, span)
+
 				if (
 					diagnostic.message.contains("Unbound value `missing_name`")
-					and span.path == "main.brp"
-					and span.start_line == 2
-					and span.start_column == 5
+					and materialized.path == "main.brp"
+					and materialized.start_line == 2
+					and materialized.start_column == 5
 				):
 					found_located_error = True
 				else if (
 					diagnostic.message.contains("Function 'main' returns wrong type")
-					and span.path == "main.brp"
-					and span.start_line == 2
-					and span.start_column == 5
+					and materialized.path == "main.brp"
+					and materialized.start_line == 2
+					and materialized.start_column == 5
 				):
 					found_located_return_error = True
 			None:
@@ -3604,6 +3619,51 @@ func test_typed_graph_retains_structured_typecheck_diagnostics() -> Bool:
 		and found_located_error
 		and found_located_return_error
 	)
+
+
+func test_interpolation_diagnostic_uses_authored_source_location() -> Bool:
+	program_source = (
+		"func message() -> String:\n\t\"prefix\\n "
+		+ "$"
+		+ "{missing_name}\""
+	)
+	graph = typecheck_graph({
+		target = {
+			path = "main.brp",
+			module_name = "main",
+			module_path = "main",
+			text = program_source,
+			typecheck_program = None,
+			module_surface = None,
+			origin = UserModule
+		},
+		modules = [],
+		module_targets = [],
+		resolved_imports = [],
+		include_comments = False,
+		allow_debug_only_calls = False,
+	})
+
+	var found_authored_location: Bool = False
+	source_table = source_table_for_file(graph.target.typed_program.source)
+
+	for diagnostic in graph.target.diagnostics:
+		match diagnostic.span:
+			Some(span):
+				materialized = source_location_span(source_table, span)
+
+				if (
+					diagnostic.message.contains("Unbound value `missing_name`")
+					and materialized.path == "main.brp"
+					and materialized.start_line == 2
+					and source_span_text(graph.target.typed_program.source, materialized)
+						== "missing_name"
+				):
+					found_authored_location = True
+			None:
+				void
+
+	found_authored_location
 
 
 func test_typed_graph_api_returns_in_memory_results() -> Bool:
@@ -5431,6 +5491,10 @@ tests: TestSuite = {
 		(
 			"typed graph retains structured typecheck diagnostics",
 			test_typed_graph_retains_structured_typecheck_diagnostics,
+		),
+		(
+			"interpolation diagnostic uses authored source location",
+			test_interpolation_diagnostic_uses_authored_source_location,
 		),
 		("typecheck bridge rejects wrong action", test_typecheck_source_rejects_wrong_action),
 		("typecheck_source requires text", test_typecheck_source_requires_text),

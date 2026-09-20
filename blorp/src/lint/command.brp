@@ -121,14 +121,22 @@ import:
 		lint_findings_sorted,
 		lint_rule_id_name,
 		lint_severity_name,
-	../lib/source: SourceSpan
+	../lib/source:
+		SourceLocation,
+		SourceSpan,
+		SourceTable,
+		source_location_span,
+		source_location_start_offset,
+		source_locations_equal,
+		source_table_for_file,
 	json: JsonValue(JsonNumber, JsonObject, JsonString, JsonVector)
 
 
 record LintContext {
 	definition_table: DefinitionTable,
 	value_referenced_callable_ids: List[Int],
-	constant_parameter_facts: List[LintConstantParameterFact]
+	constant_parameter_facts: List[LintConstantParameterFact],
+	source_table: SourceTable
 }
 
 
@@ -151,7 +159,7 @@ private pure func generated_lint_module(module: TypecheckedModule) -> Bool:
 
 private record LintOptionParameter {
 	name: String,
-	span: SourceSpan
+	span: SourceLocation
 }
 
 
@@ -160,7 +168,7 @@ private record LintListLookupOccurrence {
 	index_name: String,
 	index_base_name: String,
 	index_is_offset: Bool,
-	span: SourceSpan
+	span: SourceLocation
 }
 
 
@@ -256,6 +264,7 @@ private pure func lint_context_for_module(
 	{
 		definition_table = definition_table,
 		value_referenced_callable_ids = value_referenced_callable_ids,
+		source_table = source_table_for_file(module.typed_program.source),
 		constant_parameter_facts = graph_constant_parameter_facts(
 			module,
 			value_referenced_callable_ids,
@@ -569,6 +578,7 @@ private pure func observed_argument(
 
 
 private pure func expression_call_observations(
+	source_table: SourceTable,
 	expr: TypedExpr,
 	caller: Option[TypedFunctionInfo],
 	constant_definition_ids: List[Int],
@@ -586,7 +596,7 @@ private pure func expression_call_observations(
 							callable_id = callable_id,
 							param_index = index,
 							argument = observed_argument(arg, caller, constant_definition_ids),
-							call_site = lint_call_site_name(span),
+							call_site = lint_call_site_name(source_table, span),
 						})
 						index += 1
 				None:
@@ -597,6 +607,7 @@ private pure func expression_call_observations(
 	for child in typed_expr_children(expr):
 		current = current.concat(
 			expression_call_observations(
+				source_table,
 				child,
 				caller,
 				constant_definition_ids,
@@ -607,6 +618,7 @@ private pure func expression_call_observations(
 
 
 private pure func decl_call_observations(
+	source_table: SourceTable,
 	decl: TypedDecl,
 	constant_definition_ids: List[Int],
 ) -> List[LintCallObservation]:
@@ -614,21 +626,31 @@ private pure func decl_call_observations(
 		TypedFunctionDecl(info):
 			info.body
 				.map(func(body):
-					expression_call_observations(body, Some(info), constant_definition_ids)
+					expression_call_observations(
+						source_table,
+						body,
+						Some(info),
+						constant_definition_ids,
+					)
 				)
 				.get_or([])
 		TypedGlobalVarDecl(info):
-			expression_call_observations(info.value, None, constant_definition_ids)
+			expression_call_observations(source_table, info.value, None, constant_definition_ids)
 		TypedImplDecl(info):
 			info.methods.flat_map(func(method):
 				method.body
 					.map(func(body):
-						expression_call_observations(body, Some(method), constant_definition_ids)
+						expression_call_observations(
+							source_table,
+							body,
+							Some(method),
+							constant_definition_ids,
+						)
 					)
 					.get_or([])
 			)
 		TypedPrivateDecl(inner):
-			decl_call_observations(inner, constant_definition_ids)
+			decl_call_observations(source_table, inner, constant_definition_ids)
 		_:
 			[]
 
@@ -686,7 +708,11 @@ private pure func append_unique_constant_value(
 		values.append(value)
 
 
-private pure func lint_call_site_name(span: SourceSpan) -> String:
+private pure func lint_call_site_name(
+	source_table: SourceTable,
+	location: SourceLocation,
+) -> String:
+	span = source_location_span(source_table, location)
 	span.path + ":" + span.start_line.to_string() + ":" + span.start_column.to_string()
 
 
@@ -802,13 +828,14 @@ private pure func graph_constant_parameter_facts(
 	-- Private callables cannot be invoked from another module. Restricting the
 	-- fixed point to the target module preserves closed-world completeness while
 	-- avoiding repeated analysis of the imported standard-library graph.
+	source_table = source_table_for_file(target.typed_program.source)
 	callables = target.typed_program.decls
 		.flat_map(func(decl):
 			private_callables_from_decl(decl, False)
 		)
 		.filter(func(callable): not escaped_callable_ids.contains(callable.callable_id))
 	observations = target.typed_program.decls.flat_map(func(decl):
-		decl_call_observations(decl, constant_definition_ids)
+		decl_call_observations(source_table, decl, constant_definition_ids)
 	)
 	states = solve_constant_parameter_states(
 		initial_constant_parameter_states(callables),
@@ -836,7 +863,7 @@ private pure func graph_constant_parameter_facts(
 	)
 
 
-private pure func structural_findings(decl: TypedDecl) -> List[LintFinding]:
+private pure func structural_findings(context: LintContext, decl: TypedDecl) -> List[LintFinding]:
 	match decl:
 		TypedRecordDecl(info):
 			if info.fields.length() == 1:
@@ -854,7 +881,7 @@ private pure func structural_findings(decl: TypedDecl) -> List[LintFinding]:
 					{
 						rule_id = rule_id,
 						severity = LintAdvice,
-						span = info.decl.name.span,
+						span = source_location_span(context.source_table, info.decl.name.span),
 						message = kind + " '" + info.decl.name.text + "' has one field; consider using the field type directly."
 					},
 				]
@@ -866,14 +893,14 @@ private pure func structural_findings(decl: TypedDecl) -> List[LintFinding]:
 					{
 						rule_id = LintSingleVariantUnion,
 						severity = LintAdvice,
-						span = info.decl.name.span,
+						span = source_location_span(context.source_table, info.decl.name.span),
 						message = "Union '" + info.decl.name.text + "' has one variant; consider using the variant payload directly."
 					},
 				]
 			else:
 				[]
 		TypedPrivateDecl(inner):
-			structural_findings(inner)
+			structural_findings(context, inner)
 		_:
 			[]
 
@@ -952,7 +979,7 @@ private pure func pure_no_parameter_function_finding(
 			{
 				rule_id = LintPureNoParameters,
 				severity = LintAdvice,
-				span = info.decl.name.span,
+				span = source_location_span(context.source_table, info.decl.name.span),
 				message = "Pure function '" + info.decl.name.text + "' has no parameters; consider using a constant value."
 			},
 		]
@@ -1014,7 +1041,10 @@ private pure func directly_matched_name(body: TypedExpr) -> Option[String]:
 			None
 
 
-private pure func immediate_option_match_findings(info: TypedFunctionInfo) -> List[LintFinding]:
+private pure func immediate_option_match_findings(
+	info: TypedFunctionInfo,
+	context: LintContext,
+) -> List[LintFinding]:
 	match info.body.and_then(directly_matched_name):
 		Some(matched_name):
 			function_option_parameters(info)
@@ -1023,7 +1053,7 @@ private pure func immediate_option_match_findings(info: TypedFunctionInfo) -> Li
 					{
 						rule_id = LintImmediateOptionMatch,
 						severity = LintAdvice,
-						span = param.span,
+						span = source_location_span(context.source_table, param.span),
 						message = "Option parameter '" + param.name + "' is matched immediately; consider accepting " + "the unwrapped value at this API boundary."
 					}
 				)
@@ -1052,24 +1082,28 @@ private pure func loop_replacement_message(replacement: LintLoopReplacement) -> 
 
 
 private pure func loop_list_lookup_finding(
-	span: SourceSpan,
+	analysis: LintContext,
+	location: SourceLocation,
 	replacement: LintLoopReplacement,
 ) -> LintFinding:
 	{
 		rule_id = LintLoopListLookup,
 		severity = LintAdvice,
-		span = span,
+		span = source_location_span(analysis.source_table, location),
 		message = "List lookup inside a loop repeats indexing work; " + loop_replacement_message(
 			replacement,
 		) + "."
 	}
 
 
-private pure func manual_list_loop_finding(span: SourceSpan) -> LintFinding:
+private pure func manual_list_loop_finding(
+	analysis: LintContext,
+	location: SourceLocation,
+) -> LintFinding:
 	{
 		rule_id = LintManualListIndexLoop,
 		severity = LintAdvice,
-		span = span,
+		span = source_location_span(analysis.source_table, location),
 		message = (
 			"Manual index loop over a list; use enumerate to carry both each index and "
 			+ "element."
@@ -1077,11 +1111,14 @@ private pure func manual_list_loop_finding(span: SourceSpan) -> LintFinding:
 	}
 
 
-private pure func repeated_list_lookup_finding(span: SourceSpan) -> LintFinding:
+private pure func repeated_list_lookup_finding(
+	analysis: LintContext,
+	location: SourceLocation,
+) -> LintFinding:
 	{
 		rule_id = LintRepeatedListLookup,
 		severity = LintAdvice,
-		span = span,
+		span = source_location_span(analysis.source_table, location),
 		message = (
 			"The same list and index are looked up repeatedly in this loop; bind the element "
 			+ "once and reuse it."
@@ -1253,7 +1290,7 @@ private pure func list_lookup_index_base(expr: TypedExpr) -> Option[(String, Boo
 private pure func list_lookup_occurrence_for_parts(
 	receiver: TypedExpr,
 	index: TypedExpr,
-	span: SourceSpan,
+	span: SourceLocation,
 ) -> Option[LintListLookupOccurrence]:
 	collection_name ?= expression_identity(receiver)
 	index_base ?= list_lookup_index_base(index)
@@ -1262,7 +1299,7 @@ private pure func list_lookup_occurrence_for_parts(
 		(index_base_name, index_is_offset):
 			index_name: String = expression_identity(
 				index,
-			).get_or(index_base_name + ":offset:" + span.start_offset.to_string())
+			).get_or(index_base_name + ":offset:" + source_location_start_offset(span).to_string())
 			Some({
 				collection_name = collection_name,
 				index_name = index_name,
@@ -1332,6 +1369,7 @@ private pure func loop_body_lookup_occurrences(
 
 
 private pure func repeated_loop_lookup_findings(
+	analysis: LintContext,
 	occurrences: List[LintListLookupOccurrence],
 ) -> List[LintFinding]:
 	var seen: List[String] = []
@@ -1341,7 +1379,7 @@ private pure func repeated_loop_lookup_findings(
 		key: String = occurrence.collection_name + "\n" + occurrence.index_name
 
 		if seen.contains(key):
-			findings = findings.append(repeated_list_lookup_finding(occurrence.span))
+			findings = findings.append(repeated_list_lookup_finding(analysis, occurrence.span))
 		else:
 			seen = seen.append(key)
 
@@ -1400,7 +1438,7 @@ private pure func is_window_lookup_peer(
 	(
 		other.collection_name == occurrence.collection_name
 		and other.index_base_name == occurrence.index_base_name
-		and other.span != occurrence.span
+		and not source_locations_equal(other.span, occurrence.span)
 	)
 
 
@@ -1467,6 +1505,7 @@ private pure func loop_lookup_finding(
 			match list_lookup_occurrence(analysis, expr):
 				Some(occurrence):
 					[loop_list_lookup_finding(
+							analysis,
 							occurrence.span,
 							loop_lookup_replacement(occurrence, loop_occurrences, indexed_context),
 						)]
@@ -1503,7 +1542,7 @@ private pure func loop_expression_findings_in_context(
 				indexed_loop_context(analysis, binder, iterable, body, body_occurrences),
 			)
 			loop_expression_findings(analysis, iterable, context)
-				.concat(repeated_loop_lookup_findings(body_occurrences))
+				.concat(repeated_loop_lookup_findings(analysis, body_occurrences))
 				.concat(loop_expression_findings(analysis, body, body_context))
 		TypedConcurrentForExpr(_, iterable, params, body, _, _):
 			param_findings = loop_children_findings(
@@ -1515,7 +1554,7 @@ private pure func loop_expression_findings_in_context(
 			body_context = LintInsideLoop(body_occurrences, None)
 			loop_expression_findings(analysis, iterable, context)
 				.concat(param_findings)
-				.concat(repeated_loop_lookup_findings(body_occurrences))
+				.concat(repeated_loop_lookup_findings(analysis, body_occurrences))
 				.concat(loop_expression_findings(analysis, body, body_context))
 		TypedWhileExpr(condition, body, span, _):
 			body_occurrences = loop_body_lookup_occurrences(analysis, body)
@@ -1532,7 +1571,7 @@ private pure func loop_expression_findings_in_context(
 							)
 						)
 					):
-						[manual_list_loop_finding(span)]
+						[manual_list_loop_finding(analysis, span)]
 					else:
 						[]
 				None:
@@ -1540,7 +1579,7 @@ private pure func loop_expression_findings_in_context(
 
 			manual
 				.concat(loop_expression_findings(analysis, condition, body_context))
-				.concat(repeated_loop_lookup_findings(body_occurrences))
+				.concat(repeated_loop_lookup_findings(analysis, body_occurrences))
 				.concat(loop_expression_findings(analysis, body, body_context))
 		TypedSubscriptExpr(receiver, indices, _, _):
 			current: List[LintFinding] = loop_lookup_finding(analysis, expr, context)
@@ -1714,7 +1753,10 @@ private pure func canonical_accumulator_finding(
 							Some({
 								rule_id = LintListAppendAccumulator,
 								severity = LintAdvice,
-								span = payload.name.span,
+								span = source_location_span(
+									context.source_table,
+									payload.name.span,
+								),
 								message = "List accumulator '" + payload.name.text + "' is a " + kind_name + " construction; consider " + kind_name + ".",
 							})
 					_:
@@ -1765,7 +1807,7 @@ private pure func constant_parameter_findings(
 						findings = findings.append({
 							rule_id = LintConstantParameter,
 							severity = LintAdvice,
-							span = name.span,
+							span = source_location_span(context.source_table, name.span),
 							message = "Parameter '" + name.text + "' of private function '" + info.decl.name.text + "' receives only " + fact.value + " across direct calls; consider removing the parameter." + constant_parameter_provenance(
 								fact,
 							),
@@ -1785,7 +1827,7 @@ private pure func local_function_findings(
 	context: LintContext,
 ) -> List[LintFinding]:
 	pure_no_parameter_function_finding(info, context)
-		.concat(immediate_option_match_findings(info))
+		.concat(immediate_option_match_findings(info, context))
 		.concat(
 			info.body
 				.map(func(body): loop_expression_findings(context, body, LintOutsideLoop))
@@ -1815,7 +1857,7 @@ pure func lint_module(module: TypecheckedModule, context: LintContext) -> List[L
 	else:
 		lint_findings_sorted(
 			module.typed_program.decls
-				.flat_map(structural_findings)
+				.flat_map(func(decl): structural_findings(context, decl))
 				.concat(module.typed_program.decls.flat_map(
 					func(decl): function_findings(decl, context),
 				)),

@@ -1,5 +1,18 @@
 import:
-	../../lib/source: SourceFile, SourceSpan, source_cursor_at, source_empty_span
+	../../lib/source:
+		Cursor,
+		SourceFile,
+		SourceFileId,
+		SourceLocation,
+		SourceSpan,
+		singleton_source_file_id,
+		source_cursor_at,
+		source_location_cover,
+		source_location_end_offset,
+		source_location_from_coordinates,
+		source_location_start_offset,
+		source_locations_equal,
+		source_span,
 	../stage_02_lex/lexer: lex
 	../stage_02_lex/parse_diagnostic: ParseDiagnostic, parse_error_expected
 	../stage_02_lex/token:
@@ -265,13 +278,13 @@ import:
 		ParsedWithBinding,
 		ParsedWithBindingKind(ParsedWithPlainBinding, ParsedWithTryBinding),
 		ParsedWithErrorMap,
-		parsed_decl_span,
-		parsed_expr_span,
-		parsed_expr_with_span,
+		parsed_decl_location,
+		parsed_expr_location,
+		parsed_expr_with_location,
 		parsed_identifier,
-		parsed_param_binder_span,
-		parsed_pattern_span,
-		parsed_type_expr_span,
+		parsed_param_binder_location,
+		parsed_pattern_location,
+		parsed_type_expr_location,
 
 
 private EXPECTED_DECLARATION: String = "declaration"
@@ -328,6 +341,8 @@ private pure func parsed_string_literal_form(kind: StringLiteralKind) -> ParsedS
 -- Built once from the lexer's `List[Token]` by `initial_state`.
 private record ParserInput {
 	source: SourceFile,
+	file_id: SourceFileId,
+	location_offset_delta: Int,
 	tags: List[TokenTag],
 	payloads: List[Int],
 	start_offsets: List[Int],
@@ -338,9 +353,7 @@ private record ParserInput {
 	end_columns: List[Int],
 	trivia_starts: List[Int],
 	trivia_counts: List[Int],
-	texts: List[String],
-	path: String,
-	module_name: String
+	texts: List[String]
 }
 
 
@@ -474,7 +487,7 @@ private record ParseTupleBinderStep {
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 	values: List[ParsedIdentifier],
-	span: SourceSpan
+	span: SourceLocation
 }
 
 
@@ -594,7 +607,7 @@ private record ParseModulePathStep {
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 	value: String,
-	span: SourceSpan
+	span: SourceLocation
 }
 
 
@@ -667,7 +680,7 @@ private record ParseListPatternSpreadStep {
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 	value: ParsedListPatternSpread,
-	span: SourceSpan
+	span: SourceLocation
 }
 
 
@@ -729,7 +742,7 @@ private record ParseBodyStep {
 
 -- `span` is a `TokenRange`, not yet materialized. Keeping diagnostics in a
 -- separate result lets this hot success-path value stay inline; diagnostics
--- build a real `SourceSpan` only after failure, while delimiter consumers
+-- build a real `SourceLocation` only after failure, while delimiter consumers
 -- materialize it only when the bound is part of an AST node.
 private struct ParseSymbolStep {
 	index: Int,
@@ -783,6 +796,7 @@ private pure func initial_state(
 	texts: List[String],
 	path: String,
 	module_name: String,
+	location_offset_delta: Int,
 ) -> ParserInput:
 	capacity: Int = tokens.length()
 	var tags: List[TokenTag] = list(capacity)
@@ -810,6 +824,8 @@ private pure func initial_state(
 
 	{
 		source = source,
+		file_id = singleton_source_file_id(),
+		location_offset_delta = location_offset_delta,
 		tags = tags,
 		payloads = payloads,
 		start_offsets = start_offsets,
@@ -820,16 +836,22 @@ private pure func initial_state(
 		end_columns = end_columns,
 		trivia_starts = trivia_starts,
 		trivia_counts = trivia_counts,
-		texts = texts,
-		path = path,
-		module_name = module_name
+		texts = texts
 	}
 
 
-private pure func eof_span(state: ParserInput) -> SourceSpan:
+private pure func eof_location(state: ParserInput) -> SourceLocation:
 	cursor = source_cursor_at(state.source, state.source.text.length())
 
-	source_empty_span(state.source, cursor)
+	source_location_from_coordinates(
+		state.file_id,
+		cursor.offset + state.location_offset_delta,
+		cursor.line,
+		cursor.column,
+		cursor.offset + state.location_offset_delta,
+		cursor.line,
+		cursor.column,
+	)
 
 
 private pure func current_tag(state: ParserInput, index: Int) -> TokenTag:
@@ -848,28 +870,27 @@ private pure func current_payload(state: ParserInput, index: Int) -> Int:
 	state.payloads.get_or(index, -1)
 
 
-private pure func current_span(state: ParserInput, index: Int) -> SourceSpan:
+private pure func current_location(state: ParserInput, index: Int) -> SourceLocation:
 	match state.start_offsets.get(index):
 		Some(start_offset):
-			{
-				path = state.path,
-				module_name = state.module_name,
-				start_offset = start_offset,
-				start_line = state.start_lines.get_or(index, 0),
-				start_column = state.start_columns.get_or(index, 0),
-				end_offset = state.end_offsets.get_or(index, 0),
-				end_line = state.end_lines.get_or(index, 0),
-				end_column = state.end_columns.get_or(index, 0)
-			}
+			source_location_from_coordinates(
+				state.file_id,
+				start_offset + state.location_offset_delta,
+				state.start_lines.get_or(index, 0),
+				state.start_columns.get_or(index, 0),
+				state.end_offsets.get_or(index, 0) + state.location_offset_delta,
+				state.end_lines.get_or(index, 0),
+				state.end_columns.get_or(index, 0),
+			)
 		None:
-			eof_span(state)
+			eof_location(state)
 
 
 -- A span not yet materialized: the `[first, last]` token indices it will
 -- cover. Two `Int`s, stack-passed, never a heap allocation -- unlike
--- `SourceSpan`, threading a `TokenRange` through the recursive descent
+-- `SourceLocation`, threading a `TokenRange` through the recursive descent
 -- (and merging with `token_range_cover`) costs nothing. Call
--- `materialize_span` exactly once, at the point a real `SourceSpan` is
+-- `materialize_location` exactly once, at the point a real `SourceLocation` is
 -- required: building a `ParsedXxx` node's `span` field or a diagnostic.
 private struct TokenRange {
 	first: Int,
@@ -901,7 +922,7 @@ private pure func token_range_cover(a: TokenRange, b: TokenRange) -> TokenRange:
 	}
 
 
-private pure func materialize_span(state: ParserInput, range: TokenRange) -> SourceSpan:
+private pure func materialize_location(state: ParserInput, range: TokenRange) -> SourceLocation:
 	start_offset: Int = state.start_offsets.get_or(range.first, 0)
 	start_line: Int = state.start_lines.get_or(range.first, 0)
 	start_column: Int = state.start_columns.get_or(range.first, 0)
@@ -909,16 +930,89 @@ private pure func materialize_span(state: ParserInput, range: TokenRange) -> Sou
 	end_line: Int = state.end_lines.get_or(range.last, 0)
 	end_column: Int = state.end_columns.get_or(range.last, 0)
 
-	{
-		path = state.path,
-		module_name = state.module_name,
-		start_offset = start_offset,
-		start_line = start_line,
-		start_column = start_column,
-		end_offset = end_offset,
-		end_line = end_line,
-		end_column = end_column
-	}
+	source_location_from_coordinates(
+		state.file_id,
+		start_offset + state.location_offset_delta,
+		start_line,
+		start_column,
+		end_offset + state.location_offset_delta,
+		end_line,
+		end_column,
+	)
+
+
+private pure func parser_cursor_at_location_start(
+	state: ParserInput,
+	location: SourceLocation,
+) -> Cursor:
+	offset: Int = source_location_start_offset(location) - state.location_offset_delta
+	var lower: Int = 0
+	var upper: Int = state.start_offsets.length()
+
+	while lower < upper:
+		middle: Int = (lower + upper) / 2
+
+		if state.start_offsets.get_or(middle, offset) < offset:
+			lower = middle + 1
+		else:
+			upper = middle
+
+	if (
+		lower < state.start_offsets.length()
+		and state.start_offsets.get_or(lower, -1) == offset
+	):
+		{
+			offset = offset,
+			line = state.start_lines.get_or(lower, 1),
+			column = state.start_columns.get_or(lower, 1)
+		}
+	else:
+		source_cursor_at(state.source, offset)
+
+
+private pure func parser_cursor_at_location_end(
+	state: ParserInput,
+	location: SourceLocation,
+) -> Cursor:
+	offset: Int = source_location_end_offset(location) - state.location_offset_delta
+	var lower: Int = 0
+	var upper: Int = state.end_offsets.length()
+
+	while lower < upper:
+		middle: Int = (lower + upper) / 2
+
+		if state.end_offsets.get_or(middle, offset) < offset:
+			lower = middle + 1
+		else:
+			upper = middle
+
+	if lower < state.end_offsets.length() and state.end_offsets.get_or(lower, -1) == offset:
+		{
+			offset = offset,
+			line = state.end_lines.get_or(lower, 1),
+			column = state.end_columns.get_or(lower, 1)
+		}
+	else:
+		source_cursor_at(state.source, offset)
+
+
+private pure func parser_location_span(
+	state: ParserInput,
+	location: SourceLocation,
+) -> SourceSpan:
+	-- Diagnostics are the cold path, so reconstruct from the authored offsets.
+	-- This also avoids choosing among synthetic tokens that share one offset.
+	source_span(
+		state.source,
+		source_cursor_at(
+			state.source,
+			source_location_start_offset(location) - state.location_offset_delta,
+		),
+		source_cursor_at(
+			state.source,
+			source_location_end_offset(location) - state.location_offset_delta,
+		),
+	)
 
 
 -- Text for an identifier / int-literal / float-literal / docstring token:
@@ -952,27 +1046,29 @@ private pure func current_char_code_point(state: ParserInput, index: Int) -> Int
 	current_payload(state, index)
 
 
-private pure func span_cover(start_span: SourceSpan, end_span: SourceSpan) -> SourceSpan:
-	{
-		path = start_span.path,
-		module_name = start_span.module_name,
-		start_offset = start_span.start_offset,
-		start_line = start_span.start_line,
-		start_column = start_span.start_column,
-		end_offset = end_span.end_offset,
-		end_line = end_span.end_line,
-		end_column = end_span.end_column
-	}
+private pure func location_cover(
+	start_span: SourceLocation,
+	end_span: SourceLocation,
+) -> SourceLocation:
+	source_location_cover(start_span, end_span)
 
 
 private pure func add_expected_error(
+	state: ParserInput,
 	diagnostics: List[ParseDiagnostic],
-	span: SourceSpan,
+	span: SourceLocation,
 	message: String,
 	expected: List[String],
 	help: Option[String],
 ) -> List[ParseDiagnostic]:
-	diagnostics.append(parse_error_expected(span, message, expected, help))
+	diagnostics.append(
+		parse_error_expected(
+			parser_location_span(state, span),
+			message,
+			expected,
+			help,
+		),
+	)
 
 
 private pure func current_is_eof(state: ParserInput, index: Int) -> Bool:
@@ -1083,11 +1179,13 @@ private pure func parsed_function_annotation_from_name(
 
 
 private pure func add_unknown_function_annotation_error(
+	state: ParserInput,
 	diagnostics: List[ParseDiagnostic],
-	span: SourceSpan,
+	span: SourceLocation,
 	name: String,
 ) -> List[ParseDiagnostic]:
 	add_expected_error(
+		state,
 		diagnostics,
 		span,
 		"unknown function annotation `@${name}`",
@@ -1103,8 +1201,9 @@ private pure func consume_annotation_argument_list(
 ) -> ParserRecoveryStep:
 	var st: Int = index
 	var st_diag: List[ParseDiagnostic] = add_expected_error(
+		state,
 		diagnostics,
-		current_span(state, index),
+		current_location(state, index),
 		"function annotations do not take arguments",
 		[],
 		Some("remove the argument list from the function annotation"),
@@ -1157,6 +1256,7 @@ private pure func parse_function_annotations(
 				values = values.append(annotation)
 			None:
 				st_diag = add_unknown_function_annotation_error(
+					state,
 					st_diag,
 					name_step.value.span,
 					name_step.value.text,
@@ -1228,8 +1328,9 @@ private pure func expect_symbol_diagnostics(
 		diagnostics
 	else:
 		add_expected_error(
+			state,
 			diagnostics,
-			materialize_span(state, step.span),
+			materialize_location(state, step.span),
 			message,
 			[symbol_text(symbol)],
 			None,
@@ -1272,8 +1373,9 @@ private pure func expect_newline_diagnostics(
 		diagnostics
 	else:
 		add_expected_error(
+			state,
 			diagnostics,
-			current_span(state, step.index),
+			current_location(state, step.index),
 			message,
 			["newline"],
 			None,
@@ -1291,8 +1393,9 @@ private pure func expect_keyword_diagnostics(
 		diagnostics
 	else:
 		add_expected_error(
+			state,
 			diagnostics,
-			current_span(state, step.index),
+			current_location(state, step.index),
 			message,
 			[expected],
 			None,
@@ -1371,10 +1474,11 @@ private pure func parse_reserved_keyword_as_name(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 	keyword: Keyword,
-	span: SourceSpan,
+	span: SourceLocation,
 ) -> ParseIdentifierStep:
 	next_state: Int = index
 	next_state_diag: List[ParseDiagnostic] = add_expected_error(
+		state,
 		diagnostics,
 		span,
 		reserved_keyword_name_message(keyword),
@@ -1395,7 +1499,7 @@ private pure func parse_identifier_expected(
 	diagnostics: List[ParseDiagnostic],
 	expected: String,
 ) -> ParseIdentifierStep:
-	span: SourceSpan = current_span(state, index)
+	span: SourceLocation = current_location(state, index)
 
 	match current_tag(state, index):
 		IdentifierTag:
@@ -1420,6 +1524,7 @@ private pure func parse_identifier_expected(
 				None:
 					next_state: Int = index
 					next_state_diag: List[ParseDiagnostic] = add_expected_error(
+						state,
 						diagnostics,
 						span,
 						"expected ${expected}",
@@ -1440,6 +1545,7 @@ private pure func parse_identifier_expected(
 		_:
 			next_state: Int = index
 			next_state_diag: List[ParseDiagnostic] = add_expected_error(
+				state,
 				diagnostics,
 				span,
 				"expected ${expected}",
@@ -1484,7 +1590,7 @@ private pure func parse_declared_name_expected(
 					index,
 					diagnostics,
 					keyword,
-					current_span(state, index),
+					current_location(state, index),
 				)
 			else:
 				parse_identifier_expected(state, index, diagnostics, expected)
@@ -1509,30 +1615,30 @@ private pure func parse_type_identifier_expected(
 						diagnostics = diagnostics,
 						value = parsed_identifier(
 							text,
-							current_span(state, index),
+							current_location(state, index),
 						)
 					}
 				None:
 					parse_identifier_expected(state, index, diagnostics, expected)
 
 
-private pure func last_type_expr_span(
+private pure func last_type_expr_location(
 	items: List[ParsedTypeExpr],
-	fallback: SourceSpan,
-) -> SourceSpan:
-	var span: SourceSpan = fallback
+	fallback: SourceLocation,
+) -> SourceLocation:
+	var span: SourceLocation = fallback
 
 	for item in items:
-		span = parsed_type_expr_span(item)
+		span = parsed_type_expr_location(item)
 
 	span
 
 
 private pure func last_dim_constraint_span(
 	items: List[ParsedDimConstraint],
-	fallback: SourceSpan,
-) -> SourceSpan:
-	var span: SourceSpan = fallback
+	fallback: SourceLocation,
+) -> SourceLocation:
+	var span: SourceLocation = fallback
 
 	for item in items:
 		span = item.span
@@ -1564,9 +1670,9 @@ private pure func parsed_type_exprs_all_dim(items: List[ParsedTypeExpr]) -> Bool
 
 private pure func last_identifier_span(
 	items: List[ParsedIdentifier],
-	fallback: SourceSpan,
-) -> SourceSpan:
-	var span: SourceSpan = fallback
+	fallback: SourceLocation,
+) -> SourceLocation:
+	var span: SourceLocation = fallback
 
 	for item in items:
 		span = item.span
@@ -1609,7 +1715,7 @@ private pure func parse_hash_identifier_expected(
 	diagnostics: List[ParseDiagnostic],
 	expected: String,
 ) -> ParseIdentifierStep:
-	start_span: SourceSpan = current_span(state, index)
+	start_span: SourceLocation = current_location(state, index)
 	expect_step: ParseSymbolStep = expect_symbol(state, index, HashSymbol)
 	expect_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
@@ -1628,9 +1734,9 @@ private pure func parse_hash_identifier_expected(
 				diagnostics = st_diag,
 				value = parsed_identifier(
 					"#" + current_text(state, st),
-					span_cover(
+					location_cover(
 						start_span,
-						current_span(state, st),
+						current_location(state, st),
 					),
 				)
 			}
@@ -1641,17 +1747,18 @@ private pure func parse_hash_identifier_expected(
 					diagnostics = st_diag,
 					value = parsed_identifier(
 						"#_",
-						span_cover(
+						location_cover(
 							start_span,
-							current_span(state, st),
+							current_location(state, st),
 						),
 					)
 				}
 			else:
 				next_state: Int = st
 				next_state_diag: List[ParseDiagnostic] = add_expected_error(
+					state,
 					st_diag,
-					current_span(state, st),
+					current_location(state, st),
 					"expected ${expected}",
 					[expected],
 					None,
@@ -1665,8 +1772,9 @@ private pure func parse_hash_identifier_expected(
 		_:
 			next_state: Int = st
 			next_state_diag: List[ParseDiagnostic] = add_expected_error(
+				state,
 				st_diag,
-				current_span(state, st),
+				current_location(state, st),
 				"expected ${expected}",
 				[expected],
 				None,
@@ -1682,7 +1790,7 @@ private pure func parse_hash_identifier_expected(
 private pure func parse_dim_hash_suffix(
 	state: ParserInput,
 	st_in: Int,
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 	diagnostics: List[ParseDiagnostic],
 ) -> ParseTypeStep:
 	match current_tag(state, st_in):
@@ -1690,18 +1798,18 @@ private pure func parse_dim_hash_suffix(
 			var st: Int = st_in
 			name: ParsedIdentifier = parsed_identifier(
 				"#" + current_text(state, st),
-				span_cover(
+				location_cover(
 					start_span,
-					current_span(state, st),
+					current_location(state, st),
 				),
 			)
 			st = advance_parser(state, st)
 			var is_variadic: Bool = False
-			var end_span: SourceSpan = name.span
+			var end_span: SourceLocation = name.span
 
 			if current_is_symbol(state, st, DotDotDotSymbol):
 				is_variadic = True
-				end_span = current_span(state, st)
+				end_span = current_location(state, st)
 				st = advance_parser(state, st)
 
 			{
@@ -1710,7 +1818,7 @@ private pure func parse_dim_hash_suffix(
 				value = ParsedDimNameType(
 					name,
 					is_variadic,
-					span_cover(start_span, end_span),
+					location_cover(start_span, end_span),
 				)
 			}
 		IntLiteralTag:
@@ -1719,9 +1827,9 @@ private pure func parse_dim_hash_suffix(
 				diagnostics = diagnostics,
 				value = ParsedDimLiteralType(
 					current_text(state, st_in),
-					span_cover(
+					location_cover(
 						start_span,
-						current_span(state, st_in),
+						current_location(state, st_in),
 					),
 				)
 			}
@@ -1730,18 +1838,18 @@ private pure func parse_dim_hash_suffix(
 				var st: Int = st_in
 				name: ParsedIdentifier = parsed_identifier(
 					"#_",
-					span_cover(
+					location_cover(
 						start_span,
-						current_span(state, st),
+						current_location(state, st),
 					),
 				)
 				st = advance_parser(state, st)
 				var is_variadic: Bool = False
-				var end_span: SourceSpan = name.span
+				var end_span: SourceLocation = name.span
 
 				if current_is_symbol(state, st, DotDotDotSymbol):
 					is_variadic = True
-					end_span = current_span(state, st)
+					end_span = current_location(state, st)
 					st = advance_parser(state, st)
 
 				{
@@ -1750,14 +1858,15 @@ private pure func parse_dim_hash_suffix(
 					value = ParsedDimNameType(
 						name,
 						is_variadic,
-						span_cover(start_span, end_span),
+						location_cover(start_span, end_span),
 					)
 				}
 			else:
 				next_state: Int = st_in
 				next_state_diag: List[ParseDiagnostic] = add_expected_error(
+					state,
 					diagnostics,
-					current_span(state, st_in),
+					current_location(state, st_in),
 					"expected dimension name or literal after `#`",
 					["dimension"],
 					None,
@@ -1771,8 +1880,9 @@ private pure func parse_dim_hash_suffix(
 		_:
 			next_state: Int = st_in
 			next_state_diag: List[ParseDiagnostic] = add_expected_error(
+				state,
 				diagnostics,
-				current_span(state, st_in),
+				current_location(state, st_in),
 				"expected dimension name or literal after `#`",
 				["dimension"],
 				None,
@@ -1798,7 +1908,7 @@ private pure func parse_dim_atom(
 				parse_dim_hash_suffix(
 					state,
 					advance_parser(state, index),
-					current_span(state, index),
+					current_location(state, index),
 					diagnostics,
 				)
 			else if symbol == LeftParenSymbol:
@@ -1824,8 +1934,9 @@ private pure func parse_dim_atom(
 			else:
 				next_state: Int = index
 				next_state_diag: List[ParseDiagnostic] = add_expected_error(
+					state,
 					diagnostics,
-					current_span(state, index),
+					current_location(state, index),
 					"expected dimension expression",
 					["dimension"],
 					None,
@@ -1834,7 +1945,7 @@ private pure func parse_dim_atom(
 				{
 					index = next_state,
 					diagnostics = next_state_diag,
-					value = ParsedMissingType(current_span(state, index))
+					value = ParsedMissingType(current_location(state, index))
 				}
 		IntLiteralTag:
 			{
@@ -1842,14 +1953,15 @@ private pure func parse_dim_atom(
 				diagnostics = diagnostics,
 				value = ParsedDimLiteralType(
 					current_text(state, index),
-					current_span(state, index),
+					current_location(state, index),
 				)
 			}
 		_:
 			next_state: Int = index
 			next_state_diag: List[ParseDiagnostic] = add_expected_error(
+				state,
 				diagnostics,
-				current_span(state, index),
+				current_location(state, index),
 				"expected dimension expression",
 				["dimension"],
 				None,
@@ -1858,7 +1970,7 @@ private pure func parse_dim_atom(
 			{
 				index = next_state,
 				diagnostics = next_state_diag,
-				value = ParsedMissingType(current_span(state, index))
+				value = ParsedMissingType(current_location(state, index))
 			}
 
 
@@ -1884,7 +1996,10 @@ private pure func parse_dim_multiply(
 			op,
 			left,
 			right_step.value,
-			span_cover(parsed_type_expr_span(left), parsed_type_expr_span(right_step.value)),
+			location_cover(
+				parsed_type_expr_location(left),
+				parsed_type_expr_location(right_step.value),
+			),
 		)
 		st = right_step.index
 		st_diag = right_step.diagnostics
@@ -1918,7 +2033,10 @@ private pure func parse_dim_expr(
 			op,
 			left,
 			right_step.value,
-			span_cover(parsed_type_expr_span(left), parsed_type_expr_span(right_step.value)),
+			location_cover(
+				parsed_type_expr_location(left),
+				parsed_type_expr_location(right_step.value),
+			),
 		)
 		st = right_step.index
 		st_diag = right_step.diagnostics
@@ -1952,9 +2070,9 @@ private pure func parse_dim_constraint(
 		value = {
 			left = left_step.value,
 			right = right_step.value,
-			span = span_cover(
-				parsed_type_expr_span(left_step.value),
-				parsed_type_expr_span(right_step.value),
+			span = location_cover(
+				parsed_type_expr_location(left_step.value),
+				parsed_type_expr_location(right_step.value),
 			)
 		}
 	}
@@ -2022,22 +2140,23 @@ private pure func parse_type_array_suffixes(
 
 		if not parsed_type_exprs_all_dim(dims_step.values):
 			st_diag = add_expected_error(
+				state,
 				st_diag,
-				last_type_expr_span(dims_step.values, parsed_type_expr_span(value)),
+				last_type_expr_location(dims_step.values, parsed_type_expr_location(value)),
 				"expected array dimensions",
 				["dimension"],
 				Some("generic type arguments belong on the named type before array dimensions"),
 			)
 
-		end_span: SourceSpan = if right_step.matched:
-			materialize_span(state, right_step.span)
+		end_span: SourceLocation = if right_step.matched:
+			materialize_location(state, right_step.span)
 		else:
-			last_type_expr_span(dims_step.values, parsed_type_expr_span(value))
+			last_type_expr_location(dims_step.values, parsed_type_expr_location(value))
 
 		value = ParsedArrayType(
 			value,
 			dims_step.values,
-			span_cover(parsed_type_expr_span(value), end_span),
+			location_cover(parsed_type_expr_location(value), end_span),
 		)
 
 	{
@@ -2070,7 +2189,7 @@ private pure func parse_named_type_expr_with_bounds(
 	var st: Int = first_name_step.index
 	var st_diag: List[ParseDiagnostic] = first_name_step.diagnostics
 	var args: List[ParsedTypeExpr] = []
-	var end_span: SourceSpan = first_name_step.value.span
+	var end_span: SourceLocation = first_name_step.value.span
 
 	if allow_bounds and current_is_symbol(state, st, ColonSymbol):
 		bounds_step: ParseIdentifierListStep = parse_plus_separated_identifier_list(
@@ -2086,7 +2205,7 @@ private pure func parse_named_type_expr_with_bounds(
 			value = ParsedBoundedType(
 				type_name,
 				bounds_step.values,
-				span_cover(
+				location_cover(
 					type_name.span,
 					last_identifier_span(bounds_step.values, type_name.span),
 				),
@@ -2125,10 +2244,10 @@ private pure func parse_named_type_expr_with_bounds(
 			st = right_step.index
 			st_diag = right_step_diagnostics
 			args = args_step.values
-			end_span = last_type_expr_span(args, end_span)
+			end_span = last_type_expr_location(args, end_span)
 
 			if right_step.matched:
-				end_span = materialize_span(state, right_step.span)
+				end_span = materialize_location(state, right_step.span)
 
 		base_type: ParsedTypeExpr = match qualifier:
 			Some(module_name):
@@ -2136,7 +2255,7 @@ private pure func parse_named_type_expr_with_bounds(
 					module_name,
 					type_name,
 					[],
-					span_cover(module_name.span, type_name.span),
+					location_cover(module_name.span, type_name.span),
 				)
 			None:
 				ParsedNamedType(type_name, [], type_name.span)
@@ -2145,7 +2264,7 @@ private pure func parse_named_type_expr_with_bounds(
 			array_type: ParsedTypeExpr = ParsedArrayType(
 				base_type,
 				args,
-				span_cover(parsed_type_expr_span(base_type), end_span),
+				location_cover(parsed_type_expr_location(base_type), end_span),
 			)
 			parse_type_array_suffixes(state, st, st_diag, array_type)
 		else:
@@ -2155,13 +2274,13 @@ private pure func parse_named_type_expr_with_bounds(
 						module_name,
 						type_name,
 						args,
-						span_cover(module_name.span, end_span),
+						location_cover(module_name.span, end_span),
 					)
 				None:
 					ParsedNamedType(
 						type_name,
 						args,
-						span_cover(type_name.span, end_span),
+						location_cover(type_name.span, end_span),
 					)
 
 			parse_type_array_suffixes(state, st, st_diag, named_type)
@@ -2172,7 +2291,7 @@ private pure func parse_parenthesized_type_expr(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 ) -> ParseTypeStep:
-	start_span: SourceSpan = current_span(state, index)
+	start_span: SourceLocation = current_location(state, index)
 	var st: Int = advance_parser(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
 
@@ -2190,15 +2309,15 @@ private pure func parse_parenthesized_type_expr(
 		void_type: ParsedTypeExpr = ParsedNamedType(
 			parsed_identifier(
 				"Void",
-				span_cover(
+				location_cover(
 					start_span,
-					materialize_span(state, right_step.span),
+					materialize_location(state, right_step.span),
 				),
 			),
 			[],
-			span_cover(
+			location_cover(
 				start_span,
-				materialize_span(state, right_step.span),
+				materialize_location(state, right_step.span),
 			),
 		)
 
@@ -2216,7 +2335,7 @@ private pure func parse_parenthesized_type_expr(
 					False,
 					[],
 					return_step.value,
-					span_cover(start_span, parsed_type_expr_span(return_step.value)),
+					location_cover(start_span, parsed_type_expr_location(return_step.value)),
 				)
 			}
 		else:
@@ -2254,16 +2373,17 @@ private pure func parse_parenthesized_type_expr(
 					False,
 					items_step.values,
 					return_step.value,
-					span_cover(start_span, parsed_type_expr_span(return_step.value)),
+					location_cover(start_span, parsed_type_expr_location(return_step.value)),
 				)
 			}
 		else:
 			if items_step.values.length() > 4:
 				st_diag = add_tuple_arity_error(
+					state,
 					st_diag,
-					span_cover(
+					location_cover(
 						start_span,
-						materialize_span(state, right_step.span),
+						materialize_location(state, right_step.span),
 					),
 				)
 
@@ -2276,9 +2396,9 @@ private pure func parse_parenthesized_type_expr(
 			else:
 				ParsedTupleType(
 					items_step.values,
-					span_cover(
+					location_cover(
 						start_span,
-						materialize_span(state, right_step.span),
+						materialize_location(state, right_step.span),
 					),
 				)
 
@@ -2290,7 +2410,7 @@ private pure func parse_pure_function_type_expr(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 ) -> ParseTypeStep:
-	start_span: SourceSpan = current_span(state, index)
+	start_span: SourceLocation = current_location(state, index)
 	var st: Int = advance_parser(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
 	left_step: ParseSymbolStep = expect_symbol(state, st, LeftParenSymbol)
@@ -2337,7 +2457,7 @@ private pure func parse_pure_function_type_expr(
 			True,
 			params_step.values,
 			return_step.value,
-			span_cover(start_span, parsed_type_expr_span(return_step.value)),
+			location_cover(start_span, parsed_type_expr_location(return_step.value)),
 		)
 	}
 
@@ -2347,7 +2467,7 @@ private pure func parse_range_type_expr(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 ) -> ParseTypeStep:
-	start_span: SourceSpan = current_span(state, index)
+	start_span: SourceLocation = current_location(state, index)
 	var st: Int = advance_parser(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
 
@@ -2356,8 +2476,9 @@ private pure func parse_range_type_expr(
 		and not current_is_symbol(state, st, LeftParenSymbol)
 	):
 		st_diag = add_expected_error(
+			state,
 			st_diag,
-			current_span(state, st),
+			current_location(state, st),
 			"expected `#` dimension after `..`",
 			["# dimension"],
 			None,
@@ -2370,7 +2491,7 @@ private pure func parse_range_type_expr(
 		diagnostics = dim_step.diagnostics,
 		value = ParsedRangeType(
 			dim_step.value,
-			span_cover(start_span, parsed_type_expr_span(dim_step.value)),
+			location_cover(start_span, parsed_type_expr_location(dim_step.value)),
 		)
 	}
 
@@ -2405,8 +2526,9 @@ private pure func parse_type_expr_missing(
 	diagnostics: List[ParseDiagnostic],
 ) -> ParseTypeStep:
 	next_state_diag: List[ParseDiagnostic] = add_expected_error(
+		state,
 		diagnostics,
-		current_span(state, index),
+		current_location(state, index),
 		"expected type",
 		[EXPECTED_TYPE],
 		None,
@@ -2420,7 +2542,7 @@ private pure func parse_type_expr_missing(
 	{
 		index = recovery_state,
 		diagnostics = next_state_diag,
-		value = ParsedMissingType(current_span(state, index))
+		value = ParsedMissingType(current_location(state, index))
 	}
 
 
@@ -2470,24 +2592,24 @@ private pure func parse_type_expr(
 	parse_type_expr_allow_bounds(state, index, diagnostics, False)
 
 
-private pure func param_span_from_start(
-	start_span: SourceSpan,
+private pure func param_location_from_start(
+	start_span: SourceLocation,
 	type_expr: Option[ParsedTypeExpr],
-) -> SourceSpan:
-	end_span: SourceSpan = match type_expr:
+) -> SourceLocation:
+	end_span: SourceLocation = match type_expr:
 		Some(ty):
-			parsed_type_expr_span(ty)
+			parsed_type_expr_location(ty)
 		None:
 			start_span
 
-	span_cover(start_span, end_span)
+	location_cover(start_span, end_span)
 
 
 private pure func param_span(
 	binder: ParsedParamBinder,
 	type_expr: Option[ParsedTypeExpr],
-) -> SourceSpan:
-	param_span_from_start(parsed_param_binder_span(binder), type_expr)
+) -> SourceLocation:
+	param_location_from_start(parsed_param_binder_location(binder), type_expr)
 
 
 private pure func parse_tuple_param(
@@ -2495,7 +2617,7 @@ private pure func parse_tuple_param(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 ) -> ParseParamStep:
-	start_span: SourceSpan = current_span(state, index)
+	start_span: SourceLocation = current_location(state, index)
 	binder_step: ParseTupleBinderStep = parse_tuple_binder_after_left_paren(
 		state,
 		advance_parser(state, index),
@@ -2537,7 +2659,7 @@ private pure func parse_named_or_wildcard_param(
 			False
 
 	if is_underscore:
-		span: SourceSpan = current_span(state, index)
+		span: SourceLocation = current_location(state, index)
 		underscore: ParsedIdentifier = parsed_identifier("_", span)
 		type_step: ParseOptionalTypeStep = parse_optional_type_annotation(
 			state,
@@ -2678,7 +2800,7 @@ private pure func parse_lambda_param(
 		value = {
 			name = name_step.value,
 			type_expr = type_step.value,
-			span = param_span_from_start(name_step.value.span, type_step.value)
+			span = param_location_from_start(name_step.value.span, type_step.value)
 		}
 	}
 
@@ -2838,7 +2960,7 @@ private pure func parse_type_param_decl(
 	var st: Int = name_step.index
 	var st_diag: List[ParseDiagnostic] = name_step.diagnostics
 	var bounds: List[ParsedIdentifier] = []
-	var end_span: SourceSpan = name_step.value.span
+	var end_span: SourceLocation = name_step.value.span
 
 	if current_is_symbol(state, st, ColonSymbol):
 		bounds_step: ParseIdentifierListStep = parse_plus_separated_identifier_list(
@@ -2858,7 +2980,7 @@ private pure func parse_type_param_decl(
 		value = {
 			name = name_step.value,
 			bounds = bounds,
-			span = span_cover(name_step.value.span, end_span)
+			span = location_cover(name_step.value.span, end_span)
 		}
 	}
 
@@ -2945,7 +3067,7 @@ private pure func parse_binder_identifier_expected(
 	diagnostics: List[ParseDiagnostic],
 	expected: String,
 ) -> ParseIdentifierStep:
-	span: SourceSpan = current_span(state, index)
+	span: SourceLocation = current_location(state, index)
 
 	match current_tag(state, index):
 		IdentifierTag:
@@ -2976,7 +3098,7 @@ private pure func parse_select_receive_identifier_expected(
 	diagnostics: List[ParseDiagnostic],
 	expected: String,
 ) -> ParseIdentifierStep:
-	span: SourceSpan = current_span(state, index)
+	span: SourceLocation = current_location(state, index)
 
 	match current_tag(state, index):
 		IdentifierTag:
@@ -3203,66 +3325,77 @@ private pure func colon_starts_typed_assignment(state: ParserInput, start_index:
 	found_assignment
 
 
-private pure func expr_list_has_leading_dot_postfix_continuation(items: List[ParsedExpr]) -> Bool:
+private pure func expr_list_has_leading_dot_postfix_continuation(
+	state: ParserInput,
+	items: List[ParsedExpr],
+) -> Bool:
 	var found: Bool = False
 
 	for item in items:
-		if parsed_expr_has_leading_dot_postfix_continuation(item):
+		if parsed_expr_has_leading_dot_postfix_continuation(state, item):
 			found = True
 			break
 
 	found
 
 
-private pure func parsed_expr_has_leading_dot_postfix_continuation(expr: ParsedExpr) -> Bool:
+private pure func parsed_expr_has_leading_dot_postfix_continuation(
+	state: ParserInput,
+	expr: ParsedExpr,
+) -> Bool:
 	match expr:
 		ParsedFieldAccessExpr(target, _, span):
-			target_span: SourceSpan = parsed_expr_span(target)
+			target_span: SourceLocation = parsed_expr_location(target)
+			field_end = parser_cursor_at_location_end(state, span)
+			target_end = parser_cursor_at_location_end(state, target_span)
 
 			(
-				span.end_line > target_span.end_line
-				or parsed_expr_has_leading_dot_postfix_continuation(target)
+				field_end.line > target_end.line
+					or parsed_expr_has_leading_dot_postfix_continuation(state, target)
 			)
 		ParsedCallExpr(callee, args, _):
 			(
-				parsed_expr_has_leading_dot_postfix_continuation(callee)
-				or expr_list_has_leading_dot_postfix_continuation(args)
+				parsed_expr_has_leading_dot_postfix_continuation(state, callee)
+					or expr_list_has_leading_dot_postfix_continuation(state, args)
 			)
 		ParsedSubscriptExpr(target, indices, _):
 			(
-				parsed_expr_has_leading_dot_postfix_continuation(target)
-				or expr_list_has_leading_dot_postfix_continuation(indices)
+				parsed_expr_has_leading_dot_postfix_continuation(state, target)
+					or expr_list_has_leading_dot_postfix_continuation(state, indices)
 			)
 		ParsedBinaryExpr(_, left, right, _):
 			(
-				parsed_expr_has_leading_dot_postfix_continuation(left)
-				or parsed_expr_has_leading_dot_postfix_continuation(right)
+				parsed_expr_has_leading_dot_postfix_continuation(state, left)
+					or parsed_expr_has_leading_dot_postfix_continuation(state, right)
 			)
 		ParsedLogicalExpr(_, left, right, _):
 			(
-				parsed_expr_has_leading_dot_postfix_continuation(left)
-				or parsed_expr_has_leading_dot_postfix_continuation(right)
+				parsed_expr_has_leading_dot_postfix_continuation(state, left)
+					or parsed_expr_has_leading_dot_postfix_continuation(state, right)
 			)
 		ParsedAscriptionExpr(value, _, _):
-			parsed_expr_has_leading_dot_postfix_continuation(value)
+			parsed_expr_has_leading_dot_postfix_continuation(state, value)
 		_:
 			False
 
 
-private pure func parsed_expr_needs_leading_dot_continuation_dedent(expr: ParsedExpr) -> Bool:
+private pure func parsed_expr_needs_leading_dot_continuation_dedent(
+	state: ParserInput,
+	expr: ParsedExpr,
+) -> Bool:
 	match expr:
 		ParsedBinaryExpr(_, left, right, _):
 			(
-				parsed_expr_has_leading_dot_postfix_continuation(left)
-				or parsed_expr_needs_leading_dot_continuation_dedent(right)
+				parsed_expr_has_leading_dot_postfix_continuation(state, left)
+					or parsed_expr_needs_leading_dot_continuation_dedent(state, right)
 			)
 		ParsedLogicalExpr(_, left, right, _):
 			(
-				parsed_expr_has_leading_dot_postfix_continuation(left)
-				or parsed_expr_needs_leading_dot_continuation_dedent(right)
+				parsed_expr_has_leading_dot_postfix_continuation(state, left)
+					or parsed_expr_needs_leading_dot_continuation_dedent(state, right)
 			)
 		ParsedAscriptionExpr(value, _, _):
-			parsed_expr_has_leading_dot_postfix_continuation(value)
+			parsed_expr_has_leading_dot_postfix_continuation(state, value)
 		_:
 			False
 
@@ -3276,7 +3409,7 @@ private pure func consume_leading_dot_postfix_continuation_dedent(
 
 	if (
 		current_is_dedent(state, after_value)
-		and parsed_expr_needs_leading_dot_continuation_dedent(value)
+		and parsed_expr_needs_leading_dot_continuation_dedent(state, value)
 	):
 		advance_parser(state, after_value)
 	else:
@@ -3287,7 +3420,7 @@ private pure func parse_header_anchored_expression(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	header_span: SourceSpan,
+	header_span: SourceLocation,
 ) -> ParseExprStep:
 	if current_is_keyword(state, index, IfKeyword):
 		parse_if_expr_with_header_span(state, index, diagnostics, header_span)
@@ -3310,7 +3443,7 @@ private pure func parse_assignment_value_expr(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	header_span: SourceSpan,
+	header_span: SourceLocation,
 ) -> ParseExprStep:
 	if current_is_newline(state, index):
 		var st: Int = advance_parser(state, index)
@@ -3320,8 +3453,9 @@ private pure func parse_assignment_value_expr(
 			st = advance_parser(state, st)
 		else:
 			st_diag = add_expected_error(
+				state,
 				st_diag,
-				current_span(state, st),
+				current_location(state, st),
 				"expected indented assignment value",
 				["indent"],
 				None,
@@ -3390,7 +3524,7 @@ private pure func make_infix_expr(
 	left: ParsedExpr,
 	right: ParsedExpr,
 ) -> ParsedExpr:
-	span: SourceSpan = span_cover(parsed_expr_span(left), parsed_expr_span(right))
+	span: SourceLocation = location_cover(parsed_expr_location(left), parsed_expr_location(right))
 
 	match info.tag:
 		InfixOrOp:
@@ -3465,7 +3599,7 @@ private pure func parse_expr_list_until(
 	diagnostics: List[ParseDiagnostic],
 	end_symbol: Symbol,
 	allow_empty: Bool,
-	header_span: SourceSpan,
+	header_span: SourceLocation,
 ) -> ParseExprListStep:
 	var st: Int = index
 	var st_diag: List[ParseDiagnostic] = diagnostics
@@ -3557,10 +3691,12 @@ private pure func parse_pattern_list_until(
 
 
 private pure func add_tuple_arity_error(
+	state: ParserInput,
 	diagnostics: List[ParseDiagnostic],
-	span: SourceSpan,
+	span: SourceLocation,
 ) -> List[ParseDiagnostic]:
 	add_expected_error(
+		state,
 		diagnostics,
 		span,
 		"Tuples support 2-4 elements",
@@ -3573,13 +3709,13 @@ private pure func parse_tuple_pattern_after_left_paren(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 ) -> ParsePatternStep:
 	first_step: ParsePatternStep = parse_pattern(state, index, diagnostics)
 	var st: Int = first_step.index
 	var st_diag: List[ParseDiagnostic] = first_step.diagnostics
 	var items: List[ParsedPattern] = [first_step.value]
-	var end_span: SourceSpan = parsed_pattern_span(first_step.value)
+	var end_span: SourceLocation = parsed_pattern_location(first_step.value)
 
 	comma_step: ParseSymbolStep = expect_symbol(state, st, CommaSymbol)
 	comma_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
@@ -3606,9 +3742,9 @@ private pure func parse_tuple_pattern_after_left_paren(
 
 		match rest_step.values.get(rest_step.values.length() - 1):
 			Some(last):
-				end_span = parsed_pattern_span(last)
+				end_span = parsed_pattern_location(last)
 			None:
-				end_span = materialize_span(state, comma_step.span)
+				end_span = materialize_location(state, comma_step.span)
 
 	right_step: ParseSymbolStep = expect_symbol(state, st, RightParenSymbol)
 	right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
@@ -3622,12 +3758,13 @@ private pure func parse_tuple_pattern_after_left_paren(
 	st_diag = right_step_diagnostics
 
 	if right_step.matched:
-		end_span = materialize_span(state, right_step.span)
+		end_span = materialize_location(state, right_step.span)
 
 	if items.length() < 2 or items.length() > 4:
 		st_diag = add_tuple_arity_error(
+			state,
 			st_diag,
-			span_cover(start_span, end_span),
+			location_cover(start_span, end_span),
 		)
 
 	{
@@ -3635,7 +3772,7 @@ private pure func parse_tuple_pattern_after_left_paren(
 		diagnostics = st_diag,
 		value = ParsedTuplePattern(
 			items,
-			span_cover(start_span, end_span),
+			location_cover(start_span, end_span),
 		)
 	}
 
@@ -3644,10 +3781,11 @@ private pure func parse_list_pattern_spread_missing(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	start_span: SourceSpan,
-	span: SourceSpan,
+	start_span: SourceLocation,
+	span: SourceLocation,
 ) -> ParseListPatternSpreadStep:
 	next_state_diag: List[ParseDiagnostic] = add_expected_error(
+		state,
 		diagnostics,
 		span,
 		"expected list pattern spread target",
@@ -3664,7 +3802,7 @@ private pure func parse_list_pattern_spread_missing(
 		index = recovery_state,
 		diagnostics = next_state_diag,
 		value = ParsedListSpreadWildcard(span),
-		span = span_cover(start_span, span)
+		span = location_cover(start_span, span)
 	}
 
 
@@ -3672,9 +3810,9 @@ private pure func parse_list_pattern_spread_after_dotdotdot(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 ) -> ParseListPatternSpreadStep:
-	span: SourceSpan = current_span(state, index)
+	span: SourceLocation = current_location(state, index)
 
 	match current_tag(state, index):
 		IdentifierTag:
@@ -3686,7 +3824,7 @@ private pure func parse_list_pattern_spread_after_dotdotdot(
 				index = advance_parser(state, index),
 				diagnostics = diagnostics,
 				value = ParsedListSpreadName(name),
-				span = span_cover(start_span, span)
+				span = location_cover(start_span, span)
 			}
 		SymbolTag:
 			if current_symbol(state, index) == UnderscoreSymbol:
@@ -3694,7 +3832,7 @@ private pure func parse_list_pattern_spread_after_dotdotdot(
 					index = advance_parser(state, index),
 					diagnostics = diagnostics,
 					value = ParsedListSpreadWildcard(span),
-					span = span_cover(start_span, span)
+					span = location_cover(start_span, span)
 				}
 			else:
 				parse_list_pattern_spread_missing(state, index, diagnostics, start_span, span)
@@ -3706,17 +3844,17 @@ private pure func parse_list_pattern_after_left_bracket(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 ) -> ParsePatternStep:
 	var st: Int = index
 	var st_diag: List[ParseDiagnostic] = diagnostics
 	var items: List[ParsedPattern] = []
 	var spread: Option[ParsedListPatternSpread] = None
-	var end_span: SourceSpan = start_span
+	var end_span: SourceLocation = start_span
 
 	if not current_is_symbol(state, st, RightBracketSymbol):
 		if current_is_symbol(state, st, DotDotDotSymbol):
-			dots_span: SourceSpan = current_span(state, st)
+			dots_span: SourceLocation = current_location(state, st)
 			spread_step: ParseListPatternSpreadStep = parse_list_pattern_spread_after_dotdotdot(
 				state,
 				advance_parser(state, st),
@@ -3735,13 +3873,13 @@ private pure func parse_list_pattern_after_left_bracket(
 				items = items.append(pattern_step.value)
 				st = pattern_step.index
 				st_diag = pattern_step.diagnostics
-				end_span = parsed_pattern_span(pattern_step.value)
+				end_span = parsed_pattern_location(pattern_step.value)
 
 				if current_is_symbol(state, st, CommaSymbol):
 					st = advance_parser(state, st)
 
 					if current_is_symbol(state, st, DotDotDotSymbol):
-						dots_span: SourceSpan = current_span(state, st)
+						dots_span: SourceLocation = current_location(state, st)
 						spread_step: ParseListPatternSpreadStep = parse_list_pattern_spread_after_dotdotdot(
 							state,
 							advance_parser(state, st),
@@ -3768,7 +3906,7 @@ private pure func parse_list_pattern_after_left_bracket(
 	st_diag = right_step_diagnostics
 
 	if right_step.matched:
-		end_span = materialize_span(state, right_step.span)
+		end_span = materialize_location(state, right_step.span)
 
 	{
 		index = st,
@@ -3776,7 +3914,7 @@ private pure func parse_list_pattern_after_left_bracket(
 		value = ParsedListPattern(
 			items,
 			spread,
-			span_cover(start_span, end_span),
+			location_cover(start_span, end_span),
 		)
 	}
 
@@ -3786,7 +3924,7 @@ private pure func parse_simple_pattern(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 ) -> ParsePatternStep:
-	span: SourceSpan = current_span(state, index)
+	span: SourceLocation = current_location(state, index)
 
 	match current_tag(state, index):
 		IdentifierTag:
@@ -3808,7 +3946,7 @@ private pure func parse_simple_pattern(
 				st = constructor_step.index
 				st_diag = constructor_step.diagnostics
 				var args: List[ParsedPattern] = []
-				var end_span: SourceSpan = constructor_name.span
+				var end_span: SourceLocation = constructor_name.span
 
 				if current_is_symbol(state, st, LeftParenSymbol):
 					args_step: ParsePatternListStep = parse_pattern_list_until(
@@ -3835,7 +3973,7 @@ private pure func parse_simple_pattern(
 					args = args_step.values
 
 					if right_step.matched:
-						end_span = materialize_span(state, right_step.span)
+						end_span = materialize_location(state, right_step.span)
 
 				result: ParsePatternStep = {
 					index = st,
@@ -3844,7 +3982,7 @@ private pure func parse_simple_pattern(
 						name,
 						constructor_name,
 						args,
-						span_cover(name.span, end_span),
+						location_cover(name.span, end_span),
 					)
 				}
 				result
@@ -3869,8 +4007,8 @@ private pure func parse_simple_pattern(
 					"expected `)` after constructor pattern",
 				)
 
-				end_span: SourceSpan = if right_step.matched:
-					materialize_span(state, right_step.span)
+				end_span: SourceLocation = if right_step.matched:
+					materialize_location(state, right_step.span)
 				else:
 					name.span
 
@@ -3880,7 +4018,7 @@ private pure func parse_simple_pattern(
 					value = ParsedConstructorPattern(
 						name,
 						args_step.values,
-						span_cover(name.span, end_span),
+						location_cover(name.span, end_span),
 					)
 				}
 				result
@@ -3961,9 +4099,9 @@ private pure func parse_simple_pattern(
 							diagnostics = diagnostics,
 							value = ParsedIntPattern(
 								"-" + current_text(state, next_index),
-								span_cover(
+								location_cover(
 									span,
-									current_span(state, next_index),
+									current_location(state, next_index),
 								),
 							)
 						}
@@ -3973,14 +4111,15 @@ private pure func parse_simple_pattern(
 							diagnostics = diagnostics,
 							value = ParsedFloatPattern(
 								"-" + current_text(state, next_index),
-								span_cover(
+								location_cover(
 									span,
-									current_span(state, next_index),
+									current_location(state, next_index),
 								),
 							)
 						}
 					_:
 						next_state_diag: List[ParseDiagnostic] = add_expected_error(
+							state,
 							diagnostics,
 							span,
 							"expected numeric literal after `-` in pattern",
@@ -3996,6 +4135,7 @@ private pure func parse_simple_pattern(
 			else:
 				next_state: Int = index
 				next_state_diag: List[ParseDiagnostic] = add_expected_error(
+					state,
 					diagnostics,
 					span,
 					"expected pattern",
@@ -4053,6 +4193,7 @@ private pure func parse_simple_pattern(
 		_:
 			next_state: Int = index
 			next_state_diag: List[ParseDiagnostic] = add_expected_error(
+				state,
 				diagnostics,
 				span,
 				"expected pattern",
@@ -4081,7 +4222,7 @@ private pure func parse_pattern(
 	var st: Int = first_step.index
 	var st_diag: List[ParseDiagnostic] = first_step.diagnostics
 	var patterns: List[ParsedPattern] = [first_step.value]
-	var end_span: SourceSpan = parsed_pattern_span(first_step.value)
+	var end_span: SourceLocation = parsed_pattern_location(first_step.value)
 
 	while current_is_symbol(state, st, PipeSymbol) and not current_is_eof(state, st):
 		next_step: ParsePatternStep = parse_simple_pattern(
@@ -4092,7 +4233,7 @@ private pure func parse_pattern(
 		patterns = patterns.append(next_step.value)
 		st = next_step.index
 		st_diag = next_step.diagnostics
-		end_span = parsed_pattern_span(next_step.value)
+		end_span = parsed_pattern_location(next_step.value)
 
 	if patterns.length() == 1:
 		first_step
@@ -4102,45 +4243,63 @@ private pure func parse_pattern(
 			diagnostics = st_diag,
 			value = ParsedOrPattern(
 				patterns,
-				span_cover(parsed_pattern_span(first_step.value), end_span),
+				location_cover(parsed_pattern_location(first_step.value), end_span),
 			)
 		}
 
 
-private pure func last_expr_span(items: List[ParsedExpr], fallback: SourceSpan) -> SourceSpan:
-	var span: SourceSpan = fallback
+private pure func last_expr_location(
+	items: List[ParsedExpr],
+	fallback: SourceLocation,
+) -> SourceLocation:
+	var span: SourceLocation = fallback
 
 	for item in items:
-		span = parsed_expr_span(item)
+		span = parsed_expr_location(item)
 
 	span
 
 
-private pure func first_expr_span(items: List[ParsedExpr], fallback: SourceSpan) -> SourceSpan:
+private pure func first_expr_location(
+	items: List[ParsedExpr],
+	fallback: SourceLocation,
+) -> SourceLocation:
 	match items.get(0):
 		Some(item):
-			parsed_expr_span(item)
+			parsed_expr_location(item)
 		None:
 			fallback
+
+
+private pure func current_token_is_indented_past_anchor(
+	state: ParserInput,
+	index: Int,
+	header: Cursor,
+) -> Bool:
+	(
+		not current_is_eof(state, index)
+		and not current_is_dedent(state, index)
+		and state.start_lines.get_or(index, 0) > header.line
+		and state.start_columns.get_or(index, 0) > header.column
+	)
 
 
 private pure func current_token_is_indented_past(
 	state: ParserInput,
 	index: Int,
-	header_span: SourceSpan,
+	header_span: SourceLocation,
 ) -> Bool:
-	(
-		not current_is_eof(state, index)
-		and not current_is_dedent(state, index)
-		and state.start_lines.get_or(index, 0) > header_span.start_line
-		and state.start_columns.get_or(index, 0) > header_span.start_column
+	current_token_is_indented_past_anchor(
+		state,
+		index,
+		parser_cursor_at_location_start(state, header_span),
 	)
 
 
 private pure func consume_block_indent(
 	state: ParserInput,
 	index: Int,
-	header_span: SourceSpan,
+	header_span: SourceLocation,
 ) -> ParserStep:
 	st: Int = skip_newlines(state, index)
 
@@ -4162,14 +4321,15 @@ private pure func parse_statement_list(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	header_span: SourceSpan,
+	header_span: SourceLocation,
 ) -> ParseExprListStep:
+	header: Cursor = parser_cursor_at_location_start(state, header_span)
 	var st: Int = skip_newlines(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
 	var values: List[ParsedExpr] = []
 
 	while (
-		current_token_is_indented_past(state, st, header_span)
+		current_token_is_indented_past_anchor(state, st, header)
 		and not current_is_block_end(state, st)
 	):
 		before_index: Int = st
@@ -4180,7 +4340,7 @@ private pure func parse_statement_list(
 
 		if (
 			st == before_index
-			and current_token_is_indented_past(state, st, header_span)
+			and current_token_is_indented_past_anchor(state, st, header)
 			and not current_is_block_end(state, st)
 		):
 			st = advance_parser(state, st)
@@ -4196,7 +4356,7 @@ private pure func parse_indented_block_body(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 ) -> ParseExprStep:
 	__step_2: ParserStep = consume_block_indent(state, index, start_span)
 	__step_2_diagnostics: List[ParseDiagnostic] = expect_indent_diagnostics(
@@ -4211,8 +4371,8 @@ private pure func parse_indented_block_body(
 	st = items_step.index
 	st_diag = items_step.diagnostics
 
-	block_start_span: SourceSpan = first_expr_span(items_step.values, start_span)
-	block_end_span: SourceSpan = last_expr_span(items_step.values, block_start_span)
+	block_start_span: SourceLocation = first_expr_location(items_step.values, start_span)
+	block_end_span: SourceLocation = last_expr_location(items_step.values, block_start_span)
 
 	if current_is_dedent(state, st):
 		__step_3: ParserStep = expect_dedent(state, st)
@@ -4229,7 +4389,7 @@ private pure func parse_indented_block_body(
 		diagnostics = st_diag,
 		value = ParsedBlockExpr(
 			items_step.values,
-			span_cover(block_start_span, block_end_span),
+			location_cover(block_start_span, block_end_span),
 		)
 	}
 
@@ -4238,7 +4398,7 @@ private pure func parse_block_after_colon(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 ) -> ParseExprStep:
 	newline_step: ParserStep = expect_newline(state, index)
 	newline_step_diagnostics: List[ParseDiagnostic] = expect_newline_diagnostics(
@@ -4254,9 +4414,9 @@ private pure func parse_if_expr_with_header_span(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	header_span: SourceSpan,
+	header_span: SourceLocation,
 ) -> ParseExprStep:
-	start_span: SourceSpan = current_span(state, index)
+	start_span: SourceLocation = current_location(state, index)
 	cond_step: ParseExprStep = parse_expression(
 		state,
 		advance_parser(state, index),
@@ -4280,10 +4440,10 @@ private pure func parse_if_expr_with_header_span(
 	var st: Int = then_step.index
 	var st_diag: List[ParseDiagnostic] = then_step.diagnostics
 	var else_branch: Option[ParsedExpr] = None
-	var end_span: SourceSpan = parsed_expr_span(then_step.value)
+	var end_span: SourceLocation = parsed_expr_location(then_step.value)
 
 	if current_is_keyword(state, st, ElseKeyword):
-		else_span: SourceSpan = current_span(state, st)
+		else_span: SourceLocation = current_location(state, st)
 		st = advance_parser(state, st)
 
 		if current_is_keyword(state, st, IfKeyword):
@@ -4296,7 +4456,7 @@ private pure func parse_if_expr_with_header_span(
 			else_branch = Some(else_if_step.value)
 			st = else_if_step.index
 			st_diag = else_if_step.diagnostics
-			end_span = parsed_expr_span(else_if_step.value)
+			end_span = parsed_expr_location(else_if_step.value)
 		else:
 			else_colon_step: ParseSymbolStep = expect_symbol(state, st, ColonSymbol)
 			else_colon_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
@@ -4315,7 +4475,7 @@ private pure func parse_if_expr_with_header_span(
 			else_branch = Some(else_step.value)
 			st = else_step.index
 			st_diag = else_step.diagnostics
-			end_span = parsed_expr_span(else_step.value)
+			end_span = parsed_expr_location(else_step.value)
 
 	{
 		index = st,
@@ -4324,7 +4484,7 @@ private pure func parse_if_expr_with_header_span(
 			cond_step.value,
 			then_step.value,
 			else_branch,
-			span_cover(start_span, end_span),
+			location_cover(start_span, end_span),
 		)
 	}
 
@@ -4349,21 +4509,21 @@ private pure func parse_match_case(
 			state,
 			colon_step.index,
 			colon_step_diagnostics,
-			parsed_pattern_span(pattern_step.value),
+			parsed_pattern_location(pattern_step.value),
 		)
 	else if current_is_keyword(state, colon_step.index, MatchKeyword):
 		parse_match_expr_with_header_span(
 			state,
 			colon_step.index,
 			colon_step_diagnostics,
-			parsed_pattern_span(pattern_step.value),
+			parsed_pattern_location(pattern_step.value),
 		)
 	else if current_is_keyword(state, colon_step.index, IfKeyword):
 		parse_if_expr_with_header_span(
 			state,
 			colon_step.index,
 			colon_step_diagnostics,
-			parsed_pattern_span(pattern_step.value),
+			parsed_pattern_location(pattern_step.value),
 		)
 	else:
 		parse_statement(state, colon_step.index, colon_step_diagnostics)
@@ -4374,9 +4534,9 @@ private pure func parse_match_case(
 		value = {
 			pattern = pattern_step.value,
 			body = body_step.value,
-			span = span_cover(
-				parsed_pattern_span(pattern_step.value),
-				parsed_expr_span(body_step.value),
+			span = location_cover(
+				parsed_pattern_location(pattern_step.value),
+				parsed_expr_location(body_step.value),
 			)
 		}
 	}
@@ -4386,14 +4546,15 @@ private pure func parse_match_case_list(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	header_span: SourceSpan,
+	header_span: SourceLocation,
 ) -> ParseMatchCaseListStep:
+	header: Cursor = parser_cursor_at_location_start(state, header_span)
 	var st: Int = skip_newlines(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
 	var cases: List[ParsedMatchCase] = []
 
 	while (
-		current_token_is_indented_past(state, st, header_span)
+		current_token_is_indented_past_anchor(state, st, header)
 		and not current_is_block_end(state, st)
 	):
 		before_index: Int = st
@@ -4404,7 +4565,7 @@ private pure func parse_match_case_list(
 
 		if (
 			st == before_index
-			and current_token_is_indented_past(state, st, header_span)
+			and current_token_is_indented_past_anchor(state, st, header)
 			and not current_is_block_end(state, st)
 		):
 			st = advance_parser(state, st)
@@ -4420,9 +4581,9 @@ private pure func parse_match_expr_with_header_span(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	header_span: SourceSpan,
+	header_span: SourceLocation,
 ) -> ParseExprStep:
-	start_span: SourceSpan = current_span(state, index)
+	start_span: SourceLocation = current_location(state, index)
 	scrutinee_step: ParseExprStep = parse_expression(
 		state,
 		advance_parser(state, index),
@@ -4458,8 +4619,8 @@ private pure func parse_match_expr_with_header_span(
 	st = cases_step.index
 	st_diag = cases_step.diagnostics
 
-	end_span: SourceSpan = if current_is_dedent(state, st):
-		current_span(state, st)
+	end_span: SourceLocation = if current_is_dedent(state, st):
+		current_location(state, st)
 	else:
 		start_span
 
@@ -4479,7 +4640,7 @@ private pure func parse_match_expr_with_header_span(
 		value = ParsedMatchExpr(
 			scrutinee_step.value,
 			cases_step.values,
-			span_cover(start_span, end_span),
+			location_cover(start_span, end_span),
 		)
 	}
 
@@ -4488,7 +4649,7 @@ private pure func parse_select_receive_arm(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 ) -> ParseSelectArmStep:
 	binder_step: ParseIdentifierStep = parse_select_receive_identifier_expected(
 		state,
@@ -4528,7 +4689,7 @@ private pure func parse_select_receive_arm(
 		value = {
 			kind = ParsedSelectReceiveArm(binder_step.value, channel_step.value),
 			body = body_step.value,
-			span = span_cover(start_span, parsed_expr_span(body_step.value))
+			span = location_cover(start_span, parsed_expr_location(body_step.value))
 		}
 	}
 
@@ -4537,7 +4698,7 @@ private pure func parse_select_sealed_arm(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 ) -> ParseSelectArmStep:
 	channel_step: ParseExprStep = parse_expression(
 		state,
@@ -4566,7 +4727,7 @@ private pure func parse_select_sealed_arm(
 		value = {
 			kind = ParsedSelectSealedArm(channel_step.value),
 			body = body_step.value,
-			span = span_cover(start_span, parsed_expr_span(body_step.value))
+			span = location_cover(start_span, parsed_expr_location(body_step.value))
 		}
 	}
 
@@ -4575,7 +4736,7 @@ private pure func parse_select_after_arm(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 ) -> ParseSelectArmStep:
 	var st: Int = advance_parser(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
@@ -4611,7 +4772,7 @@ private pure func parse_select_after_arm(
 		value = {
 			kind = ParsedSelectAfterArm(timeout_step.value),
 			body = body_step.value,
-			span = span_cover(start_span, parsed_expr_span(body_step.value))
+			span = location_cover(start_span, parsed_expr_location(body_step.value))
 		}
 	}
 
@@ -4621,7 +4782,7 @@ private pure func parse_select_arm(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 ) -> ParseSelectArmStep:
-	start_span: SourceSpan = current_span(state, index)
+	start_span: SourceLocation = current_location(state, index)
 
 	if current_is_keyword(state, index, SealedKeyword):
 		parse_select_sealed_arm(state, index, diagnostics, start_span)
@@ -4638,14 +4799,15 @@ private pure func parse_select_arm_list(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	header_span: SourceSpan,
+	header_span: SourceLocation,
 ) -> ParseSelectArmListStep:
+	header: Cursor = parser_cursor_at_location_start(state, header_span)
 	var st: Int = skip_newlines(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
 	var values: List[ParsedSelectArm] = []
 
 	while (
-		current_token_is_indented_past(state, st, header_span)
+		current_token_is_indented_past_anchor(state, st, header)
 		and not current_is_block_end(state, st)
 	):
 		before_index: Int = st
@@ -4656,7 +4818,7 @@ private pure func parse_select_arm_list(
 
 		if (
 			st == before_index
-			and current_token_is_indented_past(state, st, header_span)
+			and current_token_is_indented_past_anchor(state, st, header)
 			and not current_is_block_end(state, st)
 		):
 			st = advance_parser(state, st)
@@ -4672,9 +4834,9 @@ private pure func parse_select_expr_with_header_span(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	header_span: SourceSpan,
+	header_span: SourceLocation,
 ) -> ParseExprStep:
-	start_span: SourceSpan = current_span(state, index)
+	start_span: SourceLocation = current_location(state, index)
 	var st: Int = advance_parser(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
 	colon_step: ParseSymbolStep = expect_symbol(state, st, ColonSymbol)
@@ -4706,8 +4868,8 @@ private pure func parse_select_expr_with_header_span(
 	st = arms_step.index
 	st_diag = arms_step.diagnostics
 
-	end_span: SourceSpan = if current_is_dedent(state, st):
-		current_span(state, st)
+	end_span: SourceLocation = if current_is_dedent(state, st):
+		current_location(state, st)
 	else:
 		start_span
 
@@ -4726,7 +4888,7 @@ private pure func parse_select_expr_with_header_span(
 		diagnostics = st_diag,
 		value = ParsedSelectExpr(
 			arms_step.values,
-			span_cover(start_span, end_span),
+			location_cover(start_span, end_span),
 		)
 	}
 
@@ -4736,7 +4898,7 @@ private pure func parse_debug_block_expr(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 ) -> ParseExprStep:
-	start_span: SourceSpan = current_span(state, index)
+	start_span: SourceLocation = current_location(state, index)
 	colon_step: ParseSymbolStep = expect_symbol(
 		state,
 		advance_parser(state, index),
@@ -4761,7 +4923,7 @@ private pure func parse_debug_block_expr(
 		diagnostics = body_step.diagnostics,
 		value = ParsedDebugBlockExpr(
 			body_step.value,
-			span_cover(start_span, parsed_expr_span(body_step.value)),
+			location_cover(start_span, parsed_expr_location(body_step.value)),
 		)
 	}
 
@@ -4803,7 +4965,7 @@ private pure func parse_with_error_map_opt(
 			value = Some({
 				name = name_step.value,
 				value = value_step.value,
-				span = span_cover(name_step.value.span, parsed_expr_span(value_step.value)),
+				span = location_cover(name_step.value.span, parsed_expr_location(value_step.value)),
 			})
 		}
 	else:
@@ -4865,11 +5027,11 @@ private pure func parse_with_binding(
 	st = error_map_step.index
 	st_diag = error_map_step.diagnostics
 
-	end_span: SourceSpan = match error_map_step.value:
+	end_span: SourceLocation = match error_map_step.value:
 		Some(error_map):
 			error_map.span
 		None:
-			parsed_expr_span(value_step.value)
+			parsed_expr_location(value_step.value)
 
 	{
 		index = st,
@@ -4880,16 +5042,18 @@ private pure func parse_with_binding(
 			value = value_step.value,
 			kind = kind,
 			error_map = error_map_step.value,
-			span = span_cover(name_step.value.span, end_span)
+			span = location_cover(name_step.value.span, end_span)
 		}
 	}
 
 
 private pure func add_with_multi_binding_error(
+	state: ParserInput,
 	diagnostics: List[ParseDiagnostic],
-	span: SourceSpan,
+	span: SourceLocation,
 ) -> List[ParseDiagnostic]:
 	add_expected_error(
+		state,
 		diagnostics,
 		span,
 		(
@@ -4906,7 +5070,7 @@ private pure func parse_with_expr(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 ) -> ParseExprStep:
-	start_span: SourceSpan = current_span(state, index)
+	start_span: SourceLocation = current_location(state, index)
 	binding_step: ParseWithBindingStep = parse_with_binding(
 		state,
 		advance_parser(state, index),
@@ -4917,8 +5081,9 @@ private pure func parse_with_expr(
 
 	if current_is_symbol(state, st, CommaSymbol):
 		st_diag = add_with_multi_binding_error(
+			state,
 			st_diag,
-			current_span(state, st),
+			current_location(state, st),
 		)
 
 		while (
@@ -4947,8 +5112,8 @@ private pure func parse_with_expr(
 		ParsedBlockExpr(items, span):
 			ParsedBlockExpr(
 				items,
-				span_cover(
-					first_expr_span(items, span),
+				location_cover(
+					first_expr_location(items, span),
 					span,
 				),
 			)
@@ -4961,7 +5126,7 @@ private pure func parse_with_expr(
 		value = ParsedWithExpr(
 			binding_step.value,
 			body,
-			span_cover(start_span, parsed_expr_span(body)),
+			location_cover(start_span, parsed_expr_location(body)),
 		)
 	}
 
@@ -5000,7 +5165,7 @@ private pure func parse_concurrent_param(
 		value = {
 			name = name_step.value,
 			value = value_step.value,
-			span = span_cover(name_step.value.span, parsed_expr_span(value_step.value))
+			span = location_cover(name_step.value.span, parsed_expr_location(value_step.value))
 		}
 	}
 
@@ -5017,8 +5182,9 @@ private pure func parse_concurrent_param_list_after_left_paren(
 
 	if current_is_symbol(state, st, RightParenSymbol):
 		st_diag = add_expected_error(
+			state,
 			st_diag,
-			current_span(state, st),
+			current_location(state, st),
 			"expected concurrent parameter",
 			[EXPECTED_CONCURRENT_PARAM],
 			Some(empty_help),
@@ -5042,8 +5208,9 @@ private pure func parse_concurrent_param_list_after_left_paren(
 				parsing_params = False
 			else:
 				st_diag = add_expected_error(
+					state,
 					st_diag,
-					current_span(state, st),
+					current_location(state, st),
 					"expected `, ` between concurrent parameters",
 					[","],
 					None,
@@ -5064,7 +5231,7 @@ private pure func parse_concurrent_block_expr(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 ) -> ParseExprStep:
-	start_span: SourceSpan = current_span(state, index)
+	start_span: SourceLocation = current_location(state, index)
 	var st: Int = advance_parser(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
 	var params: List[ParsedConcurrentParam] = []
@@ -5109,7 +5276,7 @@ private pure func parse_concurrent_block_expr(
 		value = ParsedConcurrentBlockExpr(
 			params,
 			body_step.value,
-			span_cover(start_span, parsed_expr_span(body_step.value)),
+			location_cover(start_span, parsed_expr_location(body_step.value)),
 		)
 	}
 
@@ -5120,8 +5287,8 @@ private pure func parse_concurrent_for_tail(
 	diagnostics: List[ParseDiagnostic],
 	binder: ParsedIdentifier,
 	iterable: ParsedExpr,
-	start_span: SourceSpan,
-	header_span: SourceSpan,
+	start_span: SourceLocation,
+	header_span: SourceLocation,
 ) -> ParseExprStep:
 	var st: Int = advance_parser(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
@@ -5147,8 +5314,9 @@ private pure func parse_concurrent_for_tail(
 		st_diag = right_step_diagnostics
 	else:
 		st_diag = add_expected_error(
+			state,
 			st_diag,
-			current_span(state, st),
+			current_location(state, st),
 			"expected `(` after concurrently",
 			["("],
 			Some("write `for x in xs concurrently(limit: N):`"),
@@ -5177,7 +5345,7 @@ private pure func parse_concurrent_for_tail(
 			iterable,
 			params,
 			body_step.value,
-			span_cover(start_span, parsed_expr_span(body_step.value)),
+			location_cover(start_span, parsed_expr_location(body_step.value)),
 		)
 	}
 
@@ -5200,7 +5368,7 @@ private pure func parse_tuple_binder_after_left_paren(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 	mode: TupleBinderIdentifierMode,
 	item_expected: String,
 	comma_message: String,
@@ -5210,7 +5378,7 @@ private pure func parse_tuple_binder_after_left_paren(
 	var st: Int = index
 	var st_diag: List[ParseDiagnostic] = diagnostics
 	var values: List[ParsedIdentifier] = []
-	var end_span: SourceSpan = start_span
+	var end_span: SourceLocation = start_span
 
 	first_step: ParseIdentifierStep = parse_tuple_binder_identifier_expected(
 		state,
@@ -5241,8 +5409,9 @@ private pure func parse_tuple_binder_after_left_paren(
 		while parsing_values and not current_is_eof(state, st):
 			if current_is_symbol(state, st, RightParenSymbol):
 				st_diag = add_expected_error(
+					state,
 					st_diag,
-					current_span(state, st),
+					current_location(state, st),
 					missing_after_comma_message,
 					[item_expected],
 					None,
@@ -5281,19 +5450,20 @@ private pure func parse_tuple_binder_after_left_paren(
 	st_diag = right_step_diagnostics
 
 	if right_step.matched:
-		end_span = materialize_span(state, right_step.span)
+		end_span = materialize_location(state, right_step.span)
 
 	if values.length() < 2 or values.length() > 4:
 		st_diag = add_tuple_arity_error(
+			state,
 			st_diag,
-			span_cover(start_span, end_span),
+			location_cover(start_span, end_span),
 		)
 
 	{
 		index = st,
 		diagnostics = st_diag,
 		values = values,
-		span = span_cover(start_span, end_span)
+		span = location_cover(start_span, end_span)
 	}
 
 
@@ -5301,7 +5471,7 @@ private pure func parse_for_tuple_binder_after_left_paren(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 ) -> ParseForBinderStep:
 	binder_step: ParseTupleBinderStep = parse_tuple_binder_after_left_paren(
 		state,
@@ -5332,7 +5502,7 @@ private pure func parse_for_binder(
 			state,
 			advance_parser(state, index),
 			diagnostics,
-			current_span(state, index),
+			current_location(state, index),
 		)
 	else:
 		name_step: ParseIdentifierStep = parse_binder_identifier_expected(
@@ -5354,7 +5524,7 @@ private pure func parse_while_expr(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 ) -> ParseExprStep:
-	start_span: SourceSpan = current_span(state, index)
+	start_span: SourceLocation = current_location(state, index)
 	cond_step: ParseExprStep = parse_expression(
 		state,
 		advance_parser(state, index),
@@ -5382,7 +5552,7 @@ private pure func parse_while_expr(
 		value = ParsedWhileExpr(
 			cond_step.value,
 			body_step.value,
-			span_cover(start_span, parsed_expr_span(body_step.value)),
+			location_cover(start_span, parsed_expr_location(body_step.value)),
 		)
 	}
 
@@ -5391,9 +5561,9 @@ private pure func parse_for_expr_with_header_span(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	header_span: SourceSpan,
+	header_span: SourceLocation,
 ) -> ParseExprStep:
-	start_span: SourceSpan = current_span(state, index)
+	start_span: SourceLocation = current_location(state, index)
 	binder_step: ParseForBinderStep = parse_for_binder(
 		state,
 		advance_parser(state, index),
@@ -5426,8 +5596,9 @@ private pure func parse_for_expr_with_header_span(
 			ParsedForTupleBinder(_, _):
 				error_state: Int = iter_step.index
 				error_state_diag: List[ParseDiagnostic] = add_expected_error(
+					state,
 					iter_step.diagnostics,
-					current_span(state, iter_step.index),
+					current_location(state, iter_step.index),
 					"`for ... concurrently` requires a single loop variable",
 					["loop variable"],
 					Some("write `for item in items concurrently(limit: N):`"),
@@ -5464,7 +5635,7 @@ private pure func parse_for_expr_with_header_span(
 				binder_step.value,
 				iter_step.value,
 				body_step.value,
-				span_cover(start_span, parsed_expr_span(body_step.value)),
+				location_cover(start_span, parsed_expr_location(body_step.value)),
 			)
 		}
 
@@ -5474,7 +5645,7 @@ private pure func parse_var_decl_statement(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 ) -> ParseExprStep:
-	start_span: SourceSpan = current_span(state, index)
+	start_span: SourceLocation = current_location(state, index)
 	name_step: ParseIdentifierStep = parse_binder_identifier_expected(
 		state,
 		advance_parser(state, index),
@@ -5512,7 +5683,7 @@ private pure func parse_var_decl_statement(
 			type_step.value,
 			value_step.value,
 			True,
-			span_cover(start_span, parsed_expr_span(value_step.value)),
+			location_cover(start_span, parsed_expr_location(value_step.value)),
 		)
 	}
 
@@ -5542,7 +5713,7 @@ private pure func parse_named_assignment_tail(
 						Some(ty),
 						value_step.value,
 						False,
-						span_cover(name.span, parsed_expr_span(value_step.value)),
+						location_cover(name.span, parsed_expr_location(value_step.value)),
 					)
 				}
 			None:
@@ -5552,7 +5723,7 @@ private pure func parse_named_assignment_tail(
 					value = ParsedAssignExpr(
 						name,
 						value_step.value,
-						span_cover(name.span, parsed_expr_span(value_step.value)),
+						location_cover(name.span, parsed_expr_location(value_step.value)),
 					)
 				}
 	else if current_is_symbol(state, index, QuestionEqualsSymbol):
@@ -5566,6 +5737,7 @@ private pure func parse_named_assignment_tail(
 		if name.text == "_":
 			next_state: Int = value_step.index
 			next_state_diag: List[ParseDiagnostic] = add_expected_error(
+				state,
 				value_step.diagnostics,
 				name.span,
 				"`?=` cannot bind to `_`; use a name for the unwrapped value",
@@ -5580,7 +5752,7 @@ private pure func parse_named_assignment_tail(
 					name,
 					type_expr,
 					value_step.value,
-					span_cover(name.span, parsed_expr_span(value_step.value)),
+					location_cover(name.span, parsed_expr_location(value_step.value)),
 				)
 			}
 		else:
@@ -5591,7 +5763,7 @@ private pure func parse_named_assignment_tail(
 					name,
 					type_expr,
 					value_step.value,
-					span_cover(name.span, parsed_expr_span(value_step.value)),
+					location_cover(name.span, parsed_expr_location(value_step.value)),
 				)
 			}
 	else:
@@ -5611,14 +5783,15 @@ private pure func parse_named_assignment_tail(
 						name,
 						op,
 						value_step.value,
-						span_cover(name.span, parsed_expr_span(value_step.value)),
+						location_cover(name.span, parsed_expr_location(value_step.value)),
 					)
 				}
 			None:
 				next_state: Int = index
 				next_state_diag: List[ParseDiagnostic] = add_expected_error(
+					state,
 					diagnostics,
-					current_span(
+					current_location(
 						state,
 						index,
 					),
@@ -5686,7 +5859,7 @@ private pure func parse_tuple_destruct_assignment(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 ) -> ParseExprStep:
-	start_span: SourceSpan = current_span(state, index)
+	start_span: SourceLocation = current_location(state, index)
 	binder_step: ParseTupleBinderStep = parse_tuple_binder_after_left_paren(
 		state,
 		advance_parser(state, index),
@@ -5719,7 +5892,7 @@ private pure func parse_tuple_destruct_assignment(
 		value = ParsedTupleDestructExpr(
 			binder_step.values,
 			value_step.value,
-			span_cover(start_span, parsed_expr_span(value_step.value)),
+			location_cover(start_span, parsed_expr_location(value_step.value)),
 		)
 	}
 
@@ -5748,7 +5921,7 @@ private pure func parse_nested_function_decl_expr(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 ) -> ParseExprStep:
-	start_span: SourceSpan = current_span(state, index)
+	start_span: SourceLocation = current_location(state, index)
 	var st: Int = index
 	var st_diag: List[ParseDiagnostic] = diagnostics
 	var is_pure: Bool = False
@@ -5794,7 +5967,7 @@ private pure func parse_assignment_after_expression(
 					value = ParsedAssignExpr(
 						name,
 						value_step.value,
-						span_cover(name.span, parsed_expr_span(value_step.value)),
+						location_cover(name.span, parsed_expr_location(value_step.value)),
 					)
 				}
 			ParsedSubscriptExpr(target, indices, left_span):
@@ -5812,7 +5985,7 @@ private pure func parse_assignment_after_expression(
 						target,
 						indices,
 						value_step.value,
-						span_cover(left_span, parsed_expr_span(value_step.value)),
+						location_cover(left_span, parsed_expr_location(value_step.value)),
 					)
 				}
 			ParsedFieldAccessExpr(_, _, left_span):
@@ -5824,6 +5997,7 @@ private pure func parse_assignment_after_expression(
 				)
 				next_state: Int = value_step.index
 				next_state_diag: List[ParseDiagnostic] = add_expected_error(
+					state,
 					value_step.diagnostics,
 					left_span,
 					(
@@ -5961,7 +6135,7 @@ private pure func parse_statement(
 			state,
 			index,
 			diagnostics,
-			current_span(state, index),
+			current_location(state, index),
 		)
 	else if current_is_tuple_destruct_assignment_start(state, index):
 		parse_tuple_destruct_assignment(state, index, diagnostics)
@@ -5980,7 +6154,7 @@ private pure func parse_lambda_body(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 	body_intro_start_line: Int,
-	block_anchor_span: SourceSpan,
+	block_anchor_span: SourceLocation,
 ) -> ParseExprStep:
 	if current_is_newline(state, index):
 		parse_block_after_colon(state, index, diagnostics, block_anchor_span)
@@ -5997,9 +6171,9 @@ private pure func parse_lambda_expr_with_header_span(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	header_span: SourceSpan,
+	header_span: SourceLocation,
 ) -> ParseExprStep:
-	start_span: SourceSpan = current_span(state, index)
+	start_span: SourceLocation = current_location(state, index)
 	var st: Int = index
 	var st_diag: List[ParseDiagnostic] = diagnostics
 	var is_pure: Bool = False
@@ -6087,7 +6261,7 @@ private pure func parse_lambda_expr_with_header_span(
 			params_step.values,
 			return_type,
 			body_step.value,
-			span_cover(start_span, parsed_expr_span(body_step.value)),
+			location_cover(start_span, parsed_expr_location(body_step.value)),
 		)
 	}
 
@@ -6097,7 +6271,7 @@ private pure func parse_tuple_tail(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 	first_item: ParsedExpr,
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 ) -> ParseExprStep:
 	var st: Int = index
 	var st_diag: List[ParseDiagnostic] = diagnostics
@@ -6135,15 +6309,16 @@ private pure func parse_tuple_tail(
 	st = right_step.index
 	st_diag = right_step_diagnostics
 
-	end_span: SourceSpan = if right_step.matched:
-		materialize_span(state, right_step.span)
+	end_span: SourceLocation = if right_step.matched:
+		materialize_location(state, right_step.span)
 	else:
-		parsed_expr_span(first_item)
+		parsed_expr_location(first_item)
 
 	if items.length() > 4:
 		st_diag = add_tuple_arity_error(
+			state,
 			st_diag,
-			span_cover(start_span, end_span),
+			location_cover(start_span, end_span),
 		)
 
 	{
@@ -6151,7 +6326,7 @@ private pure func parse_tuple_tail(
 		diagnostics = st_diag,
 		value = ParsedTupleExpr(
 			items,
-			span_cover(start_span, end_span),
+			location_cover(start_span, end_span),
 		)
 	}
 
@@ -6160,7 +6335,7 @@ private pure func parse_parenthesized_or_tuple_expr(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 ) -> ParseExprStep:
 	if current_is_symbol(state, index, RightParenSymbol):
 		right_step: ParseSymbolStep = expect_symbol(state, index, RightParenSymbol)
@@ -6175,7 +6350,12 @@ private pure func parse_parenthesized_or_tuple_expr(
 		{
 			index = right_step.index,
 			diagnostics = right_step_diagnostics,
-			value = ParsedVoidExpr(span_cover(start_span, materialize_span(state, right_step.span)))
+			value = ParsedVoidExpr(
+				location_cover(
+					start_span,
+					materialize_location(state, right_step.span),
+				),
+			)
 		}
 	else:
 		expr_step: ParseExprStep = parse_expression_with_header_span(
@@ -6211,11 +6391,11 @@ private pure func parse_parenthesized_or_tuple_expr(
 				{
 					index = right_step.index,
 					diagnostics = right_step_diagnostics,
-					value = parsed_expr_with_span(
+					value = parsed_expr_with_location(
 						expr_step.value,
-						span_cover(
+						location_cover(
 							start_span,
-							materialize_span(state, right_step.span),
+							materialize_location(state, right_step.span),
 						),
 					)
 				}
@@ -6280,7 +6460,7 @@ private pure func parse_record_expr_field(
 		value = {
 			name = name_step.value,
 			value = value_step.value,
-			span = span_cover(name_step.value.span, parsed_expr_span(value_step.value))
+			span = location_cover(name_step.value.span, parsed_expr_location(value_step.value))
 		}
 	}
 
@@ -6329,7 +6509,7 @@ private pure func parse_record_literal_expr(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 ) -> ParseExprStep:
 	fields_step: ParseRecordExprFieldListStep = parse_record_expr_field_list_until_right_brace(
 		state,
@@ -6346,8 +6526,8 @@ private pure func parse_record_literal_expr(
 		"expected `}` after record literal",
 	)
 
-	end_span: SourceSpan = if right_step.matched:
-		materialize_span(state, right_step.span)
+	end_span: SourceLocation = if right_step.matched:
+		materialize_location(state, right_step.span)
 	else:
 		start_span
 
@@ -6356,7 +6536,7 @@ private pure func parse_record_literal_expr(
 		diagnostics = right_step_diagnostics,
 		value = ParsedRecordExpr(
 			fields_step.values,
-			span_cover(start_span, end_span),
+			location_cover(start_span, end_span),
 		)
 	}
 
@@ -6388,7 +6568,7 @@ private pure func parse_dict_entry_after_key(
 		value = {
 			key = key,
 			value = value_step.value,
-			span = span_cover(parsed_expr_span(key), parsed_expr_span(value_step.value))
+			span = location_cover(parsed_expr_location(key), parsed_expr_location(value_step.value))
 		}
 	}
 
@@ -6398,7 +6578,7 @@ private pure func parse_dict_literal_tail(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 	first_key: ParsedExpr,
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 ) -> ParseExprStep:
 	first_entry_step: ParseDictEntryStep = parse_dict_entry_after_key(
 		state,
@@ -6440,17 +6620,17 @@ private pure func parse_dict_literal_tail(
 		"expected `}` after dict literal",
 	)
 
-	end_span: SourceSpan = if right_step.matched:
-		materialize_span(state, right_step.span)
+	end_span: SourceLocation = if right_step.matched:
+		materialize_location(state, right_step.span)
 	else:
-		parsed_expr_span(first_key)
+		parsed_expr_location(first_key)
 
 	{
 		index = right_step.index,
 		diagnostics = right_step_diagnostics,
 		value = ParsedDictExpr(
 			entries,
-			span_cover(start_span, end_span),
+			location_cover(start_span, end_span),
 		)
 	}
 
@@ -6460,7 +6640,7 @@ private pure func parse_vector_literal_tail(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 	first_item: ParsedExpr,
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 ) -> ParseExprStep:
 	var st: Int = index
 	var st_diag: List[ParseDiagnostic] = diagnostics
@@ -6490,17 +6670,17 @@ private pure func parse_vector_literal_tail(
 		"expected `}` after vector literal",
 	)
 
-	end_span: SourceSpan = if right_step.matched:
-		materialize_span(state, right_step.span)
+	end_span: SourceLocation = if right_step.matched:
+		materialize_location(state, right_step.span)
 	else:
-		parsed_expr_span(first_item)
+		parsed_expr_location(first_item)
 
 	{
 		index = right_step.index,
 		diagnostics = right_step_diagnostics,
 		value = ParsedVectorExpr(
 			items,
-			span_cover(start_span, end_span),
+			location_cover(start_span, end_span),
 		)
 	}
 
@@ -6510,7 +6690,7 @@ private pure func parse_record_update_tail(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 	base: ParsedExpr,
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 ) -> ParseExprStep:
 	pipe_step: ParseSymbolStep = expect_symbol(state, index, PipeSymbol)
 	pipe_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
@@ -6535,10 +6715,10 @@ private pure func parse_record_update_tail(
 		"expected `}` after record update",
 	)
 
-	end_span: SourceSpan = if right_step.matched:
-		materialize_span(state, right_step.span)
+	end_span: SourceLocation = if right_step.matched:
+		materialize_location(state, right_step.span)
 	else:
-		parsed_expr_span(base)
+		parsed_expr_location(base)
 
 	{
 		index = right_step.index,
@@ -6546,7 +6726,7 @@ private pure func parse_record_update_tail(
 		value = ParsedRecordUpdateExpr(
 			base,
 			fields_step.values,
-			span_cover(start_span, end_span),
+			location_cover(start_span, end_span),
 		)
 	}
 
@@ -6555,7 +6735,7 @@ private pure func parse_braced_expr(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 ) -> ParseExprStep:
 	st: Int = advance_parser(state, index)
 	st_diag: List[ParseDiagnostic] = diagnostics
@@ -6599,11 +6779,11 @@ private pure func parse_builtin_expr(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 ) -> ParseExprStep:
-	start_span: SourceSpan = current_span(state, index)
+	start_span: SourceLocation = current_location(state, index)
 	var st: Int = advance_parser(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
 	var name: Option[String] = None
-	var end_span: SourceSpan = start_span
+	var end_span: SourceLocation = start_span
 
 	if current_is_symbol(state, st, LeftParenSymbol):
 		st = advance_parser(state, st)
@@ -6611,12 +6791,13 @@ private pure func parse_builtin_expr(
 		match current_tag(state, st):
 			StringLiteralTag:
 				name = Some(current_string_literal_text(state, st))
-				end_span = current_span(state, st)
+				end_span = current_location(state, st)
 				st = advance_parser(state, st)
 			_:
 				st_diag = add_expected_error(
+					state,
 					st_diag,
-					current_span(state, st),
+					current_location(state, st),
 					"expected builtin name",
 					["string literal"],
 					Some("write builtin(\"runtime_helper_name\") or bare builtin"),
@@ -6637,14 +6818,14 @@ private pure func parse_builtin_expr(
 		st_diag = right_step_diagnostics
 
 		if right_step.matched:
-			end_span = materialize_span(state, right_step.span)
+			end_span = materialize_location(state, right_step.span)
 
 	{
 		index = st,
 		diagnostics = st_diag,
 		value = ParsedBuiltinExpr(
 			name,
-			span_cover(start_span, end_span),
+			location_cover(start_span, end_span),
 		)
 	}
 
@@ -6655,7 +6836,7 @@ private pure func parse_opaque_conversion_expr(
 	diagnostics: List[ParseDiagnostic],
 	is_into: Bool,
 ) -> ParseExprStep:
-	start_span: SourceSpan = current_span(state, index)
+	start_span: SourceLocation = current_location(state, index)
 	type_step: ParseTypeStep = parse_type_expr(
 		state,
 		advance_parser(state, index),
@@ -6684,22 +6865,22 @@ private pure func parse_opaque_conversion_expr(
 		"expected `)` after opaque conversion value",
 	)
 
-	end_span: SourceSpan = if right_step.matched:
-		materialize_span(state, right_step.span)
+	end_span: SourceLocation = if right_step.matched:
+		materialize_location(state, right_step.span)
 	else:
-		parsed_expr_span(value_step.value)
+		parsed_expr_location(value_step.value)
 
 	value: ParsedExpr = if is_into:
 		ParsedOpaqueIntoExpr(
 			type_step.value,
 			value_step.value,
-			span_cover(start_span, end_span),
+			location_cover(start_span, end_span),
 		)
 	else:
 		ParsedOpaqueFromExpr(
 			type_step.value,
 			value_step.value,
-			span_cover(start_span, end_span),
+			location_cover(start_span, end_span),
 		)
 
 	{
@@ -6746,8 +6927,9 @@ private pure func reject_removed_opaque_conversion(
 		"from_opaque"
 
 	{ step | diagnostics = add_expected_error(
+			state,
 			step.diagnostics,
-			current_span(state, index),
+			current_location(state, index),
 			"`" + removed_keyword + " Type(...)` opaque conversions have been removed",
 			[explicit_keyword],
 			Some("use `" + explicit_keyword + " Type(...)` instead"),
@@ -6758,9 +6940,10 @@ private pure func parse_primary_expr_missing(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	span: SourceSpan,
+	span: SourceLocation,
 ) -> ParseExprStep:
 	next_state_diag: List[ParseDiagnostic] = add_expected_error(
+		state,
 		diagnostics,
 		span,
 		"expected expression",
@@ -6785,7 +6968,7 @@ private pure func parse_primary_expr(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 ) -> ParseExprStep:
-	span: SourceSpan = current_span(state, index)
+	span: SourceLocation = current_location(state, index)
 
 	match current_tag(state, index):
 		IdentifierTag:
@@ -6937,7 +7120,7 @@ private pure func parse_primary_expr(
 						span,
 					)
 				LeftBracketSymbol:
-					start_span: SourceSpan = span
+					start_span: SourceLocation = span
 					items_step: ParseExprListStep = parse_expr_list_until(
 						state,
 						advance_parser(state, index),
@@ -6959,8 +7142,8 @@ private pure func parse_primary_expr(
 						"expected `]` after list literal",
 					)
 
-					end_span: SourceSpan = if right_step.matched:
-						materialize_span(state, right_step.span)
+					end_span: SourceLocation = if right_step.matched:
+						materialize_location(state, right_step.span)
 					else:
 						start_span
 
@@ -6969,7 +7152,7 @@ private pure func parse_primary_expr(
 						diagnostics = right_step_diagnostics,
 						value = ParsedListExpr(
 							items_step.values,
-							span_cover(start_span, end_span),
+							location_cover(start_span, end_span),
 						)
 					}
 				LeftBraceSymbol:
@@ -7028,7 +7211,7 @@ private pure func parse_postfix_expr(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 	left: ParsedExpr,
-	header_span: SourceSpan,
+	header_span: SourceLocation,
 ) -> ParseExprStep:
 	var st: Int = index
 	var st_diag: List[ParseDiagnostic] = diagnostics
@@ -7086,10 +7269,10 @@ private pure func parse_postfix_expr(
 				expr = ParsedFieldAccessExpr(
 					expr,
 					field_step.value,
-					span_cover(parsed_expr_span(expr), field_step.value.span),
+					location_cover(parsed_expr_location(expr), field_step.value.span),
 				)
 			else if current_is_symbol(state, st, LeftParenSymbol):
-				start_span: SourceSpan = parsed_expr_span(expr)
+				start_span: SourceLocation = parsed_expr_location(expr)
 				args_step: ParseExprListStep = parse_expr_list_until(
 					state,
 					advance_parser(state, st),
@@ -7113,18 +7296,18 @@ private pure func parse_postfix_expr(
 				st = right_step.index
 				st_diag = right_step_diagnostics
 
-				end_span: SourceSpan = if right_step.matched:
-					materialize_span(state, right_step.span)
+				end_span: SourceLocation = if right_step.matched:
+					materialize_location(state, right_step.span)
 				else:
 					start_span
 
 				expr = ParsedCallExpr(
 					expr,
 					args_step.values,
-					span_cover(start_span, end_span),
+					location_cover(start_span, end_span),
 				)
 			else if current_is_symbol(state, st, LeftBracketSymbol):
-				start_span: SourceSpan = parsed_expr_span(expr)
+				start_span: SourceLocation = parsed_expr_location(expr)
 				indices_step: ParseExprListStep = parse_expr_list_until(
 					state,
 					advance_parser(state, st),
@@ -7148,15 +7331,15 @@ private pure func parse_postfix_expr(
 				st = right_step.index
 				st_diag = right_step_diagnostics
 
-				end_span: SourceSpan = if right_step.matched:
-					materialize_span(state, right_step.span)
+				end_span: SourceLocation = if right_step.matched:
+					materialize_location(state, right_step.span)
 				else:
 					start_span
 
 				expr = ParsedSubscriptExpr(
 					expr,
 					indices_step.values,
-					span_cover(start_span, end_span),
+					location_cover(start_span, end_span),
 				)
 			else:
 				parsing_postfix = False
@@ -7172,12 +7355,12 @@ private pure func parse_prefix_expr_with_header_span(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	header_span: SourceSpan,
+	header_span: SourceLocation,
 ) -> ParseExprStep:
 	match current_tag(state, index):
 		SymbolTag:
 			if current_symbol(state, index) == MinusSymbol:
-				span: SourceSpan = current_span(state, index)
+				span: SourceLocation = current_location(state, index)
 				operand_step: ParseExprStep = parse_prefix_expr_with_header_span(
 					state,
 					advance_parser(state, index),
@@ -7190,7 +7373,7 @@ private pure func parse_prefix_expr_with_header_span(
 					value = ParsedUnaryExpr(
 						ParsedNegateOp,
 						operand_step.value,
-						span_cover(span, parsed_expr_span(operand_step.value)),
+						location_cover(span, parsed_expr_location(operand_step.value)),
 					)
 				}
 			else:
@@ -7206,7 +7389,7 @@ private pure func parse_prefix_expr_with_header_span(
 			keyword: Keyword = current_keyword(state, index)
 
 			if keyword == NotKeyword:
-				span: SourceSpan = current_span(state, index)
+				span: SourceLocation = current_location(state, index)
 				operand_step: ParseExprStep = parse_prefix_expr_with_header_span(
 					state,
 					advance_parser(state, index),
@@ -7219,11 +7402,11 @@ private pure func parse_prefix_expr_with_header_span(
 					value = ParsedUnaryExpr(
 						ParsedNotOp,
 						operand_step.value,
-						span_cover(span, parsed_expr_span(operand_step.value)),
+						location_cover(span, parsed_expr_location(operand_step.value)),
 					)
 				}
 			else if keyword == DetachKeyword:
-				span: SourceSpan = current_span(state, index)
+				span: SourceLocation = current_location(state, index)
 				operand_step: ParseExprStep = parse_prefix_expr_with_header_span(
 					state,
 					advance_parser(state, index),
@@ -7235,7 +7418,7 @@ private pure func parse_prefix_expr_with_header_span(
 					diagnostics = operand_step.diagnostics,
 					value = ParsedDetachExpr(
 						operand_step.value,
-						span_cover(span, parsed_expr_span(operand_step.value)),
+						location_cover(span, parsed_expr_location(operand_step.value)),
 					)
 				}
 			else if keyword == FuncKeyword:
@@ -7275,7 +7458,7 @@ private pure func parse_expression_with_header_span(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 	min_precedence: Int,
-	header_span: SourceSpan,
+	header_span: SourceLocation,
 ) -> ParseExprStep:
 	prefix_step: ParseExprStep = parse_prefix_expr_with_header_span(
 		state,
@@ -7301,7 +7484,10 @@ private pure func parse_expression_with_header_span(
 				left = ParsedAscriptionExpr(
 					left,
 					type_step.value,
-					span_cover(parsed_expr_span(left), parsed_type_expr_span(type_step.value)),
+					location_cover(
+						parsed_expr_location(left),
+						parsed_type_expr_location(type_step.value),
+					),
 				)
 				st = type_step.index
 				st_diag = type_step.diagnostics
@@ -7349,7 +7535,7 @@ private pure func parse_expression(
 		index,
 		diagnostics,
 		min_precedence,
-		current_span(state, index),
+		current_location(state, index),
 	)
 
 
@@ -7388,8 +7574,9 @@ private pure func expect_indent_diagnostics(
 		diagnostics
 	else:
 		add_expected_error(
+			state,
 			diagnostics,
-			current_span(state, step.index),
+			current_location(state, step.index),
 			"expected indented function body",
 			["indent"],
 			None,
@@ -7405,8 +7592,9 @@ private pure func expect_dedent_diagnostics(
 		diagnostics
 	else:
 		add_expected_error(
+			state,
 			diagnostics,
-			current_span(state, step.index),
+			current_location(state, step.index),
 			"expected dedent after function body",
 			["dedent"],
 			None,
@@ -7417,7 +7605,7 @@ private pure func parse_function_body(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 ) -> ParseBodyStep:
 	if current_is_newline(state, index):
 		block_step: ParseExprStep = parse_block_after_colon(state, index, diagnostics, start_span)
@@ -7444,9 +7632,9 @@ private pure func parse_function_decl_value(
 	doc: Option[String],
 	is_pure: Bool,
 	annotations: List[ParsedFunctionAnnotation],
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 ) -> ParseFunctionStep:
-	func_span: SourceSpan = current_span(state, index)
+	func_span: SourceLocation = current_location(state, index)
 	var st: Int = advance_parser(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
 	name_step: ParseIdentifierStep = parse_declared_name_expected(
@@ -7485,7 +7673,7 @@ private pure func parse_function_decl_value(
 	st_diag = params_step.diagnostics
 
 	var return_type: Option[ParsedTypeExpr] = None
-	var end_span: SourceSpan = name_step.value.span
+	var end_span: SourceLocation = name_step.value.span
 
 	if current_is_symbol(state, st, ArrowSymbol):
 		st = advance_parser(state, st)
@@ -7493,7 +7681,7 @@ private pure func parse_function_decl_value(
 		return_type = Some(type_step.value)
 		st = type_step.index
 		st_diag = type_step.diagnostics
-		end_span = parsed_type_expr_span(type_step.value)
+		end_span = parsed_type_expr_location(type_step.value)
 
 	dim_constraints_step: ParseDimConstraintListStep = parse_dim_constraints_opt(state, st, st_diag)
 	st = dim_constraints_step.index
@@ -7551,8 +7739,9 @@ private pure func parse_function_decl_value(
 	else:
 		error_state: Int = st
 		error_state_diag: List[ParseDiagnostic] = add_expected_error(
+			state,
 			st_diag,
-			current_span(state, st),
+			current_location(state, st),
 			"expected `:` before function body",
 			[":"],
 			None,
@@ -7568,9 +7757,9 @@ private pure func parse_function_decl_value(
 
 	match body_step.body:
 		Some(body):
-			end_span = parsed_expr_span(body)
+			end_span = parsed_expr_location(body)
 		None:
-			if end_span.start_offset == name_step.value.span.start_offset:
+			if source_locations_equal(end_span, name_step.value.span):
 				end_span = func_span
 
 	{
@@ -7587,7 +7776,7 @@ private pure func parse_function_decl_value(
 			is_pure = is_pure,
 			annotations = annotations,
 			doc = doc,
-			span = span_cover(start_span, end_span)
+			span = location_cover(start_span, end_span)
 		}
 	}
 
@@ -7599,7 +7788,7 @@ private pure func parse_function_decl(
 	doc: Option[String],
 	is_pure: Bool,
 	annotations: List[ParsedFunctionAnnotation],
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 ) -> ParseDeclStep:
 	function_step: ParseFunctionStep = parse_function_decl_value(
 		state,
@@ -7633,7 +7822,7 @@ private pure func parse_import_symbol(
 	var st_diag: List[ParseDiagnostic] = name_step.diagnostics
 	var constructors: List[ParsedIdentifier] = []
 	var symbol_alias: Option[ParsedIdentifier] = None
-	var end_span: SourceSpan = name_step.value.span
+	var end_span: SourceLocation = name_step.value.span
 
 	if current_is_symbol(state, st, LeftParenSymbol):
 		ctors_step: ParseIdentifierListStep = parse_identifier_list_until(
@@ -7650,8 +7839,9 @@ private pure func parse_import_symbol(
 
 		if constructors.length() == 0:
 			ctors_state_diag = add_expected_error(
+				state,
 				ctors_state_diag,
-				current_span(state, ctors_state),
+				current_location(state, ctors_state),
 				"expected constructor name",
 				[EXPECTED_CONSTRUCTOR_NAME],
 				None,
@@ -7669,7 +7859,7 @@ private pure func parse_import_symbol(
 		st_diag = right_step_diagnostics
 
 		if right_step.matched:
-			end_span = materialize_span(state, right_step.span)
+			end_span = materialize_location(state, right_step.span)
 
 	if current_is_keyword(state, st, AsKeyword):
 		alias_step: ParseIdentifierStep = parse_declared_name_expected(
@@ -7690,7 +7880,7 @@ private pure func parse_import_symbol(
 			name = name_step.value,
 			symbol_alias = symbol_alias,
 			constructors = constructors,
-			span = span_cover(name_step.value.span, end_span)
+			span = location_cover(name_step.value.span, end_span)
 		}
 	}
 
@@ -7715,8 +7905,9 @@ private pure func parse_import_symbols_until_line_end(
 			st = advance_parser(state, st)
 		else if not current_is_newline(state, st) and not current_is_block_end(state, st):
 			st_diag = add_expected_error(
+				state,
 				st_diag,
-				current_span(state, st),
+				current_location(state, st),
 				"expected `, ` between imported symbols",
 				[","],
 				None,
@@ -7784,7 +7975,7 @@ private pure func parse_module_path(
 	var st: Int = index
 	var st_diag: List[ParseDiagnostic] = diagnostics
 	var prefix: String = ""
-	var start_span: SourceSpan = current_span(state, index)
+	var start_span: SourceLocation = current_location(state, index)
 
 	if current_is_symbol(state, st, DotSymbol) and next_is_symbol(state, st, SlashSymbol):
 		prefix = "./"
@@ -7812,7 +8003,7 @@ private pure func parse_module_path(
 	st = first_step.index
 	st_diag = first_step.diagnostics
 	var path: String = prefix + first_step.value.text
-	var end_span: SourceSpan = first_step.value.span
+	var end_span: SourceLocation = first_step.value.span
 
 	while current_is_symbol(state, st, SlashSymbol):
 		st = advance_parser(state, st)
@@ -7832,7 +8023,7 @@ private pure func parse_module_path(
 		index = st,
 		diagnostics = st_diag,
 		value = path,
-		span = span_cover(start_span, end_span)
+		span = location_cover(start_span, end_span)
 	}
 
 
@@ -7846,7 +8037,7 @@ private pure func parse_import_item(
 	var st_diag: List[ParseDiagnostic] = path_step.diagnostics
 	var module_alias: Option[ParsedIdentifier] = None
 	var symbols: Option[List[ParsedImportSymbol]] = None
-	var end_span: SourceSpan = path_step.span
+	var end_span: SourceLocation = path_step.span
 
 	if current_is_keyword(state, st, AsKeyword):
 		alias_step: ParseIdentifierStep = parse_declared_name_expected(
@@ -7884,8 +8075,9 @@ private pure func parse_import_item(
 						void
 			else:
 				st_diag = add_expected_error(
+					state,
 					st_diag,
-					current_span(state, st),
+					current_location(state, st),
 					"expected import symbols after `:`",
 					["import symbol"],
 					None,
@@ -7915,7 +8107,7 @@ private pure func parse_import_item(
 			module_path_span = path_step.span,
 			module_alias = module_alias,
 			symbols = symbols,
-			span = span_cover(path_step.span, end_span)
+			span = location_cover(path_step.span, end_span)
 		}
 	}
 
@@ -7950,7 +8142,7 @@ private pure func parse_import_block_decl(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 ) -> ParseDeclStep:
 	var st: Int = advance_parser(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
@@ -7983,8 +8175,8 @@ private pure func parse_import_block_decl(
 	st = items_step.index
 	st_diag = items_step.diagnostics
 
-	end_span: SourceSpan = if current_is_dedent(state, st):
-		current_span(state, st)
+	end_span: SourceLocation = if current_is_dedent(state, st):
+		current_location(state, st)
 	else:
 		start_span
 
@@ -8002,16 +8194,18 @@ private pure func parse_import_block_decl(
 		diagnostics = st_diag,
 		value = ImportBlockParsedDecl(
 			items_step.values,
-			span_cover(start_span, end_span),
+			location_cover(start_span, end_span),
 		)
 	}
 
 
 private pure func add_foreign_block_only_error(
+	state: ParserInput,
 	diagnostics: List[ParseDiagnostic],
-	span: SourceSpan,
+	span: SourceLocation,
 ) -> List[ParseDiagnostic]:
 	add_expected_error(
+		state,
 		diagnostics,
 		span,
 		(
@@ -8047,17 +8241,18 @@ private pure func parse_foreign_block_arg(
 	st = colon_step.index
 	st_diag = colon_step_diagnostics
 	var value: String = ""
-	var end_span: SourceSpan = name_step.value.span
+	var end_span: SourceLocation = name_step.value.span
 
 	match current_tag(state, st):
 		StringLiteralTag:
 			value = current_string_literal_text(state, st)
-			end_span = current_span(state, st)
+			end_span = current_location(state, st)
 			st = advance_parser(state, st)
 		_:
 			st_diag = add_expected_error(
+				state,
 				st_diag,
-				current_span(state, st),
+				current_location(state, st),
 				"expected foreign block argument value",
 				["string literal"],
 				Some("write foreign block arguments as name: \"value\""),
@@ -8072,7 +8267,7 @@ private pure func parse_foreign_block_arg(
 		value = {
 			name = name_step.value,
 			value = value,
-			span = span_cover(name_step.value.span, end_span)
+			span = location_cover(name_step.value.span, end_span)
 		}
 	}
 
@@ -8088,8 +8283,9 @@ private pure func parse_foreign_block_arg_list_until_right_paren(
 
 	if current_is_symbol(state, st, RightParenSymbol):
 		st_diag = add_expected_error(
+			state,
 			st_diag,
-			current_span(state, st),
+			current_location(state, st),
 			"expected foreign block argument",
 			[EXPECTED_FOREIGN_BLOCK_ARG],
 			Some("omit the parentheses for a foreign block with no arguments"),
@@ -8113,8 +8309,9 @@ private pure func parse_foreign_block_arg_list_until_right_paren(
 				parsing_args = False
 			else:
 				st_diag = add_expected_error(
+					state,
 					st_diag,
-					current_span(state, st),
+					current_location(state, st),
 					"expected `, ` between foreign block arguments",
 					[","],
 					None,
@@ -8146,7 +8343,7 @@ private pure func parse_foreign_function_decl(
 ) -> ParseForeignFunctionStep:
 	var st: Int = index
 	var st_diag: List[ParseDiagnostic] = diagnostics
-	start_span: SourceSpan = current_span(state, st)
+	start_span: SourceLocation = current_location(state, st)
 	var is_private: Bool = False
 
 	if current_is_keyword(state, st, PrivateKeyword):
@@ -8207,8 +8404,8 @@ private pure func parse_foreign_function_decl(
 
 	st = params_step.index
 	st_diag = params_step.diagnostics
-	var return_type: ParsedTypeExpr = ParsedMissingType(current_span(state, st))
-	var end_span: SourceSpan = name_step.value.span
+	var return_type: ParsedTypeExpr = ParsedMissingType(current_location(state, st))
+	var end_span: SourceLocation = name_step.value.span
 	arrow_step: ParseSymbolStep = expect_symbol(state, st, ArrowSymbol)
 	arrow_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
@@ -8225,9 +8422,9 @@ private pure func parse_foreign_function_decl(
 		return_type = type_step.value
 		st = type_step.index
 		st_diag = type_step.diagnostics
-		end_span = parsed_type_expr_span(type_step.value)
+		end_span = parsed_type_expr_location(type_step.value)
 	else:
-		end_span = materialize_span(state, arrow_step.span)
+		end_span = materialize_location(state, arrow_step.span)
 
 	var c_name: Option[String] = None
 
@@ -8237,12 +8434,13 @@ private pure func parse_foreign_function_decl(
 		match current_tag(state, st):
 			StringLiteralTag:
 				c_name = Some(current_string_literal_text(state, st))
-				end_span = current_span(state, st)
+				end_span = current_location(state, st)
 				st = advance_parser(state, st)
 			_:
 				st_diag = add_expected_error(
+					state,
 					st_diag,
-					current_span(state, st),
+					current_location(state, st),
 					"expected foreign C function name",
 					["string literal"],
 					Some("write = \"c_function_name\" or omit the C name to use the Blorp name"),
@@ -8262,7 +8460,7 @@ private pure func parse_foreign_function_decl(
 			is_pure = is_pure,
 			is_private = is_private,
 			annotations = annotations_step.values,
-			span = span_cover(start_span, end_span)
+			span = location_cover(start_span, end_span)
 		}
 	}
 
@@ -8290,8 +8488,9 @@ private pure func parse_foreign_function_list(
 			st_diag = function_step.diagnostics
 		else:
 			st_diag = add_expected_error(
+				state,
 				st_diag,
-				current_span(state, st),
+				current_location(state, st),
 				"expected foreign function declaration",
 				["func"],
 				Some("write a bodyless function signature inside the foreign block"),
@@ -8316,14 +8515,18 @@ private pure func parse_foreign_block_decl(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 ) -> ParseDeclStep:
 	var st: Int = advance_parser(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
 
 	if current_is_keyword(state, st, PureKeyword) or current_is_keyword(state, st, FuncKeyword):
 		error_state: Int = st
-		error_state_diag: List[ParseDiagnostic] = add_foreign_block_only_error(st_diag, start_span)
+		error_state_diag: List[ParseDiagnostic] = add_foreign_block_only_error(
+			state,
+			st_diag,
+			start_span,
+		)
 
 		{
 			index = advance_parser(state, error_state),
@@ -8384,8 +8587,8 @@ private pure func parse_foreign_block_decl(
 		st = functions_step.index
 		st_diag = functions_step.diagnostics
 
-		end_span: SourceSpan = if current_is_dedent(state, st):
-			current_span(state, st)
+		end_span: SourceLocation = if current_is_dedent(state, st):
+			current_location(state, st)
 		else:
 			start_span
 
@@ -8404,7 +8607,7 @@ private pure func parse_foreign_block_decl(
 			value = ForeignBlockParsedDecl(
 				args,
 				functions_step.values,
-				span_cover(start_span, end_span),
+				location_cover(start_span, end_span),
 			)
 		}
 
@@ -8436,7 +8639,7 @@ private pure func parse_field_decl(
 		value = {
 			name = name_step.value,
 			type_expr = type_step.value,
-			span = span_cover(name_step.value.span, parsed_type_expr_span(type_step.value))
+			span = location_cover(name_step.value.span, parsed_type_expr_location(type_step.value))
 		}
 	}
 
@@ -8480,7 +8683,7 @@ private pure func parse_record_decl(
 	diagnostics: List[ParseDiagnostic],
 	doc: Option[String],
 	syntax: AggregateDeclarationSyntax,
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 ) -> ParseDeclStep:
 	var st: Int = advance_parser(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
@@ -8547,9 +8750,9 @@ private pure func parse_record_decl(
 			fields = fields_step.values,
 			is_struct = is_struct,
 			doc = doc,
-			span = span_cover(
+			span = location_cover(
 				start_span,
-				materialize_span(state, right_step.span),
+				materialize_location(state, right_step.span),
 			),
 		})
 	}
@@ -8560,7 +8763,7 @@ private pure func parse_variant_identifier_expected(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 ) -> ParseIdentifierStep:
-	span: SourceSpan = current_span(state, index)
+	span: SourceLocation = current_location(state, index)
 
 	match current_tag(state, index):
 		KeywordTag:
@@ -8593,7 +8796,7 @@ private pure func parse_variant_decl(
 	var st: Int = name_step.index
 	var st_diag: List[ParseDiagnostic] = name_step.diagnostics
 	var fields: List[ParsedTypeExpr] = []
-	var end_span: SourceSpan = name_step.value.span
+	var end_span: SourceLocation = name_step.value.span
 
 	if current_is_symbol(state, st, LeftParenSymbol):
 		fields_step: ParseTypeListStep = parse_type_expr_list_until(
@@ -8616,7 +8819,7 @@ private pure func parse_variant_decl(
 		st_diag = right_step_diagnostics
 
 		if right_step.matched:
-			end_span = materialize_span(state, right_step.span)
+			end_span = materialize_location(state, right_step.span)
 
 	{
 		index = st,
@@ -8624,7 +8827,7 @@ private pure func parse_variant_decl(
 		value = {
 			name = name_step.value,
 			fields = fields,
-			span = span_cover(name_step.value.span, end_span)
+			span = location_cover(name_step.value.span, end_span)
 		}
 	}
 
@@ -8661,7 +8864,7 @@ private pure func parse_union_decl(
 	diagnostics: List[ParseDiagnostic],
 	doc: Option[String],
 	is_enum: Bool,
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 ) -> ParseDeclStep:
 	var st: Int = advance_parser(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
@@ -8709,8 +8912,8 @@ private pure func parse_union_decl(
 	st = variants_step.index
 	st_diag = variants_step.diagnostics
 
-	end_span: SourceSpan = if current_is_dedent(state, st):
-		current_span(state, st)
+	end_span: SourceLocation = if current_is_dedent(state, st):
+		current_location(state, st)
 	else:
 		name_step.value.span
 
@@ -8732,7 +8935,7 @@ private pure func parse_union_decl(
 			variants = variants_step.values,
 			is_enum = is_enum,
 			doc = doc,
-			span = span_cover(start_span, end_span),
+			span = location_cover(start_span, end_span),
 		})
 	}
 
@@ -8744,8 +8947,9 @@ private pure func consume_builtin_type_argument_list(
 ) -> ParserRecoveryStep:
 	var st: Int = index
 	var st_diag: List[ParseDiagnostic] = add_expected_error(
+		state,
 		diagnostics,
-		current_span(state, index),
+		current_location(state, index),
 		"builtin type declarations do not take arguments",
 		[],
 		Some("use `resource type Name = builtin(\"cleanup\")` for resource cleanup metadata"),
@@ -8778,7 +8982,7 @@ private pure func parse_builtin_type_decl(
 	diagnostics: List[ParseDiagnostic],
 	doc: Option[String],
 	is_resource: Bool,
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 ) -> ParseDeclStep:
 	var st: Int = if is_resource:
 		advance_parser(state, index)
@@ -8811,7 +9015,7 @@ private pure func parse_builtin_type_decl(
 		EqualSymbol,
 		"expected `=` before builtin type marker",
 	)
-	builtin_span: SourceSpan = current_span(state, equal_step.index)
+	builtin_span: SourceLocation = current_location(state, equal_step.index)
 	builtin_keyword_step: ParserStep = expect_keyword(state, equal_step.index, BuiltinKeyword)
 	builtin_keyword_step_diagnostics: List[ParseDiagnostic] = expect_keyword_diagnostics(
 		state,
@@ -8823,7 +9027,7 @@ private pure func parse_builtin_type_decl(
 	st = builtin_keyword_step.index
 	st_diag = builtin_keyword_step_diagnostics
 	var cleanup: Option[ParsedResourceCleanup] = None
-	var end_span: SourceSpan = builtin_span
+	var end_span: SourceLocation = builtin_span
 
 	if current_is_symbol(state, st, LeftParenSymbol):
 		if is_resource:
@@ -8833,14 +9037,15 @@ private pure func parse_builtin_type_decl(
 				StringLiteralTag:
 					cleanup = Some({
 						builtin_name = current_string_literal_text(state, st),
-						span = current_span(state, st),
+						span = current_location(state, st),
 					})
-					end_span = current_span(state, st)
+					end_span = current_location(state, st)
 					st = advance_parser(state, st)
 				_:
 					st_diag = add_expected_error(
+						state,
 						st_diag,
-						current_span(state, st),
+						current_location(state, st),
 						"expected resource cleanup builtin name",
 						["string literal"],
 						Some("write resource type Name = builtin(\"cleanup_function\")"),
@@ -8861,7 +9066,7 @@ private pure func parse_builtin_type_decl(
 			st_diag = right_step_diagnostics
 
 			if right_step.matched:
-				end_span = materialize_span(state, right_step.span)
+				end_span = materialize_location(state, right_step.span)
 		else:
 			argument_list_step: ParserRecoveryStep = consume_builtin_type_argument_list(
 				state,
@@ -8880,7 +9085,7 @@ private pure func parse_builtin_type_decl(
 			is_resource = is_resource,
 			cleanup = cleanup,
 			doc = doc,
-			span = span_cover(start_span, end_span),
+			span = location_cover(start_span, end_span),
 		})
 	}
 
@@ -8891,7 +9096,7 @@ private pure func parse_type_alias_decl(
 	diagnostics: List[ParseDiagnostic],
 	doc: Option[String],
 	is_opaque: Bool,
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 ) -> ParseDeclStep:
 	var st: Int = advance_parser(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
@@ -8949,7 +9154,7 @@ private pure func parse_type_alias_decl(
 			target = target_step.value,
 			is_opaque = is_opaque,
 			doc = doc,
-			span = span_cover(start_span, parsed_type_expr_span(target_step.value)),
+			span = location_cover(start_span, parsed_type_expr_location(target_step.value)),
 		})
 	}
 
@@ -8962,7 +9167,7 @@ private pure func parse_trait_method(
 	var st: Int = index
 	var st_diag: List[ParseDiagnostic] = diagnostics
 	var is_pure: Bool = False
-	start_span: SourceSpan = current_span(state, st)
+	start_span: SourceLocation = current_location(state, st)
 
 	if current_is_keyword(state, st, PureKeyword):
 		is_pure = True
@@ -9010,7 +9215,7 @@ private pure func parse_trait_method(
 	st_diag = params_step.diagnostics
 	var return_type: Option[ParsedTypeExpr] = None
 	var body: Option[ParsedExpr] = None
-	var end_span: SourceSpan = name_step.value.span
+	var end_span: SourceLocation = name_step.value.span
 
 	if current_is_symbol(state, st, ArrowSymbol):
 		st = advance_parser(state, st)
@@ -9018,7 +9223,7 @@ private pure func parse_trait_method(
 		return_type = Some(type_step.value)
 		st = type_step.index
 		st_diag = type_step.diagnostics
-		end_span = parsed_type_expr_span(type_step.value)
+		end_span = parsed_type_expr_location(type_step.value)
 
 	if current_is_symbol(state, st, ColonSymbol):
 		colon_step: ParseSymbolStep = expect_symbol(state, st, ColonSymbol)
@@ -9041,9 +9246,9 @@ private pure func parse_trait_method(
 
 		match body_step.body:
 			Some(body_expr):
-				end_span = parsed_expr_span(body_expr)
+				end_span = parsed_expr_location(body_expr)
 			None:
-				end_span = materialize_span(state, colon_step.span)
+				end_span = materialize_location(state, colon_step.span)
 
 	{
 		index = st,
@@ -9054,7 +9259,7 @@ private pure func parse_trait_method(
 			return_type = return_type,
 			body = body,
 			is_pure = is_pure,
-			span = span_cover(start_span, end_span)
+			span = location_cover(start_span, end_span)
 		}
 	}
 
@@ -9090,7 +9295,7 @@ private pure func parse_trait_decl(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 	doc: Option[String],
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 ) -> ParseDeclStep:
 	var st: Int = advance_parser(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
@@ -9113,14 +9318,15 @@ private pure func parse_trait_decl(
 	var supertraits: List[ParsedIdentifier] = []
 	var methods: List[ParsedTraitMethodDecl] = []
 	var has_method_block: Bool = False
-	var end_span: SourceSpan = name_step.value.span
+	var end_span: SourceLocation = name_step.value.span
 
 	if current_is_newline(state, st):
 		has_method_block = True
 	else if current_is_block_end(state, st):
 		st_diag = add_expected_error(
+			state,
 			st_diag,
-			current_span(
+			current_location(
 				state,
 				st,
 			),
@@ -9177,7 +9383,7 @@ private pure func parse_trait_decl(
 		st_diag = methods_step.diagnostics
 
 		if current_is_dedent(state, st):
-			end_span = current_span(state, st)
+			end_span = current_location(state, st)
 
 		__step_31: ParserStep = expect_dedent(state, st)
 		__step_31_diagnostics: List[ParseDiagnostic] = expect_dedent_diagnostics(
@@ -9197,7 +9403,7 @@ private pure func parse_trait_decl(
 			supertraits = supertraits,
 			methods = methods,
 			doc = doc,
-			span = span_cover(start_span, end_span),
+			span = location_cover(start_span, end_span),
 		})
 	}
 
@@ -9213,7 +9419,7 @@ private pure func parse_impl_method_list(
 
 	while not current_is_block_end(state, st):
 		before_index: Int = st
-		var method_start_span: SourceSpan = current_span(state, st)
+		var method_start_span: SourceLocation = current_location(state, st)
 		annotations_step: ParseFunctionAnnotationsStep = parse_function_annotations(
 			state,
 			st,
@@ -9222,7 +9428,7 @@ private pure func parse_impl_method_list(
 		)
 
 		if annotations_step.values.length() > 0:
-			method_start_span = current_span(state, st)
+			method_start_span = current_location(state, st)
 
 		st = annotations_step.index
 		st_diag = annotations_step.diagnostics
@@ -9232,7 +9438,7 @@ private pure func parse_impl_method_list(
 			is_pure = True
 
 			if annotations_step.values.length() == 0:
-				method_start_span = current_span(state, st)
+				method_start_span = current_location(state, st)
 
 			st = advance_parser(state, st)
 
@@ -9251,8 +9457,9 @@ private pure func parse_impl_method_list(
 			st_diag = function_step.diagnostics
 		else:
 			st_diag = add_expected_error(
+				state,
 				st_diag,
-				current_span(state, st),
+				current_location(state, st),
 				"expected implementation method",
 				["func"],
 				Some("write a function declaration inside the implements block"),
@@ -9276,7 +9483,7 @@ private pure func parse_impl_decl(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 	doc: Option[String],
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 ) -> ParseDeclStep:
 	var st: Int = advance_parser(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
@@ -9330,10 +9537,10 @@ private pure func parse_impl_decl(
 	st = methods_step.index
 	st_diag = methods_step.diagnostics
 
-	end_span: SourceSpan = if current_is_dedent(state, st):
-		current_span(state, st)
+	end_span: SourceLocation = if current_is_dedent(state, st):
+		current_location(state, st)
 	else:
-		parsed_type_expr_span(for_type_step.value)
+		parsed_type_expr_location(for_type_step.value)
 
 	__step_35: ParserStep = expect_dedent(state, st)
 	__step_35_diagnostics: List[ParseDiagnostic] = expect_dedent_diagnostics(
@@ -9352,7 +9559,7 @@ private pure func parse_impl_decl(
 			for_type = for_type_step.value,
 			methods = methods_step.values,
 			doc = doc,
-			span = span_cover(start_span, end_span),
+			span = location_cover(start_span, end_span),
 		})
 	}
 
@@ -9362,7 +9569,7 @@ private pure func parse_top_level_var_decl(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 	is_mutable: Bool,
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 ) -> ParseDeclStep:
 	var st: Int = if is_mutable:
 		advance_parser(state, index)
@@ -9408,7 +9615,7 @@ private pure func parse_top_level_var_decl(
 			type_expr = type_step.value,
 			value = value_step.value,
 			is_mutable = is_mutable,
-			span = span_cover(start_span, parsed_expr_span(value_step.value)),
+			span = location_cover(start_span, parsed_expr_location(value_step.value)),
 		})
 	}
 
@@ -9418,11 +9625,11 @@ private pure func parse_private_decl(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 	doc: Option[String],
-	start_span: SourceSpan,
+	start_span: SourceLocation,
 ) -> ParseDeclStep:
 	var st: Int = advance_parser(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
-	var inner_start_span: SourceSpan = start_span
+	var inner_start_span: SourceLocation = start_span
 
 	annotations_step: ParseFunctionAnnotationsStep = parse_function_annotations(
 		state,
@@ -9443,8 +9650,9 @@ private pure func parse_private_decl(
 
 	if annotations_step.values.length() > 0 and not current_is_keyword(state, st, FuncKeyword):
 		st_diag = add_expected_error(
+			state,
 			st_diag,
-			current_span(state, st),
+			current_location(state, st),
 			"function annotations must be followed by a function declaration",
 			["func"],
 			Some("move the annotation onto a function declaration, or remove it"),
@@ -9500,7 +9708,7 @@ private pure func parse_private_decl(
 		diagnostics = inner_step.diagnostics,
 		value = PrivateParsedDecl(
 			inner_step.value,
-			span_cover(start_span, parsed_decl_span(inner_step.value)),
+			location_cover(start_span, parsed_decl_location(inner_step.value)),
 		)
 	}
 
@@ -9513,12 +9721,12 @@ private pure func parse_decl(
 	var st: Int = skip_newlines(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
 	var doc: Option[String] = None
-	var start_span: SourceSpan = current_span(state, st)
+	var start_span: SourceLocation = current_location(state, st)
 
 	match current_tag(state, st):
 		DocStringTag:
 			doc = Some(current_text(state, st))
-			start_span = current_span(state, st)
+			start_span = current_location(state, st)
 			st = advance_parser(state, st)
 			st = skip_newlines(state, st)
 		_:
@@ -9532,7 +9740,7 @@ private pure func parse_decl(
 	)
 
 	if annotations_step.values.length() > 0 and doc.is_none():
-		start_span = current_span(state, st)
+		start_span = current_location(state, st)
 
 	st = annotations_step.index
 	st_diag = annotations_step.diagnostics
@@ -9543,14 +9751,15 @@ private pure func parse_decl(
 		is_pure = True
 
 		if doc.is_none() and annotations_step.values.length() == 0:
-			start_span = current_span(state, st)
+			start_span = current_location(state, st)
 
 		st = advance_parser(state, st)
 
 	if annotations_step.values.length() > 0 and not current_is_keyword(state, st, FuncKeyword):
 		st_diag = add_expected_error(
+			state,
 			st_diag,
-			current_span(state, st),
+			current_location(state, st),
 			"function annotations must be followed by a function declaration",
 			["func"],
 			Some("move the annotation onto a function declaration, or remove it"),
@@ -9605,9 +9814,10 @@ private pure func parse_error_decl(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 ) -> ParseDeclStep:
-	error_span: SourceSpan = current_span(state, index)
+	error_span: SourceLocation = current_location(state, index)
 	next_state: Int = index
 	next_state_diag: List[ParseDiagnostic] = add_expected_error(
+		state,
 		diagnostics,
 		error_span,
 		"expected declaration",
@@ -9627,7 +9837,13 @@ private pure func parse_error_decl(
 	}
 
 
-pure func parse_compiler_source(source: SourceFile) -> ParsedProgram:
+-- Parse a synthetic source while storing its authored locations at a caller-
+-- supplied offset in the owning source file. Parser control and diagnostics
+-- remain local to `source`; only retained AST locations are rebased.
+pure func parse_compiler_source_rebased(
+	source: SourceFile,
+	location_offset_delta: Int,
+) -> ParsedProgram:
 	lex_result = lex(source)
 	state: ParserInput = initial_state(
 		source,
@@ -9635,6 +9851,7 @@ pure func parse_compiler_source(source: SourceFile) -> ParsedProgram:
 		lex_result.texts,
 		lex_result.path,
 		lex_result.module_name,
+		location_offset_delta,
 	)
 	var index: Int = skip_newlines(state, 0)
 	var diagnostics: List[ParseDiagnostic] = lex_result.diagnostics
@@ -9655,3 +9872,7 @@ pure func parse_compiler_source(source: SourceFile) -> ParsedProgram:
 		decls = decls,
 		diagnostics = diagnostics
 	}
+
+
+pure func parse_compiler_source(source: SourceFile) -> ParsedProgram:
+	parse_compiler_source_rebased(source, 0)

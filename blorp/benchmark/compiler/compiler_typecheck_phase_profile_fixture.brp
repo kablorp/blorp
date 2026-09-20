@@ -10,6 +10,7 @@ import:
 		ParsedProgram,
 	../../src/compiler/stage_04_modules/loaded_module: ModuleLoadCandidate
 	../../src/compiler/stage_04_modules/module_table:
+		ModuleId,
 		ModuleTable,
 		module_id_table_index,
 		module_table_canonical_path,
@@ -275,7 +276,7 @@ import:
 		accepted_semantic_catalog_constructor_table,
 		accepted_semantic_catalog_field_table,
 	../../src/compiler/stage_06_typecheck/type_system/language_surface_manifest: prelude_type_name
-	../../src/lib/source: SourceSpan
+	../../src/lib/source: SourceLocation, SourceTable, source_location_span, source_table_for_file
 	hash: crc32, hash_combine
 
 
@@ -820,16 +821,40 @@ private pure func fingerprint_add_optional_text(fingerprint: Int, value: Option[
 			fingerprint.fingerprint_add_text("none")
 
 
-private pure func fingerprint_source_span(fingerprint: Int, span: SourceSpan) -> Int:
+private pure func fingerprint_source_span(
+	fingerprint: Int,
+	source_table: SourceTable,
+	span: SourceLocation,
+) -> Int:
+	materialized = source_location_span(source_table, span)
 	fingerprint
-		.fingerprint_add_text(span.path)
-		.fingerprint_add_text(span.module_name)
-		.fingerprint_add_int(span.start_offset)
-		.fingerprint_add_int(span.start_line)
-		.fingerprint_add_int(span.start_column)
-		.fingerprint_add_int(span.end_offset)
-		.fingerprint_add_int(span.end_line)
-		.fingerprint_add_int(span.end_column)
+		.fingerprint_add_text(materialized.path)
+		.fingerprint_add_text(materialized.module_name)
+		.fingerprint_add_int(materialized.start_offset)
+		.fingerprint_add_int(materialized.start_line)
+		.fingerprint_add_int(materialized.start_column)
+		.fingerprint_add_int(materialized.end_offset)
+		.fingerprint_add_int(materialized.end_line)
+		.fingerprint_add_int(materialized.end_column)
+
+
+private pure func indexed_graph_module_source_table(
+	graph: IndexedGraph,
+	module_id: ModuleId,
+) -> Option[SourceTable]:
+	canonical_path ?= module_table_canonical_path(indexed_graph_module_table(graph), module_id)
+	target = indexed_graph_target(graph)
+
+	if prepared_module_canonical_path(target) == canonical_path:
+		Some(source_table_for_file(prepared_module_program(target).source))
+	else:
+		var source_table: Option[SourceTable] = None
+
+		for module in indexed_graph_modules(graph):
+			if prepared_module_canonical_path(module) == canonical_path:
+				source_table = Some(source_table_for_file(prepared_module_program(module).source))
+
+		source_table
 
 
 private pure func source_definition_kind_name(kind: SourceDefinitionKind) -> String:
@@ -850,9 +875,11 @@ private pure func source_definition_kind_name(kind: SourceDefinitionKind) -> Str
 
 private pure func fingerprint_callable_key(
 	fingerprint: Int,
-	module_table: ModuleTable,
+	graph: IndexedGraph,
+	source_table: SourceTable,
 	key: FuncCallableKey,
 ) -> Int:
+	module_table = indexed_graph_module_table(graph)
 	fingerprint_source_span(
 		fingerprint
 			.fingerprint_add_text(
@@ -862,15 +889,18 @@ private pure func fingerprint_callable_key(
 				).get_or("<missing-module>"),
 			)
 			.fingerprint_add_text(func_callable_key_name(key)),
+		source_table,
 		func_callable_key_span(key),
 	)
 
 
 private pure func fingerprint_source_definition_key(
 	fingerprint: Int,
-	module_table: ModuleTable,
+	graph: IndexedGraph,
+	source_table: SourceTable,
 	key: SourceDefinitionKey,
 ) -> Int:
+	module_table = indexed_graph_module_table(graph)
 	fingerprint_source_span(
 		fingerprint
 			.fingerprint_add_text(
@@ -882,6 +912,7 @@ private pure func fingerprint_source_definition_key(
 			.fingerprint_add_text(source_definition_kind_name(source_definition_key_kind(key)))
 			.fingerprint_add_text(source_definition_key_name(key))
 			.fingerprint_add_optional_text(source_definition_key_owner(key)),
+		source_table,
 		source_definition_key_span(key),
 	)
 
@@ -1274,18 +1305,28 @@ private pure func indexed_output_summary(
 		fingerprint = fingerprint_add_text(fingerprint, prepared_module_canonical_path(module))
 
 	for binding in definition_index_all_func_callable_bindings(index):
-		fingerprint = fingerprint_callable_key(
-			fingerprint.fingerprint_add_text("callable"),
-			module_table,
-			binding[0],
-		).fingerprint_add_int(binding[1])
+		match indexed_graph_module_source_table(graph, func_callable_key_module_id(binding[0])):
+			Some(source_table):
+				fingerprint = fingerprint_callable_key(
+					fingerprint.fingerprint_add_text("callable"),
+					graph,
+					source_table,
+					binding[0],
+				).fingerprint_add_int(binding[1])
+			None:
+				fingerprint = fingerprint.fingerprint_add_text("missing-callable-source")
 
 	for binding in definition_index_all_source_definition_bindings(index):
-		fingerprint = fingerprint_source_definition_key(
-			fingerprint.fingerprint_add_text("source"),
-			module_table,
-			binding[0],
-		).fingerprint_add_int(binding[1])
+		match indexed_graph_module_source_table(graph, source_definition_key_module_id(binding[0])):
+			Some(source_table):
+				fingerprint = fingerprint_source_definition_key(
+					fingerprint.fingerprint_add_text("source"),
+					graph,
+					source_table,
+					binding[0],
+				).fingerprint_add_int(binding[1])
+			None:
+				fingerprint = fingerprint.fingerprint_add_text("missing-definition-source")
 
 	callable_count = definition_index_func_callable_id_count(index)
 	source_count = definition_index_source_definition_id_count(index)

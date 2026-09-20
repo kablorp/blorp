@@ -28,6 +28,38 @@ record SourceSpan {
 }
 
 
+-- Dense identity issued by a SourceTable. Locations carry this scalar instead
+-- of copying the source path and module name into every frontend node.
+opaque type SourceFileId = Int
+
+private COMPILER_PRELUDE_FILE_ID: Int = -1
+
+-- SourceLocation is stored in union payloads throughout the frontend. Keep it
+-- pointer-sized so those payloads remain inline: a struct here is boxed by the
+-- backend and restores the per-node allocation this representation removes.
+-- Compiler source files are bounded to less than 2 GiB, leaving one scalar
+-- value outside the authored-location range for the compiler prelude.
+private SOURCE_LOCATION_OFFSET_BASE: Int = 2147483648
+
+private COMPILER_PRELUDE_LOCATION: Int = 4611686018427387904
+
+-- Compact source extent retained by parsed and typed nodes. Authored locations
+-- encode `(start_offset, end_offset)` into one Int; the source file is resolved
+-- through the borrowed SourceTable at the boundary that needs a SourceSpan.
+opaque type SourceLocation = Int
+
+
+private record SourceTableData {
+	source: SourceFile,
+	line_starts: Option[List[Int]]
+}
+
+
+-- A parsed program currently owns exactly one SourceFile. The line-start index
+-- makes location materialization logarithmic in line count plus the length of
+-- the selected line, rather than rescanning from byte zero for every node.
+opaque type SourceTable = SourceTableData
+
 private COMPILER_SOURCE_TAB_WIDTH: Int = 4
 
 
@@ -37,6 +69,198 @@ pure func source_file(path: String, module_name: String, text: String) -> Source
 		module_name = module_name,
 		text = text
 	}
+
+
+private pure func source_file_id(index: Int) -> SourceFileId:
+	into_opaque SourceFileId(index)
+
+
+-- The current frontend owns one source file per parsed program. Parsers can
+-- issue its dense id without constructing the line index used only when a
+-- compact location is later materialized as a SourceSpan.
+pure func singleton_source_file_id() -> SourceFileId:
+	source_file_id(0)
+
+
+pure func singleton_source_table(source: SourceFile) -> (SourceTable, SourceFileId):
+	var line_starts: List[Int] = [0]
+	var offset: Int = 0
+
+	while offset < source.text.length():
+		if (
+			source.text
+				.get(offset)
+				.get_or('\0') == '\n'
+		):
+			line_starts = line_starts.append(offset + 1)
+
+		offset += 1
+
+	data: SourceTableData = {
+		source = source,
+		line_starts = Some(line_starts)
+	}
+	(into_opaque SourceTable(data), singleton_source_file_id())
+
+
+pure func source_table_for_file(source: SourceFile) -> SourceTable:
+	singleton_source_table(source)[0]
+
+
+-- Source-AST finalization normally needs only file identity. Keep that path
+-- O(1); if it later produces a diagnostic, location materialization falls
+-- back to a one-off source scan instead of indexing every successful file.
+pure func unindexed_source_table_for_file(source: SourceFile) -> SourceTable:
+	into_opaque SourceTable({ source = source, line_starts = None })
+
+
+pure func source_table_source(table: SourceTable) -> SourceFile:
+	(from_opaque SourceTable(table)).source
+
+
+pure func source_location(
+	file_id: SourceFileId,
+	start_cursor: Cursor,
+	end_cursor: Cursor,
+) -> SourceLocation:
+	if from_opaque SourceFileId(file_id) == COMPILER_PRELUDE_FILE_ID:
+		into_opaque SourceLocation(COMPILER_PRELUDE_LOCATION)
+	else:
+		into_opaque SourceLocation(
+			start_cursor.offset * SOURCE_LOCATION_OFFSET_BASE + end_cursor.offset
+		)
+
+
+-- Convenience for boundaries that already own one SourceFile (notably tests
+-- constructing detached AST nodes). Production parsers should issue the id
+-- once and call source_location directly while walking the source.
+pure func source_location_for_file(
+	source: SourceFile,
+	start_cursor: Cursor,
+	end_cursor: Cursor,
+) -> SourceLocation:
+	source_location(source_file_id(0), start_cursor, end_cursor)
+
+
+pure func source_location_from_coordinates(
+	file_id: SourceFileId,
+	start_offset: Int,
+	_start_line: Int,
+	_start_column: Int,
+	end_offset: Int,
+	_end_line: Int,
+	_end_column: Int,
+) -> SourceLocation:
+	if from_opaque SourceFileId(file_id) == COMPILER_PRELUDE_FILE_ID:
+		into_opaque SourceLocation(COMPILER_PRELUDE_LOCATION)
+	else:
+		into_opaque SourceLocation(start_offset * SOURCE_LOCATION_OFFSET_BASE + end_offset)
+
+
+-- Compiler-provided declarations have no authored SourceFile, but still need a
+-- stable location for diagnostics. Keep that identity in the source-table
+-- protocol instead of putting path strings back on every location.
+pure func compiler_prelude_source_location() -> SourceLocation:
+	into_opaque SourceLocation(COMPILER_PRELUDE_LOCATION)
+
+
+pure func source_location_file_id(location: SourceLocation) -> SourceFileId:
+	if from_opaque SourceLocation(location) == COMPILER_PRELUDE_LOCATION:
+		source_file_id(COMPILER_PRELUDE_FILE_ID)
+	else:
+		source_file_id(0)
+
+
+pure func source_location_start_offset(location: SourceLocation) -> Int:
+	encoded: Int = from_opaque SourceLocation(location)
+
+	if encoded == COMPILER_PRELUDE_LOCATION:
+		0
+	else:
+		encoded / SOURCE_LOCATION_OFFSET_BASE
+
+
+pure func source_location_end_offset(location: SourceLocation) -> Int:
+	encoded: Int = from_opaque SourceLocation(location)
+
+	if encoded == COMPILER_PRELUDE_LOCATION:
+		0
+	else:
+		encoded % SOURCE_LOCATION_OFFSET_BASE
+
+
+pure func source_location_cover(
+	start_location: SourceLocation,
+	end_location: SourceLocation,
+) -> SourceLocation:
+	source_location_from_coordinates(
+		source_location_file_id(start_location),
+		source_location_start_offset(start_location),
+		0,
+		0,
+		source_location_end_offset(end_location),
+		0,
+		0,
+	)
+
+
+private pure func source_table_cursor_at(data: SourceTableData, offset: Int) -> Cursor:
+	source: SourceFile = data.source
+
+	target: Int = if offset < 0:
+		0
+	else if offset > source.text.length():
+		source.text.length()
+	else:
+		offset
+
+	match data.line_starts:
+		Some(line_starts):
+			var lower: Int = 0
+			var upper: Int = line_starts.length()
+
+			while lower + 1 < upper:
+				middle: Int = (lower + upper) / 2
+
+				if line_starts.get_or(middle, 0) <= target:
+					lower = middle
+				else:
+					upper = middle
+
+			var cursor: Cursor = {
+				offset = line_starts.get_or(lower, 0),
+				line = lower + 1,
+				column = 1
+			}
+
+			while cursor.offset < target:
+				cursor = source_advance(source, cursor)
+
+			cursor
+		None:
+			source_cursor_at(source, target)
+
+
+pure func source_location_span(table: SourceTable, location: SourceLocation) -> SourceSpan:
+	file_id: Int = from_opaque SourceFileId(source_location_file_id(location))
+
+	if file_id == COMPILER_PRELUDE_FILE_ID:
+		source: SourceFile = source_file("<compiler-prelude>", "<compiler-prelude>", "")
+		source_span(source, source_start(source), source_start(source))
+	else:
+		data: SourceTableData = from_opaque SourceTable(table)
+		start_cursor = source_table_cursor_at(data, source_location_start_offset(location))
+		end_cursor = source_table_cursor_at(data, source_location_end_offset(location))
+		source_span(data.source, start_cursor, end_cursor)
+
+
+pure func source_locations_equal(left: SourceLocation, right: SourceLocation) -> Bool:
+	from_opaque SourceLocation(left) == from_opaque SourceLocation(right)
+
+
+implements Equatable for SourceLocation:
+	pure func equals(left: SourceLocation, right: SourceLocation) -> Bool:
+		source_locations_equal(left, right)
 
 
 pure func source_start(_: SourceFile) -> Cursor:

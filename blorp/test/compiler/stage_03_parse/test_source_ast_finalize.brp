@@ -27,7 +27,15 @@ import:
 		finalized_typecheck_program_ast,
 		finalized_typecheck_program_rewrite_import_paths,
 		split_interpolated_string,
-	../../../src/lib/source: SourceFile, SourceSpan, source_cursor_at, source_file, source_span
+	../../../src/lib/source:
+		SourceFile,
+		SourceLocation,
+		source_cursor_at,
+		source_file,
+		source_location_for_file,
+		source_location_span,
+		source_span_text,
+		source_table_for_file,
 	test: TestSuite
 
 
@@ -38,8 +46,8 @@ pure func source(text: String) -> SourceFile:
 	source_file("demo.brp", "demo", text)
 
 
-pure func full_span(src: SourceFile) -> SourceSpan:
-	source_span(
+pure func full_span(src: SourceFile) -> SourceLocation:
+	source_location_for_file(
 		src,
 		source_cursor_at(src, 0),
 		source_cursor_at(src, src.text.length()),
@@ -145,7 +153,7 @@ pure func raw_literal_at(parts: List[StringInterpolationRawPart], index: Int) ->
 
 pure func raw_expr_at(parts: List[StringInterpolationRawPart], index: Int) -> String:
 	match parts.get(index):
-		Some(InterpolationExprText(value)):
+		Some(InterpolationExprText(value, _)):
 			value
 		_:
 			""
@@ -184,7 +192,7 @@ pure func diagnostic_string_at(program: ParsedProgram, index: Int) -> String:
 func test_split_interpolated_string_splits_literal_and_expr() -> Bool:
 	src: SourceFile = source("demo")
 
-	match split_interpolated_string(full_span(src), "Hello {name}!"):
+	match split_interpolated_string(source_table_for_file(src), full_span(src), "Hello {name}!"):
 		Ok(parts):
 			(
 				parts.length() == 3
@@ -199,7 +207,11 @@ func test_split_interpolated_string_splits_literal_and_expr() -> Bool:
 func test_split_interpolated_string_unescapes_literal_braces() -> Bool:
 	src: SourceFile = source("demo")
 
-	match split_interpolated_string(full_span(src), "Hello \\{name\\} {value}"):
+	match split_interpolated_string(
+		source_table_for_file(src),
+		full_span(src),
+		"Hello \\{name\\} {value}",
+	):
 		Ok(parts):
 			(
 				parts.length() == 2
@@ -218,7 +230,11 @@ func test_split_interpolated_string_preserves_multibyte_literals() -> Bool:
 	dash: String = "—"
 	src: SourceFile = source("demo")
 
-	match split_interpolated_string(full_span(src), "café " + dash + " {name} ünd"):
+	match split_interpolated_string(
+		source_table_for_file(src),
+		full_span(src),
+		"café " + dash + " {name} ünd",
+	):
 		Ok(parts):
 			(
 				parts.length() == 3
@@ -233,7 +249,11 @@ func test_split_interpolated_string_preserves_multibyte_literals() -> Bool:
 func test_split_interpolated_string_preserves_multibyte_expr_text() -> Bool:
 	src: SourceFile = source("demo")
 
-	match split_interpolated_string(full_span(src), "a {\"é\".length()} b"):
+	match split_interpolated_string(
+		source_table_for_file(src),
+		full_span(src),
+		"a {\"é\".length()} b",
+	):
 		Ok(parts):
 			(
 				parts.length() == 3
@@ -248,7 +268,7 @@ func test_split_interpolated_string_preserves_multibyte_expr_text() -> Bool:
 func test_split_interpolated_string_reports_unclosed_expr() -> Bool:
 	src: SourceFile = source("demo")
 
-	match split_interpolated_string(full_span(src), "Hello {name"):
+	match split_interpolated_string(source_table_for_file(src), full_span(src), "Hello {name"):
 		Ok(_):
 			False
 		Err(diagnostic):
@@ -271,6 +291,28 @@ func test_finalize_interpolation_program_rewrites_raw_string() -> Bool:
 				and interpolation_literal_at(parts, 2) == "!"
 				and program.diagnostics.length() == 0
 			)
+		_:
+			False
+
+
+func test_finalize_interpolation_rebases_nested_locations_to_authored_source() -> Bool:
+	program_source: String = "func message(): \"prefix\\n " + "$" + "{missing_name}\""
+	program: ParsedProgram = finalize_interpolation_program(
+		parse_compiler_source(source(program_source)),
+	)
+
+	match first_function_body(program):
+		Some(ParsedStringInterpolationPartsExpr(parts, _, _)):
+			match parts.get(1):
+				Some(ParsedInterpolationExpr(ParsedNameExpr(name))):
+					span = source_location_span(source_table_for_file(program.source), name.span)
+					(
+						span.path == "demo.brp"
+						and span.start_line == 1
+						and source_span_text(program.source, span) == "missing_name"
+					)
+				_:
+					False
 		_:
 			False
 
@@ -748,6 +790,10 @@ tests: TestSuite = {
 		(
 			"finalize interpolation program rewrites raw string",
 			test_finalize_interpolation_program_rewrites_raw_string,
+		),
+		(
+			"finalize interpolation rebases nested locations to authored source",
+			test_finalize_interpolation_rebases_nested_locations_to_authored_source,
 		),
 		(
 			"finalize interpolation program preserves duplicate hole order",

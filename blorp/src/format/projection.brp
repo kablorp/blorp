@@ -165,8 +165,15 @@ import:
 		ParsedVariantDecl,
 		ParsedWithBinding,
 		ParsedWithBindingKind(ParsedWithPlainBinding, ParsedWithTryBinding),
-		parsed_expr_span,
-	../lib/source: SourceFile, SourceSpan, source_file
+		parsed_expr_location,
+	../lib/source:
+		SourceFile,
+		SourceLocation,
+		SourceSpan,
+		SourceTable,
+		source_file,
+		source_location_span,
+		source_table_for_file,
 	engine/declaration_documents:
 		Declaration(
 			DocumentedDeclaration,
@@ -668,16 +675,20 @@ private pure func trailing_comment_on_line(
 
 
 private pure func trailing_comment_for_expr(
+	table: SourceTable,
 	comments: List[FormatterComment],
-	span: SourceSpan,
+	span: SourceLocation,
 ) -> Option[String]:
-	if span.start_line == span.end_line:
-		trailing_comment_on_line(comments, span.end_line)
+	resolved: SourceSpan = source_location_span(table, span)
+
+	if resolved.start_line == resolved.end_line:
+		trailing_comment_on_line(comments, resolved.end_line)
 	else:
 		None
 
 
 private pure func block_item_trailing_comment(
+	table: SourceTable,
 	expr: ParsedExpr,
 	comments: List[FormatterComment],
 ) -> Option[String]:
@@ -705,24 +716,29 @@ private pure func block_item_trailing_comment(
 		ParsedConcurrentForExpr(_, _, _, _, _):
 			None
 		_:
-			trailing_comment_for_expr(comments, parsed_expr_span(expr))
+			trailing_comment_for_expr(table, comments, parsed_expr_location(expr))
 
 
-private pure func block_has_comments(span: SourceSpan, comments: List[FormatterComment]) -> Bool:
+private pure func block_has_comments(
+	table: SourceTable,
+	span: SourceLocation,
+	comments: List[FormatterComment],
+) -> Bool:
+	resolved: SourceSpan = source_location_span(table, span)
 	var found: Bool = False
 
 	for comment in comments:
-		if comment.line >= span.start_line - 1 and comment.line <= span.end_line:
+		if comment.line >= resolved.start_line - 1 and comment.line <= resolved.end_line:
 			found = True
 			break
 
 	found
 
 
-private pure func block_comment_column(exprs: List[ParsedExpr]) -> Int:
+private pure func block_comment_column(table: SourceTable, exprs: List[ParsedExpr]) -> Int:
 	match exprs.get(0):
 		Some(expr):
-			parsed_expr_span(expr).start_column
+			source_location_span(table, parsed_expr_location(expr)).start_column
 		None:
 			0
 
@@ -747,6 +763,7 @@ private pure func has_leading_comment_on_line(
 
 
 private pure func initial_block_previous_end(
+	table: SourceTable,
 	exprs: List[ParsedExpr],
 	comments: List[FormatterComment],
 	min_column: Int,
@@ -754,7 +771,7 @@ private pure func initial_block_previous_end(
 ) -> Int:
 	first_line: Int = match exprs.get(0):
 		Some(expr):
-			parsed_expr_span(expr).start_line
+			source_location_span(table, parsed_expr_location(expr)).start_line
 		None:
 			fallback_start_line
 
@@ -770,27 +787,32 @@ private pure func initial_block_previous_end(
 	start_line - 1
 
 
-private pure func parsed_block_items(exprs: List[ParsedExpr]) -> List[Expression]:
-	exprs.map(func(expr): project_expr(expr))
+private pure func parsed_block_items(
+	table: SourceTable,
+	exprs: List[ParsedExpr],
+) -> List[Expression]:
+	exprs.map(func(expr): project_expr(table, expr))
 
 
-private pure func span_end_line(span: SourceSpan) -> Int:
-	if span.end_line > span.start_line:
-		span.end_line
+private pure func span_end_line(table: SourceTable, span: SourceLocation) -> Int:
+	resolved: SourceSpan = source_location_span(table, span)
+
+	if resolved.end_line > resolved.start_line:
+		resolved.end_line
 	else:
-		span.start_line
+		resolved.start_line
 
 
-private pure func expr_end_line(expr: ParsedExpr) -> Int:
-	span_end_line(parsed_expr_span(expr))
+private pure func expr_end_line(table: SourceTable, expr: ParsedExpr) -> Int:
+	span_end_line(table, parsed_expr_location(expr))
 
 
-private pure func block_blank_before(exprs: List[ParsedExpr]) -> List[Bool]:
+private pure func block_blank_before(table: SourceTable, exprs: List[ParsedExpr]) -> List[Bool]:
 	var flags: List[Bool] = []
 	var previous_end: Option[Int] = None
 
 	for expr in exprs:
-		line: Int = parsed_expr_span(expr).start_line
+		line: Int = source_location_span(table, parsed_expr_location(expr)).start_line
 
 		blank: Bool = match previous_end:
 			Some(prev):
@@ -799,7 +821,7 @@ private pure func block_blank_before(exprs: List[ParsedExpr]) -> List[Bool]:
 				False
 
 		flags = flags.append(blank)
-		previous_end = Some(expr_end_line(expr))
+		previous_end = Some(expr_end_line(table, expr))
 
 	flags
 
@@ -815,9 +837,9 @@ private pure func any_true(values: List[Bool]) -> Bool:
 	found
 
 
-private pure func spaced_block_expr(exprs: List[ParsedExpr]) -> Expression:
-	projected: List[Expression] = parsed_block_items(exprs)
-	flags: List[Bool] = block_blank_before(exprs)
+private pure func spaced_block_expr(table: SourceTable, exprs: List[ParsedExpr]) -> Expression:
+	projected: List[Expression] = parsed_block_items(table, exprs)
+	flags: List[Bool] = block_blank_before(table, exprs)
 
 	if any_true(flags):
 		var items: List[(Bool, Expression)] = []
@@ -833,29 +855,33 @@ private pure func spaced_block_expr(exprs: List[ParsedExpr]) -> Expression:
 
 
 private pure func commented_block_expr(
+	table: SourceTable,
 	exprs: List[ParsedExpr],
 	comments: List[FormatterComment],
-	span: SourceSpan,
+	span: SourceLocation,
 ) -> Expression:
-	if not block_has_comments(span, comments):
-		spaced_block_expr(exprs)
+	if not block_has_comments(table, span, comments):
+		spaced_block_expr(table, exprs)
 	else:
+		span_record: SourceSpan = source_location_span(table, span)
 		var items: List[BlockItem] = []
-		block_column: Int = block_comment_column(exprs)
+		block_column: Int = block_comment_column(table, exprs)
 		var previous_end: Int = initial_block_previous_end(
+			table,
 			exprs,
 			comments,
 			block_column,
-			span.start_line,
+			span_record.start_line,
 		)
 
 		for expr in exprs:
-			expr_span: SourceSpan = parsed_expr_span(expr)
+			expr_span: SourceLocation = parsed_expr_location(expr)
+			expr_span_record: SourceSpan = source_location_span(table, expr_span)
 			leading: BlockCommentCollect = append_leading_block_comments(
 				items,
 				comments,
 				previous_end,
-				expr_span.start_line,
+				expr_span_record.start_line,
 				block_column,
 			)
 			items = leading.items
@@ -863,24 +889,25 @@ private pure func commented_block_expr(
 
 			items = items.append(
 				BlockExpressionItem(
-					expr_span.start_line - previous_end > 1,
-					project_expr_with_comments(expr, comments),
-					block_item_trailing_comment(expr, comments),
+					expr_span_record.start_line - previous_end > 1,
+					project_expr_with_comments(table, expr, comments),
+					block_item_trailing_comment(table, expr, comments),
 				),
 			)
-			previous_end = expr_end_line(expr)
+			previous_end = expr_end_line(table, expr)
 
 		after_body: BlockCommentCollect = append_leading_block_comments(
 			items,
 			comments,
 			previous_end,
-			span.end_line,
+			span_record.end_line,
 			block_column,
 		)
 		ItemBlockExpression(after_body.items)
 
 
 private pure func block_exprs_for_concurrent(
+	table: SourceTable,
 	body: ParsedExpr,
 	comments: List[FormatterComment],
 ) -> List[Expression]:
@@ -889,36 +916,41 @@ private pure func block_exprs_for_concurrent(
 			var projected: List[Expression] = []
 
 			for item in items:
-				projected = projected.append(project_expr_with_comments(item, comments))
+				projected = projected.append(project_expr_with_comments(table, item, comments))
 
 			projected
 		_:
-			[project_expr_with_comments(body, comments)]
+			[project_expr_with_comments(table, body, comments)]
 
 
 private pure func project_record_expr_fields(
+	table: SourceTable,
 	fields: List[ParsedRecordExprField],
 ) -> List[(String, Expression)]:
 	var projected: List[(String, Expression)] = []
 
 	for field in fields:
-		projected = projected.append((field.name.text, project_expr(field.value)))
+		projected = projected.append((field.name.text, project_expr(table, field.value)))
 
 	projected
 
 
 private pure func project_dict_entries(
+	table: SourceTable,
 	entries: List[ParsedDictEntry],
 ) -> List[(Expression, Expression)]:
 	var projected: List[(Expression, Expression)] = []
 
 	for entry in entries:
-		projected = projected.append((project_expr(entry.key), project_expr(entry.value)))
+		projected = projected.append(
+			(project_expr(table, entry.key), project_expr(table, entry.value)),
+		)
 
 	projected
 
 
 private pure func project_match_cases(
+	table: SourceTable,
 	cases: List[ParsedMatchCase],
 	comments: List[FormatterComment],
 ) -> List[MatchCase]:
@@ -928,7 +960,7 @@ private pure func project_match_cases(
 		projected = projected.append(
 			MatchCaseData(
 				project_pattern(case_value.pattern),
-				project_expr_with_comments(case_value.body, comments),
+				project_expr_with_comments(table, case_value.body, comments),
 				None,
 			),
 		)
@@ -937,38 +969,40 @@ private pure func project_match_cases(
 
 
 private pure func project_select_arm(
+	table: SourceTable,
 	arm: ParsedSelectArm,
 	comments: List[FormatterComment],
 ) -> SelectArm:
-	body: Expression = project_expr_with_comments(arm.body, comments)
+	body: Expression = project_expr_with_comments(table, arm.body, comments)
 
 	match arm.kind:
 		ParsedSelectReceiveArm(name, channel):
 			SelectRecvArm(
 				name.text,
-				project_expr_with_comments(channel, comments),
+				project_expr_with_comments(table, channel, comments),
 				body,
 			)
 		ParsedSelectAfterArm(timeout):
 			SelectAfterArm(
-				project_expr_with_comments(timeout, comments),
+				project_expr_with_comments(table, timeout, comments),
 				body,
 			)
 		ParsedSelectSealedArm(channel):
 			SelectSealedArm(
-				project_expr_with_comments(channel, comments),
+				project_expr_with_comments(table, channel, comments),
 				body,
 			)
 
 
 private pure func project_select_arms(
+	table: SourceTable,
 	arms: List[ParsedSelectArm],
 	comments: List[FormatterComment],
 ) -> List[SelectArm]:
 	var projected: List[SelectArm] = []
 
 	for arm in arms:
-		projected = projected.append(project_select_arm(arm, comments))
+		projected = projected.append(project_select_arm(table, arm, comments))
 
 	projected
 
@@ -1009,6 +1043,7 @@ private pure func annotation_present(
 
 
 private pure func function_body(
+	table: SourceTable,
 	body: Option[ParsedExpr],
 	comments: List[FormatterComment],
 ) -> FunctionBody:
@@ -1018,16 +1053,17 @@ private pure func function_body(
 		Some(ParsedBuiltinExpr(name, _)):
 			BuiltinFunctionBody(name)
 		Some(body):
-			ExpressionFunctionBody(project_expr_with_comments(body, comments))
+			ExpressionFunctionBody(project_expr_with_comments(table, body, comments))
 
 
 private pure func project_function_declaration_expr(
+	table: SourceTable,
 	decl: ParsedFunctionDecl,
 	comments: List[FormatterComment],
 ) -> Expression:
 	body: Expression = match decl.body:
 		Some(expr):
-			project_expr_with_comments(expr, comments)
+			project_expr_with_comments(table, expr, comments)
 		None:
 			VoidExpression
 
@@ -1103,10 +1139,11 @@ private pure func plain_expr_run_end(text: String, start: Int, in_string: Bool) 
 
 
 private pure func split_interpolation_text(
-	source: SourceFile,
-	span: SourceSpan,
+	table: SourceTable,
+	span: SourceLocation,
 	text: String,
 ) -> Result[List[StringInterpolationPart], String]:
+	resolved_span: SourceSpan = source_location_span(table, span)
 	var parts: List[StringInterpolationPart] = []
 	var literal: String = ""
 	var i: Int = 0
@@ -1176,7 +1213,11 @@ private pure func split_interpolation_text(
 			if depth > 0:
 				error = Some("Unclosed `" + "$" + "{` in string interpolation")
 			else:
-				match parse_interpolation_expr(span.path, source.module_name, expr_text):
+				match parse_interpolation_expr(
+					resolved_span.path,
+					resolved_span.module_name,
+					expr_text,
+				):
 					Ok(expr):
 						parts = parts.append(StringInterpolationExpressionPart(expr))
 					Err(message):
@@ -1204,6 +1245,7 @@ private pure func parse_interpolation_expr(
 	wrapper: String = "___interp_temp = " + text + "\n"
 	wrapper_source: SourceFile = source_file(path, module_name, wrapper)
 	program: ParsedProgram = parse_compiler_source(wrapper_source)
+	table: SourceTable = source_table_for_file(program.source)
 
 	match first_parse_error(program.diagnostics):
 		Some(message):
@@ -1211,7 +1253,7 @@ private pure func parse_interpolation_expr(
 		None:
 			match program.decls:
 				[VarParsedDecl(var_decl)]:
-					Ok(project_expr(var_decl.value))
+					Ok(project_expr(table, var_decl.value))
 				_:
 					Err("Failed to parse interpolated expression: " + text)
 
@@ -1227,33 +1269,35 @@ private pure func first_parse_error(diagnostics: List[ParseDiagnostic]) -> Optio
 
 
 private pure func project_parsed_string_interpolation_part(
+	table: SourceTable,
 	part: ParsedStringInterpolationPart,
 ) -> StringInterpolationPart:
 	match part:
 		ParsedInterpolationLiteral(value):
 			StringInterpolationTextPart(value)
 		ParsedInterpolationExpr(expr):
-			StringInterpolationExpressionPart(project_expr(expr))
+			StringInterpolationExpressionPart(project_expr(table, expr))
 
 
 private pure func project_parsed_string_interpolation_parts(
+	table: SourceTable,
 	parts: List[ParsedStringInterpolationPart],
 ) -> List[StringInterpolationPart]:
 	var projected: List[StringInterpolationPart] = []
 
 	for part in parts:
-		projected = projected.append(project_parsed_string_interpolation_part(part))
+		projected = projected.append(project_parsed_string_interpolation_part(table, part))
 
 	projected
 
 
 private pure func project_string_interpolation(
-	source: SourceFile,
+	table: SourceTable,
 	value: String,
 	is_multiline: Bool,
-	span: SourceSpan,
+	span: SourceLocation,
 ) -> Expression:
-	match split_interpolation_text(source, span, value):
+	match split_interpolation_text(table, span, value):
 		Ok(parts):
 			StringInterpolationExpression(parts, is_multiline)
 		Err(_):
@@ -1261,6 +1305,7 @@ private pure func project_string_interpolation(
 
 
 private pure func project_expr_with_comments(
+	table: SourceTable,
 	expr: ParsedExpr,
 	comments: List[FormatterComment],
 ) -> Expression:
@@ -1274,15 +1319,10 @@ private pure func project_expr_with_comments(
 		ParsedStringLiteralExpr(value, form, _):
 			LiteralExpression(project_literal_string(value, form))
 		ParsedStringInterpolationExpr(value, is_multiline, span):
-			project_string_interpolation(
-				source_file(span.path, span.module_name, ""),
-				value,
-				is_multiline,
-				span,
-			)
+			project_string_interpolation(table, value, is_multiline, span)
 		ParsedStringInterpolationPartsExpr(parts, is_multiline, _):
 			StringInterpolationExpression(
-				project_parsed_string_interpolation_parts(parts),
+				project_parsed_string_interpolation_parts(table, parts),
 				is_multiline,
 			)
 		ParsedBoolLiteralExpr(value, _):
@@ -1292,51 +1332,58 @@ private pure func project_expr_with_comments(
 		ParsedUnaryExpr(op, inner, _):
 			UnaryExpression(
 				project_unary_op(op),
-				project_expr_with_comments(inner, comments),
+				project_expr_with_comments(table, inner, comments),
 			)
 		ParsedBinaryExpr(op, left, right, _):
 			BinaryExpression(
 				project_binary_op(op),
-				project_expr_with_comments(left, comments),
-				project_expr_with_comments(right, comments),
+				project_expr_with_comments(table, left, comments),
+				project_expr_with_comments(table, right, comments),
 			)
 		ParsedLogicalExpr(op, left, right, _):
 			LogicalExpression(
 				project_logical_op(op),
-				project_expr_with_comments(left, comments),
-				project_expr_with_comments(right, comments),
+				project_expr_with_comments(table, left, comments),
+				project_expr_with_comments(table, right, comments),
 			)
 		ParsedAscriptionExpr(inner, type_expr, _):
 			AscriptionExpression(
-				project_expr_with_comments(inner, comments),
+				project_expr_with_comments(table, inner, comments),
 				project_type_expr(type_expr),
 			)
 		ParsedRangeExpr(start, finish, _):
 			RangeExpression(
-				project_expr_with_comments(start, comments),
-				project_expr_with_comments(finish, comments),
+				project_expr_with_comments(table, start, comments),
+				project_expr_with_comments(table, finish, comments),
 			)
 		ParsedCallExpr(callee, args, _):
 			var projected_args: List[Expression] = []
 
 			for arg in args:
-				projected_args = projected_args.append(project_expr_with_comments(arg, comments))
+				projected_args = projected_args.append(
+					project_expr_with_comments(
+						table,
+						arg,
+						comments,
+					),
+				)
 
 			CallExpression(
-				project_expr_with_comments(callee, comments),
+				project_expr_with_comments(table, callee, comments),
 				projected_args,
 			)
 		ParsedFieldAccessExpr(target, field_name, _):
 			FieldAccessExpression(
-				project_expr_with_comments(target, comments),
+				project_expr_with_comments(table, target, comments),
 				field_name.text,
 			)
 		ParsedSubscriptExpr(target, indices, _):
 			if indices.length() == 1:
 				SubscriptExpression(
-					project_expr_with_comments(target, comments),
+					project_expr_with_comments(table, target, comments),
 					project_expr_with_comments(
-						indices.get_or(0, ParsedVoidExpr(parsed_expr_span(target))),
+						table,
+						indices.get_or(0, ParsedVoidExpr(parsed_expr_location(target))),
 						comments,
 					),
 				)
@@ -1346,66 +1393,67 @@ private pure func project_expr_with_comments(
 				for index in indices:
 					projected_indices = projected_indices.append(
 						project_expr_with_comments(
+							table,
 							index,
 							comments,
 						),
 					)
 
 				MultiSubscriptExpression(
-					project_expr_with_comments(target, comments),
+					project_expr_with_comments(table, target, comments),
 					projected_indices,
 				)
 		ParsedListExpr(items, _):
-			ListExpression(parsed_block_items(items))
+			ListExpression(parsed_block_items(table, items))
 		ParsedTupleExpr(items, _):
-			TupleExpression(parsed_block_items(items))
+			TupleExpression(parsed_block_items(table, items))
 		ParsedRecordExpr(fields, _):
-			RecordExpression(project_record_expr_fields(fields))
+			RecordExpression(project_record_expr_fields(table, fields))
 		ParsedRecordUpdateExpr(base, fields, _):
 			RecordUpdateExpression(
-				project_expr_with_comments(base, comments),
-				project_record_expr_fields(fields),
+				project_expr_with_comments(table, base, comments),
+				project_record_expr_fields(table, fields),
 			)
 		ParsedDictExpr(entries, _):
-			DictionaryExpression(project_dict_entries(entries))
+			DictionaryExpression(project_dict_entries(table, entries))
 		ParsedVectorExpr(items, _):
-			VectorExpression(parsed_block_items(items))
+			VectorExpression(parsed_block_items(table, items))
 		ParsedOpaqueIntoExpr(type_expr, inner, _):
 			OpaqueIntoExpression(
 				project_type_expr(type_expr),
-				project_expr_with_comments(inner, comments),
+				project_expr_with_comments(table, inner, comments),
 			)
 		ParsedOpaqueFromExpr(type_expr, inner, _):
 			OpaqueFromExpression(
 				project_type_expr(type_expr),
-				project_expr_with_comments(inner, comments),
+				project_expr_with_comments(table, inner, comments),
 			)
 		ParsedBlockExpr(items, span):
-			commented_block_expr(items, comments, span)
+			commented_block_expr(table, items, comments, span)
 		ParsedIfExpr(cond, then_expr, else_expr, _):
 			match else_expr:
 				Some(value):
 					IfElseExpression(
-						project_expr_with_comments(cond, comments),
-						project_expr_with_comments(then_expr, comments),
-						project_expr_with_comments(value, comments),
+						project_expr_with_comments(table, cond, comments),
+						project_expr_with_comments(table, then_expr, comments),
+						project_expr_with_comments(table, value, comments),
 					)
 				None:
 					IfExpression(
-						project_expr_with_comments(cond, comments),
-						project_expr_with_comments(then_expr, comments),
+						project_expr_with_comments(table, cond, comments),
+						project_expr_with_comments(table, then_expr, comments),
 					)
 		ParsedMatchExpr(value, cases, _):
 			MatchExpression(
-				project_expr_with_comments(value, comments),
-				project_match_cases(cases, comments),
+				project_expr_with_comments(table, value, comments),
+				project_match_cases(table, cases, comments),
 			)
 		ParsedSelectExpr(arms, _):
-			SelectExpression(project_select_arms(arms, comments))
+			SelectExpression(project_select_arms(table, arms, comments))
 		ParsedWithExpr(binding, body, _):
-			project_with_expr(binding, body, comments)
+			project_with_expr(table, binding, body, comments)
 		ParsedDebugBlockExpr(body, _):
-			DebugBlockExpression(project_expr_with_comments(body, comments))
+			DebugBlockExpression(project_expr_with_comments(table, body, comments))
 		ParsedLambdaExpr(is_pure, params, return_type, body, _):
 			projected_params: List[FunctionParameter] = params.map(
 				func(param): project_lambda_param(param),
@@ -1417,41 +1465,41 @@ private pure func project_expr_with_comments(
 						is_pure,
 						projected_params,
 						project_type_expr(type_expr),
-						project_expr_with_comments(body, comments),
+						project_expr_with_comments(table, body, comments),
 					)
 				None:
 					LambdaExpression(
 						is_pure,
 						projected_params,
-						project_expr_with_comments(body, comments),
+						project_expr_with_comments(table, body, comments),
 					)
 		ParsedFunctionDeclExpr(decl):
-			project_function_declaration_expr(decl, comments)
+			project_function_declaration_expr(table, decl, comments)
 		ParsedWhileExpr(cond, body, _):
 			WhileExpression(
-				project_expr_with_comments(cond, comments),
-				project_expr_with_comments(body, comments),
+				project_expr_with_comments(table, cond, comments),
+				project_expr_with_comments(table, body, comments),
 			)
 		ParsedForExpr(binder, iterable, body, _):
 			match project_for_binder_name(binder):
 				Some(name):
 					ForExpression(
 						name,
-						project_expr_with_comments(iterable, comments),
-						project_expr_with_comments(body, comments),
+						project_expr_with_comments(table, iterable, comments),
+						project_expr_with_comments(table, body, comments),
 					)
 				None:
 					TupleForExpression(
 						project_for_binder_names(binder),
-						project_expr_with_comments(iterable, comments),
-						project_expr_with_comments(body, comments),
+						project_expr_with_comments(table, iterable, comments),
+						project_expr_with_comments(table, body, comments),
 					)
 		ParsedConcurrentBlockExpr(params, body, _):
-			project_concurrent_expr(params, body, comments)
+			project_concurrent_expr(table, params, body, comments)
 		ParsedConcurrentForExpr(name, iterable, params, body, _):
-			project_concurrently_loop_expr(name.text, iterable, params, body, comments)
+			project_concurrently_loop_expr(table, name.text, iterable, params, body, comments)
 		ParsedDetachExpr(body, _):
-			DetachExpression(project_expr_with_comments(body, comments))
+			DetachExpression(project_expr_with_comments(table, body, comments))
 		ParsedBreakExpr(_):
 			BreakExpression
 		ParsedContinueExpr(_):
@@ -1471,24 +1519,24 @@ private pure func project_expr_with_comments(
 						name.text,
 						is_mutable,
 						project_type_expr(type_value),
-						project_expr_with_comments(value, comments),
+						project_expr_with_comments(table, value, comments),
 					)
 				None:
 					VariableDeclarationExpression(
 						name.text,
 						is_mutable,
-						project_expr_with_comments(value, comments),
+						project_expr_with_comments(table, value, comments),
 					)
 		ParsedAssignExpr(name, value, _):
 			AssignmentExpression(
 				name.text,
-				project_expr_with_comments(value, comments),
+				project_expr_with_comments(table, value, comments),
 			)
 		ParsedCompoundAssignExpr(name, op, value, _):
 			CompoundAssignmentExpression(
 				name.text,
 				project_compound_assign_op(op),
-				project_expr_with_comments(value, comments),
+				project_expr_with_comments(table, value, comments),
 			)
 		ParsedSubscriptAssignExpr(target, indices, value, _):
 			var projected_indices: List[Expression] = []
@@ -1496,15 +1544,16 @@ private pure func project_expr_with_comments(
 			for index in indices:
 				projected_indices = projected_indices.append(
 					project_expr_with_comments(
+						table,
 						index,
 						comments,
 					),
 				)
 
 			SubscriptAssignmentExpression(
-				project_expr_with_comments(target, comments),
+				project_expr_with_comments(table, target, comments),
 				projected_indices,
-				project_expr_with_comments(value, comments),
+				project_expr_with_comments(table, value, comments),
 			)
 		ParsedTupleDestructExpr(names, value, _):
 			var projected_names: List[String] = []
@@ -1514,7 +1563,7 @@ private pure func project_expr_with_comments(
 
 			TupleDestructureExpression(
 				projected_names,
-				project_expr_with_comments(value, comments),
+				project_expr_with_comments(table, value, comments),
 			)
 		ParsedQuestionBindExpr(name, type_expr, value, _):
 			match type_expr:
@@ -1522,22 +1571,23 @@ private pure func project_expr_with_comments(
 					TypedQuestionBindExpression(
 						name.text,
 						project_type_expr(type_value),
-						project_expr_with_comments(value, comments),
+						project_expr_with_comments(table, value, comments),
 					)
 				None:
 					QuestionBindExpression(
 						name.text,
-						project_expr_with_comments(value, comments),
+						project_expr_with_comments(table, value, comments),
 					)
 		ParsedMissingExpr(_):
 			VoidExpression
 
 
-pure func project_expr(expr: ParsedExpr) -> Expression:
-	project_expr_with_comments(expr, [])
+pure func project_expr(table: SourceTable, expr: ParsedExpr) -> Expression:
+	project_expr_with_comments(table, expr, [])
 
 
 private pure func project_with_expr(
+	table: SourceTable,
 	binding: ParsedWithBinding,
 	body: ParsedExpr,
 	comments: List[FormatterComment],
@@ -1552,7 +1602,7 @@ private pure func project_with_expr(
 
 	error_value: Option[Expression] = match binding.error_map:
 		Some(error_map):
-			Some(project_expr_with_comments(error_map.value, comments))
+			Some(project_expr_with_comments(table, error_map.value, comments))
 		None:
 			None
 
@@ -1560,14 +1610,15 @@ private pure func project_with_expr(
 		binding.name.text,
 		option_type_expr(binding.type_expr),
 		is_try,
-		project_expr_with_comments(binding.value, comments),
+		project_expr_with_comments(table, binding.value, comments),
 		error_name,
 		error_value,
-		project_expr_with_comments(body, comments),
+		project_expr_with_comments(table, body, comments),
 	)
 
 
 private pure func concurrent_param_expr(
+	table: SourceTable,
 	params: List[ParsedConcurrentParam],
 	name: String,
 	comments: List[FormatterComment],
@@ -1576,7 +1627,7 @@ private pure func concurrent_param_expr(
 
 	for param in params:
 		if result.is_none() and param.name.text == name:
-			result = Some(project_expr_with_comments(param.value, comments))
+			result = Some(project_expr_with_comments(table, param.value, comments))
 
 	result
 
@@ -1599,18 +1650,20 @@ private pure func concurrent_param_int(
 
 
 private pure func project_concurrent_expr(
+	table: SourceTable,
 	params: List[ParsedConcurrentParam],
 	body: ParsedExpr,
 	comments: List[FormatterComment],
 ) -> Expression:
 	ConcurrentExpression(
-		block_exprs_for_concurrent(body, comments),
-		concurrent_param_expr(params, "timeout", comments),
+		block_exprs_for_concurrent(table, body, comments),
+		concurrent_param_expr(table, params, "timeout", comments),
 		concurrent_param_int(params, "max_threads"),
 	)
 
 
 private pure func project_concurrently_loop_expr(
+	table: SourceTable,
 	name: String,
 	iterable: ParsedExpr,
 	params: List[ParsedConcurrentParam],
@@ -1619,9 +1672,9 @@ private pure func project_concurrently_loop_expr(
 ) -> Expression:
 	ConcurrentlyLoopExpression(
 		name,
-		project_expr_with_comments(iterable, comments),
-		project_expr_with_comments(body, comments),
-		concurrent_param_expr(params, "timeout", comments),
+		project_expr_with_comments(table, iterable, comments),
+		project_expr_with_comments(table, body, comments),
+		concurrent_param_expr(table, params, "timeout", comments),
 		ConcurrentlyLoopLimit(concurrent_param_int(params, "limit").get_or(0)),
 	)
 
@@ -1675,11 +1728,16 @@ private pure func project_import_item(item: ParsedImportDecl) -> ImportItem:
 	}
 
 
-private pure func located_decl(span: SourceSpan, declaration: Declaration) -> LocatedDeclaration:
+private pure func located_decl(
+	table: SourceTable,
+	span: SourceLocation,
+	declaration: Declaration,
+) -> LocatedDeclaration:
+	resolved: SourceSpan = source_location_span(table, span)
 	{
-		line = span.start_line,
-		column = span.start_column,
-		end_line = span_end_line(span),
+		line = resolved.start_line,
+		column = resolved.start_column,
+		end_line = span_end_line(table, span),
 		declaration = declaration
 	}
 
@@ -1704,6 +1762,7 @@ private pure func project_field_decl(field: ParsedFieldDecl) -> DeclarationField
 
 
 private pure func project_function_decl(
+	table: SourceTable,
 	decl: ParsedFunctionDecl,
 	is_private: Bool,
 	comments: List[FormatterComment],
@@ -1722,12 +1781,13 @@ private pure func project_function_decl(
 			project_params(decl.params),
 			option_type_expr(decl.return_type),
 			project_dim_constraints(decl.dim_constraints),
-			function_body(decl.body, comments),
+			function_body(table, decl.body, comments),
 		),
 	)
 
 
 private pure func project_trait_method(
+	table: SourceTable,
 	method: ParsedTraitMethodDecl,
 	comments: List[FormatterComment],
 ) -> TraitMethod:
@@ -1736,18 +1796,19 @@ private pure func project_trait_method(
 		is_pure = method.is_pure,
 		params = project_params(method.params),
 		return_type = option_type_expr(method.return_type),
-		body = method.body.map(func(expr): project_expr_with_comments(expr, comments))
+		body = method.body.map(func(expr): project_expr_with_comments(table, expr, comments))
 	}
 
 
 private pure func project_trait_methods(
+	table: SourceTable,
 	methods: List[ParsedTraitMethodDecl],
 	comments: List[FormatterComment],
 ) -> List[TraitMethod]:
 	var projected: List[TraitMethod] = []
 
 	for method in methods:
-		projected = projected.append(project_trait_method(method, comments))
+		projected = projected.append(project_trait_method(table, method, comments))
 
 	projected
 
@@ -1808,6 +1869,7 @@ private pure func project_foreign_function(
 
 
 private pure func project_impl_method(
+	table: SourceTable,
 	method: ParsedFunctionDecl,
 	comments: List[FormatterComment],
 ) -> ImplementationMethod:
@@ -1825,23 +1887,25 @@ private pure func project_impl_method(
 		params = project_params(method.params),
 		return_type = option_type_expr(method.return_type),
 		where_constraints = project_dim_constraints(method.dim_constraints),
-		body = function_body(method.body, comments)
+		body = function_body(table, method.body, comments)
 	}
 
 
 private pure func project_impl_methods(
+	table: SourceTable,
 	methods: List[ParsedFunctionDecl],
 	comments: List[FormatterComment],
 ) -> List[ImplementationMethod]:
 	var projected: List[ImplementationMethod] = []
 
 	for method in methods:
-		projected = projected.append(project_impl_method(method, comments))
+		projected = projected.append(project_impl_method(table, method, comments))
 
 	projected
 
 
 private pure func project_decl_to_located(
+	table: SourceTable,
 	decl: ParsedDecl,
 	is_private: Bool,
 	comments: List[FormatterComment],
@@ -1849,11 +1913,13 @@ private pure func project_decl_to_located(
 	match decl:
 		FunctionParsedDecl(function_decl):
 			[located_decl(
+					table,
 					function_decl.span,
-					project_function_decl(function_decl, is_private, comments),
+					project_function_decl(table, function_decl, is_private, comments),
 				)]
 		VarParsedDecl(var_decl):
 			[located_decl(
+					table,
 					var_decl.span,
 					VariableDeclaration(
 						is_private,
@@ -1861,7 +1927,7 @@ private pure func project_decl_to_located(
 						None,
 						var_decl.is_mutable,
 						option_type_expr(var_decl.type_expr),
-						project_expr_with_comments(var_decl.value, comments),
+						project_expr_with_comments(table, var_decl.value, comments),
 					),
 				)]
 		ImportBlockParsedDecl(items, _):
@@ -1870,6 +1936,7 @@ private pure func project_decl_to_located(
 			for item in items:
 				located = located.append(
 					located_decl(
+						table,
 						item.span,
 						ImportDeclaration(project_import_item(item)),
 					),
@@ -1883,6 +1950,7 @@ private pure func project_decl_to_located(
 			for function_decl in functions:
 				located = located.append(
 					located_decl(
+						table,
 						function_decl.span,
 						project_foreign_function(metadata, function_decl),
 					),
@@ -1891,6 +1959,7 @@ private pure func project_decl_to_located(
 			located
 		RecordParsedDecl(record_decl):
 			[located_decl(
+					table,
 					record_decl.span,
 					option_doc(
 						record_decl.doc,
@@ -1906,6 +1975,7 @@ private pure func project_decl_to_located(
 				)]
 		UnionParsedDecl(union_decl):
 			[located_decl(
+					table,
 					union_decl.span,
 					option_doc(
 						union_decl.doc,
@@ -1923,6 +1993,7 @@ private pure func project_decl_to_located(
 				)]
 		BuiltinTypeParsedDecl(type_decl):
 			[located_decl(
+					table,
 					type_decl.span,
 					option_doc(
 						type_decl.doc,
@@ -1940,6 +2011,7 @@ private pure func project_decl_to_located(
 				)]
 		TypeAliasParsedDecl(alias_decl):
 			[located_decl(
+					table,
 					alias_decl.span,
 					option_doc(
 						alias_decl.doc,
@@ -1959,6 +2031,7 @@ private pure func project_decl_to_located(
 				supertraits = supertraits.append(supertrait.text)
 
 			[located_decl(
+					table,
 					trait_decl.span,
 					option_doc(
 						trait_decl.doc,
@@ -1967,12 +2040,13 @@ private pure func project_decl_to_located(
 							trait_decl.name.text,
 							type_param_names(trait_decl.type_params),
 							supertraits,
-							project_trait_methods(trait_decl.methods, comments),
+							project_trait_methods(table, trait_decl.methods, comments),
 						),
 					),
 				)]
 		ImplParsedDecl(impl_decl):
 			[located_decl(
+					table,
 					impl_decl.span,
 					option_doc(
 						impl_decl.doc,
@@ -1980,14 +2054,15 @@ private pure func project_decl_to_located(
 							is_private,
 							impl_decl.trait_name.text,
 							project_type_expr(impl_decl.for_type),
-							project_impl_methods(impl_decl.methods, comments),
+							project_impl_methods(table, impl_decl.methods, comments),
 						),
 					),
 				)]
 		PrivateParsedDecl(inner, _):
-			project_decl_to_located(inner, True, comments)
+			project_decl_to_located(table, inner, True, comments)
 		ParsedErrorDecl(span):
 			[located_decl(
+					table,
 					span,
 					VariableDeclaration(
 						True,
@@ -2001,13 +2076,14 @@ private pure func project_decl_to_located(
 
 
 private pure func project_decls(
+	table: SourceTable,
 	decls: List[ParsedDecl],
 	comments: List[FormatterComment],
 ) -> List[LocatedDeclaration]:
 	var located: List[LocatedDeclaration] = []
 
 	for decl in decls:
-		for item in project_decl_to_located(decl, False, comments):
+		for item in project_decl_to_located(table, decl, False, comments):
 			located = located.append(item)
 
 	located
@@ -2017,12 +2093,14 @@ pure func parsed_program_to_formatter_program(
 	program: ParsedProgram,
 	comments: List[FormatterComment],
 ) -> Result[Program, String]:
+	table: SourceTable = source_table_for_file(program.source)
+
 	match first_parse_error(program.diagnostics):
 		Some(message):
 			Err(message)
 		None:
 			Ok({
-				declarations = project_decls(program.decls, comments),
+				declarations = project_decls(table, program.decls, comments),
 				comments = comments,
 			})
 

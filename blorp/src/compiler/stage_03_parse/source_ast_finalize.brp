@@ -4,9 +4,18 @@
 -- source AST where parser-owned sugar has already been normalized. This module
 -- owns those parser-adjacent rewrites one slice at a time.
 import:
-	../../lib/source: SourceFile, SourceSpan, source_file
+	../../lib/source:
+		SourceFile,
+		SourceLocation,
+		SourceTable,
+		source_file,
+		source_location_end_offset,
+		source_location_span,
+		source_location_start_offset,
+		source_table_source,
+		unindexed_source_table_for_file,
 	../stage_02_lex/parse_diagnostic: ParseDiagnostic, parse_error
-	language_parser: parse_compiler_source
+	language_parser: parse_compiler_source, parse_compiler_source_rebased
 	parsed_ast:
 		ParsedBinaryOp,
 		ParsedConcurrentParam,
@@ -124,7 +133,10 @@ record FinalizedImportPathRewrite {
 
 union StringInterpolationRawPart:
 	InterpolationLiteralText(String)
-	InterpolationExprText(String)
+	InterpolationExprText(String, Int)
+
+
+private INTERPOLATION_WRAPPER_PREFIX: String = "x="
 
 
 record UnicodeEscapeResult {
@@ -146,8 +158,8 @@ record ParsedExprResult {
 
 
 private union ParsedLogicalFinalizeFrame:
-	ParsedLogicalFinalizeVisitRightFrame(ParsedLogicalOp, ParsedExpr, SourceSpan)
-	ParsedLogicalFinalizeRebuildParentFrame(ParsedLogicalOp, ParsedExprResult, SourceSpan)
+	ParsedLogicalFinalizeVisitRightFrame(ParsedLogicalOp, ParsedExpr, SourceLocation)
+	ParsedLogicalFinalizeRebuildParentFrame(ParsedLogicalOp, ParsedExprResult, SourceLocation)
 
 
 private union ParsedLogicalFinalizeFrameStack:
@@ -253,7 +265,7 @@ record FunctionDeclsResult {
 record IdentifierReference {
 	name: String,
 	qualified_member: Option[String],
-	span: SourceSpan
+	span: SourceLocation
 }
 
 
@@ -395,13 +407,14 @@ private pure func mangle_nested_function_name(
 
 
 private pure func nested_capture_diagnostic(
+	table: SourceTable,
 	nested_name: String,
 	parent_name: String,
 	captured_name: String,
-	span: SourceSpan,
+	span: SourceLocation,
 ) -> ParseDiagnostic:
 	parse_error(
-		span,
+		source_location_span(table, span),
 		"Nested function '" + nested_name + "' cannot capture parent-scope identifier '" + captured_name + "'",
 	)
 
@@ -517,13 +530,65 @@ private pure func plain_expr_run_end(text: String, start: Int, in_string: Bool) 
 	index
 
 
+-- The lexer removes the `$` that introduces an interpolation hole. Recover
+-- each hole's authored expression offset from the original source so the
+-- synthetic wrapper parser can retain locations owned by that source file.
+private pure func interpolation_hole_start_offsets(
+	table: SourceTable,
+	span: SourceLocation,
+) -> List[Int]:
+	source: SourceFile = source_table_source(table)
+	var starts: List[Int] = []
+	var offset: Int = source_location_start_offset(span)
+	end_offset: Int = source_location_end_offset(span)
+
+	while offset + 1 < end_offset:
+		current: Char = source.text.get_or(offset, '\0')
+
+		if current == '\\':
+			offset += 2
+		else if current == '$' and source.text.get_or(offset + 1, '\0') == '{':
+			starts = starts.append(offset + 2)
+			offset += 2
+			var depth: Int = 1
+			var in_string: Bool = False
+			var in_char: Bool = False
+
+			while offset < end_offset and depth > 0:
+				nested: Char = source.text.get_or(offset, '\0')
+
+				if nested == '\\':
+					offset += 2
+				else if nested == '"' and not in_char:
+					in_string = not in_string
+					offset += 1
+				else if nested == '\'' and not in_string:
+					in_char = not in_char
+					offset += 1
+				else if not in_string and not in_char and nested == '{':
+					depth += 1
+					offset += 1
+				else if not in_string and not in_char and nested == '}':
+					depth -= 1
+					offset += 1
+				else:
+					offset += 1
+		else:
+			offset += 1
+
+	starts
+
+
 pure func split_interpolated_string(
-	span: SourceSpan,
+	table: SourceTable,
+	span: SourceLocation,
 	text: String,
 ) -> Result[List[StringInterpolationRawPart], ParseDiagnostic]:
 	var parts: List[StringInterpolationRawPart] = []
 	var literal: String = string(64)
 	var index: Int = 0
+	hole_starts: List[Int] = interpolation_hole_start_offsets(table, span)
+	var hole_index: Int = 0
 	var error: Option[ParseDiagnostic] = None
 
 	while index < text.length() and error.is_none():
@@ -579,6 +644,11 @@ pure func split_interpolated_string(
 						literal = literal.append_char(ch)
 						index += 1
 		else if ch == '{':
+			hole_start: Int = hole_starts.get_or(
+				hole_index,
+				source_location_start_offset(span),
+			)
+			hole_index += 1
 			parts = append_lit_part(parts, literal)
 			literal = ""
 			index += 1
@@ -618,9 +688,14 @@ pure func split_interpolated_string(
 					index = run_end
 
 			if depth > 0:
-				error = Some(parse_error(span, "Unclosed `" + "$" + "{` in string interpolation"))
+				error = Some(
+					parse_error(
+						source_location_span(table, span),
+						"Unclosed `" + "$" + "{` in string interpolation",
+					),
+				)
 			else:
-				parts = parts.append(InterpolationExprText(expr_text))
+				parts = parts.append(InterpolationExprText(expr_text, hole_start))
 		else:
 			run_end: Int = plain_literal_run_end(text, index)
 			literal += text.substring(index, run_end - index)
@@ -1354,6 +1429,7 @@ private pure func apply_name_rewrites(rewrites: List[NameRewrite], expr: ParsedE
 
 
 private pure func hoist_nested_body(
+	table: SourceTable,
 	parent_name: String,
 	parent_locals: List[String],
 	body: ParsedExpr,
@@ -1361,7 +1437,7 @@ private pure func hoist_nested_body(
 ) -> HoistExprResult:
 	match body:
 		ParsedBlockExpr(items, span):
-			result = hoist_nested_block_items(parent_name, parent_locals, items, next_id)
+			result = hoist_nested_block_items(table, parent_name, parent_locals, items, next_id)
 			{
 				value = ParsedBlockExpr(result.value, span),
 				hoisted = result.hoisted,
@@ -1378,6 +1454,7 @@ private pure func hoist_nested_body(
 
 
 private pure func hoist_nested_block_items(
+	table: SourceTable,
 	parent_name: String,
 	parent_locals: List[String],
 	items: List[ParsedExpr],
@@ -1418,6 +1495,7 @@ private pure func hoist_nested_block_items(
 							Some(reference):
 								diagnostics = diagnostics.append(
 									nested_capture_diagnostic(
+										table,
 										original_name,
 										parent_name,
 										reference.name,
@@ -1432,6 +1510,7 @@ private pure func hoist_nested_block_items(
 							raw_body,
 						)
 						body_result = hoist_nested_body(
+							table,
 							new_name,
 							own_params,
 							body_with_rewrites,
@@ -1474,12 +1553,14 @@ private pure func hoist_nested_block_items(
 
 
 private pure func hoist_nested_function_decl(
+	table: SourceTable,
 	decl: ParsedFunctionDecl,
 	next_id: Int,
 ) -> HoistFunctionResult:
 	match decl.body:
 		Some(body):
 			body_result = hoist_nested_body(
+				table,
 				decl.name.text,
 				params_bound_names(decl.params),
 				body,
@@ -1501,6 +1582,7 @@ private pure func hoist_nested_function_decl(
 
 
 private pure func hoist_nested_function_decls(
+	table: SourceTable,
 	items: List[ParsedFunctionDecl],
 	next_id: Int,
 ) -> HoistFunctionDeclsResult:
@@ -1510,7 +1592,7 @@ private pure func hoist_nested_function_decls(
 	var current_id: Int = next_id
 
 	for item in items:
-		result = hoist_nested_function_decl(item, current_id)
+		result = hoist_nested_function_decl(table, item, current_id)
 		current_id = result.next_id
 		values = values.append(result.decl)
 
@@ -1528,7 +1610,10 @@ private pure func hoist_nested_function_decls(
 	}
 
 
-private pure func hoist_nested_decls(decls: List[ParsedDecl]) -> HoistDeclsResult:
+private pure func hoist_nested_decls(
+	table: SourceTable,
+	decls: List[ParsedDecl],
+) -> HoistDeclsResult:
 	var values: List[ParsedDecl] = []
 	var diagnostics: List[ParseDiagnostic] = []
 	var current_id: Int = 0
@@ -1536,7 +1621,7 @@ private pure func hoist_nested_decls(decls: List[ParsedDecl]) -> HoistDeclsResul
 	for decl in decls:
 		match decl:
 			FunctionParsedDecl(function_decl):
-				result = hoist_nested_function_decl(function_decl, current_id)
+				result = hoist_nested_function_decl(table, function_decl, current_id)
 				current_id = result.next_id
 
 				if not result.hoisted.is_empty():
@@ -1546,7 +1631,7 @@ private pure func hoist_nested_decls(decls: List[ParsedDecl]) -> HoistDeclsResul
 				values = values.append(FunctionParsedDecl(result.decl))
 				diagnostics = diagnostics.concat(result.diagnostics)
 			ImplParsedDecl(impl_decl):
-				result = hoist_nested_function_decls(impl_decl.methods, current_id)
+				result = hoist_nested_function_decls(table, impl_decl.methods, current_id)
 				current_id = result.next_id
 
 				if not result.hoisted.is_empty():
@@ -1558,7 +1643,7 @@ private pure func hoist_nested_decls(decls: List[ParsedDecl]) -> HoistDeclsResul
 			PrivateParsedDecl(inner, span):
 				match inner:
 					FunctionParsedDecl(function_decl):
-						result = hoist_nested_function_decl(function_decl, current_id)
+						result = hoist_nested_function_decl(table, function_decl, current_id)
 						current_id = result.next_id
 
 						if not result.hoisted.is_empty():
@@ -1599,7 +1684,7 @@ private pure func subscript_get_builtin_name(arity: Int) -> String:
 
 
 private pure func make_untyped_call_expr(
-	span: SourceSpan,
+	span: SourceLocation,
 	name: String,
 	args: List[ParsedExpr],
 ) -> ParsedExpr:
@@ -1613,7 +1698,7 @@ private pure func make_untyped_call_expr(
 private pure func rewrite_subscript_read_node(
 	target: ParsedExpr,
 	indices: List[ParsedExpr],
-	span: SourceSpan,
+	span: SourceLocation,
 ) -> ParsedExpr:
 	if indices.length() == 1:
 		match indices.get(0):
@@ -1903,16 +1988,22 @@ private pure func rewrite_subscript_read_program(program: ParsedProgram) -> Pars
 
 
 private pure func parse_interpolation_expr(
+	table: SourceTable,
 	module_name: String,
-	span: SourceSpan,
+	span: SourceLocation,
 	text: String,
+	source_start_offset: Int,
 ) -> ParsedExprOptionResult:
+	source: SourceFile = source_table_source(table)
 	wrapper_source: SourceFile = source_file(
-		span.path,
+		source.path,
 		module_name,
-		"___interp_temp = " + text + "\n",
+		INTERPOLATION_WRAPPER_PREFIX + text + "\n",
 	)
-	program: ParsedProgram = parse_compiler_source(wrapper_source)
+	program: ParsedProgram = parse_compiler_source_rebased(
+		wrapper_source,
+		source_start_offset - INTERPOLATION_WRAPPER_PREFIX.length(),
+	)
 
 	match first_parse_error(program.diagnostics):
 		Some(diagnostic):
@@ -1920,7 +2011,7 @@ private pure func parse_interpolation_expr(
 				value = None,
 				diagnostics = [
 					parse_error(
-						span,
+						source_location_span(table, span),
 						"Parse error in interpolated expression: " + diagnostic.message,
 					),
 				]
@@ -1928,7 +2019,7 @@ private pure func parse_interpolation_expr(
 		None:
 			match program.decls:
 				[VarParsedDecl(var_decl)]:
-					finalized = finalize_interpolation_expr(module_name, var_decl.value)
+					finalized = finalize_interpolation_expr(table, module_name, var_decl.value)
 					{
 						value = Some(finalized.value),
 						diagnostics = finalized.diagnostics
@@ -1937,14 +2028,18 @@ private pure func parse_interpolation_expr(
 					{
 						value = None,
 						diagnostics = [
-							parse_error(span, "Failed to parse interpolated expression: " + text),
+							parse_error(
+								source_location_span(table, span),
+								"Failed to parse interpolated expression: " + text,
+							),
 						]
 					}
 
 
 private pure func finalize_interpolation_parts(
+	table: SourceTable,
 	module_name: String,
-	span: SourceSpan,
+	span: SourceLocation,
 	raw_parts: List[StringInterpolationRawPart],
 ) -> InterpolationPartsResult:
 	var parts: List[ParsedStringInterpolationPart] = []
@@ -1954,8 +2049,14 @@ private pure func finalize_interpolation_parts(
 		match part:
 			InterpolationLiteralText(value):
 				parts = parts.append(ParsedInterpolationLiteral(value))
-			InterpolationExprText(text):
-				parsed_expr = parse_interpolation_expr(module_name, span, text)
+			InterpolationExprText(text, source_start_offset):
+				parsed_expr = parse_interpolation_expr(
+					table,
+					module_name,
+					span,
+					text,
+					source_start_offset,
+				)
 				diagnostics = diagnostics.concat(parsed_expr.diagnostics)
 
 				match parsed_expr.value:
@@ -1971,12 +2072,13 @@ private pure func finalize_interpolation_parts(
 
 
 private pure func finalize_optional_expr(
+	table: SourceTable,
 	module_name: String,
 	value: Option[ParsedExpr],
 ) -> ParsedExprOptionResult:
 	match value:
 		Some(expr):
-			finalized = finalize_interpolation_expr(module_name, expr)
+			finalized = finalize_interpolation_expr(table, module_name, expr)
 			{
 				value = Some(finalized.value),
 				diagnostics = finalized.diagnostics
@@ -1988,12 +2090,16 @@ private pure func finalize_optional_expr(
 			}
 
 
-private pure func finalize_exprs(module_name: String, items: List[ParsedExpr]) -> ParsedExprsResult:
+private pure func finalize_exprs(
+	table: SourceTable,
+	module_name: String,
+	items: List[ParsedExpr],
+) -> ParsedExprsResult:
 	var values: List[ParsedExpr] = []
 	var diagnostics: List[ParseDiagnostic] = []
 
 	for item in items:
-		finalized = finalize_interpolation_expr(module_name, item)
+		finalized = finalize_interpolation_expr(table, module_name, item)
 		values = values.append(finalized.value)
 
 		for diagnostic in finalized.diagnostics:
@@ -2006,6 +2112,7 @@ private pure func finalize_exprs(module_name: String, items: List[ParsedExpr]) -
 
 
 private pure func finalize_record_fields(
+	table: SourceTable,
 	module_name: String,
 	items: List[ParsedRecordExprField],
 ) -> RecordFieldsResult:
@@ -2013,7 +2120,7 @@ private pure func finalize_record_fields(
 	var diagnostics: List[ParseDiagnostic] = []
 
 	for item in items:
-		finalized = finalize_interpolation_expr(module_name, item.value)
+		finalized = finalize_interpolation_expr(table, module_name, item.value)
 		values = values.append({ item | value = finalized.value })
 		diagnostics = diagnostics.concat(finalized.diagnostics)
 
@@ -2024,6 +2131,7 @@ private pure func finalize_record_fields(
 
 
 private pure func finalize_dict_entries(
+	table: SourceTable,
 	module_name: String,
 	items: List[ParsedDictEntry],
 ) -> DictEntriesResult:
@@ -2031,8 +2139,8 @@ private pure func finalize_dict_entries(
 	var diagnostics: List[ParseDiagnostic] = []
 
 	for item in items:
-		key = finalize_interpolation_expr(module_name, item.key)
-		value = finalize_interpolation_expr(module_name, item.value)
+		key = finalize_interpolation_expr(table, module_name, item.key)
+		value = finalize_interpolation_expr(table, module_name, item.value)
 		values = values.append({ item |
 				key = key.value,
 				value = value.value
@@ -2047,6 +2155,7 @@ private pure func finalize_dict_entries(
 
 
 private pure func finalize_match_cases(
+	table: SourceTable,
 	module_name: String,
 	items: List[ParsedMatchCase],
 ) -> MatchCasesResult:
@@ -2054,7 +2163,7 @@ private pure func finalize_match_cases(
 	var diagnostics: List[ParseDiagnostic] = []
 
 	for item in items:
-		body = finalize_interpolation_expr(module_name, item.body)
+		body = finalize_interpolation_expr(table, module_name, item.body)
 		values = values.append({ item | body = body.value })
 		diagnostics = diagnostics.concat(body.diagnostics)
 
@@ -2065,24 +2174,25 @@ private pure func finalize_match_cases(
 
 
 private pure func finalize_select_arm_kind(
+	table: SourceTable,
 	module_name: String,
 	kind: ParsedSelectArmKind,
 ) -> SelectArmKindResult:
 	match kind:
 		ParsedSelectReceiveArm(name, source):
-			finalized = finalize_interpolation_expr(module_name, source)
+			finalized = finalize_interpolation_expr(table, module_name, source)
 			{
 				kind = ParsedSelectReceiveArm(name, finalized.value),
 				diagnostics = finalized.diagnostics
 			}
 		ParsedSelectSealedArm(source):
-			finalized = finalize_interpolation_expr(module_name, source)
+			finalized = finalize_interpolation_expr(table, module_name, source)
 			{
 				kind = ParsedSelectSealedArm(finalized.value),
 				diagnostics = finalized.diagnostics
 			}
 		ParsedSelectAfterArm(source):
-			finalized = finalize_interpolation_expr(module_name, source)
+			finalized = finalize_interpolation_expr(table, module_name, source)
 			{
 				kind = ParsedSelectAfterArm(finalized.value),
 				diagnostics = finalized.diagnostics
@@ -2090,6 +2200,7 @@ private pure func finalize_select_arm_kind(
 
 
 private pure func finalize_select_arms(
+	table: SourceTable,
 	module_name: String,
 	items: List[ParsedSelectArm],
 ) -> SelectArmsResult:
@@ -2097,8 +2208,8 @@ private pure func finalize_select_arms(
 	var diagnostics: List[ParseDiagnostic] = []
 
 	for item in items:
-		kind = finalize_select_arm_kind(module_name, item.kind)
-		body = finalize_interpolation_expr(module_name, item.body)
+		kind = finalize_select_arm_kind(table, module_name, item.kind)
+		body = finalize_interpolation_expr(table, module_name, item.body)
 		values = values.append({ item |
 				kind = kind.kind,
 				body = body.value
@@ -2113,6 +2224,7 @@ private pure func finalize_select_arms(
 
 
 private pure func finalize_concurrent_params(
+	table: SourceTable,
 	module_name: String,
 	items: List[ParsedConcurrentParam],
 ) -> ConcurrentParamsResult:
@@ -2120,7 +2232,7 @@ private pure func finalize_concurrent_params(
 	var diagnostics: List[ParseDiagnostic] = []
 
 	for item in items:
-		value = finalize_interpolation_expr(module_name, item.value)
+		value = finalize_interpolation_expr(table, module_name, item.value)
 		values = values.append({ item | value = value.value })
 		diagnostics = diagnostics.concat(value.diagnostics)
 
@@ -2131,12 +2243,13 @@ private pure func finalize_concurrent_params(
 
 
 private pure func finalize_with_error_map(
+	table: SourceTable,
 	module_name: String,
 	value: Option[ParsedWithErrorMap],
 ) -> WithErrorMapResult:
 	match value:
 		Some(error_map):
-			finalized = finalize_interpolation_expr(module_name, error_map.value)
+			finalized = finalize_interpolation_expr(table, module_name, error_map.value)
 			{
 				value = Some({ error_map | value = finalized.value }),
 				diagnostics = finalized.diagnostics
@@ -2149,11 +2262,12 @@ private pure func finalize_with_error_map(
 
 
 private pure func finalize_with_binding(
+	table: SourceTable,
 	module_name: String,
 	binding: ParsedWithBinding,
 ) -> WithBindingResult:
-	value = finalize_interpolation_expr(module_name, binding.value)
-	error_map = finalize_with_error_map(module_name, binding.error_map)
+	value = finalize_interpolation_expr(table, module_name, binding.value)
+	error_map = finalize_with_error_map(table, module_name, binding.error_map)
 	{
 		binding = { binding |
 			value = value.value,
@@ -2164,18 +2278,23 @@ private pure func finalize_with_binding(
 
 
 private pure func finalize_function_decl(
+	table: SourceTable,
 	module_name: String,
 	decl: ParsedFunctionDecl,
 ) -> FunctionDeclResult:
-	body = finalize_optional_expr(module_name, decl.body)
+	body = finalize_optional_expr(table, module_name, decl.body)
 	{
 		decl = { decl | body = body.value },
 		diagnostics = body.diagnostics
 	}
 
 
-private pure func finalize_var_decl(module_name: String, decl: ParsedVarDecl) -> VarDeclResult:
-	value = finalize_interpolation_expr(module_name, decl.value)
+private pure func finalize_var_decl(
+	table: SourceTable,
+	module_name: String,
+	decl: ParsedVarDecl,
+) -> VarDeclResult:
+	value = finalize_interpolation_expr(table, module_name, decl.value)
 	{
 		decl = { decl | value = value.value },
 		diagnostics = value.diagnostics
@@ -2183,10 +2302,11 @@ private pure func finalize_var_decl(module_name: String, decl: ParsedVarDecl) ->
 
 
 private pure func finalize_trait_method(
+	table: SourceTable,
 	module_name: String,
 	decl: ParsedTraitMethodDecl,
 ) -> TraitMethodResult:
-	body = finalize_optional_expr(module_name, decl.body)
+	body = finalize_optional_expr(table, module_name, decl.body)
 	{
 		method = { decl | body = body.value },
 		diagnostics = body.diagnostics
@@ -2194,6 +2314,7 @@ private pure func finalize_trait_method(
 
 
 private pure func finalize_trait_methods(
+	table: SourceTable,
 	module_name: String,
 	items: List[ParsedTraitMethodDecl],
 ) -> TraitMethodsResult:
@@ -2201,7 +2322,7 @@ private pure func finalize_trait_methods(
 	var diagnostics: List[ParseDiagnostic] = []
 
 	for item in items:
-		finalized = finalize_trait_method(module_name, item)
+		finalized = finalize_trait_method(table, module_name, item)
 		values = values.append(finalized.method)
 		diagnostics = diagnostics.concat(finalized.diagnostics)
 
@@ -2212,6 +2333,7 @@ private pure func finalize_trait_methods(
 
 
 private pure func finalize_function_decls(
+	table: SourceTable,
 	module_name: String,
 	items: List[ParsedFunctionDecl],
 ) -> FunctionDeclsResult:
@@ -2219,7 +2341,7 @@ private pure func finalize_function_decls(
 	var diagnostics: List[ParseDiagnostic] = []
 
 	for item in items:
-		finalized = finalize_function_decl(module_name, item)
+		finalized = finalize_function_decl(table, module_name, item)
 		values = values.append(finalized.decl)
 		diagnostics = diagnostics.concat(finalized.diagnostics)
 
@@ -2235,32 +2357,38 @@ private pure func finalize_function_decls(
 -- temporaries for every ParsedExpr variant. Logical chains use the explicit
 -- frame machine below.
 private pure func finalize_binary_spine_operand(
+	table: SourceTable,
 	module_name: String,
 	expr: ParsedExpr,
 ) -> ParsedExprResult:
 	match expr:
 		ParsedBinaryExpr(op, left, right, span):
-			finalize_binary_interpolation_expr(module_name, op, left, right, span)
+			finalize_binary_interpolation_expr(table, module_name, op, left, right, span)
 		_:
-			finalize_interpolation_expr(module_name, expr)
+			finalize_interpolation_expr(table, module_name, expr)
 
 
 private pure func finalize_binary_interpolation_expr(
+	table: SourceTable,
 	module_name: String,
 	op: ParsedBinaryOp,
 	left: ParsedExpr,
 	right: ParsedExpr,
-	span: SourceSpan,
+	span: SourceLocation,
 ) -> ParsedExprResult:
-	left_result = finalize_binary_spine_operand(module_name, left)
-	right_result = finalize_binary_spine_operand(module_name, right)
+	left_result = finalize_binary_spine_operand(table, module_name, left)
+	right_result = finalize_binary_spine_operand(table, module_name, right)
 	{
 		value = ParsedBinaryExpr(op, left_result.value, right_result.value, span),
 		diagnostics = left_result.diagnostics.concat(right_result.diagnostics)
 	}
 
 
-private pure func finalize_logical_expr(module_name: String, expr: ParsedExpr) -> ParsedExprResult:
+private pure func finalize_logical_expr(
+	table: SourceTable,
+	module_name: String,
+	expr: ParsedExpr,
+) -> ParsedExprResult:
 	-- Source logical chains are left-associated. Traverse this common generated
 	-- shape explicitly because the full expression matcher has a large -O0 C
 	-- frame and cannot recurse safely through thousands of terms.
@@ -2284,6 +2412,7 @@ private pure func finalize_logical_expr(module_name: String, expr: ParsedExpr) -
 					_:
 						action = ParsedLogicalFinalizeRebuildExpr(
 							finalize_interpolation_expr(
+								table,
 								module_name,
 								current,
 							),
@@ -2318,14 +2447,15 @@ private pure func finalize_logical_expr(module_name: String, expr: ParsedExpr) -
 
 
 private pure func finalize_interpolation_expr(
+	table: SourceTable,
 	module_name: String,
 	expr: ParsedExpr,
 ) -> ParsedExprResult:
 	match expr:
 		ParsedStringInterpolationExpr(value, is_multiline, span):
-			match split_interpolated_string(span, value):
+			match split_interpolated_string(table, span, value):
 				Ok(raw_parts):
-					parts = finalize_interpolation_parts(module_name, span, raw_parts)
+					parts = finalize_interpolation_parts(table, module_name, span, raw_parts)
 
 					if parts.diagnostics.length() == 0:
 						{
@@ -2347,107 +2477,107 @@ private pure func finalize_interpolation_expr(
 						diagnostics = [diagnostic]
 					}
 		ParsedUnaryExpr(op, value, span):
-			finalized = finalize_interpolation_expr(module_name, value)
+			finalized = finalize_interpolation_expr(table, module_name, value)
 			{
 				value = ParsedUnaryExpr(op, finalized.value, span),
 				diagnostics = finalized.diagnostics
 			}
 		ParsedBinaryExpr(op, left, right, span):
-			finalize_binary_interpolation_expr(module_name, op, left, right, span)
+			finalize_binary_interpolation_expr(table, module_name, op, left, right, span)
 		ParsedLogicalExpr(op, left, right, span):
-			finalize_logical_expr(module_name, expr)
+			finalize_logical_expr(table, module_name, expr)
 		ParsedAscriptionExpr(value, type_expr, span):
-			finalized = finalize_interpolation_expr(module_name, value)
+			finalized = finalize_interpolation_expr(table, module_name, value)
 			{
 				value = ParsedAscriptionExpr(finalized.value, type_expr, span),
 				diagnostics = finalized.diagnostics
 			}
 		ParsedRangeExpr(start, finish, span):
-			start_result = finalize_interpolation_expr(module_name, start)
-			finish_result = finalize_interpolation_expr(module_name, finish)
+			start_result = finalize_interpolation_expr(table, module_name, start)
+			finish_result = finalize_interpolation_expr(table, module_name, finish)
 			{
 				value = ParsedRangeExpr(start_result.value, finish_result.value, span),
 				diagnostics = start_result.diagnostics.concat(finish_result.diagnostics)
 			}
 		ParsedCallExpr(callee, args, span):
-			callee_result = finalize_interpolation_expr(module_name, callee)
-			args_result = finalize_exprs(module_name, args)
+			callee_result = finalize_interpolation_expr(table, module_name, callee)
+			args_result = finalize_exprs(table, module_name, args)
 			{
 				value = ParsedCallExpr(callee_result.value, args_result.values, span),
 				diagnostics = callee_result.diagnostics.concat(args_result.diagnostics)
 			}
 		ParsedFieldAccessExpr(target, field, span):
-			finalized = finalize_interpolation_expr(module_name, target)
+			finalized = finalize_interpolation_expr(table, module_name, target)
 			{
 				value = ParsedFieldAccessExpr(finalized.value, field, span),
 				diagnostics = finalized.diagnostics
 			}
 		ParsedSubscriptExpr(target, indices, span):
-			target_result = finalize_interpolation_expr(module_name, target)
-			indices_result = finalize_exprs(module_name, indices)
+			target_result = finalize_interpolation_expr(table, module_name, target)
+			indices_result = finalize_exprs(table, module_name, indices)
 			{
 				value = ParsedSubscriptExpr(target_result.value, indices_result.values, span),
 				diagnostics = target_result.diagnostics.concat(indices_result.diagnostics)
 			}
 		ParsedListExpr(items, span):
-			result = finalize_exprs(module_name, items)
+			result = finalize_exprs(table, module_name, items)
 			{
 				value = ParsedListExpr(result.values, span),
 				diagnostics = result.diagnostics
 			}
 		ParsedTupleExpr(items, span):
-			result = finalize_exprs(module_name, items)
+			result = finalize_exprs(table, module_name, items)
 			{
 				value = ParsedTupleExpr(result.values, span),
 				diagnostics = result.diagnostics
 			}
 		ParsedRecordExpr(fields, span):
-			result = finalize_record_fields(module_name, fields)
+			result = finalize_record_fields(table, module_name, fields)
 			{
 				value = ParsedRecordExpr(result.fields, span),
 				diagnostics = result.diagnostics
 			}
 		ParsedRecordUpdateExpr(base, fields, span):
-			base_result = finalize_interpolation_expr(module_name, base)
-			fields_result = finalize_record_fields(module_name, fields)
+			base_result = finalize_interpolation_expr(table, module_name, base)
+			fields_result = finalize_record_fields(table, module_name, fields)
 			{
 				value = ParsedRecordUpdateExpr(base_result.value, fields_result.fields, span),
 				diagnostics = base_result.diagnostics.concat(fields_result.diagnostics)
 			}
 		ParsedDictExpr(entries, span):
-			result = finalize_dict_entries(module_name, entries)
+			result = finalize_dict_entries(table, module_name, entries)
 			{
 				value = ParsedDictExpr(result.entries, span),
 				diagnostics = result.diagnostics
 			}
 		ParsedVectorExpr(items, span):
-			result = finalize_exprs(module_name, items)
+			result = finalize_exprs(table, module_name, items)
 			{
 				value = ParsedVectorExpr(result.values, span),
 				diagnostics = result.diagnostics
 			}
 		ParsedOpaqueIntoExpr(type_expr, value, span):
-			result = finalize_interpolation_expr(module_name, value)
+			result = finalize_interpolation_expr(table, module_name, value)
 			{
 				value = ParsedOpaqueIntoExpr(type_expr, result.value, span),
 				diagnostics = result.diagnostics
 			}
 		ParsedOpaqueFromExpr(type_expr, value, span):
-			result = finalize_interpolation_expr(module_name, value)
+			result = finalize_interpolation_expr(table, module_name, value)
 			{
 				value = ParsedOpaqueFromExpr(type_expr, result.value, span),
 				diagnostics = result.diagnostics
 			}
 		ParsedBlockExpr(items, span):
-			result = finalize_exprs(module_name, items)
+			result = finalize_exprs(table, module_name, items)
 			{
 				value = ParsedBlockExpr(result.values, span),
 				diagnostics = result.diagnostics
 			}
 		ParsedIfExpr(cond, then_expr, else_expr, span):
-			cond_result = finalize_interpolation_expr(module_name, cond)
-			then_result = finalize_interpolation_expr(module_name, then_expr)
-			else_result = finalize_optional_expr(module_name, else_expr)
+			cond_result = finalize_interpolation_expr(table, module_name, cond)
+			then_result = finalize_interpolation_expr(table, module_name, then_expr)
+			else_result = finalize_optional_expr(table, module_name, else_expr)
 			{
 				value = ParsedIfExpr(cond_result.value, then_result.value, else_result.value, span),
 				diagnostics = cond_result.diagnostics
@@ -2455,68 +2585,68 @@ private pure func finalize_interpolation_expr(
 					.concat(else_result.diagnostics)
 			}
 		ParsedMatchExpr(value, cases, span):
-			value_result = finalize_interpolation_expr(module_name, value)
-			cases_result = finalize_match_cases(module_name, cases)
+			value_result = finalize_interpolation_expr(table, module_name, value)
+			cases_result = finalize_match_cases(table, module_name, cases)
 			{
 				value = ParsedMatchExpr(value_result.value, cases_result.cases, span),
 				diagnostics = value_result.diagnostics.concat(cases_result.diagnostics)
 			}
 		ParsedSelectExpr(arms, span):
-			result = finalize_select_arms(module_name, arms)
+			result = finalize_select_arms(table, module_name, arms)
 			{
 				value = ParsedSelectExpr(result.arms, span),
 				diagnostics = result.diagnostics
 			}
 		ParsedWithExpr(binding, body, span):
-			binding_result = finalize_with_binding(module_name, binding)
-			body_result = finalize_interpolation_expr(module_name, body)
+			binding_result = finalize_with_binding(table, module_name, binding)
+			body_result = finalize_interpolation_expr(table, module_name, body)
 			{
 				value = ParsedWithExpr(binding_result.binding, body_result.value, span),
 				diagnostics = binding_result.diagnostics.concat(body_result.diagnostics)
 			}
 		ParsedDebugBlockExpr(body, span):
-			result = finalize_interpolation_expr(module_name, body)
+			result = finalize_interpolation_expr(table, module_name, body)
 			{
 				value = ParsedDebugBlockExpr(result.value, span),
 				diagnostics = result.diagnostics
 			}
 		ParsedLambdaExpr(is_pure, params, return_type, body, span):
-			result = finalize_interpolation_expr(module_name, body)
+			result = finalize_interpolation_expr(table, module_name, body)
 			{
 				value = ParsedLambdaExpr(is_pure, params, return_type, result.value, span),
 				diagnostics = result.diagnostics
 			}
 		ParsedFunctionDeclExpr(decl):
-			result = finalize_function_decl(module_name, decl)
+			result = finalize_function_decl(table, module_name, decl)
 			{
 				value = ParsedFunctionDeclExpr(result.decl),
 				diagnostics = result.diagnostics
 			}
 		ParsedWhileExpr(cond, body, span):
-			cond_result = finalize_interpolation_expr(module_name, cond)
-			body_result = finalize_interpolation_expr(module_name, body)
+			cond_result = finalize_interpolation_expr(table, module_name, cond)
+			body_result = finalize_interpolation_expr(table, module_name, body)
 			{
 				value = ParsedWhileExpr(cond_result.value, body_result.value, span),
 				diagnostics = cond_result.diagnostics.concat(body_result.diagnostics)
 			}
 		ParsedForExpr(binder, iterable, body, span):
-			iter_result = finalize_interpolation_expr(module_name, iterable)
-			body_result = finalize_interpolation_expr(module_name, body)
+			iter_result = finalize_interpolation_expr(table, module_name, iterable)
+			body_result = finalize_interpolation_expr(table, module_name, body)
 			{
 				value = ParsedForExpr(binder, iter_result.value, body_result.value, span),
 				diagnostics = iter_result.diagnostics.concat(body_result.diagnostics)
 			}
 		ParsedConcurrentBlockExpr(params, body, span):
-			params_result = finalize_concurrent_params(module_name, params)
-			body_result = finalize_interpolation_expr(module_name, body)
+			params_result = finalize_concurrent_params(table, module_name, params)
+			body_result = finalize_interpolation_expr(table, module_name, body)
 			{
 				value = ParsedConcurrentBlockExpr(params_result.params, body_result.value, span),
 				diagnostics = params_result.diagnostics.concat(body_result.diagnostics)
 			}
 		ParsedConcurrentForExpr(name, iterable, params, body, span):
-			iter_result = finalize_interpolation_expr(module_name, iterable)
-			params_result = finalize_concurrent_params(module_name, params)
-			body_result = finalize_interpolation_expr(module_name, body)
+			iter_result = finalize_interpolation_expr(table, module_name, iterable)
+			params_result = finalize_concurrent_params(table, module_name, params)
+			body_result = finalize_interpolation_expr(table, module_name, body)
 			{
 				value = ParsedConcurrentForExpr(
 					name,
@@ -2530,33 +2660,33 @@ private pure func finalize_interpolation_expr(
 					.concat(body_result.diagnostics)
 			}
 		ParsedDetachExpr(body, span):
-			result = finalize_interpolation_expr(module_name, body)
+			result = finalize_interpolation_expr(table, module_name, body)
 			{
 				value = ParsedDetachExpr(result.value, span),
 				diagnostics = result.diagnostics
 			}
 		ParsedVarDeclExpr(name, type_expr, value, is_mutable, span):
-			result = finalize_interpolation_expr(module_name, value)
+			result = finalize_interpolation_expr(table, module_name, value)
 			{
 				value = ParsedVarDeclExpr(name, type_expr, result.value, is_mutable, span),
 				diagnostics = result.diagnostics
 			}
 		ParsedAssignExpr(name, value, span):
-			result = finalize_interpolation_expr(module_name, value)
+			result = finalize_interpolation_expr(table, module_name, value)
 			{
 				value = ParsedAssignExpr(name, result.value, span),
 				diagnostics = result.diagnostics
 			}
 		ParsedCompoundAssignExpr(name, op, value, span):
-			result = finalize_interpolation_expr(module_name, value)
+			result = finalize_interpolation_expr(table, module_name, value)
 			{
 				value = ParsedCompoundAssignExpr(name, op, result.value, span),
 				diagnostics = result.diagnostics
 			}
 		ParsedSubscriptAssignExpr(target, indices, value, span):
-			target_result = finalize_interpolation_expr(module_name, target)
-			indices_result = finalize_exprs(module_name, indices)
-			value_result = finalize_interpolation_expr(module_name, value)
+			target_result = finalize_interpolation_expr(table, module_name, target)
+			indices_result = finalize_exprs(table, module_name, indices)
+			value_result = finalize_interpolation_expr(table, module_name, value)
 			{
 				value = ParsedSubscriptAssignExpr(
 					target_result.value,
@@ -2569,13 +2699,13 @@ private pure func finalize_interpolation_expr(
 					.concat(value_result.diagnostics)
 			}
 		ParsedTupleDestructExpr(names, value, span):
-			result = finalize_interpolation_expr(module_name, value)
+			result = finalize_interpolation_expr(table, module_name, value)
 			{
 				value = ParsedTupleDestructExpr(names, result.value, span),
 				diagnostics = result.diagnostics
 			}
 		ParsedQuestionBindExpr(name, type_expr, value, span):
-			result = finalize_interpolation_expr(module_name, value)
+			result = finalize_interpolation_expr(table, module_name, value)
 			{
 				value = ParsedQuestionBindExpr(name, type_expr, result.value, span),
 				diagnostics = result.diagnostics
@@ -2587,34 +2717,38 @@ private pure func finalize_interpolation_expr(
 			}
 
 
-private pure func finalize_decl(module_name: String, decl: ParsedDecl) -> DeclResult:
+private pure func finalize_decl(
+	table: SourceTable,
+	module_name: String,
+	decl: ParsedDecl,
+) -> DeclResult:
 	match decl:
 		FunctionParsedDecl(function_decl):
-			result = finalize_function_decl(module_name, function_decl)
+			result = finalize_function_decl(table, module_name, function_decl)
 			{
 				decl = FunctionParsedDecl(result.decl),
 				diagnostics = result.diagnostics
 			}
 		VarParsedDecl(var_decl):
-			result = finalize_var_decl(module_name, var_decl)
+			result = finalize_var_decl(table, module_name, var_decl)
 			{
 				decl = VarParsedDecl(result.decl),
 				diagnostics = result.diagnostics
 			}
 		TraitParsedDecl(trait_decl):
-			methods = finalize_trait_methods(module_name, trait_decl.methods)
+			methods = finalize_trait_methods(table, module_name, trait_decl.methods)
 			{
 				decl = TraitParsedDecl({ trait_decl | methods = methods.methods }),
 				diagnostics = methods.diagnostics
 			}
 		ImplParsedDecl(impl_decl):
-			methods = finalize_function_decls(module_name, impl_decl.methods)
+			methods = finalize_function_decls(table, module_name, impl_decl.methods)
 			{
 				decl = ImplParsedDecl({ impl_decl | methods = methods.functions }),
 				diagnostics = methods.diagnostics
 			}
 		PrivateParsedDecl(inner, span):
-			result = finalize_decl(module_name, inner)
+			result = finalize_decl(table, module_name, inner)
 			{
 				decl = PrivateParsedDecl(result.decl, span),
 				diagnostics = result.diagnostics
@@ -2626,12 +2760,16 @@ private pure func finalize_decl(module_name: String, decl: ParsedDecl) -> DeclRe
 			}
 
 
-private pure func finalize_decls(module_name: String, decls: List[ParsedDecl]) -> DeclsResult:
+private pure func finalize_decls(
+	table: SourceTable,
+	module_name: String,
+	decls: List[ParsedDecl],
+) -> DeclsResult:
 	var values: List[ParsedDecl] = []
 	var diagnostics: List[ParseDiagnostic] = []
 
 	for decl in decls:
-		result = finalize_decl(module_name, decl)
+		result = finalize_decl(table, module_name, decl)
 		values = values.append(result.decl)
 		diagnostics = diagnostics.concat(result.diagnostics)
 
@@ -2641,8 +2779,30 @@ private pure func finalize_decls(module_name: String, decls: List[ParsedDecl]) -
 	}
 
 
+private pure func finalize_interpolation_program_with_table(
+	program: ParsedProgram,
+	table: SourceTable,
+) -> ParsedProgram:
+	result = finalize_decls(table, program.source.module_name, program.decls)
+	{
+		source = program.source,
+		decls = result.decls,
+		diagnostics = program.diagnostics.concat(result.diagnostics)
+	}
+
+
 pure func finalize_interpolation_program(program: ParsedProgram) -> ParsedProgram:
-	result = finalize_decls(program.source.module_name, program.decls)
+	finalize_interpolation_program_with_table(
+		program,
+		unindexed_source_table_for_file(program.source),
+	)
+
+
+private pure func finalize_nested_functions_program_with_table(
+	program: ParsedProgram,
+	table: SourceTable,
+) -> ParsedProgram:
+	result = hoist_nested_decls(table, program.decls)
 	{
 		source = program.source,
 		decls = result.decls,
@@ -2651,18 +2811,17 @@ pure func finalize_interpolation_program(program: ParsedProgram) -> ParsedProgra
 
 
 pure func finalize_nested_functions_program(program: ParsedProgram) -> ParsedProgram:
-	result = hoist_nested_decls(program.decls)
-	{
-		source = program.source,
-		decls = result.decls,
-		diagnostics = program.diagnostics.concat(result.diagnostics)
-	}
+	finalize_nested_functions_program_with_table(
+		program,
+		unindexed_source_table_for_file(program.source),
+	)
 
 
 pure func finalize_typecheck_source_program(program: ParsedProgram) -> ParsedProgram:
-	rewrite_subscript_read_program(
-		finalize_nested_functions_program(finalize_interpolation_program(program)),
-	)
+	table: SourceTable = unindexed_source_table_for_file(program.source)
+	interpolated = finalize_interpolation_program_with_table(program, table)
+	nested = finalize_nested_functions_program_with_table(interpolated, table)
+	rewrite_subscript_read_program(nested)
 
 
 pure func finalized_typecheck_program(program: ParsedProgram) -> FinalizedTypecheckProgram:
