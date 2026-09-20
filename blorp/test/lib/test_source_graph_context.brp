@@ -1,5 +1,20 @@
 import:
+	../../src/compiler/pipeline: frontend_graph_discover
+	../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
+	../../src/compiler/stage_03_parse/source_ast_finalize:
+		FinalizedImportPathRewrite,
+		finalized_typecheck_program,
+		finalized_typecheck_program_rewrite_import_paths,
+	../../src/compiler/stage_04_modules/frontend_graph: frontend_graph_root_modules
+	../../src/compiler/stage_04_modules/frontend_graph_service:
+		FrontendSourceCandidate,
+		FrontendSourceInput(FinalizedFrontendSource),
+		FrontendSourceResolution(FrontendSourceUnresolved),
+	../../src/compiler/stage_04_modules/loaded_module:
+		ModuleOrigin(UserModule),
+		resolved_module_identity_from_resolver,
 	../../src/lib/cli_args: CliAction(CliCheck)
+	../../src/lib/source: source_file
 	../../src/lib/source_graph: source_graph_setup_for_paths
 	fs: create_directories, message, remove_directory_tree, write_text_atomic
 	io: print_error
@@ -59,12 +74,63 @@ func test_source_graph_setup_rejects_conflicting_project_contexts() -> Bool:
 			False
 
 
+--- Finalized imports can differ from their source text after a compiler-owned
+--- resolution rewrite. Discovery must retain that finalized root instead of
+--- reparsing the original text and silently losing the canonical path.
+func test_finalized_root_retains_rewritten_import_path() -> Bool:
+	source = source_file("/workspace/root.brp", "root", "import:\n\trequested\n\nVALUE = 1\n")
+	program = finalized_typecheck_program(parse_compiler_source(source))
+	rewritten = finalized_typecheck_program_rewrite_import_paths(
+		program,
+		source.path,
+		source.module_name,
+		[
+			{
+				from_path = source.path,
+				from_module = source.module_name,
+				import_path = "requested",
+				resolved_module = "canonical"
+			},
+		],
+	)
+	root: FrontendSourceCandidate = {
+		identity = resolved_module_identity_from_resolver("root", UserModule),
+		input = FinalizedFrontendSource(rewritten)
+	}
+
+	match (
+		frontend_graph_discover(
+			[root],
+			[],
+			func(_importer, requested_path):
+				if requested_path == "canonical":
+					Ok(FrontendSourceUnresolved)
+				else:
+					Err("expected canonical import path, found `" + requested_path + "`")
+			,
+			func(_location): Err("not reached"),
+		)
+	):
+		Err(_):
+			False
+		Ok(graph):
+			match frontend_graph_root_modules(graph):
+				[root_module]:
+					root_module.surface.import_paths == ["canonical"]
+				_:
+					False
+
+
 tests: TestSuite = {
 	description = "Shared source graph context",
 	tests = [
 		(
 			"rejects conflicting project contexts",
 			test_source_graph_setup_rejects_conflicting_project_contexts,
+		),
+		(
+			"retains finalized root import rewrites",
+			test_finalized_root_retains_rewritten_import_path,
 		),
 	]
 }
