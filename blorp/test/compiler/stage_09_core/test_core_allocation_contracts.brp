@@ -52,8 +52,18 @@ import:
 			VoidBox,
 		),
 		CoreBoxedStorageValue,
-		CoreCallKind(BuiltinCall, ForeignCall, ListToStringCall, UnknownCall, UserCall),
+		CoreCallKind(
+			BuiltinCall,
+			DirectRuntimeCall,
+			ForeignCall,
+			IntrinsicCall,
+			ListToStringCall,
+			UnknownCall,
+			UserCall,
+		),
 		CoreClosureCapture,
+		CoreDirectRuntimeArgs(DirectRuntimeArgsAsWritten),
+		CoreDirectRuntimeResult(DirectRuntimeResultAsWritten),
 		CoreExpr(
 			AccessorLiteralMatchExpr,
 			ClosureCreateExpr,
@@ -1092,6 +1102,109 @@ private pure func test_capture_and_reuse_contracts_preserve_hidden_causes() -> B
 			False
 
 
+private pure func test_closed_intrinsic_catalog_admits_only_audited_names() -> Bool:
+	var valid: Bool = True
+	audited_names: List[String] = [
+		"bit_and",
+		"bit_or",
+		"bit_xor",
+		"bit_not",
+		"shift_left",
+		"shift_right",
+		"list_len",
+		"list_capacity",
+		"string_len",
+		"bytes_len",
+		"dict_len",
+		"set_len",
+		"set_capacity",
+		"set_mask",
+		"dict_capacity",
+		"dict_mask",
+		"dict_grow_at",
+		"dict_order_len",
+		"slice_start",
+		"slice_len",
+		"memory_is_unique_heap",
+		"memory_is_unique_stack",
+		"memory_refcount_heap",
+		"memory_refcount_stack",
+		"memory_size_of_heap",
+		"memory_size_of_stack",
+		"memory_same_object_heap",
+		"memory_same_object_stack",
+		"tensor_len",
+		"tensor_capacity",
+		"fixed_value",
+		"fixed_scale",
+		"fixed_precision",
+		"fixed_pow10",
+	]
+
+	for name in audited_names:
+		contract: CoreAllocationContract = core_call_allocation_contract(IntrinsicCall(name))
+
+		if not allocation_facts_are_free(contract.facts) or not contract.dependencies.is_empty():
+			valid = False
+		else:
+			void
+
+	near_miss: CoreAllocationContract = core_call_allocation_contract(
+		IntrinsicCall("string_length"),
+	)
+
+	match near_miss.dependencies:
+		[RuntimeAllocationDependency]:
+			valid and near_miss.facts.unknown == [RuntimeOperationAllocation]
+		_:
+			False
+
+
+private pure func test_closed_runtime_catalog_distinguishes_safe_and_allocating() -> Bool:
+	var valid: Bool = True
+
+	for name in [
+		"blorp_min",
+		"blorp_max",
+		"blorp_hash_combine",
+		"blorp_length",
+		"blorp_codepoint_length",
+	]:
+		contract: CoreAllocationContract = core_call_allocation_contract(DirectRuntimeCall({
+			name = name,
+			args = DirectRuntimeArgsAsWritten,
+			result = DirectRuntimeResultAsWritten,
+		}))
+
+		if not allocation_facts_are_free(contract.facts) or not contract.dependencies.is_empty():
+			valid = False
+		else:
+			void
+
+	levenshtein: CoreAllocationContract = core_call_allocation_contract(DirectRuntimeCall({
+		name = "blorp_string_levenshtein",
+		args = DirectRuntimeArgsAsWritten,
+		result = DirectRuntimeResultAsWritten,
+	}))
+	unregistered: CoreAllocationContract = core_call_allocation_contract(DirectRuntimeCall({
+		name = "blorp_length_unregistered",
+		args = DirectRuntimeArgsAsWritten,
+		result = DirectRuntimeResultAsWritten,
+	}))
+
+	match unregistered.dependencies:
+		[RuntimeAllocationDependency]:
+			(
+				valid
+				and levenshtein.facts.may_allocate == [RawBufferAllocation]
+				and levenshtein.facts.unknown.is_empty()
+				and levenshtein.dependencies.is_empty()
+				and unregistered.facts.unknown == [RuntimeOperationAllocation]
+			)
+		_:
+			False
+
+
 private pure func test_fact_merging_is_stable_and_deduplicated() -> Bool:
 	merged: CoreLocalAllocationFacts = merge_allocation_facts(
 		{
@@ -1188,6 +1301,14 @@ tests: TestSuite = {
 		(
 			"capture and reuse contracts preserve hidden causes",
 			test_capture_and_reuse_contracts_preserve_hidden_causes,
+		),
+		(
+			"closed intrinsic catalog admits only audited names",
+			test_closed_intrinsic_catalog_admits_only_audited_names,
+		),
+		(
+			"closed runtime catalog distinguishes safe and allocating",
+			test_closed_runtime_catalog_distinguishes_safe_and_allocating,
 		),
 		("fact merging is stable and deduplicated", test_fact_merging_is_stable_and_deduplicated),
 	]
