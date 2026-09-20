@@ -16,8 +16,8 @@ import:
 			UnknownCallAllocationDependency,
 			ClosureAllocationDependency,
 		),
-		AllocationOperationCategory,
-		AllocationRiskReason(RuntimeCallbackBoundary, UnknownCallTarget),
+		AllocationOperationCategory(CallAllocationOperation),
+		AllocationRiskReason(MissingFunctionBody, RuntimeCallbackBoundary, UnknownCallTarget),
 		CoreAllocationContract,
 		CoreLocalAllocationFacts,
 		UnionCleanupPlan,
@@ -36,6 +36,7 @@ import:
 			NoReleasePolicy,
 			StackResultReleasePolicy,
 		),
+		CoreSourceLoc(SyntheticSourceLoc),
 		CoreType(
 			BoxedResultType,
 			EnumType,
@@ -53,6 +54,7 @@ import:
 			VoidType,
 		),
 		CoreUnionDecl,
+		core_expr_source_loc,
 		core_type_equal,
 	traverse as CoreTraverse
 	type_policy: cleanup_release_policy_for_type
@@ -74,6 +76,7 @@ enum AllocationProofStatus:
 record AllocationSite {
 	site_id: Int,
 	owner_index: Int,
+	loc: CoreSourceLoc,
 	category: AllocationOperationCategory,
 	facts: CoreLocalAllocationFacts,
 	coverage_complete: Bool
@@ -134,7 +137,8 @@ private record AllocationOwnerSeed {
 	def_id: Int,
 	name: String,
 	kind: AllocationOwnerKind,
-	body: Option[CoreExpr]
+	body: Option[CoreExpr],
+	loc: CoreSourceLoc
 }
 
 
@@ -260,6 +264,13 @@ private pure func missing_target_facts() -> CoreLocalAllocationFacts:
 	}
 
 
+private pure func missing_body_facts() -> CoreLocalAllocationFacts:
+	{
+		may_allocate = [],
+		unknown = [MissingFunctionBody]
+	}
+
+
 private pure func release_policies_equal(left: CoreReleasePolicy, right: CoreReleasePolicy) -> Bool:
 	match (left, right):
 		(NoReleasePolicy, NoReleasePolicy) | (ArcReleasePolicy, ArcReleasePolicy) | (ArcReleaseOnlyPolicy, ArcReleaseOnlyPolicy) | (StackResultReleasePolicy, StackResultReleasePolicy):
@@ -290,7 +301,8 @@ private pure func owner_seed_for_function(function_info: CoreFunction) -> Alloca
 		def_id = function_info.def_id,
 		name = function_info.name,
 		kind = AllocationFunctionOwner,
-		body = function_info.body
+		body = function_info.body,
+		loc = function_info.loc
 	}
 
 
@@ -307,6 +319,7 @@ private pure func allocation_owner_seeds(program: CoreProgram) -> List[Allocatio
 					name = global.name.name,
 					kind = AllocationGlobalOwner,
 					body = Some(global.init),
+					loc = global.loc,
 				})
 			ImplDecl(impl):
 				for method in impl.methods:
@@ -531,15 +544,30 @@ private pure func collect_owner(
 
 	match seed.body:
 		None:
+			facts: CoreLocalAllocationFacts = missing_body_facts()
+
+			incomplete_witness_site: Option[Int] = if registry_complete:
+				None
+			else:
+				Some(first_site_id)
+
+			site: AllocationSite = {
+				site_id = first_site_id,
+				owner_index = owner_index,
+				loc = seed.loc,
+				category = CallAllocationOperation,
+				facts = facts,
+				coverage_complete = registry_complete
+			}
 			{
 				local = {
-					facts = missing_target_facts(),
+					facts = facts,
 					coverage_complete = registry_complete,
 					may_witness_site = None,
-					unknown_witness_site = None,
-					incomplete_witness_site = None
+					unknown_witness_site = Some(first_site_id),
+					incomplete_witness_site = incomplete_witness_site
 				},
-				sites = [],
+				sites = [site],
 				pending_edges = [],
 				expression_nodes = 0,
 				cleanup_cache = initial_cleanup_cache,
@@ -616,6 +644,7 @@ private pure func collect_owner(
 							sites = sites.append({
 								site_id = site_id,
 								owner_index = owner_index,
+								loc = core_expr_source_loc(work.expr),
 								category = contract.category,
 								facts = site_facts,
 								coverage_complete = site_complete,

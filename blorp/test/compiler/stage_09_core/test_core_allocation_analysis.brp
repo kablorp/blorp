@@ -12,7 +12,12 @@ import:
 		allocation_summary_for_def_id,
 		analyze_core_allocations,
 	../../../src/compiler/stage_09_core/allocation_contracts:
-		AllocationRiskReason(CleanupScratchAllocation, RawBufferAllocation, UnknownCallTarget),
+		AllocationRiskReason(
+			CleanupScratchAllocation,
+			MissingFunctionBody,
+			RawBufferAllocation,
+			UnknownCallTarget,
+		),
 	../../../src/compiler/stage_09_core/ir:
 		CoreCallKind(SelectedDirectCall),
 		CoreDecl(FunctionDecl, UnionDecl),
@@ -23,7 +28,7 @@ import:
 		CoreLiteral(IntLiteral),
 		CoreProgram,
 		CoreReleasePolicy(ArcReleasePolicy),
-		CoreSourceLoc(SyntheticSourceLoc),
+		CoreSourceLoc(KnownSourceLoc, SyntheticSourceLoc),
 		CoreType(NamedType, TensorType, UnionType),
 		CoreUnionDecl,
 		CoreUnionPayloadStorage(TypedUnionPayloadStorage),
@@ -37,7 +42,7 @@ private pure func int_literal(value: Int) -> CoreExpr:
 	LiteralExpr(IntLiteral(value), INT_TYPE, SyntheticSourceLoc)
 
 
-private pure func allocation_expr() -> CoreExpr:
+private pure func allocation_expr_at(loc: CoreSourceLoc) -> CoreExpr:
 	ListConstructExpr(
 		{
 			layout = PointerListStorage,
@@ -48,15 +53,24 @@ private pure func allocation_expr() -> CoreExpr:
 			"List",
 			[INT_TYPE],
 		),
-		SyntheticSourceLoc,
+		loc,
 	)
+
+
+private pure func allocation_expr() -> CoreExpr:
+	allocation_expr_at(SyntheticSourceLoc)
 
 
 private pure func direct_call(def_id: Int) -> CoreExpr:
 	CallExpr(SelectedDirectCall(def_id), int_literal(0), [], INT_TYPE, SyntheticSourceLoc)
 
 
-private pure func function_decl(name: String, def_id: Int, body: Option[CoreExpr]) -> CoreDecl:
+private pure func function_decl_at(
+	name: String,
+	def_id: Int,
+	body: Option[CoreExpr],
+	loc: CoreSourceLoc,
+) -> CoreDecl:
 	FunctionDecl({
 		name = name,
 		source_module = None,
@@ -67,8 +81,12 @@ private pure func function_decl(name: String, def_id: Int, body: Option[CoreExpr
 		is_pure = True,
 		function_kind = UserFunction,
 		def_id = def_id,
-		loc = SyntheticSourceLoc,
+		loc = loc,
 	})
+
+
+private pure func function_decl(name: String, def_id: Int, body: Option[CoreExpr]) -> CoreDecl:
+	function_decl_at(name, def_id, body, SyntheticSourceLoc)
 
 
 private pure func program(decls: List[CoreDecl]) -> CoreProgram:
@@ -178,6 +196,19 @@ private pure func test_local_and_transitive_allocation_summaries() -> Bool:
 		and analysis.work.dependency_edges == 2
 		and analysis.work.expression_nodes == 5
 	)
+
+
+private pure func test_allocation_site_retains_core_source_location() -> Bool:
+	loc: CoreSourceLoc = KnownSourceLoc("source.brp", 4, 2, 4, 16)
+	analysis: CoreAllocationAnalysis = analyze_core_allocations(
+		program([function_decl("allocate", 10, Some(allocation_expr_at(loc)))]),
+	)
+
+	match analysis.sites:
+		[site]:
+			site.loc == loc
+		_:
+			False
 
 
 private pure func test_safe_recursive_component_is_proven_free() -> Bool:
@@ -356,11 +387,24 @@ private pure func test_long_call_chain_uses_iterative_bounded_work() -> Bool:
 
 
 private pure func test_bodyless_owner_fails_closed() -> Bool:
+	loc: CoreSourceLoc = KnownSourceLoc("external.brp", 7, 3, 7, 20)
 	analysis: CoreAllocationAnalysis = analyze_core_allocations(
-		program([function_decl("external", 10, None)]),
+		program([function_decl_at("external", 10, None, loc)]),
 	)
 
-	summary(analysis, 10).status == AllocationUnknown
+	site_ok: Bool = match analysis.sites.get(0):
+		Some(site):
+			site.facts.unknown == [MissingFunctionBody] and site.loc == loc
+		None:
+			False
+
+	(
+		summary(analysis, 10).status == AllocationUnknown
+		and summary(analysis, 10).facts.unknown == [MissingFunctionBody]
+		and summary(analysis, 10).unknown_witness_site == Some(0)
+		and analysis.sites.length() == 1
+		and site_ok
+	)
 
 
 private pure func test_unsupported_final_core_marks_analysis_incomplete() -> Bool:
@@ -414,6 +458,10 @@ tests: TestSuite = {
 		(
 			"local and transitive allocation summaries",
 			test_local_and_transitive_allocation_summaries,
+		),
+		(
+			"allocation site retains Core source location",
+			test_allocation_site_retains_core_source_location,
 		),
 		("safe recursive component is proven free", test_safe_recursive_component_is_proven_free),
 		(

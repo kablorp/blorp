@@ -1,0 +1,185 @@
+import:
+	../../../src/compiler/stage_09_core/allocation_analysis:
+		AllocationAnalysisWork,
+		AllocationDependencyEdge,
+		AllocationOwnerKind(AllocationFunctionOwner),
+		AllocationOwnerSummary,
+		AllocationProofStatus(AllocationMayAllocateAndUnknown, AllocationProvenFree),
+		AllocationSite,
+		CoreAllocationAnalysis,
+	../../../src/compiler/stage_09_core/allocation_contracts:
+		AllocationOperationCategory(CallAllocationOperation, CollectionAllocationOperation),
+		AllocationRiskReason(RawBufferAllocation, UnknownCallTarget),
+	../../../src/compiler/stage_09_core/allocation_report:
+		render_allocation_report_human,
+		render_allocation_report_json,
+	../../../src/compiler/stage_09_core/ir: CoreSourceLoc(KnownSourceLoc, SyntheticSourceLoc)
+	test: TestSuite
+
+
+private pure func work() -> AllocationAnalysisWork:
+	{
+		expression_nodes = 3,
+		allocation_sites = 2,
+		dependency_edges = 2,
+		component_count = 3,
+		cleanup_requests = 0,
+		cleanup_cache_hits = 0,
+		cleanup_type_nodes = 0,
+		worklist_pops = 2,
+		propagation_edge_visits = 2,
+		summary_updates = 1
+	}
+
+
+private pure func owner(
+	owner_index: Int,
+	def_id: Int,
+	name: String,
+	status: AllocationProofStatus,
+	may_witness_site: Option[Int],
+	unknown_witness_site: Option[Int],
+) -> AllocationOwnerSummary:
+	facts = if status == AllocationProvenFree:
+		{
+			may_allocate = [],
+			unknown = []
+		}
+	else:
+		{
+			may_allocate = [RawBufferAllocation],
+			unknown = [UnknownCallTarget]
+		}
+
+	{
+		owner_index = owner_index,
+		def_id = def_id,
+		name = name,
+		kind = AllocationFunctionOwner,
+		component_id = owner_index,
+		status = status,
+		facts = facts,
+		coverage_complete = True,
+		may_witness_site = may_witness_site,
+		unknown_witness_site = unknown_witness_site,
+		incomplete_witness_site = None
+	}
+
+
+private pure func analysis() -> CoreAllocationAnalysis:
+	call_site: AllocationSite = {
+		site_id = 0,
+		owner_index = 0,
+		loc = KnownSourceLoc("main.brp", 2, 2, 2, 12),
+		category = CallAllocationOperation,
+		facts = {
+			may_allocate = [],
+			unknown = []
+		},
+		coverage_complete = True
+	}
+	leaf_site: AllocationSite = {
+		site_id = 1,
+		owner_index = 1,
+		loc = SyntheticSourceLoc,
+		category = CollectionAllocationOperation,
+		facts = {
+			may_allocate = [RawBufferAllocation],
+			unknown = [UnknownCallTarget]
+		},
+		coverage_complete = True
+	}
+	edge: AllocationDependencyEdge = {
+		site_id = 0,
+		caller_index = 0,
+		callee_index = 1
+	}
+	cycle_edge: AllocationDependencyEdge = {
+		site_id = 1,
+		caller_index = 1,
+		callee_index = 0
+	}
+
+	{
+		owners = [
+			owner(0, 10, "root", AllocationMayAllocateAndUnknown, Some(0), Some(0)),
+			owner(1, 20, "leaf", AllocationMayAllocateAndUnknown, Some(1), Some(1)),
+			owner(2, 30, "safe", AllocationProvenFree, None, None),
+		],
+		sites = [call_site, leaf_site],
+		edges = [edge, cycle_edge],
+		work = work()
+	}
+
+
+private pure func test_json_report_is_versioned_and_fail_closed() -> Bool:
+	rendered: String = render_allocation_report_json("main.brp", analysis())
+
+	(
+		rendered.contains("\"schema_version\":1")
+		and rendered.contains("\"report_kind\":\"core_allocation_analysis\"")
+		and rendered.contains("\"compiler_identity\":{\"version\":")
+		and rendered.contains("\"executable_guarantee_status\":\"unavailable\"")
+		and rendered.contains("\"backend_plan_identity\":{\"status\":\"unavailable\"}")
+		and rendered.contains("\"backend_plan_coverage\":\"incomplete\"")
+		and rendered.contains("\"behavior_configuration_identity\":{\"status\":\"unavailable\"}")
+		and rendered.contains("\"behavior_configuration_coverage\":\"incomplete\"")
+		and rendered.contains("\"prepared_program_identity\":{\"status\":\"unavailable\"}")
+		and rendered.contains("\"core_status\":\"may_allocate_and_unknown\"")
+		and rendered.contains("\"executable_status\":\"incomplete\"")
+		and rendered.contains("\"may_witness_path\":[0,1]")
+		and rendered.contains("\"unknown_witness_path\":[0,1]")
+		and rendered.contains("\"source\":{\"status\":\"compiler_generated\"}")
+		and rendered.contains("\"owners\":[")
+	)
+
+
+private pure func test_witness_path_is_bounded_through_cycle() -> Bool:
+	rendered: String = render_allocation_report_json("main.brp", analysis())
+
+	(
+		rendered.contains("\"may_witness_path\":[0,1]")
+		and not rendered.contains("\"may_witness_path\":[0,1,0")
+	)
+
+
+private pure func test_json_report_is_deterministic_and_escapes_source_path() -> Bool:
+	source_path: String = "quoted\"path\nline.brp"
+	first: String = render_allocation_report_json(source_path, analysis())
+	second: String = render_allocation_report_json(source_path, analysis())
+
+	first == second and first.contains("\"source_path\":\"quoted\\\"path\\nline.brp\"")
+
+
+private pure func test_human_report_labels_core_only_safe_result() -> Bool:
+	rendered: String = render_allocation_report_human("main.brp", analysis())
+
+	(
+		rendered.contains("Executable allocation guarantee: unavailable")
+		and rendered.contains("root#10: may allocate and has unknown allocation boundaries")
+		and rendered.contains("may reasons: raw_buffer")
+		and rendered.contains("may witness: site 0 -> site 1")
+		and rendered.contains("unknown witness: site 0 -> site 1")
+		and rendered.contains("site 0 [call] main.brp:2:2")
+		and rendered.contains("site 1 [collection] compiler-generated")
+		and rendered.contains(
+			"safe#30: no known allocation in analyzed Core; executable coverage incomplete",
+		)
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp compiler allocation report rendering",
+	tests = [
+		("JSON report is versioned and fail closed", test_json_report_is_versioned_and_fail_closed),
+		(
+			"human report labels Core-only safe result",
+			test_human_report_labels_core_only_safe_result,
+		),
+		("witness path is bounded through cycle", test_witness_path_is_bounded_through_cycle),
+		(
+			"JSON report is deterministic and escapes source path",
+			test_json_report_is_deterministic_and_escapes_source_path,
+		),
+	]
+}

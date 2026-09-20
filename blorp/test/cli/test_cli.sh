@@ -281,6 +281,115 @@ $RUN_OUTPUT"
     fi
 }
 
+expect_allocation_report_json() {
+    local name="$1"
+    shift
+    local report_file
+    report_file=$(mktemp "$TMPDIR_CLI/allocation-report.XXXXXX") || exit 1
+
+    TOTAL=$((TOTAL + 1))
+    run_capture "" "$@"
+    printf '%s' "$RUN_OUTPUT" > "$report_file"
+
+    if [ "$RUN_CODE" -ne 0 ]; then
+        record_fail "$name" "expected exit 0, got $RUN_CODE
+$RUN_OUTPUT"
+    elif python3 - "$report_file" <<'PY'
+import json
+import pathlib
+import sys
+
+report = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert report["schema_version"] == 1
+assert report["report_kind"] == "core_allocation_analysis"
+assert report["compiler_identity"]["version"]
+assert report["executable_coverage_complete"] is False
+assert report["executable_guarantee_status"] == "unavailable"
+assert report["prepared_program_identity"]["status"] == "unavailable"
+assert report["backend_plan_coverage"] == "incomplete"
+assert report["behavior_configuration_coverage"] == "incomplete"
+assert isinstance(report["owners"], list) and report["owners"]
+assert isinstance(report["sites"], list)
+for owner in report["owners"]:
+    assert owner["executable_status"] == "incomplete"
+    assert "may_witness_path" in owner
+    assert "unknown_witness_path" in owner
+PY
+    then
+        record_pass "$name"
+    else
+        record_fail "$name" "allocation report is not valid fail-closed JSON
+$RUN_OUTPUT"
+    fi
+
+    rm -f "$report_file"
+}
+
+expect_compiled_allocation_facts() {
+    local name="$1"
+    local source_path="$2"
+    shift 2
+    local report_file
+    report_file=$(mktemp "$TMPDIR_CLI/allocation-facts.XXXXXX") || exit 1
+
+    TOTAL=$((TOTAL + 1))
+    run_capture "" "$@"
+    printf '%s' "$RUN_OUTPUT" > "$report_file"
+
+    if [ "$RUN_CODE" -ne 0 ]; then
+        record_fail "$name" "expected exit 0, got $RUN_CODE
+$RUN_OUTPUT"
+    elif python3 - "$report_file" "$source_path" <<'PY'
+import json
+import pathlib
+import sys
+
+report = json.loads(pathlib.Path(sys.argv[1]).read_text())
+source_path = sys.argv[2]
+owners = {owner["name"]: owner for owner in report["owners"]}
+
+local = owners["local_allocation"]
+assert local["core_status"] == "may_allocate"
+assert local["may_reasons"] == ["raw_buffer"]
+assert len(local["may_witness_path"]) == 1
+
+transitive = owners["transitive_allocation"]
+assert transitive["core_status"] == "may_allocate"
+assert transitive["may_reasons"] == ["raw_buffer"]
+assert len(transitive["may_witness_path"]) == 2
+
+cleanup = owners["allocating_cleanup"]
+assert "cleanup_scratch" in cleanup["may_reasons"]
+assert cleanup["may_witness_path"]
+
+foreign = owners["unknown_foreign_boundary"]
+assert foreign["core_status"] == "unknown"
+assert foreign["unknown_reasons"] == ["foreign_call_boundary"]
+assert foreign["unknown_witness_path"]
+
+bodyless = owners["external_value"]
+assert bodyless["unknown_reasons"] == ["missing_function_body"]
+assert bodyless["unknown_witness_path"]
+
+source_sites = [
+    site for site in report["sites"]
+    if site["source"].get("path") == source_path
+]
+assert source_sites
+assert any(site["may_reasons"] == ["raw_buffer"] for site in source_sites)
+assert any(site["unknown_reasons"] == ["foreign_call_boundary"] for site in source_sites)
+assert any("cleanup_scratch" in site["may_reasons"] for site in report["sites"])
+PY
+    then
+        record_pass "$name"
+    else
+        record_fail "$name" "compiled allocation facts did not match expected boundaries
+$RUN_OUTPUT"
+    fi
+
+    rm -f "$report_file"
+}
+
 expect_timing_labels() {
     local name="$1"
     local expected_code="$2"
@@ -778,6 +887,7 @@ verify_package_lifecycle() {
 }
 
 valid_prog="$TMPDIR_CLI/valid.brp"
+allocation_report_prog="$TMPDIR_CLI/allocation_report.brp"
 explicit_opaque_prog="$TMPDIR_CLI/explicit_opaque.brp"
 formatted_opaque_prog="$TMPDIR_CLI/formatted_opaque.brp"
 empty_prog="$TMPDIR_CLI/empty.brp"
@@ -924,6 +1034,39 @@ cat > "$valid_prog" <<'BRP'
 func main(args: List[String]) -> Int:
 	print("cli ok")
 	0
+BRP
+
+cat > "$allocation_report_prog" <<'BRP'
+foreign:
+	func external_value(value: Int) -> Int = "external_value"
+
+
+union Tree:
+	Leaf
+	Branch(Tree)
+
+
+func local_allocation() -> List[Int]:
+	[1, 2, 3]
+
+
+func transitive_allocation() -> List[Int]:
+	local_allocation()
+
+
+func unknown_foreign_boundary(value: Int) -> Int:
+	external_value(value)
+
+
+func allocating_cleanup() -> Void:
+	tree: Tree = Branch(Leaf)
+	void
+
+
+func main(args: List[String]) -> Int:
+	values: List[Int] = transitive_allocation()
+	allocating_cleanup()
+	unknown_foreign_boundary(values.length())
 BRP
 
 cat > "$compiler_runtime_import" <<'BRP'
@@ -1316,6 +1459,30 @@ fi
 if [ "$CLI_MODE" = "all" ]; then
     verify_package_lifecycle
 fi
+
+expect_output_contains "allocation report human output" 0 \
+	"Executable allocation guarantee: unavailable" \
+	"$BLORP_BIN" compile --no-format --explain-allocations "$valid_prog"
+expect_allocation_report_json "allocation report JSON output" \
+	"$BLORP_BIN" compile --no-format --explain-allocations=json "$valid_prog"
+expect_compiled_allocation_facts "allocation report preserves compiled source facts" \
+	"$allocation_report_prog" \
+	"$BLORP_BIN" compile --no-format --explain-allocations=json "$allocation_report_prog"
+TOTAL=$((TOTAL + 1))
+if [ -e "$compiled_c" ]; then
+	record_fail "allocation report does not emit default C output" \
+		"unexpected output file: $compiled_c"
+else
+	record_pass "allocation report does not emit default C output"
+fi
+expect_output_contains "allocation report rejects output path" 1 \
+	"Error: --explain-allocations does not accept -o" \
+	"$BLORP_BIN" compile --no-format --explain-allocations -o "$compiled_c" "$valid_prog"
+expect_output_contains "allocation report rejects stopped Core pipeline" 1 \
+	"Error: --explain-allocations requires the complete final Core pipeline" \
+	"$BLORP_BIN" compile --no-format --explain-allocations --stop-after=final "$valid_prog"
+expect_exit "allocation report rejects invalid source" 1 \
+	"$BLORP_BIN" compile --no-format --explain-allocations "$invalid_prog"
 
 expect_exit "compile success" 0 "$BLORP_BIN" compile --no-format -o "$compiled_c" "$valid_prog"
 TOTAL=$((TOTAL + 1))

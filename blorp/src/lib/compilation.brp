@@ -51,8 +51,9 @@ import:
 		runtime_projected_observations,
 		runtime_projected_typed_summary,
 	../compiler/stage_06_typecheck/bridge: TypecheckedGraph
+	../compiler/stage_09_core/allocation_analysis: CoreAllocationAnalysis, analyze_core_allocations
 	../compiler/stage_09_core/pass_runner: CorePassTiming
-	../compiler/stage_09_core/pipeline: PreparedCoreProgram
+	../compiler/stage_09_core/pipeline: PreparedCoreProgram, prepared_core_program_value
 	../lib/build_artifact:
 		BuildArtifact,
 		BuildArtifactConfiguration,
@@ -64,7 +65,7 @@ import:
 		CTranslationUnitPolicy,
 		SCRATCH_SHARED_HEADER_NAME,
 		c_shared_header_name,
-	cli_args: CliCompileArgs, CliRunArgs
+	cli_args: CliAllocationReportFormat, CliCompileArgs, CliRunArgs
 	cli_plan: CliCompilePlan, CliRunSourcePlan, compile_plan_source
 	diagnostic: cli_error_message
 	function_profile: FunctionProfileConfiguration, FunctionProfileMode, function_profile_mode
@@ -101,6 +102,7 @@ pure func compile_plan_parsed_summary(plan: CliCompilePlan) -> Option[String]:
 union CompileExecution:
 	CompileFrontendFailed(List[String])
 	CompileArtifact(String, CompileArtifactOutput, List[CompileObservation], Option[String])
+	CompileAllocationReport(String, CoreAllocationAnalysis, List[CompileObservation], Option[String])
 	CompileStopped(String, String, String, List[CompileObservation])
 	CompileCoreInvariantFailed(String)
 	CompileEmitFailed(String)
@@ -148,7 +150,8 @@ record PreparedCompileExecution {
 	configuration: BuildArtifactConfiguration,
 	late_stages: List[LateCoreStageRequest],
 	typed_program_summary: Option[String],
-	early_observations: List[CoreObservation]
+	early_observations: List[CoreObservation],
+	allocation_report: Option[CliAllocationReportFormat]
 }
 
 
@@ -193,7 +196,8 @@ record CompileContinuation {
 	native_features: List[BuildNativeFeature],
 	profile: FunctionProfileConfiguration,
 	compatibility: BuildCompatibility,
-	late_stages: List[LateCoreStageRequest]
+	late_stages: List[LateCoreStageRequest],
+	allocation_report: Option[CliAllocationReportFormat]
 }
 
 
@@ -384,11 +388,20 @@ func finish_prepared_compile_execution(prepared: PreparedCompileExecution) -> Co
 		LateCoreCompilePhaseInvariantFailed(stage_name, detail, _):
 			CompileCoreInvariantFailed("${stage_name}: ${detail}")
 		LateCoreCompilePhaseReady(late, _):
-			match emit_backend_compile_execution(late):
-				BackendEmissionCompilePhaseReady(emitted):
-					construct_artifact_compile_execution(emitted)
-				BackendEmissionCompilePhaseFailed(message):
-					CompileEmitFailed(message)
+			match late.prepared.allocation_report:
+				Some(_):
+					CompileAllocationReport(
+						late.prepared.compilation.target_path,
+						analyze_core_allocations(prepared_core_program_value(late.prepared_core)),
+						compile_observations(late.observations),
+						late.prepared.typed_program_summary,
+					)
+				None:
+					match emit_backend_compile_execution(late):
+						BackendEmissionCompilePhaseReady(emitted):
+							construct_artifact_compile_execution(emitted)
+						BackendEmissionCompilePhaseFailed(message):
+							CompileEmitFailed(message)
 
 
 func finish_prepared_run_artifact_execution(
@@ -436,6 +449,7 @@ private pure func compile_preparation_from_frontend(
 				late_stages = stage_requests.late_stages,
 				typed_program_summary = typed_program_summary,
 				early_observations = early_observations,
+				allocation_report = plan.options.allocation_report,
 			})
 
 
@@ -491,7 +505,8 @@ private pure func compile_continuation(
 		native_features = graph_native_features(plan.graph.graph),
 		profile = plan.options.profile,
 		compatibility = compile_compatibility(plan.options),
-		late_stages = stage_requests.late_stages
+		late_stages = stage_requests.late_stages,
+		allocation_report = plan.options.allocation_report
 	}
 
 
@@ -600,7 +615,8 @@ pure func prepared_compile_execution_from_projected(
 		),
 		late_stages = projected.continuation.late_stages,
 		typed_program_summary = runtime_projected_typed_summary(projected.projected),
-		early_observations = runtime_projected_observations(projected.projected)
+		early_observations = runtime_projected_observations(projected.projected),
+		allocation_report = projected.continuation.allocation_report
 	}
 
 
@@ -671,6 +687,7 @@ func prepare_run_plan(plan: CliRunSourcePlan) -> Result[CompilePreparation, List
 				late_stages = [],
 				typed_program_summary = typed_program_summary,
 				early_observations = early_observations,
+				allocation_report = None,
 			}))
 
 

@@ -1,0 +1,493 @@
+-- Human and JSON rendering for report-only final-Core allocation analysis.
+--
+-- Backend helper plans and behavior configuration do not yet have frozen
+-- structural identities. Every report therefore marks the executable
+-- guarantee unavailable, including functions whose analyzed Core has no
+-- known allocation. This module is explanatory output, not a certificate.
+import:
+	../stage_01_generated_inputs/compiler_build_info: VERSION, VERSION_DESCRIPTION
+	allocation_analysis:
+		AllocationDependencyEdge,
+		AllocationOwnerKind(AllocationFunctionOwner, AllocationGlobalOwner),
+		AllocationOwnerSummary,
+		AllocationProofStatus(
+			AllocationAnalysisIncomplete,
+			AllocationMayAllocate,
+			AllocationMayAllocateAndUnknown,
+			AllocationProvenFree,
+			AllocationUnknown,
+		),
+		AllocationSite,
+		CoreAllocationAnalysis,
+	allocation_contracts:
+		ALLOCATION_CONTRACT_CATALOG_REVISION,
+		AllocationOperationCategory(
+			BoxAllocationOperation,
+			CallAllocationOperation,
+			CleanupAllocationOperation,
+			ClosureAllocationOperation,
+			CollectionAllocationOperation,
+			ControlFlowAllocationOperation,
+			RecordAllocationOperation,
+			ScalarAllocationOperation,
+			TaskAllocationOperation,
+			TupleAllocationOperation,
+			UnionAllocationOperation,
+			UnsupportedAllocationOperation,
+		),
+		AllocationRiskReason,
+		allocation_reason_code,
+	ir: CoreSourceLoc(KnownSourceLoc, SyntheticSourceLoc)
+	json: JsonValue(JsonBool, JsonNumber, JsonObject, JsonString, JsonVector)
+
+
+private ALLOCATION_REPORT_SCHEMA_VERSION: Int = 1
+
+
+private enum WitnessKind:
+	MayAllocateWitness
+	UnknownAllocationWitness
+	IncompleteAnalysisWitness
+
+
+private record AllocationWitnessIndex {
+	sites_by_owner: List[List[AllocationSite]],
+	edges_by_owner: List[List[AllocationDependencyEdge]]
+}
+
+
+private pure func witness_index(analysis: CoreAllocationAnalysis) -> AllocationWitnessIndex:
+	empty_sites: List[AllocationSite] = []
+	empty_edges: List[AllocationDependencyEdge] = []
+	var sites_by_owner: List[List[AllocationSite]] = empty_sites.repeat(analysis.owners.length())
+	var edges_by_owner: List[List[AllocationDependencyEdge]] = empty_edges.repeat(
+		analysis.owners.length(),
+	)
+
+	for site in analysis.sites:
+		sites_by_owner = sites_by_owner.set(
+			site.owner_index,
+			sites_by_owner
+				.get_or(site.owner_index, [])
+				.append(site),
+		)
+
+	for edge in analysis.edges:
+		edges_by_owner = edges_by_owner.set(
+			edge.caller_index,
+			edges_by_owner
+				.get_or(edge.caller_index, [])
+				.append(edge),
+		)
+
+	{
+		sites_by_owner = sites_by_owner,
+		edges_by_owner = edges_by_owner
+	}
+
+
+private pure func site_matches_witness(site: AllocationSite, kind: WitnessKind) -> Bool:
+	match kind:
+		MayAllocateWitness:
+			not site.facts.may_allocate.is_empty()
+		UnknownAllocationWitness:
+			not site.facts.unknown.is_empty()
+		IncompleteAnalysisWitness:
+			not site.coverage_complete
+
+
+private pure func first_local_witness_site(
+	index: AllocationWitnessIndex,
+	owner_index: Int,
+	kind: WitnessKind,
+) -> Option[AllocationSite]:
+	index.sites_by_owner
+		.get_or(owner_index, [])
+		.find(func(site): site_matches_witness(site, kind))
+
+
+-- Breadth-first predecessor rows keep one bounded deterministic path even for
+-- recursive components. No call-chain strings or expanded paths are retained
+-- in the analysis product.
+private pure func witness_path(
+	analysis: CoreAllocationAnalysis,
+	index: AllocationWitnessIndex,
+	start_owner: Int,
+	kind: WitnessKind,
+) -> List[Int]:
+	owner_count: Int = analysis.owners.length()
+	var visited: List[Bool] = False.repeat(owner_count)
+	var predecessor_owner: List[Int] = (-1).repeat(owner_count)
+	var predecessor_site: List[Int] = (-1).repeat(owner_count)
+	var queue: List[Int] = [start_owner]
+	var cursor: Int = 0
+	var terminal_owner: Int = -1
+	var terminal_site: Int = -1
+
+	if start_owner >= 0 and start_owner < owner_count:
+		visited = visited.set(start_owner, True)
+	else:
+		queue = []
+
+	while cursor < queue.length() and terminal_owner < 0:
+		owner_index: Int = queue.get_or(cursor, -1)
+		cursor += 1
+
+		match first_local_witness_site(index, owner_index, kind):
+			Some(site):
+				terminal_owner = owner_index
+				terminal_site = site.site_id
+			None:
+				for edge in index.edges_by_owner.get_or(owner_index, []):
+					if not visited.get_or(edge.callee_index, True):
+						visited = visited.set(edge.callee_index, True)
+						predecessor_owner = predecessor_owner.set(edge.callee_index, owner_index)
+						predecessor_site = predecessor_site.set(edge.callee_index, edge.site_id)
+						queue = queue.append(edge.callee_index)
+					else:
+						void
+
+	if terminal_owner < 0:
+		[]
+	else:
+		var reverse_path: List[Int] = [terminal_site]
+		var current: Int = terminal_owner
+
+		while current != start_owner and current >= 0:
+			reverse_path = reverse_path.append(predecessor_site.get_or(current, -1))
+			current = predecessor_owner.get_or(current, -1)
+
+		reverse_path.reverse()
+
+
+private pure func proof_status_code(status: AllocationProofStatus) -> String:
+	match status:
+		AllocationProvenFree:
+			"core_no_known_allocation"
+		AllocationMayAllocate:
+			"may_allocate"
+		AllocationUnknown:
+			"unknown"
+		AllocationMayAllocateAndUnknown:
+			"may_allocate_and_unknown"
+		AllocationAnalysisIncomplete:
+			"incomplete"
+
+
+private pure func operation_category_code(category: AllocationOperationCategory) -> String:
+	match category:
+		ScalarAllocationOperation:
+			"scalar"
+		ControlFlowAllocationOperation:
+			"control_flow"
+		BoxAllocationOperation:
+			"box"
+		TupleAllocationOperation:
+			"tuple"
+		CollectionAllocationOperation:
+			"collection"
+		RecordAllocationOperation:
+			"record"
+		UnionAllocationOperation:
+			"union"
+		ClosureAllocationOperation:
+			"closure"
+		TaskAllocationOperation:
+			"task"
+		CleanupAllocationOperation:
+			"cleanup"
+		CallAllocationOperation:
+			"call"
+		UnsupportedAllocationOperation:
+			"unsupported"
+
+
+private pure func owner_kind_code(kind: AllocationOwnerKind) -> String:
+	match kind:
+		AllocationFunctionOwner:
+			"function"
+		AllocationGlobalOwner:
+			"global"
+
+
+private pure func reason_vector(reasons: List[AllocationRiskReason]) -> JsonValue:
+	JsonVector(reasons.map(
+		func(reason): JsonString(allocation_reason_code(reason)),
+	))
+
+
+private pure func int_vector(values: List[Int]) -> JsonValue:
+	JsonVector(values.map(
+		func(value): JsonNumber(to_float(value)),
+	))
+
+
+private pure func source_json(loc: CoreSourceLoc) -> JsonValue:
+	match loc:
+		KnownSourceLoc(path, line, column, end_line, end_column):
+			JsonObject([
+				("status", JsonString("known")),
+				("path", JsonString(path)),
+				("line", JsonNumber(to_float(line))),
+				("column", JsonNumber(to_float(column))),
+				("end_line", JsonNumber(to_float(end_line))),
+				("end_column", JsonNumber(to_float(end_column))),
+			])
+		SyntheticSourceLoc:
+			JsonObject([("status", JsonString("compiler_generated"))])
+
+
+private pure func unavailable_identity() -> JsonValue:
+	JsonObject([("status", JsonString("unavailable"))])
+
+
+private pure func compiler_identity() -> JsonValue:
+	JsonObject([
+		("version", JsonString(VERSION)),
+		("description", JsonString(VERSION_DESCRIPTION)),
+	])
+
+
+private pure func owner_json(
+	analysis: CoreAllocationAnalysis,
+	index: AllocationWitnessIndex,
+	owner: AllocationOwnerSummary,
+) -> JsonValue:
+	JsonObject([
+		("owner_index", JsonNumber(to_float(owner.owner_index))),
+		("definition_id", JsonNumber(to_float(owner.def_id))),
+		("name", JsonString(owner.name)),
+		("kind", JsonString(owner_kind_code(owner.kind))),
+		("core_status", JsonString(proof_status_code(owner.status))),
+		("executable_status", JsonString("incomplete")),
+		("coverage_complete", JsonBool(owner.coverage_complete)),
+		("may_reasons", reason_vector(owner.facts.may_allocate)),
+		("unknown_reasons", reason_vector(owner.facts.unknown)),
+		(
+			"may_witness_path",
+			int_vector(witness_path(analysis, index, owner.owner_index, MayAllocateWitness)),
+		),
+		(
+			"unknown_witness_path",
+			int_vector(
+				witness_path(
+					analysis,
+					index,
+					owner.owner_index,
+					UnknownAllocationWitness,
+				),
+			),
+		),
+		(
+			"incomplete_witness_path",
+			int_vector(
+				witness_path(
+					analysis,
+					index,
+					owner.owner_index,
+					IncompleteAnalysisWitness,
+				),
+			),
+		),
+	])
+
+
+private pure func site_json(site: AllocationSite) -> JsonValue:
+	JsonObject([
+		("site_id", JsonNumber(to_float(site.site_id))),
+		("owner_index", JsonNumber(to_float(site.owner_index))),
+		("category", JsonString(operation_category_code(site.category))),
+		("source", source_json(site.loc)),
+		("may_reasons", reason_vector(site.facts.may_allocate)),
+		("unknown_reasons", reason_vector(site.facts.unknown)),
+		("coverage_complete", JsonBool(site.coverage_complete)),
+	])
+
+
+private pure func work_json(analysis: CoreAllocationAnalysis) -> JsonValue:
+	work = analysis.work
+	JsonObject([
+		("expression_nodes", JsonNumber(to_float(work.expression_nodes))),
+		("allocation_sites", JsonNumber(to_float(work.allocation_sites))),
+		("dependency_edges", JsonNumber(to_float(work.dependency_edges))),
+		("component_count", JsonNumber(to_float(work.component_count))),
+		("cleanup_requests", JsonNumber(to_float(work.cleanup_requests))),
+		("cleanup_cache_hits", JsonNumber(to_float(work.cleanup_cache_hits))),
+		("cleanup_type_nodes", JsonNumber(to_float(work.cleanup_type_nodes))),
+		("worklist_pops", JsonNumber(to_float(work.worklist_pops))),
+		("propagation_edge_visits", JsonNumber(to_float(work.propagation_edge_visits))),
+		("summary_updates", JsonNumber(to_float(work.summary_updates))),
+	])
+
+
+pure func render_allocation_report_json(
+	source_path: String,
+	analysis: CoreAllocationAnalysis,
+) -> String:
+	index: AllocationWitnessIndex = witness_index(analysis)
+	JsonObject([
+		("schema_version", JsonNumber(to_float(ALLOCATION_REPORT_SCHEMA_VERSION))),
+		("report_kind", JsonString("core_allocation_analysis")),
+		("source_path", JsonString(source_path)),
+		("compiler_identity", compiler_identity()),
+		("contract_catalog_revision", JsonNumber(to_float(ALLOCATION_CONTRACT_CATALOG_REVISION))),
+		("prepared_program_identity", unavailable_identity()),
+		("backend_plan_identity", unavailable_identity()),
+		("backend_plan_coverage", JsonString("incomplete")),
+		("behavior_configuration_identity", unavailable_identity()),
+		("behavior_configuration_coverage", JsonString("incomplete")),
+		("executable_coverage_complete", JsonBool(False)),
+		("executable_guarantee_status", JsonString("unavailable")),
+		("owners", JsonVector(analysis.owners.map(
+				func(owner): owner_json(analysis, index, owner),
+			))),
+		("sites", JsonVector(analysis.sites.map(site_json))),
+		("work", work_json(analysis)),
+	]).to_string()
+
+
+private pure func witness_path_text(path: List[Int]) -> String:
+	if path.is_empty():
+		"unavailable"
+	else:
+		path
+			.map(func(site_id): "site " + site_id.to_string())
+			.join(" -> ")
+
+
+private pure func reasons_text(reasons: List[AllocationRiskReason]) -> String:
+	if reasons.is_empty():
+		"none"
+	else:
+		reasons
+			.map(allocation_reason_code)
+			.join(", ")
+
+
+private pure func source_text(loc: CoreSourceLoc) -> String:
+	match loc:
+		KnownSourceLoc(path, line, column, _, _):
+			path + ":" + line.to_string() + ":" + column.to_string()
+		SyntheticSourceLoc:
+			"compiler-generated"
+
+
+private pure func owner_human(
+	analysis: CoreAllocationAnalysis,
+	index: AllocationWitnessIndex,
+	owner: AllocationOwnerSummary,
+) -> String:
+	prefix: String = owner.name + "#" + owner.def_id.to_string() + ": "
+
+	status: String = match owner.status:
+		AllocationProvenFree:
+			"no known allocation in analyzed Core; executable coverage incomplete"
+		AllocationMayAllocate:
+			"may allocate"
+		AllocationUnknown:
+			"has unknown allocation boundaries"
+		AllocationMayAllocateAndUnknown:
+			"may allocate and has unknown allocation boundaries"
+		AllocationAnalysisIncomplete:
+			"Core allocation analysis incomplete"
+
+	var lines: List[String] = [prefix + status]
+
+	if not owner.facts.may_allocate.is_empty():
+		lines = lines.append("  may reasons: " + reasons_text(owner.facts.may_allocate))
+		lines = lines.append(
+			"  may witness: " + witness_path_text(
+				witness_path(
+					analysis,
+					index,
+					owner.owner_index,
+					MayAllocateWitness,
+				),
+			),
+		)
+	else:
+		void
+
+	if not owner.facts.unknown.is_empty():
+		lines = lines.append("  unknown reasons: " + reasons_text(owner.facts.unknown))
+		lines = lines.append(
+			"  unknown witness: " + witness_path_text(
+				witness_path(
+					analysis,
+					index,
+					owner.owner_index,
+					UnknownAllocationWitness,
+				),
+			),
+		)
+	else:
+		void
+
+	if not owner.coverage_complete:
+		lines = lines.append(
+			"  incomplete witness: " + witness_path_text(
+				witness_path(
+					analysis,
+					index,
+					owner.owner_index,
+					IncompleteAnalysisWitness,
+				),
+			),
+		)
+	else:
+		void
+
+	lines.join("\n")
+
+
+private pure func site_human(site: AllocationSite) -> String:
+	coverage: String = if site.coverage_complete:
+		"complete"
+	else:
+		"incomplete"
+
+	[
+		"site " + site.site_id.to_string() + " [" + operation_category_code(
+			site.category,
+		) + "] " + source_text(site.loc),
+		"  may reasons: " + reasons_text(site.facts.may_allocate),
+		"  unknown reasons: " + reasons_text(site.facts.unknown),
+		"  coverage: " + coverage,
+	].join("\n")
+
+
+pure func render_allocation_report_human(
+	source_path: String,
+	analysis: CoreAllocationAnalysis,
+) -> String:
+	index: AllocationWitnessIndex = witness_index(analysis)
+	header: String = [
+		"Allocation report for " + source_path,
+		"Compiler: blorp " + VERSION,
+		"Scope: final prepared Core plus cataloged cleanup contracts",
+		"Executable allocation guarantee: unavailable",
+		(
+			"Reason: backend helper plan and behavior configuration identities are "
+			+ "unavailable"
+		),
+		"Contract catalog revision: " + ALLOCATION_CONTRACT_CATALOG_REVISION.to_string(),
+	].join("\n")
+	owners: String = analysis.owners
+		.map(func(owner): owner_human(analysis, index, owner))
+		.join("\n")
+	sites: String = analysis.sites
+		.map(site_human)
+		.join("\n")
+	var sections: List[String] = [header]
+
+	if not owners.is_empty():
+		sections = sections.append("Owners:\n" + owners)
+	else:
+		void
+
+	if not sites.is_empty():
+		sections = sections.append("Sites:\n" + sites)
+	else:
+		void
+
+	sections.join("\n")

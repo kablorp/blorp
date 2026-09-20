@@ -2975,6 +2975,16 @@ bin/blorp test --help
 bin/blorp format --help
 ```
 
+To inspect conservative allocation facts after the complete final Core
+pipeline, use `bin/blorp compile --explain-allocations SOURCE.brp` for human
+output or `--explain-allocations=json` for a versioned machine-readable report.
+Report mode does not emit C and cannot be combined with `-o`, `--ast`, AST
+dump options, or `--stop-after`. A successful report command means analysis
+completed, not that the program is allocation-free. Current reports cover analyzed Core and
+cataloged cleanup contracts, but explicitly mark backend-plan and behavior-
+configuration coverage incomplete; they do not make an executable allocation-
+free guarantee.
+
 Project configuration is discovered from the nearest `blorp.toml`. `[std].path`
 selects a project standard library, and `[packages]` declares source-package
 aliases. Command-line overrides and common environment variables are listed by

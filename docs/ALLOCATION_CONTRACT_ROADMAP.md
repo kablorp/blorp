@@ -1,11 +1,13 @@
 # Allocation explanation and `no_alloc` roadmap
 
-Status: proposed implementation plan; **none of the new syntax, flags, or
-allocation contracts below is implemented**. This is a design/acceptance
-document, not the current language reference. Investigated against
-`4054fe4d8350df1fab96b5ae8a8c2435e9b55608` on 2026-09-20. Recheck symbol
-locations and the pipeline order before implementation; do not transplant
-historical line numbers into code.
+Status: implementation in progress. The final-Core analysis and allocation
+explanation flag described through milestone 3 are implemented. Backend-plan
+and behavior-configuration coverage is still incomplete, so reports explicitly
+make no executable allocation-free guarantee. The proposed `no_alloc` syntax
+and enforcement in milestones 4 and later are not implemented. This remains a
+design/acceptance document rather than the current language reference for those
+later milestones. Recheck symbol locations and pipeline order before further
+implementation; do not transplant historical line numbers into code.
 
 ## Outcome and boundaries
 
@@ -315,6 +317,16 @@ not ship as working `no_alloc`. Milestone 6's focused runtime oracle should
 be developed alongside 1/2, then used for the release gate. No implementation
 milestone is complete merely because the next stage can compensate for it.
 
+Implementation status:
+
+| Milestone | Status | Current boundary |
+| --- | --- | --- |
+| 0. Contract/coverage inventory | Complete | Core expression/call coverage is manifest-owned and new variants fail closed. |
+| 1. Shared operation and cleanup facts | Partial | The closed Core/cleanup catalog and runtime pilot exist; backend helper plans and behavior configuration do not yet publish complete structural identities. |
+| 2. Final-Core summary analysis | Complete for report scope | Deterministic dense identities, iterative SCC propagation, cleanup memoization, separate may/unknown facts, source sites, and bounded work counters are implemented. |
+| 3. Allocation explanation interface | Complete | Human and versioned JSON reports run after final prepared Core without C emission; executable coverage remains explicitly incomplete. |
+| 4-7. Source contracts, enforcement, runtime oracle, precision | Not implemented | No `no_alloc` syntax or allocation-contract rejection is available yet. |
+
 ### 0. Freeze the contract and allocation-coverage inventory
 
 **Context.** Constructor-only checking would miss raw growth, destructor
@@ -430,11 +442,13 @@ Keep reporting separate from rejection: unannotated risky code remains legal.
 Attach source locations before rendering, with explicit "compiler-generated"
 fallback provenance. Expose the same structured result for future LSP use.
 
-**Example report (proposed fields).**
+**Example report (abridged current fields).**
 
 ```json
-{"schema_version":1,"status":"may_allocate","function_id":42,
- "reason":"union_payload_box","site_id":17,"witness_path":[8,17]}
+{"schema_version":1,"report_kind":"core_allocation_analysis",
+ "executable_guarantee_status":"unavailable",
+ "owners":[{"definition_id":42,"core_status":"may_allocate",
+ "may_reasons":["heap_box"],"may_witness_path":[8,17]}]}
 ```
 
 IDs are artifact-local; also include source/canonical declaration display
@@ -745,9 +759,9 @@ semantic/artifact identity can be established, and no giant pasted logs.
 
 ## Completion checklist
 
-- [ ] Shared allocation/cleanup contracts and exhaustive coverage tests.
-- [ ] Indexed final-Core analysis, recursive summaries and bounded witnesses.
-- [ ] Useful human and machine-readable allocation explanations.
+- [ ] Complete shared backend/runtime allocation and cleanup contracts; the Core catalog and exhaustive coverage tests are implemented.
+- [x] Indexed final-Core analysis, recursive summaries and bounded witnesses.
+- [x] Useful human and machine-readable allocation explanations.
 - [ ] Region syntax/provenance survives all relevant transforms.
 - [ ] Consistent `check`/compile/run/test enforcement and honest LSP status.
 - [ ] Runtime oracle catches raw growth, boxing and allocating destruction.
