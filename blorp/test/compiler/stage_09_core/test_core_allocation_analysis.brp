@@ -1,0 +1,453 @@
+import:
+	../../../src/compiler/stage_09_core/allocation_analysis:
+		AllocationOwnerKind(AllocationFunctionOwner),
+		AllocationOwnerSummary,
+		AllocationProofStatus(
+			AllocationAnalysisIncomplete,
+			AllocationMayAllocate,
+			AllocationProvenFree,
+			AllocationUnknown,
+		),
+		CoreAllocationAnalysis,
+		allocation_summary_for_def_id,
+		analyze_core_allocations,
+	../../../src/compiler/stage_09_core/allocation_contracts:
+		AllocationRiskReason(CleanupScratchAllocation, RawBufferAllocation, UnknownCallTarget),
+	../../../src/compiler/stage_09_core/ir:
+		CoreCallKind(SelectedDirectCall),
+		CoreDecl(FunctionDecl, UnionDecl),
+		CoreExpr(CallExpr, DebugBlockExpr, DropExpr, ListConstructExpr, LiteralExpr, SeqExpr),
+		CoreFunction,
+		CoreFunctionKind(UserFunction),
+		CoreListStorageLayout(PointerListStorage),
+		CoreLiteral(IntLiteral),
+		CoreProgram,
+		CoreReleasePolicy(ArcReleasePolicy),
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(NamedType, TensorType, UnionType),
+		CoreUnionDecl,
+		CoreUnionPayloadStorage(TypedUnionPayloadStorage),
+	test: TestSuite
+
+
+private INT_TYPE: CoreType = NamedType("Int", [])
+
+
+private pure func int_literal(value: Int) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), INT_TYPE, SyntheticSourceLoc)
+
+
+private pure func allocation_expr() -> CoreExpr:
+	ListConstructExpr(
+		{
+			layout = PointerListStorage,
+			elements = [],
+			elem_needs_release = False
+		},
+		NamedType(
+			"List",
+			[INT_TYPE],
+		),
+		SyntheticSourceLoc,
+	)
+
+
+private pure func direct_call(def_id: Int) -> CoreExpr:
+	CallExpr(SelectedDirectCall(def_id), int_literal(0), [], INT_TYPE, SyntheticSourceLoc)
+
+
+private pure func function_decl(name: String, def_id: Int, body: Option[CoreExpr]) -> CoreDecl:
+	FunctionDecl({
+		name = name,
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = INT_TYPE,
+		body = body,
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = def_id,
+		loc = SyntheticSourceLoc,
+	})
+
+
+private pure func program(decls: List[CoreDecl]) -> CoreProgram:
+	{
+		decls = decls,
+		foreign_includes = []
+	}
+
+
+private pure func recursive_union_decl() -> CoreUnionDecl:
+	{
+		abi_type = None,
+		name = "Node",
+		type_params = [],
+		payload_storage = TypedUnionPayloadStorage,
+		variants = [
+			{
+				name = "Node",
+				c_name = "node",
+				tag = 0,
+				tag_c_name = "NODE_TAG",
+				fields = [
+					{
+						typ = UnionType("Node"),
+						release_policy = ArcReleasePolicy
+					},
+				],
+				def_id = None
+			},
+		],
+		loc = SyntheticSourceLoc
+	}
+
+
+private pure func recursive_union_drop() -> CoreExpr:
+	DropExpr(
+		{
+			name = "node",
+			uniq = 0,
+			def_id = None
+		},
+		UnionType("Node"),
+		ArcReleasePolicy,
+		int_literal(0),
+		INT_TYPE,
+		SyntheticSourceLoc,
+	)
+
+
+private pure func tensor_of_recursive_union_drop() -> CoreExpr:
+	tensor_type: CoreType = TensorType({
+		element_type = UnionType("Node"),
+		dims = [],
+	})
+
+	DropExpr(
+		{
+			name = "nodes",
+			uniq = 0,
+			def_id = None
+		},
+		tensor_type,
+		ArcReleasePolicy,
+		int_literal(0),
+		INT_TYPE,
+		SyntheticSourceLoc,
+	)
+
+
+private pure func summary(analysis: CoreAllocationAnalysis, def_id: Int) -> AllocationOwnerSummary:
+	allocation_summary_for_def_id(analysis, def_id).get_or({
+		owner_index = -1,
+		def_id = -1,
+		name = "missing",
+		kind = AllocationFunctionOwner,
+		component_id = -1,
+		status = AllocationAnalysisIncomplete,
+		facts = {
+			may_allocate = [],
+			unknown = []
+		},
+		coverage_complete = False,
+		may_witness_site = None,
+		unknown_witness_site = None,
+		incomplete_witness_site = None,
+	})
+
+
+private pure func test_local_and_transitive_allocation_summaries() -> Bool:
+	analysis: CoreAllocationAnalysis = analyze_core_allocations(program([
+		function_decl("leaf", 30, Some(allocation_expr())),
+		function_decl("middle", 20, Some(direct_call(30))),
+		function_decl("root", 10, Some(direct_call(20))),
+	]))
+	leaf: AllocationOwnerSummary = summary(analysis, 30)
+	middle: AllocationOwnerSummary = summary(analysis, 20)
+	root: AllocationOwnerSummary = summary(analysis, 10)
+
+	(
+		leaf.status == AllocationMayAllocate
+		and middle.status == AllocationMayAllocate
+		and root.status == AllocationMayAllocate
+		and leaf.facts.may_allocate == [RawBufferAllocation]
+		and middle.facts.may_allocate == [RawBufferAllocation]
+		and root.facts.may_allocate == [RawBufferAllocation]
+		and analysis.edges.length() == 2
+		and analysis.work.dependency_edges == 2
+		and analysis.work.expression_nodes == 5
+	)
+
+
+private pure func test_safe_recursive_component_is_proven_free() -> Bool:
+	analysis: CoreAllocationAnalysis = analyze_core_allocations(program([
+		function_decl("left", 10, Some(direct_call(20))),
+		function_decl("right", 20, Some(direct_call(10))),
+	]))
+	left: AllocationOwnerSummary = summary(analysis, 10)
+	right: AllocationOwnerSummary = summary(analysis, 20)
+
+	(
+		left.status == AllocationProvenFree
+		and right.status == AllocationProvenFree
+		and left.component_id == right.component_id
+		and analysis.work.component_count == 1
+	)
+
+
+private pure func test_recursive_component_propagates_local_allocation() -> Bool:
+	analysis: CoreAllocationAnalysis = analyze_core_allocations(program([
+		function_decl("left", 10, Some(direct_call(20))),
+		function_decl("right", 20, Some(SeqExpr(direct_call(10), allocation_expr()))),
+	]))
+
+	(
+		summary(analysis, 10).status == AllocationMayAllocate
+		and summary(analysis, 20).status == AllocationMayAllocate
+		and summary(analysis, 10).component_id == summary(analysis, 20).component_id
+	)
+
+
+private pure func test_diamond_uses_bounded_indexed_propagation() -> Bool:
+	analysis: CoreAllocationAnalysis = analyze_core_allocations(program([
+		function_decl("leaf", 40, Some(allocation_expr())),
+		function_decl("left", 30, Some(direct_call(40))),
+		function_decl("right", 20, Some(direct_call(40))),
+		function_decl("root", 10, Some(SeqExpr(direct_call(30), direct_call(20)))),
+	]))
+
+	(
+		summary(analysis, 10).status == AllocationMayAllocate
+		and summary(analysis, 20).status == AllocationMayAllocate
+		and summary(analysis, 30).status == AllocationMayAllocate
+		and summary(analysis, 40).status == AllocationMayAllocate
+		and analysis.work.allocation_sites == 5
+		and analysis.work.dependency_edges == 4
+		and analysis.work.component_count == 4
+		and analysis.work.propagation_edge_visits == 4
+		and analysis.work.summary_updates == 3
+	)
+
+
+private pure func test_definition_identity_not_display_name_selects_callee() -> Bool:
+	analysis: CoreAllocationAnalysis = analyze_core_allocations(program([
+		function_decl("same", 10, Some(int_literal(0))),
+		function_decl("same", 20, Some(allocation_expr())),
+		function_decl("caller", 30, Some(direct_call(10))),
+	]))
+
+	(
+		summary(analysis, 10).status == AllocationProvenFree
+		and summary(analysis, 20).status == AllocationMayAllocate
+		and summary(analysis, 30).status == AllocationProvenFree
+	)
+
+
+private pure func test_duplicate_definition_identity_is_incomplete() -> Bool:
+	analysis: CoreAllocationAnalysis = analyze_core_allocations(program([
+		function_decl("first", 10, Some(int_literal(0))),
+		function_decl("second", 10, Some(allocation_expr())),
+		function_decl("caller", 20, Some(direct_call(10))),
+	]))
+
+	match analysis.owners:
+		[first, second, caller]:
+			match analysis.sites:
+				[_, call_site]:
+					(
+						first.status == AllocationAnalysisIncomplete
+						and second.status == AllocationAnalysisIncomplete
+						and caller.status == AllocationAnalysisIncomplete
+						and caller.incomplete_witness_site == Some(1)
+						and not call_site.coverage_complete
+						and allocation_summary_for_def_id(analysis, 10).is_none()
+						and analysis.edges.is_empty()
+					)
+				_:
+					False
+		_:
+			False
+
+
+private pure func test_missing_direct_target_fails_closed() -> Bool:
+	analysis: CoreAllocationAnalysis = analyze_core_allocations(
+		program([function_decl("caller", 10, Some(direct_call(999)))]),
+	)
+	caller: AllocationOwnerSummary = summary(analysis, 10)
+
+	match analysis.sites:
+		[site]:
+			(
+				caller.status == AllocationUnknown
+				and caller.facts.unknown == [UnknownCallTarget]
+				and caller.unknown_witness_site == Some(0)
+				and site.facts.unknown == [UnknownCallTarget]
+				and analysis.edges.is_empty()
+			)
+		_:
+			False
+
+
+private pure func test_recursive_union_cleanup_propagates_scratch_allocation() -> Bool:
+	analysis: CoreAllocationAnalysis = analyze_core_allocations(program([
+		UnionDecl(recursive_union_decl()),
+		function_decl("drop_node", 10, Some(recursive_union_drop())),
+		function_decl("caller", 20, Some(direct_call(10))),
+	]))
+
+	(
+		summary(analysis, 10).facts.may_allocate == [CleanupScratchAllocation]
+		and summary(analysis, 20).facts.may_allocate == [CleanupScratchAllocation]
+		and summary(analysis, 10).status == AllocationMayAllocate
+		and summary(analysis, 20).status == AllocationMayAllocate
+	)
+
+
+private pure func test_tensor_element_cleanup_propagates_scratch_allocation() -> Bool:
+	analysis: CoreAllocationAnalysis = analyze_core_allocations(program([
+		UnionDecl(recursive_union_decl()),
+		function_decl("drop_nodes", 10, Some(tensor_of_recursive_union_drop())),
+	]))
+
+	(
+		summary(analysis, 10).facts.may_allocate == [CleanupScratchAllocation]
+		and summary(analysis, 10).status == AllocationMayAllocate
+	)
+
+
+private pure func test_repeated_cleanup_uses_memoized_summary() -> Bool:
+	analysis: CoreAllocationAnalysis = analyze_core_allocations(program([
+		UnionDecl(recursive_union_decl()),
+		function_decl(
+			"drop_twice",
+			10,
+			Some(SeqExpr(recursive_union_drop(), recursive_union_drop())),
+		),
+	]))
+
+	(
+		summary(analysis, 10).status == AllocationMayAllocate
+		and analysis.work.cleanup_requests == 2
+		and analysis.work.cleanup_cache_hits == 1
+		and analysis.work.cleanup_type_nodes == 1
+	)
+
+
+private pure func test_long_call_chain_uses_iterative_bounded_work() -> Bool:
+	chain_length: Int = 512
+	var decls: List[CoreDecl] = [function_decl("leaf", 0, Some(allocation_expr()))]
+
+	for def_id in 1..chain_length:
+		decls = decls.append(function_decl("chain", def_id, Some(direct_call(def_id - 1))))
+
+	analysis: CoreAllocationAnalysis = analyze_core_allocations(program(decls))
+
+	(
+		summary(analysis, chain_length - 1).status == AllocationMayAllocate
+		and analysis.work.expression_nodes == chain_length * 2 - 1
+		and analysis.work.allocation_sites == chain_length
+		and analysis.work.dependency_edges == chain_length - 1
+		and analysis.work.component_count == chain_length
+		and analysis.work.worklist_pops == chain_length
+		and analysis.work.propagation_edge_visits == chain_length - 1
+		and analysis.work.summary_updates == chain_length - 1
+	)
+
+
+private pure func test_bodyless_owner_fails_closed() -> Bool:
+	analysis: CoreAllocationAnalysis = analyze_core_allocations(
+		program([function_decl("external", 10, None)]),
+	)
+
+	summary(analysis, 10).status == AllocationUnknown
+
+
+private pure func test_unsupported_final_core_marks_analysis_incomplete() -> Bool:
+	analysis: CoreAllocationAnalysis = analyze_core_allocations(
+		program(
+			[
+				function_decl(
+					"debug",
+					10,
+					Some(DebugBlockExpr(int_literal(1), INT_TYPE, SyntheticSourceLoc)),
+				),
+			],
+		),
+	)
+	result: AllocationOwnerSummary = summary(analysis, 10)
+
+	(
+		result.status == AllocationAnalysisIncomplete
+		and not result.coverage_complete
+		and result.incomplete_witness_site == Some(0)
+	)
+
+
+private pure func test_analysis_is_deterministic() -> Bool:
+	source: CoreProgram = program([
+		function_decl("leaf", 30, Some(allocation_expr())),
+		function_decl("left", 20, Some(direct_call(30))),
+		function_decl("right", 10, Some(direct_call(30))),
+	])
+	first: CoreAllocationAnalysis = analyze_core_allocations(source)
+	second: CoreAllocationAnalysis = analyze_core_allocations(source)
+	first_root: AllocationOwnerSummary = summary(first, 10)
+	second_root: AllocationOwnerSummary = summary(second, 10)
+
+	(
+		first_root.owner_index == second_root.owner_index
+		and first_root.component_id == second_root.component_id
+		and first_root.status == second_root.status
+		and first_root.may_witness_site == second_root.may_witness_site
+		and first.sites.length() == second.sites.length()
+		and first.edges.length() == second.edges.length()
+		and first.work.expression_nodes == second.work.expression_nodes
+		and first.work.propagation_edge_visits == second.work.propagation_edge_visits
+		and first.work.summary_updates == second.work.summary_updates
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp compiler Core allocation summary analysis",
+	tests = [
+		(
+			"local and transitive allocation summaries",
+			test_local_and_transitive_allocation_summaries,
+		),
+		("safe recursive component is proven free", test_safe_recursive_component_is_proven_free),
+		(
+			"recursive component propagates local allocation",
+			test_recursive_component_propagates_local_allocation,
+		),
+		("diamond uses bounded indexed propagation", test_diamond_uses_bounded_indexed_propagation),
+		(
+			"definition identity not display name selects callee",
+			test_definition_identity_not_display_name_selects_callee,
+		),
+		(
+			"duplicate definition identity is incomplete",
+			test_duplicate_definition_identity_is_incomplete,
+		),
+		("missing direct target fails closed", test_missing_direct_target_fails_closed),
+		(
+			"recursive union cleanup propagates scratch allocation",
+			test_recursive_union_cleanup_propagates_scratch_allocation,
+		),
+		(
+			"tensor element cleanup propagates scratch allocation",
+			test_tensor_element_cleanup_propagates_scratch_allocation,
+		),
+		("repeated cleanup uses memoized summary", test_repeated_cleanup_uses_memoized_summary),
+		(
+			"long call chain uses iterative bounded work",
+			test_long_call_chain_uses_iterative_bounded_work,
+		),
+		("bodyless owner fails closed", test_bodyless_owner_fails_closed),
+		(
+			"unsupported final Core marks analysis incomplete",
+			test_unsupported_final_core_marks_analysis_incomplete,
+		),
+		("analysis is deterministic", test_analysis_is_deterministic),
+	]
+}

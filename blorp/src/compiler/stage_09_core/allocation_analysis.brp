@@ -1,0 +1,1096 @@
+-- Final-Core allocation summary analysis.
+--
+-- The analysis assigns dense owner/site IDs in declaration and expression
+-- traversal order, records local facts once, condenses direct-call recursion,
+-- and propagates finite risk categories over component reverse edges. It is a
+-- report model only: no source obligation or emission admission is enforced
+-- here.
+import:
+	allocation_contracts:
+		AllocationCoverage(UnsupportedFinalCoreOperation),
+		AllocationDependency(
+			CleanupAllocationDependency,
+			DirectFunctionAllocationDependency,
+			ForeignAllocationDependency,
+			RuntimeAllocationDependency,
+			UnknownCallAllocationDependency,
+			ClosureAllocationDependency,
+		),
+		AllocationOperationCategory,
+		AllocationRiskReason(RuntimeCallbackBoundary, UnknownCallTarget),
+		CoreAllocationContract,
+		CoreLocalAllocationFacts,
+		UnionCleanupPlan,
+		core_expr_allocation_contract,
+		merge_allocation_facts,
+		union_cleanup_plan,
+	ir:
+		CoreDecl(FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl, UnionDecl),
+		CoreExpr,
+		CoreFunction,
+		CoreHeapRecordDecl,
+		CoreProgram,
+		CoreReleasePolicy(
+			ArcReleaseOnlyPolicy,
+			ArcReleasePolicy,
+			NoReleasePolicy,
+			StackResultReleasePolicy,
+		),
+		CoreType(
+			BoxedResultType,
+			EnumType,
+			FunctionType,
+			HeapRecordType,
+			NamedType,
+			RangeType,
+			SelfType,
+			StackResultType,
+			TensorType,
+			TupleType,
+			TypeParameterType,
+			UnionType,
+			ValueRecordType,
+			VoidType,
+		),
+		CoreUnionDecl,
+		core_type_equal,
+	traverse as CoreTraverse
+	type_policy: cleanup_release_policy_for_type
+
+
+enum AllocationOwnerKind:
+	AllocationFunctionOwner
+	AllocationGlobalOwner
+
+
+enum AllocationProofStatus:
+	AllocationProvenFree
+	AllocationMayAllocate
+	AllocationUnknown
+	AllocationMayAllocateAndUnknown
+	AllocationAnalysisIncomplete
+
+
+record AllocationSite {
+	site_id: Int,
+	owner_index: Int,
+	category: AllocationOperationCategory,
+	facts: CoreLocalAllocationFacts,
+	coverage_complete: Bool
+}
+
+
+record AllocationDependencyEdge {
+	site_id: Int,
+	caller_index: Int,
+	callee_index: Int
+}
+
+
+record AllocationOwnerSummary {
+	owner_index: Int,
+	def_id: Int,
+	name: String,
+	kind: AllocationOwnerKind,
+	component_id: Int,
+	status: AllocationProofStatus,
+	facts: CoreLocalAllocationFacts,
+	coverage_complete: Bool,
+	may_witness_site: Option[Int],
+	unknown_witness_site: Option[Int],
+	incomplete_witness_site: Option[Int]
+}
+
+
+record AllocationAnalysisWork {
+	expression_nodes: Int,
+	allocation_sites: Int,
+	dependency_edges: Int,
+	component_count: Int,
+	cleanup_requests: Int,
+	cleanup_cache_hits: Int,
+	cleanup_type_nodes: Int,
+	worklist_pops: Int,
+	propagation_edge_visits: Int,
+	summary_updates: Int
+}
+
+
+record CoreAllocationAnalysis {
+	owners: List[AllocationOwnerSummary],
+	sites: List[AllocationSite],
+	edges: List[AllocationDependencyEdge],
+	work: AllocationAnalysisWork
+}
+
+
+private EMPTY_FACTS: CoreLocalAllocationFacts = {
+	may_allocate = [],
+	unknown = []
+}
+
+
+private record AllocationOwnerSeed {
+	def_id: Int,
+	name: String,
+	kind: AllocationOwnerKind,
+	body: Option[CoreExpr]
+}
+
+
+private record AllocationTypeIndex {
+	unions: Dict[String, CoreUnionDecl],
+	heap_records: Dict[String, CoreHeapRecordDecl]
+}
+
+
+private record AllocationOwnerRegistry {
+	callable_index_by_def_id: Dict[Int, Int],
+	invalid_def_ids: Dict[Int, Bool]
+}
+
+
+private record PendingCleanup {
+	typ: CoreType,
+	policy: CoreReleasePolicy
+}
+
+
+private record CleanupCacheEntry {
+	typ: CoreType,
+	policy: CoreReleasePolicy,
+	facts: CoreLocalAllocationFacts
+}
+
+
+private record CleanupFactsResult {
+	facts: CoreLocalAllocationFacts,
+	type_nodes: Int
+}
+
+
+private record ContractCleanupFacts {
+	facts: CoreLocalAllocationFacts,
+	cache: List[CleanupCacheEntry],
+	requests: Int,
+	cache_hits: Int,
+	type_nodes: Int
+}
+
+
+private record PendingExpr {
+	expr: CoreExpr
+}
+
+
+private record LocalOwnerFacts {
+	facts: CoreLocalAllocationFacts,
+	coverage_complete: Bool,
+	may_witness_site: Option[Int],
+	unknown_witness_site: Option[Int],
+	incomplete_witness_site: Option[Int]
+}
+
+
+private record CollectedOwner {
+	local: LocalOwnerFacts,
+	sites: List[AllocationSite],
+	pending_edges: List[(Int, Int)],
+	expression_nodes: Int,
+	cleanup_cache: List[CleanupCacheEntry],
+	cleanup_requests: Int,
+	cleanup_cache_hits: Int,
+	cleanup_type_nodes: Int
+}
+
+
+private struct DfsFrame {
+	vertex: Int,
+	next_dependency: Int
+}
+
+
+private record ComponentAssignments {
+	component_by_owner: List[Int],
+	component_count: Int
+}
+
+
+private record ComponentEdge {
+	caller_component: Int,
+	callee_component: Int,
+	site_id: Int
+}
+
+
+private record SolvedComponents {
+	facts: List[CoreLocalAllocationFacts],
+	coverage_complete: List[Bool],
+	may_witness_site: List[Option[Int]],
+	unknown_witness_site: List[Option[Int]],
+	incomplete_witness_site: List[Option[Int]],
+	worklist_pops: Int,
+	propagation_edge_visits: Int,
+	summary_updates: Int
+}
+
+
+private pure func facts_are_empty(facts: CoreLocalAllocationFacts) -> Bool:
+	facts.may_allocate.is_empty() and facts.unknown.is_empty()
+
+
+private pure func allocation_facts_equal(
+	left: CoreLocalAllocationFacts,
+	right: CoreLocalAllocationFacts,
+) -> Bool:
+	left.may_allocate == right.may_allocate and left.unknown == right.unknown
+
+
+private pure func unknown_cleanup_facts() -> CoreLocalAllocationFacts:
+	{
+		may_allocate = [],
+		unknown = [RuntimeCallbackBoundary]
+	}
+
+
+private pure func missing_target_facts() -> CoreLocalAllocationFacts:
+	{
+		may_allocate = [],
+		unknown = [UnknownCallTarget]
+	}
+
+
+private pure func release_policies_equal(left: CoreReleasePolicy, right: CoreReleasePolicy) -> Bool:
+	match (left, right):
+		(NoReleasePolicy, NoReleasePolicy) | (ArcReleasePolicy, ArcReleasePolicy) | (ArcReleaseOnlyPolicy, ArcReleaseOnlyPolicy) | (StackResultReleasePolicy, StackResultReleasePolicy):
+			True
+		_:
+			False
+
+
+private pure func cached_cleanup_facts(
+	cache: List[CleanupCacheEntry],
+	typ: CoreType,
+	policy: CoreReleasePolicy,
+) -> Option[CoreLocalAllocationFacts]:
+	var result: Option[CoreLocalAllocationFacts] = None
+
+	for entry in cache:
+		if core_type_equal(entry.typ, typ) and release_policies_equal(entry.policy, policy):
+			result = Some(entry.facts)
+			break
+		else:
+			void
+
+	result
+
+
+private pure func owner_seed_for_function(function_info: CoreFunction) -> AllocationOwnerSeed:
+	{
+		def_id = function_info.def_id,
+		name = function_info.name,
+		kind = AllocationFunctionOwner,
+		body = function_info.body
+	}
+
+
+private pure func allocation_owner_seeds(program: CoreProgram) -> List[AllocationOwnerSeed]:
+	var seeds: List[AllocationOwnerSeed] = []
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				seeds = seeds.append(owner_seed_for_function(function_info))
+			GlobalDecl(global):
+				seeds = seeds.append({
+					def_id = global.def_id,
+					name = global.name.name,
+					kind = AllocationGlobalOwner,
+					body = Some(global.init),
+				})
+			ImplDecl(impl):
+				for method in impl.methods:
+					seeds = seeds.append(owner_seed_for_function(method))
+			_:
+				void
+
+	seeds
+
+
+private pure func allocation_type_index(program: CoreProgram) -> AllocationTypeIndex:
+	var unions: Dict[String, CoreUnionDecl] = {}
+	var heap_records: Dict[String, CoreHeapRecordDecl] = {}
+
+	for decl in program.decls:
+		match decl:
+			UnionDecl(union_decl):
+				unions = unions.set(union_decl.name, union_decl)
+			HeapRecordDecl(record_decl):
+				heap_records = heap_records.set(record_decl.name, record_decl)
+			_:
+				void
+
+	{
+		unions = unions,
+		heap_records = heap_records
+	}
+
+
+private pure func allocation_owner_registry(
+	seeds: List[AllocationOwnerSeed],
+) -> AllocationOwnerRegistry:
+	var seen_def_ids: Dict[Int, Bool] = {}
+	var callable_index_by_def_id: Dict[Int, Int] = {}
+	var invalid_def_ids: Dict[Int, Bool] = {}
+
+	for owner_index in 0..seeds.length():
+		match seeds.get(owner_index):
+			Some(seed):
+				if seen_def_ids.contains(seed.def_id):
+					invalid_def_ids = invalid_def_ids.set(seed.def_id, True)
+					callable_index_by_def_id = callable_index_by_def_id.remove(seed.def_id)
+				else:
+					seen_def_ids = seen_def_ids.set(seed.def_id, True)
+
+					match seed.kind:
+						AllocationFunctionOwner:
+							callable_index_by_def_id = callable_index_by_def_id.set(
+								seed.def_id,
+								owner_index,
+							)
+						AllocationGlobalOwner:
+							void
+			None:
+				void
+
+	{
+		callable_index_by_def_id = callable_index_by_def_id,
+		invalid_def_ids = invalid_def_ids
+	}
+
+
+private pure func cleanup_facts(
+	index: AllocationTypeIndex,
+	typ: CoreType,
+	policy: CoreReleasePolicy,
+) -> CleanupFactsResult:
+	var facts: CoreLocalAllocationFacts = EMPTY_FACTS
+	var pending: List[PendingCleanup] = [
+		{
+			typ = typ,
+			policy = policy
+		},
+	]
+	var visited_unions: Dict[String, Bool] = {}
+	var visited_records: Dict[String, Bool] = {}
+	var type_nodes: Int = 0
+
+	while not pending.is_empty():
+		pending_index: Int = pending.length() - 1
+
+		match pending.get(pending_index):
+			None:
+				pending = pending.take(pending_index)
+			Some(work):
+				pending = pending.take(pending_index)
+
+				match work.policy:
+					NoReleasePolicy | ArcReleaseOnlyPolicy:
+						type_nodes += 1
+						void
+					ArcReleasePolicy | StackResultReleasePolicy:
+						match work.typ:
+							UnionType(name):
+								if not visited_unions.contains(name):
+									type_nodes += 1
+									visited_unions = visited_unions.set(name, True)
+
+									match index.unions.get(name):
+										Some(union_decl):
+											plan: UnionCleanupPlan = union_cleanup_plan(union_decl)
+											facts = merge_allocation_facts(facts, plan.facts)
+
+											for dependency in plan.dependencies:
+												pending = pending.append({
+													typ = dependency.typ,
+													policy = dependency.release_policy,
+												})
+										None:
+											facts = merge_allocation_facts(
+												facts,
+												unknown_cleanup_facts(),
+											)
+								else:
+									void
+							HeapRecordType(name):
+								if not visited_records.contains(name):
+									type_nodes += 1
+									visited_records = visited_records.set(name, True)
+
+									match index.heap_records.get(name):
+										Some(record_decl):
+											for field in record_decl.fields:
+												pending = pending.append({
+													typ = field.typ,
+													policy = field.release_policy,
+												})
+										None:
+											facts = merge_allocation_facts(
+												facts,
+												unknown_cleanup_facts(),
+											)
+								else:
+									void
+							TupleType(items):
+								type_nodes += 1
+
+								for item in items:
+									pending = pending.append({
+										typ = item,
+										policy = cleanup_release_policy_for_type(item),
+									})
+							StackResultType(ok_type, err_type) | BoxedResultType(ok_type, err_type):
+								type_nodes += 1
+								pending = pending.append({
+									typ = ok_type,
+									policy = cleanup_release_policy_for_type(ok_type),
+								})
+								pending = pending.append({
+									typ = err_type,
+									policy = cleanup_release_policy_for_type(err_type),
+								})
+							TensorType(info):
+								type_nodes += 1
+								pending = pending.append({
+									typ = info.element_type,
+									policy = cleanup_release_policy_for_type(info.element_type),
+								})
+							NamedType(_, _) | FunctionType(_, _, _) | TypeParameterType(_) | SelfType:
+								type_nodes += 1
+								facts = merge_allocation_facts(facts, unknown_cleanup_facts())
+							VoidType | EnumType(_) | ValueRecordType(_) | RangeType:
+								type_nodes += 1
+								void
+
+	{
+		facts = facts,
+		type_nodes = type_nodes
+	}
+
+
+private pure func merge_contract_cleanup_facts(
+	contract: CoreAllocationContract,
+	type_index: AllocationTypeIndex,
+	initial_cache: List[CleanupCacheEntry],
+) -> ContractCleanupFacts:
+	var facts: CoreLocalAllocationFacts = contract.facts
+	var cache: List[CleanupCacheEntry] = initial_cache
+	var requests: Int = 0
+	var cache_hits: Int = 0
+	var type_nodes: Int = 0
+
+	for dependency in contract.dependencies:
+		match dependency:
+			CleanupAllocationDependency(typ, policy):
+				requests += 1
+
+				match cached_cleanup_facts(cache, typ, policy):
+					Some(cached_facts):
+						cache_hits += 1
+						facts = merge_allocation_facts(facts, cached_facts)
+					None:
+						result: CleanupFactsResult = cleanup_facts(type_index, typ, policy)
+						type_nodes += result.type_nodes
+						facts = merge_allocation_facts(facts, result.facts)
+						cache = cache.append({
+							typ = typ,
+							policy = policy,
+							facts = result.facts,
+						})
+			_:
+				void
+
+	{
+		facts = facts,
+		cache = cache,
+		requests = requests,
+		cache_hits = cache_hits,
+		type_nodes = type_nodes
+	}
+
+
+private pure func collect_owner(
+	owner_index: Int,
+	seed: AllocationOwnerSeed,
+	type_index: AllocationTypeIndex,
+	owner_registry: AllocationOwnerRegistry,
+	initial_cleanup_cache: List[CleanupCacheEntry],
+	first_site_id: Int,
+) -> CollectedOwner:
+	registry_complete: Bool = not owner_registry.invalid_def_ids.contains(seed.def_id)
+
+	match seed.body:
+		None:
+			{
+				local = {
+					facts = missing_target_facts(),
+					coverage_complete = registry_complete,
+					may_witness_site = None,
+					unknown_witness_site = None,
+					incomplete_witness_site = None
+				},
+				sites = [],
+				pending_edges = [],
+				expression_nodes = 0,
+				cleanup_cache = initial_cleanup_cache,
+				cleanup_requests = 0,
+				cleanup_cache_hits = 0,
+				cleanup_type_nodes = 0
+			}
+		Some(body):
+			var pending: List[PendingExpr] = [{expr = body}]
+			var facts: CoreLocalAllocationFacts = EMPTY_FACTS
+			var coverage_complete: Bool = registry_complete
+			var may_witness_site: Option[Int] = None
+			var unknown_witness_site: Option[Int] = None
+			var incomplete_witness_site: Option[Int] = None
+			var sites: List[AllocationSite] = []
+			var pending_edges: List[(Int, Int)] = []
+			var expression_nodes: Int = 0
+			var cleanup_cache: List[CleanupCacheEntry] = initial_cleanup_cache
+			var cleanup_requests: Int = 0
+			var cleanup_cache_hits: Int = 0
+			var cleanup_type_nodes: Int = 0
+
+			while not pending.is_empty():
+				pending_index: Int = pending.length() - 1
+
+				match pending.get(pending_index):
+					None:
+						pending = pending.take(pending_index)
+					Some(work):
+						pending = pending.take(pending_index)
+						expression_nodes += 1
+						contract: CoreAllocationContract = core_expr_allocation_contract(work.expr)
+						cleanup: ContractCleanupFacts = merge_contract_cleanup_facts(
+							contract,
+							type_index,
+							cleanup_cache,
+						)
+						var site_facts: CoreLocalAllocationFacts = cleanup.facts
+						cleanup_cache = cleanup.cache
+						cleanup_requests += cleanup.requests
+						cleanup_cache_hits += cleanup.cache_hits
+						cleanup_type_nodes += cleanup.type_nodes
+						var site_complete: Bool = contract.coverage != UnsupportedFinalCoreOperation
+						site_id: Int = first_site_id + sites.length()
+
+						for dependency in contract.dependencies:
+							match dependency:
+								DirectFunctionAllocationDependency(def_id):
+									match owner_registry.callable_index_by_def_id.get(def_id):
+										Some(callee_index):
+											pending_edges = pending_edges.append(
+												(site_id, callee_index),
+											)
+										None:
+											if owner_registry.invalid_def_ids.contains(def_id):
+												site_complete = False
+											else:
+												site_facts = merge_allocation_facts(
+													site_facts,
+													missing_target_facts(),
+												)
+								CleanupAllocationDependency(_, _):
+									void
+								UnknownCallAllocationDependency | ForeignAllocationDependency | RuntimeAllocationDependency | ClosureAllocationDependency:
+									void
+
+						has_site: Bool = (
+							not facts_are_empty(site_facts)
+							or not contract.dependencies.is_empty()
+							or not site_complete
+						)
+
+						if has_site:
+							sites = sites.append({
+								site_id = site_id,
+								owner_index = owner_index,
+								category = contract.category,
+								facts = site_facts,
+								coverage_complete = site_complete,
+							})
+
+							if (
+								may_witness_site.is_none()
+								and not site_facts.may_allocate.is_empty()
+							):
+								may_witness_site = Some(site_id)
+							else:
+								void
+
+							if unknown_witness_site.is_none() and not site_facts.unknown.is_empty():
+								unknown_witness_site = Some(site_id)
+							else:
+								void
+
+							if incomplete_witness_site.is_none() and not site_complete:
+								incomplete_witness_site = Some(site_id)
+							else:
+								void
+						else:
+							void
+
+						facts = merge_allocation_facts(facts, site_facts)
+						coverage_complete = coverage_complete and site_complete
+
+						children: List[CoreExpr] = CoreTraverse.immediate_core_expr_children(
+							work.expr,
+						)
+
+						for child in children.reverse():
+							pending = pending.append({expr = child})
+
+			{
+				local = {
+					facts = facts,
+					coverage_complete = coverage_complete,
+					may_witness_site = may_witness_site,
+					unknown_witness_site = unknown_witness_site,
+					incomplete_witness_site = incomplete_witness_site
+				},
+				sites = sites,
+				pending_edges = pending_edges,
+				expression_nodes = expression_nodes,
+				cleanup_cache = cleanup_cache,
+				cleanup_requests = cleanup_requests,
+				cleanup_cache_hits = cleanup_cache_hits,
+				cleanup_type_nodes = cleanup_type_nodes
+			}
+
+
+private pure func finish_order(outgoing: List[List[Int]]) -> List[Int]:
+	var visited: Dict[Int, Bool] = {}
+	var finished: List[Int] = []
+
+	for root in 0..outgoing.length():
+		if not visited.contains(root):
+			visited = visited.set(root, True)
+			var stack: List[DfsFrame] = [
+				{
+					vertex = root,
+					next_dependency = 0
+				},
+			]
+
+			while not stack.is_empty():
+				frame_index: Int = stack.length() - 1
+
+				match stack.get(frame_index):
+					None:
+						stack = stack.take(frame_index)
+					Some(frame):
+						dependencies: List[Int] = outgoing.get_or(frame.vertex, [])
+
+						match dependencies.get(frame.next_dependency):
+							Some(dependency):
+								stack = stack.set(
+									frame_index,
+									{
+										vertex = frame.vertex,
+										next_dependency = frame.next_dependency + 1
+									},
+								)
+
+								if not visited.contains(dependency):
+									visited = visited.set(dependency, True)
+									stack = stack.append({
+										vertex = dependency,
+										next_dependency = 0,
+									})
+							None:
+								finished = finished.append(frame.vertex)
+								stack = stack.take(frame_index)
+
+	finished
+
+
+private pure func component_assignments(
+	outgoing: List[List[Int]],
+	incoming: List[List[Int]],
+) -> ComponentAssignments:
+	order: List[Int] = finish_order(outgoing)
+	missing_component: Int = -1
+	var component_by_owner: List[Int] = missing_component.repeat(outgoing.length())
+	var next_component: Int = 0
+
+	for root in order.reverse():
+		if component_by_owner.get_or(root, missing_component) == missing_component:
+			component_by_owner = component_by_owner.set(root, next_component)
+			var stack: List[Int] = [root]
+
+			while not stack.is_empty():
+				stack_index: Int = stack.length() - 1
+
+				match stack.get(stack_index):
+					None:
+						stack = stack.take(stack_index)
+					Some(owner):
+						stack = stack.take(stack_index)
+
+						for dependency in incoming.get_or(owner, []):
+							if component_by_owner.get_or(
+								dependency,
+								missing_component,
+							) == missing_component:
+								component_by_owner = component_by_owner.set(
+									dependency,
+									next_component,
+								)
+								stack = stack.append(dependency)
+							else:
+								void
+
+			next_component += 1
+
+	{
+		component_by_owner = component_by_owner,
+		component_count = next_component
+	}
+
+
+private pure func solved_components(
+	assignments: ComponentAssignments,
+	locals: List[LocalOwnerFacts],
+	edges: List[AllocationDependencyEdge],
+) -> SolvedComponents:
+	var facts: List[CoreLocalAllocationFacts] = EMPTY_FACTS.repeat(assignments.component_count)
+	var coverage_complete: List[Bool] = True.repeat(assignments.component_count)
+	var may_witness_site: List[Option[Int]] = None.repeat(assignments.component_count)
+	var unknown_witness_site: List[Option[Int]] = None.repeat(assignments.component_count)
+	var incomplete_witness_site: List[Option[Int]] = None.repeat(assignments.component_count)
+
+	for owner_index in 0..locals.length():
+		component: Int = assignments.component_by_owner.get_or(owner_index, -1)
+
+		match locals.get(owner_index):
+			Some(local):
+				facts = facts.set(
+					component,
+					merge_allocation_facts(
+						facts.get_or(component, EMPTY_FACTS),
+						local.facts,
+					),
+				)
+				coverage_complete = coverage_complete.set(
+					component,
+					coverage_complete.get_or(component, True) and local.coverage_complete,
+				)
+
+				if (
+					may_witness_site
+						.get_or(component, None)
+						.is_none()
+				):
+					may_witness_site = may_witness_site.set(component, local.may_witness_site)
+				else:
+					void
+
+				if (
+					unknown_witness_site
+						.get_or(component, None)
+						.is_none()
+				):
+					unknown_witness_site = unknown_witness_site.set(
+						component,
+						local.unknown_witness_site,
+					)
+				else:
+					void
+
+				if (
+					incomplete_witness_site
+						.get_or(component, None)
+						.is_none()
+				):
+					incomplete_witness_site = incomplete_witness_site.set(
+						component,
+						local.incomplete_witness_site,
+					)
+				else:
+					void
+			None:
+				void
+
+	empty_component_edges: List[ComponentEdge] = []
+	var reverse_edges: List[List[ComponentEdge]] = empty_component_edges.repeat(
+		assignments.component_count,
+	)
+	var seen_component_edges: Dict[Int, Bool] = {}
+
+	for edge in edges:
+		caller_component: Int = assignments.component_by_owner.get_or(edge.caller_index, -1)
+		callee_component: Int = assignments.component_by_owner.get_or(edge.callee_index, -1)
+
+		if caller_component != callee_component:
+			key: Int = caller_component * assignments.component_count + callee_component
+
+			if not seen_component_edges.contains(key):
+				seen_component_edges = seen_component_edges.set(key, True)
+				reverse_edges = reverse_edges.set(
+					callee_component,
+					reverse_edges
+						.get_or(callee_component, [])
+						.append({
+							caller_component = caller_component,
+							callee_component = callee_component,
+							site_id = edge.site_id,
+						}),
+				)
+			else:
+				void
+		else:
+			void
+
+	var pending: List[Int] = []
+	var scheduled: Dict[Int, Bool] = {}
+
+	for component in 0..assignments.component_count:
+		if (
+			not facts_are_empty(facts.get_or(component, EMPTY_FACTS))
+			or not coverage_complete.get_or(component, True)
+		):
+			pending = pending.append(component)
+			scheduled = scheduled.set(component, True)
+		else:
+			void
+
+	var worklist_pops: Int = 0
+	var propagation_edge_visits: Int = 0
+	var summary_updates: Int = 0
+
+	while not pending.is_empty():
+		pending_index: Int = pending.length() - 1
+
+		match pending.get(pending_index):
+			None:
+				pending = pending.take(pending_index)
+			Some(callee_component):
+				pending = pending.take(pending_index)
+				scheduled = scheduled.remove(callee_component)
+				worklist_pops += 1
+				callee_facts: CoreLocalAllocationFacts = facts.get_or(callee_component, EMPTY_FACTS)
+				callee_complete: Bool = coverage_complete.get_or(callee_component, True)
+
+				for edge in reverse_edges.get_or(callee_component, []):
+					propagation_edge_visits += 1
+					caller: Int = edge.caller_component
+					before: CoreLocalAllocationFacts = facts.get_or(caller, EMPTY_FACTS)
+					after: CoreLocalAllocationFacts = merge_allocation_facts(before, callee_facts)
+					before_complete: Bool = coverage_complete.get_or(caller, True)
+					after_complete: Bool = before_complete and callee_complete
+					changed: Bool = (
+						not allocation_facts_equal(after, before)
+						or after_complete != before_complete
+					)
+
+					if changed:
+						facts = facts.set(caller, after)
+						coverage_complete = coverage_complete.set(caller, after_complete)
+						summary_updates += 1
+
+						if before.may_allocate.is_empty() and not after.may_allocate.is_empty():
+							may_witness_site = may_witness_site.set(caller, Some(edge.site_id))
+						else:
+							void
+
+						if before.unknown.is_empty() and not after.unknown.is_empty():
+							unknown_witness_site = unknown_witness_site.set(
+								caller,
+								Some(edge.site_id),
+							)
+						else:
+							void
+
+						if before_complete and not after_complete:
+							incomplete_witness_site = incomplete_witness_site.set(
+								caller,
+								Some(edge.site_id),
+							)
+						else:
+							void
+
+						if not scheduled.contains(caller):
+							pending = pending.append(caller)
+							scheduled = scheduled.set(caller, True)
+						else:
+							void
+					else:
+						void
+
+	{
+		facts = facts,
+		coverage_complete = coverage_complete,
+		may_witness_site = may_witness_site,
+		unknown_witness_site = unknown_witness_site,
+		incomplete_witness_site = incomplete_witness_site,
+		worklist_pops = worklist_pops,
+		propagation_edge_visits = propagation_edge_visits,
+		summary_updates = summary_updates
+	}
+
+
+pure func allocation_proof_status(
+	facts: CoreLocalAllocationFacts,
+	coverage_complete: Bool,
+) -> AllocationProofStatus:
+	if not coverage_complete:
+		AllocationAnalysisIncomplete
+	else if not facts.may_allocate.is_empty() and not facts.unknown.is_empty():
+		AllocationMayAllocateAndUnknown
+	else if not facts.unknown.is_empty():
+		AllocationUnknown
+	else if not facts.may_allocate.is_empty():
+		AllocationMayAllocate
+	else:
+		AllocationProvenFree
+
+
+pure func analyze_core_allocations(program: CoreProgram) -> CoreAllocationAnalysis:
+	seeds: List[AllocationOwnerSeed] = allocation_owner_seeds(program)
+	type_index: AllocationTypeIndex = allocation_type_index(program)
+	owner_registry: AllocationOwnerRegistry = allocation_owner_registry(seeds)
+
+	var locals: List[LocalOwnerFacts] = []
+	var sites: List[AllocationSite] = []
+	var edges: List[AllocationDependencyEdge] = []
+	empty_owner_indices: List[Int] = []
+	empty_owner_edge_set: Dict[Int, Bool] = {}
+	var outgoing: List[List[Int]] = empty_owner_indices.repeat(seeds.length())
+	var incoming: List[List[Int]] = empty_owner_indices.repeat(seeds.length())
+	var outgoing_seen: List[Dict[Int, Bool]] = empty_owner_edge_set.repeat(seeds.length())
+	var expression_nodes: Int = 0
+	var cleanup_cache: List[CleanupCacheEntry] = []
+	var cleanup_requests: Int = 0
+	var cleanup_cache_hits: Int = 0
+	var cleanup_type_nodes: Int = 0
+
+	for owner_index in 0..seeds.length():
+		match seeds.get(owner_index):
+			Some(seed):
+				collected: CollectedOwner = collect_owner(
+					owner_index,
+					seed,
+					type_index,
+					owner_registry,
+					cleanup_cache,
+					sites.length(),
+				)
+				locals = locals.append(collected.local)
+				sites = sites.concat(collected.sites)
+				expression_nodes += collected.expression_nodes
+				cleanup_cache = collected.cleanup_cache
+				cleanup_requests += collected.cleanup_requests
+				cleanup_cache_hits += collected.cleanup_cache_hits
+				cleanup_type_nodes += collected.cleanup_type_nodes
+
+				for (site_id, callee_index) in collected.pending_edges:
+					edges = edges.append({
+						site_id = site_id,
+						caller_index = owner_index,
+						callee_index = callee_index,
+					})
+
+					owner_edges: Dict[Int, Bool] = outgoing_seen.get_or(owner_index, {})
+
+					if not owner_edges.contains(callee_index):
+						outgoing_seen = outgoing_seen.set(
+							owner_index,
+							owner_edges.set(callee_index, True),
+						)
+						outgoing = outgoing.set(
+							owner_index,
+							outgoing
+								.get_or(owner_index, [])
+								.append(callee_index),
+						)
+						incoming = incoming.set(
+							callee_index,
+							incoming
+								.get_or(callee_index, [])
+								.append(owner_index),
+						)
+					else:
+						void
+			None:
+				void
+
+	assignments: ComponentAssignments = component_assignments(outgoing, incoming)
+	solved: SolvedComponents = solved_components(assignments, locals, edges)
+	var owners: List[AllocationOwnerSummary] = []
+
+	for owner_index in 0..seeds.length():
+		match seeds.get(owner_index):
+			Some(seed):
+				component: Int = assignments.component_by_owner.get_or(owner_index, -1)
+				owner_facts: CoreLocalAllocationFacts = solved.facts.get_or(component, EMPTY_FACTS)
+				owner_complete: Bool = solved.coverage_complete.get_or(component, False)
+				owners = owners.append({
+					owner_index = owner_index,
+					def_id = seed.def_id,
+					name = seed.name,
+					kind = seed.kind,
+					component_id = component,
+					status = allocation_proof_status(owner_facts, owner_complete),
+					facts = owner_facts,
+					coverage_complete = owner_complete,
+					may_witness_site = solved.may_witness_site.get_or(component, None),
+					unknown_witness_site = solved.unknown_witness_site.get_or(component, None),
+					incomplete_witness_site = solved.incomplete_witness_site.get_or(
+						component,
+						None,
+					),
+				})
+			None:
+				void
+
+	{
+		owners = owners,
+		sites = sites,
+		edges = edges,
+		work = {
+			expression_nodes = expression_nodes,
+			allocation_sites = sites.length(),
+			dependency_edges = edges.length(),
+			component_count = assignments.component_count,
+			cleanup_requests = cleanup_requests,
+			cleanup_cache_hits = cleanup_cache_hits,
+			cleanup_type_nodes = cleanup_type_nodes,
+			worklist_pops = solved.worklist_pops,
+			propagation_edge_visits = solved.propagation_edge_visits,
+			summary_updates = solved.summary_updates
+		}
+	}
+
+
+pure func allocation_summary_for_def_id(
+	analysis: CoreAllocationAnalysis,
+	def_id: Int,
+) -> Option[AllocationOwnerSummary]:
+	var result: Option[AllocationOwnerSummary] = None
+	var ambiguous: Bool = False
+
+	for summary in analysis.owners:
+		if summary.def_id == def_id:
+			match result:
+				Some(_):
+					ambiguous = True
+				None:
+					result = Some(summary)
+		else:
+			void
+
+	if ambiguous:
+		None
+	else:
+		result
