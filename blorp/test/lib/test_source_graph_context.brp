@@ -4,6 +4,7 @@ import:
 	../../src/compiler/stage_03_parse/source_ast_finalize:
 		FinalizedImportPathRewrite,
 		finalized_typecheck_program,
+		finalized_typecheck_program_ast,
 		finalized_typecheck_program_rewrite_import_paths,
 	../../src/compiler/stage_04_modules/frontend_graph: frontend_graph_root_modules
 	../../src/compiler/stage_04_modules/frontend_graph_service:
@@ -12,10 +13,14 @@ import:
 		FrontendSourceResolution(FrontendSourceUnresolved),
 	../../src/compiler/stage_04_modules/loaded_module:
 		ModuleOrigin(UserModule),
+		resolved_module_canonical_path,
 		resolved_module_identity_from_resolver,
 	../../src/lib/cli_args: CliAction(CliCheck)
+	../../src/lib/cli_plan: CliParsedSourceFile
 	../../src/lib/source: source_file
-	../../src/lib/source_graph: source_graph_setup_for_paths
+	../../src/lib/source_graph:
+		frontend_compilation_graph_for_roots_with_setup,
+		source_graph_setup_for_paths,
 	fs: create_directories, message, remove_directory_tree, write_text_atomic
 	io: print_error
 	path: join
@@ -121,6 +126,37 @@ func test_finalized_root_retains_rewritten_import_path() -> Bool:
 					False
 
 
+--- The finalized program is the sole source of a finalized candidate's
+--- metadata. CLI fields are only retained for planning and may not reintroduce
+--- a stale identity after a compiler-owned transformation.
+func test_finalized_root_identity_comes_from_program_source() -> Bool:
+	program_source = source_file("/workspace/program_root.brp", "program_root", "VALUE = 1\n")
+	finalized = finalized_typecheck_program(parse_compiler_source(program_source))
+	stale_root: CliParsedSourceFile = {
+		path = "/workspace/stale_root.brp",
+		module_name = "stale_root",
+		source_text = "STALE = 0\n",
+		typecheck_program = finalized
+	}
+	setup = source_graph_setup_for_paths(check_action(stale_root.path), [stale_root.path])
+
+	match frontend_compilation_graph_for_roots_with_setup(setup, [stale_root]):
+		Err(_):
+			False
+		Ok(compilation):
+			match frontend_graph_root_modules(compilation.graph):
+				[root]:
+					program = finalized_typecheck_program_ast(root.program)
+					(
+						resolved_module_canonical_path(root.identity) == "program_root"
+						and program.source.path == program_source.path
+						and program.source.module_name == program_source.module_name
+						and program.source.text == program_source.text
+					)
+				_:
+					False
+
+
 tests: TestSuite = {
 	description = "Shared source graph context",
 	tests = [
@@ -131,6 +167,10 @@ tests: TestSuite = {
 		(
 			"retains finalized root import rewrites",
 			test_finalized_root_retains_rewritten_import_path,
+		),
+		(
+			"derives finalized root identity from program source",
+			test_finalized_root_identity_comes_from_program_source,
 		),
 	]
 }
