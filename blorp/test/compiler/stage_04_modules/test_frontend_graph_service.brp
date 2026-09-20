@@ -12,7 +12,7 @@ import:
 		frontend_graph_modules,
 	../../../src/compiler/stage_04_modules/frontend_graph_service:
 		COMPILER_FRONTEND_IMPLICIT_MODULE_PATHS,
-		FrontendDiscoveryError(FrontendDiscoveryIdentityConflict),
+		FrontendDiscoveryError(FrontendDiscoveryIdentityConflict, FrontendDiscoveryProviderFailed),
 		FrontendGraphServiceError(
 			DuplicateCompilerFrontendImportOutcome,
 			MissingCompilerFrontendImportOutcome,
@@ -32,6 +32,7 @@ import:
 		resolved_module_identity_from_resolver,
 	../../../src/compiler/stage_04_modules/module_surface: module_surface_for_program
 	../../../src/lib/source: SourceFile, source_file
+	channel: Channel, channel, send, try_recv
 	test: TestSuite
 
 
@@ -239,6 +240,165 @@ private pure func load_cycle_source(location: FrontendSourceLocation) -> Result[
 	Ok(frontend_source_candidate_source(cycle_source(location.module_name, imported_module)))
 
 
+--- This mixes roots, a seed, fan-out, a diamond, and a cycle. The graph
+--- order is discovery order: initial roots and seeds, then each module the
+--- first time its identity is reached from the growing worklist.
+private pure func ordered_graph_source(module_name: String) -> SourceFile:
+	match module_name:
+		"first_root":
+			source_file(
+				"/workspace/first_root.brp",
+				"first_root",
+				"import:\n\tleft\n\tshared\n\nVALUE = 1\n",
+			)
+		"second_root":
+			source_file(
+				"/workspace/second_root.brp",
+				"second_root",
+				"import:\n\tright\n\nVALUE = 1\n",
+			)
+		"seed":
+			source_file("/workspace/seed.brp", "seed", "import:\n\tshared\n\nVALUE = 1\n")
+		"left":
+			source_file("/workspace/left.brp", "left", "import:\n\tleaf\n\nVALUE = 1\n")
+		"shared":
+			source_file("/workspace/shared.brp", "shared", "import:\n\ttail\n\nVALUE = 1\n")
+		"right":
+			source_file("/workspace/right.brp", "right", "import:\n\tleaf\n\nVALUE = 1\n")
+		"leaf":
+			source_file("/workspace/leaf.brp", "leaf", "import:\n\tfirst_root\n\nVALUE = 1\n")
+		_:
+			source_file("/workspace/tail.brp", "tail", "VALUE = 1\n")
+
+
+private pure func ordered_graph_candidate(module_name: String) -> FrontendSourceCandidate:
+	{
+		identity = identity(module_name),
+		source = ordered_graph_source(module_name)
+	}
+
+
+private pure func resolve_ordered_graph(
+	_importer: FrontendSourceCandidate,
+	requested_path: String,
+) -> Result[FrontendSourceResolution, String]:
+	Ok(FrontendSourceResolved(frontend_source_location(ordered_graph_candidate(requested_path))))
+
+
+func test_discovery_preserves_growing_worklist_order_across_graph_shapes() -> Bool:
+	first_root = ordered_graph_candidate("first_root")
+	second_root = ordered_graph_candidate("second_root")
+	seed = ordered_graph_candidate("seed")
+	load_calls: Channel[String] = channel(8)
+	load_with_observation = func(location: FrontendSourceLocation):
+		_ = send(load_calls, location.module_name)
+		Ok(ordered_graph_source(location.module_name))
+
+	match (
+		frontend_graph_discover(
+			[first_root, second_root],
+			[seed],
+			resolve_ordered_graph,
+			load_with_observation,
+		)
+	):
+		Err(_):
+			False
+		Ok(graph):
+			match [
+				try_recv(load_calls),
+				try_recv(load_calls),
+				try_recv(load_calls),
+				try_recv(load_calls),
+				try_recv(load_calls),
+				try_recv(load_calls),
+			]:
+				[Some("left"), Some("shared"), Some("right"), Some("leaf"), Some("tail"), None]:
+					(
+						frontend_graph_modules(
+							graph,
+						).map(
+							func(
+								found,
+							): found.surface.module_name,
+						) == [
+							"first_root",
+							"second_root",
+							"seed",
+							"left",
+							"shared",
+							"right",
+							"leaf",
+							"tail",
+						]
+						and frontend_graph_import_edges(
+							graph,
+						).map(
+							func(
+								edge,
+							): edge.requested_path,
+						) == [
+							"left",
+							"shared",
+							"right",
+							"shared",
+							"leaf",
+							"tail",
+							"leaf",
+							"first_root",
+						]
+					)
+				_:
+					False
+
+
+private pure func first_provider_failure_source() -> FrontendSourceCandidate:
+	{
+		identity = identity("failure_root"),
+		source = source_file(
+			"/workspace/failure_root.brp",
+			"failure_root",
+			"import:\n\tbroken\n\tlater\n\nVALUE = 1\n",
+		)
+	}
+
+
+private pure func resolve_first_provider_failure(
+	_importer: FrontendSourceCandidate,
+	requested_path: String,
+) -> Result[FrontendSourceResolution, String]:
+	if requested_path == "broken":
+		Ok(FrontendSourceResolved(frontend_source_location({
+			identity = identity("broken"),
+			source = source_file("/workspace/broken.brp", "broken", "VALUE = 1\n"),
+		})))
+	else:
+		Err("later resolution should not run")
+
+
+private pure func load_first_provider_failure(
+	_location: FrontendSourceLocation,
+) -> Result[SourceFile, String]:
+	Err("first load failed")
+
+
+func test_discovery_reports_the_first_provider_failure() -> Bool:
+	match frontend_graph_discover(
+		[first_provider_failure_source()],
+		[],
+		resolve_first_provider_failure,
+		load_first_provider_failure,
+	):
+		Err(FrontendDiscoveryProviderFailed(importer, requested_path, message)):
+			(
+				resolved_module_identities_equal(importer, identity("failure_root"))
+				and requested_path == "broken"
+				and message == "first load failed"
+			)
+		_:
+			False
+
+
 func test_discovery_owns_parsing_resolution_edges_and_cycle_termination() -> Bool:
 	app = cycle_source("app", "dep")
 
@@ -378,6 +538,11 @@ tests: TestSuite = {
 			"own parsing resolution edges and cycle termination",
 			test_discovery_owns_parsing_resolution_edges_and_cycle_termination,
 		),
+		(
+			"preserves growing worklist order across graph shapes",
+			test_discovery_preserves_growing_worklist_order_across_graph_shapes,
+		),
+		("reports the first provider failure", test_discovery_reports_the_first_provider_failure),
 		(
 			"reject identity conflict with different paths",
 			test_discovery_rejects_identity_conflict_with_different_paths,
