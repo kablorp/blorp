@@ -45,6 +45,9 @@ module inventory lives in
 - [Per-Node Codegen Roadmap](PER_NODE_CODEGEN_ROADMAP.md) is the task-level
   plan for cutting the per-node cost of generated C (reference counting,
   cleanup frames, runtime calls), with the stage-2 measurement rule.
+- [Allocation Contract Roadmap](ALLOCATION_CONTRACT_ROADMAP.md) proposes
+  allocation explanations and a compile-time `no_alloc` block, including
+  runtime/cleanup coverage, Core analysis, and tooling enforcement.
 - [Frontend Facts Roadmap](FRONTEND_FACTS_ROADMAP.md) is the task-level
   plan for publishing each stage's facts as id-keyed tables (module,
   name, definition tables) and removing threaded state from typecheck.
