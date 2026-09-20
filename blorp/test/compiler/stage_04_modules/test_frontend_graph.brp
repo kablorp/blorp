@@ -4,6 +4,7 @@ import:
 		finalized_typecheck_program,
 		finalized_typecheck_program_ast,
 	../../../src/compiler/stage_04_modules/frontend_graph:
+		FrontendGraph,
 		FrontendGraphError(
 			DuplicateCompilerFrontendModulePath,
 			MissingCompilerFrontendEdgeImporter,
@@ -14,6 +15,7 @@ import:
 		FrontendImportEdge,
 		FrontendImportResolution(FrontendResolvedImport, FrontendUnresolvedImport),
 		FrontendModule,
+		FrontendModuleReferenceId,
 		FrontendModuleReferenceResolution(
 			ResolvedFrontendModuleReference,
 			UnresolvedFrontendModuleReference,
@@ -33,7 +35,7 @@ import:
 		resolved_module_identities_equal,
 		resolved_module_identity_from_resolver,
 	../../../src/compiler/stage_04_modules/module_surface: module_surface_for_program
-	../../../src/compiler/stage_04_modules/module_table: module_ids_equal
+	../../../src/compiler/stage_04_modules/module_table: ModuleId, module_ids_equal
 	../../../src/lib/source: source_file
 	test: TestSuite
 
@@ -42,18 +44,103 @@ private pure func identity(canonical_path: String, origin: ModuleOrigin) -> Reso
 	resolved_module_identity_from_resolver(canonical_path, origin)
 
 
-private pure func module(
+private pure func module_with_source(
 	canonical_path: String,
 	module_name: String,
 	origin: ModuleOrigin,
+	source_text: String,
 ) -> FrontendModule:
-	source = source_file("/workspace/" + module_name + ".brp", module_name, "VALUE = 1\n")
+	source = source_file("/workspace/" + module_name + ".brp", module_name, source_text)
 	program = finalized_typecheck_program(parse_compiler_source(source))
 	{
 		identity = identity(canonical_path, origin),
 		program = program,
 		surface = module_surface_for_program(finalized_typecheck_program_ast(program))
 	}
+
+
+private pure func module(
+	canonical_path: String,
+	module_name: String,
+	origin: ModuleOrigin,
+) -> FrontendModule:
+	module_with_source(canonical_path, module_name, origin, "VALUE = 1\n")
+
+
+private pure func reference_paths_for_module(
+	graph: FrontendGraph,
+	module_identity: ResolvedModuleIdentity,
+) -> List[String]:
+	match frontend_graph_find_module_id(graph, module_identity):
+		Some(module_id):
+			var paths: List[String] = []
+
+			for reference_id in frontend_graph_reference_ids(graph, module_id):
+				match frontend_graph_reference(graph, reference_id):
+					Some(reference):
+						paths = paths.append(reference.requested_path)
+					None:
+						void
+
+			paths
+		None:
+			[]
+
+
+private pure func reference_matches_resolved(
+	graph: FrontendGraph,
+	reference_id: FrontendModuleReferenceId,
+	requested_path: String,
+	target_id: ModuleId,
+) -> Bool:
+	match (
+		frontend_graph_reference(graph, reference_id),
+		frontend_graph_reference_resolution(graph, reference_id),
+	):
+		(Some(reference), Some(ResolvedFrontendModuleReference(target))):
+			reference.requested_path == requested_path and module_ids_equal(target, target_id)
+		_:
+			False
+
+
+private pure func reference_matches_unresolved(
+	graph: FrontendGraph,
+	reference_id: FrontendModuleReferenceId,
+	requested_path: String,
+) -> Bool:
+	match (
+		frontend_graph_reference(graph, reference_id),
+		frontend_graph_reference_resolution(graph, reference_id),
+	):
+		(Some(reference), Some(UnresolvedFrontendModuleReference)):
+			reference.requested_path == requested_path
+		_:
+			False
+
+
+private pure func reference_order_matches_source(
+	graph: FrontendGraph,
+	app_identity: ResolvedModuleIdentity,
+	first_identity: ResolvedModuleIdentity,
+	again_identity: ResolvedModuleIdentity,
+) -> Bool:
+	match (
+		frontend_graph_find_module_id(graph, app_identity),
+		frontend_graph_find_module_id(graph, first_identity),
+		frontend_graph_find_module_id(graph, again_identity),
+	):
+		(Some(app_id), Some(first_id), Some(again_id)):
+			match frontend_graph_reference_ids(graph, app_id):
+				[first_reference_id, second_reference_id, again_reference_id]:
+					(
+						reference_matches_resolved(graph, first_reference_id, "first", first_id)
+						and reference_matches_unresolved(graph, second_reference_id, "second")
+						and reference_matches_resolved(graph, again_reference_id, "first", again_id)
+					)
+				_:
+					False
+		_:
+			False
 
 
 pure func test_graph_retains_exact_requested_import_and_identity() -> Bool:
@@ -332,6 +419,84 @@ pure func test_graph_retains_dense_module_and_reference_tables() -> Bool:
 					False
 
 
+pure func test_graph_reorders_repeated_references_and_retains_fallback_remainders() -> Bool:
+	app = module_with_source(
+		"app/main",
+		"main",
+		UserModule,
+		"import:\n\tfirst: first\n\tsecond: second\n\tagain: first\n\nVALUE = 1\n",
+	)
+	first = module("first", "first", UserModule)
+	again = module("again", "again", UserModule)
+	first_edge: FrontendImportEdge = {
+		importer = app.identity,
+		requested_path = "first",
+		resolution = FrontendResolvedImport(first.identity)
+	}
+	second_edge: FrontendImportEdge = {
+		importer = app.identity,
+		requested_path = "second",
+		resolution = FrontendUnresolvedImport
+	}
+	again_edge: FrontendImportEdge = {
+		importer = app.identity,
+		requested_path = "first",
+		resolution = FrontendResolvedImport(again.identity)
+	}
+	ordered_edges: List[FrontendImportEdge] = [first_edge, second_edge, again_edge]
+	late_mismatch_edges: List[FrontendImportEdge] = [first_edge, again_edge, second_edge]
+	missing_and_extra_edges: List[FrontendImportEdge] = [
+		first_edge,
+		{
+			importer = app.identity,
+			requested_path = "extra",
+			resolution = FrontendUnresolvedImport
+		},
+	]
+
+	ordered_matches_source: Bool = match (
+		frontend_graph(
+			[app, first, again],
+			[app.identity],
+			ordered_edges,
+		)
+	):
+		Ok(graph):
+			reference_order_matches_source(graph, app.identity, first.identity, again.identity)
+		Err(_):
+			False
+
+	late_mismatch_matches_source: Bool = match (
+		frontend_graph(
+			[app, first, again],
+			[app.identity],
+			late_mismatch_edges,
+		)
+	):
+		Ok(graph):
+			reference_order_matches_source(graph, app.identity, first.identity, again.identity)
+		Err(_):
+			False
+
+	missing_and_extra_paths: List[String] = match (
+		frontend_graph(
+			[app, first, again],
+			[app.identity],
+			missing_and_extra_edges,
+		)
+	):
+		Ok(graph):
+			reference_paths_for_module(graph, app.identity)
+		Err(_):
+			[]
+
+	(
+		ordered_matches_source
+		and late_mismatch_matches_source
+		and missing_and_extra_paths == ["first", "extra"]
+	)
+
+
 tests: TestSuite = {
 	description = "Compiler frontend graph model",
 	tests = [
@@ -357,6 +522,10 @@ tests: TestSuite = {
 		(
 			"retain dense module and reference tables",
 			test_graph_retains_dense_module_and_reference_tables,
+		),
+		(
+			"reorder repeated references and retain fallback remainders",
+			test_graph_reorders_repeated_references_and_retains_fallback_remainders,
 		),
 	]
 }
