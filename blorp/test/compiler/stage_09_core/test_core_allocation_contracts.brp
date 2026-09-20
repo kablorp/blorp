@@ -1,0 +1,217 @@
+import:
+	../../../src/compiler/stage_09_core/allocation_contracts:
+		AllocationRiskReason(CleanupScratchAllocation, ForeignCallBoundary, HeapBoxAllocation),
+		CoreLocalAllocationFacts,
+		UnionCleanupDependency,
+		UnionCleanupPlan(DirectUnionCleanup, IterativeUnionCleanup, NoUnionCleanup),
+		allocation_facts_are_free,
+		allocation_reason_code,
+		box_allocation_facts,
+		union_cleanup_plan
+	../../../src/compiler/stage_09_core/ir:
+		CoreBoxKind(
+			Float16Box,
+			Float32Box,
+			FloatBox,
+			Int128Box,
+			PointerBox,
+			PrimBox,
+			StructBox,
+			UInt128Box,
+			VoidBox,
+		),
+		CoreReleasePolicy(
+			ArcReleaseOnlyPolicy,
+			ArcReleasePolicy,
+			NoReleasePolicy,
+			StackResultReleasePolicy,
+		),
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(NamedType, UnionType),
+		CoreUnionDecl,
+		CoreUnionField,
+		CoreUnionPayloadStorage(TypedUnionPayloadStorage),
+		CoreUnionVariant
+	test: TestSuite
+
+
+private pure func facts_are_empty(facts: CoreLocalAllocationFacts) -> Bool:
+	facts.may_allocate.is_empty() and facts.unknown.is_empty()
+
+
+private pure func test_bit_packed_boxes_are_allocation_free() -> Bool:
+	var valid: Bool = True
+
+	for kind in [PrimBox, PointerBox, VoidBox, FloatBox, Float32Box, Float16Box]:
+		facts: CoreLocalAllocationFacts = box_allocation_facts(kind)
+		if not facts_are_empty(facts) or not allocation_facts_are_free(facts):
+			valid = False
+		else:
+			void
+
+	valid
+
+
+private pure func test_wide_and_struct_boxes_allocate() -> Bool:
+	var valid: Bool = True
+
+	for kind in [Int128Box, UInt128Box, StructBox("Point")]:
+		facts: CoreLocalAllocationFacts = box_allocation_facts(kind)
+		if facts.may_allocate != [HeapBoxAllocation] or not facts.unknown.is_empty():
+			valid = False
+		else:
+			void
+
+	valid
+
+
+private pure func union_field(
+	typ: CoreType,
+	release_policy: CoreReleasePolicy,
+) -> CoreUnionField:
+	{
+		typ = typ,
+		release_policy = release_policy
+	}
+
+
+private pure func union_variant(
+	name: String,
+	tag: Int,
+	fields: List[CoreUnionField],
+) -> CoreUnionVariant:
+	{
+		name = name,
+		c_name = name,
+		tag = tag,
+		tag_c_name = name + "_TAG",
+		fields = fields,
+		def_id = None
+	}
+
+
+private pure func union_decl(
+	name: String,
+	variants: List[CoreUnionVariant],
+) -> CoreUnionDecl:
+	{
+		abi_type = None,
+		name = name,
+		type_params = [],
+		payload_storage = TypedUnionPayloadStorage,
+		variants = variants,
+		loc = SyntheticSourceLoc
+	}
+
+
+private pure func direct_cleanup_dependencies_match(
+	dependencies: List[UnionCleanupDependency],
+) -> Bool:
+	match dependencies:
+		[text, nested, stack_result]:
+			match (text.typ, text.release_policy):
+				(NamedType("String", []), ArcReleaseOnlyPolicy):
+					match (nested.typ, nested.release_policy):
+						(UnionType("Other"), ArcReleasePolicy):
+							match (stack_result.typ, stack_result.release_policy):
+								(NamedType("Result", []), StackResultReleasePolicy):
+									True
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+private pure func iterative_cleanup_dependencies_match(
+	dependencies: List[UnionCleanupDependency],
+) -> Bool:
+	match dependencies:
+		[recursive]:
+			match (recursive.typ, recursive.release_policy):
+				(UnionType("Node"), ArcReleasePolicy):
+					True
+				_:
+					False
+		_:
+			False
+
+
+private pure func test_union_cleanup_plans_are_explicit() -> Bool:
+	none: CoreUnionDecl = union_decl(
+		"Empty",
+		[union_variant("Empty", 0, [union_field(NamedType("Int", []), NoReleasePolicy)])],
+	)
+	direct: CoreUnionDecl = union_decl(
+		"Holder",
+		[
+			union_variant(
+				"Text",
+				0,
+				[union_field(NamedType("String", []), ArcReleaseOnlyPolicy)],
+			),
+			union_variant(
+				"Nested",
+				1,
+				[
+					union_field(UnionType("Other"), ArcReleasePolicy),
+					union_field(NamedType("Result", []), StackResultReleasePolicy),
+				],
+			),
+		],
+	)
+	iterative: CoreUnionDecl = union_decl(
+		"Node",
+		[union_variant("Node", 0, [union_field(UnionType("Node"), ArcReleasePolicy)])],
+	)
+
+	match (union_cleanup_plan(none), union_cleanup_plan(direct), union_cleanup_plan(iterative)):
+		(
+			NoUnionCleanup,
+			DirectUnionCleanup(direct_dependencies),
+			IterativeUnionCleanup(facts, iterative_dependencies),
+		):
+			(
+				direct_cleanup_dependencies_match(direct_dependencies)
+				and iterative_cleanup_dependencies_match(iterative_dependencies)
+				and facts.may_allocate == [CleanupScratchAllocation]
+				and facts.unknown.is_empty()
+				and not allocation_facts_are_free(facts)
+			)
+		_:
+			False
+
+
+private pure func test_mixed_risks_are_preserved() -> Bool:
+	facts: CoreLocalAllocationFacts = {
+		may_allocate = [HeapBoxAllocation],
+		unknown = [ForeignCallBoundary]
+	}
+
+	(
+		facts.may_allocate == [HeapBoxAllocation]
+		and facts.unknown == [ForeignCallBoundary]
+		and not allocation_facts_are_free(facts)
+	)
+
+
+private pure func test_reason_codes_are_stable() -> Bool:
+	(
+		allocation_reason_code(HeapBoxAllocation) == "heap_box"
+		and allocation_reason_code(CleanupScratchAllocation) == "cleanup_scratch"
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp compiler Core allocation contracts",
+	tests = [
+		("bit-packed boxes are allocation-free", test_bit_packed_boxes_are_allocation_free),
+		("wide and struct boxes allocate", test_wide_and_struct_boxes_allocate),
+		("union cleanup plans are explicit", test_union_cleanup_plans_are_explicit),
+		("mixed risks are preserved", test_mixed_risks_are_preserved),
+		("reason codes are stable", test_reason_codes_are_stable),
+	]
+}

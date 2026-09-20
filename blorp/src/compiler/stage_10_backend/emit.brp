@@ -21,6 +21,11 @@ import:
 		function_profile_mode,
 		function_profile_selectors,
 	../stage_08_core_lower/identity: core_module_member_name
+	../stage_09_core/allocation_contracts:
+		UnionCleanupPlan(DirectUnionCleanup, IterativeUnionCleanup, NoUnionCleanup),
+		union_cleanup_plan,
+		union_field_uses_iterative_cleanup,
+		union_variant_has_cleanup
 	../stage_09_core/c_type_layout as TypeLayout
 	../stage_09_core/ir:
 		CoreAccessor(
@@ -24877,18 +24882,6 @@ private pure func emit_heap_record_decl(
 	}
 
 
-private pure func release_policy_requires_release(policy: CoreReleasePolicy) -> Bool:
-	match policy:
-		NoReleasePolicy:
-			False
-		ArcReleasePolicy:
-			True
-		ArcReleaseOnlyPolicy:
-			True
-		StackResultReleasePolicy:
-			True
-
-
 private pure func union_field_storage_type(
 	payload_storage: CoreUnionPayloadStorage,
 	field: CoreUnionField,
@@ -24933,26 +24926,12 @@ private pure func emit_union_constructor_param(
 	union_field_storage_type(payload_storage, field) + " field" + index.to_string()
 
 
-private pure func union_variant_has_releasable_field(variant: CoreUnionVariant) -> Bool:
-	var has_releasable_field: Bool = False
-
-	for field in variant.fields:
-		if release_policy_requires_release(field.release_policy):
-			has_releasable_field = True
-			break
-
-	has_releasable_field
-
-
 private pure func union_decl_has_destructor(union_decl: CoreUnionDecl) -> Bool:
-	var has_destructor: Bool = False
-
-	for variant in union_decl.variants:
-		if union_variant_has_releasable_field(variant):
-			has_destructor = True
-			break
-
-	has_destructor
+	match union_cleanup_plan(union_decl):
+		NoUnionCleanup:
+			False
+		DirectUnionCleanup(_) | IterativeUnionCleanup(_, _):
+			True
 
 
 private pure func union_variant_uses_release_mask(
@@ -24963,7 +24942,7 @@ private pure func union_variant_uses_release_mask(
 		TypedUnionPayloadStorage:
 			False
 		ErasedUnionPayloadStorage:
-			union_variant_has_releasable_field(variant)
+			union_variant_has_cleanup(variant)
 
 
 private pure func union_decl_has_release_mask(union_decl: CoreUnionDecl) -> Bool:
@@ -24977,52 +24956,12 @@ private pure func union_decl_has_release_mask(union_decl: CoreUnionDecl) -> Bool
 	has_release_mask
 
 
-private pure func union_field_is_self_recursive(union_name: String, field: CoreUnionField) -> Bool:
-	match union_type_name(field.typ):
-		Some(name):
-			name == union_name
-		None:
-			False
-
-
-private pure func union_field_uses_iterative_release(
-	union_decl: CoreUnionDecl,
-	field: CoreUnionField,
-) -> Bool:
-	match field.release_policy:
-		ArcReleasePolicy:
-			union_field_is_self_recursive(union_decl.name, field)
-		NoReleasePolicy:
-			False
-		ArcReleaseOnlyPolicy:
-			False
-		StackResultReleasePolicy:
-			False
-
-
-private pure func union_variant_uses_iterative_release(
-	union_decl: CoreUnionDecl,
-	variant: CoreUnionVariant,
-) -> Bool:
-	var uses_iterative_release: Bool = False
-
-	for field in variant.fields:
-		if union_field_uses_iterative_release(union_decl, field):
-			uses_iterative_release = True
-			break
-
-	uses_iterative_release
-
-
 private pure func union_decl_uses_iterative_destructor(union_decl: CoreUnionDecl) -> Bool:
-	var uses_iterative_destructor: Bool = False
-
-	for variant in union_decl.variants:
-		if union_variant_uses_iterative_release(union_decl, variant):
-			uses_iterative_destructor = True
-			break
-
-	uses_iterative_destructor
+	match union_cleanup_plan(union_decl):
+		IterativeUnionCleanup(_, _):
+			True
+		NoUnionCleanup | DirectUnionCleanup(_):
+			False
 
 
 private pure func typed_union_field_release_statement(
@@ -25068,12 +25007,12 @@ private pure func union_field_release_statement(
 	index: Int,
 	naming: BackendTypeNaming,
 ) -> String:
-	if not release_policy_requires_release(field.release_policy):
+	if not release_policy_requires_cleanup(field.release_policy):
 		""
 	else:
 		field_c: String = "self->data." + variant.name + ".field" + index.to_string()
 
-		if union_field_uses_iterative_release(union_decl, field):
+		if union_field_uses_iterative_cleanup(union_decl, field):
 			iterative_union_field_release_statement(union_decl, index, field_c, naming)
 		else:
 			match union_decl.payload_storage:
@@ -25090,7 +25029,7 @@ private pure func emit_union_destructor_cases(
 	var cases_c: String = ""
 
 	for variant in union_decl.variants:
-		if union_variant_has_releasable_field(variant):
+		if union_variant_has_cleanup(variant):
 			var releases_c: String = ""
 			var index: Int = 0
 

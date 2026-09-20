@@ -1,0 +1,203 @@
+-- Canonical local allocation facts shared by final-Core analysis and backend
+-- planning. These facts describe allocation risk only; they do not certify a
+-- prepared program or discharge a source obligation.
+import:
+	ir:
+		CoreBoxKind(
+			Float16Box,
+			Float32Box,
+			FloatBox,
+			Int128Box,
+			PointerBox,
+			PrimBox,
+			StructBox,
+			UInt128Box,
+			VoidBox,
+		),
+		CoreReleasePolicy(
+			ArcReleaseOnlyPolicy,
+			ArcReleasePolicy,
+			NoReleasePolicy,
+			StackResultReleasePolicy,
+		),
+		CoreType(UnionType),
+		CoreUnionDecl,
+		CoreUnionField,
+		CoreUnionVariant
+
+
+enum AllocationRiskReason:
+	ManagedObjectAllocation
+	RawBufferAllocation
+	CapacityGrowthAllocation
+	HeapBoxAllocation
+	ClosureEnvironmentAllocation
+	TupleStorageAllocation
+	CowFallbackAllocation
+	TaskAllocation
+	CleanupScratchAllocation
+	RuntimeOperationAllocation
+	UnknownCallTarget
+	ForeignCallBoundary
+	RuntimeCallbackBoundary
+
+
+record CoreLocalAllocationFacts {
+	may_allocate: List[AllocationRiskReason],
+	unknown: List[AllocationRiskReason]
+}
+
+
+record UnionCleanupDependency {
+	typ: CoreType,
+	release_policy: CoreReleasePolicy
+}
+
+
+union UnionCleanupPlan:
+	NoUnionCleanup
+	DirectUnionCleanup(List[UnionCleanupDependency])
+	IterativeUnionCleanup(CoreLocalAllocationFacts, List[UnionCleanupDependency])
+
+
+private EMPTY_ALLOCATION_FACTS: CoreLocalAllocationFacts = {
+	may_allocate = [],
+	unknown = []
+}
+
+
+pure func allocation_facts_are_free(facts: CoreLocalAllocationFacts) -> Bool:
+	facts.may_allocate.is_empty() and facts.unknown.is_empty()
+
+
+pure func allocation_reason_code(reason: AllocationRiskReason) -> String:
+	match reason:
+		ManagedObjectAllocation:
+			"managed_object"
+		RawBufferAllocation:
+			"raw_buffer"
+		CapacityGrowthAllocation:
+			"capacity_growth"
+		HeapBoxAllocation:
+			"heap_box"
+		ClosureEnvironmentAllocation:
+			"closure_environment"
+		TupleStorageAllocation:
+			"tuple_storage"
+		CowFallbackAllocation:
+			"cow_fallback"
+		TaskAllocation:
+			"task"
+		CleanupScratchAllocation:
+			"cleanup_scratch"
+		RuntimeOperationAllocation:
+			"runtime_operation"
+		UnknownCallTarget:
+			"unknown_call_target"
+		ForeignCallBoundary:
+			"foreign_call_boundary"
+		RuntimeCallbackBoundary:
+			"runtime_callback_boundary"
+
+
+pure func box_allocation_facts(kind: CoreBoxKind) -> CoreLocalAllocationFacts:
+	match kind:
+		PrimBox | PointerBox | VoidBox | FloatBox | Float32Box | Float16Box:
+			EMPTY_ALLOCATION_FACTS
+		Int128Box | UInt128Box | StructBox(_):
+			{
+				may_allocate = [HeapBoxAllocation],
+				unknown = []
+			}
+
+
+pure func release_policy_requires_cleanup(policy: CoreReleasePolicy) -> Bool:
+	match policy:
+		NoReleasePolicy:
+			False
+		ArcReleasePolicy | ArcReleaseOnlyPolicy | StackResultReleasePolicy:
+			True
+
+
+private pure func union_field_is_self_recursive(
+	union_name: String,
+	field: CoreUnionField,
+) -> Bool:
+	match field.typ:
+		UnionType(name):
+			name == union_name
+		_:
+			False
+
+
+pure func union_field_uses_iterative_cleanup(
+	union_decl: CoreUnionDecl,
+	field: CoreUnionField,
+) -> Bool:
+	match field.release_policy:
+		ArcReleasePolicy:
+			union_field_is_self_recursive(union_decl.name, field)
+		NoReleasePolicy | ArcReleaseOnlyPolicy | StackResultReleasePolicy:
+			False
+
+
+pure func union_variant_has_cleanup(variant: CoreUnionVariant) -> Bool:
+	var has_cleanup: Bool = False
+
+	for field in variant.fields:
+		if release_policy_requires_cleanup(field.release_policy):
+			has_cleanup = True
+			break
+		else:
+			void
+
+	has_cleanup
+
+
+private pure func union_variant_uses_iterative_cleanup(
+	union_decl: CoreUnionDecl,
+	variant: CoreUnionVariant,
+) -> Bool:
+	var uses_iterative_cleanup: Bool = False
+
+	for field in variant.fields:
+		if union_field_uses_iterative_cleanup(union_decl, field):
+			uses_iterative_cleanup = True
+			break
+		else:
+			void
+
+	uses_iterative_cleanup
+
+
+pure func union_cleanup_plan(union_decl: CoreUnionDecl) -> UnionCleanupPlan:
+	var dependencies: List[UnionCleanupDependency] = []
+	var uses_iterative_cleanup: Bool = False
+
+	for variant in union_decl.variants:
+		if union_variant_has_cleanup(variant):
+			for field in variant.fields:
+				if release_policy_requires_cleanup(field.release_policy):
+					dependencies = dependencies.append({
+						typ = field.typ,
+						release_policy = field.release_policy
+					})
+				else:
+					void
+		else:
+			void
+
+		if union_variant_uses_iterative_cleanup(union_decl, variant):
+			uses_iterative_cleanup = True
+		else:
+			void
+
+	if uses_iterative_cleanup:
+		IterativeUnionCleanup({
+			may_allocate = [CleanupScratchAllocation],
+			unknown = []
+		}, dependencies)
+	else if not dependencies.is_empty():
+		DirectUnionCleanup(dependencies)
+	else:
+		NoUnionCleanup
