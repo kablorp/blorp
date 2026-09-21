@@ -392,6 +392,17 @@ result_field() {
     printf '%s\n' "$line" | tr ' ' '\n' | sed -n "s/^${key}=//p" | tail -1
 }
 
+set_structured_gate_failure() {
+    local key="$1"
+    local message="$2"
+    eval "${key}_structured_valid=false"
+    eval "${key}_status=FAIL"
+    eval "${key}_passed=0"
+    eval "${key}_failed=1"
+    eval "${key}_tests=1"
+    eval "${key}_failures=\$message"
+}
+
 structured_gate_values_are_valid() {
     local status="$1"
     local passed="$2"
@@ -423,10 +434,33 @@ structured_gate_values_are_valid() {
 parse_structured_gate_result() {
     local output="$1"
     local key="$2"
-    local line status passed failed tests
+    local line status passed failed tests result_count
 
-    line=$(printf '%s\n' "$output" | grep "^BLORP_GATE_RESULT gate=$key " | tail -1)
-    [ -n "$line" ] || return 1
+    # Counts and status come only from one exact envelope. Human summaries are
+    # display-only and cannot rescue a missing, malformed, or duplicate result.
+    result_count=$(printf '%s\n' "$output" | awk -v gate="gate=$key" \
+        '$1 == "BLORP_GATE_RESULT" && $2 == gate { count += 1 } END { print count + 0 }')
+    if [ "$result_count" -ne 1 ]; then
+        set_structured_gate_failure "$key" \
+            "$key gate did not report exactly one structured result"
+        return 0
+    fi
+
+    line=$(printf '%s\n' "$output" | awk -v gate="gate=$key" \
+        '$1 == "BLORP_GATE_RESULT" && $2 == gate { print; exit }')
+    if ! printf '%s\n' "$line" | awk -v gate="gate=$key" '
+        NF != 6 ||
+        $1 != "BLORP_GATE_RESULT" ||
+        $2 != gate ||
+        $3 !~ /^status=(PASS|FAIL)$/ ||
+        $4 !~ /^passed=[0-9]+$/ ||
+        $5 !~ /^failed=[0-9]+$/ ||
+        $6 !~ /^tests=[0-9]+$/ { exit 1 }
+    '; then
+        set_structured_gate_failure "$key" \
+            "$key gate reported an invalid structured result"
+        return 0
+    fi
 
     status=$(result_field "$line" status)
     passed=$(result_field "$line" passed)
@@ -434,12 +468,8 @@ parse_structured_gate_result() {
     tests=$(result_field "$line" tests)
 
     if ! structured_gate_values_are_valid "$status" "$passed" "$failed" "$tests"; then
-        eval "${key}_status=FAIL"
-        eval "${key}_passed=0"
-        eval "${key}_failed=1"
-        eval "${key}_tests=1"
-        local message="$key gate reported an invalid structured result"
-        eval "${key}_failures=\$message"
+        set_structured_gate_failure "$key" \
+            "$key gate reported an invalid structured result"
         return 0
     fi
 
@@ -451,6 +481,7 @@ parse_structured_gate_result() {
     eval "${key}_passed=\$passed"
     eval "${key}_failed=\$failed"
     eval "${key}_tests=\$tests"
+    eval "${key}_structured_valid=true"
     return 0
 }
 
@@ -498,49 +529,17 @@ mark_gate_process_failure() {
 parse_blorp_output() {
     local output="$1"
     local key="$2"
-	if parse_structured_gate_result "$output" "$key"; then
-		if [ "$(eval echo "\$${key}_status")" = "FAIL" ]; then
-			local fails
-			fails=$(echo "$output" \
-				| grep -E '^(FAIL:|[[:space:]]*\[FAIL\])' \
-				| sed -E 's/^FAIL: *//; s/^[[:space:]]*\[FAIL\] *//')
-			[ -n "$fails" ] && eval "${key}_failures=\$fails"
-		fi
-        return
+    local structured_valid status fails
+    parse_structured_gate_result "$output" "$key"
+    eval "structured_valid=\$${key}_structured_valid"
+    eval "status=\$${key}_status"
+    if [ "$structured_valid" = "true" ] && [ "$status" = "FAIL" ]; then
+        fails=$(printf '%s\n' "$output" \
+            | grep -E '^(FAIL:|[[:space:]]*\[FAIL\])' \
+            | sed -E 's/^FAIL: *//; s/^[[:space:]]*\[FAIL\] *//')
+        [ -n "$fails" ] && eval "${key}_failures=\$fails"
     fi
-
-    # "Results: 403 passed, 3 failed (3312 tests)" or "Results: 45 passed, 0 failed (0 tests, 718 doctests)"
-    local summary
-    summary=$(echo "$output" | grep '^Results:')
-    if [ -z "$summary" ]; then
-        eval "${key}_status=FAIL"
-        eval "${key}_passed=0"
-        eval "${key}_failed=1"
-        eval "${key}_tests=1"
-        local fails
-        fails=$(echo "$output" | grep -E '^(Combined test compile failed|error:|\(C compilation failed\))' | head -1)
-        [ -n "$fails" ] || fails="$key gate exited before reporting Results"
-        eval "${key}_failures=\$fails"
-        return
-    fi
-
-    local p f t
-    p=$(echo "$summary" | grep -o '[0-9]* passed' | grep -o '[0-9]*')
-    f=$(echo "$summary" | grep -o '[0-9]* failed' | grep -o '[0-9]*')
-    # Total: sum all numbers inside parentheses (handles "0 tests, 718 doctests")
-    t=$(echo "$summary" | sed 's/.*(\(.*\))/\1/' | grep -o '[0-9]*' | awk '{s+=$1} END {print s}')
-
-    eval "${key}_passed=$p"
-    eval "${key}_failed=$f"
-    eval "${key}_tests=$t"
-    if [ "$f" -eq 0 ]; then
-        eval "${key}_status=PASS"
-    else
-        eval "${key}_status=FAIL"
-        local fails
-        fails=$(echo "$output" | grep "^FAIL:" | sed 's/^FAIL: *//')
-        eval "${key}_failures=\$fails"
-    fi
+    return 0
 }
 
 emit_combined_leak_result() {
@@ -548,30 +547,15 @@ emit_combined_leak_result() {
     local diag_output="$2"
     local suite_exit="$3"
     local diag_exit="$4"
-    local suite_line diag_summary
     local suite_status suite_passed suite_failed suite_tests
     local diag_passed diag_failed diag_tests
     local passed failed tests status
 
-    suite_line=$(printf '%s\n' "$suite_output" | grep "^BLORP_GATE_RESULT gate=leak " | tail -1)
-    if [ -n "$suite_line" ]; then
-        suite_status=$(result_field "$suite_line" status)
-        suite_passed=$(result_field "$suite_line" passed)
-        suite_failed=$(result_field "$suite_line" failed)
-        suite_tests=$(result_field "$suite_line" tests)
-    fi
-    if ! structured_gate_values_are_valid "${suite_status:-}" \
-        "${suite_passed:-}" "${suite_failed:-}" "${suite_tests:-}"
-    then
-        suite_status="FAIL"
-        suite_passed=0
-        suite_failed=1
-        suite_tests=1
-    else
-        suite_passed=$((10#$suite_passed))
-        suite_failed=$((10#$suite_failed))
-        suite_tests=$((10#$suite_tests))
-    fi
+    parse_structured_gate_result "$suite_output" "leak_suite"
+    suite_status="$leak_suite_status"
+    suite_passed="$leak_suite_passed"
+    suite_failed="$leak_suite_failed"
+    suite_tests="$leak_suite_tests"
 
     if [ "$suite_exit" -ne 0 ]; then
         suite_status="FAIL"
@@ -581,20 +565,10 @@ emit_combined_leak_result() {
         fi
     fi
 
-    diag_summary=$(printf '%s\n' "$diag_output" | grep '^Diagnostic results: [0-9][0-9]* passed, [0-9][0-9]* failed$' | tail -1)
-    if [ -n "$diag_summary" ]; then
-        diag_passed=$(printf '%s\n' "$diag_summary" | sed -n 's/^Diagnostic results: \([0-9][0-9]*\) passed, \([0-9][0-9]*\) failed$/\1/p')
-        diag_failed=$(printf '%s\n' "$diag_summary" | sed -n 's/^Diagnostic results: \([0-9][0-9]*\) passed, \([0-9][0-9]*\) failed$/\2/p')
-        diag_tests=$((diag_passed + diag_failed))
-    fi
-    case "${diag_passed:-}:${diag_failed:-}:${diag_tests:-}" in
-        [0-9]*:[0-9]*:[0-9]*) ;;
-        *)
-            diag_passed=0
-            diag_failed=1
-            diag_tests=1
-            ;;
-    esac
+    parse_structured_gate_result "$diag_output" "leak_diagnostics"
+    diag_passed="$leak_diagnostics_passed"
+    diag_failed="$leak_diagnostics_failed"
+    diag_tests="$leak_diagnostics_tests"
 
     if [ "$diag_exit" -ne 0 ] && [ "$diag_failed" -eq 0 ]; then
         diag_failed=1
@@ -609,8 +583,15 @@ emit_combined_leak_result() {
         status="FAIL"
     fi
 
+    if [ -n "${leak_suite_failures:-}" ]; then
+        printf 'FAIL: %s\n' "$leak_suite_failures"
+    fi
+    if [ -n "${leak_diagnostics_failures:-}" ]; then
+        printf 'FAIL: %s\n' "$leak_diagnostics_failures"
+    fi
     printf 'Results: %s passed, %s failed (%s leak checks)\n' "$passed" "$failed" "$tests"
     printf 'BLORP_GATE_RESULT gate=leak status=%s passed=%s failed=%s tests=%s\n' "$status" "$passed" "$failed" "$tests"
+    [ "$status" = "PASS" ]
 }
 
 emit_aggregated_blorp_result() {
@@ -663,43 +644,15 @@ emit_aggregated_blorp_result() {
 parse_cli_for_key() {
     local output="$1"
     local key="$2"
-    local status failures message
-
-    if parse_structured_gate_result "$output" "$key"; then
-        eval "status=\$${key}_status"
-        if [ "$status" = "FAIL" ]; then
-            failures=$(echo "$output" | grep '^FAIL:' | sed 's/^FAIL: *//')
-            [ -n "$failures" ] && eval "${key}_failures=\$failures"
-        fi
-        return
+    local structured_valid status failures
+    parse_structured_gate_result "$output" "$key"
+    eval "structured_valid=\$${key}_structured_valid"
+    eval "status=\$${key}_status"
+    if [ "$structured_valid" = "true" ] && [ "$status" = "FAIL" ]; then
+        failures=$(printf '%s\n' "$output" | grep '^FAIL:' | sed 's/^FAIL: *//')
+        [ -n "$failures" ] && eval "${key}_failures=\$failures"
     fi
-
-    local summary p f t
-    summary=$(echo "$output" | grep '^Results:')
-    if [ -z "$summary" ]; then
-        eval "${key}_status=FAIL"
-        eval "${key}_passed=0"
-        eval "${key}_failed=1"
-        eval "${key}_tests=1"
-        message="${key} gate exited before reporting Results"
-        eval "${key}_failures=\$message"
-        return
-    fi
-
-    p=$(echo "$summary" | grep -o '[0-9]* passed' | grep -o '[0-9]*')
-    f=$(echo "$summary" | grep -o '[0-9]* failed' | grep -o '[0-9]*')
-    t=$(echo "$summary" | sed 's/.*(\(.*\))/\1/' | grep -o '[0-9]*' | head -1)
-
-    eval "${key}_passed=\$p"
-    eval "${key}_failed=\$f"
-    eval "${key}_tests=\$t"
-    if [ "$f" -eq 0 ]; then
-        eval "${key}_status=PASS"
-    else
-        eval "${key}_status=FAIL"
-        failures=$(echo "$output" | grep '^FAIL:' | sed 's/^FAIL: *//')
-        eval "${key}_failures=\$failures"
-    fi
+    return 0
 }
 
 parse_cli() {
@@ -1028,20 +981,13 @@ run_compiler_blorp_sanitize_commands() {
 
 parse_std_check_gate_output() {
     local output="$1"
-    if parse_structured_gate_result "$output" "std_check"; then
-        if [ "$std_check_status" = "FAIL" ]; then
-            local failures
-            failures=$(echo "$output" | grep '^FAIL:' | sed 's/^FAIL: *//')
-            [ -n "$failures" ] && std_check_failures="$failures"
-        fi
-        return
+    local failures
+    parse_structured_gate_result "$output" "std_check"
+    if [ "$std_check_structured_valid" = "true" ] && [ "$std_check_status" = "FAIL" ]; then
+        failures=$(printf '%s\n' "$output" | grep '^FAIL:' | sed 's/^FAIL: *//')
+        [ -n "$failures" ] && std_check_failures="$failures"
     fi
-
-    std_check_status="FAIL"
-    std_check_passed=0
-    std_check_failed=1
-    std_check_tests=1
-    std_check_failures="std-check gate exited before reporting a summary"
+    return 0
 }
 
 run_std_check_gate_commands() {
@@ -1256,7 +1202,7 @@ run_leak() {
     echo "═══ Leak-Check Ownership Suites + Diagnostics ═══"
     echo ""
     local output exit_code output_file diag_output_file start_seconds
-    local suite_exit diag_exit suite_output diag_output
+    local suite_exit diag_exit combined_exit suite_output diag_output
     start_seconds=$(now_seconds)
     output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_leak.XXXXXX") || exit 1
     diag_output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_leak_diag.XXXXXX") || {
@@ -1264,7 +1210,7 @@ run_leak() {
         exit 1
     }
     if $verbose; then
-        env BLORP_GATE_RESULT=leak bin/blorp test $blorp_test_artifact_flags --leak-check --suite --timeout "$leak_test_timeout" "${leak_roots[@]}" 2>&1 | tee "$output_file"
+        env BLORP_GATE_RESULT=leak_suite bin/blorp test $blorp_test_artifact_flags --leak-check --suite --timeout "$leak_test_timeout" "${leak_roots[@]}" 2>&1 | tee "$output_file"
         suite_exit=${PIPESTATUS[0]}
         suite_output=$(cat "$output_file")
         blorp/test/runtime/test_leak_report.sh 2>&1 | tee "$diag_output_file"
@@ -1272,7 +1218,7 @@ run_leak() {
         diag_output=$(cat "$diag_output_file")
         cat "$diag_output_file" >> "$output_file"
     else
-        env BLORP_GATE_RESULT=leak bin/blorp test $blorp_test_artifact_flags --leak-check --suite --timeout "$leak_test_timeout" "${leak_roots[@]}" > "$output_file" 2>&1
+        env BLORP_GATE_RESULT=leak_suite bin/blorp test $blorp_test_artifact_flags --leak-check --suite --timeout "$leak_test_timeout" "${leak_roots[@]}" > "$output_file" 2>&1
         suite_exit=$?
         suite_output=$(cat "$output_file")
         blorp/test/runtime/test_leak_report.sh > "$diag_output_file" 2>&1
@@ -1283,11 +1229,13 @@ run_leak() {
     if $verbose; then
         emit_combined_leak_result "$suite_output" "$diag_output" "$suite_exit" "$diag_exit" \
             | tee -a "$output_file"
+        combined_exit=${PIPESTATUS[0]}
     else
         emit_combined_leak_result "$suite_output" "$diag_output" "$suite_exit" "$diag_exit" \
             >> "$output_file"
+        combined_exit=$?
     fi
-    if [ "$suite_exit" -eq 0 ] && [ "$diag_exit" -eq 0 ]; then
+    if [ "$suite_exit" -eq 0 ] && [ "$diag_exit" -eq 0 ] && [ "$combined_exit" -eq 0 ]; then
         exit_code=0
     else
         exit_code=1
@@ -1515,7 +1463,7 @@ run_gate_to_file() {
             run_runtime_gate_commands "$outfile" false
             ;;
         leak)
-            env BLORP_GATE_RESULT=leak bin/blorp test $blorp_test_artifact_flags --leak-check --suite --timeout "$parallel_leak_timeout" "${leak_roots[@]}" >> "$outfile" 2>&1
+            env BLORP_GATE_RESULT=leak_suite bin/blorp test $blorp_test_artifact_flags --leak-check --suite --timeout "$parallel_leak_timeout" "${leak_roots[@]}" >> "$outfile" 2>&1
             leak_suite_exit=$?
             leak_suite_output=$(cat "$outfile")
             leak_diag_outfile="$gate_tmpdir/${gate}_diag_output"
@@ -1524,7 +1472,8 @@ run_gate_to_file() {
             leak_diag_output=$(cat "$leak_diag_outfile")
             cat "$leak_diag_outfile" >> "$outfile"
             emit_combined_leak_result "$leak_suite_output" "$leak_diag_output" "$leak_suite_exit" "$leak_diag_exit" >> "$outfile"
-            if [ "$leak_suite_exit" -ne 0 ] || [ "$leak_diag_exit" -ne 0 ]; then
+            leak_combined_exit=$?
+            if [ "$leak_suite_exit" -ne 0 ] || [ "$leak_diag_exit" -ne 0 ] || [ "$leak_combined_exit" -ne 0 ]; then
                 false
             else
                 true

@@ -147,6 +147,12 @@ chmod +x "$TMP_HARNESS/blorp/test/package/test_package.sh"
 cat > "$TMP_HARNESS/blorp/test/runtime/test_leak_report.sh" <<'SH'
 #!/usr/bin/env bash
 echo "Diagnostic results: 1 passed, 0 failed"
+if [ "${BLORP_DIAG_OMIT_STRUCTURED:-0}" != "1" ]; then
+	echo "BLORP_GATE_RESULT gate=leak_diagnostics status=${BLORP_DIAG_RESULT_STATUS:-PASS} passed=${BLORP_DIAG_RESULT_PASSED:-1} failed=${BLORP_DIAG_RESULT_FAILED:-0} tests=${BLORP_DIAG_RESULT_TESTS:-1}"
+fi
+if [ "${BLORP_DIAG_DUPLICATE_STRUCTURED:-0}" = "1" ]; then
+	echo "BLORP_GATE_RESULT gate=leak_diagnostics status=PASS passed=1 failed=0 tests=1"
+fi
 SH
 chmod +x "$TMP_HARNESS/blorp/test/runtime/test_leak_report.sh"
 
@@ -200,8 +206,11 @@ if [ "\${1:-}" = "test" ]; then
 		echo "\$BLORP_TEST_TERMINAL_OUTPUT"
 	fi
 	echo "Results: 1 passed, 0 failed (1 tests)"
-	if [ -n "\${BLORP_GATE_RESULT:-}" ]; then
+	if [ -n "\${BLORP_GATE_RESULT:-}" ] && [ "\${BLORP_TEST_OMIT_STRUCTURED:-0}" != "1" ]; then
 		echo "BLORP_GATE_RESULT gate=\$BLORP_GATE_RESULT status=\${BLORP_TEST_RESULT_STATUS:-PASS} passed=\${BLORP_TEST_RESULT_PASSED:-1} failed=\${BLORP_TEST_RESULT_FAILED:-0} tests=\${BLORP_TEST_RESULT_TESTS:-1}"
+		if [ "\${BLORP_TEST_DUPLICATE_STRUCTURED:-0}" = "1" ]; then
+			echo "BLORP_GATE_RESULT gate=\$BLORP_GATE_RESULT status=PASS passed=1 failed=0 tests=1"
+		fi
 	fi
 	exit "\${BLORP_TEST_COMMAND_EXIT:-1}"
 fi
@@ -296,6 +305,49 @@ assert_invalid_structured_result oversized-count PASS 999999999999999999999999 0
 
 echo "PASS: scripts/test rejects invalid structured gate results"
 
+missing_structured_output="$TMP_HARNESS/missing-structured-output.txt"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_TEST_COMMAND_EXIT=0 \
+		BLORP_TEST_OMIT_STRUCTURED=1 \
+		BLORP_TEST_TERMINAL_OUTPUT='Combined test compile failed' \
+		bash scripts/test runtime --serial
+) > "$missing_structured_output" 2>&1
+missing_structured_status=$?
+if [ "$missing_structured_status" -eq 0 ] \
+	|| ! grep -Eq 'Runtime[[:space:]]+FAIL[[:space:]]+0[[:space:]]+1[[:space:]]+1' \
+		"$missing_structured_output" \
+	|| ! grep -Fq 'runtime gate did not report exactly one structured result' \
+		"$missing_structured_output"
+then
+	echo "FAIL: scripts/test should reject a missing structured result even with human summaries"
+	cat "$missing_structured_output"
+	exit 1
+fi
+
+duplicate_structured_output="$TMP_HARNESS/duplicate-structured-output.txt"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_TEST_COMMAND_EXIT=0 \
+		BLORP_TEST_DUPLICATE_STRUCTURED=1 \
+		bash scripts/test runtime --serial
+) > "$duplicate_structured_output" 2>&1
+duplicate_structured_status=$?
+if [ "$duplicate_structured_status" -eq 0 ] \
+	|| ! grep -Eq 'Runtime[[:space:]]+FAIL[[:space:]]+0[[:space:]]+1[[:space:]]+1' \
+		"$duplicate_structured_output" \
+	|| ! grep -Fq 'runtime gate did not report exactly one structured result' \
+		"$duplicate_structured_output"
+then
+	echo "FAIL: scripts/test should reject duplicate structured results"
+	cat "$duplicate_structured_output"
+	exit 1
+fi
+
+echo "PASS: scripts/test rejects missing and duplicate structured results"
+
 named_failure_output="$TMP_HARNESS/named-failure-output.txt"
 write_fake_blorp "$check_log"
 (
@@ -312,10 +364,13 @@ named_failure_status=$?
 
 named_failure_excerpt=$(sed -n '/^Failure output for runtime:/,/^Re-run with --verbose/p' \
 	"$named_failure_output")
+named_failure_summary=$(sed -n '/^Failed tests:/,/^BLORP_GATE_RESULT gate=test/p' \
+	"$named_failure_output")
 if [ "$named_failure_status" -eq 0 ] \
-	|| ! grep -Fq '[FAIL] late named failure' <<< "$named_failure_excerpt"
+	|| ! grep -Fq '[FAIL] late named failure' <<< "$named_failure_excerpt" \
+	|| ! grep -Fq 'late named failure' <<< "$named_failure_summary"
 then
-	echo "FAIL: scripts/test should include indented test failures in its compact excerpt"
+	echo "FAIL: scripts/test should preserve named structured failures in its excerpt and summary"
 	cat "$named_failure_output"
 	exit 1
 fi
@@ -521,6 +576,65 @@ fi
 
 echo "PASS: scripts/test leak reports an unambiguous combined result"
 
+missing_diag_output="$TMP_HARNESS/missing-diag-output.txt"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_TEST_COMMAND_EXIT=0 \
+		BLORP_DIAG_OMIT_STRUCTURED=1 \
+		bash scripts/test leak --serial --no-build
+) > "$missing_diag_output" 2>&1
+missing_diag_status=$?
+if [ "$missing_diag_status" -eq 0 ] \
+	|| ! grep -Eq 'Leak-check[[:space:]]+FAIL[[:space:]]+1[[:space:]]+1[[:space:]]+2' \
+		"$missing_diag_output"
+then
+	echo "FAIL: scripts/test leak should reject missing diagnostic verdicts"
+	cat "$missing_diag_output"
+	exit 1
+fi
+
+echo "PASS: scripts/test leak rejects missing diagnostic verdicts"
+
+malformed_diag_output="$TMP_HARNESS/malformed-diag-output.txt"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_TEST_COMMAND_EXIT=0 \
+		BLORP_DIAG_RESULT_STATUS=PASS \
+		BLORP_DIAG_RESULT_FAILED=not-a-count \
+		bash scripts/test leak --serial --no-build
+) > "$malformed_diag_output" 2>&1
+malformed_diag_status=$?
+if [ "$malformed_diag_status" -eq 0 ] \
+	|| ! grep -Eq 'Leak-check[[:space:]]+FAIL[[:space:]]+1[[:space:]]+1[[:space:]]+2' \
+		"$malformed_diag_output"
+then
+	echo "FAIL: scripts/test leak should reject malformed diagnostic verdicts"
+	cat "$malformed_diag_output"
+	exit 1
+fi
+
+duplicate_diag_output="$TMP_HARNESS/duplicate-diag-output.txt"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_TEST_COMMAND_EXIT=0 \
+		BLORP_DIAG_DUPLICATE_STRUCTURED=1 \
+		bash scripts/test leak --serial --no-build
+) > "$duplicate_diag_output" 2>&1
+duplicate_diag_status=$?
+if [ "$duplicate_diag_status" -eq 0 ] \
+	|| ! grep -Eq 'Leak-check[[:space:]]+FAIL[[:space:]]+1[[:space:]]+1[[:space:]]+2' \
+		"$duplicate_diag_output"
+then
+	echo "FAIL: scripts/test leak should reject duplicate diagnostic verdicts"
+	cat "$duplicate_diag_output"
+	exit 1
+fi
+
+echo "PASS: scripts/test leak rejects malformed and duplicate diagnostic verdicts"
+
 if [ -f "$check_log" ]; then
 	echo "FAIL: scripts/test runtime should not run a hidden std check"
 	cat "$output_file"
@@ -607,12 +721,20 @@ echo "PASS: package lifecycle checks have a package-owned implementation"
 mkdir -p "$TMP_HARNESS/blorp/test/lsp/fixtures" "$TMP_HARNESS/fake-python-bin"
 cat > "$TMP_HARNESS/fake-python-bin/python3" <<'SH'
 #!/usr/bin/env bash
+emit_fixture_result=false
+case "$*" in
+	*test_lsp_fixture_process.py) emit_fixture_result=true ;;
+esac
 if [ "${FAKE_LSP_FAIL:-0}" = "1" ]; then
 	echo "FAIL: public LSP fixture regression"
-	echo "BLORP_GATE_RESULT gate=${BLORP_GATE_RESULT:-lsp} status=FAIL passed=11 failed=1 tests=12"
+	if $emit_fixture_result; then
+		echo "BLORP_GATE_RESULT gate=lsp status=FAIL passed=11 failed=1 tests=12"
+	fi
 	exit 1
 fi
-echo "BLORP_GATE_RESULT gate=${BLORP_GATE_RESULT:-lsp} status=PASS passed=12 failed=0 tests=12"
+if $emit_fixture_result; then
+	echo "BLORP_GATE_RESULT gate=lsp status=PASS passed=12 failed=0 tests=12"
+fi
 SH
 chmod +x "$TMP_HARNESS/fake-python-bin/python3"
 lsp_failure_output="$TMP_HARNESS/lsp-failure-output.txt"

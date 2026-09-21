@@ -73,6 +73,12 @@ fi
 
 echo ""
 echo "Diagnostic results: $PASS passed, $FAIL failed"
+if [ "$FAIL" -gt 0 ]; then
+    DIAGNOSTIC_STATUS=FAIL
+else
+    DIAGNOSTIC_STATUS=PASS
+fi
+echo "BLORP_GATE_RESULT gate=leak_diagnostics status=$DIAGNOSTIC_STATUS passed=$PASS failed=$FAIL tests=$((PASS + FAIL))"
 if [ $FAIL -gt 0 ]; then
     exit 1
 fi
