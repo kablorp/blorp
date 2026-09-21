@@ -19896,7 +19896,7 @@ typedef struct {
     void** keys;         // Flat array [capacity]
     void** values;       // Flat array [capacity]
     uint8_t* meta;       // [capacity]: metadata bytes
-    long* order;         // Dense array of slot indices [size], preserves insertion order
+    long* order;         // Slot indices [capacity], with -1 holes, preserves insertion order
     long* order_index;   // Reverse map: slot -> position in order[] (-1 if unoccupied)
     unsigned long (*hash_fn)(void*);
     bool (*eq_fn)(void*, void*);
@@ -20419,6 +20419,13 @@ blorp_Dict* blorp_dict_insert(blorp_Dict* dict, void* key, void* value) {
     bool was_shared = __builtin_expect(!blorp_is_unique(dict), 0);
     blorp_Dict* result = was_shared ? blorp_dict_copy(dict) : dict;
     if (was_shared) blorp_release(dict);
+
+    // Removal leaves a hole in order[] and order_len remains monotonic until a
+    // rehash compacts it. A remove/reinsert workload can therefore fill the
+    // order array while the live-entry load factor stays low.
+    if (__builtin_expect(result->order_len >= result->capacity, 0)) {
+        blorp_dict_rehash(result, result->capacity);
+    }
 
     unsigned long hash = result->hash_fn(key);
     long insert_slot = -1;
