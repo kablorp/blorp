@@ -263,6 +263,58 @@ static pthread_mutex_t __process_spawn_mutex = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
 // ============================================================================
+// Allocation oracle: raw allocation-path counters (allocation-contract
+// roadmap milestone 6). MemStats/blorp_alloc only ever counted managed
+// object requests; every OTHER libc/OS allocation call this runtime makes
+// (pool slab refills, malloc/calloc/realloc-backed raw buffers, aligned
+// SIMD buffers, generated cleanup scratch growth, fiber stack mmaps) was
+// invisible to a Blorp test doing a before/after MemStats snapshot. These
+// counters close that gap. They are atomics with no formatting/logging on
+// the hot path and are only touched when __blorp_allocator_stats_active()
+// is true (the same BLORP_ALLOCATOR_STATS-style gate blorp_alloc already
+// uses), so the production path keeps its single predicted branch.
+//
+// Every malloc/calloc/realloc/aligned_alloc/mmap call site in this file must
+// either go through one of the BLORP_ORACLE_* wrappers below (directly, or
+// transitively through blorp_malloc_checked/blorp_realloc_checked/
+// blorp_calloc_checked/blorp_pool_refill/blorp_simd_alloc, which are
+// themselves instrumented), or be listed in the allowlist comment block
+// next to it explaining why the oracle does not observe it. See
+// blorp/test/runtime/test_runtime_alloc_oracle_coverage.py.
+static bool __blorp_lightweight_stats_enabled = false;
+
+static struct {
+    _Atomic long backing_pool_refill_events;
+    _Atomic long backing_libc_malloc_events;
+    _Atomic long raw_buffer_malloc_events;
+    _Atomic long raw_buffer_calloc_events;
+    _Atomic long raw_buffer_realloc_events;
+    _Atomic long raw_buffer_aligned_events;
+    _Atomic long cleanup_scratch_events;
+    _Atomic long fiber_mmap_events;
+} __blorp_oracle_stats = {0, 0, 0, 0, 0, 0, 0, 0};
+
+static inline bool __blorp_allocator_stats_active(void);
+
+static inline void __blorp_oracle_count(_Atomic long* counter) {
+    if (__blorp_allocator_stats_active()) {
+        atomic_fetch_add_explicit(counter, 1, memory_order_relaxed);
+    }
+}
+
+// Thin counted wrappers around the libc allocation calls used for raw
+// (non-managed) backing storage: list/string/dict/set capacity buffers,
+// stream combinator state, I/O ring buffers, and similar. Semantically
+// identical to calling libc directly; the only difference is the oracle
+// counter bump when stats are active.
+#define BLORP_ORACLE_MALLOC(sz) \
+    (__blorp_oracle_count(&__blorp_oracle_stats.raw_buffer_malloc_events), malloc(sz))
+#define BLORP_ORACLE_CALLOC(n, sz) \
+    (__blorp_oracle_count(&__blorp_oracle_stats.raw_buffer_calloc_events), calloc((n), (sz)))
+#define BLORP_ORACLE_REALLOC(p, sz) \
+    (__blorp_oracle_count(&__blorp_oracle_stats.raw_buffer_realloc_events), realloc((p), (sz)))
+
+// ============================================================================
 // Checked Arithmetic for Allocation Sizes
 // ============================================================================
 
@@ -287,7 +339,7 @@ static size_t blorp_checked_add(size_t a, size_t b) {
 }
 
 void* blorp_malloc_checked(size_t size) {
-    void* ptr = malloc(size);
+    void* ptr = BLORP_ORACLE_MALLOC(size);
     if (!ptr) {
         fprintf(stderr, "blorp: out of memory (malloc %zu bytes)\\n", size);
         exit(1);
@@ -296,7 +348,7 @@ void* blorp_malloc_checked(size_t size) {
 }
 
 static void* blorp_realloc_checked(void* old_ptr, size_t size) {
-    void* ptr = realloc(old_ptr, size);
+    void* ptr = BLORP_ORACLE_REALLOC(old_ptr, size);
     if (!ptr) {
         fprintf(stderr, "blorp: out of memory (realloc %zu bytes)\\n", size);
         exit(1);
@@ -305,7 +357,7 @@ static void* blorp_realloc_checked(void* old_ptr, size_t size) {
 }
 
 static void* blorp_calloc_checked(size_t count, size_t size) {
-    void* ptr = calloc(count, size);
+    void* ptr = BLORP_ORACLE_CALLOC(count, size);
     if (!ptr) {
         fprintf(stderr, "blorp: out of memory (calloc %zu * %zu bytes)\\n", count, size);
         exit(1);
@@ -378,11 +430,47 @@ typedef struct blorp_Object_s {
 typedef void (*blorp_destructor_fn)(void*);
 
 // User-facing value snapshot for blorp_get_mem_stats.
+//
+// The first four fields count managed (blorp_alloc-backed) object requests,
+// as before. The remaining fields are the allocation oracle's counters
+// (allocation-contract roadmap milestone 6): every OTHER heap/OS allocation
+// path this runtime has, so a zero-delta MemStats snapshot pair is actual
+// evidence of "no heap activity" rather than just "no managed objects".
+// They are populated only while the lightweight allocator-stats gate is
+// active (see oracle_stats_active); reading them while that gate is off
+// always reports oracle_stats_active == 0, which callers must treat as an
+// incomplete/failed measurement, never as a zero-allocation result.
 typedef struct {
     long total_allocations;
     long total_releases;
     long current_objects;
     long bytes_allocated;
+    // Backing allocator events distinct from the logical managed-object
+    // requests above: a pool slab refill or an oversized/ASan-mode libc
+    // malloc supplies storage for one or many blorp_alloc() calls, so these
+    // must not be summed with total_allocations to avoid double counting.
+    long backing_pool_refill_events;
+    long backing_libc_malloc_events;
+    // Raw (non-managed) buffer requests: list/string/dict/set capacity
+    // storage, stream combinator state, I/O buffers, and similar, routed
+    // through blorp_malloc_checked/blorp_realloc_checked/blorp_calloc_checked.
+    long raw_buffer_malloc_events;
+    long raw_buffer_calloc_events;
+    long raw_buffer_realloc_events;
+    // SIMD-aligned buffer requests (aligned_alloc, or malloc when no SIMD
+    // alignment is required) from blorp_simd_alloc.
+    long raw_buffer_aligned_events;
+    // Generated cleanup scratch: growth of a recursive union's iterative
+    // destructor work stack (stage_10_backend/emit.brp).
+    long cleanup_scratch_events;
+    // Fiber stack mmap requests that were not satisfied by the fiber stack
+    // reuse pool.
+    long fiber_mmap_events;
+    // 1 when the oracle counters above were actually being tracked at
+    // snapshot time (BLORP_ALLOCATOR_STATS-style gate active), 0 otherwise.
+    // A caller must fail rather than treat an all-zero oracle snapshot as
+    // proof of no allocation when this is 0.
+    long oracle_stats_active;
 } blorp_MemStats;
 
 // User-facing value snapshot for scheduler instrumentation.
@@ -841,7 +929,8 @@ static inline void __blorp_scheduler_stat_lock(
 // memory profiles use only atomic object counters plus allocator/RSS snapshots.
 // With neither mode enabled, alloc/release skip all stats traffic.
 static bool __blorp_stats_enabled = false;
-static bool __blorp_lightweight_stats_enabled = false;
+// __blorp_lightweight_stats_enabled is declared earlier, next to the
+// allocation-oracle counters that also gate on it.
 static bool __blorp_compiler_memory_profile_enabled = false;
 static bool __blorp_typecheck_body_metrics_enabled = false;
 static bool __blorp_trace_allocs = false;
@@ -1072,6 +1161,11 @@ static __blorp_TypecheckBodyMetric* __blorp_typecheck_body_metrics = NULL;
 static size_t __blorp_typecheck_body_metric_count = 0;
 static size_t __blorp_typecheck_body_metric_capacity = 0;
 
+// Not an allocation the oracle observes, because this is compiler
+// self-profiling instrumentation gated by BLORP_TYPECHECK_BODY_METRICS
+// (__blorp_typecheck_body_metrics_enabled), independent of and orthogonal
+// to the subject program's own execution; see the roadmap's "optional
+// profiler/leak/sanitizer bookkeeping" exclusion.
 static char* __blorp_typecheck_body_metric_text(const char* text) {
     const char* source = text ? text : "";
     size_t length = strlen(source);
@@ -1138,6 +1232,10 @@ static blorp_AllocMeta* __alloc_meta_find_locked(const blorp_Object* obj) {
     return NULL;
 }
 
+// Not an allocation the oracle observes, because this is cold leak/full-stats
+// metadata bookkeeping (only reachable when __alloc_meta_enabled(), i.e.
+// BLORP_LEAK_CHECK/BLORP_TRACK_STATS/BLORP_TRACE_ALLOCS), never active in the
+// lightweight BLORP_ALLOCATOR_STATS oracle mode this test harness uses.
 static void __alloc_meta_insert(blorp_Object* obj, size_t alloc_size, bool stats_tracked) {
     if (!__alloc_meta_enabled()) return;
     blorp_AllocMeta* meta = (blorp_AllocMeta*)malloc(sizeof(blorp_AllocMeta));
@@ -1322,6 +1420,7 @@ static inline void blorp_init_object_header(blorp_Object* header,
 
 static inline void* blorp_simd_alloc(size_t size) {
     void* ptr;
+    __blorp_oracle_count(&__blorp_oracle_stats.raw_buffer_aligned_events);
     #if defined(BLORP_SIMD_AVX) || defined(BLORP_SIMD_AVX2)
         // AVX requires 32-byte alignment
         ptr = aligned_alloc(32, ((size + 31) / 32) * 32);
@@ -1834,6 +1933,9 @@ void blorp_typecheck_body_metric_record_c(
         size_t grown = __blorp_typecheck_body_metric_capacity
             ? __blorp_typecheck_body_metric_capacity * 2
             : 1024;
+        // Not an allocation the oracle observes, because this is compiler
+        // self-profiling instrumentation gated by its own metrics flag,
+        // independent of the subject program's execution.
         __blorp_TypecheckBodyMetric* rows = (__blorp_TypecheckBodyMetric*)realloc(
             __blorp_typecheck_body_metrics,
             grown * sizeof(__blorp_TypecheckBodyMetric)
@@ -1863,6 +1965,9 @@ void blorp_typecheck_phase_metric_record_c(
         size_t grown = __blorp_typecheck_phase_metric_capacity
             ? __blorp_typecheck_phase_metric_capacity * 2
             : 64;
+        // Not an allocation the oracle observes, because this is compiler
+        // self-profiling instrumentation gated by its own metrics flag,
+        // independent of the subject program's execution.
         __blorp_TypecheckPhaseMetric* rows = (__blorp_TypecheckPhaseMetric*)realloc(
             __blorp_typecheck_phase_metrics,
             grown * sizeof(__blorp_TypecheckPhaseMetric)
@@ -1920,6 +2025,9 @@ void blorp_typecheck_ctfe_metric_record_c(
         size_t grown = __blorp_typecheck_ctfe_metric_capacity
             ? __blorp_typecheck_ctfe_metric_capacity * 2
             : 16;
+        // Not an allocation the oracle observes, because this is compiler
+        // self-profiling instrumentation gated by its own metrics flag,
+        // independent of the subject program's execution.
         __blorp_TypecheckCtfeMetric* rows = (__blorp_TypecheckCtfeMetric*)realloc(
             __blorp_typecheck_ctfe_metrics,
             grown * sizeof(__blorp_TypecheckCtfeMetric)
@@ -2323,6 +2431,7 @@ static void blorp_pool_drain(void) {
 static void* blorp_pool_refill(blorp_PoolTLS* tls, int cls) {
     size_t obj_size = blorp_pool_sizes[cls];
     size_t slab_bytes = obj_size * BLORP_POOL_REFILL_COUNT;
+    __blorp_oracle_count(&__blorp_oracle_stats.backing_pool_refill_events);
     char* slab = (char*)malloc(slab_bytes);
     if (!slab) {
         fprintf(stderr, "blorp: out of memory (requested %zu bytes)\n", slab_bytes);
@@ -2480,6 +2589,7 @@ void* blorp_alloc(size_t size) {
         }
         // Round up to class size for poolable objects (so free can recycle)
         if (cls >= 0) actual_size = blorp_pool_sizes[cls];
+        __blorp_oracle_count(&__blorp_oracle_stats.backing_libc_malloc_events);
         obj = malloc(actual_size);
         if (!obj) {
             fprintf(stderr, "blorp: out of memory (requested %zu bytes)\n", size);
@@ -2996,7 +3106,7 @@ static blorp_IoWaiterList blorp_tcp_inner_close_and_extract_waiters(
 }
 
 static blorp_TcpInner* blorp_tcp_inner_new(blorp_TcpHandleKind kind, int fd) {
-    blorp_TcpInner* inner = (blorp_TcpInner*)calloc(1, sizeof(blorp_TcpInner));
+    blorp_TcpInner* inner = (blorp_TcpInner*)BLORP_ORACLE_CALLOC(1, sizeof(blorp_TcpInner));
     if (!inner) {
         fprintf(stderr, "blorp: out of memory (requested %zu bytes)\n",
                 sizeof(blorp_TcpInner));
@@ -4538,6 +4648,18 @@ void blorp_release_slow_extern(void* obj) {
 void blorp_release_arc_only_slow_extern(void* obj) {
     blorp_Object* header = (blorp_Object*)obj;
     blorp_release_slow_finish(header, obj, NULL);
+}
+
+// Counted growth for the generated iterative union destructor's work stack
+// (stage_10_backend/emit.brp's emit_iterative_union_destructor). A final
+// release of a deeply nested recursive union walks children with an
+// explicit stack instead of C recursion, and that stack is grown with this
+// helper instead of a bare realloc() so the allocation oracle can see it;
+// see docs/ALLOCATION_CONTRACT_ROADMAP.md's "Final release of recursive
+// union" acceptance row.
+void* blorp_union_destroy_stack_grow(void* old_stack, size_t new_size) {
+    __blorp_oracle_count(&__blorp_oracle_stats.cleanup_scratch_events);
+    return realloc(old_stack, new_size);
 }
 
 // Single-threaded mode: use plain increment/decrement instead of atomics (14x cheaper)
@@ -8942,7 +9064,7 @@ static void blorp_list_reverse_slots_inplace(blorp_List* list) {
     unsigned char stack_tmp[256];
     unsigned char* tmp = stack_tmp;
     if (stride > sizeof(stack_tmp)) {
-        tmp = (unsigned char*)malloc(stride);
+        tmp = (unsigned char*)BLORP_ORACLE_MALLOC(stride);
         if (!tmp) {
             fprintf(stderr, "blorp: out of memory (requested %zu bytes)\n", stride);
             exit(1);
@@ -14318,7 +14440,7 @@ static char* blorp_tls_string_to_c_copy(blorp_String* value) {
     if (!value || value->len < 0) return NULL;
     if (blorp_string_contains_nul(value)) return NULL;
     if ((unsigned long)value->len > SIZE_MAX - 1UL) return NULL;
-    char* out = (char*)malloc((size_t)value->len + 1U);
+    char* out = (char*)BLORP_ORACLE_MALLOC((size_t)value->len + 1U);
     if (!out) return NULL;
     memcpy(out, value->data, (size_t)value->len);
     out[value->len] = '\0';
@@ -14515,7 +14637,7 @@ static blorp_TlsSessionResult blorp_tls_backend_connect_openssl(
     }
 
     blorp_TlsOpenSslState* state =
-        (blorp_TlsOpenSslState*)calloc(1, sizeof(blorp_TlsOpenSslState));
+        (blorp_TlsOpenSslState*)BLORP_ORACLE_CALLOC(1, sizeof(blorp_TlsOpenSslState));
     if (!state) {
         free(host);
         return blorp_tls_session_result_error(
@@ -22175,6 +22297,7 @@ static void* blorp_fiber_stack_alloc(size_t size, void* allocator_data) {
     }
     size_t aligned_size = __blorp_page_align(size);
     size_t total = aligned_size + __blorp_page_size;  // +1 page for guard
+    __blorp_oracle_count(&__blorp_oracle_stats.fiber_mmap_events);
     void* ptr = mmap(NULL, total, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (ptr == MAP_FAILED) return NULL;
@@ -22334,7 +22457,7 @@ static void* __blorp_worker(void* arg) {
 #if defined(BLORP_ASAN)
     char* alt_stack = NULL;
 #else
-    char* alt_stack = (char*)malloc(SIGSTKSZ);
+    char* alt_stack = (char*)BLORP_ORACLE_MALLOC(SIGSTKSZ);
 #endif
     bool alt_stack_installed = false;
     if (alt_stack) {
@@ -23705,7 +23828,7 @@ static void blorp_io_deadline_heap_reserve(size_t needed) {
         exit(1);
     }
     blorp_IoWaiter** new_items =
-        (blorp_IoWaiter**)realloc(
+        (blorp_IoWaiter**)BLORP_ORACLE_REALLOC(
             __blorp_io_deadline_queue.items,
             new_cap * sizeof(blorp_IoWaiter*));
     if (!new_items) {
@@ -23871,7 +23994,7 @@ static void blorp_io_deadline_queue_clear(void) {
     pthread_mutex_lock(&__blorp_io_deadline_queue.lock);
     if (__blorp_io_deadline_queue.len > 0) {
         removed_count = __blorp_io_deadline_queue.len;
-        removed = (blorp_IoDeadlineEntry*)calloc(
+        removed = (blorp_IoDeadlineEntry*)BLORP_ORACLE_CALLOC(
             removed_count, sizeof(blorp_IoDeadlineEntry));
         if (!removed) {
             pthread_mutex_unlock(&__blorp_io_deadline_queue.lock);
@@ -24167,7 +24290,7 @@ static void blorp_timer_heap_reserve(size_t needed) {
         exit(1);
     }
     blorp_TimerWaiter** new_items =
-        (blorp_TimerWaiter**)realloc(__fiber_timer_queue.items,
+        (blorp_TimerWaiter**)BLORP_ORACLE_REALLOC(__fiber_timer_queue.items,
             new_cap * sizeof(blorp_TimerWaiter*));
     if (!new_items) {
         fprintf(stderr, "blorp: out of memory (timer queue %zu entries)\n",
@@ -27646,7 +27769,7 @@ static blorp_List* __blorp_lfilter_parallel_impl(blorp_List* list, blorp_Closure
     }
 
     // Phase 1: parallel predicate evaluation
-    int8_t* mask = (int8_t*)calloc(len, sizeof(int8_t));
+    int8_t* mask = (int8_t*)BLORP_ORACLE_CALLOC(len, sizeof(int8_t));
     long num_chunks = num_threads;
     if (num_chunks > len / BLORP_LPAR_MIN_CHUNK) num_chunks = len / BLORP_LPAR_MIN_CHUNK;
     if (num_chunks < 2) num_chunks = 2;
@@ -30389,7 +30512,7 @@ static void fallible_line_append(
             }
             next_cap *= 2;
         }
-        char* next = (char*)realloc(*line, (size_t)next_cap);
+        char* next = (char*)BLORP_ORACLE_REALLOC(*line, (size_t)next_cap);
         if (!next) {
             fprintf(stderr, "blorp: out of memory (realloc %ld bytes)\n",
                 next_cap);
@@ -30441,7 +30564,7 @@ blorp_Stream* blorp_stream_from_list(blorp_List* list) {
     s->elem_layout = (list && list->elem_release != NULL)
         ? BLORP_STREAM_ELEM_BORROWED_ARC
         : BLORP_STREAM_ELEM_IMMEDIATE;
-    StreamListState* st = malloc(sizeof(StreamListState));
+    StreamListState* st = BLORP_ORACLE_MALLOC(sizeof(StreamListState));
     st->list = list;
     if (list) blorp_retain((blorp_Object*)list);
     st->idx = 0;
@@ -30463,7 +30586,7 @@ static void stream_range_cleanup(blorp_Stream* self) {
 }
 blorp_Stream* blorp_stream_from_range(long start, long end) {
     blorp_Stream* s = blorp_stream_new();
-    StreamRangeState* st = malloc(sizeof(StreamRangeState));
+    StreamRangeState* st = BLORP_ORACLE_MALLOC(sizeof(StreamRangeState));
     st->current = start;
     st->end = end;
     s->state = st;
@@ -30487,7 +30610,7 @@ static void stream_repeat_cleanup(blorp_Stream* self) {
 }
 blorp_Stream* blorp_stream_repeat(void* value, long elem_layout_code) {
     blorp_Stream* s = blorp_stream_new();
-    StreamRepeatState* st = malloc(sizeof(StreamRepeatState));
+    StreamRepeatState* st = BLORP_ORACLE_MALLOC(sizeof(StreamRepeatState));
     st->value = value;
     blorp_StreamElementLayout requested_layout =
         blorp_stream_layout_from_code(elem_layout_code);
@@ -30539,7 +30662,7 @@ blorp_Stream* blorp_stream_unfold(
     long state_layout_code
 ) {
     blorp_Stream* s = blorp_stream_new();
-    StreamUnfoldState* st = malloc(sizeof(StreamUnfoldState));
+    StreamUnfoldState* st = BLORP_ORACLE_MALLOC(sizeof(StreamUnfoldState));
     st->state_val = seed;
     st->func = func;
     if (func) blorp_retain((blorp_Object*)func);
@@ -30590,7 +30713,7 @@ static void stream_map_cleanup(blorp_Stream* self) {
 blorp_Stream* blorp_stream_map(blorp_Stream* inner, blorp_Closure* func, long result_elem_layout_code) {
     blorp_Stream* s = blorp_stream_new();
     s->elem_layout = blorp_stream_layout_from_code(result_elem_layout_code);
-    StreamMapState* st = malloc(sizeof(StreamMapState));
+    StreamMapState* st = BLORP_ORACLE_MALLOC(sizeof(StreamMapState));
     st->inner = inner;
     if (inner) blorp_retain((blorp_Object*)inner);
     st->func = func;
@@ -30631,7 +30754,7 @@ static void stream_filter_cleanup(blorp_Stream* self) {
 blorp_Stream* blorp_stream_filter(blorp_Stream* inner, blorp_Closure* pred) {
     blorp_Stream* s = blorp_stream_new();
     s->elem_layout = inner->elem_layout;
-    StreamFilterState* st = malloc(sizeof(StreamFilterState));
+    StreamFilterState* st = BLORP_ORACLE_MALLOC(sizeof(StreamFilterState));
     st->inner = inner;
     if (inner) blorp_retain((blorp_Object*)inner);
     st->pred = pred;
@@ -30669,7 +30792,7 @@ static bool stream_filter_map_pull(blorp_Stream* self, void** out) {
 blorp_Stream* blorp_stream_filter_map(blorp_Stream* inner, blorp_Closure* func) {
     blorp_Stream* s = blorp_stream_new();
     s->elem_layout = inner->elem_layout;
-    StreamFilterMapState* st = malloc(sizeof(StreamFilterMapState));
+    StreamFilterMapState* st = BLORP_ORACLE_MALLOC(sizeof(StreamFilterMapState));
     st->inner = inner;
     if (inner) blorp_retain((blorp_Object*)inner);
     st->func = func;
@@ -30708,7 +30831,7 @@ static bool stream_filter_map_pull_##PUBLIC_SUFFIX(blorp_Stream* self, void** ou
 blorp_Stream* blorp_stream_filter_map_##PUBLIC_SUFFIX(blorp_Stream* inner, blorp_Closure* func) { \
     blorp_Stream* s = blorp_stream_new(); \
     s->elem_layout = BLORP_STREAM_ELEM_IMMEDIATE; \
-    StreamFilterMapState* st = malloc(sizeof(StreamFilterMapState)); \
+    StreamFilterMapState* st = BLORP_ORACLE_MALLOC(sizeof(StreamFilterMapState)); \
     st->inner = inner; \
     if (inner) blorp_retain((blorp_Object*)inner); \
     st->func = func; \
@@ -30761,7 +30884,7 @@ static bool stream_filter_map_pull_nullable(blorp_Stream* self, void** out) {
 blorp_Stream* blorp_stream_filter_map_nullable(blorp_Stream* inner, blorp_Closure* func) {
     blorp_Stream* s = blorp_stream_new();
     s->elem_layout = BLORP_STREAM_ELEM_OWNED_ARC;
-    StreamFilterMapState* st = malloc(sizeof(StreamFilterMapState));
+    StreamFilterMapState* st = BLORP_ORACLE_MALLOC(sizeof(StreamFilterMapState));
     st->inner = inner;
     if (inner) blorp_retain((blorp_Object*)inner);
     st->func = func;
@@ -30787,7 +30910,7 @@ static void stream_take_cleanup(blorp_Stream* self) {
 blorp_Stream* blorp_stream_take(blorp_Stream* inner, long n) {
     blorp_Stream* s = blorp_stream_new();
     s->elem_layout = inner->elem_layout;
-    StreamTakeState* st = malloc(sizeof(StreamTakeState));
+    StreamTakeState* st = BLORP_ORACLE_MALLOC(sizeof(StreamTakeState));
     st->inner = inner;
     if (inner) blorp_retain((blorp_Object*)inner);
     st->remaining = n;
@@ -30818,7 +30941,7 @@ static void stream_drop_cleanup(blorp_Stream* self) {
 blorp_Stream* blorp_stream_drop(blorp_Stream* inner, long n) {
     blorp_Stream* s = blorp_stream_new();
     s->elem_layout = inner->elem_layout;
-    StreamDropState* st = malloc(sizeof(StreamDropState));
+    StreamDropState* st = BLORP_ORACLE_MALLOC(sizeof(StreamDropState));
     st->inner = inner;
     if (inner) blorp_retain((blorp_Object*)inner);
     st->skipped = 0;
@@ -30858,7 +30981,7 @@ static void stream_take_while_cleanup(blorp_Stream* self) {
 blorp_Stream* blorp_stream_take_while(blorp_Stream* inner, blorp_Closure* pred) {
     blorp_Stream* s = blorp_stream_new();
     s->elem_layout = inner->elem_layout;
-    StreamTakeWhileState* st = malloc(sizeof(StreamTakeWhileState));
+    StreamTakeWhileState* st = BLORP_ORACLE_MALLOC(sizeof(StreamTakeWhileState));
     st->inner = inner;
     if (inner) blorp_retain((blorp_Object*)inner);
     st->pred = pred;
@@ -30894,7 +31017,7 @@ static void stream_enum_cleanup(blorp_Stream* self) {
 blorp_Stream* blorp_stream_enumerate(blorp_Stream* inner) {
     blorp_Stream* s = blorp_stream_new();
     s->elem_layout = BLORP_STREAM_ELEM_OWNED_ARC;
-    StreamEnumState* st = malloc(sizeof(StreamEnumState));
+    StreamEnumState* st = BLORP_ORACLE_MALLOC(sizeof(StreamEnumState));
     st->inner = inner;
     if (inner) blorp_retain((blorp_Object*)inner);
     st->idx = 0;
@@ -31545,7 +31668,7 @@ static void fallible_file_lines_append(
             }
             next_cap *= 2;
         }
-        char* next = (char*)realloc(st->line, (size_t)next_cap);
+        char* next = (char*)BLORP_ORACLE_REALLOC(st->line, (size_t)next_cap);
         if (!next) {
             fprintf(stderr, "blorp: out of memory (realloc %ld bytes)\n",
                 next_cap);
@@ -34895,8 +35018,8 @@ long blorp_string_levenshtein(const blorp_String* a, const blorp_String* b) {
     const blorp_String* col_s = a->len <= b->len ? b : a;
     long cols = row_s->len;
     long rows = col_s->len;
-    long* prev = malloc((cols + 1) * sizeof(long));
-    long* curr = malloc((cols + 1) * sizeof(long));
+    long* prev = BLORP_ORACLE_MALLOC((cols + 1) * sizeof(long));
+    long* curr = BLORP_ORACLE_MALLOC((cols + 1) * sizeof(long));
     if (!prev || !curr) { free(prev); free(curr); return rows; }
     for (long j = 0; j <= cols; j++) prev[j] = j;
     for (long i = 1; i <= rows; i++) {
@@ -34922,7 +35045,7 @@ blorp_String* blorp_string_lcs(const blorp_String* a, const blorp_String* b) {
         return blorp_string_create("");
     long m = a->len, n = b->len;
     long best_len = 0, best_end = 0;
-    long* dp = calloc(n + 1, sizeof(long));
+    long* dp = BLORP_ORACLE_CALLOC(n + 1, sizeof(long));
     if (!dp) return blorp_string_create("");
     for (long i = 1; i <= m; i++) {
         for (long j = n; j >= 1; j--) {
@@ -36038,7 +36161,7 @@ static blorp_FileStringResult blorp_file_read_text_fd(int fd) {
                 return blorp_file_string_error(BLORP_FILE_ERROR_UNSUPPORTED,
                     blorp_string_create("read_text: file too large"));
             }
-            char* new_buf = (char*)realloc(buf, (size_t)next_cap);
+            char* new_buf = (char*)BLORP_ORACLE_REALLOC(buf, (size_t)next_cap);
             if (!new_buf) {
                 free(buf);
                 fprintf(stderr,
@@ -36090,7 +36213,7 @@ static blorp_FileBytesResult blorp_file_read_bytes_fd(int fd) {
                     blorp_string_create("read_bytes: file too large"));
             }
             unsigned char* new_buf =
-                (unsigned char*)realloc(buf, (size_t)next_cap);
+                (unsigned char*)BLORP_ORACLE_REALLOC(buf, (size_t)next_cap);
             if (!new_buf) {
                 free(buf);
                 fprintf(stderr,
@@ -37581,11 +37704,32 @@ blorp_MemStats blorp_get_mem_stats(void) {
         stats.current_objects = atomic_load_explicit(
             &global_mem_stats.current_objects, memory_order_relaxed);
         stats.bytes_allocated = __blorp_allocator_bytes_in_use();
+        stats.backing_pool_refill_events = atomic_load_explicit(
+            &__blorp_oracle_stats.backing_pool_refill_events, memory_order_relaxed);
+        stats.backing_libc_malloc_events = atomic_load_explicit(
+            &__blorp_oracle_stats.backing_libc_malloc_events, memory_order_relaxed);
+        stats.raw_buffer_malloc_events = atomic_load_explicit(
+            &__blorp_oracle_stats.raw_buffer_malloc_events, memory_order_relaxed);
+        stats.raw_buffer_calloc_events = atomic_load_explicit(
+            &__blorp_oracle_stats.raw_buffer_calloc_events, memory_order_relaxed);
+        stats.raw_buffer_realloc_events = atomic_load_explicit(
+            &__blorp_oracle_stats.raw_buffer_realloc_events, memory_order_relaxed);
+        stats.raw_buffer_aligned_events = atomic_load_explicit(
+            &__blorp_oracle_stats.raw_buffer_aligned_events, memory_order_relaxed);
+        stats.cleanup_scratch_events = atomic_load_explicit(
+            &__blorp_oracle_stats.cleanup_scratch_events, memory_order_relaxed);
+        stats.fiber_mmap_events = atomic_load_explicit(
+            &__blorp_oracle_stats.fiber_mmap_events, memory_order_relaxed);
+        stats.oracle_stats_active = 1;
     } else {
         stats.total_allocations = atomic_load(&global_mem_stats.total_allocations);
         stats.total_releases = atomic_load(&global_mem_stats.total_releases);
         stats.current_objects = atomic_load(&global_mem_stats.current_objects);
         stats.bytes_allocated = atomic_load(&global_mem_stats.bytes_allocated);
+        // Oracle fields and oracle_stats_active stay 0: this snapshot was
+        // taken without the lightweight allocator-stats gate active, so the
+        // oracle counters were not being maintained and must not be read as
+        // "zero events observed".
     }
     return stats;
 }
@@ -37594,6 +37738,13 @@ void blorp_reset_mem_stats(void) {
     // Lightweight process-wide counters deliberately omit per-object metadata.
     // A reset starts an exact measurement epoch, so objects allocated before
     // this boundary must not affect the new epoch when they are later released.
+    //
+    // This switches to the full/precise metadata mode and away from the
+    // lightweight allocator-stats gate, so it deliberately leaves the
+    // allocation-oracle counters alone: the oracle's before/after workflow
+    // (see memory.brp's assert_no_heap_activity) takes two get_mem_stats()
+    // snapshots under BLORP_ALLOCATOR_STATS and diffs them, and does not use
+    // this reset.
     __blorp_lightweight_stats_enabled = false;
     __blorp_stats_enabled = true;
     atomic_fetch_add(&global_mem_stats.epoch, 1);
@@ -38140,6 +38291,9 @@ static blorp_ProfileExecutionState* blorp_profile_current_execution_state(
         return NULL;
     }
 
+    // Not an allocation the oracle observes, because this is the optional
+    // sampling/call profiler subsystem (BLORP_PROFILE), excluded by the
+    // roadmap's "optional profiler/leak/sanitizer bookkeeping" clause.
     blorp_ProfileExecutionState* state = calloc(1, sizeof(*state));
     if (!state || pthread_setspecific(profile_root_execution_key, state) != 0) {
         free(state);
@@ -38213,6 +38367,9 @@ static bool blorp_profile_execution_push(
                 &profile_stack_growth_failures, 1, memory_order_relaxed);
             return false;
         }
+        // Not an allocation the oracle observes, because this is the optional
+        // sampling/call profiler subsystem (BLORP_PROFILE), excluded by the
+        // roadmap's "optional profiler/leak/sanitizer bookkeeping" clause.
         blorp_ProfileFrame* frames = realloc(
             state->frames, capacity * sizeof(blorp_ProfileFrame));
         if (!frames) {
@@ -38614,6 +38771,9 @@ int blorp_profile_enable(
 
     blorp_ProfileEntry* entries = NULL;
     if (function_count > 0) {
+        // Not an allocation the oracle observes, because this is the optional
+        // sampling/call profiler subsystem (BLORP_PROFILE), excluded by the
+        // roadmap's "optional profiler/leak/sanitizer bookkeeping" clause.
         entries = calloc(function_count, sizeof(blorp_ProfileEntry));
         if (!entries) {
             atomic_fetch_add_explicit(
@@ -38998,6 +39158,9 @@ static void blorp_profile_report_with_abandonment_cause(
             pthread_mutex_unlock(&profile_window_mutex);
             return;
         }
+        // Not an allocation the oracle observes, because this is the optional
+        // sampling/call profiler subsystem (BLORP_PROFILE), excluded by the
+        // roadmap's "optional profiler/leak/sanitizer bookkeeping" clause.
         entries = malloc(profile_function_count * sizeof(blorp_ProfileSnapshot));
         if (!entries) {
             fprintf(stderr,
@@ -42618,7 +42781,7 @@ void* blorp_process_run(const blorp_String* program, const blorp_List* args) {
     if (argc < 0 || argc > (long)(SIZE_MAX / sizeof(char*) - 2)) {
         return (void*)blorp_result_err_cstr("too many process arguments");
     }
-    char** argv = (char**)malloc(sizeof(char*) * ((size_t)argc + 2));
+    char** argv = (char**)BLORP_ORACLE_MALLOC(sizeof(char*) * ((size_t)argc + 2));
     if (!argv) return (void*)blorp_result_err_cstr("out of memory");
 
     blorp_Result* cstr_err = NULL;
@@ -42795,7 +42958,7 @@ void* blorp_process_run_inherit(const blorp_String* program, const blorp_List* a
     if (argc < 0 || argc > (long)(SIZE_MAX / sizeof(char*) - 2)) {
         return (void*)blorp_result_err_cstr("too many process arguments");
     }
-    char** argv = (char**)malloc(sizeof(char*) * ((size_t)argc + 2));
+    char** argv = (char**)BLORP_ORACLE_MALLOC(sizeof(char*) * ((size_t)argc + 2));
     if (!argv) return (void*)blorp_result_err_cstr("out of memory");
 
     blorp_Result* cstr_err = NULL;

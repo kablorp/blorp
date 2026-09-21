@@ -493,6 +493,14 @@ if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_allocator_sta
 	echo "FAIL: hygiene-check must include the optimized runtime allocator regression" >&2
 	exit 1
 fi
+if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_alloc_oracle.py' Makefile; then
+	echo "FAIL: hygiene-check must include the allocation oracle counter contract" >&2
+	exit 1
+fi
+if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_alloc_oracle_coverage.py' Makefile; then
+	echo "FAIL: hygiene-check must include the allocation oracle raw-call coverage gate" >&2
+	exit 1
+fi
 if ! grep -Fq 'python3 -m unittest blorp/test/build/test_record_validation.py' Makefile; then
 	echo "FAIL: hygiene-check must include the validation evidence recorder contract" >&2
 	exit 1

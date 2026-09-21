@@ -192,11 +192,23 @@ typedef struct blorp_Object_s {
 #define BLORP_ALLOC_CLASS_DIRECT UINT32_MAX
 typedef void (*blorp_destructor_fn)(void*);
 
+// Must match runtime.c's blorp_MemStats field-for-field: this header is
+// compiled separately into generated C that calls blorp_get_mem_stats(),
+// defined in runtime.o, and the struct is passed by value.
 typedef struct {
     long total_allocations;
     long total_releases;
     long current_objects;
     long bytes_allocated;
+    long backing_pool_refill_events;
+    long backing_libc_malloc_events;
+    long raw_buffer_malloc_events;
+    long raw_buffer_calloc_events;
+    long raw_buffer_realloc_events;
+    long raw_buffer_aligned_events;
+    long cleanup_scratch_events;
+    long fiber_mmap_events;
+    long oracle_stats_active;
 } blorp_MemStats;
 
 typedef struct {
@@ -1008,6 +1020,11 @@ void blorp_set_destructor_id(void* obj, uint32_t id);
 // Release slow path (destructor + free + stats) — defined in runtime.o
 void blorp_release_slow_extern(void* obj);
 void blorp_release_arc_only_slow_extern(void* obj);
+
+// Counted growth for a generated iterative union destructor's work stack
+// (stage_10_backend/emit.brp's emit_iterative_union_destructor) — defined
+// in runtime.o. See the allocation oracle in runtime.c.
+void* blorp_union_destroy_stack_grow(void* old_stack, size_t new_size);
 
 // Cooperative checkpoint slow path (budget reset, cancellation poll, yield)
 // — defined in runtime.o

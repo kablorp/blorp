@@ -7,12 +7,31 @@
 -- ============================================================================
 -- Core Types and Builtins
 -- ============================================================================
--- Memory statistics value tracks allocation patterns
+-- Memory statistics value tracks allocation patterns.
+--
+-- The first four fields count managed (blorp_alloc-backed) object
+-- requests, as before. The remaining fields are the allocation oracle's
+-- counters (allocation-contract roadmap milestone 6): every OTHER
+-- heap/OS allocation path the runtime has (pool slab refills, raw
+-- malloc/calloc/realloc/aligned buffers, generated cleanup scratch growth,
+-- fiber stack mmaps), populated only while `BLORP_ALLOCATOR_STATS`-style
+-- tracking is active. `oracle_stats_active` is 0 when that gate was off at
+-- snapshot time; a caller must treat that as an incomplete measurement,
+-- never as "zero events". See `assert_no_heap_activity`.
 struct MemStats {
 	total_allocations: Int,
 	total_releases: Int,
 	current_objects: Int,
-	bytes_allocated: Int
+	bytes_allocated: Int,
+	backing_pool_refill_events: Int,
+	backing_libc_malloc_events: Int,
+	raw_buffer_malloc_events: Int,
+	raw_buffer_calloc_events: Int,
+	raw_buffer_realloc_events: Int,
+	raw_buffer_aligned_events: Int,
+	cleanup_scratch_events: Int,
+	fiber_mmap_events: Int,
+	oracle_stats_active: Int
 }
 
 
@@ -129,17 +148,109 @@ func measure_memory(f: () -> Void) -> MemStats:
 
 -- Get the delta in memory stats between two points
 pure func mem_delta(before: MemStats, after: MemStats) -> MemStats:
+	-- Both endpoints must have been taken with the oracle gate active for a
+	-- delta to mean anything; see assert_no_heap_activity.
+	both_active: Bool = before.oracle_stats_active > 0 and after.oracle_stats_active > 0
+
+	active_flag: Int = match both_active:
+		True:
+			1
+		False:
+			0
+
 	{
 		total_allocations = after.total_allocations - before.total_allocations,
 		total_releases = after.total_releases - before.total_releases,
 		current_objects = after.current_objects - before.current_objects,
-		bytes_allocated = after.bytes_allocated - before.bytes_allocated
+		bytes_allocated = after.bytes_allocated - before.bytes_allocated,
+		backing_pool_refill_events = after.backing_pool_refill_events - before.backing_pool_refill_events,
+		backing_libc_malloc_events = after.backing_libc_malloc_events - before.backing_libc_malloc_events,
+		raw_buffer_malloc_events = after.raw_buffer_malloc_events - before.raw_buffer_malloc_events,
+		raw_buffer_calloc_events = after.raw_buffer_calloc_events - before.raw_buffer_calloc_events,
+		raw_buffer_realloc_events = after.raw_buffer_realloc_events - before.raw_buffer_realloc_events,
+		raw_buffer_aligned_events = after.raw_buffer_aligned_events - before.raw_buffer_aligned_events,
+		cleanup_scratch_events = after.cleanup_scratch_events - before.cleanup_scratch_events,
+		fiber_mmap_events = after.fiber_mmap_events - before.fiber_mmap_events,
+		oracle_stats_active = active_flag
 	}
 
 
 -- Check for memory leaks: returns true if objects are still live
 pure func has_leaks(stats: MemStats) -> Bool:
 	stats.current_objects > 0
+
+
+-- Allocation oracle assertion (allocation-contract roadmap milestone 6).
+--
+-- Given a `before`/`after` MemStats pair bracketing a piece of test code,
+-- confirm that NO heap activity happened on any counted path: managed
+-- object requests, pool slab refills, raw buffer malloc/calloc/realloc,
+-- SIMD-aligned buffers, generated cleanup scratch growth, and fiber stack
+-- mmaps. On success returns `Ok(void)`. On failure, names the first
+-- counter that moved (or explains that the oracle gate was not active) so
+-- a caller does not have to re-derive which path allocated.
+--
+-- This is test-only: it is for single-fiber test code measured under
+-- `BLORP_ALLOCATOR_STATS=1`, since the underlying counters are process-
+-- global. It does not support nested scopes or concurrent fibers; a test
+-- that needs either must snapshot around each fiber's own single-threaded
+-- region instead of sharing one before/after pair.
+pure func assert_no_heap_activity(before: MemStats, after: MemStats) -> Result[Void, String]:
+	if before.oracle_stats_active == 0 or after.oracle_stats_active == 0:
+		Err((
+				"allocation oracle inactive: run with BLORP_ALLOCATOR_STATS=1 (a disabled gate "
+				+ "must fail, not read as zero)"
+			))
+	else:
+		delta: MemStats = mem_delta(before, after)
+
+		if delta.total_allocations != 0:
+			Err("managed allocation requests moved by " + delta.total_allocations.to_string())
+		else:
+			if delta.total_releases != 0:
+				Err("managed release requests moved by " + delta.total_releases.to_string())
+			else:
+				if delta.backing_pool_refill_events != 0:
+					Err(
+						"pool slab refill events moved by " + delta.backing_pool_refill_events.to_string(),
+					)
+				else:
+					if delta.backing_libc_malloc_events != 0:
+						Err(
+							"backing libc malloc events moved by " + delta.backing_libc_malloc_events.to_string(),
+						)
+					else:
+						if delta.raw_buffer_malloc_events != 0:
+							Err(
+								"raw buffer malloc events moved by " + delta.raw_buffer_malloc_events.to_string(),
+							)
+						else:
+							if delta.raw_buffer_calloc_events != 0:
+								Err(
+									"raw buffer calloc events moved by " + delta.raw_buffer_calloc_events.to_string(),
+								)
+							else:
+								if delta.raw_buffer_realloc_events != 0:
+									Err(
+										"raw buffer realloc events moved by " + delta.raw_buffer_realloc_events.to_string(),
+									)
+								else:
+									if delta.raw_buffer_aligned_events != 0:
+										Err(
+											"raw aligned-buffer events moved by " + delta.raw_buffer_aligned_events.to_string(),
+										)
+									else:
+										if delta.cleanup_scratch_events != 0:
+											Err(
+												"cleanup scratch events moved by " + delta.cleanup_scratch_events.to_string(),
+											)
+										else:
+											if delta.fiber_mmap_events != 0:
+												Err(
+													"fiber stack mmap events moved by " + delta.fiber_mmap_events.to_string(),
+												)
+											else:
+												Ok(void)
 
 
 -- Print memory report comparing before/after stats
