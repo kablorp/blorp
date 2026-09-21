@@ -63,16 +63,17 @@ the admitted checkpoints are explicitly rejected by the adapter, so this
 product is not a canonical full-grammar parser result.
 
 The retained schema probe keeps its AST inputs outside the measurement epoch.
-After the collections/access checkpoint, the product-only lifetime for sixteen
-binary roots (48 nodes) is 8 objects and 4,768 bytes, versus 81 objects and
+After the type/interpolation checkpoint, the product-only lifetime for sixteen
+binary roots (48 nodes) is 8 objects and 4,832 bytes, versus 81 objects and
 5,824 bytes for freshly constructed legacy trees with the same root shape.
 This is a retained-layout comparison, not a construction-speed claim: the test
-oracle pays 223 allocations because it converts an existing AST and runs the
+oracle pays 230 allocations because it converts an existing AST and runs the
 exhaustive validator, while the legacy fixture construction pays 83. Empty,
-scalar, and binary compact products retain 2/256, 6/800, and 8/960
-objects/bytes respectively. The 64-byte increase at each size is the measured
-per-product cost of the five new inline-table handles and the larger product
-allocation class; it is explicit rather than hidden by a large-tree result.
+scalar, and binary compact products retain 2/320, 6/864, and 8/1,024
+objects/bytes respectively. Collections/access added five table handles and
+64 retained bytes; type/interpolation adds six more handles and another 64
+bytes. This cumulative 128-byte fixed increase is explicit rather than hidden
+by a large-tree result.
 
 Both 48-node lifetime fixtures keep the same source and static identifier text
 outside the measurement epoch. The compact result additionally retains its
@@ -88,11 +89,13 @@ bytes. These rows use inline list storage.
 Text values live in one owned string table; text-bearing payload rows store an
 index instead of allocating one record per node. The opaque product record is
 120 bytes by ABI `sizeof` and occupies a 128-byte allocator size class. With
-the five collections/access tables, the product is 160 bytes by ABI `sizeof`
-and occupies a 192-byte allocator size class. The nested aggregate probe covers
+the five collections/access tables, the product was 160 bytes by ABI `sizeof`
+and occupied a 192-byte allocator size class. With the six type/interpolation
+tables, it is 208 bytes by ABI `sizeof` and occupies a 256-byte allocator size
+class. The nested aggregate probe covers
 two roots, 33 nodes, and 31 child ids across record update, dictionary, list,
 tuple, vector, field access, and multi-index subscript forms; it retains 12
-objects and 5,216 current live bytes. There is no paired legacy claim for that
+objects and 5,280 current live bytes. There is no paired legacy claim for that
 mixed shape. Raw evidence is reproduced by
 `blorp/benchmark/compiler/compact_expression_product_schema_probe.brp`; its
 output must be captured with `--leak-check` so live type buckets are available.
@@ -123,15 +126,74 @@ names, grammar-permitted empty aggregate forms, multiple indices, and nested key
 expressions. There is still no production caller or compact-to-production
 bridge.
 
+#### Type-bearing wrappers and finalized interpolation oracle
+
+The third test-only family adds `ParsedAscriptionExpr`, `ParsedRangeExpr`,
+`ParsedOpaqueIntoExpr`, `ParsedOpaqueFromExpr`, and
+`ParsedStringInterpolationPartsExpr`. It covers both interpolation-part
+variants and all eleven current `ParsedTypeExpr` variants. Type nodes, type
+children, identifier slices, and identifiers are product-owned scalar rows;
+no row retains a managed `ParsedTypeExpr`. Dimension operators, dimension-name
+splat status, and function purity are encoded by precise node kinds. Named and
+qualified arguments preserve source order, function children are parameters
+then result, and array children are element then dimensions.
+
+Finalized interpolation payloads own checked part slices. Literal parts own a
+shared-text-table index. Expression parts own a bijective ordinal into the
+expression node's child slice, preserving mixed part order without retaining a
+managed interpolation-part wrapper. A real parser/finalizer fixture verifies
+that hole expressions parsed through the synthetic wrapper project with their
+rebased authored offsets, duplicate-hole order, and one authored source owner.
+The wrapper source is not retained. Compiler-prelude sentinel locations are
+rejected rather than mislabeled as authored source; multi-owner construction
+remains a future direct-parser capability and is not claimed by this adapter.
+
+The mixed type/interpolation probe has one root, five expression nodes, four
+expression child ids, eight type nodes, seven type child ids, four identifier
+slices, five identifiers, and four interpolation parts. It retains 14 objects
+and 2,656 current live bytes; there is no paired legacy claim. Generated C
+confirms inline storage: type-node rows are 48 bytes, identifier-slice rows are
+16 bytes, type-identifier rows are 24 bytes, interpolation-parts payload rows
+are 24 bytes, and interpolation-part rows are 16 bytes on the measured ABI.
+
+The round-trip oracle uses nested matches when comparing interpolation parts.
+The logically equivalent simultaneous tuple match currently mishandles a later
+managed-union payload after a mixed literal/expression sequence. This is a
+separate compiler issue, not evidence of lost compact-product data: the added
+negative controls reject independently altered nested field names, target
+spans, field spans, and enclosing field-access spans. The non-gating standalone
+reproduction is
+[`compiler_managed_union_tuple_match_repro.brp`](../blorp/benchmark/compiler/compiler_managed_union_tuple_match_repro.brp).
+At base `cf43c637e03d49f90bd07f4fc30a275dadae2333`, using `bin/blorp` SHA-256
+`1500987a6e6e8f363e3ce9b7b8a33ae00490018ce63a06fc511c6de4d71a4a8b`
+and fixture SHA-256
+`7184c1ea3ef530131af5f54e28b00e51036cd1ff061d058e191ba6d048fd60ee`, run:
+
+```bash
+bin/blorp test --timeout 180 \
+  blorp/benchmark/compiler/compiler_managed_union_tuple_match_repro.brp
+```
+
+Both cases should pass. Observed behavior is that the nested match passes and
+the simultaneous match fails, so this documented reproduction intentionally
+returns a failing test status and is not registered in a normal gate.
+
 Remaining milestone-1 coverage is deliberately finite:
 
-1. type-bearing wrappers and finalized interpolation parts: ascription,
-   range, opaque into/from, and interpolation-part expressions;
-2. control flow, patterns, and bindings: block, if, match, select, `with`,
+1. control flow, patterns, and bindings: block, if, match, select, `with`,
    debug, lambda, nested function declarations, loops, declarations,
    assignment, subscript assignment, destructuring, and question binding;
-3. concurrency and recovery: concurrent block/for, detach, their parameter
+2. concurrency and recovery: concurrent block/for, detach, their parameter
    metadata, and recovery-sensitive combinations of the existing missing form.
+
+The current declaration has 48 `ParsedExpr` variants. Exactly 29 are now in
+the oracle. The remaining 19 are explicit, not an open-ended category:
+
+| Status | Count | Variants |
+| --- | ---: | --- |
+| Covered | 29 | name; integer, float, string, raw interpolation, bool, and char literals; unary, binary, logical, ascription, range, call, field access, subscript, list, tuple, record, record update, dictionary, vector, opaque into/from, finalized interpolation parts, break, continue, void, builtin, missing |
+| Control/binding/pattern checkpoint | 16 | block, if, match, select, with, debug block, lambda, function declaration, while, for, variable declaration, assignment, compound assignment, subscript assignment, tuple destructuring, question binding |
+| Concurrency checkpoint | 3 | concurrent block, concurrent for, detach |
 
 After those checkpoints cover every `ParsedExpr` variant and their reachable
 pattern/binder rows, milestone 2 starts the first direct canonical construction
@@ -141,6 +203,18 @@ does not add a form-subset parser or leave the AST adapter in production. The
 adapter/projection remain test-only differential oracles, while the first
 production change measures direct construction plus the named consuming
 projection before any downstream caller migration.
+
+The concrete integration boundary is `ParseExprStep` and the expression
+driver rooted at `parse_expression_with_header_span`, `parse_expression`,
+`parse_primary_expr`, and `parse_postfix_expr`. Milestone 2 introduces a
+phase-specific step carrying a compact expression node id, while one outer
+driver owns the row buffers and grammar/value stacks. Existing precedence,
+postfix, block, and recovery helpers append completed scalar rows through that
+driver instead of returning `ParsedExpr`. Type parsing publishes type-root ids
+into the same product. Declaration/program assembly then publishes one
+validated product; the test-only AST adapter is never called by this path. A
+named consuming projection at the finalized-program compatibility boundary is
+measured and retained only until its enumerated downstream callers migrate.
 
 ## Goals
 

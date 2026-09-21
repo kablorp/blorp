@@ -7,10 +7,12 @@ import:
 	../../lib/source:
 		SourceFile,
 		SourceLocation,
+		compiler_prelude_source_location,
 		singleton_source_file_id,
 		source_location_end_offset,
 		source_location_from_offsets,
 		source_location_start_offset,
+		source_locations_equal,
 	parsed_ast:
 		ParsedBinaryOp(
 			ParsedAddOp,
@@ -26,8 +28,15 @@ import:
 			ParsedSubtractOp,
 		),
 		ParsedDictEntry,
+		ParsedDimBinaryOp(
+			ParsedDimAddOp,
+			ParsedDimDivideOp,
+			ParsedDimMultiplyOp,
+			ParsedDimSubtractOp,
+		),
 		ParsedExpr(
 			ParsedBinaryExpr,
+			ParsedAscriptionExpr,
 			ParsedBoolLiteralExpr,
 			ParsedBreakExpr,
 			ParsedBuiltinExpr,
@@ -42,7 +51,11 @@ import:
 			ParsedLogicalExpr,
 			ParsedMissingExpr,
 			ParsedNameExpr,
+			ParsedOpaqueFromExpr,
+			ParsedOpaqueIntoExpr,
+			ParsedRangeExpr,
 			ParsedStringInterpolationExpr,
+			ParsedStringInterpolationPartsExpr,
 			ParsedStringLiteralExpr,
 			ParsedSubscriptExpr,
 			ParsedTupleExpr,
@@ -55,7 +68,21 @@ import:
 		ParsedIdentifier,
 		ParsedLogicalOp(ParsedAndOp, ParsedOrOp),
 		ParsedRecordExprField,
+		ParsedStringInterpolationPart(ParsedInterpolationExpr, ParsedInterpolationLiteral),
 		ParsedStringLiteralForm,
+		ParsedTypeExpr(
+			ParsedArrayType,
+			ParsedBoundedType,
+			ParsedDimBinaryType,
+			ParsedDimLiteralType,
+			ParsedDimNameType,
+			ParsedFunctionType,
+			ParsedMissingType,
+			ParsedNamedType,
+			ParsedQualifiedNamedType,
+			ParsedRangeType,
+			ParsedTupleType,
+		),
 		ParsedUnaryOp(ParsedNegateOp, ParsedNotOp),
 		parsed_identifier,
 	source_ast_finalize: IdentifierReference
@@ -81,6 +108,11 @@ enum CompactExpressionNodeKind:
 	CompactRecordUpdateNode
 	CompactDictNode
 	CompactVectorNode
+	CompactFinalizedInterpolationNode
+	CompactAscriptionNode
+	CompactRangeNode
+	CompactOpaqueIntoNode
+	CompactOpaqueFromNode
 	CompactBreakNode
 	CompactContinueNode
 	CompactVoidNode
@@ -115,6 +147,30 @@ enum CompactUnitPayloadKind:
 	CompactMissingPayload
 
 
+enum CompactTypeNodeKind:
+	CompactNamedTypeNode
+	CompactQualifiedNamedTypeNode
+	CompactBoundedTypeNode
+	CompactDimNameTypeNode
+	CompactDimSplatNameTypeNode
+	CompactDimLiteralTypeNode
+	CompactDimAddTypeNode
+	CompactDimSubtractTypeNode
+	CompactDimMultiplyTypeNode
+	CompactDimDivideTypeNode
+	CompactRangeTypeNode
+	CompactTupleTypeNode
+	CompactPureFunctionTypeNode
+	CompactImpureFunctionTypeNode
+	CompactArrayTypeNode
+	CompactMissingTypeNode
+
+
+enum CompactInterpolationPartKind:
+	CompactInterpolationLiteralPart
+	CompactInterpolationExpressionPart
+
+
 union CompactExpressionOracleError:
 	UnsupportedCompactExpressionOracleForm
 	InvalidCompactExpressionOracleProduct
@@ -135,6 +191,9 @@ enum CompactExpressionCorruption:
 	CompactWrongArity
 	CompactMetadataSliceAlias
 	CompactAbsurdMetadataCount
+	CompactTypePayloadFamilyMismatch
+	CompactInterpolationPartOrdinalAlias
+	CompactAbsurdInterpolationPartCount
 
 
 struct CompactProductSourceLocation {
@@ -219,6 +278,40 @@ struct CompactDictEntryRow {
 }
 
 
+struct CompactTypeNodeRow {
+	kind: CompactTypeNodeKind,
+	payload_index: Int,
+	child_start: Int,
+	child_count: Int,
+	span: CompactProductSourceLocation
+}
+
+
+struct CompactTypeIdentifierSliceRow {
+	identifier_start: Int,
+	identifier_count: Int
+}
+
+
+struct CompactTypeIdentifierRow {
+	text_index: Int,
+	span: CompactProductSourceLocation
+}
+
+
+struct CompactInterpolationPartsPayloadRow {
+	part_start: Int,
+	part_count: Int,
+	is_multiline: Bool
+}
+
+
+struct CompactInterpolationPartRow {
+	kind: CompactInterpolationPartKind,
+	payload_index: Int
+}
+
+
 struct CompactUnitPayloadRow {
 	kind: CompactUnitPayloadKind
 }
@@ -241,6 +334,12 @@ private record CompactExpressionProductRep {
 	record_fields: List[CompactRecordFieldRow],
 	dict_payloads: List[CompactDictPayloadRow],
 	dict_entries: List[CompactDictEntryRow],
+	type_nodes: List[CompactTypeNodeRow],
+	type_children: List[Int],
+	type_identifier_slices: List[CompactTypeIdentifierSliceRow],
+	type_identifiers: List[CompactTypeIdentifierRow],
+	interpolation_parts_payloads: List[CompactInterpolationPartsPayloadRow],
+	interpolation_parts: List[CompactInterpolationPartRow],
 	unit_payloads: List[CompactUnitPayloadRow],
 	roots: List[Int]
 }
@@ -266,6 +365,12 @@ record CompactExpressionProductCounts {
 	record_field_count: Int,
 	dict_payload_count: Int,
 	dict_entry_count: Int,
+	type_node_count: Int,
+	type_child_count: Int,
+	type_identifier_slice_count: Int,
+	type_identifier_count: Int,
+	interpolation_parts_payload_count: Int,
+	interpolation_part_count: Int,
 	unit_payload_count: Int,
 	root_count: Int
 }
@@ -282,6 +387,13 @@ private union CompactBuildAction:
 	CompactBuildSequence(CompactExpressionNodeKind, Int, SourceLocation)
 	CompactBuildRecord(List[ParsedRecordExprField], Bool, SourceLocation)
 	CompactBuildDict(List[ParsedDictEntry], SourceLocation)
+	CompactBuildTypedWrapper(CompactExpressionNodeKind, SourceLocation)
+	CompactBuildRange(SourceLocation)
+	CompactBuildInterpolationParts(List[ParsedStringInterpolationPart], Bool, SourceLocation)
+	CompactBuildTypeVisit(ParsedTypeExpr)
+	CompactBuildTypeIdentifiers(CompactTypeNodeKind, List[ParsedIdentifier], Int, SourceLocation)
+	CompactBuildTypeText(CompactTypeNodeKind, String, SourceLocation)
+	CompactBuildTypeNoPayload(CompactTypeNodeKind, Int, SourceLocation)
 
 
 private union CompactReferenceAction:
@@ -290,10 +402,17 @@ private union CompactReferenceAction:
 
 private NO_COMPACT_PAYLOAD_INDEX: Int = -1
 
+private NO_COMPACT_SOURCE_OWNER_INDEX: Int = -1
+
 
 private pure func compact_source_location(location: SourceLocation) -> CompactProductSourceLocation:
+	owner_index = if source_locations_equal(location, compiler_prelude_source_location()):
+		NO_COMPACT_SOURCE_OWNER_INDEX
+	else:
+		0
+
 	{
-		source_owner_index = 0,
+		source_owner_index = owner_index,
 		location = location
 	}
 
@@ -338,6 +457,34 @@ private pure func compact_logical_operator(op: ParsedLogicalOp) -> CompactExpres
 			CompactAndOperator
 		ParsedOrOp:
 			CompactOrOperator
+
+
+private pure func compact_dim_binary_kind(op: ParsedDimBinaryOp) -> CompactTypeNodeKind:
+	match op:
+		ParsedDimAddOp:
+			CompactDimAddTypeNode
+		ParsedDimSubtractOp:
+			CompactDimSubtractTypeNode
+		ParsedDimMultiplyOp:
+			CompactDimMultiplyTypeNode
+		ParsedDimDivideOp:
+			CompactDimDivideTypeNode
+
+
+private pure func parsed_dim_binary_operator(
+	kind: CompactTypeNodeKind,
+) -> Option[ParsedDimBinaryOp]:
+	match kind:
+		CompactDimAddTypeNode:
+			Some(ParsedDimAddOp)
+		CompactDimSubtractTypeNode:
+			Some(ParsedDimSubtractOp)
+		CompactDimMultiplyTypeNode:
+			Some(ParsedDimMultiplyOp)
+		CompactDimDivideTypeNode:
+			Some(ParsedDimDivideOp)
+		_:
+			None
 
 
 private pure func parsed_unary_operator(op: CompactExpressionOperator) -> Option[ParsedUnaryOp]:
@@ -451,12 +598,53 @@ private pure func compact_expected_child_count(
 			None
 		CompactRecordNode | CompactRecordUpdateNode | CompactDictNode:
 			None
+		CompactFinalizedInterpolationNode:
+			None
+		CompactAscriptionNode | CompactOpaqueIntoNode | CompactOpaqueFromNode:
+			Some(1)
+		CompactRangeNode:
+			Some(2)
 		_:
 			Some(0)
 
 
 private pure func compact_metadata_slice_is_valid(start: Int, count: Int, length: Int) -> Bool:
 	start >= 0 and count >= 0 and start <= length and count <= length - start
+
+
+private pure func compact_type_exact_child_count(kind: CompactTypeNodeKind) -> Option[Int]:
+	match kind:
+		CompactBoundedTypeNode | CompactDimNameTypeNode | CompactDimSplatNameTypeNode | CompactDimLiteralTypeNode | CompactMissingTypeNode:
+			Some(0)
+		CompactDimAddTypeNode | CompactDimSubtractTypeNode | CompactDimMultiplyTypeNode | CompactDimDivideTypeNode:
+			Some(2)
+		CompactRangeTypeNode:
+			Some(1)
+		_:
+			None
+
+
+private pure func compact_type_uses_identifier_slice(kind: CompactTypeNodeKind) -> Bool:
+	match kind:
+		CompactNamedTypeNode | CompactQualifiedNamedTypeNode | CompactBoundedTypeNode | CompactDimNameTypeNode | CompactDimSplatNameTypeNode:
+			True
+		_:
+			False
+
+
+private pure func compact_type_identifier_count_is_valid(
+	kind: CompactTypeNodeKind,
+	count: Int,
+) -> Bool:
+	match kind:
+		CompactNamedTypeNode | CompactDimNameTypeNode | CompactDimSplatNameTypeNode:
+			count == 1
+		CompactQualifiedNamedTypeNode:
+			count == 2
+		CompactBoundedTypeNode:
+			count >= 1
+		_:
+			False
 
 
 private pure func compact_source_span_is_valid(
@@ -493,6 +681,13 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 		var record_field_slot_owners = 0.repeat(rep.record_fields.length())
 		var dict_owners = 0.repeat(rep.dict_payloads.length())
 		var dict_entry_slot_owners = 0.repeat(rep.dict_entries.length())
+		var type_parent_count = 0.repeat(rep.type_nodes.length())
+		var type_root_membership = False.repeat(rep.type_nodes.length())
+		var type_child_slot_owners = 0.repeat(rep.type_children.length())
+		var type_identifier_slice_owners = 0.repeat(rep.type_identifier_slices.length())
+		var type_identifier_owners = 0.repeat(rep.type_identifiers.length())
+		var interpolation_parts_payload_owners = 0.repeat(rep.interpolation_parts_payloads.length())
+		var interpolation_part_slot_owners = 0.repeat(rep.interpolation_parts.length())
 		var unit_owners = 0.repeat(rep.unit_payloads.length())
 
 		for root in rep.roots:
@@ -574,6 +769,16 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 												)
 												and node.child_count % 2 == 0
 												and node.child_count / 2 == payload.entry_count
+											)
+										None:
+											valid = False
+								CompactFinalizedInterpolationNode:
+									match rep.interpolation_parts_payloads.get(node.payload_index):
+										Some(payload):
+											valid = compact_metadata_slice_is_valid(
+												payload.part_start,
+												payload.part_count,
+												rep.interpolation_parts.length(),
 											)
 										None:
 											valid = False
@@ -817,6 +1022,86 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 										entry_offset += 1
 								None:
 									valid = False
+						CompactFinalizedInterpolationNode:
+							match rep.interpolation_parts_payloads.get(node.payload_index):
+								Some(payload):
+									interpolation_parts_payload_owners = interpolation_parts_payload_owners.set(
+										node.payload_index,
+										interpolation_parts_payload_owners
+											.get(node.payload_index)
+											.get_or(0) + 1,
+									)
+									var expression_ordinal_owners = 0.repeat(node.child_count)
+									var part_offset: Int = 0
+
+									while part_offset < payload.part_count and valid:
+										part_slot = payload.part_start + part_offset
+
+										match rep.interpolation_parts.get(part_slot):
+											Some(part):
+												interpolation_part_slot_owners = interpolation_part_slot_owners.set(
+													part_slot,
+													interpolation_part_slot_owners
+														.get(part_slot)
+														.get_or(0) + 1,
+												)
+
+												match part.kind:
+													CompactInterpolationLiteralPart:
+														if (
+															part.payload_index < 0
+															or part.payload_index >= rep.texts.length()
+														):
+															valid = False
+														else:
+															owned_text_indices = owned_text_indices.set(
+																part.payload_index,
+																owned_text_indices
+																	.get(part.payload_index)
+																	.get_or(0) + 1,
+															)
+													CompactInterpolationExpressionPart:
+														if (
+															part.payload_index < 0
+															or part.payload_index >= node.child_count
+														):
+															valid = False
+														else:
+															expression_ordinal_owners = expression_ordinal_owners.set(
+																part.payload_index,
+																expression_ordinal_owners
+																	.get(part.payload_index)
+																	.get_or(0) + 1,
+															)
+											None:
+												valid = False
+
+										part_offset += 1
+
+									for owners in expression_ordinal_owners:
+										valid = valid and owners == 1
+								None:
+									valid = False
+						CompactAscriptionNode | CompactOpaqueIntoNode | CompactOpaqueFromNode:
+							if (
+								node.payload_index < 0
+								or node.payload_index >= rep.type_nodes.length()
+							):
+								valid = False
+							else if (
+								type_root_membership
+									.get(node.payload_index)
+									.get_or(False)
+							):
+								valid = False
+							else:
+								type_root_membership = type_root_membership.set(
+									node.payload_index,
+									True,
+								)
+						CompactRangeNode:
+							if node.payload_index != NO_COMPACT_PAYLOAD_INDEX:
+								valid = False
 						CompactBreakNode | CompactContinueNode | CompactVoidNode | CompactUnnamedBuiltinNode | CompactMissingNode:
 							match rep.unit_payloads.get(node.payload_index):
 								Some(payload):
@@ -836,6 +1121,137 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 
 			node_index += 1
 
+		var type_node_index: Int = 0
+
+		while type_node_index < rep.type_nodes.length() and valid:
+			match rep.type_nodes.get(type_node_index):
+				Some(node):
+					if not compact_source_span_is_valid(rep.source_owners, node.span):
+						valid = False
+
+					if (
+						node.child_start < 0
+						or node.child_count < 0
+						or node.child_start > rep.type_children.length()
+						or node.child_count > rep.type_children.length() - node.child_start
+					):
+						valid = False
+
+					match compact_type_exact_child_count(node.kind):
+						Some(expected):
+							if node.child_count != expected:
+								valid = False
+						None:
+							match node.kind:
+								CompactNamedTypeNode | CompactQualifiedNamedTypeNode | CompactTupleTypeNode:
+									void
+								CompactPureFunctionTypeNode | CompactImpureFunctionTypeNode | CompactArrayTypeNode:
+									if node.child_count < 1:
+										valid = False
+								_:
+									valid = False
+
+					var child_offset: Int = 0
+
+					while child_offset < node.child_count and valid:
+						child_slot = node.child_start + child_offset
+
+						match rep.type_children.get(child_slot):
+							Some(child):
+								if child < 0 or child >= type_node_index:
+									valid = False
+								else:
+									type_parent_count = type_parent_count.set(
+										child,
+										type_parent_count
+											.get(child)
+											.get_or(0) + 1,
+									)
+									type_child_slot_owners = type_child_slot_owners.set(
+										child_slot,
+										type_child_slot_owners
+											.get(child_slot)
+											.get_or(0) + 1,
+									)
+							None:
+								valid = False
+
+						child_offset += 1
+
+					if compact_type_uses_identifier_slice(node.kind):
+						match rep.type_identifier_slices.get(node.payload_index):
+							Some(payload):
+								if (
+									not compact_metadata_slice_is_valid(
+										payload.identifier_start,
+										payload.identifier_count,
+										rep.type_identifiers.length(),
+									)
+									or not compact_type_identifier_count_is_valid(
+										node.kind,
+										payload.identifier_count,
+									)
+								):
+									valid = False
+								else:
+									type_identifier_slice_owners = type_identifier_slice_owners.set(
+										node.payload_index,
+										type_identifier_slice_owners
+											.get(node.payload_index)
+											.get_or(0) + 1,
+									)
+									var identifier_offset: Int = 0
+
+									while identifier_offset < payload.identifier_count and valid:
+										identifier_slot = payload.identifier_start + identifier_offset
+
+										match rep.type_identifiers.get(identifier_slot):
+											Some(identifier):
+												if (
+													not compact_source_span_is_valid(
+														rep.source_owners,
+														identifier.span,
+													)
+													or identifier.text_index < 0
+													or identifier.text_index >= rep.texts.length()
+												):
+													valid = False
+												else:
+													type_identifier_owners = type_identifier_owners.set(
+														identifier_slot,
+														type_identifier_owners
+															.get(identifier_slot)
+															.get_or(0) + 1,
+													)
+													owned_text_indices = owned_text_indices.set(
+														identifier.text_index,
+														owned_text_indices
+															.get(identifier.text_index)
+															.get_or(0) + 1,
+													)
+											None:
+												valid = False
+
+										identifier_offset += 1
+							None:
+								valid = False
+					else if node.kind == CompactDimLiteralTypeNode:
+						if node.payload_index < 0 or node.payload_index >= rep.texts.length():
+							valid = False
+						else:
+							owned_text_indices = owned_text_indices.set(
+								node.payload_index,
+								owned_text_indices
+									.get(node.payload_index)
+									.get_or(0) + 1,
+							)
+					else if node.payload_index != NO_COMPACT_PAYLOAD_INDEX:
+						valid = False
+				None:
+					valid = False
+
+			type_node_index += 1
+
 		if valid:
 			var index: Int = 0
 
@@ -848,6 +1264,18 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 					.get_or(False)
 				valid = is_root and parents == 0 or not is_root and parents == 1
 				index += 1
+
+			var type_index: Int = 0
+
+			while type_index < rep.type_nodes.length() and valid:
+				parents = type_parent_count
+					.get(type_index)
+					.get_or(-1)
+				is_root = type_root_membership
+					.get(type_index)
+					.get_or(False)
+				valid = is_root and parents == 0 or not is_root and parents == 1
+				type_index += 1
 
 		if valid:
 			for owners in child_slot_owners:
@@ -892,6 +1320,21 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 			for owners in dict_entry_slot_owners:
 				valid = valid and owners == 1
 
+			for owners in type_child_slot_owners:
+				valid = valid and owners == 1
+
+			for owners in type_identifier_slice_owners:
+				valid = valid and owners == 1
+
+			for owners in type_identifier_owners:
+				valid = valid and owners == 1
+
+			for owners in interpolation_parts_payload_owners:
+				valid = valid and owners == 1
+
+			for owners in interpolation_part_slot_owners:
+				valid = valid and owners == 1
+
 			for owners in unit_owners:
 				valid = valid and owners == 1
 
@@ -919,9 +1362,16 @@ pure func compact_expression_oracle_from_parsed_roots(
 	var record_fields: List[CompactRecordFieldRow] = []
 	var dict_payloads: List[CompactDictPayloadRow] = []
 	var dict_entries: List[CompactDictEntryRow] = []
+	var type_nodes: List[CompactTypeNodeRow] = []
+	var type_children: List[Int] = []
+	var type_identifier_slices: List[CompactTypeIdentifierSliceRow] = []
+	var type_identifiers: List[CompactTypeIdentifierRow] = []
+	var interpolation_parts_payloads: List[CompactInterpolationPartsPayloadRow] = []
+	var interpolation_parts: List[CompactInterpolationPartRow] = []
 	var unit_payloads: List[CompactUnitPayloadRow] = []
 	var actions: List[CompactBuildAction] = []
 	var values: List[Int] = []
+	var type_values: List[Int] = []
 	var supported = True
 
 	var root_index = roots.length() - 1
@@ -1057,6 +1507,16 @@ pure func compact_expression_oracle_from_parsed_roots(
 							.append(CompactBuildLogical(op, span))
 							.append(CompactBuildVisit(right))
 							.append(CompactBuildVisit(left))
+					ParsedAscriptionExpr(value, type_expr, span):
+						actions = actions
+							.append(CompactBuildTypedWrapper(CompactAscriptionNode, span))
+							.append(CompactBuildTypeVisit(type_expr))
+							.append(CompactBuildVisit(value))
+					ParsedRangeExpr(start, finish, span):
+						actions = actions
+							.append(CompactBuildRange(span))
+							.append(CompactBuildVisit(finish))
+							.append(CompactBuildVisit(start))
 					ParsedCallExpr(callee, args, span):
 						actions = actions.append(CompactBuildCall(args.length(), span))
 						var arg_index = args.length() - 1
@@ -1183,6 +1643,36 @@ pure func compact_expression_oracle_from_parsed_roots(
 									supported = False
 
 							index -= 1
+					ParsedOpaqueIntoExpr(type_expr, value, span):
+						actions = actions
+							.append(CompactBuildTypedWrapper(CompactOpaqueIntoNode, span))
+							.append(CompactBuildTypeVisit(type_expr))
+							.append(CompactBuildVisit(value))
+					ParsedOpaqueFromExpr(type_expr, value, span):
+						actions = actions
+							.append(CompactBuildTypedWrapper(CompactOpaqueFromNode, span))
+							.append(CompactBuildTypeVisit(type_expr))
+							.append(CompactBuildVisit(value))
+					ParsedStringInterpolationPartsExpr(parts, is_multiline, span):
+						actions = actions.append(
+							CompactBuildInterpolationParts(
+								parts,
+								is_multiline,
+								span,
+							),
+						)
+						var part_index = parts.length() - 1
+
+						while part_index >= 0:
+							match parts.get(part_index):
+								Some(ParsedInterpolationExpr(value)):
+									actions = actions.append(CompactBuildVisit(value))
+								Some(ParsedInterpolationLiteral(_)):
+									void
+								None:
+									supported = False
+
+							part_index -= 1
 					ParsedBreakExpr(span):
 						payload_index = unit_payloads.length()
 						unit_payloads = unit_payloads.append({kind = CompactBreakPayload})
@@ -1263,6 +1753,144 @@ pure func compact_expression_oracle_from_parsed_roots(
 						values = values.append(node_index)
 					_:
 						supported = False
+			Some(CompactBuildTypeVisit(type_expr)):
+				match type_expr:
+					ParsedNamedType(name, args, span):
+						actions = actions.append(
+							CompactBuildTypeIdentifiers(
+								CompactNamedTypeNode,
+								[name],
+								args.length(),
+								span,
+							),
+						)
+						var index = args.length() - 1
+
+						while index >= 0:
+							match args.get(index):
+								Some(arg):
+									actions = actions.append(CompactBuildTypeVisit(arg))
+								None:
+									supported = False
+
+							index -= 1
+					ParsedQualifiedNamedType(qualifier, name, args, span):
+						actions = actions.append(
+							CompactBuildTypeIdentifiers(
+								CompactQualifiedNamedTypeNode,
+								[qualifier, name],
+								args.length(),
+								span,
+							),
+						)
+						var index = args.length() - 1
+
+						while index >= 0:
+							match args.get(index):
+								Some(arg):
+									actions = actions.append(CompactBuildTypeVisit(arg))
+								None:
+									supported = False
+
+							index -= 1
+					ParsedBoundedType(name, bounds, span):
+						actions = actions.append(
+							CompactBuildTypeIdentifiers(
+								CompactBoundedTypeNode,
+								[name].concat(bounds),
+								0,
+								span,
+							),
+						)
+					ParsedDimNameType(name, is_splat, span):
+						kind = if is_splat:
+							CompactDimSplatNameTypeNode
+						else:
+							CompactDimNameTypeNode
+
+						actions = actions.append(CompactBuildTypeIdentifiers(kind, [name], 0, span))
+					ParsedDimLiteralType(text, span):
+						actions = actions.append(
+							CompactBuildTypeText(
+								CompactDimLiteralTypeNode,
+								text,
+								span,
+							),
+						)
+					ParsedDimBinaryType(op, left, right, span):
+						actions = actions
+							.append(CompactBuildTypeNoPayload(compact_dim_binary_kind(op), 2, span))
+							.append(CompactBuildTypeVisit(right))
+							.append(CompactBuildTypeVisit(left))
+					ParsedRangeType(value, span):
+						actions = actions
+							.append(CompactBuildTypeNoPayload(CompactRangeTypeNode, 1, span))
+							.append(CompactBuildTypeVisit(value))
+					ParsedTupleType(fields, span):
+						actions = actions.append(
+							CompactBuildTypeNoPayload(
+								CompactTupleTypeNode,
+								fields.length(),
+								span,
+							),
+						)
+						var index = fields.length() - 1
+
+						while index >= 0:
+							match fields.get(index):
+								Some(field):
+									actions = actions.append(CompactBuildTypeVisit(field))
+								None:
+									supported = False
+
+							index -= 1
+					ParsedFunctionType(is_pure, params, result, span):
+						kind = if is_pure:
+							CompactPureFunctionTypeNode
+						else:
+							CompactImpureFunctionTypeNode
+
+						actions = actions
+							.append(CompactBuildTypeNoPayload(kind, params.length() + 1, span))
+							.append(CompactBuildTypeVisit(result))
+						var index = params.length() - 1
+
+						while index >= 0:
+							match params.get(index):
+								Some(param):
+									actions = actions.append(CompactBuildTypeVisit(param))
+								None:
+									supported = False
+
+							index -= 1
+					ParsedArrayType(element, dimensions, span):
+						actions = actions.append(
+							CompactBuildTypeNoPayload(
+								CompactArrayTypeNode,
+								dimensions.length() + 1,
+								span,
+							),
+						)
+						var index = dimensions.length() - 1
+
+						while index >= 0:
+							match dimensions.get(index):
+								Some(dimension):
+									actions = actions.append(CompactBuildTypeVisit(dimension))
+								None:
+									supported = False
+
+							index -= 1
+
+						actions = actions.append(CompactBuildTypeVisit(element))
+					ParsedMissingType(span):
+						actions = actions.append(
+							CompactBuildTypeNoPayload(
+								CompactMissingTypeNode,
+								0,
+								span,
+							),
+						)
 			Some(CompactBuildUnary(op, span)):
 				if values.is_empty():
 					supported = False
@@ -1554,10 +2182,206 @@ pure func compact_expression_oracle_from_parsed_roots(
 						span = compact_source_location(span),
 					})
 					values = values.append(node_index)
+			Some(CompactBuildTypedWrapper(kind, span)):
+				if values.is_empty() or type_values.is_empty():
+					supported = False
+				else:
+					value_start = values.length() - 1
+					type_start = type_values.length() - 1
+					child_start = children.length()
+					children = children.append(
+						values
+							.get(value_start)
+							.get_or(-1),
+					)
+					values = values.take(value_start)
+					payload_index = type_values
+						.get(type_start)
+						.get_or(-1)
+					type_values = type_values.take(type_start)
+					node_index = nodes.length()
+					nodes = nodes.append({
+						kind = kind,
+						payload_index = payload_index,
+						child_start = child_start,
+						child_count = 1,
+						span = compact_source_location(span),
+					})
+					values = values.append(node_index)
+			Some(CompactBuildRange(span)):
+				if values.length() < 2:
+					supported = False
+				else:
+					value_start = values.length() - 2
+					child_start = children.length()
+					children = children
+						.append(
+							values
+								.get(value_start)
+								.get_or(-1),
+						)
+						.append(
+							values
+								.get(value_start + 1)
+								.get_or(-1),
+						)
+					values = values.take(value_start)
+					node_index = nodes.length()
+					nodes = nodes.append({
+						kind = CompactRangeNode,
+						payload_index = NO_COMPACT_PAYLOAD_INDEX,
+						child_start = child_start,
+						child_count = 2,
+						span = compact_source_location(span),
+					})
+					values = values.append(node_index)
+			Some(CompactBuildInterpolationParts(parts, is_multiline, span)):
+				var expression_count: Int = 0
+
+				for part in parts:
+					match part:
+						ParsedInterpolationExpr(_):
+							expression_count += 1
+						ParsedInterpolationLiteral(_):
+							void
+
+				if values.length() < expression_count:
+					supported = False
+				else:
+					value_start = values.length() - expression_count
+					child_start = children.length()
+					var value_index = value_start
+
+					while value_index < values.length():
+						children = children.append(
+							values
+								.get(value_index)
+								.get_or(-1),
+						)
+						value_index += 1
+
+					values = values.take(value_start)
+					part_start = interpolation_parts.length()
+					var expression_ordinal: Int = 0
+
+					for part in parts:
+						match part:
+							ParsedInterpolationLiteral(text):
+								text_index = texts.length()
+								texts = texts.append(text)
+								interpolation_parts = interpolation_parts.append({
+									kind = CompactInterpolationLiteralPart,
+									payload_index = text_index,
+								})
+							ParsedInterpolationExpr(_):
+								interpolation_parts = interpolation_parts.append({
+									kind = CompactInterpolationExpressionPart,
+									payload_index = expression_ordinal,
+								})
+								expression_ordinal += 1
+
+					payload_index = interpolation_parts_payloads.length()
+					interpolation_parts_payloads = interpolation_parts_payloads.append({
+						part_start = part_start,
+						part_count = parts.length(),
+						is_multiline = is_multiline,
+					})
+					node_index = nodes.length()
+					nodes = nodes.append({
+						kind = CompactFinalizedInterpolationNode,
+						payload_index = payload_index,
+						child_start = child_start,
+						child_count = expression_count,
+						span = compact_source_location(span),
+					})
+					values = values.append(node_index)
+			Some(CompactBuildTypeIdentifiers(kind, identifiers, child_count, span)):
+				if type_values.length() < child_count:
+					supported = False
+				else:
+					value_start = type_values.length() - child_count
+					child_start = type_children.length()
+					var value_index = value_start
+
+					while value_index < type_values.length():
+						type_children = type_children.append(
+							type_values
+								.get(value_index)
+								.get_or(-1),
+						)
+						value_index += 1
+
+					type_values = type_values.take(value_start)
+					identifier_start = type_identifiers.length()
+
+					for identifier in identifiers:
+						text_index = texts.length()
+						texts = texts.append(identifier.text)
+						type_identifiers = type_identifiers.append({
+							text_index = text_index,
+							span = compact_source_location(identifier.span),
+						})
+
+					payload_index = type_identifier_slices.length()
+					type_identifier_slices = type_identifier_slices.append({
+						identifier_start = identifier_start,
+						identifier_count = identifiers.length(),
+					})
+					type_node_index = type_nodes.length()
+					type_nodes = type_nodes.append({
+						kind = kind,
+						payload_index = payload_index,
+						child_start = child_start,
+						child_count = child_count,
+						span = compact_source_location(span),
+					})
+					type_values = type_values.append(type_node_index)
+			Some(CompactBuildTypeText(kind, text, span)):
+				text_index = texts.length()
+				texts = texts.append(text)
+				type_node_index = type_nodes.length()
+				type_nodes = type_nodes.append({
+					kind = kind,
+					payload_index = text_index,
+					child_start = type_children.length(),
+					child_count = 0,
+					span = compact_source_location(span),
+				})
+				type_values = type_values.append(type_node_index)
+			Some(CompactBuildTypeNoPayload(kind, child_count, span)):
+				if type_values.length() < child_count:
+					supported = False
+				else:
+					value_start = type_values.length() - child_count
+					child_start = type_children.length()
+					var value_index = value_start
+
+					while value_index < type_values.length():
+						type_children = type_children.append(
+							type_values
+								.get(value_index)
+								.get_or(-1),
+						)
+						value_index += 1
+
+					type_values = type_values.take(value_start)
+					type_node_index = type_nodes.length()
+					type_nodes = type_nodes.append({
+						kind = kind,
+						payload_index = NO_COMPACT_PAYLOAD_INDEX,
+						child_start = child_start,
+						child_count = child_count,
+						span = compact_source_location(span),
+					})
+					type_values = type_values.append(type_node_index)
 			None:
 				supported = False
 
-	if not supported or values.length() != roots.length():
+	if (
+		not supported
+		or values.length() != roots.length()
+		or not type_values.is_empty()
+	):
 		Err(UnsupportedCompactExpressionOracleForm)
 	else:
 		rep: CompactExpressionProductRep = {
@@ -1577,6 +2401,12 @@ pure func compact_expression_oracle_from_parsed_roots(
 			record_fields = record_fields,
 			dict_payloads = dict_payloads,
 			dict_entries = dict_entries,
+			type_nodes = type_nodes,
+			type_children = type_children,
+			type_identifier_slices = type_identifier_slices,
+			type_identifiers = type_identifiers,
+			interpolation_parts_payloads = interpolation_parts_payloads,
+			interpolation_parts = interpolation_parts,
 			unit_payloads = unit_payloads,
 			roots = values
 		}
@@ -1706,12 +2536,236 @@ private pure func projected_dict_entries(
 		None
 
 
+private pure func projected_type_child(
+	rep: CompactExpressionProductRep,
+	projected: List[ParsedTypeExpr],
+	node: CompactTypeNodeRow,
+	offset: Int,
+) -> Option[ParsedTypeExpr]:
+	match rep.type_children.get(node.child_start + offset):
+		Some(child):
+			projected.get(child)
+		None:
+			None
+
+
+private pure func projected_type_children(
+	rep: CompactExpressionProductRep,
+	projected: List[ParsedTypeExpr],
+	node: CompactTypeNodeRow,
+	start_offset: Int,
+) -> Option[List[ParsedTypeExpr]]:
+	var values: List[ParsedTypeExpr] = []
+	var offset = start_offset
+	var valid = True
+
+	while offset < node.child_count and valid:
+		match projected_type_child(rep, projected, node, offset):
+			Some(value):
+				values = values.append(value)
+			None:
+				valid = False
+
+		offset += 1
+
+	if valid:
+		Some(values)
+	else:
+		None
+
+
+private pure func projected_type_identifier(
+	rep: CompactExpressionProductRep,
+	node: CompactTypeNodeRow,
+	offset: Int,
+) -> Option[ParsedIdentifier]:
+	match rep.type_identifier_slices.get(node.payload_index):
+		Some(payload):
+			match rep.type_identifiers.get(payload.identifier_start + offset):
+				Some(identifier):
+					rep.texts
+						.get(identifier.text_index)
+						.map(func(text): parsed_identifier(text, identifier.span.location))
+				None:
+					None
+		None:
+			None
+
+
+private pure func projected_type_identifiers(
+	rep: CompactExpressionProductRep,
+	node: CompactTypeNodeRow,
+	start_offset: Int,
+) -> Option[List[ParsedIdentifier]]:
+	match rep.type_identifier_slices.get(node.payload_index):
+		Some(payload):
+			var values: List[ParsedIdentifier] = []
+			var offset = start_offset
+			var valid = True
+
+			while offset < payload.identifier_count and valid:
+				match projected_type_identifier(rep, node, offset):
+					Some(value):
+						values = values.append(value)
+					None:
+						valid = False
+
+				offset += 1
+
+			if valid:
+				Some(values)
+			else:
+				None
+		None:
+			None
+
+
+private pure func compact_project_types(
+	rep: CompactExpressionProductRep,
+) -> Option[List[ParsedTypeExpr]]:
+	var projected: List[ParsedTypeExpr] = []
+	var valid = True
+	var node_index: Int = 0
+
+	while node_index < rep.type_nodes.length() and valid:
+		match rep.type_nodes.get(node_index):
+			Some(node):
+				span = node.span.location
+				var value: Option[ParsedTypeExpr] = None
+
+				match node.kind:
+					CompactNamedTypeNode:
+						match (
+							projected_type_identifier(rep, node, 0),
+							projected_type_children(rep, projected, node, 0),
+						):
+							(Some(name), Some(args)):
+								value = Some(ParsedNamedType(name, args, span))
+							_:
+								void
+					CompactQualifiedNamedTypeNode:
+						match (
+							projected_type_identifier(rep, node, 0),
+							projected_type_identifier(rep, node, 1),
+							projected_type_children(rep, projected, node, 0),
+						):
+							(Some(qualifier), Some(name), Some(args)):
+								value = Some(ParsedQualifiedNamedType(qualifier, name, args, span))
+							_:
+								void
+					CompactBoundedTypeNode:
+						match (
+							projected_type_identifier(rep, node, 0),
+							projected_type_identifiers(rep, node, 1),
+						):
+							(Some(name), Some(bounds)):
+								value = Some(ParsedBoundedType(name, bounds, span))
+							_:
+								void
+					CompactDimNameTypeNode | CompactDimSplatNameTypeNode:
+						value = projected_type_identifier(
+							rep,
+							node,
+							0,
+						).map(
+							func(
+								name,
+							): ParsedDimNameType(
+								name,
+								node.kind == CompactDimSplatNameTypeNode,
+								span,
+							),
+						)
+					CompactDimLiteralTypeNode:
+						value = rep.texts
+							.get(node.payload_index)
+							.map(func(text): ParsedDimLiteralType(text, span))
+					CompactDimAddTypeNode | CompactDimSubtractTypeNode | CompactDimMultiplyTypeNode | CompactDimDivideTypeNode:
+						match (
+							parsed_dim_binary_operator(node.kind),
+							projected_type_child(rep, projected, node, 0),
+							projected_type_child(rep, projected, node, 1),
+						):
+							(Some(op), Some(left), Some(right)):
+								value = Some(ParsedDimBinaryType(op, left, right, span))
+							_:
+								void
+					CompactRangeTypeNode:
+						value = projected_type_child(
+							rep,
+							projected,
+							node,
+							0,
+						).map(
+							func(inner): ParsedRangeType(inner, span),
+						)
+					CompactTupleTypeNode:
+						value = projected_type_children(
+							rep,
+							projected,
+							node,
+							0,
+						).map(
+							func(fields): ParsedTupleType(fields, span),
+						)
+					CompactPureFunctionTypeNode | CompactImpureFunctionTypeNode:
+						match (
+							projected_type_children(rep, projected, node, 0),
+							projected_type_child(rep, projected, node, node.child_count - 1),
+						):
+							(Some(children), Some(result)):
+								value = Some(
+									ParsedFunctionType(
+										node.kind == CompactPureFunctionTypeNode,
+										children.take(children.length() - 1),
+										result,
+										span,
+									),
+								)
+							_:
+								void
+					CompactArrayTypeNode:
+						match (
+							projected_type_child(rep, projected, node, 0),
+							projected_type_children(rep, projected, node, 1),
+						):
+							(Some(element), Some(dimensions)):
+								value = Some(ParsedArrayType(element, dimensions, span))
+							_:
+								void
+					CompactMissingTypeNode:
+						value = Some(ParsedMissingType(span))
+
+				match value:
+					Some(type_expr):
+						projected = projected.append(type_expr)
+					None:
+						valid = False
+			None:
+				valid = False
+
+		node_index += 1
+
+	if valid:
+		Some(projected)
+	else:
+		None
+
+
 pure func compact_expression_oracle_project(
 	product: ValidatedExpressionProduct,
 ) -> Result[List[ParsedExpr], CompactExpressionOracleError]:
 	rep = from_opaque ValidatedExpressionProduct(product)
 	var projected: List[ParsedExpr] = []
-	var valid = True
+	var projected_types: List[ParsedTypeExpr] = []
+	var valid = False
+
+	match compact_project_types(rep):
+		Some(values):
+			projected_types = values
+			valid = True
+		None:
+			void
 
 	var node_index: Int = 0
 
@@ -1818,6 +2872,24 @@ pure func compact_expression_oracle_project(
 								).map(
 									func(op): ParsedLogicalExpr(op, left, right, span),
 								)
+							_:
+								void
+					CompactAscriptionNode:
+						match (
+							projected_child(rep, projected, node, 0),
+							projected_types.get(node.payload_index),
+						):
+							(Some(child), Some(type_expr)):
+								value = Some(ParsedAscriptionExpr(child, type_expr, span))
+							_:
+								void
+					CompactRangeNode:
+						match (
+							projected_child(rep, projected, node, 0),
+							projected_child(rep, projected, node, 1),
+						):
+							(Some(start), Some(finish)):
+								value = Some(ParsedRangeExpr(start, finish, span))
 							_:
 								void
 					CompactCallNode:
@@ -1934,6 +3006,66 @@ pure func compact_expression_oracle_project(
 						).map(
 							func(items): ParsedVectorExpr(items, span),
 						)
+					CompactOpaqueIntoNode | CompactOpaqueFromNode:
+						match (
+							projected_child(rep, projected, node, 0),
+							projected_types.get(node.payload_index),
+						):
+							(Some(child), Some(type_expr)):
+								value = if node.kind == CompactOpaqueIntoNode:
+									Some(ParsedOpaqueIntoExpr(type_expr, child, span))
+								else:
+									Some(ParsedOpaqueFromExpr(type_expr, child, span))
+							_:
+								void
+					CompactFinalizedInterpolationNode:
+						match rep.interpolation_parts_payloads.get(node.payload_index):
+							Some(payload):
+								var parts: List[ParsedStringInterpolationPart] = []
+								var part_offset: Int = 0
+
+								while part_offset < payload.part_count and valid:
+									match rep.interpolation_parts.get(
+										payload.part_start + part_offset,
+									):
+										Some(part):
+											match part.kind:
+												CompactInterpolationLiteralPart:
+													match rep.texts.get(part.payload_index):
+														Some(text):
+															parts = parts.append(
+																ParsedInterpolationLiteral(text),
+															)
+														None:
+															valid = False
+												CompactInterpolationExpressionPart:
+													match projected_child(
+														rep,
+														projected,
+														node,
+														part.payload_index,
+													):
+														Some(expr):
+															parts = parts.append(
+																ParsedInterpolationExpr(expr),
+															)
+														None:
+															valid = False
+										None:
+											valid = False
+
+									part_offset += 1
+
+								if valid:
+									value = Some(
+										ParsedStringInterpolationPartsExpr(
+											parts,
+											payload.is_multiline,
+											span,
+										),
+									)
+							None:
+								void
 					CompactBreakNode:
 						value = Some(ParsedBreakExpr(span))
 					CompactContinueNode:
@@ -2094,6 +3226,12 @@ pure func compact_expression_oracle_counts(
 		record_field_count = rep.record_fields.length(),
 		dict_payload_count = rep.dict_payloads.length(),
 		dict_entry_count = rep.dict_entries.length(),
+		type_node_count = rep.type_nodes.length(),
+		type_child_count = rep.type_children.length(),
+		type_identifier_slice_count = rep.type_identifier_slices.length(),
+		type_identifier_count = rep.type_identifiers.length(),
+		interpolation_parts_payload_count = rep.interpolation_parts_payloads.length(),
+		interpolation_part_count = rep.interpolation_parts.length(),
 		unit_payload_count = rep.unit_payloads.length(),
 		root_count = rep.roots.length()
 	}
@@ -2141,6 +3279,20 @@ pure func compact_expression_oracle_rejects_corruption(
 			],
 			start_span.location,
 		)
+		typed = ParsedAscriptionExpr(
+			left,
+			ParsedNamedType(
+				parsed_identifier("Type", start_span.location),
+				[],
+				start_span.location,
+			),
+			start_span.location,
+		)
+		interpolated = ParsedStringInterpolationPartsExpr(
+			[ParsedInterpolationExpr(left), ParsedInterpolationExpr(right)],
+			False,
+			start_span.location,
+		)
 
 		match (
 			compact_expression_oracle_from_parsed_roots(
@@ -2151,6 +3303,8 @@ pure func compact_expression_oracle_rejects_corruption(
 					ParsedCallExpr(left, [], start_span.location),
 					record_a,
 					record_b,
+					typed,
+					interpolated,
 				],
 			)
 		):
@@ -2168,6 +3322,12 @@ pure func compact_expression_oracle_rejects_corruption(
 					.get_or(-1)
 				record_b_root = rep.roots
 					.get(4)
+					.get_or(-1)
+				typed_root = rep.roots
+					.get(5)
+					.get_or(-1)
+				interpolation_root = rep.roots
+					.get(6)
 					.get_or(-1)
 
 				match corruption:
@@ -2291,6 +3451,56 @@ pure func compact_expression_oracle_rejects_corruption(
 											record_payloads = rep.record_payloads.set(
 												node.payload_index,
 												{ payload | field_count = 999999999 },
+											)
+										}
+									None:
+										void
+							None:
+								void
+					CompactTypePayloadFamilyMismatch:
+						match rep.nodes.get(typed_root):
+							Some(node):
+								match rep.type_nodes.get(node.payload_index):
+									Some(type_node):
+										corrupted = { rep | type_nodes = rep.type_nodes.set(
+												node.payload_index,
+												{ type_node |
+													kind = CompactDimLiteralTypeNode,
+													payload_index = 0
+												},
+											) }
+									None:
+										void
+							None:
+								void
+					CompactInterpolationPartOrdinalAlias:
+						match rep.nodes.get(interpolation_root):
+							Some(node):
+								match rep.interpolation_parts_payloads.get(node.payload_index):
+									Some(payload):
+										match rep.interpolation_parts.get(payload.part_start + 1):
+											Some(part):
+												corrupted = { rep |
+													interpolation_parts = rep.interpolation_parts.set(
+														payload.part_start + 1,
+														{ part | payload_index = 0 },
+													)
+												}
+											None:
+												void
+									None:
+										void
+							None:
+								void
+					CompactAbsurdInterpolationPartCount:
+						match rep.nodes.get(interpolation_root):
+							Some(node):
+								match rep.interpolation_parts_payloads.get(node.payload_index):
+									Some(payload):
+										corrupted = { rep |
+											interpolation_parts_payloads = rep.interpolation_parts_payloads.set(
+												node.payload_index,
+												{ payload | part_count = 999999999 },
 											)
 										}
 									None:
