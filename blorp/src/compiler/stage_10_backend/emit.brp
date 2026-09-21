@@ -23,6 +23,32 @@ import:
 	../stage_08_core_lower/identity: core_module_member_name
 	../stage_09_core/allocation_contracts: union_variant_has_cleanup
 	../stage_09_core/c_type_layout as TypeLayout
+	../stage_09_core/cancellation_plan:
+		BackendCleanupTemporaryRole(
+			CallArgumentTemporary,
+			ClosureMoveTemporary,
+			ConcurrentResultTemporary,
+			IterableTemporary,
+			SelectValueTemporary,
+		),
+		CancellationActivationIdentity(
+			FunctionCancellationActivation,
+			GlobalInitializerCancellationActivation,
+		),
+		CancellationCleanupAction(
+			ReleaseArcCancellationOwner,
+			ReleaseArcOnlyCancellationOwner,
+			ReleaseStackResultCancellationOwner,
+		),
+		CancellationProtectionPlan,
+		build_current_behavior_cancellation_plan,
+		cancellation_backend_temporary_candidate,
+		cancellation_call_consumed_arg_indices,
+		cancellation_cleanup_action_for_release_policy,
+		cancellation_let_protection,
+		cancellation_match_scrutinee_protection,
+		cancellation_plan_requires_local_owner_protection,
+		cancellation_variable_requires_protection,
 	../stage_09_core/ir:
 		CoreAccessor(
 			BoxedStackResultErrPayloadAccessor,
@@ -451,16 +477,20 @@ import:
 		intrinsic_contract,
 	../stage_09_core/pipeline:
 		PreparedCoreProgram,
+		prepared_core_program_cancellation_plan_table,
 		prepared_core_program_cleanup_plan,
 		prepared_core_program_value,
 		run_pre_dce_tail
 	../stage_09_core/prepare as CorePrepare:
+		CancellationPlanTable,
 		CleanupFieldPlan,
 		CleanupPlan,
 		CleanupStrategy(DirectCleanup, IterativeCleanup, NoCleanup),
 		CleanupTypePlan(HeapRecordTypeCleanup, NotACleanupType, UnionTypeCleanup),
 		CleanupVariantPlan,
+		cancellation_plan_table_row,
 		cleanup_plan_row,
+		empty_cancellation_protection_plan,
 		heap_record_cleanup_field_plan,
 		union_cleanup_field_plan,
 		union_cleanup_variant_plan
@@ -497,37 +527,6 @@ import:
 		emitted_callback_name,
 		prepare_c_emission_symbols,
 		symbol_projection_error_text,
-	cancellation_plan:
-		BackendCleanupTemporaryRole(
-			CallArgumentTemporary,
-			ClosureMoveTemporary,
-			ConcurrentResultTemporary,
-			IterableTemporary,
-			SelectValueTemporary,
-		),
-		CancellationActivationIdentity(
-			FunctionCancellationActivation,
-			GlobalInitializerCancellationActivation,
-		),
-		CancellationCleanupAction(
-			ReleaseArcCancellationOwner,
-			ReleaseArcOnlyCancellationOwner,
-			ReleaseStackResultCancellationOwner,
-		),
-		CancellationProgramSummary,
-		CancellationProtectionPlan,
-		analyze_program_cancellation,
-		build_current_behavior_cancellation_plan,
-		build_region_sensitive_cancellation_plan,
-		cancellation_backend_temporary_candidate,
-		cancellation_call_consumed_arg_indices,
-		cancellation_cleanup_action_for_release_policy,
-		cancellation_function_summary,
-		cancellation_global_initializer_summary,
-		cancellation_let_protection,
-		cancellation_match_scrutinee_protection,
-		cancellation_plan_requires_local_owner_protection,
-		cancellation_variable_requires_protection,
 	canonical_empty_list: CanonicalEmptyList, canonical_empty_list_for_construct
 	emit_record_layout:
 		CHeapRecordFieldStorage(OrdinaryCHeapRecordField, PackedBooleanCHeapRecordField),
@@ -1123,59 +1122,22 @@ private pure func activation_requires_local_owner_protection(
 	cancellation_plan_requires_local_owner_protection(emission_context.cleanup_plan)
 
 
-private pure func function_emission_context(
-	func_info: CoreFunction,
-	body: CoreExpr,
-	program_summary: CancellationProgramSummary,
+---
+Builds the emission context from a plan already computed in prepare (see
+`CorePrepare.CancellationPlanTable`). The emitter used to decide, per
+function or global initializer, whether the current-behavior or the
+region-sensitive cancellation plan applied and build it at print time; that
+decision and the plan itself are now a fact recorded once before emission,
+so this reads a row instead.
+---
+private pure func emission_context_from_plan(
+	plan: CancellationProtectionPlan,
 	profile_function_id: Option[ProfileFunctionId],
 	symbol_authority: CEmissionSymbolAuthority,
 ) -> FunctionEmissionContext:
-	identity: CoreDefinitionIdentity = {
-		name = func_info.name,
-		def_id = func_info.def_id
-	}
-	activation: CancellationActivationIdentity = FunctionCancellationActivation(identity)
-
-	plan: CancellationProtectionPlan = match cancellation_function_summary(
-		program_summary,
-		identity,
-	):
-		Some(_):
-			build_region_sensitive_cancellation_plan(activation, body, program_summary)
-		None:
-			build_current_behavior_cancellation_plan(activation, body)
-
 	{
 		cleanup_plan = plan,
 		profile_function_id = profile_function_id,
-		symbol_authority = symbol_authority,
-		indent = BASE_INDENT
-	}
-
-
-private pure func global_emission_context(
-	global: CoreGlobal,
-	program_summary: CancellationProgramSummary,
-	symbol_authority: CEmissionSymbolAuthority,
-) -> FunctionEmissionContext:
-	identity: CoreDefinitionIdentity = {
-		name = global.name.name,
-		def_id = global.def_id
-	}
-	activation: CancellationActivationIdentity = GlobalInitializerCancellationActivation(identity)
-
-	plan: CancellationProtectionPlan = match cancellation_global_initializer_summary(
-		program_summary,
-		identity,
-	):
-		Some(_):
-			build_region_sensitive_cancellation_plan(activation, global.init, program_summary)
-		None:
-			build_current_behavior_cancellation_plan(activation, global.init)
-
-	{
-		cleanup_plan = plan,
-		profile_function_id = None,
 		symbol_authority = symbol_authority,
 		indent = BASE_INDENT
 	}
@@ -12517,7 +12479,7 @@ private pure func emit_static_closure_definition(
 private pure func emit_closure_body_function(
 	func_info: CoreFunction,
 	abi: CoreClosureAbi,
-	program_summary: CancellationProgramSummary,
+	plan: CancellationProtectionPlan,
 	symbol_authority: CEmissionSymbolAuthority,
 	internal_type_linkage: Bool,
 ) -> Option[String]:
@@ -12529,10 +12491,8 @@ private pure func emit_closure_body_function(
 				func_info.def_id,
 				abi.c_name,
 			)
-			emission_context: FunctionEmissionContext = function_emission_context(
-				func_info,
-				body,
-				program_summary,
+			emission_context: FunctionEmissionContext = emission_context_from_plan(
+				plan,
 				None,
 				symbol_authority,
 			)
@@ -12631,6 +12591,19 @@ private pure func body_value_can_be_cleanup_slot(body: FunctionBodyC) -> Bool:
 	body.statements != "" and body.value != "" and is_generated_temp_value(body.value)
 
 
+---
+Left as an emitter decision for this step: the release policy for these
+emitter-introduced body-value slots is a pure function of `typ`, but they are
+identified by `FunctionBodyC.value` -- a generated C temp name that only
+exists once the backend has already threaded a match/if/call result through
+its own control-flow rendering, with no single Core node or plan-recorded
+site id to key a table row on. Recording it in the plan would need the
+fairness/resource-management passes (or the plan's own walk) to model
+backend-introduced body-value slots as a distinct site kind first; that is
+the broader pass-level change flagged in the prior audit for the
+12649-12684 checkpoint-temp sites this helper also serves, not a same-step
+threading job.
+---
 private pure func owned_body_value_cleanup(
 	body: FunctionBodyC,
 	typ: CoreType,
@@ -22262,15 +22235,13 @@ private pure func emit_supported_user_function(
 	func_info: CoreFunction,
 	profile_plan: Option[ProfileEmissionPlan],
 	profile_function_id: Option[ProfileFunctionId],
-	program_summary: CancellationProgramSummary,
+	plan: CancellationProtectionPlan,
 	symbol_authority: CEmissionSymbolAuthority,
 ) -> Option[String]:
 	match func_info.body:
-		Some(body):
-			emission_context: FunctionEmissionContext = function_emission_context(
-				func_info,
-				body,
-				program_summary,
+		Some(_):
+			emission_context: FunctionEmissionContext = emission_context_from_plan(
+				plan,
 				profile_function_id,
 				symbol_authority,
 			)
@@ -22394,7 +22365,7 @@ private pure func emit_function(
 	profile_function_id: Option[ProfileFunctionId],
 	display_name: String,
 	internal_linkage: Bool,
-	program_summary: CancellationProgramSummary,
+	plan: CancellationProtectionPlan,
 	symbol_authority: CEmissionSymbolAuthority,
 	internal_type_linkage: Bool,
 ) -> String:
@@ -22407,7 +22378,7 @@ private pure func emit_function(
 						func_info,
 						profile_plan,
 						profile_function_id,
-						program_summary,
+						plan,
 						symbol_authority,
 					):
 						Some(c_code):
@@ -22424,7 +22395,7 @@ private pure func emit_function(
 						func_info,
 						profile_plan,
 						profile_function_id,
-						program_summary,
+						plan,
 						symbol_authority,
 					):
 						Some(c_code):
@@ -22443,7 +22414,7 @@ private pure func emit_function(
 			match emit_closure_body_function(
 				func_info,
 				abi,
-				program_summary,
+				plan,
 				symbol_authority,
 				internal_type_linkage,
 			):
@@ -24525,12 +24496,12 @@ private pure func global_needs_runtime_init(global: CoreGlobal) -> Bool:
 private pure func emit_global_runtime_init_body(
 	global: CoreGlobal,
 	next_temp: Int,
-	program_summary: CancellationProgramSummary,
+	plan: CancellationProtectionPlan,
 	symbol_authority: CEmissionSymbolAuthority,
 ) -> Option[FunctionBodyC]:
-	emission_context: FunctionEmissionContext = global_emission_context(
-		global,
-		program_summary,
+	emission_context: FunctionEmissionContext = emission_context_from_plan(
+		plan,
+		None,
 		symbol_authority,
 	)
 	init_body ?= emit_function_body(global.init, next_temp, emission_context)
@@ -25572,27 +25543,56 @@ private pure func emit_global_cleanup_statements(decls: List[CoreDecl]) -> Strin
 	statements
 
 
+---
+The plan row for the `GlobalDecl` at `decl_index`, or a defensive empty plan
+when the table has no row there -- which never happens for a `decl_index`
+taken from the same `decls` the table was built from (see
+`CorePrepare.build_cancellation_plan_table`).
+---
+private pure func global_cancellation_plan_or_default(
+	table: CancellationPlanTable,
+	decl_index: Int,
+	global: CoreGlobal,
+) -> CancellationProtectionPlan:
+	fallback_identity: CoreDefinitionIdentity = {
+		name = global.name.name,
+		def_id = global.def_id
+	}
+
+	CorePrepare.cancellation_plan_table_row(table, decl_index).get_or(
+		empty_cancellation_protection_plan(GlobalInitializerCancellationActivation(fallback_identity)),
+	)
+
+
 private pure func emit_global_init_function(
 	decls: List[CoreDecl],
-	program_summary: CancellationProgramSummary,
+	cancellation_table: CancellationPlanTable,
 	symbol_authority: CEmissionSymbolAuthority,
 ) -> Result[String, CoreEmitError]:
 	var statements: String = make_string(0)
 	var error: Option[CoreEmitError] = None
 	var temp_index: Int = 0
 
-	for decl in decls:
+	for entry in decls.enumerate():
+		decl_index: Int = entry[0]
+
 		match error:
 			Some(existing_error):
 				void
 			None:
-				match decl:
+				match entry[1]:
 					GlobalDecl(global):
 						if global_needs_runtime_init(global):
+							plan: CancellationProtectionPlan = global_cancellation_plan_or_default(
+								cancellation_table,
+								decl_index,
+								global,
+							)
+
 							match emit_global_runtime_init_body(
 								global,
 								temp_index,
-								program_summary,
+								plan,
 								symbol_authority,
 							):
 								Some(init_body):
@@ -25693,12 +25693,33 @@ private pure func render_function_definitions(functions: List[CFunctionEmission]
 	c_code
 
 
+---
+The plan row for the `FunctionDecl` at `decl_index`, or a defensive empty
+plan when the table has no row there -- which never happens for a
+`decl_index` taken from the same `decls` the table was built from (see
+`CorePrepare.build_cancellation_plan_table`).
+---
+private pure func function_cancellation_plan_or_default(
+	table: CancellationPlanTable,
+	decl_index: Int,
+	func_info: CoreFunction,
+) -> CancellationProtectionPlan:
+	fallback_identity: CoreDefinitionIdentity = {
+		name = func_info.name,
+		def_id = func_info.def_id
+	}
+
+	CorePrepare.cancellation_plan_table_row(table, decl_index).get_or(
+		empty_cancellation_protection_plan(FunctionCancellationActivation(fallback_identity)),
+	)
+
+
 private pure func emit_function_decls(
 	decls: List[CoreDecl],
 	profile_plan: Option[ProfileEmissionPlan],
 	symbol_authority: CEmissionSymbolAuthority,
 	internal_linkage: Bool,
-	program_summary: CancellationProgramSummary,
+	cancellation_table: CancellationPlanTable,
 	internal_type_linkage: Bool,
 ) -> List[CFunctionEmission]:
 	var functions: List[CFunctionEmission] = []
@@ -25706,8 +25727,10 @@ private pure func emit_function_decls(
 
 	-- Selection preserves declaration order, so one cursor assigns IDs without
 	-- scanning the selected list for every emitted function.
-	for decl in decls:
-		match decl:
+	for entry in decls.enumerate():
+		decl_index: Int = entry[0]
+
+		match entry[1]:
 			FunctionDecl(func_info):
 				profile_function_id: Option[ProfileFunctionId] = profile_function_id_at_cursor(
 					profile_plan,
@@ -25718,6 +25741,12 @@ private pure func emit_function_decls(
 				if profile_function_id.is_some():
 					next_profile_id += 1
 
+				plan: CancellationProtectionPlan = function_cancellation_plan_or_default(
+					cancellation_table,
+					decl_index,
+					func_info,
+				)
+
 				functions = functions.append({
 					def_id = func_info.def_id,
 					text = emit_function(
@@ -25727,7 +25756,7 @@ private pure func emit_function_decls(
 						profile_function_id,
 						func_info.name,
 						internal_linkage,
-						program_summary,
+						plan,
 						symbol_authority,
 						internal_type_linkage,
 					),
@@ -26141,6 +26170,7 @@ declare `extern` in a shared header.
 private pure func emit_decls(
 	program: CoreProgram,
 	plan: CleanupPlan,
+	cancellation_table: CancellationPlanTable,
 	profile_configuration: FunctionProfileConfiguration,
 	symbol_authority: CEmissionSymbolAuthority,
 	canonical_empty_lists: List[CanonicalEmptyList],
@@ -26148,14 +26178,13 @@ private pure func emit_decls(
 	internal_type_linkage: Bool,
 ) -> Result[CEmissionSections, CoreEmitError]:
 	decls: List[CoreDecl] = program.decls
-	cancellation_summary: CancellationProgramSummary = analyze_program_cancellation(program)
 	layouts: CRecordLayoutRegistry = classify_c_record_layouts(program)
 	static_string_literals ?= collect_backend_static_string_literals(
 		program,
 	).map_err(
 		func(error): InvalidStaticStringLiteralPool(error),
 	)
-	global_init ?= emit_global_init_function(decls, cancellation_summary, symbol_authority)
+	global_init ?= emit_global_init_function(decls, cancellation_table, symbol_authority)
 
 	profile_plan ?= profile_emission_plan(decls, symbol_authority, profile_configuration)
 
@@ -26210,7 +26239,7 @@ private pure func emit_decls(
 			profile_plan,
 			symbol_authority,
 			internal_linkage,
-			cancellation_summary,
+			cancellation_table,
 			internal_type_linkage,
 		),
 		value_record_emissions = value_record_emissions,
@@ -26237,6 +26266,9 @@ pure func try_emit_prepared_core_program_c_artifact_with_profile(
 ) -> Result[CArtifact, CoreEmitError]:
 	program: CoreProgram = prepared_core_program_value(prepared)
 	plan: CleanupPlan = prepared_core_program_cleanup_plan(prepared)
+	cancellation_table: CancellationPlanTable = prepared_core_program_cancellation_plan_table(
+		prepared,
+	)
 
 	match prepare_c_emission_symbols(program):
 		Err(error):
@@ -26245,6 +26277,7 @@ pure func try_emit_prepared_core_program_c_artifact_with_profile(
 			sections ?= emit_decls(
 				program,
 				plan,
+				cancellation_table,
 				profile_configuration,
 				ValidatedCEmissionSymbols(symbol_plan),
 				c_emission_canonical_empty_lists(symbol_plan),
@@ -26267,6 +26300,9 @@ pure func try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
 ) -> Result[CArtifact, CoreEmitError]:
 	program: CoreProgram = prepared_core_program_value(prepared)
 	plan: CleanupPlan = prepared_core_program_cleanup_plan(prepared)
+	cancellation_table: CancellationPlanTable = prepared_core_program_cancellation_plan_table(
+		prepared,
+	)
 	canonical_empty_lists ?= canonical_empty_lists_for_unprojected_program(
 		program,
 	).map_err(
@@ -26276,6 +26312,7 @@ pure func try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
 	sections ?= emit_decls(
 		program,
 		plan,
+		cancellation_table,
 		profile_configuration,
 		UnprojectedCEmissionSymbolsForTests,
 		canonical_empty_lists,
@@ -26963,6 +27000,9 @@ pure func try_emit_prepared_core_program_c_split_artifact_with_profile(
 	else:
 		program: CoreProgram = prepared_core_program_value(prepared)
 		plan: CleanupPlan = prepared_core_program_cleanup_plan(prepared)
+		cancellation_table: CancellationPlanTable = prepared_core_program_cancellation_plan_table(
+			prepared,
+		)
 
 		match prepare_c_emission_symbols(program):
 			Err(error):
@@ -26985,6 +27025,7 @@ pure func try_emit_prepared_core_program_c_split_artifact_with_profile(
 				sections ?= emit_decls(
 					program,
 					plan,
+					cancellation_table,
 					profile_configuration,
 					authority,
 					canonical_empty_lists,

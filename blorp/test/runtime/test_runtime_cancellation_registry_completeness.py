@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Completeness guard for the DirectRuntimeCall cancellation-point registry.
 
-`stage_10_backend/cancellation_plan.brp` classifies a `DirectRuntimeCall` as
+`stage_09_core/cancellation_plan.brp` classifies a `DirectRuntimeCall` as
 "cannot cancel the current task" unless its C symbol appears in
 `RUNTIME_CALL_CANCELLATION_POINT_SYMBOLS`. That symbol is exactly what
 `emit_direct_runtime_call` writes as a bare C function call, so the only way
@@ -38,7 +38,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 RUNTIME_C = ROOT / "blorp" / "src" / "lib" / "runtime" / "native" / "runtime.c"
 CANCELLATION_PLAN = (
-    ROOT / "blorp" / "src" / "compiler" / "stage_10_backend" / "cancellation_plan.brp"
+    ROOT / "blorp" / "src" / "compiler" / "stage_09_core" / "cancellation_plan.brp"
 )
 
 # Sink functions: anything that can leave the current C frame through longjmp

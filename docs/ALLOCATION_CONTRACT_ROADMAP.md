@@ -44,7 +44,7 @@ implementation of `no_alloc`.
 | `stage_09_core/type_policy.brp`, `ownership.brp` | Ownership and representation facts are reusable inputs, **not** allocation summaries. A scalar-returning call can allocate temporaries. `FreshOwned` describes a result, not all work in a call. |
 | `stage_09_core/pipeline.brp` | Late order includes projection, DCE, consumption, static strings, ownership, Perceus, reuse, closure, resource management, fairness, preparation, and prepared reuse. Checking before these transformations is insufficient. |
 | `stage_10_backend/emit.brp` | C emission still chooses allocation-relevant helper behavior. In particular, `emit_iterative_union_destructor` generates a work stack grown by `realloc`. A final release can allocate even when the source has no constructor. |
-| `stage_10_backend/cancellation_plan.brp` | Generated cleanup behavior must be included; source-expression classification alone cannot cover it. |
+| `stage_09_core/cancellation_plan.brp` | Generated cleanup behavior must be included; source-expression classification alone cannot cover it. |
 | `blorp/src/check/command.brp` | `execute_check_plan` currently uses frontend validation only. It does not run final Core. Silently adding a syntax node without changing this command would give misleading successful checks. |
 | `stage_09_core/pass_runner.brp` | Pass results and diagnostics have a shared protocol. Add a structured allocation diagnostic; do not squeeze a source contract violation into an emission error string. |
 

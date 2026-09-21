@@ -11,6 +11,19 @@ import:
 		union_cleanup_kind,
 		union_field_uses_iterative_cleanup,
 		union_variant_has_cleanup,
+	cancellation_plan:
+		CancellationActivationIdentity(
+			FunctionCancellationActivation,
+			GlobalInitializerCancellationActivation,
+		),
+		CancellationProgramSummary,
+		CancellationProtectionPlan,
+		CoreCancellationEffect(CannotCancelCurrentTask),
+		analyze_program_cancellation,
+		build_current_behavior_cancellation_plan,
+		build_region_sensitive_cancellation_plan,
+		cancellation_function_summary,
+		cancellation_global_initializer_summary,
 	ir:
 		CoreBoxKind(
 			Float16Box,
@@ -165,6 +178,7 @@ import:
 			VoidExpr,
 			WhileExpr,
 		),
+		CoreDefinitionIdentity,
 		CoreFunction,
 		CoreGlobal,
 		CoreHashContainerConstructor(
@@ -5778,5 +5792,152 @@ pure func build_cleanup_plan(program: CoreProgram) -> CleanupPlan:
 
 	for decl in program.decls:
 		rows = rows.append(cleanup_type_plan_for_decl(decl))
+
+	{ rows = rows }
+
+
+---
+Step 2 of the emitter-as-dumb-printer migration: the per-function/global
+cancellation and cleanup plan.
+
+`stage_10_backend/emit.brp` used to decide, while printing a function body or
+a global initializer, which values need a cleanup frame and what runs on a
+cancelled exit -- by calling `CancellationPlan.build_current_behavior_cancellation_plan`
+/ `build_region_sensitive_cancellation_plan` itself, once per function, at
+print time. `CancellationPlanTable` publishes that decision as data instead.
+
+There is one row per declaration in a program's `decls`, indexed exactly like
+`CleanupPlan.rows` and `program.decls` -- the same dense identity. A
+`FunctionDecl` with a body and every `GlobalDecl` get `Some(plan)`; anything
+else (a function with no body, and every other declaration kind) gets `None`.
+
+The plan is built once (see `build_cancellation_plan_table`) by calling the
+same `CancellationPlan` builders the emitter used to call; it does not
+reimplement them. Whether a function's plan is the region-sensitive or the
+current-behavior variant is itself a whole-program Core fact (whether the
+function is in `CancellationProgramSummary`), computed here from
+`analyze_program_cancellation`, so the emitter no longer needs the program
+summary at all.
+---
+record CancellationPlanTable {
+	rows: List[Option[CancellationProtectionPlan]]
+}
+
+
+---
+The row for the declaration at `decl_index`, or `None` when that declaration
+has no cancellation plan (not a callable, or a function with no body) or the
+index is out of range.
+---
+pure func cancellation_plan_table_row(
+	table: CancellationPlanTable,
+	decl_index: Int,
+) -> Option[CancellationProtectionPlan]:
+	match table.rows.get(decl_index):
+		Some(row):
+			row
+		None:
+			None
+
+
+---
+A defensive default for a declaration whose row is unexpectedly missing --
+never exercised when `decl_index` comes from the same `decls` the table was
+built from, since prepare and the emitter walk them the same way. It is a
+plain record literal, not a call into the builders, so this stays a reader,
+never a planner, on the emitter's behalf.
+---
+pure func empty_cancellation_protection_plan(
+	activation: CancellationActivationIdentity,
+) -> CancellationProtectionPlan:
+	{
+		activation = activation,
+		effect = CannotCancelCurrentTask,
+		max_live_slots = 0,
+		sites = [],
+		let_protections = [],
+		let_protections_by_name = {},
+		match_scrutinee_protections = [],
+		match_scrutinee_protections_by_uniq = None,
+		planned_owner_count = 0,
+		expression_visits = 0
+	}
+
+
+private pure func function_cancellation_plan(
+	func_info: CoreFunction,
+	program_summary: CancellationProgramSummary,
+) -> Option[CancellationProtectionPlan]:
+	match func_info.body:
+		Some(body):
+			identity: CoreDefinitionIdentity = {
+				name = func_info.name,
+				def_id = func_info.def_id
+			}
+			activation: CancellationActivationIdentity = FunctionCancellationActivation(identity)
+
+			plan: CancellationProtectionPlan = match cancellation_function_summary(
+				program_summary,
+				identity,
+			):
+				Some(_):
+					build_region_sensitive_cancellation_plan(activation, body, program_summary)
+				None:
+					build_current_behavior_cancellation_plan(activation, body)
+
+			Some(plan)
+		None:
+			None
+
+
+private pure func global_cancellation_plan(
+	global: CoreGlobal,
+	program_summary: CancellationProgramSummary,
+) -> Option[CancellationProtectionPlan]:
+	identity: CoreDefinitionIdentity = {
+		name = global.name.name,
+		def_id = global.def_id
+	}
+	activation: CancellationActivationIdentity = GlobalInitializerCancellationActivation(identity)
+
+	plan: CancellationProtectionPlan = match cancellation_global_initializer_summary(
+		program_summary,
+		identity,
+	):
+		Some(_):
+			build_region_sensitive_cancellation_plan(activation, global.init, program_summary)
+		None:
+			build_current_behavior_cancellation_plan(activation, global.init)
+
+	Some(plan)
+
+
+private pure func cancellation_plan_for_decl(
+	decl: CoreDecl,
+	program_summary: CancellationProgramSummary,
+) -> Option[CancellationProtectionPlan]:
+	match decl:
+		FunctionDecl(func_info):
+			function_cancellation_plan(func_info, program_summary)
+		GlobalDecl(global):
+			global_cancellation_plan(global, program_summary)
+		EnumDecl(_) | UnionDecl(_) | ValueRecordDecl(_) | HeapRecordDecl(_) | TypeAliasDecl(_) | TraitDecl(_) | ImplDecl(_):
+			None
+
+
+---
+Builds the program's cancellation plan table once. Every function
+declaration with a body and every global declaration get a row computed from
+the shared `CancellationPlan` builders; every other declaration gets `None`.
+Called once, from the single place a `CoreProgram` becomes a
+`PreparedCoreProgram` (`stage_09_core/pipeline.brp`), so the emitter never
+has to call `analyze_program_cancellation` or the plan builders itself.
+---
+pure func build_cancellation_plan_table(program: CoreProgram) -> CancellationPlanTable:
+	program_summary: CancellationProgramSummary = analyze_program_cancellation(program)
+	var rows: List[Option[CancellationProtectionPlan]] = []
+
+	for decl in program.decls:
+		rows = rows.append(cancellation_plan_for_decl(decl, program_summary))
 
 	{ rows = rows }

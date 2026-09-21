@@ -4,7 +4,7 @@ import:
 		CoreBoxKind(PointerBox, PrimBox, StructBox),
 		CoreBoxedStorageValue,
 		CoreCallKind(BuiltinCall, IntrinsicCall, UserCall),
-		CoreDecl(FunctionDecl, HeapRecordDecl, UnionDecl, ValueRecordDecl),
+		CoreDecl(FunctionDecl, GlobalDecl, HeapRecordDecl, UnionDecl, ValueRecordDecl),
 		CoreExpr(
 			BinaryExpr,
 			BoxExpr,
@@ -32,6 +32,7 @@ import:
 		),
 		CoreFunction,
 		CoreFunctionKind(UserFunction),
+		CoreGlobal,
 		CoreHashContainerConstructor(StringHashContainerConstructor),
 		CoreHeapRecordDecl,
 		CoreListStorageLayout(InlineStructListStorage, PointerListStorage),
@@ -90,12 +91,16 @@ import:
 		CoreValueRecordDecl,
 		CoreVar,
 		core_program_to_json,
+	../../../src/compiler/stage_09_core/cancellation_plan: CancellationProtectionPlan
 	../../../src/compiler/stage_09_core/prepare:
+		CancellationPlanTable,
 		CleanupFieldPlan,
 		CleanupPlan,
 		CleanupStrategy(DirectCleanup, IterativeCleanup, NoCleanup),
 		CleanupTypePlan(HeapRecordTypeCleanup, NotACleanupType, UnionTypeCleanup),
+		build_cancellation_plan_table,
 		build_cleanup_plan,
+		cancellation_plan_table_row,
 		cleanup_plan_row,
 		heap_record_cleanup_field_plan,
 		is_primitive_tuple_slot_type,
@@ -2685,6 +2690,93 @@ pure func test_build_cleanup_plan_rows() -> Bool:
 	direct_ok and iterative_ok and iterative_field_ok and heap_ok and heap_count_field_ok and heap_label_field_ok
 
 
+pure func cancellation_plan_test_function_with_body(def_id: Int) -> CoreFunction:
+	{
+		name = "with_body",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = int_type(),
+		body = Some(int_literal(1)),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = def_id,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func cancellation_plan_test_function_without_body(def_id: Int) -> CoreFunction:
+	{
+		name = "without_body",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = int_type(),
+		body = None,
+		is_pure = True,
+		function_kind = BuiltinFunction("without_body"),
+		def_id = def_id,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func cancellation_plan_test_global(def_id: Int) -> CoreGlobal:
+	{
+		name = {
+			name = "cancellation_plan_test_global",
+			uniq = 0,
+			def_id = Some(def_id)
+		},
+		source_module = None,
+		typ = int_type(),
+		init = int_literal(1),
+		is_mutable = False,
+		is_const = True,
+		is_private = False,
+		def_id = def_id,
+		loc = SyntheticSourceLoc
+	}
+
+
+---
+Builds the cancellation plan table for a program with a function that has a
+body, a function with no body, and a global -- the row shapes step 2 of the
+emitter migration needs to distinguish. A function with a body and a global
+each get `Some(plan)` built from the same `CancellationPlan` builders the
+emitter used to call at print time; a function with no body gets `None`, and
+the row for a declaration kind that is never a cancellation callable (checked
+here through the out-of-range default) is `None` too.
+---
+pure func test_build_cancellation_plan_table_rows() -> Bool:
+	program: CoreProgram = {
+		decls = [
+			FunctionDecl(cancellation_plan_test_function_with_body(1)),
+			FunctionDecl(cancellation_plan_test_function_without_body(2)),
+			GlobalDecl(cancellation_plan_test_global(3)),
+		],
+		foreign_includes = []
+	}
+	table: CancellationPlanTable = build_cancellation_plan_table(program)
+
+	function_with_body_ok: Bool = match cancellation_plan_table_row(table, 0):
+		Some(plan):
+			plan.expression_visits > 0
+		None:
+			False
+
+	function_without_body_ok: Bool = cancellation_plan_table_row(table, 1).is_none()
+
+	global_ok: Bool = match cancellation_plan_table_row(table, 2):
+		Some(plan):
+			plan.expression_visits > 0
+		None:
+			False
+
+	out_of_range_ok: Bool = cancellation_plan_table_row(table, 99).is_none()
+
+	function_with_body_ok and function_without_body_ok and global_ok and out_of_range_ok
+
+
 tests: TestSuite = {
 	description = "Blorp compiler Core prepare",
 	tests = [
@@ -2831,5 +2923,6 @@ tests: TestSuite = {
 		),
 		("prepare reuses already prepared output", test_prepare_reuses_already_prepared_output),
 		("build cleanup plan rows", test_build_cleanup_plan_rows),
+		("build cancellation plan table rows", test_build_cancellation_plan_table_rows),
 	]
 }
