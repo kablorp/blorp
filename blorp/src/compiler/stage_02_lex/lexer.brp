@@ -190,6 +190,27 @@ private struct LambdaBodyLevel {
 }
 
 
+-- These marker scans return only scalar-compatible fields. A tuple would
+-- heap-box both the result and its Cursor payload at every aligned-pipe line.
+private struct LineSpacesScan {
+	indent: Int,
+	next_cursor: Cursor
+}
+
+
+private struct PipeMarkerScan {
+	continues: Bool,
+	marker_cursor: Cursor
+}
+
+
+private struct RawPipeStartMarkerScan {
+	matched: Bool,
+	margin_column: Int,
+	marker_cursor: Cursor
+}
+
+
 pure func lex_ok(result: LexResult) -> Bool:
 	result.diagnostics.is_empty()
 
@@ -322,7 +343,10 @@ private pure func read_line_text(source: SourceFile, cursor: Cursor) -> (String,
 
 -- Leading spaces and tabs never change the line, so the run is scanned by
 -- offset while the indent width and the column are carried forward together.
-private pure func skip_line_spaces_with_indent(source: SourceFile, cursor: Cursor) -> (Int, Cursor):
+private pure func skip_line_spaces_with_indent(
+	source: SourceFile,
+	cursor: Cursor,
+) -> LineSpacesScan:
 	text: String = source.text
 	var offset: Int = cursor.offset
 	var column: Int = cursor.column
@@ -347,34 +371,61 @@ private pure func skip_line_spaces_with_indent(source: SourceFile, cursor: Curso
 		column = column
 	}
 
-	(indent, next_cursor)
+	{
+		indent = indent,
+		next_cursor = next_cursor
+	}
 
 
 private pure func pipe_marker_at_margin(
 	source: SourceFile,
 	cursor: Cursor,
 	margin_column: Int,
-) -> (Bool, Cursor):
-	(indent, marker_cursor) = skip_line_spaces_with_indent(source, cursor)
+) -> PipeMarkerScan:
+	spaces: LineSpacesScan = skip_line_spaces_with_indent(source, cursor)
+	indent: Int = spaces.indent
+	marker_cursor: Cursor = spaces.next_cursor
 
 	if indent == margin_column - 1:
 		match source_peek(source, marker_cursor):
 			Some('|'):
-				(True, marker_cursor)
+				{
+					continues = True,
+					marker_cursor = marker_cursor
+				}
 			_:
-				(False, marker_cursor)
+				{
+					continues = False,
+					marker_cursor = marker_cursor
+				}
 	else:
-		(False, marker_cursor)
+		{
+			continues = False,
+			marker_cursor = marker_cursor
+		}
 
 
-private pure func raw_pipe_start_marker(source: SourceFile, cursor: Cursor) -> (Bool, Int, Cursor):
-	(indent, marker_cursor) = skip_line_spaces_with_indent(source, cursor)
+private pure func raw_pipe_start_marker(
+	source: SourceFile,
+	cursor: Cursor,
+) -> RawPipeStartMarkerScan:
+	spaces: LineSpacesScan = skip_line_spaces_with_indent(source, cursor)
+	indent: Int = spaces.indent
+	marker_cursor: Cursor = spaces.next_cursor
 
 	match source_peek(source, marker_cursor):
 		Some('|'):
-			(True, indent + 1, marker_cursor)
+			{
+				matched = True,
+				margin_column = indent + 1,
+				marker_cursor = marker_cursor
+			}
 		_:
-			(False, indent + 1, marker_cursor)
+			{
+				matched = False,
+				margin_column = indent + 1,
+				marker_cursor = marker_cursor
+			}
 
 
 private pure func raw_pipe_start_after_raw(
@@ -390,18 +441,19 @@ private pure func raw_pipe_start_after_raw(
 					None
 				else:
 					after_raw: Cursor = cursor_advanced(source, cursor, 3)
-					(_, after_spaces) = skip_line_spaces_with_indent(source, after_raw)
+					spaces: LineSpacesScan = skip_line_spaces_with_indent(source, after_raw)
+					after_spaces: Cursor = spaces.next_cursor
 
 					match source_peek(source, after_spaces):
 						Some('\n'):
 							after_newline: Cursor = source_advance(source, after_spaces)
-							(ok, margin_column, marker_cursor) = raw_pipe_start_marker(
+							marker: RawPipeStartMarkerScan = raw_pipe_start_marker(
 								source,
 								after_newline,
 							)
 
-							if ok:
-								Some((margin_column, marker_cursor))
+							if marker.matched:
+								Some((marker.margin_column, marker.marker_cursor))
 							else:
 								None
 						_:
@@ -1081,10 +1133,10 @@ private pure func scan_pipe_block(
 			ended_with_newline = line_ended_with_newline
 
 			if ended_with_newline:
-				(continues, marker_cursor) = pipe_marker_at_margin(source, cur, margin_column)
+				marker: PipeMarkerScan = pipe_marker_at_margin(source, cur, margin_column)
 
-				if continues:
-					cur = marker_cursor
+				if marker.continues:
+					cur = marker.marker_cursor
 					first_line = False
 				else:
 					break
