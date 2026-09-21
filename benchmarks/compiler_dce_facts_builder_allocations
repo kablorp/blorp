@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
+compiler="${BLORP_DCE_FACTS_COMPILER:-$repo_root/bin/blorp}"
+source_file="$repo_root/benchmarks/blorp/profiles/dce_facts_builder_allocations.brp"
+expected_allocations="${BLORP_DCE_FACTS_EXPECT_ALLOCATIONS:-15367}"
+measure_only="${BLORP_DCE_FACTS_MEASURE_ONLY:-0}"
+
+if [ "${BLORP_DCE_FACTS_SKIP_BUILD:-0}" != "1" ]; then
+	BLORP_CLI_C_OPTIMIZATION=-O2 make -C "$repo_root" all >/dev/null
+fi
+
+if [ ! -x "$compiler" ]; then
+	echo "compiler_dce_facts_builder_allocations: compiler is not executable: $compiler" >&2
+	exit 1
+fi
+
+output=$(
+	cd "$repo_root"
+	BLORP_TRACK_STATS=1 "$compiler" run --no-format "$source_file"
+)
+
+names=$(printf '%s\n' "$output" | sed -n '1p')
+reads=$(printf '%s\n' "$output" | sed -n '2p')
+invalidations=$(printf '%s\n' "$output" | sed -n '3p')
+occurrences=$(printf '%s\n' "$output" | sed -n '4p')
+exact_order=$(printf '%s\n' "$output" | sed -n '5p')
+allocations=$(printf '%s\n' "$output" | sed -n '6p')
+releases=$(printf '%s\n' "$output" | sed -n '7p')
+current_objects=$(printf '%s\n' "$output" | sed -n '8p')
+bytes_allocated=$(printf '%s\n' "$output" | sed -n '9p')
+line_count=$(printf '%s\n' "$output" | wc -l | tr -d ' ')
+
+for value in "$names" "$reads" "$invalidations" "$occurrences" "$exact_order" \
+	"$allocations" "$releases" "$current_objects" "$bytes_allocated"; do
+	if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+		echo "compiler_dce_facts_builder_allocations: malformed probe output:" >&2
+		printf '%s\n' "$output" >&2
+		exit 1
+	fi
+done
+
+if [ "$line_count" -ne 9 ] || [ "$names" -ne 512 ] || [ "$reads" -ne 512 ] \
+	|| [ "$invalidations" -ne 512 ] || [ "$occurrences" -ne 2048 ] \
+	|| [ "$exact_order" -ne 1 ]; then
+	echo "compiler_dce_facts_builder_allocations: reference identity or order changed:" >&2
+	printf '%s\n' "$output" >&2
+	exit 1
+fi
+
+if [ "$measure_only" != "0" ] && [ "$measure_only" != "1" ]; then
+	echo "compiler_dce_facts_builder_allocations: BLORP_DCE_FACTS_MEASURE_ONLY must be 0 or 1" >&2
+	exit 1
+fi
+
+if [ "$measure_only" != "1" ] && [ "$allocations" -gt "$expected_allocations" ]; then
+	echo "compiler_dce_facts_builder_allocations: expected at most $expected_allocations allocations, got $allocations" >&2
+	exit 1
+fi
+
+printf 'DCE_FACTS_BUILDER_ALLOCATIONS schema=1 references=512 allocations=%s releases=%s current_objects=%s bytes_allocated=%s\n' \
+	"$allocations" "$releases" "$current_objects" "$bytes_allocated"

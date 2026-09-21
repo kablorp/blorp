@@ -369,35 +369,63 @@ private pure func add_resolved_value_to_index(
 
 
 private pure func add_value_read(facts: DceFacts, variable: CoreVar) -> DceFacts:
-	referenced: DceFacts = add_global_name(facts, variable.name)
+	-- A read contributes several facts at once. Compute those collection values
+	-- first, then publish one record update so the threaded accumulator does not
+	-- allocate a shell for the global, occurrence, and resolved-read steps.
+	global_name_seen = facts.global_names_seen.contains(variable.name)
+	global_names = if global_name_seen:
+		facts.global_names
+	else:
+		facts.global_names.append(variable.name)
+	global_names_seen = if global_name_seen:
+		facts.global_names_seen
+	else:
+		facts.global_names_seen.set(variable.name, True)
 
-	match referenced.mode:
+	match facts.mode:
 		CollectReachabilityFacts:
-			referenced
+			if global_name_seen:
+				facts
+			else:
+				{ facts |
+					global_names = global_names,
+					global_names_seen = global_names_seen
+				}
 		CollectValueReferences:
 			match variable.def_id:
 				Some(def_id):
-					with_occurrence: DceFacts = { referenced |
-						value_reference_occurrences = referenced.value_reference_occurrences.append(
-							variable,
-						)
-					}
-
 					if resolved_value_index_contains(
-						with_occurrence.value_read_uniqs_by_def_id,
+						facts.value_read_uniqs_by_def_id,
 						variable,
 					):
-						with_occurrence
+						{ facts |
+							global_names = global_names,
+							global_names_seen = global_names_seen,
+							value_reference_occurrences = facts.value_reference_occurrences.append(
+								variable,
+							)
+						}
 					else:
-						{ with_occurrence |
-							value_reads = with_occurrence.value_reads.append(variable),
+						{ facts |
+							global_names = global_names,
+							global_names_seen = global_names_seen,
+							value_reads = facts.value_reads.append(variable),
 							value_read_uniqs_by_def_id = add_resolved_value_to_index(
-								with_occurrence.value_read_uniqs_by_def_id,
+								facts.value_read_uniqs_by_def_id,
+								variable,
+							),
+							value_reference_occurrences = facts.value_reference_occurrences.append(
 								variable,
 							)
 						}
 				None:
-					referenced
+					if global_name_seen:
+						facts
+					else:
+						{ facts |
+							global_names = global_names,
+							global_names_seen = global_names_seen
+						}
 
 
 private pure func add_variable_reference(
@@ -419,24 +447,27 @@ private pure func add_value_invalidation(facts: DceFacts, variable: CoreVar) -> 
 		CollectValueReferences:
 			match variable.def_id:
 				Some(def_id):
-					with_occurrence: DceFacts = { facts |
-						value_reference_occurrences = facts.value_reference_occurrences.append(
-							variable,
-						)
-					}
-
+					-- Publish the occurrence and first invalidation together for the
+					-- same reason as add_value_read.
 					if resolved_value_index_contains(
-						with_occurrence.value_invalidation_uniqs_by_def_id,
+						facts.value_invalidation_uniqs_by_def_id,
 						variable,
 					):
-						with_occurrence
+						{ facts |
+							value_reference_occurrences = facts.value_reference_occurrences.append(
+								variable,
+							)
+						}
 					else:
-						{ with_occurrence |
-							value_invalidations = with_occurrence.value_invalidations.append(
+						{ facts |
+							value_invalidations = facts.value_invalidations.append(
 								variable,
 							),
 							value_invalidation_uniqs_by_def_id = add_resolved_value_to_index(
-								with_occurrence.value_invalidation_uniqs_by_def_id,
+								facts.value_invalidation_uniqs_by_def_id,
+								variable,
+							),
+							value_reference_occurrences = facts.value_reference_occurrences.append(
 								variable,
 							)
 						}

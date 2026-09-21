@@ -375,6 +375,18 @@ BLORP_RECORD_UPDATE_SKIP_BUILD=1 \
   benchmarks/compiler_record_update_nested_match_allocations
 ```
 
+`compiler_dce_facts_builder_allocations` retains a focused 512-identity Core
+expression for DCE value-fact collection. It checks exact identity and order for
+first and duplicate reads and invalidations, then caps managed allocations for
+the collection window so one logical fact cannot regress into several threaded
+`DceFacts` publications:
+
+```bash
+benchmarks/compiler_dce_facts_builder_allocations
+BLORP_DCE_FACTS_SKIP_BUILD=1 \
+  benchmarks/compiler_dce_facts_builder_allocations
+```
+
 ### Frontend and Typecheck Function Profile
 
 `compiler_typecheck_profile` runs a bounded synthetic graph through
