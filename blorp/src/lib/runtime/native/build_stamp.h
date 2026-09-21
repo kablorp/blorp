@@ -9,6 +9,8 @@
 
 blorp_String *blorp_build_stamp_commit(void);
 blorp_String *blorp_build_stamp_target(void);
+blorp_String *blorp_build_stamp_channel(void);
+blorp_String *blorp_build_stamp_dirty(void);
 blorp_String *blorp_build_stamp_compiled_by(void);
 blorp_String *blorp_build_stamp_cli_optimization(void);
 blorp_String *blorp_build_stamp_runtime_optimization(void);

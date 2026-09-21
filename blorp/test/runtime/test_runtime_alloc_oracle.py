@@ -62,6 +62,7 @@ class RuntimeAllocOracleTests(unittest.TestCase):
     def test_every_oracle_counter_moves_on_its_own_path(self) -> None:
         source = textwrap.dedent(
             """\
+            #define _GNU_SOURCE
             #define MINICORO_IMPL
             #include "minicoro.h"
             #include "runtime.c"
@@ -145,10 +146,10 @@ class RuntimeAllocOracleTests(unittest.TestCase):
                 void* stack = blorp_fiber_stack_alloc(65536, NULL);
                 blorp_MemStats after_fiber = blorp_get_mem_stats();
                 CHECK_MOVED(before_fiber, after_fiber, fiber_mmap_events, 11);
-                if (stack) {
-                    size_t aligned_size = __blorp_page_align(65536);
-                    munmap(stack, aligned_size + __blorp_page_size);
-                }
+                // The returned pointer sits one page above the mapping base
+                // (the guard page is below it); release through the
+                // runtime's own inverse rather than recomputing the base.
+                if (stack) blorp_fiber_stack_unmap(stack, 65536);
 
                 return 0;
             }
@@ -160,6 +161,7 @@ class RuntimeAllocOracleTests(unittest.TestCase):
     def test_idle_process_reports_zero_oracle_counters(self) -> None:
         source = textwrap.dedent(
             """\
+            #define _GNU_SOURCE
             #define MINICORO_IMPL
             #include "minicoro.h"
             #include "runtime.c"
@@ -188,6 +190,7 @@ class RuntimeAllocOracleTests(unittest.TestCase):
     def test_disabled_gate_reports_inactive_not_zero(self) -> None:
         source = textwrap.dedent(
             """\
+            #define _GNU_SOURCE
             #define MINICORO_IMPL
             #include "minicoro.h"
             #include "runtime.c"

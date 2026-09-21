@@ -21,6 +21,12 @@
 #ifndef BLORP_BUILD_STAMP_TARGET
 #define BLORP_BUILD_STAMP_TARGET "unknown"
 #endif
+#ifndef BLORP_BUILD_STAMP_CHANNEL
+#define BLORP_BUILD_STAMP_CHANNEL "unknown"
+#endif
+#ifndef BLORP_BUILD_STAMP_DIRTY
+#define BLORP_BUILD_STAMP_DIRTY "unknown"
+#endif
 #ifndef BLORP_BUILD_STAMP_COMPILED_BY
 #define BLORP_BUILD_STAMP_COMPILED_BY "unknown"
 #endif
@@ -43,6 +49,14 @@ blorp_String *blorp_build_stamp_commit(void) {
 
 blorp_String *blorp_build_stamp_target(void) {
     return blorp_string_create(BLORP_BUILD_STAMP_TARGET);
+}
+
+blorp_String *blorp_build_stamp_channel(void) {
+    return blorp_string_create(BLORP_BUILD_STAMP_CHANNEL);
+}
+
+blorp_String *blorp_build_stamp_dirty(void) {
+    return blorp_string_create(BLORP_BUILD_STAMP_DIRTY);
 }
 
 blorp_String *blorp_build_stamp_compiled_by(void) {

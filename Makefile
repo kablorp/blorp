@@ -41,7 +41,8 @@ BLORP_CLI_EMBEDDED_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/embedded-inputs.sha2
 BLORP_CLI_MANIFEST_TOOL := scripts/blorp-cli-embedded-manifest
 BLORP_CLI_RUNTIME_SOURCES_C := $(BLORP_CLI_BUILD_DIR)/runtime_sources.c
 BLORP_CLI_RUNTIME_OBJECT := $(BLORP_CLI_BUILD_DIR)/runtime-$(BLORP_CLI_RUNTIME_CONFIG_HASH).o
-# Build facts (commit, target, compiled_by, optimization, split) reported by
+# Build facts (commit, target, channel, dirty, compiled_by, optimization,
+# split, cc) reported by
 # `blorp --version`. Compiled from a single small C file so a changed commit
 # relinks the CLI without recompiling the generated compiler C or any split
 # translation unit; see BLORP_CLI_LINK_INPUT_HASH below for the cache that
@@ -215,6 +216,17 @@ $(BLORP_CLI_BUILD_STAMP_OBJECT): blorp-cli-build-stamp-force $(BLORP_CLI_BUILD_S
 			commit="$$commit-dirty"; \
 		fi; \
 	fi; \
+	channel=$${BLORP_BUILD_CHANNEL:-local}; \
+	dirty=$${BLORP_BUILD_DIRTY:-}; \
+	if [ -z "$$dirty" ]; then \
+		if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then \
+			dirty=unknown; \
+		elif [ -n "$$(git status --porcelain --untracked-files=no 2>/dev/null)" ]; then \
+			dirty=true; \
+		else \
+			dirty=false; \
+		fi; \
+	fi; \
 	target=$${BLORP_BUILD_TARGET:-}; \
 	if [ -z "$$target" ]; then \
 		target=$$(scripts/target-triple 2>/dev/null || echo unknown); \
@@ -238,6 +250,8 @@ $(BLORP_CLI_BUILD_STAMP_OBJECT): blorp-cli-build-stamp-force $(BLORP_CLI_BUILD_S
 	$(BLORP_CC) -O2 -fwrapv -pipe -w \
 		-DBLORP_BUILD_STAMP_COMMIT="\"$$commit\"" \
 		-DBLORP_BUILD_STAMP_TARGET="\"$$target\"" \
+		-DBLORP_BUILD_STAMP_CHANNEL="\"$$channel\"" \
+		-DBLORP_BUILD_STAMP_DIRTY="\"$$dirty\"" \
 		-DBLORP_BUILD_STAMP_COMPILED_BY="\"$$compiled_by\"" \
 		-DBLORP_BUILD_STAMP_CLI_OPTIMIZATION="\"$(BLORP_CLI_C_OPTIMIZATION)\"" \
 		-DBLORP_BUILD_STAMP_RUNTIME_OPTIMIZATION="\"$(BLORP_CLI_RUNTIME_C_OPTIMIZATION)\"" \
