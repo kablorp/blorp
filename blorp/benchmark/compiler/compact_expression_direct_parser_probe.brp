@@ -6,11 +6,29 @@
 --   bin/blorp run blorp/benchmark/compiler/compact_expression_direct_parser_probe.brp -- wide 128 100
 --   bin/blorp run blorp/benchmark/compiler/compact_expression_direct_parser_probe.brp -- malformed 128 100
 import:
+	../../src/compiler/stage_02_lex/lexer: lex
+	../../src/compiler/stage_02_lex/parse_diagnostic: ParseDiagnostic
 	../../src/compiler/stage_03_parse/compact_expression_product:
 		CompactDirectRootRequest,
 		compact_expression_direct_parse_checkpoint,
 		compact_expression_oracle_counts,
+		compact_expression_oracle_project,
 	../../src/compiler/stage_03_parse/language_parser: raw_expression_parser_checkpoint
+	../../src/compiler/stage_03_parse/parsed_ast:
+		ParsedExpr(
+			ParsedBinaryExpr,
+			ParsedBoolLiteralExpr,
+			ParsedCallExpr,
+			ParsedCharLiteralExpr,
+			ParsedFloatLiteralExpr,
+			ParsedIntLiteralExpr,
+			ParsedLogicalExpr,
+			ParsedMissingExpr,
+			ParsedNameExpr,
+			ParsedRangeExpr,
+			ParsedStringLiteralExpr,
+			ParsedUnaryExpr,
+		),
 	../../src/lib/source: SourceFile, source_cursor_at, source_file, source_location_for_file
 	memory: get_mem_stats, reset_mem_stats
 	string: parse_int
@@ -20,6 +38,26 @@ import:
 private DEFAULT_WIDTH: Int = 128
 
 private DEFAULT_ITERATIONS: Int = 100
+
+
+private struct BenchmarkExpressionObservation {
+	node_count: Int,
+	unary_count: Int,
+	call_count: Int,
+	argument_count: Int
+}
+
+
+private struct BenchmarkPreflight {
+	equivalent: Bool,
+	shape_valid: Bool,
+	node_count: Int,
+	unary_count: Int,
+	call_count: Int,
+	argument_count: Int,
+	actions_pushed: Int,
+	maximum_action_depth: Int
+}
 
 
 private pure func positive_argument(args: List[String], index: Int, default: Int) -> Int:
@@ -34,7 +72,7 @@ private pure func positive_argument(args: List[String], index: Int, default: Int
 
 private pure func workload_source(kind: String, width: Int) -> SourceFile:
 	text = if kind == "deep":
-		"-".repeat(width) + "alpha"
+		"- ".repeat(width) + "alpha"
 	else if kind == "wide" or kind == "malformed":
 		var call = "f("
 		var index: Int = 0
@@ -56,6 +94,257 @@ private pure func workload_source(kind: String, width: Int) -> SourceFile:
 	source_file("direct_probe.brp", "direct_probe", text)
 
 
+private pure func expression_observation(expr: ParsedExpr) -> BenchmarkExpressionObservation:
+	match expr:
+		ParsedUnaryExpr(_op, value, _span):
+			child = expression_observation(value)
+			{
+				node_count = child.node_count + 1,
+				unary_count = child.unary_count + 1,
+				call_count = child.call_count,
+				argument_count = child.argument_count
+			}
+		ParsedBinaryExpr(_op, left, right, _span):
+			left_observation = expression_observation(left)
+			right_observation = expression_observation(right)
+			{
+				node_count = left_observation.node_count + right_observation.node_count + 1,
+				unary_count = left_observation.unary_count + right_observation.unary_count,
+				call_count = left_observation.call_count + right_observation.call_count,
+				argument_count = left_observation.argument_count + right_observation.argument_count
+			}
+		ParsedLogicalExpr(_op, left, right, _span):
+			left_observation = expression_observation(left)
+			right_observation = expression_observation(right)
+			{
+				node_count = left_observation.node_count + right_observation.node_count + 1,
+				unary_count = left_observation.unary_count + right_observation.unary_count,
+				call_count = left_observation.call_count + right_observation.call_count,
+				argument_count = left_observation.argument_count + right_observation.argument_count
+			}
+		ParsedRangeExpr(left, right, _span):
+			left_observation = expression_observation(left)
+			right_observation = expression_observation(right)
+			{
+				node_count = left_observation.node_count + right_observation.node_count + 1,
+				unary_count = left_observation.unary_count + right_observation.unary_count,
+				call_count = left_observation.call_count + right_observation.call_count,
+				argument_count = left_observation.argument_count + right_observation.argument_count
+			}
+		ParsedCallExpr(callee, args, _span):
+			callee_observation = expression_observation(callee)
+			var node_count = callee_observation.node_count + 1
+			var unary_count = callee_observation.unary_count
+			var call_count = callee_observation.call_count + 1
+			var argument_count = callee_observation.argument_count + args.length()
+
+			for arg in args:
+				argument_observation = expression_observation(arg)
+				node_count += argument_observation.node_count
+				unary_count += argument_observation.unary_count
+				call_count += argument_observation.call_count
+				argument_count += argument_observation.argument_count
+
+			{
+				node_count = node_count,
+				unary_count = unary_count,
+				call_count = call_count,
+				argument_count = argument_count
+			}
+		_:
+			{
+				node_count = 1,
+				unary_count = 0,
+				call_count = 0,
+				argument_count = 0
+			}
+
+
+private pure func expressions_equal(left: ParsedExpr, right: ParsedExpr) -> Bool:
+	match (left, right):
+		(ParsedNameExpr(left_name), ParsedNameExpr(right_name)):
+			left_name.text == right_name.text and left_name.span == right_name.span
+		(ParsedIntLiteralExpr(left_text, left_span), ParsedIntLiteralExpr(right_text, right_span)):
+			left_text == right_text and left_span == right_span
+		(ParsedFloatLiteralExpr(left_text, left_span), ParsedFloatLiteralExpr(right_text, right_span)):
+			left_text == right_text and left_span == right_span
+		(ParsedStringLiteralExpr(left_text, left_form, left_span), ParsedStringLiteralExpr(right_text, right_form, right_span)):
+			left_text == right_text and left_form == right_form and left_span == right_span
+		(ParsedBoolLiteralExpr(left_value, left_span), ParsedBoolLiteralExpr(right_value, right_span)):
+			left_value == right_value and left_span == right_span
+		(ParsedCharLiteralExpr(left_value, left_span), ParsedCharLiteralExpr(right_value, right_span)):
+			left_value == right_value and left_span == right_span
+		(ParsedUnaryExpr(left_op, left_value, left_span), ParsedUnaryExpr(right_op, right_value, right_span)):
+			(
+				left_op == right_op
+				and expressions_equal(left_value, right_value)
+				and left_span == right_span
+			)
+		(ParsedBinaryExpr(left_op, left_lhs, left_rhs, left_span), ParsedBinaryExpr(right_op, right_lhs, right_rhs, right_span)):
+			(
+				left_op == right_op
+				and expressions_equal(left_lhs, right_lhs)
+				and expressions_equal(left_rhs, right_rhs)
+				and left_span == right_span
+			)
+		(ParsedLogicalExpr(left_op, left_lhs, left_rhs, left_span), ParsedLogicalExpr(right_op, right_lhs, right_rhs, right_span)):
+			(
+				left_op == right_op
+				and expressions_equal(left_lhs, right_lhs)
+				and expressions_equal(left_rhs, right_rhs)
+				and left_span == right_span
+			)
+		(ParsedRangeExpr(left_start, left_finish, left_span), ParsedRangeExpr(right_start, right_finish, right_span)):
+			(
+				expressions_equal(left_start, right_start)
+				and expressions_equal(left_finish, right_finish)
+				and left_span == right_span
+			)
+		(ParsedCallExpr(left_callee, left_args, left_span), ParsedCallExpr(right_callee, right_args, right_span)):
+			var equal = left_args.length() == right_args.length()
+			var index: Int = 0
+
+			while index < left_args.length() and equal:
+				match (left_args.get(index), right_args.get(index)):
+					(Some(left_arg), Some(right_arg)):
+						equal = expressions_equal(left_arg, right_arg)
+					_:
+						equal = False
+
+				index += 1
+
+			expressions_equal(left_callee, right_callee) and equal and left_span == right_span
+		(ParsedMissingExpr(left_span), ParsedMissingExpr(right_span)):
+			left_span == right_span
+		_:
+			False
+
+
+private pure func diagnostics_equal(
+	left: List[ParseDiagnostic],
+	right: List[ParseDiagnostic],
+) -> Bool:
+	var equal = left.length() == right.length()
+	var index: Int = 0
+
+	while index < left.length() and equal:
+		match (left.get(index), right.get(index)):
+			(Some(left_value), Some(right_value)):
+				equal = (
+					left_value.span == right_value.span
+					and left_value.message == right_value.message
+					and left_value.expected == right_value.expected
+					and left_value.help == right_value.help
+				)
+			_:
+				equal = False
+
+		index += 1
+
+	equal
+
+
+private pure func benchmark_preflight(
+	source: SourceFile,
+	kind: String,
+	width: Int,
+) -> BenchmarkPreflight:
+	header = source_location_for_file(
+		source,
+		source_cursor_at(source, 0),
+		source_cursor_at(source, 0),
+	)
+	baseline = raw_expression_parser_checkpoint(source, 0, 0, header)
+	request: CompactDirectRootRequest = {
+		index = 0,
+		min_precedence = 0,
+		header_span = header
+	}
+	baseline_observation = expression_observation(baseline.value)
+
+	match compact_expression_direct_parse_checkpoint(source, [request]):
+		Ok(checkpoint):
+			counts = compact_expression_oracle_counts(checkpoint.product)
+
+			match compact_expression_oracle_project(checkpoint.product):
+				Ok([projected]):
+					projected_observation = expression_observation(projected)
+
+					shape_valid = if kind == "deep":
+						(
+							baseline_observation.node_count == width + 1
+							and baseline_observation.unary_count == width
+							and counts.node_count == width + 1
+							and checkpoint.counts.maximum_action_depth == width + 3
+						)
+					else if kind == "wide" or kind == "malformed":
+						(
+							baseline_observation.node_count == width + 2
+							and baseline_observation.call_count == 1
+							and baseline_observation.argument_count == width
+							and counts.node_count == width + 2
+						)
+					else:
+						True
+
+					{
+						equivalent = (
+							checkpoint.end_indices == [baseline.index]
+							and diagnostics_equal(checkpoint.diagnostics, baseline.diagnostics)
+							and expressions_equal(projected, baseline.value)
+						),
+						shape_valid = shape_valid,
+						node_count = projected_observation.node_count,
+						unary_count = projected_observation.unary_count,
+						call_count = projected_observation.call_count,
+						argument_count = projected_observation.argument_count,
+						actions_pushed = checkpoint.counts.actions_pushed,
+						maximum_action_depth = checkpoint.counts.maximum_action_depth
+					}
+				_:
+					{
+						equivalent = False,
+						shape_valid = False,
+						node_count = -1,
+						unary_count = -1,
+						call_count = -1,
+						argument_count = -1,
+						actions_pushed = -1,
+						maximum_action_depth = -1
+					}
+		Err(_):
+			{
+				equivalent = False,
+				shape_valid = False,
+				node_count = -1,
+				unary_count = -1,
+				call_count = -1,
+				argument_count = -1,
+				actions_pushed = -1,
+				maximum_action_depth = -1
+			}
+
+
+private pure func observation_checksum(
+	observation: BenchmarkExpressionObservation,
+	end_index: Int,
+	diagnostic_count: Int,
+) -> Int:
+	observation.node_count * 31 + observation.unary_count * 37 + observation.call_count * 41 + observation.argument_count * 43 + end_index * 47 + diagnostic_count * 53
+
+
+private pure func lex_execute(source: SourceFile, iterations: Int) -> Int:
+	var checksum: Int = 0
+	var iteration: Int = 0
+
+	while iteration < iterations:
+		result = lex(source)
+		checksum += result.tokens.length() * 31 + result.diagnostics.length()
+		iteration += 1
+
+	checksum
+
+
 private pure func baseline_execute(source: SourceFile, iterations: Int) -> Int:
 	header = source_location_for_file(
 		source,
@@ -67,13 +356,17 @@ private pure func baseline_execute(source: SourceFile, iterations: Int) -> Int:
 
 	while iteration < iterations:
 		checkpoint = raw_expression_parser_checkpoint(source, 0, 0, header)
-		checksum += checkpoint.index + checkpoint.diagnostics.length()
+		checksum += observation_checksum(
+			expression_observation(checkpoint.value),
+			checkpoint.index,
+			checkpoint.diagnostics.length(),
+		)
 		iteration += 1
 
 	checksum
 
 
-private pure func direct_execute(source: SourceFile, iterations: Int) -> Int:
+private pure func direct_product_execute(source: SourceFile, iterations: Int) -> Int:
 	header = source_location_for_file(
 		source,
 		source_cursor_at(source, 0),
@@ -91,10 +384,44 @@ private pure func direct_execute(source: SourceFile, iterations: Int) -> Int:
 		match compact_expression_direct_parse_checkpoint(source, [request]):
 			Ok(checkpoint):
 				counts = compact_expression_oracle_counts(checkpoint.product)
-				checksum += checkpoint.end_indices.get_or(
+				checksum += counts.node_count * 31 + checkpoint.end_indices.get_or(
 					0,
 					-1,
-				) + checkpoint.diagnostics.length() + counts.node_count
+				) * 47 + checkpoint.diagnostics.length() * 53
+			Err(_):
+				checksum = -1
+
+		iteration += 1
+
+	checksum
+
+
+private pure func direct_consumed_execute(source: SourceFile, iterations: Int) -> Int:
+	header = source_location_for_file(
+		source,
+		source_cursor_at(source, 0),
+		source_cursor_at(source, 0),
+	)
+	request: CompactDirectRootRequest = {
+		index = 0,
+		min_precedence = 0,
+		header_span = header
+	}
+	var checksum: Int = 0
+	var iteration: Int = 0
+
+	while iteration < iterations:
+		match compact_expression_direct_parse_checkpoint(source, [request]):
+			Ok(checkpoint):
+				match compact_expression_oracle_project(checkpoint.product):
+					Ok([projected]):
+						checksum += observation_checksum(
+							expression_observation(projected),
+							checkpoint.end_indices.get_or(0, -1),
+							checkpoint.diagnostics.length(),
+						)
+					_:
+						checksum = -1
 			Err(_):
 				checksum = -1
 
@@ -108,8 +435,17 @@ func main(args: List[String]) -> Int:
 	width = positive_argument(args, 2, DEFAULT_WIDTH)
 	iterations = positive_argument(args, 3, DEFAULT_ITERATIONS)
 	source = workload_source(kind, width)
+	preflight = benchmark_preflight(source, kind, width)
+	lex_warmup = lex_execute(source, 1)
 	baseline_warmup = baseline_execute(source, 1)
-	direct_warmup = direct_execute(source, 1)
+	direct_product_warmup = direct_product_execute(source, 1)
+	direct_consumed_warmup = direct_consumed_execute(source, 1)
+
+	reset_mem_stats()
+	lex_started = now_microseconds()
+	lex_checksum = lex_execute(source, iterations)
+	lex_elapsed = now_microseconds() - lex_started
+	lex_memory = get_mem_stats()
 
 	reset_mem_stats()
 	baseline_started = now_microseconds()
@@ -118,16 +454,29 @@ func main(args: List[String]) -> Int:
 	baseline_memory = get_mem_stats()
 
 	reset_mem_stats()
-	direct_started = now_microseconds()
-	direct = direct_execute(source, iterations)
-	direct_elapsed = now_microseconds() - direct_started
-	direct_memory = get_mem_stats()
+	direct_product_started = now_microseconds()
+	direct_product = direct_product_execute(source, iterations)
+	direct_product_elapsed = now_microseconds() - direct_product_started
+	direct_product_memory = get_mem_stats()
+
+	reset_mem_stats()
+	direct_consumed_started = now_microseconds()
+	direct_consumed = direct_consumed_execute(source, iterations)
+	direct_consumed_elapsed = now_microseconds() - direct_consumed_started
+	direct_consumed_memory = get_mem_stats()
 
 	print(
-		"COMPACT_DIRECT_PARSER" + " workload=" + kind + " width=" + width.to_string() + " iterations=" + iterations.to_string() + " baseline_us=" + baseline_elapsed.to_string() + " direct_us=" + direct_elapsed.to_string() + " baseline_allocations=" + baseline_memory.total_allocations.to_string() + " direct_allocations=" + direct_memory.total_allocations.to_string() + " baseline_releases=" + baseline_memory.total_releases.to_string() + " direct_releases=" + direct_memory.total_releases.to_string() + " baseline_live=" + baseline_memory.current_objects.to_string() + " direct_live=" + direct_memory.current_objects.to_string() + " baseline_checksum=" + baseline.to_string() + " direct_checksum=" + direct.to_string() + " warmup=" + (baseline_warmup + direct_warmup).to_string(),
+		"COMPACT_DIRECT_PARSER" + " workload=" + kind + " width=" + width.to_string() + " iterations=" + iterations.to_string() + " equivalent=" + preflight.equivalent.to_string() + " shape_valid=" + preflight.shape_valid.to_string() + " nodes=" + preflight.node_count.to_string() + " unary=" + preflight.unary_count.to_string() + " calls=" + preflight.call_count.to_string() + " arguments=" + preflight.argument_count.to_string() + " actions_pushed=" + preflight.actions_pushed.to_string() + " maximum_action_depth=" + preflight.maximum_action_depth.to_string() + " lex_us=" + lex_elapsed.to_string() + " baseline_us=" + baseline_elapsed.to_string() + " direct_product_us=" + direct_product_elapsed.to_string() + " direct_consumed_us=" + direct_consumed_elapsed.to_string() + " lex_allocations=" + lex_memory.total_allocations.to_string() + " baseline_allocations=" + baseline_memory.total_allocations.to_string() + " direct_product_allocations=" + direct_product_memory.total_allocations.to_string() + " direct_consumed_allocations=" + direct_consumed_memory.total_allocations.to_string() + " lex_releases=" + lex_memory.total_releases.to_string() + " baseline_releases=" + baseline_memory.total_releases.to_string() + " direct_product_releases=" + direct_product_memory.total_releases.to_string() + " direct_consumed_releases=" + direct_consumed_memory.total_releases.to_string() + " lex_live=" + lex_memory.current_objects.to_string() + " baseline_live=" + baseline_memory.current_objects.to_string() + " direct_product_live=" + direct_product_memory.current_objects.to_string() + " direct_consumed_live=" + direct_consumed_memory.current_objects.to_string() + " lex_checksum=" + lex_checksum.to_string() + " baseline_checksum=" + baseline.to_string() + " direct_product_checksum=" + direct_product.to_string() + " direct_consumed_checksum=" + direct_consumed.to_string() + " warmup=" + (lex_warmup + baseline_warmup + direct_product_warmup + direct_consumed_warmup).to_string(),
 	)
 
-	if baseline < 0 or direct < 0:
+	if (
+		not preflight.equivalent
+		or not preflight.shape_valid
+		or baseline < 0
+		or direct_product < 0
+		or direct_consumed < 0
+		or baseline != direct_consumed
+	):
 		1
 	else:
 		0

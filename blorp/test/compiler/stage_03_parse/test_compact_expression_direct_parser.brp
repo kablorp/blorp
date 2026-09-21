@@ -135,6 +135,16 @@ pure func diagnostics_equal(left: List[ParseDiagnostic], right: List[ParseDiagno
 	equal
 
 
+pure func unary_depth(expr: ParsedExpr) -> Int:
+	match expr:
+		ParsedUnaryExpr(_op, value, _span):
+			unary_depth(value) + 1
+		ParsedNameExpr(_name):
+			0
+		_:
+			-1
+
+
 pure func checkpoint_matches_production(text: String) -> Bool:
 	src = expression_source(text)
 	header = location(src, 0)
@@ -170,6 +180,38 @@ func test_scalar_frame_stack_reuses_retained_slots() -> Bool:
 		and probe.retained_slot_count == 4096
 		and probe.reuse_depth == 32
 	)
+
+
+func test_deep_unary_fixture_exercises_intended_shape() -> Bool:
+	depth: Int = 256
+	src = expression_source("- ".repeat(depth) + "alpha")
+	header = location(src, 0)
+	baseline = raw_expression_parser_checkpoint(src, 0, 0, header)
+	request: CompactDirectRootRequest = {
+		index = 0,
+		min_precedence = 0,
+		header_span = header
+	}
+
+	match compact_expression_direct_parse_checkpoint(src, [request]):
+		Ok(checkpoint):
+			counts = compact_expression_oracle_counts(checkpoint.product)
+
+			match compact_expression_oracle_project(checkpoint.product):
+				Ok([projected]):
+					(
+						unary_depth(baseline.value) == depth
+						and unary_depth(projected) == depth
+						and counts.node_count == depth + 1
+						and checkpoint.counts.maximum_action_depth == depth + 3
+						and checkpoint.end_indices == [baseline.index]
+						and diagnostics_equal(checkpoint.diagnostics, baseline.diagnostics)
+						and expressions_equal(projected, baseline.value)
+					)
+				_:
+					False
+		Err(_):
+			False
 
 
 func test_admitted_grammar_matches_production_parser() -> Bool:
@@ -318,6 +360,10 @@ tests: TestSuite = {
 	description = "Compact expression direct parser",
 	tests = [
 		("scalar frame stack reuses retained slots", test_scalar_frame_stack_reuses_retained_slots),
+		(
+			"deep unary fixture exercises intended shape",
+			test_deep_unary_fixture_exercises_intended_shape,
+		),
 		(
 			"admitted grammar matches production parser",
 			test_admitted_grammar_matches_production_parser,
