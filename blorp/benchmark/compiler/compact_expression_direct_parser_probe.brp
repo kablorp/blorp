@@ -88,6 +88,13 @@ private struct MultiRootPreflight {
 }
 
 
+private record ConsumedMultiRootResult {
+	indices: List[Int],
+	diagnostics: List[ParseDiagnostic],
+	values: List[ParsedExpr]
+}
+
+
 private pure func positive_argument(args: List[String], index: Int, default: Int) -> Int:
 	match args.get(index):
 		Some(text):
@@ -436,7 +443,7 @@ private pure func direct_product_multi_root_held(
 			}
 
 
-private pure func direct_consumed_multi_root_held(
+private pure func direct_overlap_multi_root_held(
 	fixture: MultiRootFixture,
 ) -> HeldMemoryObservation:
 	match compact_expression_direct_parse_checkpoint(fixture.source, fixture.direct_requests):
@@ -463,6 +470,52 @@ private pure func direct_consumed_multi_root_held(
 						valid = False
 					}
 		Err(_):
+			{
+				allocations = -1,
+				releases = -1,
+				retained_objects = -1,
+				retained_bytes = -1,
+				checksum = -1,
+				valid = False
+			}
+
+
+-- Return only the consumed observable value. The validated compact product is
+-- local to this helper and is released before its caller samples memory.
+private pure func direct_consume_multi_root(
+	fixture: MultiRootFixture,
+) -> Option[ConsumedMultiRootResult]:
+	match compact_expression_direct_parse_checkpoint(fixture.source, fixture.direct_requests):
+		Ok(checkpoint):
+			match compact_expression_oracle_project(checkpoint.product):
+				Ok(projected):
+					Some({
+						indices = checkpoint.end_indices,
+						diagnostics = checkpoint.diagnostics,
+						values = projected,
+					})
+				Err(_):
+					None
+		Err(_):
+			None
+
+
+private pure func direct_consumed_multi_root_held(
+	fixture: MultiRootFixture,
+) -> HeldMemoryObservation:
+	match direct_consume_multi_root(fixture):
+		Some(consumed):
+			held = get_mem_stats()
+			checksum = multi_root_checksum(consumed.values, consumed.indices)
+			{
+				allocations = held.total_allocations,
+				releases = held.total_releases,
+				retained_objects = held.current_objects,
+				retained_bytes = held.bytes_allocated,
+				checksum = checksum,
+				valid = consumed.values.length() == fixture.direct_requests.length()
+			}
+		None:
 			{
 				allocations = -1,
 				releases = -1,
@@ -672,11 +725,15 @@ private func run_multi_root(root_count: Int) -> Int:
 	direct_product_released = get_mem_stats()
 
 	reset_mem_stats()
+	direct_overlap = direct_overlap_multi_root_held(fixture)
+	direct_overlap_released = get_mem_stats()
+
+	reset_mem_stats()
 	direct_consumed = direct_consumed_multi_root_held(fixture)
 	direct_consumed_released = get_mem_stats()
 
 	print(
-		"COMPACT_DIRECT_MULTIROOT" + " roots=" + root_count.to_string() + " equivalent=" + preflight.equivalent.to_string() + " shape_valid=" + preflight.shape_valid.to_string() + " baseline_allocations=" + baseline.allocations.to_string() + " baseline_held_releases=" + baseline.releases.to_string() + " baseline_held_objects=" + baseline.retained_objects.to_string() + " baseline_held_bytes=" + baseline.retained_bytes.to_string() + " baseline_released_objects=" + baseline_released.current_objects.to_string() + " baseline_released_bytes=" + baseline_released.bytes_allocated.to_string() + " direct_product_allocations=" + direct_product.allocations.to_string() + " direct_product_held_releases=" + direct_product.releases.to_string() + " direct_product_held_objects=" + direct_product.retained_objects.to_string() + " direct_product_held_bytes=" + direct_product.retained_bytes.to_string() + " direct_product_released_objects=" + direct_product_released.current_objects.to_string() + " direct_product_released_bytes=" + direct_product_released.bytes_allocated.to_string() + " direct_consumed_allocations=" + direct_consumed.allocations.to_string() + " direct_consumed_held_releases=" + direct_consumed.releases.to_string() + " direct_consumed_held_objects=" + direct_consumed.retained_objects.to_string() + " direct_consumed_held_bytes=" + direct_consumed.retained_bytes.to_string() + " direct_consumed_released_objects=" + direct_consumed_released.current_objects.to_string() + " direct_consumed_released_bytes=" + direct_consumed_released.bytes_allocated.to_string() + " baseline_checksum=" + baseline.checksum.to_string() + " direct_product_checksum=" + direct_product.checksum.to_string() + " direct_consumed_checksum=" + direct_consumed.checksum.to_string(),
+		"COMPACT_DIRECT_MULTIROOT" + " roots=" + root_count.to_string() + " equivalent=" + preflight.equivalent.to_string() + " shape_valid=" + preflight.shape_valid.to_string() + " baseline_allocations=" + baseline.allocations.to_string() + " baseline_held_releases=" + baseline.releases.to_string() + " baseline_held_objects=" + baseline.retained_objects.to_string() + " baseline_held_bytes=" + baseline.retained_bytes.to_string() + " baseline_released_objects=" + baseline_released.current_objects.to_string() + " baseline_released_bytes=" + baseline_released.bytes_allocated.to_string() + " direct_product_allocations=" + direct_product.allocations.to_string() + " direct_product_held_releases=" + direct_product.releases.to_string() + " direct_product_held_objects=" + direct_product.retained_objects.to_string() + " direct_product_held_bytes=" + direct_product.retained_bytes.to_string() + " direct_product_released_objects=" + direct_product_released.current_objects.to_string() + " direct_product_released_bytes=" + direct_product_released.bytes_allocated.to_string() + " direct_overlap_allocations=" + direct_overlap.allocations.to_string() + " direct_overlap_held_releases=" + direct_overlap.releases.to_string() + " direct_overlap_held_objects=" + direct_overlap.retained_objects.to_string() + " direct_overlap_held_bytes=" + direct_overlap.retained_bytes.to_string() + " direct_overlap_released_objects=" + direct_overlap_released.current_objects.to_string() + " direct_overlap_released_bytes=" + direct_overlap_released.bytes_allocated.to_string() + " direct_consumed_allocations=" + direct_consumed.allocations.to_string() + " direct_consumed_held_releases=" + direct_consumed.releases.to_string() + " direct_consumed_held_objects=" + direct_consumed.retained_objects.to_string() + " direct_consumed_held_bytes=" + direct_consumed.retained_bytes.to_string() + " direct_consumed_released_objects=" + direct_consumed_released.current_objects.to_string() + " direct_consumed_released_bytes=" + direct_consumed_released.bytes_allocated.to_string() + " baseline_checksum=" + baseline.checksum.to_string() + " direct_product_checksum=" + direct_product.checksum.to_string() + " direct_overlap_checksum=" + direct_overlap.checksum.to_string() + " direct_consumed_checksum=" + direct_consumed.checksum.to_string(),
 	)
 
 	if (
@@ -684,13 +741,17 @@ private func run_multi_root(root_count: Int) -> Int:
 		or not preflight.shape_valid
 		or not baseline.valid
 		or not direct_product.valid
+		or not direct_overlap.valid
 		or not direct_consumed.valid
 		or baseline.checksum != preflight.checksum
+		or direct_overlap.checksum != preflight.checksum
 		or direct_consumed.checksum != preflight.checksum
 		or baseline_released.current_objects != 0
 		or baseline_released.bytes_allocated != 0
 		or direct_product_released.current_objects != 0
 		or direct_product_released.bytes_allocated != 0
+		or direct_overlap_released.current_objects != 0
+		or direct_overlap_released.bytes_allocated != 0
 		or direct_consumed_released.current_objects != 0
 		or direct_consumed_released.bytes_allocated != 0
 	):

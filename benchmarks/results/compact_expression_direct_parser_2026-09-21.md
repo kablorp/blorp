@@ -77,18 +77,25 @@ projected AST order and spans, and full diagnostic identity.
 Fixture, source, and request construction occur before each memory epoch. Each
 screen captures managed objects and bytes while the result is held, then again
 after the result is released. `direct_product` holds only the validated product;
-`direct_consumed` holds both that product and its projected `ParsedExpr` roots.
+`direct_overlap` holds both that product and its projected `ParsedExpr` roots.
+`direct_consumed` calls a consuming helper that returns only roots, cursors, and
+diagnostics, then samples in the caller after the compact product is released.
 
 ```text
-COMPACT_DIRECT_MULTIROOT roots=1 equivalent=True shape_valid=True baseline_allocations=28 baseline_held_releases=22 baseline_held_objects=6 baseline_held_bytes=448 baseline_released_objects=0 baseline_released_bytes=0 direct_product_allocations=64 direct_product_held_releases=55 direct_product_held_objects=9 direct_product_held_bytes=1224 direct_product_released_objects=0 direct_product_released_bytes=0 direct_consumed_allocations=70 direct_consumed_held_releases=58 direct_consumed_held_objects=12 direct_consumed_held_bytes=1448 direct_consumed_released_objects=0 direct_consumed_released_bytes=0 baseline_checksum=168 direct_product_checksum=68 direct_consumed_checksum=168
-COMPACT_DIRECT_MULTIROOT roots=16 equivalent=True shape_valid=True baseline_allocations=182 baseline_held_releases=146 baseline_held_objects=36 baseline_held_bytes=2560 baseline_released_objects=0 baseline_released_bytes=0 direct_product_allocations=149 direct_product_held_releases=140 direct_product_held_objects=9 direct_product_held_bytes=2168 direct_product_released_objects=0 direct_product_released_bytes=0 direct_consumed_allocations=204 direct_consumed_held_releases=162 direct_consumed_held_objects=42 direct_consumed_held_bytes=4408 direct_consumed_released_objects=0 direct_consumed_released_bytes=0 baseline_checksum=19448 direct_product_checksum=1088 direct_consumed_checksum=19448
-COMPACT_DIRECT_MULTIROOT roots=128 equivalent=True shape_valid=True baseline_allocations=1309 baseline_held_releases=1049 baseline_held_objects=260 baseline_held_bytes=18656 baseline_released_objects=0 baseline_released_bytes=0 direct_product_allocations=725 direct_product_held_releases=716 direct_product_held_objects=9 direct_product_held_bytes=11064 direct_product_released_objects=0 direct_product_released_bytes=0 direct_consumed_allocations=1122 direct_consumed_held_releases=856 direct_consumed_held_objects=266 direct_consumed_held_bytes=28520 direct_consumed_released_objects=0 direct_consumed_released_bytes=0 baseline_checksum=2370496 direct_product_checksum=8704 direct_consumed_checksum=2370496
+COMPACT_DIRECT_MULTIROOT roots=1 equivalent=True shape_valid=True baseline_allocations=28 baseline_held_releases=22 baseline_held_objects=6 baseline_held_bytes=448 baseline_released_objects=0 baseline_released_bytes=0 direct_product_allocations=64 direct_product_held_releases=55 direct_product_held_objects=9 direct_product_held_bytes=1224 direct_product_released_objects=0 direct_product_released_bytes=0 direct_overlap_allocations=70 direct_overlap_held_releases=58 direct_overlap_held_objects=12 direct_overlap_held_bytes=1448 direct_overlap_released_objects=0 direct_overlap_released_bytes=0 direct_consumed_allocations=71 direct_consumed_held_releases=65 direct_consumed_held_objects=6 direct_consumed_held_bytes=448 direct_consumed_released_objects=0 direct_consumed_released_bytes=0 baseline_checksum=168 direct_product_checksum=68 direct_overlap_checksum=168 direct_consumed_checksum=168
+COMPACT_DIRECT_MULTIROOT roots=16 equivalent=True shape_valid=True baseline_allocations=182 baseline_held_releases=146 baseline_held_objects=36 baseline_held_bytes=2560 baseline_released_objects=0 baseline_released_bytes=0 direct_product_allocations=149 direct_product_held_releases=140 direct_product_held_objects=9 direct_product_held_bytes=2168 direct_product_released_objects=0 direct_product_released_bytes=0 direct_overlap_allocations=204 direct_overlap_held_releases=162 direct_overlap_held_objects=42 direct_overlap_held_bytes=4408 direct_overlap_released_objects=0 direct_overlap_released_bytes=0 direct_consumed_allocations=205 direct_consumed_held_releases=169 direct_consumed_held_objects=36 direct_consumed_held_bytes=2560 direct_consumed_released_objects=0 direct_consumed_released_bytes=0 baseline_checksum=19448 direct_product_checksum=1088 direct_overlap_checksum=19448 direct_consumed_checksum=19448
+COMPACT_DIRECT_MULTIROOT roots=128 equivalent=True shape_valid=True baseline_allocations=1309 baseline_held_releases=1049 baseline_held_objects=260 baseline_held_bytes=18656 baseline_released_objects=0 baseline_released_bytes=0 direct_product_allocations=725 direct_product_held_releases=716 direct_product_held_objects=9 direct_product_held_bytes=11064 direct_product_released_objects=0 direct_product_released_bytes=0 direct_overlap_allocations=1122 direct_overlap_held_releases=856 direct_overlap_held_objects=266 direct_overlap_held_bytes=28520 direct_overlap_released_objects=0 direct_overlap_released_bytes=0 direct_consumed_allocations=1123 direct_consumed_held_releases=863 direct_consumed_held_objects=260 direct_consumed_held_bytes=18656 direct_consumed_released_objects=0 direct_consumed_released_bytes=0 baseline_checksum=2370496 direct_product_checksum=8704 direct_overlap_checksum=2370496 direct_consumed_checksum=2370496
 ```
 
 At 16 and 128 roots, the held validated product uses fewer managed bytes than
-the baseline AST batch. Holding both product and projection uses more managed
-bytes than baseline. Every path returns to zero epoch objects and bytes after
-release. These are retained managed-byte snapshots, not peak measurements:
+the baseline AST batch. The overlap snapshot uses more managed bytes than
+baseline, while the true post-consumption snapshot exactly matches baseline
+held objects and bytes at every size. Generated C confirms the compact
+checkpoint result is released in the consuming helper before its caller invokes
+`get_mem_stats`; the retained evidence is in
+`/tmp/blorp-compact-consumed-final.mGjEo0/consumed_probe.c`. Every path returns
+to zero epoch objects and bytes after release. These are retained managed-byte
+snapshots, not peak measurements:
 the existing `MemStats` API has no peak watermark, and its byte field does not
 represent RSS, allocator slack, or untracked raw buffers. Retired instructions
 were also unavailable and were not estimated.
@@ -121,8 +128,9 @@ Hashes:
 - raw parser seam: `83ce0fb04b671ee1c526b0531ea74e2c989b215ab659455588303ee2b2f6d056`;
 - differential test: `5006dc5382457246c591278372e068f28425d2d93de98729254e4eec876f2385`;
 - frame probe: `8da703e944ec8a86adde9cccc7c68d9fa0d4a13ba4779aa1921d2a0a2e722d4f`;
-- parser probe: `e94817ca7ba9ec98aa4351ca0106063b4d1bc08d1a3c80fc18b75336b79c42cc`;
-- generated frame-probe C: `ea9529e1d63407ad69d427452b88d29beda1b0ea3b443bbb2588dbe8139a4c02`.
+- parser probe: `113899bced333801b43db2d0e00b7a1a48e80f33b88995bcc7957f597d2f57b8`;
+- generated frame-probe C: `ea9529e1d63407ad69d427452b88d29beda1b0ea3b443bbb2588dbe8139a4c02`;
+- generated consuming-probe C: `245a9fd07b58bbb7187b64142c84843a64ddb7b2c31c2aa3a238ad4ad0b69255`.
 
 Recommendation: keep this as a corrected, measured test-only checkpoint and
 do not change production wiring. The corrected results distinguish a promising
