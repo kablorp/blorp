@@ -61,6 +61,7 @@ import:
 			ParsedIntLiteralExpr,
 			ParsedListExpr,
 			ParsedLogicalExpr,
+			ParsedMatchExpr,
 			ParsedMissingExpr,
 			ParsedNameExpr,
 			ParsedOpaqueFromExpr,
@@ -84,7 +85,24 @@ import:
 		),
 		ParsedForBinder(ParsedForNameBinder, ParsedForTupleBinder),
 		ParsedIdentifier,
+		ParsedListPatternSpread(ParsedListSpreadName, ParsedListSpreadWildcard),
 		ParsedLogicalOp(ParsedAndOp, ParsedOrOp),
+		ParsedMatchCase,
+		ParsedPattern(
+			ParsedBoolPattern,
+			ParsedCharPattern,
+			ParsedConstructorPattern,
+			ParsedFloatPattern,
+			ParsedIntPattern,
+			ParsedListPattern,
+			ParsedMissingPattern,
+			ParsedNamePattern,
+			ParsedOrPattern,
+			ParsedQualifiedConstructorPattern,
+			ParsedStringPattern,
+			ParsedTuplePattern,
+			ParsedWildcardPattern,
+		),
 		ParsedRecordExprField,
 		ParsedStringInterpolationPart(ParsedInterpolationExpr, ParsedInterpolationLiteral),
 		ParsedStringLiteralForm,
@@ -153,6 +171,25 @@ enum CompactExpressionNodeKind:
 	CompactWhileNode
 	CompactForNameNode
 	CompactForTupleNode
+	CompactMatchNode
+
+
+enum CompactPatternNodeKind:
+	CompactWildcardPatternNode
+	CompactNamePatternNode
+	CompactIntPatternNode
+	CompactFloatPatternNode
+	CompactStringPatternNode
+	CompactCharPatternNode
+	CompactBoolPatternNode
+	CompactConstructorPatternNode
+	CompactQualifiedConstructorPatternNode
+	CompactTuplePatternNode
+	CompactListPatternNode
+	CompactListNameSpreadPatternNode
+	CompactListWildcardSpreadPatternNode
+	CompactOrPatternNode
+	CompactMissingPatternNode
 
 
 enum CompactExpressionOperator:
@@ -235,6 +272,15 @@ enum CompactExpressionCorruption:
 	CompactForBinderSliceOutOfRange
 	CompactForBinderSliceAlias
 	CompactIdentifierSliceForeignSourceOwner
+	CompactPatternChildBackEdge
+	CompactPatternSharedChild
+	CompactPatternOrphanNode
+	CompactPatternPayloadFamilyMismatch
+	CompactPatternIdentifierSliceAlias
+	CompactPatternIdentifierSliceOutOfRange
+	CompactPatternIdentifierSliceForeignSourceOwner
+	CompactPatternRootAlias
+	CompactMatchCaseBindingCountMismatch
 
 
 struct CompactProductSourceLocation {
@@ -372,6 +418,35 @@ struct CompactTypedBinderRow {
 }
 
 
+struct CompactPatternNodeRow {
+	kind: CompactPatternNodeKind,
+	payload_index: Int,
+	child_start: Int,
+	child_count: Int,
+	span: CompactProductSourceLocation
+}
+
+
+struct CompactPatternIdentifierSliceRow {
+	identifier_start: Int,
+	identifier_count: Int,
+	span: CompactProductSourceLocation
+}
+
+
+struct CompactPatternIdentifierRow {
+	text_index: Int,
+	span: CompactProductSourceLocation
+}
+
+
+struct CompactMatchCaseRow {
+	pattern_root_index: Int,
+	binding_count: Int,
+	span: CompactProductSourceLocation
+}
+
+
 struct CompactUnitPayloadRow {
 	kind: CompactUnitPayloadKind
 }
@@ -403,6 +478,11 @@ private record CompactExpressionProductRep {
 	control_identifiers: List[CompactControlIdentifierRow],
 	identifier_slices: List[CompactIdentifierSliceRow],
 	typed_binders: List[CompactTypedBinderRow],
+	pattern_nodes: List[CompactPatternNodeRow],
+	pattern_children: List[Int],
+	pattern_identifier_slices: List[CompactPatternIdentifierSliceRow],
+	pattern_identifiers: List[CompactPatternIdentifierRow],
+	match_cases: List[CompactMatchCaseRow],
 	unit_payloads: List[CompactUnitPayloadRow],
 	roots: List[Int]
 }
@@ -437,6 +517,11 @@ record CompactExpressionProductCounts {
 	control_identifier_count: Int,
 	identifier_slice_count: Int,
 	typed_binder_count: Int,
+	pattern_node_count: Int,
+	pattern_child_count: Int,
+	pattern_identifier_slice_count: Int,
+	pattern_identifier_count: Int,
+	match_case_count: Int,
 	unit_payload_count: Int,
 	root_count: Int
 }
@@ -477,6 +562,14 @@ private union CompactBuildAction:
 	CompactBuildTypedBinder(CompactExpressionNodeKind, ParsedIdentifier, Bool, SourceLocation)
 	CompactBuildIdentifier(CompactExpressionNodeKind, ParsedIdentifier, Int, SourceLocation)
 	CompactBuildIdentifierSlice(CompactExpressionNodeKind, List[ParsedIdentifier], Int, SourceLocation, SourceLocation)
+	CompactBuildMatch(List[ParsedMatchCase], SourceLocation)
+	CompactBuildPatternVisit(ParsedPattern)
+	CompactBuildPatternNoPayload(CompactPatternNodeKind, Int, SourceLocation)
+	CompactBuildPatternText(CompactPatternNodeKind, String, SourceLocation)
+	CompactBuildPatternString(String, ParsedStringLiteralForm, SourceLocation)
+	CompactBuildPatternChar(Int, SourceLocation)
+	CompactBuildPatternBool(Bool, SourceLocation)
+	CompactBuildPatternIdentifiers(CompactPatternNodeKind, List[ParsedIdentifier], Int, SourceLocation, SourceLocation)
 	CompactBuildTypeVisit(ParsedTypeExpr)
 	CompactBuildTypeIdentifiers(CompactTypeNodeKind, List[ParsedIdentifier], Int, SourceLocation)
 	CompactBuildTypeText(CompactTypeNodeKind, String, SourceLocation)
@@ -487,6 +580,8 @@ private union CompactReferenceAction:
 	CompactReferenceVisit(Int)
 	CompactReferenceEnterIdentifier(Int)
 	CompactReferenceEnterIdentifierSlice(Int)
+	CompactReferenceEnterPatternNode(Int)
+	CompactReferenceEnterPatternIdentifiers(Int)
 	CompactReferenceLeaveBindings(Int)
 
 
@@ -722,7 +817,7 @@ private pure func compact_expected_child_count(
 			None
 		CompactFinalizedInterpolationNode:
 			None
-		CompactBlockNode | CompactSubscriptAssignNode | CompactIfNode:
+		CompactBlockNode | CompactSubscriptAssignNode | CompactIfNode | CompactMatchNode:
 			None
 		CompactAscriptionNode | CompactOpaqueIntoNode | CompactOpaqueFromNode:
 			Some(1)
@@ -777,6 +872,37 @@ private pure func compact_type_identifier_count_is_valid(
 			False
 
 
+private pure func compact_pattern_exact_child_count(kind: CompactPatternNodeKind) -> Option[Int]:
+	match kind:
+		CompactWildcardPatternNode | CompactNamePatternNode | CompactIntPatternNode | CompactFloatPatternNode | CompactStringPatternNode | CompactCharPatternNode | CompactBoolPatternNode | CompactMissingPatternNode:
+			Some(0)
+		_:
+			None
+
+
+private pure func compact_pattern_uses_identifier_slice(kind: CompactPatternNodeKind) -> Bool:
+	match kind:
+		CompactNamePatternNode | CompactConstructorPatternNode | CompactQualifiedConstructorPatternNode | CompactListNameSpreadPatternNode | CompactListWildcardSpreadPatternNode:
+			True
+		_:
+			False
+
+
+private pure func compact_pattern_identifier_count_is_valid(
+	kind: CompactPatternNodeKind,
+	count: Int,
+) -> Bool:
+	match kind:
+		CompactNamePatternNode | CompactConstructorPatternNode | CompactListNameSpreadPatternNode:
+			count == 1
+		CompactQualifiedConstructorPatternNode:
+			count == 2
+		CompactListWildcardSpreadPatternNode:
+			count == 0
+		_:
+			False
+
+
 private pure func compact_source_span_is_valid(
 	sources: List[SourceFile],
 	span: CompactProductSourceLocation,
@@ -821,6 +947,13 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 		var control_identifier_owners = 0.repeat(rep.control_identifiers.length())
 		var identifier_slice_owners = 0.repeat(rep.identifier_slices.length())
 		var typed_binder_owners = 0.repeat(rep.typed_binders.length())
+		var pattern_parent_count = 0.repeat(rep.pattern_nodes.length())
+		var pattern_root_membership = False.repeat(rep.pattern_nodes.length())
+		var pattern_child_slot_owners = 0.repeat(rep.pattern_children.length())
+		var pattern_identifier_slice_owners = 0.repeat(rep.pattern_identifier_slices.length())
+		var pattern_identifier_owners = 0.repeat(rep.pattern_identifiers.length())
+		var match_case_slot_owners = 0.repeat(rep.match_cases.length())
+		var validated_pattern_binding_counts = 0.repeat(rep.pattern_nodes.length())
 		var unit_owners = 0.repeat(rep.unit_payloads.length())
 
 		for root in rep.roots:
@@ -936,6 +1069,15 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 									valid = (
 										node.payload_index >= 0
 										and node.payload_index < rep.identifier_slices.length()
+									)
+								CompactMatchNode:
+									valid = (
+										node.child_count >= 1
+										and compact_metadata_slice_is_valid(
+											node.payload_index,
+											node.child_count - 1,
+											rep.match_cases.length(),
+										)
 									)
 								_:
 									valid = False
@@ -1260,6 +1402,42 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 						CompactBlockNode | CompactSubscriptAssignNode | CompactIfNode | CompactDebugBlockNode | CompactWhileNode:
 							if node.payload_index != NO_COMPACT_PAYLOAD_INDEX:
 								valid = False
+						CompactMatchNode:
+							var case_offset: Int = 0
+
+							while case_offset < node.child_count - 1 and valid:
+								case_slot = node.payload_index + case_offset
+
+								match rep.match_cases.get(case_slot):
+									Some(case):
+										if (
+											not compact_source_span_is_valid(
+												rep.source_owners,
+												case.span,
+											)
+											or case.pattern_root_index < 0
+											or case.pattern_root_index >= rep.pattern_nodes.length()
+											or case.binding_count < 0
+											or pattern_root_membership
+												.get(case.pattern_root_index)
+												.get_or(False)
+										):
+											valid = False
+										else:
+											pattern_root_membership = pattern_root_membership.set(
+												case.pattern_root_index,
+												True,
+											)
+											match_case_slot_owners = match_case_slot_owners.set(
+												case_slot,
+												match_case_slot_owners
+													.get(case_slot)
+													.get_or(0) + 1,
+											)
+									None:
+										valid = False
+
+								case_offset += 1
 						CompactImmutableVarDeclNode | CompactMutableVarDeclNode | CompactQuestionBindNode:
 							match rep.typed_binders.get(node.payload_index):
 								Some(payload):
@@ -1496,6 +1674,225 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 
 			type_node_index += 1
 
+		var pattern_node_index: Int = 0
+
+		while pattern_node_index < rep.pattern_nodes.length() and valid:
+			match rep.pattern_nodes.get(pattern_node_index):
+				Some(node):
+					if not compact_source_span_is_valid(rep.source_owners, node.span):
+						valid = False
+
+					if not compact_metadata_slice_is_valid(
+						node.child_start,
+						node.child_count,
+						rep.pattern_children.length(),
+					):
+						valid = False
+
+					match compact_pattern_exact_child_count(node.kind):
+						Some(expected):
+							if node.child_count != expected:
+								valid = False
+						None:
+							void
+
+					var binding_count: Int = 0
+					var child_offset: Int = 0
+
+					while child_offset < node.child_count and valid:
+						child_slot = node.child_start + child_offset
+
+						match rep.pattern_children.get(child_slot):
+							Some(child):
+								if child < 0 or child >= pattern_node_index:
+									valid = False
+								else:
+									pattern_parent_count = pattern_parent_count.set(
+										child,
+										pattern_parent_count
+											.get(child)
+											.get_or(0) + 1,
+									)
+									pattern_child_slot_owners = pattern_child_slot_owners.set(
+										child_slot,
+										pattern_child_slot_owners
+											.get(child_slot)
+											.get_or(0) + 1,
+									)
+									binding_count += validated_pattern_binding_counts
+										.get(child)
+										.get_or(0)
+							None:
+								valid = False
+
+						child_offset += 1
+
+					if compact_pattern_uses_identifier_slice(node.kind):
+						match rep.pattern_identifier_slices.get(node.payload_index):
+							Some(payload):
+								if (
+									not compact_metadata_slice_is_valid(
+										payload.identifier_start,
+										payload.identifier_count,
+										rep.pattern_identifiers.length(),
+									)
+									or not compact_pattern_identifier_count_is_valid(
+										node.kind,
+										payload.identifier_count,
+									)
+									or not compact_source_span_is_valid(
+										rep.source_owners,
+										payload.span,
+									)
+								):
+									valid = False
+								else:
+									pattern_identifier_slice_owners = pattern_identifier_slice_owners.set(
+										node.payload_index,
+										pattern_identifier_slice_owners
+											.get(node.payload_index)
+											.get_or(0) + 1,
+									)
+									var identifier_offset: Int = 0
+
+									while identifier_offset < payload.identifier_count and valid:
+										identifier_slot = payload.identifier_start + identifier_offset
+
+										match rep.pattern_identifiers.get(identifier_slot):
+											Some(identifier):
+												if (
+													not compact_source_span_is_valid(
+														rep.source_owners,
+														identifier.span,
+													)
+													or identifier.text_index < 0
+													or identifier.text_index >= rep.texts.length()
+												):
+													valid = False
+												else:
+													pattern_identifier_owners = pattern_identifier_owners.set(
+														identifier_slot,
+														pattern_identifier_owners
+															.get(identifier_slot)
+															.get_or(0) + 1,
+													)
+													owned_text_indices = owned_text_indices.set(
+														identifier.text_index,
+														owned_text_indices
+															.get(identifier.text_index)
+															.get_or(0) + 1,
+													)
+											None:
+												valid = False
+
+										identifier_offset += 1
+
+									if (
+										node.kind == CompactNamePatternNode
+										or node.kind == CompactListNameSpreadPatternNode
+									):
+										binding_count += 1
+							None:
+								valid = False
+					else:
+						match node.kind:
+							CompactIntPatternNode | CompactFloatPatternNode:
+								match rep.text_payloads.get(node.payload_index):
+									Some(payload):
+										if (
+											payload.text_index < 0
+											or payload.text_index >= rep.texts.length()
+										):
+											valid = False
+										else:
+											text_owners = text_owners.set(
+												node.payload_index,
+												text_owners
+													.get(node.payload_index)
+													.get_or(0) + 1,
+											)
+											owned_text_indices = owned_text_indices.set(
+												payload.text_index,
+												owned_text_indices
+													.get(payload.text_index)
+													.get_or(0) + 1,
+											)
+									None:
+										valid = False
+							CompactStringPatternNode:
+								match rep.string_payloads.get(node.payload_index):
+									Some(payload):
+										if (
+											payload.text_index < 0
+											or payload.text_index >= rep.texts.length()
+										):
+											valid = False
+										else:
+											string_owners = string_owners.set(
+												node.payload_index,
+												string_owners
+													.get(node.payload_index)
+													.get_or(0) + 1,
+											)
+											owned_text_indices = owned_text_indices.set(
+												payload.text_index,
+												owned_text_indices
+													.get(payload.text_index)
+													.get_or(0) + 1,
+											)
+									None:
+										valid = False
+							CompactCharPatternNode:
+								if (
+									node.payload_index < 0
+									or node.payload_index >= char_owners.length()
+								):
+									valid = False
+								else:
+									char_owners = char_owners.set(node.payload_index, char_owners
+											.get(node.payload_index)
+											.get_or(0) + 1)
+							CompactBoolPatternNode:
+								if (
+									node.payload_index < 0
+									or node.payload_index >= bool_owners.length()
+								):
+									valid = False
+								else:
+									bool_owners = bool_owners.set(node.payload_index, bool_owners
+											.get(node.payload_index)
+											.get_or(0) + 1)
+							CompactWildcardPatternNode | CompactTuplePatternNode | CompactListPatternNode | CompactOrPatternNode | CompactMissingPatternNode:
+								if node.payload_index != NO_COMPACT_PAYLOAD_INDEX:
+									valid = False
+							_:
+								valid = False
+
+					validated_pattern_binding_counts = validated_pattern_binding_counts.set(
+						pattern_node_index,
+						binding_count,
+					)
+				None:
+					valid = False
+
+			pattern_node_index += 1
+
+		var match_case_index: Int = 0
+
+		while match_case_index < rep.match_cases.length() and valid:
+			match rep.match_cases.get(match_case_index):
+				Some(case):
+					if (
+						case.binding_count != validated_pattern_binding_counts
+							.get(case.pattern_root_index)
+							.get_or(-1)
+					):
+						valid = False
+				None:
+					valid = False
+
+			match_case_index += 1
+
 		var control_identifier_index: Int = 0
 
 		while control_identifier_index < rep.control_identifiers.length() and valid:
@@ -1543,6 +1940,18 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 					.get_or(False)
 				valid = is_root and parents == 0 or not is_root and parents == 1
 				type_index += 1
+
+			var pattern_index: Int = 0
+
+			while pattern_index < rep.pattern_nodes.length() and valid:
+				parents = pattern_parent_count
+					.get(pattern_index)
+					.get_or(-1)
+				is_root = pattern_root_membership
+					.get(pattern_index)
+					.get_or(False)
+				valid = is_root and parents == 0 or not is_root and parents == 1
+				pattern_index += 1
 
 		if valid:
 			for owners in child_slot_owners:
@@ -1611,6 +2020,18 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 			for owners in typed_binder_owners:
 				valid = valid and owners == 1
 
+			for owners in pattern_child_slot_owners:
+				valid = valid and owners == 1
+
+			for owners in pattern_identifier_slice_owners:
+				valid = valid and owners == 1
+
+			for owners in pattern_identifier_owners:
+				valid = valid and owners == 1
+
+			for owners in match_case_slot_owners:
+				valid = valid and owners == 1
+
 			for owners in unit_owners:
 				valid = valid and owners == 1
 
@@ -1647,10 +2068,17 @@ pure func compact_expression_oracle_from_parsed_roots(
 	var control_identifiers: List[CompactControlIdentifierRow] = []
 	var identifier_slices: List[CompactIdentifierSliceRow] = []
 	var typed_binders: List[CompactTypedBinderRow] = []
+	var pattern_nodes: List[CompactPatternNodeRow] = []
+	var pattern_children: List[Int] = []
+	var pattern_identifier_slices: List[CompactPatternIdentifierSliceRow] = []
+	var pattern_identifiers: List[CompactPatternIdentifierRow] = []
+	var match_cases: List[CompactMatchCaseRow] = []
 	var unit_payloads: List[CompactUnitPayloadRow] = []
 	var actions: List[CompactBuildAction] = []
 	var values: List[Int] = []
 	var type_values: List[Int] = []
+	var pattern_values: List[Int] = []
+	var pattern_binding_counts: List[Int] = []
 	var supported = True
 
 	var root_index = roots.length() - 1
@@ -2083,6 +2511,22 @@ pure func compact_expression_oracle_from_parsed_roots(
 						actions = actions
 							.append(CompactBuildVisit(then_expr))
 							.append(CompactBuildVisit(condition))
+					ParsedMatchExpr(scrutinee, cases, span):
+						actions = actions.append(CompactBuildMatch(cases, span))
+						var case_index = cases.length() - 1
+
+						while case_index >= 0:
+							match cases.get(case_index):
+								Some(case):
+									actions = actions
+										.append(CompactBuildPatternVisit(case.pattern))
+										.append(CompactBuildVisit(case.body))
+								None:
+									supported = False
+
+							case_index -= 1
+
+						actions = actions.append(CompactBuildVisit(scrutinee))
 					ParsedDebugBlockExpr(body, span):
 						actions = actions
 							.append(CompactBuildSequence(CompactDebugBlockNode, 1, span))
@@ -2858,6 +3302,364 @@ pure func compact_expression_oracle_from_parsed_roots(
 						span = compact_source_location(span),
 					})
 					values = values.append(node_index)
+			Some(CompactBuildPatternVisit(pattern)):
+				match pattern:
+					ParsedWildcardPattern(span):
+						actions = actions.append(
+							CompactBuildPatternNoPayload(
+								CompactWildcardPatternNode,
+								0,
+								span,
+							),
+						)
+					ParsedNamePattern(name):
+						actions = actions.append(
+							CompactBuildPatternIdentifiers(
+								CompactNamePatternNode,
+								[name],
+								0,
+								name.span,
+								name.span,
+							),
+						)
+					ParsedIntPattern(text, span):
+						actions = actions.append(
+							CompactBuildPatternText(
+								CompactIntPatternNode,
+								text,
+								span,
+							),
+						)
+					ParsedFloatPattern(text, span):
+						actions = actions.append(
+							CompactBuildPatternText(
+								CompactFloatPatternNode,
+								text,
+								span,
+							),
+						)
+					ParsedStringPattern(text, form, span):
+						actions = actions.append(CompactBuildPatternString(text, form, span))
+					ParsedCharPattern(value, span):
+						actions = actions.append(CompactBuildPatternChar(value, span))
+					ParsedBoolPattern(value, span):
+						actions = actions.append(CompactBuildPatternBool(value, span))
+					ParsedConstructorPattern(name, args, span):
+						actions = actions.append(
+							CompactBuildPatternIdentifiers(
+								CompactConstructorPatternNode,
+								[name],
+								args.length(),
+								span,
+								span,
+							),
+						)
+						var index = args.length() - 1
+
+						while index >= 0:
+							match args.get(index):
+								Some(arg):
+									actions = actions.append(CompactBuildPatternVisit(arg))
+								None:
+									supported = False
+
+							index -= 1
+					ParsedQualifiedConstructorPattern(module_name, name, args, span):
+						actions = actions.append(
+							CompactBuildPatternIdentifiers(
+								CompactQualifiedConstructorPatternNode,
+								[module_name, name],
+								args.length(),
+								span,
+								span,
+							),
+						)
+						var index = args.length() - 1
+
+						while index >= 0:
+							match args.get(index):
+								Some(arg):
+									actions = actions.append(CompactBuildPatternVisit(arg))
+								None:
+									supported = False
+
+							index -= 1
+					ParsedTuplePattern(items, span):
+						actions = actions.append(
+							CompactBuildPatternNoPayload(
+								CompactTuplePatternNode,
+								items.length(),
+								span,
+							),
+						)
+						var index = items.length() - 1
+
+						while index >= 0:
+							match items.get(index):
+								Some(item):
+									actions = actions.append(CompactBuildPatternVisit(item))
+								None:
+									supported = False
+
+							index -= 1
+					ParsedListPattern(items, spread, span):
+						match spread:
+							Some(ParsedListSpreadName(name)):
+								actions = actions.append(
+									CompactBuildPatternIdentifiers(
+										CompactListNameSpreadPatternNode,
+										[name],
+										items.length(),
+										name.span,
+										span,
+									),
+								)
+							Some(ParsedListSpreadWildcard(spread_span)):
+								actions = actions.append(
+									CompactBuildPatternIdentifiers(
+										CompactListWildcardSpreadPatternNode,
+										[],
+										items.length(),
+										spread_span,
+										span,
+									),
+								)
+							None:
+								actions = actions.append(
+									CompactBuildPatternNoPayload(
+										CompactListPatternNode,
+										items.length(),
+										span,
+									),
+								)
+
+						var index = items.length() - 1
+
+						while index >= 0:
+							match items.get(index):
+								Some(item):
+									actions = actions.append(CompactBuildPatternVisit(item))
+								None:
+									supported = False
+
+							index -= 1
+					ParsedOrPattern(patterns, span):
+						actions = actions.append(
+							CompactBuildPatternNoPayload(
+								CompactOrPatternNode,
+								patterns.length(),
+								span,
+							),
+						)
+						var index = patterns.length() - 1
+
+						while index >= 0:
+							match patterns.get(index):
+								Some(item):
+									actions = actions.append(CompactBuildPatternVisit(item))
+								None:
+									supported = False
+
+							index -= 1
+					ParsedMissingPattern(span):
+						actions = actions.append(
+							CompactBuildPatternNoPayload(
+								CompactMissingPatternNode,
+								0,
+								span,
+							),
+						)
+			Some(CompactBuildPatternNoPayload(kind, child_count, span)):
+				if pattern_values.length() < child_count:
+					supported = False
+				else:
+					value_start = pattern_values.length() - child_count
+					child_start = pattern_children.length()
+					var binding_count: Int = 0
+					var value_index = value_start
+
+					while value_index < pattern_values.length():
+						child_id = pattern_values
+							.get(value_index)
+							.get_or(-1)
+						pattern_children = pattern_children.append(child_id)
+						binding_count += pattern_binding_counts
+							.get(child_id)
+							.get_or(0)
+						value_index += 1
+
+					pattern_values = pattern_values.take(value_start)
+					node_index = pattern_nodes.length()
+					pattern_nodes = pattern_nodes.append({
+						kind = kind,
+						payload_index = NO_COMPACT_PAYLOAD_INDEX,
+						child_start = child_start,
+						child_count = child_count,
+						span = compact_source_location(span),
+					})
+					pattern_binding_counts = pattern_binding_counts.append(binding_count)
+					pattern_values = pattern_values.append(node_index)
+			Some(CompactBuildPatternText(kind, text, span)):
+				text_index = texts.length()
+				texts = texts.append(text)
+				payload_index = text_payloads.length()
+				text_payloads = text_payloads.append({text_index = text_index})
+				node_index = pattern_nodes.length()
+				pattern_nodes = pattern_nodes.append({
+					kind = kind,
+					payload_index = payload_index,
+					child_start = pattern_children.length(),
+					child_count = 0,
+					span = compact_source_location(span),
+				})
+				pattern_binding_counts = pattern_binding_counts.append(0)
+				pattern_values = pattern_values.append(node_index)
+			Some(CompactBuildPatternString(text, form, span)):
+				text_index = texts.length()
+				texts = texts.append(text)
+				payload_index = string_payloads.length()
+				string_payloads = string_payloads.append({
+					text_index = text_index,
+					form = form,
+				})
+				node_index = pattern_nodes.length()
+				pattern_nodes = pattern_nodes.append({
+					kind = CompactStringPatternNode,
+					payload_index = payload_index,
+					child_start = pattern_children.length(),
+					child_count = 0,
+					span = compact_source_location(span),
+				})
+				pattern_binding_counts = pattern_binding_counts.append(0)
+				pattern_values = pattern_values.append(node_index)
+			Some(CompactBuildPatternChar(value, span)):
+				payload_index = char_payloads.length()
+				char_payloads = char_payloads.append({value = value})
+				node_index = pattern_nodes.length()
+				pattern_nodes = pattern_nodes.append({
+					kind = CompactCharPatternNode,
+					payload_index = payload_index,
+					child_start = pattern_children.length(),
+					child_count = 0,
+					span = compact_source_location(span),
+				})
+				pattern_binding_counts = pattern_binding_counts.append(0)
+				pattern_values = pattern_values.append(node_index)
+			Some(CompactBuildPatternBool(value, span)):
+				payload_index = bool_payloads.length()
+				bool_payloads = bool_payloads.append({value = value})
+				node_index = pattern_nodes.length()
+				pattern_nodes = pattern_nodes.append({
+					kind = CompactBoolPatternNode,
+					payload_index = payload_index,
+					child_start = pattern_children.length(),
+					child_count = 0,
+					span = compact_source_location(span),
+				})
+				pattern_binding_counts = pattern_binding_counts.append(0)
+				pattern_values = pattern_values.append(node_index)
+			Some(CompactBuildPatternIdentifiers(kind, identifiers, child_count, identifier_span, span)):
+				if pattern_values.length() < child_count:
+					supported = False
+				else:
+					value_start = pattern_values.length() - child_count
+					child_start = pattern_children.length()
+					var binding_count: Int = 0
+					var value_index = value_start
+
+					while value_index < pattern_values.length():
+						child_id = pattern_values
+							.get(value_index)
+							.get_or(-1)
+						pattern_children = pattern_children.append(child_id)
+						binding_count += pattern_binding_counts
+							.get(child_id)
+							.get_or(0)
+						value_index += 1
+
+					pattern_values = pattern_values.take(value_start)
+					identifier_start = pattern_identifiers.length()
+
+					for identifier in identifiers:
+						text_index = texts.length()
+						texts = texts.append(identifier.text)
+						pattern_identifiers = pattern_identifiers.append({
+							text_index = text_index,
+							span = compact_source_location(identifier.span),
+						})
+
+					payload_index = pattern_identifier_slices.length()
+					pattern_identifier_slices = pattern_identifier_slices.append({
+						identifier_start = identifier_start,
+						identifier_count = identifiers.length(),
+						span = compact_source_location(identifier_span),
+					})
+
+					if kind == CompactNamePatternNode or kind == CompactListNameSpreadPatternNode:
+						binding_count += 1
+
+					node_index = pattern_nodes.length()
+					pattern_nodes = pattern_nodes.append({
+						kind = kind,
+						payload_index = payload_index,
+						child_start = child_start,
+						child_count = child_count,
+						span = compact_source_location(span),
+					})
+					pattern_binding_counts = pattern_binding_counts.append(binding_count)
+					pattern_values = pattern_values.append(node_index)
+			Some(CompactBuildMatch(cases, span)):
+				case_count = cases.length()
+
+				if values.length() < case_count + 1 or pattern_values.length() < case_count:
+					supported = False
+				else:
+					value_start = values.length() - case_count - 1
+					pattern_start = pattern_values.length() - case_count
+					child_start = children.length()
+					var offset: Int = 0
+
+					while offset < case_count + 1:
+						children = children.append(
+							values
+								.get(value_start + offset)
+								.get_or(-1),
+						)
+						offset += 1
+
+					values = values.take(value_start)
+					case_start = match_cases.length()
+					offset = 0
+
+					while offset < case_count:
+						pattern_root = pattern_values
+							.get(pattern_start + offset)
+							.get_or(-1)
+
+						match cases.get(offset):
+							Some(case):
+								match_cases = match_cases.append({
+									pattern_root_index = pattern_root,
+									binding_count = pattern_binding_counts
+										.get(pattern_root)
+										.get_or(-1),
+									span = compact_source_location(case.span),
+								})
+							None:
+								supported = False
+
+						offset += 1
+
+					pattern_values = pattern_values.take(pattern_start)
+					node_index = nodes.length()
+					nodes = nodes.append({
+						kind = CompactMatchNode,
+						payload_index = case_start,
+						child_start = child_start,
+						child_count = case_count + 1,
+						span = compact_source_location(span),
+					})
+					values = values.append(node_index)
 			Some(CompactBuildTypeIdentifiers(kind, identifiers, child_count, span)):
 				if type_values.length() < child_count:
 					supported = False
@@ -2944,6 +3746,7 @@ pure func compact_expression_oracle_from_parsed_roots(
 		not supported
 		or values.length() != roots.length()
 		or not type_values.is_empty()
+		or not pattern_values.is_empty()
 	):
 		Err(UnsupportedCompactExpressionOracleForm)
 	else:
@@ -2973,6 +3776,11 @@ pure func compact_expression_oracle_from_parsed_roots(
 			control_identifiers = control_identifiers,
 			identifier_slices = identifier_slices,
 			typed_binders = typed_binders,
+			pattern_nodes = pattern_nodes,
+			pattern_children = pattern_children,
+			pattern_identifier_slices = pattern_identifier_slices,
+			pattern_identifiers = pattern_identifiers,
+			match_cases = match_cases,
 			unit_payloads = unit_payloads,
 			roots = values
 		}
@@ -3370,19 +4178,217 @@ private pure func compact_project_types(
 		None
 
 
+private pure func projected_pattern_child(
+	rep: CompactExpressionProductRep,
+	projected: List[ParsedPattern],
+	node: CompactPatternNodeRow,
+	offset: Int,
+) -> Option[ParsedPattern]:
+	match rep.pattern_children.get(node.child_start + offset):
+		Some(child):
+			projected.get(child)
+		None:
+			None
+
+
+private pure func projected_pattern_children(
+	rep: CompactExpressionProductRep,
+	projected: List[ParsedPattern],
+	node: CompactPatternNodeRow,
+) -> Option[List[ParsedPattern]]:
+	var values: List[ParsedPattern] = []
+	var offset: Int = 0
+	var valid = True
+
+	while offset < node.child_count and valid:
+		match projected_pattern_child(rep, projected, node, offset):
+			Some(value):
+				values = values.append(value)
+			None:
+				valid = False
+
+		offset += 1
+
+	if valid:
+		Some(values)
+	else:
+		None
+
+
+private pure func projected_pattern_identifier(
+	rep: CompactExpressionProductRep,
+	node: CompactPatternNodeRow,
+	offset: Int,
+) -> Option[ParsedIdentifier]:
+	match rep.pattern_identifier_slices.get(node.payload_index):
+		Some(payload):
+			match rep.pattern_identifiers.get(payload.identifier_start + offset):
+				Some(identifier):
+					rep.texts
+						.get(identifier.text_index)
+						.map(func(text): parsed_identifier(text, identifier.span.location))
+				None:
+					None
+		None:
+			None
+
+
+private pure func compact_project_patterns(
+	rep: CompactExpressionProductRep,
+) -> Option[List[ParsedPattern]]:
+	var projected: List[ParsedPattern] = []
+	var valid = True
+	var node_index: Int = 0
+
+	while node_index < rep.pattern_nodes.length() and valid:
+		match rep.pattern_nodes.get(node_index):
+			Some(node):
+				span = node.span.location
+				var value: Option[ParsedPattern] = None
+
+				match node.kind:
+					CompactWildcardPatternNode:
+						value = Some(ParsedWildcardPattern(span))
+					CompactNamePatternNode:
+						value = projected_pattern_identifier(
+							rep,
+							node,
+							0,
+						).map(
+							func(identifier): ParsedNamePattern(identifier),
+						)
+					CompactIntPatternNode:
+						value = compact_text_payload(
+							rep,
+							node.payload_index,
+						).map(
+							func(text): ParsedIntPattern(text, span),
+						)
+					CompactFloatPatternNode:
+						value = compact_text_payload(
+							rep,
+							node.payload_index,
+						).map(
+							func(text): ParsedFloatPattern(text, span),
+						)
+					CompactStringPatternNode:
+						match rep.string_payloads.get(node.payload_index):
+							Some(payload):
+								value = rep.texts
+									.get(payload.text_index)
+									.map(func(text): ParsedStringPattern(text, payload.form, span))
+							None:
+								void
+					CompactCharPatternNode:
+						value = rep.char_payloads
+							.get(node.payload_index)
+							.map(func(payload): ParsedCharPattern(payload.value, span))
+					CompactBoolPatternNode:
+						value = rep.bool_payloads
+							.get(node.payload_index)
+							.map(func(payload): ParsedBoolPattern(payload.value, span))
+					CompactConstructorPatternNode:
+						match (
+							projected_pattern_identifier(rep, node, 0),
+							projected_pattern_children(rep, projected, node),
+						):
+							(Some(name), Some(args)):
+								value = Some(ParsedConstructorPattern(name, args, span))
+							_:
+								void
+					CompactQualifiedConstructorPatternNode:
+						match (
+							projected_pattern_identifier(rep, node, 0),
+							projected_pattern_identifier(rep, node, 1),
+							projected_pattern_children(rep, projected, node),
+						):
+							(Some(module_name), Some(name), Some(args)):
+								value = Some(
+									ParsedQualifiedConstructorPattern(
+										module_name,
+										name,
+										args,
+										span,
+									),
+								)
+							_:
+								void
+					CompactTuplePatternNode:
+						value = projected_pattern_children(
+							rep,
+							projected,
+							node,
+						).map(
+							func(items): ParsedTuplePattern(items, span),
+						)
+					CompactListPatternNode | CompactListNameSpreadPatternNode | CompactListWildcardSpreadPatternNode:
+						match projected_pattern_children(rep, projected, node):
+							Some(items):
+								var spread: Option[ParsedListPatternSpread] = None
+
+								if node.kind == CompactListNameSpreadPatternNode:
+									spread = projected_pattern_identifier(
+										rep,
+										node,
+										0,
+									).map(
+										func(name): ParsedListSpreadName(name),
+									)
+								else if node.kind == CompactListWildcardSpreadPatternNode:
+									spread = rep.pattern_identifier_slices
+										.get(node.payload_index)
+										.map(
+											func(
+												payload,
+											): ParsedListSpreadWildcard(payload.span.location),
+										)
+
+								if node.kind == CompactListPatternNode or spread.is_some():
+									value = Some(ParsedListPattern(items, spread, span))
+							None:
+								void
+					CompactOrPatternNode:
+						value = projected_pattern_children(
+							rep,
+							projected,
+							node,
+						).map(
+							func(patterns): ParsedOrPattern(patterns, span),
+						)
+					CompactMissingPatternNode:
+						value = Some(ParsedMissingPattern(span))
+
+				match value:
+					Some(pattern):
+						projected = projected.append(pattern)
+					None:
+						valid = False
+			None:
+				valid = False
+
+		node_index += 1
+
+	if valid:
+		Some(projected)
+	else:
+		None
+
+
 pure func compact_expression_oracle_project(
 	product: ValidatedExpressionProduct,
 ) -> Result[List[ParsedExpr], CompactExpressionOracleError]:
 	rep = from_opaque ValidatedExpressionProduct(product)
 	var projected: List[ParsedExpr] = []
 	var projected_types: List[ParsedTypeExpr] = []
+	var projected_patterns: List[ParsedPattern] = []
 	var valid = False
 
-	match compact_project_types(rep):
-		Some(values):
-			projected_types = values
+	match (compact_project_types(rep), compact_project_patterns(rep)):
+		(Some(type_values), Some(pattern_values)):
+			projected_types = type_values
+			projected_patterns = pattern_values
 			valid = True
-		None:
+		_:
 			void
 
 	var node_index: Int = 0
@@ -3838,6 +4844,36 @@ pure func compact_expression_oracle_project(
 									)
 							_:
 								void
+					CompactMatchNode:
+						match projected_child(rep, projected, node, 0):
+							Some(scrutinee):
+								var cases: List[ParsedMatchCase] = []
+								var case_offset: Int = 0
+
+								while case_offset < node.child_count - 1 and valid:
+									match (
+										rep.match_cases.get(node.payload_index + case_offset),
+										projected_child(rep, projected, node, case_offset + 1),
+									):
+										(Some(case), Some(body)):
+											match projected_patterns.get(case.pattern_root_index):
+												Some(pattern):
+													cases = cases.append({
+														pattern = pattern,
+														body = body,
+														span = case.span.location,
+													})
+												None:
+													valid = False
+										_:
+											valid = False
+
+									case_offset += 1
+
+								if valid:
+									value = Some(ParsedMatchExpr(scrutinee, cases, span))
+							None:
+								void
 					CompactDebugBlockNode:
 						value = projected_child(
 							rep,
@@ -4057,6 +5093,42 @@ private pure func compact_expression_oracle_reference_traversal(
 												void
 									_:
 										void
+							CompactMatchNode:
+								var case_offset = node.child_count - 2
+
+								while case_offset >= 0:
+									match rep.match_cases.get(node.payload_index + case_offset):
+										Some(case):
+											actions = actions
+												.append(
+													CompactReferenceLeaveBindings(
+														case.binding_count,
+													),
+												)
+												.append(
+													CompactReferenceVisit(
+														rep.children
+															.get(node.child_start + case_offset + 1)
+															.get_or(-1),
+													),
+												)
+												.append(
+													CompactReferenceEnterPatternNode(
+														case.pattern_root_index,
+													),
+												)
+										None:
+											void
+
+									case_offset -= 1
+
+								actions = actions.append(
+									CompactReferenceVisit(
+										rep.children
+											.get(node.child_start)
+											.get_or(-1),
+									),
+								)
 							CompactBlockNode:
 								var entered_count: Int = 0
 								leave_action_index = actions.length()
@@ -4206,6 +5278,50 @@ private pure func compact_expression_oracle_reference_traversal(
 							offset += 1
 					None:
 						void
+			Some(CompactReferenceEnterPatternNode(pattern_node_index)):
+				match rep.pattern_nodes.get(pattern_node_index):
+					Some(node):
+						if node.kind == CompactListNameSpreadPatternNode:
+							actions = actions.append(
+								CompactReferenceEnterPatternIdentifiers(node.payload_index),
+							)
+
+						var child_offset = node.child_count - 1
+
+						while child_offset >= 0:
+							match rep.pattern_children.get(node.child_start + child_offset):
+								Some(child_id):
+									actions = actions.append(
+										CompactReferenceEnterPatternNode(child_id),
+									)
+								None:
+									void
+
+							child_offset -= 1
+
+						if node.kind == CompactNamePatternNode:
+							actions = actions.append(
+								CompactReferenceEnterPatternIdentifiers(node.payload_index),
+							)
+					None:
+						void
+			Some(CompactReferenceEnterPatternIdentifiers(slice_index)):
+				match rep.pattern_identifier_slices.get(slice_index):
+					Some(slice):
+						var offset: Int = 0
+
+						while offset < slice.identifier_count:
+							match rep.pattern_identifiers.get(slice.identifier_start + offset):
+								Some(identifier):
+									bound_text_indices = bound_text_indices.append(
+										identifier.text_index,
+									)
+								None:
+									void
+
+							offset += 1
+					None:
+						void
 			Some(CompactReferenceLeaveBindings(count)):
 				bound_text_indices = bound_text_indices.take(bound_text_indices.length() - count)
 			None:
@@ -4263,6 +5379,11 @@ pure func compact_expression_oracle_counts(
 		control_identifier_count = rep.control_identifiers.length(),
 		identifier_slice_count = rep.identifier_slices.length(),
 		typed_binder_count = rep.typed_binders.length(),
+		pattern_node_count = rep.pattern_nodes.length(),
+		pattern_child_count = rep.pattern_children.length(),
+		pattern_identifier_slice_count = rep.pattern_identifier_slices.length(),
+		pattern_identifier_count = rep.pattern_identifiers.length(),
+		match_case_count = rep.match_cases.length(),
 		unit_payload_count = rep.unit_payloads.length(),
 		root_count = rep.roots.length()
 	}
@@ -4304,6 +5425,30 @@ private pure func compact_corruption_scope_tuple_node_id(
 	match rep.nodes.get(scope_root):
 		Some(scope_node):
 			rep.children.get(scope_node.child_start + 3)
+		None:
+			None
+
+
+private pure func compact_corruption_match_case(
+	rep: CompactExpressionProductRep,
+	match_root: Int,
+	case_offset: Int,
+) -> Option[CompactMatchCaseRow]:
+	match rep.nodes.get(match_root):
+		Some(node):
+			rep.match_cases.get(node.payload_index + case_offset)
+		None:
+			None
+
+
+private pure func compact_corruption_pattern_child(
+	rep: CompactExpressionProductRep,
+	pattern_root: Int,
+	child_offset: Int,
+) -> Option[Int]:
+	match rep.pattern_nodes.get(pattern_root):
+		Some(node):
+			rep.pattern_children.get(node.child_start + child_offset)
 		None:
 			None
 
@@ -4404,6 +5549,39 @@ pure func compact_expression_oracle_rejects_corruption(
 			right,
 			start_span.location,
 		)
+		matched = ParsedMatchExpr(
+			left,
+			[
+				{
+					pattern = ParsedTuplePattern(
+						[
+							ParsedNamePattern(parsed_identifier("bound", start_span.location)),
+							ParsedConstructorPattern(
+								parsed_identifier("Some", start_span.location),
+								[
+									ParsedNamePattern(
+										parsed_identifier(
+											"value",
+											start_span.location,
+										),
+									),
+								],
+								start_span.location,
+							),
+						],
+						start_span.location,
+					),
+					body = right,
+					span = start_span.location
+				},
+				{
+					pattern = ParsedWildcardPattern(start_span.location),
+					body = left,
+					span = start_span.location
+				},
+			],
+			start_span.location,
+		)
 
 		match (
 			compact_expression_oracle_from_parsed_roots(
@@ -4418,6 +5596,7 @@ pure func compact_expression_oracle_rejects_corruption(
 					interpolated,
 					scoped,
 					looped,
+					matched,
 				],
 			)
 		):
@@ -4447,6 +5626,9 @@ pure func compact_expression_oracle_rejects_corruption(
 					.get_or(-1)
 				loop_root = rep.roots
 					.get(8)
+					.get_or(-1)
+				match_root = rep.roots
+					.get(9)
 					.get_or(-1)
 
 				match corruption:
@@ -4731,6 +5913,186 @@ pure func compact_expression_oracle_rejects_corruption(
 												}
 											None:
 												void
+									None:
+										void
+							None:
+								void
+					CompactPatternChildBackEdge:
+						match compact_corruption_match_case(rep, match_root, 0):
+							Some(case):
+								match rep.pattern_nodes.get(case.pattern_root_index):
+									Some(pattern_root):
+										corrupted = { rep |
+											pattern_children = rep.pattern_children.set(
+												pattern_root.child_start,
+												case.pattern_root_index,
+											)
+										}
+									None:
+										void
+							None:
+								void
+					CompactPatternSharedChild:
+						match compact_corruption_match_case(rep, match_root, 0):
+							Some(case):
+								match (
+									rep.pattern_nodes.get(case.pattern_root_index),
+									compact_corruption_pattern_child(
+										rep,
+										case.pattern_root_index,
+										0,
+									),
+								):
+									(Some(pattern_root), Some(first_child)):
+										corrupted = { rep |
+											pattern_children = rep.pattern_children.set(
+												pattern_root.child_start + 1,
+												first_child,
+											)
+										}
+									_:
+										void
+							None:
+								void
+					CompactPatternOrphanNode:
+						corrupted = { rep | pattern_nodes = rep.pattern_nodes.append({
+								kind = CompactWildcardPatternNode,
+								payload_index = NO_COMPACT_PAYLOAD_INDEX,
+								child_start = rep.pattern_children.length(),
+								child_count = 0,
+								span = start_span,
+							}) }
+					CompactPatternPayloadFamilyMismatch:
+						match compact_corruption_match_case(rep, match_root, 0):
+							Some(case):
+								match compact_corruption_pattern_child(
+									rep,
+									case.pattern_root_index,
+									0,
+								):
+									Some(name_node_id):
+										match rep.pattern_nodes.get(name_node_id):
+											Some(name_node):
+												corrupted = { rep |
+													pattern_nodes = rep.pattern_nodes.set(
+														name_node_id,
+														{ name_node |
+															kind = CompactBoolPatternNode
+														},
+													)
+												}
+											None:
+												void
+									None:
+										void
+							None:
+								void
+					CompactPatternIdentifierSliceAlias:
+						match compact_corruption_match_case(rep, match_root, 0):
+							Some(case):
+								match (
+									compact_corruption_pattern_child(
+										rep,
+										case.pattern_root_index,
+										0,
+									),
+									compact_corruption_pattern_child(
+										rep,
+										case.pattern_root_index,
+										1,
+									),
+								):
+									(Some(name_node_id), Some(constructor_node_id)):
+										match (
+											rep.pattern_nodes.get(name_node_id),
+											rep.pattern_nodes.get(constructor_node_id),
+										):
+											(Some(name_node), Some(constructor_node)):
+												corrupted = { rep |
+													pattern_nodes = rep.pattern_nodes.set(
+														constructor_node_id,
+														{ constructor_node |
+															payload_index = name_node.payload_index
+														},
+													)
+												}
+											_:
+												void
+									_:
+										void
+							None:
+								void
+					CompactPatternIdentifierSliceOutOfRange | CompactPatternIdentifierSliceForeignSourceOwner:
+						match compact_corruption_match_case(rep, match_root, 0):
+							Some(case):
+								match compact_corruption_pattern_child(
+									rep,
+									case.pattern_root_index,
+									0,
+								):
+									Some(name_node_id):
+										match rep.pattern_nodes.get(name_node_id):
+											Some(name_node):
+												match rep.pattern_identifier_slices.get(
+													name_node.payload_index,
+												):
+													Some(slice):
+														changed_slice = if corruption == CompactPatternIdentifierSliceOutOfRange:
+															{ slice |
+																identifier_start = rep.pattern_identifiers.length()
+															}
+														else:
+															{ slice |
+																span = { slice.span |
+																	source_owner_index = 1
+																}
+															}
+
+														corrupted = { rep |
+															pattern_identifier_slices = rep.pattern_identifier_slices.set(
+																name_node.payload_index,
+																changed_slice,
+															)
+														}
+													None:
+														void
+											None:
+												void
+									None:
+										void
+							None:
+								void
+					CompactPatternRootAlias:
+						match rep.nodes.get(match_root):
+							Some(node):
+								match (
+									rep.match_cases.get(node.payload_index),
+									rep.match_cases.get(node.payload_index + 1),
+								):
+									(Some(first), Some(second)):
+										corrupted = { rep |
+											match_cases = rep.match_cases.set(
+												node.payload_index + 1,
+												{ second |
+													pattern_root_index = first.pattern_root_index
+												},
+											)
+										}
+									_:
+										void
+							None:
+								void
+					CompactMatchCaseBindingCountMismatch:
+						match rep.nodes.get(match_root):
+							Some(node):
+								match rep.match_cases.get(node.payload_index):
+									Some(case):
+										corrupted = { rep |
+											match_cases = rep.match_cases.set(
+												node.payload_index,
+												{ case | binding_count = case.binding_count + 1 },
+											)
+										}
 									None:
 										void
 							None:

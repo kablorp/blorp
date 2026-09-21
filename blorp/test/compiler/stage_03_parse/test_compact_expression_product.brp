@@ -25,6 +25,15 @@ import:
 			CompactForBinderSliceOutOfRange,
 			CompactForBinderSliceAlias,
 			CompactIdentifierSliceForeignSourceOwner,
+			CompactMatchCaseBindingCountMismatch,
+			CompactPatternChildBackEdge,
+			CompactPatternIdentifierSliceAlias,
+			CompactPatternIdentifierSliceForeignSourceOwner,
+			CompactPatternIdentifierSliceOutOfRange,
+			CompactPatternOrphanNode,
+			CompactPatternPayloadFamilyMismatch,
+			CompactPatternRootAlias,
+			CompactPatternSharedChild,
 		),
 		CompactExpressionOracleError(
 			InvalidCompactExpressionOracleProduct,
@@ -91,6 +100,7 @@ import:
 			ParsedRangeExpr,
 			ParsedRecordExpr,
 			ParsedRecordUpdateExpr,
+			ParsedSelectExpr,
 			ParsedStringInterpolationExpr,
 			ParsedStringInterpolationPartsExpr,
 			ParsedStringLiteralExpr,
@@ -110,7 +120,24 @@ import:
 		),
 		ParsedForBinder(ParsedForNameBinder, ParsedForTupleBinder),
 		ParsedIdentifier,
+		ParsedListPatternSpread(ParsedListSpreadName, ParsedListSpreadWildcard),
 		ParsedLogicalOp(ParsedAndOp, ParsedOrOp),
+		ParsedMatchCase,
+		ParsedPattern(
+			ParsedBoolPattern,
+			ParsedCharPattern,
+			ParsedConstructorPattern,
+			ParsedFloatPattern,
+			ParsedIntPattern,
+			ParsedListPattern,
+			ParsedMissingPattern,
+			ParsedNamePattern,
+			ParsedOrPattern,
+			ParsedQualifiedConstructorPattern,
+			ParsedStringPattern,
+			ParsedTuplePattern,
+			ParsedWildcardPattern,
+		),
 		ParsedProgram,
 		ParsedRecordExprField,
 		ParsedStringInterpolationPart(ParsedInterpolationExpr, ParsedInterpolationLiteral),
@@ -862,6 +889,71 @@ pure func simple_control_roots(src: SourceFile) -> List[ParsedExpr]:
 	]
 
 
+pure func match_pattern_root(src: SourceFile) -> ParsedExpr:
+	common_span = span(src, 0, 5)
+	name: pure (String) -> ParsedIdentifier = pure func(text):
+		parsed_identifier(text, common_span)
+	pattern = ParsedTuplePattern(
+		[
+			ParsedWildcardPattern(common_span),
+			ParsedNamePattern(name("bound")),
+			ParsedIntPattern("123", common_span),
+			ParsedFloatPattern("4.5", common_span),
+			ParsedStringPattern("raw", ParsedRawStringLiteral, common_span),
+			ParsedCharPattern(97, common_span),
+			ParsedBoolPattern(True, common_span),
+			ParsedConstructorPattern(name("Some"), [ParsedNamePattern(name("value"))], common_span),
+			ParsedQualifiedConstructorPattern(
+				name("Result"),
+				name("Ok"),
+				[ParsedWildcardPattern(common_span)],
+				common_span,
+			),
+			ParsedTuplePattern(
+				[ParsedNamePattern(name("tuple_item")), ParsedIntPattern("123", common_span)],
+				common_span,
+			),
+			ParsedListPattern([ParsedNamePattern(name("list_item"))], None, common_span),
+			ParsedListPattern(
+				[ParsedNamePattern(name("head")), ParsedIntPattern("123", common_span)],
+				Some(ParsedListSpreadName(name("tail"))),
+				common_span,
+			),
+			ParsedListPattern(
+				[ParsedWildcardPattern(common_span)],
+				Some(ParsedListSpreadWildcard(common_span)),
+				common_span,
+			),
+			ParsedOrPattern(
+				[ParsedNamePattern(name("choice")), ParsedMissingPattern(common_span)],
+				common_span,
+			),
+			ParsedMissingPattern(common_span),
+		],
+		common_span,
+	)
+
+	ParsedMatchExpr(
+		ParsedNameExpr(name("subject")),
+		[
+			{
+				pattern = pattern,
+				body = ParsedCallExpr(
+					ParsedNameExpr(name("consume")),
+					[
+						ParsedNameExpr(name("bound")),
+						ParsedNameExpr(name("tail")),
+						ParsedNameExpr(name("outside")),
+					],
+					common_span,
+				),
+				span = common_span
+			},
+		],
+		common_span,
+	)
+
+
 pure func optional_expressions_equal(left: Option[ParsedExpr], right: Option[ParsedExpr]) -> Bool:
 	match left:
 		Some(left_expr):
@@ -887,6 +979,158 @@ pure func optional_type_expressions_equal(
 					False
 		None:
 			right.is_none()
+
+
+pure func pattern_lists_equal(left: List[ParsedPattern], right: List[ParsedPattern]) -> Bool:
+	var equal = left.length() == right.length()
+	var index: Int = 0
+
+	while index < left.length() and equal:
+		match (left.get(index), right.get(index)):
+			(Some(left_pattern), Some(right_pattern)):
+				equal = patterns_equal(left_pattern, right_pattern)
+			_:
+				equal = False
+
+		index += 1
+
+	equal
+
+
+pure func optional_list_spreads_equal(
+	left: Option[ParsedListPatternSpread],
+	right: Option[ParsedListPatternSpread],
+) -> Bool:
+	match left:
+		Some(ParsedListSpreadName(left_name)):
+			match right:
+				Some(ParsedListSpreadName(right_name)):
+					identifiers_equal(left_name, right_name)
+				_:
+					False
+		Some(ParsedListSpreadWildcard(left_span)):
+			match right:
+				Some(ParsedListSpreadWildcard(right_span)):
+					left_span == right_span
+				_:
+					False
+		None:
+			right.is_none()
+
+
+pure func patterns_equal(left: ParsedPattern, right: ParsedPattern) -> Bool:
+	match left:
+		ParsedWildcardPattern(left_span):
+			match right:
+				ParsedWildcardPattern(right_span):
+					left_span == right_span
+				_:
+					False
+		ParsedNamePattern(left_name):
+			match right:
+				ParsedNamePattern(right_name):
+					identifiers_equal(left_name, right_name)
+				_:
+					False
+		ParsedIntPattern(left_text, left_span):
+			match right:
+				ParsedIntPattern(right_text, right_span):
+					left_text == right_text and left_span == right_span
+				_:
+					False
+		ParsedFloatPattern(left_text, left_span):
+			match right:
+				ParsedFloatPattern(right_text, right_span):
+					left_text == right_text and left_span == right_span
+				_:
+					False
+		ParsedStringPattern(left_text, left_form, left_span):
+			match right:
+				ParsedStringPattern(right_text, right_form, right_span):
+					left_text == right_text and left_form == right_form and left_span == right_span
+				_:
+					False
+		ParsedCharPattern(left_value, left_span):
+			match right:
+				ParsedCharPattern(right_value, right_span):
+					left_value == right_value and left_span == right_span
+				_:
+					False
+		ParsedBoolPattern(left_value, left_span):
+			match right:
+				ParsedBoolPattern(right_value, right_span):
+					left_value == right_value and left_span == right_span
+				_:
+					False
+		ParsedConstructorPattern(left_name, left_args, left_span):
+			match right:
+				ParsedConstructorPattern(right_name, right_args, right_span):
+					(
+						identifiers_equal(left_name, right_name)
+						and pattern_lists_equal(left_args, right_args)
+						and left_span == right_span
+					)
+				_:
+					False
+		ParsedQualifiedConstructorPattern(left_module, left_name, left_args, left_span):
+			match right:
+				ParsedQualifiedConstructorPattern(right_module, right_name, right_args, right_span):
+					(
+						identifiers_equal(left_module, right_module)
+						and identifiers_equal(left_name, right_name)
+						and pattern_lists_equal(left_args, right_args)
+						and left_span == right_span
+					)
+				_:
+					False
+		ParsedTuplePattern(left_items, left_span):
+			match right:
+				ParsedTuplePattern(right_items, right_span):
+					pattern_lists_equal(left_items, right_items) and left_span == right_span
+				_:
+					False
+		ParsedListPattern(left_items, left_spread, left_span):
+			match right:
+				ParsedListPattern(right_items, right_spread, right_span):
+					(
+						pattern_lists_equal(left_items, right_items)
+						and optional_list_spreads_equal(left_spread, right_spread)
+						and left_span == right_span
+					)
+				_:
+					False
+		ParsedOrPattern(left_items, left_span):
+			match right:
+				ParsedOrPattern(right_items, right_span):
+					pattern_lists_equal(left_items, right_items) and left_span == right_span
+				_:
+					False
+		ParsedMissingPattern(left_span):
+			match right:
+				ParsedMissingPattern(right_span):
+					left_span == right_span
+				_:
+					False
+
+
+pure func match_cases_equal(left: List[ParsedMatchCase], right: List[ParsedMatchCase]) -> Bool:
+	var equal = left.length() == right.length()
+	var index: Int = 0
+
+	while index < left.length() and equal:
+		match (left.get(index), right.get(index)):
+			(Some(left_case), Some(right_case)):
+				equal = (
+					patterns_equal(left_case.pattern, right_case.pattern)
+					and expressions_equal(left_case.body, right_case.body)
+					and left_case.span == right_case.span
+				)
+			_:
+				equal = False
+
+		index += 1
+
+	equal
 
 
 pure func expressions_equal(left: ParsedExpr, right: ParsedExpr) -> Bool:
@@ -1182,6 +1426,16 @@ pure func expressions_equal(left: ParsedExpr, right: ParsedExpr) -> Bool:
 						expressions_equal(left_condition, right_condition)
 						and expressions_equal(left_then, right_then)
 						and optional_expressions_equal(left_else, right_else)
+						and left_span == right_span
+					)
+				_:
+					False
+		ParsedMatchExpr(left_scrutinee, left_cases, left_span):
+			match right:
+				ParsedMatchExpr(right_scrutinee, right_cases, right_span):
+					(
+						expressions_equal(left_scrutinee, right_scrutinee)
+						and match_cases_equal(left_cases, right_cases)
 						and left_span == right_span
 					)
 				_:
@@ -2156,11 +2410,129 @@ func test_direct_reference_oracle_preserves_order_duplicates_and_lifetime() -> B
 	)
 
 
+func test_match_and_pattern_family_round_trips_exactly() -> Bool:
+	src = source()
+	original = match_pattern_root(src)
+
+	match compact_expression_oracle_from_parsed_roots(src, [original]):
+		Ok(product):
+			match compact_expression_oracle_project(product):
+				Ok([projected]):
+					expressions_equal(original, projected)
+				_:
+					False
+		Err(_):
+			False
+
+
+func test_match_real_parser_round_trips_both_spread_positions() -> Bool:
+	program_text = "func run(xs: List[Int]) -> Int:\n\tmatch xs:\n\t\t[...rest]: length(rest)\n\t\t[head, ...tail]: head\n\t\t[..._]: length(xs)\n\t\t[_, ..._]: length(xs)"
+	program_source = source_file("match_patterns.brp", "match_patterns", program_text)
+
+	match first_function_body(parse_compiler_source(program_source)):
+		Some(body):
+			match compact_expression_oracle_from_parsed_roots(program_source, [body]):
+				Ok(product):
+					match compact_expression_oracle_project(product):
+						Ok([projected]):
+							expressions_equal(body, projected)
+						_:
+							False
+				Err(_):
+					False
+		None:
+			False
+
+
+func test_match_reference_order_and_pattern_scope_match_production() -> Bool:
+	src = source()
+	root = match_pattern_root(src)
+	legacy = parsed_expr_free_identifier_references(root)
+
+	match compact_expression_oracle_from_parsed_roots(src, [root]):
+		Ok(product):
+			compact = compact_expression_oracle_free_identifier_references(product)
+			(
+				reference_lists_equal(legacy, compact)
+				and compact.map(
+					func(reference): reference.name,
+				) == ["subject", "consume", "outside"]
+			)
+		Err(_):
+			False
+
+
+func test_match_scope_restores_outer_equal_text_and_does_not_leak() -> Bool:
+	src = source()
+	common_span = span(src, 0, 5)
+	name: pure (String) -> ParsedIdentifier = pure func(text):
+		parsed_identifier(text, common_span)
+	root = ParsedBlockExpr(
+		[
+			ParsedVarDeclExpr(name("same"), None, ParsedNameExpr(name("seed")), False, common_span),
+			ParsedMatchExpr(
+				ParsedNameExpr(name("subject")),
+				[
+					{
+						pattern = ParsedConstructorPattern(
+							name("Ctor"),
+							[ParsedNamePattern(name("same"))],
+							common_span,
+						),
+						body = ParsedCallExpr(
+							ParsedNameExpr(name("Ctor")),
+							[ParsedNameExpr(name("same"))],
+							common_span,
+						),
+						span = common_span
+					},
+					{
+						pattern = ParsedWildcardPattern(common_span),
+						body = ParsedNameExpr(name("same")),
+						span = common_span
+					},
+				],
+				common_span,
+			),
+			ParsedNameExpr(name("same")),
+		],
+		common_span,
+	)
+	legacy = parsed_expr_free_identifier_references(root)
+
+	match compact_expression_oracle_from_parsed_roots(src, [root]):
+		Ok(product):
+			compact = compact_expression_oracle_free_identifier_references(product)
+			(
+				reference_lists_equal(legacy, compact)
+				and compact.map(func(reference): reference.name) == ["seed", "subject", "Ctor"]
+			)
+		Err(_):
+			False
+
+
+func test_match_pattern_metadata_counts_are_explicit() -> Bool:
+	src = source()
+
+	match compact_expression_oracle_from_parsed_roots(src, [match_pattern_root(src)]):
+		Ok(product):
+			counts = compact_expression_oracle_counts(product)
+			(
+				counts.pattern_node_count == 26
+				and counts.pattern_child_count == 25
+				and counts.pattern_identifier_slice_count == 10
+				and counts.pattern_identifier_count == 10
+				and counts.match_case_count == 1
+				and counts.root_count == 1
+			)
+		Err(_):
+			False
+
+
 func test_unsupported_form_is_rejected_explicitly() -> Bool:
 	src = source()
 
-	match compact_expression_oracle_from_parsed_roots(src, [ParsedMatchExpr(
-				ParsedVoidExpr(span(src, 0, 5)),
+	match compact_expression_oracle_from_parsed_roots(src, [ParsedSelectExpr(
 				[],
 				span(src, 0, 5),
 			)]):
@@ -2197,6 +2569,15 @@ func test_validator_rejects_corrupt_products() -> Bool:
 		CompactForBinderSliceOutOfRange,
 		CompactForBinderSliceAlias,
 		CompactIdentifierSliceForeignSourceOwner,
+		CompactPatternChildBackEdge,
+		CompactPatternSharedChild,
+		CompactPatternOrphanNode,
+		CompactPatternPayloadFamilyMismatch,
+		CompactPatternIdentifierSliceAlias,
+		CompactPatternIdentifierSliceOutOfRange,
+		CompactPatternIdentifierSliceForeignSourceOwner,
+		CompactPatternRootAlias,
+		CompactMatchCaseBindingCountMismatch,
 	]
 	var rejected = True
 
@@ -2387,6 +2768,22 @@ tests: TestSuite = {
 			"direct reference oracle preserves order duplicates and lifetime",
 			test_direct_reference_oracle_preserves_order_duplicates_and_lifetime,
 		),
+		(
+			"match and pattern family round trips exactly",
+			test_match_and_pattern_family_round_trips_exactly,
+		),
+		(
+			"match real parser round trips both spread positions",
+			test_match_real_parser_round_trips_both_spread_positions,
+		),
+		(
+			"match reference order and pattern scope match production",
+			test_match_reference_order_and_pattern_scope_match_production,
+		),
+		(
+			"match scope restores outer equal text and does not leak",
+			test_match_scope_restores_outer_equal_text_and_does_not_leak,
+		),
 		("validator rejects corrupt products", test_validator_rejects_corrupt_products),
 		("unsupported form is rejected explicitly", test_unsupported_form_is_rejected_explicitly),
 		(
@@ -2405,6 +2802,10 @@ tests: TestSuite = {
 		(
 			"simple control metadata counts are explicit",
 			test_simple_control_metadata_counts_are_explicit,
+		),
+		(
+			"match pattern metadata counts are explicit",
+			test_match_pattern_metadata_counts_are_explicit,
 		),
 	]
 }

@@ -63,19 +63,21 @@ the admitted checkpoints are explicitly rejected by the adapter, so this
 product is not a canonical full-grammar parser result.
 
 The retained schema probe keeps its AST inputs outside the measurement epoch.
-After the type/interpolation checkpoint, the product-only lifetime for sixteen
-binary roots (48 nodes) is 8 objects and 4,832 bytes, versus 81 objects and
+After the match/pattern checkpoint, the product-only lifetime for sixteen
+binary roots (48 nodes) is 8 objects and 4,848 bytes, versus 81 objects and
 5,824 bytes for freshly constructed legacy trees with the same root shape.
 This is a retained-layout comparison, not a construction-speed claim: the test
 oracle pays 233 allocations because it converts an existing AST and runs the
 exhaustive validator, while the legacy fixture construction pays 83. Empty,
-scalar, and binary compact products retain 2/320, 6/864, and 8/1,024
+scalar, and binary compact products retain 2/336, 6/880, and 8/1,040
 objects/bytes respectively. Collections/access added five table handles and
 64 retained bytes; type/interpolation adds six more handles and another 64
 bytes. This cumulative 128-byte fixed increase is explicit rather than hidden
 by a large-tree result. The scope-skeleton checkpoint adds three more scalar
 table handles and raises ABI `sizeof` from 208 to 232 bytes without leaving the
-256-byte allocator class, so empty and pre-existing retained sizes do not rise.
+256-byte allocator class. The match/pattern checkpoint adds five table handles,
+raises ABI `sizeof` to 272 bytes, and therefore leaves the runtime's 256-byte
+small-object pool. The record is now an ordinary 272-byte heap request.
 
 Both 48-node lifetime fixtures keep the same source and static identifier text
 outside the measurement epoch. The compact result additionally retains its
@@ -97,7 +99,7 @@ tables, it is 208 bytes by ABI `sizeof` and occupies a 256-byte allocator size
 class. The nested aggregate probe covers
 two roots, 33 nodes, and 31 child ids across record update, dictionary, list,
 tuple, vector, field access, and multi-index subscript forms; it retains 12
-objects and 5,280 current live bytes. There is no paired legacy claim for that
+objects and 5,296 current live bytes. There is no paired legacy claim for that
 mixed shape. Raw evidence is reproduced by
 `blorp/benchmark/compiler/compact_expression_product_schema_probe.brp`; its
 output must be captured with `--leak-check` so live type buckets are available.
@@ -153,7 +155,7 @@ remains a future direct-parser capability and is not claimed by this adapter.
 The mixed type/interpolation probe has one root, five expression nodes, four
 expression child ids, eight type nodes, seven type child ids, four identifier
 slices, five identifiers, and four interpolation parts. It retains 14 objects
-and 2,656 current live bytes; there is no paired legacy claim. Generated C
+and 2,672 current live bytes; there is no paired legacy claim. Generated C
 confirms inline storage: type-node rows are 48 bytes, identifier-slice rows are
 16 bytes, type-identifier rows are 24 bytes, interpolation-parts payload rows
 are 24 bytes, and interpolation-part rows are 16 bytes on the measured ABI.
@@ -209,7 +211,7 @@ adding a table handle or changing the product/allocator sizes.
 A deterministic 64-binding scope fixture produces 64 free initializer
 references and exactly 2,080 bound-name comparisons, matching the current
 modeled `List.contains` work (`64 * 65 / 2`). Its one product contains 193 nodes and 192
-child ids and retains 9 objects / 20,640 bytes. This is a scaling control, not
+child ids and retains 9 objects / 20,656 bytes. This is a scaling control, not
 an asymptotic improvement claim: the wide sequential workload retains
 quadratic lookup work. An exact-name index should be considered only if later measurement
 shows that lookup dominating real source/module workloads.
@@ -232,27 +234,72 @@ identifier.
 
 The retained simple-control fixture has 13 nodes, 12 child ids, two control
 identifiers, one identifier slice, seven free references, and one bound-name
-comparison. It retains 9 objects / 2,096 bytes. The complete product remains
-232 bytes by ABI `sizeof` in the 256-byte allocator class; the now span-bearing
+comparison. It retains 9 objects / 2,112 bytes. Before match/pattern tables the
+complete product was 232 bytes by ABI `sizeof` in the 256-byte allocator class;
+the now span-bearing
 identifier-slice row is 32 bytes on the measured 64-bit ABI.
 That is an exact 16-byte increase in row storage for each populated identifier
 slice before list-capacity and allocator-size-class rounding; it does not
 change products whose slice table remains empty.
 
+#### Match and pattern oracle
+
+The sixth test-only family adds `ParsedMatchExpr`, all thirteen
+`ParsedPattern` variants, and both named and wildcard list spreads. Five
+product-owned tables store pattern nodes, pattern child ids, pattern identifier
+slices, pattern identifiers, and match cases. Pattern children and cases retain
+source order. A list spread remains metadata on its list-pattern node and is
+logically visited after every item, matching the parser rule that a spread ends
+the authored list pattern.
+
+Each match case stores its pattern root, case span, and a cached binding count.
+The validator recomputes binding counts once in the same postorder pass that
+proves pattern graph ownership, and rejects any mismatch before constructing a
+validated product. It also rejects backedges, shared or orphan pattern nodes,
+aliased or out-of-range identifier slices, foreign source owners, mismatched
+payload families, and aliased pattern roots. Traversal may therefore pop the
+cached count without risking removal of bindings owned by an outer scope.
+
+The direct reference oracle visits the scrutinee in the outer scope, then each
+case independently. Pattern names and named list spreads bind only the matching
+case body; constructor and qualifier identifiers do not bind. Item bindings
+precede a named spread binding, `or` alternatives preserve their current
+flattened source order and duplicates, and no case binding leaks to another
+case or a later root. Tests compare ordered production references, exact
+round-trip structure and spans, nested equal-text restoration, and real-parser
+list spreads both with and without preceding items.
+
+On the measured 64-bit generated-C ABI, pattern-node rows are 48 bytes,
+pattern-identifier-slice rows are 32 bytes, pattern-identifier rows are 24
+bytes, and match-case rows are 32 bytes. The retained pattern fixture has one
+match root, three expression nodes, two expression child ids, thirteen pattern
+nodes, twelve pattern child ids, seven identifier slices, seven identifiers,
+and one match-case row. It retains 13 objects / 2,864 current live bytes. The
+fixture reports one free reference and one bound-name comparison. This is a
+layout and semantic checkpoint, not a construction-speed claim. The generated
+C and retained probe source SHA-256 values for this checkpoint are
+`c2b13db4c9a8f55a6c3b814f05c4e5060e0e16126d1bfbaad45a98f366b74e30`
+and `9ae87d5c491049a5083c528c7396ebc1c3c683d28aee22ad38d459130fda860e`.
+The captured checkpoint output is
+[`compact_expression_product_match_pattern_2026-09-20.md`](../benchmarks/results/compact_expression_product_match_pattern_2026-09-20.md).
+The aggregate `compiler-blorp` gate remains intentionally pending until the
+final structured-scope checkpoint; C1 uses the owning focused suite and changed
+compiler checks.
+
 Remaining milestone-1 coverage is deliberately finite:
 
-1. structured scopes: match, select, `with`, lambda, and nested function
+1. remaining structured scopes: select, `with`, lambda, and nested function
    declaration, including their pattern/binder metadata;
 2. concurrency and recovery: concurrent block/for, detach, their parameter
    metadata, and recovery-sensitive combinations of the existing missing form.
 
-The current declaration has 48 `ParsedExpr` variants. Exactly 40 are now in
-the oracle. The remaining 8 are explicit, not an open-ended category:
+The current declaration has 48 `ParsedExpr` variants. Exactly 41 are now in
+the oracle. The remaining 7 are explicit, not an open-ended category:
 
 | Status | Count | Variants |
 | --- | ---: | --- |
-| Covered | 40 | name; integer, float, string, raw interpolation, bool, and char literals; unary, binary, logical, ascription, range, call, field access, subscript, list, tuple, record, record update, dictionary, vector, opaque into/from, finalized interpolation parts, block, variable declaration, assignment, compound assignment, subscript assignment, tuple destructuring, question binding, if, debug block, while, for, break, continue, void, builtin, missing |
-| Structured-scope checkpoint | 5 | match, select, with, lambda, function declaration |
+| Covered | 41 | name; integer, float, string, raw interpolation, bool, and char literals; unary, binary, logical, ascription, range, call, field access, subscript, list, tuple, record, record update, dictionary, vector, opaque into/from, finalized interpolation parts, block, variable declaration, assignment, compound assignment, subscript assignment, tuple destructuring, question binding, if, match, debug block, while, for, break, continue, void, builtin, missing |
+| Structured-scope checkpoints | 4 | select, with, lambda, function declaration |
 | Concurrency checkpoint | 3 | concurrent block, concurrent for, detach |
 
 After those checkpoints cover every `ParsedExpr` variant and their reachable
