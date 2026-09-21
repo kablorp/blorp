@@ -1,7 +1,8 @@
 # Compact Parser Migration
 
-Status: design checkpoint. Production implementation requires choosing the
-first boundary in [Decision Before Implementation](#decision-before-implementation).
+Status: milestone-1 schema frozen at all 48 `ParsedExpr` variants. Production
+implementation remains unwired and requires the direct-construction checkpoint
+in [Decision Before Implementation](#decision-before-implementation).
 
 Goal: replace per-expression ownership traffic in the compiler parser with a
 validated, product-owned compact representation while preserving the complete
@@ -30,7 +31,7 @@ whole-compiler speed or memory and they do not validate the full grammar.
 
 The current production boundary is much broader:
 
-- `ParsedExpr` has approximately fifty variants, including declarations,
+- `ParsedExpr` has 48 variants, including declarations,
   blocks, concurrency, recovery nodes, and interpolation; the broader
   expression graph also reaches separate pattern and binder types.
 - `source_ast_finalize.brp` reparses interpolation expressions, hoists nested
@@ -63,14 +64,14 @@ the admitted checkpoints are explicitly rejected by the adapter, so this
 product is not a canonical full-grammar parser result.
 
 The retained schema probe keeps its AST inputs outside the measurement epoch.
-At the current cumulative callable checkpoint, the product-only lifetime
-for sixteen binary roots (48 nodes) is 8 objects and 4,920 bytes, versus 81
+At the current cumulative concurrency/recovery checkpoint, the product-only
+lifetime for sixteen binary roots (48 nodes) is 8 objects and 4,936 bytes, versus 81
 objects and 5,824 bytes for freshly constructed legacy trees with the same
 root shape.
 This is a retained-layout comparison, not a construction-speed claim: the test
-oracle pays 249 allocations because it converts an existing AST and runs the
+oracle pays 251 allocations because it converts an existing AST and runs the
 exhaustive validator, while the legacy fixture construction pays 83. Empty,
-scalar, and binary compact products retain 2/408, 6/952, and 8/1,112
+scalar, and binary compact products retain 2/424, 6/968, and 8/1,128
 objects/bytes respectively. Collections/access added five table handles and
 64 retained bytes; type/interpolation adds six more handles and another 64
 bytes. This cumulative 128-byte fixed increase is explicit rather than hidden
@@ -81,7 +82,8 @@ raises ABI `sizeof` to 272 bytes, and therefore leaves the runtime's 256-byte
 small-object pool. The record is now an ordinary 272-byte heap request.
 The select/with checkpoint adds three table handles and raises both ABI
 `sizeof` and the ordinary heap request to 296 bytes. The callable checkpoint
-adds six table handles and raises both to 344 bytes.
+adds six table handles and raises both to 344 bytes. The concurrency/recovery
+checkpoint adds two scalar table handles and raises both to 360 bytes.
 
 Both 48-node lifetime fixtures keep the same source and static identifier text
 outside the measurement epoch. The compact result additionally retains its
@@ -100,11 +102,11 @@ index instead of allocating one record per node. The opaque product record is
 the five collections/access tables, the product was 160 bytes by ABI `sizeof`
 and occupied a 192-byte allocator size class. With the six type/interpolation
 tables, it is 208 bytes by ABI `sizeof` and occupies a 256-byte allocator size
-class. Under the current cumulative callable schema, the nested aggregate
+class. Under the current cumulative concurrency/recovery schema, the nested aggregate
 probe covers
 two roots, 33 nodes, and 31 child ids across record update, dictionary, list,
 tuple, vector, field access, and multi-index subscript forms; it retains 12
-objects and 5,368 current live bytes. There is no paired legacy claim for that
+objects and 5,384 current live bytes. There is no paired legacy claim for that
 mixed shape. Raw evidence is reproduced by
 `blorp/benchmark/compiler/compact_expression_product_schema_probe.brp`; its
 output must be captured with `--leak-check` so live type buckets are available.
@@ -385,22 +387,63 @@ This final structured-scope checkpoint ran the deferred aggregate gate once:
 all 4,965 `compiler-blorp` tests passed. Focused normal, sanitizer, and leak
 runs each passed all 36 owning tests, with zero leaked bytes.
 
-Remaining milestone-1 coverage is deliberately finite:
+#### Concurrency and recovery oracle
 
-1. concurrency and recovery: concurrent block/for, detach, their parameter
-   metadata, and recovery-sensitive combinations of the existing missing form.
+The ninth and final test-only family adds concurrent block, concurrent for,
+and detach. Concurrent-parameter rows preserve the authored label identifier
+and full parameter span; concurrent-for payloads preserve the loop binder and
+the start of their parameter slice. Parameter values and the iterable remain
+ordinary expression children, so missing-expression recovery uses the same
+`ParsedMissingExpr` node as the production parser rather than a second recovery
+encoding.
 
-The current declaration has 48 `ParsedExpr` variants. Exactly 45 are now in
-the oracle. The remaining 3 are explicit, not an open-ended category:
+Free-reference traversal preserves the production rules. Concurrent parameter
+values are visited left-to-right in the outer scope. A concurrent-for binder is
+visible only in its body, not its iterable or parameter values. For a
+concurrent block body, assignment targets and immutable or mutable declaration
+names are task labels rather than reads or sibling bindings; only each task's
+value is visited in the shared outer scope. A non-block concurrent body falls
+back to ordinary expression traversal. Detach traverses its body in the
+incoming scope.
+
+The validator checks arity before subtracting derived parameter counts, then
+enforces exact ownership for parameter slices, parameter rows, parameter-name
+identifiers, concurrent-for payloads, and loop binders. The corruption matrix
+covers aliased and out-of-range slices, orphan rows and payloads, foreign spans,
+identifier and binder aliases, all three arity failures, and a representative
+concurrency payload-family mismatch. Exact real-parser recovery tests retain
+diagnostic order, message, expected tokens, help, and both the closing-token
+and EOF spans.
+
+On the measured 64-bit generated-C ABI, concurrent-parameter rows are 24 bytes
+and concurrent-for rows are 16 bytes. The retained concurrency fixture has
+three roots, thirteen nodes, ten child ids, three parameter rows, one
+concurrent-for payload, five control identifiers, seven free references, and
+one modeled bound-name comparison. It retains 11 objects / 2,552 current live
+bytes. Empty and 48-node small-module products retain 424 and 4,936 bytes; the
+product record is 360 bytes. Generated C SHA-256 is
+`6a5fd39d56386065d8704f56e2721491f884f562f6acae08850597165edaf119`;
+probe source SHA-256 is
+`9a3b13e4fdcd2a496cd83af9f60cea20860cd40db16025ee79f84846a6deea2b`.
+The captured checkpoint output is
+[`compact_expression_product_concurrency_2026-09-21.md`](../benchmarks/results/compact_expression_product_concurrency_2026-09-21.md).
+This remains a schema/layout result, not a construction or whole-compiler
+speed claim. The callable checkpoint's 4,965-test aggregate result predates
+these test-only schema additions; no production parser path imports this
+oracle, so the approved final checkpoint uses focused normal, sanitizer, leak,
+layout, and changed-file validation rather than claiming a second aggregate.
+All three focused modes passed 40/40 tests, and the leak run reported zero
+leaked bytes.
+
+Milestone 1 is now frozen. The current declaration has 48 `ParsedExpr`
+variants and all 48 are represented by the oracle:
 
 | Status | Count | Variants |
 | --- | ---: | --- |
-| Covered | 45 | name; integer, float, string, raw interpolation, bool, and char literals; unary, binary, logical, ascription, range, call, field access, subscript, list, tuple, record, record update, dictionary, vector, opaque into/from, finalized interpolation parts, block, variable declaration, assignment, compound assignment, subscript assignment, tuple destructuring, question binding, if, match, select, with, lambda, function declaration, debug block, while, for, break, continue, void, builtin, missing |
-| Concurrency checkpoint | 3 | concurrent block, concurrent for, detach |
+| Covered | 48 | name; integer, float, string, raw interpolation, bool, and char literals; unary, binary, logical, ascription, range, call, field access, subscript, list, tuple, record, record update, dictionary, vector, opaque into/from, finalized interpolation parts, block, variable declaration, assignment, compound assignment, subscript assignment, tuple destructuring, question binding, if, match, select, with, lambda, function declaration, concurrent block, concurrent for, detach, debug block, while, for, break, continue, void, builtin, missing |
 
-After those checkpoints cover every `ParsedExpr` variant and their reachable
-pattern/binder rows, milestone 2 starts the first direct canonical construction
-path in `language_parser.brp`. It replaces the existing expression-tree
+Milestone 2 starts only after the direct-construction ownership checkpoint. It
+adds the first canonical construction path in `language_parser.brp` and replaces the existing expression-tree
 construction for the complete expression grammar in one parser-owned path; it
 does not add a form-subset parser or leave the AST adapter in production. The
 adapter/projection remain test-only differential oracles, while the first

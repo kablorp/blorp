@@ -33,6 +33,7 @@ import:
 			ParsedAssignMultiplyOp,
 			ParsedAssignSubtractOp,
 		),
+		ParsedConcurrentParam,
 		ParsedDictEntry,
 		ParsedDimBinaryOp(
 			ParsedDimAddOp,
@@ -53,7 +54,10 @@ import:
 			ParsedCharLiteralExpr,
 			ParsedContinueExpr,
 			ParsedCompoundAssignExpr,
+			ParsedConcurrentBlockExpr,
+			ParsedConcurrentForExpr,
 			ParsedDebugBlockExpr,
+			ParsedDetachExpr,
 			ParsedFloatLiteralExpr,
 			ParsedDictExpr,
 			ParsedFieldAccessExpr,
@@ -197,6 +201,9 @@ enum CompactExpressionNodeKind:
 	CompactWithNode
 	CompactLambdaNode
 	CompactFunctionDeclNode
+	CompactConcurrentBlockNode
+	CompactConcurrentForNode
+	CompactDetachNode
 
 
 enum CompactPatternNodeKind:
@@ -357,6 +364,17 @@ enum CompactExpressionCorruption:
 	CompactFunctionDocTextOutOfRange
 	CompactFunctionWrongArity
 	CompactFunctionOrphanAnnotation
+	CompactConcurrentParamSliceAlias
+	CompactConcurrentOrphanParam
+	CompactConcurrentParamForeignSourceOwner
+	CompactConcurrentParamIdentifierAlias
+	CompactConcurrentForPayloadAlias
+	CompactConcurrentForOrphanPayload
+	CompactConcurrentForBinderAlias
+	CompactConcurrentBlockWrongArity
+	CompactConcurrentForWrongArity
+	CompactDetachWrongArity
+	CompactConcurrentPayloadFamilyMismatch
 
 
 struct CompactProductSourceLocation {
@@ -593,6 +611,18 @@ struct CompactCallableDimConstraintRow {
 }
 
 
+struct CompactConcurrentParamRow {
+	name_identifier_index: Int,
+	span: CompactProductSourceLocation
+}
+
+
+struct CompactConcurrentForRow {
+	binder_identifier_index: Int,
+	parameter_start: Int
+}
+
+
 struct CompactUnitPayloadRow {
 	kind: CompactUnitPayloadKind
 }
@@ -638,6 +668,8 @@ private record CompactExpressionProductRep {
 	callable_type_params: List[CompactCallableTypeParamRow],
 	callable_dim_constraints: List[CompactCallableDimConstraintRow],
 	function_annotations: List[CompactFunctionAnnotationKind],
+	concurrent_params: List[CompactConcurrentParamRow],
+	concurrent_for_payloads: List[CompactConcurrentForRow],
 	unit_payloads: List[CompactUnitPayloadRow],
 	roots: List[Int]
 }
@@ -686,6 +718,8 @@ record CompactExpressionProductCounts {
 	callable_type_param_count: Int,
 	callable_dim_constraint_count: Int,
 	function_annotation_count: Int,
+	concurrent_param_count: Int,
+	concurrent_for_payload_count: Int,
 	unit_payload_count: Int,
 	root_count: Int
 }
@@ -731,6 +765,8 @@ private union CompactBuildAction:
 	CompactBuildWith(ParsedWithBinding, SourceLocation)
 	CompactBuildLambda(Bool, List[ParsedLambdaParam], Option[ParsedTypeExpr], SourceLocation)
 	CompactBuildFunction(ParsedFunctionDecl)
+	CompactBuildConcurrentBlock(List[ParsedConcurrentParam], SourceLocation)
+	CompactBuildConcurrentFor(ParsedIdentifier, List[ParsedConcurrentParam], SourceLocation)
 	CompactBuildPatternVisit(ParsedPattern)
 	CompactBuildPatternNoPayload(CompactPatternNodeKind, Int, SourceLocation)
 	CompactBuildPatternText(CompactPatternNodeKind, String, SourceLocation)
@@ -746,6 +782,7 @@ private union CompactBuildAction:
 
 private union CompactReferenceAction:
 	CompactReferenceVisit(Int)
+	CompactReferenceVisitConcurrentTask(Int)
 	CompactReferenceEnterIdentifier(Int)
 	CompactReferenceEnterIdentifierSlice(Int)
 	CompactReferenceEnterPatternNode(Int)
@@ -991,9 +1028,9 @@ private pure func compact_expected_child_count(
 			None
 		CompactFinalizedInterpolationNode:
 			None
-		CompactBlockNode | CompactSubscriptAssignNode | CompactIfNode | CompactMatchNode | CompactSelectNode | CompactWithNode | CompactFunctionDeclNode:
+		CompactBlockNode | CompactSubscriptAssignNode | CompactIfNode | CompactMatchNode | CompactSelectNode | CompactWithNode | CompactFunctionDeclNode | CompactConcurrentBlockNode | CompactConcurrentForNode:
 			None
-		CompactLambdaNode:
+		CompactLambdaNode | CompactDetachNode:
 			Some(1)
 		CompactAscriptionNode | CompactOpaqueIntoNode | CompactOpaqueFromNode:
 			Some(1)
@@ -1138,6 +1175,8 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 		var callable_type_param_slot_owners = 0.repeat(rep.callable_type_params.length())
 		var callable_dim_constraint_slot_owners = 0.repeat(rep.callable_dim_constraints.length())
 		var function_annotation_slot_owners = 0.repeat(rep.function_annotations.length())
+		var concurrent_param_slot_owners = 0.repeat(rep.concurrent_params.length())
+		var concurrent_for_payload_owners = 0.repeat(rep.concurrent_for_payloads.length())
 		var validated_pattern_binding_counts = 0.repeat(rep.pattern_nodes.length())
 		var unit_owners = 0.repeat(rep.unit_payloads.length())
 
@@ -1322,6 +1361,28 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 											)
 										None:
 											valid = False
+								CompactConcurrentBlockNode:
+									valid = (
+										node.child_count >= 1
+										and compact_metadata_slice_is_valid(
+											node.payload_index,
+											node.child_count - 1,
+											rep.concurrent_params.length(),
+										)
+									)
+								CompactConcurrentForNode:
+									if node.child_count < 2:
+										valid = False
+									else:
+										match rep.concurrent_for_payloads.get(node.payload_index):
+											Some(payload):
+												valid = compact_metadata_slice_is_valid(
+													payload.parameter_start,
+													node.child_count - 2,
+													rep.concurrent_params.length(),
+												)
+											None:
+												valid = False
 								_:
 									valid = False
 
@@ -2202,6 +2263,102 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 										annotation_offset += 1
 								None:
 									valid = False
+						CompactConcurrentBlockNode:
+							var parameter_offset: Int = 0
+							parameter_count = node.child_count - 1
+
+							while parameter_offset < parameter_count and valid:
+								parameter_slot = node.payload_index + parameter_offset
+
+								match rep.concurrent_params.get(parameter_slot):
+									Some(parameter):
+										if (
+											not compact_source_span_is_valid(
+												rep.source_owners,
+												parameter.span,
+											)
+											or parameter.name_identifier_index < 0
+											or parameter.name_identifier_index >= rep.control_identifiers.length()
+										):
+											valid = False
+										else:
+											concurrent_param_slot_owners = concurrent_param_slot_owners.set(
+												parameter_slot,
+												concurrent_param_slot_owners
+													.get(parameter_slot)
+													.get_or(0) + 1,
+											)
+											control_identifier_owners = control_identifier_owners.set(
+												parameter.name_identifier_index,
+												control_identifier_owners
+													.get(parameter.name_identifier_index)
+													.get_or(0) + 1,
+											)
+									None:
+										valid = False
+
+								parameter_offset += 1
+						CompactConcurrentForNode:
+							match rep.concurrent_for_payloads.get(node.payload_index):
+								Some(payload):
+									if (
+										payload.binder_identifier_index < 0
+										or payload.binder_identifier_index >= rep.control_identifiers.length()
+									):
+										valid = False
+									else:
+										concurrent_for_payload_owners = concurrent_for_payload_owners.set(
+											node.payload_index,
+											concurrent_for_payload_owners
+												.get(node.payload_index)
+												.get_or(0) + 1,
+										)
+										control_identifier_owners = control_identifier_owners.set(
+											payload.binder_identifier_index,
+											control_identifier_owners
+												.get(payload.binder_identifier_index)
+												.get_or(0) + 1,
+										)
+
+									var parameter_offset: Int = 0
+									parameter_count = node.child_count - 2
+
+									while parameter_offset < parameter_count and valid:
+										parameter_slot = payload.parameter_start + parameter_offset
+
+										match rep.concurrent_params.get(parameter_slot):
+											Some(parameter):
+												if (
+													not compact_source_span_is_valid(
+														rep.source_owners,
+														parameter.span,
+													)
+													or parameter.name_identifier_index < 0
+													or parameter.name_identifier_index >= rep.control_identifiers.length()
+												):
+													valid = False
+												else:
+													concurrent_param_slot_owners = concurrent_param_slot_owners.set(
+														parameter_slot,
+														concurrent_param_slot_owners
+															.get(parameter_slot)
+															.get_or(0) + 1,
+													)
+													control_identifier_owners = control_identifier_owners.set(
+														parameter.name_identifier_index,
+														control_identifier_owners
+															.get(parameter.name_identifier_index)
+															.get_or(0) + 1,
+													)
+											None:
+												valid = False
+
+										parameter_offset += 1
+								None:
+									valid = False
+						CompactDetachNode:
+							if node.payload_index != NO_COMPACT_PAYLOAD_INDEX:
+								valid = False
 						CompactImmutableVarDeclNode | CompactMutableVarDeclNode | CompactQuestionBindNode:
 							match rep.typed_binders.get(node.payload_index):
 								Some(payload):
@@ -2823,6 +2980,12 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 			for owners in function_annotation_slot_owners:
 				valid = valid and owners == 1
 
+			for owners in concurrent_param_slot_owners:
+				valid = valid and owners == 1
+
+			for owners in concurrent_for_payload_owners:
+				valid = valid and owners == 1
+
 			for owners in unit_owners:
 				valid = valid and owners == 1
 
@@ -2873,6 +3036,8 @@ pure func compact_expression_oracle_from_parsed_roots(
 	var callable_type_params: List[CompactCallableTypeParamRow] = []
 	var callable_dim_constraints: List[CompactCallableDimConstraintRow] = []
 	var function_annotations: List[CompactFunctionAnnotationKind] = []
+	var concurrent_params: List[CompactConcurrentParamRow] = []
+	var concurrent_for_payloads: List[CompactConcurrentForRow] = []
 	var unit_payloads: List[CompactUnitPayloadRow] = []
 	var actions: List[CompactBuildAction] = []
 	var values: List[Int] = []
@@ -3438,6 +3603,40 @@ pure func compact_expression_oracle_from_parsed_roots(
 									supported = False
 
 							function_param_index -= 1
+					ParsedConcurrentBlockExpr(params, body, span):
+						actions = actions
+							.append(CompactBuildConcurrentBlock(params, span))
+							.append(CompactBuildVisit(body))
+						var concurrent_param_index = params.length() - 1
+
+						while concurrent_param_index >= 0:
+							match params.get(concurrent_param_index):
+								Some(param):
+									actions = actions.append(CompactBuildVisit(param.value))
+								None:
+									supported = False
+
+							concurrent_param_index -= 1
+					ParsedConcurrentForExpr(name, iterable, params, body, span):
+						actions = actions
+							.append(CompactBuildConcurrentFor(name, params, span))
+							.append(CompactBuildVisit(body))
+						var concurrent_param_index = params.length() - 1
+
+						while concurrent_param_index >= 0:
+							match params.get(concurrent_param_index):
+								Some(param):
+									actions = actions.append(CompactBuildVisit(param.value))
+								None:
+									supported = False
+
+							concurrent_param_index -= 1
+
+						actions = actions.append(CompactBuildVisit(iterable))
+					ParsedDetachExpr(body, span):
+						actions = actions
+							.append(CompactBuildSequence(CompactDetachNode, 1, span))
+							.append(CompactBuildVisit(body))
 					ParsedDebugBlockExpr(body, span):
 						actions = actions
 							.append(CompactBuildSequence(CompactDebugBlockNode, 1, span))
@@ -4999,6 +5198,104 @@ pure func compact_expression_oracle_from_parsed_roots(
 						span = compact_source_location(decl.span),
 					})
 					values = values.append(node_index)
+			Some(CompactBuildConcurrentBlock(params, span)):
+				child_count = params.length() + 1
+
+				if values.length() < child_count:
+					supported = False
+				else:
+					value_start = values.length() - child_count
+					child_start = children.length()
+					var value_index = value_start
+
+					while value_index < values.length():
+						children = children.append(
+							values
+								.get(value_index)
+								.get_or(-1),
+						)
+						value_index += 1
+
+					values = values.take(value_start)
+					parameter_start = concurrent_params.length()
+
+					for param in params:
+						text_index = texts.length()
+						texts = texts.append(param.name.text)
+						identifier_index = control_identifiers.length()
+						control_identifiers = control_identifiers.append({
+							text_index = text_index,
+							span = compact_source_location(param.name.span),
+						})
+						concurrent_params = concurrent_params.append({
+							name_identifier_index = identifier_index,
+							span = compact_source_location(param.span),
+						})
+
+					node_index = nodes.length()
+					nodes = nodes.append({
+						kind = CompactConcurrentBlockNode,
+						payload_index = parameter_start,
+						child_start = child_start,
+						child_count = child_count,
+						span = compact_source_location(span),
+					})
+					values = values.append(node_index)
+			Some(CompactBuildConcurrentFor(name, params, span)):
+				child_count = params.length() + 2
+
+				if values.length() < child_count:
+					supported = False
+				else:
+					value_start = values.length() - child_count
+					child_start = children.length()
+					var value_index = value_start
+
+					while value_index < values.length():
+						children = children.append(
+							values
+								.get(value_index)
+								.get_or(-1),
+						)
+						value_index += 1
+
+					values = values.take(value_start)
+					binder_text_index = texts.length()
+					texts = texts.append(name.text)
+					binder_identifier_index = control_identifiers.length()
+					control_identifiers = control_identifiers.append({
+						text_index = binder_text_index,
+						span = compact_source_location(name.span),
+					})
+					parameter_start = concurrent_params.length()
+
+					for param in params:
+						text_index = texts.length()
+						texts = texts.append(param.name.text)
+						identifier_index = control_identifiers.length()
+						control_identifiers = control_identifiers.append({
+							text_index = text_index,
+							span = compact_source_location(param.name.span),
+						})
+						concurrent_params = concurrent_params.append({
+							name_identifier_index = identifier_index,
+							span = compact_source_location(param.span),
+						})
+
+					payload_index = concurrent_for_payloads.length()
+					concurrent_for_payloads = concurrent_for_payloads.append({
+						binder_identifier_index = binder_identifier_index,
+						parameter_start = parameter_start,
+					})
+					node_index = nodes.length()
+					nodes = nodes.append({
+						kind = CompactConcurrentForNode,
+						payload_index = payload_index,
+						child_start = child_start,
+						child_count = child_count,
+						span = compact_source_location(span),
+					})
+					values = values.append(node_index)
 			Some(CompactBuildTypeIdentifiers(kind, identifiers, child_count, span)):
 				if type_values.length() < child_count:
 					supported = False
@@ -5129,6 +5426,8 @@ pure func compact_expression_oracle_from_parsed_roots(
 			callable_type_params = callable_type_params,
 			callable_dim_constraints = callable_dim_constraints,
 			function_annotations = function_annotations,
+			concurrent_params = concurrent_params,
+			concurrent_for_payloads = concurrent_for_payloads,
 			unit_payloads = unit_payloads,
 			roots = values
 		}
@@ -5174,6 +5473,44 @@ private pure func projected_control_identifier(
 				.map(func(text): parsed_identifier(text, identifier.span.location))
 		None:
 			None
+
+
+private pure func projected_concurrent_params(
+	rep: CompactExpressionProductRep,
+	projected: List[ParsedExpr],
+	node: CompactExpressionNodeRow,
+	parameter_start: Int,
+	child_start_offset: Int,
+	parameter_count: Int,
+) -> Option[List[ParsedConcurrentParam]]:
+	var params: List[ParsedConcurrentParam] = []
+	var parameter_offset: Int = 0
+	var valid = True
+
+	while parameter_offset < parameter_count and valid:
+		match (
+			rep.concurrent_params.get(parameter_start + parameter_offset),
+			projected_child(rep, projected, node, child_start_offset + parameter_offset),
+		):
+			(Some(parameter), Some(value)):
+				match projected_control_identifier(rep, parameter.name_identifier_index):
+					Some(name):
+						params = params.append({
+							name = name,
+							value = value,
+							span = parameter.span.location,
+						})
+					None:
+						valid = False
+			_:
+				valid = False
+
+		parameter_offset += 1
+
+	if valid:
+		Some(params)
+	else:
+		None
 
 
 private pure func projected_identifier_slice(
@@ -6682,6 +7019,68 @@ pure func compact_expression_oracle_project(
 										void
 							None:
 								void
+					CompactConcurrentBlockNode:
+						parameter_count = node.child_count - 1
+
+						match (
+							projected_concurrent_params(
+								rep,
+								projected,
+								node,
+								node.payload_index,
+								0,
+								parameter_count,
+							),
+							projected_child(rep, projected, node, parameter_count),
+						):
+							(Some(params), Some(body)):
+								value = Some(ParsedConcurrentBlockExpr(params, body, span))
+							_:
+								void
+					CompactConcurrentForNode:
+						match rep.concurrent_for_payloads.get(node.payload_index):
+							Some(payload):
+								parameter_count = node.child_count - 2
+
+								match (
+									projected_control_identifier(
+										rep,
+										payload.binder_identifier_index,
+									),
+									projected_child(rep, projected, node, 0),
+									projected_concurrent_params(
+										rep,
+										projected,
+										node,
+										payload.parameter_start,
+										1,
+										parameter_count,
+									),
+									projected_child(rep, projected, node, parameter_count + 1),
+								):
+									(Some(name), Some(iterable), Some(params), Some(body)):
+										value = Some(
+											ParsedConcurrentForExpr(
+												name,
+												iterable,
+												params,
+												body,
+												span,
+											),
+										)
+									_:
+										void
+							None:
+								void
+					CompactDetachNode:
+						value = projected_child(
+							rep,
+							projected,
+							node,
+							0,
+						).map(
+							func(body): ParsedDetachExpr(body, span),
+						)
 					CompactDebugBlockNode:
 						value = projected_child(
 							rep,
@@ -7064,6 +7463,83 @@ private pure func compact_expression_oracle_reference_traversal(
 								-- The production expression-reference consumer treats nested
 								-- declarations as opaque and does not bind their names.
 								void
+							CompactConcurrentBlockNode:
+								parameter_count = node.child_count - 1
+								body_id = rep.children
+									.get(node.child_start + parameter_count)
+									.get_or(-1)
+
+								match rep.nodes.get(body_id):
+									Some(body):
+										if body.kind == CompactBlockNode:
+											var task_offset = body.child_count - 1
+
+											while task_offset >= 0:
+												actions = actions.append(
+													CompactReferenceVisitConcurrentTask(
+														rep.children
+															.get(body.child_start + task_offset)
+															.get_or(-1),
+													),
+												)
+												task_offset -= 1
+										else:
+											actions = actions.append(CompactReferenceVisit(body_id))
+									None:
+										void
+
+								var parameter_offset = parameter_count - 1
+
+								while parameter_offset >= 0:
+									actions = actions.append(
+										CompactReferenceVisit(
+											rep.children
+												.get(node.child_start + parameter_offset)
+												.get_or(-1),
+										),
+									)
+									parameter_offset -= 1
+							CompactConcurrentForNode:
+								match rep.concurrent_for_payloads.get(node.payload_index):
+									Some(payload):
+										parameter_count = node.child_count - 2
+										actions = actions
+											.append(CompactReferenceLeaveBindings(1))
+											.append(
+												CompactReferenceVisit(
+													rep.children
+														.get(node.child_start + parameter_count + 1)
+														.get_or(-1),
+												),
+											)
+											.append(
+												CompactReferenceEnterIdentifier(
+													payload.binder_identifier_index,
+												),
+											)
+										var parameter_offset = parameter_count - 1
+
+										while parameter_offset >= 0:
+											actions = actions.append(
+												CompactReferenceVisit(
+													rep.children
+														.get(
+															node.child_start + parameter_offset + 1,
+														)
+														.get_or(-1),
+												),
+											)
+											parameter_offset -= 1
+
+										actions = actions.append(
+											CompactReferenceVisit(
+												rep.children
+													.get(node.child_start)
+													.get_or(-1),
+											),
+										)
+									None:
+										void
 							CompactBlockNode:
 								var entered_count: Int = 0
 								leave_action_index = actions.length()
@@ -7188,6 +7664,22 @@ private pure func compact_expression_oracle_reference_traversal(
 											void
 
 									child_offset -= 1
+					None:
+						void
+			Some(CompactReferenceVisitConcurrentTask(node_id)):
+				match rep.nodes.get(node_id):
+					Some(node):
+						match node.kind:
+							CompactAssignNode | CompactImmutableVarDeclNode | CompactMutableVarDeclNode:
+								actions = actions.append(
+									CompactReferenceVisit(
+										rep.children
+											.get(node.child_start)
+											.get_or(-1),
+									),
+								)
+							_:
+								actions = actions.append(CompactReferenceVisit(node_id))
 					None:
 						void
 			Some(CompactReferenceEnterIdentifier(identifier_index)):
@@ -7328,6 +7820,8 @@ pure func compact_expression_oracle_counts(
 		callable_type_param_count = rep.callable_type_params.length(),
 		callable_dim_constraint_count = rep.callable_dim_constraints.length(),
 		function_annotation_count = rep.function_annotations.length(),
+		concurrent_param_count = rep.concurrent_params.length(),
+		concurrent_for_payload_count = rep.concurrent_for_payloads.length(),
 		unit_payload_count = rep.unit_payloads.length(),
 		root_count = rep.roots.length()
 	}
@@ -7658,6 +8152,50 @@ pure func compact_expression_oracle_rejects_corruption(
 			doc = None,
 			span = start_span.location,
 		})
+		concurrent_block = ParsedConcurrentBlockExpr(
+			[
+				{
+					name = parsed_identifier("limit", start_span.location),
+					value = left,
+					span = start_span.location
+				},
+			],
+			right,
+			start_span.location,
+		)
+		first_concurrent_for = ParsedConcurrentForExpr(
+			parsed_identifier(
+				"item",
+				start_span.location,
+			),
+			left,
+			[
+				{
+					name = parsed_identifier("limit", start_span.location),
+					value = right,
+					span = start_span.location
+				},
+			],
+			right,
+			start_span.location,
+		)
+		second_concurrent_for = ParsedConcurrentForExpr(
+			parsed_identifier(
+				"other",
+				start_span.location,
+			),
+			right,
+			[
+				{
+					name = parsed_identifier("timeout", start_span.location),
+					value = left,
+					span = start_span.location
+				},
+			],
+			left,
+			start_span.location,
+		)
+		detached = ParsedDetachExpr(left, start_span.location)
 
 		match (
 			compact_expression_oracle_from_parsed_roots(
@@ -7682,6 +8220,10 @@ pure func compact_expression_oracle_rejects_corruption(
 					second_lambda,
 					first_function,
 					second_function,
+					concurrent_block,
+					first_concurrent_for,
+					second_concurrent_for,
+					detached,
 				],
 			)
 		):
@@ -7741,6 +8283,18 @@ pure func compact_expression_oracle_rejects_corruption(
 					.get_or(-1)
 				second_function_root = rep.roots
 					.get(18)
+					.get_or(-1)
+				concurrent_block_root = rep.roots
+					.get(19)
+					.get_or(-1)
+				first_concurrent_for_root = rep.roots
+					.get(20)
+					.get_or(-1)
+				second_concurrent_for_root = rep.roots
+					.get(21)
+					.get_or(-1)
+				detach_root = rep.roots
+					.get(22)
 					.get_or(-1)
 
 				match corruption:
@@ -8621,6 +9175,158 @@ pure func compact_expression_oracle_rejects_corruption(
 								CompactTailRecursiveAnnotation,
 							)
 						}
+					CompactConcurrentParamSliceAlias:
+						match (
+							rep.nodes.get(concurrent_block_root),
+							rep.nodes.get(first_concurrent_for_root),
+						):
+							(Some(block_node), Some(for_node)):
+								match rep.concurrent_for_payloads.get(for_node.payload_index):
+									Some(payload):
+										corrupted = { rep |
+											concurrent_for_payloads = rep.concurrent_for_payloads.set(
+												for_node.payload_index,
+												{ payload |
+													parameter_start = block_node.payload_index
+												},
+											)
+										}
+									None:
+										void
+							_:
+								void
+					CompactConcurrentOrphanParam:
+						corrupted = { rep | concurrent_params = rep.concurrent_params.append({
+								name_identifier_index = 0,
+								span = start_span,
+							}) }
+					CompactConcurrentParamForeignSourceOwner:
+						match rep.nodes.get(concurrent_block_root):
+							Some(node):
+								match rep.concurrent_params.get(node.payload_index):
+									Some(parameter):
+										corrupted = { rep |
+											concurrent_params = rep.concurrent_params.set(
+												node.payload_index,
+												{ parameter |
+													span = { parameter.span |
+														source_owner_index = 1
+													}
+												},
+											)
+										}
+									None:
+										void
+							None:
+								void
+					CompactConcurrentParamIdentifierAlias:
+						match (
+							rep.nodes.get(concurrent_block_root),
+							rep.nodes.get(first_concurrent_for_root),
+						):
+							(Some(block_node), Some(for_node)):
+								match (
+									rep.concurrent_params.get(block_node.payload_index),
+									rep.concurrent_for_payloads.get(for_node.payload_index),
+								):
+									(Some(block_parameter), Some(for_payload)):
+										match rep.concurrent_params.get(
+											for_payload.parameter_start,
+										):
+											Some(for_parameter):
+												corrupted = { rep |
+													concurrent_params = rep.concurrent_params.set(
+														for_payload.parameter_start,
+														{ for_parameter |
+															name_identifier_index = block_parameter.name_identifier_index
+														},
+													)
+												}
+											None:
+												void
+									_:
+										void
+							_:
+								void
+					CompactConcurrentForPayloadAlias:
+						match (
+							rep.nodes.get(first_concurrent_for_root),
+							rep.nodes.get(second_concurrent_for_root),
+						):
+							(Some(first_node), Some(second_node)):
+								corrupted = { rep |
+									nodes = rep.nodes.set(
+										second_concurrent_for_root,
+										{ second_node | payload_index = first_node.payload_index },
+									)
+								}
+							_:
+								void
+					CompactConcurrentForOrphanPayload:
+						corrupted = { rep |
+							concurrent_for_payloads = rep.concurrent_for_payloads.append({
+								binder_identifier_index = 0,
+								parameter_start = 0,
+							})
+						}
+					CompactConcurrentForBinderAlias:
+						match (
+							rep.nodes.get(first_concurrent_for_root),
+							rep.nodes.get(second_concurrent_for_root),
+						):
+							(Some(first_node), Some(second_node)):
+								match (
+									rep.concurrent_for_payloads.get(first_node.payload_index),
+									rep.concurrent_for_payloads.get(second_node.payload_index),
+								):
+									(Some(first_payload), Some(second_payload)):
+										corrupted = { rep |
+											concurrent_for_payloads = rep.concurrent_for_payloads.set(
+												second_node.payload_index,
+												{ second_payload |
+													binder_identifier_index = first_payload.binder_identifier_index
+												},
+											)
+										}
+									_:
+										void
+							_:
+								void
+					CompactConcurrentBlockWrongArity | CompactConcurrentPayloadFamilyMismatch:
+						match rep.nodes.get(concurrent_block_root):
+							Some(node):
+								changed = if corruption == CompactConcurrentBlockWrongArity:
+									{ node | child_count = 0 }
+								else:
+									{ node |
+										kind = CompactConcurrentForNode,
+										payload_index = 0
+									}
+
+								corrupted = { rep |
+									nodes = rep.nodes.set(concurrent_block_root, changed)
+								}
+							None:
+								void
+					CompactConcurrentForWrongArity:
+						match rep.nodes.get(first_concurrent_for_root):
+							Some(node):
+								corrupted = { rep |
+									nodes = rep.nodes.set(
+										first_concurrent_for_root,
+										{ node | child_count = 1 },
+									)
+								}
+							None:
+								void
+					CompactDetachWrongArity:
+						match rep.nodes.get(detach_root):
+							Some(node):
+								corrupted = { rep |
+									nodes = rep.nodes.set(detach_root, { node | child_count = 0 })
+								}
+							None:
+								void
 
 				not compact_expression_product_is_valid(corrupted)
 			Err(_):

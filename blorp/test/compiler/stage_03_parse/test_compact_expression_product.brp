@@ -58,11 +58,19 @@ import:
 			CompactFunctionDocTextOutOfRange,
 			CompactFunctionWrongArity,
 			CompactFunctionOrphanAnnotation,
+			CompactConcurrentParamSliceAlias,
+			CompactConcurrentOrphanParam,
+			CompactConcurrentParamForeignSourceOwner,
+			CompactConcurrentParamIdentifierAlias,
+			CompactConcurrentForPayloadAlias,
+			CompactConcurrentForOrphanPayload,
+			CompactConcurrentForBinderAlias,
+			CompactConcurrentBlockWrongArity,
+			CompactConcurrentForWrongArity,
+			CompactDetachWrongArity,
+			CompactConcurrentPayloadFamilyMismatch,
 		),
-		CompactExpressionOracleError(
-			InvalidCompactExpressionOracleProduct,
-			UnsupportedCompactExpressionOracleForm,
-		),
+		CompactExpressionOracleError(InvalidCompactExpressionOracleProduct),
 		compact_expression_oracle_counts,
 		compact_expression_oracle_free_identifier_references,
 		compact_expression_oracle_from_parsed_roots,
@@ -90,6 +98,7 @@ import:
 			ParsedAssignMultiplyOp,
 			ParsedAssignSubtractOp,
 		),
+		ParsedConcurrentParam,
 		ParsedDecl(FunctionParsedDecl),
 		ParsedDictEntry,
 		ParsedDimBinaryOp(
@@ -110,6 +119,8 @@ import:
 			ParsedCharLiteralExpr,
 			ParsedContinueExpr,
 			ParsedCompoundAssignExpr,
+			ParsedConcurrentBlockExpr,
+			ParsedConcurrentForExpr,
 			ParsedDebugBlockExpr,
 			ParsedDetachExpr,
 			ParsedDictExpr,
@@ -213,6 +224,7 @@ import:
 		source_file,
 		source_location_for_file,
 		source_location_start_offset,
+		source_span_text,
 	memory: size_of
 	test: TestSuite
 
@@ -1196,6 +1208,107 @@ pure func callable_roots(src: SourceFile) -> List[ParsedExpr]:
 	]
 
 
+pure func concurrency_roots(src: SourceFile) -> List[ParsedExpr]:
+	common_span = span(src, 0, 5)
+	name: pure (String) -> ParsedIdentifier = pure func(text):
+		parsed_identifier(text, common_span)
+	ref: pure (String) -> ParsedExpr = pure func(text):
+		ParsedNameExpr(name(text))
+
+	[
+		ParsedConcurrentBlockExpr(
+			[
+				{
+					name = name("limit"),
+					value = ref("param_source"),
+					span = common_span
+				},
+				{
+					name = name("limit"),
+					value = ref("limit"),
+					span = common_span
+				},
+			],
+			ParsedBlockExpr(
+				[
+					ParsedAssignExpr(name("assigned_task"), ref("assigned_source"), common_span),
+					ParsedVarDeclExpr(
+						name("immutable_task"),
+						None,
+						ref("immutable_source"),
+						False,
+						common_span,
+					),
+					ParsedVarDeclExpr(
+						name("mutable_task"),
+						None,
+						ref("mutable_source"),
+						True,
+						common_span,
+					),
+					ref("assigned_task"),
+					ref("immutable_task"),
+					ref("mutable_task"),
+				],
+				common_span,
+			),
+			common_span,
+		),
+		ParsedConcurrentBlockExpr([], ref("non_block_body"), common_span),
+		ParsedConcurrentForExpr(
+			name("item"),
+			ref("items"),
+			[
+				{
+					name = name("limit"),
+					value = ref("item"),
+					span = common_span
+				},
+				{
+					name = name("timeout"),
+					value = ref("timeout_value"),
+					span = common_span
+				},
+			],
+			ParsedCallExpr(
+				ref("consume"),
+				[ref("item"), ref("outside")],
+				common_span,
+			),
+			common_span,
+		),
+		ParsedDetachExpr(
+			ParsedCallExpr(ref("launch"), [ref("payload")], common_span),
+			common_span,
+		),
+		ParsedConcurrentBlockExpr(
+			[
+				{
+					name = name("missing_param"),
+					value = ParsedMissingExpr(common_span),
+					span = common_span
+				},
+			],
+			ParsedMissingExpr(common_span),
+			common_span,
+		),
+		ParsedConcurrentForExpr(
+			name("missing_item"),
+			ParsedMissingExpr(common_span),
+			[
+				{
+					name = name("missing_param"),
+					value = ParsedMissingExpr(common_span),
+					span = common_span
+				},
+			],
+			ParsedMissingExpr(common_span),
+			common_span,
+		),
+		ParsedDetachExpr(ParsedMissingExpr(common_span), common_span),
+	]
+
+
 pure func optional_expressions_equal(left: Option[ParsedExpr], right: Option[ParsedExpr]) -> Bool:
 	match left:
 		Some(left_expr):
@@ -1963,6 +2076,34 @@ pure func expressions_equal(left: ParsedExpr, right: ParsedExpr) -> Bool:
 					)
 				_:
 					False
+		ParsedConcurrentBlockExpr(left_params, left_body, left_span):
+			match right:
+				ParsedConcurrentBlockExpr(right_params, right_body, right_span):
+					(
+						concurrent_params_equal(left_params, right_params)
+						and expressions_equal(left_body, right_body)
+						and left_span == right_span
+					)
+				_:
+					False
+		ParsedConcurrentForExpr(left_name, left_iterable, left_params, left_body, left_span):
+			match right:
+				ParsedConcurrentForExpr(right_name, right_iterable, right_params, right_body, right_span):
+					(
+						identifiers_equal(left_name, right_name)
+						and expressions_equal(left_iterable, right_iterable)
+						and concurrent_params_equal(left_params, right_params)
+						and expressions_equal(left_body, right_body)
+						and left_span == right_span
+					)
+				_:
+					False
+		ParsedDetachExpr(left_body, left_span):
+			match right:
+				ParsedDetachExpr(right_body, right_span):
+					expressions_equal(left_body, right_body) and left_span == right_span
+				_:
+					False
 		ParsedVoidExpr(left_span):
 			match right:
 				ParsedVoidExpr(right_span):
@@ -1999,6 +2140,32 @@ pure func expressions_equal(left: ParsedExpr, right: ParsedExpr) -> Bool:
 
 pure func identifiers_equal(left: ParsedIdentifier, right: ParsedIdentifier) -> Bool:
 	left.text == right.text and left.span == right.span
+
+
+pure func concurrent_params_equal(
+	left: List[ParsedConcurrentParam],
+	right: List[ParsedConcurrentParam],
+) -> Bool:
+	if left.length() != right.length():
+		False
+	else:
+		var equal = True
+		var index: Int = 0
+
+		while index < left.length() and equal:
+			match (left.get(index), right.get(index)):
+				(Some(left_param), Some(right_param)):
+					equal = (
+						identifiers_equal(left_param.name, right_param.name)
+						and expressions_equal(left_param.value, right_param.value)
+						and left_param.span == right_param.span
+					)
+				_:
+					equal = False
+
+			index += 1
+
+		equal
 
 
 pure func for_binders_equal(left: ParsedForBinder, right: ParsedForBinder) -> Bool:
@@ -3199,16 +3366,160 @@ func test_callable_metadata_counts_are_explicit() -> Bool:
 			False
 
 
-func test_unsupported_form_is_rejected_explicitly() -> Bool:
+func test_concurrency_family_round_trips_exactly() -> Bool:
+	src = source()
+	roots = concurrency_roots(src)
+
+	match compact_expression_oracle_from_parsed_roots(src, roots):
+		Ok(product):
+			match compact_expression_oracle_project(product):
+				Ok(projected):
+					expression_lists_equal(roots, projected)
+				Err(_):
+					False
+		Err(_):
+			False
+
+
+func test_concurrency_real_parser_and_recovery_round_trip_exactly() -> Bool:
+	program_text = "func run(items: List[Int]):\n\tconcurrent(max_threads: 4, timeout: 5000):\n\t\tfirst = launch()\n\t\tvar second = launch()\n\tfor item in items concurrently(limit: 2, timeout: 5000):\n\t\tconsume(item)\n\tdetach launch()"
+	program_source = source_file("concurrency.brp", "concurrency", program_text)
+	recovery_text = "func run():\n\tconcurrent(timeout: ):\n\t\tdetach"
+	recovery_source = source_file("concurrency_recovery.brp", "concurrency_recovery", recovery_text)
+	recovery_program = parse_compiler_source(recovery_source)
+
+	match (
+		first_function_body(parse_compiler_source(program_source)),
+		first_function_body(recovery_program),
+		recovery_program.diagnostics.get(0),
+		recovery_program.diagnostics.get(1),
+	):
+		(Some(body), Some(recovery_body), Some(first_diagnostic), Some(second_diagnostic)):
+			match compact_expression_oracle_from_parsed_roots(program_source, [body]):
+				Ok(product):
+					match compact_expression_oracle_project(product):
+						Ok([projected]):
+							match compact_expression_oracle_from_parsed_roots(
+								recovery_source,
+								[recovery_body],
+							):
+								Ok(recovery_product):
+									match compact_expression_oracle_project(recovery_product):
+										Ok([projected_recovery]):
+											(
+												expressions_equal(body, projected)
+												and expressions_equal(
+													recovery_body,
+													projected_recovery,
+												)
+												and recovery_program.diagnostics.length() == 2
+												and first_diagnostic.message == "expected expression"
+												and first_diagnostic.expected == ["expression"]
+												and first_diagnostic.help == None
+												and source_span_text(
+													recovery_source,
+													first_diagnostic.span,
+												) == ")"
+												and second_diagnostic.message == "expected expression"
+												and second_diagnostic.expected == ["expression"]
+												and second_diagnostic.help == None
+												and second_diagnostic.span.start_offset == recovery_text.length()
+												and second_diagnostic.span.end_offset == recovery_text.length()
+											)
+										_:
+											False
+								Err(_):
+									False
+						_:
+							False
+				Err(_):
+					False
+		_:
+			False
+
+
+func test_concurrency_reference_scopes_match_production() -> Bool:
+	src = source()
+	roots = concurrency_roots(src)
+	legacy = roots.flat_map(func(root): parsed_expr_free_identifier_references(root))
+
+	match compact_expression_oracle_from_parsed_roots(src, roots):
+		Ok(product):
+			compact = compact_expression_oracle_free_identifier_references(product)
+			(
+				reference_lists_equal(legacy, compact)
+				and compact.map(
+					func(
+						reference,
+					): reference.name,
+				) == [
+					"param_source",
+					"limit",
+					"assigned_source",
+					"immutable_source",
+					"mutable_source",
+					"assigned_task",
+					"immutable_task",
+					"mutable_task",
+					"non_block_body",
+					"items",
+					"item",
+					"timeout_value",
+					"consume",
+					"outside",
+					"launch",
+					"payload",
+				]
+			)
+		Err(_):
+			False
+
+
+func test_concurrent_task_labels_are_not_ordinary_assignment_reads() -> Bool:
+	src = source()
+	common_span = span(src, 0, 5)
+	label = parsed_identifier("task_label", common_span)
+	value = ParsedNameExpr(parsed_identifier("source", common_span))
+	ordinary = ParsedAssignExpr(label, value, common_span)
+	concurrent_expr = ParsedConcurrentBlockExpr(
+		[],
+		ParsedBlockExpr([ordinary], common_span),
+		common_span,
+	)
+	legacy_ordinary = parsed_expr_free_identifier_references(ordinary)
+	legacy_concurrent = parsed_expr_free_identifier_references(concurrent_expr)
+
+	match (
+		compact_expression_oracle_from_parsed_roots(
+			src,
+			[ordinary, concurrent_expr],
+		)
+	):
+		Ok(product):
+			compact = compact_expression_oracle_free_identifier_references(product)
+			(
+				legacy_ordinary.map(func(reference): reference.name) == ["task_label", "source"]
+				and legacy_concurrent.map(func(reference): reference.name) == ["source"]
+				and compact.map(
+					func(reference): reference.name,
+				) == ["task_label", "source", "source"]
+			)
+		Err(_):
+			False
+
+
+func test_concurrency_metadata_counts_are_explicit() -> Bool:
 	src = source()
 
-	match compact_expression_oracle_from_parsed_roots(src, [ParsedDetachExpr(
-				ParsedVoidExpr(span(src, 0, 5)),
-				span(src, 0, 5),
-			)]):
-		Err(UnsupportedCompactExpressionOracleForm):
-			True
-		_:
+	match compact_expression_oracle_from_parsed_roots(src, concurrency_roots(src)):
+		Ok(product):
+			counts = compact_expression_oracle_counts(product)
+			(
+				counts.concurrent_param_count == 6
+				and counts.concurrent_for_payload_count == 2
+				and counts.root_count == 7
+			)
+		Err(_):
 			False
 
 
@@ -3274,6 +3585,17 @@ func test_validator_rejects_corrupt_products() -> Bool:
 		CompactFunctionDocTextOutOfRange,
 		CompactFunctionWrongArity,
 		CompactFunctionOrphanAnnotation,
+		CompactConcurrentParamSliceAlias,
+		CompactConcurrentOrphanParam,
+		CompactConcurrentParamForeignSourceOwner,
+		CompactConcurrentParamIdentifierAlias,
+		CompactConcurrentForPayloadAlias,
+		CompactConcurrentForOrphanPayload,
+		CompactConcurrentForBinderAlias,
+		CompactConcurrentBlockWrongArity,
+		CompactConcurrentForWrongArity,
+		CompactDetachWrongArity,
+		CompactConcurrentPayloadFamilyMismatch,
 	]
 	var rejected = True
 
@@ -3501,8 +3823,20 @@ tests: TestSuite = {
 			"callable reference scopes match production",
 			test_callable_reference_scopes_match_production,
 		),
+		("concurrency family round trips exactly", test_concurrency_family_round_trips_exactly),
+		(
+			"concurrency real parser and recovery round trip exactly",
+			test_concurrency_real_parser_and_recovery_round_trip_exactly,
+		),
+		(
+			"concurrency reference scopes match production",
+			test_concurrency_reference_scopes_match_production,
+		),
+		(
+			"concurrent task labels are not ordinary assignment reads",
+			test_concurrent_task_labels_are_not_ordinary_assignment_reads,
+		),
 		("validator rejects corrupt products", test_validator_rejects_corrupt_products),
-		("unsupported form is rejected explicitly", test_unsupported_form_is_rejected_explicitly),
 		(
 			"empty and small layout counts are explicit",
 			test_empty_and_small_layout_counts_are_explicit,
@@ -3529,5 +3863,9 @@ tests: TestSuite = {
 			test_select_and_with_metadata_counts_are_explicit,
 		),
 		("callable metadata counts are explicit", test_callable_metadata_counts_are_explicit),
+		(
+			"concurrency metadata counts are explicit",
+			test_concurrency_metadata_counts_are_explicit,
+		),
 	]
 }
