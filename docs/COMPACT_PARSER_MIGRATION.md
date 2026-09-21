@@ -67,13 +67,15 @@ After the type/interpolation checkpoint, the product-only lifetime for sixteen
 binary roots (48 nodes) is 8 objects and 4,832 bytes, versus 81 objects and
 5,824 bytes for freshly constructed legacy trees with the same root shape.
 This is a retained-layout comparison, not a construction-speed claim: the test
-oracle pays 230 allocations because it converts an existing AST and runs the
+oracle pays 233 allocations because it converts an existing AST and runs the
 exhaustive validator, while the legacy fixture construction pays 83. Empty,
 scalar, and binary compact products retain 2/320, 6/864, and 8/1,024
 objects/bytes respectively. Collections/access added five table handles and
 64 retained bytes; type/interpolation adds six more handles and another 64
 bytes. This cumulative 128-byte fixed increase is explicit rather than hidden
-by a large-tree result.
+by a large-tree result. The scope-skeleton checkpoint adds three more scalar
+table handles and raises ABI `sizeof` from 208 to 232 bytes without leaving the
+256-byte allocator class, so empty and pre-existing retained sizes do not rise.
 
 Both 48-node lifetime fixtures keep the same source and static identifier text
 outside the measurement epoch. The compact result additionally retains its
@@ -178,21 +180,53 @@ Both cases should pass. Observed behavior is that the nested match passes and
 the simultaneous match fails, so this documented reproduction intentionally
 returns a failing test status and is not registered in a normal gate.
 
+#### Sequential scope skeleton oracle
+
+The fourth test-only family adds block, immutable and mutable variable
+declarations, assignment, all four compound assignments, subscript assignment,
+tuple destructuring, and question binding. Three product-owned scalar tables
+store control identifiers, identifier slices, and typed binders. A precisely
+named `NO_COMPACT_TYPE_ROOT_INDEX` sentinel represents an absent binder type;
+the validator rejects every other negative or out-of-range root and requires
+each present type root to have one owner.
+
+The direct reference oracle uses scalar enter/leave actions and one local bound
+text-index stack. Initializers are visited before their declaration enters the
+scope, bindings affect only later block siblings, assignment targets precede
+their values, and subscript assignment preserves target/index/value order.
+Qualified `name.field` references remain suppressed only while `name` is bound.
+No product or builder record is carried by a traversal step, and no node clones
+an environment.
+
+Generated C confirms inline storage on the measured 64-bit ABI: control
+identifier rows are 24 bytes, identifier-slice rows are 16 bytes, and typed
+binder rows are 16 bytes. The complete product record is 232 bytes by ABI
+`sizeof` and still occupies the 256-byte allocator class.
+
+A deterministic 64-binding scope fixture produces 64 free initializer
+references and exactly 2,080 bound-name comparisons, matching the current
+modeled `List.contains` work (`64 * 65 / 2`). Its one product contains 193 nodes and 192
+child ids and retains 9 objects / 20,640 bytes. This is a scaling control, not
+an asymptotic improvement claim: the wide sequential workload retains
+quadratic lookup work. An exact-name index should be considered only if later measurement
+shows that lookup dominating real source/module workloads.
+
 Remaining milestone-1 coverage is deliberately finite:
 
-1. control flow, patterns, and bindings: block, if, match, select, `with`,
-   debug, lambda, nested function declarations, loops, declarations,
-   assignment, subscript assignment, destructuring, and question binding;
-2. concurrency and recovery: concurrent block/for, detach, their parameter
+1. simple control: if, debug block, while, and for;
+2. structured scopes: match, select, `with`, lambda, and nested function
+   declaration, including their pattern/binder metadata;
+3. concurrency and recovery: concurrent block/for, detach, their parameter
    metadata, and recovery-sensitive combinations of the existing missing form.
 
-The current declaration has 48 `ParsedExpr` variants. Exactly 29 are now in
-the oracle. The remaining 19 are explicit, not an open-ended category:
+The current declaration has 48 `ParsedExpr` variants. Exactly 36 are now in
+the oracle. The remaining 12 are explicit, not an open-ended category:
 
 | Status | Count | Variants |
 | --- | ---: | --- |
-| Covered | 29 | name; integer, float, string, raw interpolation, bool, and char literals; unary, binary, logical, ascription, range, call, field access, subscript, list, tuple, record, record update, dictionary, vector, opaque into/from, finalized interpolation parts, break, continue, void, builtin, missing |
-| Control/binding/pattern checkpoint | 16 | block, if, match, select, with, debug block, lambda, function declaration, while, for, variable declaration, assignment, compound assignment, subscript assignment, tuple destructuring, question binding |
+| Covered | 36 | name; integer, float, string, raw interpolation, bool, and char literals; unary, binary, logical, ascription, range, call, field access, subscript, list, tuple, record, record update, dictionary, vector, opaque into/from, finalized interpolation parts, block, variable declaration, assignment, compound assignment, subscript assignment, tuple destructuring, question binding, break, continue, void, builtin, missing |
+| Simple-control checkpoint | 4 | if, debug block, while, for |
+| Structured-scope checkpoint | 5 | match, select, with, lambda, function declaration |
 | Concurrency checkpoint | 3 | concurrent block, concurrent for, detach |
 
 After those checkpoints cover every `ParsedExpr` variant and their reachable
@@ -207,8 +241,12 @@ projection before any downstream caller migration.
 The concrete integration boundary is `ParseExprStep` and the expression
 driver rooted at `parse_expression_with_header_span`, `parse_expression`,
 `parse_primary_expr`, and `parse_postfix_expr`. Milestone 2 introduces a
-phase-specific step carrying a compact expression node id, while one outer
-driver owns the row buffers and grammar/value stacks. Existing precedence,
+phase-specific scalar step carrying only token index, diagnostics, and a
+compact expression node id. This is not a record rename: the top-level parse
+driver creates and exclusively owns every row buffer and grammar/value/action
+stack; helper results transfer only scalar control and ids back to that driver;
+publication consumes those buffers into the validated product exactly once.
+Existing precedence,
 postfix, block, and recovery helpers append completed scalar rows through that
 driver instead of returning `ParsedExpr`. Type parsing publishes type-root ids
 into the same product. Declaration/program assembly then publishes one
