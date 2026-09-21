@@ -78,10 +78,12 @@ import:
 			ParsedUnaryExpr,
 			ParsedRecordExpr,
 			ParsedRecordUpdateExpr,
+			ParsedSelectExpr,
 			ParsedVectorExpr,
 			ParsedVarDeclExpr,
 			ParsedVoidExpr,
 			ParsedWhileExpr,
+			ParsedWithExpr,
 		),
 		ParsedForBinder(ParsedForNameBinder, ParsedForTupleBinder),
 		ParsedIdentifier,
@@ -104,6 +106,8 @@ import:
 			ParsedWildcardPattern,
 		),
 		ParsedRecordExprField,
+		ParsedSelectArm,
+		ParsedSelectArmKind(ParsedSelectAfterArm, ParsedSelectReceiveArm, ParsedSelectSealedArm),
 		ParsedStringInterpolationPart(ParsedInterpolationExpr, ParsedInterpolationLiteral),
 		ParsedStringLiteralForm,
 		ParsedTypeExpr(
@@ -120,6 +124,9 @@ import:
 			ParsedTupleType,
 		),
 		ParsedUnaryOp(ParsedNegateOp, ParsedNotOp),
+		ParsedWithBinding,
+		ParsedWithBindingKind(ParsedWithPlainBinding, ParsedWithTryBinding),
+		ParsedWithErrorMap,
 		parsed_identifier,
 	source_ast_finalize: IdentifierReference
 
@@ -172,6 +179,8 @@ enum CompactExpressionNodeKind:
 	CompactForNameNode
 	CompactForTupleNode
 	CompactMatchNode
+	CompactSelectNode
+	CompactWithNode
 
 
 enum CompactPatternNodeKind:
@@ -190,6 +199,17 @@ enum CompactPatternNodeKind:
 	CompactListWildcardSpreadPatternNode
 	CompactOrPatternNode
 	CompactMissingPatternNode
+
+
+enum CompactSelectArmKind:
+	CompactSelectReceiveArm
+	CompactSelectSealedArm
+	CompactSelectAfterArm
+
+
+enum CompactWithBindingKind:
+	CompactWithPlainBinding
+	CompactWithTryBinding
 
 
 enum CompactExpressionOperator:
@@ -281,6 +301,18 @@ enum CompactExpressionCorruption:
 	CompactPatternIdentifierSliceForeignSourceOwner
 	CompactPatternRootAlias
 	CompactMatchCaseBindingCountMismatch
+	CompactSelectArmBinderMismatch
+	CompactSelectArmUnexpectedBinder
+	CompactSelectArmSliceAlias
+	CompactSelectArmForeignSourceOwner
+	CompactWithBindingAlias
+	CompactWithPlainBindingHasErrorMap
+	CompactWithTypeRootOutOfRange
+	CompactWithErrorMapOutOfRange
+	CompactWithErrorMapAlias
+	CompactWithErrorMapForeignSourceOwner
+	CompactWithWrongArity
+	CompactWithOrphanErrorMap
 
 
 struct CompactProductSourceLocation {
@@ -447,6 +479,28 @@ struct CompactMatchCaseRow {
 }
 
 
+struct CompactSelectArmRow {
+	kind: CompactSelectArmKind,
+	binder_identifier_index: Int,
+	span: CompactProductSourceLocation
+}
+
+
+struct CompactWithBindingRow {
+	kind: CompactWithBindingKind,
+	binding_identifier_index: Int,
+	type_root_index: Int,
+	error_map_index: Int,
+	span: CompactProductSourceLocation
+}
+
+
+struct CompactWithErrorMapRow {
+	identifier_index: Int,
+	span: CompactProductSourceLocation
+}
+
+
 struct CompactUnitPayloadRow {
 	kind: CompactUnitPayloadKind
 }
@@ -483,6 +537,9 @@ private record CompactExpressionProductRep {
 	pattern_identifier_slices: List[CompactPatternIdentifierSliceRow],
 	pattern_identifiers: List[CompactPatternIdentifierRow],
 	match_cases: List[CompactMatchCaseRow],
+	select_arms: List[CompactSelectArmRow],
+	with_bindings: List[CompactWithBindingRow],
+	with_error_maps: List[CompactWithErrorMapRow],
 	unit_payloads: List[CompactUnitPayloadRow],
 	roots: List[Int]
 }
@@ -522,6 +579,9 @@ record CompactExpressionProductCounts {
 	pattern_identifier_slice_count: Int,
 	pattern_identifier_count: Int,
 	match_case_count: Int,
+	select_arm_count: Int,
+	with_binding_count: Int,
+	with_error_map_count: Int,
 	unit_payload_count: Int,
 	root_count: Int
 }
@@ -563,6 +623,8 @@ private union CompactBuildAction:
 	CompactBuildIdentifier(CompactExpressionNodeKind, ParsedIdentifier, Int, SourceLocation)
 	CompactBuildIdentifierSlice(CompactExpressionNodeKind, List[ParsedIdentifier], Int, SourceLocation, SourceLocation)
 	CompactBuildMatch(List[ParsedMatchCase], SourceLocation)
+	CompactBuildSelect(List[ParsedSelectArm], SourceLocation)
+	CompactBuildWith(ParsedWithBinding, SourceLocation)
 	CompactBuildPatternVisit(ParsedPattern)
 	CompactBuildPatternNoPayload(CompactPatternNodeKind, Int, SourceLocation)
 	CompactBuildPatternText(CompactPatternNodeKind, String, SourceLocation)
@@ -590,6 +652,10 @@ private NO_COMPACT_PAYLOAD_INDEX: Int = -1
 private NO_COMPACT_SOURCE_OWNER_INDEX: Int = -1
 
 private NO_COMPACT_TYPE_ROOT_INDEX: Int = -1
+
+private NO_COMPACT_IDENTIFIER_INDEX: Int = -1
+
+private NO_COMPACT_ERROR_MAP_INDEX: Int = -1
 
 
 private pure func compact_source_location(location: SourceLocation) -> CompactProductSourceLocation:
@@ -817,7 +883,7 @@ private pure func compact_expected_child_count(
 			None
 		CompactFinalizedInterpolationNode:
 			None
-		CompactBlockNode | CompactSubscriptAssignNode | CompactIfNode | CompactMatchNode:
+		CompactBlockNode | CompactSubscriptAssignNode | CompactIfNode | CompactMatchNode | CompactSelectNode | CompactWithNode:
 			None
 		CompactAscriptionNode | CompactOpaqueIntoNode | CompactOpaqueFromNode:
 			Some(1)
@@ -953,6 +1019,9 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 		var pattern_identifier_slice_owners = 0.repeat(rep.pattern_identifier_slices.length())
 		var pattern_identifier_owners = 0.repeat(rep.pattern_identifiers.length())
 		var match_case_slot_owners = 0.repeat(rep.match_cases.length())
+		var select_arm_slot_owners = 0.repeat(rep.select_arms.length())
+		var with_binding_owners = 0.repeat(rep.with_bindings.length())
+		var with_error_map_owners = 0.repeat(rep.with_error_maps.length())
 		var validated_pattern_binding_counts = 0.repeat(rep.pattern_nodes.length())
 		var unit_owners = 0.repeat(rep.unit_payloads.length())
 
@@ -1079,6 +1148,26 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 											rep.match_cases.length(),
 										)
 									)
+								CompactSelectNode:
+									valid = (
+										node.child_count % 2 == 0
+										and compact_metadata_slice_is_valid(
+											node.payload_index,
+											node.child_count / 2,
+											rep.select_arms.length(),
+										)
+									)
+								CompactWithNode:
+									match rep.with_bindings.get(node.payload_index):
+										Some(binding):
+											expected = if binding.error_map_index == NO_COMPACT_ERROR_MAP_INDEX:
+												2
+											else:
+												3
+
+											valid = node.child_count == expected
+										None:
+											valid = False
 								_:
 									valid = False
 
@@ -1438,6 +1527,122 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 										valid = False
 
 								case_offset += 1
+						CompactSelectNode:
+							var arm_offset: Int = 0
+
+							while arm_offset < node.child_count / 2 and valid:
+								arm_slot = node.payload_index + arm_offset
+
+								match rep.select_arms.get(arm_slot):
+									Some(arm):
+										if not compact_source_span_is_valid(
+											rep.source_owners,
+											arm.span,
+										):
+											valid = False
+										else:
+											match arm.kind:
+												CompactSelectReceiveArm:
+													if (
+														arm.binder_identifier_index < 0
+														or arm.binder_identifier_index >= rep.control_identifiers.length()
+													):
+														valid = False
+													else:
+														control_identifier_owners = control_identifier_owners.set(
+															arm.binder_identifier_index,
+															control_identifier_owners
+																.get(arm.binder_identifier_index)
+																.get_or(0) + 1,
+														)
+												CompactSelectSealedArm | CompactSelectAfterArm:
+													if arm.binder_identifier_index != NO_COMPACT_IDENTIFIER_INDEX:
+														valid = False
+
+											select_arm_slot_owners = select_arm_slot_owners.set(
+												arm_slot,
+												select_arm_slot_owners
+													.get(arm_slot)
+													.get_or(0) + 1,
+											)
+									None:
+										valid = False
+
+								arm_offset += 1
+						CompactWithNode:
+							match rep.with_bindings.get(node.payload_index):
+								Some(binding):
+									if (
+										not compact_source_span_is_valid(
+											rep.source_owners,
+											binding.span,
+										)
+										or binding.binding_identifier_index < 0
+										or binding.binding_identifier_index >= rep.control_identifiers.length()
+										or (
+											binding.kind == CompactWithPlainBinding
+											and binding.error_map_index != NO_COMPACT_ERROR_MAP_INDEX
+										)
+									):
+										valid = False
+									else:
+										with_binding_owners = with_binding_owners.set(
+											node.payload_index,
+											with_binding_owners
+												.get(node.payload_index)
+												.get_or(0) + 1,
+										)
+										control_identifier_owners = control_identifier_owners.set(
+											binding.binding_identifier_index,
+											control_identifier_owners
+												.get(binding.binding_identifier_index)
+												.get_or(0) + 1,
+										)
+
+									if binding.type_root_index != NO_COMPACT_TYPE_ROOT_INDEX:
+										if (
+											binding.type_root_index < 0
+											or binding.type_root_index >= rep.type_nodes.length()
+											or type_root_membership
+												.get(binding.type_root_index)
+												.get_or(False)
+										):
+											valid = False
+										else:
+											type_root_membership = type_root_membership.set(
+												binding.type_root_index,
+												True,
+											)
+
+									if binding.error_map_index != NO_COMPACT_ERROR_MAP_INDEX:
+										match rep.with_error_maps.get(binding.error_map_index):
+											Some(error_map):
+												if (
+													not compact_source_span_is_valid(
+														rep.source_owners,
+														error_map.span,
+													)
+													or error_map.identifier_index < 0
+													or error_map.identifier_index >= rep.control_identifiers.length()
+												):
+													valid = False
+												else:
+													with_error_map_owners = with_error_map_owners.set(
+														binding.error_map_index,
+														with_error_map_owners
+															.get(binding.error_map_index)
+															.get_or(0) + 1,
+													)
+													control_identifier_owners = control_identifier_owners.set(
+														error_map.identifier_index,
+														control_identifier_owners
+															.get(error_map.identifier_index)
+															.get_or(0) + 1,
+													)
+											None:
+												valid = False
+								None:
+									valid = False
 						CompactImmutableVarDeclNode | CompactMutableVarDeclNode | CompactQuestionBindNode:
 							match rep.typed_binders.get(node.payload_index):
 								Some(payload):
@@ -2032,6 +2237,15 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 			for owners in match_case_slot_owners:
 				valid = valid and owners == 1
 
+			for owners in select_arm_slot_owners:
+				valid = valid and owners == 1
+
+			for owners in with_binding_owners:
+				valid = valid and owners == 1
+
+			for owners in with_error_map_owners:
+				valid = valid and owners == 1
+
 			for owners in unit_owners:
 				valid = valid and owners == 1
 
@@ -2073,6 +2287,9 @@ pure func compact_expression_oracle_from_parsed_roots(
 	var pattern_identifier_slices: List[CompactPatternIdentifierSliceRow] = []
 	var pattern_identifiers: List[CompactPatternIdentifierRow] = []
 	var match_cases: List[CompactMatchCaseRow] = []
+	var select_arms: List[CompactSelectArmRow] = []
+	var with_bindings: List[CompactWithBindingRow] = []
+	var with_error_maps: List[CompactWithErrorMapRow] = []
 	var unit_payloads: List[CompactUnitPayloadRow] = []
 	var actions: List[CompactBuildAction] = []
 	var values: List[Int] = []
@@ -2527,6 +2744,46 @@ pure func compact_expression_oracle_from_parsed_roots(
 							case_index -= 1
 
 						actions = actions.append(CompactBuildVisit(scrutinee))
+					ParsedSelectExpr(arms, span):
+						actions = actions.append(CompactBuildSelect(arms, span))
+						var arm_index = arms.length() - 1
+
+						while arm_index >= 0:
+							match arms.get(arm_index):
+								Some(arm):
+									source_expr: ParsedExpr = match arm.kind:
+										ParsedSelectReceiveArm(_, channel):
+											channel
+										ParsedSelectSealedArm(channel):
+											channel
+										ParsedSelectAfterArm(timeout):
+											timeout
+
+									actions = actions
+										.append(CompactBuildVisit(arm.body))
+										.append(CompactBuildVisit(source_expr))
+								None:
+									supported = False
+
+							arm_index -= 1
+					ParsedWithExpr(binding, body, span):
+						actions = actions
+							.append(CompactBuildWith(binding, span))
+							.append(CompactBuildVisit(body))
+
+						match binding.error_map:
+							Some(error_map):
+								actions = actions.append(CompactBuildVisit(error_map.value))
+							None:
+								void
+
+						match binding.type_expr:
+							Some(type_expr):
+								actions = actions.append(CompactBuildTypeVisit(type_expr))
+							None:
+								void
+
+						actions = actions.append(CompactBuildVisit(binding.value))
 					ParsedDebugBlockExpr(body, span):
 						actions = actions
 							.append(CompactBuildSequence(CompactDebugBlockNode, 1, span))
@@ -3660,6 +3917,148 @@ pure func compact_expression_oracle_from_parsed_roots(
 						span = compact_source_location(span),
 					})
 					values = values.append(node_index)
+			Some(CompactBuildSelect(arms, span)):
+				child_count = arms.length() * 2
+
+				if values.length() < child_count:
+					supported = False
+				else:
+					value_start = values.length() - child_count
+					child_start = children.length()
+					var value_offset: Int = 0
+
+					while value_offset < child_count:
+						children = children.append(
+							values
+								.get(value_start + value_offset)
+								.get_or(-1),
+						)
+						value_offset += 1
+
+					values = values.take(value_start)
+					arm_start = select_arms.length()
+
+					for arm in arms:
+						var kind = CompactSelectSealedArm
+						var binder_identifier_index = NO_COMPACT_IDENTIFIER_INDEX
+
+						match arm.kind:
+							ParsedSelectReceiveArm(name, _):
+								kind = CompactSelectReceiveArm
+								text_index = texts.length()
+								texts = texts.append(name.text)
+								binder_identifier_index = control_identifiers.length()
+								control_identifiers = control_identifiers.append({
+									text_index = text_index,
+									span = compact_source_location(name.span),
+								})
+							ParsedSelectSealedArm(_):
+								kind = CompactSelectSealedArm
+							ParsedSelectAfterArm(_):
+								kind = CompactSelectAfterArm
+
+						select_arms = select_arms.append({
+							kind = kind,
+							binder_identifier_index = binder_identifier_index,
+							span = compact_source_location(arm.span),
+						})
+
+					node_index = nodes.length()
+					nodes = nodes.append({
+						kind = CompactSelectNode,
+						payload_index = arm_start,
+						child_start = child_start,
+						child_count = child_count,
+						span = compact_source_location(span),
+					})
+					values = values.append(node_index)
+			Some(CompactBuildWith(binding, span)):
+				has_error_map = binding.error_map.is_some()
+
+				child_count = if has_error_map:
+					3
+				else:
+					2
+
+				if (
+					values.length() < child_count
+					or binding.type_expr.is_some() and type_values.is_empty()
+				):
+					supported = False
+				else:
+					value_start = values.length() - child_count
+					child_start = children.length()
+					var value_offset: Int = 0
+
+					while value_offset < child_count:
+						children = children.append(
+							values
+								.get(value_start + value_offset)
+								.get_or(-1),
+						)
+						value_offset += 1
+
+					values = values.take(value_start)
+
+					type_root_index = if binding.type_expr.is_some():
+						type_value_index = type_values.length() - 1
+						root = type_values
+							.get(type_value_index)
+							.get_or(-1)
+						type_values = type_values.take(type_value_index)
+						root
+					else:
+						NO_COMPACT_TYPE_ROOT_INDEX
+
+					binding_text_index = texts.length()
+					texts = texts.append(binding.name.text)
+					binding_identifier_index = control_identifiers.length()
+					control_identifiers = control_identifiers.append({
+						text_index = binding_text_index,
+						span = compact_source_location(binding.name.span),
+					})
+					var error_map_index = NO_COMPACT_ERROR_MAP_INDEX
+
+					match binding.error_map:
+						Some(error_map):
+							error_text_index = texts.length()
+							texts = texts.append(error_map.name.text)
+							error_identifier_index = control_identifiers.length()
+							control_identifiers = control_identifiers.append({
+								text_index = error_text_index,
+								span = compact_source_location(error_map.name.span),
+							})
+							error_map_index = with_error_maps.length()
+							with_error_maps = with_error_maps.append({
+								identifier_index = error_identifier_index,
+								span = compact_source_location(error_map.span),
+							})
+						None:
+							void
+
+					binding_kind = match binding.kind:
+						ParsedWithPlainBinding:
+							CompactWithPlainBinding
+						ParsedWithTryBinding:
+							CompactWithTryBinding
+
+					payload_index = with_bindings.length()
+					with_bindings = with_bindings.append({
+						kind = binding_kind,
+						binding_identifier_index = binding_identifier_index,
+						type_root_index = type_root_index,
+						error_map_index = error_map_index,
+						span = compact_source_location(binding.span),
+					})
+					node_index = nodes.length()
+					nodes = nodes.append({
+						kind = CompactWithNode,
+						payload_index = payload_index,
+						child_start = child_start,
+						child_count = child_count,
+						span = compact_source_location(span),
+					})
+					values = values.append(node_index)
 			Some(CompactBuildTypeIdentifiers(kind, identifiers, child_count, span)):
 				if type_values.length() < child_count:
 					supported = False
@@ -3781,6 +4180,9 @@ pure func compact_expression_oracle_from_parsed_roots(
 			pattern_identifier_slices = pattern_identifier_slices,
 			pattern_identifiers = pattern_identifiers,
 			match_cases = match_cases,
+			select_arms = select_arms,
+			with_bindings = with_bindings,
+			with_error_maps = with_error_maps,
 			unit_payloads = unit_payloads,
 			roots = values
 		}
@@ -4874,6 +5276,122 @@ pure func compact_expression_oracle_project(
 									value = Some(ParsedMatchExpr(scrutinee, cases, span))
 							None:
 								void
+					CompactSelectNode:
+						var arms: List[ParsedSelectArm] = []
+						var arm_offset: Int = 0
+
+						while arm_offset < node.child_count / 2 and valid:
+							match (
+								rep.select_arms.get(node.payload_index + arm_offset),
+								projected_child(rep, projected, node, arm_offset * 2),
+								projected_child(rep, projected, node, arm_offset * 2 + 1),
+							):
+								(Some(arm), Some(source_expr), Some(body)):
+									var kind: Option[ParsedSelectArmKind] = None
+
+									match arm.kind:
+										CompactSelectReceiveArm:
+											kind = projected_control_identifier(
+												rep,
+												arm.binder_identifier_index,
+											).map(
+												func(
+													name,
+												): ParsedSelectReceiveArm(name, source_expr),
+											)
+										CompactSelectSealedArm:
+											kind = Some(ParsedSelectSealedArm(source_expr))
+										CompactSelectAfterArm:
+											kind = Some(ParsedSelectAfterArm(source_expr))
+
+									match kind:
+										Some(arm_kind):
+											arms = arms.append({
+												kind = arm_kind,
+												body = body,
+												span = arm.span.location,
+											})
+										None:
+											valid = False
+								_:
+									valid = False
+
+							arm_offset += 1
+
+						if valid:
+							value = Some(ParsedSelectExpr(arms, span))
+					CompactWithNode:
+						match (
+							rep.with_bindings.get(node.payload_index),
+							projected_child(rep, projected, node, 0),
+						):
+							(Some(binding), Some(resource_value)):
+								match (
+									projected_control_identifier(
+										rep,
+										binding.binding_identifier_index,
+									),
+									projected_optional_type(
+										projected_types,
+										binding.type_root_index,
+									),
+								):
+									(Some(name), Some(type_expr)):
+										var error_map: Option[ParsedWithErrorMap] = None
+										var body_offset: Int = 1
+
+										if binding.error_map_index != NO_COMPACT_ERROR_MAP_INDEX:
+											body_offset = 2
+
+											match (
+												rep.with_error_maps.get(binding.error_map_index),
+												projected_child(rep, projected, node, 1),
+											):
+												(Some(map_row), Some(map_value)):
+													match projected_control_identifier(
+														rep,
+														map_row.identifier_index,
+													):
+														Some(map_name):
+															error_map = Some({
+																name = map_name,
+																value = map_value,
+																span = map_row.span.location,
+															})
+														None:
+															valid = False
+												_:
+													valid = False
+
+										match projected_child(rep, projected, node, body_offset):
+											Some(body):
+												binding_kind = match binding.kind:
+													CompactWithPlainBinding:
+														ParsedWithPlainBinding
+													CompactWithTryBinding:
+														ParsedWithTryBinding
+
+												if valid:
+													value = Some(
+														ParsedWithExpr(
+															{
+																name = name,
+																type_expr = type_expr,
+																value = resource_value,
+																kind = binding_kind,
+																error_map = error_map,
+																span = binding.span.location
+															},
+															body,
+															span,
+														),
+													)
+											None:
+												void
+									_:
+										void
+							_:
+								void
 					CompactDebugBlockNode:
 						value = projected_child(
 							rep,
@@ -5129,6 +5647,95 @@ private pure func compact_expression_oracle_reference_traversal(
 											.get_or(-1),
 									),
 								)
+							CompactSelectNode:
+								var arm_offset = node.child_count / 2 - 1
+
+								while arm_offset >= 0:
+									match rep.select_arms.get(node.payload_index + arm_offset):
+										Some(arm):
+											if arm.kind == CompactSelectReceiveArm:
+												actions = actions.append(
+													CompactReferenceLeaveBindings(1),
+												)
+
+											actions = actions.append(
+												CompactReferenceVisit(
+													rep.children
+														.get(node.child_start + arm_offset * 2 + 1)
+														.get_or(-1),
+												),
+											)
+
+											if arm.kind == CompactSelectReceiveArm:
+												actions = actions.append(
+													CompactReferenceEnterIdentifier(
+														arm.binder_identifier_index,
+													),
+												)
+
+											actions = actions.append(
+												CompactReferenceVisit(
+													rep.children
+														.get(node.child_start + arm_offset * 2)
+														.get_or(-1),
+												),
+											)
+										None:
+											void
+
+									arm_offset -= 1
+							CompactWithNode:
+								match rep.with_bindings.get(node.payload_index):
+									Some(binding):
+										body_offset = if binding.error_map_index == NO_COMPACT_ERROR_MAP_INDEX:
+											1
+										else:
+											2
+
+										actions = actions
+											.append(CompactReferenceLeaveBindings(1))
+											.append(
+												CompactReferenceVisit(
+													rep.children
+														.get(node.child_start + body_offset)
+														.get_or(-1),
+												),
+											)
+											.append(
+												CompactReferenceEnterIdentifier(
+													binding.binding_identifier_index,
+												),
+											)
+
+										if binding.error_map_index != NO_COMPACT_ERROR_MAP_INDEX:
+											match rep.with_error_maps.get(binding.error_map_index):
+												Some(error_map):
+													actions = actions
+														.append(CompactReferenceLeaveBindings(1))
+														.append(
+															CompactReferenceVisit(
+																rep.children
+																	.get(node.child_start + 1)
+																	.get_or(-1),
+															),
+														)
+														.append(
+															CompactReferenceEnterIdentifier(
+																error_map.identifier_index,
+															),
+														)
+												None:
+													void
+
+										actions = actions.append(
+											CompactReferenceVisit(
+												rep.children
+													.get(node.child_start)
+													.get_or(-1),
+											),
+										)
+									None:
+										void
 							CompactBlockNode:
 								var entered_count: Int = 0
 								leave_action_index = actions.length()
@@ -5384,6 +5991,9 @@ pure func compact_expression_oracle_counts(
 		pattern_identifier_slice_count = rep.pattern_identifier_slices.length(),
 		pattern_identifier_count = rep.pattern_identifiers.length(),
 		match_case_count = rep.match_cases.length(),
+		select_arm_count = rep.select_arms.length(),
+		with_binding_count = rep.with_bindings.length(),
+		with_error_map_count = rep.with_error_maps.length(),
 		unit_payload_count = rep.unit_payloads.length(),
 		root_count = rep.roots.length()
 	}
@@ -5582,6 +6192,58 @@ pure func compact_expression_oracle_rejects_corruption(
 			],
 			start_span.location,
 		)
+		selected = ParsedSelectExpr(
+			[
+				{
+					kind = ParsedSelectReceiveArm(
+						parsed_identifier("received", start_span.location),
+						left,
+					),
+					body = right,
+					span = start_span.location
+				},
+				{
+					kind = ParsedSelectSealedArm(right),
+					body = left,
+					span = start_span.location
+				},
+			],
+			start_span.location,
+		)
+		plain_with = ParsedWithExpr(
+			{
+				name = parsed_identifier("resource", start_span.location),
+				type_expr = None,
+				value = left,
+				kind = ParsedWithPlainBinding,
+				error_map = None,
+				span = start_span.location
+			},
+			right,
+			start_span.location,
+		)
+		mapped_with = ParsedWithExpr(
+			{
+				name = parsed_identifier("resource", start_span.location),
+				type_expr = Some(
+					ParsedNamedType(
+						parsed_identifier("Type", start_span.location),
+						[],
+						start_span.location,
+					),
+				),
+				value = left,
+				kind = ParsedWithTryBinding,
+				error_map = Some({
+					name = parsed_identifier("error", start_span.location),
+					value = right,
+					span = start_span.location,
+				}),
+				span = start_span.location
+			},
+			left,
+			start_span.location,
+		)
 
 		match (
 			compact_expression_oracle_from_parsed_roots(
@@ -5597,6 +6259,11 @@ pure func compact_expression_oracle_rejects_corruption(
 					scoped,
 					looped,
 					matched,
+					selected,
+					selected,
+					plain_with,
+					mapped_with,
+					mapped_with,
 				],
 			)
 		):
@@ -5629,6 +6296,21 @@ pure func compact_expression_oracle_rejects_corruption(
 					.get_or(-1)
 				match_root = rep.roots
 					.get(9)
+					.get_or(-1)
+				first_select_root = rep.roots
+					.get(10)
+					.get_or(-1)
+				second_select_root = rep.roots
+					.get(11)
+					.get_or(-1)
+				plain_with_root = rep.roots
+					.get(12)
+					.get_or(-1)
+				first_mapped_with_root = rep.roots
+					.get(13)
+					.get_or(-1)
+				second_mapped_with_root = rep.roots
+					.get(14)
 					.get_or(-1)
 
 				match corruption:
@@ -6097,6 +6779,182 @@ pure func compact_expression_oracle_rejects_corruption(
 										void
 							None:
 								void
+					CompactSelectArmBinderMismatch | CompactSelectArmForeignSourceOwner:
+						match rep.nodes.get(first_select_root):
+							Some(node):
+								match rep.select_arms.get(node.payload_index):
+									Some(arm):
+										changed_arm = if corruption == CompactSelectArmBinderMismatch:
+											{ arm |
+												binder_identifier_index = NO_COMPACT_IDENTIFIER_INDEX
+											}
+										else:
+											{ arm | span = { arm.span | source_owner_index = 1 } }
+
+										corrupted = { rep |
+											select_arms = rep.select_arms.set(
+												node.payload_index,
+												changed_arm,
+											)
+										}
+									None:
+										void
+							None:
+								void
+					CompactSelectArmUnexpectedBinder:
+						match rep.nodes.get(first_select_root):
+							Some(node):
+								match (
+									rep.select_arms.get(node.payload_index),
+									rep.select_arms.get(node.payload_index + 1),
+								):
+									(Some(receive_arm), Some(sealed_arm)):
+										match rep.control_identifiers.get(
+											receive_arm.binder_identifier_index,
+										):
+											Some(identifier):
+												binder_identifier_index = rep.control_identifiers.length()
+												corrupted = { rep |
+													control_identifiers = rep.control_identifiers.append(
+														identifier,
+													),
+													select_arms = rep.select_arms.set(
+														node.payload_index + 1,
+														{ sealed_arm |
+															binder_identifier_index = binder_identifier_index
+														},
+													)
+												}
+											None:
+												void
+									_:
+										void
+							None:
+								void
+					CompactSelectArmSliceAlias:
+						match (rep.nodes.get(first_select_root), rep.nodes.get(second_select_root)):
+							(Some(first), Some(second)):
+								corrupted = { rep |
+									nodes = rep.nodes.set(
+										second_select_root,
+										{ second | payload_index = first.payload_index },
+									)
+								}
+							_:
+								void
+					CompactWithBindingAlias:
+						match (
+							rep.nodes.get(plain_with_root),
+							rep.nodes.get(first_mapped_with_root),
+						):
+							(Some(plain_node), Some(mapped_node)):
+								corrupted = { rep |
+									nodes = rep.nodes.set(
+										plain_with_root,
+										{ plain_node | payload_index = mapped_node.payload_index },
+									)
+								}
+							_:
+								void
+					CompactWithPlainBindingHasErrorMap:
+						match rep.nodes.get(first_mapped_with_root):
+							Some(node):
+								match rep.with_bindings.get(node.payload_index):
+									Some(binding):
+										corrupted = { rep |
+											with_bindings = rep.with_bindings.set(
+												node.payload_index,
+												{ binding | kind = CompactWithPlainBinding },
+											)
+										}
+									None:
+										void
+							None:
+								void
+					CompactWithTypeRootOutOfRange | CompactWithErrorMapOutOfRange:
+						match rep.nodes.get(first_mapped_with_root):
+							Some(node):
+								match rep.with_bindings.get(node.payload_index):
+									Some(binding):
+										changed_binding = if corruption == CompactWithTypeRootOutOfRange:
+											{ binding | type_root_index = rep.type_nodes.length() }
+										else:
+											{ binding |
+												error_map_index = rep.with_error_maps.length()
+											}
+
+										corrupted = { rep |
+											with_bindings = rep.with_bindings.set(
+												node.payload_index,
+												changed_binding,
+											)
+										}
+									None:
+										void
+							None:
+								void
+					CompactWithErrorMapAlias:
+						match (
+							rep.nodes.get(first_mapped_with_root),
+							rep.nodes.get(second_mapped_with_root),
+						):
+							(Some(first_node), Some(second_node)):
+								match (
+									rep.with_bindings.get(first_node.payload_index),
+									rep.with_bindings.get(second_node.payload_index),
+								):
+									(Some(first), Some(second)):
+										corrupted = { rep |
+											with_bindings = rep.with_bindings.set(
+												second_node.payload_index,
+												{ second |
+													error_map_index = first.error_map_index
+												},
+											)
+										}
+									_:
+										void
+							_:
+								void
+					CompactWithErrorMapForeignSourceOwner:
+						match rep.nodes.get(first_mapped_with_root):
+							Some(node):
+								match rep.with_bindings.get(node.payload_index):
+									Some(binding):
+										match rep.with_error_maps.get(binding.error_map_index):
+											Some(error_map):
+												corrupted = { rep |
+													with_error_maps = rep.with_error_maps.set(
+														binding.error_map_index,
+														{ error_map |
+															span = { error_map.span |
+																source_owner_index = 1
+															}
+														},
+													)
+												}
+											None:
+												void
+									None:
+										void
+							None:
+								void
+					CompactWithWrongArity:
+						match rep.nodes.get(first_mapped_with_root):
+							Some(node):
+								corrupted = { rep |
+									nodes = rep.nodes.set(
+										first_mapped_with_root,
+										{ node | child_count = 2 },
+									)
+								}
+							None:
+								void
+					CompactWithOrphanErrorMap:
+						corrupted = { rep | with_error_maps = rep.with_error_maps.append({
+								identifier_index = 0,
+								span = start_span,
+							}) }
 
 				not compact_expression_product_is_valid(corrupted)
 			Err(_):

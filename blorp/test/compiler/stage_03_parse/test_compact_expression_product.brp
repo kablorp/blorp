@@ -34,6 +34,16 @@ import:
 			CompactPatternPayloadFamilyMismatch,
 			CompactPatternRootAlias,
 			CompactPatternSharedChild,
+			CompactSelectArmBinderMismatch,
+			CompactSelectArmForeignSourceOwner,
+			CompactSelectArmSliceAlias,
+			CompactWithBindingAlias,
+			CompactWithErrorMapAlias,
+			CompactWithErrorMapForeignSourceOwner,
+			CompactWithErrorMapOutOfRange,
+			CompactWithOrphanErrorMap,
+			CompactWithTypeRootOutOfRange,
+			CompactWithWrongArity,
 		),
 		CompactExpressionOracleError(
 			InvalidCompactExpressionOracleProduct,
@@ -94,6 +104,7 @@ import:
 			ParsedIntLiteralExpr,
 			ParsedLogicalExpr,
 			ParsedListExpr,
+			ParsedLambdaExpr,
 			ParsedMatchExpr,
 			ParsedMissingExpr,
 			ParsedNameExpr,
@@ -117,6 +128,7 @@ import:
 			ParsedVarDeclExpr,
 			ParsedVoidExpr,
 			ParsedWhileExpr,
+			ParsedWithExpr,
 		),
 		ParsedForBinder(ParsedForNameBinder, ParsedForTupleBinder),
 		ParsedIdentifier,
@@ -140,6 +152,8 @@ import:
 		),
 		ParsedProgram,
 		ParsedRecordExprField,
+		ParsedSelectArm,
+		ParsedSelectArmKind(ParsedSelectAfterArm, ParsedSelectReceiveArm, ParsedSelectSealedArm),
 		ParsedStringInterpolationPart(ParsedInterpolationExpr, ParsedInterpolationLiteral),
 		ParsedStringLiteralForm(ParsedRawStringLiteral),
 		ParsedTypeExpr(
@@ -156,6 +170,8 @@ import:
 			ParsedTupleType,
 		),
 		ParsedUnaryOp(ParsedNegateOp, ParsedNotOp),
+		ParsedWithBindingKind(ParsedWithPlainBinding, ParsedWithTryBinding),
+		ParsedWithErrorMap,
 		parsed_identifier,
 	../../../src/compiler/stage_03_parse/source_ast_finalize:
 		IdentifierReference,
@@ -954,6 +970,87 @@ pure func match_pattern_root(src: SourceFile) -> ParsedExpr:
 	)
 
 
+pure func select_with_roots(src: SourceFile) -> List[ParsedExpr]:
+	common_span = span(src, 0, 5)
+	name: pure (String) -> ParsedIdentifier = pure func(text):
+		parsed_identifier(text, common_span)
+	int_type = ParsedNamedType(name("Int"), [], common_span)
+
+	[
+		ParsedSelectExpr(
+			[
+				{
+					kind = ParsedSelectReceiveArm(
+						name("received"),
+						ParsedNameExpr(name("receive_source")),
+					),
+					body = ParsedNameExpr(name("received")),
+					span = common_span
+				},
+				{
+					kind = ParsedSelectSealedArm(ParsedNameExpr(name("sealed_source"))),
+					body = ParsedNameExpr(name("sealed_body")),
+					span = common_span
+				},
+				{
+					kind = ParsedSelectAfterArm(ParsedNameExpr(name("timeout_source"))),
+					body = ParsedNameExpr(name("timeout_body")),
+					span = common_span
+				},
+			],
+			common_span,
+		),
+		ParsedWithExpr(
+			{
+				name = name("plain_resource"),
+				type_expr = None,
+				value = ParsedNameExpr(name("plain_value")),
+				kind = ParsedWithPlainBinding,
+				error_map = None,
+				span = common_span
+			},
+			ParsedNameExpr(name("plain_resource")),
+			common_span,
+		),
+		ParsedWithExpr(
+			{
+				name = name("resource"),
+				type_expr = Some(int_type),
+				value = ParsedNameExpr(name("resource_value")),
+				kind = ParsedWithTryBinding,
+				error_map = Some({
+					name = name("map_error"),
+					value = ParsedCallExpr(
+						ParsedNameExpr(name("map_value")),
+						[ParsedNameExpr(name("map_error")), ParsedNameExpr(name("resource"))],
+						common_span,
+					),
+					span = common_span,
+				}),
+				span = common_span
+			},
+			ParsedCallExpr(
+				ParsedNameExpr(name("body_value")),
+				[ParsedNameExpr(name("resource")), ParsedNameExpr(name("map_error"))],
+				common_span,
+			),
+			common_span,
+		),
+		ParsedWithExpr(
+			{
+				name = name("try_resource"),
+				type_expr = None,
+				value = ParsedNameExpr(name("try_value")),
+				kind = ParsedWithTryBinding,
+				error_map = None,
+				span = common_span
+			},
+			ParsedNameExpr(name("try_resource")),
+			common_span,
+		),
+	]
+
+
 pure func optional_expressions_equal(left: Option[ParsedExpr], right: Option[ParsedExpr]) -> Bool:
 	match left:
 		Some(left_expr):
@@ -1131,6 +1228,70 @@ pure func match_cases_equal(left: List[ParsedMatchCase], right: List[ParsedMatch
 		index += 1
 
 	equal
+
+
+pure func select_arms_equal(left: List[ParsedSelectArm], right: List[ParsedSelectArm]) -> Bool:
+	var equal = left.length() == right.length()
+	var index: Int = 0
+
+	while index < left.length() and equal:
+		match (left.get(index), right.get(index)):
+			(Some(left_arm), Some(right_arm)):
+				var kinds_equal = False
+
+				match left_arm.kind:
+					ParsedSelectReceiveArm(left_name, left_source):
+						match right_arm.kind:
+							ParsedSelectReceiveArm(right_name, right_source):
+								kinds_equal = (
+									identifiers_equal(left_name, right_name)
+									and expressions_equal(left_source, right_source)
+								)
+							_:
+								void
+					ParsedSelectSealedArm(left_source):
+						match right_arm.kind:
+							ParsedSelectSealedArm(right_source):
+								kinds_equal = expressions_equal(left_source, right_source)
+							_:
+								void
+					ParsedSelectAfterArm(left_source):
+						match right_arm.kind:
+							ParsedSelectAfterArm(right_source):
+								kinds_equal = expressions_equal(left_source, right_source)
+							_:
+								void
+
+				equal = (
+					kinds_equal
+					and expressions_equal(left_arm.body, right_arm.body)
+					and left_arm.span == right_arm.span
+				)
+			_:
+				equal = False
+
+		index += 1
+
+	equal
+
+
+pure func optional_with_error_maps_equal(
+	left: Option[ParsedWithErrorMap],
+	right: Option[ParsedWithErrorMap],
+) -> Bool:
+	match left:
+		Some(left_map):
+			match right:
+				Some(right_map):
+					(
+						identifiers_equal(left_map.name, right_map.name)
+						and expressions_equal(left_map.value, right_map.value)
+						and left_map.span == right_map.span
+					)
+				None:
+					False
+		None:
+			right.is_none()
 
 
 pure func expressions_equal(left: ParsedExpr, right: ParsedExpr) -> Bool:
@@ -1436,6 +1597,33 @@ pure func expressions_equal(left: ParsedExpr, right: ParsedExpr) -> Bool:
 					(
 						expressions_equal(left_scrutinee, right_scrutinee)
 						and match_cases_equal(left_cases, right_cases)
+						and left_span == right_span
+					)
+				_:
+					False
+		ParsedSelectExpr(left_arms, left_span):
+			match right:
+				ParsedSelectExpr(right_arms, right_span):
+					select_arms_equal(left_arms, right_arms) and left_span == right_span
+				_:
+					False
+		ParsedWithExpr(left_binding, left_body, left_span):
+			match right:
+				ParsedWithExpr(right_binding, right_body, right_span):
+					(
+						identifiers_equal(left_binding.name, right_binding.name)
+						and optional_type_expressions_equal(
+							left_binding.type_expr,
+							right_binding.type_expr,
+						)
+						and expressions_equal(left_binding.value, right_binding.value)
+						and left_binding.kind == right_binding.kind
+						and optional_with_error_maps_equal(
+							left_binding.error_map,
+							right_binding.error_map,
+						)
+						and left_binding.span == right_binding.span
+						and expressions_equal(left_body, right_body)
 						and left_span == right_span
 					)
 				_:
@@ -2529,11 +2717,105 @@ func test_match_pattern_metadata_counts_are_explicit() -> Bool:
 			False
 
 
+func test_select_and_with_family_round_trips_exactly() -> Bool:
+	src = source()
+	roots = select_with_roots(src)
+
+	match compact_expression_oracle_from_parsed_roots(src, roots):
+		Ok(product):
+			match compact_expression_oracle_project(product):
+				Ok(projected):
+					expression_lists_equal(roots, projected)
+				Err(_):
+					False
+		Err(_):
+			False
+
+
+func test_select_and_with_real_parser_round_trip_and_scopes_match() -> Bool:
+	program_text = "func run(ch: Channel[Int], path: String):\n\tselect:\n\t\tvalue from ch:\n\t\t\tuse(value)\n\t\tsealed ch:\n\t\t\tclosed()\n\t\t_ after 10:\n\t\t\ttimed_out()\n\twith handle = open(path):\n\t\tuse(handle)\n\twith reader: Reader ?= open(path) on err => map_error(err, reader):\n\t\tuse(reader, err)"
+	program_source = source_file("select_with.brp", "select_with", program_text)
+
+	match first_function_body(parse_compiler_source(program_source)):
+		Some(body):
+			match compact_expression_oracle_from_parsed_roots(program_source, [body]):
+				Ok(product):
+					match compact_expression_oracle_project(product):
+						Ok([projected]):
+							(
+								expressions_equal(body, projected)
+								and reference_lists_equal(
+									parsed_expr_free_identifier_references(body),
+									compact_expression_oracle_free_identifier_references(product),
+								)
+							)
+						_:
+							False
+				Err(_):
+					False
+		None:
+			False
+
+
+func test_select_and_with_reference_scopes_match_production() -> Bool:
+	src = source()
+	roots = select_with_roots(src)
+	legacy = roots.flat_map(func(root): parsed_expr_free_identifier_references(root))
+
+	match compact_expression_oracle_from_parsed_roots(src, roots):
+		Ok(product):
+			compact = compact_expression_oracle_free_identifier_references(product)
+			(
+				reference_lists_equal(legacy, compact)
+				and compact.map(
+					func(
+						reference,
+					): reference.name,
+				) == [
+					"receive_source",
+					"sealed_source",
+					"sealed_body",
+					"timeout_source",
+					"timeout_body",
+					"plain_value",
+					"resource_value",
+					"map_value",
+					"resource",
+					"body_value",
+					"map_error",
+					"try_value",
+				]
+			)
+		Err(_):
+			False
+
+
+func test_select_and_with_metadata_counts_are_explicit() -> Bool:
+	src = source()
+
+	match compact_expression_oracle_from_parsed_roots(src, select_with_roots(src)):
+		Ok(product):
+			counts = compact_expression_oracle_counts(product)
+			(
+				counts.select_arm_count == 3
+				and counts.with_binding_count == 3
+				and counts.with_error_map_count == 1
+				and counts.control_identifier_count == 5
+				and counts.type_node_count == 1
+				and counts.root_count == 4
+			)
+		Err(_):
+			False
+
+
 func test_unsupported_form_is_rejected_explicitly() -> Bool:
 	src = source()
 
-	match compact_expression_oracle_from_parsed_roots(src, [ParsedSelectExpr(
+	match compact_expression_oracle_from_parsed_roots(src, [ParsedLambdaExpr(
+				True,
 				[],
+				None,
+				ParsedVoidExpr(span(src, 0, 5)),
 				span(src, 0, 5),
 			)]):
 		Err(UnsupportedCompactExpressionOracleForm):
@@ -2578,6 +2860,18 @@ func test_validator_rejects_corrupt_products() -> Bool:
 		CompactPatternIdentifierSliceForeignSourceOwner,
 		CompactPatternRootAlias,
 		CompactMatchCaseBindingCountMismatch,
+		CompactSelectArmBinderMismatch,
+		CompactSelectArmUnexpectedBinder,
+		CompactSelectArmSliceAlias,
+		CompactSelectArmForeignSourceOwner,
+		CompactWithBindingAlias,
+		CompactWithPlainBindingHasErrorMap,
+		CompactWithTypeRootOutOfRange,
+		CompactWithErrorMapOutOfRange,
+		CompactWithErrorMapAlias,
+		CompactWithErrorMapForeignSourceOwner,
+		CompactWithWrongArity,
+		CompactWithOrphanErrorMap,
 	]
 	var rejected = True
 
@@ -2784,6 +3078,18 @@ tests: TestSuite = {
 			"match scope restores outer equal text and does not leak",
 			test_match_scope_restores_outer_equal_text_and_does_not_leak,
 		),
+		(
+			"select and with family round trips exactly",
+			test_select_and_with_family_round_trips_exactly,
+		),
+		(
+			"select and with real parser round trip exactly",
+			test_select_and_with_real_parser_round_trip_and_scopes_match,
+		),
+		(
+			"select and with reference scopes match production",
+			test_select_and_with_reference_scopes_match_production,
+		),
 		("validator rejects corrupt products", test_validator_rejects_corrupt_products),
 		("unsupported form is rejected explicitly", test_unsupported_form_is_rejected_explicitly),
 		(
@@ -2806,6 +3112,10 @@ tests: TestSuite = {
 		(
 			"match pattern metadata counts are explicit",
 			test_match_pattern_metadata_counts_are_explicit,
+		),
+		(
+			"select and with metadata counts are explicit",
+			test_select_and_with_metadata_counts_are_explicit,
 		),
 	]
 }
