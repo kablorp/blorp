@@ -5,6 +5,7 @@ import:
 		TaggedPayload,
 		Token,
 		TokenKind(EndOfFileToken, IdentifierToken, KeywordToken, SymbolToken),
+		TokenTag(DedentTag, EndOfFileTag, IdentifierTag, KeywordTag),
 		Trivia,
 		TriviaKind(CommentTrivia, WhitespaceTrivia),
 		append_trivia_run,
@@ -12,6 +13,7 @@ import:
 		span_of,
 		symbol_text,
 		tagged_payload_for,
+		token_from_cursors,
 		token_kind_name,
 		token_kind_of,
 		token_kind_own_text,
@@ -123,6 +125,98 @@ func test_eof_token_has_name() -> Bool:
 	token_kind_name(token_kind_of([], token)) == "end of file"
 
 
+-- `token_from_cursors` is the scalar constructor the lexer's migrated
+-- successful scans call: no `SourceSpan` is built or thrown away to reach
+-- these same ten fields. It must match `token_with_trivia_range` fed the
+-- equivalent `SourceSpan` field-for-field: offsets, lines, columns,
+-- payload, and trivia range.
+func test_token_from_cursors_matches_span_construction() -> Bool:
+	src: SourceFile = fixture_source_file()
+	start: Cursor = source_cursor_at(src, 0)
+	finish: Cursor = source_cursor_at(src, 4)
+	tagged: TaggedPayload = tagged_payload_for(KeywordToken(FuncKeyword), -1)
+	via_span: Token = token_with_trivia_range(
+		tagged.tag,
+		tagged.id,
+		span_between(src, 0, 4),
+		3,
+		2,
+	)
+	via_cursors: Token = token_from_cursors(KeywordTag, tagged.id, start, finish, 3, 2)
+
+	(
+		via_cursors.kind == via_span.kind
+		and via_cursors.payload == via_span.payload
+		and via_cursors.start_offset == via_span.start_offset
+		and via_cursors.start_line == via_span.start_line
+		and via_cursors.start_column == via_span.start_column
+		and via_cursors.end_offset == via_span.end_offset
+		and via_cursors.end_line == via_span.end_line
+		and via_cursors.end_column == via_span.end_column
+		and via_cursors.trivia_start == via_span.trivia_start
+		and via_cursors.trivia_count == via_span.trivia_count
+	)
+
+
+-- An identifier token built by `token_from_cursors` in the middle of a
+-- line, off byte offset zero, still recovers its exact text through
+-- `span_of` -- the scalar constructor must carry line/column, not only
+-- offsets.
+func test_token_from_cursors_identifier_offsets() -> Bool:
+	src: SourceFile = fixture_source_file()
+	start: Cursor = source_cursor_at(src, 5)
+	finish: Cursor = source_cursor_at(src, 9)
+	token: Token = token_from_cursors(IdentifierTag, 0, start, finish, 0, 0)
+	span: SourceSpan = span_of(token, src.path, src.module_name)
+
+	(
+		token.start_offset == 5
+		and token.end_offset == 9
+		and token.start_line == 1
+		and token.start_column == 6
+		and token.end_line == 1
+		and token.end_column == 10
+		and source_span_text(src, span) == "main"
+	)
+
+
+-- The EOF token every `lex` call publishes is a zero-width, shared-offset
+-- token built from one cursor passed twice.
+func test_token_from_cursors_eof_is_zero_width() -> Bool:
+	src: SourceFile = fixture_source_file()
+	end_of_source: Cursor = source_cursor_at(src, src.text.length())
+	token: Token = token_from_cursors(EndOfFileTag, -1, end_of_source, end_of_source, 4, 0)
+
+	(
+		token.kind == EndOfFileTag
+		and token.payload == -1
+		and token.start_offset == token.end_offset
+		and token.start_line == token.end_line
+		and token.start_column == token.end_column
+		and token.trivia_start == 4
+		and token.trivia_count == 0
+	)
+
+
+-- Synthetic indent/dedent tokens share their start and end cursor (a
+-- zero-width token at the line's current position): `token_from_cursors`
+-- must accept `start == end` and still publish two matching cursors, not
+-- an implicit one-past-end.
+func test_token_from_cursors_shared_offset_synthetic_token() -> Bool:
+	src: SourceFile = fixture_source_file()
+	at: Cursor = source_cursor_at(src, 4)
+	token: Token = token_from_cursors(DedentTag, -1, at, at, 1, 0)
+
+	(
+		token.start_offset == 4
+		and token.end_offset == 4
+		and token.start_line == token.end_line
+		and token.start_column == token.end_column
+		and token.trivia_start == 1
+		and token.trivia_count == 0
+	)
+
+
 -- Two occurrences of the same text intern to the same id and share one
 -- entry in the published text table -- the identifier/literal text table
 -- is deduplicated, not one heap object per occurrence. This is the exact
@@ -185,6 +279,10 @@ tests: TestSuite = {
 		("token text comes from span", test_token_text_comes_from_span),
 		("token trivia is explicit", test_token_trivia_is_explicit),
 		("eof token has name", test_eof_token_has_name),
+		("token_from_cursors matches span construction", test_token_from_cursors_matches_span_construction),
+		("token_from_cursors identifier offsets", test_token_from_cursors_identifier_offsets),
+		("token_from_cursors eof is zero width", test_token_from_cursors_eof_is_zero_width),
+		("token_from_cursors shared offset synthetic token", test_token_from_cursors_shared_offset_synthetic_token),
 		("intern_text deduplicates identical text", test_intern_text_deduplicates_identical_text),
 	]
 }
