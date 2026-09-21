@@ -5,6 +5,12 @@
 -- constructs such as record literals and primitive tuple literals itself.
 import:
 	../stage_08_core_lower/list_layout: tensor_for_element_storage_for_canonical_type
+	allocation_contracts:
+		UnionCleanupKind(DirectUnionCleanup, IterativeUnionCleanup, NoUnionCleanup),
+		release_policy_requires_cleanup,
+		union_cleanup_kind,
+		union_field_uses_iterative_cleanup,
+		union_variant_has_cleanup,
 	ir:
 		CoreBoxKind(
 			Float16Box,
@@ -5538,3 +5544,239 @@ pure func prepare_program(program: CoreProgram) -> CoreProgram:
 		decls = decls,
 		foreign_includes = program.foreign_includes
 	}
+
+
+---
+Step 1 of the emitter-as-dumb-printer migration: the per-type cleanup
+(destructor) plan.
+
+Today `stage_10_backend/emit.brp` decides which destructor a heap record or
+union gets by calling `allocation_contracts` policy predicates while it
+prints, and recomputes the same per-field facts every time a type's
+destructor is emitted. Nothing before emission records the outcome, so nothing
+upstream (in particular the allocation analysis) can see that releasing a
+self-recursive union may allocate scratch memory for the iterative destructor's
+work stack.
+
+`CleanupPlan` publishes that decision as data instead. There is one row per
+declaration in a program's `decls`, in the same order, so the row's index is
+its declaration's dense identity -- the only identity types have today; there
+is no narrower type id than the position of the declaration in `decls`. Rows
+for anything that is not a heap record or a union are `NotACleanupType`.
+
+The plan is built once (see `build_cleanup_plan`) by calling the shared
+`allocation_contracts` predicates that already encode this policy; it does not
+reimplement them. The emitter should read a row instead of calling
+`union_cleanup_kind` / `union_field_uses_iterative_cleanup` /
+`release_policy_requires_cleanup` itself.
+---
+enum CleanupStrategy:
+	NoCleanup
+	DirectCleanup
+	IterativeCleanup
+
+
+record CleanupFieldPlan {
+	needs_release: Bool,
+	uses_iterative_cleanup: Bool
+}
+
+
+record CleanupVariantPlan {
+	has_cleanup: Bool,
+	fields: List[CleanupFieldPlan]
+}
+
+
+record UnionCleanupTypePlan {
+	strategy: CleanupStrategy,
+	may_allocate_scratch: Bool,
+	variants: List[CleanupVariantPlan]
+}
+
+
+record HeapRecordCleanupTypePlan {
+	strategy: CleanupStrategy,
+	fields: List[CleanupFieldPlan]
+}
+
+
+union CleanupTypePlan:
+	UnionTypeCleanup(UnionCleanupTypePlan)
+	HeapRecordTypeCleanup(HeapRecordCleanupTypePlan)
+	NotACleanupType
+
+
+---
+One row per declaration, indexed exactly like `program.decls`.
+---
+record CleanupPlan {
+	rows: List[CleanupTypePlan]
+}
+
+
+---
+The row for the declaration at `decl_index`. An out-of-range index (which
+should never happen for a plan built from the same `decls` it is queried
+against) reads as `NotACleanupType` rather than failing.
+---
+pure func cleanup_plan_row(plan: CleanupPlan, decl_index: Int) -> CleanupTypePlan:
+	match plan.rows.get(decl_index):
+		Some(row):
+			row
+		None:
+			NotACleanupType
+
+
+---
+The precomputed per-variant facts for one union variant, or `None` when
+`type_plan` is not a union row or `variant_index` is out of range.
+---
+pure func union_cleanup_variant_plan(
+	type_plan: CleanupTypePlan,
+	variant_index: Int,
+) -> Option[CleanupVariantPlan]:
+	match type_plan:
+		UnionTypeCleanup(union_plan):
+			union_plan.variants.get(variant_index)
+		HeapRecordTypeCleanup(_) | NotACleanupType:
+			None
+
+
+---
+The precomputed per-field facts for one union field, or `None` when
+`type_plan` is not a union row or the indices are out of range.
+---
+pure func union_cleanup_field_plan(
+	type_plan: CleanupTypePlan,
+	variant_index: Int,
+	field_index: Int,
+) -> Option[CleanupFieldPlan]:
+	match type_plan:
+		UnionTypeCleanup(union_plan):
+			match union_plan.variants.get(variant_index):
+				Some(variant_plan):
+					variant_plan.fields.get(field_index)
+				None:
+					None
+		HeapRecordTypeCleanup(_) | NotACleanupType:
+			None
+
+
+---
+The precomputed per-field facts for one heap record field, or `None` when
+`type_plan` is not a heap record row or the index is out of range.
+---
+pure func heap_record_cleanup_field_plan(
+	type_plan: CleanupTypePlan,
+	field_index: Int,
+) -> Option[CleanupFieldPlan]:
+	match type_plan:
+		HeapRecordTypeCleanup(record_plan):
+			record_plan.fields.get(field_index)
+		UnionTypeCleanup(_) | NotACleanupType:
+			None
+
+
+private pure func cleanup_strategy_for_union(kind: UnionCleanupKind) -> CleanupStrategy:
+	match kind:
+		NoUnionCleanup:
+			NoCleanup
+		DirectUnionCleanup:
+			DirectCleanup
+		IterativeUnionCleanup:
+			IterativeCleanup
+
+
+private pure func cleanup_field_plan_for_union_field(
+	union_decl: CoreUnionDecl,
+	field: CoreUnionField,
+) -> CleanupFieldPlan:
+	{
+		needs_release = release_policy_requires_cleanup(field.release_policy),
+		uses_iterative_cleanup = union_field_uses_iterative_cleanup(union_decl, field)
+	}
+
+
+private pure func cleanup_variant_plan(
+	union_decl: CoreUnionDecl,
+	variant: CoreUnionVariant,
+) -> CleanupVariantPlan:
+	var fields: List[CleanupFieldPlan] = []
+
+	for field in variant.fields:
+		fields = fields.append(cleanup_field_plan_for_union_field(union_decl, field))
+
+	{
+		has_cleanup = union_variant_has_cleanup(variant),
+		fields = fields
+	}
+
+
+private pure func union_cleanup_type_plan(union_decl: CoreUnionDecl) -> CleanupTypePlan:
+	strategy: CleanupStrategy = cleanup_strategy_for_union(union_cleanup_kind(union_decl))
+	var variants: List[CleanupVariantPlan] = []
+
+	for variant in union_decl.variants:
+		variants = variants.append(cleanup_variant_plan(union_decl, variant))
+
+	UnionTypeCleanup({
+		strategy = strategy,
+		may_allocate_scratch = strategy == IterativeCleanup,
+		variants = variants
+	})
+
+
+private pure func heap_record_cleanup_type_plan(record_decl: CoreHeapRecordDecl) -> CleanupTypePlan:
+	var fields: List[CleanupFieldPlan] = []
+	var has_destructor: Bool = False
+
+	for field in record_decl.fields:
+		needs_release: Bool = release_policy_requires_cleanup(field.release_policy)
+
+		if needs_release:
+			has_destructor = True
+		else:
+			void
+
+		fields = fields.append({
+			needs_release = needs_release,
+			uses_iterative_cleanup = False
+		})
+
+	strategy: CleanupStrategy = if has_destructor:
+		DirectCleanup
+	else:
+		NoCleanup
+
+	HeapRecordTypeCleanup({
+		strategy = strategy,
+		fields = fields
+	})
+
+
+private pure func cleanup_type_plan_for_decl(decl: CoreDecl) -> CleanupTypePlan:
+	match decl:
+		UnionDecl(union_decl):
+			union_cleanup_type_plan(union_decl)
+		HeapRecordDecl(record_decl):
+			heap_record_cleanup_type_plan(record_decl)
+		FunctionDecl(_) | GlobalDecl(_) | EnumDecl(_) | ValueRecordDecl(_) | TypeAliasDecl(_) | TraitDecl(_) | ImplDecl(_):
+			NotACleanupType
+
+
+---
+Builds the program's cleanup plan once. Every heap record and union
+declaration gets a row computed from the shared `allocation_contracts`
+predicates; every other declaration gets `NotACleanupType`. Called once, from
+the single place a `CoreProgram` becomes a `PreparedCoreProgram`
+(`stage_09_core/pipeline.brp`), so the emitter never has to call the
+policy predicates itself.
+---
+pure func build_cleanup_plan(program: CoreProgram) -> CleanupPlan:
+	var rows: List[CleanupTypePlan] = []
+
+	for decl in program.decls:
+		rows = rows.append(cleanup_type_plan_for_decl(decl))
+
+	{ rows = rows }

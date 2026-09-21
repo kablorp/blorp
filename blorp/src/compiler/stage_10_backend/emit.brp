@@ -21,12 +21,7 @@ import:
 		function_profile_mode,
 		function_profile_selectors,
 	../stage_08_core_lower/identity: core_module_member_name
-	../stage_09_core/allocation_contracts:
-		UnionCleanupKind(DirectUnionCleanup, IterativeUnionCleanup, NoUnionCleanup),
-		union_cleanup_kind,
-		union_decl_has_cleanup,
-		union_field_uses_iterative_cleanup,
-		union_variant_has_cleanup,
+	../stage_09_core/allocation_contracts: union_variant_has_cleanup
 	../stage_09_core/c_type_layout as TypeLayout
 	../stage_09_core/ir:
 		CoreAccessor(
@@ -454,8 +449,21 @@ import:
 		OwnershipResultMode(ReturnOwned),
 		builtin_contract,
 		intrinsic_contract,
-	../stage_09_core/pipeline: PreparedCoreProgram, prepared_core_program_value, run_pre_dce_tail
-	../stage_09_core/prepare as CorePrepare
+	../stage_09_core/pipeline:
+		PreparedCoreProgram,
+		prepared_core_program_cleanup_plan,
+		prepared_core_program_value,
+		run_pre_dce_tail
+	../stage_09_core/prepare as CorePrepare:
+		CleanupFieldPlan,
+		CleanupPlan,
+		CleanupStrategy(DirectCleanup, IterativeCleanup, NoCleanup),
+		CleanupTypePlan(HeapRecordTypeCleanup, NotACleanupType, UnionTypeCleanup),
+		CleanupVariantPlan,
+		cleanup_plan_row,
+		heap_record_cleanup_field_plan,
+		union_cleanup_field_plan,
+		union_cleanup_variant_plan
 	../stage_09_core/traverse as CoreTraverse
 	../stage_09_core/type_policy as CoreTypePolicy
 	c_naming:
@@ -24708,24 +24716,24 @@ private pure func heap_record_field_release_statement(field: CoreHeapRecordField
 			"  blorp_stack_result_release(__rec->" + field_name + ");\n"
 
 
-private pure func heap_record_has_destructor(record_decl: CoreHeapRecordDecl) -> Bool:
-	var has_destructor: Bool = False
+---
+Reads the strategy a `CleanupTypePlan` row carries, whichever kind of type
+it describes. `NotACleanupType` never reaches this from a heap record or
+union call site, but reading as `NoCleanup` keeps this total rather than
+partial.
+---
+private pure func cleanup_type_plan_strategy(type_plan: CleanupTypePlan) -> CleanupStrategy:
+	match type_plan:
+		UnionTypeCleanup(union_plan):
+			union_plan.strategy
+		HeapRecordTypeCleanup(record_plan):
+			record_plan.strategy
+		NotACleanupType:
+			NoCleanup
 
-	for field in record_decl.fields:
-		match field.release_policy:
-			NoReleasePolicy:
-				void
-			ArcReleasePolicy:
-				has_destructor = True
-				break
-			ArcReleaseOnlyPolicy:
-				has_destructor = True
-				break
-			StackResultReleasePolicy:
-				has_destructor = True
-				break
 
-	has_destructor
+private pure func cleanup_type_plan_has_destructor(type_plan: CleanupTypePlan) -> Bool:
+	cleanup_type_plan_strategy(type_plan) != NoCleanup
 
 
 ---
@@ -24740,10 +24748,11 @@ private pure func destroy_function_signature(destroy_name: String) -> String:
 
 private pure func emit_heap_record_destructor(
 	record_decl: CoreHeapRecordDecl,
+	type_plan: CleanupTypePlan,
 	naming: BackendTypeNaming,
 	internal_type_linkage: Bool,
 ) -> String:
-	if heap_record_has_destructor(record_decl):
+	if cleanup_type_plan_has_destructor(type_plan):
 		var releases: String = ""
 
 		for field in record_decl.fields:
@@ -24763,6 +24772,7 @@ private pure func emit_heap_record_destructor(
 
 private pure func emit_heap_record_reuse(
 	record_decl: CoreHeapRecordDecl,
+	type_plan: CleanupTypePlan,
 	naming: BackendTypeNaming,
 ) -> String:
 	record_c_type: String = TypeLayout.c_type_name(HeapRecordType(record_decl.name))
@@ -24776,7 +24786,7 @@ private pure func emit_heap_record_reuse(
 		field_names = field_names.append(field_name)
 		assignments += "    __old->" + field_name + " = " + field_name + ";\n"
 
-	destroy_old_fields: String = if heap_record_has_destructor(record_decl):
+	destroy_old_fields: String = if cleanup_type_plan_has_destructor(type_plan):
 		"    " + naming.destroy_name + "(__old);\n"
 	else:
 		""
@@ -24809,6 +24819,7 @@ private pure func render_heap_record_decl_emission(emission: CHeapRecordDeclEmis
 
 private pure func emit_heap_record_decl(
 	record_decl: CoreHeapRecordDecl,
+	type_plan: CleanupTypePlan,
 	layouts: CRecordLayoutRegistry,
 	layout: CRecordLayout,
 	authority: CEmissionSymbolAuthority,
@@ -24867,19 +24878,24 @@ private pure func emit_heap_record_decl(
 	else:
 		params.join(", ")
 
-	destructor_init: String = if heap_record_has_destructor(record_decl):
+	destructor_init: String = if cleanup_type_plan_has_destructor(type_plan):
 		"  BLORP_SET_DESTRUCTOR(__rec, " + naming.destroy_name + ");\n"
 	else:
 		""
 
 	header: String = "typedef struct " + record_decl.name + " {\n" + "  blorp_Object header;\n" + fields_c + "} " + record_decl.name + ";\n\n"
-	destructor_c: String = emit_heap_record_destructor(record_decl, naming, internal_type_linkage)
+	destructor_c: String = emit_heap_record_destructor(
+		record_decl,
+		type_plan,
+		naming,
+		internal_type_linkage,
+	)
 	make_c: String = record_c_type + " " + naming.make_name + "(" + param_c + ") {\n" + "  " + record_decl.name + "* __rec = (" + record_decl.name + "*)blorp_alloc(sizeof(" + record_decl.name + "));\n" + "  BLORP_TAG(__rec, \"" + record_decl.name + "\");\n" + destructor_init + assignments + "  return (" + record_c_type + ")__rec;\n}\n\n"
 
 	{
 		type_header = header,
 		functions = [destructor_c, make_c],
-		inline_support = emit_heap_record_reuse(record_decl, naming)
+		inline_support = emit_heap_record_reuse(record_decl, type_plan, naming)
 	}
 
 
@@ -24925,10 +24941,6 @@ private pure func emit_union_constructor_param(
 	index: Int,
 ) -> String:
 	union_field_storage_type(payload_storage, field) + " field" + index.to_string()
-
-
-private pure func union_decl_has_destructor(union_decl: CoreUnionDecl) -> Bool:
-	union_decl_has_cleanup(union_decl)
 
 
 private pure func union_variant_uses_release_mask(
@@ -24993,32 +25005,45 @@ private pure func union_field_release_statement(
 	union_decl: CoreUnionDecl,
 	variant: CoreUnionVariant,
 	field: CoreUnionField,
+	field_plan: Option[CleanupFieldPlan],
 	index: Int,
 	naming: BackendTypeNaming,
 ) -> String:
-	if not release_policy_requires_cleanup(field.release_policy):
-		""
-	else:
-		field_c: String = "self->data." + variant.name + ".field" + index.to_string()
+	match field_plan:
+		None:
+			""
+		Some(plan_row):
+			if not plan_row.needs_release:
+				""
+			else:
+				field_c: String = "self->data." + variant.name + ".field" + index.to_string()
 
-		if union_field_uses_iterative_cleanup(union_decl, field):
-			iterative_union_field_release_statement(union_decl, index, field_c, naming)
-		else:
-			match union_decl.payload_storage:
-				TypedUnionPayloadStorage:
-					typed_union_field_release_statement(field, field_c)
-				ErasedUnionPayloadStorage:
-					erased_union_field_release_statement(index, field_c)
+				if plan_row.uses_iterative_cleanup:
+					iterative_union_field_release_statement(union_decl, index, field_c, naming)
+				else:
+					match union_decl.payload_storage:
+						TypedUnionPayloadStorage:
+							typed_union_field_release_statement(field, field_c)
+						ErasedUnionPayloadStorage:
+							erased_union_field_release_statement(index, field_c)
 
 
 private pure func emit_union_destructor_cases(
 	union_decl: CoreUnionDecl,
+	type_plan: CleanupTypePlan,
 	naming: BackendTypeNaming,
 ) -> String:
 	var cases_c: String = ""
+	var variant_index: Int = 0
 
 	for variant in union_decl.variants:
-		if union_variant_has_cleanup(variant):
+		variant_has_cleanup: Bool = match union_cleanup_variant_plan(type_plan, variant_index):
+			Some(variant_plan):
+				variant_plan.has_cleanup
+			None:
+				False
+
+		if variant_has_cleanup:
 			var releases_c: String = ""
 			var index: Int = 0
 
@@ -25027,18 +25052,24 @@ private pure func emit_union_destructor_cases(
 					union_decl,
 					variant,
 					field,
+					union_cleanup_field_plan(type_plan, variant_index, index),
 					index,
 					naming,
 				)
 				index += 1
 
 			cases_c += "    case " + variant.tag_c_name + ":\n" + releases_c + "      break;\n"
+		else:
+			void
+
+		variant_index += 1
 
 	cases_c
 
 
 private pure func emit_simple_union_destructor(
 	union_decl: CoreUnionDecl,
+	type_plan: CleanupTypePlan,
 	naming: BackendTypeNaming,
 	internal_type_linkage: Bool,
 ) -> String:
@@ -25051,12 +25082,14 @@ private pure func emit_simple_union_destructor(
 		naming.destroy_name,
 	) + " {\n" + "  " + union_decl.name + "* self = (" + union_decl.name + "*)obj;\n" + "  switch (self->tag) {\n" + emit_union_destructor_cases(
 		union_decl,
+		type_plan,
 		naming,
 	) + "    default:\n" + "      break;\n" + "  }\n" + "}\n\n"
 
 
 private pure func emit_iterative_union_destructor(
 	union_decl: CoreUnionDecl,
+	type_plan: CleanupTypePlan,
 	naming: BackendTypeNaming,
 	internal_type_linkage: Bool,
 ) -> String:
@@ -25072,6 +25105,7 @@ private pure func emit_iterative_union_destructor(
 
 	"static void " + stack_push_name + "(" + type_name + "*** stack, long* count, long* capacity, " + type_name + "* value) {\n" + "  if (*count >= *capacity) {\n" + "    long next_capacity = (*capacity == 0) ? 64 : (*capacity * 2);\n" + "    " + type_name + "** grown = (" + type_name + "**)blorp_union_destroy_stack_grow(*stack, sizeof(" + type_name + "*) * (size_t)next_capacity);\n" + "    if (!grown) { fprintf(stderr, \"blorp: out of memory (" + type_name + " destroy stack)\\n\"); abort(); }\n" + "    *stack = grown;\n" + "    *capacity = next_capacity;\n" + "  }\n" + "  (*stack)[*count] = value;\n" + "  *count += 1;\n" + "}\n\n" + "static void " + release_child_name + "(" + type_name + "*** stack, long* count, long* capacity, " + type_name + "* value) {\n" + "  if (!value) return;\n" + "  blorp_Object* header = (blorp_Object*)value;\n" + "  if (BLORP_RC_LOAD(header->refcount) == BLORP_IMMORTAL_REFCOUNT) return;\n" + "  long previous_refcount = BLORP_RC_DEC_PREV(header->refcount);\n" + "  if (previous_refcount == 1) " + stack_push_name + "(stack, count, capacity, value);\n" + "}\n\n" + "static void " + destroy_fields_name + "(" + type_name + "* self, " + type_name + "*** __destroy_stack, long* __destroy_count, long* __destroy_capacity) {\n" + "  switch (self->tag) {\n" + emit_union_destructor_cases(
 		union_decl,
+		type_plan,
 		naming,
 	) + "    default:\n" + "      break;\n" + "  }\n" + "}\n\n" + storage_class + destroy_function_signature(
 		naming.destroy_name,
@@ -25080,21 +25114,23 @@ private pure func emit_iterative_union_destructor(
 
 private pure func emit_union_destructor(
 	union_decl: CoreUnionDecl,
+	type_plan: CleanupTypePlan,
 	naming: BackendTypeNaming,
 	internal_type_linkage: Bool,
 ) -> String:
-	match union_cleanup_kind(union_decl):
-		NoUnionCleanup:
+	match cleanup_type_plan_strategy(type_plan):
+		NoCleanup:
 			""
-		IterativeUnionCleanup:
-			emit_iterative_union_destructor(union_decl, naming, internal_type_linkage)
-		DirectUnionCleanup:
-			emit_simple_union_destructor(union_decl, naming, internal_type_linkage)
+		IterativeCleanup:
+			emit_iterative_union_destructor(union_decl, type_plan, naming, internal_type_linkage)
+		DirectCleanup:
+			emit_simple_union_destructor(union_decl, type_plan, naming, internal_type_linkage)
 
 
 private pure func emit_union_constructor(
 	union_decl: CoreUnionDecl,
 	variant: CoreUnionVariant,
+	type_plan: CleanupTypePlan,
 	naming: BackendTypeNaming,
 ) -> String:
 	if variant.fields.length() == 0:
@@ -25126,7 +25162,7 @@ private pure func emit_union_constructor(
 		if uses_release_mask:
 			params = params.append("unsigned long release_mask")
 
-		destructor_init: String = if union_decl_has_destructor(union_decl):
+		destructor_init: String = if cleanup_type_plan_has_destructor(type_plan):
 			"  BLORP_SET_DESTRUCTOR(__vc, " + naming.destroy_name + ");\n"
 		else:
 			""
@@ -25146,6 +25182,7 @@ private pure func emit_union_constructor(
 private pure func emit_union_reuse_constructor(
 	union_decl: CoreUnionDecl,
 	variant: CoreUnionVariant,
+	type_plan: CleanupTypePlan,
 	naming: BackendTypeNaming,
 ) -> String:
 	if variant.fields.length() == 0:
@@ -25179,7 +25216,7 @@ private pure func emit_union_reuse_constructor(
 			params = params.append("unsigned long release_mask")
 			fresh_args = fresh_args.append("release_mask")
 
-		destroy_old_fields: String = if union_decl_has_destructor(union_decl):
+		destroy_old_fields: String = if cleanup_type_plan_has_destructor(type_plan):
 			"    " + naming.destroy_name + "(__old);\n"
 		else:
 			""
@@ -25245,6 +25282,7 @@ private pure func render_union_decl_emission(emission: CUnionDeclEmission) -> St
 
 private pure func emit_union_decl(
 	union_decl: CoreUnionDecl,
+	type_plan: CleanupTypePlan,
 	authority: CEmissionSymbolAuthority,
 	internal_type_linkage: Bool,
 ) -> CUnionDeclEmission:
@@ -25270,18 +25308,18 @@ private pure func emit_union_decl(
 		)
 		constructor_pieces = constructor_pieces.append({
 			is_owner_data = variant.fields.length() == 0,
-			text = emit_union_constructor(union_decl, variant, naming),
+			text = emit_union_constructor(union_decl, variant, type_plan, naming),
 		})
 		reuse_constructors_c = append_emitted_c(
 			reuse_constructors_c,
-			emit_union_reuse_constructor(union_decl, variant, naming),
+			emit_union_reuse_constructor(union_decl, variant, type_plan, naming),
 		)
 
 	header: String = "typedef struct " + union_decl.name + " {\n" + "  blorp_Object header;\n" + "  int tag;\n" + release_mask_field + "  union {\n" + storage_c + "  } data;\n" + "} " + union_decl.name + ";\n\n" + tags_c + "\n"
 
 	{
 		type_header = header,
-		functions = [emit_union_destructor(union_decl, naming, internal_type_linkage)],
+		functions = [emit_union_destructor(union_decl, type_plan, naming, internal_type_linkage)],
 		constructor_pieces = constructor_pieces,
 		inline_support = reuse_constructors_c
 	}
@@ -25930,18 +25968,22 @@ private pure func collect_value_record_decl_emissions(
 
 private pure func collect_heap_record_decl_emissions(
 	decls: List[CoreDecl],
+	plan: CleanupPlan,
 	layouts: CRecordLayoutRegistry,
 	authority: CEmissionSymbolAuthority,
 	internal_type_linkage: Bool,
 ) -> List[CHeapRecordDeclEmission]:
 	var result: List[CHeapRecordDeclEmission] = []
 
-	for decl in decls:
-		match decl:
+	for entry in decls.enumerate():
+		decl_index: Int = entry[0]
+
+		match entry[1]:
 			HeapRecordDecl(record_decl):
 				result = result.append(
 					emit_heap_record_decl(
 						record_decl,
+						cleanup_plan_row(plan, decl_index),
 						layouts,
 						c_heap_record_layout(layouts, record_decl.name),
 						authority,
@@ -25970,17 +26012,21 @@ private pure func collect_heap_record_decl_emissions(
 
 private pure func collect_union_decl_emissions(
 	decls: List[CoreDecl],
+	plan: CleanupPlan,
 	authority: CEmissionSymbolAuthority,
 	internal_type_linkage: Bool,
 ) -> List[CUnionDeclEmission]:
 	var result: List[CUnionDeclEmission] = []
 
-	for decl in decls:
-		match decl:
+	for entry in decls.enumerate():
+		decl_index: Int = entry[0]
+
+		match entry[1]:
 			UnionDecl(union_decl):
 				result = result.append(
 					emit_union_decl(
 						union_decl,
+						cleanup_plan_row(plan, decl_index),
 						authority,
 						internal_type_linkage,
 					),
@@ -26094,6 +26140,7 @@ declare `extern` in a shared header.
 ---
 private pure func emit_decls(
 	program: CoreProgram,
+	plan: CleanupPlan,
 	profile_configuration: FunctionProfileConfiguration,
 	symbol_authority: CEmissionSymbolAuthority,
 	canonical_empty_lists: List[CanonicalEmptyList],
@@ -26119,12 +26166,14 @@ private pure func emit_decls(
 	)
 	heap_record_emissions: List[CHeapRecordDeclEmission] = collect_heap_record_decl_emissions(
 		decls,
+		plan,
 		layouts,
 		symbol_authority,
 		internal_type_linkage,
 	)
 	union_emissions: List[CUnionDeclEmission] = collect_union_decl_emissions(
 		decls,
+		plan,
 		symbol_authority,
 		internal_type_linkage,
 	)
@@ -26187,6 +26236,7 @@ pure func try_emit_prepared_core_program_c_artifact_with_profile(
 	profile_configuration: FunctionProfileConfiguration,
 ) -> Result[CArtifact, CoreEmitError]:
 	program: CoreProgram = prepared_core_program_value(prepared)
+	plan: CleanupPlan = prepared_core_program_cleanup_plan(prepared)
 
 	match prepare_c_emission_symbols(program):
 		Err(error):
@@ -26194,6 +26244,7 @@ pure func try_emit_prepared_core_program_c_artifact_with_profile(
 		Ok(symbol_plan):
 			sections ?= emit_decls(
 				program,
+				plan,
 				profile_configuration,
 				ValidatedCEmissionSymbols(symbol_plan),
 				c_emission_canonical_empty_lists(symbol_plan),
@@ -26215,6 +26266,7 @@ pure func try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
 	profile_configuration: FunctionProfileConfiguration,
 ) -> Result[CArtifact, CoreEmitError]:
 	program: CoreProgram = prepared_core_program_value(prepared)
+	plan: CleanupPlan = prepared_core_program_cleanup_plan(prepared)
 	canonical_empty_lists ?= canonical_empty_lists_for_unprojected_program(
 		program,
 	).map_err(
@@ -26223,6 +26275,7 @@ pure func try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
 
 	sections ?= emit_decls(
 		program,
+		plan,
 		profile_configuration,
 		UnprojectedCEmissionSymbolsForTests,
 		canonical_empty_lists,
@@ -26480,16 +26533,19 @@ list to call them.
 ---
 private pure func type_support_function_prototypes(
 	decls: List[CoreDecl],
+	plan: CleanupPlan,
 	authority: CEmissionSymbolAuthority,
 ) -> String:
 	var c_code: String = make_string(0)
 
-	for decl in decls:
-		match decl:
+	for entry in decls.enumerate():
+		decl_index: Int = entry[0]
+
+		match entry[1]:
 			HeapRecordDecl(record_decl):
 				naming: BackendTypeNaming = selected_type_naming(authority, record_decl.name)
 
-				if heap_record_has_destructor(record_decl):
+				if cleanup_type_plan_has_destructor(cleanup_plan_row(plan, decl_index)):
 					c_code = append_emitted_c(
 						c_code,
 						destroy_function_signature(naming.destroy_name) + ";\n",
@@ -26502,7 +26558,7 @@ private pure func type_support_function_prototypes(
 			UnionDecl(union_decl):
 				naming: BackendTypeNaming = selected_type_naming(authority, union_decl.name)
 
-				if union_decl_has_destructor(union_decl):
+				if cleanup_type_plan_has_destructor(cleanup_plan_row(plan, decl_index)):
 					c_code = append_emitted_c(
 						c_code,
 						destroy_function_signature(naming.destroy_name) + ";\n",
@@ -26752,6 +26808,7 @@ function reads them off `sections` instead of calling
 private pure func render_split_translation_units(
 	sections: CEmissionSections,
 	decls: List[CoreDecl],
+	plan: CleanupPlan,
 	authority: CEmissionSymbolAuthority,
 	canonical_empty_lists: List[CanonicalEmptyList],
 	static_string_literals: List[BackendStaticStringLiteral],
@@ -26819,6 +26876,7 @@ private pure func render_split_translation_units(
 		heap_record_emissions,
 	) + header_owner_data + header_global_init_prototype + header_literal_macro + header_canonical_empty_list_typedefs + header_canonical_empty_list_externs + header_string_literal_externs + sections.static_closure_forward_decls + header_global_externs + header_profile_metadata_extern + type_support_function_prototypes(
 		decls,
+		plan,
 		authority,
 	) + sections.function_forward_decls + emit_entrypoint_forward_decls(
 		decls,
@@ -26904,6 +26962,7 @@ pure func try_emit_prepared_core_program_c_split_artifact_with_profile(
 		})
 	else:
 		program: CoreProgram = prepared_core_program_value(prepared)
+		plan: CleanupPlan = prepared_core_program_cleanup_plan(prepared)
 
 		match prepare_c_emission_symbols(program):
 			Err(error):
@@ -26925,6 +26984,7 @@ pure func try_emit_prepared_core_program_c_split_artifact_with_profile(
 				)
 				sections ?= emit_decls(
 					program,
+					plan,
 					profile_configuration,
 					authority,
 					canonical_empty_lists,
@@ -26936,6 +26996,7 @@ pure func try_emit_prepared_core_program_c_split_artifact_with_profile(
 					render_split_translation_units(
 						sections,
 						program.decls,
+						plan,
 						authority,
 						canonical_empty_lists,
 						static_string_literals,
