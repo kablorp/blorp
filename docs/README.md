@@ -52,6 +52,7 @@ module inventory lives in
   allocation explanations and a compile-time `no_alloc` block, including
   runtime/cleanup coverage, Core analysis, and tooling enforcement.
 - [Frontend Facts Roadmap](FRONTEND_FACTS_ROADMAP.md) is the task-level
+- [`SOURCE_DISCOVERY_PERFORMANCE_ROADMAP.md`](SOURCE_DISCOVERY_PERFORMANCE_ROADMAP.md) — lexer/parser/discovery cuts (Task 4 landed; rest deferred), with its profile in `benchmarks/results/`.
   plan for publishing each stage's facts as id-keyed tables (module,
   name, definition tables) and removing threaded state from typecheck.
 - [Compact Parser Migration](COMPACT_PARSER_MIGRATION.md) defines the staged
