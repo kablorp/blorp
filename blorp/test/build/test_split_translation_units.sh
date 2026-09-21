@@ -11,13 +11,19 @@ compiler="${BLORP_BIN:-bin/blorp}"
 source_program="blorp/tool/generate_build_sources.brp"
 native_runtime="blorp/src/lsp/server/native_runtime.c"
 runtime_sources="blorp/build/_build/blorp-cli/runtime_sources.c"
-runtime_object=$(ls blorp/build/_build/blorp-cli/runtime-*.o 2>/dev/null | head -n 1)
+# The build cache directory can accumulate runtime-<hash>.o objects from
+# earlier runtime.c/minicoro.h/cc revisions across many `make` invocations, so
+# picking any file that matches runtime-*.o is not safe. Ask the Makefile for
+# the one it would use for the current sources instead of guessing from the
+# directory listing.
+runtime_object_name=$(make -n build-blorp-cli 2>/dev/null | grep -o 'runtime-[0-9a-f]\{64\}\.o' | head -n 1)
+runtime_object="blorp/build/_build/blorp-cli/${runtime_object_name}"
 
 if [ ! -x "$compiler" ]; then
     echo "FAIL: $compiler is not built; run make first" >&2
     exit 1
 fi
-if [ ! -f "$runtime_sources" ] || [ -z "$runtime_object" ]; then
+if [ ! -f "$runtime_sources" ] || [ -z "$runtime_object_name" ] || [ ! -f "$runtime_object" ]; then
     echo "FAIL: prepared CLI runtime inputs are missing; run make first" >&2
     exit 1
 fi
