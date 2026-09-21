@@ -27,7 +27,7 @@ import:
 		union_cleanup_plan,
 	ir:
 		CoreDecl(FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl, UnionDecl),
-		CoreExpr,
+		CoreExpr(ClosureCreateExpr),
 		CoreFunction,
 		CoreHeapRecordDecl,
 		CoreProgram,
@@ -149,7 +149,15 @@ private record AllocationOwnerSeed {
 
 private record AllocationTypeIndex {
 	unions: Dict[String, CoreUnionDecl],
-	heap_records: Dict[String, CoreHeapRecordDecl]
+	heap_records: Dict[String, CoreHeapRecordDecl],
+	-- Merged cleanup facts over every capture type of every ClosureCreateExpr
+	-- anywhere in the program (see closure_capture_cleanup_facts). Releasing
+	-- a closure releases its captures and nothing else -- see
+	-- blorp_closure_destroy in runtime.c -- so this stands in for "the
+	-- capture facts of whichever concrete closure occupies this Closure- or
+	-- FunctionType-typed slot", computed once as a whole-program worst case
+	-- since the static type alone cannot say which literal it is.
+	closure_capture_facts: CoreLocalAllocationFacts
 }
 
 
@@ -350,8 +358,81 @@ private pure func allocation_type_index(program: CoreProgram) -> AllocationTypeI
 
 	{
 		unions = unions,
-		heap_records = heap_records
+		heap_records = heap_records,
+		closure_capture_facts = EMPTY_FACTS
 	}
+
+
+-- Every closure literal in the program, wherever it occurs (not just at
+-- declaration top level): a captured value's own type never appears in a
+-- Closure- or FunctionType-typed CoreType, so the only way to bound "what
+-- could this closure release" is to look at every ClosureCreateExpr that
+-- exists anywhere and union their capture types.
+private pure func scan_closure_capture_types(root: CoreExpr) -> List[CoreType]:
+	var pending: List[PendingExpr] = [{expr = root}]
+	var captured_types: List[CoreType] = []
+
+	while not pending.is_empty():
+		pending_index: Int = pending.length() - 1
+
+		match pending.get(pending_index):
+			None:
+				pending = pending.take(pending_index)
+			Some(work):
+				pending = pending.take(pending_index)
+
+				match work.expr:
+					ClosureCreateExpr(closure, _, _):
+						for capture in closure.captures:
+							captured_types = captured_types.append(capture.typ)
+					_:
+						void
+
+				children: List[CoreExpr] = CoreTraverse.immediate_core_expr_children(work.expr)
+
+				for child in children.reverse():
+					pending = pending.append({expr = child})
+
+	captured_types
+
+
+private pure func program_closure_capture_types(seeds: List[AllocationOwnerSeed]) -> List[CoreType]:
+	var types: List[CoreType] = []
+
+	for seed in seeds:
+		match seed.body:
+			Some(body):
+				types = types.concat(scan_closure_capture_types(body))
+			None:
+				void
+
+	types
+
+
+-- Merge the cleanup facts of every capture type found anywhere in the
+-- program. `type_index` must carry an empty `closure_capture_facts` here:
+-- a capture that is itself Closure/FunctionType-typed contributes nothing
+-- extra at this step, because whichever literal closure produced that
+-- captured value is itself some ClosureCreateExpr found independently by
+-- `program_closure_capture_types`, so its own captures are already flat in
+-- `capture_types`. This is a one-pass flattening, not an approximation.
+private pure func closure_capture_cleanup_facts(
+	type_index: AllocationTypeIndex,
+	capture_types: List[CoreType],
+) -> CoreLocalAllocationFacts:
+	var facts: CoreLocalAllocationFacts = EMPTY_FACTS
+
+	for typ in capture_types:
+		policy: CoreReleasePolicy = cleanup_release_policy_for_type(typ)
+
+		match policy:
+			NoReleasePolicy | ArcReleaseOnlyPolicy:
+				void
+			ArcReleasePolicy | StackResultReleasePolicy:
+				result: CleanupFactsResult = cleanup_facts(type_index, typ, policy)
+				facts = merge_allocation_facts(facts, result.facts)
+
+	facts
 
 
 private pure func allocation_owner_registry(
@@ -483,19 +564,32 @@ private pure func cleanup_facts(
 									typ = info.element_type,
 									policy = cleanup_release_policy_for_type(info.element_type),
 								})
-							-- List/Set/Dict release known runtime code that walks the
-							-- backing buffer and drops each element with the
-							-- element type's own (already-analyzed) cleanup; that
-							-- is not a callback into unknown user code. Every
-							-- other ArcReleasePolicy NamedType (Closure, Channel,
-							-- Stream/FallibleStream, resource sources, network
-							-- session types) really can call back on release and
-							-- stays unknown.
+							-- List/Set/Dict/Channel release known runtime code that
+							-- walks the backing buffer/queue and drops each element
+							-- with the element type's own (already-analyzed)
+							-- cleanup; blorp_channel_destructor (runtime.c) only
+							-- calls the generic elem_release on buffered values,
+							-- same as blorp_dict_destroy/blorp_list_destroy -- not
+							-- a callback into unknown user code. Option decomposes
+							-- into its payload the same way: the nullable/managed
+							-- representation just means "release the payload if
+							-- present". Closure and FunctionType decompose into
+							-- the whole program's closure_capture_facts (see
+							-- AllocationTypeIndex): blorp_closure_destroy only
+							-- calls blorp_release on retained captures, never user
+							-- code, so a closure/function value can only be as
+							-- risky as the riskiest capture any closure literal in
+							-- the program actually has. Everything else under
+							-- ArcReleasePolicy that isn't one of these known shapes
+							-- -- Stream/FallibleStream (dynamic per-instance
+							-- state_cleanup dispatch), resource sources, and
+							-- network session types (call into a backend's close())
+							-- -- really can call back on release and stays unknown.
 							NamedType(name, args):
 								type_nodes += 1
 
 								match (name, args):
-									("List", [element]) | ("Set", [element]):
+									("List", [element]) | ("Set", [element]) | ("Channel", [element]):
 										pending = pending.append({
 											typ = element,
 											policy = cleanup_release_policy_for_type(element),
@@ -509,9 +603,19 @@ private pure func cleanup_facts(
 											typ = value,
 											policy = cleanup_release_policy_for_type(value),
 										})
+									("Option", [payload]):
+										pending = pending.append({
+											typ = payload,
+											policy = cleanup_release_policy_for_type(payload),
+										})
+									("Closure", []):
+										facts = merge_allocation_facts(facts, index.closure_capture_facts)
 									_:
 										facts = merge_allocation_facts(facts, unknown_cleanup_facts())
-							FunctionType(_, _, _) | TypeParameterType(_) | SelfType:
+							FunctionType(_, _, _):
+								type_nodes += 1
+								facts = merge_allocation_facts(facts, index.closure_capture_facts)
+							TypeParameterType(_) | SelfType:
 								type_nodes += 1
 								facts = merge_allocation_facts(facts, unknown_cleanup_facts())
 							VoidType | EnumType(_) | ValueRecordType(_) | RangeType:
@@ -1022,7 +1126,13 @@ pure func allocation_proof_status(
 
 pure func analyze_core_allocations(program: CoreProgram) -> CoreAllocationAnalysis:
 	seeds: List[AllocationOwnerSeed] = allocation_owner_seeds(program)
-	type_index: AllocationTypeIndex = allocation_type_index(program)
+	base_type_index: AllocationTypeIndex = allocation_type_index(program)
+	capture_types: List[CoreType] = program_closure_capture_types(seeds)
+	closure_facts: CoreLocalAllocationFacts = closure_capture_cleanup_facts(
+		base_type_index,
+		capture_types,
+	)
+	type_index: AllocationTypeIndex = { base_type_index | closure_capture_facts = closure_facts }
 	owner_registry: AllocationOwnerRegistry = allocation_owner_registry(seeds)
 
 	var locals: List[LocalOwnerFacts] = []

@@ -211,3 +211,199 @@ measurement had been built at `-O2` in its own worktree; the tool's own
 "toolchain mismatch: optimization differs" line flags this. The metric that
 matters for a report-only change — generated C byte-for-byte identity — is
 exact.
+
+## Cut 2 (2026-09-21): closures, functions, Channel, and Option decompose too
+
+Follow-up to cut 1. Cut 1 left `List`/`Dict`/`Set` of closures, closure-holding
+records, `Channel`, and `Option`-wrapped containers unknown, and treated
+custom-hash containers as a release-time risk. This cut checked each of
+those assumptions against the runtime and corrected the ones that did not
+hold.
+
+### What the runtime actually does on release
+
+- **Closures are safe to decompose.** `blorp_closure_destroy` (`runtime.c`)
+  only calls `blorp_release` on each retained capture slot named by
+  `env_release_mask`; it never runs arbitrary user code. Capture retention
+  at creation is symmetric: `emit.brp`'s `closure_capture_box_expr` calls
+  `blorp_retain((blorp_Object*)...)` for managed-pointer captures. So
+  releasing a closure is exactly as risky as releasing its captures — no
+  more, no less. `FunctionType` values are ARC-managed the same way
+  (`cleanup_release_policy_for_type` gives both `NamedType("Closure", [])`
+  and `FunctionType` `ArcReleasePolicy`) and decompose identically.
+  The catch: a bare `Closure`/`FunctionType` `CoreType` cannot say which
+  concrete closure literal occupies a given slot (the same "which instance
+  is this really" problem as an erased union payload), so there is no
+  single field type to recurse into the way a record field works. The fix
+  is a whole-program bound: scan every `ClosureCreateExpr` anywhere in the
+  program (not just top-level — nested closures too) via
+  `program_closure_capture_types`, merge all their captures' cleanup facts
+  once via `closure_capture_cleanup_facts`, and cache the result on
+  `AllocationTypeIndex.closure_capture_facts`. Every `Closure`/`FunctionType`
+  release in the program then decomposes to that one merged fact set. A
+  capture that is itself `Closure`/`FunctionType`-typed contributes nothing
+  extra at this step (computed against an index with an still-empty
+  `closure_capture_facts`) because whichever literal produced that captured
+  closure is itself found independently by the same whole-program scan — a
+  one-pass flattening, not an approximation.
+- **`Channel` is not a special "resource" case.** `blorp_channel_destructor`
+  only calls the generic `elem_release` on buffered values — the same
+  mechanism `blorp_dict_destroy`/`blorp_list_destroy` use for element
+  release. `Channel[T]` now decomposes into `T`'s own cleanup facts exactly
+  like `List`/`Set`.
+- **`Option` decomposes into its payload.** The nullable/managed
+  representation means "release the payload if present"; `cleanup_facts`
+  now appends `{typ = payload, policy = cleanup_release_policy_for_type(payload)}`
+  instead of treating any `ArcReleasePolicy` `Option` as unknown. `Result`
+  was already fully decomposed via `StackResultType`/`BoxedResultType` in
+  cut 1 (a separate representation, not a `NamedType`); no change needed
+  there.
+- **Custom-hash containers are not a release-time risk — the original cut-2
+  hypothesis for this one did not hold.** `blorp_dict_destroy` and
+  `blorp_set_destroy` (`runtime.c`) never call `dict->hash_fn`/`dict->eq_fn`
+  (or the `Set` equivalents) during teardown; those fields are read only by
+  the insert/lookup/rehash paths. Release only calls the generic
+  `key_release`/`value_release`, identical to an ordinary `Dict`/`Set`. The
+  `hash_fn`/`eq_fn` fields are plain C function pointers (not
+  `blorp_Closure*`), so there is not even a captured closure to release
+  alongside the container. The genuine custom-hash risk stays exactly where
+  cut 1 already put it: `unknown_call_target` on the *construction* site
+  (`dict_construct_allocation_contract`'s `CustomHashContainerConstructor`
+  arm), not cleanup. No cleanup-side change was made for this case, and the
+  requested "custom-hash-holding record" negative test is not constructible
+  because there is no such cleanup-time distinction to observe — instead,
+  `test_record_holding_dict_field_cleanup_is_free_regardless_of_hash_kind`
+  demonstrates the actual (free) behavior directly.
+- **Resources with a real finalizer stay unknown, confirmed.**
+  `blorp_tls_session_destroy` and `blorp_websocket_session_destroy` call
+  `backend->close(session)` — a real backend callback, not just element
+  release. `blorp_stream_destroy`/`blorp_fallible_stream_destroy` call
+  `s->state_cleanup(s)`, a function pointer chosen per-instance by which
+  stream combinator (`map`/`filter`/`take_while`/...) built that particular
+  stream — a second "which instance is this" type-erasure problem, but
+  without an equivalent of `CoreClosureCapture` to bound it program-wide, so
+  it stays unknown. `Stream`/`FallibleStream`, resource sources, and network
+  session types are the remaining `NamedType` fallback case in
+  `cleanup_facts`.
+
+### Changes
+
+- `blorp/src/compiler/stage_09_core/allocation_analysis.brp`:
+  - `AllocationTypeIndex` gained `closure_capture_facts: CoreLocalAllocationFacts`.
+  - Added `scan_closure_capture_types`, `program_closure_capture_types`, and
+    `closure_capture_cleanup_facts` to compute it once per analysis.
+  - `cleanup_facts`'s `NamedType` arm now also decomposes `("Channel", [element])`
+    like `List`/`Set`, `("Option", [payload])` into the payload, and
+    `("Closure", [])` into `index.closure_capture_facts`. The `FunctionType`
+    arm (previously grouped with `TypeParameterType`/`SelfType` as unknown)
+    is now its own arm using `index.closure_capture_facts`;
+    `TypeParameterType`/`SelfType` remain unknown (unresolved generics,
+    unrelated to this task).
+- No changes to `allocation_contracts.brp`, `allocation_report.brp`, or the
+  emitter/runtime — cut 1 already made the emission-time and construction-time
+  fixes this cut needed to build on.
+
+### Before/after census (identical frozen input, `origin/main` cut-1 commit `3984badfa`)
+
+Both runs used the same frozen snapshot of that exact commit, so this table
+isolates cut 2's effect from cut 1's (already-landed) effect and from
+unrelated commits landed on `main` afterward (a runtime-oracle allocation
+counter and a build fix, neither touching the allocation-analysis files).
+
+| owner status | before (cut 1 only) | after (cut 1 + cut 2) | delta |
+|---|---:|---:|---:|
+| `core_no_known_allocation` | 2,869 | 2,927 | +58 |
+| `may_allocate` only | 1,209 | 1,733 | +524 |
+| `unknown` only | 2,804 | 2,496 | -308 |
+| `may_allocate_and_unknown` | 10,006 | 9,732 | -274 |
+| total owners | 16,888 | 16,888 | 0 |
+
+| site category / unknown reason | before | after | delta |
+|---|---:|---:|---:|
+| `cleanup` / `runtime_callback_boundary` | 36,725 | 12,478 | -24,247 (-66.0%) |
+| `call` / `runtime_operation` | 24,852 | 24,852 | 0 |
+| `control_flow` / `runtime_callback_boundary` | 3,720 | **0** | -3,720 (-100%) |
+| `call` / `unknown_call_target` | 1,446 | 1,446 | 0 |
+| `call` / `foreign_call_boundary` | 1,091 | 1,091 | 0 |
+| `record` / `runtime_callback_boundary` | 630 | **0** | -630 (-100%) |
+| `call` / `missing_function_body` | 192 | 192 | 0 |
+| `tuple` / `runtime_callback_boundary` | 1 | **0** | -1 (-100%) |
+| total sites | 176,760 | 176,760 | 0 |
+
+`control_flow`, `record`, and `tuple` category unknowns from
+`runtime_callback_boundary` are now fully eliminated — every remaining
+`runtime_callback_boundary` unknown is in the `cleanup` and (transitively,
+via loop iterable cleanup) `call` categories, and each now names the actual
+resource/stream/network type via `detail` (cut 1's site-naming field).
+
+| may reason | before | after |
+|---|---:|---:|
+| `cleanup_scratch` | 26,189 | 32,966 |
+| `managed_object` | 20,654 | 20,654 |
+| `raw_buffer` | 6,537 | 6,537 |
+| `cow_fallback` | 849 | 849 |
+| `closure_environment` | 1,120 | 1,120 |
+| `tuple_storage` | 2,521 | 2,521 |
+| `capacity_growth` | 193 | 193 |
+| `heap_box` | 281 | 281 |
+| `task` | 5 | 5 |
+
+Every `may_allocate` reason except `cleanup_scratch` is unchanged, the same
+signature as cut 1: only false unknowns are removed, no real risk is
+relaxed. `cleanup_scratch` rose by 6,777 for the same reason as cut 1 — more
+paths (now through `Channel`/`Option`/`Closure` as well as `List`/`Dict`/`Set`)
+reach a recursive union's `union_cleanup_plan` instead of stopping at a
+blanket unknown first.
+
+### Gates
+
+Allocation test suites (`bin/blorp test`, using its own `BLORP_GATE_RESULT`
+env-driven summary line, not composed here):
+
+```
+benchmarks/self_compile_measure lock -- env BLORP_GATE_RESULT=alloc-precision-cut2-tests \
+  bin/blorp test --timeout 180 \
+  blorp/test/compiler/stage_09_core/test_core_allocation_contracts.brp \
+  blorp/test/compiler/stage_09_core/test_core_allocation_analysis.brp \
+  blorp/test/compiler/stage_09_core/test_core_allocation_report.brp
+BLORP_GATE_RESULT gate=alloc-precision-cut2-tests status=PASS passed=59 failed=0 tests=59
+```
+
+`scripts/compiler-check`'s own line:
+
+```
+benchmarks/self_compile_measure lock -- scripts/compiler-check --changed --base origin/main
+BLORP_GATE_RESULT gate=compiler-check status=PASS passed=2074 failed=0 tests=2074
+```
+
+`self_compile_measure --require-identical` (this tool does not print a
+`BLORP_GATE_RESULT` line; reporting its actual output verbatim). Baseline
+measured first from a separate worktree pinned at cut 1's landed commit
+(`3984badfa`), candidate measured from this branch against the same input
+revision:
+
+```
+benchmarks/self_compile_measure --program small --label cut2-parent --input-rev 3984badf \
+  --samples 1 --output /tmp/cut2_parent_measure.json          # baseline, parent worktree
+benchmarks/self_compile_measure --program small --label cut2 --input-rev 3984badf \
+  --samples 1 --baseline /tmp/cut2_parent_measure.json --require-identical --allow-toolchain-mismatch
+output C : IDENTICAL (45827 vs 45827 bytes)
+```
+Exit code 0. `--allow-toolchain-mismatch` was required because the tool's own
+`make` step rebuilds the candidate at `-O0` while the baseline was built at
+`-O2` in its own worktree — the same toolchain-level (not content-level)
+mismatch cut 1 hit; the tool distinguishes this from an actual C difference
+via a separate exit code (3 for a real diff, 4 for a toolchain mismatch), and
+only the identical-bytes result is the acceptance evidence for a report-only
+change. Without `--allow-toolchain-mismatch` the run exits 4 on the
+toolchain guard alone, even though the C is identical — worth flagging for
+whoever reviews future report-only gates against this tool: check
+`output bytes` and `output C : IDENTICAL` in the printed comparison, not
+just the process exit code, since 4 does not mean the content differs.
+
+### Probe
+
+`Option[List[Int]]` and closures capturing only scalars, which both showed
+up as `unknown: runtime_callback_boundary` in the cut-1 census (821 and part
+of the "List of complex union types" residue respectively), now report no
+known allocation, matching the `total(xs)` probe from cut 1.

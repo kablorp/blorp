@@ -24,6 +24,7 @@ import:
 		CoreDecl(FunctionDecl, HeapRecordDecl, UnionDecl),
 		CoreExpr(
 			CallExpr,
+			ClosureCreateExpr,
 			CooperativeCheckpointExpr,
 			DebugBlockExpr,
 			DropExpr,
@@ -499,24 +500,13 @@ private pure func test_list_dict_set_of_scalars_cleanup_is_free() -> Bool:
 	)
 
 
--- Negative trap: a List of Closures still calls back on release (the
--- closure's captured environment can hold anything), so it must stay
--- unknown even though ordinary List[Int] cleanup is now free.
-private pure func test_list_of_closures_cleanup_stays_unknown() -> Bool:
-	analysis: CoreAllocationAnalysis = analyze_core_allocations(program([
-		function_decl(
-			"drop_list_of_closures",
-			10,
-			Some(drop_of(NamedType("List", [NamedType("Closure", [])]), ArcReleasePolicy)),
-		),
-	]))
-	result: AllocationOwnerSummary = summary(analysis, 10)
-
-	result.status == AllocationUnknown and result.facts.unknown == [RuntimeCallbackBoundary]
-
-
--- Negative trap: a heap record holding a closure field still calls back on
--- release even though its own release policy is otherwise ordinary ARC.
+-- blorp_closure_destroy (runtime.c) only calls blorp_release on retained
+-- captures -- it never runs arbitrary user code. A CoreType alone (Closure
+-- or FunctionType) cannot say which concrete closure literal occupies a
+-- given slot, so the analysis bounds it by scanning every ClosureCreateExpr
+-- in the whole program and merging their captures' cleanup facts. A heap
+-- record field or a List element typed Closure decomposes into that
+-- program-wide summary instead of an unconditional unknown.
 private pure func widget_with_closure_field() -> CoreDecl:
 	HeapRecordDecl({
 		abi_type = None,
@@ -533,13 +523,202 @@ private pure func widget_with_closure_field() -> CoreDecl:
 	})
 
 
-private pure func test_closure_holding_record_cleanup_stays_unknown() -> Bool:
+private pure func closure_literal(capture_type: CoreType) -> CoreExpr:
+	ClosureCreateExpr(
+		{
+			function_name = "closure_body",
+			def_id = 500,
+			c_name = "closure_body_500",
+			static_name = "closure_body_static_500",
+			captures = [
+				{
+					name = "captured",
+					typ = capture_type
+				},
+			]
+		},
+		NamedType(
+			"Closure",
+			[],
+		),
+		SyntheticSourceLoc,
+	)
+
+
+-- Positive: no closure literal anywhere in this program captures anything
+-- risky (just an Int), so every Closure-typed release is free, including a
+-- List[Closure] element and a record field.
+private pure func test_closure_cleanup_is_free_when_no_capture_is_risky() -> Bool:
 	analysis: CoreAllocationAnalysis = analyze_core_allocations(program([
-		widget_with_closure_field(),
+		function_decl("make_closure", 5, Some(closure_literal(INT_TYPE))),
 		function_decl(
-			"drop_widget",
+			"drop_list_of_closures",
 			10,
-			Some(drop_of(HeapRecordType("Widget"), ArcReleasePolicy)),
+			Some(drop_of(NamedType("List", [NamedType("Closure", [])]), ArcReleasePolicy)),
+		),
+		widget_with_closure_field(),
+		function_decl("drop_widget", 20, Some(drop_of(HeapRecordType("Widget"), ArcReleasePolicy))),
+	]))
+
+	(
+		summary(analysis, 10).status == AllocationProvenFree
+		and summary(analysis, 20).status == AllocationProvenFree
+	)
+
+
+-- Positive: a closure capturing a recursive union contributes exactly
+-- cleanup_scratch (the same fact union_cleanup_plan already computes for a
+-- bare recursive-union drop), not a blanket unknown.
+private pure func test_closure_capturing_recursive_union_is_cleanup_scratch() -> Bool:
+	analysis: CoreAllocationAnalysis = analyze_core_allocations(program([
+		UnionDecl(recursive_union_decl()),
+		function_decl("make_closure", 5, Some(closure_literal(UnionType("Node")))),
+		function_decl("drop_closure", 10, Some(drop_of(NamedType("Closure", []), ArcReleasePolicy))),
+	]))
+	result: AllocationOwnerSummary = summary(analysis, 10)
+
+	result.status == AllocationMayAllocate and result.facts.may_allocate == [CleanupScratchAllocation]
+
+
+-- Negative trap: a closure capturing a genuine resource (a Stream, whose
+-- release dispatches through a per-instance state_cleanup function pointer
+-- chosen dynamically by which combinator built it -- see blorp_stream_destroy
+-- in runtime.c) makes every Closure-typed release in the program unknown,
+-- because the static type cannot say which literal closure a given value
+-- actually is.
+private pure func test_closure_capturing_resource_stays_unknown() -> Bool:
+	analysis: CoreAllocationAnalysis = analyze_core_allocations(program([
+		function_decl("make_closure", 5, Some(closure_literal(NamedType("Stream", [INT_TYPE])))),
+		function_decl(
+			"drop_list_of_closures",
+			10,
+			Some(drop_of(NamedType("List", [NamedType("Closure", [])]), ArcReleasePolicy)),
+		),
+		widget_with_closure_field(),
+		function_decl("drop_widget", 20, Some(drop_of(HeapRecordType("Widget"), ArcReleasePolicy))),
+	]))
+
+	(
+		summary(analysis, 10).status == AllocationUnknown
+		and summary(analysis, 10).facts.unknown == [RuntimeCallbackBoundary]
+		and summary(analysis, 20).status == AllocationUnknown
+		and summary(analysis, 20).facts.unknown == [RuntimeCallbackBoundary]
+	)
+
+
+-- Positive: blorp_channel_destructor (runtime.c) only calls the generic
+-- elem_release on buffered values, exactly like blorp_dict_destroy and
+-- blorp_list_destroy -- Channel is not a special "resource with a
+-- finalizer" case, so Channel[Int] cleanup is free just like List[Int].
+private pure func test_channel_of_scalars_cleanup_is_free() -> Bool:
+	analysis: CoreAllocationAnalysis = analyze_core_allocations(program([
+		function_decl(
+			"drop_channel",
+			10,
+			Some(drop_of(NamedType("Channel", [INT_TYPE]), ArcReleasePolicy)),
+		),
+	]))
+
+	summary(analysis, 10).status == AllocationProvenFree
+
+
+-- Positive: Option's nullable/managed representation means "release the
+-- payload if present"; it decomposes into the payload's own cleanup facts
+-- the same way a container element does.
+private pure func test_option_of_list_cleanup_is_free() -> Bool:
+	analysis: CoreAllocationAnalysis = analyze_core_allocations(program([
+		function_decl(
+			"drop_option_list",
+			10,
+			Some(drop_of(NamedType("Option", [NamedType("List", [INT_TYPE])]), ArcReleasePolicy)),
+		),
+	]))
+
+	summary(analysis, 10).status == AllocationProvenFree
+
+
+-- Negative: an Option wrapping a genuine resource stays unknown, because
+-- decomposing Option only defers to the payload's own facts.
+private pure func test_option_of_resource_stays_unknown() -> Bool:
+	analysis: CoreAllocationAnalysis = analyze_core_allocations(program([
+		function_decl(
+			"drop_option_stream",
+			10,
+			Some(
+				drop_of(
+					NamedType("Option", [NamedType("Stream", [INT_TYPE])]),
+					ArcReleasePolicy,
+				),
+			),
+		),
+	]))
+	result: AllocationOwnerSummary = summary(analysis, 10)
+
+	result.status == AllocationUnknown and result.facts.unknown == [RuntimeCallbackBoundary]
+
+
+-- Documents a finding from the runtime: blorp_dict_destroy/blorp_set_destroy
+-- never call dict->hash_fn/eq_fn during release (only during insert/lookup);
+-- they only call the generic key_release/value_release on stored entries.
+-- So a record holding a Dict/Set field cleans up by element type alone,
+-- regardless of whether that container used a custom hash -- custom hash
+-- is a construction-time risk (see the "container construction preserves
+-- payload risks" contracts test), not a cleanup-time one.
+private pure func widget_with_dict_field() -> CoreDecl:
+	HeapRecordDecl({
+		abi_type = None,
+		name = "IndexWidget",
+		type_params = [],
+		fields = [
+			{
+				name = "by_id",
+				typ = NamedType("Dict", [INT_TYPE, INT_TYPE]),
+				release_policy = ArcReleasePolicy
+			},
+		],
+		loc = SyntheticSourceLoc,
+	})
+
+
+private pure func test_record_holding_dict_field_cleanup_is_free_regardless_of_hash_kind() -> Bool:
+	analysis: CoreAllocationAnalysis = analyze_core_allocations(program([
+		widget_with_dict_field(),
+		function_decl(
+			"drop_index_widget",
+			10,
+			Some(drop_of(HeapRecordType("IndexWidget"), ArcReleasePolicy)),
+		),
+	]))
+
+	summary(analysis, 10).status == AllocationProvenFree
+
+
+-- Negative trap: a heap record holding a genuine resource field (a Stream,
+-- whose release dispatches through a per-instance state_cleanup callback --
+-- see blorp_stream_destroy in runtime.c) stays unknown.
+private pure func widget_with_stream_field() -> CoreDecl:
+	HeapRecordDecl({
+		abi_type = None,
+		name = "SourceWidget",
+		type_params = [],
+		fields = [
+			{
+				name = "events",
+				typ = NamedType("Stream", [INT_TYPE]),
+				release_policy = ArcReleasePolicy
+			},
+		],
+		loc = SyntheticSourceLoc,
+	})
+
+
+private pure func test_record_holding_resource_field_stays_unknown() -> Bool:
+	analysis: CoreAllocationAnalysis = analyze_core_allocations(program([
+		widget_with_stream_field(),
+		function_decl(
+			"drop_source_widget",
+			10,
+			Some(drop_of(HeapRecordType("SourceWidget"), ArcReleasePolicy)),
 		),
 	]))
 	result: AllocationOwnerSummary = summary(analysis, 10)
@@ -638,12 +817,27 @@ tests: TestSuite = {
 			test_list_dict_set_of_scalars_cleanup_is_free,
 		),
 		(
-			"list of closures cleanup stays unknown",
-			test_list_of_closures_cleanup_stays_unknown,
+			"closure cleanup is free when no capture is risky",
+			test_closure_cleanup_is_free_when_no_capture_is_risky,
 		),
 		(
-			"closure-holding record cleanup stays unknown",
-			test_closure_holding_record_cleanup_stays_unknown,
+			"closure capturing recursive union is cleanup scratch",
+			test_closure_capturing_recursive_union_is_cleanup_scratch,
+		),
+		(
+			"closure capturing resource stays unknown",
+			test_closure_capturing_resource_stays_unknown,
+		),
+		("channel of scalars cleanup is free", test_channel_of_scalars_cleanup_is_free),
+		("option of list cleanup is free", test_option_of_list_cleanup_is_free),
+		("option of resource stays unknown", test_option_of_resource_stays_unknown),
+		(
+			"record holding dict field cleanup is free regardless of hash kind",
+			test_record_holding_dict_field_cleanup_is_free_regardless_of_hash_kind,
+		),
+		(
+			"record holding resource field stays unknown",
+			test_record_holding_resource_field_stays_unknown,
 		),
 		(
 			"loop over list of scalars with checkpoint is free",
