@@ -1790,12 +1790,34 @@ Rules:
    `benchmarks/self_compile_measure lock -- <cmd>` so concurrent worktrees
    neither perturb each other nor overwhelm macOS `syspolicyd`.
 5. Report the comparison table verbatim: allocations per phase, total
-   allocations, minimum retired instructions, phase medians, and the
-   IDENTICAL/DIFFERENT output line. Wall time alone is never evidence.
+   allocations, minimum retired instructions, and the IDENTICAL/DIFFERENT
+   output line. Wall time and per-phase `phases_ms` are host-clock noise, not
+   acceptance evidence; the table omits them by default (they are still
+   recorded in the JSON) and only prints them with `--show-wall`.
+6. Every measurement records a toolchain fingerprint (`cc_version`, the full
+   `<compiler> --version` output, and the `compiled_by` / `optimization` /
+   `commit` fields parsed from it). `compare()` prints a `toolchain mismatch:`
+   line for each of `cc_version`, `compiled_by`, or `optimization` that
+   differs and exits nonzero unless `--allow-toolchain-mismatch` is passed —
+   an Xcode clang update or a bootstrap-pin change moves instruction counts on
+   byte-identical C, so a baseline and candidate built with different
+   toolchains are not comparable by default. A `commit` difference alone is
+   expected and informational only. If the compiler under test is
+   bootstrap-built (`compiled_by` starts with `dev-`) and the worktree
+   touches `blorp/src/compiler/stage_10_backend/` or
+   `blorp/src/lib/runtime/native/`, the harness also prints a loud warning
+   that the measurement cannot observe those changes and points at
+   `benchmarks/build_stage2_compiler` (see the stage-2 rule below).
 
 Retained baselines live in `benchmarks/results/self_compile_baseline_*.json`
 and `self_compile_small_baseline_*.json`; a new baseline is recorded only when
-the input revision or host changes.
+the input revision or host changes. Baselines recorded before the toolchain
+fingerprint was added have no `toolchain` key at all; comparing against one
+of them prints a warning ("baseline predates fingerprint recording") instead
+of a hard refusal, and instruction-count deltas against them should be read
+with that in mind rather than trusted outright. Existing baseline files are
+not rewritten retroactively — fingerprints are recorded from this change
+forward only.
 
 ### The Stage-2 Rule
 
