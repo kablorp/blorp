@@ -1,0 +1,133 @@
+-- Paired checkpoint for the iterative compact-expression parser. Fixture
+-- construction and warmup stay outside both measured windows.
+--
+-- Usage:
+--   bin/blorp run blorp/benchmark/compiler/compact_expression_direct_parser_probe.brp -- deep 256 100
+--   bin/blorp run blorp/benchmark/compiler/compact_expression_direct_parser_probe.brp -- wide 128 100
+--   bin/blorp run blorp/benchmark/compiler/compact_expression_direct_parser_probe.brp -- malformed 128 100
+import:
+	../../src/compiler/stage_03_parse/compact_expression_product:
+		CompactDirectRootRequest,
+		compact_expression_direct_parse_checkpoint,
+		compact_expression_oracle_counts,
+	../../src/compiler/stage_03_parse/language_parser: raw_expression_parser_checkpoint
+	../../src/lib/source: SourceFile, source_cursor_at, source_file, source_location_for_file
+	memory: get_mem_stats, reset_mem_stats
+	string: parse_int
+	system: now_microseconds
+
+
+private DEFAULT_WIDTH: Int = 128
+
+private DEFAULT_ITERATIONS: Int = 100
+
+
+private pure func positive_argument(args: List[String], index: Int, default: Int) -> Int:
+	match args.get(index):
+		Some(text):
+			parse_int(text)
+				.filter(func(value): value > 0)
+				.get_or(default)
+		None:
+			default
+
+
+private pure func workload_source(kind: String, width: Int) -> SourceFile:
+	text = if kind == "deep":
+		"-".repeat(width) + "alpha"
+	else if kind == "wide" or kind == "malformed":
+		var call = "f("
+		var index: Int = 0
+
+		while index < width:
+			if index > 0:
+				call += ", "
+
+			call += "alpha"
+			index += 1
+
+		if kind == "wide":
+			call + ")"
+		else:
+			call
+	else:
+		"f(alpha, beta + gamma)"
+
+	source_file("direct_probe.brp", "direct_probe", text)
+
+
+private pure func baseline_execute(source: SourceFile, iterations: Int) -> Int:
+	header = source_location_for_file(
+		source,
+		source_cursor_at(source, 0),
+		source_cursor_at(source, 0),
+	)
+	var checksum: Int = 0
+	var iteration: Int = 0
+
+	while iteration < iterations:
+		checkpoint = raw_expression_parser_checkpoint(source, 0, 0, header)
+		checksum += checkpoint.index + checkpoint.diagnostics.length()
+		iteration += 1
+
+	checksum
+
+
+private pure func direct_execute(source: SourceFile, iterations: Int) -> Int:
+	header = source_location_for_file(
+		source,
+		source_cursor_at(source, 0),
+		source_cursor_at(source, 0),
+	)
+	request: CompactDirectRootRequest = {
+		index = 0,
+		min_precedence = 0,
+		header_span = header
+	}
+	var checksum: Int = 0
+	var iteration: Int = 0
+
+	while iteration < iterations:
+		match compact_expression_direct_parse_checkpoint(source, [request]):
+			Ok(checkpoint):
+				counts = compact_expression_oracle_counts(checkpoint.product)
+				checksum += checkpoint.end_indices.get_or(
+					0,
+					-1,
+				) + checkpoint.diagnostics.length() + counts.node_count
+			Err(_):
+				checksum = -1
+
+		iteration += 1
+
+	checksum
+
+
+func main(args: List[String]) -> Int:
+	kind = args.get_or(1, "small")
+	width = positive_argument(args, 2, DEFAULT_WIDTH)
+	iterations = positive_argument(args, 3, DEFAULT_ITERATIONS)
+	source = workload_source(kind, width)
+	baseline_warmup = baseline_execute(source, 1)
+	direct_warmup = direct_execute(source, 1)
+
+	reset_mem_stats()
+	baseline_started = now_microseconds()
+	baseline = baseline_execute(source, iterations)
+	baseline_elapsed = now_microseconds() - baseline_started
+	baseline_memory = get_mem_stats()
+
+	reset_mem_stats()
+	direct_started = now_microseconds()
+	direct = direct_execute(source, iterations)
+	direct_elapsed = now_microseconds() - direct_started
+	direct_memory = get_mem_stats()
+
+	print(
+		"COMPACT_DIRECT_PARSER" + " workload=" + kind + " width=" + width.to_string() + " iterations=" + iterations.to_string() + " baseline_us=" + baseline_elapsed.to_string() + " direct_us=" + direct_elapsed.to_string() + " baseline_allocations=" + baseline_memory.total_allocations.to_string() + " direct_allocations=" + direct_memory.total_allocations.to_string() + " baseline_releases=" + baseline_memory.total_releases.to_string() + " direct_releases=" + direct_memory.total_releases.to_string() + " baseline_live=" + baseline_memory.current_objects.to_string() + " direct_live=" + direct_memory.current_objects.to_string() + " baseline_checksum=" + baseline.to_string() + " direct_checksum=" + direct.to_string() + " warmup=" + (baseline_warmup + direct_warmup).to_string(),
+	)
+
+	if baseline < 0 or direct < 0:
+		1
+	else:
+		0

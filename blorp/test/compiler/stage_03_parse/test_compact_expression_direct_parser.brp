@@ -1,0 +1,342 @@
+import:
+	../../../src/compiler/stage_02_lex/parse_diagnostic: ParseDiagnostic
+	../../../src/compiler/stage_03_parse/compact_expression_product:
+		CompactDirectParseCheckpointError(UnsupportedCompactDirectParseForm),
+		CompactDirectRootRequest,
+		CompactDirectUnsupportedFormKind(
+			CompactDirectUnsupportedInterpolatedString,
+			CompactDirectUnsupportedOperator,
+			CompactDirectUnsupportedPostfix,
+			CompactDirectUnsupportedPrimary,
+		),
+		compact_expression_direct_frame_storage_probe,
+		compact_expression_direct_parse_checkpoint,
+		compact_expression_oracle_counts,
+		compact_expression_oracle_project,
+	../../../src/compiler/stage_03_parse/language_parser:
+		RawExpressionParserCheckpoint,
+		raw_expression_parser_checkpoint,
+	../../../src/compiler/stage_03_parse/parsed_ast:
+		ParsedExpr(
+			ParsedBinaryExpr,
+			ParsedBoolLiteralExpr,
+			ParsedCallExpr,
+			ParsedCharLiteralExpr,
+			ParsedFloatLiteralExpr,
+			ParsedIntLiteralExpr,
+			ParsedLogicalExpr,
+			ParsedMissingExpr,
+			ParsedNameExpr,
+			ParsedRangeExpr,
+			ParsedStringLiteralExpr,
+			ParsedUnaryExpr,
+		),
+	../../../src/lib/source:
+		SourceFile,
+		SourceLocation,
+		source_cursor_at,
+		source_file,
+		source_location_for_file,
+	test: TestSuite
+
+
+pure func expression_source(text: String) -> SourceFile:
+	source_file("direct_expression.brp", "direct_expression", text)
+
+
+pure func location(src: SourceFile, offset: Int) -> SourceLocation:
+	source_location_for_file(
+		src,
+		source_cursor_at(src, offset),
+		source_cursor_at(src, offset),
+	)
+
+
+pure func expressions_equal(left: ParsedExpr, right: ParsedExpr) -> Bool:
+	match (left, right):
+		(ParsedNameExpr(left_name), ParsedNameExpr(right_name)):
+			left_name.text == right_name.text and left_name.span == right_name.span
+		(ParsedIntLiteralExpr(left_text, left_span), ParsedIntLiteralExpr(right_text, right_span)):
+			left_text == right_text and left_span == right_span
+		(ParsedFloatLiteralExpr(left_text, left_span), ParsedFloatLiteralExpr(right_text, right_span)):
+			left_text == right_text and left_span == right_span
+		(ParsedStringLiteralExpr(left_text, left_form, left_span), ParsedStringLiteralExpr(right_text, right_form, right_span)):
+			left_text == right_text and left_form == right_form and left_span == right_span
+		(ParsedBoolLiteralExpr(left_value, left_span), ParsedBoolLiteralExpr(right_value, right_span)):
+			left_value == right_value and left_span == right_span
+		(ParsedCharLiteralExpr(left_value, left_span), ParsedCharLiteralExpr(right_value, right_span)):
+			left_value == right_value and left_span == right_span
+		(ParsedUnaryExpr(left_op, left_value, left_span), ParsedUnaryExpr(right_op, right_value, right_span)):
+			(
+				left_op == right_op
+				and expressions_equal(left_value, right_value)
+				and left_span == right_span
+			)
+		(ParsedBinaryExpr(left_op, left_lhs, left_rhs, left_span), ParsedBinaryExpr(right_op, right_lhs, right_rhs, right_span)):
+			(
+				left_op == right_op
+				and expressions_equal(left_lhs, right_lhs)
+				and expressions_equal(left_rhs, right_rhs)
+				and left_span == right_span
+			)
+		(ParsedLogicalExpr(left_op, left_lhs, left_rhs, left_span), ParsedLogicalExpr(right_op, right_lhs, right_rhs, right_span)):
+			(
+				left_op == right_op
+				and expressions_equal(left_lhs, right_lhs)
+				and expressions_equal(left_rhs, right_rhs)
+				and left_span == right_span
+			)
+		(ParsedRangeExpr(left_start, left_finish, left_span), ParsedRangeExpr(right_start, right_finish, right_span)):
+			(
+				expressions_equal(left_start, right_start)
+				and expressions_equal(left_finish, right_finish)
+				and left_span == right_span
+			)
+		(ParsedCallExpr(left_callee, left_args, left_span), ParsedCallExpr(right_callee, right_args, right_span)):
+			var equal = left_args.length() == right_args.length()
+			var index: Int = 0
+
+			while index < left_args.length() and equal:
+				equal = expressions_equal(
+					left_args
+						.get(index)
+						.get_or(ParsedMissingExpr(left_span)),
+					right_args
+						.get(index)
+						.get_or(ParsedMissingExpr(right_span)),
+				)
+				index += 1
+
+			expressions_equal(left_callee, right_callee) and equal and left_span == right_span
+		(ParsedMissingExpr(left_span), ParsedMissingExpr(right_span)):
+			left_span == right_span
+		_:
+			False
+
+
+pure func diagnostics_equal(left: List[ParseDiagnostic], right: List[ParseDiagnostic]) -> Bool:
+	var equal = left.length() == right.length()
+	var index: Int = 0
+
+	while index < left.length() and equal:
+		match (left.get(index), right.get(index)):
+			(Some(left_value), Some(right_value)):
+				equal = (
+					left_value.span == right_value.span
+					and left_value.message == right_value.message
+					and left_value.expected == right_value.expected
+					and left_value.help == right_value.help
+				)
+			_:
+				equal = False
+
+		index += 1
+
+	equal
+
+
+pure func checkpoint_matches_production(text: String) -> Bool:
+	src = expression_source(text)
+	header = location(src, 0)
+	baseline: RawExpressionParserCheckpoint = raw_expression_parser_checkpoint(src, 0, 0, header)
+	request: CompactDirectRootRequest = {
+		index = 0,
+		min_precedence = 0,
+		header_span = header
+	}
+
+	match compact_expression_direct_parse_checkpoint(src, [request]):
+		Ok(checkpoint):
+			match compact_expression_oracle_project(checkpoint.product):
+				Ok([projected]):
+					(
+						checkpoint.end_indices == [baseline.index]
+						and diagnostics_equal(checkpoint.diagnostics, baseline.diagnostics)
+						and expressions_equal(projected, baseline.value)
+					)
+				_:
+					False
+		Err(_):
+			False
+
+
+func test_scalar_frame_stack_reuses_retained_slots() -> Bool:
+	probe = compact_expression_direct_frame_storage_probe(4096, 32)
+	(
+		probe.push_count == 4128
+		and probe.pop_count == 4128
+		and probe.maximum_depth == 4096
+		and probe.checksum == 8387056
+		and probe.retained_slot_count == 4096
+		and probe.reuse_depth == 32
+	)
+
+
+func test_admitted_grammar_matches_production_parser() -> Bool:
+	var matches = True
+
+	for text in [
+		"alpha",
+		"123",
+		"4.5",
+		"\"hello\"",
+		"raw\"hello\"",
+		"'a'",
+		"True",
+		"False",
+		"(alpha)",
+		"--alpha",
+		"not alpha",
+		"alpha + beta * gamma",
+		"alpha +\nbeta",
+		"alpha < beta and beta != gamma or False",
+		"alpha..beta",
+		"f()",
+		"f(alpha,)",
+		"f(alpha,\nbeta)",
+		"f(alpha, beta + gamma)",
+		"f()(alpha)",
+	]:
+		matches = matches and checkpoint_matches_production(text)
+
+	matches
+
+
+func test_malformed_admitted_forms_match_recovery_and_progress() -> Bool:
+	(
+		checkpoint_matches_production("-")
+		and checkpoint_matches_production("alpha +")
+		and checkpoint_matches_production("f(alpha")
+		and checkpoint_matches_production("f(")
+		and checkpoint_matches_production("f(alpha,")
+		and checkpoint_matches_production("f(alpha,\n")
+	)
+
+
+func test_multiple_roots_share_one_product_and_preserve_cursor_boundaries() -> Bool:
+	src = expression_source("alpha, beta")
+	first_header = location(src, 0)
+	second_header = location(src, 7)
+	first = raw_expression_parser_checkpoint(src, 0, 0, first_header)
+	second = raw_expression_parser_checkpoint(src, 2, 0, second_header)
+	requests: List[CompactDirectRootRequest] = [
+		{
+			index = 0,
+			min_precedence = 0,
+			header_span = first_header
+		},
+		{
+			index = 2,
+			min_precedence = 0,
+			header_span = second_header
+		},
+	]
+
+	match compact_expression_direct_parse_checkpoint(src, requests):
+		Ok(checkpoint):
+			counts = compact_expression_oracle_counts(checkpoint.product)
+
+			match compact_expression_oracle_project(checkpoint.product):
+				Ok([first_projected, second_projected]):
+					(
+						checkpoint.end_indices == [first.index, second.index]
+						and diagnostics_equal(checkpoint.diagnostics, first.diagnostics)
+						and diagnostics_equal(checkpoint.diagnostics, second.diagnostics)
+						and expressions_equal(first_projected, first.value)
+						and expressions_equal(second_projected, second.value)
+						and counts.source_owner_count == 1
+						and counts.root_count == 2
+					)
+				_:
+					False
+		Err(_):
+			False
+
+
+func test_minimum_precedence_stops_before_unadmitted_operator() -> Bool:
+	src = expression_source("alpha as Int")
+	header = location(src, 0)
+	baseline = raw_expression_parser_checkpoint(src, 0, 1, header)
+	request: CompactDirectRootRequest = {
+		index = 0,
+		min_precedence = 1,
+		header_span = header
+	}
+
+	match compact_expression_direct_parse_checkpoint(src, [request]):
+		Ok(checkpoint):
+			match compact_expression_oracle_project(checkpoint.product):
+				Ok([projected]):
+					(
+						checkpoint.end_indices == [baseline.index]
+						and diagnostics_equal(checkpoint.diagnostics, baseline.diagnostics)
+						and expressions_equal(projected, baseline.value)
+					)
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func rejects_as(
+	text: String,
+	expected_kind: CompactDirectUnsupportedFormKind,
+	expected_index: Int,
+) -> Bool:
+	src = expression_source(text)
+	request: CompactDirectRootRequest = {
+		index = 0,
+		min_precedence = 0,
+		header_span = location(src, 0)
+	}
+
+	match compact_expression_direct_parse_checkpoint(src, [request]):
+		Err(UnsupportedCompactDirectParseForm(kind, index, _span)):
+			kind == expected_kind and index == expected_index
+		_:
+			False
+
+
+func test_unadmitted_forms_are_explicitly_unsupported() -> Bool:
+	(
+		rejects_as("\"Value: " + "$" + "{name}\"", CompactDirectUnsupportedInterpolatedString, 0)
+		and rejects_as("alpha.field", CompactDirectUnsupportedPostfix, 1)
+		and rejects_as("alpha\n.field", CompactDirectUnsupportedPostfix, 1)
+		and rejects_as("alpha[0]", CompactDirectUnsupportedPostfix, 1)
+		and rejects_as("alpha as Int", CompactDirectUnsupportedOperator, 1)
+		and rejects_as("if True", CompactDirectUnsupportedPrimary, 0)
+		and rejects_as("into", CompactDirectUnsupportedPrimary, 0)
+		and rejects_as("into Int(alpha)", CompactDirectUnsupportedPrimary, 0)
+		and rejects_as("[]", CompactDirectUnsupportedPrimary, 0)
+		and rejects_as("{}", CompactDirectUnsupportedPrimary, 0)
+		and rejects_as("_", CompactDirectUnsupportedPrimary, 0)
+		and rejects_as("()", CompactDirectUnsupportedPrimary, 0)
+	)
+
+
+tests: TestSuite = {
+	description = "Compact expression direct parser",
+	tests = [
+		("scalar frame stack reuses retained slots", test_scalar_frame_stack_reuses_retained_slots),
+		(
+			"admitted grammar matches production parser",
+			test_admitted_grammar_matches_production_parser,
+		),
+		(
+			"malformed admitted forms match recovery and progress",
+			test_malformed_admitted_forms_match_recovery_and_progress,
+		),
+		(
+			"multiple roots share one product and preserve cursor boundaries",
+			test_multiple_roots_share_one_product_and_preserve_cursor_boundaries,
+		),
+		(
+			"minimum precedence stops before unadmitted operator",
+			test_minimum_precedence_stops_before_unadmitted_operator,
+		),
+		(
+			"unadmitted forms are explicitly unsupported",
+			test_unadmitted_forms_are_explicitly_unsupported,
+		),
+	]
+}

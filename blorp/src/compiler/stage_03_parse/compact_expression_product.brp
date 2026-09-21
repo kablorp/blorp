@@ -5,14 +5,74 @@
 -- family before the production parser owns any compact representation.
 import:
 	../../lib/source:
+		Cursor,
 		SourceFile,
 		SourceLocation,
+		SourceSpan,
 		compiler_prelude_source_location,
 		singleton_source_file_id,
+		source_cursor_at,
+		source_location_cover,
 		source_location_end_offset,
 		source_location_from_offsets,
 		source_location_start_offset,
 		source_locations_equal,
+		source_span,
+	../stage_02_lex/lexer: lex
+	../stage_02_lex/parse_diagnostic: ParseDiagnostic, parse_error_expected
+	../stage_02_lex/token:
+		Keyword(AndKeyword, AsKeyword, FalseKeyword, NotKeyword, OrKeyword, TrueKeyword),
+		StringLiteralKind(
+			InterpolatedPipeStringLiteral,
+			InterpolatedStringLiteral,
+			NormalStringLiteral,
+			PipeStringLiteral,
+			RawPipeStringLiteral,
+			RawStringLiteral,
+		),
+		Symbol(
+			ColonSymbol,
+			CommaSymbol,
+			DotSymbol,
+			DotDotSymbol,
+			EqualSymbol,
+			EqualEqualSymbol,
+			GreaterEqualSymbol,
+			GreaterSymbol,
+			LeftBracketSymbol,
+			LeftBraceSymbol,
+			LeftParenSymbol,
+			LessEqualSymbol,
+			LessSymbol,
+			MinusSymbol,
+			NotEqualSymbol,
+			PercentSymbol,
+			PlusSymbol,
+			RightBracketSymbol,
+			RightParenSymbol,
+			SlashSymbol,
+			StarSymbol,
+			UnderscoreSymbol,
+		),
+		Token,
+		TokenTag(
+			CharLiteralTag,
+			DedentTag,
+			EndOfFileTag,
+			FloatLiteralTag,
+			IdentifierTag,
+			IndentTag,
+			IntLiteralTag,
+			KeywordTag,
+			NewlineTag,
+			StringLiteralTag,
+			SymbolTag,
+		),
+		interned_text,
+		keyword_from_ordinal,
+		symbol_from_ordinal,
+		unpacked_string_literal_kind,
+		unpacked_string_literal_text_id,
 	parsed_ast:
 		ParsedBinaryOp(
 			ParsedAddOp,
@@ -126,7 +186,12 @@ import:
 		ParsedSelectArm,
 		ParsedSelectArmKind(ParsedSelectAfterArm, ParsedSelectReceiveArm, ParsedSelectSealedArm),
 		ParsedStringInterpolationPart(ParsedInterpolationExpr, ParsedInterpolationLiteral),
-		ParsedStringLiteralForm,
+		ParsedStringLiteralForm(
+			ParsedPipeStringLiteral,
+			ParsedPlainStringLiteral,
+			ParsedRawPipeStringLiteral,
+			ParsedRawStringLiteral,
+		),
 		ParsedTypeExpr(
 			ParsedArrayType,
 			ParsedBoundedType,
@@ -729,6 +794,1433 @@ struct CompactReferenceTraversalCounts {
 	reference_count: Int,
 	bound_name_comparison_count: Int
 }
+
+
+private enum CompactDirectParseFrameKind:
+	CompactDirectParseExpressionFrame
+	CompactDirectParsePrefixFrame
+	CompactDirectParsePrimaryFrame
+	CompactDirectParsePostfixFrame
+	CompactDirectResumeGroupingFrame
+	CompactDirectParseUnaryFrame
+	CompactDirectParsePostfixCallFrame
+	CompactDirectResumeInfixFrame
+	CompactDirectCombineInfixFrame
+
+
+-- Deliberately one tagged scalar struct instead of a payload-carrying union.
+-- The direct-parser driver can keep a List of these inline without allocating
+-- one managed wrapper per continuation.
+private struct CompactDirectParseFrame {
+	kind: CompactDirectParseFrameKind,
+	operator: CompactExpressionOperator,
+	first: Int,
+	second: Int,
+	flag: Bool,
+	span: SourceLocation
+}
+
+
+struct CompactDirectFrameStorageProbe {
+	push_count: Int,
+	pop_count: Int,
+	maximum_depth: Int,
+	checksum: Int,
+	retained_slot_count: Int,
+	reuse_depth: Int
+}
+
+
+enum CompactDirectUnsupportedFormKind:
+	CompactDirectUnsupportedPrimary
+	CompactDirectUnsupportedPostfix
+	CompactDirectUnsupportedOperator
+	CompactDirectUnsupportedInterpolatedString
+
+
+struct CompactDirectRootRequest {
+	index: Int,
+	min_precedence: Int,
+	header_span: SourceLocation
+}
+
+
+struct CompactDirectParseCounts {
+	actions_pushed: Int,
+	maximum_action_depth: Int,
+	maximum_value_depth: Int,
+	root_count: Int
+}
+
+
+record CompactDirectParseCheckpoint {
+	end_indices: List[Int],
+	diagnostics: List[ParseDiagnostic],
+	product: ValidatedExpressionProduct,
+	counts: CompactDirectParseCounts
+}
+
+
+union CompactDirectParseCheckpointError:
+	UnsupportedCompactDirectParseForm(CompactDirectUnsupportedFormKind, Int, SourceLocation)
+	InvalidCompactDirectParseProduct
+
+
+pure func compact_expression_direct_frame_storage_probe(
+	deep_depth: Int,
+	reuse_depth: Int,
+) -> CompactDirectFrameStorageProbe:
+	var frames: List[CompactDirectParseFrame] = []
+	var push_count: Int = 0
+	var pop_count: Int = 0
+	var maximum_depth: Int = 0
+	var checksum: Int = 0
+	var frame_count: Int = 0
+	span = source_location_from_offsets(singleton_source_file_id(), 0, 0)
+
+	while push_count < deep_depth:
+		frame: CompactDirectParseFrame = {
+			kind = CompactDirectParseExpressionFrame,
+			operator = CompactAddOperator,
+			first = push_count,
+			second = 0,
+			flag = False,
+			span = span
+		}
+
+		if frame_count < frames.length():
+			frames = frames.set(frame_count, frame)
+		else:
+			frames = frames.append(frame)
+
+		frame_count += 1
+		push_count += 1
+
+		if frame_count > maximum_depth:
+			maximum_depth = frame_count
+
+	while frame_count > 0:
+		frame_count -= 1
+		frame_index = frame_count
+
+		match frames.get(frame_index):
+			Some(frame):
+				checksum += frame.first
+			None:
+				void
+
+		pop_count += 1
+
+	var reuse_push_count: Int = 0
+
+	while reuse_push_count < reuse_depth:
+		frame: CompactDirectParseFrame = {
+			kind = CompactDirectParseExpressionFrame,
+			operator = CompactAddOperator,
+			first = reuse_push_count,
+			second = 0,
+			flag = False,
+			span = span
+		}
+
+		if frame_count < frames.length():
+			frames = frames.set(frame_count, frame)
+		else:
+			frames = frames.append(frame)
+
+		frame_count += 1
+		push_count += 1
+		reuse_push_count += 1
+
+		if frame_count > maximum_depth:
+			maximum_depth = frame_count
+
+	while frame_count > 0:
+		frame_count -= 1
+		frame_index = frame_count
+
+		match frames.get(frame_index):
+			Some(frame):
+				checksum += frame.first
+			None:
+				void
+
+		pop_count += 1
+
+	{
+		push_count = push_count,
+		pop_count = pop_count,
+		maximum_depth = maximum_depth,
+		checksum = checksum,
+		retained_slot_count = frames.length(),
+		reuse_depth = reuse_depth
+	}
+
+
+private struct CompactDirectInfixInfo {
+	precedence: Int,
+	kind: CompactExpressionNodeKind,
+	operator: CompactExpressionOperator
+}
+
+
+private pure func compact_direct_frame(
+	kind: CompactDirectParseFrameKind,
+	operator: CompactExpressionOperator,
+	first: Int,
+	second: Int,
+	flag: Bool,
+	span: SourceLocation,
+) -> CompactDirectParseFrame:
+	{
+		kind = kind,
+		operator = operator,
+		first = first,
+		second = second,
+		flag = flag,
+		span = span
+	}
+
+
+private pure func compact_direct_token_location(
+	source: SourceFile,
+	tokens: List[Token],
+	index: Int,
+) -> SourceLocation:
+	match tokens.get(index):
+		Some(token):
+			source_location_from_offsets(
+				singleton_source_file_id(),
+				token.start_offset,
+				token.end_offset,
+			)
+		None:
+			source_location_from_offsets(
+				singleton_source_file_id(),
+				source.text.length(),
+				source.text.length(),
+			)
+
+
+private pure func compact_direct_diagnostic_span(
+	source: SourceFile,
+	location: SourceLocation,
+) -> SourceSpan:
+	start: Cursor = source_cursor_at(source, source_location_start_offset(location))
+	finish: Cursor = source_cursor_at(source, source_location_end_offset(location))
+	source_span(source, start, finish)
+
+
+private pure func compact_direct_is_symbol(tokens: List[Token], index: Int, symbol: Symbol) -> Bool:
+	match tokens.get(index):
+		Some(token):
+			token.kind == SymbolTag and symbol_from_ordinal(token.payload) == symbol
+		None:
+			False
+
+
+private pure func compact_direct_is_keyword(
+	tokens: List[Token],
+	index: Int,
+	keyword: Keyword,
+) -> Bool:
+	match tokens.get(index):
+		Some(token):
+			token.kind == KeywordTag and keyword_from_ordinal(token.payload) == keyword
+		None:
+			False
+
+
+private pure func compact_direct_is_eof(tokens: List[Token], index: Int) -> Bool:
+	tokens
+		.get(index)
+		.map(func(token): token.kind == EndOfFileTag)
+		.get_or(True)
+
+
+private pure func compact_direct_is_soft_boundary(tokens: List[Token], index: Int) -> Bool:
+	match tokens.get(index):
+		Some(token):
+			if (
+				token.kind == EndOfFileTag
+				or token.kind == NewlineTag
+				or token.kind == DedentTag
+			):
+				True
+			else if token.kind == SymbolTag:
+				symbol = symbol_from_ordinal(token.payload)
+				(
+					symbol == ColonSymbol
+					or symbol == CommaSymbol
+					or symbol == LeftParenSymbol
+					or symbol == RightBracketSymbol
+					or symbol == RightParenSymbol
+				)
+			else:
+				False
+		None:
+			True
+
+
+private pure func compact_direct_skip_call_separator_layout(tokens: List[Token], index: Int) -> Int:
+	var next = index
+
+	while (
+		tokens
+			.get(next)
+			.map(func(token): token.kind == NewlineTag)
+			.get_or(False)
+	):
+		next += 1
+
+	var closing_index = next
+
+	while (
+		tokens
+			.get(closing_index)
+			.map(func(token): token.kind == NewlineTag or token.kind == DedentTag)
+			.get_or(False)
+	):
+		closing_index += 1
+
+	if compact_direct_is_symbol(tokens, closing_index, RightParenSymbol):
+		closing_index
+	else:
+		next
+
+
+private pure func compact_direct_starts_dot_postfix_continuation(
+	tokens: List[Token],
+	index: Int,
+) -> Bool:
+	match tokens.get(index):
+		Some(token):
+			if token.kind != NewlineTag:
+				False
+			else:
+				next = index + 1
+
+				match tokens.get(next):
+					Some(next_token):
+						if next_token.kind == IndentTag:
+							compact_direct_is_symbol(tokens, next + 1, DotSymbol)
+						else:
+							compact_direct_is_symbol(tokens, next, DotSymbol)
+					None:
+						False
+		None:
+			False
+
+
+private pure func compact_direct_infix_info(
+	tokens: List[Token],
+	index: Int,
+) -> Option[CompactDirectInfixInfo]:
+	if compact_direct_is_keyword(tokens, index, OrKeyword):
+		Some({
+			precedence = 1,
+			kind = CompactLogicalNode,
+			operator = CompactOrOperator,
+		})
+	else if compact_direct_is_keyword(tokens, index, AndKeyword):
+		Some({
+			precedence = 2,
+			kind = CompactLogicalNode,
+			operator = CompactAndOperator,
+		})
+	else:
+		match tokens.get(index):
+			Some(token):
+				if token.kind == SymbolTag:
+					match symbol_from_ordinal(token.payload):
+						EqualEqualSymbol:
+							Some({
+								precedence = 3,
+								kind = CompactBinaryNode,
+								operator = CompactEqualOperator,
+							})
+						NotEqualSymbol:
+							Some({
+								precedence = 3,
+								kind = CompactBinaryNode,
+								operator = CompactNotEqualOperator,
+							})
+						LessSymbol:
+							Some({
+								precedence = 3,
+								kind = CompactBinaryNode,
+								operator = CompactLessOperator,
+							})
+						LessEqualSymbol:
+							Some({
+								precedence = 3,
+								kind = CompactBinaryNode,
+								operator = CompactLessEqualOperator,
+							})
+						GreaterSymbol:
+							Some({
+								precedence = 3,
+								kind = CompactBinaryNode,
+								operator = CompactGreaterOperator,
+							})
+						GreaterEqualSymbol:
+							Some({
+								precedence = 3,
+								kind = CompactBinaryNode,
+								operator = CompactGreaterEqualOperator,
+							})
+						DotDotSymbol:
+							Some({
+								precedence = 4,
+								kind = CompactRangeNode,
+								operator = CompactAddOperator,
+							})
+						PlusSymbol:
+							Some({
+								precedence = 5,
+								kind = CompactBinaryNode,
+								operator = CompactAddOperator,
+							})
+						MinusSymbol:
+							Some({
+								precedence = 5,
+								kind = CompactBinaryNode,
+								operator = CompactSubtractOperator,
+							})
+						StarSymbol:
+							Some({
+								precedence = 6,
+								kind = CompactBinaryNode,
+								operator = CompactMultiplyOperator,
+							})
+						SlashSymbol:
+							Some({
+								precedence = 6,
+								kind = CompactBinaryNode,
+								operator = CompactDivideOperator,
+							})
+						PercentSymbol:
+							Some({
+								precedence = 6,
+								kind = CompactBinaryNode,
+								operator = CompactModuloOperator,
+							})
+						_:
+							None
+				else:
+					None
+			None:
+				None
+
+
+-- This remains a test-only checkpoint: it parses the admitted scalar
+-- expression grammar straight into the compact product without constructing
+-- ParsedExpr values or calling the production parser.
+pure func compact_expression_direct_parse_checkpoint(
+	source: SourceFile,
+	requests: List[CompactDirectRootRequest],
+) -> Result[CompactDirectParseCheckpoint, CompactDirectParseCheckpointError]:
+	lex_result = lex(source)
+	tokens = lex_result.tokens
+	lex_texts = lex_result.texts
+	var diagnostics: List[ParseDiagnostic] = lex_result.diagnostics
+	var end_indices: List[Int] = []
+
+	var nodes: List[CompactExpressionNodeRow] = []
+	var children: List[Int] = []
+	var texts: List[String] = []
+	var text_payloads: List[CompactTextPayloadRow] = []
+	var string_payloads: List[CompactStringPayloadRow] = []
+	var bool_payloads: List[CompactBoolPayloadRow] = []
+	var char_payloads: List[CompactCharPayloadRow] = []
+	var operator_payloads: List[CompactOperatorPayloadRow] = []
+	var call_payloads: List[CompactCallPayloadRow] = []
+	var unit_payloads: List[CompactUnitPayloadRow] = []
+	var roots: List[Int] = []
+
+	var actions: List[CompactDirectParseFrame] = []
+	var action_count: Int = 0
+	var values: List[Int] = []
+	var value_count: Int = 0
+	var actions_pushed: Int = 0
+	var maximum_action_depth: Int = 0
+	var maximum_value_depth: Int = 0
+	var failure: Option[CompactDirectParseCheckpointError] = None
+	var request_index: Int = 0
+	var token_index: Int = 0
+
+	while request_index < requests.length() and failure.is_none():
+		match requests.get(request_index):
+			Some(request):
+				token_index = request.index
+				action_count = 1
+				value_count = 0
+				root_frame = compact_direct_frame(
+					CompactDirectParseExpressionFrame,
+					CompactAddOperator,
+					request.min_precedence,
+					0,
+					False,
+					request.header_span,
+				)
+
+				if actions.is_empty():
+					actions = actions.append(root_frame)
+				else:
+					actions = actions.set(0, root_frame)
+
+				actions_pushed += 1
+
+				while action_count > 0 and failure.is_none():
+					action_count -= 1
+					action = actions.get(action_count)
+					var scheduled_first: Option[CompactDirectParseFrame] = None
+					var scheduled_second: Option[CompactDirectParseFrame] = None
+					var scheduled_third: Option[CompactDirectParseFrame] = None
+					var produced_node: Option[Int] = None
+
+					match action:
+						Some(frame):
+							match frame.kind:
+								CompactDirectParseExpressionFrame:
+									scheduled_first = Some(
+										compact_direct_frame(
+											CompactDirectResumeInfixFrame,
+											CompactAddOperator,
+											frame.first,
+											0,
+											False,
+											frame.span,
+										),
+									)
+									scheduled_second = Some(
+										compact_direct_frame(
+											CompactDirectParsePostfixFrame,
+											CompactAddOperator,
+											0,
+											0,
+											False,
+											frame.span,
+										),
+									)
+									scheduled_third = Some(
+										compact_direct_frame(
+											CompactDirectParsePrefixFrame,
+											CompactAddOperator,
+											0,
+											0,
+											False,
+											frame.span,
+										),
+									)
+								CompactDirectParsePrefixFrame:
+									location = compact_direct_token_location(
+										source,
+										tokens,
+										token_index,
+									)
+
+									if compact_direct_is_symbol(tokens, token_index, MinusSymbol):
+										token_index += 1
+										scheduled_first = Some(
+											compact_direct_frame(
+												CompactDirectParseUnaryFrame,
+												CompactNegateOperator,
+												0,
+												0,
+												False,
+												location,
+											),
+										)
+										scheduled_second = Some(
+											compact_direct_frame(
+												CompactDirectParsePrefixFrame,
+												CompactAddOperator,
+												0,
+												0,
+												False,
+												frame.span,
+											),
+										)
+									else if compact_direct_is_keyword(
+										tokens,
+										token_index,
+										NotKeyword,
+									):
+										token_index += 1
+										scheduled_first = Some(
+											compact_direct_frame(
+												CompactDirectParseUnaryFrame,
+												CompactNotOperator,
+												0,
+												0,
+												False,
+												location,
+											),
+										)
+										scheduled_second = Some(
+											compact_direct_frame(
+												CompactDirectParsePrefixFrame,
+												CompactAddOperator,
+												0,
+												0,
+												False,
+												frame.span,
+											),
+										)
+									else:
+										scheduled_first = Some(
+											compact_direct_frame(
+												CompactDirectParsePrimaryFrame,
+												CompactAddOperator,
+												0,
+												0,
+												False,
+												frame.span,
+											),
+										)
+								CompactDirectParsePrimaryFrame:
+									location = compact_direct_token_location(
+										source,
+										tokens,
+										token_index,
+									)
+
+									match tokens.get(token_index):
+										Some(token):
+											match token.kind:
+												IdentifierTag | IntLiteralTag | FloatLiteralTag:
+													text = interned_text(lex_texts, token.payload)
+
+													-- The production parser reserves this spelling for
+													-- migration lookahead. Keep it outside the admitted
+													-- direct-name grammar instead of guessing its type tail.
+													if (
+														token.kind == IdentifierTag
+														and text == "into"
+													):
+														failure = Some(
+															UnsupportedCompactDirectParseForm(
+																CompactDirectUnsupportedPrimary,
+																token_index,
+																location,
+															),
+														)
+
+													text_index = texts.length()
+													texts = texts.append(text)
+													payload_index = text_payloads.length()
+													text_payloads = text_payloads.append(
+														{text_index = text_index},
+													)
+
+													kind = if token.kind == IdentifierTag:
+														CompactNameNode
+													else if token.kind == IntLiteralTag:
+														CompactIntNode
+													else:
+														CompactFloatNode
+
+													produced_node = Some(nodes.length())
+													nodes = nodes.append({
+														kind = kind,
+														payload_index = payload_index,
+														child_start = children.length(),
+														child_count = 0,
+														span = compact_source_location(location),
+													})
+													token_index += 1
+												StringLiteralTag:
+													literal_kind = unpacked_string_literal_kind(
+														token.payload,
+													)
+
+													if (
+														literal_kind == InterpolatedStringLiteral
+														or literal_kind == InterpolatedPipeStringLiteral
+													):
+														failure = Some(
+															UnsupportedCompactDirectParseForm(
+																CompactDirectUnsupportedInterpolatedString,
+																token_index,
+																location,
+															),
+														)
+													else:
+														text_index = texts.length()
+														texts = texts.append(
+															interned_text(
+																lex_texts,
+																unpacked_string_literal_text_id(
+																	token.payload,
+																),
+															),
+														)
+
+														form = match literal_kind:
+															RawStringLiteral:
+																ParsedRawStringLiteral
+															PipeStringLiteral:
+																ParsedPipeStringLiteral
+															RawPipeStringLiteral:
+																ParsedRawPipeStringLiteral
+															_:
+																ParsedPlainStringLiteral
+
+														payload_index = string_payloads.length()
+														string_payloads = string_payloads.append({
+															text_index = text_index,
+															form = form,
+														})
+														produced_node = Some(nodes.length())
+														nodes = nodes.append({
+															kind = CompactStringNode,
+															payload_index = payload_index,
+															child_start = children.length(),
+															child_count = 0,
+															span = compact_source_location(
+																location,
+															),
+														})
+														token_index += 1
+												CharLiteralTag:
+													payload_index = char_payloads.length()
+													char_payloads = char_payloads.append(
+														{value = token.payload},
+													)
+													produced_node = Some(nodes.length())
+													nodes = nodes.append({
+														kind = CompactCharNode,
+														payload_index = payload_index,
+														child_start = children.length(),
+														child_count = 0,
+														span = compact_source_location(location),
+													})
+													token_index += 1
+												KeywordTag:
+													keyword = keyword_from_ordinal(token.payload)
+
+													if (
+														keyword == TrueKeyword
+														or keyword == FalseKeyword
+													):
+														payload_index = bool_payloads.length()
+														bool_payloads = bool_payloads.append(
+															{value = keyword == TrueKeyword},
+														)
+														produced_node = Some(nodes.length())
+														nodes = nodes.append({
+															kind = CompactBoolNode,
+															payload_index = payload_index,
+															child_start = children.length(),
+															child_count = 0,
+															span = compact_source_location(
+																location,
+															),
+														})
+														token_index += 1
+													else:
+														failure = Some(
+															UnsupportedCompactDirectParseForm(
+																CompactDirectUnsupportedPrimary,
+																token_index,
+																location,
+															),
+														)
+												SymbolTag:
+													symbol = symbol_from_ordinal(token.payload)
+													unsupported_primary = (
+														symbol == LeftBracketSymbol
+														or symbol == LeftBraceSymbol
+														or symbol == UnderscoreSymbol
+														or (
+															symbol == LeftParenSymbol
+															and compact_direct_is_symbol(
+																tokens,
+																token_index + 1,
+																RightParenSymbol,
+															)
+														)
+													)
+
+													if unsupported_primary:
+														failure = Some(
+															UnsupportedCompactDirectParseForm(
+																CompactDirectUnsupportedPrimary,
+																token_index,
+																location,
+															),
+														)
+													else if symbol == LeftParenSymbol:
+														token_index += 1
+														scheduled_first = Some(
+															compact_direct_frame(
+																CompactDirectResumeGroupingFrame,
+																CompactAddOperator,
+																0,
+																0,
+																False,
+																location,
+															),
+														)
+														scheduled_second = Some(
+															compact_direct_frame(
+																CompactDirectParseExpressionFrame,
+																CompactAddOperator,
+																0,
+																0,
+																False,
+																location,
+															),
+														)
+													else:
+														diagnostics = diagnostics.append(
+															parse_error_expected(
+																compact_direct_diagnostic_span(
+																	source,
+																	location,
+																),
+																"expected expression",
+																["expression"],
+																None,
+															),
+														)
+
+														if not compact_direct_is_soft_boundary(
+															tokens,
+															token_index,
+														):
+															token_index += 1
+
+														payload_index = unit_payloads.length()
+														unit_payloads = unit_payloads.append(
+															{kind = CompactMissingPayload},
+														)
+														produced_node = Some(nodes.length())
+														nodes = nodes.append({
+															kind = CompactMissingNode,
+															payload_index = payload_index,
+															child_start = children.length(),
+															child_count = 0,
+															span = compact_source_location(
+																location,
+															),
+														})
+												_:
+													span = compact_direct_diagnostic_span(
+														source,
+														location,
+													)
+													diagnostics = diagnostics.append(
+														parse_error_expected(
+															span,
+															"expected expression",
+															["expression"],
+															None,
+														),
+													)
+
+													if not compact_direct_is_soft_boundary(
+														tokens,
+														token_index,
+													):
+														token_index += 1
+
+													payload_index = unit_payloads.length()
+													unit_payloads = unit_payloads.append(
+														{kind = CompactMissingPayload},
+													)
+													produced_node = Some(nodes.length())
+													nodes = nodes.append({
+														kind = CompactMissingNode,
+														payload_index = payload_index,
+														child_start = children.length(),
+														child_count = 0,
+														span = compact_source_location(location),
+													})
+										None:
+											failure = Some(
+												UnsupportedCompactDirectParseForm(
+													CompactDirectUnsupportedPrimary,
+													token_index,
+													location,
+												),
+											)
+								CompactDirectParseUnaryFrame:
+									if value_count < 1:
+										failure = Some(InvalidCompactDirectParseProduct)
+									else:
+										child = values
+											.get(value_count - 1)
+											.get_or(-1)
+										child_location = nodes
+											.get(child)
+											.map(func(node): node.span.location)
+											.get_or(frame.span)
+										child_start = children.length()
+										children = children.append(child)
+										payload_index = operator_payloads.length()
+										operator_payloads = operator_payloads.append(
+											{operator = frame.operator},
+										)
+										produced_node = Some(nodes.length())
+										nodes = nodes.append({
+											kind = CompactUnaryNode,
+											payload_index = payload_index,
+											child_start = child_start,
+											child_count = 1,
+											span = compact_source_location(
+												source_location_cover(
+													frame.span,
+													child_location,
+												),
+											),
+										})
+										value_count -= 1
+								CompactDirectResumeGroupingFrame:
+									if value_count < 1:
+										failure = Some(InvalidCompactDirectParseProduct)
+									else if compact_direct_is_symbol(
+										tokens,
+										token_index,
+										CommaSymbol,
+									):
+										failure = Some(
+											UnsupportedCompactDirectParseForm(
+												CompactDirectUnsupportedPrimary,
+												token_index,
+												compact_direct_token_location(
+													source,
+													tokens,
+													token_index,
+												),
+											),
+										)
+									else if compact_direct_is_symbol(
+										tokens,
+										token_index,
+										RightParenSymbol,
+									):
+										right_location = compact_direct_token_location(
+											source,
+											tokens,
+											token_index,
+										)
+										node_index = values
+											.get(value_count - 1)
+											.get_or(-1)
+
+										match nodes.get(node_index):
+											Some(node):
+												-- ParsedNameExpr keeps its identifier span when grouped;
+												-- the production location-rewrite helper does likewise.
+												if node.kind != CompactNameNode:
+													nodes = nodes.set(
+														node_index,
+														{ node |
+															span = compact_source_location(
+																source_location_cover(
+																	frame.span,
+																	right_location,
+																),
+															)
+														},
+													)
+											None:
+												failure = Some(InvalidCompactDirectParseProduct)
+
+										token_index += 1
+									else:
+										location = compact_direct_token_location(
+											source,
+											tokens,
+											token_index,
+										)
+										diagnostics = diagnostics.append(
+											parse_error_expected(
+												compact_direct_diagnostic_span(source, location),
+												"expected `)` after expression",
+												[")"],
+												None,
+											),
+										)
+								CompactDirectParsePostfixFrame:
+									if compact_direct_is_symbol(
+										tokens,
+										token_index,
+										LeftParenSymbol,
+									):
+										if value_count < 1:
+											failure = Some(InvalidCompactDirectParseProduct)
+										else:
+											target_slot = value_count - 1
+											target = values
+												.get(target_slot)
+												.get_or(-1)
+											start_span = nodes
+												.get(target)
+												.map(func(node): node.span.location)
+												.get_or(
+													compact_direct_token_location(
+														source,
+														tokens,
+														token_index,
+													),
+												)
+											token_index += 1
+
+											if compact_direct_is_symbol(
+												tokens,
+												token_index,
+												RightParenSymbol,
+											):
+												right_location = compact_direct_token_location(
+													source,
+													tokens,
+													token_index,
+												)
+												token_index += 1
+												child_start = children.length()
+												children = children.append(target)
+												payload_index = call_payloads.length()
+												call_payloads = call_payloads.append(
+													{argument_count = 0},
+												)
+												produced_node = Some(nodes.length())
+												nodes = nodes.append({
+													kind = CompactCallNode,
+													payload_index = payload_index,
+													child_start = child_start,
+													child_count = 1,
+													span = compact_source_location(
+														source_location_cover(
+															start_span,
+															right_location,
+														),
+													),
+												})
+												value_count -= 1
+												scheduled_first = Some(frame)
+											else:
+												at_eof = compact_direct_is_eof(tokens, token_index)
+												scheduled_first = Some(
+													compact_direct_frame(
+														CompactDirectParsePostfixCallFrame,
+														CompactAddOperator,
+														target_slot,
+														0,
+														at_eof,
+														start_span,
+													),
+												)
+
+												if not at_eof:
+													scheduled_second = Some(
+														compact_direct_frame(
+															CompactDirectParseExpressionFrame,
+															CompactAddOperator,
+															0,
+															0,
+															False,
+															frame.span,
+														),
+													)
+									else if (
+										compact_direct_is_symbol(tokens, token_index, DotSymbol)
+										or compact_direct_is_symbol(
+											tokens,
+											token_index,
+											LeftBracketSymbol,
+										)
+										or compact_direct_starts_dot_postfix_continuation(
+											tokens,
+											token_index,
+										)
+									):
+										failure = Some(
+											UnsupportedCompactDirectParseForm(
+												CompactDirectUnsupportedPostfix,
+												token_index,
+												compact_direct_token_location(
+													source,
+													tokens,
+													token_index,
+												),
+											),
+										)
+								CompactDirectParsePostfixCallFrame:
+									argument_count = if frame.flag:
+										frame.second
+									else:
+										frame.second + 1
+
+									if compact_direct_is_symbol(tokens, token_index, CommaSymbol):
+										token_index += 1
+										token_index = compact_direct_skip_call_separator_layout(
+											tokens,
+											token_index,
+										)
+
+										if (
+											compact_direct_is_symbol(
+												tokens,
+												token_index,
+												RightParenSymbol,
+											)
+											or compact_direct_is_eof(tokens, token_index)
+										):
+											scheduled_first = Some(
+												compact_direct_frame(
+													CompactDirectParsePostfixCallFrame,
+													frame.operator,
+													frame.first,
+													argument_count,
+													True,
+													frame.span,
+												),
+											)
+										else:
+											scheduled_first = Some(
+												compact_direct_frame(
+													CompactDirectParsePostfixCallFrame,
+													frame.operator,
+													frame.first,
+													argument_count,
+													False,
+													frame.span,
+												),
+											)
+											scheduled_second = Some(
+												compact_direct_frame(
+													CompactDirectParseExpressionFrame,
+													CompactAddOperator,
+													0,
+													0,
+													False,
+													frame.span,
+												),
+											)
+									else:
+										matched_right = compact_direct_is_symbol(
+											tokens,
+											token_index,
+											RightParenSymbol,
+										)
+										right_location = compact_direct_token_location(
+											source,
+											tokens,
+											token_index,
+										)
+
+										if matched_right:
+											token_index += 1
+										else:
+											diagnostics = diagnostics.append(
+												parse_error_expected(
+													compact_direct_diagnostic_span(
+														source,
+														right_location,
+													),
+													"expected `)` after call arguments",
+													[")"],
+													None,
+												),
+											)
+
+										if value_count < frame.first + 1 + argument_count:
+											failure = Some(InvalidCompactDirectParseProduct)
+										else:
+											child_start = children.length()
+											var child_offset: Int = 0
+
+											while child_offset < argument_count + 1:
+												children = children.append(
+													values
+														.get(frame.first + child_offset)
+														.get_or(-1),
+												)
+												child_offset += 1
+
+											payload_index = call_payloads.length()
+											call_payloads = call_payloads.append(
+												{argument_count = argument_count},
+											)
+
+											end_span = if matched_right:
+												right_location
+											else:
+												frame.span
+
+											value_count = frame.first
+											produced_node = Some(nodes.length())
+											nodes = nodes.append({
+												kind = CompactCallNode,
+												payload_index = payload_index,
+												child_start = child_start,
+												child_count = argument_count + 1,
+												span = compact_source_location(
+													source_location_cover(
+														frame.span,
+														end_span,
+													),
+												),
+											})
+											scheduled_first = Some(
+												compact_direct_frame(
+													CompactDirectParsePostfixFrame,
+													CompactAddOperator,
+													0,
+													0,
+													False,
+													frame.span,
+												),
+											)
+								CompactDirectResumeInfixFrame:
+									match compact_direct_infix_info(tokens, token_index):
+										Some(info):
+											if info.precedence >= frame.first:
+												token_index += 1
+												var skipping_newlines = True
+
+												while skipping_newlines:
+													match tokens.get(token_index):
+														Some(token):
+															if token.kind == NewlineTag:
+																token_index += 1
+															else:
+																skipping_newlines = False
+														None:
+															skipping_newlines = False
+
+												scheduled_first = Some(frame)
+												scheduled_second = Some(
+													compact_direct_frame(
+														CompactDirectCombineInfixFrame,
+														info.operator,
+														0,
+														0,
+														info.kind == CompactRangeNode,
+														frame.span,
+													),
+												)
+												scheduled_third = Some(
+													compact_direct_frame(
+														CompactDirectParseExpressionFrame,
+														CompactAddOperator,
+														info.precedence + 1,
+														0,
+														False,
+														frame.span,
+													),
+												)
+										None:
+											if (
+												frame.first <= 0
+												and ((
+													compact_direct_is_keyword(
+														tokens,
+														token_index,
+														AsKeyword,
+													)
+													or compact_direct_is_symbol(
+														tokens,
+														token_index,
+														EqualSymbol,
+													)
+												))
+											):
+												failure = Some(
+													UnsupportedCompactDirectParseForm(
+														CompactDirectUnsupportedOperator,
+														token_index,
+														compact_direct_token_location(
+															source,
+															tokens,
+															token_index,
+														),
+													),
+												)
+								CompactDirectCombineInfixFrame:
+									if value_count < 2:
+										failure = Some(InvalidCompactDirectParseProduct)
+									else:
+										left = values
+											.get(value_count - 2)
+											.get_or(-1)
+										right = values
+											.get(value_count - 1)
+											.get_or(-1)
+										left_span = nodes
+											.get(left)
+											.map(func(node): node.span.location)
+											.get_or(frame.span)
+										right_span = nodes
+											.get(right)
+											.map(func(node): node.span.location)
+											.get_or(frame.span)
+
+										kind = if frame.flag:
+											CompactRangeNode
+										else if (
+											frame.operator == CompactAndOperator
+											or frame.operator == CompactOrOperator
+										):
+											CompactLogicalNode
+										else:
+											CompactBinaryNode
+
+										payload_index = if kind == CompactRangeNode:
+											NO_COMPACT_PAYLOAD_INDEX
+										else:
+											index = operator_payloads.length()
+											operator_payloads = operator_payloads.append(
+												{operator = frame.operator},
+											)
+											index
+
+										child_start = children.length()
+										children = children
+											.append(left)
+											.append(right)
+										value_count -= 2
+										produced_node = Some(nodes.length())
+										nodes = nodes.append({
+											kind = kind,
+											payload_index = payload_index,
+											child_start = child_start,
+											child_count = 2,
+											span = compact_source_location(
+												source_location_cover(
+													left_span,
+													right_span,
+												),
+											),
+										})
+								_:
+									failure = Some(InvalidCompactDirectParseProduct)
+						None:
+							failure = Some(InvalidCompactDirectParseProduct)
+
+					match produced_node:
+						Some(node_index):
+							if value_count < values.length():
+								values = values.set(value_count, node_index)
+							else:
+								values = values.append(node_index)
+
+							value_count += 1
+
+							if value_count > maximum_value_depth:
+								maximum_value_depth = value_count
+						None:
+							void
+
+					var scheduled_index: Int = 0
+
+					while scheduled_index < 3:
+						scheduled = if scheduled_index == 0:
+							scheduled_first
+						else if scheduled_index == 1:
+							scheduled_second
+						else:
+							scheduled_third
+
+						match scheduled:
+							Some(next_frame):
+								if action_count < actions.length():
+									actions = actions.set(action_count, next_frame)
+								else:
+									actions = actions.append(next_frame)
+
+								action_count += 1
+								actions_pushed += 1
+
+								if action_count > maximum_action_depth:
+									maximum_action_depth = action_count
+							None:
+								void
+
+						scheduled_index += 1
+
+				if failure.is_none():
+					if value_count == 1:
+						roots = roots.append(
+							values
+								.get(0)
+								.get_or(-1),
+						)
+						end_indices = end_indices.append(token_index)
+					else:
+						failure = Some(InvalidCompactDirectParseProduct)
+			None:
+				failure = Some(InvalidCompactDirectParseProduct)
+
+		request_index += 1
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			rep: CompactExpressionProductRep = {
+				source_owners = [source],
+				nodes = nodes,
+				children = children,
+				texts = texts,
+				text_payloads = text_payloads,
+				string_payloads = string_payloads,
+				interpolation_payloads = [],
+				bool_payloads = bool_payloads,
+				char_payloads = char_payloads,
+				operator_payloads = operator_payloads,
+				call_payloads = call_payloads,
+				field_access_payloads = [],
+				record_payloads = [],
+				record_fields = [],
+				dict_payloads = [],
+				dict_entries = [],
+				type_nodes = [],
+				type_children = [],
+				type_identifier_slices = [],
+				type_identifiers = [],
+				interpolation_parts_payloads = [],
+				interpolation_parts = [],
+				control_identifiers = [],
+				identifier_slices = [],
+				typed_binders = [],
+				pattern_nodes = [],
+				pattern_children = [],
+				pattern_identifier_slices = [],
+				pattern_identifiers = [],
+				match_cases = [],
+				select_arms = [],
+				with_bindings = [],
+				with_error_maps = [],
+				lambda_payloads = [],
+				function_payloads = [],
+				callable_params = [],
+				callable_type_params = [],
+				callable_dim_constraints = [],
+				function_annotations = [],
+				concurrent_params = [],
+				concurrent_for_payloads = [],
+				unit_payloads = unit_payloads,
+				roots = roots
+			}
+
+			if compact_expression_product_is_valid(rep):
+				Ok({
+					end_indices = end_indices,
+					diagnostics = diagnostics,
+					product = into_opaque ValidatedExpressionProduct(rep),
+					counts = {
+						actions_pushed = actions_pushed,
+						maximum_action_depth = maximum_action_depth,
+						maximum_value_depth = maximum_value_depth,
+						root_count = roots.length()
+					},
+				})
+			else:
+				Err(InvalidCompactDirectParseProduct)
 
 
 private record CompactReferenceTraversalResult {
