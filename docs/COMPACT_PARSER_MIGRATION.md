@@ -63,11 +63,12 @@ the admitted checkpoints are explicitly rejected by the adapter, so this
 product is not a canonical full-grammar parser result.
 
 The retained schema probe keeps its AST inputs outside the measurement epoch.
-After the match/pattern checkpoint, the product-only lifetime for sixteen
-binary roots (48 nodes) is 8 objects and 4,872 bytes, versus 81 objects and
-5,824 bytes for freshly constructed legacy trees with the same root shape.
+At the current cumulative select/with checkpoint, the product-only lifetime
+for sixteen binary roots (48 nodes) is 8 objects and 4,872 bytes, versus 81
+objects and 5,824 bytes for freshly constructed legacy trees with the same
+root shape.
 This is a retained-layout comparison, not a construction-speed claim: the test
-oracle pays 233 allocations because it converts an existing AST and runs the
+oracle pays 243 allocations because it converts an existing AST and runs the
 exhaustive validator, while the legacy fixture construction pays 83. Empty,
 scalar, and binary compact products retain 2/360, 6/904, and 8/1,064
 objects/bytes respectively. Collections/access added five table handles and
@@ -98,7 +99,8 @@ index instead of allocating one record per node. The opaque product record is
 the five collections/access tables, the product was 160 bytes by ABI `sizeof`
 and occupied a 192-byte allocator size class. With the six type/interpolation
 tables, it is 208 bytes by ABI `sizeof` and occupies a 256-byte allocator size
-class. The nested aggregate probe covers
+class. Under the current cumulative select/with schema, the nested aggregate
+probe covers
 two roots, 33 nodes, and 31 child ids across record update, dictionary, list,
 tuple, vector, field access, and multi-index subscript forms; it retains 12
 objects and 5,320 current live bytes. There is no paired legacy claim for that
@@ -154,8 +156,9 @@ The wrapper source is not retained. Compiler-prelude sentinel locations are
 rejected rather than mislabeled as authored source; multi-owner construction
 remains a future direct-parser capability and is not claimed by this adapter.
 
-The mixed type/interpolation probe has one root, five expression nodes, four
-expression child ids, eight type nodes, seven type child ids, four identifier
+Under the current cumulative select/with schema, the mixed type/interpolation
+probe has one root, five expression nodes, four expression child ids, eight
+type nodes, seven type child ids, four identifier
 slices, five identifiers, and four interpolation parts. It retains 14 objects
 and 2,696 current live bytes; there is no paired legacy claim. Generated C
 confirms inline storage: type-node rows are 48 bytes, identifier-slice rows are
@@ -210,8 +213,9 @@ complete product record was 232 bytes by ABI `sizeof` and occupied the
 binder span to the existing slice row, raising that row to 32 bytes without
 adding a table handle or changing the product/allocator sizes.
 
-A deterministic 64-binding scope fixture produces 64 free initializer
-references and exactly 2,080 bound-name comparisons, matching the current
+Under the current cumulative select/with schema, a deterministic 64-binding
+scope fixture produces 64 free initializer references and exactly 2,080
+bound-name comparisons, matching the current
 modeled `List.contains` work (`64 * 65 / 2`). Its one product contains 193 nodes and 192
 child ids and retains 9 objects / 20,680 bytes. This is a scaling control, not
 an asymptotic improvement claim: the wide sequential workload retains
@@ -234,8 +238,9 @@ and qualified references. Tuple-binder source spans are stored explicitly on
 the existing slice row; projection never guesses a span from the first or last
 identifier.
 
-The retained simple-control fixture has 13 nodes, 12 child ids, two control
-identifiers, one identifier slice, seven free references, and one bound-name
+Under the current cumulative select/with schema, the retained simple-control
+fixture has 13 nodes, 12 child ids, two control identifiers, one identifier
+slice, seven free references, and one bound-name
 comparison. It retains 9 objects / 2,136 bytes. Before match/pattern tables the
 complete product was 232 bytes by ABI `sizeof` in the 256-byte allocator class;
 the now span-bearing
@@ -276,8 +281,9 @@ pattern-identifier-slice rows are 32 bytes, pattern-identifier rows are 24
 bytes, and match-case rows are 32 bytes. The retained pattern fixture has one
 match root, three expression nodes, two expression child ids, thirteen pattern
 nodes, twelve pattern child ids, seven identifier slices, seven identifiers,
-and one match-case row. It retains 13 objects / 2,888 current live bytes. The
-fixture reports one free reference and one bound-name comparison. This is a
+and one match-case row. At this match/pattern checkpoint, the fixture retained
+13 objects / 2,864 current live bytes. It reports one free reference and one
+bound-name comparison. This is a
 layout and semantic checkpoint, not a construction-speed claim. The generated
 C and retained probe source SHA-256 values for this checkpoint are
 `c2b13db4c9a8f55a6c3b814f05c4e5060e0e16126d1bfbaad45a98f366b74e30`
