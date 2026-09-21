@@ -29,6 +29,14 @@ bin/blorp run --release --no-format \
   blorp/benchmark/compiler/compact_expression_direct_parser_probe.brp -- wide 128 100
 bin/blorp run --release --no-format \
   blorp/benchmark/compiler/compact_expression_direct_parser_probe.brp -- malformed 128 100
+
+# Deterministic shared-product screens; the final argument is ignored.
+bin/blorp run --release --no-format \
+  blorp/benchmark/compiler/compact_expression_direct_parser_probe.brp -- multiroot 1 1
+bin/blorp run --release --no-format \
+  blorp/benchmark/compiler/compact_expression_direct_parser_probe.brp -- multiroot 16 1
+bin/blorp run --release --no-format \
+  blorp/benchmark/compiler/compact_expression_direct_parser_probe.brp -- multiroot 128 1
 ```
 
 Retained output:
@@ -57,6 +65,34 @@ node and depth invariants. Baseline and consumed checksums are identical. The
 product-only checksum is deliberately different because that boundary observes
 validated product node count without constructing a `ParsedExpr`.
 
+## Shared-product roots and held managed bytes
+
+The multi-root screen uses one source containing comma-separated `alpha`
+expressions. The baseline batch seam lexes once, constructs its token columns
+once, and invokes the actual private production expression parser for every
+requested root. The direct path likewise lexes once and publishes one validated
+product with one source owner. Preflight checks root count, cursor order, exact
+projected AST order and spans, and full diagnostic identity.
+
+Fixture, source, and request construction occur before each memory epoch. Each
+screen captures managed objects and bytes while the result is held, then again
+after the result is released. `direct_product` holds only the validated product;
+`direct_consumed` holds both that product and its projected `ParsedExpr` roots.
+
+```text
+COMPACT_DIRECT_MULTIROOT roots=1 equivalent=True shape_valid=True baseline_allocations=28 baseline_held_releases=22 baseline_held_objects=6 baseline_held_bytes=448 baseline_released_objects=0 baseline_released_bytes=0 direct_product_allocations=64 direct_product_held_releases=55 direct_product_held_objects=9 direct_product_held_bytes=1224 direct_product_released_objects=0 direct_product_released_bytes=0 direct_consumed_allocations=70 direct_consumed_held_releases=58 direct_consumed_held_objects=12 direct_consumed_held_bytes=1448 direct_consumed_released_objects=0 direct_consumed_released_bytes=0 baseline_checksum=168 direct_product_checksum=68 direct_consumed_checksum=168
+COMPACT_DIRECT_MULTIROOT roots=16 equivalent=True shape_valid=True baseline_allocations=182 baseline_held_releases=146 baseline_held_objects=36 baseline_held_bytes=2560 baseline_released_objects=0 baseline_released_bytes=0 direct_product_allocations=149 direct_product_held_releases=140 direct_product_held_objects=9 direct_product_held_bytes=2168 direct_product_released_objects=0 direct_product_released_bytes=0 direct_consumed_allocations=204 direct_consumed_held_releases=162 direct_consumed_held_objects=42 direct_consumed_held_bytes=4408 direct_consumed_released_objects=0 direct_consumed_released_bytes=0 baseline_checksum=19448 direct_product_checksum=1088 direct_consumed_checksum=19448
+COMPACT_DIRECT_MULTIROOT roots=128 equivalent=True shape_valid=True baseline_allocations=1309 baseline_held_releases=1049 baseline_held_objects=260 baseline_held_bytes=18656 baseline_released_objects=0 baseline_released_bytes=0 direct_product_allocations=725 direct_product_held_releases=716 direct_product_held_objects=9 direct_product_held_bytes=11064 direct_product_released_objects=0 direct_product_released_bytes=0 direct_consumed_allocations=1122 direct_consumed_held_releases=856 direct_consumed_held_objects=266 direct_consumed_held_bytes=28520 direct_consumed_released_objects=0 direct_consumed_released_bytes=0 baseline_checksum=2370496 direct_product_checksum=8704 direct_consumed_checksum=2370496
+```
+
+At 16 and 128 roots, the held validated product uses fewer managed bytes than
+the baseline AST batch. Holding both product and projection uses more managed
+bytes than baseline. Every path returns to zero epoch objects and bytes after
+release. These are retained managed-byte snapshots, not peak measurements:
+the existing `MemStats` API has no peak watermark, and its byte field does not
+represent RSS, allocator slack, or untracked raw buffers. Retired instructions
+were also unavailable and were not estimated.
+
 The differential suite compares projected expressions, token cursors, full
 diagnostic values, and multi-root ordering against the actual production
 parser. The direct driver admits names except the reserved migration-lookahead
@@ -82,10 +118,10 @@ second 32-frame pass; there is no trimming heuristic.
 Hashes:
 
 - compact product source: `dbacec27ef0de00874492e24d9fa9721c01e79a017f4e2f6164026900a6e9c76`;
-- raw parser seam: `adaa19d1a83c2ba7db74eb989d78101efaa5632530e77174ceed18b03daf2493`;
-- differential test: `428d7d97c1ef9ea928adb6cde84a80608a5ad15426d4519c544fc529b69500bf`;
+- raw parser seam: `83ce0fb04b671ee1c526b0531ea74e2c989b215ab659455588303ee2b2f6d056`;
+- differential test: `5006dc5382457246c591278372e068f28425d2d93de98729254e4eec876f2385`;
 - frame probe: `8da703e944ec8a86adde9cccc7c68d9fa0d4a13ba4779aa1921d2a0a2e722d4f`;
-- parser probe: `69ebec54cb05d707b6777957869724cd5ba9b928da4920ccddc19bdb5199e21f`;
+- parser probe: `e94817ca7ba9ec98aa4351ca0106063b4d1bc08d1a3c80fc18b75336b79c42cc`;
 - generated frame-probe C: `ea9529e1d63407ad69d427452b88d29beda1b0ea3b443bbb2588dbe8139a4c02`.
 
 Recommendation: keep this as a corrected, measured test-only checkpoint and

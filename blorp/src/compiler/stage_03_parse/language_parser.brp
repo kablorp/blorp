@@ -622,6 +622,23 @@ record RawExpressionParserCheckpoint {
 }
 
 
+-- Test-only batch companion to RawExpressionParserCheckpoint. It constructs
+-- the lexer and parser token columns once, then parses each requested root
+-- through the same private production expression entry point.
+struct RawExpressionParserRootRequest {
+	index: Int,
+	min_precedence: Int,
+	header_span: SourceLocation
+}
+
+
+record RawExpressionParserBatchCheckpoint {
+	indices: List[Int],
+	diagnostics: List[ParseDiagnostic],
+	values: List[ParsedExpr]
+}
+
+
 -- This hot-path result carries only scalars, so keep it inline. The parser
 -- calls this helper once per postfix-loop iteration; a record here would turn
 -- an otherwise read-only layout query into one heap allocation per call.
@@ -7532,6 +7549,42 @@ pure func raw_expression_parser_checkpoint(
 		index = step.index,
 		diagnostics = step.diagnostics,
 		value = step.value
+	}
+
+
+pure func raw_expression_parser_batch_checkpoint(
+	source: SourceFile,
+	requests: List[RawExpressionParserRootRequest],
+) -> RawExpressionParserBatchCheckpoint:
+	lex_result = lex(source)
+	state = initial_state(
+		source,
+		lex_result.tokens,
+		lex_result.texts,
+		lex_result.path,
+		lex_result.module_name,
+		0,
+	)
+	var indices: List[Int] = []
+	var diagnostics = lex_result.diagnostics
+	var values: List[ParsedExpr] = []
+
+	for request in requests:
+		step = parse_expression_with_header_span(
+			state,
+			request.index,
+			diagnostics,
+			request.min_precedence,
+			request.header_span,
+		)
+		indices = indices.append(step.index)
+		diagnostics = step.diagnostics
+		values = values.append(step.value)
+
+	{
+		indices = indices,
+		diagnostics = diagnostics,
+		values = values
 	}
 
 
