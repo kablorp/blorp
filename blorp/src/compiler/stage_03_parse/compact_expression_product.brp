@@ -1,0 +1,1421 @@
+-- Test oracle for the staged compact-expression schema.
+--
+-- This module has no production callers. It proves one driver-local buffer
+-- construction model and differential projection for the first expression
+-- family before the production parser owns any compact representation.
+import:
+	../../lib/source:
+		SourceFile,
+		SourceLocation,
+		singleton_source_file_id,
+		source_location_end_offset,
+		source_location_from_offsets,
+		source_location_start_offset,
+	parsed_ast:
+		ParsedBinaryOp(
+			ParsedAddOp,
+			ParsedDivideOp,
+			ParsedEqualOp,
+			ParsedGreaterEqualOp,
+			ParsedGreaterOp,
+			ParsedLessEqualOp,
+			ParsedLessOp,
+			ParsedModuloOp,
+			ParsedMultiplyOp,
+			ParsedNotEqualOp,
+			ParsedSubtractOp,
+		),
+		ParsedExpr(
+			ParsedBinaryExpr,
+			ParsedBoolLiteralExpr,
+			ParsedBreakExpr,
+			ParsedBuiltinExpr,
+			ParsedCallExpr,
+			ParsedCharLiteralExpr,
+			ParsedContinueExpr,
+			ParsedFloatLiteralExpr,
+			ParsedIntLiteralExpr,
+			ParsedLogicalExpr,
+			ParsedMissingExpr,
+			ParsedNameExpr,
+			ParsedStringInterpolationExpr,
+			ParsedStringLiteralExpr,
+			ParsedUnaryExpr,
+			ParsedVoidExpr,
+		),
+		ParsedLogicalOp(ParsedAndOp, ParsedOrOp),
+		ParsedStringLiteralForm,
+		ParsedUnaryOp(ParsedNegateOp, ParsedNotOp),
+		parsed_identifier,
+	source_ast_finalize: IdentifierReference
+
+
+enum CompactExpressionNodeKind:
+	CompactNameNode
+	CompactIntNode
+	CompactFloatNode
+	CompactStringNode
+	CompactInterpolationNode
+	CompactBoolNode
+	CompactCharNode
+	CompactUnaryNode
+	CompactBinaryNode
+	CompactLogicalNode
+	CompactCallNode
+	CompactBreakNode
+	CompactContinueNode
+	CompactVoidNode
+	CompactNamedBuiltinNode
+	CompactUnnamedBuiltinNode
+	CompactMissingNode
+
+
+enum CompactExpressionOperator:
+	CompactNegateOperator
+	CompactNotOperator
+	CompactAddOperator
+	CompactSubtractOperator
+	CompactMultiplyOperator
+	CompactDivideOperator
+	CompactModuloOperator
+	CompactEqualOperator
+	CompactNotEqualOperator
+	CompactLessOperator
+	CompactLessEqualOperator
+	CompactGreaterOperator
+	CompactGreaterEqualOperator
+	CompactAndOperator
+	CompactOrOperator
+
+
+enum CompactUnitPayloadKind:
+	CompactBreakPayload
+	CompactContinuePayload
+	CompactVoidPayload
+	CompactUnnamedBuiltinPayload
+	CompactMissingPayload
+
+
+union CompactExpressionOracleError:
+	UnsupportedCompactExpressionOracleForm
+	InvalidCompactExpressionOracleProduct
+
+
+enum CompactExpressionCorruption:
+	CompactChildIdOutOfRange
+	CompactChildSliceOverlap
+	CompactDuplicateRoot
+	CompactForeignSourceOwner
+	CompactNodeBackEdge
+	CompactNegativeCallArity
+	CompactOrphanNode
+	CompactOrphanPayload
+	CompactPayloadFamilyMismatch
+	CompactSharedChild
+	CompactTextIndexAlias
+	CompactWrongArity
+
+
+struct CompactProductSourceLocation {
+	source_owner_index: Int,
+	location: SourceLocation
+}
+
+
+struct CompactExpressionNodeRow {
+	kind: CompactExpressionNodeKind,
+	payload_index: Int,
+	child_start: Int,
+	child_count: Int,
+	span: CompactProductSourceLocation
+}
+
+
+struct CompactTextPayloadRow {
+	text_index: Int
+}
+
+
+struct CompactStringPayloadRow {
+	text_index: Int,
+	form: ParsedStringLiteralForm
+}
+
+
+struct CompactInterpolationPayloadRow {
+	text_index: Int,
+	is_multiline: Bool
+}
+
+
+struct CompactBoolPayloadRow {
+	value: Bool
+}
+
+
+struct CompactCharPayloadRow {
+	value: Int
+}
+
+
+struct CompactOperatorPayloadRow {
+	operator: CompactExpressionOperator
+}
+
+
+struct CompactCallPayloadRow {
+	argument_count: Int
+}
+
+
+struct CompactUnitPayloadRow {
+	kind: CompactUnitPayloadKind
+}
+
+
+private record CompactExpressionProductRep {
+	source_owners: List[SourceFile],
+	nodes: List[CompactExpressionNodeRow],
+	children: List[Int],
+	texts: List[String],
+	text_payloads: List[CompactTextPayloadRow],
+	string_payloads: List[CompactStringPayloadRow],
+	interpolation_payloads: List[CompactInterpolationPayloadRow],
+	bool_payloads: List[CompactBoolPayloadRow],
+	char_payloads: List[CompactCharPayloadRow],
+	operator_payloads: List[CompactOperatorPayloadRow],
+	call_payloads: List[CompactCallPayloadRow],
+	unit_payloads: List[CompactUnitPayloadRow],
+	roots: List[Int]
+}
+
+
+opaque type ValidatedExpressionProduct = CompactExpressionProductRep
+
+
+record CompactExpressionProductCounts {
+	source_owner_count: Int,
+	node_count: Int,
+	child_count: Int,
+	text_count: Int,
+	text_payload_count: Int,
+	string_payload_count: Int,
+	interpolation_payload_count: Int,
+	bool_payload_count: Int,
+	char_payload_count: Int,
+	operator_payload_count: Int,
+	call_payload_count: Int,
+	unit_payload_count: Int,
+	root_count: Int
+}
+
+
+private union CompactBuildAction:
+	CompactBuildVisit(ParsedExpr)
+	CompactBuildUnary(ParsedUnaryOp, SourceLocation)
+	CompactBuildBinary(ParsedBinaryOp, SourceLocation)
+	CompactBuildLogical(ParsedLogicalOp, SourceLocation)
+	CompactBuildCall(Int, SourceLocation)
+
+
+private pure func compact_source_location(location: SourceLocation) -> CompactProductSourceLocation:
+	{
+		source_owner_index = 0,
+		location = location
+	}
+
+
+private pure func compact_unary_operator(op: ParsedUnaryOp) -> CompactExpressionOperator:
+	match op:
+		ParsedNegateOp:
+			CompactNegateOperator
+		ParsedNotOp:
+			CompactNotOperator
+
+
+private pure func compact_binary_operator(op: ParsedBinaryOp) -> CompactExpressionOperator:
+	match op:
+		ParsedAddOp:
+			CompactAddOperator
+		ParsedSubtractOp:
+			CompactSubtractOperator
+		ParsedMultiplyOp:
+			CompactMultiplyOperator
+		ParsedDivideOp:
+			CompactDivideOperator
+		ParsedModuloOp:
+			CompactModuloOperator
+		ParsedEqualOp:
+			CompactEqualOperator
+		ParsedNotEqualOp:
+			CompactNotEqualOperator
+		ParsedLessOp:
+			CompactLessOperator
+		ParsedLessEqualOp:
+			CompactLessEqualOperator
+		ParsedGreaterOp:
+			CompactGreaterOperator
+		ParsedGreaterEqualOp:
+			CompactGreaterEqualOperator
+
+
+private pure func compact_logical_operator(op: ParsedLogicalOp) -> CompactExpressionOperator:
+	match op:
+		ParsedAndOp:
+			CompactAndOperator
+		ParsedOrOp:
+			CompactOrOperator
+
+
+private pure func parsed_unary_operator(op: CompactExpressionOperator) -> Option[ParsedUnaryOp]:
+	match op:
+		CompactNegateOperator:
+			Some(ParsedNegateOp)
+		CompactNotOperator:
+			Some(ParsedNotOp)
+		_:
+			None
+
+
+private pure func parsed_binary_operator(op: CompactExpressionOperator) -> Option[ParsedBinaryOp]:
+	match op:
+		CompactAddOperator:
+			Some(ParsedAddOp)
+		CompactSubtractOperator:
+			Some(ParsedSubtractOp)
+		CompactMultiplyOperator:
+			Some(ParsedMultiplyOp)
+		CompactDivideOperator:
+			Some(ParsedDivideOp)
+		CompactModuloOperator:
+			Some(ParsedModuloOp)
+		CompactEqualOperator:
+			Some(ParsedEqualOp)
+		CompactNotEqualOperator:
+			Some(ParsedNotEqualOp)
+		CompactLessOperator:
+			Some(ParsedLessOp)
+		CompactLessEqualOperator:
+			Some(ParsedLessEqualOp)
+		CompactGreaterOperator:
+			Some(ParsedGreaterOp)
+		CompactGreaterEqualOperator:
+			Some(ParsedGreaterEqualOp)
+		_:
+			None
+
+
+private pure func parsed_logical_operator(op: CompactExpressionOperator) -> Option[ParsedLogicalOp]:
+	match op:
+		CompactAndOperator:
+			Some(ParsedAndOp)
+		CompactOrOperator:
+			Some(ParsedOrOp)
+		_:
+			None
+
+
+private pure func compact_operator_matches_node(
+	kind: CompactExpressionNodeKind,
+	op: CompactExpressionOperator,
+) -> Bool:
+	match kind:
+		CompactUnaryNode:
+			parsed_unary_operator(op).is_some()
+		CompactBinaryNode:
+			parsed_binary_operator(op).is_some()
+		CompactLogicalNode:
+			parsed_logical_operator(op).is_some()
+		_:
+			False
+
+
+private pure func compact_unit_matches_node(
+	kind: CompactExpressionNodeKind,
+	payload: CompactUnitPayloadKind,
+) -> Bool:
+	match kind:
+		CompactBreakNode:
+			payload == CompactBreakPayload
+		CompactContinueNode:
+			payload == CompactContinuePayload
+		CompactVoidNode:
+			payload == CompactVoidPayload
+		CompactUnnamedBuiltinNode:
+			payload == CompactUnnamedBuiltinPayload
+		CompactMissingNode:
+			payload == CompactMissingPayload
+		_:
+			False
+
+
+private pure func compact_expected_child_count(
+	kind: CompactExpressionNodeKind,
+	call_payloads: List[CompactCallPayloadRow],
+	payload_index: Int,
+) -> Option[Int]:
+	match kind:
+		CompactUnaryNode:
+			Some(1)
+		CompactBinaryNode:
+			Some(2)
+		CompactLogicalNode:
+			Some(2)
+		CompactCallNode:
+			match call_payloads.get(payload_index):
+				Some(row):
+					if row.argument_count >= 0:
+						Some(row.argument_count + 1)
+					else:
+						None
+				None:
+					None
+		_:
+			Some(0)
+
+
+private pure func compact_source_span_is_valid(
+	sources: List[SourceFile],
+	span: CompactProductSourceLocation,
+) -> Bool:
+	match sources.get(span.source_owner_index):
+		Some(source):
+			start = source_location_start_offset(span.location)
+			end = source_location_end_offset(span.location)
+			start >= 0 and start <= end and end <= source.text.length()
+		None:
+			False
+
+
+private pure func compact_expression_product_is_valid(rep: CompactExpressionProductRep) -> Bool:
+	if rep.source_owners.is_empty():
+		False
+	else:
+		var valid = True
+		var parent_count = 0.repeat(rep.nodes.length())
+		var root_membership = False.repeat(rep.nodes.length())
+		var child_slot_owners = 0.repeat(rep.children.length())
+		var owned_text_indices = 0.repeat(rep.texts.length())
+		var text_owners = 0.repeat(rep.text_payloads.length())
+		var string_owners = 0.repeat(rep.string_payloads.length())
+		var interpolation_owners = 0.repeat(rep.interpolation_payloads.length())
+		var bool_owners = 0.repeat(rep.bool_payloads.length())
+		var char_owners = 0.repeat(rep.char_payloads.length())
+		var operator_owners = 0.repeat(rep.operator_payloads.length())
+		var call_owners = 0.repeat(rep.call_payloads.length())
+		var unit_owners = 0.repeat(rep.unit_payloads.length())
+
+		for root in rep.roots:
+			if root < 0 or root >= rep.nodes.length():
+				valid = False
+			else if (
+				root_membership
+					.get(root)
+					.get_or(False)
+			):
+				valid = False
+			else:
+				root_membership = root_membership.set(root, True)
+
+		var node_index: Int = 0
+
+		while node_index < rep.nodes.length() and valid:
+			match rep.nodes.get(node_index):
+				Some(node):
+					if not compact_source_span_is_valid(rep.source_owners, node.span):
+						valid = False
+
+					if (
+						node.child_start < 0
+						or node.child_count < 0
+						or node.child_start + node.child_count > rep.children.length()
+					):
+						valid = False
+
+					match compact_expected_child_count(
+						node.kind,
+						rep.call_payloads,
+						node.payload_index,
+					):
+						Some(expected):
+							if node.child_count != expected:
+								valid = False
+						None:
+							valid = False
+
+					var child_offset: Int = 0
+
+					while child_offset < node.child_count and valid:
+						child_slot = node.child_start + child_offset
+
+						match rep.children.get(child_slot):
+							Some(child):
+								if child < 0 or child >= node_index:
+									valid = False
+								else:
+									parent_count = parent_count.set(child, parent_count
+											.get(child)
+											.get_or(0) + 1)
+									child_slot_owners = child_slot_owners.set(
+										child_slot,
+										child_slot_owners
+											.get(child_slot)
+											.get_or(0) + 1,
+									)
+							None:
+								valid = False
+
+						child_offset += 1
+
+					match node.kind:
+						CompactNameNode | CompactIntNode | CompactFloatNode | CompactNamedBuiltinNode:
+							match rep.text_payloads.get(node.payload_index):
+								Some(payload):
+									if (
+										payload.text_index < 0
+										or payload.text_index >= rep.texts.length()
+									):
+										valid = False
+									else:
+										text_owners = text_owners.set(
+											node.payload_index,
+											text_owners
+												.get(node.payload_index)
+												.get_or(0) + 1,
+										)
+										owned_text_indices = owned_text_indices.set(
+											payload.text_index,
+											owned_text_indices
+												.get(payload.text_index)
+												.get_or(0) + 1,
+										)
+								None:
+									valid = False
+						CompactStringNode:
+							match rep.string_payloads.get(node.payload_index):
+								Some(payload):
+									if (
+										payload.text_index < 0
+										or payload.text_index >= rep.texts.length()
+									):
+										valid = False
+									else:
+										string_owners = string_owners.set(
+											node.payload_index,
+											string_owners
+												.get(node.payload_index)
+												.get_or(0) + 1,
+										)
+										owned_text_indices = owned_text_indices.set(
+											payload.text_index,
+											owned_text_indices
+												.get(payload.text_index)
+												.get_or(0) + 1,
+										)
+								None:
+									valid = False
+						CompactInterpolationNode:
+							match rep.interpolation_payloads.get(node.payload_index):
+								Some(payload):
+									if (
+										payload.text_index < 0
+										or payload.text_index >= rep.texts.length()
+									):
+										valid = False
+									else:
+										interpolation_owners = interpolation_owners.set(
+											node.payload_index,
+											interpolation_owners
+												.get(node.payload_index)
+												.get_or(0) + 1,
+										)
+										owned_text_indices = owned_text_indices.set(
+											payload.text_index,
+											owned_text_indices
+												.get(payload.text_index)
+												.get_or(0) + 1,
+										)
+								None:
+									valid = False
+						CompactBoolNode:
+							if node.payload_index < 0 or node.payload_index >= bool_owners.length():
+								valid = False
+							else:
+								bool_owners = bool_owners.set(node.payload_index, bool_owners
+										.get(node.payload_index)
+										.get_or(0) + 1)
+						CompactCharNode:
+							if node.payload_index < 0 or node.payload_index >= char_owners.length():
+								valid = False
+							else:
+								char_owners = char_owners.set(node.payload_index, char_owners
+										.get(node.payload_index)
+										.get_or(0) + 1)
+						CompactUnaryNode | CompactBinaryNode | CompactLogicalNode:
+							match rep.operator_payloads.get(node.payload_index):
+								Some(payload):
+									if compact_operator_matches_node(node.kind, payload.operator):
+										operator_owners = operator_owners.set(
+											node.payload_index,
+											operator_owners
+												.get(node.payload_index)
+												.get_or(0) + 1,
+										)
+									else:
+										valid = False
+								None:
+									valid = False
+						CompactCallNode:
+							if node.payload_index < 0 or node.payload_index >= call_owners.length():
+								valid = False
+							else:
+								call_owners = call_owners.set(node.payload_index, call_owners
+										.get(node.payload_index)
+										.get_or(0) + 1)
+						CompactBreakNode | CompactContinueNode | CompactVoidNode | CompactUnnamedBuiltinNode | CompactMissingNode:
+							match rep.unit_payloads.get(node.payload_index):
+								Some(payload):
+									if compact_unit_matches_node(node.kind, payload.kind):
+										unit_owners = unit_owners.set(
+											node.payload_index,
+											unit_owners
+												.get(node.payload_index)
+												.get_or(0) + 1,
+										)
+									else:
+										valid = False
+								None:
+									valid = False
+				None:
+					valid = False
+
+			node_index += 1
+
+		if valid:
+			var index: Int = 0
+
+			while index < rep.nodes.length() and valid:
+				parents = parent_count
+					.get(index)
+					.get_or(-1)
+				is_root = root_membership
+					.get(index)
+					.get_or(False)
+				valid = is_root and parents == 0 or not is_root and parents == 1
+				index += 1
+
+		if valid:
+			for owners in child_slot_owners:
+				valid = valid and owners == 1
+
+			for owners in owned_text_indices:
+				valid = valid and owners == 1
+
+			for owners in text_owners:
+				valid = valid and owners == 1
+
+			for owners in string_owners:
+				valid = valid and owners == 1
+
+			for owners in interpolation_owners:
+				valid = valid and owners == 1
+
+			for owners in bool_owners:
+				valid = valid and owners == 1
+
+			for owners in char_owners:
+				valid = valid and owners == 1
+
+			for owners in operator_owners:
+				valid = valid and owners == 1
+
+			for owners in call_owners:
+				valid = valid and owners == 1
+
+			for owners in unit_owners:
+				valid = valid and owners == 1
+
+		valid
+
+
+pure func compact_expression_oracle_from_parsed_roots(
+	source: SourceFile,
+	roots: List[ParsedExpr],
+) -> Result[ValidatedExpressionProduct, CompactExpressionOracleError]:
+	-- All growing buffers belong to this one pure driver. No helper accepts or
+	-- returns a builder record.
+	var nodes: List[CompactExpressionNodeRow] = []
+	var children: List[Int] = []
+	var texts: List[String] = []
+	var text_payloads: List[CompactTextPayloadRow] = []
+	var string_payloads: List[CompactStringPayloadRow] = []
+	var interpolation_payloads: List[CompactInterpolationPayloadRow] = []
+	var bool_payloads: List[CompactBoolPayloadRow] = []
+	var char_payloads: List[CompactCharPayloadRow] = []
+	var operator_payloads: List[CompactOperatorPayloadRow] = []
+	var call_payloads: List[CompactCallPayloadRow] = []
+	var unit_payloads: List[CompactUnitPayloadRow] = []
+	var actions: List[CompactBuildAction] = []
+	var values: List[Int] = []
+	var supported = True
+
+	var root_index = roots.length() - 1
+
+	while root_index >= 0:
+		match roots.get(root_index):
+			Some(root):
+				actions = actions.append(CompactBuildVisit(root))
+			None:
+				supported = False
+
+		root_index -= 1
+
+	while not actions.is_empty() and supported:
+		action_index = actions.length() - 1
+		action = actions.get(action_index)
+		actions = actions.take(action_index)
+
+		match action:
+			Some(CompactBuildVisit(expr)):
+				match expr:
+					ParsedNameExpr(name):
+						text_index = texts.length()
+						texts = texts.append(name.text)
+						payload_index = text_payloads.length()
+						text_payloads = text_payloads.append({text_index = text_index})
+						node_index = nodes.length()
+						nodes = nodes.append({
+							kind = CompactNameNode,
+							payload_index = payload_index,
+							child_start = children.length(),
+							child_count = 0,
+							span = compact_source_location(name.span),
+						})
+						values = values.append(node_index)
+					ParsedIntLiteralExpr(text, span):
+						text_index = texts.length()
+						texts = texts.append(text)
+						payload_index = text_payloads.length()
+						text_payloads = text_payloads.append({text_index = text_index})
+						node_index = nodes.length()
+						nodes = nodes.append({
+							kind = CompactIntNode,
+							payload_index = payload_index,
+							child_start = children.length(),
+							child_count = 0,
+							span = compact_source_location(span),
+						})
+						values = values.append(node_index)
+					ParsedFloatLiteralExpr(text, span):
+						text_index = texts.length()
+						texts = texts.append(text)
+						payload_index = text_payloads.length()
+						text_payloads = text_payloads.append({text_index = text_index})
+						node_index = nodes.length()
+						nodes = nodes.append({
+							kind = CompactFloatNode,
+							payload_index = payload_index,
+							child_start = children.length(),
+							child_count = 0,
+							span = compact_source_location(span),
+						})
+						values = values.append(node_index)
+					ParsedStringLiteralExpr(text, form, span):
+						text_index = texts.length()
+						texts = texts.append(text)
+						payload_index = string_payloads.length()
+						string_payloads = string_payloads.append({
+							text_index = text_index,
+							form = form,
+						})
+						node_index = nodes.length()
+						nodes = nodes.append({
+							kind = CompactStringNode,
+							payload_index = payload_index,
+							child_start = children.length(),
+							child_count = 0,
+							span = compact_source_location(span),
+						})
+						values = values.append(node_index)
+					ParsedStringInterpolationExpr(text, is_multiline, span):
+						text_index = texts.length()
+						texts = texts.append(text)
+						payload_index = interpolation_payloads.length()
+						interpolation_payloads = interpolation_payloads.append({
+							text_index = text_index,
+							is_multiline = is_multiline,
+						})
+						node_index = nodes.length()
+						nodes = nodes.append({
+							kind = CompactInterpolationNode,
+							payload_index = payload_index,
+							child_start = children.length(),
+							child_count = 0,
+							span = compact_source_location(span),
+						})
+						values = values.append(node_index)
+					ParsedBoolLiteralExpr(value, span):
+						payload_index = bool_payloads.length()
+						bool_payloads = bool_payloads.append({value = value})
+						node_index = nodes.length()
+						nodes = nodes.append({
+							kind = CompactBoolNode,
+							payload_index = payload_index,
+							child_start = children.length(),
+							child_count = 0,
+							span = compact_source_location(span),
+						})
+						values = values.append(node_index)
+					ParsedCharLiteralExpr(value, span):
+						payload_index = char_payloads.length()
+						char_payloads = char_payloads.append({value = value})
+						node_index = nodes.length()
+						nodes = nodes.append({
+							kind = CompactCharNode,
+							payload_index = payload_index,
+							child_start = children.length(),
+							child_count = 0,
+							span = compact_source_location(span),
+						})
+						values = values.append(node_index)
+					ParsedUnaryExpr(op, value, span):
+						actions = actions
+							.append(CompactBuildUnary(op, span))
+							.append(CompactBuildVisit(value))
+					ParsedBinaryExpr(op, left, right, span):
+						actions = actions
+							.append(CompactBuildBinary(op, span))
+							.append(CompactBuildVisit(right))
+							.append(CompactBuildVisit(left))
+					ParsedLogicalExpr(op, left, right, span):
+						actions = actions
+							.append(CompactBuildLogical(op, span))
+							.append(CompactBuildVisit(right))
+							.append(CompactBuildVisit(left))
+					ParsedCallExpr(callee, args, span):
+						actions = actions.append(CompactBuildCall(args.length(), span))
+						var arg_index = args.length() - 1
+
+						while arg_index >= 0:
+							match args.get(arg_index):
+								Some(arg):
+									actions = actions.append(CompactBuildVisit(arg))
+								None:
+									supported = False
+
+							arg_index -= 1
+
+						actions = actions.append(CompactBuildVisit(callee))
+					ParsedBreakExpr(span):
+						payload_index = unit_payloads.length()
+						unit_payloads = unit_payloads.append({kind = CompactBreakPayload})
+						node_index = nodes.length()
+						nodes = nodes.append({
+							kind = CompactBreakNode,
+							payload_index = payload_index,
+							child_start = children.length(),
+							child_count = 0,
+							span = compact_source_location(span),
+						})
+						values = values.append(node_index)
+					ParsedContinueExpr(span):
+						payload_index = unit_payloads.length()
+						unit_payloads = unit_payloads.append({kind = CompactContinuePayload})
+						node_index = nodes.length()
+						nodes = nodes.append({
+							kind = CompactContinueNode,
+							payload_index = payload_index,
+							child_start = children.length(),
+							child_count = 0,
+							span = compact_source_location(span),
+						})
+						values = values.append(node_index)
+					ParsedVoidExpr(span):
+						payload_index = unit_payloads.length()
+						unit_payloads = unit_payloads.append({kind = CompactVoidPayload})
+						node_index = nodes.length()
+						nodes = nodes.append({
+							kind = CompactVoidNode,
+							payload_index = payload_index,
+							child_start = children.length(),
+							child_count = 0,
+							span = compact_source_location(span),
+						})
+						values = values.append(node_index)
+					ParsedBuiltinExpr(name, span):
+						match name:
+							Some(text):
+								text_index = texts.length()
+								texts = texts.append(text)
+								payload_index = text_payloads.length()
+								text_payloads = text_payloads.append({text_index = text_index})
+								node_index = nodes.length()
+								nodes = nodes.append({
+									kind = CompactNamedBuiltinNode,
+									payload_index = payload_index,
+									child_start = children.length(),
+									child_count = 0,
+									span = compact_source_location(span),
+								})
+								values = values.append(node_index)
+							None:
+								payload_index = unit_payloads.length()
+								unit_payloads = unit_payloads.append(
+									{kind = CompactUnnamedBuiltinPayload},
+								)
+								node_index = nodes.length()
+								nodes = nodes.append({
+									kind = CompactUnnamedBuiltinNode,
+									payload_index = payload_index,
+									child_start = children.length(),
+									child_count = 0,
+									span = compact_source_location(span),
+								})
+								values = values.append(node_index)
+					ParsedMissingExpr(span):
+						payload_index = unit_payloads.length()
+						unit_payloads = unit_payloads.append({kind = CompactMissingPayload})
+						node_index = nodes.length()
+						nodes = nodes.append({
+							kind = CompactMissingNode,
+							payload_index = payload_index,
+							child_start = children.length(),
+							child_count = 0,
+							span = compact_source_location(span),
+						})
+						values = values.append(node_index)
+					_:
+						supported = False
+			Some(CompactBuildUnary(op, span)):
+				if values.is_empty():
+					supported = False
+				else:
+					value_start = values.length() - 1
+					child_start = children.length()
+					children = children.append(
+						values
+							.get(value_start)
+							.get_or(-1),
+					)
+					values = values.take(value_start)
+					payload_index = operator_payloads.length()
+					operator_payloads = operator_payloads.append(
+						{operator = compact_unary_operator(op)},
+					)
+					node_index = nodes.length()
+					nodes = nodes.append({
+						kind = CompactUnaryNode,
+						payload_index = payload_index,
+						child_start = child_start,
+						child_count = 1,
+						span = compact_source_location(span),
+					})
+					values = values.append(node_index)
+			Some(CompactBuildBinary(op, span)):
+				if values.length() < 2:
+					supported = False
+				else:
+					value_start = values.length() - 2
+					child_start = children.length()
+					children = children
+						.append(
+							values
+								.get(value_start)
+								.get_or(-1),
+						)
+						.append(
+							values
+								.get(value_start + 1)
+								.get_or(-1),
+						)
+					values = values.take(value_start)
+					payload_index = operator_payloads.length()
+					operator_payloads = operator_payloads.append(
+						{operator = compact_binary_operator(op)},
+					)
+					node_index = nodes.length()
+					nodes = nodes.append({
+						kind = CompactBinaryNode,
+						payload_index = payload_index,
+						child_start = child_start,
+						child_count = 2,
+						span = compact_source_location(span),
+					})
+					values = values.append(node_index)
+			Some(CompactBuildLogical(op, span)):
+				if values.length() < 2:
+					supported = False
+				else:
+					value_start = values.length() - 2
+					child_start = children.length()
+					children = children
+						.append(
+							values
+								.get(value_start)
+								.get_or(-1),
+						)
+						.append(
+							values
+								.get(value_start + 1)
+								.get_or(-1),
+						)
+					values = values.take(value_start)
+					payload_index = operator_payloads.length()
+					operator_payloads = operator_payloads.append(
+						{operator = compact_logical_operator(op)},
+					)
+					node_index = nodes.length()
+					nodes = nodes.append({
+						kind = CompactLogicalNode,
+						payload_index = payload_index,
+						child_start = child_start,
+						child_count = 2,
+						span = compact_source_location(span),
+					})
+					values = values.append(node_index)
+			Some(CompactBuildCall(argument_count, span)):
+				child_count = argument_count + 1
+
+				if values.length() < child_count:
+					supported = False
+				else:
+					value_start = values.length() - child_count
+					child_start = children.length()
+					var value_index = value_start
+
+					while value_index < values.length():
+						children = children.append(
+							values
+								.get(value_index)
+								.get_or(-1),
+						)
+						value_index += 1
+
+					values = values.take(value_start)
+					payload_index = call_payloads.length()
+					call_payloads = call_payloads.append({argument_count = argument_count})
+					node_index = nodes.length()
+					nodes = nodes.append({
+						kind = CompactCallNode,
+						payload_index = payload_index,
+						child_start = child_start,
+						child_count = child_count,
+						span = compact_source_location(span),
+					})
+					values = values.append(node_index)
+			None:
+				supported = False
+
+	if not supported or values.length() != roots.length():
+		Err(UnsupportedCompactExpressionOracleForm)
+	else:
+		rep: CompactExpressionProductRep = {
+			source_owners = [source],
+			nodes = nodes,
+			children = children,
+			texts = texts,
+			text_payloads = text_payloads,
+			string_payloads = string_payloads,
+			interpolation_payloads = interpolation_payloads,
+			bool_payloads = bool_payloads,
+			char_payloads = char_payloads,
+			operator_payloads = operator_payloads,
+			call_payloads = call_payloads,
+			unit_payloads = unit_payloads,
+			roots = values
+		}
+
+		if compact_expression_product_is_valid(rep):
+			Ok(into_opaque ValidatedExpressionProduct(rep))
+		else:
+			Err(InvalidCompactExpressionOracleProduct)
+
+
+private pure func projected_child(
+	rep: CompactExpressionProductRep,
+	projected: List[ParsedExpr],
+	node: CompactExpressionNodeRow,
+	offset: Int,
+) -> Option[ParsedExpr]:
+	match rep.children.get(node.child_start + offset):
+		Some(child):
+			projected.get(child)
+		None:
+			None
+
+
+private pure func compact_text_payload(
+	rep: CompactExpressionProductRep,
+	payload_index: Int,
+) -> Option[String]:
+	match rep.text_payloads.get(payload_index):
+		Some(payload):
+			rep.texts.get(payload.text_index)
+		None:
+			None
+
+
+pure func compact_expression_oracle_project(
+	product: ValidatedExpressionProduct,
+) -> Result[List[ParsedExpr], CompactExpressionOracleError]:
+	rep = from_opaque ValidatedExpressionProduct(product)
+	var projected: List[ParsedExpr] = []
+	var valid = True
+
+	var node_index: Int = 0
+
+	while node_index < rep.nodes.length() and valid:
+		match rep.nodes.get(node_index):
+			Some(node):
+				span = node.span.location
+				var value: Option[ParsedExpr] = None
+
+				match node.kind:
+					CompactNameNode:
+						value = compact_text_payload(
+							rep,
+							node.payload_index,
+						).map(
+							func(text): ParsedNameExpr(parsed_identifier(text, span)),
+						)
+					CompactIntNode:
+						value = compact_text_payload(
+							rep,
+							node.payload_index,
+						).map(
+							func(text): ParsedIntLiteralExpr(text, span),
+						)
+					CompactFloatNode:
+						value = compact_text_payload(
+							rep,
+							node.payload_index,
+						).map(
+							func(text): ParsedFloatLiteralExpr(text, span),
+						)
+					CompactStringNode:
+						match rep.string_payloads.get(node.payload_index):
+							Some(payload):
+								value = rep.texts
+									.get(payload.text_index)
+									.map(
+										func(
+											text,
+										): ParsedStringLiteralExpr(text, payload.form, span),
+									)
+							None:
+								void
+					CompactInterpolationNode:
+						match rep.interpolation_payloads.get(node.payload_index):
+							Some(payload):
+								value = rep.texts
+									.get(payload.text_index)
+									.map(
+										func(
+											text,
+										): ParsedStringInterpolationExpr(
+											text,
+											payload.is_multiline,
+											span,
+										),
+									)
+							None:
+								void
+					CompactBoolNode:
+						value = rep.bool_payloads
+							.get(node.payload_index)
+							.map(func(row): ParsedBoolLiteralExpr(row.value, span))
+					CompactCharNode:
+						value = rep.char_payloads
+							.get(node.payload_index)
+							.map(func(row): ParsedCharLiteralExpr(row.value, span))
+					CompactUnaryNode:
+						match (
+							rep.operator_payloads.get(node.payload_index),
+							projected_child(rep, projected, node, 0),
+						):
+							(Some(payload), Some(child)):
+								value = parsed_unary_operator(
+									payload.operator,
+								).map(
+									func(op): ParsedUnaryExpr(op, child, span),
+								)
+							_:
+								void
+					CompactBinaryNode:
+						match (
+							rep.operator_payloads.get(node.payload_index),
+							projected_child(rep, projected, node, 0),
+							projected_child(rep, projected, node, 1),
+						):
+							(Some(payload), Some(left), Some(right)):
+								value = parsed_binary_operator(
+									payload.operator,
+								).map(
+									func(op): ParsedBinaryExpr(op, left, right, span),
+								)
+							_:
+								void
+					CompactLogicalNode:
+						match (
+							rep.operator_payloads.get(node.payload_index),
+							projected_child(rep, projected, node, 0),
+							projected_child(rep, projected, node, 1),
+						):
+							(Some(payload), Some(left), Some(right)):
+								value = parsed_logical_operator(
+									payload.operator,
+								).map(
+									func(op): ParsedLogicalExpr(op, left, right, span),
+								)
+							_:
+								void
+					CompactCallNode:
+						match projected_child(rep, projected, node, 0):
+							Some(callee):
+								var args: List[ParsedExpr] = []
+								var child_offset: Int = 1
+
+								while child_offset < node.child_count:
+									match projected_child(rep, projected, node, child_offset):
+										Some(arg):
+											args = args.append(arg)
+										None:
+											valid = False
+
+									child_offset += 1
+
+								if valid:
+									value = Some(ParsedCallExpr(callee, args, span))
+							None:
+								void
+					CompactBreakNode:
+						value = Some(ParsedBreakExpr(span))
+					CompactContinueNode:
+						value = Some(ParsedContinueExpr(span))
+					CompactVoidNode:
+						value = Some(ParsedVoidExpr(span))
+					CompactNamedBuiltinNode:
+						value = compact_text_payload(
+							rep,
+							node.payload_index,
+						).map(
+							func(text): ParsedBuiltinExpr(Some(text), span),
+						)
+					CompactUnnamedBuiltinNode:
+						value = Some(ParsedBuiltinExpr(None, span))
+					CompactMissingNode:
+						value = Some(ParsedMissingExpr(span))
+
+				match value:
+					Some(expr):
+						projected = projected.append(expr)
+					None:
+						valid = False
+			None:
+				valid = False
+
+		node_index += 1
+
+	if not valid:
+		Err(InvalidCompactExpressionOracleProduct)
+	else:
+		var roots: List[ParsedExpr] = []
+
+		for root in rep.roots:
+			match projected.get(root):
+				Some(expr):
+					roots = roots.append(expr)
+				None:
+					valid = False
+
+		if valid:
+			Ok(roots)
+		else:
+			Err(InvalidCompactExpressionOracleProduct)
+
+
+pure func compact_expression_oracle_free_identifier_references(
+	product: ValidatedExpressionProduct,
+) -> List[IdentifierReference]:
+	rep = from_opaque ValidatedExpressionProduct(product)
+	var references: List[IdentifierReference] = []
+
+	-- Postorder rows preserve the current left-to-right encounter order for the
+	-- first family: unary, binary/logical, and callee-before-argument calls.
+	for node in rep.nodes:
+		if node.kind == CompactNameNode:
+			match compact_text_payload(rep, node.payload_index):
+				Some(text):
+					references = references.append({
+						name = text,
+						qualified_member = None,
+						span = node.span.location,
+					})
+				None:
+					void
+
+	references
+
+
+pure func compact_expression_oracle_counts(
+	product: ValidatedExpressionProduct,
+) -> CompactExpressionProductCounts:
+	rep = from_opaque ValidatedExpressionProduct(product)
+	{
+		source_owner_count = rep.source_owners.length(),
+		node_count = rep.nodes.length(),
+		child_count = rep.children.length(),
+		text_count = rep.texts.length(),
+		text_payload_count = rep.text_payloads.length(),
+		string_payload_count = rep.string_payloads.length(),
+		interpolation_payload_count = rep.interpolation_payloads.length(),
+		bool_payload_count = rep.bool_payloads.length(),
+		char_payload_count = rep.char_payloads.length(),
+		operator_payload_count = rep.operator_payloads.length(),
+		call_payload_count = rep.call_payloads.length(),
+		unit_payload_count = rep.unit_payloads.length(),
+		root_count = rep.roots.length()
+	}
+
+
+pure func compact_expression_oracle_rejects_corruption(
+	source: SourceFile,
+	corruption: CompactExpressionCorruption,
+) -> Bool:
+	if source.text.length() < 10:
+		False
+	else:
+		start_span = compact_source_location(
+			source_location_from_offsets(
+				singleton_source_file_id(),
+				0,
+				1,
+			),
+		)
+		left = ParsedNameExpr(parsed_identifier("a", start_span.location))
+		right = ParsedNameExpr(parsed_identifier("b", start_span.location))
+		base = ParsedBinaryExpr(
+			ParsedAddOp,
+			ParsedBinaryExpr(ParsedMultiplyOp, left, right, start_span.location),
+			right,
+			start_span.location,
+		)
+
+		match (
+			compact_expression_oracle_from_parsed_roots(
+				source,
+				[
+					base,
+					ParsedBoolLiteralExpr(True, start_span.location),
+					ParsedCallExpr(left, [], start_span.location),
+				],
+			)
+		):
+			Ok(product):
+				rep = from_opaque ValidatedExpressionProduct(product)
+				var corrupted = rep
+				binary_root = rep.roots
+					.get(0)
+					.get_or(-1)
+				call_root = rep.roots
+					.get(2)
+					.get_or(-1)
+
+				match corruption:
+					CompactChildIdOutOfRange:
+						corrupted = { rep | children = rep.children.set(0, rep.nodes.length()) }
+					CompactChildSliceOverlap:
+						match rep.nodes.get(binary_root):
+							Some(node):
+								corrupted = { rep |
+									nodes = rep.nodes.set(binary_root, { node | child_start = 0 })
+								}
+							None:
+								void
+					CompactDuplicateRoot:
+						corrupted = { rep | roots = rep.roots.append(binary_root) }
+					CompactForeignSourceOwner:
+						match rep.nodes.get(0):
+							Some(node):
+								corrupted = { rep |
+									nodes = rep.nodes.set(
+										0,
+										{ node | span = { node.span | source_owner_index = 1 } },
+									)
+								}
+							None:
+								void
+					CompactNodeBackEdge:
+						corrupted = { rep | children = rep.children.set(0, 2) }
+					CompactNegativeCallArity:
+						match rep.nodes.get(call_root):
+							Some(node):
+								match rep.call_payloads.get(node.payload_index):
+									Some(payload):
+										corrupted = { rep |
+											call_payloads = rep.call_payloads.set(
+												node.payload_index,
+												{ payload | argument_count = -1 },
+											)
+										}
+									None:
+										void
+							None:
+								void
+					CompactOrphanNode:
+						text_index = rep.texts.length()
+						payload_index = rep.text_payloads.length()
+						corrupted = { rep |
+							texts = rep.texts.append("orphan"),
+							text_payloads = rep.text_payloads.append({text_index = text_index}),
+							nodes = rep.nodes.append({
+								kind = CompactNameNode,
+								payload_index = payload_index,
+								child_start = rep.children.length(),
+								child_count = 0,
+								span = start_span,
+							})
+						}
+					CompactOrphanPayload:
+						corrupted = { rep |
+							text_payloads = rep.text_payloads.append({text_index = 0})
+						}
+					CompactPayloadFamilyMismatch:
+						match rep.nodes.get(0):
+							Some(node):
+								corrupted = { rep |
+									nodes = rep.nodes.set(0, { node | kind = CompactBoolNode })
+								}
+							None:
+								void
+					CompactSharedChild:
+						match rep.nodes.get(binary_root):
+							Some(node):
+								corrupted = { rep |
+									children = rep.children.set(node.child_start + 1, 0)
+								}
+							None:
+								void
+					CompactTextIndexAlias:
+						match rep.text_payloads.get(1):
+							Some(payload):
+								corrupted = { rep |
+									text_payloads = rep.text_payloads.set(
+										1,
+										{ payload | text_index = 0 },
+									)
+								}
+							None:
+								void
+					CompactWrongArity:
+						match rep.nodes.get(binary_root):
+							Some(node):
+								corrupted = { rep |
+									nodes = rep.nodes.set(binary_root, { node | child_count = 1 })
+								}
+							None:
+								void
+
+				not compact_expression_product_is_valid(corrupted)
+			Err(_):
+				False

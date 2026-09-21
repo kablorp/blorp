@@ -1,0 +1,502 @@
+# Compact Parser Migration
+
+Status: design checkpoint. Production implementation requires choosing the
+first boundary in [Decision Before Implementation](#decision-before-implementation).
+
+Goal: replace per-expression ownership traffic in the compiler parser with a
+validated, product-owned compact representation while preserving the complete
+language, diagnostics, recovery, source identity, and downstream semantics.
+This is the implementation plan for T7 in the
+[Frontend Facts Roadmap](FRONTEND_FACTS_ROADMAP.md#t7-parser-nodes-without-per-node-ownership-traffic).
+
+Read first: [`stage_03_parse/parsed_ast.brp`](../blorp/src/compiler/stage_03_parse/parsed_ast.brp),
+[`stage_03_parse/language_parser.brp`](../blorp/src/compiler/stage_03_parse/language_parser.brp),
+[`stage_03_parse/source_ast_finalize.brp`](../blorp/src/compiler/stage_03_parse/source_ast_finalize.brp),
+[`stage_06_typecheck/headers/global_header_completion.brp`](../blorp/src/compiler/stage_06_typecheck/headers/global_header_completion.brp),
+and the measurement protocol in [`benchmarks/README.md`](../benchmarks/README.md).
+
+## Evidence And Scope
+
+The retained experiment at commit `656169d9ba517bccb88cb3ad225670f6fcd9f7e6`
+was deliberately narrower than the production parser. On a 21-case expression
+corpus, its compact construction-and-consumer path produced the same ordered
+identifier-reference output as the recursive-tree baseline. Across its
+retained workloads, allocations fell 28.0% to 65.2%, process-wide retired
+instructions fell 32.5% to 58.1%, and RSS fell 2.8% to 6.9%. After the compact
+product and output were retained through full lifetime, however, retained
+bytes were 3,360 versus 2,560 for the baseline, a 31.3% regression. Those
+numbers justify investigating the construction boundary; they do not predict
+whole-compiler speed or memory and they do not validate the full grammar.
+
+The current production boundary is much broader:
+
+- `ParsedExpr` has approximately fifty variants, including declarations,
+  blocks, concurrency, recovery nodes, and interpolation; the broader
+  expression graph also reaches separate pattern and binder types.
+- `source_ast_finalize.brp` reparses interpolation expressions, hoists nested
+  functions, and rewrites subscript reads before typechecking.
+- formatter and LSP paths consume raw syntax and recovery information, while
+  compile/check/run consume `FinalizedTypecheckProgram`.
+- the first measured downstream consumer,
+  `parsed_expr_free_identifier_references`, has binding-sensitive rules for
+  block order, patterns, `select`, `with`, lambdas, loops, concurrency,
+  assignment, and tuple/question bindings.
+- global initializer expressions are also needed later by inference. Merely
+  attaching a compact sidecar to `ParsedVarDecl` retains both representations
+  and does not establish a useful ownership boundary.
+
+The migration must therefore cover one exact production boundary at a time.
+No milestone may call a token-subset parser for selected expressions, infer
+node kind from spelling or shape, or keep two permanent grammar
+implementations.
+
+### Milestone 1 checkpoint: scalar, operator, and call oracle
+
+The first test-only form family covers names, scalar literals, raw parser
+interpolation literals, unary/binary/logical operators, calls,
+break/continue/void/builtin/missing forms. `ParsedStringInterpolationExpr` is
+stored only as the raw parser form in this checkpoint; no finalized
+interpolation semantics or rebased-source provenance is claimed. Every other
+expression form is explicitly rejected by the adapter, so this product is not
+a canonical full-grammar parser result.
+
+The retained schema probe keeps its AST inputs outside the measurement epoch.
+The product-only lifetime for sixteen binary roots (48 nodes) is 8 objects and
+4,704 bytes, versus 81 objects and 5,824 bytes for freshly constructed legacy
+trees with the same root shape. This is a retained-layout comparison, not a
+construction-speed claim: the test oracle pays 218 allocations because it
+converts an existing AST and runs the exhaustive validator, while the legacy
+fixture construction pays 83. Empty, scalar, and binary compact products retain
+2/192, 6/736, and 8/896 objects/bytes respectively.
+
+Both 48-node lifetime fixtures keep the same source and static identifier text
+outside the measurement epoch. The compact result additionally retains its
+source-owner list, so the comparison does not hide that ownership cost. The
+legacy side constructs sixteen fresh three-node trees; the compact side stores
+sixteen equivalent roots rather than reusing one compact root.
+
+On the current 64-bit generated-C ABI, source-bearing locations are 16 bytes,
+node headers are 48 bytes, bool rows are 1 byte, char rows are 8 bytes,
+text/operator/call/unit rows are 8 bytes, and string/interpolation rows are 16
+bytes. These rows use inline list storage.
+Text values live in one owned string table; text-bearing payload rows store an
+index instead of allocating one record per node. The opaque product record is
+120 bytes by ABI `sizeof` and occupies a 128-byte allocator size class. Raw
+evidence is reproduced by
+`blorp/benchmark/compiler/compact_expression_product_schema_probe.brp`; its
+output must be captured with `--leak-check` so live type buckets are available.
+
+## Goals
+
+- One grammar and recovery implementation constructs the canonical expression
+  product for every expression form it claims to own.
+- Node and row identities are dense, product-scoped ids. Public APIs keep ids
+  attached to one traversal; any necessary detached-id boundary explicitly
+  checks provenance.
+- Construction uses one private mutable builder; publication yields immutable
+  validated facts.
+- Consumers traverse tables by id without rebuilding a recursive tree or
+  scanning the product to rediscover invariants.
+- Source spelling, exact spans, diagnostic order, recovery facts, binding
+  order, duplicate references, and generated output remain identical.
+- A projection exists only at a named compatibility boundary, is consumed
+  rather than cached beside the compact representation, and has a deletion
+  milestone.
+- Performance claims use direct same-boundary measurements and whole-compiler
+  confirmation. Negative results are valid.
+
+## Non-Goals
+
+- No source-language, diagnostic, recovery, formatter, LSP, type-system, Core,
+  runtime, or generated-C behavior change.
+- No reduced grammar, best-effort parse, name-based heuristic, unsafe indexing,
+  unchecked cast, or validation deferred to every consumer.
+- No benchmark-only production API or data layout chosen only for the current
+  free-identifier consumer.
+- No eager `ParsedExpr` tree plus compact mirror in a long-lived program or
+  module record.
+- No permanent general parser plus compact special-case parser.
+- T7b cursor changes, name interning, and unrelated frontend-table migrations
+  remain separate work.
+
+## Canonical Product Schema
+
+The public representation should be an opaque `ValidatedExpressionProduct`.
+Only its owning module can construct or unwrap its representation. Integer ids
+are dense offsets, not generatively branded capabilities: two products can
+issue the same integer. The initial API therefore exposes no detached ids.
+Callers pass a borrowed product to a traversal and receive independently owned
+facts; traversal control remains inline integer state rather than an allocated
+cursor carrying the managed product. If a later boundary truly needs detached
+ids, that change must introduce and measure an explicit owner key. A structural
+hash or global mutable counter is not collision-proof identity. The module does
+not expose parallel lists that callers can combine incorrectly.
+
+The initial schema should use these concepts; exact Blorp record names can be
+settled in the schema commit:
+
+```text
+ValidatedExpressionProduct (opaque)
+  source_owners: List[ExpressionSourceOwner]
+  nodes: List[ExpressionNodeHeader]
+  child_ids: List[ExpressionNodeId]
+  identifier_rows: List[IdentifierRow]
+  literal_rows: List[LiteralRow]
+  call_rows, field_rows, block_rows, if_rows, match_rows, ...
+  pattern_rows and pattern_child_ids
+  binding_rows
+  recovery_rows
+  diagnostic_rows
+  roots: List[ExpressionNodeId]
+
+ExpressionNodeHeader
+  kind: ExpressionNodeKind
+  payload_row: Int
+  span: ProductSourceLocation
+```
+
+`ExpressionNodeId`, `PatternNodeId`, and any row id are opaque integer ids.
+They are meaningful only during a traversal of their owning product, but an
+ordinary range check cannot distinguish a same-range id from another product.
+The initial API prevents routine misuse by hiding detached ids. A future
+detached-id boundary must validate provenance as well as range.
+
+`ProductSourceLocation` pairs an owner-table id with `SourceLocation`. Each
+`ExpressionSourceOwner` says whether the text is an authored file, an authored
+range reparsed during interpolation, or compiler-synthesized text with an
+explicit diagnostic origin. Interpolation rebasing, nested-function hoisting,
+and other finalization work must preserve or deliberately create this
+provenance. The product retains every source/token text owner needed by its
+rows; releasing lexer tokens cannot invalidate later text or locations.
+
+`ExpressionNodeKind` is a precise enum. Each kind indexes exactly one
+kind-specific payload table, such as a binary row, call row, block row, match
+row, or binding row. This avoids both a boxed union per node and a broad record
+whose nullable fields permit invalid combinations. Variable-length children
+use a `(start, length)` slice into an append-only id table. Child order is
+source order unless the grammar explicitly defines another order.
+
+Text ownership is explicit:
+
+- authored identifiers and literals retain either the exact immutable text or
+  an exact byte range into the product's source; the schema must not normalize
+  spelling needed by formatter or diagnostics;
+- synthesized text created by finalization belongs to the product's immutable
+  text table and survives after the private builder is released;
+- consumer outputs own their strings when their lifetime can exceed the
+  product. A returned reference must never borrow builder storage.
+
+Families with distinct invariants receive distinct rows rather than flag
+combinations. At minimum this applies to match patterns and binders, select arm
+kinds, `with` bindings and error maps, concurrent forms and parameters, record
+fields and updates, dictionary entries, interpolation parts, lambda/for/param
+binders, and assignment forms.
+
+The enclosing canonical parse result is a phase-specific compact program, not
+`ParsedProgram` plus a sidecar:
+
+```text
+CompactParsedProgram
+  source_owners
+  declarations: List[CompactParsedDecl]
+  expressions: ValidatedExpressionProduct
+  diagnostics and ordered recovery events
+
+CompactParsedDecl
+  declaration metadata
+  expression roots for initializer/body/default expressions
+```
+
+`CompactParsedDecl` mirrors every declaration family but replaces each
+embedded `ParsedExpr` with an internal expression-root reference. Nested
+function declaration expressions use the same compact declaration rows rather
+than embedding `ParsedFunctionDecl`. `ParsedTypeExpr` may remain a separately
+owned raw type tree in the first slice because it does not contain
+`ParsedExpr`; its exact ownership is a field of the compact program, not a
+pointer back into a legacy `ParsedProgram`. Match cases own compact pattern
+roots and expression roots. Declaration-to-root, diagnostic, and recovery
+event order is explicit in this envelope.
+
+## Construction And Validation
+
+"Private builder" means buffers local to one pure driver, not a builder record
+returned through every recursive grammar call and not a new mutable-reference
+capability. The production construction API is:
+
+```text
+parse_expression_product(tokens, source_owners, start_cursor)
+  -> ParseExpressionProductStep
+```
+
+That function owns local `var` row buffers plus explicit grammar and value
+stacks. One iterative dispatch loop consumes tokens, appends complete rows, and
+returns a validated product and next cursor. Small private helpers may classify
+a token or construct one row value, but they do not accept and return the row
+buffers. Nested expression contexts push frames into the same driver. This
+control model must be demonstrated for each form-family checkpoint before the
+production parser switches; it cannot fall back to threading a growing product
+record through approximately fifty existing grammar functions.
+
+Milestone 1 uses the same ownership technique in a test-only AST adapter:
+`compact_expression_oracle_from_parsed(source_owners, root)` has one set of
+driver-local buffers and an explicit visit/rebuild stack. Its inverse,
+`compact_expression_oracle_project(product)`, is test-only. Neither API is
+called by production code.
+
+The driver does not publish partially initialized nodes. Its finish path runs
+the full validator and either publishes `ValidatedExpressionProduct` or
+returns an explicit construction error. Production callers never receive raw
+buffers or partially validated state.
+
+Validation establishes at least:
+
+- every root, child, payload, pattern, binding, recovery, and diagnostic id is
+  in range and belongs to the same product;
+- every node kind selects the correct payload table and each payload row is
+  owned by exactly one node unless the schema explicitly permits sharing;
+- every child slice is in range, ordered, and belongs to the declared family;
+- authored spans are ordered byte offsets within the owned source; synthesized
+  spans use an explicit source rule rather than a magic value;
+- grammar-required arity and optionality are represented by the row type, not
+  rechecked by consumers;
+- recovery nodes preserve the parser's missing-token facts, discarded-token
+  order, diagnostic order, and resume location;
+- references to exact token text or source ranges remain valid for the full
+  product lifetime.
+- child ids are postorder predecessors of their parent, so the graph is
+  acyclic; every non-root node has exactly one parent unless a future row type
+  explicitly introduces sharing;
+- every node is reachable from exactly one declared root, child slices do not
+  overlap, and payload rows are neither orphaned nor multiply owned;
+- recovery and diagnostic rows carry a monotonically increasing event index,
+  are associated with a program, declaration, or expression root, and
+  reproduce the parser's global encounter order.
+
+These checks run once at the construction boundary, not once per consumer. The
+first production implementation runs the exhaustive validator in every build.
+A later change may replace a particular scan with a smart-construction proof
+only when the API makes the invalid state structurally impossible, differential
+tests exercise that proof, and measurements justify the change. A comment or a
+debug-only assertion is not sufficient evidence for eliding release
+validation.
+
+## Semantic Compatibility Contract
+
+The full grammar and recovery surface must be inventoried from parser tests,
+not reconstructed from the experiment. Differential tests must include every
+`ParsedExpr`, pattern, binder, select arm, with-binding, concurrent, record,
+dictionary, interpolation, and missing-expression form.
+
+For identifier references, compatibility means the exact ordered list,
+including duplicates and spans. It also includes the existing special rules:
+
+- field access qualifies names without converting the field token into a free
+  identifier;
+- block bindings become visible only after their initializer and preserve
+  sequential scope;
+- match-case pattern names are bound only in the corresponding body;
+- receive, `with`, lambda, `for`, and concurrent binders have their current
+  scopes;
+- assignments, tuple destructuring, and question bindings keep their present
+  read/bind behavior;
+- nested function declaration expressions contribute no direct references at
+  the current consumer boundary.
+
+Finalization is part of the contract. Interpolation reparsing, nested-function
+hoisting, and subscript-read rewriting must either operate directly on the
+compact product or occur before a one-way compact handoff. A consumer cannot
+run on a pre-finalized compact view and claim equivalence to the current
+post-finalization AST.
+
+Raw parser consumers remain explicit. Formatter and LSP migration is a later
+milestone unless the chosen first boundary includes their exact recovery and
+token requirements. They may temporarily use a consuming projection, but a
+second parser is not permitted.
+
+## Ownership And Lifetime
+
+The desired lifetime is linear by phase:
+
+```text
+private builder -> validated compact product -> direct consumers
+                                         \-> consuming projection -> next phase
+```
+
+A phase record owns one canonical expression representation. If a compatibility
+projection is required, the function consumes the compact product and returns
+the legacy representation; it does not add a cached AST field beside compact
+tables. Likewise, output from the free-identifier consumer is independently
+owned and remains valid after releasing the product.
+
+The current `FinalizedTypecheckProgram` is only an opaque `ParsedProgram`, and
+stage 04 and stage 06 repeatedly unwrap it. A production cutover must replace
+that alias with a phase-specific representation or introduce an even narrower
+phase-owned initializer product. Adding a compact sidecar to the current alias
+is explicitly rejected.
+
+The first production lifetime is ordered as follows:
+
+```text
+compact program
+  -> compact-aware finalization
+  -> module surface plus independently owned initializer-reference facts
+  -> consuming projection to the legacy finalized program
+  -> stage 04/06 use the legacy program and retained facts; compact is gone
+```
+
+`GlobalInitializerReferenceFacts` retains its own source-owner table once per
+module and ordered reference rows containing owner-table ids and locations.
+It therefore survives compact-product release without detaching a bare
+`SourceLocation`. Later graph completion resolves these facts to global rows;
+it does not need the compact product. Finalization should normalize ordinary
+authored and interpolation-rebased spans to the module's primary source owner,
+while representing any genuine synthesized origin explicitly.
+
+Current consumer groups that the migration must account for are:
+
+- raw syntax and recovery: formatter projection, LSP diagnostics/analysis,
+  parsed AST JSON/debug output, test discovery, and doctest;
+- finalization: interpolation reparsing, nested-function hoisting, subscript
+  rewriting, and import-path rewriting;
+- finalized metadata: pipeline/module-surface construction, loaded-module and
+  frontend-graph services, source-name/definition indexing, and frontend
+  summaries;
+- typed frontend: bridge and frontend-graph typecheck, declaration/header
+  installation, global-header completion, inference/type occurrence, and
+  stage-07 global materialization.
+
+Milestones 2 through 4 move the parser, finalization, module-surface reader, and
+initializer-reference publication. All other finalized consumers use the one
+consuming projection until their named milestone moves. Raw consumers continue
+through a raw compatibility result from the same parser, never a second grammar
+implementation.
+
+## Staged Milestones
+
+Each milestone is independently reviewed, tested, and measured. A milestone
+that fails its semantic or cost gate is reverted or redesigned rather than
+papered over with another retained representation.
+
+1. **Schema and oracle.** Add the opaque product, driver-local builder buffers,
+   validator, fixture inventory, and test-only AST adapter/projection used as a
+   differential oracle. Land reviewable form-family checkpoints (scalar and
+   operator forms; collections/access; control flow and bindings; patterns;
+   concurrency and recovery), each with round-trip and corruption fixtures.
+   No production caller changes. The product is not considered full-grammar
+   until every family is covered.
+2. **One canonical construction boundary.** Teach the production expression
+   parser to construct the compact product for the complete expression grammar
+   and recovery surface. Keep declarations/types raw only where the boundary
+   says so. Any legacy expression projection is consuming and instrumented.
+3. **Finalization.** Move interpolation, nested-function, and subscript-read
+   finalization to compact tables, preserving diagnostics and spans exactly.
+4. **First direct consumer and projection boundary.** Publish module surfaces
+   and independently owned ordered global-initializer reference facts directly
+   from compact data, then consume/project the compact program for remaining
+   finalized-AST callers. Global-header completion resolves the published
+   facts instead of walking `ParsedExpr`. Output must match exactly for the
+   full compiler corpus, including order and duplicates before dependency
+   deduplication.
+5. **Typecheck projection removal.** Migrate inference and declaration
+   consumers family by family until no `ParsedExpr` projection remains in the
+   compile/check/run pipeline; remove the compatibility projection in the same
+   milestone as its last caller.
+6. **Raw-tooling consumers.** Migrate formatter, LSP, JSON/debug output,
+   doctest, and test-discovery paths according to their token and recovery
+   needs. Delete legacy expression construction once the last caller moves.
+7. **Cursor follow-up.** Consider T7b only after compact nodes are canonical
+   and separately measured.
+
+Milestones 2 through 5 may need more than one commit, but no commit may leave a
+new permanent parser or an undocumented dual-representation lifetime.
+
+## Tests And Measurements
+
+Fast feedback:
+
+- parser and finalizer fixtures for the exact form being changed;
+- `blorp/test/compiler/stage_03_parse/test_parser.brp`;
+- `blorp/test/compiler/stage_03_parse/test_source_ast_finalize.brp`;
+- `blorp/test/compiler/pipeline/test_global_header_completion.brp` for the
+  first direct consumer;
+- validation tests that deliberately construct every rejected id, row, slice,
+  span, and family mismatch through test-only builder hooks.
+
+Every construction milestone also runs all parser-owned manifest checks and
+`scripts/compiler-check --changed`. Before direct `bin/blorp` tests, verify
+`scripts/compiler-build-status`; rebuild with `make` when it is not `FRESH`.
+Broader compiler and sanitizer gates follow the owning test suites.
+
+Differential evidence must cover:
+
+- all expression grammar and error-recovery fixtures, not a token subset;
+- exact diagnostics including order, message, help, and span;
+- exact raw syntax projection where formatter/LSP depend on it;
+- exact finalized AST or typed/Core output at transitional boundaries;
+- exact identifier-reference order, duplicates, qualification, and spans;
+- identical generated C for the small program and self-compile corpus.
+
+Cost evidence is collected at the boundary changed. Report at least parser and
+consumer allocations, retired instructions, peak and retained memory, output
+identity, source/binary provenance, raw artifact paths, and release order. Run
+the repository self-compile protocol for whole-compiler confirmation. A win in
+construction paired with higher full-lifetime retention is not accepted
+without showing the product is consumed before the peak.
+
+Schema checkpoints additionally measure empty and small products. Report the
+size and retained allocation shape for an empty root set, one scalar, one
+binary expression, and a small module's root set. Count every allocated table,
+including empty lists, and report node-header and family-row widths. A schema
+that saves large-tree traffic but adds substantial per-module table overhead
+must change before production construction.
+
+## Compatibility Projection Exit Criteria
+
+A production projection must have all of the following before it lands:
+
+- an enumerated caller list and owning milestone;
+- evidence that compact and projected trees are not retained together across a
+  phase boundary;
+- a counter or profile row measuring projection calls, allocations, and time;
+- differential tests for every projected form;
+- a deletion condition: the last listed caller moves, then the projection and
+  its tests are deleted in the same milestone.
+
+Projection cost is charged to the candidate in benchmarks. It cannot be
+excluded as setup if production pays it.
+
+## Decision Before Implementation
+
+The repository survey found no honest tiny direct-parser cutover. Choose one of
+these boundaries before production code begins:
+
+### A. Canonical Full-Expression Construction (recommended)
+
+Complete milestone 1, then implement milestones 2 through 4 as the first
+production slice: the full expression grammar constructs the validated
+product, compact-aware finalization preserves current semantics, and
+module-surface and global-initializer reference-fact publication are the first
+direct consumers. The compact program is then consumed into a compatibility
+projection for remaining typecheck callers; later dependency resolution reads
+the independently owned facts. Require a review checkpoint after each form
+family; do not switch production construction until the complete owned grammar
+is coherent.
+
+This is larger than the experiment, but it establishes the intended ownership
+model, keeps one grammar, and measures the real construction/consumer path.
+The work should be split into reviewable schema/oracle, construction,
+finalization, and consumer commits; production wiring lands only when the
+whole slice is coherent.
+
+### B. AST-To-Compact Test Oracle (not a production option)
+
+Convert parsed AST fixtures to a validated compact product, project them back,
+and compare the real consumer outputs in tests. This proves schema and consumer
+semantics in form-family checkpoints, but it pays for both constructions and
+is not a parser migration or a speed claim. It must not be wired into the
+production compile/check/run pipeline.
+
+The adapter is deleted after option A's canonical parser construction and the
+last differential caller move. Do not implement A and B as competing
+production paths. A is the chosen migration direction; B exists only as its
+temporary test oracle.

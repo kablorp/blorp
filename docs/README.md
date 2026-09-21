@@ -51,6 +51,9 @@ module inventory lives in
 - [Frontend Facts Roadmap](FRONTEND_FACTS_ROADMAP.md) is the task-level
   plan for publishing each stage's facts as id-keyed tables (module,
   name, definition tables) and removing threaded state from typecheck.
+- [Compact Parser Migration](COMPACT_PARSER_MIGRATION.md) defines the staged
+  schema, ownership, compatibility, and measurement contract for replacing
+  per-expression parser trees without creating a second permanent parser.
 - [Self-Compile Measurement Protocol](../benchmarks/README.md#self-compile-measurement-protocol)
   is the standard compiler-performance measurement and its retained baselines.
 
