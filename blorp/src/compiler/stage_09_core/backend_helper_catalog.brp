@@ -1,0 +1,4238 @@
+-- Catalog of every backend renderer helper's runtime allocation and
+-- ownership behaviour: one row per `*Args` record / dispatch variant across
+-- prepared_backend_renderer.brp, prepared_list_renderer.brp,
+-- prepared_tensor_renderer.brp, prepared_tuple_renderer.brp and
+-- intrinsic_renderer.brp in stage_10_backend/. This module answers a
+-- question the renderers cannot answer of themselves: what the emitted C
+-- DOES at runtime once a renderer has been chosen for a Core node.
+--
+-- Rows were built by reading each render function's body and matching the
+-- runtime function(s) it calls against blorp/src/lib/runtime/native/runtime.c
+-- (see the docstring on each BackendHelperKind variant for the cited
+-- function). Where a variant carries a secondary flag that changes runtime
+-- behaviour (element-release policy, dict-key release policy, channel
+-- send/recv runtime), it is split into its own row rather than a boolean
+-- field, matching the rule the renderers already apply to list handoff
+-- store/borrow variants.
+--
+-- This catalog is total today, but that is not the same as executable
+-- coverage: allocation_report.brp reports backend_plan_coverage and
+-- behavior_configuration_coverage as "catalog_only" until every rendered
+-- helper in emit.brp is tagged with the BackendHelperKind it renders and the
+-- allocation analysis reads backend_helper_contract for it -- only then does
+-- coverage become "complete".
+import:
+	allocation_contracts:
+		AllocationRiskReason(
+			CapacityGrowthAllocation,
+			CowFallbackAllocation,
+			ManagedObjectAllocation,
+			RuntimeOperationAllocation,
+		),
+
+
+record BackendHelperContract {
+	allocates: List[AllocationRiskReason],
+	retains: Bool,
+	releases: Bool,
+	calls_user_code: Bool,
+	cleanup_scratch: Bool
+}
+
+
+-- One variant per distinct emitted-C helper shape across the five stage_10_backend
+-- renderer files: 94 from prepared_backend_renderer.brp,
+-- 52 from prepared_list_renderer.brp, 72 from
+-- prepared_tensor_renderer.brp, 7 from prepared_tuple_renderer.brp,
+-- and 153 from intrinsic_renderer.brp's
+-- NoArg/OneArg/TwoArg/ThreeArg intrinsic tables (378 total). A new
+-- renderer variant must be added here or backend_helper_contract's match
+-- stops being exhaustive and the build fails closed.
+enum BackendHelperKind:
+	BackendDictCtorGeneric
+	BackendDictCtorString
+	BackendDictCtorFloat
+	BackendDictCtorCustomNoElemRelease
+	BackendDictCtorCustomWithElemRelease
+	BackendDictStackOptionValueRecordGetKeepKey
+	BackendDictStackOptionValueRecordGetReleaseKey
+	BackendDictStackOptionLongGetKeepKey
+	BackendDictStackOptionLongGetReleaseKey
+	BackendDictStackOptionInt128GetKeepKey
+	BackendDictStackOptionInt128GetReleaseKey
+	BackendDictStackOptionUInt128GetKeepKey
+	BackendDictStackOptionUInt128GetReleaseKey
+	BackendDictConstructEmpty
+	BackendDictValueReleaseInit
+	BackendDictInsert
+	BackendDictIterSourceBinding
+	BackendDictIterLoopOpen
+	BackendDictIterHeader
+	BackendDictIterSlotBinding
+	BackendDictIterDeletedSlotGuard
+	BackendDictIterKeyBinding
+	BackendDictIterPairBinding
+	BackendDictConstructWithBody
+	BackendSetCtorGeneric
+	BackendSetCtorString
+	BackendSetCtorFloat
+	BackendSetCtorCustomNoElemRelease
+	BackendSetCtorCustomWithElemRelease
+	BackendSetIterSourceBinding
+	BackendSetIterRetain
+	BackendSetIterLoopOpen
+	BackendSetIterEntryKey
+	BackendSetIterRelease
+	BackendSetIterHeader
+	BackendStringFindByteFrom
+	BackendStringByteRead
+	BackendStringByteWrite
+	BackendStringByteCopy
+	BackendStringSetLen
+	BackendStringIterSourceBinding
+	BackendStringIterLoopOpen
+	BackendStringIterCodepointBinding
+	BackendStringIterHeader
+	BackendFlatIterSourceBinding
+	BackendFlatIterLengthBinding
+	BackendFlatIterLoopOpen
+	BackendFlatIterLoopHeader
+	BackendFlatIterRawDataBinding
+	BackendFlatIterRawValueBinding
+	BackendDictWithCapacityGeneric
+	BackendDictWithCapacityString
+	BackendDictWithCapacityFloat
+	BackendDictWithCapacityCustomNoElemRelease
+	BackendDictWithCapacityCustomWithElemRelease
+	BackendChannelWithElemRelease
+	BackendChannelRetainingSendSend
+	BackendChannelRetainingSendTrySend
+	BackendChannelRetainingSendTrySendStatus
+	BackendChannelRetainingSendWithTimeoutSendTimeout
+	BackendChannelRetainingSendWithTimeoutSendTimeoutStatus
+	BackendChannelTrySendAttempt
+	BackendChannelTrySendAttemptRetainedValue
+	BackendChannelSendTimeoutAttempt
+	BackendChannelSendTimeoutAttemptRetainedValue
+	BackendChannelTryRecvAttempt
+	BackendChannelRecvTimeoutAttempt
+	BackendChannelTryRecvAttemptNoReleaseMask
+	BackendChannelRecvTimeoutAttemptNoReleaseMask
+	BackendStackOptionSomeValue
+	BackendStackOptionSomeVoidStatement
+	BackendStackOptionNone
+	BackendStackOptionTaggedValue
+	BackendStackOptionTaggedVoidStatement
+	BackendStackOptionTaggedNone
+	BackendStackResultOk
+	BackendStackResultErr
+	BackendStackResultTaggedPayload
+	BackendChannelIterSourceBinding
+	BackendChannelIterValueInit
+	BackendChannelIterLoopOpen
+	BackendChannelIterReleaseObject
+	BackendChannelIterHeader
+	BackendSelectArmsDecl
+	BackendSelectRecvArm
+	BackendSelectSealedArm
+	BackendSelectAfterArm
+	BackendSelectWait
+	BackendSelectFirstBranchOpen
+	BackendSelectNextBranchOpen
+	BackendSelectCleanupFrameDecl
+	BackendSelectCleanupPush
+	BackendSelectCleanupPop
+	BackendSelectReceivedValueBinding
+	ListPointerGet
+	ListInlineCheckedGet
+	ListInlineProvenGet
+	ListInlineBitsLoad
+	ListInlineBitsStore
+	ListPointerSetRawStore
+	ListPointerHandoffSetOwnedStore
+	ListInlineStructSetRawStore
+	ListInlineStructHandoffSetOwnedStore
+	ListPointerSwap
+	ListInlineBitsSwap
+	ListInlineStructSwap
+	ListInlineStructLoadChecked
+	ListInlineStructLoadProven
+	ListInlineStructLoadDirect
+	ListListInlineStructUnboxListName
+	ListListInlineStructUnboxIndexName
+	ListListInlineStructUnboxOutName
+	ListListInlineStructUnboxOpen
+	ListListInlineStructUnboxClose
+	ListHandoffSetSourceSlot
+	ListCopySpanUninit
+	ListEnsureUnique
+	ListEnsureCapacity
+	ListReuseAlloc
+	ListReuseAllocWithRelease
+	ListListAllocPointer
+	ListListAllocInline
+	ListListAllocInlineStruct
+	ListListAllocWithRelease
+	ListRetainFor
+	ListRetainForNoop
+	ListListConstructName
+	ListListConstruct
+	ListListConstructInitElemRelease
+	ListListConstructInlineStructSet
+	ListListConstructSetLen
+	ListListConstructAppend
+	ListListConstructAppendOwned
+	ListListHandoffCapacityName
+	ListListHandoffReuseName
+	ListListHandoffReleaseName
+	ListListStorageModePointer
+	ListListStorageModeInline
+	ListListElementSizePointer
+	ListListElementSizeInlineStruct
+	ListListElementReleaseFn
+	ListListElementReleaseNone
+	ListListHandoffBorrowPrefix
+	ListListHandoffReusePrefix
+	ListListHandoffBorrowSuffix
+	ListListHandoffReuseSuffix
+	TensorRawViewDecl
+	TensorRawRead
+	TensorRawWriteExpr
+	TensorRawWriteStmt
+	TensorWordStorageCheck
+	TensorF64StorageCheck
+	TensorF32StorageCheck
+	TensorI64StorageCheck
+	TensorTensorStorageModePointer
+	TensorTensorStorageModeF64
+	TensorTensorStorageModeF32
+	TensorTensorStorageModeI64
+	TensorTensorStorageModeInline
+	TensorTensorElementSizePointer
+	TensorTensorElementSizeF64
+	TensorTensorElementSizeF32
+	TensorTensorElementSizeI64
+	TensorTensorElementSizeInlineStruct
+	TensorTensorCallbackResultBoxedStruct
+	TensorTensorCallbackResultBoxedFloat
+	TensorTensorCallbackResultBoxedFloat32
+	TensorTensorCallbackResultBits
+	TensorDataPointerGetUnchecked
+	TensorInlineStructGetUnchecked
+	TensorInlineStructElementDecl
+	TensorInlineStructGetChecked
+	TensorInlineStructMatrixGetChecked
+	TensorStackOptionVectorValueRecordGet
+	TensorStackOptionVectorLongGet
+	TensorStackOptionVectorInt128Get
+	TensorStackOptionVectorUInt128Get
+	TensorStackOptionMatrixValueRecordGet
+	TensorStackOptionMatrixLongGet
+	TensorStackOptionMatrixInt128Get
+	TensorStackOptionMatrixUInt128Get
+	TensorF64RawGetUnchecked
+	TensorF32RawGetUnchecked
+	TensorTensorAllocPointer
+	TensorTensorAllocI64
+	TensorTensorAllocF64
+	TensorTensorAllocF32
+	TensorTensorAllocPacked
+	TensorTensorAllocSized
+	TensorTensorAllocWithRelease
+	TensorTensorFillInlineStruct
+	TensorTensorFillBoxed
+	TensorTensorFillBoxedReleaseValue
+	TensorTensorFillDimName
+	TensorTensorFillTotalName
+	TensorTensorFillDimBind
+	TensorTensorFillDimArg
+	TensorTensorFillProductExpr
+	TensorTensorFillRawScalar
+	TensorTensorFillPacked
+	TensorTensorInitElemRelease
+	TensorTensorRankedAllocPointer
+	TensorTensorRankedAllocI64
+	TensorTensorRankedAllocF64
+	TensorTensorRankedAllocF32
+	TensorTensorRankedAllocPacked
+	TensorTensorRankedAllocSized
+	TensorTensorLiteralName
+	TensorTensorLiteralConstruct
+	TensorTensorLiteralF32Write
+	TensorTensorLiteralF64Write
+	TensorTensorLiteralI64Write
+	TensorTensorLiteralWordWrite
+	TensorTensorLiteralPackedWrite
+	TensorTensorLiteralInlineStructWrite
+	TensorTensorLiteralBoxedWrite
+	TensorTensorLiteralBoxedOwnedWrite
+	TensorTensorLiteralBoxedBorrowedWrite
+	TupleTupleName
+	TupleTupleArg
+	TupleTupleConstruct
+	TupleTupleRetainElem
+	TupleTupleConstructWithRc
+	TupleTupleFieldElement
+	TupleTupleFieldAccess
+	IntrinsicMathInfinity
+	IntrinsicMathNegInfinity
+	IntrinsicMathNan
+	IntrinsicElemReleaseFn
+	IntrinsicMathSin
+	IntrinsicMathCos
+	IntrinsicMathTan
+	IntrinsicMathAsin
+	IntrinsicMathAcos
+	IntrinsicMathAtan
+	IntrinsicMathSinh
+	IntrinsicMathCosh
+	IntrinsicMathTanh
+	IntrinsicMathAsinh
+	IntrinsicMathAcosh
+	IntrinsicMathAtanh
+	IntrinsicMathExp
+	IntrinsicMathExp2
+	IntrinsicMathExpm1
+	IntrinsicMathLog
+	IntrinsicMathLog2
+	IntrinsicMathLog10
+	IntrinsicMathLog1p
+	IntrinsicMathSqrt
+	IntrinsicMathCbrt
+	IntrinsicMathFloor
+	IntrinsicMathCeil
+	IntrinsicMathRound
+	IntrinsicMathTrunc
+	IntrinsicMathIsNan
+	IntrinsicMathIsInf
+	IntrinsicMathIsFinite
+	IntrinsicBitNot
+	IntrinsicListLen
+	IntrinsicListCapacity
+	IntrinsicStringLen
+	IntrinsicBytesLen
+	IntrinsicDictLen
+	IntrinsicSetLen
+	IntrinsicSetCapacity
+	IntrinsicSetMask
+	IntrinsicSetFirst
+	IntrinsicSetLast
+	IntrinsicSetEntryKey
+	IntrinsicSetEntryNext
+	IntrinsicSetEntryPrevOrder
+	IntrinsicSetEntryNextOrder
+	IntrinsicDictCapacity
+	IntrinsicDictMask
+	IntrinsicDictGrowAt
+	IntrinsicDictOrderLen
+	IntrinsicDictKeyReleaseFn
+	IntrinsicDictValueReleaseFn
+	IntrinsicSliceSource
+	IntrinsicSliceStart
+	IntrinsicSliceLen
+	IntrinsicMemoryIsUniqueStack
+	IntrinsicMemoryRefcountHeap
+	IntrinsicMemoryRefcountStack
+	IntrinsicMemorySizeOfHeap
+	IntrinsicMemorySizeOfStack
+	IntrinsicTensorLen
+	IntrinsicTensorCapacity
+	IntrinsicFixedValue
+	IntrinsicFixedScale
+	IntrinsicFixedPrecision
+	IntrinsicListReverseOwned
+	IntrinsicStringAlloc
+	IntrinsicStringEnsureUnique
+	IntrinsicBytesAlloc
+	IntrinsicBytesCow
+	IntrinsicSetHashImmediate
+	IntrinsicSetAlloc
+	IntrinsicSetAllocEntry
+	IntrinsicSetCow
+	IntrinsicDictHashImmediate
+	IntrinsicDictAlloc
+	IntrinsicDictCow
+	IntrinsicMemoryIsUniqueHeap
+	IntrinsicTensorIsUnique
+	IntrinsicFixedPow10
+	IntrinsicMathPow
+	IntrinsicMathAtan2
+	IntrinsicMathHypot
+	IntrinsicMathFmod
+	IntrinsicMathCopysign
+	IntrinsicBitAnd
+	IntrinsicBitOr
+	IntrinsicBitXor
+	IntrinsicShiftLeft
+	IntrinsicShiftRight
+	IntrinsicListSetLen
+	IntrinsicListSetElemRelease
+	IntrinsicStringGetByte
+	IntrinsicBytesGet
+	IntrinsicBytesSetLen
+	IntrinsicSetBucket
+	IntrinsicSetSetLen
+	IntrinsicSetSetFirst
+	IntrinsicSetSetLast
+	IntrinsicSetEntrySetNext
+	IntrinsicSetEntrySetPrevOrder
+	IntrinsicSetEntrySetNextOrder
+	IntrinsicSetEqImmediate
+	IntrinsicDictKeyAt
+	IntrinsicDictValueAt
+	IntrinsicDictMetaGet
+	IntrinsicDictOrderGet
+	IntrinsicDictOrderIndexGet
+	IntrinsicDictSetLen
+	IntrinsicDictSetOrderLen
+	IntrinsicDictEqImmediate
+	IntrinsicTensorGetI64WordUnchecked
+	IntrinsicTensorGetI64RawUnchecked
+	IntrinsicMemorySameObjectStack
+	IntrinsicListGet
+	IntrinsicListReleaseElem
+	IntrinsicStringEnsureCapacity
+	IntrinsicSetHash
+	IntrinsicSetRetainKeyFor
+	IntrinsicSetFreeEntry
+	IntrinsicSetReuseAlloc
+	IntrinsicSetResize
+	IntrinsicSetReserveForLen
+	IntrinsicDictHash
+	IntrinsicDictRetainKeyFor
+	IntrinsicDictRetainValueFor
+	IntrinsicDictReleaseValueFor
+	IntrinsicDictReuseAlloc
+	IntrinsicDictResize
+	IntrinsicTensorGetF64
+	IntrinsicTensorGetF32
+	IntrinsicTensorGetF16
+	IntrinsicTensorGetI64
+	IntrinsicMemorySameObjectHeap
+	IntrinsicMathFma
+	IntrinsicStringSetByte
+	IntrinsicBytesSet
+	IntrinsicSetSetBucket
+	IntrinsicDictSetKeyAt
+	IntrinsicDictSetValueAt
+	IntrinsicDictMetaSet
+	IntrinsicDictOrderSet
+	IntrinsicDictOrderIndexSet
+	IntrinsicStringFindByteFrom
+	IntrinsicSetEq
+	IntrinsicDictEq
+	IntrinsicSliceAlloc
+	IntrinsicTensorSetF64
+	IntrinsicTensorSetF32
+	IntrinsicTensorSetF16
+	IntrinsicTensorSetI64
+	IntrinsicFixedAlloc
+
+
+-- Increment whenever a catalog row's contract changes meaning, a renderer
+-- variant is added/removed, or a secondary-flag split changes. Reports
+-- expose this alongside the variant count as the backend-plan identity.
+BACKEND_HELPER_CATALOG_REVISION: Int = 1
+
+BACKEND_HELPER_KIND_COUNT: Int = 378
+
+
+pure func backend_helper_contract(kind: BackendHelperKind) -> BackendHelperContract:
+	match kind:
+		BackendDictCtorGeneric:
+			-- prepared_backend_renderer.brp: BackendDictCtorGeneric -- blorp_dict_new
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendDictCtorString:
+			-- prepared_backend_renderer.brp: BackendDictCtorString -- blorp_dict_new_string
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendDictCtorFloat:
+			-- prepared_backend_renderer.brp: BackendDictCtorFloat -- blorp_dict_new_float
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendDictCtorCustomNoElemRelease:
+			-- prepared_backend_renderer.brp: BackendDictCtorCustomNoElemRelease -- blorp_dict_new_custom, blorp_elem_release_fn
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendDictCtorCustomWithElemRelease:
+			-- prepared_backend_renderer.brp: BackendDictCtorCustomWithElemRelease -- blorp_dict_new_custom, blorp_elem_release_fn
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendDictStackOptionValueRecordGetKeepKey:
+			-- prepared_backend_renderer.brp: BackendDictStackOptionValueRecordGetKeepKey -- blorp_dict_get_raw, blorp_release, blorp_unbox_struct
+			{
+				allocates = [],
+				retains = False,
+				releases = True,
+				calls_user_code = True,
+				cleanup_scratch = False
+			}
+		BackendDictStackOptionValueRecordGetReleaseKey:
+			-- prepared_backend_renderer.brp: BackendDictStackOptionValueRecordGetReleaseKey -- blorp_dict_get_raw, blorp_release, blorp_unbox_struct
+			{
+				allocates = [],
+				retains = False,
+				releases = True,
+				calls_user_code = True,
+				cleanup_scratch = False
+			}
+		BackendDictStackOptionLongGetKeepKey:
+			-- prepared_backend_renderer.brp: BackendDictStackOptionLongGetKeepKey -- blorp_dict_get_raw, blorp_release
+			{
+				allocates = [],
+				retains = False,
+				releases = True,
+				calls_user_code = True,
+				cleanup_scratch = False
+			}
+		BackendDictStackOptionLongGetReleaseKey:
+			-- prepared_backend_renderer.brp: BackendDictStackOptionLongGetReleaseKey -- blorp_dict_get_raw, blorp_release
+			{
+				allocates = [],
+				retains = False,
+				releases = True,
+				calls_user_code = True,
+				cleanup_scratch = False
+			}
+		BackendDictStackOptionInt128GetKeepKey:
+			-- prepared_backend_renderer.brp: BackendDictStackOptionInt128GetKeepKey -- blorp_dict_get_raw, blorp_release, blorp_unbox_int128
+			{
+				allocates = [],
+				retains = False,
+				releases = True,
+				calls_user_code = True,
+				cleanup_scratch = False
+			}
+		BackendDictStackOptionInt128GetReleaseKey:
+			-- prepared_backend_renderer.brp: BackendDictStackOptionInt128GetReleaseKey -- blorp_dict_get_raw, blorp_release, blorp_unbox_int128
+			{
+				allocates = [],
+				retains = False,
+				releases = True,
+				calls_user_code = True,
+				cleanup_scratch = False
+			}
+		BackendDictStackOptionUInt128GetKeepKey:
+			-- prepared_backend_renderer.brp: BackendDictStackOptionUInt128GetKeepKey -- blorp_dict_get_raw, blorp_release, blorp_unbox_uint128
+			{
+				allocates = [],
+				retains = False,
+				releases = True,
+				calls_user_code = True,
+				cleanup_scratch = False
+			}
+		BackendDictStackOptionUInt128GetReleaseKey:
+			-- prepared_backend_renderer.brp: BackendDictStackOptionUInt128GetReleaseKey -- blorp_dict_get_raw, blorp_release, blorp_unbox_uint128
+			{
+				allocates = [],
+				retains = False,
+				releases = True,
+				calls_user_code = True,
+				cleanup_scratch = False
+			}
+		BackendDictConstructEmpty:
+			-- prepared_backend_renderer.brp: BackendDictConstructEmpty -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendDictValueReleaseInit:
+			-- prepared_backend_renderer.brp: BackendDictValueReleaseInit -- blorp_dict_set_value_release
+			{
+				allocates = [],
+				retains = False,
+				releases = True,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendDictInsert:
+			-- prepared_backend_renderer.brp: BackendDictInsert -- blorp_dict_insert, blorp_release
+			{
+				allocates = [CapacityGrowthAllocation, CowFallbackAllocation],
+				retains = False,
+				releases = True,
+				calls_user_code = True,
+				cleanup_scratch = False
+			}
+		BackendDictIterSourceBinding:
+			-- prepared_backend_renderer.brp: BackendDictIterSourceBinding -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendDictIterLoopOpen:
+			-- prepared_backend_renderer.brp: BackendDictIterLoopOpen -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendDictIterHeader:
+			-- prepared_backend_renderer.brp: BackendDictIterHeader -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendDictIterSlotBinding:
+			-- prepared_backend_renderer.brp: BackendDictIterSlotBinding -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendDictIterDeletedSlotGuard:
+			-- prepared_backend_renderer.brp: BackendDictIterDeletedSlotGuard -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendDictIterKeyBinding:
+			-- prepared_backend_renderer.brp: BackendDictIterKeyBinding -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendDictIterPairBinding:
+			-- prepared_backend_renderer.brp: BackendDictIterPairBinding -- blorp_tuple_new
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendDictConstructWithBody:
+			-- prepared_backend_renderer.brp: BackendDictConstructWithBody -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendSetCtorGeneric:
+			-- prepared_backend_renderer.brp: BackendSetCtorGeneric -- blorp_set_new
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendSetCtorString:
+			-- prepared_backend_renderer.brp: BackendSetCtorString -- blorp_set_new_string
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendSetCtorFloat:
+			-- prepared_backend_renderer.brp: BackendSetCtorFloat -- blorp_set_new_float
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendSetCtorCustomNoElemRelease:
+			-- prepared_backend_renderer.brp: BackendSetCtorCustomNoElemRelease -- blorp_elem_release_fn, blorp_set_new_custom
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendSetCtorCustomWithElemRelease:
+			-- prepared_backend_renderer.brp: BackendSetCtorCustomWithElemRelease -- blorp_elem_release_fn, blorp_set_new_custom
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendSetIterSourceBinding:
+			-- prepared_backend_renderer.brp: BackendSetIterSourceBinding -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendSetIterRetain:
+			-- prepared_backend_renderer.brp: BackendSetIterRetain -- blorp_retain
+			{
+				allocates = [],
+				retains = True,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendSetIterLoopOpen:
+			-- prepared_backend_renderer.brp: BackendSetIterLoopOpen -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendSetIterEntryKey:
+			-- prepared_backend_renderer.brp: BackendSetIterEntryKey -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendSetIterRelease:
+			-- prepared_backend_renderer.brp: BackendSetIterRelease -- blorp_release
+			{
+				allocates = [],
+				retains = False,
+				releases = True,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendSetIterHeader:
+			-- prepared_backend_renderer.brp: BackendSetIterHeader -- blorp_retain
+			{
+				allocates = [],
+				retains = True,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendStringFindByteFrom:
+			-- prepared_backend_renderer.brp: BackendStringFindByteFrom -- blorp_string_find_byte_from
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendStringByteRead:
+			-- prepared_backend_renderer.brp: BackendStringByteRead -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendStringByteWrite:
+			-- prepared_backend_renderer.brp: BackendStringByteWrite -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendStringByteCopy:
+			-- prepared_backend_renderer.brp: BackendStringByteCopy -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendStringSetLen:
+			-- prepared_backend_renderer.brp: BackendStringSetLen -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendStringIterSourceBinding:
+			-- prepared_backend_renderer.brp: BackendStringIterSourceBinding -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendStringIterLoopOpen:
+			-- prepared_backend_renderer.brp: BackendStringIterLoopOpen -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendStringIterCodepointBinding:
+			-- prepared_backend_renderer.brp: BackendStringIterCodepointBinding -- blorp_string_next_codepoint
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendStringIterHeader:
+			-- prepared_backend_renderer.brp: BackendStringIterHeader -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendFlatIterSourceBinding:
+			-- prepared_backend_renderer.brp: BackendFlatIterSourceBinding -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendFlatIterLengthBinding:
+			-- prepared_backend_renderer.brp: BackendFlatIterLengthBinding -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendFlatIterLoopOpen:
+			-- prepared_backend_renderer.brp: BackendFlatIterLoopOpen -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendFlatIterLoopHeader:
+			-- prepared_backend_renderer.brp: BackendFlatIterLoopHeader -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendFlatIterRawDataBinding:
+			-- prepared_backend_renderer.brp: BackendFlatIterRawDataBinding -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendFlatIterRawValueBinding:
+			-- prepared_backend_renderer.brp: BackendFlatIterRawValueBinding -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendDictWithCapacityGeneric:
+			-- prepared_backend_renderer.brp: BackendDictWithCapacityGeneric -- blorp_dict_with_capacity
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendDictWithCapacityString:
+			-- prepared_backend_renderer.brp: BackendDictWithCapacityString -- blorp_dict_with_capacity_string
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendDictWithCapacityFloat:
+			-- prepared_backend_renderer.brp: BackendDictWithCapacityFloat -- blorp_dict_with_capacity_float
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendDictWithCapacityCustomNoElemRelease:
+			-- prepared_backend_renderer.brp: BackendDictWithCapacityCustomNoElemRelease -- blorp_dict_with_capacity_custom, blorp_elem_release_fn
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendDictWithCapacityCustomWithElemRelease:
+			-- prepared_backend_renderer.brp: BackendDictWithCapacityCustomWithElemRelease -- blorp_dict_with_capacity_custom, blorp_elem_release_fn
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendChannelWithElemRelease:
+			-- prepared_backend_renderer.brp: BackendChannelWithElemRelease -- blorp_channel_init_elem_release, blorp_channel_new
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendChannelRetainingSendSend:
+			-- prepared_backend_renderer.brp: BackendChannelRetainingSendSend -- blorp_channel_send, blorp_channel_try_send, blorp_channel_try_send_status, blorp_release, blorp_task_cleanup_pop_slot_with_task, blorp_task_cleanup_push_with_task
+			{
+				allocates = [RuntimeOperationAllocation],
+				retains = False,
+				releases = True,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendChannelRetainingSendTrySend:
+			-- prepared_backend_renderer.brp: BackendChannelRetainingSendTrySend -- blorp_channel_send, blorp_channel_try_send, blorp_channel_try_send_status, blorp_release, blorp_task_cleanup_pop_slot_with_task, blorp_task_cleanup_push_with_task
+			{
+				allocates = [RuntimeOperationAllocation],
+				retains = False,
+				releases = True,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendChannelRetainingSendTrySendStatus:
+			-- prepared_backend_renderer.brp: BackendChannelRetainingSendTrySendStatus -- blorp_channel_send, blorp_channel_try_send, blorp_channel_try_send_status, blorp_release, blorp_task_cleanup_pop_slot_with_task, blorp_task_cleanup_push_with_task
+			{
+				allocates = [RuntimeOperationAllocation],
+				retains = False,
+				releases = True,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendChannelRetainingSendWithTimeoutSendTimeout:
+			-- prepared_backend_renderer.brp: BackendChannelRetainingSendWithTimeoutSendTimeout -- blorp_channel_send_timeout, blorp_channel_send_timeout_status, blorp_release, blorp_task_cleanup_pop_slot_with_task, blorp_task_cleanup_push_with_task
+			{
+				allocates = [RuntimeOperationAllocation],
+				retains = False,
+				releases = True,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendChannelRetainingSendWithTimeoutSendTimeoutStatus:
+			-- prepared_backend_renderer.brp: BackendChannelRetainingSendWithTimeoutSendTimeoutStatus -- blorp_channel_send_timeout, blorp_channel_send_timeout_status, blorp_release, blorp_task_cleanup_pop_slot_with_task, blorp_task_cleanup_push_with_task
+			{
+				allocates = [RuntimeOperationAllocation],
+				retains = False,
+				releases = True,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendChannelTrySendAttempt:
+			-- prepared_backend_renderer.brp: BackendChannelTrySendAttempt -- blorp_channel_try_send_status
+			{
+				allocates = [RuntimeOperationAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendChannelTrySendAttemptRetainedValue:
+			-- prepared_backend_renderer.brp: BackendChannelTrySendAttemptRetainedValue -- blorp_channel_try_send_status, blorp_release, blorp_task_cleanup_pop_slot_with_task, blorp_task_cleanup_push_with_task
+			{
+				allocates = [RuntimeOperationAllocation],
+				retains = False,
+				releases = True,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendChannelSendTimeoutAttempt:
+			-- prepared_backend_renderer.brp: BackendChannelSendTimeoutAttempt -- blorp_channel_send_timeout_status
+			{
+				allocates = [RuntimeOperationAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendChannelSendTimeoutAttemptRetainedValue:
+			-- prepared_backend_renderer.brp: BackendChannelSendTimeoutAttemptRetainedValue -- blorp_channel_send_timeout_status, blorp_release, blorp_task_cleanup_pop_slot_with_task, blorp_task_cleanup_push_with_task
+			{
+				allocates = [RuntimeOperationAllocation],
+				retains = False,
+				releases = True,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendChannelTryRecvAttempt:
+			-- prepared_backend_renderer.brp: BackendChannelTryRecvAttempt -- blorp_channel_try_recv_status_raw
+			{
+				allocates = [RuntimeOperationAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendChannelRecvTimeoutAttempt:
+			-- prepared_backend_renderer.brp: BackendChannelRecvTimeoutAttempt -- blorp_channel_recv_timeout_status_raw
+			{
+				allocates = [RuntimeOperationAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendChannelTryRecvAttemptNoReleaseMask:
+			-- prepared_backend_renderer.brp: BackendChannelTryRecvAttemptNoReleaseMask -- blorp_channel_try_recv_status_raw
+			{
+				allocates = [RuntimeOperationAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendChannelRecvTimeoutAttemptNoReleaseMask:
+			-- prepared_backend_renderer.brp: BackendChannelRecvTimeoutAttemptNoReleaseMask -- blorp_channel_recv_timeout_status_raw
+			{
+				allocates = [RuntimeOperationAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendStackOptionSomeValue:
+			-- prepared_backend_renderer.brp: BackendStackOptionSomeValue -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendStackOptionSomeVoidStatement:
+			-- prepared_backend_renderer.brp: BackendStackOptionSomeVoidStatement -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendStackOptionNone:
+			-- prepared_backend_renderer.brp: BackendStackOptionNone -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendStackOptionTaggedValue:
+			-- prepared_backend_renderer.brp: BackendStackOptionTaggedValue -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendStackOptionTaggedVoidStatement:
+			-- prepared_backend_renderer.brp: BackendStackOptionTaggedVoidStatement -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendStackOptionTaggedNone:
+			-- prepared_backend_renderer.brp: BackendStackOptionTaggedNone -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendStackResultOk:
+			-- prepared_backend_renderer.brp: BackendStackResultOk -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendStackResultErr:
+			-- prepared_backend_renderer.brp: BackendStackResultErr -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendStackResultTaggedPayload:
+			-- prepared_backend_renderer.brp: BackendStackResultTaggedPayload -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendChannelIterSourceBinding:
+			-- prepared_backend_renderer.brp: BackendChannelIterSourceBinding -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendChannelIterValueInit:
+			-- prepared_backend_renderer.brp: BackendChannelIterValueInit -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendChannelIterLoopOpen:
+			-- prepared_backend_renderer.brp: BackendChannelIterLoopOpen -- blorp_channel_recv_raw
+			{
+				allocates = [RuntimeOperationAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendChannelIterReleaseObject:
+			-- prepared_backend_renderer.brp: BackendChannelIterReleaseObject -- blorp_release
+			{
+				allocates = [],
+				retains = False,
+				releases = True,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendChannelIterHeader:
+			-- prepared_backend_renderer.brp: BackendChannelIterHeader -- blorp_channel_recv_raw
+			{
+				allocates = [RuntimeOperationAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendSelectArmsDecl:
+			-- prepared_backend_renderer.brp: BackendSelectArmsDecl -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendSelectRecvArm:
+			-- prepared_backend_renderer.brp: BackendSelectRecvArm -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendSelectSealedArm:
+			-- prepared_backend_renderer.brp: BackendSelectSealedArm -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendSelectAfterArm:
+			-- prepared_backend_renderer.brp: BackendSelectAfterArm -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendSelectWait:
+			-- prepared_backend_renderer.brp: BackendSelectWait -- blorp_select_wait
+			{
+				allocates = [RuntimeOperationAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendSelectFirstBranchOpen:
+			-- prepared_backend_renderer.brp: BackendSelectFirstBranchOpen -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendSelectNextBranchOpen:
+			-- prepared_backend_renderer.brp: BackendSelectNextBranchOpen -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendSelectCleanupFrameDecl:
+			-- prepared_backend_renderer.brp: BackendSelectCleanupFrameDecl -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendSelectCleanupPush:
+			-- prepared_backend_renderer.brp: BackendSelectCleanupPush -- blorp_task_cleanup_push_with_task
+			{
+				allocates = [RuntimeOperationAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendSelectCleanupPop:
+			-- prepared_backend_renderer.brp: BackendSelectCleanupPop -- blorp_task_cleanup_pop_slot_with_task
+			{
+				allocates = [RuntimeOperationAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendSelectReceivedValueBinding:
+			-- prepared_backend_renderer.brp: BackendSelectReceivedValueBinding -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListPointerGet:
+			-- prepared_list_renderer.brp: PointerGet -- blorp_list_get
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListInlineCheckedGet:
+			-- prepared_list_renderer.brp: InlineCheckedGet -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListInlineProvenGet:
+			-- prepared_list_renderer.brp: InlineProvenGet -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListInlineBitsLoad:
+			-- prepared_list_renderer.brp: InlineBitsLoad -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListInlineBitsStore:
+			-- prepared_list_renderer.brp: InlineBitsStore -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListPointerSetRawStore:
+			-- prepared_list_renderer.brp: PointerSetRawStore -- blorp_list_handoff_set_owned, blorp_list_set_raw
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListPointerHandoffSetOwnedStore:
+			-- prepared_list_renderer.brp: PointerHandoffSetOwnedStore -- blorp_list_handoff_set_owned, blorp_list_set_raw
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListInlineStructSetRawStore:
+			-- prepared_list_renderer.brp: InlineStructSetRawStore -- blorp_box_stack_result, blorp_box_struct, blorp_list_handoff_set_owned, blorp_list_set_raw, blorp_list_set_raw_copy
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListInlineStructHandoffSetOwnedStore:
+			-- prepared_list_renderer.brp: InlineStructHandoffSetOwnedStore -- blorp_box_stack_result, blorp_box_struct, blorp_list_handoff_set_owned, blorp_list_set_raw, blorp_list_set_raw_copy
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListPointerSwap:
+			-- prepared_list_renderer.brp: PointerSwap -- blorp_list_get, blorp_list_set_raw
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListInlineBitsSwap:
+			-- prepared_list_renderer.brp: InlineBitsSwap -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListInlineStructSwap:
+			-- prepared_list_renderer.brp: InlineStructSwap -- blorp_list_get, blorp_list_set_raw
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListInlineStructLoadChecked:
+			-- prepared_list_renderer.brp: InlineStructLoadChecked -- blorp_list_get, blorp_unbox_struct
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListInlineStructLoadProven:
+			-- prepared_list_renderer.brp: InlineStructLoadProven -- blorp_list_get, blorp_unbox_struct
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListInlineStructLoadDirect:
+			-- prepared_list_renderer.brp: InlineStructLoadDirect -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListListInlineStructUnboxListName:
+			-- prepared_list_renderer.brp: ListInlineStructUnboxListName -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListListInlineStructUnboxIndexName:
+			-- prepared_list_renderer.brp: ListInlineStructUnboxIndexName -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListListInlineStructUnboxOutName:
+			-- prepared_list_renderer.brp: ListInlineStructUnboxOutName -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListListInlineStructUnboxOpen:
+			-- prepared_list_renderer.brp: ListInlineStructUnboxOpen -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListListInlineStructUnboxClose:
+			-- prepared_list_renderer.brp: ListInlineStructUnboxClose -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListHandoffSetSourceSlot:
+			-- prepared_list_renderer.brp: HandoffSetSourceSlot -- blorp_list_handoff_set_source_slot
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListCopySpanUninit:
+			-- prepared_list_renderer.brp: CopySpanUninit -- blorp_list_copy_span_uninit
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListEnsureUnique:
+			-- prepared_list_renderer.brp: EnsureUnique -- blorp_is_unique, blorp_list_cow
+			{
+				allocates = [CowFallbackAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListEnsureCapacity:
+			-- prepared_list_renderer.brp: EnsureCapacity -- blorp_is_unique, blorp_list_ensure_capacity
+			{
+				allocates = [CapacityGrowthAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListReuseAlloc:
+			-- prepared_list_renderer.brp: ReuseAlloc -- blorp_list_reuse_alloc
+			{
+				allocates = [CapacityGrowthAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListReuseAllocWithRelease:
+			-- prepared_list_renderer.brp: ReuseAllocWithRelease -- blorp_list_init_elem_release, blorp_list_reuse_alloc
+			{
+				allocates = [CapacityGrowthAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListListAllocPointer:
+			-- prepared_list_renderer.brp: ListAllocPointer -- blorp_list_new
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListListAllocInline:
+			-- prepared_list_renderer.brp: ListAllocInline -- blorp_list_new_inline
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListListAllocInlineStruct:
+			-- prepared_list_renderer.brp: ListAllocInlineStruct -- blorp_list_new_inline
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListListAllocWithRelease:
+			-- prepared_list_renderer.brp: ListAllocWithRelease -- blorp_list_init_elem_release
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListRetainFor:
+			-- prepared_list_renderer.brp: RetainFor -- blorp_list_retain_for
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListRetainForNoop:
+			-- prepared_list_renderer.brp: RetainForNoop -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListListConstructName:
+			-- prepared_list_renderer.brp: ListConstructName -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListListConstruct:
+			-- prepared_list_renderer.brp: ListConstruct -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListListConstructInitElemRelease:
+			-- prepared_list_renderer.brp: ListConstructInitElemRelease -- blorp_list_init_elem_release
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListListConstructInlineStructSet:
+			-- prepared_list_renderer.brp: ListConstructInlineStructSet -- blorp_list_set_raw_copy
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListListConstructSetLen:
+			-- prepared_list_renderer.brp: ListConstructSetLen -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListListConstructAppend:
+			-- prepared_list_renderer.brp: ListConstructAppend -- blorp_list_append
+			{
+				allocates = [
+					ManagedObjectAllocation,
+					CowFallbackAllocation,
+					CapacityGrowthAllocation,
+				],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListListConstructAppendOwned:
+			-- prepared_list_renderer.brp: ListConstructAppendOwned -- blorp_list_append_owned
+			{
+				allocates = [
+					ManagedObjectAllocation,
+					CowFallbackAllocation,
+					CapacityGrowthAllocation,
+				],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListListHandoffCapacityName:
+			-- prepared_list_renderer.brp: ListHandoffCapacityName -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListListHandoffReuseName:
+			-- prepared_list_renderer.brp: ListHandoffReuseName -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListListHandoffReleaseName:
+			-- prepared_list_renderer.brp: ListHandoffReleaseName -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListListStorageModePointer:
+			-- prepared_list_renderer.brp: ListStorageModePointer -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListListStorageModeInline:
+			-- prepared_list_renderer.brp: ListStorageModeInline -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListListElementSizePointer:
+			-- prepared_list_renderer.brp: ListElementSizePointer -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListListElementSizeInlineStruct:
+			-- prepared_list_renderer.brp: ListElementSizeInlineStruct -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListListElementReleaseFn:
+			-- prepared_list_renderer.brp: ListElementReleaseFn -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListListElementReleaseNone:
+			-- prepared_list_renderer.brp: ListElementReleaseNone -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListListHandoffBorrowPrefix:
+			-- prepared_list_renderer.brp: ListHandoffBorrowPrefix -- blorp_list_handoff_begin_borrow
+			{
+				allocates = [CapacityGrowthAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListListHandoffReusePrefix:
+			-- prepared_list_renderer.brp: ListHandoffReusePrefix -- blorp_list_handoff_begin_reuse
+			{
+				allocates = [CapacityGrowthAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListListHandoffBorrowSuffix:
+			-- prepared_list_renderer.brp: ListHandoffBorrowSuffix -- blorp_list_handoff_finish
+			{
+				allocates = [CapacityGrowthAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListListHandoffReuseSuffix:
+			-- prepared_list_renderer.brp: ListHandoffReuseSuffix -- blorp_list_handoff_finish
+			{
+				allocates = [CapacityGrowthAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorRawViewDecl:
+			-- prepared_tensor_renderer.brp: RawViewDecl -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorRawRead:
+			-- prepared_tensor_renderer.brp: RawRead -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorRawWriteExpr:
+			-- prepared_tensor_renderer.brp: RawWriteExpr -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorRawWriteStmt:
+			-- prepared_tensor_renderer.brp: RawWriteStmt -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorWordStorageCheck:
+			-- prepared_tensor_renderer.brp: WordStorageCheck -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorF64StorageCheck:
+			-- prepared_tensor_renderer.brp: F64StorageCheck -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorF32StorageCheck:
+			-- prepared_tensor_renderer.brp: F32StorageCheck -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorI64StorageCheck:
+			-- prepared_tensor_renderer.brp: I64StorageCheck -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorStorageModePointer:
+			-- prepared_tensor_renderer.brp: TensorStorageModePointer -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorStorageModeF64:
+			-- prepared_tensor_renderer.brp: TensorStorageModeF64 -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorStorageModeF32:
+			-- prepared_tensor_renderer.brp: TensorStorageModeF32 -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorStorageModeI64:
+			-- prepared_tensor_renderer.brp: TensorStorageModeI64 -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorStorageModeInline:
+			-- prepared_tensor_renderer.brp: TensorStorageModeInline -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorElementSizePointer:
+			-- prepared_tensor_renderer.brp: TensorElementSizePointer -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorElementSizeF64:
+			-- prepared_tensor_renderer.brp: TensorElementSizeF64 -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorElementSizeF32:
+			-- prepared_tensor_renderer.brp: TensorElementSizeF32 -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorElementSizeI64:
+			-- prepared_tensor_renderer.brp: TensorElementSizeI64 -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorElementSizeInlineStruct:
+			-- prepared_tensor_renderer.brp: TensorElementSizeInlineStruct -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorCallbackResultBoxedStruct:
+			-- prepared_tensor_renderer.brp: TensorCallbackResultBoxedStruct -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorCallbackResultBoxedFloat:
+			-- prepared_tensor_renderer.brp: TensorCallbackResultBoxedFloat -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorCallbackResultBoxedFloat32:
+			-- prepared_tensor_renderer.brp: TensorCallbackResultBoxedFloat32 -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorCallbackResultBits:
+			-- prepared_tensor_renderer.brp: TensorCallbackResultBits -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorDataPointerGetUnchecked:
+			-- prepared_tensor_renderer.brp: DataPointerGetUnchecked -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorInlineStructGetUnchecked:
+			-- prepared_tensor_renderer.brp: InlineStructGetUnchecked -- blorp_unbox_struct
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorInlineStructElementDecl:
+			-- prepared_tensor_renderer.brp: InlineStructElementDecl -- blorp_unbox_struct
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorInlineStructGetChecked:
+			-- prepared_tensor_renderer.brp: InlineStructGetChecked -- blorp_unbox_struct
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorInlineStructMatrixGetChecked:
+			-- prepared_tensor_renderer.brp: InlineStructMatrixGetChecked -- blorp_unbox_struct
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorStackOptionVectorValueRecordGet:
+			-- prepared_tensor_renderer.brp: StackOptionVectorValueRecordGet -- blorp_unbox_struct
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorStackOptionVectorLongGet:
+			-- prepared_tensor_renderer.brp: StackOptionVectorLongGet -- blorp_vector_read_i64
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorStackOptionVectorInt128Get:
+			-- prepared_tensor_renderer.brp: StackOptionVectorInt128Get -- blorp_unbox_int128
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorStackOptionVectorUInt128Get:
+			-- prepared_tensor_renderer.brp: StackOptionVectorUInt128Get -- blorp_unbox_uint128
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorStackOptionMatrixValueRecordGet:
+			-- prepared_tensor_renderer.brp: StackOptionMatrixValueRecordGet -- blorp_unbox_struct
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorStackOptionMatrixLongGet:
+			-- prepared_tensor_renderer.brp: StackOptionMatrixLongGet -- blorp_vector_read_i64
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorStackOptionMatrixInt128Get:
+			-- prepared_tensor_renderer.brp: StackOptionMatrixInt128Get -- blorp_unbox_int128
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorStackOptionMatrixUInt128Get:
+			-- prepared_tensor_renderer.brp: StackOptionMatrixUInt128Get -- blorp_unbox_uint128
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorF64RawGetUnchecked:
+			-- prepared_tensor_renderer.brp: F64RawGetUnchecked -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorF32RawGetUnchecked:
+			-- prepared_tensor_renderer.brp: F32RawGetUnchecked -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorAllocPointer:
+			-- prepared_tensor_renderer.brp: TensorAllocPointer -- blorp_vector_new
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorAllocI64:
+			-- prepared_tensor_renderer.brp: TensorAllocI64 -- blorp_vector_new_i64
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorAllocF64:
+			-- prepared_tensor_renderer.brp: TensorAllocF64 -- blorp_vector_new_f64
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorAllocF32:
+			-- prepared_tensor_renderer.brp: TensorAllocF32 -- blorp_vector_new_f32
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorAllocPacked:
+			-- prepared_tensor_renderer.brp: TensorAllocPacked -- blorp_vector_new_packed
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorAllocSized:
+			-- prepared_tensor_renderer.brp: TensorAllocSized -- blorp_vector_new_sized
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorAllocWithRelease:
+			-- prepared_tensor_renderer.brp: TensorAllocWithRelease -- blorp_vector_init_elem_release
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorFillInlineStruct:
+			-- prepared_tensor_renderer.brp: TensorFillInlineStruct -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorFillBoxed:
+			-- prepared_tensor_renderer.brp: TensorFillBoxed -- blorp_vector_set_elem_release
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorFillBoxedReleaseValue:
+			-- prepared_tensor_renderer.brp: TensorFillBoxedReleaseValue -- blorp_release, blorp_vector_set_elem_release
+			{
+				allocates = [],
+				retains = False,
+				releases = True,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorFillDimName:
+			-- prepared_tensor_renderer.brp: TensorFillDimName -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorFillTotalName:
+			-- prepared_tensor_renderer.brp: TensorFillTotalName -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorFillDimBind:
+			-- prepared_tensor_renderer.brp: TensorFillDimBind -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorFillDimArg:
+			-- prepared_tensor_renderer.brp: TensorFillDimArg -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorFillProductExpr:
+			-- prepared_tensor_renderer.brp: TensorFillProductExpr -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorFillRawScalar:
+			-- prepared_tensor_renderer.brp: TensorFillRawScalar -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorFillPacked:
+			-- prepared_tensor_renderer.brp: TensorFillPacked -- blorp_packed_set
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorInitElemRelease:
+			-- prepared_tensor_renderer.brp: TensorInitElemRelease -- blorp_vector_init_elem_release
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorRankedAllocPointer:
+			-- prepared_tensor_renderer.brp: TensorRankedAllocPointer -- blorp_tensor_new
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorRankedAllocI64:
+			-- prepared_tensor_renderer.brp: TensorRankedAllocI64 -- blorp_tensor_new_i64
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorRankedAllocF64:
+			-- prepared_tensor_renderer.brp: TensorRankedAllocF64 -- blorp_tensor_new_f64
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorRankedAllocF32:
+			-- prepared_tensor_renderer.brp: TensorRankedAllocF32 -- blorp_tensor_new_f32
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorRankedAllocPacked:
+			-- prepared_tensor_renderer.brp: TensorRankedAllocPacked -- blorp_tensor_new_packed
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorRankedAllocSized:
+			-- prepared_tensor_renderer.brp: TensorRankedAllocSized -- blorp_tensor_new_sized
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorLiteralName:
+			-- prepared_tensor_renderer.brp: TensorLiteralName -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorLiteralConstruct:
+			-- prepared_tensor_renderer.brp: TensorLiteralConstruct -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorLiteralF32Write:
+			-- prepared_tensor_renderer.brp: TensorLiteralF32Write -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorLiteralF64Write:
+			-- prepared_tensor_renderer.brp: TensorLiteralF64Write -- blorp_vector_write_f64
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorLiteralI64Write:
+			-- prepared_tensor_renderer.brp: TensorLiteralI64Write -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorLiteralWordWrite:
+			-- prepared_tensor_renderer.brp: TensorLiteralWordWrite -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorLiteralPackedWrite:
+			-- prepared_tensor_renderer.brp: TensorLiteralPackedWrite -- blorp_packed_set
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorLiteralInlineStructWrite:
+			-- prepared_tensor_renderer.brp: TensorLiteralInlineStructWrite -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorLiteralBoxedWrite:
+			-- prepared_tensor_renderer.brp: TensorLiteralBoxedWrite -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorLiteralBoxedOwnedWrite:
+			-- prepared_tensor_renderer.brp: TensorLiteralBoxedOwnedWrite -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TensorTensorLiteralBoxedBorrowedWrite:
+			-- prepared_tensor_renderer.brp: TensorLiteralBoxedBorrowedWrite -- blorp_retain
+			{
+				allocates = [],
+				retains = True,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TupleTupleName:
+			-- prepared_tuple_renderer.brp: TupleName -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TupleTupleArg:
+			-- prepared_tuple_renderer.brp: TupleArg -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TupleTupleConstruct:
+			-- prepared_tuple_renderer.brp: TupleConstruct -- blorp_tuple_new
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TupleTupleRetainElem:
+			-- prepared_tuple_renderer.brp: TupleRetainElem -- blorp_retain
+			{
+				allocates = [],
+				retains = True,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TupleTupleConstructWithRc:
+			-- prepared_tuple_renderer.brp: TupleConstructWithRc -- blorp_tuple_new, blorp_tuple_set_rc
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TupleTupleFieldElement:
+			-- prepared_tuple_renderer.brp: TupleFieldElement -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		TupleTupleFieldAccess:
+			-- prepared_tuple_renderer.brp: TupleFieldAccess -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathInfinity:
+			-- intrinsic_renderer.brp NoArgIntrinsic: MathInfinity -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathNegInfinity:
+			-- intrinsic_renderer.brp NoArgIntrinsic: MathNegInfinity -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathNan:
+			-- intrinsic_renderer.brp NoArgIntrinsic: MathNan -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicElemReleaseFn:
+			-- intrinsic_renderer.brp NoArgIntrinsic: ElemReleaseFn -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathSin:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MathSin -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathCos:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MathCos -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathTan:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MathTan -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathAsin:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MathAsin -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathAcos:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MathAcos -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathAtan:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MathAtan -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathSinh:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MathSinh -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathCosh:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MathCosh -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathTanh:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MathTanh -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathAsinh:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MathAsinh -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathAcosh:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MathAcosh -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathAtanh:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MathAtanh -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathExp:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MathExp -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathExp2:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MathExp2 -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathExpm1:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MathExpm1 -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathLog:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MathLog -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathLog2:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MathLog2 -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathLog10:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MathLog10 -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathLog1p:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MathLog1p -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathSqrt:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MathSqrt -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathCbrt:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MathCbrt -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathFloor:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MathFloor -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathCeil:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MathCeil -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathRound:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MathRound -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathTrunc:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MathTrunc -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathIsNan:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MathIsNan -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathIsInf:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MathIsInf -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathIsFinite:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MathIsFinite -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicBitNot:
+			-- intrinsic_renderer.brp OneArgIntrinsic: BitNot -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicListLen:
+			-- intrinsic_renderer.brp OneArgIntrinsic: ListLen -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicListCapacity:
+			-- intrinsic_renderer.brp OneArgIntrinsic: ListCapacity -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicStringLen:
+			-- intrinsic_renderer.brp OneArgIntrinsic: StringLen -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicBytesLen:
+			-- intrinsic_renderer.brp OneArgIntrinsic: BytesLen -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicDictLen:
+			-- intrinsic_renderer.brp OneArgIntrinsic: DictLen -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicSetLen:
+			-- intrinsic_renderer.brp OneArgIntrinsic: SetLen -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicSetCapacity:
+			-- intrinsic_renderer.brp OneArgIntrinsic: SetCapacity -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicSetMask:
+			-- intrinsic_renderer.brp OneArgIntrinsic: SetMask -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicSetFirst:
+			-- intrinsic_renderer.brp OneArgIntrinsic: SetFirst -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicSetLast:
+			-- intrinsic_renderer.brp OneArgIntrinsic: SetLast -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicSetEntryKey:
+			-- intrinsic_renderer.brp OneArgIntrinsic: SetEntryKey -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicSetEntryNext:
+			-- intrinsic_renderer.brp OneArgIntrinsic: SetEntryNext -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicSetEntryPrevOrder:
+			-- intrinsic_renderer.brp OneArgIntrinsic: SetEntryPrevOrder -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicSetEntryNextOrder:
+			-- intrinsic_renderer.brp OneArgIntrinsic: SetEntryNextOrder -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicDictCapacity:
+			-- intrinsic_renderer.brp OneArgIntrinsic: DictCapacity -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicDictMask:
+			-- intrinsic_renderer.brp OneArgIntrinsic: DictMask -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicDictGrowAt:
+			-- intrinsic_renderer.brp OneArgIntrinsic: DictGrowAt -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicDictOrderLen:
+			-- intrinsic_renderer.brp OneArgIntrinsic: DictOrderLen -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicDictKeyReleaseFn:
+			-- intrinsic_renderer.brp OneArgIntrinsic: DictKeyReleaseFn -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicDictValueReleaseFn:
+			-- intrinsic_renderer.brp OneArgIntrinsic: DictValueReleaseFn -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicSliceSource:
+			-- intrinsic_renderer.brp OneArgIntrinsic: SliceSource -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicSliceStart:
+			-- intrinsic_renderer.brp OneArgIntrinsic: SliceStart -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicSliceLen:
+			-- intrinsic_renderer.brp OneArgIntrinsic: SliceLen -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMemoryIsUniqueStack:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MemoryIsUniqueStack -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMemoryRefcountHeap:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MemoryRefcountHeap -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMemoryRefcountStack:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MemoryRefcountStack -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMemorySizeOfHeap:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MemorySizeOfHeap -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMemorySizeOfStack:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MemorySizeOfStack -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicTensorLen:
+			-- intrinsic_renderer.brp OneArgIntrinsic: TensorLen -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicTensorCapacity:
+			-- intrinsic_renderer.brp OneArgIntrinsic: TensorCapacity -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicFixedValue:
+			-- intrinsic_renderer.brp OneArgIntrinsic: FixedValue -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicFixedScale:
+			-- intrinsic_renderer.brp OneArgIntrinsic: FixedScale -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicFixedPrecision:
+			-- intrinsic_renderer.brp OneArgIntrinsic: FixedPrecision -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicListReverseOwned:
+			-- intrinsic_renderer.brp OneArgIntrinsic: ListReverseOwned -- blorp_list_reverse_owned
+			{
+				allocates = [CowFallbackAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicStringAlloc:
+			-- intrinsic_renderer.brp OneArgIntrinsic: StringAlloc -- blorp_string_alloc
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicStringEnsureUnique:
+			-- intrinsic_renderer.brp OneArgIntrinsic: StringEnsureUnique -- blorp_string_cow
+			{
+				allocates = [CowFallbackAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicBytesAlloc:
+			-- intrinsic_renderer.brp OneArgIntrinsic: BytesAlloc -- blorp_bytes_alloc
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicBytesCow:
+			-- intrinsic_renderer.brp OneArgIntrinsic: BytesCow -- blorp_bytes_cow
+			{
+				allocates = [CowFallbackAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicSetHashImmediate:
+			-- intrinsic_renderer.brp OneArgIntrinsic: SetHashImmediate -- blorp_hash_int
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicSetAlloc:
+			-- intrinsic_renderer.brp OneArgIntrinsic: SetAlloc -- blorp_set_alloc
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicSetAllocEntry:
+			-- intrinsic_renderer.brp OneArgIntrinsic: SetAllocEntry -- blorp_set_alloc_entry
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicSetCow:
+			-- intrinsic_renderer.brp OneArgIntrinsic: SetCow -- blorp_set_cow
+			{
+				allocates = [CowFallbackAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicDictHashImmediate:
+			-- intrinsic_renderer.brp OneArgIntrinsic: DictHashImmediate -- blorp_hash_int
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicDictAlloc:
+			-- intrinsic_renderer.brp OneArgIntrinsic: DictAlloc -- blorp_dict_alloc
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicDictCow:
+			-- intrinsic_renderer.brp OneArgIntrinsic: DictCow -- blorp_dict_cow
+			{
+				allocates = [CowFallbackAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMemoryIsUniqueHeap:
+			-- intrinsic_renderer.brp OneArgIntrinsic: MemoryIsUniqueHeap -- blorp_is_unique
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicTensorIsUnique:
+			-- intrinsic_renderer.brp OneArgIntrinsic: TensorIsUnique -- blorp_is_unique
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicFixedPow10:
+			-- intrinsic_renderer.brp OneArgIntrinsic: FixedPow10 -- blorp_pow10
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathPow:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: MathPow -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathAtan2:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: MathAtan2 -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathHypot:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: MathHypot -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathFmod:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: MathFmod -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathCopysign:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: MathCopysign -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicBitAnd:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: BitAnd -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicBitOr:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: BitOr -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicBitXor:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: BitXor -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicShiftLeft:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: ShiftLeft -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicShiftRight:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: ShiftRight -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicListSetLen:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: ListSetLen -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicListSetElemRelease:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: ListSetElemRelease -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicStringGetByte:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: StringGetByte -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicBytesGet:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: BytesGet -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicBytesSetLen:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: BytesSetLen -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicSetBucket:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: SetBucket -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicSetSetLen:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: SetSetLen -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicSetSetFirst:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: SetSetFirst -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicSetSetLast:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: SetSetLast -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicSetEntrySetNext:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: SetEntrySetNext -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicSetEntrySetPrevOrder:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: SetEntrySetPrevOrder -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicSetEntrySetNextOrder:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: SetEntrySetNextOrder -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicSetEqImmediate:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: SetEqImmediate -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicDictKeyAt:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: DictKeyAt -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicDictValueAt:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: DictValueAt -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicDictMetaGet:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: DictMetaGet -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicDictOrderGet:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: DictOrderGet -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicDictOrderIndexGet:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: DictOrderIndexGet -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicDictSetLen:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: DictSetLen -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicDictSetOrderLen:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: DictSetOrderLen -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicDictEqImmediate:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: DictEqImmediate -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicTensorGetI64WordUnchecked:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: TensorGetI64WordUnchecked -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicTensorGetI64RawUnchecked:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: TensorGetI64RawUnchecked -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMemorySameObjectStack:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: MemorySameObjectStack -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicListGet:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: ListGet -- blorp_list_get
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicListReleaseElem:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: ListReleaseElem -- blorp_list_release_elem
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicStringEnsureCapacity:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: StringEnsureCapacity -- blorp_string_ensure_capacity
+			{
+				allocates = [CapacityGrowthAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicSetHash:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: SetHash -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = True,
+				cleanup_scratch = False
+			}
+		IntrinsicSetRetainKeyFor:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: SetRetainKeyFor -- blorp_retain
+			{
+				allocates = [],
+				retains = True,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicSetFreeEntry:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: SetFreeEntry -- blorp_set_free_entry
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicSetReuseAlloc:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: SetReuseAlloc -- blorp_set_reuse_alloc
+			{
+				allocates = [CapacityGrowthAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicSetResize:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: SetResize -- blorp_set_resize_to
+			{
+				allocates = [CapacityGrowthAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = True,
+				cleanup_scratch = False
+			}
+		IntrinsicSetReserveForLen:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: SetReserveForLen -- blorp_set_reserve_for_len
+			{
+				allocates = [CapacityGrowthAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicDictHash:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: DictHash -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = True,
+				cleanup_scratch = False
+			}
+		IntrinsicDictRetainKeyFor:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: DictRetainKeyFor -- blorp_retain
+			{
+				allocates = [],
+				retains = True,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicDictRetainValueFor:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: DictRetainValueFor -- blorp_retain
+			{
+				allocates = [],
+				retains = True,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicDictReleaseValueFor:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: DictReleaseValueFor -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = True,
+				calls_user_code = True,
+				cleanup_scratch = False
+			}
+		IntrinsicDictReuseAlloc:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: DictReuseAlloc -- blorp_dict_reuse_alloc
+			{
+				allocates = [CapacityGrowthAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = True,
+				cleanup_scratch = False
+			}
+		IntrinsicDictResize:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: DictResize -- blorp_dict_resize_to
+			{
+				allocates = [CapacityGrowthAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = True,
+				cleanup_scratch = False
+			}
+		IntrinsicTensorGetF64:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: TensorGetF64 -- blorp_vector_read_f64
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicTensorGetF32:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: TensorGetF32 -- blorp_vector_read_f32
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicTensorGetF16:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: TensorGetF16 -- blorp_vector_read_f16
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicTensorGetI64:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: TensorGetI64 -- blorp_vector_read_i64
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMemorySameObjectHeap:
+			-- intrinsic_renderer.brp TwoArgIntrinsic: MemorySameObjectHeap -- blorp_same_object
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicMathFma:
+			-- intrinsic_renderer.brp ThreeArgIntrinsic: MathFma -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicStringSetByte:
+			-- intrinsic_renderer.brp ThreeArgIntrinsic: StringSetByte -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicBytesSet:
+			-- intrinsic_renderer.brp ThreeArgIntrinsic: BytesSet -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicSetSetBucket:
+			-- intrinsic_renderer.brp ThreeArgIntrinsic: SetSetBucket -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicDictSetKeyAt:
+			-- intrinsic_renderer.brp ThreeArgIntrinsic: DictSetKeyAt -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicDictSetValueAt:
+			-- intrinsic_renderer.brp ThreeArgIntrinsic: DictSetValueAt -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicDictMetaSet:
+			-- intrinsic_renderer.brp ThreeArgIntrinsic: DictMetaSet -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicDictOrderSet:
+			-- intrinsic_renderer.brp ThreeArgIntrinsic: DictOrderSet -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicDictOrderIndexSet:
+			-- intrinsic_renderer.brp ThreeArgIntrinsic: DictOrderIndexSet -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicStringFindByteFrom:
+			-- intrinsic_renderer.brp ThreeArgIntrinsic: StringFindByteFrom -- blorp_string_find_byte_from
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicSetEq:
+			-- intrinsic_renderer.brp ThreeArgIntrinsic: SetEq -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = True,
+				cleanup_scratch = False
+			}
+		IntrinsicDictEq:
+			-- intrinsic_renderer.brp ThreeArgIntrinsic: DictEq -- no runtime call (pure C template over already-materialized values)
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = True,
+				cleanup_scratch = False
+			}
+		IntrinsicSliceAlloc:
+			-- intrinsic_renderer.brp ThreeArgIntrinsic: SliceAlloc -- blorp_slice_alloc
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicTensorSetF64:
+			-- intrinsic_renderer.brp ThreeArgIntrinsic: TensorSetF64 -- blorp_vector_write_f64
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicTensorSetF32:
+			-- intrinsic_renderer.brp ThreeArgIntrinsic: TensorSetF32 -- blorp_vector_write_f32
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicTensorSetF16:
+			-- intrinsic_renderer.brp ThreeArgIntrinsic: TensorSetF16 -- blorp_vector_write_f16
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicTensorSetI64:
+			-- intrinsic_renderer.brp ThreeArgIntrinsic: TensorSetI64 -- blorp_vector_write_i64
+			{
+				allocates = [],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		IntrinsicFixedAlloc:
+			-- intrinsic_renderer.brp ThreeArgIntrinsic: FixedAlloc -- blorp_fixed_raw
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+
+
+-- Every BackendHelperKind variant, in declaration order. A coverage test
+-- iterates this list and calls backend_helper_contract on each; the list's
+-- length is checked against BACKEND_HELPER_KIND_COUNT so an added variant
+-- that is missing here (as opposed to missing a match arm, which fails to
+-- compile) still fails the test instead of silently under-counting.
+ALL_BACKEND_HELPER_KINDS: List[BackendHelperKind] = [
+	BackendDictCtorGeneric,
+	BackendDictCtorString,
+	BackendDictCtorFloat,
+	BackendDictCtorCustomNoElemRelease,
+	BackendDictCtorCustomWithElemRelease,
+	BackendDictStackOptionValueRecordGetKeepKey,
+	BackendDictStackOptionValueRecordGetReleaseKey,
+	BackendDictStackOptionLongGetKeepKey,
+	BackendDictStackOptionLongGetReleaseKey,
+	BackendDictStackOptionInt128GetKeepKey,
+	BackendDictStackOptionInt128GetReleaseKey,
+	BackendDictStackOptionUInt128GetKeepKey,
+	BackendDictStackOptionUInt128GetReleaseKey,
+	BackendDictConstructEmpty,
+	BackendDictValueReleaseInit,
+	BackendDictInsert,
+	BackendDictIterSourceBinding,
+	BackendDictIterLoopOpen,
+	BackendDictIterHeader,
+	BackendDictIterSlotBinding,
+	BackendDictIterDeletedSlotGuard,
+	BackendDictIterKeyBinding,
+	BackendDictIterPairBinding,
+	BackendDictConstructWithBody,
+	BackendSetCtorGeneric,
+	BackendSetCtorString,
+	BackendSetCtorFloat,
+	BackendSetCtorCustomNoElemRelease,
+	BackendSetCtorCustomWithElemRelease,
+	BackendSetIterSourceBinding,
+	BackendSetIterRetain,
+	BackendSetIterLoopOpen,
+	BackendSetIterEntryKey,
+	BackendSetIterRelease,
+	BackendSetIterHeader,
+	BackendStringFindByteFrom,
+	BackendStringByteRead,
+	BackendStringByteWrite,
+	BackendStringByteCopy,
+	BackendStringSetLen,
+	BackendStringIterSourceBinding,
+	BackendStringIterLoopOpen,
+	BackendStringIterCodepointBinding,
+	BackendStringIterHeader,
+	BackendFlatIterSourceBinding,
+	BackendFlatIterLengthBinding,
+	BackendFlatIterLoopOpen,
+	BackendFlatIterLoopHeader,
+	BackendFlatIterRawDataBinding,
+	BackendFlatIterRawValueBinding,
+	BackendDictWithCapacityGeneric,
+	BackendDictWithCapacityString,
+	BackendDictWithCapacityFloat,
+	BackendDictWithCapacityCustomNoElemRelease,
+	BackendDictWithCapacityCustomWithElemRelease,
+	BackendChannelWithElemRelease,
+	BackendChannelRetainingSendSend,
+	BackendChannelRetainingSendTrySend,
+	BackendChannelRetainingSendTrySendStatus,
+	BackendChannelRetainingSendWithTimeoutSendTimeout,
+	BackendChannelRetainingSendWithTimeoutSendTimeoutStatus,
+	BackendChannelTrySendAttempt,
+	BackendChannelTrySendAttemptRetainedValue,
+	BackendChannelSendTimeoutAttempt,
+	BackendChannelSendTimeoutAttemptRetainedValue,
+	BackendChannelTryRecvAttempt,
+	BackendChannelRecvTimeoutAttempt,
+	BackendChannelTryRecvAttemptNoReleaseMask,
+	BackendChannelRecvTimeoutAttemptNoReleaseMask,
+	BackendStackOptionSomeValue,
+	BackendStackOptionSomeVoidStatement,
+	BackendStackOptionNone,
+	BackendStackOptionTaggedValue,
+	BackendStackOptionTaggedVoidStatement,
+	BackendStackOptionTaggedNone,
+	BackendStackResultOk,
+	BackendStackResultErr,
+	BackendStackResultTaggedPayload,
+	BackendChannelIterSourceBinding,
+	BackendChannelIterValueInit,
+	BackendChannelIterLoopOpen,
+	BackendChannelIterReleaseObject,
+	BackendChannelIterHeader,
+	BackendSelectArmsDecl,
+	BackendSelectRecvArm,
+	BackendSelectSealedArm,
+	BackendSelectAfterArm,
+	BackendSelectWait,
+	BackendSelectFirstBranchOpen,
+	BackendSelectNextBranchOpen,
+	BackendSelectCleanupFrameDecl,
+	BackendSelectCleanupPush,
+	BackendSelectCleanupPop,
+	BackendSelectReceivedValueBinding,
+	ListPointerGet,
+	ListInlineCheckedGet,
+	ListInlineProvenGet,
+	ListInlineBitsLoad,
+	ListInlineBitsStore,
+	ListPointerSetRawStore,
+	ListPointerHandoffSetOwnedStore,
+	ListInlineStructSetRawStore,
+	ListInlineStructHandoffSetOwnedStore,
+	ListPointerSwap,
+	ListInlineBitsSwap,
+	ListInlineStructSwap,
+	ListInlineStructLoadChecked,
+	ListInlineStructLoadProven,
+	ListInlineStructLoadDirect,
+	ListListInlineStructUnboxListName,
+	ListListInlineStructUnboxIndexName,
+	ListListInlineStructUnboxOutName,
+	ListListInlineStructUnboxOpen,
+	ListListInlineStructUnboxClose,
+	ListHandoffSetSourceSlot,
+	ListCopySpanUninit,
+	ListEnsureUnique,
+	ListEnsureCapacity,
+	ListReuseAlloc,
+	ListReuseAllocWithRelease,
+	ListListAllocPointer,
+	ListListAllocInline,
+	ListListAllocInlineStruct,
+	ListListAllocWithRelease,
+	ListRetainFor,
+	ListRetainForNoop,
+	ListListConstructName,
+	ListListConstruct,
+	ListListConstructInitElemRelease,
+	ListListConstructInlineStructSet,
+	ListListConstructSetLen,
+	ListListConstructAppend,
+	ListListConstructAppendOwned,
+	ListListHandoffCapacityName,
+	ListListHandoffReuseName,
+	ListListHandoffReleaseName,
+	ListListStorageModePointer,
+	ListListStorageModeInline,
+	ListListElementSizePointer,
+	ListListElementSizeInlineStruct,
+	ListListElementReleaseFn,
+	ListListElementReleaseNone,
+	ListListHandoffBorrowPrefix,
+	ListListHandoffReusePrefix,
+	ListListHandoffBorrowSuffix,
+	ListListHandoffReuseSuffix,
+	TensorRawViewDecl,
+	TensorRawRead,
+	TensorRawWriteExpr,
+	TensorRawWriteStmt,
+	TensorWordStorageCheck,
+	TensorF64StorageCheck,
+	TensorF32StorageCheck,
+	TensorI64StorageCheck,
+	TensorTensorStorageModePointer,
+	TensorTensorStorageModeF64,
+	TensorTensorStorageModeF32,
+	TensorTensorStorageModeI64,
+	TensorTensorStorageModeInline,
+	TensorTensorElementSizePointer,
+	TensorTensorElementSizeF64,
+	TensorTensorElementSizeF32,
+	TensorTensorElementSizeI64,
+	TensorTensorElementSizeInlineStruct,
+	TensorTensorCallbackResultBoxedStruct,
+	TensorTensorCallbackResultBoxedFloat,
+	TensorTensorCallbackResultBoxedFloat32,
+	TensorTensorCallbackResultBits,
+	TensorDataPointerGetUnchecked,
+	TensorInlineStructGetUnchecked,
+	TensorInlineStructElementDecl,
+	TensorInlineStructGetChecked,
+	TensorInlineStructMatrixGetChecked,
+	TensorStackOptionVectorValueRecordGet,
+	TensorStackOptionVectorLongGet,
+	TensorStackOptionVectorInt128Get,
+	TensorStackOptionVectorUInt128Get,
+	TensorStackOptionMatrixValueRecordGet,
+	TensorStackOptionMatrixLongGet,
+	TensorStackOptionMatrixInt128Get,
+	TensorStackOptionMatrixUInt128Get,
+	TensorF64RawGetUnchecked,
+	TensorF32RawGetUnchecked,
+	TensorTensorAllocPointer,
+	TensorTensorAllocI64,
+	TensorTensorAllocF64,
+	TensorTensorAllocF32,
+	TensorTensorAllocPacked,
+	TensorTensorAllocSized,
+	TensorTensorAllocWithRelease,
+	TensorTensorFillInlineStruct,
+	TensorTensorFillBoxed,
+	TensorTensorFillBoxedReleaseValue,
+	TensorTensorFillDimName,
+	TensorTensorFillTotalName,
+	TensorTensorFillDimBind,
+	TensorTensorFillDimArg,
+	TensorTensorFillProductExpr,
+	TensorTensorFillRawScalar,
+	TensorTensorFillPacked,
+	TensorTensorInitElemRelease,
+	TensorTensorRankedAllocPointer,
+	TensorTensorRankedAllocI64,
+	TensorTensorRankedAllocF64,
+	TensorTensorRankedAllocF32,
+	TensorTensorRankedAllocPacked,
+	TensorTensorRankedAllocSized,
+	TensorTensorLiteralName,
+	TensorTensorLiteralConstruct,
+	TensorTensorLiteralF32Write,
+	TensorTensorLiteralF64Write,
+	TensorTensorLiteralI64Write,
+	TensorTensorLiteralWordWrite,
+	TensorTensorLiteralPackedWrite,
+	TensorTensorLiteralInlineStructWrite,
+	TensorTensorLiteralBoxedWrite,
+	TensorTensorLiteralBoxedOwnedWrite,
+	TensorTensorLiteralBoxedBorrowedWrite,
+	TupleTupleName,
+	TupleTupleArg,
+	TupleTupleConstruct,
+	TupleTupleRetainElem,
+	TupleTupleConstructWithRc,
+	TupleTupleFieldElement,
+	TupleTupleFieldAccess,
+	IntrinsicMathInfinity,
+	IntrinsicMathNegInfinity,
+	IntrinsicMathNan,
+	IntrinsicElemReleaseFn,
+	IntrinsicMathSin,
+	IntrinsicMathCos,
+	IntrinsicMathTan,
+	IntrinsicMathAsin,
+	IntrinsicMathAcos,
+	IntrinsicMathAtan,
+	IntrinsicMathSinh,
+	IntrinsicMathCosh,
+	IntrinsicMathTanh,
+	IntrinsicMathAsinh,
+	IntrinsicMathAcosh,
+	IntrinsicMathAtanh,
+	IntrinsicMathExp,
+	IntrinsicMathExp2,
+	IntrinsicMathExpm1,
+	IntrinsicMathLog,
+	IntrinsicMathLog2,
+	IntrinsicMathLog10,
+	IntrinsicMathLog1p,
+	IntrinsicMathSqrt,
+	IntrinsicMathCbrt,
+	IntrinsicMathFloor,
+	IntrinsicMathCeil,
+	IntrinsicMathRound,
+	IntrinsicMathTrunc,
+	IntrinsicMathIsNan,
+	IntrinsicMathIsInf,
+	IntrinsicMathIsFinite,
+	IntrinsicBitNot,
+	IntrinsicListLen,
+	IntrinsicListCapacity,
+	IntrinsicStringLen,
+	IntrinsicBytesLen,
+	IntrinsicDictLen,
+	IntrinsicSetLen,
+	IntrinsicSetCapacity,
+	IntrinsicSetMask,
+	IntrinsicSetFirst,
+	IntrinsicSetLast,
+	IntrinsicSetEntryKey,
+	IntrinsicSetEntryNext,
+	IntrinsicSetEntryPrevOrder,
+	IntrinsicSetEntryNextOrder,
+	IntrinsicDictCapacity,
+	IntrinsicDictMask,
+	IntrinsicDictGrowAt,
+	IntrinsicDictOrderLen,
+	IntrinsicDictKeyReleaseFn,
+	IntrinsicDictValueReleaseFn,
+	IntrinsicSliceSource,
+	IntrinsicSliceStart,
+	IntrinsicSliceLen,
+	IntrinsicMemoryIsUniqueStack,
+	IntrinsicMemoryRefcountHeap,
+	IntrinsicMemoryRefcountStack,
+	IntrinsicMemorySizeOfHeap,
+	IntrinsicMemorySizeOfStack,
+	IntrinsicTensorLen,
+	IntrinsicTensorCapacity,
+	IntrinsicFixedValue,
+	IntrinsicFixedScale,
+	IntrinsicFixedPrecision,
+	IntrinsicListReverseOwned,
+	IntrinsicStringAlloc,
+	IntrinsicStringEnsureUnique,
+	IntrinsicBytesAlloc,
+	IntrinsicBytesCow,
+	IntrinsicSetHashImmediate,
+	IntrinsicSetAlloc,
+	IntrinsicSetAllocEntry,
+	IntrinsicSetCow,
+	IntrinsicDictHashImmediate,
+	IntrinsicDictAlloc,
+	IntrinsicDictCow,
+	IntrinsicMemoryIsUniqueHeap,
+	IntrinsicTensorIsUnique,
+	IntrinsicFixedPow10,
+	IntrinsicMathPow,
+	IntrinsicMathAtan2,
+	IntrinsicMathHypot,
+	IntrinsicMathFmod,
+	IntrinsicMathCopysign,
+	IntrinsicBitAnd,
+	IntrinsicBitOr,
+	IntrinsicBitXor,
+	IntrinsicShiftLeft,
+	IntrinsicShiftRight,
+	IntrinsicListSetLen,
+	IntrinsicListSetElemRelease,
+	IntrinsicStringGetByte,
+	IntrinsicBytesGet,
+	IntrinsicBytesSetLen,
+	IntrinsicSetBucket,
+	IntrinsicSetSetLen,
+	IntrinsicSetSetFirst,
+	IntrinsicSetSetLast,
+	IntrinsicSetEntrySetNext,
+	IntrinsicSetEntrySetPrevOrder,
+	IntrinsicSetEntrySetNextOrder,
+	IntrinsicSetEqImmediate,
+	IntrinsicDictKeyAt,
+	IntrinsicDictValueAt,
+	IntrinsicDictMetaGet,
+	IntrinsicDictOrderGet,
+	IntrinsicDictOrderIndexGet,
+	IntrinsicDictSetLen,
+	IntrinsicDictSetOrderLen,
+	IntrinsicDictEqImmediate,
+	IntrinsicTensorGetI64WordUnchecked,
+	IntrinsicTensorGetI64RawUnchecked,
+	IntrinsicMemorySameObjectStack,
+	IntrinsicListGet,
+	IntrinsicListReleaseElem,
+	IntrinsicStringEnsureCapacity,
+	IntrinsicSetHash,
+	IntrinsicSetRetainKeyFor,
+	IntrinsicSetFreeEntry,
+	IntrinsicSetReuseAlloc,
+	IntrinsicSetResize,
+	IntrinsicSetReserveForLen,
+	IntrinsicDictHash,
+	IntrinsicDictRetainKeyFor,
+	IntrinsicDictRetainValueFor,
+	IntrinsicDictReleaseValueFor,
+	IntrinsicDictReuseAlloc,
+	IntrinsicDictResize,
+	IntrinsicTensorGetF64,
+	IntrinsicTensorGetF32,
+	IntrinsicTensorGetF16,
+	IntrinsicTensorGetI64,
+	IntrinsicMemorySameObjectHeap,
+	IntrinsicMathFma,
+	IntrinsicStringSetByte,
+	IntrinsicBytesSet,
+	IntrinsicSetSetBucket,
+	IntrinsicDictSetKeyAt,
+	IntrinsicDictSetValueAt,
+	IntrinsicDictMetaSet,
+	IntrinsicDictOrderSet,
+	IntrinsicDictOrderIndexSet,
+	IntrinsicStringFindByteFrom,
+	IntrinsicSetEq,
+	IntrinsicDictEq,
+	IntrinsicSliceAlloc,
+	IntrinsicTensorSetF64,
+	IntrinsicTensorSetF32,
+	IntrinsicTensorSetF16,
+	IntrinsicTensorSetI64,
+	IntrinsicFixedAlloc,
+]
