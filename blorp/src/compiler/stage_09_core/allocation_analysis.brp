@@ -22,6 +22,7 @@ import:
 		CoreLocalAllocationFacts,
 		UnionCleanupPlan,
 		core_expr_allocation_contract,
+		core_expr_operation_detail,
 		merge_allocation_facts,
 		union_cleanup_plan,
 	ir:
@@ -79,7 +80,11 @@ record AllocationSite {
 	loc: CoreSourceLoc,
 	category: AllocationOperationCategory,
 	facts: CoreLocalAllocationFacts,
-	coverage_complete: Bool
+	coverage_complete: Bool,
+	-- Which runtime operation a call site matched, or which type a
+	-- cleanup/loop site releases or iterates. Empty when not applicable.
+	-- Display-only; never consulted by classification.
+	detail: String
 }
 
 
@@ -478,7 +483,35 @@ private pure func cleanup_facts(
 									typ = info.element_type,
 									policy = cleanup_release_policy_for_type(info.element_type),
 								})
-							NamedType(_, _) | FunctionType(_, _, _) | TypeParameterType(_) | SelfType:
+							-- List/Set/Dict release known runtime code that walks the
+							-- backing buffer and drops each element with the
+							-- element type's own (already-analyzed) cleanup; that
+							-- is not a callback into unknown user code. Every
+							-- other ArcReleasePolicy NamedType (Closure, Channel,
+							-- Stream/FallibleStream, resource sources, network
+							-- session types) really can call back on release and
+							-- stays unknown.
+							NamedType(name, args):
+								type_nodes += 1
+
+								match (name, args):
+									("List", [element]) | ("Set", [element]):
+										pending = pending.append({
+											typ = element,
+											policy = cleanup_release_policy_for_type(element),
+										})
+									("Dict", [key, value]):
+										pending = pending.append({
+											typ = key,
+											policy = cleanup_release_policy_for_type(key),
+										})
+										pending = pending.append({
+											typ = value,
+											policy = cleanup_release_policy_for_type(value),
+										})
+									_:
+										facts = merge_allocation_facts(facts, unknown_cleanup_facts())
+							FunctionType(_, _, _) | TypeParameterType(_) | SelfType:
 								type_nodes += 1
 								facts = merge_allocation_facts(facts, unknown_cleanup_facts())
 							VoidType | EnumType(_) | ValueRecordType(_) | RangeType:
@@ -557,7 +590,8 @@ private pure func collect_owner(
 				loc = seed.loc,
 				category = CallAllocationOperation,
 				facts = facts,
-				coverage_complete = registry_complete
+				coverage_complete = registry_complete,
+				detail = ""
 			}
 			{
 				local = {
@@ -648,6 +682,7 @@ private pure func collect_owner(
 								category = contract.category,
 								facts = site_facts,
 								coverage_complete = site_complete,
+								detail = core_expr_operation_detail(work.expr),
 							})
 
 							if (

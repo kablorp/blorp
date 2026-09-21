@@ -16,20 +16,31 @@ import:
 			CleanupScratchAllocation,
 			MissingFunctionBody,
 			RawBufferAllocation,
+			RuntimeCallbackBoundary,
 			UnknownCallTarget,
 		),
 	../../../src/compiler/stage_09_core/ir:
 		CoreCallKind(SelectedDirectCall),
-		CoreDecl(FunctionDecl, UnionDecl),
-		CoreExpr(CallExpr, DebugBlockExpr, DropExpr, ListConstructExpr, LiteralExpr, SeqExpr),
+		CoreDecl(FunctionDecl, HeapRecordDecl, UnionDecl),
+		CoreExpr(
+			CallExpr,
+			CooperativeCheckpointExpr,
+			DebugBlockExpr,
+			DropExpr,
+			ForListExpr,
+			ListConstructExpr,
+			LiteralExpr,
+			SeqExpr,
+		),
 		CoreFunction,
 		CoreFunctionKind(UserFunction),
 		CoreListStorageLayout(PointerListStorage),
 		CoreLiteral(IntLiteral),
+		CoreLoopRangeDirection(RangeMayRunBackward),
 		CoreProgram,
 		CoreReleasePolicy(ArcReleasePolicy),
 		CoreSourceLoc(KnownSourceLoc, SyntheticSourceLoc),
-		CoreType(NamedType, TensorType, UnionType),
+		CoreType(HeapRecordType, NamedType, TensorType, UnionType),
 		CoreUnionDecl,
 		CoreUnionPayloadStorage(TypedUnionPayloadStorage),
 	test: TestSuite
@@ -452,6 +463,131 @@ private pure func test_analysis_is_deterministic() -> Bool:
 	)
 
 
+private pure func drop_of(value_type: CoreType, policy: CoreReleasePolicy) -> CoreExpr:
+	DropExpr(
+		{
+			name = "value",
+			uniq = 0,
+			def_id = None
+		},
+		value_type,
+		policy,
+		int_literal(0),
+		INT_TYPE,
+		SyntheticSourceLoc,
+	)
+
+
+-- A List/Dict/Set of scalars releases known runtime code that walks the
+-- backing buffer; there is no per-element user callback, so cleanup must be
+-- allocation-free, not "unknown: runtime_callback_boundary".
+private pure func test_list_dict_set_of_scalars_cleanup_is_free() -> Bool:
+	analysis: CoreAllocationAnalysis = analyze_core_allocations(program([
+		function_decl("drop_list", 10, Some(drop_of(NamedType("List", [INT_TYPE]), ArcReleasePolicy))),
+		function_decl(
+			"drop_dict",
+			20,
+			Some(drop_of(NamedType("Dict", [INT_TYPE, INT_TYPE]), ArcReleasePolicy)),
+		),
+		function_decl("drop_set", 30, Some(drop_of(NamedType("Set", [INT_TYPE]), ArcReleasePolicy))),
+	]))
+
+	(
+		summary(analysis, 10).status == AllocationProvenFree
+		and summary(analysis, 20).status == AllocationProvenFree
+		and summary(analysis, 30).status == AllocationProvenFree
+	)
+
+
+-- Negative trap: a List of Closures still calls back on release (the
+-- closure's captured environment can hold anything), so it must stay
+-- unknown even though ordinary List[Int] cleanup is now free.
+private pure func test_list_of_closures_cleanup_stays_unknown() -> Bool:
+	analysis: CoreAllocationAnalysis = analyze_core_allocations(program([
+		function_decl(
+			"drop_list_of_closures",
+			10,
+			Some(drop_of(NamedType("List", [NamedType("Closure", [])]), ArcReleasePolicy)),
+		),
+	]))
+	result: AllocationOwnerSummary = summary(analysis, 10)
+
+	result.status == AllocationUnknown and result.facts.unknown == [RuntimeCallbackBoundary]
+
+
+-- Negative trap: a heap record holding a closure field still calls back on
+-- release even though its own release policy is otherwise ordinary ARC.
+private pure func widget_with_closure_field() -> CoreDecl:
+	HeapRecordDecl({
+		abi_type = None,
+		name = "Widget",
+		type_params = [],
+		fields = [
+			{
+				name = "on_click",
+				typ = NamedType("Closure", []),
+				release_policy = ArcReleasePolicy
+			},
+		],
+		loc = SyntheticSourceLoc,
+	})
+
+
+private pure func test_closure_holding_record_cleanup_stays_unknown() -> Bool:
+	analysis: CoreAllocationAnalysis = analyze_core_allocations(program([
+		widget_with_closure_field(),
+		function_decl(
+			"drop_widget",
+			10,
+			Some(drop_of(HeapRecordType("Widget"), ArcReleasePolicy)),
+		),
+	]))
+	result: AllocationOwnerSummary = summary(analysis, 10)
+
+	result.status == AllocationUnknown and result.facts.unknown == [RuntimeCallbackBoundary]
+
+
+-- Matches the motivating probe: `for x in xs: total += x` over List[Int]
+-- must report no known allocation. The fairness pass's cooperative
+-- checkpoint at the loop back-edge is a separate, already allocation-free
+-- catalog entry; the loop's own contribution and the List[Int] iterable's
+-- cleanup are both allocation-free.
+private pure func total_over_list_of_int() -> CoreExpr:
+	ForListExpr(
+		{
+			binder = {
+				variable = {
+					name = "x",
+					uniq = 1,
+					def_id = None
+				},
+				typ = INT_TYPE,
+				range_direction = RangeMayRunBackward
+			},
+			layout = PointerListStorage,
+			iterable = LiteralExpr(IntLiteral(0), NamedType("List", [INT_TYPE]), SyntheticSourceLoc),
+			iterable_release_policy = ArcReleasePolicy,
+			body = SeqExpr(
+				CooperativeCheckpointExpr(NamedType("Void", []), SyntheticSourceLoc),
+				int_literal(0),
+			)
+		},
+		NamedType(
+			"Void",
+			[],
+		),
+		SyntheticSourceLoc,
+	)
+
+
+private pure func test_loop_over_list_of_scalars_with_checkpoint_is_free() -> Bool:
+	analysis: CoreAllocationAnalysis = analyze_core_allocations(program([
+		function_decl("total", 10, Some(total_over_list_of_int())),
+	]))
+
+	summary(analysis, 10).status == AllocationProvenFree
+
+
 tests: TestSuite = {
 	description = "Blorp compiler Core allocation summary analysis",
 	tests = [
@@ -497,5 +633,21 @@ tests: TestSuite = {
 			test_unsupported_final_core_marks_analysis_incomplete,
 		),
 		("analysis is deterministic", test_analysis_is_deterministic),
+		(
+			"list/dict/set of scalars cleanup is free",
+			test_list_dict_set_of_scalars_cleanup_is_free,
+		),
+		(
+			"list of closures cleanup stays unknown",
+			test_list_of_closures_cleanup_stays_unknown,
+		),
+		(
+			"closure-holding record cleanup stays unknown",
+			test_closure_holding_record_cleanup_stays_unknown,
+		),
+		(
+			"loop over list of scalars with checkpoint is free",
+			test_loop_over_list_of_scalars_with_checkpoint_is_free,
+		),
 	]
 }

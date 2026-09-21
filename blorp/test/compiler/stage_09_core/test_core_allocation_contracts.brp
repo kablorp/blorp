@@ -36,7 +36,9 @@ import:
 		allocation_reason_code,
 		box_allocation_facts,
 		core_call_allocation_contract,
+		core_call_kind_operation_name,
 		core_expr_allocation_contract,
+		core_expr_operation_detail,
 		merge_allocation_facts,
 		union_cleanup_plan,
 	../../../src/compiler/stage_09_core/ir:
@@ -67,6 +69,7 @@ import:
 		CoreDirectRuntimeResult(DirectRuntimeResultAsWritten),
 		CoreExpr(
 			AccessorLiteralMatchExpr,
+			CallExpr,
 			ClosureCreateExpr,
 			CooperativeCheckpointExpr,
 			DebugBlockExpr,
@@ -768,7 +771,13 @@ private pure func test_list_get_layouts_are_locally_allocation_free() -> Bool:
 	)
 
 
-private pure func test_scheduler_checkpoint_fails_closed() -> Bool:
+-- blorp_cooperative_checkpoint's fast path only decrements a thread-local
+-- budget (runtime.c:26007-26013); its slow path resets the budget, polls
+-- cancellation, and calls blorp_yield_now, which is a coroutine stack switch
+-- (runtime.c:25947-25971, runtime.c:25988-26001) -- no heap allocation on
+-- either path, so the checkpoint the fairness pass inserts at loop
+-- back-edges must not make an otherwise allocation-free loop unknown.
+private pure func test_scheduler_checkpoint_is_allocation_free() -> Bool:
 	contract: CoreAllocationContract = core_expr_allocation_contract(
 		CooperativeCheckpointExpr(
 			NamedType("Void", []),
@@ -776,11 +785,7 @@ private pure func test_scheduler_checkpoint_fails_closed() -> Bool:
 		),
 	)
 
-	match contract.dependencies:
-		[RuntimeAllocationDependency]:
-			contract.facts.unknown == [RuntimeCallbackBoundary]
-		_:
-			False
+	allocation_facts_are_free(contract.facts) and contract.dependencies.is_empty()
 
 
 private pure func loop_binder() -> CoreLoopBinder:
@@ -964,12 +969,14 @@ private pure func test_container_construction_preserves_payload_risks() -> Bool:
 	)
 
 	match dict_contract.dependencies:
-		[RuntimeAllocationDependency]:
+		[UnknownCallAllocationDependency]:
 			(
 				list_contract.facts.may_allocate == [RawBufferAllocation, HeapBoxAllocation]
 				and tensor_contract.facts.may_allocate == [RawBufferAllocation, HeapBoxAllocation]
 				and dict_contract.facts.may_allocate == [ManagedObjectAllocation, HeapBoxAllocation]
-				and dict_contract.facts.unknown == [RuntimeCallbackBoundary]
+				-- A custom hash/equals pair is a named, unresolved call target
+				-- (the user's hash function), not an opaque runtime boundary.
+				and dict_contract.facts.unknown == [UnknownCallTarget]
 			)
 		_:
 			False
@@ -1225,6 +1232,48 @@ private pure func test_fact_merging_is_stable_and_deduplicated() -> Bool:
 	)
 
 
+private pure func test_call_site_detail_names_the_matched_operation() -> Bool:
+	(
+		core_call_kind_operation_name(BuiltinCall("blorp_list_to_string")) == "blorp_list_to_string"
+		and core_call_kind_operation_name(
+			DirectRuntimeCall({
+				name = "blorp_string_levenshtein",
+				args = DirectRuntimeArgsAsWritten,
+				result = DirectRuntimeResultAsWritten,
+			}),
+		) == "blorp_string_levenshtein"
+		and core_call_kind_operation_name(UnknownCall) == "unknown_call"
+		and core_expr_operation_detail(
+			CallExpr(
+				BuiltinCall("blorp_list_to_string"),
+				int_literal(0),
+				[],
+				NamedType("Int", []),
+				SyntheticSourceLoc,
+			),
+		) == "blorp_list_to_string"
+	)
+
+
+private pure func test_cleanup_and_loop_site_detail_names_the_type() -> Bool:
+	(
+		core_expr_operation_detail(drop_expr(NamedType("List", [NamedType("Int", [])]), ArcReleasePolicy)) == "List[Int]"
+		and core_expr_operation_detail(
+			ForListExpr(
+				{
+					binder = loop_binder(),
+					layout = PointerListStorage,
+					iterable = LiteralExpr(IntLiteral(0), NamedType("String", []), SyntheticSourceLoc),
+					iterable_release_policy = ArcReleaseOnlyPolicy,
+					body = int_literal(0)
+				},
+				NamedType("Void", []),
+				SyntheticSourceLoc,
+			),
+		) == "String"
+	)
+
+
 tests: TestSuite = {
 	description = "Blorp compiler Core allocation contracts",
 	tests = [
@@ -1279,7 +1328,7 @@ tests: TestSuite = {
 			"list get layouts are locally allocation-free",
 			test_list_get_layouts_are_locally_allocation_free,
 		),
-		("scheduler checkpoint fails closed", test_scheduler_checkpoint_fails_closed),
+		("scheduler checkpoint is allocation-free", test_scheduler_checkpoint_is_allocation_free),
 		(
 			"loop contracts publish hidden runtime and cleanup",
 			test_loop_contracts_publish_hidden_runtime_and_cleanup,
@@ -1313,5 +1362,13 @@ tests: TestSuite = {
 			test_closed_runtime_catalog_distinguishes_safe_and_allocating,
 		),
 		("fact merging is stable and deduplicated", test_fact_merging_is_stable_and_deduplicated),
+		(
+			"call site detail names the matched operation",
+			test_call_site_detail_names_the_matched_operation,
+		),
+		(
+			"cleanup and loop site detail names the type",
+			test_cleanup_and_loop_site_detail_names_the_type,
+		),
 	]
 }

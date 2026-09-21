@@ -174,7 +174,7 @@ import:
 		CoreUnionReuseConstruct,
 		CoreUnionVariant,
 		core_expr_type,
-	type_policy: cleanup_release_policy_for_type
+	type_policy: cleanup_release_policy_for_type, core_type_to_string
 
 
 enum AllocationRiskReason:
@@ -196,7 +196,7 @@ enum AllocationRiskReason:
 
 -- Increment whenever an admitted operation contract changes meaning. Reports
 -- expose this revision but do not treat it as a complete backend-plan identity.
-ALLOCATION_CONTRACT_CATALOG_REVISION: Int = 2
+ALLOCATION_CONTRACT_CATALOG_REVISION: Int = 3
 
 
 record CoreLocalAllocationFacts {
@@ -778,6 +778,9 @@ private pure func dict_construct_allocation_contract(
 	)
 
 	match construct.constructor:
+		-- A custom hash/equals pair is a user-supplied callback target, not an
+		-- opaque runtime operation: name the actual cause so it can be
+		-- resolved like any other unresolved call target.
 		CustomHashContainerConstructor(_, _, _):
 			if construct.entries.is_empty():
 				base
@@ -787,10 +790,10 @@ private pure func dict_construct_allocation_contract(
 						base,
 						{
 							may_allocate = [],
-							unknown = [RuntimeCallbackBoundary]
+							unknown = [UnknownCallTarget]
 						},
 					),
-					RuntimeAllocationDependency,
+					UnknownCallAllocationDependency,
 				)
 		_:
 			base
@@ -893,12 +896,16 @@ pure func core_expr_allocation_contract(expr: CoreExpr) -> CoreAllocationContrac
 	match expr:
 		LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _) | VarExpr(_, _, _) | VoidExpr(_, _):
 			free_allocation_contract(ScalarAllocationOperation)
+		-- blorp_cooperative_checkpoint's fast path (runtime.c:26007-26013) only
+		-- decrements a thread-local budget and branches; its slow path
+		-- (runtime.c:25988-26001) resets the budget, polls cancellation
+		-- (longjmp into already-registered cleanup frames, accounted at the
+		-- values actually being cleaned up, not here), and calls
+		-- blorp_yield_now (runtime.c:25947-25971), which records a pending
+		-- wake and calls mco_yield -- a coroutine stack switch, not a heap
+		-- allocation. The checkpoint itself never allocates.
 		CooperativeCheckpointExpr(_, _):
-			unknown_allocation_contract(
-				ControlFlowAllocationOperation,
-				RuntimeCallbackBoundary,
-				RuntimeAllocationDependency,
-			)
+			free_allocation_contract(ControlFlowAllocationOperation)
 		BinaryExpr(_, _, _, _, _) | UnaryExpr(_, _, _, _) | LogicalExpr(_, _, _, _, _) | AssignExpr(_, _, _, _) | CastExpr(_, _, _) | UnboxExpr(_, _, _, _) | FieldExpr(_, _, _, _) | TupleFieldExpr(_, _, _, _):
 			free_allocation_contract(ScalarAllocationOperation)
 		CallExpr(kind, _, _, _, _):
@@ -1190,3 +1197,74 @@ pure func union_cleanup_plan(union_decl: CoreUnionDecl) -> UnionCleanupPlan:
 		facts = facts,
 		dependencies = dependencies
 	}
+
+
+-- Display-only operation identity for a call site: the validated Core call
+-- kind or runtime/foreign symbol the catalog above matched. This never feeds
+-- back into the allocation facts themselves; it only names, in reports, which
+-- operation a `call`/`runtime_operation` site is about.
+pure func core_call_kind_operation_name(kind: CoreCallKind) -> String:
+	match kind:
+		UnknownCall:
+			"unknown_call"
+		SelectedDirectCall(_):
+			"selected_direct_call"
+		DeferredTraitCall(trait_name, method_name):
+			trait_name + "::" + method_name
+		SelectedTraitCall(trait_name, _, method_name, _):
+			trait_name + "::" + method_name
+		UserCall(name, _, _):
+			name
+		ForeignCall(name, _):
+			name
+		BuiltinCall(name):
+			name
+		DirectRuntimeCall(call):
+			call.name
+		OperationResultCall(bridge):
+			bridge.runtime_c_name
+		FallibleStreamTerminalCall(bridge):
+			bridge.runtime_c_name
+		TensorParallelCall(name, _):
+			name
+		DictWithCapacityCall(_):
+			"dict_with_capacity"
+		ListToStringCall(_):
+			"list_to_string"
+		IntrinsicCall(name):
+			name
+		ClosureCall:
+			"closure_call"
+
+
+-- Display-only detail for a `call`, `cleanup`, or `control_flow` site: which
+-- runtime operation a call site matched, or which type a cleanup/loop site is
+-- releasing or iterating. Derived entirely from facts the site's own Core
+-- expression already carries; this is not a second fact table and never
+-- affects the may/unknown classification above. A trailing wildcard is
+-- intentional here (unlike core_expr_allocation_contract): this is advisory
+-- report detail, not a compiler-coverage fence.
+pure func core_expr_operation_detail(expr: CoreExpr) -> String:
+	match expr:
+		CallExpr(kind, _, _, _, _):
+			core_call_kind_operation_name(kind)
+		DropExpr(_, value_type, _, _, _, _):
+			core_type_to_string(value_type)
+		RecordCowUpdateExpr(_, _, typ, _) | RecordReuseExpr(_, _, typ, _):
+			core_type_to_string(typ)
+		UnionReuseConstructExpr(construct, _, _):
+			construct.type_name
+		ForListExpr(loop, _, _) | ForStringExpr(loop, _, _) | ForSetExpr(loop, _, _) | ForResourceSourceExpr(loop, _, _) | ForTensorExpr(loop, _, _) | ForStreamExpr(loop, _, _) | ForDictExpr(loop, _, _):
+			core_type_to_string(core_expr_type(loop.iterable))
+		ForChannelExpr(loop, _, _):
+			core_type_to_string(loop.binder.typ)
+		DictConstructExpr(construct, _, _):
+			match construct.constructor:
+				CustomHashContainerConstructor(hash_fn, _, _):
+					hash_fn
+				_:
+					""
+		AccessorLiteralMatchExpr(scrutinee, _, _, _, _) | LengthMatchExpr(scrutinee, _, _, _, _) | ConstructorMatchExpr(scrutinee, _, _, _, _, _):
+			core_type_to_string(core_expr_type(scrutinee))
+		_:
+			""
