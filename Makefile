@@ -33,7 +33,7 @@ BLORP_CLI_SPLIT_DIR := $(BLORP_CLI_BUILD_DIR)/split-c
 # runtime config identity below and for the `cc:` line in `blorp --version`,
 # so the binary is the single source of truth for which C compiler built it.
 BLORP_CLI_CC_VERSION := $(shell $(BLORP_CC) --version 2>/dev/null | head -n 1)
-BLORP_CLI_RUNTIME_CONFIG_HASH := $(shell { printf '%s\n' '$(BLORP_CLI_RUNTIME_C_OPTIMIZATION)' '-fwrapv -pipe -w -DMINICORO_IMPL -DBLORP_COMPILER_RUNTIME_SOURCES=1'; shasum -a 256 blorp/src/lib/runtime/native/minicoro.h blorp/src/lib/runtime/native/runtime.c blorp/src/lib/runtime/native/runtime_decl.c; command -v $(BLORP_CC); printf '%s\n' '$(BLORP_CLI_CC_VERSION)'; } | shasum -a 256 | awk '{print $$1}')
+BLORP_CLI_RUNTIME_CONFIG_HASH := $(shell { printf '%s\n' '$(BLORP_CLI_RUNTIME_C_OPTIMIZATION)' '-fwrapv -pipe -w -D_GNU_SOURCE -DMINICORO_IMPL -DBLORP_COMPILER_RUNTIME_SOURCES=1'; shasum -a 256 blorp/src/lib/runtime/native/minicoro.h blorp/src/lib/runtime/native/runtime.c blorp/src/lib/runtime/native/runtime_decl.c; command -v $(BLORP_CC); printf '%s\n' '$(BLORP_CLI_CC_VERSION)'; } | shasum -a 256 | awk '{print $$1}')
 BLORP_CLI_BUILD_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/build-inputs.sha256
 BLORP_CLI_INSTALL_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/install-inputs.sha256
 BLORP_CLI_BIN_HASH := $(BLORP_CLI_BUILD_DIR)/blorp.sha256
@@ -175,12 +175,20 @@ $(BLORP_CLI_RUNTIME_SOURCES_C): force-generated-sources $(BLORP_BUILD_SOURCE_GEN
 # The content-addressed target name already covers every runtime input. Normal
 # timestamp prerequisites would rebuild a valid object restored by CI when a
 # fresh checkout gives unchanged sources newer mtimes than the cached object.
+#
+# -D_GNU_SOURCE is required on the command line, not just runtime.c's own
+# #define: -include pastes minicoro.h before runtime.c's own text, and if a
+# glibc header reachable from minicoro.h is processed before that #define
+# runs, its include guard locks accept4/pipe2/strptime out for the rest of
+# the translation unit. generate_build_sources.brp's embedded-runtime-c mode
+# avoids this by writing the #define ahead of both files in one text blob;
+# this raw recipe has no such prelude, so the flag carries the same guarantee.
 $(BLORP_CLI_RUNTIME_OBJECT):
 	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
 	@set -e; \
 	tmp="$@.tmp"; \
 	trap 'rm -f "$$tmp"' EXIT; \
-	$(BLORP_CC) "$(BLORP_CLI_RUNTIME_C_OPTIMIZATION)" -fwrapv -pipe -w -DMINICORO_IMPL \
+	$(BLORP_CC) "$(BLORP_CLI_RUNTIME_C_OPTIMIZATION)" -fwrapv -pipe -w -D_GNU_SOURCE -DMINICORO_IMPL \
 		-DBLORP_COMPILER_RUNTIME_SOURCES=1 \
 		-include blorp/src/lib/runtime/native/minicoro.h -c blorp/src/lib/runtime/native/runtime.c -o "$$tmp"; \
 	mv "$$tmp" "$@"; \

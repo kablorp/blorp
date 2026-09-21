@@ -201,7 +201,7 @@ class CompilerBuildStatusTests(unittest.TestCase):
 	def runtime_config_hash(self, runtime_opt: str = "-O2") -> str:
 		records = [
 			f"{runtime_opt}\n",
-			"-fwrapv -pipe -w -DMINICORO_IMPL -DBLORP_COMPILER_RUNTIME_SOURCES=1\n",
+			"-fwrapv -pipe -w -D_GNU_SOURCE -DMINICORO_IMPL -DBLORP_COMPILER_RUNTIME_SOURCES=1\n",
 			f"{sha256_file(self.root / 'blorp/src/lib/runtime/native/minicoro.h')}  blorp/src/lib/runtime/native/minicoro.h\n",
 			f"{sha256_file(self.root / 'blorp/src/lib/runtime/native/runtime.c')}  blorp/src/lib/runtime/native/runtime.c\n",
 			f"{sha256_file(self.root / 'blorp/src/lib/runtime/native/runtime_decl.c')}  blorp/src/lib/runtime/native/runtime_decl.c\n",
