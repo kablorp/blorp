@@ -305,6 +305,9 @@ class CompilerBuildStatusTests(unittest.TestCase):
 			{
 				"PATH": f"{self.root / 'fake-bin'}:{env['PATH']}",
 				"PYTHONDONTWRITEBYTECODE": "1",
+				# Pin the compiler to the fake "cc" fixture set up in setUp();
+				# the real default is BLORP_CC=clang.
+				"BLORP_CC": "cc",
 			}
 		)
 		if use_bootstrap_override:

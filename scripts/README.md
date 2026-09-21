@@ -453,7 +453,8 @@ is: commit (plus `-dirty` for uncommitted tracked changes), target triple,
 `compiled_by` (the bootstrap tag, or `self-<commit>` for a stage-2 binary
 built by `bin/blorp` itself — see `benchmarks/build_stage2_compiler`),
 `optimization` (`cli=` and `runtime=` flags actually used), `split` (the
-translation-unit count), and `cc` (the first line of `cc --version`). These
+translation-unit count), and `cc` (the first line of `$BLORP_CC --version`,
+default Clang). These
 values are stamped in at compile time from a small, always-freshly-rebuilt
 object (`blorp/src/lib/runtime/native/build_stamp.c`), not embedded into the
 generated compiler C, so a new commit relinks the binary instead of forcing a

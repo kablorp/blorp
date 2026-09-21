@@ -108,7 +108,7 @@ echo "PASS: blorp compile --c-translation-units publishes a manifest-listed file
 # --- every unit is a valid translation unit on its own --------------------
 
 for unit in 0 1 2 3; do
-    if ! "${CC:-cc}" -fsyntax-only "${cc_common_flags[@]}" "${cc_include_flags[@]}" \
+    if ! "${BLORP_CC:-clang}" -fsyntax-only "${cc_common_flags[@]}" "${cc_include_flags[@]}" \
         "$split_dir/x.$unit.c" > "$log" 2>&1; then
         fail "translation unit $unit should compile on its own"
     fi
@@ -119,7 +119,7 @@ echo "PASS: each emitted translation unit compiles independently"
 # --- the split set links and runs like the single-file build --------------
 
 split_bin="$work_dir/split.bin"
-if ! "${CC:-cc}" -O0 "${cc_common_flags[@]}" "${cc_include_flags[@]}" \
+if ! "${BLORP_CC:-clang}" -O0 "${cc_common_flags[@]}" "${cc_include_flags[@]}" \
     "$split_dir/x.0.c" "$split_dir/x.1.c" "$split_dir/x.2.c" "$split_dir/x.3.c" \
     "$runtime_object" "$runtime_sources" "$native_runtime" \
     -lm -lpthread -o "$split_bin" > "$log" 2>&1; then
@@ -133,7 +133,7 @@ if ! "$compiler" compile --no-format --no-embed-runtime -o "$single_c" "$source_
 fi
 
 single_bin="$work_dir/single.bin"
-if ! "${CC:-cc}" -O0 "${cc_common_flags[@]}" "${cc_include_flags[@]}" \
+if ! "${BLORP_CC:-clang}" -O0 "${cc_common_flags[@]}" "${cc_include_flags[@]}" \
     "$single_c" "$runtime_object" "$runtime_sources" "$native_runtime" \
     -lm -lpthread -o "$single_bin" > "$log" 2>&1; then
     fail "the single-file build should link"

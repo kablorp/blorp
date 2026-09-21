@@ -33,6 +33,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 MAKEFILE = REPO_ROOT / "Makefile"
 INSTALLED_BIN = REPO_ROOT / "bin" / "blorp"
 BUILD_STATUS = REPO_ROOT / "scripts" / "compiler-build-status"
+# Same variable, same default as the Makefile's BLORP_CC; read explicitly here
+# (rather than relying on `make -n` picking it up from the ambient
+# environment) so the extracted compile/link commands always match the
+# compiler this script intends to build with.
+BLORP_CC = os.environ.get("BLORP_CC", "clang")
 
 # Unique markers inside the printed recipes that sit immediately before the
 # command we want, so a `make -n` dump of an unrelated prerequisite recipe
@@ -52,13 +57,15 @@ LINK_MARKER = 'echo "Linking Blorp CLI"'
 GENERATE_RE = re.compile(
     r'"\s+compile(?P<flags>.*?)-o "\$tmp_c" "(?P<source>[^"]*)"', re.DOTALL
 )
+# The leading token is the expanded $(BLORP_CC) value (e.g. "clang" or
+# "gcc"), not literally "cc"; capture it instead of assuming its spelling.
 COMPILE_RE = re.compile(
-    r'cc "(?P<opt>[^"]*)"(?P<flags>.*?)'
+    r'(?P<cc>\S+) "(?P<opt>[^"]*)"(?P<flags>.*?)'
     r'-c "(?P<source>[^"]*blorp_cli_main\.c)" -o "\$body_objects"',
     re.DOTALL,
 )
 LINK_RE = re.compile(
-    r'cc "(?P<opt>[^"]*)"(?P<flags>.*?)'
+    r'(?P<cc>\S+) "(?P<opt>[^"]*)"(?P<flags>.*?)'
     r'\$obj_files "(?P<runtime_obj>[^"]*)" "(?P<runtime_sources>[^"]*)" '
     r'"(?P<lsp_native>[^"]*)" "(?P<stamp_obj>[^"]*)" '
     r'(?P<libs>[^\n]*?) -o "\$tmp_bin"',
@@ -82,7 +89,7 @@ def sha256_file(path: Path) -> str:
 def make_var(name: str) -> str:
     """Read one Makefile variable's fully expanded value via `make -pn`."""
     result = subprocess.run(
-        ["make", "-pn", "-f", str(MAKEFILE)],
+        ["make", "-pn", "-f", str(MAKEFILE), f"BLORP_CC={BLORP_CC}"],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
@@ -98,7 +105,10 @@ def make_var(name: str) -> str:
 
 def make_recipe(target: str) -> str:
     result = subprocess.run(
-        ["make", "-n", "BLORP_CLI_C_SPLIT=1", target], cwd=REPO_ROOT, capture_output=True, text=True
+        ["make", "-n", "BLORP_CLI_C_SPLIT=1", f"BLORP_CC={BLORP_CC}", target],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
     )
     if result.returncode != 0:
         raise BuildError(f"`make -n {target}` failed:\n{result.stderr}")
@@ -141,7 +151,7 @@ def extract_compile_command(recipe_text: str, input_c: Path, output_obj: Path) -
             "the Makefile recipe changed, resync this script"
         )
     flags = tokens_from_flags(match.group("flags"))
-    return ["cc", match.group("opt"), *flags, "-c", str(input_c), "-o", str(output_obj)]
+    return [match.group("cc"), match.group("opt"), *flags, "-c", str(input_c), "-o", str(output_obj)]
 
 
 def extract_link_command(recipe_text: str, input_obj: Path, output_bin: Path) -> list[str]:
@@ -172,7 +182,7 @@ def extract_link_command(recipe_text: str, input_obj: Path, output_bin: Path) ->
                 "(the stage-2 link reuses stage 1's runtime and build-stamp objects)"
             )
     return [
-        "cc",
+        match.group("cc"),
         match.group("opt"),
         *flags,
         str(input_obj),
@@ -244,7 +254,7 @@ def build(output: Path) -> int:
     stamp_result = subprocess.run(
         ["make", "prepare-blorp-cli-build-stamp"],
         cwd=REPO_ROOT,
-        env={**os.environ, "BLORP_BOOTSTRAP_COMPILER_BIN": str(INSTALLED_BIN)},
+        env={**os.environ, "BLORP_BOOTSTRAP_COMPILER_BIN": str(INSTALLED_BIN), "BLORP_CC": BLORP_CC},
         capture_output=True,
         text=True,
     )

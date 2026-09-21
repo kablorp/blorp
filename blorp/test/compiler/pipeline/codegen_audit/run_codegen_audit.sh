@@ -107,7 +107,7 @@ fi
 # covered by runtime tests and would make this suite pay avoidable linker cost.
 CC_SYNTAX_ONLY_FLAGS=(-fsyntax-only)
 
-if cc --version 2>/dev/null | grep -qi clang; then
+if "${BLORP_CC:-clang}" --version 2>/dev/null | grep -qi clang; then
     CC_WARNING_FLAGS=(
         "${CC_SYNTAX_ONLY_FLAGS[@]}"
         -Werror=unsequenced
@@ -239,7 +239,7 @@ run_case() {
     fi
 
     set +e
-    cc_output=$(run_with_timeout cc "${CC_WARNING_FLAGS[@]}" -I "$test_dir" -include "$RUNTIME_DECL" "$c_file")
+    cc_output=$(run_with_timeout "${BLORP_CC:-clang}" "${CC_WARNING_FLAGS[@]}" -I "$test_dir" -include "$RUNTIME_DECL" "$c_file")
     cc_exit=$?
     set -e
     if [ "$cc_exit" -eq 124 ]; then

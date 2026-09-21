@@ -41,16 +41,19 @@ To remove the dev binary:
 rm -f "$HOME/.local/bin/blorp"
 ```
 
-A C compiler such as clang or gcc is still required to compile and run Blorp
-programs.
+A C compiler such as Clang or GCC is still required to compile and run Blorp
+programs. Both are supported and exercised in CI; the host compiler is chosen
+through `BLORP_CC`, which defaults to Clang.
 
 Building from source is mainly useful for compiler development. To do that,
-install a C compiler such as clang or gcc and `curl`, then run:
+install a C compiler such as Clang or GCC and `curl`, then run:
 
 ```bash
 make
 bin/blorp run examples/hello.brp
 ```
+
+`BLORP_CC=gcc make` selects GCC instead of the default Clang.
 
 For more examples and setup notes, see https://blorp-lang.org.
 Repository documentation starts at [docs/README.md](docs/README.md).

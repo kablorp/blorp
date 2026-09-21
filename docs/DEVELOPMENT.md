@@ -21,7 +21,9 @@ A source build requires:
 
 - Git
 - GNU Make
-- a C compiler such as Clang or GCC
+- a C compiler such as Clang or GCC; both are supported and exercised in CI.
+  The Makefile selects the host compiler through `BLORP_CC`, which defaults
+  to Clang, e.g. `BLORP_CC=gcc make` builds with GCC instead.
 - `curl` or `wget`
 - `shasum` or `sha256sum` for bootstrap verification
 - Python 3 for repository scripts and integration tests
@@ -180,7 +182,7 @@ The packet keeps `metadata.json`, stdout, stderr, hashes of captured logs, the
 current Git revision, start and end tracked/untracked worktree fingerprints,
 whether source changed during the run, the `bin/blorp` hash when present, and
 only a small allowlist of known validation environment variables such as
-`BLORP_COMPILER_TEST_TIMEOUT` and `CC`. If the packet output is inside the Git
+`BLORP_COMPILER_TEST_TIMEOUT` and `BLORP_CC`. If the packet output is inside the Git
 worktree, that output directory is explicitly excluded from source
 fingerprints. The recorder returns the wrapped command's status, refuses
 arbitrary existing output directories, and never decides whether a passing

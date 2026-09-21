@@ -17,7 +17,9 @@ scripts/compiler-build-status     # FRESH / STALE / UNKNOWN, no rebuild
 `bin/blorp --version` and `scripts/compiler-build-status` are the two ways to
 confirm which binary you actually have (commit, who/what compiled it,
 optimization level, generated-C split); both are being extended to print
-more provenance, so check `--help` rather than assume a fixed field set.
+more provenance, so check `--help` rather than assume a fixed field set. The
+`cc:` line in `--version` and the harness's toolchain fingerprint both record
+whatever `BLORP_CC` (default Clang) was set to when the binary was built.
 Never `git stash` in a worktree — worktrees share one stash list and a pop
 can destroy another agent's edits; snapshot with `git diff > file` instead.
 

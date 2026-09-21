@@ -293,19 +293,19 @@ fi
 # ambient override, including recursive Make's command-line propagation; the
 # explicit release override is covered below.
 cli_build_plan=$(
-	unset BLORP_CLI_C_OPTIMIZATION MAKEFLAGS MFLAGS
+	unset BLORP_CLI_C_OPTIMIZATION BLORP_CC MAKEFLAGS MFLAGS
 	make -n build-blorp-cli
 )
 generate_cli_c_plan=$(
-	unset BLORP_CLI_C_OPTIMIZATION MAKEFLAGS MFLAGS
+	unset BLORP_CLI_C_OPTIMIZATION BLORP_CC MAKEFLAGS MFLAGS
 	make -n generate-blorp-cli-c
 )
 prepare_cli_c_plan=$(
-	unset BLORP_CLI_C_OPTIMIZATION MAKEFLAGS MFLAGS
+	unset BLORP_CLI_C_OPTIMIZATION BLORP_CC MAKEFLAGS MFLAGS
 	make -n prepare-blorp-cli-c
 )
 compile_cli_plan=$(
-	unset BLORP_CLI_C_OPTIMIZATION MAKEFLAGS MFLAGS
+	unset BLORP_CLI_C_OPTIMIZATION BLORP_CC MAKEFLAGS MFLAGS
 	make -n compile-prepared-blorp-cli
 )
 if ! grep -Fq 'generate-blorp-cli-c' Makefile ||
@@ -317,7 +317,7 @@ then
 	echo "FAIL: the Blorp CLI build must expose separate generated-C and native compile targets" >&2
 	exit 1
 fi
-if grep -Fq 'cc "-O0" -fwrapv -pipe -w' <<<"$generate_cli_c_plan" ||
+if grep -Fq 'clang "-O0" -fwrapv -pipe -w' <<<"$generate_cli_c_plan" ||
 	! grep -Fq -- '--no-format --no-embed-runtime' <<<"$generate_cli_c_plan" ||
 	grep -Fq 'runtime_sources.c' <<<"$generate_cli_c_plan" ||
 	grep -Fq "find blorp/src -name '*.h'" <<<"$generate_cli_c_plan"
@@ -326,12 +326,12 @@ then
 	exit 1
 fi
 if ! grep -Fq 'runtime_sources.c' <<<"$prepare_cli_c_plan" ||
-	grep -Fq 'cc "-O0" -fwrapv -pipe -w' <<<"$prepare_cli_c_plan"
+	grep -Fq 'clang "-O0" -fwrapv -pipe -w' <<<"$prepare_cli_c_plan"
 then
 	echo "FAIL: C preparation must generate native C inputs without compiling them" >&2
 	exit 1
 fi
-if ! grep -Fq 'cc "-O0" -fwrapv -pipe -w' <<<"$compile_cli_plan"
+if ! grep -Fq 'clang "-O0" -fwrapv -pipe -w' <<<"$compile_cli_plan"
 then
 	echo "FAIL: the native compile target must compile the generated C" >&2
 	exit 1
@@ -397,12 +397,15 @@ if ! grep -Fq 'BLORP_COMPILER_RUNTIME_SOURCES=1' <<<"$cli_build_plan"; then
 	echo "FAIL: the compiler-only runtime source hooks must be explicitly enabled" >&2
 	exit 1
 fi
-if ! grep -Fq 'cc "-O0" -fwrapv -pipe -w' <<<"$cli_build_plan"; then
+if ! grep -Fq 'clang "-O0" -fwrapv -pipe -w' <<<"$cli_build_plan"; then
 	echo "FAIL: local Blorp CLI builds must retain the fast -O0 default" >&2
 	exit 1
 fi
-release_cli_build_plan=$(make -n BLORP_CLI_C_OPTIMIZATION=-O2 build-blorp-cli)
-if ! grep -Fq 'cc "-O2" -fwrapv -pipe -w' <<<"$release_cli_build_plan"; then
+release_cli_build_plan=$(
+	unset BLORP_CC
+	make -n BLORP_CLI_C_OPTIMIZATION=-O2 build-blorp-cli
+)
+if ! grep -Fq 'clang "-O2" -fwrapv -pipe -w' <<<"$release_cli_build_plan"; then
 	echo "FAIL: the Blorp CLI build must accept the release C optimization level" >&2
 	exit 1
 fi
@@ -414,18 +417,22 @@ then
 	echo "FAIL: fast and release compiler builds must share the optimized runtime object" >&2
 	exit 1
 fi
-runtime_build_plan=$(make -n -B prepare-blorp-cli-runtime)
-if ! grep -Fq 'cc "-O2" -fwrapv -pipe -w' <<<"$runtime_build_plan"; then
+runtime_build_plan=$(
+	unset BLORP_CC
+	make -n -B prepare-blorp-cli-runtime
+)
+if ! grep -Fq 'clang "-O2" -fwrapv -pipe -w' <<<"$runtime_build_plan"; then
 	echo "FAIL: the separately cached compiler runtime must use -O2" >&2
 	exit 1
 fi
 debug_runtime_build_plan=$(
+	unset BLORP_CC
 	make -n -B BLORP_CLI_RUNTIME_C_OPTIMIZATION=-O0 prepare-blorp-cli-runtime
 )
 debug_runtime_object=$(
 	grep -o 'runtime-[0-9a-f]\{64\}\.o' <<<"$debug_runtime_build_plan" | head -n 1
 )
-if ! grep -Fq 'cc "-O0" -fwrapv -pipe -w' <<<"$debug_runtime_build_plan" ||
+if ! grep -Fq 'clang "-O0" -fwrapv -pipe -w' <<<"$debug_runtime_build_plan" ||
 	[ -z "$debug_runtime_object" ] || [ "$debug_runtime_object" = "$local_runtime_object" ]
 then
 	echo "FAIL: an explicit runtime optimization override must get a distinct object" >&2
@@ -448,8 +455,11 @@ if [ ! -e "$runtime_object_path" ]; then
 fi
 for runtime_source in minicoro.h runtime.c runtime_decl.c; do
 	runtime_source_path="blorp/src/lib/runtime/native/$runtime_source"
-	runtime_timestamp_plan=$(make -n -W "$runtime_source_path" prepare-blorp-cli-runtime)
-	if grep -Fq 'cc "' <<<"$runtime_timestamp_plan"; then
+	runtime_timestamp_plan=$(
+		unset BLORP_CC
+		make -n -W "$runtime_source_path" prepare-blorp-cli-runtime
+	)
+	if grep -Fq 'clang "' <<<"$runtime_timestamp_plan"; then
 		echo "FAIL: content-addressed runtime object must ignore $runtime_source timestamps" >&2
 		exit 1
 	fi
@@ -604,7 +614,7 @@ if ! grep -Fq '"$splitter_hash" "8"' <<<"$cli_build_plan"; then
 	exit 1
 fi
 split_one_build_plan=$(
-	unset BLORP_CLI_C_OPTIMIZATION MAKEFLAGS MFLAGS
+	unset BLORP_CLI_C_OPTIMIZATION BLORP_CC MAKEFLAGS MFLAGS
 	make -n BLORP_CLI_C_SPLIT=1 compile-prepared-blorp-cli
 )
 if ! grep -Fq '"$splitter_hash" "1"' <<<"$split_one_build_plan"; then

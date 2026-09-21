@@ -53,7 +53,7 @@ if ! "$compiler" compile --no-format -o "$rebuilt_cli_c" \
     exit 1
 fi
 
-if ! "${CC:-cc}" -O0 -fwrapv -pipe -w \
+if ! "${BLORP_CC:-clang}" -O0 -fwrapv -pipe -w \
     -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
     -Iblorp/src/compiler/stage_01_generated_inputs \
     -Iblorp/src/compiler/stage_04_modules \

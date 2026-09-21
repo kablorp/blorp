@@ -1526,7 +1526,7 @@ fi
 expect_exit "compile profile window probe" 0 \
 	"$BLORP_BIN" compile --profile --no-format -o "$profile_window_c" "$profile_window_prog"
 expect_exit "link profile window probe" 0 \
-	"${CC:-cc}" -O0 -fwrapv -w "$profile_window_c" -lm -lpthread -o "$profile_window_bin"
+	"${BLORP_CC:-clang}" -O0 -fwrapv -w "$profile_window_c" -lm -lpthread -o "$profile_window_bin"
 TOTAL=$((TOTAL + 1))
 run_capture "" "$profile_window_bin"
 if [ "$RUN_CODE" -ne 0 ]; then
@@ -1782,7 +1782,7 @@ expect_process_inheritance "run_session_command inherits stdin" \
 	blorp/test/runtime/sys/process_inheritance_feedback.brp -- session
 expect_output_contains "run reports configured host discovery failure" 1 \
 	"host toolchain discovery failed" \
-	env CC="$TMPDIR_CLI/missing-cc" \
+	env BLORP_CC="$TMPDIR_CLI/missing-cc" \
 	"$BLORP_BIN" run --no-format --timeout 5 "$valid_prog"
 
 # A module name is the module's host path, and Core flattens it into a C
@@ -2018,7 +2018,7 @@ $RUN_OUTPUT"
 	expect_test_signal_exit "eligible suite handles SIGTERM during host discovery" TERM 143 \
 		"$host_discovery_signal_marker" "$host_discovery_descendant_marker" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" \
-		"CC=sh $signal_helper $host_discovery_signal_marker $host_discovery_descendant_marker" \
+		"BLORP_CC=sh $signal_helper $host_discovery_signal_marker $host_discovery_descendant_marker" \
 		"$BLORP_BIN" test --suite --timeout 5 \
 		blorp/test/runtime/types/test_bool.brp
 	expect_test_signal_exit "eligible suite handles SIGINT" INT 130 "$signal_marker" \
@@ -2233,7 +2233,7 @@ BRP
     TOTAL=$((TOTAL + 1))
     : > "$formatter_err"
     if "$BLORP_BIN" compile --no-format -o "$formatter_tool_c" blorp/src/format/engine/formatter.brp > "$formatter_err" 2>&1 \
-        && "${CC:-cc}" -O2 -fwrapv -w "$formatter_tool_c" -lm -lpthread -o "$formatter_tool_bin" >> "$formatter_err" 2>&1; then
+        && "${BLORP_CC:-clang}" -O2 -fwrapv -w "$formatter_tool_c" -lm -lpthread -o "$formatter_tool_bin" >> "$formatter_err" 2>&1; then
         formatter_tool_ready=true
         record_pass "Blorp formatter tool compiles"
     else

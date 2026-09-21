@@ -117,7 +117,7 @@ int main(int argc, char** argv) {
 }
 C
 
-cc -std=c11 "$tmp_dir/provider.c" "$tmp_dir/dump.c" -o "$tmp_dir/dump"
+"${BLORP_CC:-clang}" -std=c11 "$tmp_dir/provider.c" "$tmp_dir/dump.c" -o "$tmp_dir/dump"
 
 {
 	printf '#define _GNU_SOURCE\n#define MINICORO_IMPL\n'

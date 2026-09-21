@@ -49,7 +49,7 @@ class RecordValidationTests(unittest.TestCase):
 			{
 				"BLORP_COMPILER_TEST_TIMEOUT": "17",
 				"BLORP_API_TOKEN": "do-not-record-this-secret",
-				"CC": "fake cc with spaces",
+				"BLORP_CC": "fake cc with spaces",
 			}
 		)
 		if extra_env is not None:
@@ -139,7 +139,7 @@ class RecordValidationTests(unittest.TestCase):
 			environment = metadata["environment"]
 			self.assertEqual(
 				environment,
-				{"BLORP_COMPILER_TEST_TIMEOUT": "17", "CC": "fake cc with spaces"},
+				{"BLORP_COMPILER_TEST_TIMEOUT": "17", "BLORP_CC": "fake cc with spaces"},
 			)
 			self.assertNotIn("do-not-record-this-secret", (output / "metadata.json").read_text())
 			self.assertIn("out:space value\n", (output / "stdout.log").read_text(encoding="utf-8"))

@@ -16,6 +16,11 @@ BLORP_CLI_C_HASH := $(BLORP_CLI_BUILD_DIR)/blorp_cli_main.c.sha256
 BLORP_CLI_C_BUILD_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/generated-c-build-inputs.sha256
 BLORP_CLI_C_OPTIMIZATION ?= -O0
 BLORP_CLI_RUNTIME_C_OPTIMIZATION ?= -O2
+# Host C compiler. Clang and GCC are both supported and both exercised in CI;
+# Clang is the default. `BLORP_CC=gcc make` selects GCC. `blorp --version`'s
+# `cc:` line and the harness toolchain fingerprint record whatever this was
+# set to, so a silent fallback to the wrong compiler cannot hide.
+BLORP_CC ?= clang
 # Number of translation units the generated CLI C is split into before the
 # host C compile. 8 is the measured default (see
 # benchmarks/results/split_generated_c_O0_O2_2026-09-17.md and
@@ -24,11 +29,11 @@ BLORP_CLI_RUNTIME_C_OPTIMIZATION ?= -O2
 BLORP_CLI_C_SPLIT ?= 8
 BLORP_CLI_SPLITTER := scripts/split-generated-c
 BLORP_CLI_SPLIT_DIR := $(BLORP_CLI_BUILD_DIR)/split-c
-# First line of `cc --version`, computed once and reused both for the
+# First line of `$(BLORP_CC) --version`, computed once and reused both for the
 # runtime config identity below and for the `cc:` line in `blorp --version`,
 # so the binary is the single source of truth for which C compiler built it.
-BLORP_CLI_CC_VERSION := $(shell cc --version 2>/dev/null | head -n 1)
-BLORP_CLI_RUNTIME_CONFIG_HASH := $(shell { printf '%s\n' '$(BLORP_CLI_RUNTIME_C_OPTIMIZATION)' '-fwrapv -pipe -w -DMINICORO_IMPL -DBLORP_COMPILER_RUNTIME_SOURCES=1'; shasum -a 256 blorp/src/lib/runtime/native/minicoro.h blorp/src/lib/runtime/native/runtime.c blorp/src/lib/runtime/native/runtime_decl.c; command -v cc; printf '%s\n' '$(BLORP_CLI_CC_VERSION)'; } | shasum -a 256 | awk '{print $$1}')
+BLORP_CLI_CC_VERSION := $(shell $(BLORP_CC) --version 2>/dev/null | head -n 1)
+BLORP_CLI_RUNTIME_CONFIG_HASH := $(shell { printf '%s\n' '$(BLORP_CLI_RUNTIME_C_OPTIMIZATION)' '-fwrapv -pipe -w -DMINICORO_IMPL -DBLORP_COMPILER_RUNTIME_SOURCES=1'; shasum -a 256 blorp/src/lib/runtime/native/minicoro.h blorp/src/lib/runtime/native/runtime.c blorp/src/lib/runtime/native/runtime_decl.c; command -v $(BLORP_CC); printf '%s\n' '$(BLORP_CLI_CC_VERSION)'; } | shasum -a 256 | awk '{print $$1}')
 BLORP_CLI_BUILD_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/build-inputs.sha256
 BLORP_CLI_INSTALL_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/install-inputs.sha256
 BLORP_CLI_BIN_HASH := $(BLORP_CLI_BUILD_DIR)/blorp.sha256
@@ -139,7 +144,7 @@ $(BLORP_BUILD_SOURCE_GENERATOR): $(BLORP_BUILD_SOURCE_GENERATOR_C)
 	@set -e; \
 	tmp="$@.tmp"; \
 	trap 'rm -f "$$tmp"' EXIT; \
-	cc -O2 -fwrapv -pipe -w "$<" -lm -lpthread -o "$$tmp"; \
+	$(BLORP_CC) -O2 -fwrapv -pipe -w "$<" -lm -lpthread -o "$$tmp"; \
 	mv "$$tmp" "$@"; \
 	trap - EXIT
 
@@ -175,7 +180,7 @@ $(BLORP_CLI_RUNTIME_OBJECT):
 	@set -e; \
 	tmp="$@.tmp"; \
 	trap 'rm -f "$$tmp"' EXIT; \
-	cc "$(BLORP_CLI_RUNTIME_C_OPTIMIZATION)" -fwrapv -pipe -w -DMINICORO_IMPL \
+	$(BLORP_CC) "$(BLORP_CLI_RUNTIME_C_OPTIMIZATION)" -fwrapv -pipe -w -DMINICORO_IMPL \
 		-DBLORP_COMPILER_RUNTIME_SOURCES=1 \
 		-include blorp/src/lib/runtime/native/minicoro.h -c blorp/src/lib/runtime/native/runtime.c -o "$$tmp"; \
 	mv "$$tmp" "$@"; \
@@ -222,7 +227,7 @@ $(BLORP_CLI_BUILD_STAMP_OBJECT): blorp-cli-build-stamp-force $(BLORP_CLI_BUILD_S
 	fi; \
 	tmp="$@.tmp"; \
 	trap 'rm -f "$$tmp"' EXIT; \
-	cc -O2 -fwrapv -pipe -w \
+	$(BLORP_CC) -O2 -fwrapv -pipe -w \
 		-DBLORP_BUILD_STAMP_COMMIT="\"$$commit\"" \
 		-DBLORP_BUILD_STAMP_TARGET="\"$$target\"" \
 		-DBLORP_BUILD_STAMP_COMPILED_BY="\"$$compiled_by\"" \
@@ -354,7 +359,7 @@ compile-prepared-blorp-cli: $(BLORP_CLI_RUNTIME_OBJECT) $(BLORP_CLI_BUILD_STAMP_
 			echo "Compiling Blorp CLI (single TU)"; \
 			rm -rf "$$split_dir"; \
 			mkdir -p "$$obj_dir"; \
-			cc "$(BLORP_CLI_C_OPTIMIZATION)" -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
+			$(BLORP_CC) "$(BLORP_CLI_C_OPTIMIZATION)" -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
 				-include blorp/src/lib/runtime/native/runtime_decl.c \
 				-Iblorp/src/compiler/stage_01_generated_inputs \
 				-Iblorp/src/compiler/stage_04_modules \
@@ -376,7 +381,7 @@ compile-prepared-blorp-cli: $(BLORP_CLI_RUNTIME_OBJECT) $(BLORP_CLI_BUILD_STAMP_
 				set -e; \
 				src="$$1"; \
 				base=$$(basename "$$src" .c); \
-				cc "$(BLORP_CLI_C_OPTIMIZATION)" -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
+				$(BLORP_CC) "$(BLORP_CLI_C_OPTIMIZATION)" -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
 					-include blorp/src/lib/runtime/native/runtime_decl.c \
 					-Iblorp/src/compiler/stage_01_generated_inputs \
 					-Iblorp/src/compiler/stage_04_modules \
@@ -412,7 +417,7 @@ compile-prepared-blorp-cli: $(BLORP_CLI_RUNTIME_OBJECT) $(BLORP_CLI_BUILD_STAMP_
 	actual_bin_hash=$$(shasum -a 256 "$(BLORP_CLI_BIN)" 2>/dev/null | awk '{print $$1}'); \
 	if [ "$$link_hash" != "$$old_link_hash" ] || [ ! -x "$(BLORP_CLI_BIN)" ] || [ -z "$$actual_bin_hash" ] || [ "$$actual_bin_hash" != "$$recorded_bin_hash" ]; then \
 		echo "Linking Blorp CLI"; \
-		cc "$(BLORP_CLI_C_OPTIMIZATION)" -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
+		$(BLORP_CC) "$(BLORP_CLI_C_OPTIMIZATION)" -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
 			-include blorp/src/lib/runtime/native/runtime_decl.c \
 			-Iblorp/src/compiler/stage_01_generated_inputs \
 			-Iblorp/src/compiler/stage_04_modules \
