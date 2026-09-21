@@ -50,24 +50,29 @@ No milestone may call a token-subset parser for selected expressions, infer
 node kind from spelling or shape, or keep two permanent grammar
 implementations.
 
-### Milestone 1 checkpoint: scalar, operator, and call oracle
+### Milestone 1 checkpoints
+
+#### Scalar, operator, and call oracle
 
 The first test-only form family covers names, scalar literals, raw parser
 interpolation literals, unary/binary/logical operators, calls,
 break/continue/void/builtin/missing forms. `ParsedStringInterpolationExpr` is
 stored only as the raw parser form in this checkpoint; no finalized
-interpolation semantics or rebased-source provenance is claimed. Every other
-expression form is explicitly rejected by the adapter, so this product is not
-a canonical full-grammar parser result.
+interpolation semantics or rebased-source provenance is claimed. Forms outside
+the admitted checkpoints are explicitly rejected by the adapter, so this
+product is not a canonical full-grammar parser result.
 
 The retained schema probe keeps its AST inputs outside the measurement epoch.
-The product-only lifetime for sixteen binary roots (48 nodes) is 8 objects and
-4,704 bytes, versus 81 objects and 5,824 bytes for freshly constructed legacy
-trees with the same root shape. This is a retained-layout comparison, not a
-construction-speed claim: the test oracle pays 218 allocations because it
-converts an existing AST and runs the exhaustive validator, while the legacy
-fixture construction pays 83. Empty, scalar, and binary compact products retain
-2/192, 6/736, and 8/896 objects/bytes respectively.
+After the collections/access checkpoint, the product-only lifetime for sixteen
+binary roots (48 nodes) is 8 objects and 4,768 bytes, versus 81 objects and
+5,824 bytes for freshly constructed legacy trees with the same root shape.
+This is a retained-layout comparison, not a construction-speed claim: the test
+oracle pays 223 allocations because it converts an existing AST and runs the
+exhaustive validator, while the legacy fixture construction pays 83. Empty,
+scalar, and binary compact products retain 2/256, 6/800, and 8/960
+objects/bytes respectively. The 64-byte increase at each size is the measured
+per-product cost of the five new inline-table handles and the larger product
+allocation class; it is explicit rather than hidden by a large-tree result.
 
 Both 48-node lifetime fixtures keep the same source and static identifier text
 outside the measurement epoch. The compact result additionally retains its
@@ -75,16 +80,67 @@ source-owner list, so the comparison does not hide that ownership cost. The
 legacy side constructs sixteen fresh three-node trees; the compact side stores
 sixteen equivalent roots rather than reusing one compact root.
 
-On the current 64-bit generated-C ABI, source-bearing locations are 16 bytes,
+On the current 64-bit generated-C ABI before collections/access expansion,
+source-bearing locations are 16 bytes,
 node headers are 48 bytes, bool rows are 1 byte, char rows are 8 bytes,
 text/operator/call/unit rows are 8 bytes, and string/interpolation rows are 16
 bytes. These rows use inline list storage.
 Text values live in one owned string table; text-bearing payload rows store an
 index instead of allocating one record per node. The opaque product record is
-120 bytes by ABI `sizeof` and occupies a 128-byte allocator size class. Raw
-evidence is reproduced by
+120 bytes by ABI `sizeof` and occupies a 128-byte allocator size class. With
+the five collections/access tables, the product is 160 bytes by ABI `sizeof`
+and occupies a 192-byte allocator size class. The nested aggregate probe covers
+two roots, 33 nodes, and 31 child ids across record update, dictionary, list,
+tuple, vector, field access, and multi-index subscript forms; it retains 12
+objects and 5,216 current live bytes. There is no paired legacy claim for that
+mixed shape. Raw evidence is reproduced by
 `blorp/benchmark/compiler/compact_expression_product_schema_probe.brp`; its
 output must be captured with `--leak-check` so live type buckets are available.
+The probe label is `current_live_bytes`: the runtime counter is current live
+memory at the snapshot, not cumulative bytes allocated during construction.
+Generated C confirms inline list storage for the new rows. Field-access
+payloads are 24 bytes, record payloads are 16 bytes, record-field rows are 40
+bytes, dictionary payloads are 16 bytes, and dictionary-entry rows are 16
+bytes on the same 64-bit ABI.
+
+#### Collections and access oracle
+
+The second test-only family covers field access, multi-index subscript, list,
+tuple, record, record update, dictionary, and vector expressions. Sequence
+item/index counts are derived from the node header instead of duplicated in a
+payload row. Record and dictionary payloads own checked slices into separate
+inline metadata tables. Record field rows preserve label text, label span, and
+field span without managed per-field wrappers; dictionary entry rows preserve
+entry spans. Values remain node children in source order.
+
+The direct reference oracle matches the current production consumer: a bare
+name target in `qualifier.member` produces one qualified reference, field
+labels do not become references, and a non-name field target recursively
+visits only its target. Subscript visits target before indices; record update
+visits base before field values; dictionaries visit each key before its value.
+Tests include chained access, call/subscript targets, repeated labels and
+names, grammar-permitted empty aggregate forms, multiple indices, and nested key/value
+expressions. There is still no production caller or compact-to-production
+bridge.
+
+Remaining milestone-1 coverage is deliberately finite:
+
+1. type-bearing wrappers and finalized interpolation parts: ascription,
+   range, opaque into/from, and interpolation-part expressions;
+2. control flow, patterns, and bindings: block, if, match, select, `with`,
+   debug, lambda, nested function declarations, loops, declarations,
+   assignment, subscript assignment, destructuring, and question binding;
+3. concurrency and recovery: concurrent block/for, detach, their parameter
+   metadata, and recovery-sensitive combinations of the existing missing form.
+
+After those checkpoints cover every `ParsedExpr` variant and their reachable
+pattern/binder rows, milestone 2 starts the first direct canonical construction
+path in `language_parser.brp`. It replaces the existing expression-tree
+construction for the complete expression grammar in one parser-owned path; it
+does not add a form-subset parser or leave the AST adapter in production. The
+adapter/projection remain test-only differential oracles, while the first
+production change measures direct construction plus the named consuming
+projection before any downstream caller migration.
 
 ## Goals
 

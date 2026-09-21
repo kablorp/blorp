@@ -25,6 +25,7 @@ import:
 			ParsedNotEqualOp,
 			ParsedSubtractOp,
 		),
+		ParsedDictEntry,
 		ParsedExpr(
 			ParsedBinaryExpr,
 			ParsedBoolLiteralExpr,
@@ -34,16 +35,26 @@ import:
 			ParsedCharLiteralExpr,
 			ParsedContinueExpr,
 			ParsedFloatLiteralExpr,
+			ParsedDictExpr,
+			ParsedFieldAccessExpr,
 			ParsedIntLiteralExpr,
+			ParsedListExpr,
 			ParsedLogicalExpr,
 			ParsedMissingExpr,
 			ParsedNameExpr,
 			ParsedStringInterpolationExpr,
 			ParsedStringLiteralExpr,
+			ParsedSubscriptExpr,
+			ParsedTupleExpr,
 			ParsedUnaryExpr,
+			ParsedRecordExpr,
+			ParsedRecordUpdateExpr,
+			ParsedVectorExpr,
 			ParsedVoidExpr,
 		),
+		ParsedIdentifier,
 		ParsedLogicalOp(ParsedAndOp, ParsedOrOp),
+		ParsedRecordExprField,
 		ParsedStringLiteralForm,
 		ParsedUnaryOp(ParsedNegateOp, ParsedNotOp),
 		parsed_identifier,
@@ -62,6 +73,14 @@ enum CompactExpressionNodeKind:
 	CompactBinaryNode
 	CompactLogicalNode
 	CompactCallNode
+	CompactFieldAccessNode
+	CompactSubscriptNode
+	CompactListNode
+	CompactTupleNode
+	CompactRecordNode
+	CompactRecordUpdateNode
+	CompactDictNode
+	CompactVectorNode
 	CompactBreakNode
 	CompactContinueNode
 	CompactVoidNode
@@ -114,6 +133,8 @@ enum CompactExpressionCorruption:
 	CompactSharedChild
 	CompactTextIndexAlias
 	CompactWrongArity
+	CompactMetadataSliceAlias
+	CompactAbsurdMetadataCount
 
 
 struct CompactProductSourceLocation {
@@ -168,6 +189,36 @@ struct CompactCallPayloadRow {
 }
 
 
+struct CompactFieldAccessPayloadRow {
+	field_text_index: Int,
+	field_span: CompactProductSourceLocation
+}
+
+
+struct CompactRecordPayloadRow {
+	field_start: Int,
+	field_count: Int
+}
+
+
+struct CompactRecordFieldRow {
+	name_text_index: Int,
+	name_span: CompactProductSourceLocation,
+	field_span: CompactProductSourceLocation
+}
+
+
+struct CompactDictPayloadRow {
+	entry_start: Int,
+	entry_count: Int
+}
+
+
+struct CompactDictEntryRow {
+	entry_span: CompactProductSourceLocation
+}
+
+
 struct CompactUnitPayloadRow {
 	kind: CompactUnitPayloadKind
 }
@@ -185,6 +236,11 @@ private record CompactExpressionProductRep {
 	char_payloads: List[CompactCharPayloadRow],
 	operator_payloads: List[CompactOperatorPayloadRow],
 	call_payloads: List[CompactCallPayloadRow],
+	field_access_payloads: List[CompactFieldAccessPayloadRow],
+	record_payloads: List[CompactRecordPayloadRow],
+	record_fields: List[CompactRecordFieldRow],
+	dict_payloads: List[CompactDictPayloadRow],
+	dict_entries: List[CompactDictEntryRow],
 	unit_payloads: List[CompactUnitPayloadRow],
 	roots: List[Int]
 }
@@ -205,6 +261,11 @@ record CompactExpressionProductCounts {
 	char_payload_count: Int,
 	operator_payload_count: Int,
 	call_payload_count: Int,
+	field_access_payload_count: Int,
+	record_payload_count: Int,
+	record_field_count: Int,
+	dict_payload_count: Int,
+	dict_entry_count: Int,
 	unit_payload_count: Int,
 	root_count: Int
 }
@@ -216,6 +277,18 @@ private union CompactBuildAction:
 	CompactBuildBinary(ParsedBinaryOp, SourceLocation)
 	CompactBuildLogical(ParsedLogicalOp, SourceLocation)
 	CompactBuildCall(Int, SourceLocation)
+	CompactBuildFieldAccess(ParsedIdentifier, SourceLocation)
+	CompactBuildSubscript(Int, SourceLocation)
+	CompactBuildSequence(CompactExpressionNodeKind, Int, SourceLocation)
+	CompactBuildRecord(List[ParsedRecordExprField], Bool, SourceLocation)
+	CompactBuildDict(List[ParsedDictEntry], SourceLocation)
+
+
+private union CompactReferenceAction:
+	CompactReferenceVisit(Int)
+
+
+private NO_COMPACT_PAYLOAD_INDEX: Int = -1
 
 
 private pure func compact_source_location(location: SourceLocation) -> CompactProductSourceLocation:
@@ -370,8 +443,20 @@ private pure func compact_expected_child_count(
 						None
 				None:
 					None
+		CompactFieldAccessNode:
+			Some(1)
+		CompactSubscriptNode:
+			None
+		CompactListNode | CompactTupleNode | CompactVectorNode:
+			None
+		CompactRecordNode | CompactRecordUpdateNode | CompactDictNode:
+			None
 		_:
 			Some(0)
+
+
+private pure func compact_metadata_slice_is_valid(start: Int, count: Int, length: Int) -> Bool:
+	start >= 0 and count >= 0 and start <= length and count <= length - start
 
 
 private pure func compact_source_span_is_valid(
@@ -403,6 +488,11 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 		var char_owners = 0.repeat(rep.char_payloads.length())
 		var operator_owners = 0.repeat(rep.operator_payloads.length())
 		var call_owners = 0.repeat(rep.call_payloads.length())
+		var field_access_owners = 0.repeat(rep.field_access_payloads.length())
+		var record_owners = 0.repeat(rep.record_payloads.length())
+		var record_field_slot_owners = 0.repeat(rep.record_fields.length())
+		var dict_owners = 0.repeat(rep.dict_payloads.length())
+		var dict_entry_slot_owners = 0.repeat(rep.dict_entries.length())
 		var unit_owners = 0.repeat(rep.unit_payloads.length())
 
 		for root in rep.roots:
@@ -428,7 +518,8 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 					if (
 						node.child_start < 0
 						or node.child_count < 0
-						or node.child_start + node.child_count > rep.children.length()
+						or node.child_start > rep.children.length()
+						or node.child_count > rep.children.length() - node.child_start
 					):
 						valid = False
 
@@ -441,7 +532,53 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 							if node.child_count != expected:
 								valid = False
 						None:
-							valid = False
+							match node.kind:
+								CompactSubscriptNode:
+									valid = (
+										node.child_count >= 1
+										and node.payload_index == NO_COMPACT_PAYLOAD_INDEX
+									)
+								CompactListNode | CompactTupleNode | CompactVectorNode:
+									valid = node.payload_index == NO_COMPACT_PAYLOAD_INDEX
+								CompactRecordNode | CompactRecordUpdateNode:
+									match rep.record_payloads.get(node.payload_index):
+										Some(payload):
+											valid = (
+												compact_metadata_slice_is_valid(
+													payload.field_start,
+													payload.field_count,
+													rep.record_fields.length(),
+												)
+												and ((
+													(
+														node.kind == CompactRecordNode
+														and node.child_count == payload.field_count
+													)
+													or (
+														node.kind == CompactRecordUpdateNode
+														and node.child_count >= 1
+														and node.child_count - 1 == payload.field_count
+													)
+												))
+											)
+										None:
+											valid = False
+								CompactDictNode:
+									match rep.dict_payloads.get(node.payload_index):
+										Some(payload):
+											valid = (
+												compact_metadata_slice_is_valid(
+													payload.entry_start,
+													payload.entry_count,
+													rep.dict_entries.length(),
+												)
+												and node.child_count % 2 == 0
+												and node.child_count / 2 == payload.entry_count
+											)
+										None:
+											valid = False
+								_:
+									valid = False
 
 					var child_offset: Int = 0
 
@@ -572,6 +709,114 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 								call_owners = call_owners.set(node.payload_index, call_owners
 										.get(node.payload_index)
 										.get_or(0) + 1)
+						CompactFieldAccessNode:
+							match rep.field_access_payloads.get(node.payload_index):
+								Some(payload):
+									if (
+										not compact_source_span_is_valid(
+											rep.source_owners,
+											payload.field_span,
+										)
+										or payload.field_text_index < 0
+										or payload.field_text_index >= rep.texts.length()
+									):
+										valid = False
+									else:
+										field_access_owners = field_access_owners.set(
+											node.payload_index,
+											field_access_owners
+												.get(node.payload_index)
+												.get_or(0) + 1,
+										)
+										owned_text_indices = owned_text_indices.set(
+											payload.field_text_index,
+											owned_text_indices
+												.get(payload.field_text_index)
+												.get_or(0) + 1,
+										)
+								None:
+									valid = False
+						CompactSubscriptNode | CompactListNode | CompactTupleNode | CompactVectorNode:
+							void
+						CompactRecordNode | CompactRecordUpdateNode:
+							match rep.record_payloads.get(node.payload_index):
+								Some(payload):
+									record_owners = record_owners.set(
+										node.payload_index,
+										record_owners
+											.get(node.payload_index)
+											.get_or(0) + 1,
+									)
+									var field_offset: Int = 0
+
+									while field_offset < payload.field_count and valid:
+										field_slot = payload.field_start + field_offset
+
+										match rep.record_fields.get(field_slot):
+											Some(field):
+												if (
+													not compact_source_span_is_valid(
+														rep.source_owners,
+														field.name_span,
+													)
+													or not compact_source_span_is_valid(
+														rep.source_owners,
+														field.field_span,
+													)
+													or field.name_text_index < 0
+													or field.name_text_index >= rep.texts.length()
+												):
+													valid = False
+												else:
+													record_field_slot_owners = record_field_slot_owners.set(
+														field_slot,
+														record_field_slot_owners
+															.get(field_slot)
+															.get_or(0) + 1,
+													)
+													owned_text_indices = owned_text_indices.set(
+														field.name_text_index,
+														owned_text_indices
+															.get(field.name_text_index)
+															.get_or(0) + 1,
+													)
+											None:
+												valid = False
+
+										field_offset += 1
+								None:
+									valid = False
+						CompactDictNode:
+							match rep.dict_payloads.get(node.payload_index):
+								Some(payload):
+									dict_owners = dict_owners.set(node.payload_index, dict_owners
+											.get(node.payload_index)
+											.get_or(0) + 1)
+									var entry_offset: Int = 0
+
+									while entry_offset < payload.entry_count and valid:
+										entry_slot = payload.entry_start + entry_offset
+
+										match rep.dict_entries.get(entry_slot):
+											Some(entry):
+												if not compact_source_span_is_valid(
+													rep.source_owners,
+													entry.entry_span,
+												):
+													valid = False
+												else:
+													dict_entry_slot_owners = dict_entry_slot_owners.set(
+														entry_slot,
+														dict_entry_slot_owners
+															.get(entry_slot)
+															.get_or(0) + 1,
+													)
+											None:
+												valid = False
+
+										entry_offset += 1
+								None:
+									valid = False
 						CompactBreakNode | CompactContinueNode | CompactVoidNode | CompactUnnamedBuiltinNode | CompactMissingNode:
 							match rep.unit_payloads.get(node.payload_index):
 								Some(payload):
@@ -632,6 +877,21 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 			for owners in call_owners:
 				valid = valid and owners == 1
 
+			for owners in field_access_owners:
+				valid = valid and owners == 1
+
+			for owners in record_owners:
+				valid = valid and owners == 1
+
+			for owners in record_field_slot_owners:
+				valid = valid and owners == 1
+
+			for owners in dict_owners:
+				valid = valid and owners == 1
+
+			for owners in dict_entry_slot_owners:
+				valid = valid and owners == 1
+
 			for owners in unit_owners:
 				valid = valid and owners == 1
 
@@ -654,6 +914,11 @@ pure func compact_expression_oracle_from_parsed_roots(
 	var char_payloads: List[CompactCharPayloadRow] = []
 	var operator_payloads: List[CompactOperatorPayloadRow] = []
 	var call_payloads: List[CompactCallPayloadRow] = []
+	var field_access_payloads: List[CompactFieldAccessPayloadRow] = []
+	var record_payloads: List[CompactRecordPayloadRow] = []
+	var record_fields: List[CompactRecordFieldRow] = []
+	var dict_payloads: List[CompactDictPayloadRow] = []
+	var dict_entries: List[CompactDictEntryRow] = []
 	var unit_payloads: List[CompactUnitPayloadRow] = []
 	var actions: List[CompactBuildAction] = []
 	var values: List[Int] = []
@@ -806,6 +1071,118 @@ pure func compact_expression_oracle_from_parsed_roots(
 							arg_index -= 1
 
 						actions = actions.append(CompactBuildVisit(callee))
+					ParsedFieldAccessExpr(target, field, span):
+						actions = actions
+							.append(CompactBuildFieldAccess(field, span))
+							.append(CompactBuildVisit(target))
+					ParsedSubscriptExpr(target, indices, span):
+						actions = actions.append(CompactBuildSubscript(indices.length(), span))
+						var index = indices.length() - 1
+
+						while index >= 0:
+							match indices.get(index):
+								Some(value):
+									actions = actions.append(CompactBuildVisit(value))
+								None:
+									supported = False
+
+							index -= 1
+
+						actions = actions.append(CompactBuildVisit(target))
+					ParsedListExpr(items, span):
+						actions = actions.append(
+							CompactBuildSequence(
+								CompactListNode,
+								items.length(),
+								span,
+							),
+						)
+						var index = items.length() - 1
+
+						while index >= 0:
+							match items.get(index):
+								Some(value):
+									actions = actions.append(CompactBuildVisit(value))
+								None:
+									supported = False
+
+							index -= 1
+					ParsedTupleExpr(items, span):
+						actions = actions.append(
+							CompactBuildSequence(
+								CompactTupleNode,
+								items.length(),
+								span,
+							),
+						)
+						var index = items.length() - 1
+
+						while index >= 0:
+							match items.get(index):
+								Some(value):
+									actions = actions.append(CompactBuildVisit(value))
+								None:
+									supported = False
+
+							index -= 1
+					ParsedRecordExpr(fields, span):
+						actions = actions.append(CompactBuildRecord(fields, False, span))
+						var index = fields.length() - 1
+
+						while index >= 0:
+							match fields.get(index):
+								Some(field):
+									actions = actions.append(CompactBuildVisit(field.value))
+								None:
+									supported = False
+
+							index -= 1
+					ParsedRecordUpdateExpr(base, fields, span):
+						actions = actions.append(CompactBuildRecord(fields, True, span))
+						var index = fields.length() - 1
+
+						while index >= 0:
+							match fields.get(index):
+								Some(field):
+									actions = actions.append(CompactBuildVisit(field.value))
+								None:
+									supported = False
+
+							index -= 1
+
+						actions = actions.append(CompactBuildVisit(base))
+					ParsedDictExpr(entries, span):
+						actions = actions.append(CompactBuildDict(entries, span))
+						var index = entries.length() - 1
+
+						while index >= 0:
+							match entries.get(index):
+								Some(entry):
+									actions = actions
+										.append(CompactBuildVisit(entry.value))
+										.append(CompactBuildVisit(entry.key))
+								None:
+									supported = False
+
+							index -= 1
+					ParsedVectorExpr(items, span):
+						actions = actions.append(
+							CompactBuildSequence(
+								CompactVectorNode,
+								items.length(),
+								span,
+							),
+						)
+						var index = items.length() - 1
+
+						while index >= 0:
+							match items.get(index):
+								Some(value):
+									actions = actions.append(CompactBuildVisit(value))
+								None:
+									supported = False
+
+							index -= 1
 					ParsedBreakExpr(span):
 						payload_index = unit_payloads.length()
 						unit_payloads = unit_payloads.append({kind = CompactBreakPayload})
@@ -1003,6 +1380,180 @@ pure func compact_expression_oracle_from_parsed_roots(
 						span = compact_source_location(span),
 					})
 					values = values.append(node_index)
+			Some(CompactBuildFieldAccess(field, span)):
+				if values.is_empty():
+					supported = False
+				else:
+					value_start = values.length() - 1
+					child_start = children.length()
+					children = children.append(
+						values
+							.get(value_start)
+							.get_or(-1),
+					)
+					values = values.take(value_start)
+					text_index = texts.length()
+					texts = texts.append(field.text)
+					payload_index = field_access_payloads.length()
+					field_access_payloads = field_access_payloads.append({
+						field_text_index = text_index,
+						field_span = compact_source_location(field.span),
+					})
+					node_index = nodes.length()
+					nodes = nodes.append({
+						kind = CompactFieldAccessNode,
+						payload_index = payload_index,
+						child_start = child_start,
+						child_count = 1,
+						span = compact_source_location(span),
+					})
+					values = values.append(node_index)
+			Some(CompactBuildSubscript(index_count, span)):
+				child_count = index_count + 1
+
+				if index_count < 0 or values.length() < child_count:
+					supported = False
+				else:
+					value_start = values.length() - child_count
+					child_start = children.length()
+					var value_index = value_start
+
+					while value_index < values.length():
+						children = children.append(
+							values
+								.get(value_index)
+								.get_or(-1),
+						)
+						value_index += 1
+
+					values = values.take(value_start)
+					node_index = nodes.length()
+					nodes = nodes.append({
+						kind = CompactSubscriptNode,
+						payload_index = NO_COMPACT_PAYLOAD_INDEX,
+						child_start = child_start,
+						child_count = child_count,
+						span = compact_source_location(span),
+					})
+					values = values.append(node_index)
+			Some(CompactBuildSequence(kind, item_count, span)):
+				if item_count < 0 or values.length() < item_count:
+					supported = False
+				else:
+					value_start = values.length() - item_count
+					child_start = children.length()
+					var value_index = value_start
+
+					while value_index < values.length():
+						children = children.append(
+							values
+								.get(value_index)
+								.get_or(-1),
+						)
+						value_index += 1
+
+					values = values.take(value_start)
+					node_index = nodes.length()
+					nodes = nodes.append({
+						kind = kind,
+						payload_index = NO_COMPACT_PAYLOAD_INDEX,
+						child_start = child_start,
+						child_count = item_count,
+						span = compact_source_location(span),
+					})
+					values = values.append(node_index)
+			Some(CompactBuildRecord(fields, is_update, span)):
+				var child_count = fields.length()
+
+				if is_update:
+					child_count += 1
+
+				if values.length() < child_count:
+					supported = False
+				else:
+					value_start = values.length() - child_count
+					child_start = children.length()
+					var value_index = value_start
+
+					while value_index < values.length():
+						children = children.append(
+							values
+								.get(value_index)
+								.get_or(-1),
+						)
+						value_index += 1
+
+					values = values.take(value_start)
+					field_start = record_fields.length()
+
+					for field in fields:
+						text_index = texts.length()
+						texts = texts.append(field.name.text)
+						record_fields = record_fields.append({
+							name_text_index = text_index,
+							name_span = compact_source_location(field.name.span),
+							field_span = compact_source_location(field.span),
+						})
+
+					payload_index = record_payloads.length()
+					record_payloads = record_payloads.append({
+						field_start = field_start,
+						field_count = fields.length(),
+					})
+					var kind = CompactRecordNode
+
+					if is_update:
+						kind = CompactRecordUpdateNode
+
+					node_index = nodes.length()
+					nodes = nodes.append({
+						kind = kind,
+						payload_index = payload_index,
+						child_start = child_start,
+						child_count = child_count,
+						span = compact_source_location(span),
+					})
+					values = values.append(node_index)
+			Some(CompactBuildDict(entries, span)):
+				child_count = entries.length() * 2
+
+				if values.length() < child_count:
+					supported = False
+				else:
+					value_start = values.length() - child_count
+					child_start = children.length()
+					var value_index = value_start
+
+					while value_index < values.length():
+						children = children.append(
+							values
+								.get(value_index)
+								.get_or(-1),
+						)
+						value_index += 1
+
+					values = values.take(value_start)
+					entry_start = dict_entries.length()
+
+					for entry in entries:
+						dict_entries = dict_entries.append(
+							{entry_span = compact_source_location(entry.span)},
+						)
+
+					payload_index = dict_payloads.length()
+					dict_payloads = dict_payloads.append({
+						entry_start = entry_start,
+						entry_count = entries.length(),
+					})
+					node_index = nodes.length()
+					nodes = nodes.append({
+						kind = CompactDictNode,
+						payload_index = payload_index,
+						child_start = child_start,
+						child_count = child_count,
+						span = compact_source_location(span),
+					})
+					values = values.append(node_index)
 			None:
 				supported = False
 
@@ -1021,6 +1572,11 @@ pure func compact_expression_oracle_from_parsed_roots(
 			char_payloads = char_payloads,
 			operator_payloads = operator_payloads,
 			call_payloads = call_payloads,
+			field_access_payloads = field_access_payloads,
+			record_payloads = record_payloads,
+			record_fields = record_fields,
+			dict_payloads = dict_payloads,
+			dict_entries = dict_entries,
 			unit_payloads = unit_payloads,
 			roots = values
 		}
@@ -1053,6 +1609,101 @@ private pure func compact_text_payload(
 			rep.texts.get(payload.text_index)
 		None:
 			None
+
+
+private pure func projected_children(
+	rep: CompactExpressionProductRep,
+	projected: List[ParsedExpr],
+	node: CompactExpressionNodeRow,
+	start_offset: Int,
+) -> Option[List[ParsedExpr]]:
+	var values: List[ParsedExpr] = []
+	var offset = start_offset
+	var valid = True
+
+	while offset < node.child_count and valid:
+		match projected_child(rep, projected, node, offset):
+			Some(value):
+				values = values.append(value)
+			None:
+				valid = False
+
+		offset += 1
+
+	if valid:
+		Some(values)
+	else:
+		None
+
+
+private pure func projected_record_fields(
+	rep: CompactExpressionProductRep,
+	projected: List[ParsedExpr],
+	node: CompactExpressionNodeRow,
+	payload: CompactRecordPayloadRow,
+	child_start_offset: Int,
+) -> Option[List[ParsedRecordExprField]]:
+	var fields: List[ParsedRecordExprField] = []
+	var offset: Int = 0
+	var valid = True
+
+	while offset < payload.field_count and valid:
+		match (
+			rep.record_fields.get(payload.field_start + offset),
+			projected_child(rep, projected, node, child_start_offset + offset),
+		):
+			(Some(field), Some(value)):
+				match rep.texts.get(field.name_text_index):
+					Some(name):
+						fields = fields.append({
+							name = parsed_identifier(name, field.name_span.location),
+							value = value,
+							span = field.field_span.location,
+						})
+					None:
+						valid = False
+			_:
+				valid = False
+
+		offset += 1
+
+	if valid:
+		Some(fields)
+	else:
+		None
+
+
+private pure func projected_dict_entries(
+	rep: CompactExpressionProductRep,
+	projected: List[ParsedExpr],
+	node: CompactExpressionNodeRow,
+	payload: CompactDictPayloadRow,
+) -> Option[List[ParsedDictEntry]]:
+	var entries: List[ParsedDictEntry] = []
+	var offset: Int = 0
+	var valid = True
+
+	while offset < payload.entry_count and valid:
+		match (
+			rep.dict_entries.get(payload.entry_start + offset),
+			projected_child(rep, projected, node, offset * 2),
+			projected_child(rep, projected, node, offset * 2 + 1),
+		):
+			(Some(entry), Some(key), Some(value)):
+				entries = entries.append({
+					key = key,
+					value = value,
+					span = entry.entry_span.location,
+				})
+			_:
+				valid = False
+
+		offset += 1
+
+	if valid:
+		Some(entries)
+	else:
+		None
 
 
 pure func compact_expression_oracle_project(
@@ -1188,6 +1839,101 @@ pure func compact_expression_oracle_project(
 									value = Some(ParsedCallExpr(callee, args, span))
 							None:
 								void
+					CompactFieldAccessNode:
+						match (
+							rep.field_access_payloads.get(node.payload_index),
+							projected_child(rep, projected, node, 0),
+						):
+							(Some(payload), Some(target)):
+								value = rep.texts
+									.get(payload.field_text_index)
+									.map(func(field): ParsedFieldAccessExpr(
+											target,
+											parsed_identifier(field, payload.field_span.location),
+											span,
+										))
+							_:
+								void
+					CompactSubscriptNode:
+						match (
+							projected_child(rep, projected, node, 0),
+							projected_children(rep, projected, node, 1),
+						):
+							(Some(target), Some(indices)):
+								value = Some(ParsedSubscriptExpr(target, indices, span))
+							_:
+								void
+					CompactListNode:
+						value = projected_children(
+							rep,
+							projected,
+							node,
+							0,
+						).map(
+							func(items): ParsedListExpr(items, span),
+						)
+					CompactTupleNode:
+						value = projected_children(
+							rep,
+							projected,
+							node,
+							0,
+						).map(
+							func(items): ParsedTupleExpr(items, span),
+						)
+					CompactRecordNode:
+						match rep.record_payloads.get(node.payload_index):
+							Some(payload):
+								value = projected_record_fields(
+									rep,
+									projected,
+									node,
+									payload,
+									0,
+								).map(
+									func(fields): ParsedRecordExpr(fields, span),
+								)
+							None:
+								void
+					CompactRecordUpdateNode:
+						match (
+							rep.record_payloads.get(node.payload_index),
+							projected_child(rep, projected, node, 0),
+						):
+							(Some(payload), Some(base)):
+								value = projected_record_fields(
+									rep,
+									projected,
+									node,
+									payload,
+									1,
+								).map(
+									func(fields): ParsedRecordUpdateExpr(base, fields, span),
+								)
+							_:
+								void
+					CompactDictNode:
+						match rep.dict_payloads.get(node.payload_index):
+							Some(payload):
+								value = projected_dict_entries(
+									rep,
+									projected,
+									node,
+									payload,
+								).map(
+									func(entries): ParsedDictExpr(entries, span),
+								)
+							None:
+								void
+					CompactVectorNode:
+						value = projected_children(
+							rep,
+							projected,
+							node,
+							0,
+						).map(
+							func(items): ParsedVectorExpr(items, span),
+						)
 					CompactBreakNode:
 						value = Some(ParsedBreakExpr(span))
 					CompactContinueNode:
@@ -1239,20 +1985,90 @@ pure func compact_expression_oracle_free_identifier_references(
 ) -> List[IdentifierReference]:
 	rep = from_opaque ValidatedExpressionProduct(product)
 	var references: List[IdentifierReference] = []
+	var actions: List[CompactReferenceAction] = []
+	var root_index = rep.roots.length() - 1
 
-	-- Postorder rows preserve the current left-to-right encounter order for the
-	-- first family: unary, binary/logical, and callee-before-argument calls.
-	for node in rep.nodes:
-		if node.kind == CompactNameNode:
-			match compact_text_payload(rep, node.payload_index):
-				Some(text):
-					references = references.append({
-						name = text,
-						qualified_member = None,
-						span = node.span.location,
-					})
-				None:
-					void
+	while root_index >= 0:
+		actions = actions.append(
+			CompactReferenceVisit(
+				rep.roots
+					.get(root_index)
+					.get_or(-1),
+			),
+		)
+		root_index -= 1
+
+	-- Preorder actions preserve the production consumer's source order and let
+	-- field access classify a bare-name target before visiting it as a free name.
+	while not actions.is_empty():
+		action_index = actions.length() - 1
+		action = actions.get(action_index)
+		actions = actions.take(action_index)
+
+		match action:
+			Some(CompactReferenceVisit(node_id)):
+				match rep.nodes.get(node_id):
+					Some(node):
+						match node.kind:
+							CompactNameNode:
+								match compact_text_payload(rep, node.payload_index):
+									Some(text):
+										references = references.append({
+											name = text,
+											qualified_member = None,
+											span = node.span.location,
+										})
+									None:
+										void
+							CompactFieldAccessNode:
+								match (
+									rep.children.get(node.child_start),
+									rep.field_access_payloads.get(node.payload_index),
+								):
+									(Some(target_id), Some(payload)):
+										match rep.nodes.get(target_id):
+											Some(target):
+												if target.kind == CompactNameNode:
+													match (
+														compact_text_payload(
+															rep,
+															target.payload_index,
+														),
+														rep.texts.get(payload.field_text_index),
+													):
+														(Some(name), Some(member)):
+															references = references.append({
+																name = name,
+																qualified_member = Some(member),
+																span = target.span.location,
+															})
+														_:
+															void
+												else:
+													actions = actions.append(
+														CompactReferenceVisit(target_id),
+													)
+											None:
+												void
+									_:
+										void
+							_:
+								var child_offset = node.child_count - 1
+
+								while child_offset >= 0:
+									match rep.children.get(node.child_start + child_offset):
+										Some(child_id):
+											actions = actions.append(
+												CompactReferenceVisit(child_id),
+											)
+										None:
+											void
+
+									child_offset -= 1
+					None:
+						void
+			None:
+				void
 
 	references
 
@@ -1273,6 +2089,11 @@ pure func compact_expression_oracle_counts(
 		char_payload_count = rep.char_payloads.length(),
 		operator_payload_count = rep.operator_payloads.length(),
 		call_payload_count = rep.call_payloads.length(),
+		field_access_payload_count = rep.field_access_payloads.length(),
+		record_payload_count = rep.record_payloads.length(),
+		record_field_count = rep.record_fields.length(),
+		dict_payload_count = rep.dict_payloads.length(),
+		dict_entry_count = rep.dict_entries.length(),
 		unit_payload_count = rep.unit_payloads.length(),
 		root_count = rep.roots.length()
 	}
@@ -1300,6 +2121,26 @@ pure func compact_expression_oracle_rejects_corruption(
 			right,
 			start_span.location,
 		)
+		record_a = ParsedRecordExpr(
+			[
+				{
+					name = parsed_identifier("first", start_span.location),
+					value = left,
+					span = start_span.location
+				},
+			],
+			start_span.location,
+		)
+		record_b = ParsedRecordExpr(
+			[
+				{
+					name = parsed_identifier("second", start_span.location),
+					value = right,
+					span = start_span.location
+				},
+			],
+			start_span.location,
+		)
 
 		match (
 			compact_expression_oracle_from_parsed_roots(
@@ -1308,6 +2149,8 @@ pure func compact_expression_oracle_rejects_corruption(
 					base,
 					ParsedBoolLiteralExpr(True, start_span.location),
 					ParsedCallExpr(left, [], start_span.location),
+					record_a,
+					record_b,
 				],
 			)
 		):
@@ -1319,6 +2162,12 @@ pure func compact_expression_oracle_rejects_corruption(
 					.get_or(-1)
 				call_root = rep.roots
 					.get(2)
+					.get_or(-1)
+				record_a_root = rep.roots
+					.get(3)
+					.get_or(-1)
+				record_b_root = rep.roots
+					.get(4)
 					.get_or(-1)
 
 				match corruption:
@@ -1413,6 +2262,39 @@ pure func compact_expression_oracle_rejects_corruption(
 								corrupted = { rep |
 									nodes = rep.nodes.set(binary_root, { node | child_count = 1 })
 								}
+							None:
+								void
+					CompactMetadataSliceAlias:
+						match (rep.nodes.get(record_a_root), rep.nodes.get(record_b_root)):
+							(Some(first_node), Some(second_node)):
+								match (
+									rep.record_payloads.get(first_node.payload_index),
+									rep.record_payloads.get(second_node.payload_index),
+								):
+									(Some(first), Some(second)):
+										corrupted = { rep |
+											record_payloads = rep.record_payloads.set(
+												second_node.payload_index,
+												{ second | field_start = first.field_start },
+											)
+										}
+									_:
+										void
+							_:
+								void
+					CompactAbsurdMetadataCount:
+						match rep.nodes.get(record_a_root):
+							Some(node):
+								match rep.record_payloads.get(node.payload_index):
+									Some(payload):
+										corrupted = { rep |
+											record_payloads = rep.record_payloads.set(
+												node.payload_index,
+												{ payload | field_count = 999999999 },
+											)
+										}
+									None:
+										void
 							None:
 								void
 
