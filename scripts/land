@@ -1,0 +1,122 @@
+#!/bin/bash
+# Squash-merge one commit/branch onto main, gate it, and push ff-only.
+#
+#   scripts/land <commit-or-branch> --title "<title>" [--body "<text>"] \
+#       [--record <json> --record-name <file>] [--gate <scripts/test gate>]... \
+#       [--dry-run]
+set -euo pipefail
+
+lock() { benchmarks/self_compile_measure lock -- "$@"; }
+verdict_status() { grep '^BLORP_GATE_RESULT ' | tail -1 | sed -n 's/.*status=\([A-Z]*\).*/\1/p'; }
+emit_verdict() { printf 'BLORP_GATE_RESULT gate=land status=%s passed=%s failed=%s tests=1\n' "$1" "$2" "$3"; }
+usage() {
+    echo "Usage: scripts/land <commit-or-branch> --title TITLE [--body TEXT]" >&2
+    echo "  [--record JSON --record-name FILE] [--gate GATE]... [--dry-run]" >&2
+}
+
+ref="" title="" body="" record="" record_name="" dry_run=0
+gates=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --title) title="$2"; shift 2 ;;
+        --body) body="$2"; shift 2 ;;
+        --record) record="$2"; shift 2 ;;
+        --record-name) record_name="$2"; shift 2 ;;
+        --gate) gates+=("$2"); shift 2 ;;
+        --dry-run) dry_run=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        -*) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+        *) [ -z "$ref" ] || { echo "Only one commit-or-branch may be given." >&2; exit 1; }; ref="$1"; shift ;;
+    esac
+done
+
+[ -n "$ref" ] || { echo "Missing commit-or-branch." >&2; usage; exit 1; }
+[ -n "$title" ] || { echo "Missing --title." >&2; usage; exit 1; }
+case "$title" in
+    Merge*) echo "Refusing title starting with 'Merge': $title" >&2; exit 1 ;;
+esac
+printf '%s' "$title" | grep -Eq '#[0-9]+' &&
+    { echo "Refusing title containing an issue reference: $title" >&2; exit 1; }
+if { [ -n "$record" ] && [ -z "$record_name" ]; } || { [ -z "$record" ] && [ -n "$record_name" ]; }; then
+    echo "--record and --record-name must be given together." >&2
+    exit 1
+fi
+
+branch="$(git rev-parse --abbrev-ref HEAD)"
+if [ "$branch" != "main" ] || [ -n "$(git status --porcelain)" ]; then
+    echo "Refusing: run scripts/land from a clean checkout of main." >&2
+    exit 1
+fi
+
+git fetch origin
+git merge --ff-only origin/main
+
+squash_status=0
+git merge --squash "$ref" || squash_status=$?
+conflicts="$(git diff --name-only --diff-filter=U || true)"
+if [ "$squash_status" -ne 0 ] && [ -z "$conflicts" ]; then
+    echo "git merge --squash $ref failed." >&2
+    exit "$squash_status"
+fi
+for path in $conflicts; do
+    case "$path" in
+        benchmarks/results/*|*harness*) git checkout --ours -- "$path"; git add -- "$path" ;;
+    esac
+done
+remaining="$(git diff --name-only --diff-filter=U || true)"
+if [ -n "$remaining" ]; then
+    echo "Unresolved merge conflicts outside benchmarks/results and harness paths:" >&2
+    echo "$remaining" >&2
+    exit 1
+fi
+
+if [ -n "$record" ]; then
+    mkdir -p benchmarks/results
+    cp "$record" "benchmarks/results/$record_name"
+    git add "benchmarks/results/$record_name"
+fi
+
+if [ -n "$body" ]; then
+    git commit -m "$title" -m "$body"
+else
+    git commit -m "$title"
+fi
+
+make
+echo "Build stamp: $(bin/blorp --version)"
+scripts/compiler-build-status
+
+overall="PASS"
+result="$(lock scripts/compiler-check --changed --base origin/main | tee /dev/stderr || true)"
+[ "$(printf '%s\n' "$result" | verdict_status)" = "PASS" ] || overall="FAIL"
+gate_count=${#gates[@]}
+i=0
+while [ "$i" -lt "$gate_count" ]; do
+    gate="${gates[$i]}"
+    result="$(lock scripts/test --no-build "$gate" | tee /dev/stderr || true)"
+    [ "$(printf '%s\n' "$result" | verdict_status)" = "PASS" ] || overall="FAIL"
+    i=$((i + 1))
+done
+
+landed_sha="$(git rev-parse HEAD)"
+if [ "$overall" != "PASS" ]; then
+    emit_verdict FAIL 0 1
+    exit 1
+fi
+
+if [ "$dry_run" -eq 1 ]; then
+    emit_verdict PASS 1 0
+    echo "Dry run: not pushed. Landed commit (local): $landed_sha"
+    exit 0
+fi
+
+git fetch origin
+if ! git merge-base --is-ancestor origin/main HEAD; then
+    emit_verdict FAIL 0 1
+    echo "origin/main moved; rerun." >&2
+    exit 1
+fi
+
+git push origin HEAD:main
+emit_verdict PASS 1 0
+echo "Landed $landed_sha on main."

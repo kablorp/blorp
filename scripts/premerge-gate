@@ -27,6 +27,33 @@ leak_test_timeout="${BLORP_LEAK_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-60}}"
 compiler_test_timeout="${BLORP_COMPILER_TEST_TIMEOUT:-360}"
 example_timeout=10
 
+# scripts/test's own BLORP_GATE_RESULT line (from run_test_suites, below) is
+# captured here so this script can print one aggregate verdict line of its
+# own as the last line of stdout, however the script exits.
+PREMERGE_TEST_LOG=$(mktemp "${TMPDIR:-/tmp}/blorp-premerge-test.XXXXXX")
+
+premerge_gate_verdict() {
+    local exit_code=$?
+    local total_passed=0 total_failed=0 total_tests=0 overall="PASS"
+    local line status
+    line=$(grep '^BLORP_GATE_RESULT gate=' "$PREMERGE_TEST_LOG" 2>/dev/null | tail -1 || true)
+    rm -f "$PREMERGE_TEST_LOG"
+    if [ -n "$line" ]; then
+        status=$(printf '%s\n' "$line" | sed -n 's/.*status=\([A-Z]*\).*/\1/p')
+        total_passed=$(printf '%s\n' "$line" | sed -n 's/.*passed=\([0-9]*\).*/\1/p')
+        total_failed=$(printf '%s\n' "$line" | sed -n 's/.*failed=\([0-9]*\).*/\1/p')
+        total_tests=$(printf '%s\n' "$line" | sed -n 's/.*tests=\([0-9]*\).*/\1/p')
+        [ "$status" = "FAIL" ] && overall="FAIL"
+    fi
+    if [ "$exit_code" -ne 0 ]; then
+        overall="FAIL"
+    fi
+    printf 'BLORP_GATE_RESULT gate=premerge-gate status=%s passed=%s failed=%s tests=%s\n' \
+        "$overall" "${total_passed:-0}" "${total_failed:-0}" "${total_tests:-0}"
+    exit "$exit_code"
+}
+trap premerge_gate_verdict EXIT
+
 usage() {
     cat <<'EOF'
 Usage: scripts/premerge-gate [options]
@@ -310,11 +337,20 @@ run_test_suites() {
     if [ "$release_compiler" -eq 1 ]; then
         test_flags+=(--release-compiler)
     fi
-    run_cmd env "BLORP_TEST_TIMEOUT=$test_timeout" \
+    local cmd=(
+        env "BLORP_TEST_TIMEOUT=$test_timeout" \
         "BLORP_RUNTIME_TEST_TIMEOUT=$runtime_test_timeout" \
         "BLORP_LEAK_TEST_TIMEOUT=$leak_test_timeout" \
         "BLORP_COMPILER_TEST_TIMEOUT=$compiler_test_timeout" scripts/test "${test_flags[@]}" \
         compiler-blorp compiler-tools std-check runtime leak doctest cli-deep lsp
+    )
+    printf '+ '
+    quote_cmd "${cmd[@]}"
+    echo ""
+    if [ "$dry_run" -eq 1 ]; then
+        return 0
+    fi
+    "${cmd[@]}" | tee "$PREMERGE_TEST_LOG"
 }
 
 run_codegen_audit() {

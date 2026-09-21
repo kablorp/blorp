@@ -615,9 +615,14 @@ def _print_plan_json(manifest: Manifest, plan: Plan) -> None:
     print(json.dumps(payload, indent=2))
 
 
-def _run_logged(command: list[str], root: Path, log_path: Path) -> int:
+def _run_logged(
+    command: list[str], root: Path, log_path: Path, extra_env: dict[str, str] | None = None
+) -> int:
     print(f"Running: {shlex.join(command)}")
     sys.stdout.flush()
+    env = dict(os.environ)
+    if extra_env:
+        env.update(extra_env)
     with log_path.open("w", encoding="utf-8") as log:
         process = subprocess.Popen(
             command,
@@ -625,12 +630,40 @@ def _run_logged(command: list[str], root: Path, log_path: Path) -> int:
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            env=env,
         )
         assert process.stdout is not None
         for line in process.stdout:
             log.write(line)
             log.flush()
         return process.wait()
+
+
+GATE_RESULT_PATTERN = re.compile(
+    r"^BLORP_GATE_RESULT gate=\S+ status=(?P<status>PASS|FAIL) "
+    r"passed=(?P<passed>\d+) failed=(?P<failed>\d+) tests=(?P<tests>\d+)\s*$"
+)
+
+
+def _read_gate_result(log_path: Path) -> tuple[int, int, int] | None:
+    """Return (passed, failed, tests) from the last BLORP_GATE_RESULT line, if any."""
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        match = GATE_RESULT_PATTERN.match(line.strip())
+        if match:
+            return int(match["passed"]), int(match["failed"]), int(match["tests"])
+    return None
+
+
+def _print_verdict(status: int, passed: int, failed: int, tests: int) -> None:
+    verdict = "PASS" if status == 0 else "FAIL"
+    print(
+        f"BLORP_GATE_RESULT gate=compiler-check status={verdict} "
+        f"passed={passed} failed={failed} tests={tests}"
+    )
 
 
 def _repository_revision(root: Path) -> str:
@@ -668,6 +701,7 @@ def execute_selection(root: Path, selection: Selection, original_arguments: list
         print(
             f"Compiler check completed with no selected work in {elapsed:.2f}s"
         )
+        _print_verdict(0, 0, 0, 0)
         return 0
 
     log_root = root / "logs"
@@ -690,14 +724,32 @@ def execute_selection(root: Path, selection: Selection, original_arguments: list
         encoding="utf-8",
     )
 
+    total_passed = 0
+    total_failed = 0
+    total_tests = 0
+
     status = _run_logged(["make"], root, log_directory / "prepare.log")
     if status == 0 and selection.suites:
         timeout = os.environ.get("BLORP_COMPILER_TEST_TIMEOUT", DEFAULT_SUITE_TIMEOUT_SECONDS)
+        suites_log = log_directory / "suites.log"
         status = _run_logged(
             ["bin/blorp", "test", "--timeout", timeout, *[suite.path for suite in selection.suites]],
             root,
-            log_directory / "suites.log",
+            suites_log,
+            extra_env={"BLORP_GATE_RESULT": "compiler-check-suites"},
         )
+        result = _read_gate_result(suites_log)
+        if result is not None:
+            passed, failed, tests = result
+            total_passed += passed
+            total_failed += failed
+            total_tests += tests
+        else:
+            total_tests += 1
+            if status == 0:
+                total_passed += 1
+            else:
+                total_failed += 1
     if status == 0:
         for check in selection.checks:
             if check.gate is not None:
@@ -714,7 +766,20 @@ def execute_selection(root: Path, selection: Selection, original_arguments: list
             else:
                 assert check.command is not None
                 command = list(check.command)
-            status = _run_logged(command, root, log_directory / f"check-{check.identifier}.log")
+            check_log = log_directory / f"check-{check.identifier}.log"
+            status = _run_logged(command, root, check_log)
+            result = _read_gate_result(check_log)
+            if result is not None:
+                passed, failed, tests = result
+                total_passed += passed
+                total_failed += failed
+                total_tests += tests
+            else:
+                total_tests += 1
+                if status == 0:
+                    total_passed += 1
+                else:
+                    total_failed += 1
             if status != 0:
                 break
 
@@ -723,6 +788,7 @@ def execute_selection(root: Path, selection: Selection, original_arguments: list
         print(f"Compiler check failed with status {status}.", file=sys.stderr)
         print(f"Rerun: {rerun}", file=sys.stderr)
         print(f"Logs retained at: {log_directory.relative_to(root)}", file=sys.stderr)
+        _print_verdict(status, total_passed, total_failed, total_tests)
         return status
 
     shutil.rmtree(log_directory)
@@ -731,6 +797,7 @@ def execute_selection(root: Path, selection: Selection, original_arguments: list
         f"Compiler check passed: {len(selection.sources)} sources, "
         f"{len(selection.suites)} suites, {len(selection.checks)} checks in {elapsed:.2f}s"
     )
+    _print_verdict(0, total_passed, total_failed, total_tests)
     return 0
 
 

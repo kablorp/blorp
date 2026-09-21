@@ -122,6 +122,20 @@ trading a slower build for a faster compiler in the gates that follow; see
 "Compiler optimization level" in `docs/DEVELOPMENT.md` for the -O0/-O2 split
 and the re-link cost of switching levels between runs.
 
+Every gate entry point (`scripts/test`, `scripts/compiler-check`,
+`scripts/premerge-gate`, `scripts/docker-gate`) prints exactly one machine-
+readable verdict line as the last line of stdout:
+
+```
+BLORP_GATE_RESULT gate=<entrypoint> status=PASS|FAIL passed=N failed=N tests=N
+```
+
+`<entrypoint>` is the tool's own name (`test`, `compiler-check`, ...), and the
+counts are the aggregate across every gate that ran, matching the human
+"Total" row. Exit status always agrees with `status`. Automation should read
+this line instead of grepping prose; it is the same `BLORP_GATE_RESULT`
+format individual gates already emit for their own sub-results.
+
 ## Complexity Candidate Analysis
 
 `scripts/complexity-check` compiles a Blorp entrypoint through the Core
@@ -402,6 +416,35 @@ Modes:
 - Default volume mode mounts the working tree into the container.
 - `--clean` copies source into the image for a more CI-like run.
 - `--premerge-gate` runs `scripts/premerge-gate --no-docker` inside Docker.
+
+## Landing a Branch
+
+`scripts/land` squash-merges one reviewed commit or branch onto `main` and
+gates it before pushing:
+
+```bash
+scripts/land <commit-or-branch> --title "<title>" [--body "<text>"] \
+    [--record <json> --record-name <file>] [--gate <scripts/test gate>]... \
+    [--dry-run]
+```
+
+Run it from the integration worktree while sitting on a clean checkout of
+`main`; it refuses otherwise. It fast-forwards to `origin/main`, squash-merges
+the given commit or branch (keeping the current side's version of any
+conflicts under `benchmarks/results/` or a `harness` path), optionally copies
+a measurement file into `benchmarks/results/<name>` and stages it, and commits
+with the given title and body. Titles starting with `Merge` or containing an
+`#<digits>` issue reference are refused so main's history stays standalone
+and readable. After `make`, it prints the `bin/blorp --version` build stamp,
+then runs `scripts/compiler-check --changed --base origin/main` and any
+`--gate` gates through `benchmarks/self_compile_measure lock --` so they don't
+collide with other worktrees' gates; every one must end in a `BLORP_GATE_RESULT
+... status=PASS` line (a compiler-check run with no selected work counts).
+Only if all of that passes, and `origin/main` is still an ancestor of the new
+commit, does it push with fast-forward semantics; otherwise it reports that
+`origin/main` moved and asks for a rerun. `--dry-run` runs the same sequence,
+including the commit, but stops before the push. It finishes with its own
+`BLORP_GATE_RESULT gate=land ...` line and the landed commit SHA.
 
 ## Build Source Generation
 
