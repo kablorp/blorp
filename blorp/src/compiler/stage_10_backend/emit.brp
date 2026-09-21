@@ -622,6 +622,9 @@ import:
 			BackendDictStackOptionUInt128Get,
 			BackendDictStackOptionValueRecordGet,
 			BackendDictValueReleaseInit,
+			BackendEntrypointArgvListPrelude,
+			BackendGenericObjectAlloc,
+			BackendInlineStructBoxAlloc,
 			BackendSelectAfterArm,
 			BackendSelectArmsDecl,
 			BackendSelectCleanupFrameDecl,
@@ -643,6 +646,7 @@ import:
 			BackendSetIterRetain,
 			BackendSetIterRelease,
 			BackendSetIterSourceBinding,
+			BackendStringCreateFromCString,
 			BackendStringIterCodepointBinding,
 			BackendStringIterHeader,
 			BackendStringIterLoopOpen,
@@ -665,6 +669,9 @@ import:
 		InlineStructStoreArgs,
 		InlineStructStoreBoxing(StackResultBoxing, StructAddressBoxing),
 		InlineStructSwapArgs,
+		ListAllocInlineArgs,
+		ListAllocInlineStructArgs,
+		ListAllocWithReleaseStatementsArgs,
 		ListHandoffBorrowSuffixArgs,
 		ListHandoffPrefixArgs,
 		ListHandoffReuseSuffixArgs,
@@ -682,6 +689,10 @@ import:
 			InlineStructLoadDirect,
 			InlineStructHandoffSetOwnedStore,
 			InlineStructSwap,
+			ListAllocInline,
+			ListAllocInlineStruct,
+			ListAllocPointer,
+			ListAllocWithReleaseStatements,
 			ListElementReleaseFn,
 			ListElementReleaseNone,
 			ListElementSizeInlineStruct,
@@ -1696,7 +1707,7 @@ private pure func entrypoint_arg_prelude(func_info: CoreFunction) -> String:
 	if entrypoint_has_source_args(func_info):
 		arg_name: String = entrypoint_arg_name(func_info.params)
 
-		"  blorp_List* " + arg_name + " = blorp_list_new(argc);\n" + "  blorp_list_init_elem_release(" + arg_name + ", blorp_elem_release_fn);\n" + "  for (int __i = 0; __i < argc; __i++) " + arg_name + " = blorp_list_append_owned(" + arg_name + ", (void*)blorp_string_create(argv[__i]));\n"
+		render_prepared_backend_op(BackendEntrypointArgvListPrelude(arg_name))
 	else:
 		""
 
@@ -4369,7 +4380,9 @@ private pure func fallible_stream_error_value_statement(
 		error_domain,
 		op_tmp + ".error.detail",
 		op_tmp + ".error.detail ? 1UL : 0UL",
-	) + "; break; } } else { blorp_String* " + detail_tmp + " = " + op_tmp + ".error.detail ? " + op_tmp + ".error.detail : blorp_string_create(\"fallible stream error domain mismatch\"); " + err_tmp + " = " + fallible_stream_other_error_expr(
+	) + "; break; } } else { blorp_String* " + detail_tmp + " = " + op_tmp + ".error.detail ? " + op_tmp + ".error.detail : " + render_prepared_backend_op(
+		BackendStringCreateFromCString("\"fallible stream error domain mismatch\""),
+	) + "; " + err_tmp + " = " + fallible_stream_other_error_expr(
 		error_domain,
 		detail_tmp,
 		op_tmp + ".error.detail ? 1UL : 0UL",
@@ -7431,11 +7444,17 @@ private pure func emit_tuple_construct_body(
 private pure func list_alloc_call(layout: CoreListStorageLayout, capacity: String) -> String:
 	match layout:
 		PointerListStorage:
-			"blorp_list_new(" + capacity + ")"
+			render_prepared_list_op(ListAllocPointer(capacity))
 		InlineListStorage(width_bytes):
-			"blorp_list_new_inline(" + capacity + ", " + width_bytes.to_string() + ")"
+			render_prepared_list_op(ListAllocInline({
+				capacity = capacity,
+				elem_size = width_bytes.to_string(),
+			}))
 		InlineStructListStorage(c_type):
-			"blorp_list_new_inline(" + capacity + ", sizeof(" + c_type + "))"
+			render_prepared_list_op(ListAllocInlineStruct({
+				capacity = capacity,
+				struct_ty = c_type,
+			}))
 
 
 private pure func list_construct_alloc(layout: CoreListStorageLayout, len: Int) -> String:
@@ -8316,7 +8335,11 @@ private pure func render_ranked_tensor_checked_get_erased(
 	vector_tmp: String = ranked_tensor_checked_get_vector_tmp(temp_seed)
 	value_tmp: String = ranked_tensor_checked_get_value_tmp(temp_seed)
 
-	read_body: String = "if (blorp_vector_is_i64_raw(" + vector_tmp + ")) { " + value_tmp + " = (void*)(intptr_t)((long*)" + vector_tmp + "->data)[" + prelude.flat + "]; } else if (" + vector_tmp + "->storage_mode == BLORP_VECTOR_STORAGE_PACKED) { " + value_tmp + " = (void*)(intptr_t)blorp_packed_get(" + vector_tmp + ", " + prelude.flat + "); } else if (" + vector_tmp + "->storage_mode == BLORP_VECTOR_STORAGE_F64) { " + value_tmp + " = blorp_box_float(blorp_vector_read_f64(" + vector_tmp + ", " + prelude.flat + ")); } else if (" + vector_tmp + "->storage_mode == BLORP_VECTOR_STORAGE_F32) { " + value_tmp + " = blorp_box_float32(blorp_vector_read_f32(" + vector_tmp + ", " + prelude.flat + ")); } else if (" + vector_tmp + "->storage_mode == BLORP_VECTOR_STORAGE_INLINE) { " + value_tmp + " = blorp_alloc(sizeof(blorp_Object) + " + vector_tmp + "->elem_size); memcpy((char*)" + value_tmp + " + sizeof(blorp_Object), (char*)" + vector_tmp + "->data + " + prelude.flat + " * " + vector_tmp + "->elem_size, " + vector_tmp + "->elem_size); } else { " + value_tmp + " = " + vector_tmp + "->data[" + prelude.flat + "]; }"
+	inline_struct_box_alloc: String = render_prepared_backend_op(
+		BackendInlineStructBoxAlloc(vector_tmp + "->elem_size"),
+	)
+
+	read_body: String = "if (blorp_vector_is_i64_raw(" + vector_tmp + ")) { " + value_tmp + " = (void*)(intptr_t)((long*)" + vector_tmp + "->data)[" + prelude.flat + "]; } else if (" + vector_tmp + "->storage_mode == BLORP_VECTOR_STORAGE_PACKED) { " + value_tmp + " = (void*)(intptr_t)blorp_packed_get(" + vector_tmp + ", " + prelude.flat + "); } else if (" + vector_tmp + "->storage_mode == BLORP_VECTOR_STORAGE_F64) { " + value_tmp + " = blorp_box_float(blorp_vector_read_f64(" + vector_tmp + ", " + prelude.flat + ")); } else if (" + vector_tmp + "->storage_mode == BLORP_VECTOR_STORAGE_F32) { " + value_tmp + " = blorp_box_float32(blorp_vector_read_f32(" + vector_tmp + ", " + prelude.flat + ")); } else if (" + vector_tmp + "->storage_mode == BLORP_VECTOR_STORAGE_INLINE) { " + value_tmp + " = " + inline_struct_box_alloc + "; memcpy((char*)" + value_tmp + " + sizeof(blorp_Object), (char*)" + vector_tmp + "->data + " + prelude.flat + " * " + vector_tmp + "->elem_size, " + vector_tmp + "->elem_size); } else { " + value_tmp + " = " + vector_tmp + "->data[" + prelude.flat + "]; }"
 
 	Some(
 		"({ " + prelude.statements + " void* " + value_tmp + " = (void*)0; if (__builtin_expect(" + prelude.condition + ", 1)) { " + read_body + " } " + value_tmp + "; })",
@@ -15739,7 +15762,11 @@ private pure func emit_concurrently_copy_item_loop(
 
 	result_setup: String = match loop.output:
 		ConcurrentlyLoopCollect:
-			emission_context.indent + "blorp_List* " + results_name + " = blorp_list_new(" + len_name + ");\n" + emission_context.indent + "blorp_list_init_elem_release(" + results_name + ", blorp_elem_release_fn);\n" + planned_owned_temp_cleanup_push_statement(
+			render_prepared_list_op(ListAllocWithReleaseStatements({
+				indent = emission_context.indent,
+				alloc_expr = render_prepared_list_op(ListAllocPointer(len_name)),
+				result_tmp = results_name,
+			})) + planned_owned_temp_cleanup_push_statement(
 				emission_context,
 				base_temp,
 				ConcurrentResultTemporary,
@@ -22278,9 +22305,9 @@ private pure func emit_static_closure_forward_decl(
 
 
 private pure func emit_enum_to_string_case(variant: CoreEnumVariant) -> String:
-	"    case " + variant.c_name + ": return blorp_string_create(" + c_string_literal(
-		variant.name,
-	) + ");\n"
+	"    case " + variant.c_name + ": return " + render_prepared_backend_op(
+		BackendStringCreateFromCString(c_string_literal(variant.name)),
+	) + ";\n"
 
 
 ---
@@ -24615,7 +24642,8 @@ private pure func emit_heap_record_decl(
 		naming,
 		internal_type_linkage,
 	)
-	make_c: String = record_c_type + " " + naming.make_name + "(" + param_c + ") {\n" + "  " + record_decl.name + "* __rec = (" + record_decl.name + "*)blorp_alloc(sizeof(" + record_decl.name + "));\n" + "  BLORP_TAG(__rec, \"" + record_decl.name + "\");\n" + destructor_init + assignments + "  return (" + record_c_type + ")__rec;\n}\n\n"
+	record_alloc: String = render_prepared_backend_op(BackendGenericObjectAlloc(record_decl.name))
+	make_c: String = record_c_type + " " + naming.make_name + "(" + param_c + ") {\n" + "  " + record_decl.name + "* __rec = (" + record_decl.name + "*)" + record_alloc + ";\n" + "  BLORP_TAG(__rec, \"" + record_decl.name + "\");\n" + destructor_init + assignments + "  return (" + record_c_type + ")__rec;\n}\n\n"
 
 	{
 		type_header = header,
@@ -24899,9 +24927,11 @@ private pure func emit_union_constructor(
 		else:
 			""
 
+		union_alloc: String = render_prepared_backend_op(BackendGenericObjectAlloc(union_decl.name))
+
 		union_decl.name + "* " + variant.c_name + "(" + params.join(
 			", ",
-		) + ") {\n" + "  " + union_decl.name + "* __vc = (" + union_decl.name + "*)blorp_alloc(sizeof(" + union_decl.name + "));\n" + "  BLORP_TAG(__vc, \"" + union_decl.name + "\");\n" + destructor_init + "  __vc->tag = " + variant.tag_c_name + ";\n" + release_mask_init + assignments + "  return __vc;\n}\n\n"
+		) + ") {\n" + "  " + union_decl.name + "* __vc = (" + union_decl.name + "*)" + union_alloc + ";\n" + "  BLORP_TAG(__vc, \"" + union_decl.name + "\");\n" + destructor_init + "  __vc->tag = " + variant.tag_c_name + ";\n" + release_mask_init + assignments + "  return __vc;\n}\n\n"
 
 
 private pure func emit_union_reuse_constructor(

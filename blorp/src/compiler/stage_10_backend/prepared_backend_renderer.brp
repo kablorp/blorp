@@ -528,6 +528,10 @@ union PreparedBackendOp:
 	BackendSelectCleanupPush(SelectCleanupPushArgs)
 	BackendSelectCleanupPop(String)
 	BackendSelectReceivedValueBinding(SelectReceivedValueBindingArgs)
+	BackendGenericObjectAlloc(String)
+	BackendInlineStructBoxAlloc(String)
+	BackendStringCreateFromCString(String)
+	BackendEntrypointArgvListPrelude(String)
 
 
 -- C snippet rendering helpers.
@@ -1405,3 +1409,43 @@ pure func render_prepared_backend_op(op: PreparedBackendOp) -> String:
 			"blorp_task_cleanup_pop_slot_with_task(&" + value_slot + ", __blorp_task);"
 		BackendSelectReceivedValueBinding(args):
 			"void* " + args.binding + " = " + args.result + ".value;"
+		BackendGenericObjectAlloc(c_type):
+			render_generic_object_alloc(c_type)
+		BackendInlineStructBoxAlloc(elem_size_expr):
+			render_inline_struct_box_alloc(elem_size_expr)
+		BackendStringCreateFromCString(c_string_expr):
+			render_string_create_from_c_string(c_string_expr)
+		BackendEntrypointArgvListPrelude(arg_name):
+			render_entrypoint_argv_list_prelude(arg_name)
+
+
+--- The `blorp_alloc(sizeof(T))` shape shared by every generated record and
+--- union-variant constructor function (`make_<Type>`): allocate an untagged
+--- object of exactly the type's own size. Callers still write the pointer
+--- cast and the `BLORP_TAG` call themselves, since those are type-name
+--- text, not allocation behaviour.
+private pure func render_generic_object_alloc(c_type: String) -> String:
+	"blorp_alloc(sizeof(" + c_type + "))"
+
+
+--- The boxed-inline-struct-element shape used when a tensor's storage mode
+--- is only known at runtime: allocate room for a `blorp_Object` header plus
+--- one element, so the caller can `memcpy` the raw bytes in after.
+private pure func render_inline_struct_box_alloc(elem_size_expr: String) -> String:
+	"blorp_alloc(sizeof(blorp_Object) + " + elem_size_expr + ")"
+
+
+--- Wraps a raw C string expression (a `char*`) into an owned `blorp_String*`.
+private pure func render_string_create_from_c_string(c_string_expr: String) -> String:
+	"blorp_string_create(" + c_string_expr + ")"
+
+
+--- The CLI entrypoint's `argc`/`argv` prelude: build the `List[String]`
+--- passed to a program's `main` from the process's raw argument vector.
+--- Composes `BackendStringCreateFromCString` for each element the same way
+--- `render_dict_iter_header` composes its own constituent ops -- only this
+--- function's own call site records a kind for the result.
+private pure func render_entrypoint_argv_list_prelude(arg_name: String) -> String:
+	string_create: String = render_prepared_backend_op(BackendStringCreateFromCString("argv[__i]"))
+
+	"  blorp_List* " + arg_name + " = blorp_list_new(argc);\n" + "  blorp_list_init_elem_release(" + arg_name + ", blorp_elem_release_fn);\n" + "  for (int __i = 0; __i < argc; __i++) " + arg_name + " = blorp_list_append_owned(" + arg_name + ", (void*)" + string_create + ");\n"

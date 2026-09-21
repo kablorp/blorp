@@ -8,22 +8,40 @@ emitted for a small, fast fixture program, so a change to the emitter or the
 renderers that shifts these counts is caught immediately instead of only
 showing up as a self-compile allocation-count drift.
 
-What this test does NOT yet do: predict these counts from the prepared
-program plus backend_helper_catalog.brp (BackendHelperKind / row counts).
-That requires tagging every renderer call site in emit.brp with the
-BackendHelperKind it renders (`RenderedHelper { kind, c }` in the design doc),
-which was scoped as step 2 of the catalog task and is not done -- the catalog
-exists and is total (see test_core_backend_helper_catalog.brp), but nothing
-in emit.brp reads it yet. Until that wiring lands, this test pins actual
-counts from the compiled C directly (a regression guard), not
-catalog-predicted counts (the eventual "prediction equals reality" proof).
+What this test does NOT yet do: predict these counts from data published
+before emission. `backend_helper_kind_mapping.brp` now has a total
+`backend_helper_kind_of_<renderer>_op` function per renderer mapping an op
+value to the `BackendHelperKind` it renders (pure data, exercised by
+test_backend_helper_kind_mapping.brp) -- but wiring a dispatcher to return
+`RenderedHelper { kind, c }` and threading a per-function accumulator
+through emit.brp turned out to be the wrong shape for the prediction this
+test wants: emit.brp is a pure, mutually-recursive tree of `emit_*`
+functions (`emit_simple_expr` alone fans out to ~50 sibling functions)
+returning plain `String`/`Option[String]`/`FunctionBodyC`, with no
+context-out channel a kind could ride back on, so bubbling a count up would
+mean rewriting most of that file's return types. The real prediction needs
+helper selection to move into a prepare-side pass that publishes each Core
+node's chosen `BackendHelperKind` before emission ever runs, the same way
+CleanupPlan and CancellationPlanTable already do for their own facts --
+that is future work, not part of this task.
 
-Residue: none tracked yet, for the same reason -- there is no prediction to
-diff against. When the wiring lands, replace EXPECTED_CALL_COUNTS' role with
-a real prediction built from the prepared program's rendered-helper counts
-plus backend_helper_catalog.brp, and move any site that still can't be
-predicted (documented emitter-introduced temporaries, per cf9a7350's audit)
-into an explicit allowed-residue list here.
+What this task did land: every direct `blorp_alloc`/`blorp_string_create`/
+`blorp_list_new`/`blorp_list_new_inline` call that emit.brp used to spell
+as a literal now goes through a renderer entry with its own catalog row
+(five new rows: BackendGenericObjectAlloc, BackendInlineStructBoxAlloc,
+BackendStringCreateFromCString, BackendEntrypointArgvListPrelude,
+ListListAllocWithReleaseStatements -- catalog now 383 rows), guarded by
+test_no_direct_emitter_allocation.py. That changed nothing about what C is
+emitted (proven byte-identical via stage-2 for the frozen self-compile and
+this small.brp fixture), so EXPECTED_CALL_COUNTS below did not need to
+change.
+
+Residue: none tracked yet, since this test still pins actual counts from
+the compiled C directly (a regression guard) rather than a prediction. When
+helper selection moves into prepare and a real prediction replaces
+EXPECTED_CALL_COUNTS' role, move any site that still can't be predicted
+(documented emitter-introduced temporaries, per cf9a7350's audit) into an
+explicit allowed-residue list here.
 """
 
 from __future__ import annotations

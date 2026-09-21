@@ -40,12 +40,34 @@ record BackendHelperContract {
 }
 
 
+--- The result of dispatching one prepared backend/list/tensor/tuple/intrinsic
+--- op through its renderer: the emitted C text plus the `BackendHelperKind`
+--- that C came from. Every dispatcher (`render_prepared_backend_op`,
+--- `render_prepared_list_op`, `render_prepared_tensor_op`,
+--- `render_prepared_tuple_op`, `render_intrinsic`) returns this instead of a
+--- bare `String` so that `emit.brp`'s call sites can record which helper
+--- kind produced each piece of C without re-deriving it from the op again.
+--- Renderer-internal recursive calls (e.g. `render_dict_iter_header`
+--- composing `BackendDictIterSourceBinding` + `BackendDictIterLoopOpen`) use
+--- only `.c` from the nested `RenderedHelper` and drop `.kind`: only the
+--- `emit.brp` call site for the composite op (e.g. `BackendDictIterHeader`)
+--- records a kind, so nested renders are not double-counted.
+record RenderedHelper {
+	kind: BackendHelperKind,
+	c: String
+}
+
+
 -- One variant per distinct emitted-C helper shape across the five stage_10_backend
--- renderer files: 94 from prepared_backend_renderer.brp,
--- 52 from prepared_list_renderer.brp, 72 from
+-- renderer files: 98 from prepared_backend_renderer.brp (including four
+-- variants added to route emit.brp's former direct blorp_alloc/
+-- blorp_string_create call sites through the renderer -- see the commit
+-- that added them),
+-- 53 from prepared_list_renderer.brp (including one added for the same
+-- reason, ListAllocWithReleaseStatements), 72 from
 -- prepared_tensor_renderer.brp, 7 from prepared_tuple_renderer.brp,
 -- and 153 from intrinsic_renderer.brp's
--- NoArg/OneArg/TwoArg/ThreeArg intrinsic tables (378 total). A new
+-- NoArg/OneArg/TwoArg/ThreeArg intrinsic tables (383 total). A new
 -- renderer variant must be added here or backend_helper_contract's match
 -- stops being exhaustive and the build fails closed.
 enum BackendHelperKind:
@@ -427,14 +449,19 @@ enum BackendHelperKind:
 	IntrinsicTensorSetF16
 	IntrinsicTensorSetI64
 	IntrinsicFixedAlloc
+	BackendGenericObjectAlloc
+	BackendInlineStructBoxAlloc
+	BackendStringCreateFromCString
+	BackendEntrypointArgvListPrelude
+	ListListAllocWithReleaseStatements
 
 
 -- Increment whenever a catalog row's contract changes meaning, a renderer
 -- variant is added/removed, or a secondary-flag split changes. Reports
 -- expose this alongside the variant count as the backend-plan identity.
-BACKEND_HELPER_CATALOG_REVISION: Int = 1
+BACKEND_HELPER_CATALOG_REVISION: Int = 2
 
-BACKEND_HELPER_KIND_COUNT: Int = 378
+BACKEND_HELPER_KIND_COUNT: Int = 383
 
 
 pure func backend_helper_contract(kind: BackendHelperKind) -> BackendHelperContract:
@@ -3849,6 +3876,60 @@ pure func backend_helper_contract(kind: BackendHelperKind) -> BackendHelperContr
 				calls_user_code = False,
 				cleanup_scratch = False
 			}
+		BackendGenericObjectAlloc:
+			-- prepared_backend_renderer.brp: BackendGenericObjectAlloc -- blorp_alloc
+			-- (the `blorp_alloc(sizeof(T))` shape shared by every generated
+			-- record and union-variant make_<Type> constructor)
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendInlineStructBoxAlloc:
+			-- prepared_backend_renderer.brp: BackendInlineStructBoxAlloc -- blorp_alloc
+			-- (boxes one inline-struct tensor element behind a blorp_Object
+			-- header when the tensor's storage mode is only known at runtime)
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendStringCreateFromCString:
+			-- prepared_backend_renderer.brp: BackendStringCreateFromCString -- blorp_string_create
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		BackendEntrypointArgvListPrelude:
+			-- prepared_backend_renderer.brp: BackendEntrypointArgvListPrelude --
+			-- blorp_list_new, blorp_list_init_elem_release, blorp_list_append_owned,
+			-- blorp_string_create (the CLI argc/argv-to-List[String] bootstrap)
+			{
+				allocates = [ManagedObjectAllocation, CapacityGrowthAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
+		ListListAllocWithReleaseStatements:
+			-- prepared_list_renderer.brp: ListAllocWithReleaseStatements --
+			-- blorp_list_new (or another list-alloc expression the caller
+			-- supplies), blorp_list_init_elem_release, as two bare statements
+			-- rather than render_list_alloc_with_release's ({ ... }) block
+			{
+				allocates = [ManagedObjectAllocation],
+				retains = False,
+				releases = False,
+				calls_user_code = False,
+				cleanup_scratch = False
+			}
 
 
 -- Every BackendHelperKind variant, in declaration order. A coverage test
@@ -4235,4 +4316,9 @@ ALL_BACKEND_HELPER_KINDS: List[BackendHelperKind] = [
 	IntrinsicTensorSetF16,
 	IntrinsicTensorSetI64,
 	IntrinsicFixedAlloc,
+	BackendGenericObjectAlloc,
+	BackendInlineStructBoxAlloc,
+	BackendStringCreateFromCString,
+	BackendEntrypointArgvListPrelude,
+	ListListAllocWithReleaseStatements,
 ]
