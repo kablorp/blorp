@@ -507,6 +507,7 @@ hygiene-check: build-blorp-cli
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest $(STANDARD_LIBRARY_TEST_ROOT)/test_check_std_builtins.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/architecture/test_compiler_antipattern_audit.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/architecture/test_dead_code_audit.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/stage_10_backend/test_cancellation_identity_reuse.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/build/test_compiler_check.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/runtime/test_runtime_allocator_stats.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/runtime/test_runtime_alloc_oracle.py
