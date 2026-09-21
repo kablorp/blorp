@@ -1,6 +1,6 @@
 # Blorp Compiler Makefile
 
-.PHONY: all build build-blorp-cli generate-blorp-cli-c prepare-blorp-cli-c prepare-blorp-cli-runtime compile-prepared-blorp-cli compile-blorp-cli install-prepared-blorp-cli compiler-build-source-generator install warm warm-formatter clean test smoke runtime-test test-asan compiler-blorp-test compiler-tools-test compiler-core-sanitize-test compiler-blorp-sanitize-test lsp-test package-test c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all force-generated-sources
+.PHONY: all build build-blorp-cli generate-blorp-cli-c prepare-blorp-cli-c prepare-blorp-cli-runtime prepare-blorp-cli-build-stamp compile-prepared-blorp-cli compile-blorp-cli install-prepared-blorp-cli compiler-build-source-generator install warm warm-formatter clean test smoke runtime-test test-asan compiler-blorp-test compiler-tools-test compiler-core-sanitize-test compiler-blorp-sanitize-test lsp-test package-test c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all force-generated-sources
 
 STANDARD_LIBRARY_SOURCE_ROOT := standard_library/src
 STANDARD_LIBRARY_TEST_ROOT := standard_library/test
@@ -24,7 +24,11 @@ BLORP_CLI_RUNTIME_C_OPTIMIZATION ?= -O2
 BLORP_CLI_C_SPLIT ?= 8
 BLORP_CLI_SPLITTER := scripts/split-generated-c
 BLORP_CLI_SPLIT_DIR := $(BLORP_CLI_BUILD_DIR)/split-c
-BLORP_CLI_RUNTIME_CONFIG_HASH := $(shell { printf '%s\n' '$(BLORP_CLI_RUNTIME_C_OPTIMIZATION)' '-fwrapv -pipe -w -DMINICORO_IMPL -DBLORP_COMPILER_RUNTIME_SOURCES=1'; shasum -a 256 blorp/src/lib/runtime/native/minicoro.h blorp/src/lib/runtime/native/runtime.c blorp/src/lib/runtime/native/runtime_decl.c; command -v cc; cc --version 2>/dev/null | head -n 1; } | shasum -a 256 | awk '{print $$1}')
+# First line of `cc --version`, computed once and reused both for the
+# runtime config identity below and for the `cc:` line in `blorp --version`,
+# so the binary is the single source of truth for which C compiler built it.
+BLORP_CLI_CC_VERSION := $(shell cc --version 2>/dev/null | head -n 1)
+BLORP_CLI_RUNTIME_CONFIG_HASH := $(shell { printf '%s\n' '$(BLORP_CLI_RUNTIME_C_OPTIMIZATION)' '-fwrapv -pipe -w -DMINICORO_IMPL -DBLORP_COMPILER_RUNTIME_SOURCES=1'; shasum -a 256 blorp/src/lib/runtime/native/minicoro.h blorp/src/lib/runtime/native/runtime.c blorp/src/lib/runtime/native/runtime_decl.c; command -v cc; printf '%s\n' '$(BLORP_CLI_CC_VERSION)'; } | shasum -a 256 | awk '{print $$1}')
 BLORP_CLI_BUILD_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/build-inputs.sha256
 BLORP_CLI_INSTALL_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/install-inputs.sha256
 BLORP_CLI_BIN_HASH := $(BLORP_CLI_BUILD_DIR)/blorp.sha256
@@ -32,6 +36,15 @@ BLORP_CLI_EMBEDDED_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/embedded-inputs.sha2
 BLORP_CLI_MANIFEST_TOOL := scripts/blorp-cli-embedded-manifest
 BLORP_CLI_RUNTIME_SOURCES_C := $(BLORP_CLI_BUILD_DIR)/runtime_sources.c
 BLORP_CLI_RUNTIME_OBJECT := $(BLORP_CLI_BUILD_DIR)/runtime-$(BLORP_CLI_RUNTIME_CONFIG_HASH).o
+# Build facts (commit, target, compiled_by, optimization, split) reported by
+# `blorp --version`. Compiled from a single small C file so a changed commit
+# relinks the CLI without recompiling the generated compiler C or any split
+# translation unit; see BLORP_CLI_LINK_INPUT_HASH below for the cache that
+# keeps that relink cheap and automatic.
+BLORP_CLI_BUILD_STAMP_SOURCE := blorp/src/lib/runtime/native/build_stamp.c
+BLORP_CLI_BUILD_STAMP_HEADER := blorp/src/lib/runtime/native/build_stamp.h
+BLORP_CLI_BUILD_STAMP_OBJECT := $(BLORP_CLI_BUILD_DIR)/build_stamp.o
+BLORP_CLI_LINK_INPUT_HASH := $(BLORP_CLI_BUILD_DIR)/link-inputs.sha256
 BLORP_LSP_NATIVE_RUNTIME_C := blorp/src/lsp/server/native_runtime.c
 BLORP_EMBEDDED_STD_SOURCE := blorp/src/compiler/stage_01_generated_inputs/embedded_std.brp
 BLORP_BUILD_INFO_SOURCE := blorp/src/compiler/stage_01_generated_inputs/compiler_build_info.brp
@@ -74,6 +87,7 @@ all: install
 # would recopy on every make and invalidate mtime-based caches.
 install: build-blorp-cli
 	@$(MAKE) --no-print-directory install-prepared-blorp-cli
+	@"$(BLORP_INSTALLED_BIN)" --version
 
 install-prepared-blorp-cli:
 	@test -x "$(BLORP_CLI_BIN)"
@@ -143,9 +157,14 @@ $(BLORP_BUILD_INFO_SOURCE): force-generated-sources $(BLORP_BUILD_SOURCE_GENERAT
 build: build-blorp-cli
 
 # Build the public Blorp executable through the immutable pinned compiler.
-$(BLORP_CLI_RUNTIME_SOURCES_C): force-generated-sources $(BLORP_BUILD_SOURCE_GENERATOR) blorp/src/lib/runtime/native/minicoro.h blorp/src/lib/runtime/native/runtime.c blorp/src/lib/runtime/native/runtime_decl.c
+# build_stamp.h/.c are appended (with no -D defines, so every field falls
+# back to "unknown") so that any Blorp program compiled through the embedded
+# runtime -- including this repo's own test suites, which link that way
+# rather than through the CLI's dedicated build -- resolves the
+# blorp_build_stamp_* symbols main.brp references for `--version`.
+$(BLORP_CLI_RUNTIME_SOURCES_C): force-generated-sources $(BLORP_BUILD_SOURCE_GENERATOR) blorp/src/lib/runtime/native/minicoro.h blorp/src/lib/runtime/native/runtime.c blorp/src/lib/runtime/native/runtime_decl.c $(BLORP_CLI_BUILD_STAMP_HEADER) $(BLORP_CLI_BUILD_STAMP_SOURCE)
 	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
-	$(BLORP_BUILD_SOURCE_GENERATOR) embedded-runtime-c blorp/src/lib/runtime/native/minicoro.h blorp/src/lib/runtime/native/runtime.c blorp/src/lib/runtime/native/runtime_decl.c > $@.tmp
+	$(BLORP_BUILD_SOURCE_GENERATOR) embedded-runtime-c blorp/src/lib/runtime/native/minicoro.h blorp/src/lib/runtime/native/runtime.c blorp/src/lib/runtime/native/runtime_decl.c $(BLORP_CLI_BUILD_STAMP_HEADER) $(BLORP_CLI_BUILD_STAMP_SOURCE) > $@.tmp
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
 # The content-addressed target name already covers every runtime input. Normal
@@ -163,6 +182,60 @@ $(BLORP_CLI_RUNTIME_OBJECT):
 	trap - EXIT
 
 prepare-blorp-cli-runtime: $(BLORP_CLI_RUNTIME_OBJECT)
+
+# Always recompiled: this is one small, cheap-to-compile file, and its
+# content (git commit, dirty flag, compiled_by, optimization, split) is
+# exactly the kind of fact that changes on nearly every invocation. Compiling
+# it fresh every time is far cheaper than tracking its own staleness, and it
+# keeps `blorp --version` honest without ever touching the generated
+# compiler C or its split translation units.
+.PHONY: blorp-cli-build-stamp-force
+blorp-cli-build-stamp-force:
+
+$(BLORP_CLI_BUILD_STAMP_OBJECT): blorp-cli-build-stamp-force $(BLORP_CLI_BUILD_STAMP_SOURCE) $(BLORP_CLI_BUILD_STAMP_HEADER)
+	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
+	@set -e; \
+	commit=$${BLORP_BUILD_COMMIT:-}; \
+	if [ -z "$$commit" ]; then \
+		commit=$$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown); \
+		if [ "$$commit" != "unknown" ] && [ -n "$$(git status --porcelain --untracked-files=no 2>/dev/null)" ]; then \
+			commit="$$commit-dirty"; \
+		fi; \
+	fi; \
+	target=$${BLORP_BUILD_TARGET:-}; \
+	if [ -z "$$target" ]; then \
+		target=$$(scripts/target-triple 2>/dev/null || echo unknown); \
+	fi; \
+	bootstrap_override="$${BLORP_BOOTSTRAP_COMPILER_BIN:-}"; \
+	if [ -n "$$bootstrap_override" ]; then \
+		self_version=$$("$$bootstrap_override" --version 2>/dev/null || true); \
+		self_commit=$$(printf '%s\n' "$$self_version" | sed -n 's/^commit: //p'); \
+		self_commit=$${self_commit%-dirty}; \
+		if [ -n "$$self_commit" ] && [ "$$self_commit" != "unknown" ]; then \
+			compiled_by="self-$$self_commit"; \
+		else \
+			compiled_by="self-$$(basename "$$bootstrap_override")"; \
+		fi; \
+	else \
+		compiled_by=$$(sed -n 's/^BLORP_BOOTSTRAP_TAG=//p' blorp/build/bootstrap.env); \
+		compiled_by=$${compiled_by:-unknown}; \
+	fi; \
+	tmp="$@.tmp"; \
+	trap 'rm -f "$$tmp"' EXIT; \
+	cc -O2 -fwrapv -pipe -w \
+		-DBLORP_BUILD_STAMP_COMMIT="\"$$commit\"" \
+		-DBLORP_BUILD_STAMP_TARGET="\"$$target\"" \
+		-DBLORP_BUILD_STAMP_COMPILED_BY="\"$$compiled_by\"" \
+		-DBLORP_BUILD_STAMP_CLI_OPTIMIZATION="\"$(BLORP_CLI_C_OPTIMIZATION)\"" \
+		-DBLORP_BUILD_STAMP_RUNTIME_OPTIMIZATION="\"$(BLORP_CLI_RUNTIME_C_OPTIMIZATION)\"" \
+		-DBLORP_BUILD_STAMP_SPLIT="\"$(BLORP_CLI_C_SPLIT)\"" \
+		-DBLORP_BUILD_STAMP_CC="\"$(BLORP_CLI_CC_VERSION)\"" \
+		-include blorp/src/lib/runtime/native/runtime_decl.c \
+		-c "$(BLORP_CLI_BUILD_STAMP_SOURCE)" -o "$$tmp"; \
+	mv "$$tmp" "$@"; \
+	trap - EXIT
+
+prepare-blorp-cli-build-stamp: $(BLORP_CLI_BUILD_STAMP_OBJECT)
 
 # Generate the compiler C separately so CI reports self-hosting time independently.
 generate-blorp-cli-c: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP_CLI_SOURCE)
@@ -240,7 +313,14 @@ prepare-blorp-cli-c: generate-blorp-cli-c $(BLORP_CLI_RUNTIME_SOURCES_C)
 	trap - EXIT
 
 # Compile prepared C inputs with the host C toolchain only.
-compile-prepared-blorp-cli: $(BLORP_CLI_RUNTIME_OBJECT)
+#
+# This recipe is deliberately two-phase. Phase 1 produces the per-TU (or
+# single-TU) body objects, gated by $$new_hash: only real source, config, or
+# toolchain changes touch it, so it never runs merely because HEAD moved.
+# Phase 2 links those objects together with the always-fresh build-stamp
+# object, gated by $$link_hash ($$new_hash plus the current commit): a new
+# commit relinks the binary (cheap) without re-running phase 1 (expensive).
+compile-prepared-blorp-cli: $(BLORP_CLI_RUNTIME_OBJECT) $(BLORP_CLI_BUILD_STAMP_OBJECT)
 	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
 	@set -e; \
 	for input in "$(BLORP_CLI_C)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" "$(BLORP_CLI_BUILD_INPUT_MANIFEST)"; do \
@@ -249,19 +329,31 @@ compile-prepared-blorp-cli: $(BLORP_CLI_RUNTIME_OBJECT)
 	tmp_bin="$(BLORP_CLI_BIN).tmp"; \
 	tmp_hash="$(BLORP_CLI_INPUT_HASH).tmp"; \
 	tmp_bin_hash="$(BLORP_CLI_BIN_HASH).tmp"; \
-	trap 'rm -f "$$tmp_bin" "$$tmp_hash" "$$tmp_bin_hash"' EXIT; \
-	rm -f "$$tmp_bin" "$$tmp_hash" "$$tmp_bin_hash"; \
+	tmp_link_hash="$(BLORP_CLI_LINK_INPUT_HASH).tmp"; \
+	trap 'rm -f "$$tmp_bin" "$$tmp_hash" "$$tmp_bin_hash" "$$tmp_link_hash"' EXIT; \
+	rm -f "$$tmp_bin" "$$tmp_hash" "$$tmp_bin_hash" "$$tmp_link_hash"; \
 	source_hash=$$(shasum -a 256 "$(BLORP_CLI_BUILD_INPUT_MANIFEST)" | awk '{print $$1}'); \
 	generated_c_hash=$$(shasum -a 256 "$(BLORP_CLI_C)" | awk '{print $$1}'); \
 	splitter_hash=$$(shasum -a 256 "$(BLORP_CLI_SPLITTER)" | awk '{print $$1}'); \
 	recipe_hash=$$(sed -n '/^# Compile prepared C inputs/,/^# Preserve the safe all-in-one build path/p' Makefile | shasum -a 256 | awk '{print $$1}'); \
 	new_hash=$$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$$source_hash" "$$generated_c_hash" "$$recipe_hash" "$(BLORP_CLI_C_OPTIMIZATION)" "$(BLORP_CLI_RUNTIME_CONFIG_HASH)" "$$splitter_hash" "$(BLORP_CLI_C_SPLIT)" | shasum -a 256 | awk '{print $$1}'); \
 	old_hash=$$(cat "$(BLORP_CLI_INPUT_HASH)" 2>/dev/null || true); \
-	recorded_bin_hash=$$(cat "$(BLORP_CLI_BIN_HASH)" 2>/dev/null || true); \
-	actual_bin_hash=$$(shasum -a 256 "$(BLORP_CLI_BIN)" 2>/dev/null | awk '{print $$1}'); \
-	if [ "$$new_hash" != "$$old_hash" ] || [ ! -x "$(BLORP_CLI_BIN)" ] || [ -z "$$actual_bin_hash" ] || [ "$$actual_bin_hash" != "$$recorded_bin_hash" ]; then \
+	split_dir="$(BLORP_CLI_SPLIT_DIR)/n$(BLORP_CLI_C_SPLIT)"; \
+	obj_dir="$$split_dir/obj"; \
+	if [ "$(BLORP_CLI_C_SPLIT)" -le 1 ]; then \
+		body_objects="$$obj_dir/blorp_cli_main.o"; \
+		objects_present=0; \
+		[ -s "$$body_objects" ] && objects_present=1; \
+	else \
+		body_objects=""; \
+		objects_present=0; \
+		[ -d "$$obj_dir" ] && ls "$$obj_dir"/split_body_*.o >/dev/null 2>&1 && objects_present=1; \
+	fi; \
+	if [ "$$new_hash" != "$$old_hash" ] || [ "$$objects_present" != 1 ]; then \
 		if [ "$(BLORP_CLI_C_SPLIT)" -le 1 ]; then \
 			echo "Compiling Blorp CLI (single TU)"; \
+			rm -rf "$$split_dir"; \
+			mkdir -p "$$obj_dir"; \
 			cc "$(BLORP_CLI_C_OPTIMIZATION)" -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
 				-include blorp/src/lib/runtime/native/runtime_decl.c \
 				-Iblorp/src/compiler/stage_01_generated_inputs \
@@ -272,11 +364,9 @@ compile-prepared-blorp-cli: $(BLORP_CLI_RUNTIME_OBJECT)
 				-Iblorp/src/lib \
 				-Iblorp/src/lsp/server \
 				-Iblorp/src/test \
-				"$(BLORP_CLI_C)" "$(BLORP_CLI_RUNTIME_OBJECT)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" "$(BLORP_LSP_NATIVE_RUNTIME_C)" -lm -lpthread -o "$$tmp_bin"; \
+				-c "$(BLORP_CLI_C)" -o "$$body_objects"; \
 		else \
 			echo "Compiling Blorp CLI ($(BLORP_CLI_C_SPLIT)-way split)"; \
-			split_dir="$(BLORP_CLI_SPLIT_DIR)/n$(BLORP_CLI_C_SPLIT)"; \
-			obj_dir="$$split_dir/obj"; \
 			rm -rf "$$split_dir"; \
 			mkdir -p "$(BLORP_CLI_SPLIT_DIR)"; \
 			python3 "$(BLORP_CLI_SPLITTER)" "$(BLORP_CLI_C)" "$(BLORP_CLI_SPLIT_DIR)" -n "$(BLORP_CLI_C_SPLIT)"; \
@@ -298,24 +388,46 @@ compile-prepared-blorp-cli: $(BLORP_CLI_RUNTIME_OBJECT)
 					-Iblorp/src/test \
 					-c "$$src" -o "$(BLORP_CLI_SPLIT_DIR)/n$(BLORP_CLI_C_SPLIT)/obj/$$base.o" \
 			' sh; \
-			obj_files=$$(ls "$$obj_dir"/split_body_*.o | LC_ALL=C sort); \
-			cc "$(BLORP_CLI_C_OPTIMIZATION)" -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
-				-include blorp/src/lib/runtime/native/runtime_decl.c \
-				-Iblorp/src/compiler/stage_01_generated_inputs \
-				-Iblorp/src/compiler/stage_04_modules \
-				-Iblorp/src/compiler/stage_06_typecheck/graph \
-				-Iblorp/src/compiler/stage_06_typecheck/type_system \
-				-Iblorp/src \
-				-Iblorp/src/lib \
-				-Iblorp/src/lsp/server \
-				-Iblorp/src/test \
-				$$obj_files "$(BLORP_CLI_RUNTIME_OBJECT)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" "$(BLORP_LSP_NATIVE_RUNTIME_C)" -lm -lpthread -o "$$tmp_bin"; \
 		fi; \
+	else \
+		echo "Blorp CLI objects up to date"; \
+	fi; \
+	printf '%s\n' "$$new_hash" > "$$tmp_hash"; \
+	mv "$$tmp_hash" "$(BLORP_CLI_INPUT_HASH)"; \
+	if [ "$(BLORP_CLI_C_SPLIT)" -le 1 ]; then \
+		obj_files="$$body_objects"; \
+	else \
+		obj_files=$$(ls "$$obj_dir"/split_body_*.o | LC_ALL=C sort); \
+	fi; \
+	commit=$${BLORP_BUILD_COMMIT:-}; \
+	if [ -z "$$commit" ]; then \
+		commit=$$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown); \
+		if [ "$$commit" != "unknown" ] && [ -n "$$(git status --porcelain --untracked-files=no 2>/dev/null)" ]; then \
+			commit="$$commit-dirty"; \
+		fi; \
+	fi; \
+	link_hash=$$(printf '%s\n%s\n' "$$new_hash" "$$commit" | shasum -a 256 | awk '{print $$1}'); \
+	old_link_hash=$$(cat "$(BLORP_CLI_LINK_INPUT_HASH)" 2>/dev/null || true); \
+	recorded_bin_hash=$$(cat "$(BLORP_CLI_BIN_HASH)" 2>/dev/null || true); \
+	actual_bin_hash=$$(shasum -a 256 "$(BLORP_CLI_BIN)" 2>/dev/null | awk '{print $$1}'); \
+	if [ "$$link_hash" != "$$old_link_hash" ] || [ ! -x "$(BLORP_CLI_BIN)" ] || [ -z "$$actual_bin_hash" ] || [ "$$actual_bin_hash" != "$$recorded_bin_hash" ]; then \
+		echo "Linking Blorp CLI"; \
+		cc "$(BLORP_CLI_C_OPTIMIZATION)" -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
+			-include blorp/src/lib/runtime/native/runtime_decl.c \
+			-Iblorp/src/compiler/stage_01_generated_inputs \
+			-Iblorp/src/compiler/stage_04_modules \
+			-Iblorp/src/compiler/stage_06_typecheck/graph \
+			-Iblorp/src/compiler/stage_06_typecheck/type_system \
+			-Iblorp/src \
+			-Iblorp/src/lib \
+			-Iblorp/src/lsp/server \
+			-Iblorp/src/test \
+			$$obj_files "$(BLORP_CLI_RUNTIME_OBJECT)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" "$(BLORP_LSP_NATIVE_RUNTIME_C)" "$(BLORP_CLI_BUILD_STAMP_OBJECT)" -lm -lpthread -o "$$tmp_bin"; \
 		shasum -a 256 "$$tmp_bin" | awk '{print $$1}' > "$$tmp_bin_hash"; \
 		mv "$$tmp_bin" "$(BLORP_CLI_BIN)"; \
-		printf '%s\n' "$$new_hash" > "$$tmp_hash"; \
-		mv "$$tmp_hash" "$(BLORP_CLI_INPUT_HASH)"; \
 		mv "$$tmp_bin_hash" "$(BLORP_CLI_BIN_HASH)"; \
+		printf '%s\n' "$$link_hash" > "$$tmp_link_hash"; \
+		mv "$$tmp_link_hash" "$(BLORP_CLI_LINK_INPUT_HASH)"; \
 	else \
 		echo "Blorp CLI up to date"; \
 	fi; \

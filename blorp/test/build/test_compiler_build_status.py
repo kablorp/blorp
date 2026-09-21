@@ -136,9 +136,41 @@ class CompilerBuildStatusTests(unittest.TestCase):
 		self.write("blorp/build/_build/blorp-cli/runtime_sources.c", "runtime sources\n")
 		self.runtime_object = self.build / f"runtime-{self.runtime_config_hash()}.o"
 		self.runtime_object.write_bytes(b"runtime object\n")
-		make_executable(self.build / "blorp", b"build compiler\n")
+		self.write_fake_binary_version()
 		make_executable(self.root / "bin/blorp", b"installed compiler\n")
 		self.write_fresh_manifests()
+
+	def write_fake_binary_version(
+		self,
+		cli_opt: str = "-O0",
+		runtime_opt: str = "-O2",
+		split_n: str = "8",
+		compiled_by: str = "dev-aaaaaaaaaaaa",
+	) -> None:
+		# `scripts/compiler-build-status` now derives cli/runtime optimization
+		# and split count by running the built binary's own `--version`
+		# instead of trusting ambient environment variables (that was the
+		# bug: a binary built with one flag set but queried under a shell
+		# with different flags would misreport). The fake binary here is a
+		# real, executable script so that behavior can be exercised.
+		script = "\n".join(
+			[
+				"#!/bin/sh",
+				'if [ "$1" = "--version" ]; then',
+				"cat <<'BLORP_VERSION_EOF'",
+				"blorp 0.0.1",
+				"commit: deadbeef0000",
+				"target: aarch64-apple-darwin",
+				f"compiled_by: {compiled_by}",
+				f"optimization: cli={cli_opt} runtime={runtime_opt}",
+				f"split: {split_n}",
+				"cc: fake cc 1.0",
+				"BLORP_VERSION_EOF",
+				"fi",
+				"",
+			]
+		)
+		make_executable(self.build / "blorp", script.encode("utf-8"))
 
 	def tearDown(self) -> None:
 		self.tempdir.cleanup()
@@ -381,21 +413,49 @@ class CompilerBuildStatusTests(unittest.TestCase):
 
 		self.assert_status(result, 2, "UNKNOWN")
 
+	def test_bootstrap_pin_change_reports_stale(self) -> None:
+		# blorp/build/bootstrap.env pins BLORP_BOOTSTRAP_TAG=dev-aaaaaaaaaaaa
+		# (see setUp); a binary reporting a different dev- compiled_by means
+		# it was built under a pin that has since been rotated.
+		self.write_fake_binary_version(compiled_by="dev-bbbbbbbbbbbb")
+
+		result = self.run_status()
+
+		self.assert_status(result, 1, "STALE")
+		self.assertIn("bootstrap pin changed", result.stdout)
+
+	def test_self_compiled_by_does_not_trigger_bootstrap_pin_check(self) -> None:
+		# A stage-2 binary's compiled_by is self-<commit>, not a dev- tag, so
+		# it is never compared against the bootstrap pin.
+		self.write_fake_binary_version(compiled_by="self-2d25f3b1578b")
+		self.write_fresh_manifests()
+
+		result = self.run_status()
+
+		self.assert_status(result, 0, "FRESH")
+
 	def test_bootstrap_and_native_flags_report_stale(self) -> None:
 		self.write("bootstrap-blorp", "new bootstrap\n")
 		self.assert_status(self.run_status(), 1, "STALE")
 		self.write_fresh_manifests()
 
-		result = self.run_status(extra_env={"BLORP_CLI_C_OPTIMIZATION": "-O2"})
+		# The binary itself now reports what it was actually built with (see
+		# write_fake_binary_version); a mismatch against the recorded
+		# manifests is what makes this STALE, not an ambient env var.
+		self.write_fake_binary_version(cli_opt="-O2")
+
+		result = self.run_status()
 
 		self.assert_status(result, 1, "STALE")
-		self.assertIn("BLORP_CLI_C_OPTIMIZATION=-O2", result.stdout)
+		self.assertIn("cli=-O2", result.stdout)
 
 	def test_split_count_change_reports_stale(self) -> None:
-		result = self.run_status(extra_env={"BLORP_CLI_C_SPLIT": "1"})
+		self.write_fake_binary_version(split_n="1")
+
+		result = self.run_status()
 
 		self.assert_status(result, 1, "STALE")
-		self.assertIn("BLORP_CLI_C_SPLIT=1", result.stdout)
+		self.assertIn("split: 1", result.stdout)
 
 	def test_splitter_script_edit_reports_stale(self) -> None:
 		self.write("scripts/split-generated-c", "changed splitter\n")
@@ -412,9 +472,10 @@ class CompilerBuildStatusTests(unittest.TestCase):
 		self.assertIn("8 per-TU objects", result.stdout)
 
 	def test_fresh_reports_single_tu_escape_hatch(self) -> None:
+		self.write_fake_binary_version(split_n="1")
 		self.write_fresh_manifests(split_n="1")
 
-		result = self.run_status(extra_env={"BLORP_CLI_C_SPLIT": "1"})
+		result = self.run_status()
 
 		self.assert_status(result, 0, "FRESH")
 		self.assertIn("single translation unit", result.stdout)

@@ -446,6 +446,26 @@ commit, does it push with fast-forward semantics; otherwise it reports that
 including the commit, but stops before the push. It finishes with its own
 `BLORP_GATE_RESULT gate=land ...` line and the landed commit SHA.
 
+## Identifying A Binary
+
+`bin/blorp --version` is the single source of truth for what a given binary
+is: commit (plus `-dirty` for uncommitted tracked changes), target triple,
+`compiled_by` (the bootstrap tag, or `self-<commit>` for a stage-2 binary
+built by `bin/blorp` itself — see `benchmarks/build_stage2_compiler`),
+`optimization` (`cli=` and `runtime=` flags actually used), `split` (the
+translation-unit count), and `cc` (the first line of `cc --version`). These
+values are stamped in at compile time from a small, always-freshly-rebuilt
+object (`blorp/src/lib/runtime/native/build_stamp.c`), not embedded into the
+generated compiler C, so a new commit relinks the binary instead of forcing a
+full recompile.
+
+`scripts/compiler-build-status` reads this block from the built binary — not
+ambient environment variables — to decide FRESH/STALE, so its verdict matches
+how the binary on disk was actually built regardless of the current shell's
+environment. It also flags `STALE` with reason "bootstrap pin changed" when
+`blorp/build/bootstrap.env`'s tag no longer matches a `dev-` `compiled_by`,
+and prints the version block after a `FRESH` verdict.
+
 ## Build Source Generation
 
 `make compiler-build-source-generator` compiles

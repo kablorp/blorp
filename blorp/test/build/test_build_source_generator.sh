@@ -87,6 +87,8 @@ grep -Fq 'usage: generate-build-sources' "$tmp_dir/usage.err"
 	blorp/src/lib/runtime/native/minicoro.h \
 	blorp/src/lib/runtime/native/runtime.c \
 	blorp/src/lib/runtime/native/runtime_decl.c \
+	blorp/src/lib/runtime/native/build_stamp.h \
+	blorp/src/lib/runtime/native/build_stamp.c \
 	>"$tmp_dir/provider.c"
 
 cat >"$tmp_dir/dump.c" <<'C'
@@ -122,6 +124,8 @@ cc -std=c11 "$tmp_dir/provider.c" "$tmp_dir/dump.c" -o "$tmp_dir/dump"
 	cat blorp/src/lib/runtime/native/minicoro.h
 	printf '\n'
 	cat blorp/src/lib/runtime/native/runtime.c
+	printf '\n'
+	cat blorp/src/lib/runtime/native/build_stamp.c
 } >"$tmp_dir/expected-runtime.c"
 
 {
@@ -129,6 +133,8 @@ cc -std=c11 "$tmp_dir/provider.c" "$tmp_dir/dump.c" -o "$tmp_dir/dump"
 	cat blorp/src/lib/runtime/native/minicoro.h
 	printf '\n'
 	cat blorp/src/lib/runtime/native/runtime_decl.c
+	printf '\n'
+	cat blorp/src/lib/runtime/native/build_stamp.h
 } >"$tmp_dir/expected-declarations.c"
 
 "$tmp_dir/dump" runtime >"$tmp_dir/actual-runtime.c"

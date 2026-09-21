@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import os
 import platform
+import re
 import shutil
 import stat
 import subprocess
@@ -442,6 +443,40 @@ def cc_identity(root: Path) -> tuple[str, str]:
 	return cc, first_line
 
 
+def read_binary_version(binary: Path) -> dict[str, str]:
+	"""Parse `<binary> --version` into its named fields.
+
+	This is the single source of truth for what a binary was actually built
+	with: reading it here (instead of trusting ambient environment variables,
+	which may not match how the binary now on disk was built) is what makes
+	FRESH/STALE agree with reality regardless of the caller's shell.
+	"""
+	try:
+		completed = subprocess.run(
+			[str(binary), "--version"],
+			text=True,
+			stdout=subprocess.PIPE,
+			stderr=subprocess.DEVNULL,
+			check=False,
+			timeout=5,
+		)
+	except (OSError, subprocess.SubprocessError) as error:
+		raise StatusError(f"could not read version from {binary}") from error
+	fields: dict[str, str] = {}
+	for line in completed.stdout.splitlines():
+		name, separator, value = line.partition(": ")
+		if separator:
+			fields[name] = value
+	if "optimization" not in fields or "split" not in fields:
+		raise StatusError(f"could not parse `--version` output from {binary}")
+	match = re.match(r"^cli=(\S+) runtime=(\S+)$", fields["optimization"])
+	if not match:
+		raise StatusError(f"could not parse optimization field from {binary} --version")
+	fields["cli_optimization"] = match.group(1)
+	fields["runtime_optimization"] = match.group(2)
+	return fields
+
+
 def runtime_config_hash(root: Path, runtime_optimization: str) -> str:
 	cc_path, cc_version = cc_identity(root)
 	records = [
@@ -559,10 +594,20 @@ def status(root: Path) -> StatusResult:
 		if stale:
 			return stale
 
-		cli_optimization = os.environ.get("BLORP_CLI_C_OPTIMIZATION", "-O0")
-		runtime_optimization = os.environ.get("BLORP_CLI_RUNTIME_C_OPTIMIZATION", "-O2")
+		binary_version = read_binary_version(root / BUILD_BIN)
+		cli_optimization = binary_version["cli_optimization"]
+		runtime_optimization = binary_version["runtime_optimization"]
+		split_n = binary_version["split"]
+		bootstrap_config = read_bootstrap_configuration(root)
+		compiled_by = binary_version.get("compiled_by", "")
+		if compiled_by.startswith("dev-") and compiled_by != bootstrap_config["BLORP_BOOTSTRAP_TAG"]:
+			return StatusResult(
+				"STALE",
+				"bootstrap pin changed",
+				f"blorp/build/bootstrap.env pins {bootstrap_config['BLORP_BOOTSTRAP_TAG']}; "
+				f"bin/blorp reports compiled_by={compiled_by}",
+			)
 		runtime_hash = runtime_config_hash(root, runtime_optimization)
-		split_n = os.environ.get("BLORP_CLI_C_SPLIT", "8")
 		splitter_hash = sha256_file(root / SPLITTER_SCRIPT)
 		binary_input_hash = hash_lines(
 			sha256_bytes(build_manifest),
@@ -581,9 +626,8 @@ def status(root: Path) -> StatusResult:
 			return StatusResult(
 				"STALE",
 				"native compiler build identity changed",
-				f"BLORP_CLI_C_OPTIMIZATION={cli_optimization}; "
-				f"BLORP_CLI_RUNTIME_C_OPTIMIZATION={runtime_optimization}; "
-				f"BLORP_CLI_C_SPLIT={split_n}",
+				f"bin/blorp reports optimization: cli={cli_optimization} "
+				f"runtime={runtime_optimization}; split: {split_n}",
 			)
 		verify_hash_file(
 			root / BUILD_BIN_HASH,
@@ -656,6 +700,19 @@ def main(arguments: list[str]) -> int:
 	result = status(Path.cwd())
 	if not options.quiet:
 		sys.stdout.write(format_result(result))
+		if result.state == "FRESH":
+			try:
+				completed = subprocess.run(
+					[str(INSTALLED_BIN), "--version"],
+					text=True,
+					stdout=subprocess.PIPE,
+					stderr=subprocess.DEVNULL,
+					check=False,
+					timeout=5,
+				)
+				sys.stdout.write(completed.stdout)
+			except (OSError, subprocess.SubprocessError):
+				pass
 	return result.exit_code
 
 

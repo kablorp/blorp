@@ -50,6 +50,12 @@ bin/blorp --version
 bin/blorp test --warmup-only
 ```
 
+`bin/blorp --version` is how you identify a binary: commit (`-dirty` for
+uncommitted tracked changes), target, `compiled_by`, the `-O` flags it was
+actually compiled with, translation-unit split, and `cc` identity. Trust this
+output over ambient environment variables — it reflects what the binary on
+disk was actually built with, not what your current shell happens to export.
+
 `make` performs a self-hosted build:
 
 1. Resolve the pinned bootstrap compiler.
@@ -88,9 +94,11 @@ Caveat: the generated C build-input hash includes this value, so alternating
 between `-O0` and `-O2` across runs forces a full re-link of the generated C
 (minutes, not seconds) each time you switch. Don't interleave `-O0` edit-loop
 runs with `-O2` gate runs in the same working tree without expecting that
-cost; `scripts/compiler-build-status` reports `STALE` when the installed
-binary was built at a different optimization level than the one currently in
-the environment.
+cost; `scripts/compiler-build-status` reads the optimization level and split
+count the installed binary actually reports (via `--version`), so it reports
+`STALE` only when the binary's build inputs have genuinely changed, not
+because of whatever `BLORP_CLI_C_OPTIMIZATION` your current shell happens to
+export.
 
 ## Daily Development Loop
 
