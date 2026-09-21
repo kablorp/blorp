@@ -306,8 +306,14 @@ assert report["compiler_identity"]["version"]
 assert report["executable_coverage_complete"] is False
 assert report["executable_guarantee_status"] == "unavailable"
 assert report["prepared_program_identity"]["status"] == "unavailable"
-assert report["backend_plan_coverage"] == "incomplete"
-assert report["behavior_configuration_coverage"] == "incomplete"
+for axis in ("backend_plan", "behavior_configuration"):
+    identity = report[axis + "_identity"]
+    assert identity["status"] == "cataloged"
+    assert isinstance(identity["revision"], int) and identity["revision"] > 0
+    assert isinstance(identity["kind_count"], int) and identity["kind_count"] > 0
+    # The catalog is total, but emitted helpers are not yet tagged with
+    # their kind, so coverage must stay short of a guarantee.
+    assert report[axis + "_coverage"] == "catalog_only"
 assert isinstance(report["owners"], list) and report["owners"]
 assert isinstance(report["sites"], list)
 for owner in report["owners"]:
