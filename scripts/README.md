@@ -581,6 +581,36 @@ not fail the quality gate merely because cleanup remains queued. Track accepted
 cleanup work in GitHub issues rather than copying point-in-time counts into a
 maintained document.
 
+### Compiler anti-pattern census
+
+`scripts/audit-compiler-antipatterns` inventories a small set of recurring
+source shapes that are useful during compiler cleanup:
+
+```bash
+scripts/audit-compiler-antipatterns
+scripts/audit-compiler-antipatterns --json > /tmp/blorp-antipatterns.json
+scripts/audit-compiler-antipatterns --rule threaded-state-record --json
+scripts/audit-compiler-antipatterns --large-file-lines 8000
+```
+
+The census reports string-keyed dictionaries, index builders, large threaded
+records, records whose optional fields and booleans may encode illegal states,
+small tuple returns, managed parameters returned unchanged from an update-like
+conditional, struct container placements whose final layout and hot read sites
+need inspection, and large source files. The complete unfiltered counts remain in
+JSON when `--rule` selects a review slice, so two revisions can be compared
+without accidentally changing the census boundary.
+
+These are review candidates, not lint failures or performance conclusions.
+JSON `confidence` describes confidence that the syntactic shape matched, not
+confidence that the code should be refactored.
+For example, `Dict[String, ...]` is correct before an identity has been
+resolved, a boolean can represent an independent fact, and a struct placement
+can remain inline. Confirm hotness and representation before changing source.
+Use allocation/instruction counters for an ownership claim, generated C for a
+layout or backend claim, and exact output identity for every performance
+experiment. Run before/after censuses with the same options and source scope.
+
 The module-identity graph modes isolate functions whose signatures or bodies
 directly carry `ResolvedModuleIdentity`, `ModuleIdentity`, `FrontendModuleId`,
 `ModuleId`, explicit `module_path`/`module_name` String bindings or fields, or a

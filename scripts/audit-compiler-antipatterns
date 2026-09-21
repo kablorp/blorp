@@ -1,0 +1,559 @@
+#!/usr/bin/env python3
+"""Report review candidates for recurring compiler source anti-patterns.
+
+This is a source-shape census, not a semantic or performance proof.  The
+rules intentionally stop at patterns that can be described deterministically;
+every finding still needs an owner to decide whether the representation is
+deliberate and whether changing it improves generated code or allocations.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections import Counter
+from dataclasses import dataclass
+import json
+from pathlib import Path
+import re
+import sys
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_SOURCE_ROOT = ROOT / "blorp/src/compiler"
+EXCLUDED_DIRECTORY_NAMES = {"stage_01_generated_inputs"}
+
+RULES = (
+    "conditional-parameter-passthrough",
+    "flag-state-record",
+    "index-builder",
+    "large-file",
+    "small-tuple-return",
+    "string-keyed-dict",
+    "struct-storage-review",
+    "threaded-state-record",
+)
+
+TYPE_DECLARATION = re.compile(
+    r"^(?P<indent>[ \t]*)(?:private\s+)?(?P<kind>record|struct)\s+"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\{",
+)
+FUNCTION_START = re.compile(
+    r"^(?:private\s+)?(?:(?:pure|impure|foreign|builtin)\s+)*func\s+"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?:\s*\[[^]]+\])?\s*\("
+)
+FIELD = re.compile(
+    r"^\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?P<type>[^,\n]+)"
+)
+DICT_STRING = re.compile(r"\bDict\s*\[\s*String\s*,")
+OPTION_TYPE = re.compile(r"\bOption\s*\[")
+BOOL_TYPE = re.compile(r"^Bool\b")
+INDEX_BUILDER_NAME = re.compile(r"(?:build.*index|index.*build)", re.IGNORECASE)
+UNION_START = re.compile(
+    r"^(?:private\s+)?union\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)[^:]*:\s*$"
+)
+
+
+@dataclass(frozen=True)
+class TypeDeclaration:
+    kind: str
+    name: str
+    path: Path
+    line: int
+    fields: tuple[tuple[str, str, int], ...]
+
+
+@dataclass(frozen=True)
+class Function:
+    name: str
+    path: Path
+    line: int
+    parameters: tuple[tuple[str, str], ...]
+    return_type: str
+    body: tuple[tuple[int, str], ...]
+
+
+@dataclass(frozen=True)
+class Finding:
+    rule: str
+    confidence: str
+    path: str
+    line: int
+    symbol: str
+    evidence: str
+
+    def as_json(self) -> dict[str, object]:
+        return {
+            "rule": self.rule,
+            "confidence": self.confidence,
+            "path": self.path,
+            "line": self.line,
+            "symbol": self.symbol,
+            "evidence": self.evidence,
+        }
+
+
+def indentation(line: str) -> int:
+    return len(line) - len(line.lstrip(" \t"))
+
+
+def display_path(path: Path, source_root: Path) -> str:
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path.relative_to(source_root))
+
+
+def display_source_root(source_root: Path) -> str:
+    try:
+        return str(source_root.relative_to(ROOT))
+    except ValueError:
+        return "<external>"
+
+
+def mask_comments_and_strings(text: str) -> str:
+    """Mask non-code text while preserving source offsets and line numbers."""
+    masked: list[str] = []
+    quote: str | None = None
+    escaped = False
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if quote is not None:
+            if character == "\n":
+                masked.append(character)
+            elif escaped:
+                masked.append(" ")
+                escaped = False
+            elif character == "\\":
+                masked.append(" ")
+                escaped = True
+            elif character == quote:
+                masked.append(character)
+                quote = None
+            else:
+                masked.append(" ")
+            index += 1
+            continue
+
+        if character in {'"', "'"}:
+            quote = character
+            masked.append(character)
+            index += 1
+            continue
+        if character == "-" and text[index : index + 2] == "--":
+            while index < len(text) and text[index] != "\n":
+                masked.append(" ")
+                index += 1
+            continue
+        masked.append(character)
+        index += 1
+    return "".join(masked)
+
+
+def source_files(source_root: Path) -> list[Path]:
+    return sorted(
+        path
+        for path in source_root.rglob("*.brp")
+        if not EXCLUDED_DIRECTORY_NAMES.intersection(path.parts)
+    )
+
+
+def parse_type_declarations(path: Path, lines: list[str]) -> list[TypeDeclaration]:
+    declarations: list[TypeDeclaration] = []
+    index = 0
+    while index < len(lines):
+        match = TYPE_DECLARATION.match(lines[index])
+        if match is None:
+            index += 1
+            continue
+        fields: list[tuple[str, str, int]] = []
+        declaration_line = index + 1
+        index += 1
+        while index < len(lines) and lines[index].strip() != "}":
+            field = FIELD.match(lines[index])
+            if field is not None:
+                fields.append(
+                    (field.group("name"), field.group("type").strip(), index + 1)
+                )
+            index += 1
+        declarations.append(
+            TypeDeclaration(
+                kind=match.group("kind"),
+                name=match.group("name"),
+                path=path,
+                line=declaration_line,
+                fields=tuple(fields),
+            )
+        )
+        index += 1
+    return declarations
+
+
+def split_parameters(parameters: str) -> tuple[tuple[str, str], ...]:
+    parts: list[str] = []
+    start = 0
+    depth = 0
+    for index, character in enumerate(parameters):
+        if character in "[({":
+            depth += 1
+        elif character in "])}":
+            depth -= 1
+        elif character == "," and depth == 0:
+            parts.append(parameters[start:index])
+            start = index + 1
+    parts.append(parameters[start:])
+
+    parsed: list[tuple[str, str]] = []
+    for part in parts:
+        match = re.fullmatch(
+            r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.+?)\s*", part, re.DOTALL
+        )
+        if match is not None:
+            parsed.append((match.group(1), " ".join(match.group(2).split())))
+    return tuple(parsed)
+
+
+def parse_functions(path: Path, lines: list[str]) -> list[Function]:
+    functions: list[Function] = []
+    index = 0
+    while index < len(lines):
+        if indentation(lines[index]) != 0 or FUNCTION_START.match(lines[index]) is None:
+            index += 1
+            continue
+
+        start = index
+        header_lines = [lines[index]]
+        depth = lines[index].count("(") - lines[index].count(")")
+        while index + 1 < len(lines) and (depth > 0 or not header_lines[-1].rstrip().endswith(":")):
+            index += 1
+            header_lines.append(lines[index])
+            depth += lines[index].count("(") - lines[index].count(")")
+            if depth == 0 and lines[index].rstrip().endswith(":"):
+                break
+
+        header = " ".join(part.strip() for part in header_lines)
+        match = re.match(
+            r"(?:private\s+)?(?:(?:pure|impure|foreign|builtin)\s+)*func\s+"
+            r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?:\s*\[[^]]+\])?\s*"
+            r"\((?P<params>.*?)\)\s*"
+            r"(?:->\s*(?P<return>.*?))?\s*:\s*$",
+            header,
+        )
+        if match is None:
+            index += 1
+            continue
+
+        body: list[tuple[int, str]] = []
+        body_index = index + 1
+        while body_index < len(lines):
+            line = lines[body_index]
+            if line.strip() and indentation(line) == 0:
+                break
+            body.append((body_index + 1, line.rstrip("\n")))
+            body_index += 1
+        functions.append(
+            Function(
+                name=match.group("name"),
+                path=path,
+                line=start + 1,
+                parameters=split_parameters(match.group("params")),
+                return_type=" ".join((match.group("return") or "").split()),
+                body=tuple(body),
+            )
+        )
+        index = body_index
+    return functions
+
+
+def line_number(text: str, offset: int) -> int:
+    return text.count("\n", 0, offset) + 1
+
+
+def collect_findings(source_root: Path, large_file_lines: int) -> tuple[list[Finding], int, int]:
+    files = source_files(source_root)
+    parsed_files: list[tuple[Path, str, list[str]]] = []
+    types: list[TypeDeclaration] = []
+    functions: list[Function] = []
+    total_lines = 0
+    findings: list[Finding] = []
+
+    for path in files:
+        text = path.read_text(encoding="utf-8")
+        lines = text.splitlines(keepends=True)
+        code_text = mask_comments_and_strings(text)
+        code_lines = code_text.splitlines(keepends=True)
+        parsed_files.append((path, code_text, code_lines))
+        total_lines += len(lines)
+        types.extend(parse_type_declarations(path, code_lines))
+        functions.extend(parse_functions(path, code_lines))
+        shown_path = display_path(path, source_root)
+
+        if len(lines) >= large_file_lines:
+            findings.append(
+                Finding(
+                    "large-file",
+                    "high",
+                    shown_path,
+                    1,
+                    path.stem,
+                    f"file contains {len(lines)} lines (threshold {large_file_lines})",
+                )
+            )
+
+        for match in DICT_STRING.finditer(code_text):
+            findings.append(
+                Finding(
+                    "string-keyed-dict",
+                    "high",
+                    shown_path,
+                    line_number(code_text, match.start()),
+                    "Dict[String, ...]",
+                    "string-keyed dictionary; review whether an existing dense identity can key it",
+                )
+            )
+
+    record_types = {declaration.name: declaration for declaration in types if declaration.kind == "record"}
+    struct_names = {declaration.name for declaration in types if declaration.kind == "struct"}
+
+    for declaration in types:
+        shown_path = display_path(declaration.path, source_root)
+        option_fields = sum(bool(OPTION_TYPE.match(field_type)) for _, field_type, _ in declaration.fields)
+        bool_fields = sum(bool(BOOL_TYPE.match(field_type)) for _, field_type, _ in declaration.fields)
+        if declaration.kind == "record" and option_fields >= 2 and bool_fields >= 1:
+            findings.append(
+                Finding(
+                    "flag-state-record",
+                    "medium",
+                    shown_path,
+                    declaration.line,
+                    declaration.name,
+                    f"record combines {option_fields} Option fields with {bool_fields} Bool field(s)",
+                )
+            )
+
+    for function in functions:
+        shown_path = display_path(function.path, source_root)
+        if INDEX_BUILDER_NAME.search(function.name):
+            findings.append(
+                Finding(
+                    "index-builder",
+                    "high",
+                    shown_path,
+                    function.line,
+                    function.name,
+                    "function name identifies an index builder; compare its input with other published indexes",
+                )
+            )
+
+        return_type = function.return_type.strip()
+        if return_type.startswith("(") and return_type.endswith(")"):
+            components = split_parameters(return_type[1:-1])
+            if not components:
+                # Tuple return components do not have parameter names.
+                raw = return_type[1:-1]
+                depth = 0
+                commas = 0
+                for character in raw:
+                    if character in "[({":
+                        depth += 1
+                    elif character in "])}":
+                        depth -= 1
+                    elif character == "," and depth == 0:
+                        commas += 1
+                component_count = commas + 1 if raw.strip() else 0
+            else:
+                component_count = len(components)
+            if 2 <= component_count <= 3:
+                findings.append(
+                    Finding(
+                        "small-tuple-return",
+                        "medium",
+                        shown_path,
+                        function.line,
+                        function.name,
+                        f"returns a {component_count}-component tuple; review allocation and escape behavior",
+                    )
+                )
+
+        body_text = "\n".join(line for _, line in function.body)
+        has_branch = bool(re.search(r"^\s*(?:if|match)\b", body_text, re.MULTILINE))
+        if has_branch and return_type:
+            for parameter_name, parameter_type in function.parameters:
+                if parameter_type != return_type:
+                    continue
+                managed_type = (
+                    parameter_type.startswith("List[")
+                    or parameter_type.startswith("Dict[")
+                    or parameter_type in record_types
+                )
+                if not managed_type:
+                    continue
+                update_like_use = bool(
+                    re.search(
+                        rf"\b{re.escape(parameter_name)}\.(?:append|insert|remove|set|update|with_)\w*\s*\(",
+                        body_text,
+                    )
+                    or re.search(rf"\{{\s*{re.escape(parameter_name)}\s*\|", body_text)
+                )
+                if not update_like_use:
+                    continue
+                bare_lines = [
+                    body_line
+                    for body_line, line in function.body
+                    if line.strip() == parameter_name
+                ]
+                if bare_lines:
+                    findings.append(
+                        Finding(
+                            "conditional-parameter-passthrough",
+                            "low",
+                            shown_path,
+                            bare_lines[0],
+                            function.name,
+                            f"syntactic lead: a conditional path returns parameter {parameter_name} unchanged",
+                        )
+                    )
+                    break
+
+    carrier_types_by_record: dict[str, set[str]] = {name: set() for name in record_types}
+    for carrier in record_types.values():
+        for _, field_type, _ in carrier.fields:
+            if field_type in record_types:
+                carrier_types_by_record[field_type].add(carrier.name)
+
+    functions_by_record: dict[str, list[str]] = {name: [] for name in record_types}
+    for function in functions:
+        for _, parameter_type in function.parameters:
+            declaration = record_types.get(parameter_type)
+            return_names = {parameter_type}.union(
+                carrier_types_by_record.get(parameter_type, set())
+            )
+            returned_directly_or_in_carrier = any(
+                re.search(rf"\b{re.escape(return_name)}\b", function.return_type)
+                for return_name in return_names
+            )
+            if declaration is not None and returned_directly_or_in_carrier:
+                functions_by_record[parameter_type].append(function.name)
+    for record_name, names in functions_by_record.items():
+        declaration = record_types[record_name]
+        if len(declaration.fields) >= 6 and len(set(names)) >= 3:
+            findings.append(
+                Finding(
+                    "threaded-state-record",
+                    "medium",
+                    display_path(declaration.path, source_root),
+                    declaration.line,
+                    record_name,
+                    f"{len(declaration.fields)}-field record is accepted and returned directly or in a carrier by {len(set(names))} functions",
+                )
+            )
+
+    for path, text, lines in parsed_files:
+        shown_path = display_path(path, source_root)
+        for struct_name in sorted(struct_names):
+            container = re.compile(rf"\b(?P<kind>Option|List)\s*\[\s*{re.escape(struct_name)}\s*\]")
+            for match in container.finditer(text):
+                findings.append(
+                    Finding(
+                        "struct-storage-review",
+                        "medium",
+                        shown_path,
+                        line_number(text, match.start()),
+                        struct_name,
+                        f"struct appears in {match.group('kind')} placement; verify final layout and hot read behavior",
+                    )
+                )
+
+        index = 0
+        while index < len(lines):
+            union = UNION_START.match(lines[index].rstrip("\n"))
+            if union is None:
+                index += 1
+                continue
+            base_indent = indentation(lines[index])
+            index += 1
+            while index < len(lines):
+                line = lines[index]
+                if line.strip() and indentation(line) <= base_indent:
+                    break
+                for struct_name in sorted(struct_names):
+                    if re.search(rf"\(\s*{re.escape(struct_name)}\s*\)", line):
+                        findings.append(
+                            Finding(
+                                "struct-storage-review",
+                                "medium",
+                                shown_path,
+                                index + 1,
+                                struct_name,
+                                f"struct is a payload of union {union.group('name')}; verify final layout and hot read behavior",
+                            )
+                        )
+                index += 1
+
+    return sorted(findings, key=lambda item: (item.rule, item.path, item.line, item.symbol)), len(files), total_lines
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Census review candidates for recurring compiler anti-patterns."
+    )
+    parser.add_argument("--source-root", type=Path, default=DEFAULT_SOURCE_ROOT)
+    parser.add_argument("--json", action="store_true", help="emit stable JSON")
+    parser.add_argument(
+        "--large-file-lines",
+        type=int,
+        default=4000,
+        metavar="N",
+        help="report files containing at least N lines (default: 4000)",
+    )
+    parser.add_argument("--rule", choices=RULES, help="show only one rule's findings")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if args.large_file_lines < 1:
+        print("error: --large-file-lines must be positive", file=sys.stderr)
+        return 2
+    source_root = args.source_root.resolve()
+    if not source_root.is_dir():
+        print(f"error: source root is not a directory: {source_root}", file=sys.stderr)
+        return 2
+
+    findings, file_count, source_lines = collect_findings(source_root, args.large_file_lines)
+    counts = Counter(finding.rule for finding in findings)
+    census = {
+        "source_files": file_count,
+        "source_lines": source_lines,
+        "by_rule": {rule: counts[rule] for rule in RULES},
+    }
+    visible = [finding for finding in findings if args.rule is None or finding.rule == args.rule]
+    report = {
+        "schema_version": 1,
+        "source_root": display_source_root(source_root),
+        "census": census,
+        "findings": [finding.as_json() for finding in visible],
+        "limitations": [
+            "Findings are source-shape review candidates, not proof of a defect or performance cost.",
+            "Confidence describes confidence in the syntactic match, not confidence that a refactor is warranted.",
+            "Boxing, copy-on-write reuse, hotness, and generated representation require compiler or generated-C evidence.",
+            "Counts are useful for before/after cleanup censuses only when run with identical inputs and options.",
+        ],
+    }
+    if args.json:
+        json.dump(report, sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
+    else:
+        print(f"Compiler anti-pattern census: {file_count} files, {source_lines} lines")
+        for rule in RULES:
+            print(f"{rule}: {counts[rule]}")
+        for finding in visible:
+            print(
+                f"{finding.path}:{finding.line}: {finding.rule}: "
+                f"{finding.symbol}: {finding.evidence}"
+            )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
