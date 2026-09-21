@@ -40,6 +40,7 @@ import:
 			ParsedDimMultiplyOp,
 			ParsedDimSubtractOp,
 		),
+		ParsedDimConstraint,
 		ParsedExpr(
 			ParsedAssignExpr,
 			ParsedBinaryExpr,
@@ -57,9 +58,11 @@ import:
 			ParsedDictExpr,
 			ParsedFieldAccessExpr,
 			ParsedForExpr,
+			ParsedFunctionDeclExpr,
 			ParsedIfExpr,
 			ParsedIntLiteralExpr,
 			ParsedListExpr,
+			ParsedLambdaExpr,
 			ParsedLogicalExpr,
 			ParsedMatchExpr,
 			ParsedMissingExpr,
@@ -86,10 +89,20 @@ import:
 			ParsedWithExpr,
 		),
 		ParsedForBinder(ParsedForNameBinder, ParsedForTupleBinder),
+		ParsedFunctionAnnotation(
+			ParsedDebugOnlyAnnotation,
+			ParsedNoCopyAnnotation,
+			ParsedResourceResultOrdinaryAnnotation,
+			ParsedTailRecursiveAnnotation,
+		),
+		ParsedFunctionDecl,
 		ParsedIdentifier,
+		ParsedLambdaParam,
 		ParsedListPatternSpread(ParsedListSpreadName, ParsedListSpreadWildcard),
 		ParsedLogicalOp(ParsedAndOp, ParsedOrOp),
 		ParsedMatchCase,
+		ParsedParam,
+		ParsedParamBinder(ParsedParamNameBinder, ParsedParamTupleBinder, ParsedParamWildcardBinder),
 		ParsedPattern(
 			ParsedBoolPattern,
 			ParsedCharPattern,
@@ -123,6 +136,7 @@ import:
 			ParsedRangeType,
 			ParsedTupleType,
 		),
+		ParsedTypeParamDecl,
 		ParsedUnaryOp(ParsedNegateOp, ParsedNotOp),
 		ParsedWithBinding,
 		ParsedWithBindingKind(ParsedWithPlainBinding, ParsedWithTryBinding),
@@ -181,6 +195,8 @@ enum CompactExpressionNodeKind:
 	CompactMatchNode
 	CompactSelectNode
 	CompactWithNode
+	CompactLambdaNode
+	CompactFunctionDeclNode
 
 
 enum CompactPatternNodeKind:
@@ -210,6 +226,20 @@ enum CompactSelectArmKind:
 enum CompactWithBindingKind:
 	CompactWithPlainBinding
 	CompactWithTryBinding
+
+
+enum CompactCallableParamKind:
+	CompactLambdaNameParam
+	CompactFunctionNameParam
+	CompactFunctionWildcardParam
+	CompactFunctionTupleParam
+
+
+enum CompactFunctionAnnotationKind:
+	CompactTailRecursiveAnnotation
+	CompactNoCopyAnnotation
+	CompactDebugOnlyAnnotation
+	CompactResourceResultOrdinaryAnnotation
 
 
 enum CompactExpressionOperator:
@@ -313,6 +343,20 @@ enum CompactExpressionCorruption:
 	CompactWithErrorMapForeignSourceOwner
 	CompactWithWrongArity
 	CompactWithOrphanErrorMap
+	CompactLambdaPayloadAlias
+	CompactLambdaSharedTypeRoot
+	CompactFunctionPayloadAlias
+	CompactCallableParamSliceAlias
+	CompactCallableWildcardNonemptySlice
+	CompactCallableParamTypeRootOutOfRange
+	CompactCallableTypeParamBoundsAlias
+	CompactCallableDimTypeRootAlias
+	CompactFunctionAnnotationSliceAlias
+	CompactFunctionKeywordForeignSourceOwner
+	CompactFunctionAbsentKeywordLocation
+	CompactFunctionDocTextOutOfRange
+	CompactFunctionWrongArity
+	CompactFunctionOrphanAnnotation
 
 
 struct CompactProductSourceLocation {
@@ -501,6 +545,54 @@ struct CompactWithErrorMapRow {
 }
 
 
+struct CompactLambdaRow {
+	parameter_start: Int,
+	parameter_count: Int,
+	return_type_root_index: Int,
+	is_pure: Bool
+}
+
+
+struct CompactFunctionRow {
+	name_identifier_index: Int,
+	type_parameter_start: Int,
+	type_parameter_count: Int,
+	parameter_start: Int,
+	parameter_count: Int,
+	return_type_root_index: Int,
+	dimension_constraint_start: Int,
+	dimension_constraint_count: Int,
+	annotation_start: Int,
+	annotation_count: Int,
+	doc_text_index: Int,
+	is_pure: Bool,
+	keyword_span: CompactProductSourceLocation
+}
+
+
+struct CompactCallableParamRow {
+	kind: CompactCallableParamKind,
+	binder_payload_index: Int,
+	type_root_index: Int,
+	span: CompactProductSourceLocation
+}
+
+
+struct CompactCallableTypeParamRow {
+	name_identifier_index: Int,
+	bound_identifier_start: Int,
+	bound_identifier_count: Int,
+	span: CompactProductSourceLocation
+}
+
+
+struct CompactCallableDimConstraintRow {
+	left_type_root_index: Int,
+	right_type_root_index: Int,
+	span: CompactProductSourceLocation
+}
+
+
 struct CompactUnitPayloadRow {
 	kind: CompactUnitPayloadKind
 }
@@ -540,6 +632,12 @@ private record CompactExpressionProductRep {
 	select_arms: List[CompactSelectArmRow],
 	with_bindings: List[CompactWithBindingRow],
 	with_error_maps: List[CompactWithErrorMapRow],
+	lambda_payloads: List[CompactLambdaRow],
+	function_payloads: List[CompactFunctionRow],
+	callable_params: List[CompactCallableParamRow],
+	callable_type_params: List[CompactCallableTypeParamRow],
+	callable_dim_constraints: List[CompactCallableDimConstraintRow],
+	function_annotations: List[CompactFunctionAnnotationKind],
 	unit_payloads: List[CompactUnitPayloadRow],
 	roots: List[Int]
 }
@@ -582,6 +680,12 @@ record CompactExpressionProductCounts {
 	select_arm_count: Int,
 	with_binding_count: Int,
 	with_error_map_count: Int,
+	lambda_payload_count: Int,
+	function_payload_count: Int,
+	callable_param_count: Int,
+	callable_type_param_count: Int,
+	callable_dim_constraint_count: Int,
+	function_annotation_count: Int,
 	unit_payload_count: Int,
 	root_count: Int
 }
@@ -625,6 +729,8 @@ private union CompactBuildAction:
 	CompactBuildMatch(List[ParsedMatchCase], SourceLocation)
 	CompactBuildSelect(List[ParsedSelectArm], SourceLocation)
 	CompactBuildWith(ParsedWithBinding, SourceLocation)
+	CompactBuildLambda(Bool, List[ParsedLambdaParam], Option[ParsedTypeExpr], SourceLocation)
+	CompactBuildFunction(ParsedFunctionDecl)
 	CompactBuildPatternVisit(ParsedPattern)
 	CompactBuildPatternNoPayload(CompactPatternNodeKind, Int, SourceLocation)
 	CompactBuildPatternText(CompactPatternNodeKind, String, SourceLocation)
@@ -656,6 +762,8 @@ private NO_COMPACT_TYPE_ROOT_INDEX: Int = -1
 private NO_COMPACT_IDENTIFIER_INDEX: Int = -1
 
 private NO_COMPACT_ERROR_MAP_INDEX: Int = -1
+
+private NO_COMPACT_TEXT_INDEX: Int = -1
 
 
 private pure func compact_source_location(location: SourceLocation) -> CompactProductSourceLocation:
@@ -883,8 +991,10 @@ private pure func compact_expected_child_count(
 			None
 		CompactFinalizedInterpolationNode:
 			None
-		CompactBlockNode | CompactSubscriptAssignNode | CompactIfNode | CompactMatchNode | CompactSelectNode | CompactWithNode:
+		CompactBlockNode | CompactSubscriptAssignNode | CompactIfNode | CompactMatchNode | CompactSelectNode | CompactWithNode | CompactFunctionDeclNode:
 			None
+		CompactLambdaNode:
+			Some(1)
 		CompactAscriptionNode | CompactOpaqueIntoNode | CompactOpaqueFromNode:
 			Some(1)
 		CompactRangeNode:
@@ -1022,6 +1132,12 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 		var select_arm_slot_owners = 0.repeat(rep.select_arms.length())
 		var with_binding_owners = 0.repeat(rep.with_bindings.length())
 		var with_error_map_owners = 0.repeat(rep.with_error_maps.length())
+		var lambda_payload_owners = 0.repeat(rep.lambda_payloads.length())
+		var function_payload_owners = 0.repeat(rep.function_payloads.length())
+		var callable_param_slot_owners = 0.repeat(rep.callable_params.length())
+		var callable_type_param_slot_owners = 0.repeat(rep.callable_type_params.length())
+		var callable_dim_constraint_slot_owners = 0.repeat(rep.callable_dim_constraints.length())
+		var function_annotation_slot_owners = 0.repeat(rep.function_annotations.length())
 		var validated_pattern_binding_counts = 0.repeat(rep.pattern_nodes.length())
 		var unit_owners = 0.repeat(rep.unit_payloads.length())
 
@@ -1166,6 +1282,44 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 												3
 
 											valid = node.child_count == expected
+										None:
+											valid = False
+								CompactLambdaNode:
+									match rep.lambda_payloads.get(node.payload_index):
+										Some(payload):
+											valid = compact_metadata_slice_is_valid(
+												payload.parameter_start,
+												payload.parameter_count,
+												rep.callable_params.length(),
+											)
+										None:
+											valid = False
+								CompactFunctionDeclNode:
+									match rep.function_payloads.get(node.payload_index):
+										Some(payload):
+											valid = (
+												(node.child_count == 0 or node.child_count == 1)
+												and compact_metadata_slice_is_valid(
+													payload.type_parameter_start,
+													payload.type_parameter_count,
+													rep.callable_type_params.length(),
+												)
+												and compact_metadata_slice_is_valid(
+													payload.parameter_start,
+													payload.parameter_count,
+													rep.callable_params.length(),
+												)
+												and compact_metadata_slice_is_valid(
+													payload.dimension_constraint_start,
+													payload.dimension_constraint_count,
+													rep.callable_dim_constraints.length(),
+												)
+												and compact_metadata_slice_is_valid(
+													payload.annotation_start,
+													payload.annotation_count,
+													rep.function_annotations.length(),
+												)
+											)
 										None:
 											valid = False
 								_:
@@ -1641,6 +1795,411 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 													)
 											None:
 												valid = False
+								None:
+									valid = False
+						CompactLambdaNode:
+							match rep.lambda_payloads.get(node.payload_index):
+								Some(payload):
+									lambda_payload_owners = lambda_payload_owners.set(
+										node.payload_index,
+										lambda_payload_owners
+											.get(node.payload_index)
+											.get_or(0) + 1,
+									)
+									var parameter_offset: Int = 0
+
+									while parameter_offset < payload.parameter_count and valid:
+										parameter_slot = payload.parameter_start + parameter_offset
+
+										match rep.callable_params.get(parameter_slot):
+											Some(parameter):
+												if (
+													parameter.kind != CompactLambdaNameParam
+													or not compact_source_span_is_valid(
+														rep.source_owners,
+														parameter.span,
+													)
+													or parameter.binder_payload_index < 0
+													or parameter.binder_payload_index >= rep.control_identifiers.length()
+												):
+													valid = False
+												else:
+													control_identifier_owners = control_identifier_owners.set(
+														parameter.binder_payload_index,
+														control_identifier_owners
+															.get(parameter.binder_payload_index)
+															.get_or(0) + 1,
+													)
+
+												if parameter.type_root_index != NO_COMPACT_TYPE_ROOT_INDEX:
+													if (
+														parameter.type_root_index < 0
+														or parameter.type_root_index >= rep.type_nodes.length()
+														or type_root_membership
+															.get(parameter.type_root_index)
+															.get_or(False)
+													):
+														valid = False
+													else:
+														type_root_membership = type_root_membership.set(
+															parameter.type_root_index,
+															True,
+														)
+
+												callable_param_slot_owners = callable_param_slot_owners.set(
+													parameter_slot,
+													callable_param_slot_owners
+														.get(parameter_slot)
+														.get_or(0) + 1,
+												)
+											None:
+												valid = False
+
+										parameter_offset += 1
+
+									if payload.return_type_root_index != NO_COMPACT_TYPE_ROOT_INDEX:
+										if (
+											payload.return_type_root_index < 0
+											or payload.return_type_root_index >= rep.type_nodes.length()
+											or type_root_membership
+												.get(payload.return_type_root_index)
+												.get_or(False)
+										):
+											valid = False
+										else:
+											type_root_membership = type_root_membership.set(
+												payload.return_type_root_index,
+												True,
+											)
+								None:
+									valid = False
+						CompactFunctionDeclNode:
+							match rep.function_payloads.get(node.payload_index):
+								Some(payload):
+									function_payload_owners = function_payload_owners.set(
+										node.payload_index,
+										function_payload_owners
+											.get(node.payload_index)
+											.get_or(0) + 1,
+									)
+
+									if (
+										payload.name_identifier_index < 0
+										or payload.name_identifier_index >= rep.control_identifiers.length()
+									):
+										valid = False
+									else:
+										control_identifier_owners = control_identifier_owners.set(
+											payload.name_identifier_index,
+											control_identifier_owners
+												.get(payload.name_identifier_index)
+												.get_or(0) + 1,
+										)
+
+									if payload.keyword_span.source_owner_index == NO_COMPACT_SOURCE_OWNER_INDEX:
+										if not source_locations_equal(
+											payload.keyword_span.location,
+											node.span.location,
+										):
+											valid = False
+									else if not compact_source_span_is_valid(
+										rep.source_owners,
+										payload.keyword_span,
+									):
+										valid = False
+
+									if payload.doc_text_index != NO_COMPACT_TEXT_INDEX:
+										if (
+											payload.doc_text_index < 0
+											or payload.doc_text_index >= rep.texts.length()
+										):
+											valid = False
+										else:
+											owned_text_indices = owned_text_indices.set(
+												payload.doc_text_index,
+												owned_text_indices
+													.get(payload.doc_text_index)
+													.get_or(0) + 1,
+											)
+
+									var type_parameter_offset: Int = 0
+
+									while (
+										type_parameter_offset < payload.type_parameter_count
+										and valid
+									):
+										type_parameter_slot = payload.type_parameter_start + type_parameter_offset
+
+										match rep.callable_type_params.get(type_parameter_slot):
+											Some(type_parameter):
+												if (
+													not compact_source_span_is_valid(
+														rep.source_owners,
+														type_parameter.span,
+													)
+													or type_parameter.name_identifier_index < 0
+													or type_parameter.name_identifier_index >= rep.type_identifiers.length()
+													or not compact_metadata_slice_is_valid(
+														type_parameter.bound_identifier_start,
+														type_parameter.bound_identifier_count,
+														rep.type_identifiers.length(),
+													)
+												):
+													valid = False
+												else:
+													type_identifier_owners = type_identifier_owners.set(
+														type_parameter.name_identifier_index,
+														type_identifier_owners
+															.get(
+																type_parameter.name_identifier_index,
+															)
+															.get_or(0) + 1,
+													)
+
+													match rep.type_identifiers.get(
+														type_parameter.name_identifier_index,
+													):
+														Some(identifier):
+															if (
+																not compact_source_span_is_valid(
+																	rep.source_owners,
+																	identifier.span,
+																)
+																or identifier.text_index < 0
+																or identifier.text_index >= rep.texts.length()
+															):
+																valid = False
+															else:
+																owned_text_indices = owned_text_indices.set(
+																	identifier.text_index,
+																	owned_text_indices
+																		.get(identifier.text_index)
+																		.get_or(0) + 1,
+																)
+														None:
+															valid = False
+
+													var bound_offset: Int = 0
+
+													while bound_offset < type_parameter.bound_identifier_count:
+														bound_index = type_parameter.bound_identifier_start + bound_offset
+														type_identifier_owners = type_identifier_owners.set(
+															bound_index,
+															type_identifier_owners
+																.get(bound_index)
+																.get_or(0) + 1,
+														)
+
+														match rep.type_identifiers.get(bound_index):
+															Some(identifier):
+																if (
+																	not compact_source_span_is_valid(
+																		rep.source_owners,
+																		identifier.span,
+																	)
+																	or identifier.text_index < 0
+																	or identifier.text_index >= rep.texts.length()
+																):
+																	valid = False
+																else:
+																	owned_text_indices = owned_text_indices.set(
+																		identifier.text_index,
+																		owned_text_indices
+																			.get(
+																				identifier.text_index,
+																			)
+																			.get_or(0) + 1,
+																	)
+															None:
+																valid = False
+
+														bound_offset += 1
+
+													callable_type_param_slot_owners = callable_type_param_slot_owners.set(
+														type_parameter_slot,
+														callable_type_param_slot_owners
+															.get(type_parameter_slot)
+															.get_or(0) + 1,
+													)
+											None:
+												valid = False
+
+										type_parameter_offset += 1
+
+									var parameter_offset: Int = 0
+
+									while parameter_offset < payload.parameter_count and valid:
+										parameter_slot = payload.parameter_start + parameter_offset
+
+										match rep.callable_params.get(parameter_slot):
+											Some(parameter):
+												if not compact_source_span_is_valid(
+													rep.source_owners,
+													parameter.span,
+												):
+													valid = False
+												else:
+													match parameter.kind:
+														CompactFunctionNameParam:
+															if (
+																parameter.binder_payload_index < 0
+																or parameter.binder_payload_index >= rep.control_identifiers.length()
+															):
+																valid = False
+															else:
+																control_identifier_owners = control_identifier_owners.set(
+																	parameter.binder_payload_index,
+																	control_identifier_owners
+																		.get(
+																			parameter.binder_payload_index,
+																		)
+																		.get_or(0) + 1,
+																)
+														CompactFunctionWildcardParam | CompactFunctionTupleParam:
+															match rep.identifier_slices.get(
+																parameter.binder_payload_index,
+															):
+																Some(slice):
+																	if (
+																		not compact_source_span_is_valid(
+																			rep.source_owners,
+																			slice.span,
+																		)
+																		or not compact_metadata_slice_is_valid(
+																			slice.identifier_start,
+																			slice.identifier_count,
+																			rep.control_identifiers.length(),
+																		)
+																		or (
+																			parameter.kind == CompactFunctionWildcardParam
+																			and slice.identifier_count != 0
+																		)
+																	):
+																		valid = False
+																	else:
+																		identifier_slice_owners = identifier_slice_owners.set(
+																			parameter.binder_payload_index,
+																			identifier_slice_owners
+																				.get(
+																					parameter.binder_payload_index,
+																				)
+																				.get_or(0) + 1,
+																		)
+																		var identifier_offset: Int = 0
+
+																		while identifier_offset < slice.identifier_count:
+																			identifier_index = slice.identifier_start + identifier_offset
+																			control_identifier_owners = control_identifier_owners.set(
+																				identifier_index,
+																				control_identifier_owners
+																					.get(
+																						identifier_index,
+																					)
+																					.get_or(0) + 1,
+																			)
+																			identifier_offset += 1
+																None:
+																	valid = False
+														CompactLambdaNameParam:
+															valid = False
+
+												if parameter.type_root_index != NO_COMPACT_TYPE_ROOT_INDEX:
+													if (
+														parameter.type_root_index < 0
+														or parameter.type_root_index >= rep.type_nodes.length()
+														or type_root_membership
+															.get(parameter.type_root_index)
+															.get_or(False)
+													):
+														valid = False
+													else:
+														type_root_membership = type_root_membership.set(
+															parameter.type_root_index,
+															True,
+														)
+
+												callable_param_slot_owners = callable_param_slot_owners.set(
+													parameter_slot,
+													callable_param_slot_owners
+														.get(parameter_slot)
+														.get_or(0) + 1,
+												)
+											None:
+												valid = False
+
+										parameter_offset += 1
+
+									if payload.return_type_root_index != NO_COMPACT_TYPE_ROOT_INDEX:
+										if (
+											payload.return_type_root_index < 0
+											or payload.return_type_root_index >= rep.type_nodes.length()
+											or type_root_membership
+												.get(payload.return_type_root_index)
+												.get_or(False)
+										):
+											valid = False
+										else:
+											type_root_membership = type_root_membership.set(
+												payload.return_type_root_index,
+												True,
+											)
+
+									var constraint_offset: Int = 0
+
+									while (
+										constraint_offset < payload.dimension_constraint_count
+										and valid
+									):
+										constraint_slot = payload.dimension_constraint_start + constraint_offset
+
+										match rep.callable_dim_constraints.get(constraint_slot):
+											Some(constraint):
+												if not compact_source_span_is_valid(
+													rep.source_owners,
+													constraint.span,
+												):
+													valid = False
+
+												for type_root_index in [
+													constraint.left_type_root_index,
+													constraint.right_type_root_index,
+												]:
+													if (
+														type_root_index < 0
+														or type_root_index >= rep.type_nodes.length()
+														or type_root_membership
+															.get(type_root_index)
+															.get_or(False)
+													):
+														valid = False
+													else:
+														type_root_membership = type_root_membership.set(
+															type_root_index,
+															True,
+														)
+
+												callable_dim_constraint_slot_owners = callable_dim_constraint_slot_owners.set(
+													constraint_slot,
+													callable_dim_constraint_slot_owners
+														.get(constraint_slot)
+														.get_or(0) + 1,
+												)
+											None:
+												valid = False
+
+										constraint_offset += 1
+
+									var annotation_offset: Int = 0
+
+									while annotation_offset < payload.annotation_count:
+										annotation_slot = payload.annotation_start + annotation_offset
+										function_annotation_slot_owners = function_annotation_slot_owners.set(
+											annotation_slot,
+											function_annotation_slot_owners
+												.get(annotation_slot)
+												.get_or(0) + 1,
+										)
+										annotation_offset += 1
 								None:
 									valid = False
 						CompactImmutableVarDeclNode | CompactMutableVarDeclNode | CompactQuestionBindNode:
@@ -2246,6 +2805,24 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 			for owners in with_error_map_owners:
 				valid = valid and owners == 1
 
+			for owners in lambda_payload_owners:
+				valid = valid and owners == 1
+
+			for owners in function_payload_owners:
+				valid = valid and owners == 1
+
+			for owners in callable_param_slot_owners:
+				valid = valid and owners == 1
+
+			for owners in callable_type_param_slot_owners:
+				valid = valid and owners == 1
+
+			for owners in callable_dim_constraint_slot_owners:
+				valid = valid and owners == 1
+
+			for owners in function_annotation_slot_owners:
+				valid = valid and owners == 1
+
 			for owners in unit_owners:
 				valid = valid and owners == 1
 
@@ -2290,6 +2867,12 @@ pure func compact_expression_oracle_from_parsed_roots(
 	var select_arms: List[CompactSelectArmRow] = []
 	var with_bindings: List[CompactWithBindingRow] = []
 	var with_error_maps: List[CompactWithErrorMapRow] = []
+	var lambda_payloads: List[CompactLambdaRow] = []
+	var function_payloads: List[CompactFunctionRow] = []
+	var callable_params: List[CompactCallableParamRow] = []
+	var callable_type_params: List[CompactCallableTypeParamRow] = []
+	var callable_dim_constraints: List[CompactCallableDimConstraintRow] = []
+	var function_annotations: List[CompactFunctionAnnotationKind] = []
 	var unit_payloads: List[CompactUnitPayloadRow] = []
 	var actions: List[CompactBuildAction] = []
 	var values: List[Int] = []
@@ -2784,6 +3367,77 @@ pure func compact_expression_oracle_from_parsed_roots(
 								void
 
 						actions = actions.append(CompactBuildVisit(binding.value))
+					ParsedLambdaExpr(is_pure, params, return_type, body, span):
+						actions = actions
+							.append(CompactBuildLambda(is_pure, params, return_type, span))
+							.append(CompactBuildVisit(body))
+
+						match return_type:
+							Some(type_expr):
+								actions = actions.append(CompactBuildTypeVisit(type_expr))
+							None:
+								void
+
+						var param_index = params.length() - 1
+
+						while param_index >= 0:
+							match params.get(param_index):
+								Some(param):
+									match param.type_expr:
+										Some(type_expr):
+											actions = actions.append(
+												CompactBuildTypeVisit(type_expr),
+											)
+										None:
+											void
+								None:
+									supported = False
+
+							param_index -= 1
+					ParsedFunctionDeclExpr(decl):
+						actions = actions.append(CompactBuildFunction(decl))
+
+						match decl.body:
+							Some(body):
+								actions = actions.append(CompactBuildVisit(body))
+							None:
+								void
+
+						var constraint_index = decl.dim_constraints.length() - 1
+
+						while constraint_index >= 0:
+							match decl.dim_constraints.get(constraint_index):
+								Some(constraint):
+									actions = actions
+										.append(CompactBuildTypeVisit(constraint.right))
+										.append(CompactBuildTypeVisit(constraint.left))
+								None:
+									supported = False
+
+							constraint_index -= 1
+
+						match decl.return_type:
+							Some(type_expr):
+								actions = actions.append(CompactBuildTypeVisit(type_expr))
+							None:
+								void
+
+						var function_param_index = decl.params.length() - 1
+
+						while function_param_index >= 0:
+							match decl.params.get(function_param_index):
+								Some(param):
+									match param.type_expr:
+										Some(type_expr):
+											actions = actions.append(
+												CompactBuildTypeVisit(type_expr),
+											)
+										None:
+											void
+								None:
+									supported = False
+
+							function_param_index -= 1
 					ParsedDebugBlockExpr(body, span):
 						actions = actions
 							.append(CompactBuildSequence(CompactDebugBlockNode, 1, span))
@@ -4059,6 +4713,292 @@ pure func compact_expression_oracle_from_parsed_roots(
 						span = compact_source_location(span),
 					})
 					values = values.append(node_index)
+			Some(CompactBuildLambda(is_pure, params, return_type, span)):
+				var required_type_count: Int = if return_type.is_some():
+					1
+				else:
+					0
+
+				for param in params:
+					if param.type_expr.is_some():
+						required_type_count += 1
+
+				if values.is_empty() or type_values.length() < required_type_count:
+					supported = False
+				else:
+					type_value_start = type_values.length() - required_type_count
+					var type_value_offset: Int = 0
+					parameter_start = callable_params.length()
+
+					for param in params:
+						text_index = texts.length()
+						texts = texts.append(param.name.text)
+						identifier_index = control_identifiers.length()
+						control_identifiers = control_identifiers.append({
+							text_index = text_index,
+							span = compact_source_location(param.name.span),
+						})
+
+						type_root_index = if param.type_expr.is_some():
+							root = type_values
+								.get(type_value_start + type_value_offset)
+								.get_or(-1)
+							type_value_offset += 1
+							root
+						else:
+							NO_COMPACT_TYPE_ROOT_INDEX
+
+						callable_params = callable_params.append({
+							kind = CompactLambdaNameParam,
+							binder_payload_index = identifier_index,
+							type_root_index = type_root_index,
+							span = compact_source_location(param.span),
+						})
+
+					return_type_root_index = if return_type.is_some():
+						root = type_values
+							.get(type_value_start + type_value_offset)
+							.get_or(-1)
+						type_value_offset += 1
+						root
+					else:
+						NO_COMPACT_TYPE_ROOT_INDEX
+
+					type_values = type_values.take(type_value_start)
+					body_value_index = values.length() - 1
+					body_node_index = values
+						.get(body_value_index)
+						.get_or(-1)
+					values = values.take(body_value_index)
+					child_start = children.length()
+					children = children.append(body_node_index)
+					payload_index = lambda_payloads.length()
+					lambda_payloads = lambda_payloads.append({
+						parameter_start = parameter_start,
+						parameter_count = params.length(),
+						return_type_root_index = return_type_root_index,
+						is_pure = is_pure,
+					})
+					node_index = nodes.length()
+					nodes = nodes.append({
+						kind = CompactLambdaNode,
+						payload_index = payload_index,
+						child_start = child_start,
+						child_count = 1,
+						span = compact_source_location(span),
+					})
+					values = values.append(node_index)
+			Some(CompactBuildFunction(decl)):
+				var required_type_count: Int = if decl.return_type.is_some():
+					1
+				else:
+					0
+
+				for param in decl.params:
+					if param.type_expr.is_some():
+						required_type_count += 1
+
+				required_type_count += decl.dim_constraints.length() * 2
+
+				body_count = if decl.body.is_some():
+					1
+				else:
+					0
+
+				if values.length() < body_count or type_values.length() < required_type_count:
+					supported = False
+				else:
+					type_value_start = type_values.length() - required_type_count
+					var type_value_offset: Int = 0
+					name_text_index = texts.length()
+					texts = texts.append(decl.name.text)
+					name_identifier_index = control_identifiers.length()
+					control_identifiers = control_identifiers.append({
+						text_index = name_text_index,
+						span = compact_source_location(decl.name.span),
+					})
+					type_parameter_start = callable_type_params.length()
+
+					for type_param in decl.type_params:
+						type_name_text_index = texts.length()
+						texts = texts.append(type_param.name.text)
+						type_name_identifier_index = type_identifiers.length()
+						type_identifiers = type_identifiers.append({
+							text_index = type_name_text_index,
+							span = compact_source_location(type_param.name.span),
+						})
+						bound_identifier_start = type_identifiers.length()
+
+						for bound in type_param.bounds:
+							bound_text_index = texts.length()
+							texts = texts.append(bound.text)
+							type_identifiers = type_identifiers.append({
+								text_index = bound_text_index,
+								span = compact_source_location(bound.span),
+							})
+
+						callable_type_params = callable_type_params.append({
+							name_identifier_index = type_name_identifier_index,
+							bound_identifier_start = bound_identifier_start,
+							bound_identifier_count = type_param.bounds.length(),
+							span = compact_source_location(type_param.span),
+						})
+
+					parameter_start = callable_params.length()
+
+					for param in decl.params:
+						var kind = CompactFunctionWildcardParam
+						var binder_payload_index = NO_COMPACT_IDENTIFIER_INDEX
+
+						match param.binder:
+							ParsedParamNameBinder(name):
+								kind = CompactFunctionNameParam
+								text_index = texts.length()
+								texts = texts.append(name.text)
+								binder_payload_index = control_identifiers.length()
+								control_identifiers = control_identifiers.append({
+									text_index = text_index,
+									span = compact_source_location(name.span),
+								})
+							ParsedParamWildcardBinder(binder_span):
+								kind = CompactFunctionWildcardParam
+								binder_payload_index = identifier_slices.length()
+								identifier_slices = identifier_slices.append({
+									identifier_start = control_identifiers.length(),
+									identifier_count = 0,
+									span = compact_source_location(binder_span),
+								})
+							ParsedParamTupleBinder(names, binder_span):
+								kind = CompactFunctionTupleParam
+								identifier_start = control_identifiers.length()
+
+								for name in names:
+									text_index = texts.length()
+									texts = texts.append(name.text)
+									control_identifiers = control_identifiers.append({
+										text_index = text_index,
+										span = compact_source_location(name.span),
+									})
+
+								binder_payload_index = identifier_slices.length()
+								identifier_slices = identifier_slices.append({
+									identifier_start = identifier_start,
+									identifier_count = names.length(),
+									span = compact_source_location(binder_span),
+								})
+
+						type_root_index = if param.type_expr.is_some():
+							root = type_values
+								.get(type_value_start + type_value_offset)
+								.get_or(-1)
+							type_value_offset += 1
+							root
+						else:
+							NO_COMPACT_TYPE_ROOT_INDEX
+
+						callable_params = callable_params.append({
+							kind = kind,
+							binder_payload_index = binder_payload_index,
+							type_root_index = type_root_index,
+							span = compact_source_location(param.span),
+						})
+
+					return_type_root_index = if decl.return_type.is_some():
+						root = type_values
+							.get(type_value_start + type_value_offset)
+							.get_or(-1)
+						type_value_offset += 1
+						root
+					else:
+						NO_COMPACT_TYPE_ROOT_INDEX
+
+					dimension_constraint_start = callable_dim_constraints.length()
+
+					for constraint in decl.dim_constraints:
+						left_type_root_index = type_values
+							.get(type_value_start + type_value_offset)
+							.get_or(-1)
+						type_value_offset += 1
+						right_type_root_index = type_values
+							.get(type_value_start + type_value_offset)
+							.get_or(-1)
+						type_value_offset += 1
+						callable_dim_constraints = callable_dim_constraints.append({
+							left_type_root_index = left_type_root_index,
+							right_type_root_index = right_type_root_index,
+							span = compact_source_location(constraint.span),
+						})
+
+					type_values = type_values.take(type_value_start)
+					annotation_start = function_annotations.length()
+
+					for annotation in decl.annotations:
+						compact_annotation = match annotation:
+							ParsedTailRecursiveAnnotation:
+								CompactTailRecursiveAnnotation
+							ParsedNoCopyAnnotation:
+								CompactNoCopyAnnotation
+							ParsedDebugOnlyAnnotation:
+								CompactDebugOnlyAnnotation
+							ParsedResourceResultOrdinaryAnnotation:
+								CompactResourceResultOrdinaryAnnotation
+
+						function_annotations = function_annotations.append(compact_annotation)
+
+					var doc_text_index = NO_COMPACT_TEXT_INDEX
+
+					match decl.doc:
+						Some(doc):
+							doc_text_index = texts.length()
+							texts = texts.append(doc)
+						None:
+							void
+
+					keyword_span = match decl.keyword_span:
+						Some(keyword):
+							compact_source_location(keyword)
+						None:
+							{
+								source_owner_index = NO_COMPACT_SOURCE_OWNER_INDEX,
+								location = decl.span
+							}
+
+					child_start = children.length()
+
+					if body_count == 1:
+						body_value_index = values.length() - 1
+						children = children.append(
+							values
+								.get(body_value_index)
+								.get_or(-1),
+						)
+						values = values.take(body_value_index)
+
+					payload_index = function_payloads.length()
+					function_payloads = function_payloads.append({
+						name_identifier_index = name_identifier_index,
+						type_parameter_start = type_parameter_start,
+						type_parameter_count = decl.type_params.length(),
+						parameter_start = parameter_start,
+						parameter_count = decl.params.length(),
+						return_type_root_index = return_type_root_index,
+						dimension_constraint_start = dimension_constraint_start,
+						dimension_constraint_count = decl.dim_constraints.length(),
+						annotation_start = annotation_start,
+						annotation_count = decl.annotations.length(),
+						doc_text_index = doc_text_index,
+						is_pure = decl.is_pure,
+						keyword_span = keyword_span,
+					})
+					node_index = nodes.length()
+					nodes = nodes.append({
+						kind = CompactFunctionDeclNode,
+						payload_index = payload_index,
+						child_start = child_start,
+						child_count = body_count,
+						span = compact_source_location(decl.span),
+					})
+					values = values.append(node_index)
 			Some(CompactBuildTypeIdentifiers(kind, identifiers, child_count, span)):
 				if type_values.length() < child_count:
 					supported = False
@@ -4183,6 +5123,12 @@ pure func compact_expression_oracle_from_parsed_roots(
 			select_arms = select_arms,
 			with_bindings = with_bindings,
 			with_error_maps = with_error_maps,
+			lambda_payloads = lambda_payloads,
+			function_payloads = function_payloads,
+			callable_params = callable_params,
+			callable_type_params = callable_type_params,
+			callable_dim_constraints = callable_dim_constraints,
+			function_annotations = function_annotations,
 			unit_payloads = unit_payloads,
 			roots = values
 		}
@@ -4267,6 +5213,232 @@ private pure func projected_optional_type(
 		projected_types
 			.get(type_root_index)
 			.map(func(type_expr): Some(type_expr))
+
+
+private pure func projected_type_identifier_at(
+	rep: CompactExpressionProductRep,
+	identifier_index: Int,
+) -> Option[ParsedIdentifier]:
+	match rep.type_identifiers.get(identifier_index):
+		Some(identifier):
+			rep.texts
+				.get(identifier.text_index)
+				.map(func(text): parsed_identifier(text, identifier.span.location))
+		None:
+			None
+
+
+private pure func projected_lambda_params(
+	rep: CompactExpressionProductRep,
+	projected_types: List[ParsedTypeExpr],
+	start: Int,
+	count: Int,
+) -> Option[List[ParsedLambdaParam]]:
+	var params: List[ParsedLambdaParam] = []
+	var offset: Int = 0
+	var valid = True
+
+	while offset < count and valid:
+		match rep.callable_params.get(start + offset):
+			Some(param):
+				match (
+					projected_control_identifier(rep, param.binder_payload_index),
+					projected_optional_type(projected_types, param.type_root_index),
+				):
+					(Some(name), Some(type_expr)):
+						params = params.append({
+							name = name,
+							type_expr = type_expr,
+							span = param.span.location,
+						})
+					_:
+						valid = False
+			None:
+				valid = False
+
+		offset += 1
+
+	if valid:
+		Some(params)
+	else:
+		None
+
+
+private pure func projected_function_params(
+	rep: CompactExpressionProductRep,
+	projected_types: List[ParsedTypeExpr],
+	start: Int,
+	count: Int,
+) -> Option[List[ParsedParam]]:
+	var params: List[ParsedParam] = []
+	var offset: Int = 0
+	var valid = True
+
+	while offset < count and valid:
+		match rep.callable_params.get(start + offset):
+			Some(param):
+				var binder: Option[ParsedParamBinder] = None
+
+				match param.kind:
+					CompactFunctionNameParam:
+						binder = projected_control_identifier(
+							rep,
+							param.binder_payload_index,
+						).map(
+							func(name): ParsedParamNameBinder(name),
+						)
+					CompactFunctionWildcardParam:
+						binder = rep.identifier_slices
+							.get(param.binder_payload_index)
+							.map(func(slice): ParsedParamWildcardBinder(slice.span.location))
+					CompactFunctionTupleParam:
+						match (
+							rep.identifier_slices.get(param.binder_payload_index),
+							projected_identifier_slice(rep, param.binder_payload_index),
+						):
+							(Some(slice), Some(names)):
+								binder = Some(ParsedParamTupleBinder(names, slice.span.location))
+							_:
+								void
+					CompactLambdaNameParam:
+						void
+
+				match (binder, projected_optional_type(projected_types, param.type_root_index)):
+					(Some(param_binder), Some(type_expr)):
+						params = params.append({
+							binder = param_binder,
+							type_expr = type_expr,
+							span = param.span.location,
+						})
+					_:
+						valid = False
+			None:
+				valid = False
+
+		offset += 1
+
+	if valid:
+		Some(params)
+	else:
+		None
+
+
+private pure func projected_callable_type_params(
+	rep: CompactExpressionProductRep,
+	start: Int,
+	count: Int,
+) -> Option[List[ParsedTypeParamDecl]]:
+	var params: List[ParsedTypeParamDecl] = []
+	var offset: Int = 0
+	var valid = True
+
+	while offset < count and valid:
+		match rep.callable_type_params.get(start + offset):
+			Some(param):
+				var bounds: List[ParsedIdentifier] = []
+				var bound_offset: Int = 0
+
+				while bound_offset < param.bound_identifier_count and valid:
+					match projected_type_identifier_at(
+						rep,
+						param.bound_identifier_start + bound_offset,
+					):
+						Some(bound):
+							bounds = bounds.append(bound)
+						None:
+							valid = False
+
+					bound_offset += 1
+
+				match projected_type_identifier_at(rep, param.name_identifier_index):
+					Some(name):
+						if valid:
+							params = params.append({
+								name = name,
+								bounds = bounds,
+								span = param.span.location,
+							})
+					None:
+						valid = False
+			None:
+				valid = False
+
+		offset += 1
+
+	if valid:
+		Some(params)
+	else:
+		None
+
+
+private pure func projected_callable_dim_constraints(
+	rep: CompactExpressionProductRep,
+	projected_types: List[ParsedTypeExpr],
+	start: Int,
+	count: Int,
+) -> Option[List[ParsedDimConstraint]]:
+	var constraints: List[ParsedDimConstraint] = []
+	var offset: Int = 0
+	var valid = True
+
+	while offset < count and valid:
+		match rep.callable_dim_constraints.get(start + offset):
+			Some(constraint):
+				match (
+					projected_types.get(constraint.left_type_root_index),
+					projected_types.get(constraint.right_type_root_index),
+				):
+					(Some(left), Some(right)):
+						constraints = constraints.append({
+							left = left,
+							right = right,
+							span = constraint.span.location,
+						})
+					_:
+						valid = False
+			None:
+				valid = False
+
+		offset += 1
+
+	if valid:
+		Some(constraints)
+	else:
+		None
+
+
+private pure func projected_function_annotations(
+	rep: CompactExpressionProductRep,
+	start: Int,
+	count: Int,
+) -> Option[List[ParsedFunctionAnnotation]]:
+	var annotations: List[ParsedFunctionAnnotation] = []
+	var offset: Int = 0
+	var valid = True
+
+	while offset < count and valid:
+		match rep.function_annotations.get(start + offset):
+			Some(annotation):
+				annotations = annotations.append(
+					match annotation:
+						CompactTailRecursiveAnnotation:
+							ParsedTailRecursiveAnnotation
+						CompactNoCopyAnnotation:
+							ParsedNoCopyAnnotation
+						CompactDebugOnlyAnnotation:
+							ParsedDebugOnlyAnnotation
+						CompactResourceResultOrdinaryAnnotation:
+							ParsedResourceResultOrdinaryAnnotation
+				)
+			None:
+				valid = False
+
+		offset += 1
+
+	if valid:
+		Some(annotations)
+	else:
+		None
 
 
 private pure func projected_children(
@@ -5392,6 +6564,124 @@ pure func compact_expression_oracle_project(
 										void
 							_:
 								void
+					CompactLambdaNode:
+						match rep.lambda_payloads.get(node.payload_index):
+							Some(payload):
+								match (
+									projected_lambda_params(
+										rep,
+										projected_types,
+										payload.parameter_start,
+										payload.parameter_count,
+									),
+									projected_optional_type(
+										projected_types,
+										payload.return_type_root_index,
+									),
+									projected_child(rep, projected, node, 0),
+								):
+									(Some(params), Some(return_type), Some(body)):
+										value = Some(
+											ParsedLambdaExpr(
+												payload.is_pure,
+												params,
+												return_type,
+												body,
+												span,
+											),
+										)
+									_:
+										void
+							None:
+								void
+					CompactFunctionDeclNode:
+						match rep.function_payloads.get(node.payload_index):
+							Some(payload):
+								keyword_span = if payload.keyword_span.source_owner_index == NO_COMPACT_SOURCE_OWNER_INDEX:
+									Some(None)
+								else:
+									Some(Some(payload.keyword_span.location))
+
+								doc = if payload.doc_text_index == NO_COMPACT_TEXT_INDEX:
+									Some(None)
+								else:
+									rep.texts
+										.get(payload.doc_text_index)
+										.map(func(text): Some(text))
+
+								body = if node.child_count == 0:
+									Some(None)
+								else:
+									projected_child(
+										rep,
+										projected,
+										node,
+										0,
+									).map(
+										func(expr): Some(expr),
+									)
+
+								match (
+									projected_control_identifier(
+										rep,
+										payload.name_identifier_index,
+									),
+									projected_callable_type_params(
+										rep,
+										payload.type_parameter_start,
+										payload.type_parameter_count,
+									),
+									projected_function_params(
+										rep,
+										projected_types,
+										payload.parameter_start,
+										payload.parameter_count,
+									),
+									projected_optional_type(
+										projected_types,
+										payload.return_type_root_index,
+									),
+								):
+									(Some(name), Some(type_params), Some(params), Some(return_type)):
+										match (
+											projected_callable_dim_constraints(
+												rep,
+												projected_types,
+												payload.dimension_constraint_start,
+												payload.dimension_constraint_count,
+											),
+											projected_function_annotations(
+												rep,
+												payload.annotation_start,
+												payload.annotation_count,
+											),
+											keyword_span,
+											doc,
+										):
+											(Some(dim_constraints), Some(annotations), Some(function_keyword_span), Some(function_doc)):
+												match body:
+													Some(function_body):
+														value = Some(ParsedFunctionDeclExpr({
+															name = name,
+															keyword_span = function_keyword_span,
+															type_params = type_params,
+															params = params,
+															return_type = return_type,
+															dim_constraints = dim_constraints,
+															body = function_body,
+															is_pure = payload.is_pure,
+															annotations = annotations,
+															doc = function_doc,
+															span = span,
+														}))
+													None:
+														void
+											_:
+												void
+									_:
+										void
+							None:
+								void
 					CompactDebugBlockNode:
 						value = projected_child(
 							rep,
@@ -5736,6 +7026,44 @@ private pure func compact_expression_oracle_reference_traversal(
 										)
 									None:
 										void
+							CompactLambdaNode:
+								match rep.lambda_payloads.get(node.payload_index):
+									Some(payload):
+										actions = actions
+											.append(
+												CompactReferenceLeaveBindings(
+													payload.parameter_count,
+												),
+											)
+											.append(
+												CompactReferenceVisit(
+													rep.children
+														.get(node.child_start)
+														.get_or(-1),
+												),
+											)
+										var parameter_offset = payload.parameter_count - 1
+
+										while parameter_offset >= 0:
+											match rep.callable_params.get(
+												payload.parameter_start + parameter_offset,
+											):
+												Some(parameter):
+													actions = actions.append(
+														CompactReferenceEnterIdentifier(
+															parameter.binder_payload_index,
+														),
+													)
+												None:
+													void
+
+											parameter_offset -= 1
+									None:
+										void
+							CompactFunctionDeclNode:
+								-- The production expression-reference consumer treats nested
+								-- declarations as opaque and does not bind their names.
+								void
 							CompactBlockNode:
 								var entered_count: Int = 0
 								leave_action_index = actions.length()
@@ -5994,6 +7322,12 @@ pure func compact_expression_oracle_counts(
 		select_arm_count = rep.select_arms.length(),
 		with_binding_count = rep.with_bindings.length(),
 		with_error_map_count = rep.with_error_maps.length(),
+		lambda_payload_count = rep.lambda_payloads.length(),
+		function_payload_count = rep.function_payloads.length(),
+		callable_param_count = rep.callable_params.length(),
+		callable_type_param_count = rep.callable_type_params.length(),
+		callable_dim_constraint_count = rep.callable_dim_constraints.length(),
+		function_annotation_count = rep.function_annotations.length(),
 		unit_payload_count = rep.unit_payloads.length(),
 		root_count = rep.roots.length()
 	}
@@ -6244,6 +7578,86 @@ pure func compact_expression_oracle_rejects_corruption(
 			left,
 			start_span.location,
 		)
+		callable_type = ParsedNamedType(
+			parsed_identifier("Type", start_span.location),
+			[],
+			start_span.location,
+		)
+		first_lambda = ParsedLambdaExpr(
+			True,
+			[
+				{
+					name = parsed_identifier("first", start_span.location),
+					type_expr = Some(callable_type),
+					span = start_span.location
+				},
+			],
+			Some(callable_type),
+			left,
+			start_span.location,
+		)
+		second_lambda = ParsedLambdaExpr(
+			False,
+			[
+				{
+					name = parsed_identifier("second", start_span.location),
+					type_expr = None,
+					span = start_span.location
+				},
+			],
+			None,
+			right,
+			start_span.location,
+		)
+		first_function = ParsedFunctionDeclExpr({
+			name = parsed_identifier("first_function", start_span.location),
+			keyword_span = Some(start_span.location),
+			type_params = [
+				{
+					name = parsed_identifier("T", start_span.location),
+					bounds = [parsed_identifier("Eq", start_span.location)],
+					span = start_span.location
+				},
+			],
+			params = [
+				{
+					binder = ParsedParamWildcardBinder(start_span.location),
+					type_expr = None,
+					span = start_span.location
+				},
+				{
+					binder = ParsedParamNameBinder(parsed_identifier("value", start_span.location)),
+					type_expr = Some(callable_type),
+					span = start_span.location
+				},
+			],
+			return_type = Some(callable_type),
+			dim_constraints = [
+				{
+					left = callable_type,
+					right = callable_type,
+					span = start_span.location
+				},
+			],
+			body = Some(left),
+			is_pure = False,
+			annotations = [ParsedTailRecursiveAnnotation, ParsedNoCopyAnnotation],
+			doc = Some("docs"),
+			span = start_span.location,
+		})
+		second_function = ParsedFunctionDeclExpr({
+			name = parsed_identifier("second_function", start_span.location),
+			keyword_span = None,
+			type_params = [],
+			params = [],
+			return_type = None,
+			dim_constraints = [],
+			body = None,
+			is_pure = True,
+			annotations = [ParsedDebugOnlyAnnotation],
+			doc = None,
+			span = start_span.location,
+		})
 
 		match (
 			compact_expression_oracle_from_parsed_roots(
@@ -6264,6 +7678,10 @@ pure func compact_expression_oracle_rejects_corruption(
 					plain_with,
 					mapped_with,
 					mapped_with,
+					first_lambda,
+					second_lambda,
+					first_function,
+					second_function,
 				],
 			)
 		):
@@ -6311,6 +7729,18 @@ pure func compact_expression_oracle_rejects_corruption(
 					.get_or(-1)
 				second_mapped_with_root = rep.roots
 					.get(14)
+					.get_or(-1)
+				first_lambda_root = rep.roots
+					.get(15)
+					.get_or(-1)
+				second_lambda_root = rep.roots
+					.get(16)
+					.get_or(-1)
+				first_function_root = rep.roots
+					.get(17)
+					.get_or(-1)
+				second_function_root = rep.roots
+					.get(18)
 					.get_or(-1)
 
 				match corruption:
@@ -6955,6 +8385,242 @@ pure func compact_expression_oracle_rejects_corruption(
 								identifier_index = 0,
 								span = start_span,
 							}) }
+					CompactLambdaPayloadAlias:
+						match (rep.nodes.get(first_lambda_root), rep.nodes.get(second_lambda_root)):
+							(Some(first), Some(second)):
+								corrupted = { rep |
+									nodes = rep.nodes.set(
+										second_lambda_root,
+										{ second | payload_index = first.payload_index },
+									)
+								}
+							_:
+								void
+					CompactLambdaSharedTypeRoot:
+						match rep.nodes.get(first_lambda_root):
+							Some(node):
+								match rep.lambda_payloads.get(node.payload_index):
+									Some(payload):
+										match rep.callable_params.get(payload.parameter_start):
+											Some(parameter):
+												corrupted = { rep |
+													lambda_payloads = rep.lambda_payloads.set(
+														node.payload_index,
+														{ payload |
+															return_type_root_index = parameter.type_root_index
+														},
+													)
+												}
+											None:
+												void
+									None:
+										void
+							None:
+								void
+					CompactFunctionPayloadAlias:
+						match (
+							rep.nodes.get(first_function_root),
+							rep.nodes.get(second_function_root),
+						):
+							(Some(first), Some(second)):
+								corrupted = { rep |
+									nodes = rep.nodes.set(
+										second_function_root,
+										{ second | payload_index = first.payload_index },
+									)
+								}
+							_:
+								void
+					CompactCallableParamSliceAlias:
+						match (
+							rep.nodes.get(first_lambda_root),
+							rep.nodes.get(first_function_root),
+						):
+							(Some(lambda_node), Some(function_node)):
+								match (
+									rep.lambda_payloads.get(lambda_node.payload_index),
+									rep.function_payloads.get(function_node.payload_index),
+								):
+									(Some(lambda_payload), Some(function_payload)):
+										corrupted = { rep |
+											function_payloads = rep.function_payloads.set(
+												function_node.payload_index,
+												{ function_payload |
+													parameter_start = lambda_payload.parameter_start
+												},
+											)
+										}
+									_:
+										void
+							_:
+								void
+					CompactCallableWildcardNonemptySlice | CompactCallableParamTypeRootOutOfRange:
+						match rep.nodes.get(first_function_root):
+							Some(node):
+								match rep.function_payloads.get(node.payload_index):
+									Some(payload):
+										parameter_offset = if corruption == CompactCallableWildcardNonemptySlice:
+											0
+										else:
+											1
+
+										match rep.callable_params.get(
+											payload.parameter_start + parameter_offset,
+										):
+											Some(parameter):
+												if corruption == CompactCallableWildcardNonemptySlice:
+													match rep.identifier_slices.get(
+														parameter.binder_payload_index,
+													):
+														Some(slice):
+															corrupted = { rep |
+																identifier_slices = rep.identifier_slices.set(
+																	parameter.binder_payload_index,
+																	{ slice |
+																		identifier_count = 1
+																	},
+																)
+															}
+														None:
+															void
+												else:
+													corrupted = { rep |
+														callable_params = rep.callable_params.set(
+															payload.parameter_start + parameter_offset,
+															{ parameter |
+																type_root_index = rep.type_nodes.length()
+															},
+														)
+													}
+											None:
+												void
+									None:
+										void
+							None:
+								void
+					CompactCallableTypeParamBoundsAlias | CompactCallableDimTypeRootAlias:
+						match rep.nodes.get(first_function_root):
+							Some(node):
+								match rep.function_payloads.get(node.payload_index):
+									Some(payload):
+										if corruption == CompactCallableTypeParamBoundsAlias:
+											match rep.callable_type_params.get(
+												payload.type_parameter_start,
+											):
+												Some(type_parameter):
+													corrupted = { rep |
+														callable_type_params = rep.callable_type_params.set(
+															payload.type_parameter_start,
+															{ type_parameter |
+																bound_identifier_start = type_parameter.name_identifier_index
+															},
+														)
+													}
+												None:
+													void
+										else:
+											match rep.callable_dim_constraints.get(
+												payload.dimension_constraint_start,
+											):
+												Some(constraint):
+													corrupted = { rep |
+														callable_dim_constraints = rep.callable_dim_constraints.set(
+															payload.dimension_constraint_start,
+															{ constraint |
+																right_type_root_index = constraint.left_type_root_index
+															},
+														)
+													}
+												None:
+													void
+									None:
+										void
+							None:
+								void
+					CompactFunctionAnnotationSliceAlias:
+						match (
+							rep.nodes.get(first_function_root),
+							rep.nodes.get(second_function_root),
+						):
+							(Some(first_node), Some(second_node)):
+								match (
+									rep.function_payloads.get(first_node.payload_index),
+									rep.function_payloads.get(second_node.payload_index),
+								):
+									(Some(first), Some(second)):
+										corrupted = { rep |
+											function_payloads = rep.function_payloads.set(
+												second_node.payload_index,
+												{ second |
+													annotation_start = first.annotation_start
+												},
+											)
+										}
+									_:
+										void
+							_:
+								void
+					CompactFunctionKeywordForeignSourceOwner | CompactFunctionDocTextOutOfRange | CompactFunctionWrongArity:
+						match rep.nodes.get(first_function_root):
+							Some(node):
+								if corruption == CompactFunctionWrongArity:
+									corrupted = { rep |
+										nodes = rep.nodes.set(
+											first_function_root,
+											{ node | child_count = 2 },
+										)
+									}
+								else:
+									match rep.function_payloads.get(node.payload_index):
+										Some(payload):
+											changed_payload = if corruption == CompactFunctionKeywordForeignSourceOwner:
+												{ payload |
+													keyword_span = { payload.keyword_span |
+														source_owner_index = 1
+													}
+												}
+											else:
+												{ payload | doc_text_index = rep.texts.length() }
+
+											corrupted = { rep |
+												function_payloads = rep.function_payloads.set(
+													node.payload_index,
+													changed_payload,
+												)
+											}
+										None:
+											void
+							None:
+								void
+					CompactFunctionAbsentKeywordLocation:
+						match rep.nodes.get(second_function_root):
+							Some(node):
+								match rep.function_payloads.get(node.payload_index):
+									Some(payload):
+										corrupted = { rep |
+											function_payloads = rep.function_payloads.set(
+												node.payload_index,
+												{ payload |
+													keyword_span = { payload.keyword_span |
+														location = source_location_from_offsets(
+															singleton_source_file_id(),
+															1,
+															2,
+														)
+													}
+												},
+											)
+										}
+									None:
+										void
+							None:
+								void
+					CompactFunctionOrphanAnnotation:
+						corrupted = { rep |
+							function_annotations = rep.function_annotations.append(
+								CompactTailRecursiveAnnotation,
+							)
+						}
 
 				not compact_expression_product_is_valid(corrupted)
 			Err(_):

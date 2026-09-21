@@ -63,14 +63,14 @@ the admitted checkpoints are explicitly rejected by the adapter, so this
 product is not a canonical full-grammar parser result.
 
 The retained schema probe keeps its AST inputs outside the measurement epoch.
-At the current cumulative select/with checkpoint, the product-only lifetime
-for sixteen binary roots (48 nodes) is 8 objects and 4,872 bytes, versus 81
+At the current cumulative callable checkpoint, the product-only lifetime
+for sixteen binary roots (48 nodes) is 8 objects and 4,920 bytes, versus 81
 objects and 5,824 bytes for freshly constructed legacy trees with the same
 root shape.
 This is a retained-layout comparison, not a construction-speed claim: the test
-oracle pays 243 allocations because it converts an existing AST and runs the
+oracle pays 249 allocations because it converts an existing AST and runs the
 exhaustive validator, while the legacy fixture construction pays 83. Empty,
-scalar, and binary compact products retain 2/360, 6/904, and 8/1,064
+scalar, and binary compact products retain 2/408, 6/952, and 8/1,112
 objects/bytes respectively. Collections/access added five table handles and
 64 retained bytes; type/interpolation adds six more handles and another 64
 bytes. This cumulative 128-byte fixed increase is explicit rather than hidden
@@ -80,7 +80,8 @@ table handles and raises ABI `sizeof` from 208 to 232 bytes without leaving the
 raises ABI `sizeof` to 272 bytes, and therefore leaves the runtime's 256-byte
 small-object pool. The record is now an ordinary 272-byte heap request.
 The select/with checkpoint adds three table handles and raises both ABI
-`sizeof` and the ordinary heap request to 296 bytes.
+`sizeof` and the ordinary heap request to 296 bytes. The callable checkpoint
+adds six table handles and raises both to 344 bytes.
 
 Both 48-node lifetime fixtures keep the same source and static identifier text
 outside the measurement epoch. The compact result additionally retains its
@@ -99,11 +100,11 @@ index instead of allocating one record per node. The opaque product record is
 the five collections/access tables, the product was 160 bytes by ABI `sizeof`
 and occupied a 192-byte allocator size class. With the six type/interpolation
 tables, it is 208 bytes by ABI `sizeof` and occupies a 256-byte allocator size
-class. Under the current cumulative select/with schema, the nested aggregate
+class. Under the current cumulative callable schema, the nested aggregate
 probe covers
 two roots, 33 nodes, and 31 child ids across record update, dictionary, list,
 tuple, vector, field access, and multi-index subscript forms; it retains 12
-objects and 5,320 current live bytes. There is no paired legacy claim for that
+objects and 5,368 current live bytes. There is no paired legacy claim for that
 mixed shape. Raw evidence is reproduced by
 `blorp/benchmark/compiler/compact_expression_product_schema_probe.brp`; its
 output must be captured with `--leak-check` so live type buckets are available.
@@ -156,7 +157,7 @@ The wrapper source is not retained. Compiler-prelude sentinel locations are
 rejected rather than mislabeled as authored source; multi-owner construction
 remains a future direct-parser capability and is not claimed by this adapter.
 
-Under the current cumulative select/with schema, the mixed type/interpolation
+At the select/with checkpoint, the mixed type/interpolation
 probe has one root, five expression nodes, four expression child ids, eight
 type nodes, seven type child ids, four identifier
 slices, five identifiers, and four interpolation parts. It retains 14 objects
@@ -213,7 +214,7 @@ complete product record was 232 bytes by ABI `sizeof` and occupied the
 binder span to the existing slice row, raising that row to 32 bytes without
 adding a table handle or changing the product/allocator sizes.
 
-Under the current cumulative select/with schema, a deterministic 64-binding
+At the select/with checkpoint, a deterministic 64-binding
 scope fixture produces 64 free initializer references and exactly 2,080
 bound-name comparisons, matching the current
 modeled `List.contains` work (`64 * 65 / 2`). Its one product contains 193 nodes and 192
@@ -238,10 +239,10 @@ and qualified references. Tuple-binder source spans are stored explicitly on
 the existing slice row; projection never guesses a span from the first or last
 identifier.
 
-Under the current cumulative select/with schema, the retained simple-control
+Under the current cumulative callable schema, the retained simple-control
 fixture has 13 nodes, 12 child ids, two control identifiers, one identifier
 slice, seven free references, and one bound-name
-comparison. It retains 9 objects / 2,136 bytes. Before match/pattern tables the
+comparison. It retains 9 objects / 2,184 bytes. Before match/pattern tables the
 complete product was 232 bytes by ABI `sizeof` in the 256-byte allocator class;
 the now span-bearing
 identifier-slice row is 32 bytes on the measured 64-bit ABI.
@@ -338,20 +339,63 @@ The aggregate `compiler-blorp` gate remains intentionally pending until the
 final structured-scope checkpoint; C2 uses the owning focused suite and changed
 compiler checks.
 
+#### Callable oracle
+
+The eighth test-only family adds `ParsedLambdaExpr` and
+`ParsedFunctionDeclExpr`. Six product-owned tables store lambda payloads,
+function payloads, callable parameters, callable type parameters, dimension
+constraints, and function annotations. Parameters reuse the existing control
+identifier and identifier-slice tables, including a zero-count owned slice for
+wildcard binders so their authored span survives projection. Tuple binders keep
+zero- and one-name cases without guessing legality from cardinality.
+
+Lambda bodies are traversed with their parameters in scope, while parameter and
+return types remain metadata. Nested function declarations are opaque to the
+enclosing free-reference traversal: the declaration name is not introduced and
+its body contributes no enclosing references. Projection preserves absent
+keyword spans through a canonical sentinel at the declaration span,
+`None` versus `Some("")` documentation, unnamed versus named builtins,
+duplicate type bounds and annotations, purity, and optional bodies with exactly
+zero or one child.
+
+The validator rejects aliased or orphan callable payloads and metadata rows,
+overlapping or out-of-range parameter slices, nonempty wildcard slices,
+invalid or shared type roots, aliased type-parameter bounds, malformed keyword
+sentinels, foreign spans, invalid documentation text indices, aliased dimension
+roots, aliased annotation slices, and invalid function body arity. Focused tests
+also compare exact manual and real-parser round trips plus production reference
+ordering and shadowing.
+
+On the measured 64-bit generated-C ABI, lambda rows are 32 bytes, function rows
+are 112 bytes, callable-parameter and callable-type-parameter rows are 40 bytes,
+dimension-constraint rows are 32 bytes, and annotation values are 8 bytes. The
+retained callable fixture has two roots, four nodes, two child ids, one lambda,
+one function, four parameters, one type parameter, one dimension constraint,
+and four annotations. It retains 18 objects / 4,040 current live bytes and
+reports one modeled bound-name comparison. Empty and 48-node small-module
+products now retain 408 and 4,920 bytes; the product record is 344 bytes. This
+remains a schema/layout result, not a construction-speed claim. Generated C
+SHA-256 is
+`c1f599af10729d0837a1e0e5ba14316592a3deec9ababb1bac0413d44e41e16b`;
+probe source SHA-256 is
+`1d024cff55f04b9c478854b47fb1df96ac547484f318e721bf33fdc830b50189`.
+The captured checkpoint output is
+[`compact_expression_product_callable_2026-09-21.md`](../benchmarks/results/compact_expression_product_callable_2026-09-21.md).
+This final structured-scope checkpoint ran the deferred aggregate gate once:
+all 4,965 `compiler-blorp` tests passed. Focused normal, sanitizer, and leak
+runs each passed all 36 owning tests, with zero leaked bytes.
+
 Remaining milestone-1 coverage is deliberately finite:
 
-1. remaining structured scopes: lambda and nested function
-   declaration, including their pattern/binder metadata;
-2. concurrency and recovery: concurrent block/for, detach, their parameter
+1. concurrency and recovery: concurrent block/for, detach, their parameter
    metadata, and recovery-sensitive combinations of the existing missing form.
 
-The current declaration has 48 `ParsedExpr` variants. Exactly 43 are now in
-the oracle. The remaining 5 are explicit, not an open-ended category:
+The current declaration has 48 `ParsedExpr` variants. Exactly 45 are now in
+the oracle. The remaining 3 are explicit, not an open-ended category:
 
 | Status | Count | Variants |
 | --- | ---: | --- |
-| Covered | 43 | name; integer, float, string, raw interpolation, bool, and char literals; unary, binary, logical, ascription, range, call, field access, subscript, list, tuple, record, record update, dictionary, vector, opaque into/from, finalized interpolation parts, block, variable declaration, assignment, compound assignment, subscript assignment, tuple destructuring, question binding, if, match, select, with, debug block, while, for, break, continue, void, builtin, missing |
-| Structured-scope checkpoint | 2 | lambda, function declaration |
+| Covered | 45 | name; integer, float, string, raw interpolation, bool, and char literals; unary, binary, logical, ascription, range, call, field access, subscript, list, tuple, record, record update, dictionary, vector, opaque into/from, finalized interpolation parts, block, variable declaration, assignment, compound assignment, subscript assignment, tuple destructuring, question binding, if, match, select, with, lambda, function declaration, debug block, while, for, break, continue, void, builtin, missing |
 | Concurrency checkpoint | 3 | concurrent block, concurrent for, detach |
 
 After those checkpoints cover every `ParsedExpr` variant and their reachable
