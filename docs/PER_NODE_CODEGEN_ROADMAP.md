@@ -254,11 +254,16 @@ categories that matter here.
 
 ## Working agreement for this roadmap
 
-- One task per worker, in its own worktree and branch cut from `origin/main`
-  (`git worktree add -b perf/<slug> ../blorp-rm-<slug> origin/main`). Never
-  operate in another worktree. Commit per cut; do not rebase, merge, or push;
-  the coordinator merges. Commit titles must stand alone (what changed, no
-  task ids, no pasted tables).
+General setup/land rules are in
+[`docs/WORKER_CHECKLIST.md`](WORKER_CHECKLIST.md): one task per worker in its
+own worktree and branch cut from `origin/main`
+(`git worktree add -b perf/<slug> ../blorp-rm-<slug> origin/main`); commit per
+cut with standalone titles, no task ids, no pasted tables; do not rebase,
+merge, or push, the coordinator merges; serialize gates, never run compiled
+binaries in parallel (macOS `syspolicyd` stalls under many fresh binaries).
+
+Task-specific:
+
 - Sonnet with high reasoning for every task. Stop and end the turn with
   `QUESTION FOR COORDINATOR:` when a cut needs a contract change visible to
   user programs, when a fixture disagrees with your reading of a contract, or
@@ -269,8 +274,7 @@ categories that matter here.
   harness. Slow loop: the stage-2 self-compile, three samples. Wall time is
   noise on this machine; instructions retired and the pattern counts are the
   signal.
-- Gates per cut, one at a time, never in parallel background shells (macOS
-  `syspolicyd` stalls under many fresh binaries): the owning suites, then
+- Gates per cut, one at a time: the owning suites, then
   `benchmarks/self_compile_measure lock -- scripts/test compiler-core-sanitize leak`,
   then `benchmarks/self_compile_measure lock -- scripts/compiler-check --changed --base main`.
   Measurements take no lock; run them before waiting on any gate. The full

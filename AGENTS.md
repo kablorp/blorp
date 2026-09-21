@@ -8,7 +8,9 @@ This file contains binding principles and development rules. Read the
 task-specific reference below rather than loading every guide, roadmap, source
 file, or test log. [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) owns detailed
 commands and efficient investigation/handoff examples; [`docs/README.md`](docs/README.md)
-routes the maintained references.
+routes the maintained references. Performance and other compiler tasks should
+start with [`docs/WORKER_CHECKLIST.md`](docs/WORKER_CHECKLIST.md) for the
+setup/measure/land loop before reading a roadmap.
 
 | Task | Start with | First feedback |
 | --- | --- | --- |

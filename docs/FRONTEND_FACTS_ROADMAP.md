@@ -162,20 +162,20 @@ it is a `cc` wrapper and changes nothing about the build.
 
 ## Working agreement
 
-Same as the codegen roadmap: one task per Sonnet worker in its own worktree
-cut from `origin/main`; commit per cut with standalone titles; never rebase,
-merge, or push; the coordinator squash-merges each task as one commit.
-Stop with `QUESTION FOR COORDINATOR:` when a change would alter a published
-type that another running task also edits, when identity breaks and you
-believe it benign, or after three hours without a measured result. Never
-end a turn waiting on a build or gate; poll in a foreground loop.
+Same as the codegen roadmap and the general setup/measure/land loop in
+[`docs/WORKER_CHECKLIST.md`](WORKER_CHECKLIST.md): one task per Sonnet worker
+in its own worktree cut from `origin/main`; commit per cut with standalone
+titles; never rebase, merge, or push; the coordinator squash-merges each task
+as one commit; never `git stash` in these worktrees; compare instruction
+counts only against a baseline built with the same C toolchain (an Xcode
+update once moved identical C by 3.8%; the r6 baselines are the current
+toolchain).
 
-Two rules learned the hard way on 2026-09-17: never use `git stash` in
-these worktrees (the stash list is shared across every worktree of the
-repo and pops race between sessions; snapshot with `git diff > file` or a
-commit), and compare instruction counts only against a baseline built with
-the same C toolchain (an Xcode update moved identical C by 3.8%; the r6
-baselines are the current toolchain).
+Task-specific: stop with `QUESTION FOR COORDINATOR:` when a change would
+alter a published type that another running task also edits, when identity
+breaks and you believe it benign, or after three hours without a measured
+result. Never end a turn waiting on a build or gate; poll in a foreground
+loop.
 
 What "maximal result for every data source change" means in practice:
 when you convert one lookup, convert every lookup on that data source in

@@ -14,6 +14,9 @@ results, not in maintained docs.
 
 ## Use The Toolchain
 
+- [Worker Checklist](WORKER_CHECKLIST.md) is the one page to read before
+  starting a compiler or compiler-performance task: setup, fast feedback
+  loop, measurement, and landing rules.
 - [Developer Guide](DEVELOPMENT.md) is the practical workflow for building,
   testing, diagnosing, profiling, and changing Blorp and its compiler.
 - [Lint](LINT.md) documents typed source findings and stable rule IDs.

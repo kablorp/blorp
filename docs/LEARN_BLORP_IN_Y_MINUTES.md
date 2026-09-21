@@ -528,6 +528,41 @@ scripts/test compiler-blorp
   `pkg/`.
 - Do not rely on generated C shape as the source language contract.
 
+## Gotchas for Compiler Authors
+
+Learned by trial while working on the compiler itself; each is verified
+against current source/tests, not folklore. Re-verify before relying on one
+if the cited code has since moved.
+
+- **`==` on a `union` value is identity, not structural**, unless the union
+  has a user-written `implements Equatable`. The default compiles to a raw
+  pointer compare (`stage_10_backend/emit.brp` falls through to
+  `c_primitive_binary_expr`; `has_native_structural_equality` in
+  `trait_resolve.brp` routes every union there). Two separately constructed
+  `Circle(1.0)` values are `!=` unless you implement `Equatable` yourself.
+- **A `struct` is boxed when it lives in a union payload or an `Option`**,
+  but stored inline (not boxed) inside a `List`. See the comment at
+  `blorp/src/lib/source.brp:37-41` on why `SourceLocation` is an `Int` rather
+  than a struct, and `boxed_storage_kind` in
+  `stage_09_core/specialize_layout.brp`.
+- **`List[struct]` stores structs inline; reading one element copies the
+  whole struct** (`InlineStructListStorage` in `stage_09_core/ir.brp`). Read
+  the field you need through the list rather than binding the whole element
+  on a hot path.
+- **`from_opaque` is transparent to ownership analysis, like a cast** — it
+  does not introduce a retain by itself (`perceus.brp`'s
+  `direct_aliases_name` passes `CastExpr`/`from_opaque` through to its inner
+  value the same as `FieldExpr`). A borrowed argument stays borrowed after
+  `from_opaque`.
+- **Foreign `same_object` is a raw pointer compare with no module-local
+  state**, so identity checks work the same across modules
+  (`blorp_same_object` in `runtime_decl.c`; see
+  `blorp/test/runtime/memory/test_same_object_identity.brp`).
+- **Declarations take `---` fenced docstrings, not `--` comment blocks**
+  (`docs/GUIDE.md`'s Doctests section; `standard_library/src/string.brp` has
+  dozens of examples). `--` is an ordinary line comment and is never picked
+  up as documentation.
+
 ## Where to Go Next
 
 - `docs/GUIDE.md` for the full language reference.
@@ -535,3 +570,5 @@ scripts/test compiler-blorp
 - `docs/MEMORY_MODEL.md` for value semantics, ARC, and COW.
 - `docs/ARCHITECTURE.md` for compiler pipeline details.
 - `standard_library/src/*.brp` and `blorp/test/runtime/**/*.brp` for current idioms.
+- `docs/WORKER_CHECKLIST.md` for the build/measure/land loop before starting
+  a compiler-performance task.
