@@ -52,9 +52,12 @@ import:
 			ParsedCharLiteralExpr,
 			ParsedContinueExpr,
 			ParsedCompoundAssignExpr,
+			ParsedDebugBlockExpr,
 			ParsedFloatLiteralExpr,
 			ParsedDictExpr,
 			ParsedFieldAccessExpr,
+			ParsedForExpr,
+			ParsedIfExpr,
 			ParsedIntLiteralExpr,
 			ParsedListExpr,
 			ParsedLogicalExpr,
@@ -77,7 +80,9 @@ import:
 			ParsedVectorExpr,
 			ParsedVarDeclExpr,
 			ParsedVoidExpr,
+			ParsedWhileExpr,
 		),
+		ParsedForBinder(ParsedForNameBinder, ParsedForTupleBinder),
 		ParsedIdentifier,
 		ParsedLogicalOp(ParsedAndOp, ParsedOrOp),
 		ParsedRecordExprField,
@@ -143,6 +148,11 @@ enum CompactExpressionNodeKind:
 	CompactSubscriptAssignNode
 	CompactTupleDestructNode
 	CompactQuestionBindNode
+	CompactIfNode
+	CompactDebugBlockNode
+	CompactWhileNode
+	CompactForNameNode
+	CompactForTupleNode
 
 
 enum CompactExpressionOperator:
@@ -222,6 +232,9 @@ enum CompactExpressionCorruption:
 	CompactTypedBinderTypeRootOutOfRange
 	CompactTypedBinderInvalidAbsentTypeRoot
 	CompactTypedBinderSharedTypeRoot
+	CompactForBinderSliceOutOfRange
+	CompactForBinderSliceAlias
+	CompactIdentifierSliceForeignSourceOwner
 
 
 struct CompactProductSourceLocation {
@@ -348,7 +361,8 @@ struct CompactControlIdentifierRow {
 
 struct CompactIdentifierSliceRow {
 	identifier_start: Int,
-	identifier_count: Int
+	identifier_count: Int,
+	span: CompactProductSourceLocation
 }
 
 
@@ -461,8 +475,8 @@ private union CompactBuildAction:
 	CompactBuildRange(SourceLocation)
 	CompactBuildInterpolationParts(List[ParsedStringInterpolationPart], Bool, SourceLocation)
 	CompactBuildTypedBinder(CompactExpressionNodeKind, ParsedIdentifier, Bool, SourceLocation)
-	CompactBuildIdentifier(CompactExpressionNodeKind, ParsedIdentifier, SourceLocation)
-	CompactBuildIdentifierSlice(CompactExpressionNodeKind, List[ParsedIdentifier], SourceLocation)
+	CompactBuildIdentifier(CompactExpressionNodeKind, ParsedIdentifier, Int, SourceLocation)
+	CompactBuildIdentifierSlice(CompactExpressionNodeKind, List[ParsedIdentifier], Int, SourceLocation, SourceLocation)
 	CompactBuildTypeVisit(ParsedTypeExpr)
 	CompactBuildTypeIdentifiers(CompactTypeNodeKind, List[ParsedIdentifier], Int, SourceLocation)
 	CompactBuildTypeText(CompactTypeNodeKind, String, SourceLocation)
@@ -708,7 +722,7 @@ private pure func compact_expected_child_count(
 			None
 		CompactFinalizedInterpolationNode:
 			None
-		CompactBlockNode | CompactSubscriptAssignNode:
+		CompactBlockNode | CompactSubscriptAssignNode | CompactIfNode:
 			None
 		CompactAscriptionNode | CompactOpaqueIntoNode | CompactOpaqueFromNode:
 			Some(1)
@@ -716,6 +730,10 @@ private pure func compact_expected_child_count(
 			Some(2)
 		CompactImmutableVarDeclNode | CompactMutableVarDeclNode | CompactAssignNode | CompactCompoundAddAssignNode | CompactCompoundSubtractAssignNode | CompactCompoundMultiplyAssignNode | CompactCompoundDivideAssignNode | CompactTupleDestructNode | CompactQuestionBindNode:
 			Some(1)
+		CompactDebugBlockNode:
+			Some(1)
+		CompactWhileNode | CompactForNameNode | CompactForTupleNode:
+			Some(2)
 		_:
 			Some(0)
 
@@ -897,12 +915,27 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 											)
 										None:
 											valid = False
-								CompactBlockNode:
+								CompactBlockNode | CompactDebugBlockNode | CompactWhileNode:
 									valid = node.payload_index == NO_COMPACT_PAYLOAD_INDEX
+								CompactIfNode:
+									valid = (
+										(node.child_count == 2 or node.child_count == 3)
+										and node.payload_index == NO_COMPACT_PAYLOAD_INDEX
+									)
 								CompactSubscriptAssignNode:
 									valid = (
 										node.child_count >= 2
 										and node.payload_index == NO_COMPACT_PAYLOAD_INDEX
+									)
+								CompactForNameNode:
+									valid = (
+										node.payload_index >= 0
+										and node.payload_index < rep.control_identifiers.length()
+									)
+								CompactForTupleNode:
+									valid = (
+										node.payload_index >= 0
+										and node.payload_index < rep.identifier_slices.length()
 									)
 								_:
 									valid = False
@@ -1224,7 +1257,7 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 						CompactRangeNode:
 							if node.payload_index != NO_COMPACT_PAYLOAD_INDEX:
 								valid = False
-						CompactBlockNode | CompactSubscriptAssignNode:
+						CompactBlockNode | CompactSubscriptAssignNode | CompactIfNode | CompactDebugBlockNode | CompactWhileNode:
 							if node.payload_index != NO_COMPACT_PAYLOAD_INDEX:
 								valid = False
 						CompactImmutableVarDeclNode | CompactMutableVarDeclNode | CompactQuestionBindNode:
@@ -1265,7 +1298,7 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 											)
 								None:
 									valid = False
-						CompactAssignNode | CompactCompoundAddAssignNode | CompactCompoundSubtractAssignNode | CompactCompoundMultiplyAssignNode | CompactCompoundDivideAssignNode:
+						CompactAssignNode | CompactCompoundAddAssignNode | CompactCompoundSubtractAssignNode | CompactCompoundMultiplyAssignNode | CompactCompoundDivideAssignNode | CompactForNameNode:
 							if (
 								node.payload_index < 0
 								or node.payload_index >= rep.control_identifiers.length()
@@ -1278,13 +1311,19 @@ private pure func compact_expression_product_is_valid(rep: CompactExpressionProd
 										.get(node.payload_index)
 										.get_or(0) + 1,
 								)
-						CompactTupleDestructNode:
+						CompactTupleDestructNode | CompactForTupleNode:
 							match rep.identifier_slices.get(node.payload_index):
 								Some(payload):
-									if not compact_metadata_slice_is_valid(
-										payload.identifier_start,
-										payload.identifier_count,
-										rep.control_identifiers.length(),
+									if (
+										not compact_metadata_slice_is_valid(
+											payload.identifier_start,
+											payload.identifier_count,
+											rep.control_identifiers.length(),
+										)
+										or not compact_source_span_is_valid(
+											rep.source_owners,
+											payload.span,
+										)
 									):
 										valid = False
 									else:
@@ -1949,7 +1988,7 @@ pure func compact_expression_oracle_from_parsed_roots(
 									.append(CompactBuildVisit(value))
 					ParsedAssignExpr(name, value, span):
 						actions = actions
-							.append(CompactBuildIdentifier(CompactAssignNode, name, span))
+							.append(CompactBuildIdentifier(CompactAssignNode, name, 1, span))
 							.append(CompactBuildVisit(value))
 					ParsedCompoundAssignExpr(name, op, value, span):
 						actions = actions
@@ -1957,6 +1996,7 @@ pure func compact_expression_oracle_from_parsed_roots(
 								CompactBuildIdentifier(
 									compact_compound_assign_kind(op),
 									name,
+									1,
 									span,
 								),
 							)
@@ -1989,6 +2029,8 @@ pure func compact_expression_oracle_from_parsed_roots(
 								CompactBuildIdentifierSlice(
 									CompactTupleDestructNode,
 									names,
+									1,
+									span,
 									span,
 								),
 							)
@@ -2018,6 +2060,63 @@ pure func compact_expression_oracle_from_parsed_roots(
 										),
 									)
 									.append(CompactBuildVisit(value))
+					ParsedIfExpr(condition, then_expr, else_expr, span):
+						child_count = if else_expr.is_some():
+							3
+						else:
+							2
+
+						actions = actions.append(
+							CompactBuildSequence(
+								CompactIfNode,
+								child_count,
+								span,
+							),
+						)
+
+						match else_expr:
+							Some(value):
+								actions = actions.append(CompactBuildVisit(value))
+							None:
+								void
+
+						actions = actions
+							.append(CompactBuildVisit(then_expr))
+							.append(CompactBuildVisit(condition))
+					ParsedDebugBlockExpr(body, span):
+						actions = actions
+							.append(CompactBuildSequence(CompactDebugBlockNode, 1, span))
+							.append(CompactBuildVisit(body))
+					ParsedWhileExpr(condition, body, span):
+						actions = actions
+							.append(CompactBuildSequence(CompactWhileNode, 2, span))
+							.append(CompactBuildVisit(body))
+							.append(CompactBuildVisit(condition))
+					ParsedForExpr(binder, iterable, body, span):
+						match binder:
+							ParsedForNameBinder(name):
+								actions = actions.append(
+									CompactBuildIdentifier(
+										CompactForNameNode,
+										name,
+										2,
+										span,
+									),
+								)
+							ParsedForTupleBinder(names, binder_span):
+								actions = actions.append(
+									CompactBuildIdentifierSlice(
+										CompactForTupleNode,
+										names,
+										2,
+										binder_span,
+										span,
+									),
+								)
+
+						actions = actions
+							.append(CompactBuildVisit(body))
+							.append(CompactBuildVisit(iterable))
 					ParsedBreakExpr(span):
 						payload_index = unit_payloads.length()
 						unit_payloads = unit_payloads.append({kind = CompactBreakPayload})
@@ -2684,17 +2783,22 @@ pure func compact_expression_oracle_from_parsed_roots(
 						span = compact_source_location(span),
 					})
 					values = values.append(node_index)
-			Some(CompactBuildIdentifier(kind, identifier, span)):
-				if values.is_empty():
+			Some(CompactBuildIdentifier(kind, identifier, child_count, span)):
+				if values.length() < child_count:
 					supported = False
 				else:
-					value_start = values.length() - 1
+					value_start = values.length() - child_count
 					child_start = children.length()
-					children = children.append(
-						values
-							.get(value_start)
-							.get_or(-1),
-					)
+					var value_index = value_start
+
+					while value_index < values.length():
+						children = children.append(
+							values
+								.get(value_index)
+								.get_or(-1),
+						)
+						value_index += 1
+
 					values = values.take(value_start)
 					text_index = texts.length()
 					texts = texts.append(identifier.text)
@@ -2708,21 +2812,26 @@ pure func compact_expression_oracle_from_parsed_roots(
 						kind = kind,
 						payload_index = identifier_index,
 						child_start = child_start,
-						child_count = 1,
+						child_count = child_count,
 						span = compact_source_location(span),
 					})
 					values = values.append(node_index)
-			Some(CompactBuildIdentifierSlice(kind, identifiers, span)):
-				if values.is_empty():
+			Some(CompactBuildIdentifierSlice(kind, identifiers, child_count, identifier_span, span)):
+				if values.length() < child_count:
 					supported = False
 				else:
-					value_start = values.length() - 1
+					value_start = values.length() - child_count
 					child_start = children.length()
-					children = children.append(
-						values
-							.get(value_start)
-							.get_or(-1),
-					)
+					var value_index = value_start
+
+					while value_index < values.length():
+						children = children.append(
+							values
+								.get(value_index)
+								.get_or(-1),
+						)
+						value_index += 1
+
 					values = values.take(value_start)
 					identifier_start = control_identifiers.length()
 
@@ -2738,13 +2847,14 @@ pure func compact_expression_oracle_from_parsed_roots(
 					identifier_slices = identifier_slices.append({
 						identifier_start = identifier_start,
 						identifier_count = identifiers.length(),
+						span = compact_source_location(identifier_span),
 					})
 					node_index = nodes.length()
 					nodes = nodes.append({
 						kind = kind,
 						payload_index = payload_index,
 						child_start = child_start,
-						child_count = 1,
+						child_count = child_count,
 						span = compact_source_location(span),
 					})
 					values = values.append(node_index)
@@ -3706,6 +3816,81 @@ pure func compact_expression_oracle_project(
 										void
 							_:
 								void
+					CompactIfNode:
+						match (
+							projected_child(rep, projected, node, 0),
+							projected_child(rep, projected, node, 1),
+						):
+							(Some(condition), Some(then_expr)):
+								else_expr: Option[ParsedExpr] = if node.child_count == 3:
+									projected_child(rep, projected, node, 2)
+								else:
+									None
+
+								if node.child_count == 2 or else_expr.is_some():
+									value = Some(
+										ParsedIfExpr(
+											condition,
+											then_expr,
+											else_expr,
+											span,
+										),
+									)
+							_:
+								void
+					CompactDebugBlockNode:
+						value = projected_child(
+							rep,
+							projected,
+							node,
+							0,
+						).map(
+							func(body): ParsedDebugBlockExpr(body, span),
+						)
+					CompactWhileNode:
+						match (
+							projected_child(rep, projected, node, 0),
+							projected_child(rep, projected, node, 1),
+						):
+							(Some(condition), Some(body)):
+								value = Some(ParsedWhileExpr(condition, body, span))
+							_:
+								void
+					CompactForNameNode:
+						match (
+							projected_control_identifier(rep, node.payload_index),
+							projected_child(rep, projected, node, 0),
+							projected_child(rep, projected, node, 1),
+						):
+							(Some(identifier), Some(iterable), Some(body)):
+								value = Some(
+									ParsedForExpr(
+										ParsedForNameBinder(identifier),
+										iterable,
+										body,
+										span,
+									),
+								)
+							_:
+								void
+					CompactForTupleNode:
+						match (
+							rep.identifier_slices.get(node.payload_index),
+							projected_identifier_slice(rep, node.payload_index),
+							projected_child(rep, projected, node, 0),
+							projected_child(rep, projected, node, 1),
+						):
+							(Some(payload), Some(identifiers), Some(iterable), Some(body)):
+								value = Some(
+									ParsedForExpr(
+										ParsedForTupleBinder(identifiers, payload.span.location),
+										iterable,
+										body,
+										span,
+									),
+								)
+							_:
+								void
 					CompactBreakNode:
 						value = Some(ParsedBreakExpr(span))
 					CompactContinueNode:
@@ -3927,6 +4112,38 @@ private pure func compact_expression_oracle_reference_traversal(
 									leave_action_index,
 									CompactReferenceLeaveBindings(entered_count),
 								)
+							CompactForNameNode | CompactForTupleNode:
+								var binding_count: Int = 1
+								var enter_action: CompactReferenceAction = CompactReferenceEnterIdentifier(
+									node.payload_index,
+								)
+
+								if node.kind == CompactForTupleNode:
+									binding_count = rep.identifier_slices
+										.get(node.payload_index)
+										.map(func(slice): slice.identifier_count)
+										.get_or(0)
+									enter_action = CompactReferenceEnterIdentifierSlice(
+										node.payload_index,
+									)
+
+								actions = actions
+									.append(CompactReferenceLeaveBindings(binding_count))
+									.append(
+										CompactReferenceVisit(
+											rep.children
+												.get(node.child_start + 1)
+												.get_or(-1),
+										),
+									)
+									.append(enter_action)
+									.append(
+										CompactReferenceVisit(
+											rep.children
+												.get(node.child_start)
+												.get_or(-1),
+										),
+									)
 							CompactAssignNode | CompactCompoundAddAssignNode | CompactCompoundSubtractAssignNode | CompactCompoundMultiplyAssignNode | CompactCompoundDivideAssignNode:
 								match projected_control_identifier(rep, node.payload_index):
 									Some(identifier):
@@ -4080,6 +4297,17 @@ private pure func compact_product_with_corrupt_binder_type_root(
 			rep
 
 
+private pure func compact_corruption_scope_tuple_node_id(
+	rep: CompactExpressionProductRep,
+	scope_root: Int,
+) -> Option[Int]:
+	match rep.nodes.get(scope_root):
+		Some(scope_node):
+			rep.children.get(scope_node.child_start + 3)
+		None:
+			None
+
+
 pure func compact_expression_oracle_rejects_corruption(
 	source: SourceFile,
 	corruption: CompactExpressionCorruption,
@@ -4157,7 +4385,23 @@ pure func compact_expression_oracle_rejects_corruption(
 					left,
 					False,
 					start_span.location,
+				), ParsedTupleDestructExpr(
+					[parsed_identifier("tuple", start_span.location)],
+					left,
+					start_span.location,
 				)],
+			start_span.location,
+		)
+		looped = ParsedForExpr(
+			ParsedForTupleBinder(
+				[
+					parsed_identifier("left", start_span.location),
+					parsed_identifier("right", start_span.location),
+				],
+				start_span.location,
+			),
+			left,
+			right,
 			start_span.location,
 		)
 
@@ -4173,6 +4417,7 @@ pure func compact_expression_oracle_rejects_corruption(
 					typed,
 					interpolated,
 					scoped,
+					looped,
 				],
 			)
 		):
@@ -4199,6 +4444,9 @@ pure func compact_expression_oracle_rejects_corruption(
 					.get_or(-1)
 				scope_root = rep.roots
 					.get(7)
+					.get_or(-1)
+				loop_root = rep.roots
+					.get(8)
 					.get_or(-1)
 
 				match corruption:
@@ -4425,6 +4673,66 @@ pure func compact_expression_oracle_rejects_corruption(
 									scope_root,
 									typed_node.payload_index,
 								)
+							None:
+								void
+					CompactForBinderSliceOutOfRange:
+						match rep.nodes.get(loop_root):
+							Some(loop_node):
+								match rep.identifier_slices.get(loop_node.payload_index):
+									Some(slice):
+										corrupted = { rep |
+											identifier_slices = rep.identifier_slices.set(
+												loop_node.payload_index,
+												{ slice |
+													identifier_start = rep.control_identifiers.length()
+												},
+											)
+										}
+									None:
+										void
+							None:
+								void
+					CompactForBinderSliceAlias:
+						match (
+							compact_corruption_scope_tuple_node_id(rep, scope_root),
+							rep.nodes.get(loop_root),
+						):
+							(Some(tuple_node_id), Some(loop_node)):
+								match rep.nodes.get(tuple_node_id):
+									Some(tuple_node):
+										corrupted = { rep |
+											nodes = rep.nodes.set(
+												loop_root,
+												{ loop_node |
+													payload_index = tuple_node.payload_index
+												},
+											)
+										}
+									None:
+										void
+							_:
+								void
+					CompactIdentifierSliceForeignSourceOwner:
+						match compact_corruption_scope_tuple_node_id(rep, scope_root):
+							Some(tuple_node_id):
+								match rep.nodes.get(tuple_node_id):
+									Some(tuple_node):
+										match rep.identifier_slices.get(tuple_node.payload_index):
+											Some(slice):
+												corrupted = { rep |
+													identifier_slices = rep.identifier_slices.set(
+														tuple_node.payload_index,
+														{ slice |
+															span = { slice.span |
+																source_owner_index = 1
+															}
+														},
+													)
+												}
+											None:
+												void
+									None:
+										void
 							None:
 								void
 

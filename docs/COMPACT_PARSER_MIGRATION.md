@@ -198,10 +198,13 @@ Qualified `name.field` references remain suppressed only while `name` is bound.
 No product or builder record is carried by a traversal step, and no node clones
 an environment.
 
-Generated C confirms inline storage on the measured 64-bit ABI: control
-identifier rows are 24 bytes, identifier-slice rows are 16 bytes, and typed
-binder rows are 16 bytes. The complete product record is 232 bytes by ABI
-`sizeof` and still occupies the 256-byte allocator class.
+At the scope-skeleton checkpoint, generated C confirmed inline storage on the
+measured 64-bit ABI: control-identifier rows were 24 bytes,
+identifier-slice rows were 16 bytes, and typed-binder rows were 16 bytes. The
+complete product record was 232 bytes by ABI `sizeof` and occupied the
+256-byte allocator class. The simple-control checkpoint below adds the tuple
+binder span to the existing slice row, raising that row to 32 bytes without
+adding a table handle or changing the product/allocator sizes.
 
 A deterministic 64-binding scope fixture produces 64 free initializer
 references and exactly 2,080 bound-name comparisons, matching the current
@@ -211,21 +214,44 @@ an asymptotic improvement claim: the wide sequential workload retains
 quadratic lookup work. An exact-name index should be considered only if later measurement
 shows that lookup dominating real source/module workloads.
 
+#### Simple control oracle
+
+The fifth test-only family adds `if` with and without `else`, debug blocks,
+`while`, and both name- and tuple-binder `for`. It reuses the existing scalar
+node, child, control-identifier, and identifier-slice tables. The generalized
+identifier actions now take a child count, so a `for` node shares the same
+construction path as the one-child assignment and destructuring nodes rather
+than introducing another metadata builder.
+
+Conditions and iterables are visited in the outer scope. A `for` binder enters
+only for its body and is removed before later siblings or roots. This remains
+true for non-block bodies, nested equal-text shadowing, duplicate tuple names,
+and qualified references. Tuple-binder source spans are stored explicitly on
+the existing slice row; projection never guesses a span from the first or last
+identifier.
+
+The retained simple-control fixture has 13 nodes, 12 child ids, two control
+identifiers, one identifier slice, seven free references, and one bound-name
+comparison. It retains 9 objects / 2,096 bytes. The complete product remains
+232 bytes by ABI `sizeof` in the 256-byte allocator class; the now span-bearing
+identifier-slice row is 32 bytes on the measured 64-bit ABI.
+That is an exact 16-byte increase in row storage for each populated identifier
+slice before list-capacity and allocator-size-class rounding; it does not
+change products whose slice table remains empty.
+
 Remaining milestone-1 coverage is deliberately finite:
 
-1. simple control: if, debug block, while, and for;
-2. structured scopes: match, select, `with`, lambda, and nested function
+1. structured scopes: match, select, `with`, lambda, and nested function
    declaration, including their pattern/binder metadata;
-3. concurrency and recovery: concurrent block/for, detach, their parameter
+2. concurrency and recovery: concurrent block/for, detach, their parameter
    metadata, and recovery-sensitive combinations of the existing missing form.
 
-The current declaration has 48 `ParsedExpr` variants. Exactly 36 are now in
-the oracle. The remaining 12 are explicit, not an open-ended category:
+The current declaration has 48 `ParsedExpr` variants. Exactly 40 are now in
+the oracle. The remaining 8 are explicit, not an open-ended category:
 
 | Status | Count | Variants |
 | --- | ---: | --- |
-| Covered | 36 | name; integer, float, string, raw interpolation, bool, and char literals; unary, binary, logical, ascription, range, call, field access, subscript, list, tuple, record, record update, dictionary, vector, opaque into/from, finalized interpolation parts, block, variable declaration, assignment, compound assignment, subscript assignment, tuple destructuring, question binding, break, continue, void, builtin, missing |
-| Simple-control checkpoint | 4 | if, debug block, while, for |
+| Covered | 40 | name; integer, float, string, raw interpolation, bool, and char literals; unary, binary, logical, ascription, range, call, field access, subscript, list, tuple, record, record update, dictionary, vector, opaque into/from, finalized interpolation parts, block, variable declaration, assignment, compound assignment, subscript assignment, tuple destructuring, question binding, if, debug block, while, for, break, continue, void, builtin, missing |
 | Structured-scope checkpoint | 5 | match, select, with, lambda, function declaration |
 | Concurrency checkpoint | 3 | concurrent block, concurrent for, detach |
 

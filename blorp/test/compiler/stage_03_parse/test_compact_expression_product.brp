@@ -22,6 +22,9 @@ import:
 			CompactTypedBinderTypeRootOutOfRange,
 			CompactTypedBinderInvalidAbsentTypeRoot,
 			CompactTypedBinderSharedTypeRoot,
+			CompactForBinderSliceOutOfRange,
+			CompactForBinderSliceAlias,
+			CompactIdentifierSliceForeignSourceOwner,
 		),
 		CompactExpressionOracleError(
 			InvalidCompactExpressionOracleProduct,
@@ -77,9 +80,12 @@ import:
 			ParsedDictExpr,
 			ParsedFieldAccessExpr,
 			ParsedFloatLiteralExpr,
+			ParsedForExpr,
+			ParsedIfExpr,
 			ParsedIntLiteralExpr,
 			ParsedLogicalExpr,
 			ParsedListExpr,
+			ParsedMatchExpr,
 			ParsedMissingExpr,
 			ParsedNameExpr,
 			ParsedRangeExpr,
@@ -100,7 +106,9 @@ import:
 			ParsedVectorExpr,
 			ParsedVarDeclExpr,
 			ParsedVoidExpr,
+			ParsedWhileExpr,
 		),
+		ParsedForBinder(ParsedForNameBinder, ParsedForTupleBinder),
 		ParsedIdentifier,
 		ParsedLogicalOp(ParsedAndOp, ParsedOrOp),
 		ParsedProgram,
@@ -784,6 +792,88 @@ pure func scope_skeleton_roots(src: SourceFile) -> List[ParsedExpr]:
 		)]
 
 
+pure func simple_control_roots(src: SourceFile) -> List[ParsedExpr]:
+	alpha_identifier = parsed_identifier(
+		"alpha",
+		span(src, 0, 5),
+	)
+	beta_identifier = parsed_identifier(
+		"beta",
+		span(src, 6, 10),
+	)
+	first_gamma = parsed_identifier(
+		"gamma",
+		span(src, 11, 16),
+	)
+	second_gamma = parsed_identifier(
+		"gamma",
+		span(src, 17, 22),
+	)
+	alpha = ParsedNameExpr(alpha_identifier)
+	beta = ParsedNameExpr(beta_identifier)
+	gamma = ParsedNameExpr(first_gamma)
+	delta = ParsedNameExpr(parsed_identifier("delta", span(src, 17, 22)))
+
+	[
+		ParsedIfExpr(
+			alpha,
+			beta,
+			None,
+			span(src, 0, 10),
+		),
+		ParsedIfExpr(
+			alpha,
+			beta,
+			Some(gamma),
+			span(src, 0, 16),
+		),
+		ParsedDebugBlockExpr(
+			delta,
+			span(src, 17, 22),
+		),
+		ParsedWhileExpr(
+			alpha,
+			beta,
+			span(src, 0, 10),
+		),
+		ParsedForExpr(
+			ParsedForNameBinder(beta_identifier),
+			alpha,
+			beta,
+			span(src, 0, 10),
+		),
+		ParsedForExpr(
+			ParsedForTupleBinder(
+				[first_gamma, second_gamma],
+				span(
+					src,
+					10,
+					22,
+				),
+			),
+			alpha,
+			gamma,
+			span(
+				src,
+				0,
+				22,
+			),
+		),
+	]
+
+
+pure func optional_expressions_equal(left: Option[ParsedExpr], right: Option[ParsedExpr]) -> Bool:
+	match left:
+		Some(left_expr):
+			match right:
+				Some(right_expr):
+					expressions_equal(left_expr, right_expr)
+				None:
+					False
+		None:
+			right.is_none()
+
+
 pure func optional_type_expressions_equal(
 	left: Option[ParsedTypeExpr],
 	right: Option[ParsedTypeExpr],
@@ -1085,6 +1175,44 @@ pure func expressions_equal(left: ParsedExpr, right: ParsedExpr) -> Bool:
 					)
 				_:
 					False
+		ParsedIfExpr(left_condition, left_then, left_else, left_span):
+			match right:
+				ParsedIfExpr(right_condition, right_then, right_else, right_span):
+					(
+						expressions_equal(left_condition, right_condition)
+						and expressions_equal(left_then, right_then)
+						and optional_expressions_equal(left_else, right_else)
+						and left_span == right_span
+					)
+				_:
+					False
+		ParsedDebugBlockExpr(left_body, left_span):
+			match right:
+				ParsedDebugBlockExpr(right_body, right_span):
+					expressions_equal(left_body, right_body) and left_span == right_span
+				_:
+					False
+		ParsedWhileExpr(left_condition, left_body, left_span):
+			match right:
+				ParsedWhileExpr(right_condition, right_body, right_span):
+					(
+						expressions_equal(left_condition, right_condition)
+						and expressions_equal(left_body, right_body)
+						and left_span == right_span
+					)
+				_:
+					False
+		ParsedForExpr(left_binder, left_iterable, left_body, left_span):
+			match right:
+				ParsedForExpr(right_binder, right_iterable, right_body, right_span):
+					(
+						for_binders_equal(left_binder, right_binder)
+						and expressions_equal(left_iterable, right_iterable)
+						and expressions_equal(left_body, right_body)
+						and left_span == right_span
+					)
+				_:
+					False
 		ParsedVoidExpr(left_span):
 			match right:
 				ParsedVoidExpr(right_span):
@@ -1121,6 +1249,22 @@ pure func expressions_equal(left: ParsedExpr, right: ParsedExpr) -> Bool:
 
 pure func identifiers_equal(left: ParsedIdentifier, right: ParsedIdentifier) -> Bool:
 	left.text == right.text and left.span == right.span
+
+
+pure func for_binders_equal(left: ParsedForBinder, right: ParsedForBinder) -> Bool:
+	match left:
+		ParsedForNameBinder(left_name):
+			match right:
+				ParsedForNameBinder(right_name):
+					identifiers_equal(left_name, right_name)
+				_:
+					False
+		ParsedForTupleBinder(left_names, left_span):
+			match right:
+				ParsedForTupleBinder(right_names, right_span):
+					identifier_lists_equal(left_names, right_names) and left_span == right_span
+				_:
+					False
 
 
 pure func identifier_lists_equal(
@@ -1518,6 +1662,140 @@ func test_scope_skeleton_family_round_trips_exactly() -> Bool:
 			False
 
 
+func test_simple_control_family_round_trips_exactly() -> Bool:
+	src = source()
+	roots = simple_control_roots(src)
+
+	match compact_expression_oracle_from_parsed_roots(src, roots):
+		Ok(product):
+			match compact_expression_oracle_project(product):
+				Ok(projected):
+					expression_lists_equal(roots, projected)
+				Err(_):
+					False
+		Err(_):
+			False
+
+
+func test_simple_control_real_parser_round_trips_exactly() -> Bool:
+	program_text = "func run(items: List[Int], pairs: List[(Int, Int)]):\n\tif ready:\n\t\tdebug:\n\t\t\tinspect()\n\telse:\n\t\twhile waiting:\n\t\t\ttick()\n\tfor item in items:\n\t\tuse(item)\n\tfor (left, left) in pairs:\n\t\tuse(left)"
+	program_source = source_file("simple_control.brp", "simple_control", program_text)
+
+	match first_function_body(parse_compiler_source(program_source)):
+		Some(body):
+			match compact_expression_oracle_from_parsed_roots(program_source, [body]):
+				Ok(product):
+					match compact_expression_oracle_project(product):
+						Ok([projected]):
+							expressions_equal(body, projected)
+						_:
+							False
+				Err(_):
+					False
+		None:
+			False
+
+
+func test_simple_control_scope_matches_production() -> Bool:
+	src = source()
+	item_outer = parsed_identifier(
+		"item",
+		span(src, 0, 5),
+	)
+	item_inner = parsed_identifier(
+		"item",
+		span(src, 6, 10),
+	)
+	first_pair = parsed_identifier(
+		"pair",
+		span(src, 11, 16),
+	)
+	second_pair = parsed_identifier(
+		"pair",
+		span(src, 17, 22),
+	)
+	member = parsed_identifier(
+		"member",
+		span(src, 23, 26),
+	)
+	root = ParsedBlockExpr(
+		[
+			ParsedVarDeclExpr(
+				item_outer,
+				None,
+				ParsedNameExpr(parsed_identifier("seed", span(src, 27, 30))),
+				False,
+				span(src, 0, 30),
+			),
+			ParsedForExpr(
+				ParsedForNameBinder(item_inner),
+				ParsedNameExpr(item_outer),
+				ParsedFieldAccessExpr(
+					ParsedNameExpr(item_inner),
+					member,
+					span(src, 6, 26),
+				),
+				span(src, 0, 26),
+			),
+			ParsedFieldAccessExpr(
+				ParsedNameExpr(item_outer),
+				member,
+				span(src, 0, 26),
+			),
+			ParsedFieldAccessExpr(
+				ParsedNameExpr(parsed_identifier("outside", span(src, 31, 34))),
+				member,
+				span(src, 23, 34),
+			),
+			ParsedForExpr(
+				ParsedForTupleBinder(
+					[first_pair, second_pair],
+					span(
+						src,
+						10,
+						22,
+					),
+				),
+				ParsedNameExpr(parsed_identifier("pairs", span(src, 31, 34))),
+				ParsedNameExpr(first_pair),
+				span(
+					src,
+					10,
+					34,
+				),
+			),
+			ParsedNameExpr(first_pair),
+		],
+		span(
+			src,
+			0,
+			34,
+		),
+	)
+	roots = [root, ParsedFieldAccessExpr(
+			ParsedNameExpr(item_inner),
+			member,
+			span(src, 6, 26),
+		)]
+	var legacy: List[IdentifierReference] = []
+
+	for value in roots:
+		legacy = legacy.concat(parsed_expr_free_identifier_references(value))
+
+	match compact_expression_oracle_from_parsed_roots(src, roots):
+		Ok(product):
+			compact = compact_expression_oracle_free_identifier_references(product)
+			encoded = compact.map(func(reference):
+				reference.name + ":" + reference.qualified_member.get_or("-")
+			)
+			(
+				reference_lists_equal(legacy, compact)
+				and encoded == ["seed:-", "outside:member", "pairs:-", "pair:-", "item:member"]
+			)
+		Err(_):
+			False
+
+
 func test_scope_skeleton_reference_order_and_shadowing_match_production() -> Bool:
 	src = source()
 	roots = scope_skeleton_roots(src)
@@ -1881,8 +2159,9 @@ func test_direct_reference_oracle_preserves_order_duplicates_and_lifetime() -> B
 func test_unsupported_form_is_rejected_explicitly() -> Bool:
 	src = source()
 
-	match compact_expression_oracle_from_parsed_roots(src, [ParsedDebugBlockExpr(
+	match compact_expression_oracle_from_parsed_roots(src, [ParsedMatchExpr(
 				ParsedVoidExpr(span(src, 0, 5)),
+				[],
 				span(src, 0, 5),
 			)]):
 		Err(UnsupportedCompactExpressionOracleForm):
@@ -1915,6 +2194,9 @@ func test_validator_rejects_corrupt_products() -> Bool:
 		CompactTypedBinderTypeRootOutOfRange,
 		CompactTypedBinderInvalidAbsentTypeRoot,
 		CompactTypedBinderSharedTypeRoot,
+		CompactForBinderSliceOutOfRange,
+		CompactForBinderSliceAlias,
+		CompactIdentifierSliceForeignSourceOwner,
 	]
 	var rejected = True
 
@@ -2028,6 +2310,22 @@ func test_scope_skeleton_metadata_counts_are_explicit() -> Bool:
 			False
 
 
+func test_simple_control_metadata_counts_are_explicit() -> Bool:
+	src = source()
+
+	match compact_expression_oracle_from_parsed_roots(src, simple_control_roots(src)):
+		Ok(product):
+			counts = compact_expression_oracle_counts(product)
+			(
+				counts.control_identifier_count == 3
+				and counts.identifier_slice_count == 1
+				and counts.typed_binder_count == 0
+				and counts.root_count == 6
+			)
+		Err(_):
+			False
+
+
 tests: TestSuite = {
 	description = "Compact expression product schema oracle",
 	tests = [
@@ -2047,6 +2345,15 @@ tests: TestSuite = {
 			"scope skeleton family round trips exactly",
 			test_scope_skeleton_family_round_trips_exactly,
 		),
+		(
+			"simple control family round trips exactly",
+			test_simple_control_family_round_trips_exactly,
+		),
+		(
+			"simple control real parser body round trips exactly",
+			test_simple_control_real_parser_round_trips_exactly,
+		),
+		("simple control scope matches production", test_simple_control_scope_matches_production),
 		(
 			"scope skeleton reference order and shadowing match production",
 			test_scope_skeleton_reference_order_and_shadowing_match_production,
@@ -2094,6 +2401,10 @@ tests: TestSuite = {
 		(
 			"scope skeleton metadata counts are explicit",
 			test_scope_skeleton_metadata_counts_are_explicit,
+		),
+		(
+			"simple control metadata counts are explicit",
+			test_simple_control_metadata_counts_are_explicit,
 		),
 	]
 }
