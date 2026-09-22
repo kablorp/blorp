@@ -362,3 +362,131 @@ re-deriving.
 - `core_source_loc` and `core_var`'s percentages are not additional to the
   46.80% node-kind sum -- their allocations happen *inside* whichever node's
   self-time window called them.
+
+## Drilling into TypedNameExpr, and the callee-signature memo question (2026-09-22, third pass)
+
+Two items, following the same discipline: attribute, check the 25%
+threshold, cut only what clears it.
+
+### Drilling into TypedNameExpr
+
+`TypedNameExpr` (plain name references -- `Ok(VarExpr(core_var(clean_name, def_id), typ, loc))`)
+was the largest self-allocation contributor at 19.98% of lowering
+(3,802,949 allocations, 271,869 calls, 14.0/call). Wrapped its four
+sub-steps the same way as `TypedCallExpr`'s drill-down (same enter/exit
+primitive, new labels):
+
+| step | calls | self allocations | % of name-reference budget | self/call |
+|---|---|---|---|---|
+| `NameExpr.identity_total` (the final callable-id reconciliation match, before the cut below) | 271,869 | 1,359,345 | **35.74%** | 5.0 |
+| `NameExpr.split_callable_id` (`split_var_callable_id`: UFCS-prefix check, `#<id>` suffix split) | 271,869 | 543,738 | 14.29% | 2.0 |
+| `TypedNameExpr` own residual (exactly `core_source_loc`'s 2/call, isolated once `node_construct` and `identity_total` were split out) | 271,869 | 543,738 | 14.29% | 2.0 |
+| `NameExpr.node_construct` (`core_var` + `VarExpr(...)`) | 271,869 | 543,738 | 14.29% | 2.0 |
+| `NameExpr.resolved_definition_id` (`resolved_core_decl_callable_id` when `info.resolved_call` is set) | 271,869 | 469,963 | 12.35% | 1.7 |
+| `NameExpr.lowered_name` (`lowered_name_expr_name`: UFCS name substitution for resolved calls) | 271,869 | 343,458 | 9.03% | 1.3 |
+| **total (= name-reference budget)** | 271,869 | **3,803,980** | 100% | 14.0 |
+
+**Go: `NameExpr.identity_total`, 35.74%, clears the 25% threshold.** The
+mechanism was not a String split or concatenation (those are
+`split_callable_id`/`lowered_name`, each under 15%) -- it was
+`lower_name_expr_identity`'s own return type. That function reconciled two
+sources of the callable id (`encoded_id` from `split_var_callable_id`,
+`resolved_id` from a resolved call) but returned `Result[(String, Option[Int]), CoreLowerError]`,
+boxing `clean_name` into a tuple purely to carry it back out past the
+reconciliation, even though the reconciliation itself never reads or
+touches `clean_name`. At 5 allocations/call for what is, in the common
+case, one integer-or-none comparison, that tuple-in-Result return was the
+single most expensive thing a plain variable reference pays for.
+
+**Cut, landed**: split `lower_name_expr_identity` into
+`resolve_name_expr_def_id(name, encoded_id, resolved_id) -> Result[Option[Int], CoreLowerError]`
+(the reconciliation, unchanged logic, now returning only the `Option[Int]`
+it actually decides) and `resolved_name_expr_id` (the `info.resolved_call`
+match, unchanged). `clean_name` is now read directly from
+`split_var_callable_id`'s existing return at the one call site
+(`lower_typed_expr_as_type_impl`'s `TypedNameExpr` arm) instead of being
+routed through the reconciliation's return value. Same semantics, same
+error message, one fewer heap-boxed tuple per name reference.
+
+Measured on the frozen self-compile (same input, same command as the
+earlier sections):
+
+```
+core_lowering_complete, metrics unset, before this cut: 19,036,171
+core_lowering_complete, metrics unset, after this cut:  18,764,302
+```
+
+**-271,869 allocations (-1.43%), exactly one allocation per call** -- the
+tuple, and only the tuple; the `Ok`/`Option` boxing the reconciliation still
+does was already there before and is unchanged. `self_compile_measure --require-identical`
+confirms: byte-identical generated C (160,183,601 bytes both), every other
+phase's allocation row at +0.00%, `TOTAL` -0.11%, instructions retired
+-0.08% (improved, not regressed). Re-verified metrics on/off allocation
+parity holds after the cut (66,210,587 both ways, same as the metrics-off
+baseline), so the drill-down instrumentation itself did not shift.
+
+### The callee-signature memo question
+
+Point 2 of the earlier follow-up left open whether a memo for
+`CallExpr.callee_type_lowering` (33.32% of call lowering's own budget,
+see the second-pass section above) could safely be keyed by the callee's
+resolved definition id alone.
+
+**Answer: the id is per template, not per instantiation.** `ResolvedCallInfo`
+(`blorp/src/compiler/stage_06_typecheck/infer.brp:506`) carries `target:
+ResolvedCallTarget` (whose `ResolvedGraphCallableCall(CallableId, ...)` and
+similar variants hold the STABLE callable/definition id, the same for every
+call site referencing a given function or trait method) as a *separate*
+field from `bound_type_params: List[BoundTypeParam]`,
+`instantiated_params: List[SemanticType]`, and `instantiated_return:
+SemanticType` -- the per-call-site instantiation. `resolve_trait_self_call`
+(`infer.brp:9557`) is direct proof these differ: for a trait method with
+`Self` in its signature, it computes `resolved_params =
+params.map(func(param): resolve_self(self_type, param))` and
+`resolved_return = resolve_self(self_type, return_type)` from *this call
+site's* receiver type, builds `resolved_func_type =
+SemanticFunctionType(is_pure, resolved_params, resolved_return)`, and
+folds it into `updated_resolved_call`'s `instantiated_params`/
+`instantiated_return` -- two calls to the same trait method with different
+receiver types get different instantiated signatures under the same
+callable id. `CoreMonoDefIdMap` (`blorp/src/compiler/stage_09_core/mono_impl.brp:71`)
+confirms this from the other end: monomorphization is a **Core-level pass
+that runs after lowering**, rewriting definition ids to point at
+specialized copies it creates -- its whole job is to turn one
+lowering-time definition id plus the concrete types actually used back
+into multiple specialized declarations, which only makes sense if lowering
+itself sees one id shared across differently-instantiated call sites.
+
+**A memo keyed only by definition id would therefore be wrong**: it would
+hand a later call site whichever instantiation happened to lower first.
+Per the standing instruction, the key must include the instantiated
+parameter/return types.
+
+**Is that key available without allocating? Yes, for retrieval -- not yet
+for safe storage.** `instantiated_params`/`instantiated_return` already
+exist on `ResolvedCallInfo`; no new computation is needed to obtain them,
+and hashing them by pointer identity (the same technique the type-metric
+fix above uses) needs no new allocation either -- walk the list, combine
+each element's pointer hash with the definition id's. But a **hash** key is
+not a safe **equality** key: two different instantiations could collide,
+and correctness requires confirming an exact match (definition id, plus
+every param pointer, plus the return pointer) on a hit, not just a hash
+match. That comparison is itself cheap (pointer equality, no allocation),
+but it means the cache entry must retain the full parameter list and return
+type pointers to compare against on lookup, not just a hash -- a real,
+new, always-on (not debug-gated) C-side data structure with correctness
+consequences if it is wrong, unlike this session's other two cuts (a
+handful of module-level constants, and dropping one already-redundant
+tuple), which cannot silently produce a wrong answer if a comparison is
+subtly off.
+
+**Not implemented this session.** The pieces are identified precisely
+enough that a future session should not need to re-derive them: memo
+storage keyed by `(definition_id, instantiated_params pointers,
+instantiated_return pointer)`, populated once per distinct instantiation
+the first time it is lowered (naturally happens during expression lowering
+itself, no need to special-case declaration lowering the way the
+type-histogram or scalar-constant work did), read on every
+`CallExpr.callee_type_lowering`. Recommending it as the next task, gated on
+writing and testing the exact-match comparison before it goes anywhere
+near a production (non-debug-gated) code path.

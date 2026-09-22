@@ -877,24 +877,29 @@ private pure func resolved_core_decl_callable_id(
 			Ok(None)
 
 
-private pure func lower_name_expr_identity(
-	context: CoreLowerContext,
+-- Reconciles the two sources a name reference's callable id can come from
+-- (a `#<id>` suffix already encoded on the name, and a resolved-call
+-- definition id) into the one id the lowered `CoreVar` carries.
+--
+-- Split out of what used to be `lower_name_expr_identity` (2026-09-22
+-- attribution: that single function returning `Result[(String, Option[Int]),
+-- CoreLowerError]` boxed a tuple purely to carry `clean_name` back out
+-- alongside a value this reconciliation never touches, measured at 5
+-- allocations/call -- 35.7% of a plain name reference's whole lowering
+-- budget, clearing the 25% cut threshold; see
+-- `core_lowering_allocation_attribution_2026-09-22.md`). `clean_name` needs
+-- no `Result` at all (`split_var_callable_id` cannot fail), so it is now
+-- read directly at the one call site instead of round-tripping through a
+-- boxed tuple that only existed to carry it past this reconciliation.
+private pure func resolve_name_expr_def_id(
 	name: ParsedIdentifier,
-	info: TypedExprInfo,
-) -> Result[(String, Option[Int]), CoreLowerError]:
-	lowered_name ?= lowered_name_expr_name(context, name, info)
-	(clean_name, encoded_id) = split_var_callable_id(lowered_name)
-
-	resolved_id ?= match info.resolved_call:
-		Some(resolved):
-			resolved_core_decl_callable_id(context, resolved)
-		None:
-			Ok(None)
-
+	encoded_id: Option[Int],
+	resolved_id: Option[Int],
+) -> Result[Option[Int], CoreLowerError]:
 	match (encoded_id, resolved_id):
 		(Some(encoded), Some(resolved)):
 			if encoded == resolved:
-				Ok((clean_name, encoded_id))
+				Ok(encoded_id)
 			else:
 				Err(
 					CoreLowerInvalidCall(
@@ -902,9 +907,20 @@ private pure func lower_name_expr_identity(
 					),
 				)
 		(Some(_), None):
-			Ok((clean_name, encoded_id))
+			Ok(encoded_id)
 		(None, _):
-			Ok((clean_name, resolved_id))
+			Ok(resolved_id)
+
+
+private pure func resolved_name_expr_id(
+	context: CoreLowerContext,
+	info: TypedExprInfo,
+) -> Result[Option[Int], CoreLowerError]:
+	match info.resolved_call:
+		Some(resolved):
+			resolved_core_decl_callable_id(context, resolved)
+		None:
+			Ok(None)
 
 
 private pure func apply_resolved_callee_identity(
@@ -4871,9 +4887,45 @@ private pure func lower_typed_expr_as_type_impl(
 
 	match expr:
 		TypedNameExpr(name, info):
-			identity ?= lower_name_expr_identity(context, name, info)
-			(clean_name, def_id) = identity
-			Ok(VarExpr(core_var(clean_name, def_id), typ, loc))
+			if core_lowering_type_metrics_enabled() == 0:
+				lowered_name ?= lowered_name_expr_name(context, name, info)
+				(clean_name, encoded_id) = split_var_callable_id(lowered_name)
+				resolved_id ?= resolved_name_expr_id(context, info)
+				def_id ?= resolve_name_expr_def_id(name, encoded_id, resolved_id)
+				Ok(VarExpr(core_var(clean_name, def_id), typ, loc))
+			else:
+				-- Attribution instrumentation: drill one level into a plain
+				-- name reference's own lowering cost (see the 2026-09-22
+				-- self-time table: `TypedNameExpr` is the largest single
+				-- self contributor). Reuses the generic enter/exit
+				-- primitive with call-specific labels, same as the
+				-- `TypedCallExpr` drill-down. `resolve_name_expr_def_id`'s
+				-- own cost (no longer a tuple-in-Result return) is folded
+				-- into `TypedNameExpr`'s residual rather than given its own
+				-- label, since it dropped from 35.7% of the budget to a
+				-- single small integer-or-none match with nothing left to
+				-- drill into.
+				core_lowering_node_enter()
+				lowered_name_result = lowered_name_expr_name(context, name, info)
+				core_lowering_node_exit("NameExpr.lowered_name")
+				lowered_name ?= lowered_name_result
+
+				core_lowering_node_enter()
+				split_result = split_var_callable_id(lowered_name)
+				core_lowering_node_exit("NameExpr.split_callable_id")
+				(clean_name, encoded_id) = split_result
+
+				core_lowering_node_enter()
+				resolved_id_result = resolved_name_expr_id(context, info)
+				core_lowering_node_exit("NameExpr.resolved_definition_id")
+				resolved_id ?= resolved_id_result
+
+				def_id ?= resolve_name_expr_def_id(name, encoded_id, resolved_id)
+
+				core_lowering_node_enter()
+				name_node = VarExpr(core_var(clean_name, def_id), typ, loc)
+				core_lowering_node_exit("NameExpr.node_construct")
+				Ok(name_node)
 		TypedIntLiteralExpr(text, _, _):
 			Ok(LiteralExpr(core_literal_int(text), typ, loc))
 		TypedFloatLiteralExpr(text, _, _):
