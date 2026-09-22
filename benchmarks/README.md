@@ -268,6 +268,15 @@ PYTHONDONTWRITEBYTECODE=1 \
   python3 -m unittest blorp/test/test/test_session_benchmark.py
 ```
 
+### Gate Time Profile
+
+A phase-by-phase breakdown of where `scripts/test` gate wall time goes
+(Blorp compile vs. host clang vs. execution vs. harness overhead, per-gate
+artifact/translation-unit counts, and distinct-binary launch counts), built
+from `BLORP_TEST_TIMING`/`BLORP_TEST_ARTIFACT_*` log rows under
+`--release-compiler --timings --log-dir`, is in
+[`results/gate_time_profile_2026-09-22.md`](results/gate_time_profile_2026-09-22.md).
+
 ### Compiler Record Layout
 
 `compiler_record_layout` compiles a bounded fixture through the production
