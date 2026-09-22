@@ -54,6 +54,7 @@ module inventory lives in
 - [Frontend Facts Roadmap](FRONTEND_FACTS_ROADMAP.md) is the task-level
 - [`SOURCE_DISCOVERY_PERFORMANCE_ROADMAP.md`](SOURCE_DISCOVERY_PERFORMANCE_ROADMAP.md) — lexer/parser/discovery cuts (Task 4 landed; rest deferred), with its profile in `benchmarks/results/`.
 - [`TYPECHECK_OPTIMIZATION_ISSUES.md`](TYPECHECK_OPTIMIZATION_ISSUES.md) — five worker-ready typecheck issues (T-A..T-E) with anchors, fast loop, acceptance numbers.
+- [`CORE_ID_MIGRATION.md`](CORE_ID_MIGRATION.md) — Core variable identity by integer, steps 0-6 with start gates, oracles and expected effects; lessons from the reverted cuts.
   plan for publishing each stage's facts as id-keyed tables (module,
   name, definition tables) and removing threaded state from typecheck.
 - [Compact Parser Migration](COMPACT_PARSER_MIGRATION.md) defines the staged
