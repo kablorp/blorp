@@ -1,15 +1,57 @@
 # Typecheck Optimization Issues
 
-Five self-contained issues for reducing the time and allocations of the typed
-frontend on the compiler's own self-compile. Each issue names the exact
-functions and records to change, the order of cuts, the fast loop, the
-acceptance numbers, and the traps that cost earlier attempts a cycle. Read
-[`WORKER_CHECKLIST.md`](WORKER_CHECKLIST.md) first; the rules there (no
-`git stash`, no parallel test binaries, foreground gates, one squash commit
-per task) apply to every issue below.
+Issues for reducing the time and allocations of the typed frontend on the
+compiler's own self-compile. The first execution wave ran five issues (T-A
+to T-E); one landed, two were measured and rejected, two were blocked. Their
+results are recorded verbatim below, and the live work is now two issues: a
+mandatory per-helper attribution pass, and the second cut of T-D. Each issue
+names the exact functions and records to change, the order of cuts, the fast
+loop, the acceptance numbers, and the traps that cost earlier attempts a
+cycle. Read [`WORKER_CHECKLIST.md`](WORKER_CHECKLIST.md) first; the rules
+there (no `git stash`, no parallel test binaries, foreground gates, one
+squash commit per task) apply to every issue below.
 
-All anchors are against main at `cf9a7350` (2026-09-21). Line numbers drift;
+All anchors are against main at `de865651` (2026-09-21). Line numbers drift;
 the function and record names do not, so grep for the name if a line is off.
+
+## First wave results
+
+Recorded as reported by the workers. Numbers are `-O2`, frozen self-compile
+input, allocation rows from `benchmarks/self_compile_measure` unless the
+entry says otherwise.
+
+- **T-A rejected.** Dense authority tables: 0% allocation change,
+  small-program instructions +0.476%. `SourceNameId` buckets: +18
+  allocations. Both reverted. Dictionary probes do not allocate, so T-A was
+  never an allocation lever.
+- **T-B blocked** and retired as written.
+- **T-C rejected.** Correct unboxing of the value slot saved 550,709
+  typed-frontend allocations, 1.406%, against an 8% target; the full split's
+  ceiling was 2.889%. Reverted. The per-node info records are not the mass.
+- **T-D cut 1 accepted.** `global_header_completion` splits as
+  `global_plan` 6,701, `global_prepare` 5,201,772, `global_pending` 0,
+  `global_annotated` 1,421,126 allocations. Preparation
+  (`prepared_module_environments` in `stage_06_typecheck/decl.brp`) is 78.3%
+  of global completion. Identical C. Measurement in
+  `benchmarks/results/self_compile_typecheck_global_attribution_O2_2026-09-21.json`
+  once that worktree (`/Users/keithphilpott/.codex/worktrees/typecheck-t-d`)
+  is landed.
+- **T-E blocked** and retired as written.
+
+What the wave taught, and what the live issues are built on:
+
+- Two of the three measured issues named a structure from reading the code
+  and were wrong about where the allocations are. Neither dictionary probes
+  nor per-node info boxes are the mass. No further cut is written from code
+  reading alone; every cut names a helper and an allocation count from the
+  attribution issue below.
+- The one accepted result came from attribution first: T-D cut 1 spent its
+  budget on phase rows and found that a step nobody had named
+  (`prepared_module_environments`) is more than three quarters of a phase
+  that was assumed to be inference.
+- `global_pending` is zero on the self-compile: no unannotated global in
+  the compiler or the standard library reaches the pending loop, so the
+  "pending inference dominates" branch of the old T-D cut 2 is dead.
 
 ## Shared context
 
@@ -17,7 +59,10 @@ the function and record names do not, so grep for the name if a line is off.
 
 Frozen self-compile input `10acd6104`, compiler built at `-O2`, one run with
 `BLORP_TYPECHECK_BODY_METRICS=1` (the metrics inflate allocation totals; use
-them for attribution, and the harness rows below for acceptance):
+them for attribution, and the harness rows below for acceptance). The four
+`global_*` rows are children of `global_header_completion`, added by T-D
+cut 1 and measured in that worktree; do not add a parent and its children
+together.
 
 | typecheck phase row | wall | allocations |
 | --- | ---: | ---: |
@@ -25,7 +70,11 @@ them for attribution, and the harness rows below for acceptance):
 | `bound_modules` | 190 ms | 1.83M |
 | `callable_headers` | 66 ms | 1.17M |
 | `global_header_completion` | 834 ms | 6.62M |
-| `graph_completion` (contains the row above) | 848 ms | 6.76M |
+| &nbsp;&nbsp;`global_plan` | | 6,701 |
+| &nbsp;&nbsp;`global_prepare` | | 5,201,772 |
+| &nbsp;&nbsp;`global_pending` | | 0 |
+| &nbsp;&nbsp;`global_annotated` | | 1,421,126 |
+| `graph_completion` (contains `global_header_completion`) | 848 ms | 6.76M |
 | `module_bodies` (13,314 bodies) | 1,847 ms | 27.66M |
 
 Harness rows without metrics (`benchmarks/self_compile_measure`, same input):
@@ -35,7 +84,10 @@ about 34M, so the typed frontend itself is about 25.6M allocations and
 generated code 30%, reference counting 27%, cancellation cleanup frames
 18.5%, allocation 7.5%, string and dict lookups 5%. The zonk skip for bodies
 with no metas (`a92f30bda`) already landed; per-node zonk reuse was measured
-negative and is not an option here.
+negative and is not an option here. T-C established that the per-node
+`TypedExprInfo` and `ValueSlot` boxes are at most 2.889% of the typed
+frontend; the remaining body-loop mass is in the helpers, which is what the
+attribution issue ranks.
 
 ### Fast loop (about 6 s per run)
 
@@ -58,6 +110,13 @@ named above and the `typed_frontend_complete` checkpoint
 counts are deterministic; run once while iterating. Wall time is noise until
 the harness runs below.
 
+Once T-D cut 1 is landed the same run prints the `global_plan`,
+`global_prepare`, `global_pending` and `global_annotated` rows with their
+`globals_total`, `globals_annotated`, `globals_pending`, `pending_project`
+and `pending_dependency` counts (format in `benchmarks/README.md`, "Global
+completion also reports ..."). Until then, build the T-D worktree to see
+them.
+
 Per-body attribution: the same run prints one `BLORP_TYPECHECK_BODY` row per
 body sorted by time (`runtime.c` ~2075-2148 for the format). `head -40` of
 those rows tells you whether a change moved the expensive bodies.
@@ -77,10 +136,10 @@ Typecheck source is compiled into `bin/blorp` by the bootstrap, so unlike
 emitter changes these measurements do observe your change directly, and
 `--require-identical` is a real identity check (exit 3 means the typed
 program changed and lowering produced different C: a bug, not a result). A
-cut lands when the `typed_frontend_complete` allocation row drops by at
-least the issue's target, retired instructions do not rise beyond 0.3%, and
-the small program does not regress. A neutral result is reported and
-dropped, not argued.
+cut lands when the issue's named allocation row drops by at least the
+issue's target, retired instructions do not rise beyond 0.3%, and the small
+program does not regress. A neutral result is reported and dropped, not
+argued; T-A and T-C are the precedent, and both reports were useful.
 
 ### Correctness loop
 
@@ -101,11 +160,16 @@ perf regression tests; run the ones that name the structure you touch.
 
 ### Traps seen this month
 
+- Naming the structure before measuring it. T-A (dictionaries) and T-C
+  (per-node boxes) each cost a cycle proving a hypothesis wrong that a
+  per-helper allocation count would have ruled out in an hour. Dictionary
+  probes do not allocate. A boxed record on every node is visible but
+  small when the helpers around it allocate lists and closures.
 - A helper that returns its parameter unchanged on one path defeats
   in-place update everywhere it is called (the reuse gate assumes aliasing).
   Return a record update, or update at the assignment site from a local.
-- `Dict[String, ...]` where an `Int` id exists. Every issue below removes
-  one; do not add another.
+- `Dict[String, ...]` where an `Int` id exists is a cleanliness issue, not
+  an allocation lever (T-A). Do not write an allocation cut around one.
 - A struct inside an `Option`, a union payload, or a `List` of records is
   boxed; converting a record to a struct there saves nothing.
 - Reading a whole struct out of an inline `List[struct]` copies it; read the
@@ -115,341 +179,289 @@ perf regression tests; run the ones that name the structure you touch.
   them, own accumulators as locals.
 - Wall-clock claims. A "50% win" this month was machine noise. Allocation
   rows and retired instructions only.
+- Instruction regressions on the small program. T-A's dense tables were
+  allocation-neutral and still cost +0.476% instructions there; the small
+  program row is a gate, not a courtesy.
 
 ---
 
-## Issue T-A: Dense slot tables in the accepted authorities
+## Issue T-F: Profile body checking per helper (mandatory, runs first)
 
-**Goal.** Replace the `Int -> Int` dictionaries that map a definition id to a
-slot index with dense lists indexed by the id, and stop hashing a name more
-than once per bare lookup. Target: `typed_frontend_complete` allocations
-down 2% or more, string-hash and dict-probe instruction share down; C
-identical.
+**Goal.** Produce the ranked list of the top twenty allocating helpers in
+`stage_06_typecheck/infer.brp` and `stage_06_typecheck/type_system/` on the
+self-compile body loop, with calls, allocations and allocations per call for
+each, as a retained benchmark and a results file. Every later typecheck cut
+must name a helper and an allocation count from this list. No compiler
+change is accepted from this issue other than the counters it needs; the
+deliverable is the table.
 
-**Why.** Definition ids are dense integers minted from a running counter
-(`graph/definition_index.brp:950`, `definition_id(current_next_def_id)`),
-and the definition table already exploits that: `definition_table_rep_row`
-(`definition_index.brp:413-421`) is `rows.get(raw_id - first_graph_definition_id)`,
-an array index. But the per-kind authorities consulted on every bare-name
-resolution then throw that away. `accepted_global_find`
-(`type_system/accepted_global_authority.brp:707-718`) does: one
-`String -> Int` dict probe in the source-name table, one array index into
-`visible_locators_by_source_name_id`, then `binding_at`
-(`accepted_global_authority.brp:696-704`) does a second dict probe
-`table.index_by_global_definition_id.get(definition_id)` before the final
-`table.slots.get(index)`. `accepted_callable_find`
-(`type_system/accepted_callable_authority.brp` ~562-579) has the same shape
-and additionally compares candidates through
-`definition_index_rep_find_func_callable_id`
-(`definition_index.brp:984-1005`), a linear scan of a
-`FuncCallableNameBuckets = Dict[String, List[DefinitionId]]` bucket
-(`definition_index.brp:149`) calling `definition_table_rep_row` per candidate.
+**Model.** `benchmarks/compiler_dce_facts_builder_allocations` and
+`benchmarks/blorp/profiles/dce_facts_builder_allocations.brp` (commit
+`94d34bdc`, "Fuse DCE fact updates"). The pair is: a focused Blorp program
+under `benchmarks/blorp/profiles/` that builds a deterministic input,
+calls `reset_mem_stats()`, runs the function under study once, reads
+`get_mem_stats()` (`standard_library/src/memory.brp:21-48`, a `MemStats`
+struct whose read allocates nothing), checks output identity, and prints one
+value per line; and a bash wrapper under `benchmarks/` that builds at
+`-O2` unless `*_SKIP_BUILD=1`, runs the program with `BLORP_TRACK_STATS=1`,
+validates every line as an integer, fails on any identity change, caps
+`allocations` at an expected value (`*_MEASURE_ONLY=1` to report without the
+cap), and prints one `..._ALLOCATIONS schema=1 ... allocations=... ` summary
+line. The README entry from that commit (`benchmarks/README.md`, "retains a
+focused 512-identity Core expression") is the shape of the documentation.
+
+**Where the numbers come from.** The function profiler
+(`bin/blorp compile --profile --profile-mode exact --profile-module <m>`,
+flags in `blorp/src/lib/cli_args.brp`; `blorp_ProfileEntry` in `runtime.c`
+~37983-37987) records `total_ns`, `self_ns` and `call_count` per function
+and nothing about allocations; its "Function Profile" table (`runtime.c`
+~39217, columns Inclusive, Self, Self %, Calls, Avg self) is time only. The
+managed-allocation counter is process-global (`get_mem_stats`,
+`typecheck_body_metrics_allocations`). So today the repo can give you calls
+per helper, or allocations for one window, but not allocations per helper.
+This issue adds that.
 
 **Cuts, in order.**
 
-1. `index_by_global_definition_id: Dict[Int, Int]` (find its declaration in
-   `accepted_global_authority.brp`; it is populated where slots are appended)
-   becomes `slot_by_definition_offset: List[Int]` indexed by
-   `raw_id - first_graph_definition_id`, with `-1` for "no slot". Build it in
-   the same builder that appends slots; read it in `binding_at`. Do the same
-   for the callable authority's equivalent index and for
-   `accepted_trait_implementation_authority.brp` if it has one (it calls
-   `definition_id_runtime_value` at line 270; check what it indexes).
-2. `FuncCallableNameBuckets` keyed by `String` becomes keyed by
-   `SourceNameId` (an `Int`): change the type at `definition_index.brp:149`,
-   the insert in `definition_index_add_func_callable_id` (~1044-1059), and the
-   lookup in `definition_index_rep_find_func_callable_id` (984-1005). The
-   callers already have or can obtain a `SourceNameId` via
-   `source_name_table_find_id` (`graph/source_name_table.brp:437-442`); do the
-   String lookup once at the entry of the find, never inside the loop.
-3. Measure after each cut. If cut 2 is flat, keep it anyway only if it
-   deletes code; otherwise revert it and say so.
+1. Self allocations per profiled function. Add `self_allocations` to
+   `blorp_ProfileEntry` next to `self_ns`, attributed the same way exact
+   timing attributes self time: read the allocation counter at frame enter
+   and exit, subtract the callees' inclusive counts, add the remainder to the
+   frame's function. Only in `BLORP_PROFILE_MODE_EXACT`; the `calls` mode
+   stays as it is. Print it as two more columns (`Self allocs`,
+   `Avg allocs`) at the end of the "Function Profile" table and leave the
+   existing columns in place and in order (`benchmarks/compiler_typecheck_profile`
+   and its README recipes read the call counts from it). Build the profiled
+   compiler with the two-step recipe (bootstrap `compile --no-embed-runtime`,
+   then `cc` with `-DBLORP_PROFILE_EXACT_TIMING=1` for both the runtime
+   object and the generated C); the Makefile's prebuilt runtime object does
+   not define it and an exact probe then reports `functions_observed=0`.
+   Check `PROFILE_DIAGNOSTICS` shows `calls_completed > 0` before trusting a
+   row.
+2. The retained probe. `benchmarks/blorp/profiles/typecheck_body_helper_allocations.brp`
+   imports `typecheck_graph` (the entry `benchmarks/compiler_typecheck_profile`
+   already drives in-process through
+   `blorp/benchmark/compiler/compiler_typecheck_profile.brp`) and checks a
+   fixed corpus: the frozen self-compile input is too large for a gate, so
+   the program builds a deterministic synthetic module set the way the
+   existing profile does, sized so one run is under ten seconds at `-O2`,
+   and prints body count, diagnostic count, a hash of the typed JSON, then
+   the `MemStats` fields. `benchmarks/compiler_typecheck_body_helper_allocations`
+   wraps it exactly as the DCE wrapper does: identity lines must match,
+   `allocations` is capped, `BLORP_TYPECHECK_HELPERS_MEASURE_ONLY=1` lifts
+   the cap. This gives the gate. It does not give the ranking; the ranking
+   comes from cut 3 on the real input.
+3. The ranking. Run the profiled compiler from cut 1 on the frozen
+   self-compile input with `--stop-after=lower`, restrict to
+   `--profile-module` covering `stage_06_typecheck/infer` and
+   `stage_06_typecheck/type_system/*`, and write
+   `benchmarks/results/typecheck_body_helper_allocations_O2_<date>.md`
+   with the top twenty rows by `self_allocations`: helper, file, calls,
+   allocations, allocations per call, share of `module_bodies` allocations.
+   Add a second table with the top twenty by allocations per call whose
+   call count is above 1,000 (the expensive-but-rare helpers hide in the
+   first table). Keep the raw profile output next to it as `.tsv`. State
+   the compiler commit, the input revision and the toolchain line from
+   `bin/blorp --version` at the top of the file.
+4. Land cuts 1 and 2 as one squash commit with the two tables in the
+   results file; the wrapper joins the `compiler-tools` gate the way the
+   DCE wrapper did. The results file is the artifact every later issue
+   cites.
 
-**Tests.** `test_definition_index.brp`, `test_accepted_record_authority.brp`,
-`test_accepted_union_authority.brp`, `test_accepted_alias_authority.brp`,
-plus the authority tests for globals and callables (grep `accepted_global`
-and `accepted_callable` under `blorp/test/compiler/stage_06_typecheck/`). Add
-one test per converted table asserting that a definition id outside the
-table's range returns `None`, not an out-of-bounds panic.
+**Acceptance.** Cut 1 is identical C (`--require-identical` on the harness
+with the profiler off) and zero allocation change in the unprofiled build.
+Cut 2's wrapper passes with the cap set to the measured value. Cut 3's
+results file exists and its top-twenty rows account for a stated share of
+`module_bodies` allocations; if that share is under 50%, widen to the top
+forty and say so. Nothing in this issue needs a self-compile allocation win.
 
-**Traps.** `first_graph_definition_id` differs between the in-progress
-`DefinitionIndexRep` and the finished `DefinitionTable`; read it from the
-table you are indexing. Ids from `definition_index_add_func_callable_id` may
-be minted after the table's rows were appended; check `next_def_id` handling
-at `definition_index.brp:1044-1059` and the source-definition adder near
-line 1281 before assuming the dense range is closed.
+**Tests.** `blorp/test/compiler/stage_06_typecheck/support/test_typecheck_body_metrics.py`
+(row format), whatever parses the "Function Profile" table or the
+`PROFILE_DIAGNOSTICS` line (grep both under `blorp/test/` and
+`benchmarks/`), and the new wrapper itself.
+
+**Traps.** Self attribution across task fibers: the exact profiler already
+handles frames across yields for time (`scheduled-active`); allocations must
+follow the same frame stack, or a helper that yields inherits another
+fiber's allocations. Global initializers folded by CTFE do not allocate at
+runtime; a helper called only from a folded initializer shows zero and that
+is correct. The metrics build (`BLORP_TYPECHECK_BODY_METRICS=1`) inflates
+totals; run the ranking with it off and use `--profile` only. Do not rank
+by `self_ns`; time rows on this machine moved by 50% between runs this
+month.
 
 ---
 
-## Issue T-B: Scope lookup keyed by name id, not name text
+## Issue T-D cut 2: Build module environment preparation once
 
-**Goal.** Every identifier occurrence in a body currently walks the scope
-chain hashing its `String` once per scope. Key scopes by an `Int` name id so
-the chain walk hashes an integer, and hash the string at most once per
-occurrence. Target: string hash and equality samples in the body loop
-(about 5% of it) mostly gone; `typed_frontend_complete` allocations down
-1% or more from fewer key copies; C identical.
+**Goal.** `global_prepare` is 5,201,772 allocations, 78.3% of
+`global_header_completion`, and all of it is `prepared_module_environments`
+(`stage_06_typecheck/decl.brp:7551`), called once per compile from
+`complete_planned_global_headers` (`decl.brp:8263`). It prepares one
+canonical environment per module and its result is carried to body checking
+in `TypecheckGraphFacts.prepared_environments` (`decl.brp:8498-8505`), so
+the function is not run twice; it is one function that rebuilds the same
+per-module setup once per module, once per trait header, once per callable
+header and once per implementation header, through a `bases` list it
+updates by `bases.set(index, {...})`. Move the setup that is the same for
+every module in front of the loops, build the per-module state once, and
+stop copying the base record per header. Target: the `global_prepare` row
+down 40% or more (about 2.1M allocations), the `typed_frontend_complete`
+harness row down 1.5% or more; identical C.
 
-**Where.** `type_system/env.brp`:
+**Where.** `decl.brp`, all inside `prepared_module_environments`
+(7551-7920):
 
-- `Scope` record (277-280): `symbols: List[Symbol]`,
-  `symbols_by_name: Dict[String, List[Int]]`. The `Int`s are indices into
-  `symbols`, most recent first (`scope_add_symbol`, 495-505, prepends).
-- `scope_lookup` (562-571) probes `symbols_by_name` and takes index 0.
-- `env_lookup` (718-729) walks `env.scopes` outer to inner calling
-  `scope_lookup` per scope, `O(depth)` string hashes.
-- `env_symbols_named` (~704) walks every scope and collects all matches; it
-  is the fallback `lookup_bare_value` takes when the direct hit is filtered
-  by visibility.
-
-`infer.brp`: `lookup_bare_value` (7218-7305) is the single choke point for
-identifier resolution: `env_lookup` first, then `env_symbols_named`, then the
-accepted callable and global authorities (Issue T-A), then constructors. Its
-callers are `infer_name_expr` (7395), `bare_callee_is_constructor` (9268), and
-`infer_special_builtin_call_expr` (17057). Binders enter the scope through
-`env_add_var_with_details` from: `add_lambda_param_bindings` (13501),
-`add_tuple_destruct_bindings` (13775), `add_match_binding` (17550),
-`add_tuple_for_bindings` (19273), `infer_for_expr` (19413),
-`infer_implicit_assign_binding` (19661), `infer_var_decl_expr` (19932),
-`question_bind_result` (20085), `add_concurrent_result_binding` (20731),
-`infer_with_error_mapper` (21101), `infer_with_body` (21311),
-`infer_concurrent_for_body` (21597), `infer_select_arm_body` (21776),
-`if_refined_then_context` (18738).
+- Setup derived before the loops (7559-7585): `callable_headers`,
+  `type_headers`, `bound_graph`, `definition_table`, the `modules` list
+  (target concatenated with every bound module), `base_positions_by_module_id`
+  and an empty `header_products` table. These are already hoisted; nothing
+  to do here except pass them down.
+- Loop 1 (7590-7604): `module_header_product_table_ensure` per module and
+  per visible import per module. A module imported by forty modules is
+  ensured forty times; the hit path must be checked for allocation
+  (the returned table, the `bound_module_visible_import_modules` list).
+- Loop 2 (7605-7631): `prepared_module_environment_base_state`
+  (7437-7515) per module. Inside it, per module: a fresh
+  `TypecheckState`, `typecheck_prescan_known_type_names`, three
+  `prepare_*_type_authority` calls that each thread and return the state,
+  `accepted_global_authority_for_module`, `register_module_view_type_facts`,
+  `module_header_product_table_section` for the local section,
+  `typecheck_register_import_modules_from` over every visible import, and
+  `typecheck_install_module_header_section`. Then `bases.append` of a
+  `PreparedModuleCallableBase` that holds the whole state plus
+  `local_type_names_from_decls` over the module's declarations.
+- Loops 3 to 6 (7632-7860): per trait header, per base (preliminary trait
+  authority), per callable header, per implementation header, each doing
+  `bases.set(index, { base | state = ... })`. Every `set` of a record with
+  a `TypecheckState` inside it is a record update on a shared list
+  element; whether it copies depends on the reuse gates (see the traps in
+  the shared context), and `prepare_accepted_module_callable` returns a
+  new base per callable header (13,000 or more callables).
+- Loop 7 (7860-7920): per base, install the callable and trait
+  authorities, `prepared_canonical_module_environment` (7516), and the
+  `issues` append.
 
 **Cuts, in order.**
 
-1. Introduce the key. The program-wide `SourceNameTable`
-   (`graph/source_name_table.brp:30-39`, `spellings: List[String]`,
-   `id_by_spelling: Dict[String, Int]`) already exists in the typecheck
-   session. Add an `Env`-level accessor that turns a `String` into its
-   `SourceNameId` through `source_name_table_find_id`, inserting on a miss
-   if the table permits it (it is built during the graph phase; if it is
-   frozen by body-checking time, add a per-session local-name table with
-   the same shape for names that only occur as locals). Do this once at the
-   top of `lookup_bare_value` and once in `env_add_symbol`.
-2. Change `Scope.symbols_by_name` to `Dict[Int, List[Int]]` keyed by the
-   name id; `scope_add_symbol` and `scope_lookup` take the id. `Symbol` keeps
-   its `name: String` for diagnostics. All external callers go through
-   `env_lookup`, `env_lookup_with_scope_depth` (746-762),
-   `env_symbols_named`, `env_lookup_in_current_scope` and the
-   `env_add_*` wrappers (776, 804, 826, 1003, 1389, 1491, 1556, 1620); each
-   gains an id parameter or resolves the id at its entry. Do not leave a
-   String-keyed twin alive "for compatibility".
-3. Remove the fallback scan. `env_symbols_named` exists because
-   `env_lookup` returns the first hit even when visibility filtering will
-   reject it. Make the walk take the visibility predicate
-   (`symbol_is_lexical_or_current_module`, see `lookup_bare_value`) so it
-   returns the first *visible* hit and the all-matches scan is only reached
-   for genuine ambiguity. Count how often the fallback still fires with a
-   temporary counter under `BLORP_TYPECHECK_BODY_METRICS` before and after
-   and put both numbers in the commit body; then delete the counter.
-4. Measure after each cut.
+1. Attribute inside `global_prepare` before touching it. Add temporary
+   `typecheck_phase_mark` / `record_typecheck_phase` rows around each of
+   the seven loops named above: `prepare_products`, `prepare_bases`,
+   `prepare_traits`, `prepare_trait_authority`, `prepare_callables`,
+   `prepare_impls`, `prepare_environments`. One fast-loop run in the T-D
+   worktree (or on main once it lands); put the seven numbers in the commit
+   body. If T-F has landed, cross-check against its ranking for
+   `prepare_accepted_module_callable`, `typecheck_register_import_modules_from`
+   and the three `prepare_*_type_authority` helpers. Keep the rows if they
+   cost nothing with metrics off (a disabled mark is one probe call).
+2. Cut the loop that dominates:
+   - If `prepare_callables` dominates: `prepare_accepted_module_callable`
+     is called once per callable header and returns a whole
+     `PreparedModuleCallableBase`, which `bases.set` then stores. Group the
+     callable headers by owner module first (one pass over
+     `callable_header_graph_callables` into a `List[List[Int]]` indexed by
+     base position), then process each module's callables in one call that
+     owns the base as a local and appends to `callables` without returning
+     the record per header. Same shape for the trait and implementation
+     loops if their rows are large.
+   - If `prepare_bases` dominates: the per-module setup in
+     `prepared_module_environment_base_state` is the "shared pre-loop
+     setup" this cut is named for. Split it: the parts that depend only on
+     graph-wide inputs (`type_headers`, the accepted alias, record, union
+     and global tables) are built once before the loop as a
+     `PreparedModuleSetup` record and borrowed; the per-module part
+     (prescan, binding diagnostics, the module's own authorities, import
+     registration) reads from it. In particular check whether
+     `prepare_type_alias_authority`, `prepare_record_type_authority` and
+     `prepare_union_type_authority` rebuild anything from the whole table
+     per module rather than selecting the module's slice.
+   - If `prepare_products` dominates: make the hit path of
+     `module_header_product_table_ensure` allocation-free and ensure each
+     import module once by collecting the distinct import module ids first.
+3. Stop threading the state through `bases.set`. Whatever loop you cut,
+   the base list update `bases = bases.set(index, { base | state = ... })`
+   should become an update of a local that is written back once per
+   module, not once per header. Check with `--dump-core-after=perceus` on
+   a small program that the update is in place (the reuse gate notes in
+   the shared traps).
+4. Measure the `global_prepare` row with the fast loop after each cut, then
+   run the acceptance harness. Land as one squash commit with the row before
+   and after and the cut-1 split in the body.
 
-**Tests.** `type_system/test_env.brp` (2,117 lines; shadowing, scope depth,
-visibility cases live here), `test_infer.brp`, and
-`test_env_symbols_named_profile_benchmark.brp`, which is the existing
-regression test for cut 3. Add cases for: a local shadowing an imported
-callable, a match binding shadowing a lambda parameter, and a name that
-exists only in an outer module scope.
+**Acceptance.** The `global_prepare` row is the metric: down 40% or more.
+`typed_frontend_complete` down 1.5% or more on the harness. The
+`module_bodies` row must not rise: the environments this function builds
+are read by every body through `typecheck_session_for_prepared_module`
+(7920), so a cut that leaves the environments cheaper to build but more
+expensive to read is not a win. Identical C; small program not regressed;
+instructions within 0.3%.
 
-**Traps.** Diagnostics print `Symbol.name`, not the key; keep the text on
-the symbol. `env_symbols_named` returns matches in scope order and callers
-may depend on that order for ambiguity messages; preserve it. Do not put the
-name id on `ParsedIdentifier` in this issue (that is a parser change with
-its own identity oracle); resolve the id at the `Env` boundary.
+**Tests.** `test_typecheck_decl.brp` (global ordering and cycle
+diagnostics), `test_global_header_dependency_profile_benchmark.brp`,
+`test_typecheck_body_metrics.py` (the `global_*` rows and their counts),
+`test_accepted_record_authority.brp`, `test_accepted_union_authority.brp`,
+`test_accepted_alias_authority.brp`, and `fixtures/typecheck/should_fail`
+cases that mention globals, imports, traits or cycles. Add one test where a
+global initializer references a callable from an imported module and one
+where a module declares a trait, an implementation and a callable so all
+four per-header loops touch the same base, asserting the same diagnostics
+before and after.
 
----
-
-## Issue T-C: Flatten the per-node typed facts
-
-**Goal.** Every `TypedExpr` node carries a `TypedExprInfo` record and, in
-the common case, a boxed `KeptValueSlot`, so a body of N nodes costs at
-least 2N allocations before any inference happens; the phase averages about
-2,100 allocations per body over 13,314 bodies. Remove the boxes that carry
-no information in the common case. Target: `typed_frontend_complete`
-allocations down 8% or more; C identical.
-
-**Where.** `infer.brp`:
-
-- `TypedExprInfo` (536-544): `source_type: Option[SemanticType]`,
-  `origin: ExprTypeOrigin`, `value_slot: ValueSlot`, `proofs: ValueProofs`,
-  `resolved_call: Option[ResolvedCallInfo]`,
-  `resolved_definition_id: Option[Int]`, `resource_dependencies: List[String]`.
-- `ValueSlot` (`type_system/type_widening.brp:65-67`):
-  `KeptValueSlot(SemanticType)` or `WidenedValueSlot(SemanticType, SemanticType, TypeWideningReason)`.
-  `KeptValueSlot` is constructed 18 times in infer.brp; it is the common
-  case and it boxes one pointer.
-- `ExprTypeOrigin` (473-476): `InferredOrigin` (no payload, free),
-  `ExplicitAnnotationOrigin(SemanticType)`, `SynthesizedOrigin(String)`.
-- `ResolvedCallInfo` (506-518): 12 fields including three lists; built by
-  seven `resolved_call_from_*` helpers (1510, 1577, 1645, 1682, 1704, 1723, 1747).
-- The near-universal constructor is `typed_expr_info_from_slot` (1373-1387),
-  called from 17 sites (1395, 6849, 7339, 7408, 7432, 7461, 7517, 7581, 8883,
-  8895, 8917, 8938, 10457, 10775, 13740, 16405) and wrapped by
-  `inferred_info` (1391-1400).
-- Readers: the accessors at `infer.brp:1779-2012` (`typed_expr_info`,
-  `typed_expr_value_type`, `typed_expr_resolved_call`, `typed_expr_widening`,
-  ...); `typed_ast_json.brp` reads the fields directly (61 sites, e.g.
-  784-791 and the `resolved_call_to_json` family 415-655); `stage_07_ctfe`
-  reads `typed_expr_resolved_call` and `typed_expr_value_type` (`ir.brp:388,
-  961, 986, 1050`, `body_dependencies.brp:61`); `stage_08_core_lower/lower.brp`
-  reads `typed_expr_value_type` at 21 sites (1893, 2101, 2164, 2296, 2659 and
-  others); `graph/typed_expr_children.brp` and the LSP read no info fields.
-- The zonk rebuilds info per node in `zonk_typed_expr_info` (2968-2978) for
-  the 0.7% of bodies that still have metas.
-
-**Cuts, in order.**
-
-1. Measure the shape first. Add a temporary counter under
-   `BLORP_TYPECHECK_BODY_METRICS` that counts `TypedExprInfo` constructions
-   and how many have `value_slot` kept, `origin` inferred, `resolved_call`
-   none, `proofs` empty, `resource_dependencies` empty. Put the five ratios
-   in the commit body; they justify cut 2 and 3. Remove the counter after.
-2. Unbox the value slot. Replace `value_slot: ValueSlot` with
-   `slot_type: SemanticType` and `widening: Option[TypeWidening]` where
-   `TypeWidening` holds the widened-from type and the reason. `KeptValueSlot`
-   becomes "widening is `None`", so the common node allocates no slot box.
-   Update `typed_expr_info_from_slot`, the accessors, `zonk_value_slot`, and
-   `value_slot_to_json`; `typed_ast_json` must produce the same JSON as
-   before (the `test_typed_ast_json.brp` suite is the oracle).
-3. Share the empties. If cut 1 shows `proofs` and `resource_dependencies`
-   are empty on nearly every node, make the constructors reuse one
-   program-lifetime empty value instead of building a fresh empty list or
-   record per node (check whether `[]` already shares; if it does, this cut
-   is a no-op and you say so).
-4. Only if cuts 2 and 3 leave the target unmet: split `TypedExprInfo` into
-   the always-present part (`slot_type`, `origin`, `widening`,
-   `resolved_definition_id`) stored inline on the node, and a
-   `Option[TypedExprExtras]` holding `source_type`, `proofs`,
-   `resolved_call`, `resource_dependencies`, allocated only when one of them
-   is non-default. This touches every `TypedExpr` variant (60 or more at
-   `infer.brp:679`) and every construction site; do it with the central
-   builder and let the exhaustiveness errors find the rest.
-
-**Tests.** `test_infer.brp`, `test_typed_ast_json.brp` (JSON must be
-byte-identical for every fixture), `test_typecheck_bridge.brp`, plus the
-CTFE and lowering suites that read the accessors
-(`blorp/test/compiler/stage_07_ctfe`, `stage_08_core_lower`).
-
-**Traps.** `WidenedValueSlot` carries two types; keep both. `zonk` must
-still resolve metas inside `slot_type` and inside the widening. Do not
-move to node-index side tables in this issue; that is the flat typed AST
-and needs its own oracle.
+**Traps.** The order of diagnostics inside one module follows the order
+the loops append errors to the base state (trait errors, then callable
+errors after `callable_error_start`, then implementation errors); regrouping
+the loops per module must keep that order or the should_fail fixtures move.
+`callable_error_start` is read after the preliminary trait authority loop
+and `callable_errors` is sliced from it; if the state is no longer threaded
+through `bases`, compute both from the local. The global pass sees the
+*initial* global table (`initial_global_table` at 8263) on purpose; keep it
+an input of the per-module part, never of anything shared with body
+checking. `allow_debug_only_calls` is constant per compile and belongs in
+the shared setup; `prepared_module_environment_accepts_request` (8918)
+compares it per environment, so keep it on `module_facts` too. Do not move
+CTFE work: `ctfe_globals` runs after completion and reads the completed
+table.
 
 ---
 
-## Issue T-D: Global header completion is a fifth of the phase
+## Retired issues
 
-**Goal.** `global_header_completion` costs 834 ms and 6.6M allocations,
-more than a fifth of the typed frontend, for what should be a dependency
-sort over globals and inference of the unannotated ones. Attribute it, then
-cut the largest component. Target: the `global_header_completion` phase row
-down 30% or more in allocations; C identical.
+Kept as one paragraph each so the next wave does not rewrite them.
 
-**Where.** `decl.brp`: `complete_typecheck_graph` (8839-8853) runs once per
-compile from `bridge.brp:978-989` and calls
-`complete_typecheck_graph_for_meta_run` (8723-8836), which times
-`accepted_aliases`, `accepted_records`, `accepted_unions`, `accepted_globals`,
-then `complete_global_header_graph` (8416-8449, the 834 ms row), then
-`accepted_graph`. `complete_global_header_graph` builds a
-`GlobalHeaderCompletionPlan` via `global_header_completion_plan_build`
-(`headers/global_header_completion.brp:679-733`): it iterates every global
-header in the program (`callable_header_graph_globals`), splits annotated
-from pending, builds `global_dependency_adjacency` over the pending ones and
-orders them with `pending_global_dependency_order`, then the completion
-infers each pending global's type in that order. The body-metrics row
-`complete_planned_global_headers` (a `decl.brp` function) is where the
-inference happens.
-
-**Cuts, in order.**
-
-1. Attribute. Wrap the three sub-steps (plan build, annotated installs,
-   pending inference) in `typecheck_phase_mark` / `record_typecheck_phase`
-   rows (the pattern is in `complete_typecheck_graph_for_meta_run`) named
-   `global_plan`, `global_annotated`, `global_pending`. Also print the
-   counts: globals total, annotated, pending, and how many pending globals
-   are in the compiler's own modules versus the standard library. Put the
-   table in the commit body. This cut lands on its own; the rows are
-   permanent.
-2. Cut whichever row dominates:
-   - If `global_pending` dominates: each pending global is inferred with a
-     fresh inference session; check whether the session setup
-     (`InferSession` construction, environment install for the global's
-     module) is rebuilt per global and hoist it per module. The
-     per-module header product from `6ccd89809`
-     (`headers/type_header_install.brp:563-580`,
-     `module_header_product_table_ensure` 787-816) is the model: build once
-     per module, read per global.
-   - If `global_plan` dominates: `global_dependency_adjacency` is likely
-     computing dependencies by scanning each global's initializer for names
-     and resolving them by string; key it by definition id (Issue T-A gives
-     you the dense index) and build the adjacency as a `List[List[Int]]`.
-   - If `global_annotated` dominates: annotated globals need no inference;
-     find what is being rebuilt for them and stop.
-3. Measure with the fast loop after each cut; the phase row is the metric.
-
-**Tests.** `test_typecheck_decl.brp` (global ordering and cycle diagnostics
-live here), `test_global_header_dependency_profile_benchmark.brp` (existing
-regression test for the plan), `fixtures/typecheck/should_fail` cases that
-mention globals or cycles.
-
-**Traps.** The order in which pending globals are inferred determines which
-diagnostic is reported first for a cycle; keep
-`pending_global_dependency_order` stable. Globals can depend on CTFE
-results (`ctfe_globals` runs after); do not move CTFE work.
-
----
-
-## Issue T-E: Resolve each identifier once per body (design, then cut 1)
-
-**Goal.** Longer term, a use site should carry the definition id or local
-slot it resolved to, so inference and every later stage read an id instead
-of re-walking scopes by name. Today `TypedNameExpr(ParsedIdentifier, TypedExprInfo)`
-keeps only `ParsedIdentifier.text` and `resolved_definition_id: Option[Int]`
-(set for callables and globals, `None` for locals); the scope index used to
-resolve a local is discarded. This issue delivers the design and the first
-cut, and depends on T-B.
-
-**Deliverable 1, design note (`docs/`, under 120 lines).** What a per-body
-resolution table looks like: one row per identifier occurrence in source
-order (occurrence index minted by the parser or by a pre-pass over the
-parsed body), row = `Local(slot)` or `Definition(DefinitionId)` or
-`Constructor(...)`, built by one walk that mirrors the binder call sites
-listed in T-B; who consumes it (inference reads the row instead of calling
-`lookup_bare_value`; lowering reads the id instead of the name; the
-definition table published out of typecheck, the parked `perf/definition-table`
-branch, becomes the consumer's index). Say what the parser must add
-(an occurrence index on `ParsedIdentifier`, or a side counter in the
-finalizer) and what the identity oracle is (typed JSON and diagnostics
-unchanged).
-
-**Deliverable 2, cut 1.** Give locals an id: when `env_add_var_with_details`
-binds a local, mint a per-body slot number and store it on the `Symbol`;
-when `infer_name_expr` resolves a `BareEnvSymbol`, put that slot into
-`resolved_definition_id` (or a new `resolved_local_slot: Option[Int]` if the
-two id spaces must not mix; prefer a single `ResolvedName` union with
-`LocalSlot(Int)` and `Definition(Int)` arms and delete the bare
-`Option[Int]`). Lowering's `lower.brp` currently reconstructs local identity
-by name and uniq; find where (grep `uniq` in `lower.brp`) and read the slot
-instead. Acceptance for cut 1 is identical C and no allocation regression;
-the win arrives when lowering stops rebuilding its name maps, which is the
-follow-up.
-
-**Tests.** `test_infer.brp`, `test_typed_ast_json.brp` (a new field must be
-serialized deterministically), lowering suites.
-
-**Traps.** Shadowing: two locals with the same name in one body must get
-different slots and the typed JSON must show which was resolved. Closures
-capture locals by name today (`closure.brp` `free_vars_expr`); keep the name
-until the capture path reads slots too.
+- **T-A, dense authority tables.** Rejected on measurement. The
+  `Int -> Int` dictionaries in `accepted_global_authority.brp` and
+  `accepted_callable_authority.brp` and the `String`-keyed
+  `FuncCallableNameBuckets` in `graph/definition_index.brp` are probe cost,
+  not allocation cost. Converting them is a cleanliness change to be done
+  when a file is open for another reason, not a perf task.
+- **T-B, scope lookup keyed by name id.** Blocked; retired as written. The
+  `Scope.symbols_by_name: Dict[String, List[Int]]` shape in
+  `type_system/env.brp` stands. Given T-A's result the allocation claim in
+  T-B (fewer key copies) is unproven; if T-F ranks `scope_lookup`,
+  `env_lookup` or `env_symbols_named` in its top twenty, rewrite the issue
+  from that row.
+- **T-C, flatten the per-node typed facts.** Rejected on measurement:
+  1.406% for the value-slot unboxing, 2.889% ceiling for the full split.
+  Reverted so the `TypedExprInfo` / `ValueSlot` shape in `infer.brp` is
+  unchanged. Not worth a second pass unless the node count itself falls.
+- **T-D cut 1, attribute global header completion.** Accepted; see the
+  results above. Cut 2 is rewritten above around the row it found.
+- **T-E, resolve each identifier once per body.** Blocked on T-B; retired
+  as written. The design deliverable (a per-body resolution table read by
+  inference and lowering) remains a good idea for the flat typed AST work,
+  where it needs its own oracle.
 
 ---
 
 ## Order and parallelism
 
-T-A and T-C touch different files and can run in parallel. T-B follows T-A
-(it wants the name-id key). T-D is independent and can start at any time;
-its cut 1 is attribution only and should land within a day. T-E starts
-after T-B lands. Each issue is one squash commit on main with the
-measurement record folded into the commit body; record the accepted
-harness JSON under `benchmarks/results/self_compile_<issue>_O2_<date>.json`.
+T-F runs first and alone; it is the input to every later cut. T-D cut 2
+may start in parallel because its row is already attributed by T-D cut 1
+and its target is a different phase from the body loop that T-F ranks, but
+its own attribution step (the seven loop rows inside `global_prepare`)
+must be in the commit body before a loop is rewritten. After T-F lands,
+new body-loop issues are written one per helper from its table, each with
+the helper's calls, allocations and allocations per call as the opening
+line. Each issue is one squash commit on main with the measurement record
+folded into the commit body; record the accepted harness JSON under
+`benchmarks/results/self_compile_<issue>_O2_<date>.json`.
