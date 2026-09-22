@@ -811,6 +811,17 @@ import:
 		TupleConstructWithRcArgs,
 		TupleRetainElemArgs,
 		render_prepared_tuple_op,
+	profile_renderer:
+		ProfileEmissionPlan,
+		ProfileFunctionId,
+		ProfileFunctionMetadata,
+		emit_profile_end,
+		emit_profile_metadata,
+		emit_profile_metadata_extern_decl,
+		emit_profile_runtime_setup,
+		emit_profile_start,
+		profile_function_id_at_cursor,
+		profile_function_requires_exit,
 	static_string_literal_pool:
 		BackendStaticStringLiteral,
 		StaticStringLiteralPoolError(
@@ -971,33 +982,6 @@ pure func core_emit_error_message(error: CoreEmitError) -> String:
 private DEFAULT_PROFILE_CONFIGURATION: FunctionProfileConfiguration = FunctionProfileOff
 
 private MANGLED_DEF_ID_PREFIX: String = "__def_"
-
-
-private struct ProfileFunctionId {
-	value: Int,
-	mode: FunctionProfileMode
-}
-
-
-private record ProfileFunctionMetadata {
-	logical_name: String,
-	c_symbol: String,
-	module_path: Option[String],
-	definition_id: Int
-}
-
-
-private record ProfileEmissionPlan {
-	mode: FunctionProfileMode,
-	described_count: Int,
-	functions: List[ProfileFunctionMetadata]
-}
-
-
-private record ProfileSelectorIndex {
-	modules: Dict[String, Bool],
-	functions: Dict[String, Bool]
-}
 
 
 private BASE_INDENT: String = "  "
@@ -1482,6 +1466,12 @@ private pure func described_profile_functions(
 	functions
 
 
+private record ProfileSelectorIndex {
+	modules: Dict[String, Bool],
+	functions: Dict[String, Bool]
+}
+
+
 private pure func profile_selector_index(
 	functions: List[ProfileFunctionMetadata],
 	selectors: List[FunctionProfileSelector],
@@ -1609,68 +1599,6 @@ private pure func profile_emission_plan(
 				}))
 
 
-private pure func emit_profile_metadata(
-	plan: Option[ProfileEmissionPlan],
-	internal_type_linkage: Bool,
-) -> String:
-	match plan:
-		Some(profile_plan):
-			if profile_plan.functions.length() == 0:
-				""
-			else:
-				var rows: String = make_string(0)
-
-				for metadata in profile_plan.functions:
-					module_path: String = match metadata.module_path:
-						Some(path):
-							c_string_literal(path)
-						None:
-							"NULL"
-
-					flags: String = if metadata.module_path.is_some():
-						"BLORP_PROFILE_METADATA_HAS_MODULE"
-					else:
-						"0u"
-
-					rows += "  {" + c_string_literal(
-						metadata.logical_name,
-					) + ", " + c_string_literal(
-						metadata.c_symbol,
-					) + ", " + module_path + ", " + metadata.definition_id.to_string() + ", " + flags + "},\n"
-
-				profile_mode_name: String = match profile_plan.mode:
-					FunctionProfileCallsMode:
-						"calls"
-					FunctionProfileExactMode:
-						"exact"
-					FunctionProfileOffMode:
-						"off"
-
-				storage_class: String = if internal_type_linkage:
-					"static const "
-				else:
-					"const "
-
-				"/* BLORP_PROFILE mode=" + profile_mode_name + " functions_described=" + profile_plan.described_count.to_string() + " functions_selected=" + profile_plan.functions
-					.length()
-					.to_string() + " */\n" + storage_class + "blorp_ProfileFunctionMetadata __blorp_profile_functions[" + profile_plan.functions
-					.length()
-					.to_string() + "] = {\n" + rows + "};\n\n"
-		None:
-			""
-
-
-private pure func emit_profile_metadata_extern_decl(plan: Option[ProfileEmissionPlan]) -> String:
-	match plan:
-		Some(profile_plan):
-			if profile_plan.functions.length() == 0:
-				""
-			else:
-				"extern const blorp_ProfileFunctionMetadata __blorp_profile_functions[];\n"
-		None:
-			""
-
-
 private pure func c_function_signature(
 	func_info: CoreFunction,
 	symbol_authority: CEmissionSymbolAuthority,
@@ -1718,63 +1646,6 @@ private pure func entrypoint_arg_cleanup(func_info: CoreFunction) -> String:
 		"  blorp_release(" + entrypoint_arg_name(func_info.params) + ");\n"
 	else:
 		""
-
-
-private pure func emit_profile_runtime_setup(plan: Option[ProfileEmissionPlan]) -> String:
-	match plan:
-		Some(profile_plan):
-			profile_mode: String = match profile_plan.mode:
-				FunctionProfileCallsMode:
-					"BLORP_PROFILE_MODE_CALLS"
-				FunctionProfileExactMode:
-					"BLORP_PROFILE_MODE_EXACT"
-				FunctionProfileOffMode:
-					"BLORP_PROFILE_MODE_OFF"
-
-			"  if (blorp_profile_enable(" + profile_mode + ", __blorp_profile_functions, " + profile_plan.functions
-				.length()
-				.to_string() + ", " + profile_plan.described_count.to_string() + ") != 0) return 1;\n"
-		None:
-			""
-
-
-private pure func emit_profile_start(profile_function_id: Option[ProfileFunctionId]) -> String:
-	match profile_function_id:
-		Some(id):
-			match id.mode:
-				FunctionProfileCallsMode:
-					"  blorp_profile_count_id(" + id.value.to_string() + ");\n"
-				FunctionProfileExactMode:
-					"  blorp_profile_start_id(" + id.value.to_string() + ");\n"
-				FunctionProfileOffMode:
-					""
-		None:
-			""
-
-
-private pure func emit_profile_end(
-	indent: String,
-	profile_function_id: Option[ProfileFunctionId],
-) -> String:
-	match profile_function_id:
-		Some(id):
-			match id.mode:
-				FunctionProfileExactMode:
-					indent + "blorp_profile_end_id(" + id.value.to_string() + ");\n"
-				FunctionProfileCallsMode | FunctionProfileOffMode:
-					""
-		None:
-			""
-
-
-private pure func profile_function_requires_exit(
-	profile_function_id: Option[ProfileFunctionId],
-) -> Bool:
-	match profile_function_id:
-		Some(id):
-			id.mode == FunctionProfileExactMode
-		None:
-			False
 
 
 private pure func c_param_list(params: List[CoreParam]) -> String:
@@ -25423,35 +25294,6 @@ private pure func emit_global_init_function(
 					"void " + GLOBAL_INIT_FUNCTION_NAME + "(void) {\n" + statements + cleanup_registration + "}\n\n",
 				),
 			)
-
-
-private pure func profile_metadata_matches_function(
-	metadata: ProfileFunctionMetadata,
-	func_info: CoreFunction,
-) -> Bool:
-	metadata.definition_id == func_info.def_id and metadata.module_path == func_info.source_module
-
-
-private pure func profile_function_id_at_cursor(
-	profile_plan: Option[ProfileEmissionPlan],
-	next_profile_id: Int,
-	func_info: CoreFunction,
-) -> Option[ProfileFunctionId]:
-	match profile_plan:
-		Some(plan):
-			match plan.functions.get(next_profile_id):
-				Some(metadata):
-					if profile_metadata_matches_function(metadata, func_info):
-						Some({
-							value = next_profile_id,
-							mode = plan.mode,
-						})
-					else:
-						None
-				None:
-					None
-		None:
-			None
 
 
 ---
