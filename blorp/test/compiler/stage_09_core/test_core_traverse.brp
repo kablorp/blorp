@@ -1,26 +1,36 @@
 import:
 	../../../src/compiler/stage_09_core/ir:
+		CoreBinaryOp(AddOp),
 		CoreCallKind(BuiltinCall),
 		CoreDictLiteralEntry,
 		CoreExpr(
+			BinaryExpr,
 			CallExpr,
 			DictExpr,
+			ForRangeExpr,
 			IfExpr,
 			LiteralExpr,
 			LiteralMatchExpr,
 			LogicalExpr,
+			PreClosureConcurrentExpr,
 			PreClosureDetachExpr,
+			RawMatchExpr,
 			RecordCowUpdateExpr,
 			RecordExpr,
 			SelectExpr,
 			SemanticMatchExpr,
 			SeqExpr,
+			StringByteCopyExpr,
+			TensorRawFillExpr,
 			VarExpr,
+			VoidExpr,
 		),
 		CoreLiteral(IntLiteral),
 		CoreLiteralMatchCase,
 		CoreLiteralMatchFallback(LiteralMatchFallbackBody),
 		CoreLogicalOp(AndOp),
+		CoreLoopBinder,
+		CoreLoopRangeDirection(RangeForwardOnly),
 		CorePattern(
 			ConstructorPattern,
 			ListPattern,
@@ -31,6 +41,8 @@ import:
 			TuplePattern,
 			WildcardPattern,
 		),
+		CorePreClosureConcurrentBinding,
+		CoreRawMatchCase,
 		CoreRecordCowField,
 		CoreRecordFieldValue,
 		CoreReleasePolicy(NoReleasePolicy),
@@ -39,17 +51,28 @@ import:
 		CoreSemanticMatchAccessor(RootSemanticMatchAccessor),
 		CoreSemanticMatchTree(SemanticLiteralMatch, SemanticMatchFail, SemanticMatchLeaf),
 		CoreSourceLoc(SyntheticSourceLoc),
+		CoreTensorRawScalarKind(TensorFloat64Elements),
 		CoreType(HeapRecordType, NamedType, VoidType),
 		CoreVar,
 		core_expr_to_json,
 	../../../src/compiler/stage_09_core/traverse:
+		CoreMapState,
 		core_pattern_binds_name,
 		core_pattern_bound_names,
+		map_core_aggregate_children_with_state,
+		map_core_concurrency_children_with_state,
 		map_core_expr_children,
 		map_core_expr_children_and_types_with_context,
 		map_core_expr_children_with_context,
+		map_core_expr_children_with_state,
+		map_core_leaf_children_with_state,
 		map_core_logical_tree,
+		map_core_logical_tree_with_state,
+		map_core_loop_children_with_state,
+		map_core_match_children_with_state,
+		map_core_operator_children_with_state,
 		map_core_sequence_items,
+		map_core_storage_children_with_state,
 		rebuild_core_sequence,
 		split_core_sequence,
 	memory: same_object
@@ -546,6 +569,561 @@ pure func test_pattern_binding_membership_matches_ordered_projection() -> Bool:
 	equivalent
 
 
+-- ============================================================================
+-- Stateful traversal: sibling order and state threading, per node family.
+
+pure func record_visit_order(
+	state: List[String],
+	expr: CoreExpr,
+) -> CoreMapState[List[String], CoreExpr]:
+	match expr:
+		VarExpr(variable, _, _):
+			{ state = state.append(variable.name), value = replacement_expr() }
+		_:
+			{ state = state, value = expr }
+
+
+pure func state_identity_expr(state: Int, expr: CoreExpr) -> CoreMapState[Int, CoreExpr]:
+	{ state = state, value = expr }
+
+
+pure func test_state_leaf_family_passes_state_through_unchanged() -> Bool:
+	shapes: List[CoreExpr] = [
+		var_expr("leaf"),
+		LiteralExpr(IntLiteral(7), int_type(), SyntheticSourceLoc),
+		VoidExpr(VoidType, SyntheticSourceLoc),
+	]
+	var all_ok: Bool = True
+
+	for shape in shapes:
+		result: CoreMapState[Int, CoreExpr] = map_core_leaf_children_with_state(
+			3,
+			state_identity_expr,
+			shape,
+		)
+
+		if not (same_object(result.value, shape) and result.state == 3):
+			all_ok = False
+
+	all_ok
+
+
+pure func test_state_operator_family_threads_binary_sibling_order() -> Bool:
+	expr: CoreExpr = BinaryExpr(
+		AddOp,
+		var_expr("left"),
+		var_expr("right"),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	result: CoreMapState[List[String], CoreExpr] = map_core_operator_children_with_state(
+		[],
+		record_visit_order,
+		expr,
+	)
+	expected: CoreExpr = BinaryExpr(AddOp, replacement_expr(), replacement_expr(), int_type(), SyntheticSourceLoc)
+
+	result.state == ["left", "right"] and core_exprs_equal(result.value, expected)
+
+
+pure func test_state_operator_family_threads_if_sibling_order() -> Bool:
+	expr: CoreExpr = IfExpr(
+		var_expr("cond"),
+		var_expr("then_branch"),
+		var_expr("else_branch"),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	result: CoreMapState[List[String], CoreExpr] = map_core_operator_children_with_state(
+		[],
+		record_visit_order,
+		expr,
+	)
+
+	result.state == ["cond", "then_branch", "else_branch"]
+
+
+pure func test_state_operator_family_identity_mapper_reuses_shape() -> Bool:
+	shapes: List[CoreExpr] = [
+		SeqExpr(var_expr("first"), var_expr("second")),
+		IfExpr(
+			var_expr("cond"),
+			var_expr("then_branch"),
+			var_expr("else_branch"),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+	]
+	var reused: Int = 0
+
+	for shape in shapes:
+		result: CoreMapState[Int, CoreExpr] = map_core_operator_children_with_state(
+			0,
+			state_identity_expr,
+			shape,
+		)
+
+		if same_object(result.value, shape):
+			reused += 1
+
+	reused == shapes.length()
+
+
+pure func test_state_aggregate_family_threads_call_args_order() -> Bool:
+	expr: CoreExpr = CallExpr(
+		BuiltinCall("blorp_print"),
+		var_expr("callee"),
+		[var_expr("a"), var_expr("b"), var_expr("c")],
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	result: CoreMapState[List[String], CoreExpr] = map_core_aggregate_children_with_state(
+		[],
+		record_visit_order,
+		expr,
+	)
+
+	result.state == ["callee", "a", "b", "c"]
+
+
+pure func test_state_aggregate_family_threads_record_cow_update_order() -> Bool:
+	cow_field: CoreRecordCowField = {
+		field = {
+			name = "changed",
+			typ = int_type(),
+			release_policy = NoReleasePolicy
+		},
+		replacement = Some(var_expr("replacement"))
+	}
+	expr: CoreExpr = RecordCowUpdateExpr(
+		var_expr("source"),
+		[cow_field],
+		HeapRecordType("Pair"),
+		SyntheticSourceLoc,
+	)
+	result: CoreMapState[List[String], CoreExpr] = map_core_aggregate_children_with_state(
+		[],
+		record_visit_order,
+		expr,
+	)
+
+	-- Fields visit before source, matching `immediate_core_expr_children`'s
+	-- `fields...concat([source])` order.
+	result.state == ["replacement", "source"]
+
+
+pure func test_state_aggregate_family_threads_select_arm_order() -> Bool:
+	recv_arm: CoreSelectArm = {
+		kind = SelectRecvArm({
+			binder = named_var("item"),
+			elem_type = int_type(),
+			channel = var_expr("channel"),
+		}),
+		body = var_expr("recv_body"),
+		loc = SyntheticSourceLoc
+	}
+	after_arm: CoreSelectArm = {
+		kind = SelectAfterArm(var_expr("timeout")),
+		body = var_expr("after_body"),
+		loc = SyntheticSourceLoc
+	}
+	expr: CoreExpr = SelectExpr([recv_arm, after_arm], VoidType, SyntheticSourceLoc)
+	result: CoreMapState[List[String], CoreExpr] = map_core_aggregate_children_with_state(
+		[],
+		record_visit_order,
+		expr,
+	)
+
+	-- Each arm's kind visits before its body, matching
+	-- `immediate_core_expr_children`'s `select_arm_kind_items(arm.kind).append(arm.body)`.
+	result.state == ["channel", "recv_body", "timeout", "after_body"]
+
+
+pure func test_state_aggregate_family_identity_mapper_reuses_shape() -> Bool:
+	dict_entry: CoreDictLiteralEntry = {
+		key = var_expr("key"),
+		value = var_expr("value")
+	}
+	record_field: CoreRecordFieldValue = {
+		name = "field",
+		value = var_expr("field_value")
+	}
+	shapes: List[CoreExpr] = [
+		CallExpr(
+			BuiltinCall("blorp_print"),
+			var_expr("callee"),
+			[var_expr("first_arg"), var_expr("second_arg")],
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		DictExpr([dict_entry], int_type(), SyntheticSourceLoc),
+		RecordExpr([record_field], HeapRecordType("Pair"), SyntheticSourceLoc),
+		SelectExpr(
+			[{
+				kind = SelectAfterArm(var_expr("timeout")),
+				body = var_expr("after_body"),
+				loc = SyntheticSourceLoc
+			}],
+			VoidType,
+			SyntheticSourceLoc,
+		),
+	]
+	var reused: Int = 0
+
+	for shape in shapes:
+		result: CoreMapState[Int, CoreExpr] = map_core_aggregate_children_with_state(
+			0,
+			state_identity_expr,
+			shape,
+		)
+
+		if same_object(result.value, shape):
+			reused += 1
+
+	reused == shapes.length()
+
+
+pure func test_state_logical_tree_threads_left_to_right() -> Bool:
+	expr: CoreExpr = LogicalExpr(
+		AndOp,
+		LogicalExpr(AndOp, var_expr("a"), var_expr("b"), int_type(), SyntheticSourceLoc),
+		var_expr("c"),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	result: CoreMapState[List[String], CoreExpr] = map_core_logical_tree_with_state(
+		[],
+		record_visit_order,
+		expr,
+	)
+
+	result.state == ["a", "b", "c"]
+
+
+pure func test_state_logical_tree_identity_mapper_reuses_shape() -> Bool:
+	expr: CoreExpr = LogicalExpr(
+		AndOp,
+		LogicalExpr(AndOp, var_expr("a"), var_expr("b"), int_type(), SyntheticSourceLoc),
+		var_expr("c"),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	result: CoreMapState[Int, CoreExpr] = map_core_logical_tree_with_state(
+		0,
+		state_identity_expr,
+		expr,
+	)
+
+	same_object(result.value, expr) and result.state == 0
+
+
+pure func test_state_storage_family_threads_string_byte_copy_order() -> Bool:
+	expr: CoreExpr = StringByteCopyExpr(
+		{
+			dst = var_expr("dst"),
+			dst_pos = var_expr("dst_pos"),
+			src = var_expr("src"),
+			src_pos = var_expr("src_pos"),
+			len = var_expr("len")
+		},
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	result: CoreMapState[List[String], CoreExpr] = map_core_storage_children_with_state(
+		[],
+		record_visit_order,
+		expr,
+	)
+
+	result.state == ["dst", "dst_pos", "src", "src_pos", "len"]
+
+
+pure func test_state_storage_family_threads_tensor_raw_fill_order() -> Bool:
+	expr: CoreExpr = TensorRawFillExpr(
+		{
+			raw_kind = TensorFloat64Elements,
+			value = var_expr("value"),
+			dims = [var_expr("dim0"), var_expr("dim1")]
+		},
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	result: CoreMapState[List[String], CoreExpr] = map_core_storage_children_with_state(
+		[],
+		record_visit_order,
+		expr,
+	)
+
+	-- The fill value visits before its dims, matching
+	-- `immediate_core_expr_children`'s `[fill.value].concat(fill.dims)`.
+	result.state == ["value", "dim0", "dim1"]
+
+
+pure func test_state_storage_family_identity_mapper_reuses_shape() -> Bool:
+	shapes: List[CoreExpr] = [
+		StringByteCopyExpr(
+			{
+				dst = var_expr("dst"),
+				dst_pos = var_expr("dst_pos"),
+				src = var_expr("src"),
+				src_pos = var_expr("src_pos"),
+				len = var_expr("len")
+			},
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		TensorRawFillExpr(
+			{
+				raw_kind = TensorFloat64Elements,
+				value = var_expr("value"),
+				dims = [var_expr("dim0")]
+			},
+			int_type(),
+			SyntheticSourceLoc,
+		),
+	]
+	var reused: Int = 0
+
+	for shape in shapes:
+		result: CoreMapState[Int, CoreExpr] = map_core_storage_children_with_state(
+			0,
+			state_identity_expr,
+			shape,
+		)
+
+		if same_object(result.value, shape):
+			reused += 1
+
+	reused == shapes.length()
+
+
+pure func range_binder(name: String) -> CoreLoopBinder:
+	{
+		variable = named_var(name),
+		typ = int_type(),
+		range_direction = RangeForwardOnly
+	}
+
+
+pure func test_state_loop_family_threads_for_range_order() -> Bool:
+	expr: CoreExpr = ForRangeExpr(
+		range_binder("i"),
+		var_expr("start"),
+		var_expr("end_value"),
+		var_expr("body"),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	result: CoreMapState[List[String], CoreExpr] = map_core_loop_children_with_state(
+		[],
+		record_visit_order,
+		expr,
+	)
+
+	-- Matches `immediate_core_expr_children`'s `[start, end_value, body]`.
+	result.state == ["start", "end_value", "body"]
+
+
+pure func test_state_loop_family_identity_mapper_reuses_shape() -> Bool:
+	shapes: List[CoreExpr] = [
+		ForRangeExpr(
+			range_binder("i"),
+			var_expr("start"),
+			var_expr("end_value"),
+			var_expr("body"),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+	]
+	var reused: Int = 0
+
+	for shape in shapes:
+		result: CoreMapState[Int, CoreExpr] = map_core_loop_children_with_state(
+			0,
+			state_identity_expr,
+			shape,
+		)
+
+		if same_object(result.value, shape):
+			reused += 1
+
+	reused == shapes.length()
+
+
+pure func test_state_concurrency_family_threads_pre_closure_block_order() -> Bool:
+	binding_one: CorePreClosureConcurrentBinding = {
+		variable = named_var("b1"),
+		typ = int_type(),
+		rhs = var_expr("rhs1")
+	}
+	binding_two: CorePreClosureConcurrentBinding = {
+		variable = named_var("b2"),
+		typ = int_type(),
+		rhs = var_expr("rhs2")
+	}
+	expr: CoreExpr = PreClosureConcurrentExpr(
+		{
+			bindings = [binding_one, binding_two],
+			body = var_expr("body"),
+			timeout = Some(var_expr("timeout")),
+			max_threads = None
+		},
+		VoidType,
+		SyntheticSourceLoc,
+	)
+	result: CoreMapState[List[String], CoreExpr] = map_core_concurrency_children_with_state(
+		[],
+		record_visit_order,
+		expr,
+	)
+
+	-- Matches `immediate_core_expr_children`'s
+	-- `block.bindings.map(rhs).append(body).concat(optional_expr_items(timeout))`.
+	result.state == ["rhs1", "rhs2", "body", "timeout"]
+
+
+pure func test_state_concurrency_family_identity_mapper_reuses_shape() -> Bool:
+	binding: CorePreClosureConcurrentBinding = {
+		variable = named_var("b1"),
+		typ = int_type(),
+		rhs = var_expr("rhs1")
+	}
+	shapes: List[CoreExpr] = [
+		PreClosureConcurrentExpr(
+			{
+				bindings = [binding],
+				body = var_expr("body"),
+				timeout = None,
+				max_threads = None
+			},
+			VoidType,
+			SyntheticSourceLoc,
+		),
+	]
+	var reused: Int = 0
+
+	for shape in shapes:
+		result: CoreMapState[Int, CoreExpr] = map_core_concurrency_children_with_state(
+			0,
+			state_identity_expr,
+			shape,
+		)
+
+		if same_object(result.value, shape):
+			reused += 1
+
+	reused == shapes.length()
+
+
+pure func test_state_match_family_threads_raw_match_case_order() -> Bool:
+	expr: CoreExpr = RawMatchExpr(
+		var_expr("scrutinee"),
+		[
+			{ pattern = WildcardPattern, body = var_expr("case_one") },
+			{ pattern = WildcardPattern, body = var_expr("case_two") },
+		],
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	result: CoreMapState[List[String], CoreExpr] = map_core_match_children_with_state(
+		[],
+		record_visit_order,
+		expr,
+	)
+
+	-- Matches `immediate_core_expr_children`'s
+	-- `[scrutinee].concat(cases.map(body))`.
+	result.state == ["scrutinee", "case_one", "case_two"]
+
+
+pure func test_state_match_family_identity_mapper_reuses_shape() -> Bool:
+	shapes: List[CoreExpr] = [
+		RawMatchExpr(
+			var_expr("scrutinee"),
+			[{ pattern = WildcardPattern, body = var_expr("case_one") }],
+			int_type(),
+			SyntheticSourceLoc,
+		),
+	]
+	var reused: Int = 0
+
+	for shape in shapes:
+		result: CoreMapState[Int, CoreExpr] = map_core_match_children_with_state(
+			0,
+			state_identity_expr,
+			shape,
+		)
+
+		if same_object(result.value, shape):
+			reused += 1
+
+	reused == shapes.length()
+
+
+pure func test_state_dispatcher_routes_every_family() -> Bool:
+	binary: CoreExpr = BinaryExpr(
+		AddOp,
+		var_expr("left"),
+		var_expr("right"),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	call: CoreExpr = CallExpr(
+		BuiltinCall("blorp_print"),
+		var_expr("callee"),
+		[var_expr("arg")],
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	string_copy: CoreExpr = StringByteCopyExpr(
+		{
+			dst = var_expr("dst"),
+			dst_pos = var_expr("dst_pos"),
+			src = var_expr("src"),
+			src_pos = var_expr("src_pos"),
+			len = var_expr("len")
+		},
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	for_range: CoreExpr = ForRangeExpr(
+		range_binder("i"),
+		var_expr("start"),
+		var_expr("end_value"),
+		var_expr("body"),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	raw_match: CoreExpr = RawMatchExpr(
+		var_expr("scrutinee"),
+		[{ pattern = WildcardPattern, body = var_expr("case_body") }],
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	logical: CoreExpr = LogicalExpr(
+		AndOp,
+		var_expr("a"),
+		var_expr("b"),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	leaf: CoreExpr = var_expr("leaf")
+
+	var all_ok: Bool = True
+
+	for shape in [binary, call, string_copy, for_range, raw_match, logical, leaf]:
+		result: CoreMapState[Int, CoreExpr] = map_core_expr_children_with_state(
+			0,
+			state_identity_expr,
+			shape,
+		)
+
+		if not same_object(result.value, shape):
+			all_ok = False
+
+	all_ok
+
+
 tests: TestSuite = {
 	description = "Blorp compiler Core traversal",
 	tests = [
@@ -574,6 +1152,86 @@ tests: TestSuite = {
 		(
 			"pattern binding membership matches ordered projection",
 			test_pattern_binding_membership_matches_ordered_projection,
+		),
+		(
+			"state leaf family passes state through unchanged",
+			test_state_leaf_family_passes_state_through_unchanged,
+		),
+		(
+			"state operator family threads binary sibling order",
+			test_state_operator_family_threads_binary_sibling_order,
+		),
+		(
+			"state operator family threads if sibling order",
+			test_state_operator_family_threads_if_sibling_order,
+		),
+		(
+			"state operator family identity mapper reuses shape",
+			test_state_operator_family_identity_mapper_reuses_shape,
+		),
+		(
+			"state aggregate family threads call args order",
+			test_state_aggregate_family_threads_call_args_order,
+		),
+		(
+			"state aggregate family threads record COW update order",
+			test_state_aggregate_family_threads_record_cow_update_order,
+		),
+		(
+			"state aggregate family threads select arm order",
+			test_state_aggregate_family_threads_select_arm_order,
+		),
+		(
+			"state aggregate family identity mapper reuses shape",
+			test_state_aggregate_family_identity_mapper_reuses_shape,
+		),
+		(
+			"state logical tree threads left to right",
+			test_state_logical_tree_threads_left_to_right,
+		),
+		(
+			"state logical tree identity mapper reuses shape",
+			test_state_logical_tree_identity_mapper_reuses_shape,
+		),
+		(
+			"state storage family threads string byte copy order",
+			test_state_storage_family_threads_string_byte_copy_order,
+		),
+		(
+			"state storage family threads tensor raw fill order",
+			test_state_storage_family_threads_tensor_raw_fill_order,
+		),
+		(
+			"state storage family identity mapper reuses shape",
+			test_state_storage_family_identity_mapper_reuses_shape,
+		),
+		(
+			"state loop family threads for range order",
+			test_state_loop_family_threads_for_range_order,
+		),
+		(
+			"state loop family identity mapper reuses shape",
+			test_state_loop_family_identity_mapper_reuses_shape,
+		),
+		(
+			"state concurrency family threads pre closure block order",
+			test_state_concurrency_family_threads_pre_closure_block_order,
+		),
+		(
+			"state concurrency family identity mapper reuses shape",
+			test_state_concurrency_family_identity_mapper_reuses_shape,
+		),
+		(
+			"state match family threads raw match case order",
+			test_state_match_family_threads_raw_match_case_order,
+		),
+		(
+			"state match family identity mapper reuses shape",
+			test_state_match_family_identity_mapper_reuses_shape,
+		),
+		(
+			"state dispatcher routes every family",
+			test_state_dispatcher_routes_every_family,
 		),
 	]
 }

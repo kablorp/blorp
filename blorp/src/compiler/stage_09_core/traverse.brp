@@ -4613,3 +4613,2900 @@ pure func any_core_dict_literal_entry_exprs(
 			break
 
 	found
+
+
+-- ============================================================================
+-- Stateful sibling of the context-carrying traversal above.
+--
+-- `map_core_expr_children_with_context[C]` threads a value that never
+-- changes across a node's children. Some passes (fresh-variable or
+-- fresh-version counters, next-binding-id allocators) need a value that
+-- *does* change, with each sibling seeing the value the previous sibling
+-- produced, in exactly the left-to-right order `immediate_core_expr_children`
+-- lists a node's children. This is that variant.
+--
+-- `mapper` returns the next state together with the possibly-rewritten
+-- child, and every function below feeds that returned state into the next
+-- sibling call in source order, then returns the final state.
+--
+-- This is a separate set of functions, not a generic specialization of the
+-- context-carrying dispatcher: making the read-only variant's ~1700 lines
+-- return the new state on every arm (instead of adding one parameter, as the
+-- context-carrying conversion did) would change control flow throughout,
+-- and the read-only variant must not regress. The two are kept independent
+-- on purpose; the read-only variant above is untouched by anything below.
+--
+-- Type rewriting is out of scope here: no caller of this variant substitutes
+-- types, so there is no `type_mapper` parameter, and the purely type-level
+-- containers the context-carrying variant handles (parameters, loop binders,
+-- closure/task captures, accessors, match bindings) are omitted entirely.
+--
+-- Coverage lands one node family per commit (leaf, operator, aggregate
+-- first; then storage; then loop, concurrency, match) so each family's
+-- sibling order can be checked by hand against `immediate_core_expr_children`
+-- before the next lands. `map_core_expr_children_with_state` only becomes
+-- part of the public surface once every family is covered; until then the
+-- family functions below are exercised directly by tests and are not wired
+-- into any pass.
+record CoreMapState[S, T] {
+	state: S,
+	value: T
+}
+
+
+-- Leaves. `immediate_core_expr_children` answers `[]` for every one of these
+-- kinds (literals, `VarExpr`, `VoidExpr`, checkpoints, `Break`/`Continue`,
+-- `SetAllocExpr`, and `ClosureCreateExpr`/`DetachExpr`, whose only payloads
+-- are type-level closure/task capture metadata), so there is no CoreExpr
+-- child to visit and the state passes through unchanged. No match over the
+-- specific kind is needed.
+pure func map_core_leaf_children_with_state[S](
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+	expr: CoreExpr,
+) -> CoreMapState[S, CoreExpr]:
+	{ state = state, value = expr }
+
+
+-- Operators, casts, field reads, and the simple binding and control forms.
+-- Each arm threads the state produced by one child into the call for the
+-- next, in the same left-to-right order `immediate_core_expr_children` lists
+-- for that node kind.
+pure func map_core_operator_children_with_state[S](
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+	expr: CoreExpr,
+) -> CoreMapState[S, CoreExpr]:
+	match expr:
+		DebugBlockExpr(body, typ, loc):
+			mapped_body: CoreMapState[S, CoreExpr] = mapper(state, body)
+			rebuilt: CoreExpr = if same_core_expr(mapped_body.value, body):
+				expr
+			else:
+				DebugBlockExpr(mapped_body.value, typ, loc)
+
+			{ state = mapped_body.state, value = rebuilt }
+		BinaryExpr(op, left, right, typ, loc):
+			mapped_left: CoreMapState[S, CoreExpr] = mapper(state, left)
+			mapped_right: CoreMapState[S, CoreExpr] = mapper(mapped_left.state, right)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_left.value, left)
+				and same_core_expr(mapped_right.value, right)
+			):
+				expr
+			else:
+				BinaryExpr(op, mapped_left.value, mapped_right.value, typ, loc)
+
+			{ state = mapped_right.state, value = rebuilt }
+		UnaryExpr(op, value, typ, loc):
+			mapped_value: CoreMapState[S, CoreExpr] = mapper(state, value)
+			rebuilt: CoreExpr = if same_core_expr(mapped_value.value, value):
+				expr
+			else:
+				UnaryExpr(op, mapped_value.value, typ, loc)
+
+			{ state = mapped_value.state, value = rebuilt }
+		LogicalExpr(op, left, right, typ, loc):
+			mapped_left: CoreMapState[S, CoreExpr] = mapper(state, left)
+			mapped_right: CoreMapState[S, CoreExpr] = mapper(mapped_left.state, right)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_left.value, left)
+				and same_core_expr(mapped_right.value, right)
+			):
+				expr
+			else:
+				LogicalExpr(op, mapped_left.value, mapped_right.value, typ, loc)
+
+			{ state = mapped_right.state, value = rebuilt }
+		AssignExpr(variable, rhs, typ, loc):
+			mapped_rhs: CoreMapState[S, CoreExpr] = mapper(state, rhs)
+			rebuilt: CoreExpr = if same_core_expr(mapped_rhs.value, rhs):
+				expr
+			else:
+				AssignExpr(variable, mapped_rhs.value, typ, loc)
+
+			{ state = mapped_rhs.state, value = rebuilt }
+		CastExpr(value, typ, loc):
+			mapped_value: CoreMapState[S, CoreExpr] = mapper(state, value)
+			rebuilt: CoreExpr = if same_core_expr(mapped_value.value, value):
+				expr
+			else:
+				CastExpr(mapped_value.value, typ, loc)
+
+			{ state = mapped_value.state, value = rebuilt }
+		UnboxExpr(kind, value, typ, loc):
+			mapped_value: CoreMapState[S, CoreExpr] = mapper(state, value)
+			rebuilt: CoreExpr = if same_core_expr(mapped_value.value, value):
+				expr
+			else:
+				UnboxExpr(kind, mapped_value.value, typ, loc)
+
+			{ state = mapped_value.state, value = rebuilt }
+		FieldExpr(value, field_name, typ, loc):
+			mapped_value: CoreMapState[S, CoreExpr] = mapper(state, value)
+			rebuilt: CoreExpr = if same_core_expr(mapped_value.value, value):
+				expr
+			else:
+				FieldExpr(mapped_value.value, field_name, typ, loc)
+
+			{ state = mapped_value.state, value = rebuilt }
+		TupleFieldExpr(value, field_index, typ, loc):
+			mapped_value: CoreMapState[S, CoreExpr] = mapper(state, value)
+			rebuilt: CoreExpr = if same_core_expr(mapped_value.value, value):
+				expr
+			else:
+				TupleFieldExpr(mapped_value.value, field_index, typ, loc)
+
+			{ state = mapped_value.state, value = rebuilt }
+		BoxExpr(box, typ, loc):
+			mapped_value: CoreMapState[S, CoreExpr] = mapper(state, box.value)
+			rebuilt: CoreExpr = if same_core_expr(mapped_value.value, box.value):
+				expr
+			else:
+				BoxExpr({ box | value = mapped_value.value }, typ, loc)
+
+			{ state = mapped_value.state, value = rebuilt }
+		PreClosureDetachExpr(detached, typ, loc):
+			mapped_detached: CoreMapState[S, CoreExpr] = mapper(state, detached)
+			rebuilt: CoreExpr = if same_core_expr(mapped_detached.value, detached):
+				expr
+			else:
+				PreClosureDetachExpr(mapped_detached.value, typ, loc)
+
+			{ state = mapped_detached.state, value = rebuilt }
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			mapped_body: CoreMapState[S, CoreExpr] = mapper(state, body)
+			rebuilt: CoreExpr = if same_core_expr(mapped_body.value, body):
+				expr
+			else:
+				DupExpr(variable, value_type, retain_policy, mapped_body.value, typ, loc)
+
+			{ state = mapped_body.state, value = rebuilt }
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			mapped_body: CoreMapState[S, CoreExpr] = mapper(state, body)
+			rebuilt: CoreExpr = if same_core_expr(mapped_body.value, body):
+				expr
+			else:
+				DropExpr(variable, value_type, release_policy, mapped_body.value, typ, loc)
+
+			{ state = mapped_body.state, value = rebuilt }
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			mapped_rhs: CoreMapState[S, CoreExpr] = mapper(state, rhs)
+			mapped_body: CoreMapState[S, CoreExpr] = mapper(mapped_rhs.state, body)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_rhs.value, rhs)
+				and same_core_expr(mapped_body.value, body)
+			):
+				expr
+			else:
+				LetExpr(variable, is_mutable, typ, mapped_rhs.value, mapped_body.value)
+
+			{ state = mapped_body.state, value = rebuilt }
+		BorrowLetExpr(variable, typ, rhs, body):
+			mapped_rhs: CoreMapState[S, CoreExpr] = mapper(state, rhs)
+			mapped_body: CoreMapState[S, CoreExpr] = mapper(mapped_rhs.state, body)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_rhs.value, rhs)
+				and same_core_expr(mapped_body.value, body)
+			):
+				expr
+			else:
+				BorrowLetExpr(variable, typ, mapped_rhs.value, mapped_body.value)
+
+			{ state = mapped_body.state, value = rebuilt }
+		SeqExpr(first, second):
+			mapped_first: CoreMapState[S, CoreExpr] = mapper(state, first)
+			mapped_second: CoreMapState[S, CoreExpr] = mapper(mapped_first.state, second)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_first.value, first)
+				and same_core_expr(mapped_second.value, second)
+			):
+				expr
+			else:
+				SeqExpr(mapped_first.value, mapped_second.value)
+
+			{ state = mapped_second.state, value = rebuilt }
+		WhileExpr(cond, body, typ, loc):
+			mapped_cond: CoreMapState[S, CoreExpr] = mapper(state, cond)
+			mapped_body: CoreMapState[S, CoreExpr] = mapper(mapped_cond.state, body)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_cond.value, cond)
+				and same_core_expr(mapped_body.value, body)
+			):
+				expr
+			else:
+				WhileExpr(mapped_cond.value, mapped_body.value, typ, loc)
+
+			{ state = mapped_body.state, value = rebuilt }
+		RangeExpr(start, end_value, typ, loc):
+			mapped_start: CoreMapState[S, CoreExpr] = mapper(state, start)
+			mapped_end: CoreMapState[S, CoreExpr] = mapper(mapped_start.state, end_value)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_start.value, start)
+				and same_core_expr(mapped_end.value, end_value)
+			):
+				expr
+			else:
+				RangeExpr(mapped_start.value, mapped_end.value, typ, loc)
+
+			{ state = mapped_end.state, value = rebuilt }
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			mapped_cond: CoreMapState[S, CoreExpr] = mapper(state, cond)
+			mapped_then: CoreMapState[S, CoreExpr] = mapper(mapped_cond.state, then_expr)
+			mapped_else: CoreMapState[S, CoreExpr] = mapper(mapped_then.state, else_expr)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_cond.value, cond)
+				and same_core_expr(mapped_then.value, then_expr)
+				and same_core_expr(mapped_else.value, else_expr)
+			):
+				expr
+			else:
+				IfExpr(mapped_cond.value, mapped_then.value, mapped_else.value, typ, loc)
+
+			{ state = mapped_else.state, value = rebuilt }
+		_:
+			{ state = state, value = expr }
+
+
+-- Long source-level `and`/`or` chains form deep Core trees; walk them
+-- iteratively so the state-threading traversal does not consume one native
+-- stack frame per logical node. Reuses the same task union as the read-only
+-- logical-tree walker: the state itself is threaded through one outer
+-- variable rather than carried per task, since the postorder visit order
+-- this worklist produces is already strictly left-to-right.
+pure func map_core_logical_tree_with_state[S](
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+	expr: CoreExpr,
+) -> CoreMapState[S, CoreExpr]:
+	var tasks: List[CoreLogicalMapTask] = [MapCoreLogicalNode(expr)]
+	var task_count: Int = 1
+	var mapped: List[CoreExpr] = []
+	var mapped_count: Int = 0
+	var valid: Bool = True
+	var current_state: S = state
+
+	while valid and task_count > 0:
+		task_count -= 1
+
+		match tasks.get(task_count):
+			Some(task):
+				match task:
+					MapCoreLogicalNode(current_expr):
+						match current_expr:
+							LogicalExpr(op, left, right, typ, loc):
+								rebuild_task: CoreLogicalMapTask = RebuildMappedCoreLogicalNode(
+									current_expr,
+								)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, rebuild_task)
+								else:
+									tasks.append(rebuild_task)
+
+								task_count += 1
+
+								right_task: CoreLogicalMapTask = MapCoreLogicalNode(right)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, right_task)
+								else:
+									tasks.append(right_task)
+
+								task_count += 1
+
+								left_task: CoreLogicalMapTask = MapCoreLogicalNode(left)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, left_task)
+								else:
+									tasks.append(left_task)
+
+								task_count += 1
+							_:
+								mapped_expr: CoreMapState[S, CoreExpr] = mapper(
+									current_state,
+									current_expr,
+								)
+
+								current_state = mapped_expr.state
+
+								mapped = if mapped_count < mapped.length():
+									mapped.set(mapped_count, mapped_expr.value)
+								else:
+									mapped.append(mapped_expr.value)
+
+								mapped_count += 1
+					RebuildMappedCoreLogicalNode(source_expr):
+						match source_expr:
+							LogicalExpr(op, left, right, typ, loc):
+								match (mapped.get(mapped_count - 2), mapped.get(mapped_count - 1)):
+									(Some(mapped_left), Some(mapped_right)):
+										rebuilt: CoreExpr = if (
+											same_core_expr(mapped_left, left)
+											and same_core_expr(mapped_right, right)
+										):
+											source_expr
+										else:
+											LogicalExpr(op, mapped_left, mapped_right, typ, loc)
+
+										mapped = mapped.set(mapped_count - 2, rebuilt)
+										mapped_count -= 1
+									_:
+										valid = False
+							_:
+								valid = False
+			None:
+				valid = False
+
+	if valid and mapped_count == 1:
+		{ state = current_state, value = mapped.get_or(0, expr) }
+	else:
+		{ state = current_state, value = expr }
+
+
+private pure func map_core_state_exprs[S](
+	items: List[CoreExpr],
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+) -> CoreMapState[S, Option[List[CoreExpr]]]:
+	var mapped: List[CoreExpr] = []
+	var changed: Bool = False
+	var current_state: S = state
+	var index: Int = 0
+
+	for item in items:
+		result: CoreMapState[S, CoreExpr] = mapper(current_state, item)
+		current_state = result.state
+
+		if changed:
+			mapped = mapped.append(result.value)
+		else if not same_core_expr(result.value, item):
+			mapped = items.take(index).append(result.value)
+			changed = True
+		else:
+			void
+
+		index += 1
+
+	if changed:
+		{ state = current_state, value = Some(mapped) }
+	else:
+		{ state = current_state, value = None }
+
+
+private pure func map_core_state_tuple_element[S](
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+	element: CoreTupleElement,
+) -> CoreMapState[S, Option[CoreTupleElement]]:
+	match element:
+		TuplePrimElement(value):
+			mapped: CoreMapState[S, CoreExpr] = mapper(state, value)
+			rebuilt: Option[CoreTupleElement] = if same_core_expr(mapped.value, value):
+				None
+			else:
+				Some(TuplePrimElement(mapped.value))
+
+			{ state = mapped.state, value = rebuilt }
+		TuplePointerElement(value):
+			mapped: CoreMapState[S, CoreExpr] = mapper(state, value)
+			rebuilt: Option[CoreTupleElement] = if same_core_expr(mapped.value, value):
+				None
+			else:
+				Some(TuplePointerElement(mapped.value))
+
+			{ state = mapped.state, value = rebuilt }
+		TupleStructElement(value, c_type):
+			mapped: CoreMapState[S, CoreExpr] = mapper(state, value)
+			rebuilt: Option[CoreTupleElement] = if same_core_expr(mapped.value, value):
+				None
+			else:
+				Some(TupleStructElement(mapped.value, c_type))
+
+			{ state = mapped.state, value = rebuilt }
+		TupleStackResultElement(value):
+			mapped: CoreMapState[S, CoreExpr] = mapper(state, value)
+			rebuilt: Option[CoreTupleElement] = if same_core_expr(mapped.value, value):
+				None
+			else:
+				Some(TupleStackResultElement(mapped.value))
+
+			{ state = mapped.state, value = rebuilt }
+		TupleVoidElement:
+			{ state = state, value = None }
+		TupleFloatElement(value):
+			mapped: CoreMapState[S, CoreExpr] = mapper(state, value)
+			rebuilt: Option[CoreTupleElement] = if same_core_expr(mapped.value, value):
+				None
+			else:
+				Some(TupleFloatElement(mapped.value))
+
+			{ state = mapped.state, value = rebuilt }
+		TupleFloat32Element(value):
+			mapped: CoreMapState[S, CoreExpr] = mapper(state, value)
+			rebuilt: Option[CoreTupleElement] = if same_core_expr(mapped.value, value):
+				None
+			else:
+				Some(TupleFloat32Element(mapped.value))
+
+			{ state = mapped.state, value = rebuilt }
+		TupleFloat16Element(value):
+			mapped: CoreMapState[S, CoreExpr] = mapper(state, value)
+			rebuilt: Option[CoreTupleElement] = if same_core_expr(mapped.value, value):
+				None
+			else:
+				Some(TupleFloat16Element(mapped.value))
+
+			{ state = mapped.state, value = rebuilt }
+
+
+private pure func map_core_state_tuple_elements[S](
+	elements: List[CoreTupleElement],
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+) -> CoreMapState[S, Option[List[CoreTupleElement]]]:
+	var mapped: List[CoreTupleElement] = []
+	var changed: Bool = False
+	var current_state: S = state
+	var index: Int = 0
+
+	for element in elements:
+		result: CoreMapState[S, Option[CoreTupleElement]] = map_core_state_tuple_element(
+			current_state,
+			mapper,
+			element,
+		)
+		current_state = result.state
+
+		match result.value:
+			Some(mapped_element):
+				mapped = if changed:
+					mapped.append(mapped_element)
+				else:
+					elements.take(index).append(mapped_element)
+
+				changed = True
+			None:
+				if changed:
+					mapped = mapped.append(element)
+				else:
+					void
+
+		index += 1
+
+	if changed:
+		{ state = current_state, value = Some(mapped) }
+	else:
+		{ state = current_state, value = None }
+
+
+private pure func map_core_state_boxed_storage_value[S](
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+	value: CoreBoxedStorageValue,
+) -> CoreMapState[S, Option[CoreBoxedStorageValue]]:
+	mapped_value: CoreMapState[S, CoreExpr] = mapper(state, value.value)
+	rebuilt: Option[CoreBoxedStorageValue] = if same_core_expr(mapped_value.value, value.value):
+		None
+	else:
+		Some({ value | value = mapped_value.value })
+
+	{ state = mapped_value.state, value = rebuilt }
+
+
+private pure func map_core_state_boxed_storage_values[S](
+	values: List[CoreBoxedStorageValue],
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+) -> CoreMapState[S, Option[List[CoreBoxedStorageValue]]]:
+	var mapped: List[CoreBoxedStorageValue] = []
+	var changed: Bool = False
+	var current_state: S = state
+	var index: Int = 0
+
+	for value in values:
+		result: CoreMapState[S, Option[CoreBoxedStorageValue]] = map_core_state_boxed_storage_value(
+			current_state,
+			mapper,
+			value,
+		)
+		current_state = result.state
+
+		match result.value:
+			Some(mapped_value):
+				mapped = if changed:
+					mapped.append(mapped_value)
+				else:
+					values.take(index).append(mapped_value)
+
+				changed = True
+			None:
+				if changed:
+					mapped = mapped.append(value)
+				else:
+					void
+
+		index += 1
+
+	if changed:
+		{ state = current_state, value = Some(mapped) }
+	else:
+		{ state = current_state, value = None }
+
+
+private pure func map_core_state_dict_literal_entry[S](
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+	entry: CoreDictLiteralEntry,
+) -> CoreMapState[S, Option[CoreDictLiteralEntry]]:
+	mapped_key: CoreMapState[S, CoreExpr] = mapper(state, entry.key)
+	mapped_value: CoreMapState[S, CoreExpr] = mapper(mapped_key.state, entry.value)
+	rebuilt: Option[CoreDictLiteralEntry] = if (
+		same_core_expr(mapped_key.value, entry.key)
+		and same_core_expr(mapped_value.value, entry.value)
+	):
+		None
+	else:
+		Some({
+			key = mapped_key.value,
+			value = mapped_value.value,
+		})
+
+	{ state = mapped_value.state, value = rebuilt }
+
+
+private pure func map_core_state_dict_literal_entries[S](
+	entries: List[CoreDictLiteralEntry],
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+) -> CoreMapState[S, Option[List[CoreDictLiteralEntry]]]:
+	var mapped: List[CoreDictLiteralEntry] = []
+	var changed: Bool = False
+	var current_state: S = state
+	var index: Int = 0
+
+	for entry in entries:
+		result: CoreMapState[S, Option[CoreDictLiteralEntry]] = map_core_state_dict_literal_entry(
+			current_state,
+			mapper,
+			entry,
+		)
+		current_state = result.state
+
+		match result.value:
+			Some(mapped_entry):
+				mapped = if changed:
+					mapped.append(mapped_entry)
+				else:
+					entries.take(index).append(mapped_entry)
+
+				changed = True
+			None:
+				if changed:
+					mapped = mapped.append(entry)
+				else:
+					void
+
+		index += 1
+
+	if changed:
+		{ state = current_state, value = Some(mapped) }
+	else:
+		{ state = current_state, value = None }
+
+
+private pure func map_core_state_dict_entry[S](
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+	entry: CoreDictEntry,
+) -> CoreMapState[S, Option[CoreDictEntry]]:
+	mapped_key: CoreMapState[S, Option[CoreBoxedStorageValue]] = map_core_state_boxed_storage_value(
+		state,
+		mapper,
+		entry.key,
+	)
+	mapped_value: CoreMapState[S, Option[CoreBoxedStorageValue]] = map_core_state_boxed_storage_value(
+		mapped_key.state,
+		mapper,
+		entry.value,
+	)
+	rebuilt: Option[CoreDictEntry] = if mapped_key.value.is_none() and mapped_value.value.is_none():
+		None
+	else:
+		Some({ entry |
+				key = mapped_key.value.get_or(entry.key),
+				value = mapped_value.value.get_or(entry.value)
+			})
+
+	{ state = mapped_value.state, value = rebuilt }
+
+
+private pure func map_core_state_dict_entries[S](
+	entries: List[CoreDictEntry],
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+) -> CoreMapState[S, Option[List[CoreDictEntry]]]:
+	var mapped: List[CoreDictEntry] = []
+	var changed: Bool = False
+	var current_state: S = state
+	var index: Int = 0
+
+	for entry in entries:
+		result: CoreMapState[S, Option[CoreDictEntry]] = map_core_state_dict_entry(
+			current_state,
+			mapper,
+			entry,
+		)
+		current_state = result.state
+
+		match result.value:
+			Some(mapped_entry):
+				mapped = if changed:
+					mapped.append(mapped_entry)
+				else:
+					entries.take(index).append(mapped_entry)
+
+				changed = True
+			None:
+				if changed:
+					mapped = mapped.append(entry)
+				else:
+					void
+
+		index += 1
+
+	if changed:
+		{ state = current_state, value = Some(mapped) }
+	else:
+		{ state = current_state, value = None }
+
+
+private pure func map_core_state_record_fields[S](
+	fields: List[CoreRecordFieldValue],
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+) -> CoreMapState[S, Option[List[CoreRecordFieldValue]]]:
+	var mapped: List[CoreRecordFieldValue] = []
+	var changed: Bool = False
+	var current_state: S = state
+	var index: Int = 0
+
+	for field in fields:
+		result: CoreMapState[S, CoreExpr] = mapper(current_state, field.value)
+		current_state = result.state
+
+		if changed:
+			mapped = mapped.append({ field | value = result.value })
+		else if not same_core_expr(result.value, field.value):
+			mapped = fields.take(index).append({ field | value = result.value })
+			changed = True
+		else:
+			void
+
+		index += 1
+
+	if changed:
+		{ state = current_state, value = Some(mapped) }
+	else:
+		{ state = current_state, value = None }
+
+
+private pure func map_core_state_record_cow_field[S](
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+	field: CoreRecordCowField,
+) -> CoreMapState[S, Option[CoreRecordCowField]]:
+	match field.replacement:
+		Some(replacement):
+			mapped: CoreMapState[S, CoreExpr] = mapper(state, replacement)
+			rebuilt: Option[CoreRecordCowField] = if same_core_expr(mapped.value, replacement):
+				None
+			else:
+				Some({ field | replacement = Some(mapped.value) })
+
+			{ state = mapped.state, value = rebuilt }
+		None:
+			{ state = state, value = None }
+
+
+private pure func map_core_state_record_cow_fields[S](
+	fields: List[CoreRecordCowField],
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+) -> CoreMapState[S, Option[List[CoreRecordCowField]]]:
+	var mapped: List[CoreRecordCowField] = []
+	var changed: Bool = False
+	var current_state: S = state
+	var index: Int = 0
+
+	for field in fields:
+		result: CoreMapState[S, Option[CoreRecordCowField]] = map_core_state_record_cow_field(
+			current_state,
+			mapper,
+			field,
+		)
+		current_state = result.state
+
+		match result.value:
+			Some(mapped_field):
+				mapped = if changed:
+					mapped.append(mapped_field)
+				else:
+					fields.take(index).append(mapped_field)
+
+				changed = True
+			None:
+				if changed:
+					mapped = mapped.append(field)
+				else:
+					void
+
+		index += 1
+
+	if changed:
+		{ state = current_state, value = Some(mapped) }
+	else:
+		{ state = current_state, value = None }
+
+
+private pure func map_core_state_select_arm_kind[S](
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+	kind: CoreSelectArmKind,
+) -> CoreMapState[S, Option[CoreSelectArmKind]]:
+	match kind:
+		SelectRecvArm(recv):
+			mapped: CoreMapState[S, CoreExpr] = mapper(state, recv.channel)
+			rebuilt: Option[CoreSelectArmKind] = if same_core_expr(mapped.value, recv.channel):
+				None
+			else:
+				Some(SelectRecvArm({ recv | channel = mapped.value }))
+
+			{ state = mapped.state, value = rebuilt }
+		SelectSealedArm(channel):
+			mapped: CoreMapState[S, CoreExpr] = mapper(state, channel)
+			rebuilt: Option[CoreSelectArmKind] = if same_core_expr(mapped.value, channel):
+				None
+			else:
+				Some(SelectSealedArm(mapped.value))
+
+			{ state = mapped.state, value = rebuilt }
+		SelectAfterArm(timeout):
+			mapped: CoreMapState[S, CoreExpr] = mapper(state, timeout)
+			rebuilt: Option[CoreSelectArmKind] = if same_core_expr(mapped.value, timeout):
+				None
+			else:
+				Some(SelectAfterArm(mapped.value))
+
+			{ state = mapped.state, value = rebuilt }
+
+
+private pure func map_core_state_select_arm[S](
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+	arm: CoreSelectArm,
+) -> CoreMapState[S, Option[CoreSelectArm]]:
+	mapped_kind: CoreMapState[S, Option[CoreSelectArmKind]] = map_core_state_select_arm_kind(
+		state,
+		mapper,
+		arm.kind,
+	)
+	mapped_body: CoreMapState[S, CoreExpr] = mapper(mapped_kind.state, arm.body)
+	rebuilt: Option[CoreSelectArm] = if (
+		mapped_kind.value.is_none()
+		and same_core_expr(mapped_body.value, arm.body)
+	):
+		None
+	else:
+		Some({ arm |
+				kind = mapped_kind.value.get_or(arm.kind),
+				body = mapped_body.value
+			})
+
+	{ state = mapped_body.state, value = rebuilt }
+
+
+private pure func map_core_state_select_arms[S](
+	arms: List[CoreSelectArm],
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+) -> CoreMapState[S, Option[List[CoreSelectArm]]]:
+	var mapped: List[CoreSelectArm] = []
+	var changed: Bool = False
+	var current_state: S = state
+	var index: Int = 0
+
+	for arm in arms:
+		result: CoreMapState[S, Option[CoreSelectArm]] = map_core_state_select_arm(
+			current_state,
+			mapper,
+			arm,
+		)
+		current_state = result.state
+
+		match result.value:
+			Some(mapped_arm):
+				mapped = if changed:
+					mapped.append(mapped_arm)
+				else:
+					arms.take(index).append(mapped_arm)
+
+				changed = True
+			None:
+				if changed:
+					mapped = mapped.append(arm)
+				else:
+					void
+
+		index += 1
+
+	if changed:
+		{ state = current_state, value = Some(mapped) }
+	else:
+		{ state = current_state, value = None }
+
+
+-- Calls and the literal, record, union, and select aggregates.
+pure func map_core_aggregate_children_with_state[S](
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+	expr: CoreExpr,
+) -> CoreMapState[S, CoreExpr]:
+	match expr:
+		CallExpr(kind, callee, args, typ, loc):
+			mapped_callee: CoreMapState[S, CoreExpr] = mapper(state, callee)
+			mapped_args: CoreMapState[S, Option[List[CoreExpr]]] = map_core_state_exprs(
+				args,
+				mapped_callee.state,
+				mapper,
+			)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_callee.value, callee)
+				and mapped_args.value.is_none()
+			):
+				expr
+			else:
+				CallExpr(kind, mapped_callee.value, mapped_args.value.get_or(args), typ, loc)
+
+			{ state = mapped_args.state, value = rebuilt }
+		TupleExpr(items, typ, loc):
+			mapped_items: CoreMapState[S, Option[List[CoreExpr]]] = map_core_state_exprs(
+				items,
+				state,
+				mapper,
+			)
+			rebuilt: CoreExpr = if mapped_items.value.is_none():
+				expr
+			else:
+				TupleExpr(mapped_items.value.get_or(items), typ, loc)
+
+			{ state = mapped_items.state, value = rebuilt }
+		TupleConstructExpr(construct, typ, loc):
+			mapped_elements: CoreMapState[S, Option[List[CoreTupleElement]]] = map_core_state_tuple_elements(
+				construct.elements,
+				state,
+				mapper,
+			)
+			rebuilt: CoreExpr = if mapped_elements.value.is_none():
+				expr
+			else:
+				TupleConstructExpr(
+					{ construct | elements = mapped_elements.value.get_or(construct.elements) },
+					typ,
+					loc,
+				)
+
+			{ state = mapped_elements.state, value = rebuilt }
+		VectorExpr(items, typ, loc):
+			mapped_items: CoreMapState[S, Option[List[CoreExpr]]] = map_core_state_exprs(
+				items,
+				state,
+				mapper,
+			)
+			rebuilt: CoreExpr = if mapped_items.value.is_none():
+				expr
+			else:
+				VectorExpr(mapped_items.value.get_or(items), typ, loc)
+
+			{ state = mapped_items.state, value = rebuilt }
+		ListConstructExpr(construct, typ, loc):
+			mapped_elements: CoreMapState[S, Option[List[CoreBoxedStorageValue]]] = map_core_state_boxed_storage_values(
+				construct.elements,
+				state,
+				mapper,
+			)
+			rebuilt: CoreExpr = if mapped_elements.value.is_none():
+				expr
+			else:
+				ListConstructExpr(
+					{ construct | elements = mapped_elements.value.get_or(construct.elements) },
+					typ,
+					loc,
+				)
+
+			{ state = mapped_elements.state, value = rebuilt }
+		DictExpr(entries, typ, loc):
+			mapped_entries: CoreMapState[S, Option[List[CoreDictLiteralEntry]]] = map_core_state_dict_literal_entries(
+				entries,
+				state,
+				mapper,
+			)
+			rebuilt: CoreExpr = if mapped_entries.value.is_none():
+				expr
+			else:
+				DictExpr(mapped_entries.value.get_or(entries), typ, loc)
+
+			{ state = mapped_entries.state, value = rebuilt }
+		DictConstructExpr(construct, typ, loc):
+			mapped_entries: CoreMapState[S, Option[List[CoreDictEntry]]] = map_core_state_dict_entries(
+				construct.entries,
+				state,
+				mapper,
+			)
+			rebuilt: CoreExpr = if mapped_entries.value.is_none():
+				expr
+			else:
+				DictConstructExpr(
+					{ construct | entries = mapped_entries.value.get_or(construct.entries) },
+					typ,
+					loc,
+				)
+
+			{ state = mapped_entries.state, value = rebuilt }
+		RecordExpr(fields, typ, loc):
+			mapped_fields: CoreMapState[S, Option[List[CoreRecordFieldValue]]] = map_core_state_record_fields(
+				fields,
+				state,
+				mapper,
+			)
+			rebuilt: CoreExpr = if mapped_fields.value.is_none():
+				expr
+			else:
+				RecordExpr(mapped_fields.value.get_or(fields), typ, loc)
+
+			{ state = mapped_fields.state, value = rebuilt }
+		RecordUpdateExpr(base, fields, typ, loc):
+			mapped_base: CoreMapState[S, CoreExpr] = mapper(state, base)
+			mapped_fields: CoreMapState[S, Option[List[CoreRecordFieldValue]]] = map_core_state_record_fields(
+				fields,
+				mapped_base.state,
+				mapper,
+			)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_base.value, base)
+				and mapped_fields.value.is_none()
+			):
+				expr
+			else:
+				RecordUpdateExpr(
+					mapped_base.value,
+					mapped_fields.value.get_or(fields),
+					typ,
+					loc,
+				)
+
+			{ state = mapped_fields.state, value = rebuilt }
+		RecordReuseExpr(source, fields, typ, loc):
+			mapped_source: CoreMapState[S, CoreExpr] = mapper(state, source)
+			mapped_fields: CoreMapState[S, Option[List[CoreRecordFieldValue]]] = map_core_state_record_fields(
+				fields,
+				mapped_source.state,
+				mapper,
+			)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_source.value, source)
+				and mapped_fields.value.is_none()
+			):
+				expr
+			else:
+				RecordReuseExpr(
+					mapped_source.value,
+					mapped_fields.value.get_or(fields),
+					typ,
+					loc,
+				)
+
+			{ state = mapped_fields.state, value = rebuilt }
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			mapped_fields: CoreMapState[S, Option[List[CoreRecordCowField]]] = map_core_state_record_cow_fields(
+				fields,
+				state,
+				mapper,
+			)
+			mapped_source: CoreMapState[S, CoreExpr] = mapper(mapped_fields.state, source)
+			rebuilt: CoreExpr = if (
+				mapped_fields.value.is_none()
+				and same_core_expr(mapped_source.value, source)
+			):
+				expr
+			else:
+				RecordCowUpdateExpr(
+					mapped_source.value,
+					mapped_fields.value.get_or(fields),
+					typ,
+					loc,
+				)
+
+			{ state = mapped_source.state, value = rebuilt }
+		RecordConstructExpr(type_name, fields, typ, loc):
+			mapped_fields: CoreMapState[S, Option[List[CoreRecordFieldValue]]] = map_core_state_record_fields(
+				fields,
+				state,
+				mapper,
+			)
+			rebuilt: CoreExpr = if mapped_fields.value.is_none():
+				expr
+			else:
+				RecordConstructExpr(type_name, mapped_fields.value.get_or(fields), typ, loc)
+
+			{ state = mapped_fields.state, value = rebuilt }
+		UnionConstructExpr(construct, typ, loc):
+			mapped_args: CoreMapState[S, Option[List[CoreBoxedStorageValue]]] = map_core_state_boxed_storage_values(
+				construct.args,
+				state,
+				mapper,
+			)
+			rebuilt: CoreExpr = if mapped_args.value.is_none():
+				expr
+			else:
+				UnionConstructExpr(
+					{ construct | args = mapped_args.value.get_or(construct.args) },
+					typ,
+					loc,
+				)
+
+			{ state = mapped_args.state, value = rebuilt }
+		UnionReuseConstructExpr(construct, typ, loc):
+			mapped_source: CoreMapState[S, CoreExpr] = mapper(state, construct.source)
+			mapped_args: CoreMapState[S, Option[List[CoreBoxedStorageValue]]] = map_core_state_boxed_storage_values(
+				construct.args,
+				mapped_source.state,
+				mapper,
+			)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_source.value, construct.source)
+				and mapped_args.value.is_none()
+			):
+				expr
+			else:
+				UnionReuseConstructExpr(
+					{ construct |
+						source = mapped_source.value,
+						args = mapped_args.value.get_or(construct.args)
+					},
+					typ,
+					loc,
+				)
+
+			{ state = mapped_args.state, value = rebuilt }
+		SelectExpr(select_expr, typ, loc):
+			mapped_arms: CoreMapState[S, Option[List[CoreSelectArm]]] = map_core_state_select_arms(
+				select_expr,
+				state,
+				mapper,
+			)
+			rebuilt: CoreExpr = if mapped_arms.value.is_none():
+				expr
+			else:
+				SelectExpr(mapped_arms.value.get_or(select_expr), typ, loc)
+
+			{ state = mapped_arms.state, value = rebuilt }
+		_:
+			{ state = state, value = expr }
+
+
+-- List, string, and tensor storage primitives.
+pure func map_core_storage_children_with_state[S](
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+	expr: CoreExpr,
+) -> CoreMapState[S, CoreExpr]:
+	match expr:
+		ListAllocExpr(alloc, typ, loc):
+			mapped_capacity: CoreMapState[S, CoreExpr] = mapper(state, alloc.capacity)
+			rebuilt: CoreExpr = if same_core_expr(mapped_capacity.value, alloc.capacity):
+				expr
+			else:
+				ListAllocExpr({ alloc | capacity = mapped_capacity.value }, typ, loc)
+
+			{ state = mapped_capacity.state, value = rebuilt }
+		ListGetExpr(get, typ, loc):
+			mapped_list: CoreMapState[S, CoreExpr] = mapper(state, get.list)
+			mapped_index: CoreMapState[S, CoreExpr] = mapper(mapped_list.state, get.index)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_list.value, get.list)
+				and same_core_expr(mapped_index.value, get.index)
+			):
+				expr
+			else:
+				ListGetExpr(
+					{ get |
+						list = mapped_list.value,
+						index = mapped_index.value
+					},
+					typ,
+					loc,
+				)
+
+			{ state = mapped_index.state, value = rebuilt }
+		ListHandoffExpr(handoff, typ, loc):
+			mapped_source: CoreMapState[S, CoreExpr] = mapper(state, handoff.source)
+			mapped_capacity: CoreMapState[S, CoreExpr] = mapper(mapped_source.state, handoff.capacity)
+			mapped_body: CoreMapState[S, CoreExpr] = mapper(mapped_capacity.state, handoff.body)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_source.value, handoff.source)
+				and same_core_expr(mapped_capacity.value, handoff.capacity)
+				and same_core_expr(mapped_body.value, handoff.body)
+			):
+				expr
+			else:
+				ListHandoffExpr(
+					{ handoff |
+						source = mapped_source.value,
+						capacity = mapped_capacity.value,
+						body = mapped_body.value
+					},
+					typ,
+					loc,
+				)
+
+			{ state = mapped_body.state, value = rebuilt }
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			mapped_list: CoreMapState[S, CoreExpr] = mapper(state, set.list)
+			mapped_index: CoreMapState[S, CoreExpr] = mapper(mapped_list.state, set.index)
+			mapped_value: CoreMapState[S, Option[CoreBoxedStorageValue]] = map_core_state_boxed_storage_value(
+				mapped_index.state,
+				mapper,
+				set.value,
+			)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_list.value, set.list)
+				and same_core_expr(mapped_index.value, set.index)
+				and mapped_value.value.is_none()
+			):
+				expr
+			else:
+				ListHandoffSetOwnedExpr(
+					{ set |
+						list = mapped_list.value,
+						index = mapped_index.value,
+						value = mapped_value.value.get_or(set.value)
+					},
+					typ,
+					loc,
+				)
+
+			{ state = mapped_value.state, value = rebuilt }
+		ListHandoffSetSourceSlotExpr(slot, typ, loc):
+			mapped_result: CoreMapState[S, CoreExpr] = mapper(state, slot.result)
+			mapped_out_index: CoreMapState[S, CoreExpr] = mapper(mapped_result.state, slot.out_index)
+			mapped_source: CoreMapState[S, CoreExpr] = mapper(mapped_out_index.state, slot.source)
+			mapped_source_index: CoreMapState[S, CoreExpr] = mapper(mapped_source.state, slot.source_index)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_result.value, slot.result)
+				and same_core_expr(mapped_out_index.value, slot.out_index)
+				and same_core_expr(mapped_source.value, slot.source)
+				and same_core_expr(mapped_source_index.value, slot.source_index)
+			):
+				expr
+			else:
+				ListHandoffSetSourceSlotExpr(
+					{ slot |
+						result = mapped_result.value,
+						out_index = mapped_out_index.value,
+						source = mapped_source.value,
+						source_index = mapped_source_index.value
+					},
+					typ,
+					loc,
+				)
+
+			{ state = mapped_source_index.state, value = rebuilt }
+		ListRetainExpr(retain, typ, loc):
+			mapped_list: CoreMapState[S, CoreExpr] = mapper(state, retain.list)
+			mapped_value: CoreMapState[S, Option[CoreBoxedStorageValue]] = map_core_state_boxed_storage_value(
+				mapped_list.state,
+				mapper,
+				retain.value,
+			)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_list.value, retain.list)
+				and mapped_value.value.is_none()
+			):
+				expr
+			else:
+				ListRetainExpr(
+					{ retain |
+						list = mapped_list.value,
+						value = mapped_value.value.get_or(retain.value)
+					},
+					typ,
+					loc,
+				)
+
+			{ state = mapped_value.state, value = rebuilt }
+		ListSetExpr(set, typ, loc):
+			mapped_list: CoreMapState[S, CoreExpr] = mapper(state, set.list)
+			mapped_index: CoreMapState[S, CoreExpr] = mapper(mapped_list.state, set.index)
+			mapped_value: CoreMapState[S, Option[CoreBoxedStorageValue]] = map_core_state_boxed_storage_value(
+				mapped_index.state,
+				mapper,
+				set.value,
+			)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_list.value, set.list)
+				and same_core_expr(mapped_index.value, set.index)
+				and mapped_value.value.is_none()
+			):
+				expr
+			else:
+				ListSetExpr(
+					{ set |
+						list = mapped_list.value,
+						index = mapped_index.value,
+						value = mapped_value.value.get_or(set.value)
+					},
+					typ,
+					loc,
+				)
+
+			{ state = mapped_value.state, value = rebuilt }
+		ListSwapExpr(swap, typ, loc):
+			mapped_list: CoreMapState[S, CoreExpr] = mapper(state, swap.list)
+			mapped_left_index: CoreMapState[S, CoreExpr] = mapper(mapped_list.state, swap.left_index)
+			mapped_right_index: CoreMapState[S, CoreExpr] = mapper(mapped_left_index.state, swap.right_index)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_list.value, swap.list)
+				and same_core_expr(mapped_left_index.value, swap.left_index)
+				and same_core_expr(mapped_right_index.value, swap.right_index)
+			):
+				expr
+			else:
+				ListSwapExpr(
+					{ swap |
+						list = mapped_list.value,
+						left_index = mapped_left_index.value,
+						right_index = mapped_right_index.value
+					},
+					typ,
+					loc,
+				)
+
+			{ state = mapped_right_index.state, value = rebuilt }
+		StringByteReadExpr(read, typ, loc):
+			mapped_source: CoreMapState[S, CoreExpr] = mapper(state, read.source)
+			mapped_index: CoreMapState[S, CoreExpr] = mapper(mapped_source.state, read.index)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_source.value, read.source)
+				and same_core_expr(mapped_index.value, read.index)
+			):
+				expr
+			else:
+				StringByteReadExpr(
+					{ read |
+						source = mapped_source.value,
+						index = mapped_index.value
+					},
+					typ,
+					loc,
+				)
+
+			{ state = mapped_index.state, value = rebuilt }
+		StringByteWriteExpr(write, typ, loc):
+			mapped_target: CoreMapState[S, CoreExpr] = mapper(state, write.target)
+			mapped_index: CoreMapState[S, CoreExpr] = mapper(mapped_target.state, write.index)
+			mapped_byte: CoreMapState[S, CoreExpr] = mapper(mapped_index.state, write.byte)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_target.value, write.target)
+				and same_core_expr(mapped_index.value, write.index)
+				and same_core_expr(mapped_byte.value, write.byte)
+			):
+				expr
+			else:
+				StringByteWriteExpr(
+					{ write |
+						target = mapped_target.value,
+						index = mapped_index.value,
+						byte = mapped_byte.value
+					},
+					typ,
+					loc,
+				)
+
+			{ state = mapped_byte.state, value = rebuilt }
+		StringByteCopyExpr(copy, typ, loc):
+			mapped_dst: CoreMapState[S, CoreExpr] = mapper(state, copy.dst)
+			mapped_dst_pos: CoreMapState[S, CoreExpr] = mapper(mapped_dst.state, copy.dst_pos)
+			mapped_src: CoreMapState[S, CoreExpr] = mapper(mapped_dst_pos.state, copy.src)
+			mapped_src_pos: CoreMapState[S, CoreExpr] = mapper(mapped_src.state, copy.src_pos)
+			mapped_len: CoreMapState[S, CoreExpr] = mapper(mapped_src_pos.state, copy.len)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_dst.value, copy.dst)
+				and same_core_expr(mapped_dst_pos.value, copy.dst_pos)
+				and same_core_expr(mapped_src.value, copy.src)
+				and same_core_expr(mapped_src_pos.value, copy.src_pos)
+				and same_core_expr(mapped_len.value, copy.len)
+			):
+				expr
+			else:
+				StringByteCopyExpr(
+					{ copy |
+						dst = mapped_dst.value,
+						dst_pos = mapped_dst_pos.value,
+						src = mapped_src.value,
+						src_pos = mapped_src_pos.value,
+						len = mapped_len.value
+					},
+					typ,
+					loc,
+				)
+
+			{ state = mapped_len.state, value = rebuilt }
+		StringSetLenExpr(set_len, typ, loc):
+			mapped_target: CoreMapState[S, CoreExpr] = mapper(state, set_len.target)
+			mapped_len: CoreMapState[S, CoreExpr] = mapper(mapped_target.state, set_len.len)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_target.value, set_len.target)
+				and same_core_expr(mapped_len.value, set_len.len)
+			):
+				expr
+			else:
+				StringSetLenExpr(
+					{ set_len |
+						target = mapped_target.value,
+						len = mapped_len.value
+					},
+					typ,
+					loc,
+				)
+
+			{ state = mapped_len.state, value = rebuilt }
+		TensorLiteralExpr(literal, typ, loc):
+			match literal.payload:
+				TensorRawLiteralPayload(raw):
+					mapped_elements: CoreMapState[S, Option[List[CoreExpr]]] = map_core_state_exprs(
+						raw.elements,
+						state,
+						mapper,
+					)
+					rebuilt: CoreExpr = if mapped_elements.value.is_none():
+						expr
+					else:
+						TensorLiteralExpr(
+							{ literal |
+								payload = TensorRawLiteralPayload(
+									{ raw | elements = mapped_elements.value.get_or(raw.elements) },
+								)
+							},
+							typ,
+							loc,
+						)
+
+					{ state = mapped_elements.state, value = rebuilt }
+				TensorInlineStructLiteralPayload(inline_struct):
+					mapped_elements: CoreMapState[S, Option[List[CoreExpr]]] = map_core_state_exprs(
+						inline_struct.elements,
+						state,
+						mapper,
+					)
+					rebuilt: CoreExpr = if mapped_elements.value.is_none():
+						expr
+					else:
+						TensorLiteralExpr(
+							{ literal |
+								payload = TensorInlineStructLiteralPayload(
+									{ inline_struct |
+										elements = mapped_elements.value.get_or(inline_struct.elements)
+									},
+								)
+							},
+							typ,
+							loc,
+						)
+
+					{ state = mapped_elements.state, value = rebuilt }
+		TensorBoxedLiteralExpr(literal, typ, loc):
+			mapped_elements: CoreMapState[S, Option[List[CoreBoxedStorageValue]]] = map_core_state_boxed_storage_values(
+				literal.elements,
+				state,
+				mapper,
+			)
+			rebuilt: CoreExpr = if mapped_elements.value.is_none():
+				expr
+			else:
+				TensorBoxedLiteralExpr(
+					{ literal | elements = mapped_elements.value.get_or(literal.elements) },
+					typ,
+					loc,
+				)
+
+			{ state = mapped_elements.state, value = rebuilt }
+		TensorPackedLiteralExpr(literal, typ, loc):
+			mapped_elements: CoreMapState[S, Option[List[CoreExpr]]] = map_core_state_exprs(
+				literal.elements,
+				state,
+				mapper,
+			)
+			rebuilt: CoreExpr = if mapped_elements.value.is_none():
+				expr
+			else:
+				TensorPackedLiteralExpr(
+					{ literal | elements = mapped_elements.value.get_or(literal.elements) },
+					typ,
+					loc,
+				)
+
+			{ state = mapped_elements.state, value = rebuilt }
+		TensorRawFillExpr(fill, typ, loc):
+			mapped_value: CoreMapState[S, CoreExpr] = mapper(state, fill.value)
+			mapped_dims: CoreMapState[S, Option[List[CoreExpr]]] = map_core_state_exprs(
+				fill.dims,
+				mapped_value.state,
+				mapper,
+			)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_value.value, fill.value)
+				and mapped_dims.value.is_none()
+			):
+				expr
+			else:
+				TensorRawFillExpr(
+					{ fill |
+						value = mapped_value.value,
+						dims = mapped_dims.value.get_or(fill.dims)
+					},
+					typ,
+					loc,
+				)
+
+			{ state = mapped_dims.state, value = rebuilt }
+		TensorRawReadExpr(read, typ, loc):
+			mapped_index: CoreMapState[S, CoreExpr] = mapper(state, read.index)
+			rebuilt: CoreExpr = if same_core_expr(mapped_index.value, read.index):
+				expr
+			else:
+				TensorRawReadExpr({ read | index = mapped_index.value }, typ, loc)
+
+			{ state = mapped_index.state, value = rebuilt }
+		TensorRawWriteExpr(write, typ, loc):
+			mapped_index: CoreMapState[S, CoreExpr] = mapper(state, write.index)
+			mapped_value: CoreMapState[S, CoreExpr] = mapper(mapped_index.state, write.value)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_index.value, write.index)
+				and same_core_expr(mapped_value.value, write.value)
+			):
+				expr
+			else:
+				TensorRawWriteExpr(
+					{ write |
+						index = mapped_index.value,
+						value = mapped_value.value
+					},
+					typ,
+					loc,
+				)
+
+			{ state = mapped_value.state, value = rebuilt }
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			mapped_source: CoreMapState[S, CoreExpr] = mapper(state, binding.source)
+			mapped_body: CoreMapState[S, CoreExpr] = mapper(mapped_source.state, body)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_source.value, binding.source)
+				and same_core_expr(mapped_body.value, body)
+			):
+				expr
+			else:
+				TensorRawViewLetExpr(
+					{ binding | source = mapped_source.value },
+					mapped_body.value,
+					typ,
+					loc,
+				)
+
+			{ state = mapped_body.state, value = rebuilt }
+		_:
+			{ state = state, value = expr }
+
+
+-- Lambdas, tail-recursive loops, `for` loops, and resource scopes. Purely
+-- type-level fields (parameters, loop binders, item modes, task closures)
+-- carry no CoreExpr child and are always left as they were, matching
+-- `immediate_core_expr_children`'s omission of them.
+pure func map_core_loop_children_with_state[S](
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+	expr: CoreExpr,
+) -> CoreMapState[S, CoreExpr]:
+	match expr:
+		LambdaExpr(params, return_type, body, is_pure, typ, loc):
+			mapped_body: CoreMapState[S, CoreExpr] = mapper(state, body)
+			rebuilt: CoreExpr = if same_core_expr(mapped_body.value, body):
+				expr
+			else:
+				LambdaExpr(params, return_type, mapped_body.value, is_pure, typ, loc)
+
+			{ state = mapped_body.state, value = rebuilt }
+		TailrecLoopExpr(params, return_type, body, loc):
+			mapped_body: CoreMapState[S, CoreExpr] = mapper(state, body)
+			rebuilt: CoreExpr = if same_core_expr(mapped_body.value, body):
+				expr
+			else:
+				TailrecLoopExpr(params, return_type, mapped_body.value, loc)
+
+			{ state = mapped_body.state, value = rebuilt }
+		TailrecRecurExpr(args, typ, loc):
+			mapped_args: CoreMapState[S, Option[List[CoreExpr]]] = map_core_state_exprs(args, state, mapper)
+			rebuilt: CoreExpr = if mapped_args.value.is_none():
+				expr
+			else:
+				TailrecRecurExpr(mapped_args.value.get_or(args), typ, loc)
+
+			{ state = mapped_args.state, value = rebuilt }
+		TailrecListSpreadLoopExpr(loop, loc):
+			mapped_body: CoreMapState[S, CoreExpr] = mapper(state, loop.body)
+			rebuilt: CoreExpr = if same_core_expr(mapped_body.value, loop.body):
+				expr
+			else:
+				TailrecListSpreadLoopExpr({ loop | body = mapped_body.value }, loc)
+
+			{ state = mapped_body.state, value = rebuilt }
+		TailrecListSpreadRecurExpr(rebinds, cursor_advance, typ, loc):
+			mapped_rebinds: CoreMapState[S, Option[List[CoreTailrecListSpreadRebind]]] = map_core_state_tailrec_rebinds(
+				rebinds,
+				state,
+				mapper,
+			)
+			rebuilt: CoreExpr = if mapped_rebinds.value.is_none():
+				expr
+			else:
+				TailrecListSpreadRecurExpr(
+					mapped_rebinds.value.get_or(rebinds),
+					cursor_advance,
+					typ,
+					loc,
+				)
+
+			{ state = mapped_rebinds.state, value = rebuilt }
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			mapped_start: CoreMapState[S, CoreExpr] = mapper(state, start)
+			mapped_end: CoreMapState[S, CoreExpr] = mapper(mapped_start.state, end_value)
+			mapped_body: CoreMapState[S, CoreExpr] = mapper(mapped_end.state, body)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_start.value, start)
+				and same_core_expr(mapped_end.value, end_value)
+				and same_core_expr(mapped_body.value, body)
+			):
+				expr
+			else:
+				ForRangeExpr(binder, mapped_start.value, mapped_end.value, mapped_body.value, typ, loc)
+
+			{ state = mapped_body.state, value = rebuilt }
+		ForChannelExpr(loop, typ, loc):
+			mapped_iterable: CoreMapState[S, CoreExpr] = mapper(state, loop.iterable)
+			mapped_body: CoreMapState[S, CoreExpr] = mapper(mapped_iterable.state, loop.body)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_iterable.value, loop.iterable)
+				and same_core_expr(mapped_body.value, loop.body)
+			):
+				expr
+			else:
+				ForChannelExpr(
+					{ loop | iterable = mapped_iterable.value, body = mapped_body.value },
+					typ,
+					loc,
+				)
+
+			{ state = mapped_body.state, value = rebuilt }
+		ForListExpr(loop, typ, loc):
+			mapped_iterable: CoreMapState[S, CoreExpr] = mapper(state, loop.iterable)
+			mapped_body: CoreMapState[S, CoreExpr] = mapper(mapped_iterable.state, loop.body)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_iterable.value, loop.iterable)
+				and same_core_expr(mapped_body.value, loop.body)
+			):
+				expr
+			else:
+				ForListExpr(
+					{ loop | iterable = mapped_iterable.value, body = mapped_body.value },
+					typ,
+					loc,
+				)
+
+			{ state = mapped_body.state, value = rebuilt }
+		ForStringExpr(loop, typ, loc):
+			mapped_iterable: CoreMapState[S, CoreExpr] = mapper(state, loop.iterable)
+			mapped_body: CoreMapState[S, CoreExpr] = mapper(mapped_iterable.state, loop.body)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_iterable.value, loop.iterable)
+				and same_core_expr(mapped_body.value, loop.body)
+			):
+				expr
+			else:
+				ForStringExpr(
+					{ loop | iterable = mapped_iterable.value, body = mapped_body.value },
+					typ,
+					loc,
+				)
+
+			{ state = mapped_body.state, value = rebuilt }
+		ForDictExpr(loop, typ, loc):
+			mapped_iterable: CoreMapState[S, CoreExpr] = mapper(state, loop.iterable)
+			mapped_body: CoreMapState[S, CoreExpr] = mapper(mapped_iterable.state, loop.body)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_iterable.value, loop.iterable)
+				and same_core_expr(mapped_body.value, loop.body)
+			):
+				expr
+			else:
+				ForDictExpr(
+					{ loop | iterable = mapped_iterable.value, body = mapped_body.value },
+					typ,
+					loc,
+				)
+
+			{ state = mapped_body.state, value = rebuilt }
+		ForSetExpr(loop, typ, loc):
+			mapped_iterable: CoreMapState[S, CoreExpr] = mapper(state, loop.iterable)
+			mapped_body: CoreMapState[S, CoreExpr] = mapper(mapped_iterable.state, loop.body)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_iterable.value, loop.iterable)
+				and same_core_expr(mapped_body.value, loop.body)
+			):
+				expr
+			else:
+				ForSetExpr(
+					{ loop | iterable = mapped_iterable.value, body = mapped_body.value },
+					typ,
+					loc,
+				)
+
+			{ state = mapped_body.state, value = rebuilt }
+		ForStreamExpr(loop, typ, loc):
+			mapped_iterable: CoreMapState[S, CoreExpr] = mapper(state, loop.iterable)
+			mapped_body: CoreMapState[S, CoreExpr] = mapper(mapped_iterable.state, loop.body)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_iterable.value, loop.iterable)
+				and same_core_expr(mapped_body.value, loop.body)
+			):
+				expr
+			else:
+				ForStreamExpr(
+					{ loop | iterable = mapped_iterable.value, body = mapped_body.value },
+					typ,
+					loc,
+				)
+
+			{ state = mapped_body.state, value = rebuilt }
+		ForResourceSourceExpr(loop, typ, loc):
+			mapped_iterable: CoreMapState[S, CoreExpr] = mapper(state, loop.iterable)
+			mapped_body: CoreMapState[S, CoreExpr] = mapper(mapped_iterable.state, loop.body)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_iterable.value, loop.iterable)
+				and same_core_expr(mapped_body.value, loop.body)
+			):
+				expr
+			else:
+				ForResourceSourceExpr(
+					{ loop | iterable = mapped_iterable.value, body = mapped_body.value },
+					typ,
+					loc,
+				)
+
+			{ state = mapped_body.state, value = rebuilt }
+		ForTensorExpr(loop, typ, loc):
+			mapped_iterable: CoreMapState[S, CoreExpr] = mapper(state, loop.iterable)
+			mapped_body: CoreMapState[S, CoreExpr] = mapper(mapped_iterable.state, loop.body)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_iterable.value, loop.iterable)
+				and same_core_expr(mapped_body.value, loop.body)
+			):
+				expr
+			else:
+				ForTensorExpr(
+					{ loop | iterable = mapped_iterable.value, body = mapped_body.value },
+					typ,
+					loc,
+				)
+
+			{ state = mapped_body.state, value = rebuilt }
+		ResourceScopeExpr(scope, typ, loc):
+			mapped_acquire: CoreMapState[S, CoreExpr] = mapper(state, scope.acquire)
+			mapped_body: CoreMapState[S, CoreExpr] = mapper(mapped_acquire.state, scope.body)
+			mapped_cleanup: CoreMapState[S, CoreExpr] = mapper(mapped_body.state, scope.cleanup)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_acquire.value, scope.acquire)
+				and same_core_expr(mapped_body.value, scope.body)
+				and same_core_expr(mapped_cleanup.value, scope.cleanup)
+			):
+				expr
+			else:
+				ResourceScopeExpr(
+					{ scope |
+						acquire = mapped_acquire.value,
+						body = mapped_body.value,
+						cleanup = mapped_cleanup.value
+					},
+					typ,
+					loc,
+				)
+
+			{ state = mapped_cleanup.state, value = rebuilt }
+		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
+			mapped_cleanups: CoreMapState[S, Option[List[CoreExpr]]] = map_core_state_exprs(
+				cleanup_exit.cleanups,
+				state,
+				mapper,
+			)
+			rebuilt: CoreExpr = if mapped_cleanups.value.is_none():
+				expr
+			else:
+				ResourceCleanupExitExpr(
+					{ cleanup_exit | cleanups = mapped_cleanups.value.get_or(cleanup_exit.cleanups) },
+					typ,
+					loc,
+				)
+
+			{ state = mapped_cleanups.state, value = rebuilt }
+		_:
+			{ state = state, value = expr }
+
+
+private pure func map_core_state_tailrec_rebinds[S](
+	rebinds: List[CoreTailrecListSpreadRebind],
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+) -> CoreMapState[S, Option[List[CoreTailrecListSpreadRebind]]]:
+	var mapped: List[CoreTailrecListSpreadRebind] = []
+	var changed: Bool = False
+	var current_state: S = state
+	var index: Int = 0
+
+	for rebind in rebinds:
+		result: CoreMapState[S, CoreExpr] = mapper(current_state, rebind.value)
+		current_state = result.state
+
+		if changed:
+			mapped = mapped.append({ rebind | value = result.value })
+		else if not same_core_expr(result.value, rebind.value):
+			mapped = rebinds.take(index).append({ rebind | value = result.value })
+			changed = True
+		else:
+			void
+
+		index += 1
+
+	if changed:
+		{ state = current_state, value = Some(mapped) }
+	else:
+		{ state = current_state, value = None }
+
+
+-- Structured-concurrency blocks and loops, before and after closure
+-- formation. Purely type-level fields (item type/mode, task closures) carry
+-- no CoreExpr child and are always left as they were.
+pure func map_core_concurrency_children_with_state[S](
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+	expr: CoreExpr,
+) -> CoreMapState[S, CoreExpr]:
+	match expr:
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			mapped_iterable: CoreMapState[S, CoreExpr] = mapper(state, loop.iterable)
+			mapped_body: CoreMapState[S, CoreExpr] = mapper(mapped_iterable.state, loop.body)
+			mapped_timeout: CoreMapState[S, Option[CoreExpr]] = map_core_state_optional_expr(
+				mapped_body.state,
+				mapper,
+				loop.timeout,
+			)
+			mapped_limit: CoreMapState[S, CoreExpr] = mapper(mapped_timeout.state, loop.limit)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_iterable.value, loop.iterable)
+				and same_core_expr(mapped_body.value, loop.body)
+				and same_optional_core_expr(mapped_timeout.value, loop.timeout)
+				and same_core_expr(mapped_limit.value, loop.limit)
+			):
+				expr
+			else:
+				PreClosureConcurrentlyLoopExpr(
+					{ loop |
+						iterable = mapped_iterable.value,
+						body = mapped_body.value,
+						timeout = mapped_timeout.value,
+						limit = mapped_limit.value
+					},
+					typ,
+					loc,
+				)
+
+			{ state = mapped_limit.state, value = rebuilt }
+		ConcurrentlyLoopExpr(loop, typ, loc):
+			mapped_iterable: CoreMapState[S, CoreExpr] = mapper(state, loop.iterable)
+			mapped_body: CoreMapState[S, CoreExpr] = mapper(mapped_iterable.state, loop.body)
+			mapped_timeout: CoreMapState[S, Option[CoreExpr]] = map_core_state_optional_expr(
+				mapped_body.state,
+				mapper,
+				loop.timeout,
+			)
+			mapped_limit: CoreMapState[S, CoreExpr] = mapper(mapped_timeout.state, loop.limit)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_iterable.value, loop.iterable)
+				and same_core_expr(mapped_body.value, loop.body)
+				and same_optional_core_expr(mapped_timeout.value, loop.timeout)
+				and same_core_expr(mapped_limit.value, loop.limit)
+			):
+				expr
+			else:
+				ConcurrentlyLoopExpr(
+					{ loop |
+						iterable = mapped_iterable.value,
+						body = mapped_body.value,
+						timeout = mapped_timeout.value,
+						limit = mapped_limit.value
+					},
+					typ,
+					loc,
+				)
+
+			{ state = mapped_limit.state, value = rebuilt }
+		PreClosureConcurrentExpr(block, typ, loc):
+			mapped_bindings: CoreMapState[S, Option[List[CorePreClosureConcurrentBinding]]] = map_core_state_pre_closure_concurrent_bindings(
+				block.bindings,
+				state,
+				mapper,
+			)
+			mapped_body: CoreMapState[S, CoreExpr] = mapper(mapped_bindings.state, block.body)
+			mapped_timeout: CoreMapState[S, Option[CoreExpr]] = map_core_state_optional_expr(
+				mapped_body.state,
+				mapper,
+				block.timeout,
+			)
+			rebuilt: CoreExpr = if (
+				mapped_bindings.value.is_none()
+				and same_core_expr(mapped_body.value, block.body)
+				and same_optional_core_expr(mapped_timeout.value, block.timeout)
+			):
+				expr
+			else:
+				PreClosureConcurrentExpr(
+					{ block |
+						bindings = mapped_bindings.value.get_or(block.bindings),
+						body = mapped_body.value,
+						timeout = mapped_timeout.value
+					},
+					typ,
+					loc,
+				)
+
+			{ state = mapped_timeout.state, value = rebuilt }
+		ConcurrentExpr(block, typ, loc):
+			mapped_bindings: CoreMapState[S, Option[List[CoreConcurrentBinding]]] = map_core_state_concurrent_bindings(
+				block.bindings,
+				state,
+				mapper,
+			)
+			mapped_body: CoreMapState[S, CoreExpr] = mapper(mapped_bindings.state, block.body)
+			mapped_timeout: CoreMapState[S, Option[CoreExpr]] = map_core_state_optional_expr(
+				mapped_body.state,
+				mapper,
+				block.timeout,
+			)
+			rebuilt: CoreExpr = if (
+				mapped_bindings.value.is_none()
+				and same_core_expr(mapped_body.value, block.body)
+				and same_optional_core_expr(mapped_timeout.value, block.timeout)
+			):
+				expr
+			else:
+				ConcurrentExpr(
+					{ block |
+						bindings = mapped_bindings.value.get_or(block.bindings),
+						body = mapped_body.value,
+						timeout = mapped_timeout.value
+					},
+					typ,
+					loc,
+				)
+
+			{ state = mapped_timeout.state, value = rebuilt }
+		_:
+			{ state = state, value = expr }
+
+
+private pure func map_core_state_optional_expr[S](
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+	value: Option[CoreExpr],
+) -> CoreMapState[S, Option[CoreExpr]]:
+	match value:
+		Some(inner):
+			result: CoreMapState[S, CoreExpr] = mapper(state, inner)
+			rebuilt: Option[CoreExpr] = if same_core_expr(result.value, inner):
+				value
+			else:
+				Some(result.value)
+
+			{ state = result.state, value = rebuilt }
+		None:
+			{ state = state, value = value }
+
+
+private pure func map_core_state_concurrent_binding[S](
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+	binding: CoreConcurrentBinding,
+) -> CoreMapState[S, Option[CoreConcurrentBinding]]:
+	mapped_rhs: CoreMapState[S, CoreExpr] = mapper(state, binding.rhs)
+	rebuilt: Option[CoreConcurrentBinding] = if same_core_expr(mapped_rhs.value, binding.rhs):
+		None
+	else:
+		Some({ binding | rhs = mapped_rhs.value })
+
+	{ state = mapped_rhs.state, value = rebuilt }
+
+
+private pure func map_core_state_concurrent_bindings[S](
+	bindings: List[CoreConcurrentBinding],
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+) -> CoreMapState[S, Option[List[CoreConcurrentBinding]]]:
+	var mapped: List[CoreConcurrentBinding] = []
+	var changed: Bool = False
+	var current_state: S = state
+	var index: Int = 0
+
+	for binding in bindings:
+		result: CoreMapState[S, Option[CoreConcurrentBinding]] = map_core_state_concurrent_binding(
+			current_state,
+			mapper,
+			binding,
+		)
+		current_state = result.state
+
+		match result.value:
+			Some(mapped_binding):
+				mapped = if changed:
+					mapped.append(mapped_binding)
+				else:
+					bindings.take(index).append(mapped_binding)
+
+				changed = True
+			None:
+				if changed:
+					mapped = mapped.append(binding)
+				else:
+					void
+
+		index += 1
+
+	if changed:
+		{ state = current_state, value = Some(mapped) }
+	else:
+		{ state = current_state, value = None }
+
+
+private pure func map_core_state_pre_closure_concurrent_binding[S](
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+	binding: CorePreClosureConcurrentBinding,
+) -> CoreMapState[S, Option[CorePreClosureConcurrentBinding]]:
+	mapped_rhs: CoreMapState[S, CoreExpr] = mapper(state, binding.rhs)
+	rebuilt: Option[CorePreClosureConcurrentBinding] = if same_core_expr(mapped_rhs.value, binding.rhs):
+		None
+	else:
+		Some({ binding | rhs = mapped_rhs.value })
+
+	{ state = mapped_rhs.state, value = rebuilt }
+
+
+private pure func map_core_state_pre_closure_concurrent_bindings[S](
+	bindings: List[CorePreClosureConcurrentBinding],
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+) -> CoreMapState[S, Option[List[CorePreClosureConcurrentBinding]]]:
+	var mapped: List[CorePreClosureConcurrentBinding] = []
+	var changed: Bool = False
+	var current_state: S = state
+	var index: Int = 0
+
+	for binding in bindings:
+		result: CoreMapState[S, Option[CorePreClosureConcurrentBinding]] = map_core_state_pre_closure_concurrent_binding(
+			current_state,
+			mapper,
+			binding,
+		)
+		current_state = result.state
+
+		match result.value:
+			Some(mapped_binding):
+				mapped = if changed:
+					mapped.append(mapped_binding)
+				else:
+					bindings.take(index).append(mapped_binding)
+
+				changed = True
+			None:
+				if changed:
+					mapped = mapped.append(binding)
+				else:
+					void
+
+		index += 1
+
+	if changed:
+		{ state = current_state, value = Some(mapped) }
+	else:
+		{ state = current_state, value = None }
+
+
+-- The compiled match forms. Purely type-level fields (accessors, bindings,
+-- scrutinee/result types) carry no CoreExpr child and are always left as
+-- they were.
+pure func map_core_match_children_with_state[S](
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+	expr: CoreExpr,
+) -> CoreMapState[S, CoreExpr]:
+	match expr:
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			mapped_scrutinee: CoreMapState[S, CoreExpr] = mapper(state, scrutinee)
+			mapped_cases: CoreMapState[S, Option[List[CoreRawMatchCase]]] = map_core_state_raw_match_cases(
+				cases,
+				mapped_scrutinee.state,
+				mapper,
+			)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_scrutinee.value, scrutinee)
+				and mapped_cases.value.is_none()
+			):
+				expr
+			else:
+				RawMatchExpr(mapped_scrutinee.value, mapped_cases.value.get_or(cases), typ, loc)
+
+			{ state = mapped_cases.state, value = rebuilt }
+		SemanticMatchExpr(scrutinee, tree, typ, loc):
+			mapped_scrutinee: CoreMapState[S, CoreExpr] = mapper(state, scrutinee)
+			mapped_tree: CoreMapState[S, Option[CoreSemanticMatchTree]] = map_core_state_semantic_match_tree(
+				tree,
+				mapped_scrutinee.state,
+				mapper,
+			)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_scrutinee.value, scrutinee)
+				and mapped_tree.value.is_none()
+			):
+				expr
+			else:
+				SemanticMatchExpr(mapped_scrutinee.value, mapped_tree.value.get_or(tree), typ, loc)
+
+			{ state = mapped_tree.state, value = rebuilt }
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			mapped_scrutinee: CoreMapState[S, CoreExpr] = mapper(state, scrutinee)
+			mapped_cases: CoreMapState[S, Option[List[CoreLiteralMatchCase]]] = map_core_state_literal_match_cases(
+				cases,
+				mapped_scrutinee.state,
+				mapper,
+			)
+			mapped_fallback: CoreMapState[S, Option[CoreLiteralMatchFallback]] = map_core_state_literal_match_fallback(
+				fallback,
+				mapped_cases.state,
+				mapper,
+			)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_scrutinee.value, scrutinee)
+				and mapped_cases.value.is_none()
+				and mapped_fallback.value.is_none()
+			):
+				expr
+			else:
+				LiteralMatchExpr(
+					mapped_scrutinee.value,
+					mapped_cases.value.get_or(cases),
+					mapped_fallback.value.get_or(fallback),
+					typ,
+					loc,
+				)
+
+			{ state = mapped_fallback.state, value = rebuilt }
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			mapped_scrutinee: CoreMapState[S, CoreExpr] = mapper(state, scrutinee)
+			mapped_match: CoreMapState[S, Option[CoreConstructorLiteralMatch]] = map_core_state_constructor_literal_match(
+				match_expr,
+				mapped_scrutinee.state,
+				mapper,
+			)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_scrutinee.value, scrutinee)
+				and mapped_match.value.is_none()
+			):
+				expr
+			else:
+				AccessorLiteralMatchExpr(
+					mapped_scrutinee.value,
+					release_policy,
+					mapped_match.value.get_or(match_expr),
+					typ,
+					loc,
+				)
+
+			{ state = mapped_match.state, value = rebuilt }
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			mapped_scrutinee: CoreMapState[S, CoreExpr] = mapper(state, scrutinee)
+			mapped_match: CoreMapState[S, Option[CoreConstructorLengthMatch]] = map_core_state_constructor_length_match(
+				match_expr,
+				mapped_scrutinee.state,
+				mapper,
+			)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_scrutinee.value, scrutinee)
+				and mapped_match.value.is_none()
+			):
+				expr
+			else:
+				LengthMatchExpr(
+					mapped_scrutinee.value,
+					release_policy,
+					mapped_match.value.get_or(match_expr),
+					typ,
+					loc,
+				)
+
+			{ state = mapped_match.state, value = rebuilt }
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			mapped_scrutinee: CoreMapState[S, CoreExpr] = mapper(state, scrutinee)
+			mapped_cases: CoreMapState[S, Option[List[CoreConstructorMatchCase]]] = map_core_state_constructor_match_cases(
+				cases,
+				mapped_scrutinee.state,
+				mapper,
+			)
+			mapped_fallback: CoreMapState[S, Option[CoreConstructorMatchFallback]] = map_core_state_constructor_match_fallback(
+				fallback,
+				mapped_cases.state,
+				mapper,
+			)
+			rebuilt: CoreExpr = if (
+				same_core_expr(mapped_scrutinee.value, scrutinee)
+				and mapped_cases.value.is_none()
+				and mapped_fallback.value.is_none()
+			):
+				expr
+			else:
+				ConstructorMatchExpr(
+					mapped_scrutinee.value,
+					release_policy,
+					mapped_cases.value.get_or(cases),
+					mapped_fallback.value.get_or(fallback),
+					typ,
+					loc,
+				)
+
+			{ state = mapped_fallback.state, value = rebuilt }
+		_:
+			{ state = state, value = expr }
+
+
+private pure func map_core_state_raw_match_cases[S](
+	cases: List[CoreRawMatchCase],
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+) -> CoreMapState[S, Option[List[CoreRawMatchCase]]]:
+	var mapped: List[CoreRawMatchCase] = []
+	var changed: Bool = False
+	var current_state: S = state
+	var index: Int = 0
+
+	for match_case in cases:
+		result: CoreMapState[S, CoreExpr] = mapper(current_state, match_case.body)
+		current_state = result.state
+
+		if changed:
+			mapped = mapped.append({
+				pattern = match_case.pattern,
+				body = result.value,
+			})
+		else if not same_core_expr(result.value, match_case.body):
+			mapped = cases
+				.take(index)
+				.append({
+					pattern = match_case.pattern,
+					body = result.value,
+				})
+			changed = True
+		else:
+			void
+
+		index += 1
+
+	if changed:
+		{ state = current_state, value = Some(mapped) }
+	else:
+		{ state = current_state, value = None }
+
+
+private pure func map_core_state_literal_match_case[S](
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+	match_case: CoreLiteralMatchCase,
+) -> CoreMapState[S, Option[CoreLiteralMatchCase]]:
+	mapped_body: CoreMapState[S, CoreExpr] = mapper(state, match_case.body)
+	rebuilt: Option[CoreLiteralMatchCase] = if same_core_expr(mapped_body.value, match_case.body):
+		None
+	else:
+		Some({ match_case | body = mapped_body.value })
+
+	{ state = mapped_body.state, value = rebuilt }
+
+
+private pure func map_core_state_literal_match_cases[S](
+	cases: List[CoreLiteralMatchCase],
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+) -> CoreMapState[S, Option[List[CoreLiteralMatchCase]]]:
+	var mapped: List[CoreLiteralMatchCase] = []
+	var changed: Bool = False
+	var current_state: S = state
+	var index: Int = 0
+
+	for match_case in cases:
+		result: CoreMapState[S, Option[CoreLiteralMatchCase]] = map_core_state_literal_match_case(
+			current_state,
+			mapper,
+			match_case,
+		)
+		current_state = result.state
+
+		match result.value:
+			Some(mapped_case):
+				mapped = if changed:
+					mapped.append(mapped_case)
+				else:
+					cases.take(index).append(mapped_case)
+
+				changed = True
+			None:
+				if changed:
+					mapped = mapped.append(match_case)
+				else:
+					void
+
+		index += 1
+
+	if changed:
+		{ state = current_state, value = Some(mapped) }
+	else:
+		{ state = current_state, value = None }
+
+
+private pure func map_core_state_literal_match_fallback[S](
+	fallback: CoreLiteralMatchFallback,
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+) -> CoreMapState[S, Option[CoreLiteralMatchFallback]]:
+	match fallback:
+		LiteralMatchFallbackBody(body):
+			mapped: CoreMapState[S, CoreExpr] = mapper(state, body)
+			rebuilt: Option[CoreLiteralMatchFallback] = if same_core_expr(mapped.value, body):
+				None
+			else:
+				Some(LiteralMatchFallbackBody(mapped.value))
+
+			{ state = mapped.state, value = rebuilt }
+		LiteralMatchFallbackBindings(bindings, body):
+			mapped: CoreMapState[S, CoreExpr] = mapper(state, body)
+			rebuilt: Option[CoreLiteralMatchFallback] = if same_core_expr(mapped.value, body):
+				None
+			else:
+				Some(LiteralMatchFallbackBindings(bindings, mapped.value))
+
+			{ state = mapped.state, value = rebuilt }
+		LiteralMatchFallbackFail:
+			{ state = state, value = None }
+
+
+private pure func map_core_state_constructor_literal_match[S](
+	match_expr: CoreConstructorLiteralMatch,
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+) -> CoreMapState[S, Option[CoreConstructorLiteralMatch]]:
+	mapped_cases: CoreMapState[S, Option[List[CoreLiteralMatchCase]]] = map_core_state_literal_match_cases(
+		match_expr.cases,
+		state,
+		mapper,
+	)
+	mapped_fallback: CoreMapState[S, Option[CoreLiteralMatchFallback]] = map_core_state_literal_match_fallback(
+		match_expr.fallback,
+		mapped_cases.state,
+		mapper,
+	)
+	rebuilt: Option[CoreConstructorLiteralMatch] = if (
+		mapped_cases.value.is_none()
+		and mapped_fallback.value.is_none()
+	):
+		None
+	else:
+		Some({ match_expr |
+				cases = mapped_cases.value.get_or(match_expr.cases),
+				fallback = mapped_fallback.value.get_or(match_expr.fallback)
+			})
+
+	{ state = mapped_fallback.state, value = rebuilt }
+
+
+private pure func map_core_state_constructor_match_body[S](
+	body: CoreConstructorMatchBody,
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+) -> CoreMapState[S, Option[CoreConstructorMatchBody]]:
+	match body:
+		ConstructorMatchBodyExpr(inner):
+			mapped: CoreMapState[S, CoreExpr] = mapper(state, inner)
+			rebuilt: Option[CoreConstructorMatchBody] = if same_core_expr(mapped.value, inner):
+				None
+			else:
+				Some(ConstructorMatchBodyExpr(mapped.value))
+
+			{ state = mapped.state, value = rebuilt }
+		ConstructorMatchBodyLiteral(match_expr):
+			mapped: CoreMapState[S, Option[CoreConstructorLiteralMatch]] = map_core_state_constructor_literal_match(
+				match_expr,
+				state,
+				mapper,
+			)
+
+			match mapped.value:
+				Some(mapped_match):
+					{ state = mapped.state, value = Some(ConstructorMatchBodyLiteral(mapped_match)) }
+				None:
+					{ state = mapped.state, value = None }
+		ConstructorMatchBodyLength(match_expr):
+			mapped: CoreMapState[S, Option[CoreConstructorLengthMatch]] = map_core_state_constructor_length_match(
+				match_expr,
+				state,
+				mapper,
+			)
+
+			match mapped.value:
+				Some(mapped_match):
+					{ state = mapped.state, value = Some(ConstructorMatchBodyLength(mapped_match)) }
+				None:
+					{ state = mapped.state, value = None }
+
+
+private pure func map_core_state_constructor_length_branch[S](
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+	branch: CoreConstructorLengthMatchBranch,
+) -> CoreMapState[S, Option[CoreConstructorLengthMatchBranch]]:
+	mapped_body: CoreMapState[S, Option[CoreConstructorMatchBody]] = map_core_state_constructor_match_body(
+		branch.body,
+		state,
+		mapper,
+	)
+	rebuilt: Option[CoreConstructorLengthMatchBranch] = if mapped_body.value.is_none():
+		None
+	else:
+		Some({ branch | body = mapped_body.value.get_or(branch.body) })
+
+	{ state = mapped_body.state, value = rebuilt }
+
+
+private pure func map_core_state_constructor_length_case[S](
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+	match_case: CoreConstructorLengthMatchCase,
+) -> CoreMapState[S, Option[CoreConstructorLengthMatchCase]]:
+	mapped_branch: CoreMapState[S, Option[CoreConstructorLengthMatchBranch]] = map_core_state_constructor_length_branch(
+		state,
+		mapper,
+		match_case.branch,
+	)
+
+	match mapped_branch.value:
+		Some(new_branch):
+			{ state = mapped_branch.state, value = Some({ match_case | branch = new_branch }) }
+		None:
+			{ state = mapped_branch.state, value = None }
+
+
+private pure func map_core_state_constructor_length_cases[S](
+	cases: List[CoreConstructorLengthMatchCase],
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+) -> CoreMapState[S, Option[List[CoreConstructorLengthMatchCase]]]:
+	var mapped: List[CoreConstructorLengthMatchCase] = []
+	var changed: Bool = False
+	var current_state: S = state
+	var index: Int = 0
+
+	for match_case in cases:
+		result: CoreMapState[S, Option[CoreConstructorLengthMatchCase]] = map_core_state_constructor_length_case(
+			current_state,
+			mapper,
+			match_case,
+		)
+		current_state = result.state
+
+		match result.value:
+			Some(mapped_case):
+				mapped = if changed:
+					mapped.append(mapped_case)
+				else:
+					cases.take(index).append(mapped_case)
+
+				changed = True
+			None:
+				if changed:
+					mapped = mapped.append(match_case)
+				else:
+					void
+
+		index += 1
+
+	if changed:
+		{ state = current_state, value = Some(mapped) }
+	else:
+		{ state = current_state, value = None }
+
+
+private pure func map_core_state_constructor_length_match[S](
+	match_expr: CoreConstructorLengthMatch,
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+) -> CoreMapState[S, Option[CoreConstructorLengthMatch]]:
+	mapped_cases: CoreMapState[S, Option[List[CoreConstructorLengthMatchCase]]] = map_core_state_constructor_length_cases(
+		match_expr.cases,
+		state,
+		mapper,
+	)
+
+	var geq_changed: Bool = False
+
+	mapped_geq_result: CoreMapState[S, Option[CoreConstructorLengthMatchGeq]] = match match_expr.geq:
+		Some(geq):
+			branch_result: CoreMapState[S, Option[CoreConstructorLengthMatchBranch]] = map_core_state_constructor_length_branch(
+				mapped_cases.state,
+				mapper,
+				geq.branch,
+			)
+
+			match branch_result.value:
+				Some(mapped_branch):
+					geq_changed = True
+					{ state = branch_result.state, value = Some({ geq | branch = mapped_branch }) }
+				None:
+					{ state = branch_result.state, value = match_expr.geq }
+		None:
+			{ state = mapped_cases.state, value = match_expr.geq }
+
+	var fallback_changed: Bool = False
+
+	mapped_fallback_result: CoreMapState[S, Option[CoreConstructorLengthMatchBranch]] = match match_expr.fallback:
+		Some(branch):
+			branch_result: CoreMapState[S, Option[CoreConstructorLengthMatchBranch]] = map_core_state_constructor_length_branch(
+				mapped_geq_result.state,
+				mapper,
+				branch,
+			)
+
+			match branch_result.value:
+				Some(mapped_branch):
+					fallback_changed = True
+					{ state = branch_result.state, value = Some(mapped_branch) }
+				None:
+					{ state = branch_result.state, value = match_expr.fallback }
+		None:
+			{ state = mapped_geq_result.state, value = match_expr.fallback }
+
+	rebuilt: Option[CoreConstructorLengthMatch] = if (
+		mapped_cases.value.is_none()
+		and not geq_changed
+		and not fallback_changed
+	):
+		None
+	else:
+		Some({ match_expr |
+				cases = mapped_cases.value.get_or(match_expr.cases),
+				geq = mapped_geq_result.value,
+				fallback = mapped_fallback_result.value
+			})
+
+	{ state = mapped_fallback_result.state, value = rebuilt }
+
+
+private pure func map_core_state_constructor_match_case[S](
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+	match_case: CoreConstructorMatchCase,
+) -> CoreMapState[S, Option[CoreConstructorMatchCase]]:
+	mapped_body: CoreMapState[S, Option[CoreConstructorMatchBody]] = map_core_state_constructor_match_body(
+		match_case.body,
+		state,
+		mapper,
+	)
+	rebuilt: Option[CoreConstructorMatchCase] = if mapped_body.value.is_none():
+		None
+	else:
+		Some({ match_case | body = mapped_body.value.get_or(match_case.body) })
+
+	{ state = mapped_body.state, value = rebuilt }
+
+
+private pure func map_core_state_constructor_match_cases[S](
+	cases: List[CoreConstructorMatchCase],
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+) -> CoreMapState[S, Option[List[CoreConstructorMatchCase]]]:
+	var mapped: List[CoreConstructorMatchCase] = []
+	var changed: Bool = False
+	var current_state: S = state
+	var index: Int = 0
+
+	for match_case in cases:
+		result: CoreMapState[S, Option[CoreConstructorMatchCase]] = map_core_state_constructor_match_case(
+			current_state,
+			mapper,
+			match_case,
+		)
+		current_state = result.state
+
+		match result.value:
+			Some(mapped_case):
+				mapped = if changed:
+					mapped.append(mapped_case)
+				else:
+					cases.take(index).append(mapped_case)
+
+				changed = True
+			None:
+				if changed:
+					mapped = mapped.append(match_case)
+				else:
+					void
+
+		index += 1
+
+	if changed:
+		{ state = current_state, value = Some(mapped) }
+	else:
+		{ state = current_state, value = None }
+
+
+private pure func map_core_state_constructor_match_fallback[S](
+	fallback: CoreConstructorMatchFallback,
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+) -> CoreMapState[S, Option[CoreConstructorMatchFallback]]:
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			mapped: CoreMapState[S, CoreExpr] = mapper(state, body)
+			rebuilt: Option[CoreConstructorMatchFallback] = if same_core_expr(mapped.value, body):
+				None
+			else:
+				Some(ConstructorMatchFallbackBody(mapped.value))
+
+			{ state = mapped.state, value = rebuilt }
+		ConstructorMatchFallbackBindings(bindings, body):
+			mapped: CoreMapState[S, CoreExpr] = mapper(state, body)
+			rebuilt: Option[CoreConstructorMatchFallback] = if same_core_expr(mapped.value, body):
+				None
+			else:
+				Some(ConstructorMatchFallbackBindings(bindings, mapped.value))
+
+			{ state = mapped.state, value = rebuilt }
+		ConstructorMatchFallbackFail:
+			{ state = state, value = None }
+
+
+private pure func map_core_state_semantic_match_tree[S](
+	tree: CoreSemanticMatchTree,
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+) -> CoreMapState[S, Option[CoreSemanticMatchTree]]:
+	match tree:
+		SemanticMatchLeaf(bindings, body):
+			mapped: CoreMapState[S, CoreExpr] = mapper(state, body)
+			rebuilt: Option[CoreSemanticMatchTree] = if same_core_expr(mapped.value, body):
+				None
+			else:
+				Some(SemanticMatchLeaf(bindings, mapped.value))
+
+			{ state = mapped.state, value = rebuilt }
+		SemanticMatchFail:
+			{ state = state, value = None }
+		SemanticConstructorMatch(accessor, cases, fallback):
+			mapped_cases: CoreMapState[S, Option[List[CoreSemanticConstructorMatchCase]]] = map_core_state_semantic_constructor_cases(
+				cases,
+				state,
+				mapper,
+			)
+
+			var fallback_changed: Bool = False
+
+			mapped_fallback_result: CoreMapState[S, Option[CoreSemanticMatchTree]] = match fallback:
+				Some(fallback_tree):
+					tree_result: CoreMapState[S, Option[CoreSemanticMatchTree]] = map_core_state_semantic_match_tree(
+						fallback_tree,
+						mapped_cases.state,
+						mapper,
+					)
+
+					match tree_result.value:
+						Some(mapped_tree):
+							fallback_changed = True
+							{ state = tree_result.state, value = Some(mapped_tree) }
+						None:
+							{ state = tree_result.state, value = fallback }
+				None:
+					{ state = mapped_cases.state, value = fallback }
+
+			rebuilt: Option[CoreSemanticMatchTree] = if mapped_cases.value.is_none() and not fallback_changed:
+				None
+			else:
+				Some(
+					SemanticConstructorMatch(
+						accessor,
+						mapped_cases.value.get_or(cases),
+						mapped_fallback_result.value,
+					),
+				)
+
+			{ state = mapped_fallback_result.state, value = rebuilt }
+		SemanticLiteralMatch(accessor, cases, fallback):
+			mapped_cases: CoreMapState[S, Option[List[CoreSemanticLiteralMatchCase]]] = map_core_state_semantic_literal_cases(
+				cases,
+				state,
+				mapper,
+			)
+			mapped_fallback: CoreMapState[S, Option[CoreSemanticMatchTree]] = map_core_state_semantic_match_tree(
+				fallback,
+				mapped_cases.state,
+				mapper,
+			)
+			rebuilt: Option[CoreSemanticMatchTree] = if (
+				mapped_cases.value.is_none()
+				and mapped_fallback.value.is_none()
+			):
+				None
+			else:
+				Some(
+					SemanticLiteralMatch(
+						accessor,
+						mapped_cases.value.get_or(cases),
+						mapped_fallback.value.get_or(fallback),
+					),
+				)
+
+			{ state = mapped_fallback.state, value = rebuilt }
+		SemanticLengthMatch(accessor, cases, geq, fallback):
+			mapped_cases: CoreMapState[S, Option[List[CoreSemanticLengthMatchCase]]] = map_core_state_semantic_length_cases(
+				cases,
+				state,
+				mapper,
+			)
+
+			var geq_changed: Bool = False
+
+			mapped_geq_result: CoreMapState[S, Option[CoreSemanticLengthMatchGeq]] = match geq:
+				Some(geq_case):
+					body_result: CoreMapState[S, Option[CoreSemanticMatchTree]] = map_core_state_semantic_match_tree(
+						geq_case.body,
+						mapped_cases.state,
+						mapper,
+					)
+
+					match body_result.value:
+						Some(mapped_body):
+							geq_changed = True
+							{ state = body_result.state, value = Some({ geq_case | body = mapped_body }) }
+						None:
+							{ state = body_result.state, value = geq }
+				None:
+					{ state = mapped_cases.state, value = geq }
+
+			var fallback_changed: Bool = False
+
+			mapped_fallback_result: CoreMapState[S, Option[CoreSemanticMatchTree]] = match fallback:
+				Some(fallback_tree):
+					tree_result: CoreMapState[S, Option[CoreSemanticMatchTree]] = map_core_state_semantic_match_tree(
+						fallback_tree,
+						mapped_geq_result.state,
+						mapper,
+					)
+
+					match tree_result.value:
+						Some(mapped_tree):
+							fallback_changed = True
+							{ state = tree_result.state, value = Some(mapped_tree) }
+						None:
+							{ state = tree_result.state, value = fallback }
+				None:
+					{ state = mapped_geq_result.state, value = fallback }
+
+			rebuilt: Option[CoreSemanticMatchTree] = if (
+				mapped_cases.value.is_none()
+				and not geq_changed
+				and not fallback_changed
+			):
+				None
+			else:
+				Some(
+					SemanticLengthMatch(
+						accessor,
+						mapped_cases.value.get_or(cases),
+						mapped_geq_result.value,
+						mapped_fallback_result.value,
+					),
+				)
+
+			{ state = mapped_fallback_result.state, value = rebuilt }
+
+
+private pure func map_core_state_semantic_constructor_cases[S](
+	cases: List[CoreSemanticConstructorMatchCase],
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+) -> CoreMapState[S, Option[List[CoreSemanticConstructorMatchCase]]]:
+	var mapped: List[CoreSemanticConstructorMatchCase] = []
+	var changed: Bool = False
+	var current_state: S = state
+	var index: Int = 0
+
+	for match_case in cases:
+		result: CoreMapState[S, Option[CoreSemanticMatchTree]] = map_core_state_semantic_match_tree(
+			match_case.body,
+			current_state,
+			mapper,
+		)
+		current_state = result.state
+
+		match result.value:
+			Some(mapped_body):
+				mapped = if changed:
+					mapped.append({ match_case | body = mapped_body })
+				else:
+					cases.take(index).append({ match_case | body = mapped_body })
+
+				changed = True
+			None:
+				if changed:
+					mapped = mapped.append(match_case)
+				else:
+					void
+
+		index += 1
+
+	if changed:
+		{ state = current_state, value = Some(mapped) }
+	else:
+		{ state = current_state, value = None }
+
+
+private pure func map_core_state_semantic_literal_cases[S](
+	cases: List[CoreSemanticLiteralMatchCase],
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+) -> CoreMapState[S, Option[List[CoreSemanticLiteralMatchCase]]]:
+	var mapped: List[CoreSemanticLiteralMatchCase] = []
+	var changed: Bool = False
+	var current_state: S = state
+	var index: Int = 0
+
+	for match_case in cases:
+		result: CoreMapState[S, Option[CoreSemanticMatchTree]] = map_core_state_semantic_match_tree(
+			match_case.body,
+			current_state,
+			mapper,
+		)
+		current_state = result.state
+
+		match result.value:
+			Some(mapped_body):
+				mapped = if changed:
+					mapped.append({ match_case | body = mapped_body })
+				else:
+					cases.take(index).append({ match_case | body = mapped_body })
+
+				changed = True
+			None:
+				if changed:
+					mapped = mapped.append(match_case)
+				else:
+					void
+
+		index += 1
+
+	if changed:
+		{ state = current_state, value = Some(mapped) }
+	else:
+		{ state = current_state, value = None }
+
+
+private pure func map_core_state_semantic_length_cases[S](
+	cases: List[CoreSemanticLengthMatchCase],
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+) -> CoreMapState[S, Option[List[CoreSemanticLengthMatchCase]]]:
+	var mapped: List[CoreSemanticLengthMatchCase] = []
+	var changed: Bool = False
+	var current_state: S = state
+	var index: Int = 0
+
+	for match_case in cases:
+		result: CoreMapState[S, Option[CoreSemanticMatchTree]] = map_core_state_semantic_match_tree(
+			match_case.body,
+			current_state,
+			mapper,
+		)
+		current_state = result.state
+
+		match result.value:
+			Some(mapped_body):
+				mapped = if changed:
+					mapped.append({ match_case | body = mapped_body })
+				else:
+					cases.take(index).append({ match_case | body = mapped_body })
+
+				changed = True
+			None:
+				if changed:
+					mapped = mapped.append(match_case)
+				else:
+					void
+
+		index += 1
+
+	if changed:
+		{ state = current_state, value = Some(mapped) }
+	else:
+		{ state = current_state, value = None }
+
+
+-- Every node family above is now covered, so this is the general-purpose
+-- entry point: dispatches each `CoreExpr` kind to the family that handles
+-- it, exactly mirroring `map_core_expr_children_with_map_context`'s kind
+-- groups (leaf, operator, aggregate, storage, loop, concurrency, match).
+-- `LogicalExpr` goes through the iterative logical-tree walker rather than
+-- the plain operator family, for the same stack-depth reason the read-only
+-- variant's callers use `map_core_logical_tree` on deep chains.
+pure func map_core_expr_children_with_state[S](
+	state: S,
+	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+	expr: CoreExpr,
+) -> CoreMapState[S, CoreExpr]:
+	match expr:
+		LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _) | VarExpr(_, _, _) | VoidExpr(_, _) | CooperativeCheckpointExpr(_, _) | BreakExpr(_, _) | ContinueExpr(_, _) | SetAllocExpr(_, _, _) | ClosureCreateExpr(_, _, _) | DetachExpr(_, _, _):
+			map_core_leaf_children_with_state(state, mapper, expr)
+		LogicalExpr(_, _, _, _, _):
+			map_core_logical_tree_with_state(state, mapper, expr)
+		DebugBlockExpr(_, _, _) | BinaryExpr(_, _, _, _, _) | UnaryExpr(_, _, _, _) | AssignExpr(_, _, _, _) | CastExpr(_, _, _) | UnboxExpr(_, _, _, _) | FieldExpr(_, _, _, _) | TupleFieldExpr(_, _, _, _) | BoxExpr(_, _, _) | PreClosureDetachExpr(_, _, _) | DupExpr(_, _, _, _, _, _) | DropExpr(_, _, _, _, _, _) | LetExpr(_, _, _, _, _) | BorrowLetExpr(_, _, _, _) | SeqExpr(_, _) | WhileExpr(_, _, _, _) | RangeExpr(_, _, _, _) | IfExpr(_, _, _, _, _):
+			map_core_operator_children_with_state(state, mapper, expr)
+		CallExpr(_, _, _, _, _) | TupleExpr(_, _, _) | TupleConstructExpr(_, _, _) | VectorExpr(_, _, _) | ListConstructExpr(_, _, _) | DictExpr(_, _, _) | DictConstructExpr(_, _, _) | RecordExpr(_, _, _) | RecordUpdateExpr(_, _, _, _) | RecordReuseExpr(_, _, _, _) | RecordCowUpdateExpr(_, _, _, _) | RecordConstructExpr(_, _, _, _) | UnionConstructExpr(_, _, _) | UnionReuseConstructExpr(_, _, _) | SelectExpr(_, _, _):
+			map_core_aggregate_children_with_state(state, mapper, expr)
+		ListAllocExpr(_, _, _) | ListGetExpr(_, _, _) | ListHandoffExpr(_, _, _) | ListHandoffSetOwnedExpr(_, _, _) | ListHandoffSetSourceSlotExpr(_, _, _) | ListRetainExpr(_, _, _) | ListSetExpr(_, _, _) | ListSwapExpr(_, _, _) | StringByteReadExpr(_, _, _) | StringByteWriteExpr(_, _, _) | StringByteCopyExpr(_, _, _) | StringSetLenExpr(_, _, _) | TensorLiteralExpr(_, _, _) | TensorBoxedLiteralExpr(_, _, _) | TensorPackedLiteralExpr(_, _, _) | TensorRawFillExpr(_, _, _) | TensorRawReadExpr(_, _, _) | TensorRawWriteExpr(_, _, _) | TensorRawViewLetExpr(_, _, _, _):
+			map_core_storage_children_with_state(state, mapper, expr)
+		LambdaExpr(_, _, _, _, _, _) | TailrecLoopExpr(_, _, _, _) | TailrecRecurExpr(_, _, _) | TailrecListSpreadLoopExpr(_, _) | TailrecListSpreadRecurExpr(_, _, _, _) | ForRangeExpr(_, _, _, _, _, _) | ForChannelExpr(_, _, _) | ForListExpr(_, _, _) | ForStringExpr(_, _, _) | ForDictExpr(_, _, _) | ForSetExpr(_, _, _) | ForStreamExpr(_, _, _) | ForResourceSourceExpr(_, _, _) | ForTensorExpr(_, _, _) | ResourceScopeExpr(_, _, _) | ResourceCleanupExitExpr(_, _, _):
+			map_core_loop_children_with_state(state, mapper, expr)
+		PreClosureConcurrentlyLoopExpr(_, _, _) | ConcurrentlyLoopExpr(_, _, _) | PreClosureConcurrentExpr(_, _, _) | ConcurrentExpr(_, _, _):
+			map_core_concurrency_children_with_state(state, mapper, expr)
+		RawMatchExpr(_, _, _, _) | SemanticMatchExpr(_, _, _, _) | LiteralMatchExpr(_, _, _, _, _) | AccessorLiteralMatchExpr(_, _, _, _, _) | LengthMatchExpr(_, _, _, _, _) | ConstructorMatchExpr(_, _, _, _, _, _):
+			map_core_match_children_with_state(state, mapper, expr)
