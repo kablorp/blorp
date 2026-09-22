@@ -2048,6 +2048,38 @@ real-program section for the corrected full tables and the design decisions
 they produced (module-level constants for arg-less scalar types, not a
 per-function memo).
 
+### Perceus Engine Allocation Attribution
+
+`BLORP_PERCEUS_ENGINE_METRICS=1` makes any compile print, to stderr, a
+self/inclusive allocation table for the Perceus drop-insertion engine
+(`insert_drops_expr_inner_result` and the `insert_drops_change_aware_*`/
+`rewrite_loop_body`/`inserted_expr`/`plan_managed_let`/`rebuild_managed_let`/
+`add_resolved_value`/`without_bound_value` helpers in
+`blorp/src/compiler/stage_09_core/perceus/results_and_loops.brp`), keyed by
+the visited `CoreExpr`'s own kind tag for the engine's per-node dispatch and
+by a `helper:<name>` label for each named helper, plus construction counts
+for `PerceusInsertedExpr`, `PerceusManagedLetPlan`,
+`PerceusInsertBindingFrameStack` frames and `PerceusResolvedValueIndex`
+updates. Same design as `BLORP_CORE_LOWERING_TYPE_METRICS` above: an
+enter/exit stack over the runtime's own total-allocation counter, keyed by a
+short static string, never a rendered/structural value, so
+`pass_perceus_complete`'s allocation row is identical whether the variable
+is set or not. `insert_drops_program` flushes the counters once per
+compile, right before returning:
+
+```bash
+BLORP_COMPILER_MEMORY_PROFILE=1 BLORP_PERCEUS_ENGINE_METRICS=1 bin/blorp compile \
+  --no-format --no-embed-runtime --std-dir <std> -o /tmp/out.c <entry>.brp 2>perceus_engine.log
+```
+
+```text
+BLORP_PERCEUS_ENGINE_CONSTRUCT schema=1 kind=PerceusInsertedExpr count=1849101
+BLORP_PERCEUS_ENGINE_NODE kind=helper:rebuild_managed_let calls=57472 self_allocations=15605213 inclusive_allocations=15605213 self_per_call=271.527
+```
+
+See `benchmarks/results/perceus_engine_attribution_2026-09-22.md` for the
+full tables and the go/no-go calls for the roadmap's P3/P4/P5 issues.
+
 ## Timing Model
 
 `bench.sh` first compiles all compiled-language binaries for the selected

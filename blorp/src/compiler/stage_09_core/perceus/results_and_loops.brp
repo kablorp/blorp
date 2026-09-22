@@ -67,9 +67,12 @@ import:
 			ConcurrentExpr,
 			ConcurrentlyLoopExpr,
 			ConstructorMatchExpr,
+			ContinueExpr,
+			CooperativeCheckpointExpr,
 			DebugBlockExpr,
 			DetachExpr,
 			DictConstructExpr,
+			DictExpr,
 			DropExpr,
 			DupExpr,
 			FieldExpr,
@@ -99,6 +102,8 @@ import:
 			PreClosureConcurrentExpr,
 			PreClosureConcurrentlyLoopExpr,
 			PreClosureDetachExpr,
+			RangeExpr,
+			RawMatchExpr,
 			RecordConstructExpr,
 			RecordExpr,
 			RecordCowUpdateExpr,
@@ -107,7 +112,9 @@ import:
 			ResourceCleanupExitExpr,
 			ResourceScopeExpr,
 			SelectExpr,
+			SemanticMatchExpr,
 			SeqExpr,
+			SetAllocExpr,
 			StaticStringLiteralExpr,
 			StringByteCopyExpr,
 			StringByteReadExpr,
@@ -118,6 +125,8 @@ import:
 			TailrecLoopExpr,
 			TailrecRecurExpr,
 			TensorBoxedLiteralExpr,
+			TensorLiteralExpr,
+			TensorPackedLiteralExpr,
 			TensorRawFillExpr,
 			TensorRawReadExpr,
 			TensorRawViewLetExpr,
@@ -128,6 +137,7 @@ import:
 			UnaryExpr,
 			UnboxExpr,
 			UnionConstructExpr,
+			UnionReuseConstructExpr,
 			VarExpr,
 			VectorExpr,
 			VoidExpr,
@@ -253,6 +263,215 @@ import:
 foreign:
 	private pure func same_core_expr(left: CoreExpr, right: CoreExpr) -> Bool = "blorp_same_object"
 
+
+-- Attribution instrumentation for the Perceus drop-insertion engine
+-- (BLORP_PERCEUS_ENGINE_METRICS), the same design as the Core-lowering
+-- node-kind metric (BLORP_CORE_LOWERING_TYPE_METRICS, commit f7599ff4):
+-- opt-in, enter/exit around the runtime's own total-allocation counter,
+-- keyed by a short static string label (a `CoreExpr` kind tag or a named
+-- helper), never a rendered/structural key. The first version of the
+-- lowering metric rendered a value to JSON per call and inflated that
+-- phase 3.8x; this metric never renders anything -- every hook below is an
+-- integer read/write. A no-op unless the variable is set: production
+-- compiles pay one branch per call and nothing else, and even when set
+-- this allocates no Blorp-managed object.
+foreign:
+	pure func perceus_engine_metrics_enabled() -> Int = "blorp_perceus_engine_metrics_enabled_c"
+	pure func perceus_engine_current_allocations() -> Int = "blorp_runtime_total_allocations_c"
+	pure func perceus_engine_node_enter() -> Void = "blorp_perceus_engine_node_enter_c"
+	pure func perceus_engine_node_exit(kind: String) -> Void = "blorp_perceus_engine_node_exit_c"
+	pure func perceus_engine_inserted_expr_construct() -> Void = "blorp_perceus_engine_inserted_expr_construct_c"
+	pure func perceus_engine_managed_let_plan_construct() -> Void = "blorp_perceus_engine_managed_let_plan_construct_c"
+	pure func perceus_engine_frame_construct() -> Void = "blorp_perceus_engine_frame_construct_c"
+	pure func perceus_engine_resolved_value_update() -> Void = "blorp_perceus_engine_resolved_value_update_c"
+	pure func perceus_engine_metrics_report() -> Void = "blorp_perceus_engine_metrics_report_c"
+
+
+-- Attribution instrumentation: a short static tag per `CoreExpr` variant,
+-- used only to key the BLORP_PERCEUS_ENGINE_METRICS node-kind table (see
+-- `insert_drops_expr_inner_result`'s wrapper below). Never used for dispatch
+-- or the actual drop insertion, so a mismatch here cannot change compiled
+-- output -- only which histogram bucket a count lands in.
+private pure func core_expr_kind_name(expr: CoreExpr) -> String:
+	match expr:
+		LiteralExpr(_, _, _):
+			"LiteralExpr"
+		StaticStringLiteralExpr(_, _, _, _):
+			"StaticStringLiteralExpr"
+		VarExpr(_, _, _):
+			"VarExpr"
+		VoidExpr(_, _):
+			"VoidExpr"
+		DebugBlockExpr(_, _, _):
+			"DebugBlockExpr"
+		CooperativeCheckpointExpr(_, _):
+			"CooperativeCheckpointExpr"
+		CallExpr(_, _, _, _, _):
+			"CallExpr"
+		BinaryExpr(_, _, _, _, _):
+			"BinaryExpr"
+		UnaryExpr(_, _, _, _):
+			"UnaryExpr"
+		LogicalExpr(_, _, _, _, _):
+			"LogicalExpr"
+		AssignExpr(_, _, _, _):
+			"AssignExpr"
+		CastExpr(_, _, _):
+			"CastExpr"
+		BoxExpr(_, _, _):
+			"BoxExpr"
+		UnboxExpr(_, _, _, _):
+			"UnboxExpr"
+		FieldExpr(_, _, _, _):
+			"FieldExpr"
+		TupleFieldExpr(_, _, _, _):
+			"TupleFieldExpr"
+		TupleExpr(_, _, _):
+			"TupleExpr"
+		TupleConstructExpr(_, _, _):
+			"TupleConstructExpr"
+		VectorExpr(_, _, _):
+			"VectorExpr"
+		LambdaExpr(_, _, _, _, _, _):
+			"LambdaExpr"
+		ClosureCreateExpr(_, _, _):
+			"ClosureCreateExpr"
+		ListConstructExpr(_, _, _):
+			"ListConstructExpr"
+		ListAllocExpr(_, _, _):
+			"ListAllocExpr"
+		ListGetExpr(_, _, _):
+			"ListGetExpr"
+		ListHandoffExpr(_, _, _):
+			"ListHandoffExpr"
+		ListHandoffSetOwnedExpr(_, _, _):
+			"ListHandoffSetOwnedExpr"
+		ListHandoffSetSourceSlotExpr(_, _, _):
+			"ListHandoffSetSourceSlotExpr"
+		StringByteReadExpr(_, _, _):
+			"StringByteReadExpr"
+		StringByteWriteExpr(_, _, _):
+			"StringByteWriteExpr"
+		StringByteCopyExpr(_, _, _):
+			"StringByteCopyExpr"
+		StringSetLenExpr(_, _, _):
+			"StringSetLenExpr"
+		TensorLiteralExpr(_, _, _):
+			"TensorLiteralExpr"
+		TensorBoxedLiteralExpr(_, _, _):
+			"TensorBoxedLiteralExpr"
+		TensorPackedLiteralExpr(_, _, _):
+			"TensorPackedLiteralExpr"
+		TensorRawFillExpr(_, _, _):
+			"TensorRawFillExpr"
+		TensorRawReadExpr(_, _, _):
+			"TensorRawReadExpr"
+		TensorRawWriteExpr(_, _, _):
+			"TensorRawWriteExpr"
+		TensorRawViewLetExpr(_, _, _, _):
+			"TensorRawViewLetExpr"
+		DictExpr(_, _, _):
+			"DictExpr"
+		DictConstructExpr(_, _, _):
+			"DictConstructExpr"
+		SetAllocExpr(_, _, _):
+			"SetAllocExpr"
+		ListRetainExpr(_, _, _):
+			"ListRetainExpr"
+		ListSetExpr(_, _, _):
+			"ListSetExpr"
+		ListSwapExpr(_, _, _):
+			"ListSwapExpr"
+		RecordExpr(_, _, _):
+			"RecordExpr"
+		RecordUpdateExpr(_, _, _, _):
+			"RecordUpdateExpr"
+		RecordReuseExpr(_, _, _, _):
+			"RecordReuseExpr"
+		RecordCowUpdateExpr(_, _, _, _):
+			"RecordCowUpdateExpr"
+		RecordConstructExpr(_, _, _, _):
+			"RecordConstructExpr"
+		UnionConstructExpr(_, _, _):
+			"UnionConstructExpr"
+		UnionReuseConstructExpr(_, _, _):
+			"UnionReuseConstructExpr"
+		DetachExpr(_, _, _):
+			"DetachExpr"
+		DupExpr(_, _, _, _, _, _):
+			"DupExpr"
+		DropExpr(_, _, _, _, _, _):
+			"DropExpr"
+		LetExpr(_, _, _, _, _):
+			"LetExpr"
+		BorrowLetExpr(_, _, _, _):
+			"BorrowLetExpr"
+		SeqExpr(_, _):
+			"SeqExpr"
+		WhileExpr(_, _, _, _):
+			"WhileExpr"
+		BreakExpr(_, _):
+			"BreakExpr"
+		ContinueExpr(_, _):
+			"ContinueExpr"
+		ResourceScopeExpr(_, _, _):
+			"ResourceScopeExpr"
+		ResourceCleanupExitExpr(_, _, _):
+			"ResourceCleanupExitExpr"
+		TailrecLoopExpr(_, _, _, _):
+			"TailrecLoopExpr"
+		TailrecRecurExpr(_, _, _):
+			"TailrecRecurExpr"
+		TailrecListSpreadLoopExpr(_, _):
+			"TailrecListSpreadLoopExpr"
+		TailrecListSpreadRecurExpr(_, _, _, _):
+			"TailrecListSpreadRecurExpr"
+		ForRangeExpr(_, _, _, _, _, _):
+			"ForRangeExpr"
+		ForChannelExpr(_, _, _):
+			"ForChannelExpr"
+		ForListExpr(_, _, _):
+			"ForListExpr"
+		ForStringExpr(_, _, _):
+			"ForStringExpr"
+		ForDictExpr(_, _, _):
+			"ForDictExpr"
+		ForSetExpr(_, _, _):
+			"ForSetExpr"
+		ForStreamExpr(_, _, _):
+			"ForStreamExpr"
+		ForResourceSourceExpr(_, _, _):
+			"ForResourceSourceExpr"
+		ForTensorExpr(_, _, _):
+			"ForTensorExpr"
+		PreClosureConcurrentlyLoopExpr(_, _, _):
+			"PreClosureConcurrentlyLoopExpr"
+		ConcurrentlyLoopExpr(_, _, _):
+			"ConcurrentlyLoopExpr"
+		PreClosureConcurrentExpr(_, _, _):
+			"PreClosureConcurrentExpr"
+		ConcurrentExpr(_, _, _):
+			"ConcurrentExpr"
+		PreClosureDetachExpr(_, _, _):
+			"PreClosureDetachExpr"
+		SelectExpr(_, _, _):
+			"SelectExpr"
+		RangeExpr(_, _, _, _):
+			"RangeExpr"
+		RawMatchExpr(_, _, _, _):
+			"RawMatchExpr"
+		SemanticMatchExpr(_, _, _, _):
+			"SemanticMatchExpr"
+		LiteralMatchExpr(_, _, _, _, _):
+			"LiteralMatchExpr"
+		AccessorLiteralMatchExpr(_, _, _, _, _):
+			"AccessorLiteralMatchExpr"
+		LengthMatchExpr(_, _, _, _, _):
+			"LengthMatchExpr"
+		ConstructorMatchExpr(_, _, _, _, _, _):
+			"ConstructorMatchExpr"
+		IfExpr(_, _, _, _, _):
+			"IfExpr"
 
 record PerceusManagedLetPlan {
 	source: CoreExpr,
@@ -1118,6 +1337,19 @@ pure func insert_drops_change_aware_aggregate(
 	env: PerceusEnv,
 	source: CoreExpr,
 ) -> PerceusInsertedExpr:
+	if perceus_engine_metrics_enabled() == 0:
+		insert_drops_change_aware_aggregate_impl(env, source)
+	else:
+		perceus_engine_node_enter()
+		result: PerceusInsertedExpr = insert_drops_change_aware_aggregate_impl(env, source)
+		perceus_engine_node_exit("helper:insert_drops_change_aware_aggregate")
+		result
+
+
+private pure func insert_drops_change_aware_aggregate_impl(
+	env: PerceusEnv,
+	source: CoreExpr,
+) -> PerceusInsertedExpr:
 	debug:
 		perceus_work_insert_aggregate_visits()
 
@@ -1585,6 +1817,32 @@ private pure func plan_managed_let(
 	rhs: CoreExpr,
 	body: CoreExpr,
 ) -> PerceusManagedLetPlan:
+	if perceus_engine_metrics_enabled() == 0:
+		plan_managed_let_impl(env, source, variable, is_mutable, bind_type, rhs, body)
+	else:
+		perceus_engine_node_enter()
+		result: PerceusManagedLetPlan = plan_managed_let_impl(
+			env,
+			source,
+			variable,
+			is_mutable,
+			bind_type,
+			rhs,
+			body,
+		)
+		perceus_engine_node_exit("helper:plan_managed_let")
+		result
+
+
+private pure func plan_managed_let_impl(
+	env: PerceusEnv,
+	source: CoreExpr,
+	variable: CoreVar,
+	is_mutable: Bool,
+	bind_type: CoreType,
+	rhs: CoreExpr,
+	body: CoreExpr,
+) -> PerceusManagedLetPlan:
 	rhs_is_owned_temporary: Bool = binding_alias_rhs_is_owned_temporary(env, bind_type, rhs)
 	owned_rhs_reuses_source: Bool = normalize_binding_alias_rhs_reuses_source(
 		env,
@@ -1610,6 +1868,8 @@ private pure func plan_managed_let(
 		)
 	else:
 		body
+
+	perceus_engine_managed_let_plan_construct()
 
 	{
 		source = source,
@@ -1642,6 +1902,21 @@ private pure func managed_let_reuses_source(
 
 
 private pure func rebuild_managed_let(
+	env: PerceusEnv,
+	plan: PerceusManagedLetPlan,
+	rewritten_rhs: CoreExpr,
+	rewritten_body: CoreExpr,
+) -> CoreExpr:
+	if perceus_engine_metrics_enabled() == 0:
+		rebuild_managed_let_impl(env, plan, rewritten_rhs, rewritten_body)
+	else:
+		perceus_engine_node_enter()
+		result: CoreExpr = rebuild_managed_let_impl(env, plan, rewritten_rhs, rewritten_body)
+		perceus_engine_node_exit("helper:rebuild_managed_let")
+		result
+
+
+private pure func rebuild_managed_let_impl(
 	env: PerceusEnv,
 	plan: PerceusManagedLetPlan,
 	rewritten_rhs: CoreExpr,
@@ -2013,6 +2288,20 @@ private pure func retain_borrowed_loop_body(
 
 
 pure func rewrite_loop_body(
+	env: PerceusEnv,
+	binder: CoreLoopBinder,
+	body: CoreExpr,
+) -> CoreExpr:
+	if perceus_engine_metrics_enabled() == 0:
+		rewrite_loop_body_impl(env, binder, body)
+	else:
+		perceus_engine_node_enter()
+		result: CoreExpr = rewrite_loop_body_impl(env, binder, body)
+		perceus_engine_node_exit("helper:rewrite_loop_body")
+		result
+
+
+private pure func rewrite_loop_body_impl(
 	env: PerceusEnv,
 	binder: CoreLoopBinder,
 	body: CoreExpr,
@@ -2524,6 +2813,19 @@ private pure func add_resolved_value(
 	index: PerceusResolvedValueIndex,
 	variable: CoreVar,
 ) -> PerceusResolvedValueIndex:
+	if perceus_engine_metrics_enabled() == 0:
+		add_resolved_value_impl(index, variable)
+	else:
+		perceus_engine_node_enter()
+		result: PerceusResolvedValueIndex = add_resolved_value_impl(index, variable)
+		perceus_engine_node_exit("helper:add_resolved_value")
+		result
+
+
+private pure func add_resolved_value_impl(
+	index: PerceusResolvedValueIndex,
+	variable: CoreVar,
+) -> PerceusResolvedValueIndex:
 	match variable.def_id:
 		Some(def_id):
 			occurrences_by_uniq: Dict[Int, Dict[Int, Int]] = index.occurrences_by_def_id_by_uniq_by_name.get_or(
@@ -2532,6 +2834,8 @@ private pure func add_resolved_value(
 			)
 			occurrences_by_def_id: Dict[Int, Int] = occurrences_by_uniq.get_or(variable.uniq, {})
 			occurrences: Int = occurrences_by_def_id.get_or(def_id, 0)
+
+			perceus_engine_resolved_value_update()
 
 			{
 				occurrences_by_def_id_by_uniq_by_name = index.occurrences_by_def_id_by_uniq_by_name.set(
@@ -2562,6 +2866,19 @@ private pure func without_bound_value(
 	index: PerceusResolvedValueIndex,
 	variable: CoreVar,
 ) -> PerceusResolvedValueIndex:
+	if perceus_engine_metrics_enabled() == 0:
+		without_bound_value_impl(index, variable)
+	else:
+		perceus_engine_node_enter()
+		result: PerceusResolvedValueIndex = without_bound_value_impl(index, variable)
+		perceus_engine_node_exit("helper:without_bound_value")
+		result
+
+
+private pure func without_bound_value_impl(
+	index: PerceusResolvedValueIndex,
+	variable: CoreVar,
+) -> PerceusResolvedValueIndex:
 	match (variable.def_id, index.occurrences_by_def_id_by_uniq_by_name.get(variable.name)):
 		(Some(def_id), Some(occurrences_by_uniq)):
 			match occurrences_by_uniq.get(variable.uniq):
@@ -2584,6 +2901,8 @@ private pure func without_bound_value(
 								remaining_by_uniq,
 							)
 
+						perceus_engine_resolved_value_update()
+
 						{occurrences_by_def_id_by_uniq_by_name = remaining_by_name}
 				None:
 					index
@@ -2592,11 +2911,23 @@ private pure func without_bound_value(
 
 
 pure func inserted_expr(expr: CoreExpr, reuses_source: Bool) -> PerceusInsertedExpr:
+	if perceus_engine_metrics_enabled() == 0:
+		inserted_expr_impl(expr, reuses_source)
+	else:
+		perceus_engine_node_enter()
+		result: PerceusInsertedExpr = inserted_expr_impl(expr, reuses_source)
+		perceus_engine_node_exit("helper:inserted_expr")
+		result
+
+
+private pure func inserted_expr_impl(expr: CoreExpr, reuses_source: Bool) -> PerceusInsertedExpr:
 	direct_consume: Option[PerceusDirectConsume] = match expr:
 		VarExpr(variable, typ, loc):
 			Some({variable = variable})
 		_:
 			None
+
+	perceus_engine_inserted_expr_construct()
 
 	{
 		expr = expr,
@@ -2791,7 +3122,30 @@ private pure func managed_let_has_single_direct_consume(
 				False
 
 
+-- The engine's true per-node dispatch entry: every recursive descent into a
+-- child expression, from the frame-stack loop below and from every
+-- `insert_drops_change_aware_*` helper, calls back into this public name.
+-- Wrapping it here -- rather than inside the private state machine below --
+-- means the BLORP_PERCEUS_ENGINE_METRICS enter/exit stack sees exactly the
+-- same call tree production does, keyed by the node's own `CoreExpr` kind,
+-- with each callee's allocations already charged to its own frame by the
+-- time this frame's self/inclusive split is computed (same technique as
+-- `lower_typed_expr_as_type`'s wrapper in stage_08_core_lower/lower.brp).
 pure func insert_drops_expr_inner_result(
+	env: PerceusEnv,
+	expr: CoreExpr,
+) -> PerceusInsertedExpr:
+	if perceus_engine_metrics_enabled() == 0:
+		insert_drops_expr_inner_result_impl(env, expr)
+	else:
+		kind: String = core_expr_kind_name(expr)
+		perceus_engine_node_enter()
+		result: PerceusInsertedExpr = insert_drops_expr_inner_result_impl(env, expr)
+		perceus_engine_node_exit(kind)
+		result
+
+
+private pure func insert_drops_expr_inner_result_impl(
 	env: PerceusEnv,
 	expr: CoreExpr,
 ) -> PerceusInsertedExpr:
@@ -2831,6 +3185,7 @@ pure func insert_drops_expr_inner_result(
 							body,
 						)
 						frames = PerceusInsertManagedLetRhsFrame(plan, frames)
+						perceus_engine_frame_construct()
 						managed_binding_frame_count += 1
 						visiting = True
 						current_expr = plan.owned_rhs
@@ -2843,6 +3198,7 @@ pure func insert_drops_expr_inner_result(
 							body,
 							frames,
 						)
+						perceus_engine_frame_construct()
 						visiting = True
 						current_expr = rhs
 				BorrowLetExpr(variable, bind_type, rhs, body):
@@ -2853,14 +3209,17 @@ pure func insert_drops_expr_inner_result(
 						body,
 						frames,
 					)
+					perceus_engine_frame_construct()
 					visiting = True
 					current_expr = rhs
 				SeqExpr(first, second):
 					frames = PerceusInsertSequenceFirstFrame(current, second, frames)
+					perceus_engine_frame_construct()
 					visiting = True
 					current_expr = first
 				AssignExpr(variable, rhs, typ, loc):
 					frames = PerceusInsertAssignRhsFrame(variable, typ, loc, frames)
+					perceus_engine_frame_construct()
 					visiting = True
 					current_expr = rhs
 				_:
@@ -2890,6 +3249,7 @@ pure func insert_drops_expr_inner_result(
 					complete = True
 				PerceusInsertManagedLetRhsFrame(plan, remaining):
 					frames = PerceusInsertManagedLetBodyFrame(plan, rewritten, remaining)
+					perceus_engine_frame_construct()
 					visiting = True
 					current_expr = plan.branch_safe_body
 				PerceusInsertManagedLetBodyFrame(plan, rewritten_rhs, remaining):
@@ -2951,6 +3311,7 @@ pure func insert_drops_expr_inner_result(
 						rewritten,
 						remaining,
 					)
+					perceus_engine_frame_construct()
 					visiting = True
 					current_expr = body
 				PerceusInsertLetBodyFrame(source, variable, is_mutable, bind_type, rewritten_rhs, remaining):
@@ -2973,6 +3334,7 @@ pure func insert_drops_expr_inner_result(
 						rewritten,
 						remaining,
 					)
+					perceus_engine_frame_construct()
 					visiting = True
 					current_expr = body
 				PerceusInsertBorrowLetBodyFrame(source, variable, bind_type, rewritten_rhs, remaining):
@@ -2989,6 +3351,7 @@ pure func insert_drops_expr_inner_result(
 					pending = inserted_binding_expr(rebuilt, variable, rewritten, reuses_source)
 				PerceusInsertSequenceFirstFrame(source, second, remaining):
 					frames = PerceusInsertSequenceSecondFrame(source, rewritten, remaining)
+					perceus_engine_frame_construct()
 					visiting = True
 					current_expr = second
 				PerceusInsertSequenceSecondFrame(source, rewritten_first, remaining):
@@ -4340,6 +4703,32 @@ private pure func insert_drops_change_aware_call(
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> PerceusInsertedExpr:
+	if perceus_engine_metrics_enabled() == 0:
+		insert_drops_change_aware_call_impl(env, source, kind, callee, args, typ, loc)
+	else:
+		perceus_engine_node_enter()
+		result: PerceusInsertedExpr = insert_drops_change_aware_call_impl(
+			env,
+			source,
+			kind,
+			callee,
+			args,
+			typ,
+			loc,
+		)
+		perceus_engine_node_exit("helper:insert_drops_change_aware_call")
+		result
+
+
+private pure func insert_drops_change_aware_call_impl(
+	env: PerceusEnv,
+	source: CoreExpr,
+	kind: CoreCallKind,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> PerceusInsertedExpr:
 	debug:
 		perceus_work_insert_call_visits()
 
@@ -4392,6 +4781,19 @@ private pure func insert_drops_change_aware_call(
 
 
 private pure func insert_drops_change_aware_fixed_ownership(
+	env: PerceusEnv,
+	source: CoreExpr,
+) -> PerceusInsertedExpr:
+	if perceus_engine_metrics_enabled() == 0:
+		insert_drops_change_aware_fixed_ownership_impl(env, source)
+	else:
+		perceus_engine_node_enter()
+		result: PerceusInsertedExpr = insert_drops_change_aware_fixed_ownership_impl(env, source)
+		perceus_engine_node_exit("helper:insert_drops_change_aware_fixed_ownership")
+		result
+
+
+private pure func insert_drops_change_aware_fixed_ownership_impl(
 	env: PerceusEnv,
 	source: CoreExpr,
 ) -> PerceusInsertedExpr:
@@ -4531,6 +4933,19 @@ pure func insert_drops_non_binding_expr(
 
 
 private pure func insert_drops_change_aware_normalized_expr(
+	env: PerceusEnv,
+	expr: CoreExpr,
+) -> PerceusInsertedExpr:
+	if perceus_engine_metrics_enabled() == 0:
+		insert_drops_change_aware_normalized_expr_impl(env, expr)
+	else:
+		perceus_engine_node_enter()
+		result: PerceusInsertedExpr = insert_drops_change_aware_normalized_expr_impl(env, expr)
+		perceus_engine_node_exit("helper:insert_drops_change_aware_normalized_expr")
+		result
+
+
+private pure func insert_drops_change_aware_normalized_expr_impl(
 	env: PerceusEnv,
 	expr: CoreExpr,
 ) -> PerceusInsertedExpr:

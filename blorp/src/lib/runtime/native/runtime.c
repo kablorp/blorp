@@ -2536,6 +2536,229 @@ void blorp_core_lowering_node_kind_report_c(void) {
     free(sorted);
 }
 
+// ============================================================================
+// Attribution instrumentation for the Perceus drop-insertion engine
+// (BLORP_PERCEUS_ENGINE_METRICS). Same design as the Core-lowering node-kind
+// metric above: an opt-in enter/exit stack over the runtime's own total-
+// allocation counter (blorp_runtime_total_allocations_c), keyed by a short
+// static string label -- either a `CoreExpr` kind tag (see
+// core_expr_kind_name in perceus/results_and_loops.brp) or a named helper
+// ("helper:<name>") -- never a rendered/structural key. The lowering
+// metric's own history is the reason: its first version rendered a lowered
+// type to JSON per call and inflated that phase's allocation row 3.8x while
+// active. This metric never renders anything -- every hook here reads or
+// writes only integers, so it allocates no Blorp-managed object whether the
+// variable is set or not. A no-op unless BLORP_PERCEUS_ENGINE_METRICS is
+// set: production compiles pay one branch per call and nothing else.
+// ============================================================================
+typedef struct {
+    long entry_allocations;
+    long child_charged;
+} __blorp_PerceusEngineFrame;
+
+static __blorp_PerceusEngineFrame* __blorp_perceus_engine_stack = NULL;
+static size_t __blorp_perceus_engine_stack_len = 0;
+static size_t __blorp_perceus_engine_stack_capacity = 0;
+
+typedef struct {
+    char* key;
+    long calls;
+    long self_allocations;
+    long inclusive_allocations;
+} __blorp_PerceusEngineEntry;
+
+static __blorp_PerceusEngineEntry* __blorp_perceus_engine_table = NULL;
+static size_t __blorp_perceus_engine_table_capacity = 0;
+static size_t __blorp_perceus_engine_table_used = 0;
+
+static int __blorp_perceus_engine_metrics_enabled_flag = -1;
+
+static long __blorp_perceus_inserted_expr_constructions = 0;
+static long __blorp_perceus_managed_let_plan_constructions = 0;
+static long __blorp_perceus_frame_constructions = 0;
+static long __blorp_perceus_resolved_value_index_updates = 0;
+
+long blorp_perceus_engine_metrics_enabled_c(void) {
+    if (__blorp_perceus_engine_metrics_enabled_flag < 0) {
+        const char* value = getenv("BLORP_PERCEUS_ENGINE_METRICS");
+        __blorp_perceus_engine_metrics_enabled_flag =
+            (value != NULL && value[0] != '\0' && strcmp(value, "0") != 0) ? 1 : 0;
+    }
+    return __blorp_perceus_engine_metrics_enabled_flag;
+}
+
+void blorp_perceus_engine_node_enter_c(void) {
+    if (!blorp_perceus_engine_metrics_enabled_c()) return;
+    if (__blorp_perceus_engine_stack_len == __blorp_perceus_engine_stack_capacity) {
+        size_t grown = __blorp_perceus_engine_stack_capacity
+            ? __blorp_perceus_engine_stack_capacity * 2
+            : 1024;
+        // Not an allocation the oracle observes: BLORP_PERCEUS_ENGINE_METRICS
+        // profiling-only bookkeeping, gated the same way as the lowering
+        // node-kind stack above.
+        __blorp_PerceusEngineFrame* frames = (__blorp_PerceusEngineFrame*)realloc(
+            __blorp_perceus_engine_stack,
+            grown * sizeof(__blorp_PerceusEngineFrame)
+        );
+        if (!frames) return;
+        __blorp_perceus_engine_stack = frames;
+        __blorp_perceus_engine_stack_capacity = grown;
+    }
+    __blorp_PerceusEngineFrame* frame =
+        &__blorp_perceus_engine_stack[__blorp_perceus_engine_stack_len++];
+    frame->entry_allocations = blorp_runtime_total_allocations_c();
+    frame->child_charged = 0;
+}
+
+static void __blorp_perceus_engine_table_grow(void) {
+    size_t grown = __blorp_perceus_engine_table_capacity
+        ? __blorp_perceus_engine_table_capacity * 2
+        : 64;
+    // Not an allocation the oracle observes: BLORP_PERCEUS_ENGINE_METRICS
+    // profiling-only bookkeeping, same rehash pattern as the lowering
+    // node-kind table above.
+    __blorp_PerceusEngineEntry* rows = (__blorp_PerceusEngineEntry*)calloc(
+        grown,
+        sizeof(__blorp_PerceusEngineEntry)
+    );
+    if (!rows) return;
+    for (size_t index = 0; index < __blorp_perceus_engine_table_capacity; index++) {
+        __blorp_PerceusEngineEntry* old = &__blorp_perceus_engine_table[index];
+        if (old->key == NULL) continue;
+        size_t mask = grown - 1;
+        size_t slot = __blorp_core_lowering_string_hash(old->key) & mask;
+        while (rows[slot].key != NULL) slot = (slot + 1) & mask;
+        rows[slot] = *old;
+    }
+    free(__blorp_perceus_engine_table);
+    __blorp_perceus_engine_table = rows;
+    __blorp_perceus_engine_table_capacity = grown;
+}
+
+void blorp_perceus_engine_node_exit_c(const char* kind) {
+    if (!blorp_perceus_engine_metrics_enabled_c()) return;
+    if (__blorp_perceus_engine_stack_len == 0) return;
+    __blorp_PerceusEngineFrame frame =
+        __blorp_perceus_engine_stack[--__blorp_perceus_engine_stack_len];
+    long current = blorp_runtime_total_allocations_c();
+    long total_delta = current - frame.entry_allocations;
+    long self_delta = total_delta - frame.child_charged;
+    if (__blorp_perceus_engine_stack_len > 0) {
+        __blorp_perceus_engine_stack[__blorp_perceus_engine_stack_len - 1]
+            .child_charged += total_delta;
+    }
+    if (__blorp_perceus_engine_table_used * 2 >= __blorp_perceus_engine_table_capacity) {
+        __blorp_perceus_engine_table_grow();
+        if (!__blorp_perceus_engine_table) return;
+    }
+    size_t mask = __blorp_perceus_engine_table_capacity - 1;
+    size_t index = __blorp_core_lowering_string_hash(kind) & mask;
+    while (__blorp_perceus_engine_table[index].key != NULL) {
+        if (strcmp(__blorp_perceus_engine_table[index].key, kind) == 0) {
+            __blorp_perceus_engine_table[index].calls++;
+            __blorp_perceus_engine_table[index].self_allocations += self_delta;
+            __blorp_perceus_engine_table[index].inclusive_allocations += total_delta;
+            return;
+        }
+        index = (index + 1) & mask;
+    }
+    __blorp_perceus_engine_table[index].key = __blorp_typecheck_body_metric_text(kind);
+    __blorp_perceus_engine_table[index].calls = 1;
+    __blorp_perceus_engine_table[index].self_allocations = self_delta;
+    __blorp_perceus_engine_table[index].inclusive_allocations = total_delta;
+    __blorp_perceus_engine_table_used++;
+}
+
+void blorp_perceus_engine_inserted_expr_construct_c(void) {
+    if (!blorp_perceus_engine_metrics_enabled_c()) return;
+    __blorp_perceus_inserted_expr_constructions++;
+}
+
+void blorp_perceus_engine_managed_let_plan_construct_c(void) {
+    if (!blorp_perceus_engine_metrics_enabled_c()) return;
+    __blorp_perceus_managed_let_plan_constructions++;
+}
+
+void blorp_perceus_engine_frame_construct_c(void) {
+    if (!blorp_perceus_engine_metrics_enabled_c()) return;
+    __blorp_perceus_frame_constructions++;
+}
+
+void blorp_perceus_engine_resolved_value_update_c(void) {
+    if (!blorp_perceus_engine_metrics_enabled_c()) return;
+    __blorp_perceus_resolved_value_index_updates++;
+}
+
+static int __blorp_perceus_engine_entry_compare(const void* left, const void* right) {
+    const __blorp_PerceusEngineEntry* first = (const __blorp_PerceusEngineEntry*)left;
+    const __blorp_PerceusEngineEntry* second = (const __blorp_PerceusEngineEntry*)right;
+    if (first->key == NULL && second->key == NULL) return 0;
+    if (first->key == NULL) return 1;
+    if (second->key == NULL) return -1;
+    if (first->self_allocations != second->self_allocations) {
+        return first->self_allocations < second->self_allocations ? 1 : -1;
+    }
+    return strcmp(first->key, second->key);
+}
+
+void blorp_perceus_engine_metrics_report_c(void) {
+    if (!blorp_perceus_engine_metrics_enabled_c()) return;
+    fprintf(
+        stderr,
+        "BLORP_PERCEUS_ENGINE_CONSTRUCT schema=1 kind=PerceusInsertedExpr count=%ld\n",
+        __blorp_perceus_inserted_expr_constructions
+    );
+    fprintf(
+        stderr,
+        "BLORP_PERCEUS_ENGINE_CONSTRUCT schema=1 kind=PerceusManagedLetPlan count=%ld\n",
+        __blorp_perceus_managed_let_plan_constructions
+    );
+    fprintf(
+        stderr,
+        "BLORP_PERCEUS_ENGINE_CONSTRUCT schema=1 kind=PerceusInsertBindingFrameStack count=%ld\n",
+        __blorp_perceus_frame_constructions
+    );
+    fprintf(
+        stderr,
+        "BLORP_PERCEUS_ENGINE_CONSTRUCT schema=1 kind=PerceusResolvedValueIndex count=%ld\n",
+        __blorp_perceus_resolved_value_index_updates
+    );
+    if (__blorp_perceus_engine_table_used == 0) return;
+    // Not an allocation the oracle observes: BLORP_PERCEUS_ENGINE_METRICS
+    // profiling-only bookkeeping, same private-sort-copy pattern as the
+    // lowering node-kind report above.
+    __blorp_PerceusEngineEntry* sorted = (__blorp_PerceusEngineEntry*)malloc(
+        __blorp_perceus_engine_table_capacity * sizeof(__blorp_PerceusEngineEntry)
+    );
+    if (!sorted) return;
+    memcpy(
+        sorted,
+        __blorp_perceus_engine_table,
+        __blorp_perceus_engine_table_capacity * sizeof(__blorp_PerceusEngineEntry)
+    );
+    qsort(
+        sorted,
+        __blorp_perceus_engine_table_capacity,
+        sizeof(__blorp_PerceusEngineEntry),
+        __blorp_perceus_engine_entry_compare
+    );
+    for (size_t index = 0; index < __blorp_perceus_engine_table_used; index++) {
+        fprintf(
+            stderr,
+            "BLORP_PERCEUS_ENGINE_NODE kind=%s calls=%ld self_allocations=%ld "
+            "inclusive_allocations=%ld self_per_call=%.3f\n",
+            sorted[index].key ? sorted[index].key : "",
+            sorted[index].calls,
+            sorted[index].self_allocations,
+            sorted[index].inclusive_allocations,
+            sorted[index].calls
+                ? (double)sorted[index].self_allocations / (double)sorted[index].calls
+                : 0.0
+        );
+    }
+    free(sorted);
+}
+
 #define BLORP_LIST_STORAGE_POINTER 0
 #define BLORP_LIST_STORAGE_INLINE 1
 #define BLORP_LIST_CALLBACK_BITS 0
