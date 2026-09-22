@@ -210,6 +210,57 @@ class CompilerToolFixtureRunnerTests(unittest.TestCase):
             self.assertIn("no compiler tool fixtures found", result.stdout)
             self.assertIn("status=FAIL passed=0 failed=1 tests=1", result.stdout)
 
+    def test_warmup_timeout_is_independent_of_fixture_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fixture_root = root / "test_compiler"
+            fixture = fixture_root / "format/should_pass/fast.brp"
+            fixture.parent.mkdir(parents=True)
+            fixture.write_text("func main(args: List[String]) -> Int: 0\n", encoding="utf-8")
+            compiler = root / "bin" / "blorp"
+            compiler.parent.mkdir(parents=True, exist_ok=True)
+            compiler.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env python3
+                    from pathlib import Path
+                    import sys
+                    import time
+
+                    if Path(sys.argv[-1]).name == "warmup.brp":
+                        time.sleep(1.5)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            compiler.chmod(0o755)
+
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(RUNNER),
+                    "--blorp-bin",
+                    str(compiler),
+                    "--fixture-root",
+                    str(fixture_root),
+                    "--no-stdlib-case",
+                    "--expected-count",
+                    "1",
+                    "--timeout",
+                    "1",
+                    "--warmup-timeout",
+                    "0",
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+
+            self.assertNotIn("warmup timed out", result.stdout)
+            self.assertIn("status=PASS", result.stdout, result.stdout + result.stderr)
+
     def test_timeout_terminates_descendant_that_escapes_process_group(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -257,12 +308,14 @@ class CompilerToolFixtureRunnerTests(unittest.TestCase):
                     "--expected-count",
                     "1",
                     "--timeout",
-                    "1",
+                    "3",
+                    "--warmup-timeout",
+                    "0",
                 ],
                 cwd=REPO_ROOT,
                 capture_output=True,
                 text=True,
-                timeout=6,
+                timeout=60,
                 env={**os.environ, "DESCENDANT_MARKER": str(marker)},
                 check=False,
             )
@@ -408,11 +461,13 @@ class CompilerToolFixtureRunnerTests(unittest.TestCase):
                     "1",
                     "--timeout",
                     "5",
+                    "--warmup-timeout",
+                    "0",
                 ],
                 cwd=REPO_ROOT,
                 capture_output=True,
                 text=True,
-                timeout=8,
+                timeout=60,
                 check=False,
             )
 

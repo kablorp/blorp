@@ -233,10 +233,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-stdlib-case", action="store_true")
     parser.add_argument("--expected-count", type=int)
     parser.add_argument("--timeout", type=int, default=30)
+    parser.add_argument(
+        "--warmup-timeout",
+        type=int,
+        help="seconds for the formatter warmup run (0 = unbounded; default: --timeout)",
+    )
     parser.add_argument("--gate-name", default="compiler_tools")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
-    if args.timeout < 0 or (args.expected_count is not None and args.expected_count < 1):
+    if args.warmup_timeout is None:
+        args.warmup_timeout = args.timeout
+    if (
+        args.timeout < 0
+        or args.warmup_timeout < 0
+        or (args.expected_count is not None and args.expected_count < 1)
+    ):
         parser.error("timeouts must be non-negative and expected counts must be positive")
     return args
 
@@ -278,7 +289,7 @@ def main() -> int:
         )
         return 1
 
-    warmup_failures = warm_formatter(compiler, args.timeout)
+    warmup_failures = warm_formatter(compiler, args.warmup_timeout)
     if warmup_failures:
         emit_failure("format/warmup", "renderer", warmup_failures)
         print(
