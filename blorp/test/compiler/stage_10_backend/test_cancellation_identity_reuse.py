@@ -9,7 +9,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[4]
 CANCELLATION_PLAN = (
-    ROOT / "blorp" / "src" / "compiler" / "stage_10_backend" / "cancellation_plan.brp"
+    ROOT / "blorp" / "src" / "compiler" / "stage_09_core" / "cancellation_plan.brp"
 )
 
 
