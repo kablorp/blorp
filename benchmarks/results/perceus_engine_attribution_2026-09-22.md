@@ -556,3 +556,160 @@ the cut separate:
 2. The `transform_let_constructor_match_body` `match_node` deferral above,
    its own commit on top -- the only behavior-affecting (allocation-count)
    change in this follow-up.
+
+## P8 follow-up: does `summarize_linear_ownership_uses` re-summarize the same
+## `(name, expr)` within one `rebuild_managed_let`? (2026-09-22, third pass)
+
+Issue P8 of `docs/PERCEUS_CLEANUP_ISSUES.md`'s worker brief: the prior
+section found `summarize_linear_ownership_uses` at 28.56% of the pass
+(self, aggregated across the whole compile) and stopped short of drilling
+into it because that was out of scope for the `rebuild_managed_let` drill.
+P8's hypothesis is narrower and checkable: within a *single*
+`rebuild_managed_let` invocation, do several of its helpers (the legacy
+balance, the divergent-constructor-match predicate, the `transform_let_if_body`/
+`transform_let_constructor_match_body` paths, the preserves-owner checks)
+call `summarize_linear_ownership_uses` more than once on the identical
+`(name, expr)` pair -- the same name and the same `CoreExpr` node by
+pointer identity, not merely an equal-shaped one?
+
+### Instrumentation
+
+Extended the `BLORP_PERCEUS_ENGINE_METRICS` mechanism (still allocation-free,
+still opt-in, still never rendering or hashing a value -- see the design
+note at the top of this file) with:
+
+- **Depth-scoped external/internal split.** `summarize_linear_ownership_uses`'s
+  existing metrics wrapper (`perceus/uses.brp`) now also calls a dedicated
+  enter/exit pair (`perceus_engine_summary_enter`/`perceus_engine_summary_exit`,
+  `runtime.c`) around the same `_impl` call. These keep their own small
+  stack (separate from the generic node-kind stack) whose depth at entry
+  says whether this is an "external" call (depth was 0 -- reached from
+  outside `uses.brp`'s own recursion) or an "internal" one (reached through
+  `summarize_linear_call`'s callee/argument recursion or
+  `summarize_linear_borrow`'s catch-all fallback, both of which call back
+  into the same wrapped entry point).
+- **Per-invocation identity table.** Every external call records the raw
+  pointer identity of its `name: String` and `expr: CoreExpr` arguments
+  (the same primitive `blorp_same_object`/`same_core_expr` already use
+  elsewhere in this pass family -- never a rendered or hashed key) into a
+  small array, linear-scanned to check whether that exact pair was already
+  seen. The array resets whenever a new `rebuild_managed_let` invocation
+  begins (`perceus_engine_summary_invocation_begin`, called once at the top
+  of `rebuild_managed_let_impl` in `results_and_loops.brp`), so a match only
+  counts as a duplicate within the same managed-let rebuild, never across
+  two different bindings.
+- **A real node-visit counter under the metric.** `perceus_work_linear_summary_node_visits`
+  is `@debug_only` and erased in a normal or `BLORP_PERCEUS_ENGINE_METRICS`
+  build (it only counts under the separate, much larger `--profile-mode exact`
+  instrumented-build path). Added a second call
+  (`perceus_engine_summary_node_visit`) at the same site in the frame-stack
+  loop, gated on `perceus_engine_metrics_enabled()` like every other hook
+  here, so `node_visits` is a real dynamic count under this metric without
+  needing the exact-profile build.
+
+Files touched: `blorp/src/compiler/stage_09_core/perceus/uses.brp` (the
+metrics wrapper and the frame-loop hook, plus this module's own local
+rebinding of the new foreign hooks -- there is no re-export in Blorp),
+`blorp/src/compiler/stage_09_core/perceus/results_and_loops.brp` (the
+`perceus_engine_summary_invocation_begin` foreign declaration and its one
+call site at the top of `rebuild_managed_let_impl`), and
+`blorp/src/lib/runtime/native/runtime.c`/`runtime_decl.c` (the new counters
+and hooks, same file section as the rest of `BLORP_PERCEUS_ENGINE_METRICS`).
+`perceus/contracts.brp` and `perceus/borrowed.brp`/`perceus/mutable.brp`
+were not touched (owned by other concurrent workers).
+
+### On/off honesty check
+
+Frozen input: `benchmarks/self_compile_measure freeze --rev origin/main`,
+commit `14f4a469374dd9a91163632e55771733cf1cbafc` (`origin/main` after
+merging in the P7 drill-down/cut commits and an unrelated `contracts.brp`
+change from a concurrent worker). Two direct compiles of the same input,
+`BLORP_CLI_C_OPTIMIZATION=-O2`, `BLORP_COMPILER_MEMORY_PROFILE=1`, identical
+otherwise except `BLORP_PERCEUS_ENGINE_METRICS`:
+
+| | `pass_dict_literal_ownership_complete` (cumulative) | `pass_perceus_complete` (cumulative) | Pass delta |
+| --- | ---: | ---: | ---: |
+| Metric unset | 148,800,274 | 209,179,634 | 60,379,360 |
+| `BLORP_PERCEUS_ENGINE_METRICS=1` | 148,800,274 | 209,179,634 | 60,379,360 |
+
+Identical. The generated C is also byte-identical between the two runs
+(`diff` reports no difference) -- confirmed both on this frozen self-compile
+input and on a small hand-written program used to smoke-test the
+instrumentation first.
+
+### The census
+
+Same frozen input, `BLORP_PERCEUS_ENGINE_METRICS=1` run:
+
+```
+BLORP_PERCEUS_ENGINE_LET_BINDINGS schema=1 total=73908 managed=57604
+BLORP_PERCEUS_ENGINE_SUMMARY schema=1 node_visits=9254443 external_calls=1137607 external_repeated_calls=160240 repeated_inclusive_allocations=1388534
+BLORP_PERCEUS_ENGINE_NODE kind=helper:summarize_linear_ownership_uses calls=4801330 self_allocations=17388595 inclusive_allocations=53424140 self_per_call=3.622
+```
+
+| Quantity | Value |
+| --- | ---: |
+| Total calls to `summarize_linear_ownership_uses` (external + internal recursion) | 4,801,330 |
+| **External calls** (reached from outside `uses.brp`'s own recursion) | **1,137,607** |
+| Internal (recursive) calls, by subtraction | 3,663,723 |
+| External calls that repeat a `(name, expr)` pair already summarized in the same `rebuild_managed_let` invocation | **160,240** (14.09% of external calls) |
+| Inclusive allocations of those repeated external calls | **1,388,534** |
+| `summarize_linear_ownership_uses`'s own inclusive allocations (global, matches the prior section's 53,411,618 within input drift) | 53,424,140 |
+| Repeated calls' share of the summary walk's allocations | 1,388,534 / 53,424,140 = **2.60%** |
+| Repeated calls' share of the whole pass | 1,388,534 / 60,379,360 = **2.30%** |
+| Node visits (frame-stack loop iterations, now counted for real under this metric) | 9,254,443 |
+| Allocations per node visited (53,424,140 / 9,254,443) | **5.77** |
+
+### Go/no-go: are repeated calls at least 20% of the summary walk's allocations?
+
+**No.** 2.60% of `summarize_linear_ownership_uses`'s own inclusive
+allocations (2.30% of the whole pass) come from calls that repeat a
+`(name, expr)` pair already summarized within the same `rebuild_managed_let`
+invocation -- an order of magnitude under the 20% bar this issue set for
+attempting the per-binding memoization in deliverable 2. The 14.09% of
+external calls that are repeats charge disproportionately *less* than their
+share of calls (2.60% of allocations), which is consistent with duplicate
+calls tending to land on smaller subtrees (a branch or scrutinee, not a
+whole managed-let body) rather than on the large bodies that dominate the
+walk's cost.
+
+This matches, rather than contradicts, the prior section's own finding for
+`balance_let_body_legacy`: drilling every path into it found "no confirmed
+duplicate call on the same `(env, name, body)` triple" for the dominant
+wildcard-arm case. This census confirms that at the identity level and
+across every caller of `summarize_linear_ownership_uses`, not just
+`balance_let_body_legacy`'s callers: the walk is overwhelmingly summarizing
+distinct `(name, expr)` pairs, not re-walking the same one.
+
+**Deliverable executed: 3 (report and stop; no memoization).** The
+per-node cost of the walk itself dominates -- 5.77 allocations per frame-loop
+node visit, from the boxed `OwnershipUseSummary` combinators
+(`seq_ownership_uses`, `aggregate_ownership_uses`, the frame-stack pushes)
+and the `PerceusOwnershipSummaryFrameStack` frame allocations, not from
+redundant work on shared subtrees. `OwnershipUseSummary`'s own docstring
+already records that flattening it from a boxed `record` to unboxed scalars
+was measured and made things 2% worse; re-testing that tradeoff is
+explicitly out of scope for this issue (a separate decision, per the issue
+brief). No changes were made to `balance.brp` or the memoization call sites
+named in deliverable 2's brief -- there is no confirmed duplicate-work
+mechanism there to cut without changing behavior.
+
+### Gates (`benchmarks/self_compile_measure lock --`, foreground)
+
+- `bin/blorp test --timeout 600 blorp/test/compiler/stage_09_core/test_core_perceus.brp` -- 364 passed.
+- `python3 -m unittest blorp.test.compiler.benchmark.test_perceus_memory` -- 80 passed.
+- `make hygiene-check` -- passed.
+- `scripts/compiler-check --changed` -- passed (2 sources changed, 2,439 tests).
+- `scripts/test --serial compiler-blorp compiler-tools` -- 5,144 passed.
+- `scripts/test leak` -- 963 passed.
+- `scripts/test compiler-core-sanitize` -- 2,075 passed.
+
+`pass_perceus_complete` is unchanged by this commit (instrumentation only,
+confirmed above); there is no cut to measure identity or instructions for,
+per the go/no-go result.
+
+### Commit
+
+One commit, instrumentation and this results section together (deliverable
+1 only -- deliverable 2's 20% gate was not met, so there is no second,
+behavior-changing commit for this issue).

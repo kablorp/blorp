@@ -2701,6 +2701,135 @@ void blorp_perceus_engine_let_binding_managed_c(void) {
     __blorp_perceus_let_bindings_managed++;
 }
 
+// ----------------------------------------------------------------------
+// P8 duplicate-summary census: identity-keyed tracking of external calls
+// to summarize_linear_ownership_uses (perceus/uses.brp), scoped per
+// rebuild_managed_let invocation. "External" means entered while no other
+// call to summarize_linear_ownership_uses was already on this dedicated
+// stack -- i.e. not reached through uses.brp's own recursive dispatch
+// (summarize_linear_call and summarize_linear_borrow's fallback arm both
+// recurse back through the same wrapped entry point). Identity is the raw
+// pointer of the Blorp String (name) and CoreExpr (expr) objects passed
+// in, the same probe `blorp_same_object` already performs elsewhere in
+// this pass family; nothing here is rendered or hashed on contents, so
+// this allocates nothing beyond the same amortized-growth bookkeeping
+// arrays the sibling metric above already uses.
+// ----------------------------------------------------------------------
+typedef struct {
+    long entry_allocations;
+    int is_external;
+    int is_repeat;
+} __blorp_PerceusSummaryFrame;
+
+static __blorp_PerceusSummaryFrame* __blorp_perceus_summary_stack = NULL;
+static size_t __blorp_perceus_summary_stack_len = 0;
+static size_t __blorp_perceus_summary_stack_capacity = 0;
+
+typedef struct {
+    const void* name;
+    const void* expr;
+} __blorp_PerceusSummarySeen;
+
+static __blorp_PerceusSummarySeen* __blorp_perceus_summary_seen = NULL;
+static size_t __blorp_perceus_summary_seen_len = 0;
+static size_t __blorp_perceus_summary_seen_capacity = 0;
+
+static long __blorp_perceus_summary_invocation_id = 0;
+static long __blorp_perceus_summary_seen_invocation = -1;
+
+static long __blorp_perceus_summary_node_visits = 0;
+static long __blorp_perceus_summary_external_calls = 0;
+static long __blorp_perceus_summary_external_repeated_calls = 0;
+static long __blorp_perceus_summary_repeated_inclusive_allocations = 0;
+
+void blorp_perceus_engine_summary_invocation_begin_c(void) {
+    if (!blorp_perceus_engine_metrics_enabled_c()) return;
+    __blorp_perceus_summary_invocation_id++;
+}
+
+void blorp_perceus_engine_summary_node_visit_c(void) {
+    if (!blorp_perceus_engine_metrics_enabled_c()) return;
+    __blorp_perceus_summary_node_visits++;
+}
+
+void blorp_perceus_engine_summary_enter_c(const void* name_obj, const void* expr_obj) {
+    if (!blorp_perceus_engine_metrics_enabled_c()) return;
+    if (__blorp_perceus_summary_stack_len == __blorp_perceus_summary_stack_capacity) {
+        size_t grown = __blorp_perceus_summary_stack_capacity
+            ? __blorp_perceus_summary_stack_capacity * 2
+            : 1024;
+        // Not an allocation the oracle observes: BLORP_PERCEUS_ENGINE_METRICS
+        // profiling-only bookkeeping, same growth pattern as the sibling
+        // node-kind stack above.
+        __blorp_PerceusSummaryFrame* frames = (__blorp_PerceusSummaryFrame*)realloc(
+            __blorp_perceus_summary_stack,
+            grown * sizeof(__blorp_PerceusSummaryFrame)
+        );
+        if (!frames) return;
+        __blorp_perceus_summary_stack = frames;
+        __blorp_perceus_summary_stack_capacity = grown;
+    }
+    __blorp_PerceusSummaryFrame* frame =
+        &__blorp_perceus_summary_stack[__blorp_perceus_summary_stack_len++];
+    frame->entry_allocations = blorp_runtime_total_allocations_c();
+    frame->is_external = (__blorp_perceus_summary_stack_len == 1) ? 1 : 0;
+    frame->is_repeat = 0;
+
+    if (frame->is_external) {
+        __blorp_perceus_summary_external_calls++;
+        if (__blorp_perceus_summary_seen_invocation != __blorp_perceus_summary_invocation_id) {
+            __blorp_perceus_summary_seen_invocation = __blorp_perceus_summary_invocation_id;
+            __blorp_perceus_summary_seen_len = 0;
+        }
+        int found = 0;
+        for (size_t index = 0; index < __blorp_perceus_summary_seen_len; index++) {
+            if (
+                __blorp_perceus_summary_seen[index].name == name_obj
+                && __blorp_perceus_summary_seen[index].expr == expr_obj
+            ) {
+                found = 1;
+                break;
+            }
+        }
+        if (found) {
+            frame->is_repeat = 1;
+            __blorp_perceus_summary_external_repeated_calls++;
+        } else {
+            if (__blorp_perceus_summary_seen_len == __blorp_perceus_summary_seen_capacity) {
+                size_t grown = __blorp_perceus_summary_seen_capacity
+                    ? __blorp_perceus_summary_seen_capacity * 2
+                    : 64;
+                // Not an allocation the oracle observes: see above.
+                __blorp_PerceusSummarySeen* rows = (__blorp_PerceusSummarySeen*)realloc(
+                    __blorp_perceus_summary_seen,
+                    grown * sizeof(__blorp_PerceusSummarySeen)
+                );
+                if (rows) {
+                    __blorp_perceus_summary_seen = rows;
+                    __blorp_perceus_summary_seen_capacity = grown;
+                }
+            }
+            if (__blorp_perceus_summary_seen_len < __blorp_perceus_summary_seen_capacity) {
+                __blorp_perceus_summary_seen[__blorp_perceus_summary_seen_len].name = name_obj;
+                __blorp_perceus_summary_seen[__blorp_perceus_summary_seen_len].expr = expr_obj;
+                __blorp_perceus_summary_seen_len++;
+            }
+        }
+    }
+}
+
+void blorp_perceus_engine_summary_exit_c(void) {
+    if (!blorp_perceus_engine_metrics_enabled_c()) return;
+    if (__blorp_perceus_summary_stack_len == 0) return;
+    __blorp_PerceusSummaryFrame frame =
+        __blorp_perceus_summary_stack[--__blorp_perceus_summary_stack_len];
+    if (frame.is_external && frame.is_repeat) {
+        long current = blorp_runtime_total_allocations_c();
+        long total_delta = current - frame.entry_allocations;
+        __blorp_perceus_summary_repeated_inclusive_allocations += total_delta;
+    }
+}
+
 static int __blorp_perceus_engine_entry_compare(const void* left, const void* right) {
     const __blorp_PerceusEngineEntry* first = (const __blorp_PerceusEngineEntry*)left;
     const __blorp_PerceusEngineEntry* second = (const __blorp_PerceusEngineEntry*)right;
@@ -2740,6 +2869,15 @@ void blorp_perceus_engine_metrics_report_c(void) {
         "BLORP_PERCEUS_ENGINE_LET_BINDINGS schema=1 total=%ld managed=%ld\n",
         __blorp_perceus_let_bindings_total,
         __blorp_perceus_let_bindings_managed
+    );
+    fprintf(
+        stderr,
+        "BLORP_PERCEUS_ENGINE_SUMMARY schema=1 node_visits=%ld external_calls=%ld "
+        "external_repeated_calls=%ld repeated_inclusive_allocations=%ld\n",
+        __blorp_perceus_summary_node_visits,
+        __blorp_perceus_summary_external_calls,
+        __blorp_perceus_summary_external_repeated_calls,
+        __blorp_perceus_summary_repeated_inclusive_allocations
     );
     if (__blorp_perceus_engine_table_used == 0) return;
     // Not an allocation the oracle observes: BLORP_PERCEUS_ENGINE_METRICS
