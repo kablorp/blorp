@@ -1,0 +1,1454 @@
+-- Repeated-context protection: when a name might be consumed more than
+-- once inside a single branch/context (e.g. both arms of a nested
+-- expression touch it), give each repeated use of the name its own
+-- protected reference instead of letting the second use observe a value the
+-- first already dropped.
+--
+-- protect_repeated_consumes is the entry point rewrite_mutable_let_body
+-- calls before rewriting a mutable local's body; everything else here is
+-- its per-node-shape dispatch.
+import:
+	../ir:
+		CoreAccessor,
+		CoreBoxedStorageValue,
+		CoreConstructorLengthMatch,
+		CoreConstructorLengthMatchBranch,
+		CoreConstructorLengthMatchCase,
+		CoreConstructorLengthMatchGeq,
+		CoreConstructorMatchBody(
+			ConstructorMatchBodyExpr,
+			ConstructorMatchBodyLength,
+			ConstructorMatchBodyLiteral,
+		),
+		CoreConstructorMatchCase,
+		CoreConstructorMatchFallback(
+			ConstructorMatchFallbackBindings,
+			ConstructorMatchFallbackBody,
+			ConstructorMatchFallbackFail,
+		),
+		CoreConstructorMatchTest,
+		CoreDictEntry,
+		CoreExpr(
+			AccessorLiteralMatchExpr,
+			AssignExpr,
+			BinaryExpr,
+			BorrowLetExpr,
+			BoxExpr,
+			BreakExpr,
+			CallExpr,
+			CastExpr,
+			ClosureCreateExpr,
+			ConcurrentExpr,
+			ConcurrentlyLoopExpr,
+			ConstructorMatchExpr,
+			DebugBlockExpr,
+			DetachExpr,
+			DictConstructExpr,
+			DropExpr,
+			DupExpr,
+			FieldExpr,
+			ForChannelExpr,
+			ForDictExpr,
+			ForListExpr,
+			ForRangeExpr,
+			ForResourceSourceExpr,
+			ForSetExpr,
+			ForStreamExpr,
+			ForStringExpr,
+			ForTensorExpr,
+			IfExpr,
+			LambdaExpr,
+			LetExpr,
+			ListConstructExpr,
+			ListAllocExpr,
+			ListGetExpr,
+			ListHandoffExpr,
+			ListHandoffSetOwnedExpr,
+			ListHandoffSetSourceSlotExpr,
+			ListRetainExpr,
+			ListSetExpr,
+			ListSwapExpr,
+			LiteralExpr,
+			LogicalExpr,
+			PreClosureConcurrentExpr,
+			PreClosureConcurrentlyLoopExpr,
+			PreClosureDetachExpr,
+			RecordConstructExpr,
+			RecordExpr,
+			RecordCowUpdateExpr,
+			RecordReuseExpr,
+			RecordUpdateExpr,
+			ResourceCleanupExitExpr,
+			ResourceScopeExpr,
+			SelectExpr,
+			SeqExpr,
+			StaticStringLiteralExpr,
+			StringByteCopyExpr,
+			StringByteReadExpr,
+			StringByteWriteExpr,
+			StringSetLenExpr,
+			TailrecListSpreadLoopExpr,
+			TailrecListSpreadRecurExpr,
+			TailrecLoopExpr,
+			TailrecRecurExpr,
+			TensorBoxedLiteralExpr,
+			TensorRawFillExpr,
+			TensorRawReadExpr,
+			TensorRawViewLetExpr,
+			TensorRawWriteExpr,
+			TupleConstructExpr,
+			TupleExpr,
+			TupleFieldExpr,
+			UnaryExpr,
+			UnboxExpr,
+			UnionConstructExpr,
+			VarExpr,
+			VectorExpr,
+			VoidExpr,
+			WhileExpr,
+			LiteralMatchExpr,
+			LengthMatchExpr,
+		),
+		CoreLiteral,
+		CoreLiteralMatchCase,
+		CoreLiteralMatchFallback(
+			LiteralMatchFallbackBindings,
+			LiteralMatchFallbackBody,
+			LiteralMatchFallbackFail,
+		),
+		CoreMatchBinding,
+		CoreRecordFieldValue,
+		CoreSourceLoc(KnownSourceLoc, SyntheticSourceLoc),
+		CoreType,
+		CoreVar,
+	env:
+		PerceusEnv,
+		is_managed_type,
+	uses:
+		OwnershipUseSummary,
+		match_bindings_shadow,
+		summarize_linear_call,
+		summarize_linear_ownership_uses,
+	balance:
+		prepend_dups,
+	../perceus:
+		is_consuming_collection_equality,
+	borrowed:
+		retain_borrowed_aggregate_value,
+	../traverse as CoreTraverse
+
+
+-- This binds straight to the runtime primitive rather than calling the generic
+-- `memory.same_object`, because the pinned bootstrap compiler
+-- (dev-8341b419d990) cannot project a builtin name it has never seen. Once the
+-- bootstrap pin moves past the commit that introduced `blorp_same_object`,
+-- delete this block and import `memory: same_object` instead. perceus.brp and
+-- several other Core passes carry the same declaration for the same reason.
+foreign:
+	private pure func same_core_expr(left: CoreExpr, right: CoreExpr) -> Bool = "blorp_same_object"
+	private pure func same_core_expr_list(
+		left: List[CoreExpr],
+		right: List[CoreExpr],
+	) -> Bool = "blorp_same_object"
+
+
+private pure func protect_repeated_exprs(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	exprs: List[CoreExpr],
+	in_repeated_context: Bool,
+) -> List[CoreExpr]:
+	var protected: List[CoreExpr] = []
+	var changed: Bool = False
+
+	for expr in exprs:
+		protected_expr: CoreExpr = protect_repeated_consumes(
+			env,
+			target,
+			target_type,
+			expr,
+			in_repeated_context,
+		)
+
+		if not same_core_expr(protected_expr, expr):
+			changed = True
+		else:
+			void
+
+		protected = protected.append(protected_expr)
+
+	if changed:
+		protected
+	else:
+		-- Hand back the source list so the caller can recognise an untouched
+		-- argument list with one allocation identity check.
+		exprs
+
+
+private pure func protect_repeated_aggregate_value(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	value: CoreExpr,
+	in_repeated_context: Bool,
+) -> CoreExpr:
+	protected: CoreExpr = protect_repeated_consumes(
+		env,
+		target,
+		target_type,
+		value,
+		in_repeated_context,
+	)
+
+	if in_repeated_context:
+		retain_borrowed_aggregate_value(
+			env,
+			{
+				name = target,
+				typ = target_type,
+				loc = SyntheticSourceLoc
+			},
+			protected,
+		)
+	else:
+		protected
+
+
+private pure func protect_repeated_aggregate_exprs(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	exprs: List[CoreExpr],
+	in_repeated_context: Bool,
+) -> List[CoreExpr]:
+	var protected: List[CoreExpr] = []
+
+	for expr in exprs:
+		protected = protected.append(
+			protect_repeated_aggregate_value(
+				env,
+				target,
+				target_type,
+				expr,
+				in_repeated_context,
+			),
+		)
+
+	protected
+
+
+private pure func protect_repeated_record_fields(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	fields: List[CoreRecordFieldValue],
+	in_repeated_context: Bool,
+) -> List[CoreRecordFieldValue]:
+	var protected: List[CoreRecordFieldValue] = []
+
+	for field in fields:
+		name: String = field.name
+		value: CoreExpr = field.value
+		protected = protected.append({
+			name = name,
+			value = protect_repeated_aggregate_value(
+				env,
+				target,
+				target_type,
+				value,
+				in_repeated_context,
+			),
+		})
+
+	protected
+
+
+private pure func protect_repeated_boxed_value(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	value: CoreBoxedStorageValue,
+	in_repeated_context: Bool,
+) -> CoreBoxedStorageValue:
+	protected_expr: CoreExpr = if value.transfers_ownership:
+		protect_repeated_aggregate_value(env, target, target_type, value.value, in_repeated_context)
+	else:
+		protect_repeated_consumes(env, target, target_type, value.value, in_repeated_context)
+
+	{
+		kind = value.kind,
+		value = protected_expr,
+		needs_release = value.needs_release,
+		transfers_ownership = value.transfers_ownership
+	}
+
+
+private pure func protect_repeated_boxed_values(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	values: List[CoreBoxedStorageValue],
+	in_repeated_context: Bool,
+) -> List[CoreBoxedStorageValue]:
+	var protected: List[CoreBoxedStorageValue] = []
+
+	for value in values:
+		protected = protected.append(
+			protect_repeated_boxed_value(
+				env,
+				target,
+				target_type,
+				value,
+				in_repeated_context,
+			),
+		)
+
+	protected
+
+
+private pure func protect_repeated_dict_entries(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	entries: List[CoreDictEntry],
+	in_repeated_context: Bool,
+) -> List[CoreDictEntry]:
+	var protected: List[CoreDictEntry] = []
+
+	for entry in entries:
+		protected = protected.append({
+			key = protect_repeated_boxed_value(
+				env,
+				target,
+				target_type,
+				entry.key,
+				in_repeated_context,
+			),
+			value = protect_repeated_boxed_value(
+				env,
+				target,
+				target_type,
+				entry.value,
+				in_repeated_context,
+			),
+		})
+
+	protected
+
+
+private pure func protect_repeated_literal_match_cases(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	cases: List[CoreLiteralMatchCase],
+	in_repeated_context: Bool,
+) -> List[CoreLiteralMatchCase]:
+	var protected: List[CoreLiteralMatchCase] = []
+
+	for match_case in cases:
+		protected = protected.append(
+			protect_repeated_literal_match_case(
+				env,
+				target,
+				target_type,
+				match_case,
+				in_repeated_context,
+			),
+		)
+
+	protected
+
+
+private pure func protect_repeated_constructor_length_cases(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	cases: List[CoreConstructorLengthMatchCase],
+	in_repeated_context: Bool,
+) -> List[CoreConstructorLengthMatchCase]:
+	var protected: List[CoreConstructorLengthMatchCase] = []
+
+	for match_case in cases:
+		protected = protected.append(
+			protect_repeated_constructor_length_case(
+				env,
+				target,
+				target_type,
+				match_case,
+				in_repeated_context,
+			),
+		)
+
+	protected
+
+
+private pure func protect_repeated_constructor_match_cases(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	cases: List[CoreConstructorMatchCase],
+	in_repeated_context: Bool,
+) -> List[CoreConstructorMatchCase]:
+	var protected: List[CoreConstructorMatchCase] = []
+
+	for match_case in cases:
+		protected = protected.append(
+			protect_repeated_constructor_match_case(
+				env,
+				target,
+				target_type,
+				match_case,
+				in_repeated_context,
+			),
+		)
+
+	protected
+
+
+private pure func protect_repeated_constructor_match_body(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	body: CoreConstructorMatchBody,
+	in_repeated_context: Bool,
+) -> CoreConstructorMatchBody:
+	match body:
+		ConstructorMatchBodyExpr(expr):
+			ConstructorMatchBodyExpr(
+				protect_repeated_consumes(
+					env,
+					target,
+					target_type,
+					expr,
+					in_repeated_context,
+				),
+			)
+		ConstructorMatchBodyLiteral(match_expr):
+			accessor = match_expr.accessor
+			scrutinee_type: CoreType = match_expr.scrutinee_type
+			cases: List[CoreLiteralMatchCase] = match_expr.cases
+			fallback: CoreLiteralMatchFallback = match_expr.fallback
+			result_type: CoreType = match_expr.result_type
+			loc: CoreSourceLoc = match_expr.loc
+			protected_cases: List[CoreLiteralMatchCase] = protect_repeated_literal_match_cases(
+				env,
+				target,
+				target_type,
+				cases,
+				in_repeated_context,
+			)
+			protected_fallback: CoreLiteralMatchFallback = protect_repeated_literal_match_fallback(
+				env,
+				target,
+				target_type,
+				fallback,
+				in_repeated_context,
+			)
+
+			ConstructorMatchBodyLiteral({
+				accessor = accessor,
+				scrutinee_type = scrutinee_type,
+				cases = protected_cases,
+				fallback = protected_fallback,
+				result_type = result_type,
+				loc = loc,
+			})
+		ConstructorMatchBodyLength(match_expr):
+			ConstructorMatchBodyLength(
+				protect_repeated_constructor_length_match(
+					env,
+					target,
+					target_type,
+					match_expr,
+					in_repeated_context,
+				),
+			)
+
+
+private pure func protect_repeated_literal_match_case(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	match_case: CoreLiteralMatchCase,
+	in_repeated_context: Bool,
+) -> CoreLiteralMatchCase:
+	literal: CoreLiteral = match_case.literal
+	bindings: List[CoreMatchBinding] = match_case.bindings
+	body: CoreExpr = match_case.body
+
+	if match_bindings_shadow(target.name, bindings):
+		{
+			literal = literal,
+			bindings = bindings,
+			body = body
+		}
+	else:
+		{
+			literal = literal,
+			bindings = bindings,
+			body = protect_repeated_consumes(env, target, target_type, body, in_repeated_context)
+		}
+
+
+private pure func protect_repeated_literal_match_fallback(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	fallback: CoreLiteralMatchFallback,
+	in_repeated_context: Bool,
+) -> CoreLiteralMatchFallback:
+	match fallback:
+		LiteralMatchFallbackBody(body):
+			LiteralMatchFallbackBody(
+				protect_repeated_consumes(
+					env,
+					target,
+					target_type,
+					body,
+					in_repeated_context,
+				),
+			)
+		LiteralMatchFallbackBindings(bindings, body):
+			if match_bindings_shadow(target.name, bindings):
+				fallback
+			else:
+				LiteralMatchFallbackBindings(
+					bindings,
+					protect_repeated_consumes(env, target, target_type, body, in_repeated_context),
+				)
+		LiteralMatchFallbackFail:
+			LiteralMatchFallbackFail
+
+
+private pure func protect_repeated_constructor_length_branch(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	branch: CoreConstructorLengthMatchBranch,
+	in_repeated_context: Bool,
+) -> CoreConstructorLengthMatchBranch:
+	bindings: List[CoreMatchBinding] = branch.bindings
+	body: CoreConstructorMatchBody = branch.body
+
+	if match_bindings_shadow(target.name, bindings):
+		{
+			bindings = bindings,
+			body = body
+		}
+	else:
+		{
+			bindings = bindings,
+			body = protect_repeated_constructor_match_body(
+				env,
+				target,
+				target_type,
+				body,
+				in_repeated_context,
+			)
+		}
+
+
+private pure func protect_repeated_constructor_length_match(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	match_expr: CoreConstructorLengthMatch,
+	in_repeated_context: Bool,
+) -> CoreConstructorLengthMatch:
+	accessor = match_expr.accessor
+	cases: List[CoreConstructorLengthMatchCase] = match_expr.cases
+	geq: Option[CoreConstructorLengthMatchGeq] = match_expr.geq
+	fallback: Option[CoreConstructorLengthMatchBranch] = match_expr.fallback
+	result_type: CoreType = match_expr.result_type
+	loc: CoreSourceLoc = match_expr.loc
+	protected_cases: List[CoreConstructorLengthMatchCase] = protect_repeated_constructor_length_cases(
+		env,
+		target,
+		target_type,
+		cases,
+		in_repeated_context,
+	)
+
+	protected_geq: Option[CoreConstructorLengthMatchGeq] = match geq:
+		Some(match_case):
+			Some(
+				protect_repeated_constructor_length_geq(
+					env,
+					target,
+					target_type,
+					match_case,
+					in_repeated_context,
+				),
+			)
+		None:
+			None
+
+	protected_fallback: Option[CoreConstructorLengthMatchBranch] = match fallback:
+		Some(branch):
+			Some(
+				protect_repeated_constructor_length_branch(
+					env,
+					target,
+					target_type,
+					branch,
+					in_repeated_context,
+				),
+			)
+		None:
+			None
+
+	{
+		accessor = accessor,
+		cases = protected_cases,
+		geq = protected_geq,
+		fallback = protected_fallback,
+		result_type = result_type,
+		loc = loc
+	}
+
+
+private pure func protect_repeated_constructor_length_case(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	match_case: CoreConstructorLengthMatchCase,
+	in_repeated_context: Bool,
+) -> CoreConstructorLengthMatchCase:
+	length: Int = match_case.length
+	branch: CoreConstructorLengthMatchBranch = match_case.branch
+
+	{
+		length = length,
+		branch = protect_repeated_constructor_length_branch(
+			env,
+			target,
+			target_type,
+			branch,
+			in_repeated_context,
+		)
+	}
+
+
+private pure func protect_repeated_constructor_length_geq(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	match_case: CoreConstructorLengthMatchGeq,
+	in_repeated_context: Bool,
+) -> CoreConstructorLengthMatchGeq:
+	minimum_length: Int = match_case.minimum_length
+	branch: CoreConstructorLengthMatchBranch = match_case.branch
+
+	{
+		minimum_length = minimum_length,
+		branch = protect_repeated_constructor_length_branch(
+			env,
+			target,
+			target_type,
+			branch,
+			in_repeated_context,
+		)
+	}
+
+
+private pure func protect_repeated_constructor_match_case(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	match_case: CoreConstructorMatchCase,
+	in_repeated_context: Bool,
+) -> CoreConstructorMatchCase:
+	constructor: String = match_case.constructor
+	accessor: CoreAccessor = match_case.accessor
+	test: CoreConstructorMatchTest = match_case.test
+	bindings: List[CoreMatchBinding] = match_case.bindings
+	body: CoreConstructorMatchBody = match_case.body
+
+	if match_bindings_shadow(target.name, bindings):
+		{
+			constructor = constructor,
+			accessor = accessor,
+			test = test,
+			bindings = bindings,
+			body = body
+		}
+	else:
+		{
+			constructor = constructor,
+			accessor = accessor,
+			test = test,
+			bindings = bindings,
+			body = protect_repeated_constructor_match_body(
+				env,
+				target,
+				target_type,
+				body,
+				in_repeated_context,
+			)
+		}
+
+
+private pure func protect_repeated_constructor_match_fallback(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	fallback: CoreConstructorMatchFallback,
+	in_repeated_context: Bool,
+) -> CoreConstructorMatchFallback:
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			ConstructorMatchFallbackBody(
+				protect_repeated_consumes(
+					env,
+					target,
+					target_type,
+					body,
+					in_repeated_context,
+				),
+			)
+		ConstructorMatchFallbackBindings(bindings, body):
+			if match_bindings_shadow(target.name, bindings):
+				fallback
+			else:
+				ConstructorMatchFallbackBindings(
+					bindings,
+					protect_repeated_consumes(env, target, target_type, body, in_repeated_context),
+				)
+		ConstructorMatchFallbackFail:
+			ConstructorMatchFallbackFail
+
+
+pure func protect_repeated_consumes(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	expr: CoreExpr,
+	in_repeated_context: Bool,
+) -> CoreExpr:
+	match expr:
+		CallExpr(kind, callee, args, typ, loc):
+			protected_callee: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				callee,
+				in_repeated_context,
+			)
+			protected_args: List[CoreExpr] = protect_repeated_exprs(
+				env,
+				target,
+				target_type,
+				args,
+				in_repeated_context,
+			)
+
+			call: CoreExpr = if (
+				same_core_expr(protected_callee, callee)
+				and same_core_expr_list(protected_args, args)
+			):
+				expr
+			else:
+				CallExpr(kind, protected_callee, protected_args, typ, loc)
+
+			if in_repeated_context:
+				uses: OwnershipUseSummary = summarize_linear_call(
+					env,
+					target.name,
+					typ,
+					kind,
+					protected_callee,
+					protected_args,
+				)
+				prepend_dups(uses.consumed_refs, target, target_type, call)
+			else:
+				call
+		BinaryExpr(op, left, right, typ, loc):
+			protected_left: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				left,
+				in_repeated_context,
+			)
+			protected_right: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				right,
+				in_repeated_context,
+			)
+
+			binary: CoreExpr = if (
+				same_core_expr(protected_left, left)
+				and same_core_expr(protected_right, right)
+			):
+				expr
+			else:
+				BinaryExpr(op, protected_left, protected_right, typ, loc)
+
+			if in_repeated_context and is_consuming_collection_equality(op, left, right):
+				uses: OwnershipUseSummary = summarize_linear_ownership_uses(
+					env,
+					target.name,
+					binary,
+				)
+				prepend_dups(uses.consumed_refs, target, target_type, binary)
+			else:
+				binary
+		UnaryExpr(op, inner, typ, loc):
+			protected_inner: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				inner,
+				in_repeated_context,
+			)
+
+			if same_core_expr(protected_inner, inner):
+				expr
+			else:
+				UnaryExpr(op, protected_inner, typ, loc)
+		LogicalExpr(op, left, right, typ, loc):
+			protected_left: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				left,
+				in_repeated_context,
+			)
+			protected_right: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				right,
+				in_repeated_context,
+			)
+
+			if same_core_expr(protected_left, left) and same_core_expr(protected_right, right):
+				expr
+			else:
+				LogicalExpr(op, protected_left, protected_right, typ, loc)
+		CastExpr(inner, typ, loc):
+			protected_inner: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				inner,
+				in_repeated_context,
+			)
+
+			if same_core_expr(protected_inner, inner):
+				expr
+			else:
+				CastExpr(protected_inner, typ, loc)
+		BoxExpr(box, typ, loc):
+			protected_value: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				box.value,
+				in_repeated_context,
+			)
+
+			if same_core_expr(protected_value, box.value):
+				expr
+			else:
+				BoxExpr(
+					{ box |
+						value = protected_value,
+						source_type = box.source_type
+					},
+					typ,
+					loc,
+				)
+		UnboxExpr(kind, inner, typ, loc):
+			protected_inner: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				inner,
+				in_repeated_context,
+			)
+
+			if same_core_expr(protected_inner, inner):
+				expr
+			else:
+				UnboxExpr(kind, protected_inner, typ, loc)
+		FieldExpr(owner, field, typ, loc):
+			protected_owner: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				owner,
+				in_repeated_context,
+			)
+
+			if same_core_expr(protected_owner, owner):
+				expr
+			else:
+				FieldExpr(protected_owner, field, typ, loc)
+		TupleFieldExpr(owner, field_index, typ, loc):
+			protected_owner: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				owner,
+				in_repeated_context,
+			)
+
+			if same_core_expr(protected_owner, owner):
+				expr
+			else:
+				TupleFieldExpr(protected_owner, field_index, typ, loc)
+		TupleExpr(items, typ, loc):
+			TupleExpr(
+				protect_repeated_aggregate_exprs(
+					env,
+					target,
+					target_type,
+					items,
+					in_repeated_context,
+				),
+				typ,
+				loc,
+			)
+		VectorExpr(items, typ, loc):
+			VectorExpr(
+				protect_repeated_aggregate_exprs(
+					env,
+					target,
+					target_type,
+					items,
+					in_repeated_context,
+				),
+				typ,
+				loc,
+			)
+		RecordExpr(fields, typ, loc):
+			RecordExpr(
+				protect_repeated_record_fields(
+					env,
+					target,
+					target_type,
+					fields,
+					in_repeated_context,
+				),
+				typ,
+				loc,
+			)
+		RecordUpdateExpr(base, fields, typ, loc):
+			RecordUpdateExpr(
+				protect_repeated_consumes(env, target, target_type, base, in_repeated_context),
+				protect_repeated_record_fields(
+					env,
+					target,
+					target_type,
+					fields,
+					in_repeated_context,
+				),
+				typ,
+				loc,
+			)
+		RecordReuseExpr(source, fields, typ, loc):
+			RecordReuseExpr(
+				protect_repeated_consumes(env, target, target_type, source, in_repeated_context),
+				protect_repeated_record_fields(
+					env,
+					target,
+					target_type,
+					fields,
+					in_repeated_context,
+				),
+				typ,
+				loc,
+			)
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			RecordCowUpdateExpr(
+				protect_repeated_consumes(env, target, target_type, source, in_repeated_context),
+				CoreTraverse.map_core_record_cow_fields(
+					fields,
+					pure func(
+						replacement,
+					): protect_repeated_aggregate_value(
+						env,
+						target,
+						target_type,
+						replacement,
+						in_repeated_context,
+					),
+				),
+				typ,
+				loc,
+			)
+		RecordConstructExpr(type_name, fields, typ, loc):
+			RecordConstructExpr(
+				type_name,
+				protect_repeated_record_fields(
+					env,
+					target,
+					target_type,
+					fields,
+					in_repeated_context,
+				),
+				typ,
+				loc,
+			)
+		ListConstructExpr(construct, typ, loc):
+			layout = construct.layout
+			elements: List[CoreBoxedStorageValue] = construct.elements
+			elem_needs_release: Bool = construct.elem_needs_release
+			ListConstructExpr(
+				{
+					layout = layout,
+					elements = protect_repeated_boxed_values(
+						env,
+						target,
+						target_type,
+						elements,
+						in_repeated_context,
+					),
+					elem_needs_release = elem_needs_release
+				},
+				typ,
+				loc,
+			)
+		TensorBoxedLiteralExpr(literal, typ, loc):
+			shape = literal.shape
+			elements: List[CoreBoxedStorageValue] = literal.elements
+			elem_needs_release: Bool = literal.elem_needs_release
+			TensorBoxedLiteralExpr(
+				{
+					shape = shape,
+					elements = protect_repeated_boxed_values(
+						env,
+						target,
+						target_type,
+						elements,
+						in_repeated_context,
+					),
+					elem_needs_release = elem_needs_release
+				},
+				typ,
+				loc,
+			)
+		DictConstructExpr(construct, typ, loc):
+			DictConstructExpr(
+				{ construct |
+					entries = protect_repeated_dict_entries(
+						env,
+						target,
+						target_type,
+						construct.entries,
+						in_repeated_context,
+					)
+				},
+				typ,
+				loc,
+			)
+		UnionConstructExpr(construct, typ, loc):
+			UnionConstructExpr(
+				{ construct |
+					args = protect_repeated_boxed_values(
+						env,
+						target,
+						target_type,
+						construct.args,
+						in_repeated_context,
+					)
+				},
+				typ,
+				loc,
+			)
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			protected_body: CoreExpr = if variable.name == target.name:
+				body
+			else:
+				protect_repeated_consumes(env, target, target_type, body, in_repeated_context)
+
+			protected_rhs: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				rhs,
+				in_repeated_context,
+			)
+
+			if same_core_expr(protected_rhs, rhs) and same_core_expr(protected_body, body):
+				expr
+			else:
+				LetExpr(variable, is_mutable, typ, protected_rhs, protected_body)
+		BorrowLetExpr(variable, typ, rhs, body):
+			protected_body: CoreExpr = if variable.name == target.name:
+				body
+			else:
+				protect_repeated_consumes(env, target, target_type, body, in_repeated_context)
+
+			protected_rhs: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				rhs,
+				in_repeated_context,
+			)
+
+			if same_core_expr(protected_rhs, rhs) and same_core_expr(protected_body, body):
+				expr
+			else:
+				BorrowLetExpr(variable, typ, protected_rhs, protected_body)
+		SeqExpr(first, second):
+			protected_first: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				first,
+				in_repeated_context,
+			)
+			protected_second: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				second,
+				in_repeated_context,
+			)
+
+			if same_core_expr(protected_first, first) and same_core_expr(protected_second, second):
+				expr
+			else:
+				SeqExpr(protected_first, protected_second)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			protected_cond: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				cond,
+				in_repeated_context,
+			)
+			protected_then: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				then_expr,
+				in_repeated_context,
+			)
+			protected_else: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				else_expr,
+				in_repeated_context,
+			)
+
+			if (
+				same_core_expr(protected_cond, cond)
+				and same_core_expr(protected_then, then_expr)
+				and same_core_expr(protected_else, else_expr)
+			):
+				expr
+			else:
+				IfExpr(protected_cond, protected_then, protected_else, typ, loc)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			ConstructorMatchExpr(
+				protect_repeated_consumes(env, target, target_type, scrutinee, in_repeated_context),
+				release_policy,
+				protect_repeated_constructor_match_cases(
+					env,
+					target,
+					target_type,
+					cases,
+					in_repeated_context,
+				),
+				protect_repeated_constructor_match_fallback(
+					env,
+					target,
+					target_type,
+					fallback,
+					in_repeated_context,
+				),
+				typ,
+				loc,
+			)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			-- This case was missing: `ConstructorMatchExpr` (above) recurses
+			-- into its branches with the same `in_repeated_context`, so a call
+			-- that consumes `target` inside a union/Option match nested in a
+			-- loop gets its extra protective dup. `LiteralMatchExpr` (matching
+			-- a String/Int/Char scrutinee) fell through to the `_: expr`
+			-- default at the bottom of this match, so `in_repeated_context`
+			-- never reached its case bodies and a consuming call inside one
+			-- arm of a literal match nested in a `while` loop got no dup at
+			-- all -- the double release behind this task's use-after-free.
+			LiteralMatchExpr(
+				protect_repeated_consumes(env, target, target_type, scrutinee, in_repeated_context),
+				protect_repeated_literal_match_cases(
+					env,
+					target,
+					target_type,
+					cases,
+					in_repeated_context,
+				),
+				protect_repeated_literal_match_fallback(
+					env,
+					target,
+					target_type,
+					fallback,
+					in_repeated_context,
+				),
+				typ,
+				loc,
+			)
+		WhileExpr(cond, body, typ, loc):
+			protected_cond: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				cond,
+				True,
+			)
+			protected_body: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				body,
+				True,
+			)
+
+			if same_core_expr(protected_cond, cond) and same_core_expr(protected_body, body):
+				expr
+			else:
+				WhileExpr(protected_cond, protected_body, typ, loc)
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			protected_body: CoreExpr = if binder.variable.name == target.name:
+				body
+			else:
+				protect_repeated_consumes(env, target, target_type, body, True)
+
+			ForRangeExpr(
+				binder,
+				protect_repeated_consumes(env, target, target_type, start, in_repeated_context),
+				protect_repeated_consumes(env, target, target_type, end_value, in_repeated_context),
+				protected_body,
+				typ,
+				loc,
+			)
+		ForChannelExpr(loop, typ, loc):
+			protected_body: CoreExpr = if loop.binder.variable.name == target.name:
+				loop.body
+			else:
+				protect_repeated_consumes(env, target, target_type, loop.body, True)
+
+			ForChannelExpr(
+				{ loop |
+					iterable = protect_repeated_consumes(
+						env,
+						target,
+						target_type,
+						loop.iterable,
+						in_repeated_context,
+					),
+					body = protected_body
+				},
+				typ,
+				loc,
+			)
+		ForListExpr(loop, typ, loc):
+			protected_body: CoreExpr = if loop.binder.variable.name == target.name:
+				loop.body
+			else:
+				protect_repeated_consumes(env, target, target_type, loop.body, True)
+
+			ForListExpr(
+				{ loop |
+					iterable = protect_repeated_consumes(
+						env,
+						target,
+						target_type,
+						loop.iterable,
+						in_repeated_context,
+					),
+					body = protected_body
+				},
+				typ,
+				loc,
+			)
+		ForStringExpr(loop, typ, loc):
+			protected_body: CoreExpr = if loop.binder.variable.name == target.name:
+				loop.body
+			else:
+				protect_repeated_consumes(env, target, target_type, loop.body, True)
+
+			ForStringExpr(
+				{ loop |
+					iterable = protect_repeated_consumes(
+						env,
+						target,
+						target_type,
+						loop.iterable,
+						in_repeated_context,
+					),
+					body = protected_body
+				},
+				typ,
+				loc,
+			)
+		ForDictExpr(loop, typ, loc):
+			protected_body: CoreExpr = if loop.binder.variable.name == target.name:
+				loop.body
+			else:
+				protect_repeated_consumes(env, target, target_type, loop.body, True)
+
+			ForDictExpr(
+				{ loop |
+					iterable = protect_repeated_consumes(
+						env,
+						target,
+						target_type,
+						loop.iterable,
+						in_repeated_context,
+					),
+					body = protected_body
+				},
+				typ,
+				loc,
+			)
+		ForSetExpr(loop, typ, loc):
+			protected_body: CoreExpr = if loop.binder.variable.name == target.name:
+				loop.body
+			else:
+				protect_repeated_consumes(env, target, target_type, loop.body, True)
+
+			ForSetExpr(
+				{ loop |
+					iterable = protect_repeated_consumes(
+						env,
+						target,
+						target_type,
+						loop.iterable,
+						in_repeated_context,
+					),
+					body = protected_body
+				},
+				typ,
+				loc,
+			)
+		ForStreamExpr(loop, typ, loc):
+			protected_body: CoreExpr = if loop.binder.variable.name == target.name:
+				loop.body
+			else:
+				protect_repeated_consumes(env, target, target_type, loop.body, True)
+
+			ForStreamExpr(
+				{ loop |
+					iterable = protect_repeated_consumes(
+						env,
+						target,
+						target_type,
+						loop.iterable,
+						in_repeated_context,
+					),
+					body = protected_body
+				},
+				typ,
+				loc,
+			)
+		ForResourceSourceExpr(loop, typ, loc):
+			protected_body: CoreExpr = if loop.binder.variable.name == target.name:
+				loop.body
+			else:
+				protect_repeated_consumes(env, target, target_type, loop.body, True)
+
+			ForResourceSourceExpr(
+				{ loop |
+					iterable = protect_repeated_consumes(
+						env,
+						target,
+						target_type,
+						loop.iterable,
+						in_repeated_context,
+					),
+					body = protected_body
+				},
+				typ,
+				loc,
+			)
+		ForTensorExpr(loop, typ, loc):
+			protected_body: CoreExpr = if loop.binder.variable.name == target.name:
+				loop.body
+			else:
+				protect_repeated_consumes(env, target, target_type, loop.body, True)
+
+			ForTensorExpr(
+				{ loop |
+					iterable = protect_repeated_consumes(
+						env,
+						target,
+						target_type,
+						loop.iterable,
+						in_repeated_context,
+					),
+					body = protected_body
+				},
+				typ,
+				loc,
+			)
+		AssignExpr(variable, rhs, typ, loc):
+			if variable.name == target.name:
+				expr
+			else:
+				AssignExpr(
+					variable,
+					protect_repeated_consumes(env, target, target_type, rhs, in_repeated_context),
+					typ,
+					loc,
+				)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			if variable.name == target.name:
+				expr
+			else:
+				DupExpr(
+					variable,
+					value_type,
+					retain_policy,
+					protect_repeated_consumes(env, target, target_type, body, in_repeated_context),
+					typ,
+					loc,
+				)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			DropExpr(
+				variable,
+				value_type,
+				release_policy,
+				protect_repeated_consumes(env, target, target_type, body, in_repeated_context),
+				typ,
+				loc,
+			)
+		ResourceScopeExpr(scope, typ, loc):
+			ResourceScopeExpr(
+				{ scope |
+					acquire = protect_repeated_consumes(
+						env,
+						target,
+						target_type,
+						scope.acquire,
+						in_repeated_context,
+					),
+					body = protect_repeated_consumes(
+						env,
+						target,
+						target_type,
+						scope.body,
+						in_repeated_context,
+					),
+					cleanup = protect_repeated_consumes(
+						env,
+						target,
+						target_type,
+						scope.cleanup,
+						in_repeated_context,
+					)
+				},
+				typ,
+				loc,
+			)
+		_:
+			expr

@@ -317,6 +317,29 @@ dictionary literals so every transferred entry is explicit. These operations
 are not emitter cleanup and must not be reordered or omitted from ownership
 analysis.
 
+Perceus (`stage_09_core/perceus.brp` and `stage_09_core/perceus/`) is split by
+responsibility, following the `stage_06_typecheck` subdirectory convention. In
+pipeline order: `perceus/work_counters.brp` (the `--debug`-only work-counter
+markers every other module calls into; no Perceus dependencies of its own),
+`perceus/env.brp` (`PerceusEnv`, `build_env`, the callable/user-call-contract
+tables, and the managed-type/contract queries such as `is_managed_type` and
+`contract_for_call`), `perceus/uses.brp` (`OwnershipUseSummary` and the
+summarize_*/count_uses family every later phase queries), and
+`perceus/contracts.brp` (the reverse-parameter-flow graph and its
+build/solve/annotate path: `build_ownership_contract_graph`,
+`solve_user_call_contracts`, `infer_user_call_contracts`,
+`annotate_user_call_contracts`). `perceus.brp` itself keeps the per-function
+rewrite pipeline (`rewrite_decl`, `rewrite_function`, `rewrite_global`), the
+top-level entry point `insert_drops_program`, and the phases not yet split into
+their own module (balance, mutable-assignment, repeated-context protection,
+borrowed-owner normalization, result-alias normalization, borrowed-loop
+marking, and the drop-insertion engine). A few names are still mutually
+imported between `perceus.brp` and a `perceus/` module during this migration
+(e.g. `assignment_rhs_returns_alias`) because they are shared by both an
+already-split phase and a phase that has not moved yet; Blorp's module
+resolution allows this since imports name symbols rather than establishing a
+compilation order.
+
 ### Early Core Responsibilities
 
 - Lower source semantics without inserting ad hoc retain/release operations.

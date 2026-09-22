@@ -398,7 +398,13 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
 
     def test_contract_inference_uses_collected_equations_without_body_rescans(self) -> None:
         perceus_source = (
-            ROOT / "blorp" / "src" / "compiler" / "stage_09_core" / "perceus.brp"
+            ROOT
+            / "blorp"
+            / "src"
+            / "compiler"
+            / "stage_09_core"
+            / "perceus"
+            / "contracts.brp"
         ).read_text(encoding="utf-8")
 
         for required in (

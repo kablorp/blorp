@@ -1,0 +1,3469 @@
+-- How Perceus counts and classifies the uses a name or expression makes of
+-- its arguments: the summarize_* family (per-node ownership-use summaries)
+-- and count_uses (the legacy name-matching walk older phases still use).
+--
+-- OwnershipUseSummary is Perceus's basic currency: required/consumed
+-- reference counts, whether a name is touched at all, and whether a result
+-- aliases its argument. build_env has already run by the time any of this is
+-- called; every later phase module (balance, mutable, protect, borrowed,
+-- results, drops) queries these summaries rather than re-deriving them.
+import:
+	../closure as CoreClosure
+	../dce as CoreDce
+	../ir:
+		CoreAccessor(ListSpreadAccessor, RootAccessor),
+		CoreBinaryOp(EqualOp, NotEqualOp),
+		CoreBoxKind(PointerBox),
+		CoreBoxedStorageValue,
+		CoreCallKind(
+			BuiltinCall,
+			ClosureCall,
+			DeferredTraitCall,
+			DictWithCapacityCall,
+			DirectRuntimeCall,
+			FallibleStreamTerminalCall,
+			ForeignCall,
+			IntrinsicCall,
+			ListToStringCall,
+			OperationResultCall,
+			SelectedDirectCall,
+			SelectedTraitCall,
+			TensorParallelCall,
+			UnknownCall,
+			UserCall,
+		),
+		CoreClosureCapture,
+		CoreConcurrentBinding,
+		CoreConstructorLengthMatch,
+		CoreConstructorLengthMatchBranch,
+		CoreConstructorLengthMatchCase,
+		CoreConstructorLengthMatchGeq,
+		CoreConstructorLiteralMatch,
+		CoreConstructorMatchBody(
+			ConstructorMatchBodyExpr,
+			ConstructorMatchBodyLength,
+			ConstructorMatchBodyLiteral,
+		),
+		CoreConstructorMatchCase,
+		CoreConstructorMatchFallback(
+			ConstructorMatchFallbackBindings,
+			ConstructorMatchFallbackBody,
+			ConstructorMatchFallbackFail,
+		),
+		CoreConstructorMatchTest,
+		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl, UnionDecl),
+		CoreDictEntry,
+		CoreExpr(
+			AccessorLiteralMatchExpr,
+			AssignExpr,
+			BinaryExpr,
+			BorrowLetExpr,
+			BoxExpr,
+			BreakExpr,
+			CallExpr,
+			CastExpr,
+			ClosureCreateExpr,
+			ConcurrentExpr,
+			ConcurrentlyLoopExpr,
+			ConstructorMatchExpr,
+			DebugBlockExpr,
+			DetachExpr,
+			DictConstructExpr,
+			DropExpr,
+			DupExpr,
+			FieldExpr,
+			ForChannelExpr,
+			ForDictExpr,
+			ForListExpr,
+			ForRangeExpr,
+			ForResourceSourceExpr,
+			ForSetExpr,
+			ForStreamExpr,
+			ForStringExpr,
+			ForTensorExpr,
+			IfExpr,
+			LambdaExpr,
+			LetExpr,
+			ListConstructExpr,
+			ListAllocExpr,
+			ListGetExpr,
+			ListHandoffExpr,
+			ListHandoffSetOwnedExpr,
+			ListHandoffSetSourceSlotExpr,
+			ListRetainExpr,
+			ListSetExpr,
+			ListSwapExpr,
+			LiteralExpr,
+			LogicalExpr,
+			PreClosureConcurrentExpr,
+			PreClosureConcurrentlyLoopExpr,
+			PreClosureDetachExpr,
+			RecordConstructExpr,
+			RecordExpr,
+			RecordCowUpdateExpr,
+			RecordReuseExpr,
+			RecordUpdateExpr,
+			ResourceCleanupExitExpr,
+			ResourceScopeExpr,
+			SelectExpr,
+			SeqExpr,
+			StaticStringLiteralExpr,
+			StringByteCopyExpr,
+			StringByteReadExpr,
+			StringByteWriteExpr,
+			StringSetLenExpr,
+			TailrecListSpreadLoopExpr,
+			TailrecListSpreadRecurExpr,
+			TailrecLoopExpr,
+			TailrecRecurExpr,
+			TensorBoxedLiteralExpr,
+			TensorRawFillExpr,
+			TensorRawReadExpr,
+			TensorRawViewLetExpr,
+			TensorRawWriteExpr,
+			TupleConstructExpr,
+			TupleExpr,
+			TupleFieldExpr,
+			UnaryExpr,
+			UnboxExpr,
+			UnionConstructExpr,
+			VarExpr,
+			VectorExpr,
+			VoidExpr,
+			WhileExpr,
+			LiteralMatchExpr,
+			LengthMatchExpr,
+		),
+		CoreFunctionKind(ClosureBodyFunction),
+		CoreListHandoffMode(BorrowFreshHandoff),
+		CoreListSet,
+		CoreLiteral(StringLiteral),
+		CoreLiteralMatchCase,
+		CoreLiteralMatchFallback(
+			LiteralMatchFallbackBindings,
+			LiteralMatchFallbackBody,
+			LiteralMatchFallbackFail,
+		),
+		CoreLogicalOp,
+		CoreLoopBinder,
+		CoreMatchBinding,
+		CoreMatchBindingMode(MatchBorrowBindingMode, MatchOwnBindingMode),
+		CoreParam,
+		CorePreClosureConcurrentBinding,
+		CoreRecordCowField,
+		CoreRecordFieldValue,
+		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy, StackResultReleasePolicy),
+		CoreRetainPolicy(ArcRetainPolicy, StackResultRetainPolicy),
+		CoreSelectArm,
+		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
+		CoreSourceLoc(KnownSourceLoc, SyntheticSourceLoc),
+		CoreTupleConstruct,
+		CoreTupleElement(
+			TupleFloat16Element,
+			TupleFloat32Element,
+			TupleFloatElement,
+			TuplePointerElement,
+			TuplePrimElement,
+			TupleStackResultElement,
+			TupleStructElement,
+			TupleVoidElement,
+		),
+		CoreType(
+			BoxedResultType,
+			EnumType,
+			FunctionType,
+			HeapRecordType,
+			NamedType,
+			RangeType,
+			SelfType,
+			StackResultType,
+			TensorType,
+			TupleType,
+			TypeParameterType,
+			UnionType,
+			ValueRecordType,
+			VoidType,
+		),
+		CoreUnboxKind(PointerUnbox),
+		CoreVar,
+		core_expr_type,
+		core_var_equal,
+		core_vars_have_same_definition,
+	../ownership:
+		OwnershipArgMode(BorrowArg, TransferArg),
+		OwnershipCallContract,
+		OwnershipResultMode(
+			ReturnAliasOfArg,
+			ReturnBorrowed,
+			ReturnOwned,
+			ReturnPrimitive,
+			ReturnVoid,
+		),
+		arg_allows_borrowed_result_alias,
+		arg_consumes_caller,
+		arg_preserves_caller,
+		builtin_contract,
+		intrinsic_contract,
+	env:
+		OwnershipCallableId,
+		PerceusEnv,
+		contract_for_call,
+		is_managed_type,
+	work_counters:
+		perceus_work_legacy_count_node_visits,
+		perceus_work_linear_summary_node_visits,
+		perceus_work_linear_summary_requests,
+	../perceus:
+		binary_operands_are_borrowed,
+	mutable:
+		assignment_rhs_returns_alias,
+	balance:
+		constructor_match_body_uses_managed_borrowed_binding,
+		match_branch_uses_managed_borrowed_binding,
+	../resolve as CoreResolve
+	../traverse as CoreTraverse
+	../type_policy as CoreTypePolicy
+
+
+--- The summary walk's explicit stack of what is left to do above the node it is
+--- visiting. Each frame carries the rest of the stack as its last field rather
+--- than sitting inside a separate cons cell, so a push costs one allocation.
+private union PerceusOwnershipSummaryFrameStack:
+	PerceusOwnershipSummaryNoFrame
+	PerceusOwnershipSummaryLetRhsFrame(CoreVar, CoreExpr, PerceusOwnershipSummaryFrameStack)
+	PerceusOwnershipSummaryCombineBodyFrame(OwnershipUseSummary, PerceusOwnershipSummaryFrameStack)
+	PerceusOwnershipSummarySequenceFirstFrame(CoreExpr, PerceusOwnershipSummaryFrameStack)
+	PerceusOwnershipSummarySequenceSecondFrame(OwnershipUseSummary, PerceusOwnershipSummaryFrameStack)
+	PerceusOwnershipSummaryDupBodyFrame(Bool, PerceusOwnershipSummaryFrameStack)
+	PerceusOwnershipSummaryDropBodyFrame(Bool, PerceusOwnershipSummaryFrameStack)
+	PerceusOwnershipSummaryPassBodyFrame(PerceusOwnershipSummaryFrameStack)
+
+
+
+
+--- How one name is used by one expression: the peak simultaneous references it
+--- needs, how many of them it consumes, whether it appears at all, and whether
+--- the expression's result aliases it. This stays a `record` even though every
+--- field is scalar: the summary walk's frame stack and its per-argument lists
+--- hold summaries as union and collection payloads, which box a `struct` at
+--- every push, and a measured conversion cost 2% more allocations than it saved.
+
+record OwnershipUseSummary {
+	required_refs: Int,
+	consumed_refs: Int,
+	touched: Bool,
+	returns_alias: Bool
+}
+
+
+NO_OWNERSHIP_USES: OwnershipUseSummary = {
+	required_refs = 0,
+	consumed_refs = 0,
+	touched = False,
+	returns_alias = False
+}
+
+CONSUME_OWNERSHIP_USE: OwnershipUseSummary = {
+	required_refs = 1,
+	consumed_refs = 1,
+	touched = True,
+	returns_alias = False
+}
+
+BORROW_OWNERSHIP_USE: OwnershipUseSummary = {
+	required_refs = 1,
+	consumed_refs = 0,
+	touched = True,
+	returns_alias = False
+}
+
+
+private pure func ownership_uses_from_legacy_count(count: Int) -> OwnershipUseSummary:
+	if count <= 0:
+		NO_OWNERSHIP_USES
+	else:
+		{
+			required_refs = count,
+			consumed_refs = count,
+			touched = True,
+			returns_alias = False
+		}
+
+
+pure func seq_ownership_uses(
+	first: OwnershipUseSummary,
+	second: OwnershipUseSummary,
+) -> OwnershipUseSummary:
+	{
+		required_refs = max_int(first.required_refs, first.consumed_refs + second.required_refs),
+		consumed_refs = first.consumed_refs + second.consumed_refs,
+		touched = first.touched or second.touched,
+		returns_alias = second.returns_alias
+	}
+
+
+private pure func ownership_uses_with_returns_alias(
+	uses: OwnershipUseSummary,
+	returns_alias: Bool,
+) -> OwnershipUseSummary:
+	{
+		required_refs = uses.required_refs,
+		consumed_refs = uses.consumed_refs,
+		touched = uses.touched,
+		returns_alias = returns_alias
+	}
+
+
+--- Evaluate `second` after `first` and report whether either result aliases
+--- the name. Sequencing with `NO_OWNERSHIP_USES` is the identity, so this is
+--- exactly `aggregate_ownership_uses([first, second])` without the list.
+private pure func aggregate_ownership_uses_pair(
+	first: OwnershipUseSummary,
+	second: OwnershipUseSummary,
+) -> OwnershipUseSummary:
+	ownership_uses_with_returns_alias(
+		seq_ownership_uses(first, second),
+		first.returns_alias or second.returns_alias,
+	)
+
+
+private pure func aggregate_ownership_uses_from(
+	initial: OwnershipUseSummary,
+	items: List[OwnershipUseSummary],
+) -> OwnershipUseSummary:
+	var summary: OwnershipUseSummary = initial
+	var returns_alias: Bool = initial.returns_alias
+
+	for item in items:
+		summary = seq_ownership_uses(summary, item)
+
+		if item.returns_alias:
+			returns_alias = True
+		else:
+			void
+
+	ownership_uses_with_returns_alias(summary, returns_alias)
+
+
+private pure func aggregate_ownership_uses(items: List[OwnershipUseSummary]) -> OwnershipUseSummary:
+	aggregate_ownership_uses_from(NO_OWNERSHIP_USES, items)
+
+
+private pure func sum_ownership_uses(items: List[OwnershipUseSummary]) -> OwnershipUseSummary:
+	var required_refs: Int = 0
+	var consumed_refs: Int = 0
+	var touched: Bool = False
+	var returns_alias: Bool = False
+
+	for item in items:
+		required_refs += item.required_refs
+		consumed_refs += item.consumed_refs
+		touched = touched or item.touched
+		returns_alias = returns_alias or item.returns_alias
+
+	{
+		required_refs = required_refs,
+		consumed_refs = consumed_refs,
+		touched = touched,
+		returns_alias = returns_alias
+	}
+
+
+--- Take the worse of two mutually exclusive branches. Branch counts start at
+--- zero and are never negative, so this is exactly
+--- `branch_ownership_uses([first, second])` without the list.
+pure func branch_ownership_uses_pair(
+	first: OwnershipUseSummary,
+	second: OwnershipUseSummary,
+) -> OwnershipUseSummary:
+	{
+		required_refs = max_int(first.required_refs, second.required_refs),
+		consumed_refs = max_int(first.consumed_refs, second.consumed_refs),
+		touched = first.touched or second.touched,
+		returns_alias = first.returns_alias or second.returns_alias
+	}
+
+
+pure func branch_ownership_uses(items: List[OwnershipUseSummary]) -> OwnershipUseSummary:
+	var required_refs: Int = 0
+	var consumed_refs: Int = 0
+	var touched: Bool = False
+	var returns_alias: Bool = False
+
+	for item in items:
+		required_refs = max_int(required_refs, item.required_refs)
+		consumed_refs = max_int(consumed_refs, item.consumed_refs)
+		touched = touched or item.touched
+		returns_alias = returns_alias or item.returns_alias
+
+	{
+		required_refs = required_refs,
+		consumed_refs = consumed_refs,
+		touched = touched,
+		returns_alias = returns_alias
+	}
+
+
+pure func direct_aliases_name(name: String, expr: CoreExpr) -> Bool:
+	match expr:
+		VarExpr(variable, typ, loc):
+			variable.name == name
+		FieldExpr(owner, field, typ, loc):
+			direct_aliases_name(name, owner)
+		TupleFieldExpr(owner, field_index, typ, loc):
+			direct_aliases_name(name, owner)
+		CastExpr(inner, typ, loc):
+			direct_aliases_name(name, inner)
+		UnboxExpr(kind, inner, typ, loc):
+			direct_aliases_name(name, inner)
+		_:
+			False
+
+
+private pure func count_uses_in_exprs(name: String, exprs: List[CoreExpr]) -> Int:
+	var total: Int = 0
+
+	for expr in exprs:
+		total += count_uses(name, expr)
+
+	total
+
+
+private pure func count_uses_in_boxed_values(
+	name: String,
+	values: List[CoreBoxedStorageValue],
+) -> Int:
+	var total: Int = 0
+
+	for value in values:
+		total += count_uses(name, value.value)
+
+	total
+
+
+private pure func count_uses_in_record_fields(
+	name: String,
+	fields: List[CoreRecordFieldValue],
+) -> Int:
+	var total: Int = 0
+
+	for field in fields:
+		total += count_uses(name, field.value)
+
+	total
+
+
+private pure func count_uses_in_record_cow_fields(
+	name: String,
+	fields: List[CoreRecordCowField],
+) -> Int:
+	var total: Int = 0
+
+	for field in fields:
+		match field.replacement:
+			Some(replacement):
+				total += count_uses(name, replacement)
+			None:
+				void
+
+	total
+
+
+private pure func count_uses_in_dict_entries(name: String, entries: List[CoreDictEntry]) -> Int:
+	var total: Int = 0
+
+	for entry in entries:
+		total += count_uses(name, entry.key.value)
+		total += count_uses(name, entry.value.value)
+
+	total
+
+
+pure func match_bindings_shadow(name: String, bindings: List[CoreMatchBinding]) -> Bool:
+	var shadowed: Bool = False
+
+	for binding in bindings:
+		if binding.variable.name == name:
+			shadowed = True
+			break
+		else:
+			void
+
+	shadowed
+
+
+pure func max_int(left: Int, right: Int) -> Int:
+	if left > right:
+		left
+	else:
+		right
+
+
+pure func count_uses_in_constructor_match_body(
+	name: String,
+	body: CoreConstructorMatchBody,
+) -> Int:
+	match body:
+		ConstructorMatchBodyExpr(expr):
+			count_uses(name, expr)
+		ConstructorMatchBodyLiteral(match_expr):
+			count_uses_in_constructor_literal_match(name, match_expr)
+		ConstructorMatchBodyLength(match_expr):
+			count_uses_in_constructor_length_match(name, match_expr)
+
+
+private pure func count_uses_in_constructor_match_case(
+	name: String,
+	match_case: CoreConstructorMatchCase,
+) -> Int:
+	if match_bindings_shadow(name, match_case.bindings):
+		0
+	else:
+		count_uses_in_constructor_match_body(name, match_case.body)
+
+
+private pure func count_uses_in_constructor_match_cases(
+	name: String,
+	cases: List[CoreConstructorMatchCase],
+) -> Int:
+	var max_uses: Int = 0
+
+	for match_case in cases:
+		max_uses = max_int(
+			max_uses,
+			count_uses_in_constructor_match_case(name, match_case),
+		)
+
+	max_uses
+
+
+private pure func count_uses_in_constructor_match_fallback(
+	name: String,
+	fallback: CoreConstructorMatchFallback,
+) -> Int:
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			count_uses(name, body)
+		ConstructorMatchFallbackBindings(bindings, body):
+			if match_bindings_shadow(name, bindings):
+				0
+			else:
+				count_uses(name, body)
+		ConstructorMatchFallbackFail:
+			0
+
+
+private pure func count_uses_in_literal_match_case(
+	name: String,
+	match_case: CoreLiteralMatchCase,
+) -> Int:
+	if match_bindings_shadow(name, match_case.bindings):
+		0
+	else:
+		count_uses(name, match_case.body)
+
+
+private pure func count_uses_in_literal_match_cases(
+	name: String,
+	cases: List[CoreLiteralMatchCase],
+) -> Int:
+	var max_uses: Int = 0
+
+	for match_case in cases:
+		max_uses = max_int(
+			max_uses,
+			count_uses_in_literal_match_case(name, match_case),
+		)
+
+	max_uses
+
+
+private pure func count_uses_in_literal_match_fallback(
+	name: String,
+	fallback: CoreLiteralMatchFallback,
+) -> Int:
+	match fallback:
+		LiteralMatchFallbackBody(body):
+			count_uses(name, body)
+		LiteralMatchFallbackBindings(bindings, body):
+			if match_bindings_shadow(name, bindings):
+				0
+			else:
+				count_uses(name, body)
+		LiteralMatchFallbackFail:
+			0
+
+
+private pure func count_uses_in_constructor_literal_match(
+	name: String,
+	match_expr: CoreConstructorLiteralMatch,
+) -> Int:
+	max_int(
+		count_uses_in_literal_match_cases(name, match_expr.cases),
+		count_uses_in_literal_match_fallback(name, match_expr.fallback),
+	)
+
+
+private pure func count_uses_in_constructor_length_branch(
+	name: String,
+	branch: CoreConstructorLengthMatchBranch,
+) -> Int:
+	if match_bindings_shadow(name, branch.bindings):
+		0
+	else:
+		count_uses_in_constructor_match_body(name, branch.body)
+
+
+private pure func count_uses_in_constructor_length_cases(
+	name: String,
+	cases: List[CoreConstructorLengthMatchCase],
+) -> Int:
+	var max_uses: Int = 0
+
+	for match_case in cases:
+		max_uses = max_int(
+			max_uses,
+			count_uses_in_constructor_length_branch(name, match_case.branch),
+		)
+
+	max_uses
+
+
+private pure func count_uses_in_constructor_length_geq(
+	name: String,
+	geq: Option[CoreConstructorLengthMatchGeq],
+) -> Int:
+	match geq:
+		Some(value):
+			count_uses_in_constructor_length_branch(name, value.branch)
+		None:
+			0
+
+
+private pure func count_uses_in_constructor_length_fallback(
+	name: String,
+	fallback: Option[CoreConstructorLengthMatchBranch],
+) -> Int:
+	match fallback:
+		Some(branch):
+			count_uses_in_constructor_length_branch(name, branch)
+		None:
+			0
+
+
+private pure func count_uses_in_constructor_length_match(
+	name: String,
+	match_expr: CoreConstructorLengthMatch,
+) -> Int:
+	max_int(
+		count_uses_in_constructor_length_cases(name, match_expr.cases),
+		max_int(
+			count_uses_in_constructor_length_geq(name, match_expr.geq),
+			count_uses_in_constructor_length_fallback(name, match_expr.fallback),
+		),
+	)
+
+
+private pure func summarize_boxed_storage_uses(
+	env: PerceusEnv,
+	name: String,
+	value: CoreBoxedStorageValue,
+) -> OwnershipUseSummary:
+	if value.transfers_ownership:
+		summarize_linear_ownership_uses(env, name, value.value)
+	else:
+		summarize_linear_borrow(env, name, value.value)
+
+
+private pure func summarize_boxed_storage_values(
+	env: PerceusEnv,
+	name: String,
+	values: List[CoreBoxedStorageValue],
+) -> OwnershipUseSummary:
+	var summaries: List[OwnershipUseSummary] = []
+
+	for value in values:
+		summaries = summaries.append(summarize_boxed_storage_uses(env, name, value))
+
+	aggregate_ownership_uses(summaries)
+
+
+private pure func summarize_exprs(
+	env: PerceusEnv,
+	name: String,
+	exprs: List[CoreExpr],
+) -> OwnershipUseSummary:
+	var summaries: List[OwnershipUseSummary] = []
+
+	for expr in exprs:
+		summaries = summaries.append(summarize_linear_ownership_uses(env, name, expr))
+
+	aggregate_ownership_uses(summaries)
+
+
+private pure func summarize_borrowed_exprs(
+	env: PerceusEnv,
+	name: String,
+	exprs: List[CoreExpr],
+) -> OwnershipUseSummary:
+	var summaries: List[OwnershipUseSummary] = []
+
+	for expr in exprs:
+		summaries = summaries.append(summarize_linear_borrow(env, name, expr))
+
+	aggregate_ownership_uses(summaries)
+
+
+private pure func summarize_record_fields(
+	env: PerceusEnv,
+	name: String,
+	fields: List[CoreRecordFieldValue],
+) -> OwnershipUseSummary:
+	var summaries: List[OwnershipUseSummary] = []
+
+	for field in fields:
+		summaries = summaries.append(summarize_linear_ownership_uses(env, name, field.value))
+
+	aggregate_ownership_uses(summaries)
+
+
+private pure func summarize_record_cow_fields(
+	env: PerceusEnv,
+	name: String,
+	fields: List[CoreRecordCowField],
+) -> OwnershipUseSummary:
+	var summaries: List[OwnershipUseSummary] = []
+
+	for field in fields:
+		match field.replacement:
+			Some(replacement):
+				summaries = summaries.append(
+					summarize_linear_ownership_uses(
+						env,
+						name,
+						replacement,
+					),
+				)
+			None:
+				void
+
+	aggregate_ownership_uses(summaries)
+
+
+private pure func summarize_dict_entries(
+	env: PerceusEnv,
+	name: String,
+	entries: List[CoreDictEntry],
+) -> OwnershipUseSummary:
+	var summaries: List[OwnershipUseSummary] = []
+
+	for entry in entries:
+		summaries = summaries.append(summarize_boxed_storage_uses(env, name, entry.key))
+		summaries = summaries.append(summarize_boxed_storage_uses(env, name, entry.value))
+
+	aggregate_ownership_uses(summaries)
+
+
+private pure func summarize_call_args(
+	env: PerceusEnv,
+	name: String,
+	modes: List[OwnershipArgMode],
+	args: List[CoreExpr],
+) -> List[OwnershipUseSummary]:
+	-- One summary per argument that the contract describes a mode for, in
+	-- argument order. Peeling both lists one head at a time rebuilt a tail
+	-- pair and a result list at every position, so a call with n arguments
+	-- allocated O(n^2) lists to produce n summaries.
+	var summaries: List[OwnershipUseSummary] = []
+	var index: Int = 0
+
+	for arg in args:
+		match modes.get(index):
+			Some(mode):
+				summaries = summaries.append(summarize_linear_call_arg(env, name, mode, arg))
+			None:
+				void
+
+		index += 1
+
+	summaries
+
+
+private pure func call_result_aliases_from_borrowed_args(
+	env: PerceusEnv,
+	name: String,
+	modes: List[OwnershipArgMode],
+	args: List[CoreExpr],
+) -> Bool:
+	match modes:
+		[]:
+			False
+		[mode, ...mode_tail]:
+			match args:
+				[]:
+					False
+				[arg, ...arg_tail]:
+					this_arg_aliases: Bool = (
+						arg_allows_borrowed_result_alias(mode)
+						and borrow_expr_aliases_target(env, name, arg)
+					)
+
+					(
+						this_arg_aliases
+						or call_result_aliases_from_borrowed_args(env, name, mode_tail, arg_tail)
+					)
+
+
+private pure func call_result_aliases_target(
+	env: PerceusEnv,
+	name: String,
+	contract: OwnershipCallContract,
+	args: List[CoreExpr],
+	arg_uses: List[OwnershipUseSummary],
+) -> Bool:
+	match contract.result:
+		ReturnAliasOfArg(index):
+			match args.get(index):
+				Some(arg):
+					match arg_uses.get(index):
+						Some(uses):
+							uses.returns_alias or borrow_expr_aliases_target(env, name, arg)
+						None:
+							False
+				None:
+					False
+		ReturnBorrowed:
+			call_result_aliases_from_borrowed_args(env, name, contract.args, args)
+		ReturnVoid:
+			False
+		ReturnPrimitive:
+			False
+		ReturnOwned:
+			False
+
+
+pure func summarize_linear_call(
+	env: PerceusEnv,
+	name: String,
+	return_type: CoreType,
+	kind: CoreCallKind,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+) -> OwnershipUseSummary:
+	match contract_for_call(env, kind, args.length(), return_type):
+		Some(contract):
+			arg_uses: List[OwnershipUseSummary] = summarize_call_args(
+				env,
+				name,
+				contract.args,
+				args,
+			)
+
+			-- A closure call evaluates the borrowed callee before its arguments.
+			-- Every other call kind reaches its callee through the contract, so
+			-- the argument summaries are the whole story.
+			uses: OwnershipUseSummary = match kind:
+				ClosureCall:
+					aggregate_ownership_uses_from(
+						summarize_linear_borrow(env, name, callee),
+						arg_uses,
+					)
+				_:
+					aggregate_ownership_uses(arg_uses)
+
+			ownership_uses_with_returns_alias(
+				uses,
+				call_result_aliases_target(env, name, contract, args, arg_uses),
+			)
+		None:
+			callee_uses: OwnershipUseSummary = summarize_linear_ownership_uses(env, name, callee)
+			var summaries: List[OwnershipUseSummary] = []
+
+			for arg in args:
+				summaries = summaries.append(summarize_linear_ownership_uses(env, name, arg))
+
+			aggregate_ownership_uses_from(callee_uses, summaries)
+
+
+private pure func summarize_linear_call_arg(
+	env: PerceusEnv,
+	name: String,
+	mode: OwnershipArgMode,
+	arg: CoreExpr,
+) -> OwnershipUseSummary:
+	if arg_consumes_caller(mode):
+		summarize_linear_ownership_uses(env, name, arg)
+	else:
+		summarize_linear_borrow(env, name, arg)
+
+
+pure func summarize_linear_borrow(
+	env: PerceusEnv,
+	name: String,
+	expr: CoreExpr,
+) -> OwnershipUseSummary:
+	match expr:
+		VarExpr(variable, typ, loc):
+			if variable.name == name:
+				BORROW_OWNERSHIP_USE
+			else:
+				NO_OWNERSHIP_USES
+		FieldExpr(owner, field, typ, loc):
+			summarize_linear_borrow(env, name, owner)
+		TupleFieldExpr(owner, field_index, typ, loc):
+			summarize_linear_borrow(env, name, owner)
+		CastExpr(inner, typ, loc):
+			summarize_linear_borrow(env, name, inner)
+		BoxExpr(box_op, typ, loc):
+			summarize_linear_borrow(env, name, box_op.value)
+		UnboxExpr(kind, inner, typ, loc):
+			summarize_linear_borrow(env, name, inner)
+		_:
+			summarize_linear_ownership_uses(env, name, expr)
+
+
+pure func release_expr_owner_var(expr: CoreExpr) -> Option[CoreVar]:
+	match expr:
+		VarExpr(variable, typ, loc):
+			Some(variable)
+		CastExpr(inner, typ, loc):
+			release_expr_owner_var(inner)
+		UnboxExpr(PointerUnbox, inner, typ, loc):
+			release_expr_owner_var(inner)
+		_:
+			None
+
+
+private pure func release_expr_is_owner_value(name: String, expr: CoreExpr) -> Bool:
+	match release_expr_owner_var(expr):
+		Some(variable):
+			variable.name == name
+		None:
+			False
+
+
+pure func releasing_match_consumes_owner(
+	name: String,
+	scrutinee: CoreExpr,
+	release_policy: CoreReleasePolicy,
+) -> Bool:
+	release_policy != NoReleasePolicy and release_expr_is_owner_value(name, scrutinee)
+
+
+pure func summarize_match_ownership_uses(
+	env: PerceusEnv,
+	name: String,
+	scrutinee: CoreExpr,
+	release_policy: CoreReleasePolicy,
+	branch_uses: OwnershipUseSummary,
+) -> OwnershipUseSummary:
+	scrutinee_aliases_owner: Bool = borrow_expr_aliases_target(env, name, scrutinee)
+
+	scrutinee_uses: OwnershipUseSummary = if scrutinee_aliases_owner:
+		summarize_linear_borrow(env, name, scrutinee)
+	else:
+		summarize_linear_ownership_uses(env, name, scrutinee)
+
+	balanced_branch_uses: OwnershipUseSummary = if scrutinee_aliases_owner:
+		if releasing_match_consumes_owner(name, scrutinee, release_policy):
+			-- Releasing matches inspect the alias first, run their selected
+			-- branch, and consume the matched owner when the match exits.
+			ownership_uses_with_returns_alias(
+				seq_ownership_uses(branch_uses, CONSUME_OWNERSHIP_USE),
+				branch_uses.returns_alias,
+			)
+		else:
+			seq_ownership_uses(BORROW_OWNERSHIP_USE, branch_uses)
+	else:
+		branch_uses
+
+	seq_ownership_uses(scrutinee_uses, balanced_branch_uses)
+
+
+pure func borrow_expr_aliases_target(env: PerceusEnv, name: String, expr: CoreExpr) -> Bool:
+	match expr:
+		VarExpr(variable, typ, loc):
+			variable.name == name
+		FieldExpr(owner, field, typ, loc):
+			borrow_expr_aliases_target(env, name, owner)
+		TupleFieldExpr(owner, field_index, typ, loc):
+			borrow_expr_aliases_target(env, name, owner)
+		CastExpr(inner, typ, loc):
+			borrow_expr_aliases_target(env, name, inner)
+		UnboxExpr(kind, inner, typ, loc):
+			borrow_expr_aliases_target(env, name, inner)
+		_:
+			summarize_linear_ownership_uses(env, name, expr).returns_alias
+
+
+pure func core_var_matches_param(variable: CoreVar, param: CoreParam) -> Bool:
+	match param.name.def_id:
+		Some(_):
+			core_vars_have_same_definition(variable, param.name)
+		None:
+			variable.name == param.name.name
+
+
+pure func match_bindings_shadow_param(
+	bindings: List[CoreMatchBinding],
+	param: CoreParam,
+) -> Bool:
+	bindings.any(func(binding): core_var_matches_param(binding.variable, param))
+
+
+private pure func call_args_return_borrowed_definition(
+	env: PerceusEnv,
+	target_name: String,
+	target_def_id: Int,
+	modes: List[OwnershipArgMode],
+	args: List[CoreExpr],
+) -> Bool:
+	var found: Bool = False
+	var index: Int = 0
+
+	for arg in args:
+		match modes.get(index):
+			Some(mode):
+				if (
+					arg_allows_borrowed_result_alias(mode)
+					and borrow_expr_aliases_definition(env, target_name, target_def_id, arg)
+				):
+					found = True
+					break
+				else:
+					void
+			None:
+				void
+
+		index += 1
+
+	found
+
+
+private pure func call_result_aliases_definition(
+	env: PerceusEnv,
+	target_name: String,
+	target_def_id: Int,
+	contract: OwnershipCallContract,
+	args: List[CoreExpr],
+) -> Bool:
+	match contract.result:
+		ReturnAliasOfArg(index):
+			match args.get(index):
+				Some(arg):
+					borrow_expr_aliases_definition(env, target_name, target_def_id, arg)
+				None:
+					False
+		ReturnBorrowed:
+			call_args_return_borrowed_definition(
+				env,
+				target_name,
+				target_def_id,
+				contract.args,
+				args,
+			)
+		ReturnVoid:
+			False
+		ReturnPrimitive:
+			False
+		ReturnOwned:
+			False
+
+
+private pure func binding_body_aliases_definition(
+	env: PerceusEnv,
+	target_name: String,
+	target_def_id: Int,
+	variable: CoreVar,
+	is_mutable: Bool,
+	typ: CoreType,
+	rhs: CoreExpr,
+	body: CoreExpr,
+) -> Bool:
+	binding_shadows_target: Bool = (
+		variable.name == target_name
+		and variable.def_id == Some(target_def_id)
+	)
+
+	if (
+		not binding_shadows_target
+		and borrow_expr_aliases_definition(env, target_name, target_def_id, body)
+	):
+		True
+	else if (
+		not is_mutable
+		and is_managed_type(env, typ)
+		and borrow_expr_aliases_definition(env, target_name, target_def_id, rhs)
+	):
+		match variable.def_id:
+			Some(binding_def_id):
+				borrow_expr_aliases_definition(env, variable.name, binding_def_id, body)
+			None:
+				False
+	else:
+		False
+
+
+-- Resolved parameters require definition-aware result traversal. Keep this
+-- separate from the name-based use summary: branches inspect only values that
+-- can become the expression result, and borrowed match bindings propagate an
+-- alias only when their own resolved identity is returned.
+private pure func match_bindings_shadow_definition(
+	bindings: List[CoreMatchBinding],
+	target_name: String,
+	target_def_id: Int,
+) -> Bool:
+	bindings.any(func(binding):
+		binding.variable.name == target_name and binding.variable.def_id == Some(target_def_id)
+	)
+
+
+private pure func borrowed_match_bindings_alias_expr_result(
+	env: PerceusEnv,
+	bindings: List[CoreMatchBinding],
+	body: CoreExpr,
+) -> Bool:
+	var aliases: Bool = False
+
+	for binding in bindings:
+		match binding.variable.def_id:
+			Some(binding_def_id):
+				if (
+					binding.mode == MatchBorrowBindingMode
+					and is_managed_type(env, binding.typ)
+					and borrow_expr_aliases_definition(
+						env,
+						binding.variable.name,
+						binding_def_id,
+						body,
+					)
+				):
+					aliases = True
+					break
+				else:
+					void
+			None:
+				void
+
+	aliases
+
+
+private pure func match_expr_branch_aliases_definition(
+	env: PerceusEnv,
+	target_name: String,
+	target_def_id: Int,
+	source_aliases_target: Bool,
+	bindings: List[CoreMatchBinding],
+	body: CoreExpr,
+) -> Bool:
+	direct_alias: Bool = (
+		not match_bindings_shadow_definition(bindings, target_name, target_def_id)
+		and borrow_expr_aliases_definition(env, target_name, target_def_id, body)
+	)
+
+	borrowed_binding_alias: Bool = (
+		source_aliases_target
+		and borrowed_match_bindings_alias_expr_result(env, bindings, body)
+	)
+
+	direct_alias or borrowed_binding_alias
+
+
+private pure func literal_match_aliases_definition(
+	env: PerceusEnv,
+	target_name: String,
+	target_def_id: Int,
+	source_aliases_target: Bool,
+	cases: List[CoreLiteralMatchCase],
+	fallback: CoreLiteralMatchFallback,
+) -> Bool:
+	var aliases: Bool = False
+
+	for match_case in cases:
+		if match_expr_branch_aliases_definition(
+			env,
+			target_name,
+			target_def_id,
+			source_aliases_target,
+			match_case.bindings,
+			match_case.body,
+		):
+			aliases = True
+			break
+		else:
+			void
+
+	if aliases:
+		True
+	else:
+		match fallback:
+			LiteralMatchFallbackBody(body):
+				borrow_expr_aliases_definition(env, target_name, target_def_id, body)
+			LiteralMatchFallbackBindings(bindings, body):
+				match_expr_branch_aliases_definition(
+					env,
+					target_name,
+					target_def_id,
+					source_aliases_target,
+					bindings,
+					body,
+				)
+			LiteralMatchFallbackFail:
+				False
+
+
+private pure func constructor_match_body_aliases_definition(
+	env: PerceusEnv,
+	target_name: String,
+	target_def_id: Int,
+	source_aliases_target: Bool,
+	body: CoreConstructorMatchBody,
+) -> Bool:
+	match body:
+		ConstructorMatchBodyExpr(expr):
+			borrow_expr_aliases_definition(env, target_name, target_def_id, expr)
+		ConstructorMatchBodyLiteral(match_expr):
+			literal_match_aliases_definition(
+				env,
+				target_name,
+				target_def_id,
+				source_aliases_target,
+				match_expr.cases,
+				match_expr.fallback,
+			)
+		ConstructorMatchBodyLength(match_expr):
+			constructor_length_match_aliases_definition(
+				env,
+				target_name,
+				target_def_id,
+				source_aliases_target,
+				match_expr,
+			)
+
+
+private pure func borrowed_match_bindings_alias_constructor_result(
+	env: PerceusEnv,
+	bindings: List[CoreMatchBinding],
+	body: CoreConstructorMatchBody,
+) -> Bool:
+	var aliases: Bool = False
+
+	for binding in bindings:
+		match binding.variable.def_id:
+			Some(binding_def_id):
+				if (
+					binding.mode == MatchBorrowBindingMode
+					and is_managed_type(env, binding.typ)
+					and constructor_match_body_aliases_definition(
+						env,
+						binding.variable.name,
+						binding_def_id,
+						True,
+						body,
+					)
+				):
+					aliases = True
+					break
+				else:
+					void
+			None:
+				void
+
+	aliases
+
+
+private pure func match_constructor_branch_aliases_definition(
+	env: PerceusEnv,
+	target_name: String,
+	target_def_id: Int,
+	source_aliases_target: Bool,
+	bindings: List[CoreMatchBinding],
+	body: CoreConstructorMatchBody,
+) -> Bool:
+	direct_alias: Bool = (
+		not match_bindings_shadow_definition(bindings, target_name, target_def_id)
+		and constructor_match_body_aliases_definition(
+			env,
+			target_name,
+			target_def_id,
+			source_aliases_target,
+			body,
+		)
+	)
+
+	borrowed_binding_alias: Bool = (
+		source_aliases_target
+		and borrowed_match_bindings_alias_constructor_result(env, bindings, body)
+	)
+
+	direct_alias or borrowed_binding_alias
+
+
+private pure func constructor_length_branch_aliases_definition(
+	env: PerceusEnv,
+	target_name: String,
+	target_def_id: Int,
+	source_aliases_target: Bool,
+	branch: CoreConstructorLengthMatchBranch,
+) -> Bool:
+	match_constructor_branch_aliases_definition(
+		env,
+		target_name,
+		target_def_id,
+		source_aliases_target,
+		branch.bindings,
+		branch.body,
+	)
+
+
+private pure func constructor_length_match_aliases_definition(
+	env: PerceusEnv,
+	target_name: String,
+	target_def_id: Int,
+	source_aliases_target: Bool,
+	match_expr: CoreConstructorLengthMatch,
+) -> Bool:
+	var aliases: Bool = False
+
+	for match_case in match_expr.cases:
+		if constructor_length_branch_aliases_definition(
+			env,
+			target_name,
+			target_def_id,
+			source_aliases_target,
+			match_case.branch,
+		):
+			aliases = True
+			break
+		else:
+			void
+
+	if not aliases:
+		match match_expr.geq:
+			Some(match_case):
+				aliases = constructor_length_branch_aliases_definition(
+					env,
+					target_name,
+					target_def_id,
+					source_aliases_target,
+					match_case.branch,
+				)
+			None:
+				void
+	else:
+		void
+
+	if not aliases:
+		match match_expr.fallback:
+			Some(branch):
+				aliases = constructor_length_branch_aliases_definition(
+					env,
+					target_name,
+					target_def_id,
+					source_aliases_target,
+					branch,
+				)
+			None:
+				void
+	else:
+		void
+
+	aliases
+
+
+private pure func constructor_match_aliases_definition(
+	env: PerceusEnv,
+	target_name: String,
+	target_def_id: Int,
+	source_aliases_target: Bool,
+	cases: List[CoreConstructorMatchCase],
+	fallback: CoreConstructorMatchFallback,
+) -> Bool:
+	var aliases: Bool = False
+
+	for match_case in cases:
+		if match_constructor_branch_aliases_definition(
+			env,
+			target_name,
+			target_def_id,
+			source_aliases_target,
+			match_case.bindings,
+			match_case.body,
+		):
+			aliases = True
+			break
+		else:
+			void
+
+	if aliases:
+		True
+	else:
+		match fallback:
+			ConstructorMatchFallbackBody(body):
+				borrow_expr_aliases_definition(env, target_name, target_def_id, body)
+			ConstructorMatchFallbackBindings(bindings, body):
+				match_expr_branch_aliases_definition(
+					env,
+					target_name,
+					target_def_id,
+					source_aliases_target,
+					bindings,
+					body,
+				)
+			ConstructorMatchFallbackFail:
+				False
+
+
+-- Prove that a Dup already owns every alias returned through transparent
+-- wrappers. Unsupported shapes conservatively return False and retain through
+-- the ordinary borrowed-result path.
+private pure func expr_references_definition(
+	target_name: String,
+	target_def_id: Int,
+	expr: CoreExpr,
+) -> Bool:
+	CoreDce.value_references(expr).resolved_reads.any(func(variable):
+		variable.name == target_name and variable.def_id == Some(target_def_id)
+	)
+
+
+private pure func expr_invalidates_definition(
+	target_name: String,
+	target_def_id: Int,
+	expr: CoreExpr,
+) -> Bool:
+	CoreDce.value_references(expr).resolved_invalidations.any(func(variable):
+		variable.name == target_name and variable.def_id == Some(target_def_id)
+	)
+
+
+private pure func constructor_literal_match_references_definition(
+	target_name: String,
+	target_def_id: Int,
+	match_expr: CoreConstructorLiteralMatch,
+) -> Bool:
+	var references_target: Bool = False
+
+	for match_case in match_expr.cases:
+		if (
+			not match_bindings_shadow_definition(match_case.bindings, target_name, target_def_id)
+			and expr_references_definition(target_name, target_def_id, match_case.body)
+		):
+			references_target = True
+			break
+		else:
+			void
+
+	if not references_target:
+		match match_expr.fallback:
+			LiteralMatchFallbackBody(body):
+				references_target = expr_references_definition(target_name, target_def_id, body)
+			LiteralMatchFallbackBindings(bindings, body):
+				references_target = (
+					not match_bindings_shadow_definition(bindings, target_name, target_def_id)
+					and expr_references_definition(target_name, target_def_id, body)
+				)
+			LiteralMatchFallbackFail:
+				void
+	else:
+		void
+
+	references_target
+
+
+private pure func constructor_match_body_references_definition(
+	target_name: String,
+	target_def_id: Int,
+	body: CoreConstructorMatchBody,
+) -> Bool:
+	match body:
+		ConstructorMatchBodyExpr(expr):
+			expr_references_definition(target_name, target_def_id, expr)
+		ConstructorMatchBodyLiteral(match_expr):
+			constructor_literal_match_references_definition(target_name, target_def_id, match_expr)
+		ConstructorMatchBodyLength(match_expr):
+			constructor_length_match_references_definition(target_name, target_def_id, match_expr)
+
+
+private pure func constructor_length_branch_references_definition(
+	target_name: String,
+	target_def_id: Int,
+	branch: CoreConstructorLengthMatchBranch,
+) -> Bool:
+	(
+		not match_bindings_shadow_definition(branch.bindings, target_name, target_def_id)
+		and constructor_match_body_references_definition(target_name, target_def_id, branch.body)
+	)
+
+
+private pure func constructor_length_match_references_definition(
+	target_name: String,
+	target_def_id: Int,
+	match_expr: CoreConstructorLengthMatch,
+) -> Bool:
+	var references_target: Bool = False
+
+	for match_case in match_expr.cases:
+		if constructor_length_branch_references_definition(
+			target_name,
+			target_def_id,
+			match_case.branch,
+		):
+			references_target = True
+			break
+		else:
+			void
+
+	if not references_target:
+		match match_expr.geq:
+			Some(match_case):
+				references_target = constructor_length_branch_references_definition(
+					target_name,
+					target_def_id,
+					match_case.branch,
+				)
+			None:
+				void
+	else:
+		void
+
+	if not references_target:
+		match match_expr.fallback:
+			Some(branch):
+				references_target = constructor_length_branch_references_definition(
+					target_name,
+					target_def_id,
+					branch,
+				)
+			None:
+				void
+	else:
+		void
+
+	references_target
+
+
+private pure func binding_body_returns_only_exact_definition_alias(
+	env: PerceusEnv,
+	target_name: String,
+	target_def_id: Int,
+	variable: CoreVar,
+	is_mutable: Bool,
+	typ: CoreType,
+	rhs: CoreExpr,
+	body: CoreExpr,
+) -> Bool:
+	binding_shadows_target: Bool = (
+		variable.name == target_name
+		and variable.def_id == Some(target_def_id)
+	)
+
+	direct_exact_alias: Bool = (
+		not binding_shadows_target
+		and not expr_invalidates_definition(target_name, target_def_id, rhs)
+		and returns_only_exact_definition_alias(env, target_name, target_def_id, body)
+	)
+
+	bound_exact_alias: Bool = if (
+		not is_mutable
+		and is_managed_type(env, typ)
+		and returns_only_exact_definition_alias(env, target_name, target_def_id, rhs)
+	):
+		match variable.def_id:
+			Some(binding_def_id):
+				returns_only_exact_definition_alias(env, variable.name, binding_def_id, body)
+			None:
+				False
+	else:
+		False
+
+	direct_exact_alias or bound_exact_alias
+
+
+private pure func expr_result_is_exact_or_unrelated(
+	env: PerceusEnv,
+	target_name: String,
+	target_def_id: Int,
+	expr: CoreExpr,
+) -> Bool:
+	(
+		returns_only_exact_definition_alias(env, target_name, target_def_id, expr)
+		or not expr_references_definition(target_name, target_def_id, expr)
+	)
+
+
+private pure func literal_match_returns_only_exact_definition_alias(
+	env: PerceusEnv,
+	target_name: String,
+	target_def_id: Int,
+	cases: List[CoreLiteralMatchCase],
+	fallback: CoreLiteralMatchFallback,
+) -> Bool:
+	var has_exact_result: Bool = False
+	var every_result_is_safe: Bool = True
+
+	for match_case in cases:
+		if match_bindings_shadow_definition(match_case.bindings, target_name, target_def_id):
+			void
+		else:
+			case_is_exact: Bool = returns_only_exact_definition_alias(
+				env,
+				target_name,
+				target_def_id,
+				match_case.body,
+			)
+			has_exact_result = has_exact_result or case_is_exact
+			every_result_is_safe = (
+				every_result_is_safe
+				and ((
+					case_is_exact
+					or not expr_references_definition(target_name, target_def_id, match_case.body)
+				))
+			)
+
+	match fallback:
+		LiteralMatchFallbackBody(body):
+			fallback_is_exact: Bool = returns_only_exact_definition_alias(
+				env,
+				target_name,
+				target_def_id,
+				body,
+			)
+			has_exact_result = has_exact_result or fallback_is_exact
+			every_result_is_safe = (
+				every_result_is_safe
+				and expr_result_is_exact_or_unrelated(env, target_name, target_def_id, body)
+			)
+		LiteralMatchFallbackBindings(bindings, body):
+			if match_bindings_shadow_definition(bindings, target_name, target_def_id):
+				void
+			else:
+				fallback_is_exact: Bool = returns_only_exact_definition_alias(
+					env,
+					target_name,
+					target_def_id,
+					body,
+				)
+				has_exact_result = has_exact_result or fallback_is_exact
+				every_result_is_safe = (
+					every_result_is_safe
+					and expr_result_is_exact_or_unrelated(env, target_name, target_def_id, body)
+				)
+		LiteralMatchFallbackFail:
+			void
+
+	has_exact_result and every_result_is_safe
+
+
+private pure func constructor_match_body_returns_only_exact_definition_alias(
+	env: PerceusEnv,
+	target_name: String,
+	target_def_id: Int,
+	body: CoreConstructorMatchBody,
+) -> Bool:
+	match body:
+		ConstructorMatchBodyExpr(expr):
+			returns_only_exact_definition_alias(env, target_name, target_def_id, expr)
+		ConstructorMatchBodyLiteral(match_expr):
+			literal_match_returns_only_exact_definition_alias(
+				env,
+				target_name,
+				target_def_id,
+				match_expr.cases,
+				match_expr.fallback,
+			)
+		ConstructorMatchBodyLength(match_expr):
+			constructor_length_match_returns_only_exact_definition_alias(
+				env,
+				target_name,
+				target_def_id,
+				match_expr,
+			)
+
+
+private pure func constructor_match_body_is_exact_or_unrelated(
+	env: PerceusEnv,
+	target_name: String,
+	target_def_id: Int,
+	body: CoreConstructorMatchBody,
+) -> Bool:
+	match body:
+		ConstructorMatchBodyExpr(expr):
+			expr_result_is_exact_or_unrelated(env, target_name, target_def_id, expr)
+		ConstructorMatchBodyLiteral(match_expr):
+			(
+				literal_match_returns_only_exact_definition_alias(
+					env,
+					target_name,
+					target_def_id,
+					match_expr.cases,
+					match_expr.fallback,
+				)
+				or not constructor_literal_match_references_definition(
+					target_name,
+					target_def_id,
+					match_expr,
+				)
+			)
+		ConstructorMatchBodyLength(match_expr):
+			(
+				constructor_length_match_returns_only_exact_definition_alias(
+					env,
+					target_name,
+					target_def_id,
+					match_expr,
+				)
+				or not constructor_length_match_references_definition(
+					target_name,
+					target_def_id,
+					match_expr,
+				)
+			)
+
+
+private pure func constructor_length_branch_returns_only_exact_definition_alias(
+	env: PerceusEnv,
+	target_name: String,
+	target_def_id: Int,
+	branch: CoreConstructorLengthMatchBranch,
+) -> Bool:
+	(
+		not match_bindings_shadow_definition(branch.bindings, target_name, target_def_id)
+		and constructor_match_body_returns_only_exact_definition_alias(
+			env,
+			target_name,
+			target_def_id,
+			branch.body,
+		)
+	)
+
+
+private pure func constructor_length_branch_is_exact_or_unrelated(
+	env: PerceusEnv,
+	target_name: String,
+	target_def_id: Int,
+	branch: CoreConstructorLengthMatchBranch,
+) -> Bool:
+	(
+		match_bindings_shadow_definition(branch.bindings, target_name, target_def_id)
+		or constructor_match_body_is_exact_or_unrelated(
+			env,
+			target_name,
+			target_def_id,
+			branch.body,
+		)
+	)
+
+
+private pure func constructor_length_match_returns_only_exact_definition_alias(
+	env: PerceusEnv,
+	target_name: String,
+	target_def_id: Int,
+	match_expr: CoreConstructorLengthMatch,
+) -> Bool:
+	var has_exact_result: Bool = False
+	var every_result_is_safe: Bool = True
+
+	for match_case in match_expr.cases:
+		case_is_exact: Bool = constructor_length_branch_returns_only_exact_definition_alias(
+			env,
+			target_name,
+			target_def_id,
+			match_case.branch,
+		)
+		has_exact_result = has_exact_result or case_is_exact
+		every_result_is_safe = (
+			every_result_is_safe
+			and constructor_length_branch_is_exact_or_unrelated(
+				env,
+				target_name,
+				target_def_id,
+				match_case.branch,
+			)
+		)
+
+	match match_expr.geq:
+		Some(match_case):
+			case_is_exact: Bool = constructor_length_branch_returns_only_exact_definition_alias(
+				env,
+				target_name,
+				target_def_id,
+				match_case.branch,
+			)
+			has_exact_result = has_exact_result or case_is_exact
+			every_result_is_safe = (
+				every_result_is_safe
+				and constructor_length_branch_is_exact_or_unrelated(
+					env,
+					target_name,
+					target_def_id,
+					match_case.branch,
+				)
+			)
+		None:
+			void
+
+	match match_expr.fallback:
+		Some(branch):
+			fallback_is_exact: Bool = constructor_length_branch_returns_only_exact_definition_alias(
+				env,
+				target_name,
+				target_def_id,
+				branch,
+			)
+			has_exact_result = has_exact_result or fallback_is_exact
+			every_result_is_safe = (
+				every_result_is_safe
+				and constructor_length_branch_is_exact_or_unrelated(
+					env,
+					target_name,
+					target_def_id,
+					branch,
+				)
+			)
+		None:
+			void
+
+	has_exact_result and every_result_is_safe
+
+
+private pure func constructor_match_returns_only_exact_definition_alias(
+	env: PerceusEnv,
+	target_name: String,
+	target_def_id: Int,
+	cases: List[CoreConstructorMatchCase],
+	fallback: CoreConstructorMatchFallback,
+) -> Bool:
+	var has_exact_result: Bool = False
+	var every_result_is_safe: Bool = True
+
+	for match_case in cases:
+		if match_bindings_shadow_definition(match_case.bindings, target_name, target_def_id):
+			void
+		else:
+			case_is_exact: Bool = constructor_match_body_returns_only_exact_definition_alias(
+				env,
+				target_name,
+				target_def_id,
+				match_case.body,
+			)
+			has_exact_result = has_exact_result or case_is_exact
+			every_result_is_safe = (
+				every_result_is_safe
+				and constructor_match_body_is_exact_or_unrelated(
+					env,
+					target_name,
+					target_def_id,
+					match_case.body,
+				)
+			)
+
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			fallback_is_exact: Bool = returns_only_exact_definition_alias(
+				env,
+				target_name,
+				target_def_id,
+				body,
+			)
+			has_exact_result = has_exact_result or fallback_is_exact
+			every_result_is_safe = (
+				every_result_is_safe
+				and expr_result_is_exact_or_unrelated(env, target_name, target_def_id, body)
+			)
+		ConstructorMatchFallbackBindings(bindings, body):
+			if match_bindings_shadow_definition(bindings, target_name, target_def_id):
+				void
+			else:
+				fallback_is_exact: Bool = returns_only_exact_definition_alias(
+					env,
+					target_name,
+					target_def_id,
+					body,
+				)
+				has_exact_result = has_exact_result or fallback_is_exact
+				every_result_is_safe = (
+					every_result_is_safe
+					and expr_result_is_exact_or_unrelated(env, target_name, target_def_id, body)
+				)
+		ConstructorMatchFallbackFail:
+			void
+
+	has_exact_result and every_result_is_safe
+
+
+private pure func returns_only_exact_definition_alias(
+	env: PerceusEnv,
+	target_name: String,
+	target_def_id: Int,
+	expr: CoreExpr,
+) -> Bool:
+	match expr:
+		VarExpr(variable, typ, loc):
+			variable.name == target_name and variable.def_id == Some(target_def_id)
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			binding_body_returns_only_exact_definition_alias(
+				env,
+				target_name,
+				target_def_id,
+				variable,
+				is_mutable,
+				typ,
+				rhs,
+				body,
+			)
+		BorrowLetExpr(variable, typ, rhs, body):
+			binding_body_returns_only_exact_definition_alias(
+				env,
+				target_name,
+				target_def_id,
+				variable,
+				False,
+				typ,
+				rhs,
+				body,
+			)
+		SeqExpr(first, second):
+			(
+				not expr_invalidates_definition(target_name, target_def_id, first)
+				and returns_only_exact_definition_alias(env, target_name, target_def_id, second)
+			)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			(
+				not (variable.name == target_name and variable.def_id == Some(target_def_id))
+				and returns_only_exact_definition_alias(env, target_name, target_def_id, body)
+			)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			then_returns_exact: Bool = returns_only_exact_definition_alias(
+				env,
+				target_name,
+				target_def_id,
+				then_expr,
+			)
+			else_returns_exact: Bool = returns_only_exact_definition_alias(
+				env,
+				target_name,
+				target_def_id,
+				else_expr,
+			)
+
+			(
+				not expr_invalidates_definition(target_name, target_def_id, cond)
+				and (then_returns_exact or else_returns_exact)
+				and ((
+					then_returns_exact
+					or not expr_references_definition(target_name, target_def_id, then_expr)
+				))
+				and ((
+					else_returns_exact
+					or not expr_references_definition(target_name, target_def_id, else_expr)
+				))
+			)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			(
+				not expr_references_definition(target_name, target_def_id, scrutinee)
+				and not expr_invalidates_definition(target_name, target_def_id, scrutinee)
+				and literal_match_returns_only_exact_definition_alias(
+					env,
+					target_name,
+					target_def_id,
+					cases,
+					fallback,
+				)
+			)
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			(
+				not expr_references_definition(target_name, target_def_id, scrutinee)
+				and not expr_invalidates_definition(target_name, target_def_id, scrutinee)
+				and literal_match_returns_only_exact_definition_alias(
+					env,
+					target_name,
+					target_def_id,
+					match_expr.cases,
+					match_expr.fallback,
+				)
+			)
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			(
+				not expr_references_definition(target_name, target_def_id, scrutinee)
+				and not expr_invalidates_definition(target_name, target_def_id, scrutinee)
+				and constructor_length_match_returns_only_exact_definition_alias(
+					env,
+					target_name,
+					target_def_id,
+					match_expr,
+				)
+			)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			(
+				not expr_references_definition(target_name, target_def_id, scrutinee)
+				and not expr_invalidates_definition(target_name, target_def_id, scrutinee)
+				and constructor_match_returns_only_exact_definition_alias(
+					env,
+					target_name,
+					target_def_id,
+					cases,
+					fallback,
+				)
+			)
+		ResourceScopeExpr(scope, typ, loc):
+			(
+				not expr_references_definition(target_name, target_def_id, scope.acquire)
+				and not expr_invalidates_definition(target_name, target_def_id, scope.acquire)
+				and not ((
+					scope.variable.name == target_name
+					and scope.variable.def_id == Some(target_def_id)
+				))
+				and returns_only_exact_definition_alias(env, target_name, target_def_id, scope.body)
+				and not expr_references_definition(target_name, target_def_id, scope.cleanup)
+				and not expr_invalidates_definition(target_name, target_def_id, scope.cleanup)
+			)
+		_:
+			False
+
+
+private pure func borrow_expr_aliases_definition(
+	env: PerceusEnv,
+	target_name: String,
+	target_def_id: Int,
+	expr: CoreExpr,
+) -> Bool:
+	match expr:
+		VarExpr(variable, typ, loc):
+			variable.name == target_name and variable.def_id == Some(target_def_id)
+		FieldExpr(owner, field, typ, loc):
+			borrow_expr_aliases_definition(env, target_name, target_def_id, owner)
+		TupleFieldExpr(owner, field_index, typ, loc):
+			borrow_expr_aliases_definition(env, target_name, target_def_id, owner)
+		ListGetExpr(get, typ, loc):
+			borrow_expr_aliases_definition(env, target_name, target_def_id, get.list)
+		CallExpr(kind, callee, args, typ, loc):
+			match contract_for_call(env, kind, args.length(), typ):
+				Some(contract):
+					call_result_aliases_definition(env, target_name, target_def_id, contract, args)
+				None:
+					False
+		CastExpr(inner, typ, loc):
+			borrow_expr_aliases_definition(env, target_name, target_def_id, inner)
+		UnboxExpr(kind, inner, typ, loc):
+			borrow_expr_aliases_definition(env, target_name, target_def_id, inner)
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			binding_body_aliases_definition(
+				env,
+				target_name,
+				target_def_id,
+				variable,
+				is_mutable,
+				typ,
+				rhs,
+				body,
+			)
+		BorrowLetExpr(variable, typ, rhs, body):
+			binding_body_aliases_definition(
+				env,
+				target_name,
+				target_def_id,
+				variable,
+				False,
+				typ,
+				rhs,
+				body,
+			)
+		SeqExpr(first, second):
+			borrow_expr_aliases_definition(env, target_name, target_def_id, second)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			if (
+				variable.name == target_name
+				and variable.def_id == Some(target_def_id)
+				and returns_only_exact_definition_alias(env, target_name, target_def_id, body)
+			):
+				False
+			else:
+				borrow_expr_aliases_definition(env, target_name, target_def_id, body)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			borrow_expr_aliases_definition(env, target_name, target_def_id, body)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			(
+				borrow_expr_aliases_definition(env, target_name, target_def_id, then_expr)
+				or borrow_expr_aliases_definition(env, target_name, target_def_id, else_expr)
+			)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			literal_match_aliases_definition(
+				env,
+				target_name,
+				target_def_id,
+				borrow_expr_aliases_definition(env, target_name, target_def_id, scrutinee),
+				cases,
+				fallback,
+			)
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			literal_match_aliases_definition(
+				env,
+				target_name,
+				target_def_id,
+				borrow_expr_aliases_definition(env, target_name, target_def_id, scrutinee),
+				match_expr.cases,
+				match_expr.fallback,
+			)
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			constructor_length_match_aliases_definition(
+				env,
+				target_name,
+				target_def_id,
+				borrow_expr_aliases_definition(env, target_name, target_def_id, scrutinee),
+				match_expr,
+			)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			constructor_match_aliases_definition(
+				env,
+				target_name,
+				target_def_id,
+				borrow_expr_aliases_definition(env, target_name, target_def_id, scrutinee),
+				cases,
+				fallback,
+			)
+		ResourceScopeExpr(scope, typ, loc):
+			binding_body_aliases_definition(
+				env,
+				target_name,
+				target_def_id,
+				scope.variable,
+				False,
+				scope.typ,
+				scope.acquire,
+				scope.body,
+			)
+		_:
+			False
+
+
+pure func borrow_expr_aliases_param(
+	env: PerceusEnv,
+	param: CoreParam,
+	expr: CoreExpr,
+) -> Bool:
+	match param.name.def_id:
+		Some(def_id):
+			borrow_expr_aliases_definition(env, param.name.name, def_id, expr)
+		None:
+			borrow_expr_aliases_target(env, param.name.name, expr)
+
+
+pure func borrowed_result_aliases_param(env: PerceusEnv, param: CoreParam, expr: CoreExpr) -> Bool:
+	borrow_expr_aliases_param(env, param, expr)
+
+
+pure func core_params_shadow(name: String, params: List[CoreParam]) -> Bool:
+	params.any(func(param): param.name.name == name)
+
+
+private pure func count_optional_use(name: String, expr: Option[CoreExpr]) -> Int:
+	match expr:
+		Some(value):
+			count_uses(name, value)
+		None:
+			0
+
+
+private pure func count_loop_uses(
+	name: String,
+	binder: CoreLoopBinder,
+	iterable: CoreExpr,
+	body: CoreExpr,
+) -> Int:
+	count_uses(name, iterable) + if binder.variable.name == name:
+		0
+	else:
+		count_uses(name, body)
+
+
+private pure func task_capture_ownership_use(name: String, body: CoreExpr) -> OwnershipUseSummary:
+	if count_uses(name, body) > 0:
+		BORROW_OWNERSHIP_USE
+	else:
+		NO_OWNERSHIP_USES
+
+
+private pure func summarize_optional_ownership_use(
+	env: PerceusEnv,
+	name: String,
+	expr: Option[CoreExpr],
+) -> OwnershipUseSummary:
+	match expr:
+		Some(value):
+			summarize_linear_ownership_uses(env, name, value)
+		None:
+			NO_OWNERSHIP_USES
+
+
+private pure func summarize_repeated_body_uses(
+	env: PerceusEnv,
+	name: String,
+	prefix_uses: OwnershipUseSummary,
+	body: CoreExpr,
+	body_shadowed: Bool,
+	whole_expr: CoreExpr,
+) -> OwnershipUseSummary:
+	body_uses: OwnershipUseSummary = if body_shadowed:
+		NO_OWNERSHIP_USES
+	else:
+		summarize_linear_ownership_uses(env, name, body)
+
+	if body_uses.consumed_refs > 0:
+		ownership_uses_from_legacy_count(count_uses(name, whole_expr))
+	else:
+		seq_ownership_uses(
+			prefix_uses,
+			ownership_uses_with_returns_alias(body_uses, False),
+		)
+
+
+private pure func summarize_constructor_literal_match_uses(
+	env: PerceusEnv,
+	name: String,
+	match_expr: CoreConstructorLiteralMatch,
+) -> OwnershipUseSummary:
+	var branch_uses: List[OwnershipUseSummary] = []
+
+	for match_case in match_expr.cases:
+		if match_bindings_shadow(name, match_case.bindings):
+			branch_uses = branch_uses.append(NO_OWNERSHIP_USES)
+		else:
+			branch_uses = branch_uses.append(
+				summarize_linear_ownership_uses(
+					env,
+					name,
+					match_case.body,
+				),
+			)
+
+	match match_expr.fallback:
+		LiteralMatchFallbackBody(body):
+			branch_uses = branch_uses.append(summarize_linear_ownership_uses(env, name, body))
+		LiteralMatchFallbackBindings(bindings, body):
+			if match_bindings_shadow(name, bindings):
+				branch_uses = branch_uses.append(NO_OWNERSHIP_USES)
+			else:
+				branch_uses = branch_uses.append(summarize_linear_ownership_uses(env, name, body))
+		LiteralMatchFallbackFail:
+			branch_uses = branch_uses.append(NO_OWNERSHIP_USES)
+
+	branch_ownership_uses(branch_uses)
+
+
+private pure func summarize_constructor_match_body_uses(
+	env: PerceusEnv,
+	name: String,
+	body: CoreConstructorMatchBody,
+) -> OwnershipUseSummary:
+	match body:
+		ConstructorMatchBodyExpr(expr):
+			summarize_linear_ownership_uses(env, name, expr)
+		ConstructorMatchBodyLiteral(match_expr):
+			summarize_constructor_literal_match_uses(env, name, match_expr)
+		ConstructorMatchBodyLength(match_expr):
+			summarize_constructor_length_match_uses(env, name, match_expr)
+
+
+pure func summarize_constructor_length_branch_uses(
+	env: PerceusEnv,
+	name: String,
+	branch: CoreConstructorLengthMatchBranch,
+) -> OwnershipUseSummary:
+	if match_bindings_shadow(name, branch.bindings):
+		NO_OWNERSHIP_USES
+	else:
+		summarize_constructor_match_body_uses(env, name, branch.body)
+
+
+private pure func summarize_constructor_length_match_uses(
+	env: PerceusEnv,
+	name: String,
+	match_expr: CoreConstructorLengthMatch,
+) -> OwnershipUseSummary:
+	var branch_uses: List[OwnershipUseSummary] = []
+
+	for match_case in match_expr.cases:
+		branch_uses = branch_uses.append(
+			summarize_constructor_length_branch_uses(
+				env,
+				name,
+				match_case.branch,
+			),
+		)
+
+	match match_expr.geq:
+		Some(match_case):
+			branch_uses = branch_uses.append(
+				summarize_constructor_length_branch_uses(
+					env,
+					name,
+					match_case.branch,
+				),
+			)
+		None:
+			void
+
+	match match_expr.fallback:
+		Some(branch):
+			branch_uses = branch_uses.append(
+				summarize_constructor_length_branch_uses(
+					env,
+					name,
+					branch,
+				),
+			)
+		None:
+			branch_uses = branch_uses.append(NO_OWNERSHIP_USES)
+
+	branch_ownership_uses(branch_uses)
+
+
+private pure func summarize_constructor_match_case_uses(
+	env: PerceusEnv,
+	name: String,
+	scrutinee_aliases_owner: Bool,
+	match_case: CoreConstructorMatchCase,
+) -> OwnershipUseSummary:
+	if match_bindings_shadow(name, match_case.bindings):
+		NO_OWNERSHIP_USES
+	else:
+		body_uses: OwnershipUseSummary = summarize_constructor_match_body_uses(
+			env,
+			name,
+			match_case.body,
+		)
+		uses_managed_borrowed_binding: Bool = (
+			scrutinee_aliases_owner
+			and constructor_match_body_uses_managed_borrowed_binding(
+				env,
+				match_case.bindings,
+				match_case.body,
+			)
+		)
+
+		if uses_managed_borrowed_binding:
+			ownership_uses_with_returns_alias(
+				seq_ownership_uses(body_uses, BORROW_OWNERSHIP_USE),
+				body_uses.returns_alias,
+			)
+		else:
+			body_uses
+
+
+private pure func summarize_constructor_match_branch_uses(
+	env: PerceusEnv,
+	name: String,
+	scrutinee_aliases_owner: Bool,
+	cases: List[CoreConstructorMatchCase],
+	fallback: CoreConstructorMatchFallback,
+) -> OwnershipUseSummary:
+	var branch_uses: List[OwnershipUseSummary] = []
+
+	for match_case in cases:
+		branch_uses = branch_uses.append(
+			summarize_constructor_match_case_uses(
+				env,
+				name,
+				scrutinee_aliases_owner,
+				match_case,
+			),
+		)
+
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			branch_uses = branch_uses.append(summarize_linear_ownership_uses(env, name, body))
+		ConstructorMatchFallbackBindings(bindings, body):
+			if match_bindings_shadow(name, bindings):
+				branch_uses = branch_uses.append(NO_OWNERSHIP_USES)
+			else:
+				body_uses: OwnershipUseSummary = summarize_linear_ownership_uses(env, name, body)
+				uses_managed_borrowed_binding: Bool = (
+					scrutinee_aliases_owner
+					and match_branch_uses_managed_borrowed_binding(env, bindings, body)
+				)
+
+				branch_uses = branch_uses.append(
+					if uses_managed_borrowed_binding:
+						ownership_uses_with_returns_alias(
+							seq_ownership_uses(body_uses, BORROW_OWNERSHIP_USE),
+							body_uses.returns_alias,
+						)
+					else:
+						body_uses
+				)
+		ConstructorMatchFallbackFail:
+			branch_uses = branch_uses.append(NO_OWNERSHIP_USES)
+
+	branch_ownership_uses(branch_uses)
+
+
+private pure func summarize_linear_ownership_uses_non_binding(
+	env: PerceusEnv,
+	name: String,
+	expr: CoreExpr,
+) -> OwnershipUseSummary:
+	match expr:
+		VarExpr(variable, typ, loc):
+			if variable.name == name:
+				CONSUME_OWNERSHIP_USE
+			else:
+				NO_OWNERSHIP_USES
+		LiteralExpr(literal, typ, loc):
+			NO_OWNERSHIP_USES
+		StaticStringLiteralExpr(id, value, typ, loc):
+			NO_OWNERSHIP_USES
+		VoidExpr(typ, loc):
+			NO_OWNERSHIP_USES
+		DebugBlockExpr(body, typ, loc):
+			summarize_linear_ownership_uses(env, name, body)
+		CallExpr(kind, callee, args, typ, loc):
+			summarize_linear_call(env, name, typ, kind, callee, args)
+		BinaryExpr(op, left, right, typ, loc):
+			if binary_operands_are_borrowed(op, left, right):
+				seq_ownership_uses(
+					summarize_linear_borrow(env, name, left),
+					summarize_linear_borrow(env, name, right),
+				)
+			else:
+				seq_ownership_uses(
+					summarize_linear_ownership_uses(env, name, left),
+					summarize_linear_ownership_uses(env, name, right),
+				)
+		UnaryExpr(op, inner, typ, loc):
+			summarize_linear_ownership_uses(env, name, inner)
+		LogicalExpr(op, left, right, typ, loc):
+			seq_ownership_uses(
+				summarize_linear_ownership_uses(env, name, left),
+				summarize_linear_ownership_uses(env, name, right),
+			)
+		AssignExpr(variable, rhs, typ, loc):
+			if variable.name == name:
+				NO_OWNERSHIP_USES
+			else if assignment_rhs_returns_alias(env, rhs):
+				-- Managed assignment copies an alias into the destination. The
+				-- assignment rewriter inserts that retain, so the source binding
+				-- remains owned by its enclosing scope and must still be dropped.
+				summarize_linear_borrow(env, name, rhs)
+			else:
+				summarize_linear_ownership_uses(env, name, rhs)
+		CastExpr(inner, typ, loc):
+			summarize_linear_borrow(env, name, inner)
+		BoxExpr(box_op, typ, loc):
+			match box_op.kind:
+				PointerBox:
+					summarize_linear_ownership_uses(env, name, box_op.value)
+				_:
+					summarize_linear_borrow(env, name, box_op.value)
+		UnboxExpr(kind, inner, typ, loc):
+			summarize_linear_borrow(env, name, inner)
+		FieldExpr(owner, field, typ, loc):
+			uses: OwnershipUseSummary = summarize_linear_borrow(env, name, owner)
+
+			if uses.touched and is_managed_type(env, typ):
+				ownership_uses_with_returns_alias(uses, True)
+			else:
+				uses
+		TupleFieldExpr(owner, field_index, typ, loc):
+			uses: OwnershipUseSummary = summarize_linear_borrow(env, name, owner)
+
+			if uses.touched and is_managed_type(env, typ):
+				ownership_uses_with_returns_alias(uses, True)
+			else:
+				uses
+		LambdaExpr(params, return_type, body, is_pure, typ, loc):
+			if core_params_shadow(name, params):
+				NO_OWNERSHIP_USES
+			else:
+				task_capture_ownership_use(name, body)
+		ClosureCreateExpr(closure, typ, loc):
+			if closure.captures.any(func(capture): capture.name == name):
+				BORROW_OWNERSHIP_USE
+			else:
+				NO_OWNERSHIP_USES
+		TupleExpr(items, typ, loc):
+			summarize_exprs(env, name, items)
+		VectorExpr(items, typ, loc):
+			summarize_exprs(env, name, items)
+		RecordExpr(fields, typ, loc):
+			summarize_record_fields(env, name, fields)
+		RecordUpdateExpr(base, fields, typ, loc):
+			seq_ownership_uses(
+				summarize_linear_ownership_uses(env, name, base),
+				summarize_record_fields(env, name, fields),
+			)
+		RecordReuseExpr(source, fields, typ, loc):
+			seq_ownership_uses(
+				summarize_record_fields(env, name, fields),
+				summarize_linear_ownership_uses(env, name, source),
+			)
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			seq_ownership_uses(
+				summarize_record_cow_fields(env, name, fields),
+				summarize_linear_ownership_uses(env, name, source),
+			)
+		RecordConstructExpr(type_name, fields, typ, loc):
+			summarize_record_fields(env, name, fields)
+		ListConstructExpr(construct, typ, loc):
+			summarize_boxed_storage_values(env, name, construct.elements)
+		ListAllocExpr(alloc, typ, loc):
+			summarize_linear_ownership_uses(env, name, alloc.capacity)
+		ListGetExpr(get, typ, loc):
+			uses: OwnershipUseSummary = seq_ownership_uses(
+				summarize_linear_borrow(env, name, get.list),
+				summarize_linear_ownership_uses(env, name, get.index),
+			)
+
+			if uses.touched and is_managed_type(env, typ):
+				ownership_uses_with_returns_alias(uses, True)
+			else:
+				uses
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			seq_ownership_uses(
+				summarize_linear_borrow(env, name, set.list),
+				seq_ownership_uses(
+					summarize_linear_ownership_uses(env, name, set.index),
+					summarize_linear_ownership_uses(env, name, set.value.value),
+				),
+			)
+		ListHandoffSetSourceSlotExpr(slot, typ, loc):
+			summarize_borrowed_exprs(
+				env,
+				name,
+				[slot.result, slot.out_index, slot.source, slot.source_index],
+			)
+		ListRetainExpr(retain, typ, loc):
+			seq_ownership_uses(
+				summarize_linear_borrow(env, name, retain.list),
+				summarize_linear_borrow(env, name, retain.value.value),
+			)
+		ListSetExpr(set, typ, loc):
+			seq_ownership_uses(
+				summarize_linear_borrow(env, name, set.list),
+				seq_ownership_uses(
+					summarize_linear_ownership_uses(env, name, set.index),
+					summarize_boxed_storage_uses(env, name, set.value),
+				),
+			)
+		StringByteReadExpr(read, typ, loc):
+			seq_ownership_uses(
+				summarize_linear_borrow(env, name, read.source),
+				summarize_linear_ownership_uses(env, name, read.index),
+			)
+		StringByteWriteExpr(write, typ, loc):
+			summarize_borrowed_exprs(
+				env,
+				name,
+				[write.target, write.index, write.byte],
+			)
+		StringByteCopyExpr(copy, typ, loc):
+			summarize_borrowed_exprs(
+				env,
+				name,
+				[copy.dst, copy.dst_pos, copy.src, copy.src_pos, copy.len],
+			)
+		StringSetLenExpr(set_len, typ, loc):
+			summarize_borrowed_exprs(
+				env,
+				name,
+				[set_len.target, set_len.len],
+			)
+		TensorRawReadExpr(read, typ, loc):
+			summarize_linear_ownership_uses(env, name, read.index)
+		TensorRawWriteExpr(write, typ, loc):
+			seq_ownership_uses(
+				summarize_linear_ownership_uses(env, name, write.index),
+				summarize_linear_ownership_uses(env, name, write.value),
+			)
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			source_uses: OwnershipUseSummary = summarize_linear_borrow(env, name, binding.source)
+
+			body_uses: OwnershipUseSummary = if binding.variable.name == name:
+				NO_OWNERSHIP_USES
+			else:
+				summarize_linear_ownership_uses(env, name, body)
+
+			seq_ownership_uses(source_uses, body_uses)
+		TensorBoxedLiteralExpr(literal, typ, loc):
+			summarize_boxed_storage_values(env, name, literal.elements)
+		DictConstructExpr(construct, typ, loc):
+			summarize_dict_entries(env, name, construct.entries)
+		UnionConstructExpr(construct, typ, loc):
+			summarize_boxed_storage_values(env, name, construct.args)
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			rhs_uses: OwnershipUseSummary = if (
+				is_managed_type(env, typ)
+				and direct_aliases_name(name, rhs)
+			):
+				summarize_linear_borrow(env, name, rhs)
+			else:
+				summarize_linear_ownership_uses(env, name, rhs)
+
+			body_uses: OwnershipUseSummary = if variable.name == name:
+				NO_OWNERSHIP_USES
+			else:
+				summarize_linear_ownership_uses(env, name, body)
+
+			seq_ownership_uses(rhs_uses, body_uses)
+		BorrowLetExpr(variable, typ, rhs, body):
+			rhs_uses: OwnershipUseSummary = summarize_linear_borrow(env, name, rhs)
+
+			body_uses: OwnershipUseSummary = if variable.name == name:
+				NO_OWNERSHIP_USES
+			else:
+				summarize_linear_ownership_uses(env, name, body)
+
+			seq_ownership_uses(rhs_uses, body_uses)
+		SeqExpr(first, second):
+			seq_ownership_uses(
+				summarize_linear_ownership_uses(env, name, first),
+				summarize_linear_ownership_uses(env, name, second),
+			)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			if variable.name == name:
+				uses: OwnershipUseSummary = summarize_linear_ownership_uses(env, name, body)
+
+				{
+					required_refs = max_int(1, uses.required_refs - 1),
+					consumed_refs = max_int(0, uses.consumed_refs - 1),
+					touched = True,
+					returns_alias = uses.returns_alias
+				}
+			else:
+				summarize_linear_ownership_uses(env, name, body)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			if variable.name == name:
+				seq_ownership_uses(
+					CONSUME_OWNERSHIP_USE,
+					summarize_linear_ownership_uses(env, name, body),
+				)
+			else:
+				summarize_linear_ownership_uses(env, name, body)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			seq_ownership_uses(
+				summarize_linear_ownership_uses(env, name, cond),
+				branch_ownership_uses_pair(
+					summarize_linear_ownership_uses(env, name, then_expr),
+					summarize_linear_ownership_uses(env, name, else_expr),
+				),
+			)
+		WhileExpr(cond, body, typ, loc):
+			cond_uses: OwnershipUseSummary = summarize_linear_ownership_uses(env, name, cond)
+			body_uses: OwnershipUseSummary = summarize_linear_ownership_uses(env, name, body)
+
+			if cond_uses.consumed_refs > 0 or body_uses.consumed_refs > 0:
+				ownership_uses_from_legacy_count(count_uses(name, expr))
+			else:
+				seq_ownership_uses(
+					cond_uses,
+					ownership_uses_with_returns_alias(body_uses, False),
+				)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			scrutinee_aliases_owner: Bool = borrow_expr_aliases_target(env, name, scrutinee)
+			summarize_match_ownership_uses(
+				env,
+				name,
+				scrutinee,
+				release_policy,
+				summarize_constructor_match_branch_uses(
+					env,
+					name,
+					scrutinee_aliases_owner,
+					cases,
+					fallback,
+				),
+			)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			summarize_match_ownership_uses(
+				env,
+				name,
+				scrutinee,
+				NoReleasePolicy,
+				summarize_constructor_literal_match_uses(
+					env,
+					name,
+					{
+						accessor = RootAccessor,
+						scrutinee_type = core_expr_type(scrutinee),
+						cases = cases,
+						fallback = fallback,
+						result_type = typ,
+						loc = loc
+					},
+				),
+			)
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			summarize_match_ownership_uses(
+				env,
+				name,
+				scrutinee,
+				release_policy,
+				summarize_constructor_literal_match_uses(env, name, match_expr),
+			)
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			summarize_match_ownership_uses(
+				env,
+				name,
+				scrutinee,
+				release_policy,
+				summarize_constructor_length_match_uses(env, name, match_expr),
+			)
+		BreakExpr(typ, loc):
+			NO_OWNERSHIP_USES
+		ResourceScopeExpr(scope, typ, loc):
+			acquire_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
+				env,
+				name,
+				scope.acquire,
+			)
+
+			scoped_uses: OwnershipUseSummary = if scope.variable.name == name:
+				NO_OWNERSHIP_USES
+			else:
+				seq_ownership_uses(
+					summarize_linear_ownership_uses(env, name, scope.body),
+					summarize_linear_ownership_uses(env, name, scope.cleanup),
+				)
+
+			seq_ownership_uses(acquire_uses, scoped_uses)
+		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
+			summarize_exprs(env, name, cleanup_exit.cleanups)
+		PreClosureDetachExpr(detached, typ, loc):
+			task_capture_ownership_use(name, detached)
+		DetachExpr(detached, typ, loc):
+			if detached.captures.any(func(capture): capture.name == name):
+				BORROW_OWNERSHIP_USE
+			else:
+				NO_OWNERSHIP_USES
+		ListHandoffExpr(handoff, typ, loc):
+			source_uses: OwnershipUseSummary = if handoff.mode == BorrowFreshHandoff:
+				summarize_linear_borrow(env, name, handoff.source)
+			else:
+				summarize_linear_ownership_uses(env, name, handoff.source)
+
+			body_shadowed: Bool = (
+				handoff.source_var.name == name
+				or handoff.result_var.name == name
+				or handoff.len_var.name == name
+				or handoff.out_var.name == name
+			)
+
+			body_uses: OwnershipUseSummary = if body_shadowed:
+				NO_OWNERSHIP_USES
+			else:
+				summarize_linear_ownership_uses(env, name, handoff.body)
+
+			seq_ownership_uses(
+				source_uses,
+				seq_ownership_uses(
+					summarize_linear_ownership_uses(env, name, handoff.capacity),
+					body_uses,
+				),
+			)
+		TailrecLoopExpr(params, return_type, body, loc):
+			if core_params_shadow(name, params):
+				NO_OWNERSHIP_USES
+			else:
+				summarize_linear_ownership_uses(env, name, body)
+		TailrecRecurExpr(args, typ, loc):
+			sum_ownership_uses(args.map(
+				func(arg): summarize_linear_ownership_uses(env, name, arg),
+			))
+		TailrecListSpreadLoopExpr(loop, loc):
+			if loop.list_param.name.name == name or core_params_shadow(name, loop.params):
+				NO_OWNERSHIP_USES
+			else:
+				summarize_linear_ownership_uses(env, name, loop.body)
+		TailrecListSpreadRecurExpr(rebinds, cursor_advance, typ, loc):
+			sum_ownership_uses(rebinds.map(
+				func(rebind): summarize_linear_ownership_uses(env, name, rebind.value),
+			))
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			summarize_repeated_body_uses(
+				env,
+				name,
+				seq_ownership_uses(
+					summarize_linear_ownership_uses(env, name, start),
+					summarize_linear_ownership_uses(env, name, end_value),
+				),
+				body,
+				binder.variable.name == name,
+				expr,
+			)
+		ForChannelExpr(loop, typ, loc):
+			summarize_repeated_body_uses(
+				env,
+				name,
+				summarize_linear_borrow(env, name, loop.iterable),
+				loop.body,
+				loop.binder.variable.name == name,
+				expr,
+			)
+		ForListExpr(loop, typ, loc):
+			summarize_repeated_body_uses(
+				env,
+				name,
+				summarize_linear_borrow(env, name, loop.iterable),
+				loop.body,
+				loop.binder.variable.name == name,
+				expr,
+			)
+		ForStringExpr(loop, typ, loc):
+			summarize_repeated_body_uses(
+				env,
+				name,
+				summarize_linear_borrow(env, name, loop.iterable),
+				loop.body,
+				loop.binder.variable.name == name,
+				expr,
+			)
+		ForDictExpr(loop, typ, loc):
+			summarize_repeated_body_uses(
+				env,
+				name,
+				summarize_linear_borrow(env, name, loop.iterable),
+				loop.body,
+				loop.binder.variable.name == name,
+				expr,
+			)
+		ForSetExpr(loop, typ, loc):
+			summarize_repeated_body_uses(
+				env,
+				name,
+				summarize_linear_borrow(env, name, loop.iterable),
+				loop.body,
+				loop.binder.variable.name == name,
+				expr,
+			)
+		ForStreamExpr(loop, typ, loc):
+			summarize_repeated_body_uses(
+				env,
+				name,
+				summarize_linear_borrow(env, name, loop.iterable),
+				loop.body,
+				loop.binder.variable.name == name,
+				expr,
+			)
+		ForResourceSourceExpr(loop, typ, loc):
+			summarize_repeated_body_uses(
+				env,
+				name,
+				summarize_linear_borrow(env, name, loop.iterable),
+				loop.body,
+				loop.binder.variable.name == name,
+				expr,
+			)
+		ForTensorExpr(loop, typ, loc):
+			summarize_repeated_body_uses(
+				env,
+				name,
+				summarize_linear_borrow(env, name, loop.iterable),
+				loop.body,
+				loop.binder.variable.name == name,
+				expr,
+			)
+		PreClosureConcurrentExpr(block, typ, loc):
+			var task_summaries: List[OwnershipUseSummary] = []
+			var shadowed: Bool = False
+
+			for binding in block.bindings:
+				task_summaries = task_summaries.append(
+					task_capture_ownership_use(
+						name,
+						binding.rhs,
+					),
+				)
+
+				if binding.variable.name == name:
+					shadowed = True
+				else:
+					void
+
+			body_uses: OwnershipUseSummary = if shadowed:
+				NO_OWNERSHIP_USES
+			else:
+				summarize_linear_ownership_uses(env, name, block.body)
+
+			seq_ownership_uses(
+				summarize_optional_ownership_use(env, name, block.timeout),
+				seq_ownership_uses(sum_ownership_uses(task_summaries), body_uses),
+			)
+		ConcurrentExpr(block, typ, loc):
+			var task_summaries: List[OwnershipUseSummary] = []
+			var shadowed: Bool = False
+
+			for binding in block.bindings:
+				task_summaries = task_summaries.append(
+					task_capture_ownership_use(
+						name,
+						binding.rhs,
+					),
+				)
+
+				if binding.variable.name == name:
+					shadowed = True
+				else:
+					void
+
+			body_uses: OwnershipUseSummary = if shadowed:
+				NO_OWNERSHIP_USES
+			else:
+				summarize_linear_ownership_uses(env, name, block.body)
+
+			seq_ownership_uses(
+				summarize_optional_ownership_use(env, name, block.timeout),
+				seq_ownership_uses(sum_ownership_uses(task_summaries), body_uses),
+			)
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			iter_uses: OwnershipUseSummary = summarize_linear_borrow(env, name, loop.iterable)
+
+			task_uses: OwnershipUseSummary = if loop.variable.name == name:
+				NO_OWNERSHIP_USES
+			else:
+				task_capture_ownership_use(name, loop.body)
+
+			var loop_uses: OwnershipUseSummary = aggregate_ownership_uses_pair(
+				summarize_optional_ownership_use(env, name, loop.timeout),
+				iter_uses,
+			)
+			loop_uses = aggregate_ownership_uses_pair(
+				loop_uses,
+				summarize_linear_ownership_uses(env, name, loop.limit),
+			)
+
+			aggregate_ownership_uses_pair(loop_uses, task_uses)
+		ConcurrentlyLoopExpr(loop, typ, loc):
+			iter_uses: OwnershipUseSummary = summarize_linear_borrow(env, name, loop.iterable)
+
+			task_uses: OwnershipUseSummary = if loop.variable.name == name:
+				NO_OWNERSHIP_USES
+			else:
+				task_capture_ownership_use(name, loop.body)
+
+			var loop_uses: OwnershipUseSummary = aggregate_ownership_uses_pair(
+				summarize_optional_ownership_use(env, name, loop.timeout),
+				iter_uses,
+			)
+			loop_uses = aggregate_ownership_uses_pair(
+				loop_uses,
+				summarize_linear_ownership_uses(env, name, loop.limit),
+			)
+
+			aggregate_ownership_uses_pair(loop_uses, task_uses)
+		SelectExpr(select_expr, typ, loc):
+			var wait_summaries: List[OwnershipUseSummary] = []
+			var branch_summaries: List[OwnershipUseSummary] = []
+
+			for arm in select_expr:
+				arm_shadows: Bool = match arm.kind:
+					SelectRecvArm(recv):
+						wait_summaries = wait_summaries.append(
+							summarize_linear_borrow(
+								env,
+								name,
+								recv.channel,
+							),
+						)
+						recv.binder.name == name
+					SelectSealedArm(channel):
+						wait_summaries = wait_summaries.append(
+							summarize_linear_borrow(
+								env,
+								name,
+								channel,
+							),
+						)
+						False
+					SelectAfterArm(timeout):
+						wait_summaries = wait_summaries.append(
+							summarize_linear_ownership_uses(
+								env,
+								name,
+								timeout,
+							),
+						)
+						False
+
+				branch_summaries = branch_summaries.append(
+					if arm_shadows:
+						NO_OWNERSHIP_USES
+					else:
+						summarize_linear_ownership_uses(env, name, arm.body)
+				)
+
+			seq_ownership_uses(
+				aggregate_ownership_uses(wait_summaries),
+				branch_ownership_uses(branch_summaries),
+			)
+		_:
+			ownership_uses_from_legacy_count(count_uses(name, expr))
+
+
+pure func summarize_linear_ownership_uses(
+	env: PerceusEnv,
+	name: String,
+	expr: CoreExpr,
+) -> OwnershipUseSummary:
+	debug:
+		perceus_work_linear_summary_requests()
+
+	var frames: PerceusOwnershipSummaryFrameStack = PerceusOwnershipSummaryNoFrame
+	var visiting: Bool = True
+	var current_expr: CoreExpr = expr
+	var pending: OwnershipUseSummary = NO_OWNERSHIP_USES
+	var result: OwnershipUseSummary = NO_OWNERSHIP_USES
+	var complete: Bool = False
+
+	while not complete:
+		if visiting:
+			current: CoreExpr = current_expr
+
+			debug:
+				perceus_work_linear_summary_node_visits()
+
+			match current:
+				LetExpr(variable, is_mutable, typ, rhs, body):
+					if is_managed_type(env, typ) and direct_aliases_name(name, rhs):
+						rhs_uses: OwnershipUseSummary = summarize_linear_borrow(env, name, rhs)
+
+						if variable.name == name:
+							visiting = False
+							pending = seq_ownership_uses(rhs_uses, NO_OWNERSHIP_USES)
+						else:
+							frames = PerceusOwnershipSummaryCombineBodyFrame(rhs_uses, frames)
+							visiting = True
+							current_expr = body
+					else:
+						frames = PerceusOwnershipSummaryLetRhsFrame(variable, body, frames)
+						visiting = True
+						current_expr = rhs
+				BorrowLetExpr(variable, typ, rhs, body):
+					rhs_uses: OwnershipUseSummary = summarize_linear_borrow(env, name, rhs)
+
+					if variable.name == name:
+						visiting = False
+						pending = seq_ownership_uses(rhs_uses, NO_OWNERSHIP_USES)
+					else:
+						frames = PerceusOwnershipSummaryCombineBodyFrame(rhs_uses, frames)
+						visiting = True
+						current_expr = body
+				SeqExpr(first, second):
+					frames = PerceusOwnershipSummarySequenceFirstFrame(second, frames)
+					visiting = True
+					current_expr = first
+				AssignExpr(variable, rhs, typ, loc):
+					if variable.name == name:
+						visiting = False
+						pending = NO_OWNERSHIP_USES
+					else if assignment_rhs_returns_alias(env, rhs):
+						-- Mutable assignment retains managed aliases before replacing
+						-- the target, so the source remains owned by its scope.
+						visiting = False
+						pending = summarize_linear_borrow(env, name, rhs)
+					else:
+						visiting = True
+						current_expr = rhs
+				DupExpr(variable, value_type, retain_policy, body, typ, loc):
+					frames = PerceusOwnershipSummaryDupBodyFrame(variable.name == name, frames)
+					visiting = True
+					current_expr = body
+				DropExpr(variable, value_type, release_policy, body, typ, loc):
+					frames = PerceusOwnershipSummaryDropBodyFrame(variable.name == name, frames)
+					visiting = True
+					current_expr = body
+				DebugBlockExpr(body, typ, loc):
+					frames = PerceusOwnershipSummaryPassBodyFrame(frames)
+					visiting = True
+					current_expr = body
+				_:
+					visiting = False
+					pending = summarize_linear_ownership_uses_non_binding(env, name, current)
+		else:
+			summary: OwnershipUseSummary = pending
+
+			match frames:
+				PerceusOwnershipSummaryNoFrame:
+					result = summary
+					complete = True
+				PerceusOwnershipSummaryLetRhsFrame(variable, body, remaining):
+					if variable.name == name:
+						frames = remaining
+						visiting = False
+						pending = seq_ownership_uses(summary, NO_OWNERSHIP_USES)
+					else:
+						frames = PerceusOwnershipSummaryCombineBodyFrame(summary, remaining)
+						visiting = True
+						current_expr = body
+				PerceusOwnershipSummaryCombineBodyFrame(prefix_uses, remaining):
+					frames = remaining
+					visiting = False
+					pending = seq_ownership_uses(prefix_uses, summary)
+				PerceusOwnershipSummarySequenceFirstFrame(second, remaining):
+					frames = PerceusOwnershipSummarySequenceSecondFrame(summary, remaining)
+					visiting = True
+					current_expr = second
+				PerceusOwnershipSummarySequenceSecondFrame(first_uses, remaining):
+					frames = remaining
+					visiting = False
+					pending = seq_ownership_uses(first_uses, summary)
+				PerceusOwnershipSummaryDupBodyFrame(matches_target, remaining):
+					adjusted: OwnershipUseSummary = if matches_target:
+						{
+							required_refs = max_int(1, summary.required_refs - 1),
+							consumed_refs = max_int(0, summary.consumed_refs - 1),
+							touched = True,
+							returns_alias = summary.returns_alias
+						}
+					else:
+						summary
+
+					frames = remaining
+					visiting = False
+					pending = adjusted
+				PerceusOwnershipSummaryDropBodyFrame(matches_target, remaining):
+					adjusted: OwnershipUseSummary = if matches_target:
+						seq_ownership_uses(CONSUME_OWNERSHIP_USE, summary)
+					else:
+						summary
+
+					frames = remaining
+					visiting = False
+					pending = adjusted
+				PerceusOwnershipSummaryPassBodyFrame(remaining):
+					frames = remaining
+					visiting = False
+					pending = summary
+
+	result
+
+
+private pure func count_core_var_use(name: String, variable: CoreVar) -> Int:
+	if variable.name == name:
+		1
+	else:
+		0
+
+
+pure func count_uses(name: String, expr: CoreExpr) -> Int:
+	debug:
+		perceus_work_legacy_count_node_visits()
+
+	match expr:
+		VarExpr(variable, typ, loc):
+			if variable.name == name:
+				1
+			else:
+				0
+		LiteralExpr(literal, typ, loc):
+			0
+		StaticStringLiteralExpr(id, value, typ, loc):
+			0
+		VoidExpr(typ, loc):
+			0
+		DebugBlockExpr(body, typ, loc):
+			count_uses(name, body)
+		CallExpr(kind, callee, args, typ, loc):
+			count_uses(name, callee) + count_uses_in_exprs(name, args)
+		BinaryExpr(op, left, right, typ, loc):
+			count_uses(name, left) + count_uses(name, right)
+		UnaryExpr(op, inner, typ, loc):
+			count_uses(name, inner)
+		LogicalExpr(op, left, right, typ, loc):
+			count_uses(name, left) + count_uses(name, right)
+		AssignExpr(variable, rhs, typ, loc):
+			count_uses(name, rhs)
+		CastExpr(inner, typ, loc):
+			count_uses(name, inner)
+		BoxExpr(box_op, typ, loc):
+			count_uses(name, box_op.value)
+		UnboxExpr(kind, inner, typ, loc):
+			count_uses(name, inner)
+		FieldExpr(owner, field, typ, loc):
+			count_uses(name, owner)
+		TupleFieldExpr(owner, field_index, typ, loc):
+			count_uses(name, owner)
+		LambdaExpr(params, return_type, body, is_pure, typ, loc):
+			if core_params_shadow(name, params):
+				0
+			else if count_uses(name, body) > 0:
+				1
+			else:
+				0
+		ClosureCreateExpr(closure, typ, loc):
+			if closure.captures.any(func(capture): capture.name == name):
+				1
+			else:
+				0
+		TupleExpr(items, typ, loc):
+			count_uses_in_exprs(name, items)
+		VectorExpr(items, typ, loc):
+			count_uses_in_exprs(name, items)
+		RecordExpr(fields, typ, loc):
+			count_uses_in_record_fields(name, fields)
+		RecordUpdateExpr(base, fields, typ, loc):
+			count_uses(name, base) + count_uses_in_record_fields(name, fields)
+		RecordReuseExpr(source, fields, typ, loc):
+			count_uses(name, source) + count_uses_in_record_fields(name, fields)
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			count_uses_in_record_cow_fields(name, fields) + count_uses(name, source)
+		RecordConstructExpr(type_name, fields, typ, loc):
+			count_uses_in_record_fields(name, fields)
+		ListConstructExpr(construct, typ, loc):
+			count_uses_in_boxed_values(name, construct.elements)
+		ListAllocExpr(alloc, typ, loc):
+			count_uses(name, alloc.capacity)
+		ListGetExpr(get, typ, loc):
+			count_uses(name, get.list) + count_uses(name, get.index)
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			count_uses(
+				name,
+				set.list,
+			) + count_uses(name, set.index) + count_uses(name, set.value.value)
+		ListHandoffSetSourceSlotExpr(slot, typ, loc):
+			count_uses(
+				name,
+				slot.result,
+			) + count_uses(
+				name,
+				slot.out_index,
+			) + count_uses(name, slot.source) + count_uses(name, slot.source_index)
+		ListRetainExpr(retain, typ, loc):
+			count_uses(name, retain.list) + count_uses(name, retain.value.value)
+		ListSetExpr(set, typ, loc):
+			count_uses(
+				name,
+				set.list,
+			) + count_uses(name, set.index) + count_uses(name, set.value.value)
+		StringByteReadExpr(read, typ, loc):
+			count_uses(name, read.source) + count_uses(name, read.index)
+		StringByteWriteExpr(write, typ, loc):
+			count_uses(
+				name,
+				write.target,
+			) + count_uses(name, write.index) + count_uses(name, write.byte)
+		StringByteCopyExpr(copy, typ, loc):
+			count_uses(
+				name,
+				copy.dst,
+			) + count_uses(
+				name,
+				copy.dst_pos,
+			) + count_uses(
+				name,
+				copy.src,
+			) + count_uses(name, copy.src_pos) + count_uses(name, copy.len)
+		StringSetLenExpr(set_len, typ, loc):
+			count_uses(name, set_len.target) + count_uses(name, set_len.len)
+		TensorRawReadExpr(read, typ, loc):
+			count_core_var_use(name, read.view) + count_uses(name, read.index)
+		TensorRawWriteExpr(write, typ, loc):
+			count_core_var_use(
+				name,
+				write.view,
+			) + count_uses(name, write.index) + count_uses(name, write.value)
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			body_uses: Int = if binding.variable.name == name:
+				0
+			else:
+				count_uses(name, body)
+
+			count_uses(name, binding.source) + body_uses
+		TensorBoxedLiteralExpr(literal, typ, loc):
+			count_uses_in_boxed_values(name, literal.elements)
+		DictConstructExpr(construct, typ, loc):
+			count_uses_in_dict_entries(name, construct.entries)
+		UnionConstructExpr(construct, typ, loc):
+			count_uses_in_boxed_values(name, construct.args)
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			rhs_uses: Int = count_uses(name, rhs)
+
+			if variable.name == name:
+				rhs_uses
+			else:
+				rhs_uses + count_uses(name, body)
+		BorrowLetExpr(variable, typ, rhs, body):
+			rhs_uses: Int = count_uses(name, rhs)
+
+			if variable.name == name:
+				rhs_uses
+			else:
+				rhs_uses + count_uses(name, body)
+		SeqExpr(first, second):
+			count_uses(name, first) + count_uses(name, second)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			count_uses(name, body)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			count_uses(name, body)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			count_uses(name, cond) + max_int(
+				count_uses(name, then_expr),
+				count_uses(name, else_expr),
+			)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			count_uses(name, scrutinee) + max_int(
+				count_uses_in_constructor_match_cases(name, cases),
+				count_uses_in_constructor_match_fallback(name, fallback),
+			)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			count_uses(name, scrutinee) + max_int(
+				count_uses_in_literal_match_cases(name, cases),
+				count_uses_in_literal_match_fallback(name, fallback),
+			)
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			count_uses(name, scrutinee) + count_uses_in_constructor_literal_match(name, match_expr)
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			count_uses(name, scrutinee) + count_uses_in_constructor_length_match(name, match_expr)
+		BreakExpr(typ, loc):
+			0
+		WhileExpr(cond, body, typ, loc):
+			count_uses(name, cond) + count_uses(name, body)
+		ResourceScopeExpr(scope, typ, loc):
+			scoped_uses: Int = if scope.variable.name == name:
+				0
+			else:
+				count_uses(name, scope.body) + count_uses(name, scope.cleanup)
+
+			count_uses(name, scope.acquire) + scoped_uses
+		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
+			count_uses_in_exprs(name, cleanup_exit.cleanups)
+		TailrecLoopExpr(params, return_type, body, loc):
+			if core_params_shadow(name, params):
+				0
+			else:
+				count_uses(name, body)
+		TailrecRecurExpr(args, typ, loc):
+			count_uses_in_exprs(name, args)
+		TailrecListSpreadLoopExpr(loop, loc):
+			if loop.list_param.name.name == name or core_params_shadow(name, loop.params):
+				0
+			else:
+				count_uses(name, loop.body)
+		TailrecListSpreadRecurExpr(rebinds, cursor_advance, typ, loc):
+			var total: Int = 0
+
+			for rebind in rebinds:
+				total += count_uses(name, rebind.value)
+
+			total
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			count_uses(name, start) + count_loop_uses(name, binder, end_value, body)
+		ForChannelExpr(loop, typ, loc):
+			count_loop_uses(name, loop.binder, loop.iterable, loop.body)
+		ForListExpr(loop, typ, loc):
+			count_loop_uses(name, loop.binder, loop.iterable, loop.body)
+		ForStringExpr(loop, typ, loc):
+			count_loop_uses(name, loop.binder, loop.iterable, loop.body)
+		ForDictExpr(loop, typ, loc):
+			count_loop_uses(name, loop.binder, loop.iterable, loop.body)
+		ForSetExpr(loop, typ, loc):
+			count_loop_uses(name, loop.binder, loop.iterable, loop.body)
+		ForStreamExpr(loop, typ, loc):
+			count_loop_uses(name, loop.binder, loop.iterable, loop.body)
+		ForResourceSourceExpr(loop, typ, loc):
+			count_loop_uses(name, loop.binder, loop.iterable, loop.body)
+		ForTensorExpr(loop, typ, loc):
+			count_loop_uses(name, loop.binder, loop.iterable, loop.body)
+		PreClosureDetachExpr(detached, typ, loc):
+			count_uses(name, detached)
+		DetachExpr(detached, typ, loc):
+			if detached.captures.any(func(capture): capture.name == name):
+				1
+			else:
+				0
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			body_uses: Int = if loop.variable.name == name:
+				0
+			else:
+				count_uses(name, loop.body)
+
+			count_uses(
+				name,
+				loop.iterable,
+			) + body_uses + count_optional_use(name, loop.timeout) + count_uses(name, loop.limit)
+		ConcurrentlyLoopExpr(loop, typ, loc):
+			body_uses: Int = if loop.variable.name == name:
+				0
+			else:
+				count_uses(name, loop.body)
+
+			count_uses(
+				name,
+				loop.iterable,
+			) + body_uses + count_optional_use(name, loop.timeout) + count_uses(name, loop.limit)
+		PreClosureConcurrentExpr(block, typ, loc):
+			var rhs_uses: Int = 0
+			var shadowed: Bool = False
+
+			for binding in block.bindings:
+				rhs_uses += count_uses(name, binding.rhs)
+
+				if binding.variable.name == name:
+					shadowed = True
+				else:
+					void
+
+			body_uses: Int = if shadowed:
+				0
+			else:
+				count_uses(name, block.body)
+
+			rhs_uses + body_uses + count_optional_use(name, block.timeout)
+		ConcurrentExpr(block, typ, loc):
+			var rhs_uses: Int = 0
+			var shadowed: Bool = False
+
+			for binding in block.bindings:
+				rhs_uses += count_uses(name, binding.rhs)
+
+				if binding.variable.name == name:
+					shadowed = True
+				else:
+					void
+
+			body_uses: Int = if shadowed:
+				0
+			else:
+				count_uses(name, block.body)
+
+			rhs_uses + body_uses + count_optional_use(name, block.timeout)
+		SelectExpr(select_expr, typ, loc):
+			var wait_uses: Int = 0
+			var branch_uses: Int = 0
+
+			for arm in select_expr:
+				arm_shadows: Bool = match arm.kind:
+					SelectRecvArm(recv):
+						wait_uses += count_uses(name, recv.channel)
+						recv.binder.name == name
+					SelectSealedArm(channel):
+						wait_uses += count_uses(name, channel)
+						False
+					SelectAfterArm(timeout):
+						wait_uses += count_uses(name, timeout)
+						False
+
+				if not arm_shadows:
+					branch_uses = max_int(
+						branch_uses,
+						count_uses(name, arm.body),
+					)
+				else:
+					void
+
+			wait_uses + branch_uses
+		ListHandoffExpr(handoff, typ, loc):
+			body_shadowed: Bool = (
+				handoff.source_var.name == name
+				or handoff.result_var.name == name
+				or handoff.len_var.name == name
+				or handoff.out_var.name == name
+			)
+
+			body_uses: Int = if body_shadowed:
+				0
+			else:
+				count_uses(name, handoff.body)
+
+			count_uses(name, handoff.source) + count_uses(name, handoff.capacity) + body_uses
+		_:
+			0

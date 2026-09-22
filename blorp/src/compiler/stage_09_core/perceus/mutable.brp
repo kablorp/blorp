@@ -1,0 +1,4511 @@
+-- Mutable-local reassignment rewriting: turns `assign` nodes for a mutable
+-- local into explicit retain/release/drop operations across every branch
+-- shape (if, match, constructor/literal match, loops), and normalizes which
+-- branch owns the assignment's aliasing result.
+--
+-- rewrite_mutable_let_body is the entry point insert_drops_expr calls for a
+-- mutable-local let binding; everything else here is its shared machinery.
+-- assignment_rhs_returns_alias and the normalize_assignment_alias_* family
+-- decide whether an assignment's right-hand side aliases an existing owner
+-- (so the old value must not be dropped early); perceus/uses.brp and
+-- perceus/contracts.brp both call it directly since assignment aliasing is
+-- consulted while a use is still being summarized.
+import:
+	../ir:
+		CoreBinaryOp(EqualOp, NotEqualOp),
+		CoreBoxKind(PointerBox),
+		CoreBoxedStorageValue,
+		CoreCallKind(
+			BuiltinCall,
+			ClosureCall,
+			DeferredTraitCall,
+			DictWithCapacityCall,
+			DirectRuntimeCall,
+			FallibleStreamTerminalCall,
+			ForeignCall,
+			IntrinsicCall,
+			ListToStringCall,
+			OperationResultCall,
+			SelectedDirectCall,
+			SelectedTraitCall,
+			TensorParallelCall,
+			UnknownCall,
+			UserCall,
+		),
+		CoreConstructorLengthMatch,
+		CoreConstructorLengthMatchBranch,
+		CoreConstructorLengthMatchCase,
+		CoreConstructorLengthMatchGeq,
+		CoreConstructorLiteralMatch,
+		CoreConstructorMatchBody(
+			ConstructorMatchBodyExpr,
+			ConstructorMatchBodyLength,
+			ConstructorMatchBodyLiteral,
+		),
+		CoreConstructorMatchCase,
+		CoreConstructorMatchFallback(
+			ConstructorMatchFallbackBindings,
+			ConstructorMatchFallbackBody,
+			ConstructorMatchFallbackFail,
+		),
+		CoreDictEntry,
+		CoreExpr(
+			AccessorLiteralMatchExpr,
+			AssignExpr,
+			BinaryExpr,
+			BorrowLetExpr,
+			BoxExpr,
+			BreakExpr,
+			CallExpr,
+			CastExpr,
+			ClosureCreateExpr,
+			ConcurrentExpr,
+			ConcurrentlyLoopExpr,
+			ConstructorMatchExpr,
+			DebugBlockExpr,
+			DetachExpr,
+			DictConstructExpr,
+			DropExpr,
+			DupExpr,
+			FieldExpr,
+			ForChannelExpr,
+			ForDictExpr,
+			ForListExpr,
+			ForRangeExpr,
+			ForResourceSourceExpr,
+			ForSetExpr,
+			ForStreamExpr,
+			ForStringExpr,
+			ForTensorExpr,
+			IfExpr,
+			LambdaExpr,
+			LetExpr,
+			ListConstructExpr,
+			ListAllocExpr,
+			ListGetExpr,
+			ListHandoffExpr,
+			ListHandoffSetOwnedExpr,
+			ListHandoffSetSourceSlotExpr,
+			ListRetainExpr,
+			ListSetExpr,
+			ListSwapExpr,
+			LiteralExpr,
+			LogicalExpr,
+			PreClosureConcurrentExpr,
+			PreClosureConcurrentlyLoopExpr,
+			PreClosureDetachExpr,
+			RecordConstructExpr,
+			RecordExpr,
+			RecordCowUpdateExpr,
+			RecordReuseExpr,
+			RecordUpdateExpr,
+			ResourceCleanupExitExpr,
+			ResourceScopeExpr,
+			SelectExpr,
+			SeqExpr,
+			StaticStringLiteralExpr,
+			StringByteCopyExpr,
+			StringByteReadExpr,
+			StringByteWriteExpr,
+			StringSetLenExpr,
+			TailrecListSpreadLoopExpr,
+			TailrecListSpreadRecurExpr,
+			TailrecLoopExpr,
+			TailrecRecurExpr,
+			TensorBoxedLiteralExpr,
+			TensorRawFillExpr,
+			TensorRawReadExpr,
+			TensorRawViewLetExpr,
+			TensorRawWriteExpr,
+			TupleConstructExpr,
+			TupleExpr,
+			TupleFieldExpr,
+			UnaryExpr,
+			UnboxExpr,
+			UnionConstructExpr,
+			VarExpr,
+			VectorExpr,
+			VoidExpr,
+			WhileExpr,
+			LiteralMatchExpr,
+			LengthMatchExpr,
+		),
+		CoreListHandoffMode(BorrowFreshHandoff),
+		CoreListSet,
+		CoreLiteral(StringLiteral),
+		CoreLiteralMatchCase,
+		CoreLiteralMatchFallback(
+			LiteralMatchFallbackBindings,
+			LiteralMatchFallbackBody,
+			LiteralMatchFallbackFail,
+		),
+		CoreLoopBinder,
+		CoreMatchBinding,
+		CoreMatchBindingMode(MatchBorrowBindingMode, MatchOwnBindingMode),
+		CoreParam,
+		CoreRecordCowField,
+		CoreRecordFieldValue,
+		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy, StackResultReleasePolicy),
+		CoreSelectArm,
+		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
+		CoreSourceLoc(KnownSourceLoc, SyntheticSourceLoc),
+		CoreType(
+			BoxedResultType,
+			EnumType,
+			FunctionType,
+			HeapRecordType,
+			NamedType,
+			RangeType,
+			SelfType,
+			StackResultType,
+			TensorType,
+			TupleType,
+			TypeParameterType,
+			UnionType,
+			ValueRecordType,
+			VoidType,
+		),
+		CoreVar,
+		core_expr_type,
+	../ownership:
+		OwnershipCallContract,
+		OwnershipResultMode(ReturnAliasOfArg),
+		arg_consumes_caller,
+	balance:
+		balance_branch_body,
+		balance_let_body_legacy,
+		balanced_path_has_divergent_constructor_match,
+		drop_after_body,
+		freshen_shadowed_match_bindings,
+		prepend_dups,
+		prepend_drops,
+	env:
+		PerceusEnv,
+		build_env,
+		contract_for_call,
+		is_managed_type,
+		is_nullary_constructor_reference,
+		release_policy_for_type,
+		retain_policy_for_type,
+	uses:
+		NO_OWNERSHIP_USES,
+		OwnershipUseSummary,
+		borrow_expr_aliases_target,
+		count_uses,
+		release_expr_owner_var,
+		releasing_match_consumes_owner,
+		count_uses_in_constructor_match_body,
+		match_bindings_shadow,
+		max_int,
+		summarize_constructor_length_branch_uses,
+		summarize_linear_ownership_uses,
+		summarize_match_ownership_uses,
+	../perceus:
+		exact_owned_vars_add,
+		exact_owned_vars_contains,
+		exact_owned_vars_remove,
+		managed_pointer_unbox_alias,
+		retain_alias_as_owned,
+		retained_core_var_from_effect,
+	borrowed:
+		retain_borrowed_param_result,
+	protect:
+		protect_repeated_consumes,
+	../traverse as CoreTraverse
+
+
+record MutableAssignmentRewrite {
+	expr: CoreExpr,
+	next_temp: Int
+}
+
+
+private record MutableExprListRewrite {
+	exprs: List[CoreExpr],
+	next_temp: Int
+}
+
+
+private record MutableRecordFieldsRewrite {
+	fields: List[CoreRecordFieldValue],
+	next_temp: Int
+}
+
+
+private record MutableRecordCowFieldsRewrite {
+	fields: List[CoreRecordCowField],
+	next_temp: Int,
+	skips_old_release: Bool
+}
+
+
+private record MutableBoxedValuesRewrite {
+	values: List[CoreBoxedStorageValue],
+	next_temp: Int
+}
+
+
+private record MutableDictEntriesRewrite {
+	entries: List[CoreDictEntry],
+	next_temp: Int
+}
+
+
+private record AssignmentAliasNormalizationContext {
+	env: PerceusEnv,
+	local_aliases: Dict[String, Bool],
+	exact_owned_vars: List[CoreVar]
+}
+
+
+private record MutableTargetContext {
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType
+}
+
+
+private record MutableLiteralCasesRewrite {
+	cases: List[CoreLiteralMatchCase],
+	next_temp: Int
+}
+
+
+private record MutableConstructorMatchBodyRewrite {
+	body: CoreConstructorMatchBody,
+	next_temp: Int
+}
+
+
+private record MutableLiteralMatchFallbackRewrite {
+	fallback: CoreLiteralMatchFallback,
+	next_temp: Int
+}
+
+
+private record MutableConstructorLiteralMatchRewrite {
+	match_expr: CoreConstructorLiteralMatch,
+	next_temp: Int
+}
+
+
+private record MutableConstructorLengthBranchRewrite {
+	branch: CoreConstructorLengthMatchBranch,
+	next_temp: Int
+}
+
+
+private record MutableConstructorLengthMatchRewrite {
+	match_expr: CoreConstructorLengthMatch,
+	next_temp: Int
+}
+
+
+private record MutableConstructorMatchFallbackRewrite {
+	fallback: CoreConstructorMatchFallback,
+	next_temp: Int
+}
+
+
+private record MutableConstructorMatchRewrite {
+	cases: List[CoreConstructorMatchCase],
+	fallback: CoreConstructorMatchFallback,
+	next_temp: Int
+}
+
+
+private pure func mutable_assignment_temp_var(target: CoreVar, index: Int) -> CoreVar:
+	{
+		name = "__assign_${target.name}_${target.uniq}_${index}",
+		uniq = target.uniq,
+		def_id = None
+	}
+
+
+private pure func assignment_result_returns_alias(
+	env: PerceusEnv,
+	local_aliases: Dict[String, Bool],
+	expr: CoreExpr,
+) -> Bool:
+	match expr:
+		VarExpr(variable, typ, loc):
+			match local_aliases.get(variable.name):
+				Some(aliases):
+					aliases
+				None:
+					(
+						is_managed_type(env, typ)
+						and not is_nullary_constructor_reference(env, variable)
+					)
+		FieldExpr(owner, field, typ, loc):
+			is_managed_type(env, typ)
+		TupleFieldExpr(owner, field_index, typ, loc):
+			is_managed_type(env, typ)
+		CastExpr(inner, typ, loc):
+			assignment_result_returns_alias(env, local_aliases, inner)
+		UnboxExpr(kind, inner, typ, loc):
+			(
+				managed_pointer_unbox_alias(env, kind, typ)
+				or assignment_result_returns_alias(env, local_aliases, inner)
+			)
+		CallExpr(kind, callee, args, typ, loc):
+			match contract_for_call(env, kind, args.length(), typ):
+				Some(contract):
+					match contract.result:
+						ReturnBorrowed:
+							True
+						ReturnAliasOfArg(index):
+							True
+						_:
+							False
+				None:
+					False
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			binding_aliases: Bool = (
+				is_managed_type(env, typ)
+				and assignment_result_returns_alias(env, local_aliases, rhs)
+			)
+
+			assignment_result_returns_alias(
+				env,
+				local_aliases.set(variable.name, binding_aliases),
+				body,
+			)
+		BorrowLetExpr(variable, typ, rhs, body):
+			assignment_result_returns_alias(
+				env,
+				local_aliases.set(
+					variable.name,
+					is_managed_type(env, typ),
+				),
+				body,
+			)
+		SeqExpr(first, second):
+			assignment_result_returns_alias(env, local_aliases, second)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			match body:
+				VarExpr(returned, return_type, return_loc):
+					if variable.name == returned.name and variable.uniq == returned.uniq:
+						False
+					else:
+						assignment_result_returns_alias(env, local_aliases, body)
+				_:
+					assignment_result_returns_alias(env, local_aliases, body)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			assignment_result_returns_alias(env, local_aliases, body)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			(
+				assignment_result_returns_alias(env, local_aliases, then_expr)
+				or assignment_result_returns_alias(env, local_aliases, else_expr)
+			)
+		_:
+			False
+
+
+pure func assignment_rhs_returns_alias(env: PerceusEnv, rhs: CoreExpr) -> Bool:
+	assignment_result_returns_alias(env, {}, rhs)
+
+
+private pure func normalize_assignment_alias_match_result(
+	context: AssignmentAliasNormalizationContext,
+	bindings: List[CoreMatchBinding],
+	result: CoreExpr,
+) -> CoreExpr:
+	var local_aliases: Dict[String, Bool] = context.local_aliases
+	var exact_owned_vars: List[CoreVar] = context.exact_owned_vars
+
+	for binding in bindings:
+		local_aliases = local_aliases.set(
+			binding.variable.name,
+			binding.mode == MatchBorrowBindingMode,
+		)
+		exact_owned_vars = exact_owned_vars_remove(exact_owned_vars, binding.variable)
+
+	normalize_assignment_alias_result_inner(context.env, local_aliases, exact_owned_vars, result)
+
+
+private pure func assignment_result_is_exact_owner(
+	exact_owned_vars: List[CoreVar],
+	expr: CoreExpr,
+) -> Bool:
+	match expr:
+		VarExpr(variable, typ, loc):
+			exact_owned_vars_contains(exact_owned_vars, variable)
+		CastExpr(inner, typ, loc):
+			assignment_result_is_exact_owner(exact_owned_vars, inner)
+		UnboxExpr(kind, inner, typ, loc):
+			assignment_result_is_exact_owner(exact_owned_vars, inner)
+		_:
+			False
+
+
+private pure func exact_owned_vars_after_effect(
+	exact_owned_vars: List[CoreVar],
+	expr: CoreExpr,
+) -> List[CoreVar]:
+	match retained_core_var_from_effect(expr):
+		Some(variable):
+			exact_owned_vars_add(exact_owned_vars, variable)
+		None:
+			match expr:
+				DebugBlockExpr(body, typ, loc):
+					exact_owned_vars_after_effect(exact_owned_vars, body)
+				SeqExpr(first, second):
+					exact_owned_vars_after_effect(
+						exact_owned_vars_after_effect(exact_owned_vars, first),
+						second,
+					)
+				DupExpr(variable, value_type, retain_policy, body, typ, loc):
+					retained_vars: List[CoreVar] = match retain_policy:
+						NoRetainPolicy:
+							exact_owned_vars
+						_:
+							exact_owned_vars_add(exact_owned_vars, variable)
+
+					exact_owned_vars_after_effect(retained_vars, body)
+				DropExpr(variable, value_type, release_policy, body, typ, loc):
+					released_vars: List[CoreVar] = match release_policy:
+						NoReleasePolicy:
+							exact_owned_vars
+						_:
+							exact_owned_vars_remove(exact_owned_vars, variable)
+
+					exact_owned_vars_after_effect(released_vars, body)
+				_:
+					exact_owned_vars
+
+
+private pure func exact_owned_vars_for_match_results(
+	exact_owned_vars: List[CoreVar],
+	scrutinee: CoreExpr,
+	release_policy: CoreReleasePolicy,
+) -> List[CoreVar]:
+	match release_policy:
+		NoReleasePolicy:
+			exact_owned_vars
+		_:
+			match release_expr_owner_var(scrutinee):
+				Some(variable):
+					exact_owned_vars_remove(exact_owned_vars, variable)
+				None:
+					exact_owned_vars
+
+
+private pure func normalize_assignment_alias_result_inner(
+	env: PerceusEnv,
+	local_aliases: Dict[String, Bool],
+	exact_owned_vars: List[CoreVar],
+	expr: CoreExpr,
+) -> CoreExpr:
+	result_is_exact_owner: Bool = assignment_result_is_exact_owner(exact_owned_vars, expr)
+
+	if result_is_exact_owner or not is_managed_type(env, core_expr_type(expr)):
+		expr
+	else:
+		match expr:
+			DebugBlockExpr(body, typ, loc):
+				DebugBlockExpr(
+					normalize_assignment_alias_result_inner(
+						env,
+						local_aliases,
+						exact_owned_vars,
+						body,
+					),
+					typ,
+					loc,
+				)
+			IfExpr(cond, then_expr, else_expr, typ, loc):
+				IfExpr(
+					cond,
+					normalize_assignment_alias_result_inner(
+						env,
+						local_aliases,
+						exact_owned_vars,
+						then_expr,
+					),
+					normalize_assignment_alias_result_inner(
+						env,
+						local_aliases,
+						exact_owned_vars,
+						else_expr,
+					),
+					typ,
+					loc,
+				)
+			LetExpr(variable, is_mutable, typ, rhs, body):
+				owned_rhs: CoreExpr = if is_managed_type(env, typ):
+					normalize_assignment_alias_result_inner(
+						env,
+						local_aliases,
+						exact_owned_vars,
+						rhs,
+					)
+				else:
+					rhs
+
+				LetExpr(
+					variable,
+					is_mutable,
+					typ,
+					owned_rhs,
+					normalize_assignment_alias_result_inner(
+						env,
+						local_aliases.set(variable.name, False),
+						exact_owned_vars_remove(exact_owned_vars, variable),
+						body,
+					),
+				)
+			BorrowLetExpr(variable, typ, rhs, body):
+				BorrowLetExpr(
+					variable,
+					typ,
+					rhs,
+					normalize_assignment_alias_result_inner(
+						env,
+						local_aliases.set(
+							variable.name,
+							is_managed_type(env, typ),
+						),
+						exact_owned_vars_remove(exact_owned_vars, variable),
+						body,
+					),
+				)
+			SeqExpr(first, second):
+				SeqExpr(
+					first,
+					normalize_assignment_alias_result_inner(
+						env,
+						local_aliases,
+						exact_owned_vars_after_effect(exact_owned_vars, first),
+						second,
+					),
+				)
+			DupExpr(variable, value_type, retain_policy, body, typ, loc):
+				DupExpr(
+					variable,
+					value_type,
+					retain_policy,
+					normalize_assignment_alias_result_inner(
+						env,
+						local_aliases.set(variable.name, False),
+						exact_owned_vars_add(exact_owned_vars, variable),
+						body,
+					),
+					typ,
+					loc,
+				)
+			DropExpr(variable, value_type, release_policy, body, typ, loc):
+				DropExpr(
+					variable,
+					value_type,
+					release_policy,
+					normalize_assignment_alias_result_inner(
+						env,
+						local_aliases,
+						exact_owned_vars_remove(exact_owned_vars, variable),
+						body,
+					),
+					typ,
+					loc,
+				)
+			LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+				CoreTraverse.map_core_match_results_with_context(
+					expr,
+					{
+						env = env,
+						local_aliases = local_aliases,
+						exact_owned_vars = exact_owned_vars
+					},
+					normalize_assignment_alias_match_result,
+				)
+			AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+				CoreTraverse.map_core_match_results_with_context(
+					expr,
+					{
+						env = env,
+						local_aliases = local_aliases,
+						exact_owned_vars = exact_owned_vars_for_match_results(
+							exact_owned_vars,
+							scrutinee,
+							release_policy,
+						)
+					},
+					normalize_assignment_alias_match_result,
+				)
+			LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+				CoreTraverse.map_core_match_results_with_context(
+					expr,
+					{
+						env = env,
+						local_aliases = local_aliases,
+						exact_owned_vars = exact_owned_vars_for_match_results(
+							exact_owned_vars,
+							scrutinee,
+							release_policy,
+						)
+					},
+					normalize_assignment_alias_match_result,
+				)
+			ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+				CoreTraverse.map_core_match_results_with_context(
+					expr,
+					{
+						env = env,
+						local_aliases = local_aliases,
+						exact_owned_vars = exact_owned_vars_for_match_results(
+							exact_owned_vars,
+							scrutinee,
+							release_policy,
+						)
+					},
+					normalize_assignment_alias_match_result,
+				)
+			ResourceScopeExpr(scope, typ, loc):
+				ResourceScopeExpr({ scope | body = normalize_assignment_alias_result_inner(
+							env,
+							local_aliases,
+							exact_owned_vars_remove(exact_owned_vars, scope.variable),
+							scope.body,
+						) }, typ, loc)
+			ListHandoffExpr(handoff, typ, loc):
+				ListHandoffExpr({ handoff | body = normalize_assignment_alias_result_inner(
+							env,
+							local_aliases.set(handoff.result_var.name, False),
+							exact_owned_vars_remove(exact_owned_vars, handoff.result_var),
+							handoff.body,
+						) }, typ, loc)
+			TensorRawViewLetExpr(binding, body, typ, loc):
+				TensorRawViewLetExpr(
+					binding,
+					normalize_assignment_alias_result_inner(
+						env,
+						local_aliases.set(binding.variable.name, False),
+						exact_owned_vars_remove(exact_owned_vars, binding.variable),
+						body,
+					),
+					typ,
+					loc,
+				)
+			_:
+				if assignment_result_returns_alias(env, local_aliases, expr):
+					retain_alias_as_owned(expr)
+				else:
+					expr
+
+
+pure func normalize_assignment_alias_result(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
+	normalize_assignment_alias_result_inner(env, {}, [], expr)
+
+
+private pure func rewrite_uniform_mutable_assignment_with_uses(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	rhs: CoreExpr,
+	uses: OwnershipUseSummary,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+	temp_index: Int,
+	skip_old_release: Bool,
+) -> MutableAssignmentRewrite:
+	protected_rhs: CoreExpr = prepend_dups(
+		max_int(0, uses.consumed_refs - 1),
+		target,
+		target_type,
+		rhs,
+	)
+
+	if skip_old_release or uses.consumed_refs > 0:
+		{
+			expr = AssignExpr(target, protected_rhs, typ, loc),
+			next_temp = temp_index
+		}
+	else:
+		rhs_type: CoreType = core_expr_type(rhs)
+		temp: CoreVar = mutable_assignment_temp_var(target, temp_index)
+		drop_old: CoreExpr = DropExpr(
+			target,
+			target_type,
+			release_policy_for_type(target_type),
+			VoidExpr(VoidType, loc),
+			VoidType,
+			loc,
+		)
+		assign_new: CoreExpr = AssignExpr(
+			target,
+			VarExpr(temp, rhs_type, loc),
+			typ,
+			loc,
+		)
+		install_new: CoreExpr = SeqExpr(drop_old, assign_new)
+
+		retained_install: CoreExpr = if assignment_rhs_returns_alias(env, rhs):
+			DupExpr(temp, rhs_type, retain_policy_for_type(rhs_type), install_new, typ, loc)
+		else:
+			install_new
+
+		{
+			expr = LetExpr(temp, False, rhs_type, protected_rhs, retained_install),
+			next_temp = temp_index + 1
+		}
+
+
+private pure func mutable_branch_assignment(
+	target: CoreVar,
+	body: CoreExpr,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	AssignExpr(target, body, typ, loc)
+
+
+private pure func install_mutable_assignment_in_literal_cases(
+	target: CoreVar,
+	cases: List[CoreLiteralMatchCase],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> List[CoreLiteralMatchCase]:
+	cases.map(
+		func(
+			match_case,
+		): { match_case | body = mutable_branch_assignment(target, match_case.body, typ, loc) },
+	)
+
+
+private pure func install_mutable_assignment_in_literal_fallback(
+	target: CoreVar,
+	fallback: CoreLiteralMatchFallback,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreLiteralMatchFallback:
+	match fallback:
+		LiteralMatchFallbackBody(body):
+			LiteralMatchFallbackBody(mutable_branch_assignment(target, body, typ, loc))
+		LiteralMatchFallbackBindings(bindings, body):
+			LiteralMatchFallbackBindings(
+				bindings,
+				mutable_branch_assignment(target, body, typ, loc),
+			)
+		LiteralMatchFallbackFail:
+			LiteralMatchFallbackFail
+
+
+private pure func install_mutable_assignment_in_constructor_literal_match(
+	target: CoreVar,
+	match_expr: CoreConstructorLiteralMatch,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreConstructorLiteralMatch:
+	{ match_expr |
+		cases = install_mutable_assignment_in_literal_cases(target, match_expr.cases, typ, loc),
+		fallback = install_mutable_assignment_in_literal_fallback(
+			target,
+			match_expr.fallback,
+			typ,
+			loc,
+		),
+		result_type = typ
+	}
+
+
+private pure func install_mutable_assignment_in_constructor_body(
+	target: CoreVar,
+	body: CoreConstructorMatchBody,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreConstructorMatchBody:
+	match body:
+		ConstructorMatchBodyExpr(expr):
+			ConstructorMatchBodyExpr(mutable_branch_assignment(target, expr, typ, loc))
+		ConstructorMatchBodyLiteral(match_expr):
+			ConstructorMatchBodyLiteral(
+				install_mutable_assignment_in_constructor_literal_match(
+					target,
+					match_expr,
+					typ,
+					loc,
+				),
+			)
+		ConstructorMatchBodyLength(match_expr):
+			ConstructorMatchBodyLength(
+				install_mutable_assignment_in_constructor_length_match(
+					target,
+					match_expr,
+					typ,
+					loc,
+				),
+			)
+
+
+private pure func install_mutable_assignment_in_length_branch(
+	target: CoreVar,
+	branch: CoreConstructorLengthMatchBranch,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreConstructorLengthMatchBranch:
+	{ branch |
+		body = install_mutable_assignment_in_constructor_body(target, branch.body, typ, loc)
+	}
+
+
+private pure func install_mutable_assignment_in_constructor_length_match(
+	target: CoreVar,
+	match_expr: CoreConstructorLengthMatch,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreConstructorLengthMatch:
+	cases: List[CoreConstructorLengthMatchCase] = match_expr.cases.map(
+		func(
+			match_case,
+		): { match_case |
+			branch = install_mutable_assignment_in_length_branch(
+				target,
+				match_case.branch,
+				typ,
+				loc,
+			)
+		},
+	)
+
+	geq: Option[CoreConstructorLengthMatchGeq] = match match_expr.geq:
+		Some(match_case):
+			Some(
+				{ match_case |
+					branch = install_mutable_assignment_in_length_branch(
+						target,
+						match_case.branch,
+						typ,
+						loc,
+					)
+				},
+			)
+		None:
+			None
+
+	fallback: Option[CoreConstructorLengthMatchBranch] = match match_expr.fallback:
+		Some(branch):
+			Some(install_mutable_assignment_in_length_branch(target, branch, typ, loc))
+		None:
+			None
+
+	{ match_expr |
+		cases = cases,
+		geq = geq,
+		fallback = fallback,
+		result_type = typ
+	}
+
+
+private pure func install_mutable_assignment_in_constructor_fallback(
+	target: CoreVar,
+	fallback: CoreConstructorMatchFallback,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreConstructorMatchFallback:
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			ConstructorMatchFallbackBody(mutable_branch_assignment(target, body, typ, loc))
+		ConstructorMatchFallbackBindings(bindings, body):
+			ConstructorMatchFallbackBindings(
+				bindings,
+				mutable_branch_assignment(target, body, typ, loc),
+			)
+		ConstructorMatchFallbackFail:
+			ConstructorMatchFallbackFail
+
+
+private pure func install_mutable_assignment_in_match(
+	target: CoreVar,
+	rhs: CoreExpr,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> Option[CoreExpr]:
+	match rhs:
+		LiteralMatchExpr(scrutinee, cases, fallback, rhs_type, rhs_loc):
+			Some(
+				LiteralMatchExpr(
+					scrutinee,
+					install_mutable_assignment_in_literal_cases(target, cases, typ, loc),
+					install_mutable_assignment_in_literal_fallback(target, fallback, typ, loc),
+					typ,
+					rhs_loc,
+				),
+			)
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, rhs_type, rhs_loc):
+			Some(
+				AccessorLiteralMatchExpr(
+					scrutinee,
+					release_policy,
+					install_mutable_assignment_in_constructor_literal_match(
+						target,
+						match_expr,
+						typ,
+						loc,
+					),
+					typ,
+					rhs_loc,
+				),
+			)
+		LengthMatchExpr(scrutinee, release_policy, match_expr, rhs_type, rhs_loc):
+			Some(
+				LengthMatchExpr(
+					scrutinee,
+					release_policy,
+					install_mutable_assignment_in_constructor_length_match(
+						target,
+						match_expr,
+						typ,
+						loc,
+					),
+					typ,
+					rhs_loc,
+				),
+			)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, rhs_type, rhs_loc):
+			Some(ConstructorMatchExpr(scrutinee, release_policy, cases.map(
+						func(
+							match_case,
+						): { match_case |
+							body = install_mutable_assignment_in_constructor_body(
+								target,
+								match_case.body,
+								typ,
+								loc,
+							)
+						},
+					), install_mutable_assignment_in_constructor_fallback(
+						target,
+						fallback,
+						typ,
+						loc,
+					), typ, rhs_loc))
+		_:
+			None
+
+
+private pure func rewrite_non_match_direct_mutable_assignment_with_uses(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	rhs: CoreExpr,
+	uses: OwnershipUseSummary,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+	temp_index: Int,
+	skip_old_release: Bool,
+) -> MutableAssignmentRewrite:
+	match rhs:
+		IfExpr(cond, then_expr, else_expr, rhs_type, rhs_loc):
+			cond_uses: OwnershipUseSummary = summarize_linear_ownership_uses(env, target.name, cond)
+			then_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
+				env,
+				target.name,
+				then_expr,
+			)
+			else_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
+				env,
+				target.name,
+				else_expr,
+			)
+
+			if (
+				not skip_old_release
+				and cond_uses.consumed_refs == 0
+				and then_uses.consumed_refs != else_uses.consumed_refs
+			):
+				-- Install branch results locally so a consuming path transfers the old
+				-- slot while a borrowing path still releases it. A single summary keeps
+				-- only the maximum branch consumption and cannot make that distinction.
+				then_result: MutableAssignmentRewrite = rewrite_direct_mutable_assignment_with_uses(
+					env,
+					target,
+					target_type,
+					then_expr,
+					then_uses,
+					typ,
+					loc,
+					temp_index,
+					False,
+				)
+				else_result: MutableAssignmentRewrite = rewrite_direct_mutable_assignment_with_uses(
+					env,
+					target,
+					target_type,
+					else_expr,
+					else_uses,
+					typ,
+					loc,
+					then_result.next_temp,
+					False,
+				)
+				{
+					expr = IfExpr(cond, then_result.expr, else_result.expr, typ, rhs_loc),
+					next_temp = else_result.next_temp
+				}
+			else:
+				-- A consuming predicate changes which owner reaches both branches.
+				-- Match-like RHS forms also need binding-aware branch installation;
+				-- keep both on the established stabilization path until covered by a
+				-- concrete mixed-consumption regression.
+				rewrite_uniform_mutable_assignment_with_uses(
+					env,
+					target,
+					target_type,
+					rhs,
+					uses,
+					typ,
+					loc,
+					temp_index,
+					skip_old_release,
+				)
+		_:
+			rewrite_uniform_mutable_assignment_with_uses(
+				env,
+				target,
+				target_type,
+				rhs,
+				uses,
+				typ,
+				loc,
+				temp_index,
+				skip_old_release,
+			)
+
+
+private pure func rewrite_direct_mutable_assignment_with_uses(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	rhs: CoreExpr,
+	uses: OwnershipUseSummary,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+	temp_index: Int,
+	skip_old_release: Bool,
+) -> MutableAssignmentRewrite:
+	match install_mutable_assignment_in_match(target, rhs, typ, loc):
+		Some(branch_local_assignment):
+			-- A match chooses exactly one result path. Install the new slot value
+			-- inside that path so each branch can independently transfer or release
+			-- the previous owner, including bindings scoped to nested match bodies.
+			rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				branch_local_assignment,
+				temp_index,
+				skip_old_release,
+			)
+		None:
+			rewrite_non_match_direct_mutable_assignment_with_uses(
+				env,
+				target,
+				target_type,
+				rhs,
+				uses,
+				typ,
+				loc,
+				temp_index,
+				skip_old_release,
+			)
+
+
+pure func rewrite_direct_mutable_assignment(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	rhs: CoreExpr,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+	temp_index: Int,
+	skip_old_release: Bool,
+) -> MutableAssignmentRewrite:
+	rewrite_direct_mutable_assignment_with_uses(
+		env,
+		target,
+		target_type,
+		rhs,
+		summarize_linear_ownership_uses(env, target.name, rhs),
+		typ,
+		loc,
+		temp_index,
+		skip_old_release,
+	)
+
+
+private pure func expr_list_assigns_mutable_target(target: CoreVar, exprs: List[CoreExpr]) -> Bool:
+	exprs.any(func(expr): expr_assigns_mutable_target(target, expr))
+
+
+private pure func record_fields_assign_mutable_target(
+	target: CoreVar,
+	fields: List[CoreRecordFieldValue],
+) -> Bool:
+	fields.any(func(field): expr_assigns_mutable_target(target, field.value))
+
+
+private pure func record_cow_fields_assign_mutable_target(
+	target: CoreVar,
+	fields: List[CoreRecordCowField],
+) -> Bool:
+	fields.any(pure func(field) -> Bool:
+		match field.replacement:
+			Some(replacement):
+				expr_assigns_mutable_target(target, replacement)
+			None:
+				False
+	)
+
+
+private pure func boxed_values_assign_mutable_target(
+	target: CoreVar,
+	values: List[CoreBoxedStorageValue],
+) -> Bool:
+	values.any(func(value): expr_assigns_mutable_target(target, value.value))
+
+
+private pure func dict_entries_assign_mutable_target(
+	target: CoreVar,
+	entries: List[CoreDictEntry],
+) -> Bool:
+	entries.any(
+		func(
+			entry,
+		): (
+			expr_assigns_mutable_target(target, entry.key.value)
+			or expr_assigns_mutable_target(target, entry.value.value)
+		),
+	)
+
+
+private pure func literal_match_fallback_assigns_mutable_target(
+	target: CoreVar,
+	fallback: CoreLiteralMatchFallback,
+) -> Bool:
+	match fallback:
+		LiteralMatchFallbackBody(body):
+			expr_assigns_mutable_target(target, body)
+		LiteralMatchFallbackBindings(bindings, body):
+			(
+				not match_bindings_shadow(target.name, bindings)
+				and expr_assigns_mutable_target(target, body)
+			)
+		LiteralMatchFallbackFail:
+			False
+
+
+private pure func literal_match_cases_assign_mutable_target(
+	target: CoreVar,
+	cases: List[CoreLiteralMatchCase],
+) -> Bool:
+	cases.any(
+		func(
+			match_case,
+		): (
+			not match_bindings_shadow(target.name, match_case.bindings)
+			and expr_assigns_mutable_target(target, match_case.body)
+		),
+	)
+
+
+private pure func constructor_match_cases_assign_mutable_target(
+	target: CoreVar,
+	cases: List[CoreConstructorMatchCase],
+) -> Bool:
+	cases.any(
+		func(
+			match_case,
+		): (
+			not match_bindings_shadow(target.name, match_case.bindings)
+			and constructor_match_body_assigns_mutable_target(target, match_case.body)
+		),
+	)
+
+
+private pure func constructor_match_fallback_assigns_mutable_target(
+	target: CoreVar,
+	fallback: CoreConstructorMatchFallback,
+) -> Bool:
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			expr_assigns_mutable_target(target, body)
+		ConstructorMatchFallbackBindings(bindings, body):
+			(
+				not match_bindings_shadow(target.name, bindings)
+				and expr_assigns_mutable_target(target, body)
+			)
+		ConstructorMatchFallbackFail:
+			False
+
+
+private pure func constructor_literal_match_assigns_mutable_target(
+	target: CoreVar,
+	match_expr: CoreConstructorLiteralMatch,
+) -> Bool:
+	(
+		literal_match_cases_assign_mutable_target(target, match_expr.cases)
+		or literal_match_fallback_assigns_mutable_target(target, match_expr.fallback)
+	)
+
+
+private pure func constructor_match_body_assigns_mutable_target(
+	target: CoreVar,
+	body: CoreConstructorMatchBody,
+) -> Bool:
+	match body:
+		ConstructorMatchBodyExpr(expr):
+			expr_assigns_mutable_target(target, expr)
+		ConstructorMatchBodyLiteral(match_expr):
+			constructor_literal_match_assigns_mutable_target(target, match_expr)
+		ConstructorMatchBodyLength(match_expr):
+			constructor_length_match_assigns_mutable_target(target, match_expr)
+
+
+private pure func constructor_length_branch_assigns_mutable_target(
+	target: CoreVar,
+	branch: CoreConstructorLengthMatchBranch,
+) -> Bool:
+	(
+		not match_bindings_shadow(target.name, branch.bindings)
+		and constructor_match_body_assigns_mutable_target(target, branch.body)
+	)
+
+
+private pure func constructor_length_match_assigns_mutable_target(
+	target: CoreVar,
+	match_expr: CoreConstructorLengthMatch,
+) -> Bool:
+	cases_assign: Bool = match_expr.cases.any(
+		func(
+			match_case,
+		): constructor_length_branch_assigns_mutable_target(target, match_case.branch),
+	)
+
+	geq_assign: Bool = match match_expr.geq:
+		Some(geq):
+			constructor_length_branch_assigns_mutable_target(target, geq.branch)
+		None:
+			False
+
+	fallback_assign: Bool = match match_expr.fallback:
+		Some(branch):
+			constructor_length_branch_assigns_mutable_target(target, branch)
+		None:
+			False
+
+	cases_assign or geq_assign or fallback_assign
+
+
+pure func expr_assigns_mutable_target(target: CoreVar, expr: CoreExpr) -> Bool:
+	match expr:
+		AssignExpr(variable, rhs, typ, loc):
+			variable.name == target.name or expr_assigns_mutable_target(target, rhs)
+		DebugBlockExpr(body, typ, loc):
+			expr_assigns_mutable_target(target, body)
+		CallExpr(kind, callee, args, typ, loc):
+			(
+				expr_assigns_mutable_target(target, callee)
+				or expr_list_assigns_mutable_target(target, args)
+			)
+		BinaryExpr(op, left, right, typ, loc):
+			expr_assigns_mutable_target(target, left) or expr_assigns_mutable_target(target, right)
+		UnaryExpr(op, inner, typ, loc):
+			expr_assigns_mutable_target(target, inner)
+		LogicalExpr(op, left, right, typ, loc):
+			expr_assigns_mutable_target(target, left) or expr_assigns_mutable_target(target, right)
+		CastExpr(inner, typ, loc):
+			expr_assigns_mutable_target(target, inner)
+		BoxExpr(box, typ, loc):
+			expr_assigns_mutable_target(target, box.value)
+		UnboxExpr(kind, inner, typ, loc):
+			expr_assigns_mutable_target(target, inner)
+		FieldExpr(owner, field, typ, loc):
+			expr_assigns_mutable_target(target, owner)
+		TupleFieldExpr(owner, field_index, typ, loc):
+			expr_assigns_mutable_target(target, owner)
+		TupleExpr(items, typ, loc) | VectorExpr(items, typ, loc):
+			expr_list_assigns_mutable_target(target, items)
+		RecordExpr(fields, typ, loc) | RecordConstructExpr(_, fields, typ, loc):
+			record_fields_assign_mutable_target(target, fields)
+		RecordUpdateExpr(base, fields, typ, loc) | RecordReuseExpr(base, fields, typ, loc):
+			(
+				expr_assigns_mutable_target(target, base)
+				or record_fields_assign_mutable_target(target, fields)
+			)
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			(
+				record_cow_fields_assign_mutable_target(target, fields)
+				or expr_assigns_mutable_target(target, source)
+			)
+		ListConstructExpr(construct, typ, loc):
+			boxed_values_assign_mutable_target(target, construct.elements)
+		ListAllocExpr(alloc, typ, loc):
+			expr_assigns_mutable_target(target, alloc.capacity)
+		ListGetExpr(get, typ, loc):
+			expr_list_assigns_mutable_target(
+				target,
+				[get.list, get.index],
+			)
+		ListHandoffExpr(handoff, typ, loc):
+			expr_list_assigns_mutable_target(
+				target,
+				[handoff.source, handoff.capacity, handoff.body],
+			)
+		ListHandoffSetOwnedExpr(set, typ, loc) | ListSetExpr(set, typ, loc):
+			expr_list_assigns_mutable_target(
+				target,
+				[set.list, set.index, set.value.value],
+			)
+		ListHandoffSetSourceSlotExpr(slot, typ, loc):
+			expr_list_assigns_mutable_target(
+				target,
+				[slot.result, slot.out_index, slot.source, slot.source_index],
+			)
+		ListRetainExpr(retain, typ, loc):
+			expr_list_assigns_mutable_target(
+				target,
+				[retain.list, retain.value.value],
+			)
+		ListSwapExpr(swap, typ, loc):
+			expr_list_assigns_mutable_target(
+				target,
+				[swap.list, swap.left_index, swap.right_index],
+			)
+		StringByteReadExpr(read, typ, loc):
+			expr_list_assigns_mutable_target(
+				target,
+				[read.source, read.index],
+			)
+		StringByteWriteExpr(write, typ, loc):
+			expr_list_assigns_mutable_target(
+				target,
+				[write.target, write.index, write.byte],
+			)
+		StringByteCopyExpr(copy, typ, loc):
+			expr_list_assigns_mutable_target(
+				target,
+				[copy.dst, copy.dst_pos, copy.src, copy.src_pos, copy.len],
+			)
+		StringSetLenExpr(set_len, typ, loc):
+			expr_list_assigns_mutable_target(
+				target,
+				[set_len.target, set_len.len],
+			)
+		TensorBoxedLiteralExpr(literal, typ, loc):
+			boxed_values_assign_mutable_target(target, literal.elements)
+		TensorRawFillExpr(fill, typ, loc):
+			expr_list_assigns_mutable_target(
+				target,
+				[fill.value].concat(fill.dims),
+			)
+		TensorRawReadExpr(read, typ, loc):
+			expr_assigns_mutable_target(target, read.index)
+		TensorRawWriteExpr(write, typ, loc):
+			expr_list_assigns_mutable_target(
+				target,
+				[write.index, write.value],
+			)
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			(
+				expr_assigns_mutable_target(target, binding.source)
+				or (
+					binding.variable.name != target.name
+					and expr_assigns_mutable_target(target, body)
+				)
+			)
+		UnionConstructExpr(construct, typ, loc):
+			boxed_values_assign_mutable_target(target, construct.args)
+		DictConstructExpr(construct, typ, loc):
+			dict_entries_assign_mutable_target(target, construct.entries)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			(
+				expr_assigns_mutable_target(target, scrutinee)
+				or literal_match_cases_assign_mutable_target(target, cases)
+				or literal_match_fallback_assigns_mutable_target(target, fallback)
+			)
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			(
+				expr_assigns_mutable_target(target, scrutinee)
+				or constructor_literal_match_assigns_mutable_target(target, match_expr)
+			)
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			(
+				expr_assigns_mutable_target(target, scrutinee)
+				or constructor_length_match_assigns_mutable_target(target, match_expr)
+			)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			-- This case was missing: every other match kind here (literal,
+			-- accessor-literal, length) recurses into its branches, but a
+			-- `ConstructorMatchExpr` (the common case for a union/Option match)
+			-- fell through to the `_: False` default below. An expression
+			-- containing a `ConstructorMatchExpr` that assigns `target` in one
+			-- branch was therefore reported as not assigning it at all.
+			(
+				expr_assigns_mutable_target(target, scrutinee)
+				or constructor_match_cases_assign_mutable_target(target, cases)
+				or constructor_match_fallback_assigns_mutable_target(target, fallback)
+			)
+		ResourceScopeExpr(scope, typ, loc):
+			(
+				expr_assigns_mutable_target(target, scope.acquire)
+				or (
+					scope.variable.name != target.name
+					and ((
+						expr_assigns_mutable_target(target, scope.body)
+						or expr_assigns_mutable_target(target, scope.cleanup)
+					))
+				)
+			)
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			(
+				expr_assigns_mutable_target(target, rhs)
+				or variable.name != target.name and expr_assigns_mutable_target(target, body)
+			)
+		BorrowLetExpr(variable, typ, rhs, body):
+			(
+				expr_assigns_mutable_target(target, rhs)
+				or variable.name != target.name and expr_assigns_mutable_target(target, body)
+			)
+		SeqExpr(first, second):
+			(
+				expr_assigns_mutable_target(target, first)
+				or expr_assigns_mutable_target(target, second)
+			)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			(
+				expr_assigns_mutable_target(target, cond)
+				or expr_assigns_mutable_target(target, then_expr)
+				or expr_assigns_mutable_target(target, else_expr)
+			)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			expr_assigns_mutable_target(target, body)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			expr_assigns_mutable_target(target, body)
+		_:
+			False
+
+
+private pure func skip_old_release_after_expr(
+	env: PerceusEnv,
+	target: CoreVar,
+	skip_old_release: Bool,
+	expr: CoreExpr,
+) -> Bool:
+	(
+		((
+			skip_old_release
+			or summarize_linear_ownership_uses(env, target.name, expr).consumed_refs > 0
+		))
+		and not expr_assigns_mutable_target(target, expr)
+	)
+
+
+private pure func rewrite_mutable_expr_list(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	exprs: List[CoreExpr],
+	temp_index: Int,
+	skip_old_release: Bool,
+) -> MutableExprListRewrite:
+	var rewritten: List[CoreExpr] = []
+	var next_temp: Int = temp_index
+	var next_skips_old_release: Bool = skip_old_release
+
+	for expr in exprs:
+		result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+			env,
+			target,
+			target_type,
+			expr,
+			next_temp,
+			next_skips_old_release,
+		)
+		rewritten = rewritten.append(result.expr)
+		next_temp = result.next_temp
+		next_skips_old_release = skip_old_release_after_expr(
+			env,
+			target,
+			next_skips_old_release,
+			expr,
+		)
+
+	{
+		exprs = rewritten,
+		next_temp = next_temp
+	}
+
+
+private pure func rewrite_mutable_record_fields(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	fields: List[CoreRecordFieldValue],
+	temp_index: Int,
+	skip_old_release: Bool,
+) -> MutableRecordFieldsRewrite:
+	var rewritten_fields: List[CoreRecordFieldValue] = []
+	var next_temp: Int = temp_index
+	var next_skips_old_release: Bool = skip_old_release
+
+	for field in fields:
+		result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+			env,
+			target,
+			target_type,
+			field.value,
+			next_temp,
+			next_skips_old_release,
+		)
+		rewritten_fields = rewritten_fields.append({ field | value = result.expr })
+		next_temp = result.next_temp
+		next_skips_old_release = skip_old_release_after_expr(
+			env,
+			target,
+			next_skips_old_release,
+			field.value,
+		)
+
+	{
+		fields = rewritten_fields,
+		next_temp = next_temp
+	}
+
+
+private pure func rewrite_mutable_record_cow_fields(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	fields: List[CoreRecordCowField],
+	temp_index: Int,
+	skip_old_release: Bool,
+) -> MutableRecordCowFieldsRewrite:
+	var rewritten_fields: List[CoreRecordCowField] = []
+	var next_temp: Int = temp_index
+	var next_skips_old_release: Bool = skip_old_release
+
+	for field in fields:
+		match field.replacement:
+			Some(replacement):
+				result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+					env,
+					target,
+					target_type,
+					replacement,
+					next_temp,
+					next_skips_old_release,
+				)
+				rewritten_fields = rewritten_fields.append(
+					{ field | replacement = Some(result.expr) },
+				)
+				next_temp = result.next_temp
+				next_skips_old_release = skip_old_release_after_expr(
+					env,
+					target,
+					next_skips_old_release,
+					replacement,
+				)
+			None:
+				rewritten_fields = rewritten_fields.append(field)
+
+	{
+		fields = rewritten_fields,
+		next_temp = next_temp,
+		skips_old_release = next_skips_old_release
+	}
+
+
+private pure func rewrite_mutable_boxed_values(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	values: List[CoreBoxedStorageValue],
+	temp_index: Int,
+	skip_old_release: Bool,
+) -> MutableBoxedValuesRewrite:
+	var rewritten_values: List[CoreBoxedStorageValue] = []
+	var next_temp: Int = temp_index
+	var next_skips_old_release: Bool = skip_old_release
+
+	for value in values:
+		result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+			env,
+			target,
+			target_type,
+			value.value,
+			next_temp,
+			next_skips_old_release,
+		)
+		rewritten_values = rewritten_values.append({ value | value = result.expr })
+		next_temp = result.next_temp
+		next_skips_old_release = skip_old_release_after_expr(
+			env,
+			target,
+			next_skips_old_release,
+			value.value,
+		)
+
+	{
+		values = rewritten_values,
+		next_temp = next_temp
+	}
+
+
+private pure func rewrite_mutable_dict_entries(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	entries: List[CoreDictEntry],
+	temp_index: Int,
+	skip_old_release: Bool,
+) -> MutableDictEntriesRewrite:
+	var rewritten_entries: List[CoreDictEntry] = []
+	var next_temp: Int = temp_index
+	var next_skips_old_release: Bool = skip_old_release
+
+	for entry in entries:
+		key_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+			env,
+			target,
+			target_type,
+			entry.key.value,
+			next_temp,
+			next_skips_old_release,
+		)
+		key_skips_old_release: Bool = skip_old_release_after_expr(
+			env,
+			target,
+			next_skips_old_release,
+			entry.key.value,
+		)
+		value_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+			env,
+			target,
+			target_type,
+			entry.value.value,
+			key_result.next_temp,
+			key_skips_old_release,
+		)
+		rewritten_entries = rewritten_entries.append({ entry |
+				key = { entry.key | value = key_result.expr },
+				value = { entry.value | value = value_result.expr }
+			})
+		next_temp = value_result.next_temp
+		next_skips_old_release = skip_old_release_after_expr(
+			env,
+			target,
+			key_skips_old_release,
+			entry.value.value,
+		)
+
+	{
+		entries = rewritten_entries,
+		next_temp = next_temp
+	}
+
+
+private pure func stabilize_nested_assignment_exprs(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	exprs: List[CoreExpr],
+) -> List[CoreExpr]:
+	var stabilized: List[CoreExpr] = []
+
+	for expr in exprs:
+		stabilized = stabilized.append(
+			stabilize_nested_assignment_rhs(
+				env,
+				target,
+				target_type,
+				expr,
+			),
+		)
+
+	stabilized
+
+
+private pure func stabilize_nested_assignment_record_fields(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	fields: List[CoreRecordFieldValue],
+) -> List[CoreRecordFieldValue]:
+	var stabilized: List[CoreRecordFieldValue] = []
+
+	for field in fields:
+		stabilized = stabilized.append(
+			{ field |
+				value = stabilize_nested_assignment_rhs(env, target, target_type, field.value)
+			},
+		)
+
+	stabilized
+
+
+private pure func stabilize_nested_assignment_boxed_values(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	values: List[CoreBoxedStorageValue],
+) -> List[CoreBoxedStorageValue]:
+	var stabilized: List[CoreBoxedStorageValue] = []
+
+	for value in values:
+		stabilized = stabilized.append(
+			{ value |
+				value = stabilize_nested_assignment_rhs(env, target, target_type, value.value)
+			},
+		)
+
+	stabilized
+
+
+private pure func stabilize_nested_assignment_dict_entries(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	entries: List[CoreDictEntry],
+) -> List[CoreDictEntry]:
+	var stabilized: List[CoreDictEntry] = []
+
+	for entry in entries:
+		stabilized = stabilized.append({ entry |
+				key = { entry.key |
+					value = stabilize_nested_assignment_rhs(
+						env,
+						target,
+						target_type,
+						entry.key.value,
+					)
+				},
+				value = { entry.value |
+					value = stabilize_nested_assignment_rhs(
+						env,
+						target,
+						target_type,
+						entry.value.value,
+					)
+				}
+			})
+
+	stabilized
+
+
+private pure func stabilize_nested_assignment_call_args(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	kind: CoreCallKind,
+	args: List[CoreExpr],
+	return_type: CoreType,
+) -> List[CoreExpr]:
+	var stabilized: List[CoreExpr] = []
+	var index: Int = 0
+	contract: Option[OwnershipCallContract] = contract_for_call(
+		env,
+		kind,
+		args.length(),
+		return_type,
+	)
+
+	for arg in args:
+		prepared: CoreExpr = stabilize_nested_assignment_rhs(env, target, target_type, arg)
+
+		mode_consumes_result: Bool = match contract:
+			Some(call_contract):
+				match call_contract.args.get(index):
+					Some(mode):
+						arg_consumes_caller(mode)
+					None:
+						False
+			None:
+				False
+
+		owned_arg: CoreExpr = if (
+			mode_consumes_result
+			and is_managed_type(env, core_expr_type(prepared))
+		):
+			-- Normalize each result branch after evaluating the argument.
+			-- Earlier arguments may have replaced the target already, and a
+			-- mixed borrowed/owned result must retain only its borrowed paths.
+			normalize_assignment_alias_result(env, prepared)
+		else:
+			prepared
+
+		stabilized = stabilized.append(owned_arg)
+		index += 1
+
+	stabilized
+
+
+private pure func stabilize_nested_assignment_match_result(
+	context: MutableTargetContext,
+	bindings: List[CoreMatchBinding],
+	result: CoreExpr,
+) -> CoreExpr:
+	if match_bindings_shadow(context.target.name, bindings):
+		result
+	else:
+		stabilize_nested_assignment_rhs(context.env, context.target, context.target_type, result)
+
+
+private pure func stabilize_nested_assignment_rhs(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	expr: CoreExpr,
+) -> CoreExpr:
+	if not expr_assigns_mutable_target(target, expr):
+		protect_repeated_consumes(env, target, target_type, expr, True)
+	else:
+		match expr:
+			AssignExpr(variable, rhs, typ, loc):
+				if variable.name == target.name:
+					expr
+				else:
+					AssignExpr(
+						variable,
+						stabilize_nested_assignment_rhs(env, target, target_type, rhs),
+						typ,
+						loc,
+					)
+			DebugBlockExpr(body, typ, loc):
+				DebugBlockExpr(
+					stabilize_nested_assignment_rhs(env, target, target_type, body),
+					typ,
+					loc,
+				)
+			CallExpr(kind, callee, args, typ, loc):
+				CallExpr(
+					kind,
+					stabilize_nested_assignment_rhs(env, target, target_type, callee),
+					stabilize_nested_assignment_call_args(
+						env,
+						target,
+						target_type,
+						kind,
+						args,
+						typ,
+					),
+					typ,
+					loc,
+				)
+			BinaryExpr(op, left, right, typ, loc):
+				BinaryExpr(
+					op,
+					stabilize_nested_assignment_rhs(env, target, target_type, left),
+					stabilize_nested_assignment_rhs(env, target, target_type, right),
+					typ,
+					loc,
+				)
+			UnaryExpr(op, inner, typ, loc):
+				UnaryExpr(
+					op,
+					stabilize_nested_assignment_rhs(env, target, target_type, inner),
+					typ,
+					loc,
+				)
+			LogicalExpr(op, left, right, typ, loc):
+				LogicalExpr(
+					op,
+					stabilize_nested_assignment_rhs(env, target, target_type, left),
+					stabilize_nested_assignment_rhs(env, target, target_type, right),
+					typ,
+					loc,
+				)
+			CastExpr(inner, typ, loc):
+				CastExpr(
+					stabilize_nested_assignment_rhs(env, target, target_type, inner),
+					typ,
+					loc,
+				)
+			BoxExpr(box, typ, loc):
+				BoxExpr(
+					{ box |
+						value = stabilize_nested_assignment_rhs(env, target, target_type, box.value)
+					},
+					typ,
+					loc,
+				)
+			UnboxExpr(kind, inner, typ, loc):
+				UnboxExpr(
+					kind,
+					stabilize_nested_assignment_rhs(env, target, target_type, inner),
+					typ,
+					loc,
+				)
+			FieldExpr(owner, field, typ, loc):
+				FieldExpr(
+					stabilize_nested_assignment_rhs(env, target, target_type, owner),
+					field,
+					typ,
+					loc,
+				)
+			TupleFieldExpr(owner, field_index, typ, loc):
+				TupleFieldExpr(
+					stabilize_nested_assignment_rhs(env, target, target_type, owner),
+					field_index,
+					typ,
+					loc,
+				)
+			TupleExpr(items, typ, loc):
+				TupleExpr(
+					stabilize_nested_assignment_exprs(env, target, target_type, items),
+					typ,
+					loc,
+				)
+			VectorExpr(items, typ, loc):
+				VectorExpr(
+					stabilize_nested_assignment_exprs(env, target, target_type, items),
+					typ,
+					loc,
+				)
+			RecordExpr(fields, typ, loc):
+				RecordExpr(
+					stabilize_nested_assignment_record_fields(env, target, target_type, fields),
+					typ,
+					loc,
+				)
+			RecordConstructExpr(type_name, fields, typ, loc):
+				RecordConstructExpr(
+					type_name,
+					stabilize_nested_assignment_record_fields(env, target, target_type, fields),
+					typ,
+					loc,
+				)
+			RecordUpdateExpr(base, fields, typ, loc):
+				RecordUpdateExpr(
+					stabilize_nested_assignment_rhs(env, target, target_type, base),
+					stabilize_nested_assignment_record_fields(env, target, target_type, fields),
+					typ,
+					loc,
+				)
+			RecordReuseExpr(source, fields, typ, loc):
+				RecordReuseExpr(
+					stabilize_nested_assignment_rhs(env, target, target_type, source),
+					stabilize_nested_assignment_record_fields(env, target, target_type, fields),
+					typ,
+					loc,
+				)
+			RecordCowUpdateExpr(source, fields, typ, loc):
+				RecordCowUpdateExpr(
+					stabilize_nested_assignment_rhs(env, target, target_type, source),
+					CoreTraverse.map_core_record_cow_fields(
+						fields,
+						pure func(
+							replacement,
+						): stabilize_nested_assignment_rhs(env, target, target_type, replacement),
+					),
+					typ,
+					loc,
+				)
+			ListConstructExpr(construct, typ, loc):
+				ListConstructExpr(
+					{ construct |
+						elements = stabilize_nested_assignment_boxed_values(
+							env,
+							target,
+							target_type,
+							construct.elements,
+						)
+					},
+					typ,
+					loc,
+				)
+			ListAllocExpr(alloc, typ, loc):
+				ListAllocExpr(
+					{ alloc |
+						capacity = stabilize_nested_assignment_rhs(
+							env,
+							target,
+							target_type,
+							alloc.capacity,
+						)
+					},
+					typ,
+					loc,
+				)
+			ListGetExpr(get, typ, loc):
+				ListGetExpr(
+					{ get |
+						list = stabilize_nested_assignment_rhs(env, target, target_type, get.list),
+						index = stabilize_nested_assignment_rhs(env, target, target_type, get.index)
+					},
+					typ,
+					loc,
+				)
+			ListHandoffExpr(handoff, typ, loc):
+				body: CoreExpr = if (
+					handoff.result_var.name == target.name
+					or handoff.len_var.name == target.name
+					or handoff.out_var.name == target.name
+				):
+					handoff.body
+				else:
+					stabilize_nested_assignment_rhs(env, target, target_type, handoff.body)
+
+				ListHandoffExpr(
+					{ handoff |
+						source = stabilize_nested_assignment_rhs(
+							env,
+							target,
+							target_type,
+							handoff.source,
+						),
+						capacity = stabilize_nested_assignment_rhs(
+							env,
+							target,
+							target_type,
+							handoff.capacity,
+						),
+						body = body
+					},
+					typ,
+					loc,
+				)
+			ListHandoffSetOwnedExpr(set, typ, loc):
+				ListHandoffSetOwnedExpr(
+					{ set |
+						list = stabilize_nested_assignment_rhs(env, target, target_type, set.list),
+						index = stabilize_nested_assignment_rhs(
+							env,
+							target,
+							target_type,
+							set.index,
+						),
+						value = { set.value |
+							value = stabilize_nested_assignment_rhs(
+								env,
+								target,
+								target_type,
+								set.value.value,
+							)
+						}
+					},
+					typ,
+					loc,
+				)
+			ListHandoffSetSourceSlotExpr(slot, typ, loc):
+				ListHandoffSetSourceSlotExpr(
+					{ slot |
+						result = stabilize_nested_assignment_rhs(
+							env,
+							target,
+							target_type,
+							slot.result,
+						),
+						out_index = stabilize_nested_assignment_rhs(
+							env,
+							target,
+							target_type,
+							slot.out_index,
+						),
+						source = stabilize_nested_assignment_rhs(
+							env,
+							target,
+							target_type,
+							slot.source,
+						),
+						source_index = stabilize_nested_assignment_rhs(
+							env,
+							target,
+							target_type,
+							slot.source_index,
+						)
+					},
+					typ,
+					loc,
+				)
+			ListRetainExpr(retain, typ, loc):
+				ListRetainExpr(
+					{ retain |
+						list = stabilize_nested_assignment_rhs(
+							env,
+							target,
+							target_type,
+							retain.list,
+						),
+						value = { retain.value |
+							value = stabilize_nested_assignment_rhs(
+								env,
+								target,
+								target_type,
+								retain.value.value,
+							)
+						}
+					},
+					typ,
+					loc,
+				)
+			ListSetExpr(set, typ, loc):
+				ListSetExpr(
+					{ set |
+						list = stabilize_nested_assignment_rhs(env, target, target_type, set.list),
+						index = stabilize_nested_assignment_rhs(
+							env,
+							target,
+							target_type,
+							set.index,
+						),
+						value = { set.value |
+							value = stabilize_nested_assignment_rhs(
+								env,
+								target,
+								target_type,
+								set.value.value,
+							)
+						}
+					},
+					typ,
+					loc,
+				)
+			ListSwapExpr(swap, typ, loc):
+				ListSwapExpr(
+					{ swap |
+						list = stabilize_nested_assignment_rhs(env, target, target_type, swap.list),
+						left_index = stabilize_nested_assignment_rhs(
+							env,
+							target,
+							target_type,
+							swap.left_index,
+						),
+						right_index = stabilize_nested_assignment_rhs(
+							env,
+							target,
+							target_type,
+							swap.right_index,
+						)
+					},
+					typ,
+					loc,
+				)
+			StringByteReadExpr(read, typ, loc):
+				StringByteReadExpr(
+					{ read |
+						source = stabilize_nested_assignment_rhs(
+							env,
+							target,
+							target_type,
+							read.source,
+						),
+						index = stabilize_nested_assignment_rhs(
+							env,
+							target,
+							target_type,
+							read.index,
+						)
+					},
+					typ,
+					loc,
+				)
+			StringByteWriteExpr(write, typ, loc):
+				StringByteWriteExpr(
+					{ write |
+						target = stabilize_nested_assignment_rhs(
+							env,
+							target,
+							target_type,
+							write.target,
+						),
+						index = stabilize_nested_assignment_rhs(
+							env,
+							target,
+							target_type,
+							write.index,
+						),
+						byte = stabilize_nested_assignment_rhs(env, target, target_type, write.byte)
+					},
+					typ,
+					loc,
+				)
+			StringByteCopyExpr(copy, typ, loc):
+				StringByteCopyExpr(
+					{ copy |
+						dst = stabilize_nested_assignment_rhs(env, target, target_type, copy.dst),
+						dst_pos = stabilize_nested_assignment_rhs(
+							env,
+							target,
+							target_type,
+							copy.dst_pos,
+						),
+						src = stabilize_nested_assignment_rhs(env, target, target_type, copy.src),
+						src_pos = stabilize_nested_assignment_rhs(
+							env,
+							target,
+							target_type,
+							copy.src_pos,
+						),
+						len = stabilize_nested_assignment_rhs(env, target, target_type, copy.len)
+					},
+					typ,
+					loc,
+				)
+			StringSetLenExpr(set_len, typ, loc):
+				StringSetLenExpr(
+					{ set_len |
+						target = stabilize_nested_assignment_rhs(
+							env,
+							target,
+							target_type,
+							set_len.target,
+						),
+						len = stabilize_nested_assignment_rhs(env, target, target_type, set_len.len)
+					},
+					typ,
+					loc,
+				)
+			TensorBoxedLiteralExpr(literal, typ, loc):
+				TensorBoxedLiteralExpr(
+					{ literal |
+						elements = stabilize_nested_assignment_boxed_values(
+							env,
+							target,
+							target_type,
+							literal.elements,
+						)
+					},
+					typ,
+					loc,
+				)
+			TensorRawFillExpr(fill, typ, loc):
+				TensorRawFillExpr(
+					{ fill |
+						value = stabilize_nested_assignment_rhs(
+							env,
+							target,
+							target_type,
+							fill.value,
+						),
+						dims = stabilize_nested_assignment_exprs(
+							env,
+							target,
+							target_type,
+							fill.dims,
+						)
+					},
+					typ,
+					loc,
+				)
+			TensorRawReadExpr(read, typ, loc):
+				TensorRawReadExpr(
+					{ read |
+						index = stabilize_nested_assignment_rhs(
+							env,
+							target,
+							target_type,
+							read.index,
+						)
+					},
+					typ,
+					loc,
+				)
+			TensorRawWriteExpr(write, typ, loc):
+				TensorRawWriteExpr(
+					{ write |
+						index = stabilize_nested_assignment_rhs(
+							env,
+							target,
+							target_type,
+							write.index,
+						),
+						value = stabilize_nested_assignment_rhs(
+							env,
+							target,
+							target_type,
+							write.value,
+						)
+					},
+					typ,
+					loc,
+				)
+			TensorRawViewLetExpr(binding, body, typ, loc):
+				stabilized_body: CoreExpr = if binding.variable.name == target.name:
+					body
+				else:
+					stabilize_nested_assignment_rhs(env, target, target_type, body)
+
+				TensorRawViewLetExpr(
+					{ binding |
+						source = stabilize_nested_assignment_rhs(
+							env,
+							target,
+							target_type,
+							binding.source,
+						)
+					},
+					stabilized_body,
+					typ,
+					loc,
+				)
+			UnionConstructExpr(construct, typ, loc):
+				UnionConstructExpr(
+					{ construct |
+						args = stabilize_nested_assignment_boxed_values(
+							env,
+							target,
+							target_type,
+							construct.args,
+						)
+					},
+					typ,
+					loc,
+				)
+			DictConstructExpr(construct, typ, loc):
+				DictConstructExpr(
+					{ construct |
+						entries = stabilize_nested_assignment_dict_entries(
+							env,
+							target,
+							target_type,
+							construct.entries,
+						)
+					},
+					typ,
+					loc,
+				)
+			LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+				CoreTraverse.map_core_match_results_with_context(
+					LiteralMatchExpr(
+						stabilize_nested_assignment_rhs(env, target, target_type, scrutinee),
+						cases,
+						fallback,
+						typ,
+						loc,
+					),
+					{
+						env = env,
+						target = target,
+						target_type = target_type
+					},
+					stabilize_nested_assignment_match_result,
+				)
+			AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+				CoreTraverse.map_core_match_results_with_context(
+					AccessorLiteralMatchExpr(
+						stabilize_nested_assignment_rhs(env, target, target_type, scrutinee),
+						release_policy,
+						match_expr,
+						typ,
+						loc,
+					),
+					{
+						env = env,
+						target = target,
+						target_type = target_type
+					},
+					stabilize_nested_assignment_match_result,
+				)
+			LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+				CoreTraverse.map_core_match_results_with_context(
+					LengthMatchExpr(
+						stabilize_nested_assignment_rhs(env, target, target_type, scrutinee),
+						release_policy,
+						match_expr,
+						typ,
+						loc,
+					),
+					{
+						env = env,
+						target = target,
+						target_type = target_type
+					},
+					stabilize_nested_assignment_match_result,
+				)
+			ResourceScopeExpr(scope, typ, loc):
+				stabilized_body: CoreExpr = if scope.variable.name == target.name:
+					scope.body
+				else:
+					stabilize_nested_assignment_rhs(env, target, target_type, scope.body)
+
+				stabilized_cleanup: CoreExpr = if scope.variable.name == target.name:
+					scope.cleanup
+				else:
+					stabilize_nested_assignment_rhs(env, target, target_type, scope.cleanup)
+
+				ResourceScopeExpr(
+					{ scope |
+						acquire = stabilize_nested_assignment_rhs(
+							env,
+							target,
+							target_type,
+							scope.acquire,
+						),
+						body = stabilized_body,
+						cleanup = stabilized_cleanup
+					},
+					typ,
+					loc,
+				)
+			LetExpr(variable, is_mutable, typ, rhs, body):
+				stabilized_body: CoreExpr = if variable.name == target.name:
+					body
+				else:
+					stabilize_nested_assignment_rhs(env, target, target_type, body)
+
+				LetExpr(
+					variable,
+					is_mutable,
+					typ,
+					stabilize_nested_assignment_rhs(env, target, target_type, rhs),
+					stabilized_body,
+				)
+			BorrowLetExpr(variable, typ, rhs, body):
+				stabilized_body: CoreExpr = if variable.name == target.name:
+					body
+				else:
+					stabilize_nested_assignment_rhs(env, target, target_type, body)
+
+				BorrowLetExpr(
+					variable,
+					typ,
+					stabilize_nested_assignment_rhs(env, target, target_type, rhs),
+					stabilized_body,
+				)
+			SeqExpr(first, second):
+				SeqExpr(
+					stabilize_nested_assignment_rhs(env, target, target_type, first),
+					stabilize_nested_assignment_rhs(env, target, target_type, second),
+				)
+			IfExpr(cond, then_expr, else_expr, typ, loc):
+				IfExpr(
+					stabilize_nested_assignment_rhs(env, target, target_type, cond),
+					stabilize_nested_assignment_rhs(env, target, target_type, then_expr),
+					stabilize_nested_assignment_rhs(env, target, target_type, else_expr),
+					typ,
+					loc,
+				)
+			DupExpr(variable, value_type, retain_policy, body, typ, loc):
+				DupExpr(
+					variable,
+					value_type,
+					retain_policy,
+					stabilize_nested_assignment_rhs(env, target, target_type, body),
+					typ,
+					loc,
+				)
+			DropExpr(variable, value_type, release_policy, body, typ, loc):
+				DropExpr(
+					variable,
+					value_type,
+					release_policy,
+					stabilize_nested_assignment_rhs(env, target, target_type, body),
+					typ,
+					loc,
+				)
+			_:
+				protect_repeated_consumes(env, target, target_type, expr, True)
+
+
+private pure func rewrite_mutable_constructor_match_body(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	body: CoreConstructorMatchBody,
+	temp_index: Int,
+	skip_old_release: Bool,
+) -> MutableConstructorMatchBodyRewrite:
+	match body:
+		ConstructorMatchBodyExpr(expr):
+			result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				expr,
+				temp_index,
+				skip_old_release,
+			)
+			{
+				body = ConstructorMatchBodyExpr(result.expr),
+				next_temp = result.next_temp
+			}
+		ConstructorMatchBodyLiteral(match_expr):
+			result: MutableConstructorLiteralMatchRewrite = rewrite_mutable_constructor_literal_match(
+				env,
+				target,
+				target_type,
+				match_expr,
+				temp_index,
+				skip_old_release,
+			)
+			{
+				body = ConstructorMatchBodyLiteral(result.match_expr),
+				next_temp = result.next_temp
+			}
+		ConstructorMatchBodyLength(match_expr):
+			result: MutableConstructorLengthMatchRewrite = rewrite_mutable_constructor_length_match(
+				env,
+				target,
+				target_type,
+				match_expr,
+				temp_index,
+				skip_old_release,
+			)
+			{
+				body = ConstructorMatchBodyLength(result.match_expr),
+				next_temp = result.next_temp
+			}
+
+
+private pure func rewrite_mutable_literal_match_fallback(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	fallback: CoreLiteralMatchFallback,
+	temp_index: Int,
+	skip_old_release: Bool,
+) -> MutableLiteralMatchFallbackRewrite:
+	match fallback:
+		LiteralMatchFallbackBody(body):
+			result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				body,
+				temp_index,
+				skip_old_release,
+			)
+			{
+				fallback = LiteralMatchFallbackBody(result.expr),
+				next_temp = result.next_temp
+			}
+		LiteralMatchFallbackBindings(bindings, body):
+			if match_bindings_shadow(target.name, bindings):
+				{
+					fallback = fallback,
+					next_temp = temp_index
+				}
+			else:
+				result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+					env,
+					target,
+					target_type,
+					body,
+					temp_index,
+					skip_old_release,
+				)
+				{
+					fallback = LiteralMatchFallbackBindings(bindings, result.expr),
+					next_temp = result.next_temp
+				}
+		LiteralMatchFallbackFail:
+			{
+				fallback = LiteralMatchFallbackFail,
+				next_temp = temp_index
+			}
+
+
+private pure func rewrite_mutable_literal_match_cases(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	cases: List[CoreLiteralMatchCase],
+	temp_index: Int,
+	skip_old_release: Bool,
+) -> MutableLiteralCasesRewrite:
+	var rewritten_cases: List[CoreLiteralMatchCase] = []
+	var next_temp: Int = temp_index
+
+	for match_case in cases:
+		if match_bindings_shadow(target.name, match_case.bindings):
+			rewritten_cases = rewritten_cases.append(match_case)
+		else:
+			result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				match_case.body,
+				next_temp,
+				skip_old_release,
+			)
+			rewritten_cases = rewritten_cases.append({ match_case | body = result.expr })
+			next_temp = result.next_temp
+
+	{
+		cases = rewritten_cases,
+		next_temp = next_temp
+	}
+
+
+private pure func rewrite_mutable_constructor_literal_match(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	match_expr: CoreConstructorLiteralMatch,
+	temp_index: Int,
+	skip_old_release: Bool,
+) -> MutableConstructorLiteralMatchRewrite:
+	var rewritten_cases: List[CoreLiteralMatchCase] = []
+	var next_temp: Int = temp_index
+
+	for match_case in match_expr.cases:
+		if match_bindings_shadow(target.name, match_case.bindings):
+			rewritten_cases = rewritten_cases.append(match_case)
+		else:
+			result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				match_case.body,
+				next_temp,
+				skip_old_release,
+			)
+			rewritten_cases = rewritten_cases.append({ match_case | body = result.expr })
+			next_temp = result.next_temp
+
+	fallback_result: MutableLiteralMatchFallbackRewrite = rewrite_mutable_literal_match_fallback(
+		env,
+		target,
+		target_type,
+		match_expr.fallback,
+		next_temp,
+		skip_old_release,
+	)
+
+	{
+		match_expr = { match_expr |
+			cases = rewritten_cases,
+			fallback = fallback_result.fallback
+		},
+		next_temp = fallback_result.next_temp
+	}
+
+
+private pure func rewrite_mutable_constructor_length_branch(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	branch: CoreConstructorLengthMatchBranch,
+	temp_index: Int,
+	skip_old_release: Bool,
+) -> MutableConstructorLengthBranchRewrite:
+	if match_bindings_shadow(target.name, branch.bindings):
+		{
+			branch = branch,
+			next_temp = temp_index
+		}
+	else:
+		result: MutableConstructorMatchBodyRewrite = rewrite_mutable_constructor_match_body(
+			env,
+			target,
+			target_type,
+			branch.body,
+			temp_index,
+			skip_old_release,
+		)
+		{
+			branch = { branch | body = result.body },
+			next_temp = result.next_temp
+		}
+
+
+private pure func rewrite_mutable_constructor_length_match(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	match_expr: CoreConstructorLengthMatch,
+	temp_index: Int,
+	skip_old_release: Bool,
+) -> MutableConstructorLengthMatchRewrite:
+	var rewritten_cases: List[CoreConstructorLengthMatchCase] = []
+	var next_temp: Int = temp_index
+
+	for match_case in match_expr.cases:
+		result: MutableConstructorLengthBranchRewrite = rewrite_mutable_constructor_length_branch(
+			env,
+			target,
+			target_type,
+			match_case.branch,
+			next_temp,
+			skip_old_release,
+		)
+		rewritten_cases = rewritten_cases.append({ match_case | branch = result.branch })
+		next_temp = result.next_temp
+
+	var rewritten_geq: Option[CoreConstructorLengthMatchGeq] = None
+	var geq_temp: Int = next_temp
+
+	match match_expr.geq:
+		Some(geq):
+			result: MutableConstructorLengthBranchRewrite = rewrite_mutable_constructor_length_branch(
+				env,
+				target,
+				target_type,
+				geq.branch,
+				next_temp,
+				skip_old_release,
+			)
+			rewritten_geq = Some({ geq | branch = result.branch })
+			geq_temp = result.next_temp
+		None:
+			void
+
+	var rewritten_fallback: Option[CoreConstructorLengthMatchBranch] = None
+	var final_temp: Int = geq_temp
+
+	match match_expr.fallback:
+		Some(branch):
+			result: MutableConstructorLengthBranchRewrite = rewrite_mutable_constructor_length_branch(
+				env,
+				target,
+				target_type,
+				branch,
+				geq_temp,
+				skip_old_release,
+			)
+			rewritten_fallback = Some(result.branch)
+			final_temp = result.next_temp
+		None:
+			void
+
+	{
+		match_expr = { match_expr |
+			cases = rewritten_cases,
+			geq = rewritten_geq,
+			fallback = rewritten_fallback
+		},
+		next_temp = final_temp
+	}
+
+
+private pure func rewrite_mutable_constructor_match_fallback(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	fallback: CoreConstructorMatchFallback,
+	temp_index: Int,
+	skip_old_release: Bool,
+) -> MutableConstructorMatchFallbackRewrite:
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				body,
+				temp_index,
+				skip_old_release,
+			)
+			{
+				fallback = ConstructorMatchFallbackBody(result.expr),
+				next_temp = result.next_temp
+			}
+		ConstructorMatchFallbackBindings(bindings, body):
+			if match_bindings_shadow(target.name, bindings):
+				{
+					fallback = fallback,
+					next_temp = temp_index
+				}
+			else:
+				result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+					env,
+					target,
+					target_type,
+					body,
+					temp_index,
+					skip_old_release,
+				)
+				{
+					fallback = ConstructorMatchFallbackBindings(bindings, result.expr),
+					next_temp = result.next_temp
+				}
+		ConstructorMatchFallbackFail:
+			{
+				fallback = ConstructorMatchFallbackFail,
+				next_temp = temp_index
+			}
+
+
+private pure func rewrite_mutable_constructor_match(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	cases: List[CoreConstructorMatchCase],
+	fallback: CoreConstructorMatchFallback,
+	temp_index: Int,
+	skip_old_release: Bool,
+) -> MutableConstructorMatchRewrite:
+	var rewritten_cases: List[CoreConstructorMatchCase] = []
+	var next_temp: Int = temp_index
+
+	for match_case in cases:
+		if match_bindings_shadow(target.name, match_case.bindings):
+			rewritten_cases = rewritten_cases.append(match_case)
+		else:
+			result: MutableConstructorMatchBodyRewrite = rewrite_mutable_constructor_match_body(
+				env,
+				target,
+				target_type,
+				match_case.body,
+				next_temp,
+				skip_old_release,
+			)
+			rewritten_cases = rewritten_cases.append({ match_case | body = result.body })
+			next_temp = result.next_temp
+
+	fallback_result: MutableConstructorMatchFallbackRewrite = rewrite_mutable_constructor_match_fallback(
+		env,
+		target,
+		target_type,
+		fallback,
+		next_temp,
+		skip_old_release,
+	)
+	{
+		cases = rewritten_cases,
+		fallback = fallback_result.fallback,
+		next_temp = fallback_result.next_temp
+	}
+
+
+private pure func rewrite_mutable_bound_loop_body(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	binder: CoreLoopBinder,
+	body: CoreExpr,
+	temp_index: Int,
+	skip_old_release: Bool,
+) -> MutableAssignmentRewrite:
+	if binder.variable.name == target.name:
+		{
+			expr = body,
+			next_temp = temp_index
+		}
+	else:
+		rewrite_mutable_assignments(env, target, target_type, body, temp_index, skip_old_release)
+
+
+private pure func match_scrutinee_consumes_mutable_target(
+	env: PerceusEnv,
+	target: CoreVar,
+	scrutinee: CoreExpr,
+	release_policy: CoreReleasePolicy,
+) -> Bool:
+	if borrow_expr_aliases_target(env, target.name, scrutinee):
+		releasing_match_consumes_owner(target.name, scrutinee, release_policy)
+	else:
+		summarize_linear_ownership_uses(env, target.name, scrutinee).consumed_refs > 0
+
+
+private pure func rewrite_mutable_assignment_node(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	variable: CoreVar,
+	rhs: CoreExpr,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+	temp_index: Int,
+	skip_old_release: Bool,
+) -> MutableAssignmentRewrite:
+	rhs_with_stable_target: CoreExpr = if expr_assigns_mutable_target(target, rhs):
+		-- Nested assignments replace the slot while the surrounding RHS
+		-- is still evaluating. Preserve the slot across every other
+		-- consuming operation so each assignment sees one current owner
+		-- and the outer install can release the final nested value.
+		stabilize_nested_assignment_rhs(env, target, target_type, rhs)
+	else:
+		rhs
+
+	rhs_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+		env,
+		target,
+		target_type,
+		rhs_with_stable_target,
+		temp_index,
+		False,
+	)
+
+	if variable.name == target.name:
+		-- Recursive rewriting adds cleanup drops for assignments nested in
+		-- the RHS. The outer install must use the source expression's
+		-- ownership behavior rather than treating those synthetic drops as
+		-- consumption of the value that the nested assignment installed.
+		-- Only this install reads the summary, so an assignment to a
+		-- different slot must not pay for a walk of the stabilized RHS.
+		original_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
+			env,
+			target.name,
+			rhs_with_stable_target,
+		)
+
+		rewrite_direct_mutable_assignment_with_uses(
+			env,
+			target,
+			target_type,
+			rhs_result.expr,
+			original_uses,
+			typ,
+			loc,
+			rhs_result.next_temp,
+			skip_old_release,
+		)
+	else:
+		{
+			expr = AssignExpr(variable, rhs_result.expr, typ, loc),
+			next_temp = rhs_result.next_temp
+		}
+
+
+private pure func rewrite_mutable_assignments(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	expr: CoreExpr,
+	temp_index: Int,
+	skip_old_release: Bool,
+) -> MutableAssignmentRewrite:
+	match expr:
+		AssignExpr(variable, rhs, typ, loc):
+			if variable.name == target.name:
+				match install_mutable_assignment_in_match(target, rhs, typ, loc):
+					Some(branch_local_assignment):
+						rewrite_mutable_assignments(
+							env,
+							target,
+							target_type,
+							branch_local_assignment,
+							temp_index,
+							skip_old_release,
+						)
+					None:
+						rewrite_mutable_assignment_node(
+							env,
+							target,
+							target_type,
+							variable,
+							rhs,
+							typ,
+							loc,
+							temp_index,
+							skip_old_release,
+						)
+			else:
+				rewrite_mutable_assignment_node(
+					env,
+					target,
+					target_type,
+					variable,
+					rhs,
+					typ,
+					loc,
+					temp_index,
+					skip_old_release,
+				)
+		DebugBlockExpr(body, typ, loc):
+			body_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				body,
+				temp_index,
+				skip_old_release,
+			)
+			{
+				expr = DebugBlockExpr(body_result.expr, typ, loc),
+				next_temp = body_result.next_temp
+			}
+		BinaryExpr(op, left, right, typ, loc):
+			left_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				left,
+				temp_index,
+				skip_old_release,
+			)
+			right_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				right,
+				left_result.next_temp,
+				skip_old_release_after_expr(env, target, skip_old_release, left),
+			)
+			{
+				expr = BinaryExpr(op, left_result.expr, right_result.expr, typ, loc),
+				next_temp = right_result.next_temp
+			}
+		UnaryExpr(op, inner, typ, loc):
+			inner_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				inner,
+				temp_index,
+				skip_old_release,
+			)
+			{
+				expr = UnaryExpr(op, inner_result.expr, typ, loc),
+				next_temp = inner_result.next_temp
+			}
+		LogicalExpr(op, left, right, typ, loc):
+			left_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				left,
+				temp_index,
+				skip_old_release,
+			)
+			right_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				right,
+				left_result.next_temp,
+				skip_old_release_after_expr(env, target, skip_old_release, left),
+			)
+			{
+				expr = LogicalExpr(op, left_result.expr, right_result.expr, typ, loc),
+				next_temp = right_result.next_temp
+			}
+		CastExpr(inner, typ, loc):
+			inner_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				inner,
+				temp_index,
+				skip_old_release,
+			)
+			{
+				expr = CastExpr(inner_result.expr, typ, loc),
+				next_temp = inner_result.next_temp
+			}
+		BoxExpr(box, typ, loc):
+			value_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				box.value,
+				temp_index,
+				skip_old_release,
+			)
+			{
+				expr = BoxExpr({ box | value = value_result.expr }, typ, loc),
+				next_temp = value_result.next_temp
+			}
+		UnboxExpr(kind, inner, typ, loc):
+			inner_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				inner,
+				temp_index,
+				skip_old_release,
+			)
+			{
+				expr = UnboxExpr(kind, inner_result.expr, typ, loc),
+				next_temp = inner_result.next_temp
+			}
+		FieldExpr(owner, field, typ, loc):
+			owner_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				owner,
+				temp_index,
+				skip_old_release,
+			)
+			{
+				expr = FieldExpr(owner_result.expr, field, typ, loc),
+				next_temp = owner_result.next_temp
+			}
+		TupleFieldExpr(owner, field_index, typ, loc):
+			owner_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				owner,
+				temp_index,
+				skip_old_release,
+			)
+			{
+				expr = TupleFieldExpr(owner_result.expr, field_index, typ, loc),
+				next_temp = owner_result.next_temp
+			}
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			rhs_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				rhs,
+				temp_index,
+				False,
+			)
+			body_skips_old_release: Bool = (
+				skip_old_release
+				and not expr_assigns_mutable_target(target, rhs)
+			)
+
+			body_result: MutableAssignmentRewrite = if variable.name == target.name:
+				{
+					expr = body,
+					next_temp = rhs_result.next_temp
+				}
+			else:
+				rewrite_mutable_assignments(
+					env,
+					target,
+					target_type,
+					body,
+					rhs_result.next_temp,
+					body_skips_old_release,
+				)
+
+			{
+				expr = LetExpr(variable, is_mutable, typ, rhs_result.expr, body_result.expr),
+				next_temp = body_result.next_temp
+			}
+		BorrowLetExpr(variable, typ, rhs, body):
+			rhs_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				rhs,
+				temp_index,
+				False,
+			)
+			body_skips_old_release: Bool = (
+				skip_old_release
+				and not expr_assigns_mutable_target(target, rhs)
+			)
+
+			body_result: MutableAssignmentRewrite = if variable.name == target.name:
+				{
+					expr = body,
+					next_temp = rhs_result.next_temp
+				}
+			else:
+				rewrite_mutable_assignments(
+					env,
+					target,
+					target_type,
+					body,
+					rhs_result.next_temp,
+					body_skips_old_release,
+				)
+
+			{
+				expr = BorrowLetExpr(variable, typ, rhs_result.expr, body_result.expr),
+				next_temp = body_result.next_temp
+			}
+		SeqExpr(first, second):
+			first_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				first,
+				temp_index,
+				skip_old_release,
+			)
+			second_skips_old_release: Bool = (
+				((
+					skip_old_release
+					or summarize_linear_ownership_uses(env, target.name, first).consumed_refs > 0
+				))
+				and not expr_assigns_mutable_target(target, first)
+			)
+
+			second_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				second,
+				first_result.next_temp,
+				second_skips_old_release,
+			)
+			{
+				expr = SeqExpr(first_result.expr, second_result.expr),
+				next_temp = second_result.next_temp
+			}
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			cond_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				cond,
+				temp_index,
+				skip_old_release,
+			)
+			then_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				then_expr,
+				cond_result.next_temp,
+				skip_old_release,
+			)
+			else_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				else_expr,
+				then_result.next_temp,
+				skip_old_release,
+			)
+			{
+				expr = IfExpr(cond_result.expr, then_result.expr, else_result.expr, typ, loc),
+				next_temp = else_result.next_temp
+			}
+		WhileExpr(cond, body, typ, loc):
+			cond_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				cond,
+				temp_index,
+				skip_old_release,
+			)
+			body_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				body,
+				cond_result.next_temp,
+				skip_old_release,
+			)
+			{
+				expr = WhileExpr(cond_result.expr, body_result.expr, typ, loc),
+				next_temp = body_result.next_temp
+			}
+		ForListExpr(loop, typ, loc):
+			iterable_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				loop.iterable,
+				temp_index,
+				skip_old_release,
+			)
+			body_result: MutableAssignmentRewrite = rewrite_mutable_bound_loop_body(
+				env,
+				target,
+				target_type,
+				loop.binder,
+				loop.body,
+				iterable_result.next_temp,
+				skip_old_release,
+			)
+			{
+				expr = ForListExpr(
+					{ loop |
+						iterable = iterable_result.expr,
+						body = body_result.expr
+					},
+					typ,
+					loc,
+				),
+				next_temp = body_result.next_temp
+			}
+		ForStringExpr(loop, typ, loc):
+			iterable_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				loop.iterable,
+				temp_index,
+				skip_old_release,
+			)
+			body_result: MutableAssignmentRewrite = rewrite_mutable_bound_loop_body(
+				env,
+				target,
+				target_type,
+				loop.binder,
+				loop.body,
+				iterable_result.next_temp,
+				skip_old_release,
+			)
+			{
+				expr = ForStringExpr(
+					{ loop |
+						iterable = iterable_result.expr,
+						body = body_result.expr
+					},
+					typ,
+					loc,
+				),
+				next_temp = body_result.next_temp
+			}
+		ForDictExpr(loop, typ, loc):
+			iterable_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				loop.iterable,
+				temp_index,
+				skip_old_release,
+			)
+			body_result: MutableAssignmentRewrite = rewrite_mutable_bound_loop_body(
+				env,
+				target,
+				target_type,
+				loop.binder,
+				loop.body,
+				iterable_result.next_temp,
+				skip_old_release,
+			)
+			{
+				expr = ForDictExpr(
+					{ loop |
+						iterable = iterable_result.expr,
+						body = body_result.expr
+					},
+					typ,
+					loc,
+				),
+				next_temp = body_result.next_temp
+			}
+		ForSetExpr(loop, typ, loc):
+			iterable_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				loop.iterable,
+				temp_index,
+				skip_old_release,
+			)
+			body_result: MutableAssignmentRewrite = rewrite_mutable_bound_loop_body(
+				env,
+				target,
+				target_type,
+				loop.binder,
+				loop.body,
+				iterable_result.next_temp,
+				skip_old_release,
+			)
+			{
+				expr = ForSetExpr(
+					{ loop |
+						iterable = iterable_result.expr,
+						body = body_result.expr
+					},
+					typ,
+					loc,
+				),
+				next_temp = body_result.next_temp
+			}
+		ForStreamExpr(loop, typ, loc):
+			iterable_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				loop.iterable,
+				temp_index,
+				skip_old_release,
+			)
+			body_result: MutableAssignmentRewrite = rewrite_mutable_bound_loop_body(
+				env,
+				target,
+				target_type,
+				loop.binder,
+				loop.body,
+				iterable_result.next_temp,
+				skip_old_release,
+			)
+			{
+				expr = ForStreamExpr(
+					{ loop |
+						iterable = iterable_result.expr,
+						body = body_result.expr
+					},
+					typ,
+					loc,
+				),
+				next_temp = body_result.next_temp
+			}
+		ForResourceSourceExpr(loop, typ, loc):
+			iterable_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				loop.iterable,
+				temp_index,
+				skip_old_release,
+			)
+			body_result: MutableAssignmentRewrite = rewrite_mutable_bound_loop_body(
+				env,
+				target,
+				target_type,
+				loop.binder,
+				loop.body,
+				iterable_result.next_temp,
+				skip_old_release,
+			)
+			{
+				expr = ForResourceSourceExpr(
+					{ loop |
+						iterable = iterable_result.expr,
+						body = body_result.expr
+					},
+					typ,
+					loc,
+				),
+				next_temp = body_result.next_temp
+			}
+		ForChannelExpr(loop, typ, loc):
+			iterable_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				loop.iterable,
+				temp_index,
+				skip_old_release,
+			)
+			body_result: MutableAssignmentRewrite = rewrite_mutable_bound_loop_body(
+				env,
+				target,
+				target_type,
+				loop.binder,
+				loop.body,
+				iterable_result.next_temp,
+				skip_old_release,
+			)
+			{
+				expr = ForChannelExpr(
+					{ loop |
+						iterable = iterable_result.expr,
+						body = body_result.expr
+					},
+					typ,
+					loc,
+				),
+				next_temp = body_result.next_temp
+			}
+		ForTensorExpr(loop, typ, loc):
+			iterable_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				loop.iterable,
+				temp_index,
+				skip_old_release,
+			)
+			body_result: MutableAssignmentRewrite = rewrite_mutable_bound_loop_body(
+				env,
+				target,
+				target_type,
+				loop.binder,
+				loop.body,
+				iterable_result.next_temp,
+				skip_old_release,
+			)
+			{
+				expr = ForTensorExpr(
+					{ loop |
+						iterable = iterable_result.expr,
+						body = body_result.expr
+					},
+					typ,
+					loc,
+				),
+				next_temp = body_result.next_temp
+			}
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			start_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				start,
+				temp_index,
+				skip_old_release,
+			)
+			end_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				end_value,
+				start_result.next_temp,
+				skip_old_release,
+			)
+			body_result: MutableAssignmentRewrite = rewrite_mutable_bound_loop_body(
+				env,
+				target,
+				target_type,
+				binder,
+				body,
+				end_result.next_temp,
+				skip_old_release,
+			)
+			{
+				expr = ForRangeExpr(
+					binder,
+					start_result.expr,
+					end_result.expr,
+					body_result.expr,
+					typ,
+					loc,
+				),
+				next_temp = body_result.next_temp
+			}
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			scrutinee_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				scrutinee,
+				temp_index,
+				False,
+			)
+			branches_skip_old_release: Bool = (
+				skip_old_release
+				or match_scrutinee_consumes_mutable_target(env, target, scrutinee, NoReleasePolicy)
+			)
+
+			cases_result: MutableLiteralCasesRewrite = rewrite_mutable_literal_match_cases(
+				env,
+				target,
+				target_type,
+				cases,
+				scrutinee_result.next_temp,
+				branches_skip_old_release,
+			)
+			fallback_result: MutableLiteralMatchFallbackRewrite = rewrite_mutable_literal_match_fallback(
+				env,
+				target,
+				target_type,
+				fallback,
+				cases_result.next_temp,
+				branches_skip_old_release,
+			)
+
+			{
+				expr = LiteralMatchExpr(
+					scrutinee_result.expr,
+					cases_result.cases,
+					fallback_result.fallback,
+					typ,
+					loc,
+				),
+				next_temp = fallback_result.next_temp
+			}
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			scrutinee_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				scrutinee,
+				temp_index,
+				False,
+			)
+			branches_skip_old_release: Bool = (
+				skip_old_release
+				or match_scrutinee_consumes_mutable_target(env, target, scrutinee, release_policy)
+			)
+
+			match_result: MutableConstructorLiteralMatchRewrite = rewrite_mutable_constructor_literal_match(
+				env,
+				target,
+				target_type,
+				match_expr,
+				scrutinee_result.next_temp,
+				branches_skip_old_release,
+			)
+
+			{
+				expr = AccessorLiteralMatchExpr(
+					scrutinee_result.expr,
+					release_policy,
+					match_result.match_expr,
+					typ,
+					loc,
+				),
+				next_temp = match_result.next_temp
+			}
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			scrutinee_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				scrutinee,
+				temp_index,
+				False,
+			)
+			branches_skip_old_release: Bool = (
+				skip_old_release
+				or match_scrutinee_consumes_mutable_target(env, target, scrutinee, release_policy)
+			)
+
+			match_result: MutableConstructorLengthMatchRewrite = rewrite_mutable_constructor_length_match(
+				env,
+				target,
+				target_type,
+				match_expr,
+				scrutinee_result.next_temp,
+				branches_skip_old_release,
+			)
+
+			{
+				expr = LengthMatchExpr(
+					scrutinee_result.expr,
+					release_policy,
+					match_result.match_expr,
+					typ,
+					loc,
+				),
+				next_temp = match_result.next_temp
+			}
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			scrutinee_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				scrutinee,
+				temp_index,
+				False,
+			)
+			branches_skip_old_release: Bool = (
+				skip_old_release
+				or match_scrutinee_consumes_mutable_target(env, target, scrutinee, release_policy)
+			)
+
+			match_result: MutableConstructorMatchRewrite = rewrite_mutable_constructor_match(
+				env,
+				target,
+				target_type,
+				cases,
+				fallback,
+				scrutinee_result.next_temp,
+				branches_skip_old_release,
+			)
+			{
+				expr = ConstructorMatchExpr(
+					scrutinee_result.expr,
+					release_policy,
+					match_result.cases,
+					match_result.fallback,
+					typ,
+					loc,
+				),
+				next_temp = match_result.next_temp
+			}
+		ResourceScopeExpr(scope, typ, loc):
+			acquire_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				scope.acquire,
+				temp_index,
+				skip_old_release,
+			)
+			body_skips_old_release: Bool = skip_old_release_after_expr(
+				env,
+				target,
+				skip_old_release,
+				scope.acquire,
+			)
+
+			body_result: MutableAssignmentRewrite = if scope.variable.name == target.name:
+				{
+					expr = scope.body,
+					next_temp = acquire_result.next_temp
+				}
+			else:
+				rewrite_mutable_assignments(
+					env,
+					target,
+					target_type,
+					scope.body,
+					acquire_result.next_temp,
+					body_skips_old_release,
+				)
+
+			cleanup_skips_old_release: Bool = if scope.variable.name == target.name:
+				body_skips_old_release
+			else:
+				skip_old_release_after_expr(env, target, body_skips_old_release, scope.body)
+
+			cleanup_result: MutableAssignmentRewrite = if scope.variable.name == target.name:
+				{
+					expr = scope.cleanup,
+					next_temp = body_result.next_temp
+				}
+			else:
+				rewrite_mutable_assignments(
+					env,
+					target,
+					target_type,
+					scope.cleanup,
+					body_result.next_temp,
+					cleanup_skips_old_release,
+				)
+
+			{
+				expr = ResourceScopeExpr(
+					{ scope |
+						acquire = acquire_result.expr,
+						body = body_result.expr,
+						cleanup = cleanup_result.expr
+					},
+					typ,
+					loc,
+				),
+				next_temp = cleanup_result.next_temp
+			}
+		CallExpr(kind, callee, args, typ, loc):
+			callee_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				callee,
+				temp_index,
+				skip_old_release,
+			)
+			args_result: MutableExprListRewrite = rewrite_mutable_expr_list(
+				env,
+				target,
+				target_type,
+				args,
+				callee_result.next_temp,
+				skip_old_release_after_expr(env, target, skip_old_release, callee),
+			)
+			{
+				expr = CallExpr(kind, callee_result.expr, args_result.exprs, typ, loc),
+				next_temp = args_result.next_temp
+			}
+		TupleExpr(items, typ, loc):
+			items_result: MutableExprListRewrite = rewrite_mutable_expr_list(
+				env,
+				target,
+				target_type,
+				items,
+				temp_index,
+				skip_old_release,
+			)
+			{
+				expr = TupleExpr(items_result.exprs, typ, loc),
+				next_temp = items_result.next_temp
+			}
+		VectorExpr(items, typ, loc):
+			items_result: MutableExprListRewrite = rewrite_mutable_expr_list(
+				env,
+				target,
+				target_type,
+				items,
+				temp_index,
+				skip_old_release,
+			)
+			{
+				expr = VectorExpr(items_result.exprs, typ, loc),
+				next_temp = items_result.next_temp
+			}
+		RecordExpr(fields, typ, loc):
+			fields_result: MutableRecordFieldsRewrite = rewrite_mutable_record_fields(
+				env,
+				target,
+				target_type,
+				fields,
+				temp_index,
+				skip_old_release,
+			)
+			{
+				expr = RecordExpr(fields_result.fields, typ, loc),
+				next_temp = fields_result.next_temp
+			}
+		RecordConstructExpr(type_name, fields, typ, loc):
+			fields_result: MutableRecordFieldsRewrite = rewrite_mutable_record_fields(
+				env,
+				target,
+				target_type,
+				fields,
+				temp_index,
+				skip_old_release,
+			)
+			{
+				expr = RecordConstructExpr(type_name, fields_result.fields, typ, loc),
+				next_temp = fields_result.next_temp
+			}
+		RecordUpdateExpr(base, fields, typ, loc):
+			base_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				base,
+				temp_index,
+				skip_old_release,
+			)
+			fields_result: MutableRecordFieldsRewrite = rewrite_mutable_record_fields(
+				env,
+				target,
+				target_type,
+				fields,
+				base_result.next_temp,
+				skip_old_release_after_expr(env, target, skip_old_release, base),
+			)
+			{
+				expr = RecordUpdateExpr(base_result.expr, fields_result.fields, typ, loc),
+				next_temp = fields_result.next_temp
+			}
+		RecordReuseExpr(source, fields, typ, loc):
+			source_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				source,
+				temp_index,
+				skip_old_release,
+			)
+			fields_result: MutableRecordFieldsRewrite = rewrite_mutable_record_fields(
+				env,
+				target,
+				target_type,
+				fields,
+				source_result.next_temp,
+				skip_old_release_after_expr(env, target, skip_old_release, source),
+			)
+			{
+				expr = RecordReuseExpr(source_result.expr, fields_result.fields, typ, loc),
+				next_temp = fields_result.next_temp
+			}
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			fields_result: MutableRecordCowFieldsRewrite = rewrite_mutable_record_cow_fields(
+				env,
+				target,
+				target_type,
+				fields,
+				temp_index,
+				skip_old_release,
+			)
+			source_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				source,
+				fields_result.next_temp,
+				fields_result.skips_old_release,
+			)
+			{
+				expr = RecordCowUpdateExpr(source_result.expr, fields_result.fields, typ, loc),
+				next_temp = source_result.next_temp
+			}
+		ListConstructExpr(construct, typ, loc):
+			values_result: MutableBoxedValuesRewrite = rewrite_mutable_boxed_values(
+				env,
+				target,
+				target_type,
+				construct.elements,
+				temp_index,
+				skip_old_release,
+			)
+			{
+				expr = ListConstructExpr({ construct | elements = values_result.values }, typ, loc),
+				next_temp = values_result.next_temp
+			}
+		ListAllocExpr(alloc, typ, loc):
+			capacity_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				alloc.capacity,
+				temp_index,
+				skip_old_release,
+			)
+			{
+				expr = ListAllocExpr({ alloc | capacity = capacity_result.expr }, typ, loc),
+				next_temp = capacity_result.next_temp
+			}
+		ListGetExpr(get, typ, loc):
+			children: MutableExprListRewrite = rewrite_mutable_expr_list(
+				env,
+				target,
+				target_type,
+				[get.list, get.index],
+				temp_index,
+				skip_old_release,
+			)
+
+			match children.exprs:
+				[list, index]:
+					{
+						expr = ListGetExpr(
+							{ get |
+								list = list,
+								index = index
+							},
+							typ,
+							loc,
+						),
+						next_temp = children.next_temp
+					}
+				_:
+					{
+						expr = expr,
+						next_temp = children.next_temp
+					}
+		ListHandoffExpr(handoff, typ, loc):
+			source_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				handoff.source,
+				temp_index,
+				skip_old_release,
+			)
+			capacity_skips_old_release: Bool = skip_old_release_after_expr(
+				env,
+				target,
+				skip_old_release,
+				handoff.source,
+			)
+			capacity_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				handoff.capacity,
+				source_result.next_temp,
+				capacity_skips_old_release,
+			)
+			body_skips_old_release: Bool = skip_old_release_after_expr(
+				env,
+				target,
+				capacity_skips_old_release,
+				handoff.capacity,
+			)
+
+			body_result: MutableAssignmentRewrite = if (
+				handoff.result_var.name == target.name
+				or handoff.len_var.name == target.name
+				or handoff.out_var.name == target.name
+			):
+				{
+					expr = handoff.body,
+					next_temp = capacity_result.next_temp
+				}
+			else:
+				rewrite_mutable_assignments(
+					env,
+					target,
+					target_type,
+					handoff.body,
+					capacity_result.next_temp,
+					body_skips_old_release,
+				)
+
+			{
+				expr = ListHandoffExpr(
+					{ handoff |
+						source = source_result.expr,
+						capacity = capacity_result.expr,
+						body = body_result.expr
+					},
+					typ,
+					loc,
+				),
+				next_temp = body_result.next_temp
+			}
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			children: MutableExprListRewrite = rewrite_mutable_expr_list(
+				env,
+				target,
+				target_type,
+				[set.list, set.index, set.value.value],
+				temp_index,
+				skip_old_release,
+			)
+
+			match children.exprs:
+				[list, index, value]:
+					{
+						expr = ListHandoffSetOwnedExpr(
+							{ set |
+								list = list,
+								index = index,
+								value = { set.value | value = value }
+							},
+							typ,
+							loc,
+						),
+						next_temp = children.next_temp
+					}
+				_:
+					{
+						expr = expr,
+						next_temp = children.next_temp
+					}
+		ListHandoffSetSourceSlotExpr(slot, typ, loc):
+			children: MutableExprListRewrite = rewrite_mutable_expr_list(
+				env,
+				target,
+				target_type,
+				[slot.result, slot.out_index, slot.source, slot.source_index],
+				temp_index,
+				skip_old_release,
+			)
+
+			match children.exprs:
+				[result, out_index, source, source_index]:
+					{
+						expr = ListHandoffSetSourceSlotExpr(
+							{ slot |
+								result = result,
+								out_index = out_index,
+								source = source,
+								source_index = source_index
+							},
+							typ,
+							loc,
+						),
+						next_temp = children.next_temp
+					}
+				_:
+					{
+						expr = expr,
+						next_temp = children.next_temp
+					}
+		ListRetainExpr(retain, typ, loc):
+			children: MutableExprListRewrite = rewrite_mutable_expr_list(
+				env,
+				target,
+				target_type,
+				[retain.list, retain.value.value],
+				temp_index,
+				skip_old_release,
+			)
+
+			match children.exprs:
+				[list, value]:
+					{
+						expr = ListRetainExpr(
+							{ retain |
+								list = list,
+								value = { retain.value | value = value }
+							},
+							typ,
+							loc,
+						),
+						next_temp = children.next_temp
+					}
+				_:
+					{
+						expr = expr,
+						next_temp = children.next_temp
+					}
+		ListSetExpr(set, typ, loc):
+			children: MutableExprListRewrite = rewrite_mutable_expr_list(
+				env,
+				target,
+				target_type,
+				[set.list, set.index, set.value.value],
+				temp_index,
+				skip_old_release,
+			)
+
+			match children.exprs:
+				[list, index, value]:
+					{
+						expr = ListSetExpr(
+							{ set |
+								list = list,
+								index = index,
+								value = { set.value | value = value }
+							},
+							typ,
+							loc,
+						),
+						next_temp = children.next_temp
+					}
+				_:
+					{
+						expr = expr,
+						next_temp = children.next_temp
+					}
+		ListSwapExpr(swap, typ, loc):
+			children: MutableExprListRewrite = rewrite_mutable_expr_list(
+				env,
+				target,
+				target_type,
+				[swap.list, swap.left_index, swap.right_index],
+				temp_index,
+				skip_old_release,
+			)
+
+			match children.exprs:
+				[list, left_index, right_index]:
+					{
+						expr = ListSwapExpr(
+							{ swap |
+								list = list,
+								left_index = left_index,
+								right_index = right_index
+							},
+							typ,
+							loc,
+						),
+						next_temp = children.next_temp
+					}
+				_:
+					{
+						expr = expr,
+						next_temp = children.next_temp
+					}
+		StringByteReadExpr(read, typ, loc):
+			children: MutableExprListRewrite = rewrite_mutable_expr_list(
+				env,
+				target,
+				target_type,
+				[read.source, read.index],
+				temp_index,
+				skip_old_release,
+			)
+
+			match children.exprs:
+				[source, index]:
+					{
+						expr = StringByteReadExpr(
+							{ read |
+								source = source,
+								index = index
+							},
+							typ,
+							loc,
+						),
+						next_temp = children.next_temp
+					}
+				_:
+					{
+						expr = expr,
+						next_temp = children.next_temp
+					}
+		StringByteWriteExpr(write, typ, loc):
+			children: MutableExprListRewrite = rewrite_mutable_expr_list(
+				env,
+				target,
+				target_type,
+				[write.target, write.index, write.byte],
+				temp_index,
+				skip_old_release,
+			)
+
+			match children.exprs:
+				[write_target, index, byte]:
+					{
+						expr = StringByteWriteExpr(
+							{ write |
+								target = write_target,
+								index = index,
+								byte = byte
+							},
+							typ,
+							loc,
+						),
+						next_temp = children.next_temp
+					}
+				_:
+					{
+						expr = expr,
+						next_temp = children.next_temp
+					}
+		StringByteCopyExpr(copy, typ, loc):
+			children: MutableExprListRewrite = rewrite_mutable_expr_list(
+				env,
+				target,
+				target_type,
+				[copy.dst, copy.dst_pos, copy.src, copy.src_pos, copy.len],
+				temp_index,
+				skip_old_release,
+			)
+
+			match children.exprs:
+				[dst, dst_pos, src, src_pos, len]:
+					{
+						expr = StringByteCopyExpr(
+							{ copy |
+								dst = dst,
+								dst_pos = dst_pos,
+								src = src,
+								src_pos = src_pos,
+								len = len
+							},
+							typ,
+							loc,
+						),
+						next_temp = children.next_temp
+					}
+				_:
+					{
+						expr = expr,
+						next_temp = children.next_temp
+					}
+		StringSetLenExpr(set_len, typ, loc):
+			children: MutableExprListRewrite = rewrite_mutable_expr_list(
+				env,
+				target,
+				target_type,
+				[set_len.target, set_len.len],
+				temp_index,
+				skip_old_release,
+			)
+
+			match children.exprs:
+				[set_target, len]:
+					{
+						expr = StringSetLenExpr(
+							{ set_len |
+								target = set_target,
+								len = len
+							},
+							typ,
+							loc,
+						),
+						next_temp = children.next_temp
+					}
+				_:
+					{
+						expr = expr,
+						next_temp = children.next_temp
+					}
+		TensorBoxedLiteralExpr(literal, typ, loc):
+			values_result: MutableBoxedValuesRewrite = rewrite_mutable_boxed_values(
+				env,
+				target,
+				target_type,
+				literal.elements,
+				temp_index,
+				skip_old_release,
+			)
+			{
+				expr = TensorBoxedLiteralExpr(
+					{ literal | elements = values_result.values },
+					typ,
+					loc,
+				),
+				next_temp = values_result.next_temp
+			}
+		TensorRawFillExpr(fill, typ, loc):
+			children: MutableExprListRewrite = rewrite_mutable_expr_list(
+				env,
+				target,
+				target_type,
+				[fill.value].concat(fill.dims),
+				temp_index,
+				skip_old_release,
+			)
+
+			match children.exprs:
+				[value, ...dims]:
+					{
+						expr = TensorRawFillExpr(
+							{ fill |
+								value = value,
+								dims = dims
+							},
+							typ,
+							loc,
+						),
+						next_temp = children.next_temp
+					}
+				_:
+					{
+						expr = expr,
+						next_temp = children.next_temp
+					}
+		TensorRawReadExpr(read, typ, loc):
+			index_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				read.index,
+				temp_index,
+				skip_old_release,
+			)
+			{
+				expr = TensorRawReadExpr({ read | index = index_result.expr }, typ, loc),
+				next_temp = index_result.next_temp
+			}
+		TensorRawWriteExpr(write, typ, loc):
+			children: MutableExprListRewrite = rewrite_mutable_expr_list(
+				env,
+				target,
+				target_type,
+				[write.index, write.value],
+				temp_index,
+				skip_old_release,
+			)
+
+			match children.exprs:
+				[index, value]:
+					{
+						expr = TensorRawWriteExpr(
+							{ write |
+								index = index,
+								value = value
+							},
+							typ,
+							loc,
+						),
+						next_temp = children.next_temp
+					}
+				_:
+					{
+						expr = expr,
+						next_temp = children.next_temp
+					}
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			source_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				binding.source,
+				temp_index,
+				skip_old_release,
+			)
+
+			body_result: MutableAssignmentRewrite = if binding.variable.name == target.name:
+				{
+					expr = body,
+					next_temp = source_result.next_temp
+				}
+			else:
+				rewrite_mutable_assignments(
+					env,
+					target,
+					target_type,
+					body,
+					source_result.next_temp,
+					skip_old_release_after_expr(env, target, skip_old_release, binding.source),
+				)
+
+			{
+				expr = TensorRawViewLetExpr(
+					{ binding | source = source_result.expr },
+					body_result.expr,
+					typ,
+					loc,
+				),
+				next_temp = body_result.next_temp
+			}
+		UnionConstructExpr(construct, typ, loc):
+			values_result: MutableBoxedValuesRewrite = rewrite_mutable_boxed_values(
+				env,
+				target,
+				target_type,
+				construct.args,
+				temp_index,
+				skip_old_release,
+			)
+			{
+				expr = UnionConstructExpr({ construct | args = values_result.values }, typ, loc),
+				next_temp = values_result.next_temp
+			}
+		DictConstructExpr(construct, typ, loc):
+			entries_result: MutableDictEntriesRewrite = rewrite_mutable_dict_entries(
+				env,
+				target,
+				target_type,
+				construct.entries,
+				temp_index,
+				skip_old_release,
+			)
+			{
+				expr = DictConstructExpr(
+					{ construct | entries = entries_result.entries },
+					typ,
+					loc,
+				),
+				next_temp = entries_result.next_temp
+			}
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			body_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				body,
+				temp_index,
+				skip_old_release,
+			)
+			{
+				expr = DupExpr(variable, value_type, retain_policy, body_result.expr, typ, loc),
+				next_temp = body_result.next_temp
+			}
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			body_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				body,
+				temp_index,
+				skip_old_release,
+			)
+			{
+				expr = DropExpr(variable, value_type, release_policy, body_result.expr, typ, loc),
+				next_temp = body_result.next_temp
+			}
+		_:
+			{
+				expr = expr,
+				next_temp = temp_index
+			}
+
+
+private pure func directly_returns_var(name: String, expr: CoreExpr) -> Bool:
+	match expr:
+		VarExpr(variable, typ, loc):
+			variable.name == name
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			if variable.name == name:
+				False
+			else if directly_returns_var(name, body):
+				True
+			else:
+				match body:
+					DropExpr(dropped, value_type, release_policy, drop_body, drop_type, loc):
+						(
+							dropped.name != name
+							and directly_returns_var(variable.name, drop_body)
+							and directly_returns_var(name, rhs)
+						)
+					_:
+						False
+		BorrowLetExpr(variable, typ, rhs, body):
+			variable.name != name and directly_returns_var(name, body)
+		SeqExpr(first, second):
+			directly_returns_var(name, second)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			directly_returns_var(name, then_expr) and directly_returns_var(name, else_expr)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			directly_returns_var(name, body)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			directly_returns_var(name, body)
+		_:
+			False
+
+
+pure func rewrite_mutable_let_body(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	body: CoreExpr,
+) -> CoreExpr:
+	-- A mutable slot owns its current value until assignment replaces it or the
+	-- scope exits. Preserve that owner across outward transfers; this gives the
+	-- assignment rewriter one stable invariant instead of path-dependent moves.
+	target_param: CoreParam = {
+		name = target,
+		typ = target_type,
+		loc = SyntheticSourceLoc
+	}
+	transfer_safe_body: CoreExpr = protect_repeated_consumes(env, target, target_type, body, True)
+
+	if directly_returns_var(target.name, transfer_safe_body):
+		-- Moving the slot itself out of scope transfers its final owner. Retaining
+		-- and then dropping that same owner creates an unnecessary and fragile
+		-- handoff for later reuse/codegen passes.
+		rewrite_mutable_assignments(env, target, target_type, transfer_safe_body, 0, False).expr
+	else:
+		result_safe_body: CoreExpr = retain_borrowed_param_result(
+			env,
+			target_param,
+			transfer_safe_body,
+		)
+		rewritten_body: CoreExpr = rewrite_mutable_assignments(
+			env,
+			target,
+			target_type,
+			result_safe_body,
+			0,
+			False,
+		).expr
+
+		drop_after_body(1, target, target_type, rewritten_body)
