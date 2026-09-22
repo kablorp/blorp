@@ -26162,9 +26162,9 @@ Prototypes for the type-support functions that were already externally
 linked before this step (heap record destroy/make, union destroy/non-empty
 -variant constructors, enum to_string/vector_to_string) but never needed a
 prototype, because a single translation unit never called one before
-defining it. TU 0 owns every one of these definitions (see
-`type_support_function_definitions`); every other TU needs this prototype
-list to call them.
+defining it. These definitions are now balanced across every unit like any
+other function (see `collect_type_support_function_emissions`), so every TU
+needs this prototype list to call whichever ones land elsewhere.
 ---
 private pure func type_support_function_prototypes(
 	decls: List[CoreDecl],
@@ -26226,40 +26226,51 @@ private pure func type_support_function_prototypes(
 
 
 ---
-TU 0's definitions for the type-support functions prototyped above, built
-directly from the already-collected `C*DeclEmission` lists -- reusing step
-1's structured data rather than re-deriving or re-parsing anything.
+The type-support functions prototyped above (heap record destroy/make,
+union destroy/non-empty-variant constructors, enum to_string/
+vector_to_string), as individually weighable items rather than one fused
+string. Before this step every one of these landed unconditionally in TU 0
+regardless of `unit_count`, which made TU 0 hold the entire program's type
+-support surface on top of its normal share of `assign_translation_units`'s
+byte-balanced function bins -- for a program with hundreds of record/union
+/enum declarations that dwarfs every other unit's compile cost even though
+the LPT packer below is perfectly capable of spreading it out. Each item
+here carries a synthetic negative `def_id` (real declaration `def_id`s are
+always non-negative) so it sorts before same-bin real functions while
+staying unique and declaration-ordered among the type-support items
+themselves; the caller concatenates this list with `sections
+.function_definitions` before handing everything to `assign_translation_units`
+so this material is packed exactly like any other function body.
 ---
-private pure func type_support_function_definitions(
+private pure func collect_type_support_function_emissions(
 	heap_record_emissions: List[CHeapRecordDeclEmission],
 	union_emissions: List[CUnionDeclEmission],
 	enum_emissions: List[CEnumDeclEmission],
-) -> String:
-	var c_code: String = make_string(0)
+) -> List[CFunctionEmission]:
+	var items: List[CFunctionEmission] = []
+	var next_index: Int = 0
 
 	for emission in heap_record_emissions:
-		c_code = append_emitted_c(
-			c_code,
-			emission.functions.join(""),
-		)
+		for text in emission.functions:
+			items = items.append({def_id = next_index - 2000000000, text = text})
+			next_index += 1
 
 	for emission in union_emissions:
-		c_code = append_emitted_c(
-			c_code,
-			emission.functions.join(""),
-		)
+		for text in emission.functions:
+			items = items.append({def_id = next_index - 2000000000, text = text})
+			next_index += 1
 
 		for piece in emission.constructor_pieces:
 			if not piece.is_owner_data:
-				c_code = append_emitted_c(c_code, piece.text)
+				items = items.append({def_id = next_index - 2000000000, text = piece.text})
+				next_index += 1
 
 	for emission in enum_emissions:
-		c_code = append_emitted_c(
-			c_code,
-			emission.functions.join(""),
-		)
+		for text in emission.functions:
+			items = items.append({def_id = next_index - 2000000000, text = text})
+			next_index += 1
 
-	c_code
+	items
 
 
 ---
@@ -26538,20 +26549,23 @@ private pure func render_split_translation_units(
 	for emission in owner_data_emissions:
 		tu0_owner_data = append_emitted_c(tu0_owner_data, emission.tu0_definition)
 
-	tu0_type_functions: String = type_support_function_definitions(
+	type_support_items: List[CFunctionEmission] = collect_type_support_function_emissions(
 		heap_record_emissions,
 		union_emissions,
 		enum_emissions,
 	)
 
+	-- Type-support functions are packed by the same byte-balanced LPT bin
+	-- assignment as every other function definition, instead of all landing
+	-- unconditionally in unit 0 (see `collect_type_support_function_emissions`).
 	function_bins: List[String] = bin_function_definitions(
-		sections.function_definitions,
+		type_support_items.concat(sections.function_definitions),
 		unit_count,
 	)
 
 	header_include: String = "#include \"" + header_name + "\"\n"
 
-	tu0_prelude: String = header_include + tu0_string_literal_defs + tu0_canonical_empty_list_defs + tu0_owner_data + sections.global_decls + sections.profile_metadata + sections.global_init + tu0_type_functions
+	tu0_prelude: String = header_include + tu0_string_literal_defs + tu0_canonical_empty_list_defs + tu0_owner_data + sections.global_decls + sections.profile_metadata + sections.global_init
 
 	var bodies: List[String] = []
 	var unit_index: Int = 0

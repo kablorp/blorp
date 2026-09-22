@@ -906,8 +906,9 @@ the single-file path builds (`value_record_emissions` / `heap_record_
 emissions` / `enum_emissions` / `union_emissions` on `CEmissionSections`),
 so a field named `header` must be escaped identically on both paths: the
 typedef routed to the shared header spells the member `__blorp_field_header`,
-the make function's assignment (a type-support definition routed to TU 0)
-assigns through the same escaped name, and the raw collision (an unescaped
+the make function's assignment (a type-support definition, balanced across
+units like any other function) assigns through the same escaped name, and
+the raw collision (an unescaped
 `  long header;` member or `__rec->header =` assignment) never appears in
 the header or any body.
 ---
@@ -930,6 +931,81 @@ pure func test_split_path_escapes_runtime_reserved_field_names() -> Bool:
 			no_raw_assignment: Bool = count_occurrences_across(result.bodies, "__rec->header =") == 0
 
 			has_escaped_typedef and has_escaped_make_assignment and no_raw_field_decl and no_raw_assignment
+		Err(_):
+			False
+
+
+pure func indexed_heap_record_decl(index: Int) -> CoreHeapRecordDecl:
+	{
+		abi_type = None,
+		name = "Box" + index.to_string(),
+		type_params = [],
+		fields = [
+			{
+				name = "count",
+				typ = int_type(),
+				release_policy = NoReleasePolicy
+			},
+			{
+				name = "label",
+				typ = string_type(),
+				release_policy = ArcReleasePolicy
+			},
+		],
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func many_heap_record_decls(count: Int) -> List[CoreDecl]:
+	var decls: List[CoreDecl] = []
+	var index: Int = 0
+
+	while index < count:
+		decls = decls.append(HeapRecordDecl(indexed_heap_record_decl(index)))
+		index += 1
+
+	decls
+
+
+---
+40 distinct heap records (each with a releasable field, so each emits a
+destroy function and a make function) plus two small ordinary functions --
+almost all of this program's emitted weight is type-support text, not
+`function_definitions`.
+---
+pure func type_support_heavy_program() -> CoreProgram:
+	{
+		decls = many_heap_record_decls(40).concat([
+			FunctionDecl(trivial_int_function("alpha", 950, 1)),
+			FunctionDecl(trivial_int_function("beta", 951, 2)),
+		]),
+		foreign_includes = []
+	}
+
+
+---
+Test 13: before this step, every heap record's destroy/make functions
+landed unconditionally in TU 0 (see `collect_type_support_function_
+emissions`'s docstring), so splitting `type_support_heavy_program` across 4
+units would have put nearly all of its weight in body 0 regardless of
+`unit_count`. Now that this material is LPT-packed alongside ordinary
+functions, no body should dominate by more than the same 1.35x-of-mean
+bound `test_skewed_program_balances_within_bound` checks for ordinary
+functions.
+---
+pure func test_type_support_heavy_program_balances_across_units() -> Bool:
+	match try_emit_prepared_core_program_c_split_artifact_with_profile(
+		run_pre_dce_tail(type_support_heavy_program()),
+		FunctionProfileOff,
+		4,
+		"blorp_shared.h",
+	):
+		Ok(result):
+			mean_len: Int = mean_body_length(result.bodies)
+			longest_len: Int = max_body_length(result.bodies)
+
+			-- longest <= 1.35 * mean, in integer arithmetic: longest * 100 <= mean * 135.
+			result.bodies.length() == 4 and longest_len * 100 <= mean_len * 135
 		Err(_):
 			False
 
@@ -968,6 +1044,10 @@ tests: TestSuite = {
 		(
 			"split path escapes runtime-reserved field names",
 			test_split_path_escapes_runtime_reserved_field_names,
+		),
+		(
+			"type-support-heavy program balances across units",
+			test_type_support_heavy_program_balances_across_units,
 		),
 	]
 }
