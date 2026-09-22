@@ -403,8 +403,7 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
             / "src"
             / "compiler"
             / "stage_09_core"
-            / "perceus"
-            / "contracts.brp"
+            / "ownership_contracts.brp"
         ).read_text(encoding="utf-8")
 
         for required in (

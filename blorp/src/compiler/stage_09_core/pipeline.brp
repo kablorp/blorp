@@ -15,6 +15,7 @@ import:
 		check_late_core_invariants,
 		core_late_invariant_message,
 	match_projection as CoreMatchProjection
+	ownership_contracts as CoreOwnershipContracts
 	pass_runner:
 		CorePass,
 		CorePassControl,
@@ -119,6 +120,8 @@ STATIC_STRING_LITERALS_PASS: String = "static_string_literals"
 RECORD_UPDATE_OWNERSHIP_PASS: String = "record_update_ownership"
 
 DICT_LITERAL_OWNERSHIP_PASS: String = "dict_literal_ownership"
+
+OWNERSHIP_CONTRACTS_PASS: String = "ownership_contracts"
 
 PERCEUS_PASS: String = "perceus"
 
@@ -238,8 +241,37 @@ pure func run_dict_literal_ownership_pass(program: CoreProgram) -> CoreProgram:
 	CorePrepare.prepare_dict_literals_for_ownership(program)
 
 
-pure func run_perceus_pass(program: CoreProgram) -> CoreProgram:
-	CorePerceus.insert_drops_program(program)
+-- Resolves global value refs, builds the base `PerceusEnv`, solves the
+-- ownership contract graph to a fixpoint, and annotates every `UserCall` site
+-- with its resolved consumed-argument list -- once per program, immediately
+-- before `perceus`. Publishes the result as `CorePassState.ownership_contract_facts`
+-- so `perceus` (this span's very next pass) reads it instead of rebuilding the
+-- environment or re-solving the graph.
+pure func run_ownership_contracts_pass(
+	state: CorePassState,
+) -> Result[CorePassState, CorePassDiagnostic]:
+	resolved_program: CoreProgram = CoreResolve.resolve_global_value_refs(state.program)
+	facts: CoreOwnershipContracts.OwnershipContractFacts = CoreOwnershipContracts.infer_ownership_contracts(
+		resolved_program,
+	)
+	annotated_program: CoreProgram = CoreOwnershipContracts.annotate_ownership_contracts_program(
+		facts,
+		resolved_program,
+	)
+
+	Ok({ state |
+		program = annotated_program,
+		ownership_contract_facts = facts,
+	})
+
+
+pure func run_perceus_pass(state: CorePassState) -> Result[CorePassState, CorePassDiagnostic]:
+	Ok({ state |
+		program = CorePerceus.insert_drops_program_with_facts(
+			state.program,
+			state.ownership_contract_facts,
+		),
+	})
 
 
 pure func run_reuse_pass(program: CoreProgram) -> CoreProgram:
@@ -309,7 +341,8 @@ pure func late_core_passes() -> List[CorePass]:
 		),
 		core_program_pass(RECORD_UPDATE_OWNERSHIP_PASS, run_record_update_ownership_pass),
 		core_program_pass(DICT_LITERAL_OWNERSHIP_PASS, run_dict_literal_ownership_pass),
-		checked_late_core_pass(PERCEUS_PASS, run_perceus_pass, PerceusStage),
+		core_pass(OWNERSHIP_CONTRACTS_PASS, run_ownership_contracts_pass),
+		checked_stateful_late_core_pass(PERCEUS_PASS, run_perceus_pass, PerceusStage),
 		checked_late_core_pass(REUSE_PASS, run_reuse_pass, ReuseStage),
 		checked_stateful_late_core_pass(CLOSURE_PASS, run_closure_pass, ClosureStage),
 		core_program_pass(RESOURCE_MANAGEMENT_PASS, run_resource_management_pass),

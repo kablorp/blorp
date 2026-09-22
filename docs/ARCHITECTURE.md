@@ -293,6 +293,7 @@ lower + ffi_boundary + list_layout
   -> consume_specialize
   -> static_string_literals
   -> record-update ownership lowering + dictionary ownership preparation
+  -> ownership_contracts
   -> perceus
   -> reuse
   -> closure
@@ -317,18 +318,30 @@ dictionary literals so every transferred entry is explicit. These operations
 are not emitter cleanup and must not be reordered or omitted from ownership
 analysis.
 
+Contract inference is its own Core pass, `ownership_contracts`
+(`stage_09_core/ownership_contracts.brp`), that runs immediately before
+Perceus: it resolves global value refs, builds the base `PerceusEnv`, builds
+and solves the reverse-parameter-flow graph over user calls
+(`build_ownership_contract_graph`, `solve_user_call_contracts`,
+`infer_user_call_contracts`), and annotates every `UserCall` site with its
+resolved consumed-argument list (`annotate_ownership_contracts_program`). It
+publishes the result as `OwnershipContractFacts` on `CorePassState`.
+
 Perceus (`stage_09_core/perceus.brp` and `stage_09_core/perceus/`) is split by
-responsibility, following the `stage_06_typecheck` subdirectory convention. In
-pipeline order: `perceus/work_counters.brp` (the `--debug`-only work-counter
-markers every other module calls into; no Perceus dependencies of its own),
-`perceus/env.brp` (`PerceusEnv`, `build_env`, the callable/user-call-contract
-tables, and the managed-type/contract queries such as `is_managed_type` and
+responsibility, following the `stage_06_typecheck` subdirectory convention.
+`insert_drops_program_with_facts` reads `OwnershipContractFacts.env` from
+`CorePassState` rather than building the environment or solving the contract
+graph itself, so both run exactly once per program; `insert_drops_program`
+stays as a self-contained entry point (it runs `ownership_contracts`'s own
+steps first) for tests, the work profiler, and the benchmark backend bridge,
+none of which go through `CorePassState`. In pipeline order:
+`perceus/work_counters.brp` (the `--debug`-only work-counter markers every
+other module calls into; no Perceus dependencies of its own), `perceus/env.brp`
+(`PerceusEnv`, `build_env`, the callable/user-call-contract tables, and the
+managed-type/contract queries such as `is_managed_type` and
 `contract_for_call`), `perceus/uses.brp` (`OwnershipUseSummary` and the
-summarize_*/count_uses family every later phase queries),
-`perceus/contracts.brp` (the reverse-parameter-flow graph and its
-build/solve/annotate path: `build_ownership_contract_graph`,
-`solve_user_call_contracts`, `infer_user_call_contracts`,
-`annotate_user_call_contracts`), `perceus/balance.brp` (branch and
+summarize_*/count_uses family every later phase queries), `perceus/balance.brp`
+(branch and
 compiled-match ownership balancing), `perceus/mutable.brp` (mutable-local
 reassignment rewriting), `perceus/protect.brp` (repeated-context protection),
 `perceus/borrowed.brp` (borrowed-owner catalog normalization for calls,
@@ -345,11 +358,12 @@ through several shared result types (`PerceusInsertedExpr`,
 caller/callee pair that both cross a file boundary and call back into each
 other, so no split of that cluster compiles. `perceus.brp` itself is now just
 the top-level per-declaration pipeline: `rewrite_decl`, `rewrite_function`,
-`rewrite_global`, and the entry point `insert_drops_program`. A few names are
-still mutually imported between sibling `perceus/` modules (e.g.
-`assignment_rhs_returns_alias`, imported back from `perceus/uses.brp` and
-`perceus/contracts.brp` into `perceus/mutable.brp`) because they are shared
-across phase boundaries that do not reduce to a strict dependency order;
+`rewrite_global`, and the entry points `insert_drops_program_with_facts` and
+`insert_drops_program`. A few names are still mutually imported between
+sibling `perceus/` modules (e.g. `assignment_rhs_returns_alias`, imported back
+from `perceus/uses.brp` and `ownership_contracts.brp` into `perceus/mutable.brp`)
+because they are shared across phase boundaries that do not reduce to a strict
+dependency order;
 Blorp's module resolution allows this since imports name symbols rather than
 establishing a compilation order.
 

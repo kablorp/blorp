@@ -1,17 +1,24 @@
--- The per-call ownership contract solver: builds the reverse-parameter-flow
+-- The `ownership_contracts` Core pass: builds the reverse-parameter-flow
 -- graph over user calls (build_ownership_contract_graph), solves it to a
 -- fixpoint (solve_user_call_contracts), and annotates each call site with its
--- resolved contract (infer_user_call_contracts, annotate_user_call_contracts).
+-- resolved contract (infer_user_call_contracts, annotate_ownership_contracts_program).
 --
--- Runs once per program, after build_env and before any per-function
--- rewriting (see insert_drops_program's pipeline comment). Depends on
--- perceus/env for the callable index and user_call_contract_table it fills
--- in, and on perceus/uses for the linear-ownership summaries the graph
--- traversal consults.
+-- Runs once per program, immediately before `perceus` in the late-Core pass
+-- list (see `pipeline.run_ownership_contracts_pass`), and publishes
+-- `OwnershipContractFacts` on `CorePassState` for `perceus` to consume. This
+-- module owns the whole-program orchestration that used to live at the top of
+-- `insert_drops_program`: resolving global value refs, building the base
+-- `PerceusEnv`, solving the contract graph, and annotating every `UserCall`
+-- site with its resolved consumed-argument list. Perceus no longer builds its
+-- own copy of this environment or re-solves the graph; it reads
+-- `OwnershipContractFacts.env` instead, so `build_env` and the solver each run
+-- exactly once per program. Depends on perceus/env for the callable index and
+-- user_call_contract_table it fills in, and on perceus/uses for the
+-- linear-ownership summaries the graph traversal consults.
 import:
-	../closure as CoreClosure
-	../dce as CoreDce
-	../ir:
+	closure as CoreClosure
+	dce as CoreDce
+	ir:
 		CoreAccessor(ListSpreadAccessor, RootAccessor),
 		CoreBinaryOp(EqualOp, NotEqualOp),
 		CoreBoxKind(PointerBox),
@@ -137,6 +144,7 @@ import:
 		),
 		CoreFunction,
 		CoreFunctionKind(ClosureBodyFunction),
+		CoreGlobal,
 		CoreListHandoffMode(BorrowFreshHandoff),
 		CoreListSet,
 		CoreLiteral(StringLiteral),
@@ -193,7 +201,7 @@ import:
 		core_expr_type,
 		core_var_equal,
 		core_vars_have_same_definition,
-	../ownership:
+	ownership:
 		OwnershipArgMode(BorrowArg, TransferArg),
 		OwnershipCallContract,
 		OwnershipResultMode(
@@ -208,7 +216,7 @@ import:
 		arg_preserves_caller,
 		builtin_contract,
 		intrinsic_contract,
-	env:
+	perceus/env:
 		OwnershipCallableContractSource(ExplicitCallSiteContract, FixedCallableContract, InferredCallableContract),
 		OwnershipCallableId,
 		PerceusEnv,
@@ -219,9 +227,10 @@ import:
 		lookup_direct_user_call_contract,
 		lookup_ownership_callable_id,
 		lookup_return_type_constructor_call_contract,
+		perceus_env_for_managed_types,
 		user_call_contract_from_consumed_args,
 		user_call_contract_table,
-	uses:
+	perceus/uses:
 		CONSUME_OWNERSHIP_USE,
 		NO_OWNERSHIP_USES,
 		OwnershipUseSummary,
@@ -236,7 +245,7 @@ import:
 		match_bindings_shadow,
 		max_int,
 		summarize_linear_ownership_uses,
-	work_counters:
+	perceus/work_counters:
 		perceus_work_contract_collection_expression_visits,
 		perceus_work_contract_collection_task_pushes,
 		perceus_work_contract_direct_parameter_inserts,
@@ -253,13 +262,13 @@ import:
 		perceus_work_contract_solver_frontier_callable_visits,
 		perceus_work_contract_solver_parameter_marks,
 		perceus_work_contract_solver_wave_iterations,
-	results_and_loops:
+	perceus/results_and_loops:
 		binary_operands_are_borrowed,
-	mutable:
+	perceus/mutable:
 		assignment_rhs_returns_alias,
-	../resolve as CoreResolve
-	../traverse as CoreTraverse
-	../type_policy as CoreTypePolicy
+	resolve as CoreResolve
+	traverse as CoreTraverse
+	type_policy as CoreTypePolicy
 
 
 record ParameterFlow {
@@ -3381,3 +3390,79 @@ pure func annotate_user_call_contracts(env: PerceusEnv, expr: CoreExpr) -> CoreE
 			)
 		_:
 			rewritten
+
+
+---
+The published result of the `ownership_contracts` Core pass: the `PerceusEnv`
+`build_env` and the solver produced, with `user_call_contracts` already
+solved to a fixpoint. `perceus` reads `env` directly instead of calling
+`build_env` or `infer_user_call_contracts` itself, so both run exactly once
+per program. `late_invariants` and `match_projection` do not read this record:
+they each run at pipeline points where the call-site contract table would
+still be empty (`match_projection` runs before this pass even exists in the
+pipeline; `late_invariants`'s only `contract_for_call` use special-cases
+`UserCall` before it would consult the table), so both keep building their own
+`PerceusEnv` from a bare `CoreProgram` for the unrelated managed-type and
+constructor-contract queries they still need.
+---
+record OwnershipContractFacts {
+	env: PerceusEnv
+}
+
+
+-- The `CorePassState.ownership_contract_facts` default before the
+-- `ownership_contracts` pass has run (early Core, and any late-Core span that
+-- starts before it). Nothing reads it before that pass sets the real value.
+pure func empty_ownership_contract_facts() -> OwnershipContractFacts:
+	{ env = perceus_env_for_managed_types([]) }
+
+
+pure func infer_ownership_contracts(program: CoreProgram) -> OwnershipContractFacts:
+	{ env = infer_user_call_contracts(program, build_env(program)) }
+
+
+private pure func annotate_ownership_contracts_function(
+	env: PerceusEnv,
+	func_info: CoreFunction,
+) -> CoreFunction:
+	match func_info.body:
+		Some(body):
+			{ func_info | body = Some(annotate_user_call_contracts(env, body)) }
+		None:
+			func_info
+
+
+private pure func annotate_ownership_contracts_global(
+	env: PerceusEnv,
+	global: CoreGlobal,
+) -> CoreGlobal:
+	{ global | init = annotate_user_call_contracts(env, global.init) }
+
+
+private pure func annotate_ownership_contracts_decl(env: PerceusEnv, decl: CoreDecl) -> CoreDecl:
+	match decl:
+		FunctionDecl(func_info):
+			FunctionDecl(annotate_ownership_contracts_function(env, func_info))
+		GlobalDecl(global):
+			GlobalDecl(annotate_ownership_contracts_global(env, global))
+		_:
+			decl
+
+
+---
+Rewrites every `UserCall` site in `program` to carry its resolved
+consumed-argument list, using `facts.env`. Runs once per program immediately
+after `infer_ownership_contracts` (see `pipeline.run_ownership_contracts_pass`);
+`perceus`'s own per-declaration rewrite reads the already-annotated call sites
+instead of annotating them itself, since annotation only consults
+`facts.env` (the callable index, the solved contract table, and the
+constructor-contract tables `build_env` already filled in) rather than any
+Perceus-internal walking state.
+---
+pure func annotate_ownership_contracts_program(
+	facts: OwnershipContractFacts,
+	program: CoreProgram,
+) -> CoreProgram:
+	{ program |
+		decls = program.decls.map(func(decl): annotate_ownership_contracts_decl(facts.env, decl))
+	}

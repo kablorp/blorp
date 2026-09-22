@@ -1,10 +1,15 @@
 -- Perceus-style explicit reference-count insertion for Core JSON.
 --
--- The port owns contract inference, branch and compiled-match balancing,
--- repeated-context protection, mutable reassignment, borrowed return and
--- aggregate retention, consumed-parameter balancing, and recursive final-drop
--- insertion. Production compilation enters Blorp after Core DCE and runs this
--- pass before reuse, closure conversion, resource lowering, and C emission.
+-- The port owns branch and compiled-match balancing, repeated-context
+-- protection, mutable reassignment, borrowed return and aggregate retention,
+-- consumed-parameter balancing, and recursive final-drop insertion. Contract
+-- inference (the reverse-parameter-flow graph, its solver, and call-site
+-- annotation) is its own `ownership_contracts` Core pass that runs
+-- immediately before this one and publishes `OwnershipContractFacts` on
+-- `CorePassState`; `insert_drops_program` reads `facts.env` rather than
+-- building the environment or solving the graph itself. Production
+-- compilation enters Blorp after Core DCE and runs this pass before reuse,
+-- closure conversion, resource lowering, and C emission.
 import:
 	closure as CoreClosure
 	dce as CoreDce
@@ -213,7 +218,6 @@ import:
 		PerceusEnv,
 		PerceusGlobal,
 		PerceusGlobalLookup(CollidingPerceusGlobals, UniquePerceusGlobal),
-		build_env,
 		callable_consumed_args,
 		contract_for_call,
 		is_managed_type,
@@ -227,10 +231,7 @@ import:
 		user_call_contract_from_consumed_args,
 		user_call_contract_table,
 		uses_branch_aware_balance,
-	perceus/contracts:
-		annotate_user_call_contracts,
-		infer_user_call_contracts,
-		int_list_contains,
+	ownership_contracts as CoreOwnershipContracts: OwnershipContractFacts
 	perceus/balance:
 		balance_branch_body,
 		balance_let_body_legacy,
@@ -494,7 +495,7 @@ private pure func rewrite_function(env: PerceusEnv, func_info: CoreFunction) -> 
 			contract_body: CoreExpr = balance_short_circuit_operands(
 				env,
 				params,
-				annotate_user_call_contracts(env, body),
+				body,
 			)
 
 			consumed_params: List[Int] = match lookup_ownership_callable_id(
@@ -597,7 +598,6 @@ private pure func rewrite_global(env: PerceusEnv, global: CoreGlobal) -> CoreGlo
 	is_private: Bool = global.is_private
 	def_id: Int = global.def_id
 	loc: CoreSourceLoc = global.loc
-	contract_init: CoreExpr = annotate_user_call_contracts(env, init)
 	global_value: CoreParam = {
 		name = { name | def_id = Some(def_id) },
 		typ = typ,
@@ -606,14 +606,14 @@ private pure func rewrite_global(env: PerceusEnv, global: CoreGlobal) -> CoreGlo
 	global_entries: List[BorrowedOwnerEntry] = referenced_global_owner_entries(
 		env,
 		[global_value],
-		contract_init,
+		init,
 		GlobalInitializerOwnerRegion,
 	)
 	owned_init: CoreExpr = normalize_global_initializer_owner_entries(
 		env,
 		global_entries,
 		typ,
-		contract_init,
+		init,
 	)
 	rewritten_init: CoreExpr = insert_drops_expr(env, owned_init)
 
@@ -647,13 +647,21 @@ private pure func rewrite_decl(env: PerceusEnv, decl: CoreDecl) -> CoreDecl:
 			decl
 
 
-pure func insert_drops_program(program: CoreProgram) -> CoreProgram:
-	resolved_program: CoreProgram = CoreResolve.resolve_global_value_refs(program)
-	foreign_includes: List[String] = resolved_program.foreign_includes
-	env: PerceusEnv = infer_user_call_contracts(resolved_program, build_env(resolved_program))
+-- `program` has already been through the `ownership_contracts` pass: global
+-- value refs are resolved and every `UserCall` site carries its resolved
+-- consumed-argument list. `facts.env` is the same `PerceusEnv` that pass built
+-- and solved, so this reads it rather than calling `build_env` or
+-- `infer_user_call_contracts` again. This is the entry point production
+-- compiles use (`pipeline.run_perceus_pass`).
+pure func insert_drops_program_with_facts(
+	program: CoreProgram,
+	facts: OwnershipContractFacts,
+) -> CoreProgram:
+	foreign_includes: List[String] = program.foreign_includes
+	env: PerceusEnv = facts.env
 	var decls: List[CoreDecl] = []
 
-	for decl in resolved_program.decls:
+	for decl in program.decls:
 		decls = decls.append(rewrite_decl(env, decl))
 
 	perceus_engine_metrics_report()
@@ -662,3 +670,22 @@ pure func insert_drops_program(program: CoreProgram) -> CoreProgram:
 		decls = decls,
 		foreign_includes = foreign_includes
 	}
+
+
+-- Self-contained entry point for callers that only have a bare `CoreProgram`:
+-- tests, the work profiler, and the benchmark backend bridge, none of which
+-- run the `ownership_contracts` pass first. Resolves global value refs,
+-- builds the environment, solves the contract graph, and annotates call
+-- sites itself before doing exactly what `insert_drops_program_with_facts`
+-- does. Production compiles never take this path; they call
+-- `insert_drops_program_with_facts` with the already-published facts instead,
+-- so `build_env` and the solver each run once per program rather than twice.
+pure func insert_drops_program(program: CoreProgram) -> CoreProgram:
+	resolved_program: CoreProgram = CoreResolve.resolve_global_value_refs(program)
+	facts: OwnershipContractFacts = CoreOwnershipContracts.infer_ownership_contracts(resolved_program)
+	annotated_program: CoreProgram = CoreOwnershipContracts.annotate_ownership_contracts_program(
+		facts,
+		resolved_program,
+	)
+
+	insert_drops_program_with_facts(annotated_program, facts)
