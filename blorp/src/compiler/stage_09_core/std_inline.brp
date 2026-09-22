@@ -104,7 +104,7 @@ import:
 		CoreType,
 		CoreVar,
 		core_var_equal,
-	traverse: immediate_core_expr_children, map_core_expr_children
+	traverse: CoreMapState, immediate_core_expr_children, map_core_expr_children, map_core_expr_children_with_state
 
 
 private enum StdInlineArgBinding:
@@ -164,26 +164,21 @@ private record StdInlineExprResult {
 }
 
 
+-- `targets` never changes across a traversal; bundling it with the counter
+-- that does (`next_id`) lets `rewrite_expr_state` thread one `S` through
+-- `map_core_expr_children_with_state` instead of building a closure per
+-- visit to smuggle `targets` in.
+private record StdInlineRewriteState {
+	targets: StdInlineTargets,
+	next_id: Int
+}
+
+
 private record StdInlineExprsResult {
 	next_id: Int,
 	exprs: List[CoreExpr],
 	changed: Bool
 }
-
-
-private union StdInlineLogicalFrame:
-	StdInlineLogicalVisitRightFrame(CoreLogicalOp, CoreExpr, CoreType, CoreSourceLoc)
-	StdInlineLogicalRebuildParentFrame(CoreLogicalOp, StdInlineExprResult, CoreType, CoreSourceLoc)
-
-
-private union StdInlineLogicalFrameStack:
-	StdInlineLogicalNoFrame
-	StdInlineLogicalMoreFrames(StdInlineLogicalFrame, StdInlineLogicalFrameStack)
-
-
-private union StdInlineLogicalAction:
-	StdInlineLogicalVisitExpr(CoreExpr, Int)
-	StdInlineLogicalRebuildExpr(StdInlineExprResult)
 
 
 private record StdInlineBoxedValuesResult {
@@ -216,51 +211,9 @@ private record StdInlineOptionalExprResult {
 }
 
 
-private record StdInlineConcurrentBindingsResult {
-	next_id: Int,
-	bindings: List[CorePreClosureConcurrentBinding]
-}
-
-
 private record StdInlineSelectArmsResult {
 	next_id: Int,
 	arms: List[CoreSelectArm]
-}
-
-
-private record StdInlineConstructorBodyResult {
-	next_id: Int,
-	body: CoreConstructorMatchBody
-}
-
-
-private record StdInlineConstructorCasesResult {
-	next_id: Int,
-	cases: List[CoreConstructorMatchCase]
-}
-
-
-private record StdInlineConstructorFallbackResult {
-	next_id: Int,
-	fallback: CoreConstructorMatchFallback
-}
-
-
-private record StdInlineLiteralCasesResult {
-	next_id: Int,
-	cases: List[CoreLiteralMatchCase]
-}
-
-
-private record StdInlineLiteralFallbackResult {
-	next_id: Int,
-	fallback: CoreLiteralMatchFallback
-}
-
-
-private record StdInlineLengthBranchResult {
-	next_id: Int,
-	branch: CoreConstructorLengthMatchBranch
 }
 
 
@@ -484,61 +437,39 @@ private pure func rename_binder(
 		].concat(renames), fresh[1])
 
 
-private pure func rewrite_exprs(
-	targets: StdInlineTargets,
-	next_id: Int,
-	exprs: List[CoreExpr],
-) -> StdInlineExprsResult:
-	var current_id: Int = next_id
-	var rewritten: List[CoreExpr] = exprs
-	var changed: Bool = False
-	var index: Int = 0
-
-	for expr in exprs:
-		result: StdInlineExprResult = rewrite_expr(targets, current_id, expr)
-		current_id = result.next_id
-
-		if changed:
-			rewritten = rewritten.append(result.expr)
-		else if not same_core_expr(result.expr, expr):
-			rewritten = exprs
-				.take(index)
-				.append(result.expr)
-			changed = True
-
-		index += 1
-
-	{
-		next_id = current_id,
-		exprs = rewritten,
-		changed = changed
-	}
-
-
--- Binary expressions commonly form deep left-associated spines. Recurse
--- through them directly so each node avoids both the exhaustive rewrite_expr
--- frame and a temporary two-element List allocation. Logical chains use the
--- explicit frame machine below.
-private pure func rewrite_binary_spine(
-	targets: StdInlineTargets,
-	next_id: Int,
+-- Binary expressions can form deep left-associated spines. `LogicalExpr`
+-- gets an iterative walker inside `map_core_expr_children_with_state`
+-- itself, but the operator family it shares with `BinaryExpr` recurses
+-- plainly, so this keeps the recursive edges in one small self-recursive
+-- helper instead of re-entering the general dispatcher, whose per-level
+-- frame is sized for every node kind in that family at once.
+private pure func rewrite_binary_spine_state(
+	state: StdInlineRewriteState,
 	expr: CoreExpr,
-) -> StdInlineExprResult:
+) -> CoreMapState[StdInlineRewriteState, CoreExpr]:
 	match expr:
 		BinaryExpr(op, left, right, typ, loc):
-			left_result: StdInlineExprResult = rewrite_binary_spine(targets, next_id, left)
-			right_result: StdInlineExprResult = rewrite_binary_spine(
-				targets,
-				left_result.next_id,
+			left_result: CoreMapState[StdInlineRewriteState, CoreExpr] = rewrite_binary_spine_state(
+				state,
+				left,
+			)
+			right_result: CoreMapState[StdInlineRewriteState, CoreExpr] = rewrite_binary_spine_state(
+				left_result.state,
 				right,
 			)
-			{
-				next_id = right_result.next_id,
-				expr = BinaryExpr(op, left_result.expr, right_result.expr, typ, loc)
-			}
-		_:
-			rewrite_expr(targets, next_id, expr)
 
+			if same_core_expr(left_result.value, left) and same_core_expr(right_result.value, right):
+				{
+					state = right_result.state,
+					value = expr
+				}
+			else:
+				{
+					state = right_result.state,
+					value = BinaryExpr(op, left_result.value, right_result.value, typ, loc)
+				}
+		_:
+			rewrite_expr_state(state, expr)
 
 private pure func clone_exprs(
 	next_id: Int,
@@ -590,25 +521,6 @@ private pure func clone_boxed_values(
 	}
 
 
-private pure func rewrite_boxed_values(
-	targets: StdInlineTargets,
-	next_id: Int,
-	values: List[CoreBoxedStorageValue],
-) -> StdInlineBoxedValuesResult:
-	var current_id: Int = next_id
-	var rewritten: List[CoreBoxedStorageValue] = []
-
-	for value in values:
-		result: StdInlineExprResult = rewrite_expr(targets, current_id, value.value)
-		current_id = result.next_id
-		rewritten = rewritten.append({ value | value = result.expr })
-
-	{
-		next_id = current_id,
-		values = rewritten
-	}
-
-
 private pure func clone_dict_entries(
 	next_id: Int,
 	renames: List[StdInlineRename],
@@ -640,37 +552,6 @@ private pure func clone_dict_entries(
 	}
 
 
-private pure func rewrite_dict_entries(
-	targets: StdInlineTargets,
-	next_id: Int,
-	entries: List[CoreDictLiteralEntry],
-) -> StdInlineDictEntriesResult:
-	var current_id: Int = next_id
-	var rewritten: List[CoreDictLiteralEntry] = []
-
-	for entry in entries:
-		children: StdInlineExprsResult = rewrite_exprs(
-			targets,
-			current_id,
-			[entry.key, entry.value],
-		)
-		current_id = children.next_id
-
-		match children.exprs:
-			[key, value]:
-				rewritten = rewritten.append({ entry |
-						key = key,
-						value = value
-					})
-			_:
-				rewritten = rewritten.append(entry)
-
-	{
-		next_id = current_id,
-		entries = rewritten
-	}
-
-
 private pure func clone_record_fields(
 	next_id: Int,
 	renames: List[StdInlineRename],
@@ -687,25 +568,6 @@ private pure func clone_record_fields(
 	{
 		next_id = current_id,
 		fields = cloned
-	}
-
-
-private pure func rewrite_record_fields(
-	targets: StdInlineTargets,
-	next_id: Int,
-	fields: List[CoreRecordFieldValue],
-) -> StdInlineRecordFieldsResult:
-	var current_id: Int = next_id
-	var rewritten: List[CoreRecordFieldValue] = []
-
-	for field in fields:
-		result: StdInlineExprResult = rewrite_expr(targets, current_id, field.value)
-		current_id = result.next_id
-		rewritten = rewritten.append({ field | value = result.expr })
-
-	{
-		next_id = current_id,
-		fields = rewritten
 	}
 
 
@@ -732,29 +594,6 @@ private pure func clone_record_cow_fields(
 	}
 
 
-private pure func rewrite_record_cow_fields(
-	targets: StdInlineTargets,
-	next_id: Int,
-	fields: List[CoreRecordCowField],
-) -> StdInlineRecordCowFieldsResult:
-	var current_id: Int = next_id
-	var rewritten: List[CoreRecordCowField] = []
-
-	for field in fields:
-		result: StdInlineOptionalExprResult = rewrite_optional_expr(
-			targets,
-			current_id,
-			field.replacement,
-		)
-		current_id = result.next_id
-		rewritten = rewritten.append({ field | replacement = result.expr })
-
-	{
-		next_id = current_id,
-		fields = rewritten
-	}
-
-
 private pure func clone_optional_expr(
 	next_id: Int,
 	renames: List[StdInlineRename],
@@ -772,44 +611,6 @@ private pure func clone_optional_expr(
 				next_id = next_id,
 				expr = None
 			}
-
-
-private pure func rewrite_optional_expr(
-	targets: StdInlineTargets,
-	next_id: Int,
-	value: Option[CoreExpr],
-) -> StdInlineOptionalExprResult:
-	match value:
-		Some(expr):
-			result: StdInlineExprResult = rewrite_expr(targets, next_id, expr)
-			{
-				next_id = result.next_id,
-				expr = Some(result.expr)
-			}
-		None:
-			{
-				next_id = next_id,
-				expr = None
-			}
-
-
-private pure func rewrite_concurrent_bindings(
-	targets: StdInlineTargets,
-	next_id: Int,
-	bindings: List[CorePreClosureConcurrentBinding],
-) -> StdInlineConcurrentBindingsResult:
-	var current_id: Int = next_id
-	var rewritten: List[CorePreClosureConcurrentBinding] = []
-
-	for binding in bindings:
-		result: StdInlineExprResult = rewrite_expr(targets, current_id, binding.rhs)
-		current_id = result.next_id
-		rewritten = rewritten.append({ binding | rhs = result.expr })
-
-	{
-		next_id = current_id,
-		bindings = rewritten
-	}
 
 
 private pure func clone_select_arms(
@@ -875,256 +676,6 @@ private pure func clone_select_arms(
 		next_id = current_id,
 		arms = cloned
 	}
-
-
-private pure func rewrite_select_arms(
-	targets: StdInlineTargets,
-	next_id: Int,
-	arms: List[CoreSelectArm],
-) -> StdInlineSelectArmsResult:
-	var current_id: Int = next_id
-	var rewritten: List[CoreSelectArm] = []
-
-	for arm in arms:
-		kind_expr: CoreExpr = match arm.kind:
-			SelectRecvArm(recv):
-				recv.channel
-			SelectSealedArm(channel):
-				channel
-			SelectAfterArm(timeout):
-				timeout
-
-		children: StdInlineExprsResult = rewrite_exprs(
-			targets,
-			current_id,
-			[kind_expr, arm.body],
-		)
-		current_id = children.next_id
-
-		match children.exprs:
-			[rewritten_kind_expr, rewritten_body]:
-				rewritten_kind: CoreSelectArmKind = match arm.kind:
-					SelectRecvArm(recv):
-						SelectRecvArm({ recv | channel = rewritten_kind_expr })
-					SelectSealedArm(_):
-						SelectSealedArm(rewritten_kind_expr)
-					SelectAfterArm(_):
-						SelectAfterArm(rewritten_kind_expr)
-
-				rewritten = rewritten.append({ arm |
-						kind = rewritten_kind,
-						body = rewritten_body
-					})
-			_:
-				rewritten = rewritten.append(arm)
-
-	{
-		next_id = current_id,
-		arms = rewritten
-	}
-
-
-private pure func rewrite_literal_cases(
-	targets: StdInlineTargets,
-	next_id: Int,
-	cases: List[CoreLiteralMatchCase],
-) -> StdInlineLiteralCasesResult:
-	var current_id: Int = next_id
-	var rewritten: List[CoreLiteralMatchCase] = []
-
-	for match_case in cases:
-		body: StdInlineExprResult = rewrite_expr(targets, current_id, match_case.body)
-		current_id = body.next_id
-		rewritten = rewritten.append({ match_case | body = body.expr })
-
-	{
-		next_id = current_id,
-		cases = rewritten
-	}
-
-
-private pure func rewrite_literal_fallback(
-	targets: StdInlineTargets,
-	next_id: Int,
-	fallback: CoreLiteralMatchFallback,
-) -> StdInlineLiteralFallbackResult:
-	match fallback:
-		LiteralMatchFallbackBody(body):
-			result: StdInlineExprResult = rewrite_expr(targets, next_id, body)
-			{
-				next_id = result.next_id,
-				fallback = LiteralMatchFallbackBody(result.expr)
-			}
-		LiteralMatchFallbackBindings(bindings, body):
-			result: StdInlineExprResult = rewrite_expr(targets, next_id, body)
-			{
-				next_id = result.next_id,
-				fallback = LiteralMatchFallbackBindings(bindings, result.expr)
-			}
-		LiteralMatchFallbackFail:
-			{
-				next_id = next_id,
-				fallback = fallback
-			}
-
-
-private pure func rewrite_constructor_literal_match(
-	targets: StdInlineTargets,
-	next_id: Int,
-	match_expr: CoreConstructorLiteralMatch,
-) -> (Int, CoreConstructorLiteralMatch):
-	cases: StdInlineLiteralCasesResult = rewrite_literal_cases(targets, next_id, match_expr.cases)
-	fallback: StdInlineLiteralFallbackResult = rewrite_literal_fallback(
-		targets,
-		cases.next_id,
-		match_expr.fallback,
-	)
-	(fallback.next_id, { match_expr |
-			cases = cases.cases,
-			fallback = fallback.fallback
-		})
-
-
-private pure func rewrite_constructor_body(
-	targets: StdInlineTargets,
-	next_id: Int,
-	body: CoreConstructorMatchBody,
-) -> StdInlineConstructorBodyResult:
-	match body:
-		ConstructorMatchBodyExpr(expr):
-			result: StdInlineExprResult = rewrite_expr(targets, next_id, expr)
-			{
-				next_id = result.next_id,
-				body = ConstructorMatchBodyExpr(result.expr)
-			}
-		ConstructorMatchBodyLiteral(match_expr):
-			result: (Int, CoreConstructorLiteralMatch) = rewrite_constructor_literal_match(
-				targets,
-				next_id,
-				match_expr,
-			)
-			{
-				next_id = result[0],
-				body = ConstructorMatchBodyLiteral(result[1])
-			}
-		ConstructorMatchBodyLength(match_expr):
-			result: (Int, CoreConstructorLengthMatch) = rewrite_constructor_length_match(
-				targets,
-				next_id,
-				match_expr,
-			)
-			{
-				next_id = result[0],
-				body = ConstructorMatchBodyLength(result[1])
-			}
-
-
-private pure func rewrite_constructor_length_branch(
-	targets: StdInlineTargets,
-	next_id: Int,
-	branch: CoreConstructorLengthMatchBranch,
-) -> StdInlineLengthBranchResult:
-	body: StdInlineConstructorBodyResult = rewrite_constructor_body(targets, next_id, branch.body)
-	{
-		next_id = body.next_id,
-		branch = { branch | body = body.body }
-	}
-
-
-private pure func rewrite_constructor_length_match(
-	targets: StdInlineTargets,
-	next_id: Int,
-	match_expr: CoreConstructorLengthMatch,
-) -> (Int, CoreConstructorLengthMatch):
-	var current_id: Int = next_id
-	var cases: List[CoreConstructorLengthMatchCase] = []
-
-	for match_case in match_expr.cases:
-		branch: StdInlineLengthBranchResult = rewrite_constructor_length_branch(
-			targets,
-			current_id,
-			match_case.branch,
-		)
-		current_id = branch.next_id
-		cases = cases.append({ match_case | branch = branch.branch })
-
-	geq: Option[CoreConstructorLengthMatchGeq] = match match_expr.geq:
-		Some(value):
-			branch: StdInlineLengthBranchResult = rewrite_constructor_length_branch(
-				targets,
-				current_id,
-				value.branch,
-			)
-			current_id = branch.next_id
-			Some({ value | branch = branch.branch })
-		None:
-			None
-
-	fallback: Option[CoreConstructorLengthMatchBranch] = match match_expr.fallback:
-		Some(value):
-			branch: StdInlineLengthBranchResult = rewrite_constructor_length_branch(
-				targets,
-				current_id,
-				value,
-			)
-			current_id = branch.next_id
-			Some(branch.branch)
-		None:
-			None
-
-	(current_id, { match_expr |
-			cases = cases,
-			geq = geq,
-			fallback = fallback
-		})
-
-
-private pure func rewrite_constructor_cases(
-	targets: StdInlineTargets,
-	next_id: Int,
-	cases: List[CoreConstructorMatchCase],
-) -> StdInlineConstructorCasesResult:
-	var current_id: Int = next_id
-	var rewritten: List[CoreConstructorMatchCase] = []
-
-	for match_case in cases:
-		body: StdInlineConstructorBodyResult = rewrite_constructor_body(
-			targets,
-			current_id,
-			match_case.body,
-		)
-		current_id = body.next_id
-		rewritten = rewritten.append({ match_case | body = body.body })
-
-	{
-		next_id = current_id,
-		cases = rewritten
-	}
-
-
-private pure func rewrite_constructor_fallback(
-	targets: StdInlineTargets,
-	next_id: Int,
-	fallback: CoreConstructorMatchFallback,
-) -> StdInlineConstructorFallbackResult:
-	match fallback:
-		ConstructorMatchFallbackBody(body):
-			result: StdInlineExprResult = rewrite_expr(targets, next_id, body)
-			{
-				next_id = result.next_id,
-				fallback = ConstructorMatchFallbackBody(result.expr)
-			}
-		ConstructorMatchFallbackBindings(bindings, body):
-			result: StdInlineExprResult = rewrite_expr(targets, next_id, body)
-			{
-				next_id = result.next_id,
-				fallback = ConstructorMatchFallbackBindings(bindings, result.expr)
-			}
-		ConstructorMatchFallbackFail:
-			{
-				next_id = next_id,
-				fallback = fallback
-			}
 
 
 private pure func clone_semantic_tree(
@@ -2017,789 +1568,30 @@ private pure func expand_call(
 			}
 
 
-private pure func rewrite_semantic_tree(
-	targets: StdInlineTargets,
-	next_id: Int,
-	tree: CoreSemanticMatchTree,
-) -> StdInlineSemanticResult:
-	match tree:
-		SemanticMatchLeaf(bindings, body):
-			body_result: StdInlineExprResult = rewrite_expr(targets, next_id, body)
-			{
-				next_id = body_result.next_id,
-				tree = SemanticMatchLeaf(bindings, body_result.expr)
-			}
-		SemanticMatchFail:
-			{
-				next_id = next_id,
-				tree = SemanticMatchFail
-			}
-		SemanticConstructorMatch(accessor, cases, fallback):
-			var current_id: Int = next_id
-			var rewritten_cases: List[CoreSemanticConstructorMatchCase] = []
-
-			for match_case in cases:
-				body_result: StdInlineSemanticResult = rewrite_semantic_tree(
-					targets,
-					current_id,
-					match_case.body,
-				)
-				current_id = body_result.next_id
-				rewritten_cases = rewritten_cases.append({ match_case | body = body_result.tree })
-
-			rewritten_fallback: Option[CoreSemanticMatchTree] = match fallback:
-				Some(fallback_tree):
-					fallback_result: StdInlineSemanticResult = rewrite_semantic_tree(
-						targets,
-						current_id,
-						fallback_tree,
-					)
-					current_id = fallback_result.next_id
-					Some(fallback_result.tree)
-				None:
-					None
-
-			{
-				next_id = current_id,
-				tree = SemanticConstructorMatch(accessor, rewritten_cases, rewritten_fallback)
-			}
-		SemanticLiteralMatch(accessor, cases, fallback):
-			var current_id: Int = next_id
-			var rewritten_cases: List[CoreSemanticLiteralMatchCase] = []
-
-			for match_case in cases:
-				body_result: StdInlineSemanticResult = rewrite_semantic_tree(
-					targets,
-					current_id,
-					match_case.body,
-				)
-				current_id = body_result.next_id
-				rewritten_cases = rewritten_cases.append({ match_case | body = body_result.tree })
-
-			fallback_result: StdInlineSemanticResult = rewrite_semantic_tree(
-				targets,
-				current_id,
-				fallback,
-			)
-			{
-				next_id = fallback_result.next_id,
-				tree = SemanticLiteralMatch(accessor, rewritten_cases, fallback_result.tree)
-			}
-		SemanticLengthMatch(accessor, cases, geq, fallback):
-			var current_id: Int = next_id
-			var rewritten_cases: List[CoreSemanticLengthMatchCase] = []
-
-			for match_case in cases:
-				body_result: StdInlineSemanticResult = rewrite_semantic_tree(
-					targets,
-					current_id,
-					match_case.body,
-				)
-				current_id = body_result.next_id
-				rewritten_cases = rewritten_cases.append({ match_case | body = body_result.tree })
-
-			rewritten_geq: Option[CoreSemanticLengthMatchGeq] = match geq:
-				Some(geq_case):
-					body_result: StdInlineSemanticResult = rewrite_semantic_tree(
-						targets,
-						current_id,
-						geq_case.body,
-					)
-					current_id = body_result.next_id
-					Some({ geq_case | body = body_result.tree })
-				None:
-					None
-
-			rewritten_fallback: Option[CoreSemanticMatchTree] = match fallback:
-				Some(fallback_tree):
-					fallback_result: StdInlineSemanticResult = rewrite_semantic_tree(
-						targets,
-						current_id,
-						fallback_tree,
-					)
-					current_id = fallback_result.next_id
-					Some(fallback_result.tree)
-				None:
-					None
-
-			{
-				next_id = current_id,
-				tree = SemanticLengthMatch(
-					accessor,
-					rewritten_cases,
-					rewritten_geq,
-					rewritten_fallback,
-				)
-			}
-
-
-private pure func rewrite_iterable_loop(
-	targets: StdInlineTargets,
-	next_id: Int,
+-- `rewrite_expr_state` is the state-threading core: everything but `BinaryExpr`
+-- (a stack-safety spine, mirroring `ssa.brp`'s treatment of the same node
+-- kind) and the post-children check for a target `CallExpr` goes through
+-- `map_core_expr_children_with_state`, which already special-cases
+-- `LogicalExpr` with its own iterative walker for deep `and`/`or` chains.
+-- `targets` rides along in `StdInlineRewriteState` because it never changes,
+-- so passing it as part of `S` costs nothing beyond the counter itself and
+-- avoids a closure captured per visit.
+private pure func rewrite_expr_state(
+	state: StdInlineRewriteState,
 	expr: CoreExpr,
-	iterable: CoreExpr,
-	body: CoreExpr,
-) -> StdInlineExprResult:
-	children: StdInlineExprsResult = rewrite_exprs(
-		targets,
-		next_id,
-		[iterable, body],
-	)
-
-	match children.exprs:
-		[rewritten_iterable, rewritten_body]:
-			rewritten_expr: CoreExpr = match expr:
-				ForChannelExpr(loop, typ, loc):
-					ForChannelExpr(
-						{ loop |
-							iterable = rewritten_iterable,
-							body = rewritten_body
-						},
-						typ,
-						loc,
-					)
-				ForListExpr(loop, typ, loc):
-					ForListExpr(
-						{ loop |
-							iterable = rewritten_iterable,
-							body = rewritten_body
-						},
-						typ,
-						loc,
-					)
-				ForStringExpr(loop, typ, loc):
-					ForStringExpr(
-						{ loop |
-							iterable = rewritten_iterable,
-							body = rewritten_body
-						},
-						typ,
-						loc,
-					)
-				ForDictExpr(loop, typ, loc):
-					ForDictExpr(
-						{ loop |
-							iterable = rewritten_iterable,
-							body = rewritten_body
-						},
-						typ,
-						loc,
-					)
-				ForSetExpr(loop, typ, loc):
-					ForSetExpr(
-						{ loop |
-							iterable = rewritten_iterable,
-							body = rewritten_body
-						},
-						typ,
-						loc,
-					)
-				ForStreamExpr(loop, typ, loc):
-					ForStreamExpr(
-						{ loop |
-							iterable = rewritten_iterable,
-							body = rewritten_body
-						},
-						typ,
-						loc,
-					)
-				ForResourceSourceExpr(loop, typ, loc):
-					ForResourceSourceExpr(
-						{ loop |
-							iterable = rewritten_iterable,
-							body = rewritten_body
-						},
-						typ,
-						loc,
-					)
-				ForTensorExpr(loop, typ, loc):
-					ForTensorExpr(
-						{ loop |
-							iterable = rewritten_iterable,
-							body = rewritten_body
-						},
-						typ,
-						loc,
-					)
-				_:
-					expr
-
-			{
-				next_id = children.next_id,
-				expr = rewritten_expr
-			}
-		_:
-			{
-				next_id = children.next_id,
-				expr = expr
-			}
-
-
-private pure func rewrite_logical_expr(
-	targets: StdInlineTargets,
-	next_id: Int,
-	expr: CoreExpr,
-) -> StdInlineExprResult:
-	-- Logical chains are left-associated. Explicit postorder frames preserve
-	-- left-to-right fresh-name threading without recursively entering the
-	-- general std-inline matcher for every term.
-	var frames: StdInlineLogicalFrameStack = StdInlineLogicalNoFrame
-	var action: StdInlineLogicalAction = StdInlineLogicalVisitExpr(expr, next_id)
-	var result: StdInlineExprResult = {
-		next_id = next_id,
-		expr = expr
-	}
-	var complete: Bool = False
-
-	while not complete:
-		match action:
-			StdInlineLogicalVisitExpr(current, current_id):
-				match current:
-					LogicalExpr(op, left, right, typ, loc):
-						frames = StdInlineLogicalMoreFrames(
-							StdInlineLogicalVisitRightFrame(op, right, typ, loc),
-							frames,
-						)
-						action = StdInlineLogicalVisitExpr(left, current_id)
-					_:
-						action = StdInlineLogicalRebuildExpr(
-							rewrite_expr(
-								targets,
-								current_id,
-								current,
-							),
-						)
-			StdInlineLogicalRebuildExpr(rewritten):
-				match frames:
-					StdInlineLogicalNoFrame:
-						result = rewritten
-						complete = True
-					StdInlineLogicalMoreFrames(frame, remaining):
-						frames = remaining
-
-						match frame:
-							StdInlineLogicalVisitRightFrame(op, right, typ, loc):
-								frames = StdInlineLogicalMoreFrames(
-									StdInlineLogicalRebuildParentFrame(op, rewritten, typ, loc),
-									frames,
-								)
-								action = StdInlineLogicalVisitExpr(right, rewritten.next_id)
-							StdInlineLogicalRebuildParentFrame(op, left, typ, loc):
-								action = StdInlineLogicalRebuildExpr({
-									next_id = rewritten.next_id,
-									expr = LogicalExpr(op, left.expr, rewritten.expr, typ, loc),
-								})
-
-	result
-
-
-private pure func rewrite_expr(
-	targets: StdInlineTargets,
-	next_id: Int,
-	expr: CoreExpr,
-) -> StdInlineExprResult:
-	children_rewritten: StdInlineExprResult = match expr:
+) -> CoreMapState[StdInlineRewriteState, CoreExpr]:
+	children_rewritten: CoreMapState[StdInlineRewriteState, CoreExpr] = match expr:
 		BinaryExpr(_, _, _, _, _):
-			rewrite_binary_spine(targets, next_id, expr)
-		LogicalExpr(_, _, _, _, _):
-			rewrite_logical_expr(targets, next_id, expr)
-		SeqExpr(first, second):
-			children: StdInlineExprsResult = rewrite_exprs(
-				targets,
-				next_id,
-				[first, second],
-			)
-
-			if not children.changed:
-				{
-					next_id = children.next_id,
-					expr = expr
-				}
-			else:
-				match children.exprs:
-					[rewritten_first, rewritten_second]:
-						{
-							next_id = children.next_id,
-							expr = SeqExpr(rewritten_first, rewritten_second)
-						}
-					_:
-						{
-							next_id = children.next_id,
-							expr = expr
-						}
-		IfExpr(cond, then_expr, else_expr, typ, loc):
-			children: StdInlineExprsResult = rewrite_exprs(
-				targets,
-				next_id,
-				[cond, then_expr, else_expr],
-			)
-
-			if not children.changed:
-				{
-					next_id = children.next_id,
-					expr = expr
-				}
-			else:
-				match children.exprs:
-					[rewritten_cond, rewritten_then, rewritten_else]:
-						{
-							next_id = children.next_id,
-							expr = IfExpr(rewritten_cond, rewritten_then, rewritten_else, typ, loc)
-						}
-					_:
-						{
-							next_id = children.next_id,
-							expr = expr
-						}
-		LetExpr(variable, is_mutable, typ, rhs, body):
-			children: StdInlineExprsResult = rewrite_exprs(
-				targets,
-				next_id,
-				[rhs, body],
-			)
-
-			if not children.changed:
-				{
-					next_id = children.next_id,
-					expr = expr
-				}
-			else:
-				match children.exprs:
-					[rewritten_rhs, rewritten_body]:
-						{
-							next_id = children.next_id,
-							expr = LetExpr(variable, is_mutable, typ, rewritten_rhs, rewritten_body)
-						}
-					_:
-						{
-							next_id = children.next_id,
-							expr = expr
-						}
-		BorrowLetExpr(variable, typ, rhs, body):
-			children: StdInlineExprsResult = rewrite_exprs(
-				targets,
-				next_id,
-				[rhs, body],
-			)
-
-			if not children.changed:
-				{
-					next_id = children.next_id,
-					expr = expr
-				}
-			else:
-				match children.exprs:
-					[rewritten_rhs, rewritten_body]:
-						{
-							next_id = children.next_id,
-							expr = BorrowLetExpr(variable, typ, rewritten_rhs, rewritten_body)
-						}
-					_:
-						{
-							next_id = children.next_id,
-							expr = expr
-						}
-		ResourceScopeExpr(scope, typ, loc):
-			children: StdInlineExprsResult = rewrite_exprs(
-				targets,
-				next_id,
-				[scope.acquire, scope.body, scope.cleanup],
-			)
-
-			if not children.changed:
-				{
-					next_id = children.next_id,
-					expr = expr
-				}
-			else:
-				match children.exprs:
-					[acquire, body, cleanup]:
-						{
-							next_id = children.next_id,
-							expr = ResourceScopeExpr(
-								{ scope |
-									acquire = acquire,
-									body = body,
-									cleanup = cleanup
-								},
-								typ,
-								loc,
-							)
-						}
-					_:
-						{
-							next_id = children.next_id,
-							expr = expr
-						}
-		TupleExpr(items, typ, loc):
-			children: StdInlineExprsResult = rewrite_exprs(targets, next_id, items)
-
-			if not children.changed:
-				{
-					next_id = children.next_id,
-					expr = expr
-				}
-			else:
-				{
-					next_id = children.next_id,
-					expr = TupleExpr(children.exprs, typ, loc)
-				}
-		VectorExpr(items, typ, loc):
-			children: StdInlineExprsResult = rewrite_exprs(targets, next_id, items)
-
-			if not children.changed:
-				{
-					next_id = children.next_id,
-					expr = expr
-				}
-			else:
-				{
-					next_id = children.next_id,
-					expr = VectorExpr(children.exprs, typ, loc)
-				}
-		ListConstructExpr(construct, typ, loc):
-			elements: StdInlineBoxedValuesResult = rewrite_boxed_values(
-				targets,
-				next_id,
-				construct.elements,
-			)
-			{
-				next_id = elements.next_id,
-				expr = ListConstructExpr({ construct | elements = elements.values }, typ, loc)
-			}
-		DictExpr(entries, typ, loc):
-			rewritten_entries: StdInlineDictEntriesResult = rewrite_dict_entries(
-				targets,
-				next_id,
-				entries,
-			)
-			{
-				next_id = rewritten_entries.next_id,
-				expr = DictExpr(rewritten_entries.entries, typ, loc)
-			}
-		RecordExpr(fields, typ, loc):
-			rewritten_fields: StdInlineRecordFieldsResult = rewrite_record_fields(
-				targets,
-				next_id,
-				fields,
-			)
-			{
-				next_id = rewritten_fields.next_id,
-				expr = RecordExpr(rewritten_fields.fields, typ, loc)
-			}
-		RecordUpdateExpr(base, fields, typ, loc):
-			rewritten_base: StdInlineExprResult = rewrite_expr(targets, next_id, base)
-			rewritten_fields: StdInlineRecordFieldsResult = rewrite_record_fields(
-				targets,
-				rewritten_base.next_id,
-				fields,
-			)
-			{
-				next_id = rewritten_fields.next_id,
-				expr = RecordUpdateExpr(rewritten_base.expr, rewritten_fields.fields, typ, loc)
-			}
-		RecordReuseExpr(source, fields, typ, loc):
-			rewritten_source: StdInlineExprResult = rewrite_expr(targets, next_id, source)
-			rewritten_fields: StdInlineRecordFieldsResult = rewrite_record_fields(
-				targets,
-				rewritten_source.next_id,
-				fields,
-			)
-			{
-				next_id = rewritten_fields.next_id,
-				expr = RecordReuseExpr(rewritten_source.expr, rewritten_fields.fields, typ, loc)
-			}
-		RecordCowUpdateExpr(source, fields, typ, loc):
-			rewritten_fields: StdInlineRecordCowFieldsResult = rewrite_record_cow_fields(
-				targets,
-				next_id,
-				fields,
-			)
-			rewritten_source: StdInlineExprResult = rewrite_expr(
-				targets,
-				rewritten_fields.next_id,
-				source,
-			)
-			{
-				next_id = rewritten_source.next_id,
-				expr = RecordCowUpdateExpr(rewritten_source.expr, rewritten_fields.fields, typ, loc)
-			}
-		TensorLiteralExpr(literal, typ, loc):
-			payload_result: StdInlineExprsResult = match literal.payload:
-				TensorRawLiteralPayload(raw):
-					rewrite_exprs(targets, next_id, raw.elements)
-				TensorInlineStructLiteralPayload(inline_struct):
-					rewrite_exprs(targets, next_id, inline_struct.elements)
-
-			rewritten_payload: CoreTensorLiteralPayload = match literal.payload:
-				TensorRawLiteralPayload(raw):
-					TensorRawLiteralPayload({ raw | elements = payload_result.exprs })
-				TensorInlineStructLiteralPayload(inline_struct):
-					TensorInlineStructLiteralPayload(
-						{ inline_struct | elements = payload_result.exprs },
-					)
-
-			{
-				next_id = payload_result.next_id,
-				expr = TensorLiteralExpr({ literal | payload = rewritten_payload }, typ, loc)
-			}
-		WhileExpr(cond, body, typ, loc):
-			children: StdInlineExprsResult = rewrite_exprs(
-				targets,
-				next_id,
-				[cond, body],
-			)
-
-			if not children.changed:
-				{
-					next_id = children.next_id,
-					expr = expr
-				}
-			else:
-				match children.exprs:
-					[rewritten_cond, rewritten_body]:
-						{
-							next_id = children.next_id,
-							expr = WhileExpr(rewritten_cond, rewritten_body, typ, loc)
-						}
-					_:
-						{
-							next_id = children.next_id,
-							expr = expr
-						}
-		RangeExpr(start, end_value, typ, loc):
-			children: StdInlineExprsResult = rewrite_exprs(
-				targets,
-				next_id,
-				[start, end_value],
-			)
-
-			if not children.changed:
-				{
-					next_id = children.next_id,
-					expr = expr
-				}
-			else:
-				match children.exprs:
-					[rewritten_start, rewritten_end]:
-						{
-							next_id = children.next_id,
-							expr = RangeExpr(rewritten_start, rewritten_end, typ, loc)
-						}
-					_:
-						{
-							next_id = children.next_id,
-							expr = expr
-						}
-		ForRangeExpr(binder, start, end_value, body, typ, loc):
-			children: StdInlineExprsResult = rewrite_exprs(
-				targets,
-				next_id,
-				[start, end_value, body],
-			)
-
-			if not children.changed:
-				{
-					next_id = children.next_id,
-					expr = expr
-				}
-			else:
-				match children.exprs:
-					[rewritten_start, rewritten_end, rewritten_body]:
-						{
-							next_id = children.next_id,
-							expr = ForRangeExpr(
-								binder,
-								rewritten_start,
-								rewritten_end,
-								rewritten_body,
-								typ,
-								loc,
-							)
-						}
-					_:
-						{
-							next_id = children.next_id,
-							expr = expr
-						}
-		ForChannelExpr(loop, _, _):
-			rewrite_iterable_loop(targets, next_id, expr, loop.iterable, loop.body)
-		ForListExpr(loop, _, _):
-			rewrite_iterable_loop(targets, next_id, expr, loop.iterable, loop.body)
-		ForStringExpr(loop, _, _):
-			rewrite_iterable_loop(targets, next_id, expr, loop.iterable, loop.body)
-		ForDictExpr(loop, _, _):
-			rewrite_iterable_loop(targets, next_id, expr, loop.iterable, loop.body)
-		ForSetExpr(loop, _, _):
-			rewrite_iterable_loop(targets, next_id, expr, loop.iterable, loop.body)
-		ForStreamExpr(loop, _, _):
-			rewrite_iterable_loop(targets, next_id, expr, loop.iterable, loop.body)
-		ForResourceSourceExpr(loop, _, _):
-			rewrite_iterable_loop(targets, next_id, expr, loop.iterable, loop.body)
-		ForTensorExpr(loop, _, _):
-			rewrite_iterable_loop(targets, next_id, expr, loop.iterable, loop.body)
-		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
-			iterable: StdInlineExprResult = rewrite_expr(targets, next_id, loop.iterable)
-			body: StdInlineExprResult = rewrite_expr(targets, iterable.next_id, loop.body)
-			timeout: StdInlineOptionalExprResult = rewrite_optional_expr(
-				targets,
-				body.next_id,
-				loop.timeout,
-			)
-			limit: StdInlineExprResult = rewrite_expr(targets, timeout.next_id, loop.limit)
-			{
-				next_id = limit.next_id,
-				expr = PreClosureConcurrentlyLoopExpr(
-					{ loop |
-						iterable = iterable.expr,
-						body = body.expr,
-						timeout = timeout.expr,
-						limit = limit.expr
-					},
-					typ,
-					loc,
-				)
-			}
-		PreClosureConcurrentExpr(block, typ, loc):
-			bindings: StdInlineConcurrentBindingsResult = rewrite_concurrent_bindings(
-				targets,
-				next_id,
-				block.bindings,
-			)
-			body: StdInlineExprResult = rewrite_expr(targets, bindings.next_id, block.body)
-			timeout: StdInlineOptionalExprResult = rewrite_optional_expr(
-				targets,
-				body.next_id,
-				block.timeout,
-			)
-			{
-				next_id = timeout.next_id,
-				expr = PreClosureConcurrentExpr(
-					{ block |
-						bindings = bindings.bindings,
-						body = body.expr,
-						timeout = timeout.expr
-					},
-					typ,
-					loc,
-				)
-			}
-		SelectExpr(arms, typ, loc):
-			result: StdInlineSelectArmsResult = rewrite_select_arms(targets, next_id, arms)
-			{
-				next_id = result.next_id,
-				expr = SelectExpr(result.arms, typ, loc)
-			}
-		TensorRawViewLetExpr(binding, body, typ, loc):
-			children: StdInlineExprsResult = rewrite_exprs(
-				targets,
-				next_id,
-				[binding.source, body],
-			)
-
-			if not children.changed:
-				{
-					next_id = children.next_id,
-					expr = expr
-				}
-			else:
-				match children.exprs:
-					[source, rewritten_body]:
-						{
-							next_id = children.next_id,
-							expr = TensorRawViewLetExpr(
-								{ binding | source = source },
-								rewritten_body,
-								typ,
-								loc,
-							)
-						}
-					_:
-						{
-							next_id = children.next_id,
-							expr = expr
-						}
-		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
-			rewritten_scrutinee: StdInlineExprResult = rewrite_expr(targets, next_id, scrutinee)
-			rewritten_cases: StdInlineConstructorCasesResult = rewrite_constructor_cases(
-				targets,
-				rewritten_scrutinee.next_id,
-				cases,
-			)
-			rewritten_fallback: StdInlineConstructorFallbackResult = rewrite_constructor_fallback(
-				targets,
-				rewritten_cases.next_id,
-				fallback,
-			)
-
-			{
-				next_id = rewritten_fallback.next_id,
-				expr = ConstructorMatchExpr(
-					rewritten_scrutinee.expr,
-					release_policy,
-					rewritten_cases.cases,
-					rewritten_fallback.fallback,
-					typ,
-					loc,
-				)
-			}
-		SemanticMatchExpr(scrutinee, tree, typ, loc):
-			scrutinee_result: StdInlineExprResult = rewrite_expr(targets, next_id, scrutinee)
-			tree_result: StdInlineSemanticResult = rewrite_semantic_tree(
-				targets,
-				scrutinee_result.next_id,
-				tree,
-			)
-			{
-				next_id = tree_result.next_id,
-				expr = SemanticMatchExpr(scrutinee_result.expr, tree_result.tree, typ, loc)
-			}
-		CallExpr(kind, callee, args, typ, loc):
-			children: StdInlineExprsResult = rewrite_exprs(
-				targets,
-				next_id,
-				[callee].concat(args),
-			)
-
-			if not children.changed:
-				{
-					next_id = children.next_id,
-					expr = expr
-				}
-			else:
-				match children.exprs:
-					[]:
-						{
-							next_id = children.next_id,
-							expr = expr
-						}
-					[rewritten_callee, ...rewritten_args]:
-						{
-							next_id = children.next_id,
-							expr = CallExpr(kind, rewritten_callee, rewritten_args, typ, loc)
-						}
+			rewrite_binary_spine_state(state, expr)
 		_:
-			match immediate_core_expr_children(expr):
-				[child]:
-					child_result: StdInlineExprResult = rewrite_expr(targets, next_id, child)
-					{
-						next_id = child_result.next_id,
-						expr = map_core_expr_children(expr, pure func(_): child_result.expr)
-					}
-				_:
-					-- Multi-child source forms are handled explicitly above.
-					-- Later-phase forms are not valid inputs to this stage.
-					{
-						next_id = next_id,
-						expr = expr
-					}
+			map_core_expr_children_with_state(state, rewrite_expr_state, expr)
 
-	match children_rewritten.expr:
+	match children_rewritten.value:
 		CallExpr(UserCall(name, Some(def_id), _), _, args, _, _):
-			match find_target(targets, name, def_id):
+			match find_target(children_rewritten.state.targets, name, def_id):
 				Some(target):
 					expanded: StdInlineExpandedCall = expand_call(
-						children_rewritten.next_id,
+						children_rewritten.state.next_id,
 						target,
 						args,
 					)
@@ -2807,8 +1599,8 @@ private pure func rewrite_expr(
 					match expanded.expr:
 						Some(inlined):
 							{
-								next_id = expanded.next_id,
-								expr = inlined
+								state = { children_rewritten.state | next_id = expanded.next_id },
+								value = inlined
 							}
 						None:
 							children_rewritten
@@ -2816,6 +1608,22 @@ private pure func rewrite_expr(
 					children_rewritten
 		_:
 			children_rewritten
+
+
+private pure func rewrite_expr(
+	targets: StdInlineTargets,
+	next_id: Int,
+	expr: CoreExpr,
+) -> StdInlineExprResult:
+	result: CoreMapState[StdInlineRewriteState, CoreExpr] = rewrite_expr_state(
+		{ targets = targets, next_id = next_id },
+		expr,
+	)
+	{
+		next_id = result.state.next_id,
+		expr = result.value
+	}
+
 
 
 private pure func rewrite_function(

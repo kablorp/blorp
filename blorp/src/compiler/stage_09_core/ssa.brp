@@ -149,31 +149,12 @@ enum CoreAssignmentShape:
 	ControlFlowAssignment
 
 
-record CoreSsaExprRewrite {
-	expr: CoreExpr,
-	next_version: Int
-}
-
-
 record CoreSsaProgramRewrite {
 	program: CoreProgram,
 	next_version: Int
 }
 
 
-private union CoreSsaLogicalFrame:
-	CoreSsaLogicalVisitRightFrame(CoreLogicalOp, CoreExpr, CoreType, CoreSourceLoc)
-	CoreSsaLogicalRebuildParentFrame(CoreLogicalOp, CoreSsaExprRewrite, CoreType, CoreSourceLoc)
-
-
-private union CoreSsaLogicalFrameStack:
-	CoreSsaLogicalNoFrame
-	CoreSsaLogicalMoreFrames(CoreSsaLogicalFrame, CoreSsaLogicalFrameStack)
-
-
-private union CoreSsaLogicalAction:
-	CoreSsaLogicalVisitExpr(CoreExpr, Int)
-	CoreSsaLogicalRebuildExpr(CoreSsaExprRewrite)
 
 
 private pure func combine_assignment_shape(
@@ -1113,89 +1094,6 @@ pure func substitute_var(old_name: String, new_var: CoreVar, expr: CoreExpr) -> 
 			)
 
 
-private record CoreSsaExprsRewrite {
-	items: List[CoreExpr],
-	next_version: Int,
-	changed: Bool
-}
-
-
-private record CoreSsaBoxedValuesRewrite {
-	items: List[CoreBoxedStorageValue],
-	next_version: Int,
-	changed: Bool
-}
-
-
-private record CoreSsaDictEntriesRewrite {
-	items: List[CoreDictLiteralEntry],
-	next_version: Int,
-	changed: Bool
-}
-
-
-private record CoreSsaRecordFieldsRewrite {
-	items: List[CoreRecordFieldValue],
-	next_version: Int,
-	changed: Bool
-}
-
-
-private record CoreSsaRecordCowFieldsRewrite {
-	items: List[CoreRecordCowField],
-	next_version: Int,
-	changed: Bool
-}
-
-
-private record CoreSsaRawMatchCasesRewrite {
-	items: List[CoreRawMatchCase],
-	next_version: Int,
-	changed: Bool
-}
-
-
-private record CoreSsaConstructorMatchCasesRewrite {
-	items: List[CoreConstructorMatchCase],
-	next_version: Int,
-	changed: Bool
-}
-
-
-private record CoreSsaConstructorMatchFallbackRewrite {
-	fallback: CoreConstructorMatchFallback,
-	next_version: Int,
-	changed: Bool
-}
-
-
-private record CoreSsaPreClosureBindingsRewrite {
-	items: List[CorePreClosureConcurrentBinding],
-	next_version: Int,
-	changed: Bool
-}
-
-
-private record CoreSsaConcurrentBindingsRewrite {
-	items: List[CoreConcurrentBinding],
-	next_version: Int,
-	changed: Bool
-}
-
-
-private record CoreSsaSelectArmsRewrite {
-	items: List[CoreSelectArm],
-	next_version: Int,
-	changed: Bool
-}
-
-
-private record CoreSsaOptionalRewrite {
-	value: Option[CoreExpr],
-	next_version: Int,
-	changed: Bool
-}
-
 
 private union CoreSsaBodyStep:
 	SsaExpressionStep(CoreExpr)
@@ -1219,482 +1117,8 @@ private pure func fresh_version(base_name: String, next_version: Int) -> CoreSsa
 	}
 
 
-private pure func rewrite_exprs(items: List[CoreExpr], next_version: Int) -> CoreSsaExprsRewrite:
-	var rewritten: List[CoreExpr] = items
-	var current_version: Int = next_version
-	var changed: Bool = False
-	var index: Int = 0
 
-	for item in items:
-		result = rewrite_expr_from(item, current_version)
-		current_version = result.next_version
-
-		if changed:
-			rewritten = rewritten.append(result.expr)
-		else if not same_core_expr(result.expr, item):
-			rewritten = items
-				.take(index)
-				.append(result.expr)
-			changed = True
-
-		index += 1
-
-	{
-		items = rewritten,
-		next_version = current_version,
-		changed = changed
-	}
-
-
-private pure func rewrite_boxed_values(
-	items: List[CoreBoxedStorageValue],
-	next_version: Int,
-) -> CoreSsaBoxedValuesRewrite:
-	var rewritten: List[CoreBoxedStorageValue] = items
-	var current_version: Int = next_version
-	var changed: Bool = False
-	var index: Int = 0
-
-	for item in items:
-		result = rewrite_expr_from(item.value, current_version)
-		current_version = result.next_version
-
-		if changed:
-			rewritten = rewritten.append({ item | value = result.expr })
-		else if not same_core_expr(result.expr, item.value):
-			rewritten = items
-				.take(index)
-				.append({ item | value = result.expr })
-			changed = True
-
-		index += 1
-
-	{
-		items = rewritten,
-		next_version = current_version,
-		changed = changed
-	}
-
-
-private pure func rewrite_dict_entries(
-	items: List[CoreDictLiteralEntry],
-	next_version: Int,
-) -> CoreSsaDictEntriesRewrite:
-	var rewritten: List[CoreDictLiteralEntry] = items
-	var current_version: Int = next_version
-	var changed: Bool = False
-	var index: Int = 0
-
-	for item in items:
-		key_result = rewrite_expr_from(item.key, current_version)
-		value_result = rewrite_expr_from(item.value, key_result.next_version)
-		current_version = value_result.next_version
-		rewritten_entry: CoreDictLiteralEntry = {
-			key = key_result.expr,
-			value = value_result.expr
-		}
-
-		if changed:
-			rewritten = rewritten.append(rewritten_entry)
-		else if (
-			not same_core_expr(key_result.expr, item.key)
-			or not same_core_expr(value_result.expr, item.value)
-		):
-			rewritten = items
-				.take(index)
-				.append(rewritten_entry)
-			changed = True
-
-		index += 1
-
-	{
-		items = rewritten,
-		next_version = current_version,
-		changed = changed
-	}
-
-
-private pure func rewrite_record_fields(
-	items: List[CoreRecordFieldValue],
-	next_version: Int,
-) -> CoreSsaRecordFieldsRewrite:
-	var rewritten: List[CoreRecordFieldValue] = items
-	var current_version: Int = next_version
-	var changed: Bool = False
-	var index: Int = 0
-
-	for item in items:
-		result = rewrite_expr_from(item.value, current_version)
-		current_version = result.next_version
-
-		if changed:
-			rewritten = rewritten.append({ item | value = result.expr })
-		else if not same_core_expr(result.expr, item.value):
-			rewritten = items
-				.take(index)
-				.append({ item | value = result.expr })
-			changed = True
-
-		index += 1
-
-	{
-		items = rewritten,
-		next_version = current_version,
-		changed = changed
-	}
-
-
-private pure func rewrite_record_cow_fields(
-	items: List[CoreRecordCowField],
-	next_version: Int,
-) -> CoreSsaRecordCowFieldsRewrite:
-	var rewritten: List[CoreRecordCowField] = items
-	var current_version: Int = next_version
-	var changed: Bool = False
-	var index: Int = 0
-
-	for item in items:
-		match item.replacement:
-			Some(replacement):
-				result = rewrite_expr_from(replacement, current_version)
-				current_version = result.next_version
-
-				if changed:
-					rewritten = rewritten.append({ item | replacement = Some(result.expr) })
-				else if not same_core_expr(result.expr, replacement):
-					rewritten = items
-						.take(index)
-						.append({ item | replacement = Some(result.expr) })
-					changed = True
-			None:
-				if changed:
-					rewritten = rewritten.append(item)
-				else:
-					void
-
-		index += 1
-
-	{
-		items = rewritten,
-		next_version = current_version,
-		changed = changed
-	}
-
-
-private pure func rewrite_raw_match_cases(
-	items: List[CoreRawMatchCase],
-	next_version: Int,
-) -> CoreSsaRawMatchCasesRewrite:
-	var rewritten: List[CoreRawMatchCase] = items
-	var current_version: Int = next_version
-	var changed: Bool = False
-	var index: Int = 0
-
-	for item in items:
-		result = rewrite_expr_from(item.body, current_version)
-		current_version = result.next_version
-
-		if changed:
-			rewritten = rewritten.append({ item | body = result.expr })
-		else if not same_core_expr(result.expr, item.body):
-			rewritten = items
-				.take(index)
-				.append({ item | body = result.expr })
-			changed = True
-
-		index += 1
-
-	{
-		items = rewritten,
-		next_version = current_version,
-		changed = changed
-	}
-
-
-private pure func rewrite_constructor_match_cases(
-	items: List[CoreConstructorMatchCase],
-	next_version: Int,
-) -> CoreSsaConstructorMatchCasesRewrite:
-	var rewritten: List[CoreConstructorMatchCase] = items
-	var current_version: Int = next_version
-	var changed: Bool = False
-	var index: Int = 0
-
-	for item in items:
-		match item.body:
-			ConstructorMatchBodyExpr(body):
-				result = rewrite_expr_from(body, current_version)
-				current_version = result.next_version
-
-				if changed:
-					rewritten = rewritten.append(
-						{ item | body = ConstructorMatchBodyExpr(result.expr) },
-					)
-				else if not same_core_expr(result.expr, body):
-					rewritten = items
-						.take(index)
-						.append({ item | body = ConstructorMatchBodyExpr(result.expr) })
-					changed = True
-			ConstructorMatchBodyLiteral(_) | ConstructorMatchBodyLength(_):
-				if changed:
-					rewritten = rewritten.append(item)
-				else:
-					void
-
-		index += 1
-
-	{
-		items = rewritten,
-		next_version = current_version,
-		changed = changed
-	}
-
-
-private pure func rewrite_constructor_match_fallback(
-	fallback: CoreConstructorMatchFallback,
-	next_version: Int,
-) -> CoreSsaConstructorMatchFallbackRewrite:
-	match fallback:
-		ConstructorMatchFallbackBody(body):
-			result = rewrite_expr_from(body, next_version)
-
-			if same_core_expr(result.expr, body):
-				{
-					fallback = fallback,
-					next_version = result.next_version,
-					changed = False
-				}
-			else:
-				{
-					fallback = ConstructorMatchFallbackBody(result.expr),
-					next_version = result.next_version,
-					changed = True
-				}
-		ConstructorMatchFallbackBindings(bindings, body):
-			result = rewrite_expr_from(body, next_version)
-
-			if same_core_expr(result.expr, body):
-				{
-					fallback = fallback,
-					next_version = result.next_version,
-					changed = False
-				}
-			else:
-				{
-					fallback = ConstructorMatchFallbackBindings(bindings, result.expr),
-					next_version = result.next_version,
-					changed = True
-				}
-		ConstructorMatchFallbackFail:
-			{
-				fallback = ConstructorMatchFallbackFail,
-				next_version = next_version,
-				changed = False
-			}
-
-
-private pure func rewrite_pre_closure_bindings(
-	items: List[CorePreClosureConcurrentBinding],
-	next_version: Int,
-) -> CoreSsaPreClosureBindingsRewrite:
-	var rewritten: List[CorePreClosureConcurrentBinding] = items
-	var current_version: Int = next_version
-	var changed: Bool = False
-	var index: Int = 0
-
-	for item in items:
-		result = rewrite_expr_from(item.rhs, current_version)
-		current_version = result.next_version
-
-		if changed:
-			rewritten = rewritten.append({ item | rhs = result.expr })
-		else if not same_core_expr(result.expr, item.rhs):
-			rewritten = items
-				.take(index)
-				.append({ item | rhs = result.expr })
-			changed = True
-
-		index += 1
-
-	{
-		items = rewritten,
-		next_version = current_version,
-		changed = changed
-	}
-
-
-private pure func rewrite_concurrent_bindings(
-	items: List[CoreConcurrentBinding],
-	next_version: Int,
-) -> CoreSsaConcurrentBindingsRewrite:
-	var rewritten: List[CoreConcurrentBinding] = items
-	var current_version: Int = next_version
-	var changed: Bool = False
-	var index: Int = 0
-
-	for item in items:
-		result = rewrite_expr_from(item.rhs, current_version)
-		current_version = result.next_version
-
-		if changed:
-			rewritten = rewritten.append({ item | rhs = result.expr })
-		else if not same_core_expr(result.expr, item.rhs):
-			rewritten = items
-				.take(index)
-				.append({ item | rhs = result.expr })
-			changed = True
-
-		index += 1
-
-	{
-		items = rewritten,
-		next_version = current_version,
-		changed = changed
-	}
-
-
-private pure func rewrite_optional(
-	value: Option[CoreExpr],
-	next_version: Int,
-) -> CoreSsaOptionalRewrite:
-	match value:
-		Some(expr):
-			result = rewrite_expr_from(expr, next_version)
-
-			if same_core_expr(result.expr, expr):
-				{
-					value = value,
-					next_version = result.next_version,
-					changed = False
-				}
-			else:
-				{
-					value = Some(result.expr),
-					next_version = result.next_version,
-					changed = True
-				}
-		None:
-			{
-				value = None,
-				next_version = next_version,
-				changed = False
-			}
-
-
-private pure func rewrite_select_arms(
-	arms: List[CoreSelectArm],
-	next_version: Int,
-) -> CoreSsaSelectArmsRewrite:
-	var rewritten: List[CoreSelectArm] = arms
-	var current_version: Int = next_version
-	var changed: Bool = False
-	var index: Int = 0
-
-	for arm in arms:
-		arm_result: CoreSsaSelectArmRewrite = rewrite_select_arm(arm, current_version)
-		current_version = arm_result.next_version
-
-		if changed:
-			rewritten = rewritten.append(arm_result.arm)
-		else if arm_result.changed:
-			rewritten = arms
-				.take(index)
-				.append(arm_result.arm)
-			changed = True
-
-		index += 1
-
-	{
-		items = rewritten,
-		next_version = current_version,
-		changed = changed
-	}
-
-
-private record CoreSsaSelectArmRewrite {
-	arm: CoreSelectArm,
-	next_version: Int,
-	changed: Bool
-}
-
-
-private pure func rewrite_select_arm(
-	arm: CoreSelectArm,
-	next_version: Int,
-) -> CoreSsaSelectArmRewrite:
-	match arm.kind:
-		SelectRecvArm(recv):
-			channel_result = rewrite_expr_from(recv.channel, next_version)
-			body_result = rewrite_expr_from(arm.body, channel_result.next_version)
-
-			if (
-				same_core_expr(channel_result.expr, recv.channel)
-				and same_core_expr(body_result.expr, arm.body)
-			):
-				{
-					arm = arm,
-					next_version = body_result.next_version,
-					changed = False
-				}
-			else:
-				{
-					arm = {
-						kind = SelectRecvArm({ recv | channel = channel_result.expr }),
-						body = body_result.expr,
-						loc = arm.loc
-					},
-					next_version = body_result.next_version,
-					changed = True
-				}
-		SelectSealedArm(channel):
-			channel_result = rewrite_expr_from(channel, next_version)
-			body_result = rewrite_expr_from(arm.body, channel_result.next_version)
-
-			if (
-				same_core_expr(channel_result.expr, channel)
-				and same_core_expr(body_result.expr, arm.body)
-			):
-				{
-					arm = arm,
-					next_version = body_result.next_version,
-					changed = False
-				}
-			else:
-				{
-					arm = {
-						kind = SelectSealedArm(channel_result.expr),
-						body = body_result.expr,
-						loc = arm.loc
-					},
-					next_version = body_result.next_version,
-					changed = True
-				}
-		SelectAfterArm(timeout):
-			timeout_result = rewrite_expr_from(timeout, next_version)
-			body_result = rewrite_expr_from(arm.body, timeout_result.next_version)
-
-			if (
-				same_core_expr(timeout_result.expr, timeout)
-				and same_core_expr(body_result.expr, arm.body)
-			):
-				{
-					arm = arm,
-					next_version = body_result.next_version,
-					changed = False
-				}
-			else:
-				{
-					arm = {
-						kind = SelectAfterArm(timeout_result.expr),
-						body = body_result.expr,
-						loc = arm.loc
-					},
-					next_version = body_result.next_version,
-					changed = True
-				}
-
-
-private pure func rewrite_sequence(expr: CoreExpr, next_version: Int) -> CoreSsaExprRewrite:
+private pure func rewrite_sequence(expr: CoreExpr, next_version: Int) -> CoreTraverse.CoreMapState[Int, CoreExpr]:
 	var preceding: List[CoreExpr] = []
 	var final_expr: CoreExpr = expr
 
@@ -1712,10 +1136,10 @@ private pure func rewrite_sequence(expr: CoreExpr, next_version: Int) -> CoreSsa
 
 	for item in preceding:
 		result = rewrite_expr_from(item, current_version)
-		rewritten_preceding = rewritten_preceding.append(result.expr)
-		current_version = result.next_version
+		rewritten_preceding = rewritten_preceding.append(result.value)
+		current_version = result.state
 
-		if same_core_expr(result.expr, item):
+		if same_core_expr(result.value, item):
 			void
 		else:
 			changed = True
@@ -1724,10 +1148,10 @@ private pure func rewrite_sequence(expr: CoreExpr, next_version: Int) -> CoreSsa
 
 	-- Nothing in the chain moved, so the chain itself is the answer; rebuilding
 	-- it would allocate one SeqExpr per statement to say the same thing.
-	if not changed and same_core_expr(final_result.expr, final_expr):
-		unchanged_rewrite(expr, final_result.next_version)
+	if not changed and same_core_expr(final_result.value, final_expr):
+		unchanged_rewrite(expr, final_result.state)
 	else:
-		var rewritten_expr: CoreExpr = final_result.expr
+		var rewritten_expr: CoreExpr = final_result.value
 		var index: Int = rewritten_preceding.length() - 1
 
 		while index >= 0:
@@ -1740,8 +1164,8 @@ private pure func rewrite_sequence(expr: CoreExpr, next_version: Int) -> CoreSsa
 			index -= 1
 
 		{
-			expr = rewritten_expr,
-			next_version = final_result.next_version
+			state = final_result.state,
+			value = rewritten_expr
 		}
 
 
@@ -1751,7 +1175,7 @@ private pure func rewrite_mutable_body_sequence(
 	typ: CoreType,
 	expr: CoreExpr,
 	next_version: Int,
-) -> CoreSsaExprRewrite:
+) -> CoreTraverse.CoreMapState[Int, CoreExpr]:
 	var preceding: List[CoreExpr] = []
 	var final_expr: CoreExpr = expr
 
@@ -1788,7 +1212,7 @@ private pure func rewrite_mutable_body_sequence(
 				steps = steps.append(SsaExpressionStep(substitute_var(var_name, active_var, item)))
 
 	final_result = rewrite_mutable_body(var_name, active_var, typ, final_expr, current_version)
-	var rewritten_expr: CoreExpr = final_result.expr
+	var rewritten_expr: CoreExpr = final_result.value
 	var index: Int = steps.length() - 1
 
 	while index >= 0:
@@ -1803,8 +1227,8 @@ private pure func rewrite_mutable_body_sequence(
 		index -= 1
 
 	{
-		expr = rewritten_expr,
-		next_version = final_result.next_version
+		state = final_result.state,
+		value = rewritten_expr
 	}
 
 
@@ -1814,7 +1238,7 @@ private pure func rewrite_mutable_body(
 	typ: CoreType,
 	expr: CoreExpr,
 	next_version: Int,
-) -> CoreSsaExprRewrite:
+) -> CoreTraverse.CoreMapState[Int, CoreExpr]:
 	match expr:
 		SeqExpr(_, _):
 			rewrite_mutable_body_sequence(var_name, current_var, typ, expr, next_version)
@@ -1823,34 +1247,34 @@ private pure func rewrite_mutable_body(
 
 			if variable.name == var_name:
 				{
-					expr = LetExpr(variable, is_mutable, bind_type, rewritten_rhs, body),
-					next_version = next_version
+					state = next_version,
+					value = LetExpr(variable, is_mutable, bind_type, rewritten_rhs, body)
 				}
 			else:
 				body_result = rewrite_mutable_body(var_name, current_var, typ, body, next_version)
 				{
-					expr = LetExpr(
+					state = body_result.state,
+					value = LetExpr(
 						variable,
 						is_mutable,
 						bind_type,
 						rewritten_rhs,
-						body_result.expr,
-					),
-					next_version = body_result.next_version
+						body_result.value,
+					)
 				}
 		BorrowLetExpr(variable, bind_type, rhs, body):
 			rewritten_rhs = substitute_var(var_name, current_var, rhs)
 
 			if variable.name == var_name:
 				{
-					expr = BorrowLetExpr(variable, bind_type, rewritten_rhs, body),
-					next_version = next_version
+					state = next_version,
+					value = BorrowLetExpr(variable, bind_type, rewritten_rhs, body)
 				}
 			else:
 				body_result = rewrite_mutable_body(var_name, current_var, typ, body, next_version)
 				{
-					expr = BorrowLetExpr(variable, bind_type, rewritten_rhs, body_result.expr),
-					next_version = body_result.next_version
+					state = body_result.state,
+					value = BorrowLetExpr(variable, bind_type, rewritten_rhs, body_result.value)
 				}
 		ResourceScopeExpr(scope, result_type, loc):
 			renamed_body: CoreExpr = if scope.variable.name == var_name:
@@ -1864,7 +1288,8 @@ private pure func rewrite_mutable_body(
 				substitute_var(var_name, current_var, scope.cleanup)
 
 			{
-				expr = ResourceScopeExpr(
+				state = next_version,
+				value = ResourceScopeExpr(
 					{ scope |
 						acquire = substitute_var(var_name, current_var, scope.acquire),
 						body = renamed_body,
@@ -1872,31 +1297,30 @@ private pure func rewrite_mutable_body(
 					},
 					result_type,
 					loc,
-				),
-				next_version = next_version
+				)
 			}
 		AssignExpr(target, rhs, assign_type, loc):
 			if target.name == var_name:
 				fresh = fresh_version(var_name, next_version)
 				{
-					expr = LetExpr(
+					state = fresh.next_version,
+					value = LetExpr(
 						fresh.variable,
 						False,
 						typ,
 						substitute_var(var_name, current_var, rhs),
 						VoidExpr(assign_type, loc),
-					),
-					next_version = fresh.next_version
+					)
 				}
 			else:
 				{
-					expr = substitute_var(var_name, current_var, expr),
-					next_version = next_version
+					state = next_version,
+					value = substitute_var(var_name, current_var, expr)
 				}
 		_:
 			{
-				expr = substitute_var(var_name, current_var, expr),
-				next_version = next_version
+				state = next_version,
+				value = substitute_var(var_name, current_var, expr)
 			}
 
 
@@ -1913,12 +1337,12 @@ private pure func rewrite_let_after_children(
 	rhs: CoreExpr,
 	body: CoreExpr,
 	next_version: Int,
-) -> CoreSsaExprRewrite:
+) -> CoreTraverse.CoreMapState[Int, CoreExpr]:
 	if not is_mutable:
 		if children_moved:
 			{
-				expr = LetExpr(variable, False, typ, rhs, body),
-				next_version = next_version
+				state = next_version,
+				value = LetExpr(variable, False, typ, rhs, body)
 			}
 		else:
 			unchanged_rewrite(original, next_version)
@@ -1926,13 +1350,13 @@ private pure func rewrite_let_after_children(
 		match classify_assignment_shape(variable.name, body):
 			NoAssignment:
 				{
-					expr = LetExpr(variable, False, typ, rhs, body),
-					next_version = next_version
+					state = next_version,
+					value = LetExpr(variable, False, typ, rhs, body)
 				}
 			ControlFlowAssignment:
 				{
-					expr = LetExpr(variable, True, typ, rhs, body),
-					next_version = next_version
+					state = next_version,
+					value = LetExpr(variable, True, typ, rhs, body)
 				}
 			StraightLineAssignment:
 				initial = fresh_version(variable.name, next_version)
@@ -1944,776 +1368,110 @@ private pure func rewrite_let_after_children(
 					initial.next_version,
 				)
 				{
-					expr = LetExpr(initial.variable, False, typ, rhs, body_result.expr),
-					next_version = body_result.next_version
+					state = body_result.state,
+					value = LetExpr(initial.variable, False, typ, rhs, body_result.value)
 				}
 
 
-private pure func unchanged_rewrite(expr: CoreExpr, next_version: Int) -> CoreSsaExprRewrite:
+private pure func unchanged_rewrite(
+	expr: CoreExpr,
+	next_version: Int,
+) -> CoreTraverse.CoreMapState[Int, CoreExpr]:
 	{
-		expr = expr,
-		next_version = next_version
+		state = next_version,
+		value = expr
 	}
 
 
+-- `LetExpr` is the one form SSA versioning cares about: whether a mutable
+-- local survives, is respelled immutable, or gets a fresh version per
+-- straight-line assignment is decided in `rewrite_let_after_children`, which
+-- can substitute the chosen variable through the rest of the body via
+-- `rewrite_mutable_body`. `SeqExpr` and `BinaryExpr` keep their own small,
+-- self-recursive spine walks for stack safety on deep statement blocks and
+-- left-associated arithmetic/string-concatenation chains: recursing through
+-- `map_core_expr_children_with_state`'s dispatcher instead measurably
+-- overflows the stack on a few-thousand-deep chain, because each level then
+-- costs several stack frames (this function, the dispatcher, the operator
+-- family, the adapter) sized for every node kind that family handles,
+-- instead of one small frame sized for this one arm alone (caught by
+-- `test_deep_binary_spine_is_stack_bounded` under AddressSanitizer). Every
+-- other node kind shares no logic beyond mapping children and threading
+-- `next_version` left to right in `immediate_core_expr_children` order,
+-- which `map_core_expr_children_with_state` already provides, including its
+-- own iterative walk for logical `and`/`or` chains.
+pure func rewrite_expr_from(expr: CoreExpr, next_version: Int) -> CoreTraverse.CoreMapState[Int, CoreExpr]:
+	match expr:
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			rhs_result = rewrite_expr_from(rhs, next_version)
+			body_result = rewrite_expr_from(body, rhs_result.state)
+			rewrite_let_after_children(
+				expr,
+				(
+					not same_core_expr(rhs_result.value, rhs)
+					or not same_core_expr(body_result.value, body)
+				),
+				variable,
+				is_mutable,
+				typ,
+				rhs_result.value,
+				body_result.value,
+				body_result.state,
+			)
+		SeqExpr(_, _):
+			rewrite_sequence(expr, next_version)
+		BinaryExpr(_, _, _, _, _):
+			rewrite_binary_spine_from(expr, next_version)
+		_:
+			CoreTraverse.map_core_expr_children_with_state(next_version, rewrite_expr_from_step, expr)
+
+
+-- `map_core_expr_children_with_state` calls `mapper(state, child)`;
+-- `rewrite_expr_from` takes `(expr, next_version)`. This only reorders the
+-- two arguments and forwards the same `CoreMapState` result straight back,
+-- so it costs a function reference and a tail call, not an allocation: the
+-- two functions already agree on the result type, so there is nothing left
+-- to convert.
+private pure func rewrite_expr_from_step(
+	next_version: Int,
+	child: CoreExpr,
+) -> CoreTraverse.CoreMapState[Int, CoreExpr]:
+	rewrite_expr_from(child, next_version)
+
+
 -- Binary expressions can form deep left-associated spines. Keep those
--- recursive edges inside this small helper instead of re-entering the
--- exhaustive dispatcher, whose generated C frame contains temporaries for
--- every CoreExpr variant. Logical chains use the explicit frame machine below.
+-- recursive edges inside this small helper instead of re-entering
+-- `rewrite_expr_from`'s dispatch, whose per-level frame is sized for every
+-- node kind at once.
 private pure func rewrite_binary_spine_from(
 	expr: CoreExpr,
 	next_version: Int,
-) -> CoreSsaExprRewrite:
+) -> CoreTraverse.CoreMapState[Int, CoreExpr]:
 	match expr:
 		BinaryExpr(op, left, right, typ, loc):
 			left_result = rewrite_binary_spine_from(left, next_version)
-			right_result = rewrite_binary_spine_from(right, left_result.next_version)
+			right_result = rewrite_binary_spine_from(right, left_result.state)
 
-			if same_core_expr(left_result.expr, left) and same_core_expr(right_result.expr, right):
-				unchanged_rewrite(expr, right_result.next_version)
+			if same_core_expr(left_result.value, left) and same_core_expr(right_result.value, right):
+				unchanged_rewrite(expr, right_result.state)
 			else:
 				{
-					expr = BinaryExpr(op, left_result.expr, right_result.expr, typ, loc),
-					next_version = right_result.next_version
+					state = right_result.state,
+					value = BinaryExpr(op, left_result.value, right_result.value, typ, loc)
 				}
 		_:
 			rewrite_expr_from(expr, next_version)
 
 
-private pure func rewrite_logical_expr_from(
+pure func desugar_expr_from(
 	expr: CoreExpr,
 	next_version: Int,
-) -> CoreSsaExprRewrite:
-	-- Logical chains are left-associated. Preserve left-to-right version
-	-- threading with explicit postorder frames so generated suites do not
-	-- recurse through the large exhaustive SSA matcher once per term.
-	var frames: CoreSsaLogicalFrameStack = CoreSsaLogicalNoFrame
-	var action: CoreSsaLogicalAction = CoreSsaLogicalVisitExpr(expr, next_version)
-	var result: CoreSsaExprRewrite = {
-		expr = expr,
-		next_version = next_version
-	}
-	var complete: Bool = False
-
-	while not complete:
-		match action:
-			CoreSsaLogicalVisitExpr(current, current_version):
-				match current:
-					LogicalExpr(op, left, right, typ, loc):
-						frames = CoreSsaLogicalMoreFrames(
-							CoreSsaLogicalVisitRightFrame(op, right, typ, loc),
-							frames,
-						)
-						action = CoreSsaLogicalVisitExpr(left, current_version)
-					_:
-						action = CoreSsaLogicalRebuildExpr(
-							rewrite_expr_from(
-								current,
-								current_version,
-							),
-						)
-			CoreSsaLogicalRebuildExpr(rewritten):
-				match frames:
-					CoreSsaLogicalNoFrame:
-						result = rewritten
-						complete = True
-					CoreSsaLogicalMoreFrames(frame, remaining):
-						frames = remaining
-
-						match frame:
-							CoreSsaLogicalVisitRightFrame(op, right, typ, loc):
-								frames = CoreSsaLogicalMoreFrames(
-									CoreSsaLogicalRebuildParentFrame(op, rewritten, typ, loc),
-									frames,
-								)
-								action = CoreSsaLogicalVisitExpr(right, rewritten.next_version)
-							CoreSsaLogicalRebuildParentFrame(op, left, typ, loc):
-								action = CoreSsaLogicalRebuildExpr({
-									expr = LogicalExpr(op, left.expr, rewritten.expr, typ, loc),
-									next_version = rewritten.next_version,
-								})
-
-	result
-
-
--- This match exhaustively names the cross-stage Core union. Forms produced
--- before SSA recurse explicitly; leaf forms and forms introduced only by
--- later passes return unchanged. Adding a Core variant must update this
--- boundary instead of silently bypassing mutable-local lowering.
--- The arms live in the grouped functions below rather than in one exhaustive
--- match, because a match over every CoreExpr variant emits a C frame holding
--- the temporaries of every arm at once and the arms here each need locals for
--- their mapped children. This dispatcher binds nothing.
-private pure func rewrite_expr_from(expr: CoreExpr, next_version: Int) -> CoreSsaExprRewrite:
-	match expr:
-		DebugBlockExpr(_, _, _) | UnaryExpr(_, _, _, _) | AssignExpr(_, _, _, _) | FieldExpr(_, _, _, _) | TupleFieldExpr(_, _, _, _) | PreClosureDetachExpr(_, _, _) | WhileExpr(_, _, _, _) | RangeExpr(_, _, _, _) | IfExpr(_, _, _, _, _):
-			rewrite_operator_expr_from(expr, next_version)
-		CallExpr(_, _, _, _, _) | TupleExpr(_, _, _) | VectorExpr(_, _, _) | LambdaExpr(_, _, _, _, _, _) | ListConstructExpr(_, _, _) | DictExpr(_, _, _) | RecordExpr(_, _, _) | RecordUpdateExpr(_, _, _, _) | RecordReuseExpr(_, _, _, _) | RecordCowUpdateExpr(_, _, _, _) | LetExpr(_, _, _, _, _) | BorrowLetExpr(_, _, _, _):
-			rewrite_aggregate_expr_from(expr, next_version)
-		ResourceScopeExpr(_, _, _) | ForRangeExpr(_, _, _, _, _, _) | ForChannelExpr(_, _, _) | ForListExpr(_, _, _) | ForStringExpr(_, _, _) | ForDictExpr(_, _, _) | ForSetExpr(_, _, _) | ForStreamExpr(_, _, _) | ForResourceSourceExpr(_, _, _) | ForTensorExpr(_, _, _):
-			rewrite_loop_expr_from(expr, next_version)
-		PreClosureConcurrentlyLoopExpr(_, _, _) | ConcurrentlyLoopExpr(_, _, _) | PreClosureConcurrentExpr(_, _, _) | ConcurrentExpr(_, _, _) | SelectExpr(_, _, _) | RawMatchExpr(_, _, _, _) | ConstructorMatchExpr(_, _, _, _, _, _):
-			rewrite_concurrency_match_expr_from(expr, next_version)
-		BinaryExpr(_, _, _, _, _):
-			rewrite_binary_spine_from(expr, next_version)
-		LogicalExpr(_, _, _, _, _):
-			rewrite_logical_expr_from(expr, next_version)
-		SeqExpr(_, _):
-			rewrite_sequence(expr, next_version)
-		_:
-			-- Everything else is a leaf as far as versioning is concerned: either
-			-- it binds nothing and holds no expression this pass rewrites, or it
-			-- is a later-phase form that cannot reach the desugar stage.
-			unchanged_rewrite(expr, next_version)
-
-
--- Operators and the simple control forms: map children, hand the input node
--- back when none of them moved.
-private pure func rewrite_operator_expr_from(
-	expr: CoreExpr,
-	next_version: Int,
-) -> CoreSsaExprRewrite:
-	match expr:
-		DebugBlockExpr(body, typ, loc):
-			body_result = rewrite_expr_from(body, next_version)
-
-			if same_core_expr(body_result.expr, body):
-				unchanged_rewrite(expr, body_result.next_version)
-			else:
-				{
-					expr = DebugBlockExpr(body_result.expr, typ, loc),
-					next_version = body_result.next_version
-				}
-		UnaryExpr(op, value, typ, loc):
-			value_result = rewrite_expr_from(value, next_version)
-
-			if same_core_expr(value_result.expr, value):
-				unchanged_rewrite(expr, value_result.next_version)
-			else:
-				{
-					expr = UnaryExpr(op, value_result.expr, typ, loc),
-					next_version = value_result.next_version
-				}
-		AssignExpr(variable, rhs, typ, loc):
-			rhs_result = rewrite_expr_from(rhs, next_version)
-
-			if same_core_expr(rhs_result.expr, rhs):
-				unchanged_rewrite(expr, rhs_result.next_version)
-			else:
-				{
-					expr = AssignExpr(variable, rhs_result.expr, typ, loc),
-					next_version = rhs_result.next_version
-				}
-		FieldExpr(value, field_name, typ, loc):
-			value_result = rewrite_expr_from(value, next_version)
-
-			if same_core_expr(value_result.expr, value):
-				unchanged_rewrite(expr, value_result.next_version)
-			else:
-				{
-					expr = FieldExpr(value_result.expr, field_name, typ, loc),
-					next_version = value_result.next_version
-				}
-		TupleFieldExpr(value, field_index, typ, loc):
-			value_result = rewrite_expr_from(value, next_version)
-
-			if same_core_expr(value_result.expr, value):
-				unchanged_rewrite(expr, value_result.next_version)
-			else:
-				{
-					expr = TupleFieldExpr(value_result.expr, field_index, typ, loc),
-					next_version = value_result.next_version
-				}
-		PreClosureDetachExpr(body, typ, loc):
-			body_result = rewrite_expr_from(body, next_version)
-
-			if same_core_expr(body_result.expr, body):
-				unchanged_rewrite(expr, body_result.next_version)
-			else:
-				{
-					expr = PreClosureDetachExpr(body_result.expr, typ, loc),
-					next_version = body_result.next_version
-				}
-		WhileExpr(cond, body, typ, loc):
-			cond_result = rewrite_expr_from(cond, next_version)
-			body_result = rewrite_expr_from(body, cond_result.next_version)
-
-			if same_core_expr(cond_result.expr, cond) and same_core_expr(body_result.expr, body):
-				unchanged_rewrite(expr, body_result.next_version)
-			else:
-				{
-					expr = WhileExpr(cond_result.expr, body_result.expr, typ, loc),
-					next_version = body_result.next_version
-				}
-		RangeExpr(start, end_value, typ, loc):
-			start_result = rewrite_expr_from(start, next_version)
-			end_result = rewrite_expr_from(end_value, start_result.next_version)
-
-			if (
-				same_core_expr(start_result.expr, start)
-				and same_core_expr(end_result.expr, end_value)
-			):
-				unchanged_rewrite(expr, end_result.next_version)
-			else:
-				{
-					expr = RangeExpr(start_result.expr, end_result.expr, typ, loc),
-					next_version = end_result.next_version
-				}
-		IfExpr(cond, then_expr, else_expr, typ, loc):
-			cond_result = rewrite_expr_from(cond, next_version)
-			then_result = rewrite_expr_from(then_expr, cond_result.next_version)
-			else_result = rewrite_expr_from(else_expr, then_result.next_version)
-
-			if (
-				same_core_expr(cond_result.expr, cond)
-				and same_core_expr(then_result.expr, then_expr)
-				and same_core_expr(else_result.expr, else_expr)
-			):
-				unchanged_rewrite(expr, else_result.next_version)
-			else:
-				{
-					expr = IfExpr(cond_result.expr, then_result.expr, else_result.expr, typ, loc),
-					next_version = else_result.next_version
-				}
-		_:
-			unchanged_rewrite(expr, next_version)
-
-
--- Aggregates and the binding forms: map children, hand the input node back
--- when none of them moved.
-private pure func rewrite_aggregate_expr_from(
-	expr: CoreExpr,
-	next_version: Int,
-) -> CoreSsaExprRewrite:
-	match expr:
-		CallExpr(kind, callee, args, typ, loc):
-			callee_result = rewrite_expr_from(callee, next_version)
-			args_result = rewrite_exprs(args, callee_result.next_version)
-
-			if same_core_expr(callee_result.expr, callee) and not args_result.changed:
-				unchanged_rewrite(expr, args_result.next_version)
-			else:
-				{
-					expr = CallExpr(kind, callee_result.expr, args_result.items, typ, loc),
-					next_version = args_result.next_version
-				}
-		TupleExpr(items, typ, loc):
-			items_result = rewrite_exprs(items, next_version)
-
-			if not items_result.changed:
-				unchanged_rewrite(expr, items_result.next_version)
-			else:
-				{
-					expr = TupleExpr(items_result.items, typ, loc),
-					next_version = items_result.next_version
-				}
-		VectorExpr(items, typ, loc):
-			items_result = rewrite_exprs(items, next_version)
-
-			if not items_result.changed:
-				unchanged_rewrite(expr, items_result.next_version)
-			else:
-				{
-					expr = VectorExpr(items_result.items, typ, loc),
-					next_version = items_result.next_version
-				}
-		LambdaExpr(params, return_type, body, is_pure, typ, loc):
-			body_result = rewrite_expr_from(body, next_version)
-
-			if same_core_expr(body_result.expr, body):
-				unchanged_rewrite(expr, body_result.next_version)
-			else:
-				{
-					expr = LambdaExpr(params, return_type, body_result.expr, is_pure, typ, loc),
-					next_version = body_result.next_version
-				}
-		ListConstructExpr(construct, typ, loc):
-			items_result = rewrite_boxed_values(construct.elements, next_version)
-
-			if not items_result.changed:
-				unchanged_rewrite(expr, items_result.next_version)
-			else:
-				{
-					expr = ListConstructExpr(
-						{ construct | elements = items_result.items },
-						typ,
-						loc,
-					),
-					next_version = items_result.next_version
-				}
-		DictExpr(entries, typ, loc):
-			entries_result = rewrite_dict_entries(entries, next_version)
-
-			if not entries_result.changed:
-				unchanged_rewrite(expr, entries_result.next_version)
-			else:
-				{
-					expr = DictExpr(entries_result.items, typ, loc),
-					next_version = entries_result.next_version
-				}
-		RecordExpr(fields, typ, loc):
-			fields_result = rewrite_record_fields(fields, next_version)
-
-			if not fields_result.changed:
-				unchanged_rewrite(expr, fields_result.next_version)
-			else:
-				{
-					expr = RecordExpr(fields_result.items, typ, loc),
-					next_version = fields_result.next_version
-				}
-		RecordUpdateExpr(base, fields, typ, loc):
-			base_result = rewrite_expr_from(base, next_version)
-			fields_result = rewrite_record_fields(fields, base_result.next_version)
-
-			if same_core_expr(base_result.expr, base) and not fields_result.changed:
-				unchanged_rewrite(expr, fields_result.next_version)
-			else:
-				{
-					expr = RecordUpdateExpr(base_result.expr, fields_result.items, typ, loc),
-					next_version = fields_result.next_version
-				}
-		RecordReuseExpr(source, fields, typ, loc):
-			source_result = rewrite_expr_from(source, next_version)
-			fields_result = rewrite_record_fields(fields, source_result.next_version)
-
-			if same_core_expr(source_result.expr, source) and not fields_result.changed:
-				unchanged_rewrite(expr, fields_result.next_version)
-			else:
-				{
-					expr = RecordReuseExpr(source_result.expr, fields_result.items, typ, loc),
-					next_version = fields_result.next_version
-				}
-		RecordCowUpdateExpr(source, fields, typ, loc):
-			fields_result = rewrite_record_cow_fields(fields, next_version)
-			source_result = rewrite_expr_from(source, fields_result.next_version)
-
-			if same_core_expr(source_result.expr, source) and not fields_result.changed:
-				unchanged_rewrite(expr, source_result.next_version)
-			else:
-				{
-					expr = RecordCowUpdateExpr(source_result.expr, fields_result.items, typ, loc),
-					next_version = source_result.next_version
-				}
-		LetExpr(variable, is_mutable, typ, rhs, body):
-			rhs_result = rewrite_expr_from(rhs, next_version)
-			body_result = rewrite_expr_from(body, rhs_result.next_version)
-			rewrite_let_after_children(
-				expr,
-				(
-					not same_core_expr(rhs_result.expr, rhs)
-					or not same_core_expr(body_result.expr, body)
-				),
-				variable,
-				is_mutable,
-				typ,
-				rhs_result.expr,
-				body_result.expr,
-				body_result.next_version,
-			)
-		BorrowLetExpr(variable, typ, rhs, body):
-			rhs_result = rewrite_expr_from(rhs, next_version)
-			body_result = rewrite_expr_from(body, rhs_result.next_version)
-
-			if same_core_expr(rhs_result.expr, rhs) and same_core_expr(body_result.expr, body):
-				unchanged_rewrite(expr, body_result.next_version)
-			else:
-				{
-					expr = BorrowLetExpr(variable, typ, rhs_result.expr, body_result.expr),
-					next_version = body_result.next_version
-				}
-		_:
-			unchanged_rewrite(expr, next_version)
-
-
--- Loops and resource scopes: map children, hand the input node back when none
--- of them moved.
-private pure func rewrite_loop_expr_from(expr: CoreExpr, next_version: Int) -> CoreSsaExprRewrite:
-	match expr:
-		ResourceScopeExpr(scope, typ, loc):
-			acquire_result = rewrite_expr_from(scope.acquire, next_version)
-			body_result = rewrite_expr_from(scope.body, acquire_result.next_version)
-			cleanup_result = rewrite_expr_from(scope.cleanup, body_result.next_version)
-
-			if (
-				same_core_expr(acquire_result.expr, scope.acquire)
-				and same_core_expr(body_result.expr, scope.body)
-				and same_core_expr(cleanup_result.expr, scope.cleanup)
-			):
-				unchanged_rewrite(expr, cleanup_result.next_version)
-			else:
-				{
-					expr = ResourceScopeExpr(
-						{ scope |
-							acquire = acquire_result.expr,
-							body = body_result.expr,
-							cleanup = cleanup_result.expr
-						},
-						typ,
-						loc,
-					),
-					next_version = cleanup_result.next_version
-				}
-		ForRangeExpr(binder, start, end_value, body, typ, loc):
-			start_result = rewrite_expr_from(start, next_version)
-			end_result = rewrite_expr_from(end_value, start_result.next_version)
-			body_result = rewrite_expr_from(body, end_result.next_version)
-
-			if (
-				same_core_expr(start_result.expr, start)
-				and same_core_expr(end_result.expr, end_value)
-				and same_core_expr(body_result.expr, body)
-			):
-				unchanged_rewrite(expr, body_result.next_version)
-			else:
-				{
-					expr = ForRangeExpr(
-						binder,
-						start_result.expr,
-						end_result.expr,
-						body_result.expr,
-						typ,
-						loc,
-					),
-					next_version = body_result.next_version
-				}
-		ForChannelExpr(loop, typ, loc):
-			iterable_result = rewrite_expr_from(loop.iterable, next_version)
-			body_result = rewrite_expr_from(loop.body, iterable_result.next_version)
-
-			if (
-				same_core_expr(iterable_result.expr, loop.iterable)
-				and same_core_expr(body_result.expr, loop.body)
-			):
-				unchanged_rewrite(expr, body_result.next_version)
-			else:
-				{
-					expr = ForChannelExpr(
-						{ loop |
-							iterable = iterable_result.expr,
-							body = body_result.expr
-						},
-						typ,
-						loc,
-					),
-					next_version = body_result.next_version
-				}
-		ForListExpr(loop, typ, loc):
-			iterable_result = rewrite_expr_from(loop.iterable, next_version)
-			body_result = rewrite_expr_from(loop.body, iterable_result.next_version)
-
-			if (
-				same_core_expr(iterable_result.expr, loop.iterable)
-				and same_core_expr(body_result.expr, loop.body)
-			):
-				unchanged_rewrite(expr, body_result.next_version)
-			else:
-				{
-					expr = ForListExpr(
-						{ loop |
-							iterable = iterable_result.expr,
-							body = body_result.expr
-						},
-						typ,
-						loc,
-					),
-					next_version = body_result.next_version
-				}
-		ForStringExpr(loop, typ, loc):
-			iterable_result = rewrite_expr_from(loop.iterable, next_version)
-			body_result = rewrite_expr_from(loop.body, iterable_result.next_version)
-
-			if (
-				same_core_expr(iterable_result.expr, loop.iterable)
-				and same_core_expr(body_result.expr, loop.body)
-			):
-				unchanged_rewrite(expr, body_result.next_version)
-			else:
-				{
-					expr = ForStringExpr(
-						{ loop |
-							iterable = iterable_result.expr,
-							body = body_result.expr
-						},
-						typ,
-						loc,
-					),
-					next_version = body_result.next_version
-				}
-		ForDictExpr(loop, typ, loc):
-			iterable_result = rewrite_expr_from(loop.iterable, next_version)
-			body_result = rewrite_expr_from(loop.body, iterable_result.next_version)
-
-			if (
-				same_core_expr(iterable_result.expr, loop.iterable)
-				and same_core_expr(body_result.expr, loop.body)
-			):
-				unchanged_rewrite(expr, body_result.next_version)
-			else:
-				{
-					expr = ForDictExpr(
-						{ loop |
-							iterable = iterable_result.expr,
-							body = body_result.expr
-						},
-						typ,
-						loc,
-					),
-					next_version = body_result.next_version
-				}
-		ForSetExpr(loop, typ, loc):
-			iterable_result = rewrite_expr_from(loop.iterable, next_version)
-			body_result = rewrite_expr_from(loop.body, iterable_result.next_version)
-
-			if (
-				same_core_expr(iterable_result.expr, loop.iterable)
-				and same_core_expr(body_result.expr, loop.body)
-			):
-				unchanged_rewrite(expr, body_result.next_version)
-			else:
-				{
-					expr = ForSetExpr(
-						{ loop |
-							iterable = iterable_result.expr,
-							body = body_result.expr
-						},
-						typ,
-						loc,
-					),
-					next_version = body_result.next_version
-				}
-		ForStreamExpr(loop, typ, loc):
-			iterable_result = rewrite_expr_from(loop.iterable, next_version)
-			body_result = rewrite_expr_from(loop.body, iterable_result.next_version)
-
-			if (
-				same_core_expr(iterable_result.expr, loop.iterable)
-				and same_core_expr(body_result.expr, loop.body)
-			):
-				unchanged_rewrite(expr, body_result.next_version)
-			else:
-				{
-					expr = ForStreamExpr(
-						{ loop |
-							iterable = iterable_result.expr,
-							body = body_result.expr
-						},
-						typ,
-						loc,
-					),
-					next_version = body_result.next_version
-				}
-		ForResourceSourceExpr(loop, typ, loc):
-			iterable_result = rewrite_expr_from(loop.iterable, next_version)
-			body_result = rewrite_expr_from(loop.body, iterable_result.next_version)
-
-			if (
-				same_core_expr(iterable_result.expr, loop.iterable)
-				and same_core_expr(body_result.expr, loop.body)
-			):
-				unchanged_rewrite(expr, body_result.next_version)
-			else:
-				{
-					expr = ForResourceSourceExpr(
-						{ loop |
-							iterable = iterable_result.expr,
-							body = body_result.expr
-						},
-						typ,
-						loc,
-					),
-					next_version = body_result.next_version
-				}
-		ForTensorExpr(loop, typ, loc):
-			iterable_result = rewrite_expr_from(loop.iterable, next_version)
-			body_result = rewrite_expr_from(loop.body, iterable_result.next_version)
-
-			if (
-				same_core_expr(iterable_result.expr, loop.iterable)
-				and same_core_expr(body_result.expr, loop.body)
-			):
-				unchanged_rewrite(expr, body_result.next_version)
-			else:
-				{
-					expr = ForTensorExpr(
-						{ loop |
-							iterable = iterable_result.expr,
-							body = body_result.expr
-						},
-						typ,
-						loc,
-					),
-					next_version = body_result.next_version
-				}
-		_:
-			unchanged_rewrite(expr, next_version)
-
-
--- Concurrency blocks and the match forms: map children, hand the input node
--- back when none of them moved.
-private pure func rewrite_concurrency_match_expr_from(
-	expr: CoreExpr,
-	next_version: Int,
-) -> CoreSsaExprRewrite:
-	match expr:
-		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
-			iterable_result = rewrite_expr_from(loop.iterable, next_version)
-			body_result = rewrite_expr_from(loop.body, iterable_result.next_version)
-			timeout_result = rewrite_optional(loop.timeout, body_result.next_version)
-			limit_result = rewrite_expr_from(loop.limit, timeout_result.next_version)
-
-			if (
-				same_core_expr(iterable_result.expr, loop.iterable)
-				and same_core_expr(body_result.expr, loop.body)
-				and not timeout_result.changed
-				and same_core_expr(limit_result.expr, loop.limit)
-			):
-				unchanged_rewrite(expr, limit_result.next_version)
-			else:
-				{
-					expr = PreClosureConcurrentlyLoopExpr(
-						{ loop |
-							iterable = iterable_result.expr,
-							body = body_result.expr,
-							timeout = timeout_result.value,
-							limit = limit_result.expr
-						},
-						typ,
-						loc,
-					),
-					next_version = limit_result.next_version
-				}
-		ConcurrentlyLoopExpr(loop, typ, loc):
-			iterable_result = rewrite_expr_from(loop.iterable, next_version)
-			body_result = rewrite_expr_from(loop.body, iterable_result.next_version)
-			timeout_result = rewrite_optional(loop.timeout, body_result.next_version)
-			limit_result = rewrite_expr_from(loop.limit, timeout_result.next_version)
-
-			if (
-				same_core_expr(iterable_result.expr, loop.iterable)
-				and same_core_expr(body_result.expr, loop.body)
-				and not timeout_result.changed
-				and same_core_expr(limit_result.expr, loop.limit)
-			):
-				unchanged_rewrite(expr, limit_result.next_version)
-			else:
-				{
-					expr = ConcurrentlyLoopExpr(
-						{ loop |
-							iterable = iterable_result.expr,
-							body = body_result.expr,
-							timeout = timeout_result.value,
-							limit = limit_result.expr
-						},
-						typ,
-						loc,
-					),
-					next_version = limit_result.next_version
-				}
-		PreClosureConcurrentExpr(block, typ, loc):
-			bindings_result = rewrite_pre_closure_bindings(block.bindings, next_version)
-			body_result = rewrite_expr_from(block.body, bindings_result.next_version)
-			timeout_result = rewrite_optional(block.timeout, body_result.next_version)
-
-			if (
-				not bindings_result.changed
-				and same_core_expr(body_result.expr, block.body)
-				and not timeout_result.changed
-			):
-				unchanged_rewrite(expr, timeout_result.next_version)
-			else:
-				{
-					expr = PreClosureConcurrentExpr(
-						{ block |
-							bindings = bindings_result.items,
-							body = body_result.expr,
-							timeout = timeout_result.value
-						},
-						typ,
-						loc,
-					),
-					next_version = timeout_result.next_version
-				}
-		ConcurrentExpr(block, typ, loc):
-			bindings_result = rewrite_concurrent_bindings(block.bindings, next_version)
-			body_result = rewrite_expr_from(block.body, bindings_result.next_version)
-			timeout_result = rewrite_optional(block.timeout, body_result.next_version)
-
-			if (
-				not bindings_result.changed
-				and same_core_expr(body_result.expr, block.body)
-				and not timeout_result.changed
-			):
-				unchanged_rewrite(expr, timeout_result.next_version)
-			else:
-				{
-					expr = ConcurrentExpr(
-						{ block |
-							bindings = bindings_result.items,
-							body = body_result.expr,
-							timeout = timeout_result.value
-						},
-						typ,
-						loc,
-					),
-					next_version = timeout_result.next_version
-				}
-		SelectExpr(arms, typ, loc):
-			arms_result = rewrite_select_arms(arms, next_version)
-
-			if not arms_result.changed:
-				unchanged_rewrite(expr, arms_result.next_version)
-			else:
-				{
-					expr = SelectExpr(arms_result.items, typ, loc),
-					next_version = arms_result.next_version
-				}
-		RawMatchExpr(scrutinee, cases, typ, loc):
-			scrutinee_result = rewrite_expr_from(scrutinee, next_version)
-			cases_result = rewrite_raw_match_cases(cases, scrutinee_result.next_version)
-
-			if same_core_expr(scrutinee_result.expr, scrutinee) and not cases_result.changed:
-				unchanged_rewrite(expr, cases_result.next_version)
-			else:
-				{
-					expr = RawMatchExpr(scrutinee_result.expr, cases_result.items, typ, loc),
-					next_version = cases_result.next_version
-				}
-		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
-			scrutinee_result = rewrite_expr_from(scrutinee, next_version)
-			cases_result = rewrite_constructor_match_cases(cases, scrutinee_result.next_version)
-			fallback_result = rewrite_constructor_match_fallback(
-				fallback,
-				cases_result.next_version,
-			)
-
-			if (
-				same_core_expr(scrutinee_result.expr, scrutinee)
-				and not cases_result.changed
-				and not fallback_result.changed
-			):
-				unchanged_rewrite(expr, fallback_result.next_version)
-			else:
-				{
-					expr = ConstructorMatchExpr(
-						scrutinee_result.expr,
-						release_policy,
-						cases_result.items,
-						fallback_result.fallback,
-						typ,
-						loc,
-					),
-					next_version = fallback_result.next_version
-				}
-		_:
-			unchanged_rewrite(expr, next_version)
-
-
-pure func desugar_expr_from(expr: CoreExpr, next_version: Int) -> CoreSsaExprRewrite:
+) -> CoreTraverse.CoreMapState[Int, CoreExpr]:
 	rewrite_expr_from(expr, next_version)
 
 
 pure func desugar_expr(expr: CoreExpr) -> CoreExpr:
-	desugar_expr_from(expr, 0).expr
+	desugar_expr_from(expr, 0).value
 
 
 private record CoreSsaFunctionRewrite {
@@ -2742,15 +1500,15 @@ private pure func rewrite_function(
 		Some(body):
 			body_result = rewrite_expr_from(body, next_version)
 
-			if same_core_expr(body_result.expr, body):
+			if same_core_expr(body_result.value, body):
 				{
 					function = function,
-					next_version = body_result.next_version
+					next_version = body_result.state
 				}
 			else:
 				{
-					function = { function | body = Some(body_result.expr) },
-					next_version = body_result.next_version
+					function = { function | body = Some(body_result.value) },
+					next_version = body_result.state
 				}
 		None:
 			{
@@ -2788,8 +1546,8 @@ private pure func rewrite_decl(decl: CoreDecl, next_version: Int) -> CoreSsaDecl
 		GlobalDecl(global):
 			result = rewrite_expr_from(global.init, next_version)
 			{
-				decl = GlobalDecl({ global | init = result.expr }),
-				next_version = result.next_version
+				decl = GlobalDecl({ global | init = result.value }),
+				next_version = result.state
 			}
 		ImplDecl(impl_decl):
 			result = rewrite_functions(impl_decl.methods, next_version)
