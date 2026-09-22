@@ -392,6 +392,35 @@ pure func fixture_source_span() -> SourceLocation:
 	source_location_for_file(src, start, finish)
 
 
+-- A span at an explicit offset range within `fixture_source_file`'s text
+-- ("func main(x: Int) -> Int: x + 1"), for Core Identity Migration step 1
+-- tests that need two distinct binders (`fixture_source_span()` always
+-- resolves to the same offset, so every plain `ident(...)` in this file
+-- mints the same `uniq`; shadowing tests need binders that do not collide).
+pure func fixture_source_span_at(start: Int, finish: Int) -> SourceLocation:
+	src: SourceFile = fixture_source_file()
+	start_cursor: Cursor = source_cursor_at(src, start)
+	finish_cursor: Cursor = source_cursor_at(src, finish)
+	source_location_for_file(src, start_cursor, finish_cursor)
+
+
+-- An identifier at an explicit, test-chosen span. `fixture_source_file`'s
+-- text has `x` at offset 10 (the declared parameter) and offset 26 (the
+-- body's use); this lets a test place a same-named binder at each so their
+-- minted `uniq` values (source-offset-derived; see `core_binder_uniq` in
+-- lower.brp) are guaranteed distinct.
+pure func ident_at(text: String, start: Int, finish: Int) -> ParsedIdentifier:
+	parsed_identifier(text, fixture_source_span_at(start, finish))
+
+
+-- The `uniq` step 1 mints for a binder at `[start, finish)`: mirrors
+-- `core_binder_uniq` in lower.brp (`source_location_start_offset(span) +
+-- 1`) without depending on that private function, so a test can compute
+-- the expected value independently of the implementation it is checking.
+pure func expected_uniq_at(start: Int) -> Int:
+	start + 1
+
+
 private record CoreResolvedCallFixture {
 	module_table: ModuleTable,
 	definition_table: DefinitionTable,
@@ -2717,7 +2746,7 @@ func test_lowers_block_local_var_decl_to_let() -> Bool:
 					VarExpr(
 						{
 							name = "x",
-							uniq = 0,
+							uniq = 1,
 							def_id = None
 						},
 						core_int_type(),
@@ -2894,7 +2923,7 @@ func test_lowers_tuple_destruct_in_block() -> Bool:
 									VarExpr(
 										{
 											name = "a",
-											uniq = 0,
+											uniq = 1,
 											def_id = None
 										},
 										core_int_type(),
@@ -2962,7 +2991,7 @@ func test_lowers_tuple_destruct_skipping_wildcard() -> Bool:
 							VarExpr(
 								{
 									name = "b",
-									uniq = 0,
+									uniq = 1,
 									def_id = None
 								},
 								core_bool_type(),
@@ -4178,7 +4207,7 @@ func test_lowers_lambda_expression() -> Bool:
 							VarExpr(
 								{
 									name = "x",
-									uniq = 0,
+									uniq = 1,
 									def_id = None
 								},
 								core_int_type(),
@@ -4190,6 +4219,235 @@ func test_lowers_lambda_expression() -> Bool:
 						)
 					)
 				None:
+					False
+		_:
+			False
+
+
+-- Core Identity Migration step 1 (docs/CORE_ID_MIGRATION.md): shadowing
+-- across nested `let`s mints a distinct `uniq` per binder, and a use
+-- resolves to the innermost one.
+func test_mints_distinct_uniq_for_shadowing_in_nested_scopes() -> Bool:
+	outer_span = fixture_source_span_at(10, 11)
+	inner_span = fixture_source_span_at(26, 27)
+	inner_decl = TypedVarDeclExpr(
+		{
+			name = ident_at("x", 26, 27),
+			annotation = None,
+			initializer = int_expr("2"),
+			is_mutable = False,
+			span = inner_span
+		},
+		expr_info(TYPE_VOID),
+	)
+	inner_use = TypedNameExpr(ident_at("x", 26, 27), expr_info(int_type()))
+	inner_block = TypedBlockExpr([inner_decl, inner_use], inner_span, expr_info(int_type()))
+	outer_decl = TypedVarDeclExpr(
+		{
+			name = ident_at("x", 10, 11),
+			annotation = None,
+			initializer = int_expr("1"),
+			is_mutable = False,
+			span = outer_span
+		},
+		expr_info(TYPE_VOID),
+	)
+	expr = TypedBlockExpr([outer_decl, inner_block], outer_span, expr_info(int_type()))
+
+	match lower_typed_expr(fixture_source_table(), expr):
+		Ok(LetExpr(outer_var, _, _, _, outer_body)):
+			match outer_body:
+				LetExpr(inner_var, _, _, _, inner_body):
+					(
+						outer_var.name == "x"
+						and outer_var.uniq == expected_uniq_at(10)
+						and inner_var.name == "x"
+						and inner_var.uniq == expected_uniq_at(26)
+						and outer_var.uniq != inner_var.uniq
+						and core_exprs_equal(
+							inner_body,
+							VarExpr(
+								{ name = "x", uniq = expected_uniq_at(26), def_id = None },
+								core_int_type(),
+								core_source_loc(fixture_source_table(), inner_span),
+							),
+						)
+					)
+				_:
+					False
+		_:
+			False
+
+
+-- A lambda parameter shadows an enclosing `let` of the same name: the use
+-- inside the lambda body resolves to the parameter's `uniq`, not the outer
+-- `let`'s.
+func test_lambda_parameter_shadows_enclosing_let() -> Bool:
+	outer_span = fixture_source_span_at(10, 11)
+	param_span = fixture_source_span_at(26, 27)
+	param: TypedLambdaParam = {
+		name = ident_at("x", 26, 27),
+		source_type = Some(int_type()),
+		param_type = int_type()
+	}
+	lambda_body = TypedNameExpr(ident_at("x", 26, 27), expr_info(int_type()))
+	lambda = TypedLambdaExpr(
+		True,
+		[param],
+		Some(int_type()),
+		lambda_body,
+		param_span,
+		expr_info(function_type()),
+	)
+	outer_decl = TypedVarDeclExpr(
+		{
+			name = ident_at("x", 10, 11),
+			annotation = None,
+			initializer = int_expr("1"),
+			is_mutable = False,
+			span = outer_span
+		},
+		expr_info(TYPE_VOID),
+	)
+	tail = TypedNameExpr(ident_at("x", 10, 11), expr_info(int_type()))
+	expr = TypedBlockExpr([outer_decl, lambda, tail], outer_span, expr_info(int_type()))
+
+	match lower_typed_expr(fixture_source_table(), expr):
+		Ok(LetExpr(outer_var, _, _, _, after_let)):
+			match after_let:
+				SeqExpr(lowered_lambda, after_lambda):
+					lambda_ok: Bool = match lowered_lambda:
+						LambdaExpr(_, _, lowered_body, _, _, _):
+							core_exprs_equal(
+								lowered_body,
+								VarExpr(
+									{ name = "x", uniq = expected_uniq_at(26), def_id = None },
+									core_int_type(),
+									core_source_loc(fixture_source_table(), param_span),
+								),
+							)
+						_:
+							False
+
+					(
+						outer_var.uniq == expected_uniq_at(10)
+						and lambda_ok
+						and core_exprs_equal(
+							after_lambda,
+							VarExpr(
+								{ name = "x", uniq = expected_uniq_at(10), def_id = None },
+								core_int_type(),
+								core_source_loc(fixture_source_table(), outer_span),
+							),
+						)
+					)
+				_:
+					False
+		_:
+			False
+
+
+-- Match bindings are deliberately NOT scope-resolved in step 1 (see the
+-- docstring on `lower_raw_match_cases` in lower.brp): giving them real
+-- identity desyncs from `match_lowering.brp`'s direct-constructor fast
+-- path, which rebuilds its own `uniq = 0` binder around the already-lowered
+-- arm body. This pins that intentional limitation: a plain match binding's
+-- arm-body reference still lowers at `uniq = 0` (today's fallback for a
+-- name absent from scope), exactly like every other reference this step
+-- does not cover.
+func test_match_binding_does_not_mint_identity_yet() -> Bool:
+	span = fixture_source_span_at(26, 27)
+	binding_case: TypedMatchCase = {
+		pattern = TypedNamePattern(ident_at("v", 26, 27), int_type()),
+		body = TypedNameExpr(ident_at("v", 26, 27), expr_info(int_type())),
+		span = span
+	}
+	match_expr = TypedMatchExpr(
+		TypedNameExpr(ident("scrutinee"), expr_info(int_type())),
+		[binding_case],
+		span,
+		expr_info(int_type()),
+	)
+
+	match lower_typed_expr(fixture_source_table(), match_expr):
+		Ok(RawMatchExpr(_, cases, _, _)):
+			match cases.get(0):
+				Some(lowered_case):
+					core_exprs_equal(
+						lowered_case.body,
+						VarExpr(
+							{ name = "v", uniq = 0, def_id = None },
+							core_int_type(),
+							core_source_loc(fixture_source_table(), span),
+						),
+					)
+				None:
+					False
+		_:
+			False
+
+
+-- A `for` loop's binder is visible only inside the loop body: a use of the
+-- same name after the loop, bound by an outer `let`, must still resolve to
+-- the outer binder, not leak the loop's popped scope entry.
+func test_loop_binder_scope_does_not_leak_after_the_loop() -> Bool:
+	outer_span = fixture_source_span_at(10, 11)
+	loop_span = fixture_source_span_at(26, 27)
+	outer_decl = TypedVarDeclExpr(
+		{
+			name = ident_at("x", 10, 11),
+			annotation = None,
+			initializer = int_expr("1"),
+			is_mutable = False,
+			span = outer_span
+		},
+		expr_info(TYPE_VOID),
+	)
+	loop_body = TypedNameExpr(ident_at("x", 26, 27), expr_info(int_type()))
+	loop_expr = TypedForExpr(
+		ParsedForNameBinder(ident_at("x", 26, 27)),
+		TypedNameExpr(ident("xs"), expr_info(list_int_type())),
+		None,
+		loop_body,
+		loop_span,
+		expr_info(TYPE_VOID),
+	)
+	tail = TypedNameExpr(ident_at("x", 10, 11), expr_info(int_type()))
+	expr = TypedBlockExpr([outer_decl, loop_expr, tail], outer_span, expr_info(int_type()))
+
+	match lower_typed_expr(fixture_source_table(), expr):
+		Ok(LetExpr(outer_var, _, _, _, after_let)):
+			match after_let:
+				SeqExpr(lowered_loop, after_loop):
+					loop_ok: Bool = match lowered_loop:
+						ForListExpr(for_list, _, _):
+							(
+								for_list.binder.variable.uniq == expected_uniq_at(26)
+								and core_exprs_equal(
+									for_list.body,
+									VarExpr(
+										{ name = "x", uniq = expected_uniq_at(26), def_id = None },
+										core_int_type(),
+										core_source_loc(fixture_source_table(), loop_span),
+									),
+								)
+							)
+						_:
+							False
+
+					(
+						outer_var.uniq == expected_uniq_at(10)
+						and loop_ok
+						and core_exprs_equal(
+							after_loop,
+							VarExpr(
+								{ name = "x", uniq = expected_uniq_at(10), def_id = None },
+								core_int_type(),
+								core_source_loc(fixture_source_table(), outer_span),
+							),
+						)
+					)
+				_:
 					False
 		_:
 			False
@@ -6843,6 +7101,22 @@ tests: TestSuite = {
 		("lowers set for expression", test_lowers_set_for_expression),
 		("lowers stream for expression", test_lowers_stream_for_expression),
 		("lowers lambda expression", test_lowers_lambda_expression),
+		(
+			"mints distinct uniq for shadowing in nested scopes",
+			test_mints_distinct_uniq_for_shadowing_in_nested_scopes,
+		),
+		(
+			"lambda parameter shadows enclosing let",
+			test_lambda_parameter_shadows_enclosing_let,
+		),
+		(
+			"match binding does not mint identity yet",
+			test_match_binding_does_not_mint_identity_yet,
+		),
+		(
+			"loop binder scope does not leak after the loop",
+			test_loop_binder_scope_does_not_leak_after_the_loop,
+		),
 		(
 			"lowers detach expression to pre-closure detach",
 			test_lowers_detach_expression_to_pre_closure_detach,

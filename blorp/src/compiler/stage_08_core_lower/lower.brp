@@ -482,7 +482,46 @@ record CoreLowerContext {
 	definition_table: Option[DefinitionTable],
 	module_id: Option[ModuleId],
 	callable_names: CoreLowerCallableNameRegistry,
-	module_member_prefixes: Dict[String, String]
+	module_member_prefixes: Dict[String, String],
+	-- Core Identity Migration step 1 (docs/CORE_ID_MIGRATION.md). `next_uniq`
+	-- is the allocator's high-water mark: every binder mints its `uniq` from
+	-- its own source span (see `core_binder_uniq`), which is stateless and
+	-- collision-free within one source file, so lowering never has to thread
+	-- a counter through sibling subexpressions to avoid two independent
+	-- binders racing for the same value. `next_uniq` instead tracks an upper
+	-- bound on every minted value so the SSA desugar pass can seed its own
+	-- version counter above it (see `ssa.brp:fresh_version` /
+	-- `desugar_program_from`) without colliding with a real binder's uniq.
+	-- It is finalized once, from the source table, when a function's body
+	-- has been lowered (see `core_lower_context_with_uniq_bound`), the same
+	-- point at which `next_def_id` is already threaded across declarations.
+	next_uniq: Int,
+	-- The lexical scope stack for resolving a local name use to its
+	-- innermost binder's `uniq`. Kept as a plain association list searched
+	-- from the front (most recently pushed binder first) because scope
+	-- depth is small and no name id reaches lowering from the source-name
+	-- table (see `resolve_local_uniq`).
+	scope: List[CoreLowerScopeEntry]
+}
+
+
+-- One (name, uniq) binding on the lowering scope stack. Tried as a `struct`
+-- (so `List[struct]`'s inline storage, `InlineStructListStorage` in
+-- stage_09_core/ir.brp, would skip a record box per push) and rejected by
+-- the compiler: "struct fields must be scalar values ... use a record for
+-- strings." A `String` field forces `record`. The remaining, still-real
+-- saving is in how entries are pushed: batched and appended rather than
+-- boxed one at a time and prepended (see `push_local_scope`/
+-- `push_local_scopes` below). A per-function name-id table (storing an
+-- interned int here instead of `name: String`, letting this become a
+-- struct) would remove the record box too, but that table is itself a
+-- second growing structure needing its own lookup/allocation on the same
+-- hot path, and no name id reaches lowering today (see
+-- `core_local_var_use`'s docstring) -- not attempted given the size of the
+-- remaining delta after the batching fix (see the step 1 commit message).
+record CoreLowerScopeEntry {
+	name: String,
+	uniq: Int
 }
 
 
@@ -569,7 +608,9 @@ pure func core_lower_context(next_def_id: Int, source_module: Option[String]) ->
 		definition_table = None,
 		module_id = None,
 		callable_names = CoreLowerDefaultCallableNames,
-		module_member_prefixes = {}
+		module_member_prefixes = {},
+		next_uniq = CORE_LOWER_UNIQ_SEED_BOUND,
+		scope = []
 	}
 
 
@@ -587,7 +628,9 @@ pure func core_lower_context_with_callable_names(
 		definition_table = Some(definition_table),
 		module_id = Some(module_id),
 		callable_names = callable_names,
-		module_member_prefixes = {}
+		module_member_prefixes = {},
+		next_uniq = CORE_LOWER_UNIQ_SEED_BOUND,
+		scope = []
 	}
 
 
@@ -661,6 +704,171 @@ private pure func core_var_impl(name: String, def_id: Option[Int]) -> CoreVar:
 		uniq = 0,
 		def_id = def_id
 	}
+
+
+-- Every authored `SourceLocation` packs `start_offset * SOURCE_LOCATION_OFFSET_BASE
+-- + end_offset` into one non-negative Int strictly below this bound (see
+-- `blorp/src/lib/source.brp`; compiler source files are bounded to less than
+-- 2 GiB). `core_binder_uniq` below never mints a value at or above it, so it
+-- is a safe, allocation-free seed for the SSA desugar pass's own version
+-- counter (`ssa.brp:fresh_version`) -- see `core_lower_context`'s
+-- `next_uniq` field.
+private CORE_LOWER_UNIQ_SEED_BOUND: Int = 2147483648
+
+
+-- Core Identity Migration step 1 (docs/CORE_ID_MIGRATION.md). Mint a
+-- binder's `uniq` from its own source span rather than from a counter
+-- threaded through lowering. Two distinct source tokens never share a start
+-- offset within one file -- the invariant `SourceLocation` itself already
+-- relies on -- so this is a pure, stateless allocator: it needs no state
+-- threaded across sibling subexpressions to stay collision-free (two
+-- independent closures that each bind a parameter of the same name do not
+-- race for one shared counter value, because each mints from its own,
+-- textually distinct, parameter span). `+ 1` keeps every minted uniq
+-- strictly positive so it stays distinguishable from the `uniq = 0`
+-- sentinel that still means "no local identity" for globals, callables,
+-- constructors, and the synthetic binders the ~30 other private
+-- `core_var(name)` helpers mint (unaffected by this step; see step 5 of the
+-- roadmap).
+private pure func core_binder_uniq(span: SourceLocation) -> Int:
+	source_location_start_offset(span) + 1
+
+
+-- A binder introduced from a real source identifier: name plus a uniq
+-- derived from that identifier's own span.
+private pure func core_local_var(identifier: ParsedIdentifier) -> CoreVar:
+	{ core_var(identifier.text, None) | uniq = core_binder_uniq(identifier.span) }
+
+
+-- A binder lowering itself invents with no `ParsedIdentifier` of its own
+-- (for example the record-update temp): keyed off the span of the
+-- construct that needs it instead.
+private pure func core_local_var_at(name: String, span: SourceLocation) -> CoreVar:
+	{ core_var(name, None) | uniq = core_binder_uniq(span) }
+
+
+-- Push one binder onto the lowering scope stack, valid only for the span of
+-- code where it is visible. Appended, not prepended: `.append` grows a
+-- `List`'s backing store in place (amortized, no separate list built to
+-- concatenate), where `[entry].concat(context.scope)` would both box a
+-- one-element list just to discard it and copy the whole existing scope on
+-- every push. `resolve_local_uniq` below scans back-to-front to still
+-- prefer the innermost (most recently appended) binder. Callers must pass
+-- the resulting context solely into the specific sub-lowering call that is
+-- that binder's continuation (the `let` body, the match arm body, the loop
+-- body, ...): `CoreLowerContext` stays a Reader everywhere else in
+-- expression lowering, so a scope extension must never leak into an
+-- unrelated sibling call still holding the original context.
+private pure func push_local_scope(
+	context: CoreLowerContext,
+	name: String,
+	uniq: Int,
+) -> CoreLowerContext:
+	{ context | scope = context.scope.append({ name = name, uniq = uniq }) }
+
+
+-- Push several binders at once (in list order, so later entries shadow
+-- earlier ones at the same scope depth, matching how `push_local_scope`
+-- would be called one at a time). One `.concat` for the whole batch, not
+-- one context copy and one list write per name.
+private pure func push_local_scopes(
+	context: CoreLowerContext,
+	names: List[String],
+	uniqs: List[Int],
+) -> CoreLowerContext:
+	{ context | scope = context.scope.concat(local_scope_entries(names, uniqs)) }
+
+
+private pure func local_scope_entries(
+	names: List[String],
+	uniqs: List[Int],
+) -> List[CoreLowerScopeEntry]:
+	var entries: List[CoreLowerScopeEntry] = []
+	var index: Int = 0
+
+	while index < names.length():
+		match (names.get(index), uniqs.get(index)):
+			(Some(name), Some(uniq)):
+				entries = entries.append({ name = name, uniq = uniq })
+			_:
+				void
+
+		index += 1
+
+	entries
+
+
+-- Push a lowered parameter list's binders onto the scope stack in one
+-- batch, in order, so a later parameter that repeats an earlier name
+-- shadows it the same way a nested `let` would (matches source semantics:
+-- `func(x, x)` would already be rejected earlier; this only matters for two
+-- parameter lists being combined, e.g. lambda-params-in-a-lambda-in-a-lambda).
+private pure func push_params_scope(context: CoreLowerContext, params: List[CoreParam]) -> CoreLowerContext:
+	entries: List[CoreLowerScopeEntry] = params.map(
+		pure func(param: CoreParam): { name = param.name.name, uniq = param.name.uniq },
+	)
+	{ context | scope = context.scope.concat(entries) }
+
+
+-- Push a function's own parameter scope: the ordinary (already-minted)
+-- parameter binders, plus every name a tuple parameter destructures into
+-- (minted here, from its own identifier span, matching what
+-- `lower_tuple_destruct_bindings` mints for the same name when it later
+-- builds that destructure's `LetExpr`). Both the plain parameters and the
+-- destructured names are visible for the whole function body, so this is
+-- pushed once, before lowering it -- unlike a `let`'s scope, which is
+-- local to one continuation.
+private pure func push_function_scope(context: CoreLowerContext, params: CoreLowerParams) -> CoreLowerContext:
+	-- A function body starts a fresh scope: no binder from a sibling
+	-- declaration (or, for a lambda literal's own nested call into this
+	-- same helper -- there is none today, but defensively) should leak in.
+	fresh_context: CoreLowerContext = { context | scope = [] }
+	with_params = push_params_scope(fresh_context, params.params)
+
+	destructured_names: List[ParsedIdentifier] = params.destructures.flat_map(
+		pure func(destructure: CoreLowerParamDestructure): destructure.names,
+	)
+	push_local_scopes(
+		with_params,
+		destructured_names.map(pure func(n: ParsedIdentifier): n.text),
+		destructured_names.map(pure func(n: ParsedIdentifier): core_binder_uniq(n.span)),
+	)
+
+
+-- Resolve a name use to its innermost binder's `uniq`, or `None` if the
+-- name is not a local in scope (a global, callable, or constructor, which
+-- keep `uniq = 0` and carry `def_id` instead). Scans back-to-front since
+-- `push_local_scope`/`push_local_scopes` append: the innermost binder is
+-- always the last one whose name matches.
+private pure func resolve_local_uniq(context: CoreLowerContext, name: String) -> Option[Int]:
+	var result: Option[Int] = None
+
+	for entry in context.scope:
+		if entry.name == name:
+			result = Some(entry.uniq)
+
+	result
+
+
+-- A name-use site's `CoreVar`: a resolved global/callable/constructor
+-- (`def_id` present) keeps `uniq = 0`; a local (`def_id = None`) resolves
+-- through the scope stack to the binder it refers to. A name absent from
+-- scope (not yet covered by step 1's binder sites, or a forward reference)
+-- falls back to today's `uniq = 0`, unchanged from before this step.
+private pure func core_local_var_use(
+	context: CoreLowerContext,
+	name: String,
+	def_id: Option[Int],
+) -> CoreVar:
+	match def_id:
+		Some(_):
+			core_var(name, def_id)
+		None:
+			match resolve_local_uniq(context, name):
+				Some(uniq):
+					{ core_var(name, None) | uniq = uniq }
+				None:
+					core_var(name, None)
 
 
 private pure func split_var_callable_id(name: String) -> (String, Option[Int]):
@@ -2139,11 +2347,15 @@ private pure func lower_typed_record_update(
 		_:
 			lowered_receiver ?= lower_typed_expr_with_context(context, receiver)
 			lowered_updates ?= lower_typed_record_fields(context, updates)
-			temp_var: CoreVar = {
-				name = "__record_update_" + source_location_start_offset(span).to_string(),
-				uniq = source_location_start_offset(span),
-				def_id = None
-			}
+			-- Self-contained: `temp_var` is never looked up through the
+			-- scope stack, only referenced directly below, so it only
+			-- needs a `uniq` distinct from any real binder's -- which
+			-- `core_local_var_at` (the same allocator as every other
+			-- binder site) already guarantees.
+			temp_var: CoreVar = core_local_var_at(
+				"__record_update_" + source_location_start_offset(span).to_string(),
+				span,
+			)
 			base_ref = VarExpr(temp_var, typ, loc)
 			fields ?= lower_record_update_fields(
 				context,
@@ -2326,6 +2538,23 @@ private pure func lower_typed_field_access(
 			Ok(FieldExpr(lowered_receiver, field.text, typ, loc))
 
 
+-- Match bindings are deliberately NOT given scope-resolved identity in step
+-- 1, unlike every other binder kind. `CorePattern.NamePattern` carries only
+-- a `String` (see `stage_09_core/ir.brp`; giving it a `uniq` is an IR
+-- change well outside lower.brp, and outside step 1's file list in
+-- docs/CORE_ID_MIGRATION.md). Worse: `stage_09_core/match_lowering.brp`'s
+-- direct-constructor fast path (`bind_constructor_payloads`) rebuilds its
+-- own `LetExpr` binder for a matched name via its own private `core_var`
+-- (`uniq = 0`) around the arm body Core lowering already produced. Giving
+-- the arm body's own uses of that name a nonzero, scope-resolved `uniq`
+-- here would desync them from that later-rebuilt `uniq = 0` binder --
+-- `core_var_equal` would call them different variables, `bind_constructor_
+-- payloads`'s consumer can conclude the original binding is unused, and
+-- the reference in `body` no longer names a declared C local. This was
+-- confirmed by a real `scripts/test leak` failure ("use of undeclared
+-- identifier") when this was pushed onto scope; reverted. A match
+-- binding's uses keep resolving through today's fallback (`uniq = 0`)
+-- until that consumer is also converted (see step 3/5 of the roadmap).
 private pure func lower_raw_match_cases(
 	context: CoreLowerContext,
 	cases: List[TypedMatchCase],
@@ -2676,7 +2905,7 @@ private pure func lower_typed_lambda_params(
 			match core_lower_type_with_prefixes(context.module_member_prefixes, param.param_type):
 				Ok(param_type):
 					lowered = lowered.append({
-						name = core_var(param.name.text, None),
+						name = core_local_var(param.name),
 						typ = param_type,
 						loc = core_source_loc_from_context(context, param.name.span),
 					})
@@ -2705,7 +2934,7 @@ private pure func lower_for_name_binder(
 		ParsedForNameBinder(name):
 			typ ?= core_lower_value_type(context.module_member_prefixes, element_type)
 			Ok({
-				variable = core_var(name.text, None),
+				variable = core_local_var(name),
 				typ = typ,
 				range_direction = RangeMayRunBackward,
 			})
@@ -2719,11 +2948,14 @@ private pure func lower_typed_for_binding(
 	element_type: SemanticType,
 	body: TypedExpr,
 ) -> Result[CoreLowerLoopBinding, CoreLowerError]:
-	lowered_body ?= lower_typed_expr_with_context(context, body)
-
 	match binder:
 		ParsedForNameBinder(_):
 			lowered_binder ?= lower_for_name_binder(context, binder, element_type)
+			-- The loop binder is visible only inside the loop body.
+			lowered_body ?= lower_typed_expr_with_context(
+				push_local_scope(context, lowered_binder.variable.name, lowered_binder.variable.uniq),
+				body,
+			)
 			Ok({
 				binder = lowered_binder,
 				body = lowered_body,
@@ -2749,6 +2981,15 @@ private pure func lower_typed_for_binding(
 							clone_core_type(tuple_type),
 							core_source_loc_from_context(context, span),
 						)
+						-- Each destructured name is visible only inside the
+						-- loop body; mint its uniq from its own identifier
+						-- span before lowering the body.
+						body_context = push_local_scopes(
+							context,
+							names.map(pure func(n: ParsedIdentifier): n.text),
+							names.map(pure func(n: ParsedIdentifier): core_binder_uniq(n.span)),
+						)
+						lowered_body ?= lower_typed_expr_with_context(body_context, body)
 						body_with_bindings ?= lower_tuple_destruct_bindings(
 							context,
 							names,
@@ -2801,7 +3042,12 @@ private pure func lower_typed_range_for(
 		lowered_binder ?= lower_for_name_binder(context, binder, element_type)
 		lowered_start ?= lower_typed_expr_with_context(context, start_expr)
 		lowered_end ?= lower_typed_expr_with_context(context, end_expr)
-		lowered_body ?= lower_typed_expr_with_context(context, body)
+		-- The loop binder is visible only inside the loop body, not to the
+		-- start/end bounds.
+		lowered_body ?= lower_typed_expr_with_context(
+			push_local_scope(context, lowered_binder.variable.name, lowered_binder.variable.uniq),
+			body,
+		)
 		Ok(ForRangeExpr(lowered_binder, lowered_start, lowered_end, lowered_body, typ, loc))
 
 
@@ -4345,6 +4591,13 @@ private pure func lower_typed_question_bind(
 		if block_kind != rhs_kind:
 			Err(CoreLowerInvalidType("?= carrier kind changed between inference and lowering"))
 		else:
+			-- NOT scope-resolved, matching `lower_raw_match_cases`'s
+			-- match-binding limitation above: `?=` desugars to exactly the
+			-- same `NamePattern`-bound `RawMatchExpr` shape (the `Some`/`Ok`
+			-- arm below), so it hits the identical `match_lowering.brp`
+			-- direct-constructor-fast-path desync. Confirmed by the same
+			-- kind of `scripts/test leak` "undeclared identifier" failure
+			-- this produced before being reverted.
 			success_body ?= lower_typed_block_expr(
 				context,
 				rest,
@@ -4392,6 +4645,17 @@ private pure func with_resource_name(binding: TypedWithBinding) -> String:
 		question_bind_name("resource", binding.span)
 	else:
 		binding.name.text
+
+
+-- The `with`-bound resource's own binder. A real name mints from its own
+-- identifier span like any other binder; `_` has no identifier to mint
+-- from and is never looked up by name, so it keeps the synthetic,
+-- self-contained treatment it already had.
+private pure func with_resource_var(binding: TypedWithBinding) -> CoreVar:
+	if binding.name.text == "_":
+		core_var(with_resource_name(binding), None)
+	else:
+		core_local_var(binding.name)
 
 
 private pure func with_resource_type(
@@ -4450,7 +4714,7 @@ private pure func resource_scope_expr(
 	result_type: CoreType,
 	loc: CoreSourceLoc,
 ) -> CoreExpr:
-	resource_var = core_var(with_resource_name(binding), None)
+	resource_var = with_resource_var(binding)
 	scope: CoreResourceScope = {
 		variable = clone_core_var(resource_var),
 		typ = clone_core_type(resource_type),
@@ -4528,7 +4792,12 @@ private pure func lower_typed_with(
 	)
 	is_try = typed_with_binding_is_try(binding)
 	resource_type ?= with_resource_type(is_try, clone_core_type(acquisition_type))
-	lowered_body ?= lower_typed_expr_with_context(context, body)
+	-- The resource binder is visible only inside the `with` body.
+	resource_var = with_resource_var(binding)
+	lowered_body ?= lower_typed_expr_with_context(
+		push_local_scope(context, resource_var.name, resource_var.uniq),
+		body,
+	)
 
 	if is_try:
 		acquisition_kind ?= core_carrier_kind(acquisition_type)
@@ -4628,7 +4897,7 @@ private pure func lower_tuple_destruct_bindings(
 			else:
 				Ok(
 					LetExpr(
-						core_var(name.text, None),
+						core_local_var(name),
 						False,
 						field_type,
 						TupleFieldExpr(tuple_ref, index, field_type, loc),
@@ -4665,7 +4934,15 @@ private pure func lower_typed_tuple_destruct(
 		_:
 			Err(CoreLowerInvalidType("tuple destructure value must have tuple type"))
 
-	body ?= lower_typed_block_expr(context, rest, block_type, loc)
+	-- Each destructured name is visible only in the block's own
+	-- continuation (`rest`), so `rest` must be lowered against a scope
+	-- that already has them bound.
+	body_context = push_local_scopes(
+		context,
+		names.map(pure func(n: ParsedIdentifier): n.text),
+		names.map(pure func(n: ParsedIdentifier): core_binder_uniq(n.span)),
+	)
+	body ?= lower_typed_block_expr(body_context, rest, block_type, loc)
 	temp_var = core_var(tuple_destruct_name(span), None)
 	temp_ref = VarExpr(temp_var, value_type, loc)
 	body_with_bindings ?= lower_tuple_destruct_bindings(
@@ -4704,8 +4981,13 @@ private pure func lower_typed_block_expr(
 						context.module_member_prefixes,
 						typed_expr_value_type(payload.initializer),
 					)
+					binder: CoreVar = core_local_var(payload.name)
+					-- The binding is visible only to the block's own
+					-- continuation (`rest`), not to `payload.initializer`
+					-- (already lowered above against the unmodified
+					-- context) or to any sibling scope.
 					body ?= lower_typed_block_expr(
-						context,
+						push_local_scope(context, payload.name.text, binder.uniq),
 						rest,
 						typ,
 						core_source_loc_from_context(context, payload.span),
@@ -4713,7 +4995,7 @@ private pure func lower_typed_block_expr(
 
 					Ok(
 						LetExpr(
-							core_var(payload.name.text, None),
+							binder,
 							payload.is_mutable,
 							bind_type,
 							lowered_init,
@@ -4892,7 +5174,7 @@ private pure func lower_typed_expr_as_type_impl(
 				(clean_name, encoded_id) = split_var_callable_id(lowered_name)
 				resolved_id ?= resolved_name_expr_id(context, info)
 				def_id ?= resolve_name_expr_def_id(name, encoded_id, resolved_id)
-				Ok(VarExpr(core_var(clean_name, def_id), typ, loc))
+				Ok(VarExpr(core_local_var_use(context, clean_name, def_id), typ, loc))
 			else:
 				-- Attribution instrumentation: drill one level into a plain
 				-- name reference's own lowering cost (see the 2026-09-22
@@ -4923,7 +5205,7 @@ private pure func lower_typed_expr_as_type_impl(
 				def_id ?= resolve_name_expr_def_id(name, encoded_id, resolved_id)
 
 				core_lowering_node_enter()
-				name_node = VarExpr(core_var(clean_name, def_id), typ, loc)
+				name_node = VarExpr(core_local_var_use(context, clean_name, def_id), typ, loc)
 				core_lowering_node_exit("NameExpr.node_construct")
 				Ok(name_node)
 		TypedIntLiteralExpr(text, _, _):
@@ -4958,7 +5240,7 @@ private pure func lower_typed_expr_as_type_impl(
 			lower_typed_expr_as_type(context, inner, typ)
 		TypedAssignExpr(name, _, value, _, _):
 			lowered_value ?= lower_typed_expr_with_context(context, value)
-			Ok(AssignExpr(core_var(name.text, None), lowered_value, typ, loc))
+			Ok(AssignExpr(core_local_var_use(context, name.text, None), lowered_value, typ, loc))
 		TypedUnaryExpr(op, inner, _, _):
 			lowered_inner ?= lower_typed_expr_with_context(context, inner)
 			Ok(UnaryExpr(core_unary_op(op), lowered_inner, typ, loc))
@@ -5089,7 +5371,13 @@ private pure func lower_typed_expr_as_type_impl(
 				context.module_member_prefixes,
 				typed_expr_value_type(body),
 			)
-			lowered_body ?= lower_typed_expr_with_context(context, body)
+			-- The parameters are visible only inside this lambda's own
+			-- body, never to the context the lambda literal itself was
+			-- built in.
+			lowered_body ?= lower_typed_expr_with_context(
+				push_params_scope(context, lowered_params),
+				body,
+			)
 			Ok(LambdaExpr(lowered_params, lowered_return_type, lowered_body, is_pure, typ, loc))
 		TypedBlockExpr(items, _, _):
 			lower_typed_block_expr(context, items, typ, loc)
@@ -5140,7 +5428,7 @@ private pure func core_lower_param(
 		ParsedParamNameBinder(name):
 			Ok({
 				param = {
-					name = core_var(name.text, None),
+					name = core_local_var(name),
 					typ = typ,
 					loc = core_source_loc_from_context(context, name.span)
 				},
@@ -5292,7 +5580,7 @@ private pure func lower_typed_function_body(
 		ParsedFunctionSourceBody:
 			match info.body:
 				Some(body):
-					match lower_typed_expr_with_context(context, body):
+					match lower_typed_expr_with_context(push_function_scope(context, params), body):
 						Ok(lowered_body):
 							wrapped_body ?= lower_param_destructures(
 								context,
